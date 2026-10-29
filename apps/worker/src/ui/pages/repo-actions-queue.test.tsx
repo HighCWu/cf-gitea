@@ -429,8 +429,13 @@ describe("the mounted queue routes (the census C6 mount: the minted-session rout
     // `/actions/runs/{run}` is claimed by the landed C2 run-viewer family
     // (actions-run-view — that unit's own suite pins its shapes).
     expect(parseUiRoute("/alice/demo/actions/job_queue/extra")).toBeNull();
-    expect(parseUiRoute("/-/admin/actions")).toBeNull();
-    expect(parseUiRoute("/-/admin/actions/runners")).toBeNull();
+    // The bare group + runners tails FLIPPED at the admin-actions mount
+    // window (admin-actions-redirect / admin-actions-runners serve now);
+    // scoped-workflows stays unclaimed — no substrate (the documented
+    // reduction).
+    expect(parseUiRoute("/-/admin/actions")).toMatchObject({ family: "admin-actions-redirect" });
+    expect(parseUiRoute("/-/admin/actions/runners")).toMatchObject({ family: "admin-actions-runners" });
+    expect(parseUiRoute("/-/admin/actions/scoped_workflows")).toBeNull();
     expect(handlesUiRoute("/alice/demo/actions/job_queue")).toBe(true);
   });
 

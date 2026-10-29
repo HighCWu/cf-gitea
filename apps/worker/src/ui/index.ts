@@ -743,6 +743,28 @@ import {
   serveArtifactPreviewRaw,
 } from "./pages/repo-actions-artifacts";
 import {
+  bulkAdminActionsRunners,
+  deleteAdminActionsRunner,
+  loadAdminActionsRunnerEditPageData,
+  loadAdminActionsRunnersPageData,
+  parseAdminActionsRunnerBulkForm,
+  parseAdminActionsRunnerDescriptionForm,
+  parseAdminActionsRunnerDisabledForm,
+  renderAdminActionsRunnerEditPage,
+  renderAdminActionsRunnersPage,
+  resetAdminActionsRunnerToken,
+  setAdminActionsRunnerDisabled,
+  updateAdminActionsRunnerDescription,
+} from "./pages/admin-actions-runners";
+import {
+  applyAdminActionsVariableCreate,
+  applyAdminActionsVariableUpdate,
+  deleteAdminActionsVariable,
+  loadAdminActionsVariablesPageData,
+  parseAdminActionsVariableForm,
+  renderAdminActionsVariablesPage,
+} from "./pages/admin-actions-variables";
+import {
   deleteRepoActionsRunner,
   loadRepoActionsRunnerEditPageData,
   loadRepoActionsRunnersPageData,
@@ -2949,10 +2971,25 @@ export interface AdminRoute {
     | "admin-notices-empty"
     // The census C6 arm: the admin JOB QUEUE page (pages/repo-actions-queue.tsx
     // — web.go:904's `GET /actions/job_queue` shared_actions.JobQueue inside
-    // the /-/admin group's /actions group; the group's runners/variables/
-    // scoped-workflows tails stay unclaimed — their admin pages are not
-    // landed, the dead-link rule).
-    | "admin-actions-job-queue";
+    // the /-/admin group's /actions group), plus the group's RUNNERS and
+    // VARIABLES pages and write arms (pages/admin-actions-runners.tsx /
+    // admin-actions-variables.tsx — web.go:898-902's addSettingsRunnersRoutes
+    // + addSettingsVariablesRoutes + the bare group's ./actions/runners
+    // LocationRedirect). The scoped-workflows tail (web.go:903) stays
+    // unclaimed — its action_scoped_workflow_source store has no substrate
+    // (the module's documented reduction, the dead-link rule).
+    | "admin-actions-job-queue"
+    | "admin-actions-redirect"
+    | "admin-actions-runners"
+    | "admin-actions-runners-token-reset"
+    | "admin-actions-runners-edit"
+    | "admin-actions-runners-update"
+    | "admin-actions-runners-delete"
+    | "admin-actions-runners-bulk"
+    | "admin-actions-variables"
+    | "admin-actions-variables-new"
+    | "admin-actions-variables-edit"
+    | "admin-actions-variables-delete";
   /** The monitor page (stats/cron/queue/stacktrace → the module's
    *  AdminMonitorPage union); absent on the dashboard family and the three
    *  listing families. */
@@ -2963,6 +3000,10 @@ export interface AdminRoute {
   /** The positive-integer {id} (the application-delete family — the landed
    *  PathParamInt64 posture; "007" parses as 7). */
   applicationId?: number;
+  /** The positive-integer {id} for the admin actions families — the
+   *  runners edit/update/delete combos and the variables edit/delete
+   *  combos (digits-only claims, the same PathParamInt64 posture). */
+  id?: number;
 }
 
 /** Window-2a: the user-settings tab families (the two-stage module wave —
@@ -3575,12 +3616,78 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (tail.length === 2 && tail[0] === "notices" && tail[1] === "empty") return { family: "admin-notices-empty" };
     // The census C6 arm (pages/repo-actions-queue.tsx — web.go:898-905's
     // /actions group's job_queue GET): the exact two-tail literal under the
-    // admin scope. The group's bare literal (upstream's ./actions/runners
-    // LocationRedirect) and its runners/variables/scoped-workflows tails
-    // stay unclaimed — the admin pages are not landed (the dead-link rule),
-    // the engine's 404.
+    // admin scope.
     if (tail.length === 2 && tail[0] === "actions" && tail[1] === "job_queue") {
       return { family: "admin-actions-job-queue" };
+    }
+    // The admin actions RUNNERS family (pages/admin-actions-runners.tsx —
+    // web.go:898-901's addSettingsRunnersRoutes inside the admin /actions
+    // group + POST /runners/bulk): the static tails claim first (chi
+    // static-before-dynamic), then the digits-only {id} combo (the house
+    // PathParamInt64 idiom); deeper tails stay unclaimed → the engine's 404.
+    if (tail.length === 3 && tail[0] === "actions" && tail[1] === "runners" && tail[2] === "bulk") {
+      return { family: "admin-actions-runners-bulk" };
+    }
+    if (tail.length === 3 && tail[0] === "actions" && tail[1] === "runners" && tail[2] === "reset_registration_token") {
+      return { family: "admin-actions-runners-token-reset" };
+    }
+    if (tail.length === 3 && tail[0] === "actions" && tail[1] === "runners" && /^\d+$/.test(tail[2] as string)) {
+      return { family: "admin-actions-runners-edit", id: Number.parseInt(tail[2] as string, 10) };
+    }
+    if (
+      tail.length === 4 &&
+      tail[0] === "actions" &&
+      tail[1] === "runners" &&
+      /^\d+$/.test(tail[2] as string) &&
+      tail[3] === "update-runner"
+    ) {
+      return { family: "admin-actions-runners-update", id: Number.parseInt(tail[2] as string, 10) };
+    }
+    if (
+      tail.length === 4 &&
+      tail[0] === "actions" &&
+      tail[1] === "runners" &&
+      /^\d+$/.test(tail[2] as string) &&
+      tail[3] === "delete"
+    ) {
+      return { family: "admin-actions-runners-delete", id: Number.parseInt(tail[2] as string, 10) };
+    }
+    if (tail.length === 2 && tail[0] === "actions" && tail[1] === "runners") {
+      return { family: "admin-actions-runners" };
+    }
+    // The admin actions VARIABLES family (pages/admin-actions-variables.tsx —
+    // web.go:902's addSettingsVariablesRoutes): the /new static tail, the
+    // digits-only {id} edit/delete combos, then the bare list literal.
+    if (tail.length === 3 && tail[0] === "actions" && tail[1] === "variables" && tail[2] === "new") {
+      return { family: "admin-actions-variables-new" };
+    }
+    if (
+      tail.length === 4 &&
+      tail[0] === "actions" &&
+      tail[1] === "variables" &&
+      /^\d+$/.test(tail[2] as string) &&
+      tail[3] === "edit"
+    ) {
+      return { family: "admin-actions-variables-edit", id: Number.parseInt(tail[2] as string, 10) };
+    }
+    if (
+      tail.length === 4 &&
+      tail[0] === "actions" &&
+      tail[1] === "variables" &&
+      /^\d+$/.test(tail[2] as string) &&
+      tail[3] === "delete"
+    ) {
+      return { family: "admin-actions-variables-delete", id: Number.parseInt(tail[2] as string, 10) };
+    }
+    if (tail.length === 2 && tail[0] === "actions" && tail[1] === "variables") {
+      return { family: "admin-actions-variables" };
+    }
+    // The bare group literal (web.go:898's GET "" — misc.LocationRedirect's
+    // 303 onto ./actions/runners, mounted INSIDE adminReq so the prologue
+    // gates the redirect). The scoped-workflows tail (web.go:903) stays
+    // unclaimed — no substrate (the module's documented reduction).
+    if (tail.length === 1 && tail[0] === "actions") {
+      return { family: "admin-actions-redirect" };
     }
     if (tail.length === 2 && tail[0] === "monitor") {
       if (tail[1] === "stats") return { family: "admin-monitor", page: "stats" };
@@ -6436,6 +6543,158 @@ async function adminActionsJobQueuePage(c: Context<{ Bindings: Env }>): Promise<
     return p.respond(c.html(renderJobQueueFragment(data), 200));
   }
   return p.respond(c.html(renderAdminActionsJobQueuePage(p.ctx, data), 200));
+}
+
+/** GET /-/admin/actions (the bare group literal — misc.LocationRedirect's
+ *  303 onto ./actions/runners, misc.go:76-80's EXACT relative bytes; the
+ *  prologue gates the redirect because upstream mounts it inside adminReq). */
+async function adminActionsGroupRedirect(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  return p.respond(new Response(null, { status: 303, headers: { location: "./actions/runners" } }));
+}
+
+/** The admin actions RUNNERS family's handlers (pages/admin-actions-runners.
+ *  tsx — web.go:898-901 + the bulk POST; writes sameOriginGuard-first). */
+async function adminActionsRunnersPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminActionsRunnersPageData(c.env.DB, new URL(c.req.raw.url).searchParams);
+  return p.respond(c.html(renderAdminActionsRunnersPage(p.ctx, data), 200));
+}
+
+async function adminActionsRunnersTokenReset(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  await resetAdminActionsRunnerToken(c.env.DB);
+  return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/actions/runners" } }));
+}
+
+async function adminActionsRunnerEditPage(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminActionsRunnerEditPageData(c.env.DB, runnerId, new URL(c.req.raw.url).searchParams);
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderAdminActionsRunnerEditPage(p.ctx, data), 200));
+}
+
+async function adminActionsRunnerEditSubmit(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = parseAdminActionsRunnerDescriptionForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await updateAdminActionsRunnerDescription(c.env.DB, runnerId, form.description);
+  if (outcome === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/actions/runners" } }));
+}
+
+async function adminActionsRunnerUpdate(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = parseAdminActionsRunnerDisabledForm(await readUrlEncodedForm(c.req.raw));
+  if (form.disabled === null) {
+    return p.respond(
+      new Response("missing 'disabled' parameter\n", {
+        status: 400,
+        headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+      }),
+    );
+  }
+  const outcome = await setAdminActionsRunnerDisabled(c.env.DB, runnerId, form.disabled);
+  if (outcome === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(new Response(null, { status: 303, headers: { location: `/-/admin/actions/runners/${runnerId}` } }));
+}
+
+async function adminActionsRunnerDelete(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const outcome = await deleteAdminActionsRunner(c.env.DB, runnerId);
+  if (outcome === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/actions/runners" } }));
+}
+
+async function adminActionsRunnersBulk(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = parseAdminActionsRunnerBulkForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await bulkAdminActionsRunners(c.env.DB, form);
+  if (outcome === "invalid-ids") {
+    return p.respond(
+      new Response("missing runner IDs\n", {
+        status: 400,
+        headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+      }),
+    );
+  }
+  if (outcome === "invalid-action") {
+    return p.respond(
+      new Response("invalid action\n", {
+        status: 400,
+        headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+      }),
+    );
+  }
+  return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/actions/runners" } }));
+}
+
+/** The admin actions VARIABLES family's handlers (pages/admin-actions-
+ *  variables.tsx — web.go:902). */
+async function adminActionsVariablesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminActionsVariablesPageData(c.env.DB);
+  return p.respond(c.html(renderAdminActionsVariablesPage(p.ctx, data), 200));
+}
+
+async function adminActionsVariableCreate(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = parseAdminActionsVariableForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await applyAdminActionsVariableCreate(c.env.DB, form);
+  if (outcome.outcome === "saved") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/actions/variables" } }));
+  }
+  // The shared union's arm — unreachable at create (no path id), answered
+  // defensively rather than de-narrowed.
+  if (outcome.outcome === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  const data = await loadAdminActionsVariablesPageData(c.env.DB);
+  return p.respond(c.html(renderAdminActionsVariablesPage(p.ctx, data, outcome.message), 200));
+}
+
+async function adminActionsVariableEdit(c: Context<{ Bindings: Env }>, variableId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = parseAdminActionsVariableForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await applyAdminActionsVariableUpdate(c.env.DB, variableId, form);
+  if (outcome.outcome === "saved") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/actions/variables" } }));
+  }
+  if (outcome.outcome === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  const data = await loadAdminActionsVariablesPageData(c.env.DB);
+  return p.respond(c.html(renderAdminActionsVariablesPage(p.ctx, data, outcome.message), 200));
+}
+
+async function adminActionsVariableDelete(c: Context<{ Bindings: Env }>, variableId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const outcome = await deleteAdminActionsVariable(c.env.DB, variableId);
+  if (outcome === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/actions/variables" } }));
 }
 
 // ---------------------------------------------------------------------------
@@ -13706,6 +13965,28 @@ uiRouter.get("/-/admin/config", (c) => adminConfigPage(c));
 // answers chi's 405.
 uiRouter.get("/-/admin/actions/job_queue", (c) => adminActionsJobQueuePage(c));
 uiRouter.post("/-/admin/actions/job_queue", () => methodNotAllowed("GET"));
+// The admin actions group's runners/variables families + the bare group
+// redirect (static literals before the dynamic {id} arms; the POST-only
+// shapes' GET twins answer chi's 405).
+uiRouter.get("/-/admin/actions", (c) => adminActionsGroupRedirect(c));
+uiRouter.get("/-/admin/actions/runners", (c) => adminActionsRunnersPage(c));
+uiRouter.post("/-/admin/actions/runners/reset_registration_token", (c) => adminActionsRunnersTokenReset(c));
+uiRouter.get("/-/admin/actions/runners/reset_registration_token", () => methodNotAllowed("POST"));
+uiRouter.post("/-/admin/actions/runners/bulk", (c) => adminActionsRunnersBulk(c));
+uiRouter.get("/-/admin/actions/runners/bulk", () => methodNotAllowed("POST"));
+uiRouter.get("/-/admin/actions/runners/:id(\\d+)", (c) => adminActionsRunnerEditPage(c, Number.parseInt(c.req.param("id") ?? "0", 10)));
+uiRouter.post("/-/admin/actions/runners/:id(\\d+)", (c) => adminActionsRunnerEditSubmit(c, Number.parseInt(c.req.param("id") ?? "0", 10)));
+uiRouter.post("/-/admin/actions/runners/:id(\\d+)/update-runner", (c) => adminActionsRunnerUpdate(c, Number.parseInt(c.req.param("id") ?? "0", 10)));
+uiRouter.get("/-/admin/actions/runners/:id(\\d+)/update-runner", () => methodNotAllowed("POST"));
+uiRouter.post("/-/admin/actions/runners/:id(\\d+)/delete", (c) => adminActionsRunnerDelete(c, Number.parseInt(c.req.param("id") ?? "0", 10)));
+uiRouter.get("/-/admin/actions/runners/:id(\\d+)/delete", () => methodNotAllowed("POST"));
+uiRouter.get("/-/admin/actions/variables", (c) => adminActionsVariablesPage(c));
+uiRouter.post("/-/admin/actions/variables/new", (c) => adminActionsVariableCreate(c));
+uiRouter.get("/-/admin/actions/variables/new", () => methodNotAllowed("POST"));
+uiRouter.post("/-/admin/actions/variables/:id(\\d+)/edit", (c) => adminActionsVariableEdit(c, Number.parseInt(c.req.param("id") ?? "0", 10)));
+uiRouter.get("/-/admin/actions/variables/:id(\\d+)/edit", () => methodNotAllowed("POST"));
+uiRouter.post("/-/admin/actions/variables/:id(\\d+)/delete", (c) => adminActionsVariableDelete(c, Number.parseInt(c.req.param("id") ?? "0", 10)));
+uiRouter.get("/-/admin/actions/variables/:id(\\d+)/delete", () => methodNotAllowed("POST"));
 // The POST-only shapes' GET twins answer the methodNotAllowed arm (the
 // method-blind parse convention — upstream chi's own 405 posture).
 uiRouter.get("/-/admin/emails/activate", () => methodNotAllowed("POST"));
