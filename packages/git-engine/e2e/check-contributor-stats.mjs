@@ -198,23 +198,19 @@ function buildTimelineFixture() {
   writeFileSync(join(dir, "README.md"), "cf-gitea\nactivity fixture\nrooted\nprime one\nprime two\nprime three\nbob one\nbob two\n");
   git(dir, "add -A");
   git(dir, `commit -qm "c3 bob file"`, as("Bob", "bob@example.com", at("2026-03-03T10:00:00+00:00")));
+  // The side branch adds ONLY her file — the merge is CLEAN by construction
+  // (a conflict-expecting fixture broke on a CI runner's git: the merge
+  // failed to START, the catch swallowed it, and c5 landed single-parent —
+  // see check-activity-stats.mjs's note, run 40800106017).
   git(dir, "checkout -q -b side HEAD~2");
-  writeFileSync(join(dir, "README.md"), "cf-gitea\nactivity fixture\nroot\nside change\n");
   writeFileSync(join(dir, "side.txt"), "s1\ns2\ns3\ns4\ns5\ns6\ns7\n");
   git(dir, "add -A");
   git(dir, `commit -qm "c4 side work"`, as("Carol", "carol@example.com", at("2026-03-04T10:00:00+00:00")));
   git(dir, "checkout -q main");
-  try {
-    execSync(`git -C ${dir} merge --no-ff --no-commit side`, { stdio: "ignore" });
-  } catch {
-    // the README conflict — expected
-  }
-  writeFileSync(
-    join(dir, "README.md"),
-    "cf-gitea\nactivity fixture\nrooted\nprime one\nprime two\nprime three\nbob one\nbob two\nside change\nmerged resolution\n"
-  );
-  git(dir, "add -A");
-  git(dir, `commit -qm "c5 merge side (conflict resolved)"`, as("Alice Prime", "alice@example.com", at("2026-03-05T10:00:00+00:00")));
+  assert(git(dir, "rev-parse --abbrev-ref HEAD") === "main", "fixture drift: not on main before the merge");
+  git(dir, "merge --no-ff --no-commit side"); // CLEAN by construction — nonzero exit = fixture bug
+  assert(git(dir, "rev-parse -q --verify MERGE_HEAD") !== "", "fixture drift: no MERGE_HEAD after the no-commit merge");
+  git(dir, `commit -qm "c5 merge side"`, as("Alice Prime", "alice@example.com", at("2026-03-05T10:00:00+00:00")));
   git(dir, "mv src/a.ts src/a-renamed.ts");
   writeFileSync(join(dir, "src/a-renamed.ts"), "a1\na2\na3\na4\na5\na6\na7\na8\na9\na10\na11\n");
   writeFileSync(join(dir, "src/bob.ts"), "b1\nb2 prime\nb3\nb4\nb5\n");
@@ -457,7 +453,8 @@ await check(3, "merge + full-history, structurally: the merge costs a step but n
   // carol's bucket: c4's diff vs c1 is README +1 and side.txt +7 (8); c7's is
   // binary +0 and bob.ts delete -5 — the +7 PROVES side.txt's lines arrived
   // through carol's OWN commit, never through the merge's tree
-  assertEq(result.contributors["carol@example.com"].weeks[SUN1], { week: SUN1, additions: 8, deletions: 5, commits: 2 });
+  // +7 = side.txt only (the clean-merge fixture dropped the side README edit)
+  assertEq(result.contributors["carol@example.com"].weeks[SUN1], { week: SUN1, additions: 7, deletions: 5, commits: 2 });
   // the merge's own first-parent net change is NONZERO (git-verified) — so
   // "the merge contributed nothing" is the --no-merges exclusion, never a
   // vacuous empty diff

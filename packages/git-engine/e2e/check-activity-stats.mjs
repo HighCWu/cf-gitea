@@ -188,10 +188,15 @@ function buildTimelineFixture() {
   writeFileSync(join(dir, "README.md"), "cf-gitea\nactivity fixture\nrooted\nprime one\nprime two\nprime three\nbob one\nbob two\n");
   git(dir, "add -A");
   git(dir, `commit -qm "c3 bob file"`, as("Bob", "bob@example.com", at("2026-03-03T10:00:00+00:00")));
-  // c4 (Carol, on the SIDE branch off c1 — off the first-parent chain): edits
-  // README (guaranteed merge conflict) and adds her own file
+  // c4 (Carol, on the SIDE branch off c1 — off the first-parent chain): adds
+  // her own file ONLY — the merge must be CLEAN by construction. (The first
+  // draft had both branches edit README to force a conflict; a CI runner's
+  // git then failed to START the merge — caught as "expected conflict", the
+  // fixture silently lost MERGE_HEAD, and c5 landed single-parent, tripping
+  // checks 2/3/5 — observed run 40800106017 while the identical tree passed
+  // 10/10 on the dev box. Content-dependent fixture semantics are gone: a
+  // clean merge cannot fail to start, and MERGE_HEAD is asserted below.)
   git(dir, "checkout -q -b side HEAD~2");
-  writeFileSync(join(dir, "README.md"), "cf-gitea\nactivity fixture\nroot\nside change\n");
   writeFileSync(join(dir, "side.txt"), "s1\ns2\ns3\ns4\ns5\ns6\ns7\n");
   git(dir, "add -A");
   git(dir, `commit -qm "c4 side work"`, as("Carol", "carol@example.com", at("2026-03-04T10:00:00+00:00")));
@@ -201,19 +206,13 @@ function buildTimelineFixture() {
   // The merge legitimately carries side.txt INTO the tip tree — where it
   // still must never reach the fold's file set.
   git(dir, "checkout -q main");
-  let mergeFailed = false;
-  try {
-    execSync(`git -C ${dir} merge --no-ff --no-commit side`, { stdio: "ignore" });
-  } catch {
-    mergeFailed = true; // the README conflict — expected
-  }
-  assert(mergeFailed, "the fixture's merge must conflict (both branches edited README)");
-  writeFileSync(
-    join(dir, "README.md"),
-    "cf-gitea\nactivity fixture\nrooted\nprime one\nprime two\nprime three\nbob one\nbob two\nside change\nmerged resolution\n"
+  assert(git(dir, "rev-parse --abbrev-ref HEAD").trim() === "main", "fixture drift: not on main before the merge");
+  git(dir, "merge --no-ff --no-commit side"); // CLEAN by construction — a nonzero exit here is a fixture bug, not an arm
+  assert(
+    git(dir, "rev-parse -q --verify MERGE_HEAD").trim() !== "",
+    "fixture drift: the no-commit merge is not in progress (no MERGE_HEAD)",
   );
-  git(dir, "add -A");
-  git(dir, `commit -qm "c5 merge side (conflict resolved)"`, as("Alice Prime", "alice@example.com", at("2026-03-05T10:00:00+00:00")));
+  git(dir, `commit -qm "c5 merge side"`, as("Alice Prime", "alice@example.com", at("2026-03-05T10:00:00+00:00")));
   // c6 (Bob again, SAME bob email in upper case): renames a.ts AND edits the
   // content (numstat --no-renames: full delete + full add), edits bob.ts
   git(dir, "mv src/a.ts src/a-renamed.ts");

@@ -548,7 +548,10 @@ async function keyIdentity(material: RsaKeyMaterial): Promise<{ keyId: string; c
  *  RSA sign + fetch crosses the boundary (observed: 2-of-4 full runs, and
  *  once solo). Sleep past the boundary when <5s remain — the whole
  *  keygen-signed-fetch chain then has >=55s of slack. Deterministic, no
- *  product change (the route is upstream-faithful, gpg_key_verify.go:74-86). */
+ *  product change (the route is upstream-faithful, gpg_key_verify.go:74-86).
+ *  The guard cannot cover a stall that crosses TWO boundaries mid-span (the
+ *  route's fallback absorbs only one flip) — the 201-expecting sites take
+ *  the flip-conditioned retry in sendGpgVerify for that residual. */
 async function avoidMinuteBoundary(): Promise<void> {
   const intoMinute = Date.now() % 60_000;
   if (intoMinute > 55_000) await new Promise((r) => setTimeout(r, 60_000 - intoMinute + 100));
@@ -653,6 +656,48 @@ async function seedGpgKey(
   return keyId;
 }
 
+/** The straddle-hardened verify send for the 201-expecting tests: derive the
+ *  token, sign it, POST, and — ONLY on a 422 whose minute has moved past the
+ *  signed candidate's — re-derive, re-sign and send once more.
+ *
+ *  Why: the route answers 201 iff the signed candidate encodes its OWN minute
+ *  or the previous one (it tries token = V(+1) then lastToken = V(0), the
+ *  upstream dual-window fallback, gpg_key.go:216-219 — ported at
+ *  account-aggregates.ts:1330). A candidate therefore misses exactly when the
+ *  wall clock crosses TWO minute boundaries inside the test's tokenFor →
+ *  armoredSignature → fetch span; one flip is absorbed by the fallback.
+ *  Observed 2026-10-29 (full-suite composite, run 40798026988's window): the
+ *  SUBKEY test 422'd and then passed 30/30 on rerun — a >60s stall of the
+ *  normally-millisecond-scale span under composite load, not a product
+ *  defect (a data-dependent 422 cannot self-heal on rerun; upstream carries
+ *  the identical client-side race). avoidMinuteBoundary gives the span >=55s
+ *  of slack but cannot guard a stall that happens mid-fetch; the bounded
+ *  retry mirrors what a real client does on invalid-token-signature (fetch a
+ *  fresh token, re-sign). It cannot mask a genuine 422: the flip check
+ *  re-derives the token first, so a same-minute 422 (wrong payload, wrong
+ *  key, route regression) is returned as-is and fails the test honestly, and
+ *  even a retried genuine failure still answers 422. The 422/404-expecting
+ *  tests never take this path — their outcomes are minute-independent (see
+ *  their in-test comments). */
+async function sendGpgVerify(owner: Seeded, keyId: string, material: RsaKeyMaterial): Promise<Response> {
+  await avoidMinuteBoundary();
+  let candidate = await tokenFor(owner);
+  let res = await router()(
+    "/user/gpg_key_verify",
+    jsonAuth(token(owner), { key_id: keyId, armored_signature: await armoredSignature(material, candidate) }),
+  );
+  if (res.status === 422 && (await tokenFor(owner)) !== candidate) {
+    // The minute left the signed candidate's window — the two-flip straddle
+    // from the incident above. Re-sign against the fresh minute, send once.
+    candidate = await tokenFor(owner);
+    res = await router()(
+      "/user/gpg_key_verify",
+      jsonAuth(token(owner), { key_id: keyId, armored_signature: await armoredSignature(material, candidate) }),
+    );
+  }
+  return res;
+}
+
 describe("POST /user/gpg_key_verify (userVerifyGPGKey)", () => {
   it("marks a key verified with a valid RSA signature over the token (201)", async () => {
     let material = await generateRsa();
@@ -663,13 +708,8 @@ describe("POST /user/gpg_key_verify (userVerifyGPGKey)", () => {
     }
     await seedGpgKey(owner.id, material);
     const row = (await drizzle(env.DB).select().from(gpgKeys).where(eq(gpgKeys.keyId, keyId)).all())[0]!;
-    await avoidMinuteBoundary();
-    const candidate = await tokenFor(owner);
-
-    const res = await router()(
-      "/user/gpg_key_verify",
-      jsonAuth(token(owner), { key_id: keyId, armored_signature: await armoredSignature(material, candidate) }),
-    );
+    // Straddle-hardened send (see sendGpgVerify for the 2026-10-29 incident).
+    const res = await sendGpgVerify(owner, keyId, material);
     expect(res.status).toBe(201);
     const body = await res.json<Record<string, unknown>>();
     expect(body.key_id).toBe(keyId);
@@ -688,13 +728,9 @@ describe("POST /user/gpg_key_verify (userVerifyGPGKey)", () => {
     const sub = await generateRsa();
     await seedGpgKey(owner.id, primary);
     const subKeyId = await seedGpgKey(owner.id, sub, { primaryKeyId: keyId });
-    await avoidMinuteBoundary();
-    const candidate = await tokenFor(owner);
-
-    const res = await router()(
-      "/user/gpg_key_verify",
-      jsonAuth(token(owner), { key_id: keyId, armored_signature: await armoredSignature(sub, candidate) }),
-    );
+    // Signed by the SUBKEY — the incident test (2026-10-29 composite, run
+    // 40798026988's window: 422-then-passed). Straddle-hardened send.
+    const res = await sendGpgVerify(owner, keyId, sub);
     expect(res.status).toBe(201);
     // The primary row flips verified (upstream updates the matched KEY row);
     // the body renders the primary with its subkey list.
@@ -727,6 +763,10 @@ describe("POST /user/gpg_key_verify (userVerifyGPGKey)", () => {
     const impostor = await generateRsa();
     const keyId = await seedGpgKey(owner.id, material);
     const unsigned = await seedGpgKey(owner.id, impostor, { canSign: false });
+    // No straddle retry needed: both asserted outcomes are minute-INDEPENDENT
+    // — the impostor's signature fails verify over EVERY candidate value and
+    // the canSign=false arm answers 422 without any token compare. The guard
+    // stays only as cheap slack.
     await avoidMinuteBoundary();
     const candidate = await tokenFor(owner);
     const send = router();
@@ -769,6 +809,11 @@ describe("POST /user/gpg_key_verify (userVerifyGPGKey)", () => {
     const material = await generateRsa();
     await seedGpgKey(recluse.id, material);
     const send = router();
+    // No straddle retry needed: every arm 404s at the owner-scoped key
+    // lookup, which the route answers BEFORE any token compare
+    // (account-aggregates.ts — the 404 arms precede verifyTokenSignature),
+    // so the clock position cannot change these statuses. The guard stays
+    // only as cheap slack.
     await avoidMinuteBoundary();
     const candidate = await tokenFor(owner);
     const signature = await armoredSignature(material, candidate);
