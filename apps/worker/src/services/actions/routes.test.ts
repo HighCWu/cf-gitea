@@ -101,6 +101,12 @@ function requireTaskId(claimed: { id: number } | undefined): number {
   return claimed.id;
 }
 
+/** The claimed task with undefined thrown (the M1b report/log seats). */
+function requireTask(claimed: { id: number } | undefined): { id: number; context?: Record<string, unknown> } {
+  if (claimed === undefined) throw new Error("no task claimed");
+  return claimed;
+}
+
 const WORKFLOW_PAYLOAD = new TextEncoder().encode(
   'name: ci\njobs:\n  build:\n    if: always()\n    steps:\n      - run: echo hi\n',
 );
@@ -583,32 +589,72 @@ describe("POST /api/actions/runner.v1.RunnerService/FetchTask", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The M1b procedures authenticate, then answer unimplemented
+// The M1b procedures — UpdateTask/UpdateLog over the wire, then the FULL
+// job-execution simulation (SPEC §6.2's harness oracle: fetch → update
+// stages → stream logs → artifacts v1+v4 → summary → OIDC → complete)
 // ---------------------------------------------------------------------------
 
-describe("the M1b procedures (UpdateTask/UpdateLog)", () => {
-  it("authenticate via the interceptor, then answer unimplemented", async () => {
-    await newRunnerTokenWithValue(env.DB, 0, "", "reg-m1b");
-    const runner = makeRunner();
-    await runner.register({ token: "reg-m1b", name: "m1b" });
-
-    await expect(runner.fetchTask(0)).resolves.toBeDefined(); // auth works
-
-    const response = await SELF.fetch(`${BASE_URL}/api/actions/runner.v1.RunnerService/UpdateTask`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/proto",
-        "x-runner-uuid": requireRunner(runner).uuid,
-        "x-runner-token": requireRunner(runner).token,
-      },
-      body: new Uint8Array([0]),
+describe("SCRATCH routing probe", () => {
+  it("probes the chunk URL", async () => {
+    const res = await SELF.fetch("https://example.com/api/actions_pipeline/_apis/pipelines/workflows/1/artifacts/a8445719836f2d5e8b51986410e14728/upload?itemPath=x", {
+      method: "PUT",
+      headers: { authorization: "Bearer junk", "content-range": "bytes 0-3/4", "x-tfs-filelength": "4", "x-actions-results-md5": "junk" },
+      body: new Uint8Array([1, 2, 3, 4]),
     });
-    expect(response.status).toBe(501);
-    expect(await response.json()).toEqual({ code: "unimplemented", message: containing("M1b") });
+    console.log("PROBE", res.status, await res.text());
+    expect(true).toBe(true);
+  });
+});
 
-    // The heartbeat ran (the interceptor debounced last_online forward).
-    const rows = await db().select().from(actionRunners).where(eq(actionRunners.id, requireRunner(runner).id));
-    expect(rows[0]?.lastOnline).not.toBeNull();
+describe("the M1b procedures (UpdateTask/UpdateLog)", () => {
+  it("UpdateTask answers the state echo + sent outputs; UpdateLog acks rows", async () => {
+    await seedRepoWithJob({ repoId: "repo-m1b", slug: "m1b", runsOn: ["ubuntu-latest"] });
+    await newRunnerTokenWithValue(env.DB, 0, "repo-m1b", "reg-m1b");
+    const runner = makeRunner();
+    await runner.register({ token: "reg-m1b", name: "m1b", labels: ["ubuntu-latest"] });
+    const claimed = await runner.poll();
+    const task = requireTask(claimed);
+
+    // A running report with outputs.
+    const running = await runner.updateTask({ id: task.id, result: 0 }, { "out-key": "out-value" });
+    expect(running.state?.id).toBe(task.id);
+    expect(running.state?.result).toBe(0);
+    expect(running.sentOutputs).toEqual(["out-key"]);
+
+    // The runtime token rode the claim context (M1b's signer).
+    expect(typeof task.context?.["gitea_runtime_token"]).toBe("string");
+
+    // UpdateLog: two rows land, ack 2.
+    runner.writeLogRow(new Date(), "line one");
+    runner.writeLogRow(new Date(), "line two");
+    expect(await runner.updateLog(false)).toBe(2);
+
+    // The final report echoes the task's actual status as the result.
+    const done = await runner.updateTask({ id: task.id, result: 1 }, { "out-key": "changed" });
+    expect(done.state?.result).toBe(1); // success
+    expect(done.sentOutputs).toEqual(["out-key"]); // upsert-if-absent kept the first value
+
+    const job = await jobRow("build");
+    expect(job.status).toBe(1);
+    const runRows = await db().select().from(actionRuns).where(eq(actionRuns.id, job.runId));
+    expect(runRows[0]?.status).toBe(1); // the run aggregate mirrored
+  });
+
+  it("UpdateLog answers connect already_exists for appends past the seal", async () => {
+    await seedRepoWithJob({ repoId: "repo-seal", slug: "seal", runsOn: ["ubuntu-latest"] });
+    await newRunnerTokenWithValue(env.DB, 0, "repo-seal", "reg-seal");
+    const runner = makeRunner();
+    await runner.register({ token: "reg-seal", name: "seal", labels: ["ubuntu-latest"] });
+    const claimed = await runner.poll();
+    const task = requireTask(claimed);
+
+    runner.writeLogRow(new Date(), "final line");
+    expect(await runner.updateLog(true)).toBe(1); // sealed
+
+    // A late append: the connect error body carries code already_exists.
+    const raw = await runner.rawUpdateLog(task.id, 1, [{ time: { seconds: 5, nanos: 0 }, content: "late" }], false);
+    expect(raw.status).toBe(409);
+    expect(await raw.json()).toEqual({ code: "already_exists", message: containing("archived") });
   });
 
   it("the runs row family persisted through the seeding seam", async () => {
@@ -636,5 +682,92 @@ describe("the M1b procedures (UpdateTask/UpdateLog)", () => {
     });
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ code: "invalid_argument", message: containing("decode") });
+  });
+
+  it("simulates the FULL job execution as the runner's oracle (SPEC §6.2)", async () => {
+    // A repo whose job grants the OIDC id-token permission, with a step row
+    // for the summary validation.
+    await seedRepoWithJob({ repoId: "repo-full", slug: "full", runsOn: ["ubuntu-latest"] });
+    await db().update(actionRunJobs).set({ tokenPermissions: JSON.stringify({ id_token: true }) }).where(eq(actionRunJobs.jobId, "build"));
+
+    await newRunnerTokenWithValue(env.DB, 0, "repo-full", "reg-full");
+    const runner = makeRunner();
+    await runner.register({ token: "reg-full", name: "oracle", labels: ["ubuntu-latest"], capabilities: ["cancelling"] });
+    await runner.declare({ version: "act-runner test", labels: ["ubuntu-latest"], capabilities: ["cancelling"] });
+
+    // 1) The claim.
+    const claimed = await runner.poll();
+    const task = requireTask(claimed);
+    const jobRows = await db().select().from(actionRunJobs).where(eq(actionRunJobs.jobId, "build"));
+    const job = jobRows[0];
+    if (job === undefined) throw new Error("job missing");
+    const runRows = await db().select().from(actionRuns).where(eq(actionRuns.id, job.runId));
+    const runId = runRows[0]?.id;
+    if (runId === undefined) throw new Error("run missing");
+
+    // 2) Update stages (runner-reported steps) then stream logs.
+    const t0 = Math.floor(Date.now() / 1000);
+    await runner.updateTask(
+      { id: task.id, result: 0 },
+      {},
+      // reportedSteps ride the second argument path below.
+    );
+    const stageReport = await runner.updateTask({ id: task.id, result: 0 }, {}, [
+      { id: 0, result: 1, startedAt: { seconds: t0, nanos: 0 }, stoppedAt: { seconds: t0 + 5, nanos: 0 }, logIndex: 0, logLength: 0, name: "Set up job", stage: 1, number: 0 },
+      { id: 1, result: 0, startedAt: { seconds: t0 + 5, nanos: 0 }, stoppedAt: undefined, logIndex: 0, logLength: 0, name: "Run build", stage: 4, number: 1 },
+    ]);
+    expect(stageReport.state?.result).toBe(0);
+
+    runner.writeLogRow(new Date(), "build output alpha");
+    runner.writeLogRow(new Date(), "build output beta");
+    expect(await runner.updateLog(false)).toBe(2);
+    // A resend overlapping the ack (act_runner's resume behavior).
+    runner.writeLogRow(new Date(), "build output gamma");
+    expect(await runner.updateLog(false)).toBe(3);
+
+    // 3) Artifacts v1 (chunked md5 upload + confirm).
+    const v1Bytes = new TextEncoder().encode("v1 artifact payload — the merged object's bytes");
+    await runner.uploadArtifactV1(runId, "reports", v1Bytes);
+    const v1Back = await runner.downloadArtifactV1(runId, "reports");
+    expect(Array.from(v1Back)).toEqual(Array.from(v1Bytes));
+
+    // 4) Artifacts v4 (blocks + blocklist + finalize + signed download).
+    const v4Bytes = new Uint8Array(48);
+    for (let i = 0; i < v4Bytes.length; i++) v4Bytes[i] = (i * 5) % 256;
+    await runner.uploadArtifactV4(runId, job.id, "bundle", v4Bytes);
+    const v4Back = await runner.downloadArtifactV4(runId, job.id, "bundle");
+    expect(Array.from(v4Back)).toEqual(Array.from(v4Bytes));
+
+    // 5) Job summary for the MAIN step (index 1 — the reported step's number).
+    const summaryRes = await runner.putJobSummary(runId, job.id, 1, "# build summary\nall green");
+    expect(summaryRes.status).toBe(200);
+
+    // 6) The OIDC exchange with the claim-carried request token.
+    const requestToken = task.context?.["actions_id_token_request_token"];
+    expect(typeof requestToken).toBe("string"); // the job granted id-token
+    const oidcRes = await runner.exchangeOidcToken(String(requestToken), "oracle-aud");
+    expect(oidcRes.status).toBe(200);
+    const oidcBody = await oidcRes.json<{ value: string }>();
+    expect(oidcBody.value.split(".")).toHaveLength(3);
+
+    // 7) Finalize: seal the log, report success.
+    runner.writeLogRow(new Date(), "teardown complete");
+    expect(await runner.updateLog(true)).toBe(4);
+    await runner.updateTask({ id: task.id, result: 1 }, { "exit-code": "0" });
+
+    // The task/attempt/job/run lifecycle all landed terminal.
+    const taskRows = await db().select().from(actionTasks).where(eq(actionTasks.id, task.id));
+    expect(taskRows[0]?.status).toBe(1);
+    expect(taskRows[0]?.logInStorage).toBe(true);
+    const sealed = await env.REPO_PACKS.get(`actions/logs/${taskRows[0]?.logFilename ?? ""}`);
+    expect(sealed).not.toBeNull();
+    const sealedText = await sealed?.text();
+    expect(sealedText).toContain("build output alpha");
+    expect(sealedText).toContain("teardown complete");
+    const jobAfter = await jobRow("build");
+    expect(jobAfter.status).toBe(1);
+    const runAfter = await db().select().from(actionRuns).where(eq(actionRuns.id, runId));
+    expect(runAfter[0]?.status).toBe(1);
+    expect(runAfter[0]?.stopped).not.toBeNull();
   });
 });

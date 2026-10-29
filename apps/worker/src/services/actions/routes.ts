@@ -19,9 +19,8 @@
  * verified constant-time against the salted digest; heartbeats are
  * debounced (last_online 30 s, last_active 5 s and only on the Update*
  * family — the "major source of DB load" rule). Plain errors reach runners
- * as connect CodeUnknown with their message (withErrorMessages).
- * UpdateTask/UpdateLog are M1b: they authenticate, then answer
- * `unimplemented`.
+ * as connect CodeUnknown with their message (withErrorMessages). The OIDC
+ * issuer group (actions.go:16-20) mounts beside the RPC family here.
  */
 
 import { Hono } from "hono";
@@ -34,6 +33,8 @@ import {
   X_GITEA_ACTIONS_CAPABILITIES_HEADER,
 } from "./register";
 import { fetchTask } from "./dispatch";
+import { createOidcRouter } from "./oidc";
+import { updateLog, updateTask, ConnectLikeAlreadyExists } from "./update";
 import {
   getRunnerByUUID,
   shouldPersistLastActive,
@@ -47,14 +48,20 @@ import {
   decodeFetchTaskRequest,
   decodePingRequest,
   decodeRegisterRequest,
+  decodeUpdateLogRequest,
+  decodeUpdateTaskRequest,
   encodeDeclareResponse,
   encodeFetchTaskResponse,
   encodePingResponse,
   encodeRegisterResponse,
+  encodeUpdateLogResponse,
+  encodeUpdateTaskResponse,
   type DeclareRequest,
   type FetchTaskRequest,
   type PingRequest,
   type RegisterRequest,
+  type UpdateLogRequest,
+  type UpdateTaskRequest,
 } from "./wire";
 
 export const RUNNER_SERVICE_NAME = "runner.v1.RunnerService";
@@ -290,6 +297,9 @@ export function createActionsRouter(): Hono<{ Bindings: Env; Variables: ActionsV
   // JSON error body.
   r.onError((err, c) => connectError(c, err));
 
+  // -- the OIDC group (actions.go:16-20, oidc.ts) ---------------------------
+  r.route("/oidc", createOidcRouter());
+
   // -- ping.v1.PingService (ping/ping.go:31-42) -----------------------------
   r.post(
     `/${PING_SERVICE_NAME}/Ping`,
@@ -382,7 +392,7 @@ export function createActionsRouter(): Hono<{ Bindings: Env; Variables: ActionsV
       encodeFetchTaskResponse,
       async (req: FetchTaskRequest, c) => {
         const runner = runnerOf(c);
-        const result = await fetchTask(c.env.DB, runner, req.tasksVersion, appUrlOf(c));
+        const result = await fetchTask(c.env, c.env.DB, runner, req.tasksVersion, appUrlOf(c));
         return {
           task: result.task,
           tasksVersion: result.tasksVersion,
@@ -392,15 +402,54 @@ export function createActionsRouter(): Hono<{ Bindings: Env; Variables: ActionsV
     ),
   );
 
-  // UpdateTask / UpdateLog authenticate, then answer unimplemented (M1b,
-  // SPEC §7) — the interceptor still runs (heartbeats included).
-  for (const method of ["UpdateTask", "UpdateLog"]) {
-    r.post(`/${RUNNER_SERVICE_NAME}/${method}`, withRunner(), (c) =>
-      c.json({ code: "unimplemented", message: "UpdateTask lands with SPEC-0012 M1b" }, 501, {
-        "content-type": "application/json",
-      }),
-    );
-  }
+  // UpdateTask / UpdateLog (runner.go:220-359, M1b) — real ingestion now.
+  // UpdateTask: the state machine + outputs + sentOutputs. UpdateLog: the
+  // ack protocol; the archive-guard answers connect's AlreadyExists.
+  r.post(
+    `/${RUNNER_SERVICE_NAME}/UpdateTask`,
+    withRunner(),
+    procedure(
+      decodeUpdateTaskRequest,
+      encodeUpdateTaskResponse,
+      async (req: UpdateTaskRequest, c) => {
+        const runner = runnerOf(c);
+        const outcome = await updateTask(c.env.DB, runner.id, req);
+        return {
+          state: {
+            id: outcome.stateId,
+            result: outcome.result,
+            startedAt: undefined,
+            stoppedAt: undefined,
+            steps: [],
+            reportedSteps: [],
+          },
+          sentOutputs: outcome.sentOutputs,
+        };
+      },
+      undefined,
+    ),
+  );
+
+  r.post(
+    `/${RUNNER_SERVICE_NAME}/UpdateLog`,
+    withRunner(),
+    procedure(
+      decodeUpdateLogRequest,
+      encodeUpdateLogResponse,
+      async (req: UpdateLogRequest, c) => {
+        const runner = runnerOf(c);
+        try {
+          return await updateLog(c.env, runner.id, req);
+        } catch (err) {
+          if (err instanceof ConnectLikeAlreadyExists) {
+            throw new ConnectError("already_exists", err.message);
+          }
+          throw err;
+        }
+      },
+      undefined,
+    ),
+  );
 
   return r;
 }

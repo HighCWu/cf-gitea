@@ -146,8 +146,8 @@ describe("the pick limiter (TryPickTask, task.go:31-53)", () => {
     // Hold every slot: each invocation runs its synchronous prologue
     // (acquiring a slot) before its first D1 await, so 16 un-awaited calls
     // pin the semaphore and the 17th answers throttled WITHOUT touching D1.
-    const holding = Array.from({ length: 16 }, () => tryPickTask(env.DB, seedInfo.runner));
-    const throttled = await tryPickTask(env.DB, seedInfo.runner);
+    const holding = Array.from({ length: 16 }, () => tryPickTask(env, env.DB, seedInfo.runner));
+    const throttled = await tryPickTask(env, env.DB, seedInfo.runner);
     expect(throttled).toEqual({ task: null, throttled: true });
     // Drain the holders (they claim the job or find nothing — either way no
     // throw).
@@ -158,11 +158,11 @@ describe("the pick limiter (TryPickTask, task.go:31-53)", () => {
     const seedInfo = await seed();
     // Bootstrap the scope so fetchTask proceeds to the pick (version mismatch).
     await increaseTaskVersion(env.DB, seedInfo.ownerId, seedInfo.repoId);
-    const holding = Array.from({ length: 16 }, () => tryPickTask(env.DB, seedInfo.runner));
+    const holding = Array.from({ length: 16 }, () => tryPickTask(env, env.DB, seedInfo.runner));
     // The runner's stale version (0) differs from latest (1) → pick attempt →
     // throttled → the response carries the runner's OWN stale version so it
     // retries on its next poll (runner.go:202-207).
-    const response = await fetchTask(env.DB, seedInfo.runner, 0, "https://example.com/");
+    const response = await fetchTask(env, env.DB, seedInfo.runner, 0, "https://example.com/");
     expect(response.task).toBeUndefined();
     expect(response.tasksVersion).toBe(0);
     await Promise.all(holding);
@@ -172,7 +172,7 @@ describe("the pick limiter (TryPickTask, task.go:31-53)", () => {
 describe("the claim + payload path", () => {
   it("claims and assembles the full Task payload with the pull-request context", async () => {
     const seedInfo = await seed();
-    const response = await fetchTask(env.DB, seedInfo.runner, 0, "https://example.com/");
+    const response = await fetchTask(env, env.DB, seedInfo.runner, 0, "https://example.com/");
     const task = response.task;
     expect(task).toBeDefined();
     const claimed = task as NonNullable<typeof task>;
@@ -197,7 +197,7 @@ describe("the claim + payload path", () => {
       description: "",
       createdAt: now,
     });
-    const response = await fetchTask(env.DB, seedInfo.runner, 0, "https://example.com/");
+    const response = await fetchTask(env, env.DB, seedInfo.runner, 0, "https://example.com/");
     const task = response.task;
     expect(task).toBeDefined();
     expect(Object.keys((task as NonNullable<typeof task>).secrets).sort()).toEqual([
@@ -213,7 +213,7 @@ describe("the claim + payload path", () => {
     const { actionRuns } = await import("../../db/schema");
     await db().delete(actionRuns);
 
-    await expect(fetchTask(env.DB, seedInfo.runner, 0, "")).rejects.toThrow(/vanished/);
+    await expect(fetchTask(env, env.DB, seedInfo.runner, 0, "")).rejects.toThrow(/vanished/);
 
     const job = (await db().select().from(actionRunJobs).where(eq(actionRunJobs.jobId, "build")))[0];
     expect(job?.status).toBe(5); // back to waiting
@@ -245,7 +245,7 @@ describe("the claim + payload path", () => {
     });
 
     // Claim `build` via the runner.
-    const first = await fetchTask(env.DB, seedInfo.runner, 0, "");
+    const first = await fetchTask(env, env.DB, seedInfo.runner, 0, "");
     const buildTask = first.task;
     expect(buildTask).toBeDefined();
 

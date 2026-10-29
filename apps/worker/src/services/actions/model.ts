@@ -480,6 +480,8 @@ export interface InsertActionJobInput {
   needs?: string[];
   runsOn?: string[];
   workflowPayload: Uint8Array;
+  /** The ActionsTokenPermissions JSON (the OIDC id-token gate's row). */
+  tokenPermissions?: string | null;
 }
 
 /**
@@ -541,30 +543,34 @@ export async function insertActionRun(
     .set({ latestAttemptId: attemptRow.id, updated: now })
     .where(eq(actionRuns.id, runRow.id));
 
-  const jobRows =
-    jobs.length > 0
-      ? await db
-          .insert(actionRunJobs)
-          .values(
-            jobs.map((j) => ({
-              runId: runRow.id,
-              repoId: run.repoId,
-              ownerId: run.ownerId,
-              commitSha: run.commitSha,
-              name: j.name ?? j.jobId,
-              attempt: 1,
-              workflowPayload: j.workflowPayload,
-              jobId: j.jobId,
-              needs: JSON.stringify(j.needs ?? []),
-              runsOn: JSON.stringify(j.runsOn ?? []),
-              status: ACTION_STATUS_WAITING,
-              runAttemptId: attemptRow.id,
-              created: now,
-              updated: now,
-            })),
-          )
-          .returning()
-      : [];
+  // The job rows are ~40 columns — D1's 100-bind-per-query cap fits TWO
+  // rows per statement (the repo's chunking idiom), so multi-job inserts
+  // chunk (a lone-job insert — the M1a/M1b hot path — stays one statement).
+  const jobValues = jobs.map((j) => ({
+    runId: runRow.id,
+    repoId: run.repoId,
+    ownerId: run.ownerId,
+    commitSha: run.commitSha,
+    name: j.name ?? j.jobId,
+    attempt: 1,
+    workflowPayload: j.workflowPayload,
+    jobId: j.jobId,
+    needs: JSON.stringify(j.needs ?? []),
+    runsOn: JSON.stringify(j.runsOn ?? []),
+    tokenPermissions: j.tokenPermissions ?? null,
+    status: ACTION_STATUS_WAITING,
+    runAttemptId: attemptRow.id,
+    created: now,
+    updated: now,
+  }));
+  const JOB_CHUNK = 2;
+  const jobRows: RunJobRow[] = [];
+  for (let i = 0; i < jobValues.length; i += JOB_CHUNK) {
+    const chunk = jobValues.slice(i, i + JOB_CHUNK);
+    if (chunk.length === 0) continue;
+    const rows = await db.insert(actionRunJobs).values(chunk).returning();
+    jobRows.push(...rows);
+  }
 
   const hasDispatchableWaiting = jobRows.some((j) => !j.isReusableCaller);
   if (hasDispatchableWaiting) {
@@ -574,12 +580,14 @@ export async function insertActionRun(
   return { run: runRow, attempt: attemptRow, jobRows };
 }
 
-/** The repositories row the dispatch joins through (full name, owner). */
+/** The repositories row the dispatch joins through (full name, owner,
+ *  visibility — the OIDC claim's repository_visibility leg). */
 export interface RepoRecord {
   id: string;
   ownerNamespace: string;
   ownerId: number | null;
   slug: string;
+  visibility: string;
 }
 
 export async function getRepoById(d1: D1, id: string): Promise<RepoRecord | null> {
@@ -590,6 +598,7 @@ export async function getRepoById(d1: D1, id: string): Promise<RepoRecord | null
       ownerNamespace: repositories.ownerNamespace,
       ownerId: repositories.ownerId,
       slug: repositories.slug,
+      visibility: repositories.visibility,
     })
     .from(repositories)
     .where(eq(repositories.id, id))

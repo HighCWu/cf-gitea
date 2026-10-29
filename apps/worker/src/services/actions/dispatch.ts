@@ -50,6 +50,8 @@ import {
   type TaskRow,
   type TaskWithToken,
 } from "./model";
+import { taskAllowsOidcToken } from "./oidc";
+import { createAuthorizationToken, oidcIssuer, signActionsClaims } from "./secrets";
 import type { Task, TaskNeed } from "./wire";
 
 /** The D1/database binding spelling shared by the service functions. */
@@ -108,6 +110,7 @@ function releasePickSlot(): void {
  * the runner retries on its next poll (runner.go:202-207).
  */
 export async function tryPickTask(
+  env: Env,
   d1: D1,
   runner: RunnerRow,
   appUrl = "",
@@ -116,7 +119,7 @@ export async function tryPickTask(
     return { task: null, throttled: true };
   }
   try {
-    const task = await pickTask(d1, runner, appUrl);
+    const task = await pickTask(env, d1, runner, appUrl);
     return { task, throttled: false };
   } finally {
     releasePickSlot();
@@ -129,6 +132,7 @@ export async function tryPickTask(
  * server always attempts a pick on mismatch.
  */
 export async function fetchTask(
+  env: Env,
   d1: D1,
   runner: RunnerRow,
   runnerTasksVersion: number,
@@ -151,7 +155,7 @@ export async function fetchTask(
     if (freshRunner === undefined) {
       return { task: undefined, tasksVersion: latestVersion };
     }
-    const picked = await tryPickTask(d1, freshRunner, appUrl);
+    const picked = await tryPickTask(env, d1, freshRunner, appUrl);
     if (picked.throttled) {
       // Keep the runner's STALE version so it retries on its next poll
       // instead of sleeping to the next bump (runner.go:202-207).
@@ -167,7 +171,7 @@ export async function fetchTask(
 // PickTask (services/actions/task.go:66-131)
 // ---------------------------------------------------------------------------
 
-async function pickTask(d1: D1, runner: RunnerRow, appUrl: string): Promise<Task | null> {
+async function pickTask(env: Env, d1: D1, runner: RunnerRow, appUrl: string): Promise<Task | null> {
   if (runner.isDisabled) {
     return null;
   }
@@ -198,7 +202,7 @@ async function pickTask(d1: D1, runner: RunnerRow, appUrl: string): Promise<Task
   }
 
   try {
-    return await buildRunnerTask(d1, claimed, appUrl);
+    return await buildRunnerTask(env, d1, claimed, appUrl);
   } catch (err) {
     // The job was claimed but the payload failed: release the claim so the
     // job returns to the waiting queue (task.go:108-112, ReleaseTaskForRunner).
@@ -313,7 +317,7 @@ interface ClaimContext {
  * context, secrets, vars, needs}. Assembly failures propagate so the caller
  * releases the claim.
  */
-async function buildRunnerTask(d1: D1, claimed: ClaimedTask, appUrl: string): Promise<Task> {
+async function buildRunnerTask(env: Env, d1: D1, claimed: ClaimedTask, appUrl: string): Promise<Task> {
   const db = drizzle(d1);
   const jobRows = await db.select().from(actionRunJobs).where(eq(actionRunJobs.id, claimed.jobId)).limit(1);
   const job = jobRows[0];
@@ -333,7 +337,7 @@ async function buildRunnerTask(d1: D1, claimed: ClaimedTask, appUrl: string): Pr
     getSecretsOfTask(d1, ctx),
     getVariablesOfRun(d1, ctx),
     findTaskNeeds(d1, job),
-    generateTaskContext(d1, appUrl, ctx),
+    generateTaskContext(env, d1, appUrl, ctx),
   ]);
 
   return {
@@ -365,7 +369,7 @@ function refParts(ref: string): { shortName: string; refType: string } {
   return { shortName: ref, refType: "" };
 }
 
-async function generateTaskContext(d1: D1, appUrl: string, ctx: ClaimContext): Promise<Record<string, unknown>> {
+async function generateTaskContext(env: Env, d1: D1, appUrl: string, ctx: ClaimContext): Promise<Record<string, unknown>> {
   const { task, job, run, repo } = ctx;
   const ownerNamespace = repo?.ownerNamespace ?? "";
   const slug = repo?.slug ?? "";
@@ -403,7 +407,7 @@ async function generateTaskContext(d1: D1, appUrl: string, ctx: ClaimContext): P
   const triggerUser =
     run.triggerUserId > 0 ? await getUserById(d1, run.triggerUserId) : null;
 
-  return {
+  const out: Record<string, unknown> = {
     // standard contexts (context.go:76-110)
     action: "",
     action_path: "",
@@ -450,9 +454,23 @@ async function generateTaskContext(d1: D1, appUrl: string, ctx: ClaimContext): P
 
     // task-scoped additions (task.go:199-212)
     token: task.token,
-    // STAGED: gitea_runtime_token + actions_id_token_request_* ride M1b's
-    // HS256 signer (§4.4).
+    gitea_runtime_token: await createAuthorizationToken(env, task.id, run.id, job.id),
+    // The OIDC request pair rides the job's stored token_permissions JSON
+    // (taskAllowsOidcToken, oidc.ts): null in v1 denies — upstream's first
+    // branch (services/actions/oidc.go:115-119).
   };
+  if (taskAllowsOidcToken(job)) {
+    const requestToken = await signActionsClaims(env, {
+      scp: "Actions.IDTokenRequest",
+      ac: "",
+      taskId: task.id,
+      runId: 0,
+      jobId: 0,
+    });
+    out["actions_id_token_request_url"] = `${oidcIssuer(appUrl)}/token?`; // actions/core appends "&audience=..."
+    out["actions_id_token_request_token"] = requestToken;
+  }
+  return out;
 }
 
 /**

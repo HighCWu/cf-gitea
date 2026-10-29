@@ -11,6 +11,8 @@ import { createApiRouter } from "./api/router";
 import { createPackagesProtocolRouter } from "./api/routes/packages";
 import { createEcosystemProtocolRouter } from "./api/routes/packages-protocols";
 import { createActionsRouter } from "./services/actions/routes";
+import { createArtifactsV1Router } from "./services/actions/artifacts-v1";
+import { ARTIFACT_V4_ROUTE_BASE, createArtifactsV4Router } from "./services/actions/artifacts-v4";
 import { authorize } from "./git-http/authorize";
 import { gitHttpGate } from "./git-http/gate";
 import { handleRepoTasks } from "./repos/purge";
@@ -211,9 +213,20 @@ app.route("/api/packages", createEcosystemProtocolRouter());
 // (upstream actions.go:22-26), with the runner interceptor living inside the
 // sub-app (x-runner-uuid/token auth + debounced heartbeats). No resolveAuth
 // mount: the runner protocol's credential model is its own (registration
-// tokens + runner polling tokens, NOT /api/v1 tokens). UpdateTask/UpdateLog
-// authenticate, then answer unimplemented until M1b.
+// tokens + runner polling tokens, NOT /api/v1 tokens). M1b adds the OIDC
+// issuer group (/api/actions/oidc — actions.go:16-20) inside the same sub-app.
 app.route("/api/actions", createActionsRouter());
+
+// /api/actions_pipeline (SPEC-0012 §2.1/§2.4, M1b): the artifacts-v1 family
+// + job summaries (init.go:203-204 — upstream's own "only artifact is used
+// for now" note rides the same mount). The Bearer runtime-token gate lives
+// inside the sub-app.
+app.route("/api/actions_pipeline", createArtifactsV1Router());
+
+// /twirp/github.actions.results.api.v1.ArtifactService (SPEC-0012 §2.5, M1b):
+// the artifacts-v4 family (init.go:205-206). Authenticated twirp posts +
+// HMAC-signed unauthenticated upload/download, all inside the sub-app.
+app.route(ARTIFACT_V4_ROUTE_BASE, createArtifactsV4Router());
 
 // Avatar serving (web mux at the pin — routers/web/base.go): mounted BEFORE
 // uiRouter so its literal /avatar, /avatars and /user/avatar routes always
@@ -275,8 +288,16 @@ export default {
     // Attachments carve-out (web.go:912 — the site-level /attachments/:uuid
     // download route): never repo-scoped, never the engine's.
     const isAttachmentServing = segments[0] === "attachments";
+    // "twirp" joins "api" in Hono-land: the artifacts-v4 mount (SPEC-0012
+    // §2.1, init.go:205-206) lives at /twirp/github.actions.results.api.v1.
+    // ArtifactService and is never repo-scoped.
     const isRepoScoped =
-      segments.length >= 2 && segments[1] !== "" && segments[0] !== "api" && !isAvatarServing && !isAttachmentServing;
+      segments.length >= 2 &&
+      segments[1] !== "" &&
+      segments[0] !== "api" &&
+      segments[0] !== "twirp" &&
+      !isAvatarServing &&
+      !isAttachmentServing;
     if (isRepoScoped) {
       // All methods for the UI's write families (new/edit/delete file,
       // new-issue, comments, settings, milestones — waves 4-8 are POSTs on
