@@ -421,8 +421,13 @@ describe("the secrets page DOM (repo/settings/actions.tmpl PageType secrets + sh
     expect(html).toContain('href="/alice/demo/settings"'); // the landed settings tabs stay linked
     expect(html).toContain('href="/alice/demo/settings/hooks"');
     expect(html).toContain('href="/alice/demo/settings/lfs"');
-    expect(html).not.toContain("settings/actions/runners"); // the unlanded sub-items render nothing
-    expect(html).not.toContain("settings/actions/general");
+    expect(html).not.toContain("settings/actions/runners"); // the unlanded sub-item renders nothing
+    // The General sub-item is lit by the census C9 mount
+    // (pages/repo-settings-actions-general.tsx) — upstream keeps it
+    // UNCONDITIONAL inside the Actions disclosure (navbar.tmpl:43-46; the
+    // disabled unit's re-entry), so it renders on these enabled pages too,
+    // inactive while Secrets is.
+    expect(html).toContain('<a class="item" href="/alice/demo/settings/actions/general">General</a>');
     // Audit stays LAST in upstream's menu order (navbar.tmpl:60-62 — after
     // the Actions details block).
     const at = (s: string) => html.indexOf(s);

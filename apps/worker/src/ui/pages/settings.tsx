@@ -258,6 +258,7 @@ import { tagProtectionLocale } from "./repo-settings-tags";
 import { wikiSettingsLocale } from "./repo-settings-wiki";
 import { repoSettingsLfsLocale } from "./repo-settings-lfs";
 import { repoSettingsActionsLocale } from "./repo-settings-actions-secrets-variables";
+import { repoSettingsActionsGeneralLocale } from "./repo-settings-actions-general";
 import { settingsAuditLogsLocale } from "./settings-audit-logs";
 
 /** Page chrome text (component-local, the issuesLocale pattern — locale.ts
@@ -559,6 +560,7 @@ export function SettingsNav(props: {
     | "mirror"
     | "wiki"
     | "audit" // pages/settings-audit-logs.tsx (the census R13 arm)
+    | "general" // pages/repo-settings-actions-general.tsx (the census C9 arm)
     | "secrets" // pages/repo-settings-actions-secrets-variables.tsx (the census C8 arm)
     | "variables"; // pages/repo-settings-actions-secrets-variables.tsx (the census C8 arm)
   /** The repo row, arming the conditional Public Access item (navbar.tmpl:
@@ -572,12 +574,18 @@ export function SettingsNav(props: {
   /** The repo-unit arm of navbar.tmpl:47's
    *  `{{if and .EnableActions (.Permission.CanRead Actions)}}` — the
    *  caller's `repo_settings.has_actions` read (the instance flag is
-   *  vacuous here): the Actions <details> with the landed Secrets +
-   *  Variables sub-items (the census C8 arm) renders only while the unit
-   *  is enabled. Reduced like the conditional Public Access item: call
-   *  sites that cannot evaluate it render the reduced nav without the
-   *  block; the actions pages pass `true` behind their MustEnableActions
-   *  route gate. */
+   *  vacuous here): the Actions <details> with the landed General (the
+   *  census C9 arm) + Secrets + Variables sub-items renders while the unit
+   *  is enabled, the runners/secrets/variables trio inside it riding this
+   *  same flag (navbar.tmpl:47's conditional — the General item is
+   *  UNCONDITIONAL upstream, the disabled unit's re-entry, since
+   *  web.go:1262-1265 mounts the general group outside MustEnableActions).
+   *  Reduced like the conditional Public Access item: call sites that
+   *  cannot evaluate it render the reduced nav without the block; the
+   *  gated actions pages (secrets/variables) pass `true` behind their
+   *  MustEnableActions route gate — EXCEPT the general page, whose route is
+   *  unit-gate-free upstream and whose `active: "general"` arm renders the
+   *  block with General alone in the disabled posture. */
   hasActions?: boolean;
 }) {
   const showPublicAccess =
@@ -642,29 +650,48 @@ export function SettingsNav(props: {
         </a>
         {/* navbar.tmpl:41-59 — the Actions <details>, between the code-unit
             block and Audit (Audit stays LAST, upstream's menu order). Open
-            while either landed sub-tab renders; the General (:44-46) and
-            Runners (:47-50) sub-items render nothing (no landed pages — the
-            dead-link rule). The whole block rides the caller's hasActions
-            read of navbar.tmpl:47's unit conditional (the prop doc). */}
-        {props.hasActions === true ? (
+            while any landed sub-tab renders. The General (:44-46) sub-item
+            lit by the pages/repo-settings-actions-general.tsx mount (the
+            census C9 arm); Runners (:47-50) still renders nothing (no
+            landed page — the dead-link rule). Upstream gates ONLY the
+            runners/secrets/variables trio on the unit conditional
+            (navbar.tmpl:47) — the General item is unconditional (the
+            disabled unit's re-entry) — reduced here to: the block rides the
+            caller's hasActions read, PLUS the general page's own arm
+            (active === "general": the toggle page renders with the block
+            and General even while the unit is off, the trio suppressed by
+            the same conditional that gates it upstream). */}
+        {props.hasActions === true || props.active === "general" ? (
           <details
             class="item"
-            open={props.active === "secrets" || props.active === "variables" ? true : undefined}
+            open={
+              props.active === "general" || props.active === "secrets" || props.active === "variables" ? true : undefined
+            }
           >
             <summary>{repoSettingsActionsLocale.actions}</summary>
             <div class="menu">
               <a
-                class={props.active === "secrets" ? "active item" : "item"}
-                href={`${props.repoLink}/settings/actions/secrets`}
+                class={props.active === "general" ? "active item" : "item"}
+                href={`${props.repoLink}/settings/actions/general`}
               >
-                {repoSettingsActionsLocale.secrets_nav}
+                {repoSettingsActionsGeneralLocale.general}
               </a>
-              <a
-                class={props.active === "variables" ? "active item" : "item"}
-                href={`${props.repoLink}/settings/actions/variables`}
-              >
-                {repoSettingsActionsLocale.variables_nav}
-              </a>
+              {props.hasActions === true ? (
+                <>
+                  <a
+                    class={props.active === "secrets" ? "active item" : "item"}
+                    href={`${props.repoLink}/settings/actions/secrets`}
+                  >
+                    {repoSettingsActionsLocale.secrets_nav}
+                  </a>
+                  <a
+                    class={props.active === "variables" ? "active item" : "item"}
+                    href={`${props.repoLink}/settings/actions/variables`}
+                  >
+                    {repoSettingsActionsLocale.variables_nav}
+                  </a>
+                </>
+              ) : null}
             </div>
           </details>
         ) : null}
