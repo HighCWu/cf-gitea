@@ -199,6 +199,19 @@ beforeAll(async () => {
     .update(actions)
     .set({ createdAt: new Date(T0 * 1000) })
     .where(eq(actions.actUserId, aliceRow.id));
+  // The admin-users table's created-date cells (the users-table twin of the
+  // actions pin above, same precedent): the harness seeds user rows with
+  // wall-clock created_at, so /-/admin/users rendered the SEED DAY's date —
+  // the golden captured "Oct 28, 2026" on its capture day and rotted at the
+  // next midnight (observed 2026-10-29: the clean-checkout composite's only
+  // golden failure, byte 12523). Pin EVERY user row to T0: the whole-table
+  // UPDATE is inert for every other golden — no committed page renders a
+  // user's created_at except the admin users table (grep over goldens/*.html
+  // for wall-clock-derived date bytes found only admin-users.html), and the
+  // "Never Signed In" last-login cell reads a null column, not a clock.
+  await drizzle(env.DB)
+    .update(users)
+    .set({ createdAt: new Date(T0 * 1000) });
   // The wiki-view-home golden's seed (the wave-wiki-fixedtime closure of the
   // wiki-start case comment's "UNLANDABLE" view arm, below): the FIXED-TIME
   // writer (ui/testing/seed-wiki.ts) lands golden-alt's Home page through the
