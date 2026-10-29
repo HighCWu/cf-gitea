@@ -34,9 +34,8 @@
  * set at the pin): the basic form's `template`/`website` fields, the
  * advanced form's unit checkboxes (`enable_internal_tracker` /
  * `enable_projects` / `enable_releases` / `enable_packages` /
- * `enable_pulls`, plus `enable_actions` relocated from actions_general.tmpl)
- * and the merged `archived` danger-zone flip — each toggle round-trips
- * through D1 (the repo_settings row / repositories.is_template /
+ * `enable_pulls`) and the merged `archived` danger-zone flip — each toggle
+ * round-trips through D1 (the repo_settings row / repositories.is_template /
  * repositories.is_archived) and re-renders its stored state on the GET;
  * the archive arm's upstream mirror refusal ("You cannot archive a mirrored
  * repo.") re-renders at 200 with nothing written. Disclosed, NOT pinned
@@ -46,6 +45,16 @@
  * branches.tmpl `action=default_branch` block, the branch-protection
  * module's page), and the invalid re-render's wave-129-field carry (the
  * handler rebuild pins below that the fallback renders the STORED states).
+ *
+ * Checkbox-retire additions (upstream parity restored): `enable_actions` is
+ * OFF this form — options.tmpl's unit list carries no actions checkbox at
+ * the pin (the toggle lives ONLY on actions_general.tmpl, rendered by the
+ * census C9 general page), so the earlier wave-129 relocation is retired.
+ * The matrix pins the retirement's two faces: the GET renders no
+ * `enable_actions` input even when the stored flag is ON, and the options
+ * POST leaves the stored has_actions untouched (the general page's
+ * actions_unit POST is the sole UI writer — the pre-retirement form would
+ * have CLOBBERED it on every save).
  */
 
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
@@ -231,10 +240,9 @@ describe("parseRepoBasicsForm (the wave-settings-options field set)", () => {
         enable_releases: "on",
         enable_projects: "on",
         enable_packages: "on",
-        enable_actions: "on",
       }),
     );
-    expect(on.units).toEqual({ hasIssues: true, hasPullRequests: true, hasReleases: true, hasProjects: true, hasPackages: true, hasActions: true });
+    expect(on.units).toEqual({ hasIssues: true, hasPullRequests: true, hasReleases: true, hasProjects: true, hasPackages: true });
     // The unchecked-checkbox post: every unit field absent from the body.
     expect(parseRepoBasicsForm(new URLSearchParams({ repo_name: "demo" })).units).toEqual({
       hasIssues: false,
@@ -242,8 +250,16 @@ describe("parseRepoBasicsForm (the wave-settings-options field set)", () => {
       hasReleases: false,
       hasProjects: false,
       hasPackages: false,
-      hasActions: false,
     });
+  });
+
+  it("no enable_actions arm: the retired field parses into nothing (actions_general.tmpl's alone)", () => {
+    // A stray/stale client posting the retired field must not flip anything:
+    // the parser drops it and RepoBasicsUnits has no hasActions member to
+    // receive it (the module header's retirement note).
+    const stray = parseRepoBasicsForm(new URLSearchParams({ repo_name: "demo", enable_actions: "on" }));
+    expect(stray.units).toEqual({ hasIssues: false, hasPullRequests: false, hasReleases: false, hasProjects: false, hasPackages: false });
+    expect(Object.hasOwn(stray.units ?? {}, "hasActions")).toBe(false);
   });
 
   it("website/template/archived parse with the checkbox semantics; the parser always fills the wave fields", () => {
@@ -499,20 +515,23 @@ async function storedRepoColumns(): Promise<{ is_template: number; is_archived: 
 }
 
 describe("the options form's wave-settings-options field set (template/website/units/archived)", () => {
-  it("the plain GET renders the upstream-default unit states (issues/pulls/releases on, projects/packages/actions off) and no stored website", async () => {
+  it("the plain GET renders the upstream-default unit states (issues/pulls/releases on, projects/packages off) and no stored website", async () => {
     const res = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
     expect(res.status).toBe(200);
     const html = await res.text();
     // The advanced-form section label + the unit checkboxes at the defaults
     // (loadRepoSettings' DefaultRepoUnits minus wiki, which lives at
-    // /settings/wiki, minus code, which has no landed column).
+    // /settings/wiki; minus code, which has no landed column; minus actions,
+    // which lives at /settings/actions/general).
     expect(html).toContain('<h4 class="ui dividing header">Advanced Settings</h4>');
     expect(html).toContain('<input class="enable-system" name="enable_internal_tracker" type="checkbox" checked=""/>');
     expect(html).toContain('<input class="enable-system" name="enable_pulls" type="checkbox" checked=""/>');
     expect(html).toContain('<input class="enable-system" name="enable_releases" type="checkbox" checked=""/>');
     expect(html).toContain('<input class="enable-system" name="enable_projects" type="checkbox"/>');
     expect(html).toContain('<input class="enable-system" name="enable_packages" type="checkbox"/>');
-    expect(html).toContain('<input class="enable-system" name="enable_actions" type="checkbox"/>');
+    // The retirement: no enable_actions input at all (upstream options.tmpl
+    // keeps the toggle on actions_general.tmpl only).
+    expect(html).not.toContain('name="enable_actions"');
     // The basic-form additions: the template/archived toggles unchecked (the
     // repo row's flags) and the website input empty (no stored value).
     expect(html).toContain('<input id="template" name="template" type="checkbox"/>');
@@ -534,7 +553,9 @@ describe("the options form's wave-settings-options field set (template/website/u
     expect(html).toContain('<input class="enable-system" name="enable_internal_tracker" type="checkbox"/>'); // stored off
     expect(html).toContain('<input class="enable-system" name="enable_pulls" type="checkbox"/>'); // stored off
     expect(html).toContain('<input class="enable-system" name="enable_projects" type="checkbox" checked=""/>'); // stored on
-    expect(html).toContain('<input class="enable-system" name="enable_actions" type="checkbox" checked=""/>'); // stored on
+    // Stored has_actions ON (seeded above) yet STILL no checkbox: the flag's
+    // render home is the general page, never this form.
+    expect(html).not.toContain('name="enable_actions"');
     expect(html).toContain('<input id="template" name="template" type="checkbox" checked=""/>'); // the repo row's flag
     expect(html).toContain('<input id="archived" name="archived" type="checkbox"/>'); // still unarchived
   });
@@ -548,32 +569,53 @@ describe("the options form's wave-settings-options field set (template/website/u
       enable_releases: "on",
       enable_projects: "on",
       enable_packages: "on",
-      enable_actions: "on",
     });
     expect(on.status).toBe(303);
     expect(on.headers.get("location")).toBe("/alice/demo/settings");
     // The persisted shape: the raw repo_settings integers (1/0) AND the
     // service read (the boolean mode the API PATCH + wiki gates consume).
-    expect(await storedUnitRow()).toEqual({ has_issues: 1, has_pull_requests: 1, has_releases: 1, has_projects: 1, has_packages: 1, has_actions: 1 });
+    // has_actions stays at its DEFAULT: the options POST has no arm for it.
+    expect(await storedUnitRow()).toEqual({ has_issues: 1, has_pull_requests: 1, has_releases: 1, has_projects: 1, has_packages: 1, has_actions: 0 });
     const settings = await loadRepoSettings(env.DB, repo.id);
     expect(settings.hasIssues).toBe(true);
     expect(settings.hasPullRequests).toBe(true);
     expect(settings.hasReleases).toBe(true);
     expect(settings.hasProjects).toBe(true);
     expect(settings.hasPackages).toBe(true);
-    expect(settings.hasActions).toBe(true);
+    expect(settings.hasActions).toBe(false);
     const page = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
     const html = await page.text();
     expect(html).toContain('<input class="enable-system" name="enable_packages" type="checkbox" checked=""/>');
-    expect(html).toContain('<input class="enable-system" name="enable_actions" type="checkbox" checked=""/>');
+    expect(html).not.toContain('name="enable_actions"'); // retired: no checkbox to re-render
 
-    // The unchecked-checkbox post flips every unit off (HTML semantics: an
-    // absent field is an unchecked box — the same rule `private` pinned).
+    // The unchecked-checkbox post flips every carried unit off (HTML
+    // semantics: an absent field is an unchecked box — the same rule
+    // `private` pinned).
     const off = await basicsPost({ repo_name: "demo", description: "" });
     expect(off.status).toBe(303);
     expect(await storedUnitRow()).toEqual({ has_issues: 0, has_pull_requests: 0, has_releases: 0, has_projects: 0, has_packages: 0, has_actions: 0 });
     const offPage = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
     expect(await offPage.text()).toContain('<input class="enable-system" name="enable_internal_tracker" type="checkbox"/>');
+  });
+
+  it("the options POST leaves a stored has_actions=on untouched (the general page's toggle is the sole UI writer)", async () => {
+    // The retirement's load-bearing arm: the pre-retirement form carried
+    // enable_actions and its absent-field-false parse CLOBBERED the flag on
+    // every unrelated options save. Post-retirement the write arm is gone.
+    await saveRepoSettings(env.DB, repo.id, { hasActions: true }, new Date());
+    const nav = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
+    expect(await nav.text()).toContain('href="/alice/demo/settings/actions/general"'); // the nav lights from the STORED read
+
+    const res = await basicsPost({ repo_name: "demo", description: "an ordinary save", enable_packages: "on" });
+    expect(res.status).toBe(303);
+    // The carried units follow the HTML semantics (absent = off), but
+    // has_actions — seeded ON and absent from the body — STANDS at 1: the
+    // pre-retirement form would have reset it to 0 right here.
+    expect(await storedUnitRow()).toEqual({ has_issues: 0, has_pull_requests: 0, has_releases: 0, has_projects: 0, has_packages: 1, has_actions: 1 });
+    expect((await loadRepoSettings(env.DB, repo.id)).hasActions).toBe(true); // the flag STANDS
+    // The nav still lights on the re-read (data.hasActions, never the form).
+    const page = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
+    expect(await page.text()).toContain('href="/alice/demo/settings/actions/general"');
   });
 
   it("the template flag round-trips both ways through repositories.is_template and the GET reflects it", async () => {

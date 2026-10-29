@@ -91,10 +91,14 @@
  *       `enable_packages` / `enable_pulls` (advanced form, its exact order) —
  *       the repo_settings has_* unit flags through saveRepoSettings (the
  *       same fields the API PATCH maps to has_issues/has_pull_requests/&c.).
- *     - `enable_actions` — upstream renders this checkbox on the ACTIONS
- *       settings tab (actions_general.tmpl), not options.tmpl; it renders
- *       here because the landed storage + API surface carry has_actions and
- *       our UI has no Actions tab (cf-gitea relocation).
+ *     - NOT rendered: `enable_actions` — upstream keeps the toggle ONLY on
+ *       actions_general.tmpl (options.tmpl's unit list carries no actions
+ *       checkbox at this pin); the census C9 general page landed that tab
+ *       (repo-settings-actions-general.tsx, actions_general.tmpl:13's own
+ *       POST), so the wave-129 relocation is RETIRED — this form neither
+ *       renders the checkbox nor writes has_actions (the options POST leaves
+ *       the stored flag untouched; the general page's toggle is the sole UI
+ *       writer, the API PATCH aside).
  *     - the `archived` checkbox — upstream keeps the archive flip in the
  *       danger zone behind a typed modal (`action=archive`); it merges into
  *       this form as a plain checkbox behind the Origin guard (the wave-4
@@ -300,8 +304,6 @@ export const settingsLocale = {
   projects_desc: "Enable Projects", // "repo.settings.projects_desc"
   packages: "Packages", // "repo.packages"
   packages_desc: "Enable Repository Packages Registry", // "repo.settings.packages_desc"
-  actions: "Actions", // "repo.actions"
-  actions_desc: "Enable Actions", // "actions.general.enable_actions" (the checkbox relocates actions_general.tmpl's field here — the module header)
   archive_toggle: "Archive Repo", // "repo.settings.archive.button" (the merged danger-zone flip)
   archive_mirror_error: "You cannot archive a mirrored repo.", // "repo.settings.archive.error_ismirror"
 } as const;
@@ -328,22 +330,23 @@ export async function canAdminRepo(env: Env, repo: RepoRow, viewer: Viewer): Pro
 // The basics page (GET /settings + POST /settings)
 // ---------------------------------------------------------------------------
 
-/** The unit-feature checkbox states the options form carries — the
+/**
+ * The unit-feature checkbox states the options form carries — the
  *  repo_settings has_* columns MINUS wiki (the wave-54 split owns the
- *  `enable_wiki` checkbox at /settings/wiki, repo-settings-wiki.tsx) and
- *  MINUS code (no landed repo_settings column — a checkbox would be a dead
- *  control, §2.4.1). Member names are the service shape; FORM field names
- *  are upstream options.tmpl's verbatim (`enable_internal_tracker`,
- *  `enable_pulls`, `enable_releases`, `enable_projects`, `enable_packages`)
- *  plus actions_general.tmpl's `enable_actions` relocated here (our UI has
- *  no Actions tab; the module header). */
+ *  `enable_wiki` checkbox at /settings/wiki, repo-settings-wiki.tsx), MINUS
+ *  code (no landed repo_settings column — a checkbox would be a dead
+ *  control, §2.4.1), and MINUS actions (upstream keeps that toggle ONLY on
+ *  actions_general.tmpl; the census C9 general page owns it — the retirement
+ *  note in the module header). Member names are the service shape; FORM
+ *  field names are upstream options.tmpl's verbatim (`enable_internal_tracker`,
+ *  `enable_pulls`, `enable_releases`, `enable_projects`, `enable_packages`).
+ */
 export interface RepoBasicsUnits {
   hasIssues: boolean;
   hasPullRequests: boolean;
   hasReleases: boolean;
   hasProjects: boolean;
   hasPackages: boolean;
-  hasActions: boolean;
 }
 
 /** The basics form's submitted state. The wave-129 fields are OPTIONAL so
@@ -364,11 +367,17 @@ export interface RepoBasicsForm {
 }
 
 /** The basics form's render inputs: the STORED description/website/units
- *  (loadRepoSettings) plus the re-rendered submission. */
+ *  (loadRepoSettings) plus the re-rendered submission. `hasActions` is the
+ *  STORED has_actions read — the SettingsNav Actions block's navbar.tmpl:47
+ *  conditional — deliberately OUTSIDE the form (the options POST can neither
+ *  carry nor clobber the flag; the general page's toggle is the sole UI
+ *  writer), so it is read fresh off loadRepoSettings on every render
+ *  including the invalid re-render. */
 export interface RepoBasicsData {
   description: string;
   website: string;
   units: RepoBasicsUnits;
+  hasActions: boolean;
   form: RepoBasicsForm;
 }
 
@@ -380,12 +389,12 @@ export async function loadRepoBasics(d1: D1Database, repo: RepoRow): Promise<Rep
     hasReleases: settings.hasReleases,
     hasProjects: settings.hasProjects,
     hasPackages: settings.hasPackages,
-    hasActions: settings.hasActions,
   };
   return {
     description: settings.description,
     website: settings.website,
     units,
+    hasActions: settings.hasActions,
     form: {
       name: repo.slug,
       description: settings.description,
@@ -401,12 +410,13 @@ export async function loadRepoBasics(d1: D1Database, repo: RepoRow): Promise<Rep
 /** Parse the urlencoded basics POST — the upstream field names verbatim:
  *  `repo_name`/`template`/`description`/`website` (options.tmpl's update
  *  form), `enable_internal_tracker`/`enable_pulls`/`enable_releases`/
- *  `enable_projects`/`enable_packages` (the advanced form), `enable_actions`
- *  (actions_general.tmpl's, relocated), `private` (the merged danger-zone
- *  flip, wave 4) plus `archived` (the same posture — upstream's danger zone
- *  posts `action=archive` from a modal instead; the checkbox field name is
- *  cf-gitea's). Checkbox semantics are the HTML ones the `private` field
- *  pinned: any present value counts, an absent field is false. */
+ *  `enable_projects`/`enable_packages` (the advanced form), `private` (the
+ *  merged danger-zone flip, wave 4) plus `archived` (the same posture —
+ *  upstream's danger zone posts `action=archive` from a modal instead; the
+ *  checkbox field name is cf-gitea's). No `enable_actions` arm: the field is
+ *  actions_general.tmpl's alone and the form dropped it (the module header's
+ *  retirement note). Checkbox semantics are the HTML ones the `private`
+ *  field pinned: any present value counts, an absent field is false. */
 export function parseRepoBasicsForm(params: URLSearchParams): RepoBasicsForm {
   return {
     name: (params.get("repo_name") ?? "").trim(),
@@ -421,7 +431,6 @@ export function parseRepoBasicsForm(params: URLSearchParams): RepoBasicsForm {
       hasReleases: (params.get("enable_releases") ?? "") !== "",
       hasProjects: (params.get("enable_projects") ?? "") !== "",
       hasPackages: (params.get("enable_packages") ?? "") !== "",
-      hasActions: (params.get("enable_actions") ?? "") !== "",
     },
   };
 }
@@ -433,8 +442,10 @@ export type RepoBasicsResult = { outcome: "applied"; slug: string } | { outcome:
  * only on a case-insensitive change (the route's guard), visibility only on
  * a change, description through the settings upsert (always — the empty
  * description is a legitimate stored value), the website/units subset when
- * the form carries them (the API route's conditional-patch build), and the
- * template/archived flips through the service arms (change-guarded). Name
+ * the form carries them (the API route's conditional-patch build; has_actions
+ * EXCLUDED from the patch — the general page's actions_unit POST owns that
+ * flag, and an options save must not clobber it), and the template/archived
+ * flips through the service arms (change-guarded). Name
  * errors are the API's 422 messages, re-rendered inline; the archive arm's
  * upstream mirror refusal re-renders the same way — evaluated BEFORE any
  * write so an invalid outcome leaves the whole POST inert (the invalid-arm
@@ -473,7 +484,8 @@ export async function applyRepoBasics(d1: D1Database, repo: RepoRow, form: RepoB
     settingsPatch.hasReleases = form.units.hasReleases;
     settingsPatch.hasProjects = form.units.hasProjects;
     settingsPatch.hasPackages = form.units.hasPackages;
-    settingsPatch.hasActions = form.units.hasActions;
+    // No hasActions arm: the checkbox retired (the module header) — the
+    // general page's actions_unit POST is the sole UI writer of the flag.
   }
   await saveRepoSettings(d1, repo.id, settingsPatch, now);
   if (form.isTemplate !== undefined && form.isTemplate !== repo.isTemplate) {
@@ -730,9 +742,12 @@ export function RepoSettingsPage(props: { ctx: UiContext; data: RepoBasicsData; 
   return (
     <BaseLayout ctx={ctx} title={settingsLocale.settings} pageClass="repository settings options">
       <div class="ui container flex-container">
-        {/* The options page loads the unit flags (data.units) — it evaluates
-            navbar.tmpl:47's conditional and lights the Actions block. */}
-        <SettingsNav repoLink={repoLink} active="options" repo={repo} hasActions={units.hasActions} />
+        {/* The Actions block lights from the STORED has_actions read
+            (data.hasActions, navbar.tmpl:47's conditional) — never the
+            carried form: the options form dropped its enable_actions field
+            (the module header's retirement note), so the flag has no form
+            arm to carry. */}
+        <SettingsNav repoLink={repoLink} active="options" repo={repo} hasActions={data.hasActions} />
         <div class="flex-container-main">
           <h4 class="ui top attached header">{settingsLocale.basic_settings}</h4>
           <div class="ui attached segment">
@@ -814,13 +829,10 @@ export function RepoSettingsPage(props: { ctx: UiContext; data: RepoBasicsData; 
                   <label>{settingsLocale.pulls_desc}</label>
                 </div>
               </div>
-              <div class="inline field">
-                <label>{settingsLocale.actions}</label>
-                <div class="ui checkbox">
-                  <input class="enable-system" name="enable_actions" type="checkbox" checked={units.hasActions} />
-                  <label>{settingsLocale.actions_desc}</label>
-                </div>
-              </div>
+              {/* No `enable_actions` field: upstream keeps that toggle ONLY on
+                  actions_general.tmpl (options.tmpl's unit list ends at pulls
+                  at this pin) and the census C9 general page landed it — the
+                  module header's retirement note. */}
               <div class="field">
                 <button type="submit" class="ui primary button">
                   {settingsLocale.update_settings}
