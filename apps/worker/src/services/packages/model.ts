@@ -7,7 +7,8 @@
  * (package_update.go), the delete cascades, the quota checks
  * (packages.go:366-457 with our §3.4 config surface), and the owner access
  * mode (determineAccessMode, services/context/package.go:112-166, folded per
- * §4.1 onto the landed org model).
+ * §4.1 onto the landed org model — including HasOrgOrUserVisible's
+ * membership floor, org.go:458-461, so a private org's plain member reads).
  *
  * Routes are thin over THIS module (AGENTS.md: business logic lives in
  * services); D1 access goes through Drizzle only. No Durable Object: the
@@ -808,8 +809,12 @@ export function maxAccessMode(a: PackageAccessMode, b: PackageAccessMode): Packa
  * The §4.1 org access-mode fold (ratification 8): an org member's grants are
  * `org_members.role` ('owner' = the Owners-team bridge → owner rank) UNIONed
  * with every team row's `authorize` (≥ read → package read, ≥ write →
- * package write — no per-unit column, the landed teams collapse). A
- * non-member falls through to the visibility read arm.
+ * package write — no per-unit column, the landed teams collapse), floored at
+ * read for ANY membership row — upstream HasOrgOrUserVisible's membership arm
+ * (org.go:458-461: visibility-satisfies OR member) applied at
+ * package.go:155-157, so a PLAIN member (no team row) of a private org still
+ * reads, exactly as upstream's post-union fallback grants. A non-member stays
+ * none and falls through to the visibility read arm.
  */
 async function orgMemberAccessMode(d1: D1Database, orgId: number, doerId: number): Promise<PackageAccessMode> {
   const db = drizzle(d1);
@@ -818,7 +823,10 @@ async function orgMemberAccessMode(d1: D1Database, orgId: number, doerId: number
     .from(orgMembers)
     .where(and(eq(orgMembers.orgId, orgId), eq(orgMembers.userId, doerId)))
     .get();
-  let mode: PackageAccessMode = memberRole !== undefined && memberRole.role === "owner" ? "owner" : "none";
+  // The membership floor: any org_members row reads at least (upstream
+  // HasOrgOrUserVisible org.go:458-461 via package.go:155-157); the team
+  // authorize union below only raises it.
+  let mode: PackageAccessMode = memberRole === undefined ? "none" : memberRole.role === "owner" ? "owner" : "read";
   // The team authorize union — every team row counts (upstream's
   // UnitAccessMode(TypePackages) loop with the per-unit overrides collapsed).
   const teamRows = await db
@@ -840,9 +848,11 @@ async function orgMemberAccessMode(d1: D1Database, orgId: number, doerId: number
  *      passes the verdict via `ownerVisibleToDoer`, false → none);
  *   2. site admin → owner mode (DoerIsSiteAdminFullAccess);
  *   3. owner self → owner mode;
- *   4. org owner: the §4.1 fold (membership role + team authorize union),
- *      then the visibility read arm — MEMBERSHIP IS CONSULTED FIRST, so a
- *      private org's own members keep their grants;
+ *   4. org owner: the §4.1 fold (membership role + team authorize union,
+ *      floored at read for any membership row — HasOrgOrUserVisible's
+ *      membership arm, org.go:458-461 via package.go:155-157), then the
+ *      visibility read arm — MEMBERSHIP IS CONSULTED FIRST, so a private
+ *      org's own members (team-granted OR plain) keep their read;
  *   5. user owner: public → anyone, limited → any authenticated doer,
  *      private → self/admin only.
  *

@@ -493,13 +493,18 @@ describe("determinePackageAccessMode", () => {
     ).toBe("none");
   });
 
-  it("org fold (ratification 8): owner-role member → owner; write/read team grants; private non-member → none", async () => {
+  it("org fold (ratification 8 + the HasOrgOrUserVisible membership floor): owner-role member → owner; write/read team grants; plain member reads; private non-member → none", async () => {
     const orgOwner = await seedUser("acme-owner");
     const org = await seedUser("acme", { type: "org" });
     const writer = await seedUser("writer");
     const reader = await seedUser("reader");
+    const plain = await seedUser("plainmember");
     const outsider = await seedUser("outsider");
     await db().insert(orgMembers).values({ orgId: org.id, userId: orgOwner.id, role: "owner", createdAt: NOW });
+    // The PLAIN member: a membership row, no team row — upstream
+    // HasOrgOrUserVisible (org.go:458-461) grants this doer read through the
+    // membership arm at package.go:155-157.
+    await db().insert(orgMembers).values({ orgId: org.id, userId: plain.id, role: "member", createdAt: NOW });
 
     const writeTeam = await db()
       .insert(teams)
@@ -522,17 +527,20 @@ describe("determinePackageAccessMode", () => {
     expect(await determinePackageAccessMode(env.DB, orgRow, { id: orgOwner.id, isAdmin: false })).toBe("owner");
     expect(await determinePackageAccessMode(env.DB, orgRow, { id: writer.id, isAdmin: false })).toBe("write");
     expect(await determinePackageAccessMode(env.DB, orgRow, { id: reader.id, isAdmin: false })).toBe("read");
+    expect(await determinePackageAccessMode(env.DB, orgRow, { id: plain.id, isAdmin: false })).toBe("read"); // public org: floor and visibility agree
     expect(await determinePackageAccessMode(env.DB, orgRow, { id: outsider.id, isAdmin: false })).toBe("read"); // public org visible
     expect(await determinePackageAccessMode(env.DB, orgRow, null)).toBe("read");
 
-    // Private org: members keep their grants, strangers are blind. The
-    // owner row is re-read AFTER the visibility flip (the ladder reads the
-    // row's CURRENT visibility).
+    // Private org: members keep their grants — the TEAM-granted reader AND
+    // the PLAIN member (the closed HasOrgOrUserVisible floor, package.go:
+    // 155-157) — while strangers are blind. The owner row is re-read AFTER
+    // the visibility flip (the ladder reads the row's CURRENT visibility).
     await db().update(users).set({ visibility: "private" }).where(eq(users.id, org.id));
     const privateUser = await db().select().from(users).where(eq(users.id, org.id)).get();
     if (privateUser === undefined) throw new Error("org seed vanished");
     const privateRow = asOwner(privateUser);
     expect(await determinePackageAccessMode(env.DB, privateRow, { id: reader.id, isAdmin: false })).toBe("read");
+    expect(await determinePackageAccessMode(env.DB, privateRow, { id: plain.id, isAdmin: false })).toBe("read"); // the membership floor
     expect(await determinePackageAccessMode(env.DB, privateRow, { id: outsider.id, isAdmin: false })).toBe("none");
     expect(await determinePackageAccessMode(env.DB, privateRow, null)).toBe("none");
   });

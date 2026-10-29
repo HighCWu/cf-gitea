@@ -9,6 +9,7 @@ import {
 } from "./auth/middleware";
 import { createApiRouter } from "./api/router";
 import { createPackagesProtocolRouter } from "./api/routes/packages";
+import { createEcosystemProtocolRouter } from "./api/routes/packages-protocols";
 import { authorize } from "./git-http/authorize";
 import { gitHttpGate } from "./git-http/gate";
 import { handleRepoTasks } from "./repos/purge";
@@ -143,6 +144,13 @@ app.route("/api/v1", createApiRouter());
 // (§5.10) that makes real package-manager clients re-prompt. run_worker_first
 // pins /api/* so the asset tree never shadows these paths.
 app.route("/api/packages", createPackagesProtocolRouter());
+
+// SPEC-0016 M3: the pypi + helm protocol families ride the SAME /api/packages
+// mount (upstream's CommonRoutes groups at api.go:417-421 / api.go:337-341) —
+// a second sub-app beside the generic router, with the same credential-pass
+// gate (no resolveAuth mount; the 401 + WWW-Authenticate challenge arms live
+// inside).
+app.route("/api/packages", createEcosystemProtocolRouter());
 
 // Avatar serving (web mux at the pin — routers/web/base.go): mounted BEFORE
 // uiRouter so its literal /avatar, /avatars and /user/avatar routes always
