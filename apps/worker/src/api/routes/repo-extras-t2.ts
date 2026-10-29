@@ -17,6 +17,8 @@ import {
   users,
 } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
+import { carryRepoCell } from "../../repos/carry";
+import { tombstoneRepoDO } from "../../repos/purge";
 import {
   NotAuthorizedError,
   OwnerNotAssignableError,
@@ -1169,12 +1171,25 @@ export function registerRepoExtrasT2Routes(
       const found = await requireVisibleRepo(c, c.req.valid("param"));
       const doer = doerOf(c);
       try {
-        // The registry rides the accept (REDEPLOY8's flagged tail — the
-        // repoEdit PATCH threads the same dep): bare construction skips
-        // syncRegistryMove, so the moved repo 404s "repository not found" at
-        // its NEW url while the registry still advertises the stale old key.
+        // The full engine-dep set rides the accept (the service-seam production
+        // shape repos/lifecycle.test.ts wires; the repoEdit PATCH threads the
+        // registry+carry pair): beyond syncRegistryMove (bare construction
+        // leaves the moved repo 404ing "repository not found" at its NEW url
+        // while the registry still advertises the stale old key), the
+        // tombstone+carry pair runs moveEngineCell — upstream's accept-step
+        // rename of the repo directory AND its wiki (transferOwnership:
+        // transfer.go:308-314 + the IsRepositoryExist-guarded wiki move
+        // :316-327, driven by AcceptTransferOwnership:46→83): the name-addressed
+        // RepoCells would otherwise strand at the old owner until delete (the
+        // new URL serving a fresh-empty cell). wikiExists stays unwired — the
+        // same posture as the rename path (routes/repo.ts): unwired, a
+        // never-provisioned sibling's tombstone+carry is the harmless
+        // fresh-empty round trip the new name lazily provisions anyway
+        // (RepoEngineDeps.wikiExists contract).
         await new RepoService(c.env.DB, {
           registry: c.env.REGISTRY.getByName("registry"),
+          tombstone: (engineName) => tombstoneRepoDO(c.env, engineName),
+          carry: (fromEngine, toEngine, storageKey) => carryRepoCell(c.env, fromEngine, toEngine, storageKey),
         }).acceptTransfer(found.repo.id, { id: doer.id, isAdmin: doer.isAdmin });
       } catch (error) {
         if (error instanceof TransferNotExistError || error instanceof OwnerNotAssignableError) {

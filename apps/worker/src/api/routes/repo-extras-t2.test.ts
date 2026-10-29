@@ -18,7 +18,7 @@
 
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
@@ -49,6 +49,7 @@ import { IssuesService } from "../../issues/service";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { ensureSeededRepo, type SeedCommit } from "../../ui/testing/seed-repo";
 import { releaseAssetKey } from "../services/release-assets";
+import { createWikiPage, readWikiPage } from "../../services/wiki";
 import { engineCell, ZERO_OID } from "../services/engine";
 import type { User } from "../models/user";
 
@@ -282,6 +283,20 @@ async function seedCollaborator(userId: number, mode: "read" | "write" | "admin"
 /** One pending transfer row. */
 async function seedPendingTransfer(repoId: string, newOwnerId: number): Promise<void> {
   await drizzle(env.DB).insert(repoTransfer).values({ repoId, doerId: ownerId, newOwnerId, createdAt: NOW });
+}
+
+/** The cell carries the tombstone flag: beginReceive is refused outright
+ *  (lifecycle.test.ts's expectTombstoned shape, against the route-level move). */
+async function expectTombstonedCell(engineName: string): Promise<void> {
+  const begin = await env.REPO.getByName(engineName).beginReceive({
+    commands: [{ ref: "refs/heads/main", old: ZERO_OID, next: ZERO_OID }],
+    capabilities: [],
+    packBytesHint: null,
+  });
+  expect(begin.tag).toBe("rejected");
+  if (begin.tag === "rejected") {
+    expect(begin.results).toEqual([{ ref: "refs/heads/main", ok: false, message: "repository deleted" }]);
+  }
 }
 
 /** One release row; returns its global id. */
@@ -989,6 +1004,78 @@ describe("POST .../transfer/accept + /reject (repo-extras-t2)", () => {
       .where(eq(repoRedirects.ownerNamespace, OWNER))
       .all();
     expect(redirect.map((row) => row.lowerName)).toEqual(["t2-accept"]); // the old URL keeps working
+  });
+
+  // REDEPLOY13's transfer-accept wiring gap, closed: the route now rides the
+  // full engine-dep set (registry + tombstone + carry), so acceptTransfer's
+  // moveEngineCell actually runs — the cells answer at the NEW owner, the old
+  // pair is tombstoned, the wiki sibling + registry entry move with the row
+  // (upstream's accept-step rename, transferOwnership transfer.go:308-327).
+  it("accept carries the engine cells to the new owner: refs answer at the new namespace, the old pair tombstoned, wiki sibling + registry move", async () => {
+    // Real engine content (the beforeAll ensureSeededRepo pattern) — a
+    // D1-only row would carry nothing and assert nothing.
+    const slug = "t2-carry";
+    const seeded = await ensureSeededRepo({
+      owner: OWNER,
+      slug,
+      commits: [
+        { message: "seed: carry me over", time: T0, files: [{ path: "README.md", content: "# carry suite\n" }] },
+      ],
+    });
+    const tip = seeded.tips[0] as string;
+    const row = await drizzle(env.DB)
+      .select()
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, slug)))
+      .get();
+    if (row === undefined) throw new Error("carry repo row missing");
+    const ownerRow = await drizzle(env.DB).select().from(users).where(eq(users.id, ownerId)).get();
+    if (ownerRow === undefined) throw new Error("carry owner row missing");
+
+    // Provision the wiki sibling so the move has pages to carry (upstream
+    // renames an EXISTING wiki at the accept; a never-provisioned one
+    // round-trips empty either way — the unwired wikiExists posture).
+    await createWikiPage(
+      env,
+      { repo: row, owner: ownerRow },
+      { name: OWNER, email: `${OWNER}@example.com` },
+      { title: "Home", content: new TextEncoder().encode("# Home\n"), message: "" },
+      "https://example.com",
+      { now: 1_700_000_000 },
+    );
+    // Producer sanity: both cells live under the old owner.
+    expect((await env.REPO.getByName(`${OWNER}/${slug}`).listRefs()).refs.map((r) => r.name)).toEqual([
+      "refs/heads/main",
+    ]);
+    expect((await env.REPO.getByName(`${OWNER}/${slug}.wiki`).listRefs()).refs.map((r) => r.name)).toEqual([
+      "refs/heads/main",
+    ]);
+
+    await seedPendingTransfer(row.id, neighborId);
+    const accepted = await send(`/repos/${OWNER}/${slug}/transfer/accept`, authed({ method: "POST" }, TOKEN_NEIGHBOR));
+    expect(accepted.status).toBe(202);
+
+    // The MAIN cell answers at the NEW owner with the pushed ref...
+    const after = await env.REPO.getByName(`neighbor/${slug}`).listRefs();
+    expect(after.refs.map((r) => [r.name, r.target])).toEqual([["refs/heads/main", tip]]);
+    // ...the OLD cell is tombstoned (refuses new receive leases)...
+    await expectTombstonedCell(`${OWNER}/${slug}`);
+    // ...the wiki sibling carried (the page reads through the landed read
+    // path at the derived new name; the old sibling refuses leases too)...
+    const moved = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, row.id)).get();
+    if (moved === undefined) throw new Error("moved row missing");
+    const neighborRow = await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId)).get();
+    if (neighborRow === undefined) throw new Error("neighbor row missing");
+    const page = await readWikiPage(env, { repo: moved, owner: neighborRow }, "Home", "https://example.com");
+    expect(page).not.toBeNull();
+    expect(atob(page!.content_base64)).toContain("# Home");
+    expect((await env.REPO.getByName(`neighbor/${slug}.wiki`).listRefs()).refs.map((r) => r.name)).toEqual([
+      "refs/heads/main",
+    ]);
+    await expectTombstonedCell(`${OWNER}/${slug}.wiki`);
+    // ...and the registry entry re-pointed (upsert new BEFORE remove old).
+    expect(await env.REGISTRY.getByName("registry").get(`neighbor/${slug}`)).not.toBeNull();
+    expect(await env.REGISTRY.getByName("registry").get(`${OWNER}/${slug}`)).toBeNull();
   });
 
   it("404s accept without a pending row", async () => {
