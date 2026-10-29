@@ -168,6 +168,15 @@
  *   shape; the pinned shape sits lower by construction, which the
  *   direction-aware gate reads as an improvement, not a failure — no
  *   re-record needed, the metric schema is unchanged.
+ *   Clone wall/rate ("clone-wall"/"clone-rate", 2026-10-29): the initial
+ *   calibration left clone percentage-only on two samples of evidence ("stayed
+ *   in band everywhere"); four consecutive CI runs on clone-path-identical
+ *   code then spread 589-2677 ms vs the 783 ms baseline (4.5x — the worst
+ *   delta, 1894 ms, is a whole throttled runner instance, and the same code
+ *   passed at 589 ms the next run). Runner-instance level shifts move a
+ *   780 ms transfer the same way they move the 100 ms overhead ops, so the
+ *   pair gets floors above the observed noise (2000 ms / 5 MiB/s): gross-only
+ *   wall teeth, byte metrics keep the structural teeth.
  *   Methodology pairing: the overhead wall
  *   metrics are medians over 3 independent push->fetch cycles — median kills
  *   the within-host per-attempt outliers; the absolute floor absorbs the
@@ -240,6 +249,24 @@ const OVERHEAD_METRICS = new Set([
   "inforefs_p50_ms",
   "inforefs_p95_ms",
 ]);
+// Clone wall/rate class: the one metrics family with real bulk work (a ~780 ms,
+// 5.7 MiB transfer), so the calibration initially left it percentage-only ("stayed
+// in band everywhere" — but that was two samples). Four consecutive CI runs on
+// clone-path-identical code (the 2026-10-28 sweep/headers/engine/activity
+// commits touch nothing under git-http) then recorded clone_wall_ms 2676.83 /
+// 589.35 / 773.57 / 912.97 vs the 783.26 baseline — a 4.5x cross-run spread
+// whose worst noise delta is 1893.57 ms (run 40785963622, a throttled runner
+// instance; the same code passed at 589 ms the very next run) and whose rate
+// twin fell 6.89 -> 2.02 MiB/s (4.87 absolute). Same methodology as
+// OVERHEAD_ABS_FLOOR_MS: floors sit just above the largest observed
+// identical-code noise delta, so the wall/rate pair keeps only gross-regression
+// teeth (a real clone-path CPU collapse moves these by multiples of the
+// baseline) while the byte metrics (clone_received_bytes, byte-exact per
+// fixture) carry the structural teeth.
+const CLONE_WALL_METRICS = new Set(["clone_wall_ms"]);
+const CLONE_RATE_METRICS = new Set(["clone_effective_mib_per_s"]);
+const CLONE_ABS_FLOOR_MS = 2000;
+const CLONE_ABS_FLOOR_MIB_S = 5;
 // Independent push->fetch cycles behind the median for the two overhead wall
 // metrics (single-shot samples at the ~100 ms scale swing 2x within a host).
 const PUSH_FETCH_SAMPLES = 3;
@@ -915,9 +942,11 @@ function compareAgainstBaseline(results, baseline, sizes) {
       // metrics must exceed BOTH the percentage band and the ms floor;
       // byte-overhead metrics (push_bytes) BOTH the band and the byte floor;
       // the default class is percentage-only.
-      const cls = OVERHEAD_METRICS.has(key) ? "overhead" : OVERHEAD_BYTES.has(key) ? "byte-overhead" : "default";
-      const absFloor = cls === "overhead" ? OVERHEAD_ABS_FLOOR_MS : cls === "byte-overhead" ? OVERHEAD_ABS_FLOOR_BYTES : 0;
-      const absUnit = key.endsWith("_ms") ? " ms" : key.endsWith("_bytes") ? " B" : "";
+      const cls = OVERHEAD_METRICS.has(key) ? "overhead" : OVERHEAD_BYTES.has(key) ? "byte-overhead"
+        : CLONE_WALL_METRICS.has(key) ? "clone-wall" : CLONE_RATE_METRICS.has(key) ? "clone-rate" : "default";
+      const absFloor = cls === "overhead" ? OVERHEAD_ABS_FLOOR_MS : cls === "byte-overhead" ? OVERHEAD_ABS_FLOOR_BYTES
+        : cls === "clone-wall" ? CLONE_ABS_FLOOR_MS : cls === "clone-rate" ? CLONE_ABS_FLOOR_MIB_S : 0;
+      const absUnit = key.endsWith("_ms") ? " ms" : key.endsWith("_bytes") ? " B" : key.endsWith("_per_s") ? " MiB/s" : "";
       const absWorse = Math.max(0, worseDelta);
       if (pct > REGRESSION_THRESHOLD && (absFloor === 0 || absWorse > absFloor)) {
         const fmt = FMT[key] ?? String;
@@ -947,7 +976,8 @@ function printCompare(results, { failures, checked, skipped }) {
   console.log(
     `\ncomparison vs baseline (gate: >${REGRESSION_THRESHOLD * 100}% worse on any recorded metric; ` +
     `overhead wall metrics — push/fetch/inforefs — must ALSO exceed ${OVERHEAD_ABS_FLOOR_MS} ms absolute worse, ` +
-    `and push_bytes must exceed ${OVERHEAD_ABS_FLOOR_BYTES} B absolute worse: ` +
+    `push_bytes must exceed ${OVERHEAD_ABS_FLOOR_BYTES} B absolute worse, and the clone wall/rate pair ` +
+    `must exceed ${CLONE_ABS_FLOOR_MS} ms / ${CLONE_ABS_FLOOR_MIB_S} MiB/s absolute worse: ` +
     "sub-second fixed-overhead ops swing 2-8x across hosts on identical code and pinned push bytes still wobble a few B, see TOLERANCE CLASSES in scripts/bench-run.mjs):",
   );
   for (const size of Object.keys(results.sizes)) {
@@ -1053,7 +1083,7 @@ async function main() {
   const cmp = compareAgainstBaseline(results, baseline, opts.sizes);
   printCompare(results, cmp);
   if (cmp.failures.length > 0) {
-    console.error(`\nbenchmark regression gate FAILED (${cmp.failures.length} metric(s) over tolerance: >${REGRESSION_THRESHOLD * 100}%, wall overhead also >${OVERHEAD_ABS_FLOOR_MS} ms / push_bytes also >${OVERHEAD_ABS_FLOOR_BYTES} B absolute)`);
+        console.error(`\nbenchmark regression gate FAILED (${cmp.failures.length} metric(s) over tolerance: >${REGRESSION_THRESHOLD * 100}%, wall overhead also >${OVERHEAD_ABS_FLOOR_MS} ms / push_bytes also >${OVERHEAD_ABS_FLOOR_BYTES} B / clone wall also >${CLONE_ABS_FLOOR_MS} ms or rate also >${CLONE_ABS_FLOOR_MIB_S} MiB/s absolute)`);
     return 1;
   }
   console.log("benchmark regression gate PASSED");
