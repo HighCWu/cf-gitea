@@ -563,7 +563,7 @@ export function registerIssueT2Routes(
     }
     const form = c.req.valid("json");
     if (form.body !== (row.comment.content ?? "")) {
-      await updateCommentBody(c.env.DB, row.comment.id, form.body, new Date());
+      await updateCommentBody(c.env.DB, row.comment.id, form.body, new Date(), doer?.id ?? null);
       row.comment = { ...row.comment, content: form.body };
     }
     return c.json(await toApiComment(c.env.DB, viewer, found, row.issue, row.comment), 200);

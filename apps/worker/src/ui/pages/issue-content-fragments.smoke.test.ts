@@ -26,6 +26,14 @@
  *   prevHistoryId chaining, the canSoftDelete arms (anonymous/owner/
  *   comment-poster), the JSON 404 on a foreign history id, and the
  *   orphaned-comment empty-200 quirk.
+ * - content-history/soft-delete: the write arm's response map (the `{"ok":
+ *   true}` 200, the JSON 403 denial, the HTML-shell 404s, the two
+ *   empty-200 quirks), the row flip (is_deleted + the EMPTIED body), and
+ *   the visibility flips it causes in the sibling read arms (the deleted
+ *   marker in the list, the prev-chain skip in detail, the unfiltered
+ *   overview count) — plus the actor-attribution end-to-end (an editor's
+ *   revision, attributed through the hooks' actorId arm, is soft-deletable
+ *   by that editor alone).
  */
 
 import { env } from "cloudflare:test";
@@ -37,12 +45,13 @@ import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
 import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
-import { issueAttachments, issueContentHistory, issueLabels, labels, repositories, users } from "../../db/schema";
-import { changeIssueBody, updateCommentBody } from "../../api/services/issues";
+import { issueAttachments, issueContentHistory, issueLabels, labels, comments, repositories, users } from "../../db/schema";
+import { changeIssueBody, softDeleteIssueContentHistory, updateCommentBody } from "../../api/services/issues";
 import {
   contentHistoryDetailFragmentResponse,
   contentHistoryListFragmentResponse,
   contentHistoryOverviewFragmentResponse,
+  contentHistorySoftDeleteFragmentResponse,
   formInt64,
   issueAttachmentsFragmentResponse,
   issueInfoFragmentResponse,
@@ -52,6 +61,7 @@ import {
   loadIssueAttachmentsFragment,
   loadIssueInfoFragment,
   resolveFragmentIssue,
+  softDeleteContentHistoryFragment,
 } from "./issue-content-fragments";
 
 // --- fixtures ----------------------------------------------------------------
@@ -527,5 +537,242 @@ describe("the canSoftDelete gate's revision-poster family (content_history.go:84
     const strangerViewer = { kind: "user", id: stranger.id, username: "fragstranger", isAdmin: false } as const;
     const strangerDetail = await loadContentHistoryDetailFragment(env, repo, issue, strangerViewer, comment.id, editRevision.id);
     expect(strangerDetail).toMatchObject({ kind: "ok", canSoftDelete: false }); // no grant, no poster match
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The soft-delete POST arm (issue_content_history.go:183-236
+// SoftDeleteContentHistory — upstream web.go:1391, the reqSignIn'd UPDATE
+// group): the loader's guard order verbatim, the row flip, and the
+// visibility flips across the sibling read arms.
+// ---------------------------------------------------------------------------
+
+describe("the soft-delete POST arm (issue_content_history.go:183-236)", () => {
+  it("the owner hides a body revision: the write empties the snapshot, and every read arm reflects the flip", async () => {
+    const s = await seed();
+    const repo = (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, s.repoId)).get())!;
+    const issue = await resolveFragmentIssue(env.DB, repo, s.issue.index);
+    expect(issue).not.toBeNull();
+    if (issue === null) return;
+    const ownerViewer = { kind: "user", id: s.ownerId, username: "fragowner", isAdmin: false } as const;
+
+    // The body namespace: created@10 ("the body") + edited@50 ("the edited body").
+    const bodyRevisions = await drizzle(env.DB)
+      .select({ id: issueContentHistory.id, editedAt: issueContentHistory.editedAt })
+      .from(issueContentHistory)
+      .all();
+    const editedId = bodyRevisions
+      .filter((row) => row.editedAt.getTime() === at(50).getTime())
+      .map((row) => row.id)[0];
+    expect(editedId).toBeDefined();
+    if (editedId === undefined) return;
+
+    // The owner rides the repo-write grant arm of canSoftDeleteContentHistory.
+    const outcome = await softDeleteContentHistoryFragment(env, repo, issue, ownerViewer, 0, editedId);
+    expect(outcome).toEqual({ kind: "deleted" });
+    const response = contentHistorySoftDeleteFragmentResponse(outcome);
+    expect(response.status).toBe(200); // ALWAYS 200 — :233-235 writes ctx.JSON(200, {"ok": …})
+    expect(response.headers.get("content-type")).toBe("application/json;charset=utf-8");
+    expect(await response.text()).toBe(JSON.stringify({ ok: true }));
+
+    // The row flip (content_history.go:184-186): is_deleted + the body
+    // EMPTIED to "" (never NULL).
+    const row = await drizzle(env.DB).select().from(issueContentHistory).where(eq(issueContentHistory.id, editedId)).get();
+    expect(row?.isDeleted).toBe(true);
+    expect(row?.contentText).toBe("");
+
+    // The detail arm still RESOLVES the deleted revision (the target is not
+    // is_deleted-filtered) — but its content is gone, so the diff runs
+    // against the surviving predecessor as a pure delete.
+    const detailAfter = await loadContentHistoryDetailFragment(env, repo, issue, ownerViewer, 0, editedId);
+    expect(detailAfter).toMatchObject({ kind: "ok", historyId: editedId });
+    if (detailAfter.kind === "ok") {
+      expect(detailAfter.diffHtml).toBe(`<pre class="chroma"><span class="gd">the body</span></pre>`);
+    }
+
+    // The list arm keeps the entry with the deleted marker (the dropdown
+    // refuses detail on it — repo-issue-content.ts:121).
+    const list = await loadContentHistoryListFragment(env.DB, issue, 0);
+    expect(list.results).toHaveLength(2);
+    expect(list.results![0]?.name).toContain('<i data-history-is-deleted="1">deleted</i>');
+
+    // The overview still counts it (no is_deleted filter, content_history.go:117-122).
+    const overview = await loadContentHistoryOverviewFragment(env.DB, issue);
+    expect(overview.editedHistoryCountMap["0"]).toBe(2);
+
+    // Service parity: a no-match id is NOT an error (xorm's Update affects
+    // zero rows and returns nil — the ok arm, :231-235).
+    expect(await softDeleteIssueContentHistory(env.DB, 999999)).toBe(true);
+  });
+
+  it("a soft-deleted MIDDLE revision drops out of the prev-diff chain; the actorId-attributed editor can hide their own revision", async () => {
+    const s = await seed();
+    const repo = (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, s.repoId)).get())!;
+    const issue = await resolveFragmentIssue(env.DB, repo, s.issue.index);
+    expect(issue).not.toBeNull();
+    if (issue === null) return;
+    const svc = new IssuesService(env.DB);
+    const poster = await seedVerifiedUser({ username: "fragposter" });
+    const editor = await seedVerifiedUser({ username: "frageditor" });
+
+    // The poster posts; the EDITOR rewrites twice through the hooks' actorId
+    // arm — both edit revisions' poster_id is the editor (the §5.1
+    // attribution); the first-created back-fill stays poster-attributed.
+    const comment = await svc.addComment({ issueId: issue.id, posterId: poster.id, content: "v0", now: at(110) });
+    await updateCommentBody(env.DB, comment.id, "v1", at(111), editor.id);
+    await updateCommentBody(env.DB, comment.id, "v2", at(112), editor.id);
+    const rows = await namespaceRows(comment.id);
+    expect(rows).toHaveLength(3);
+    const createdRevision = rows[0]!; // @110 — "v0" (poster-attributed back-fill)
+    const middleRevision = rows[1]!; // @111 — "v1" (editor-attributed)
+    const latestRevision = rows[2]!; // @112 — "v2" (editor-attributed)
+
+    // Attribution end-to-end: BOTH edit entries NAME the editor.
+    const listBefore = await loadContentHistoryListFragment(env.DB, issue, comment.id);
+    expect(listBefore.results).toHaveLength(3);
+    expect(listBefore.results![0]?.name).toContain("<strong>frageditor</strong>");
+    expect(listBefore.results![1]?.name).toContain("<strong>frageditor</strong>");
+    expect(listBefore.results![2]?.name).toContain("<strong>fragposter</strong>");
+
+    // Baseline chain: the latest revision diffs against the middle one.
+    const before = await loadContentHistoryDetailFragment(
+      env,
+      repo,
+      issue,
+      { kind: "user", id: s.ownerId, username: "fragowner", isAdmin: false },
+      comment.id,
+      latestRevision.id,
+    );
+    expect(before).toMatchObject({ kind: "ok", prevHistoryId: middleRevision.id });
+    if (before.kind === "ok") {
+      expect(before.diffHtml).toBe(`<pre class="chroma">v<span class="gd">1</span><span class="gi">2</span></pre>`);
+    }
+
+    // The EDITOR — neither the issue poster nor the comment poster, only
+    // the MIDDLE revision's poster — hides it through the
+    // history.PosterID arm of canSoftDeleteContentHistory (:104).
+    const editorViewer = { kind: "user", id: editor.id, username: "frageditor", isAdmin: false } as const;
+    expect(await softDeleteContentHistoryFragment(env, repo, issue, editorViewer, comment.id, middleRevision.id)).toEqual({ kind: "deleted" });
+    const flipped = await drizzle(env.DB).select().from(issueContentHistory).where(eq(issueContentHistory.id, middleRevision.id)).get();
+    expect(flipped?.isDeleted).toBe(true);
+    expect(flipped?.contentText).toBe("");
+
+    // The visibility flip: the latest revision's prev chain SKIPS the
+    // deleted middle and now diffs against the first-created revision.
+    const after = await loadContentHistoryDetailFragment(env, repo, issue, editorViewer, comment.id, latestRevision.id);
+    expect(after).toMatchObject({ kind: "ok", prevHistoryId: createdRevision.id });
+    if (after.kind === "ok") {
+      expect(after.diffHtml).toBe(`<pre class="chroma">v<span class="gd">0</span><span class="gi">2</span></pre>`);
+    }
+
+    // The deleted middle itself still resolves (the target is NOT
+    // is_deleted-filtered) — its emptied body diffs as a pure delete
+    // against the surviving predecessor.
+    const middle = await loadContentHistoryDetailFragment(env, repo, issue, editorViewer, comment.id, middleRevision.id);
+    expect(middle).toMatchObject({ kind: "ok", historyId: middleRevision.id, prevHistoryId: createdRevision.id });
+    if (middle.kind === "ok") {
+      expect(middle.diffHtml).toBe(`<pre class="chroma"><span class="gd">v0</span></pre>`);
+    }
+
+    // The list keeps all three entries; the hidden one carries the marker.
+    const listAfter = await loadContentHistoryListFragment(env.DB, issue, comment.id);
+    expect(listAfter.results).toHaveLength(3);
+    expect(listAfter.results!.filter((item) => item.name.includes('<i data-history-is-deleted="1">deleted</i>'))).toHaveLength(1);
+  });
+
+  it("the guard arms: stranger 403, anonymous + scope mismatches the HTML 404, the two misses the empty-200 quirks", async () => {
+    const s = await seed();
+    const repo = (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, s.repoId)).get())!;
+    const issue = await resolveFragmentIssue(env.DB, repo, s.issue.index);
+    expect(issue).not.toBeNull();
+    if (issue === null) return;
+    const ownerViewer = { kind: "user", id: s.ownerId, username: "fragowner", isAdmin: false } as const;
+    const stranger = await seedVerifiedUser({ username: "fragstranger" });
+    const strangerViewer = { kind: "user", id: stranger.id, username: "fragstranger", isAdmin: false } as const;
+
+    const bodyRevisions = await drizzle(env.DB)
+      .select({ id: issueContentHistory.id, editedAt: issueContentHistory.editedAt })
+      .from(issueContentHistory)
+      .all();
+    const editedId = bodyRevisions
+      .filter((row) => row.editedAt.getTime() === at(50).getTime())
+      .map((row) => row.id)[0];
+    expect(editedId).toBeDefined();
+    if (editedId === undefined) return;
+
+    // A signed-in stranger without any grant or poster match → the JSON 403
+    // (:224-229) — the body the bundle toasts (repo-issue-content.ts:54).
+    const forbidden = await softDeleteContentHistoryFragment(env, repo, issue, strangerViewer, 0, editedId);
+    expect(forbidden).toEqual({ kind: "forbidden" });
+    const forbiddenResponse = contentHistorySoftDeleteFragmentResponse(forbidden);
+    expect(forbiddenResponse.status).toBe(403);
+    expect(await forbiddenResponse.text()).toBe(JSON.stringify({ message: "Can not delete the content history" }));
+    const unflipped = await drizzle(env.DB).select().from(issueContentHistory).where(eq(issueContentHistory.id, editedId)).get();
+    expect(unflipped?.isDeleted).toBe(false); // the denial wrote NOTHING
+
+    // Anonymous → ctx.NotFound(nil) (:188-191) — the HTML shell 404.
+    const anonymous = await softDeleteContentHistoryFragment(env, repo, issue, ANONYMOUS, 0, editedId);
+    expect(anonymous).toEqual({ kind: "notFound" });
+    const anonymousResponse = contentHistorySoftDeleteFragmentResponse(anonymous, "<html>404</html>");
+    expect(anonymousResponse.status).toBe(404);
+    expect(anonymousResponse.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(await anonymousResponse.text()).toBe("<html>404</html>");
+
+    // Global history-id miss (:200-203) — the log-and-return EMPTY 200.
+    const missing = await softDeleteContentHistoryFragment(env, repo, issue, ownerViewer, 0, 999999);
+    expect(missing).toEqual({ kind: "orphanedHistory" });
+    const missingResponse = contentHistorySoftDeleteFragmentResponse(missing);
+    expect(missingResponse.status).toBe(200);
+    expect(await missingResponse.text()).toBe("");
+
+    // comment_id mismatch (:208-211): a body revision requested under the
+    // comment namespace is a ctx.NotFound HTML 404.
+    const commentMismatch = await softDeleteContentHistoryFragment(env, repo, issue, ownerViewer, s.editedCommentId, editedId);
+    expect(commentMismatch).toEqual({ kind: "notFound" });
+
+    // A history row of ANOTHER issue (:204-207) — same HTML 404.
+    const foreignInserted = await drizzle(env.DB)
+      .insert(issueContentHistory)
+      .values({ issueId: 999999, commentId: 0, posterId: s.ownerId, editedAt: at(130), contentText: "foreign", isFirstCreated: false })
+      .returning({ id: issueContentHistory.id });
+    const foreignId = foreignInserted[0]?.id;
+    expect(foreignId).toBeDefined();
+    if (foreignId === undefined) return;
+    expect(await softDeleteContentHistoryFragment(env, repo, issue, ownerViewer, 0, foreignId)).toEqual({ kind: "notFound" });
+
+    // The comment-scope guard (:217-220): the history row marries a comment
+    // id whose ROW lives on another issue — the comment resolves, the scope
+    // check fails.
+    const otherIssue = await new IssuesService(env.DB).createIssue({
+      repoId: repo.id,
+      title: "the other issue",
+      content: "",
+      posterId: s.ownerId,
+      now: at(131),
+    });
+    await drizzle(env.DB).insert(comments).values({ id: 424242, type: 0, issueId: otherIssue.id, posterId: s.ownerId, content: "elsewhere" });
+    const marriedInserted = await drizzle(env.DB)
+      .insert(issueContentHistory)
+      .values({ issueId: issue.id, commentId: 424242, posterId: s.ownerId, editedAt: at(132), contentText: "married", isFirstCreated: false })
+      .returning({ id: issueContentHistory.id });
+    const marriedId = marriedInserted[0]?.id;
+    expect(marriedId).toBeDefined();
+    if (marriedId === undefined) return;
+    expect(await softDeleteContentHistoryFragment(env, repo, issue, ownerViewer, 424242, marriedId)).toEqual({ kind: "notFound" });
+
+    // The orphaned-comment quirk (:213-216): the married comment id with NO
+    // row — the EMPTY 200.
+    const orphanInserted = await drizzle(env.DB)
+      .insert(issueContentHistory)
+      .values({ issueId: issue.id, commentId: 424243, posterId: s.ownerId, editedAt: at(133), contentText: "orphaned", isFirstCreated: false })
+      .returning({ id: issueContentHistory.id });
+    const orphanId = orphanInserted[0]?.id;
+    expect(orphanId).toBeDefined();
+    if (orphanId === undefined) return;
+    const orphaned = await softDeleteContentHistoryFragment(env, repo, issue, ownerViewer, 424243, orphanId);
+    expect(orphaned).toEqual({ kind: "orphanedComment" });
+    const orphanedResponse = contentHistorySoftDeleteFragmentResponse(orphaned);
+    expect(orphanedResponse.status).toBe(200);
+    expect(await orphanedResponse.text()).toBe("");
   });
 });

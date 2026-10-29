@@ -1098,7 +1098,7 @@ export function registerPullRoutes(
       const body = patchField(form.body);
       if (body !== undefined && body !== (issue.content ?? "")) {
         const oldContent = issue.content ?? "";
-        const updated = await changeIssueBody(c.env.DB, issue, body, requestedVersion ?? issue.contentVersion, now);
+        const updated = await changeIssueBody(c.env.DB, issue, body, requestedVersion ?? issue.contentVersion, now, actorId);
         if (updated === null) {
           // Lost the concurrent CAS race — upstream ErrIssueAlreadyChanged.
           throw new ApiError(409, "the issue is already changed");

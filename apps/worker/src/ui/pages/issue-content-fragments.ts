@@ -12,6 +12,16 @@
  *   GET /{username}/{reponame}/{type}/{index}/content-history/overview  repo.GetContentHistoryOverview
  *   GET /{username}/{reponame}/{type}/{index}/content-history/list      repo.GetContentHistoryList
  *   GET /{username}/{reponame}/{type}/{index}/content-history/detail    repo.GetContentHistoryDetail
+ *   POST /{username}/{reponame}/{type}/{index}/content-history/soft-delete  repo.SoftDeleteContentHistory
+ *
+ * The three GETs share the view group (web.go:1319-1334, optSignIn +
+ * RepoAssignment + RequireUnitReader, mounted twice for {issues|pulls});
+ * the soft-delete POST rides upstream's OTHER group (web.go:1391, the
+ * `addIssuesPullsUpdateRoutes` family — reqSignIn + RepoAssignment +
+ * RepoMustNotBeArchived at web.go:1440, RequireUnitReader at :1408-1409),
+ * so its anonymous arm (issue_content_history.go:188-191 ctx.NotFound(nil))
+ * is defense-in-depth behind the sign-in gate, mirrored in the loader
+ * anyway.
  *
  * The `{type}` discriminators share ONE route group (web.go:1333-1334) and
  * upstream's own FIXME rides the group: "many pulls requests are sent to
@@ -122,6 +132,33 @@
  *   revision's comment row cannot be missing (the comment-delete hook
  *   removes its history rows), but the upstream miss arm (log + EMPTY 200
  *   body, :160-163) is mirrored as the `orphanedComment` outcome.
+ * - CONTENT-HISTORY SOFT-DELETE — IMPLEMENTED (issue_content_history.go:
+ *   183-236 SoftDeleteContentHistory; specs/issue-content-history.md §6's
+ *   optional follow-up): the moderation write that hides one revision.
+ *   Arm order mirrors the handler verbatim: an anonymous doer is the HTML
+ *   shell 404 (:188-191); the history read is GLOBAL by id
+ *   (GetIssueContentHistoryByID, content_history.go:209-218 — no issue
+ *   scope here, unlike the detail arm) and a miss is the log-and-return
+ *   EMPTY 200 quirk (:200-203, `orphanedHistory`); the two scope guards —
+ *   history.IssueID ≠ issue.ID (:204-207) and history.CommentID ≠
+ *   comment_id (:208-211) — are ctx.NotFound HTML-shell 404s; a
+ *   comment-scoped history reads its comment row globally
+ *   (GetCommentByID, :212-221) with the same empty-200 miss quirk
+ *   (`orphanedComment`) and the comment.IssueID ≠ issue.ID HTML 404; the
+ *   canSoftDeleteContentHistory gate (:223-229, the same function the
+ *   detail arm reports) denies with the JSON 403 `{"message": "Can not
+ *   delete the content history"}`; the write is
+ *   `SoftDeleteIssueContentHistory` (content_history.go:182-192 —
+ *   `is_deleted = 1` + the body EMPTIED to "") and the response is
+ *   `{"ok": err == nil}` — always HTTP 200 (:231-235), so a failed write
+ *   is `{"ok": false}`, not an error status. The official bundle POSTs
+ *   `comment_id`/`history_id` as QUERY params and toasts `resp.message`
+ *   on a non-ok body (web_src/js/features/repo-issue-content.ts:44-58);
+ *   a soft-deleted revision keeps its list entry with the
+ *   `data-history-is-deleted` marker (the dropdown refuses to open detail
+ *   on it, repo-issue-content.ts:121), drops out of every prev-diff chain
+ *   (GetIssueContentHistoryAndPrev filters is_deleted on the PREVIOUS
+ *   revision only), and still counts in the overview map (no filter).
  *
  * ## Mount record (MOUNTED at 22599e4, window-2e B2 — the wiring HANDOFF
  * is retired)
@@ -153,6 +190,19 @@
  *   historyId)` + `contentHistoryDetailFragmentResponse(data)` (the
  *   historyNotFound outcome IS the JSON 404 body — never the HTML shell).
  *   specs/issue-content-history.md §6 records the designs.
+ * - `POST rest = [<index>, "content-history", "soft-delete"]` → family
+ *   `"issue-content-history-soft-delete"` (upstream web.go:1391 — the
+ *   reqSignIn'd UPDATE group, NOT the GET group): the detail handler's
+ *   shape — `resolveUiRequest` → `resolveFragmentIssue` (null → the 404
+ *   shell) → FormInt64 `comment_id` AND `history_id` →
+ *   `softDeleteContentHistoryFragment(env, repo, issue, viewer, commentId,
+ *   historyId)` → `contentHistorySoftDeleteFragmentResponse(data,
+ *   renderNotFound(ctx))` (the notFound outcome renders the HTML shell;
+ *   forbidden is the JSON 403; the two orphaned outcomes are the EMPTY
+ *   200s; deleted/writeFailed are the `{"ok": …}` 200s). Upstream gates
+ *   the group with reqSignIn (web.go:1440) — if the mount's posture stays
+ *   anonymous-allowed like the GETs, the loader's own anonymous →
+ *   notFound arm (issue_content_history.go:188-191) keeps the parity.
  * - `rest = [<index>, "attachments", <uuid>]` → the per-issue alias of the
  *   landed site-level serving seam (`"issue-attachments-alias"` — a 302
  *   onto `/attachments/{uuid}`, the canonical `browser_download_url`;
@@ -171,6 +221,7 @@ import type { Issue } from "../../api/models/issue";
 import {
   findIssueByRepoAndIndex,
   issueLabelRows,
+  softDeleteIssueContentHistory,
   toApiIssue,
 } from "../../api/services/issues";
 import { canWriteRepository } from "../../api/services/repo-access";
@@ -776,6 +827,111 @@ export function contentHistoryDetailFragmentResponse(data: ContentHistoryDetailO
  *  Env — the single-field projection keeps both call shapes honest. */
 function d1Of(env: Env): D1Database {
   return env.DB;
+}
+
+// ---------------------------------------------------------------------------
+// Arm 6 — POST /{type}/{index}/content-history/soft-delete
+// (issue_content_history.go:183-236 SoftDeleteContentHistory, web.go:1391)
+// ---------------------------------------------------------------------------
+
+/**
+ * The soft-delete outcomes, one per upstream response arm: `deleted` /
+ * `writeFailed` are the ALWAYS-200 `{"ok": err == nil}` body
+ * (:231-235 — a failed write is `{"ok": false}`, not an error status);
+ * `forbidden` is the JSON 403 (:224-229); `notFound` collects the ctx.NotFound
+ * HTML-shell arms (anonymous :188-191, the two history scope guards
+ * :204-211, the comment-scope guard :217-220) — the mount renders the shell;
+ * `orphanedHistory` / `orphanedComment` mirror the two log-and-return
+ * EMPTY-200 quirks (:200-203 GetIssueContentHistoryByID miss,
+ * :213-216 GetCommentByID miss).
+ */
+export type ContentHistorySoftDeleteOutcome =
+  | { readonly kind: "deleted" }
+  | { readonly kind: "writeFailed" }
+  | { readonly kind: "forbidden" }
+  | { readonly kind: "notFound" }
+  | { readonly kind: "orphanedHistory" }
+  | { readonly kind: "orphanedComment" };
+
+/**
+ * The soft-delete arm: the handler's guard order verbatim (:188-229) —
+ * anonymous, the GLOBAL history-by-id read (no issue scope here, unlike
+ * the detail arm's `AND issue_id = ?`), the issue/comment scope guards,
+ * the comment row for comment-scoped revisions, the canSoftDeleteContent
+ * History gate, then the write. `env` (not bare d1) because the grant arm
+ * rides sessionRepoGrant, the detail loader's exact reason.
+ */
+export async function softDeleteContentHistoryFragment(
+  env: Env,
+  repo: RepoRow,
+  issue: IssueRow,
+  viewer: Viewer,
+  commentId: number,
+  historyId: number,
+): Promise<ContentHistorySoftDeleteOutcome> {
+  // :188-191 — `ctx.Doer == nil` → ctx.NotFound(nil). Unreachable through
+  // upstream's reqSignIn'd group (web.go:1440), mirrored for the mount's
+  // anonymous-allowed posture.
+  if (viewer.kind !== "user") return { kind: "notFound" };
+
+  // :200-203 — GetIssueContentHistoryByID(historyID), GLOBAL by id; the
+  // miss arm logs and returns with nothing written (the EMPTY 200 quirk).
+  const historyRows = await drizzle(d1Of(env))
+    .select()
+    .from(issueContentHistory)
+    .where(eq(issueContentHistory.id, historyId))
+    .limit(1)
+    .all();
+  const history = historyRows[0];
+  if (history === undefined) return { kind: "orphanedHistory" };
+
+  // :204-211 — the two ctx.NotFound scope guards (HTML shell, NOT the
+  // detail arm's JSON 404).
+  if (history.issueId !== issue.id) return { kind: "notFound" };
+  if (history.commentId !== commentId) return { kind: "notFound" };
+
+  // :212-221 — the comment row, read globally (GetCommentByID) and then
+  // scope-checked against THIS issue; the miss arm is the empty-200 quirk.
+  let comment: typeof comments.$inferSelect | null = null;
+  if (commentId !== 0) {
+    const found = await drizzle(d1Of(env)).select().from(comments).where(eq(comments.id, commentId)).limit(1).all();
+    comment = found[0] ?? null;
+    if (comment === null) return { kind: "orphanedComment" };
+    if (comment.issueId !== issue.id) return { kind: "notFound" };
+  }
+
+  // :223-229 — the same grant the detail arm REPORTS is the gate that
+  // ENFORCES here; denial is the JSON 403 body the bundle toasts.
+  if (!(await canSoftDeleteContentHistory(env, repo, issue, viewer, comment, history))) {
+    return { kind: "forbidden" };
+  }
+
+  // :231-235 — SoftDeleteIssueContentHistory; `{"ok": err == nil}`.
+  return { kind: (await softDeleteIssueContentHistory(d1Of(env), historyId)) ? "deleted" : "writeFailed" };
+}
+
+/** `ctx.JSON` per outcome (:225-228 the 403, :233-235 the ok payload) —
+ *  plus the notFound HTML-shell arm the mount fills with the rendered
+ *  not-found page (the info arm's convention). */
+export function contentHistorySoftDeleteFragmentResponse(
+  data: ContentHistorySoftDeleteOutcome,
+  notFoundHtml = "",
+): Response {
+  switch (data.kind) {
+    case "deleted":
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: jsonHeaders() });
+    case "writeFailed":
+      return new Response(JSON.stringify({ ok: false }), { status: 200, headers: jsonHeaders() });
+    case "forbidden":
+      return new Response(JSON.stringify({ message: "Can not delete the content history" }), {
+        status: 403,
+        headers: jsonHeaders(),
+      });
+    case "notFound":
+      return new Response(notFoundHtml, { status: 404, headers: { "content-type": "text/html; charset=utf-8" } });
+    default:
+      return new Response(null, { status: 200 }); // the two log-and-return quirks
+  }
 }
 
 // ---------------------------------------------------------------------------

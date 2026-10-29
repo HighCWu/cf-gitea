@@ -39,7 +39,7 @@ two remaining content-history fragment arms (`list`, `detail`).
 **Out of scope**
 
 - The `POST .../content-history/soft-delete` arm (upstream
-  `SoftDeleteContentHistory`, web.go:1329): it is a POST, not one of the two
+  `SoftDeleteContentHistory`, web.go:1391 (cite corrected 2026-10-29 — the POST rides addIssuesPullsUpdateRoutes, a different group from the GETs; was mis-cited 1329)): it is a POST, not one of the two
   GET fragments of this wave; rows can still be soft-deleted by a later wave
   (the write path and the `is_deleted` column exist and the list/detail arms
   already honor the flag). Mount recipe in §6.
@@ -295,7 +295,7 @@ Inside the same `rest.length === 3` arm of the route parser
   > The line cites drifted with sibling landings (the parser arm is now
   > `ui/index.ts`'s `rest.length === 3` block, the overview handler its
   > neighbor) — the shapes held and the mount followed them.
-- Optional follow-up (soft-delete wave): `POST .../soft-delete` → family
+- CLOSED 2026-10-29 (the soft-delete wave landed: six upstream guard arms verbatim, the empty-200 quirks kept; the writeFailed arm is unreachable on real D1 — no-match id answers true, xorm zero-rows-no-error parity): `POST .../soft-delete` → family
   `"issue-content-history-soft-delete"` driving a `softDeleteContentHistory`
   service export (permission math in §2's canSoftDelete).
 - Optional route threading for edit attribution (§5.1): pass the acting

@@ -1270,7 +1270,7 @@ export function registerIssueRoutes(
       // pre-edit content into the notifier (UpdateComment:420-461's
       // `changes.body.from`).
       const oldContent = row.comment.content ?? "";
-      await updateCommentBody(c.env.DB, row.comment.id, form.body, new Date());
+      await updateCommentBody(c.env.DB, row.comment.id, form.body, new Date(), editor.id ?? null); // actorId: the revision attributes its editor
       row.comment = { ...row.comment, content: form.body };
       // Webhook: comment edited — the `issue.IsPull` discriminant picks
       // issue_comment / pull_request_comment.
@@ -1409,7 +1409,7 @@ export function registerIssueRoutes(
         found.repo.ownerId,
       );
       const oldContent = issue.content ?? "";
-      const updated = await changeIssueBody(c.env.DB, issue, body, requestedVersion ?? issue.contentVersion, now);
+      const updated = await changeIssueBody(c.env.DB, issue, body, requestedVersion ?? issue.contentVersion, now, actorId);
       if (updated === null) {
         // Lost the concurrent CAS race — upstream ErrIssueAlreadyChanged.
         throw new ApiError(409, "the issue is already changed");

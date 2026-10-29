@@ -1192,6 +1192,28 @@ export async function keepLimitedIssueContentHistory(d1: D1Database, issueId: nu
   }
 }
 
+/**
+ * `SoftDeleteIssueContentHistory` (content_history.go:182-192): the
+ * moderation write behind upstream's POST .../content-history/soft-delete
+ * arm — one UPDATE scoping `is_deleted = 1` and EMPTYING the snapshot body
+ * (`content_text = ""`, never NULL — the column's documented invariant) by
+ * the row id. The boolean is upstream's `err == nil`: a failed write keeps
+ * the HTTP 200 and answers `{"ok": false}` (the handler arm,
+ * issue_content_history.go:231-235); row existence and permission are the
+ * caller's guards (upstream loads + scope-checks before writing).
+ */
+export async function softDeleteIssueContentHistory(d1: D1Database, historyId: number): Promise<boolean> {
+  try {
+    await drizzle(d1)
+      .update(issueContentHistory)
+      .set({ isDeleted: true, contentText: "" })
+      .where(eq(issueContentHistory.id, historyId));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** PATCH comment: body + content_version bump + updated stamp, riding the
  *  content-history write hook (specs/issue-content-history.md §3 — upstream
  *  services/issue/comments.go UpdateComment). */
