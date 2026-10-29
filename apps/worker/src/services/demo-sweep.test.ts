@@ -104,6 +104,15 @@ function scheduledEnv(demoMode: string): Env {
   // at the test-env level; the armed posture is pinned in audit.test.ts
   // under explicit envs).
   (copy as { AUDIT_RETENTION_DAYS?: string }).AUDIT_RETENTION_DAYS = "off";
+  // Same pin for the actions-retention producer (SPEC-0012 §4.5, rides the
+  // same hourly entry, NOT demo-gated): the example config ships the
+  // strict-polarity trio ARMED at the upstream defaults, so without this pin
+  // the armed vars would trip this suite's zero-D1/zero-send tripwires (the
+  // armed arms are pinned in services/actions/retention.test.ts).
+  const actionsPin = copy as { ACTIONS_ARTIFACT_RETENTION_DAYS?: string; ACTIONS_LOG_RETENTION_DAYS?: string; ACTIONS_RUN_RETENTION_DAYS?: string };
+  actionsPin.ACTIONS_ARTIFACT_RETENTION_DAYS = "off";
+  actionsPin.ACTIONS_LOG_RETENTION_DAYS = "off";
+  actionsPin.ACTIONS_RUN_RETENTION_DAYS = "off";
   return copy;
 }
 

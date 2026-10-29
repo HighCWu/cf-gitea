@@ -37,11 +37,15 @@
  * index.ts's `scheduled` handler is the single delegation
  * `await handleScheduledCron(controller, env)`. The dispatcher
  * reproduces the pre-M1 inline behavior on every non-hourly entry — the
- * mirror producers run unconditionally — and runs ONLY the (self-gated)
- * demo producer on the hourly "0 * * * *" entry (carried by
- * wrangler.jsonc.example), plus the (self-gated) audit-retention producer
- * block and the (unconditional, probe-gated) packages-cleanup producer
- * block on that same entry (SPEC-0015 §4.3 + SPEC-0016 §4.4 — the TWO
+ * mirror producers run unconditionally, joined (M2 wiring, SPEC-0012 §4.5's
+ * zombie arm) by the probe-gated actions-zombie producer (upstream's own
+ * always-on `stop_zombie_tasks` @every 5m, cron/tasks_actions.go:26-35 — the
+ * SPEC-0016 §4.4 packages ratification shape) — and runs FOUR producer
+ * blocks on the hourly "0 * * * *" entry (carried by wrangler.jsonc.example):
+ * the (self-gated) demo producer, the (self-gated) audit-retention producer,
+ * the (probe-gated, ratified non-demo-gated) packages-cleanup producer, and
+ * the (self-gated on the ACTIONS_*_RETENTION_DAYS trio) actions-retention
+ * producer (SPEC-0015 §4.3 + SPEC-0016 §4.4 + SPEC-0012 §4.5 — the THREE
  * sanctioned extensions; see the marked blocks in handleScheduledCron).
  * Tests exercise `handleScheduledCron` / `enqueueDueDemoSweeps` / the
  * purge.ts consumer arms directly with fabricated ScheduledControllers —
@@ -53,6 +57,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { repositories, users } from "../db/schema";
 import { enqueueDueAuditRetention } from "./audit";
+import { enqueueDueActionsRetention, enqueueDueZombieStops } from "./actions/retention";
 import { enqueueDuePackagesCleanup } from "./packages/cleanup";
 import { enqueueDueMirrorSyncs } from "./mirror/sync";
 import { enqueueDuePushMirrorSyncs } from "./mirror/push-sync";
@@ -245,17 +250,21 @@ export async function enqueueDueDemoSweeps(
 // ---------------------------------------------------------------------------
 
 /**
- * The cron dispatcher (§3.1): the hourly entry carries ONLY the demo
+ * The cron dispatcher (§3.1): the hourly entry carries the demo
  * producer (which self-gates on DEMO_MODE before its first D1 read — gate
  * off → the whole invocation performs zero reads and zero sends, §2's
  * invariant arm 1), the audit-retention producer (self-gated on
- * AUDIT_RETENTION_DAYS) and the packages-cleanup producer (ratified
+ * AUDIT_RETENTION_DAYS), the packages-cleanup producer (ratified
  * non-demo-gated — SPEC-0016 §4.4 — but probe-gated: no enabled rule AND no
- * expired orphans → zero sends); every OTHER entry — the standing 10-minute
- * step entry and anything a future config adds — runs the mirror producers
- * exactly as the inline handler always has: unconditional, gate-independent
- * (their CAS guard absorbs any :00 overlap, sync.ts:890-898). The step entry
- * therefore NEVER triggers a sweep, in either gate state.
+ * expired orphans → zero sends) and the actions-retention producer
+ * (self-gated on the ACTIONS_*_RETENTION_DAYS trio — SPEC-0012 §4.5: no var
+ * set → zero reads and zero sends); every OTHER entry — the standing
+ * 10-minute step entry and anything a future config adds — runs the mirror
+ * producers exactly as the inline handler always has: unconditional,
+ * gate-independent (their CAS guard absorbs any :00 overlap, sync.ts:890-898),
+ * joined by the probe-gated actions-zombie producer (upstream's always-on
+ * stop_zombie_tasks cadence). The step entry therefore NEVER triggers a
+ * sweep, in either gate state.
  */
 export async function handleScheduledCron(controller: ScheduledController, env: Env): Promise<void> {
   if (controller.cron === DEMO_SWEEP_CRON) {
@@ -296,10 +305,52 @@ export async function handleScheduledCron(controller: ScheduledController, env: 
       );
     }
     // --- END packages-cleanup producer block -------------------------------
+    // --- BEGIN actions-retention producer block (SPEC-0012 §4.5; the THIRD
+    // --- sanctioned extension of this dispatcher) --------------------------
+    // The strict-polarity trio ACTIONS_{ARTIFACT,LOG,RUN}_RETENTION_DAYS
+    // (upstream defaults 90/365/400 — modules/setting/actions.go:15-21) gates
+    // it fully-self-gated in services/actions/retention.ts: with no var set
+    // (a default deployment) it returns before its FIRST D1 read and before
+    // any queue send (the demoModeEnabled/audit posture — upstream's cleanup
+    // is always-on with the defaults, ours deletes only where an operator set
+    // a var); armed, it is at most ONE indexed LIMIT-1 probe per armed arm +
+    // at most ONE enqueue ("crons enqueue, consumers do the work" — the sweep
+    // runs in the REPO_TASKS consumer arm, runActionsRetention). Probe
+    // failures are logged and swallowed HERE: a broken tail arm must not fail
+    // the hourly invocation (the packages block's rationale) — the next tick
+    // re-probes.
+    try {
+      await enqueueDueActionsRetention(env, {});
+    } catch (error) {
+      console.error(
+        `[actions-retention] producer probes failed (retrying next tick): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    // --- END actions-retention producer block ------------------------------
     return;
   }
   // The mirror producers, exactly as today (index.ts scheduled) — the
   // pull-mirror SELECT+CAS+enqueue and the push-mirror twin.
   await enqueueDueMirrorSyncs(env, {});
   await enqueueDuePushMirrorSyncs(env, {});
+  // --- BEGIN actions-zombie producer block (SPEC-0012 §4.5/§5.6; the FOURTH
+  // --- sanctioned extension of this dispatcher) ---------------------------
+  // Upstream's stop_zombie_tasks is NOT retention: an always-on @every 5m
+  // cron (cron/tasks_actions.go:26-35, enabled default, no retention knob)
+  // that stops running/cancelling tasks whose `updated` went quiet past
+  // ZOMBIE_TASK_TIMEOUT (10 min) — so it rides this 10-minute step entry
+  // (the standing cadence closest to upstream's), NOT the hourly entry, and
+  // is NOT var-gated. It deletes no user data (the §2 invariant's scope is
+  // data deletion, which only the retention/demo families perform) and is
+  // probe-gated like the packages producer: zero sends unless a stale task
+  // exists. Swallowed failures keep the mirror producers' invocation intact
+  // (the tail-arm rationale); the next tick re-probes.
+  try {
+    await enqueueDueZombieStops(env, {});
+  } catch (error) {
+    console.error(
+      `[actions-zombie] producer probe failed (retrying next tick): ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  // --- END actions-zombie producer block ----------------------------------
 }

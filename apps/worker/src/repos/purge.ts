@@ -54,6 +54,12 @@
  */
 
 import { isAuditRetentionMessage, pruneExpiredAuditEvents } from "../services/audit";
+import {
+  isActionsRetentionMessage,
+  isActionsZombieStopMessage,
+  runActionsRetention,
+  stopZombieTasks,
+} from "../services/actions/retention";
 import { handlePackagesCleanup, isPackageCleanupMessage } from "../services/packages/cleanup";
 import { DEMO_RETENTION_HOURS, isDemoSweepMessage } from "../services/demo-sweep";
 import { handleMirrorSync, isMirrorSyncMessage } from "../services/mirror/sync";
@@ -184,6 +190,13 @@ export async function destroyRepoDO(env: Env, engineName: string): Promise<void>
  *     deleteRepository cascade as the API's DELETE route. No CAS on the
  *     enqueue: the row deletion is the claim, so redelivery (and the
  *     §3.0 DLQ redrive) is absorbed idempotently.
+ *   - actions retention ({kind: "actions-retention", …days}, SPEC-0012
+ *     §4.5): the ACTIONS_*_RETENTION_DAYS-gated hourly producer's sweep
+ *     request — runActionsRetention runs the armed arms (Cleanup +
+ *     CleanupOldRuns; the parsed windows ride the message).
+ *   - actions zombie stop ({kind: "actions-zombie"}, SPEC-0012 §5.6): the
+ *     probe-gated step-entry producer's stop request — StopZombieTasks over
+ *     stale running/cancelling tasks.
  *
  * Per message: idempotent work, then ack; a throw retries THAT message (the
  * redelivery re-runs the idempotent steps). Storage errors never fail the
@@ -275,6 +288,40 @@ export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): P
         message.ack();
       } catch (error) {
         console.error(`[repo-tasks] package-cleanup ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
+        message.retry();
+      }
+      continue;
+    }
+    // Actions retention (SPEC-0012 §4.5) — the same typed-arm placement: the
+    // producer (enqueueDueActionsRetention, on the hourly cron entry) arms
+    // per-var and the message CARRIES the parsed day-counts, so this arm runs
+    // exactly what was armed (unarmed arms ride as 0 = the upstream skip
+    // polarity) — no vars re-read consume-side. The sweep (artifacts + logs +
+    // ephemeral runners + old runs) is idempotent across redeliveries; a
+    // throw retries THAT message.
+    if (isActionsRetentionMessage(message.body)) {
+      try {
+        await runActionsRetention(env, message.body);
+        message.ack();
+      } catch (error) {
+        console.error(`[repo-tasks] actions-retention ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
+        message.retry();
+      }
+      continue;
+    }
+    // Actions zombie stop (SPEC-0012 §5.6) — upstream's always-on
+    // stop_zombie_tasks cron arm: stop running/cancelling tasks quiet past
+    // the zombie timeout (10 min default, ZOMBIE_TASK_TIMEOUT_MS). NOT
+    // var-gated (no retention knob upstream either); the step-entry producer
+    // sends only when a stale task exists. Idempotent (a stopped task is no
+    // longer running, so redelivery finds nothing).
+    if (isActionsZombieStopMessage(message.body)) {
+      try {
+        const stopped = await stopZombieTasks(env.DB);
+        console.log(`[repo-tasks] actions-zombie ${message.id}: stopped ${stopped}`);
+        message.ack();
+      } catch (error) {
+        console.error(`[repo-tasks] actions-zombie ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
         message.retry();
       }
       continue;

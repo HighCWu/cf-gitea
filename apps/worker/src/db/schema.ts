@@ -3947,3 +3947,59 @@ export const actionLogChunks = sqliteTable(
     index("action_log_chunks_task_id_idx").on(t.taskId),
   ],
 );
+
+// ---------------------------------------------------------------------------
+// The instance keystore (SPEC-0012 §4.4's keystore home — the upstream-faithful
+// port of the JWT/key material persistence). Upstream keeps NEITHER piece in a
+// models table: the HS256 general token-signing secret lives in the SETTING
+// STORE (app.ini `[oauth2] JWT_SECRET`, generated once and saved back into the
+// config when absent — modules/setting/oauth2.go:129-150, served by
+// GetGeneralTokenSigningSecret, :154-164) and the actions OIDC RS256 key lives
+// in an AppData FILE (<AppDataPath>/jwt/actions_oidc.pem,
+// services/actions/oidc.go:40-54 via LoadOrCreateAsymmetricKey,
+// services/oauth2_provider/jwtsigningkey.go:344-413). Our substrate has no
+// app.ini and no data dir (SPEC-0018 §1 ratified: no runtime-writable settings
+// store), so the D1 database — the deployment-local persistent store — is the
+// analog home: one row per material piece, keyed by name.
+// ---------------------------------------------------------------------------
+
+/**
+ * The instance keystore rows (one per crypto-material piece; write-once in
+ * practice — code only ever INSERTs, rotation is the OPERATOR replacing or
+ * deleting a row out-of-band + an isolate restart, exactly upstream's "edit
+ * app.ini / replace the PEM and restart" semantics; the code never rewrites
+ * an existing row).
+ *
+ * Rows (services/actions/secrets.ts owns the load-or-create behind
+ * loadKeystore — the single swap point):
+ *
+ *   - `general_token_signing_secret` — value:
+ *     `{"v":1,"tokenSigningSecret":"<64 hex chars = 32 bytes>"}` (upstream
+ *     oauth2.JWT_SECRET's role: the HS256 key for the runtime JWT, the OIDC
+ *     request JWT and the artifacts-v4 HMAC).
+ *   - `actions_oidc_signing_key` — value: `{"v":1,"oidcPrivateJwk":{…}}` with
+ *     the private RSA JWK + `kid` (upstream actions_oidc.pem's role; the
+ *     PEM/PKCS8 spelling replaced by JWK JSON — the same material in Web
+ *     Crypto's native format).
+ *
+ * At rest the values are plaintext JSON — the repo's ratified actions-secrets
+ * posture (the `secrets` table comment above: "an instance key model does not
+ * exist yet"; upstream itself stores the PEM unencrypted on the AppData disk).
+ * `name` is the PRIMARY KEY: two rows, point reads, no further indexes. The
+ * insert race (two isolates cold-generating concurrently) resolves by
+ * on-conflict-do-nothing + read-back — strictly stronger than upstream's
+ * temp-file + os.Link publish-complete-only dance (jwtsigningkey.go:389-392):
+ * a D1 row is never observable half-written.
+ */
+export const systemKeystore = sqliteTable("system_keystore", {
+  /** Material piece name (`general_token_signing_secret` |
+   *  `actions_oidc_signing_key`). */
+  name: text("name").primaryKey(),
+  /** The material JSON (see the row shapes above). */
+  value: text("value").notNull(),
+  /** Row creation — the mint time (upstream's file creation / app.ini save). */
+  createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+  /** Equals createdAt unless the OPERATOR rotated the material (the code
+   *  never updates a row). */
+  updatedAt: integer("updated_unix", { mode: "timestamp" }).notNull(),
+});

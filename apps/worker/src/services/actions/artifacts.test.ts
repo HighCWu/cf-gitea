@@ -10,7 +10,7 @@
 
 import { applyD1Migrations, SELF } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
@@ -22,6 +22,7 @@ import {
   actionTasks,
   repositories,
   repoUnits,
+  systemKeystore,
   users,
 } from "../../db/schema";
 import { createRunner, insertActionRun } from "./model";
@@ -693,9 +694,14 @@ describe("the secrets service", () => {
     expect(jwk1.use).toBe("sig");
     expect(jwk1.alg).toBe("RS256");
 
-    // The object persists in R2.
-    const obj = await env.REPO_PACKS.get("actions/_keystore/instance.json");
-    expect(obj).not.toBeNull();
+    // The material persists in the D1 keystore home (system_keystore — the
+    // M2 keystore-home port; the M1b R2 object is only a legacy adoption
+    // source now and is no longer written).
+    const keystoreRows = await db()
+      .select({ name: systemKeystore.name })
+      .from(systemKeystore)
+      .where(inArray(systemKeystore.name, ["general_token_signing_secret", "actions_oidc_signing_key"]));
+    expect(keystoreRows.map((r) => r.name).sort()).toEqual(["actions_oidc_signing_key", "general_token_signing_secret"]);
   });
 
   it("round-trips the runtime JWT and rejects scope/tamper misses", async () => {
