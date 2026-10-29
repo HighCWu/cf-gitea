@@ -1,6 +1,6 @@
 # SPEC-0016: The package registry — owner-scoped package model, the generic registry protocol, and the R04/R16 prerequisites
 
-Status: **draft** (ratification pending — open questions at §8; nothing built
+Status: **accepted** (ratified 2026-10-29, orchestrator — decisions appended at §8) (ratification pending — open questions at §8; nothing built
 before ratification, mirroring 0015's pre-ratification posture) ·
 Date: 2026-10-29 · Un-defers the UI gap census's two (c) FEATURE-GATED
 package rows
@@ -673,3 +673,16 @@ updates §2.1's table + the divergence ledger with its documented reductions.
    collapse, consistent with the landed teams model; upstream parity can
    arrive as a columns migration later if a deployment needs per-unit
    granularity.
+
+### Ratification (2026-10-29, orchestrator)
+
+All eight questions resolved per their proposals: (1) two-pass blob copy
+ships; (2) global-dedup `packages/blobs/<sharded-sha256>` namespace with the
+reference-counted deletion; (3) 512 MiB generic quota default (self-host R2
+cost safety; the var relaxes); (4) the unreferenced-sweep is the SOLE
+content-key deleter, owner cascades delete rows only; (5) the cleanup is the
+second sanctioned non-demo-gated producer block on the hourly entry (the
+audit-retention precedent, landed 5c8853c); (6) container upload state
+deferred to the M6 SPEC-attachment; (7) `repo_units` enum extends in the M2
+migration; (8) the accessMode-collapse fold, upstream parity can arrive as a
+later columns migration.

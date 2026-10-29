@@ -1,6 +1,6 @@
 # SPEC-0017: The commit-graph page — the `graphData` engine RPC and `GET .../graph`
 
-Status: **draft** (R09-SPEC unit, 2026-10-29 — for orchestrator ratification) ·
+Status: **accepted** (ratified 2026-10-29, orchestrator — decisions appended at §8) (R09-SPEC unit, 2026-10-29 — for orchestrator ratification) ·
 Date: 2026-10-29 · Fills census row R09
 ([docs/compat/ui-gap-census-2026-10-29.md](../docs/compat/ui-gap-census-2026-10-29.md):
 `GET .../graph` (ABSENT), size L, the two-step: an in-DO lane/position RPC +
@@ -709,3 +709,14 @@ unit in one index.ts registration window.
    page URL has no ref and upstream's walk is multi-ref by construction
    (§2.1). Ratify the opts shape (or reinstate a `ref` default-tip parameter
    if a future consumer needs a single-tip graph).
+
+### Ratification (2026-10-29, orchestrator)
+
+All six resolved per their proposals: (1) host the official JS (the heatmap
+DOM-parity precedent; the form-GET bar remains a no-ids-removal fallback);
+(2) the lane algorithm with the mechanical divergence ledgered — visual
+parity on the 5px/12px grid is the bar, glyph-identity is not; (3) the
+hybrid pager; (4) identity enrichment cut from v1 (the RPC carries the git
+identities; the D1 join lands later with no RPC change); (5) `?file=`
+honest-absent; (6) the `graphData(opts)` shape ratified — no `ref`
+parameter; a single-tip default graph is `refs` with one entry.
