@@ -75,9 +75,10 @@
  *   values (upstream's JSONErrorAuto is a form-fetch-action JS arm); a
  *   "missing" id is upstream's genuine ctx.NotFound(nil)
  *   (variables.go:172-175 / :186-191) — the app's 404 shell.
- * - The navbar is the module-local AdminActionsNav imported from the runners
- *   module (one copy for the wave — the module header's nav note); the
- *   HANDOFF's step 6 folds both onto AdminFamilyShell.
+ * - The navbar is the family-shared AdminFamilyNav (admin-users.tsx — the
+ *   integrator fold of the wave's former local AdminActionsNav, imported
+ *   from the runners module): the page rides AdminFamilyShell with
+ *   active="actions-variables".
  * - Scoped Workflows (web.go:903's group arm) is NOT SERVED — the runners
  *   module's reduction verdict carries for the whole group.
  *
@@ -189,7 +190,7 @@ import {
   type VariableRow,
 } from "../../api/services/secrets-variables";
 import { actionVariables } from "../../db/schema";
-import { BaseLayout, Icon, renderPage } from "../shell";
+import { Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 import {
   formatRepoActionsDate,
@@ -199,7 +200,7 @@ import {
   REPO_ACTIONS_WEB_LIST_LIMIT,
   repoSettingsActionsLocale,
 } from "./repo-settings-actions-secrets-variables";
-import { AdminActionsNav } from "./admin-actions-runners";
+import { AdminFamilyShell } from "./admin-users";
 
 // ---------------------------------------------------------------------------
 // The GLOBAL scope (upstream BelongingScopeGlobal() — variables.go:71-78's
@@ -472,42 +473,35 @@ export function AdminActionsVariablesPage(props: { ctx: UiContext; data: AdminAc
   const { ctx } = props;
   const base = "/-/admin/actions/variables";
   return (
-    <BaseLayout ctx={ctx} title={repoSettingsActionsLocale.variables_nav} pageClass="admin actions">
-      <div class="ui container fluid padded flex-container">
-        <AdminActionsNav active="actions-variables" />
-        <div class="flex-container-main">
-          <div class="admin-setting-content">
-            {/* shared/variables/variable_list.tmpl:1-17 */}
-            <h4 class="ui top attached header">{repoSettingsActionsLocale.variables_management}</h4>
-            <div class="ui attached segment">
-              {props.data.variables.length > 0 ? (
-                <div class="flex-divided-list items-with-main">
-                  {props.data.variables.map((row) => (
-                    <AdminActionsVariableRowItem key={row.id} row={row} />
-                  ))}
-                </div>
-              ) : (
-                <p>{repoSettingsActionsLocale.variables_none}</p>
-              )}
-              {props.error !== null ? <div class="ui negative message">{props.error}</div> : null}
-              {/* The #edit-variable-modal dialog reduced to the inline add
-                  form (the module header) — the dialog's lead line rides
-                  above it (variable_list.tmpl:72). */}
-              <div class="tw-mt-4" id="add-variable-panel">
-                <p>{repoSettingsActionsLocale.variables_description}</p>
-                <form class="ui form" action={`${base}/new`} method="post">
-                  <ActionsFormFields idPrefix="variable-add" form={props.data.form} />
-                  <div class="field">
-                    <button type="submit" class="ui primary button">
-                      {repoSettingsActionsLocale.add_variable}
-                    </button>
-                  </div>
-                </form>
-              </div>
-            </div>
+    <AdminFamilyShell ctx={ctx} title={repoSettingsActionsLocale.variables_nav} pageClass="admin actions" active="actions-variables">
+      {/* shared/variables/variable_list.tmpl:1-17 */}
+      <h4 class="ui top attached header">{repoSettingsActionsLocale.variables_management}</h4>
+      <div class="ui attached segment">
+        {props.data.variables.length > 0 ? (
+          <div class="flex-divided-list items-with-main">
+            {props.data.variables.map((row) => (
+              <AdminActionsVariableRowItem key={row.id} row={row} />
+            ))}
           </div>
+        ) : (
+          <p>{repoSettingsActionsLocale.variables_none}</p>
+        )}
+        {props.error !== null ? <div class="ui negative message">{props.error}</div> : null}
+        {/* The #edit-variable-modal dialog reduced to the inline add
+            form (the module header) — the dialog's lead line rides
+            above it (variable_list.tmpl:72). */}
+        <div class="tw-mt-4" id="add-variable-panel">
+          <p>{repoSettingsActionsLocale.variables_description}</p>
+          <form class="ui form" action={`${base}/new`} method="post">
+            <ActionsFormFields idPrefix="variable-add" form={props.data.form} />
+            <div class="field">
+              <button type="submit" class="ui primary button">
+                {repoSettingsActionsLocale.add_variable}
+              </button>
+            </div>
+          </form>
         </div>
       </div>
-    </BaseLayout>
+    </AdminFamilyShell>
   );
 }

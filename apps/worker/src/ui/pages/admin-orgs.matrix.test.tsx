@@ -265,6 +265,11 @@ describe("the admin orgs DOM (templates/admin/org/list.tmpl at the pin)", () => 
     // group's first item renders (navbar.tmpl:34-38, the EnablePackages arm
     // armed by default).
     expect(html).toContain('href="/-/admin/packages"');
-    expect(html).not.toContain("/-/admin/actions");
+    // The Actions group serves since 0c8da44 (job queue) — the stale
+    // not-contains pin died with it; the fold added Runners/Variables.
+    expect(html).toContain('href="/-/admin/actions/runners"');
+    expect(html).toContain('href="/-/admin/actions/variables"');
+    expect(html).toContain('href="/-/admin/actions/job_queue"');
+    expect(html).not.toContain("/-/admin/actions/scoped_workflows");
   });
 });

@@ -321,12 +321,14 @@ describe("the admin users DOM (templates/admin/user/list.tmpl at the pin)", () =
     // group's first item renders (navbar.tmpl:34-38, the EnablePackages arm
     // armed by default).
     expect(html).toContain('href="/-/admin/packages"');
-    // The census C6 arm landed (the Actions group's Job-queue item,
-    // navbar.tmpl:73-89 — pages/repo-actions-queue.tsx's mount); the group's
-    // unlanded siblings stay dead links (the dead-link rule).
+    // The census C6 arm landed (the Actions group, navbar.tmpl:73-89) with
+    // its full landed set: Job queue (pages/repo-actions-queue.tsx's mount)
+    // and the actions wave's Runners + Variables (the integrator fold of the
+    // modules' local AdminActionsNav); the Scoped-workflows item stays a
+    // dead link (its page is not served — the dead-link rule).
     expect(html).toContain('href="/-/admin/actions/job_queue"');
-    expect(html).not.toContain('href="/-/admin/actions/runners"');
-    expect(html).not.toContain('href="/-/admin/actions/variables"');
+    expect(html).toContain('href="/-/admin/actions/runners"');
+    expect(html).toContain('href="/-/admin/actions/variables"');
     expect(html).not.toContain("/-/admin/actions/scoped-workflows");
   });
 

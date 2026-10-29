@@ -393,6 +393,8 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Webhooks",
       "Summary", // SPEC-0018 §3.2's Configuration group item (navbar.tmpl:95-97's position)
       "System Notices", // SPEC-0018 §3.1's top-level item (navbar.tmpl:104-106's position)
+      "Runners", // the actions wave's landed Runners item (navbar.tmpl:78-80, the Actions group)
+      "Variables", // the actions wave's landed Variables item (navbar.tmpl:81-83, the Actions group)
       "Job queue", // the census C6 arm's landed item (navbar.tmpl:87-89, the Actions group)
       "Stats",
       "Cron Tasks",
@@ -449,6 +451,8 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Webhooks",
       "Summary", // SPEC-0018 §3.2's Configuration group item (navbar.tmpl:95-97's position)
       "System Notices", // SPEC-0018 §3.1's top-level item (navbar.tmpl:104-106's position)
+      "Runners", // the actions wave's landed Runners item (navbar.tmpl:78-80, the Actions group)
+      "Variables", // the actions wave's landed Variables item (navbar.tmpl:81-83, the Actions group)
       "Job queue", // the census C6 arm's landed item (navbar.tmpl:87-89, the Actions group)
       "Stats",
       "Cron Tasks",
@@ -524,6 +528,8 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Webhooks",
       "Summary", // SPEC-0018 §3.2's Configuration group item (navbar.tmpl:95-97's position)
       "System Notices", // SPEC-0018 §3.1's top-level item (navbar.tmpl:104-106's position)
+      "Runners", // the actions wave's landed Runners item (navbar.tmpl:78-80, the Actions group)
+      "Variables", // the actions wave's landed Variables item (navbar.tmpl:81-83, the Actions group)
       "Job queue", // the census C6 arm's landed item (navbar.tmpl:87-89, the Actions group)
       "Stats",
       "Cron Tasks",
@@ -597,6 +603,8 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Webhooks",
       "Summary", // SPEC-0018 §3.2's Configuration group item (navbar.tmpl:95-97's position)
       "System Notices", // SPEC-0018 §3.1's top-level item (navbar.tmpl:104-106's position)
+      "Runners", // the actions wave's landed Runners item (navbar.tmpl:78-80, the Actions group)
+      "Variables", // the actions wave's landed Variables item (navbar.tmpl:81-83, the Actions group)
       "Job queue", // the census C6 arm's landed item (navbar.tmpl:87-89, the Actions group)
       "Stats",
       "Cron Tasks",

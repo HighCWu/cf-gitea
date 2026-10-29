@@ -345,6 +345,11 @@ describe("the admin repos DOM (templates/admin/repo/list.tmpl at the pin)", () =
     expect(html).toContain('href="/-/admin/hooks"');
     expect(html).toContain('href="/-/admin/notices"'); // SPEC-0018 §3.1's top-level item
     expect(html).toContain('href="/-/admin/config"'); // SPEC-0018 §3.2's Configuration group (the Summary item)
-    expect(html).not.toContain("/-/admin/actions");
+    // The Actions group serves since 0c8da44 (job queue) — the stale
+    // not-contains pin died with it; the fold added Runners/Variables.
+    expect(html).toContain('href="/-/admin/actions/runners"');
+    expect(html).toContain('href="/-/admin/actions/variables"');
+    expect(html).toContain('href="/-/admin/actions/job_queue"');
+    expect(html).not.toContain("/-/admin/actions/scoped_workflows");
   });
 });

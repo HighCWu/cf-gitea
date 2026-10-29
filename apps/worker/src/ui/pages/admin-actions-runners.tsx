@@ -110,16 +110,13 @@
  * - The edit page's task list keeps the twins' posture: the Job cell renders
  *   the id as TEXT (the repo twin's GetRunJobLink reduction — its fold-back
  *   is that module's reported follow-up and this module inherits it).
- * - The NAVBAR is the module-local AdminActionsNav (below): the landed
- *   AdminFamilyNav's structure with the Actions group carrying this wave's
- *   landed Runners + Variables items beside Job queue. The shared nav's
- *   union cannot grow from this module (admin-users.tsx is outside the wave's
- *   ownership — the repo twin's mount-scaffolding precedent); the HANDOFF
- *   recipes carry the admin-users.tsx extension and the swap of BOTH this
- *   module's and the variables module's shells onto AdminFamilyShell (the
- *   repo twin's reported fold-back convention). The Scoped Workflows item
- *   stays OMITTED even here — its page is not served (the reduction below),
- *   the dead-link rule.
+ * - The NAVBAR is the family-shared AdminFamilyNav (admin-users.tsx — the
+ *   integrator fold of this module's former local AdminActionsNav, the
+ *   repo twin's fold-back convention): both pages ride AdminFamilyShell
+ *   with active="actions-runners", the Actions group carrying this wave's
+ *   landed Runners + Variables items beside Job queue. The Scoped Workflows
+ *   item stays OMITTED — its page is not served (the reduction below), the
+ *   dead-link rule.
  * - SCOPED WORKFLOWS IS NOT SERVED (web.go:903's group arm): upstream's page
  *   rides the `action_scoped_workflow_source` store (models/actions/
  *   scoped_workflow.go — per-owner registered source repos with the
@@ -306,7 +303,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { actionRunJobs, actionRunners, actionTasks, repositories, users } from "../../db/schema";
 import { getOrCreateActiveRunnerToken, newRunnerToken, type RunnerRow } from "../../services/actions/model";
-import { BaseLayout, Icon, renderPage } from "../shell";
+import { Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 import { TimeSince } from "../components/file-list";
 import { shortSha } from "../page-data";
@@ -326,7 +323,7 @@ import {
   type RunnerTaskView,
   type RunnerView,
 } from "./repo-settings-actions-runners";
-import { AdminFamilyPagination, adminFamilyLocale } from "./admin-users";
+import { AdminFamilyPagination, AdminFamilyShell } from "./admin-users";
 
 // ---------------------------------------------------------------------------
 // Locale (this module adds only the strings its pages cite beyond the shared
@@ -338,84 +335,6 @@ export const adminActionsRunnersLocale = {
   total_count: "Total:", // "admin.total" = 'Total: %d' — the count renders beside it (runner_list.tmpl:4)
   selectRow: "Check/Uncheck", // "repo.issues.action_check" (the per-row checkbox's aria-label prefix, runner_list.tmpl:113)
 } as const;
-
-// ---------------------------------------------------------------------------
-// The module-local admin navbar (the mount-scaffolding convention — the
-// module header's nav note): the landed AdminFamilyNav's structure with the
-// Actions group carrying this wave's Runners + Variables items beside Job
-// queue. The Scoped Workflows item stays omitted (the page is not served —
-// the dead-link rule). The HANDOFF's step 6 folds this into the shared nav.
-// ---------------------------------------------------------------------------
-
-export type AdminActionsNavActive = "actions-runners" | "actions-variables";
-
-export function AdminActionsNav(props: { active: AdminActionsNavActive }) {
-  const item = (href: string, label: string, active: boolean) => (
-    <a class={active ? "active item" : "item"} href={href}>
-      {label}
-    </a>
-  );
-  return (
-    <div class="flex-container-nav">
-      <div class="ui fluid vertical menu">
-        <div class="header item">{adminFamilyLocale.settings}</div>
-        <details class="item">
-          <summary>{adminFamilyLocale.maintenance}</summary>
-          <div class="menu">{item("/-/admin", adminFamilyLocale.dashboard, false)}</div>
-        </details>
-        <details class="item">
-          <summary>{adminFamilyLocale.identityAccess}</summary>
-          <div class="menu">
-            {item("/-/admin/orgs", adminFamilyLocale.organizations, false)}
-            {item("/-/admin/users", adminFamilyLocale.userAccounts, false)}
-            {item("/-/admin/badges", adminFamilyLocale.badges, false)}
-            {item("/-/admin/emails", adminFamilyLocale.emails, false)}
-          </div>
-        </details>
-        <details class="item">
-          <summary>{adminFamilyLocale.assets}</summary>
-          <div class="menu">
-            {item("/-/admin/repos", adminFamilyLocale.repositories, false)}
-          </div>
-        </details>
-        <details class="item">
-          <summary>{adminFamilyLocale.integrations}</summary>
-          <div class="menu">
-            {item("/-/admin/applications", adminFamilyLocale.applications, false)}
-            {item("/-/admin/hooks", adminFamilyLocale.hooks, false)}
-          </div>
-        </details>
-        <details class="item">
-          <summary>{adminFamilyLocale.configuration}</summary>
-          <div class="menu">{item("/-/admin/config", adminFamilyLocale.configSummary, false)}</div>
-        </details>
-        {item("/-/admin/notices", adminFamilyLocale.notices, false)}
-        {/* navbar.tmpl:73-89 — the Actions group with this wave's landed
-            items (Runners :78-80, Variables :81-83) beside the C6 Job-queue
-            item (:87-89). Scoped Workflows (:84-86) stays omitted — its page
-            is not served (the module header's reduction; the dead-link
-            rule). */}
-        <details class="item" open>
-          <summary>{adminFamilyLocale.actions}</summary>
-          <div class="menu">
-            {item("/-/admin/actions/runners", repoSettingsRunnersLocale.runner_title, props.active === "actions-runners")}
-            {item("/-/admin/actions/variables", "Variables", props.active === "actions-variables")}
-            {item("/-/admin/actions/job_queue", adminFamilyLocale.jobQueue, false)}
-          </div>
-        </details>
-        <details class="item">
-          <summary>{adminFamilyLocale.monitoring}</summary>
-          <div class="menu">
-            {item("/-/admin/monitor/stats", adminFamilyLocale.stats, false)}
-            {item("/-/admin/monitor/cron", adminFamilyLocale.cron, false)}
-            {item("/-/admin/monitor/queue", adminFamilyLocale.queues, false)}
-            {item("/-/admin/monitor/stacktrace", adminFamilyLocale.trace, false)}
-          </div>
-        </details>
-      </div>
-    </div>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // The list query (FindRunnerOptions.ToConds over the ADMIN scope — no scope
@@ -816,167 +735,160 @@ export function AdminActionsRunnersPage(props: { ctx: UiContext; data: AdminActi
   if (data.query !== "") pagerQuery.set("q", data.query);
   if (data.sortType !== "") pagerQuery.set("sort", data.sortType);
   return (
-    <BaseLayout ctx={ctx} title={repoSettingsRunnersLocale.actions} pageClass="admin actions">
-      <div class="ui container fluid padded flex-container">
-        <AdminActionsNav active="actions-runners" />
-        <div class="flex-container-main">
-          <div class="admin-setting-content">
-            {/* runner_list.tmpl:3-37 — the header with the count in the
-                admin.total form ("Total: %d") and the token panel (the
-                dropdown reduced inline; the module header). */}
-            <h4 class="ui top attached header">
-              {repoSettingsRunnersLocale.runner_manage_panel} ({adminActionsRunnersLocale.total_count} {data.total})
-            </h4>
-            <div class="ui attached segment" id="runner-registration-token-panel">
-              <div>
-                <a href="https://docs.gitea.com/usage/actions/runner" target="_blank" rel="noopener noreferrer">
-                  {repoSettingsRunnersLocale.new_notice}
-                </a>
-              </div>
-              <div class="ui divider" />
-              <div class="ui header">{repoSettingsRunnersLocale.registration_token}</div>
-              <div class="ui action input">
-                <input type="text" value={data.registrationToken} readonly aria-label={repoSettingsRunnersLocale.registration_token} />
-                <button
-                  type="button"
-                  class="ui basic label button"
-                  aria-label={repoSettingsRunnersLocale.copy}
-                  data-clipboard-text={data.registrationToken}
-                >
-                  {repoSettingsRunnersLocale.copy}
-                </button>
-              </div>
-              <div class="ui divider" />
-              {/* The reset arm — upstream's link-action + confirm modal
-                  reduced to the plain form (the twins' header). */}
-              <form method="post" action={`${base}/reset_registration_token`}>
-                <button type="submit" class="link-action">
-                  {repoSettingsRunnersLocale.reset_registration_token}
-                </button>
-              </form>
-            </div>
-            {/* The search segment (runner_list.tmpl:33-37). */}
-            <div class="ui attached segment">
-              <form class="ui form ignore-dirty" id="user-list-search-form" action={base} method="get">
-                <div class="ui small icon input">
-                  <input name="q" value={data.query} placeholder={repoSettingsRunnersLocale.search_runners} />
-                </div>
-              </form>
-            </div>
-            {/* AllowBulkActions is TRUE at the admin scope
-                (runners.go:155) — the bulk toolbar reduced to the
-                admin-notices idiom: ONE form wrapping the table + the
-                toolbar (the module header; the JS select-all and confirm
-                modals omitted). */}
-            {data.runners.length > 0 ? (
-              <form method="post" action={`${base}/bulk`}>
-                <div class="ui attached table segment">
-                  <table class="ui very basic table unstackable">
-                    <thead>
-                      <tr>
-                        {/* The AllowBulkActions checkbox column
-                            (runner_list.tmpl:59-61); the select-all
-                            checkbox is JS-wired upstream and stays
-                            omitted (the module header). */}
-                        <th class="tw-w-8" aria-label={adminActionsRunnersLocale.selectRow} />
-                        {/* The sort headers' data-sortt attributes ride
-                            verbatim (runner_list.tmpl:62-84). */}
-                        <th data-sortt-asc="alphabetically" data-sortt-desc="reversealphabetically">
-                          {repoSettingsRunnersLocale.runner_title}
-                        </th>
-                        <th data-sortt-asc="online" data-sortt-desc="offline">
-                          {repoSettingsRunnersLocale.status}
-                        </th>
-                        <th data-sortt-asc="newest" data-sortt-desc="oldest">
-                          {repoSettingsRunnersLocale.id}
-                        </th>
-                        <th>{repoSettingsRunnersLocale.version}</th>
-                        <th>{repoSettingsRunnersLocale.owner_type}</th>
-                        <th>{repoSettingsRunnersLocale.labels}</th>
-                        <th>{repoSettingsRunnersLocale.last_online}</th>
-                        <th>{repoSettingsRunnersLocale.edit}</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {data.runners.map((runner) => (
-                        <tr>
-                          <td>
-                            <input
-                              type="checkbox"
-                              name="ids"
-                              value={String(runner.row.id)}
-                              aria-label={`${adminActionsRunnersLocale.selectRow}: ${runner.row.name}`}
-                            />
-                          </td>
-                          <td>
-                            <p data-tooltip-content={runner.row.description}>{runner.row.name}</p>
-                          </td>
-                          <td>
-                            <span class={`ui label ${runnerStatusClass(runner.status)}`}>{runnerStatusLocaleText(runner.status)}</span>
-                            {runner.row.isDisabled ? <span class="ui grey label">{repoSettingsRunnersLocale.disabled}</span> : null}
-                          </td>
-                          <td>{runner.row.id}</td>
-                          <td>{runner.row.version !== "" ? runner.row.version : repoSettingsRunnersLocale.unknown}</td>
-                          <td>
-                            {runner.belongsTo.tooltip !== null ? (
-                              <span data-tooltip-content={runner.belongsTo.tooltip}>{runner.belongsTo.text}</span>
-                            ) : (
-                              <span>{runner.belongsTo.text}</span>
-                            )}
-                          </td>
-                          <td>
-                            <span class="flex-text-inline tw-flex-wrap">
-                              {runner.agentLabels.map((label) => (
-                                <span class="ui label">{label}</span>
-                              ))}
-                            </span>
-                          </td>
-                          <td>
-                            {runner.row.lastOnline !== null ? (
-                              <TimeSince unixSeconds={runner.row.lastOnline.getTime() / 1000} tz="+0000" />
-                            ) : (
-                              repoSettingsRunnersLocale.never
-                            )}
-                          </td>
-                          {/* EditableInContext(0, 0) is TRUE for every row
-                              (runner.go:162-165) — the pencil is
-                              unconditional at the admin scope
-                              (runner_list.tmpl:118-122). */}
-                          <td>
-                            <a href={`${base}/${runner.row.id}`} aria-label={repoSettingsRunnersLocale.edit}>
-                              <Icon name="octicon-pencil" />
-                            </a>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                {/* The bulk toolbar's three submits (runner_list.tmpl:41-52
-                    reduced; the confirm modal omitted — the module
-                    header). */}
-                <div class="ui attached segment">
-                  <button type="submit" class="ui small button" name="action" value="disable">
-                    {repoSettingsRunnersLocale.disable_runner}
-                  </button>
-                  <button type="submit" class="ui small button" name="action" value="enable">
-                    {repoSettingsRunnersLocale.enable_runner}
-                  </button>
-                  <button type="submit" class="ui small red button" name="action" value="delete">
-                    {repoSettingsRunnersLocale.delete_runner}
-                  </button>
-                </div>
-              </form>
-            ) : (
-              <div class="ui attached segment tw-text-center">{repoSettingsRunnersLocale.none}</div>
-            )}
-            {/* base/paginate — the family pager keeping the q + sort
-                facets. */}
-            <AdminFamilyPagination basePath={base} query={pagerQuery} page={data.page} more={data.more} />
-          </div>
+    <AdminFamilyShell ctx={ctx} title={repoSettingsRunnersLocale.actions} pageClass="admin actions" active="actions-runners">
+      {/* runner_list.tmpl:3-37 — the header with the count in the
+          admin.total form ("Total: %d") and the token panel (the
+          dropdown reduced inline; the module header). */}
+      <h4 class="ui top attached header">
+        {repoSettingsRunnersLocale.runner_manage_panel} ({adminActionsRunnersLocale.total_count} {data.total})
+      </h4>
+      <div class="ui attached segment" id="runner-registration-token-panel">
+        <div>
+          <a href="https://docs.gitea.com/usage/actions/runner" target="_blank" rel="noopener noreferrer">
+            {repoSettingsRunnersLocale.new_notice}
+          </a>
         </div>
+        <div class="ui divider" />
+        <div class="ui header">{repoSettingsRunnersLocale.registration_token}</div>
+        <div class="ui action input">
+          <input type="text" value={data.registrationToken} readonly aria-label={repoSettingsRunnersLocale.registration_token} />
+          <button
+            type="button"
+            class="ui basic label button"
+            aria-label={repoSettingsRunnersLocale.copy}
+            data-clipboard-text={data.registrationToken}
+          >
+            {repoSettingsRunnersLocale.copy}
+          </button>
+        </div>
+        <div class="ui divider" />
+        {/* The reset arm — upstream's link-action + confirm modal
+            reduced to the plain form (the twins' header). */}
+        <form method="post" action={`${base}/reset_registration_token`}>
+          <button type="submit" class="link-action">
+            {repoSettingsRunnersLocale.reset_registration_token}
+          </button>
+        </form>
       </div>
-    </BaseLayout>
+      {/* The search segment (runner_list.tmpl:33-37). */}
+      <div class="ui attached segment">
+        <form class="ui form ignore-dirty" id="user-list-search-form" action={base} method="get">
+          <div class="ui small icon input">
+            <input name="q" value={data.query} placeholder={repoSettingsRunnersLocale.search_runners} />
+          </div>
+        </form>
+      </div>
+      {/* AllowBulkActions is TRUE at the admin scope
+          (runners.go:155) — the bulk toolbar reduced to the
+          admin-notices idiom: ONE form wrapping the table + the
+          toolbar (the module header; the JS select-all and confirm
+          modals omitted). */}
+      {data.runners.length > 0 ? (
+        <form method="post" action={`${base}/bulk`}>
+          <div class="ui attached table segment">
+            <table class="ui very basic table unstackable">
+              <thead>
+                <tr>
+                  {/* The AllowBulkActions checkbox column
+                      (runner_list.tmpl:59-61); the select-all
+                      checkbox is JS-wired upstream and stays
+                      omitted (the module header). */}
+                  <th class="tw-w-8" aria-label={adminActionsRunnersLocale.selectRow} />
+                  {/* The sort headers' data-sortt attributes ride
+                      verbatim (runner_list.tmpl:62-84). */}
+                  <th data-sortt-asc="alphabetically" data-sortt-desc="reversealphabetically">
+                    {repoSettingsRunnersLocale.runner_title}
+                  </th>
+                  <th data-sortt-asc="online" data-sortt-desc="offline">
+                    {repoSettingsRunnersLocale.status}
+                  </th>
+                  <th data-sortt-asc="newest" data-sortt-desc="oldest">
+                    {repoSettingsRunnersLocale.id}
+                  </th>
+                  <th>{repoSettingsRunnersLocale.version}</th>
+                  <th>{repoSettingsRunnersLocale.owner_type}</th>
+                  <th>{repoSettingsRunnersLocale.labels}</th>
+                  <th>{repoSettingsRunnersLocale.last_online}</th>
+                  <th>{repoSettingsRunnersLocale.edit}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.runners.map((runner) => (
+                  <tr>
+                    <td>
+                      <input
+                        type="checkbox"
+                        name="ids"
+                        value={String(runner.row.id)}
+                        aria-label={`${adminActionsRunnersLocale.selectRow}: ${runner.row.name}`}
+                      />
+                    </td>
+                    <td>
+                      <p data-tooltip-content={runner.row.description}>{runner.row.name}</p>
+                    </td>
+                    <td>
+                      <span class={`ui label ${runnerStatusClass(runner.status)}`}>{runnerStatusLocaleText(runner.status)}</span>
+                      {runner.row.isDisabled ? <span class="ui grey label">{repoSettingsRunnersLocale.disabled}</span> : null}
+                    </td>
+                    <td>{runner.row.id}</td>
+                    <td>{runner.row.version !== "" ? runner.row.version : repoSettingsRunnersLocale.unknown}</td>
+                    <td>
+                      {runner.belongsTo.tooltip !== null ? (
+                        <span data-tooltip-content={runner.belongsTo.tooltip}>{runner.belongsTo.text}</span>
+                      ) : (
+                        <span>{runner.belongsTo.text}</span>
+                      )}
+                    </td>
+                    <td>
+                      <span class="flex-text-inline tw-flex-wrap">
+                        {runner.agentLabels.map((label) => (
+                          <span class="ui label">{label}</span>
+                        ))}
+                      </span>
+                    </td>
+                    <td>
+                      {runner.row.lastOnline !== null ? (
+                        <TimeSince unixSeconds={runner.row.lastOnline.getTime() / 1000} tz="+0000" />
+                      ) : (
+                        repoSettingsRunnersLocale.never
+                      )}
+                    </td>
+                    {/* EditableInContext(0, 0) is TRUE for every row
+                        (runner.go:162-165) — the pencil is
+                        unconditional at the admin scope
+                        (runner_list.tmpl:118-122). */}
+                    <td>
+                      <a href={`${base}/${runner.row.id}`} aria-label={repoSettingsRunnersLocale.edit}>
+                        <Icon name="octicon-pencil" />
+                      </a>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {/* The bulk toolbar's three submits (runner_list.tmpl:41-52
+              reduced; the confirm modal omitted — the module
+              header). */}
+          <div class="ui attached segment">
+            <button type="submit" class="ui small button" name="action" value="disable">
+              {repoSettingsRunnersLocale.disable_runner}
+            </button>
+            <button type="submit" class="ui small button" name="action" value="enable">
+              {repoSettingsRunnersLocale.enable_runner}
+            </button>
+            <button type="submit" class="ui small red button" name="action" value="delete">
+              {repoSettingsRunnersLocale.delete_runner}
+            </button>
+          </div>
+        </form>
+      ) : (
+        <div class="ui attached segment tw-text-center">{repoSettingsRunnersLocale.none}</div>
+      )}
+      {/* base/paginate — the family pager keeping the q + sort
+          facets. */}
+      <AdminFamilyPagination basePath={base} query={pagerQuery} page={data.page} more={data.more} />
+    </AdminFamilyShell>
   );
 }
 
@@ -992,152 +904,145 @@ export function AdminActionsRunnerEditPage(props: { ctx: UiContext; data: AdminA
   const base = "/-/admin/actions/runners";
   const runnerLink = `${base}/${data.runner.id}`;
   return (
-    <BaseLayout ctx={ctx} title={adminActionsRunnersLocale.edit_runner} pageClass="admin runners">
-      <div class="ui container fluid padded flex-container">
-        <AdminActionsNav active="actions-runners" />
-        <div class="flex-container-main">
-          <div class="admin-setting-content">
-            {/* runner_edit.tmpl:2-4 (shared/actions/runner_edit) — the
-                header. */}
-            <h4 class="ui top attached header">
-              {repoSettingsRunnersLocale.runner_title} {data.runner.id} {data.runner.name}
-            </h4>
-            <div class="ui attached segment">
-              {/* The basic-info fields (runner_edit.tmpl:7-31). */}
-              <div class="runner-basic-info">
-                <div class="field tw-inline-block tw-mr-4">
-                  <label>{repoSettingsRunnersLocale.status}</label>
-                  <span class={`ui ${data.runnerStatus === "offline" ? "basic" : "green"} label`}>
-                    {runnerStatusLocaleText(data.runnerStatus)}
-                  </span>
-                </div>
-                <div class="field tw-inline-block tw-mr-4">
-                  <label>{repoSettingsRunnersLocale.availability}</label>
-                  <span class={`ui ${data.runner.isDisabled ? "grey" : "green"} label`}>
-                    {data.runner.isDisabled ? repoSettingsRunnersLocale.disabled : repoSettingsRunnersLocale.enabled}
-                  </span>
-                </div>
-                <div class="field tw-inline-block tw-mr-4">
-                  <label>{repoSettingsRunnersLocale.last_online}</label>
-                  <span>
-                    {data.runner.lastOnline !== null ? (
-                      <TimeSince unixSeconds={data.runner.lastOnline.getTime() / 1000} tz="+0000" />
-                    ) : (
-                      repoSettingsRunnersLocale.never
-                    )}
-                  </span>
-                </div>
-                <div class="field tw-inline-block tw-mr-4">
-                  <label>{repoSettingsRunnersLocale.labels}</label>
-                  <span class="flex-text-inline tw-flex-wrap">
-                    {data.agentLabels.map((label) => (
-                      <span class="ui label">{label}</span>
-                    ))}
-                  </span>
-                </div>
-                <div class="field tw-inline-block tw-mr-4">
-                  <label>{repoSettingsRunnersLocale.owner_type}</label>
-                  <span>
-                    {data.belongsTo.tooltip !== null ? (
-                      <span data-tooltip-content={data.belongsTo.tooltip}>{data.belongsTo.text}</span>
-                    ) : (
-                      data.belongsTo.text
-                    )}
-                  </span>
-                </div>
-              </div>
-              <div class="divider" />
-              {/* The description form (runner_edit.tmpl:33-42) — the submit
-                  is the Update Changes button; the enable/disable and
-                  delete arms reduce to the plain POST forms beside it (the
-                  twins' header). */}
-              <form class="ui form" method="post" action={runnerLink}>
-                <div class="field">
-                  <label for="description">{repoSettingsRunnersLocale.description}</label>
-                  <input id="description" name="description" value={data.runner.description} />
-                </div>
-                <div class="field">
-                  <button type="submit" class="ui primary button">
-                    {repoSettingsRunnersLocale.update_runner}
-                  </button>
-                </div>
-              </form>
-              <form class="tw-inline-block" method="post" action={`${runnerLink}/update-runner`}>
-                <input type="hidden" name="disabled" value={data.runner.isDisabled ? "false" : "true"} />
-                <button type="submit" class="ui button">
-                  {data.runner.isDisabled ? repoSettingsRunnersLocale.enable_runner : repoSettingsRunnersLocale.disable_runner}
-                </button>
-              </form>
-              <form class="tw-inline-block" method="post" action={`${runnerLink}/delete`}>
-                <button type="submit" class="ui red button">
-                  {repoSettingsRunnersLocale.delete_runner}
-                </button>
-              </form>
-            </div>
-            {/* The recent tasks (runner_edit.tmpl:45-86). */}
-            <h4 class="ui top attached header">{repoSettingsRunnersLocale.task_list}</h4>
-            <div class="ui attached segment">
-              <table class="ui very basic table unstackable">
-                <thead>
-                  <tr>
-                    <th>{repoSettingsRunnersLocale.task_list_job}</th>
-                    <th>{repoSettingsRunnersLocale.task_list_status}</th>
-                    <th>{repoSettingsRunnersLocale.task_list_repository}</th>
-                    <th>{repoSettingsRunnersLocale.task_list_commit}</th>
-                    <th>{repoSettingsRunnersLocale.task_list_done_at}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {data.tasks.length > 0 ? (
-                    data.tasks.map((task) => (
-                      <tr>
-                        {/* The GetRunJobLink reduction — the id renders as
-                            text (the repo twin's header; its fold-back is
-                            that module's follow-up). */}
-                        <td>{task.jobId ?? task.id}</td>
-                        <td>
-                          <span class={`ui label task-status-${actionsStatusToString(task.status)}`}>
-                            {actionsStatusLocaleText(task.status)}
-                          </span>
-                        </td>
-                        <td>{task.repoLink !== null ? <a href={task.repoLink}>{task.repoFullName}</a> : null}</td>
-                        <td>
-                          {task.commitSha !== "" && task.repoLink !== null ? (
-                            <a class="ui sha label" href={`${task.repoLink}/commit/${task.commitSha}`}>
-                              {shortSha(task.commitSha)}
-                            </a>
-                          ) : null}
-                        </td>
-                        <td>{task.stopped !== null ? <TimeSince unixSeconds={task.stopped.getTime() / 1000} tz="+0000" /> : "-"}</td>
-                      </tr>
-                    ))
-                  ) : (
-                    <tr>
-                      <td colspan={5}>{repoSettingsRunnersLocale.task_list_no_tasks}</td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-              {data.page > 1 || data.more ? (
-                <div class="center page buttons">
-                  <div class="ui borderless pagination menu">
-                    {data.page > 1 ? (
-                      <a class="item navigation" href={`${runnerLink}?page=${data.page - 1}`}>
-                        <span class="navigation_label">Newer</span>
+    <AdminFamilyShell ctx={ctx} title={adminActionsRunnersLocale.edit_runner} pageClass="admin runners" active="actions-runners">
+      {/* runner_edit.tmpl:2-4 (shared/actions/runner_edit) — the
+          header. */}
+      <h4 class="ui top attached header">
+        {repoSettingsRunnersLocale.runner_title} {data.runner.id} {data.runner.name}
+      </h4>
+      <div class="ui attached segment">
+        {/* The basic-info fields (runner_edit.tmpl:7-31). */}
+        <div class="runner-basic-info">
+          <div class="field tw-inline-block tw-mr-4">
+            <label>{repoSettingsRunnersLocale.status}</label>
+            <span class={`ui ${data.runnerStatus === "offline" ? "basic" : "green"} label`}>
+              {runnerStatusLocaleText(data.runnerStatus)}
+            </span>
+          </div>
+          <div class="field tw-inline-block tw-mr-4">
+            <label>{repoSettingsRunnersLocale.availability}</label>
+            <span class={`ui ${data.runner.isDisabled ? "grey" : "green"} label`}>
+              {data.runner.isDisabled ? repoSettingsRunnersLocale.disabled : repoSettingsRunnersLocale.enabled}
+            </span>
+          </div>
+          <div class="field tw-inline-block tw-mr-4">
+            <label>{repoSettingsRunnersLocale.last_online}</label>
+            <span>
+              {data.runner.lastOnline !== null ? (
+                <TimeSince unixSeconds={data.runner.lastOnline.getTime() / 1000} tz="+0000" />
+              ) : (
+                repoSettingsRunnersLocale.never
+              )}
+            </span>
+          </div>
+          <div class="field tw-inline-block tw-mr-4">
+            <label>{repoSettingsRunnersLocale.labels}</label>
+            <span class="flex-text-inline tw-flex-wrap">
+              {data.agentLabels.map((label) => (
+                <span class="ui label">{label}</span>
+              ))}
+            </span>
+          </div>
+          <div class="field tw-inline-block tw-mr-4">
+            <label>{repoSettingsRunnersLocale.owner_type}</label>
+            <span>
+              {data.belongsTo.tooltip !== null ? (
+                <span data-tooltip-content={data.belongsTo.tooltip}>{data.belongsTo.text}</span>
+              ) : (
+                data.belongsTo.text
+              )}
+            </span>
+          </div>
+        </div>
+        <div class="divider" />
+        {/* The description form (runner_edit.tmpl:33-42) — the submit
+            is the Update Changes button; the enable/disable and
+            delete arms reduce to the plain POST forms beside it (the
+            twins' header). */}
+        <form class="ui form" method="post" action={runnerLink}>
+          <div class="field">
+            <label for="description">{repoSettingsRunnersLocale.description}</label>
+            <input id="description" name="description" value={data.runner.description} />
+          </div>
+          <div class="field">
+            <button type="submit" class="ui primary button">
+              {repoSettingsRunnersLocale.update_runner}
+            </button>
+          </div>
+        </form>
+        <form class="tw-inline-block" method="post" action={`${runnerLink}/update-runner`}>
+          <input type="hidden" name="disabled" value={data.runner.isDisabled ? "false" : "true"} />
+          <button type="submit" class="ui button">
+            {data.runner.isDisabled ? repoSettingsRunnersLocale.enable_runner : repoSettingsRunnersLocale.disable_runner}
+          </button>
+        </form>
+        <form class="tw-inline-block" method="post" action={`${runnerLink}/delete`}>
+          <button type="submit" class="ui red button">
+            {repoSettingsRunnersLocale.delete_runner}
+          </button>
+        </form>
+      </div>
+      {/* The recent tasks (runner_edit.tmpl:45-86). */}
+      <h4 class="ui top attached header">{repoSettingsRunnersLocale.task_list}</h4>
+      <div class="ui attached segment">
+        <table class="ui very basic table unstackable">
+          <thead>
+            <tr>
+              <th>{repoSettingsRunnersLocale.task_list_job}</th>
+              <th>{repoSettingsRunnersLocale.task_list_status}</th>
+              <th>{repoSettingsRunnersLocale.task_list_repository}</th>
+              <th>{repoSettingsRunnersLocale.task_list_commit}</th>
+              <th>{repoSettingsRunnersLocale.task_list_done_at}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {data.tasks.length > 0 ? (
+              data.tasks.map((task) => (
+                <tr>
+                  {/* The GetRunJobLink reduction — the id renders as
+                      text (the repo twin's header; its fold-back is
+                      that module's follow-up). */}
+                  <td>{task.jobId ?? task.id}</td>
+                  <td>
+                    <span class={`ui label task-status-${actionsStatusToString(task.status)}`}>
+                      {actionsStatusLocaleText(task.status)}
+                    </span>
+                  </td>
+                  <td>{task.repoLink !== null ? <a href={task.repoLink}>{task.repoFullName}</a> : null}</td>
+                  <td>
+                    {task.commitSha !== "" && task.repoLink !== null ? (
+                      <a class="ui sha label" href={`${task.repoLink}/commit/${task.commitSha}`}>
+                        {shortSha(task.commitSha)}
                       </a>
                     ) : null}
-                    {data.more ? (
-                      <a class="item navigation" href={`${runnerLink}?page=${data.page + 1}`}>
-                        <span class="navigation_label">Older</span>
-                      </a>
-                    ) : null}
-                  </div>
-                </div>
+                  </td>
+                  <td>{task.stopped !== null ? <TimeSince unixSeconds={task.stopped.getTime() / 1000} tz="+0000" /> : "-"}</td>
+                </tr>
+              ))
+            ) : (
+              <tr>
+                <td colspan={5}>{repoSettingsRunnersLocale.task_list_no_tasks}</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+        {data.page > 1 || data.more ? (
+          <div class="center page buttons">
+            <div class="ui borderless pagination menu">
+              {data.page > 1 ? (
+                <a class="item navigation" href={`${runnerLink}?page=${data.page - 1}`}>
+                  <span class="navigation_label">Newer</span>
+                </a>
+              ) : null}
+              {data.more ? (
+                <a class="item navigation" href={`${runnerLink}?page=${data.page + 1}`}>
+                  <span class="navigation_label">Older</span>
+                </a>
               ) : null}
             </div>
           </div>
-        </div>
+        ) : null}
       </div>
-    </BaseLayout>
+    </AdminFamilyShell>
   );
 }
