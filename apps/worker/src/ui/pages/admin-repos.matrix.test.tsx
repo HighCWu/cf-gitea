@@ -342,7 +342,7 @@ describe("the admin repos DOM (templates/admin/repo/list.tmpl at the pin)", () =
     expect(html).toContain('href="/-/admin/applications"');
     expect(html).toContain('href="/-/admin/hooks"');
     expect(html).toContain('href="/-/admin/notices"'); // SPEC-0018 §3.1's top-level item
-    expect(html).not.toContain("/-/admin/config");
+    expect(html).toContain('href="/-/admin/config"'); // SPEC-0018 §3.2's Configuration group (the Summary item)
     expect(html).not.toContain("/-/admin/actions");
   });
 });

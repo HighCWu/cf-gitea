@@ -15,10 +15,11 @@ import type { CommitJson } from "@cf-gitea/git-engine";
 import { BranchSelector } from "../components/branch-selector";
 import { CommitList, commitsLocale } from "../components/commit-list";
 import type { EngineClient } from "../engine";
+import { graphLocale } from "./repo-graph";
 import { resolveRefSuffix, splitRefSuffix } from "../index";
 import type { RefType } from "../index";
 import { parsePageNumber, pathEscapeSegments } from "../page-data";
-import { BaseLayout } from "../shell";
+import { BaseLayout, Icon } from "../shell";
 import type { UiContext } from "../ui-context";
 import { resolveHeadBranch } from "./home";
 import type { ResolvedRefs } from "./home";
@@ -139,6 +140,12 @@ export function CommitsPage(props: { ctx: UiContext; data: CommitsData }) {
               active={data.active}
               treePath={data.path}
             />
+            {/* upstream commits.tmpl:19-21 — the Commit Graph button beside
+                the branch dropdown (web.go:1738's /graph family) */}
+            <a href={`${repoLink}/graph`} class="ui basic small compact button">
+              <Icon name="octicon-git-branch" />
+              {graphLocale.commit_graph}
+            </a>
           </div>
         </div>
         <div class="ui top attached header flex-left-right">

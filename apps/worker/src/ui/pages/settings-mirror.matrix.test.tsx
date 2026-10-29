@@ -563,10 +563,12 @@ describe("the render shapes wave-10's fixture could not carry", () => {
     const res = await get("/smx-owner/smx-shapes/settings/mirror", "smx-owner");
     expect(res.status).toBe(200);
     const html = await res.text();
-    // lfs_enabled=true + lfs_endpoint are seeded; the panel renders neither a
-    // section nor an input for them (upstream's LFS fields ride the edit
-    // form that the no-settings-write-arm reduction dropped).
-    expect(html).not.toContain("LFS");
+    // The settings navbar's LFS item renders now (the census R11 arm's mount
+    // retired the SettingsNav omission); the PANEL keeps neither a section
+    // nor an input for the seeded lfs_enabled/lfs_endpoint pair (upstream's
+    // LFS fields ride the edit form that the no-settings-write-arm reduction
+    // dropped) — the endpoint value stays absent.
+    expect(html).toContain('href="/smx-owner/smx-shapes/settings/lfs">LFS</a>');
     expect(html).not.toContain("lfs.invalid");
   });
 

@@ -485,8 +485,14 @@ const markupBodyHook = ({ success }: { success: boolean }): undefined => {
 /**
  * Published settings values (module header documents each choice against
  * upstream's defaults and our runtime).
+ *
+ * The four groups are EXPORTED (SPEC-0018 §8.2, ratified): the admin config
+ * summary page (`src/ui/pages/admin-config.tsx`) imports them instead of
+ * re-declaring copies — the constants are the API's published truth and the
+ * page's whole point is rendering that truth. The values-cross-check test
+ * (admin-config.matrix.test.tsx) enforces the single source by identity.
  */
-const GENERAL_API_SETTINGS: z.infer<typeof generalApiSettingsSchema> = {
+export const GENERAL_API_SETTINGS: z.infer<typeof generalApiSettingsSchema> = {
   // routes/git.ts GIT_TREES_PER_PAGE (== modules/setting/api.go:20 default).
   default_git_trees_per_page: 1000,
   // routes/git.ts DEFAULT_MAX_BLOB_SIZE (== modules/setting/api.go:21).
@@ -500,7 +506,7 @@ const GENERAL_API_SETTINGS: z.infer<typeof generalApiSettingsSchema> = {
   max_response_items: MAX_RESPONSE_ITEMS,
 };
 
-const GENERAL_ATTACHMENT_SETTINGS: z.infer<typeof generalAttachmentSettingsSchema> = {
+export const GENERAL_ATTACHMENT_SETTINGS: z.infer<typeof generalAttachmentSettingsSchema> = {
   // modules/setting/attachment.go:18 default string — PUBLISHED CONFIG, the
   // release-asset uploads do not enforce a type filter (module header).
   allowed_types:
@@ -513,7 +519,7 @@ const GENERAL_ATTACHMENT_SETTINGS: z.infer<typeof generalAttachmentSettingsSchem
   max_size: 512,
 };
 
-const GENERAL_REPO_SETTINGS: z.infer<typeof generalRepoSettingsSchema> = {
+export const GENERAL_REPO_SETTINGS: z.infer<typeof generalRepoSettingsSchema> = {
   // Every shipped feature advertises enabled: git smart-HTTP
   // (src/git-http), LFS (src/lfs), imports (routes/imports.ts), mirrors
   // (routes/mirror.ts), stars (routes/starred.ts).
@@ -527,7 +533,7 @@ const GENERAL_REPO_SETTINGS: z.infer<typeof generalRepoSettingsSchema> = {
   time_tracking_disabled: true,
 };
 
-const GENERAL_UI_SETTINGS: z.infer<typeof generalUiSettingsSchema> = {
+export const GENERAL_UI_SETTINGS: z.infer<typeof generalUiSettingsSchema> = {
   // The exact set the reaction routes enforce (services/issue-extras.ts).
   allowed_reactions: [...ALLOWED_REACTIONS],
   custom_emojis: [],

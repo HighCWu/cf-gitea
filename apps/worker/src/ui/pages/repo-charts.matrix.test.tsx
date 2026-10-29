@@ -13,8 +13,10 @@
  *   - the MOUNTS: upstream's verbatim chart divs (#repo-contributors-chart
  *     with repoLink/default-branch + the locale data attributes,
  *     #repo-code-frequency-chart / #repo-recent-commits-chart with the
- *     loading locale set), the PageData repoLink assignments the latter two
- *     Vue components read (code_frequency.go:25, recent_commits.go:23), and
+ *     loading locale set), the PageData repoLink the latter two Vue
+ *     components read — served in the head's #global-window-config JSON
+ *     since R15 open issue 2 retired the page-body inline assignment
+ *     (code_frequency.go:25, recent_commits.go:23), and
  *     the four-item tab strip with per-page active arm (repo/navbar.tmpl);
  *   - the /data SHAPES pinned against the seeded fixture (the
  *     engine-seeding idiom, real pushes): the full ContributorData map with
@@ -73,6 +75,17 @@ async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
   const response = await uiRouter.fetch(new Request(`https://test.local${path}`, init), routeEnv, context);
   await waitOnExecutionContext(context);
   return response;
+}
+
+/** The head config JSON parsed out of a full-document render (the
+ * shell.test.tsx extractor): the matrix asserts the window.config bytes the
+ * Vue components boot from — since R15 open issue 2 the PageData payload
+ * rides this JSON (upstream WindowConfig's `"pageData"` arm,
+ * context_template.go:162), and the page-body inline assignment is retired. */
+function configJson(html: string): Record<string, unknown> {
+  const match = /<script type="application\/json" id="global-window-config">([\s\S]*?)<\/script>/.exec(html);
+  if (match === null) throw new Error(`no config tag in:\n${html}`);
+  return JSON.parse(match[1] ?? "") as Record<string, unknown>;
 }
 
 // --- fixtures -------------------------------------------------------------------
@@ -325,7 +338,10 @@ describe("the chart pages mount (the census's heatmap precedent: verbatim divs, 
     // Pulse inert (the repo header's Activity TAB is separately active —
     // assert the nav ITEM, not the bare class pair).
     expect(html).toContain('<a class="item" href="/charts-owner/charts/activity">Pulse</a>');
-    // NO PageData arm on this page (contributors.go arms none).
+    // NO PageData arm on this page (contributors.go arms none): the head
+    // config JSON serves the unarmed null, and the retired inline mechanism
+    // (R15 open issue 2) emits no body script.
+    expect(configJson(html).pageData).toBeNull();
     expect(html).not.toContain("window.config.pageData =");
   });
 
@@ -338,9 +354,12 @@ describe("the chart pages mount (the census's heatmap precedent: verbatim divs, 
     expect(html).toContain('id="repo-code-frequency-chart"');
     expect(html).toContain('data-locale-loading-title="Loading code frequency…"');
     expect(html).toContain('data-locale-loading-title-failed="Could not load code frequency"');
-    // The PageData payload (code_frequency.go:25 → window.config.pageData;
-    // the Vue reads pageData.repoLink).
-    expect(html).toContain('window.config.pageData = {"repoLink":"/charts-owner/charts"};');
+    // The PageData payload rides the head's #global-window-config JSON
+    // (code_frequency.go:25 → window.config.pageData; the Vue reads
+    // pageData.repoLink) — the inline body assignment is retired (R15 open
+    // issue 2), so no body script exists on any chart page.
+    expect(configJson(html).pageData).toEqual({ repoLink: "/charts-owner/charts" });
+    expect(html).not.toContain("window.config.pageData =");
     expect(html).toContain('class="active item" href="/charts-owner/charts/activity/code-frequency"');
     expect(html).toContain('<a class="item" href="/charts-owner/charts/activity">Pulse</a>');
   });
@@ -354,7 +373,10 @@ describe("the chart pages mount (the census's heatmap precedent: verbatim divs, 
     expect(html).toContain('id="repo-recent-commits-chart"');
     expect(html).toContain('data-locale-loading-title="Loading recent commits…"');
     expect(html).toContain('data-locale-loading-title-failed="Could not load recent commits"');
-    expect(html).toContain('window.config.pageData = {"repoLink":"/charts-owner/charts"};');
+    // The PageData repoLink in the head config JSON (recent_commits.go:23;
+    // the inline body assignment retired — R15 open issue 2).
+    expect(configJson(html).pageData).toEqual({ repoLink: "/charts-owner/charts" });
+    expect(html).not.toContain("window.config.pageData =");
     expect(html).toContain('class="active item" href="/charts-owner/charts/activity/recent-commits"');
   });
 

@@ -185,7 +185,10 @@ describe("window.config (§2.4.1)", () => {
 
   it("carries pageData null, the notificationSettings triple, and the sharedWorkerUri from the manifest", () => {
     const config = configJson(page());
+    // The absent arm (every page that passes no pageData): upstream's Go nil
+    // marshal — `"pageData":null` raw in the config JSON.
     expect(config.pageData).toBeNull();
+    expect(page()).toContain('"pageData":null');
     expect(Object.keys(config.notificationSettings as object).sort()).toEqual([
       "MaxTimeout",
       "MinTimeout",
@@ -194,6 +197,35 @@ describe("window.config (§2.4.1)", () => {
     expect(config.notificationSettings).toEqual({ MinTimeout: 10000, TimeoutStep: 10000, MaxTimeout: 60000 });
     expect(config.sharedWorkerUri).toBe(assetURI(manifest, "web_src/js/user-events.sharedworker.ts"));
     expect(config.sharedWorkerUri).toBe("/assets/js/user-events.5555eeee.js");
+  });
+
+  it("threads a per-page pageData payload through the head config JSON (upstream ctx.PageData — the chart pages' repoLink channel)", () => {
+    // BaseLayout's pageData prop rides WindowConfig's `"pageData"` arm
+    // (context_template.go:162) — the R15 issue-2 channel that replaced the
+    // page-body inline `window.config.pageData = …` assignment.
+    const armed = renderPage(
+      <BaseLayout ctx={anonymousCtx} pageData={{ repoLink: "/octocat/hello" }}>
+        <p>armed</p>
+      </BaseLayout>,
+    );
+    expect(configJson(armed).pageData).toEqual({ repoLink: "/octocat/hello" });
+    // The raw emission is upstream's Go-marshal shape: the payload object in
+    // the config JSON, exactly where null served on the unarmed page.
+    expect(armed).toContain('"pageData":{"repoLink":"/octocat/hello"}');
+    expect(armed).not.toContain('"pageData":null');
+    expect(armed).not.toContain("window.config.pageData ="); // no body script — the JSON is the only channel
+    // The payload rides serializeWindowConfig's escaping — a hostile value
+    // cannot close the config tag (the same guarantee the retired inline
+    // serializer gave), and it round-trips intact for the bundle's bootstrap
+    // parse (web_src/js/bootstrap.ts:5).
+    const hostile = renderPage(
+      <BaseLayout ctx={anonymousCtx} pageData={{ repoLink: "/a</script>b&c<d>e" }}>
+        <p>hostile</p>
+      </BaseLayout>,
+    );
+    expect(hostile.match(/<\/script>/g)).toHaveLength(5); // collector, config, iife, index module, canary only
+    expect(hostile).toContain('"pageData":{"repoLink":"/a\\u003c/script\\u003eb\\u0026c\\u003cd\\u003ee"}');
+    expect(configJson(hostile).pageData).toEqual({ repoLink: "/a</script>b&c<d>e" });
   });
 
   it("carries exactly the 7 client i18n keys", () => {

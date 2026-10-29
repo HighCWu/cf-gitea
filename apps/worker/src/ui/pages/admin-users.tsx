@@ -167,12 +167,13 @@
  * AdminMonitorNav scaffolding copies deleted): it renders upstream's
  * navbar.tmpl reduced to the LANDED pages — Maintenance (Dashboard),
  * Identity & Access (Organizations + Users + Badges + Emails), Assets
- * (Repositories), Integrations (Applications + Webhooks), the top-level
- * System Notices item (SPEC-0018 §3.1), Monitoring (the four live monitor
- * items; audit_logs omitted) — with the details-open + active-item arms
- * derived from the `active` prop (upstream's per-group PageIs* conditions),
- * and OMITS every group whose items are all unlanded (self_check, auths,
- * packages, actions, config). Survey row flipped on landing:
+ * (Repositories), Integrations (Applications + Webhooks), the Configuration
+ * group (SPEC-0018 §3.2's Summary item), the top-level System Notices item
+ * (SPEC-0018 §3.1), Monitoring (the four live monitor items; audit_logs
+ * omitted) — with the details-open + active-item arms derived from the
+ * `active` prop (upstream's per-group PageIs* conditions), and OMITS every
+ * group whose items are all unlanded (self_check, auths — SPEC-0018 §3.3's
+ * omission verdict, packages, actions). Survey row flipped on landing:
  * docs/compat/ui-parity-survey.md:549 (the `/-/admin/*` row — users/orgs/
  * repos go PARTIAL→listed).
  */
@@ -280,6 +281,7 @@ export type AdminFamilyNavActive =
   | "badges"
   | "applications"
   | "hooks"
+  | "config"
   | "notices"
   | "stats"
   | "cron"
@@ -303,6 +305,8 @@ export const adminFamilyLocale = {
   integrations: "Integrations", // "admin.integrations" (navbar.tmpl:53 — the R18 wave's group)
   applications: "Applications", // "settings.applications" (the admin applications arm's nav item)
   hooks: "Webhooks", // "admin.hooks" (the admin hooks arm's nav item)
+  configuration: "Configuration", // "admin.config" (navbar.tmpl:93 — the SPEC-0018 §3.2 arm's group)
+  configSummary: "Summary", // "admin.config_summary" (navbar.tmpl:95-97; config.go:61's Title)
   notices: "System Notices", // "admin.notices" (the SPEC-0018 §3.1 arm's nav item)
   monitoring: "Monitoring", // "admin.monitor"
   stats: "Stats", // "admin.monitor.stats"
@@ -315,14 +319,16 @@ export const adminFamilyLocale = {
  *  shared navbar across the whole admin family): the Maintenance details
  *  (Dashboard), Identity & Access (Organizations + User Accounts + Badges +
  *  Emails — the R18 arms), Assets (Repositories), Integrations
- *  (Applications + Webhooks — the R18 arms), the TOP-LEVEL System Notices
+ *  (Applications + Webhooks — the R18 arms), the Configuration group (the
+ *  SPEC-0018 §3.2 arm's Summary item, navbar.tmpl:93-102 — the settings-
+ *  editor item omitted by the dead-link rule), the TOP-LEVEL System Notices
  *  item (the SPEC-0018 §3.1 arm, navbar.tmpl:104-106's position), and
  *  Monitoring (the monitor family's four live items). Upstream's per-group
  *  `PageIs*` conditions reduce to: the group containing the active page
  *  renders `open`, the active item gets the `active item` class. auths,
- *  packages, audit_logs, self_check, config, actions are omitted — all
- *  their upstream items are unlanded pages (the dead-link rule; the
- *  census's (b)/(c) classes). */
+ *  packages, audit_logs, self_check, actions are omitted — all their
+ *  upstream items are unlanded pages (the dead-link rule; the census's
+ *  (b)/(c) classes; the auths omission is SPEC-0018 §3.3's verdict). */
 export function AdminFamilyNav(props: { active: AdminFamilyNavActive }) {
   const item = (href: string, label: string, active: boolean) => (
     <a class={active ? "active item" : "item"} href={href}>
@@ -336,6 +342,7 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive }) {
     props.active === "users" || props.active === "orgs" || props.active === "badges" || props.active === "emails";
   const assetsOpen = props.active === "repos";
   const integrationsOpen = props.active === "applications" || props.active === "hooks";
+  const configOpen = props.active === "config";
   const monitorOpen = props.active === "stats" || props.active === "cron" || props.active === "queue" || props.active === "trace";
   const openAttr = (open: boolean) => (open ? true : undefined);
   return (
@@ -366,9 +373,18 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive }) {
             {item("/-/admin/hooks", adminFamilyLocale.hooks, props.active === "hooks")}
           </div>
         </details>
+        {/* The SPEC-0018 §3.2 config arm — upstream's Configuration group
+            (navbar.tmpl:93-102) between Integrations and the top-level
+            System Notices item, carrying its Summary item only: the
+            settings-editor item (navbar.tmpl:98-100) stays omitted — its
+            page requires the §-out write path (the dead-link rule). */}
+        <details class="item" open={openAttr(configOpen)}>
+          <summary>{adminFamilyLocale.configuration}</summary>
+          <div class="menu">{item("/-/admin/config", adminFamilyLocale.configSummary, props.active === "config")}</div>
+        </details>
         {/* The SPEC-0018 §3.1 notices arm — upstream renders it as a TOP-LEVEL
-            item after the (unlanded here) Configuration group and before
-            Monitor (navbar.tmpl:104-106); the landed nav keeps that order. */}
+            item after the Configuration group and before Monitor
+            (navbar.tmpl:104-106); the landed nav keeps that order. */}
         {item("/-/admin/notices", adminFamilyLocale.notices, props.active === "notices")}
         <details class="item" open={openAttr(monitorOpen)}>
           <summary>{adminFamilyLocale.monitoring}</summary>

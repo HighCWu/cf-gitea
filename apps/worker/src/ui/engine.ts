@@ -37,7 +37,9 @@ import type {
   CommitJson,
   ActivityStatsResult,
   ContributorStatsResult,
+  GraphDataResult,
   GrepResult,
+  LfsPointerScanResult,
   LogResult,
   RefsResult,
   TreeCommitsResult,
@@ -73,6 +75,25 @@ export interface EngineClient {
    *  commit's recorded timezone, oldest-name precedence; NO TTL (the
    *  fixed-history immutability argument); `truncated` on the scan cap. */
   contributorStats(ref: string | undefined): Promise<ContributorStatsResult | null>;
+  /** The commit-graph page's data (SPEC-0017 M1, census R09): the multi-tip
+   *  date-ordered walk with in-DO lane assignment — render-ready rows on the
+   *  5px/12px grid, `total` delivered only when the frontier exhausted
+   *  inside MAX_GRAPH_SCAN (the hybrid pager contract), `truncated` on any
+   *  budget exit; `null` = empty repo/unborn HEAD (the availability
+   *  ladder). */
+  graphData(opts?: {
+    refs?: string[];
+    page?: number;
+    limit?: number;
+    hidePRRefs?: boolean;
+  }): Promise<GraphDataResult | null>;
+  /** The LFS pointer-scan answer (SPEC-0015 M3, census R11): every size-gated
+   *  candidate blob at the ref's tip returned RAW (path/git-oid/size/bytes —
+   *  deliberately pointer-grammar-agnostic; the WORKER parses with the landed
+   *  `parsePointer` and joins `lfsObjects`, the ratified §2.3 split).
+   *  `truncated` flags a budget exit (visited/row cap), never a skip; `null`
+   *  = unresolvable ref/empty repo (the availability ladder). */
+  scanLfsPointers(ref: string | undefined, opts?: { path?: string; oid?: string }): Promise<LfsPointerScanResult | null>;
 }
 
 /** Build the client for one repository from the request's bindings. */
@@ -90,5 +111,7 @@ export function engineClient(env: Env, repoName: string): EngineClient {
     grep: (ref, opts) => safe(cell.grep(ref, opts)),
     activityStats: (ref, period) => safe(cell.activityStats(ref, period)),
     contributorStats: (ref) => safe(cell.contributorStats(ref)),
+    graphData: (opts) => safe(cell.graphData(opts)),
+    scanLfsPointers: (ref, opts) => safe(cell.scanLfsPointers(ref, opts)),
   };
 }

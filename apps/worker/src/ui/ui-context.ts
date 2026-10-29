@@ -59,6 +59,23 @@ export interface UiContext {
    *  gates the tab on the same unit condition) and the `/projects` group's
    *  handlers both read it. Absent = not loaded (non-repo requests). */
   repoHasProjects?: boolean;
+  /** The repo's Packages unit toggle (SPEC-0016 M2 — `repo_settings.
+   *  has_packages`, the repoHasProjects twin for the R16 tab/route;
+   *  repo/header.tmpl:140-144 gates the tab on CanRead(TypePackages), our
+   *  landed reduction carries the flag). Set by the repo-scoped prologue
+   *  from the SAME loadRepoSettings read; the shell's Packages tab and the
+   *  `/packages` handler both read it (pages/packages.tsx
+   *  `repoPackagesEnabled` is the loader-side twin). Absent/false = the tab
+   *  renders nothing and the route 404-shells (upstream DefaultRepoUnits
+   *  ships packages disabled). */
+  repoHasPackages?: boolean;
+  /** The global PACKAGES_ENABLED gate (SPEC-0016 M2 — the strict-polarity
+   *  var; absent/true = enabled, only the exact "false" disables — the
+   *  DEMO_MODE discipline). Gates the R04 tab anchors (the profile's
+   *  overview strip, the org menu) exactly like upstream's
+   *  `if setting.Packages.Enabled` registration wrap (web.go:1106);
+   *  the handlers read the env directly for their 404 shells. */
+  packagesEnabled?: boolean;
   /** Signed-in viewers only: the unread-notification count for the navbar
    *  bell (pages wave 10 — head_navbar_icons.tmpl's `.notification_count`
    *  badge; upstream PageGlobalData.GetNotificationUnreadCount parity, one

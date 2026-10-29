@@ -379,7 +379,7 @@ describe("the admin emails DOM (templates/admin/emails/list.tmpl at the pin)", (
     expect(html).toContain('href="/-/admin"'); // the landed dashboard
     expect(html).not.toContain("/-/admin/auths");
     expect(html).toContain('href="/-/admin/notices"'); // SPEC-0018 §3.1's top-level item
-    expect(html).not.toContain("/-/admin/config");
+    expect(html).toContain('href="/-/admin/config"'); // SPEC-0018 §3.2's Configuration group (the Summary item)
     expect(html).not.toContain("/-/admin/packages");
   });
 });

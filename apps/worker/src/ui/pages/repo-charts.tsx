@@ -50,16 +50,19 @@
  * RepoRecentCommits.vue), and the components fetch the `/data` routes and
  * draw chart.js charts. Upstream is equally chart-less without JS.
  *
- * pageData mechanism divergence (the module's one): upstream carries
- * `repoLink` inside the head's `#global-window-config` JSON; our shell's
- * WindowConfig has no per-page PageData channel yet (`pageData: null`,
- * shell.tsx), so the two pages that need it emit a small page-body inline
- * assignment `window.config.pageData = {"repoLink": …}`. Order-safe: the
- * config JSON is parsed by the HEAD iife (web_src/js/iife.ts:4 →
- * bootstrap.ts:5 — the ONLY bootstrap import; the body-tail module never
- * re-assigns window.config), so an inline body script runs between the head
- * parse and the bundle's init functions. The observable state at init time
- * (window.config.pageData.repoLink set) matches upstream exactly.
+ * pageData mechanism (upstream's own — R15 open issue 2 retired the page-body
+ * inline stopgap): upstream carries `repoLink` inside the head's
+ * `#global-window-config` JSON — `WindowConfig()`'s
+ * `"pageData": c.parentContext().GetData()["PageData"]`
+ * (services/context/context_template.go:162; context.go:53's "it is
+ * `window.config.pageData`"), and the HEAD iife parses that JSON before any
+ * init function runs (web_src/js/iife.ts:4 → bootstrap.ts:5 — the ONLY
+ * bootstrap import; the body-tail module never re-assigns window.config).
+ * The shell's WindowConfig carries the same per-page channel (shell.tsx
+ * `pageData`, threaded through BaseLayout with serializeWindowConfig's
+ * escaping), so the two pages that need it pass `{repoLink}` in and emit NO
+ * body script. The observable state at init time — and the head JSON's byte
+ * shape — matches upstream exactly.
  *
  * ## The /data JSON contract (pinned from the Vue fetch parsers)
  *
@@ -230,27 +233,24 @@ export function RepoActivityNavMenu(props: { repoLink: string; active: "pulse" |
 // The pages (the shared repo/activity shell + the three mount templates)
 // ---------------------------------------------------------------------------
 
-/** The window.config.pageData payload the two PageData-armed pages emit
- *  (services/context/context.go:53 — "PageData is used by JavaScript
- *  modules, it is `window.config.pageData`"). The escaping is
- *  serializeWindowConfig's (the `</script>` guarantee). */
-export function serializeChartPageData(pageData: { repoLink: string }): string {
-  return JSON.stringify(pageData)
-    .replaceAll("<", "\\u003c")
-    .replaceAll(">", "\\u003e")
-    .replaceAll("&", "\\u0026");
-}
-
 /** The shared page frame (repo/activity.tmpl): the repo header + the
  *  flex-container + the tab strip + the chart mount. `title` is the
  *  navbar-label page title; the mount is the per-page template's verbatim
- *  div. */
-function ChartPageFrame(props: { ctx: UiContext; title: string; active: RepoChartKind; children: Child }) {
+ *  div. `pageData` is the page's Context.PageData payload, threaded into the
+ *  head's window.config JSON (shell.tsx — the upstream WindowConfig channel,
+ *  context_template.go:162). */
+function ChartPageFrame(props: {
+  ctx: UiContext;
+  title: string;
+  active: RepoChartKind;
+  pageData?: Record<string, unknown>;
+  children: Child;
+}) {
   const repo = props.ctx.repo;
   if (repo === undefined) throw new Error("ChartPageFrame requires ctx.repo");
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   return (
-    <BaseLayout ctx={props.ctx} title={props.title} pageClass="repository commits">
+    <BaseLayout ctx={props.ctx} title={props.title} pageClass="repository commits" pageData={props.pageData}>
       <div class="ui container flex-container">
         <div class="flex-container-nav">
           <RepoActivityNavMenu repoLink={repoLink} active={props.active} />
@@ -290,18 +290,14 @@ export function RepoContributorsPage(props: { ctx: UiContext }) {
 
 /** GET …/activity/code-frequency (repo.CodeFrequency, code_frequency.go:20-26
  *  → templates/repo/code_frequency.tmpl): the div + the PageData repoLink
- *  (code_frequency.go:24 — the Vue reads `window.config.pageData.repoLink`). */
+ *  (code_frequency.go:24's ctx.PageData["repoLink"], carried in the head's
+ *  window.config JSON — the Vue reads `window.config.pageData.repoLink`). */
 export function RepoCodeFrequencyPage(props: { ctx: UiContext }) {
   const repo = props.ctx.repo;
   if (repo === undefined) throw new Error("RepoCodeFrequencyPage requires ctx.repo");
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   return (
-    <ChartPageFrame ctx={props.ctx} title={repoChartsLocale.navbar_code_frequency} active="code-frequency">
-      <script
-        dangerouslySetInnerHTML={{
-          __html: `window.config.pageData = ${serializeChartPageData({ repoLink })};`,
-        }}
-      />
+    <ChartPageFrame ctx={props.ctx} title={repoChartsLocale.navbar_code_frequency} active="code-frequency" pageData={{ repoLink }}>
       <div
         id="repo-code-frequency-chart"
         data-locale-loading-title={repoChartsLocale.loading_code_frequency}
@@ -315,18 +311,14 @@ export function RepoCodeFrequencyPage(props: { ctx: UiContext }) {
 
 /** GET …/activity/recent-commits (repo.RecentCommits, recent_commits.go:18-24
  *  → templates/repo/recent_commits.tmpl): the div + the PageData repoLink
- *  (recent_commits.go:22). The chart itself reuses the code-frequency data. */
+ *  (recent_commits.go:22's ctx.PageData["repoLink"], carried in the head's
+ *  window.config JSON). The chart itself reuses the code-frequency data. */
 export function RepoRecentCommitsPage(props: { ctx: UiContext }) {
   const repo = props.ctx.repo;
   if (repo === undefined) throw new Error("RepoRecentCommitsPage requires ctx.repo");
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   return (
-    <ChartPageFrame ctx={props.ctx} title={repoChartsLocale.navbar_recent_commits} active="recent-commits">
-      <script
-        dangerouslySetInnerHTML={{
-          __html: `window.config.pageData = ${serializeChartPageData({ repoLink })};`,
-        }}
-      />
+    <ChartPageFrame ctx={props.ctx} title={repoChartsLocale.navbar_recent_commits} active="recent-commits" pageData={{ repoLink }}>
       <div
         id="repo-recent-commits-chart"
         data-locale-loading-title={repoChartsLocale.loading_recent_commits}

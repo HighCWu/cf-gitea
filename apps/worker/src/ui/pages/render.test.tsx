@@ -127,6 +127,8 @@ function stubEngine(
     grep: () => Promise.resolve(null), // refused-work posture: pages that never search
     activityStats: () => Promise.resolve(null), // the unresolvable-ref ladder
     contributorStats: () => Promise.resolve(null),
+    graphData: () => Promise.resolve(null), // the empty-repo ladder; no page under test graphs here
+    scanLfsPointers: () => Promise.resolve(null), // the empty-repo ladder; no page under test scans here
     ...overrides,
   };
 }

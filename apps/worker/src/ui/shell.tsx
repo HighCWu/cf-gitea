@@ -57,23 +57,31 @@ export interface WindowConfig {
   assetUrlPrefix: string;
   runModeIsProd: boolean;
   customEmojis: Record<string, never>;
-  /** Per-page Vue-island payloads arrive later; every slice-1 page is null. */
-  pageData: null;
+  /** Upstream `Context.PageData` (services/context/context.go:53 — "it is
+   *  `window.config.pageData`"), carried into the config JSON by
+   *  WindowConfig()'s `"pageData": c.parentContext().GetData()["PageData"]`
+   *  (context_template.go:162). Pages that arm none serve null (Go's nil);
+   *  the bundle's bootstrap normalizes null to {} client-side
+   *  (web_src/js/bootstrap.ts:7), so unarmed pages never see a null access. */
+  pageData: Record<string, unknown> | null;
   mermaidMaxSourceCharacters: number;
   sharedWorkerUri: string;
   notificationSettings: { MinTimeout: number; TimeoutStep: number; MaxTimeout: number };
   i18n: typeof configI18n;
 }
 
-/** Build the per-request window.config from the render context. */
-export function buildWindowConfig(ctx: UiContext): WindowConfig {
+/** Build the per-request window.config from the render context. `pageData`
+ *  threads the page's Context.PageData payload (the chart pages' repoLink —
+ *  code_frequency.go:25, recent_commits.go:23); absent → null, the
+ *  byte-identical unarmed render every golden pins. */
+export function buildWindowConfig(ctx: UiContext, pageData?: Record<string, unknown>): WindowConfig {
   return {
     appUrl: `${ctx.origin}/`,
     appSubUrl: "",
     assetUrlPrefix: "/assets",
     runModeIsProd: true,
     customEmojis: {},
-    pageData: null,
+    pageData: pageData ?? null,
     mermaidMaxSourceCharacters: 50000,
     sharedWorkerUri: ctx.assets.sharedWorkerUri,
     notificationSettings: { MinTimeout: 10000, TimeoutStep: 10000, MaxTimeout: 60000 },
@@ -103,7 +111,7 @@ const ERROR_COLLECTOR = [
   "window.addEventListener('unhandledrejection', function(e) {window._globalHandlerErrors=window._globalHandlerErrors||[]; window._globalHandlerErrors.push(e);});",
 ].join("\n");
 
-function Head(props: { ctx: UiContext; title: string }) {
+function Head(props: { ctx: UiContext; title: string; pageData?: Record<string, unknown> }) {
   const { ctx } = props;
   return (
     <head>
@@ -123,7 +131,7 @@ function Head(props: { ctx: UiContext; title: string }) {
       <script
         type="application/json"
         id="global-window-config"
-        dangerouslySetInnerHTML={{ __html: serializeWindowConfig(buildWindowConfig(ctx)) }}
+        dangerouslySetInnerHTML={{ __html: serializeWindowConfig(buildWindowConfig(ctx, props.pageData)) }}
       />
       <script src={ctx.assets.iifeUri} />
     </head>
@@ -236,23 +244,26 @@ export function Navbar(props: { viewer: Viewer; activeNav?: "explore"; notificat
 // ---------------------------------------------------------------------------
 
 /** Tabs that back real pages this slice — the strip shows only these.
- *  Upstream order is Code → Issues → Pulls → Releases → Activity
- *  (header.tmpl:157, the wave-20 addition; header.tmpl:177, the activity
- *  page's tab — the releases family and the /activity route resolve both
- *  tabs' 404s); Commits is the cf-gitea addition (SPEC-0008 §2.4.1 —
+ *  Upstream order is Code → Issues → Pulls → Packages → Projects → Releases
+ *  → Activity (header.tmpl:157, the wave-20 addition; header.tmpl:177, the
+ *  activity page's tab — the releases family and the /activity route resolve
+ *  both tabs' 404s); Commits is the cf-gitea addition (SPEC-0008 §2.4.1 —
  *  /commits is a slice-1 page) and keeps last so the upstream relative
- *  order stays intact. The upstream `{{if .NumReleases}}` count label is
- *  unrendered: D1 keeps no maintained num_releases counter and the shared
- *  shell would pay a COUNT on every repo-scoped render for a label most
- *  repos never show (pages/releases.tsx header) — the releases PAGES render
- *  the real count in their header menu. */
-export type RepoTab = "code" | "issues" | "pulls" | "projects" | "releases" | "activity" | "commits";
+ *  order stays intact. SPEC-0016 M2 inserts "packages" at upstream's
+ *  header.tmpl:140-144 slot (between Pulls and Projects). The upstream
+ *  `{{if .NumReleases}}` count label is unrendered: D1 keeps no maintained
+ *  num_releases counter and the shared shell would pay a COUNT on every
+ *  repo-scoped render for a label most repos never show (pages/releases.tsx
+ *  header) — the releases PAGES render the real count in their header
+ *  menu. */
+export type RepoTab = "code" | "issues" | "pulls" | "packages" | "projects" | "releases" | "activity" | "commits";
 
 /** Tab chrome text for the wave-3 tabs (the components/commit-list.tsx
  *  component-local pattern — locale.ts is shared and not this wave's file). */
 const tabLocale = {
   repo_issues: "Issues", // "repo.issues"
   repo_pulls: "Pull Requests", // "repo.pulls"
+  repo_packages: "Packages", // "packages.title" (header.tmpl:140-144 — SPEC-0016 M2)
   repo_projects: "Projects", // "repo.projects" (wave 45 — the projects tab)
   repo_releases: "Releases", // "repo.releases"
   repo_activity: "Activity", // "repo.activity" (the pulse tab)
@@ -329,6 +340,19 @@ export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
               <Icon name="octicon-git-pull-request" /> {tabLocale.repo_pulls}
               {openPulls > 0 ? <span class="ui small label">{openPulls}</span> : null}
             </a>
+            {/* header.tmpl:140-144 — the packages tab (SPEC-0016 M2), gated
+                on the landed unit-flag reduction (repo_settings.has_packages
+                via the ctx repoHasPackages member — the projects tab's
+                MustEnableRepoProjects reduction twin; upstream's
+                CanRead(TypePackages)). The count label upstream never arms
+                and no data-shortcut-keys ride it (the activity tab's
+                precedent); the icon IS in the landed set
+                (octicon-package). */}
+            {props.ctx.repoHasPackages ? (
+              <a class={activeTab === "packages" ? "active item" : "item"} href={`${repoLink}/packages`}>
+                <Icon name="octicon-package" /> {tabLocale.repo_packages}
+              </a>
+            ) : null}
             {/* header.tmpl:146-154 — the projects tab (wave 45), gated on the
                 SAME unit condition as upstream (MustEnableRepoProjects → the
                 loaded repoHasProjects toggle). The count label is the
@@ -502,6 +526,13 @@ export function BaseLayout(props: {
   /** The div's `data-sequence-number` (upstream FormString
    *  "sequence-number" passthrough — the JS discards stale fragments). */
   mainDataSequence?: string;
+  /** Upstream `ctx.PageData` — the page's per-page JS payload, serialized
+   *  inside the head's `#global-window-config` JSON (context.go:53;
+   *  context_template.go:162's `"pageData"` arm). Absent → null: the config
+   *  JSON is byte-identical to every unarmed page's (the goldens pin it),
+   *  and the escaping is serializeWindowConfig's (the `</script>`
+   *  guarantee). */
+  pageData?: Record<string, unknown>;
 }) {
   const { ctx } = props;
   const pageTitle = ctx.repo ? `${ctx.repo.ownerNamespace}/${ctx.repo.slug}` : locale.app_name;
@@ -518,7 +549,7 @@ export function BaseLayout(props: {
     props.activeTab ?? (props.pageClass === "repository commits" ? "activity" : undefined);
   return (
     <html lang="en" data-theme="gitea-light">
-      <Head ctx={ctx} title={fullTitle} />
+      <Head ctx={ctx} title={fullTitle} pageData={props.pageData} />
       <body>
         <div class="full height">
           <noscript>{locale.enable_javascript}</noscript>

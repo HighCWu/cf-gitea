@@ -65,11 +65,12 @@
  *   confirmation); the confirmation step is not reproduced — the checkbox is
  *   a plain POST behind the Origin guard.
  * - Not rendered: the avatar field (no avatar pipeline), the mirror/archive
- *   tint sections, and the navbar items with no landed pages (LFS/Actions —
+ *   tint sections, and the navbar items with no landed pages (Actions —
  *   the SettingsNav dead-link rule; the landed tabs' items folded in,
  *   wave-settingsnav-fold; Audit joined the landed set with the census R13
- *   arm, see the SettingsNav note). Template/website WERE in this list until
- *   wave-settings-options landed them (below).
+ *   arm and LFS with the census R11 arm, see the SettingsNav note).
+ *   Template/website WERE in this list until wave-settings-options landed
+ *   them (below).
  * - The options form's full field set (wave 129 — upstream options.tmpl at
  *   the pin renders TWO forms with action-routed POST handling: the basic
  *   `action=update` form — repo_name/template/description/website — and the
@@ -255,6 +256,7 @@ import { gitHooksSettingsLocale } from "./repo-settings-githooks";
 import { publicAccessLocale } from "./repo-settings-public-access";
 import { tagProtectionLocale } from "./repo-settings-tags";
 import { wikiSettingsLocale } from "./repo-settings-wiki";
+import { repoSettingsLfsLocale } from "./repo-settings-lfs";
 import { settingsAuditLogsLocale } from "./settings-audit-logs";
 
 /** Page chrome text (component-local, the issuesLocale pattern — locale.ts
@@ -521,7 +523,9 @@ export function renderRepoSettingsPage(options: {
  *     <details> block it follows upstream has no landed pages). Lit by the
  *     pages/settings-audit-logs.tsx mount; before that page landed the item
  *     rode the dead-link omission (the module header's v1-degradations
- *     note, now retired for Audit — LFS and Actions stay dead).
+ *     note, now retired for Audit). LFS (navbar.tmpl:35-39) is the census
+ *     R11 arm's item — lit by the pages/repo-settings-lfs.tsx mount; only
+ *     Actions stays dead.
  *
  * The tab items' texts import the owning page modules' locale objects (the
  * one-copy rule). Wave-settingsnav-fold deleted the five modules' scaffold
@@ -540,6 +544,7 @@ export function SettingsNav(props: {
     | "tags"
     | "githooks"
     | "keys"
+    | "lfs" // pages/repo-settings-lfs.tsx (the census R11 arm)
     | "mirror"
     | "wiki"
     | "audit"; // pages/settings-audit-logs.tsx (the census R13 arm)
@@ -594,6 +599,15 @@ export function SettingsNav(props: {
         {/* navbar.tmpl:32-34 — Deploy Keys. */}
         <a class={props.active === "keys" ? "active item" : "item"} href={`${props.repoLink}/settings/keys`}>
           {deployKeysSettingsLocale.deploy_keys}
+        </a>
+        {/* navbar.tmpl:35-39 — LFS, immediately after Deploy Keys inside the
+            code-unit block; upstream gates the item on .LFSStartServer — the
+            LFS server is unconditional here (SPEC-0006's always-on store), so
+            the item always renders. Lit by the pages/repo-settings-lfs.tsx
+            mount (the census R11 arm — the SettingsNav dead-link omission
+            retired for LFS; Actions stays dead). */}
+        <a class={props.active === "lfs" ? "active item" : "item"} href={`${props.repoLink}/settings/lfs`}>
+          {repoSettingsLfsLocale.lfs}
         </a>
         <a class={props.active === "mirror" ? "active item" : "item"} href={`${props.repoLink}/settings/mirror`}>
           {mirrorLocale.mirror_settings}

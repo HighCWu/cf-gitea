@@ -213,7 +213,7 @@ describe("the dashboard DOM (templates/admin/dashboard.tmpl at the pin)", () => 
     expect(html).not.toContain(`<details class="item" open=""><summary>${adminFamilyLocale.monitoring}</summary>`);
     expect(html).not.toContain(`<details class="item" open=""><summary>${adminFamilyLocale.identityAccess}</summary>`);
     expect(html).not.toContain("self_check"); // unlanded — the dead-link rule
-    expect(html).not.toContain('href="/-/admin/config"');
+    expect(html).toContain('href="/-/admin/config"'); // SPEC-0018 §3.2's Configuration group (the Summary item)
     expect(html).toContain('href="/-/admin/notices"'); // SPEC-0018 §3.1's top-level item
   });
 

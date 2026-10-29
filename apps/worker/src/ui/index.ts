@@ -1016,6 +1016,14 @@ import {
   renderAdminApplicationsPage,
 } from "./pages/admin-applications";
 import { adminNoticesLocale, loadAdminNoticesData, renderAdminNoticesPage } from "./pages/admin-notices";
+// The SPEC-0018 §3.2 config arm (the census R18/R20 config summary — the
+// read-only build-posture page; the vars slice keeps secrets unreachable
+// even by accident, the module header's rule-3 guarantee).
+import {
+  adminConfigVarsFromEnv,
+  loadAdminConfigData,
+  renderAdminConfigPage,
+} from "./pages/admin-config";
 import {
   loadUserProfileData,
   renderUserProfilePage,
@@ -1349,6 +1357,19 @@ import {
   parseRepoWikiForm,
   renderRepoWikiSettingsPage,
 } from "./pages/repo-settings-wiki";
+// The census R11 arm: the four LFS settings read surfaces (upstream
+// web.go:1249-1261's /settings/lfs group; the scan/join pipeline lives in
+// services/lfs/read.ts).
+import {
+  loadLfsDetailPageData,
+  loadLfsFilesPageData,
+  loadLfsFindPageData,
+  loadLfsPointersPageData,
+  renderRepoSettingsLfsDetailPage,
+  renderRepoSettingsLfsFindPage,
+  renderRepoSettingsLfsListPage,
+  renderRepoSettingsLfsPointersPage,
+} from "./pages/repo-settings-lfs";
 // Window-2e C2b: the editor tails + cherrypick/patch modules.
 import {
   loadEditorUploadData,
@@ -1428,6 +1449,7 @@ import {
   contentHistoryDetailFragmentResponse,
   contentHistoryListFragmentResponse,
   contentHistoryOverviewFragmentResponse,
+  contentHistorySoftDeleteFragmentResponse,
   formInt64,
   issueAttachmentsFragmentResponse,
   issueInfoFragmentResponse,
@@ -1437,6 +1459,7 @@ import {
   loadIssueAttachmentsFragment,
   loadIssueInfoFragment,
   resolveFragmentIssue,
+  softDeleteContentHistoryFragment,
 } from "./pages/issue-content-fragments";
 import { loadPullMergeBoxData, pullMergeBoxFragmentHtml, pullMergeBoxFragmentResponse } from "./pages/pull-merge-box";
 import {
@@ -1464,6 +1487,15 @@ import {
   renderRepoRecentCommitsPage,
   type RepoChartKind,
 } from "./pages/repo-charts";
+// The census R09-M2 commit-graph page (web.go:1738's /graph literal) over
+// the M1 graphData engine RPC (SPEC-0017 M2); one handler answers the page
+// and the ?div-only=true fragment twin.
+import {
+  loadGraphData,
+  parseGraphQuery,
+  renderGraphFragment,
+  renderRepoGraphPage,
+} from "./pages/repo-graph";
 import {
   commentAttachmentsFragmentResponse,
   loadCommentAttachmentsFragment,
@@ -1646,6 +1678,10 @@ export interface SettingsRoute {
     | "settings-tag-detail" // GET+POST /settings/tags/{id}
     | "settings-keys" // GET+POST /settings/keys
     | "settings-keys-delete" // POST /settings/keys/delete
+    | "settings-lfs" // GET /settings/lfs (the census R11 arm)
+    | "settings-lfs-show" // GET /settings/lfs/show/{oid}
+    | "settings-lfs-pointers" // GET /settings/lfs/pointers
+    | "settings-lfs-find" // GET /settings/lfs/find
     | "settings-public-access" // GET+POST /settings/public_access
     | "settings-wiki" // GET+POST /settings/wiki (window-2d pass 2)
     | "settings-audit-logs"; // GET /settings/audit_logs (the census R13 arm — GET only upstream, web.go:1279)
@@ -1654,7 +1690,8 @@ export interface SettingsRoute {
   /** The hook id (the detail/test/delete families only) or the rule id (the
    *  branch-delete family, the tag-detail family). */
   id?: number;
-  /** The Git hook name (the settings-githook family). */
+  /** The Git hook name (the settings-githook family) or the LFS oid (the
+   *  settings-lfs-show family). */
   name?: string;
 }
 
@@ -2525,6 +2562,19 @@ export interface RepoChartRoute {
   tail: "data" | null;
 }
 
+/** The census R09-M2 commit-graph family (pages/repo-graph.tsx): upstream
+ *  web.go:1738's `m.Get("/graph", repo.Graph)` in a bare group with
+ *  `repo.MustBeNotEmpty` (web.go:1737-1744) — NO ref-suffix middleware: the
+ *  URL carries no ref, ever. The query arms (mode / hide-pr-refs / branch /
+ *  div-only / page) ride the URL, not the path — the family claims the bare
+ *  literal only; deeper tails stay unclaimed → the engine's 404, exactly
+ *  upstream's unregistered-route answer. */
+export interface GraphRoute {
+  family: "graph";
+  owner: string;
+  repo: string;
+}
+
 /** Window-2e B2: the repo-scoped aux feeds + fragments (issues-search-aux,
  *  issue-content-fragments, pull-merge-box, compare-feeds,
  *  pull-files-single-commit, activity-author-data). */
@@ -2537,6 +2587,7 @@ export interface IssueAuxRoute {
     | "issue-content-overview"
     | "issue-content-history-list"
     | "issue-content-history-detail"
+    | "issue-content-history-soft-delete"
     | "issue-attachments-alias"
     | "pull-merge-box"
     | "pull-files-range"
@@ -2572,10 +2623,10 @@ export interface UserSettingsRoute {
 /** Window-2c: the admin family (pages/admin-dashboard.tsx +
  *  pages/admin-monitor.tsx + the wave's users/orgs/repos pages — upstream's
  *  /-/admin group). The census R18 (a) arms extend the family union
- *  additively: emails / hooks / badges / applications, and SPEC-0018 §3.1's
- *  notices arm (each module's header carries its mount record; the remaining
- *  upstream arms stay unclaimed — config/auths are the census's (b) class,
- *  packages/actions the (c) gate). */
+ *  additively: emails / hooks / badges / applications, SPEC-0018 §3.1's
+ *  notices arm and §3.2's config summary (each module's header carries its
+ *  mount record; the remaining upstream arms stay unclaimed — auths is the
+ *  census's remaining (b) class, packages/actions the (c) gate). */
 export interface AdminRoute {
   family:
     | "admin-dashboard"
@@ -2598,6 +2649,7 @@ export interface AdminRoute {
     | "admin-applications"
     | "admin-application-create"
     | "admin-application-delete"
+    | "admin-config"
     | "admin-notices"
     | "admin-notices-delete"
     | "admin-notices-empty";
@@ -2832,6 +2884,7 @@ export type ParsedUiRoute =
   | RepoSearchRoute
   | RepoActivityRoute
   | RepoChartRoute
+  | GraphRoute
   | SiteHomeRoute
   | ExploreRoute
   | NotificationsRoute
@@ -3144,6 +3197,13 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     ) {
       return { family: "admin-application-delete", applicationId: Number.parseInt(tail[2] as string, 10) };
     }
+    // The SPEC-0018 §3.2 config arm (web.go:788-794's /config group): the
+    // read-only summary GET beside the notices arm. Upstream's ChangeConfig
+    // POST, the settings editor page and the two test riders are the §3.2
+    // §-outs (arming is a var edit + redeploy, never a runtime toggle), so
+    // ONLY the bare literal claims — every other config/* tail stays
+    // unclaimed → the engine's 404.
+    if (tail.length === 1 && tail[0] === "config") return { family: "admin-config" };
     // The SPEC-0018 §3.1 notices arm (web.go:882-886's /notices group): the
     // paged GET and the two plain-form write POSTs (the module's mount
     // record). NO create route — notices are system-generated, upstream
@@ -3734,6 +3794,12 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (rest[1] === "content-history" && rest[2] === "detail") {
         return { family: "issue-content-history-detail", owner, repo, urlKind: head, index };
       }
+      // The soft-delete write (issue_content_history.go:183-236's
+      // SoftDeleteContentHistory, web.go:1391 — the reqSignIn'd UPDATE
+      // group): the detail arm's exact three-segment tail shape, POST-only.
+      if (rest[1] === "content-history" && rest[2] === "soft-delete") {
+        return { family: "issue-content-history-soft-delete", owner, repo, urlKind: head, index };
+      }
       // The byte-serving alias: upstream mounts the uuid arm at
       // /{index}/attachments/{uuid} (web.go:1337) driving the same seam as
       // the site-level /attachments/{uuid} — a 302 onto it (the module's
@@ -3807,6 +3873,28 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (rest.length === 1 && rest[0] === "keys") return { family: "settings-keys", owner, repo };
     if (rest.length === 2 && rest[0] === "keys" && rest[1] === "delete") {
       return { family: "settings-keys-delete", owner, repo };
+    }
+    // The census R11 arm (pages/repo-settings-lfs.tsx — upstream
+    // web.go:1249-1261's `m.Group("/settings/lfs", ...)` under the shared
+    // reqRepoAdmin settings group): the four read surfaces — the list, the
+    // {oid} detail, the pointer scan and the find form. The write tails
+    // (delete / auto-associate / the locks trio) stay unclaimed — the pages
+    // render no controls for them — so the engine answers those with its
+    // 404, upstream's unregistered-route answer; the bare `/lfs/show`
+    // literal and every deeper/junk tail likewise.
+    if (rest.length === 1 && rest[0] === "lfs") return { family: "settings-lfs", owner, repo };
+    if (rest.length === 2 && rest[0] === "lfs" && rest[1] === "pointers") {
+      return { family: "settings-lfs-pointers", owner, repo };
+    }
+    if (rest.length === 2 && rest[0] === "lfs" && rest[1] === "find") {
+      return { family: "settings-lfs-find", owner, repo };
+    }
+    if (rest.length === 3 && rest[0] === "lfs" && rest[1] === "show" && rest[2] !== undefined && rest[2] !== "") {
+      try {
+        return { family: "settings-lfs-show", owner, repo, name: decodeURIComponent(rest[2]) };
+      } catch {
+        return null;
+      }
     }
     // The census R13 arm (pages/settings-audit-logs.tsx — web.go:1279's
     // literal `m.Get("/audit_logs", repo_setting.ViewAuditLogs)`, GET only;
@@ -4230,6 +4318,15 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // unregistered-route answer.
   if (head === "search") {
     if (rest.length === 0) return { family: "repo-search", owner, repo };
+    return null;
+  }
+  // The census R09-M2 commit graph (pages/repo-graph.tsx — upstream
+  // web.go:1738's bare `/graph` literal in the MustBeNotEmpty group at
+  // web.go:1737-1744): the exact bare literal, GET-only — no ref-suffix
+  // middleware exists upstream, so no deeper tail claims (the query arms
+  // mode/hide-pr-refs/branch/div-only/page ride the URL).
+  if (head === "graph") {
+    if (rest.length === 0) return { family: "graph", owner, repo };
     return null;
   }
   // Wave-26 fork form (pages/repo-fork.tsx — upstream web.go:1490's
@@ -5147,6 +5244,80 @@ async function repoWikiSettingsSubmit(c: Context<{ Bindings: Env }>): Promise<Re
   return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/wiki?saved=1` } }));
 }
 
+// --- the census R11 arm (pages/repo-settings-lfs.tsx — upstream's
+// /settings/lfs group, web.go:1249-1261; the shared settingsGate posture —
+// the whole settings group closes behind reqRepoAdmin, web.go:1283-1286;
+// the four surfaces are read-only pages, so no sameOriginGuard POST runs
+// here) ---------------------------------------------------------------
+
+/** GET /{owner}/{repo}/settings/lfs (LFSFiles, lfs.go:44-68): the paged
+ *  meta-object listing — pure D1, renders on an unborn HEAD too (the family
+ *  has no MustBeNotEmpty gate upstream). */
+async function repoLfsListPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { url, ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-lfs") return respond(await c.notFound()); // drift guard
+  const data = await loadLfsFilesPageData(c.env, repo, parsePageNumber(url.searchParams.get("page")));
+  return respond(c.html(renderRepoSettingsLfsListPage({ ctx, data }), 200));
+}
+
+/** GET /{owner}/{repo}/settings/lfs/show/{oid} (LFSFileGet, lfs.go:230-315):
+ *  the detail view — an invalid oid or a meta miss 404-shells (the loader's
+ *  null = lfs.go's IsValid + ErrLFSObjectNotExist arms). */
+async function repoLfsDetailPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "settings-lfs-show" || route.name === undefined) return respond(await c.notFound()); // drift guard
+  const data = await loadLfsDetailPageData(c.env, repo, route.name);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderRepoSettingsLfsDetailPage({ ctx, data }), 200));
+}
+
+/** GET /{owner}/{repo}/settings/lfs/pointers (LFSPointerFiles,
+ *  lfs.go:389-495): the scan + join page — the engine's null ladder renders
+ *  the found-0 empty state (never a 404); the viewer's site-admin flag keys
+ *  the Associatable mid-term reduction (the read.ts header). */
+async function repoLfsPointersPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-lfs-pointers") return respond(await c.notFound()); // drift guard
+  const data = await loadLfsPointersPageData(c.env, repo, viewer.kind === "user" && viewer.isAdmin);
+  return respond(c.html(renderRepoSettingsLfsPointersPage({ ctx, data }), 200));
+}
+
+/** GET /{owner}/{repo}/settings/lfs/find (LFSFileFind, lfs.go:349-386): the
+ *  oid/size form's answer page — an empty oid, a junk/zero size (upstream
+ *  FormInt64's miss parses 0) or a non-hex oid 404-shells (the loader's
+ *  null = lfs.go:356-359's guard). */
+async function repoLfsFindPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { url, ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-lfs-find") return respond(await c.notFound()); // drift guard
+  const size = Number.parseInt(url.searchParams.get("size") ?? "", 10);
+  const data = await loadLfsFindPageData(
+    c.env,
+    repo,
+    url.searchParams.get("oid") ?? "",
+    Number.isNaN(size) ? 0 : size,
+    url.searchParams.get("sha") ?? undefined,
+  );
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  return respond(c.html(renderRepoSettingsLfsFindPage({ ctx, data }), 200));
+}
+
 // ---------------------------------------------------------------------------
 // Window-2e folds: the branches writer forms' POST arms (the wave-63 module
 // handoff — upstream web.go:1477-1486's editor middlewares: writer grant +
@@ -5542,6 +5713,33 @@ async function issueContentHistoryDetailRoute(c: Context<{ Bindings: Env }>): Pr
   return respond(contentHistoryDetailFragmentResponse(data));
 }
 
+/**
+ * POST /{owner}/{repo}/{issues|pulls}/{index}/content-history/soft-delete
+ * (issue_content_history.go:183-236's SoftDeleteContentHistory, web.go:1391
+ * — the reqSignIn'd UPDATE group): the detail handler's shape, then the
+ * module's outcome map — the notFound arm renders the HTML shell, forbidden
+ * is the JSON 403, the two orphaned quirks are the EMPTY 200s, and
+ * deleted/writeFailed are the `{"ok": …}` 200s (:231-235). The bundle's
+ * fetch carries comment_id + history_id on the QUERY STRING
+ * (repo-issue-content.ts:48), so the FormInt64 reads ride the search params
+ * exactly like the detail arm.
+ */
+async function issueContentHistorySoftDeleteRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, repo, respond, viewer } = resolved;
+  const route = resolved.route;
+  if (route.family !== "issue-content-history-soft-delete" || route.index === undefined) return respond(await c.notFound()); // drift guard
+  const issue = await resolveFragmentIssue(c.env.DB, repo, route.index);
+  if (issue === null) return respond(c.html(renderNotFound(ctx), 404));
+  const commentId = formInt64(resolved.url.searchParams.get("comment_id"));
+  const historyId = formInt64(resolved.url.searchParams.get("history_id"));
+  const data = await softDeleteContentHistoryFragment(c.env, repo, issue, viewer, commentId, historyId);
+  return respond(contentHistorySoftDeleteFragmentResponse(data, renderNotFound(ctx)));
+}
+
 async function issueAttachmentsAliasRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
@@ -5697,6 +5895,32 @@ async function repoSearchPage(c: Context<{ Bindings: Env }>): Promise<Response> 
   const data = await loadRepoSearchData(engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`), repo, url.searchParams);
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   return respond(c.html(renderRepoSearchPage({ ctx, data }), 200));
+}
+
+/** GET /{owner}/{repo}/graph (pages/repo-graph.tsx — the census R09-M2
+ *  commit-graph page, upstream web.go:1738 → commit.go:106-173). The shared
+ *  visibility read IS the bare group's middleware gate (ours reduces to the
+ *  visibility read, the repo-activity precedent); `MustBeNotEmpty`
+ *  404-shells empty repos (web.go:1737) and the loader's null answers the
+ *  unborn-HEAD ladder plus the engine-transport 404 (the activity-page
+ *  posture). One handler answers BOTH arms: the full page and the
+ *  `?div-only=true` body fragment (commit.go:170-173's tplGraphDiv — the
+ *  official bundle's refresh fetch; the pager links strip the param,
+ *  commit.go:169's RemoveParam). */
+async function repoGraphPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "graph") return respond(await c.notFound()); // drift guard
+  if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404)); // MustBeNotEmpty (web.go:1737)
+  const query = parseGraphQuery(url.searchParams);
+  const data = await loadGraphData(engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`), query);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+  return respond(
+    query.divOnly ? c.html(renderGraphFragment(repoLink, data), 200) : c.html(renderRepoGraphPage(ctx, data), 200),
+  );
 }
 
 /** GET /{owner}/{repo}/comments/{id}/attachments (the fragment module's
@@ -8080,6 +8304,22 @@ async function adminNoticesEmpty(c: Context<{ Bindings: Env }>): Promise<Respons
   await emptyNotices(c.env.DB);
   const data = await loadAdminNoticesData(c.env.DB, new URL(c.req.raw.url).searchParams);
   return p.respond(c.html(renderAdminNoticesPage(p.ctx, data, { kind: "positive", text: adminNoticesLocale.deleteSuccess })));
+}
+
+// --- the SPEC-0018 §3.2 config arm (pages/admin-config.tsx — upstream's
+// /-/admin config group, web.go:788-794; the shared adminPagePrologue;
+// GET-only — the ChangeConfig write is the §3.2 §-out) ----------------------
+
+/** GET /-/admin/config (pages/admin-config.tsx): the prologue → the
+ *  read-only summary over the declared non-secret wrangler vars (the env
+ *  slice is the §3.2 rule-3 guarantee — secrets are not fields of the
+ *  loader's input), the published settings constants and the build
+ *  posture. */
+async function adminConfigPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminConfigData(adminConfigVarsFromEnv(c.env));
+  return p.respond(c.html(renderAdminConfigPage(p.ctx, data)));
 }
 
 /**
@@ -11761,6 +12001,11 @@ uiRouter.post("/-/admin/applications/oauth2/:id{\\d+}/delete", (c) => adminAppli
 uiRouter.get("/-/admin/notices", (c) => adminNoticesPage(c));
 uiRouter.post("/-/admin/notices/delete", (c) => adminNoticesDelete(c));
 uiRouter.post("/-/admin/notices/empty", (c) => adminNoticesEmpty(c));
+// The SPEC-0018 §3.2 config arm (parseUiRoute claims exactly the bare
+// literal — web.go:788-794's GET-only summary beside the notices lines).
+// Upstream's ChangeConfig POST is the §3.2 §-out: no POST twin exists, the
+// unregistered method falls to the sub-app's 404 (never a page render).
+uiRouter.get("/-/admin/config", (c) => adminConfigPage(c));
 // The POST-only shapes' GET twins answer the methodNotAllowed arm (the
 // method-blind parse convention — upstream chi's own 405 posture).
 uiRouter.get("/-/admin/emails/activate", () => methodNotAllowed("POST"));
@@ -11787,6 +12032,11 @@ uiRouter.get("/:owner/labels/delete", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/commits", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/commits/*", (c) => uiPage(c));
+// The census R09-M2 commit-graph family (parseUiRoute claims exactly the
+// bare literal — web.go:1737-1744's GET-only page beside the commits group;
+// no ref-suffix wildcard exists upstream, so the single line is exact —
+// deeper /graph/* tails stay engine-owned).
+uiRouter.get("/:owner/:repo/graph", (c) => repoGraphPage(c));
 uiRouter.get("/:owner/:repo/src", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/src/*", (c) => uiPage(c));
 // The blame family (web.go:1729-1733): the typed tails only — the parser
@@ -11873,6 +12123,17 @@ uiRouter.get("/:owner/:repo/settings/public_access", (c) => repoPublicAccessPage
 uiRouter.post("/:owner/:repo/settings/public_access", (c) => repoPublicAccessSubmit(c));
 uiRouter.get("/:owner/:repo/settings/wiki", (c) => repoWikiSettingsPage(c));
 uiRouter.post("/:owner/:repo/settings/wiki", (c) => repoWikiSettingsSubmit(c));
+// The census R11 LFS settings family (parseUiRoute claims exactly these four
+// GET shapes — web.go:1249-1261's read surfaces). The POST twins answer
+// chi's 405 (the audit arm's convention — read-only pages, no write arm).
+uiRouter.get("/:owner/:repo/settings/lfs", (c) => repoLfsListPage(c));
+uiRouter.post("/:owner/:repo/settings/lfs", () => methodNotAllowed("GET"));
+uiRouter.get("/:owner/:repo/settings/lfs/show/:name", (c) => repoLfsDetailPage(c));
+uiRouter.post("/:owner/:repo/settings/lfs/show/:name", () => methodNotAllowed("GET"));
+uiRouter.get("/:owner/:repo/settings/lfs/pointers", (c) => repoLfsPointersPage(c));
+uiRouter.post("/:owner/:repo/settings/lfs/pointers", () => methodNotAllowed("GET"));
+uiRouter.get("/:owner/:repo/settings/lfs/find", (c) => repoLfsFindPage(c));
+uiRouter.post("/:owner/:repo/settings/lfs/find", () => methodNotAllowed("GET"));
 // The census R13 audit arm (parseUiRoute claims exactly the 5-segment
 // literal — web.go:1279's GET-only page; the POST answers chi's 405, the
 // compare family's methodNotAllowed convention).
@@ -11904,6 +12165,10 @@ uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/content-history/ove
 // answer for `/issues/-1/...`).
 uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/content-history/list", (c) => issueContentHistoryListRoute(c));
 uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/content-history/detail", (c) => issueContentHistoryDetailRoute(c));
+// The soft-delete write (parseUiRoute claims exactly this shape — the
+// detail arm's tail with the soft-delete literal; POST-only upstream,
+// web.go:1391's UPDATE group).
+uiRouter.post("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/content-history/soft-delete", (c) => issueContentHistorySoftDeleteRoute(c));
 uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/merge_box", (c) => pullMergeBoxRoute(c));
 uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/files/:segment{^[a-f0-9]{7,64}(\\.\\.[a-f0-9]{7,64})?$}", (c) => pullFilesRangeRoute(c));
 uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/commits/:sha{^[a-f0-9]{7,64}$}", (c) => pullCommitFilesRoute(c));
