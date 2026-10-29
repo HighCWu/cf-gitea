@@ -4,9 +4,23 @@
  * listing with the latest-commit box and §3.5 per-entry enrichment, and the
  * README section rendered through the shared §3.4 markdown pipeline.
  *
+ * The body rides upstream home.tmpl's `repo-grid-filelist-sidebar` grid:
+ * the listing in `.repo-home-filelist` plus the `.repo-home-sidebar-top`
+ * column carrying the repo-home code-search form (home_sidebar_top.tmpl:2-10
+ * — the GET form toward `{RepoLink}/search`, the ONLY upstream link into the
+ * landed search page). The form's markup is byte-faithful to the pin; the
+ * `S` shortcut works because the official bundle serves it: the kbd hint's
+ * `data-global-init="onGlobalShortcut"` is registered server-bundle-side
+ * (web_src/js/modules/shortcut.ts:123) and observer.ts wires the wrapper.
+ * The rest of upstream's sidebar_top (description/website/topics/README
+ * link/size/stars/watchers/forks) and the whole sidebar_bottom (latest
+ * release, language stats) are deferred — each needs data surfaces this
+ * unit does not own; the grid already reserves their slots.
+ *
  * Empty repos (§4.1: public, unborn HEAD) render the upstream repo/empty.tmpl
  * analog — clone command from the request origin + create-by-push hint, no
- * file list, no README — never a crash on `readCommit(null)`.
+ * file list, no README, no sidebar (upstream's empty.tmpl has none) — never
+ * a crash on `readCommit(null)`.
  */
 
 import type { CommitJson, TreeEntryJson } from "@cf-gitea/git-engine";
@@ -16,8 +30,9 @@ import { FileContentView } from "../components/file-content";
 import { RepoFilesTable } from "../components/file-list";
 import type { EngineClient } from "../engine";
 import { enrichTreeCommits, pickReadme, renderRepoMarkdown } from "../page-data";
-import { BaseLayout } from "../shell";
+import { BaseLayout, Icon } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
+import { searchPageLocale } from "./repo-search";
 
 /** The ref universe + resolved default branch behind one page render. */
 export interface ResolvedRefs extends SelectorRefs {
@@ -156,40 +171,62 @@ export function HomePage(props: { ctx: UiContext; data: HomeData }) {
   return (
     <BaseLayout ctx={ctx} pageClass="repository file list" activeTab="code">
       <div class="ui container">
-        <div class="repo-button-row">
-          <div class="repo-button-row-left">
-            <BranchSelector
+        <div class="repo-grid-filelist-sidebar">
+          <div class="repo-home-filelist">
+            <div class="repo-button-row">
+              <div class="repo-button-row-left">
+                <BranchSelector
+                  repoLink={repoLink}
+                  family="src"
+                  refs={data.refs}
+                  active={{ refType: "branch", ref: head }}
+                />
+              </div>
+            </div>
+            <RepoFilesTable
               repoLink={repoLink}
-              family="src"
-              refs={data.refs}
-              active={{ refType: "branch", ref: head }}
+              refType="branch"
+              ref={head}
+              dirPath=""
+              entries={data.entries}
+              commits={data.commits}
+              latestCommit={data.latestCommit}
             />
+            {readme !== null ? (
+              <div class="repo-readme-section">
+                <FileContentView
+                  repoLink={repoLink}
+                  treePath={readme.entry.name}
+                  ref={head}
+                  variant={readme.variant}
+                  markupHtml={readme.html}
+                  text={readme.text}
+                  size={readme.entry.size ?? null}
+                  latestCommit={data.commits.get(readme.entry.name) ?? null}
+                  readmeInList={true}
+                />
+              </div>
+            ) : null}
+          </div>
+          <div class="repo-home-sidebar-top flex-relaxed-list">
+            {/* home_sidebar_top.tmpl:2-10 verbatim + shared/search/button:
+                the GET form into the landed /search page. The kbd hint's
+                data-global-init rides the official bundle (shortcut.ts:123
+                registers onGlobalShortcut — focus-on-S, click-to-focus,
+                aria-keyshortcuts are all bundle-side runtime behavior). */}
+            <form class="ignore-dirty tw-flex" action={`${repoLink}/search`} method="get">
+              <div class="ui small action input tw-flex tw-flex-1">
+                <div class="ui input tw-flex tw-flex-1 global-shortcut-wrapper">
+                  <input name="q" size={10} placeholder={searchPageLocale.code_kind} />
+                  <kbd data-global-init="onGlobalShortcut" data-shortcut-keys="s">S</kbd>
+                </div>
+                <button type="submit" class="ui small icon button" aria-label={searchPageLocale.search}>
+                  <Icon name="octicon-search" />
+                </button>
+              </div>
+            </form>
           </div>
         </div>
-        <RepoFilesTable
-          repoLink={repoLink}
-          refType="branch"
-          ref={head}
-          dirPath=""
-          entries={data.entries}
-          commits={data.commits}
-          latestCommit={data.latestCommit}
-        />
-        {readme !== null ? (
-          <div class="repo-readme-section">
-            <FileContentView
-              repoLink={repoLink}
-              treePath={readme.entry.name}
-              ref={head}
-              variant={readme.variant}
-              markupHtml={readme.html}
-              text={readme.text}
-              size={readme.entry.size ?? null}
-              latestCommit={data.commits.get(readme.entry.name) ?? null}
-              readmeInList={true}
-            />
-          </div>
-        ) : null}
       </div>
     </BaseLayout>
   );

@@ -488,30 +488,90 @@ measurement carries sibling-owned uncommitted edits outside this
 survey's ownership (the issues-API quartet + webhook docs + mirror
 scripts among others) — not characterized, changes no counts; every
 count reads committed HEAD.
+**Ticked 2026-10-29** a seventeenth time, at HEAD `c7ec2fe` — the v1.3
+wave's formal re-walk, PROGRAMMATIC (the backtick-aware family walk,
+run on this file BEFORE the edits — it reproduces tick-16's baseline
+exactly: A 21/1/2, B 11/2/5, C 21/2/3, D 22/0/0, E 9/0/3, F 10/0/4 =
+94/5/17, 116 rows — and again AFTER, where its counts must equal the
+headline below). TWELVE rows flip LANDED across the two UI commits of
+the v1.3 wave, each verified against the tree (parse family + render
+call site at HEAD, not assumed from commit messages):
+`77e8567` (the combined wave, nine units) lands
+`/explore/organizations` (A — the `explore-organizations` family over
+the visibility-ladder org listing, rendered through
+`pages/explore.tsx`), `/{username}/-/heatmap` (B — the
+`owner-heatmap` JSON family + the SSR widget arm in the profile
+feed), `/org/{org}/dashboard[/{team}]` (B — the `org-dashboard`
+family, member-gated 404-shell kept, the `/dashboard/-/heatmap` tail
+a recorded reduction), `/org/{org}/issues|pulls|milestones[/{team}]`
+(B — the `org-inbox` family, member-ladder scope), the
+`/{org}/teams/{team}` NAME carrier (B — PARTIAL→LANDED, the R19 arm:
+non-integer segments resolve case-folded per org.go:213-218), the
+org settings applications tab (the B settings row's penultimate
+tail), `.../blame/*` (C — page + file-view anchor over the blame RPC
+`aa1fb29`), `.../raw/*` + `.../media/*` (C — the two
+PARTIAL-by-divergence rows: the byte families landed, `links.ts`
+switched to the upstream web shape), and the shell Activity tab +
+repo-activity wiring (F); `781d8a3` (the registration window, four
+units) lands the repo `.../settings/audit_logs` page (E — over M4's
+`findAuditEvents`) AND its org twin (the B settings row's LAST tail —
+the row flips LANDED), the in-repo `.../search` page (C — over the
+grep RPC `0644597`), and the three chart pages + `/data` JSON routes
+(F — over `contributorStats` `449400a`). `7381c0d` (SPEC-0018 M1)
+lands the admin notices page — NO flip (the A admin row stays
+PARTIAL, its STILL ABSENT list shrinking to config/auths/packages/
+actions). Machinery-only landings move Data notes, not statuses: the
+`graphData` boundary RPC (`7a21493`, SPEC-0017 M1 — the C graph row
+stays ABSENT, its page in flight), packages M1 (`8cdf44a`, SPEC-0016
+— the two packages rows stay ABSENT, the M2 pages in flight), the
+activity page itself (`5f5e167` + the `b61220b` graft) and its engine
+upgrade (`c14359c`). Headline **107/1/8, zero rows in flight** (116
+rows). Reconciliation vs the census landing ledger
+(`ui-gap-census-2026-10-29.md`, appended at HEAD `e5e1432`, predicted
+103/2/11): the ledger's in-flight set resolved AFTER its measurement
+— R10/R13/R15 pages and R20's audit arm at `781d8a3`, R09's RPC at
+`7a21493`, packages M1 at `8cdf44a` — and the delta is exactly
++3 ABSENT→LANDED, +1 PARTIAL→LANDED (R20): **103/2/11 + that delta =
+107/1/8** — the arithmetic reconciles, and the ledger's "R20 stays
+PARTIAL" line is superseded by its own audit arm landing. TWO flags,
+recorded not absorbed: (1) upstream's `/-/admin/audit_logs`
+(web.go:797-798 — `admin.ViewAuditLogs` + `ExportAuditLogs`) sits
+inside the admin row's cited range but appears in NEITHER this
+survey's admin row label NOR the census's R18 list, and SPEC-0018
+dispositioned admin config/notices/auths without it — the row's
+STILL ABSENT note now names it, no row added (the row set stays
+116, pin-stable per the preamble); (2) `check-openapi` FAILS at this
+HEAD — one (b)-class fail, `POST /packages/{owner}/{type}/{name}/-/unlink`
+declares 204 against contract {201, 404}, introduced by the packages
+M1 landing (`8cdf44a`); declared 500 ops / 306 paths, tier-1 78/78 /
+129/129 intact — an open issue for the packages unit, not a survey
+row.
 
 - **Pin**: `fc4936884584a41931906553d96c2601d750e6ef` (v1.22.0-rc1-3919;
   verified `git -C gitea rev-parse HEAD`). Every `web.go:N` cite is
   `gitea/routers/web/web.go` at that commit unless another file is named.
 - **Our side**: the route table + parser families in
-  `apps/worker/src/ui/index.ts` at HEAD `59b1c3c` (refreshed at
-  tick-16; tick-15's measurements were at `ea6a49d`, tick-12's at
+  `apps/worker/src/ui/index.ts` at HEAD `c7ec2fe` (refreshed at
+  tick-17; tick-16's measurements were at `59b1c3c`, tick-15's at
+  `ea6a49d`, tick-12's at
   `484eb92`) — the header inventory
   (the route-family comment block) and the `ParsedUiRoute` union
-  (index.ts:2477 at this tick) are the exhaustive family list (a family
+  (index.ts:2811 at this tick) are the exhaustive family list (a family
   exists iff a parse branch returns it); the pages under
-  `apps/worker/src/ui/pages/` (191 files committed at this tick: 102 page
-  modules + 89 test modules — tick-15's "89 + 101" split was
-  transposed, its 190 total right; up from 160 files at `03f9e82`) and the
+  `apps/worker/src/ui/pages/` (221 files committed at this tick: 117 page
+  modules + 104 test modules; up from 191 files at `59b1c3c` and 160 at
+  `03f9e82`) and the
   session router (`src/ui/session.ts`) + the first-run router
   (`src/ui/first-run.ts` — the `/install` window + the ALLOW_SIGNUP-gated
   `/user/sign_up`, mounted BEFORE `uiRouter`, `9d77172`) carry the renders, with the
   `src/web/` seam routers (avatar serving, attachments serving) mounted in
   `src/index.ts`. Every count reads committed HEAD
-  (`git show` / `git ls-tree HEAD`); at this tick the working tree
-  carries sibling-owned uncommitted edits outside this survey's
-  ownership — not characterized, changes no counts. The survey's
-  `grep -c "family:"` parse-branch count stands at 286 and index.ts at
-  10,764 lines at this tick (284 / 10,717 at tick-15; 263 / 10,054 when
+  (`git show` / `git ls-tree HEAD`); the working tree is CLEAN at this
+  tick's measurement (zero porcelain entries — the first clean-tree
+  tick since tick-15). The survey's
+  `grep -c "family:"` parse-branch count stands at 330 and index.ts at
+  12,341 lines at this tick (286 / 10,764 at tick-16; 284 / 10,717 at
+  tick-15; 263 / 10,054 when
   the session began).
 - **Reproducing the counts** (exactly these walks):
   1. Upstream: walk the page-bearing GETs out of `gitea/routers/web/web.go`
@@ -567,13 +627,13 @@ model or a new engine-boundary RPC / whole subsystem).
 
 | Family | rows | LANDED | PARTIAL | ABSENT | IN-FLIGHT |
 |---|---|---|---|---|---|
-| A site-level + auth | 24 | 21 | 1 | 2 | 0 |
-| B owner pages | 18 | 11 | 2 | 5 | 0 |
-| C repo code browsing | 26 | 21 | 2 | 3 | 0 |
+| A site-level + auth | 24 | 22 | 1 | 1 | 0 |
+| B owner pages | 18 | 16 | 0 | 2 | 0 |
+| C repo code browsing | 26 | 25 | 0 | 1 | 0 |
 | D issues + pulls | 22 | 22 | 0 | 0 | 0 |
-| E repo settings | 12 | 9 | 0 | 3 | 0 |
-| F repo sub-systems | 14 | 10 | 0 | 4 | 0 |
-| **total** | **116** | **94** | **5** | **17** | **0** |
+| E repo settings | 12 | 10 | 0 | 2 | 0 |
+| F repo sub-systems | 14 | 12 | 0 | 2 | 0 |
+| **total** | **116** | **107** | **1** | **8** | **0** |
 
 (The regen's headline was 36/4/69 + 4 in-flight; the `5d9122c` tick took
 it to 48/4/61 + 0. The `7016ce9` tick: wave-ui-parity-6 lands 2 ABSENT rows
@@ -636,6 +696,20 @@ status column (the trio row was already LANDED at `19d15a1`; its
 purge-page gap lived in the Data cell), and the printed A 21/0/3
 dropped the `/-/admin/*` PARTIAL — the tables at `ea6a49d` tally
 91/5/20, which is the baseline this tick's headline corrects from.)
+The `c7ec2fe` tick (tick-17, the v1.3 wave's re-walk): TWELVE flips —
+A +1 LANDED −1 ABSENT (`/explore/organizations`, `77e8567`), B +5
+LANDED −2 PARTIAL −3 ABSENT (heatmap, org dashboard, org inbox at
+`77e8567`; the teams name carrier `77e8567` and the org settings tabs
+row — its applications arm `77e8567`, its audit_logs arm `781d8a3`,
+closing it), C +4 LANDED −2 PARTIAL −2 ABSENT (blame `77e8567` over
+the `aa1fb29` RPC; raw + media `77e8567`; search `781d8a3` over the
+`0644597` RPC), E +1 LANDED −1 ABSENT (settings/audit_logs
+`781d8a3`), F +2 LANDED −2 ABSENT (activity `77e8567`/`c14359c`;
+charts `781d8a3` over `449400a`) — for **107/1/8 + 0** at 116 rows.
+The admin row stays PARTIAL (notices `7381c0d` shrank its absent
+list, flipped nothing); graph stays ABSENT (the `7a21493` RPC is
+machinery, its page in flight); the two packages rows stay ABSENT
+(the `8cdf44a` M1 backend is machinery, the M2 pages in flight).
 
 ## In-flight (excluded from the totals — do not re-dispatch)
 
@@ -691,6 +765,17 @@ counted by the formal re-walk) and the first-run pair (`515a594` +
 at this measurement again carries sibling-owned uncommitted edits
 outside this survey's ownership — not characterized, changes no
 counts.
+Tick-17: the tree is CLEAN (zero porcelain entries) and zero rows are
+in flight. TWO page surfaces are PENDING over landed machinery —
+sibling-owned dispatch lanes, not counted as in-flight rows (their
+rows stay ABSENT-with-note and inside the totals, keeping the ledger
+arithmetic reconcilable): the graph page (C — the `graphData` RPC
+landed `7a21493`, SPEC-0017 M1, oracle 14/14 vs real git; the SSR SVG
+page is the next lane) and the packages M2 pages (B/F — SPEC-0016 M1
+landed `8cdf44a` (six D1 tables, the R2 two-pass blob pipeline, the
+`/api/packages` protocol, 9 management ops + admin list declared);
+the UI pages stay downstream of the API per the ledger's recorded
+gate). Do not re-dispatch the machinery; the pages' lanes are owned.
 
 The previous in-flight chain, for the record: the module wave
 (fifteen page modules across thirteen commits, tracked through ticks
@@ -838,7 +923,7 @@ onto).
 | `GET /explore` (redirect) | web.go:550-552 | LANDED | landed | core | — |
 | `GET /explore/repos` | web.go:553 | LANDED (`pages/explore.tsx`) | landed | core | — |
 | `GET /explore/users` | web.go:555 | LANDED | landed | core | — |
-| `GET /explore/organizations` | web.go:557 | ABSENT | partial (org rows + `adminGetAllOrgs` landed, admin-gated; no anonymous visible-org search arm — `OrgService` has no explore listing, verified) | core | M |
+| `GET /explore/organizations` | web.go:557 | LANDED (the combined wave `77e8567` — the `explore-organizations` parse family + the render through `pages/explore.tsx` over the visibility-ladder org listing; the anonymous visible-org arm the old Data note demanded IS the landed ladder) | landed | core | — |
 | `GET /explore/code` | web.go:558-563 | ABSENT | none (no grep RPC) | authoring | L |
 | `GET /explore/topics/search` | web.go:564 | LANDED (aux JSON feed, window-2e A `84996c6` — optSignIn, no gate; the topic-search aux over the landed topics) | landed (topics) | admin | — |
 | `GET /sitemap.xml` + explore sitemaps | web.go:530,554,556 | LANDED (window-2e A `84996c6` — exact literals BEFORE the owner/repo parse, else `/explore/repos/sitemap-1.xml` parses owner=explore; the idx guards + the repo-search API-Viewer bridge fixed forward `c2925f2`) | landed | admin | — |
@@ -868,16 +953,16 @@ onto).
 | `GET /{username}` (profile or org home, one handler) | web.go:911 | LANDED (`pages/user-profile.tsx` + `pages/org-home.tsx`; the FULL tab strip now serves: `?tab=activity` mounted `b1bf73a` — `ownerHomePage`'s user half renders `pages/activity-feeds.tsx` under the tab, profile.go:162-190's arm, the org half ignores the query — and the mount window `2f7afe9` wired followers/following (`pages/user-follow-tabs.tsx`), stars (`pages/user-stars-tab.tsx`) and watching (`pages/user-watching-tab.tsx`) beside it (index.ts:5347-5367's tab dispatch); the folds put the Stars anchor in every strip (the default DisableStars arm), watching after it, and avatar-card follower anchors with the 18px person glyph. Tick-14: the icon.tmpl glyph chain landed tree-wide — `65d07b6` ports icon.tmpl's mirror > fork > plain into OrgRepoListItem exactly (matrix-8 flagged the unconditional fallback repo glyph as an UNDOCUMENTED divergence — never recorded in this survey, nothing to strike; the four direct consumers profile/explore/dashboard/subscriptions inherit; deliberately NOT settings-repos' RepoKindIcon — repos.tmpl:86-96's chain is lock-first with fork before mirror, a DIFFERENT chain), and `cb1fb3f` lands the same chain in the stars/watching rows — both glyphs already in the AdminEmbeddedSvg allowlist, zero allowlist work, zero loader changes) | landed | core | — |
 | `GET /{username}.rss` / `.atom` (handled inside the sub-route) | web.go:909-911 | LANDED (window-2e B1 `1a59af0` — one regex-constrained registration (the owner-home precedent); `resolveActivityFeeds` org-then-user, visibility-gated, renamed 307, missing 404 shell; gorilla-parity bytes with USER_FEED_CONTENT_TYPES) | landed (`repoListActivityFeeds` family declared `2ef9359`, `renderFeedItems` in `api/services/activity-feeds.ts`) | admin | — |
 | `GET /{username}/-/repositories` (org repo list) | web.go:1134 | LANDED (`pages/org-repos.tsx`, ui-parity-2) | landed | core | — |
-| `GET /{username}/-/heatmap` | web.go:1135 | ABSENT | none | admin | M |
+| `GET /{username}/-/heatmap` | web.go:1135 | LANDED (the combined wave `77e8567` — the `owner-heatmap` JSON family + `pages/owner-heatmap.ts`, GET-only at the exact 4-segment shape, tail-registered with the documented no-earlier-match rationale; the contribution data serves as the web JSON feed and the SSR widget arm rides the profile feed — upstream's page-embedded client-fetch shape reduced, the render-policy divergence recorded per the census's call; the `-` namespace's disjoint literal cannot shadow the landed `/-/projects` shapes) | landed | admin | — |
 | `GET /{username}/-/packages[/...]` | web.go:1108-1128 | ABSENT | none (no packages system — FEATURE-ABSENT) | admin | L |
 | `GET /{username}/-/projects` (the index) | web.go:1139 | LANDED (`pages/owner-projects.tsx`, wave-ui-parity-8 `45bea22`; upstream's group is a project INDEX, not a board — `?state=` facet, writer-only count toggle, visibility-filtered counts, both empty arms, org-vs-individual chrome; no dead controls — titles plain-text, write controls unrendered; follower-404 gate divergence pinned) | landed (projects store 0024 + all three API scopes declared) | authoring | — |
 | `/{username}/-/projects` board + write group (`GET /{id}`, `/{id}/workflows[/{workflow_id}]`, `/new`, `/{id}/edit`) | web.go:1140-1155 (+ board/workflow helpers web.go:327-345) | LANDED (`pages/owner-project-board.tsx` + the `owner-project-*` parse families, `9b49cd2` — landed mid-tick after being dispatched in-flight; the board view with columns+cards, both write forms, the workflow tails, form-POST conventions with kebab/move/drag-drop/JS-builder reductions documented, nothing dead; the LIST landed `45bea22`) | landed (same store) | authoring | — |
 | `GET /{username}/-/code` (global code search) | web.go:1166 | ABSENT | none (no grep RPC) | authoring | L |
 | `GET /org/{org}/members` | web.go:965 | LANDED (`pages/org-members.tsx`, ui-parity-2; tick-13: the keyword arm instr()s — its LIKE pair capped at D1's 50-byte pattern limit and a 49+-char needle answered a plain 500, fixed `943e1e9`; tick-14: the class swept tree-wide `c91f689` — every request-derived LIKE pattern ported to the instr() substring shape (milestones name, the issues title/content pair shared by the repo list and /repos/issues/search, repos-search's comma trio, suggestions, topics ×2, the teams pair, the global-inbox ×2, watching — 11 sites) plus the releases tag_filter glob translated exactly (prefix/middle-chain/suffix with the no-overlap length pin, the >64-star guard disclosed) — closing the raw-LIKE `%`/`_` wildcard leak (upstream escapes both, release.go:302-309)) | landed | core | — |
-| `GET /org/{org}/dashboard[/{team}]` (+heatmap) | web.go:982-985 | ABSENT | partial | authoring | M |
-| `GET /org/{org}/issues|pulls|milestones[/{team}]` | web.go:986-991 | ABSENT | partial | authoring | M |
+| `GET /org/{org}/dashboard[/{team}]` (+heatmap) | web.go:982-985 | LANDED (the combined wave `77e8567` — the `org-dashboard` family + `pages/org-dashboard.tsx` over the upstream dashboard literals; the member-gated 404-shell posture kept per the census's member-only posture; the `{team}` arm rides the name carrier; the `/dashboard/-/heatmap` tail (web.go:984-985) stays unclaimed — the recorded reduction) | landed | authoring | — |
+| `GET /org/{org}/issues|pulls|milestones[/{team}]` | web.go:986-991 | LANDED (the combined wave `77e8567` — the `org-inbox` family + `pages/org-inbox.tsx`, the member-ladder scope + the team arm, the 404-for-non-members posture kept) | landed | authoring | — |
 | `GET /{org}/teams` | web.go:993 | LANDED (`pages/org-teams.tsx`, owner gate) | landed | authoring | — |
-| `GET /{org}/teams/{team}` (+`/repositories` web.go:998) | web.go:997-998 | PARTIAL — landed id-keyed detail (upstream links by team NAME); repositories list merged into the detail slice | landed | authoring | — |
+| `GET /{org}/teams/{team}` (+`/repositories` web.go:998) | web.go:997-998 | LANDED (the id-keyed detail slice now carries the NAME carrier — the combined wave's R19 arm `77e8567`: any non-integer `{team}` segment resolves case-folded against the lower names (org.go:213-218's EqualFold walk), the miss rendering the 404 shell; the merged members+repositories slice stays (the census's recorded closer-port call); name tails carry no edit/delete read arms — five-segment name tails stay unclaimed → the engine's 404, the recorded reduction) | landed | authoring | — |
 | `GET /{org}/teams/new` | web.go:1009 | LANDED | landed | authoring | — |
 | `GET|POST /{org}/teams/{team}/edit` (+ the team delete write) | web.go:1011-1013 | LANDED (`pages/org-settings.tsx`'s edit arm, `8380cf0` — new.tmpl's edit form over every landed `editTeam` field: name, description, the visibility radio triple, permission radios checked by the team's `authorize` (blanket read/write/admin — the landed enum has no `none`), stored per-unit teams rendering their unit rows with `units_present=1` and form-convert semantics per upstream's ParseAccessMode-first order; the `repo_access` radios dead-control-unrendered — the landed arm ignores the field; the red Delete Team button a real form POST, the confirm dialog reduced) | landed (`orgEditTeam`/`orgDeleteTeam` declared) | authoring | — |
 | `GET|POST /{org}/settings` (options) + the avatar pair + the danger-zone writes | web.go:1017-1021,1065-1067 | LANDED (`pages/org-settings.tsx`, wave 49 `8380cf0` — the options combo over `orgEdit`: full_name/email/description/website/location + `repo_admin_change_team_access` + the visibility modal's write; the avatar pair multipart-bridged through the landed avatar pipeline (`processAvatarImage`/`uploadAvatar`); rename/delete/visibility as three `<details>` disclosure forms — the dialog reduction, every control live; `max_repo_creation` honest-absent, no landed key nor column; the navbar's unlanded tabs render nothing, the dead-link rule) | landed (`orgEdit`/`renameOrg`/`orgDelete`/`orgUpdateAvatar`/`orgDeleteAvatar` declared) | authoring | — |
