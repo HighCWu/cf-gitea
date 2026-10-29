@@ -110,6 +110,16 @@ import {
   validateNpmName,
 } from "../../services/packages/npm";
 
+import {
+  decodeMavenPathWildcard,
+  extractMavenPathParameters,
+  loadMavenMetadataDocument,
+  mavenMetadataChecksum,
+  mavenPathExt,
+  openMavenFile,
+  uploadMavenPackageFile,
+} from "../../services/packages/maven";
+
 const WWW_AUTHENTICATE = 'Basic realm="Gitea Package API"';
 
 // ---------------------------------------------------------------------------
@@ -585,6 +595,96 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
   app.on("DELETE", "/:username/npm/*", (c) => npmDispatch(c));
   app.on("POST", "/:username/npm/*", (c) => npmDispatch(c));
 
+
+  // ------------------------------ MAVEN (api.go:336-339) ------------------------------
+  const mavenDownload = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const wildcard = decodeMavenPathWildcard(c.req.path, c.req.param("username") ?? "");
+      if (wildcard === null) return plainResponse(400, "request parameters are invalid");
+      const params = extractMavenPathParameters(wildcard);
+      if (params === null) return plainResponse(400, "request parameters are invalid");
+
+      if (params.isMeta && params.version === "") {
+        // serveMavenMetadata (maven.go:82-150).
+        const doc = await loadMavenMetadataDocument(c.env.DB, owner, params);
+        if (doc === null) return plainResponse(404, "package does not exist");
+        const ext = mavenPathExt(params.filename).toLowerCase();
+        const bytes = new TextEncoder().encode(doc.xml);
+        if (ext === ".md5" || ext === ".sha1" || ext === ".sha256" || ext === ".sha512") {
+          return plainResponse(200, await mavenMetadataChecksum(doc.xml, ext));
+        }
+        const headers = new Headers({
+          "content-type": "text/xml",
+          "content-length": String(bytes.byteLength),
+          "last-modified": doc.lastModified.toUTCString(),
+        });
+        return new Response(c.req.method === "HEAD" ? null : bytes, { status: 200, headers });
+      }
+
+      const opened = await openMavenFile(
+        c.env.DB,
+        c.env.REPO_PACKS,
+        owner,
+        params,
+        c.req.method === "HEAD" ? "HEAD" : "GET",
+      );
+      if (opened.kind === "checksum") {
+        return plainResponse(200, opened.hash);
+      }
+      const headers = new Headers({
+        "content-type": opened.contentType,
+        "content-length": String(opened.size),
+        "last-modified": opened.file.createdUnix.toUTCString(),
+      });
+      // Upstream's HEAD-only branch sets headers WITHOUT the filename
+      // (maven.go:216-219) — no Content-Disposition; the GET arm sets it
+      // (helper.ServePackageFile).
+      if (c.req.method !== "HEAD") {
+        headers.set(
+          "content-disposition",
+          `attachment; filename="${opened.file.name.replace(/["\\]/g, "_")}"`,
+        );
+      }
+      return new Response(c.req.method === "HEAD" ? null : opened.stream, { status: 200, headers });
+    } catch (error) {
+      return mavenErrorResponse(error);
+    }
+  };
+  app.put("/:username/maven/*", async (c) => {
+    try {
+      const { owner, cred } = await protocolContext(c, "write");
+      const doer = cred.doer;
+      if (doer === null) {
+        return plainResponse(401, "user should have specific permission or be a site admin", {
+          "WWW-Authenticate": WWW_AUTHENTICATE,
+        });
+      }
+      const declaredLength = contentLength(c.req.raw);
+      if (declaredLength === null) {
+        return plainResponse(411, "Content-Length header is required");
+      }
+      const wildcard = decodeMavenPathWildcard(c.req.path, c.req.param("username") ?? "");
+      if (wildcard === null) return plainResponse(400, "request parameters are invalid");
+      const outcome = await uploadMavenPackageFile({
+        d1: c.env.DB,
+        bucket: c.env.REPO_PACKS,
+        owner,
+        doer,
+        pathWildcard: wildcard,
+        useLegacyPackageName: new URL(c.req.url).searchParams.get("use_legacy_package_name") ?? "",
+        content: bodyStream(c.req.raw),
+        declaredLength,
+        quota: packagesQuotaFromEnv(c.env),
+      });
+      return new Response(null, { status: outcome.kind === "created" ? 201 : 200 });
+    } catch (error) {
+      return mavenErrorResponse(error);
+    }
+  });
+
+  app.get("/:username/maven/*", (c) => mavenDownload(c));
+  app.on("HEAD", "/:username/maven/*", (c) => mavenDownload(c));
   return app;
 }
 
