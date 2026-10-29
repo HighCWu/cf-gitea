@@ -27,7 +27,7 @@ import { renderToString } from "hono/jsx/dom/server";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { loadRepoSettings, saveRepoSettings } from "../../api/services/repo-settings";
-import { repositories } from "../../db/schema";
+import { repoUnits, repositories } from "../../db/schema";
 import {
   applyRepoActionsUnitToggle,
   formBool,
@@ -73,7 +73,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  for (const table of ["repo_settings", "repositories", "users"]) {
+  for (const table of ["repo_units", "repo_settings", "repositories", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   repo = await seedRepo("demo");
@@ -173,6 +173,15 @@ describe("applyRepoActionsUnitToggle (ActionsUnitPost's UpdateRepositoryUnits ar
   it("is repo-scoped — the neighbor's flag never moves", async () => {
     await applyRepoActionsUnitToggle(env.DB, repo.id, { enableActions: true });
     expect((await loadRepoSettings(env.DB, "repo-2")).hasActions).toBe(false);
+  });
+
+  it("maintains the repo_units actions row in lockstep (the scan's unit gate — ActionsUnitPost's UpdateRepositoryUnits arm: enable inserts, disable deletes)", async () => {
+    await applyRepoActionsUnitToggle(env.DB, repo.id, { enableActions: true });
+    expect(
+      (await drizzle(env.DB).select().from(repoUnits).where(eq(repoUnits.repoId, repo.id)).all()).map((r) => r.type),
+    ).toEqual(["actions"]);
+    await applyRepoActionsUnitToggle(env.DB, repo.id, { enableActions: false });
+    expect(await drizzle(env.DB).select().from(repoUnits).where(eq(repoUnits.repoId, repo.id)).all()).toEqual([]);
   });
 });
 

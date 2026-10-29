@@ -1,7 +1,7 @@
 import { drizzle } from "drizzle-orm/d1";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 
-import { repoSettings, repositories } from "../../db/schema";
+import { repoSettings, repoUnits, repositories } from "../../db/schema";
 
 /**
  * Repo-edit stored subset (SPEC-0004 §2.4 row: `PATCH /repos/{owner}/{repo}`
@@ -20,10 +20,12 @@ import { repoSettings, repositories } from "../../db/schema";
  * `repo_id`, upstream keeps the columns on the repository row) so the hot
  * `repositories` schema stays untouched.
  *
- * Defaults are upstream's: `DefaultRepoUnits` (code/issues/pulls/releases
- * enabled, wiki enabled, projects/packages/actions disabled — the exact
- * values services/repository.ts renders today) with empty description/
- * website.
+ * Defaults are the landed house posture: code/issues/pulls/releases/wiki
+ * enabled, projects/packages/actions disabled (upstream's DefaultRepoUnits at
+ * the pin actually enables projects, packages AND actions —
+ * models/unit/unit.go:60-72; the disabled-on-arrival trio is a documented
+ * house divergence, the default-false render posture), with empty
+ * description/website.
  */
 
 /**
@@ -99,7 +101,28 @@ export async function loadRepoSettings(d1: D1Database, repoId: string): Promise<
 
 /** The PATCH write: upsert only the fields the body set (others keep their
  *  stored value — the merged row is computed read-then-apply and written via
- *  the `repo_id` PK conflict clause, preserving SQLite's single-row upsert). */
+ *  the `repo_id` PK conflict clause, preserving SQLite's single-row upsert).
+ *
+ *  The Actions unit-row maintenance rides the same write (upstream
+ *  ActionsUnitPost, routers/web/repo/setting/actions.go:67-93: enable →
+ *  `UpdateRepositoryUnits(ctx, repo, [newRepoUnit(repo, TypeActions, nil)], nil)`
+ *  inserts the repo_unit row; disable → the deleteUnitTypes arm deletes it —
+ *  services/repository/setting.go:19-52, one transaction). The row's presence
+ *  IS the enabled state upstream (UnitEnabled reads the repo_unit rows,
+ *  models/repo/repo.go:385-387), and our landed owner-scope runner scan gates
+ *  on the SAME join (services/actions `scopeRepoIds`, the models/actions/
+ *  task.go:280-284 port) — so a has_actions write that left the row unwritten
+ *  made the scan blind to every production repo (the C9 unit-row gap). A
+ *  packages write carries no row duty: its gate is the documented
+ *  `has_packages` flag reduction (schema.ts's MustEnableRepoPackages note)
+ *  with no row reader.
+ *
+ *  Both unit states ride ONE batch (a single SQLite transaction on D1), so
+ *  the flag and the row can never commit divergently. The row write is
+ *  unconditional in the unit's direction — insert is conflict-tolerant and
+ *  delete affects zero rows when absent (upstream likewise rewrites the unit
+ *  list on every toggle without consulting the previous state) — which also
+ *  heals any pre-fix flag/row divergence on the next save. */
 export async function saveRepoSettings(
   d1: D1Database,
   repoId: string,
@@ -109,10 +132,20 @@ export async function saveRepoSettings(
   const current = await loadRepoSettings(d1, repoId);
   const merged = { ...current, ...patch };
   const values = { ...merged, updatedAt: now };
-  await drizzle(d1)
+  const db = drizzle(d1);
+  const upsert = db
     .insert(repoSettings)
     .values({ repoId, ...values })
     .onConflictDoUpdate({ target: repoSettings.repoId, set: values });
+  if (patch.hasActions === undefined) {
+    await upsert;
+    return;
+  }
+  const unitWrite =
+    patch.hasActions === true
+      ? db.insert(repoUnits).values({ repoId, type: "actions" }).onConflictDoNothing()
+      : db.delete(repoUnits).where(and(eq(repoUnits.repoId, repoId), eq(repoUnits.type, "actions")));
+  await db.batch([upsert, unitWrite]);
 }
 
 /** Repo-scoped settings delete (the api repoDelete path's housekeeping; the

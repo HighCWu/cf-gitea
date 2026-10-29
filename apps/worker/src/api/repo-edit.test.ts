@@ -19,7 +19,7 @@ import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { repoRedirects, repoTransfer, repoWatchers, repositories, stars, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
+import { repoRedirects, repoTransfer, repoUnits, repoWatchers, repositories, stars, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
 import {
   createOptionalTokenAuthMiddleware,
   createStubAuthResolver,
@@ -99,7 +99,7 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   await resetRepoExtrasTables();
-  for (const table of ["stars", "repo_transfer", "repo_redirects", "repo_counters", "webhook_deliveries", "webhooks", "repositories", "users"]) {
+  for (const table of ["stars", "repo_transfer", "repo_redirects", "repo_counters", "repo_units", "webhook_deliveries", "webhooks", "repositories", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   await env.DB.prepare(
@@ -203,6 +203,28 @@ describe("PATCH /repos/{owner}/{repo} (repoEdit) — stored settings subset", ()
     expect(body.has_projects).toBe(true);
     // Ignored remainder: no store — the render keeps the upstream defaults.
     expect(body.mirror_interval).toBe("");
+  });
+
+  it("maintains the repo_units actions row with has_actions (the scan's unit gate — upstream ActionsUnitPost's UpdateRepositoryUnits arm)", async () => {
+    // The owner-scope runner scan joins repo_units type='actions'
+    // (models/actions/task.go:280-284), so a flag-only PATCH left it blind
+    // to the repo (the C9 unit-row gap).
+    const on = await makeApp()(repoPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ has_actions: true }),
+    });
+    expect(on.status).toBe(200);
+    expect(
+      (await drizzle(env.DB).select().from(repoUnits).where(eq(repoUnits.repoId, "7401")).all()).map((r) => r.type),
+    ).toEqual(["actions"]);
+    const off = await makeApp()(repoPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ has_actions: false }),
+    });
+    expect(off.status).toBe(200);
+    expect(await drizzle(env.DB).select().from(repoUnits).where(eq(repoUnits.repoId, "7401")).all()).toEqual([]);
   });
 
   it("writes the template flag (repo.go:699-701) — the API-reachable generate gate", async () => {
