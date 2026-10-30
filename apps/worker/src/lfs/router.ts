@@ -46,9 +46,22 @@
  * - Successes ride the same envelope: `writeStatus(200)` emits
  *   `{"message":"OK"}` with the LFS media type (upload + verify).
  *
- * Locks (`info/lfs/locks/*`) are P2 (§2.7): answered with a plain 501 before
- * auth — push/pull never touch them, and `git lfs lock` users get an honest
- * capability signal instead of a 404.
+ * Locks (`info/lfs/locks/*`, §2.7) are implemented per upstream
+ * `services/lfs/locks.go`: the four group registrations (GET/POST `locks`,
+ * POST `locks/verify`, POST `locks/{lid}/unlock`) run the group's
+ * `CheckAcceptMediaType` (415) before per-verb auth (list/verify read,
+ * create/unlock write — all REQUIRE a signed-in doer, `requireSigned`), then
+ * the upstream arms: 401 with the route-specific "You must have pull/push
+ * access to <verb> locks" JSON body + the gitea-lfs realm, 403 scope, 400
+ * body-decode (`writeStatus`), 201 create / 200 list+verify+unlock / 409
+ * duplicate with the existing lock echoed. Response content-type is
+ * `application/json;charset=utf-8` with NO trailing newline — upstream's
+ * `ctx.JSON` overrides the media-type header the handlers set and its
+ * jsonv2 `MarshalWrite` emits compact bodies (both verified at the pin);
+ * unlock's not-found and not-owner-without-force arms answer upstream's exact
+ * 500 "unable to delete lock : Internal Server Error" (locks.go:311-318 maps
+ * EVERY `DeleteLFSLockByID` error there — there is no 404/403 arm at this
+ * pin). See src/lfs/locks.ts for the arm-by-arm citations.
  *
  * Config: upstream serves the subtree only when `LFS_START_SERVER` is on
  * (`lfsServerEnabled` parity). No config surface exists yet (`wrangler.jsonc`
@@ -90,6 +103,8 @@ import {
   type BatchShapingContext,
   type LfsLimits,
 } from "../services/lfs/batch";
+import { LfsLockService } from "../services/lfs/locks";
+import { handleLocks } from "./locks";
 import { LfsStateService, validateAdoptStat } from "../services/lfs/state";
 import {
   createLfsStore,
@@ -109,6 +124,15 @@ type RepositoryRow = typeof repositories.$inferSelect;
 /** The LFS family sub-routes (SPEC-0006 §2.1 table). */
 export type LfsRouteKind = "batch" | "upload" | "download" | "verify" | "locks" | "not-found";
 
+/** The locks group's four registrations (`routers/common/lfs.go:22-27`). */
+export type LfsLockVerb = "list" | "create" | "verify" | "unlock";
+
+export interface LfsLocksSubRoute {
+  verb: LfsLockVerb;
+  /** `POST /locks/{lid}/unlock` raw path segment (Go ParseInt per handler). */
+  lid: string | null;
+}
+
 export interface LfsRoute {
   /** Decoded owner path segment (request casing; D1 lookups fold case). */
   owner: string;
@@ -122,6 +146,11 @@ export interface LfsRoute {
    * or the base64url filename for GET (download). Null on bare `objects/{oid}`.
    */
   arg: string | null;
+  /**
+   * Parsed locks sub-route when `kind === "locks"`; undefined for hand-built
+   * routes (defensive — the dispatcher answers those with the catch-all).
+   */
+  lock?: LfsLocksSubRoute;
 }
 
 /**
@@ -157,13 +186,29 @@ export function parseLfsRoute(pathname: string, method: string): LfsRoute | null
   let kind: LfsRouteKind = "not-found";
   let oid: string | null = null;
   let arg: string | null = null;
+  let lock: LfsLocksSubRoute | undefined = undefined;
 
   if (tail === "objects/batch") {
     kind = method === "POST" ? "batch" : "not-found";
   } else if (tail === "verify") {
     kind = method === "POST" ? "verify" : "not-found";
-  } else if (tail === "locks" || tail.startsWith("locks/")) {
-    kind = "locks"; // any method — P2 defer answers 501 for all of them
+  } else if (tail === "locks" || tail === "locks/") {
+    // Group registrations `m.Get("/")` + `m.Post("/")` — chi matches both the
+    // bare and the trailing-slash form; other methods hit the catch-all.
+    if (method === "GET" || method === "POST") {
+      kind = "locks";
+      lock = { verb: method === "GET" ? "list" : "create", lid: null };
+    }
+  } else if (tail === "locks/verify") {
+    if (method === "POST") {
+      kind = "locks";
+      lock = { verb: "verify", lid: null };
+    }
+  } else if (/^locks\/[^/]+\/unlock$/.test(tail)) {
+    if (method === "POST") {
+      kind = "locks";
+      lock = { verb: "unlock", lid: tail.slice("locks/".length, tail.length - "/unlock".length) };
+    }
   } else if (tail.startsWith("objects/") && tail.length > "objects/".length) {
     const value = tail.slice("objects/".length);
     const slash = value.indexOf("/");
@@ -190,7 +235,7 @@ export function parseLfsRoute(pathname: string, method: string): LfsRoute | null
     }
   }
 
-  return { owner, repo, kind, oid, arg };
+  return { owner, repo, kind, oid, arg, lock };
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +419,7 @@ export async function authorizeLfs(input: {
 export interface LfsDeps {
   state: LfsStateService;
   store: LfsStore;
+  locks: LfsLockService;
   limits: LfsLimits;
   now: () => Date;
 }
@@ -386,6 +432,7 @@ export function defaultLfsDeps(env: Env): LfsDeps {
   return {
     state: new LfsStateService(env.DB),
     store: createLfsStore(env.REPO_PACKS),
+    locks: new LfsLockService(env.DB),
     limits: DEFAULT_LFS_LIMITS,
     now: () => new Date(),
   };
@@ -429,7 +476,7 @@ export async function serveLfs(
   // Route-level decisions before auth (upstream: routing first; the §2.1
   // catch-all row carries no auth).
   if (lfs.kind === "not-found") return lfsNotFound();
-  if (lfs.kind === "locks") return lfsError(501); // §2.7 P2
+  if (lfs.kind === "locks") return handleLocks(req, env, waitUntil, lfs, resolved, deps);
 
   try {
     switch (lfs.kind) {
@@ -475,8 +522,8 @@ class BodyTooLargeError extends Error {
 }
 
 /** Stream the request body to a string with a hard cap (AGENTS.md: never an
- *  unbounded `await req.text()`). */
-async function readBodyCapped(req: Request, cap: number): Promise<string> {
+ *  unbounded `await req.text()`). Shared with the locks handlers (§2.7). */
+export async function readBodyCapped(req: Request, cap: number): Promise<string> {
   const declared = req.headers.get("content-length");
   if (declared !== null && Number.parseInt(declared, 10) > cap) throw new BodyTooLargeError();
   if (req.body === null) return "";

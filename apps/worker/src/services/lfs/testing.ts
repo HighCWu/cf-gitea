@@ -23,4 +23,5 @@ export async function applyLfsObjectsDdl(): Promise<void> {
 /** Clear rows between tests (schema persists; only rows are per-test scratch). */
 export async function resetLfsTables(): Promise<void> {
   await env.DB.prepare("DELETE FROM lfs_objects").run();
+  await env.DB.prepare("DELETE FROM lfs_locks").run();
 }

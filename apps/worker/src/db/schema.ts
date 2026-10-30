@@ -309,8 +309,17 @@ export const repoUnits = sqliteTable(
      * SPEC-0012 M1a adds 'actions' (upstream unit 10,
      * models/unit/unit.go:35 TypeActions) — the owner-scope runner scan's
      * unit gate (services/actions CreateTaskForRunner's repo_unit join).
+     * The repoEdit parity wave adds 'pull_requests' (upstream unit 2,
+     * models/unit/unit.go:28 TypePullRequests) and 'projects' (upstream
+     * unit 8, models/unit/unit.go:38 TypeProjects) — config carriers for
+     * the PATCH /repos merge-flag + projects_mode stores
+     * (services/repo-settings.ts; upstream unit 5 TypeCode keeps its
+     * pre-existing row role: has_code's lockstep toggle). Same type-level
+     * -only extension, no SQL migration.
      */
-    type: text("type", { enum: ["code", "packages", "actions"] }).notNull().default("code"),
+    type: text("type", {
+      enum: ["code", "packages", "actions", "pull_requests", "projects"],
+    }).notNull().default("code"),
     /** What anonymous visitors may do on this unit: 'none' | 'read'. */
     anonymousAccessMode: text("anonymous_access_mode", { enum: ["none", "read"] })
       .notNull()
@@ -1126,6 +1135,44 @@ export const lfsObjects = sqliteTable(
     primaryKey({ columns: [t.repoId, t.oid] }),
     index("idx_lfs_objects_repo_state_updated").on(t.repoId, t.state, t.updatedAt),
   ],
+);
+
+// ---------------------------------------------------------------------------
+// SPEC-0006 §2.7 — git-lfs file locking (lfs_locks).
+// ---------------------------------------------------------------------------
+
+/**
+ * One git-lfs file lock (`git lfs lock`) — the `LFSLock` model
+ * (upstream models/git/lfs_lock.go:21-28): numeric autoincrement id (the wire
+ * `id` is its decimal string), repo scope, owning user, normalized path,
+ * creation time (unix seconds, `mode: "timestamp"` — upstream renders
+ * `locked_at` second-rounded RFC3339 via `convert.ToLFSLock`).
+ *
+ * `lower_path` is our one added column: upstream enforces the per-repo
+ * path-uniqueness of `CreateLFSLock` with a case-insensitive SELECT
+ * (`lower(path) = ?`, lfs_lock.go:94) inside the insert transaction; D1 has
+ * no such transactional check-then-insert, so the folded copy carries a
+ * UNIQUE index (`uq_lfs_locks_repo_lower_path`) — the duplicate race answers
+ * 409 with the existing lock instead of double-inserting. Wire-invisible.
+ * `repo_id` is the numeric repo key the LFS router derives (same bridge as
+ * `lfs_objects`; same TODO to move to `repositories.id`).
+ */
+export const lfsLocks = sqliteTable(
+  "lfs_locks",
+  {
+    /** Wire lock id (decimal string on the LFS locks API). */
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Numeric repo key derived by the LFS router (not `repositories.id`). */
+    repoId: integer("repo_id").notNull(),
+    /** Owning user id (`users.id`; orgs included — orgs are user rows). */
+    ownerId: integer("owner_id").notNull(),
+    /** Locked file path, `util.PathJoinRel`-normalized, original case. */
+    path: text("path").notNull(),
+    /** `path.toLowerCase()` — the case-insensitive uniqueness/lookup key. */
+    lowerPath: text("lower_path").notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [uniqueIndex("uq_lfs_locks_repo_lower_path").on(t.repoId, t.lowerPath)],
 );
 
 // ---------------------------------------------------------------------------

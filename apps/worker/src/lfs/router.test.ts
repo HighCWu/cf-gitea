@@ -20,6 +20,7 @@ import {
   LFS_ACCEPT_HEADER,
   LFS_MEDIA_TYPE,
 } from "../services/lfs/batch";
+import { LfsLockService } from "../services/lfs/locks";
 import { LfsStateService } from "../services/lfs/state";
 import {
   PresignLfsStore,
@@ -828,18 +829,28 @@ describe("family catch-all and P2 deferrals", () => {
     expect(wrongMethod.headers.get("content-type")).toContain("text/plain");
   });
 
-  it("answers locks/* with a plain 501 before auth (§2.7 P2)", async () => {
+  it("404s locks method mismatches via the catch-all, 415s matched routes without Accept", async () => {
+    // Method mismatches never reach the locks group's media-type middleware —
+    // they fall to the family catch-all (chi: no route in the group matches),
+    // plain-text like every other unregistered subpath.
     const fixtures = await seedFixtures();
+    const auth = { authorization: basicTokenHeader(fixtures.write) };
+    const base = `${repoUrl(fixtures.privateRepo)}/info/lfs/locks`;
 
-    const anonymous = await SELF.fetch(`${repoUrl(fixtures.privateRepo)}/info/lfs/locks`, { method: "POST" });
-    expect(anonymous.status).toBe(501);
-    expect(anonymous.headers.get("www-authenticate")).toBeNull();
-    expect(await anonymous.json()).toEqual({ message: "Not Implemented" });
+    const wrongMethod = await SELF.fetch(`${base}/verify`, { method: "GET", headers: auth });
+    expect(wrongMethod.status).toBe(404);
+    expect(await wrongMethod.text()).toBe("404 page not found\n");
 
-    const nested = await SELF.fetch(`${repoUrl(fixtures.privateRepo)}/info/lfs/locks/42/unlock`, {
-      method: "POST",
-    });
-    expect(nested.status).toBe(501);
+    const junk = await SELF.fetch(`${base}/42`, { method: "POST", headers: auth });
+    expect(junk.status).toBe(404);
+    expect(await junk.text()).toBe("404 page not found\n");
+
+    // A matched route with a foreign Accept 415s before auth (the group's
+    // CheckAcceptMediaType) — anonymous, still 415.
+    const noAccept = await SELF.fetch(base, { method: "POST" });
+    expect(noAccept.status).toBe(415);
+    expect(noAccept.headers.get("content-type")).toBe("application/vnd.git-lfs+json");
+    expect(await noAccept.json()).toEqual({ message: "Unsupported Media Type" });
   });
 });
 
@@ -858,6 +869,7 @@ describe("presign href mode (capability probe, batch roundtrip)", () => {
     const deps = {
       state: new LfsStateService(env.DB),
       store: presign,
+      locks: new LfsLockService(env.DB),
       limits: DEFAULT_LFS_LIMITS,
       now: () => new Date("2026-10-24T12:00:00Z"),
     };
