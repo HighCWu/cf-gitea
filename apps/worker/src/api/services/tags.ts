@@ -71,7 +71,7 @@ import {
   ZERO_OID,
   type RefTip,
 } from "./engine";
-import { personDate, toAnnotatedTag, toTag } from "./git-models";
+import { toAnnotatedTag, toTag } from "./git-models";
 import { toApiRepository, viewerOf, type RepositoryWithOwner } from "./repository";
 import type { AnnotatedTag, Tag } from "../models/git";
 
@@ -258,22 +258,21 @@ export async function readTagData(env: ApiEnv["Bindings"], pair: TagStoreRepo, t
 }
 
 /**
- * The Tag wire render — the canonical toTag converter fed the message the
- * boundary now serves. Spread-fed here rather than re-parameterizing the
- * converter because services/git-models.ts is outside this unit's ownership;
- * fold back into toTag when its owner's window opens (and retire the stale
- * deviation note in its docstring).
+ * The Tag wire render — bare delegation to the canonical toTag converter's
+ * arms arity (convert.go:227's t.MessageUTF8 arm), fed the message the
+ * boundary now serves.
  */
 export function renderTag(name: string, tip: RefTip, commitSha: string, data: { message: string }, pair: RepositoryWithOwner, origin: string): Tag {
-  return { ...toTag(name, tip, commitSha, pair, origin), message: data.message };
+  return toTag(name, tip, commitSha, data, pair, origin);
 }
 
 /**
- * The AnnotatedTag wire render — the canonical toAnnotatedTag converter fed
- * the message + the ToCommitUser-shaped tagger (UTC RFC3339 date, the same
- * personDate render every CommitUser here uses). Same ownership note as
- * renderTag. `tagger` stays null when the tag object omits the header (the
- * schema is nullable; upstream's parse defaults it to the empty identity).
+ * The AnnotatedTag wire render — bare delegation to the canonical
+ * toAnnotatedTag converter's arms arity, fed the message + the tagger; the
+ * converter renders the tagger ToCommitUser-shaped (UTC RFC3339 date, the
+ * same personDate render every CommitUser here uses). `tagger` stays null
+ * when the tag object omits the header (the schema is nullable; upstream's
+ * parse defaults it to the empty identity).
  */
 export function renderAnnotatedTag(
   name: string,
@@ -283,11 +282,7 @@ export function renderAnnotatedTag(
   pair: RepositoryWithOwner,
   origin: string,
 ): AnnotatedTag {
-  return {
-    ...toAnnotatedTag(name, tip, commitSha, pair, origin),
-    message: data.message,
-    tagger: data.tagger === null ? null : { name: data.tagger.name, email: data.tagger.email, date: personDate(data.tagger) },
-  };
+  return toAnnotatedTag(name, tip, commitSha, data, pair, origin);
 }
 
 // ---------------------------------------------------------------------------
