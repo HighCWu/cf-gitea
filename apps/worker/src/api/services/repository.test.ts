@@ -24,15 +24,18 @@ import { repositories, teamMembers, teamRepoAccess, teams, type TeamAccessMode }
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import { applyOrgsDdl, resetOrgTables } from "../../services/orgs/testing";
 import {
+  apiUserFromRow,
   canViewRepository,
   canViewRepositoryWithTeams,
   doerRepoAccessMode,
   findRepositoryByPath,
+  findUserByName,
   repositoryPermissions,
   repositoryPermissionsWithTeams,
   toApiRepository,
   type Viewer,
 } from "./repository";
+import { saveUserProfileColumns } from "./user-settings";
 
 beforeAll(async () => {
   await applyAuthD1Migrations();
@@ -262,5 +265,69 @@ describe("repositoryPermissionsWithTeams — the AccessMode → Permission mappi
     const anonymous: Viewer = { origin: "https://example.com", requester: null };
     expect(canViewRepository(anonymous, reduced)).toBe(false);
     expect(repositoryPermissions(anonymous, reduced)).toEqual({ admin: false, push: false, pull: false });
+  });
+});
+
+describe("apiUserFromRow — the profile quartet projects from the row (usability finding F-1)", () => {
+  const anonymous: Viewer = { origin: "https://example.com", requester: null };
+
+  it("populates full_name/description/website/location set through the web form's writer (saveUserProfileColumns)", async () => {
+    const owner = await seedVerifiedUser({ username: "Profiled" });
+    // The write arm the web form rides (POST /user/settings →
+    // saveUserProfileColumns, services/user-settings.ts) — the same columns
+    // the API PATCH /user/settings persists.
+    await saveUserProfileColumns(env.DB, owner.id, {
+      displayName: "Profiled Owner",
+      description: "desc-probe-check-xyz",
+      website: "https://example.com/~profiled",
+      location: "The Internet",
+    });
+    const row = await findUserByName(env.DB, "Profiled");
+    if (row === null) throw new Error("fixture user missing");
+
+    // The API reader (GET /users/{username} via toApiUser, GET /user — both
+    // delegate to this converter). Upstream toUser renders the four fields
+    // straight off the row for every viewer (convert/user.go:84–93).
+    const user = apiUserFromRow(row, anonymous);
+    expect(user.full_name).toBe("Profiled Owner");
+    expect(user.description).toBe("desc-probe-check-xyz");
+    expect(user.website).toBe("https://example.com/~profiled");
+    expect(user.location).toBe("The Internet");
+  });
+
+  it("the embedded Repository.owner renders the same fields (the repo listings' owner objects)", async () => {
+    const owner = await seedVerifiedUser({ username: "Profiled" });
+    await saveUserProfileColumns(env.DB, owner.id, {
+      displayName: "Profiled Owner",
+      description: "profiled's repos",
+      website: "https://profiled.example.com",
+      location: "The Internet",
+    });
+    await seedRepo(owner.id, "profiled", "widgets", "public");
+    const pair = await findRepositoryByPath(env.DB, "profiled", "widgets");
+    if (pair === null) throw new Error("fixture repo missing");
+
+    const repo = toApiRepository(anonymous, pair);
+    if (repo.owner === undefined) throw new Error("owner payload missing");
+    expect(repo.owner.full_name).toBe("Profiled Owner");
+    expect(repo.owner.description).toBe("profiled's repos");
+    expect(repo.owner.website).toBe("https://profiled.example.com");
+    expect(repo.owner.location).toBe("The Internet");
+  });
+
+  it("NULL profile columns still render the empty string (upstream's zero value)", async () => {
+    await seedVerifiedUser({ username: "Plain" });
+    const row = await findUserByName(env.DB, "Plain");
+    if (row === null) throw new Error("fixture user missing");
+    expect(row.description).toBeNull();
+    expect(row.website).toBeNull();
+    expect(row.location).toBeNull();
+    expect(row.displayName).toBeNull();
+
+    const user = apiUserFromRow(row, anonymous);
+    expect(user.full_name).toBe("");
+    expect(user.description).toBe("");
+    expect(user.website).toBe("");
+    expect(user.location).toBe("");
   });
 });

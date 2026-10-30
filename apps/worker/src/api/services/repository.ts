@@ -408,10 +408,14 @@ export function userTypeToApiString(type: UserRow["type"]): "User" | "Organizati
  * `ToUserWithAccessMode` hardcodes `authed=false` at convert/user.go:73–75,
  * a divergence we deliberately do not copy so both landed callers agree).
  * `type`/`visibility` render the row's real columns (`userTypeToApiString`,
- * `VisibilityString`). The primary email shows only to the user themself or a
- * site admin (upstream hides private emails behind a placeholder we do not
- * render yet). Exported for the converters that embed a `User` (commit-status
- * creator), matching upstream `convert.ToUser`.
+ * `VisibilityString`). The profile quartet renders the landed `users` columns
+ * (`full_name`/`description`/`website`/`location`, SPEC-0007 §3.2) exactly
+ * like upstream `toUser` (convert/user.go:84–93 — the fields come straight
+ * off the user row, visible to every reader, not authed-gated). The primary
+ * email shows only to the user themself or a site admin (upstream hides
+ * private emails behind a placeholder we do not render yet). Exported for the
+ * converters that embed a `User` (commit-status creator), matching upstream
+ * `convert.ToUser`.
  */
 export function apiUserFromRow(row: UserRow, viewer: Viewer): User {
   const authed =
@@ -434,9 +438,9 @@ export function apiUserFromRow(row: UserRow, viewer: Viewer): User {
     restricted: false,
     active: authed ? row.status === "active" : false,
     prohibit_login: authed ? row.status === "prohibited" : false,
-    location: "",
-    website: "",
-    description: "",
+    location: row.location ?? "",
+    website: row.website ?? "",
+    description: row.description ?? "",
     visibility: row.visibility,
     followers_count: 0, // TODO(SPEC-0005): social counters
     following_count: 0,
