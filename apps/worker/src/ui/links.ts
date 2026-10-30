@@ -65,6 +65,23 @@ export function rawFileLink(repoLink: string, treePath: string, ref: string, ref
   return treePath === "" ? base : `${base}/${pathEscapeSegments(treePath)}`;
 }
 
+/**
+ * The media file link — view_file.go:210-212's RawFileLink overwrite for
+ * LFS-pointed files: RepoLink + `/media/` + RefTypeNameSubURL
+ * (`branch|tag|commit/{ref}`) + PathEscapeSegments TreePath (the identical
+ * composition to rawFileLink under the SingleDownloadOrLFS group,
+ * web.go:1707-1713 — /raw stays pointer bytes, the media family resolves
+ * LFS). Callers gate on the file view's pointer probe (isLfsFile); regular
+ * files keep rawFileLink. The refType-less form does not occur at the call
+ * site (the file view always resolves the ref) but mirrors rawFileLink's
+ * deprecated catch-all arm for symmetry.
+ */
+export function mediaFileLink(repoLink: string, treePath: string, ref: string, refType?: RefType): string {
+  const prefix = refType === undefined ? "media" : `media/${refType}`;
+  const base = `${repoLink}/${prefix}/${pathEscapeSegments(ref)}`;
+  return treePath === "" ? base : `${base}/${pathEscapeSegments(treePath)}`;
+}
+
 /** The commits page's `?path=` filter form (§3.3 file-view History link). */
 export function commitsHistoryLink(repoLink: string, treePath: string): string {
   return `${repoLink}/commits?path=${encodeURIComponent(treePath)}`;

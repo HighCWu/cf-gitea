@@ -37,7 +37,11 @@
  *     file-view.tsx's view.go:72-123 pointer probe): the badge renders on a
  *     seeded pointer file — with or without a meta row — beside the size in
  *     the same file-info-entry, and on nothing else (plain text, plain
- *     binary, malformed pointer).
+ *     binary, malformed pointer);
+ *   - the file view's raw/media link flip (view_file.go:210-212's
+ *     RawFileLink overwrite): a pointer file's view actions link /media
+ *     (parse-only — meta row or not), a regular file and the malformed
+ *     pointer keep /raw.
  *
  * The fixture world is the `alice` owner's `rawserve` repo (public,
  * two commits: README.md then the PNG + the later README edit — the
@@ -415,6 +419,49 @@ describe("the file view's LFS badge (the view.go:72-123 pointer probe)", () => {
       const response = await fetchUi(`/alice/rawserve/src/branch/main/${path}`);
       expect(response.status).toBe(200);
       expect(await response.text()).not.toContain(BADGE);
+    }
+  });
+});
+
+// --- 6b. the file view's raw/media link flip (view_file.go:210-212) ---------------
+
+describe("the file view's raw/media link flip (view_file.go:210-212's RawFileLink overwrite)", () => {
+  it("links an LFS-pointer file's raw/media actions to the /media family — meta row or not (the parse-only flip)", async () => {
+    // big.bin rides the media suite's verified row + object; ghost.bin has
+    // NO meta row — the flip keys on `fInfo.isLFSFile()` alone (the probe's
+    // parse verdict), so both flip identically (the badge's parse-only
+    // posture, now on the link too). Every RawFileLink consumer carries the
+    // overwritten value (view_file.tmpl:2 root attr, :49 Raw button, :64
+    // copy control, :123-135 media srcs — the composed URL mirrors
+    // RepoLink + "/media/" + RefTypeNameSubURL + "/" + PathEscapeSegments
+    // TreePath).
+    for (const path of ["assets/big.bin", "assets/ghost.bin"]) {
+      const response = await fetchUi(`/alice/rawserve/src/branch/main/${path}`);
+      expect(response.status).toBe(200);
+      const html = await response.text();
+      const mediaLink = `/alice/rawserve/media/branch/main/${path}`;
+      expect(html).toContain(`data-raw-file-link="${mediaLink}"`);
+      expect(html).toContain(`href="${mediaLink}"`);
+      // The dead-link backstop: the flipped target serves on both arms
+      // (big.bin → the LFS bytes, ghost.bin → the nil-meta pointer-text
+      // fall-through — section 5 pins the bytes/headers).
+      expect((await fetchUi(mediaLink)).status).toBe(200);
+    }
+  });
+
+  it("keeps /raw on regular files AND the malformed pointer (SingleDownload has no LFS arm)", async () => {
+    // The negatives: plain text, plain binary — and broken.bin, whose
+    // pointer-shaped content FAILS the parse (the InvalidPointerError arm,
+    // upstream's IsValid() == false plain file): a guard against flipping on
+    // pointer-shaped bytes rather than a VALID pointer.
+    for (const path of ["README.md", "NOTES.txt", "assets/logo.png", "assets/broken.bin"]) {
+      const response = await fetchUi(`/alice/rawserve/src/branch/main/${path}`);
+      expect(response.status).toBe(200);
+      const html = await response.text();
+      const rawLink = `/alice/rawserve/raw/branch/main/${path}`;
+      expect(html).toContain(`data-raw-file-link="${rawLink}"`);
+      expect(html).toContain(`href="${rawLink}"`);
+      expect(html).not.toContain(`data-raw-file-link="/alice/rawserve/media/`);
     }
   });
 });

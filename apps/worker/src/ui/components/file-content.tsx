@@ -18,7 +18,7 @@
  */
 
 
-import { commitsHistoryLink, rawFileLink } from "../links";
+import { commitsHistoryLink, mediaFileLink, rawFileLink } from "../links";
 import { formatByteSize, splitLines } from "../page-data";
 import { Icon } from "../shell";
 import { LatestCommitBox, TimeSince } from "./file-list";
@@ -187,7 +187,14 @@ export function FileContentView(props: {
    *  rest). Undefined = not rendered. */
   blameHref?: string;
 }) {
-  const rawLink = rawFileLink(props.repoLink, props.treePath, props.ref, props.refType);
+  // view_file.go:210-212's RawFileLink overwrite: an LFS-pointed file links
+  // the /media family (SingleDownloadOrLFS) — every template consumer
+  // (view_file.tmpl:2 root attr, :49 Raw button, :64 copy control, :100
+  // too-large, :123-135 media srcs) reads the overwritten value; a regular
+  // file keeps the /raw family (SingleDownload — no LFS arm at the pin).
+  const rawLink = props.isLfsFile
+    ? mediaFileLink(props.repoLink, props.treePath, props.ref, props.refType)
+    : rawFileLink(props.repoLink, props.treePath, props.ref, props.refType);
   return (
     <div
       {...(props.readmeInList ? { id: "readme" } : {})}

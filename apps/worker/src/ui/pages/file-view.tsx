@@ -10,7 +10,10 @@
  * The blob view carries the §2.4.1 enhancement registry: root
  * `data-global-init="initRepoFileView"` + `data-raw-file-link`, and the copy
  * button `data-global-click="onCopyContentButtonClick"` — the raw link
- * targets the tier-1 API raw route (§3.3, open question 3).
+ * targets the upstream WEB raw shape (links.ts rawFileLink; the former
+ * tier-1 API `?ref=` divergence is retired). LFS-pointed files flip the
+ * same registry to the /media family (view_file.go:210-212's RawFileLink
+ * overwrite — components/file-content.tsx composes it off `isLfsFile`).
  *
  * The blob view also carries upstream's LFS badge (file_info.tmpl:14 —
  * `<span class="ui label">LFS</span>` beside the size): the loader runs
@@ -18,7 +21,12 @@
  * getFileReader — the first lfs.MetaFileMaxSize bytes text-gated, then
  * lfs.ReadPointerFromBuffer; a VALID pointer flags the file LFS, INCLUDING
  * when the meta row is missing — view.go:104-110 sets lfsMeta on that error
- * path too, so the badge is a parse-only, D1-free property).
+ * path too, so the badge is a parse-only, D1-free property). The SAME
+ * parse-only flag drives the raw/media link flip: view_file.go:210-212
+ * overwrites RawFileLink with `/media/` + RefTypeNameSubURL + TreePath
+ * whenever `fInfo.isLFSFile()` — meta row or not — so a pointer file's
+ * Raw button, copy control, and view-raw media sources resolve LFS while
+ * a regular file keeps /raw (SingleDownload has no LFS arm at the pin).
  */
 
 import type { CommitJson, TreeEntryJson } from "@cf-gitea/git-engine";
