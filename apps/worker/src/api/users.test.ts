@@ -804,6 +804,29 @@ describe("mounted chain (SELF): GET /user renders row truth (api review drift 1)
       following_count: 0,
     });
   });
+
+  it("GET /user degrades to the sync render when the counts seam has no binding (9f883d0)", async () => {
+    // api.test.ts's bare rig (app.request with NO env — c.env is undefined)
+    // used to 500 on the counts block's c.env.DB read; 9f883d0 made the whole
+    // seam best-effort. The dedicated pin asserts the FALLBACK CONTENT: the
+    // identity answer is the middleware's sync render (the stub identity,
+    // which carries the zero counts), never a 500 for the counts.
+    const bare = createApiRouter(); // stub resolver, no env injected
+
+    const res = await bare.request("https://example.com/user", {
+      headers: { Authorization: `token ${TOKEN}` },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json<Record<string, unknown>>();
+    expect(body).toMatchObject({
+      id: STUB_USER.id,
+      login: STUB_LOGIN,
+      username: STUB_LOGIN,
+      followers_count: 0, // the sync render's zero — the async twin never ran
+      following_count: 0,
+    });
+  });
 });
 
 describe("mounted chain (SELF): public-only route arms", () => {
