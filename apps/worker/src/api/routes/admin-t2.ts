@@ -43,8 +43,7 @@ import { toApiUser } from "../services/user";
  *                                             a thin delegation to repo.CreateUserRepo,
  *                                             exactly what POST /user/repos rides)
  *
- * The remaining 25 ops are TABLE-DEPENDENT and stay undeclared: the Actions
- * runner/run families (`/admin/actions/*` — no runner tables), cron
+ * The remaining 24 ops are TABLE-DEPENDENT and stay undeclared: cron
  * (`/admin/cron*` — no task model), emails (`/admin/emails*` — no
  * email_address store), system-wide webhooks (`/admin/hooks*` — webhooks is
  * repo-scoped), packages, unadopted repositories (no adoption model), user
@@ -1076,7 +1075,10 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
   // POST /admin/users/{username}/repos — upstream is a one-line delegation to
   // repo.CreateUserRepo (admin/repo.go:46–48), the same service POST
   // /user/repos rides: the readme-template 400 first, then the create with
-  // the TARGET row as owner, mapped 409/422 like user-repos.ts.
+  // the TARGET row as owner, mapped 409/422 like user-repos.ts; an unknown
+  // gitignores/license template name 500s with the row rolled back
+  // (create.go:236-241,448-456 — the user-repos route note and the
+  // RUNTIME_ONLY table entry carry the cites).
   app.openapi(adminCreateRepoRoute(requireAuth), async (c) => {
     const { username } = c.req.valid("param");
     const target = await resolveTargetRow(c, username);

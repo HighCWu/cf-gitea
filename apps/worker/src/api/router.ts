@@ -16,6 +16,7 @@ import { registerAdminOrgExtrasRoutes } from "./routes/admin-org-extras";
 import { registerDeployKeyRoutes } from "./routes/deploy-keys";
 import { registerSecretsVariablesRoutes } from "./routes/secrets-variables";
 import { registerActionsArtifactRoutes } from "./routes/actions-artifacts";
+import { registerAdminActionsRoutes } from "./routes/admin-actions";
 import { registerBlockRoutes } from "./routes/blocks";
 import { registerPushMirrorRoutes } from "./routes/push-mirrors";
 import { registerTagProtectionRoutes } from "./routes/tag-protections";
@@ -235,6 +236,10 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // actions-artifacts.ts; requireAuth accepted for symmetry, unused: upstream
   // carries no reqToken on these arms).
   registerActionsArtifactRoutes(app, requireAuth, optionalAuth);
+  // The admin Actions family (P1-12 — routes/admin-actions.ts; the 7 ops
+  // behind the site-admin gate; runtime-only 401/403 per the /admin/cron
+  // precedent).
+  registerAdminActionsRoutes(app, requireAuth);
   // Tier-1 tail families (REG-MERGE-3, committed 6e3c322): the archive
   // download, the diffpatch apply, the languages listing and the scheduled
   // auto-merge cancellation. All are deeper `/repos/{owner}/{repo}/<family>`
