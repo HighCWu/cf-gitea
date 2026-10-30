@@ -1,6 +1,6 @@
 # cf-gitea v1.3.2 — Release Notes (the registry wave)
 
-**Range**: `ce1b51c..FINAL_HEAD_TBD` — **FINAL_COUNT_TBD commits** (30 at
+**Range**: `ce1b51c..a454bf7` — **40 commits** (30 at
 this document's snapshot, HEAD `1a38996`, taken 2026-10-31 in the early
 hours +0800 while commits were still landing hourly — the freeze fill
 resolves both markers). v1.3.1 tagged `4a5d6bd` (the freeze fill itself);
