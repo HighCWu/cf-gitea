@@ -291,11 +291,17 @@ describe("GET /{owner}/{repo}/archive/{ref}.{tar.gz|zip}", () => {
     expect(res.headers.get("content-disposition")).toBe('attachment; filename="wave32arc-feature.zip"');
     expect(res.headers.get("etag")).toBe(`W/"${c2}-zip-true"`);
     const bytes = new Uint8Array(await res.arrayBuffer());
-    // The local-file-header magic PK\x03\x04; STORE keeps names literal.
+    // The local-file-header magic PK\x03\x04; the archive-parity wave moved
+    // the entries STORE → DEFLATE (git archive's own posture, archive-zip.c
+    // deflates every non-empty entry) — the header's method field now reads
+    // 8 while the entry NAMES stay literal. The file CONTENT is a deflate
+    // stream here, so its literal assert moved to archive.test.ts's
+    // dedicated DEFLATE pins (round-trip + CRC verified there).
     expect([bytes[0], bytes[1], bytes[2], bytes[3]]).toEqual([0x50, 0x4b, 0x03, 0x04]);
+    // Method 8 (deflate) in the first local header, little-endian at :8.
+    expect((bytes[8] ?? 0) | ((bytes[9] ?? 0) << 8)).toBe(8);
     const text = new TextDecoder().decode(bytes);
     expect(text).toContain("wave32arc/docs/notes.md");
-    expect(text).toContain("# wave32 notes");
   });
 
   it("resolves branch → multi-segment branch → tag → full oid (404 otherwise)", async () => {

@@ -8,9 +8,10 @@
  *
  * The engine's vendored snapshot builders (packages/git-engine
  * src/git/snapshot.ts tarGz/zip) are NOT on the dist-types export surface
- * (mod.d.ts), so this module re-derives the same ustar/STORE formats. Upstream
+ * (mod.d.ts), so this module re-derives the same ustar/zip formats. Upstream
  * behavior (routers/api/v1/repo/file.go GetArchive →
- * services/repository/archiver serveRepoArchive → modules/git/archive.go):
+ * services/repository/archiver serveRepoArchive → modules/git/archive.go —
+ * a real `git archive` run):
  *   - `{archive}` = `REF.tar.gz` | `REF.zip` (`REF.bundle` is the third
  *     upstream format — a git bundle needs pack surgery the API surface does
  *     not carry; parsed but refused with the unknown-format 400, documented);
@@ -24,6 +25,48 @@
  *     exact match or a descendant; the surviving entries keep full paths);
  *   - response headers: the Nix immutable-rev Link header, an attachment
  *     Content-Disposition naming `<slug>-<ref with slashes as dashes>.<ext>`.
+ *
+ * .gitattributes export rules (parity-review-git D3 §7.3): upstream archives
+ * are real `git archive` output, which honors export-ignore/export-subst read
+ * from the ARCHIVED TREE ONLY (no worktree/info/global attribute sources
+ * without git archive's --worktree-attributes). Honored here at the entry
+ * level, before any byte streams:
+ *   - a directory's `.gitattributes` is parsed when the walk enters it (one
+ *     extra readBlob per directory that carries one); deeper files take
+ *     precedence over shallower ones, and within one file the LAST matching
+ *     line wins (gitattributes(5));
+ *   - patterns follow gitignore(5) matching: a pattern containing a slash
+ *     (leading or middle) is anchored to its .gitattributes directory, a
+ *     pattern without one matches the BASENAME at any depth; a trailing
+ *     slash makes it directory-only; a matching DIRECTORY prunes its whole
+ *     subtree. Outside the honored subset (documented): `[...]` character
+ *     classes, brace expansion and escaped wildcards;
+ *   - `!pattern` negative-pattern lines are SKIPPED (git 2.43 warns "negative
+ *     patterns are ignored in git attributes" and does the same);
+ *     `-export-ignore` is the re-include arm — a deeper file's unset beats a
+ *     shallower set, so `/tests export-ignore` + `lib/.gitattributes`
+ *     `keep.go -export-ignore` archives lib/keep.go;
+ *   - attribute exclusion applies REGARDLESS of `path` subpaths (verified
+ *     against git 2.43: `git archive HEAD <ignored path>` answers an empty
+ *     archive — a pathspec cannot resurrect an export-ignored path);
+ *   - export-subst is PARSED but intentionally NOT substituted. Upstream
+ *     expands `$Format:…$` through git's full pretty-format machinery —
+ *     verified against git 2.43.0, every log placeholder expands (even %h
+ *     abbreviation, %d decorations, multi-line formats; a `$Format:` without
+ *     its closing `$` even steals the next `$` in the file). Faithfulness
+ *     there is engine-deep (%h/%p need object-graph abbreviation, %d/%D need
+ *     ref decorations, %aN/%aE need mailmap), and a partial substitution is a
+ *     state git never produces — so blobs stream byte-identical to the
+ *     committed content and `$Format:…$` literals survive verbatim. The
+ *     disposition is pinned in archive.test.ts; moving it engine-side is the
+ *     recorded future arm.
+ *
+ * zip entries DEFLATE (method 8, raw deflate via CompressionStream):
+ * `git archive --format=zip` deflates at the zlib default level (archive-zip.c
+ * writes method 8 for every non-empty entry), so the former STORE posture
+ * (SPEC-0004's CPU-for-bytes trade) is superseded by the parity review §7.4 —
+ * method 8 + honest compressed/uncompressed sizes, content byte-identical
+ * after inflate.
  *
  * SPEC-0004 §3.4 cache note: engine reads key Cache API entries by
  * `repositories.refs_version`; this walk reads through the DO live (the
@@ -90,11 +133,192 @@ export function resolveArchiveRef(tips: ReturnType<typeof refTipMap>, ref: strin
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// .gitattributes export rules (export-ignore honored; export-subst parsed)
+// ---------------------------------------------------------------------------
+
+const TD = new TextDecoder();
+
+/**
+ * One parsed .gitattributes line that assigns one of the archive-relevant
+ * attributes. Lines assigning neither export-ignore nor export-subst are
+ * dropped at parse time (they cannot affect the archive). Assignment values
+ * follow gitattributes(5): `attr` = true, `-attr` = false (unset), `!attr` =
+ * null (explicitly unspecified), `attr=value` = undefined (neither TRUE nor
+ * UNSET — the archive check is git's ATTR_TRUE, so value forms never match).
+ */
+export interface GitattributesRule {
+  re: RegExp;
+  /** pattern ended with `/` — matches directories only */
+  dirOnly: boolean;
+  /** pattern had no slash — matched against the basename at any depth */
+  basenameOnly: boolean;
+  exportIgnore?: boolean | null;
+  exportSubst?: boolean | null;
+}
+
+/**
+ * gitignore(5) matching for one rule: anchored patterns match the whole
+ * repo-root-relative path; basename patterns match at any depth; dirOnly
+ * rules never match a file entry. Directory matches prune the subtree at the
+ * walk site (upstream: "patterns that match a directory do not recursively
+ * match paths inside that directory" — the prune is what archives get).
+ */
+export function ruleMatches(rule: GitattributesRule, path: string, isDir: boolean): boolean {
+  if (rule.dirOnly && !isDir) return false;
+  if (rule.basenameOnly) {
+    const base = path.slice(path.lastIndexOf("/") + 1);
+    return rule.re.test(base);
+  }
+  return rule.re.test(path);
+}
+
+/**
+ * The LAST matching export-ignore assignment in rule order wins; rule order
+ * is root→leaf files with each file's lines in order, which reproduces
+ * gitattributes(5)'s precedence (deeper file beats shallower, later line
+ * beats earlier). No matching assignment → unspecified → include.
+ */
+function exportIgnoreExcluded(rules: GitattributesRule[], path: string, isDir: boolean): boolean {
+  let value: boolean | null | undefined;
+  for (const rule of rules) {
+    if (rule.exportIgnore === undefined) continue;
+    if (ruleMatches(rule, path, isDir)) value = rule.exportIgnore;
+  }
+  return value === true;
+}
+
+/** One unanchored segment: `*`/`?` never cross `/` (gitignore wildmatch). */
+function compileSegment(segment: string): string {
+  let out = "";
+  for (const ch of segment) {
+    if (ch === "*") out += "[^/]*";
+    else if (ch === "?") out += "[^/]";
+    else out += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+  return out;
+}
+
+function compilePattern(pattern: string, dirOnly: boolean, basenameOnly: boolean): GitattributesRule {
+  let source: string;
+  if (basenameOnly) {
+    source = `^${compileSegment(pattern)}$`;
+  } else {
+    // `**` as a whole segment crosses directories; `**/` also matches zero of
+    // them (gitignore wildmatch). Leading `**/x` → x at any depth; `x/**`
+    // matches everything below x but not x itself.
+    source = "^";
+    const segments = pattern.split("/");
+    for (let i = 0; i < segments.length; i++) {
+      const segment = segments[i] as string;
+      const last = i === segments.length - 1;
+      if (segment === "**") {
+        source += last ? ".*" : "(?:.*/)?";
+        continue;
+      }
+      source += compileSegment(segment);
+      if (!last) source += "/";
+    }
+    source += "$";
+  }
+  return { re: new RegExp(source, "u"), dirOnly, basenameOnly };
+}
+
+/**
+ * Field split with gitattributes' backslash escapes (`foo\ bar` is one field
+ * whose space is literal); the backslash itself is dropped from the field.
+ */
+function splitAttrFields(line: string): string[] {
+  const fields: string[] = [];
+  let current = "";
+  let escaped = false;
+  for (const ch of line) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === " " || ch === "\t") {
+      if (current !== "") {
+        fields.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (escaped) current += "\\";
+  if (current !== "") fields.push(current);
+  return fields;
+}
+
+/** `name` → true; `-name` → false; `!name` → null; `name=value` → undefined. */
+function attrAssignment(token: string): { name: string; value: boolean | null | undefined } | null {
+  if (token.startsWith("-")) return { name: token.slice(1), value: false };
+  if (token.startsWith("!")) return { name: token.slice(1), value: null };
+  const eq = token.indexOf("=");
+  if (eq >= 0) return { name: token.slice(0, eq), value: undefined };
+  return { name: token, value: true };
+}
+
+/**
+ * Parse one .gitattributes blob's text as found at tree directory `dir`
+ * ("" for the root). gitattributes(5) line grammar with the archive subset:
+ * comments (`#`), blank lines, `[attr]` macro lines and `!pattern`
+ * negative-pattern lines are skipped (git 2.43 ignores the latter with a
+ * warning); the remaining lines compile one pattern each. Patterns anchor to
+ * `dir` when they contain a slash, otherwise match basenames at any depth.
+ */
+export function parseGitattributes(text: string, dir: string): GitattributesRule[] {
+  const rules: GitattributesRule[] = [];
+  const dirPrefix = dir === "" ? "" : `${dir}/`;
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.replace(/\r$/, "");
+    if (line === "" || line.startsWith("#") || line.startsWith("!") || line.startsWith("[attr]")) continue;
+    const fields = splitAttrFields(line);
+    const pattern = fields[0];
+    if (pattern === undefined) continue;
+    let dirOnly = false;
+    let body = pattern;
+    if (body.endsWith("/")) {
+      dirOnly = true;
+      body = body.slice(0, -1);
+    }
+    const basenameOnly = !body.includes("/");
+    if (body.startsWith("/")) body = body.slice(1);
+    if (body === "") continue;
+    let compiled: GitattributesRule;
+    try {
+      compiled = compilePattern(basenameOnly ? body : dirPrefix + body, dirOnly, basenameOnly);
+    } catch {
+      continue; // an uncompilable pattern matches nothing, like git's skip
+    }
+    const rule: GitattributesRule = { re: compiled.re, dirOnly: compiled.dirOnly, basenameOnly: compiled.basenameOnly };
+    for (const token of fields.slice(1)) {
+      const assignment = attrAssignment(token);
+      if (assignment === null) continue;
+      if (assignment.name === "export-ignore" && rule.exportIgnore === undefined) rule.exportIgnore = assignment.value;
+      if (assignment.name === "export-subst" && rule.exportSubst === undefined) rule.exportSubst = assignment.value;
+    }
+    if (rule.exportIgnore !== undefined || rule.exportSubst !== undefined) rules.push(rule);
+  }
+  return rules;
+}
+
 /**
  * Bounded depth-first flatten of the ref's tree through per-level listTree
  * RPCs (collectTreeRecursive's interim pattern, with archive-scale budgets).
  * Gitlink (submodule) entries are skipped; symlinks carry their mode. Paths
- * not matching any subPath pathspec are pruned before recursion.
+ * not matching any subPath pathspec are pruned before recursion, and
+ * .gitattributes export-ignore rules collected along the walked chain exclude
+ * entries before they reach the archive (see the module doc): a directory
+ * match prunes its whole subtree, and exclusion holds regardless of the
+ * pathspec — a `path` subpath cannot resurrect an export-ignored path, like
+ * git archive.
  */
 export async function collectArchiveEntries(
   reads: EngineReads,
@@ -105,19 +329,27 @@ export async function collectArchiveEntries(
   let dirs = 0;
   const matches = (path: string): boolean =>
     subPaths.length === 0 || subPaths.some((p) => path === p || path.startsWith(`${p}/`) || p.startsWith(`${path}/`));
-  const walk = async (prefix: string): Promise<void> => {
+  const walk = async (prefix: string, inherited: GitattributesRule[]): Promise<void> => {
     const tree = await reads.listTree(refTarget, prefix);
     if (tree === null) return;
+    const rules = [...inherited];
+    const attrEntry = tree.entries.find((e) => e.name === ".gitattributes" && e.type === "blob");
+    if (attrEntry !== undefined) {
+      const blob = await reads.readBlob(refTarget, prefix === "" ? ".gitattributes" : `${prefix}/.gitattributes`);
+      if (blob !== null) rules.push(...parseGitattributes(TD.decode(blob.data), prefix));
+    }
     for (const entry of tree.entries) {
       const path = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
       if (!matches(path)) continue;
       if (entry.type === "tree") {
+        if (exportIgnoreExcluded(rules, path, true)) continue;
         dirs += 1;
         if (dirs > MAX_ARCHIVE_DIRS) {
           throw new ApiError(422, "repository tree exceeds the archive walk budget");
         }
-        await walk(path);
+        await walk(path, rules);
       } else if (entry.type === "blob") {
+        if (exportIgnoreExcluded(rules, path, false)) continue;
         if (out.length >= MAX_ARCHIVE_FILES) {
           throw new ApiError(422, "repository tree exceeds the archive walk budget");
         }
@@ -126,7 +358,7 @@ export async function collectArchiveEntries(
       // type "commit" (submodule): skipped, like upstream git archive
     }
   };
-  await walk("");
+  await walk("", []);
   return out;
 }
 
@@ -282,12 +514,22 @@ async function* tarChunks(options: ArchiveStreamOptions): AsyncGenerator<Uint8Ar
   yield new Uint8Array(1024); // end-of-archive
 }
 
+/** Raw DEFLATE (no zlib wrapper — zip method 8's stream form) of one blob. */
+async function deflateRaw(bytes: Uint8Array): Promise<Uint8Array> {
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("deflate-raw"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
 /**
- * The zip chunk stream with STORE entries (method 0 — valid zip, no deflate
- * on the request path; the engine's own builder compresses, this one trades
- * bytes for CPU, a documented SPEC-0004 posture). Local parts stream per
- * entry; the central directory (small: 46 bytes + name each) accumulates and
- * precedes the EOCD at close.
+ * The zip chunk stream with DEFLATE entries (method 8 — `git archive
+ * --format=zip` deflates every entry at the zlib default level, archive-zip.c;
+ * the former STORE posture is superseded per parity-review-git §7.4). Each
+ * entry's bytes compress whole (the blob is already fully read) so the local
+ * header carries the real CRC-32 of the UNCOMPRESSED data plus honest
+ * compressed/uncompressed sizes — no data-descriptor flag. The size budget
+ * still counts uncompressed bytes (the cap bounds content, not the codec).
+ * Local parts stream per entry; the central directory (small: 46 bytes + name
+ * each) accumulates and precedes the EOCD at close.
  */
 async function* zipChunks(options: ArchiveStreamOptions): AsyncGenerator<Uint8Array> {
   const { prefix, entries, reads, refTarget, mtime } = options;
@@ -305,6 +547,7 @@ async function* zipChunks(options: ArchiveStreamOptions): AsyncGenerator<Uint8Ar
     if (total > MAX_ARCHIVE_TOTAL_BYTES) {
       throw new Error("archive exceeds the total size budget");
     }
+    const stored = await deflateRaw(blob.data);
     const externalAttrs = (((entry.mode === "120000" ? 0o120777 : 0o100000 | (entry.mode === "100755" ? 0o755 : 0o644)) << 16) >>> 0);
 
     const local = new Uint8Array(30 + name.byteLength);
@@ -312,16 +555,16 @@ async function* zipChunks(options: ArchiveStreamOptions): AsyncGenerator<Uint8Ar
     u32(lv, 0, 0x04034b50);
     u16(lv, 4, 20);
     u16(lv, 6, 0); // flags
-    u16(lv, 8, 0); // method STORE
+    u16(lv, 8, 8); // method DEFLATE (raw)
     u16(lv, 10, time);
     u16(lv, 12, date);
     u32(lv, 14, crc);
-    u32(lv, 18, size); // compressed
+    u32(lv, 18, stored.byteLength); // compressed
     u32(lv, 22, size);
     u16(lv, 26, name.byteLength);
     local.set(name, 30);
     yield local;
-    if (size > 0) yield blob.data;
+    if (stored.byteLength > 0) yield stored;
 
     const cd = new Uint8Array(46 + name.byteLength);
     const cv = new DataView(cd.buffer);
@@ -329,18 +572,18 @@ async function* zipChunks(options: ArchiveStreamOptions): AsyncGenerator<Uint8Ar
     u16(cv, 4, (3 << 8) | 20); // made by unix
     u16(cv, 6, 20);
     u16(cv, 8, 0); // flags
-    u16(cv, 10, 0); // method STORE
+    u16(cv, 10, 8); // method DEFLATE (raw)
     u16(cv, 12, time);
     u16(cv, 14, date);
     u32(cv, 16, crc);
-    u32(cv, 20, size);
+    u32(cv, 20, stored.byteLength);
     u32(cv, 24, size);
     u16(cv, 28, name.byteLength);
     u32(cv, 38, externalAttrs);
     u32(cv, 42, offset);
     cd.set(name, 46);
     central.push(cd);
-    offset += local.byteLength + size;
+    offset += local.byteLength + stored.byteLength;
   }
 
   const cdStart = offset;

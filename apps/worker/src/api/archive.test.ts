@@ -6,11 +6,15 @@
  *
  * Pinned here: the tar.gz round-trip (ustar headers, lowercase repo prefix,
  * gzip magic, commit-time mtimes, symlink/exec modes), the zip structure
- * (STORE entries, central directory, EOCD), the `path` subpath filter, the
- * upstream `unknown format` 400 / `unrecognized repository reference` 404
- * (empty repositories land there too), the multi-segment-ref catchall, the
- * Nix immutable Link header, and the languages map (bytes per language,
- * descending, {} for an empty repo).
+ * (DEFLATE entries — `git archive --format=zip`'s method 8 — central
+ * directory, EOCD), the `path` subpath filter, the upstream `unknown format`
+ * 400 / `unrecognized repository reference` 404 (empty repositories land
+ * there too), the multi-segment-ref catchall, the Nix immutable Link header,
+ * the .gitattributes export rules (export-ignore honored per gitattributes(5)
+ * matching — anchored dir prune, basename depth, exact file, deeper
+ * `-export-ignore` re-include — and export-subst pinned as parsed-but-not-
+ * substituted, `$Format:…$` literals surviving byte-identical), and the
+ * languages map (bytes per language, descending, {} for an empty repo).
  */
 
 import { applyD1Migrations } from "cloudflare:test";
@@ -28,6 +32,7 @@ import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
 import { registerArchiveRoutes } from "./routes/archive";
 import { registerLanguageRoutes } from "./routes/languages";
+import { parseGitattributes, ruleMatches } from "./services/archive";
 import { engineCell, ZERO_OID } from "./services/engine";
 import { RepoService } from "../repos/service";
 import type { User } from "./models/user";
@@ -52,12 +57,53 @@ const SEED_COMMITS = [
   },
 ];
 
+// The .gitattributes fixture repo (parity-review-git D3): a marked FILE and a
+// marked DIRECTORY, a basename pattern exercised at depth, a deeper
+// .gitattributes re-including one file, and an export-subst file.
+const ATTR_SLUG = "attr-repo";
+const ATTR_PATH = `/repos/${OWNER}/${ATTR_SLUG}`;
+const ATTR_KEEP = "package keep\n";
+const ATTR_VERSION = "ver=$Format:%H$\n";
+
+const ATTR_COMMITS = [
+  {
+    message: "seed: attributes",
+    time: T0,
+    files: [
+      {
+        path: ".gitattributes",
+        content: [
+          "# archive attribute suite",
+          "/tests export-ignore",
+          "*.log export-ignore",
+          "docs/notes.md export-ignore",
+          "*.go export-ignore",
+          "VERSION export-subst",
+          "",
+        ].join("\n"),
+      },
+      { path: "lib/.gitattributes", content: "keep.go -export-ignore\n" },
+      { path: "README.md", content: "# attribute suite\n" },
+      { path: "src/gen.go", content: "package gen\n" },
+      { path: "lib/gen.go", content: "package gen\n" },
+      { path: "lib/keep.go", content: ATTR_KEEP },
+      { path: "src/drop.log", content: "log\n" },
+      { path: "deep/nested/drop.log", content: "log\n" },
+      { path: "tests/unit.js", content: "test('x', () => {});\n" },
+      { path: "tests/sub/deep.txt", content: "deep\n" },
+      { path: "docs/notes.md", content: "notes\n" },
+      { path: "VERSION", content: ATTR_VERSION },
+    ],
+  },
+];
+
 let OWNER_ID = 1;
 
 beforeAll(async () => {
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
   await applyAuthD1Migrations();
   await ensureSeededRepo({ owner: OWNER, slug: SLUG, commits: SEED_COMMITS });
+  await ensureSeededRepo({ owner: OWNER, slug: ATTR_SLUG, commits: ATTR_COMMITS });
   const row = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, OWNER)).get();
   if (row === undefined) throw new Error("seed owner missing");
   OWNER_ID = row.id;
@@ -136,7 +182,7 @@ interface ZipEntry {
   content: string;
 }
 
-function parseZip(bytes: Uint8Array): ZipEntry[] {
+async function parseZip(bytes: Uint8Array): Promise<ZipEntry[]> {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const decoder = new TextDecoder();
   // locate the EOCD (scan the last 64 KiB)
@@ -159,13 +205,23 @@ function parseZip(bytes: Uint8Array): ZipEntry[] {
     const nameLen = view.getUint16(cdOffset + 28, true);
     const name = decoder.decode(bytes.subarray(cdOffset + 46, cdOffset + 46 + nameLen));
     const localNameLen = view.getUint16(localOffset + 26, true);
+    const compressedSize = view.getUint32(localOffset + 18, true);
     const size = view.getUint32(localOffset + 22, true);
     const dataStart = localOffset + 30 + localNameLen;
+    const raw = bytes.subarray(dataStart, dataStart + compressedSize);
+    const content =
+      method === 8
+        ? decoder.decode(
+            new Uint8Array(
+              await new Response(new Blob([raw]).stream().pipeThrough(new DecompressionStream("deflate-raw"))).arrayBuffer(),
+            ),
+          )
+        : decoder.decode(bytes.subarray(dataStart, dataStart + size));
     entries.push({
       name,
       method,
       mode: (externalAttrs >>> 16) & 0xffff,
-      content: decoder.decode(bytes.subarray(dataStart, dataStart + size)),
+      content,
     });
     cdOffset += 46 + nameLen;
   }
@@ -207,11 +263,12 @@ describe("GET /repos/{owner}/{repo}/archive/{archive} (repoGetArchive)", () => {
     expect(link).toMatch(new RegExp(`^<${ORIGIN}/api/v1/repos/${OWNER}/${SLUG}/archive/[0-9a-f]{40}\\.tar\\.gz\\?rev=[0-9a-f]{40}>; rel="immutable"$`, "u"));
   });
 
-  it("streams a zip of the branch: STORE entries, central directory, exec modes preserved", async () => {
+  it("streams a zip of the branch: DEFLATE entries (git archive's method 8), central directory, exec modes preserved", async () => {
     const res = await fetchRoute(`${REPO_PATH}/archive/main.zip`);
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toBe("application/zip");
-    const entries = parseZip(new Uint8Array(await res.arrayBuffer()));
+    const zipBytes = new Uint8Array(await res.arrayBuffer());
+    const entries = await parseZip(zipBytes);
     expect(entries.map((e) => e.name).sort()).toEqual([
       `${SLUG}/README.md`,
       `${SLUG}/main.go`,
@@ -219,9 +276,10 @@ describe("GET /repos/{owner}/{repo}/archive/{archive} (repoGetArchive)", () => {
       `${SLUG}/src/lib.py`,
     ]);
     for (const entry of entries) {
-      expect(entry.method).toBe(0); // STORE
+      expect(entry.method).toBe(8); // DEFLATE — real git archive never STOREs
       expect(entry.mode & 0o170000).toBe(0o100000); // regular files
     }
+    // the round-trip proves the local header's CRC/sizes describe the raw bytes
     const go = entries.find((e) => e.name === `${SLUG}/main.go`);
     expect(go?.content).toBe("package main\n");
   });
@@ -282,6 +340,141 @@ describe("GET /repos/{owner}/{repo}/archive/{archive} (repoGetArchive)", () => {
     const res = await fetchRoute("/repos/archiver/ghost-repo/archive/main.tar.gz");
     expect(res.status).toBe(404);
     expect(await jsonBody(res)).toEqual({ message: "not found", url: `${ORIGIN}/api/swagger` });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// .gitattributes export rules (parity-review-git D3 — tar AND zip arms)
+// ---------------------------------------------------------------------------
+
+describe("archive .gitattributes export rules", () => {
+  const KEPT = [
+    `${ATTR_SLUG}/.gitattributes`,
+    `${ATTR_SLUG}/README.md`,
+    `${ATTR_SLUG}/VERSION`,
+    `${ATTR_SLUG}/lib/.gitattributes`,
+    `${ATTR_SLUG}/lib/keep.go`,
+  ].sort();
+
+  it("excludes export-ignored entries from the tar: anchored dir prune, basename at depth, exact file; deeper -export-ignore re-includes", async () => {
+    const res = await fetchRoute(`${ATTR_PATH}/archive/main.tar.gz`);
+    expect(res.status).toBe(200);
+    const gz = new Uint8Array(await res.arrayBuffer());
+    const tarBytes = new Uint8Array(
+      await new Response(new Blob([gz]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer(),
+    );
+    const entries = parseTar(tarBytes);
+    // Negative pin: every UNMARKED file is present — both .gitattributes files
+    // themselves (git archives them unless they are export-ignored) and
+    // lib/keep.go, re-included by lib/.gitattributes' `keep.go -export-ignore`
+    // beating the root `*.go export-ignore` (deeper file, later state).
+    expect(entries.map((e) => e.name).sort()).toEqual(KEPT);
+    // Excluded: /tests (anchored dir — its whole subtree went with it),
+    // *.log at depth (src/drop.log, deep/nested/drop.log), docs/notes.md
+    // (exact), src+lib gen.go, and lib/keep.go's siblings.
+    expect(entries.some((e) => e.name.includes("tests/"))).toBe(false);
+    expect(entries.some((e) => e.name.endsWith(".log"))).toBe(false);
+    expect(entries.some((e) => e.name === `${ATTR_SLUG}/docs/notes.md`)).toBe(false);
+    const keep = entries.find((e) => e.name === `${ATTR_SLUG}/lib/keep.go`);
+    expect(keep?.content).toBe(ATTR_KEEP);
+  });
+
+  it("excludes the same set from the zip (DEFLATE entries)", async () => {
+    const res = await fetchRoute(`${ATTR_PATH}/archive/main.zip`);
+    expect(res.status).toBe(200);
+    const entries = await parseZip(new Uint8Array(await res.arrayBuffer()));
+    expect(entries.map((e) => e.name).sort()).toEqual(KEPT);
+    for (const entry of entries) {
+      expect(entry.method).toBe(8);
+    }
+  });
+
+  it("pins the export-subst disposition: parsed, NOT substituted — $Format:…$ survives byte-identical", async () => {
+    // Upstream (real git archive) expands $Format:…$ through git's full
+    // pretty-format machinery; that is engine-deep here (object-graph
+    // abbreviation for %h, ref decorations for %d, mailmap for %aN), and a
+    // partial substitution is a state git never produces — so the blob
+    // streams byte-identical and the literal survives. Documented in the
+    // service module doc; this pin marks the disposition as DELIBERATE.
+    for (const tail of ["main.tar.gz", "main.zip"]) {
+      const res = await fetchRoute(`${ATTR_PATH}/archive/${tail}`);
+      expect(res.status).toBe(200);
+      if (tail.endsWith(".zip")) {
+        const entries = await parseZip(new Uint8Array(await res.arrayBuffer()));
+        expect(entries.find((e) => e.name === `${ATTR_SLUG}/VERSION`)?.content).toBe(ATTR_VERSION);
+      } else {
+        const gz = new Uint8Array(await res.arrayBuffer());
+        const tarBytes = new Uint8Array(
+          await new Response(new Blob([gz]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer(),
+        );
+        expect(new TextDecoder().decode(tarBytes)).toContain(ATTR_VERSION);
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseGitattributes matching rules (the gitattributes(5) subset, white-box)
+// ---------------------------------------------------------------------------
+
+describe("parseGitattributes matching rules", () => {
+  /** The documented resolution: the LAST matching export-ignore assignment wins. */
+  const excluded = (text: string, dir: string, path: string, isDir = false): boolean => {
+    let value: boolean | null | undefined;
+    for (const rule of parseGitattributes(text, dir)) {
+      if (rule.exportIgnore === undefined) continue;
+      if (ruleMatches(rule, path, isDir)) value = rule.exportIgnore;
+    }
+    return value === true;
+  };
+
+  it("last matching line wins; -export-ignore unsets; value forms are never TRUE", () => {
+    expect(excluded("x.txt export-ignore\nx.txt -export-ignore\n", "", "x.txt")).toBe(false);
+    expect(excluded("x.txt -export-ignore\nx.txt export-ignore\n", "", "x.txt")).toBe(true);
+    expect(excluded("x.txt export-ignore=maybe\n", "", "x.txt")).toBe(false);
+  });
+
+  it("!pattern negative-pattern lines are skipped (git 2.43 warns and ignores them)", () => {
+    const rules = parseGitattributes("!x.txt export-ignore\n", "");
+    expect(rules).toEqual([]);
+    expect(excluded("!x.txt export-ignore\n", "", "x.txt")).toBe(false);
+  });
+
+  it("comments, blank lines and [attr] macro lines produce no rules (macros are outside the subset)", () => {
+    expect(parseGitattributes("# comment\n\n[attr]macro export-ignore\n", "")).toEqual([]);
+  });
+
+  it("patterns without a slash match the basename at any depth; anchored patterns do not", () => {
+    expect(excluded("*.log export-ignore\n", "", "a/b/c.log")).toBe(true);
+    expect(excluded("*.log export-ignore\n", "", "a/b/c.txt")).toBe(false);
+    // `/tests` anchors to the root: the top-level dir matches, a nested
+    // `suite/tests` does not.
+    expect(excluded("/tests export-ignore\n", "", "tests", true)).toBe(true);
+    expect(excluded("/tests export-ignore\n", "", "suite/tests", true)).toBe(false);
+    // a leading slash anchors to the file's directory; a bare name matches
+    // basenames at any depth beneath it
+    expect(excluded("notes.md export-ignore\n", "docs", "docs/notes.md")).toBe(true);
+    expect(excluded("/notes.md export-ignore\n", "docs", "docs/notes.md")).toBe(true);
+    expect(excluded("/notes.md export-ignore\n", "docs", "other/notes.md")).toBe(false);
+  });
+
+  it("trailing slash makes the pattern directory-only; directories prune, files do not match", () => {
+    expect(excluded("gen/ export-ignore\n", "", "gen", true)).toBe(true);
+    expect(excluded("gen/ export-ignore\n", "", "lib/gen", true)).toBe(true);
+    expect(excluded("gen/ export-ignore\n", "", "gen")).toBe(false);
+  });
+
+  it("`**` crosses directories: leading matches any depth, trailing matches the subtree only", () => {
+    expect(excluded("**/deep.txt export-ignore\n", "", "a/b/deep.txt")).toBe(true);
+    expect(excluded("**/deep.txt export-ignore\n", "", "deep.txt")).toBe(true);
+    expect(excluded("dist/** export-ignore\n", "", "dist/x/y.js")).toBe(true);
+    expect(excluded("dist/** export-ignore\n", "", "dist", true)).toBe(false);
+  });
+
+  it("parses export-subst assignments (recorded for the documented disposition)", () => {
+    const rules = parseGitattributes("VERSION export-subst\n!other export-subst\n", "");
+    expect(rules).toHaveLength(1);
+    expect(rules[0]?.exportSubst).toBe(true);
   });
 });
 
