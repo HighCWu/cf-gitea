@@ -23,7 +23,6 @@ import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { saveRepoSettings } from "../../api/services/repo-settings";
 import { actionArtifacts, actionLogChunks, actionRunAttempts, actionRunJobs, actionRuns, actionTaskSteps, actionTasks, repositories } from "../../db/schema";
 import {
-  ACTION_STATUS_CANCELLED,
   ACTION_STATUS_FAILURE,
   ACTION_STATUS_PENDING,
   ACTION_STATUS_RUNNING,

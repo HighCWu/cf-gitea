@@ -101,7 +101,7 @@ export const COMPARE_RULES = [
     fields: ["outcome", "commands.exits", "checks", "refs_local", "refs_remote"],
     enforced: false,
     rule: "The capability-matrix dump is endpoint-descriptive by design (Round-8: test-generated, not " +
-      "hand-maintained): ours must never advertise filter (enforced inside the case for ours), while a " +
+      "hand-maintained): ours advertises the blob-family filter since P2-8 (e454a75 — the engine SERVES it; the Round-8 never-advertise rule retired), while a " +
       "real Gitea legitimately advertises it via stock git upload-pack; agent strings and capability " +
       "sets differ legitimately (ours=agent=dgit/0.3, theirs=agent=git/x.y — both key=value per git " +
       "convention since the 2026-10-25 bare-token fix). Divergences here DOCUMENT the matrix — they " +

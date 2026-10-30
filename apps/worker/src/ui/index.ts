@@ -8707,7 +8707,7 @@ async function orgActionsGeneralSubmit(c: Context<{ Bindings: Env }>): Promise<R
   const { org, respond } = resolved;
   if (resolved.route.family !== "org-settings-actions-general") return respond(await c.notFound()); // drift guard
   const params = await c.req.parseBody().then(
-    (body) => new URLSearchParams(Object.entries(body).map(([k, v]) => [k, String(v)])),
+    (body) => new URLSearchParams(Object.entries(body).map(([k, v]) => [k, typeof v === "string" ? v : v.name])),
     () => new URLSearchParams(),
   );
   const outcome = await applyOwnerActionsGeneralForms(
@@ -8734,7 +8734,7 @@ async function userActionsGeneralSubmit(c: Context<{ Bindings: Env }>): Promise<
   const p = await userSettingsTabPrologue(c, true);
   if (!p.ok) return p.response;
   const params = await c.req.parseBody().then(
-    (body) => new URLSearchParams(Object.entries(body).map(([k, v]) => [k, String(v)])),
+    (body) => new URLSearchParams(Object.entries(body).map(([k, v]) => [k, typeof v === "string" ? v : v.name])),
     () => new URLSearchParams(),
   );
   const outcome = await applyUserActionsGeneralForms(

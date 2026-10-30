@@ -26,7 +26,7 @@ async function gzipOf(data: Uint8Array): Promise<Uint8Array> {
   const writer = cs.writable.getWriter();
   void writer.write(data);
   void writer.close();
-  return bytesFrom(cs.readable as ReadableStream<Uint8Array>);
+  return bytesFrom(cs.readable);
 }
 
 function concat(...parts: Uint8Array[]): Uint8Array {

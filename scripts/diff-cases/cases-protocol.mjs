@@ -467,17 +467,19 @@ export const PROTOCOL_CASES = [
       const agentToken = [...v0Caps, ...v2Caps].find((c) => /^agent=/.test(c)) ?? null;
       t.note("agent_token", agentToken);
 
-      // THE Round-8 assertion: unadvertised-and-rejected beats
-      // plausible-but-wrong — ours must never advertise filter (partial
-      // clone is not implemented; advertising it would invite silent
-      // wrong-semantics fetches).
+      // THE P2-8 FLIP (e454a75): the engine now SERVES the blob-family
+      // filters (blob:none / blob:limit=<n>, real-client accepted — partial
+      // clone end-to-end incl. the lazy-fetch round), so advertising filter
+      // is the upstream-faithful posture; the Round-8 never-advertise rule
+      // retired WITH that landing. The v0 side stays unadvertised (the v0
+      // filter line still fails closed — the engine's own matrix check).
       if (isOurs) {
-        t.check("ours-never-advertises-filter", !filterAdvertised,
-          `filter in advert: v0 caps = [${v0Caps.filter((c) => c === "filter").join("")}], v2 fetch args = [${v2FetchArgs.join(" ")}]`);
+        t.check("ours-advertises-filter-v2", v2FetchArgs.includes("filter"),
+          `v2 fetch args = [${v2FetchArgs.join(" ")}] — expected filter since P2-8`);
         t.check("ours-advertises-agent-key-value", agentToken !== null && /^agent=[^/\s]+\/\S/.test(agentToken),
           `agent capability = ${String(agentToken)} — expected the key=value form agent=<name>/<version> per git convention`);
       } else {
-        t.note("filter_check_scope", "the never-advertise-filter assertion applies to ours only; this endpoint's advert is recorded for the matrix");
+        t.note("filter_check_scope", "the filter advertisement assertion applies to ours only; this endpoint's advert is recorded for the matrix");
       }
 
       // Advertised shallow ⇒ the deepen family is handled-or-rejected,
