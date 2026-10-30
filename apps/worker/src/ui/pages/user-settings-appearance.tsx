@@ -236,9 +236,14 @@ export interface UserSettingsAppearancePageData {
  * language "").
  */
 export async function loadUserSettingsAppearancePageData(d1: D1Database, userId: number): Promise<UserSettingsAppearancePageData | null> {
-  const row = await drizzle(d1).select({ id: users.id }).from(users).where(eq(users.id, userId)).get();
+  // The two reads are independent (PK lookups on different tables) — issue
+  // them concurrently; the serial depth cost is the F1 latency finding
+  // (the profile tab's twin landed the same shape).
+  const [row, settings] = await Promise.all([
+    drizzle(d1).select({ id: users.id }).from(users).where(eq(users.id, userId)).get(),
+    loadUserSettings(d1, userId),
+  ]);
   if (row === undefined) return null;
-  const settings = await loadUserSettings(d1, userId);
   return { theme: settings.theme, language: settings.language };
 }
 

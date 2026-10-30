@@ -127,13 +127,23 @@ export interface UserSettingsPageData {
 /**
  * Load the page (the GET arm's two stores): the users row (the route's
  * findSettingsRow slice widened with username/email/visibility) and
- * `loadUserSettings`. `null` = the session doer has no D1 row (the
+ * `loadUserSettings`. The two reads are independent (only `userId` feeds
+ * both) and are issued CONCURRENTLY — the profile page pays the session
+ * prologue's two sequential D1 round trips (verifySession's lookup, then
+ * the navbar bell's unread COUNT) before this loader runs, so serializing
+ * the loader's own pair put the GET at four sequential round trips, the
+ * deepest of any signed-in page (the usability F1 latency finding:
+ * ~1.4 s server-side p50 at production D1 round-trip latency, 3-4× every
+ * sibling page). `null` = the session doer has no D1 row (the
  * silent-auth-failure convention — the 404 shell, the file-editor pattern).
  */
 export async function loadUserSettingsPageData(d1: D1Database, userId: number): Promise<UserSettingsPageData | null> {
-  const row = await drizzle(d1).select().from(users).where(eq(users.id, userId)).get();
+  const [row, settings] = await Promise.all([
+    drizzle(d1).select().from(users).where(eq(users.id, userId)).get(),
+    loadUserSettings(d1, userId),
+  ]);
   if (row === undefined) return null;
-  return { user: row, settings: await loadUserSettings(d1, userId) };
+  return { user: row, settings };
 }
 
 /** The form's fields (upstream profile.tmpl's field names). */
