@@ -328,9 +328,17 @@ export default {
       // trailing-slash shape (the pinned /:owner/:repo/ passthrough included).
       const lastcommitTrailingSlash =
         pathname.endsWith("/") && segments[2] === "lastcommit" && handlesUiRoute(pathname.slice(0, -1));
+      // The wiki-scoped twin (usability sweep, 2026-10-30): upstream's wiki
+      // itself EMITS slashed URLs — the missing-page fold's
+      // RepoLink+"/wiki/?action=_pages" (wiki.go:238/340/400) and the view
+      // dropdown's Pages item (view.tmpl:25) — and chi's Combo("/*") matches
+      // every slashed wiki tail, so the carve is WIDE (any /wiki/…/ shape
+      // the parser claims trimmed), not the exact-bare-emit narrower form.
+      const wikiTrailingSlash =
+        pathname.endsWith("/") && segments[2] === "wiki" && handlesUiRoute(pathname.slice(0, -1));
       if (
         !engineAdminRootDelete &&
-        (lastcommitTrailingSlash || (!pathname.endsWith("/") && handlesUiRoute(pathname)))
+        (lastcommitTrailingSlash || wikiTrailingSlash || (!pathname.endsWith("/") && handlesUiRoute(pathname)))
       ) {
         return app.fetch(req, env, ctx);
       }
