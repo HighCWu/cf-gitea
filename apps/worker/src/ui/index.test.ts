@@ -431,6 +431,12 @@ describe("parseUiRoute", () => {
     ["/user/settings/packages/rules/7/preview", { family: "user-settings-packages-rule-preview", id: 7 }],
     ["/user/settings/packages/cargo/initialize", null], // cargo/chef tails unregistered
     ["/user/settings/packages/rules/junk", null], // non-numeric id
+    // The P2-1/P2-2 actions-general mounts (web.go:722/:724 user,
+    // :1052/:1054 org — the bare group redirects + the General pages).
+    ["/acme/settings/actions", { family: "org-settings-actions-redirect", owner: "acme" }],
+    ["/acme/settings/actions/general", { family: "org-settings-actions-general", owner: "acme" }],
+    ["/user/settings/actions", { family: "user-settings-actions-redirect", id: null }],
+    ["/user/settings/actions/general", { family: "user-settings-actions-general", id: null }],
   ];
 
   it.each(table)("parses %s", (pathname, expected) => {

@@ -934,6 +934,7 @@ import {
   setOrgActionsRunnerDisabled,
   updateOrgActionsRunnerDescription,
 } from "./pages/org-settings-actions-runners";
+import { loadOrgActionsGeneralPageData, renderOrgActionsGeneralPage } from "./pages/org-settings-actions-general";
 import {
   applyOrgCleanupRuleCreate,
   applyOrgCleanupRuleEdit,
@@ -1014,6 +1015,8 @@ import {
   setUserActionsRunnerDisabled,
   updateUserActionsRunnerDescription,
 } from "./pages/user-settings-actions-runners";
+import { renderUserActionsGeneralPage } from "./pages/user-settings-actions-general";
+import { OWNER_ACTIONS_GENERAL_FRESH_DATA } from "./pages/org-settings-actions-general";
 import {
   applyUserCleanupRuleCreate,
   applyUserCleanupRuleEdit,
@@ -3118,6 +3121,8 @@ export interface UserSettingsTabRoute {
     | "user-settings-security"
     | "user-settings-secrets"
     | "user-settings-secrets-delete"
+    | "user-settings-actions-redirect" // GET /user/settings/actions (web.go:722 bare LocationRedirect)
+    | "user-settings-actions-general" // GET /user/settings/actions/general (web.go:724)
     | "user-settings-actions-runners"
     | "user-settings-actions-runners-token-reset"
     | "user-settings-actions-runners-edit"
@@ -3227,6 +3232,8 @@ export interface OrgSettingsRoute {
     | "org-actions-variables-new" // POST .../variables/new (window-2b)
     | "org-actions-variables-edit" // POST .../variables/{id}/edit (window-2b)
     | "org-actions-variables-delete" // POST .../variables/{id}/delete (window-2b)
+    | "org-settings-actions-redirect" // GET /{org}/settings/actions (web.go:1052 bare LocationRedirect)
+    | "org-settings-actions-general" // GET /{org}/settings/actions/general (web.go:1054)
     | "org-actions-runners" // GET /{org}/settings/actions/runners (the census C7 org arm)
     | "org-actions-runners-token-reset" // POST .../runners/reset_registration_token
     | "org-actions-runners-edit" // GET+POST .../runners/{id} (page + the description update)
@@ -3552,6 +3559,14 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (tail.length === 4 && tail[0] === "packages" && tail[1] === "rules" && tail[3] === "preview") {
       const id = numericId(tail[2]);
       return id === null ? null : { family: "user-settings-packages-rule-preview", id };
+    }
+    if (tail.length === 1 && tail[0] === "actions") {
+      // web.go:722: GET /user/settings/actions -> LocationRedirect("./actions/general").
+      return { family: "user-settings-actions-redirect", id: null };
+    }
+    if (tail.length === 2 && tail[0] === "actions" && tail[1] === "general") {
+      // web.go:724: the GeneralSettings page (the P2-1 mount).
+      return { family: "user-settings-actions-general", id: null };
     }
     if (tail.length === 2 && tail[0] === "actions" && tail[1] === "runners") {
       return { family: "user-settings-actions-runners", id: null };
@@ -4105,6 +4120,14 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     // repo runners family's PathParamInt64 parity: junk fails the parse, a
     // negative parses and 404-shells on the scope lookup). Every other
     // tail stays unclaimed → the engine's 404.
+    if (raw.length === 4 && raw[3] === "actions") {
+      // web.go:1052: GET /{org}/settings/actions -> LocationRedirect("./actions/general").
+      return { family: "org-settings-actions-redirect", owner };
+    }
+    if (raw.length === 5 && raw[3] === "actions" && raw[4] === "general") {
+      // web.go:1054: the GeneralSettings page (the P2-2 mount).
+      return { family: "org-settings-actions-general", owner };
+    }
     if (raw.length === 5 && raw[3] === "actions" && raw[4] === "runners") {
       return { family: "org-actions-runners", owner };
     }
@@ -8643,6 +8666,23 @@ async function userSettingsSecretsDelete(c: Context<{ Bindings: Env }>): Promise
 /** The user-scope RUNNERS family's handlers (pages/user-settings-actions-
  *  runners.tsx — web.go:723; the tab prologue's session gate, writes
  *  sameOriginGuard-first via the prologue's withOriginGuard arm). */
+/** GET /user/settings/actions (web.go:722): the bare group redirect —
+ * the LITERAL "./actions/general" bytes. */
+async function userActionsGroupRedirect(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  return p.respond(new Response(null, { status: 303, headers: { location: "./actions/general" } }));
+}
+
+/** GET /user/settings/actions/general (web.go:724) — the P2-1 page (the
+ * reuse twin; its loader needs no D1). */
+async function userActionsGeneralPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  // The reuse twin renders the shared FRESH_DATA directly (no D1 read).
+  return p.respond(c.html(renderUserActionsGeneralPage(p.ctx, { ownerId: p.viewer.id, ...OWNER_ACTIONS_GENERAL_FRESH_DATA }), 200));
+}
+
 async function userActionsRunnersPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const p = await userSettingsTabPrologue(c, false);
   if (!p.ok) return p.response;
@@ -9870,6 +9910,28 @@ async function orgActionsVariablesDelete(c: Context<{ Bindings: Env }>, variable
 // instance-level flags at this scope, both compile-time TRUE in the landed
 // posture, the module header — sameOriginGuard-first POSTs).
 // ---------------------------------------------------------------------------
+
+/** GET /{org}/settings/actions (web.go:1052): the bare group redirect —
+ * misc.LocationRedirect("./actions/general"), the LITERAL relative bytes
+ * (the adminActionsGroupRedirect convention). */
+async function orgActionsGroupRedirect(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { respond } = resolved;
+  if (resolved.route.family !== "org-settings-actions-redirect") return respond(await c.notFound()); // drift guard
+  return respond(new Response(null, { status: 303, headers: { location: "./actions/general" } }));
+}
+
+/** GET /{org}/settings/actions/general (web.go:1054, shared_actions.
+ * GeneralSettings) — the P2-2 page over the no-setting posture. */
+async function orgActionsGeneralPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-settings-actions-general") return respond(await c.notFound()); // drift guard
+  const data = loadOrgActionsGeneralPageData(org);
+  return respond(c.html(renderOrgActionsGeneralPage(ctx, { ...data, org }), 200));
+}
 
 /** GET /{org}/settings/actions/runners (shared_actions.Runners' org arm,
  * runners.go:102-155) through the require-owner prologue. */
@@ -14464,6 +14526,8 @@ uiRouter.post("/user/settings/actions/secrets", (c) => userSettingsSecretsSubmit
 uiRouter.post("/user/settings/actions/secrets/delete", (c) => userSettingsSecretsDelete(c));
 // The user-scope RUNNERS family (the static reset literal before the {id}
 // arms; the GET-only edit page's POST twin answers chi's 405).
+uiRouter.get("/user/settings/actions", (c) => userActionsGroupRedirect(c));
+uiRouter.get("/user/settings/actions/general", (c) => userActionsGeneralPage(c));
 uiRouter.get("/user/settings/actions/runners", (c) => userActionsRunnersPage(c));
 uiRouter.post("/user/settings/actions/runners/reset_registration_token", (c) => userActionsRunnersTokenReset(c));
 uiRouter.get("/user/settings/actions/runners/reset_registration_token", () => methodNotAllowed("POST"));
@@ -14580,6 +14644,8 @@ uiRouter.post("/:owner/settings/hooks/:id/delete", (c) => orgHookDeleteSubmit(c)
 // Window-2b: the blocked_users tab + the actions sub-tabs.
 uiRouter.get("/:owner/settings/blocked_users", (c) => orgBlockedUsersPage(c));
 uiRouter.post("/:owner/settings/blocked_users", (c) => orgBlockedUsersSubmit(c));
+uiRouter.get("/:owner/settings/actions", (c) => orgActionsGroupRedirect(c));
+uiRouter.get("/:owner/settings/actions/general", (c) => orgActionsGeneralPage(c));
 uiRouter.get("/:owner/settings/actions/secrets", (c) => orgActionsSecretsPage(c));
 uiRouter.post("/:owner/settings/actions/secrets", (c) => orgActionsSecretsSubmit(c));
 uiRouter.post("/:owner/settings/actions/secrets/delete", (c) => orgActionsSecretsDelete(c));
