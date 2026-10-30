@@ -11946,6 +11946,26 @@ async function archiveFileDownload(c: Context<{ Bindings: Env }>): Promise<Respo
   );
 }
 
+/** POST /{owner}/{repo}/archive/* (InitiateDownload, repo.go:381-390): the
+ *  bundle's pre-flight — our archives stream (no async archiver queue), so
+ *  upstream's fast-path answer is the whole behavior: checkDownloadTokenScope's
+ *  repo-scoped read gate rides the same resolveUiRequest ladder, then
+ *  {"complete":true}. */
+async function archiveInitiateDownload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, respond } = resolved;
+  if (route.family !== "repo-archive") return respond(await c.notFound()); // drift guard
+  return respond(
+    new Response(JSON.stringify({ complete: true }), {
+      status: 200,
+      headers: { "content-type": "application/json;charset=utf-8" },
+    }),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // The wave-32 commit aux-JSON family (pages/commit-contained-refs.ts — the
 // survey's row 3: upstream web.go:1740 repo.LoadBranchesAndTags)
@@ -15203,6 +15223,14 @@ uiRouter.post("/:owner/:repo/fork", (c) => repoForkSubmit(c));
 // (InitiateDownload) stays engine-owned.
 uiRouter.get("/:owner/:repo/archive/*", (c) => archiveFileDownload(c));
 uiRouter.get("/:owner/:repo/archive", (c) => archiveFileDownload(c));
+// The UI archive button's POST arm (upstream InitiateDownload, web.go:1691 +
+// repo.go:381-390): the vendored bundle POSTs FIRST and aborts on non-JSON —
+// without this arm no web archive download ever starts (the parity review's
+// adapter-owned HIGH). Upstream answers {"complete":true} when streaming or
+// subpaths are in play (our archives always stream — the module doc); the
+// sameOriginGuard rides per the write-family convention; GET twins 405.
+uiRouter.post("/:owner/:repo/archive/*", (c) => archiveInitiateDownload(c));
+uiRouter.post("/:owner/:repo/archive", (c) => archiveInitiateDownload(c));
 uiRouter.get("/:owner/:repo/commit/:lbsha/load-branches-and-tags", (c) => commitContainedRefsJson(c));
 // Wave-33 tags tails + releases edit/delete (parseUiRoute claims exactly
 // these shapes — upstream's web.go:1499 `/tags/list` aux literal, web.go:1501
