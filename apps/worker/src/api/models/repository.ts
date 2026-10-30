@@ -204,10 +204,12 @@ export type SearchResults = z.infer<typeof searchResultsSchema>;
 /**
  * Mirror of the vendored contract's `CreateRepoOption`
  * (#/definitions/CreateRepoOption) — field-for-field including the enums.
- * `name` is the one required field. Consumed by `POST /orgs/{org}/repos`
- * (createOrgRepo); the engine-dependent options (`auto_init` + template
- * scaffolding: `readme`/`license`/`gitignores`/`issue_labels`) are accepted
- * per the contract and deferred to the commit-builder wave (SPEC-0004 §3.4).
+ * `name` is the one required field. Consumed by `POST /user/repos`,
+ * `POST /orgs/{org}/repos` and the admin create; `auto_init` lands the
+ * initial commit with the template scaffolding (`readme` 400-validated,
+ * `gitignores`/`license` rendered from the inlined options/ catalogs —
+ * services/user-repos.ts + services/repo-init-templates.ts), leaving
+ * `issue_labels` the one accepted-and-ignored option.
  */
 export const createRepoOptionSchema = z.object({
   auto_init: z.boolean().optional().openapi({ description: "Whether the repository should be auto-initialized?" }),

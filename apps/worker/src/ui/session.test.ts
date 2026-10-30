@@ -297,6 +297,23 @@ describe("POST /login — the happy path (§2.2)", () => {
     expect(res.status).toBe(303);
     expect(await failureCount(ip)).toBe(0); // limiter.reset ran via waitUntil
   });
+
+  it("stamps users.last_login_at at the mint (P3-7 — upstream's SetLastLogin sign-in family, auth.go:427-430)", async () => {
+    const alice = await seedUser({ username: "Alice" });
+    const pat = await seedToken(alice, "web");
+    const before = Date.now();
+
+    const res = await request("/login", form({ password: pat }));
+    expect(res.status).toBe(303);
+
+    const row = (await drizzle(env.DB).select().from(users).where(eq(users.id, alice.id)).all())[0];
+    const at = row?.lastLoginAt?.getTime() ?? -1;
+    expect(row?.lastLoginAt).not.toBeNull();
+    // The column is drizzle `timestamp` mode — SECONDS at rest (the users
+    // table's created_at convention), so the compare is second-truncated.
+    expect(at).toBeGreaterThanOrEqual(Math.floor(before / 1000) * 1000);
+    expect(at).toBeLessThanOrEqual(Date.now());
+  });
 });
 
 describe("POST /login — failure paths re-render at 200 and count one limiter failure (§2.2, §4.11)", () => {
@@ -796,6 +813,20 @@ describe("§2.4 verification, rotation, reuse detection", () => {
     expect(result.clearCookie).toBe(true);
     await Promise.all(result.background); // the lazy GC write
     expect(await drizzle(env.DB).select().from(sessions).all()).toHaveLength(0);
+  });
+
+  it("verifySession never touches users.last_login_at (P3-7 — upstream's CheckAuthToken is read-only on the user row, auth_token.go:33-69)", async () => {
+    const alice = await seedUser();
+    const cookieValue = await mintSession(env.DB, alice.id, { now: new Date(T) });
+    const afterMint = (await drizzle(env.DB).select().from(users).where(eq(users.id, alice.id)).all())[0]
+      ?.lastLoginAt?.getTime();
+
+    const result = await verifySession(env.DB, cookieValue, { now: new Date(T + 60 * 60 * 1000) });
+    expect(result.outcome).toBe("authenticated");
+
+    const afterVerify = (await drizzle(env.DB).select().from(users).where(eq(users.id, alice.id)).all())[0]
+      ?.lastLoginAt?.getTime();
+    expect(afterVerify).toBe(afterMint);
   });
 
   it("forced rotation rewrites the digest + grace columns and returns a fresh Set-Cookie (§2.4 step 5)", async () => {

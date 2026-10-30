@@ -228,7 +228,10 @@ export function registerOrgRoutes(
     // shares: repo.go:493 hands the ORG to `CreateUserRepo(ctx, org.AsUser(),
     // *opt)` — description/default_branch metadata, the auto_init initial
     // commit (the owner's git signature, i.e. the org-as-user row — init.go
-    // initRepoCommit(ctx, tmpPath, repo, u)) and the is_empty flip. The
+    // initRepoCommit(ctx, tmpPath, repo, u)) and the is_empty flip; an
+    // unknown gitignores/license template name 500s with the row rolled
+    // back (create.go:236-241,448-456 — the user-repos route note and the
+    // RUNTIME_ONLY table entry carry the cites). The
     // engine registry rides the create (REDEPLOY8 — the user-repos note):
     // bare construction skips seedRepoExtras' upsert and the repo 404s on
     // info/refs/clone until a push lands.
