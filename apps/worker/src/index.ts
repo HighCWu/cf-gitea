@@ -20,6 +20,7 @@ import { repoTasksDlqHandler } from "./repos/dlq";
 import { handleUserPushEvent } from "./services/webhooks-push";
 import { enqueuePushMirrorSyncsOnCommit } from "./services/mirror/push-sync";
 import { handleScheduledCron } from "./services/demo-sweep";
+import { armsForEntry, recordArmsFailure, recordArmsSuccess } from "./services/cron-state";
 import { handlesUiRoute, uiRouter } from "./ui";
 import { sessionRouter } from "./ui/session";
 import { firstRunRouter } from "./ui/first-run";
@@ -422,11 +423,40 @@ export default {
   // budget (AGENTS.md Workers rules) — SELECT + enqueue ONLY here; the sync
   // itself runs in the REPO_TASKS consumer (handleRepoTasks →
   // handleMirrorSync).
-  async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext) {
+  //
+  // THE TICK STATE (usability F3, docs/usability/findings-latency-health.md):
+  // after each entry resolves, every arm the entry carries (services/
+  // cron-state.ts armsForEntry — the exact handleScheduledCron dispatch
+  // mirror) gets ONE multi-row upsert recording the completed tick (cheap,
+  // ctx.waitUntil — the entry's real work already happened, the recording
+  // never fails it). A REJECTED entry stamps last_error on the same arms and
+  // RETHROWS untouched — the platform's error visibility is exactly the
+  // pre-F3 behavior. The granularity is ENTRY-ATOMIC by construction (the
+  // recorder wraps the one delegation; per-producer attribution lives only
+  // in the dispatcher's own log lines) — services/cron-state.ts's module
+  // header pins the semantics. The admin monitor's cron page reads the rows
+  // (loadAdminMonitorCronRunState) — "did the crons run today" is
+  // certifiable from the product surface.
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
     // SPEC-0014 M1 dispatch: the hourly string runs ONLY the demo sweep
     // producer (gate-checked, silent when off); every other cadence runs the
     // mirror producers unconditionally (their CAS absorbs overlaps).
-    await handleScheduledCron(controller, env);
+    const arms = armsForEntry(controller.cron);
+    try {
+      await handleScheduledCron(controller, env);
+    } catch (error) {
+      ctx.waitUntil(
+        recordArmsFailure(env.DB, arms, error).catch((recordError) => {
+          console.error("[cron-state] failure stamp not recorded", recordError);
+        }),
+      );
+      throw error;
+    }
+    ctx.waitUntil(
+      recordArmsSuccess(env.DB, arms).catch((recordError) => {
+        console.error("[cron-state] success tick not recorded", recordError);
+      }),
+    );
   },
 
   // Queue consumers: REPO_TASKS = delete purge (SPEC-0003 §2.5.5), import

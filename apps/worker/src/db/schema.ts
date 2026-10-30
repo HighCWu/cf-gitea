@@ -4021,3 +4021,49 @@ export const systemKeystore = sqliteTable("system_keystore", {
    *  never updates a row). */
   updatedAt: integer("updated_unix", { mode: "timestamp" }).notNull(),
 });
+
+/**
+ * The per-arm cron tick state (usability F3 —
+ * docs/usability/findings-latency-health.md): one row per landed scheduled
+ * arm (services/cron-state.ts CRON_ARMS owns the census; the Worker's
+ * `scheduled` handler upserts it per entry execution and the admin monitor's
+ * cron page reads it — "did the crons run today" becomes certifiable from
+ * the product surface). Upstream keeps this state IN MEMORY on its Task
+ * structs (services/cron/tasks.go TaskTableRow{Name, Spec, Next, Prev,
+ * Status, LastMessage, ExecTimes} — a long-lived process, so no table
+ * exists upstream); Workers isolates are ephemeral and the cron entries fire
+ * in fresh invocations, so the same columns land in D1 instead. It is NOT a
+ * general kv store (system_keystore is crypto-material, user/repo_settings
+ * are per-principal): one tiny table, one row per arm, written by exactly
+ * one writer (the scheduled handler).
+ *
+ * Column mapping (upstream TaskTableRow → here):
+ *   - `arm` — the task name (upstream Name; the registry key).
+ *   - `last_success_unix` — the last COMPLETED tick (upstream Prev shows the
+ *     run START whether it succeeded or failed; ours records completion,
+ *     because the entry-atomic recorder cannot attribute a failed entry's
+ *     partially-run arms — the store module header holds the granularity
+ *     note). NULL = never succeeded.
+ *   - `last_error` / `last_error_unix` — upstream Status("error") +
+ *     LastMessage (tasks.go:124-136); NULL = the last recorded tick was
+ *     clean. The message is clipped at emit (the system_notices §5.2 bound
+ *     discipline, scaled down).
+ *   - `runs` — completed-tick count (upstream ExecTimes counts run STARTS,
+ *     tasks.go:95-97, manual runs included — our granularity counts recorded
+ *     successes, manual runs included via the monitor's run arm).
+ */
+export const cronState = sqliteTable("cron_state", {
+  /** The scheduled arm's registry name (CRON_ARMS[].arm — upstream's task
+   *  name where a faithful twin exists; the PRIMARY KEY is the whole row:
+   *  one row per arm, point upserts, no further indexes). */
+  arm: text("arm").primaryKey(),
+  /** Last completed tick, unix seconds; NULL = never succeeded. */
+  lastSuccessUnix: integer("last_success_unix", { mode: "timestamp" }),
+  /** The entry's last failure one-liner (clipped at emit); NULL = clean. */
+  lastError: text("last_error"),
+  /** When lastError was written; NULL with a non-null lastError never
+   *  happens (the recorder writes the pair). */
+  lastErrorUnix: integer("last_error_unix", { mode: "timestamp" }),
+  /** Completed-tick count (success upserts only — see the block comment). */
+  runs: integer("runs").notNull().default(0),
+});

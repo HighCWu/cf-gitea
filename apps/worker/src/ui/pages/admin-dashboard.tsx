@@ -73,9 +73,12 @@
  * ## Data (§3.2 — the landed seams, never a self-fetch)
  *
  * The maintenance row set IS the landed cron registry read through the
- * monitor module's exported `loadAdminMonitorCron` (admin-monitor.tsx:509) —
- * ONE registry copy (the no-duplicate rule; that module mirrors
- * admin-degenerate.ts's CRON_TASKS, which mirrors wrangler.jsonc). The run
+ * monitor module's exported `loadAdminMonitorCron` — ONE registry copy (the
+ * no-duplicate rule); since the usability F3 census (services/cron-state.ts)
+ * grew that registry to the full seven-arm listing, this dashboard reads the
+ * RUNNABLE subset of it: these rows carry run buttons, and only the arms
+ * with a landed run body may render one (the dead-control rule; the monitor
+ * cron page renders the FULL census, buttons only where runnable). The run
  * arm is the landed producer `enqueueDueMirrorSyncs`
  * (services/mirror/sync.ts) directly — the API's own POST arm body
  * (admin-degenerate.ts:351), never a fetch to our own /api/v1.
@@ -179,12 +182,17 @@ export interface AdminDashboardData {
   maintenance: AdminMonitorCronEntry[];
 }
 
-/** The dashboard load — the landed registry (the monitor module's loader;
- *  prev is null until the first fire, execTimes 0 — the admin-degenerate
- *  posture). The Promise signature is the wiring wave's loader convention
- *  (the async-migration plugs in without a call-site change). */
+/** The dashboard load — the landed registry's RUNNABLE subset (the monitor
+ *  module's loader; the usability F3 census grew that registry to the full
+ *  seven-arm listing, and these rows carry run buttons, so the runnable
+ *  filter keeps this segment the bodies its POST can actually execute —
+ *  never a dead control; the monitor cron page renders the FULL census
+ *  through the same loader). prev is null until the first fire, execTimes 0
+ *  — the admin-degenerate posture. The Promise signature is the wiring
+ *  wave's loader convention (the async-migration plugs in without a
+ *  call-site change). */
 export function loadAdminDashboardData(now: Date): Promise<AdminDashboardData> {
-  return Promise.resolve({ maintenance: loadAdminMonitorCron(now).entries });
+  return Promise.resolve({ maintenance: loadAdminMonitorCron(now).entries.filter((entry) => entry.runnable) });
 }
 
 // ---------------------------------------------------------------------------

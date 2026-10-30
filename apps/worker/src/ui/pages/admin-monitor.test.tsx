@@ -61,12 +61,16 @@ import {
   applyAdminMonitorCronForm,
   formatMonitorFullTime,
   loadAdminMonitorCron,
+  loadAdminMonitorCronRunState,
   loadAdminMonitorQueues,
   loadAdminMonitorStats,
   parseAdminMonitorCronForm,
   renderAdminMonitorCronPage,
 } from "./admin-monitor";
 import { AdminFamilyNav } from "./admin-users";
+import { armsForEntry, listCronState, recordArmsFailure, recordArmsSuccess } from "../../services/cron-state";
+
+const LATER = new Date("2026-01-01T13:00:00Z");
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -96,6 +100,7 @@ const AT = new Date("2026-01-01T00:00:00Z");
 const FIXTURE_TABLES = [
   "comments",
   "commit_statuses",
+  "cron_state",
   "follows",
   "issue_attachments",
   "issues",
@@ -340,23 +345,113 @@ describe("loadAdminMonitorStats (GetStatistic's landed-table subset, sorted keys
 
 const NOW = new Date("2026-01-01T12:07:33Z");
 
-describe("loadAdminMonitorCron (the landed registry mirror — admin-degenerate.ts's CRON_TASKS)", () => {
-  it("mirrors the one landed task with the API's field mapping", () => {
+describe("loadAdminMonitorCron (the FULL landed arm census — the usability F3 listing)", () => {
+  it("carries all seven landed arms with their wrangler schedules in registry order", () => {
     const { entries } = loadAdminMonitorCron(NOW);
-    expect(entries).toEqual([
-      {
-        name: "update_mirrors",
-        spec: "*/10 * * * *",
-        next: new Date("2026-01-01T12:10:00Z"), // the next 10-min UTC boundary
-        prev: null, // never fired — the registry keeps no execution history
-        execTimes: 0,
-      },
+    expect(entries.map((entry) => [entry.name, entry.spec])).toEqual([
+      ["update_mirrors", "*/10 * * * *"],
+      ["update_push_mirrors", "*/10 * * * *"],
+      ["stop_zombie_tasks", "*/10 * * * *"],
+      ["demo_sweep", "0 * * * *"],
+      ["delete_old_audit_events", "0 * * * *"],
+      ["cleanup_packages", "0 * * * *"],
+      ["cleanup_actions", "0 * * * *"],
     ]);
+    // The never-fired posture without recorded state (the sync loader's
+    // shape): prev null, zero executions, the empty-Status result arm.
+    for (const entry of entries) {
+      expect(entry.prev).toBeNull();
+      expect(entry.execTimes).toBe(0);
+      expect(entry.result).toEqual({ status: "none", message: null, at: null });
+    }
+    // The run button renders ONLY on the run-capable row (the landed run
+    // body — admin-degenerate's registry posture; never a dead control).
+    expect(entries.filter((entry) => entry.runnable).map((entry) => entry.name)).toEqual(["update_mirrors"]);
+  });
+
+  it("computes Next for BOTH landed spec families from the real expressions", () => {
+    const { entries } = loadAdminMonitorCron(NOW);
+    const byName = new Map(entries.map((entry) => [entry.name, entry]));
+    // minute-step: the next 10-minute UTC boundary.
+    expect(byName.get("update_mirrors")!.next).toEqual(new Date("2026-01-01T12:10:00Z"));
+    // exact-minute-hourly: the next top-of-hour (the parser family the
+    // hourly entry's spec needed).
+    expect(byName.get("demo_sweep")!.next).toEqual(new Date("2026-01-01T13:00:00Z"));
   });
 
   it("an on-boundary now yields the NEXT step (the producer convention)", () => {
     const { entries } = loadAdminMonitorCron(new Date("2026-01-01T12:10:00Z"));
     expect(entries[0]!.next).toEqual(new Date("2026-01-01T12:20:00Z"));
+  });
+
+  it("an on-the-hour now yields the NEXT hour for the hourly family", () => {
+    const { entries } = loadAdminMonitorCron(new Date("2026-01-01T13:00:00Z"));
+    const byName = new Map(entries.map((entry) => [entry.name, entry]));
+    expect(byName.get("demo_sweep")!.next).toEqual(new Date("2026-01-01T14:00:00Z"));
+  });
+});
+
+describe("loadAdminMonitorCronRunState (the state-bearing loader — the route swap target)", () => {
+  it("an empty cron_state answers the sync loader's never-fired census exactly", async () => {
+    const stateful = await loadAdminMonitorCronRunState(env.DB, NOW);
+    expect(stateful.entries).toEqual(loadAdminMonitorCron(NOW).entries);
+  });
+
+  it("merges recorded ticks: prev/execTimes from successes, the Result triple from the last tick", async () => {
+    // The scheduled handler's exact calls: the step entry succeeded twice,
+    // then the hourly entry failed on its FIRST recorded tick.
+    await recordArmsSuccess(env.DB, armsForEntry("*/10 * * * *"), { now: NOW });
+    await recordArmsSuccess(env.DB, armsForEntry("*/10 * * * *"), { now: LATER });
+    await recordArmsFailure(env.DB, armsForEntry("0 * * * *"), new Error("DB/REPO_TASKS not bound"), { now: NOW });
+
+    const { entries } = await loadAdminMonitorCronRunState(env.DB, NOW);
+    const byName = new Map(entries.map((entry) => [entry.name, entry]));
+
+    // A completed-tick arm: prev = the last success, executions counted.
+    const mirrors = byName.get("update_mirrors")!;
+    expect(mirrors.prev).toEqual(LATER);
+    expect(mirrors.execTimes).toBe(2);
+    expect(mirrors.result).toEqual({ status: "finished", message: null, at: null });
+
+    // An error-stamped arm (never succeeded): the `-` prev, the x glyph's
+    // inputs carried.
+    const sweep = byName.get("demo_sweep")!;
+    expect(sweep.prev).toBeNull();
+    expect(sweep.execTimes).toBe(0);
+    expect(sweep.result).toEqual({
+      status: "error",
+      message: "DB/REPO_TASKS not bound",
+      at: NOW,
+    });
+    // The whole failed entry is stamped (the granularity note): every
+    // hourly arm carries the error, no hourly arm moved last_success.
+    expect(byName.get("cleanup_actions")!.result.status).toBe("error");
+    expect(byName.get("cleanup_actions")!.prev).toBeNull();
+  });
+
+  it("a success AFTER a failure replaces the error posture (the last tick decides)", async () => {
+    await recordArmsFailure(env.DB, armsForEntry("*/10 * * * *"), new Error("first tick threw"), { now: NOW });
+    await recordArmsSuccess(env.DB, armsForEntry("*/10 * * * *"), { now: LATER });
+    const { entries } = await loadAdminMonitorCronRunState(env.DB, NOW);
+    const mirrors = entries.find((entry) => entry.name === "update_mirrors")!;
+    expect(mirrors.result).toEqual({ status: "finished", message: null, at: null });
+    expect(mirrors.prev).toEqual(LATER);
+    expect(mirrors.execTimes).toBe(1);
+  });
+
+  it("renders the last-run state per arm: prev timestamp, executions, the check/x glyphs", async () => {
+    await recordArmsSuccess(env.DB, armsForEntry("*/10 * * * *"), { now: NOW });
+    await recordArmsFailure(env.DB, armsForEntry("0 * * * *"), new Error("producer probes failed"), { now: NOW });
+    const { entries } = await loadAdminMonitorCronRunState(env.DB, NOW);
+    const html = renderToString(<AdminMonitorCronPage ctx={ctx} data={{ entries }} flash={null} />);
+    // The finished arm renders the check glyph and the recorded prev.
+    expect(html).toContain(`>${formatMonitorFullTime(NOW)}</td>`);
+    expect(html).toContain('class="svg octicon-check"');
+    // The error arm renders the x glyph with the stored one-liner tooltip.
+    expect(html).toContain('data-tooltip-content="producer probes failed"');
+    expect(html).toContain('class="svg octicon-x"');
+    // Exactly ONE run button (the runnable row) among seven rows.
+    expect((html.match(/name="op" value=/g) ?? []).length).toBe(1);
   });
 });
 
@@ -404,7 +499,7 @@ describe("applyAdminMonitorCronForm (DashboardPost's task arm over the landed pr
       .run();
   }
 
-  it("the known task runs the landed producer — run = enqueue, row flips queued", async () => {
+  it("the known task runs the landed producer — run = enqueue, row flips queued, tick recorded", async () => {
     await seedDueMirror();
     const queue = recordingQueue();
     const result = await applyAdminMonitorCronForm({ ...env, MIRROR_SYNC_QUEUE: queue }, { op: "update_mirrors", from: "monitor" }, { now: NOW });
@@ -412,6 +507,10 @@ describe("applyAdminMonitorCronForm (DashboardPost's task arm over the landed pr
     expect(queue.batches).toEqual([[{ kind: "mirror-sync", repoId: "7401" }]]);
     const row = await drizzle(env.DB).select().from(repoMirrors).all();
     expect(row[0]!.syncState).toBe("queued");
+    // The manual run records ITS tick (upstream ExecTimes counts the
+    // dashboard trigger too — tasks.go:95-97) on the update_mirrors row.
+    const state = await listCronState(env.DB);
+    expect(state.get("update_mirrors")).toMatchObject({ runs: 1, lastSuccess: NOW, lastError: null });
   });
 
   it("an unknown task answers task.unknown WITHOUT running anything", async () => {
@@ -422,6 +521,8 @@ describe("applyAdminMonitorCronForm (DashboardPost's task arm over the landed pr
     expect(queue.batches).toEqual([]);
     const row = await drizzle(env.DB).select().from(repoMirrors).all();
     expect(row[0]!.syncState).toBe("idle"); // untouched
+    const state = await listCronState(env.DB);
+    expect(state.size).toBe(0); // never a tick for an unknown op
   });
 
   it("a failed binding funnels to the unknown arm (never runs)", async () => {

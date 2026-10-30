@@ -56,16 +56,35 @@
  *            external-auth store), UpdateTask (no update checker);
  *            IssueByLabel/IssueByRepository render upstream only behind the
  *            metrics settings (statistic.go:87,96) — the default-off arm.
- *   cron     the static cron registry mirrored by the landed
- *            `GET /admin/cron` (routes/admin-degenerate.ts:129-149 — itself
- *            the mirror of wrangler.jsonc `triggers.crons`; admin-degenerate
- *            exports only the route registrar, so this module mirrors the one
- *            landed task under the same standing rule: a cron added to
- *            wrangler.jsonc lands in BOTH registries in the same change). The
- *            run arm is the landed service body the API's
- *            `POST /admin/cron/{task}` serves: `enqueueDueMirrorSyncs`
- *            (services/mirror/sync.ts:847 — "run = enqueue", the
- *            admin-degenerate posture).
+ *   cron     the FULL landed arm census — `CRON_ARMS` (services/
+ *            cron-state.ts, the usability F3 listing): one row per scheduled
+ *            arm of the Worker's `scheduled` handler, mirroring
+ *            handleScheduledCron's dispatch exactly (three arms on every
+ *            10-minute step entry, four producer arms on the hourly entry;
+ *            the census block comment holds the per-arm upstream twin cites
+ *            and the two cf-gitea-extension names). The per-arm tick state —
+ *            Previous Time / Executions / Result, upstream's TaskTableRow
+ *            Prev/ExecTimes/Status triple — comes from the `cron_state`
+ *            table (migration 0044), which the scheduled handler upserts per
+ *            entry (services/cron-state.ts; upstream keeps the same state in
+ *            process memory — tasks.go TaskTableRow — a luxury no Workers
+ *            isolate has). TWO loaders serve it: `loadAdminMonitorCron(now)`
+ *            is the SYNC census render (never-fired posture for every arm —
+ *            the shape ui/index.ts's route call sites use until their
+ *            two-line swap to `loadAdminMonitorCronRunState(db, now)`, which
+ *            merges the recorded state; the swap is the disclosed
+ *            integration — ui/index.ts is outside this module's ownership).
+ *            The run arm stays the landed RUN-CAPABLE subset — exactly
+ *            admin-degenerate.ts's CRON_TASKS bodies (update_mirrors; "run =
+ *            enqueue"): the button renders only there and the other six rows
+ *            render an empty first cell (never a dead control); a manual run
+ *            records its tick too (upstream ExecTimes counts run STARTS —
+ *            tasks.go:95-97 — and RunWithUser serves both triggers).
+ *            admin-degenerate's own API registry remains the degenerate
+ *            one-task mirror of wrangler.jsonc (its module header's standing
+ *            rule binds WRANGLER ADDITIONS to both registries; the F3
+ *            listing extends the MONITOR side only — extending the API
+ *            registry + its run bodies is the api-owning wave's follow-up).
  *   queue    Cloudflare Queues expose no depth introspection and there is no
  *            in-process queue manager to enumerate — but the LANDED D1 state
  *            of the two queue-backed pipelines answers "number in queue" for
@@ -94,8 +113,9 @@
  * cron.tmpl:7-35) with the per-row `<button name="op" value="{name}"
  * title="Run">` glyph, columns Name/Schedule/Next Time/Previous
  * Time/Executions/Result, the Previous arm `-` until the first fire
- * (`{{if gt .Prev.Year 1}}`), the Result arm `—` while Status is empty, and
- * the hidden `from=monitor`. queue.tmpl reduced to the columns with landed
+ * (`{{if gt .Prev.Year 1}}`), the Result arm `—` while Status is empty and
+ * the octicon-check / octicon-x pair (tooltip = the last message) when the
+ * task HAS run (cron.tmpl:29), and the hidden `from=monitor`. queue.tmpl: reduced to the columns with landed
  * sources (Name/Type/Number in Queue — Exemplar Type and the worker counts
  * have no cf-gitea source; the per-queue Review link and manage page are not
  * rendered: no landed set-workers/remove-arms — the dead-control rule) plus
@@ -115,6 +135,19 @@
  *   flash message ("Started Task: %s" / "Unknown task: %s",
  *   admin.dashboard.task.*) re-renders the page (the no-JS hooks-page
  *   convention; upstream redirects back to monitor/cron with a flash).
+ * - The run button renders ONLY on the run-capable row (update_mirrors —
+ *   the landed run body, admin-degenerate.ts's registry posture): upstream
+ *   renders one on every row because every registered task is runnable in
+ *   its in-process scheduler; rendering ours for arms with no landed run
+ *   body would POST into the task.unknown flash — the dead-control rule.
+ *   The other six rows render an empty first cell.
+ * - The Result cell renders upstream's THREE states from the recorded tick
+ *   state: `—` while the arm never recorded (Status ""), the octicon-check
+ *   after a completed tick ("finished"), the octicon-x with the stored
+ *   one-liner as the tooltip after a failed entry ("error", cron.tmpl:29's
+ *   data-tooltip-content arm — a plain attribute here, the Fomantic tooltip
+ *   hydrates it client-side the same way). The manual run's tick rides the
+ *   same store (upstream ExecTimes counts manual runs too, tasks.go:95-97).
  * - The delivery-state breakdown segment is a cf-gitea addition (marked in
  *   the locale block) — upstream's queue table has no per-state view, but the
  *   landed log carries the states and the depth number alone hides them.
@@ -136,6 +169,14 @@
  *                                 renderAdminMonitorStatsPage
  *   GET /-/admin/monitor/cron     gate → loadAdminMonitorCron(new Date()) →
  *                                 renderAdminMonitorCronPage({flash: null})
+ *                                 (the SYNC census loader — the state-bearing
+ *                                 swap to `await loadAdminMonitorCronRunState(
+ *                                 c.env.DB, routeNow())` at both cron call
+ *                                 sites is the disclosed ui/index.ts
+ *                                 integration, outside this module's
+ *                                 ownership; until it lands the page renders
+ *                                 the full listing in the never-fired
+ *                                 posture)
  *   POST /-/admin/monitor/cron    sameOriginGuard FIRST → gate →
  *                                 parseAdminMonitorCronForm(readUrlEncodedForm)
  *                                 → applyAdminMonitorCronForm(env, form) →
@@ -160,6 +201,7 @@ import { drizzle } from "drizzle-orm/d1";
 import type { Child } from "hono/jsx";
 
 import { enqueueDueMirrorSyncs } from "../../services/mirror/sync";
+import { CRON_ARMS, listCronState, recordArmsSuccess, type CronStateRow } from "../../services/cron-state";
 import {
   commitStatuses,
   comments,
@@ -185,7 +227,7 @@ import {
 } from "../../db/schema";
 import type { UiContext } from "../ui-context";
 import { BaseLayout, Icon, renderPage } from "../shell";
-import { AdminFamilyNav } from "./admin-users";
+import { AdminEmbeddedSvg, AdminFamilyNav } from "./admin-users";
 
 // ---------------------------------------------------------------------------
 // Page chrome + copy text (component-local, the orgSettingsBlockedLocale
@@ -213,7 +255,15 @@ export const adminMonitorLocale = {
   lastResult: "Result", // "admin.monitor.last_execution_result"
   operationRun: "Run", // "admin.dashboard.operation_run" (the run button title)
   // The cron task name render (cron.tmpl:24 — `admin.dashboard.{Name}`).
+  // Upstream's locale strings verbatim (options/locale/locale_en-US.json);
+  // the two cf-gitea-extension arms (no upstream key exists) are marked.
   taskUpdateMirrors: "Update Mirrors", // "admin.dashboard.update_mirrors"
+  taskUpdatePushMirrors: "Update Push Mirrors", // cf-gitea extension (update_mirrors's push twin)
+  taskStopZombieTasks: "Stop actions zombie tasks", // "admin.dashboard.stop_zombie_tasks"
+  taskDemoSweep: "Demo Sweep", // cf-gitea extension (SPEC-0014 — the producer's own log tag)
+  taskDeleteOldAuditEvents: "Delete audit events older than the retention period", // "admin.dashboard.delete_old_audit_events"
+  taskCleanupPackages: "Clean up expired packages", // "admin.dashboard.cleanup_packages"
+  taskCleanupActions: "Clean up expired actions' resources", // "admin.dashboard.cleanup_actions"
   // The queue table headers (queue.tmpl:10-15, reduced to the sourced three).
   queueName: "Name", // "admin.monitor.queue.name"
   queueType: "Type", // "admin.monitor.queue.type"
@@ -414,33 +464,39 @@ export function renderAdminMonitorStatsPage(options: { ctx: UiContext; data: Adm
 // Cron (GET /-/admin/monitor/cron — cron.tmpl over the landed cron registry)
 // ---------------------------------------------------------------------------
 
-/** Go's zero time.Time as the cron registry's never-fired Prev/Next render
- *  (admin-degenerate.ts GO_ZERO_TIME — services/cron leaves task.Prev unset
- *  until the first fire). */
-const GO_ZERO_TIME = "0001-01-01T00:00:00Z";
-
-/** One rendered cron row — the landed registry's entry shape (the Cron
- *  struct render, modules/structs/cron.go's five fields): `prev` null = the
- *  never-fired arm (cron.tmpl:27 renders `-` while `.Prev.Year < 2`),
- *  `execTimes` 0 — the landed registry keeps no execution history (the
- *  admin-degenerate posture). */
+/** One rendered cron row — the landed arm's render inputs (the Cron struct
+ *  render, modules/structs/cron.go's five fields, PLUS the recorded tick
+ *  state upstream keeps in process memory): `prev` null = the never-fired
+ *  arm (cron.tmpl:27 renders `-` while `.Prev.Year < 2`), `execTimes` 0 =
+ *  no completed tick recorded, `result.status` "none" = the empty Status
+ *  (cron.tmpl:29's `—`). */
 export interface AdminMonitorCronEntry {
-  /** Upstream's task name (services/cron tasks_basic.go register calls). */
+  /** The arm's registry name (CRON_ARMS — upstream's task name where a
+   *  faithful twin exists; the run form's `op` value). */
   name: string;
   /** The wrangler-declared trigger expression — rendered verbatim. */
   spec: string;
-  /** The next UTC firing; null only for a spec the minute-step parser cannot
+  /** The next UTC firing; null only for a spec the parser families cannot
    *  read — the zero-time render, never a wrong time. */
   next: Date | null;
+  /** The last COMPLETED tick (cron_state.last_success); null = never. */
   prev: Date | null;
+  /** Completed ticks recorded for the arm (manual runs included). */
   execTimes: number;
+  /** The Result cell's triple (cron.tmpl:29): "none" → the em dash,
+   *  "finished" → the check glyph, "error" → the x glyph with the stored
+   *  one-liner as the tooltip. */
+  result: { status: "none" | "finished" | "error"; message: string | null; at: Date | null };
+  /** Whether the run button renders (the landed run-capable subset — the
+   *  module header's reduction; false rows render an empty first cell). */
+  runnable: boolean;
 }
 
 /**
  * The minute-step subset of cron expressions (a star-slash-N minute field
- * followed by `* * * * *`) → the step in minutes, or null for anything else
- * (admin-degenerate.ts's private parser mirrored — a future wrangler spec
- * lands in BOTH registries in the same change, the module header's rule).
+ * followed by `* * * * *`) → the step in minutes. (admin-degenerate.ts's
+ * private parser mirrored — that module's registry is still the single
+ * `update_mirrors` step spec, so its copy needs only this family.)
  */
 function minuteStepMinutes(spec: string): number | null {
   if (spec === "* * * * *") {
@@ -454,6 +510,20 @@ function minuteStepMinutes(spec: string): number | null {
   return step >= 1 ? step : null;
 }
 
+/**
+ * The exact-minute-hourly family (`M * * * *`, 0-59) → the minute. The
+ * hourly entry's landed spec (`0 * * * *`) needs it — the minute-step
+ * parser deliberately rejects it (never a wrong guess).
+ */
+function hourlyEntryMinute(spec: string): number | null {
+  const match = /^(\d{1,2}) \* \* \* \*$/.exec(spec);
+  if (match === null) {
+    return null;
+  }
+  const minute = Number.parseInt(match[1] ?? "", 10);
+  return minute >= 0 && minute <= 59 ? minute : null;
+}
+
 /** The next UTC firing of a minute-step spec after `from` (Cloudflare cron
  *  triggers fire at UTC minute boundaries; on a boundary the NEXT step is
  *  returned — admin-degenerate.ts's nextMinuteStepFire mirrored). */
@@ -465,30 +535,101 @@ function nextMinuteStepFire(stepMinutes: number, from: Date): Date {
   return next;
 }
 
-/**
- * The landed cron task registry — the mirror of admin-degenerate.ts's
- * CRON_TASKS (itself the mirror of wrangler.jsonc `triggers.crons`; that
- * module exports only its route registrar, so the render table lives here).
- * Standing rule (both module headers): a cron added to wrangler.jsonc joins
- * the API registry and THIS table under its upstream task name in the same
- * change.
- */
-const MONITOR_CRON_TASKS: Array<{ name: string; spec: string }> = [
-  { name: "update_mirrors", spec: "*/10 * * * *" },
-];
+/** The next UTC firing of an exact-minute-hourly spec after `from` (the
+ *  same boundary convention: ON the firing minute the NEXT hour returns). */
+function nextHourlyFire(minute: number, from: Date): Date {
+  const next = new Date(from.getTime());
+  next.setUTCMinutes(minute, 0, 0);
+  if (next.getTime() <= from.getTime()) {
+    next.setUTCHours(next.getUTCHours() + 1);
+  }
+  return next;
+}
 
-/** The cron table rows (the landed `GET /admin/cron` render — the API's
- *  toApiCron field mapping over the mirrored registry). */
+/** The supported families' dispatch — null renders the zero time (never a
+ *  wrong time, the parser's own posture for an unsupported future spec). */
+function nextFireForSpec(spec: string, from: Date): Date | null {
+  const step = minuteStepMinutes(spec);
+  if (step !== null) {
+    return nextMinuteStepFire(step, from);
+  }
+  const minute = hourlyEntryMinute(spec);
+  if (minute !== null) {
+    return nextHourlyFire(minute, from);
+  }
+  return null;
+}
+
+/**
+ * The run-capable subset — the arms whose POST body is landed (exactly
+ * admin-degenerate.ts's CRON_TASKS run bodies; today the pull-mirror
+ * producer: "run = enqueue"). The run button renders ONLY here; the other
+ * rows' op would answer the task.unknown flash — never a dead control.
+ * Extending run capability = extending BOTH this set and applyAdminMonitor-
+ * CronForm's accepted ops (and the API registry's run bodies) in one change.
+ */
+const RUNNABLE_CRON_ARMS: ReadonlySet<string> = new Set(["update_mirrors"]);
+
+/** The registry mirror's source — CRON_ARMS (services/cron-state.ts) is the
+ *  single census (the scheduled handler's recorder keys the same names, so
+ *  a monitor row and its tick row can never drift apart). */
+const MONITOR_CRON_TASKS = CRON_ARMS;
+
+/**
+ * The landed cron task registry render — the FULL arm census (the module
+ * header's F3 listing) in the never-fired posture: prev null, execTimes 0,
+ * result "none". The tick state rides `loadAdminMonitorCronRunState`; this
+ * sync loader is the shape ui/index.ts's route call sites use until their
+ * two-line swap (the mount record).
+ */
 export function loadAdminMonitorCron(now: Date): { entries: AdminMonitorCronEntry[] } {
   return {
-    entries: MONITOR_CRON_TASKS.map((task) => {
-      const step = minuteStepMinutes(task.spec);
+    entries: MONITOR_CRON_TASKS.map((task) => ({
+      name: task.arm,
+      spec: task.spec,
+      next: nextFireForSpec(task.spec, now),
+      prev: null,
+      execTimes: 0,
+      result: { status: "none", message: null, at: null },
+      runnable: RUNNABLE_CRON_ARMS.has(task.arm),
+    })),
+  };
+}
+
+/**
+ * The state-bearing loader (the route's swap target): the same census with
+ * the `cron_state` rows merged over it — prev/Executions from the recorded
+ * successes, the Result triple from the recorded error (a completed tick
+ * after a failed one REPLACES the error posture: status follows the LAST
+ * recorded tick, exactly upstream's single Status field). An arm without a
+ * row keeps the never-fired posture (a fresh deployment, the golden
+ * harness). One point scan of a ≤7-row table.
+ */
+export async function loadAdminMonitorCronRunState(
+  db: D1Database,
+  now: Date,
+): Promise<{ entries: AdminMonitorCronEntry[] }> {
+  const base = loadAdminMonitorCron(now);
+  const state: Map<string, CronStateRow> = await listCronState(db);
+  return {
+    entries: base.entries.map((entry) => {
+      const row = state.get(entry.name);
+      if (row === undefined) {
+        return entry;
+      }
+      // The last recorded tick decides the posture: a failure stamps the
+      // error pair WITHOUT moving last_success (the store's granularity
+      // note), so lastErrorUnix > lastSuccess ⇔ the error IS the last tick.
+      const failedLast = row.lastErrorUnix !== null && (row.lastSuccess === null || row.lastErrorUnix > row.lastSuccess);
       return {
-        name: task.name,
-        spec: task.spec,
-        next: step === null ? new Date(GO_ZERO_TIME) : nextMinuteStepFire(step, now),
-        prev: null,
-        execTimes: 0,
+        ...entry,
+        prev: row.lastSuccess,
+        execTimes: row.runs,
+        result: failedLast
+          ? { status: "error", message: row.lastError, at: row.lastErrorUnix }
+          : row.lastSuccess !== null
+            ? { status: "finished", message: null, at: null }
+            : { status: "none", message: null, at: null },
       };
     }),
   };
@@ -498,7 +639,24 @@ export function loadAdminMonitorCron(now: Date): { entries: AdminMonitorCronEntr
  *  locale key; unknown names fall back to the raw op, DashboardPost's
  *  task.unknown arm carries the raw value too). */
 function taskDisplayName(name: string): string {
-  return name === "update_mirrors" ? adminMonitorLocale.taskUpdateMirrors : name;
+  switch (name) {
+    case "update_mirrors":
+      return adminMonitorLocale.taskUpdateMirrors;
+    case "update_push_mirrors":
+      return adminMonitorLocale.taskUpdatePushMirrors;
+    case "stop_zombie_tasks":
+      return adminMonitorLocale.taskStopZombieTasks;
+    case "demo_sweep":
+      return adminMonitorLocale.taskDemoSweep;
+    case "delete_old_audit_events":
+      return adminMonitorLocale.taskDeleteOldAuditEvents;
+    case "cleanup_packages":
+      return adminMonitorLocale.taskCleanupPackages;
+    case "cleanup_actions":
+      return adminMonitorLocale.taskCleanupActions;
+    default:
+      return name;
+  }
 }
 
 /** Upstream `DateUtils.FullTime` — "Jan 01, 2006 20:33:44" (util_date.go:33),
@@ -536,16 +694,35 @@ export type AdminMonitorCronResult =
  * task.started flash; an unknown task answers task.unknown WITHOUT running
  * anything (upstream's flash-error arm). A failed binding (`op` absent) is
  * the unknown arm's funnel (the binding-failure convention).
+ *
+ * The manual run RECORDS ITS TICK (cron_state, the update_mirrors row):
+ * upstream's ExecTimes counts run STARTS on the shared RunWithUser path —
+ * the dashboard trigger included (tasks.go:95-97) — and the recorded
+ * success clears any standing error, so the monitor's row reflects a
+ * human-triggered run exactly like a scheduled one. The recording is
+ * log-and-continue: a failed tick write never fails the run's flash (the
+ * enqueue already happened; the scheduled handler's own tick will refresh
+ * the row on the next entry).
  */
 export async function applyAdminMonitorCronForm(
   env: Env,
   form: AdminMonitorCronForm,
   options: { now?: Date } = {},
 ): Promise<AdminMonitorCronResult> {
-  if (form.op === null || form.op !== "update_mirrors") {
+  // The run-capable gate (RUNNABLE_CRON_ARMS — the landed run bodies), NOT
+  // census membership: a listed-but-unrunnable arm must answer task.unknown
+  // exactly like an unknown op (upstream's flash-error arm), never run the
+  // wrong body.
+  if (form.op === null || !RUNNABLE_CRON_ARMS.has(form.op)) {
     return { outcome: "invalid", message: adminMonitorLocale.taskUnknown.replace("%s", form.op ?? "") };
   }
   await enqueueDueMirrorSyncs(env, { now: options.now });
+  const arm = CRON_ARMS.find((entry) => entry.arm === form.op);
+  if (arm !== undefined) {
+    await recordArmsSuccess(env.DB, [arm], options).catch((recordError: unknown) => {
+      console.error("[cron-state] manual run tick not recorded", recordError);
+    });
+  }
   return { outcome: "applied", message: adminMonitorLocale.taskStarted.replace("%s", taskDisplayName(form.op)) };
 }
 
@@ -580,16 +757,19 @@ export function AdminMonitorCronPage(props: {
               {props.data.entries.map((entry) => (
                 <tr>
                   <td>
-                    {/* The run button (cron.tmpl:23). octicon-triangle-right
-                        is outside the generated icon allowlist — octicon-clock
-                        is the documented stand-in (the feeds-glyph convention;
-                        a later allowlist extension swaps it per this one-line
-                        site). NO other per-row controls: upstream's Result
-                        glyph pair (cron.tmpl:29) renders only for a non-empty
-                        Status, which the landed registry never sets. */}
-                    <button type="submit" class="ui primary button" name="op" value={entry.name} title={adminMonitorLocale.operationRun}>
-                      <Icon name="octicon-clock" />
-                    </button>
+                    {/* The run button (cron.tmpl:23) — ONLY on the
+                        run-capable row (the module header's reduction: a
+                        button for a bodyless arm would POST into
+                        task.unknown — the dead-control rule); the other
+                        rows render the empty first cell. octicon-triangle-
+                        right is outside the generated icon allowlist —
+                        octicon-clock is the documented stand-in (the
+                        feeds-glyph convention). */}
+                    {entry.runnable ? (
+                      <button type="submit" class="ui primary button" name="op" value={entry.name} title={adminMonitorLocale.operationRun}>
+                        <Icon name="octicon-clock" />
+                      </button>
+                    ) : null}
                   </td>
                   <td>{taskDisplayName(entry.name)}</td>
                   <td>{entry.spec}</td>
@@ -597,8 +777,22 @@ export function AdminMonitorCronPage(props: {
                   {/* cron.tmpl:27 — `-` while Prev.Year < 2 (never fired). */}
                   <td>{entry.prev === null ? "-" : formatMonitorFullTime(entry.prev)}</td>
                   <td>{entry.execTimes}</td>
-                  {/* cron.tmpl:29 — the em dash while Status is empty. */}
-                  <td>—</td>
+                  {/* cron.tmpl:29 — the em dash while Status is empty;
+                      otherwise the check (finished) / x (error, tooltip =
+                      the stored one-liner) glyph pair. octicon-check is
+                      allowlisted; octicon-x rides the AdminEmbeddedSvg
+                      arm (the admin-emails check/x cell precedent). */}
+                  {entry.result.status === "none" ? (
+                    <td>—</td>
+                  ) : entry.result.status === "finished" ? (
+                    <td>
+                      <Icon name="octicon-check" />
+                    </td>
+                  ) : (
+                    <td data-tooltip-content={entry.result.message ?? ""}>
+                      <AdminEmbeddedSvg name="octicon-x" />
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>
