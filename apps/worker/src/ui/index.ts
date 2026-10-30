@@ -1595,6 +1595,7 @@ import {
   parseSitemapIdx,
   sitemapXmlResponse,
 } from "./pages/sitemap";
+import { apiSwaggerPage, swaggerV1Json } from "./pages/api-swagger";
 import {
   loadRepoSearchAux,
   loadTopicSearchAux,
@@ -14391,6 +14392,15 @@ uiRouter.get("/explore/organizations", (c) => exploreOrganizationsPage(c));
 // The SPEC-0019 M2 code search page (upstream web.go:558's literal; the
 // exact 3-segment literal beside its siblings — the navbar's fourth tab).
 uiRouter.get("/explore/code", (c) => exploreCodePage(c));
+// The swagger viewer (upstream web.go:303-305's /api/swagger — session
+// middleware but NO reqSignIn, public) + the two spec JSON arms
+// (web.go:1794-1797, bare). STATIC block: a later static LOSES to the
+// dynamic /:owner/:repo pair below under this pin's RegExpRouter, and
+// /api/swagger would otherwise parse as owner `api`. The page module's
+// doc carries the full mount record (findings-links A2's fix).
+uiRouter.get("/api/swagger", (c) => apiSwaggerPage(c));
+uiRouter.get("/swagger.v1.json", () => swaggerV1Json());
+uiRouter.get("/openapi3.v1.json", () => swaggerV1Json());
 // The ORG-scoped inbox families (parseUiRoute claims exactly these 4-/5-
 // segment shapes — upstream web.go:986-991's `/org/{org}` group). Registered
 // in the STATIC block, physically before the dynamic /:owner/:repo pairs:
