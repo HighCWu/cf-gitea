@@ -10,9 +10,10 @@
  * the `created_unix DESC, id DESC` ordering, the latest-release contract
  * (no drafts/prereleases/tag-only rows), the case-insensitive tag lookup,
  * the PATCH set-fields rule + publish stamp, the DELETE cascades (assets
- * included), the writer gate (403), the pin's NO-mustNotBeArchived
- * registration (a release write on an archived repo still answers 200-family,
- * unlike the topics family), and the `release` webhook emissions (published/
+ * included), the writer gate (403), the archived-repo arm (NO route-level
+ * mustNotBeArchived — the refusal is createTag's in-service gate answering
+ * the unmapped 500, create AND edit, drafts included; 409 outranks it), and
+ * the `release` webhook emissions (published/
  * updated/deleted through emitWebhookDeliveries, the upstream `!IsDraft`
  * gate: drafts emit nothing).
  *
@@ -338,14 +339,47 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
     expect((await res.json<Record<string, unknown>>()).target_commitish).toBe("main");
   });
 
-  it("does NOT 423 on an archived repo (the pin registers no mustNotBeArchived here)", async () => {
+  it("500s an archived repo (createTag's MustNotBeArchived — no route gate, the unmapped APIErrorInternal answer)", async () => {
+    // The release subtree registers NO route-level mustNotBeArchived
+    // (api.go:1408-1429), so the 423 middleware never fires; the refusal is
+    // createTag's in-service gate (services/release/release.go:75-78), which
+    // the create handler maps to ctx.APIErrorInternal → 500
+    // (routers/api/v1/repo/release.go:285-287).
     await drizzle(env.DB).update(repositories).set({ isArchived: true }).where(eq(repositories.id, "7301"));
     const res = await makeApp()(`${REPO_PATH}/releases`, {
       method: "POST",
       headers: jsonAuth,
       body: JSON.stringify({ tag_name: "v4.0.0" }),
     });
-    expect(res.status).toBe(201);
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ message: "internal server error", url: ERROR_URL });
+    // The abort preceded the tag write AND the row write (createTag's gate is
+    // its first act after LoadAttributes).
+    expect((await makeApp()(`${REPO_PATH}/tags/v4.0.0`)).status).toBe(404);
+    expect(await drizzle(env.DB).select().from(releases).where(eq(releases.tagName, "v4.0.0")).all()).toEqual([]);
+  });
+
+  it("500s an archived repo for a DRAFT create too (createTag's gate precedes the !IsDraft arm)", async () => {
+    await drizzle(env.DB).update(repositories).set({ isArchived: true }).where(eq(repositories.id, "7301"));
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "v4.0.0", draft: true }),
+    });
+    expect(res.status).toBe(500);
+    expect(await drizzle(env.DB).select().from(releases).where(eq(releases.tagName, "v4.0.0")).all()).toEqual([]);
+  });
+
+  it("409 outranks the archived 500 (upstream's IsReleaseExist precedes createTag)", async () => {
+    await seedRelease({ tag: "v1.0.0" });
+    await drizzle(env.DB).update(repositories).set({ isArchived: true }).where(eq(repositories.id, "7301"));
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "v1.0.0" }),
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ message: "release tag already exist [tag_name: v1.0.0]", url: ERROR_URL });
   });
 
   it("401s an anonymous caller", async () => {
@@ -754,9 +788,9 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
   // the fill (:148-158), a tag_name rename lands the NEW ref and leaves the
   // OLD one in git (no `tag -d` outside DeleteReleaseByID, release.go:388),
   // a body-only published edit re-fills through the ride arm, and the
-  // untaggable arms (unresolvable target, protected tag) answer upstream's
-  // unmapped 500 (ctx.APIErrorInternal, release.go:379-382) with the row
-  // untouched.
+  // untaggable arms (the archived gate, unresolvable target, protected tag)
+  // answer upstream's unmapped 500 (ctx.APIErrorInternal, release.go:379-382)
+  // with the row untouched.
   // -----------------------------------------------------------------------
 
   it("publishing a draft stamps published_at AND lands the tag with the fill (the D1-only publish closes: release.go:269 + :148-158)", async () => {
@@ -871,6 +905,32 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
     } finally {
       await drizzle(env.DB).delete(protectedTags).where(eq(protectedTags.repoId, "7301"));
     }
+  });
+
+  it("an archived repo 500s the edit too (UpdateRelease re-runs createTag, whose MustNotBeArchived gate is unmapped here)", async () => {
+    await drizzle(env.DB).update(repositories).set({ isArchived: true }).where(eq(repositories.id, "7301"));
+    const res = await makeApp()(`${REPO_PATH}/releases/${releaseId}`, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ name: "Archived Rename" }),
+    });
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ message: "internal server error", url: ERROR_URL });
+    expect((await releaseRow("v1")).title).toBe("One"); // the rename never landed
+  });
+
+  it("an archived repo 500s the publish-from-draft edit before the tag arm (createTag's gate precedes !IsDraft)", async () => {
+    await drizzle(env.DB).update(repositories).set({ isArchived: true }).where(eq(repositories.id, "7301"));
+    const res = await makeApp()(`${REPO_PATH}/releases/${draftId}`, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ draft: false }),
+    });
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ message: "internal server error", url: ERROR_URL });
+    const row = await releaseRow("v2-draft");
+    expect(row.isDraft).toBe(true);
+    expect(row.publishedUnix).toBe(0); // the publish never landed
   });
 
   it("404s the PATCH on a missing/tag-only release", async () => {

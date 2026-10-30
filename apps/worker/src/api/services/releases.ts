@@ -379,11 +379,14 @@ async function readTaggedCommitFill(
  * fill then applies): editRelease below lands the missing tag and fills
  * sha1/created/num_commits at the publish-from-draft moment.
  *
- * NOT replicated: createTag's MustNotBeArchived arm (release.go:74-77) —
- * upstream's release handler maps none of its outcomes (an archived-repo
- * release create dies as an internal 500 there), and the landed release
- * surface deliberately registers no mustNotBeArchived (the pinned 201 on
- * archived repos); the tag is created.
+ * The archived arm (createTag's MustNotBeArchived, services/release/
+ * release.go:75-78 — retired divergence, the v1.3.2 board's P2-5): the gate
+ * sits INSIDE createTag, after the duplicate 409 and before the !IsDraft
+ * gate; the release subtree registers NO route-level mustNotBeArchived
+ * (api.go:1408-1429 — only mustEnableUnit(TypeReleases)), so the middleware's
+ * 423 never fires here and the failure surfaces as the handlers' unmapped
+ * ctx.APIErrorInternal → 500 (routers/api/v1/repo/release.go:285-287 create,
+ * :379-382 edit). Replicated: untyped throw → the house 500.
  */
 export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInput): Promise<CreateReleaseWithGitTagResult> {
   const { pair } = input;
@@ -396,6 +399,20 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
     .get();
   if (existing !== undefined && !existing.isTag) {
     throw new ReleaseAlreadyExistError(input.tagName);
+  }
+
+  // createTag's MustNotBeArchived arm (services/release/release.go:75-78),
+  // in createTag's position: after the duplicate check (upstream's
+  // IsReleaseExist 409 precedes createTag, release.go:176-186), before the
+  // !IsDraft gate — the refusal is UNCONDITIONAL (drafts die here too). Both
+  // upstream surfaces reach it (CreateRelease release.go:187 and the
+  // tag-record conversion's UpdateRelease release.go:269) and neither maps
+  // the outcome: ErrRepoIsArchived falls to ctx.APIErrorInternal → 500
+  // (routers/api/v1/repo/release.go:285-287) — untyped here, so the error
+  // handler renders the house 500. Message mirrors ErrRepoIsArchived.Error()
+  // (LogString + " is archived", models/repo/repo.go:63,272-277); wire-invisible.
+  if (pair.repo.isArchived) {
+    throw new Error(`<Repository ${repoId}:${pair.owner.username}/${pair.repo.slug}> is archived`);
   }
 
   let tagCreated = false;
@@ -518,8 +535,11 @@ export interface EditReleaseResult {
  * same service with its own unconditional Title/Note assignments):
  *
  *   1. EVERY edit re-runs createTag (release.go:269) with an EMPTY message —
- *      so an edit-created tag is always LIGHTWEIGHT (release.go:119). For a
- *      post-edit DRAFT nothing touches git (createTag's else arm :166-168
+ *      so an edit-created tag is always LIGHTWEIGHT (release.go:119). The
+ *      re-run's MustNotBeArchived gate (release.go:75-78, right after
+ *      LoadAttributes) fires first, so an edit on an ARCHIVED repo 500s
+ *      before any tag work, draft or published alike. For a post-edit DRAFT
+ *      nothing touches git (createTag's else arm :166-168
  *      only re-stamps created_unix = now — a re-edited draft rises in the
  *      created_unix DESC list). For a PUBLISHED post-edit state:
  *        - tag exists → RIDE it, no write, no error (release.go:83 IsTagExist);
@@ -571,6 +591,17 @@ export async function editRelease(input: EditReleaseTagContext & {
   const target = patch.target ?? row.target;
   const isDraft = patch.isDraft ?? row.isDraft;
   const nowSec = Math.floor(patch.now.getTime() / 1000);
+
+  // Step 0 — createTag's MustNotBeArchived arm (services/release/release.go:
+  // 75-78): UpdateRelease re-runs createTag UNCONDITIONALLY (release.go:269 —
+  // draft states included), so an edit on an archived repo dies before the
+  // tag arm for every post-edit state. Upstream's EditRelease maps none of
+  // UpdateRelease's outcomes (ctx.APIErrorInternal → 500, routers/api/v1/
+  // repo/release.go:379-382) — untyped here, the house 500 (message mirrors
+  // ErrRepoIsArchived.Error(), wire-invisible).
+  if (pair.repo.isArchived) {
+    throw new Error(`<Repository ${pair.repo.id}:${pair.owner.username}/${pair.repo.slug}> is archived`);
+  }
 
   // Step 1 — the tag arm (createTag's !IsDraft gate, release.go:78).
   let tagCreated = false;

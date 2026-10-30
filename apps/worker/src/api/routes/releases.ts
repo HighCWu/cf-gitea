@@ -58,8 +58,14 @@ import { emitRefWebhook, zeroCommitPushPayload } from "../services/tags";
  *   - every route of the family: 412 when the stored has_releases flag is
  *     false (upstream mustEnableUnit — the flag itself is only settable via
  *     repoEdit's has_releases);
- *   - POST: 423 is NOT emitted — the vendored pin registers NO
- *     mustNotBeArchived on release writes, unlike topics/contents.
+ *   - POST/PATCH: 500 on an ARCHIVED repo — the release subtree registers NO
+ *     route-level mustNotBeArchived (api.go:1408-1429, unlike topics/
+ *     contents), so the 423 middleware never fires; the refusal is createTag's
+ *     in-service MustNotBeArchived arm (services/release/release.go:75-78,
+ *     reached by both CreateRelease release.go:187 and UpdateRelease
+ *     release.go:269), which neither handler maps — ctx.APIErrorInternal →
+ *     500 (release.go:285-287 / :379-382). Upstream's own vendored contract
+ *     declares no 500 either; untyped here, the house 500 body.
  *
  * Engine boundary (the N2 wave + the UpdateRelease tag wave): creating AND
  * editing a release land the git tag through the shared tag-store service
@@ -599,10 +605,11 @@ export function registerReleaseRoutes(
       // release_service.UpdateRelease re-runs createTag (the edit's tag arm:
       // a publish-from-draft lands the missing tag, a rename lands the new
       // ref, every published edit re-fills sha1/created/num_commits). The
-      // tag-arm failures (protected tag, unresolvable target, unreadable
-      // commit) propagate as untyped errors → the handler's 500
-      // "internal server error" — upstream EditRelease maps NONE of
-      // UpdateRelease's outcomes (ctx.APIErrorInternal, release.go:379-382).
+      // tag-arm failures (the archived gate, protected tag, unresolvable
+      // target, unreadable commit) propagate as untyped errors → the
+      // handler's 500 "internal server error" — upstream EditRelease maps
+      // NONE of UpdateRelease's outcomes (ctx.APIErrorInternal,
+      // release.go:379-382).
       const updated = await editRelease({
         env: c.env,
         d1: c.env.DB,

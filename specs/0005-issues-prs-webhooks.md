@@ -158,14 +158,21 @@ Citations: `gitea/models/repo/release.go`, `models/repo/attachment.go`,
   `target_commitish` → the default branch; a `tag_message` creates the ANNOTATED
   tag object (release.go:110-121). A created tag fires the tags-API's byte-identical
   zero-commit `push` + `create` ref-webhook pair (upstream createTag's PushCommits +
-  CreateRef, release.go:125-148). Kept as the engine tail: `sha1`/`num_commits`
-  stay unwritten and the tag is dated by the row (upstream fills them from the
-  tagged commit, release.go:150-157); the EDIT path's tag arm (upstream
-  UpdateRelease → createTag on the draft→publish flip / tag-record conversion,
-  release.go:262) and DELETE's `delTag` arm remain D1-only. createTag's
-  MustNotBeArchived arm is deliberately not replicated: upstream's release handler
-  maps none of its outcomes (an archived-repo create dies as an internal 500
-  there), and the landed release surface registers no mustNotBeArchived.
+  CreateRef, release.go:125-148). The fill (`sha1`/`num_commits`/the commit-dated
+  `created_unix`, release.go:150-157) and the EDIT path's tag arm (upstream
+  UpdateRelease → createTag, release.go:262/269) LANDED with the UpdateRelease tag
+  wave; only DELETE's `delTag` arm remains D1-only (the API passes `delTag=false`).
+  createTag's
+  MustNotBeArchived arm IS replicated (as-built, the v1.3.2 board's P2-5,
+  2026-10-31): the release subtree registers NO route-level mustNotBeArchived
+  (`api.go:1408–1429` — only `mustEnableUnit(TypeReleases)`, so the middleware's
+  423 never fires here), and the refusal is the in-service gate at
+  `services/release/release.go:75–78`, reached by BOTH surfaces
+  (CreateRelease `release.go:187`, UpdateRelease `release.go:269`) AFTER the
+  duplicate 409 and BEFORE the `!IsDraft` gate (drafts included); neither
+  handler maps `ErrRepoIsArchived`, so it answers `ctx.APIErrorInternal` →
+  bare **500** (`routers/api/v1/repo/release.go:285–287` create, `:379–382`
+  edit) — our untyped throw → the house 500 body (the ef2c049 convention).
 - **Drafts/pre-releases**: `is_draft` rows are hidden from the public list and from
   `GET /releases/latest` (`GetLatestReleaseByRepoID` filters
   `is_draft=false AND is_prerelease=false AND is_tag=false`,
@@ -673,7 +680,7 @@ status create; repo create/delete/rename/fork (repository events).
 | 4.11 | **Release/tag divergence** | Creating a release for an existing tag attaches to it (upstream reads the sha from the tag; as-built `sha1` stays null — the engine tail); `409` when the repo already has a release row for the tag (upstream `ErrReleaseAlreadyExist`). A fresh `tag_name` creates the git tag from `target_commitish` via the shared tag-store service (§2.3 as-built note). Deleting a release keeps the tag; deleting a tag-only record (`is_tag`) deletes the tag via the engine ref CAS. |
 | 4.12 | **Issue delete cascade** | One D1 batch: comments (incl. xref rows where `ref_issue_id` or `dependent_issue_id` points here), `issue_labels`, `reactions`, `issue_subscriptions`, `issue_pins`, `pull_requests` (+ RepoDO `removeRef refs/pull/N/head` for PRs, `waitUntil`), status rows untouched (they are sha-scoped). Counter rows are *not* rewound. |
 | 4.13 | **Repo delete** | Webhook rows + deliveries die with the repo's D1 purge (SPEC-0003 §2.5); in-flight Queue messages hit missing rows and ack as `skipped`; R2 `release-assets/<release_id>/` keys are covered by the `repos/<storage_key>/` prefix purge — hence assets live **under** the repo prefix. |
-| 4.14 | **Archived repo** | Every mutation in this SPEC's surface → 423 (SPEC-0004 §4); includes issue create/comment/label ops, PR create/merge, release edits, webhook CRUD, `hooks/{id}/tests`. |
+| 4.14 | **Archived repo** | Every mutation in this SPEC's surface → 423 (SPEC-0004 §4); includes issue create/comment/label ops, PR create/merge, webhook CRUD, `hooks/{id}/tests`. EXCEPTION — release create/edit → **500** (upstream gates them INSIDE `createTag`, `services/release/release.go:75–78`, not with the 423 middleware; §2.3). |
 | 4.15 | **Issues disabled (`has_issues=false`)** | Issue/label/milestone routes → 412; PR routes stay live (external-tracker pattern, SPEC-0004 §4). |
 | 4.16 | **Payload size limits** | Webhook payload stored in full in D1 (`payload_content` text); a push payload is bounded by the 5-commit cap (§2.5) + `PayloadCommit` shape; issue/comment `content` capped by API limits (mirroring upstream LONGTEXT reality — enforce 16 MiB request-body cap at the router). |
 
