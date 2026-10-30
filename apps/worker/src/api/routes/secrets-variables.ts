@@ -23,40 +23,58 @@ import {
   createVariableRow,
   deleteSecretByName,
   deleteVariableRow,
+  findRunnerInContext,
   getVariableRow,
+  listRunnerRows,
   listSecretRows,
   listVariableRows,
   ownerScope,
   repoScope,
+  RUNNER_FOREIGN_MESSAGE,
+  runnerMissMessage,
   secretNotFoundMessage,
+  setRunnerDisabled,
+  toApiRunner,
   toApiSecret,
   toApiVariable,
   updateVariableRow,
   variableNotFoundMessage,
 } from "../services/secrets-variables";
+import { deleteRunner, getOrCreateActiveRunnerToken } from "../../services/actions/model";
 
 /**
- * The actions secrets/variables families (the inventory's
+ * The actions secrets/variables/runners families (the inventory's
  * `wave-api-secrets-variables` batch — 23 frozen operations over migration
  * 0021's `secrets` + `action_variables` tables, storage in
- * services/secrets-variables.ts). This is the only actions-family surface
- * that works without the actions runtime (SPEC-0012 stays gated): CI/tooling
- * reads and writes the KV stores, no runner involved. The three scopes share
- * ONE wire shape and ONE service — only the auth gates and the id-scope of
- * the storage reads differ:
+ * services/secrets-variables.ts — extended by P1-7 with the 15
+ * runner-management operations over the landed `action_runners` +
+ * `action_runner_tokens` control-plane store, SPEC-0012 §2.8's runners
+ * family: routers/api/v1/shared/runners.go). This is the only actions-family
+ * surface that works without a live actions runtime: secrets/variables are
+ * pure KV stores; the runner ops manage REGISTRATION and REGISTRY state (the
+ * registration token the runner protocol consumes, the registry CRUD the UI
+ * settings pages render) — none of them polls or claims tasks. The three
+ * scopes share ONE wire shape and ONE service — only the auth gates and the
+ * id-scope of the storage reads differ:
  *
- *   - repo (8): repoListActionsSecrets / updateRepoSecret / deleteRepoSecret /
- *     getRepoVariablesList / getRepoVariable / createRepoVariable /
- *     updateRepoVariable / deleteRepoVariable — the `reqToken(), reqOwner()`
- *     group (routers/api/v1/api.go:1253 addActionsRoutes → 971-985);
- *   - org (8): orgListActionsSecrets / updateOrgSecret / deleteOrgSecret /
+ *   - repo (8 + 5): repoListActionsSecrets / updateRepoSecret /
+ *     deleteRepoSecret / getRepoVariablesList / getRepoVariable /
+ *     createRepoVariable / updateRepoVariable / deleteRepoVariable +
+ *     getRepoRunners / repoCreateRunnerRegistrationToken / getRepoRunner /
+ *     deleteRepoRunner / updateRepoRunner — the `reqToken(), reqOwner()`
+ *     group (routers/api/v1/api.go:1253 addActionsRoutes → 971-990);
+ *   - org (8 + 5): orgListActionsSecrets / updateOrgSecret / deleteOrgSecret /
  *     getOrgVariablesList / getOrgVariable / createOrgVariable /
- *     updateOrgVariable / deleteOrgVariable — `reqToken(), reqOrgOwnership()`
+ *     updateOrgVariable / deleteOrgVariable + getOrgRunners /
+ *     orgCreateRunnerRegistrationToken / getOrgRunner / deleteOrgRunner /
+ *     updateOrgRunner — `reqToken(), reqOrgOwnership()`
  *     (api.go:1738-1742; the landed orgs.ts guard trio);
- *   - user (7): updateUserSecret / deleteUserSecret / getUserVariablesList /
- *     getUserVariable / createUserVariable / updateUserVariable /
- *     deleteUserVariable — the `/user` group's `reqToken()` (api.go:1093,
- *     1113-1127): the doer IS the owner, no further gate.
+ *   - user (7 + 5): updateUserSecret / deleteUserSecret /
+ *     getUserVariablesList / getUserVariable / createUserVariable /
+ *     updateUserVariable / deleteUserVariable + getUserRunners /
+ *     userCreateRunnerRegistrationToken / getUserRunner / deleteUserRunner /
+ *     updateUserRunner — the `/user` group's `reqToken()` (api.go:1093,
+ *     1113-1133): the doer IS the owner, no further gate.
  *
  * REPO GATE PRECISION — upstream's arm is `reqOwner()`, NOT `reqAdmin()`
  * (api.go:354-361): Permission.IsOwner() is `AccessMode >= AccessModeOwner`
@@ -83,11 +101,35 @@ import {
  *   - org arm:    403 (non-owner member/outsider — reqOrgOwnership);
  *   - body arms:  422 (the Go binder's Required fields — "Data: Required" /
  *                 "Value: Required", api.go:841-844's `<Field>: <error>`
- *                 rendering; the vendored contract declares no 422 here).
+ *                 rendering; the vendored contract declares no 422 here —
+ *                 EXCEPT the runner PATCH, whose contract DOES declare the
+ *                 422: shared/runners.go:130-133's own `Disabled == nil`
+ *                 check answers "[Disabled]: Required").
+ *
+ * RUNNER DECLARED SETS (uniform across the three scopes — the shared
+ * handlers): list {200,400,404} (+ the `disabled` query filter —
+ * FormOptionalBool, base_form.go:71-79: absent = no filter, an unparsable
+ * value parses as false); registration-token {200}; get {200,400,404};
+ * delete {204,400,404}; update {200,400,404,422}. The RUNTIME-ONLY codes:
+ *   - 401 (reqToken) and the scope 403s — the same three gates as above;
+ *   - the declared 400s have no read path here either (the disabled filter
+ *     cannot 400; PathParamInt64's non-numeric runner_id parses to 0 and
+ *     falls into the 404 miss — services/context/base_path.go:35-38).
+ *
+ * RUNNER ERROR MESSAGES — a runner miss 404s "runner with id N: resource
+ * does not exist" (GetRunnerByID's wrapped not-exist, runner.go:336, rendered
+ * whole by ErrorUnwrapForUser); a runner outside the route's scope (a repo
+ * id fetched on the org route, a global row fetched anywhere non-admin)
+ * 404s "No permission to access this runner" (EditableInContext's
+ * APIErrorNotFound, shared/runners.go:80). Registration-token 200s
+ * {"token": …} — the raw token (GetOrCreateActiveRunnerToken reuses the
+ * scope's active token until a reset, runner_token.go:127-134).
  *
  * EMPTY-BODY ARMS — every mutation answers a bare status (ctx.Status), no
  * body, exactly like upstream: secret PUT 201/204, secret DELETE 204,
- * variable create 201, variable update 204, variable delete 204.
+ * variable create 201, variable update 204, variable delete 204, runner
+ * DELETE 204 (the runner PATCH and the token POST carry JSON bodies like
+ * upstream's ctx.JSON).
  *
  * ERROR MESSAGES (APIErrorAuto → ErrorUnwrapForUser, the err.Error() text):
  *   - secret miss: ErrSecretNotFound{} constructed with the EMPTY Name field
@@ -150,6 +192,47 @@ const updateVariableOptionSchema = z.object({
   description: z.string().optional().openapi({ description: "Description of the variable to update" }),
 });
 
+/** `#/definitions/ActionRunnerLabel` (structs/repo_actions.go:225-229) —
+ *  convert.ToActionRunner renders every agent label as type "custom" with
+ *  the slice index as id (convert.go:800-808). */
+const actionRunnerLabelSchema = z.object({
+  id: z.number().int().openapi({ format: "int64", description: "the label's slice index" }),
+  name: z.string().openapi({ description: "the label's name" }),
+  type: z.string().openapi({ description: "the label's type" }),
+});
+
+/** `#/definitions/ActionRunner` (structs/repo_actions.go:232-241) —
+ *  `status` is the coarse "online"/"offline" string, `busy` the fine ACTIVE
+ *  rank (convert.go:798-814). */
+const actionRunnerSchema = z.object({
+  id: z.number().int().openapi({ format: "int64" }),
+  name: z.string(),
+  status: z.string().openapi({ description: "online or offline" }),
+  busy: z.boolean(),
+  disabled: z.boolean(),
+  ephemeral: z.boolean(),
+  labels: z.array(actionRunnerLabelSchema),
+});
+
+/** `#/definitions/ActionRunnersResponse` (structs/repo_actions.go:252-255). */
+const actionRunnersResponseSchema = z.object({
+  runners: z.array(actionRunnerSchema),
+  total_count: z.number().int().openapi({ format: "int64" }),
+});
+
+/** The registration-token body (shared/runners.go:19-23) — the Go struct
+ *  serializes as {"token": …}. */
+const registrationTokenSchema = z.object({
+  token: z.string().openapi({ description: "the registration token" }),
+});
+
+/** `#/definitions/EditActionRunnerOption` (structs/repo_actions.go:244-249) —
+ *  the pointer field is NOT binder-Required (the bind succeeds on a missing
+ *  field); shared/runners.go:130-133's own nil check answers the 422. */
+const editActionRunnerOptionSchema = z.object({
+  disabled: z.boolean().optional().openapi({ description: "Disable the runner" }),
+});
+
 // ---------------------------------------------------------------------------
 // Shared response/param fragments.
 // ---------------------------------------------------------------------------
@@ -187,6 +270,40 @@ const secretNameParams = {
 const variableNameParams = {
   variablename: z.string().min(1).openapi({ description: "name of the variable" }),
 } as const;
+
+const runnerIdParams = {
+  runner_id: z.string().min(1).openapi({ type: "integer", format: "int64", description: "id of the runner" }),
+} as const;
+
+/** The runner list's `disabled` filter — the contract types it boolean; the
+ *  wire is a query STRING parsed with FormOptionalBool's semantics
+ *  (base_form.go:71-79). */
+const runnerListQuery = {
+  query: z.object({
+    page: z.string().optional().openapi({ type: "integer", description: "page number of results to return (1-based)" }),
+    limit: z.string().optional().openapi({ type: "integer", description: "page size of results" }),
+    disabled: z.string().optional().openapi({ type: "boolean", description: "filter by disabled status (true or false)" }),
+  }),
+} as const;
+
+/** PathParamInt64 (services/context/base_path.go:35-38) — a strict parse
+ *  whose failure arm is 0, so a non-numeric runner_id becomes the 404 miss
+ *  for id 0, exactly upstream. */
+function pathParamInt64(raw: string): number {
+  return /^-?\d+$/.test(raw) ? Number.parseInt(raw, 10) : 0;
+}
+
+/** FormOptionalBool (services/context/base_form.go:71-79): absent/empty =
+ *  no filter; strconv.ParseBool's true spellings ("1","t","T","true",
+ *  "TRUE","True") or case-insensitive "on" = true; everything else parses
+ *  as false (the ignored error arm). */
+function formOptionalBool(url: URL, key: string): boolean | null {
+  const raw = url.searchParams.get(key);
+  if (raw === null || raw === "") {
+    return null;
+  }
+  return /^(1|t|T|true|TRUE|True)$/.test(raw) || raw.toLowerCase() === "on";
+}
 
 // ---------------------------------------------------------------------------
 // Gates — the repo reqOwner seam and the org guard trio.
@@ -1106,6 +1223,591 @@ export function registerSecretsVariablesRoutes(app: OpenAPIHono<ApiEnv>, require
         throw new ApiError(404, variableNotFoundMessage());
       }
       return c.body(null, 204);
+    },
+  );
+
+  // =========================================================================
+  // RUNNERS — the registration/management family (routers/api/v1/shared/
+  // runners.go via addActionsRoutes' /runners group, api.go:984-990). The
+  // same five shapes repeat per scope; only the gate and the scope id differ.
+  // =========================================================================
+
+  // -------------------------------------------------------------------------
+  // GET /repos/{owner}/{repo}/actions/runners (getRepoRunners)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/repos/{owner}/{repo}/actions/runners",
+      middleware: [requireAuth],
+      tags: ["repository"],
+      summary: "Get repo-level runners",
+      operationId: "getRepoRunners",
+      request: {
+        params: z.object(ownerRepoParams),
+        ...runnerListQuery,
+      },
+      responses: {
+        200: {
+          description: "RunnerList",
+          content: { "application/json": { schema: actionRunnersResponseSchema } },
+        },
+        400: errorResponse,
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireRepoOwner(c, pair);
+      const url = new URL(c.req.url);
+      const opts = parseListOptions(url);
+      const { rows, total } = await listRunnerRows(
+        c.env.DB,
+        repoScope(pair.repo.id),
+        formOptionalBool(url, "disabled"),
+        opts.page,
+        opts.limit,
+      );
+      setPaginationHeaders(c, total, opts);
+      return c.json({ runners: rows.map((row) => toApiRunner(row, new Date())), total_count: total }, 200);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // POST /repos/{owner}/{repo}/actions/runners/registration-token
+  // (repoCreateRunnerRegistrationToken)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "post",
+      path: "/repos/{owner}/{repo}/actions/runners/registration-token",
+      middleware: [requireAuth],
+      tags: ["repository"],
+      summary: "Get a repository's actions runner registration token",
+      operationId: "repoCreateRunnerRegistrationToken",
+      request: {
+        params: z.object(ownerRepoParams),
+      },
+      responses: {
+        200: {
+          description: "RegistrationToken",
+          content: { "application/json": { schema: registrationTokenSchema } },
+        },
+      },
+    }),
+    async (c) => {
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireRepoOwner(c, pair);
+      const token = await getOrCreateActiveRunnerToken(c.env.DB, 0, pair.repo.id);
+      return c.json({ token: token.token }, 200);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // GET /repos/{owner}/{repo}/actions/runners/{runner_id} (getRepoRunner)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/repos/{owner}/{repo}/actions/runners/{runner_id}",
+      middleware: [requireAuth],
+      tags: ["repository"],
+      summary: "Get a repo-level runner",
+      operationId: "getRepoRunner",
+      request: {
+        params: z.object({ ...ownerRepoParams, ...runnerIdParams }),
+      },
+      responses: {
+        200: {
+          description: "Runner",
+          content: { "application/json": { schema: actionRunnerSchema } },
+        },
+        400: errorResponse,
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireRepoOwner(c, pair);
+      const runnerId = pathParamInt64(c.req.valid("param").runner_id);
+      const found = await findRunnerInContext(c.env.DB, runnerId, repoScope(pair.repo.id));
+      if (found.kind === "miss") {
+        throw new ApiError(404, runnerMissMessage(runnerId));
+      }
+      if (found.kind === "foreign") {
+        throw new ApiError(404, RUNNER_FOREIGN_MESSAGE);
+      }
+      return c.json(toApiRunner(found.row, new Date()), 200);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // DELETE /repos/{owner}/{repo}/actions/runners/{runner_id} (deleteRepoRunner)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "delete",
+      path: "/repos/{owner}/{repo}/actions/runners/{runner_id}",
+      middleware: [requireAuth],
+      tags: ["repository"],
+      summary: "Delete a repo-level runner",
+      operationId: "deleteRepoRunner",
+      request: {
+        params: z.object({ ...ownerRepoParams, ...runnerIdParams }),
+      },
+      responses: {
+        204: { description: "runner has been deleted" },
+        400: errorResponse,
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireRepoOwner(c, pair);
+      const runnerId = pathParamInt64(c.req.valid("param").runner_id);
+      const found = await findRunnerInContext(c.env.DB, runnerId, repoScope(pair.repo.id));
+      if (found.kind === "miss") {
+        throw new ApiError(404, runnerMissMessage(runnerId));
+      }
+      if (found.kind === "foreign") {
+        throw new ApiError(404, RUNNER_FOREIGN_MESSAGE);
+      }
+      await deleteRunner(c.env.DB, found.row.id);
+      return c.body(null, 204);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // PATCH /repos/{owner}/{repo}/actions/runners/{runner_id} (updateRepoRunner)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "patch",
+      path: "/repos/{owner}/{repo}/actions/runners/{runner_id}",
+      middleware: [requireAuth],
+      tags: ["repository"],
+      summary: "Update a repo-level runner",
+      operationId: "updateRepoRunner",
+      request: {
+        params: z.object({ ...ownerRepoParams, ...runnerIdParams }),
+        body: { content: { "application/json": { schema: editActionRunnerOptionSchema } } },
+      },
+      responses: {
+        200: {
+          description: "Runner",
+          content: { "application/json": { schema: actionRunnerSchema } },
+        },
+        400: errorResponse,
+        404: notFoundResponse,
+        422: { description: "validationError", content: { "application/json": { schema: apiErrorSchema } } },
+      },
+    }),
+    async (c) => {
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireRepoOwner(c, pair);
+      const form = c.req.valid("json");
+      const runnerId = pathParamInt64(c.req.valid("param").runner_id);
+      // Upstream order: the runner lookup's 404 arms fire BEFORE the
+      // Disabled-nil 422 (shared/runners.go:124-133).
+      const found = await findRunnerInContext(c.env.DB, runnerId, repoScope(pair.repo.id));
+      if (found.kind === "miss") {
+        throw new ApiError(404, runnerMissMessage(runnerId));
+      }
+      if (found.kind === "foreign") {
+        throw new ApiError(404, RUNNER_FOREIGN_MESSAGE);
+      }
+      if (form.disabled === undefined) {
+        throw new ApiError(422, "[Disabled]: Required");
+      }
+      await setRunnerDisabled(c.env.DB, found.row, form.disabled);
+      const updated = await findRunnerInContext(c.env.DB, runnerId, repoScope(pair.repo.id));
+      if (updated.kind !== "found") {
+        throw new ApiError(404, runnerMissMessage(runnerId));
+      }
+      return c.json(toApiRunner(updated.row, new Date()), 200);
+    },
+  );
+
+  // =========================================================================
+  // ORG SCOPE (5) — the addActionsRoutes org arm's reqOrgOwnership
+  // (api.go:1738-1742); the guard trio is requireOrgActionsAccess above.
+  // =========================================================================
+
+  // -------------------------------------------------------------------------
+  // GET /orgs/{org}/actions/runners (getOrgRunners)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/orgs/{org}/actions/runners",
+      middleware: [requireAuth],
+      tags: ["organization"],
+      summary: "Get org-level runners",
+      operationId: "getOrgRunners",
+      request: {
+        params: z.object(orgParams),
+        ...runnerListQuery,
+      },
+      responses: {
+        200: {
+          description: "RunnerList",
+          content: { "application/json": { schema: actionRunnersResponseSchema } },
+        },
+        400: errorResponse,
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const org = await requireOrgActionsAccess(c.env.DB, c.req.valid("param").org, authedDoer(c), c.req.path, new URL(c.req.url).search);
+      const url = new URL(c.req.url);
+      const opts = parseListOptions(url);
+      const { rows, total } = await listRunnerRows(
+        c.env.DB,
+        ownerScope(org.id),
+        formOptionalBool(url, "disabled"),
+        opts.page,
+        opts.limit,
+      );
+      setPaginationHeaders(c, total, opts);
+      return c.json({ runners: rows.map((row) => toApiRunner(row, new Date())), total_count: total }, 200);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // POST /orgs/{org}/actions/runners/registration-token
+  // (orgCreateRunnerRegistrationToken)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "post",
+      path: "/orgs/{org}/actions/runners/registration-token",
+      middleware: [requireAuth],
+      tags: ["organization"],
+      summary: "Get an organization's actions runner registration token",
+      operationId: "orgCreateRunnerRegistrationToken",
+      request: {
+        params: z.object(orgParams),
+      },
+      responses: {
+        200: {
+          description: "RegistrationToken",
+          content: { "application/json": { schema: registrationTokenSchema } },
+        },
+      },
+    }),
+    async (c) => {
+      const org = await requireOrgActionsAccess(c.env.DB, c.req.valid("param").org, authedDoer(c), c.req.path, new URL(c.req.url).search);
+      const token = await getOrCreateActiveRunnerToken(c.env.DB, org.id, "");
+      return c.json({ token: token.token }, 200);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // GET /orgs/{org}/actions/runners/{runner_id} (getOrgRunner)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/orgs/{org}/actions/runners/{runner_id}",
+      middleware: [requireAuth],
+      tags: ["organization"],
+      summary: "Get an org-level runner",
+      operationId: "getOrgRunner",
+      request: {
+        params: z.object({ ...orgParams, ...runnerIdParams }),
+      },
+      responses: {
+        200: {
+          description: "Runner",
+          content: { "application/json": { schema: actionRunnerSchema } },
+        },
+        400: errorResponse,
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const org = await requireOrgActionsAccess(c.env.DB, c.req.valid("param").org, authedDoer(c), c.req.path, new URL(c.req.url).search);
+      const runnerId = pathParamInt64(c.req.valid("param").runner_id);
+      const found = await findRunnerInContext(c.env.DB, runnerId, ownerScope(org.id));
+      if (found.kind === "miss") {
+        throw new ApiError(404, runnerMissMessage(runnerId));
+      }
+      if (found.kind === "foreign") {
+        throw new ApiError(404, RUNNER_FOREIGN_MESSAGE);
+      }
+      return c.json(toApiRunner(found.row, new Date()), 200);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // DELETE /orgs/{org}/actions/runners/{runner_id} (deleteOrgRunner)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "delete",
+      path: "/orgs/{org}/actions/runners/{runner_id}",
+      middleware: [requireAuth],
+      tags: ["organization"],
+      summary: "Delete an org-level runner",
+      operationId: "deleteOrgRunner",
+      request: {
+        params: z.object({ ...orgParams, ...runnerIdParams }),
+      },
+      responses: {
+        204: { description: "runner has been deleted" },
+        400: errorResponse,
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const org = await requireOrgActionsAccess(c.env.DB, c.req.valid("param").org, authedDoer(c), c.req.path, new URL(c.req.url).search);
+      const runnerId = pathParamInt64(c.req.valid("param").runner_id);
+      const found = await findRunnerInContext(c.env.DB, runnerId, ownerScope(org.id));
+      if (found.kind === "miss") {
+        throw new ApiError(404, runnerMissMessage(runnerId));
+      }
+      if (found.kind === "foreign") {
+        throw new ApiError(404, RUNNER_FOREIGN_MESSAGE);
+      }
+      await deleteRunner(c.env.DB, found.row.id);
+      return c.body(null, 204);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // PATCH /orgs/{org}/actions/runners/{runner_id} (updateOrgRunner)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "patch",
+      path: "/orgs/{org}/actions/runners/{runner_id}",
+      middleware: [requireAuth],
+      tags: ["organization"],
+      summary: "Update an org-level runner",
+      operationId: "updateOrgRunner",
+      request: {
+        params: z.object({ ...orgParams, ...runnerIdParams }),
+        body: { content: { "application/json": { schema: editActionRunnerOptionSchema } } },
+      },
+      responses: {
+        200: {
+          description: "Runner",
+          content: { "application/json": { schema: actionRunnerSchema } },
+        },
+        400: errorResponse,
+        404: notFoundResponse,
+        422: { description: "validationError", content: { "application/json": { schema: apiErrorSchema } } },
+      },
+    }),
+    async (c) => {
+      const org = await requireOrgActionsAccess(c.env.DB, c.req.valid("param").org, authedDoer(c), c.req.path, new URL(c.req.url).search);
+      const form = c.req.valid("json");
+      const runnerId = pathParamInt64(c.req.valid("param").runner_id);
+      // Upstream order: the runner lookup's 404 arms fire BEFORE the
+      // Disabled-nil 422 (shared/runners.go:124-133).
+      const found = await findRunnerInContext(c.env.DB, runnerId, ownerScope(org.id));
+      if (found.kind === "miss") {
+        throw new ApiError(404, runnerMissMessage(runnerId));
+      }
+      if (found.kind === "foreign") {
+        throw new ApiError(404, RUNNER_FOREIGN_MESSAGE);
+      }
+      if (form.disabled === undefined) {
+        throw new ApiError(422, "[Disabled]: Required");
+      }
+      await setRunnerDisabled(c.env.DB, found.row, form.disabled);
+      const updated = await findRunnerInContext(c.env.DB, runnerId, ownerScope(org.id));
+      if (updated.kind !== "found") {
+        throw new ApiError(404, runnerMissMessage(runnerId));
+      }
+      return c.json(toApiRunner(updated.row, new Date()), 200);
+    },
+  );
+
+  // =========================================================================
+  // USER SCOPE (5) — the /user group's reqToken() (api.go:1127-1133): the
+  // doer IS the owner, no further gate.
+  // =========================================================================
+
+  // -------------------------------------------------------------------------
+  // GET /user/actions/runners (getUserRunners)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/user/actions/runners",
+      middleware: [requireAuth],
+      tags: ["user"],
+      summary: "Get user-level runners",
+      operationId: "getUserRunners",
+      request: runnerListQuery,
+      responses: {
+        200: {
+          description: "RunnerList",
+          content: { "application/json": { schema: actionRunnersResponseSchema } },
+        },
+        400: errorResponse,
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const url = new URL(c.req.url);
+      const opts = parseListOptions(url);
+      const { rows, total } = await listRunnerRows(
+        c.env.DB,
+        ownerScope(authedDoer(c).id),
+        formOptionalBool(url, "disabled"),
+        opts.page,
+        opts.limit,
+      );
+      setPaginationHeaders(c, total, opts);
+      return c.json({ runners: rows.map((row) => toApiRunner(row, new Date())), total_count: total }, 200);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // POST /user/actions/runners/registration-token
+  // (userCreateRunnerRegistrationToken)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "post",
+      path: "/user/actions/runners/registration-token",
+      middleware: [requireAuth],
+      tags: ["user"],
+      summary: "Get a user's actions runner registration token",
+      operationId: "userCreateRunnerRegistrationToken",
+      request: {},
+      responses: {
+        200: {
+          description: "RegistrationToken",
+          content: { "application/json": { schema: registrationTokenSchema } },
+        },
+      },
+    }),
+    async (c) => {
+      const token = await getOrCreateActiveRunnerToken(c.env.DB, authedDoer(c).id, "");
+      return c.json({ token: token.token }, 200);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // GET /user/actions/runners/{runner_id} (getUserRunner)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/user/actions/runners/{runner_id}",
+      middleware: [requireAuth],
+      tags: ["user"],
+      summary: "Get a user-level runner",
+      operationId: "getUserRunner",
+      request: {
+        params: z.object(runnerIdParams),
+      },
+      responses: {
+        200: {
+          description: "Runner",
+          content: { "application/json": { schema: actionRunnerSchema } },
+        },
+        400: errorResponse,
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const runnerId = pathParamInt64(c.req.valid("param").runner_id);
+      const found = await findRunnerInContext(c.env.DB, runnerId, ownerScope(authedDoer(c).id));
+      if (found.kind === "miss") {
+        throw new ApiError(404, runnerMissMessage(runnerId));
+      }
+      if (found.kind === "foreign") {
+        throw new ApiError(404, RUNNER_FOREIGN_MESSAGE);
+      }
+      return c.json(toApiRunner(found.row, new Date()), 200);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // DELETE /user/actions/runners/{runner_id} (deleteUserRunner)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "delete",
+      path: "/user/actions/runners/{runner_id}",
+      middleware: [requireAuth],
+      tags: ["user"],
+      summary: "Delete a user-level runner",
+      operationId: "deleteUserRunner",
+      request: {
+        params: z.object(runnerIdParams),
+      },
+      responses: {
+        204: { description: "runner has been deleted" },
+        400: errorResponse,
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const runnerId = pathParamInt64(c.req.valid("param").runner_id);
+      const found = await findRunnerInContext(c.env.DB, runnerId, ownerScope(authedDoer(c).id));
+      if (found.kind === "miss") {
+        throw new ApiError(404, runnerMissMessage(runnerId));
+      }
+      if (found.kind === "foreign") {
+        throw new ApiError(404, RUNNER_FOREIGN_MESSAGE);
+      }
+      await deleteRunner(c.env.DB, found.row.id);
+      return c.body(null, 204);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // PATCH /user/actions/runners/{runner_id} (updateUserRunner)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "patch",
+      path: "/user/actions/runners/{runner_id}",
+      middleware: [requireAuth],
+      tags: ["user"],
+      summary: "Update a user-level runner",
+      operationId: "updateUserRunner",
+      request: {
+        params: z.object(runnerIdParams),
+        body: { content: { "application/json": { schema: editActionRunnerOptionSchema } } },
+      },
+      responses: {
+        200: {
+          description: "Runner",
+          content: { "application/json": { schema: actionRunnerSchema } },
+        },
+        400: errorResponse,
+        404: notFoundResponse,
+        422: { description: "validationError", content: { "application/json": { schema: apiErrorSchema } } },
+      },
+    }),
+    async (c) => {
+      const form = c.req.valid("json");
+      const runnerId = pathParamInt64(c.req.valid("param").runner_id);
+      const scope = ownerScope(authedDoer(c).id);
+      // Upstream order: the runner lookup's 404 arms fire BEFORE the
+      // Disabled-nil 422 (shared/runners.go:124-133).
+      const found = await findRunnerInContext(c.env.DB, runnerId, scope);
+      if (found.kind === "miss") {
+        throw new ApiError(404, runnerMissMessage(runnerId));
+      }
+      if (found.kind === "foreign") {
+        throw new ApiError(404, RUNNER_FOREIGN_MESSAGE);
+      }
+      if (form.disabled === undefined) {
+        throw new ApiError(422, "[Disabled]: Required");
+      }
+      await setRunnerDisabled(c.env.DB, found.row, form.disabled);
+      const updated = await findRunnerInContext(c.env.DB, runnerId, scope);
+      if (updated.kind !== "found") {
+        throw new ApiError(404, runnerMissMessage(runnerId));
+      }
+      return c.json(toApiRunner(updated.row, new Date()), 200);
     },
   );
 }

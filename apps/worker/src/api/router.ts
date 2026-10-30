@@ -225,8 +225,10 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // Inventory batch 5: repo deploy keys + deploy tokens (migration 0020).
   registerDeployKeyRoutes(app, requireAuth);
   // Inventory batch 3: actions secrets + variables (repo/org/user scopes,
-  // migration 0021 — storage+API surface; the Actions runtime stays
-  // SPEC-0012-gated).
+  // migration 0021 — storage+API surface) + the 15 RUNNER-management ops
+  // across the same scopes (P1-7 — the registration-token reuse, the
+  // status-rank listing, the PATCH flip; the 39-op remainder rides the
+  // board's P1-8..P1-12 rows).
   registerSecretsVariablesRoutes(app, requireAuth);
   // Tier-1 tail families (REG-MERGE-3, committed 6e3c322): the archive
   // download, the diffpatch apply, the languages listing and the scheduled

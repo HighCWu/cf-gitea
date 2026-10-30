@@ -1,14 +1,23 @@
-import { and, asc, count, eq } from "drizzle-orm";
+import { and, asc, count, desc, eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { actionVariables, secrets } from "../../db/schema";
+import { actionRunners, actionVariables, secrets } from "../../db/schema";
 import { ApiError } from "../errors";
+import {
+  getRunnerById,
+  increaseTaskVersion,
+  updateRunner,
+  type RunnerRow,
+} from "../../services/actions/model";
 
 /**
- * The actions secrets/variables service — the upstream `secret` +
+ * The actions secrets/variables/runners service — the upstream `secret` +
  * `action_variable` stores behind the three `/actions` scopes (the inventory
- * batch `wave-api-secrets-variables`, 23 operations). Upstream anchors,
- * per-function:
+ * batch `wave-api-secrets-variables`, 23 operations), extended with the
+ * runner registration/management mapping for the same three scopes (P1-7,
+ * routers/api/v1/shared/runners.go — 15 more operations; storage rides the
+ * landed control-plane primitives in services/actions/model.ts). Upstream
+ * anchors, per-function:
  *
  *   - validateSecretName     — secrets.ValidateName
  *                              (services/secrets/validation.go:24-36)
@@ -38,6 +47,23 @@ import { ApiError } from "../errors";
  *                              (services/actions/variables.go:41-48)
  *   - listVariableRows       — FindVariablesOpts (models/actions/variable.go:68-100,
  *                              ToOrders "name")
+ *
+ * RUNNER ANCHORS (the P1-7 extension):
+ *
+ *   - runnerStatusOf         — ActionRunner.Status (models/actions/runner.go:127-135)
+ *                              over RunnerOfflineTime/RunnerIdleTime (:76-77)
+ *   - toApiRunner            — convert.ToActionRunner
+ *                              (services/convert/convert.go:793-814)
+ *   - listRunnerRows         — shared.ListRunners
+ *                              (routers/api/v1/shared/runners.go:41-66) over
+ *                              FindRunnerOptions (runner.go:224-315; the
+ *                              default status-rank order at :315)
+ *   - findRunnerInContext    — getRunnerByID + EditableInContext
+ *                              (shared/runners.go:68-84; runner.go:158-169)
+ *   - runnerMissMessage      — GetRunnerByID's wrapped not-exist
+ *                              (runner.go:336) through util.ErrorUnwrapForUser
+ *                              (util/error.go:26,43-48)
+ *   - setRunnerDisabled      — SetRunnerDisabled (runner.go:354-366)
  *
  * SCOPE ENCODING (upstream's own rule, models/secret/secret.go:25-33) — a
  * repo-level row is `{ownerId: 0, repoId}`; an org/user-level row is
@@ -418,4 +444,158 @@ export function toApiVariable(row: VariableRow): {
     data: row.data,
     description: row.description,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Runners — the registration/management family (models/actions/runner.go,
+// routers/api/v1/shared/runners.go). Storage rides services/actions/model.ts's
+// landed primitives (the control-plane store); this section adds only the
+// API-layer wire mapping and the scope-guarded lookups the three /actions
+// runner scopes share.
+// ---------------------------------------------------------------------------
+
+/** The runner scope pair — the same sentinel encoding as the secrets stores
+ *  (the action_runners schema comment): repo rows are `{ownerId: 0, repoId}`,
+ *  org/user rows `{ownerId, repoId: ""}`; `(0, "")` is global and editable in
+ *  NO non-admin context (runner.go:158-169). */
+export type RunnerScope = SecretScope;
+
+/** RunnerOfflineTime (models/actions/runner.go:76). */
+export const RUNNER_OFFLINE_MS = 60_000;
+/** RunnerIdleTime (models/actions/runner.go:77). */
+export const RUNNER_IDLE_MS = 10_000;
+
+export type RunnerStatusName = "active" | "idle" | "offline";
+
+/** ActionRunner.Status (runner.go:127-135): offline past RunnerOfflineTime
+ *  since last_online, idle past RunnerIdleTime since last_active, else
+ *  active. NULL timestamps are upstream's 0 sentinel (never seen → the epoch
+ *  → offline). */
+export function runnerStatusOf(row: Pick<RunnerRow, "lastOnline" | "lastActive">, now: Date): RunnerStatusName {
+  const lastOnline = row.lastOnline?.getTime() ?? 0;
+  const lastActive = row.lastActive?.getTime() ?? 0;
+  if (now.getTime() - lastOnline > RUNNER_OFFLINE_MS) return "offline";
+  if (now.getTime() - lastActive > RUNNER_IDLE_MS) return "idle";
+  return "active";
+}
+
+/** The API `ActionRunner` (modules/structs/repo_actions.go:232-241) rendered
+ *  by convert.ToActionRunner (services/convert/convert.go:793-814): `status`
+ *  is the coarse online/offline string (NOT the statusName), `busy` mirrors
+ *  the fine ACTIVE rank, and every agent label becomes an {id: index, name,
+ *  type: "custom"} triple. */
+export function toApiRunner(row: RunnerRow, now: Date): {
+  id: number;
+  name: string;
+  status: "online" | "offline";
+  busy: boolean;
+  disabled: boolean;
+  ephemeral: boolean;
+  labels: Array<{ id: number; name: string; type: string }>;
+} {
+  const status = runnerStatusOf(row, now);
+  let labels: Array<{ id: number; name: string; type: string }>;
+  try {
+    const parsed: unknown = JSON.parse(row.agentLabels);
+    labels = Array.isArray(parsed)
+      ? parsed.map((name, i) => ({ id: i, name: String(name), type: "custom" }))
+      : [];
+  } catch {
+    labels = [];
+  }
+  return {
+    id: row.id,
+    name: row.name,
+    status: status === "offline" ? "offline" : "online",
+    busy: status === "active",
+    disabled: row.isDisabled,
+    ephemeral: row.ephemeral,
+    labels,
+  };
+}
+
+/** The FindRunnerOptions default order (runner.go:315) — the computed status
+ *  rank first, then is_disabled, last_online desc, and the id tiebreaker.
+ *  The rank CASE is runnerStatusOrderExpr (runner.go:286-292) with the NULL
+ *  columns COALESCEd to upstream's 0 sentinel so never-seen runners rank
+ *  offline. The thresholds ride the same instant as the API status fields so
+ *  a page boundary cannot disagree with the rendered status. */
+function runnerStatusOrder(now: Date) {
+  const offlineThreshold = Math.floor(now.getTime() / 1000) - Math.floor(RUNNER_OFFLINE_MS / 1000);
+  const idleThreshold = Math.floor(now.getTime() / 1000) - Math.floor(RUNNER_IDLE_MS / 1000);
+  return sql`CASE WHEN COALESCE(${actionRunners.lastOnline}, 0) <= ${offlineThreshold} THEN 2 WHEN COALESCE(${actionRunners.lastActive}, 0) <= ${idleThreshold} THEN 1 ELSE 0 END`;
+}
+
+function runnerScopeCond(scope: RunnerScope) {
+  return and(eq(actionRunners.ownerId, scope.ownerId), eq(actionRunners.repoId, scope.repoId));
+}
+
+/** shared.ListRunners (routers/api/v1/shared/runners.go:41-66): scope-filtered
+ *  (WithAvailable is FALSE on the API — a repo lists only its own rows, not
+ *  the owner's or global's), the optional disabled filter, upstream's default
+ *  order, paginated with the total. `disabled` mirrors FormOptionalBool
+ *  (services/context/base_form.go:71-79): null = absent (no filter); an
+ *  unparsable value parses as false upstream, so callers map it before us. */
+export async function listRunnerRows(
+  d1: D1Database,
+  scope: RunnerScope,
+  disabled: boolean | null,
+  page: number,
+  limit: number,
+  now: Date = new Date(),
+): Promise<{ rows: RunnerRow[]; total: number }> {
+  const where = disabled === null ? runnerScopeCond(scope) : and(runnerScopeCond(scope), eq(actionRunners.isDisabled, disabled));
+  const totals = await drizzle(d1).select({ value: count() }).from(actionRunners).where(where);
+  const rows = await drizzle(d1)
+    .select()
+    .from(actionRunners)
+    .where(where)
+    .orderBy(runnerStatusOrder(now), asc(actionRunners.isDisabled), desc(actionRunners.lastOnline), asc(actionRunners.id))
+    .limit(limit)
+    .offset((page - 1) * limit);
+  return { rows, total: totals[0]?.value ?? 0 };
+}
+
+export type RunnerLookup =
+  | { kind: "found"; row: RunnerRow }
+  | { kind: "miss" }
+  | { kind: "foreign" };
+
+/** getRunnerByID + EditableInContext (shared/runners.go:68-84): the global
+ *  lookup first (the miss carries the 404 wire text below), then the context
+ *  guard — repo scopes match `repoId`, owner scopes match `ownerId`
+ *  (runner.go:158-169); a runner belonging to a sibling scope (or global)
+ *  is a "foreign" 404, indistinguishable from a miss to unauthorized eyes
+ *  EXCEPT for the message ("No permission…" vs the not-exist text). */
+export async function findRunnerInContext(d1: D1Database, runnerId: number, scope: RunnerScope): Promise<RunnerLookup> {
+  const row = await getRunnerById(d1, runnerId);
+  if (row === null) {
+    return { kind: "miss" };
+  }
+  const inContext = scope.repoId !== "" ? row.repoId === scope.repoId : row.ownerId === scope.ownerId;
+  return inContext ? { kind: "found", row } : { kind: "foreign" };
+}
+
+/** GetRunnerByID's miss through APIErrorAuto (shared/runners.go:75-77): the
+ *  wrapped Error() text renders whole (util.ErrorUnwrapForUser returns
+ *  err.Error(), util/error.go:43-48) — "runner with id N: resource does not
+ *  exist" (runner.go:336 + util/error.go:26). */
+export function runnerMissMessage(id: number): string {
+  return `runner with id ${id}: resource does not exist`;
+}
+
+/** The EditableInContext 404 text (shared/runners.go:80,
+ *  APIErrorNotFound("No permission to access this runner")). */
+export const RUNNER_FOREIGN_MESSAGE = "No permission to access this runner";
+
+/** SetRunnerDisabled (models/actions/runner.go:354-366): the equal-value
+ *  PATCH is a no-op (no update, no version bump); a real flip updates the
+ *  one column and bumps the scope's task version so polling runners re-fetch
+ *  immediately. */
+export async function setRunnerDisabled(d1: D1Database, row: RunnerRow, isDisabled: boolean): Promise<void> {
+  if (row.isDisabled === isDisabled) {
+    return;
+  }
+  await updateRunner(d1, row.id, { isDisabled });
+  await increaseTaskVersion(d1, row.ownerId, row.repoId);
 }

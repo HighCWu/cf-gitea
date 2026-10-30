@@ -1,38 +1,44 @@
 /**
- * The actions secrets/variables families (routes/secrets-variables.ts — the
- * inventory's `wave-api-secrets-variables` batch) on real D1 (migration
- * 0021's `secrets` + `action_variables`): all 23 contract ops over the
- * standalone-mount convention (the routes ARE registered in router.ts by the
- * orchestrator after this batch).
+ * The actions secrets/variables/runners families (routes/secrets-variables.ts
+ * — the inventory's `wave-api-secrets-variables` batch extended by P1-7's 15
+ * runner-management ops) on real D1 (migration 0021's `secrets` +
+ * `action_variables` + the SPEC-0012 control-plane store's `action_runners`):
+ * all 38 contract ops over the standalone-mount convention (the routes ARE
+ * registered in router.ts by the orchestrator after this batch).
  *
  * Per-arm contract verification: every DECLARED response code of every op is
  * exercised — secrets list {200,404}, secret PUT {201,204,400,404}, secret
  * DELETE {204,400,404}, variables list/get {200,400,404}, variable create
  * {201,400,409} (+ the repo/org arms' 500), variable PUT {201,204,400,404},
- * variable DELETE {200,201,204,400,404} (the user arm without the 200). The
- * declared-but-unreachable arms (the reads' 400, the dead 201/200
- * leftovers) are pinned by the `⊆ contract` check (pnpm check:api), not
- * runtime — the module header documents each. The RUNTIME-ONLY codes stay
- * undeclared per the module header and are asserted as behavior: 401
- * (anonymous), the repo arm's reqOwner 403 (an admin-mode COLLABORATOR ranks
- * below AccessModeOwner — the precise gate this family differs from
- * deploy-keys on), the org arm's reqOrgOwnership 403, and the Go binder's
- * 422 Required texts.
+ * variable DELETE {200,201,204,400,404} (the user arm without the 200);
+ * runners list/get {200,400,404}, token {200}, delete {204,400,404}, patch
+ * {200,400,404,422}. The declared-but-unreachable arms (the reads' 400, the
+ * dead 201/200 leftovers) are pinned by the `⊆ contract` check
+ * (pnpm check:api), not runtime — the module header documents each. The
+ * RUNTIME-ONLY codes stay undeclared per the module header and are asserted
+ * as behavior: 401 (anonymous), the repo arm's reqOwner 403 (an admin-mode
+ * COLLABORATOR ranks below AccessModeOwner — the precise gate this family
+ * differs from deploy-keys on), the org arm's reqOrgOwnership 403, the Go
+ * binder's 422 Required texts, and the runner family's two 404 shapes (the
+ * not-exist text vs EditableInContext's "No permission…" foreign-scope text).
  *
  * The scope encoding is pinned end-to-end: a repo row carries owner_id=0 +
  * the TEXT repo id, an owner row carries the int owner + repo_id='' — lists
  * in one scope never leak rows from another, names are stored UPPERCASE and
  * matched case-insensitively, variable values are EOL-normalized, secret
- * data never renders.
+ * data never renders. The runner status matrix (active/idle/offline) is
+ * pinned against runner.go's 60 s/10 s windows with seeded timestamps.
  */
 
 import { OpenAPIHono } from "@hono/zod-openapi";
 import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { count, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { repositories, users } from "../../db/schema";
+import { actionRunners, actionTasksVersions, repositories, users } from "../../db/schema";
+import type { RunnerRow } from "../../services/actions/model";
 import { createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -48,7 +54,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  for (const table of ["secrets", "action_variables", "repo_collaborators", "repositories", "org_members", "user_redirects", "users"]) {
+  for (const table of ["secrets", "action_variables", "action_runners", "action_runner_tokens", "action_tasks_versions", "repo_collaborators", "repositories", "org_members", "user_redirects", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   seededUsers.clear();
@@ -164,6 +170,13 @@ const post = (path: string, body: unknown, userId?: number): Promise<Response> =
 const del = (path: string, userId?: number): Promise<Response> =>
   router()(path, { method: "DELETE", headers: userId === undefined ? {} : authHeaders(userId) });
 
+const patch = (path: string, body: unknown, userId?: number): Promise<Response> =>
+  router()(path, {
+    method: "PATCH",
+    headers: userId === undefined ? { "Content-Type": "application/json" } : authHeaders(userId),
+    body: JSON.stringify(body),
+  });
+
 // ---------------------------------------------------------------------------
 // Seeds
 // ---------------------------------------------------------------------------
@@ -235,6 +248,71 @@ interface VariableWire {
   name: string;
   data: string;
   description: string;
+}
+
+interface RunnerLabelWire {
+  id: number;
+  name: string;
+  type: string;
+}
+
+interface RunnerWire {
+  id: number;
+  name: string;
+  status: "online" | "offline";
+  busy: boolean;
+  disabled: boolean;
+  ephemeral: boolean;
+  labels: RunnerLabelWire[];
+}
+
+interface RunnerListWire {
+  runners: RunnerWire[];
+  total_count: number;
+}
+
+let runnerSeq = 9000;
+
+interface RunnerSeedTimes {
+  lastOnline?: Date | null;
+  lastActive?: Date | null;
+  isDisabled?: boolean;
+  agentLabels?: string[];
+  ephemeral?: boolean;
+}
+
+/** One runner row straight into the control-plane store (bypassing the
+ *  Register protocol — the API family manages ALREADY-registered rows), with
+ *  caller-controlled heartbeats so the status matrix is deterministic. */
+async function seedRunner(
+  scope: { ownerId: number; repoId: string },
+  name: string,
+  times: RunnerSeedTimes = {},
+): Promise<RunnerRow> {
+  const now = new Date();
+  const rows = await db()
+    .insert(actionRunners)
+    .values({
+      uuid: crypto.randomUUID(),
+      name,
+      version: "1.0.0",
+      ownerId: scope.ownerId,
+      repoId: scope.repoId,
+      agentLabels: JSON.stringify(times.agentLabels ?? []),
+      ephemeral: times.ephemeral ?? false,
+      isDisabled: times.isDisabled ?? false,
+      tokenHash: `hash-${name}-${runnerSeq++}`,
+      tokenSalt: "salt",
+      lastOnline: times.lastOnline !== undefined ? times.lastOnline : now,
+      lastActive: times.lastActive !== undefined ? times.lastActive : now,
+      created: now,
+      updated: now,
+    })
+    .returning()
+    .all();
+  const row = rows[0];
+  if (row === undefined) throw new Error("runner seed failed");
+  return row;
 }
 
 const messageOf = async (res: Response): Promise<string> => (await jsonBody<{ message: string }>(res)).message;
@@ -690,3 +768,338 @@ describe("scope isolation", () => {
     expect((await get("/api/v1/orgs/acme/actions/variables/SHARED", org.owner.id)).status).toBe(200);
   });
 });
+
+// ---------------------------------------------------------------------------
+// RUNNERS — the P1-7 extension (15 ops): registration tokens, registry CRUD,
+// the status matrix, the two 404 shapes, the scope guards
+// ---------------------------------------------------------------------------
+
+/** The status windows' test margins (runner.go:76-77): comfortably inside
+ *  active (< 10 s idle), between idle and offline (30 s), and past offline
+ *  (120 s). */
+const T_ACTIVE = 0;
+const T_IDLE = 30_000;
+const T_OFFLINE = 120_000;
+
+describe("repo runners (GET/POST/DELETE/PATCH /repos/{owner}/{repo}/actions/runners)", () => {
+  it("POST registration-token 200s {token}, reuses the scope's active token, and pins the scope", async () => {
+    const { alice } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    const first = await post(`/api/v1/repos/alice/${slug}/actions/runners/registration-token`, null, alice.id);
+    expect(first.status).toBe(200);
+    const body = await jsonBody<{ token: string }>(first);
+    expect(typeof body.token).toBe("string");
+    expect(body.token.length).toBeGreaterThan(0);
+
+    // GetOrCreateActiveRunnerToken REUSES the active token (a POST is not a
+    // reset — runner_token.go:127-134).
+    const second = await jsonBody<{ token: string }>(
+      await post(`/api/v1/repos/alice/${slug}/actions/runners/registration-token`, null, alice.id),
+    );
+    expect(second.token).toBe(body.token);
+
+    // The stored row carries the repo scope (owner_id 0 + the repo id).
+    const stored = await env.DB.prepare("SELECT owner_id, repo_id, is_active FROM action_runner_tokens").first<{
+      owner_id: number;
+      repo_id: string;
+      is_active: number;
+    }>();
+    expect(stored).toMatchObject({ owner_id: 0, repo_id: repoId, is_active: 1 });
+  });
+
+  it("GET list renders the ActionRunner wire exactly and orders by the status rank (active, idle, offline)", async () => {
+    const { alice } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    const now = Date.now();
+    const offline = await seedRunner(repoScopeSeed(repoId), "z-offline", {
+      lastOnline: new Date(now - T_OFFLINE),
+      lastActive: new Date(now - T_OFFLINE),
+      agentLabels: ["ubuntu-latest"],
+    });
+    const idleRows = await seedRunner(repoScopeSeed(repoId), "m-idle", {
+      lastOnline: new Date(now),
+      lastActive: new Date(now - T_IDLE),
+    });
+    const active = await seedRunner(repoScopeSeed(repoId), "a-active", {
+      lastOnline: new Date(now),
+      lastActive: new Date(now - T_ACTIVE),
+      agentLabels: ["fedora-latest", "docker"],
+    });
+
+    const list = await get(`/api/v1/repos/alice/${slug}/actions/runners`, alice.id);
+    expect(list.status).toBe(200);
+    expect(list.headers.get("x-total-count")).toBe("3");
+    const wire = await jsonBody<RunnerListWire>(list);
+    expect(wire.total_count).toBe(3);
+    expect(wire.runners.map((r) => r.name)).toEqual(["a-active", "m-idle", "z-offline"]);
+    expect(wire.runners.map((r) => [r.status, r.busy])).toEqual([
+      ["online", true],
+      ["online", false],
+      ["offline", false],
+    ]);
+    // The full ActionRunner wire for one entry — labels index as ids, type
+    // "custom" (convert.go:800-808).
+    expect(wire.runners[0]).toEqual({
+      id: active.id,
+      name: "a-active",
+      status: "online",
+      busy: true,
+      disabled: false,
+      ephemeral: false,
+      labels: [
+        { id: 0, name: "fedora-latest", type: "custom" },
+        { id: 1, name: "docker", type: "custom" },
+      ],
+    });
+    expect(wire.runners[2]?.id).toBe(offline.id);
+    expect(wire.runners[1]?.id).toBe(idleRows.id);
+  });
+
+  it("the disabled query filter — true/false, and an unparsable value parses FALSE (FormOptionalBool)", async () => {
+    const { alice } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    await seedRunner(repoScopeSeed(repoId), "enabled-1");
+    await seedRunner(repoScopeSeed(repoId), "enabled-2");
+    await seedRunner(repoScopeSeed(repoId), "paused", { isDisabled: true });
+
+    const names = async (q: string): Promise<string[]> =>
+      (await jsonBody<RunnerListWire>(await get(`/api/v1/repos/alice/${slug}/actions/runners${q}`, alice.id))).runners.map((r) => r.name);
+    expect(await names("")).toEqual(["enabled-1", "enabled-2", "paused"]);
+    expect(await names("?disabled=false")).toEqual(["enabled-1", "enabled-2"]);
+    expect(await names("?disabled=true")).toEqual(["paused"]);
+    // strconv.ParseBool's ignored-error arm (base_form.go:76): "yes" parses
+    // as false, so the filter selects the NON-disabled rows.
+    expect(await names("?disabled=yes")).toEqual(["enabled-1", "enabled-2"]);
+  });
+
+  it("list pagination rides page/limit with the total-count header", async () => {
+    const { alice } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    await seedRunner(repoScopeSeed(repoId), "r1");
+    await seedRunner(repoScopeSeed(repoId), "r2");
+    await seedRunner(repoScopeSeed(repoId), "r3");
+    const page2 = await get(`/api/v1/repos/alice/${slug}/actions/runners?limit=1&page=2`, alice.id);
+    expect(page2.status).toBe(200);
+    expect(page2.headers.get("x-total-count")).toBe("3");
+    const wire = await jsonBody<RunnerListWire>(page2);
+    expect(wire.runners).toHaveLength(1);
+    expect(wire.runners[0]?.name).toBe("r2");
+  });
+
+  it("GET by id 200; the two 404 shapes — the not-exist text vs the foreign-scope text; non-numeric id is the id-0 miss", async () => {
+    const { alice } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    const org = await seedOrg("acme");
+    const runner = await seedRunner(repoScopeSeed(repoId), "repo-runner");
+    const orgRunner = await seedRunner(ownerScopeSeed(org.orgId), "org-runner");
+
+    const got = await get(`/api/v1/repos/alice/${slug}/actions/runners/${runner.id}`, alice.id);
+    expect(got.status).toBe(200);
+    expect((await jsonBody<RunnerWire>(got)).name).toBe("repo-runner");
+
+    const miss = await get(`/api/v1/repos/alice/${slug}/actions/runners/999999`, alice.id);
+    expect(miss.status).toBe(404);
+    expect(await messageOf(miss)).toBe("runner with id 999999: resource does not exist");
+
+    // An org-scoped runner is NOT editable in the repo context
+    // (EditableInContext, runner.go:158-169) — the "No permission" text.
+    const foreign = await get(`/api/v1/repos/alice/${slug}/actions/runners/${orgRunner.id}`, alice.id);
+    expect(foreign.status).toBe(404);
+    expect(await messageOf(foreign)).toBe("No permission to access this runner");
+
+    // PathParamInt64's failure arm is 0 (base_path.go:35-38) → the id-0 miss.
+    const nonNumeric = await get(`/api/v1/repos/alice/${slug}/actions/runners/abc`, alice.id);
+    expect(nonNumeric.status).toBe(404);
+    expect(await messageOf(nonNumeric)).toBe("runner with id 0: resource does not exist");
+  });
+
+  it("PATCH 200 flips disabled and re-renders; the idempotent PATCH no-ops (no task-version bump); 422 on a missing disabled", async () => {
+    const { alice } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    const runner = await seedRunner(repoScopeSeed(repoId), "flip-me");
+
+    const flip = await patch(`/api/v1/repos/alice/${slug}/actions/runners/${runner.id}`, { disabled: true }, alice.id);
+    expect(flip.status).toBe(200);
+    expect((await jsonBody<RunnerWire>(flip))).toMatchObject({ id: runner.id, disabled: true });
+    // SetRunnerDisabled's real flip bumps the scope's task version
+    // (runner.go:364) — the cascade plants the missing scope rows.
+    const bumped = await db().select({ n: count() }).from(actionTasksVersions).where(eq(actionTasksVersions.repoId, repoId));
+    expect(bumped[0]?.n).toBeGreaterThan(0);
+
+    // The equal-value PATCH returns early (runner.go:355-357) — the version
+    // table does NOT grow (the earlier flip's rows are all there are).
+    const beforeRows = await db().select({ n: count() }).from(actionTasksVersions);
+    const fresh = await seedRunner(repoScopeSeed(repoId), "fresh-scope");
+    const same = await patch(`/api/v1/repos/alice/${slug}/actions/runners/${fresh.id}`, { disabled: false }, alice.id);
+    expect(same.status).toBe(200);
+    const freshRows = await db().select({ n: count() }).from(actionTasksVersions);
+    expect(freshRows[0]?.n).toBe(beforeRows[0]?.n);
+
+    // Upstream order: the 404 arms fire BEFORE the Disabled-nil 422
+    // (shared/runners.go:124-133) — a missing runner 404s even with {}.
+    const missingWithEmptyBody = await patch(`/api/v1/repos/alice/${slug}/actions/runners/999999`, {}, alice.id);
+    expect(missingWithEmptyBody.status).toBe(404);
+    const noDisabled = await patch(`/api/v1/repos/alice/${slug}/actions/runners/${runner.id}`, {}, alice.id);
+    expect(noDisabled.status).toBe(422);
+    expect(await messageOf(noDisabled)).toBe("[Disabled]: Required");
+  });
+
+  it("DELETE 204 removes; the second delete is the not-exist 404; the foreign row 404s", async () => {
+    const { alice } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    const org = await seedOrg("acme");
+    const runner = await seedRunner(repoScopeSeed(repoId), "doomed");
+    const orgRunner = await seedRunner(ownerScopeSeed(org.orgId), "org-runner");
+
+    expect((await del(`/api/v1/repos/alice/${slug}/actions/runners/${orgRunner.id}`, alice.id)).status).toBe(404);
+    expect((await del(`/api/v1/repos/alice/${slug}/actions/runners/${runner.id}`, alice.id)).status).toBe(204);
+    expect((await env.DB.prepare("SELECT COUNT(*) AS n FROM action_runners").first<{ n: number }>())?.n).toBe(1);
+    const miss = await del(`/api/v1/repos/alice/${slug}/actions/runners/${runner.id}`, alice.id);
+    expect(miss.status).toBe(404);
+    expect(await messageOf(miss)).toBe(`runner with id ${runner.id}: resource does not exist`);
+  });
+
+  it("403: a plain user (even the site admin's sibling non-owner) takes upstream's reqOwner message; the admin passes", async () => {
+    const { alice, bob, admin } = await seedWorld();
+    const { slug } = await seedRepo(alice);
+    const base = `/api/v1/repos/alice/${slug}/actions/runners`;
+    for (const attempt of [get(`${base}`, bob.id), post(`${base}/registration-token`, null, bob.id), get(`${base}/1`, bob.id), del(`${base}/1`, bob.id), patch(`${base}/1`, { disabled: true }, bob.id)]) {
+      const res = await attempt;
+      expect(res.status).toBe(403);
+      expect(await messageOf(res)).toBe("user should be the owner of the repo");
+    }
+    expect((await get(`${base}`, admin.id)).status).toBe(200);
+  });
+
+  it("401 anonymous on all five ops", async () => {
+    const { alice } = await seedWorld();
+    const { slug } = await seedRepo(alice);
+    const base = `/api/v1/repos/alice/${slug}/actions/runners`;
+    expect((await get(`${base}`)).status).toBe(401);
+    expect((await post(`${base}/registration-token`, null)).status).toBe(401);
+    expect((await get(`${base}/1`)).status).toBe(401);
+    expect((await del(`${base}/1`)).status).toBe(401);
+    expect((await patch(`${base}/1`, { disabled: true })).status).toBe(401);
+  });
+});
+
+describe("org runners (/orgs/{org}/actions/runners)", () => {
+  it("the five ops over the org scope; the owner-scope encoding pins (owner_id=org, repo_id='')", async () => {
+    const org = await seedOrg("acme");
+    const now = Date.now();
+    const runner = await seedRunner(ownerScopeSeed(org.orgId), "org-runner", {
+      lastOnline: new Date(now),
+      lastActive: new Date(now),
+      agentLabels: ["self-hosted"],
+    });
+
+    const token = await jsonBody<{ token: string }>(await post("/api/v1/orgs/acme/actions/runners/registration-token", null, org.owner.id));
+    expect(typeof token.token).toBe("string");
+    const stored = await env.DB.prepare("SELECT owner_id, repo_id FROM action_runner_tokens").first<{ owner_id: number; repo_id: string }>();
+    expect(stored).toMatchObject({ owner_id: org.orgId, repo_id: "" });
+
+    const list = await get("/api/v1/orgs/acme/actions/runners", org.owner.id);
+    expect(list.status).toBe(200);
+    const wire = await jsonBody<RunnerListWire>(list);
+    expect(wire.total_count).toBe(1);
+    expect(wire.runners[0]).toMatchObject({ id: runner.id, name: "org-runner", status: "online", busy: true });
+
+    const got = await get(`/api/v1/orgs/acme/actions/runners/${runner.id}`, org.owner.id);
+    expect(got.status).toBe(200);
+
+    const flipped = await patch(`/api/v1/orgs/acme/actions/runners/${runner.id}`, { disabled: true }, org.owner.id);
+    expect(flipped.status).toBe(200);
+    expect((await jsonBody<RunnerWire>(flipped)).disabled).toBe(true);
+    // The disabled filter now hides it.
+    const hidden = await jsonBody<RunnerListWire>(await get("/api/v1/orgs/acme/actions/runners?disabled=false", org.owner.id));
+    expect(hidden.total_count).toBe(0);
+
+    expect((await del(`/api/v1/orgs/acme/actions/runners/${runner.id}`, org.owner.id)).status).toBe(204);
+    const miss = await del(`/api/v1/orgs/acme/actions/runners/${runner.id}`, org.owner.id);
+    expect(miss.status).toBe(404);
+    expect(await messageOf(miss)).toBe(`runner with id ${runner.id}: resource does not exist`);
+  });
+
+  it("403: a plain member and an outsider take reqOrgOwnership's message; a foreign repo-scoped runner 404s with the permission text", async () => {
+    const org = await seedOrg("acme");
+    const { alice } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    const repoRunner = await seedRunner(repoScopeSeed(repoId), "repo-runner");
+
+    const memberAttempt = await get("/api/v1/orgs/acme/actions/runners", org.member.id);
+    expect(memberAttempt.status).toBe(403);
+    expect(await messageOf(memberAttempt)).toBe("Must be an organization owner");
+    expect((await post("/api/v1/orgs/acme/actions/runners/registration-token", null, org.outsider.id)).status).toBe(403);
+
+    const foreign = await get(`/api/v1/orgs/acme/actions/runners/${repoRunner.id}`, org.owner.id);
+    expect(foreign.status).toBe(404);
+    expect(await messageOf(foreign)).toBe("No permission to access this runner");
+    expect(slug.length).toBeGreaterThan(0);
+  });
+
+  it("401 anonymous on all five ops", async () => {
+    await seedOrg("acme");
+    expect((await get("/api/v1/orgs/acme/actions/runners")).status).toBe(401);
+    expect((await post("/api/v1/orgs/acme/actions/runners/registration-token", null)).status).toBe(401);
+    expect((await get("/api/v1/orgs/acme/actions/runners/1")).status).toBe(401);
+    expect((await del("/api/v1/orgs/acme/actions/runners/1")).status).toBe(401);
+    expect((await patch("/api/v1/orgs/acme/actions/runners/1", { disabled: true })).status).toBe(401);
+  });
+});
+
+describe("user runners (/user/actions/runners)", () => {
+  it("the five ops over the doer's own scope; siblings' rows are foreign", async () => {
+    const { alice, bob } = await seedWorld();
+    const now = Date.now();
+    const runner = await seedRunner(ownerScopeSeed(alice.id), "alice-runner", {
+      lastOnline: new Date(now),
+      lastActive: new Date(now - T_IDLE),
+    });
+
+    const token = await jsonBody<{ token: string }>(await post("/api/v1/user/actions/runners/registration-token", null, alice.id));
+    expect(typeof token.token).toBe("string");
+    // bob's token mint is a DIFFERENT scope row.
+    const bobToken = await jsonBody<{ token: string }>(await post("/api/v1/user/actions/runners/registration-token", null, bob.id));
+    expect(bobToken.token).not.toBe(token.token);
+
+    const list = await get("/api/v1/user/actions/runners", alice.id);
+    expect(list.status).toBe(200);
+    const wire = await jsonBody<RunnerListWire>(list);
+    expect(wire.total_count).toBe(1);
+    expect(wire.runners[0]).toMatchObject({ id: runner.id, status: "online", busy: false });
+
+    // bob sees an EMPTY list (his scope) and alice's runner is foreign.
+    expect((await jsonBody<RunnerListWire>(await get("/api/v1/user/actions/runners", bob.id))).total_count).toBe(0);
+    const foreign = await get(`/api/v1/user/actions/runners/${runner.id}`, bob.id);
+    expect(foreign.status).toBe(404);
+    expect(await messageOf(foreign)).toBe("No permission to access this runner");
+
+    const flipped = await patch(`/api/v1/user/actions/runners/${runner.id}`, { disabled: true }, alice.id);
+    expect(flipped.status).toBe(200);
+    expect((await jsonBody<RunnerWire>(flipped)).disabled).toBe(true);
+
+    expect((await del(`/api/v1/user/actions/runners/${runner.id}`, alice.id)).status).toBe(204);
+    const miss = await del(`/api/v1/user/actions/runners/${runner.id}`, alice.id);
+    expect(miss.status).toBe(404);
+    expect(await messageOf(miss)).toBe(`runner with id ${runner.id}: resource does not exist`);
+  });
+
+  it("401 anonymous on all five ops", async () => {
+    await seedWorld();
+    expect((await get("/api/v1/user/actions/runners")).status).toBe(401);
+    expect((await post("/api/v1/user/actions/runners/registration-token", null)).status).toBe(401);
+    expect((await get("/api/v1/user/actions/runners/1")).status).toBe(401);
+    expect((await del("/api/v1/user/actions/runners/1")).status).toBe(401);
+    expect((await patch("/api/v1/user/actions/runners/1", { disabled: true })).status).toBe(401);
+  });
+});
+
+/** Seed-scope builders mirroring the service's sentinel encoding (repo rows
+ *  carry owner_id 0; owner rows carry repo_id ''). */
+function repoScopeSeed(repoId: string): { ownerId: number; repoId: string } {
+  return { ownerId: 0, repoId };
+}
+
+function ownerScopeSeed(ownerId: number): { ownerId: number; repoId: string } {
+  return { ownerId, repoId: "" };
+}
