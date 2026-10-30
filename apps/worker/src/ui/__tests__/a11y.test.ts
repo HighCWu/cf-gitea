@@ -697,6 +697,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Security",
       "Applications",
       "SSH / GPG Keys",
+      "General", // the P2-1 user general page's module lit the Actions group's General sub-item (navbar.tmpl:43-45)
       "Runners",
       "Secrets",
       "Variables",
@@ -804,6 +805,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Security",
       "Applications",
       "SSH / GPG Keys",
+      "General", // the P2-1 user general page's module lit the Actions group's General sub-item (navbar.tmpl:43-45)
       "Runners",
       "Secrets",
       "Variables",

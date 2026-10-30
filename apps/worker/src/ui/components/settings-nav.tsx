@@ -33,17 +33,21 @@
  *
  * Per-template reductions applied:
  *   - user nav: Blocked users (no user-scope module), Audit, Packages,
- *     Repos, and the Actions General/Runners/Scoped-workflows sub-items are
- *     UNRENDERED (no landed pages). Account and Notifications RENDER —
+ *     Repos, and the Actions Scoped-workflows sub-item are UNRENDERED (no
+ *     landed pages). Account and Notifications RENDER —
  *     their pages landed (upstream gates them on disabled-features /
  *     EnableNotifyMail; both settings pin FALSE/TRUE so the items always
  *     render — the modules' SPEC §3 reduction).
- *   - org nav: Packages and the Actions General/Scoped-workflows sub-items
+ *   - org nav: Packages and the Actions Scoped-workflows sub-item
  *     are UNRENDERED (Applications joined the landed set with the R20-a tab,
  *     Audit with the census R13 org arm, and Runners with the census C7 org
  *     twin's mount — pages/org-settings-actions-runners.tsx; the USER
  *     twin's Runners item lit with its own module's mount — pages/
- *     user-settings-actions-runners.tsx).
+ *     user-settings-actions-runners.tsx; the GENERAL sub-items lit with the
+ *     P2-1/P2-2 owner general pages' modules — pages/
+ *     org-settings-actions-general.tsx + pages/user-settings-actions-
+ *     general.tsx; both are committed-unmounted, live links for the
+ *     index.ts window to route).
  *   - The Labels item keeps the landed href `{orgLink}/labels` — upstream's
  *     `{.OrgLink}}/settings/labels` target is the DOCUMENTED wave-14 URL
  *     divergence (pages/org-settings.tsx header: "the target exists so the
@@ -125,6 +129,7 @@ export const settingsNavLocale = {
   applications: "Applications", // "settings.applications" (:29)
   ssh_gpg_keys: "SSH / GPG Keys", // "settings.ssh_gpg_keys" (:33)
   actions: "Actions", // "actions.actions" (the <details> summary, :41)
+  actions_general: "General", // "actions.general" (user navbar.tmpl:43-45) / "settings.general" (org navbar.tmpl:32-34 — the same English word; lit by BOTH owner general pages: org-settings-actions-general + user-settings-actions-general)
   runners: "Runners", // "actions.runners" (navbar.tmpl:35-37/43-48 — lit by BOTH twins' mounts: org-settings-actions-runners + user-settings-actions-runners)
   packages: "Packages", // "packages.title" (navbar.tmpl:25/61-65 — lit by BOTH packages settings tabs' mounts: org + user)
   secrets: "Secrets", // "secrets.secrets" (:50)
@@ -151,6 +156,7 @@ export type UserSettingsNavTab =
   | "security" // pages/user-settings-security.tsx
   | "applications" // pages/user-settings-applications.tsx
   | "keys" // pages/user-settings-keys.tsx
+  | "actions-general" // pages/user-settings-actions-general.tsx
   | "runners" // pages/user-settings-actions-runners.tsx
   | "packages" // pages/user-settings-packages.tsx
   | "secrets" // pages/user-settings-secrets.tsx
@@ -165,7 +171,18 @@ export type UserSettingsNavTab =
  *  upstream's PageIsOrgSettingsLabels arm (navbar.tmpl:12 — today the item
  *  links the landed `/{org}/labels` page, which renders no settings nav, so
  *  no caller passes it yet). */
-export type OrgSettingsNavTab = "options" | "hooks" | "labels" | "applications" | "blocked" | "packages" | "runners" | "secrets" | "variables" | "audit";
+export type OrgSettingsNavTab =
+  | "options"
+  | "hooks"
+  | "labels"
+  | "applications"
+  | "blocked"
+  | "packages"
+  | "actions-general" // pages/org-settings-actions-general.tsx
+  | "runners"
+  | "secrets"
+  | "variables"
+  | "audit";
 
 // ---------------------------------------------------------------------------
 // The user settings navbar (user/settings/navbar.tmpl reduced)
@@ -173,11 +190,11 @@ export type OrgSettingsNavTab = "options" | "hooks" | "labels" | "applications" 
 
 /**
  * The shared USER settings navbar. `active` marks the rendered page's tab;
- * the Actions <details> opens while a secrets/variables page renders
+ * the Actions <details> opens while an actions-group page renders
  * (navbar.tmpl:40's or-arm) and stays closed otherwise. Item order is
  * navbar.tmpl's exact order with the dead items dropped: Profile, Account,
  * Notifications, Appearance, Security, Applications, Keys,
- * Actions▸(Secrets, Variables), Hooks, Organizations.
+ * Actions▸(General, Runners, Secrets, Variables), Hooks, Organizations.
  */
 export function UserSettingsNavbar(props: { active: UserSettingsNavTab }) {
   const item = (tab: UserSettingsNavTab) => (props.active === tab ? "active item" : "item");
@@ -213,16 +230,24 @@ export function UserSettingsNavbar(props: { active: UserSettingsNavTab }) {
         <a class={item("keys")} href="/user/settings/keys">
           {settingsNavLocale.ssh_gpg_keys}
         </a>
-        {/* navbar.tmpl:39-60 — General (:41-42) and Scoped-workflows
-            (:55-57) dead; Runners (:43-48) lit by the user twin's mount,
-            Secrets (:49-51) + Variables (:52-54) landed. Open while any of
-            the three is the active page. */}
+        {/* navbar.tmpl:39-60 — General (:43-45) lit by the user general
+            page's module (pages/user-settings-actions-general.tsx); Runners
+            (:46-48) lit by the user twin's mount, Secrets (:49-51) +
+            Variables (:52-54) landed; Scoped-workflows (:55-57) dead. Open
+            while any of the four is the active page (:40's or-arm). */}
         <details
           class="item"
-          open={props.active === "runners" || props.active === "secrets" || props.active === "variables" ? true : undefined}
+          open={
+            props.active === "actions-general" || props.active === "runners" || props.active === "secrets" || props.active === "variables"
+              ? true
+              : undefined
+          }
         >
           <summary>{settingsNavLocale.actions}</summary>
           <div class="menu">
+            <a class={item("actions-general")} href="/user/settings/actions/general">
+              {settingsNavLocale.actions_general}
+            </a>
             <a class={item("runners")} href="/user/settings/actions/runners">
               {settingsNavLocale.runners}
             </a>
@@ -267,7 +292,7 @@ export function UserSettingsNavbar(props: { active: UserSettingsNavTab }) {
  * The shared ORG settings navbar. `orgLink` is `/{org}` (the family's
  * OrgLink); `active` marks the rendered page's tab. Item order is
  * navbar.tmpl's exact order with the dead items dropped: Options, Hooks,
- * Labels, Applications, Blocked users, Actions▸(Runners, Secrets,
+ * Labels, Applications, Blocked users, Actions▸(General, Runners, Secrets,
  * Variables), Audit.
  */
 export function OrgSettingsNavbar(props: { orgLink: string; active: OrgSettingsNavTab }) {
@@ -307,17 +332,27 @@ export function OrgSettingsNavbar(props: { orgLink: string; active: OrgSettingsN
         <a class={item("packages")} href={`${props.orgLink}/settings/packages`}>
           {settingsNavLocale.packages}
         </a>
-        {/* navbar.tmpl:28-48 — General (:32-34) and Scoped-workflows
-            (:44-46) dead; Runners (:35-37) lit by the census C7 org twin's
-            mount (pages/org-settings-actions-runners.tsx), Secrets (:38-40) +
-            Variables (:41-43) landed. Open while any of the three is the
-            active page (navbar.tmpl:29's or-arm). */}
+        {/* navbar.tmpl:28-48 — General (:32-34) lit by the org general
+            page's module (pages/org-settings-actions-general.tsx); its href
+            is upstream's own `{.OrgLink}/settings/actions` — the BARE
+            actions URL the LocationRedirect serves (web.go:1052), not the
+            page URL. Runners (:35-37) lit by the census C7 org twin's mount
+            (pages/org-settings-actions-runners.tsx), Secrets (:38-40) +
+            Variables (:41-43) landed; Scoped-workflows (:44-46) dead. Open
+            while any of the four is the active page (:29's or-arm). */}
         <details
           class="item"
-          open={props.active === "runners" || props.active === "secrets" || props.active === "variables" ? true : undefined}
+          open={
+            props.active === "actions-general" || props.active === "runners" || props.active === "secrets" || props.active === "variables"
+              ? true
+              : undefined
+          }
         >
           <summary>{settingsNavLocale.actions}</summary>
           <div class="menu">
+            <a class={item("actions-general")} href={`${props.orgLink}/settings/actions`}>
+              {settingsNavLocale.actions_general}
+            </a>
             <a class={item("runners")} href={`${props.orgLink}/settings/actions/runners`}>
               {settingsNavLocale.runners}
             </a>

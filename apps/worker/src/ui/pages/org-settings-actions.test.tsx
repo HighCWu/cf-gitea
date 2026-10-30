@@ -417,11 +417,13 @@ describe("the secrets page DOM (org/settings/actions.tmpl PageType secrets + sha
     expect(html).toContain('href="/coalition/settings"'); // the landed settings tabs stay linked
     expect(html).toContain('href="/coalition/settings/hooks"');
     expect(html).toContain('href="/coalition/labels"');
-    // The still-unlanded sub-items render nothing (the General href's dead
-    // anchor can never appear — the literal is a prefix of the landed tails,
-    // so the assert pins the quoted attribute shape).
+    // The Scoped-workflows sub-item stays unlanded (P1-3's substrate). The
+    // General sub-item LIT with the P2-2 org general page's module (the
+    // navbar's quoted href is upstream's own bare-actions URL,
+    // navbar.tmpl:32-34 — the pin flips from the dead-item assert, keeping
+    // the quoted shape that disambiguates it from the landed tails).
     expect(html).not.toContain("scoped-workflows");
-    expect(html).not.toContain('href="/coalition/settings/actions"');
+    expect(html).toContain('href="/coalition/settings/actions"');
   });
 
   it("renders the empty arm (secrets.none) and the add form with the upstream contract", async () => {

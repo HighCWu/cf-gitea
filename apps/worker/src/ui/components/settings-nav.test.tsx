@@ -43,6 +43,7 @@ const USER_HREF_ORDER = [
   'href="/user/settings/security"',
   'href="/user/settings/applications"',
   'href="/user/settings/keys"',
+  'href="/user/settings/actions/general"', // lit by the user general page's module (P2-1)
   'href="/user/settings/actions/secrets"',
   'href="/user/settings/actions/variables"',
   'href="/user/settings/hooks"',
@@ -76,6 +77,7 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
       settingsNavLocale.applications, // "settings.applications"
       settingsNavLocale.ssh_gpg_keys, // "settings.ssh_gpg_keys"
       settingsNavLocale.actions, // "actions.actions" (the summary)
+      settingsNavLocale.actions_general, // "actions.general" (lit by the user general page's module)
       settingsNavLocale.secrets, // "secrets.secrets"
       settingsNavLocale.variables, // "actions.variables"
       settingsNavLocale.hooks, // "repo.settings.hooks"
@@ -100,12 +102,11 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
     ]) {
       expect(html).not.toContain(dead);
     }
-    // The Actions General/Scoped-workflows sub-items (:41-42, :55-57) have
-    // no landed pages; Runners (:43-48) landed with the user twin's mount.
-    for (const deadSub of [
-      'href="/user/settings/actions/general"',
-      'href="/user/settings/actions/scoped-workflows"',
-    ]) {
+    // The Actions Scoped-workflows sub-item (:55-57) has no landed page
+    // (P1-3's substrate); General (:43-45) lit with the user general page's
+    // module (P2-1, committed-unmounted), Runners (:46-48) landed with the
+    // user twin's mount.
+    for (const deadSub of ['href="/user/settings/actions/scoped-workflows"']) {
       expect(html).not.toContain(deadSub);
     }
   });
@@ -116,6 +117,7 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
       account: 'href="/user/settings/account"',
       notifications: 'href="/user/settings/notifications"',
       appearance: 'href="/user/settings/appearance"',
+      "actions-general": 'href="/user/settings/actions/general"', // the user general page (P2-1)
       runners: 'href="/user/settings/actions/runners"',
       packages: 'href="/user/settings/packages"',
       security: 'href="/user/settings/security"',
@@ -135,7 +137,8 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
     }
   });
 
-  it("opens the Actions disclosure while a secrets/variables page renders, closed otherwise (navbar.tmpl:40)", () => {
+  it("opens the Actions disclosure while an actions-group page renders, closed otherwise (navbar.tmpl:40)", () => {
+    expect(renderToString(<UserSettingsNavbar active="actions-general" />)).toContain('<details class="item" open');
     expect(renderToString(<UserSettingsNavbar active="secrets" />)).toContain('<details class="item" open');
     expect(renderToString(<UserSettingsNavbar active="variables" />)).toContain('<details class="item" open');
     const closed = renderToString(<UserSettingsNavbar active="profile" />);
@@ -183,6 +186,7 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
       settingsNavLocale.applications, // "settings.applications" (lit by the R20-a applications tab's mount)
       settingsNavLocale.blocked_users, // "user.block.list"
       settingsNavLocale.actions, // "actions.actions"
+      settingsNavLocale.actions_general, // "actions.general"/"settings.general" (lit by the org general page's module, P2-2)
       settingsNavLocale.runners, // "actions.runners" (lit by the C7 org twin's mount)
       settingsNavLocale.secrets, // "secrets.secrets"
       settingsNavLocale.variables, // "actions.variables"
@@ -199,6 +203,7 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
       'href="/acme/labels"', // the wave-14 divergence — upstream: /settings/labels
       'href="/acme/settings/applications"', // lit by the R20-a applications tab's mount
       'href="/acme/settings/blocked_users"',
+      'href="/acme/settings/actions"', // lit by the org general page's module (P2-2) — navbar.tmpl:32-34's BARE actions URL, before Runners
       'href="/acme/settings/actions/runners"', // lit by the C7 org twin's mount — navbar.tmpl:35-37, before Secrets
       'href="/acme/settings/actions/secrets"',
       'href="/acme/settings/actions/variables"',
@@ -212,14 +217,13 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
     expect(html).not.toContain('href="/acme/settings/labels"');
   });
 
-  it("renders NO dead items — the General/Scoped-workflows sub-items are omitted (Applications landed with the R20-a tab, Audit with the census R13 org arm, Runners with the C7 org twin's mount, Packages with the org settings packages tab's mount)", () => {
+  it("renders NO dead items — the Scoped-workflows sub-item is omitted (Applications landed with the R20-a tab, Audit with the census R13 org arm, Runners with the C7 org twin's mount, Packages with the org settings packages tab's mount, General with the org general page's module)", () => {
     const html = renderToString(<OrgSettingsNavbar orgLink="/acme" active="options" />);
-    for (const dead of [
-      'href="/acme/settings/actions"', // the General sub-item, :32-34
-      'href="/acme/settings/actions/scoped-workflows"', // :44-46
-    ]) {
-      expect(html).not.toContain(dead);
-    }
+    // The General sub-item (:32-34) now renders with upstream's own bare
+    // `{OrgLink}/settings/actions` href — the quoted attribute shape
+    // disambiguates it from the landed tails' longer hrefs.
+    expect(html).toContain('href="/acme/settings/actions"');
+    expect(html).not.toContain('href="/acme/settings/actions/scoped-workflows"'); // :44-46, dead (P1-3)
   });
 
   it("marks exactly the active tab's anchor (every union member)", () => {
@@ -229,6 +233,7 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
       labels: 'href="/acme/labels"',
       applications: 'href="/acme/settings/applications"',
       blocked: 'href="/acme/settings/blocked_users"',
+      "actions-general": 'href="/acme/settings/actions"', // the org general page (P2-2) — the bare actions URL
       runners: 'href="/acme/settings/actions/runners"',
       secrets: 'href="/acme/settings/actions/secrets"',
       variables: 'href="/acme/settings/actions/variables"',
@@ -245,6 +250,7 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
               | "labels"
               | "applications"
               | "blocked"
+              | "actions-general"
               | "runners"
               | "secrets"
               | "variables"
@@ -257,7 +263,8 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
     }
   });
 
-  it("opens the Actions disclosure while a runners/secrets/variables page renders, closed otherwise (navbar.tmpl:29)", () => {
+  it("opens the Actions disclosure while an actions-group page renders, closed otherwise (navbar.tmpl:29)", () => {
+    expect(renderToString(<OrgSettingsNavbar orgLink="/acme" active="actions-general" />)).toContain('<details class="item" open');
     expect(renderToString(<OrgSettingsNavbar orgLink="/acme" active="runners" />)).toContain('<details class="item" open');
     expect(renderToString(<OrgSettingsNavbar orgLink="/acme" active="secrets" />)).toContain('<details class="item" open');
     expect(renderToString(<OrgSettingsNavbar orgLink="/acme" active="variables" />)).toContain('<details class="item" open');
