@@ -250,7 +250,7 @@ describe("GET /repos/{owner}/{repo}/actions/workflows (ActionsListRepositoryWork
   it("lists the .gitea/workflows entries with the ActionWorkflow wire (200)", async () => {
     const res = await get(`${SUITE}/actions/workflows`, "alice-token");
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { workflows: Array<Record<string, unknown>>; total_count: number };
+    const body = await res.json<{ workflows: Array<Record<string, unknown>>; total_count: number }>();
     expect(body.total_count).toBe(3);
     const names = body.workflows.map((w) => w.id as string).sort();
     expect(names).toEqual(["broken.yml", "ci.yml", "notify.yml"]);
@@ -275,7 +275,7 @@ describe("GET /repos/{owner}/{repo}/actions/workflows (ActionsListRepositoryWork
   it("falls back to .github/workflows when .gitea/workflows does not exist", async () => {
     const res = await get(`${FALLBACK}/actions/workflows`, "alice-token");
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { workflows: Array<{ id: string; name: string }>; total_count: number };
+    const body = await res.json<{ workflows: Array<{ id: string; name: string }>; total_count: number }>();
     expect(body.total_count).toBe(1);
     expect(body.workflows[0]?.id).toBe("deploy.yml");
     expect(body.workflows[0]?.name).toBe("Deploy");
@@ -293,7 +293,7 @@ describe("GET /repos/{owner}/{repo}/actions/workflows (ActionsListRepositoryWork
     // hasActions=false — so the non-admin reader hits the unit gate.
     const denied = await get(`${EMPTY}/actions/workflows`, "bob-token");
     expect(denied.status).toBe(403);
-    expect(((await denied.json()) as { message: string }).message).toBe(
+    expect((await denied.json<{ message: string }>()).message).toBe(
       "user should have specific read permission or be a repo admin or a site admin",
     );
     expect((await get(`${EMPTY}/actions/workflows`, "admin-token")).status).toBe(200);
@@ -308,7 +308,7 @@ describe("GET /repos/{owner}/{repo}/actions/workflows/{workflow_id} (ActionsGetW
   it("serves one workflow by file name (200, the list item's shape)", async () => {
     const res = await get(`${SUITE}/actions/workflows/ci.yml`, "alice-token");
     expect(res.status).toBe(200);
-    const body = (await res.json()) as Record<string, unknown>;
+    const body = await res.json<Record<string, unknown>>();
     expect(body.id).toBe("ci.yml");
     expect(body.name).toBe("CI");
     expect(body.state).toBe("active");
@@ -348,7 +348,7 @@ describe("PUT .../disable + .../enable (the LANDED ActionsConfig store)", () => 
 
   it("the disabled workflow renders state disabled_manually; siblings stay active", async () => {
     const res = await get(`${SUITE}/actions/workflows`, "alice-token");
-    const body = (await res.json()) as { workflows: Array<{ id: string; state: string }> };
+    const body = await res.json<{ workflows: Array<{ id: string; state: string }> }>();
     expect(body.workflows.find((w) => w.id === "ci.yml")?.state).toBe("disabled_manually");
     expect(body.workflows.find((w) => w.id === "notify.yml")?.state).toBe("active");
   });
@@ -358,21 +358,21 @@ describe("PUT .../disable + .../enable (the LANDED ActionsConfig store)", () => 
     const cfg = await loadRepoActionsConfig(env.DB, SUITE_REPO_ID);
     expect(cfg.disabledWorkflows).toEqual([]);
     const res = await get(`${SUITE}/actions/workflows/ci.yml`, "alice-token");
-    expect(((await res.json()) as { state: string }).state).toBe("active");
+    expect((await res.json<{ state: string }>()).state).toBe("active");
   });
 
   it("404s an unknown workflow on both arms", async () => {
     for (const arm of ["disable", "enable"]) {
       const res = await put(`${SUITE}/actions/workflows/ghost.yml/${arm}`, "alice-token");
       expect(res.status).toBe(404);
-      expect(((await res.json()) as { message: string }).message).toBe('workflow "ghost.yml" not found');
+      expect((await res.json<{ message: string }>()).message).toBe('workflow "ghost.yml" not found');
     }
   });
 
   it("gates: the writer arm 403s a plain reader (bob) — reqRepoWriter's message", async () => {
     const res = await put(`${SUITE}/actions/workflows/ci.yml/disable`, "bob-token");
     expect(res.status).toBe(403);
-    expect(((await res.json()) as { message: string }).message).toBe("user should have a permission to write to a repo");
+    expect((await res.json<{ message: string }>()).message).toBe("user should have a permission to write to a repo");
     expect((await put(`${SUITE}/actions/workflows/ci.yml/disable`)).status).toBe(401);
   });
 });
@@ -384,7 +384,6 @@ describe("PUT .../disable + .../enable (the LANDED ActionsConfig store)", () => 
 /** The three run rows the runs suite shares (inserted once, in order). */
 let runAId = 0;
 let runBId = 0;
-let runCId = 0;
 
 describe("GET .../workflows/{workflow_id}/runs (ActionsListWorkflowRuns)", () => {
   it("404s a workflow that has no runs AND no file; 200/0 when the file exists", async () => {
@@ -396,7 +395,7 @@ describe("GET .../workflows/{workflow_id}/runs (ActionsListWorkflowRuns)", () =>
     // ghost.yml neither runs nor exists — the not-found arm.
     const missing = await get(`${SUITE}/actions/workflows/ghost.yml/runs`, "alice-token");
     expect(missing.status).toBe(404);
-    expect(((await missing.json()) as { message: string }).message).toBe('workflow "ghost.yml" not found');
+    expect((await missing.json<{ message: string }>()).message).toBe('workflow "ghost.yml" not found');
   });
 
   it("lists the workflow's runs newest-first with the ActionWorkflowRun wire (200)", async () => {
@@ -427,7 +426,7 @@ describe("GET .../workflows/{workflow_id}/runs (ActionsListWorkflowRuns)", () =>
       triggerEvent: "workflow_dispatch",
       title: "seed: docs",
     }, [{ jobId: "build", runsOn: ["ubuntu-latest"], workflowPayload: new TextEncoder().encode("name: CI\njobs:\n  build: {}\n") }]);
-    const { run: runC } = await insertActionRun(env.DB, {
+    await insertActionRun(env.DB, {
       repoId: SUITE_REPO_ID,
       ownerId: ALICE_ID,
       workflowId: "notify.yml",
@@ -442,7 +441,6 @@ describe("GET .../workflows/{workflow_id}/runs (ActionsListWorkflowRuns)", () =>
     }, [{ jobId: "notify", runsOn: ["ubuntu-latest"], workflowPayload: new TextEncoder().encode("jobs:\n  notify: {}\n") }]);
     runAId = runA.id;
     runBId = runB.id;
-    runCId = runC.id;
     // runB completes: the run AND its attempt row flip to success — the
     // converter reads the ATTEMPT's status (ToActionWorkflowRun,
     // convert.go:299-306, exactly how a real completion lands). The run
@@ -454,20 +452,21 @@ describe("GET .../workflows/{workflow_id}/runs (ActionsListWorkflowRuns)", () =>
     const res = await get(`${SUITE}/actions/workflows/ci.yml/runs`, "alice-token");
     expect(res.status).toBe(200);
     expect(res.headers.get("X-Total-Count")).toBe("2");
-    const body = (await res.json()) as { total_count: number; workflow_runs: Array<Record<string, unknown>> };
+    const body = await res.json<{ total_count: number; workflow_runs: Array<Record<string, unknown>> }>();
     expect(body.total_count).toBe(2);
     // repo-scoped order: `index DESC` (run_list.go:142-149).
     expect(body.workflow_runs.map((r) => r.id)).toEqual([runBId, runAId]); // runC (notify.yml) excluded
 
     const run = body.workflow_runs[0] as Record<string, unknown>;
+    const runUrl = run.url as string;
     expect(run.url).toBe(`${ORIGIN}/api/v1/repos/alice/actions-suite/actions/runs/${runBId}`);
     expect(run.previous_attempt_url).toBeNull(); // explicit null — attempt 1
     expect(run.html_url).toBe(`${ORIGIN}/alice/actions-suite/actions/runs/${runBId}`);
-    expect(run.jobs_url).toBe(`${run.url}/jobs`);
-    expect(run.logs_url).toBe(`${run.url}/logs`);
-    expect(run.artifacts_url).toBe(`${run.url}/artifacts`);
-    expect(run.cancel_url).toBe(`${run.url}/cancel`);
-    expect(run.rerun_url).toBe(`${run.url}/rerun`);
+    expect(run.jobs_url).toBe(`${runUrl}/jobs`);
+    expect(run.logs_url).toBe(`${runUrl}/logs`);
+    expect(run.artifacts_url).toBe(`${runUrl}/artifacts`);
+    expect(run.cancel_url).toBe(`${runUrl}/cancel`);
+    expect(run.rerun_url).toBe(`${runUrl}/rerun`);
     expect(run.display_title).toBe("seed: docs");
     expect(run.path).toBe("ci.yml@refs/heads/topic");
     expect(run.event).toBe("workflow_dispatch");
@@ -490,43 +489,43 @@ describe("GET .../workflows/{workflow_id}/runs (ActionsListWorkflowRuns)", () =>
   it("filters: status (with the 400 invalid text), actor (404 text), branch, event, head_sha", async () => {
     const queued = await get(`${SUITE}/actions/workflows/ci.yml/runs?status=queued`, "alice-token");
     expect(queued.status).toBe(200);
-    expect(((await queued.json()) as { workflow_runs: Array<{ id: number }> }).workflow_runs.map((r) => r.id)).toEqual([runAId]);
+    expect((await queued.json<{ workflow_runs: Array<{ id: number }> }>()).workflow_runs.map((r) => r.id)).toEqual([runAId]);
 
     const completed = await get(`${SUITE}/actions/workflows/ci.yml/runs?status=completed`, "alice-token");
-    expect(((await completed.json()) as { workflow_runs: Array<{ id: number }> }).workflow_runs.map((r) => r.id)).toEqual([runBId]);
+    expect((await completed.json<{ workflow_runs: Array<{ id: number }> }>()).workflow_runs.map((r) => r.id)).toEqual([runBId]);
 
     const bad = await get(`${SUITE}/actions/workflows/ci.yml/runs?status=bogus`, "alice-token");
     expect(bad.status).toBe(400);
-    expect(((await bad.json()) as { message: string }).message).toBe("invalid status bogus");
+    expect((await bad.json<{ message: string }>()).message).toBe("invalid status bogus");
 
     const actor = await get(`${SUITE}/actions/workflows/ci.yml/runs?actor=alice`, "alice-token");
-    expect(((await actor.json()) as { total_count: number }).total_count).toBe(2);
+    expect((await actor.json<{ total_count: number }>()).total_count).toBe(2);
     const ghost = await get(`${SUITE}/actions/workflows/ci.yml/runs?actor=ghost`, "alice-token");
     expect(ghost.status).toBe(404);
-    expect(((await ghost.json()) as { message: string }).message).toBe("user does not exist [uid: 0, name: ghost]");
+    expect((await ghost.json<{ message: string }>()).message).toBe("user does not exist [uid: 0, name: ghost]");
 
     const branch = await get(`${SUITE}/actions/workflows/ci.yml/runs?branch=main`, "alice-token");
-    expect(((await branch.json()) as { workflow_runs: Array<{ id: number }> }).workflow_runs.map((r) => r.id)).toEqual([runAId]);
+    expect((await branch.json<{ workflow_runs: Array<{ id: number }> }>()).workflow_runs.map((r) => r.id)).toEqual([runAId]);
 
     const event = await get(`${SUITE}/actions/workflows/ci.yml/runs?event=workflow_dispatch`, "alice-token");
-    expect(((await event.json()) as { workflow_runs: Array<{ id: number }> }).workflow_runs.map((r) => r.id)).toEqual([runBId]);
+    expect((await event.json<{ workflow_runs: Array<{ id: number }> }>()).workflow_runs.map((r) => r.id)).toEqual([runBId]);
 
     const sha = await get(`${SUITE}/actions/workflows/ci.yml/runs?head_sha=${"a".repeat(40)}`, "alice-token");
-    expect(((await sha.json()) as { workflow_runs: Array<{ id: number }> }).workflow_runs.map((r) => r.id)).toEqual([runAId]);
+    expect((await sha.json<{ workflow_runs: Array<{ id: number }> }>()).workflow_runs.map((r) => r.id)).toEqual([runAId]);
   });
 
   it("paginates with the X-Total-Count and Link headers (limit/page)", async () => {
     const page1 = await get(`${SUITE}/actions/workflows/ci.yml/runs?limit=1`, "alice-token");
     expect(page1.headers.get("X-Total-Count")).toBe("2");
     expect(page1.headers.get("Link")).toContain('rel="next"');
-    const body1 = (await page1.json()) as { workflow_runs: Array<{ id: number }> };
+    const body1 = await page1.json<{ workflow_runs: Array<{ id: number }> }>();
     expect(body1.workflow_runs).toHaveLength(1);
     expect(body1.workflow_runs[0]?.id).toBe(runBId);
 
     const page2 = await get(`${SUITE}/actions/workflows/ci.yml/runs?limit=1&page=2`, "alice-token");
     expect(page2.headers.get("Link")).toContain('rel="prev"');
     expect(page2.headers.get("Link")).toContain('rel="first"');
-    const body2 = (await page2.json()) as { workflow_runs: Array<{ id: number }> };
+    const body2 = await page2.json<{ workflow_runs: Array<{ id: number }> }>();
     expect(body2.workflow_runs[0]?.id).toBe(runAId);
   });
 
@@ -587,7 +586,7 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
   it("return_run_details=true answers the RunDetails body (200)", async () => {
     const res = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "main" }, "alice-token", "?return_run_details=true");
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { workflow_run_id: number; run_url: string; html_url: string };
+    const body = await res.json<{ workflow_run_id: number; run_url: string; html_url: string }>();
     const runRow = (await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.id, body.workflow_run_id)).get());
     expect(runRow?.id).toBe(body.workflow_run_id);
     expect(body.run_url).toBe(`${ORIGIN}/api/v1/repos/alice/actions-suite/actions/runs/${body.workflow_run_id}`);
@@ -606,35 +605,35 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
     // actions_trigger_test.go:989-999 — the else arm treats it as a branch).
     const bare = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "v1" }, "alice-token");
     expect(bare.status).toBe(404);
-    expect(((await bare.json()) as { message: string }).message).toBe('ref "v1" doesn\'t exist');
+    expect((await bare.json<{ message: string }>()).message).toBe('ref "v1" doesn\'t exist');
   });
 
   it("422s: the binder's Ref Required, a workflow without the trigger, an invalid document", async () => {
     const noRef = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, {}, "alice-token");
     expect(noRef.status).toBe(422);
-    expect(((await noRef.json()) as { message: string }).message).toBe("Ref: Required");
+    expect((await noRef.json<{ message: string }>()).message).toBe("Ref: Required");
 
     // notify.yml parses but declares only `on: push` — the
     // has-no-workflow_dispatch arm (workflow.go:141-146).
     const noTrigger = await post(`${SUITE}/actions/workflows/notify.yml/dispatches`, { ref: "main" }, "alice-token");
     expect(noTrigger.status).toBe(422);
-    expect(((await noTrigger.json()) as { message: string }).message).toBe(
+    expect((await noTrigger.json<{ message: string }>()).message).toBe(
       'workflow "notify.yml" has no workflow_dispatch event trigger',
     );
 
     const invalid = await post(`${SUITE}/actions/workflows/broken.yml/dispatches`, { ref: "main" }, "alice-token");
     expect(invalid.status).toBe(422);
-    expect(((await invalid.json()) as { message: string }).message).toContain('invalid workflow "broken.yml":');
+    expect((await invalid.json<{ message: string }>()).message).toContain('invalid workflow "broken.yml":');
   });
 
   it("404s: an unknown ref, an unknown workflow, the scoped reduction", async () => {
     const badRef = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "nope" }, "alice-token");
     expect(badRef.status).toBe(404);
-    expect(((await badRef.json()) as { message: string }).message).toBe('ref "nope" doesn\'t exist');
+    expect((await badRef.json<{ message: string }>()).message).toBe('ref "nope" doesn\'t exist');
 
     const badWorkflow = await post(`${SUITE}/actions/workflows/ghost.yml/dispatches`, { ref: "main" }, "alice-token");
     expect(badWorkflow.status).toBe(404);
-    expect(((await badWorkflow.json()) as { message: string }).message).toBe('workflow "ghost.yml" not found');
+    expect((await badWorkflow.json<{ message: string }>()).message).toBe('workflow "ghost.yml" not found');
 
     const scoped = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "main" }, "alice-token", "?scoped_workflow_source_repo_id=1");
     expect(scoped.status).toBe(404);
@@ -644,7 +643,7 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
     expect((await put(`${SUITE}/actions/workflows/ci.yml/disable`, "alice-token")).status).toBe(204);
     const res = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "main" }, "alice-token");
     expect(res.status).toBe(403);
-    expect(((await res.json()) as { message: string }).message).toBe("workflow is disabled");
+    expect((await res.json<{ message: string }>()).message).toBe("workflow is disabled");
     // A missing ref on a disabled workflow STILL answers the disabled 403
     // (the check's order — workflow.go:83-98 precedes the ref arms).
     const noRef = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "nonexistent-branch" }, "alice-token");
@@ -655,7 +654,7 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
   it("gates: the writer arm 403s bob; anonymous 401", async () => {
     const res = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "main" }, "bob-token");
     expect(res.status).toBe(403);
-    expect(((await res.json()) as { message: string }).message).toBe("user should have a permission to write to a repo");
+    expect((await res.json<{ message: string }>()).message).toBe("user should have a permission to write to a repo");
     expect((await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "main" }, "x")).status).toBe(401);
   });
 });
@@ -702,12 +701,13 @@ describe("GET /repos/{owner}/{repo}/actions/jobs/{job_id} (getWorkflowJob)", () 
 
     const res = await get(`${SUITE}/actions/jobs/${jobId}`, "alice-token");
     expect(res.status).toBe(200);
-    const body = (await res.json()) as Record<string, unknown>;
+    const body = await res.json<Record<string, unknown>>();
     expect(body.id).toBe(jobId);
     expect(body.url).toBe(`${ORIGIN}/api/v1/repos/alice/actions-suite/actions/jobs/${jobId}`);
     expect(body.html_url).toBe(`${ORIGIN}/alice/actions-suite/actions/runs/${(await drizzle(env.DB).select().from(actionRunJobs).where(eq(actionRunJobs.id, jobId)).get())?.runId}/jobs/${jobId}`);
     expect(body.run_id).toBe((await drizzle(env.DB).select().from(actionRunJobs).where(eq(actionRunJobs.id, jobId)).get())?.runId);
-    expect(body.run_url).toBe(`${ORIGIN}/api/v1/repos/alice/actions-suite/actions/runs/${body.run_id}`);
+    const runId = body.run_id as number;
+    expect(body.run_url).toBe(`${ORIGIN}/api/v1/repos/alice/actions-suite/actions/runs/${runId}`);
     expect(body.name).toBe("build (ubuntu-latest)");
     expect(body.labels).toEqual(["ubuntu-latest"]);
     expect(body.run_attempt).toBe(1);
@@ -726,7 +726,7 @@ describe("GET /repos/{owner}/{repo}/actions/jobs/{job_id} (getWorkflowJob)", () 
 
     const junk = await get(`${SUITE}/actions/jobs/not-a-number`, "alice-token");
     expect(junk.status).toBe(404);
-    expect(((await junk.json()) as { message: string }).message).toBe("not found");
+    expect((await junk.json<{ message: string }>()).message).toBe("not found");
   });
 
   it("gates: 401 anonymous, 403 on the disabled unit", async () => {
@@ -749,7 +749,7 @@ describe("GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs (downloadActionsR
 
   beforeAll(async () => {
     const db = drizzle(env.DB);
-    const { run, jobRows } = await insertActionRun(env.DB, {
+    const { jobRows } = await insertActionRun(env.DB, {
       repoId: SUITE_REPO_ID,
       ownerId: ALICE_ID,
       workflowId: "ci.yml",
@@ -836,7 +836,7 @@ describe("GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs (downloadActionsR
   it("404s: a foreign-repo job (the wrapped not-exist text), an unclaimed job, an expired log", async () => {
     const foreign = await get(`${SUITE}/actions/jobs/${foreignJobId}/logs`, "alice-token");
     expect(foreign.status).toBe(404);
-    expect(((await foreign.json()) as { message: string }).message).toBe(
+    expect((await foreign.json<{ message: string }>()).message).toBe(
       `run job with id ${foreignJobId}: resource does not exist`,
     );
 
@@ -855,12 +855,12 @@ describe("GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs (downloadActionsR
     }, [{ jobId: "build", runsOn: ["ubuntu-latest"], workflowPayload: new TextEncoder().encode("jobs:\n  build: {}\n") }]);
     const unclaimed = await get(`${SUITE}/actions/jobs/${jobRows[0]?.id}/logs`, "alice-token");
     expect(unclaimed.status).toBe(404);
-    expect(((await unclaimed.json()) as { message: string }).message).toBe("job not started");
+    expect((await unclaimed.json<{ message: string }>()).message).toBe("job not started");
 
     await drizzle(env.DB).update(actionTasks).set({ logExpired: true }).where(eq(actionTasks.id, logTaskId));
     const expired = await get(`${SUITE}/actions/jobs/${logJobId}/logs`, "alice-token");
     expect(expired.status).toBe(404);
-    expect(((await expired.json()) as { message: string }).message).toBe("logs have been cleaned up");
+    expect((await expired.json<{ message: string }>()).message).toBe("logs have been cleaned up");
     await drizzle(env.DB).update(actionTasks).set({ logExpired: false }).where(eq(actionTasks.id, logTaskId));
   });
 
