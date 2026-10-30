@@ -172,11 +172,16 @@ as such (the pipeline lives in the [SPEC index](specs/README.md) and the
 the control plane (M1a, `32ef8bf`) is in — `Register`/`Declare`/`FetchTask`/`Ping`
 mounted as connect-RPC procedures with the dispatch CAS, migration 0041's twelve
 tables, the wire freeze hash-verified against upstream's actionslib v1.5.0, and a
-fake-runner oracle speaking real connect/proto against the mounted app. Execution
-never runs in the Worker: per upstream's architecture, runners are self-hosted — a
-stock `act_runner` registered against your instance (the self-host guide is
-SPEC-0012's M2 milestone). M1b (task updates, the log-chunk protocol, artifacts
-v4-then-v1, the OIDC issuer) and the Actions UI family are in flight.
+fake-runner oracle speaking real connect/proto against the mounted app. M1b (task
+updates, the log-chunk protocol, artifacts v4-then-v1, the OIDC issuer; `10cfb97`)
+and the Actions UI family are landed, the always-on sweeps ride the standing
+crons (zombie stop `3bc5d29`; endless/abandoned/ephemeral `e4b9f66`) beside the
+opt-in `ACTIONS_*_RETENTION_DAYS` vars (`3bc5d29`), and the self-host guide is
+landed as [docs/guide/actions-runners.md](docs/guide/actions-runners.md) (M2) —
+a stock `act_runner` registers against your instance. Execution never runs in
+the Worker: per upstream's architecture, runners are self-hosted. Still absent:
+the trigger chain (M3) — nothing creates runs from pushes yet — and the
+`/api/v1` runner-management ops (SPEC-0012 §2.8).
 
 Twenty-six SPEC documents + five ADRs; new features start with a SPEC (see the
 [SPEC index](specs/README.md) for per-SPEC status). Full conventions live in

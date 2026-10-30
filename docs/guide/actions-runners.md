@@ -1,6 +1,6 @@
 # Self-hosting Gitea Actions runners against cf-gitea
 
-SPEC-0012 M2 · 2026-10-29 · Audience: an operator running a deployed cf-gitea
+SPEC-0012 M2 · 2026-10-30 · Audience: an operator running a deployed cf-gitea
 instance who wants `act_runner` polling it for CI jobs.
 
 **The security posture, up front**: cf-gitea never executes workflow steps —
@@ -32,7 +32,7 @@ Four mount families live in `apps/worker/src/index.ts`:
 | Mount | Family | Where |
 |---|---|---|
 | `POST /api/actions/{service}/{Method}` | connect-RPC: PingService echo + RunnerService (Register/Declare/FetchTask/UpdateTask/UpdateLog) | index.ts:218 · routes.ts:67-68, 304-452 |
-| `GET /api/actions/oidc/{…}` | the OIDC issuer (discovery, JWKS, token exchange) | routes.ts:301 · oidc.ts:264, 277, 282 |
+| `GET /api/actions/oidc/{…}` | the OIDC issuer (discovery, JWKS, token exchange) | routes.ts:301 · oidc.ts:271, 284, 289 |
 | `/api/actions_pipeline/_apis/pipelines/…` | artifacts v1 + job summaries (Bearer runtime-token auth) | index.ts:224 · artifacts-v1.ts |
 | `/twirp/github.actions.results.api.v1.ArtifactService/…` | artifacts v4 (twirp-style; HMAC-signed upload/download URLs) | index.ts:229 · artifacts-v4.ts:44 |
 
@@ -87,7 +87,7 @@ Lifecycle (services/actions/model.ts):
 - A token carries a SCOPE `(owner_id, repo_id)`: repo-scoped
   `(0, <repo-id>)`, owner-scoped `(<owner-id>, 0)`, global `(0, 0)`. The
   runner it registers inherits the scope and only ever sees jobs inside it
-  (the waiting-job scan, model.ts:660).
+  (the waiting-job scan, model.ts:699).
 
 **Where you can mint one today**: the repo-scoped UI only — repo
 **Settings → Actions → Runners**, the registration-token panel with its
@@ -108,7 +108,7 @@ Owner-scoped and global tokens exist at the service layer
    SPEC-0012 §4.5). First sight of a scope bootstraps its version counter
    0→1 (dispatch.ts:141-147, runner.go:179-187's port).
 2. **Pick** — on a version mismatch the server scans the scope's waiting jobs
-   oldest-first and label-matches (model.ts:660; the label rule, §2.4). A
+   oldest-first and label-matches (model.ts:699; the label rule, §2.4). A
    per-isolate semaphore caps concurrent picks at 16 (dispatch.ts:80-105;
    the documented per-isolate divergence of upstream's process semaphore,
    dispatch.ts:82-86).
@@ -161,7 +161,12 @@ Owner-scoped and global tokens exist at the service layer
 - **OIDC** — `/.well-known/openid-configuration`, `/jwks`, and `/token`
   (a token exchange, not OAuth2: the bearer is the claim-time
   `Actions.IDTokenRequest` JWT). ID-token claims mirror GitHub's, including
-  `runner_environment: "self-hosted"` (oidc.ts:1-20, 264-282).
+  `runner_environment: "self-hosted"` (oidc.ts:1-20). The audience defaults
+  to `https://<host>/<owner>` — AppURL's trailing slash plus the
+  path-escaped owner, upstream's exact composition; the exchange accepts an
+  `audience` query override — and the subject is the immutable
+  `repo:<owner>@<ownerId>/<slug>@<repoId>` with the `:pull_request` /
+  `:ref:<ref>` suffix arms (oidc.ts:124-133, 271-315).
 
 ---
 
@@ -363,8 +368,10 @@ the zero-install standing E2E.
   a seeded claim → UpdateLog ack/trim/resend arms → UpdateTask+outputs →
   the artifact families → summaries → OIDC (routes.test.ts:1-17). The
   sibling suites complete the family — `ingest.test.ts`,
-  `artifacts.test.ts`, `wire.test.ts`, `dispatch.test.ts`, `model.test.ts`
-  — 168/168 across the actions family at the M1b landing (10cfb97).
+  `artifacts.test.ts`, `wire.test.ts`, `dispatch.test.ts`, `model.test.ts`,
+  then `retention.test.ts`, `secrets.test.ts`, `config.test.ts`, and
+  `sweeps.test.ts` — 168/168 across the actions family at the M1b landing
+  (10cfb97), 196/196 across the ten files since the sweeps landed.
 - **Against a live dev server**: the class is importable — point
   `new FakeRunner({ baseUrl })` at `pnpm dev`'s workerd URL, mint a token
   from the UI (§2.2), and replay the same calls in a scratch script. The
@@ -378,14 +385,31 @@ the zero-install standing E2E.
   scopes (`apps/worker/src/api/routes/secrets-variables.ts`): repo
   `/repos/{owner}/{repo}/actions/secrets|variables`, org and user twins.
   Whatever you store there rides the claim payload (§1.4).
-- **Retention** — upstream defaults are artifacts 90 d / logs 365 d / runs
-  400 d; cf-gitea's sweep implements the arms but the env vars are not wired
-  and no scheduler calls it yet (§4.4). Practically: everything uploaded
-  today persists until the sweep is wired.
-- **Zombie tasks** — a task whose runner dies mid-run is only reaped by the
-  (unwired) sweep arm `stopZombieTasks` (retention.ts:158-180); until then a
-  dead runner's task stays RUNNING on the books. Cancel it from the run
-  viewer instead (the run-viewer cancel POST, apps/worker/src/ui/pages/repo-actions-view.tsx).
+- **Retention** — the `ACTIONS_{ARTIFACT,LOG,RUN}_RETENTION_DAYS` vars are
+  wired with strict polarity: each must parse as a positive integer or that
+  arm stays OFF (unset/zero/garbage = no reads, no sends), so a default
+  deployment NEVER deletes actions data — unlike upstream, whose cleanup
+  cron is always-on at the 90 d / 365 d / 400 d defaults. Arming a var puts
+  a probe on the hourly cron entry that enqueues at most one queue message
+  carrying the parsed values; the consumer runs exactly the armed arms
+  (retention.ts:348, 381; demo-sweep.ts:313-334; purge.ts:304-316). Set all
+  three to 90/365/400 for upstream behavior; the artifact var additionally
+  sets the upload-time expiry ceiling — an explicit per-upload expiry is
+  clamped to it, and a no-expiry upload expires at the ceiling (unarmed:
+  keep-forever) (artifacts.ts:101-115).
+- **Dead runs are swept automatically.** Four always-on arms ride the cron
+  entries — each a cheap existence probe that enqueues at most one
+  `REPO_TASKS` message, with the consumer doing the work: a task RUNNING
+  with no update for 10 minutes stops as FAILURE (a CANCELLING one stops as
+  CANCELLED — the zombie arm, retention.ts:203-244); a RUNNING task whose
+  start passed 3 h stops as FAILURE (the endless arm, sweeps.ts:59, 84); a
+  waiting/blocked/pending job quiet past 24 h is cancelled (the abandoned
+  arm, sweeps.ts:61, 130); and ephemeral runner rows with no live task are
+  deleted (the ephemeral pass, retention.ts:182). The zombie + endless
+  producers ride the 10-minute cron entry, the abandoned + ephemeral ones
+  the hourly entry (demo-sweep.ts:336-391) — upstream's own always-on jobs,
+  so no var gates them. Manual cancel from the run viewer still works
+  (the run-viewer cancel POST, apps/worker/src/ui/pages/repo-actions-view.tsx).
 
 ---
 
@@ -412,22 +436,34 @@ the zero-install standing E2E.
    Token minting is therefore UI-only, repo-scoped, today (§1.3) —
    owner-scoped and global tokens exist at the service layer
    (model.ts:223, 257) with no minting surface.
-4. **Retention vars are unwired.** `ACTIONS_{ARTIFACT,LOG,RUN}_RETENTION_DAYS`
-   are read NOWHERE from the environment; the sweep takes the knobs as
-   parameters (retention.ts:39-58) and no cron producer/consumer calls it.
-   A per-upload `?retentionDays=` on the v1 family is honored
-   (artifacts-v1.ts:312-317) but there is no default ceiling —
-   `expired_unix = 0` means keep forever (artifacts.ts:91-104).
+4. **Retention is opt-in, not upstream's always-on.** The
+   `ACTIONS_{ARTIFACT,LOG,RUN}_RETENTION_DAYS` vars are read from the
+   environment with strict polarity (retentionDaysFromEnv,
+   retention.ts:348): a positive integer arms that arm, anything else
+   leaves it OFF — a default deployment never deletes actions data. Set all
+   three to upstream's 90/365/400 for upstream behavior. The armed arms
+   ride the hourly producer/consumer pair (retention.ts:381;
+   purge.ts:304-316), and the artifact var doubles as the upload-time
+   expiry ceiling (artifacts-v1.ts:334-343, artifacts.ts:101-115):
+   without it, an upload that sends no expiry stays keep-forever
+   (`expired_unix = 0`, artifacts.ts:111-112). The per-upload
+   `?retentionDays=` on the v1 family is still honored (the query rides the
+   upload URL, artifacts-v1.ts:311; the confirm side resolves it at
+   340-343).
 5. **The keystore.** The instance's signing material — the HS256 token-signing
    secret (runtime JWTs, v4 HMAC) and the RS256 OIDC private JWK — is
-   auto-generated on first use into the private R2 object
-   `actions/_keystore/instance.json` (secrets.ts:31 and the module header,
-   7-13). This is a documented divergence from SPEC-0012 §4.4 (which wants a
-   `wrangler secret` + an encrypted D1 keystore); the function seam
-   (`loadKeystore`) is the swap point. Consequences for operators: the
-   material is never rotated by code, and deleting the object mints fresh
-   material — in-flight signed URLs and OIDC trust from before the reset
-   break (registered runners are unaffected; they re-auth normally).
+   auto-generated on first use into migration 0042's `system_keystore` D1
+   table, one write-once row per piece (`general_token_signing_secret`,
+   `actions_oidc_signing_key`; secrets.ts:73-74 and the module header,
+   18-26). Deployments predating 0042 carry the material in the legacy R2
+   object `actions/_keystore/instance.json` (secrets.ts:82) — a cold D1
+   miss adopts it into D1 once, and the object is then dead weight an
+   operator may delete out-of-band. Rotation is operator-only, exactly
+   upstream's edit-app.ini-and-restart: replace or delete the row via
+   `wrangler d1 execute` and restart the deployment — no code path ever
+   rewrites an existing row. A rotation invalidates every previously
+   minted token and changes the published JWKS kid; registered runners are
+   unaffected beyond one failed verification (they re-auth normally).
 6. **Wire divergences.** connect unary over `application/proto` only — no
    gRPC/gRPC-Web protocol variants, `application/json` answers
    `unimplemented` (WIRE-FREEZE.md:42-47; routes.ts:204-214). No response
