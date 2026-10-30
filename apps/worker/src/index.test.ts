@@ -869,6 +869,78 @@ describe("the unclaimed-repo-path 404 carve (upstream context_response.go:129-15
     expect(goGet.status).toBe(404);
     expect(goGet.headers.get("content-type")).not.toBe("text/html; charset=UTF-8");
   });
+
+  // The usability audit's exact bare shapes (docs/usability/findings-first-run.md
+  // blocker 2): unknown leaves under the explore group and the repo subtree.
+  // Both are repo-scoped shapes in the dispatcher's eyes whose parseUiRoute is
+  // null — the explore literals bind exactly (parseUiRoute's explore arm), and
+  // a junk tail claims no repo family — so the carve, never the headless
+  // engine, must answer them (the audit saw the pre-carve deployment serve
+  // `not found\n` plain text here).
+  it.skipIf(!UI_ASSETS_BUILT)("themes the explore leaf /explore/xyz (finding B-2)", async () => {
+    const response = await SELF.fetch("https://example.com/explore/xyz", {
+      headers: { accept: "text/html" },
+    });
+    expect(response.status).toBe(404);
+    expect(response.headers.get("content-type")).toBe("text/html; charset=UTF-8");
+    const html = await response.text();
+    expect(html).toContain("status-page-error");
+    expect(html).toContain("404 Not Found");
+    // `explore` is a reserved owner — the repo header never resolves.
+    expect(html).not.toContain("repo-header");
+  });
+
+  it.skipIf(!UI_ASSETS_BUILT)("themes the deeper explore leaves (/explore/{repos,users}/xyz)", async () => {
+    // The sitemap literal block (parseUiRoute's explore arm) returns null for
+    // non-sitemap tails under /explore/{repos,users}/ — an explicit early
+    // return that could silently regress to the engine; the carve answers.
+    for (const path of ["/explore/repos/xyz", "/explore/users/xyz"]) {
+      const response = await SELF.fetch(`https://example.com${path}`, {
+        headers: { accept: "text/html" },
+      });
+      expect(response.status).toBe(404);
+      expect(response.headers.get("content-type")).toBe("text/html; charset=UTF-8");
+      expect(await response.text()).toContain("status-page-error");
+    }
+  });
+
+  it.skipIf(!UI_ASSETS_BUILT)("themes the repo-subtree leaf /{owner}/{repo}/nope (finding B-2)", async () => {
+    // The audit's second exact shape: a junk tail on an unknown repo pair —
+    // the same carve arm as the /junk pin above, pinned under the finding's
+    // own path so the audited URL cannot regress silently.
+    const response = await SELF.fetch("https://example.com/no-such-user/no-such-repo/nope", {
+      headers: { accept: "text/html" },
+    });
+    expect(response.status).toBe(404);
+    expect(response.headers.get("content-type")).toBe("text/html; charset=UTF-8");
+    expect(await response.text()).toContain("status-page-error");
+  });
+
+  it("keeps non-GET web-subtree unknowns on the engine (the carve is GET-only)", async () => {
+    // The negotiation arm is GET-only by design: every other method keeps its
+    // pre-carve owner — the gate passthrough the e2e suite runs against stays
+    // byte-identical (`not found\n`, the engine's classify answer).
+    const post = await SELF.fetch("https://example.com/explore/xyz", {
+      method: "POST",
+      headers: { accept: "text/html" },
+    });
+    expect(post.status).toBe(404);
+    expect(post.headers.get("content-type")).not.toBe("text/html; charset=UTF-8");
+    expect(await post.text()).toBe("not found\n");
+  });
+
+  it("keeps the /api/v1 unknown-path 404 contract (plain, any accept)", async () => {
+    // "api" is a dispatcher exclusion — the carve never touches the API tree,
+    // and Hono's default notFound stays its answer for ANY accept (the
+    // audit's API-parity ledger note: plain `404 Not Found`, not upstream's
+    // JSON error body — a recorded divergence, not this carve's to flip).
+    const api = await SELF.fetch("https://example.com/api/v1/nope", {
+      headers: { accept: "text/html" },
+    });
+    expect(api.status).toBe(404);
+    expect(api.headers.get("content-type")).toBe("text/plain; charset=UTF-8");
+    expect(await api.text()).toBe("404 Not Found");
+  });
 });
 
 // --- the app.onError 500 chrome arm (usability sweep, 2026-10-29) --------------
