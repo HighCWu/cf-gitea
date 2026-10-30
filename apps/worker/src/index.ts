@@ -25,6 +25,7 @@ import { sessionRouter } from "./ui/session";
 import { firstRunRouter } from "./ui/first-run";
 import { avatarServingRouter } from "./web/avatar-serving";
 import { attachmentsServingRouter } from "./web/attachments-serving";
+import { securityHeaders, withSecurityHeaders } from "./web/security-headers";
 import { webhookDlqHandler } from "./webhooks/dlq";
 import { webhookQueueHandler } from "./webhooks/consumer";
 import { renderNotFoundShellResponse, renderServerErrorShellResponse } from "./ui/not-found-response";
@@ -93,7 +94,11 @@ app.onError(async (error, c) => {
   };
   const acceptsHtml = (c.req.header("accept") ?? "").includes("text/html");
   if (!acceptsHtml) {
-    return c.text("Internal Server Error", 500, headers);
+    // The security-headers ride below (web/security-headers.ts): an onError
+    // response bypasses post-`next()` middleware stamping (the same reason
+    // this arm hand-sets cache-control) — upstream's plain error renders
+    // carry nosniff verbatim (services/context/base.go:134).
+    return withSecurityHeaders(c.text("Internal Server Error", 500, headers));
   }
   // The template-render failure fallback (errpage.go:91-101): a shell that
   // cannot render answers the plain log-and-report line — never a half
@@ -107,16 +112,36 @@ app.onError(async (error, c) => {
     waitUntil = undefined;
   }
   try {
-    return await renderServerErrorShellResponse(c.env, c.req.raw, { waitUntil });
+    // The 500 shell is text/html — withSecurityHeaders adds the page CSP on
+    // top of the shell's own headers (upstream's 500.tmpl carries the CSP
+    // meta, templates/status/500.tmpl:11; base.go:205-210's header twin).
+    return withSecurityHeaders(await renderServerErrorShellResponse(c.env, c.req.raw, { waitUntil }));
   } catch (renderError) {
     console.error("500 shell render failed", renderError);
-    return c.text(
-      "Internal server error but failed to render error page template, please collect error logs and report to Gitea issue tracker",
-      500,
-      headers,
+    return withSecurityHeaders(
+      c.text(
+        "Internal server error but failed to render error page template, please collect error logs and report to Gitea issue tracker",
+        500,
+        headers,
+      ),
     );
   }
 });
+
+// THE SECURITY-HEADERS MIDDLEWARE (usability F2, docs/usability/findings-latency-health.md):
+// upstream stamps `X-Content-Type-Options: nosniff` + `X-Frame-Options:
+// SAMEORIGIN` on EVERY response leaving Gitea — SecurityHeadersHandler
+// (routers/common/middleware.go:48-64) rides ProtocolMiddlewares
+// (middleware.go:29), wired tree-wide at routers/init.go:178, defaults from
+// modules/setting/security.go:27-28 — and carries the general CSP on HTML
+// (`WebContentSecurityPolicy`, services/context/context_template.go:116-141;
+// head meta on pages, templates/base/head.tmpl:4; response header via
+// SetHeaderContentSecurityPolicyGeneral, services/context/base.go:205-210).
+// Mounted FIRST so every merged sub-app route (uiRouter, session, first-run,
+// avatars, attachments, the api trees, healthz) unwinds through it; the
+// nonce → 'unsafe-inline' adaptation and the non-Hono exits
+// (gitHttpGate / 404 shell / onError) are documented in web/security-headers.ts.
+app.use("*", securityHeaders());
 
 app.get("/healthz", (c) => c.json({ ok: true }));
 
@@ -370,10 +395,20 @@ export default {
           tail.startsWith("/info/lfs/") ||
           tail.startsWith("/api/");
         if (acceptsHtml && !engineServed) {
-          return renderNotFoundShellResponse(env, req, { waitUntil: ctx.waitUntil.bind(ctx) });
+          // Direct dispatcher exit — never routed through Hono, so the
+          // security-headers stamp rides here (web/security-headers.ts; the
+          // shell is text/html → nosniff + SAMEORIGIN + the page CSP).
+          return withSecurityHeaders(
+            await renderNotFoundShellResponse(env, req, { waitUntil: ctx.waitUntil.bind(ctx) }),
+          );
         }
       }
-      return gitHttpGate(req, env, ctx, gitHttp);
+      // The gate/engine passthrough: git-protocol, LFS, engine-JSON and the
+      // plain `not found\n` arms — upstream's SecurityHeadersHandler is
+      // tree-wide (its git endpoints leave through it too), so the stamp
+      // rides the exit: headers only, the engine's bytes and protocol
+      // surface untouched (body carried by reference, never buffered).
+      return withSecurityHeaders(await gitHttpGate(req, env, ctx, gitHttp));
     }
 
     // Everything else (healthz, /api/v1, bare paths) is Hono's, whose

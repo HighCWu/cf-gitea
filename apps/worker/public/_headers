@@ -1,3 +1,16 @@
+# The platform-served asset class (usability F2): /assets/* files are
+# edge-served by the Workers Static Assets handler (wrangler.jsonc assets
+# block, assets-first/worker-on-miss) and never touch the Worker, so the
+# security-headers middleware (src/web/security-headers.ts) cannot stamp
+# them. This file is that class's header layer — the same mechanism the
+# smoke-verified cache-control posture rides (findings-latency-health.md:
+# assets immutable 1y). The catch-all carries upstream's tree-wide
+# X-Content-Type-Options default (routers/common/middleware.go:48-64,
+# modules/setting/security.go:28); X-Frame-Options rides too for the same
+# "every response that leaves Gitea" coverage.
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: SAMEORIGIN
 /assets/js/*
   Cache-Control: public, max-age=31536000, immutable
 /assets/css/*
