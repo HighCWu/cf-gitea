@@ -22,7 +22,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
-import { comments, issueAssignees, issueLabels, issuePins, issues, labels, milestones, orgMembers, pullRequests, pullReviews, repoCounters, repositories, ReviewType, teamMembers, teamRepoAccess, teams, users, webhookDeliveries, webhooks } from "../db/schema";
+import { comments, issueAssignees, issueLabels, issuePins, issues, labels, milestones, orgMembers, pullRequests, pullReviews, repoCounters, repoSettings, repositories, ReviewType, teamMembers, teamRepoAccess, teams, users, webhookDeliveries, webhooks } from "../db/schema";
 import { CommentType } from "../issues/comment-types";
 import { IssuesService } from "../issues/service";
 import { ZERO_OID, branchRef, engineReads, refTipMap } from "./services/engine";
@@ -53,6 +53,7 @@ beforeEach(async () => {
     "milestones",
     "labels",
     "repo_counters",
+    "repo_settings",
     "repositories",
     "users",
   ]) {
@@ -514,10 +515,25 @@ describe("POST /repos/{owner}/{repo}/pulls (repoCreatePullRequest)", () => {
     expect(foreignBase.status).toBe(404);
   });
 
-  it("requires a token, a visible repo, and an unarchived repo; 422s bind failures", async () => {
+  it("requires a token, a visible repo; archived and pulls-disabled repos 404 via mustAllowPulls; 422s bind failures", async () => {
     await seedUser("Alice");
     await seedRepo("alice", "visible");
     await seedRepo("alice", "frozen", { archived: true });
+    const nopullsId = await seedRepo("alice", "nopulls");
+    // The pulls group gate runs BEFORE the route's mustNotBeArchived arm:
+    // CanEnablePulls() is false on an archived repo (repo.go:583-585), so
+    // upstream answers the whole /pulls subtree — reads AND writes, the 423
+    // family included — with the group 404 (api.go:1478, api.go:697-722).
+    const archived = await createPull("/repos/alice/frozen/pulls", { title: "x", head: "f", base: "m" });
+    expect(archived.status).toBe(404);
+    expect(await archived.json()).toEqual({ message: "not found", url: ERROR_URL });
+    expect((await router()("/repos/alice/frozen/pulls")).status).toBe(404);
+
+    // The pulls-disabled twin: has_pull_requests=false 404s the subtree too.
+    await db().insert(repoSettings).values({ repoId: nopullsId, hasPullRequests: false });
+    const nopulls = await createPull("/repos/alice/nopulls/pulls", { title: "x", head: "f", base: "m" });
+    expect(nopulls.status).toBe(404);
+    expect(await nopulls.json()).toEqual({ message: "not found", url: ERROR_URL });
 
     const anon = await router()("/repos/Alice/visible/pulls", { method: "POST", headers: jsonHeaders, body: JSON.stringify({ title: "x", head: "f", base: "m" }) });
     expect(anon.status).toBe(401);
@@ -525,10 +541,6 @@ describe("POST /repos/{owner}/{repo}/pulls (repoCreatePullRequest)", () => {
 
     const missing = await createPull("/repos/alice/ghost/pulls", { title: "x", head: "f", base: "m" });
     expect(missing.status).toBe(404);
-
-    const archived = await createPull("/repos/alice/frozen/pulls", { title: "x", head: "f", base: "m" });
-    expect(archived.status).toBe(423);
-    expect(await archived.json()).toEqual({ message: "repo is archived", url: ERROR_URL });
 
     const bind = await createPull("/repos/alice/visible/pulls", { head: "f", base: "m" }); // no title
     expect(bind.status).toBe(422);
@@ -957,13 +969,15 @@ describe("pulls list query-shape witness (query-shape-audit A3/B1/A9)", () => {
     const body = await res.json<Array<Record<string, unknown> & WitnessPull>>();
     expect(body).toHaveLength(5);
     const count = meter.count();
-    // Post-fix: 1 repo resolve + 2 (count + page) + 6 issue-side arms
+    // Post-fix: 1 repo resolve + the unit-gate read (the mustAllowPulls
+    // mount — one constant loadRepoSettings per request, riding the shared
+    // settings+units loader) + 2 (count + page) + 6 issue-side arms
     // (posters, labels, pins, milestones, PR rows, assignees — the fold's
-    // added arm) + 1 mergers + 1 head repos = 11 — page-INDEPENDENT. The
-    // pre-fix shape paid 1 + 2 + 5×(3 base reads + 1 B1 PR re-select + 1
-    // milestone + 1 merger + 1 fork head repo) = 26 at this N; 5 rows × 4
-    // alone would break the second bound.
-    expect(count).toBeLessThanOrEqual(11);
+    // added arm) + 1 mergers + 1 head repos — page-INDEPENDENT. The pre-fix
+    // shape paid 1 + 2 + 5×(3 base reads + 1 B1 PR re-select + 1 milestone
+    // + 1 merger + 1 fork head repo) = 26 at this N; 5 rows × 4 alone would
+    // break the second bound.
+    expect(count).toBeLessThanOrEqual(13);
     expect(count).toBeLessThan(5 * 4);
     // The fork head renders (batched pair lookup worked) and the merged row
     // carries its merger (the batched mergers arm worked).

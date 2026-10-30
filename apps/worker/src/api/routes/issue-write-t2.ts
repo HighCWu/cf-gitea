@@ -14,6 +14,7 @@ import { findIssueByRepoAndIndex, issueErrorToApiError, toApiIssue } from "../se
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { toApiPullRequest } from "../services/pulls";
+import { assertIssueRowUnit, assertIssuesOrPullsUnit, type IssuePullUnits } from "../services/issue-unit-gates";
 import { canWriteRepository } from "../services/repo-access";
 import { canViewRepositoryWithTeams, findRepositoryByPath, viewerOf } from "../services/repository";
 import type { RepositoryWithOwner } from "../services/repository";
@@ -241,16 +242,27 @@ async function requireVisibleRepoPair(c: Context<ApiEnv>, path: { owner: string;
   if (found === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, found.repo))) {
     throw new ApiError(404, "not found");
   }
-  return { viewer, found };
+  // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674 +
+  // api.go:720-746) at upstream's chain position — every route in this file
+  // sits in upstream's /issues subtree, so the gate rides the shared
+  // resolver: unit-less repos 404 before any handler logic. The resolved
+  // units ride along for requireIssue's per-issue narrowing (one settings
+  // read per request) (services/issue-unit-gates.ts).
+  const units = await assertIssuesOrPullsUnit(c.env.DB, found);
+  return { viewer, found, units };
 }
 
-/** Issue-by-index lookup answering the upstream ErrIssueNotExist 404. */
-async function requireIssue(c: Context<ApiEnv>, found: RepositoryWithOwner, rawIndex: string): Promise<IssueRow> {
+/** Issue-by-index lookup answering the upstream ErrIssueNotExist 404, then
+ *  `getRepoIssueByIndexForDoer`'s unit narrowing (issue.go:998-1009): an
+ *  issue whose own unit (issues vs pulls) is unreadable is the same bare 404
+ *  — plain issues hide on a pulls-fallback repo (services/issue-unit-gates.ts). */
+async function requireIssue(c: Context<ApiEnv>, found: RepositoryWithOwner, rawIndex: string, units: IssuePullUnits): Promise<IssueRow> {
   const index = pathId(rawIndex);
   const issue = await findIssueByRepoAndIndex(c.env.DB, found.repo.id, index);
   if (issue === null) {
     throw issueErrorToApiError(new IssueNotExistError({ repoId: found.repo.id, index }));
   }
+  assertIssueRowUnit(units, issue.isPull);
   return issue;
 }
 
@@ -566,9 +578,9 @@ export function registerIssueWriteT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth
   // comment; detaching a label that is not attached is the silent 204.
   // -------------------------------------------------------------------------
   app.openapi(removeIssueLabelRoute(requireAuth), async (c) => {
-    const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const { found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
     assertNotArchived(found);
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     if (!(await canWriteRepository(c, found))) {
       // Upstream DeleteIssueLabel: bare Status(403), empty message.
       throw new ApiError(403, "");
@@ -591,9 +603,9 @@ export function registerIssueWriteT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth
   // per-type cap and the duplicate-pin arm are the upstream 500s.
   // -------------------------------------------------------------------------
   app.openapi(pinIssueRoute(requireAuth), async (c) => {
-    const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const { found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
     await requireRepoWriter(c, found);
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     const { count } = await pinStats(c.env.DB, issue.repoId, issue.isPull);
     if (count >= MAX_PINNED_PER_TYPE) {
       // Upstream ErrIssueMaxPinReached via APIErrorInternal (issue_pin.go:69).
@@ -613,9 +625,9 @@ export function registerIssueWriteT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth
   // the silent 204 (issue_pin.go:105-108).
   // -------------------------------------------------------------------------
   app.openapi(unpinIssueRoute(requireAuth), async (c) => {
-    const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const { found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
     await requireRepoWriter(c, found);
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     await deleteIssuePin(c.env.DB, issue, requireDoerId(c), new Date());
     return c.body(null, 204);
   });
@@ -626,9 +638,9 @@ export function registerIssueWriteT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth
   // are the upstream 500 arms; the same position is the silent no-op.
   // -------------------------------------------------------------------------
   app.openapi(moveIssuePinRoute(requireAuth), async (c) => {
-    const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const { found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
     await requireRepoWriter(c, found);
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     const newPosition = pathInt(c.req.valid("param").position);
     if (newPosition < 1) {
       // MovePin's exact refusal (issue_pin.go:136), via APIErrorInternal.

@@ -142,6 +142,7 @@ import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { embeddedUserSchema } from "../models/issue";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
+import { assertPullsUnit } from "../services/issue-unit-gates";
 import { collaboratorModeOf } from "../services/repo-collaborators";
 import {
   findPullRequestByIndex,
@@ -315,13 +316,18 @@ const bindValidationHook = ({ success }: { success: boolean }): undefined => {
 
 /** Shared repo resolution — the anti-enumeration 404 (SPEC-0004 §2.4). */
 /** Repo resolution + visibility (the anti-enumeration 404; the review
- *  family's local copy of the issues/pulls guard). */
+ *  family's local copy of the issues/pulls guard), closed by the pulls-group
+ *  UNIT gate at upstream's chain position — the `/pulls` subtree registers
+ *  `mustAllowPulls` after repoAssignment (api.go:1478, api.go:697-722), so a
+ *  mirror, an archived repo, or a pulls-disabled repo 404s these review
+ *  routes before any handler body (services/issue-unit-gates.ts). */
 async function requireVisibleRepo(c: Context<ApiEnv>, path: { owner: string; repo: string }) {
   const viewer = viewerOf(c);
   const found = await findRepositoryByPath(c.env.DB, path.owner, path.repo);
   if (found === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, found.repo))) {
     throw new ApiError(404, "not found");
   }
+  await assertPullsUnit(c.env.DB, found);
   return { viewer, found };
 }
 

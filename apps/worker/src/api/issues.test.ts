@@ -36,6 +36,7 @@ import {
   pullRequests,
   repoCollaborators,
   repoCounters,
+  repoSettings,
   repositories,
   trackedTimes,
   userBlocking,
@@ -83,6 +84,7 @@ beforeEach(async () => {
     "milestones",
     "labels",
     "repo_counters",
+    "repo_settings",
     "repo_collaborators",
     "user_blocking",
     "repositories",
@@ -2872,13 +2874,16 @@ describe("issues list query-shape witness (query-shape-audit A2)", () => {
     >();
     expect(list).toHaveLength(6);
     const count = meter.count();
-    // Post-fix: 1 repo resolve + 2 (count + page) + 6 prefetch arms (posters,
-    // labels, pins, milestones, PR rows, assignees) = 9 — page-INDEPENDENT
-    // (the assignees arm is ONE join read for the whole page, the fold's
-    // added arm). The pre-fix shape (audit formula 2 + N×3..5) paid 1 + 2 +
-    // 6×3 + 2 milestones + 1 PR row = 24 at this N; the bounds below fail if
-    // any per-row fan returns (each issue's 3 reads alone would exceed it).
-    expect(count).toBeLessThanOrEqual(9);
+    // Post-fix: 1 repo resolve + the unit-gate read (the mustEnableIssuesOrPulls
+    // mount — one constant loadRepoSettings per request, not per row; it rides
+    // the shared settings+units loader) + 2 (count + page) + 6 prefetch arms
+    // (posters, labels, pins, milestones, PR rows, assignees) —
+    // page-INDEPENDENT (the assignees arm is ONE join read for the whole
+    // page, the fold's added arm). The pre-fix shape (audit formula
+    // 2 + N×3..5) paid 1 + 2 + 6×3 + 2 milestones + 1 PR row = 24 at this N;
+    // the bounds below fail if any per-row fan returns (each issue's 3 reads
+    // alone would exceed it).
+    expect(count).toBeLessThanOrEqual(11);
     expect(count).toBeLessThan(6 * 3);
 
     // The folded assignee block: the multi set renders in edge-row (insertion)
@@ -2992,10 +2997,11 @@ describe("comment list query-shape witness (query-shape-audit A7)", () => {
 
     const app = createApiRouter();
 
-    // (a) The issue-scoped thread: 1 repo resolve + 1 issue lookup + 1 page
-    // + 1 poster batch = 4 — page-INDEPENDENT (5 distinct posters dedupe to
-    // one read). The pre-fix shape paid 3 + C×1 (C=6 here); the 6 per-comment
-    // posters alone would break the bound.
+    // (a) The issue-scoped thread: 1 repo resolve + the unit-gate read (the
+    // shared settings+units loader, one constant per request) + 1 issue
+    // lookup + 1 page + 1 poster batch — page-INDEPENDENT (5 distinct
+    // posters dedupe to one read). The pre-fix shape paid 3 + C×1 (C=6
+    // here); the 6 per-comment posters alone would break the bound.
     const threadMeter = countedD1();
     const threadRes = await app.fetch(new Request(`https://example.com/repos/alice/visible/issues/${issue.index}/comments`), {
       ...env,
@@ -3005,11 +3011,11 @@ describe("comment list query-shape witness (query-shape-audit A7)", () => {
     const thread = await threadRes.json<Array<Record<string, unknown> & { id: number; user: unknown }>>();
     expect(thread).toHaveLength(6); // the null-poster row renders too
     const threadCount = threadMeter.count();
-    expect(threadCount).toBeLessThanOrEqual(5);
-    expect(threadCount).toBeLessThan(6); // 6 per-comment posters alone exceed it
+    expect(threadCount).toBeLessThanOrEqual(6);
+    expect(threadCount).toBeLessThan(7); // 6 per-comment posters alone exceed it
 
-    // (b) The repo-wide feed: 1 repo resolve + 2 (count + page) + 1 poster
-    // batch = 4 (pre-fix 3 + C×1 = 11 at C=8).
+    // (b) The repo-wide feed: 1 repo resolve + the unit-gate read + 2 (count
+    // + page) + 1 poster batch (pre-fix 3 + C×1 = 11 at C=8).
     const feedMeter = countedD1();
     const feedRes = await app.fetch(new Request("https://example.com/repos/alice/visible/issues/comments?state=all"), {
       ...env,
@@ -3019,7 +3025,7 @@ describe("comment list query-shape witness (query-shape-audit A7)", () => {
     const feed = await feedRes.json<Array<Record<string, unknown> & { id: number; user: unknown }>>();
     expect(feed).toHaveLength(8);
     const feedCount = feedMeter.count();
-    expect(feedCount).toBeLessThanOrEqual(5);
+    expect(feedCount).toBeLessThanOrEqual(6);
     expect(feedCount).toBeLessThan(8); // 8 per-comment posters alone exceed it
 
     // Contract discipline: every batched render is deep-equal to the
@@ -3117,12 +3123,12 @@ describe("timeline query-shape witness (query-shape-audit A5)", () => {
       "commit_ref",
     ]);
     const count = meter.count();
-    expect(count).toBeLessThanOrEqual(8);
+    expect(count).toBeLessThanOrEqual(9); // + the unit-gate read (constant)
     expect(count).toBeLessThan(12); // the 12 per-row posters alone exceed it
 
     // Empty-skip discipline: a page with NO rows skips every prefetch arm —
-    // exactly the fixed prefix (measured 3, the same count the per-row path
-    // paid on an empty page).
+    // exactly the fixed prefix (repo resolve + the unit-gate read, the same
+    // fixed cost the per-row path paid on an empty page).
     const emptyMeter = countedD1();
     const emptyRes = await app.fetch(new Request(`https://example.com/repos/alice/visible/issues/${empty.index}/timeline`), {
       ...env,
@@ -3130,7 +3136,7 @@ describe("timeline query-shape witness (query-shape-audit A5)", () => {
     });
     expect(emptyRes.status).toBe(200);
     expect(await emptyRes.json<unknown[]>()).toEqual([]);
-    expect(emptyMeter.count()).toBeLessThanOrEqual(4);
+    expect(emptyMeter.count()).toBeLessThanOrEqual(5);
 
     // The per-row FALLBACK (omitted preload), metered on the same rows and
     // viewer: 12 poster selects + 7 metadata selects = 19 — the audit's
@@ -3169,5 +3175,112 @@ describe("timeline query-shape witness (query-shape-audit A5)", () => {
     expect(timeline.filter((item) => item.old_milestone !== null)).toHaveLength(1); // the dangling old renders null
     expect(timeline.filter((item) => item.milestone !== null)).toHaveLength(1);
     expect(timeline.filter((item) => item.assignee !== null)).toHaveLength(1); // the dangling assignee renders null
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue unit gates (mustEnableIssuesOrPulls, api.go:1674 + api.go:720-746)
+// — the parity-review-api E5 gate drift: the issues subtree consults the
+// repo_settings has_issues/has_pull_requests flags (the enabled-unit store
+// at this pin; services/issue-unit-gates.ts) at upstream's exact chain
+// position, after repo resolution and before every handler.
+// ---------------------------------------------------------------------------
+
+describe("issue unit gates (mustEnableIssuesOrPulls)", () => {
+  it("404s the issues subtree on a unit-less repo while the repo read and the ungated /labels + /milestones twins stay 200", async () => {
+    const owner = await seedUser("alice");
+    const repoId = await seedRepo(owner.usernameLower, "units");
+    const issue = await seedIssue(repoId, "hidden issue");
+    await db().insert(repoSettings).values({ repoId, hasIssues: false, hasPullRequests: false });
+
+    const body = { message: "not found", url: ERROR_URL };
+    const list = await router()("/repos/alice/units/issues");
+    expect(list.status).toBe(404);
+    expect(await list.json()).toEqual(body);
+    const single = await router()(`/repos/alice/units/issues/${issue.index}`);
+    expect(single.status).toBe(404);
+    expect(await single.json()).toEqual(body);
+    const comments = await router()("/repos/alice/units/issues/comments");
+    expect(comments.status).toBe(404);
+    expect(await comments.json()).toEqual(body);
+    // Creation 404s through the group gate too — and even with the units ON
+    // the arm order is upstream's: 404 unit gate first, 423 archived later.
+    const created = await router()("/repos/alice/units/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "x" }),
+    });
+    expect(created.status).toBe(404);
+    expect(await created.json()).toEqual(body);
+
+    // The repo-level twins carry NO unit gate upstream (api.go:1675-1688):
+    // /labels and /milestones keep serving a unit-less repo, and so does the
+    // repo read itself (the code-unit routes stay 200).
+    expect((await router()("/repos/alice/units")).status).toBe(200);
+    expect((await router()("/repos/alice/units/labels")).status).toBe(200);
+    expect((await router()("/repos/alice/units/milestones")).status).toBe(200);
+  });
+
+  it("narrows the list `type` to the readable side and hides plain issues when only pulls are readable (issue.go:375-390, :998-1009)", async () => {
+    const owner = await seedUser("alice");
+    const repoId = await seedRepo(owner.usernameLower, "mixed");
+    const plain = await seedIssue(repoId, "plain issue");
+    const pull = await service().createPullRequest({
+      repoId,
+      title: "the pull",
+      posterId: owner.id,
+      headRepoId: repoId,
+      baseBranch: "main",
+      headBranch: "feature",
+    });
+    await db().insert(repoSettings).values({ repoId, hasIssues: false, hasPullRequests: true });
+
+    // No `type`: upstream forces the filter to the single readable side —
+    // the plain issue hides, the pull serves.
+    const list = await router()("/repos/alice/mixed/issues");
+    expect(list.status).toBe(200);
+    const items = await list.json<Array<{ number: number }>>();
+    expect(items.map((item) => item.number)).toEqual([pull.issue.index]);
+
+    expect((await router()("/repos/alice/mixed/issues?type=issues")).status).toBe(404);
+    expect((await router()("/repos/alice/mixed/issues?type=pulls")).status).toBe(200);
+
+    // The per-issue narrowing of getRepoIssueByIndexForDoer (issue.go:998-1009).
+    const hiddenPlain = await router()(`/repos/alice/mixed/issues/${plain.index}`);
+    expect(hiddenPlain.status).toBe(404);
+    expect(await hiddenPlain.json()).toEqual({ message: "not found", url: ERROR_URL });
+    expect((await router()(`/repos/alice/mixed/issues/${pull.issue.index}`)).status).toBe(200);
+
+    // POST /issues carries the route-level `reqRepoReader(unit.TypeIssues)`
+    // arm (api.go:1576): the pulls fallback does NOT unlock creation.
+    const created = await router()("/repos/alice/mixed/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "x" }),
+    });
+    expect(created.status).toBe(404);
+    expect(await created.json()).toEqual({ message: "not found", url: ERROR_URL });
+  });
+
+  it("keeps archived-repo reads serving while creation answers the upstream 423 (mustNotBeArchived, api.go:816-822)", async () => {
+    const owner = await seedUser("alice");
+    const repoId = await seedRepo(owner.usernameLower, "frozen2", { archived: true });
+    await seedIssue(repoId, "frozen issue");
+
+    // The issues group gate is unit-flags only — an archived repo's reads
+    // stay 200 (upstream pins: api_issue_test.go PATCHes an archived repo
+    // into StatusLocked, so the subtree itself serves).
+    const reads = await router()("/repos/alice/frozen2/issues");
+    expect(reads.status).toBe(200);
+    const items = await reads.json<Array<{ number: number }>>();
+    expect(items).toHaveLength(1);
+
+    const created = await router()("/repos/alice/frozen2/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "x" }),
+    });
+    expect(created.status).toBe(423);
+    expect(await created.json()).toEqual({ message: "repo is archived", url: ERROR_URL });
   });
 });

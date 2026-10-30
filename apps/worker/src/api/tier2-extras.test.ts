@@ -640,8 +640,11 @@ describe("pinned-list query-shape witness (query-shape-audit A2/A3, tier-2)", ()
     const pinned = await pinnedRes.json<Array<Record<string, unknown> & { number: number }>>();
     expect(pinned.map((entry) => entry.number)).toEqual([issueB.index, issueA.index]); // pin_order ASC
     const issuesCount = issuesMeter.count();
-    expect(issuesCount).toBeLessThanOrEqual(8);
-    expect(issuesCount).toBeLessThan(2 * 5);
+    // + the route's two unit-gate reads (mustEnableIssuesOrPulls + the
+    // reqRepoReader(TypeIssues) arm of api.go:1577 — each ONE constant
+    // loadRepoSettings riding the shared settings+units loader).
+    expect(issuesCount).toBeLessThanOrEqual(11);
+    expect(issuesCount).toBeLessThan(13);
     expect(pinned.find((entry) => entry.number === issueA.index)?.user).toMatchObject({ login: "cf-gitea-stub" });
     expect(pinned.find((entry) => entry.number === issueB.index)?.user).toMatchObject({ login: "neighbor" });
     expect(pinned.find((entry) => entry.number === issueA.index)?.milestone).not.toBeNull();
@@ -662,8 +665,10 @@ describe("pinned-list query-shape witness (query-shape-audit A2/A3, tier-2)", ()
     const pinnedPRs = await pullsRes.json<Array<Record<string, unknown> & { number: number }>>();
     expect(pinnedPRs.map((entry) => entry.number)).toEqual([pullIndex, secondPull.pullRequest.index]);
     const pullsCount = pullsMeter.count();
-    expect(pullsCount).toBeLessThanOrEqual(9);
-    expect(pullsCount).toBeLessThan(2 * 5);
+    // + the mustAllowPulls unit-gate read (api.go:1478 — one constant
+    // loadRepoSettings, services/issue-unit-gates.ts).
+    expect(pullsCount).toBeLessThanOrEqual(11);
+    expect(pullsCount).toBeLessThan(13);
 
     // Contract discipline: the batched pulls render is deep-equal to the
     // unbatched per-row path (mode "list", no extras, on the same rows) —

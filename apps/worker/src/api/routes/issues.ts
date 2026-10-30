@@ -76,6 +76,13 @@ import {
   userRowByName,
   visibleRepoIds,
 } from "../services/issues";
+import {
+  assertIssueRowUnit,
+  assertIssuesOrPullsUnit,
+  assertIssuesUnitReadable,
+  narrowIssueListType,
+  type IssuePullUnits,
+} from "../services/issue-unit-gates";
 import { parseMilestoneDeadline } from "../services/milestones";
 import { toApiPullRequest } from "../services/pulls";
 import {
@@ -128,9 +135,23 @@ import {
  *                                   (upstream returns empty 204)
  *   - DELETE …/comments/{id}:       400 (system comments have no deletable
  *                                   content — upstream StatusBadRequest)
- * The 412 issues-disabled family is DECLARED (per contract) but unreachable
- * today: every D1 repository has the issues unit enabled (no has_issues
- * column yet — the Repository converter hardcodes has_issues: true).
+ * UNIT gates (SPEC parity: the mustEnableIssuesOrPulls group middleware,
+ * api.go:1674 + api.go:720-746): every route under /repos/{owner}/{repo}/
+ * issues/* answers the bare 404 "not found" once the repo's issues AND pulls
+ * units are both unreadable (services/issue-unit-gates.ts — the enabled
+ * state rides the repo_settings has_issues/has_pull_requests flags), mounted
+ * inside requireVisibleRepo below so it runs at upstream's exact chain
+ * position (after repo resolution, before the handler). The in-handler
+ * narrowing rides the same units: the list `type` filter collapses/404s per
+ * unit readability (issue.go:375-390), every issue-by-index lookup 404s on
+ * an issue whose own unit is unreadable (getRepoIssueByIndexForDoer,
+ * issue.go:998-1009), and the global-comment GET narrows on its issue's unit
+ * (issue_comment.go:440). POST issues additionally carries the route-level
+ * `reqRepoReader(unit.TypeIssues)` arm (api.go:1576) AFTER the archived 423,
+ * upstream's order. The repo-level /labels and /milestones groups carry NO
+ * unit gate upstream (api.go:1675-1688) — reads stay 200 on unit-less repos.
+ * The 412 family stays DECLARED-but-unreachable for POST/PATCH issues (the
+ * merged-PR arm is PATCH's only live 412).
  *
  * Webhook triggers (SPEC-0005 §3.5): issues opened (POST) / edited (title,
  * body) / closed+reopened (PATCH state) and the comment family (POST
@@ -255,14 +276,20 @@ function asApiError(error: unknown): never | undefined {
 // Shared guards
 // ---------------------------------------------------------------------------
 
-/** Shared repo resolution — the anti-enumeration 404 (SPEC-0004 §2.4). */
+/** Shared repo resolution — the anti-enumeration 404 (SPEC-0004 §2.4) —
+ *  closed by the issues-group UNIT gate at upstream's chain position: the
+ *  `mustEnableIssuesOrPulls` middleware wraps this whole subtree after
+ *  repoAssignment (api.go:1674, api.go:720-746), so a repo whose issues and
+ *  pulls units are both unreadable 404s every route here before any handler
+ *  body runs. The resolved units ride along for the handler-level narrowing. */
 async function requireVisibleRepo(c: Context<ApiEnv>, path: { owner: string; repo: string }) {
   const viewer = viewerOf(c);
   const found = await findRepositoryByPath(c.env.DB, path.owner, path.repo);
   if (found === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, found.repo))) {
     throw new ApiError(404, "not found");
   }
-  return { viewer, found };
+  const units = await assertIssuesOrPullsUnit(c.env.DB, found);
+  return { viewer, found, units };
 }
 
 /** `mustNotBeArchived` (routers/api/v1/api.go:816) — 423 with that message. */
@@ -272,13 +299,17 @@ function assertNotArchived(found: RepositoryWithOwner): void {
   }
 }
 
-/** Issue-by-index lookup answering the upstream ErrIssueNotExist 404. */
-async function requireIssue(c: Context<ApiEnv>, found: RepositoryWithOwner, rawIndex: string): Promise<IssueRow> {
+/** Issue-by-index lookup answering the upstream ErrIssueNotExist 404, then
+ *  `getRepoIssueByIndexForDoer`'s unit narrowing (issue.go:998-1009): an
+ *  issue whose own unit (issues vs pulls) is unreadable is the same bare 404
+ *  — a plain issue hides on a pulls-fallback repo. */
+async function requireIssue(c: Context<ApiEnv>, found: RepositoryWithOwner, rawIndex: string, units: IssuePullUnits): Promise<IssueRow> {
   const index = pathId(rawIndex);
   const issue = await findIssueByRepoAndIndex(c.env.DB, found.repo.id, index);
   if (issue === null) {
     throw issueErrorToApiError(new IssueNotExistError({ repoId: found.repo.id, index }));
   }
+  assertIssueRowUnit(units, issue.isPull);
   return issue;
 }
 
@@ -1032,7 +1063,7 @@ export function registerIssueRoutes(
   // GET /repos/{owner}/{repo}/issues (issueListIssues)
   // -------------------------------------------------------------------------
   app.openapi(listIssuesRoute(optionalAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
+    const { viewer, found, units } = await requireVisibleRepo(c, c.req.valid("param"));
     const url = new URL(c.req.url);
     const since = parseQueryTime(url.searchParams.get("since"));
     const before = parseQueryTime(url.searchParams.get("before"));
@@ -1067,7 +1098,10 @@ export function registerIssueRoutes(
 
     const { items, total } = await listRepoIssues(c.env.DB, found.repo.id, {
       isClosed: parseStateFilter(url.searchParams.get("state")),
-      isPull: parseTypeFilter(url.searchParams.get("type")),
+      // The `type` narrowing of ListIssues (issue.go:375-390): an explicit
+      // type against an unreadable unit is the bare 404; without one the
+      // filter collapses to the single readable side.
+      isPull: narrowIssueListType(units, parseTypeFilter(url.searchParams.get("type"))),
       keyword: (url.searchParams.get("q") ?? "").trim(),
       labelIds: await labelIdsByRepoNames(c.env.DB, found.repo.id, csvParam(url.searchParams, "labels")),
       milestoneIds: await milestoneIdsByRepoEntries(c.env.DB, found.repo.id, csvParam(url.searchParams, "milestones")),
@@ -1095,6 +1129,10 @@ export function registerIssueRoutes(
     async (c) => {
       const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
       assertNotArchived(found);
+      // The route-level `reqRepoReader(unit.TypeIssues)` arm (api.go:1576,
+      // AFTER mustNotBeArchived): creation demands the issues unit itself,
+      // even though the group gate passed via the pulls fallback.
+      await assertIssuesUnitReadable(c.env.DB, found);
       const form = c.req.valid("json");
       const service = new IssuesService(c.env.DB);
       const requester = c.get("authUser");
@@ -1218,12 +1256,16 @@ export function registerIssueRoutes(
   // the GLOBAL comment id; system comments answer the empty 204.
   // -------------------------------------------------------------------------
   app.openapi(getCommentRoute(optionalAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
+    const { viewer, found, units } = await requireVisibleRepo(c, c.req.valid("param"));
     const commentId = pathId(c.req.valid("param").id);
     const row = await findRepoCommentById(c.env.DB, found.repo.id, commentId);
     if (row === null) {
       throw commentNotExistError(commentId);
     }
+    // Upstream GetIssueComment narrows the comment's ISSUE unit after the
+    // lookup (issue_comment.go:440 CanReadIssuesOrPulls → APIErrorNotFound):
+    // a comment on a hidden plain issue is the same bare 404.
+    assertIssueRowUnit(units, row.issue.isPull);
     if (row.comment.type !== CommentType.Comment) {
       // Upstream GetIssueComment: non-Comment types render 204 (no content).
       return c.body(null, 204);
@@ -1322,8 +1364,8 @@ export function registerIssueRoutes(
   // GET /repos/{owner}/{repo}/issues/{index} (issueGetIssue)
   // -------------------------------------------------------------------------
   app.openapi(getIssueRoute(optionalAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const { viewer, found, units } = await requireVisibleRepo(c, c.req.valid("param"));
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     return c.json(await toApiIssue(c.env.DB, viewer, found, issue), 200);
   });
 
@@ -1331,9 +1373,9 @@ export function registerIssueRoutes(
   // PATCH /repos/{owner}/{repo}/issues/{index} (issueEditIssue) — 201 quirk
   // -------------------------------------------------------------------------
   app.openapi(editIssueRoute(requireAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
+    const { viewer, found, units } = await requireVisibleRepo(c, c.req.valid("param"));
     assertNotArchived(found);
-    let issue = await requireIssue(c, found, c.req.valid("param").index);
+    let issue = await requireIssue(c, found, c.req.valid("param").index, units);
     if (!canEditIssue(c, found, issue.posterId)) {
       // Upstream answers a bare Status(403); the contract's forbidden family
       // is the {message, url} envelope — sent empty-messageed.
@@ -1557,9 +1599,9 @@ export function registerIssueRoutes(
   // DELETE /repos/{owner}/{repo}/issues/{index} (issueDelete)
   // -------------------------------------------------------------------------
   app.openapi(deleteIssueRoute(requireAuth), async (c) => {
-    const { found } = await requireVisibleRepo(c, c.req.valid("param"));
+    const { found, units } = await requireVisibleRepo(c, c.req.valid("param"));
     assertNotArchived(found);
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     // Upstream reqAdmin lands with the SPEC-0002 ACL matrix (header note).
     // The bucket rides along: attachment objects go storage-first (see the
     // cascade's doc comment). The emission context threads the request into
@@ -1573,8 +1615,8 @@ export function registerIssueRoutes(
   // GET /repos/{owner}/{repo}/issues/{index}/comments (issueGetComments)
   // -------------------------------------------------------------------------
   app.openapi(listIssueCommentsRoute(optionalAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const { viewer, found, units } = await requireVisibleRepo(c, c.req.valid("param"));
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     const url = new URL(c.req.url);
     const since = parseQueryTime(url.searchParams.get("since"));
     const before = parseQueryTime(url.searchParams.get("before"));
@@ -1594,9 +1636,9 @@ export function registerIssueRoutes(
   app.openapi(
     createCommentRoute(requireAuth),
     async (c) => {
-      const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
+      const { viewer, found, units } = await requireVisibleRepo(c, c.req.valid("param"));
       assertNotArchived(found);
-      const issue = await requireIssue(c, found, c.req.valid("param").index);
+      const issue = await requireIssue(c, found, c.req.valid("param").index, units);
       const form = c.req.valid("json");
       const service = new IssuesService(c.env.DB);
       const requester = c.get("authUser");
@@ -1649,8 +1691,8 @@ export function registerIssueRoutes(
   // GET /repos/{owner}/{repo}/issues/{index}/labels (issueGetLabels)
   // -------------------------------------------------------------------------
   app.openapi(listIssueLabelsRoute(optionalAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const { viewer, found, units } = await requireVisibleRepo(c, c.req.valid("param"));
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     const rows = await issueLabelRows(c.env.DB, issue.id);
     return c.json(rows.map((row) => toApiLabel(row, issueLabelApiUrlBase(row, found, viewer.origin))), 200);
   });
@@ -1662,9 +1704,9 @@ export function registerIssueRoutes(
   app.openapi(
     addIssueLabelsRoute(requireAuth),
     async (c) => {
-      const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
+      const { viewer, found, units } = await requireVisibleRepo(c, c.req.valid("param"));
       assertNotArchived(found);
-      const issue = await requireIssue(c, found, c.req.valid("param").index);
+      const issue = await requireIssue(c, found, c.req.valid("param").index, units);
       const form = c.req.valid("json");
       const labelIds = await resolveLabelOptionIds(c.env.DB, found, form.labels);
       const service = new IssuesService(c.env.DB);
@@ -1697,9 +1739,9 @@ export function registerIssueRoutes(
   app.openapi(
     replaceIssueLabelsRoute(requireAuth),
     async (c) => {
-      const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
+      const { viewer, found, units } = await requireVisibleRepo(c, c.req.valid("param"));
       assertNotArchived(found);
-      const issue = await requireIssue(c, found, c.req.valid("param").index);
+      const issue = await requireIssue(c, found, c.req.valid("param").index, units);
       const form = c.req.valid("json");
       const labelIds = await resolveLabelOptionIds(c.env.DB, found, form.labels);
       const service = new IssuesService(c.env.DB);
@@ -1727,9 +1769,9 @@ export function registerIssueRoutes(
   // DELETE /repos/{owner}/{repo}/issues/{index}/labels (issueClearLabels)
   // -------------------------------------------------------------------------
   app.openapi(clearIssueLabelsRoute(requireAuth), async (c) => {
-    const { found } = await requireVisibleRepo(c, c.req.valid("param"));
+    const { found, units } = await requireVisibleRepo(c, c.req.valid("param"));
     assertNotArchived(found);
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     const service = new IssuesService(c.env.DB);
     try {
       await service.replaceLabels(issue.id, [], { ownerOrgId: null });
@@ -1751,8 +1793,8 @@ export function registerIssueRoutes(
   // refs, assignees, xref columns).
   // -------------------------------------------------------------------------
   app.openapi(timelineRoute(optionalAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const { viewer, found, units } = await requireVisibleRepo(c, c.req.valid("param"));
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     const url = new URL(c.req.url);
     const since = parseQueryTime(url.searchParams.get("since"));
     const before = parseQueryTime(url.searchParams.get("before"));

@@ -19,6 +19,7 @@ import {
   readableStreamFromGenerator,
 } from "../services/release-assets";
 import { findIssueByRepoAndIndex, findRepoCommentById, commentNotExistError, issueErrorToApiError } from "../services/issues";
+import { assertIssueRowUnit, assertIssuesOrPullsUnit, issuePullUnits } from "../services/issue-unit-gates";
 import { assertNotBlockedForIssueContent } from "../services/blocks";
 import {
   assertNotArchived,
@@ -216,19 +217,34 @@ function pathId(raw: string): number {
   return Number.isSafeInteger(parsed) ? parsed : 0;
 }
 
-/** Issue-by-index lookup answering the upstream ErrIssueNotExist 404. */
+/** Repo resolution + the issues-group UNIT gate (services/issue-unit-gates.ts):
+ *  every route in this file sits in upstream's `/issues` subtree, closed by
+ *  `mustEnableIssuesOrPulls` (api.go:1674 + api.go:720-746) after
+ *  repoAssignment — unit-less repos 404 before any handler logic. */
+async function requireVisibleIssuesRepo(c: Context<ApiEnv>, path: { owner: string; repo: string }) {
+  const found = await requireVisibleRepo(c, path);
+  await assertIssuesOrPullsUnit(c.env.DB, found);
+  return found;
+}
+
+/** Issue-by-index lookup answering the upstream ErrIssueNotExist 404, then
+ *  `getRepoIssueByIndexForDoer`'s unit narrowing (issue.go:998-1009): an
+ *  issue whose own unit (issues vs pulls) is unreadable is the same bare 404
+ *  — plain issues hide on a pulls-fallback repo. */
 async function requireIssue(c: Context<ApiEnv>, found: RepositoryWithOwner, rawIndex: string): Promise<IssueRow> {
   const index = pathId(rawIndex);
   const issue = await findIssueByRepoAndIndex(c.env.DB, found.repo.id, index);
   if (issue === null) {
     throw issueErrorToApiError(new IssueNotExistError({ repoId: found.repo.id, index }));
   }
+  assertIssueRowUnit(await issuePullUnits(c.env.DB, found), issue.isPull);
   return issue;
 }
 
 /** getIssueCommentSafe (issue_comment_attachment.go:347-361) — the global
- *  comment id scoped through this repo; the visibility arm of upstream's
- *  CanReadIssuesOrPulls is the landed repo-visibility matrix. */
+ *  comment id scoped through this repo, closed by that helper's unit
+ *  narrowing (:352-355 CanReadIssuesOrPulls → APIErrorNotFound): a comment
+ *  whose issue's own unit is unreadable is the same bare 404. */
 async function requireComment(
   c: Context<ApiEnv>,
   found: RepositoryWithOwner,
@@ -240,6 +256,7 @@ async function requireComment(
     // GetCommentWithRepoID miss → APIErrorAuto(ErrCommentNotExist).
     throw commentNotExistError(commentId);
   }
+  assertIssueRowUnit(await issuePullUnits(c.env.DB, found), row.issue.isPull);
   return row;
 }
 
@@ -841,7 +858,7 @@ export function registerIssueAttachmentRoutes(
       },
     }),
     async (c) => {
-      const found = await requireVisibleRepo(c, c.req.valid("param"));
+      const found = await requireVisibleIssuesRepo(c, c.req.valid("param"));
       const issue = await requireIssue(c, found, c.req.valid("param").index);
       const rows = await drizzle(c.env.DB)
         .select()
@@ -882,7 +899,7 @@ export function registerIssueAttachmentRoutes(
       },
     }),
     async (c) => {
-      const found = await requireVisibleRepo(c, c.req.valid("param"));
+      const found = await requireVisibleIssuesRepo(c, c.req.valid("param"));
       assertNotArchived(found);
       const issue = await requireIssue(c, found, c.req.valid("param").index);
       const created = await prepareAttachmentCreate(c, found, issue, null, c.req.valid("query").name ?? "");
@@ -906,7 +923,7 @@ export function registerIssueAttachmentRoutes(
       },
     }),
     async (c) => {
-      const found = await requireVisibleRepo(c, c.req.valid("param"));
+      const found = await requireVisibleIssuesRepo(c, c.req.valid("param"));
       const issue = await requireIssue(c, found, c.req.valid("param").index);
       const row = await findIssueAttachment(c.env.DB, issue.id, c.req.valid("param").attachment_id);
       return c.json(toApiAttachment(new URL(c.req.url).origin, row), 200);
@@ -934,7 +951,7 @@ export function registerIssueAttachmentRoutes(
       },
     }),
     async (c) => {
-      const found = await requireVisibleRepo(c, c.req.valid("param"));
+      const found = await requireVisibleIssuesRepo(c, c.req.valid("param"));
       assertNotArchived(found);
       const issue = await requireIssue(c, found, c.req.valid("param").index);
       if (!(await canWriteIssueAttachment(c, found, issue))) {
@@ -975,7 +992,7 @@ export function registerIssueAttachmentRoutes(
       },
     }),
     async (c) => {
-      const found = await requireVisibleRepo(c, c.req.valid("param"));
+      const found = await requireVisibleIssuesRepo(c, c.req.valid("param"));
       assertNotArchived(found);
       const issue = await requireIssue(c, found, c.req.valid("param").index);
       if (!(await canWriteIssueAttachment(c, found, issue))) {
@@ -1015,7 +1032,7 @@ export function registerIssueAttachmentRoutes(
       },
     }),
     async (c) => {
-      const found = await requireVisibleRepo(c, c.req.valid("param"));
+      const found = await requireVisibleIssuesRepo(c, c.req.valid("param"));
       const target = await requireComment(c, found, c.req.valid("param").id);
       const rows = await drizzle(c.env.DB)
         .select()
@@ -1056,7 +1073,7 @@ export function registerIssueAttachmentRoutes(
       },
     }),
     async (c) => {
-      const found = await requireVisibleRepo(c, c.req.valid("param"));
+      const found = await requireVisibleIssuesRepo(c, c.req.valid("param"));
       assertNotArchived(found);
       const target = await requireComment(c, found, c.req.valid("param").id);
       const created = await prepareAttachmentCreate(c, found, target.issue, target.comment, c.req.valid("query").name ?? "");
@@ -1093,7 +1110,7 @@ export function registerIssueAttachmentRoutes(
       },
     }),
     async (c) => {
-      const found = await requireVisibleRepo(c, c.req.valid("param"));
+      const found = await requireVisibleIssuesRepo(c, c.req.valid("param"));
       const target = await requireComment(c, found, c.req.valid("param").id);
       const row = await findCommentAttachment(c.env.DB, target.comment.id, c.req.valid("param").attachment_id);
       return c.json(toApiAttachment(new URL(c.req.url).origin, row), 200);
@@ -1121,7 +1138,7 @@ export function registerIssueAttachmentRoutes(
       },
     }),
     async (c) => {
-      const found = await requireVisibleRepo(c, c.req.valid("param"));
+      const found = await requireVisibleIssuesRepo(c, c.req.valid("param"));
       assertNotArchived(found);
       const target = await requireComment(c, found, c.req.valid("param").id);
       if (!(await canWriteCommentAttachment(c, found, target.comment, target.issue))) {
@@ -1158,7 +1175,7 @@ export function registerIssueAttachmentRoutes(
       },
     }),
     async (c) => {
-      const found = await requireVisibleRepo(c, c.req.valid("param"));
+      const found = await requireVisibleIssuesRepo(c, c.req.valid("param"));
       assertNotArchived(found);
       const target = await requireComment(c, found, c.req.valid("param").id);
       if (!(await canWriteCommentAttachment(c, found, target.comment, target.issue))) {
@@ -1186,7 +1203,7 @@ export function registerIssueAttachmentRoutes(
     path: { owner: string; repo: string },
     rawId: string,
   ): Promise<{ row: IssueAttachmentRow; issue: IssueRow; comment: CommentRow | null }> => {
-    const found = await requireVisibleRepo(c, path);
+    const found = await requireVisibleIssuesRepo(c, path);
     const id = pathId(rawId);
     const joined =
       id <= 0
@@ -1214,7 +1231,7 @@ export function registerIssueAttachmentRoutes(
   // 413 over the cap, one streaming pass into the row's key.
   app.put("/repos/:owner/:repo/issues/attachments/:attachmentId/blob", requireAuth, async (c) => {
     const path = { owner: c.req.param("owner") ?? "", repo: c.req.param("repo") ?? "" };
-    const found = await requireVisibleRepo(c, path);
+    const found = await requireVisibleIssuesRepo(c, path);
     const { row, issue, comment } = await requireRelayAttachment(c, path, c.req.param("attachmentId") ?? "");
     assertNotArchived(found);
     const allowed =
@@ -1265,7 +1282,7 @@ export function registerIssueAttachmentRoutes(
   // streamed octet-stream body with Content-Disposition.
   app.get("/repos/:owner/:repo/issues/attachments/:attachmentId/blob", optionalAuth, async (c) => {
     const path = { owner: c.req.param("owner") ?? "", repo: c.req.param("repo") ?? "" };
-    await requireVisibleRepo(c, path);
+    await requireVisibleIssuesRepo(c, path);
     const { row } = await requireRelayAttachment(c, path, c.req.param("attachmentId") ?? "");
     if (row.r2Key === null) {
       // created but never uploaded (the relay's pending arm)

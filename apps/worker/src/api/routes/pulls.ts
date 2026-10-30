@@ -86,6 +86,7 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { ActionType, recordAction, type ActionDraft } from "../services/activity-feeds";
 import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
 import { changeIssueBody, changeIssueDeadline, changeIssueMilestone, changeIssueTitle, hasWorkInProgressPrefix, issueErrorToApiError, replaceIssueAssignees } from "../services/issues";
+import { assertPullsUnit } from "../services/issue-unit-gates";
 import { parseMilestoneDeadline } from "../services/milestones";
 import {
   existingRepoLabelIds,
@@ -280,13 +281,23 @@ function asApiError(error: unknown): never | undefined {
 // Shared guards
 // ---------------------------------------------------------------------------
 
-/** Shared repo resolution — the anti-enumeration 404 (SPEC-0004 §2.4). */
+/** Shared repo resolution — the anti-enumeration 404 (SPEC-0004 §2.4) —
+ *  closed by the pulls-group UNIT gate at upstream's chain position: the
+ *  `/pulls` subtree registers `mustAllowPulls, reqRepoReader(unit.TypeCode)`
+ *  after repoAssignment (api.go:1478; the guard api.go:697-722), so a mirror,
+ *  an ARCHIVED repo, or a repo whose pulls unit is disabled 404s every route
+ *  here before any handler body — including POST's `mustNotBeArchived` 423
+ *  family, which the group gate shadows (archived ⇒ 404 "not found"). The
+ *  code-unit read (`reqRepoReader(unit.TypeCode)`) is vacuous in our
+ *  reduction: every repo carries a seeded code unit row and the visibility
+ *  predicate above already IS that read (services/issue-unit-gates.ts). */
 async function requireVisibleRepo(c: Context<ApiEnv>, path: { owner: string; repo: string }) {
   const viewer = viewerOf(c);
   const found = await findRepositoryByPath(c.env.DB, path.owner, path.repo);
   if (found === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, found.repo))) {
     throw new ApiError(404, "not found");
   }
+  await assertPullsUnit(c.env.DB, found);
   return { viewer, found };
 }
 

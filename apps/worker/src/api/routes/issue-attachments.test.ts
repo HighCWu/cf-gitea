@@ -436,15 +436,37 @@ describe("POST /repos/{owner}/{repo}/issues/{index}/assets (issueCreateIssueAtta
     expect(row.issueId).toBe(pr.id);
   });
 
-  it("412s nothing: the issues-disabled flag is not enforced (undeclared, unreachable)", async () => {
+  it("404s a unit-less repo's assets subtree; the pulls fallback keeps serving PR assets (mustEnableIssuesOrPulls, api.go:1674)", async () => {
     const issue = await seedIssue();
-    await saveRepoSettings(env.DB, REPO_ID, { hasIssues: false }, new Date());
+    // The unit-gate wave: upstream's group middleware IS enforced now (the
+    // old pin asserted the unenforced flag and 201'd through it). Disabling
+    // BOTH units 404s the subtree with the bare not-found body.
+    await saveRepoSettings(env.DB, REPO_ID, { hasIssues: false, hasPullRequests: false }, new Date());
     const res = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=x.bin`, {
       method: "POST",
       headers: { ...auth, "Content-Type": "application/octet-stream", "Content-Length": "1" },
       body: "x",
     });
-    expect(res.status).toBe(201);
+    expect(res.status).toBe(404);
+    expect(await res.json<Record<string, unknown>>()).toEqual({ message: "not found", url: ERROR_URL });
+
+    // The pulls-fallback arm: has_pull_requests=true keeps the subtree
+    // serving, and getRepoIssueByIndexForDoer's narrowing (issue.go:998-1009)
+    // picks by the issue's OWN unit — the pull uploads, the plain issue 404s.
+    await saveRepoSettings(env.DB, REPO_ID, { hasPullRequests: true }, new Date());
+    const pr = await seedIssue({ isPull: true });
+    const pullAsset = await makeApp()(`${REPO_PATH}/issues/${pr.index}/assets?name=pr.bin`, {
+      method: "POST",
+      headers: { ...auth, "Content-Type": "application/octet-stream", "Content-Length": "2" },
+      body: "ok",
+    });
+    expect(pullAsset.status).toBe(201);
+    const plainAsset = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=x.bin`, {
+      method: "POST",
+      headers: { ...auth, "Content-Type": "application/octet-stream", "Content-Length": "1" },
+      body: "x",
+    });
+    expect(plainAsset.status).toBe(404);
   });
 });
 

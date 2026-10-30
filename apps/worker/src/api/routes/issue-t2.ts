@@ -41,6 +41,13 @@ import { watchInfoSchema } from "../models/watch";
 import type { WatchInfo } from "../models/watch";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
+import {
+  assertIssueRowUnit,
+  assertIssuesOrPullsUnit,
+  assertIssuesUnitReadable,
+  assertPullsUnit,
+  issuePullUnits,
+} from "../services/issue-unit-gates";
 import { canWriteRepository } from "../services/repo-access";
 import {
   apiRepositoryUrl,
@@ -490,13 +497,17 @@ async function requireVisibleRepoPair(c: Context<ApiEnv>, path: { owner: string;
   return { viewer, found };
 }
 
-/** Issue-by-index lookup answering the upstream ErrIssueNotExist 404. */
+/** Issue-by-index lookup answering the upstream ErrIssueNotExist 404, then
+ *  `getRepoIssueByIndexForDoer`'s unit narrowing (issue.go:998-1009): an
+ *  issue whose own unit (issues vs pulls) is unreadable is the same bare 404
+ *  — plain issues hide on a pulls-fallback repo (services/issue-unit-gates.ts). */
 async function requireIssue(c: Context<ApiEnv>, found: RepositoryWithOwner, rawIndex: string): Promise<IssueRow> {
   const index = pathId(rawIndex);
   const issue = await findIssueByRepoAndIndex(c.env.DB, found.repo.id, index);
   if (issue === null) {
     throw issueErrorToApiError(new IssueNotExistError({ repoId: found.repo.id, index }));
   }
+  assertIssueRowUnit(await issuePullUnits(c.env.DB, found), issue.isPull);
   return issue;
 }
 
@@ -545,6 +556,10 @@ export function registerIssueT2Routes(
   // -------------------------------------------------------------------------
   app.openapi(editNestedCommentRoute(requireAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674 +
+    // api.go:720-746) at upstream's chain position — unit-less repos 404
+    // before any handler logic (services/issue-unit-gates.ts).
+    await assertIssuesOrPullsUnit(c.env.DB, found);
     const issue = await requireIssue(c, found, c.req.valid("param").index);
     const commentId = pathId(c.req.valid("param").id);
     const row = await findRepoComment(c.env.DB, found.repo.id, commentId);
@@ -571,6 +586,10 @@ export function registerIssueT2Routes(
 
   app.openapi(deleteNestedCommentRoute(requireAuth), async (c) => {
     const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674 +
+    // api.go:720-746) at upstream's chain position — unit-less repos 404
+    // before any handler logic (services/issue-unit-gates.ts).
+    await assertIssuesOrPullsUnit(c.env.DB, found);
     const issue = await requireIssue(c, found, c.req.valid("param").index);
     const commentId = pathId(c.req.valid("param").id);
     const row = await findRepoComment(c.env.DB, found.repo.id, commentId);
@@ -595,6 +614,10 @@ export function registerIssueT2Routes(
   // -------------------------------------------------------------------------
   app.openapi(getIssueReactionsRoute(optionalAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674 +
+    // api.go:720-746) at upstream's chain position — unit-less repos 404
+    // before any handler logic (services/issue-unit-gates.ts).
+    await assertIssuesOrPullsUnit(c.env.DB, found);
     const issue = await requireIssue(c, found, c.req.valid("param").index);
     const listOptions = parseListOptions(new URL(c.req.url));
     const rows = await listTargetReactions(c.env.DB, issue.id, 0);
@@ -605,6 +628,10 @@ export function registerIssueT2Routes(
 
   app.openapi(postIssueReactionRoute(requireAuth), async (c) => {
     const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674 +
+    // api.go:720-746) at upstream's chain position — unit-less repos 404
+    // before any handler logic (services/issue-unit-gates.ts).
+    await assertIssuesOrPullsUnit(c.env.DB, found);
     const issue = await requireIssue(c, found, c.req.valid("param").index);
     // CreateIssueReaction's blocked set (services/issue/reaction.go:20-21):
     // the issue poster + the repo owner.
@@ -617,6 +644,10 @@ export function registerIssueT2Routes(
 
   app.openapi(deleteIssueReactionRoute(requireAuth), async (c) => {
     const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674 +
+    // api.go:720-746) at upstream's chain position — unit-less repos 404
+    // before any handler logic (services/issue-unit-gates.ts).
+    await assertIssuesOrPullsUnit(c.env.DB, found);
     const issue = await requireIssue(c, found, c.req.valid("param").index);
     const content = reactionContent(c.req.valid("json"));
     if (!ALLOWED_REACTIONS.has(content)) {
@@ -632,6 +663,10 @@ export function registerIssueT2Routes(
   // -------------------------------------------------------------------------
   app.openapi(getCommentReactionsRoute(optionalAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674) —
+    // these comment-reaction routes live in upstream's /issues subtree
+    // (services/issue-unit-gates.ts).
+    await assertIssuesOrPullsUnit(c.env.DB, found);
     const commentId = pathId(c.req.valid("param").id);
     const row = await findRepoComment(c.env.DB, found.repo.id, commentId);
     if (row === null) {
@@ -646,6 +681,10 @@ export function registerIssueT2Routes(
 
   app.openapi(postCommentReactionRoute(requireAuth), async (c) => {
     const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674) —
+    // these comment-reaction routes live in upstream's /issues subtree
+    // (services/issue-unit-gates.ts).
+    await assertIssuesOrPullsUnit(c.env.DB, found);
     const commentId = pathId(c.req.valid("param").id);
     const row = await findRepoComment(c.env.DB, found.repo.id, commentId);
     if (row === null) {
@@ -663,6 +702,10 @@ export function registerIssueT2Routes(
 
   app.openapi(deleteCommentReactionRoute(requireAuth), async (c) => {
     const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674) —
+    // these comment-reaction routes live in upstream's /issues subtree
+    // (services/issue-unit-gates.ts).
+    await assertIssuesOrPullsUnit(c.env.DB, found);
     const commentId = pathId(c.req.valid("param").id);
     const row = await findRepoComment(c.env.DB, found.repo.id, commentId);
     if (row === null) {
@@ -686,6 +729,10 @@ export function registerIssueT2Routes(
   // -------------------------------------------------------------------------
   app.openapi(issueSubscriptionsRoute(optionalAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674 +
+    // api.go:720-746) at upstream's chain position — unit-less repos 404
+    // before any handler logic (services/issue-unit-gates.ts).
+    await assertIssuesOrPullsUnit(c.env.DB, found);
     const issue = await requireIssue(c, found, c.req.valid("param").index);
     const listOptions = parseListOptions(new URL(c.req.url));
     const rows = await listIssueSubscribers(c.env.DB, issue.id);
@@ -695,6 +742,10 @@ export function registerIssueT2Routes(
 
   app.openapi(issueCheckSubscriptionRoute(requireAuth), async (c) => {
     const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674 +
+    // api.go:720-746) at upstream's chain position — unit-less repos 404
+    // before any handler logic (services/issue-unit-gates.ts).
+    await assertIssuesOrPullsUnit(c.env.DB, found);
     const issue = await requireIssue(c, found, c.req.valid("param").index);
     const watching = await checkIssueSubscription(c.env.DB, requireDoerId(c), issue);
     const origin = new URL(c.req.url).origin;
@@ -715,6 +766,10 @@ export function registerIssueT2Routes(
   // changed → 201. The declared 304 stays unserved (upstream's legacy arm).
   app.openapi(issueAddSubscriptionRoute(requireAuth), async (c) => {
     const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674 +
+    // api.go:720-746) at upstream's chain position — unit-less repos 404
+    // before any handler logic (services/issue-unit-gates.ts).
+    await assertIssuesOrPullsUnit(c.env.DB, found);
     const issue = await requireIssue(c, found, c.req.valid("param").index);
     const { user: username } = c.req.valid("param");
     const target = await subscriptionTarget(c, username);
@@ -728,6 +783,10 @@ export function registerIssueT2Routes(
 
   app.openapi(issueDeleteSubscriptionRoute(requireAuth), async (c) => {
     const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674 +
+    // api.go:720-746) at upstream's chain position — unit-less repos 404
+    // before any handler logic (services/issue-unit-gates.ts).
+    await assertIssuesOrPullsUnit(c.env.DB, found);
     const issue = await requireIssue(c, found, c.req.valid("param").index);
     const { user: username } = c.req.valid("param");
     const target = await subscriptionTarget(c, username);
@@ -748,6 +807,12 @@ export function registerIssueT2Routes(
   // -------------------------------------------------------------------------
   app.openapi(listPinnedIssuesRoute(optionalAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674) plus
+    // the route-level `reqRepoReader(unit.TypeIssues)` arm (api.go:1577):
+    // pinned ISSUES list only when the issues unit itself is readable — the
+    // pulls fallback does NOT cover this route.
+    await assertIssuesOrPullsUnit(c.env.DB, found);
+    await assertIssuesUnitReadable(c.env.DB, found);
     const rows = await listPinnedIssues(c.env.DB, found.repo.id, false);
     const renderContext = await prefetchIssueRenderContext(c.env.DB, rows);
     const rendered = await Promise.all(rows.map((issue) => toApiIssue(c.env.DB, viewer, found, issue, { context: renderContext })));
@@ -756,6 +821,10 @@ export function registerIssueT2Routes(
 
   app.openapi(listPinnedPullsRoute(optionalAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    // The pulls-group UNIT gate (mustAllowPulls, api.go:1478) — pinned PULLS
+    // live in upstream's /pulls subtree: mirror / archived / pulls-disabled
+    // repos 404 here (services/issue-unit-gates.ts).
+    await assertPullsUnit(c.env.DB, found);
     const rows = await listPinnedIssues(c.env.DB, found.repo.id, true);
     const prRowsByIndex = await findPullRequestsByIndices(c.env.DB, found.repo.id, rows.map((issue) => issue.index));
     const items = rows.flatMap((issue) => {
@@ -776,6 +845,10 @@ export function registerIssueT2Routes(
   // -------------------------------------------------------------------------
   app.openapi(editDeadlineRoute(requireAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674 +
+    // api.go:720-746) at upstream's chain position — unit-less repos 404
+    // before any handler logic (services/issue-unit-gates.ts).
+    await assertIssuesOrPullsUnit(c.env.DB, found);
     const issue = await requireIssue(c, found, c.req.valid("param").index);
     if (!(await canWriteRepository(c, found))) {
       throw new ApiError(403, "Not repo writer");
@@ -808,6 +881,10 @@ export function registerIssueT2Routes(
   // -------------------------------------------------------------------------
   app.openapi(lockIssueRoute(requireAuth), async (c) => {
     const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674 +
+    // api.go:720-746) at upstream's chain position — unit-less repos 404
+    // before any handler logic (services/issue-unit-gates.ts).
+    await assertIssuesOrPullsUnit(c.env.DB, found);
     const issue = await requireIssue(c, found, c.req.valid("param").index);
     if (!(await canWriteRepository(c, found))) {
       throw new ApiError(403, "no permission to lock this issue");
@@ -820,6 +897,10 @@ export function registerIssueT2Routes(
 
   app.openapi(unlockIssueRoute(requireAuth), async (c) => {
     const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674 +
+    // api.go:720-746) at upstream's chain position — unit-less repos 404
+    // before any handler logic (services/issue-unit-gates.ts).
+    await assertIssuesOrPullsUnit(c.env.DB, found);
     const issue = await requireIssue(c, found, c.req.valid("param").index);
     if (!(await canWriteRepository(c, found))) {
       throw new ApiError(403, "no permission to unlock this issue");

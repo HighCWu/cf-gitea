@@ -42,6 +42,7 @@ import {
   type RepositoryWithOwner,
   type Viewer,
 } from "../services/repository";
+import { assertPullsUnit } from "../services/issue-unit-gates";
 import { canWriteRepository, isRepositoryAdmin, requireVisibleRepo } from "../services/repo-access";
 import { userNotExistError } from "../services/issues";
 import { lastCommitForPath } from "../services/contents";
@@ -1404,11 +1405,18 @@ export function registerRepoExtrasT2Routes(
 
   app.openapi(resolveRoute("resolve", "repoResolvePullReviewComment"), async (c) => {
     const found = await requireVisibleRepo(c, c.req.valid("param"));
+    // The pulls-group UNIT gate (mustAllowPulls, api.go:1478) — these
+    // handlers live in upstream's /pulls subtree; mirror / archived /
+    // pulls-disabled repos 404 here before any handler logic
+    // (services/issue-unit-gates.ts).
+    await assertPullsUnit(c.env.DB, found);
     const { id } = c.req.valid("param");
     return updateResolveState(c, found, Number(id), true);
   });
   app.openapi(resolveRoute("unresolve", "repoUnresolvePullReviewComment"), async (c) => {
     const found = await requireVisibleRepo(c, c.req.valid("param"));
+    // The pulls-group UNIT gate (mustAllowPulls, api.go:1478) — see resolve.
+    await assertPullsUnit(c.env.DB, found);
     const { id } = c.req.valid("param");
     return updateResolveState(c, found, Number(id), false);
   });
@@ -1448,6 +1456,8 @@ export function registerRepoExtrasT2Routes(
     }),
     async (c) => {
       const found = await requireVisibleRepo(c, c.req.valid("param"));
+      // The pulls-group UNIT gate (mustAllowPulls, api.go:1478) — see resolve.
+      await assertPullsUnit(c.env.DB, found);
       const { index, id } = c.req.valid("param");
       const form = c.req.valid("json");
       const parent = await resolveReviewCommentTarget(c, found, Number(id));
@@ -1527,6 +1537,8 @@ export function registerRepoExtrasT2Routes(
     }),
     async (c) => {
       const found = await requireVisibleRepo(c, c.req.valid("param"));
+      // The pulls-group UNIT gate (mustAllowPulls, api.go:1478) — see resolve.
+      await assertPullsUnit(c.env.DB, found);
       const { index } = c.req.valid("param");
       const pr = await findPullRequestByIndex(c.env.DB, found.repo.id, Number(index));
       if (pr === null) {

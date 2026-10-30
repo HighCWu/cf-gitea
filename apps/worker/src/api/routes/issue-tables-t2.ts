@@ -23,6 +23,7 @@ import type { ApiEnv } from "../env";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { issueListSchema, issueSchema } from "../models/issue";
 import type { Issue } from "../models/issue";
+import { assertIssueRowUnit, assertIssuesOrPullsUnit, type IssuePullUnits } from "../services/issue-unit-gates";
 import { canWriteRepository, isRepositoryAdmin } from "../services/repo-access";
 import {
   GO_ZERO_TIME,
@@ -656,16 +657,27 @@ async function requireVisibleRepoPair(c: Context<ApiEnv>, path: { owner: string;
   if (found === null || !(await canViewRepositoryWithTeams(c.env.DB, viewer, found.repo))) {
     throw new ApiError(404, "not found");
   }
-  return { viewer, found };
+  // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674 +
+  // api.go:720-746) at upstream's chain position — every route in this file
+  // sits in upstream's /issues subtree, so the gate rides the shared
+  // resolver: unit-less repos 404 before any handler logic. The resolved
+  // units ride along for requireIssue's per-issue narrowing (one settings
+  // read per request) (services/issue-unit-gates.ts).
+  const units = await assertIssuesOrPullsUnit(c.env.DB, found);
+  return { viewer, found, units };
 }
 
-/** Issue-by-index lookup answering the upstream ErrIssueNotExist 404. */
-async function requireIssue(c: Context<ApiEnv>, found: RepositoryWithOwner, rawIndex: string): Promise<IssueRow> {
+/** Issue-by-index lookup answering the upstream ErrIssueNotExist 404, then
+ *  `getRepoIssueByIndexForDoer`'s unit narrowing (issue.go:998-1009): an
+ *  issue whose own unit (issues vs pulls) is unreadable is the same bare 404
+ *  — plain issues hide on a pulls-fallback repo (services/issue-unit-gates.ts). */
+async function requireIssue(c: Context<ApiEnv>, found: RepositoryWithOwner, rawIndex: string, units: IssuePullUnits): Promise<IssueRow> {
   const index = pathId(rawIndex);
   const issue = await findIssueByRepoAndIndex(c.env.DB, found.repo.id, index);
   if (issue === null) {
     throw issueErrorToApiError(new IssueNotExistError({ repoId: found.repo.id, index }));
   }
+  assertIssueRowUnit(units, issue.isPull);
   return issue;
 }
 
@@ -1089,9 +1101,9 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // actually-added assignee (IssueChangeAssignee:161, post-write).
   // -------------------------------------------------------------------------
   app.openapi(addAssigneesRoute(requireAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const { viewer, found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
     assertNotArchived(found);
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     await assertIssueWriter(c, found);
     const names = c.req.valid("json").assignees ?? [];
     const assignees = await resolveAssigneesByName(c.env.DB, names);
@@ -1110,9 +1122,9 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // (IssueChangeAssignee:161 with removed=true, post-write).
   // -------------------------------------------------------------------------
   app.openapi(removeAssigneesRoute(requireAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const { viewer, found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
     assertNotArchived(found);
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     await assertIssueWriter(c, found);
     const names = c.req.valid("json").assignees ?? [];
     const assignees = await resolveAssigneesByName(c.env.DB, names);
@@ -1130,8 +1142,8 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // 404 unknown/invisible user.
   // -------------------------------------------------------------------------
   app.openapi(checkAssigneeRoute(optionalAuth), async (c) => {
-    const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
-    await requireIssue(c, found, c.req.valid("param").index);
+    const { found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    await requireIssue(c, found, c.req.valid("param").index, units);
     const user = await findUserByName(c.env.DB, c.req.valid("param").assignee);
     if (user === null) {
       throw userNotExistError(c.req.valid("param").assignee);
@@ -1146,8 +1158,8 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // foreign blockers redact per the module header.
   // -------------------------------------------------------------------------
   app.openapi(listDependenciesRoute(optionalAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const { viewer, found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     const rows = await blockerRows(c.env.DB, issue);
     const { page, limit } = parseListOptions(new URL(c.req.url));
     setPaginationHeaders(c, rows.length, { page, limit });
@@ -1166,9 +1178,9 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // the path issue DEPENDS ON the form issue; 201 with the path issue.
   // -------------------------------------------------------------------------
   app.openapi(createDependencyRoute(requireAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const { viewer, found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
     assertNotArchived(found);
-    const target: DependencySide = { issue: await requireIssue(c, found, c.req.valid("param").index), repo: found };
+    const target: DependencySide = { issue: await requireIssue(c, found, c.req.valid("param").index, units), repo: found };
     const dependency = await dependencySideFromMeta(c, viewer, found, c.req.valid("json"));
     await assertDependencyGates(c, viewer, target, dependency);
     await createDependencyEdge(c.env.DB, requireDoerId(c), target.issue, dependency.issue, new Date());
@@ -1181,9 +1193,9 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // the detach twin; 200 (upstream sends 201 — header deviation).
   // -------------------------------------------------------------------------
   app.openapi(removeDependencyRoute(requireAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const { viewer, found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
     assertNotArchived(found);
-    const target: DependencySide = { issue: await requireIssue(c, found, c.req.valid("param").index), repo: found };
+    const target: DependencySide = { issue: await requireIssue(c, found, c.req.valid("param").index, units), repo: found };
     const dependency = await dependencySideFromMeta(c, viewer, found, c.req.valid("json"));
     await assertDependencyGates(c, viewer, target, dependency);
     await removeDependencyEdge(c.env.DB, target.issue, dependency.issue, requireDoerId(c), new Date());
@@ -1197,8 +1209,8 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // total/link headers (issue_dependency.go:313-355) — mirrored.
   // -------------------------------------------------------------------------
   app.openapi(listBlocksRoute(optionalAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const { viewer, found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     const rows = await blockedRows(c.env.DB, issue);
     const { page, limit } = parseListOptions(new URL(c.req.url));
     const pageRows = rows.slice((page - 1) * limit, page * limit);
@@ -1226,8 +1238,8 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // issue); 201 with the PATH issue's wire (issue_dependency.go:411).
   // -------------------------------------------------------------------------
   app.openapi(createBlockingRoute(requireAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
-    const dependency: DependencySide = { issue: await requireIssue(c, found, c.req.valid("param").index), repo: found };
+    const { viewer, found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const dependency: DependencySide = { issue: await requireIssue(c, found, c.req.valid("param").index, units), repo: found };
     const target = await dependencySideFromMeta(c, viewer, found, c.req.valid("json"));
     await assertDependencyGates(c, viewer, target, dependency);
     await createDependencyEdge(c.env.DB, requireDoerId(c), target.issue, dependency.issue, new Date());
@@ -1239,8 +1251,8 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // twin; 200 with the path issue (upstream sends 201 — header deviation).
   // -------------------------------------------------------------------------
   app.openapi(removeBlockingRoute(requireAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
-    const dependency: DependencySide = { issue: await requireIssue(c, found, c.req.valid("param").index), repo: found };
+    const { viewer, found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const dependency: DependencySide = { issue: await requireIssue(c, found, c.req.valid("param").index, units), repo: found };
     const target = await dependencySideFromMeta(c, viewer, found, c.req.valid("json"));
     await assertDependencyGates(c, viewer, target, dependency);
     await removeDependencyEdge(c.env.DB, target.issue, dependency.issue, requireDoerId(c), new Date());
@@ -1253,8 +1265,8 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // (tracked time + stop comment); a re-start here is the 409.
   // -------------------------------------------------------------------------
   app.openapi(startStopwatchRoute(requireAuth), async (c) => {
-    const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const { found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     await assertIssueWriter(c, found);
     const doerId = requireDoerId(c);
     const now = new Date();
@@ -1292,8 +1304,8 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // non-existent arm is the 409.
   // -------------------------------------------------------------------------
   app.openapi(stopStopwatchRoute(requireAuth), async (c) => {
-    const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const { found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     await assertIssueWriter(c, found);
     const doerId = requireDoerId(c);
     const stopwatch = await stopwatchOfIssue(c.env.DB, doerId, issue.id);
@@ -1310,8 +1322,8 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // comment); the non-existent arm is the 409.
   // -------------------------------------------------------------------------
   app.openapi(deleteStopwatchRoute(requireAuth), async (c) => {
-    const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const { found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     await assertIssueWriter(c, found);
     const doerId = requireDoerId(c);
     const now = new Date();
@@ -1341,8 +1353,8 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // deleted entries stay hidden.
   // -------------------------------------------------------------------------
   app.openapi(listTrackedTimesRoute(requireAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const { viewer, found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     const doerId = requireDoerId(c);
     const url = new URL(c.req.url);
     const { page, limit } = parseListOptions(url);
@@ -1416,8 +1428,8 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // content (tracked_time.go:185-193).
   // -------------------------------------------------------------------------
   app.openapi(addTimeRoute(requireAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const { viewer, found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     const doerId = requireDoerId(c);
     // CanUseTimetracker (repo.go:270): the "time tracking disabled" 400 is
     // unreachable while the timetracker has no settings module; the writer
@@ -1474,8 +1486,8 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // tracked_time.go:250).
   // -------------------------------------------------------------------------
   app.openapi(resetTimeRoute(requireAuth), async (c) => {
-    const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const { found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     const doerId = requireDoerId(c);
     // CanUseTimetracker collapse — the bare 403 (ResetIssueTime:293).
     if (!(await canWriteRepository(c, found)) && viewerOf(c).requester?.is_admin !== true) {
@@ -1514,8 +1526,8 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // type-26 comment is posted by the ENTRY'S owner (upstream Doer: t.User).
   // -------------------------------------------------------------------------
   app.openapi(deleteTimeRoute(requireAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
-    const issue = await requireIssue(c, found, c.req.valid("param").index);
+    const { viewer, found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const issue = await requireIssue(c, found, c.req.valid("param").index, units);
     const doerId = requireDoerId(c);
     // CanUseTimetracker collapse — the bare 403 (DeleteTime:361).
     if (!(await canWriteRepository(c, found)) && viewer.requester?.is_admin !== true) {

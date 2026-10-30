@@ -33,6 +33,7 @@ import { z } from "zod";
 import type { ApiEnv } from "../env";
 import { ApiError, apiErrorSchema } from "../errors";
 import { findPullRequestByIndex, pullRequestNotExistError } from "../services/pulls";
+import { assertPullsUnit } from "../services/issue-unit-gates";
 import { requireVisibleRepo } from "../services/repo-access";
 
 const notFoundResponse = {
@@ -57,6 +58,11 @@ function pathId(raw: string): number {
 
 async function cancelScheduledAutoMerge(c: Context<ApiEnv>, owner: string, repo: string, rawIndex: string): Promise<Response> {
   const found = await requireVisibleRepo(c, { owner, repo });
+  // The pulls-group UNIT gate (mustAllowPulls, api.go:1478): a mirror, an
+  // archived repo, or a pulls-disabled repo is the bare 404 before the
+  // lookup — same shadow the group gate casts over upstream's whole
+  // /pulls subtree (services/issue-unit-gates.ts).
+  await assertPullsUnit(c.env.DB, found);
   const index = pathId(rawIndex);
   const row = await findPullRequestByIndex(c.env.DB, found.repo.id, index);
   if (row === null) {
