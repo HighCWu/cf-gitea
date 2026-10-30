@@ -36,7 +36,7 @@ import { and, asc, eq } from "drizzle-orm";
 
 import { ensureSeededRepo } from "../../ui/testing/seed-repo";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { repositories, users, webhookDeliveries, webhooks } from "../../db/schema";
+import { repositories, repoSettings, users, webhookDeliveries, webhooks } from "../../db/schema";
 import {
   createOptionalTokenAuthMiddleware,
   createTokenAuthMiddleware,
@@ -75,12 +75,28 @@ const MAIN = "wmain";
 const EMPTY = "wempty";
 const ARCH = "warch";
 const PRIV = "wpriv";
+const OFF = "woff";
+const OFFARCH = "woffarch";
 const MAIN_PATH = `/repos/${OWNER}/${MAIN}`;
 const EMPTY_PATH = `/repos/${OWNER}/${EMPTY}`;
 const ARCH_PATH = `/repos/${OWNER}/${ARCH}`;
 const PRIV_PATH = `/repos/${OWNER}/${PRIV}`;
+const OFF_PATH = `/repos/${OWNER}/${OFF}`;
+const OFFARCH_PATH = `/repos/${OWNER}/${OFFARCH}`;
 
 let OWNER_ID = 1;
+
+/** The repo_settings upsert behind PATCH /repos/{owner}/{repo} — the unit
+ *  flag's D1 store. loadRepoSettings renders the ENABLED default for a
+ *  missing row, so the disabled flip must land a row, not a no-op UPDATE. */
+async function setWikiUnit(slug: string, enabled: boolean): Promise<void> {
+  const repo = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(eq(repositories.slug, slug)).get();
+  if (repo === undefined) throw new Error(`wiki-unit flip: ${slug} row missing`);
+  await drizzle(env.DB)
+    .insert(repoSettings)
+    .values({ repoId: repo.id, hasWiki: enabled })
+    .onConflictDoUpdate({ target: repoSettings.repoId, set: { hasWiki: enabled, updatedAt: new Date() } });
+}
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -93,9 +109,14 @@ beforeAll(async () => {
   await ensureSeededRepo({ owner: OWNER, slug: EMPTY, commits: [seed] });
   await ensureSeededRepo({ owner: OWNER, slug: ARCH, commits: [seed] });
   await ensureSeededRepo({ owner: OWNER, slug: PRIV, commits: [seed] });
-  // the two D1 flips for the gate arms (D1 is the metadata source of truth)
+  await ensureSeededRepo({ owner: OWNER, slug: OFF, commits: [seed] });
+  await ensureSeededRepo({ owner: OWNER, slug: OFFARCH, commits: [seed] });
+  // the D1 flips for the gate arms (D1 is the metadata source of truth)
   await drizzle(env.DB).update(repositories).set({ isArchived: true }).where(eq(repositories.slug, ARCH)).run();
   await drizzle(env.DB).update(repositories).set({ visibility: "private" }).where(eq(repositories.slug, PRIV)).run();
+  await drizzle(env.DB).update(repositories).set({ isArchived: true }).where(eq(repositories.slug, OFFARCH)).run();
+  await setWikiUnit(OFF, false);
+  await setWikiUnit(OFFARCH, false);
   const owner = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, OWNER)).get();
   if (owner === undefined) throw new Error("seed owner missing");
   OWNER_ID = owner.id;
@@ -648,5 +669,64 @@ describe("wiki webhook emissions (the upstream WikiPayload triple)", () => {
     const everyFirst = await payloadOf(everythingHookId, 0);
     expect(everyFirst.action).toBe("created");
     expect(everyFirst.page).toBe("Hooked");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The disabled-wiki family — the group-close mustEnableUnit(unit.TypeWiki)
+// (api.go:1389-1397, guard :746-752) mounted over repo_settings.hasWiki. A
+// disabled wiki 404s the subtree for EVERY caller (the enabled-units-only
+// permission map — owner and admin included), and the 404 lands BEFORE the
+// write arms' own gates: upstream's chi group middleware wraps reqToken's
+// 401, mustNotBeArchived's 423 and reqRepoWriter's 403. The other describes
+// in this file all run with has_wiki on — that IS the "enabled unchanged"
+// pin; the arm below re-asserts one enabled read after the flips.
+// ---------------------------------------------------------------------------
+
+describe("disabled wiki (mustEnableUnit(unit.TypeWiki) over repo_settings.hasWiki)", () => {
+  it("404s every read, anonymous and owner alike (the unit is unreadable to everyone)", async () => {
+    for (const path of [`${OFF_PATH}/wiki/pages`, `${OFF_PATH}/wiki/page/Home`, `${OFF_PATH}/wiki/revisions/Home`]) {
+      expect((await get(path)).status).toBe(404);
+      expect((await send(path, authed())).status).toBe(404);
+    }
+  });
+
+  it("renders upstream's APIErrorNotFound body (services/context/api.go:137-142)", async () => {
+    const res = await get(`${OFF_PATH}/wiki/pages`);
+    expect(res.status).toBe(404);
+    const body = await jsonBody<Record<string, string>>(res);
+    expect(body.message).toBe("not found");
+    expect(body.url).toBe(`${ORIGIN}/api/swagger`);
+  });
+
+  it("404s the writes before the auth and grant gates (the group-close wraps reqToken/reqRepoWriter)", async () => {
+    // anonymous: mustEnableUnit precedes reqToken — 404, never 401
+    const anon = await send(`${OFF_PATH}/wiki/new`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "Off", content_base64: "" }),
+    });
+    expect(anon.status).toBe(404);
+    // reqRepoWriter's 403 never surfaces either (an outsider is wrapped too)
+    const outsider = await send(
+      `${OFF_PATH}/wiki/new`,
+      jsonInit("POST", { title: "Off", content_base64: "" }, OUTSIDER_TOKEN),
+    );
+    expect(outsider.status).toBe(404);
+    // the owner — who passes every gate on an enabled repo — 404s on all three arms
+    expect((await send(`${OFF_PATH}/wiki/new`, jsonInit("POST", { title: "Off", content_base64: "" }))).status).toBe(404);
+    expect((await send(`${OFF_PATH}/wiki/page/Any`, jsonInit("PATCH", { content_base64: "" }))).status).toBe(404);
+    expect((await send(`${OFF_PATH}/wiki/page/Any`, authed({ method: "DELETE" }))).status).toBe(404);
+  });
+
+  it("404s an archived + wiki-disabled write before mustNotBeArchived (the group-close precedes the 423)", async () => {
+    const res = await send(`${OFFARCH_PATH}/wiki/new`, jsonInit("POST", { title: "Off", content_base64: "" }));
+    expect(res.status).toBe(404);
+  });
+
+  it("leaves an enabled sibling untouched after the flips (no cross-repo bleed)", async () => {
+    const res = await get(`${MAIN_PATH}/wiki/pages`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-Total-Count")).not.toBe("0");
   });
 });

@@ -18,6 +18,8 @@ import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { setPaginationHeaders } from "../pagination";
 import { assertNotArchived, canWriteRepository, requireVisibleRepo } from "../services/repo-access";
+import { loadRepoSettings } from "../services/repo-settings";
+import { findRepositoryByPath } from "../services/repository";
 
 /**
  * The six repository-wiki operations of the remaining-API inventory's batch
@@ -31,8 +33,14 @@ import { assertNotArchived, canWriteRepository, requireVisibleRepo } from "../se
  *   PATCH  /repos/{owner}/{repo}/wiki/page/{pageName}      (repoEditWikiPage)
  *   DELETE /repos/{owner}/{repo}/wiki/page/{pageName}      (repoDeleteWikiPage)
  *
- * Upstream gates (routers/api/v1/api.go:1389-1396): the reads run under
- * repoAssignment visibility only; the writes chain reqToken →
+ * Upstream gates (routers/api/v1/api.go:1389-1397): the whole `/wiki` group
+ * closes with `mustEnableUnit(unit.TypeWiki)` (the guard api.go:746-752) —
+ * mounted here over `repo_settings.hasWiki` (the landed loadRepoSettings
+ * seam): a disabled wiki 404s the subtree for EVERY caller (the unit-units
+ * map carries enabled units only — owner and site admin included), and the
+ * group-close runs OUTSIDE the routes' own middlewares, so the disabled 404
+ * lands before reqToken's 401 on the writes (the write middleware arm). The
+ * reads run under repoAssignment visibility only; the writes chain reqToken →
  * mustNotBeArchived → reqRepoWriter(unit.TypeWiki) — the landed trio
  * requireAuth → assertNotArchived → canWriteRepository, in that order (the
  * archive gate answers 423 before the write grant's 403, like upstream).
@@ -171,6 +179,47 @@ async function wikiWriteGuard(c: Context<ApiEnv>, owner: string, repo: string) {
   return pair;
 }
 
+/**
+ * The subtree's UNIT gate — the group-close `mustEnableUnit(unit.TypeWiki)`
+ * (api.go:1389-1397, guard api.go:746-752): `ctx.APIErrorNotFound()` unless
+ * the wiki unit is readable. `Permission.CanRead` reads the repo's ENABLED
+ * units only, so a disabled wiki is unreadable to EVERYONE — owner and site
+ * admin included (models/perm/access/repo_permission.go:86-107 +
+ * :435-477; the issue-family reduction, services/issue-unit-gates.ts).
+ * Stored state is `repo_settings.has_wiki` (the landed loadRepoSettings
+ * seam — the PATCH /repos/{owner}/{repo} flag), read per request; D1 stays
+ * the metadata source of truth.
+ *
+ * The reads run it in-handler right after `requireVisibleRepo` (upstream's
+ * repoAssignment → mustEnableUnit order). The writes mount `wikiUnitGate` as
+ * ROUTE MIDDLEWARE because their own first stop (requireAuth's 401) runs
+ * before any handler code, and upstream's group-close wraps the routes'
+ * middlewares — a disabled wiki must answer the 404 BEFORE reqToken's 401.
+ */
+async function assertWikiUnitEnabled(c: Context<ApiEnv>, repoId: string): Promise<void> {
+  if (!(await loadRepoSettings(c.env.DB, repoId)).hasWiki) {
+    throw new ApiError(404, "not found");
+  }
+}
+
+/**
+ * The write arms' mounting of the unit gate, BEFORE requireAuth (the module
+ * note on assertWikiUnitEnabled). Deliberately visibility-blind: a MISSING
+ * repositories row falls through to the landed stack unchanged (requireAuth's
+ * 401 for anonymous, the handler's requireVisibleRepo 404 otherwise), keeping
+ * every enabled-repo outcome byte-identical; on a resolved row the disabled
+ * flip 404s every caller — upstream's exact answer for those arms too, since
+ * repoAssignment and mustEnableUnit render the same APIErrorNotFound body
+ * (`{"message":"not found","url":…}`, services/context/api.go:137-142).
+ */
+const wikiUnitGate: MiddlewareHandler<ApiEnv> = async (c, next) => {
+  const found = await findRepositoryByPath(c.env.DB, c.req.param("owner") ?? "", c.req.param("repo") ?? "");
+  if (found !== null && !(await loadRepoSettings(c.env.DB, found.repo.id)).hasWiki) {
+    throw new ApiError(404, "not found");
+  }
+  await next();
+};
+
 export function registerWikiRoutes(
   app: OpenAPIHono<ApiEnv>,
   requireAuth: MiddlewareHandler<ApiEnv>,
@@ -196,6 +245,7 @@ export function registerWikiRoutes(
     async (c) => {
       const { owner, repo } = c.req.valid("param");
       const pair = await requireVisibleRepo(c, { owner, repo });
+      await assertWikiUnitEnabled(c, pair.repo.id);
       const url = new URL(c.req.url);
       const page = Math.max(formInt(url, "page"), 1);
       const rawLimit = formInt(url, "limit");
@@ -226,6 +276,7 @@ export function registerWikiRoutes(
     async (c) => {
       const { owner, repo, pageName } = c.req.valid("param");
       const pair = await requireVisibleRepo(c, { owner, repo });
+      await assertWikiUnitEnabled(c, pair.repo.id);
       const wikiName = webPathFromRequest(pageName);
       const page = await readWikiPage(c.env, pair, wikiName, new URL(c.req.url).origin);
       if (page === null) {
@@ -258,6 +309,7 @@ export function registerWikiRoutes(
     async (c) => {
       const { owner, repo, pageName } = c.req.valid("param");
       const pair = await requireVisibleRepo(c, { owner, repo });
+      await assertWikiUnitEnabled(c, pair.repo.id);
       let wikiName = webPathFromRequest(pageName);
       if (wikiName === "") wikiName = "Home";
       const url = new URL(c.req.url);
@@ -278,7 +330,7 @@ export function registerWikiRoutes(
     createRoute({
       method: "post",
       path: "/repos/{owner}/{repo}/wiki/new",
-      middleware: [requireAuth],
+      middleware: [wikiUnitGate, requireAuth],
       tags: ["repository"],
       summary: "Create a wiki page",
       operationId: "repoCreateWikiPage",
@@ -323,7 +375,7 @@ export function registerWikiRoutes(
     createRoute({
       method: "patch",
       path: "/repos/{owner}/{repo}/wiki/page/{pageName}",
-      middleware: [requireAuth],
+      middleware: [wikiUnitGate, requireAuth],
       tags: ["repository"],
       summary: "Edit a wiki page",
       operationId: "repoEditWikiPage",
@@ -365,7 +417,7 @@ export function registerWikiRoutes(
     createRoute({
       method: "delete",
       path: "/repos/{owner}/{repo}/wiki/page/{pageName}",
-      middleware: [requireAuth],
+      middleware: [wikiUnitGate, requireAuth],
       tags: ["repository"],
       summary: "Delete a wiki page",
       operationId: "repoDeleteWikiPage",

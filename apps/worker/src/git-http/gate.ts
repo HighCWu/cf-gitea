@@ -64,9 +64,12 @@
  * no wiki push-create (:215-218), no parent settle, no D1 storage key (the
  * cell keeps its name-addressed R2 namespace) and a self-healing priv=1
  * registry seed so the engine's protocol/api reads stop 404ing the cell
- * (handleWikiGitRoute's module doc). The engine-path branch (§2.1 widening)
- * learned the same name handling so the seeded row cannot reopen the
- * transitional passthrough on `.wiki` JSON/admin shapes.
+ * (handleWikiGitRoute's module doc). The family also carries the parent's
+ * wiki-unit switch: a disabled wiki (`repo_settings.hasWiki`, read through
+ * loadRepoSettings) answers upstream's unit-aware verdicts per arm
+ * (wikiDisabledStop). The engine-path branch (§2.1 widening) learned the
+ * same name handling so the seeded row cannot reopen the transitional
+ * passthrough on `.wiki` JSON/admin shapes.
  */
 
 import { and, eq } from "drizzle-orm";
@@ -76,6 +79,7 @@ import type { ClassifiedPushCommand, DurableGitHandler, EngineCallOptions, PushV
 import {
   authorizeGitHttp,
   codeUnitAnonymousRead,
+  readGrant,
   requestCredential,
   resolveRepository,
   userByUsernameLower,
@@ -90,6 +94,7 @@ import {
   rpcRequestContentType,
   splitWikiRepoName,
   type EngineRoute,
+  type GitHttpOp,
   type GitHttpRoute,
 } from "./parse";
 import {
@@ -107,6 +112,8 @@ import {
   scopeForbidden,
 } from "./respond";
 import { findRepositoryById, type RepositoryRow } from "../api/services/repository";
+import { loadRepoSettings } from "../api/services/repo-settings";
+import type { AuthUser } from "../auth/auth-context";
 import { ScopeSet } from "../auth/scopes";
 import { TokenService } from "../auth/token-service";
 import {
@@ -333,6 +340,50 @@ export async function gitHttpGate(
 }
 
 /**
+ * The `*.wiki` family's unit gate for a DISABLED wiki (repo_settings.hasWiki
+ * = false — the landed per-repo switch, read through loadRepoSettings; D1 is
+ * the metadata source of truth). Upstream's two reachable answers, by arm —
+ * see handleWikiGitRoute's module doc for the githttp.go walk:
+ *
+ * - READ on a publicly visible parent (public repo + active public owner —
+ *   upstream's canAnonymousPull posture skips the whole auth block, :131-145):
+ *   the tail check's 403 "repository wiki is disabled" (:243-253).
+ * - everything else that passed the matrix (authenticated reads AND writes
+ *   with the parent grant): the auth block's 404 "Repository not found"
+ *   (:195-199) — the grant check consults unitType=TypeWiki, which a
+ *   disabled wiki unit fails for every principal, owner and site admin
+ *   included (models/perm/access/repo_permission.go:86-107 + :435-477).
+ *
+ * Anonymous requests without the public-public posture never reach this
+ * verdict — the matrix's 401 challenge (upstream :146-160) precedes it.
+ */
+function wikiDisabledStop(
+  repo: RepositoryRow,
+  owner: AuthUser | null,
+  ownerVisibility: "public" | "limited" | "private",
+  op: GitHttpOp,
+): Response {
+  const publiclyVisible = readGrant({
+    repoVisibility: repo.visibility,
+    owner: owner === null ? null : { id: owner.id, status: owner.status },
+    ownerVisibility,
+    doer: null,
+  });
+  if (op === "read" && publiclyVisible) return repositoryWikiDisabled();
+  return repositoryNotFound();
+}
+
+/** `PlainText(403, "repository wiki is disabled")` (githttp.go:243-253) — the
+ *  respond.ts plainText family's exact shape: ctx.PlainText writes verbatim,
+ *  so NO trailing newline (unlike the http.Error 401/403 cousins). */
+function repositoryWikiDisabled(): Response {
+  return new Response("repository wiki is disabled", {
+    status: 403,
+    headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+  });
+}
+
+/**
  * The `*.wiki` git family (upstream `httpBase`, routers/web/repo/githttp.go:
  * 94-101 + 215-218 + 243-253): `/{owner}/{repo}.wiki.git/...` resolves the
  * PARENT repository (the `.wiki` marker strips like upstream's) and serves
@@ -358,11 +409,22 @@ export async function gitHttpGate(
  *   forward the parent's `protectedBranchValidator` for the same parity. No
  *   wiki push-create: a missing parent answers the bare 404 for BOTH ops
  *   (githttp.go:215-218) — wiki URLs never enter the push-create surface.
- * - The upstream wiki-unit-enabled 403 ("repository wiki is disabled",
- *   githttp.go:243-253) has no live arm here: cf-gitea's wiki is
- *   table-free and enabled for every repo (specs/wiki.md §3) — the
- *   divergence dissolves if/when a per-repo wiki switch lands (the
- *   `has_packages` precedent, repo_settings).
+ * - The per-repo wiki switch (repo_settings.hasWiki through loadRepoSettings)
+ *   gates the family exactly where upstream's unit-aware checks sit. Two
+ *   reachable upstream answers for a disabled wiki (githttp.go at the pin):
+ *   the tail `GetUnit(TypeWiki)` 403 "repository wiki is disabled"
+ *   (:243-253) serves the canAnonymousPull READ arms (public repo + active
+ *   public owner — upstream skips the whole auth block there, :131-145, so
+ *   the tail is the only wiki-aware stop), any doer; every other
+ *   matrix-passing arm takes the auth block's grant 404 "Repository not
+ *   found" (:195-199 — the check runs against unitType=TypeWiki, :95-99 +
+ *   :187, which a disabled unit fails for EVERY principal,
+ *   models/perm/access/repo_permission.go:86-107). Anonymous requests
+ *   without that posture never reach the verdict: the matrix's 401
+ *   challenge (:146-160) precedes it. The gate sits AFTER the ACL matrix
+ *   and BEFORE the mirror 403 (:201-204) — upstream's grant 404 outranks
+ *   the mirror refusal when a disabled-wiki mirrored parent takes a push
+ *   (wikiDisabledStop below).
  * - The parent's mirrored/archived posture flows through the shared matrix
  *   (row 10 archived pushes; the mirror 403 below — upstream's
  *   `!isPull && IsMirror` covers the wiki's receive-pack identically).
@@ -414,7 +476,9 @@ async function handleWikiGitRoute(
   }
 
   // Route table row 4: the wiki cell's synthetic HEAD — the parent's read
-  // rows decide (the S7 alignment's computation, wiki grant posture above).
+  // rows decide (the S7 alignment's computation, wiki grant posture above),
+  // then the family's wiki-unit gate (upstream HEAD is a pull over httpBase,
+  // so the same unit-aware verdicts apply).
   if (route.kind === "head") {
     if (req.method !== "GET") return engine.fetch(req, env, ctx);
     const decision = await authorizeGitHttp({
@@ -428,6 +492,9 @@ async function handleWikiGitRoute(
       unitAnonymousRead: false,
     });
     if (decision !== true) return decision;
+    if (!(await loadRepoSettings(env.DB, resolved.repo.id)).hasWiki) {
+      return wikiDisabledStop(resolved.repo, resolved.owner, resolved.ownerVisibility, "read");
+    }
     return serveHead(env, route, resolved.repo.defaultBranch);
   }
 
@@ -457,6 +524,15 @@ async function handleWikiGitRoute(
     unitAnonymousRead: false,
   });
   if (decision !== true) return decision;
+
+  // The wiki-unit gate (wikiDisabledStop's doc): upstream runs the grant
+  // check against unitType=TypeWiki (githttp.go:95-99 + :187-199) before the
+  // mirror refusal (:201-204), so the disabled verdict sits here — between
+  // the matrix and the mirror 403. A disabled wiki never seeds the registry
+  // row below (the read tail is unreachable).
+  if (!(await loadRepoSettings(env.DB, resolved.repo.id)).hasWiki) {
+    return wikiDisabledStop(resolved.repo, resolved.owner, resolved.ownerVisibility, op);
+  }
 
   // SPEC-0009 §2.4 row 21 / upstream githttp.go:202-205 — `!isPull` covers
   // the wiki's receive-pack: a mirrored parent's wiki is read-only too.
@@ -855,7 +931,10 @@ async function handleEnginePathBranch(
   // purge cascade (src/repos/purge.ts purgeNames). Wiki-named api paths run
   // the parent's READ rows and forward gate-cleared — the JSON mirror of the
   // git family's wiki branch (seed included: the engine 404s api reads of
-  // registry-unknown names the same way).
+  // registry-unknown names the same way), its wiki-unit gate included: a
+  // disabled wiki answers the family verdict (wikiDisabledStop — the
+  // public-parent read arm's 403, otherwise the 404) instead of leaking the
+  // cell's JSON through the seeded registry row.
   if (wikiParent !== null) {
     if (route.kind === "admin") return repositoryNotFound();
     const decision = await authorizeGitHttp({
@@ -872,6 +951,9 @@ async function handleEnginePathBranch(
       engineAdmin: false,
     });
     if (decision !== true) return decision;
+    if (!(await loadRepoSettings(env.DB, resolved.repo.id)).hasWiki) {
+      return wikiDisabledStop(resolved.repo, resolved.owner, resolved.ownerVisibility, "read");
+    }
     await ensureWikiRegistryRow(env, resolved.repo);
     return forwardToEngine(req, url, env, ctx, engine);
   }

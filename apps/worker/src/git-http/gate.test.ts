@@ -69,7 +69,7 @@ import { TeamsService } from "../api/routes/org-teams";
 import { OrgService } from "../services/orgs/orgs";
 import { settleCreatingRepo } from "./gate";
 import { createWikiPage } from "../services/wiki";
-import { deployKeys, repoCounters, repoRedirects, repositories, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
+import { deployKeys, repoCounters, repoRedirects, repoSettings, repositories, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
 import { purgeRepoMessage } from "../repos/purge";
 import { RepoService } from "../repos/service";
 import { LFS_MEDIA_TYPE } from "../services/lfs/batch";
@@ -1471,6 +1471,134 @@ describe("the *.wiki git family (upstream githttp.go:94-101 — the wiki SPEC's 
     expect(rows).toHaveLength(1);
     const cell = await env.REPO.getByName("alice/nodeletewiki.wiki").listRefs();
     expect(cell.refs.map((r) => r.name)).toContain("refs/heads/main");
+  });
+
+  // -------------------------------------------------------------------------
+  // The disabled-wiki family — the parent's repo_settings.hasWiki switch
+  // (loadRepoSettings) gating the cell per upstream's unit-aware checks
+  // (githttp.go at the pin fc493688): reads on a PUBLIC parent take the tail
+  // 403 "repository wiki is disabled" (:243-253 — the canAnonymousPull arms
+  // skip the whole auth block, so the tail is the only wiki-aware stop);
+  // every other matrix-passing arm takes the grant 404 "Repository not
+  // found" (:195-199 — the check runs against unitType=TypeWiki, which a
+  // disabled unit fails for every principal); anonymous non-public requests
+  // stay at the matrix's 401 challenge (:146-160). The other tests in this
+  // describe run with has_wiki on — that IS the "enabled unchanged" pin.
+  // -------------------------------------------------------------------------
+
+  /** The parent's `repo_settings.has_wiki` flip (loadRepoSettings reads THIS
+   *  row; RepoService.create seeds it with the enabled default — the upsert
+   *  keeps the flip robust even where a fixture skipped the seed). */
+  async function setParentWiki(slug: string, enabled: boolean): Promise<void> {
+    const row = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(eq(repositories.slug, slug)).get();
+    if (row === undefined) throw new Error(`wiki-unit flip: ${slug} row missing`);
+    await drizzle(env.DB)
+      .insert(repoSettings)
+      .values({ repoId: row.id, hasWiki: enabled })
+      .onConflictDoUpdate({ target: repoSettings.repoId, set: { hasWiki: enabled } });
+  }
+
+  it("403s a public parent's disabled-wiki clone with the exact upstream text, anonymous and granted alike (:243-253)", async () => {
+    const { aliceId } = await seedWikiParent("shutwiki", false);
+    await setParentWiki("shutwiki", false);
+    const aliceToken = (await mintFor(aliceId, "r", "read:repository")).plaintext;
+
+    // Upstream's canAnonymousPull read arms (public repo, public owner) skip
+    // the whole auth block, so ANY doer — anonymous or granted — reaches the
+    // tail check and takes its 403.
+    for (const init of [{}, { headers: { authorization: basicTokenHeader(aliceToken) } }]) {
+      const advert = await SELF.fetch("https://example.com/alice/shutwiki.wiki.git/info/refs?service=git-upload-pack", init);
+      expect(advert.status).toBe(403);
+      // ctx.PlainText writes verbatim — no trailing newline — with the
+      // plainText family's content-type + nosniff pair.
+      expect(new TextDecoder().decode(await advert.arrayBuffer())).toBe("repository wiki is disabled");
+      expect(advert.headers.get("content-type")).toBe("text/plain;charset=utf-8");
+      expect(advert.headers.get("x-content-type-options")).toBe("nosniff");
+    }
+
+    // The synthetic HEAD rides the same read verdict.
+    const head = await SELF.fetch("https://example.com/alice/shutwiki.wiki.git/HEAD");
+    expect(head.status).toBe(403);
+    expect(new TextDecoder().decode(await head.arrayBuffer())).toBe("repository wiki is disabled");
+  });
+
+  it("404s a granted doer's read of a private parent's disabled wiki (the unitType=TypeWiki grant arm, :195-199)", async () => {
+    const { aliceId, tip } = await seedWikiParent("lockedwiki", true);
+    await setParentWiki("lockedwiki", false);
+    const aliceToken = (await mintFor(aliceId, "r", "read:repository")).plaintext;
+
+    const advert = await SELF.fetch("https://example.com/alice/lockedwiki.wiki.git/info/refs?service=git-upload-pack", {
+      headers: { authorization: basicTokenHeader(aliceToken) },
+    });
+    expect(advert.status).toBe(404);
+    expect(new TextDecoder().decode(await advert.arrayBuffer())).toBe("Repository not found");
+
+    const head = await SELF.fetch("https://example.com/alice/lockedwiki.wiki.git/HEAD", {
+      headers: { authorization: basicTokenHeader(aliceToken) },
+    });
+    expect(head.status).toBe(404);
+    expect(new TextDecoder().decode(await head.arrayBuffer())).not.toContain(tip);
+  });
+
+  it("401-challenges the anonymous clone of a private parent's disabled wiki (the matrix precedes the verdict)", async () => {
+    await seedWikiParent("darkwiki", true);
+    await setParentWiki("darkwiki", false);
+
+    const advert = await SELF.fetch("https://example.com/alice/darkwiki.wiki.git/info/refs?service=git-upload-pack");
+    expect(advert.status).toBe(401);
+    expect(advert.headers.get("www-authenticate")).toBe(CHALLENGE);
+  });
+
+  it("404s every push at a disabled wiki — advert probe and RPC — and lands no ref (:195-199 for writes)", async () => {
+    const { aliceId } = await seedWikiParent("frozenwiki", false);
+    await setParentWiki("frozenwiki", false);
+    const aliceToken = (await mintFor(aliceId, "w", "write:repository")).plaintext;
+
+    // The receive-pack ADVERT (anonymous and granted): writes never take the
+    // tail 403 — anonymous stays at the challenge, the granted owner takes
+    // the grant 404 (upstream's accessMode stays Write for wiki URLs and
+    // CanAccess(Write, TypeWiki) fails for a disabled unit).
+    const anonAdvert = await SELF.fetch("https://example.com/alice/frozenwiki.wiki.git/info/refs?service=git-receive-pack");
+    expect(anonAdvert.status).toBe(401);
+    expect(anonAdvert.headers.get("www-authenticate")).toBe(CHALLENGE);
+
+    const probe = await SELF.fetch("https://example.com/alice/frozenwiki.wiki.git/info/refs?service=git-receive-pack", {
+      headers: { authorization: basicTokenHeader(aliceToken) },
+    });
+    expect(probe.status).toBe(404);
+    expect(new TextDecoder().decode(await probe.arrayBuffer())).toBe("Repository not found");
+
+    // The full RPC refuses at the same gate — the sibling cell never sees it.
+    const { oid, pack } = await buildPack();
+    const body = buildReceivePackBody([{ ref: "refs/heads/notes", oid }], pack);
+    const push = await SELF.fetch("https://example.com/alice/frozenwiki.wiki.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(aliceToken), "content-type": RECEIVE_CT },
+      body,
+    });
+    expect(push.status).toBe(404);
+    const cellRefs = await env.REPO.getByName("alice/frozenwiki.wiki").listRefs();
+    expect(cellRefs.refs.map((r) => r.name)).not.toContain("refs/heads/notes");
+  });
+
+  it("gates the disabled wiki's engine JSON api by the same family verdict", async () => {
+    const { aliceId } = await seedWikiParent("jsonoff", false);
+    await setParentWiki("jsonoff", false);
+
+    // Public parent: the read arm's tail 403, exactly like the git family.
+    const anon = await SELF.fetch("https://example.com/alice/jsonoff.wiki/api/refs");
+    expect(anon.status).toBe(403);
+    expect(new TextDecoder().decode(await anon.arrayBuffer())).toBe("repository wiki is disabled");
+
+    // Flip the SAME parent private (no second seed — seedVerifiedUser is not
+    // idempotent within a test): the granted owner now takes the 404.
+    await drizzle(env.DB).update(repositories).set({ visibility: "private" }).where(eq(repositories.slug, "jsonoff")).run();
+    const aliceToken = (await mintFor(aliceId, "r", "read:repository")).plaintext;
+    const owner = await SELF.fetch("https://example.com/alice/jsonoff.wiki/api/refs", {
+      headers: { authorization: basicTokenHeader(aliceToken) },
+    });
+    expect(owner.status).toBe(404);
+    expect(new TextDecoder().decode(await owner.arrayBuffer())).toBe("Repository not found");
   });
 });
 
