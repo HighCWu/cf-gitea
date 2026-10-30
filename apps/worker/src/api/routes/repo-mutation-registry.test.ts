@@ -77,6 +77,11 @@ async function cellHead(engineName: string): Promise<string | null> {
   return (await env.REPO.getByName(engineName).listRefs()).head;
 }
 
+// Fixture scopes widened (auth-parity H1): every mint below feeds BOTH legs
+// of the flow — POST /api/v1/user/repos (gated user AND repository,
+// api.go:1181) and repo PATCH/transfer arms (repository, api.go:1554) — so
+// the tokens carry "write:user,write:repository", exactly what an upstream
+// client must mint for this surface.
 /** POST /api/v1/user/repos through the real worker. */
 async function apiCreateRepo(
   token: string,
@@ -125,7 +130,7 @@ async function pushRef(
 describe("REDEPLOY8 tail — repo mutations reach the engine Registry/RepoCell", () => {
   it("PATCH rename: the registry row moves to the new key and the new url serves immediately", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
-    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const token = (await mintFor(alice.id, "w", "write:user,write:repository")).plaintext;
     const created = await apiCreateRepo(token, { name: "mover", private: false });
     expect(created.status).toBe(201);
     expect(await registryHas("alice/mover")).toBe(true);
@@ -145,7 +150,7 @@ describe("REDEPLOY8 tail — repo mutations reach the engine Registry/RepoCell",
 
   it("PATCH visibility flip: the registry row's priv config follows the D1 visibility", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
-    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const token = (await mintFor(alice.id, "w", "write:user,write:repository")).plaintext;
     const created = await apiCreateRepo(token, { name: "visflip", private: false });
     expect(created.status).toBe(201);
     expect((await registryRow("alice/visflip"))!.priv).toBe(0);
@@ -162,7 +167,7 @@ describe("REDEPLOY8 tail — repo mutations reach the engine Registry/RepoCell",
 
   it("PATCH default branch: the RepoCell head moves (setHead), not just the D1 column", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
-    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const token = (await mintFor(alice.id, "w", "write:user,write:repository")).plaintext;
     const created = await apiCreateRepo(token, { name: "headset", private: false });
     expect(created.status).toBe(201);
 
@@ -190,8 +195,8 @@ describe("REDEPLOY8 tail — repo mutations reach the engine Registry/RepoCell",
   it("POST transfer/accept: the registry row syncs to the new owner's key and the new url serves", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
     const bob = await seedVerifiedUser({ username: "Bob" });
-    const aliceToken = (await mintFor(alice.id, "w", "write:repository")).plaintext;
-    const bobToken = (await mintFor(bob.id, "w", "write:repository")).plaintext;
+    const aliceToken = (await mintFor(alice.id, "w", "write:user,write:repository")).plaintext;
+    const bobToken = (await mintFor(bob.id, "w", "write:user,write:repository")).plaintext;
     const created = await apiCreateRepo(aliceToken, { name: "gift", private: false });
     expect(created.status).toBe(201);
     expect(await registryHas("alice/gift")).toBe(true);
@@ -222,7 +227,7 @@ describe("REDEPLOY8 tail — repo mutations reach the engine Registry/RepoCell",
     // updates D1 while the engine keeps its old state. This is the
     // load-bearing difference the production paths above no longer have.
     const alice = await seedVerifiedUser({ username: "Alice" });
-    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const token = (await mintFor(alice.id, "w", "write:user,write:repository")).plaintext;
     const created = await apiCreateRepo(token, { name: "baremover", private: false });
     expect(created.status).toBe(201);
 

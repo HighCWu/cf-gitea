@@ -72,8 +72,10 @@ import { deleteRepoLabel, editRepoLabel, normalizeLabelColor, type LabelSortType
  *     handler shape — deviation vs literal upstream documented there);
  *   - `sort` is honored on the list but never declared in the contract
  *     (upstream reads ctx.FormString("sort") with the same mismatch);
- *   - public-only-token downgrades and tokenRequiresScopes scope categories
- *     are standing deferrals (services/orgs.ts header).
+ *   - tokenRequiresScopes scope categories are mounted tree-wide
+ *     (src/api/router.ts's apiScopeGate — this family's /orgs paths carry
+ *     `organization`, auth-parity H1); public-only-token downgrades remain
+ *     the services/orgs.ts header's topic.
  */
 
 const notFoundResponse = {

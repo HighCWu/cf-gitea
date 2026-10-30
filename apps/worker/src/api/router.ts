@@ -8,6 +8,7 @@ import {
 } from "./auth";
 import type { ApiEnv } from "./env";
 import { giteaErrorHandler } from "./errors";
+import { apiScopeGate } from "./scope-gate";
 import { registerAvatarRoutes } from "./routes/avatars";
 import { registerAccountAggregatesRoutes } from "./routes/account-aggregates";
 import { registerAdminDegenerateRoutes } from "./routes/admin-degenerate";
@@ -103,6 +104,15 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // Every error becomes Gitea's exact {message, url} body (handlers and
   // middleware just throw ApiError).
   app.onError(giteaErrorHandler);
+
+  // Tree-wide token-scope gates (auth-parity H1): upstream wraps each route
+  // group in tokenRequiresScopes(...) at chi-group level (api.go:1009-1872);
+  // the group table + evaluation live in scope-gate.ts. Mounted FIRST so the
+  // gate evaluates ahead of every registered handler — chi's group
+  // middleware ordering. Anonymous / non-token credentials pass here (the
+  // route's own reqToken / assignment gates own them), and the gate is a
+  // no-op in standalone stub-resolver usage where resolveAuth never ran.
+  app.use("*", apiScopeGate());
 
   const requireAuth = createTokenAuthMiddleware(options.auth ?? createStubAuthResolver());
   const optionalAuth = createOptionalTokenAuthMiddleware(options.auth ?? createStubAuthResolver());

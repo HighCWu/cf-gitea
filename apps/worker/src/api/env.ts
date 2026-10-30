@@ -1,4 +1,4 @@
-import type { AuthUser } from "../auth";
+import type { AuthInfo } from "../auth/auth-context";
 import type { User } from "./models/user";
 
 /**
@@ -15,7 +15,12 @@ export interface ApiEnv {
      * the Worker entry: when present, its (already D1-verified) result is the
      * source of identity for the api middlewares — the injected-resolver path
      * only applies when the router runs standalone (tests/embedding).
+     *
+     * Typed as the FULL AuthInfo (auth-parity H1): resolveAuth always
+     * attaches token + scope + isBasicAuth at runtime, and the tree-wide
+     * scope gate (scope-gate.ts) reads them — the variable was previously
+     * declared as the narrower `{ user }` slice the api middlewares consumed.
      */
-    auth?: { user: AuthUser | null };
+    auth?: AuthInfo;
   };
 }

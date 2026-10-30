@@ -144,7 +144,9 @@ import type { ParsedGpgEntity, ParsedSshKey } from "../../services/ssh-gpg-keys"
  * Landed seams per admin-t2.ts: reqToken → the shared requireAuth middleware
  * (runtime-only 401 — the contract declares none in this tag);
  * reqSiteAdmin → the local requireSiteAdmin (403 `user should be the site
- * admin` — contract-declared); scope gates → the standing SPEC-0002 deferral.
+ * admin` — contract-declared); scope gates → mounted tree-wide
+ * (src/api/router.ts's apiScopeGate — the /admin row carries `admin`,
+ * auth-parity H1).
  * The `/users/{username}` subgroup adds `context.UserAssignmentAPI()`
  * (api.go:31-66): type-blind name lookup, the user_redirect 307 seam, else
  * 404 `user redirect does not exist [name: …]`. That miss-404 is

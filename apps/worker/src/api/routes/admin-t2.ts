@@ -59,8 +59,10 @@ import { toApiUser } from "../services/user";
  *     401s in this tag);
  *   - reqSiteAdmin (api.go:343–347) → the requireSiteAdmin middleware below,
  *     403 `user should be the site admin`;
- *   - tokenRequiresScopes / rejectPublicOnly → standing deferral like every
- *     landed module (SPEC-0002 scope gates pending);
+ *   - tokenRequiresScopes → mounted tree-wide (auth-parity H1):
+ *     src/api/router.ts's apiScopeGate — the /admin row carries `admin`
+ *     (api.go:1842-1876's group gate); rejectPublicOnly → the src/index.ts
+ *     arm at /api/v1/admin/*;
  *   - UserAssignmentAPI (api.go:31–66) → resolveTargetRow below: type-blind
  *     name lookup, the user_redirect 307 seam, else 404 with upstream's
  *     `user redirect does not exist [name: …]` body (the redirect-miss error

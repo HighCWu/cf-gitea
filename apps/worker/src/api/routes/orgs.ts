@@ -122,8 +122,10 @@ import { toApiUser } from "../services/user";
  *
  * Public-only tokens are unmodeled (services/orgs.ts header) — the
  * `rejectPublicOnly` gate upstream runs inside reqOrgOwnership lands with the
- * SPEC-0002 scope wave. Token-scope categories (tokenRequiresScopes) are the
- * same standing deferral.
+ * SPEC-0002 scope wave. Token-scope categories (tokenRequiresScopes) are
+ * mounted tree-wide since the auth-parity H1 wave (src/api/router.ts's
+ * apiScopeGate — the /orgs rows carry `organization`, with the repo create/
+ * delete arms adding `repository` per api.go:1731,1733).
  */
 
 const notFoundResponse = {

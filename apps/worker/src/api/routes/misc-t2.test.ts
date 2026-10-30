@@ -333,7 +333,11 @@ describe("GET/DELETE /token (misc-t2)", () => {
       createdAt: NOW,
     };
     app.use("*", async (c, next) => {
-      c.set("auth", { user: authUser });
+      // Full AuthInfo shape (auth-parity H1 widened ApiEnv.auth): this rig
+      // simulates a resolved identity WITHOUT a token credential, so scope
+      // stays null — behaviorally identical to the `{ user }` slice this
+      // set before the widening (the gate passes scopeless requests).
+      c.set("auth", { user: authUser, token: null, scope: null, isBasicAuth: false });
       await next();
     });
     registerMiscT2Routes(app, createTokenAuthMiddleware(resolver()));

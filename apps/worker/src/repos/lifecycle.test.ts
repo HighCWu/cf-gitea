@@ -840,7 +840,7 @@ describe("engine-cell carry (P1 registry-fix: rename/transfer/delete tails)", ()
 
   it("PATCH rename carries an auto_init repo's initial commit (the production probe repro)", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
-    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+const token = (await mintFor(alice.id, "w", "write:user,write:repository")).plaintext; // auth-parity H1: the create leg rides /user/repos = user+repository (api.go:1181); the PATCH/push legs are repository-only
     const created = await SELF.fetch("https://example.com/api/v1/user/repos", {
       method: "POST",
       headers: { authorization: basicTokenHeader(token), "content-type": "application/json" },
@@ -887,7 +887,7 @@ describe("engine-cell carry (P1 registry-fix: rename/transfer/delete tails)", ()
   // resolves the FULL closure and serves a fetch round.
   it("rename carries a push STACKED on auto_init content (cross-store loose closure)", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
-    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+const token = (await mintFor(alice.id, "w", "write:user,write:repository")).plaintext; // auth-parity H1: the create leg rides /user/repos = user+repository (api.go:1181); the PATCH/push legs are repository-only
 
     // The auto_init producer: the loose commit A (POST /user/repos shape).
     const created = await SELF.fetch("https://example.com/api/v1/user/repos", {
@@ -1132,7 +1132,7 @@ describe("engine-cell carry (P1 registry-fix: rename/transfer/delete tails)", ()
   // so the materialized oid differs) is carry.ts's module doc.
   it("rename carries a LOOSE annotated tag (re-materialized: same peel, documented new oid)", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
-    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+const token = (await mintFor(alice.id, "w", "write:user,write:repository")).plaintext; // auth-parity H1: the create leg rides /user/repos = user+repository (api.go:1181); the PATCH/push legs are repository-only
     const created = await SELF.fetch("https://example.com/api/v1/user/repos", {
       method: "POST",
       headers: { authorization: basicTokenHeader(token), "content-type": "application/json" },

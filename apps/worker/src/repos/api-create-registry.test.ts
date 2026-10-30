@@ -84,7 +84,10 @@ async function apiCreateRepo(
 describe("REDEPLOY8 — API creates register in the engine Registry at create (git smart-HTTP serves them immediately)", () => {
   it("POST /user/repos: the registry row lands with the D1 row and info/refs answers 200 with the advertisement", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
-    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    // Fixture widened (auth-parity H1): POST /user/repos sits in the user-scope
+    // group AND the repo-scope combo (api.go:1181) — the token needs both
+    // write:user and write:repository, as upstream demands of any client.
+    const token = (await mintFor(alice.id, "w", "write:user,write:repository")).plaintext;
 
     const created = await apiCreateRepo(token, { name: "apimade", private: false });
     expect(created.status).toBe(201);
@@ -102,7 +105,10 @@ describe("REDEPLOY8 — API creates register in the engine Registry at create (g
   it("POST /orgs/{org}/repos: same immediate servability for an org repo", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
     await new OrgService(env.DB).createOrg({ name: "acme", ownerId: alice.id });
-    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    // Fixture widened (auth-parity H1): POST /orgs/{org}/repos is gated
+    // organization (group) AND repository (create arm) — api.go:1725-1813 +
+    // 1731. Upstream clients mint both categories.
+    const token = (await mintFor(alice.id, "w", "write:organization,write:repository")).plaintext;
 
     const created = await SELF.fetch("https://example.com/api/v1/orgs/acme/repos", {
       method: "POST",
@@ -119,7 +125,9 @@ describe("REDEPLOY8 — API creates register in the engine Registry at create (g
 
   it("POST /repos/{owner}/{repo}/forks: the fresh fork registers with the create — source and target both serve", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
-    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    // Fixture widened (auth-parity H1): the create leg rides POST /user/repos
+    // (user+repository, api.go:1181); the fork POST itself is repository-only.
+    const token = (await mintFor(alice.id, "w", "write:user,write:repository")).plaintext;
     const source = await apiCreateRepo(token, { name: "origin", private: false });
     expect(source.status).toBe(201);
 

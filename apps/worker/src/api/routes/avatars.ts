@@ -32,9 +32,9 @@ import { requireRepoAdmin, requireVisibleRepo } from "../services/repo-access";
  *   user: POST   /user/avatar                    (userUpdateAvatar)
  *         DELETE /user/avatar                    (userDeleteAvatar)
  *         — routers/api/v1/user/avatar.go; reqToken on the /user group
- *           (api.go:1204–1208) + rejectPublicOnly() (a SPEC-0002 API-layer
- *           gate, standing deferral like every /user family —
- *           routes/user-settings.ts header).
+ *           (api.go:1204–1208) + rejectPublicOnly() (the src/index.ts arm at
+ *           /api/v1/user/avatar/*) + the user-scope gate (src/api/router.ts's
+ *           apiScopeGate /user row — auth-parity H1).
  *   org:  POST   /orgs/{org}/avatar              (orgUpdateAvatar)
  *         DELETE /orgs/{org}/avatar              (orgDeleteAvatar)
  *         — routers/api/v1/org/avatar.go; reqToken + reqOrgOwnership
