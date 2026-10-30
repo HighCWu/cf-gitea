@@ -701,7 +701,10 @@ describe("POST /repos/{owner}/{repo}/pulls: the cross-repo (fork head) create ar
     expect(files.status).toBe(200);
     expect((await files.json<Array<Record<string, unknown>>>()).map((f) => f.filename)).toEqual(["feature.txt"]);
 
-    // merge: the three-way runs in the base cell and advances main.
+    // merge: the three-way runs in the base cell and advances main. The bare
+    // {do} body composes upstream's default message with the FORK form
+    // (merge.go:147 — `from {HeadRepo.FullName()}:{head} into {base}`,
+    // findings F2).
     const merge = await router()(`/repos/cf-gitea-stub/${baseSlug}/pulls/1/merge`, {
       method: "POST",
       headers: authHeaders,
@@ -711,6 +714,8 @@ describe("POST /repos/{owner}/{repo}/pulls: the cross-repo (fork head) create ar
     const mainTip = refTipMap(await engineReads(env, { ownerNamespace: "cf-gitea-stub", slug: baseSlug }).listRefs()).get(branchRef("main"))?.target;
     expect(mainTip).toBeDefined();
     expect(mainTip).not.toBe(sharedTip);
+    const mergeCommit = await engineReads(env, { ownerNamespace: "cf-gitea-stub", slug: baseSlug }).readCommit(mainTip);
+    expect(mergeCommit?.message).toBe(`Merge pull request 'fork PR' (#1) from alice/${baseSlug}:feature into main\n`);
   });
 
   it("404s a head branch the fork's cell does not have — the branch existence read runs in the HEAD cell", async () => {

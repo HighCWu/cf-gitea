@@ -194,13 +194,59 @@ async function headBranchDeleteRefusedByRule(c: Context<ApiEnv>, pair: Repositor
 
 export interface MergePullOptions {
   style: "merge" | "rebase" | "rebase-merge" | "squash" | "fast-forward-only" | "manually-merged";
-  title: string;
+  /** The composed commit message (composeMergeMessage) — "" when none. */
   message: string;
   deleteBranchAfterMerge: boolean;
   /** manually-merged: the commit the caller merged into base */
   mergeCommitId?: string;
   doerId: number;
   now: Date;
+}
+
+/**
+ * The API merge message (findings F2 — the empty merge commit). Port of the
+ * API handler's composition (gitea/routers/api/v1/repo/pull.go:966-986) over
+ * GetDefaultMergeMessage (services/pull/merge.go:112-148): a trimmed
+ * `merge_title_field` wins; empty/absent falls to the style's default —
+ *   rebase                          → "" (the fast-forward rebase amends nothing)
+ *   squash                          → `{title} (#{index})`
+ *   merge/rebase-merge/fast-forward-only →
+ *     same-repo head:               `Merge pull request '{title}' (#{index}) from {head} into {base}`
+ *     deleted head repo:            `Merge pull request '{title}' (#{index}) from <deleted>:{head} into {base}`
+ *     fork head:                    `Merge pull request '{title}' (#{index}) from {owner}/{name}:{head} into {base}`
+ * A non-empty trimmed `merge_message_field` appends as `\n\n{field}`. The
+ * `.gitea/default_merge_message/*.md` template resolution upstream runs
+ * first (merge.go:116-122) is NOT modeled — the template-less default is the
+ * only path (documented SPEC-0005 divergence). manually-merged callers skip
+ * composition entirely (upstream returns at pull.go:945-951 before it).
+ */
+export async function composeMergeMessage(
+  c: Context<ApiEnv>,
+  pair: RepositoryWithOwner,
+  issue: IssueRow,
+  pr: PullRequestRow,
+  input: { style: MergePullOptions["style"]; mergeTitleField: string; mergeMessageField: string },
+): Promise<string> {
+  let defaultTitle: string;
+  if (input.style === "rebase") {
+    // fast-forward rebase: upstream returns ("", "") — no amend, no message.
+    defaultTitle = "";
+  } else if (input.style === "squash") {
+    defaultTitle = `${issue.title} (#${pr.index})`;
+  } else if (pr.headRepoId === pair.repo.id) {
+    defaultTitle = `Merge pull request '${issue.title}' (#${pr.index}) from ${pr.headBranch} into ${pr.baseBranch}`;
+  } else {
+    const head = await findRepositoryById(c.env.DB, pr.headRepoId);
+    const from = head === null ? `<deleted>:${pr.headBranch}` : `${head.repo.ownerNamespace}/${head.repo.slug}:${pr.headBranch}`;
+    defaultTitle = `Merge pull request '${issue.title}' (#${pr.index}) from ${from} into ${pr.baseBranch}`;
+  }
+  const title = input.mergeTitleField.trim();
+  let message = title === "" ? defaultTitle : title;
+  const body = input.mergeMessageField.trim();
+  if (body !== "") {
+    message += `\n\n${body}`;
+  }
+  return message;
 }
 
 function mergePerson(c: Context<ApiEnv>): Person {
@@ -280,7 +326,7 @@ export async function mergePullRequest(
       base: baseRef,
       head,
       expectedBaseOid: baseTip,
-      message: opts.title === "" ? opts.message : opts.title,
+      message: opts.message,
       author: mergePerson(c),
       committer: mergePerson(c),
       extraRefUpdates: [],

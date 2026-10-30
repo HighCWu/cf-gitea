@@ -154,8 +154,27 @@ export const editPullRequestOptionSchema = z.object({
 
 export type EditPullRequestOption = z.infer<typeof editPullRequestOptionSchema>;
 
-/** `#/definitions/MergePullRequestOption` — POST …/pulls/{index}/merge body. */
-export const mergePullRequestOptionSchema = z.object({
+/**
+ * `#/definitions/MergePullRequestOption` — POST …/pulls/{index}/merge body.
+ *
+ * The documented keys are the swagger's lowercase property names verbatim
+ * (the Go struct's json tags, services/forms/repo_form.go:419-428). The
+ * runtime ALSO accepts the legacy PascalCase names for exactly four fields —
+ * `Do`, `MergeTitleField`, `MergeMessageField`, `MergeCommitID` — through the
+ * form's custom UnmarshalJSON, kept "for backward compatibility, to support
+ * both field names like 'do' and 'Do', because old code doesn't have 'json'
+ * tag for these fields" (repo_form.go:431-463). go-sdk/tea clients send the
+ * PascalCase form, so the alias pass below mirrors upstream exactly: the
+ * lowercase name wins when present and non-empty (Go util.IfZero) except
+ * `merge_message_field`, whose upstream aux field is a *string — a present
+ * lowercase value, even "", wins (repo_form.go:442-449). The other fields
+ * (`head_commit_id`, `force_merge`, `merge_when_checks_succeed`,
+ * `delete_branch_after_merge`) are lowercase-only upstream and here. The
+ * emitted OpenAPI document still declares only the lowercase names — the
+ * aliases are runtime-only, exactly like upstream's contract-vs-runtime
+ * split.
+ */
+const mergePullRequestOptionObject = z.object({
   delete_branch_after_merge: z.boolean().optional(),
   do: z
     .enum(["merge", "rebase", "rebase-merge", "squash", "fast-forward-only", "manually-merged"])
@@ -168,7 +187,35 @@ export const mergePullRequestOptionSchema = z.object({
   merge_when_checks_succeed: z.boolean().optional(),
 });
 
-export type MergePullRequestOption = z.infer<typeof mergePullRequestOptionSchema>;
+/** The four dual-casing pairs (canonical, legacy-PascalCase) upstream's UnmarshalJSON aliases. */
+const MERGE_PULL_REQUEST_OPTION_ALIASES = [
+  ["do", "Do"],
+  ["merge_title_field", "MergeTitleField"],
+  ["merge_message_field", "MergeMessageField"],
+  ["merge_commit_id", "MergeCommitID"],
+] as const;
+
+function applyMergePullRequestOptionAliases(raw: unknown): unknown {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const obj = { ...(raw as Record<string, unknown>) };
+  for (const [canonical, legacy] of MERGE_PULL_REQUEST_OPTION_ALIASES) {
+    const current = obj[canonical];
+    if (obj[legacy] === undefined) continue;
+    if (canonical === "merge_message_field") {
+      // pointer-typed upstream: a present lowercase value (even "") wins.
+      if (current === undefined || current === null) obj[canonical] = obj[legacy];
+    } else if (current === undefined || current === null || current === "") {
+      // util.IfZero semantics: an absent/empty canonical defers to the legacy name.
+      obj[canonical] = obj[legacy];
+    }
+    delete obj[legacy];
+  }
+  return obj;
+}
+
+export const mergePullRequestOptionSchema = z.preprocess(applyMergePullRequestOptionAliases, mergePullRequestOptionObject);
+
+export type MergePullRequestOption = z.output<typeof mergePullRequestOptionSchema>;
 
 /** `#/definitions/MergeUpstreamRequest` — POST /merge-upstream body. */
 export const mergeUpstreamRequestSchema = z.object({

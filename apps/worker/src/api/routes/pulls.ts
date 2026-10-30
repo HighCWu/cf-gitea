@@ -100,6 +100,7 @@ import {
   toApiPullRequest,
 } from "../services/pulls";
 import {
+  composeMergeMessage,
   createPullHeadRef,
   carryForkHeadIntoBase,
   crossRepoCreateMergeBase,
@@ -1507,10 +1508,22 @@ export function registerPullRoutes(
         }
       }
 
+      // The composed commit message (findings F2): a trimmed
+      // merge_title_field wins, else the style's default; a non-empty
+      // merge_message_field appends (pull.go:966-986, merge.go:112-148 —
+      // composeMergeMessage). manually-merged skips it: upstream returns at
+      // pull.go:945-951 before composing and the mark touches no commit.
+      const message =
+        form.do === "manually-merged"
+          ? ""
+          : await composeMergeMessage(c, found, issue, checked, {
+              style: form.do,
+              mergeTitleField: form.merge_title_field ?? "",
+              mergeMessageField: form.merge_message_field ?? "",
+            });
       const { commitOid } = await mergePullRequestEngine(c, found, issue, checked, {
         style: form.do,
-        title: form.merge_title_field ?? "",
-        message: form.merge_message_field ?? "",
+        message,
         deleteBranchAfterMerge: form.delete_branch_after_merge === true,
         mergeCommitId: form.merge_commit_id,
         doerId: requester.id ?? 0,

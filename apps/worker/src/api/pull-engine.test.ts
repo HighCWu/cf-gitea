@@ -404,6 +404,87 @@ describe("POST …/merge — the styles over the engine's landing primitives", (
 });
 
 // ---------------------------------------------------------------------------
+// Merge wire casing + the default message (findings F1/F2)
+// ---------------------------------------------------------------------------
+
+describe("POST …/merge — the PascalCase wire form and the default commit message", () => {
+  it("parses upstream's legacy PascalCase form {Do,MergeTitleField,MergeMessageField} — the go-sdk/tea wire shape (F1)", async () => {
+    await seedBranchWithCommit("f1-casing", "f1.txt", "f1\n");
+    const created = await send(`${REPO}/pulls`, jsonInit("POST", { title: "Casing check", head: "f1-casing", base: "main" }));
+    const index = (await jsonBody(created)).number as number;
+
+    // F1 repro: this exact body 422'd before the alias pass.
+    const merged = await send(
+      `${REPO}/pulls/${index}/merge`,
+      jsonInit("POST", { Do: "merge", MergeTitleField: "legacy title", MergeMessageField: "legacy body" }),
+    );
+    expect(merged.status).toBe(200);
+    const tips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
+    const main = await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).readCommit(tips.get("refs/heads/main")?.target);
+    expect(main?.subject).toBe("legacy title");
+    // the engine stores the git-conventional trailing newline
+    expect(main?.message).toBe("legacy title\n\nlegacy body\n");
+  });
+
+  it("still 422s an unknown Do value after the alias pass (the enum gates the merged name)", async () => {
+    await seedBranchWithCommit("f1-bogus", "f1b.txt", "f1b\n");
+    const created = await send(`${REPO}/pulls`, jsonInit("POST", { title: "Bogus Do", head: "f1-bogus", base: "main" }));
+    const index = (await jsonBody(created)).number as number;
+    const merged = await send(`${REPO}/pulls/${index}/merge`, jsonInit("POST", { Do: "teleport" }));
+    expect(merged.status).toBe(422);
+    expect((await jsonBody(merged)).message).toBe("invalid request body");
+  });
+
+  it("a bare {do:'merge'} lands upstream's default message, not an empty one (F2)", async () => {
+    await seedBranchWithCommit("f2-default", "f2.txt", "f2\n");
+    const created = await send(`${REPO}/pulls`, jsonInit("POST", { title: "Default message check", head: "f2-default", base: "main" }));
+    const index = (await jsonBody(created)).number as number;
+
+    expect((await send(`${REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge" }))).status).toBe(200);
+    const tips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
+    const main = await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).readCommit(tips.get("refs/heads/main")?.target);
+    expect(main?.parents).toHaveLength(2);
+    // services/pull/merge.go:140 — same-repo, template-less:
+    // `Merge pull request '{title}' (#{index}) from {head} into {base}`
+    expect(main?.message).toBe(`Merge pull request 'Default message check' (#${index}) from f2-default into main\n`);
+
+    // the finding's probe surface: /git/commits/{sha} no longer renders a
+    // null message for the merge commit
+    const viaApi = (await jsonBody(await get(`${REPO}/git/commits/${main?.oid}`))).commit as Record<string, unknown>;
+    expect(viaApi.message).toBe(`Merge pull request 'Default message check' (#${index}) from f2-default into main\n`);
+  });
+
+  it("merge_title_field overrides the default; a non-empty merge_message_field appends (pull.go:966-986)", async () => {
+    await seedBranchWithCommit("f2-override", "f2o.txt", "f2o\n");
+    const created = await send(`${REPO}/pulls`, jsonInit("POST", { title: "Override check", head: "f2-override", base: "main" }));
+    const index = (await jsonBody(created)).number as number;
+
+    expect(
+      (
+        await send(
+          `${REPO}/pulls/${index}/merge`,
+          jsonInit("POST", { do: "merge", merge_title_field: "custom subject", merge_message_field: "body line" }),
+        )
+      ).status,
+    ).toBe(200);
+    const tips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
+    const main = await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).readCommit(tips.get("refs/heads/main")?.target);
+    expect(main?.message).toBe("custom subject\n\nbody line\n");
+  });
+
+  it("squash defaults its title to '{title} (#{index})' (merge.go:138)", async () => {
+    await seedBranchWithCommit("f2-squash", "f2s.txt", "f2s\n");
+    const created = await send(`${REPO}/pulls`, jsonInit("POST", { title: "Squash default", head: "f2-squash", base: "main" }));
+    const index = (await jsonBody(created)).number as number;
+
+    expect((await send(`${REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "squash" }))).status).toBe(200);
+    const tips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
+    const main = await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).readCommit(tips.get("refs/heads/main")?.target);
+    expect(main?.subject).toBe(`Squash default (#${index})`);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // (C) commits family
 // ---------------------------------------------------------------------------
 

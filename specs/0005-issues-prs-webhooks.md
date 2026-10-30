@@ -211,6 +211,27 @@ Citations: `gitea/models/issues/pull.go`, `services/pull/pull.go`, `check.go`,
   `merge_pull` (28) comment and fires the `pull_request` webhook with
   `action="closed"`, `pull_request.merged=true` (`services/webhook/notifier.go:741–855`).
   Deleting the head branch afterwards writes a `delete_branch` (11) comment.
+- **Merge body wire casing (as-built, 2026-10-30)**: the documented body keys are the
+  swagger's lowercase names (`do`, `merge_title_field`, …), and the runtime also
+  accepts the legacy PascalCase aliases `Do`/`MergeTitleField`/`MergeMessageField`/
+  `MergeCommitID` through the form's custom `UnmarshalJSON`
+  (`services/forms/repo_form.go:431–463` — go-sdk/tea clients send that form).
+  Lowercase wins on collision (Go `util.IfZero`; `merge_message_field` is
+  pointer-typed, so a present lowercase value, even `""`, wins); the remaining
+  fields are lowercase-only. The emitted OpenAPI document declares only the
+  lowercase names.
+- **Merge commit message (as-built, 2026-10-30)**: a trimmed `merge_title_field`
+  wins; empty/absent falls to the style's template-less default
+  (`GetDefaultMergeMessage`, `services/pull/merge.go:112–148`) — rebase → `""`,
+  squash → `{title} (#{index})`, otherwise
+  `Merge pull request '{title}' (#{index}) from {head} into {base}` with the fork
+  form `from {owner}/{name}:{head}` and `<deleted>:{head}` for a deleted head repo
+  (`routers/api/v1/repo/pull.go:966–986`); a non-empty trimmed
+  `merge_message_field` appends as `\n\n{field}`. Documented divergences: the
+  `.gitea/default_merge_message/*.md` template resolution and the squash default
+  body (aggregated commit messages + `Reviewed-on`/`Reviewed-by` trailers,
+  `services/pull/pull.go:724–`) are not modeled — squash lands the default title
+  only. manually-merged composes no message (upstream returns before it).
 - **Work-in-progress**: titles prefixed `WIP:`, `[WIP]`, `Draft`, etc. block merge
   (`models/issues/pull.go HasWorkInProgressPrefix`).
 
