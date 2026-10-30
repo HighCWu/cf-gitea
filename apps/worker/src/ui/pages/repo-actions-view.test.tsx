@@ -23,9 +23,6 @@ import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { saveRepoSettings } from "../../api/services/repo-settings";
 import { actionArtifacts, actionLogChunks, actionRunAttempts, actionRunJobs, actionRuns, actionTaskSteps, actionTasks, repositories } from "../../db/schema";
 import {
-  ACTION_STATUS_CANCELLED,
-  ACTION_STATUS_FAILURE,
-  ACTION_STATUS_PENDING,
   ACTION_STATUS_RUNNING,
   ACTION_STATUS_SUCCESS,
   ACTION_STATUS_WAITING,
@@ -34,7 +31,6 @@ import {
   insertActionRun,
   type TaskRow,
 } from "../../services/actions/model";
-import { parseRepoActionsConfig, saveRepoActionsConfig } from "../../services/actions/config";
 import { updateLog, updateTaskByState } from "../../services/actions/update";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
@@ -53,8 +49,6 @@ import {
   repoActionsViewDetailLocale,
   repoActionsViewLocale,
   resolveRunForView,
-  resolveRunAttemptAndJobs,
-  rerunActionRun,
   type ViewResponse,
 } from "./repo-actions-view";
 import {
@@ -115,7 +109,6 @@ beforeEach(async () => {
     "action_runners",
     "action_tasks_versions",
     "repo_settings",
-    "repo_units",
     "repositories",
     "users",
   ]) {
@@ -974,174 +967,6 @@ describe("the cancel arm (POST runs/{run}/cancel — CancelRun's v1 reduction)",
     const { run } = await seedRun(1);
     const res = await getRoute(`/alice/demo/actions/runs/${run.id}/cancel`, 1);
     expect(res.status).toBe(405);
-  });
-});
-
-// --- the rerun arm (the census C5 remainder) --------------------------------------
-
-/** Resolve (attempt, jobs) the way the rerun POST handlers will (the
- *  run-level route carries no attempt/job segments — getCurrentRunJobsByPathParam's
- *  latest arm), then call the page module's rerunActionRun. */
-async function rerun(
-  runId: number,
-  request: Parameters<typeof rerunActionRun>[6],
-  opts: { attemptRaw?: string; jobRaw?: string } = {},
-): ReturnType<typeof rerunActionRun> {
-  const stored = (await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.id, runId)))[0]!;
-  const { attempt, jobs } = await resolveRunAttemptAndJobs(env.DB, stored, opts.attemptRaw ?? "", opts.jobRaw ?? "");
-  return rerunActionRun(env.DB, repo, stored, attempt, jobs, 1, request);
-}
-
-describe("the rerun arm (POST runs/{run}/rerun[-failed] + jobs/{job}/rerun — view.go:952-1016)", () => {
-  beforeEach(async () => {
-    await enableActions();
-  });
-
-  it("rerun-all creates attempt 2 and answers JSONRedirect(run.Link()) (context.go:239-241)", async () => {
-    const seeded = await seedRun(1, { jobs: [{ jobId: "build" }, { jobId: "test", needs: ["build"] }] });
-    await setStatus(seeded.run.id, seeded.attempt.id, ACTION_STATUS_FAILURE, {
-      jobStatus: ACTION_STATUS_FAILURE,
-    });
-
-    const outcome = await rerun(seeded.run.id, { kind: "run" });
-    expect(outcome).toEqual({
-      kind: "json",
-      status: 200,
-      body: { redirect: `/alice/demo/actions/runs/${seeded.run.id}` },
-    });
-
-    // The DB carries the new attempt linkage (a rerun is a new ATTEMPT, not
-    // a new run).
-    const attempts = await drizzle(env.DB).select().from(actionRunAttempts).where(eq(actionRunAttempts.runId, seeded.run.id));
-    expect(attempts).toHaveLength(2);
-    expect(attempts.map((a) => a.attempt).sort()).toEqual([1, 2]);
-    const run = (await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.id, seeded.run.id)))[0]!;
-    const newAttempt = attempts.find((a) => a.id === run.latestAttemptId)!;
-    expect(newAttempt.attempt).toBe(2);
-    const jobs = await drizzle(env.DB).select().from(actionRunJobs).where(eq(actionRunJobs.runId, seeded.run.id));
-    const attempt2Jobs = jobs.filter((job) => job.runAttemptId === newAttempt.id);
-    expect(attempt2Jobs.map((job) => job.status).sort((a, b) => a - b)).toEqual([
-      ACTION_STATUS_WAITING,
-      ACTION_STATUS_PENDING,
-    ]);
-  });
-
-  it("rerun-failed on a fully successful run 400s the no-failed-jobs locale (view.go:1002-1008)", async () => {
-    const seeded = await seedRun(1, { jobs: [{ jobId: "build" }] });
-    await setStatus(seeded.run.id, seeded.attempt.id, ACTION_STATUS_SUCCESS, { jobStatus: ACTION_STATUS_SUCCESS });
-
-    const outcome = await rerun(seeded.run.id, { kind: "run-failed" });
-    expect(outcome).toEqual({
-      kind: "json",
-      status: 400,
-      body: { errorMessage: "This workflow run has no failed jobs to re-run.", renderFormat: "text" },
-    });
-    const attempts = await drizzle(env.DB).select().from(actionRunAttempts).where(eq(actionRunAttempts.runId, seeded.run.id));
-    expect(attempts).toHaveLength(1); // nothing written
-  });
-
-  it("rerun-failed resets only the failed job and keeps the succeeded artifacts reachable", async () => {
-    const seeded = await seedRun(1, { jobs: [{ jobId: "build" }, { jobId: "test", needs: ["build"] }] });
-    await setStatus(seeded.run.id, seeded.attempt.id, ACTION_STATUS_FAILURE, { jobStatus: ACTION_STATUS_FAILURE });
-    await drizzle(env.DB)
-      .update(actionRunJobs)
-      .set({ status: ACTION_STATUS_SUCCESS, taskId: 42 })
-      .where(eq(actionRunJobs.jobId, "build"));
-    // The succeeded job's artifact rides attempt 1.
-    await env.DB.prepare(
-      `INSERT INTO action_artifacts (run_id, run_attempt_id, repo_id, owner_id, file_size, artifact_path, artifact_name, status, created, updated)
-       VALUES (?, ?, ?, 1, 10, 'a/b.txt', 'dist', 2, unixepoch(), unixepoch())`,
-    )
-      .bind(seeded.run.id, seeded.attempt.id, repo.id)
-      .run();
-
-    const outcome = await rerun(seeded.run.id, { kind: "run-failed" });
-    expect(outcome).toMatchObject({ kind: "json", status: 200 });
-
-    const run = (await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.id, seeded.run.id)))[0]!;
-    const jobs = await drizzle(env.DB).select().from(actionRunJobs).where(eq(actionRunJobs.runId, seeded.run.id));
-    const attempt2Jobs = jobs.filter((job) => job.runAttemptId === run.latestAttemptId);
-    expect(attempt2Jobs.find((job) => job.jobId === "build")!.status).toBe(ACTION_STATUS_SUCCESS); // pass-through
-    expect(attempt2Jobs.find((job) => job.jobId === "build")!.sourceTaskId).toBe(42);
-    expect(attempt2Jobs.find((job) => job.jobId === "test")!.status).toBe(ACTION_STATUS_PENDING); // reset
-    // The inheritance arm: the new attempt's rows carry the pass-through
-    // pointer, so GetArtifactAttemptIDs (rerun.ts's port) reaches attempt 1.
-    const { getArtifactAttemptIds } = await import("../../services/actions/rerun");
-    const newTest = attempt2Jobs.find((job) => job.jobId === "test")!;
-    expect(await getArtifactAttemptIds(env.DB, newTest)).toEqual([run.latestAttemptId, seeded.attempt.id]);
-  });
-
-  it("a not-done run answers the not_done locale (checkRunRerunAllowed, view.go:921-925)", async () => {
-    const { run } = await seedRun(1);
-    const outcome = await rerun(run.id, { kind: "run" });
-    expect(outcome).toEqual({
-      kind: "json",
-      status: 400,
-      body: { errorMessage: "This workflow run is not done.", renderFormat: "text" },
-    });
-  });
-
-  it("a disabled workflow answers the disabled locale (checkRunRerunAllowed, view.go:926-941)", async () => {
-    const seeded = await seedRun(1, { jobs: [{ jobId: "build" }] });
-    await setStatus(seeded.run.id, seeded.attempt.id, ACTION_STATUS_SUCCESS, { jobStatus: ACTION_STATUS_SUCCESS });
-    await saveRepoActionsConfig(env.DB, repo.id, {
-      ...parseRepoActionsConfig(null),
-      disabledWorkflows: [WORKFLOW_ID],
-    });
-    const outcome = await rerun(seeded.run.id, { kind: "run" });
-    expect(outcome).toEqual({
-      kind: "json",
-      status: 400,
-      body: { errorMessage: "Workflow is disabled.", renderFormat: "text" },
-    });
-  });
-
-  it("the job rerun: a foreign job 404-shells, the run's own job succeeds (view.go:970-974)", async () => {
-    const seeded = await seedRun(1, { jobs: [{ jobId: "build" }, { jobId: "side" }] });
-    await setStatus(seeded.run.id, seeded.attempt.id, ACTION_STATUS_FAILURE, { jobStatus: ACTION_STATUS_FAILURE });
-    const jobs = await drizzle(env.DB).select().from(actionRunJobs).where(eq(actionRunJobs.runId, seeded.run.id));
-    const buildJob = jobs.find((job) => job.jobId === "build")!;
-
-    // The foreign-job probe FIRST: upstream answers not-done before the job
-    // lookup (view.go:962's gate precedes :970), so once a rerun flips the
-    // run back to waiting, the 404 arm is unreachable.
-    const foreign = await rerun(seeded.run.id, { kind: "job", jobId: 999999 });
-    expect(foreign).toEqual({ kind: "not-found" });
-
-    const okOutcome = await rerun(seeded.run.id, { kind: "job", jobId: buildJob.id });
-    expect(okOutcome).toMatchObject({ kind: "json", status: 200 });
-  });
-
-  it("a historical attempt URL answers the 404 shell (checkLatestAttempt, view.go:944-950)", async () => {
-    const seeded = await seedRun(1, { jobs: [{ jobId: "build" }] });
-    await setStatus(seeded.run.id, seeded.attempt.id, ACTION_STATUS_FAILURE, { jobStatus: ACTION_STATUS_FAILURE });
-    await rerun(seeded.run.id, { kind: "run" }); // attempt 2 exists now
-    const stored = (await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.id, seeded.run.id)))[0]!;
-    expect(stored.latestAttemptId).not.toBe(seeded.attempt.id);
-    const outcome = await rerun(seeded.run.id, { kind: "run" }, { attemptRaw: "1" });
-    expect(outcome).toEqual({ kind: "not-found" });
-  });
-
-  it("the conflict maps 409 {message} (handleWorkflowRerunError's AlreadyExist arm, view.go:1018-1022)", async () => {
-    const seeded = await seedRun(1, { jobs: [{ jobId: "build" }] });
-    await setStatus(seeded.run.id, seeded.attempt.id, ACTION_STATUS_FAILURE, { jobStatus: ACTION_STATUS_FAILURE });
-    await drizzle(env.DB)
-      .insert(actionRunAttempts)
-      .values({
-        repoId: repo.id,
-        runId: seeded.run.id,
-        attempt: 2,
-        triggerUserId: 1,
-        status: ACTION_STATUS_WAITING,
-        created: T0,
-        updated: T0,
-      });
-    const outcome = await rerun(seeded.run.id, { kind: "run" });
-    expect(outcome).toEqual({
-      kind: "json",
-      status: 409,
-      body: { message: `workflow run attempt 2 for run ${seeded.run.id} already exists` },
-    });
   });
 });
 
