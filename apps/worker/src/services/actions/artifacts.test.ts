@@ -898,6 +898,24 @@ describe("the OIDC issuer", () => {
     expect(ok).toBe(true);
   });
 
+  it("defaults the audience to AppURL + owner when no audience is requested (oidc.go:179-182)", async () => {
+    const harness = await seedRunningTask({ tokenPermissions: JSON.stringify({ id_token: true, unit_access_modes: {} }) });
+    const requestToken = await signActionsClaims(env, { scp: "Actions.IDTokenRequest", ac: "", taskId: harness.taskId, runId: 0, jobId: 0 });
+
+    // No ?audience — the default composes https://host/<owner> (the AppURL
+    // keeps its trailing slash), not the malformed https://host<owner>.
+    const res = await SELF.fetch(`${BASE}/api/actions/oidc/token`, {
+      headers: { authorization: `Bearer ${requestToken}` },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json<{ value: string }>();
+    const payload = body.value.split(".")[1];
+    const claims = JSON.parse(atob(payload!.replace(/-/g, "+").replace(/_/g, "/"))) as Record<string, unknown>;
+    expect(claims.aud).toBe("https://example.com/artifact-owner");
+    // The subject's owner segment is the bare owner name (oidc.go:173-177).
+    expect(String(claims.sub)).toMatch(/^repo:artifact-owner@\d+\/repo@\S+:ref:refs\/heads\/main$/);
+  });
+
   it("denies a task without the id-token permission and an unknown task", async () => {
     const harness = await seedRunningTask(); // token_permissions NULL → denied
     const requestToken = await signActionsClaims(env, { scp: "Actions.IDTokenRequest", ac: "", taskId: harness.taskId, runId: 0, jobId: 0 });
@@ -924,43 +942,57 @@ describe("the OIDC issuer", () => {
 
   it("shapes the claims against the stored rows (the createOIDCClaims port)", () => {
     const now = new Date("2026-10-29T00:00:00Z");
-    const claims = createOidcClaims(
-      {
-        run: {
-          id: 5,
-          repoId: "repo-1",
-          index: 3,
-          triggerUserId: 11,
-          ref: "refs/heads/main",
-          commitSha: "a".repeat(40),
-          triggerEvent: "push",
-          eventPayload: "{}",
-          workflowId: ".gitea/workflows/ci.yml",
-          workflowCommitSha: "",
-          isForkPullRequest: false,
-        },
-        job: { attempt: 1, tokenPermissions: null },
-        repo: { ownerNamespace: "octo", slug: "hello", ownerId: 2, visibility: "public", id: "repo-1" },
-        actor: "octo",
+    const inputs = {
+      run: {
+        id: 5,
+        repoId: "repo-1",
+        index: 3,
+        triggerUserId: 11,
         ref: "refs/heads/main",
-        refType: "branch",
-        baseRef: "",
-        headRef: "",
-        sha: "a".repeat(40),
-        eventName: "push",
-        appUrl: "https://example.com",
+        commitSha: "a".repeat(40),
+        triggerEvent: "push",
+        eventPayload: "{}",
+        workflowId: ".gitea/workflows/ci.yml",
+        workflowCommitSha: "",
+        isForkPullRequest: false,
       },
-      "",
-      now,
-    );
+      job: { attempt: 1, tokenPermissions: null },
+      repo: { ownerNamespace: "octo", slug: "hello", ownerId: 2, visibility: "public", id: "repo-1" },
+      actor: "octo",
+      ref: "refs/heads/main",
+      refType: "branch",
+      baseRef: "",
+      headRef: "",
+      sha: "a".repeat(40),
+      eventName: "push",
+      appUrl: "https://example.com/",
+    };
+    const claims = createOidcClaims(inputs, "", now);
     expect(claims.iss).toBe("https://example.com/api/actions/oidc");
-    expect(claims.sub).toBe(`repo:octo/hello@2/hello@repo-1:ref:refs/heads/main`);
-    expect(claims.aud).toBe("https://example.comocto"); // AppURL + PathEscape(owner)
+    // repo:<OwnerName>@<OwnerID>/<Name>@<RepoID> (oidc.go:173-177) — the
+    // owner segment carries the owner NAME, not the full name.
+    expect(claims.sub).toBe(`repo:octo@2/hello@repo-1:ref:refs/heads/main`);
+    // setting.AppURL + url.PathEscape(OwnerName) (oidc.go:179-182) — the
+    // AppURL keeps its trailing slash: https://host/<owner>.
+    expect(claims.aud).toBe("https://example.com/octo");
     expect(claims.exp - claims.iat).toBe(300);
     expect(claims.iat - claims.nbf).toBe(300);
     expect(claims.workflow).toBe(".gitea/workflows/ci.yml");
     expect(claims.repository_visibility).toBe("public");
     expect(claims.runner_environment).toBe("self-hosted");
+
+    // A pull_request run swaps the :ref leg for :pull_request (oidc.go:175)
+    // and an EXPLICIT audience passes through untouched.
+    const pr = createOidcClaims(
+      {
+        ...inputs,
+        run: { ...inputs.run, triggerEvent: "pull_request" },
+      },
+      "oracle-aud",
+      now,
+    );
+    expect(pr.sub).toBe("repo:octo@2/hello@repo-1:pull_request");
+    expect(pr.aud).toBe("oracle-aud");
   });
 });
 

@@ -25,6 +25,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { actionRunJobs, actionRuns, actionTasks } from "../../db/schema";
+import { goPathEscape } from "../packages/npm";
 import { getRepoById, getUserById, type RepoRecord, type RunJobRow, type RunRow } from "./model";
 import { OIDC_SIGNING_ALGORITHM, oidcClaimsSupported, oidcIssuer, oidcPublicJwk, signOIDCToken, taskIdFromToken } from "./secrets";
 
@@ -102,6 +103,8 @@ interface ClaimInputs {
   headRef: string;
   sha: string;
   eventName: string;
+  /** The AppURL — origin WITH the trailing slash (setting.AppURL's shape,
+   *  `appUrlOf`). The audience composition below relies on the slash. */
   appUrl: string;
 }
 
@@ -115,15 +118,19 @@ export function createOidcClaims(inputs: ClaimInputs, audience: string, now: Dat
   const fullName = `${ownerNamespace}/${repo?.slug ?? ""}`;
 
   // GitHub's immutable format — the IDs keep a recreated owner or repo name
-  // from matching (oidc.go:171-178).
-  let subject = `repo:${fullName}@${repo?.ownerId ?? 0}/${repo?.slug ?? ""}@${run.repoId}`;
+  // from matching (oidc.go:171-178):
+  // repo:<OwnerName>@<OwnerID>/<Name>@<RepoID> — the owner segment carries
+  // the owner NAME alone, not the full name.
+  let subject = `repo:${ownerNamespace}@${repo?.ownerId ?? 0}/${repo?.slug ?? ""}@${run.repoId}`;
   if (run.triggerEvent === "pull_request") {
     subject += ":pull_request";
   } else {
     subject += `:ref:${inputs.ref}`;
   }
   if (audience === "") {
-    audience = `${appUrl}${encodeURIComponent(ownerNamespace)}`;
+    // setting.AppURL + url.PathEscape(run.Repo.OwnerName) (oidc.go:179-182) —
+    // the AppURL keeps its trailing slash: https://host/<owner>.
+    audience = `${appUrl}${goPathEscape(ownerNamespace)}`;
   }
   const visibility =
     repo?.visibility === "public" ? "public" : repo?.visibility === "internal" ? "internal" : "private";
@@ -137,7 +144,7 @@ export function createOidcClaims(inputs: ClaimInputs, audience: string, now: Dat
 
   const seconds = Math.floor(now.getTime() / 1000);
   return {
-    iss: oidcIssuer(appUrl + "/"),
+    iss: oidcIssuer(appUrl),
     sub: subject,
     aud: audience,
     exp: seconds + 5 * 60,
@@ -244,7 +251,7 @@ export async function createOidcToken(env: Env, requestToken: string, audience: 
       headRef,
       sha,
       eventName: run.triggerEvent,
-      appUrl: appUrl.replace(/\/$/, ""),
+      appUrl,
     },
     audience,
     new Date(),

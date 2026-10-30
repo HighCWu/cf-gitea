@@ -13,6 +13,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import {
   actionRunnerTokens,
+  actionRunJobs,
   actionRunners,
   actionTasksVersions,
   users,
@@ -21,6 +22,7 @@ import {
 } from "../../db/schema";
 import {
   canMatchLabels,
+  createRunner,
   cryptoRandomToken,
   ellipsisDisplayString,
   getLatestRunnerToken,
@@ -30,6 +32,7 @@ import {
   hashRunnerToken,
   increaseTaskVersion,
   newRunnerTokenWithValue,
+  scopeRepoCondition,
   shouldPersistLastActive,
   shouldPersistLastOnline,
   statusToResult,
@@ -285,5 +288,84 @@ describe("runner rows", () => {
     expect(row.tokenHash).toMatch(/^[0-9a-f]{64}$/);
     expect(JSON.stringify(row)).not.toContain(runner.token);
     expect(await verifyRunnerToken(row.tokenHash, row.tokenSalt, runner.token)).toBe(true);
+  });
+});
+
+describe("the dispatch scan's scope condition (task.go:279-286)", () => {
+  async function seedJob(repoId: string, ownerId: number, jobId: string): Promise<void> {
+    const now = new Date("2026-01-02T00:00:00Z");
+    await db().insert(actionRunJobs).values({
+      runId: 1,
+      repoId,
+      ownerId,
+      jobId,
+      workflowPayload: new TextEncoder().encode("name: ci\n"),
+      status: 5, // waiting
+      created: now,
+      updated: now,
+    });
+  }
+
+  it("an owner scope rides the repo_unit subquery — scoped repos only", async () => {
+    const ownerId = await seedUser("cond-org");
+    const otherOwner = await seedUser("cond-other");
+    await seedRepo("repo-c1", "cond-org", ownerId, "c1");
+    await seedRepo("repo-c2", "cond-org", ownerId, "c2");
+    await seedRepo("repo-cx", "cond-org", ownerId, "cx", false); // unit off → out of scope
+    await seedRepo("repo-co", "cond-other", otherOwner, "co"); // other owner → out of scope
+    const runner = await createRunner(env.DB, {
+      uuid: "uuid-cond",
+      name: "cond-runner",
+      version: "v",
+      ownerId,
+      repoId: "",
+      agentLabels: ["a"],
+      ephemeral: false,
+      hasCancellingSupport: false,
+    });
+    const cond = scopeRepoCondition(env.DB, runner);
+    if (cond === undefined) throw new Error("owner runner must scope");
+    await seedJob("repo-c1", ownerId, "j1");
+    await seedJob("repo-c2", ownerId, "j2");
+    await seedJob("repo-cx", ownerId, "jx");
+    await seedJob("repo-co", otherOwner, "jo");
+
+    const rows = await db().select({ jobId: actionRunJobs.jobId }).from(actionRunJobs).where(cond);
+    expect(rows.map((r) => r.jobId).sort()).toEqual(["j1", "j2"]);
+  });
+
+  it("a repo runner scopes to its repo and a global runner gets no scope leg", async () => {
+    const ownerId = await seedUser("cond-two");
+    await seedRepo("repo-r1", "cond-two", ownerId, "r1");
+    await seedRepo("repo-r2", "cond-two", ownerId, "r2");
+    await seedJob("repo-r1", ownerId, "jr1");
+    await seedJob("repo-r2", ownerId, "jr2");
+
+    const repoRunner = await createRunner(env.DB, {
+      uuid: "uuid-repo",
+      name: "repo-runner",
+      version: "v",
+      ownerId: 0,
+      repoId: "repo-r1",
+      agentLabels: ["a"],
+      ephemeral: false,
+      hasCancellingSupport: false,
+    });
+    const repoCond = scopeRepoCondition(env.DB, repoRunner);
+    if (repoCond === undefined) throw new Error("repo runner must scope");
+    const repoRows = await db().select({ jobId: actionRunJobs.jobId }).from(actionRunJobs).where(repoCond);
+    expect(repoRows.map((r) => r.jobId)).toEqual(["jr1"]);
+
+    const globalRunner = await createRunner(env.DB, {
+      uuid: "uuid-global",
+      name: "global-runner",
+      version: "v",
+      ownerId: 0,
+      repoId: "",
+      agentLabels: ["a"],
+      ephemeral: false,
+      hasCancellingSupport: false,
+    });
+    expect(scopeRepoCondition(env.DB, globalRunner)).toBeUndefined();
   });
 });

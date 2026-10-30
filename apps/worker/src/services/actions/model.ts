@@ -15,7 +15,7 @@
  * spelling.
  */
 
-import { and, desc, eq, gt, inArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, or, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import {
@@ -635,6 +635,9 @@ const PICK_TASK_BATCH_SIZE = 100;
  * jobCond, task.go:279-286): a repo runner sees its repo; an owner runner
  * sees the owner's repos with the Actions unit enabled (upstream's
  * repo_unit type-10 join); null = a global runner sees everything.
+ * The materialized read — the scan itself filters through
+ * {@link scopeRepoCondition}, the same join as a subquery (see there for
+ * why the scan must not consume this list directly).
  */
 export async function scopeRepoIds(d1: D1, runner: RunnerRow): Promise<string[] | null> {
   const db = drizzle(d1);
@@ -652,6 +655,37 @@ export async function scopeRepoIds(d1: D1, runner: RunnerRow): Promise<string[] 
   return null;
 }
 
+/**
+ * The scan's scope filter (CreateTaskForRunner's jobCond, task.go:279-286):
+ * a repo runner sees its repo; an owner runner sees the owner's repos with
+ * the Actions unit enabled; a global runner gets undefined (no scope leg).
+ * The owner branch keeps upstream's `builder.In("repo_id", subquery)` shape
+ * (task.go:280-283) — an IN over the repo_unit JOIN SUBQUERY, not over
+ * materialized ids: D1 caps a statement at 100 bound parameters, so the
+ * materialized list (one bind per repo + the scan's three eq legs) 500s
+ * every FetchTask once an owner passes ~95 actions-enabled repos, while the
+ * subquery carries a single bind (the owner id) at any repo count. An empty
+ * scope set needs no special case — the subquery matches nothing, which is
+ * exactly an empty IN.
+ */
+export function scopeRepoCondition(d1: D1, runner: RunnerRow): SQL<unknown> | undefined {
+  const db = drizzle(d1);
+  if (runner.repoId !== "") {
+    return eq(actionRunJobs.repoId, runner.repoId);
+  }
+  if (runner.ownerId !== 0) {
+    return inArray(
+      actionRunJobs.repoId,
+      db
+        .select({ id: repositories.id })
+        .from(repositories)
+        .innerJoin(sql`repo_units`, sql`repo_units.repo_id = repositories.id`)
+        .where(and(sql`repositories.owner_id = ${runner.ownerId}`, sql`repo_units.type = 'actions'`)),
+    );
+  }
+  return undefined;
+}
+
 /** Scan candidates for an idle runner (CreateTaskForRunner,
  *  task.go:265-331): keyset-paginated oldest-first over waiting, unclaimed,
  *  non-reusable-caller jobs within the runner's scope. Each label-matched
@@ -663,17 +697,14 @@ export async function scanAndClaimWaitingJobs<T>(
   claim: (job: RunJobRow) => Promise<T | null>,
 ): Promise<T | null> {
   const db = drizzle(d1);
-  const scopeRepos = await scopeRepoIds(d1, runner);
-  if (scopeRepos !== null && scopeRepos.length === 0) {
-    return null;
-  }
-  const base = [
+  const base: SQL<unknown>[] = [
     eq(actionRunJobs.taskId, 0),
     eq(actionRunJobs.status, ACTION_STATUS_WAITING),
     eq(actionRunJobs.isReusableCaller, false),
   ];
-  if (scopeRepos !== null) {
-    base.push(inArray(actionRunJobs.repoId, scopeRepos));
+  const scope = scopeRepoCondition(d1, runner);
+  if (scope !== undefined) {
+    base.push(scope);
   }
 
   let cursorUpdated: Date | null = null;

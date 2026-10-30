@@ -325,6 +325,72 @@ describe("the claim + payload path", () => {
   });
 });
 
+describe("the owner-runner scope scan past D1's 100-bind cap", () => {
+  it("dispatches with >100 actions-enabled repos in scope (the IN rides the subquery)", async () => {
+    // 120 actions-enabled repos under one owner: the old materialized
+    // inArray rendered one bind per repo id (+3 for the eq legs = 123),
+    // breaching D1's 100-bound-parameters-per-statement cap and 500ing
+    // every FetchTask; the scan must scope through the repo_unit subquery.
+    const ownerRows = await db()
+      .insert(users)
+      .values({
+        username: "scope-org",
+        usernameLower: "scope-org",
+        status: "active",
+        createdAt: new Date("2026-01-01T00:00:00Z"),
+      })
+      .returning({ id: users.id });
+    const ownerSeed = ownerRows[0];
+    if (ownerSeed === undefined) throw new Error("seed failed");
+    const ownerId = ownerSeed.id;
+
+    for (let i = 0; i < 120; i += 1) {
+      const id = `repo-scope-${i}`;
+      await db().insert(repositories).values({
+        id,
+        storageKey: `r_${id}`,
+        ownerNamespace: "scope-org",
+        ownerId,
+        slug: `repo-${i}`,
+        visibility: "public",
+      });
+      await db().insert(repoUnits).values({ repoId: id, type: "actions" });
+    }
+
+    // The only waiting job sits in the LAST repo — the scan must see
+    // through the whole scope set to claim it.
+    await insertActionRun(
+      env.DB,
+      {
+        repoId: "repo-scope-119",
+        ownerId,
+        workflowId: "ci.yml",
+        index: 1,
+        triggerUserId: ownerId,
+        ref: "refs/heads/main",
+        commitSha: "f".repeat(40),
+        event: "push",
+        eventPayload: "{}",
+        triggerEvent: "push",
+      },
+      [{ jobId: "build", runsOn: ["ubuntu-latest"], workflowPayload: PAYLOAD }],
+    );
+
+    const runner = await createRunner(env.DB, {
+      uuid: crypto.randomUUID(),
+      name: "scope-org-runner",
+      version: "v1",
+      ownerId,
+      repoId: "",
+      agentLabels: ["ubuntu-latest"],
+      ephemeral: false,
+      hasCancellingSupport: false,
+    });
+    const response = await fetchTask(env, env.DB, runner, 0, "");
+    expect(response.task).toBeDefined();
+  });
+});
+
 describe("the registration-token mint (the harness's token source)", () => {
   it("mints and consumes through the model seam", async () => {
     const token = await newRunnerTokenWithValue(env.DB, 0, "", "minted");
