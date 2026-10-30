@@ -11,7 +11,7 @@ import type { Env } from "./env";
 import type { Registry, RepoInfo } from "./registry";
 import { esc, repoUrl, age, layout, htmlResponse, errorPage } from "./ui/html";
 import { CSS } from "./ui/style";
-import { parseUploadRequest, parsePushCommands, renderStatus, sidebandFrames, streamingCloneResponse, type CommandResult, type PushCommand } from "./git/protocol";
+import { parseUploadRequest, parsePushCommands, parsePushOptions, renderStatus, sidebandFrames, streamingCloneResponse, ATOMIC_PUSH_FAILED, type CommandResult, type PushCommand } from "./git/protocol";
 import { isOid, concat, te, toHex, ZERO_OID, Sha1 } from "./git/util";
 import { gunzipLimited } from "./git/zlib";
 import { MultipartCapture, beginRawMultipart } from "./git/multipart";
@@ -217,6 +217,16 @@ export interface PushEvent {
    * not an authenticated value.
    */
   origin?: string;
+  /**
+   * The push options the client sent with this push (gitprotocol-pack
+   * `push-options`: pkt-lines between the command list and the packfile,
+   * present when the server advertises `push-options` and the client passed
+   * `--push-option`). Verbatim `key=value`-shaped strings, client-visible
+   * data; the hook layer's equivalent of upstream Gitea's GIT_PUSH_OPTION_*
+   * environment (cmd/hook.go pushOptions()). Absent when the push carried
+   * none, so `=== undefined` is the "no options" test.
+   */
+  pushOptions?: string[];
 }
 
 /**
@@ -246,11 +256,15 @@ export interface PushVerdict {
  * embedding Worker's authenticated identity for this receive — the same
  * in-process channel as `PushEvent.pusherId` (never derivable from client
  * request data); absent when none was resolved, which the hook evaluates
- * as not-whitelisted.
+ * as not-whitelisted. `pushOptions` carries the client's push options
+ * (gitprotocol-pack push-options section) when the push sent any — the
+ * policy hook's view of the same data `PushEvent.pushOptions` surfaces
+ * after apply.
  */
 export interface ValidatePushContext {
   repo: string;
   pusher?: PusherIdentity;
+  pushOptions?: string[];
 }
 
 /**
@@ -542,6 +556,7 @@ async function serveCloneFromR2(
     req.haves.length === 0 &&
     req.done &&
     req.deepen.kind === "none" &&
+    req.filter.kind === "none" && // a filtered clone omits blobs — the cached pack is the FULL object set, never the answer (protocol-v2 fetch=filter)
     req.clientShallows.length === 0 &&
     (req.command === "fetch" || req.caps.has("side-band-64k"));
   if (!fullClone) return null;
@@ -617,6 +632,9 @@ function corsPreflight(origin: string): Response {
 interface ParsedPush {
   commands: PushCommand[];
   caps: string[];
+  /** the client's push options (gitprotocol-pack push-options section); empty
+   * when the client did not request the capability or sent no options */
+  pushOptions: string[];
   /** pack bytes already read off the body (possibly all of it, e.g. gzipped) */
   head: Uint8Array;
   /** live body reader while the pack is still streaming; null when buffered */
@@ -684,6 +702,32 @@ async function parsePushRequest(req: Request, maxBytes: number): Promise<ParsedP
   }
   const { commands, caps } = parsePushCommands(buf.subarray(0, pos));
 
+  // push options (gitprotocol-pack: `push-options = *PKT-LINE(push-option)
+  // flush-pkt`, after the command list's flush-pkt, before the packfile): the
+  // client sends the section EXACTLY when it requested the advertised
+  // `push-options` capability — git's send-pack writes it iff it passed
+  // --push-option, so the capability token is the discriminator (a client
+  // without it goes straight to the pack). git's read_push_options breaks on
+  // the flush OR stream end (readPushOptions, builtin/receive-pack.c), so an
+  // EOF mid-section ends the section here too; a malformed length still
+  // throws like the command loop above.
+  let pushOptions: string[] = [];
+  if (caps.includes("push-options")) {
+    const optionsStart = pos;
+    for (;;) {
+      if (!(await need(4))) break;
+      const len = hex4(buf, pos);
+      if (len === 0) {
+        pos += 4;
+        break;
+      }
+      if (len < 4) throw new Error("bad pkt-line in push request");
+      if (!(await need(len))) break;
+      pos += len;
+    }
+    pushOptions = parsePushOptions(buf.subarray(optionsStart, pos));
+  }
+
   // Peek until at least one pack byte is in hand (or the body ends): a
   // deletes-only push carries no pack at all, and the known-length staging
   // path needs the consumed count to include every byte already read.
@@ -710,7 +754,7 @@ async function parsePushRequest(req: Request, maxBytes: number): Promise<ParsedP
       hint = Math.max(declared - pos, 0);
     }
   }
-  return { commands, caps, head, reader, hint };
+  return { commands, caps, pushOptions, head, reader, hint };
 }
 
 interface StagedPack {
@@ -979,7 +1023,15 @@ async function receivePack<E extends Env>(
     // 1. the command section only — the pack is never parsed here
     const push = await parsePushRequest(req, maxBytes);
     const sideband = push.caps.includes("side-band-64k");
-    const wantStatus = push.caps.includes("report-status");
+    // report-status-v2 (gitprotocol-pack) extends report-status with proc-
+    // receive option lines; a client requesting either capability gets a
+    // status report, and this engine — no proc-receive, exactly like upstream
+    // Gitea — never rewrites refs, so the v2 report carries zero option
+    // lines: the same bytes git 2.43.0 sends for a non-rewritten push.
+    const wantStatus = push.caps.includes("report-status") || push.caps.includes("report-status-v2");
+    // atomic (gitprotocol-pack): any per-ref failure rejects the whole
+    // command section (see the hook merge below and commitPush)
+    const atomic = push.caps.includes("atomic");
 
     // 2. open the lease (refname validation happens before any byte streams).
     // FIRST, bind the cell's name (repo.ts bindRepo): this entry is a direct
@@ -1172,15 +1224,29 @@ async function receivePack<E extends Env>(
       const verdicts = await internal.validatePush(classified, {
         repo,
         ...(pusher !== undefined ? { pusher } : {}),
+        ...(push.pushOptions.length > 0 ? { pushOptions: push.pushOptions } : {}),
       });
       hookRejects = verdictRejects(verdicts, push.commands.length);
+    }
+    // Under `atomic`, any per-ref failure rejects the whole section: the
+    // hook-declined commands keep their own message, the commands that WOULD
+    // have applied report ATOMIC_PUSH_FAILED — git's transaction-abort shape
+    // (execute_commands_atomic). Marking the nulls here funnels the push
+    // through the existing all-rejected path (finalize skipped, lease released
+    // with a sweep, nothing applies), and statusOfCommands renders it as-is.
+    if (atomic && hookRejects !== null && hookRejects.some((r) => r !== null)) {
+      hookRejects = hookRejects.map((r) => (r === null ? ATOMIC_PUSH_FAILED : r));
     }
 
     // 5. finalize: the DO re-checks per-command CAS and commits refs +
     // refs_version in one transaction (the pack is already indexed). The
     // hook-rejected commands are removed first, so a per-ref rejection
     // never blocks its siblings (upstream rejects per-ref inside
-    // pre-receive); finalize's results stay index-aligned with the command
+    // pre-receive) — except under `atomic`, where the merge above turned any
+    // hook rejection into an all-reject section; finalize's `atomic` flag
+    // gives the DO-side verdicts (validation rejects, CAS mismatches) the
+    // same all-or-nothing shape inside the one commit transaction.
+    // finalize's results stay index-aligned with the command
     // list it receives, and the merge below re-aligns them to the section.
     const finalizeCommands =
       hookRejects === null ? push.commands : push.commands.filter((_, i) => hookRejects![i] === null);
@@ -1205,6 +1271,7 @@ async function receivePack<E extends Env>(
       pack,
       unpackError,
       packIncomplete,
+      atomic,
     });
     leaseToken = null; // finalize decided the lease; the release below is a no-op sweep
     if (fin.tag === "lease_mismatch") {
@@ -1254,6 +1321,7 @@ async function receivePack<E extends Env>(
           commitTime: idle,
           ...(pusher !== undefined ? { pusherId: pusher.id, pusherLogin: pusher.login } : {}),
           ...(origin !== undefined ? { origin } : {}),
+          ...(push.pushOptions.length > 0 ? { pushOptions: push.pushOptions } : {}),
         };
         // The hook call runs INSIDE the promise chain: `Promise.resolve(
         // options.onPush(...))` evaluates the hook BEFORE wrapping it, so a

@@ -41,7 +41,11 @@ check("G1 deepen-not rejected (v0)", not.badArgument === "deepen-not" && not.dee
 const rel = parseUploadRequest(v2([], ["deepen-relative", `want ${OID}`, "done"]));
 check("G1 deepen-relative rejected (v2 args phase)", rel.badArgument === "deepen-relative" && rel.deepen.kind === "unsupported");
 const filt = parseUploadRequest(v2([], [`want ${OID}`, "filter blob:none", "done"]));
-check("G1 filter rejected (partial clone unimplemented)", filt.badArgument === "filter");
+// P2-8 (v1.3.2): fetch=filter is now implemented for the blob family —
+// blob:none parses into req.filter instead of failing closed; specs outside
+// the family (sparse:oid=, tree:<n>, combine:) still reject (their dedicated
+// cases live in check-protocol-v2-partial.mjs)
+check("G1 filter blob:none parsed (partial clone implemented)", filt.badArgument === null && filt.filter.kind === "blob-none");
 const unknown = parseUploadRequest(v0([`want ${OID}`, "deepen-mystery 3", "done"]));
 check("G1 unknown fetch argument fails closed", unknown.badArgument === "deepen-mystery");
 

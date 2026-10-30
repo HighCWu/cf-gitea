@@ -157,7 +157,12 @@ export function engineJsonRepoNotFound(engineName: string): Response {
 export function dummyAdvertisement(): Response {
   const zeroOid = "0".repeat(40);
   // pkt-line payload: 40 oid + space + 15 "capabilities^{}" + NUL + caps + LF
-  const capabilities = "report-status delete-refs ofs-delta side-band-64k agent=dgit/0.3";
+  // MIRRORS the engine's receive capability list (src/git/protocol.ts
+  // advertisement(), git-receive-pack branch) — this probe path stands in for
+  // a fresh empty repo's advertisement, so the client's capability-dependent
+  // decisions (--atomic, --push-option) must see the same support the real
+  // advertisement carries. Update both together.
+  const capabilities = "report-status report-status-v2 delete-refs side-band-64k atomic ofs-delta push-options object-format=sha1 agent=dgit/0.3";
   const payload = `${zeroOid} capabilities^{}\0${capabilities}\n`;
   const pkt = (s: string): string => `${(s.length + 4).toString(16).padStart(4, "0")}${s}`;
   const body = `${pkt("# service=git-receive-pack\n")}0000${pkt(payload)}0000`;

@@ -13,18 +13,24 @@
 // The matrix the runs generate (asserted, not asserted-by-hand):
 //   v0 fetch : multi_ack_detailed no-done shallow side-band-64k
 //              symref=HEAD:<head> agent=<name>/<version>
-//   v0 push  : report-status delete-refs ofs-delta side-band-64k
-//              agent=<name>/<version>
-//   v2 fetch : version 2, agent, ls-refs, fetch=shallow
-// Contrapositive pins: `filter` is NOT advertised anywhere and a filter
-// request is rejected (never silently ignored); within the advertised
-// `shallow` feature the deepen family is handled-or-rejected per member
-// (`deepen <n>` handled; deepen-since/deepen-not/deepen-relative rejected).
+//   v0 push  : report-status report-status-v2 delete-refs side-band-64k
+//              atomic ofs-delta push-options object-format=sha1
+//              agent=<name>/<version>   (P2-8: the receive caps git 2.43.0
+//              advertises, byte-observed; push-options per upstream Gitea's
+//              unconditional receive.advertisePushOptions=true)
+//   v2 fetch : version 2, agent, ls-refs=unborn, fetch=shallow filter
+// Contrapositive pins: the ADVERTISED filter family (blob:none / blob:limit)
+// is handled on the real serve path (tree-walked blobs omitted from the pack;
+// a directly-wanted blob — the promisor lazy fetch — still ships), while
+// filter specs outside the family (sparse:oid=, tree:<n>, combine:) and every
+// v0 filter line are rejected fail-closed; within the advertised `shallow`
+// feature the deepen family is handled-or-rejected per member (`deepen <n>`
+// handled; deepen-since/deepen-not/deepen-relative rejected).
 import { DatabaseSync } from "node:sqlite";
 
 const { GitStore } = await import("../src/git/store.ts");
 const { NodeSql, assert, assertEq } = await import("./helpers/lib.mjs");
-const { advertisement, uploadPack, parseUploadRequest, renderStatus } = await import("../src/git/protocol.ts");
+const { advertisement, uploadPack, parseUploadRequest, parsePushCommands, parsePushOptions, renderStatus, ATOMIC_PUSH_FAILED } = await import("../src/git/protocol.ts");
 const { beginReceive, finalizeReceive } = await import("../src/control-plane.ts");
 const { serializeTree, serializeCommit } = await import("../src/commit/serialize.ts");
 const { hashObject, TYPE_NUM } = await import("../src/git/objects.ts");
@@ -92,7 +98,11 @@ function seedHistory(store) {
   store.setRef("refs/heads/main", commit2.oid);
   store.setRef("refs/heads/feature", commit1.oid);
   store.setHead("refs/heads/main");
-  return { commit1: commit1.oid, commit2: commit2.oid };
+  return {
+    commit1: commit1.oid,
+    commit2: commit2.oid,
+    blobs: [hashObject("blob", b1), hashObject("blob", b2)],
+  };
 }
 
 const { store, sql } = makeStore();
@@ -277,6 +287,18 @@ proof("ls-refs", async () => {
   assert(text.includes("refs/heads/main"), `ls-refs lists refs: ${JSON.stringify(text.slice(0, 200))}`);
   assert(text.includes("refs/heads/feature"), "all refs listed");
   assert(text.includes(`symref-target:${store.head()}`), "symrefs honored");
+  // the unborn arm (ls-refs=unborn): on an empty repo — HEAD's symref target
+  // has no ref row — the `unborn`+`symrefs` arguments answer the literal
+  // `unborn HEAD symref-target:<head>` line (git 2.43.0 byte shape); without
+  // both arguments the empty repo answers flush-only
+  const { store: empty } = makeStore();
+  const born = await uploadPack(empty, v2ls(["symrefs", "unborn"]));
+  assert(
+    (await responseText(born)).includes(`unborn HEAD symref-target:${empty.head()}`),
+    "the unborn HEAD advertisement names the symref target"
+  );
+  const noUnborn = await uploadPack(empty, v2ls(["symrefs"]));
+  assertEq(parsePktLines(Buffer.from(await noUnborn.arrayBuffer())), [null], "symrefs without unborn on an empty repo answers flush-only");
 });
 
 proof("fetch", async () => {
@@ -287,6 +309,50 @@ proof("fetch", async () => {
   assert(text.includes("shallow-info\n"), `v2 deepen answers shallow-info: ${JSON.stringify(text.slice(0, 160))}`);
   assert(/shallow [0-9a-f]{40}/.test(text), "the shallow boundary is named");
   assert(text.includes("packfile\n"), "and the packfile follows");
+
+  // ... and the filter feature of the SAME fetch family (the advertisement's
+  // `fetch=shallow filter` value), on the real serve path: a blob:none fetch
+  // of the history serves the commit/tree closure and OMITS every
+  // tree-walked blob — the client learns those oids from the tree entries and
+  // records them as promised (partial clone). The pack's object set is
+  // resolved with the receive-side walker (the same machinery the OFS-delta
+  // proof above uses).
+  async function packOids(body) {
+    const raw = Buffer.from(await (await uploadPack(store, body)).arrayBuffer());
+    assert(Buffer.from(raw.subarray(0, 14)).toString("latin1").includes("packfile"), `a packfile section follows, not an ERR: ${JSON.stringify(raw.subarray(0, 24).toString("latin1"))}`);
+    const band1 = extractBand1(raw);
+    const host = {
+      selfPackKey: "filtered",
+      lookupObjects: async (oids) => oids.map(() => ({ found: false })),
+      readEntryBytes: async (_key, off, len) => new Uint8Array(band1.subarray(off, off + len)),
+      putRows: async () => ({ tag: "ok" }),
+    };
+    const resolver = new DeltaResolver(host, { cacheBytes: 16 * 1024 * 1024 });
+    await walkPack({ body: new Response(band1).body, size: band1.length }, (entry) => resolver.onEntry(entry), {
+      onHeader: (count) => resolver.init(count),
+    });
+    const out = await resolver.finish();
+    // NOTE: not `incomplete` — that flag is the receive-path connectivity
+    // anti-check (every non-blob's children must exist in-pack or in the
+    // object database), and a filtered pack deliberately references the
+    // omitted blobs from its trees. The declared count + the sent set below
+    // are the proof.
+    assertEq(out.objects, out.oids.size, "every declared entry resolved to an oid");
+    const sent = new Set();
+    for (let i = 0; i < out.oids.size; i++) sent.add(out.oids.atHex(i));
+    return { declared: out.objects, sent };
+  }
+  const none = await packOids(v2(["agent=git/2.43.0"], ["no-progress", "filter blob:none", `want ${h.commit2}`, "done"]));
+  assertEq(none.declared, 4, "blob:none declares only commits+trees (2 commits, 2 trees)");
+  assert(!none.sent.has(h.blobs[0]) && !none.sent.has(h.blobs[1]), "blob:none omits every tree-walked blob");
+  assert(none.sent.has(h.commit2) && none.sent.has(h.commit1), "commits still ship under the filter");
+  // the promisor lazy-fetch arm: a want that IS a blob (the raw-oid round a
+  // partial clone's checkout sends) bypasses the filter — the wanted blob
+  // ships even under blob:none, and the relaxed want gate accepts a
+  // non-tip want under a filter (upstream's has-object gate)
+  const lazy = await packOids(v2(["agent=git/2.43.0"], ["no-progress", "filter blob:none", `want ${h.blobs[1]}`, "done"]));
+  assertEq(lazy.declared, 1, "the directly-wanted blob ships (git's USER_REQUESTED carve-out)");
+  assert(lazy.sent.has(h.blobs[1]), "the lazy fetch's blob is in the pack");
 });
 
 // --- receive proofs (control plane, real host) ------------------------------
@@ -451,6 +517,126 @@ proof("ofs-delta", async () => {
   assertEq(rows.length, 2, "index rows landed for both entries");
 });
 
+proof("report-status-v2", async () => {
+  // the ADVERTISED v2 report: a client requesting ONLY report-status-v2 still
+  // gets a status report, and — this engine runs no proc-receive, exactly
+  // like upstream Gitea — the report carries ZERO option lines: the same
+  // bytes git 2.43.0 sends for a non-rewritten push (byte-observed: a stock
+  // 2.43.0 receive-pack answers `unpack ok` + `ok <ref>` with no `option`
+  // lines; the v2 grammar's option lines exist to report proc-receive
+  // rewrites). The full end-to-end flow (real Worker receive, sideband and
+  // plain) is check-receive-caps.mjs checks 10-12.
+  const { host, rstore } = receiveHost();
+  seedHistory(rstore);
+  const begin = await beginReceive(host, {
+    commands: [{ old: ZERO, next: h.commit2, ref: "refs/heads/v2br" }],
+    capabilities: ["report-status-v2", "side-band-64k"],
+  });
+  assertEq(begin.tag, "ok", "lease opened");
+  const fin = await finalizeReceive(host, {
+    leaseToken: begin.leaseToken,
+    expectedRefsVersion: begin.refsVersion,
+    commands: [{ old: ZERO, next: h.commit2, ref: "refs/heads/v2br" }],
+    newTips: [h.commit2],
+    pack: NO_PACK,
+    unpackError: null,
+  });
+  assertEq(fin.tag, "committed", "finalized");
+  // the report is band-1 framed and parses as report-status-v2 with zero
+  // option lines (the grammar's base: `report-status *option-line`)
+  const band1 = extractBand1(renderStatus(fin.results, null, true));
+  const lines = parsePktLines(band1);
+  assertEq(lines[0], "unpack ok", "the v2 report opens with the unpack line");
+  assert(lines.some((l) => l === "ok refs/heads/v2br"), `the per-command ok follows: ${JSON.stringify(lines)}`);
+  assert(lines.every((l) => l === null || !l.startsWith("option ")), "zero option lines (no proc-receive)");
+  void rstore;
+});
+
+proof("atomic", async () => {
+  // the ADVERTISED atomic: one failing command rejects the WHOLE section —
+  // the failing command keeps its own message, the would-apply sibling gets
+  // ATOMIC_PUSH_FAILED, and NO ref moves (git's ref-transaction abort,
+  // execute_commands_atomic; byte-observed on git 2.43.0: `! [rejected] main
+  // -> main (fetch first)` + `! [rejected] atom3 -> atom3 (atomic push
+  // failed)`). Drives the REAL control plane finalize.
+  const { host, rstore } = receiveHost();
+  seedHistory(rstore);
+  rstore.setRef("refs/heads/doomed", h.commit1); // the stale create: old=ZERO lies
+  const commands = [
+    { old: ZERO, next: h.commit2, ref: "refs/heads/fresh" },
+    { old: ZERO, next: h.commit2, ref: "refs/heads/doomed" },
+  ];
+  const begin = await beginReceive(host, { commands, capabilities: ["atomic", "report-status"] });
+  assertEq(begin.tag, "ok", "lease opened");
+  const fin = await finalizeReceive(host, {
+    leaseToken: begin.leaseToken,
+    expectedRefsVersion: begin.refsVersion,
+    commands,
+    newTips: [h.commit2, h.commit2],
+    pack: NO_PACK,
+    unpackError: null,
+    atomic: true,
+  });
+  // nothing applied + a "fetch first" present = the ref_conflict report
+  assertEq(fin.tag, "ref_conflict", "an atomic all-fail section is the ref_conflict shape");
+  const msgs = Object.fromEntries(fin.results.map((r) => [r.ref, { ok: r.ok, msg: r.message }]));
+  assertEq(msgs["refs/heads/doomed"], { ok: false, msg: "fetch first" }, "the failing command keeps its own message");
+  assertEq(msgs["refs/heads/fresh"], { ok: false, msg: ATOMIC_PUSH_FAILED }, "the would-apply sibling reports the atomic failure");
+  assertEq(rstore.getRef("refs/heads/fresh"), null, "NOTHING applied: the sibling ref does not exist");
+  assertEq(rstore.getRef("refs/heads/doomed"), h.commit1, "the doomed ref is untouched");
+  // control: the SAME section without atomic applies the sibling per-ref
+  const { host: host2, rstore: rstore2 } = receiveHost();
+  seedHistory(rstore2);
+  rstore2.setRef("refs/heads/doomed", h.commit1);
+  const begin2 = await beginReceive(host2, { commands, capabilities: ["report-status"] });
+  assertEq(begin2.tag, "ok", "control lease opened");
+  const fin2 = await finalizeReceive(host2, {
+    leaseToken: begin2.leaseToken,
+    expectedRefsVersion: begin2.refsVersion,
+    commands,
+    newTips: [h.commit2, h.commit2],
+    pack: NO_PACK,
+    unpackError: null,
+  });
+  assertEq(fin2.tag, "committed", "non-atomic control commits");
+  assertEq(rstore2.getRef("refs/heads/fresh"), h.commit2, "non-atomic: the sibling lands (per-ref default)");
+  assertEq(rstore2.getRef("refs/heads/doomed"), h.commit1, "non-atomic: only the stale command rejects");
+});
+
+proof("push-options", async () => {
+  // the ADVERTISED push-options: the section parser handles the documented
+  // grammar (gitprotocol-pack: push-options = *PKT-LINE(push-option)
+  // flush-pkt; each option is the pkt-line's raw bytes, NO count pkt-line —
+  // byte-observed on git 2.43.0: `packet: push> key=value` / `push> 0000`).
+  // The real Worker-side flow (options past the command flush reaching the
+  // validatePush context and the onPush event) is check-receive-caps.mjs
+  // checks 6-9.
+  const section = Buffer.concat([pkt("key=value"), pkt("run=ci"), pkt("plain"), FLUSH_PKT]);
+  assertEq(parsePushOptions(new Uint8Array(section)), ["key=value", "run=ci", "plain"], "each pkt-line is one option, in order");
+  assertEq(parsePushOptions(new Uint8Array(FLUSH_PKT)), [], "an empty section (capability requested, no options) parses to []");
+  // a trailing LF is chomped per line, the same chomp git's packet reader applies
+  const sectionLf = Buffer.concat([pkt("key=value\n"), FLUSH_PKT]);
+  assertEq(parsePushOptions(new Uint8Array(sectionLf)), ["key=value"], "a trailing LF per line is chomped (git packet-reader bug-compat)");
+});
+
+proof("object-format", async (token) => {
+  // the ADVERTISED object-format=sha1 IS this store's format: every oid is
+  // 40 hex (sha1), and a client command section carrying the capability
+  // parses clean (real git 2.43 sends it on every push)
+  assertEq(token, "object-format=sha1", "the advertised format is sha1");
+  for (const r of store.refs()) assert(/^[0-9a-f]{40}$/.test(r.oid), `ref oids are sha1: ${r.oid}`);
+  const { commands, caps } = parsePushCommands(
+    new Uint8Array(
+      Buffer.concat([
+        pkt(`${ZERO} ${h.commit2} refs/heads/of-br\0report-status atomic object-format=sha1 agent=git/2.43.0\n`),
+        FLUSH_PKT,
+      ])
+    )
+  );
+  assertEq(commands, [{ old: ZERO, next: h.commit2, ref: "refs/heads/of-br" }], "the command parses");
+  assert(caps.includes("object-format=sha1"), "the client's object-format capability is recognized");
+});
+
 // ---------------------------------------------------------------------------
 // 1. the generated table itself
 // ---------------------------------------------------------------------------
@@ -462,25 +648,25 @@ await check("matrix: the v0 fetch advertisement parses into the advertised table
   }
   assert(caps.some((t) => t.startsWith("symref=HEAD:")), "advertised: symref=HEAD:<target>");
   assert(caps.some((t) => t.startsWith("agent=")), "advertised: agent=<name>/<version>");
-  assert(!caps.includes("filter"), "filter is NOT advertised (partial clone out of scope)");
+  assert(!caps.includes("filter"), "filter is a protocol-v2 capability, not a v0 one");
   assert(!caps.includes("ofs-delta"), "ofs-delta is a push capability, not a fetch one");
 });
 
 await check("matrix: the v0 push advertisement parses into the advertised table", async () => {
   const caps = table["v0 push (git-receive-pack)"];
-  for (const token of ["report-status", "delete-refs", "ofs-delta", "side-band-64k"]) {
+  for (const token of ["report-status", "report-status-v2", "delete-refs", "ofs-delta", "side-band-64k", "atomic", "push-options", "object-format=sha1"]) {
     assert(caps.includes(token), `advertised: ${token} (in ${JSON.stringify(caps)})`);
   }
   assert(caps.some((t) => t.startsWith("agent=")), "advertised: agent=<name>/<version>");
   assert(!caps.includes("shallow"), "shallow is a fetch capability, not a push one");
+  assert(!caps.includes("quiet"), "quiet stays unadvertised (no honest live proof of progress suppression — NOTICE.md)");
 });
 
 await check("matrix: the v2 advertisement parses into the advertised table", async () => {
   const caps = table["v2 fetch (protocol v2)"];
-  assert(caps.includes("ls-refs"), "advertised: ls-refs");
-  assert(caps.includes("fetch=shallow"), "advertised: fetch=shallow");
+  assert(caps.includes("ls-refs=unborn"), `advertised: ls-refs=unborn (in ${JSON.stringify(caps)})`);
+  assert(caps.includes("fetch=shallow filter"), `advertised: fetch=shallow filter (in ${JSON.stringify(caps)})`);
   assert(caps.some((t) => t.startsWith("agent=")), "advertised: agent");
-  assert(!caps.includes("filter"), "filter is NOT advertised in v2 either");
 });
 
 await check("matrix: the empty-repo advertisement is well-formed (capabilities^{} carries the full list)", async () => {
@@ -515,7 +701,7 @@ for (const [handshake, tokens] of Object.entries(table)) {
 
 await check("gate: every advertised capability maps onto a handler proof (AdvertisedFeature ⇒ ParsedAndHandled) — no hand-maintained claims", async () => {
   assertEq(unresolved, [], `every advertised feature must have a proof; missing: ${unresolved.join("; ")}`);
-  assert(resolvedProofs.size >= 9, `the generated matrix exercised ${resolvedProofs.size} proofs`);
+  assert(resolvedProofs.size >= 13, `the generated matrix exercised ${resolvedProofs.size} proofs`);
 });
 
 // 3. run every proof
@@ -529,9 +715,16 @@ for (const [fn, { key, token, handshake }] of resolvedProofs) {
 // 4. contrapositive pins
 // ---------------------------------------------------------------------------
 
-await check("contrapositive: an UNADVERTISED filter request is rejected fail-closed, never silently ignored", async () => {
-  const v2res = await uploadPack(store, v2(["agent=git/2.43.0"], [`want ${h.commit2}`, "filter blob:none", "done"]));
-  assert((await responseText(v2res)).includes("ERR upload-pack: unsupported fetch argument 'filter'"), "filter rejected in v2");
+await check("contrapositive: filter specs OUTSIDE the advertised blob family are rejected fail-closed, never silently ignored", async () => {
+  for (const spec of ["sparse:oid=HEAD", "tree:0", "combine:blob:none+blob:limit=1"]) {
+    const v2res = await uploadPack(store, v2(["agent=git/2.43.0"], [`want ${h.commit2}`, `filter ${spec}`, "done"]));
+    assert(
+      (await responseText(v2res)).includes("ERR upload-pack: unsupported fetch argument 'filter'"),
+      `an unimplemented filter spec (${spec}) is rejected in v2`
+    );
+  }
+  // a filter line is a fetch-only argument: on a v0 request (no command=)
+  // it is not recognized and fails closed too
   const v0res = await uploadPack(store, v0([`want ${h.commit2}`, "filter blob:none", "done"]));
   assert((await responseText(v0res)).includes("ERR upload-pack: unsupported fetch argument 'filter'"), "filter rejected in v0 too");
 });

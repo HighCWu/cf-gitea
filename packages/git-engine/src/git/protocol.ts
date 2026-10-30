@@ -58,7 +58,14 @@ export interface PackCache {
 /** GET /info/refs?service=... — smart ref advertisement. */
 export function advertisement(store: GitStore, service: Service, v2 = false): Uint8Array {
   if (v2 && service === "git-upload-pack") {
-    return concat([pkt("version 2\n"), pkt(`${AGENT}\n`), pkt("ls-refs\n"), pkt("fetch=shallow\n"), FLUSH]);
+    // feature values on the capability lines, byte-shaped as stock git's
+    // client parses them (observed on git 2.43.0 upload-pack: `ls-refs=unborn`,
+    // `fetch=shallow wait-for-done filter` — wait-for-done is not advertised
+    // here, it is an optional feature). `ls-refs=unborn` is what makes the
+    // client send the `unborn` argument for an empty repo's HEAD; `filter`
+    // advertises the object filters (blob:none / blob:limit) the fetch
+    // command implements below.
+    return concat([pkt("version 2\n"), pkt(`${AGENT}\n`), pkt("ls-refs=unborn\n"), pkt("fetch=shallow filter\n"), FLUSH]);
   }
   const caps =
     service === "git-upload-pack"
@@ -70,7 +77,29 @@ export function advertisement(store: GitStore, service: Service, v2 = false): Ui
           `symref=HEAD:${store.head()}`,
           AGENT,
         ].join(" ")
-      : ["report-status", "delete-refs", "ofs-delta", "side-band-64k", AGENT].join(" ");
+      // The receive capability list, upstream-shaped: git 2.43.0 receive-pack
+      // observed byte-for-byte over a local handshake advertises `report-status
+      // report-status-v2 delete-refs side-band-64k quiet atomic ofs-delta
+      // push-options object-format=sha1 agent=git/<v>` (gitprotocol-pack(5)
+      // lists the same value set). `push-options` is advertised UNCONDITIONALLY
+      // — upstream Gitea sets receive.advertisePushOptions=true for every repo
+      // (modules/git/config.go:40-42). Two deliberate residuals, recorded in
+      // NOTICE.md: `quiet` stays unadvertised (honoring it means suppressing
+      // the receive progress feed, whose only emissions sit at 100k-object
+      // boundaries — no honest live proof), and `agent=` keeps the vendored
+      // dgit identity. Every advertised token maps onto a handler proof in
+      // e2e/check-capability-matrix.mjs.
+      : [
+          "report-status",
+          "report-status-v2",
+          "delete-refs",
+          "side-band-64k",
+          "atomic",
+          "ofs-delta",
+          "push-options",
+          "object-format=sha1",
+          AGENT,
+        ].join(" ");
 
   const lines: Uint8Array[] = [pkt(`# service=${service}\n`), FLUSH];
   const refs: { name: string; oid: string }[] = [];
@@ -278,6 +307,37 @@ export type DeepenRequest =
   | { kind: "depth"; depth: number }
   | { kind: "unsupported"; argument: string };
 
+/**
+ * The `filter <spec>` fetch argument (protocol-v2 object filtering), parsed
+ * into exactly the arms this engine implements: the blob-family filters a
+ * partial clone uses. `blob:none` omits every tree-walked blob; `blob:limit=n`
+ * omits blobs whose (uncompressed) size is strictly greater than n — git's
+ * list-objects-filter boundary, byte-verified: a blob of exactly n ships.
+ * Anything else (sparse:oid=, tree:<depth>, combine:) is
+ * `{ kind: "unsupported" }` — the request is rejected at the parse boundary
+ * like the deepen family, never silently served unfiltered (a filtered client
+ * that receives the omitted objects would defeat the partial clone).
+ */
+export type BlobFilter =
+  | { kind: "none" }
+  | { kind: "blob-none" }
+  | { kind: "blob-limit"; limit: number }
+  | { kind: "unsupported"; argument: string };
+
+/** Parse the spec text of a `filter` fetch argument. */
+function parseBlobFilter(spec: string): BlobFilter {
+  if (spec === "blob:none") return { kind: "blob-none" };
+  if (spec.startsWith("blob:limit=")) {
+    const raw = spec.slice("blob:limit=".length);
+    // git's parse: a non-numeric or negative limit dies server-side; a limit
+    // of 0 omits every blob (size > 0), matching the strict-> rule. Reject the
+    // request rather than guess at a malformed number.
+    if (!/^\d+$/.test(raw)) return { kind: "unsupported", argument: spec };
+    return { kind: "blob-limit", limit: parseInt(raw, 10) };
+  }
+  return { kind: "unsupported", argument: spec };
+}
+
 interface UploadRequest {
   command: "fetch" | "ls-refs" | null;
   wants: string[];
@@ -286,14 +346,16 @@ interface UploadRequest {
   /** the client's existing shallow boundaries (`shallow <oid>` lines) */
   clientShallows: string[];
   deepen: DeepenRequest;
+  /** the `filter <spec>` fetch argument, none when absent (see BlobFilter) */
+  filter: BlobFilter;
   caps: Set<string>;
   /**
    * First unsupported-but-semantics-changing fetch argument, or null — set
    * together with `deepen.kind = "unsupported"` for the deepen family, and
-   * for `filter` (partial clone; MUST be honored, not implemented). Parsed
-   * requests are rejected at THIS boundary, before any cache predicate or
-   * pack generation: the silent-drop used to turn `git fetch
-   * --shallow-since` into a full clone.
+   * for filter specs outside the implemented blob family (the filter token
+   * itself is the argument named in the ERR). Parsed requests are rejected at
+   * THIS boundary, before any cache predicate or pack generation: the
+   * silent-drop used to turn `git fetch --shallow-since` into a full clone.
    */
   badArgument: string | null;
 }
@@ -307,6 +369,7 @@ export function parseUploadRequest(body: Uint8Array): UploadRequest {
     done: false,
     clientShallows: [],
     deepen: { kind: "none" },
+    filter: { kind: "none" },
     caps: new Set(),
     badArgument: null,
   };
@@ -352,12 +415,22 @@ export function parseUploadRequest(body: Uint8Array): UploadRequest {
       if (req.deepen.kind !== "unsupported") req.deepen = { kind: "depth", depth };
     } else if (line === "done") {
       req.done = true;
+    } else if (line.startsWith("filter ") && req.command === "fetch") {
+      // object filtering (protocol-v2, fetch only): the implemented blob
+      // family parses into req.filter; any other spec fails closed via
+      // reject — combination safety as in the deepen family, a later valid
+      // filter never overwrites an earlier unsupported one's verdict. The
+      // same line on a v0 or ls-refs request is not a fetch argument and
+      // still fails closed below.
+      const parsed = parseBlobFilter(line.slice(7).trim());
+      if (parsed.kind === "unsupported") reject("filter");
+      else if (req.filter.kind === "none") req.filter = parsed;
     } else if (knownIgnorable(req.command, line)) {
-      if (line === "no-progress" || line === "symrefs" || line === "peel") req.caps.add(line);
+      if (line === "no-progress" || line === "symrefs" || line === "peel" || line === "unborn") req.caps.add(line);
       continue;
     } else {
-      // deepen-relative / deepen-since / deepen-not / filter, and anything
-      // else unclassified: semantics-changing and unimplemented -> fail closed
+      // deepen-relative / deepen-since / deepen-not, and anything else
+      // unclassified: semantics-changing and unimplemented -> fail closed
       reject(line.split(" ")[0]);
     }
   }
@@ -402,7 +475,19 @@ function knownIgnorable(command: "fetch" | "ls-refs" | null, line: string): bool
 async function lsRefs(store: GitStore, req: UploadRequest, gate?: ReadGate): Promise<Uint8Array> {
   const lines: Uint8Array[] = [];
   const head = store.resolveHead();
-  if (head) lines.push(pkt(`${head} HEAD${req.caps.has("symrefs") ? ` symref-target:${store.head()}` : ""}\n`));
+  if (head) {
+    lines.push(pkt(`${head} HEAD${req.caps.has("symrefs") ? ` symref-target:${store.head()}` : ""}\n`));
+  } else if (req.caps.has("unborn") && req.caps.has("symrefs")) {
+    // ls-refs=unborn (protocol-v2): an unborn HEAD — the symref target has no
+    // ref row yet — is advertised with the literal token `unborn` in the oid
+    // slot. Byte shape observed on stock git 2.43.0 (empty bare repo, args
+    // peel+symrefs+unborn): `unborn HEAD symref-target:refs/heads/main\n` —
+    // git sends the line ONLY when both `unborn` and `symrefs` were
+    // requested (unborn without symrefs answers flush-only, symrefs without
+    // unborn on an empty repo too); this matches that exactly, so a clone of
+    // an empty repo learns HEAD's default branch instead of dying.
+    lines.push(pkt(`unborn HEAD symref-target:${store.head()}\n`));
+  }
   for (const ref of store.refs()) {
     let peeled = "";
     // the peel resolves through the refs row's peeled column (cached at first
@@ -651,6 +736,20 @@ async function excludedObjects(
 }
 
 /**
+ * Does the object filter omit a tree-walked blob of `size` bytes? blob:none
+ * omits every blob; blob:limit is a STRICT > (git's list-objects-filter
+ * boundary, byte-verified on git 2.43.0: a blob of exactly <limit> ships,
+ * limit+1 is promised). Only ever consulted for blobs discovered beneath the
+ * wants — a blob that IS the want (the promisor lazy fetch's raw-oid
+ * request) bypasses the filter, git's USER_REQUESTED carve-out.
+ */
+function blobOmitted(filter: BlobFilter, size: number): boolean {
+  if (filter.kind === "blob-none") return true;
+  if (filter.kind === "blob-limit") return size > filter.limit;
+  return false;
+}
+
+/**
  * Objects to pack: closure of wants, minus excluded, cut at commitLimit.
  * Returned as one OidSet whose tagged sub-set is the pack contents — the
  * untagged remainder is the walk's visited bookkeeping, which is a strict
@@ -663,6 +762,14 @@ async function excludedObjects(
  * excluded commit — descending anyway re-sends the history the client
  * deliberately does not have, and strands it below its own shallow graft.
  * Blobs are added by type lookup alone — never inflated during the walk.
+ *
+ * `filter` (protocol-v2 object filtering) hooks the walk at exactly one
+ * point: the blob leaf's mark. An omitted blob stays in the walk as unmarked
+ * visited bookkeeping — the pack (whose header count is markedSize) carries
+ * every commit/tree/tag but not it, so the client learns the oid from the
+ * tree entry and records it as promised. A delta whose base is omitted is
+ * re-emitted whole by the serve path (ref-deltas ship only when the base
+ * ships too), so omission never breaks the pack.
  */
 async function collectPackOids(
   store: GitStore,
@@ -670,7 +777,8 @@ async function collectPackOids(
   excluded: OidSet,
   commitLimit: Set<string> | null,
   descendThroughExcluded: boolean,
-  expected: number
+  expected: number,
+  filter: BlobFilter = { kind: "none" }
 ): Promise<OidSet> {
   // The frontier is the visited set itself, walked in insertion order by a
   // cursor: a child is appended with addHex (deduped in place) and reached
@@ -679,6 +787,12 @@ async function collectPackOids(
   // this BFS and the old DFS produce the identical walk and marked sub-set.
   const walk = new OidSet(expected);
   for (const w of wants) walk.addHex(w);
+  // the wants that are themselves blobs always ship (see blobOmitted)
+  const directBlobWants = new Set<string>();
+  for (const w of wants) {
+    const meta = store.typeAndSize(w);
+    if (meta?.type === "blob") directBlobWants.add(w);
+  }
   let ops = 0;
   for (let i = 0; i < walk.size; i++) {
     const oid = walk.atHex(i);
@@ -693,8 +807,14 @@ async function collectPackOids(
       }
       continue;
     }
+    if (meta.type === "blob") {
+      // leaf: membership only — and the filter's only hook point (an omitted
+      // blob is left unmarked: visited, not packed)
+      if (!directBlobWants.has(oid) && blobOmitted(filter, meta.size)) continue;
+      walk.markHex(oid);
+      continue;
+    }
     walk.markHex(oid);
-    if (meta.type === "blob") continue; // leaf: membership only
     for (const child of childOids((await store.get(oid))!)) walk.addHex(child);
   }
   return walk;
@@ -810,12 +930,30 @@ export async function uploadPack(
     release();
     return new Response(pkt("ERR no valid wants\n") as unknown as BodyInit, { headers });
   }
-  // a want must be an object we currently advertise, not merely one we store
-  const allowed = await advertisedOids(store);
-  for (const w of req.wants) {
-    if (!allowed.has(w) || !store.has(w)) {
-      release();
-      return new Response(pkt(`ERR upload-pack: not our ref ${w}\n`) as unknown as BodyInit, { headers });
+  if (req.filter.kind !== "none") {
+    // Promisor fetch (partial clone's lazy round): the client wants raw blob
+    // oids — no ref tips — that its clone promised. Upstream's own v2 want
+    // gate is has-object, observed byte-for-byte on stock git 2.43.0
+    // stateless-rpc: a want of ANY object the server stores is served
+    // (unreachable-after-force-push blobs included), and `not our ref` fires
+    // only when the object is absent. A filtered request relaxes to exactly
+    // that has-object gate; unfiltered fetches keep the advertised-tips gate
+    // below — stricter than upstream, the standing unreachable-object-leak
+    // posture this engine documents on advertisedOids.
+    for (const w of req.wants) {
+      if (!store.has(w)) {
+        release();
+        return new Response(pkt(`ERR upload-pack: not our ref ${w}\n`) as unknown as BodyInit, { headers });
+      }
+    }
+  } else {
+    // a want must be an object we currently advertise, not merely one we store
+    const allowed = await advertisedOids(store);
+    for (const w of req.wants) {
+      if (!allowed.has(w) || !store.has(w)) {
+        release();
+        return new Response(pkt(`ERR upload-pack: not our ref ${w}\n`) as unknown as BodyInit, { headers });
+      }
     }
   }
 
@@ -905,7 +1043,10 @@ export async function uploadPack(
   // through to the walk, which then repopulates it — so a wrong pack is never
   // served, and existing repos become fast on their next full clone.
   const fullClone =
-    !req.haves.length && req.deepen.kind === "none" && wantsAreAllTips(store, req.wants);
+    !req.haves.length &&
+    req.deepen.kind === "none" &&
+    req.filter.kind === "none" && // a filtered clone omits blobs: the persisted reachable set (and the R2 cache) is the FULL object set, never the answer
+    wantsAreAllTips(store, req.wants);
 
   // R2 full-clone offload (write side). Only a standard side-band-64k full clone
   // is eligible, and it is reached only after the advertised-oids gate above — so
@@ -952,7 +1093,8 @@ export async function uploadPack(
       excluded,
       commitLimit,
       req.deepen.kind === "depth", // descendThroughExcluded: only while deepening/unshallowing
-      expected
+      expected,
+      req.filter
     );
     if (fullClone) {
       try {
@@ -1428,6 +1570,38 @@ export function parsePushCommands(section: Uint8Array): { commands: PushCommand[
   return { commands, caps };
 }
 
+/**
+ * The client's `atomic` capability: if ANY ref update fails, NONE apply. The
+ * commands that would have applied report this message (byte-observed on git
+ * 2.43.0: a per-ref failure with --atomic keeps the failing command's own ng
+ * message and renders the siblings `ng <ref> atomic push failed`), and the
+ * refs are left untouched — git's ref-transaction abort
+ * (builtin/receive-pack.c execute_commands_atomic).
+ */
+export const ATOMIC_PUSH_FAILED = "atomic push failed";
+
+/**
+ * Parse the push-options section of a receive-pack request (gitprotocol-pack:
+ * `push-options = *PKT-LINE(push-option) flush-pkt`, `push-option = 1*(
+ * VCHAR | SP )`) — the pkt-lines between the command list's flush-pkt and the
+ * packfile, present exactly when the client requested the advertised
+ * `push-options` capability (git's send-pack writes the section, empty or
+ * not, iff it passed --push-option; each option is the pkt-line's raw bytes —
+ * the reference client appends no LF, and PktParser chomps one trailing LF
+ * per line the same way git's packet reader does). Delim/special packets are
+ * skipped; the flush ends the section.
+ */
+export function parsePushOptions(section: Uint8Array): string[] {
+  const parser = new PktParser(section);
+  const options: string[] = [];
+  for (let p = parser.read(); p !== null; p = parser.read()) {
+    if (p.kind === "flush") break;
+    if (p.kind !== "line") continue;
+    options.push(p.text);
+  }
+  return options;
+}
+
 /** Characters git's check_ref_format rejects, plus HTML-dangerous ones. */
 const BAD_REF = /[\s~^:?*\[\\'"<>&`\x00-\x1f\x7f]/;
 
@@ -1584,12 +1758,47 @@ export async function validatePush(
  * guard; a mismatch (a ref moved between validation and commit, which the push
  * serialization normally prevents) both rejects that command and forces the
  * reachable cache to be rebuilt rather than extended from a now-stale walk.
+ *
+ * `atomic` is the client's `atomic` capability (gitprotocol-pack): if ANY
+ * command fails — a validation reject from the decisions, or a CAS mismatch
+ * found here — NOTHING applies and the commands that would have succeeded
+ * report ATOMIC_PUSH_FAILED, the failed ones their own message. git's shape
+ * exactly (execute_commands_atomic: the transaction aborts when any queued
+ * update errored; per-command errors survive, the rest get the atomic
+ * failure), so the verdict pass runs BEFORE the first ref write and the
+ * early return leaves the store untouched inside the same transactionSync.
  */
-export function commitPush(store: GitStore, plan: PushPlan): { results: CommandResult[]; changed: boolean; needsGc: boolean } {
+export function commitPush(
+  store: GitStore,
+  plan: PushPlan,
+  atomic = false
+): { results: CommandResult[]; changed: boolean; needsGc: boolean } {
   const results: CommandResult[] = [];
   let changed = false;
   let needsGc = false;
   let casMismatch = false;
+
+  // verdict pass (no writes): every CAS is checked before any ref moves, so
+  // an atomic push can keep its all-or-nothing promise from one sync pass
+  const casOk: boolean[] = plan.decisions.map((d) => {
+    if (d.reject) return false;
+    return (store.getRef(d.ref) ?? ZERO_OID) === d.expectedOld;
+  });
+
+  if (atomic && casOk.some((ok) => !ok)) {
+    for (let i = 0; i < plan.decisions.length; i++) {
+      const d = plan.decisions[i];
+      results.push(
+        d.reject
+          ? { ref: d.ref, ok: false, msg: d.reject }
+          : casOk[i]
+            ? { ref: d.ref, ok: false, msg: ATOMIC_PUSH_FAILED }
+            : { ref: d.ref, ok: false, msg: "fetch first" }
+      );
+    }
+    return { results, changed: false, needsGc: false };
+  }
+
   for (const d of plan.decisions) {
     if (d.reject) {
       results.push({ ref: d.ref, ok: false, msg: d.reject });

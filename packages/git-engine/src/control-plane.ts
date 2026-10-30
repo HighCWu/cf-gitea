@@ -218,6 +218,15 @@ export interface FinalizeReceiveInput {
    * mismatches (or whose object is missing) is skipped — housekeeping never
    * fails the user's push; the Queue worker's next check re-syncs the ref. */
   extraRefUpdates?: ExtraRefUpdate[];
+  /** The client's `atomic` capability (gitprotocol-pack; observed on git
+   * 2.43.0 `git push --atomic`): if ANY ref update fails, NONE apply — the
+   * failed command keeps its own ng message, the commands that would have
+   * applied report "atomic push failed". Absent/undefined = per-ref
+   * semantics (receive-pack's non-atomic default: rejected commands never
+   * block their siblings). The all-or-nothing verdict is decided inside the
+   * ONE commit transaction (commitPush's verdict pass), so a failed atomic
+   * push writes nothing at all. */
+  atomic?: boolean;
 }
 
 export type FinalizeCommitted = {
@@ -714,7 +723,7 @@ export async function finalizeReceive(host: LeaseHost, input: FinalizeReceiveInp
         plan.decisions[i] = { ref: plan.decisions[i].ref, expectedOld: plan.decisions[i].expectedOld, reject: "missing necessary objects" };
       }
     }
-    const applied = commitPush(store, plan);
+    const applied = commitPush(store, plan, input.atomic === true);
     // PR-head (and similar housekeeping) choreography rides the SAME
     // transaction (SPEC-0001b §4.7): CAS per entry, best-effort — an entry
     // whose CAS mismatches or whose object is missing is skipped (never
