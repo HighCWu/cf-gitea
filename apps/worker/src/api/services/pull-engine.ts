@@ -33,6 +33,8 @@ import {
   pullHeadRef,
   ZERO_OID,
 } from "./engine";
+import type { EngineMergeBaseResult, EngineReads } from "./engine";
+import { engineRepoName } from "./engine";
 import { findRepositoryById, type RepositoryWithOwner } from "./repository";
 import { canWriteRepository } from "./repo-access";
 
@@ -122,15 +124,50 @@ export async function ensurePullRequestChecked(
 }
 
 /**
+ * The stat's engine-read slice over a NARROW env: the service-side emitters
+ * (the push webhooks' `WebhookPushEnv`, the issue-delete emission struct)
+ * hold structural env slices, not the full request Env `engineReads`
+ * (engine.ts) types its parameter against — the same escape `engineWalk`
+ * (services/webhooks-push.ts) takes by addressing the cell from the
+ * namespace alone. The safe adapter IS engineReads's own (`null` on a
+ * thrown transport — the engine.ts module doc; `null` is also the engine's
+ * own not-found answer), reduced to the three RPCs the range needs.
+ */
+function envEngineReads(env: Pick<ApiEnv["Bindings"], "REPO">, pair: RepositoryWithOwner): Pick<EngineReads, "readCommit" | "mergeBase" | "readDiff"> {
+  const cell = env.REPO.getByName(engineRepoName(pair.repo));
+  // async/await erases the RPC stub's `Promise & Pick` intersection types,
+  // which break plain `.catch(() => null)` inference on union results —
+  // engineReads's comment verbatim.
+  const safe = async <T>(pending: Promise<T>): Promise<T | null> => {
+    try {
+      return await pending;
+    } catch {
+      return null;
+    }
+  };
+  return {
+    readCommit: (id) => safe(cell.readCommit(id)),
+    // the union-returning RPC carries an explicit type argument — the RPC
+    // stub's `Promise & Pick` intersections make inference pick one union
+    // member (engineReads's comment verbatim).
+    mergeBase: (a, b) => safe<EngineMergeBaseResult>(cell.mergeBase(a, b)),
+    readDiff: (id, id2) => safe(cell.readDiff(id, id2)),
+  };
+}
+
+/**
  * The PR diff range (three-dot): `merge_base...refs/pull/N/head`. The range
  * composition per 0001b §10.8 — a null merge base (unrelated histories)
  * renders an empty diff, exactly like `git diff base...head` upstream.
  * `truncated` carries the engine's budget flag (repo.ts computeDiff —
  * MAX_DIFF_FILES=100 / MAX_DIFF_BLOB=512 KiB; SPEC-0001b §3) so stat-style
  * consumers can refuse partial sums instead of serving them as totals.
+ *
+ * The env-parameterized core serves the non-request callers (the webhook
+ * service emitters); the Context wrapper below is the route-facing delegate.
  */
-export async function pullRequestDiff(
-  c: Context<ApiEnv>,
+export async function pullRequestDiffForEnv(
+  env: Pick<ApiEnv["Bindings"], "REPO">,
   pair: RepositoryWithOwner,
   pr: PullRequestRow,
 ): Promise<{
@@ -139,7 +176,7 @@ export async function pullRequestDiff(
   head: string;
   truncated: boolean;
 }> {
-  const reads = engineReads(c.env, pair.repo);
+  const reads = envEngineReads(env, pair);
   const baseTip = await reads.readCommit(branchRef(pr.baseBranch));
   const headCommit = await reads.readCommit(pullHeadRef(pr.index));
   if (baseTip === null || headCommit === null) {
@@ -156,6 +193,20 @@ export async function pullRequestDiff(
   }
   const diff = await reads.readDiff(headCommit.oid, mergeBase);
   return { files: diff?.files ?? [], mergeBase, head: headCommit.oid, truncated: diff?.truncated ?? false };
+}
+
+/** The route-facing diff range — the env core over the request's bindings. */
+export async function pullRequestDiff(
+  c: Context<ApiEnv>,
+  pair: RepositoryWithOwner,
+  pr: PullRequestRow,
+): Promise<{
+  files: import("@cf-gitea/git-engine").DiffFileJson[];
+  mergeBase: string | null;
+  head: string;
+  truncated: boolean;
+}> {
+  return pullRequestDiffForEnv(c.env, pair, pr);
 }
 
 /**
@@ -175,15 +226,24 @@ export async function pullRequestDiff(
  *     PR itself still renders).
  * Returns null for every omit arm; the converter renders the trio only from
  * a non-null stat (the fields are omitempty pointers, structs/pull.go:51-55).
+ *
+ * The env-parameterized core serves the webhook/service emitters whose
+ * payload conversions ride ToPayloadPullRequest too (the GetDiffShortStat
+ * block is NOT gated on isPayload — convert/pull.go:31-34 + :230-254): the
+ * push sync (`pull_request_sync`, notifier.go:850), the branch-delete close
+ * (IssueChangeStatus, notifier.go:249-271) and the issue-delete funnel
+ * (DeleteIssue, notifier.go:313-341). Those callers hold env slices, not a
+ * hono Context; `WebhookPushEnv`/the emission struct satisfy the narrow
+ * `REPO` pick structurally.
  */
-export async function pullRequestDiffShortStat(
-  c: Context<ApiEnv>,
+export async function pullRequestDiffShortStatForEnv(
+  env: Pick<ApiEnv["Bindings"], "REPO">,
   pair: RepositoryWithOwner,
   pr: PullRequestRow,
 ): Promise<{ additions: number; deletions: number; changedFiles: number } | null> {
-  let range: Awaited<ReturnType<typeof pullRequestDiff>>;
+  let range: Awaited<ReturnType<typeof pullRequestDiffForEnv>>;
   try {
-    range = await pullRequestDiff(c, pair, pr);
+    range = await pullRequestDiffForEnv(env, pair, pr);
   } catch {
     return null;
   }
@@ -197,6 +257,15 @@ export async function pullRequestDiffShortStat(
     deletions += file.del;
   }
   return { additions, deletions, changedFiles: range.files.length };
+}
+
+/** The route-facing stat — the env core over the request's bindings. */
+export async function pullRequestDiffShortStat(
+  c: Context<ApiEnv>,
+  pair: RepositoryWithOwner,
+  pr: PullRequestRow,
+): Promise<{ additions: number; deletions: number; changedFiles: number } | null> {
+  return pullRequestDiffShortStatForEnv(c.env, pair, pr);
 }
 
 /**

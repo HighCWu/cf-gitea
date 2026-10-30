@@ -891,4 +891,52 @@ describe("pull_request_review_* + pull_request_review_request webhook emissions"
     const sole = (await deliveriesFor(hookId))[0]!;
     expect(sole.eventType).toBe("pull_request_review_approved");
   });
+
+  /** The diff-stat scenario: main = the 10-line file; feature (child) edits
+   *  L5–L7 and adds extra.txt (2 lines) — the three-dot range sums to 5 adds
+   *  / 3 dels over 2 files (the hunk-suite seedDiffScenario's math). */
+  async function seedTrioScenario(): Promise<{ run: ReturnType<typeof router>; repoId: string; hookId: number; index: number }> {
+    const run = router();
+    const repoId = await seedRepo();
+    const hookId = await seedHook(repoId);
+    const mainTip = await seedFilesCommit("main", { "file.txt": "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\nL10\n" }, null);
+    const featureTip = await seedFilesCommit(
+      "feature",
+      { "file.txt": "L1\nL2\nL3\nL4\nL5-edited\nL6-edited\nL7-edited\nL8\nL9\nL10\n", "extra.txt": "E1\nE2\n" },
+      mainTip,
+    );
+    const pr = await seedPull(repoId);
+    await seedPullHeadRef(pr.index, featureTip);
+    return { run, repoId, hookId, index: pr.index };
+  }
+
+  it("carries the diff-stat trio on the reviewed payload over the real range diff (the GetDiffShortStat block is not gated on isPayload — convert/pull.go:31-34 + :230-254)", async () => {
+    const { run, hookId, index } = await seedTrioScenario();
+
+    await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${index}/reviews`, authed(ADMIN_TOKEN, { method: "POST", body: JSON.stringify({ event: "APPROVED", body: "lgtm with stats" }) }));
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries.map((row) => row.eventType)).toEqual(["pull_request_review_approved"]);
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as { pull_request: Record<string, unknown> };
+    // file.txt: 3 adds + 3 dels; extra.txt: 2 adds → 5/3/2. A D1-only PR
+    // (no engine refs) omits the fields (the omit arm, :247-250).
+    expect(payload.pull_request).toMatchObject({ additions: 5, deletions: 3, changed_files: 2 });
+  });
+
+  it("carries the trio on the review_requested / review_request_removed payloads (one render feeding both)", async () => {
+    const { run, hookId, index } = await seedTrioScenario();
+
+    await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${index}/requested_reviewers`, authed(POSTER_TOKEN, { method: "POST", body: JSON.stringify({ reviewers: ["chief"] }) }));
+    await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${index}/requested_reviewers`, authed(POSTER_TOKEN, { method: "DELETE", body: JSON.stringify({ reviewers: ["chief"] }) }));
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries.map((row) => row.eventType)).toEqual(["pull_request_review_request", "pull_request_review_request"]);
+    const added = JSON.parse(deliveries[0]!.payloadContent) as { pull_request: Record<string, unknown> };
+    const removed = JSON.parse(deliveries[1]!.payloadContent) as { pull_request: Record<string, unknown> };
+    // The add and remove payloads share the route's ONE conversion (the
+    // upstream single converter recomputes per render — the shared render is
+    // the cheaper adapter), so both carry the same 5/3/2.
+    expect(added.pull_request).toMatchObject({ additions: 5, deletions: 3, changed_files: 2 });
+    expect(removed.pull_request).toMatchObject({ additions: 5, deletions: 3, changed_files: 2 });
+  });
 });

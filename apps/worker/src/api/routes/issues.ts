@@ -84,6 +84,7 @@ import {
   type IssuePullUnits,
 } from "../services/issue-unit-gates";
 import { parseMilestoneDeadline } from "../services/milestones";
+import { pullRequestDiffShortStat } from "../services/pull-engine";
 import { toApiPullRequest } from "../services/pulls";
 import {
   apiUserFromRow,
@@ -443,13 +444,18 @@ async function emitLabelEvent(
     if (pr === null) {
       return;
     }
+    // The diff-stat trio rides the same conversion (the single converter's
+    // GetDiffShortStat block runs on EVERY single AND payload render,
+    // convert/pull.go:230-254; the omit arms — no merge base, truncated
+    // walk, engine failure :247-250 — stay omitted).
+    const diffStats = await pullRequestDiffShortStat(c, found, pr);
     await emitIssueEvent(c, {
       repoId: found.repo.id,
       ownerId: event.ownerId,
       eventType: "pull_request_label",
       payload: pullRequestEventPayload(
         action,
-        await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "payload"),
+        await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "payload", diffStats === null ? undefined : { diffStats }),
         issue.index,
         event.repository,
         event.sender,
@@ -498,13 +504,18 @@ export async function emitMilestoneEvent(
     if (pr === null) {
       return;
     }
+    // The diff-stat trio rides the same conversion (the single converter's
+    // GetDiffShortStat block runs on EVERY single AND payload render,
+    // convert/pull.go:230-254; the omit arms — no merge base, truncated
+    // walk, engine failure :247-250 — stay omitted).
+    const diffStats = await pullRequestDiffShortStat(c, found, pr);
     await emitIssueEvent(c, {
       repoId: found.repo.id,
       ownerId: event.ownerId,
       eventType: "pull_request_milestone",
       payload: pullRequestEventPayload(
         action,
-        await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "payload"),
+        await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "payload", diffStats === null ? undefined : { diffStats }),
         issue.index,
         event.repository,
         event.sender,
@@ -572,13 +583,18 @@ export async function emitAssignEvent(
     if (pr === null) {
       return;
     }
+    // The diff-stat trio rides the same conversion (the single converter's
+    // GetDiffShortStat block runs on EVERY single AND payload render,
+    // convert/pull.go:230-254; the omit arms — no merge base, truncated
+    // walk, engine failure :247-250 — stay omitted).
+    const diffStats = await pullRequestDiffShortStat(c, found, pr);
     await emitIssueEvent(c, {
       repoId: found.repo.id,
       ownerId: event.ownerId,
       eventType: "pull_request_assign",
       payload: pullRequestEventPayload(
         action,
-        await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "payload"),
+        await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "payload", diffStats === null ? undefined : { diffStats }),
         issue.index,
         event.repository,
         event.sender,

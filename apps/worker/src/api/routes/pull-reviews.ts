@@ -164,7 +164,7 @@ import {
   type Viewer,
 } from "../services/repository";
 import { engineReads } from "../services/engine";
-import { pullRequestDiff } from "../services/pull-engine";
+import { pullRequestDiff, pullRequestDiffShortStat } from "../services/pull-engine";
 import { findRule, isUserOfficialReviewer, parseRuleConfig, principalAccessOfRow } from "../../services/branch-protection";
 
 type ReviewRow = typeof pullReviews.$inferSelect;
@@ -798,6 +798,11 @@ async function emitReviewSubmitted(
   if (eventType === null) {
     return; // PENDING stays silent (notifier.go:763–766)
   }
+  // The diff-stat trio rides the same conversion (the single converter's
+  // GetDiffShortStat block runs on EVERY single AND payload render,
+  // convert/pull.go:230-254; the omit arms — no merge base, truncated walk,
+  // engine failure :247-250 — stay omitted).
+  const diffStats = await pullRequestDiffShortStat(c, found, pullRequest);
   await emitIssueEvent(c, {
     repoId: found.repo.id,
     ownerId: found.repo.ownerId,
@@ -807,7 +812,7 @@ async function emitReviewSubmitted(
       index: issue.index,
       // ToPayloadPullRequest (pull.go:30-37) — the webhook payload renders
       // the head repo regardless of the doer's visibility.
-      apiPullRequest: await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload"),
+      apiPullRequest: await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload", diffStats === null ? undefined : { diffStats }),
       repository: toApiRepository(viewer, found),
       sender: c.get("authUser"),
       requestedReviewer: c.get("authUser"),
@@ -1799,8 +1804,14 @@ export function registerPullReviewRoutes(
 
     // ToPayloadPullRequest (pull.go:30-37) — the review_request webhook
     // payloads (add user/team, remove user) render the head repo regardless
-    // of the doer's visibility.
-    const apiPullRequest = await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload");
+    // of the doer's visibility. The diff-stat trio rides the same conversion
+    // (the single converter's GetDiffShortStat block runs on EVERY single
+    // AND payload render, convert/pull.go:230-254; the omit arms — no merge
+    // base, truncated walk, engine failure :247-250 — stay omitted); the one
+    // resolution feeds every payload below (upstream recomputes per
+    // conversion — the shared render is the cheaper adapter).
+    const diffStats = await pullRequestDiffShortStat(c, found, pullRequest);
+    const apiPullRequest = await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload", diffStats === null ? undefined : { diffStats });
     const repository = toApiRepository(viewer, found);
 
     if (isAdd) {

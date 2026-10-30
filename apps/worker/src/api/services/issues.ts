@@ -33,6 +33,7 @@ import type { Comment, Issue, TimelineComment } from "../models/issue";
 import type { User } from "../models/user";
 import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "./blocks";
 import { findCollaborator } from "./repo-collaborators";
+import { pullRequestDiffShortStatForEnv } from "./pull-engine";
 import { toApiPullRequest } from "./pulls";
 import { toApiMilestone } from "./milestones";
 import {
@@ -1825,11 +1826,13 @@ export async function toApiIssueWithAssignees(d1: D1Database, viewer: Viewer, fo
  */
 export interface IssueDeleteEmission {
   /** The hono request source structurally: the bindings (D1 for the fan-out,
-   *  the optional WEBHOOK_DELIVERY queue) and hono's `executionCtx` GETTER as
-   *  a thunk — read lazily inside the emit guard, because reading it throws
-   *  for in-process callers (tests via router.fetch) that have no execution
+   *  REPO for the payload PR render's diff-stat engine read — the same slice
+   *  pullRequestDiffShortStatForEnv takes — and the optional
+   *  WEBHOOK_DELIVERY queue) and hono's `executionCtx` GETTER as a thunk —
+   *  read lazily inside the emit guard, because reading it throws for
+   *  in-process callers (tests via router.fetch) that have no execution
    *  context. */
-  readonly env: { readonly DB: D1Database; readonly WEBHOOK_DELIVERY?: unknown };
+  readonly env: { readonly DB: D1Database; readonly REPO: ApiEnv["Bindings"]["REPO"]; readonly WEBHOOK_DELIVERY?: unknown };
   readonly executionCtx?: () => { waitUntil(promise: Promise<unknown>): void };
   /** The §2.7 viewer the payload renders against (the route's viewerOf(c)). */
   readonly viewer: Viewer;
@@ -1894,6 +1897,13 @@ async function renderIssueDeletedEvent(d1: D1Database, issue: IssueRow, emission
       console.error(`[issues] delete webhook skipped (deleted): PR row missing [issue: ${issue.id}]`);
       return null;
     }
+    // The diff-stat trio rides the same conversion (the single converter's
+    // GetDiffShortStat block runs on EVERY single AND payload render,
+    // convert/pull.go:230-254; the omit arms — no merge base, truncated
+    // walk, engine failure :247-250 — stay omitted). The read goes through
+    // the env-parameterized core (the emission struct holds no hono
+    // Context).
+    const diffStats = await pullRequestDiffShortStatForEnv(emission.env, pair, pr);
     return {
       repoId: pair.repo.id,
       ownerId: pair.repo.ownerId,
@@ -1901,7 +1911,7 @@ async function renderIssueDeletedEvent(d1: D1Database, issue: IssueRow, emission
       payload: {
         action: "deleted",
         number: issue.index,
-        pull_request: await toApiPullRequest(d1, emission.viewer, pair, issue, pr, "payload"),
+        pull_request: await toApiPullRequest(d1, emission.viewer, pair, issue, pr, "payload", diffStats === null ? undefined : { diffStats }),
         repository,
         sender: emission.sender,
         commit_id: "",

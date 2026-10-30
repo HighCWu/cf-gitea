@@ -18,6 +18,7 @@ import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
+import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
 import {
   comments,
@@ -51,6 +52,7 @@ import { createApiRouter } from "./router";
 import { contractModelProperties } from "../compat/contract/frozen-contract";
 import type { TimelineComment } from "./models/issue";
 import { toTimelineComment } from "./services/issues";
+import { ZERO_OID, branchRef, engineReads, refTipMap } from "./services/engine";
 import { findRepositoryByPath, type Viewer } from "./services/repository";
 
 beforeAll(async () => {
@@ -223,6 +225,135 @@ async function deliveriesFor(hookId: number): Promise<DeliveryRow[]> {
     .from(webhookDeliveries)
     .where(eq(webhookDeliveries.hookId, hookId))
     .all();
+}
+
+// ---------------------------------------------------------------------------
+// Real engine content for the diff-stat trio pins — the pulls.test.ts seed
+// recipe (putApiObjects + commitApiChange through the public RPCs). The DO
+// cells outlive the per-test D1 wipes, so the pins use UNIQUE repo slugs and
+// the seeders stay idempotent on existing refs.
+// ---------------------------------------------------------------------------
+
+/** Worker-side object hash (workerd crypto.subtle; putApiObjects re-verifies). */
+async function gitObjectOid(type: string, data: Uint8Array): Promise<string> {
+  const header = new TextEncoder().encode(`${type} ${data.byteLength}\0`);
+  const bytes = new Uint8Array(header.byteLength + data.byteLength);
+  bytes.set(header, 0);
+  bytes.set(data, header.byteLength);
+  const digest = await crypto.subtle.digest("SHA-1", bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** One deterministic root commit on `main`, the named branches pointing at
+ *  it — idempotent (already-present refs are left alone). Returns the shared
+ *  branch tip. */
+async function seedEngineBranches(ownerLower: string, slug: string, branches: string[]): Promise<string> {
+  const pair = { ownerNamespace: ownerLower, slug };
+  const cell = env.REPO.getByName(`${ownerLower}/${slug}`);
+  const tips = refTipMap(await engineReads(env, pair).listRefs());
+  const land = async (ref: string, oid: string): Promise<void> => {
+    const result = await cell.commitApiChange({ ref, expectedOldOid: ZERO_OID, newOid: oid });
+    if (result.tag !== "committed") {
+      throw new Error(`seed ref landing failed: ${ref} (${result.tag})`);
+    }
+  };
+  let tip = tips.get(branchRef("main"))?.target;
+  if (tip === undefined) {
+    const blob = new TextEncoder().encode(`# ${slug}\n`);
+    const blobOid = await gitObjectOid("blob", blob);
+    const tree = serializeTree([{ mode: "100644", name: "README.md", oid: blobOid }]);
+    const person = { name: "seed", email: "seed@issues.invalid", time: 1761000000, tz: "+0000" };
+    const commit = serializeCommit({ tree: tree.oid, parents: [], author: person, committer: person, message: "seed\n" });
+    const put = await cell.putApiObjects([
+      { oid: blobOid, type: "blob", data: blob },
+      { oid: tree.oid, type: "tree", data: tree.data },
+      { oid: commit.oid, type: "commit", data: commit.data },
+    ]);
+    if (put.tag !== "ok") {
+      throw new Error(`seed putApiObjects failed: ${put.tag}`);
+    }
+    tip = commit.oid;
+    await land(branchRef("main"), commit.oid);
+  }
+  for (const branch of branches) {
+    if (tips.get(branchRef(branch)) === undefined) {
+      await land(branchRef(branch), tip);
+    }
+  }
+  return tip;
+}
+
+/** One CHILD commit on `branch` (parent = parentOid) replacing the whole tree
+ *  with `files`. Returns the new branch tip. */
+async function landChildCommit(
+  ownerLower: string,
+  slug: string,
+  branch: string,
+  parentOid: string,
+  files: { name: string; content: string }[],
+  message: string,
+): Promise<string> {
+  const cell = env.REPO.getByName(`${ownerLower}/${slug}`);
+  const objects: { oid: string; type: "blob" | "tree" | "commit" | "tag"; data: Uint8Array }[] = [];
+  const entries: { mode: "100644"; name: string; oid: string }[] = [];
+  for (const file of files) {
+    const blob = new TextEncoder().encode(file.content);
+    const blobOid = await gitObjectOid("blob", blob);
+    objects.push({ oid: blobOid, type: "blob", data: blob });
+    entries.push({ mode: "100644", name: file.name, oid: blobOid });
+  }
+  const tree = serializeTree(entries);
+  objects.push({ oid: tree.oid, type: "tree", data: tree.data });
+  const person = { name: "seed", email: "seed@issues.invalid", time: 1761000001, tz: "+0000" };
+  const commit = serializeCommit({ tree: tree.oid, parents: [parentOid], author: person, committer: person, message });
+  objects.push({ oid: commit.oid, type: "commit", data: commit.data });
+  const put = await cell.putApiObjects(objects);
+  if (put.tag !== "ok") {
+    throw new Error(`child commit seed putApiObjects failed: ${put.tag}`);
+  }
+  const result = await cell.commitApiChange({ ref: branchRef(branch), expectedOldOid: parentOid, newOid: commit.oid });
+  if (result.tag !== "committed") {
+    throw new Error(`child commit ref landing failed: ${result.tag}`);
+  }
+  return commit.oid;
+}
+
+/** Land `refs/pull/N/head` at a tip — what the API POST /pulls route does and
+ *  the diff-stat range's head read needs (the service-created PRs of these
+ *  pins skip that route). */
+async function landPullHeadRef(ownerLower: string, slug: string, index: number, oid: string): Promise<void> {
+  const cell = env.REPO.getByName(`${ownerLower}/${slug}`);
+  const landed = await cell.commitApiChange({ ref: `refs/pull/${index}/head`, expectedOldOid: ZERO_OID, newOid: oid });
+  if (landed.tag !== "committed") {
+    throw new Error(`seed pull head landing failed: ${landed.tag}`);
+  }
+}
+
+/** The diff-stat trio pins' PR fixture: engine branches main+topic with a
+ *  real child diff (README rewritten = 1 add + 1 del, notes.txt added = 3
+ *  lines — the three-dot range sums to 4/1/2, the pulls.test.ts GET pin's
+ *  math), the service-created PR, and its refs/pull/N/head landing. */
+async function seedTrioPr(
+  ownerLower: string,
+  slug: string,
+  title: string,
+): Promise<{ repoId: string; issueIndex: number; pullIndex: number }> {
+  const repoId = await seedRepo(ownerLower, slug);
+  const tip = await seedEngineBranches(ownerLower, slug, ["topic"]);
+  const child = await landChildCommit(ownerLower, slug, "topic", tip, [
+    { name: "README.md", content: `# ${slug} v2\n` },
+    { name: "notes.txt", content: "a\nb\nc\n" },
+  ], "child\n");
+  const pull = await service().createPullRequest({
+    repoId,
+    headRepoId: repoId,
+    baseBranch: "main",
+    headBranch: "topic",
+    title,
+    posterId: 1,
+  });
+  await landPullHeadRef(ownerLower, slug, pull.pullRequest.index, child);
+  return { repoId, issueIndex: pull.issue.index, pullIndex: pull.pullRequest.index };
 }
 
 // ---------------------------------------------------------------------------
@@ -2060,6 +2191,30 @@ describe("issue label webhook emissions (issueAddLabel / issueReplaceLabels / is
     expect(payload.pull_request.assignees).toEqual([]);
     expect(payload.pull_request.assignee).toBeNull();
   });
+
+  it("carries the diff-stat trio on the pull_request_label payload over the real range diff (the GetDiffShortStat block is not gated on isPayload — convert/pull.go:31-34 + :230-254)", async () => {
+    // The namespace's owner ROW must exist — findRepositoryByPath inner-joins it.
+    const owner = await seedUser("Alice");
+    const { repoId, issueIndex } = await seedTrioPr(owner.usernameLower, "trio-label", "PR label trio");
+    const labelId = await seedLabel(repoId, "approved");
+    const hookId = await seedHook(repoId, ["pull_request_label"]);
+
+    const add = await router()(`/repos/alice/trio-label/issues/${issueIndex}/labels`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: [labelId] }),
+    });
+    expect(add.status).toBe(200);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]!.eventType).toBe("pull_request_label");
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as { pull_request: Record<string, unknown> };
+    // README rewritten (1 add + 1 del) and notes.txt added (3 lines) — the
+    // three-dot range main...refs/pull/N/head sums to 4/1/2 (the pulls.test.ts
+    // GET pin's math); a D1-only PR omits the fields (the omit arm).
+    expect(payload.pull_request).toMatchObject({ additions: 4, deletions: 1, changed_files: 2 });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2395,6 +2550,28 @@ describe("issue milestone webhook emissions (issueEditIssue PATCH milestone arm)
       expect(payload.issue.assignee).toMatchObject({ login: neighbor.usernameLower });
     }
   });
+
+  it("carries the diff-stat trio on the pull_request_milestone payload over the real range diff (the GetDiffShortStat block is not gated on isPayload — convert/pull.go:31-34 + :230-254)", async () => {
+    // The namespace's owner ROW must exist — findRepositoryByPath inner-joins it.
+    const owner = await seedUser("Alice");
+    const { repoId, issueIndex } = await seedTrioPr(owner.usernameLower, "trio-mile", "PR milestone trio");
+    const milestoneId = await seedMilestone(repoId, "v1");
+    const hookId = await seedHook(repoId, ["pull_request_milestone"]);
+
+    const set = await router()(`/repos/alice/trio-mile/issues/${issueIndex}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ milestone: milestoneId }),
+    });
+    expect(set.status).toBe(201);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]!.eventType).toBe("pull_request_milestone");
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as { pull_request: Record<string, unknown> };
+    // The seedTrioPr math: 4 adds / 1 del over 2 files.
+    expect(payload.pull_request).toMatchObject({ additions: 4, deletions: 1, changed_files: 2 });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2629,6 +2806,28 @@ describe("issue assign webhook emissions (issueEditIssue PATCH assignee arm)", (
     // A pull_request_assign-subscribed hook never sees issue_assign traffic.
     expect(await deliveriesFor(issuesHook)).toHaveLength(0);
     expect(await db().select().from(webhookDeliveries).all()).toHaveLength(1);
+  });
+
+  it("carries the diff-stat trio on the pull_request_assign payload over the real range diff (the GetDiffShortStat block is not gated on isPayload — convert/pull.go:31-34 + :230-254)", async () => {
+    // The stub-owned repo (the doer is the owner → the assignee writer gate
+    // passes — seedOwnedList's posture).
+    const neighbor = await seedUser("neighbor");
+    const { repoId, issueIndex } = await seedTrioPr("cf-gitea-stub", "trio-assign", "PR assign trio");
+    const hookId = await seedHook(repoId, ["pull_request_assign"]);
+
+    const res = await router()(`/repos/cf-gitea-stub/trio-assign/issues/${issueIndex}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ assignees: [neighbor.usernameLower] }),
+    });
+    expect(res.status).toBe(201);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]!.eventType).toBe("pull_request_assign");
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as { pull_request: Record<string, unknown> };
+    // The seedTrioPr math: 4 adds / 1 del over 2 files.
+    expect(payload.pull_request).toMatchObject({ additions: 4, deletions: 1, changed_files: 2 });
   });
 });
 

@@ -128,6 +128,7 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 
 import { ActionType, recordAction } from "../api/services/activity-feeds";
+import { pullRequestDiffShortStatForEnv } from "../api/services/pull-engine";
 import { toApiPullRequest } from "../api/services/pulls";
 import { toPayloadCommit, usernamesByEmail } from "../api/services/git-models";
 import { compareUrl } from "../api/services/hooks";
@@ -597,6 +598,13 @@ async function emitPullRequestSyncs(
       // `synced` null and only skips the arms (the event still fires, like
       // upstream's independent IsSync loop).
       const synced = await syncPullRequestHead(env, pushedPair, basePair, head, update, options, log);
+      // The diff-stat trio rides the same conversion (the single converter's
+      // GetDiffShortStat block runs on EVERY single AND payload render,
+      // convert/pull.go:230-254; the omit arms — no merge base, truncated
+      // walk, engine failure :247-250 — stay omitted). The read goes through
+      // the env-parameterized core (this module holds WebhookPushEnv, no
+      // hono Context).
+      const diffStats = await pullRequestDiffShortStatForEnv(env, basePair, synced ?? head.pullRequest);
       await emit(
         "pull_request_sync",
         {
@@ -609,7 +617,7 @@ async function emitPullRequestSyncs(
           // anonymous) doer, pulls.ts toApiPullRequest "payload" mode. The
           // synced row (head_sha/status already moved) renders when the arms
           // landed; upstream's payload reads the same moved state.
-          pull_request: await toApiPullRequest(env.DB, viewer, basePair, head.issue, synced ?? head.pullRequest, "payload"),
+          pull_request: await toApiPullRequest(env.DB, viewer, basePair, head.issue, synced ?? head.pullRequest, "payload", diffStats === null ? undefined : { diffStats }),
           repository: toApiRepository(viewer, basePair),
           sender: identity.sender,
           commit_id: "",
@@ -1019,10 +1027,16 @@ async function closePullRequestsOfDeletedBranch(
             : await findRepositoryById(env.DB, head.pullRequest.baseRepoId);
         if (basePair !== null) {
           const viewer: Viewer = { origin, requester: null };
+          // The diff-stat trio rides the same conversion (the single
+          // converter's GetDiffShortStat block runs on EVERY single AND
+          // payload render, convert/pull.go:230-254; the omit arms — no
+          // merge base, truncated walk, engine failure :247-250 — stay
+          // omitted). Env-parameterized core: no hono Context here.
+          const diffStats = await pullRequestDiffShortStatForEnv(env, basePair, head.pullRequest);
           const payload = {
             action: "closed",
             number: head.issue.index,
-            pull_request: await toApiPullRequest(env.DB, viewer, basePair, closed, head.pullRequest, "payload"),
+            pull_request: await toApiPullRequest(env.DB, viewer, basePair, closed, head.pullRequest, "payload", diffStats === null ? undefined : { diffStats }),
             repository: toApiRepository(viewer, basePair),
             sender: identity.sender,
             commit_id: "",

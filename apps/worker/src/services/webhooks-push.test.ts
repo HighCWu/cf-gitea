@@ -1269,6 +1269,45 @@ describe("pull_request_sync — PR-head branch updates ride the push (notifier.g
       [syncOnly, "pull_request_sync"],
     ]);
   });
+
+  it("carries the diff-stat trio on the pull_request_sync payload over the real range diff (the GetDiffShortStat block is not gated on isPayload — convert/pull.go:31-34 + :230-254)", async () => {
+    const { row, token } = await seedRepoWithToken("syncstat");
+    const hookId = await seedHook({ repoId: row.id, events: { choose_events: true, events: { pull_request_sync: true } } });
+    const { index } = await seedPull(row.id, "sync trio", { headBranch: "feature", baseBranch: "main" });
+
+    // main lands FIRST (the range's base read walks it — a repo without the
+    // base branch omits the trio), then the PR's head branch (created refs
+    // never sync, push.go:292).
+    const main = await buildChainPack(null, [
+      { message: "seed", files: [{ path: "README.md", content: "seed\n" }], time: 1700000400 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: main.tips[0]!, ref: "refs/heads/main" }], main.pack, token)).status,
+    ).toBe(200);
+    const head = await buildChainPack(main.tips[0]!, [
+      { message: "pr head", files: [{ path: "README.md", content: "seed\n" }, { path: "work.txt", content: "head\n" }], time: 1700000401 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: head.tips[0]!, ref: "refs/heads/feature" }], head.pack, token)).status,
+    ).toBe(200);
+    await clearDeliveries();
+
+    // The head update that must sync. The three-dot range
+    // main...refs/pull/N/head sums the FULL tree delta against the merge
+    // base: README rewritten (1 add + 1 del), work.txt added (+1) → 2/1/2.
+    const append = await buildChainPack(head.tips[0]!, [
+      { message: "second", files: [{ path: "README.md", content: "rewritten\n" }, { path: "work.txt", content: "head\n" }], time: 1700000402 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: head.tips[0]!, oid: append.tips[0]!, ref: "refs/heads/feature" }], append.pack, token)).status,
+    ).toBe(200);
+
+    const rows = (await deliveries()).filter((r) => r.hookId === hookId);
+    expect(rows.map((r) => r.eventType)).toEqual(["pull_request_sync"]);
+    expect((JSON.parse(rows[0]!.payloadContent) as { number: number }).number).toBe(index);
+    const payload = JSON.parse(rows[0]!.payloadContent) as { pull_request: Record<string, unknown> };
+    expect(payload.pull_request).toMatchObject({ additions: 2, deletions: 1, changed_files: 2 });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1532,6 +1571,27 @@ describe("the PR-head sync arms — ref CAS, head_sha, re-check, comment (SPEC-0
     expect(feedRows[0]!.opType).toBe(ActionType.ClosePullRequest);
     expect(feedRows[0]!.content).toBe(`${index}|`);
     expect(feedRows[0]!.actUserId).toBe(aliceId);
+  });
+
+  it("the branch-delete close payload carries the diff-stat trio (the same converter's ungated GetDiffShortStat block — convert/pull.go:230-254)", async () => {
+    const { row, token } = await seedAdvancedPrHead("syncclosestat", "sync close stat");
+    const prHook = await seedHook({ repoId: row.id, events: { choose_events: true, events: { pull_request: true } } });
+
+    const featureTip = (await env.REPO.getByName(`${row.ownerNamespace}/${row.slug}`).listRefs()).refs.find(
+      (r) => r.name === "refs/heads/feature",
+    )!.target;
+    const deleteResponse = await pushThroughGate(row, wiredEngine, [{ old: featureTip, oid: PUSH_ZERO_OID, ref: "refs/heads/feature" }], null, token);
+    expect(deleteResponse.status).toBe(200);
+
+    const prRows = (await deliveries()).filter((r) => r.hookId === prHook);
+    expect(prRows.map((r) => r.eventType)).toEqual(["pull_request"]);
+    const payload = JSON.parse(prRows[0]!.payloadContent) as { pull_request: Record<string, unknown> };
+    // The seedAdvancedPrHead range main...refs/pull/N/head: README deleted
+    // (1 del, the head tree carries work.txt only), work.txt added ("second\n",
+    // 1 add) → 1/1 over 2 files. refs/pull/N/head SURVIVES the delete (only
+    // merged-PR cleanup removes it), so the close render still resolves the
+    // range; an unresolvable one omits the fields (:247-250).
+    expect(payload.pull_request).toMatchObject({ additions: 1, deletions: 1, changed_files: 2 });
   });
 
   it("an already-closed PR's head-branch deletion stays webhook-silent (no close, no feed row)", async () => {
