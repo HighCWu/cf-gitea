@@ -26,6 +26,7 @@ import { createApiRouter } from "./router";
 import { contractModelProperties } from "../compat/contract/frozen-contract";
 import type { Viewer } from "./services/repository";
 import { toApiUserWithCounts } from "./services/user";
+import { followUser } from "./services/follows";
 import { mintFor, resetAuthTables } from "../auth/testing/seeds";
 import { mintSession, SESSION_COOKIE_NAME } from "../ui/session";
 
@@ -780,6 +781,27 @@ describe("mounted chain (SELF): GET /user renders row truth (api review drift 1)
       starred_repos_count: 3, // the row's maintained counter, not the old hardcoded 0
       is_admin: false,
       active: true,
+    });
+  });
+
+  it("the self view renders the follower/following counts (the raw-column seam upstream renders here)", async () => {
+    // Upstream's GET /user carries NumFollowers/NumFollowing (convert/
+    // user.go:107-111); our seam renders the requester-visible live totals —
+    // for the SELF viewer every follower counts, private included.
+    const doer = await seedUser("CountSelf");
+    const follower = await seedUser("CountFollower", { visibility: "private" });
+    await followUser(env.DB, follower.id, doer.id);
+    const minted = await mintFor(doer.id, "count-self", "all");
+
+    const res = await SELF.fetch("https://example.com/api/v1/user", {
+      headers: { Authorization: `token ${minted.plaintext}` },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json<Record<string, unknown>>()).toMatchObject({
+      login: "CountSelf",
+      followers_count: 1, // the self view sees the private follower
+      following_count: 0,
     });
   });
 });
