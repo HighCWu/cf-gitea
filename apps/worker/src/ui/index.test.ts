@@ -546,15 +546,19 @@ describe("uiRouter", () => {
 
     // Repo context: header, original-row casing (D1 stores folded names),
     // visibility badge — and the §4.1 empty-repo render (unborn HEAD, the
-    // engine cell was never pushed): the upstream repo/empty.tmpl Quick
-    // Guide (the title carries no page prefix — empty.tmpl sets none), no
-    // file list.
+    // engine cell was never pushed): the ANONYMOUS arm of upstream
+    // repo/empty.tmpl — the single repo.empty_message segment (the
+    // webui-parity wave moved the Quick Guide behind CanWriteCode; the
+    // title carries no page prefix — empty.tmpl sets none), no file list.
     expect(html).toContain("<title>alice/hello</title>");
     expect(html).toContain('<div class="repo-header flex-left-right">');
     expect(html).toContain('href="/alice/hello"');
     expect(html).toContain('<span class="ui basic orange label">Public Access</span>');
     expect(html).toContain('class="page-content repository quickstart"');
-    expect(html).toContain("https://test.local/alice/hello.git");
+    expect(html).toContain(
+      '<div class="ui segment center">This repository does not have any content.</div>',
+    );
+    expect(html).not.toContain("Quick Guide");
     expect(html).not.toContain("repo-files-table");
     expect(html).not.toContain("status-page-error");
   });

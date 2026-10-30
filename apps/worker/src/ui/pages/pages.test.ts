@@ -195,14 +195,19 @@ describe("home page (repo browse)", () => {
     expect(html).toContain('<a class="active item" href="/alice/pages/src/branch/main">main</a>');
   });
 
-  it("renders the §4.1 empty-repo page for an unborn repo (clone command, no file list)", async () => {
+  it("renders the §4.1 empty-repo page for an unborn repo (the anonymous message arm, no file list)", async () => {
     await seedEmptyRepo("alice", "hollow");
     const res = await fetchUi("/alice/hollow");
     expect(res.status).toBe(200);
     const html = await res.text();
+    // The webui-parity wave moved the Quick Guide behind CanWriteCode — the
+    // anonymous fetch renders empty.tmpl:74's single message segment.
     expect(html).toContain('class="page-content repository quickstart"');
-    expect(html).toContain("https://test.local/alice/hollow.git");
-    expect(html).toContain("git push -u origin main");
+    expect(html).toContain(
+      '<div class="ui segment center">This repository does not have any content.</div>',
+    );
+    expect(html).not.toContain("git push -u origin main");
+    expect(html).not.toContain("Quick Guide");
     expect(html).not.toContain("repo-files-table");
     expect(html).not.toContain("readme");
   });
