@@ -31,10 +31,10 @@ Four mount families live in `apps/worker/src/index.ts`:
 
 | Mount | Family | Where |
 |---|---|---|
-| `POST /api/actions/{service}/{Method}` | connect-RPC: PingService echo + RunnerService (Register/Declare/FetchTask/UpdateTask/UpdateLog) | index.ts:218 · routes.ts:67-68, 304-452 |
+| `POST /api/actions/{service}/{Method}` | connect-RPC: PingService echo + RunnerService (Register/Declare/FetchTask/UpdateTask/UpdateLog) | index.ts:244 · routes.ts:67-68, 304-452 |
 | `GET /api/actions/oidc/{…}` | the OIDC issuer (discovery, JWKS, token exchange) | routes.ts:301 · oidc.ts:271, 284, 289 |
-| `/api/actions_pipeline/_apis/pipelines/…` | artifacts v1 + job summaries (Bearer runtime-token auth) | index.ts:224 · artifacts-v1.ts |
-| `/twirp/github.actions.results.api.v1.ArtifactService/…` | artifacts v4 (twirp-style; HMAC-signed upload/download URLs) | index.ts:229 · artifacts-v4.ts:44 |
+| `/api/actions_pipeline/_apis/pipelines/…` | artifacts v1 + job summaries (Bearer runtime-token auth) | index.ts:250 · artifacts-v1.ts |
+| `/twirp/github.actions.results.api.v1.ArtifactService/…` | artifacts v4 (twirp-style; HMAC-signed upload/download URLs) | index.ts:255 · artifacts-v4.ts:66 |
 
 **Wire format**: connect unary over `application/proto` — the codec a stock
 act_runner speaks. This is the hash-verified wire freeze of
@@ -54,8 +54,8 @@ handler errors reach the runner as connect `CodeUnknown` with upstream's exact
 message strings (routes.ts:231-234; register.ts:67-70). Heartbeats are
 debounced: `last_online` persists at most every 30 s, `last_active` (only on
 the Update* family) every 5 s — "writing on every poll is a major source of DB
-load" (routes.ts:263-275; the constants, model.ts:349-368, porting
-runner.go:64, 66, 89-99).
+load" (routes.ts:263-275; the constants, model.ts:354-373, porting
+runner.go:80, 84, 87-98).
 
 ### 1.2 The six procedures
 
@@ -73,16 +73,16 @@ runner.go:64, 66, 89-99).
 The token the runner registers with lives in the `action_runner_tokens` D1
 table (migration 0041), stored RAW (upstream parity — the runner's
 post-registration polling token is the salted-hash one, and its plaintext is
-returned exactly once at Register; model.ts:286-318).
+returned exactly once at Register; model.ts:291-323).
 
 Lifecycle (services/actions/model.ts):
 
-- `newRunnerTokenWithValue` (model.ts:183-210) deactivates all same-scope
+- `newRunnerTokenWithValue` (model.ts:188-215) deactivates all same-scope
   active tokens, then inserts the new one — **a registration token is
   REUSABLE UNTIL RESET**: "reset" = mint-new-and-deactivate-old, so one
   active token registers a whole fleet (the SPEC's draft correction;
   register.ts:7-14).
-- `getOrCreateActiveRunnerToken` (model.ts:257) — the UI's mint: reuse the
+- `getOrCreateActiveRunnerToken` (model.ts:262) — the UI's mint: reuse the
   latest token while it stays active, else mint.
 - A token carries a SCOPE `(owner_id, repo_id)`: repo-scoped
   `(0, <repo-id>)`, owner-scoped `(<owner-id>, 0)`, global `(0, 0)`. The
@@ -93,13 +93,13 @@ Lifecycle (services/actions/model.ts):
 **Settings → Actions → Runners**, the registration-token panel with its
 "Reset registration token" form POST
 (`apps/worker/src/ui/pages/repo-settings-actions-runners.tsx:380`; the reset
-arm, `apps/worker/src/ui/index.ts:6272`; the six routes,
+arm, `apps/worker/src/ui/index.ts:7127`; the six routes,
 repo-settings-actions-runners.tsx:39-49). The `/api/v1` registration-token
 and runners-CRUD endpoints (SPEC-0012 §2.8) are NOT landed yet, and the
 org-settings Actions page carries only the secrets+variables arms today —
 no runners arm (`apps/worker/src/ui/pages/org-settings-actions.tsx:11-13`).
 Owner-scoped and global tokens exist at the service layer
-(model.ts:223, 257) but no UI/API surface mints them yet (§4.3).
+(model.ts:228, 262) but no UI/API surface mints them yet (§4.3).
 
 ### 1.4 Dispatch: how a job reaches a runner
 
@@ -117,7 +117,7 @@ Owner-scoped and global tokens exist at the service layer
    task row is created with a fresh salted polling token (dispatch.ts:239-261)
    and the log filename derived from the repo's full name
    (dispatch.ts:284-294). A failed payload assembly releases the claim
-   (dispatch.ts:204-211; model.ts:731).
+   (dispatch.ts:204-211; model.ts:767).
 4. **Payload** — `buildRunnerTask` (dispatch.ts:320-354) hands the runner:
    - `workflow_payload` — the job's stored single-job YAML, **verbatim**
      (the `if: always()` claim-time rewrite is staged for M3's parser —
@@ -126,7 +126,7 @@ Owner-scoped and global tokens exist at the service layer
      refs, sha, event payload, `api_url`, `server_url`, `run_id`,
      `run_number`, … — dispatch.ts:372-474) plus `token` (the task polling
      token) and `gitea_runtime_token` (the HS256 runtime JWT for
-     artifacts/summaries/OIDC — dispatch.ts:457, secrets.ts:236), plus the
+     artifacts/summaries/OIDC — dispatch.ts:457, secrets.ts:401), plus the
      OIDC request pair when the job's stored token permissions grant
      `id-token` (dispatch.ts:462-472);
    - `secrets` — `GITHUB_TOKEN`/`GITEA_TOKEN` always; owner secrets overlaid
@@ -152,8 +152,8 @@ Owner-scoped and global tokens exist at the service layer
   artifacts-v1.ts + artifacts-merge.ts.
 - **Artifacts v4** — the actions-toolkit family: `CreateArtifact` →
   `comp=block` PUTs → `comp=blocklist` → `FinalizeArtifact`; downloads via
-  HMAC-signed URLs (60-minute expiry, verified at artifacts-v4.ts:224,
-  342-343). Body protojson capped at 1 MiB — only the signed URLs carry bulk
+  HMAC-signed URLs (60-minute expiry, verified at artifacts-v4.ts:245,
+  364-365). Body protojson capped at 1 MiB — only the signed URLs carry bulk
   bytes. artifacts-v4.ts.
 - **Job summaries** — `GITHUB_STEP_SUMMARY` markdown PUT per step, 1 MiB
   caps; advertised to runners through the Declare capabilities header
@@ -190,9 +190,9 @@ repos/service.ts:363). Two caveats:
 - **Repos created before the flip are untouched** — creation-time writes
   only. Their `repo_settings` row carries `has_actions = 0` (or no row; the
   missing-row fallback stays the pre-flip posture,
-  `apps/worker/src/api/services/repo-settings.ts:23-35`). Turn those on via
+  `apps/worker/src/api/services/repo-settings.ts:203-218`). Turn those on via
   either path below.
-- The schema column default is still false (`apps/worker/src/db/schema.ts:1323`);
+- The schema column default is still false (`apps/worker/src/db/schema.ts:1388`);
   only the creation writer arms it.
 
 Turn Actions on for an un-armed repo either way:
@@ -200,14 +200,14 @@ Turn Actions on for an un-armed repo either way:
 - **UI**: repo **Settings → Actions → General** → the "Enable Actions"
   toggle → POST `.../settings/actions/general/actions_unit`
   (apps/worker/src/ui/pages/repo-settings-actions-general.tsx header; the
-  route family, apps/worker/src/ui/index.ts:1806-1811). The page
+  route family, apps/worker/src/ui/index.ts:1901-1906). The page
   deliberately renders while the unit is disabled — it is the disabled
   unit's re-entry (upstream web.go:1262-1265's posture).
 - **API**: `PATCH /api/v1/repos/{owner}/{repo}` with `has_actions: true`
-  (`apps/worker/src/api/routes/repo.ts:583`).
+  (`apps/worker/src/api/routes/repo.ts:621`).
 
 Once enabled, the repo grows the **Actions** tab
-(`apps/worker/src/ui/shell.tsx:355`).
+(`apps/worker/src/ui/shell.tsx:581`).
 
 ### 2.2 Mint the registration token
 
@@ -273,7 +273,7 @@ runs jobs directly on the runner machine. act_runner registers the LABEL
 NAMES with the server (the schema part stays in the runner's local config as
 the execution environment). The server then matches a job's `runs-on:`
 values against those registered names EXACTLY — case-insensitive, every
-label must be present, and an empty `runs-on` never matches (model.ts:371-377,
+label must be present, and an empty `runs-on` never matches (model.ts:376-382,
 porting upstream runner.go:202-205). Consequences:
 
 - Register the names your workflows will write in `runs-on:`. If the job's
@@ -308,7 +308,7 @@ GITEA-side settings need nothing beyond the instance URL already baked into
 
 **Today runs are seeded through the service seam — a push does not create
 them yet (§4.1).** The seed is `insertActionRun(d1, run, jobs)`
-(model.ts:493): one run row + its attempt-1 + the job rows, each job
+(model.ts:498): one run row + its attempt-1 + the job rows, each job
 carrying its `runs_on` list and its single-job YAML `workflow_payload`. The
 exact shape the standing tests seed (routes.test.ts:106-168):
 
@@ -324,7 +324,7 @@ jobs:
 seeded as a run on `refs/heads/main`, event `push`, with the job
 `jobId: "build"`, `runsOn: ["ubuntu-latest"]`. `insertActionRun` bumps the
 scope `tasks_version` counters, so any polling runner picks the job up on
-its next poll (dispatch.test.ts:266).
+its next poll (dispatch.test.ts:271).
 
 The runner then experiences: claim (`FetchTask` returns the full Task) →
 steps execute locally → log rows stream via `UpdateLog` (acked, trimmed,
@@ -407,7 +407,7 @@ the zero-install standing E2E.
   arm, sweeps.ts:61, 130); and ephemeral runner rows with no live task are
   deleted (the ephemeral pass, retention.ts:182). The zombie + endless
   producers ride the 10-minute cron entry, the abandoned + ephemeral ones
-  the hourly entry (demo-sweep.ts:336-391) — upstream's own always-on jobs,
+  the hourly entry (demo-sweep.ts:335-397) — upstream's own always-on jobs,
   so no var gates them. Manual cancel from the run viewer still works
   (the run-viewer cancel POST, apps/worker/src/ui/pages/repo-actions-view.tsx).
 
@@ -420,7 +420,7 @@ the zero-install standing E2E.
    no `[skip ci]`, no `workflow_dispatch`, no schedules. `FetchTask` answers
    faithfully — but only when a waiting job EXISTS (dispatch.ts:6-11; SPEC-0012
    §3). Today runs arrive exclusively through the service seam
-   (`insertActionRun`, model.ts:493) — tests, the harness, or a script you
+   (`insertActionRun`, model.ts:498) — tests, the harness, or a script you
    write against a dev instance.
 2. **Staged arms inside the claim payload.** The job's stored YAML is handed
    over verbatim (no server-side `if: always()` rewrite — the server-side
@@ -435,7 +435,7 @@ the zero-install standing E2E.
    CRUD, runs/jobs listing, workflows enable/disable (SPEC-0012 §2.8).
    Token minting is therefore UI-only, repo-scoped, today (§1.3) —
    owner-scoped and global tokens exist at the service layer
-   (model.ts:223, 257) with no minting surface.
+   (model.ts:228, 262) with no minting surface.
 4. **Retention is opt-in, not upstream's always-on.** The
    `ACTIONS_{ARTIFACT,LOG,RUN}_RETENTION_DAYS` vars are read from the
    environment with strict polarity (retentionDaysFromEnv,
