@@ -14,6 +14,13 @@
  * the ustar/zip bytes over the landed streaming builder (repo-name prefix),
  * the `?path=` walk filter, the 400 class (unknown suffix / bundle / bare
  * `/archive`) and the 404 family (empty repo, unresolvable ref, private).
+ * POST arm (4e6d1cc — upstream's InitiateDownload, web.go:1691 +
+ * repo/repo.go:381-390): the fast-path {"complete":true} JSON — signed-in,
+ * anonymous (the group carries AllowBasic/AllowOAuth2, no reqSignIn) and
+ * bare-tail POSTs alike (the StreamArchives branch answers before the name
+ * parses), the sameOriginGuard's cross-origin 403 plain text (the
+ * write-family convention, guard-FIRST), and the ladder's existence-hidden
+ * 404 shells (unknown + private repo).
  * aux JSON — web.go:1740 repo.LoadBranchesAndTags: the ContainedLinks byte
  * shape {branches,tags,default_branch} with {name,web_link} entries, the
  * containment matrix (a commit behind a branch tip vs the tip itself,
@@ -40,10 +47,11 @@ import { settleCreatingRepo } from "../../git-http/gate";
 import { repositories, users } from "../../db/schema";
 import { RepoService } from "../../repos/service";
 import { handlesUiRoute, parseUiRoute, uiRouter } from "../index";
+import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { buildHistoryPack, buildReceivePackBody, type SeedCommit } from "../testing/seed-repo";
 import { T0, uiEnv } from "./harness";
 
-async function fetchUi(path: string, init?: { headers?: Record<string, string> }): Promise<Response> {
+async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
   return uiRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
 }
 
@@ -387,6 +395,119 @@ describe("GET /{owner}/{repo}/archive/{ref}.{tar.gz|zip}", () => {
     await db.update(repositories).set({ visibility: "private" }).where(eq(repositories.id, row.id));
     expect((await fetchUi("/alice/wave32arc/archive/main.zip")).status).toBe(404);
     await db.update(repositories).set({ visibility: "public" }).where(eq(repositories.id, row.id));
+  });
+});
+
+// --- the POST arm (InitiateDownload — 4e6d1cc) ----------------------------------
+
+/** Alice's session cookie, minted once (the harness's aliceSessionCookie
+ * recipe against this file's own fixture owner). */
+let wave32AliceSession: string | null = null;
+async function aliceSession(): Promise<string> {
+  if (wave32AliceSession === null) {
+    const alice =
+      (await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "alice")).get()) ??
+      (() => {
+        throw new Error("wave32 owner row missing before the archive POST session mint");
+      })();
+    wave32AliceSession = await mintSession(env.DB, alice.id);
+  }
+  return wave32AliceSession;
+}
+
+describe("POST /{owner}/{repo}/archive/* (InitiateDownload, 4e6d1cc)", () => {
+  const sameOrigin = { origin: "https://test.local" };
+
+  it("answers the signed-in same-origin POST with the exact fast-path JSON", async () => {
+    const res = await fetchUi("/alice/wave32arc/archive/main.tar.gz", {
+      method: "POST",
+      headers: { ...sameOrigin, cookie: `${SESSION_COOKIE_NAME}=${await aliceSession()}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/json;charset=utf-8");
+    // Upstream's fast path (repo/repo.go:389-391): the StreamArchives branch
+    // answers {"complete":true} BEFORE the archive name parses — our
+    // archives always stream (no async archiver queue), so the branch is
+    // the whole behavior. The bundle's button aborts on non-JSON, so the
+    // byte-exact body IS the contract.
+    expect(await res.text()).toBe('{"complete":true}');
+    // The router's zero-option prod Cache-Control stamp (the same stamp the
+    // aux-JSON family pins — no response escapes it unset).
+    expect(res.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
+    // The bare tail POSTs the same 200 where its GET twin 400s
+    // ("unknown format: ") — the branch precedes SplitArchiveNameType.
+    const bare = await fetchUi("/alice/wave32arc/archive", { method: "POST", headers: sameOrigin });
+    expect(bare.status).toBe(200);
+    expect(await bare.text()).toBe('{"complete":true}');
+  });
+
+  it("403s the cross-origin POST with the guard's plain text, guard-FIRST", async () => {
+    // The write-family convention (session.ts's §2.8 layer 2): the guard
+    // runs before the ladder — a VALID session still takes the 403.
+    const crossOrigin = await fetchUi("/alice/wave32arc/archive/main.tar.gz", {
+      method: "POST",
+      headers: { origin: "https://evil.example", cookie: `${SESSION_COOKIE_NAME}=${await aliceSession()}` },
+    });
+    expect(crossOrigin.status).toBe(403);
+    expect(crossOrigin.headers.get("content-type")).toBe("text/plain;charset=utf-8");
+    expect(crossOrigin.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(await crossOrigin.text()).toBe("cross-origin request rejected\n");
+    // Guard-first: the same cross-origin POST on an UNKNOWN repo still 403s
+    // (the ladder's 404 shell never runs).
+    const unknown = await fetchUi("/alice/nosuchrepo32/archive/main.tar.gz", {
+      method: "POST",
+      headers: { origin: "https://evil.example" },
+    });
+    expect(unknown.status).toBe(403);
+    expect(await unknown.text()).toBe("cross-origin request rejected\n");
+  });
+
+  it("rides the resolveUiRequest ladder: unknown and private repos 404-shell", async () => {
+    // The unknown repo: the ladder's HTML 404 shell (not the JSON arm).
+    const unknown = await fetchUi("/alice/nosuchrepo32/archive/main.tar.gz", { method: "POST", headers: sameOrigin });
+    expect(unknown.status).toBe(404);
+    expect(unknown.headers.get("content-type")).toBe("text/html; charset=UTF-8");
+    // The parse family claims the shape the handler's drift guard requires —
+    // the POST is answered by the same repo-archive claim (the method-
+    // agnostic parse, the method-aware dispatch).
+    expect(parseUiRoute("/alice/nosuchrepo32/archive/main.tar.gz")?.family).toBe("repo-archive");
+    // A private repo stays existence-hidden for the POST (the repo-scoped
+    // read gate — checkDownloadTokenScope's read level rides the ladder).
+    const db = drizzle(env.DB);
+    const row = (
+      await db
+        .select()
+        .from(repositories)
+        .where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "wave32arc")))
+        .get()
+    )!;
+    await db.update(repositories).set({ visibility: "private" }).where(eq(repositories.id, row.id));
+    expect((await fetchUi("/alice/wave32arc/archive/main.tar.gz", { method: "POST", headers: sameOrigin })).status).toBe(404);
+    await db.update(repositories).set({ visibility: "public" }).where(eq(repositories.id, row.id));
+  });
+
+  it("keeps the anonymous POST on the fast path — the archive group has no reqSignIn", async () => {
+    // Upstream's group gates are webAuth.AllowBasic + webAuth.AllowOAuth2
+    // (web.go:1690-1694) — token auth METHODS, not reqSignIn; the tokenless
+    // doer no-ops CheckTokenScopes (permission.go:16-20), so the anonymous
+    // POST takes the same fast path as the GET download family's anon arm.
+    const anon = await fetchUi("/alice/wave32arc/archive/main.tar.gz", { method: "POST", headers: sameOrigin });
+    expect(anon.status).toBe(200);
+    expect(anon.headers.get("content-type")).toBe("application/json;charset=utf-8");
+    expect(await anon.text()).toBe('{"complete":true}');
+  });
+
+  it("404s the never-pushed repo's POST — MustBeNotEmpty 404s BOTH arms (web.go:1694)", async () => {
+    // The pin-gap unit's probe found this arm missing (the POST answered
+    // 200 where the group gate 404s before InitiateDownload); the isEmpty
+    // check landed with this pin.
+    const res = await fetchUi("/alice/wave32empty/archive/main.tar.gz", {
+      method: "POST",
+      headers: { ...sameOrigin, cookie: `${SESSION_COOKIE_NAME}=${await aliceSession()}` },
+    });
+    expect(res.status).toBe(404);
+    expect(res.headers.get("content-type") ?? "").toContain("text/html");
+    expect(await res.text()).toContain("status-page-error");
   });
 });
 

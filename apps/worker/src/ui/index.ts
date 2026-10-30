@@ -11951,14 +11951,19 @@ async function archiveFileDownload(c: Context<{ Bindings: Env }>): Promise<Respo
  *  bundle's pre-flight — our archives stream (no async archiver queue), so
  *  upstream's fast-path answer is the whole behavior: checkDownloadTokenScope's
  *  repo-scoped read gate rides the same resolveUiRequest ladder, then
- *  {"complete":true}. */
+ *  {"complete":true}. The group's MustBeNotEmpty (web.go:1694) 404s BOTH
+ *  arms for a never-pushed repo BEFORE InitiateDownload — the POST arm
+ *  matches (the GET twin already 404s via ref resolution). */
 async function archiveInitiateDownload(c: Context<{ Bindings: Env }>): Promise<Response> {
   const guard = sameOriginGuard(c.req.raw);
   if (guard !== null) return guard;
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
-  const { route, respond } = resolved;
+  const { route, respond, repo } = resolved;
   if (route.family !== "repo-archive") return respond(await c.notFound()); // drift guard
+  // MustBeNotEmpty (web.go:1694): an empty repo 404-shells before the
+  // fast path — the pin-gap unit's probe found this arm missing.
+  if (repo.isEmpty) return respond(c.html(renderNotFound(resolved.ctx), 404));
   return respond(
     new Response(JSON.stringify({ complete: true }), {
       status: 200,
