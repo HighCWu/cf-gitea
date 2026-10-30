@@ -848,6 +848,9 @@ artifacts-family trimming if wire-freeze shows no legacy runners in practice.
    unsupported expressions at insert with a visible error (the SPEC-0005
    visible-error discipline); (b) a full library port; (c) WASM-compile the Go
    evaluator. Decide at M3 dispatch; (a) is the working proposal.
+   **RESOLVED 2026-10-31 — text preserved as written; the decision record and
+   the M3 staging consequence are appended at the tail of this document
+   ("Decision record — Open question 1 resolved").**
 2. **Codec implementation strategy (M1a).** Hand-rolled protobuf
    encode/decode for the ~15 frozen message shapes vs a JS protobuf library
    (@bufbuild/protobuf or protobufjs) as a new dependency. Upstream uses
@@ -1026,3 +1029,192 @@ zero-install smoke — OQ-4's resolution exercised); the operator surface
 pre-flip default-off prose was caught mid-flight and rewritten against
 b0e1d88's creation-defaults flip — the guide's enable instructions reflect
 the flipped posture.
+
+## Decision record — Open question 1 resolved: the server/runner evaluation split (2026-10-31)
+
+**Status: DECISION RECORD. No code is ratified here.** This resolves §8.1 as
+written (text preserved above) and prices the consequences for M3's staging.
+Cite conventions: upstream files are at the pin `fc493688` unless prefixed
+`actionslib:` (the external `gitea.dev/actionslib v1.5.0`, `gitea/go.mod:11`,
+read from the Go module cache copy hash-pinned per §6.1) or `cf-gitea:`.
+Line counts are non-test, non-blank Go lines measured in that same copy.
+
+### D1. The verdict
+
+The board's framing ("upstream evaluates `if:`/concurrency/matrix expressions
+with actionslib's Go `expreval`/`exprparser` — no JS equivalent") was right
+about the dependency and wrong about the size of the question. Upstream's
+server-side evaluation surface is **fixed and enumerable** — four
+value-producing call-site families plus three AST-scan-only uses (§D2) — and
+the environment each call site gets is **pinned by the server itself** to
+github/gitea/needs/strategy/matrix/vars/inputs, with `env`, `job`, `steps`,
+`runner`, and `secrets` deliberately nil (`modules/actions/jobparser/interpeter.go:43,47-50`
+— the comment at `:13` reads "returns an interpeter used in the server, need
+github, needs, strategy, matrix, inputs context only") and `WorkingDir` empty so
+`hashFiles` self-disables server-side (`actionslib:pkg/exprparser/functions.go:477-479`
+—"hashFiles is only available in steps"). Job `if:` is restricted further, to
+`github, gitea, needs, vars, inputs`, by upstream's own static validation
+(`modules/actions/jobparser/validate.go:20,54-59` — "which github.com decides
+before the matrix, so without the matrix and strategy contexts",
+`modules/actions/jobparser/model.go:490`).
+
+The other half of the split: **the runner never evaluates anything job-level.**
+The claim payload rewrites the job `if:` to the literal `always()` — "as Gitea
+has decided it and a runner must not re-evaluate it"
+(`services/actions/task.go:176-186`; cf-gitea's landed dispatch already stores
+payload bytes verbatim with this rewrite staged, `cf-gitea:apps/worker/src/services/actions/dispatch.ts:12,345`).
+All step-level expression work — step `if:`, `${{ }}` interpolation inside
+`run:`/`with:`/`env:`, the `env`/`steps`/`runner` contexts, `hashFiles` —
+belongs to act_runner's own embedded evaluator and never reaches the server.
+This was observed live in our smoke: stock act_runner v0.2.13 logged
+"evaluating expression 'success()'" for a **step** condition
+(`docs/research/act-runner-smoke-2026-10-30.md:137-138`), while the same
+payload's job decision had been made server-side before claim.
+
+And the evaluator itself is **not** nektos/act's full engine: actionslib v1.5.0
+ships gitea's own minimal rewrite — **13 built-in functions** total
+(`case`, `format`, `join`, `contains`, `startsWith`, `endsWith`, `toJSON`,
+`fromJSON`, `hashFiles`, `always`, `cancelled`, `success`, `failure`,
+`actionslib:pkg/exprparser/interpreter.go:1053-1110`). OQ-1's premise "no JS
+equivalent exists" stays true as a statement about drop-in libraries, but the
+port is measured at ~3.7k lines of dependency-light pure Go (§D4) — bounded,
+conformance-testable, and smaller than the SPEC's "largest single port cost"
+framing (§2.9) assumed.
+
+### D2. The server-side evaluation census (complete)
+
+Every non-test caller of `expreval`/`exprparser`/jobparser evaluation in
+upstream at the pin:
+
+| # | Site | What it evaluates | Contexts in the env | When |
+|---|------|-------------------|---------------------|------|
+| 1 | Run-name interpolation — `modules/actions/jobparser/jobparser.go:103-106` | `workflow.run-name` string | github, vars, inputs (nil github in detection's validation pass) | insert (`services/actions/run.go:121-127`) and detection validation (`modules/actions/workflows.go:129-136` via `ValidateWorkflowContent` `:141-144`) |
+| 2 | Static matrix combinations — `jobparser.go:112-126` (`Strategy.resolve`, `MatrixCombinations`, `buildMatrixCombos` `:225`) | combo `name:`/`runs-on:`/`continue-on-error:` `${{ }}` | github, vars, inputs + matrix values | insert, when the matrix reads no needs (`jobparser.go:65-67,112-126`) |
+| 3 | Deferred-matrix placeholder detection — `HasDeferredMatrix` `jobparser.go:18-27` via `expressionReadsNeeds` `:65-67` | none — `expreval.ReadsContext` AST scan | — | parse time |
+| 4 | Run-level concurrency — `EvaluateRunConcurrencyFillModel` (`services/actions/concurrency.go:19-46`) via `EvaluateConcurrency` (`model.go:315-337`) | workflow-level `concurrency.group/cancel` | + strategy, matrix (`newJobEvaluator` `model.go:297-303`) | insert (`services/actions/run.go:101`) |
+| 5 | Job-level concurrency at insert — `EvaluateJobConcurrencyFillModel` (`concurrency.go:46-85`) called from `insertRunJob` (`services/actions/run.go:185,267`) | `jobs.<id>.concurrency.group/cancel` | + strategy, matrix | insert, for a job that can start immediately |
+| 6 | Job-level concurrency at the emitter — `services/actions/job_emitter.go:690` | same | same | each emitter pass when needs finish |
+| 7 | Deferred-matrix expansion — `expandDeferredMatrix` (`services/actions/matrix.go:43-204`, called `job_emitter.go:600`) via `ExpandMatrixWithNeeds` (`jobparser.go:165`) | matrix combos from needs' outputs ("strategy may reference the inputs context as well as needs", `matrix.go:89`) | + needs results, strategy, matrix | emitter pass |
+| 8 | Job `if:` start-gate — `decideJobIf`/`resolveJobIf` (`services/actions/helper.go:133-150,174`) via `EvaluateJobIfExpression` (`model.go:490-497`) | `jobs.<id>.if` truth | github, gitea, needs, vars, inputs ONLY (validate.go:20) — `gitCtx["job"] = ""` (`helper.go:171`) | insert/emitter before a job starts; a false `if:` marks the job `StatusSkipped` (`helper.go:141-143`) |
+| 9 | Static context validation — `unavailableContext` (`validate.go:63-78`; `validateJobConditions` `:54-59`; run-name `:47-50`) via `expreval.Match` (`actionslib:pkg/expreval/subexpr.go:56-65`) | none — AST named-value scan | — | **detection, on every trigger event** (`GetEventsFromContent` → `ValidateWorkflowStatic`, `modules/actions/workflows.go:123-135`); push additionally records each static-invalid workflow as a FAILED RUN with the parse error as its summary (`services/actions/invalid_workflow.go:20-46`, gated on push at `notifier_helper.go:284-286`), surfaced in the run list (`routers/web/repo/actions/actions.go:559-569`) |
+| 10 | Cancel-arm function scan — `expreval.CallsFunction` (`services/actions/cancel.go:86-87`) | none — does the `if:` call `always()` but not `cancelled()` | — | cancel cascade |
+| 11 | Dispatch-input coercion — `exprparser.CoerceToString` (`services/actions/workflow.go:213`) | string coercion of dispatch inputs | — | workflow dispatch |
+| 12 | Workflow-call output evaluation — `EvaluateWorkflowCallOutputs` (`services/actions/context.go:285-290`; `actionslib:pkg/expreval/workflow_call.go`) | caller-side `outputs:` of a reusable callee | github, needs, vars, inputs | **v2-staged** (reusable workflows are out per §1.4) |
+| 13 | Schedule static scan — `ValidateWorkflowStatic` (`services/actions/schedule_tasks.go:148`) | none — same scan as #9 | — | **M3-followup-staged** (§1.4 schedules) |
+
+The full evaluator environment the server can ever populate is therefore:
+`github`/`gitea` (the alias maps gitea→github, `actionslib:pkg/exprparser/interpreter.go:239-240`),
+`needs` (from results), `strategy`+`matrix` (model.go:297-303), `vars`,
+`inputs`. `env`/`job`/`steps`/`runner`/`secrets` are nil server-side forever
+(interpeter.go:43,47-50); the full context registry is
+`actionslib:pkg/exprparser/interpreter.go:238-257`.
+
+### D3. The runner side (for the record)
+
+The Task wire carries `WorkflowPayload` + `Context` + `Secrets` + `Vars` +
+`Needs` (`services/actions/task.go:166-171`) — the runner rebuilds its own
+environment from those plus its local `env`/`steps`/`runner`/`job` state and
+evaluates everything below job level with act_runner's embedded (nektos/act)
+evaluator. cf-gitea ships none of that: our claim payload already carries the
+resolved, `always()`-forced single-job YAML (§2.3), so **the server-side
+expression engine cf-gitea needs is bounded exactly by the census in §D2** —
+nothing runner-side is ported, ever.
+
+### D4. Re-pricing OQ-1's candidates (measured)
+
+actionslib v1.5.0 non-test, non-blank lines (module-cache copy):
+
+| Package | Lines | Server-relevant? |
+|---------|-------|------------------|
+| `pkg/internal/syntax` (lexer/parser/AST/ordinal/utf16) | 1,109 | **yes** — the grammar, and the scan API rides it |
+| `pkg/exprparser` (interpreter/functions/json/object/memory/syntax) | 2,821 | **yes** minus `glob.go` (≈600) |
+| `pkg/exprparser/glob.go` | ≈600 | **no** — `hashFiles`' filesystem matcher; its only non-test caller is `hashFiles` (`functions.go:492`), which the server never reaches (`functions.go:477-479`) |
+| `pkg/expreval` (evaluator/subexpr) | 466 | **yes** minus `workflow_call.go` (≈120, v2-staged per §D2 #12) |
+| `pkg/model` (workflow model) | 2,204 | yes — but this is the separately-recorded "YAML model port" M3 row, not the evaluator |
+| in-tree `modules/actions/jobparser` (non-test) | 1,238 | yes — same, part of the model/parser port |
+
+- **(b) full library port = ≈3.7k lines** of evaluator proper (1,109 + 2,224 +
+  ≈346), no new JS deps (the only Go dep behind the dropped `glob.go` is
+  doublestar, `gitea/go.mod:135` indirect). Conformance test data rides the
+  module (`actionslib:pkg/exprparser/testdata/`, `pkg/model/testdata/`) — §6.4's
+  differential plan absorbs it directly.
+- **(a) hand-ported subset is REFUTED as a parity option.** Upstream restricts
+  only CONTEXTS (validate.go:20,54-59), never grammar: a grammar subset would
+  reject at insert expressions upstream accepts (a static-parse failure in
+  `Parse` aborts `InsertRun` — "parse workflow: %w",
+  `services/actions/run.go:121-123` — and no run is created,
+  `notifier_helper.go:363-365`), a user-visible production divergence. Its
+  other reading — "the contexts the server actually needs" — is vacuous: the
+  server's context set is already minimal (§D2). Option (a) survives only as a
+  documented-divergence staging posture (§D5), never as the M3 design.
+- **(c) WASM** stays the escape hatch if the port overruns; not needed at this
+  size.
+
+**RESOLVED: OQ-1 closes as (b)-shaped** — port the evaluator core wholesale,
+dropping `glob.go` (server-unavailable `hashFiles`) and `workflow_call.go`
+(v2), with the environment table exactly as §D2 pins it. The §8.1 working
+proposal "(a)" is retired by the evidence above, not by preference.
+
+### D5. The M3 staging consequence (the decomposition the board carries)
+
+Upstream's failure posture is now evidenced and it is **late, not insert-time**:
+evaluation failures fail the JOB with a persisted `action_run_job_summary` row
+("Error when evaluating `if` for job X", `helper.go:181-184`; the same for
+`runs-on` `job_emitter.go:628` and `concurrency` `:637`) or terminal-fail it
+(`matrix.go:52-71`); only static parse errors reject the whole run at insert
+(run.go:121-123). Any staged subset must reproduce this posture, not invent an
+insert-time rejection.
+
+M3's content decomposes into three evaluator-independence tiers:
+
+- **P — pure parity rows (no expression machinery at all):** the notifier
+  census (35 hooks, cycle break, repo skips — `services/actions/notifier.go:41-784`,
+  `notifier_helper.go:139-172`), `skipWorkflows` `[skip ci]` string scan
+  (`notifier_helper.go:298-`; strings `modules/setting/actions.go:51`),
+  workflow enumeration + the 1 MiB cap (`workflows.go:75-121`) + event
+  extraction + the `workflowpattern` matchers (a glob package, expression-free —
+  `workflows.go:390-465`), `InsertRun` mechanics + run numbering
+  (`run.go:63-160`), the job emitter's needs-graph/slots/max-parallel/
+  group-comparison (`job_emitter.go`, `services/actions/max_parallel.go`),
+  commit statuses + the skipped-status arm (`services/actions/commit_status.go`),
+  the claim-payload `if: always()` rewrite (task.go:176-186), harness wiring.
+  This is the **majority of M3's listed content**, and it produces runs
+  end-to-end for expression-free workflows — the plain push-CI case.
+- **S — syntax-layer rows (the parser, no value evaluation):** detection-time
+  static validation + the push invalid-workflow failed-run arm (§D2 #9 —
+  `workflows.go:129-135`; `invalid_workflow.go:20-46`), deferred-placeholder
+  detection (§D2 #3), the cancel scan (§D2 #10). These need
+  `internal/syntax` (1,109 lines) + `expreval/subexpr.go`, not the interpreter.
+- **E — evaluator rows (the interpreter core):** (E1) the core port
+  (interpreter/functions/json/object/memory/syntax + the `expreval` evaluator,
+  ≈2.6k lines) + conformance suite; (E2) run-name + static-matrix combos at
+  insert (§D2 #1-2); (E3) the job `if:` gate + invalid-`if:` job summaries
+  (§D2 #8); (E4) concurrency run+job (§D2 #4-6); (E5) deferred-matrix expansion
+  (§D2 #7).
+
+The honest staging limit, and why it is a limit rather than a stopping point:
+without E, `Parse` cannot evaluate expression-ful run-names/matrices, so such
+workflows insert no runs at all (run.go:121-123) — upstream inserts them.
+Upstream itself gates "expression-ful" with a literal `${{` byte scan
+(`workflows.go:134`), which is the same gate a P+S-only staging would lean on
+to state its coverage ("workflows without `${{` run; others wait for E").
+Dispatch may therefore split M3 into a P+S unit (covering expression-free
+workflows, with the expression-ful gap documented per the SPEC-0005
+visible-error discipline) and an E unit closing it; whether one L wave or two
+is a dispatch call, not a design one. The §7 M3 row's **L** sizing holds; its
+risk note changes from "port-fidelity risk" to "fidelity is
+conformance-testable against actionslib's own testdata" (§D4).
+
+### D6. Downstream notes this record corrects or arms
+
+- The board row P1-1's "OQ-1 sits in front of all of it" softens to "OQ-1's
+  evaluator rows sit in front of the E tier only" — the P and S tiers are
+  dispatchable without any §8.1 residue.
+- P1-13's scoped-workflows staged arms (the parser's YAML half,
+  `GetEventsFromContent`/`deriveScopedStatusContexts`) ride the **S tier**
+  (`GetEventsFromContent` is cited in §D2 #9), not the E tier.
+- The claim-payload rewrite (task.go:176-186) is a **P-tier row** — it needs
+  the YAML model to re-serialize a stored payload (cf-gitea dispatch.ts:345
+  already notes this), not the evaluator.
+- The `[skip ci]` arm, cycle break, and commit statuses are **P-tier** with
+  zero expression dependencies — no OQ-1 residue attaches to them.

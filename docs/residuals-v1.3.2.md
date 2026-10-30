@@ -125,7 +125,44 @@ board rows now.
    LANDED in v1.3.1, shrinking this item's sweep scope to zero — but the
    **notify/commit-status tails and the reusable-caller cascade** are
    explicitly staged to M3 (no v1 row carries parent_job_id>0), so the
-   SPEC's M3 table gains them as named rows. Size: **L**.
+   SPEC's M3 table gains them as named rows. **OQ-1 RESOLVED 2026-10-31**
+   (the decision-record addendum at the tail of
+   `specs/0012-actions-feasibility.md`, §D1-D6 — a DECISION RECORD, no code
+   ratified): upstream's server-side evaluation surface is fixed and
+   enumerable — four value-producing call-site families (run-name
+   interpolation, static-matrix combos, job `if:`, run+job concurrency) plus
+   three AST-scan-only uses (static context validation, deferred-matrix
+   detection, the cancel-arm function scan), all over a context set the
+   server itself pins to github/gitea/needs/strategy/matrix/vars/inputs
+   (`env`/`job`/`steps`/`runner`/`secrets` nil server-side, `hashFiles`
+   self-disabled; job `if:` further restricted to
+   github/gitea/needs/vars/inputs by upstream's own static validation) — and
+   the runner evaluates NOTHING job-level (the claim payload rewrites job
+   `if:` to literal `always()`, `services/actions/task.go:176-186`;
+   act_runner's step-level evaluator observed live in our smoke,
+   `docs/research/act-runner-smoke-2026-10-30.md:137-138`). The evaluator is
+   actionslib's own minimal rewrite (13 built-in functions, NOT nektos/act's
+   engine), measured at ~3.7k server-relevant non-test Go lines with
+   `glob.go`+`workflow_call.go` droppable — the verdict closes OQ-1
+   (b)-shaped (port the evaluator core wholesale; option (a)'s
+   grammar-subset reading is REFUTED — upstream restricts only contexts,
+   never grammar, and a static-parse failure already rejects the whole run
+   at insert, `run.go:121-123`). **M3 consequence: the row decomposes into
+   tiers, and only one waits on the evaluator** — P (pure parity: notifier
+   census, `[skip ci]`, workflow detection + the expression-free
+   `workflowpattern` matchers, InsertRun mechanics, the emitter's
+   needs-graph/slots, commit statuses, the claim-payload rewrite —
+   dispatchable NOW, produces runs end-to-end for expression-free
+   workflows), S (syntax-layer only: detection-time static validation + the
+   push invalid-workflow failed-run arm — needs the 1.1k-line parser, not
+   the interpreter), E (the evaluator core ≈2.6k lines + its four call-site
+   rows, conformance-tested against actionslib's own testdata). The "no
+   automatic producer" honest limit narrows accordingly: a P+S unit arms the
+   full trigger chain for workflows without `${{` (upstream's own
+   `${{`-byte-scan classification at `workflows.go:134` is the coverage
+   gate), with the expression-ful gap documented until E lands. Size:
+   **L** (one wave, or split into P+S + E dispatch units — a dispatch call,
+   per §D5).
 
 2. **C5's run-mutation remainder: rerun + rerun-failed — LANDED
    (`613aa31`), including the v1.3.1 artifact-inheritance addition.** The
@@ -838,8 +875,11 @@ board rows now.
 ## How to consume this board
 
 - Items 1–3 and 7 of P1 are SPEC-0012 work with a stated dependency order:
-  OQ-1 decides at M3's opening (its own recorded rule), C5 and C10 land
-  behind the emitter/substrate M3 provides. Item 4 (auths) and items 5–6
+  OQ-1 is RESOLVED (2026-10-31 — the decision-record addendum at the tail of
+  `specs/0012-actions-feasibility.md`; see the P1-1 row's amendment for the
+  P/S/E tier decomposition), so M3's P+S tiers are dispatchable without any
+  open question in front of them, and C5 and C10 land behind the
+  emitter/substrate M3 provides. Item 4 (auths) and items 5–6
   (M6/M7) each open with their own SPEC-attachment per the recorded
   rules — none is dispatchable as a bare UI/store unit.
 - The v1.3.1 additions (P2-5 through P2-10, P3-7 through P3-13) and the
