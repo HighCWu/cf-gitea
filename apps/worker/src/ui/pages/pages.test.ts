@@ -187,12 +187,18 @@ describe("home page (repo browse)", () => {
     expect(html).toContain('<a class="muted" href="#readme">README.md</a>');
   });
 
-  it("renders the branch selector with the repo's branches", async () => {
+  it("renders the branch selector island armed with the repo link", async () => {
     await ensureSeededRepo({ owner: "alice", slug: "pages", commits: PAGES_COMMITS });
     const html = await (await fetchUi("/alice/pages")).text();
-    expect(html).toContain('<div class="ui dropdown">');
-    expect(html).toContain('<span class="text">main</span>');
-    expect(html).toContain('<a class="active item" href="/alice/pages/src/branch/main">main</a>');
+    // The upstream Vue island (branch_dropdown.tmpl): the container carries
+    // initRepoBranchTagSelector + the current-ref pair; the menu itself is
+    // the client-DOM render (fed by /branches/list + /tags/list), so no
+    // server-rendered items exist.
+    expect(html).toContain('data-global-init="initRepoBranchTagSelector"');
+    expect(html).toContain('data-current-repo-link="/alice/pages"');
+    expect(html).toContain('data-current-ref-type="branch" data-current-ref-short-name="main"');
+    expect(html).toContain('<strong class="tw-inline-block gt-ellipsis">main</strong>');
+    expect(html).not.toContain('<a class="active item" href="/alice/pages/src/branch/main">main</a>');
   });
 
   it("renders the §4.1 empty-repo page for an unborn repo (the anonymous message arm, no file list)", async () => {

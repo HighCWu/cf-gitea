@@ -130,10 +130,21 @@
  * 5. otherwise `pullMergeBoxFragmentResponse(pullMergeBoxFragmentHtml(data))`
  * (content-type + the zero-option prod Cache-Control, the fragment twin's
  * Response shape). No layout, no window.config — the fragment mounts inside
- * the conversation page's timeline; the `pulls/{index}` conversation route
- * still renders its own reduced summary box beside the fragment (the
- * bundle fetches `merge_box` around the page — issue-detail.tsx's
- * documented degradation).
+ * the conversation page's timeline.
+ *
+ * ## The SECOND mount — the conversation page's inline box (webui-parity
+ * top-drift 5 retired)
+ *
+ * Upstream's conversation page renders the SAME template server-side in the
+ * timeline (view_content.tmpl:67-72, after `timeline-comments-end`, before
+ * the comment form, gated `IsPull && !Repository.IsArchived`); the fragment
+ * route exists so the bundle's `initRepoPullMergeBox` reload loop can
+ * refetch the card while checks run. The conversation page
+ * (pages/issue-detail.tsx) now renders `PullMergeBoxFragment` INLINE from
+ * its loader's `loadPullMergeBoxData` call — the archived gate lives there
+ * (the loader itself stays repo-shape-only, exactly like the route arm).
+ * One builder, two mounts: the fragment Response and the page markup are
+ * byte-identical by construction.
  */
 
 import { renderToString } from "hono/jsx/dom/server";
@@ -965,13 +976,17 @@ function StatusItemIcon(props: { state: CommitStatusState }) {
 }
 
 /**
- * The tplPullMergeBox fragment's bytes — the `.timeline-item.comment
- * .pull-merge-box` card, no layout. `null` renders the template's
- * ShowMergeBox=false arm: the EMPTY string (the reload loop's stop signal).
+ * The tplPullMergeBox fragment's DOM as a JSX component — the SECOND mount
+ * of this module: the conversation page (pages/issue-detail.tsx) renders it
+ * INLINE in its timeline (upstream view_content.tmpl:67-72 renders the
+ * template server-side beside the fragment route, which only exists so the
+ * bundle's reload loop can refetch). Byte-identical with
+ * pullMergeBoxFragmentHtml's output by construction — the html builder wraps
+ * this component in renderToString.
  */
-export function pullMergeBoxFragmentHtml(data: PullMergeBoxData | null): string {
-  if (data === null) return "";
-  return renderToString(
+export function PullMergeBoxFragment(props: { data: PullMergeBoxData }) {
+  const data = props.data;
+  return (
     <div
       class="timeline-item comment pull-merge-box"
       data-global-init="initRepoPullMergeBox"
@@ -1094,8 +1109,18 @@ export function pullMergeBoxFragmentHtml(data: PullMergeBoxData | null): string 
           </div>
         </div>
       </div>
-    </div>,
+    </div>
   );
+}
+
+/**
+ * The tplPullMergeBox fragment's bytes — the `.timeline-item.comment
+ * .pull-merge-box` card, no layout. `null` renders the template's
+ * ShowMergeBox=false arm: the EMPTY string (the reload loop's stop signal).
+ */
+export function pullMergeBoxFragmentHtml(data: PullMergeBoxData | null): string {
+  if (data === null) return "";
+  return renderToString(<PullMergeBoxFragment data={data} />);
 }
 
 /**

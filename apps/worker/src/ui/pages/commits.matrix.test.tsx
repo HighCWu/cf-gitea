@@ -321,8 +321,13 @@ describe("the ref-suffix resolution arms", () => {
     expect(html).toContain('id="commits-table"');
     expect(bodyRows(html)).toBe(2); // v1 = tips[1]: the second + the root
     expect(html.indexOf("log second app")).toBeLessThan(html.indexOf("log root readme")); // newest first
-    expect(html).toContain('<a class="active item" href="/cmgal/log/commits/tag/v1">v1</a>');
-    expect(html).toContain('<a class="item" href="/cmgal/log/commits/branch/main">main</a>'); // the switch items stay in-family
+    // The selector is the upstream Vue island (branch_dropdown.tmpl): the
+    // active ref rides the data-current-* pair, the /commits family link
+    // template is commits.tmpl:16 verbatim, and the menu itself is the
+    // island's client-DOM render (no server-rendered items).
+    expect(html).toContain('data-current-ref-type="tag" data-current-ref-short-name="v1"');
+    expect(html).toContain('data-ref-link-template="{RepoLink}/commits/{RefType}/{RefShortName}/{TreePath}"');
+    expect(html).not.toContain('<a class="item" href="/cmgal/log/commits/branch/main">');
   });
 
   it("a full-sha tail renders that point's history with the sha as the selector's label", async () => {
@@ -331,12 +336,11 @@ describe("the ref-suffix resolution arms", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(bodyRows(html)).toBe(2);
-    // The dropdown's label is the sha; the menu holds only branch/tag items,
-    // so NO item is active for a commit-typed ref (BranchSelector's isActive
-    // can never match) — the sha appears only in the label span.
-    expect(html).toContain(`<span class="text">${sha}</span>`);
-    expect(html).toContain('<a class="item" href="/cmgal/log/commits/branch/main">main</a>');
-    expect(html).not.toContain(`<a class="active item" href="/cmgal/log/commits/commit/${sha}">`);
+    // The dropdown's label is the sha — the dummy button's strong span —
+    // and the island's ref type is "commit" (the octicon-git-commit arm).
+    expect(html).toContain(`<strong class="tw-inline-block gt-ellipsis">${sha}</strong>`);
+    expect(html).toContain('data-current-ref-type="commit"');
+    expect(html).not.toContain('data-current-ref-short-name="main"');
   });
 
   it("a slash-bearing branch resolves as one ref (no shorter prefix exists)", async () => {
@@ -344,7 +348,7 @@ describe("the ref-suffix resolution arms", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(bodyRows(html)).toBe(2); // devbox/next = tips[1]
-    expect(html).toContain('<a class="active item" href="/cmgal/log/commits/branch/devbox/next">devbox/next</a>');
+    expect(html).toContain('data-current-ref-short-name="devbox/next"');
   });
 
   it("the shortest cumulative prefix wins the walk (upstream getRefNameFromPath): feat beats feat/one", async () => {
@@ -355,11 +359,11 @@ describe("the ref-suffix resolution arms", () => {
     // treePath acts as the path filter and names no file: zero rows, not a
     // 404 (upstream's RefCommits renders the empty filtered log).
     expect(bodyRows(html)).toBe(0);
-    expect(html).toContain('<span class="text">feat</span>');
-    // The resolved ref is `feat`, but every selector item carries the
-    // treePath — the active item's href re-emits the original URL shape.
-    expect(html).toContain('<a class="active item" href="/cmgal/log/commits/branch/feat/one">feat</a>');
-    expect(html).toContain('<a class="item" href="/cmgal/log/commits/branch/main/one">main</a>');
+    expect(html).toContain('<strong class="tw-inline-block gt-ellipsis">feat</strong>');
+    // The resolved ref is `feat` and the treePath rides its own island attr
+    // — the client substitutes it into the link template's {TreePath} slot.
+    expect(html).toContain('data-current-ref-short-name="feat"');
+    expect(html).toContain('data-current-tree-path="one"');
   });
 
   it("the treePath tail filters the file history (the /src History link's target shape)", async () => {
@@ -376,7 +380,7 @@ describe("the ref-suffix resolution arms", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(bodyRows(html)).toBe(3);
-    expect(html).toContain('<a class="active item" href="/cmgal/log/commits/branch/main">main</a>');
+    expect(html).toContain('data-current-ref-type="branch" data-current-ref-short-name="main"');
   });
 
   it("branch/HEAD swaps in the default branch (upstream repo.go:875-881)", async () => {
@@ -384,8 +388,8 @@ describe("the ref-suffix resolution arms", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(bodyRows(html)).toBe(3);
-    expect(html).toContain('<span class="text">main</span>'); // HEAD resolved to main
-    expect(html).not.toContain('<span class="text">HEAD</span>');
+    expect(html).toContain('<strong class="tw-inline-block gt-ellipsis">main</strong>'); // HEAD resolved to main
+    expect(html).not.toContain('data-current-ref-short-name="HEAD"');
   });
 
   it("404-shells the remaining bad refs: an unknown tag, the prefix-less tail, a non-hex commit tail", async () => {
@@ -636,7 +640,7 @@ describe("the upstream search/follow-rename/sign-badge chrome never renders (w12
     const html = await res.text();
     expect(html).toContain('id="commits-table"');
     expect(bodyRows(html)).toBe(0);
-    expect(html).toContain('<span class="text">main</span>'); // resolved ref main
+    expect(html).toContain('data-current-ref-short-name="main"'); // resolved ref main
     expect(parseUiRoute("/cmgal/log/commits/branch/main/search")).toEqual({
       family: "commits",
       owner: "cmgal",

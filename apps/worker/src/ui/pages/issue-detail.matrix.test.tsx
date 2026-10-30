@@ -828,7 +828,11 @@ describe("the state machine through the detail route", () => {
     expect(html).toContain('<div class="ui grey label issue-state-label">');
     expect(html).toContain('class="svg octicon-git-pull-request-draft"');
     expect(html).toContain(" Draft</div>");
-    expect(html).toContain("This pull request cannot be merged because it is marked as being a work in progress.");
+    // The merge box's WIP item — the full upstream card's
+    // "repo.pulls.cannot_merge_work_in_progress" line (the wave-3 reduced
+    // box's "no_merge_wip" sentence is retired with the webui-parity
+    // top-drift 5 mount).
+    expect(html).toContain("This pull request is marked as a work in progress.");
   });
 
   it("the MERGED PR renders the merger meta line and the merge EVENT line with the purple badge and the short sha (wave 5 pinned the purple badge alone)", async () => {

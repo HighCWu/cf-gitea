@@ -19,7 +19,9 @@
  * holding the root issue comment (`#issue-{id}`), the timeline
  * (`.timeline-item.comment` cards for user comments,
  * `.timeline-item.event` lines with `.badge` state dots for close/reopen/
- * merge, the reduced `.pull-merge-box` for open PRs, and — wave 5 — the
+ * merge, the full `.pull-merge-box` card for non-archived unmerged PRs —
+ * pages/pull-merge-box.tsx's fragment rendered INLINE, the webui-parity
+ * top-drift 5 mount — and — wave 5 — the
  * signed-in comment form `.timeline-item.comment.form` with the
  * `#status-button` close/reopen toggle) — and
  * `.issue-content-right.ui.segment` (the reduced sidebar: labels + milestone,
@@ -37,19 +39,25 @@
  * Direct service reads (§3.2, never a self-fetch): `findIssueByRepoAndIndex`
  * + `issueLabelRows` + `listIssueTimeline` + `hasWorkInProgressPrefix`
  * (src/api/services/issues.ts), `findPullRequestByIndex`
- * (src/api/services/pulls.ts), `mergeableOfRow` (src/api/services/
- * pull-engine.ts — the cached D1 state machine, the same cheap render the
- * list converter uses; the lazy engine check stays API-side), plus one
- * markdown-pipeline call per body and two batched D1 lookups (milestone,
+ * (src/api/services/pulls.ts), and — PRs — the merge box projection
+ * `loadPullMergeBoxData` (pages/pull-merge-box.tsx — the same state the
+ * mounted fragment route serves, upstream's prepareMergeBox family), plus
+ * one markdown-pipeline call per body and two batched D1 lookups (milestone,
  * person names). Anonymous, public repos only — the router resolved the row
  * before this loader runs (§2.5).
  *
  * ## Documented v1 degradations (data that has no landed source, §6 method)
  *
- * - The PR merge box renders the cached mergeability summary only (the
- *   upstream merge FORM is a write action, §2.5, and its Vue island needs the
- *   pageData payload — neither lands this wave). Mergeability comes from
- *   `mergeableOfRow` (checking → the "being computed" note) — no engine call.
+ * - The PR merge box is the FULL upstream card (pages/pull-merge-box.tsx's
+ *   fragment rendered inline — the info items, the status-check section, the
+ *   command-line instructions and the bundle's `initRepoPullMergeBox`
+ *   reload hook), replacing the wave-3 one-line mergeability summary. What
+ *   stays unrendered is the fragment's own documented reduction set: the
+ *   merge FORM + update-branch + delete-branch + WIP-toggle are write
+ *   actions or pageData islands with no landed web route (the module
+ *   header's list, verbatim). Merged PRs render no box (the loader nulls
+ *   them — upstream's ShowMergeBox=false arm with the delete button dead);
+ *   closed-unmerged PRs render the ClosedInfo pair upstream renders.
  * - Timeline coverage: user comments (type 0) and the lifecycle events the
  *   landed write paths produce — close (2), reopen (1), merge (28). The
  *   remaining system-event types (labels/milestones/title/xrefs/…) are
@@ -151,13 +159,13 @@ import {
   listIssueTimeline,
 } from "../../api/services/issues";
 import { collaboratorModeOf } from "../../api/services/repo-collaborators";
-import { mergeableOfRow } from "../../api/services/pull-engine";
 import { findPullRequestByIndex } from "../../api/services/pulls";
 import { milestones, users } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import { IssuesService } from "../../issues/service";
 import { IssueAlreadyChangedError, IssueError } from "../../issues/errors";
 import type { CommentRow, IssueRow, LabelRow, MilestoneRow, PullRequestRow } from "../../issues/service";
+import { loadPullMergeBoxData, PullMergeBoxFragment, type PullMergeBoxData } from "./pull-merge-box";
 import { TimeSince } from "../components/file-list";
 import { userLink } from "../links";
 import {
@@ -193,14 +201,6 @@ export const issueDetailLocale = {
   closed_pull: "closed this pull request", // "repo.pulls.closed_at" verb
   merged_commit: "merged commit", // "repo.issues.comment_pull_merged_at" fragment
   merged_into: "into", // "repo.issues.comment_pull_merged_at" fragment
-  // Merge-box summary lines: the first three cite upstream's own strings
-  // ("repo.pulls.no_merge_wip" and the merge-form Vue component's two
-  // sentences); the checking note is a cf-gitea addition for the state the
-  // upstream box renders as a loading placeholder.
-  merge_box_wip: "This pull request cannot be merged because it is marked as being a work in progress.",
-  merge_box_mergeable: "This branch has no conflicts with the base branch.",
-  merge_box_conflict: "This branch has conflicts that must be resolved.",
-  merge_box_checking: "Pull request mergeability is being computed.",
   // Wave-5 write chrome — the upstream locale strings verbatim.
   create_comment: "Comment", // "repo.issues.create_comment"
   close_issue: "Close Issue", // "repo.issues.close"
@@ -241,8 +241,10 @@ export interface IssueDetailData {
   issue: IssueRow;
   /** The `pull_requests` extension row — PRs only (§3.2). */
   pr: PullRequestRow | null;
-  /** Cached mergeability (PRs only): null = checking, per mergeableOfRow. */
-  mergeable: boolean | null;
+  /** The merge box projection (PRs only — `loadPullMergeBoxData`):
+   *  `null` = nothing renders (non-PR rows, archived repos, merged PRs —
+   *  upstream's ShowMergeBox=false arm). */
+  mergeBox: PullMergeBoxData | null;
   labels: LabelRow[];
   milestone: MilestoneRow | null;
   /** Display-cased poster username; `null` = no user row (mirrored imports). */
@@ -303,8 +305,16 @@ export async function loadIssueDetailData(
   if (issue === null) return null;
 
   const pr = issue.isPull ? ((await findPullRequestByIndex(d1, repo.id, index))?.pullRequest ?? null) : null;
-  const mergeable = pr === null ? null : mergeableOfRow(pr);
   const reviews = pr === null ? [] : await loadPullReviewEntries(d1, issue.id, viewer);
+  // The upstream conversation page computes the merge box server-side on
+  // every view (prepareMergeBox, issue_view.go:413); the archived gate is
+  // view_content.tmpl:67's `not $.Repository.IsArchived` — the fragment
+  // loader itself stays repo-shape-only (the route arm carries no archive
+  // refusal either).
+  const mergeBox =
+    issue.isPull && pr !== null && !repo.isArchived
+      ? await loadPullMergeBoxData(d1, { repo, issue, pr, viewer, origin })
+      : null;
 
   const [labels, timelineRows, milestoneRow] = await Promise.all([
     issueLabelRows(d1, issue.id),
@@ -360,7 +370,7 @@ export async function loadIssueDetailData(
     urlKind,
     issue,
     pr,
-    mergeable,
+    mergeBox,
     reviews,
     labels,
     milestone: milestoneRow,
@@ -880,37 +890,6 @@ function TimelineEvent(props: { data: IssueDetailData; entry: Extract<TimelineEn
   );
 }
 
-/** The reduced merge box (`pull_merge_box.tmpl` shape, summary-only): open
- *  PRs get the cached-mergeability line; the merge FORM is a write action
- *  and its Vue island needs pageData — neither lands this wave. */
-function PullMergeBox(props: { data: IssueDetailData }) {
-  const { issue, pr, mergeable } = props.data;
-  if (pr === null) return null;
-  const text = hasWorkInProgressPrefix(issue.title)
-    ? issueDetailLocale.merge_box_wip
-    : mergeable === true
-      ? issueDetailLocale.merge_box_mergeable
-      : mergeable === false
-        ? issueDetailLocale.merge_box_conflict
-        : issueDetailLocale.merge_box_checking;
-  return (
-    <div class="timeline-item comment pull-merge-box">
-      <div class="timeline-avatar">
-        <Icon name="octicon-git-merge" size={40} />
-      </div>
-      <div class="content">
-        <div class="ui segment fitted avatar-content-left-arrow">
-          <div class="merge-section flex-divided-list items-px-default">
-            <div class="item flex-left-right">
-              <div class="flex-text-block">{text}</div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 /** The reduced sidebar (`view_content/sidebar.tmpl`): PRs lead with the
  *  wave-11 Reviewers section (sidebar.tmpl:5-9 mounts reviewer_list first
  *  for is_pull rows), then the labels list (badges linking into the live
@@ -1164,7 +1143,6 @@ export function IssueDetailPage(props: {
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("IssueDetailPage requires ctx.repo");
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
-  const showMergeBox = data.pr !== null && !data.issue.isClosed && !data.pr.hasMerged;
   // The comment block renders for EVERY viewer kind — its own arms carry
   // the archived/locked/anonymous refusals (view_content.tmpl's ladder);
   // gating the whole block here made those arms unreachable dead UI (the
@@ -1198,7 +1176,7 @@ export function IssueDetailPage(props: {
                 ),
               )}
               <div class="timeline-item tw-hidden" id="timeline-comments-end" />
-              {showMergeBox ? <PullMergeBox data={data} /> : null}
+              {data.mergeBox !== null ? <PullMergeBoxFragment data={data.mergeBox} /> : null}
               {showForm ? (
                 <CommentFormBlock ctx={ctx} repoLink={repoLink} data={data} access={props.access} form={props.form} />
               ) : null}

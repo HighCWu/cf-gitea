@@ -287,7 +287,7 @@ describe("pull request detail (/pulls/{index})", () => {
     await ensureWave3Issues();
   });
 
-  it("renders the open PR: state label with the PR glyph, branch-pair desc, cached mergeability box", async () => {
+  it("renders the open PR: state label with the PR glyph, branch-pair desc, the upstream merge box", async () => {
     const res = await fetchUi("/alice/wave3/pulls/3");
     expect(res.status).toBe(200);
     const html = await res.text();
@@ -299,10 +299,22 @@ describe("pull request detail (/pulls/{index})", () => {
     // wants-to-merge with <code> branch names
     // (unlinked, no commit count — engine reads, issue-detail.tsx header).
     expect(html).toContain('<span id="pull-desc-display" class="pull-desc"><a class="tw-font-semibold" href="/alice">alice</a> wants to merge <code>feature-wave3</code> into <code>main</code></span>');
-    // The reduced merge box with the checking note (cached row state).
-    expect(html).toContain('class="timeline-item comment pull-merge-box"');
-    expect(html).toContain("Pull request mergeability is being computed.");
-    expect(html).toContain('class="timeline-avatar"');
+    // The FULL upstream merge box (pages/pull-merge-box.tsx's fragment
+    // rendered INLINE — the webui-parity top-drift 5 mount): the bundle's
+    // initRepoPullMergeBox hook + the checking poller attrs ride the root
+    // card; the checking state renders the is_checking line
+    // ("repo.pulls.is_checking") with the running glyph, and the commit
+    // blockers section wins over the protection section (the template's
+    // first-non-empty-collection rule, pull_merge_box.go:185-190).
+    expect(html).toContain('<div class="timeline-item comment pull-merge-box" data-global-init="initRepoPullMergeBox" data-pull-merge-box-reloading-interval="5000" data-pull-link="/alice/wave3/pulls/3">');
+    expect(html).toContain('class="timeline-avatar tw-text-yellow"');
+    expect(html).toContain('class="svg gitea-running rotate-clockwise"');
+    expect(html).toContain("Checking for merge conflicts…");
+    // The command-line instructions (head repo row present): upstream's
+    // Checkout h3 + the fetch/checkout pair.
+    expect(html).toContain('<h3 class="tw-m-0">Checkout</h3>');
+    expect(html).toContain("<div>git fetch -u origin feature-wave3:feature-wave3</div>");
+    expect(html).toContain("<div>git checkout feature-wave3</div>");
     expect(html).toContain('class="svg octicon-git-merge"');
     // The pulls tab is active.
     expect(html).toContain('<a class="active item" href="/alice/wave3/pulls" data-shortcut-keys="g p">');
@@ -319,15 +331,22 @@ describe("pull request detail (/pulls/{index})", () => {
     expect(html).toContain('<a class="item" href="/alice/wave3/pulls/3/files">Files Changed<span class="ui small label">-</span></a>');
   });
 
-  it("renders the closed PR: closed state with the closed-PR glyph and no merge box", async () => {
+  it("renders the closed PR: closed state with the closed-PR glyph and the merge box's ClosedInfo arm", async () => {
     const html = await (await fetchUi("/alice/wave3/pulls/4")).text();
     expect(html).toContain('<div class="ui red label issue-state-label">');
     expect(html).toContain('class="svg octicon-git-pull-request-closed"');
     expect(html).toContain(" Closed</div>");
     // The close EVENT line uses the pull verb…
     expect(html).toContain('closed this pull request <a id="event-4" href="#event-4"');
-    // …and the merge box is a live-PR-only section.
-    expect(html).not.toContain("pull-merge-box");
+    // …and the merge box STAYS (the webui-parity top-drift 5 fix: upstream
+    // pull_merge_box.tmpl:20-32 renders the closed state's ClosedInfo pair
+    // — "repo.pulls.closed" + "repo.pulls.reopen_to_merge" — in the
+    // neutral-grey arm; no blockers, no status section, no commands).
+    expect(html).toContain('<div class="timeline-item comment pull-merge-box" data-global-init="initRepoPullMergeBox"');
+    expect(html).toContain('<div class="timeline-avatar tw-text-text-light">');
+    expect(html).toContain('<h3 class="tw-mb-2">Pull request closed</h3>');
+    expect(html).toContain("Please reopen this pull request to perform a merge.");
+    expect(html).not.toContain("Checking for merge conflicts…");
   });
 
   it("303s the upstream type/URL match in both directions (issue_view.go:347-352)", async () => {
@@ -393,7 +412,16 @@ describe("wave-3 a11y smoke", () => {
 
   it("the live issue and PR pages pass the structural rules", async () => {
     for (const path of ["/alice/wave3/issues/1", "/alice/wave3/pulls/3", "/alice/wave3/issues/2"]) {
-      const violations = runA11y(await (await fetchUi(path)).text());
+      const html = await (await fetchUi(path)).text();
+      // The merge box's inline card carries upstream's OWN h3s (the command
+      // instruction titles, pull_merge_instruction.tmpl verbatim), so the
+      // conversation page ships upstream's h1(title)→h3 sequence — the a11y
+      // suite's one allowed upstream-shape skip (a11y.test.ts's
+      // upstreamMergeBoxHeadingSkips posture), bounded at one per page.
+      const carriesMergeBox = html.includes('data-global-init="initRepoPullMergeBox"');
+      const violations = runA11y(html).filter(
+        (v) => !(carriesMergeBox && v.rule === "R2-no-skip" && v.detail === "<h1> followed by <h3>"),
+      );
       expect(violations, `${path}: ${JSON.stringify(violations)}`).toEqual([]);
     }
   });
