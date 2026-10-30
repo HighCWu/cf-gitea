@@ -23,14 +23,19 @@ import { resolveTagTarget, writeTagRef, type TagCreator } from "./tags";
  * model: the filtered list/latest reads, the edit patch, the delete, and the
  * wire converter.
  *
- * Engine boundary (UPDATED by the findings-links N2 fix + its kept-open
- * tail, this change): the CREATE path also lands the GIT TAG for a fresh
- * `tag_name` through the shared tag-store service (services/tags.ts — the
- * tag-creation API's mechanism) and FILLS the row's `sha1`/`num_commits`/
- * `created_unix` from the tagged commit (upstream createTag's post-write
- * fill, release.go:148-158); the EDIT/DELETE paths remain D1-only (upstream's
- * UpdateRelease tag arm and DeleteReleaseByID's delTag stay open engine-wave
- * items — the publish-time fill rides that same open arm).
+ * Engine boundary (UPDATED by the findings-links N2 fix, then the
+ * UpdateRelease tag wave — this change): the CREATE path lands the GIT TAG
+ * for a fresh `tag_name` through the shared tag-store service (services/
+ * tags.ts — the tag-creation API's mechanism) and FILLS the row's
+ * `sha1`/`num_commits`/`created_unix` from the tagged commit (upstream
+ * createTag's post-write fill, release.go:148-158); the EDIT path now runs
+ * the same helper — upstream's UpdateRelease re-runs createTag on EVERY edit
+ * (release.go:269), so a publish-from-draft lands the missing tag here, a
+ * `tag_name` rename lands the NEW ref (the old ref is NEVER deleted —
+ * `git tag -d` exists only in DeleteReleaseByID, release.go:388), and every
+ * published edit re-fills sha1/created/num_commits; DELETE stays D1-only
+ * (upstream's API DeleteRelease passes delTag=false — the row goes, the git
+ * tag stays).
  *
  * Upstream citations (submodule pin fc4936884584):
  *  - list: `routers/api/v1/repo/release.go ListReleases` — FindReleases
@@ -44,8 +49,14 @@ import { resolveTagTarget, writeTagRef, type TagCreator } from "./tags";
  *    repo; tag-only records (`is_tag`) are 404 for every operation; drafts
  *    are 404 without release-write access (canAccessReleaseDraft);
  *  - edit: `EditRelease` — only set fields apply (empty string = untouched);
- *    the published stamp flips when a draft is published
- *    (services/release UpdateRelease → `!IsDraft && PublishedUnix == 0`);
+ *    then `release_service.UpdateRelease` (services/release/release.go:263-369)
+ *    re-runs createTag with an EMPTY message (release.go:269 — so edit-created
+ *    tags are always lightweight), zeroes `PublishedUnix` back when an edit
+ *    re-drafts (release.go:281-283), stamps it when the edit publishes a
+ *    draft or converts a tag record (release.go:283-285), and notifies
+ *    UpdateRelease ("updated") unless the edit CREATED the tag or converted a
+ *    tag record, in which case NewRelease ("published") fires (release.go:
+ *    361-367);
  *  - delete: `DeleteReleaseByID` — the row plus its attachments;
  *  - converter: `services/convert/release.go ToAPIRelease` + the Release URL
  *    methods (models/repo/release.go:130–155) — APIURL
@@ -294,6 +305,32 @@ async function countCommitsAt(reads: ReturnType<typeof engineReads>, tip: string
 }
 
 /**
+ * createTag's post-write fill (release.go:148-158), shared by the CREATE and
+ * EDIT paths: the tagged commit is read (GetTagCommit's dereference — an
+ * annotated tag peels to its commit), then `sha1` = commit oid, `num_commits`
+ * = CommitsCountOfCommit, `created_unix` = the COMMIT's committer time —
+ * "dated by its commit, so an old commit does not become the latest release"
+ * (release.go:154). A read failure is the upstream abort: the caller runs
+ * this BEFORE its row write, so the row stays untouched (CreateRelease's
+ * insert, release.go:189, / UpdateRelease's AllCols update, release.go:288,
+ * both sit after createTag).
+ */
+async function readTaggedCommitFill(
+  reads: ReturnType<typeof engineReads>,
+  taggedCommitSha: string,
+): Promise<{ sha1: string; numCommits: number; createdAt: Date }> {
+  const commit = await reads.readCommit(taggedCommitSha);
+  if (commit === null) {
+    throw new Error(`GetTagCommit: the tagged commit is unreadable [sha1: ${taggedCommitSha}]`);
+  }
+  return {
+    sha1: commit.oid,
+    numCommits: await countCommitsAt(reads, commit.oid),
+    createdAt: new Date(commit.committer.time * 1000), // release.go:154: dated by its commit
+  };
+}
+
+/**
  * Create a release row AND its git tag, upstream's exact sequence:
  *
  *   1. duplicate release row → 409 BEFORE any git write (CreateRelease's
@@ -337,11 +374,10 @@ async function countCommitsAt(reads: ReturnType<typeof engineReads>, tip: string
  *
  * Draft posture (release.go:166-168's else arm): NO tag, NO fill —
  * `created_unix` stays the row time, `sha1` null, `num_commits` 0. The
- * publish-time fill is upstream's UpdateRelease → createTag re-run
- * (release.go:269 — every edit re-runs createTag, whose fill then applies);
- * that arm belongs to the still-open UpdateRelease tag wave and is NOT
- * filled here (filling a commit a D1-only publish never tagged would point
- * sha1 at a ref that does not exist).
+ * publish-time fill is the EDIT path's job, upstream's UpdateRelease →
+ * createTag re-run (release.go:269 — every edit re-runs createTag, whose
+ * fill then applies): editRelease below lands the missing tag and fills
+ * sha1/created/num_commits at the publish-from-draft moment.
  *
  * NOT replicated: createTag's MustNotBeArchived arm (release.go:74-77) —
  * upstream's release handler maps none of its outcomes (an archived-repo
@@ -407,16 +443,7 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
   // aborts with NO row, exactly the upstream GetTagCommit/CommitsCount 500.
   let fill: { sha1: string; numCommits: number; createdAt: Date } | undefined;
   if (taggedCommitSha !== undefined) {
-    const reads = engineReads(input.env, pair.repo);
-    const commit = await reads.readCommit(taggedCommitSha);
-    if (commit === null) {
-      throw new Error(`GetTagCommit: the tagged commit is unreadable [sha1: ${taggedCommitSha}]`);
-    }
-    fill = {
-      sha1: commit.oid,
-      numCommits: await countCommitsAt(reads, commit.oid),
-      createdAt: new Date(commit.committer.time * 1000), // release.go:154: dated by its commit
-    };
+    fill = await readTaggedCommitFill(engineReads(input.env, pair.repo), taggedCommitSha);
   }
 
   const target =
@@ -458,31 +485,162 @@ export interface EditReleasePatch {
   now: Date;
 }
 
+/** The engine context the tag arm reads/writes through (the create path's
+ *  same four inputs — env/pair/doer/host). */
+export interface EditReleaseTagContext {
+  /** The worker bindings — the engine cell client's source. */
+  env: ApiEnv["Bindings"];
+  /** The repo: engine cell name + D1 scope + default branch. */
+  pair: RepositoryWithOwner;
+  /** The authenticated editor — protected-tag subject for a fresh tag. */
+  doer: TagCreator | null | undefined;
+  /** Request host, for the tagger fallback (unused on the edit path —
+   *  createTag's edit message is "" so the tag is always lightweight — but
+   *  part of the shared writeTagRef input). */
+  requestHost: string;
+}
+
+export interface EditReleaseResult {
+  /** The updated row; null only when the optimistic update lost a
+   *  concurrent write (the row vanished mid-edit). */
+  row: ReleaseRow | null;
+  /** createTag's `created` (release.go:80,127): true when THIS edit landed a
+   *  FRESH git tag — drives the ref-webhook pair and the NewRelease ("published")
+   *  notification mapping (UpdateRelease's `!isTagCreated && !isConvertedFromTag`
+   *  arm, release.go:361-367). */
+  tagCreated: boolean;
+}
+
 /**
- * `EditRelease` — apply the set fields; publishing a draft (draft → false)
- * stamps `published_unix` when it was unpublished (UpdateRelease rule).
- * Returns null only when the optimistic rename lost a concurrent write.
+ * `EditRelease` + `release_service.UpdateRelease` — upstream's exact edit→tag
+ * semantics (services/release/release.go:263-369 over the field guards of
+ * routers/api/v1/repo/release.go:361-378; the web EditReleasePost rides the
+ * same service with its own unconditional Title/Note assignments):
+ *
+ *   1. EVERY edit re-runs createTag (release.go:269) with an EMPTY message —
+ *      so an edit-created tag is always LIGHTWEIGHT (release.go:119). For a
+ *      post-edit DRAFT nothing touches git (createTag's else arm :166-168
+ *      only re-stamps created_unix = now — a re-edited draft rises in the
+ *      created_unix DESC list). For a PUBLISHED post-edit state:
+ *        - tag exists → RIDE it, no write, no error (release.go:83 IsTagExist);
+ *        - tag missing → the protected-tag gate (release.go:89-102), then
+ *          `target = rel.Target` or the default branch (IfZero, :104),
+ *          GetCommit (unresolvable → the error PROPAGATES — the API edit
+ *          surface maps none of these to 4xx, ctx.APIErrorInternal → 500,
+ *          release.go:379-382; the web surface JSONErrorAuto → 500 "internal
+ *          server error", context.go:257-274), then the lightweight write
+ *          (`created = true`, :127).
+ *      The OLD tag on a `tag_name` rename is NEVER deleted — UpdateRelease
+ *      has no `tag -d`; the old ref stays in git orphaned (only
+ *      DeleteReleaseByID deletes tags, release.go:388, on its delTag arm).
+ *   2. The fill (:148-158) runs for EVERY published edit — fresh tag, ridden
+ *      tag, and the D1-only conversion rows alike: sha1 = the tagged commit,
+ *      num_commits = the reachable depth, created_unix = the commit's
+ *      committer time. A published body-only edit therefore re-fills too
+ *      (upstream's AllCols().Update persists the re-computed row, release.go:
+ *      171 + 288). The reads precede the row write: a failed fill aborts with
+ *      the row untouched, exactly the upstream GetTagCommit/CommitsCount
+ *      error path.
+ *   3. `PublishedUnix` rules (:280-285, order matters): a post-edit DRAFT
+ *      zeroes it back ("a zero PublishedUnix means draft"); publishing a
+ *      draft (oldRelease.IsDraft) stamps now; a published row whose stamp is
+ *      still zero takes now (createTag's zero arm, :145-147). The
+ *      isConvertedFromTag arm is unreachable here — tag-only records 404 on
+ *      every edit surface (assertNotTagRecord).
+ *   4. `LowerTagName` re-lowers unconditionally (:273) and the column write
+ *      mirrors upstream's AllCols().Update (models/repo/release.go:169-173):
+ *      the re-filled sha1/num_commits/created_unix of a published edit and
+ *      the created_unix = now of a draft edit both land in the row.
+ *
+ * The git writes PRECEDE the D1 update, as upstream orders them (createTag
+ * runs outside UpdateRelease's transaction, release.go:269 vs :287) — a D1
+ * failure after a fresh tag leaves the tag in git, byte-faithful. The
+ * rename-collision edge diverges on the store level: our landed
+ * `releases_repo_tag_uq` unique index rejects renaming onto another release
+ * row's tag_name (an untyped 500 / form error) where upstream's schemaless
+ * duplicate would write both rows — the index arbitrates what upstream's
+ * IsReleaseExist checks only on the create surface.
  */
-export async function editRelease(d1: D1Database, row: ReleaseRow, patch: EditReleasePatch): Promise<ReleaseRow | null> {
+export async function editRelease(input: EditReleaseTagContext & {
+  d1: D1Database;
+  row: ReleaseRow;
+  patch: EditReleasePatch;
+}): Promise<EditReleaseResult> {
+  const { env, pair, row, patch } = input;
+  const tagName = patch.tagName ?? row.tagName;
+  const target = patch.target ?? row.target;
   const isDraft = patch.isDraft ?? row.isDraft;
-  const wasDraft = row.isDraft;
-  const publishedUnix =
-    wasDraft && !isDraft && row.publishedUnix === 0 ? Math.floor(patch.now.getTime() / 1000) : row.publishedUnix;
-  const rows = await drizzle(d1)
+  const nowSec = Math.floor(patch.now.getTime() / 1000);
+
+  // Step 1 — the tag arm (createTag's !IsDraft gate, release.go:78).
+  let tagCreated = false;
+  let taggedCommitSha: string | undefined;
+  if (!isDraft) {
+    const tips = refTipMap(await engineReads(env, pair.repo).listRefs());
+    const existingTip = tips.get(tagRef(tagName));
+    if (existingTip === undefined) {
+      // release.go:89-102 — the protected gate runs BEFORE the target
+      // resolves, in createTag's order.
+      if (!(await isTagControlAllowed(input.d1, await listProtectedTags(input.d1, pair.repo.id), tagName, input.doer?.id ?? 0))) {
+        // ErrProtectedTagName — unmapped on the edit surfaces (upstream
+        // answers 500, see the doc block).
+        throw new Error(`release tag name is protected [tag_name: ${tagName}]`);
+      }
+      const resolved = await resolveTagTarget(env, pair.repo, target ?? undefined); // IfZero(rel.Target, DefaultBranch), :104
+      if (resolved.tag === "not-found") {
+        // GetCommit's error propagates (release.go:105-108) — 500 both surfaces.
+        throw new Error(`GetCommit: the edit target does not exist [target: ${resolved.target}]`);
+      }
+      const written = await writeTagRef(env, pair.repo, {
+        name: tagName,
+        commitSha: resolved.commitSha,
+        // release.go:269 — the edit re-runs createTag with an EMPTY message:
+        // always a lightweight tag, even on a rename of a once-annotated one.
+        message: undefined,
+        doer: input.doer,
+        requestHost: input.requestHost,
+      });
+      if (written.tag === "invalid") {
+        throw new Error(written.reason); // ErrInvalidTagName, unmapped on edit
+      }
+      if (written.tag === "conflict") {
+        throw written.error;
+      }
+      tagCreated = true;
+      taggedCommitSha = written.commitSha; // the peeled commit (resolveTagTarget)
+    } else {
+      // The ride arm's peel (GetTagCommit's dereference, release.go:148).
+      taggedCommitSha = existingTip.peeled ?? existingTip.target;
+    }
+  }
+
+  // Step 2 — the fill (every published edit; release.go:148-158 via
+  // readTaggedCommitFill) / the draft arm's created_unix = now (:166-168).
+  const fill = taggedCommitSha === undefined ? undefined : await readTaggedCommitFill(engineReads(env, pair.repo), taggedCommitSha);
+
+  // Step 3 — the PublishedUnix rules (release.go:280-285 + :145-147).
+  const publishedUnix = isDraft ? 0 : row.isDraft ? nowSec : row.publishedUnix === 0 ? nowSec : row.publishedUnix;
+
+  const rows = await drizzle(input.d1)
     .update(releases)
     .set({
-      tagName: patch.tagName ?? row.tagName,
-      lowerTagName: (patch.tagName ?? row.tagName).toLowerCase(),
-      target: patch.target ?? row.target,
+      tagName,
+      lowerTagName: tagName.toLowerCase(), // release.go:273 — unconditional
+      target,
       title: patch.title ?? row.title,
       note: patch.note ?? row.note,
       isDraft,
       isPrerelease: patch.isPrerelease ?? row.isPrerelease,
       publishedUnix,
+      // The re-filled columns: a draft keeps its previous sha1/num_commits
+      // (createTag's draft arm touches neither) and takes created_unix = now.
+      sha1: fill?.sha1 ?? row.sha1,
+      numCommits: fill?.numCommits ?? row.numCommits,
+      createdAt: fill?.createdAt ?? patch.now,
     })
     .where(eq(releases.id, row.id))
     .returning();
-  return rows[0] ?? null;
+  return { row: rows[0] ?? null, tagCreated };
 }
 
 /**

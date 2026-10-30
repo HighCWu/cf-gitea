@@ -64,7 +64,7 @@ import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
 import { addOrUpdateCollaborator } from "../../api/services/repo-collaborators";
 import { createRepoHook } from "../../api/services/hooks";
-import { ZERO_OID } from "../../api/services/engine";
+import { ZERO_OID, engineReads } from "../../api/services/engine";
 import { saveRepoSettings } from "../../api/services/repo-settings";
 import { uploadReleaseAsset } from "../../api/services/release-assets";
 import { findReleaseByTag } from "../../api/services/releases";
@@ -243,6 +243,25 @@ async function releaseDeliveries(): Promise<Array<{ eventType: string; payloadCo
     .select({ eventType: webhookDeliveries.eventType, payloadContent: webhookDeliveries.payloadContent })
     .from(webhookDeliveries)
     .all();
+}
+
+/**
+ * Remove one git tag from the relmx engine cell — the fresh-create edit pin's
+ * cleanup. The cell persists across runs (the D1 wipes never touch it), so
+ * the pin whose assertions depend on the tag being CREATED (the "published"
+ * mapping) must delete its ref afterwards to stay idempotent. A no-op when
+ * the ref is already absent.
+ */
+async function deleteRelmxTagRef(tag: string): Promise<void> {
+  const cell = env.REPO.getByName("relmx-owner/rel");
+  const refs = await cell.listRefs();
+  const tip = (refs?.refs ?? []).find((ref) => ref.name === `refs/tags/${tag}`)?.target;
+  if (tip === undefined) return;
+  const landed = await cell.deleteApiRef({ ref: `refs/tags/${tag}`, expectedOid: tip });
+  if (landed.tag === "invalid") throw new Error(`relmx ref cleanup failed: ${tag} (${landed.reason})`);
+  if (landed.tag === "ref_conflict" && landed.currentOid !== null) {
+    throw new Error(`relmx ref cleanup raced: ${tag}`);
+  }
 }
 
 beforeAll(async () => {
@@ -541,8 +560,11 @@ describe("the create round-trips (prerelease + draft flags)", () => {
 });
 
 describe("the edit arm's flag round-trips (the webhook action mapping)", () => {
-  it("publishing a draft through the edit flip stamps published_unix and emits action published", async () => {
+  it("publishing a draft whose tag already exists rides it and maps to updated (upstream's isTagCreated=false fork, release.go:361-367)", async () => {
     const { repo, ownerCookie } = await theFixture();
+    // The fixture's v1 IS in git (seeded at the root commit) — the publish's
+    // createTag re-run RIDES it (release.go:83 IsTagExist) and the notifier
+    // fork stays on UpdateRelease/"updated".
     await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "v1", title: "Draft v1", isDraft: true });
     expect((await fetchUi("/relmx-owner/rel/releases/tag/v1")).status).toBe(404);
 
@@ -558,16 +580,58 @@ describe("the edit arm's flag round-trips (the webhook action mapping)", () => {
     const row = await findReleaseByTag(env.DB, repo.id, "v1");
     expect(row?.isDraft).toBe(false);
     expect((row?.publishedUnix ?? 0)).toBeGreaterThan(0); // the UpdateRelease stamp
-    // The draft→published flip maps to action "published" (release.go:363-366).
+    // The ride arm still FILLS the row from the tagged commit (the edit's
+    // createTag re-run reaches release.go:148-158 even without a tag write):
+    // sha1 = the v1 tag's tip (the root commit), depth 1, created = ITS time.
+    const refs = await engineReads(env, repo).listRefs();
+    const v1 = (refs?.refs ?? []).find((ref) => ref.name === "refs/tags/v1");
+    expect(row?.sha1).toBe(v1?.peeled ?? v1?.target);
+    expect(row?.numCommits).toBe(1);
+    expect(row?.createdAt?.toISOString()).toBe(new Date(T0 * 1000).toISOString());
     const delivery = (await releaseDeliveries())[0];
     expect(delivery?.eventType).toBe("release");
-    expect(delivery?.payloadContent).toContain('"published"');
+    expect(delivery?.payloadContent).toContain('"updated"');
     expect(delivery?.payloadContent).toContain("v1");
     // The round-trip closes: the anonymous viewer sees the release now.
     expect((await fetchUi("/relmx-owner/rel/releases/tag/v1")).status).toBe(200);
   });
 
-  it("re-drafting a published release through the edit flip is webhook-silent and hides it again", async () => {
+  it("publishing a draft whose tag is missing LANDS the git tag and maps to published (the D1-only publish closes, release.go:269)", async () => {
+    const { repo, ownerCookie } = await theFixture();
+    // v2-fresh has no git ref — the publish must create it (lightweight, at
+    // the stored target) and fill sha1/num_commits/created. The cleanup below
+    // keeps the fresh-create arm (and its "published" mapping) every run.
+    await deleteRelmxTagRef("v2-fresh");
+    await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "v2-fresh", title: "Fresh publish", isDraft: true });
+
+    const res = await postArm(
+      "/relmx-owner/rel/releases/edit/v2-fresh",
+      ownerCookie,
+      { title: "Fresh publish", content: "The tag lands now." },
+    );
+    expect(res.status).toBe(303);
+
+    const row = await findReleaseByTag(env.DB, repo.id, "v2-fresh");
+    expect(row?.isDraft).toBe(false);
+    expect((row?.publishedUnix ?? 0)).toBeGreaterThan(0);
+    const refs = await engineReads(env, repo).listRefs();
+    const fresh = (refs?.refs ?? []).find((ref) => ref.name === "refs/tags/v2-fresh");
+    const main = (refs?.refs ?? []).find((ref) => ref.name === "refs/heads/main");
+    expect(fresh?.target).toBe(main?.target); // landed at the stored target's tip
+    expect(row?.sha1).toBe(main?.target); // the fill (lightweight tag → the commit)
+    expect(row?.numCommits).toBe(2); // the main branch's depth
+    // The tag-CREATING edit maps to "published" (isTagCreated, release.go:366).
+    const delivery = (await releaseDeliveries())[0];
+    expect(delivery?.eventType).toBe("release");
+    expect(delivery?.payloadContent).toContain('"published"');
+    // The detail page's tag link resolves now — the meta row renders the
+    // /src/tag link for an in-git tag (the engine-boundary reduction's good arm).
+    const html = await (await fetchUi("/relmx-owner/rel/releases/tag/v2-fresh")).text();
+    expect(html).toContain('href="/relmx-owner/rel/src/tag/v2-fresh"');
+    await deleteRelmxTagRef("v2-fresh");
+  });
+
+  it("re-drafting a published release through the edit flip is webhook-silent, zeroes published_unix, and hides it again", async () => {
     const { repo, ownerCookie } = await theFixture();
     await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "v1", title: "Going quiet" });
 
@@ -580,6 +644,7 @@ describe("the edit arm's flag round-trips (the webhook action mapping)", () => {
 
     const row = await findReleaseByTag(env.DB, repo.id, "v1");
     expect(row?.isDraft).toBe(true);
+    expect(row?.publishedUnix).toBe(0); // "a zero PublishedUnix means draft" (release.go:281-283)
     // The emit gate (`!updated.isDraft`) kept the subscriber silent.
     expect(await releaseDeliveries()).toEqual([]);
     // The anonymous list/detail hide the re-drafted release; the writer's list
@@ -593,7 +658,7 @@ describe("the edit arm's flag round-trips (the webhook action mapping)", () => {
     expect(writerHtml).toContain('<span class="ui yellow label">Draft</span>');
   });
 
-  it("a plain published→published edit emits action updated with the new title", async () => {
+  it("a plain published→published edit rides the existing tag, emits action updated, and re-fills from it", async () => {
     const { repo, ownerCookie } = await theFixture();
     await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "v1", title: "Before" });
 
@@ -603,7 +668,12 @@ describe("the edit arm's flag round-trips (the webhook action mapping)", () => {
     });
     expect(res.status).toBe(303);
 
-    expect((await findReleaseByTag(env.DB, repo.id, "v1"))?.title).toBe("After");
+    const row = await findReleaseByTag(env.DB, repo.id, "v1");
+    expect(row?.title).toBe("After");
+    // The ride arm's re-fill (release.go:148-158 runs on every published edit).
+    const refs = await engineReads(env, repo).listRefs();
+    const v1 = (refs?.refs ?? []).find((ref) => ref.name === "refs/tags/v1");
+    expect(row?.sha1).toBe(v1?.peeled ?? v1?.target);
     const delivery = (await releaseDeliveries())[0];
     expect(delivery?.eventType).toBe("release");
     expect(delivery?.payloadContent).toContain('"updated"');

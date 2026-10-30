@@ -36,6 +36,16 @@
  * API's created_at); the ride-existing and §2.3 conversion arms fill alike,
  * and the draft arm stays unfilled (sha1 null, num_commits 0, created = the
  * row time) until publish.
+ *
+ * The UpdateRelease tag wave (this change) — the EDIT path runs upstream's
+ * createTag re-run (release.go:269): a publish-from-draft lands the missing
+ * tag WITH the fill, a tag_name rename lands the NEW ref and leaves the old
+ * one orphaned (upstream deletes tags only in DeleteReleaseByID, release.go:
+ * 388), a body-only published edit over an existing tag touches no ref (the
+ * ride arm), and the untaggable edit arms (unresolvable target, protected
+ * tag) answer the upstream UNMAPPED 500 (ctx.APIErrorInternal, release.go:
+ * 379-382) with row and refs untouched. The webhook action mapping follows
+ * the same fork: tagCreated → "published", otherwise "updated".
  */
 
 import { env } from "cloudflare:workers";
@@ -138,6 +148,26 @@ async function deliveriesFor(hookId: number): Promise<DeliveryRow[]> {
   return drizzle(env.DB).select().from(webhookDeliveries).where(eq(webhookDeliveries.hookId, hookId)).all();
 }
 
+/**
+ * Remove one git tag from the persisted rel cell — the tag-CREATING edit
+ * pins' cleanup. The engine cell persists across runs (the D1 wipes never
+ * touch it), so a pin whose assertions depend on the FRESH-create arm
+ * (tagCreated=true → the "published" mapping / the ref webhook pair) must
+ * delete its ref afterwards to stay idempotent. A no-op when the ref is
+ * already absent (a prior run cleaned up).
+ */
+async function deleteTagRef(tag: string): Promise<void> {
+  const cell = env.REPO.getByName("cf-gitea-stub/rel");
+  const refs = await cell.listRefs();
+  const tip = (refs.refs ?? []).find((ref) => ref.name === tagRef(tag))?.target;
+  if (tip === undefined) return;
+  const landed = await cell.deleteApiRef({ ref: tagRef(tag), expectedOid: tip });
+  if (landed.tag === "invalid") throw new Error(`ref cleanup failed: ${tag} (${landed.reason})`);
+  if (landed.tag === "ref_conflict" && landed.currentOid !== null) {
+    throw new Error(`ref cleanup raced: ${tag}`);
+  }
+}
+
 beforeAll(async () => {
   await applyRepoExtrasDdl();
   // The engine content the N2 pins resolve against: `main` at a two-commit
@@ -216,6 +246,17 @@ beforeEach(async () => {
     createdAt: new Date("2026-02-03T04:05:06Z"),
   });
 });
+
+/** A release row by exact tag_name — the fill/tag-arm pins' D1 read-back. */
+async function releaseRow(tag: string): Promise<typeof releases.$inferSelect> {
+  const row = await drizzle(env.DB).select().from(releases).where(eq(releases.tagName, tag)).get();
+  if (row === undefined) throw new Error(`release row missing: ${tag}`);
+  return row;
+}
+
+/** The seed commits' committer time (beforeAll's person) — the fill's
+ *  created_unix, "dated by its commit" (release.go:154). */
+const SEED_COMMIT_ISO = new Date(1761000000 * 1000).toISOString();
 
 describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
   it("creates a release and renders the URL family", async () => {
@@ -431,14 +472,6 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
   // seed's two commits both carry committer time 1761000000 (beforeAll's
   // person), main's depth at its tip is 2 and at ride-tag's root 1.
   // -----------------------------------------------------------------------
-
-  async function releaseRow(tag: string): Promise<typeof releases.$inferSelect> {
-    const row = await drizzle(env.DB).select().from(releases).where(eq(releases.tagName, tag)).get();
-    if (row === undefined) throw new Error(`release row missing: ${tag}`);
-    return row;
-  }
-
-  const SEED_COMMIT_ISO = new Date(1761000000 * 1000).toISOString(); // the seed commits' committer time
 
   it("fills sha1/num_commits/created from the tagged commit (created arm, release.go:148-158)", async () => {
     const res = await makeApp()(`${REPO_PATH}/releases`, {
@@ -714,7 +747,19 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
     expect(body.tag_name).toBe("v1");
   });
 
-  it("publishing a draft stamps published_at", async () => {
+  // -----------------------------------------------------------------------
+  // The UpdateRelease tag wave — every edit re-runs createTag (services/
+  // release/release.go:269) with an EMPTY message, so the edit-created tags
+  // are always lightweight: a publish-from-draft lands the missing tag AND
+  // the fill (:148-158), a tag_name rename lands the NEW ref and leaves the
+  // OLD one in git (no `tag -d` outside DeleteReleaseByID, release.go:388),
+  // a body-only published edit re-fills through the ride arm, and the
+  // untaggable arms (unresolvable target, protected tag) answer upstream's
+  // unmapped 500 (ctx.APIErrorInternal, release.go:379-382) with the row
+  // untouched.
+  // -----------------------------------------------------------------------
+
+  it("publishing a draft stamps published_at AND lands the tag with the fill (the D1-only publish closes: release.go:269 + :148-158)", async () => {
     const res = await makeApp()(`${REPO_PATH}/releases/${draftId}`, {
       method: "PATCH",
       headers: jsonAuth,
@@ -724,17 +769,108 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
     const body = await res.json<Record<string, unknown>>();
     expect(body.draft).toBe(false);
     expect(body.published_at).toBeTypeOf("string");
+    // The tag the draft never had now exists (created at the stored target,
+    // `main`) and the row carries the createTag fill.
+    expect((await makeApp()(`${REPO_PATH}/tags/v2-draft`)).status).toBe(200);
+    const row = await releaseRow("v2-draft");
+    expect(row.sha1).toBe(MAIN_TIP);
+    expect(row.numCommits).toBe(2);
+    expect(row.createdAt?.toISOString()).toBe(SEED_COMMIT_ISO); // the COMMIT time, not the edit time
   });
 
-  it("renames the tag (D1-only; the git tag is the engine wave)", async () => {
-    const res = await makeApp()(`${REPO_PATH}/releases/${releaseId}`, {
+  it("renames the tag: the NEW ref lands and the OLD ref stays (upstream never deletes it — release.go:263-369 has no tag -d)", async () => {
+    // A published release whose git tag EXISTS (the POST path landed it) —
+    // the rename must not orphan the old ref by deleting it.
+    const created = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "rename-src", name: "Rename me" }),
+    });
+    expect(created.status).toBe(201);
+    const id = (await created.json<{ id: number }>()).id;
+
+    const res = await makeApp()(`${REPO_PATH}/releases/${id}`, {
       method: "PATCH",
       headers: jsonAuth,
-      body: JSON.stringify({ tag_name: "v1-renamed" }),
+      body: JSON.stringify({ tag_name: "rename-dst" }),
     });
     expect(res.status).toBe(200);
-    expect((await res.json<Record<string, unknown>>()).tag_name).toBe("v1-renamed");
-    expect((await makeApp()(`${REPO_PATH}/releases/tags/v1-renamed`)).status).toBe(200);
+    expect((await res.json<Record<string, unknown>>()).tag_name).toBe("rename-dst");
+    // The new ref landed (lightweight — the edit's createTag msg is "") at
+    // the same commit, and the release resolves by the new tag only.
+    expect((await makeApp()(`${REPO_PATH}/tags/rename-dst`)).status).toBe(200);
+    expect((await makeApp()(`${REPO_PATH}/releases/tags/rename-dst`)).status).toBe(200);
+    expect((await makeApp()(`${REPO_PATH}/releases/tags/rename-src`)).status).toBe(404);
+    // The OLD ref keeps existing in git, orphaned — upstream's exact
+    // disposition (DeleteReleaseByID is the only tag deleter).
+    expect((await makeApp()(`${REPO_PATH}/tags/rename-src`)).status).toBe(200);
+    const row = await releaseRow("rename-dst");
+    expect(row.sha1).toBe(MAIN_TIP); // re-filled from the new tag
+  });
+
+  it("a body-only edit of a published release with an existing tag touches NO ref (the ride arm, release.go:83)", async () => {
+    const created = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "refkeep", name: "Ref keeper" }),
+    });
+    expect(created.status).toBe(201);
+    const id = (await created.json<{ id: number }>()).id;
+    const cell = env.REPO.getByName("cf-gitea-stub/rel");
+    const before = await cell.listRefs();
+
+    const res = await makeApp()(`${REPO_PATH}/releases/${id}`, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ name: "Edited in place" }),
+    });
+    expect(res.status).toBe(200);
+
+    const after = await cell.listRefs();
+    expect((after.refs ?? []).map((r) => [r.name, r.target])).toEqual(
+      (before.refs ?? []).map((r) => [r.name, r.target]),
+    );
+  });
+
+  it("an unresolvable target on publish aborts the edit with the upstream 500 and the row untouched (GetCommit propagates → APIErrorInternal)", async () => {
+    // A draft whose git tag does NOT exist — createTag checks IsTagExist
+    // FIRST (release.go:83), so only a missing tag reaches the target
+    // resolution that fails. v7-draft is never landed by any other pin.
+    const fresh = await seedRelease({ tag: "v7-draft", isDraft: true, minutesOffset: 9 });
+    const res = await makeApp()(`${REPO_PATH}/releases/${fresh}`, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ draft: false, target_commitish: "nope-target" }),
+    });
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ message: "internal server error", url: ERROR_URL });
+    // The abort preceded the row write AND the tag write (createTag's order).
+    const row = await releaseRow("v7-draft");
+    expect(row.isDraft).toBe(true);
+    expect(row.publishedUnix).toBe(0);
+    expect((await makeApp()(`${REPO_PATH}/tags/v7-draft`)).status).toBe(404);
+  });
+
+  it("a protected-tag rename answers the 500 too (ErrProtectedTagName is unmapped on the edit surface, release.go:379-382)", async () => {
+    await drizzle(env.DB).insert(protectedTags).values({
+      repoId: "7301",
+      namePattern: "prot-*",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    try {
+      const res = await makeApp()(`${REPO_PATH}/releases/${releaseId}`, {
+        method: "PATCH",
+        headers: jsonAuth,
+        body: JSON.stringify({ tag_name: "prot-new" }),
+      });
+      expect(res.status).toBe(500);
+      expect(await res.json()).toEqual({ message: "internal server error", url: ERROR_URL });
+      expect((await releaseRow("v1")).tagName).toBe("v1"); // the rename never landed
+      expect((await makeApp()(`${REPO_PATH}/tags/prot-new`)).status).toBe(404);
+    } finally {
+      await drizzle(env.DB).delete(protectedTags).where(eq(protectedTags.repoId, "7301"));
+    }
   });
 
   it("404s the PATCH on a missing/tag-only release", async () => {
@@ -799,10 +935,14 @@ describe("release webhook emissions (repoCreateRelease/repoEditRelease/repoDelet
     expect(delivery.payloadContent).toContain('\n  "action": "published"'); // 2-space §2.7 serialization
   });
 
-  it("emits `updated` on edit and `published` on the draft→published flip (upstream isTagCreated arm)", async () => {
+  it("emits `updated` on a riding edit and `published` on a tag-creating edit (upstream isTagCreated fork, release.go:361-367)", async () => {
     const hookId = await seedHook("7301", ["release"]);
-    const releaseId = await seedRelease({ tag: "v1", minutesOffset: 0 });
-    const draftId = await seedRelease({ tag: "v2-draft", isDraft: true, minutesOffset: 1 });
+    // The "updated" arm rides an EXISTING git tag (ride-tag is in the cell):
+    // tagCreated=false → UpdateRelease. A D1-only seeded tag (v1) whose ref
+    // is missing would CREATE it on the edit and flip the mapping.
+    const releaseId = await seedRelease({ tag: "ride-tag", minutesOffset: 0 });
+    const draftId = await seedRelease({ tag: "v2-hook-draft", isDraft: true, minutesOffset: 1 });
+    await deleteTagRef("v2-hook-draft"); // the fresh-create arm's precondition, every run
     expect(await deliveriesFor(hookId)).toHaveLength(0); // seedRelease is not a route write
 
     const renamed = await makeApp()(`${REPO_PATH}/releases/${releaseId}`, {
@@ -821,8 +961,33 @@ describe("release webhook emissions (repoCreateRelease/repoEditRelease/repoDelet
 
     const deliveries = await deliveriesFor(hookId);
     expect(deliveries.map((d) => (JSON.parse(d.payloadContent) as { action: string }).action)).toEqual(["updated", "published"]);
-    expect((JSON.parse(deliveries[0]!.payloadContent) as { release: { tag_name: string } }).release.tag_name).toBe("v1");
-    expect((JSON.parse(deliveries[1]!.payloadContent) as { release: { tag_name: string } }).release.tag_name).toBe("v2-draft");
+    expect((JSON.parse(deliveries[0]!.payloadContent) as { release: { tag_name: string } }).release.tag_name).toBe("ride-tag");
+    expect((JSON.parse(deliveries[1]!.payloadContent) as { release: { tag_name: string } }).release.tag_name).toBe("v2-hook-draft");
+    // Idempotency: the created ref must not leak into the next run (it would
+    // flip this edit to the ride/"updated" arm).
+    await deleteTagRef("v2-hook-draft");
+  });
+
+  it("an edit that creates the tag emits the ref webhook pair too (createTag's PushCommits + CreateRef, release.go:135-143)", async () => {
+    const createHook = await seedHook("7301", ["create"]);
+    const draftId = await seedRelease({ tag: "v9-draft", isDraft: true, minutesOffset: 0 });
+    await deleteTagRef("v9-draft"); // fresh-create precondition, every run
+
+    const published = await makeApp()(`${REPO_PATH}/releases/${draftId}`, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ draft: false }),
+    });
+    expect(published.status).toBe(200);
+
+    const deliveries = await deliveriesFor(createHook);
+    expect(deliveries).toHaveLength(1); // the push event matches no "create" subscription
+    expect(deliveries[0]!.eventType).toBe("create");
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as { ref: string; ref_type: string; sha: string };
+    expect(payload.ref).toBe("v9-draft");
+    expect(payload.ref_type).toBe("tag");
+    expect(payload.sha).toBe(MAIN_TIP); // the lightweight tag's tip == the filled sha1
+    await deleteTagRef("v9-draft");
   });
 
   it("stays silent while a release is a draft (create, edit, delete) and on a lost PATCH race", async () => {
@@ -928,6 +1093,9 @@ describe("activity feeds — publish_release action rows", () => {
       note: "",
       isDraft: true,
     });
+    // The flip must run the FRESH-create arm (tagCreated → "published" → the
+    // action row); a leaked ref from a previous run would flip it to "updated".
+    await deleteTagRef("v2.0");
     const app = feedsApp();
     expect((await (await app(`${REPO_PATH}/activities/feeds`)).json<unknown[]>()).length).toBe(0);
 
@@ -937,6 +1105,7 @@ describe("activity feeds — publish_release action rows", () => {
       body: JSON.stringify({ draft: false }),
     });
     expect(patched.status).toBe(200);
+    await deleteTagRef("v2.0");
 
     const body = (await (await app(`${REPO_PATH}/activities/feeds`)).json<Array<Record<string, unknown>>>());
     expect(body).toHaveLength(1);

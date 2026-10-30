@@ -61,10 +61,14 @@ import { emitRefWebhook, zeroCommitPushPayload } from "../services/tags";
  *   - POST: 423 is NOT emitted — the vendored pin registers NO
  *     mustNotBeArchived on release writes, unlike topics/contents.
  *
- * Engine boundary (per the batch brief — releases are D1-only until assets):
- * creating/editing a release does NOT create/rename the git tag through the
- * engine commit-builder (SPEC-0004 §3.4), and DELETE does not delete it;
- * `sha1` stays null and target_commitish is a stored string.
+ * Engine boundary (the N2 wave + the UpdateRelease tag wave): creating AND
+ * editing a release land the git tag through the shared tag-store service
+ * (upstream CreateRelease → createTag for the create; UpdateRelease's
+ * re-run of createTag, release.go:269, for the edit — publish-from-draft
+ * lands the missing tag, a tag_name rename lands the NEW ref while the old
+ * ref stays (upstream deletes tags only in DeleteReleaseByID, release.go:388),
+ * and every published edit re-fills sha1/created/num_commits); DELETE does
+ * not delete the ref (the API passes delTag=false).
  *
  * Webhook triggers (`release`, upstream services/webhook/notifier.go
  * sendReleaseHook:879 ← NewRelease:889 / UpdateRelease:893 / DeleteRelease:897,
@@ -72,9 +76,10 @@ import { emitRefWebhook, zeroCommitPushPayload } from "../services/tags";
  * through emitWebhookDeliveries — see emitReleaseWebhook. Upstream gates ALL
  * three actions on `!rel.IsDraft` (release.go:198,358,435): drafts emit
  * nothing, including on delete. Action mapping: create → "published";
- * edit → "updated", EXCEPT the draft→published flip which upstream reaches
- * through UpdateRelease's tag creation (isTagCreated → NewRelease, release.go:
- * 363-366) and therefore maps to "published"; delete → "deleted".
+ * edit → "updated", EXCEPT an edit that CREATED the tag (isTagCreated — the
+ * publish-from-draft whose tag was missing, or a rename onto a fresh name;
+ * upstream reaches the same fork at release.go:361-367) and therefore maps
+ * to "published"; delete → "deleted".
  *
  * Activity feeds (specs/activity-feeds.md §3.3): the publish_release
  * `action` row rides the same emitReleaseEvent seam — published only,
@@ -585,21 +590,37 @@ export function registerReleaseRoutes(
       const found = await requireReleasesRepo(c, c.req.valid("param"));
       await requireReleaseWriter(c, found);
       const viewer = { origin: new URL(c.req.url).origin, requester: c.get("authUser") };
+      const requester = c.get("authUser");
       const { id } = c.req.valid("param");
       const row = await requireReleaseById(c, found.repo.id, id);
       const form = c.req.valid("json");
       // Upstream applies only the SET fields, and only non-empty strings
-      // (len(form.X) > 0 guards); the flags are explicit tri-states.
-      const updated = await editRelease(c.env.DB, row, {
-        tagName: form.tag_name !== undefined && form.tag_name !== "" ? form.tag_name : undefined,
-        target: form.target_commitish !== undefined && form.target_commitish !== "" ? form.target_commitish : undefined,
-        title: form.name !== undefined && form.name !== "" ? form.name : undefined,
-        note: form.body !== undefined && form.body !== "" ? form.body : undefined,
-        isDraft: form.draft,
-        isPrerelease: form.prerelease,
-        now: new Date(),
+      // (len(form.X) > 0 guards); the flags are explicit tri-states — then
+      // release_service.UpdateRelease re-runs createTag (the edit's tag arm:
+      // a publish-from-draft lands the missing tag, a rename lands the new
+      // ref, every published edit re-fills sha1/created/num_commits). The
+      // tag-arm failures (protected tag, unresolvable target, unreadable
+      // commit) propagate as untyped errors → the handler's 500
+      // "internal server error" — upstream EditRelease maps NONE of
+      // UpdateRelease's outcomes (ctx.APIErrorInternal, release.go:379-382).
+      const updated = await editRelease({
+        env: c.env,
+        d1: c.env.DB,
+        pair: found,
+        doer: requester,
+        requestHost: new URL(c.req.url).hostname,
+        row,
+        patch: {
+          tagName: form.tag_name !== undefined && form.tag_name !== "" ? form.tag_name : undefined,
+          target: form.target_commitish !== undefined && form.target_commitish !== "" ? form.target_commitish : undefined,
+          title: form.name !== undefined && form.name !== "" ? form.name : undefined,
+          note: form.body !== undefined && form.body !== "" ? form.body : undefined,
+          isDraft: form.draft,
+          isPrerelease: form.prerelease,
+          now: new Date(),
+        },
       });
-      if (updated === null) {
+      if (updated.row === null) {
         // Lost a concurrent rename/delete — the upstream UpdateRelease would
         // surface as an internal error; the re-read keeps the answer honest.
         // (The degraded concurrent path emits no webhook.)
@@ -609,11 +630,36 @@ export function registerReleaseRoutes(
         }
         return c.json(await toApiRelease(c.env.DB, viewer, found, fresh), 200);
       }
-      // Webhook: UpdateRelease (release.go:363) — except the draft→published
-      // flip, which upstream reaches through the tag creation arm and maps to
-      // NewRelease/"published" (release.go:366, isTagCreated).
-      await emitReleaseEvent(c, found, updated, row.isDraft && !updated.isDraft ? "published" : "updated");
-      return c.json(await toApiRelease(c.env.DB, viewer, found, updated), 200);
+      // The ref-webhook pair when the edit landed a FRESH tag — upstream
+      // createTag notifies the created ref exactly like the create path
+      // (release.go:135-143 PushCommits + CreateRef). The edit-created tag is
+      // always lightweight (msg="", release.go:269), so the ref tip IS the
+      // filled commit sha1.
+      if (updated.tagCreated) {
+        const fullName = tagRef(updated.row.tagName);
+        const tip = updated.row.sha1 ?? ZERO_OID;
+        await emitRefWebhook(c, found, "push", zeroCommitPushPayload(c, found, fullName, ZERO_OID, tip), fullName);
+        await emitRefWebhook(
+          c,
+          found,
+          "create",
+          {
+            sha: tip,
+            ref: updated.row.tagName,
+            ref_type: "tag",
+            repository: toApiRepository(viewerOf(c), found),
+            sender: c.get("authUser") ?? null,
+          },
+          fullName,
+        );
+      }
+      // Webhook: UpdateRelease ("updated", release.go:363) — except an edit
+      // that CREATED the tag (isTagCreated), which upstream maps to
+      // NewRelease/"published" (release.go:366); a draft result stays silent
+      // (emitReleaseEvent's !IsDraft gate). isConvertedFromTag is unreachable
+      // — tag-only records 404 above.
+      await emitReleaseEvent(c, found, updated.row, updated.tagCreated ? "published" : "updated");
+      return c.json(await toApiRelease(c.env.DB, viewer, found, updated.row), 200);
     },
     releaseBodyHook,
   );

@@ -143,7 +143,10 @@
  *   `len(form.Draft) > 0` reads the same checkbox). The edit write sets
  *   Title/Note UNCONDITIONALLY (EditReleasePost's plain assignments — an
  *   emptied note clears, unlike the API PATCH's non-empty guards) and
- *   never touches the tag pair (the hidden inputs upstream ignores).
+ *   never touches the tag pair (the hidden inputs upstream ignores) — but
+ *   the WRITE runs upstream's createTag re-run (release.go:269): publishing
+ *   a draft whose git tag is missing lands `refs/tags/<tag>` at the stored
+ *   target and fills sha1/created/num_commits (editReleaseFromForm's doc).
  * - Source-archive rows in the downloads block (`/archive/{tag}.zip|tar.gz`)
  *   are unrendered — the web-shape archive route does not exist (the
  *   branches page's archive reduction); the attachment rows render the
@@ -647,17 +650,24 @@ export type EditReleaseResult =
  * emptied note clears, the API PATCH's non-empty guards are its own
  * semantics) and the flags from the checkboxes, then the `release` webhook
  * through the shared emit seam — drafts stay silent (routes/releases.ts
- * emitReleaseEvent's gate), the draft→published flip maps to action
- * "published", every other edit to "updated" (release.go:363-366's
- * UpdateRelease/NewRelease notifier mapping). The publisher-acted action row
- * the API route additionally records stays the API's own (the landed ui
- * create write's same reduction). Failures answer `invalid` with the
- * upstream message.
+ * emitReleaseEvent's gate), the action follows upstream's notifier fork
+ * (release.go:361-367): an edit that CREATED the tag (isTagCreated — the
+ * publish-from-draft whose git tag was missing) maps to "published", every
+ * other published edit to "updated" (the fixture tag already in git rides).
+ * The hidden tag pair the form carries stays ignored (upstream's handler
+ * never reads it) — the tag arm works from the STORED row: publishing a
+ * draft whose tag doesn't exist lands refs/tags/<tag> at the stored target
+ * through the same createTag re-run the API PATCH runs. The created tag's
+ * ref-webhook pair (PushCommits + CreateRef) stays the API route's emission —
+ * the landed web create write carries the same reduction. Failures answer
+ * `invalid` with the message (upstream JSONErrorAuto's message render — an
+ * untaggable publish, protected tag included, is a 500 there, context.go:
+ * 257-274; the re-render convention keeps the form).
  */
 export async function editReleaseFromForm(input: {
   env: Env;
   /** The request the webhook emission reads (the executionCtx-guarded
-   *  Queue probe — the shared seam's shape). */
+   *  Queue probe — the shared seam's shape; both routers' Contexts fit). */
   request: IssueEventRequest;
   repo: RepoRow;
   pair: RepositoryWithOwner;
@@ -669,19 +679,27 @@ export async function editReleaseFromForm(input: {
   const { form, row } = input;
   if (form.title === "") return { outcome: "invalid", message: releasesLocale.title_required };
   if (form.title.length > 255) return { outcome: "invalid", message: releasesLocale.title_too_long };
-  let updated: ReleaseRow | null;
+  let updated: { row: ReleaseRow | null; tagCreated: boolean };
   try {
-    updated = await editRelease(input.env.DB, row, {
-      title: form.title,
-      note: form.content,
-      isDraft: form.draft,
-      isPrerelease: form.prerelease,
-      now: new Date(),
+    updated = await editRelease({
+      env: input.env,
+      d1: input.env.DB,
+      pair: input.pair,
+      doer: { id: input.doer.id, login: input.doer.username, email: input.doer.email },
+      requestHost: new URL(input.origin).host,
+      row,
+      patch: {
+        title: form.title,
+        note: form.content,
+        isDraft: form.draft,
+        isPrerelease: form.prerelease,
+        now: new Date(),
+      },
     });
   } catch (error) {
     return { outcome: "invalid", message: error instanceof Error ? error.message : "release edit failed" };
   }
-  if (updated === null) {
+  if (updated.row === null) {
     // Lost a concurrent delete — the upstream UpdateRelease would surface as
     // an internal error; the API route's re-read keeps the answer honest
     // (here: the edit simply failed, the kept form re-renders).
@@ -689,16 +707,16 @@ export async function editReleaseFromForm(input: {
   }
   // The `release` webhook (the API PATCH route's action mapping) — drafts
   // silent, best-effort (the create write's posture).
-  if (!updated.isDraft) {
+  if (!updated.row.isDraft) {
     try {
       const apiViewer = { origin: input.origin, requester: apiUserFromRow(input.doer, { origin: input.origin, requester: null }) };
-      const rendered = await toApiRelease(input.env.DB, apiViewer, input.pair, updated);
+      const rendered = await toApiRelease(input.env.DB, apiViewer, input.pair, updated.row);
       await emitIssueEvent(input.request, {
         repoId: input.repo.id,
         ownerId: input.repo.ownerId,
         eventType: "release",
         payload: {
-          action: row.isDraft ? "published" : "updated",
+          action: updated.tagCreated ? "published" : "updated",
           release: rendered,
           repository: toApiRepository(apiViewer, input.pair),
           sender: apiUserFromRow(input.doer, apiViewer),
@@ -708,7 +726,7 @@ export async function editReleaseFromForm(input: {
       console.error(`[releases] webhook fan-out failed (updated): ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  return { outcome: "updated", tag: updated.tagName };
+  return { outcome: "updated", tag: updated.row.tagName };
 }
 
 export type DeleteReleaseResult =

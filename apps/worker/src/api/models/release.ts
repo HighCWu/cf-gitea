@@ -75,8 +75,9 @@ export type CreateReleaseOption = z.infer<typeof createReleaseOptionSchema>;
 /**
  * `#/definitions/EditReleaseOption` — every field optional; upstream applies
  * only the SET fields (empty strings leave the stored value untouched).
- * The `tag_name` rename is D1-only this wave (the git tag itself is the
- * engine's — see services/releases.ts).
+ * The `tag_name` rename lands the NEW git tag (a lightweight write —
+ * UpdateRelease's empty-message createTag, services/releases.ts); upstream
+ * never deletes the old ref.
  */
 export const editReleaseOptionSchema = z.object({
   body: z.string().optional().openapi({ description: "The new release notes or description" }),
