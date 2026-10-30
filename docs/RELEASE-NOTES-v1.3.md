@@ -1,12 +1,11 @@
 # cf-gitea v1.3 — Release Notes
 
 Snapshot pre-draft 2026-10-30, HEAD `0f25339` — the v1.3 wave, now
-covering the full day and past midnight: **92 commits,
-`d68ad62`→`0f25339`** (2026-10-29 06:53 → 2026-10-30 00:53 +0800).
-**TODO(final-window): the 9:00 convergence run replaces this snapshot
-line with the freeze HEAD and the final commit count** — anything
-landing between this pre-draft and the cut appends in the same
-structure. These notes were first cut MID-FLIGHT at
+covering the full day and past midnight: **119 commits,
+`d68ad62`→`4a45370`** (2026-10-29 06:53 → 2026-10-30 08:50 +0800) — the
+freeze HEAD and final count, filled by the 9:00 convergence run;
+anything landing after the cut rides the v1.4 backlog
+(docs/residuals-v1.4.md). These notes were first cut MID-FLIGHT at
 `e5e1432` (28 commits, landed as `37758d5`); the same day's second half
 landed before the freeze — the five cut-time units inside the hour, the
 wiki sibling's full git-HTTP and lifecycle arc, the packages registry's
@@ -1317,9 +1316,10 @@ the six tail GETs — logs/workflow/artifacts-download/preview pair/
 badge.svg/workflow-dispatch-inputs — stayed unclaimed at the tick's
 HEAD), and the admin row stays PARTIAL with its absent list shrunk
 (packages `a8e065f`, job-queue `0c8da44`; auths + the admin actions
-tails remain). **TODO(final-window): the final ui-parity tick
-numbers** — the 9:00 run's tick or standing re-count fills the final
-X/Y/Z of 116. No tick has run since (tick-19 measured at `e26c862`);
+tails remain). **Final tick: 115 LANDED / 1 PARTIAL / 0 ABSENT of 116
+at `6bf9c17` (tick-21, 2026-10-30 — a zero-flip maintenance tick whose
+two window landings completed arms inside already-LANDED rows; the one
+PARTIAL is the admin auths page, needs-API-first)**. No tick has run since (tick-21 measured at `6bf9c17`);
 the post-tick landings are implied-pending-next-tick, the survey's own
 convention: the org runners twin (`3ab7532`), C3's log tail/steps +
 C4's artifacts preview and signed raw serving (`cd7eec4`), the C4
