@@ -10,24 +10,52 @@ flagged reductions recorded in landed page modules. It is a dispatch board,
 not a decision record: every item cites its source, nothing here ratifies a
 new design, and items gated on a SPEC say so.
 
-**In flight at doc time — verify before consuming this backlog** (working
-tree at `849add4`; do not re-dispatch, do not count as landed until
-committed):
+**Updated at the v1.3.1 convergence snapshot `e4b9f66`** (2026-10-30, the
+post-v1.3-tag wave recorded in `docs/RELEASE-NOTES-v1.3.1.md`): the six
+parity reviews' and the link crawl's newly-known-open items are folded into
+the board below. The wave's own landed fixes are NOT residuals — where a
+v1.3.1 commit closed a piece of an item, the item says so. The freeze-time
+in-flight block below is resolved: the user settings packages twin and the
+signed-URL preview-tail golden (with its route-clock seam) both landed in
+`74df9ad`, and the survey edit landed in the v1.3 final window.
 
-- **The user settings packages twin** — untracked
-  `apps/worker/src/ui/pages/user-settings-packages.tsx` (+ test + three
-  goldens, with `index.ts`/`index.test.ts` mounts among the modified
-  files). The survey names it sibling-owned with gate-v4
-  (`docs/compat/ui-parity-survey.md`, tick-21 GATED paragraph).
-- **The signed-URL preview-tail golden** — the `/preview/{path}` golden was
-  the honest exclusion of `d580d1f` ("artifactPreviewRawLink reads
-  `Date.now()` with no route-clock seam"); the working tree carries the
-  page-clock seam in `apps/worker/src/ui/pages/repo-actions-artifacts.tsx`
-  (the ROUTE_CLOCK page-module twin) plus `goldens.test.ts` edits. Expected
-  to land before release.
-- A survey edit is also in the tree (`docs/compat/ui-parity-survey.md`
-  modified — likely the next tick); re-read it before trusting tick-21's
-  remaining-set quotes below.
+**In flight at doc time — verify at tag** (snapshot `e4b9f66`; sibling
+units are landing these as you read this — do not re-dispatch blindly, do
+not count as landed until committed, re-check each against the tag):
+
+- **Topics/licenses on the repo payloads** — the full converter
+  (`toApiRepositoryFull`, with the stored `topics` + `licenses`, fork
+  `parent`, and real mirror schedule) already sits in the tree; the
+  single-repo route swap from the sync converter is the route owner's
+  one-liner (`apps/worker/src/api/services/repository.ts` docstring; the
+  review's drifts 3+9: `docs/usability/parity-review-api.md` Top-10).
+- **The packages small items** — review-packages D-4 (nuget's three
+  service-index endpoints still require auth where upstream leaves them
+  open, verified open at `packages-protocols.ts`), D-5 (the three quota
+  403 strings), D-6 (the downloads' cache/nosniff/CSP/Accept-Ranges/304/
+  filename* header set) (`docs/usability/parity-review-packages.md`).
+- **The api unit gates** — issue/pull routes still ignore
+  `has_issues`/`has_pull_requests` (200 vs upstream 404) and any reader
+  can set labels/milestone on issue create (verified open:
+  `apps/worker/src/api/routes/issues.ts:132-133`) — review-api drift 10.
+- **The serializer counts** — `followers_count`/`following_count` always 0
+  and `last_login` the zero time on every User payload
+  (`repository.ts:474,483-484`, TODO(SPEC-0005)) — review-api drift 4.
+- **The release sha tail** — `sha1`/`num_commits` stay unwritten on
+  release rows (`6b2bedc`'s disclosed engine-wave tail,
+  `release.go:150-157`).
+- **The identities swap** — the auth test rig's contract-`User` projection
+  swapping from the convention-synced private copy to the canonical
+  `authUserToApiUser` (the test-twin of `cf269f4`'s production seam; the
+  rig's copy had already drifted — no `username` key, hardcoded
+  visibility/URLs). Uncommitted in the working tree at snapshot time
+  (`apps/worker/src/auth/testing/identities.ts` + its test).
+
+Landed in the same window, for the record (no longer open): the
+production serializer-identity swap — `GET /user` now delegates to the
+canonical converter shape (`cf269f4`), closing review-api drift 1; the
+`username` compat key (drift 2, same commit); the branch list order
+(drift 8, `7f9241e`).
 
 ---
 
@@ -55,7 +83,13 @@ committed):
    payload's `runs-on:` drives the runner's image pick, so seeded or
    M3-parsed payloads must carry it or runners fall back to a multi-GB
    ubuntu pull (`docs/research/act-runner-smoke-2026-10-30.md` §5.1 —
-   "M3's parser closes the trap"). Size: **L**.
+   "M3's parser closes the trap"). **v1.3.1 amendment** (`e4b9f66`, the
+   module header's disclosed stage): the always-on sweeps (endless tasks,
+   abandoned jobs, ephemeral-runner cleanup) and the cancel mapping
+   LANDED in v1.3.1, shrinking this item's sweep scope to zero — but the
+   **notify/commit-status tails and the reusable-caller cascade** are
+   explicitly staged to M3 (no v1 row carries parent_job_id>0), so the
+   SPEC's M3 table gains them as named rows. Size: **L**.
 
 2. **C5's run-mutation remainder: rerun + rerun-failed** (the cancel arm
    landed inside C2's window). Rerun creates a new `ActionRunAttempt` and
@@ -63,7 +97,11 @@ committed):
    M3 (`docs/research/actions-ui-census.md` C5 row and open question 1;
    `specs/0012-actions-feasibility.md` still-open list: "C5's rerun +
    rerun-failed DEFER to M3's job emitter"). Every M1c census unit is
-   landed except this and C10. Size: **M**, gated on item 1.
+   landed except this and C10. **v1.3.1 addition**: the actions review's
+   lower-ranked "rerun artifact inheritance latent" observation
+   (`docs/usability/parity-review-actions.md`) belongs to the same
+   emitter work — a rerun's artifacts must resolve to the new attempt.
+   Size: **M**, gated on item 1.
 
 3. **C10's scoped-workflows pages and their substrate.** Upstream's
    `action_scoped_workflow_source` store + workflow-file parser do not
@@ -168,6 +206,73 @@ committed):
    gate's substrate is no longer missing; still out-of-scale for a polish
    wave (touches API + git-HTTP + web-UI layers). Size: **M**.
 
+5. **The archived-release release-create arm keeps 201** (`6b2bedc`'s
+   disclosed divergence): upstream's create handler maps the
+   archived-repo failure to a bare 500 (`release.go:283`'s posture);
+   the pinned posture here keeps the 201. Recorded as a deliberate
+   divergence, listed so a future parity pass either ports the 500 arm or
+   re-affirms ours in SPEC-0004 §2.3. Size: **S** (decision + one arm).
+
+6. **The review-api semantic-drift remainder** — what v1.3.1 did not close
+   (source: `docs/usability/parity-review-api.md` Top-10 + honorable
+   mentions; drifts 1/2/8 landed — see the header note; 3/4/10 are the
+   in-flight block): (a) repoEdit's PR-merge configuration
+   accepted-and-ignored — clients disabling merge styles read the old
+   defaults back and actual merge gating never changes (drift 5);
+   (b) `assigned_by` issue filter returns empty though the assignee table
+   landed; sibling `mentioned_by` has no mention data yet (drift 6);
+   (c) the single-PR GET omits `additions`/`deletions`/`changed_files`,
+   and `review_comments` never emits (drift 7); (d) `/repos/search` and
+   the list paths keep the query-flat sync render — fork `parent` omitted,
+   mirror schedule zeroed, no topics/licenses (drift 9's list half; the
+   single-repo half is the in-flight swap); (e) honorable mentions kept on
+   the ledger: `mergeable: null` while checking, review-list
+   `X-Total-Count` counts only visible rows, transfer 202 vs 201,
+   auto-init repos missing `gitignores`/`license` files, user email never
+   rendered (upstream's noreply placeholder), comment-create accepts an
+   empty body and misses the locked-issue 403, annotated tag `message`
+   always empty (see P3-11), `default_branch` applied without an
+   existence gate. Sizes: **S–M** each; the whole remainder is a
+   dispatchable batch.
+
+7. **The review-webui rendering remainder** — source:
+   `docs/usability/parity-review-webui.md` top-drifts list; the New-PR
+   button, empty-repo anon arm, branches order, and collaborator grants
+   LANDED in v1.3.1 (`d52361b`, `56df8a6`, `7f9241e`). Still open:
+   the branch selector as a bare Fomantic dropdown where upstream is the
+   `initRepoBranchTagSelector` Vue island (~20 data attrs — affects
+   home/file-view/commits); the repo home right row lacks
+   Go-to-file/New-PR/Add-File; the issues list lacks the `#issue-filters`
+   skeleton + Labels/Milestones buttons (their pages exist); the merge box
+   lacks `initRepoPullMergeBox` and renders nothing closed; issue-detail
+   timeline `event-{id}` on both div and anchor (upstream splits
+   `issuecomment-{id}`/`event-{id}`); releases omit Source Code archives
+   although `/archive` serves (stale reduction — partially related to the
+   POST arm `4e6d1cc` mounted); the header's Issues tab misses
+   `octicon-issue-opened` and the admin Settings tab is absent although
+   settings pages landed. Sizes: **S** each except the two Vue islands
+   (**M**).
+
+8. **The review-git protocol remainder** — source:
+   `docs/usability/parity-review-git.md`; the archive POST arm and the
+   GCM realm LANDED in v1.3.1 (`4e6d1cc`, `85fa2ff`). Still open
+   (engine-scope items separated in the review): receive-pack caps lack
+   atomic/push-options/report-status-v2; `.gitattributes`
+   export-ignore/export-subst un-honored in archives + our zips STORE
+   (upstream shells to real git archive); LFS locks → 501 (upstream
+   implements the family); protocol-v2 lacks fetch=filter (partial clone
+   fatal) and ls-refs=unborn; the ladder-ordering drifts (403-before-auth
+   arms, the wiki-doesn't-exist pkt-line, dumb-HTTP absent — documented).
+   Sizes: **M** each; several are engine-boundary decisions first.
+
+9. **The review-packages D-4/D-5/D-6 tail — in-flight at doc time, verify
+   at tag.** D-4: nuget's three service-index endpoints require auth where
+   upstream deliberately leaves them open (`api.go:342-346`); D-5: the
+   three quota 403 strings differ from upstream's sentinels; D-6: downloads
+   lack upstream's cache/nosniff/CSP/Accept-Ranges/304/filename* set
+   (`docs/usability/parity-review-packages.md` fix-order tail; D-1/D-2/D-3
+   landed `3571fe8`). Size: **S** as one batch.
+
 ## P3 — hardening, tooling, and the small flagged items
 
 1. **act_runner 5.x (the `gitea/runner` line) is UNVERIFIED.** The
@@ -192,7 +297,8 @@ committed):
    writers: `wikiPerson`'s clock into wiki commits and the
    `mergePerson`/`mergePersonOf` twins ignoring `MergeInput.now` — needs
    engine-level object writes, "a wave of its own". The artifacts-preview
-   page clock is the in-flight unit above and NOT re-listed. Sizes:
+   page clock LANDED in v1.3.1 (`74df9ad`, the ARTIFACT_PREVIEW_CLOCK seam
+   + the signed-URL tail golden) and is no longer a candidate. Sizes:
    (a) **S**, (b) **S**, (c) **M**.
 
 3. **The cleanup-rule preview's PackageID-filter upgrade note.** Upstream's
@@ -235,6 +341,77 @@ committed):
    not re-sized; each is a future SPEC's call. Size: **S–L** depending on
    which reopens.
 
+7. **The serializer counts tail + the language side-store.**
+   `followers_count`/`following_count` always 0 and `last_login` the zero
+   time on every User payload — TODO(SPEC-0005), owned by the serializer
+   unit (in-flight at doc time, verify at tag; `cf269f4`, `7f9241e`).
+   Alongside it, `language` renders `''` on BOTH serializers by decision:
+   there is no users column for it — upstream keeps the language in a side
+   store, and the review graded the drift cosmetic
+   (`cf269f4`'s in-comment note; `docs/usability/parity-review-api.md`).
+   Landing either needs the store decision first (a SPEC-0005 call).
+   Size: **M** (store + two serializers); the counts alone **S** if the
+   in-flight unit lands them.
+
+8. **The review-actions lower-ranked drifts** (source:
+   `docs/usability/parity-review-actions.md` ranked list, below the five
+   v1.3.1 fixed): expired-hot-log appends accepted; v4 EXPIRED rows
+   admitted; the twirp legacy raw-token arm absent; the retention
+   fail-closed default stays the documented divergence (the sweeps
+   themselves landed — `e4b9f66`). Each is a small guard or arm on the
+   landed stores; the twirp arm is compatibility surface. Sizes: **S**
+   each.
+
+9. **The Oct 31 watch item — sweep-fire observation + the two upstream
+   filings.** The 9:00 handover record's close-out line
+   (`docs/run-pending-9am-task.md:88`) instructs: observe the sweep-fires
+   at Oct 31 11:00 UTC — D1 orphan action rows should stay 0 (the
+   latency/health baseline read 0/0, `560f0df`) — and keep watching
+   cloudflare/workers-sdk#16548 (our filed DDL defect,
+   `docs/research/workerd-ddl-cross-session-locked.md`) and #16349
+   (P3-6's ws1009 trigger). v1.3.1 tripled the sweep surface same-day
+   (`e4b9f66`'s three producers), so the first post-wiring observation
+   covers both the old retention arms and the new endless/abandoned/
+   ephemeral arms. A check, not a work item; file findings as residuals
+   if red. Size: **S** (observation + record).
+
+10. **`/raw` LFS resolution follow-up.** v1.3.1 landed the file-view LFS
+    badge and CORRECTED the premise: upstream `/raw` does NOT resolve LFS
+    at the pin (`web.go:1705-1712` wires `SingleDownload`;
+    `SingleDownloadOrLFS` is the `/media` group only) — the landed posture
+    is correct and pinned (`f561d92`'s dated correction note + the
+    pointer-parity regression pin). The disclosed follow-up surface for
+    v1.4: the `/media`-family content resolution + size + link flip, if
+    that surface is ever dispatched. Size: **M** (a new route family).
+
+11. **The annotated-tag read-tag RPC (engine boundary).** The tags API's
+    `message` is always empty because the engine boundary carries no
+    read-tag RPC (`readCommit` peels; `parseTag` unexported; only the
+    write-side `serializeTag`) — F8 of the git-e2e wave, flagged to the
+    engine owner (`1677dbb`; the deviation recorded in the git-models/
+    routes headers; finding origin `27353a2`). Needs the boundary
+    decision (a `readTag` RPC or a peeled-tag sidecar) first. Size: **M**
+    (engine + API), **engine-owner**.
+
+12. **The `/user/settings` remaining serial pair** — the perf lever
+    `06b3384` explicitly left on the table: verifySession's
+    read-and-discard of the full users row plus the navbar bell's unread
+    COUNT ride serially after it; a viewer-level carry would dedupe
+    (4→2 round trips, ~0.7s more at the observed production latency).
+    Lives in `resolveUiSession` (`ui/index.ts`) — orchestrator-owned
+    dispatch. Size: **S–M**.
+
+13. **Guide notes from the production sweeps.** (a) Pre-`b0e1d88` repos
+    carry no armed `repo_settings` row, so `/api/v1`-created or
+    migrated-in repos 404 the Actions tab until the settings toggle arms —
+    expected behavior, but the guide/README should say so (`560f0df`
+    finding F7, orchestrator adjudication). (b) The two client footguns
+    recorded for the packages guide: npm 11's nerfDart drops the registry
+    URL's last path segment without a trailing slash (ENEEDAUTH with a
+    working token), and the maven DELETE needs the encoded
+    `group%3Aartifact` name (`b9f537a`'s informational section). Size:
+    **S** (docs only).
+
 ---
 
 ## How to consume this board
@@ -244,10 +421,13 @@ committed):
   behind the emitter/substrate M3 provides. Item 4 (auths) and items 5–6
   (M6/M7) each open with their own SPEC-attachment per the recorded
   rules — none is dispatchable as a bare UI/store unit.
+- The v1.3.1 additions (P2-5 through P2-9, P3-7 through P3-13) are mostly
+  dispatchable small batches over landed substrate; P2-8's engine-scope
+  items and P3-11 need their boundary decisions first. Verify the
+  in-flight block at the top BEFORE dispatching any of them — four of the
+  five in-flight items overlap this board's P2/P3 rows.
 - P2 items are all dispatchable over landed substrate except the
-  scoped-workflows pieces (P1-3) and the in-flight twin.
+  scoped-workflows pieces (P1-3).
 - P3 is the sweep list for gap waves between feature landings; the doc-debt
-  item is safe to take anytime.
-- Re-verify the in-flight block at the top before dispatching anything
-  from P2: both in-flight units touch the packages family this board's
-  P2/P3 items reference.
+  item is safe to take anytime. P3-9 is a dated observation, not a work
+  queue — clear it after the Oct 31 11:00 UTC check.
