@@ -58,8 +58,11 @@ import {
   getPackageByName,
   packagesQuotaFromEnv,
   searchVersions,
+  PropertyType,
+  deletePackageVersionAndReferences,
 } from "../../services/packages/model";
-import { PackageSizeMismatchError, PackageBlobTooLargeError } from "../../services/packages/blobs";
+import { getPackageProperties } from "../../services/packages/protocol-common";
+import { PackageSizeMismatchError, PackageBlobTooLargeError, packageBlobContentKey } from "../../services/packages/blobs";
 import { DuplicatePackageFileError } from "../../services/packages/generic";
 import { serveFileHeaderSet, servePackageFileResponse } from "../../services/packages/serve-content";
 import {
@@ -128,6 +131,41 @@ import {
   MavenPomInvalidArgumentError,
   MavenPomParseError,
 } from "../../services/packages/maven";
+
+import {
+  CONTAINER_GHOST_USER_ID,
+  ContainerBlobNotExistError,
+  OciNamedError,
+  OCI_BLOB_UPLOAD_INVALID,
+  OCI_BLOB_UPLOAD_UNKNOWN,
+  OCI_BLOB_UNKNOWN,
+  OCI_DIGEST_INVALID,
+  OCI_MANIFEST_UNKNOWN,
+  OCI_NAME_INVALID,
+  OCI_NAME_UNKNOWN,
+  OCI_UNAUTHORIZED,
+  appendContainerUploadChunk,
+  containerBlobStoreSizeMatches,
+  createContainerBlobUpload,
+  deleteContainerBlob,
+  finalizeContainerBlobUpload,
+  getContainerBlob,
+  getContainerBlobUpload,
+  getContainerImageTags,
+  getContainerManifestVersions,
+  isContainerMediaTypeValid,
+  isContainerBlobAccessible,
+  isValidDigest,
+  isValidImageName,
+  isValidReference,
+  listContainerRepositories,
+  mintContainerToken,
+  mountContainerBlob,
+  putContainerManifest,
+  removeContainerBlobUpload,
+  saveContainerBlobFromStream,
+  verifyContainerToken,
+} from "../../services/packages/container";
 
 import {
   NUGET_EDMX_METADATA_XML,
@@ -1579,4 +1617,818 @@ function emptyStream(): ReadableStream<Uint8Array> {
       controller.close();
     },
   });
+}
+
+// ---------------------------------------------------------------------------
+// The OCI CONTAINER registry (SPEC-0016 §7 M6) — upstream ContainerRoutes
+// (routers/api/packages/api.go:509-547), the /v2/ ROOT mount. src/index.ts
+// mounts this router beside the packages mounts (`app.route("/v2",
+// createContainerProtocolRouter())`) and wrangler.jsonc.example pins
+// "/v2/*" in run_worker_first — both orchestrator-owned files (HANDOFF).
+//
+// Wire shapes (container.go:53-130): EVERY response carries the
+// Docker-Distribution-Api-Version header; the header quartet Location /
+// Range / Content-Length / Docker-Upload-Uuid rides the upload arms, the
+// Docker-Content-Digest + ETag pair the content arms; error BODIES are the
+// OCI envelope `{"errors":[{"code","message"}]}` (errors.go) while the
+// apiError arms (quota 403, bare 500) answer the bare status with NO body
+// (container.go:90-93 discards ProcessErrorForUser's message). The 401
+// handshake serves the Bearer realm challenge plus — when the {username}
+// owner exists and is non-public — the Basic realm twin (container.go:116-130,
+// the apple-container login support); the access-denied arms reuse the
+// neighbors' Gitea-Package-API challenge verbatim (upstream's shared
+// reqPackageAccess, api.go:43-63).
+//
+// The credential pass (api.go:512-515's {Basic, Auth{AllowGhostUser}}):
+// Basic → the PAT verify (a FAILED Basic verifies as ANONYMOUS, upstream
+// basic.go's nil-nil posture — the /token arm then mints the ghost token);
+// Bearer → the family's HS256 JWT ONLY (a Bearer PAT is NOT a container
+// credential — upstream packages/auth.go parses every Bearer as the JWT);
+// absent → anonymous. The ghost token (userId -1) passes
+// ReqContainerAccess but stays anonymous in the access ladder
+// (package.go:135-155's !doer.IsGhost() guards).
+// ---------------------------------------------------------------------------
+
+interface ContainerHeaderOpts {
+  location?: string;
+  /** The RFC 5988 pagination Link (catalog + tag list rel="next"). */
+  link?: string;
+  range?: string;
+  contentLength?: number;
+  uploadUuid?: string;
+  contentDigest?: string;
+  contentType?: string;
+  /** WWW-Authenticate values APPENDED in order (the handshake's pair). */
+  wwwAuthenticate?: string[];
+}
+
+/** writeResponseHeaders (container.go:63-82) + jsonResponse's content-type. */
+function containerResponse(status: number, body: BodyInit | null, opts: ContainerHeaderOpts = {}): Response {
+  const headers = new Headers();
+  if (opts.contentType !== undefined) headers.set("Content-Type", opts.contentType);
+  if (opts.location !== undefined && opts.location !== "") headers.set("Location", opts.location);
+  if (opts.link !== undefined && opts.link !== "") headers.set("Link", opts.link);
+  if (opts.range !== undefined && opts.range !== "") headers.set("Range", opts.range);
+  if (opts.contentLength !== undefined) headers.set("Content-Length", String(opts.contentLength));
+  if (opts.uploadUuid !== undefined && opts.uploadUuid !== "") headers.set("Docker-Upload-Uuid", opts.uploadUuid);
+  if (opts.contentDigest !== undefined && opts.contentDigest !== "") {
+    headers.set("Docker-Content-Digest", opts.contentDigest);
+    headers.set("ETag", `"${opts.contentDigest}"`);
+  }
+  headers.set("Docker-Distribution-Api-Version", "registry/2.0");
+  for (const value of opts.wwwAuthenticate ?? []) {
+    headers.append("WWW-Authenticate", value);
+  }
+  return new Response(body, { status, headers });
+}
+
+/** apiErrorDefined (container.go:96-114) — the OCI error envelope. */
+function ociErrorResponse(error: OciNamedError, wwwAuthenticate?: string[]): Response {
+  return containerResponse(error.statusCode, JSON.stringify({ errors: [{ code: error.code, message: error.message }] }), {
+    contentType: "application/json",
+    wwwAuthenticate,
+  });
+}
+
+/** APIUnauthorizedError (container.go:116-130): the Bearer realm (the origin
+ *  root — no sub-path to strip) + the Basic twin when the owner exists and is
+ *  non-public. */
+function containerUnauthorizedResponse(origin: string, owner: UserRow | null): Response {
+  const challenges = [
+    `Bearer realm="${origin}/v2/token",service="container_registry",scope="*"`,
+    ...(owner !== null && owner.visibility !== "public" ? ['Basic realm="Gitea Container Registry"'] : []),
+  ];
+  return ociErrorResponse(OCI_UNAUTHORIZED, challenges);
+}
+
+type ContainerCredential =
+  | { kind: "anonymous" }
+  | { kind: "ghost" }
+  | { kind: "user"; doer: AuthUser; scope: ScopeSet | null };
+
+/**
+ * The container credential pass. null = INVALID credential (a Bearer that
+ * fails the JWT verify — upstream packages/auth.go's error return → the
+ * afterAuthCallback handshake). A failed BASIC verifies as anonymous
+ * (upstream basic.go's nil-nil), NOT as invalid.
+ */
+async function resolveContainerCredential(d1: D1Database, request: Request): Promise<ContainerCredential | null> {
+  const header = request.headers.get("Authorization");
+  if (header === null) return { kind: "anonymous" };
+  const parsed = parseAuthorizationHeader(header);
+  if (parsed === null) return { kind: "anonymous" };
+  if (parsed.basicAuth !== null) {
+    const credential = basicAuthTokenCandidate(parsed.basicAuth);
+    const verified = await new TokenService(d1).verify(credential, { now: new Date() });
+    if (verified === null) return { kind: "anonymous" };
+    return { kind: "user", doer: verified.user, scope: ScopeSet.parseLenient(verified.token.scopes) };
+  }
+  const claims = await verifyContainerToken(d1, parsed.bearerToken?.token ?? "");
+  if (claims === null) return null;
+  if (claims.userId === CONTAINER_GHOST_USER_ID) return { kind: "ghost" };
+  const row = (await drizzle(d1).select().from(users).where(eq(users.id, claims.userId)).get()) ?? null;
+  if (row === null || row.status !== "active") return null;
+  return {
+    kind: "user",
+    doer: rowToAuthUser(row),
+    scope: ScopeSet.parseLenient(claims.scope),
+  };
+}
+
+/** The AuthUser projection of a users row (the auth middleware's converter). */
+function rowToAuthUser(row: UserRow): AuthUser {
+  return {
+    id: row.id,
+    username: row.username,
+    usernameLower: row.usernameLower,
+    email: row.email,
+    displayName: row.displayName,
+    location: row.location,
+    website: row.website,
+    description: row.description,
+    isAdmin: row.isAdmin,
+    status: row.status,
+    createdAt: row.createdAt,
+  };
+}
+
+/** The gate failure = the neighbors' challenge verbatim (upstream's shared
+ *  reqPackageAccess answers the same 401 + Basic realm + plain body,
+ *  api.go:51-61). */
+function containerGateContext(owner: UserRow, doer: AuthUser | null, scope: ScopeSet | null): ResolvedCredential {
+  return { doer, scope };
+}
+
+/**
+ * The container family's gate arms carry their response as a VALUE, never as
+ * a thrown HTTPException: the root app's onError override (src/index.ts:91)
+ * renders every unhandled error as the 500 chrome and has no
+ * HTTPException passthrough — a thrown challenge would die as a 500 on the
+ * live deployment (the six older families ride the same landmine; flagged to
+ * the orchestrator). The dispatcher unwraps these one frame down.
+ */
+class ContainerGateResponse extends Error {
+  constructor(readonly response: Response) {
+    super("container gate response");
+    this.name = "ContainerGateResponse";
+  }
+}
+
+/**
+ * The {username}-group preamble: the plain-404 owner resolution
+ * (UserAssignmentWeb), the public-only blindness, then the shared gate
+ * (protocolAccessGate — scope then access mode, the reqPackageAccess port).
+ * Ghost/anonymous doers reach the gate with doer=null (the ladder's
+ * anonymous arm — package.go's IsGhost guards).
+ */
+async function containerOwnerContext(
+  c: Context<{ Bindings: Env }>,
+  required: "read" | "write",
+): Promise<{ owner: UserRow; doer: AuthUser | null; ghost: boolean }> {
+  if (packagesDisabled(c.env)) {
+    throw new ContainerGateResponse(plainResponse(404, "not found"));
+  }
+  const origin = new URL(c.req.url).origin;
+  const cred = await resolveContainerCredential(c.env.DB, c.req.raw);
+  if (cred === null) {
+    // Upstream's afterAuthCallback looks the owner up from the path param
+    // for the challenge (container.go:121-128) — a private owner's path
+    // adds the Basic realm twin even on an auth-layer failure.
+    const challengeOwner = await resolveOwnerRow(c.env.DB, containerUsername(c));
+    throw new ContainerGateResponse(containerUnauthorizedResponse(origin, challengeOwner));
+  }
+  const username = containerUsername(c);
+  const owner = await resolveOwnerRow(c.env.DB, username);
+  if (owner === null) {
+    throw new ContainerGateResponse(plainResponse(404, userRedirectDoesNotExist(username)));
+  }
+  const doer = cred.kind === "user" ? cred.doer : null;
+  const scope = cred.kind === "user" ? cred.scope : null;
+  const resolved = containerGateContext(owner, doer, scope);
+  if (ownerBlindToPublicOnly(owner, resolved)) {
+    throw new ContainerGateResponse(plainResponse(404, userRedirectDoesNotExist(owner.username)));
+  }
+  try {
+    await protocolAccessGate(c.env.DB, required, owner, resolved);
+  } catch (error) {
+    // The shared gate throws the families' HTTPException challenge — carry
+    // its prepared response (upstream reqPackageAccess's 401, api.go:51-61).
+    if (error instanceof HTTPException) {
+      throw new ContainerGateResponse(error.getResponse());
+    }
+    throw error;
+  }
+  return { owner, doer, ghost: cred.kind === "ghost" };
+}
+
+/** VerifyImageName (container.go:140-144). */
+function verifyContainerImageName(image: string): void {
+  if (!isValidImageName(image)) {
+    throw OCI_NAME_INVALID;
+  }
+}
+
+/** The dispatcher's username (segments[1], decoded once — the raw path is
+ *  NOT param-decoded on a wildcard registration; upstream's chi params
+ *  arrive decoded). */
+function containerUsername(c: Context<{ Bindings: Env }>): string {
+  const segments = c.req.path.split("/").filter((segment) => segment !== "");
+  return decodeSegment(segments[1] ?? "");
+}
+
+function decodeSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
+/** The container family's error mapper (the catch-all the dispatcher wraps). */
+function containerErrorResponse(error: unknown): Response {
+  if (error instanceof HTTPException) throw error;
+  if (error instanceof ContainerGateResponse) return error.response;
+  if (error instanceof OciNamedError) return ociErrorResponse(error);
+  // The manifest PUT's missing config/layer → BLOB_UNKNOWN (container.go:589-590);
+  // the manifest GET arms catch their own NotExist first (MANIFEST_UNKNOWN).
+  if (error instanceof ContainerBlobNotExistError) return ociErrorResponse(OCI_BLOB_UNKNOWN);
+  // apiError(ctx, 403/413/500, err) — the BARE status, message discarded
+  // (container.go:90-93).
+  if (error instanceof QuotaTotalCountError || error instanceof QuotaTypeSizeError || error instanceof QuotaTotalSizeError) {
+    return containerResponse(403, null);
+  }
+  if (error instanceof PackageBlobTooLargeError) return containerResponse(413, null);
+  if (error instanceof PackageSizeMismatchError) return containerResponse(500, null);
+  console.error("[packages-container] request failed", error);
+  return containerResponse(500, null);
+}
+
+/** container.go:188-193 — the chunked-upload range header's start offset. */
+function parseContentRangeStart(contentRange: string): number | null {
+  const match = /^(\d+)-(\d+)$/.exec(contentRange.trim());
+  if (match === null) return null;
+  const start = Number.parseInt(match[1] ?? "", 10);
+  return Number.isSafeInteger(start) ? start : null;
+}
+
+/** The manifest search options from a reference (container.go:608-626) — a
+ *  digest reference or a tag (lead-only); anything else is the
+ *  MANIFEST_UNKNOWN arm. */
+function containerManifestSearchReference(reference: string): { digest?: string; tag?: string } | null {
+  if (isValidDigest(reference)) {
+    return { digest: reference };
+  }
+  if (isValidReference(reference)) {
+    return { tag: reference };
+  }
+  return null;
+}
+
+/** The stored media-type property of a manifest file (container.go:638-639 —
+ *  the fallback to application/octet-stream when absent or unrecognized). */
+async function containerManifestContentType(d1: D1Database, fileId: number): Promise<string> {
+  const properties = await getPackageProperties(d1, PropertyType.File, fileId);
+  const stored = properties.find((property) => property.name === "container.mediatype")?.value ?? "";
+  return isContainerMediaTypeValid(stored) ? stored : "application/octet-stream";
+}
+
+/**
+ * The /v2 dispatcher. Hono params cannot span the image's slashes (nested
+ * repo paths — upstream's `<image:*>`), so the router catches the whole tail
+ * with a wildcard and the grammar is walked segment-by-segment (the npm
+ * family's parseTarget pattern). Mount-agnostic: the leading segment is the
+ * mount prefix and is ignored. The zero-rest GET is the /v2/ ping (the ""
+ * registration covers the bare /v2 — Hono's route() merge collapses the "/"
+ * sub-path onto the mount point, so the trailing-slash shape arrives HERE).
+ */
+async function containerDispatch(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const segments = c.req.path.split("/").filter((segment) => segment !== "");
+    const rest = segments.slice(2);
+    const method = c.req.method;
+    const notFound = (): Response => plainResponse(404, "404 page not found\n");
+
+    if (rest.length === 0) {
+      if (method === "GET") return containerPing(c);
+      return notFound();
+    }
+    if (rest.length < 2) return notFound();
+
+    // POST <image>/blobs/uploads (api.go:527)
+    if (
+      method === "POST" &&
+      rest[rest.length - 1] === "uploads" &&
+      rest[rest.length - 2] === "blobs"
+    ) {
+      const image = rest.slice(0, -2).join("/");
+      verifyContainerImageName(image);
+      return await containerPostBlobUploads(c, image);
+    }
+    // GET <image>/tags/list (api.go:528)
+    if (method === "GET" && rest[rest.length - 1] === "list" && rest[rest.length - 2] === "tags") {
+      const image = rest.slice(0, -2).join("/");
+      verifyContainerImageName(image);
+      return await containerGetTagsList(c, image);
+    }
+    // <image>/blobs/uploads/<uuid> GET/PATCH/PUT/DELETE (api.go:530-534)
+    if (rest.length >= 4 && rest[rest.length - 2] === "uploads" && rest[rest.length - 3] === "blobs") {
+      const maybeUuid = rest[rest.length - 1];
+      if (maybeUuid !== undefined && maybeUuid !== "" && ["GET", "PATCH", "PUT", "DELETE"].includes(method)) {
+        const image = rest.slice(0, -3).join("/");
+        verifyContainerImageName(image);
+        return await containerBlobUploadSession(c, method, image, maybeUuid);
+      }
+    }
+    // <image>/blobs/<digest> HEAD/GET/DELETE (api.go:536-538)
+    if (["HEAD", "GET", "DELETE"].includes(method) && rest[rest.length - 2] === "blobs" && rest[rest.length - 1] !== "uploads") {
+      const digest = rest[rest.length - 1] ?? "";
+      const image = rest.slice(0, -2).join("/");
+      verifyContainerImageName(image);
+      return await containerBlobContent(c, method, image, digest);
+    }
+    // <image>/manifests/<reference> HEAD/GET/PUT/DELETE (api.go:540-543)
+    if (["HEAD", "GET", "PUT", "DELETE"].includes(method) && rest[rest.length - 2] === "manifests") {
+      const reference = rest[rest.length - 1] ?? "";
+      const image = rest.slice(0, -2).join("/");
+      verifyContainerImageName(image);
+      return await containerManifest(c, method, image, reference);
+    }
+    return notFound();
+  } catch (error) {
+    return containerErrorResponse(error);
+  }
+}
+
+// The individual arms — thin over services/packages/container.ts.
+
+/** DetermineSupport (container.go:148-150) behind ReqContainerAccess
+ *  (:133-137). */
+async function containerPing(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const origin = new URL(c.req.url).origin;
+  const cred = await resolveContainerCredential(c.env.DB, c.req.raw);
+  if (cred === null || cred.kind === "anonymous") {
+    return containerUnauthorizedResponse(origin, null);
+  }
+  return containerResponse(200, null);
+}
+
+/** Authenticate (container.go:154-187) — the ghost mint for anonymous, the
+ *  package-scope gate for real users, the 401 for ghost/invalid bearers. */
+async function containerToken(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const origin = new URL(c.req.url).origin;
+  const d1 = c.env.DB;
+  const cred = await resolveContainerCredential(d1, c.req.raw);
+  if (cred === null) {
+    return containerUnauthorizedResponse(origin, null);
+  }
+  if (cred.kind === "user") {
+    const scope = cred.scope;
+    // container.go:165-176 — HasAnyScope(read:package, write:package, all).
+    if (scope === null || !scope.hasAny("read:package", "write:package", "all")) {
+      return containerUnauthorizedResponse(origin, null);
+    }
+    const token = await mintContainerToken(d1, cred.doer.id, verifiedScopeString(cred));
+    return containerResponse(200, JSON.stringify({ token }), { contentType: "application/json" });
+  }
+  if (cred.kind === "anonymous") {
+    // container.go:157-163 — the ghost token (no RequireSignInViewStrict).
+    const token = await mintContainerToken(d1, CONTAINER_GHOST_USER_ID, "");
+    return containerResponse(200, JSON.stringify({ token }), { contentType: "application/json" });
+  }
+  // A ghost/invalid bearer at /token: upstream's ghost doer carries no
+  // scope → the HasAnyScope gate 401s (container.go:165-176).
+  return containerUnauthorizedResponse(origin, null);
+}
+
+/** The mint-time scope string (the PAT's normalized scope — upstream's
+ *  GetAccessScope answer). */
+function verifiedScopeString(cred: Extract<ContainerCredential, { kind: "user" }>): string {
+  return cred.scope?.toString() ?? "";
+}
+
+/** AuthenticateNotImplemented (container.go:190-198) — the 404 stub. */
+function containerTokenPost(): Response {
+  return containerResponse(404, null);
+}
+
+/** GetRepositoryList (container.go:201-231) — the catalog. */
+async function containerCatalog(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const origin = new URL(c.req.url).origin;
+  const cred = await resolveContainerCredential(c.env.DB, c.req.raw);
+  if (cred === null || cred.kind === "anonymous") {
+    return containerUnauthorizedResponse(origin, null);
+  }
+  let n = 100;
+  const rawN = c.req.query("n");
+  if (rawN !== undefined && rawN !== "") {
+    const parsed = Number.parseInt(rawN, 10);
+    n = Number.isSafeInteger(parsed) ? parsed : 0;
+  }
+  if (n <= 0 || n > 100) n = 100;
+  const last = c.req.query("last") ?? "";
+  const viewer = cred.kind === "user" ? { id: cred.doer.id, isAdmin: cred.doer.isAdmin } : null;
+  const repositories = await listContainerRepositories(c.env.DB, viewer, n, last);
+  if (repositories.length === n) {
+    // container.go:218-226 — the Link rel="next" header.
+    const v = new URLSearchParams();
+    v.set("n", String(n));
+    v.set("last", repositories[repositories.length - 1] ?? "");
+    return containerResponse(200, JSON.stringify({ repositories }), {
+      contentType: "application/json",
+      link: `</v2/_catalog?${v.toString()}>; rel="next"`,
+    });
+  }
+  return containerResponse(200, JSON.stringify({ repositories }), { contentType: "application/json" });
+}
+
+
+/** PostBlobsUploads (container.go:236-321) — mount / single-POST / session. */
+async function containerPostBlobUploads(c: Context<{ Bindings: Env }>, image: string): Promise<Response> {
+  const { owner, doer } = await containerOwnerContext(c, "write");
+  const d1 = c.env.DB;
+  const bucket = c.env.REPO_PACKS;
+  const quota = packagesQuotaFromEnv(c.env);
+  const lowerName = owner.usernameLower;
+  const doerOrNull = doer === null ? null : { id: doer.id, isAdmin: doer.isAdmin };
+
+  // The cross-repo mount (container.go:239-267): the source search is
+  // owner-UNSCOPED (the repository property names owner/image); an
+  // inaccessible or missing source falls through to the normal flow.
+  const mount = c.req.query("mount") ?? "";
+  if (mount !== "") {
+    const from = c.req.query("from") ?? "";
+    let descriptor: Awaited<ReturnType<typeof getContainerBlob>> | null = null;
+    try {
+      descriptor = await getContainerBlob(d1, { repository: from, digest: mount });
+    } catch (error) {
+      if (!(error instanceof ContainerBlobNotExistError)) throw error;
+    }
+    if (descriptor !== null && (await containerBlobStoreSizeMatches(bucket, descriptor.blob)) && (await isContainerBlobAccessible(d1, descriptor, doerOrNull))) {
+      await mountContainerBlob(d1, { id: owner.id, usernameLower: lowerName, visibility: owner.visibility, type: owner.type }, image, descriptor.blob);
+      return containerResponse(201, null, {
+        location: `/v2/${lowerName}/${image}/blobs/${mount}`,
+        contentDigest: mount,
+      });
+    }
+  }
+
+  // The single-POST arm (container.go:269-308).
+  const digest = c.req.query("digest") ?? "";
+  if (digest !== "") {
+    await saveContainerBlobFromStream({
+      d1,
+      bucket,
+      owner: { id: owner.id, usernameLower: lowerName, visibility: owner.visibility, type: owner.type },
+      doer: doer === null ? { id: 0, isAdmin: false } : { id: doer.id, isAdmin: doer.isAdmin },
+      image,
+      digest,
+      content: bodyStream(c.req.raw),
+      declaredLength: contentLength(c.req.raw) ?? undefined,
+      quota,
+    });
+    return containerResponse(201, null, {
+      location: `/v2/${lowerName}/${image}/blobs/${digest}`,
+      contentDigest: digest,
+    });
+  }
+
+  // The chunked-upload session (container.go:310-320).
+  const upload = await createContainerBlobUpload(d1);
+  return containerResponse(202, null, {
+    location: `/v2/${lowerName}/${image}/blobs/uploads/${upload.id}`,
+    uploadUuid: upload.id,
+  });
+}
+
+/** GetBlobsUpload (container.go:324-348) — the session status probe. */
+async function containerGetBlobsUpload(c: Context<{ Bindings: Env }>, image: string, uuid: string): Promise<Response> {
+  const { owner } = await containerOwnerContext(c, "write");
+  const upload = await getContainerBlobUpload(c.env.DB, uuid);
+  if (upload === null) {
+    return ociErrorResponse(OCI_BLOB_UPLOAD_UNKNOWN);
+  }
+  const lowerName = owner.usernameLower;
+  return containerResponse(204, null, {
+    location: `/v2/${lowerName}/${image}/blobs/uploads/${upload.id}`,
+    uploadUuid: upload.id,
+    range: upload.bytesReceived > 0 ? `0-${upload.bytesReceived - 1}` : undefined,
+  });
+}
+
+/** PatchBlobsUpload (container.go:352-397) — the chunk append. */
+async function containerPatchBlobsUpload(c: Context<{ Bindings: Env }>, image: string, uuid: string): Promise<Response> {
+  const { owner } = await containerOwnerContext(c, "write");
+  const upload = await getContainerBlobUpload(c.env.DB, uuid);
+  if (upload === null) {
+    return ociErrorResponse(OCI_BLOB_UPLOAD_UNKNOWN);
+  }
+  const contentRange = c.req.raw.headers.get("Content-Range");
+  if (contentRange !== null && contentRange !== "") {
+    const start = parseContentRangeStart(contentRange);
+    if (start === null) {
+      return ociErrorResponse(OCI_BLOB_UPLOAD_INVALID);
+    }
+    if (start !== upload.bytesReceived) {
+      return ociErrorResponse(OCI_BLOB_UPLOAD_INVALID.withStatusCode(416));
+    }
+  } else if (upload.bytesReceived !== 0) {
+    return ociErrorResponse(OCI_BLOB_UPLOAD_INVALID.withMessage("Stream uploads after first write are not allowed"));
+  }
+  const appended = await appendContainerUploadChunk(
+    c.env.DB,
+    c.env.REPO_PACKS,
+    upload.id,
+    bodyStream(c.req.raw),
+    contentLength(c.req.raw) ?? undefined,
+  );
+  return containerResponse(202, null, {
+    location: `/v2/${owner.usernameLower}/${image}/blobs/uploads/${upload.id}`,
+    uploadUuid: upload.id,
+    range: appended.bytesReceived > 0 ? `0-${appended.bytesReceived - 1}` : undefined,
+  });
+}
+
+/** PutBlobsUpload (container.go:400-466) — the finalize. */
+async function containerPutBlobsUpload(c: Context<{ Bindings: Env }>, image: string, uuid: string): Promise<Response> {
+  const { owner, doer } = await containerOwnerContext(c, "write");
+  const digest = c.req.query("digest") ?? "";
+  if (digest === "") {
+    return ociErrorResponse(OCI_DIGEST_INVALID);
+  }
+  const upload = await getContainerBlobUpload(c.env.DB, uuid);
+  if (upload === null) {
+    return ociErrorResponse(OCI_BLOB_UPLOAD_UNKNOWN);
+  }
+  const finalBody = c.req.raw.body;
+  await finalizeContainerBlobUpload({
+    d1: c.env.DB,
+    bucket: c.env.REPO_PACKS,
+    owner: { id: owner.id, usernameLower: owner.usernameLower, visibility: owner.visibility, type: owner.type },
+    doer: doer === null ? { id: 0, isAdmin: false } : { id: doer.id, isAdmin: doer.isAdmin },
+    image,
+    upload,
+    digest,
+    finalChunk:
+      finalBody !== null
+        ? { content: finalBody as ReadableStream<Uint8Array>, declaredLength: contentLength(c.req.raw) ?? undefined }
+        : undefined,
+    quota: packagesQuotaFromEnv(c.env),
+  });
+  return containerResponse(201, null, {
+    location: `/v2/${owner.usernameLower}/${image}/blobs/${digest}`,
+    contentDigest: digest,
+  });
+}
+
+/** DeleteBlobsUpload (container.go:469-488) — the abort. */
+async function containerDeleteBlobsUpload(c: Context<{ Bindings: Env }>, uuid: string): Promise<Response> {
+  await containerOwnerContext(c, "write");
+  const upload = await getContainerBlobUpload(c.env.DB, uuid);
+  if (upload === null) {
+    return ociErrorResponse(OCI_BLOB_UPLOAD_UNKNOWN);
+  }
+  await removeContainerBlobUpload(c.env.DB, c.env.REPO_PACKS, uuid);
+  return containerResponse(204, null);
+}
+
+/** The session-arms router (api.go:530-534 — the pattern carries write on
+ *  ALL FOUR methods). */
+async function containerBlobUploadSession(
+  c: Context<{ Bindings: Env }>,
+  method: string,
+  image: string,
+  uuid: string,
+): Promise<Response> {
+  switch (method) {
+    case "GET":
+      return containerGetBlobsUpload(c, image, uuid);
+    case "PATCH":
+      return containerPatchBlobsUpload(c, image, uuid);
+    case "PUT":
+      return containerPutBlobsUpload(c, image, uuid);
+    default:
+      return containerDeleteBlobsUpload(c, uuid);
+  }
+}
+
+/** getBlobFromContext (container.go:490-501) + the store-size gate
+ *  (getExistingContainerBlob, :781-796). */
+async function containerBlobFromContext(
+  d1: D1Database,
+  bucket: R2Bucket,
+  ownerId: number,
+  image: string,
+  digest: string,
+): Promise<Awaited<ReturnType<typeof getContainerBlob>>> {
+  if (!isValidDigest(digest)) {
+    throw new ContainerBlobNotExistError();
+  }
+  const descriptor = await getContainerBlob(d1, { ownerId, image, digest });
+  if (!(await containerBlobStoreSizeMatches(bucket, descriptor.blob))) {
+    throw new ContainerBlobNotExistError();
+  }
+  return descriptor;
+}
+
+/** HeadBlob + GetBlob (container.go:504-536). */
+async function containerBlobContent(c: Context<{ Bindings: Env }>, method: string, image: string, digest: string): Promise<Response> {
+  const { owner } = await containerOwnerContext(c, method === "DELETE" ? "write" : "read");
+  const d1 = c.env.DB;
+  if (method === "DELETE") {
+    // DeleteBlob (container.go:539-552) — the invalid digest is the
+    // BLOB_UNKNOWN arm here (the validate-then-delete order, :540-543).
+    if (!isValidDigest(digest)) {
+      return ociErrorResponse(OCI_BLOB_UNKNOWN);
+    }
+    await deleteContainerBlob(d1, owner.id, image, digest);
+    return containerResponse(202, null);
+  }
+  const descriptor = await containerBlobFromContext(d1, c.env.REPO_PACKS, owner.id, image, digest);
+  const digestProperty = descriptor.blob.hashSha256 === "" ? "" : `sha256:${descriptor.blob.hashSha256}`;
+  if (method === "HEAD") {
+    // container.go:514-519 — application/octet-stream + the length + digest.
+    return containerResponse(200, null, {
+      contentType: "application/octet-stream",
+      contentLength: descriptor.blob.size,
+      contentDigest: digestProperty,
+    });
+  }
+  // GetBlob (container.go:523-536) — always 200 full-body (upstream serveBlob
+  // io.Copy's with no range/conditional machinery; we do not advertise
+  // Accept-Ranges so resuming clients fall back per RFC 7233).
+  const object = await c.env.REPO_PACKS.get(packageBlobContentKey(descriptor.blob.hashSha256));
+  if (object === null) {
+    return ociErrorResponse(OCI_BLOB_UNKNOWN);
+  }
+  return containerResponse(200, object.body, {
+    contentType: "application/octet-stream",
+    contentLength: descriptor.blob.size,
+    contentDigest: digestProperty,
+  });
+}
+
+/** PutManifest (container.go:555-606). */
+async function containerPutManifest(c: Context<{ Bindings: Env }>, image: string, reference: string): Promise<Response> {
+  const { owner, doer } = await containerOwnerContext(c, "write");
+  const result = await putContainerManifest({
+    d1: c.env.DB,
+    bucket: c.env.REPO_PACKS,
+    owner: { id: owner.id, usernameLower: owner.usernameLower, visibility: owner.visibility, type: owner.type },
+    doer: doer === null ? { id: 0, isAdmin: false } : { id: doer.id, isAdmin: doer.isAdmin },
+    image,
+    reference,
+    contentType: c.req.header("Content-Type") ?? "",
+    content: bodyStream(c.req.raw),
+    declaredLength: contentLength(c.req.raw) ?? undefined,
+    quota: packagesQuotaFromEnv(c.env),
+  });
+  return containerResponse(201, null, {
+    location: `/v2/${owner.usernameLower}/${image}/manifests/${reference}`,
+    contentDigest: result.digest,
+  });
+}
+
+/** getManifestFromContext (container.go:628-641) + the store-size gate. */
+async function containerManifestFromContext(
+  c: Context<{ Bindings: Env }>,
+  ownerId: number,
+  image: string,
+  reference: string,
+): Promise<{ descriptor: Awaited<ReturnType<typeof getContainerBlob>>; contentType: string; digestProperty: string }> {
+  const search = containerManifestSearchReference(reference);
+  if (search === null) {
+    throw new ContainerBlobNotExistError();
+  }
+  const descriptor = await getContainerBlob(c.env.DB, {
+    ownerId,
+    image,
+    digest: search.digest,
+    tag: search.tag,
+    isManifest: true,
+    onlyLead: search.tag !== undefined,
+  });
+  if (!(await containerBlobStoreSizeMatches(c.env.REPO_PACKS, descriptor.blob))) {
+    throw new ContainerBlobNotExistError();
+  }
+  return {
+    descriptor,
+    contentType: await containerManifestContentType(c.env.DB, descriptor.file.id),
+    digestProperty: `sha256:${descriptor.blob.hashSha256}`,
+  };
+}
+
+/** HeadManifest + GetManifest (container.go:644-674). */
+async function containerGetOrHeadManifest(c: Context<{ Bindings: Env }>, method: string, image: string, reference: string): Promise<Response> {
+  const { owner } = await containerOwnerContext(c, "read");
+  let found: Awaited<ReturnType<typeof containerManifestFromContext>>;
+  try {
+    found = await containerManifestFromContext(c, owner.id, image, reference);
+  } catch (error) {
+    // container.go:647-648 / :666-667 — the not-exist arm is MANIFEST_UNKNOWN
+    // on the pull arms.
+    if (error instanceof ContainerBlobNotExistError) {
+      return ociErrorResponse(OCI_MANIFEST_UNKNOWN);
+    }
+    throw error;
+  }
+  if (method === "HEAD") {
+    return containerResponse(200, null, {
+      contentType: found.contentType,
+      contentLength: found.descriptor.blob.size,
+      contentDigest: found.digestProperty,
+    });
+  }
+  const object = await c.env.REPO_PACKS.get(packageBlobContentKey(found.descriptor.blob.hashSha256));
+  if (object === null) {
+    return ociErrorResponse(OCI_MANIFEST_UNKNOWN);
+  }
+  return containerResponse(200, object.body, {
+    contentType: found.contentType,
+    contentLength: found.descriptor.blob.size,
+    contentDigest: found.digestProperty,
+  });
+}
+
+/** DeleteManifest (container.go:678-704). */
+async function containerDeleteManifest(c: Context<{ Bindings: Env }>, image: string, reference: string): Promise<Response> {
+  const { owner } = await containerOwnerContext(c, "write");
+  const search = containerManifestSearchReference(reference);
+  if (search === null) {
+    return ociErrorResponse(OCI_MANIFEST_UNKNOWN);
+  }
+  const versions = await getContainerManifestVersions(c.env.DB, {
+    ownerId: owner.id,
+    image,
+    digest: search.digest,
+    tag: search.tag,
+    isManifest: true,
+    onlyLead: search.tag !== undefined,
+  });
+  if (versions.length === 0) {
+    return ociErrorResponse(OCI_MANIFEST_UNKNOWN);
+  }
+  for (const version of versions) {
+    await deletePackageVersionAndReferences(c.env.DB, version.id);
+  }
+  return containerResponse(202, null);
+}
+
+/** The manifest-arms router (api.go:540-543). */
+async function containerManifest(c: Context<{ Bindings: Env }>, method: string, image: string, reference: string): Promise<Response> {
+  switch (method) {
+    case "PUT":
+      return containerPutManifest(c, image, reference);
+    case "DELETE":
+      return containerDeleteManifest(c, image, reference);
+    default:
+      return containerGetOrHeadManifest(c, method, image, reference);
+  }
+}
+
+/** GetTagsList (container.go:735-778). */
+async function containerGetTagsList(c: Context<{ Bindings: Env }>, image: string): Promise<Response> {
+  const { owner } = await containerOwnerContext(c, "read");
+  const pkg = await getPackageByName(c.env.DB, owner.id, "container", image);
+  if (pkg === null) {
+    return ociErrorResponse(OCI_NAME_UNKNOWN);
+  }
+  const rawN = c.req.query("n");
+  let n = -1;
+  if (rawN !== undefined && rawN !== "") {
+    const parsed = Number.parseInt(rawN, 10);
+    n = Number.isSafeInteger(parsed) ? parsed : 0;
+  }
+  const last = c.req.query("last") ?? "";
+  const tags = await getContainerImageTags(c.env.DB, owner.id, image, n, last);
+  if (tags.length > 0) {
+    const v = new URLSearchParams();
+    if (n > 0) {
+      v.set("n", String(n));
+    }
+    v.set("last", tags[tags.length - 1] ?? "");
+    return containerResponse(200, JSON.stringify({ name: `${owner.usernameLower}/${image.toLowerCase()}`, tags }), {
+      contentType: "application/json",
+      link: `</v2/${owner.usernameLower}/${image}/tags/list?${v.toString()}>; rel="next"`,
+    });
+  }
+  return containerResponse(200, JSON.stringify({ name: `${owner.usernameLower}/${image.toLowerCase()}`, tags }), {
+    contentType: "application/json",
+  });
+}
+
+/**
+ * The /v2 sub-app (api.go:509-547) — src/index.ts mounts it at the ROOT
+ * (`app.route("/v2", …)`). The statics (/token, /_catalog, the bare /v2
+ * ping) outrank the wildcard in Hono's router; everything else reaches the
+ * grammar dispatcher (including the /v2/ trailing-slash ping — see the
+ * dispatcher's note).
+ */
+export function createContainerProtocolRouter(): Hono<{ Bindings: Env }> {
+  const app = new Hono<{ Bindings: Env }>();
+  app.get("", (c) => containerPing(c));
+  app.get("/token", (c) => containerToken(c));
+  app.post("/token", () => containerTokenPost());
+  app.get("/_catalog", (c) => containerCatalog(c));
+  app.on(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"], "/*", (c) => containerDispatch(c));
+  return app;
 }

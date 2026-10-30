@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { HTTPException } from "hono/http-exception";
 
 import { createDurableGit, Registry, RepoCell } from "@cf-gitea/git-engine";
 import { resolveAuth, tokenRouter } from "./auth";
@@ -9,7 +10,7 @@ import {
 } from "./auth/middleware";
 import { createApiRouter } from "./api/router";
 import { createPackagesProtocolRouter } from "./api/routes/packages";
-import { createEcosystemProtocolRouter } from "./api/routes/packages-protocols";
+import { createContainerProtocolRouter, createEcosystemProtocolRouter } from "./api/routes/packages-protocols";
 import { createActionsRouter } from "./services/actions/routes";
 import { createArtifactsV1Router } from "./services/actions/artifacts-v1";
 import { ARTIFACT_V4_ROUTE_BASE, createArtifactsV4Router } from "./services/actions/artifacts-v4";
@@ -88,6 +89,11 @@ const app = new Hono<{ Bindings: Env }>();
 // (services/actions/routes.ts:291), so its errors stay connect-shaped and
 // never reach this arm.
 app.onError(async (error, c) => {
+  // A thrown HTTPException carries its own crafted response (the protocol
+  // families' 401 challenges among them) — pass it through untouched instead
+  // of wrapping it as a 500 (the OCI walk's live find: every family's thrown
+  // challenge rendered 500 here while their vitest parents honored it).
+  if (error instanceof HTTPException) return error.getResponse();
   console.error(`500 answering ${c.req.method} ${c.req.url}`, error);
   const headers = {
     // SetCacheControlInHeader zero-options (errpage.go:87 → httpcache.go:29-31).
@@ -234,6 +240,12 @@ app.route("/api/packages", createPackagesProtocolRouter());
 // inside).
 app.route("/api/packages", createEcosystemProtocolRouter());
 
+// /v2 (SPEC-0016 §7 M6): the container (OCI) registry family — upstream mounts
+// ContainerRoutes on /v2 at the ROOT (api.go:509-547; container.go:117: "container
+// registry requires that the /v2 must be in the root"), beside the
+// /api/packages families.
+app.route("/v2", createContainerProtocolRouter());
+
 // /api/actions (SPEC-0012 §2.1, M1a): the runner protocol — the ping echo +
 // the connect-RPC RunnerService mounts under /<service-name>/<Method>
 // (upstream actions.go:22-26), with the runner interceptor living inside the
@@ -322,6 +334,7 @@ export default {
       segments[1] !== "" &&
       segments[0] !== "api" &&
       segments[0] !== "twirp" &&
+      segments[0] !== "v2" && // the OCI root mount (api.go:509) — /v2/{owner}/… is NOT repo-scoped
       !isAvatarServing &&
       !isAttachmentServing;
     if (isRepoScoped) {

@@ -453,6 +453,24 @@ export const users = sqliteTable(
      *  `wrangler d1 execute` — deliberately NOT automated (dev D1 is
      *  scratch, AGENTS.md; remote D1 has no production rows yet). */
     numStars: integer("num_stars").notNull().default(0),
+    // -------------------------------------------------------------------------
+    // Auth last-login (P3-7) — kept LAST for the same reason as `num_stars`:
+    // ALTER TABLE ADD COLUMN physically appends the column.
+    // -------------------------------------------------------------------------
+    /** Upstream `User.LastLoginUnix` (models/user/user.go:124, `xorm:"INDEX"`)
+     *  — set at every SESSION MINT (upstream's sign-in family: handleSignInFull
+     *  routers/web/auth/auth.go:427-430, handleUserCreated :713-717, account
+     *  activation :905, OAuth oauth.go:409, the non-interactive middleware
+     *  sign-ins services/auth/auth.go:52), never at per-request session verify
+     *  (CheckAuthToken, services/auth/auth_token.go:33-69, is read-only on the
+     *  user row). Rendered authed-gated by the API serializer
+     *  (apiUserFromRow — convert/user.go:118: `result.LastLogin =
+     *  user.LastLoginUnix.AsTime()` under `if authed`). NULL = never signed in
+     *  (upstream's zero TimeStamp; AsTime() then renders Go zero time, the
+     *  serializer's GO_ZERO_TIME). Upstream's INDEX exists for the admin
+     *  user-list `LastLoginSince` filter (user.go:897) which has no landed
+     *  surface — no index here. */
+    lastLoginAt: integer("last_login_at", { mode: "timestamp" }),
   },
   (t) => [
     uniqueIndex("users_username_lower_uq").on(t.usernameLower),
@@ -1496,6 +1514,58 @@ export const userSettings = sqliteTable("user_settings", {
     .notNull()
     .default("failure-only"),
 });
+
+// ---------------------------------------------------------------------------
+// The generic user-settings KV store (upstream `user_setting`,
+// models/user/setting.go:22-29) — ONE table, MANY keys. The typed
+// `user_settings` above is this deployment's COLLAPSE of upstream's
+// user-preference KV keys (theme/language + the two email-notification
+// preferences — each its own column there); upstream itself keeps every one
+// of those keys on the SAME generic KV, and the keys with no typed home —
+// `SettingsKeyActionsConfig` = "actions.config" (setting_options.go:26,
+// models/actions/config.go:38-47's Get/SetOwnerActionsConfig) first — land
+// here, so the store's semantics are upstream's: absent row = the caller's
+// default (setting.go:210-232's GetUserSettingJSON), the row is a
+// (user_id, key) → text upsert (setting.go:186-208's
+// upsertUserSettingValue). Column-for-column with upstream: the composite
+// UNIQUE over (user_id, setting_key) IS upstream's `key_userid` constraint
+// (both columns carry xorm's `unique(key_userid)` tag, :24-26 — its
+// user_id prefix serves the load-all-of-a-user's-settings scan, :100-110,
+// so there is no separate user_id index upstream either), setting_value is
+// upstream's TEXT. Owner scope note: upstream's OwnerActionsConfig rows are
+// written with the ORG's id as readily as a user's (getRunnersCtx's
+// OwnerID, runners.go:82-91) because upstream orgs are users-table rows —
+// the `users.type` collapse here matches, so one FK covers both scopes.
+// The constant lives in services/actions/owner-actions-config.ts (the
+// schema carries tables; the SYSTEM_NOTICE_* precedents are page-render
+// enums). Written ONLY through that service (the user_settings typed
+// store's saveUserSettings maps explicit columns and never touches this
+// table — the two stores' writes cannot clobber each other).
+// ---------------------------------------------------------------------------
+
+export const userSettingsKv = sqliteTable(
+  "user_settings_kv",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Upstream `UserID` — the owner row (a user OR an org; see the
+     *  section comment's scope note). */
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** Upstream `SettingKey varchar(255)` — lowercase always (upstream's
+     *  validateUserSettingKey refuses mixed case, setting.go:116-124). */
+    settingKey: text("setting_key").notNull(),
+    /** Upstream `SettingValue text` — opaque string bytes; the JSON keys
+     *  store their Go-marshal serialization (models/user/setting.go:227-232's
+     *  SetUserSettingJSON). */
+    settingValue: text("setting_value").notNull(),
+  },
+  (t) => [
+    // Upstream's composite UNIQUE `key_userid` (setting.go:24-26) — the
+    // upsert's arbitration point and the per-user scan key in one.
+    uniqueIndex("user_settings_kv_user_key_uq").on(t.userId, t.settingKey),
+  ],
+);
 
 // ---------------------------------------------------------------------------
 // SPEC-0009 §3.1 — pull-mirror schedule/state (the sixth raw-DDL sweep: the
@@ -3404,6 +3474,46 @@ export const packageCleanupRules = sqliteTable(
   },
   (t) => [
     uniqueIndex("package_cleanup_rules_owner_type_uq").on(t.ownerId, t.type),
+  ],
+);
+
+/**
+ * In-flight chunked blob uploads (SPEC-0016 M6 — upstream `PackageBlobUpload`,
+ * package_blob_upload.go:24-30): the upload-SESSION row of the OCI container
+ * registry (POST → PATCH chunks → PUT, routers/api/packages/container/
+ * container.go:236-488). One row per `POST /v2/{owner}/{image}/blobs/uploads`;
+ * the CHUNK BYTES live in R2 (`packages/uploads/<uuid>/<seq>` — the analog of
+ * upstream's `AppDataTempDir("package-upload")` temp file, one object per
+ * PATCH since R2 cannot append), so the row carries the two counters the
+ * protocol needs: `bytes_received` (the Range answer + the Content-Range
+ * offset gate) and `chunk_count` (the ordered chunk enumeration — upstream
+ * infers the extent from the file).
+ *
+ * ONE disclosed column reduction: upstream's `HashStateBytes BLOB` (the
+ * serialized MultiHasher resume state, blob_uploader.go:48-53) has NO analog —
+ * Workers' WebCrypto digest state is unserializable — so the PUT re-streams
+ * the chunks through fresh digests to verify the `?digest=` param (the
+ * container service module documents the trade). `updated_unix` keeps
+ * upstream's INDEX (FindExpiredBlobUploads' sweep scan, :71-76); `created_unix`
+ * stays a plain column (upstream `created` is unindexed). No UNIQUEs beyond
+ * the PK — the id is the random session handle (upstream
+ * CryptoRandomString(25); ours crypto.randomUUID() per the Workers ID rule).
+ */
+export const packageBlobUploads = sqliteTable(
+  "package_blob_uploads",
+  {
+    /** The opaque upload uuid (`.../blobs/uploads/<uuid>`, upstream pk ID). */
+    id: text("id").primaryKey(),
+    /** Running byte total (upstream `BytesReceived NOT NULL DEFAULT 0`). */
+    bytesReceived: integer("bytes_received").notNull().default(0),
+    /** Ordered R2 chunk-object count (the temp-file extent analog). */
+    chunkCount: integer("chunk_count").notNull().default(0),
+    createdUnix: integer("created_unix", { mode: "timestamp" }).notNull(),
+    /** Upstream `UpdatedUnix INDEX NOT NULL` — the expiry sweep's scan key. */
+    updatedUnix: integer("updated_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    index("package_blob_uploads_updated_idx").on(t.updatedUnix),
   ],
 );
 

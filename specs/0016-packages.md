@@ -733,3 +733,132 @@ src; boundary tests in all four suites; superset sweep 156/156).
 the deploy-probes packages-registry battery
 (`scripts/deploy-probes.mjs`, the 49a1502 battery round-trips FIVE of the
 six protocols end-to-end — generic, pypi, npm, helm, maven — nuget pending).
+
+## As-built — M6 container/OCI (2026-10-31 — the registry carries SEVEN protocols)
+
+The §2.1 container row's full wire (upstream ≈2,000 ln: routers
+api.go:509-547 + container/blob/manifest/errors 1,459 + services 456), landed
+as `services/packages/container.ts` + `createContainerProtocolRouter()` in
+`api/routes/packages-protocols.ts`, mounted at the `/v2` ROOT (upstream's
+mount, NOT `/api/packages`; `package_blob_uploads` migration 0046):
+
+- **The auth model** (`services/packages/auth.go`): `/v2/token` (GET) mints
+  the HS256 JWT `{exp(+24 h), nbf, UserID, Scope}` keyed off the instance's
+  general token signing secret — the SAME `system_keystore` row
+  `general_token_signing_secret` the actions keystore owns (upstream's
+  single GetGeneralTokenSigningSecret); the container module has its own
+  generate-once-save-back reader that deliberately skips the actions
+  loader's RSA keygen on cold paths. Basic → the PAT verify; Bearer → the
+  container JWT ONLY (a Bearer PAT is not a container credential — upstream
+  packages/auth.go parses every Bearer as the JWT and 401s on garbage);
+  anonymous → the GHOST token (UserID −1, user_system.go:12), which passes
+  ReqContainerAccess but stays anonymous in the access ladder
+  (package.go's `!doer.IsGhost()` guards — mirrored by doer=null).
+  Credentials that fail Basic verify are ANONYMOUS (upstream basic.go's
+  nil-nil), not invalid. The 401 handshake (container.go:116-130) serves
+  `Bearer realm="<origin>/v2/token",service="container_registry",scope="*"`
+  plus — on a {username} path whose owner exists and is non-public — the
+  `Basic realm="Gitea Container Registry"` twin (the apple-container login
+  support); the access-denied arms answer the shared Gitea-Package-API
+  challenge verbatim (upstream reqPackageAccess api.go:43-63). SCOPE: the
+  /token mint gates `HasAnyScope(read:package, write:package, all)`
+  (container.go:165-176) and the JWT carries the scope for the downstream
+  reqPackageAccess (GetDoerTokenScope via ExtDoerData — our
+  ScopeSet.parseLenient of the claim).
+- **The upload-session store** (the §8.6 decision): BOTH HALVES in their
+  native homes, mirroring upstream's row + temp-file split — the
+  `package_blob_uploads` D1 row (id uuid pk, bytes_received, chunk_count,
+  updated INDEX; the column map in the schema comment) and the chunk bytes
+  in R2 `packages/uploads/<uuid>/<seq>` (one object per PATCH — R2 cannot
+  append; chunk_count is the ordered enumeration upstream infers from the
+  file extent; the PATCH counters advance atomically under a
+  expected-chunk-count guard — the errOffsetMismatch race arm,
+  blob_uploader.go:88-90). R2 multipart uploads were REJECTED: non-terminal
+  parts have a 5 MiB floor and real chunked pushes stream smaller parts.
+  Disclosed reductions: (1) NO HashStateBytes — WebCrypto digest state is
+  unserializable, so PUT re-streams the chunks through fresh digests
+  (blob_uploader.go:48-53's resume posture, adapted); (2) each PATCH chunk
+  spools under the 512 MiB cap (upstream's temp file is unbounded).
+  The PUT-finalize digest verification, the quota checks
+  (CheckSizeQuotaExceeded at the blob arms, CheckCountQuotaExceeded inside
+  createPackageAndVersion — post-insert, count-includes-the-new-row, the
+  same N/N+1 boundary as the family's +1 pre-insert equivalent) and the
+  session-removed-only-on-success lifecycle are upstream-exact.
+- **Manifests** (manifest.go): the 10 MiB cap through the bounded spool
+  (over-cap → MANIFEST_INVALID 413), the media-type resolution
+  (header first, document second), the image-manifest flow (config blob
+  must exist → the metadata parse → the version row with the
+  DELETE-AND-RECREATE overwrite arm keeping the download count
+  (manifest.go:277-294) → config+layer file inserts with the
+  expected-size SIZE_INVALID gate and the _upload-version move semantics
+  (:369-374) → the lead manifest.json file with older leads demoted) and
+  the image-index flow (every referenced manifest must exist AS a manifest
+  → MANIFEST_BLOB_UNKNOWN; platform list into Metadata). The Metadata JSON
+  serializer pins Go's struct order + omitempty + sorted label keys; the
+  helm-config dispatch (helm.go:8's media type) carries the §2.1 helm-chart
+  posture. Deletes: blob DELETE removes every file row carrying the digest
+  (the unreferenced-sweep stays the sole R2-key deleter, ratification 4);
+  manifest DELETE walks GetManifestVersions (non-internal) →
+  RemovePackageVersion each → 202.
+- **Serving** (container.go:706-732's serveBlob): ALWAYS 200 full-body with
+  Content-Length + Docker-Content-Digest + ETag + the api-version header —
+  upstream io.Copy's with no Range/conditional machinery, so we neither
+  advertise Accept-Ranges nor serve 206s here (the six /api/packages
+  families keep the serve-content battery); the store-size gate
+  (getExistingContainerBlob's OptionalSize check, :781-796) reads as
+  BLOB_UNKNOWN/MANIFEST_UNKNOWN when the R2 object disagrees with the row.
+- **The wire grammar** (the route half): the image spans slashes (upstream's
+  `<image:*>`), so the router takes a wildcard and walks the tail
+  segment-by-segment (the npm family's parseTarget pattern); VerifyImageName
+  + reference/digest grammars are the pinned regexes (container.go:48-49,
+  go-digest).
+- **Live walk (docker 28.1.1, real daemon)**: `docker login` (GET /v2/ 401
+  handshake → GET /v2/token → JWT) → `docker push` of alpine:smoke (the
+  full POST→PATCH→PUT chunked dance per layer + config, then the manifest
+  PUT) → `docker pull` round-trip at the same digest → `docker run` echoed
+  (byte parity) → tags/list, _catalog, manifest HEAD (content-type
+  resolved from the document, digest + ETag), ghost-token anonymous pull
+  200, anonymous DELETE 401.
+- **THE HANDOFF (orchestrator-owned files; the live walk APPLIED these
+  locally, then reverted byte-exact — three pieces, the walk proved all
+  three are needed):**
+  1. `src/index.ts` — the import beside the ecosystem router's
+     (`import { createContainerProtocolRouter } from "./api/routes/packages-protocols";`)
+     and the mount beside the packages mounts (after
+     `app.route("/api/packages", createEcosystemProtocolRouter());`):
+     `app.route("/v2", createContainerProtocolRouter());`
+  2. `src/index.ts` — THE DISPATCH CARVE the predecessor's two-line diff
+     missed: the fetch wrapper's `isRepoScoped` predicate
+     (src/index.ts:323-329) hijacks every 2+-segment path into the
+     git-http gate, so `/v2/{owner}/…` never reached Hono (the engine
+     bare-404ed the walk). Add `segments[0] !== "v2" &&` to the predicate
+     (beside the `api`/`twirp` carve-outs).
+  3. `wrangler.jsonc.example` — `"/v2/*"` in the `run_worker_first` array
+     (beside `"/api/*"`, the asset-shadowing rule; wrangler.jsonc is
+     account-local, the example is the template).
+- **FOUND IN THE WALK (pre-existing, all seven families, orchestrator
+  call):** the root `app.onError` (src/index.ts:91) renders EVERY unhandled
+  error as the 500 chrome and has no HTTPException passthrough — the
+  protocol families' thrown 401 challenges (packageAccessChallenge,
+  api.go:51-61's shared shape) answer 500 "Internal Server Error" on the
+  live deployment while their vitest parents (bare Hono, default onError)
+  render them. One-line fix at the top of the override:
+  `if (error instanceof HTTPException) return error.getResponse();`.
+  The container family is unaffected either way: its gate arms carry
+  responses as VALUES (ContainerGateResponse, unwrapped one frame down in
+  the dispatcher) — landed deliberately so M6 is correct live regardless.
+- Tests: `container.test.ts` 36/36 own-eyes (handshake + token + ghost;
+  POST→PATCH-chunks→PUT with the mismatch/416/stream-upload/status/abort
+  arms; the chunked unknown-length spool arm; single-POST; cross-repo
+  mount; manifests incl. the overwrite arm, index, 10 MiB cap, the
+  BLOB_UNKNOWN/SIZE_INVALID/UNSUPPORTED/NAME_UNKNOWN arms; tags + catalog
+  pagination; quota 403s bare; PACKAGES_ENABLED=false; the cleanup sweep)
+  + neighbors re-run post-refactor: generic+helm 45/45, npm+nuget+pypi+
+  maven 92/92, blobs/model/serve-content/cleanup 88/88; check-openapi PASS
+  (/v2 is OUTSIDE the frozen contract's inventory — zero `/v2` paths in
+  v1-swagger.generated.json, upstream keeps the OCI API out of the v1
+  swagger too); tsc 0 in the touched files; scoped eslint clean; migration
+  0046 applied to the local D1 (DDL verified, recorded once). The
+  `specs/README.md` SPEC-0016 row ("M6 container + M7 index-builder
+  pending") and the deploy-probes battery (currently five protocols) are
+  the orchestrator's doc/wiring follow-ups, not this unit's files.
