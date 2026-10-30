@@ -162,7 +162,7 @@ P = push `receive-pack`):
 | # | Caller | Repo | Op | Response | Upstream cite |
 |---|---|---|---|---|---|
 | 1 | anonymous | public repo, public owner | F | 200 advertisement | `:132-135` |
-| 2 | anonymous | private or missing repo, or limited/private owner | F | `401` + `WWW-Authenticate: Basic realm="Gitea"` | `:150-160` |
+| 2 | anonymous | private or missing repo, or limited/private owner | F | `401` + `WWW-Authenticate: Basic realm="Gitea (Basic Auth)"` (the pin's OAuth2-disabled arm, `:152-158` — see SPEC-0002 §2.6) | `:150-160` |
 | 3 | anonymous | any | P | `401` + challenge (push always needs identity) | `:149-160` |
 | 4 | anonymous unit-read granted | private repo | F | 200 | `:138-145`, test `:163-189` |
 | 5 | anonymous unit-read granted | private repo | P | `401` (unit read never grants write) | test `:184` |
@@ -201,6 +201,26 @@ Divergence from upstream defaults (documented per AGENTS.md): upstream ships
 headless forge's primary create path; ADR-0001 names create-by-push as a 0003
 deliverable), both configurable. Push-created repos default private
 (upstream `DefaultPushCreatePrivate: true`, `modules/setting/repository.go:137`).
+
+Deploy-token rows (SPEC-0009 §2.4 continues the numbering at 21; the upstream
+`DeployToken` method is registered on the git routes BEFORE Basic — "before Basic,
+which would try the token as a password", `routers/web/web.go:135-136`; the credential
+is `gdt_…` in the Basic forms — username-only, `x-oauth-basic`, or password, per
+`basic.go` `parseAuthBasic` — never a Bearer scheme):
+
+| # | Caller | Repo | Op | Response | Upstream cite |
+|---|---|---|---|---|---|
+| 22 | deploy token | own repo, or public repo with public owner | F | 200 protocol response — the key user's ONLY permission is `getDeployKeyRepoPermission` (`models/perm/access/repo_permission.go:387-409`: the code+wiki units of ITS repo at `mode`); the public pull arm (`:132-135`) admits any signed-in doer, key user included; a foreign key on a private/limited-visible repo gets the 404 | `services/auth/deploy_token.go:27-46`, `:197-199` |
+| 23 | deploy token | own repo | P | mode ≥ write (2): archived refusal (row 10) then serve (the mirror-readonly 403 still applies, SPEC-0009 row 21); read-only key or foreign repo: `404` "Repository not found" (write capability hidden, `:197-199`) | `deploy_token.go:27-46`, `:197-199` |
+
+Deploy-token notes: the rows carry no scope arm (the key user holds no token scope, so
+`CheckRepoScopedToken` skips it — `GetAccessScope` returns "" for the key user,
+`basic.go:189-197`) and no public-only masking; a wrong/unknown `gdt_…` value falls
+through every method and lands in row 2/3's 401. Engine-shape admin surfaces (the §2.1
+widening's write rows) are refused to deploy keys: the key reaches GIT data only
+(upstream's units arm is code+wiki, `repo_permission.go:404`). `updated_unix` moves on
+use (upstream `UpdateDeployKeyLastUsed`, `deploykey.go:72-75`; cf-gitea applies the
+SPEC-0002 §2.7 24 h throttle).
 
 ### 2.5 Repo lifecycle
 

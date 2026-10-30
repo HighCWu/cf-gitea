@@ -820,6 +820,7 @@ async function handleEnginePathBranch(
           owner: canonical.owner,
           ownerVisibility: canonical.ownerVisibility,
           unitAnonymousRead: false,
+          engineAdmin: true,
         });
         if (decision !== true) return decision;
         return deleteRepositoryViaEngineShape(env, canonical.repo);
@@ -866,6 +867,9 @@ async function handleEnginePathBranch(
       owner: resolved.owner,
       ownerVisibility: resolved.ownerVisibility,
       unitAnonymousRead: false,
+      // The admin kind returned above, so only "api" reaches here — never an
+      // engine-admin surface.
+      engineAdmin: false,
     });
     if (decision !== true) return decision;
     await ensureWikiRegistryRow(env, resolved.repo);
@@ -889,6 +893,7 @@ async function handleEnginePathBranch(
     owner: resolved.owner,
     ownerVisibility: resolved.ownerVisibility,
     unitAnonymousRead,
+    engineAdmin: route.kind === "admin",
   });
   if (decision !== true) return decision;
 

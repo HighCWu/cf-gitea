@@ -115,7 +115,7 @@ describe("rename + redirects (SPEC-0003 §2.5.3, ACL row 13)", () => {
     expect(followed.headers.get("content-type")).toBe("application/x-git-upload-pack-advertisement");
     const writeFollow = await SELF.fetch(old.headers.get("location")!);
     expect(writeFollow.status).toBe(401);
-    expect(writeFollow.headers.get("www-authenticate")).toBe('Basic realm="Gitea"');
+    expect(writeFollow.headers.get("www-authenticate")).toBe('Basic realm="Gitea (Basic Auth)"');
 
     // Plain HEAD-file probes redirect too, preserving the sub-route.
     const head = await SELF.fetch("https://example.com/alice/renamed-later.git/HEAD", {
@@ -270,7 +270,7 @@ describe("visibility model (SPEC-0003 §2.5.6) and ACL rows 4/5/10", () => {
     expect((await SELF.fetch(refs)).status).toBe(200); // row 4
     const push = await SELF.fetch(pushRefs);
     expect(push.status).toBe(401); // row 5: unit read never grants write
-    expect(push.headers.get("www-authenticate")).toBe('Basic realm="Gitea"');
+    expect(push.headers.get("www-authenticate")).toBe('Basic realm="Gitea (Basic Auth)"');
   });
 
   it("row 10: archived repos refuse pushes with the upstream message but keep cloning", async () => {
@@ -478,7 +478,7 @@ describe("delete pipeline (SPEC-0003 §2.5.5, §4.2, §4.8)", () => {
     // Anonymous writes challenge (row 15) — never a silent engine recreate.
     const write = await SELF.fetch("https://example.com/alice/vanishing.git/info/refs?service=git-receive-pack");
     expect(write.status).toBe(401);
-    expect(write.headers.get("www-authenticate")).toBe('Basic realm="Gitea"');
+    expect(write.headers.get("www-authenticate")).toBe('Basic realm="Gitea (Basic Auth)"');
   });
 });
 

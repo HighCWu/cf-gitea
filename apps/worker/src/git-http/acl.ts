@@ -3,7 +3,9 @@
  *
  * Pipeline stage order follows upstream `httpBase`
  * (gitea/routers/web/repo/githttp.go:62-261):
- *   credentials → failure limiter → token verify → scope check (row 7) →
+ *   credentials → failure limiter → deploy-token verify (upstream's
+ *   DeployToken method, registered on the git routes before Basic,
+ *   web.go:135-136) → token verify → scope check (row 7) →
  *   doer account status (row 11) → owner account status → repo grants
  *   (rows 8/9) → push-create (rows 15-20, SPEC-0003 M3).
  *
@@ -38,6 +40,13 @@ import {
 import { basicAuthTokenCandidate, parseAuthorizationHeader } from "../auth/httpauth";
 import { ScopeSet } from "../auth/scopes";
 import { TokenService, type VerifiedAuth } from "../auth/token-service";
+import {
+  DEPLOY_TOKEN_PREFIX,
+  needsDeployKeyLastUsedTouch,
+  touchDeployKeyLastUsed,
+  verifyDeployToken,
+  type VerifiedDeployKey,
+} from "../auth/deploy-token-service";
 import type { AuthUser } from "../auth/auth-context";
 import type { TeamAccessMode } from "../db/schema";
 import { repoUnits, repositories, users } from "../db/schema";
@@ -144,6 +153,12 @@ export interface GitHttpAclInput {
   ownerVisibility: "public" | "limited" | "private";
   /** Rows 4/5: the private repo's code unit grants anonymous read. */
   unitAnonymousRead: boolean;
+  /** The request targets an engine-shape ADMIN surface (PUT config, POST gc,
+   *  DELETE root — the §2.1 widening's write rows). A deploy key reaches GIT
+   *  DATA only — upstream's key user holds just the code+wiki units
+   *  (repo_permission.go:404) and no admin API surface — so the
+   *  deploy-token arm refuses these shapes regardless of mode. */
+  engineAdmin?: boolean;
 }
 
 /**
@@ -159,8 +174,18 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
 
   const header = req.headers.get("authorization");
   const parsed = header === null ? null : parseAuthorizationHeader(header);
-  const credential =
-    parsed?.bearerToken?.token ?? (parsed?.basicAuth ? basicAuthTokenCandidate(parsed.basicAuth) : null);
+  // The two credential carriers, kept apart: a Bearer token and a Basic
+  // candidate flow through different upstream methods. The deploy-token
+  // method parses ONLY the Basic header (basic.go parseAuthBasic:44-68), so
+  // a `Bearer gdt_…` is not a deploy credential; the Basic candidate (the
+  // username when the password is empty/`x-oauth-basic`, else the password)
+  // is what both the deploy-token and the access-token arms try.
+  const bearerToken = parsed?.bearerToken?.token ?? null;
+  const basicCandidate = parsed?.basicAuth ? basicAuthTokenCandidate(parsed.basicAuth) : null;
+  // The access-token arm's candidate (Bearer preferred, else the Basic
+  // candidate) — non-null exactly when at least one carrier is present,
+  // which the guard below narrows.
+  const credential = bearerToken ?? basicCandidate;
 
   if (credential !== null) {
     // Credential-testing path only; anonymous requests have nothing to
@@ -173,6 +198,35 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
       "unknown";
     const verdict = await limiterCheckFailOpen(limiter, ip, now);
     if (verdict.blocked) return rateLimited(verdict.retryAfterSeconds);
+
+    // Deploy-token arm — BEFORE the access-token verify, upstream's group
+    // order on the git routes ("before Basic, which would try the token as
+    // a password", web.go:135-136). Upstream's VerifyDeployKeyToken prefix
+    // gate makes this a no-op for every non-`gdt_` Basic credential, and a
+    // miss here falls through to the access-token arm exactly like
+    // upstream's "not a deploy token, let the other methods try"
+    // (deploy_token.go:36).
+    if (basicCandidate !== null && basicCandidate.startsWith(DEPLOY_TOKEN_PREFIX)) {
+      let key: VerifiedDeployKey | null;
+      try {
+        key = await verifyDeployToken(env.DB, basicCandidate);
+      } catch {
+        // D1 unavailable mid-request: git HTTP plain 500, never fail open.
+        return new Response("internal server error\n", {
+          status: 500,
+          headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+        });
+      }
+      if (key !== null) {
+        input.waitUntil(limiterResetFailOpen(limiter, ip));
+        input.waitUntil(
+          needsDeployKeyLastUsedTouch(key, now)
+            ? touchDeployKeyLastUsed(env.DB, key.id, now)
+            : Promise.resolve(),
+        );
+        return decideDeployKey(op, repo, owner, input.ownerVisibility, input.engineAdmin === true, key);
+      }
+    }
 
     let verified: VerifiedAuth | null;
     try {
@@ -338,5 +392,61 @@ function decide(
     if (!isOwner && !isSiteAdmin && !teamWrites) return repositoryNotFound();
   }
 
+  return true;
+}
+
+/**
+ * The deploy-token decision — upstream's synthetic key user, whose ONLY
+ * permission is getDeployKeyRepoPermission (repo_permission.go:387-409): the
+ * code+wiki units of the key's OWN repository at the key's `mode`. The
+ * matrix arms, in the landed order:
+ *
+ * - owner unavailable (githttp.go:117-119, every caller) → 403;
+ * - an engine-shape admin surface, or a repo other than the key's → 404
+ *   "Repository not found" — the zero-perm 404 (:197-200: the key "belongs
+ *   to another repository, so it grants nothing here"), existence masked;
+ * - READ: publicly visible (upstream's canAnonymousPull arm admits ANY
+ *   signed-in doer's pull on a public repo with a public owner,
+ *   :132-135 — the key user included) OR the key's own repo (mode 1 and 2
+ *   both satisfy read). The key user deliberately does NOT take the
+ *   authenticated-limited-owner read line the user matrix grants: upstream's
+ *   key permission model has no such arm — a limited owner's public repo
+ *   stays beyond a foreign key.
+ * - WRITE: the key's own repo at mode >= 2 — mode 1 → 404 (row 8's
+ *   write-capability masking, :197-199) — then the archived refusal (row
+ *   10). The gate's mirror-readonly 403 still runs after the matrix
+ *   (SPEC-0009 row 21).
+ *
+ * No scope arm (deploy keys carry no token scope — upstream GetAccessScope
+ * returns "" for the key user, so CheckRepoScopedToken skips) and no
+ * public-only masking (no scope to hold it): the key row IS the grant.
+ */
+function decideDeployKey(
+  op: GitHttpOp,
+  repo: RepositoryRow,
+  owner: AuthUser | null,
+  ownerVisibility: "public" | "limited" | "private",
+  engineAdmin: boolean,
+  key: VerifiedDeployKey,
+): Response | true {
+  if (owner !== null && owner.status === "prohibited") return ownerUnavailable();
+  if (engineAdmin || owner === null) return repositoryNotFound();
+
+  if (op === "read") {
+    // Any signed-in doer's pull on a public repo with a public owner is
+    // served (:132-135) — a foreign key included; the key's own repo at
+    // mode >= read (both stored modes) covers everything else. A foreign
+    // key on a private/limited-visible repo grants nothing → the 404.
+    const publiclyVisible =
+      repo.visibility === "public" && owner.status === "active" && ownerVisibility === "public";
+    if (publiclyVisible || key.repoId === repo.id) return true;
+    return repositoryNotFound();
+  }
+
+  // Write: the key's own repo at write mode — a foreign repo or a read-only
+  // key takes the row-8 404 (write capability hidden), an own-repo write
+  // takes the row-10 archived refusal first.
+  if (key.repoId !== repo.id || key.mode < 2) return repositoryNotFound();
+  if (repo.isArchived) return repositoryArchived();
   return true;
 }

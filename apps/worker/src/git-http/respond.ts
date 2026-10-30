@@ -3,9 +3,8 @@
  *
  * Bodies and headers are ported from the vendored pin
  * (`gitea/routers/web/repo/githttp.go`, `gitea/services/context/base.go`):
- * git-HTTP errors are plain text (never JSON), the 401 challenge realm is
- * `Basic realm="Gitea"` (SPEC-0002 §2.6 pins the GCM-compatible realm even
- * though OAuth2 is absent), and protocol/cacheable responses carry the
+ * git-HTTP errors are plain text, the 401 challenge realm follows the pin's
+ * OAuth2 switch (below), and protocol/cacheable responses carry the
  * no-cache triple.
  */
 
@@ -18,6 +17,19 @@ export const NO_CACHE_HEADERS: Record<string, string> = {
   "cache-control": "no-cache, max-age=0, must-revalidate",
 };
 
+/**
+ * The 401 challenge realm — the pin's OAuth2 switch (githttp.go:152-158):
+ * `setting.OAuth2.Enabled` answers `Basic realm="Gitea"`, which tells GCM to
+ * attempt its BUILT-IN OAUTH2 APPLICATION (git-credential-manager#1442);
+ * the disabled arm deliberately answers `Basic realm="Gitea (Basic Auth)"` —
+ * "If OAuth2 is disabled, then use another realm to avoid GCM OAuth2
+ * attempt" — so credential managers fall back to prompting instead of
+ * looping on an OAuth2 endpoint that does not exist. cf-gitea has no OAuth2
+ * authorization server (only the application-management API surface has
+ * landed), so the pin's disabled arm is our constant.
+ */
+export const BASIC_AUTH_CHALLENGE = 'Basic realm="Gitea (Basic Auth)"';
+
 /** `Base.plainTextInternal` (services/context/base.go:130-139). */
 function plainText(status: number, body: string, headers?: Record<string, string>): Response {
   return new Response(body, {
@@ -29,10 +41,11 @@ function plainText(status: number, body: string, headers?: Record<string, string
 /**
  * 401 authentication challenge (upstream sets `WWW-Authenticate` then
  * `HTTPError(401)`, githttp.go:146-160 + base.go:105-111 → `http.Error`
- * appends the trailing newline).
+ * appends the trailing newline). The realm is BASIC_AUTH_CHALLENGE — the
+ * pin's OAuth2-disabled arm.
  */
 export function basicChallenge(): Response {
-  return plainText(401, "Unauthorized\n", { "www-authenticate": 'Basic realm="Gitea"' });
+  return plainText(401, "Unauthorized\n", { "www-authenticate": BASIC_AUTH_CHALLENGE });
 }
 
 /** `PlainText(404, "Repository not found")` (githttp.go:198/211) — no newline. */

@@ -64,11 +64,12 @@ import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicHeader, basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
 import { doerRepoAccessMode } from "../api/services/repository";
+import { addDeployKeyToken } from "../api/services/deploy-keys";
 import { TeamsService } from "../api/routes/org-teams";
 import { OrgService } from "../services/orgs/orgs";
 import { settleCreatingRepo } from "./gate";
 import { createWikiPage } from "../services/wiki";
-import { repoCounters, repoRedirects, repositories, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
+import { deployKeys, repoCounters, repoRedirects, repositories, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
 import { purgeRepoMessage } from "../repos/purge";
 import { RepoService } from "../repos/service";
 import { LFS_MEDIA_TYPE } from "../services/lfs/batch";
@@ -95,6 +96,7 @@ beforeEach(async () => {
     "team_members",
     "teams",
     "personal_access_tokens",
+    "deploy_keys",
     "repo_units",
     "repo_transfer",
     "repo_redirects",
@@ -110,7 +112,11 @@ beforeEach(async () => {
 
 const RECEIVE_CT = "application/x-git-receive-pack-request";
 const UPLOAD_CT = "application/x-git-upload-pack-request";
-const CHALLENGE = 'Basic realm="Gitea"';
+// The pin's OAuth2-DISABLED challenge arm (githttp.go:152-158): realm="Gitea"
+// is reserved for an enabled OAuth2 server (GCM then attempts its built-in
+// OAuth2 application); cf-gitea has no OAuth2 server, so the deliberate
+// switch lands on "Gitea (Basic Auth)" — the GCM-loop fix (SPEC-0002 §2.6).
+const CHALLENGE = 'Basic realm="Gitea (Basic Auth)"';
 
 /** Push-create `alice/<slug>` (SPEC-0003 §2.5.2) with a real one-commit pack,
  *  then run the §2.5.2 settle handshake the gate schedules via waitUntil. */
@@ -1465,5 +1471,178 @@ describe("the *.wiki git family (upstream githttp.go:94-101 — the wiki SPEC's 
     expect(rows).toHaveLength(1);
     const cell = await env.REPO.getByName("alice/nodeletewiki.wiki").listRefs();
     expect(cell.refs.map((r) => r.name)).toContain("refs/heads/main");
+  });
+});
+
+// ---------------------------------------------------------------------------------
+// The 401 realm follows the pin's OAuth2 switch (githttp.go:152-158) and deploy
+// tokens authenticate git-HTTP (the upstream DeployToken method, web.go:135-136)
+// ---------------------------------------------------------------------------------
+
+describe("the 401 challenge realm is the pin's OAuth2-disabled arm (parity-review-git)", () => {
+  it("answers Basic realm=\"Gitea (Basic Auth)\" — never the GCM OAuth2-bait realm without an OAuth2 server", async () => {
+    await pushCreateAndSettle("realmonly");
+    const challenge = await SELF.fetch(
+      "https://example.com/alice/realmonly.git/info/refs?service=git-upload-pack",
+    );
+    expect(challenge.status).toBe(401);
+    // The exact pin: `setting.OAuth2.Enabled` selects `realm="Gitea"` (GCM then
+    // attempts its built-in OAuth2 application, git-credential-manager#1442);
+    // the disabled arm deliberately switches so credential managers prompt
+    // instead of looping. cf-gitea has no OAuth2 server.
+    expect(challenge.headers.get("www-authenticate")).toBe('Basic realm="Gitea (Basic Auth)"');
+  });
+});
+
+describe("deploy tokens authenticate git-HTTP (upstream's DeployToken method, web.go:135-136)", () => {
+  /** pushCreateAndSettle + a deploy key row: the repo id comes back for the
+   *  key seed, the plaintext token only ever rides the return value. */
+  async function seedRepoWithToken(
+    slug: string,
+    readOnly: boolean,
+  ): Promise<{ token: string; repoId: string }> {
+    await pushCreateAndSettle(slug);
+    const repo = (await drizzle(env.DB).select().from(repositories).all())[0]!;
+    const added = await addDeployKeyToken(env.DB, repo.id, `deploy-${slug}`, readOnly);
+    if (added.token === undefined) throw new Error("token create returned no plaintext");
+    return { token: added.token, repoId: repo.id };
+  }
+
+  it("admits a read-only token's clone advert in the password form (upstream semantics)", async () => {
+    const { token } = await seedRepoWithToken("dtclone", true);
+    const advert = await SELF.fetch(
+      "https://example.com/alice/dtclone.git/info/refs?service=git-upload-pack",
+      { headers: { authorization: basicHeader("git", token) } },
+    );
+    expect(advert.status).toBe(200);
+    expect(advert.headers.get("content-type")).toBe("application/x-git-upload-pack-advertisement");
+  });
+
+  it("admits the username-only Basic form too (parseAuthBasic's token-as-username)", async () => {
+    const { token } = await seedRepoWithToken("dtuser", true);
+    const advert = await SELF.fetch(
+      "https://example.com/alice/dtuser.git/info/refs?service=git-upload-pack",
+      { headers: { authorization: basicTokenHeader(token) } },
+    );
+    expect(advert.status).toBe(200);
+  });
+
+  it("a write-mode token pushes for real: advert 200 and a receive lands the ref", async () => {
+    const { token } = await seedRepoWithToken("dtwrite", false);
+    const probe = await SELF.fetch(
+      "https://example.com/alice/dtwrite.git/info/refs?service=git-receive-pack",
+      { headers: { authorization: basicHeader("git", token) } },
+    );
+    expect(probe.status).toBe(200);
+
+    const { oid, pack } = await buildPack();
+    const push = await SELF.fetch("https://example.com/alice/dtwrite.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicHeader("git", token), "content-type": RECEIVE_CT },
+      body: buildReceivePackBody([{ ref: "refs/heads/feature", oid }], pack),
+    });
+    expect(push.status).toBe(200);
+    const refs = await env.REPO.getByName("alice/dtwrite").listRefs();
+    expect(refs.refs.map((r) => r.name)).toContain("refs/heads/feature");
+  });
+
+  it("a read-only token's receive is 404-masked (upstream :197-199 write-capability hiding)", async () => {
+    const { token } = await seedRepoWithToken("dtro", true);
+    const probe = await SELF.fetch(
+      "https://example.com/alice/dtro.git/info/refs?service=git-receive-pack",
+      { headers: { authorization: basicHeader("git", token) } },
+    );
+    expect(probe.status).toBe(404);
+    expect(new TextDecoder().decode(await probe.arrayBuffer())).toBe("Repository not found");
+  });
+
+  it("a key for another repository grants nothing here: 404 on its own op, public repos stay open", async () => {
+    const { token } = await seedRepoWithToken("dtmine", true);
+    // A second, PRIVATE repo: the foreign key is the zero-perm 404
+    // (repo_permission.go:393 — "the key belongs to another repository, so
+    // it grants nothing here"). The owner is the alice row push-create
+    // already seeded — seeding her again trips users.username_lower's UNIQUE.
+    const alice = (await drizzle(env.DB).select().from(users).all())[0]!;
+    await repoService().create({ owner: { id: alice.id, usernameLower: "alice" }, name: "dtother", isPrivate: true });
+    const foreign = await SELF.fetch(
+      "https://example.com/alice/dtother.git/info/refs?service=git-upload-pack",
+      { headers: { authorization: basicHeader("git", token) } },
+    );
+    expect(foreign.status).toBe(404);
+
+    // Upstream's canAnonymousPull arm admits any signed-in doer's pull on a
+    // public repo with a public owner (:132-135) — key user included.
+    await repoService().create({ owner: { id: alice.id, usernameLower: "alice" }, name: "dtpublic", isPrivate: false });
+    await env.DB.prepare("DELETE FROM repo_units").run();
+    const open = await SELF.fetch(
+      "https://example.com/alice/dtpublic.git/info/refs?service=git-upload-pack",
+      { headers: { authorization: basicHeader("git", token) } },
+    );
+    expect(open.status).toBe(200);
+  });
+
+  it("an unknown gdt_ value falls through every method into the 401 challenge", async () => {
+    await seedRepoWithToken("dtmissing", true);
+    const miss = await SELF.fetch(
+      "https://example.com/alice/dtmissing.git/info/refs?service=git-upload-pack",
+      { headers: { authorization: basicHeader("git", "gdt_notarealtoken0123456789abcdef0123456789abcdefg") } },
+    );
+    expect(miss.status).toBe(401);
+    expect(miss.headers.get("www-authenticate")).toBe(CHALLENGE);
+  });
+
+  it("a Bearer gdt_ value is NOT a deploy credential (parseAuthBasic reads Basic only)", async () => {
+    const { token } = await seedRepoWithToken("dtbearer", true);
+    const bearer = await SELF.fetch(
+      "https://example.com/alice/dtbearer.git/info/refs?service=git-upload-pack",
+      { headers: { authorization: `Bearer ${token}` } },
+    );
+    expect(bearer.status).toBe(401);
+  });
+
+  it("an engine-shape admin DELETE stays refused for a write-mode key (git data only)", async () => {
+    const { token } = await seedRepoWithToken("dtadmin", false);
+    const wipe = await SELF.fetch("https://example.com/alice/dtadmin", {
+      method: "DELETE",
+      headers: { authorization: basicHeader("git", token) },
+    });
+    expect(wipe.status).toBe(404);
+    expect(new TextDecoder().decode(await wipe.arrayBuffer())).toBe("Repository not found");
+    expect(await drizzle(env.DB).select().from(repositories).all()).toHaveLength(1);
+  });
+
+  it("touches updated_unix on use (upstream UpdateDeployKeyLastUsed / the HasUsed gate)", async () => {
+    const { token, repoId } = await seedRepoWithToken("dtused", true);
+    const before = await drizzle(env.DB).select().from(deployKeys).all();
+    expect(before).toHaveLength(1);
+    expect(before[0]!.updatedAt.getTime()).toBe(before[0]!.createdAt.getTime());
+
+    // The §2.7 24h throttle suppresses the touch on a FRESH key (the arm the
+    // matrix runs is `needsDeployKeyLastUsedTouch ? touch : no-op`) — backdate
+    // the stamp past the window so the use below moves it.
+    const staleMs = before[0]!.updatedAt.getTime() - 25 * 60 * 60 * 1000;
+    await env.DB.prepare("UPDATE deploy_keys SET updated_unix = ? WHERE id = ?")
+      .bind(Math.floor(staleMs / 1000), before[0]!.id)
+      .run();
+
+    const advert = await SELF.fetch(
+      "https://example.com/alice/dtused.git/info/refs?service=git-upload-pack",
+      { headers: { authorization: basicHeader("git", token) } },
+    );
+    expect(advert.status).toBe(200);
+    // The touch rides ctx.waitUntil in production; on the runner the
+    // background work lands within the test — poll for the stamp to move off
+    // the backdated value. Compared against the backdate (25h in the past),
+    // NOT against created_unix: both stamps are second-granular columns and a
+    // sub-second seed→use gap truncates the two equal (exact round-trip is
+    // pinned at second precision in deploy-token-service.test.ts).
+    let used = false;
+    for (let i = 0; i < 60 && !used; i++) {
+      const rows = await drizzle(env.DB).select().from(deployKeys).all();
+      used = rows[0]!.updatedAt.getTime() > staleMs;
+      if (!used) await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(used).toBe(true);
+    expect((await drizzle(env.DB).select().from(deployKeys).all())[0]!.repoId).toBe(repoId);
   });
 });
