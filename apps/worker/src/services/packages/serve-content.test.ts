@@ -320,6 +320,23 @@ describe("servePackageFileResponse", () => {
     expect(await head.text()).toBe("");
   });
 
+  it("a ZERO-START 206 slices too — the smoke's fix-before-deploy find (bytes=0-9 answered the FULL body)", async () => {
+    // The pre-deploy local smoke (docs/usability/smoke-local-api-ui.md):
+    // Range bytes=0-9 / 0-0 answered 206 with content-range 0-9/56 but the
+    // FULL 56-byte body — `plan.start > 0` skipped the slice at start 0.
+    // Go's ServeContent honors zero-start ranges; resumable clients corrupt.
+    const res = servePackageFileResponse(request({ Range: "bytes=0-9" }), streamOf(["hello world"]), opts);
+    expect(res.status).toBe(206);
+    expect(res.headers.get("content-range")).toBe("bytes 0-9/11");
+    expect(res.headers.get("content-length")).toBe("10");
+    expect(await textOf(res.body as ReadableStream<Uint8Array>)).toBe("hello worl");
+
+    const point = servePackageFileResponse(request({ Range: "bytes=0-0" }), streamOf(["hello world"]), opts);
+    expect(point.status).toBe(206);
+    expect(point.headers.get("content-range")).toBe("bytes 0-0/11");
+    expect(await textOf(point.body as ReadableStream<Uint8Array>)).toBe("h");
+  });
+
   it("HEAD carries the 200 headers without a body", async () => {
     const head = servePackageFileResponse(request({}, "HEAD"), null, opts);
     expect(head.status).toBe(200);

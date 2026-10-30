@@ -430,6 +430,10 @@ export function servePackageFileResponse(
   if (body === null) {
     return new Response(null, { status: plan.status, headers: serving });
   }
-  const out = plan.status === 206 && plan.start > 0 ? sliceByteRange(body, plan.start, plan.length) : body;
+  // EVERY 206 slices (the smoke's fix-before-deploy find: `start > 0` let a
+  // zero-start range skip the slice and stream the FULL body under a 0-9
+  // content-range — resumable clients corrupt; Go's ServeContent honors
+  // zero-start ranges).
+  const out = plan.status === 206 ? sliceByteRange(body, plan.start, plan.length) : body;
   return new Response(out, { status: plan.status, headers: serving });
 }
