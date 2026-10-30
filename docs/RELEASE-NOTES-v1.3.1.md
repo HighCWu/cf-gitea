@@ -95,7 +95,7 @@ the tag runbook.
   ratified retention shape — one indexed existence probe + at most one queue
   message per sweep; crons enqueue, consumers work. Disclosed: the
   notify/commit-status tails and the reusable-caller cascade remain M3
-  (module-header note; tracked in `docs/residuals-v1.4.md`).
+  (module-header note; tracked in `docs/residuals-v1.3.2.md`).
 
 ## 3. API
 
@@ -134,7 +134,7 @@ the tag runbook.
   target can't resolve, annotated tags when `tag_message` is set, drafts
   deferring the write to publish. The web create form rides the same
   wrapper. Disclosed: the archived-repo arm keeps our 201 where upstream
-  maps its failure to a bare 500 — recorded in `docs/residuals-v1.4.md`;
+  maps its failure to a bare 500 — recorded in `docs/residuals-v1.3.2.md`;
   the `sha1`/`num_commits` tail has since closed (`efd1916`, below).
 - **The release family is whole** (`efd1916`, `29ecd1d`). The kept-open
   tail closed: the row fills `sha1`/`num_commits`/`created` from the TAGGED
@@ -148,7 +148,7 @@ the tag runbook.
   was actually created. Upstream never deletes the old ref on rename (the
   old tag stays orphaned), and our `releases_repo_tag_uq` unique index
   answers 500 on rename-onto-existing-tag where upstream would write
-  duplicate rows — recorded (`docs/residuals-v1.4.md` P3-14).
+  duplicate rows — recorded (`docs/residuals-v1.3.2.md` P3-14).
 - **Token scopes gate the whole `/api/v1` tree** (`56109ec`). The
   `requireScope` port was mounted only on the token-CRUD router — a
   `read:user`-only or scopeless token passed every other endpoint, writes
@@ -450,7 +450,7 @@ The post-snapshot chain adds the window's own verification layer:
 
 ## 9. Known limitations
 
-The consolidated v1.4 backlog is `docs/residuals-v1.4.md` (updated in this
+The consolidated v1.4 backlog is `docs/residuals-v1.3.2.md` (updated in this
 window; the post-landing reconciliation `dc0a5bf` resolved every
 in-flight-at-doc-time row and extended the board). The wave's own disclosed
 tails: the Actions notify/commit-status tails and reusable-caller cascade

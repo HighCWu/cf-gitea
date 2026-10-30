@@ -27,7 +27,7 @@ Conventions:
 >       shows modified: `git -C gitea checkout --`) (RD25 §1,
 >       `docs/ops/rd25-runbook.md:28-35`).
 > - [ ] **All units landed**: the residuals board's in-flight block
->       (`docs/residuals-v1.4.md` header) is resolved — every named sibling is
+>       (`docs/residuals-v1.3.2.md` header) is resolved — every named sibling is
 >       a committed ancestor of HEAD; no background agent is mid-flight on the
 >       tree (the quiet-window definition, RD25 §1).
 
@@ -224,9 +224,9 @@ matches; the release row should read title `v1.3.1`, tag `v1.3.1` (v1.3's row:
 
 ## 8. The post-tag residuals tick
 
-Update `docs/residuals-v1.4.md` per its own conventions (header update lines
+Update `docs/residuals-v1.3.2.md` per its own conventions (header update lines
 stamp a snapshot sha; "How to consume" requires verifying the in-flight block
-before anything dispatches; `docs/residuals-v1.4.md:22-45,492-511`):
+before anything dispatches; `docs/residuals-v1.3.2.md:22-45,492-511`):
 
 - Stamp a header line **"Updated at the v1.3.1 tag `<TAG_COMMIT>`"** and fold
   the in-flight block: the three named siblings are landed at this writing —
@@ -237,9 +237,9 @@ before anything dispatches; `docs/residuals-v1.4.md:22-45,492-511`):
   here (`docs/RELEASE-NOTES-v1.3.1.md:267-276`).
 - Keep P3-9's dated watch visible: the Oct 31 11:00 UTC sweep-fire observation
   (D1 orphan action rows stay 0) + upstream filings #16548/#16349
-  (`docs/residuals-v1.4.md:421-432`; `docs/run-pending-9am-task.md:89` (4)).
+  (`docs/residuals-v1.3.2.md:421-432`; `docs/run-pending-9am-task.md:89` (4)).
 
-Commit docs-only via pathspec (`-- docs/residuals-v1.4.md`). This tick lands
+Commit docs-only via pathspec (`-- docs/residuals-v1.3.2.md`). This tick lands
 AFTER the tag by design — the tag carries the freeze, the board carries the
 future.
 

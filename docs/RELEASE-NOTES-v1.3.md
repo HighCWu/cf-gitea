@@ -5,7 +5,7 @@ covering the full day and past midnight: **119 commits,
 `d68ad62`→`4a45370`** (2026-10-29 06:53 → 2026-10-30 08:50 +0800) — the
 freeze HEAD and final count, filled by the 9:00 convergence run;
 anything landing after the cut rides the v1.4 backlog
-(docs/residuals-v1.4.md). These notes were first cut MID-FLIGHT at
+(docs/residuals-v1.3.2.md). These notes were first cut MID-FLIGHT at
 `e5e1432` (28 commits, landed as `37758d5`); the same day's second half
 landed before the freeze — the five cut-time units inside the hour, the
 wiki sibling's full git-HTTP and lifecycle arc, the packages registry's
