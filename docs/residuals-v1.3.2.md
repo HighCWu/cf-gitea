@@ -27,21 +27,47 @@ newly-recorded open items (the commit bodies' documented divergences,
 staged arms, and follow-ups) are folded into the board as new rows, under
 a fresh, much smaller in-flight block.
 
-**In flight at this update** (snapshot `95cdcaf`; sibling units are
-landing these as you read this — do not re-dispatch blindly, do not count
-as landed until committed):
+**Updated at the v1.3.2 reconciliation snapshot `0b39750`** (2026-10-31,
+the window since `ce1b51c`): the window's landings are folded in — P1-2
+(`613aa31`), P1-3's substrate (`e24455c`), P1-4 (`faeec92` — resolved to
+the documented divergence, the SPEC-0018 amendment), P2-1/P2-2's pages +
+mounts (`6bdd91f` + `180b409`), P2-4's web-UI arm (`a803843` +
+`4a04d46`), P2-5 (`0b39750` — strikes), P2-7 (`7e72149` — narrowed to
+the deferred Code-tab href + the still-open rows), P2-8 (`e454a75`),
+P3-10 (`cd895f6` — strikes), P3-12 (`e8ef89d` — strikes) — and the
+landings' staged tails ride new rows (P1-13: the scoped-workflows M3
+rows; P2-12: the owner-store KV prerequisite; P2-13: the P2-6 tail items
+in flight). The two stale spec lines the P2-5 unit flagged are fixed in
+place: SPEC-0005 §4.11's `sha1`-null tail (the fill landed with the
+UpdateRelease tag wave) and SPEC-0004 §4's blanket-423 (the release
+family is the bare-500 exception — upstream swagger carries ZERO
+release-family `repoArchivedError` ops of the 60).
 
-- **The ~15 model.ts cite renumbers** — the mechanical upstream-cite
-  drift from `e4b9f66`'s insertions, the cite-audit pass's open finding
-  (`ae1de6d`) — sibling in flight (the working tree's uncommitted
-  `models/issue.ts` hunks).
-- **The E9 deferral record** — review-api E9's two drifts
-  (comment-create's missing locked-issue 403 gate + the accepted empty
-  body; the P2-6(e) honorable mentions) — sibling in flight right now.
-- **The archive POST-arm pin unit** — the verification record's
-  coverage-gap finding: `4e6d1cc`'s HIGH-parity archive POST fix has ZERO
-  pins anywhere (the GET arm is well pinned) — the pin unit is dispatched
-  (`635a573`).
+**In flight at this update** (snapshot `0b39750`; sibling units are
+landing these as you read this — do not re-dispatch blindly, do not count
+as landed until committed; the carried items from the `95cdcaf` block
+are still uncommitted and keep their places):
+
+- **The store/schema wave** — the working tree's uncommitted `schema.ts`
+  + migrations 0046/0047: `0047` is `users.last_login_at` (P3-7's half —
+  the column is labeled P3-7 in the schema), `0046` is the
+  `package_blob_uploads` M6 upload store (P1-5's SPEC-0016 substrate —
+  recorded here only as the wave's rider; P1-5 itself is not reconciled
+  in this pass).
+- **The owner-store wave** — the OwnerActionsConfig KV home + the two
+  actions-settings POST arms (P2-12), in flight per dispatch; its schema
+  hunk is not yet visible in the tree.
+- **P3-11's annotated-tag read-tag RPC** — the engine-boundary wave is
+  uncommitted in the tree (`packages/git-engine` `src/repo.ts` +
+  `src/git/objects.ts` modified, the new `e2e/check-tag-read.mjs` check).
+- **The P2-6 tail items** (P2-13): the E9 deferral record + the ~15
+  model.ts cite renumbers (carried from the `95cdcaf` block, still
+  uncommitted) + the tree's uncommitted repo-init-templates unit (the
+  (d) auto-init gitignores/license files arm).
+- **The archive POST-arm pin unit** — carried: the verification record's
+  coverage-gap finding, `4e6d1cc`'s HIGH-parity archive POST fix has
+  ZERO pins anywhere (the GET arm is well pinned) — the pin unit is
+  dispatched (`635a573`), still uncommitted.
 
 Landed in the same window, for the record (no longer open): the
 production serializer-identity swap — `GET /user` now delegates to the
@@ -101,47 +127,77 @@ board rows now.
    explicitly staged to M3 (no v1 row carries parent_job_id>0), so the
    SPEC's M3 table gains them as named rows. Size: **L**.
 
-2. **C5's run-mutation remainder: rerun + rerun-failed** (the cancel arm
-   landed inside C2's window). Rerun creates a new `ActionRunAttempt` and
-   re-emits job rows — emitter territory, so the census flagged it to
-   M3 (`docs/research/actions-ui-census.md` C5 row and open question 1;
-   `specs/0012-actions-feasibility.md` still-open list: "C5's rerun +
-   rerun-failed DEFER to M3's job emitter"). Every M1c census unit is
-   landed except this and C10. **v1.3.1 addition**: the actions review's
-   lower-ranked "rerun artifact inheritance latent" observation
-   (`docs/usability/parity-review-actions.md`) belongs to the same
-   emitter work — a rerun's artifacts must resolve to the new attempt.
-   Size: **M**, gated on item 1.
+2. **C5's run-mutation remainder: rerun + rerun-failed — LANDED
+   (`613aa31`), including the v1.3.1 artifact-inheritance addition.** The
+   rerun pair follows upstream's `run.go` semantics per this row's cite:
+   the service module (`apps/worker/src/services/actions/rerun.ts`) +
+   suite + the run-viewer page's mutation buttons, with the
+   artifact-inheritance arm (rerun-failed keeps succeeded jobs' artifacts
+   downloadable, resolving to the new attempt) this row's addition named.
+   Landed as a salvage from a unit that died at the 1308 wall AFTER
+   finishing but before reporting — the verification is the green suites
+   on the tree (rerun + run-viewer 84/84 own-eyes, tree tsc 0, guard
+   PASS); the premature `fd2cfdd` landing was reverted at `6945cee` and
+   this is the clean re-landing. The census's M3-emitter gate did not
+   bind — the pair landed against the still-open M3, following upstream's
+   `run.go` semantics per this row's cite. Every M1c census unit is now
+   landed except C10 (P1-3). Size: — (landed).
 
-3. **C10's scoped-workflows pages and their substrate.** Upstream's
-   `action_scoped_workflow_source` store + workflow-file parser do not
-   exist here, so the admin scoped-workflows page is the documented-reduced
-   honest 404 with the nav item omitted (`b5923ed`, recorded in release
-   notes §4), and the user/org sub-tabs are recorded reductions (survey
-   tick-21). The census defers the pages to "the scoped-workflows
-   SPEC-attachment (post-M3)" (`docs/research/actions-ui-census.md` C10
-   row). Related honest note: the ActionsConfig store carries
-   `DisabledWorkflows`/`DisabledScopedWorkflows` for round-trip fidelity
-   but has no write arms for them — "their write arms are the workflow-list
-   pages, not this store's settings arms"
-   (`apps/worker/src/services/actions/config.ts:14-16`). Size: **L**
-   (store + parser + pages; needs its SPEC-attachment first).
+3. **C10's scoped-workflows pages and their substrate — the
+   M3-independent pure layer LANDED (`e24455c`); store + parser + pages
+   STAGED with cites.** The landing verified the board's post-M3 verdict
+   in substance via a dependency decomposition: the pages need not the
+   M3 trigger chain but TWO independent substrates, either blocking
+   alone. LANDED: `apps/worker/src/services/actions/scoped-workflows.ts`
+   — upstream-verbatim (`scoped_workflow.go:18-41` +
+   `scoped_workflows.go:31-195`): `SCOPED_WORKFLOW_DIRS`
+   (`.gitea/scoped_workflows`, the never-overlap rule), the
+   path/context-name helpers (outer-TrimSpace semantics pinned),
+   `shouldEventCreateCommitStatus`'s six-event allowlist (+ upstream's
+   own duplicated-truth TODO carried), `parsePatternLines`,
+   `buildScopedWorkflowInfos` (the live+orphan merge, orphans sorted,
+   null configs skipped), `applyScopedWorkflowRequiredForm` (fail-fast
+   patterns-empty refusal, live-unchecked-with-patterns kept as history,
+   orphan drops, required-orphan kept) — parameterized over parsed
+   files/liveSet/configs so the staged store and pages consume it
+   unchanged (suite 24/24; actions family 235/235; the full dependency
+   map in the module header). STAGED: the `action_scoped_workflow_source`
+   schema table port (schema HANDOFF — no landed table), the store
+   service, the three page modules + `ui/index.ts` route recipes (four
+   routes x three scopes), and the M3 arms (the parser's YAML half —
+   `GetEventsFromContent`/`deriveScopedStatusContexts` ride jobparser,
+   the named M3 row; the merge-gate; the notifier arms — see P1-13).
+   Until the pages land, the admin scoped-workflows page stays the
+   documented-reduced honest 404 with the nav item omitted (`b5923ed`,
+   recorded in release notes §4; survey tick-21's user/org sub-tab
+   reductions stand), and the nav folds stay folded OFF (the dead-link
+   rule — no fold until the pages land; P2-3's honest 404 stands). The
+   ActionsConfig `DisabledWorkflows`/`DisabledScopedWorkflows` note
+   (`apps/worker/src/services/actions/config.ts:14-16`) is unchanged.
+   Size: **L** minus the landed helpers (store + parser + pages; needs
+   its SPEC-attachment first).
 
-4. **The admin auths row — needs-API-first, verdict tension recorded.**
-   The survey's ONE remaining PARTIAL row: no admin login-source read
-   family is declared, so the page cannot be dispatched as UI work
-   (`docs/compat/ui-parity-survey.md` tick-20/tick-21 remaining-set
-   paragraphs; the recommendation section: "NEEDS-API-FIRST rows ... the
-   admin auths page"). SPEC-0018 §3.3's standing verdict is OMIT —
-   "no page, no store" with an explicit reopen gate ("superseded the day a
-   SPEC lands any external login chain"), because no login-source substrate
-   exists and a 100%-posture page fails the dead-link rule
-   (`specs/0018-admin-config-notices-auths.md` §3.3; the omission also
-   recorded in `specs/README.md`'s SPEC-0018 row). No new decision here:
-   either the verdict stands (zero work; the row stays the recorded
-   divergence) or a future login-source SPEC reopens it — and that SPEC is
-   the prerequisite, which is what makes this needs-API-first. Size: **L**
-   if reopened; **S** to leave as documented divergence.
+4. **The admin auths row — RESOLVED to the documented divergence
+   (`faeec92`, the S arm; SPEC-0018's as-built amendment).** The verdict
+   tension is settled: the needs-API-first premise verified
+   UNSATISFIABLE at the source — the upstream `/admin` group at the pin
+   mounts exactly cron/orgs/packages/users/emails/unadopted/hooks/
+   actions (`api.go:1814-1867`, every verb walked; no `auths.go` among
+   admin/'s 11 files), BOTH vendored swagger JSONs parse to 350 paths
+   with zero `/admin/auths*`, and the contract fetched LIVE from
+   upstream main today carries the same 350 paths (a web-search claim of
+   `/admin/auths` endpoints disproved by the live fetch — the dispatch
+   premise's likely origin). The web page exists (`web.go:874-880` over
+   login_source CRUD + four typed backend parsers) and is exactly what
+   SPEC-0018 §2.3 priced as the missing substrate; mechanically
+   forbidden besides: check-openapi's assertion hard-fails any declared
+   path absent from the frozen at-pin contract, so an invented family
+   fails the repo's own gate. The OMIT verdict stands (zero code,
+   upstream-alignment discipline enforced). Forward note from the
+   amendment: the reopened arm, when the external-login-chain SPEC
+   lands, is the upstream-shape WEB CRUD, not an API ladder — upstream's
+   own auths management has no API to mirror. Size: — (resolved; the
+   reopen gate unchanged in SPEC-0018 §3.3).
 
 5. **SPEC-0016 M6 — the container (OCI) registry.** The seventh protocol
    family, and "the only milestone that may need new infrastructure
@@ -176,24 +232,159 @@ board rows now.
    the UI settings pages serve over them today). Landing it converts the
    count to terminal and unblocks API-first clients. Size: **M**.
 
+   **Slice landed 2026-10-31 — the runner-management family (15 ops, the
+   runners/registration-token gap this row named):** the `/api/v1` runner
+   family is declared and served at all three scopes — getRepoRunners /
+   repoCreateRunnerRegistrationToken / getRepoRunner / deleteRepoRunner /
+   updateRepoRunner + the org and user twins — over the landed
+   `action_runners` + `action_runner_tokens` control-plane store
+   (`apps/worker/src/api/routes/secrets-variables.ts`'s runners section,
+   service mapping in `apps/worker/src/api/services/secrets-variables.ts`,
+   storage via `apps/worker/src/services/actions/model.ts`; upstream
+   anchors routers/api/v1/shared/runners.go + models/actions/runner.go).
+   Pins: 42/42 in the family suite (every declared arm + the runtime-only
+   401/403/422 codes + the two 404 shapes — the not-exist text vs
+   EditableInContext's "No permission…" foreign-scope text); check-openapi
+   PASS with the declared count at **515/554, 39 remaining**. The three
+   slices that predate this row's dispatch (secrets/variables at
+   repo/org/user, 23 ops) were already inside the 500. The remaining 39
+   are additive rows P1-8 through P1-12 below.
+
+8. **The `/api/v1` Actions runs/jobs listing trio — 6 ops (P1-7's
+   remainder, slice 1 of 5).** `getWorkflowRuns` +
+   `listWorkflowJobs` at repo scope, `getOrgWorkflowRuns` +
+   `getOrgWorkflowJobs` at org, `getUserWorkflowRuns` +
+   `getUserWorkflowJobs` at user — the addActionsRoutes tail
+   (`m.Get("/runs", reqToken(), reqReaderCheck, act.ListWorkflowRuns)` /
+   `m.Get("/jobs", …)`, `routers/api/v1/api.go:992-993`; org arm
+   `api.go:1738-1742` via `reqOrgMembership`; user arm
+   `api.go:1135-1136`).
+   Handlers delegate to shared.ListRuns/ListJobs
+   (`routers/api/v1/shared/action.go:35-228`) over the LANDED
+   `action_runs`/`action_run_jobs` stores — the code needs no M3 (an empty
+   store lists empty), but a DEMAND review should ride P1-1's M3 so the
+   wire has real rows to render; the `ActionWorkflowRun`/`ActionWorkflowJob`
+   wire shapes + the status/conclusion string mapping are the bulk
+   (`modules/structs/repo_actions.go:95-215`,
+   `services/convert/convert.go` ToActionWorkflowRun/Job). Size: **S-M**.
+
+9. **The repo-level Actions extras — 8 ops (P1-7's remainder, slice 2 of
+   5).** The workflows family: `ActionsListRepositoryWorkflows` /
+   `ActionsGetWorkflow` / `ActionsListWorkflowRuns` /
+   `ActionsDisableWorkflow` / `ActionsEnableWorkflow` /
+   `ActionsDispatchWorkflow` (`api.go:1255-1263`; handlers
+   `routers/api/v1/repo/action.go:859-1238`, the workflow reader over the
+   git tree + `actions_service.EnableOrDisableWorkflow`,
+   `services/actions/workflow.go:30-45`, whose store IS the landed
+   ActionsConfig — the disabled-workflow list
+   `apps/worker/src/services/actions/config.ts` already carries); plus
+   `getWorkflowJob` + `downloadActionsRunJobLogs` (`api.go:1264-1267`;
+   handlers `repo/action.go:1702-1752` + `repo/actions_run.go:15-51`, the
+   log download riding the landed DBFS logs store). Dispatches ride the
+   landed dispatch service (`apps/worker/src/services/actions/dispatch.ts`)
+   but need the M3-free workflow-parse half (the YAML name/event reader the
+   repo-actions-workflow UI module already sketches). Gated on P1-1 only
+   for data, not code. Size: **M**.
+
+10. **The `/api/v1` artifacts family — 4 ops (P1-7's remainder, slice 3
+    of 5).** `getArtifacts` / `getArtifact` / `deleteArtifact` /
+    `downloadArtifact` over `/repos/{owner}/{repo}/actions/artifacts[…]`
+    (`api.go:1371-1376`; handlers
+    `repo/action.go:1863-2151` incl. the signed download-URL build
+    `buildSignature`/`buildSigURL`, action.go:2010-2025). The artifact
+    store + the `/api/actions_pipeline` wire are LANDED
+    (`apps/worker/src/services/actions/artifacts*.ts`) — this is the
+    /api/v1 rendering (the `ActionArtifact` wire + `ActionArtifactsResponse`,
+    `modules/structs/repo_actions.go:160-183`) plus the delete arm and the
+    signed-URL download the v4 pipeline already mints. Size: **S-M**.
+
+11. **The runs deep family — 14 ops (P1-7's remainder, slice 4 of 5).**
+    `GetWorkflowRun`, `ListActionTasks`, `deleteActionRun`,
+    `approveWorkflowRun`, `cancelWorkflowRun`, `forceCancelWorkflowRun`,
+    `listWorkflowRunJobs`, `getArtifactsOfRun`,
+    `getWorkflowRunAttempt`, `listWorkflowRunAttemptJobs`,
+    `rerunWorkflowJob`, `getWorkflowRunLogs`, `rerunWorkflowRun`,
+    `rerunFailedWorkflowRun` — the `/repos/{owner}/{repo}/actions/runs/{run}[…]`
+    + `/actions/tasks` group (`api.go:1348-1379`; handlers
+    `repo/action.go:786-858` tasks, `:1239-1814` runs). Cancels/approvals
+    mutate run/job status over the LANDED model; the rerun trio rides the
+    LANDED rerun service (`apps/worker/src/services/actions/rerun.ts`).
+    M3-independent as code, demand-gated with it for data. Size: **M**.
+
+12. **The admin Actions family — 7 ops (P1-7's remainder, slice 5 of 5;
+    the documented reduction's premise is now stale).**
+    `getAdminRunners`, `adminCreateRunnerRegistrationToken`,
+    `getAdminRunner`, `deleteAdminRunner`, `updateAdminRunner`,
+    `listAdminWorkflowRuns`, `listAdminWorkflowJobs` (`api.go:1856-1867`,
+    the reqSiteAdmin group; handlers `routers/api/v1/admin/actions.go` over
+    the same shared runners.go mapping). Declared-undeclared by the
+    admin-t2 batch when "no runner tables" existed
+    (`apps/worker/src/api/routes/admin-t2.ts` header: "the Actions
+    runner/run families (`/admin/actions/*` — no runner tables)") — the
+    runner tables EXIST since SPEC-0012 M1b and this landing made the
+    shared runner mapping serve, so the reduction's reason is gone; what
+    remains is pure registration + the admin-scope (0,0) lookups
+    (EditableInContext's admin arm, runner.go:162-164). Size: **S**.
+
+13. **The scoped-workflows M3 rows — recorded by P1-3's substrate
+    landing (`e24455c`), staged behind P1-1.** The pure layer landed
+    M3-free, but three staged arms ride the M3 trigger chain and are
+    named rows for the M3 SPEC-attachment alongside P1-1's
+    notify/commit-status/reusable-caller rows: (a) the parser's YAML
+    half — `GetEventsFromContent` + `deriveScopedStatusContexts` ride
+    jobparser (upstream's own `scoped_workflow.go` parse arm), so scoped
+    workflows cannot be detected or matched until M3's YAML model port;
+    (b) the merge-gate arm — `applyScopedWorkflowRequiredForm`'s inputs
+    (the live set, the config) come from the store + parse, so required/
+    orphan adjudication activates only when both exist; (c) the notifier
+    arm — `shouldEventCreateCommitStatus`'s six-event allowlist fires
+    from the M3 event seams, not before. The schema table port and the
+    store service are M3-INDEPENDENT (staged separately in P1-3's list).
+    Cites: `e24455c`'s module-header dependency map. Size: — (rides
+    P1-1's M3; listed so the M3 SPEC-attachment does not miss them).
+
 ## P2 — parity polish
 
-1. **The user actions settings group's remaining sub-tabs**: the bare
-   `/user/settings/actions` redirect and the general page (upstream
-   `web.go:721-732`); scoped-workflows rides P1 item 3. Runners joined
-   secrets/variables at `72af05a`, so the group serves today — these two
-   pieces are the recorded reduction named at tick-21
-   (`docs/compat/ui-parity-survey.md` tick-21 paragraph and the remaining
-   set at the recommendation section). Polish-class only: "recorded
-   reductions inside LANDED rows ... polish-class only if a future
-   dispatch wants them" (same source). Size: **S**.
+1. **The user actions settings group's remaining sub-tabs — the pages +
+   mounts LANDED (`6bdd91f` + `180b409`); the write arms STAGED on the
+   owner-store wave (in flight, P2-12).** The bare
+   `/user/settings/actions` redirect answers 303 with the LITERAL
+   `./actions/general` bytes (upstream `web.go:722`'s
+   misc.LocationRedirect — the adminActionsGroupRedirect convention) and
+   the general page rides `userSettingsTabPrologue` + the reuse twin over
+   `OWNER_ACTIONS_GENERAL_FRESH_DATA` with the viewer's ownerId (its
+   loader needs no D1) — mounted literal-first in the parse arms (the
+   bare `actions` before `actions/runners`), four parse-table pins (the
+   nesting-bug guard class). The pages render the NO-SETTING
+   OwnerActionsConfig posture — upstream's own render for any owner
+   without a saved user_setting row (`setting.go:210-232`'s absent-row
+   FromDB → permissive; `general.go:78-79`'s write-all max; the
+   empty-list short-circuit) — with byte-level fidelity pinned. The POST
+   arms stay engine-owned 404s until the owner-store KV home lands
+   (`6bdd91f`'s recorded reduction: upstream persists OwnerActionsConfig
+   as a user_setting KV row, `config.go:38-46`; see P2-12). Scoped-
+   workflows stays the recorded dead item at this scope (rides P1-3's
+   staged store). Settings-nav/goldens: both unions gained
+   actions-general, 8 golden files re-baselined with token deltas
+   verified; suites 351/351 + 194/194 neighbors. Size: **S** (the write
+   arms only, riding P2-12).
 
-2. **The org actions settings tab's remaining pieces**: the general page +
-   bare redirect + scoped-workflows, the recorded reduction inside the
-   LANDED B settings row — the org tab serves secrets/variables and
-   runners (`3ab7532`) today (`docs/compat/ui-parity-survey.md` B row,
-   line-level note; tick-21 remaining set). The general page is the C9
-   page's org twin; scoped-workflows rides P1 item 3. Size: **S**.
+2. **The org actions settings tab's remaining pieces — the general page +
+   bare redirect LANDED (`6bdd91f` + `180b409`); writes STAGED on the
+   owner-store wave (in flight, P2-12).** `GET /{org}/settings/actions`
+   303s the literal `./actions/general` bytes (`web.go:1052`'s twin) and
+   `GET /{org}/settings/actions/general` rides `resolveOrgTeamsRequest`
+   (the owner prologue) + the shared `loadOrgActionsGeneralPageData` —
+   the shared core (locale, fresh-data, loaders, the
+   `ParseMaxTokenPermissions` port `general.go:25-44`) lives in
+   `org-settings-actions-general.tsx`, the user page is the reuse twin
+   (the packages-twin aliasing style); the navbars put General FIRST
+   (user `navbar.tmpl:43-45` href `/user/settings/actions/general`, org
+   `:32-34` upstream's own BARE `{OrgLink}/settings/actions` — the
+   redirect URL mirrored exactly). The POST arms stay engine-owned 404s
+   until the owner-store KV home lands (P2-12; the recipe's full
+   UpdateGeneralSettings semantics ride the org module's HANDOFF tail).
+   Scoped-workflows rides P1 item 3. Size: **S** (the write arms only).
 
 3. **The admin scoped-workflows page** (listed for traceability; consumed
    by P1 item 3): the honest 404 with the omitted nav item is the
@@ -203,25 +394,50 @@ board rows now.
    tick-20 note "scoped-workflows is the documented-reduced honest 404").
    No standalone work — see item P1-3. Size: — (rides P1-3).
 
-4. **Wiki unit gating — the standing out-of-scale divergence.** The wiki
-   API, its git-HTTP twin, and the web-UI family treat every repo as
-   wiki-enabled: "the landed API layer consults no `repo_units` rows yet;
-   every repo is treated wiki-enabled (the landed convention)"
-   (`specs/wiki.md` §1; the divergence documented at the twin's landing,
-   `specs/README.md` wiki row: "unit gating is the remaining future
-   batch"). Upstream gates on `mustEnableUnit(unit.TypeWiki)`
-   (`specs/wiki.md` §1, `api.go:1391` cite). Matters because the
-   `repo_units` infrastructure now exists (the actions/packages units write
-   it in lockstep — `specs/README.md` SPEC-0012 row, `c1cefaa`), so the
-   gate's substrate is no longer missing; still out-of-scale for a polish
-   wave (touches API + git-HTTP + web-UI layers). Size: **M**.
+4. **Wiki unit gating — the web-UI arm LANDED (`a803843` + `4a04d46`);
+   the API + git-HTTP arms stay.** The standing divergence narrowed to
+   the loaded-false window on the web UI: the shell's wiki tab now gates
+   on `ctx.repoHasWiki !== false` (ui-context gains `repoHasWiki`, the
+   inverted polarity documented — `DefaultRepoUnits` INCLUDES TypeWiki,
+   `unit.go:67-77`, so absent = render, explicit false = hide; the
+   upstream pin `header.tmpl:165-169` wraps the tab in
+   `Permission.CanRead(TypeWiki)`, `repo_permission.go:134-136`'s
+   per-repo unit read AT RENDER TIME), wired render-time by
+   `resolveUiRequest`'s EXISTING settings read (`4a04d46` — zero extra
+   D1; a settings-disabled wiki loses its tab on every repo page;
+   enabled/unsaved repos render identically, goldens no-regen held).
+   Route-side was already correct (`wikiPrologue` loads settings fresh
+   every request and 404-shells `!hasWiki` — MustEnableWiki parity, the
+   arms pinned at `wiki.matrix:352`). REMAINING: the API layer consults
+   no `repo_units` rows yet — every repo is treated wiki-enabled (the
+   landed convention; `specs/wiki.md` §1, the `api.go:1391`
+   `mustEnableUnit(unit.TypeWiki)` cite) — and the git-HTTP twin carries
+   the same posture (`specs/README.md` wiki row: "unit gating is the
+   remaining future batch"). The `repo_units` substrate exists (the
+   actions/packages units write it in lockstep — `c1cefaa`), so the gate
+   is a plain batch across the two remaining layers. Size: **M** (API +
+   git-HTTP only).
 
-5. **The archived-release release-create arm keeps 201** (`6b2bedc`'s
-   disclosed divergence): upstream's create handler maps the
-   archived-repo failure to a bare 500 (`release.go:283`'s posture);
-   the pinned posture here keeps the 201. Recorded as a deliberate
-   divergence, listed so a future parity pass either ports the 500 arm or
-   re-affirms ours in SPEC-0004 §2.3. Size: **S** (decision + one arm).
+5. **The archived-release release arms — LANDED to upstream's bare 500
+   (`0b39750`); the 201 divergence retired, the decide-or-reaffirm
+   settled.** The chain verified hunk-by-hunk at the pin: the /releases
+   subtree carries only `mustEnableUnit(TypeReleases)`
+   (`api.go:1408-1429`) — `mustNotBeArchived` NEVER runs for releases,
+   no 423 exists at any level; the gate lives INSIDE `createTag`
+   (`release.go:75-78`, `rel.Repo.MustNotBeArchived` →
+   ErrRepoIsArchived) AFTER the duplicate check and BEFORE the
+   `!IsDraft` gate — drafts are refused too — reached by BOTH
+   CreateRelease (`:187`) and UpdateRelease (`:269`, unconditional,
+   draft states included); NEITHER API handler maps it (create falls to
+   APIErrorInternal `:285-287`, edit the bare `:379-382`) → the bare 500
+   with the prod-blanked body (`context/api.go:117-130`), which ours
+   renders through the `ef2c049` untyped-throw convention. Implemented:
+   the archived gate in `createReleaseWithGitTag` (after the 409, before
+   the draft block) and `editRelease` (step 0); pins flipped (201 →
+   500+body+no-ref-no-row; draft-create 500s; 409 outranks the archived
+   500; archived edit 500s row-untouched; archived publish-from-draft
+   500s pre-tag-arm). SPEC-0005 §2.3 rewritten + §4.14's matrix row;
+   releases 56/56, compat 172/172, check:api PASS. Size: — (landed).
 
 6. **The review-api semantic-drift remainder** — what the post-v1.3.1
    wave did not close (source: `docs/usability/parity-review-api.md`
@@ -252,40 +468,61 @@ board rows now.
    never-fail-the-write posture, documented). Sizes: **S–M** each; the
    whole remainder is a dispatchable batch.
 
-7. **The review-webui rendering remainder** — source:
+7. **The review-webui rendering remainder — NARROWED by `7e72149`
+   (read items 10 and 11 for the landed drifts' detail).** Source:
    `docs/usability/parity-review-webui.md` top-drifts list; the New-PR
    button, empty-repo anon arm, branches order, and collaborator grants
-   LANDED in v1.3.1 (`d52361b`, `56df8a6`, `7f9241e`). Still open:
-   the branch selector as a bare Fomantic dropdown where upstream is the
-   `initRepoBranchTagSelector` Vue island (~20 data attrs — affects
-   home/file-view/commits); the repo home right row lacks
-   Go-to-file/New-PR/Add-File; the issues list lacks the `#issue-filters`
-   skeleton + Labels/Milestones buttons (their pages exist); the merge box
-   lacks `initRepoPullMergeBox` and renders nothing closed; issue-detail
-   timeline `event-{id}` on both div and anchor (upstream splits
-   `issuecomment-{id}`/`event-{id}`); releases omit Source Code archives
-   although `/archive` serves (stale reduction — partially related to the
-   POST arm `4e6d1cc` mounted); the header's Issues tab misses
-   `octicon-issue-opened` and the admin Settings tab is absent although
-   settings pages landed. Sizes: **S** each except the two Vue islands
-   (**M**).
+   LANDED in v1.3.1 (`d52361b`, `56df8a6`, `7f9241e`); the two Vue
+   islands (merge box, branch selector) LANDED per item 10; the timeline
+   anchor split, the issues/pulls rows, and the header tab strip's four
+   pieces LANDED at `7e72149` per item 11 (with the merge-line anchor
+   premise corrected there). REMAINING — four S pieces, no M left: the
+   Go-to-file/New-PR/Add-File home row (`pages/home.tsx`); the issues
+   list's `#issue-filters` toolbar skeleton + Labels/Milestones buttons
+   (`list.tmpl:25-56` — the New buttons are in, the
+   wrapper/checkboxes/filters are not); the releases Source-Code archive
+   rows (`pages/releases.tsx`, although `/archive` serves — the POST arm
+   `4e6d1cc` mounted); and the Code tab's ref-preserving href
+   (`header.tmpl:100-101` — the `7e72149`-deferred piece, needs the
+   current BranchName/RefTypeNameSubURL threaded through the `ui/index.ts`
+   ctx assembly). Sizes: **S** each.
 
-8. **The review-git protocol remainder** — source:
+8. **The review-git protocol remainder — the receive-pack caps pair and
+   the protocol-v2 pair LANDED (`e454a75`); the export-subst/attr-macro
+   engine arm and the ladder-ordering drifts stay.** Source:
    `docs/usability/parity-review-git.md`; the archive POST arm and the
    GCM realm LANDED in v1.3.1 (`4e6d1cc`, `85fa2ff`); the LFS locking
    family and the archive attribute semantics LANDED in the window since
-   `0fdc267` (`7b589c7`'s four-route family + the D1-race-safe unique
-   index; `5365236`'s export-ignore + zip STORE→DEFLATE). Still open
-   (engine-scope items separated in the review): receive-pack caps lack
-   atomic/push-options/report-status-v2; export-subst stays parsed but
-   not substituted in archives — blobs stream byte-identical with
-   `$Format:…$` literals surviving, and `[attr]`-macro patterns sit
-   outside the compiled matcher subset — the engine-side expansion is the
-   recorded future arm (`5365236`); protocol-v2 lacks fetch=filter
-   (partial clone fatal) and ls-refs=unborn; the ladder-ordering drifts
-   (403-before-auth arms, the wiki-doesn't-exist pkt-line, dumb-HTTP
-   absent — documented). Sizes: **M** each; several are engine-boundary
-   decisions first.
+   `0fdc267` (`7b589c7`; `5365236`). LANDED at `e454a75` (byte-observed
+   on stock git 2.43.0 under GIT_TRACE_PACKET; the full 29-script engine
+   sweep PASS=29, worker git-http 119/119, real-client acceptance incl.
+   `git clone --filter=blob:none` end-to-end with the lazy-fetch checkout
+   round and `git push --atomic` + `-o echo` over HTTP — the stale-atomic
+   failure byte-identical against reference http-backend, a stock-client
+   quirk disclosed; NOTICE carries both units' rows): receive-pack
+   advertises + honors atomic/push-options/report-status-v2 (push-options
+   advertised UNCONDITIONALLY per upstream's
+   `receive.advertisePushOptions=true`, `modules/git/config.go:40-42`;
+   the section grammar has NO count pkt-line and NO trailing LF,
+   EOF-mid-section ends it — git's read_push_options bug-compat; ATOMIC
+   via a WRITE-FREE verdict pass in commitPush, hook rejections funnel
+   the all-rejected path; report-status-v2 honored with zero option
+   lines — upstream's own no-proc-receive posture; extraRefUpdates stay
+   best-effort outside the guarantee) and protocol-v2 answers
+   ls-refs=unborn byte-identically + parses fetch=filter
+   blob:none/blob:limit=<n> (strict > boundary byte-verified; promised
+   blobs stay unmarked with the directly-wanted-blob lazy-fetch
+   carve-out; under a filter the want gate relaxes to upstream's
+   has-object rule; both full-clone fast paths exclude filtered
+   requests). STILL OPEN (engine-scope items separated in the review):
+   export-subst stays parsed but not substituted in archives — blobs
+   stream byte-identical with `$Format:…$` literals surviving, and
+   `[attr]`-macro patterns sit outside the compiled matcher subset —
+   the engine-side expansion is the recorded future arm (`5365236`);
+   the ladder-ordering drifts (403-before-auth arms, the
+   wiki-doesn't-exist pkt-line, dumb-HTTP absent — documented). Sizes:
+   **M** each; the export-subst/attr pair is an engine-boundary decision
+   first.
 
 9. **The review-packages D-4/D-5/D-6 tail — LANDED (`41eada6`).** D-4's
    nuget service-index trio serves unauthenticated (the `none` protocol
@@ -378,6 +615,34 @@ board rows now.
     BranchName/RefTypeNameSubURL threaded through the ui/index.ts ctx
     assembly).
 
+12. **The owner-store KV prerequisite — the actions-settings POST arms'
+    staged substrate (`6bdd91f`/`180b409`'s recorded reduction; the
+    store wave IN FLIGHT at this update).** Upstream persists
+    OwnerActionsConfig as a user_setting KV row (`config.go:38-46`), and
+    the two general pages' POST arms (upstream posts both forms to the
+    page URL) stay engine-owned 404s until this deployment's
+    typed-columns side store grows the KV home — `src/db` was outside
+    the pages wave by ownership. The render is correct for every
+    never-saved owner (upstream's own absent-row posture), so only the
+    write arms wait; the full UpdateGeneralSettings semantics ride the
+    org module's HANDOFF tail (the recipe recorded at `180b409`).
+    In flight — do not re-dispatch the store; see the in-flight block.
+    Size: **S–M** (one store wave + two POST arms).
+
+13. **Amendment to item 6 — the tail's in-flight arms at this update
+    (sibling-owned; do not re-dispatch; not landed until committed).**
+    (a) The E9 deferral record — comment-create's missing locked-issue
+    403 gate + the accepted empty body, the (e) honorable mentions — the
+    deferral-record unit is in flight (carried from the `95cdcaf` block,
+    still uncommitted). (b) The ~15 model.ts cite renumbers (the
+    cite-audit pass's mechanical drift finding, `ae1de6d`) — still in
+    flight. (c) The (d) auto-init files honorable mention (auto-init
+    repos missing `gitignores`/`license` files) — the tree's uncommitted
+    repo-init-templates unit (`apps/worker/src/api/services/repo-init-templates.ts`
+    + the `src/api/data` gitignore/license catalogs + their consumer
+    wiring) matches it and is in flight. Each lands against item 6's
+    ledger; no new decision.
+
 ## P3 — hardening, tooling, and the small flagged items
 
 1. **act_runner 5.x (the `gitea/runner` line) is UNVERIFIED.** The
@@ -446,22 +711,27 @@ board rows now.
    not re-sized; each is a future SPEC's call. Size: **S–L** depending on
    which reopens.
 
-7. **The serializer counts tail + the language side-store.** The counts
-   seam LANDED in the window since `0fdc267`: `followers_count`/
-   `following_count` render the requester-visible live totals (the
-   documented `ApiUserFollowCounts` divergence — a private follower never
-   counts for a viewer who cannot see them; `58283bd` + the `GET /user`
-   self wiring `40120ae`, with the no-binding degrade `9f883d0`). Still
-   open from the same TODO(SPEC-0005): `last_login` — the D1 row has NO
-   column (definitive over schema + migrations 0001-0044); the render
-   site documents the authed-gate shape and the TODO re-scoped to the
-   missing column (`58283bd`). Alongside it, `language` renders `''` on
-   BOTH serializers by decision: there is no users column for it —
-   upstream keeps the language in a side store, and the review graded the
-   drift cosmetic (`cf269f4`'s in-comment note;
-   `docs/usability/parity-review-api.md`). Landing either needs the store
-   decision first (a SPEC-0005 call). Size: **M** (store + two
-   serializers).
+7. **The serializer counts tail + the language side-store — the
+   `last_login` half is IN FLIGHT via the store/schema wave; the
+   language half stays a store decision.** The counts seam LANDED in the
+   window since `0fdc267`: `followers_count`/`following_count` render
+   the requester-visible live totals (the documented
+   `ApiUserFollowCounts` divergence — a private follower never counts
+   for a viewer who cannot see them; `58283bd` + the `GET /user` self
+   wiring `40120ae`, with the no-binding degrade `9f883d0`). The
+   `last_login` half — the D1 row had NO column (definitive over schema
+   + migrations 0001-0044 at `58283bd`'s write time) — now rides the
+   IN-FLIGHT store/schema wave: the working tree's uncommitted migration
+   `0047_fancy_chronomancer.sql` adds `users.last_login_at` (the column
+   labeled P3-7 in the schema diff; upstream's `User.LastLoginUnix`,
+   set at session MINT not per-request verify, rendered authed-gated).
+   NOT landed until committed — see the in-flight block. The `language`
+   half is untouched by the wave: `language` renders `''` on BOTH
+   serializers by decision (no users column; upstream keeps it in a side
+   store; the review graded the drift cosmetic — `cf269f4`'s in-comment
+   note; `docs/usability/parity-review-api.md`) and still needs the
+   store decision first (a SPEC-0005 call). Size: **M** for the language
+   store (the last_login half rides the in-flight wave).
 
 8. **The review-actions lower-ranked drifts** (source:
    `docs/usability/parity-review-actions.md` ranked list, below the five
@@ -485,31 +755,53 @@ board rows now.
    ephemeral arms. A check, not a work item; file findings as residuals
    if red. Size: **S** (observation + record).
 
-10. **`/raw` LFS resolution follow-up.** v1.3.1 landed the file-view LFS
-    badge and CORRECTED the premise: upstream `/raw` does NOT resolve LFS
-    at the pin (`web.go:1705-1712` wires `SingleDownload`;
-    `SingleDownloadOrLFS` is the `/media` group only) — the landed posture
-    is correct and pinned (`f561d92`'s dated correction note + the
-    pointer-parity regression pin). The disclosed follow-up surface for
-    v1.3.2: the `/media`-family content resolution + size + link flip, if
-    that surface is ever dispatched. Size: **M** (a new route family).
+10. **`/raw` LFS resolution follow-up — LANDED (`cd895f6`); the
+    disclosed v1.3.2 surface is closed.** v1.3.1 landed the file-view
+    LFS badge and corrected the premise (upstream `/raw` does NOT
+    resolve LFS at the pin — `SingleDownloadOrLFS` is the `/media` group
+    only). The follow-up's link flip landed: upstream overwrites
+    `RawFileLink` for LFS-pointed files (`view_file.go:210-212` —
+    `ctx.Repo.RepoLink + /media/ + RefTypeNameSubURL +
+    PathEscapeSegments(TreePath)`) and EVERY template consumer reads the
+    overwritten value (`view_file.tmpl:2/:49/:64/:100/:123-135`), so the
+    single `rawLink` composition flipped wholesale (`file-content.tsx:190`
+    over `links.ts`'s `mediaFileLink` mirror); the `/media` family was
+    already landed (`77e8567`, family media-file) — zero route changes.
+    Pins +2 (big.bin + ghost.bin view links `/media/branch/main/...`,
+    each flipped link live-fetches 200; README/NOTES/logo/broken.bin
+    keep `/raw` — broken.bin the malformed-pointer guard). One ownership
+    deviation disclosed + coordinator-blessed mid-flight: the
+    composition lives in `file-content.tsx` over `links.ts`'s helper,
+    not the dispatch's named `file-view.tsx`. Goldens byte-identical
+    (none of the golden fixtures render an LFS view); 17/17 + 91/91 +
+    a11y 88/88. Size: — (landed).
 
-11. **The annotated-tag read-tag RPC (engine boundary).** The tags API's
-    `message` is always empty because the engine boundary carries no
-    read-tag RPC (`readCommit` peels; `parseTag` unexported; only the
-    write-side `serializeTag`) — F8 of the git-e2e wave, flagged to the
-    engine owner (`1677dbb`; the deviation recorded in the git-models/
-    routes headers; finding origin `27353a2`). Needs the boundary
-    decision (a `readTag` RPC or a peeled-tag sidecar) first. Size: **M**
-    (engine + API), **engine-owner**.
+11. **The annotated-tag read-tag RPC (engine boundary) — IN FLIGHT at
+    this update; do not re-dispatch.** The tags API's `message` is
+    always empty because the engine boundary carries no read-tag RPC
+    (`readCommit` peels; `parseTag` unexported; only the write-side
+    `serializeTag`) — F8 of the git-e2e wave, flagged to the engine
+    owner (`1677dbb`; the deviation recorded in the git-models/routes
+    headers; finding origin `27353a2`). The boundary wave is NOW
+    uncommitted in the working tree (`packages/git-engine`
+    `src/repo.ts` + `src/git/objects.ts` modified, the new
+    `e2e/check-tag-read.mjs` check) — held, not counted landed until
+    committed; the boundary-decision premise stays as the record.
+    Size: **M** (engine + API), **engine-owner** (in flight).
 
-12. **The `/user/settings` remaining serial pair** — the perf lever
-    `06b3384` explicitly left on the table: verifySession's
-    read-and-discard of the full users row plus the navbar bell's unread
-    COUNT ride serially after it; a viewer-level carry would dedupe
-    (4→2 round trips, ~0.7s more at the observed production latency).
-    Lives in `resolveUiSession` (`ui/index.ts`) — orchestrator-owned
-    dispatch. Size: **S–M**.
+12. **The `/user/settings` remaining serial pair — LANDED as the
+    true-residue fix (`e8ef89d`), with a premise correction.** The row's
+    named page-loader pair was ALREADY parallel (`loadUserSettingsPageData`
+    is a Promise.all with the `06b3384`-era F1 cite — the premise
+    stale); the true residue sat in `resolveUiRequest`'s prologue:
+    `loadManifest` awaited BEFORE `resolveViewer` (whose chain owns
+    verifySession's users-row read) serially on every UI request. Now a
+    Promise.all pair (the manifest is independent; the bell count still
+    follows the viewer — it needs `viewer.id`). Behavior-identical;
+    session/wave12/index/goldens neighbors green (the 8 settings-nav
+    golden reds in the live tree at landing time were the
+    actions-subtabs sibling's in-flight tabs — attributed, not that
+    change). Size: — (landed).
 
 13. **Guide notes from the production sweeps.** (a) Pre-`b0e1d88` repos
     carry no armed `repo_settings` row, so `/api/v1`-created or
@@ -552,11 +844,12 @@ board rows now.
   rules — none is dispatchable as a bare UI/store unit.
 - The v1.3.1 additions (P2-5 through P2-10, P3-7 through P3-13) and the
   parity-wave additions (P3-14, P3-15) are mostly dispatchable small
-  batches over landed substrate; P2-8's engine-scope items and P3-11 need
-  their boundary decisions first. Verify the in-flight block at the top
-  BEFORE dispatching any of them — the doc-time block it replaced is
-  fully resolved (the header note), and the current three items are
-  sibling-owned.
+  batches over landed substrate; P2-8's remaining engine-scope items and
+  P3-11 need their boundary decisions first. Verify the in-flight block
+  at the top BEFORE dispatching any of them — the doc-time block it
+  replaced is fully resolved (the header note), and the block's items
+  (the store/schema wave, the owner-store wave, P3-11's engine wave, the
+  P2-6 tail items, the archive pin unit) are sibling-owned.
 - P2 items are all dispatchable over landed substrate except the
   scoped-workflows pieces (P1-3).
 - P3 is the sweep list for gap waves between feature landings; the doc-debt
