@@ -45,6 +45,7 @@ import {
   oauth2Applications,
   packageCleanupRules,
   repositories,
+  systemKeystore,
   userBadges,
   users,
   webhooks,
@@ -54,6 +55,7 @@ import { saveRepoSettings } from "../../api/services/repo-settings";
 import { createGlobalHook } from "../../api/services/hooks";
 import { demoModeEnabled } from "../../services/demo-sweep";
 import { AuditActions, emitAudit } from "../../services/audit";
+import { __setArtifactPreviewClockForTests } from "../pages/repo-actions-artifacts";
 import { __setRouteClockForTests, uiRouter } from "../index";
 import { ensureSeededFixedIdRepo } from "../testing/seed-repo";
 import { seedWikiPage } from "../testing/seed-wiki";
@@ -233,6 +235,25 @@ const ACTIONS_GOLDEN_ORG_TOKEN = "b2e1d0dead0b2e1d0dead0b2e1d0dead0b2e1d0dea";
  *  ownerId 0 there — model.ts's normalizeTokenScope). */
 const ACTIONS_GOLDEN_USER_TOKEN = "c3d2e1feed0c3d2e1feed0c3d2e1feed0c3d2e1fee";
 const ACTIONS_GOLDEN_REPO_TOKEN = "d4e5f6cafe0d4e5f6cafe0d4e5f6cafe0d4e5f6caf";
+
+/**
+ * The artifact-preview SIGNED-URL material (the preview-tail golden's rider):
+ * a FIXED `general_token_signing_secret` keystore row. artifactPreviewRawLink
+ * HMACs (artifactId, expires) with the keystore's tokenSigningSecret
+ * (services/actions/secrets.ts hmacKey → actionsBuildSignature), and the
+ * keystore is generate-once `crypto.getRandomValues` material per fresh D1 —
+ * the vitest plugin's per-file storage regenerates it EVERY run, so without
+ * this pinned row the signature segment differs per run and NO committed
+ * golden can carry the signed link (the clock seam alone is not enough — the
+ * fixed-uuid/token fixture precedent: random material is seeded, never
+ * consumed from its generator). Inert everywhere else: the keystore was
+ * first-read by this file here (the bare preview golden never signs — its
+ * previewContentUrl stays ""), the OIDC JWK piece stays generator-owned
+ * (nothing renders it), and no other golden drives an actions-signing path.
+ * 64 hex chars = the generator's own 32-byte HS256 shape.
+ */
+const GOLDEN_KEYSTORE_SIGNING_SECRET =
+  "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
 
 beforeAll(async () => {
   await drizzle(env.DB).update(users).set({ isAdmin: true }).where(eq(users.usernameLower, "morgan"));
@@ -677,6 +698,32 @@ beforeAll(async () => {
             updated: t(2),
           },
         ])
+        .run();
+    }
+
+    // The preview-tail golden's keystore pin (the constants block holds the
+    // argument): the FIXED signing-secret row — the signed iframe URL's HMAC
+    // is a pure function of (secret, artifactId, expires), and BOTH inputs
+    // are now fixtures (the clock seam pins expires; this row pins the
+    // secret). Checked first (before any render in this file can populate
+    // loadKeystore's module cache with generator material).
+    if (
+      (
+        await drizzle(env.DB)
+          .select({ name: systemKeystore.name })
+          .from(systemKeystore)
+          .where(eq(systemKeystore.name, "general_token_signing_secret"))
+          .all()
+      ).length === 0
+    ) {
+      await drizzle(env.DB)
+        .insert(systemKeystore)
+        .values({
+          name: "general_token_signing_secret",
+          value: JSON.stringify({ v: 1, tokenSigningSecret: GOLDEN_KEYSTORE_SIGNING_SECRET }),
+          createdAt: t(0),
+          updatedAt: t(0),
+        })
         .run();
     }
 
@@ -1140,13 +1187,16 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
   //     ("Back to action run #1"), the artifact-name summary + download
   //     link, the Files menu's directory row + two file rows (the legacy
   //     one-path-per-row listing — D1-only, no R2 hop), and the BARE
-  //     preview URL's no-iframe arm. The signed-URL iframe is deliberately
-  //     NOT pinned: previewContentUrl renders only on a /preview/{path} tail
-  //     and carries `Date.now()` + 1h expiry bytes (artifactPreviewRawLink)
-  //     with NO route-clock seam (the loader reads the wall clock directly,
-  //     not routeNow()) — the same class as the admin-monitor cron skip, and
-  //     the tail case stays excluded until a route-clock hop lands in the
-  //     page module (outside this file's ownership).
+  //     preview URL's no-iframe arm. The signed-URL iframe was EXCLUDED at
+  //     this case's landing — previewContentUrl renders only on a
+  //     /preview/{path} tail and carried `Date.now()` + 1h expiry bytes
+  //     (artifactPreviewRawLink) with no clock seam (the same class as the
+  //     admin-monitor cron skip). CLOSED by the follow-up wave-page-clock:
+  //     the page module's own seam (`__setArtifactPreviewClockForTests`)
+  //     plus the FIXED keystore-secret row pin BOTH signed-URL inputs, and
+  //     the tail case renders in its own describe below (the cron golden's
+  //     pin-wrap precedent — the seam is module-scope, not a per-request
+  //     field).
   // ---------------------------------------------------------------------------
   { file: "admin-actions-runners.html", path: "/-/admin/actions/runners", status: 200, signedIn: true, sessionUser: "morgan" },
   {
@@ -1382,6 +1432,91 @@ describe("route-clock override arm (set/unset behavior)", () => {
 
     const liveRss = (await renderRoute("/alice/golden/releases.rss")).html;
     expect(liveRss).not.toContain(FEED_PINNED_CHANNEL_STAMP);
+  });
+});
+
+/**
+ * The repo-actions-artifacts-preview-TAIL golden — the exclusion the
+ * repo-actions-artifacts-preview case comment documented, closed by the
+ * wave-page-clock: the page module's own ROUTE_CLOCK-twin seam
+ * (`__setArtifactPreviewClockForTests` — the same module-scope, test-only,
+ * null-restores-the-wall-clock shape as index.ts's route clock) pins the
+ * signed-link expiry hop, and the FIXED keystore-secret row (the constants
+ * block) pins the HMAC key, so every byte of the signed URL is a fixture.
+ *
+ * The case: `/morgan/admin-golden/actions/artifacts/1/preview/logs/build.log`
+ * signed in as morgan — the SAME fixture family as the bare preview golden
+ * above (no new seeds; artifact id 1's legacy two-row family), now on the
+ * /preview/{path} TAIL, so the render carries what the bare URL's no-iframe
+ * arm could not: the requested file's `active` row in the Files menu AND the
+ * sandboxed external-render iframe whose `data-src` is the signed raw link
+ * `/-/actions/artifacts/1/{expires}/{signature}/logs/build.log`.
+ *
+ * This lives in its OWN describe, not NEW_GOLDEN_CASES: the pin must WRAP
+ * the render (the seam is a module-scope override, not a per-request field)
+ * — the admin-monitor-cron golden's exact structural reason. The try/finally
+ * restores the wall clock even on failure, so a broken golden cannot leak
+ * the pin into sibling suites (module-level state, one file's worker).
+ */
+const ARTIFACTS_PREVIEW_TAIL_GOLDEN_CASE: GoldenCase = {
+  file: "repo-actions-artifacts-preview-tail.html",
+  path: "/morgan/admin-golden/actions/artifacts/1/preview/logs/build.log",
+  status: 200,
+  signedIn: true,
+  sessionUser: "morgan",
+};
+
+/** The pinned expiry literal the signed iframe URL carries: T0 + the link's
+ *  one hour (1_700_000_000 + 3_600 = 1_700_003_600). */
+const ARTIFACTS_PREVIEW_PINNED_EXPIRES = "1700003600";
+
+describe("repo-actions-artifacts-preview-tail golden (the wave-page-clock closure)", () => {
+  it("renders repo-actions-artifacts-preview-tail.html byte-identical (200) under the pinned preview clock", async () => {
+    __setArtifactPreviewClockForTests(() => new Date(T0 * 1000));
+    try {
+      await renderGoldenCase(ARTIFACTS_PREVIEW_TAIL_GOLDEN_CASE);
+    } finally {
+      __setArtifactPreviewClockForTests(null);
+    }
+  });
+});
+
+/**
+ * The page-clock override's own arm (the route-clock override arm's twin —
+ * the seam is production-invisible only if the pin BOTH moves the rendered
+ * bytes AND unset restores the wall clock). The pinned expiry literal is a
+ * 2023 stamp that can never collide with a live render (the wall clock
+ * postdates it by years), so `toContain` / `not.toContain` are the robust
+ * discriminators — no timing flakes.
+ */
+describe("artifact-preview page-clock override arm (set/unset behavior)", () => {
+  it("the pin fixes the signed iframe URL's expiry; unsetting restores the wall clock; re-pinning is exact", async () => {
+    __setArtifactPreviewClockForTests(() => new Date(T0 * 1000));
+    let pinned: string;
+    try {
+      pinned = (await renderCase(ARTIFACTS_PREVIEW_TAIL_GOLDEN_CASE)).html;
+    } finally {
+      __setArtifactPreviewClockForTests(null);
+    }
+    expect(pinned).toContain(`/-/actions/artifacts/1/${ARTIFACTS_PREVIEW_PINNED_EXPIRES}/`);
+
+    // Unset = the wall clock: the 2023 expiry is gone, proving the override
+    // actually gates these bytes (the golden above could not pass without
+    // the pin reaching the link compose).
+    const live = (await renderCase(ARTIFACTS_PREVIEW_TAIL_GOLDEN_CASE)).html;
+    expect(live).not.toContain(ARTIFACTS_PREVIEW_PINNED_EXPIRES);
+    expect(live).not.toBe(pinned);
+
+    // Re-pinning reproduces the pinned bytes exactly — no state bleed from
+    // the wall-clock render through the module-scope variable.
+    __setArtifactPreviewClockForTests(() => new Date(T0 * 1000));
+    let repinned: string;
+    try {
+      repinned = (await renderCase(ARTIFACTS_PREVIEW_TAIL_GOLDEN_CASE)).html;
+    } finally {
+      __setArtifactPreviewClockForTests(null);
+    }
+    expect(repinned).toBe(pinned);
   });
 });
 

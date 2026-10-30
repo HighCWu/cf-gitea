@@ -126,7 +126,7 @@ export const settingsNavLocale = {
   ssh_gpg_keys: "SSH / GPG Keys", // "settings.ssh_gpg_keys" (:33)
   actions: "Actions", // "actions.actions" (the <details> summary, :41)
   runners: "Runners", // "actions.runners" (navbar.tmpl:35-37/43-48 — lit by BOTH twins' mounts: org-settings-actions-runners + user-settings-actions-runners)
-  packages: "Packages", // "packages.title" (navbar.tmpl:25 — lit by the org settings packages tab's mount)
+  packages: "Packages", // "packages.title" (navbar.tmpl:25/61-65 — lit by BOTH packages settings tabs' mounts: org + user)
   secrets: "Secrets", // "secrets.secrets" (:50)
   variables: "Variables", // "actions.variables" (:53)
   hooks: "Webhooks", // "repo.settings.hooks" (:68)
@@ -152,6 +152,7 @@ export type UserSettingsNavTab =
   | "applications" // pages/user-settings-applications.tsx
   | "keys" // pages/user-settings-keys.tsx
   | "runners" // pages/user-settings-actions-runners.tsx
+  | "packages" // pages/user-settings-packages.tsx
   | "secrets" // pages/user-settings-secrets.tsx
   | "variables" // pages/user-settings-variables.tsx
   | "hooks" // pages/user-settings-webhooks.tsx
@@ -233,7 +234,12 @@ export function UserSettingsNavbar(props: { active: UserSettingsNavTab }) {
             </a>
           </div>
         </details>
-        {/* navbar.tmpl:66-70 (Packages :61-65 dead) — the user hooks tab
+        {/* navbar.tmpl:61-65 — lit by the user packages settings tab's
+            mount (pages/user-settings-packages.tsx). */}
+        <a class={item("packages")} href="/user/settings/packages">
+          {settingsNavLocale.packages}
+        </a>
+        {/* navbar.tmpl:66-70 — the user hooks tab
             reuses the repo key's text; href = the webhooks module's
             USER_SETTINGS_HOOKS_LINK. */}
         <a class={item("hooks")} href="/user/settings/hooks">

@@ -1012,6 +1012,21 @@ import {
   updateUserActionsRunnerDescription,
 } from "./pages/user-settings-actions-runners";
 import {
+  applyUserCleanupRuleCreate,
+  applyUserCleanupRuleEdit,
+  loadUserCleanupRuleEditPageData,
+  loadUserCleanupRulePreview,
+  loadUserPackagesSettingsPageData,
+  parseUserCleanupRuleForm,
+  renderUserCleanupRuleEditPage,
+  renderUserCleanupRulePreviewPage,
+  renderUserSettingsPackagesPage,
+  userCleanupRuleEditDataForAdd,
+  userCleanupRuleEditDataFromForm,
+  userSettingsPackagesLocale,
+} from "./pages/user-settings-packages";
+import type { UserProfileRow } from "./pages/user-profile";
+import {
   createUserHookFromForm,
   deleteUserHook,
   editUserHookFromForm,
@@ -3092,6 +3107,10 @@ export interface UserSettingsTabRoute {
     | "user-settings-actions-runners-edit"
     | "user-settings-actions-runners-update"
     | "user-settings-actions-runners-delete"
+    | "user-settings-packages"
+    | "user-settings-packages-rule-add"
+    | "user-settings-packages-rule-edit"
+    | "user-settings-packages-rule-preview"
     | "user-settings-variables"
     | "user-settings-variables-new"
     | "user-settings-variables-edit"
@@ -3499,6 +3518,23 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (tail.length === 4 && tail[0] === "actions" && tail[1] === "runners" && tail[3] === "delete") {
       const id = numericId(tail[2]);
       return id === null ? null : { family: "user-settings-actions-runners-delete", id };
+    }
+    // The USER-scope packages family (pages/user-settings-packages.tsx —
+    // web.go:701-719's cleanup-rules group at user scope; rules/add literal
+    // before the {id} combos; cargo/chef tails unregistered — no substrate).
+    if (tail.length === 1 && tail[0] === "packages") {
+      return { family: "user-settings-packages", id: null };
+    }
+    if (tail.length === 3 && tail[0] === "packages" && tail[1] === "rules" && tail[2] === "add") {
+      return { family: "user-settings-packages-rule-add", id: null };
+    }
+    if (tail.length === 3 && tail[0] === "packages" && tail[1] === "rules") {
+      const id = numericId(tail[2]);
+      return id === null ? null : { family: "user-settings-packages-rule-edit", id };
+    }
+    if (tail.length === 4 && tail[0] === "packages" && tail[1] === "rules" && tail[3] === "preview") {
+      const id = numericId(tail[2]);
+      return id === null ? null : { family: "user-settings-packages-rule-preview", id };
     }
     if (tail.length === 2 && tail[0] === "actions" && tail[1] === "runners") {
       return { family: "user-settings-actions-runners", id: null };
@@ -8586,6 +8622,98 @@ async function userActionsRunnerDelete(c: Context<{ Bindings: Env }>, runnerId: 
   const outcome = await deleteUserActionsRunner(c.env.DB, p.viewer.id, runnerId);
   if (outcome === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
   return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/actions/runners" } }));
+}
+
+/** The USER-scope packages family's handlers (pages/user-settings-packages.
+ *  tsx — web.go:701-719; the user twin of the org handlers, the doer row
+ *  read first for the UserProfileRow the pages render from). */
+async function readProfileRowForPackages(c: Context<{ Bindings: Env }>, viewerId: number): Promise<UserProfileRow | null> {
+  const row = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewerId)).get();
+  return row ?? null;
+}
+
+async function userPackagesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const user = await readProfileRowForPackages(c, p.viewer.id);
+  if (user === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  const data = await loadUserPackagesSettingsPageData(c.env.DB, user);
+  return p.respond(c.html(renderUserSettingsPackagesPage(p.ctx, data), 200));
+}
+
+async function userPackagesRuleAddPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const user = await readProfileRowForPackages(c, p.viewer.id);
+  if (user === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderUserCleanupRuleEditPage(p.ctx, userCleanupRuleEditDataForAdd(user)), 200));
+}
+
+async function userPackagesRuleAddSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const user = await readProfileRowForPackages(c, p.viewer.id);
+  if (user === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  const parsed = parseUserCleanupRuleForm(await readUrlEncodedForm(c.req.raw));
+  if (Object.keys(parsed.errors).length > 0) {
+    return p.respond(c.html(renderUserCleanupRuleEditPage(p.ctx, userCleanupRuleEditDataFromForm(user, false, parsed)), 200));
+  }
+  const outcome = await applyUserCleanupRuleCreate(c.env.DB, user.id, parsed.values, new Date());
+  if (outcome.outcome === "duplicate-type") {
+    return p.respond(
+      c.html(
+        renderUserCleanupRuleEditPage(
+          p.ctx,
+          userCleanupRuleEditDataFromForm(user, false, parsed, { errType: true, error: userSettingsPackagesLocale.already_exists }),
+        ),
+        200,
+      ),
+    );
+  }
+  return p.respond(new Response(null, { status: 303, headers: { location: `/user/settings/packages/rules/${outcome.ruleId}` } }));
+}
+
+async function userPackagesRuleEditPage(c: Context<{ Bindings: Env }>, ruleId: number): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const user = await readProfileRowForPackages(c, p.viewer.id);
+  if (user === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  const data = await loadUserCleanupRuleEditPageData(c.env.DB, user, ruleId);
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderUserCleanupRuleEditPage(p.ctx, data), 200));
+}
+
+async function userPackagesRuleEditSubmit(c: Context<{ Bindings: Env }>, ruleId: number): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const user = await readProfileRowForPackages(c, p.viewer.id);
+  if (user === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  const parsed = parseUserCleanupRuleForm(await readUrlEncodedForm(c.req.raw));
+  // getCleanupRuleByContext's precedence: the form id first, then the path.
+  const id = parsed.values.id !== 0 ? parsed.values.id : ruleId;
+  if (Object.keys(parsed.errors).length > 0 && parsed.values.action !== "remove") {
+    const data = await loadUserCleanupRuleEditPageData(c.env.DB, user, id);
+    const base = data ?? userCleanupRuleEditDataFromForm(user, true, parsed);
+    return p.respond(c.html(renderUserCleanupRuleEditPage(p.ctx, base), 200));
+  }
+  const outcome = await applyUserCleanupRuleEdit(c.env.DB, user.id, id, parsed.values, new Date());
+  if (outcome.outcome === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  if (outcome.outcome === "removed") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/packages" } }));
+  }
+  return p.respond(new Response(null, { status: 303, headers: { location: `/user/settings/packages/rules/${outcome.ruleId}` } }));
+}
+
+async function userPackagesRulePreviewPage(c: Context<{ Bindings: Env }>, ruleId: number): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const user = await readProfileRowForPackages(c, p.viewer.id);
+  if (user === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  // A stored pattern that fails to compile THROWS from the loader —
+  // upstream's ServerError arm (the app-level onError answers the 500).
+  const data = await loadUserCleanupRulePreview(c.env.DB, user, ruleId);
+  if (data.kind === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderUserCleanupRulePreviewPage(p.ctx, data), 200));
 }
 
 // --- the account tab (pages/user-settings-account.tsx — upstream EmailPost /
@@ -14225,6 +14353,15 @@ uiRouter.post("/user/settings/actions/runners/:id{(\\d+)}", (c) => userActionsRu
 uiRouter.post("/user/settings/actions/runners/:id{(\\d+)}/update-runner", (c) => userActionsRunnerUpdate(c, Number(c.req.param("id"))));
 uiRouter.get("/user/settings/actions/runners/:id{(\\d+)}/update-runner", () => methodNotAllowed("POST"));
 uiRouter.post("/user/settings/actions/runners/:id{(\\d+)}/delete", (c) => userActionsRunnerDelete(c, Number(c.req.param("id"))));
+// The USER-scope packages family (brace form, chi-405 twins).
+uiRouter.get("/user/settings/packages", (c) => userPackagesPage(c));
+uiRouter.post("/user/settings/packages", () => methodNotAllowed("GET"));
+uiRouter.get("/user/settings/packages/rules/add", (c) => userPackagesRuleAddPage(c));
+uiRouter.post("/user/settings/packages/rules/add", (c) => userPackagesRuleAddSubmit(c));
+uiRouter.get("/user/settings/packages/rules/:id{(\\d+)}", (c) => userPackagesRuleEditPage(c, Number(c.req.param("id"))));
+uiRouter.post("/user/settings/packages/rules/:id{(\\d+)}", (c) => userPackagesRuleEditSubmit(c, Number(c.req.param("id"))));
+uiRouter.get("/user/settings/packages/rules/:id{(\\d+)}/preview", (c) => userPackagesRulePreviewPage(c, Number(c.req.param("id"))));
+uiRouter.post("/user/settings/packages/rules/:id{(\\d+)}/preview", () => methodNotAllowed("GET"));
 uiRouter.get("/user/settings/actions/runners/:id{(\\d+)}/delete", () => methodNotAllowed("POST"));
 uiRouter.get("/user/settings/actions/variables", (c) => userSettingsVariablesPage(c));
 uiRouter.post("/user/settings/actions/variables/new", (c) => userSettingsVariablesNew(c));

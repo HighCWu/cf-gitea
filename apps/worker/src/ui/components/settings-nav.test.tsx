@@ -92,12 +92,11 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
   it("renders NO dead items — the unlanded upstream targets are omitted, never dead anchors", () => {
     const html = renderToString(<UserSettingsNavbar active="profile" />);
     // Account (:7-11), Notifications (:12-16) and Repos (:74-76) RENDER
-    // (their pages landed); Blocked users (:25-27), Audit (:36-38),
-    // Packages (:61-65) stay omitted.
+    // (their pages landed); Blocked users (:25-27), Audit (:36-38) stay
+    // omitted; Packages (:61-65) landed with the user packages tab's mount.
     for (const dead of [
       'href="/user/settings/blocked_users"',
       'href="/user/settings/audit_logs"',
-      'href="/user/settings/packages"',
     ]) {
       expect(html).not.toContain(dead);
     }
@@ -118,6 +117,7 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
       notifications: 'href="/user/settings/notifications"',
       appearance: 'href="/user/settings/appearance"',
       runners: 'href="/user/settings/actions/runners"',
+      packages: 'href="/user/settings/packages"',
       security: 'href="/user/settings/security"',
       applications: 'href="/user/settings/applications"',
       keys: 'href="/user/settings/keys"',

@@ -424,6 +424,13 @@ describe("parseUiRoute", () => {
     ["/acme/settings/packages/rules/7/preview", { family: "org-settings-packages-rule-preview", owner: "acme", id: 7 }],
     ["/acme/settings/packages/cargo/initialize", null], // the cargo tails stay unregistered
     ["/acme/settings/packages/rules/junk", null], // non-numeric id
+    // The USER-scope packages family (the same nesting-bug guard class).
+    ["/user/settings/packages", { family: "user-settings-packages", id: null }],
+    ["/user/settings/packages/rules/add", { family: "user-settings-packages-rule-add", id: null }],
+    ["/user/settings/packages/rules/7", { family: "user-settings-packages-rule-edit", id: 7 }],
+    ["/user/settings/packages/rules/7/preview", { family: "user-settings-packages-rule-preview", id: 7 }],
+    ["/user/settings/packages/cargo/initialize", null], // cargo/chef tails unregistered
+    ["/user/settings/packages/rules/junk", null], // non-numeric id
   ];
 
   it.each(table)("parses %s", (pathname, expected) => {

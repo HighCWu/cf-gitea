@@ -199,6 +199,48 @@ export function isArtifactV4(artifact: ArtifactRow): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// The page clock (the ROUTE_CLOCK seam's page-module twin — ui/index.ts's
+// module-scope route clock + `__setRouteClockForTests`, the seam that
+// un-skipped the admin-monitor-cron golden). The signed-link expiry hop in
+// artifactPreviewRawLink hardcoded `Date.now()`, so every /preview/{path}
+// render carried wall-clock bytes in the iframe's data-src and the tail
+// golden stayed excluded (the goldens.test.ts block comment). The
+// rendered-byte call below consults `artifactPreviewNow()`; with the
+// override unset (production) the expression is exactly the wall clock, so
+// every response is byte-identical to the pre-seam behavior — no
+// request-visible surface change. The raw route's expiry GATE
+// (serveArtifactPreviewRaw) deliberately does NOT consult it: it is a
+// decision, not rendered bytes (the route-clock seam's stored-row-stamp
+// care, one class over).
+//
+// No request state: one module-scope variable, read at link-compose time,
+// written ONLY by the test hook below (module-level pure).
+// ---------------------------------------------------------------------------
+
+/** The test-only page clock: returns the pinned Date, or null to fall back
+ *  to the wall clock. */
+type ArtifactPreviewClock = () => Date | null;
+
+let ARTIFACT_PREVIEW_CLOCK: ArtifactPreviewClock | null = null;
+
+/**
+ * TEST-ONLY (the name marks it): pin or clear the clock that
+ * artifactPreviewRawLink's expiry hop consults. `null` restores the wall
+ * clock. Never call from production code — the golden harness
+ * (`__tests__/goldens.test.ts`) is the only intended caller.
+ */
+export function __setArtifactPreviewClockForTests(clock: ArtifactPreviewClock | null): void {
+  ARTIFACT_PREVIEW_CLOCK = clock;
+}
+
+/** The clock the signed-link expiry runs on: the pinned override when the
+ *  test harness set one, the wall clock otherwise
+ *  (`ARTIFACT_PREVIEW_CLOCK?.() ?? new Date()`). */
+function artifactPreviewNow(): Date {
+  return ARTIFACT_PREVIEW_CLOCK?.() ?? new Date();
+}
+
+// ---------------------------------------------------------------------------
 // The HMAC link (view_artifact.go:392-400 over secrets.ts's BuildSignature)
 // ---------------------------------------------------------------------------
 
@@ -211,7 +253,7 @@ export async function artifactPreviewSignature(env: Env, artifactId: number, exp
 /** artifactPreviewRawLink (view_artifact.go:397-400): one hour out; the
  *  trailing slash is load-bearing (the route's tail mounts after it). */
 export async function artifactPreviewRawLink(env: Env, artifactId: number): Promise<string> {
-  const expires = Math.floor(Date.now() / 1000) + 60 * 60;
+  const expires = Math.floor(artifactPreviewNow().getTime() / 1000) + 60 * 60;
   const signature = await artifactPreviewSignature(env, artifactId, expires);
   return `/-/actions/artifacts/${artifactId}/${expires}/${signature}/`;
 }
