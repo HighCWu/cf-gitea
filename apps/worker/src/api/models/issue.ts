@@ -283,16 +283,21 @@ export const editIssueOptionSchema = z.object({
 
 export type EditIssueOption = z.infer<typeof editIssueOptionSchema>;
 
-/** `#/definitions/CreateIssueCommentOption` — `body` required (bind → 422). */
+/** `#/definitions/CreateIssueCommentOption` — `body` required (bind → 422):
+ *  upstream's `binding:"Required"` (structs/issue_comment.go:37) fires on the
+ *  zero value, so BOTH an absent and an empty string body fail the bind with
+ *  422 (api.go:838-845) — the `.min(1)` is that rule. */
 export const createIssueCommentOptionSchema = z.object({
-  body: z.string().openapi({ description: "the comment text content" }),
+  body: z.string().min(1).openapi({ description: "the comment text content" }),
 });
 
 export type CreateIssueCommentOption = z.infer<typeof createIssueCommentOptionSchema>;
 
-/** `#/definitions/EditIssueCommentOption` — `body` required (bind → 422). */
+/** `#/definitions/EditIssueCommentOption` — same `binding:"Required"` rule on
+ *  the edit arm (structs/issue_comment.go:45): an empty/absent body 422s in
+ *  the bind middleware before the handler runs. */
 export const editIssueCommentOptionSchema = z.object({
-  body: z.string().openapi({ description: "the updated comment text content" }),
+  body: z.string().min(1).openapi({ description: "the updated comment text content" }),
 });
 
 export type EditIssueCommentOption = z.infer<typeof editIssueCommentOptionSchema>;

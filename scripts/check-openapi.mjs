@@ -197,6 +197,16 @@ const RUNTIME_ONLY_RESPONSES = {
       500: "the image arms",
     },
   },
+  "/repos/{owner}/{repo}/issues/{index}/comments": {
+    post: {
+      422: "Go bind → APIErrorValidation on an empty/absent body — CreateIssueCommentOption.Body carries binding:\"Required\" (structs/issue_comment.go:37), the Required rule fires on the zero value (modules/web/binding/binding.go:136-146) and api.go:838-845 answers 422; upstream's own swagger documents {201,403,404,423} only",
+    },
+  },
+  "/repos/{owner}/{repo}/issues/comments/{id}": {
+    patch: {
+      422: "same Go bind arm on EditIssueCommentOption.Body's binding:\"Required\" (structs/issue_comment.go:45) — an empty/absent body 422s in the bind middleware before editIssueComment runs; the contract documents {200,204,403,404,423} only",
+    },
+  },
 };
 
 /**

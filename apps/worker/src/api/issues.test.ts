@@ -1251,6 +1251,73 @@ describe("POST /repos/{owner}/{repo}/issues/{index}/comments (issueCreateComment
     });
     expect(archived.status).toBe(423);
   });
+
+  it("422s an empty and an absent body (CreateIssueCommentOption's binding:\"Required\" → APIErrorValidation, api.go:838-845)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    await seedIssue(repoId, "bind target", { posterId: owner.id });
+
+    const empty = await router()("/repos/alice/visible/issues/1/comments", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "" }),
+    });
+    expect(empty.status).toBe(422);
+    expect(await empty.json()).toEqual({ message: "invalid request body", url: ERROR_URL });
+
+    const absent = await router()("/repos/alice/visible/issues/1/comments", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({}),
+    });
+    expect(absent.status).toBe(422);
+    expect(await absent.json()).toEqual({ message: "invalid request body", url: ERROR_URL });
+
+    // The bind fires before ANY handler arm — nothing was written.
+    expect(await db().select().from(comments).all()).toHaveLength(0);
+  });
+
+  it("403s 'You cannot comment on a locked issue.' without a write grant; a collaborator-writer and a site admin comment through (issue_comment.go:381)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "locked");
+    const issue = await seedIssue(repoId, "locked conversation", { posterId: owner.id });
+    await db().update(issues).set({ isLocked: true }).where(eq(issues.id, issue.id));
+
+    // The stub (id 1) holds no grant on alice's repo — the lock 403 carries
+    // upstream's locale string repo.issues.comment_on_locked verbatim.
+    const denied = await router()(`/repos/alice/locked/issues/${issue.index}/comments`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "locked out" }),
+    });
+    expect(denied.status).toBe(403);
+    expect(await denied.json()).toEqual({
+      message: "You cannot comment on a locked issue.",
+      url: ERROR_URL,
+    });
+
+    // A write-grade collaborator passes CanWriteIssuesOrPulls' reduction.
+    await db().insert(repoCollaborators).values({ repoId, userId: 1, mode: "write", createdAt: new Date() });
+    const writer = await router()(`/repos/alice/locked/issues/${issue.index}/comments`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "writers comment through locks" }),
+    });
+    expect(writer.status).toBe(201);
+
+    // The site admin bypasses too (ctx.Doer.IsAdmin arm) — STUB_USER is
+    // frozen at is_admin:false, so the admin identity rides its own router.
+    const adminApp = createApiRouter({ auth: { resolveToken: () => Promise.resolve({ ...STUB_USER, is_admin: true }) } });
+    const admin = await adminApp.fetch(
+      new Request(`https://example.com/repos/alice/locked/issues/${issue.index}/comments`, {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ body: "admins comment through locks" }),
+      }),
+      env,
+    );
+    expect(admin.status).toBe(201);
+  });
 });
 
 describe("GET /repos/{owner}/{repo}/issues/{index}/comments (issueGetComments)", () => {
@@ -1416,6 +1483,33 @@ describe("PATCH /repos/{owner}/{repo}/issues/comments/{id} (issueEditComment)", 
       body: JSON.stringify({ body: "stub hijack" }),
     });
     expect(stubEditsBobs.status).toBe(403);
+  });
+
+  it("422s an empty and an absent body (EditIssueCommentOption's binding:\"Required\" fires in the bind middleware, structs/issue_comment.go:45)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const issue = await seedIssue(repoId, "edit bind target", { posterId: 1 });
+    const comment = await service().addComment({ issueId: issue.id, posterId: 1, content: "original" });
+
+    const empty = await router()(`/repos/alice/visible/issues/comments/${comment.id}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "" }),
+    });
+    expect(empty.status).toBe(422);
+    expect(await empty.json()).toEqual({ message: "invalid request body", url: ERROR_URL });
+
+    const absent = await router()(`/repos/alice/visible/issues/comments/${comment.id}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({}),
+    });
+    expect(absent.status).toBe(422);
+    expect(await absent.json()).toEqual({ message: "invalid request body", url: ERROR_URL });
+
+    // The 422 fires before the handler — the comment row is untouched.
+    const row = await db().select().from(comments).where(eq(comments.id, comment.id)).all();
+    expect(row[0]?.content).toBe("original");
   });
 });
 

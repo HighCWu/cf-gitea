@@ -11,7 +11,7 @@ import { IssueError, IssueNotExistError, MilestoneNotExistError } from "../../is
 import { IssuesService, type IssueRow, type PullRequestRow } from "../../issues/service";
 import type { HookEventType } from "../../issues/webhooks";
 import { emitIssueEvent, issueEventIdentity, issueEventPayload, type IssueEventIdentity } from "../../services/issue-events";
-import { isRepositoryAdmin } from "../services/repo-access";
+import { canWriteRepository, isRepositoryAdmin } from "../services/repo-access";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import {
@@ -129,8 +129,14 @@ import {
  *                                   shared UpdateAssignees resolution;
  *                                   upstream's issues-PATCH arm maps neither
  *                                   and would 500, issue.go:780-783)
- *   - POST …/comments, POST/PUT …/labels: 400 (Go-bind / mixed id+name array
- *                                   equivalents — upstream 422/400 undeclared)
+ *   - POST …/comments:              422 (Go-bind Required on the comment
+ *                                   body, structs/issue_comment.go:37) and
+ *   - PATCH …/comments/{id}:        422 (same rule on the edit arm, :45) —
+ *                                   both declared runtime-only (the contract
+ *                                   omits them); malformed JSON still takes
+ *                                   hono's 400
+ *   - POST/PUT …/labels:            400 (mixed id+name array equivalents —
+ *                                   upstream 400 undeclared)
  *   - PATCH …/comments/{id}:        204-family edit of a system comment
  *                                   (upstream returns empty 204)
  *   - DELETE …/comments/{id}:       400 (system comments have no deletable
@@ -247,11 +253,11 @@ function pathId(raw: string): number {
   return Number.isSafeInteger(parsed) ? parsed : 0;
 }
 
-/** Body bind hook for the one operation with a declared 422 (POST issues):
- *  upstream's Go bind answers malformed/invalid bodies with 422
- *  (bind → APIErrorValidation); the generic text stands in for Go's
- *  per-field message. The operations without a declared 422 keep hono's
- *  default 400 (documented in the file header). */
+/** Body bind hook for the operations with a declared 422 (POST issues plus
+ *  the comment create/edit arms): upstream's Go bind answers malformed or
+ *  Required-failing bodies with 422 (api.go:838-845 → APIErrorValidation);
+ *  the generic text stands in for Go's per-field message. The operations
+ *  without a declared 422 keep hono's default 400 (file header). */
 const createIssueBodyHook = ({ success }: { success: boolean }): undefined => {
   if (!success) {
     throw new ApiError(422, "invalid request body");
@@ -838,6 +844,7 @@ const editCommentRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
       204: emptyResponse,
       403: forbiddenResponse,
       404: notFoundResponse,
+      422: validationErrorResponse,
       423: repoArchivedResponse,
     },
   });
@@ -895,6 +902,7 @@ const createCommentRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
       201: { description: "Comment", content: { "application/json": { schema: commentSchema } } },
       403: forbiddenResponse,
       404: notFoundResponse,
+      422: validationErrorResponse,
       423: repoArchivedResponse,
     },
   });
@@ -1280,6 +1288,10 @@ export function registerIssueRoutes(
 
   // -------------------------------------------------------------------------
   // PATCH /repos/{owner}/{repo}/issues/comments/{id} (issueEditComment)
+  // The trailing body hook is EditIssueCommentOption's `binding:"Required"`
+  // rule (structs/issue_comment.go:45) — the bind middleware answers an
+  // empty/absent body with 422 before the handler runs, the same declared
+  // runtime-only 422 as the create arm.
   // -------------------------------------------------------------------------
   app.openapi(editCommentRoute(requireAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
@@ -1331,7 +1343,7 @@ export function registerIssueRoutes(
       );
     }
     return c.json(await toApiComment(c.env.DB, viewer, found, row.issue, row.comment), 200);
-  });
+  }, createIssueBodyHook);
 
   // -------------------------------------------------------------------------
   // DELETE /repos/{owner}/{repo}/issues/comments/{id} (issueDeleteComment)
@@ -1644,6 +1656,15 @@ export function registerIssueRoutes(
       const { viewer, found, units } = await requireVisibleRepo(c, c.req.valid("param"));
       assertNotArchived(found);
       const issue = await requireIssue(c, found, c.req.valid("param").index, units);
+      // CreateIssueComment's locked arm (issue_comment.go:381): a locked
+      // issue denies comments from a doer with no write grant and no site
+      // admin flag — ctx.Locale.TrString("repo.issues.comment_on_locked").
+      // canWriteRepository is the landed CanWriteIssuesOrPulls+IsAdmin
+      // equivalent (owner/collaborator-write/team-write and the site admin
+      // all fold into its push-grade answer).
+      if (issue.isLocked && !(await canWriteRepository(c, found))) {
+        throw new ApiError(403, "You cannot comment on a locked issue.");
+      }
       const form = c.req.valid("json");
       const service = new IssuesService(c.env.DB);
       const requester = c.get("authUser");
@@ -1682,14 +1703,11 @@ export function registerIssueRoutes(
       });
       return c.json(rendered, 201);
     },
-    // 422 is NOT declared for this operation — malformed bodies take hono's
-    // default 400 (documented in the file header).
-    ({ success }: { success: boolean }) => {
-      if (!success) {
-        throw new ApiError(400, "invalid request body");
-      }
-      return undefined;
-    },
+    // The Go bind's Required on the comment body (structs/issue_comment.go:37)
+    // answers 422 at runtime — declared here and documented as a
+    // RUNTIME_ONLY_RESPONSES entry in the contract check (the vendored
+    // swagger documents {201,403,404,423} only).
+    createIssueBodyHook,
   );
 
   // -------------------------------------------------------------------------
