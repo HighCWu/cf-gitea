@@ -260,8 +260,24 @@ export function Navbar(props: { viewer: Viewer; activeNav?: "explore"; notificat
  *  permission; ours renders UNCONDITIONALLY (the wiki pages family is
  *  landed and serving; the route-level hasWiki 404 shell stays in the
  *  family's own prologue — ui/index.ts wikiPrologue's MustEnableWiki arm),
- *  so a settings-disabled wiki shows the tab over its 404 shell. */
-export type RepoTab = "code" | "issues" | "pulls" | "actions" | "packages" | "projects" | "releases" | "wiki" | "activity" | "commits";
+ *  so a settings-disabled wiki shows the tab over its 404 shell. The admin
+ *  Settings tab (header.tmpl:186-190) joins as "settings" — the strip's last
+ *  item behind the `item-flex-space` spacer, armed for the static admin
+ *  arms; the settings PAGES go active through BaseLayout's pageClass
+ *  discriminator (their shared `repository settings*` prefix — the
+ *  activity tab's derivation precedent). */
+export type RepoTab =
+  | "code"
+  | "issues"
+  | "pulls"
+  | "actions"
+  | "packages"
+  | "projects"
+  | "releases"
+  | "wiki"
+  | "activity"
+  | "commits"
+  | "settings";
 
 /** Tab chrome text for the wave-3 tabs (the components/commit-list.tsx
  *  component-local pattern — locale.ts is shared and not this wave's file). */
@@ -274,6 +290,7 @@ const tabLocale = {
   repo_releases: "Releases", // "repo.releases"
   repo_wiki: "Wiki", // "repo.wiki" (header.tmpl:165 — the tab's label)
   repo_activity: "Activity", // "repo.activity" (the pulse tab)
+  repo_settings: "Settings", // "repo.settings" (header.tmpl:186-190 — the admin tab)
 } as const;
 
 /** Create-menu chrome text (the same component-local pattern — wave 19's
@@ -546,12 +563,6 @@ export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
             </div>
           ) : null}
         </div>
-        <div class="secondary-info">
-          Created{" "}
-          <relative-time datetime={repo.createdAt.toISOString()}>
-            {repo.createdAt.toISOString().slice(0, 10)}
-          </relative-time>
-        </div>
       </div>
       <div class="ui container">
         <overflow-menu class="ui secondary pointing menu">
@@ -560,7 +571,7 @@ export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
               <Icon name="octicon-code" /> {locale.repo_code}
             </a>
             <a class={activeTab === "issues" ? "active item" : "item"} href={`${repoLink}/issues`} data-shortcut-keys="g i">
-              {tabLocale.repo_issues}
+              <Icon name="octicon-issue-opened" /> {tabLocale.repo_issues}
               {openIssues > 0 ? <span class="ui small label">{openIssues}</span> : null}
             </a>
             <a class={activeTab === "pulls" ? "active item" : "item"} href={`${repoLink}/pulls`} data-shortcut-keys="g p">
@@ -601,16 +612,17 @@ export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
                 loaded repoHasProjects toggle). The count label is the
                 documented reduction (the repositories table carries no
                 project counters — the projects store's DEVIATION note; the
-                releases tab's precedent), and the icon is the landed set's
-                octicon-project-symlink (the org tab precedent — upstream's
-                octicon-project is not in the generated set). */}
+                releases tab's precedent). The icon is upstream's own
+                octicon-project (header.tmpl:150 — the review-webui Top-10 #10
+                fix; the symlink glyph was the allowlist's stopgap, retired
+                when the generator gained the name). */}
             {props.ctx.repoHasProjects ? (
               <a
                 class={activeTab === "projects" ? "active item" : "item"}
                 href={`${repoLink}/projects`}
                 data-shortcut-keys="g b"
               >
-                <Icon name="octicon-project-symlink" /> {tabLocale.repo_projects}
+                <Icon name="octicon-project" /> {tabLocale.repo_projects}
               </a>
             ) : null}
             {/* header.tmpl:157-161 — the releases tab (wave 20); the count
@@ -647,6 +659,29 @@ export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
             <a class={activeTab === "commits" ? "active item" : "item"} href={`${repoLink}/commits`}>
               <Icon name="octicon-history" /> {locale.repo_commits}
             </a>
+            {/* header.tmpl:184-190 — the admin Settings tab (the review-webui
+                Top-10 #10 fix; the settings pages family is landed, so the
+                dead-link reason this strip once refused it is gone). Upstream
+                gates it on `.Permission.IsAdmin` — the static first arm of
+                the landed isRepositoryAdmin predicate (site admin + the
+                case-folded owner fold, repository.ts:120-122) here: the D1
+                arms (the admin-mode collaborator row, the §3.5 Owners-team
+                bridge) need the async grant this sync shell cannot pay — the
+                viewerCanCreatePull disclosure precedent; those viewers keep
+                the routes (the settingsGate prologue admits them) but stay
+                tab-less. The spacer + trailing slot match the template's
+                `item-flex-space` shape; the active arm rides BaseLayout's
+                `repository settings*` pageClass discriminator (the activity
+                tab's derivation precedent) — upstream .PageIsRepoSettings. */}
+            {props.ctx.viewer.kind === "user" &&
+            (props.ctx.viewer.isAdmin || repo.ownerNamespace === props.ctx.viewer.username.toLowerCase()) ? (
+              <>
+                <span class="item-flex-space" />
+                <a class={activeTab === "settings" ? "active item" : "item"} href={`${repoLink}/settings`}>
+                  <Icon name="octicon-tools" /> {tabLocale.repo_settings}
+                </a>
+              </>
+            ) : null}
           </div>
         </overflow-menu>
       </div>
@@ -800,8 +835,19 @@ export function BaseLayout(props: {
   // page shares that class and sets activeTab="commits" explicitly — so an
   // explicit tab always wins and the bare commits page-class resolves to the
   // activity page (the only page that renders it without one).
+  // The settings twin (the review-webui Top-10 #10 window): the repo
+  // settings pages family renders `page-content repository settings…`
+  // (upstream layout_head's pageClass) with no activeTab of its own — the
+  // shared prefix resolves to the settings tab (upstream .PageIsRepoSettings,
+  // header.tmpl:187). Org settings (`organization settings…`) has no repo
+  // header to arm and never reaches this derivation.
   const activeTab =
-    props.activeTab ?? (props.pageClass === "repository commits" ? "activity" : undefined);
+    props.activeTab ??
+    (props.pageClass === "repository commits"
+      ? "activity"
+      : props.pageClass !== undefined && props.pageClass.startsWith("repository settings")
+        ? "settings"
+        : undefined);
   return (
     <html lang="en" data-theme="gitea-light">
       <Head ctx={ctx} title={fullTitle} pageData={props.pageData} />

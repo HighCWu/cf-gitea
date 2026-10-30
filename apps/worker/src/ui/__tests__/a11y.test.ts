@@ -780,6 +780,9 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       [false, "Wiki"],
       [false, "Activity"],
       [false, "Commits"],
+      // The v1.3.2 webui remainder wave's Settings tab (header.tmpl:186-190)
+      // — the strip's tenth item, behind the spacer.
+      [false, "Settings"],
     ]);
   });
 
@@ -923,6 +926,8 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       [true, "Wiki"],
       [false, "Activity"],
       [false, "Commits"],
+      // The v1.3.2 Settings tab (header.tmpl:186-190) — the tenth item.
+      [false, "Settings"],
     ]);
   });
 

@@ -845,10 +845,15 @@ describe("the state machine through the detail route", () => {
       `<span id="pull-desc-display" class="pull-desc"><a class="tw-font-semibold" href="/${OWNER_NAME}">${OWNER_NAME}</a> merged <code>mx-done</code> into <code>main</code>`,
     );
     // The merge event: the purple badge, the git-merge glyph and the
-    // upstream merged_commit fragment with the 10-char sha.
+    // upstream merged_commit fragment — the sha as the `.ui.sha` commit link
+    // (comments.tmpl:114-116's HTMLFormat `<a class="ui sha"
+    // href="%s/commit/{sha}"><b>{ShortSha}</b></a>`, the webui-parity
+    // top-drift 4 fix; plain `<b>` before).
     expect(html).toContain('<span class="badge tw-bg-purple tw-text-white">');
     expect(html).toContain('class="svg octicon-git-merge"');
-    expect(html).toContain(`merged commit <b>${MERGE_SHA.slice(0, 10)}</b> into <b>main</b>`);
+    expect(html).toContain(
+      `merged commit <a class="ui sha" href="/${OWNER_NAME}/${REPO_SLUG}/commit/${MERGE_SHA}"><b>${MERGE_SHA.slice(0, 10)}</b></a> into <b>main</b>`,
+    );
     expect(html).toContain(`href="/${OWNER_NAME}">${OWNER_NAME}</a> merged commit`);
   });
 
@@ -1096,7 +1101,12 @@ describe("the timeline's unrendered system-event arms (w129 batch-13)", () => {
       `reopened this pull request <a id="event-${events.reopenPull}" href="#event-${events.reopenPull}"`,
     );
     expect(html).toContain(`href="/${OWNER_NAME}">${OWNER_NAME}</a> reopened this pull request`);
-    expect(html).toContain('<div id="event-' + events.reopenPull + '" class="timeline-item event">');
+    // The row div carries HashTag (`issuecomment-{id}`), NOT EventTag — the
+    // upstream id split (comment.go:553-566, comments.tmpl:81/94/107) that
+    // keeps `#issuecomment-N` deep links landing on the row while the inner
+    // anchor owns `event-{id}` (the webui-parity top-drift 4 fix; both carried
+    // `event-{id}` before — duplicate ids, invalid HTML).
+    expect(html).toContain('<div id="issuecomment-' + events.reopenPull + '" class="timeline-item event">');
     expect(html).toContain('<span class="badge tw-bg-green tw-text-white">');
     expect(html).toContain('class="svg octicon-dot-fill"');
     // The issues-variant verb must NOT render on the pulls page.
@@ -1129,22 +1139,31 @@ describe("the timeline's unrendered system-event arms (w129 batch-13)", () => {
     expect(html).toContain("Reviewers");
   });
 
-  it("the merge event's line carries the upstream #event time anchor (the anatomy the purple-badge pin left open)", async () => {
-    // Provenance: wave-polish-matrix-13. The merged-PR arm above pins the
-    // badge, the short sha and the merger link; the event line's time
-    // anchor — comments.tmpl's `#event-{id}` + relative-time pair, the same
-    // shape wave 3 pinned for close/reopen — was unpinned for the merge arm.
+  it("the merge event's line carries the .ui.sha commit link and the PLAIN time (comments.tmpl:107-116) — the anchor premise retired", async () => {
+    // Provenance: wave-polish-matrix-13, premise-corrected at the webui-parity
+    // top-drift 4 window. The old pin asserted the `#event-{id}` time anchor
+    // on the merge line "the same shape wave 3 pinned for close/reopen" —
+    // but the pin's own template does NOT embed the anchor in the merge
+    // sentence: `repo.issues.comment_pull_merged_at` ("merged commit %[1]s
+    // into %[2]s %[3]s", locale_en-US.json:1551) formats the time PLAIN,
+    // unlike the reopen/close strings whose `%[1]s` IS the `<a id="event-N">`
+    // pair (:1558-1559/1903-1904). Upstream-corrected shape: the sha rides
+    // the `.ui.sha` commit link, the time stays bare, and the row div carries
+    // HashTag.
     const fixture = await ensureIssueDetailFixtures();
     const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/pulls/${fixture.mergedPrIndex}`);
     expect(res.status).toBe(200);
     const html = await res.text();
     const anchored = new RegExp(
-      `merged commit <b>${MERGE_SHA.slice(0, 10)}</b> into <b>main</b> ` +
-        `<a id="event-\\d+" href="#event-\\d+"><relative-time`,
+      `merged commit <a class="ui sha" href="/${OWNER_NAME}/${REPO_SLUG}/commit/${MERGE_SHA}"><b>${MERGE_SHA.slice(0, 10)}</b></a> ` +
+        `into <b>main</b> <relative-time`,
     );
     expect(html).toMatch(anchored);
-    // The event card keeps the id'd div + the purple badge.
-    expect(html).toMatch(/<div id="event-\d+" class="timeline-item event"><span class="badge tw-bg-purple tw-text-white">/);
+    // The merged PR seeds only the MergePull event, so the page arms NO
+    // event anchor anywhere (the sentence has none upstream).
+    expect(html).not.toContain('id="event-');
+    // The event card keeps the HashTag id'd div + the purple badge.
+    expect(html).toMatch(/<div id="issuecomment-\d+" class="timeline-item event"><span class="badge tw-bg-purple tw-text-white">/);
   });
 
   it("the pulls family's unknown-index miss 404-shells with the repo context kept (the wave-3 negative-path twin)", async () => {

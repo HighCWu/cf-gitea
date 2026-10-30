@@ -174,6 +174,18 @@ const ALLOWLIST = [
   'octicon-eye',
   'octicon-repo-forked',
   'octicon-star-fill',
+  // The v1.3.2 review-webui window (residuals P2-7, Top-10 #10 + the
+  // issues-list rows): the header strip's projects tab switches to upstream's
+  // own octicon-project (header.tmpl:150 — the symlink glyph was the
+  // allowlist's stopgap and stays granted for the org projects tab), the
+  // admin Settings tab lands (header.tmpl:189, octicon-tools), and the
+  // issues/pulls rows' `.branches` pair renders issuelist.tmpl:83's
+  // gitea-double-chevron-left (the first gitea- namespaced glyph the shell
+  // renders; the 16x16 + multi-path constraints hold). The issues tab's
+  // octicon-issue-opened was already granted (wave 4's multi-path batch).
+  'octicon-project',
+  'octicon-tools',
+  'gitea-double-chevron-left',
 ];
 
 // What shell.tsx's Icon component hardcodes; a body needing anything else

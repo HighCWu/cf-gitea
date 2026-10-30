@@ -333,12 +333,14 @@ describe("issues list page", () => {
     expect(second).toContain("Newer");
     expect(second).toContain('<a class="item navigation" href="/alice/wave2/issues"'); // page 1 is canonical
 
-    // The labeled row's badges + milestone (plain-text degradation) + comment count.
+    // The labeled row's badges + milestone (the upstream /milestone/{id} row
+    // LINK since the webui-parity row fix — plain text before the page
+    // landed) + comment count.
     expect(second).toContain("background-color: #ee0701");
     expect(second).toContain("background-color: #84b6eb");
     expect(second).toContain(`href="?state=open&amp;labels=${fixture.bugLabelId}"`);
-    expect(second).toContain('<span class="milestone flex-text-inline tw-max-w-[300px]">');
-    expect(second).toContain(">v1.0</span>");
+    expect(second).toContain('<a class="milestone flex-text-inline tw-max-w-[300px]" href="/alice/wave2/milestone/');
+    expect(second).toContain(">v1.0</span></a>");
     expect(second).toContain('<a class="tw-no-underline muted flex-text-block" href="/alice/wave2/issues/1">1</a>');
 
     const clamped = await (await fetchUi("/alice/wave2/issues?page=0")).text();

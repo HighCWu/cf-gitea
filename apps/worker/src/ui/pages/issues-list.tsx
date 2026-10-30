@@ -18,9 +18,15 @@
  *
  * ## Documented v1 degradations (data that has no landed source, §6 method)
  *
- * - Milestone badge renders as plain text (upstream links
- *   `/{repo}/milestone/{id}` — no milestone page exists; the §2.4.1 rule
- *   "dead links are not emitted" wins over the upstream shape).
+ * - PR rows' `.branches` pair (issuelist.tmpl:78-96) landed in the v1.3.2
+ *   review-webui window: base + `gitea-double-chevron-left` + head, each a
+ *   `/src/branch/{PathEscapeSegments …}` link with `truncated-name` spans —
+ *   both hrefs against THIS repo (no forks, so upstream's cross-repo
+ *   `OwnerName:` prefix arm is dead); the extension row's branch pair rides
+ *   the loader's existing batched PR read. Milestone rows link
+ *   `/{repo}/milestone/{id}` with the octicon-milestone mark (the page
+ *   landed after this header's plain-text reduction was written — the
+ *   stale-note sync).
  * - Poster names anchor the `/{username}` profile since wave 7 (the
  *   dead-link unlock — userLink; plain text before the page existed).
  * - Search box and the label/milestone management buttons are not rendered
@@ -79,7 +85,7 @@ import type { IssueRow, LabelRow, MilestoneRow } from "../../issues/service";
 import { issueLabels, labels, milestones, pullRequests, users } from "../../db/schema";
 import { TimeSince } from "../components/file-list";
 import { userLink } from "../links";
-import { parsePageNumber } from "../page-data";
+import { parsePageNumber, pathEscapeSegments } from "../page-data";
 import { compareLink } from "./compare";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
@@ -172,6 +178,16 @@ export interface IssueListItem {
   /** The `pull_requests.has_merged` extension flag — PR rows only (the state
    *  glyph's merged branch, shared/issueicon.tmpl); false for plain issues. */
   prMerged: boolean;
+  /** The `pull_requests` branch pair — PR rows only (issuelist.tmpl:78-96's
+   *  `.branches` base→head links); null/absent for plain issues, the
+   *  sibling row-builders (milestone-detail, the project boards — their
+   *  loaders predate the pair and stay at their own posture), and rows whose
+   *  extension read missed. Both hrefs resolve against THIS repo: the landed
+   *  substrate has no forks, so headRepoId is always the row's own repo
+   *  (upstream's cross-repo OwnerName prefix arm is dead here — the
+   *  `ne $issue.RepoID …` guards never fire). */
+  prBaseBranch?: string | null;
+  prHeadBranch?: string | null;
 }
 
 /** The issues/pulls page render inputs, loaded by loadIssuesListData. */
@@ -286,20 +302,31 @@ export async function loadIssuesListData(
     milestone: null,
     posterName: null,
     prMerged: false,
+    prBaseBranch: null,
+    prHeadBranch: null,
   }));
 
-  // Batched PR extension flags for the is_pull rows (the state glyph's
-  // merged branch — one read for the whole page, the wave-2 pattern).
+  // Batched PR extension flags + branch pair for the is_pull rows (the state
+  // glyph's merged branch AND issuelist.tmpl:78-96's `.branches` links — one
+  // read for the whole page, the wave-2 pattern).
   const pullIds = items.filter((item) => item.issue.isPull).map((item) => item.issue.id);
   if (pullIds.length > 0) {
     const rows = await db
-      .select({ issueId: pullRequests.issueId, hasMerged: pullRequests.hasMerged })
+      .select({
+        issueId: pullRequests.issueId,
+        hasMerged: pullRequests.hasMerged,
+        baseBranch: pullRequests.baseBranch,
+        headBranch: pullRequests.headBranch,
+      })
       .from(pullRequests)
       .where(inArray(pullRequests.issueId, pullIds))
       .all();
-    const mergedByIssue = new Map(rows.map((row) => [row.issueId, row.hasMerged]));
+    const byIssue = new Map(rows.map((row) => [row.issueId, row]));
     for (const item of items) {
-      item.prMerged = mergedByIssue.get(item.issue.id) ?? false;
+      const extension = byIssue.get(item.issue.id);
+      item.prMerged = extension?.hasMerged ?? false;
+      item.prBaseBranch = extension?.baseBranch ?? null;
+      item.prHeadBranch = extension?.headBranch ?? null;
     }
   }
 
@@ -510,10 +537,26 @@ function IssueListItemRow(props: { repoLink: string; item: IssueListItem }) {
             #{item.issue.index}
           </a>
           <EventLine item={item} />
+          {item.prBaseBranch && item.prHeadBranch ? (
+            <div class="branches flex-text-inline">
+              <div class="branch">
+                <a href={`${props.repoLink}/src/branch/${pathEscapeSegments(item.prBaseBranch)}`}>
+                  <span class="truncated-name">{item.prBaseBranch}</span>
+                </a>
+              </div>
+              <Icon name="gitea-double-chevron-left" size={12} />
+              <div class="branch">
+                <a href={`${props.repoLink}/src/branch/${pathEscapeSegments(item.prHeadBranch)}`}>
+                  <span class="truncated-name">{item.prHeadBranch}</span>
+                </a>
+              </div>
+            </div>
+          ) : null}
           {item.milestone !== null ? (
-            <span class="milestone flex-text-inline tw-max-w-[300px]">
+            <a class="milestone flex-text-inline tw-max-w-[300px]" href={`${props.repoLink}/milestone/${item.milestone.id}`}>
+              <Icon name="octicon-milestone" size={14} />
               <span class="gt-ellipsis">{item.milestone.name}</span>
-            </span>
+            </a>
           ) : null}
         </div>
       </div>

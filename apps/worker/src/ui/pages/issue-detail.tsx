@@ -838,12 +838,19 @@ function TimelineCommentCard(props: { entry: Extract<TimelineEntry, { kind: "com
 
 /** A lifecycle event line (`comments.tmpl` types 1/2/28): the colored badge
  *  (close carries the 2-path octicon-issue-closed since the wave-4
- *  multi-path Icon) and the upstream verb with the `#event-{id}` time
- *  anchor. */
-function TimelineEvent(props: { data: IssueDetailData; entry: Extract<TimelineEntry, { kind: "reopen" | "close" | "merge" }> }) {
+ *  multi-path Icon) and the upstream verb. Upstream splits the DOM ids
+ *  (comment.go:553-566 — HashTag vs EventTag): the ROW div carries
+ *  `issuecomment-{id}` (HashTag, comments.tmpl:81/94/107 — `#issuecomment-N`
+ *  deep links land here) while the inner time anchor carries `event-{id}`
+ *  (EventTag, embedded by the locale strings' `<a id="%[1]s" href="#%[1]s">`
+ *  — locale_en-US.json:1558-1559/1903-1904). Merge events (type 28,
+ *  comments.tmpl:107-116) link the sha as `.ui.sha` over
+ *  `{repoLink}/commit/{sha}` (ShortSha's 10-rune truncate, tool.go:31-34)
+ *  and keep the time PLAIN (their locale sentence carries no anchor). */
+function TimelineEvent(props: { data: IssueDetailData; entry: Extract<TimelineEntry, { kind: "reopen" | "close" | "merge" }>; repoLink: string }) {
   const { issue, pr } = props.data;
   const { kind, comment, posterName } = props.entry;
-  const hash = `event-${comment.id}`;
+  const eventTag = `event-${comment.id}`;
   const verb =
     kind === "merge"
       ? null
@@ -864,7 +871,7 @@ function TimelineEvent(props: { data: IssueDetailData; entry: Extract<TimelineEn
     );
   const badgeColor = kind === "reopen" ? "tw-bg-green" : kind === "merge" ? "tw-bg-purple" : "tw-bg-red";
   return (
-    <div id={hash} class="timeline-item event">
+    <div id={`issuecomment-${comment.id}`} class="timeline-item event">
       <span class={`badge ${badgeColor} tw-text-white`}>{badge}</span>
       <span class="comment-text-line">
         {posterName !== null ? (
@@ -874,16 +881,27 @@ function TimelineEvent(props: { data: IssueDetailData; entry: Extract<TimelineEn
         ) : null}{" "}
         {kind === "merge" ? (
           <>
-            {issueDetailLocale.merged_commit} <b>{comment.commitSha === null || comment.commitSha === "" ? "" : comment.commitSha.slice(0, 10)}</b>{" "}
+            {issueDetailLocale.merged_commit}{" "}
+            {comment.commitSha !== null && comment.commitSha !== "" ? (
+              <a class="ui sha" href={`${props.repoLink}/commit/${comment.commitSha}`}>
+                <b>{comment.commitSha.slice(0, 10)}</b>
+              </a>
+            ) : (
+              <b />
+            )}{" "}
             {issueDetailLocale.merged_into} <b>{pr?.baseBranch ?? ""}</b>
           </>
         ) : (
           verb
         )}{" "}
         {comment.createdAt !== null ? (
-          <a id={hash} href={`#${hash}`}>
+          kind === "merge" ? (
             <TimeSince unixSeconds={unixSeconds(comment.createdAt)} tz="+0000" />
-          </a>
+          ) : (
+            <a id={eventTag} href={`#${eventTag}`}>
+              <TimeSince unixSeconds={unixSeconds(comment.createdAt)} tz="+0000" />
+            </a>
+          )
         ) : null}
       </span>
     </div>
@@ -1172,7 +1190,7 @@ export function IssueDetailPage(props: {
                 entry.kind === "comment" ? (
                   <TimelineCommentCard entry={entry} />
                 ) : (
-                  <TimelineEvent data={data} entry={entry} />
+                  <TimelineEvent data={data} entry={entry} repoLink={repoLink} />
                 ),
               )}
               <div class="timeline-item tw-hidden" id="timeline-comments-end" />

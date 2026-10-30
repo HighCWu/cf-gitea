@@ -222,8 +222,13 @@ describe("issue detail page (/issues/{index})", () => {
     expect(html).toContain('<div id="issuecomment-1" class="timeline-item comment">');
     // Close event (red badge carrying the 2-path octicon-issue-closed —
     // wave-4 multi-path Icon; the seeded transition carries no actor, so the
-    // verb stands alone).
-    expect(html).toContain('<div id="event-2" class="timeline-item event">');
+    // verb stands alone). The row div carries HashTag — `issuecomment-{id}`
+    // (comment.go:553-561, comments.tmpl:81/94/107) — while the inner time
+    // anchor carries EventTag `event-{id}` (the upstream id split, the
+    // webui-parity top-drift 4 fix: both carried `event-{id}` before —
+    // duplicate ids, and `#issuecomment-N` deep links into events died).
+    expect(html).toContain('<div id="issuecomment-2" class="timeline-item event">');
+    expect(html).not.toContain('<div id="event-2"');
     expect(html).toContain('<span class="badge tw-bg-red tw-text-white"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" class="svg octicon-issue-closed"');
     expect(html).toContain('closed this issue <a id="event-2" href="#event-2"');
     // Reopen event (green badge with the dot glyph).

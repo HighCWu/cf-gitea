@@ -324,6 +324,60 @@ board rows now.
     timeline `event-{id}` anchor split, releases Source-Code archive
     rows, header tab strip icons/Settings tab) remain open as written.
 
+11. **Amendment to item 7 — the timeline anchor split, the issues/pulls
+    rows, and the header tab strip LANDED in the v1.3.2 window
+    (2026-10-30); item 7's other rows stay open as written.** (a) The
+    timeline id split (top-drift 4): every `div.timeline-item.event` now
+    carries `issuecomment-{id}` (HashTag, comment.go:553-561 —
+    comments.tmpl:81/94/107) while the inner time anchor keeps
+    `event-{id}` (EventTag, the locale strings' `<a id="%[1]s"
+    href="#%[1]s">` embed, locale_en-US.json:1558-1559/1903-1904) — the
+    duplicate-id invalid DOM is gone and `#issuecomment-N` deep links
+    into events work; the merge event (type 28, comments.tmpl:107-116)
+    additionally links the sha as `.ui.sha` over
+    `{repoLink}/commit/{sha}` (ShortSha's 10-rune truncate, tool.go:31)
+    and keeps its time PLAIN — the matrix's old "merge line carries the
+    #event anchor" pin carried a premise the pin's own template refutes
+    (the merge locale sentence formats no anchor), corrected in the
+    same window. (b) The issues/pulls rows: PR rows render the upstream
+    `.branches` pair (issuelist.tmpl:78-96 — base + the 12px
+    `gitea-double-chevron-left` + head, each a
+    `/src/branch/{PathEscapeSegments}` link with `truncated-name`
+    spans; both hrefs against this repo — no forks, so upstream's
+    cross-repo `OwnerName:` prefix arm is dead), the branch pair riding
+    the loader's existing batched PR read (optional fields — the
+    sibling row-builders' posture unchanged), and the row milestone is
+    the upstream LINK (issuelist.tmpl:98-104 — `/milestone/{id}` +
+    14px `octicon-milestone` + `gt-ellipsis`; the module header's
+    "no milestone page" reduction was stale — the page landed ca4eb58).
+    (c) The header tab strip (Top-10 #10): the Issues tab carries
+    `octicon-issue-opened` (header.tmpl:105 — the text-degradation note
+    retired; the glyph was granted with wave 4's multi-path Icon), the
+    projects tab renders upstream's own `octicon-project`
+    (header.tmpl:150 — the symlink glyph stays on the org/projects
+    PAGES, project.go:161-166's own choice), and the admin Settings tab
+    landed (header.tmpl:184-190 — `item-flex-space` + `octicon-tools`,
+    active via the settings pages' shared `repository settings*`
+    pageClass, upstream .PageIsRepoSettings), gated on the static first
+    arm of `isRepositoryAdmin` (site admin + case-folded owner,
+    repository.ts:120-122) — the D1 arms (admin-mode collaborator,
+    Owners-team bridge) need the ctx grant this sync shell cannot pay
+    (the viewerCanCreatePull disclosure; those viewers keep the routes,
+    the settingsGate prologue admits them). The cf-gitea "Created
+    \<date\>" secondary-info retired (no upstream analog at any pin).
+    Icons: the generator allowlist gained `octicon-project`,
+    `octicon-tools`, `gitea-double-chevron-left` (the first gitea-
+    namespaced glyph; 73 entries). Goldens regenerated via the sentinel
+    (41 files, token deltas = exactly the five shapes above). Still
+    open from item 7, unchanged: the Go-to-file/Add-File home row
+    (pages/home.tsx), the `#issue-filters` toolbar skeleton + the
+    Labels/Milestones buttons (list.tmpl:25-56 — the New buttons are
+    in, the wrapper/checkboxes/filters are not), the releases
+    Source-Code archive rows (pages/releases.tsx), and the Code tab's
+    ref-preserving href (header.tmpl:100-101 — needs the current
+    BranchName/RefTypeNameSubURL threaded through the ui/index.ts ctx
+    assembly).
+
 ## P3 — hardening, tooling, and the small flagged items
 
 1. **act_runner 5.x (the `gitea/runner` line) is UNVERIFIED.** The

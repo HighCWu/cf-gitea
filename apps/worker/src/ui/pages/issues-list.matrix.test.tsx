@@ -469,6 +469,20 @@ describe("the filter-parsing arms (drop-then-apply, any-of labels, milestone id 
     const empty = await (await fetchUi("/alice/filters/issues?milestone=")).text();
     expect((empty.match(/<div class="item">/g) ?? []).length).toBe(3);
   });
+
+  it("the milestone renders as the upstream row LINK — /milestone/{id} + octicon-milestone (issuelist.tmpl:98-104 — the webui-parity row fix)", async () => {
+    // Provenance: the v1.3.2 review-webui window. The row's milestone was a
+    // bare `<span>` (the module header's "no milestone page exists" reduction
+    // — stale since the milestone pages landed, ca4eb58): no link, no glyph.
+    // Upstream: `<a class="milestone flex-text-inline tw-max-w-[300px]"
+    // href="{RepoLink}/milestone/{id}">{{svg "octicon-milestone" 14}}<span
+    // class="gt-ellipsis">{name}</span></a>`.
+    const { milestoneId } = await seedFilterRepo();
+    const html = await (await fetchUi("/alice/filters/issues")).text();
+    expect(html).toContain(`<a class="milestone flex-text-inline tw-max-w-[300px]" href="/alice/filters/milestone/${milestoneId}">`);
+    expect(html).toContain('width="14" height="14" class="svg octicon-milestone"');
+    expect(html).toContain('<span class="gt-ellipsis">v2.0</span></a>');
+  });
 });
 
 // --- the keyword shape ---------------------------------------------------------------
@@ -573,6 +587,33 @@ describe("the pulls family (the row state machine + the /issues link family)", (
     // The plain closed issue stays off the pulls closed tab (is_pull filter).
     expect(html).not.toContain(">plain pullpages issue</a>");
     expect(indexes.merged).toBe(indexes.closed + 1);
+  });
+
+  it("PR rows render the upstream .branches base→head pair (issuelist.tmpl:78-96 — the webui-parity row fix)", async () => {
+    // Provenance: the v1.3.2 review-webui window. The rows previously ended
+    // at the event line: PR rows carried no `.branches` at all (the pull
+    // extension's branch pair was loaded only as the has_merged flag). The
+    // upstream shape renders BASE first, then the 12px
+    // gitea-double-chevron-left, then HEAD — each a
+    // `/src/branch/{PathEscapeSegments branch}` link wrapping a
+    // `truncated-name` span, the whole trio inside
+    // `div.branches.flex-text-inline`. Both hrefs ride THIS repo: no forks,
+    // so upstream's cross-repo `OwnerName:` prefix arm never fires.
+    await seedPullRepo();
+    const pulls = await (await fetchUi("/alice/pullpages/pulls")).text();
+    expect(pulls).toContain(
+      '<div class="branch"><a href="/alice/pullpages/src/branch/main"><span class="truncated-name">main</span></a></div>',
+    );
+    expect(pulls).toContain('width="12" height="12" class="svg gitea-double-chevron-left"');
+    expect(pulls).toContain(
+      '<div class="branch"><a href="/alice/pullpages/src/branch/open-branch"><span class="truncated-name">open-branch</span></a></div>',
+    );
+    // Order: the base link precedes the chevron, the chevron precedes head.
+    expect(pulls.indexOf("/alice/pullpages/src/branch/main")).toBeLessThan(pulls.indexOf("gitea-double-chevron-left"));
+    expect(pulls.indexOf("gitea-double-chevron-left")).toBeLessThan(pulls.indexOf("/alice/pullpages/src/branch/open-branch"));
+    // The plain-issue list renders NO branches div (the pair is PR-row-only).
+    const issues = await (await fetchUi("/alice/pullpages/issues")).text();
+    expect(issues).not.toContain('class="branches flex-text-inline"');
   });
 });
 

@@ -346,19 +346,20 @@ describe("RepoHeader tab strip", () => {
     // none on it, unlike its strip neighbors).
     expect(strip).toContain('<a class="item" href="/octocat/hello/activity">');
     expect(strip).toContain('<a class="item" href="/octocat/hello/commits">');
-    // Inline octicon SVGs, upstream {{svg}} shape. The Issues tab degrades to
-    // text: its octicon-issue-opened glyph is a 2-path octicon, which the
-    // shell's single-path Icon contract cannot carry (gen-ui-icons.mjs).
+    // Inline octicon SVGs, upstream {{svg}} shape. The Issues tab carries its
+    // octicon-issue-opened (header.tmpl:105 — the webui-parity Top-10 #10 fix;
+    // the glyph degraded to text while the Icon was single-path, retired with
+    // the wave-4 multi-path batch that granted it).
     expect(strip).toContain('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" class="svg octicon-code"');
+    expect(strip).toContain('class="svg octicon-issue-opened"');
     expect(strip).toContain('class="svg octicon-git-pull-request"');
     expect(strip).toContain('class="svg octicon-tag"');
     expect(strip).toContain('class="svg octicon-book"');
     expect(strip).toContain('class="svg octicon-pulse"');
     expect(strip).toContain('class="svg octicon-history"');
     expect(strip.indexOf("> Code</a>")).toBeGreaterThan(0);
-    // The degraded Issues tab has no icon, so its text hugs the `>` directly.
-    expect(strip.indexOf(">Issues</a>")).toBeGreaterThan(strip.indexOf("> Code</a>"));
-    expect(strip.indexOf("> Pull Requests</a>")).toBeGreaterThan(strip.indexOf(">Issues</a>"));
+    expect(strip.indexOf("> Issues</a>")).toBeGreaterThan(strip.indexOf("> Code</a>"));
+    expect(strip.indexOf("> Pull Requests</a>")).toBeGreaterThan(strip.indexOf("> Issues</a>"));
     expect(strip.indexOf("> Releases</a>")).toBeGreaterThan(strip.indexOf("> Pull Requests</a>"));
     // Upstream strip order: Wiki sits between Releases and Activity
     // (header.tmpl:162-166).
@@ -366,10 +367,40 @@ describe("RepoHeader tab strip", () => {
     expect(strip.indexOf("> Activity</a>")).toBeGreaterThan(strip.indexOf("> Wiki</a>"));
     expect(strip).toContain("> Commits</a>");
     expect(strip.indexOf("> Commits</a>")).toBeGreaterThan(strip.indexOf("> Activity</a>"));
-    expect(strip).not.toContain('class="svg octicon-issue-opened"');
-    // Only existing pages: no Settings dead tab (Wiki resolved with the
-    // pages family; Releases in wave 20, Activity by the R14 page family).
+    // The admin Settings tab (header.tmpl:184-190): anonymous viewers are
+    // refused (`.Permission.IsAdmin`'s static arms — site admin + the
+    // case-folded owner — both need a user viewer); the tab's dead-link
+    // refusal predates the settings pages family's landing.
     expect(strip).not.toContain("Settings");
+
+    // The signed-in OWNER sees the admin Settings tab after the
+    // `item-flex-space` spacer (header.tmpl:184-190's shape: octicon-tools +
+    // "repo.settings"), and a signed-in NON-admin stranger does not.
+    const ownerViewer: Viewer = { kind: "user", id: 1, username: "octocat", isAdmin: false };
+    const ownerStrip = tabStrip(page({ ctx: { ...repoCtx, viewer: ownerViewer } }));
+    expect(ownerStrip).toContain('<span class="item-flex-space"></span>');
+    expect(ownerStrip).toContain('<a class="item" href="/octocat/hello/settings">');
+    expect(ownerStrip).toContain('class="svg octicon-tools"');
+    expect(ownerStrip.indexOf("> Settings</a>")).toBeGreaterThan(ownerStrip.indexOf("> Commits</a>"));
+    const strangerViewer: Viewer = { kind: "user", id: 42, username: "stranger", isAdmin: false };
+    expect(tabStrip(page({ ctx: { ...repoCtx, viewer: strangerViewer } }))).not.toContain("Settings");
+    // The site-admin arm admits a non-owner too (the predicate's static
+    // is_admin arm).
+    const adminViewer: Viewer = { kind: "user", id: 42, username: "stranger", isAdmin: true };
+    expect(tabStrip(page({ ctx: { ...repoCtx, viewer: adminViewer } }))).toContain('href="/octocat/hello/settings"');
+
+    // The active arm rides the settings pages' shared `repository settings…`
+    // pageClass (BaseLayout's discriminator — upstream .PageIsRepoSettings,
+    // header.tmpl:187): an explicit activeTab still wins.
+    const stripOnSettings = tabStrip(
+      renderPage(
+        <BaseLayout ctx={{ ...repoCtx, viewer: ownerViewer }} pageClass="repository settings">
+          <p>settings</p>
+        </BaseLayout>,
+      ),
+    );
+    expect(stripOnSettings).toContain('<a class="active item" href="/octocat/hello/settings">');
+    expect(stripOnSettings).not.toContain('<a class="active item" href="/octocat/hello" data-shortcut-keys="g c">');
 
     const stripOnIssues = tabStrip(
       renderPage(
@@ -406,6 +437,22 @@ describe("RepoHeader tab strip", () => {
     expect(stripOnWiki).toContain('<a class="item" href="/octocat/hello" data-shortcut-keys="g c">');
     expect(stripOnWiki).toContain('<a class="active item" href="/octocat/hello/wiki" data-shortcut-keys="g w">');
 
+    // The projects tab carries upstream's octicon-project (header.tmpl:150 —
+    // the webui-parity Top-10 #10 fix; the symlink glyph was the allowlist's
+    // stopgap and stays on the org/projects PAGES, project.go:161-166's own
+    // choice). No golden arms the tab (the fixture repos' unit is off), so
+    // the suite pins it here.
+    const stripOnProjects = tabStrip(
+      renderPage(
+        <BaseLayout ctx={{ ...repoCtx, repoHasProjects: true }} title="Projects">
+          <p>projects</p>
+        </BaseLayout>,
+      ),
+    );
+    expect(stripOnProjects).toContain('class="svg octicon-project"');
+    expect(stripOnProjects).not.toContain("octicon-project-symlink");
+    expect(stripOnProjects).toContain('<a class="item" href="/octocat/hello/projects" data-shortcut-keys="g b">');
+
     // The activity page renders `page-content repository commits` (upstream
     // activity.tmpl:2) WITHOUT an explicit activeTab — upstream tracks its
     // pulse tab through .PageIsActivity (header.tmpl:178), which the shell
@@ -431,7 +478,7 @@ describe("RepoHeader tab strip", () => {
         <p>counts</p>
       </BaseLayout>,
     ));
-    expect(strip).toContain('>Issues<span class="ui small label">3</span></a>');
+    expect(strip).toContain('> Issues<span class="ui small label">3</span></a>');
     expect(strip).toContain('> Pull Requests<span class="ui small label">3</span></a>');
     // Zero open pulls render no label (upstream `{{if .Repository.NumOpenPulls}}`).
     const zeroed = tabStrip(page({ ctx: repoCtx }));
@@ -443,7 +490,11 @@ describe("RepoHeader tab strip", () => {
     expect(html).toContain('<div class="secondary-nav"><div class="ui container"><div class="repo-header flex-left-right">');
     expect(html).toContain('class="svg octicon-repo"');
     expect(html).toContain('<span class="ui basic orange label">Public Access</span>');
-    expect(html).toContain("Created <relative-time datetime=\"2023-11-14T22:13:20.000Z\">");
+    // The cf-gitea "Created <date>" secondary-info is RETIRED (the webui-parity
+    // Top-10 #10 sync: the line had no upstream analog at any pin —
+    // header.tmpl renders no created stamp under the title row).
+    expect(html).not.toContain("Created <relative-time");
+    expect(html).not.toContain('class="secondary-info"');
     expect(html).toContain('<div class="ui tabs divider"></div>');
   });
 });
