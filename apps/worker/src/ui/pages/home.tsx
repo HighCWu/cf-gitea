@@ -17,10 +17,13 @@
  * release, language stats) are deferred — each needs data surfaces this
  * unit does not own; the grid already reserves their slots.
  *
- * Empty repos (§4.1: public, unborn HEAD) render upstream repo/empty.tmpl's
- * writer arm — the Quick Guide with the two command-line blocks (the clone
- * URL from the request origin), no file list, no README, no sidebar
- * (upstream's empty.tmpl has none) — never a crash on `readCommit(null)`.
+ * Empty repos (§4.1: public, unborn HEAD) render upstream repo/empty.tmpl
+ * branched on the viewer: writers (the canWriteRepository static arms — the
+ * EmptyRepoPage disclosure) get the Quick Guide with the two command-line
+ * blocks (the clone URL from the request origin); everyone else the
+ * template's single `repo.empty_message` segment — no file list, no README,
+ * no sidebar in either arm (upstream's empty.tmpl has none), never a crash
+ * on `readCommit(null)`.
  */
 
 import type { CommitJson, TreeEntryJson } from "@cf-gitea/git-engine";
@@ -47,6 +50,8 @@ const emptyRepoLocale = {
   create_new_repo_command: "Creating a new repository on the command line",
   /** "repo.push_exist_repo" */
   push_exist_repo: "Pushing an existing repository from the command line",
+  /** "repo.empty_message" — the non-writer arm (empty.tmpl:74). */
+  empty_message: "This repository does not have any content.",
 };
 
 /** The clone panel's chrome text (the component-local pattern — locale.ts is
@@ -258,18 +263,27 @@ export async function loadHomeData(engine: EngineClient, repo: RepoRow, origin: 
   return { isEmpty: false, refs, entries, commits, latestCommit, readme };
 }
 
-/** The §4.1 empty-repo render — upstream repo/empty.tmpl at the pin, the
- *  CanWriteCode arm: the `repository quickstart` page with the Quick Guide
- *  header, the "Clone this repository" item and the two command-line items
- *  (locale repo.quick_guide / repo.clone_this_repo / repo.create_new_repo_command
+/** The §4.1 empty-repo render — upstream repo/empty.tmpl at the pin,
+ *  BRANCHED on the viewer like the template: the CanWriteCode arm renders
+ *  the `repository quickstart` page with the Quick Guide header, the
+ *  "Clone this repository" item and the two command-line items (locale
+ *  repo.quick_guide / repo.clone_this_repo / repo.create_new_repo_command
  *  / repo.push_exist_repo; the command blocks carry upstream's exact lines —
  *  `git checkout -b` only when the default branch is not `master`, the
- *  `.js-clone-url` span the official bundle wires). Deferred like the wiki
- *  clone-button surface (pages/repo-wiki.tsx:143): the item's
- *  repo-button-row (New File / Upload File / the clone-button group) needs
- *  the CloneButtonOriginLink data + bundle plumbing this module does not
- *  own — the command blocks carry the same clone URL meanwhile. Upstream's
- *  sha256 `--object-format` arm is omitted: every landed row is sha1. */
+ *  `.js-clone-url` span the official bundle wires); everyone else gets
+ *  empty.tmpl:74's single centered segment — `repo.empty_message`
+ *  ("This repository does not have any content."). The writer fold is the
+ *  canWriteRepository STATIC arms (site admin / the case-folded owner — the
+ *  same reduction issues-list.tsx's viewerCanCreatePull carries): the
+ *  collaborator-row and team arms need the D1 grant read this render path
+ *  does not perform, so a write-granted collaborator sees the message arm —
+ *  disclosed; anonymous and plain signed-in readers get upstream's exact
+ *  non-writer arm either way. Deferred like the wiki clone-button surface
+ *  (pages/repo-wiki.tsx:143): the item's repo-button-row (New File / Upload
+ *  File / the clone-button group) needs the CloneButtonOriginLink data +
+ *  bundle plumbing this module does not own — the command blocks carry the
+ *  same clone URL meanwhile. Upstream's sha256 `--object-format` arm is
+ *  omitted: every landed row is sha1. */
 export function EmptyRepoPage(props: { ctx: UiContext }) {
   const { ctx } = props;
   const repo = ctx.repo;
@@ -279,6 +293,26 @@ export function EmptyRepoPage(props: { ctx: UiContext }) {
   // Upstream renders `git checkout -b <branch>` only when the default is
   // not `master` (empty.tmpl's `{{if ne .Repository.DefaultBranch "master"}}`).
   const checkoutLine = branch === "master" ? [] : [`git checkout -b ${branch}`];
+  // empty.tmpl's arm chain (CanWriteCode → guide, else the message). The
+  // writer fold mirrors issues-list.tsx's viewerCanCreatePull (the static
+  // grant arms — see that function's disclosure).
+  const canWriteCode =
+    ctx.viewer.kind === "user" &&
+    (ctx.viewer.isAdmin || repo.ownerNamespace.toLowerCase() === ctx.viewer.username.toLowerCase());
+  if (!canWriteCode) {
+    return (
+      <BaseLayout ctx={ctx} pageClass="repository quickstart" activeTab="code">
+        <div class="ui container">
+          <div class="ui grid">
+            <div class="sixteen wide column content">
+              {/* empty.tmpl:74 verbatim — the non-writer arm's whole body. */}
+              <div class="ui segment center">{emptyRepoLocale.empty_message}</div>
+            </div>
+          </div>
+        </div>
+      </BaseLayout>
+    );
+  }
   return (
     <BaseLayout ctx={ctx} pageClass="repository quickstart" activeTab="code">
       <div class="ui container">

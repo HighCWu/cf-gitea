@@ -16,6 +16,11 @@
  * echo), and the §4.9 resolveHeadBranch fallback chain (head-wins, stale
  * HEAD, non-branch HEAD, tags carried, no-branches null) plus the home
  * README's 512KiB cap boundary (the file-view §4.3 cap's home twin).
+ *
+ * The webui-parity wave (2026-10-30) — the empty-repo page branched on the
+ * viewer like empty.tmpl: the Quick Guide pins render through the WRITER
+ * viewer (owner fixture), and the anonymous + signed-in-reader arms pin the
+ * single repo.empty_message segment the template gives every non-writer.
  */
 
 import { describe, expect, it } from "vitest";
@@ -135,6 +140,22 @@ function stubEngine(
 
 const repo = ctx.repo as RepoRow;
 
+/** The writer viewer (empty.tmpl's CanWriteCode arm): the repo owner
+ *  through the case-folded namespace fold (EmptyRepoPage's static grant
+ *  arms) — the Quick Guide arm's fixture; the anonymous base `ctx` above
+ *  renders the template's non-writer arm (repo.empty_message). */
+const writerCtx: UiContext = {
+  ...ctx,
+  viewer: { kind: "user", id: 1, username: "octocat", isAdmin: false } satisfies Viewer,
+};
+
+/** The signed-in NON-owner (a plain reader) — upstream's non-writer arm
+ *  too: the message segment, never the Quick Guide. */
+const readerCtx: UiContext = {
+  ...ctx,
+  viewer: { kind: "user", id: 2, username: "stranger", isAdmin: false } satisfies Viewer,
+};
+
 // --- home degradation paths ----------------------------------------------------
 
 describe("loadHomeData + HomePage degradation paths", () => {
@@ -155,7 +176,7 @@ describe("loadHomeData + HomePage degradation paths", () => {
     const engine = stubEngine({ listRefs: () => Promise.resolve({ head: null, refs: [] }) });
     const data = await loadHomeData(engine, repo, ctx.origin);
     expect(data.isEmpty).toBe(true);
-    const html = renderToString(<HomePage ctx={ctx} data={data} />);
+    const html = renderToString(<HomePage ctx={writerCtx} data={data} />);
     expect(html).toContain('class="page-content repository quickstart"');
     expect(html).toContain("https://test.local/octocat/hello.git");
     expect(html).not.toContain("repo-files-table");
@@ -194,7 +215,7 @@ describe("loadHomeData + HomePage degradation paths", () => {
     expect(data.refs.headBranch).toBe("main"); // the refs survive the empty tree
     expect(data.entries).toEqual([]);
     expect(data.latestCommit).toBeNull(); // the empty shape wins over the read commit
-    const html = renderToString(<HomePage ctx={ctx} data={data} />);
+    const html = renderToString(<HomePage ctx={writerCtx} data={data} />);
     expect(html).toContain('class="page-content repository quickstart"');
     expect(html).toContain("https://test.local/octocat/hello.git");
     expect(html).not.toContain("repo-files-table");
@@ -204,13 +225,15 @@ describe("loadHomeData + HomePage degradation paths", () => {
     expect(html).not.toContain("head subject");
   });
 
-  it("renders both quick-start command blocks verbatim with the clone URL and the push hint (the §4.1 shapes)", async () => {
+  it("renders both quick-start command blocks verbatim with the clone URL and the push hint (the §4.1 shapes, the writer arm)", async () => {
     // Provenance: wave-polish-matrix-6 — the unborn arm above pins only the
     // clone URL; the two command <pre> blocks' shapes (the create-from-
-    // scratch recipe and the push-existing hint) were unpinned.
+    // scratch recipe and the push-existing hint) were unpinned. The webui-
+    // parity wave moved the Quick Guide behind the writer fold (empty.tmpl's
+    // CanWriteCode arm), so the writer viewer renders it.
     const engine = stubEngine({ listRefs: () => Promise.resolve({ head: null, refs: [] }) });
     const data = await loadHomeData(engine, repo, ctx.origin);
-    const html = renderToString(<HomePage ctx={ctx} data={data} />);
+    const html = renderToString(<HomePage ctx={writerCtx} data={data} />);
     // The upstream header + the two block headings (repo.quick_guide,
     // repo.create_new_repo_command, repo.push_exist_repo) — the pin's own
     // markup since the 2026-10-29 usability sweep replaced the old bespoke
@@ -244,14 +267,45 @@ describe("loadHomeData + HomePage degradation paths", () => {
     // Provenance: wave-polish-matrix-6 — the push hint's branch token rides
     // repo.defaultBranch (EmptyRepoPage's template literal); pinned with a
     // non-main default so a hardcoded "main" would fail.
-    const trunkCtx: UiContext = { ...ctx, repo: { ...repo, defaultBranch: "trunk" } };
+    const trunkRepo = { ...repo, defaultBranch: "trunk" };
+    const trunkCtx: UiContext = { ...writerCtx, repo: trunkRepo };
     const engine = stubEngine({ listRefs: () => Promise.resolve({ head: null, refs: [] }) });
-    const data = await loadHomeData(engine, trunkCtx.repo as RepoRow, ctx.origin);
+    const data = await loadHomeData(engine, trunkRepo, ctx.origin);
     const html = renderToString(<HomePage ctx={trunkCtx} data={data} />);
     expect(html).toContain("git checkout -b trunk");
     expect(html).toContain("git push -u origin trunk");
     expect(html).not.toContain("git checkout -b main");
     expect(html).not.toContain("git push -u origin main");
+  });
+
+  it("renders the non-writer arm to ANONYMOUS viewers: the single repo.empty_message segment, no Quick Guide (empty.tmpl:74)", async () => {
+    // The webui-parity fix: upstream shows the Quick Guide to CanWriteCode
+    // viewers only — the anonymous arm of the old render leaked the writer
+    // quickstart (clone combo + git commands) to every viewer of a public
+    // empty repo. The pageClass stays `repository quickstart` (empty.tmpl:2
+    // carries it on BOTH arms).
+    const engine = stubEngine({ listRefs: () => Promise.resolve({ head: null, refs: [] }) });
+    const data = await loadHomeData(engine, repo, ctx.origin);
+    const html = renderToString(<HomePage ctx={ctx} data={data} />);
+    expect(html).toContain('class="page-content repository quickstart"');
+    expect(html).toContain('<div class="ui segment center">This repository does not have any content.</div>');
+    // The whole writer quickstart is gone: no guide header, no command
+    // blocks, no clone URL spans.
+    expect(html).not.toContain("Quick Guide");
+    expect(html).not.toContain("Creating a new repository on the command line");
+    expect(html).not.toContain("Pushing an existing repository from the command line");
+    expect(html).not.toContain("touch README.md");
+    expect(html).not.toContain("git push -u origin main");
+    expect(html).not.toContain("js-clone-url");
+    expect(html).not.toContain("https://test.local/octocat/hello.git");
+  });
+
+  it("renders the non-writer arm to a signed-in NON-owner too (the static grant's reader arm)", async () => {
+    const engine = stubEngine({ listRefs: () => Promise.resolve({ head: null, refs: [] }) });
+    const data = await loadHomeData(engine, repo, ctx.origin);
+    const html = renderToString(<HomePage ctx={readerCtx} data={data} />);
+    expect(html).toContain('<div class="ui segment center">This repository does not have any content.</div>');
+    expect(html).not.toContain("Quick Guide");
   });
 
   it("skips the README when the entry exceeds the 512KiB cap and never calls readBlob (the home twin of §4.3)", async () => {

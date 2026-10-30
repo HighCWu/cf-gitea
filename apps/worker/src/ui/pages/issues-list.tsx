@@ -28,9 +28,23 @@
  *   The New Issue button renders like upstream (list.tmpl, unconditional —
  *   wave 4's /issues/new page is live; anonymous viewers land on the authed
  *   page's /login round-trip) and hidden on archived repos (upstream's
- *   `if not .Repository.IsArchived`). The `?labels=` / `?milestone=` FILTERS
- *   are wired — the label badges link into them (upstream QueryBuild parity,
- *   reduced to the params this page actually honors).
+ *   `if not .Repository.IsArchived`). The pulls list carries the matching
+ *   New Pull Request button (list.tmpl:27) with upstream's three viewer
+ *   states: a writer (the canWriteRepository static arms — site admin or
+ *   the case-folded owner; the collaborator/team arms need the D1 grant
+ *   read this page's fixed loader signature does not carry, so a
+ *   write-granted collaborator sees the reader arm — disclosed) renders the
+ *   live compare link, a plain signed-in reader upstream's `disabled` class
+ *   over the same link (list.tmpl's `{{if not .PullRequestCtx
+ *   .CanCreateNewPull}}disabled{{end}}`), and an anonymous viewer the live
+ *   `/login?redirect_to=` round-trip onto the compare target (the issue-
+ *   detail sign-in convention — upstream renders anon the inert disabled
+ *   arm; the round-trip makes the button honest for anon). The archived
+ *   pulls list renders the compare-commits button (list.tmpl:31-33,
+ *   upstream's exact doubled `small primary small` classes). The
+ *   `?labels=` / `?milestone=` FILTERS are wired — the label badges link
+ *   into them (upstream QueryBuild parity, reduced to the params this page
+ *   actually honors).
  * - Event line timestamp: `createdAt` for open issues, `closedAt` for
  *   closed ones (upstream computes the full last-event timeline; the
  *   denormalized columns carry the same facts for this render). Rendered
@@ -66,6 +80,7 @@ import { issueLabels, labels, milestones, pullRequests, users } from "../../db/s
 import { TimeSince } from "../components/file-list";
 import { userLink } from "../links";
 import { parsePageNumber } from "../page-data";
+import { compareLink } from "./compare";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 
@@ -79,6 +94,8 @@ export const issuesLocale = {
   noResults: "No results", // "repo.issues.filter_no_results"
   noResultsPlaceholder: "Try adjusting your search filters.", // "repo.issues.filter_no_results_placeholder"
   new_issue: "New Issue", // "repo.issues.new" (wave 4: the /issues/new page exists)
+  new_pull: "New Pull Request", // "repo.pulls.new" (list.tmpl:27's pulls-tab button)
+  compare_commits_general: "Compare commits", // "action.compare_commits_general" (the archived arm, list.tmpl:32)
 } as const;
 
 /** Upstream `setting.UI.IssuePagingNum` (modules/setting/ui.go:89). */
@@ -514,6 +531,23 @@ export function renderIssuesListPage(ctx: UiContext, data: IssuesListData): stri
   return renderPage(<IssuesListPage ctx={ctx} data={data} />);
 }
 
+/**
+ * The `PullRequestCtx.CanCreateNewPull` reduction this page's render path can
+ * evaluate (the header comment's disclosure): `canWriteRepository`'s STATIC
+ * arms only — site admin (`is_admin` → the admin matrix arm) and the repo
+ * owner (the case-folded namespace fold, `requesterLoginLower`'s owner line).
+ * The collaborator-row and §3.5 team arms need the D1 grant read, which the
+ * fixed `(d1, repoId, listKind, params)` loader signature never sees — a
+ * write-granted collaborator renders the reader arm (`disabled`), the same
+ * conservative arm upstream renders a no-fork reader. Anonymous is the
+ * caller's arm (the login round-trip link), never this predicate.
+ */
+export function viewerCanCreatePull(ctx: UiContext): boolean {
+  const { viewer, repo } = ctx;
+  if (viewer.kind !== "user" || repo === undefined) return false;
+  return viewer.isAdmin || repo.ownerNamespace.toLowerCase() === viewer.username.toLowerCase();
+}
+
 /** The issues/pulls list page (§2.4.1 discriminator: `repository
  *  issue-list` — upstream's shared list template serves both lists).
  *  activeTab stays the shell default: the tab strip renders only landed
@@ -525,18 +559,60 @@ export function IssuesListPage(props: { ctx: UiContext; data: IssuesListData }) 
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   const basePath = data.listKind === "pulls" ? `${repoLink}/pulls` : `${repoLink}/issues`;
   const title = data.listKind === "pulls" ? issuesLocale.pulls : issuesLocale.issues;
+  // PullRequestCtx.MakeDefaultCompareLink .Repository.DefaultBranch for the
+  // same-repo head (services/context/repo.go:83-87 — baseRepo.Link() +
+  // /compare/ + the PR-unit DefaultTargetBranch ... the head ref; the PR-unit
+  // config is unlanded so the target IS the default branch, and
+  // CompareHeadRef folds the same-repo head to the bare branch name).
+  const compareHref = compareLink(repoLink, repo.defaultBranch, repo.defaultBranch);
   return (
     <BaseLayout ctx={ctx} title={title} pageClass="repository issue-list">
       <div class="ui container">
-        {/* The New Issue button (list.tmpl's list-header row, reduced to the
-            live link): issues list only, hidden on archived repos — the
-            upstream `if not .Repository.IsArchived` gate. Anonymous viewers
-            clicking it land on the authed page's /login round-trip. */}
+        {/* The list-header row's creation button (list.tmpl:19-35, reduced to
+            the live link — the search box and the Labels/Milestones buttons
+            above it stay unrendered, header comment). Issues arm: the New
+            Issue button, hidden on archived repos — the upstream `if not
+            .Repository.IsArchived` gate; anonymous viewers clicking it land
+            on the authed page's /login round-trip. Pulls arm: list.tmpl:27's
+            New Pull Request button over the compare target — writers live,
+            plain signed-in readers the upstream `disabled` class over the
+            same link, anonymous the /login round-trip onto the compare page
+            (upstream renders anon the inert disabled arm; the round-trip is
+            the issue-detail sign-in convention); the archived twin carries
+            list.tmpl:31-33's Compare-commits button with its exact doubled
+            `small primary small` classes. */}
         {data.listKind === "issues" && !repo.isArchived ? (
           <div class="list-header flex-text-block">
             <a class="ui small primary button issue-list-new" href={`${repoLink}/issues/new`}>
               {issuesLocale.new_issue}
             </a>
+          </div>
+        ) : null}
+        {data.listKind === "pulls" ? (
+          <div class="list-header flex-text-block">
+            {repo.isArchived ? (
+              <a class="ui small primary small button issue-list-new" href={compareHref}>
+                {issuesLocale.compare_commits_general}
+              </a>
+            ) : ctx.viewer.kind === "anonymous" ? (
+              <a
+                class="ui small primary button new-pr-button issue-list-new"
+                href={`/login?redirect_to=${encodeURIComponent(compareHref)}`}
+              >
+                {issuesLocale.new_pull}
+              </a>
+            ) : (
+              <a
+                class={
+                  viewerCanCreatePull(ctx)
+                    ? "ui small primary button new-pr-button issue-list-new"
+                    : "ui small primary button new-pr-button issue-list-new disabled"
+                }
+                href={compareHref}
+              >
+                {issuesLocale.new_pull}
+              </a>
+            )}
           </div>
         ) : null}
         <div class="issue-list-toolbar-left">

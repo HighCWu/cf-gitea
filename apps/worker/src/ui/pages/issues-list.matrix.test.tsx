@@ -43,6 +43,14 @@
  *   - the New Issue tail: the issue-list-new button on the issues list,
  *     hidden on archived repos (the upstream IsArchived gate — RepoService
  *     always creates unarchived, so the archived twin is a direct D1 stamp);
+ *   - the New Pull Request tail (the webui-parity wave): the pulls list's
+ *     list-header button (list.tmpl:27) in its three viewer states — the
+ *     writer (owner / site admin) the live compare target
+ *     (MakeDefaultCompareLink's same-repo fold, `{default}...{default}`),
+ *     the signed-in non-owner upstream's `disabled` class over the same
+ *     link, anonymous the /login round-trip onto the compare page — plus
+ *     the archived arm's Compare-commits button (list.tmpl:31-33, pulls
+ *     only) and the non-master default branch riding the target;
  *   - the claim pin: the issues head's new/labels tails parse into their own
  *     families while the pulls head has NO such tails (unclaimed → engine
  *     404; upstream registers /pulls/new (claimed by the window-2e folds) but no /pulls/labels).
@@ -64,7 +72,7 @@ import { seedVerifiedUser } from "../../auth/testing/seeds";
 import { createRepoLabel } from "../../api/services/labels";
 import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
-import { pullRequests, repositories } from "../../db/schema";
+import { pullRequests, repositories, users } from "../../db/schema";
 import type { UiManifest } from "../manifest";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
@@ -529,8 +537,14 @@ describe("the pulls family (the row state machine + the /issues link family)", (
     expect(pulls).not.toContain(">plain pullpages issue</a>");
     // No comments were seeded: no trailing comment counters at all.
     expect(pulls).not.toContain("item-trailing");
-    // The pulls list renders NO New Issue button (issues-only tail).
-    expect(pulls).not.toContain("issue-list-new");
+    // The pulls list renders NO New Issue button (issues-only tail) — its
+    // own creation button is the new-pr-button twin (the anon arm: the
+    // /login round-trip onto the compare target; pinned in the New Pull
+    // Request tail describe).
+    expect(pulls).not.toContain('href="/alice/pullpages/issues/new"');
+    expect(pulls).toContain(
+      '<a class="ui small primary button new-pr-button issue-list-new" href="/login?redirect_to=%2Falice%2Fpullpages%2Fcompare%2Fmain...main">New Pull Request</a>',
+    );
 
     // The issues list twin: the Open tab's glyph is the issue icon there,
     // and the PR rows are excluded from BOTH of its counts (1 open plain
@@ -738,6 +752,87 @@ describe("the New Issue tail (the archived gate wave2's fixture cannot reach)", 
     expect(html).not.toContain("issue-list-new");
     expect(html).toContain(">tailz thread</a>");
     expect(html).toContain("1 Open</a>");
+  });
+});
+
+// --- the New Pull Request tail (the pulls list's list-header button) ------
+
+describe("the New Pull Request tail (list.tmpl:27-33's three viewer states over the pulls tab)", () => {
+  /** alice + one public repo (unarchived) — the button states' fixture. */
+  async function seedButtonRepo(slug: string): Promise<RepoRow> {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    return seedRepo(alice, slug);
+  }
+
+  it("the writer (the repo owner) renders the live compare target; the signed-in non-owner upstream's disabled class over the same link", async () => {
+    await seedButtonRepo("prbutton");
+    const alice = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "alice")).get();
+    const writer = await (
+      await fetchUi("/alice/prbutton/pulls", { headers: { cookie: await sessionHeader(alice!.id) } })
+    ).text();
+    // MakeDefaultCompareLink's same-repo fold: base = the PR-unit target
+    // (unlanded config → the default branch), head = the bare branch name.
+    expect(writer).toContain(
+      '<a class="ui small primary button new-pr-button issue-list-new" href="/alice/prbutton/compare/main...main">New Pull Request</a>',
+    );
+    expect(writer).not.toContain("issue-list-new disabled");
+
+    const bob = await seedVerifiedUser({ username: "bob" });
+    const reader = await (
+      await fetchUi("/alice/prbutton/pulls", { headers: { cookie: await sessionHeader(bob.id) } })
+    ).text();
+    // The `{{if not .PullRequestCtx.CanCreateNewPull}}disabled{{end}}` arm.
+    expect(reader).toContain(
+      '<a class="ui small primary button new-pr-button issue-list-new disabled" href="/alice/prbutton/compare/main...main">New Pull Request</a>',
+    );
+  });
+
+  it("a site-admin stranger renders the live link (the static grant's admin arm)", async () => {
+    await seedButtonRepo("pradmin");
+    const root = await seedVerifiedUser({ username: "root", isAdmin: true });
+    const html = await (
+      await fetchUi("/alice/pradmin/pulls", { headers: { cookie: await sessionHeader(root.id) } })
+    ).text();
+    expect(html).toContain(
+      '<a class="ui small primary button new-pr-button issue-list-new" href="/alice/pradmin/compare/main...main">New Pull Request</a>',
+    );
+    expect(html).not.toContain("issue-list-new disabled");
+  });
+
+  it("the anonymous viewer gets the live /login round-trip onto the compare target", async () => {
+    await seedButtonRepo("pranon");
+    const html = await (await fetchUi("/alice/pranon/pulls")).text();
+    expect(html).toContain(
+      '<a class="ui small primary button new-pr-button issue-list-new" href="/login?redirect_to=%2Falice%2Fpranon%2Fcompare%2Fmain...main">New Pull Request</a>',
+    );
+    expect(html).not.toContain("issue-list-new disabled");
+  });
+
+  it("the archived twin renders the Compare-commits button (list.tmpl:31-33's exact classes) and the issues list renders neither", async () => {
+    const repo = await seedButtonRepo("prarch");
+    await drizzle(env.DB).update(repositories).set({ isArchived: true }).where(eq(repositories.id, repo.id));
+    const pulls = await (await fetchUi("/alice/prarch/pulls")).text();
+    // The upstream `{{/* archived, view compare page only */}}` arm — keep
+    // the template's doubled `small primary small` classes verbatim.
+    expect(pulls).toContain(
+      '<a class="ui small primary small button issue-list-new" href="/alice/prarch/compare/main...main">Compare commits</a>',
+    );
+    expect(pulls).not.toContain("new-pr-button");
+
+    // The archived issues list renders no header button at all (the
+    // `{{if not .PageIsIssueList}}` guard).
+    const issues = await (await fetchUi("/alice/prarch/issues")).text();
+    expect(issues).not.toContain("issue-list-new");
+  });
+
+  it("a non-master default branch rides the compare target (MakeDefaultCompareLink's branch echo)", async () => {
+    const repo = await seedButtonRepo("prtrunk");
+    await drizzle(env.DB).update(repositories).set({ defaultBranch: "trunk" }).where(eq(repositories.id, repo.id));
+    const alice = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "alice")).get();
+    const html = await (
+      await fetchUi("/alice/prtrunk/pulls", { headers: { cookie: await sessionHeader(alice!.id) } })
+    ).text();
+    expect(html).toContain('href="/alice/prtrunk/compare/trunk...trunk"');
   });
 });
 
