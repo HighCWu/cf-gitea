@@ -345,16 +345,19 @@ describe("POST /repos/{owner}/{repo}/pulls (repoCreatePullRequest)", () => {
 
     expect(res.status).toBe(201);
     const body = await res.json<Record<string, unknown>>();
-    // Upstream's api.PullRequest omits the four omitempty fields at runtime
-    // (additions/deletions/changed_files/review_comments — the diff stats
-    // stay unset without the engine); everything else renders. The emitted
-    // key set is exactly PULL_FIELDS minus that quartet.
+    // The converter fills the diff-stat trio on the create 201 like every
+    // single render (pull.go:558 → convert/pull.go:230-254) — the equal-tips
+    // create's range is empty, so the trio renders ZEROS (0/0/0), not an
+    // omit: merge-base(tip, tip) resolves (merge/graph.ts:115), the empty
+    // diff is not truncated. Only review_comments stays unset (no producer).
+    // The emitted key set is exactly PULL_FIELDS minus that one.
     const emitted = Object.keys(body).sort();
     expect(emitted.filter((k) => !PULL_FIELDS.includes(k))).toEqual([]);
-    expect(emitted).toEqual(
-      PULL_FIELDS.filter((k) => !["additions", "changed_files", "deletions", "review_comments"].includes(k)),
-    );
+    expect(emitted).toEqual(PULL_FIELDS.filter((k) => !["review_comments"].includes(k)));
     expect(body).toMatchObject({
+      additions: 0,
+      deletions: 0,
+      changed_files: 0,
       number: 1, // shared per-repo sequence
       title: "created by the suite",
       body: "some body",
@@ -612,6 +615,46 @@ describe("POST /repos/{owner}/{repo}/pulls (repoCreatePullRequest)", () => {
     expect(payloadPull.filter((k) => !PULL_FIELDS.includes(k))).toEqual([]);
     expect(all[0]!.payloadContent).toContain('\n  "action": "opened"');
   });
+
+  it("carries the diff-stat trio on the 201 body over the real range diff (pull.go:558 — the same single converter as the GET)", async () => {
+    const owner = await seedUser("Alice");
+    await seedRepo(owner.usernameLower, "diffstat-d");
+    const tip = await seedEngineBranches(owner.usernameLower, "diffstat-d", ["feature"]);
+    // feature's child: README rewritten (1 add + 1 del) and notes.txt added
+    // (3 lines) — the three-dot range main...feature sums to
+    // changed_files=2, additions=4, deletions=1 (the GET pin's math).
+    await landChildCommit(owner.usernameLower, "diffstat-d", "feature", tip, [
+      { name: "README.md", content: "# diffstat-d v2\n" },
+      { name: "notes.txt", content: "a\nb\nc\n" },
+    ], "child\n");
+
+    const res = await createPull("/repos/Alice/diffstat-d/pulls", { title: "with content", head: "feature", base: "main" });
+    expect(res.status).toBe(201);
+    expect(await res.json<Record<string, unknown>>()).toMatchObject({
+      additions: 4,
+      deletions: 1,
+      changed_files: 2,
+    });
+  });
+
+  it("carries the trio on the opened payload too — ToPayloadPullRequest is the same converter, the GetDiffShortStat block is not gated on isPayload (pull.go:31-34 + :230-254, notifier.go:368)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "diffstat-e");
+    const tip = await seedEngineBranches(owner.usernameLower, "diffstat-e", ["feature"]);
+    await landChildCommit(owner.usernameLower, "diffstat-e", "feature", tip, [
+      { name: "README.md", content: "# diffstat-e v2\n" },
+      { name: "notes.txt", content: "a\nb\nc\n" },
+    ], "child\n");
+    await seedHook(repoId, ["pull_request"]);
+
+    const res = await createPull("/repos/Alice/diffstat-e/pulls", { title: "opened with stats", head: "feature", base: "main" });
+    expect(res.status).toBe(201);
+
+    const all = await db().select().from(webhookDeliveries).all();
+    expect(all).toHaveLength(1);
+    const payload = JSON.parse(all[0]!.payloadContent) as { pull_request: Record<string, unknown> };
+    expect(payload.pull_request).toMatchObject({ additions: 4, deletions: 1, changed_files: 2 });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -855,6 +898,44 @@ describe("PATCH /repos/{owner}/{repo}/pulls/{index} (repoEditPullRequest)", () =
     expect(payloads[1]?.changes).toEqual({ body: { from: "" } });
   });
 
+  it("carries the trio on the edit 201 body and its edited payload (pull.go:799 — StatusCreated with the in-source TODO 'this should be 200, not 201'; IssueChangeTitle's payload notifier.go:225)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "diffstat-f");
+    const tip = await seedEngineBranches(owner.usernameLower, "diffstat-f", ["feature"]);
+    await landChildCommit(owner.usernameLower, "diffstat-f", "feature", tip, [
+      { name: "README.md", content: "# diffstat-f v2\n" },
+      { name: "notes.txt", content: "a\nb\nc\n" },
+    ], "child\n");
+    await createPull("/repos/Alice/diffstat-f/pulls", { title: "before", head: "feature", base: "main" });
+    const hookId = await seedHook(repoId, ["pull_request"]);
+
+    const res = await patchPull("/repos/alice/diffstat-f/pulls/1", { title: "after" });
+    expect(res.status).toBe(201);
+    expect(await res.json<Record<string, unknown>>()).toMatchObject({
+      title: "after",
+      additions: 4,
+      deletions: 1,
+      changed_files: 2,
+    });
+
+    const payloads = (await deliveriesFor(hookId)).map((d) => JSON.parse(d.payloadContent) as { action: string; pull_request: Record<string, unknown> });
+    expect(payloads.map((p) => p.action)).toEqual(["edited"]);
+    expect(payloads[0]?.pull_request).toMatchObject({ additions: 4, deletions: 1, changed_files: 2 });
+  });
+
+  it("omits the trio on the edit arms for a bare D1 row (no engine head ref — the error-log omit arm, convert/pull.go:247-250)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "diffstat-g");
+    await seedPull(repoId, "no refs yet", { posterId: 1 });
+
+    const res = await patchPull("/repos/alice/diffstat-g/pulls/1", { title: "still no refs" });
+    expect(res.status).toBe(201);
+    const body = await res.json<Record<string, unknown>>();
+    expect(body.additions).toBeUndefined();
+    expect(body.deletions).toBeUndefined();
+    expect(body.changed_files).toBeUndefined();
+  });
+
   it("renaming to a WIP title flips draft (the title-prefix contract)", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible");
@@ -968,6 +1049,25 @@ describe("GET /repos/{owner}/{repo}/pulls/{base}/{head} (repoGetPullRequestByBas
     expect(forkForm.status).toBe(200);
   });
 
+  it("carries the diff-stat trio on the by-basehead render (pull.go:300 — the same single converter as the index GET, :211)", async () => {
+    const owner = await seedUser("Alice");
+    await seedRepo(owner.usernameLower, "diffstat-h");
+    const tip = await seedEngineBranches(owner.usernameLower, "diffstat-h", ["feature"]);
+    await landChildCommit(owner.usernameLower, "diffstat-h", "feature", tip, [
+      { name: "README.md", content: "# diffstat-h v2\n" },
+      { name: "notes.txt", content: "a\nb\nc\n" },
+    ], "child\n");
+    await createPull("/repos/Alice/diffstat-h/pulls", { title: "by refs with stats", head: "feature", base: "main" });
+
+    const res = await router()("/repos/alice/diffstat-h/pulls/main/feature");
+    expect(res.status).toBe(200);
+    expect(await res.json<Record<string, unknown>>()).toMatchObject({
+      additions: 4,
+      deletions: 1,
+      changed_files: 2,
+    });
+  });
+
   it("404s misses and unknown fork repos", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible");
@@ -979,6 +1079,61 @@ describe("GET /repos/{owner}/{repo}/pulls/{base}/{head} (repoGetPullRequestByBas
 
     const ghostFork = await router()("/repos/alice/visible/pulls/main/ghost:feature");
     expect(ghostFork.status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /repos/{owner}/{repo}/pulls/{index}/merge + PATCH assignees — the
+// payload-side trio mounts (the merge notifier's ToPayloadPullRequest,
+// webhook/notifier.go:715; IssueChangeAssignee's, :182 — the single
+// converter's GetDiffShortStat block is not gated on isPayload,
+// convert/pull.go:230-254).
+// ---------------------------------------------------------------------------
+
+describe("the pull webhook payloads' diff-stat trio (merge + assign)", () => {
+  it("carries the trio on the merge closed payload over the pre-merge contribution (notifier.go:715; the checked row's persisted merge base serves the range)", async () => {
+    const repoId = await seedRepo("cf-gitea-stub", "diffstat-j");
+    const tip = await seedEngineBranches("cf-gitea-stub", "diffstat-j", ["feature"]);
+    await landChildCommit("cf-gitea-stub", "diffstat-j", "feature", tip, [
+      { name: "README.md", content: "# diffstat-j v2\n" },
+      { name: "notes.txt", content: "a\nb\nc\n" },
+    ], "child\n");
+    await createPull("/repos/cf-gitea-stub/diffstat-j/pulls", { title: "merge me", head: "feature", base: "main" });
+    await seedHook(repoId, ["pull_request"]);
+
+    const merge = await router()("/repos/cf-gitea-stub/diffstat-j/pulls/1/merge", { method: "POST", headers: authHeaders, body: JSON.stringify({ do: "merge" }) });
+    expect(merge.status).toBe(200);
+
+    const all = await db().select().from(webhookDeliveries).all();
+    expect(all).toHaveLength(1);
+    expect(all[0]?.eventType).toBe("pull_request");
+    const payload = JSON.parse(all[0]!.payloadContent) as { action: string; pull_request: Record<string, unknown> };
+    expect(payload.action).toBe("closed");
+    expect(payload.pull_request).toMatchObject({ merged: true, additions: 4, deletions: 1, changed_files: 2 });
+  });
+
+  it("carries the trio on the assign payload (IssueChangeAssignee's ToPayloadPullRequest, notifier.go:182)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo("cf-gitea-stub", "diffstat-k");
+    const tip = await seedEngineBranches("cf-gitea-stub", "diffstat-k", ["feature"]);
+    await landChildCommit("cf-gitea-stub", "diffstat-k", "feature", tip, [
+      { name: "README.md", content: "# diffstat-k v2\n" },
+      { name: "notes.txt", content: "a\nb\nc\n" },
+    ], "child\n");
+    await createPull("/repos/cf-gitea-stub/diffstat-k/pulls", { title: "assign me", head: "feature", base: "main" });
+    await seedHook(repoId, ["pull_request_assign"]);
+
+    const res = await patchPull("/repos/cf-gitea-stub/diffstat-k/pulls/1", { assignees: [owner.usernameLower] });
+    expect(res.status).toBe(201);
+
+    const all = await db().select().from(webhookDeliveries).all();
+    expect(all.filter((d) => d.eventType === "pull_request_assign")).toHaveLength(1);
+    const payload = JSON.parse(all.find((d) => d.eventType === "pull_request_assign")!.payloadContent) as {
+      action: string;
+      pull_request: Record<string, unknown>;
+    };
+    expect(payload.action).toBe("assigned");
+    expect(payload.pull_request).toMatchObject({ additions: 4, deletions: 1, changed_files: 2 });
   });
 });
 

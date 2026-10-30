@@ -13,6 +13,7 @@ import { emitIssueEvent, issueEventIdentity, issueEventPayload, type IssueEventI
 import { findIssueByRepoAndIndex, issueErrorToApiError, toApiIssue } from "../services/issues";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
+import { pullRequestDiffShortStat } from "../services/pull-engine";
 import { toApiPullRequest } from "../services/pulls";
 import { assertIssueRowUnit, assertIssuesOrPullsUnit, type IssuePullUnits } from "../services/issue-unit-gates";
 import { canWriteRepository } from "../services/repo-access";
@@ -323,6 +324,11 @@ async function emitLabelDetachEvent(c: Context<ApiEnv>, found: RepositoryWithOwn
       if (pr === null) {
         return;
       }
+      // The payload conversion carries the diff-stat trio like every
+      // ToPayloadPullRequest render (convert/pull.go:230-254, not gated on
+      // isPayload; the omit arms — no merge base, truncated walk, engine
+      // failure :247-250 — stay omitted).
+      const diffStats = await pullRequestDiffShortStat(c, found, pr);
       await emitIssueEvent(c, {
         repoId: found.repo.id,
         ownerId: identity.ownerId,
@@ -332,7 +338,7 @@ async function emitLabelDetachEvent(c: Context<ApiEnv>, found: RepositoryWithOwn
           number: issue.index,
           // ToPayloadPullRequest (pull.go:30-37) — the webhook payload renders
           // the head repo regardless of the doer's visibility.
-          pull_request: await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "payload"),
+          pull_request: await toApiPullRequest(c.env.DB, viewerOf(c), found, issue, pr, "payload", diffStats === null ? undefined : { diffStats }),
           repository: identity.repository,
           sender: identity.sender,
           commit_id: "",

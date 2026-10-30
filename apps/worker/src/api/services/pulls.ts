@@ -50,9 +50,13 @@ import {
  *   - `head.sha` renders from the `pull_requests.head_sha` cache ("" when
  *     the ref has not landed),
  *   - `additions`/`deletions`/`changed_files` render from
- *     `extras.diffStats` (the single-GET route resolves the
+ *     `extras.diffStats` (the single-render routes resolve the
  *     GetDiffShortStat port — services/pull-engine.ts
- *     pullRequestDiffShortStat over convert/pull.go:245-254); `review_comments`
+ *     pullRequestDiffShortStat over convert/pull.go:245-254: the index GET,
+ *     the create 201 + its opened payload, the edit 201 + its payload
+ *     renders + the assign/merge/label payloads, the by-basehead GET — every
+ *     toAPIPullRequest conversion, single AND payload, fills it upstream);
+ *     `review_comments`
  *     stays omitted, and LISTS omit all four (upstream's list converter
  *     leaves the stats nil on purpose — the diff is slow — and panics in
  *     dev/testing if set: services/convert/pull.go:488–492),
@@ -498,8 +502,9 @@ async function headBranchInfo(
  * error/WIP → false, the rest true; non-nullable at this pin), `base.sha`
  * from the base branch tip, and `diffStats` as the GetDiffShortStat port
  * (pullRequestDiffShortStat — the `additions`/`deletions`/`changed_files`
- * trio of structs/pull.go:51-55, omitempty pointers upstream renders only on
- * the single converter, never on a list — convert/pull.go:488-492).
+ * trio of structs/pull.go:51-55, omitempty pointers upstream renders on
+ * every single AND payload conversion, never on a list —
+ * convert/pull.go:230-254, :488-492).
  * List rendering keeps the "" base default and no diffStats to stay D1-only.
  *
  * `preloaded` (optional) is the list route's page-scoped

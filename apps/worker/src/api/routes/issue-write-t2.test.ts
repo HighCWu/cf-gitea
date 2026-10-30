@@ -416,7 +416,15 @@ describe("DELETE /repos/{owner}/{repo}/issues/{index}/labels/{id} (issueRemoveLa
     expect(Object.keys(payload).sort()).toEqual(["action", "commit_id", "number", "pull_request", "repository", "sender"]);
     expect(payload.action).toBe("label_updated");
     expect(payload.number).toBe(pull.issue.index);
-    expect((payload.pull_request as Record<string, unknown>).number).toBe(pull.pullRequest.index);
+    const payloadPull = payload.pull_request as Record<string, unknown>;
+    expect(payloadPull.number).toBe(pull.pullRequest.index);
+    // The diff-stat trio rides every ToPayloadPullRequest render
+    // (convert/pull.go:230-254) — this suite's PR rows are D1-only (no engine
+    // refs), so the resolver's error-log omit arm (:247-250) applies and the
+    // fields stay absent.
+    expect(payloadPull.additions).toBeUndefined();
+    expect(payloadPull.deletions).toBeUndefined();
+    expect(payloadPull.changed_files).toBeUndefined();
   });
 
   it("stays silent for hooks not subscribed to issue_label", async () => {

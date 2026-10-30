@@ -555,8 +555,21 @@ async function emitPullAssignWebhook(
   if (pair === null) return;
   // The assignee webhook payload renders the head repo regardless of the
   // doer (IssueChangeAssignee → ToPayloadPullRequest, notifier.go:182) —
-  // payload mode, not the API-response "single" render.
-  const rendered = await toApiPullRequest(c.env.DB, viewerOf(c), found, pair.issue, pair.pullRequest, "payload");
+  // payload mode, not the API-response "single" render. The diff-stat trio
+  // rides the same conversion (the single converter's GetDiffShortStat block
+  // runs on EVERY single AND payload render, convert/pull.go:230-254; the
+  // omit arms — no merge base, truncated walk, engine failure :247-250 —
+  // stay omitted).
+  const diffStats = await pullRequestDiffShortStat(c, found, pair.pullRequest);
+  const rendered = await toApiPullRequest(
+    c.env.DB,
+    viewerOf(c),
+    found,
+    pair.issue,
+    pair.pullRequest,
+    "payload",
+    diffStats === null ? undefined : { diffStats },
+  );
   await emitPullWebhook(c, {
     repoId: found.repo.id,
     ownerId: found.repo.ownerId,
@@ -1019,8 +1032,19 @@ export function registerPullRoutes(
       // The split mirrors that: the API response keeps the doer-gated "single"
       // render, the opened payload gets its own "payload" render (head.repo
       // reaches the receivers regardless of the doer, convert/pull.go:33-37).
-      const rendered = await toApiPullRequest(c.env.DB, viewer, found, issue, pr, "single");
-      const payloadRendered = await toApiPullRequest(c.env.DB, viewer, found, issue, pr, "payload");
+      // BOTH conversions fill the diff-stat trio — the single converter's
+      // GetDiffShortStat block is NOT gated on isPayload (convert/pull.go:230-254),
+      // and the fresh PR's merge base is servable: NewPullRequest resolves
+      // pr.MergeBase synchronously at create (services/pull/pull.go:96 →
+      // checkPullRequestBranchMergeable, patch.go:83-91 / merge_tree.go:107).
+      // One engine resolution feeds both renders (upstream recomputes the stat
+      // per conversion — the shared read is the cheaper adapter); the omit
+      // arms (no merge base, truncated walk, engine failure :247-250) omit
+      // from both.
+      const diffStats = await pullRequestDiffShortStat(c, found, pr);
+      const extras = diffStats === null ? undefined : { diffStats };
+      const rendered = await toApiPullRequest(c.env.DB, viewer, found, issue, pr, "single", extras);
+      const payloadRendered = await toApiPullRequest(c.env.DB, viewer, found, issue, pr, "payload", extras);
       // Webhook: pull_request opened.
       await emitPullWebhook(c, {
         repoId: found.repo.id,
@@ -1045,8 +1069,11 @@ export function registerPullRoutes(
   // (pullRequestDiffShortStat over convert/pull.go:245-254 — upstream's
   // single converter fills the stats on EVERY single render; the omit arms —
   // no merge base, truncated engine walk, engine failure — mirror its error
-  // log :247-250) — both PR-detail read arm only, like the mergeability
-  // extras.
+  // log :247-250). The same trio mounts on the create 201 body + its opened
+  // payload (pull.go:558, :31-34), the edit 201 body + its payload renders
+  // (:799, the notifiers), the by-basehead render (:300) and the merge
+  // closed payload (notifier.go:715) — every toAPIPullRequest conversion
+  // site, like upstream's single converter.
   // -------------------------------------------------------------------------
   app.openapi(getPullRoute(optionalAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
@@ -1076,6 +1103,23 @@ export function registerPullRoutes(
         // Upstream answers a bare Status(403); the envelope carries an empty message.
         throw new ApiError(403, "");
       }
+      // The diff-stat trio resolves AT MOST ONCE per PATCH, lazily on the
+      // first render that needs it: upstream recomputes GetDiffShortStat per
+      // conversion — the single converter fills the trio on EVERY single AND
+      // payload render (convert/pull.go:230-254), the edit route's 201 body
+      // (:799) and its notifiers' payloads (IssueChangeTitle webhook/notifier.go:225,
+      // IssueChangeContent :397, IssueChangeStatus :260) included — and the
+      // shared memo is the cheaper adapter. The laziness keeps the engine
+      // read off the failing arms (403/409/412 never convert). The omit arms
+      // (no merge base, truncated walk, engine failure :247-250) omit from
+      // every render of this request.
+      let diffStatsMemo: { additions: number; deletions: number; changedFiles: number } | null | undefined;
+      const diffStatsExtras = async (): Promise<{ diffStats: { additions: number; deletions: number; changedFiles: number } } | undefined> => {
+        if (diffStatsMemo === undefined) {
+          diffStatsMemo = await pullRequestDiffShortStat(c, found, pullRequest);
+        }
+        return diffStatsMemo === null ? undefined : { diffStats: diffStatsMemo };
+      };
       const form = c.req.valid("json");
       const service = new IssuesService(c.env.DB);
       const requester = c.get("authUser");
@@ -1108,7 +1152,7 @@ export function registerPullRoutes(
           eventType: "pull_request",
           payload: pullRequestPayload(
             "edited",
-            await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload"),
+            await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload", await diffStatsExtras()),
             issue.index,
             toApiRepository(viewerOf(c), found),
             c.get("authUser"),
@@ -1133,7 +1177,7 @@ export function registerPullRoutes(
           eventType: "pull_request",
           payload: pullRequestPayload(
             "edited",
-            await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload"),
+            await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload", await diffStatsExtras()),
             issue.index,
             toApiRepository(viewerOf(c), found),
             c.get("authUser"),
@@ -1227,7 +1271,7 @@ export function registerPullRoutes(
             eventType: "pull_request",
             payload: pullRequestPayload(
               "closed",
-              await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload"),
+              await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload", await diffStatsExtras()),
               issue.index,
               toApiRepository(viewerOf(c), found),
               c.get("authUser"),
@@ -1247,7 +1291,7 @@ export function registerPullRoutes(
             eventType: "pull_request",
             payload: pullRequestPayload(
               "reopened",
-              await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload"),
+              await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "payload", await diffStatsExtras()),
               issue.index,
               toApiRepository(viewerOf(c), found),
               c.get("authUser"),
@@ -1273,7 +1317,11 @@ export function registerPullRoutes(
         issue = fresh.issue;
         pullRequest = fresh.pullRequest;
       }
-      return c.json(await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "single"), 201);
+      // The edit route's 201 carries the trio like the GET — the refetched row
+      // converts through the same single converter (pull.go:799 — upstream
+      // answers StatusCreated here too, with the in-source TODO "this should
+      // be 200, not 201" above :799).
+      return c.json(await toApiPullRequest(c.env.DB, viewer, found, issue, pullRequest, "single", await diffStatsExtras()), 201);
     },
     bindValidationHook,
   );
@@ -1558,7 +1606,20 @@ export function registerPullRoutes(
       // this payload is the path's ONLY PR render): payload mode.
       const merged = await findPullRequestByIndex(c.env.DB, found.repo.id, checked.index);
       if (merged !== null) {
-        const rendered = await toApiPullRequest(c.env.DB, viewerOf(c), found, merged.issue, merged.pullRequest, "payload");
+        // The merge notifier's ToPayloadPullRequest carries the diff-stat trio
+        // like every payload conversion (convert/pull.go:230-254 is not gated
+        // on isPayload); the omit arms (:247-250) stay omitted — the checked
+        // row's persisted merge base serves the pre-merge contribution.
+        const diffStats = await pullRequestDiffShortStat(c, found, merged.pullRequest);
+        const rendered = await toApiPullRequest(
+          c.env.DB,
+          viewerOf(c),
+          found,
+          merged.issue,
+          merged.pullRequest,
+          "payload",
+          diffStats === null ? undefined : { diffStats },
+        );
         await emitPullWebhook(c, {
           repoId: found.repo.id,
           ownerId: found.repo.ownerId,
@@ -1612,7 +1673,9 @@ export function registerPullRoutes(
   // GET /repos/{owner}/{repo}/pulls/{base}/{head} (repoGetPullRequestByBaseHead)
   // — the pure D1 lookup on the base/head columns; the fork form
   // `owner:branch` resolves the head repo through resolveHeadRepo (404 when
-  // the head repo row is absent).
+  // the head repo row is absent). The render is the SAME single converter as
+  // the index GET (pull.go:300 vs :211), so the diff-stat trio rides it too
+  // (pullRequestDiffShortStat; the omit arms mirror :247-250).
   // -------------------------------------------------------------------------
   app.openapi(getPullByBaseHeadRoute(optionalAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
@@ -1622,7 +1685,11 @@ export function registerPullRoutes(
     if (row === null) {
       throw new ApiError(404, "not found"); // upstream APIErrorNotFound
     }
-    return c.json(await toApiPullRequest(c.env.DB, viewer, found, row.issue, row.pullRequest, "single"), 200);
+    const diffStats = await pullRequestDiffShortStat(c, found, row.pullRequest);
+    return c.json(
+      await toApiPullRequest(c.env.DB, viewer, found, row.issue, row.pullRequest, "single", diffStats === null ? undefined : { diffStats }),
+      200,
+    );
   });
 }
 
