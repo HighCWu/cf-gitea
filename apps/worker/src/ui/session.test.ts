@@ -10,7 +10,11 @@
  * - Rotation / reuse (§2.4) with time travel: fresh verify, forced rotation
  *   (digest + grace columns + new Set-Cookie), the 60 s stale-cookie grace,
  *   beyond-grace and wrong-secret deletions, the CAS-loses race outcome,
- *   the throttled `last_seen_at`.
+ *   the throttled `last_seen_at` riding the re-arm statement.
+ * - Sliding validity (§2.3's 2026-10-30 amendment, the parity review's HIGH
+ *   #2): the idle TTLs re-armed per authenticated request (24 h non-remember,
+ *   31 d remember), rotation on its own 24 h clock firing while the session
+ *   is alive, the 30-days-of-use survival, and the idle deaths.
  * - Logout: valid / cookieless / forged presentations (§2.7: forged logout
  *   leaves rows untouched — reuse detection owns mismatch deletion).
  * - Boundary (§2.9): a session cookie authorizes nothing on /api/v1 or
@@ -916,7 +920,7 @@ describe("§2.4 verification, rotation, reuse detection", () => {
     expect(row?.previousSha256Digest).toBeNull();
   });
 
-  it("last_seen_at is throttled to once per hour (§3)", async () => {
+  it("last_seen_at is throttled to once per hour and rides the re-arm statement (§3, §2.3 amendment)", async () => {
     const alice = await seedUser();
     const fresh = await insertSession({
       id: "seenfresh1",
@@ -926,7 +930,12 @@ describe("§2.4 verification, rotation, reuse detection", () => {
       expiresAt: new Date(T + 60 * 60 * 1000),
       lastSeenAt: new Date(T - 30 * 60 * 1000),
     });
+    // Not due: the idle re-arm runs alone (synchronous, §2.3) — no last_seen
+    // write, no background work.
     expect((await verifySession(env.DB, fresh, { now: new Date(T) })).background).toHaveLength(0);
+    const freshRow = await drizzle(env.DB).select().from(sessions).where(eq(sessions.id, "seenfresh1")).get();
+    expect(freshRow?.lastSeenAt.getTime()).toBe(T - 30 * 60 * 1000); // untouched
+    expect(freshRow?.expiresAt.getTime()).toBe(T + 24 * 60 * 60 * 1000); // re-armed
 
     const due = await insertSession({
       id: "seendue123",
@@ -936,11 +945,13 @@ describe("§2.4 verification, rotation, reuse detection", () => {
       expiresAt: new Date(T + 60 * 60 * 1000),
       lastSeenAt: new Date(T - 2 * 60 * 60 * 1000),
     });
+    // Due: the touch rides the re-arm's single synchronous statement — the
+    // row is already updated when verifySession returns.
     const result = await verifySession(env.DB, due, { now: new Date(T) });
-    expect(result.background).toHaveLength(1);
-    await Promise.all(result.background);
+    expect(result.background).toHaveLength(0);
     const row = await drizzle(env.DB).select().from(sessions).where(eq(sessions.id, "seendue123")).get();
     expect(row?.lastSeenAt.getTime()).toBe(T);
+    expect(row?.expiresAt.getTime()).toBe(T + 24 * 60 * 60 * 1000);
   });
 
   it("the login GC sweep removes expired rows only (§2.2 step 5, §3)", async () => {
@@ -958,6 +969,119 @@ describe("§2.4 verification, rotation, reuse detection", () => {
     const rows = await drizzle(env.DB).select().from(sessions).all();
     expect(rows).toHaveLength(1);
     expect(rows[0]?.id).toBe("gcalive123");
+  });
+});
+
+// ---------------------------------------------------------------------------------
+// §2.3 sliding validity — the decoupled clocks (the parity review's HIGH #2)
+// ---------------------------------------------------------------------------------
+
+describe("§2.3 sliding validity — idle TTLs re-armed per use, rotation on its own clock", () => {
+  const H = 60 * 60 * 1000;
+  const D = 24 * H;
+
+  it("mints by the remember bit: 24 h idle non-remember, 31 d remembered (auth_token.go:97)", async () => {
+    const alice = await seedUser();
+    const plain = await mintSession(env.DB, alice.id, { now: new Date(T) });
+    const remembered = await mintSession(env.DB, alice.id, { now: new Date(T), remember: true });
+    const rows = await drizzle(env.DB).select().from(sessions).all();
+    const plainRow = rows.find((r) => r.id === (plain.split(":")[0] ?? ""));
+    const rememberedRow = rows.find((r) => r.id === (remembered.split(":")[0] ?? ""));
+    expect(plainRow?.expiresAt.getTime()).toBe(T + D);
+    expect(rememberedRow?.expiresAt.getTime()).toBe(T + 31 * D);
+  });
+
+  it("an actively-used NON-REMEMBER session at t+23h stays valid AND rotation fires on its own clock past 24h", async () => {
+    const alice = await seedUser();
+    const cookieValue = await mintSession(env.DB, alice.id, { now: new Date(T) });
+
+    // t+23h: valid (idle 23 h < 24 h) and re-armed; rotation not yet due
+    // (its clock reads 23 h). Under the old arithmetic this request was the
+    // last one the session would ever authenticate: expires_at was T+24h and
+    // the rotation window (now − rotated_at ≥ 24 h) opened only once the
+    // expiry check had already consumed that instant.
+    const at23 = await verifySession(env.DB, cookieValue, { now: new Date(T + 23 * H) });
+    expect(at23.outcome).toBe("authenticated");
+    if (at23.outcome !== "authenticated") return;
+    expect(at23.setCookie).toBeNull();
+    expect(at23.background).toHaveLength(0);
+    let row = await drizzle(env.DB).select().from(sessions).all().then((rows) => rows[0]);
+    expect(row?.expiresAt.getTime()).toBe(T + 23 * H + D); // re-armed by the use
+
+    // t+25h: still valid (armed to t+47h) AND rotated — the two clocks are
+    // decoupled; the cookie refreshes on its own daily schedule.
+    const at25 = await verifySession(env.DB, cookieValue, { now: new Date(T + 25 * H) });
+    expect(at25.outcome).toBe("authenticated");
+    if (at25.outcome !== "authenticated") return;
+    expect(at25.setCookie).not.toBeNull();
+    row = await drizzle(env.DB).select().from(sessions).all().then((rows) => rows[0]);
+    expect(row?.rotatedAt.getTime()).toBe(T + 25 * H);
+    expect(row?.expiresAt.getTime()).toBe(T + 25 * H + D);
+  });
+
+  it("a REMEMBER session survives 30 days of daily use and dies after 31 idle days (auth_token.go:80)", async () => {
+    const alice = await seedUser();
+    let cookieValue = await mintSession(env.DB, alice.id, { now: new Date(T), remember: true });
+
+    // Daily use for 30 days: every verify re-arms +31 d (and rotates, each
+    // gap ≥ 24 h — the adopted cookie is the one presented next).
+    for (let day = 1; day <= 30; day++) {
+      const result = await verifySession(env.DB, cookieValue, { now: new Date(T + day * D) });
+      expect(result.outcome).toBe("authenticated");
+      if (result.outcome !== "authenticated") return;
+      await Promise.all(result.background);
+      if (result.setCookie !== null) cookieValue = result.setCookie;
+    }
+
+    // 31 idle days after the last use: dead, the row GC'd lazily.
+    const idle = await verifySession(env.DB, cookieValue, { now: new Date(T + 61 * D + H) });
+    expect(idle.outcome).toBe("anonymous");
+    if (idle.outcome !== "anonymous") return;
+    expect(idle.clearCookie).toBe(true);
+    await Promise.all(idle.background);
+    expect(await drizzle(env.DB).select().from(sessions).all()).toHaveLength(0);
+  });
+
+  it("an idle non-remember session is dead at 25 h (§2.3: 24 h idle, the store Maxlifetime)", async () => {
+    const alice = await seedUser();
+    const cookieValue = await mintSession(env.DB, alice.id, { now: new Date(T) });
+    const result = await verifySession(env.DB, cookieValue, { now: new Date(T + 25 * H) });
+    expect(result.outcome).toBe("anonymous");
+    if (result.outcome !== "anonymous") return;
+    expect(result.clearCookie).toBe(true);
+    await Promise.all(result.background);
+    expect(await drizzle(env.DB).select().from(sessions).all()).toHaveLength(0);
+  });
+
+  it("a remembered session's rotation re-arms +31 d, not +24 h (auth_token.go:80 — the review's second-order drift)", async () => {
+    const alice = await seedUser();
+    await insertSession({
+      id: "rearm31d01",
+      userId: alice.id,
+      secret: "7".repeat(64),
+      rotatedAt: new Date(T - 25 * 60 * 60 * 1000),
+      expiresAt: new Date(T + 60 * 60 * 1000),
+      lastSeenAt: new Date(T - 25 * 60 * 60 * 1000),
+      remember: true,
+    });
+    const result = await verifySession(env.DB, `rearm31d01:${"7".repeat(64)}`, { now: new Date(T) });
+    expect(result.outcome).toBe("authenticated");
+    if (result.outcome !== "authenticated") return;
+    expect(result.setCookie).not.toBeNull();
+    await Promise.all(result.background);
+    const row = await drizzle(env.DB).select().from(sessions).where(eq(sessions.id, "rearm31d01")).get();
+    expect(row?.expiresAt.getTime()).toBe(T + 31 * 24 * 60 * 60 * 1000);
+  });
+
+  it("a remembered session idle past 24 h is still alive (the remember TTL is 31 d, not the store's 24 h)", async () => {
+    const alice = await seedUser();
+    const cookieValue = await mintSession(env.DB, alice.id, { now: new Date(T), remember: true });
+    // The old arithmetic killed every login — remember notwithstanding — at
+    // exactly 24 h; upstream keeps a remembered user alive 31 idle days.
+    const result = await verifySession(env.DB, cookieValue, { now: new Date(T + 25 * H) });
+    expect(result.outcome).toBe("authenticated");
+    if (result.outcome !== "authenticated") return;
+    expect(result.setCookie).not.toBeNull(); // rotation clock fired while valid
   });
 });
 
@@ -984,7 +1108,11 @@ describe("§2.9 boundary (the real dispatcher via SELF)", () => {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${cookieValue}` },
     });
     expect(res.status).toBe(401);
-    expect(res.headers.get("www-authenticate")).toBe('Basic realm="Gitea"');
+    // The realm follows the pin's OAuth2 switch (githttp.go:152-158): OAuth2
+    // is absent here, so upstream's disabled arm — "use another realm to
+    // avoid GCM OAuth2 attempt" — is the challenge (respond.ts
+    // BASIC_AUTH_CHALLENGE).
+    expect(res.headers.get("www-authenticate")).toBe('Basic realm="Gitea (Basic Auth)"');
   });
 });
 

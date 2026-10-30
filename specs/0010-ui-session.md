@@ -175,7 +175,7 @@ work with JS disabled — it is plain HTML).
 | `SameSite` | `Lax` | `setting/session.go:39` default |
 | `Path` | `/` | `setting/session.go` (`CookiePath` default) |
 | `Max-Age` | `remember` → 31 days (`LOGIN_REMEMBER_DAYS` default 31, `setting/security.go:146`); no `remember` → **session cookie** (no `Max-Age`; dies with the browser). The login's decision is **persisted on the row** (`sessions.remember`, migration 0035) and **every rotation re-sets the cookie with it** (§2.4 step 5) — a remembered login keeps `Max-Age=2678400` across rotations, an unremembered one's rotated cookie stays session-scope | `auth.go:127` (`SetSiteCookie(…, LogInRememberDays*Day)` inside `autoSignIn` — upstream re-issues the remember cookie with the remember TTL after every token regeneration) |
-| Row TTL | 24 h at mint; **extended by 24 h on every rotation** (§2.4) — an actively used session keeps living, an idle one dies after 24 h regardless of the cookie's persistence | `setting/session.go` store `Maxlifetime` default 86400 |
+| Row TTL | **idle TTL, re-armed by every authenticated request** (the 2026-10-30 amendment below): non-remember → 24 h idle (`setting/session.go` store `Maxlifetime` default 86400), remember → 31 days idle (`LOGIN_REMEMBER_DAYS`; upstream arms `auth_token.go:97` at mint, re-arms `auth_token.go:80` per use) — an actively used session keeps living, an idle one dies after its idle TTL regardless of the cookie's persistence; **no absolute cap** (upstream's auth-token expiry merely slides, `auth_token.go:47-92` — none exists to mirror) | `setting/session.go` store `Maxlifetime` 86400; `services/auth/auth_token.go:80,97` |
 
 The `remember` distinction is exactly upstream's: *cookie* persistence. Upstream splits
 the roles across two cookies (`gitea_session` names a server-side store entry,
@@ -203,6 +203,52 @@ past the 60 s grace, turns the next request into a step-3 mismatch that deletes 
 row: merely visiting `/login` signed-in after 24 h logged the user out (the review's
 HIGH finding, fixed `28df818`; route-level round-trips pin that the *adopted* cookie
 authenticates the next request).
+
+**Amendment (2026-10-30, the wave parity review's HIGH #2 fix — sliding validity +
+decoupled clocks).** The parity review (`docs/usability/parity-review-auth.md` §1)
+found the remember/rotation arithmetic unreachable: `SESSION_TTL_MS` and
+`ROTATION_INTERVAL_MS` were both exactly 24 h and both anchored at the same mint
+instant, so the expiry check (`expires_at <= now`, §2.4 step 2) consumed the only
+instant the rotation trigger (`now − rotated_at ≥ 24 h`, §2.4 step 5) could fire —
+rotation never ran in natural operation, reuse detection was consequently dead code,
+and every web login hard-died 24 h after mint, `remember` notwithstanding, while the
+browser held a 31-day cookie. As built:
+
+- **Validity is idle-based sliding; there is no absolute cap.** Every authenticated
+  request re-arms `expires_at = now + idleTtl(remember)`: **24 h idle** for a
+  non-remembered session (upstream server-store `Maxlifetime` default 86400,
+  `setting/session.go:38`) and **31 days idle** for a remembered one (upstream arms
+  the remember token's `ExpiresUnix` to `now + LOGIN_REMEMBER_DAYS` at mint,
+  `auth_token.go:97`, and re-arms it on every regeneration, `auth_token.go:80` —
+  and its `autoSignIn` checks + regenerates on EVERY cookie-authenticated request,
+  `routers/web/auth/auth.go:97,119-127`, so a remembered upstream user stays signed
+  in through 31 idle days). Mint arms by the same rule (`mintSession`).
+  **No absolute cap**: upstream's auth-token expiry merely slides
+  (`auth_token.go:47-92` — the only check is `ExpiresUnix < now`; no max-lifetime
+  column exists), so none is imposed here.
+- **The re-arm is synchronous** and shares one UPDATE with the throttled
+  `last_seen_at` touch when both are due (§3's 1 h throttle unchanged — only the
+  transport moved): a lost background re-arm would silently shorten the session's
+  life and resurface as a mystery logout days later. After a rotation (which
+  re-armed already) the touch goes alone in the background as before. Anonymous
+  outcomes (including the stale in-grace branch) never re-arm.
+- **Rotation keeps its own 24 h-from-`rotated_at` clock, decoupled from validity**
+  (§2.4 step 5 unchanged as a trigger): the cookie refreshes at most daily while the
+  session lives — a deliberate adaptation, since upstream's per-use regeneration
+  would put a Set-Cookie + row write on every request, which buys nothing over the
+  daily cadence this SPEC already ratified. Rotation now re-arms by the row's idle
+  TTL (`remember` → 31 d, upstream `auth_token.go:80` parity), fixing the review's
+  second-order drift (the old +24 h re-arm logged out a user active every 36 h).
+- **Reuse detection is reachable again** (rotation actually fires) — semantics
+  unchanged: the 60 s stale-grace non-authenticating branch and the beyond-grace
+  compromise delete (§2.4 step 3). Pins: an actively-used non-remember session at
+  t+23 h stays valid AND rotates past t+24 h; a remembered session survives 30 days
+  of daily use and dies after 31 idle days; an idle 25 h non-remember session is
+  dead; a remembered session idle past 24 h is alive (`session.test.ts`, the §2.3
+  sliding-validity describe).
+
+Read §2.4's step-5 "`expires_at` = now + 24 h" as now + `idleTtl(remember)` per this
+amendment; §2.3's table row above is the authoritative statement.
 
 ### 2.4 Verification, rotation, reuse detection (the upstream auth-token mechanics, ported)
 

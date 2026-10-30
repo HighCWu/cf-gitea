@@ -19,6 +19,12 @@
  * — CheckAuthToken is ported one-for-one in `verifySession`),
  * SetSiteCookie's HttpOnly hardcode (modules/web/middleware/cookie.go:57-78),
  * and the 303-See-Other redirect default (services/context/base.go:157).
+ * Validity is IDLE-sliding with rotation on its own clock (§2.3's
+ * 2026-10-30 amendment, the parity review's HIGH #2): every authenticated
+ * request re-arms the row's expiry (24 h idle non-remember, 31 d idle
+ * remember — no absolute cap, upstream has none), while the secret still
+ * rotates on its own 24 h-from-`rotated_at` clock, so rotation fires while
+ * the session is still alive.
  * Documented divergences: upstream splits the roles across `gitea_session`
  * (server store) + `gitea_remember` (auth token); we collapse both into ONE
  * `gitea_session` cookie carrying the `id:secret` pair — Workers isolates
@@ -64,14 +70,35 @@ import { shellAssetsFromManifest, type UiContext } from "./ui-context";
  *  (modules/setting/session.go:36,61). */
 export const SESSION_COOKIE_NAME = "gitea_session";
 
-/** Row TTL at mint, extended by exactly this on every rotation (§2.3):
- *  an actively used session keeps living, an idle one dies after 24 h
- *  regardless of the cookie's persistence (upstream store `Maxlifetime`
- *  default 86400). */
+/** The non-remembered session's IDLE TTL (§2.3, the 2026-10-30 amendment):
+ *  every authenticated request re-arms `expires_at` to now + this, so an
+ *  actively used session keeps living and an idle one dies after 24 h
+ *  (upstream server-store `Maxlifetime` default 86400,
+ *  modules/setting/session.go:38). Not a hard lifetime — upstream has no
+ *  absolute cap (the auth-token expiry merely slides, auth_token.go:47-92)
+ *  and none is imposed here. */
 export const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
-/** Rotation trigger (§2.4 step 5): a secret older than this is rotated on
- *  the next valid presentation. */
+/** The remembered session's IDLE TTL (§2.3): upstream arms the remember
+ *  token's `ExpiresUnix` to now + `LOGIN_REMEMBER_DAYS` (31) at mint
+ *  (services/auth/auth_token.go:97) and re-arms it on every regeneration
+ *  (auth_token.go:80) — and its `autoSignIn` checks + regenerates on EVERY
+ *  cookie-authenticated request (routers/web/auth/auth.go:97,119-127) — so a
+ *  remembered user stays signed in through 31 idle days. */
+export const REMEMBER_IDLE_TTL_MS = 31 * 24 * 60 * 60 * 1000;
+
+/** The `expires_at` re-arm quantum for a session row (§2.3). */
+export function idleTtlMs(remember: boolean): number {
+  return remember ? REMEMBER_IDLE_TTL_MS : SESSION_TTL_MS;
+}
+
+/** Rotation trigger (§2.4 step 5), on its OWN clock: a secret older than
+ *  this is rotated on the next valid presentation — independent of the idle
+ *  TTLs above, so rotation fires while the session is still valid (the
+ *  parity review's HIGH #2: with both clocks 24 h from mint, the expiry
+ *  check consumed the only instant rotation could fire and rotation was
+ *  unreachable). The cookie still refreshes at most daily while the session
+ *  lives. */
 export const ROTATION_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 /** The stale-cookie grace (§2.4 step 3): a cookie carrying the PREVIOUS
@@ -230,8 +257,9 @@ export type SessionVerification =
 /**
  * Verify a presented `gitea_session` value — the port of upstream
  * `CheckAuthToken` (services/auth/auth_token.go:33-69): format + lookup
- * (one D1 read, `sessions ⋈ users` on the primary key), expiry, digest
- * compare with reuse detection, doer status, then rotation. Never throws
+ * (one D1 read, `sessions ⋈ users` on the primary key), idle expiry, digest
+ * compare with reuse detection, doer status, rotation on its own clock,
+ * then the idle re-arm. Never throws
  * for auth outcomes; a D1 failure propagates to the caller's fail-closed
  * 500 (§4.8 — a transient error must not masquerade as a logout).
  */
@@ -255,7 +283,9 @@ export async function verifySession(
     .get();
   if (row === undefined) return { outcome: "anonymous", clearCookie: true, background: [] };
 
-  // Step 2: hard expiry → anonymous, row deleted lazily, cookie cleared (§3 GC).
+  // Step 2: idle expiry → anonymous, row deleted lazily, cookie cleared
+  // (§3 GC). While the session is in use the re-arm below keeps pushing this
+  // instant out; only genuine idleness past the row's TTL lands here.
   if (row.session.expiresAt.getTime() <= now.getTime()) {
     const background = db.delete(sessions).where(eq(sessions.id, parsed.id)).run();
     return { outcome: "anonymous", clearCookie: true, background: [background] };
@@ -288,19 +318,48 @@ export async function verifySession(
     return { outcome: "anonymous", clearCookie: true, background: [] };
   }
 
-  // Step 5: rotation — when the secret is ≥ 24 h old, mint a fresh one and
-  // conditionally update (upstream's UpdateAuthTokenByID(…, oldHash) guard,
-  // auth_token.go:71-92). `changes == 0` (a concurrent request rotated
-  // first) → skip, send nothing; the 60 s grace covers any true in-flight
-  // window (§4.4).
+  // Step 5: rotation — on its OWN clock (§2.3's 2026-10-30 amendment): the
+  // secret is re-minted when ≥ 24 h old, INDEPENDENT of the idle expiry the
+  // re-arm below maintains (the old arithmetic — both clocks 24 h from the
+  // same mint instant — left the rotation window empty: the expiry check
+  // consumed the only instant rotation could fire, so rotation AND reuse
+  // detection were unreachable). Upstream's UpdateAuthTokenByID(…, oldHash)
+  // CAS guard, auth_token.go:71-92. `changes == 0` (a concurrent request
+  // rotated first) → skip, send nothing; the 60 s grace covers any true
+  // in-flight window (§4.4).
   let setCookie: string | null = null;
+  let rotationReArmedExpiry = false;
   if (now.getTime() - row.session.rotatedAt.getTime() >= ROTATION_INTERVAL_MS) {
-    setCookie = await rotateSession(d1, parsed.id, row.session.sha256Digest, { now });
+    setCookie = await rotateSession(d1, parsed.id, row.session.sha256Digest, {
+      now,
+      remember: row.session.remember,
+    });
+    // The rotation write re-arms the idle expiry by the row's TTL (and on a
+    // CAS loss the concurrent winner just did the same) — skip the re-arm.
+    rotationReArmedExpiry = true;
   }
 
-  // Throttled `last_seen_at` touch (§3) — background work for the caller.
+  // Sliding validity (§2.3): EVERY authenticated request re-arms the idle
+  // expiry — now + 24 h non-remember, now + 31 d remember — so an actively
+  // used session keeps living and an idle one dies (upstream re-arms the
+  // remember token per use through autoSignIn, auth.go:97,119-127 +
+  // auth_token.go:80; the non-remember 24 h is the store Maxlifetime).
+  // Synchronous: a lost re-arm would silently shorten the session's life
+  // and resurface as a mystery logout days later. The throttled
+  // `last_seen_at` touch (§3) rides the same statement when due; after a
+  // rotation (which re-armed already) it goes alone in the background as
+  // before.
   const background: Promise<unknown>[] = [];
+  const updates: { expiresAt?: Date; lastSeenAt?: Date } = {};
+  if (!rotationReArmedExpiry) {
+    updates.expiresAt = new Date(now.getTime() + idleTtlMs(row.session.remember));
+  }
   if (now.getTime() - row.session.lastSeenAt.getTime() >= LAST_SEEN_THROTTLE_MS) {
+    updates.lastSeenAt = now;
+  }
+  if (updates.expiresAt !== undefined) {
+    await db.update(sessions).set(updates).where(eq(sessions.id, parsed.id)).run();
+  } else if (updates.lastSeenAt !== undefined) {
     background.push(db.update(sessions).set({ lastSeenAt: now }).where(eq(sessions.id, parsed.id)).run());
   }
 
@@ -317,8 +376,11 @@ export async function verifySession(
  * The rotation step, isolated so the CAS guard is directly assertable
  * (§2.4 step 5): mints a fresh secret and conditionally updates
  * `sha256_digest` → new, `previous_sha256_digest` → old, `rotated_at` →
- * now, `expires_at` → now + 24 h — WHERE the stored digest is still the one
- * the caller verified (upstream `UpdateAuthTokenByID(…, oldHash)`). Returns
+ * now, `expires_at` → now + the row's idle TTL (`remember` decides: 31 d
+ * re-armed like upstream's RegenerateAuthToken, auth_token.go:80 — the
+ * review's second-order drift was re-arming only +24 h) — WHERE the stored
+ * digest is still the one the caller verified (upstream
+ * `UpdateAuthTokenByID(…, oldHash)`). Returns
  * the fresh `id:secret` cookie value, or `null` when the CAS lost
  * (`changes == 0` — a concurrent request rotated first: send nothing, the
  * 60 s grace covers the in-flight window, §4.4).
@@ -327,7 +389,7 @@ export async function rotateSession(
   d1: D1Database,
   id: string,
   verifiedDigest: string,
-  options?: { now?: Date },
+  options?: { now?: Date; remember?: boolean },
 ): Promise<string | null> {
   const now = options?.now ?? new Date();
   const secret = generateSessionSecret();
@@ -337,7 +399,7 @@ export async function rotateSession(
       sha256Digest: await sha256Hex(secret),
       previousSha256Digest: verifiedDigest,
       rotatedAt: now,
-      expiresAt: new Date(now.getTime() + SESSION_TTL_MS),
+      expiresAt: new Date(now.getTime() + idleTtlMs(options?.remember ?? false)),
     })
     .where(and(eq(sessions.id, id), eq(sessions.sha256Digest, verifiedDigest)))
     .run();
@@ -347,10 +409,13 @@ export async function rotateSession(
 /**
  * Mint a session row for `userId` and return the cookie value
  * (`id:secret`, §2.2 step 5). The row starts unrotated
- * (`previous_sha256_digest` NULL, `rotated_at` = now) with the 24 h TTL.
- * `remember` persists the login form's persistence decision on the row
- * (§2.3): every later rotation re-sets the cookie with it, so a remembered
- * login never degrades to a session cookie at the first 24 h rotation.
+ * (`previous_sha256_digest` NULL, `rotated_at` = now) with the idle TTL the
+ * `remember` bit selects: 31 d remembered (upstream arms the remember
+ * token's expiry to `LOGIN_REMEMBER_DAYS` at mint, auth_token.go:97),
+ * 24 h not. `remember` persists the login form's persistence decision on
+ * the row (§2.3): every later rotation re-sets the cookie with it, so a
+ * remembered login never degrades to a session cookie at the first 24 h
+ * rotation.
  */
 export async function mintSession(
   d1: D1Database,
@@ -368,7 +433,7 @@ export async function mintSession(
       sha256Digest: await sha256Hex(secret),
       previousSha256Digest: null,
       rotatedAt: now,
-      expiresAt: new Date(now.getTime() + SESSION_TTL_MS),
+      expiresAt: new Date(now.getTime() + idleTtlMs(options?.remember ?? false)),
       lastSeenAt: now,
       remember: options?.remember ?? false,
     })
