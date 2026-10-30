@@ -209,8 +209,10 @@ describe("user feed xml envelopes (the /{username}.rss + .atom byte surfaces)", 
 
     const atom = renderUserFeedAtom(data);
 
-    // The full document, byte-for-byte. The author email is HIDDEN for the
-    // anonymous renderer (apiUserFromRow's landed posture) → no <email>.
+    // The full document, byte-for-byte. Since the email-placeholder landing
+    // (6aadbfc: GetPlaceholderEmail's {id}+{lower}@ noreply shape for
+    // non-authed viewers — convert/user.go:86), the anonymous feed renderer
+    // carries the placeholder and gorilla's WriteAtom emits <email>.
     const expected = [
       `<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">`,
       `  <title>Feed of &#34;alice&#34;</title>`,
@@ -226,6 +228,7 @@ describe("user feed xml envelopes (the /{username}.rss + .atom byte surfaces)", 
       `    <summary type="html">Live issue title&#xA;&#xA;&lt;p&gt;A &lt;strong&gt;comment&lt;/strong&gt; body&lt;/p&gt;&#xA;</summary>`,
       `    <author>`,
       `      <name>alice</name>`,
+      `      <email>1+alice@users.noreply.gitea.invalid</email>`,
       `    </author>`,
       `  </entry>`,
       `  <entry>`,
@@ -235,6 +238,7 @@ describe("user feed xml envelopes (the /{username}.rss + .atom byte surfaces)", 
       `    <link href="https://feed.test/alice/demo" rel="alternate"></link>`,
       `    <author>`,
       `      <name>alice</name>`,
+      `      <email>1+alice@users.noreply.gitea.invalid</email>`,
       `    </author>`,
       `  </entry>`,
       `</feed>`,
