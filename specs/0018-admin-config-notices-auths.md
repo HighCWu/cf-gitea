@@ -688,3 +688,92 @@ emission for slice one; (4) the 2000-char description bound; (5) zero build
 for the config write-path stack — the read-only summary IS the arm; (6) the
 instance-name row as a POSTURE line. M1 (notices) and M2 (config) serialize
 through one admin-registration window per the census's Open Issues #7 note.
+
+---
+
+## As-built — the v1.3.2 board's P1-4 re-verification (2026-10-31 — no build; the §3.3 verdict HOLDS)
+
+The v1.3.2 residual board dispatched P1-4 with an implementation premise:
+an "API-first ladder" — an `/api/v1/admin/auths` family (list/get/create/
+update/delete "with upstream's exact bodies") with the web page built over
+it. This amendment records the tension resolution the dispatch asked for:
+**the premise fails at the pin, the board row does not override §3.3, and
+the omission verdict stands unchanged.** Zero code ships under P1-4; the
+row stays the survey's one PARTIAL row as a documented divergence, exactly
+the board's S-priced arm ("S to leave as documented divergence"). The
+re-verification evidence, all own-eyes at the same pin (`fc4936884584`,
+2026-10-31):
+
+1. **Upstream has NO auth-source API at the pin — §1's out-of-scope bullet
+   re-verified.** The admin group mounts exactly cron/orgs/packages/users/
+   emails/unadopted/hooks/actions (`gitea/routers/api/v1/api.go:1814-1867` —
+   every `m.Get/m.Post/m.Combo/m.Patch/m.Delete` in the group walked); no
+   auths arm. `gitea/routers/api/v1/admin/` holds eleven files (action,
+   adopt, cron, email, hooks, org, packages, repo, runners, user_badge,
+   user) — no auths.go. Both generated swagger documents
+   (`gitea/templates/swagger/v1-swagger.generated.json` and
+   `v1-openapi3.generated.json`) parse to **350 paths each with zero
+   `/admin/auths*` entries**; the only auth-adjacent paths in either are
+   `/user/applications/oauth2` and `/{id}` — the OAuth2 CLIENT-app family
+   §2.3 already distinguishes from login sources. `gitea/modules/structs/`
+   declares no auth-source request/response structs. There are no
+   "upstream's exact bodies" to mirror: the family is pin-silent, and the
+   standing rule ("pin-silent = open question, never invent") applies.
+2. **The loophole is closed at the source: upstream main has never had it
+   either.** `templates/swagger/v1-swagger.generated.json` fetched live from
+   `go-gitea/gitea` main via the GitHub contents API (2026-10-31) parses to
+   the same 350 paths with the same `/admin/*` set and zero auths entries —
+   the auths management surface is web-only in every upstream state, so no
+   newer-than-pin version supplies the missing API shape.
+3. **The web page exists upstream and is exactly what §2.3/§3.3 priced.**
+   `GET|POST /-/admin/auths` + `/{authid}` + `/{authid}/delete` mount at
+   `gitea/routers/web/web.go:874-880` over `routers/web/admin/auths.go` and
+   `templates/admin/auth/` — a CRUD whose store is `login_source`
+   (`models/auth/source.go:109-126`, the seven-value type lattice at
+   :28-37) and whose create/edit forms parse the four typed backend config
+   records (`routers/web/admin/auths.go:116-233`). cf-gitea has none of
+   that substrate by design (SPEC-0002's PAT-only posture; the vestigial
+   `public_keys.login_source_id` always 0) — a page over it would be 100%
+   posture (§3.3 reason 1) and a `login_source` table without the six
+   backends would be config for chains that cannot sign anyone in (§3.3
+   reason 3). The survey's "no admin login-source read family is declared"
+   (`docs/compat/ui-parity-survey.md:724, :1276, :1488`) names this
+   dependency; its remedy is the external-login-chain SPEC §3.3's gate
+   names — not API invention.
+4. **The contract discipline mechanically forbids the invented family.**
+   `scripts/check-openapi.mjs` assertion (a) hard-fails (non-zero exit) any
+   path+method our router declares that the frozen contract copy
+   (`apps/worker/src/compat/contract/v1-swagger.generated.json`, the
+   verbatim-at-pin swagger per ADR-0002) lacks. An
+   `/api/v1/admin/auths` family would therefore fail the repo's own gate by
+   construction, and carrying it as a runtime-only/documented divergence
+   would make it the only upstream-absent family in the API — a reverse
+   divergence with no upstream cite, which the parity rule does not permit.
+
+**Board-row resolution:** the P1-4 row's own text defers to this SPEC —
+"No new decision here: either the verdict stands (zero work; the row stays
+the recorded divergence) or a future login-source SPEC reopens it." The
+verdict stands; nothing in the row overrides a ratified SPEC. The row's
+"needs-API-first" classification remains accurate and unchanged: the page
+is not dispatchable as UI work, and its true prerequisite is the substrate
+SPEC (§3.3's reopen gate), because the API half of an "API-first ladder"
+does not exist upstream to build first.
+
+**Forward note for the reopen** (recorded here so the future SPEC does not
+re-derive it): when the first external-login-chain SPEC lands, the reopened
+arm is the upstream-shape WEB CRUD over the new store (web.go:874-880's
+five arms) — it must NOT be specced as an API-first ladder, because
+upstream's own auths management has no `/api/v1` family at the pin or at
+main (points 1-2); any API family built alongside would itself be an
+invention requiring its own divergence record and contract exception.
+
+**Landing state of §3.3's ledger entry:** the entry rides the surfaces the
+implementing waves touched rather than a standalone `docs/compat/` file —
+this SPEC's §3.3 (the verdict + the gate), the `AdminFamilyNav` omission
+note (`apps/worker/src/ui/pages/admin-users.tsx:371-375`, "the auths
+omission is SPEC-0018 §3.3's verdict", landed with M1's `7381c0d`), the
+SPEC-0018 index row in `specs/README.md` ("the auths arm is the SPEC's
+documented omission verdict (§3.3 — no build)"), and the survey's admin row
++ NEEDS-API-FIRST paragraph (`docs/compat/ui-parity-survey.md:1276`,
+`:1551`). No code, no migration, no nav edit ships with this amendment;
+M1/M2 (`7381c0d`, `9d7ccd6`) remain the SPEC's only build output.
