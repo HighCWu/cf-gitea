@@ -148,6 +148,8 @@ import {
   type RunRow,
   type TaskRow,
 } from "../../services/actions/model";
+import { loadRepoActionsConfig } from "../../services/actions/config";
+import { getFailedJobsForRerun, rerunWorkflowRunJobs } from "../../services/actions/rerun";
 import { getTaskStepsByTaskId, readTaskLogs, type TaskStepRow } from "../../services/actions/update";
 import { avatarLinkWithSize, defaultAvatarLink, type AvatarChainUser } from "../../services/avatars";
 import { BaseLayout, renderPage } from "../shell";
@@ -167,6 +169,10 @@ export const repoActionsViewLocale = {
   rerun: "Re-run", // "rerun"
   rerunAll: "Re-run all jobs", // "rerun_all"
   rerunFailed: "Re-run failed jobs", // "rerun_failed"
+  runNotDone: "This workflow run is not done.", // "actions.runs.not_done"
+  noFailedJobs: "This workflow run has no failed jobs to re-run.", // "actions.runs.no_failed_jobs"
+  noJob: "The workflow must contain at least one job", // "actions.runs.no_job"
+  workflowDisabled: "Workflow is disabled.", // "actions.workflow.disabled"
   latest: "Latest", // "actions.runs.latest"
   latestAttempt: "Latest attempt", // "actions.runs.latest_attempt"
   attempt: "Attempt", // "actions.runs.attempt"
@@ -1860,17 +1866,25 @@ export async function cancelActionRun(
   return { outcome: "cancelled", cancelledJobs };
 }
 
-/** refreshRunStatus + SettleRunAfterCancel (run_job.go:567-600 + 796-801):
- *  recompute the attempt's aggregate from its jobs, mirror it onto the run
- *  (the latest attempt propagates; the started/stopped mirrors follow
+/** refreshRunStatus + SettleRunAfterCancel (run_job.go:552-571 + 793-801):
+ *  recompute the attempt's aggregate from ITS attempt's jobs, mirror it onto
+ *  the run (the latest attempt propagates; the started/stopped mirrors follow
  *  UpdateRunAttempt's rules). A settle that finds no jobs carries the
- *  cancelled noJobsStatus — SettleRunAfterCancel's arm. */
+ *  cancelled noJobsStatus — SettleRunAfterCancel's arm. The job load is
+ *  attempt-scoped (run_job.go:560's GetRunJobsByRunAndAttemptID) — the
+ *  runId-scope read this port replaced held only while every run carried
+ *  exactly one attempt (the rerun landing's fix; the update.ts twin carries
+ *  the same fix on the service side). */
 export async function settleRunAfterCancel(d1: D1, run: RunRow, now: Date = new Date()): Promise<void> {
   const db = drizzle(d1);
-  const jobs = await db
-    .select({ status: actionRunJobs.status, continueOnError: actionRunJobs.continueOnError })
-    .from(actionRunJobs)
-    .where(eq(actionRunJobs.runId, run.id));
+  const jobCols = { status: actionRunJobs.status, continueOnError: actionRunJobs.continueOnError };
+  const jobs =
+    run.latestAttemptId > 0
+      ? await db
+          .select(jobCols)
+          .from(actionRunJobs)
+          .where(and(eq(actionRunJobs.runId, run.id), eq(actionRunJobs.runAttemptId, run.latestAttemptId)))
+      : await db.select(jobCols).from(actionRunJobs).where(eq(actionRunJobs.runId, run.id)); // the legacy fallback, run_job.go:574-601
 
   if (run.latestAttemptId > 0) {
     const attemptRows = await db
@@ -1914,6 +1928,108 @@ export async function settleRunAfterCancel(d1: D1, run: RunRow, now: Date = new 
     if (stopped === null && isDoneStatusValue(runStatus)) stopped = now;
   }
   await db.update(actionRuns).set({ status: runStatus, started, stopped, updated: now }).where(eq(actionRuns.id, storedRun.id));
+}
+
+// ---------------------------------------------------------------------------
+// The rerun arm (the census C5 remainder — POST runs/{run}/rerun,
+// rerun-failed, jobs/{job}/rerun — actions.Rerun / RerunFailed, view.go:952-1016
+// + web.go:1588, 1597-1598; the mutation itself is services/actions/rerun.ts's
+// RerunWorkflowRunJobs port)
+// ---------------------------------------------------------------------------
+
+/** The three rerun POSTs (web.go:1588 job-level, :1597-1598 run-level). */
+export type RerunActionRunRequest =
+  | { kind: "run" } // POST /runs/{run}/rerun — all jobs (the empty set expands, rerun.go:403-412)
+  | { kind: "run-failed" } // POST /runs/{run}/rerun-failed — failed + cancelled only
+  | { kind: "job"; jobId: number }; // POST /runs/{run}/jobs/{job}/rerun — the one job (+ downstream)
+
+/** The handler-shaped outcome: the exact upstream web JSON bodies
+ *  (JSONRedirect/JSONError — context.go:239-241, 276-278 — and
+ *  handleWorkflowRerunError's {"message"} pair, view.go:1018-1028), the
+ *  job-level 404 shell (view.go:970-974), or a throw for the ServerError
+ *  arms (the resolveRunAttemptAndJobs convention). */
+export type RerunActionRunResponse =
+  | { kind: "json"; status: number; body: Record<string, unknown> }
+  | { kind: "not-found" };
+
+/**
+ * actions.Rerun / actions.RerunFailed (view.go:952-1016): the latest-attempt
+ * check (checkLatestAttempt, view.go:944-950), the done + workflow-disabled
+ * pre-checks (checkRunRerunAllowed, view.go:919-942 — the JSONError shapes),
+ * the no-job / no-failed-jobs guards (view.go:965-968, 1002-1008), then the
+ * service call with the mode's job set. Success answers
+ * ctx.JSONRedirect(run.Link()) — {"redirect": "/{owner}/{repo}/actions/runs/{id}"}
+ * (run.Link(), run.go:95-98).
+ */
+export async function rerunActionRun(
+  d1: D1,
+  repo: Pick<RepoRow, "ownerNamespace" | "slug">,
+  run: RunRow,
+  attempt: RunAttemptRow | null,
+  jobs: RunJobRow[],
+  triggerUserId: number,
+  request: RerunActionRunRequest,
+): Promise<RerunActionRunResponse> {
+  // checkLatestAttempt (view.go:944-950): only the run's latest attempt
+  // reruns — a historical attempt URL answers the 404 shell.
+  if (attempt !== null && run.latestAttemptId !== attempt.id) {
+    return { kind: "not-found" };
+  }
+
+  // checkRunRerunAllowed (view.go:919-942) — the JSONError shapes
+  // (context.go:276-278's {"errorMessage", "renderFormat": "text"}). The
+  // scoped-run twin (IsScopedWorkflowOptedOut, view.go:929-936) has no v1
+  // rows (the isScopedRun parity column is unread, SPEC §1.4).
+  if (!isDoneStatusValue(run.status)) {
+    return { kind: "json", status: 400, body: { errorMessage: repoActionsViewLocale.runNotDone, renderFormat: "text" } };
+  }
+  const cfg = await loadRepoActionsConfig(d1, run.repoId);
+  if (cfg.disabledWorkflows.includes(run.workflowId)) {
+    return { kind: "json", status: 400, body: { errorMessage: repoActionsViewLocale.workflowDisabled, renderFormat: "text" } };
+  }
+
+  let jobsToRerun: RunJobRow[];
+  if (request.kind === "run") {
+    if (jobs.length === 0) {
+      // view.go:965-968 — "actions.runs.no_job".
+      return { kind: "json", status: 400, body: { errorMessage: repoActionsViewLocale.noJob, renderFormat: "text" } };
+    }
+    jobsToRerun = []; // the whole run (rerun.go:39's empty-set meaning)
+  } else if (request.kind === "run-failed") {
+    // view.go:1002-1008 — the direct POST on a fully successful run cannot
+    // re-run everything, so the empty failed set is an error, not a rerun-all.
+    const failedJobs = getFailedJobsForRerun(jobs);
+    if (failedJobs.length === 0) {
+      return { kind: "json", status: 400, body: { errorMessage: repoActionsViewLocale.noFailedJobs, renderFormat: "text" } };
+    }
+    jobsToRerun = failedJobs;
+  } else {
+    // view.go:970-974 — findCurrentJobByPathParam's NotFound arm.
+    const currentJob = jobs.find((job) => job.id === request.jobId);
+    if (currentJob === undefined) return { kind: "not-found" };
+    jobsToRerun = [currentJob];
+  }
+
+  const result = await rerunWorkflowRunJobs(d1, run.repoId, run, triggerUserId, jobsToRerun);
+  if (result.ok) {
+    // ctx.JSONRedirect(run.Link()) — context.go:239-241.
+    const runLink = `/${repo.ownerNamespace}/${repo.slug}/actions/runs/${run.id}`;
+    return { kind: "json", status: 200, body: { redirect: runLink } };
+  }
+  // handleWorkflowRerunError (view.go:1018-1028): AlreadyExist → 409,
+  // InvalidArgument → 400 — both as bare {"message"} (the frontend's
+  // generic `Error {status}` toast arm reads this shape's absence of
+  // errorMessage); the NotExist plan arms (latest-attempt-missing,
+  // no-template-jobs) are ServerError upstream → the throw.
+  switch (result.reason) {
+    case "attempt-already-exists":
+      return { kind: "json", status: 409, body: { message: result.message } };
+    case "latest-attempt-missing":
+    case "no-template-jobs":
+      throw new Error(`actions: rerun plan for run ${run.id}: ${result.message}`);
+    default:
+      return { kind: "json", status: 400, body: { message: result.message } };
+  }
 }
 
 /** AggregateJobStatus (run_job.go:642-687) minus the fail-fast matrix arm
