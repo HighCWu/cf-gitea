@@ -46,11 +46,20 @@ export function registerUserRoute(
     // The self view renders the follower/following counts (upstream renders
     // the raw NumFollowers/NumFollowing columns here too — the same seam as
     // GET /users/{username}): re-read the row and render through the async
-    // twin; the middleware's sync render stays for every other route. A
-    // missing row (should not happen — the token resolved it) degrades to
-    // the middleware's render rather than failing the identity endpoint.
-    const row = rendered.login === undefined ? null : await findUserByName(c.env.DB, rendered.login);
-    if (row === null) return c.json(rendered, 200);
-    return c.json(await toApiUserWithCounts(c.env.DB, viewerOf(c), row), 200);
+    // twin; the middleware's sync render stays for every other route. The
+    // whole seam is best-effort — a standalone stub-resolver usage (no D1
+    // binding) or a lookup miss degrades to the middleware's render rather
+    // than failing the identity endpoint (the CI red at 40120ae: api.test's
+    // bare OpenAPIHono has NO env at all).
+    try {
+      const row = rendered.login === undefined ? null : await findUserByName(c.env.DB, rendered.login);
+      if (row !== null) {
+        return c.json(await toApiUserWithCounts(c.env.DB, viewerOf(c), row), 200);
+      }
+    } catch {
+      // no binding / lookup failure — the counts are a mounted-deployment
+      // feature; the sync render answers.
+    }
+    return c.json(rendered, 200);
   });
 }
