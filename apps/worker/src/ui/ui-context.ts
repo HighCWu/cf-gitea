@@ -79,6 +79,19 @@ export interface UiContext {
    *  polarity). Absent/false = the tab renders nothing and the route
    *  404-shells (the store default — the unit starts disabled). */
   repoHasActions?: boolean;
+  /** The repo's Wiki unit toggle (the v1.3.2 residuals P2-4 — `repo_settings.
+   *  has_wiki`, the repoHasActions twin for the wiki tab/route;
+   *  repo/header.tmpl:165 gates the tab on CanRead(TypeWiki), our landed
+   *  reduction carries the unit flag from the SAME loadRepoSettings read).
+   *  The shell's Wiki tab reads it and the `/wiki` prologue already 404-shells
+   *  on the store flag (ui/index.ts wikiPrologue — MustEnableWiki,
+   *  web.go:1614). Polarity note vs the trio above: the wiki unit ships
+   *  ENABLED by default (upstream unit.DefaultRepoUnits carries TypeWiki —
+   *  models/unit/unit.go:68-77; our store default has_wiki=1), so ABSENT
+   *  renders the tab — the not-loaded/pre-wiring window keeps the strip's
+   *  upstream-default posture and the goldens byte-identical; only an
+   *  explicit `false` (the loaded disabled state) hides it. */
+  repoHasWiki?: boolean;
   /** The global PACKAGES_ENABLED gate (SPEC-0016 M2 — the strict-polarity
    *  var; absent/true = enabled, only the exact "false" disables — the
    *  DEMO_MODE discipline). Gates the R04 tab anchors (the profile's

@@ -256,11 +256,16 @@ export function Navbar(props: { viewer: Viewer; activeNav?: "explore"; notificat
  *  repo-scoped render for a label most repos never show (pages/releases.tsx
  *  header) — the releases PAGES render the real count in their header
  *  menu. The wiki tab (header.tmpl:162-166, between Releases and Activity)
- *  is the ratified divergence: upstream gates it on the wiki unit read
- *  permission; ours renders UNCONDITIONALLY (the wiki pages family is
- *  landed and serving; the route-level hasWiki 404 shell stays in the
- *  family's own prologue — ui/index.ts wikiPrologue's MustEnableWiki arm),
- *  so a settings-disabled wiki shows the tab over its 404 shell. The admin
+ *  is unit-gated like its strip neighbors (header.tmpl:165's
+ *  `.Permission.CanRead ctx.Consts.RepoUnitTypeWiki`): the loaded
+ *  `repoHasWiki` toggle (`repo_settings.has_wiki` — the repoHasActions
+ *  twin) hides it when the settings-disabled wiki routes 404-shell anyway
+ *  (the family's own prologue — ui/index.ts wikiPrologue's MustEnableWiki
+ *  arm, web.go:1614); ABSENT (not loaded, or the pre-wiring window before
+ *  the index.ts ctx ride lands) RENDERS — the wiki unit ships enabled
+ *  (upstream unit.DefaultRepoUnits, models/unit/unit.go:68-77; the store
+ *  default has_wiki=1), so the strip's default stays upstream-faithful and
+ *  the divergence narrows to the loaded-false window only. The admin
  *  Settings tab (header.tmpl:186-190) joins as "settings" — the strip's last
  *  item behind the `item-flex-space` spacer, armed for the static admin
  *  arms; the settings PAGES go active through BaseLayout's pageClass
@@ -634,14 +639,23 @@ export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
                 family, pages/repo-wiki.tsx, unlocks it; upstream's exact
                 shape: octicon-book, the g w shortcut, active on PageIsWiki
                 which the family's five renders carry as activeTab="wiki").
-                Rendered UNCONDITIONALLY — the ratified divergence (RepoTab
-                note): upstream's CanRead(TypeWiki) unit gate reduces to
-                "wiki enabled" only through the unit table this shell does
-                not carry; the family's route-level hasWiki 404 shell keeps
-                the disabled-wiki posture honest. */}
-            <a class={activeTab === "wiki" ? "active item" : "item"} href={`${repoLink}/wiki`} data-shortcut-keys="g w">
-              <Icon name="octicon-book" /> {tabLocale.repo_wiki}
-            </a>
+                Unit-gated (header.tmpl:165's CanRead(TypeWiki)) through the
+                ctx repoHasWiki toggle — the repoHasActions twin, same
+                loadRepoSettings read upstream's gate rides
+                (models/perm/access/repo_permission.go:134-136 CanRead → the
+                repo_unit row). Polarity: `!== false` — ABSENT renders (the
+                not-loaded/pre-wiring window keeps the strip's
+                upstream-default posture: unit.DefaultRepoUnits ships wiki,
+                models/unit/unit.go:68-77, and the store default is
+                has_wiki=1); explicit false = the loaded disabled state,
+                whose routes the wikiPrologue 404-shells anyway (MustEnableWiki,
+                web.go:1614) — the disabled-wiki strip stops advertising the
+                dead tab. */}
+            {props.ctx.repoHasWiki !== false ? (
+              <a class={activeTab === "wiki" ? "active item" : "item"} href={`${repoLink}/wiki`} data-shortcut-keys="g w">
+                <Icon name="octicon-book" /> {tabLocale.repo_wiki}
+              </a>
+            ) : null}
             {/* header.tmpl:177-181 — the activity/pulse tab (the R14 activity
                 page unlocks it, pages/repo-activity.tsx). Upstream gates it on
                 CanReadAny(PullRequests, Issues, Releases, Code) ∧

@@ -337,9 +337,12 @@ describe("RepoHeader tab strip", () => {
     // the dead-tab 404 this test previously refused to render.
     expect(strip).toContain('<a class="item" href="/octocat/hello/releases" data-shortcut-keys="g r">');
     // The wiki tab (header.tmpl:162-166's shape): upstream's g w shortcut
-    // and octicon-book glyph, rendered unconditionally (the ratified
-    // divergence — shell.tsx's RepoTab note; the disabled-wiki posture is
-    // the family's route-level hasWiki 404 shell).
+    // and octicon-book glyph, rendered on the DEFAULT posture — repoCtx
+    // carries no repoHasWiki (absent = not loaded) and the wiki unit ships
+    // enabled (unit.DefaultRepoUnits, models/unit/unit.go:68-77; the store
+    // default has_wiki=1), so absent renders (the `!== false` polarity —
+    // shell.tsx's RepoTab note). The explicit-false hide arm is the
+    // dedicated gate test below.
     expect(strip).toContain('<a class="item" href="/octocat/hello/wiki" data-shortcut-keys="g w">');
     // The activity/pulse tab (header.tmpl:177's shape) — unlocked by the
     // landed /activity page family, no data-shortcut-keys (upstream arms
@@ -468,6 +471,25 @@ describe("RepoHeader tab strip", () => {
     expect(stripOnActivity).toContain('<a class="active item" href="/octocat/hello/activity">');
     expect(stripOnActivity).toContain('<a class="item" href="/octocat/hello/commits">');
     expect(stripOnActivity).not.toContain('<a class="active item" href="/octocat/hello/commits">');
+  });
+
+  it("gates the wiki tab on the loaded repoHasWiki unit toggle (header.tmpl:165's CanRead(TypeWiki))", () => {
+    // The v1.3.2 residuals P2-4 gate: the strip renders the tab with the
+    // ctx flag ABSENT (the not-loaded/pre-wiring window — repoCtx above)
+    // or EXPLICITLY true, and hides it on the loaded `false` — the state
+    // whose /wiki routes the wikiPrologue 404-shells anyway (MustEnableWiki,
+    // web.go:1614), so the disabled-wiki strip stops advertising the dead
+    // tab. Upstream arms the same condition at header.tmpl:165.
+    const stripAbsent = tabStrip(page({ ctx: repoCtx }));
+    expect(stripAbsent).toContain('href="/octocat/hello/wiki"');
+    const stripEnabled = tabStrip(page({ ctx: { ...repoCtx, repoHasWiki: true } }));
+    expect(stripEnabled).toContain('<a class="item" href="/octocat/hello/wiki" data-shortcut-keys="g w">');
+    const stripDisabled = tabStrip(page({ ctx: { ...repoCtx, repoHasWiki: false } }));
+    expect(stripDisabled).not.toContain('href="/octocat/hello/wiki"');
+    expect(stripDisabled).not.toContain("octicon-book");
+    // The hidden tab does not disturb the strip's other members (the count
+    // folds from 7 to 6 — the sibling toggles' shared shape).
+    expect(stripDisabled.match(/<a class="(?:active )?item"/g)).toHaveLength(6);
   });
 
   it("shows the open-issue/pull count labels from the D1 counters (upstream NumOpenIssues shape)", () => {
