@@ -23,12 +23,14 @@ import { resolveTagTarget, writeTagRef, type TagCreator } from "./tags";
  * model: the filtered list/latest reads, the edit patch, the delete, and the
  * wire converter.
  *
- * Engine boundary (UPDATED by the findings-links N2 fix): the CREATE path now
- * also lands the GIT TAG for a fresh `tag_name` through the shared tag-store
- * service (services/tags.ts — the tag-creation API's mechanism), matching
- * upstream services/release/release.go createTag; `sha1` stays null and the
- * EDIT/DELETE paths remain D1-only (upstream's UpdateRelease tag arm and
- * DeleteReleaseByID's delTag stay open engine-wave items).
+ * Engine boundary (UPDATED by the findings-links N2 fix + its kept-open
+ * tail, this change): the CREATE path also lands the GIT TAG for a fresh
+ * `tag_name` through the shared tag-store service (services/tags.ts — the
+ * tag-creation API's mechanism) and FILLS the row's `sha1`/`num_commits`/
+ * `created_unix` from the tagged commit (upstream createTag's post-write
+ * fill, release.go:148-158); the EDIT/DELETE paths remain D1-only (upstream's
+ * UpdateRelease tag arm and DeleteReleaseByID's delTag stay open engine-wave
+ * items — the publish-time fill rides that same open arm).
  *
  * Upstream citations (submodule pin fc4936884584):
  *  - list: `routers/api/v1/repo/release.go ListReleases` — FindReleases
@@ -253,6 +255,9 @@ export interface CreateReleaseWithGitTagInput {
 }
 
 export interface CreateReleaseWithGitTagResult {
+  /** The release row — for a published release, already carrying the
+   *  upstream createTag fill (sha1/num_commits/created_unix = the tagged
+   *  commit's); drafts return the bare writer row. */
   row: ReleaseRow;
   /** True when THIS call created the git tag (upstream createTag's `created`
    *  — drives the ref-webhook pair; an existing tag rides silently). */
@@ -260,6 +265,32 @@ export interface CreateReleaseWithGitTagResult {
   /** The new ref's tip — the TAG OBJECT oid when annotated — the create
    *  payload's `sha`. Defined only when tagCreated. */
   tagTip?: string;
+}
+
+/**
+ * `git.CommitsCountOfCommit` (release.go:155 `CommitsCount`) — commits
+ * reachable from the tagged commit. The engine has no count RPC; the answer
+ * is the paged unfiltered listLog walk (the wiki countCommitsForPath
+ * precedent, services/wiki.ts) capped at the engine's own unfiltered walk
+ * budget (MAX_LOG_SCAN = 5000, packages/git-engine src/repo.ts) — past the
+ * cap the count pins there, the same honest-partial posture as the commits
+ * route's X-Total-Count approximation. A null page is a transport-class
+ * failure on a commit known to exist → the upstream abort (below).
+ */
+async function countCommitsAt(reads: ReturnType<typeof engineReads>, tip: string): Promise<number> {
+  const ENGINE_LOG_SCAN = 5000; // MAX_LOG_SCAN, packages/git-engine src/repo.ts:121
+  let count = 0;
+  let ofs = 0;
+  while (ofs <= ENGINE_LOG_SCAN) {
+    const page = await reads.listLog(tip, { ofs, n: 100 });
+    if (page === null) {
+      throw new Error(`CommitsCount: log walk unreadable [sha1: ${tip}]`);
+    }
+    count += page.commits.length;
+    if (!page.more) break;
+    ofs += page.commits.length;
+  }
+  return count;
 }
 
 /**
@@ -281,17 +312,42 @@ export interface CreateReleaseWithGitTagResult {
  *      (release.go:104-113 GetCommit + the handler's git.IsErrNotExist
  *      answer, release.go:283-284); `tag_message` → annotated tag
  *      (release.go:110-121);
- *   4. the row rides the landed SPEC-0005 writer (IssuesService.createRelease
- *      — the 409 race fallback + the tag-record conversion, unchanged).
+ *   4. the post-write fill (createTag release.go:148-158 — this change):
+ *      for EVERY resolved tag (fresh-created, ridden existing, and the §2.3
+ *      D1-only conversions alike — upstream's fill sits inside the
+ *      `!IsDraft` block after the tag arm) the tagged commit is read
+ *      (engineReads.readCommit — peels an annotated tag's object oid to its
+ *      commit, GetTagCommit's dereference) and the row's `sha1` =
+ *      commit oid, `num_commits` = reachable-commit count
+ *      (CommitsCountOfCommit), `created_unix` = the COMMIT's committer time
+ *      — "dated by its commit, so an old commit does not become the latest
+ *      release" (release.go:154). The reads run BEFORE the row write, in
+ *      upstream's order (createTag fills, THEN CreateRelease inserts,
+ *      release.go:183-189): a failed fill aborts with no row, exactly
+ *      upstream's GetTagCommit/CommitsCount error path. The write itself is
+ *      the one residual of the shared-writer boundary (IssuesService owns
+ *      the INSERT): the precomputed fill lands as an UPDATE returning the
+ *      row, so the caller's row already carries it (the route renders
+ *      toApiRelease + the release webhook from it — `created_at` becomes
+ *      the commit time, upstream ToAPIRelease's `CreatedAt:
+ *      r.CreatedUnix.AsTime()`).
+ *   5. the row write rides the landed SPEC-0005 writer
+ *      (IssuesService.createRelease — the 409 race fallback + the
+ *      tag-record conversion, unchanged).
+ *
+ * Draft posture (release.go:166-168's else arm): NO tag, NO fill —
+ * `created_unix` stays the row time, `sha1` null, `num_commits` 0. The
+ * publish-time fill is upstream's UpdateRelease → createTag re-run
+ * (release.go:269 — every edit re-runs createTag, whose fill then applies);
+ * that arm belongs to the still-open UpdateRelease tag wave and is NOT
+ * filled here (filling a commit a D1-only publish never tagged would point
+ * sha1 at a ref that does not exist).
  *
  * NOT replicated: createTag's MustNotBeArchived arm (release.go:74-77) —
  * upstream's release handler maps none of its outcomes (an archived-repo
  * release create dies as an internal 500 there), and the landed release
  * surface deliberately registers no mustNotBeArchived (the pinned 201 on
- * archived repos); the tag is created. Also kept: `sha1`/`NumCommits` stay
- * unwritten (release.go:150-157 fills them from the tagged commit — the
- * engine-wave tail), and the tag is dated by the row, not the commit
- * (release.go:154's CreatedUnix = commit time).
+ * archived repos); the tag is created.
  */
 export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInput): Promise<CreateReleaseWithGitTagResult> {
   const { pair } = input;
@@ -308,9 +364,13 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
 
   let tagCreated = false;
   let tagTip: string | undefined;
+  // The tagged COMMIT's oid — the fill's read target. Undefined = draft (no
+  // tag, no fill).
+  let taggedCommitSha: string | undefined;
   if (!input.isDraft) {
     const tips = refTipMap(await engineReads(input.env, pair.repo).listRefs());
-    if (!tips.has(tagRef(input.tagName))) {
+    const existingTip = tips.get(tagRef(input.tagName));
+    if (existingTip === undefined) {
       if (!(await isTagControlAllowed(input.d1, await listProtectedTags(input.d1, repoId), input.tagName, input.doer?.id ?? 0))) {
         throw new ApiError(422, `release tag name is protected [tag_name: ${input.tagName}]`);
       }
@@ -333,7 +393,30 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
       }
       tagCreated = true;
       tagTip = written.refTip;
+      taggedCommitSha = written.commitSha; // already the peeled commit (resolveTagTarget)
+    } else {
+      // The ride arm: the ref's tip peeled to its commit — an annotated tag
+      // carries the engine's peel cache (`peeled`), a lightweight tag's
+      // target IS the commit (GetTagCommit's dereference, release.go:148).
+      taggedCommitSha = existingTip.peeled ?? existingTip.target;
     }
+  }
+
+  // The pre-write fill reads, upstream's order (createTag's fill precedes
+  // CreateRelease's insert — release.go:148-158 then :189): a read failure
+  // aborts with NO row, exactly the upstream GetTagCommit/CommitsCount 500.
+  let fill: { sha1: string; numCommits: number; createdAt: Date } | undefined;
+  if (taggedCommitSha !== undefined) {
+    const reads = engineReads(input.env, pair.repo);
+    const commit = await reads.readCommit(taggedCommitSha);
+    if (commit === null) {
+      throw new Error(`GetTagCommit: the tagged commit is unreadable [sha1: ${taggedCommitSha}]`);
+    }
+    fill = {
+      sha1: commit.oid,
+      numCommits: await countCommitsAt(reads, commit.oid),
+      createdAt: new Date(commit.committer.time * 1000), // release.go:154: dated by its commit
+    };
   }
 
   const target =
@@ -348,7 +431,19 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
     isDraft: input.isDraft,
     isPrerelease: input.isPrerelease,
   });
-  return { row, tagCreated, tagTip };
+
+  if (fill === undefined) {
+    return { row, tagCreated, tagTip };
+  }
+  // The fill write (the shared-writer residual — see step 4 above): the
+  // returned row already carries sha1/num_commits/created_unix for the
+  // route's render + release webhook.
+  const filled = await drizzle(input.d1)
+    .update(releases)
+    .set({ sha1: fill.sha1, numCommits: fill.numCommits, createdAt: fill.createdAt })
+    .where(eq(releases.id, row.id))
+    .returning();
+  return { row: filled[0] ?? row, tagCreated, tagTip };
 }
 
 export interface EditReleasePatch {

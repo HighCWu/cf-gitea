@@ -28,6 +28,14 @@
  * the default branch, a draft creates NO tag (createTag's !IsDraft gate),
  * `tag_message` creates the ANNOTATED tag object, and the release-specific
  * protected-tag 422 message.
+ *
+ * The kept-open tail (this change) — createTag's post-write fill
+ * (release.go:148-158): a published release's row carries sha1 = the tagged
+ * commit (annotated tags peel), num_commits = the commit depth at it,
+ * created_unix = the COMMIT's committer time (rendered straight through the
+ * API's created_at); the ride-existing and §2.3 conversion arms fill alike,
+ * and the draft arm stays unfilled (sha1 null, num_commits 0, created = the
+ * row time) until publish.
  */
 
 import { env } from "cloudflare:workers";
@@ -412,6 +420,99 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
     const tag = await one.json<{ id: string; commit: { sha: string } }>();
     expect(tag.commit.sha).toBe(MAIN_TIP); // peeled to the target commit
     expect(tag.id).not.toBe(MAIN_TIP); // the ref target is the TAG OBJECT
+  });
+
+  // -----------------------------------------------------------------------
+  // The kept-open tail — createTag's post-write fill (release.go:148-158):
+  // for EVERY resolved tag (fresh, ridden, §2.3 conversion) the row's
+  // sha1 = the tagged commit, num_commits = the commit depth at it, and
+  // created_unix = the COMMIT's committer time (dated by its commit, "so an
+  // old commit does not become the latest release", release.go:154). The
+  // seed's two commits both carry committer time 1761000000 (beforeAll's
+  // person), main's depth at its tip is 2 and at ride-tag's root 1.
+  // -----------------------------------------------------------------------
+
+  async function releaseRow(tag: string): Promise<typeof releases.$inferSelect> {
+    const row = await drizzle(env.DB).select().from(releases).where(eq(releases.tagName, tag)).get();
+    if (row === undefined) throw new Error(`release row missing: ${tag}`);
+    return row;
+  }
+
+  const SEED_COMMIT_ISO = new Date(1761000000 * 1000).toISOString(); // the seed commits' committer time
+
+  it("fills sha1/num_commits/created from the tagged commit (created arm, release.go:148-158)", async () => {
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "fill-main", name: "Fill", target_commitish: "main" }),
+    });
+    expect(res.status).toBe(201);
+    const row = await releaseRow("fill-main");
+    expect(row.sha1).toBe(MAIN_TIP); // the tagged commit (the light tag's tip)
+    expect(row.numCommits).toBe(2); // the branch depth at the tag (root + second)
+    expect(row.createdAt?.toISOString()).toBe(SEED_COMMIT_ISO); // the COMMIT time, not the row time
+    // The API response renders the fill (ToAPIRelease CreatedAt ← CreatedUnix).
+    expect((await res.json<Record<string, unknown>>()).created_at).toBe(SEED_COMMIT_ISO);
+  });
+
+  it("peels an annotated tag's fill to its commit (sha1 ≠ the tag object oid)", async () => {
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "fill-annotated", tag_message: "annotated" }),
+    });
+    expect(res.status).toBe(201);
+    const row = await releaseRow("fill-annotated");
+    expect(row.sha1).toBe(MAIN_TIP); // the COMMIT, not the tag object (GetTagCommit's dereference)
+    expect(row.numCommits).toBe(2);
+    expect(row.createdAt?.toISOString()).toBe(SEED_COMMIT_ISO);
+  });
+
+  it("fills the ride-existing arm too (the fill sits after createTag's tag arm)", async () => {
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "ride-tag", name: "Rides" }),
+    });
+    expect(res.status).toBe(201);
+    const row = await releaseRow("ride-tag");
+    expect(row.sha1).toBe(RIDE_TAG_TIP); // the pre-existing tag's commit (root)
+    expect(row.numCommits).toBe(1); // depth AT the root: one commit
+    expect(row.createdAt?.toISOString()).toBe(SEED_COMMIT_ISO);
+  });
+
+  it("converts a tag-only record WITH the fill (§2.3 + release.go:148-158)", async () => {
+    const tagOnlyId = await seedRelease({ tag: "fill-conv", isTag: true, minutesOffset: 0 });
+    const before = await releaseRow("fill-conv");
+    expect(before.createdAt?.toISOString()).toBe("2026-03-01T00:00:00.000Z"); // the tag record's own time, pre-conversion
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "fill-conv", name: "Converted" }),
+    });
+    expect(res.status).toBe(201);
+    expect((await res.json<Record<string, unknown>>()).id).toBe(tagOnlyId);
+    const row = await releaseRow("fill-conv");
+    expect(row.sha1).toBe(MAIN_TIP);
+    expect(row.numCommits).toBe(2);
+    expect(row.createdAt?.toISOString()).toBe(SEED_COMMIT_ISO); // the fill OVERWRITES the record's creation time
+  });
+
+  it("leaves the draft arm unfilled until publish (createTag's else arm, release.go:166-168)", async () => {
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "fill-draft", draft: true }),
+    });
+    expect(res.status).toBe(201);
+    const row = await releaseRow("fill-draft");
+    expect(row.sha1).toBeNull();
+    expect(row.numCommits).toBe(0);
+    expect(row.createdAt?.toISOString()).not.toBe(SEED_COMMIT_ISO); // the ROW time (2026), not the commit's
+    expect(row.createdAt?.getTime()).toBeGreaterThan(Date.parse("2026-01-01T00:00:00Z"));
+    // No git tag exists to fill FROM (the publish-time fill rides the still-open
+    // UpdateRelease tag arm — see services/releases.ts's draft-posture note).
+    expect((await makeApp()(`${REPO_PATH}/tags/fill-draft`)).status).toBe(404);
   });
 
   it("422s the release-specific protected-tag message on a fresh protected tag (release.go:281)", async () => {
