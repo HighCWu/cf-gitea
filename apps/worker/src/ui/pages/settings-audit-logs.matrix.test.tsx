@@ -612,9 +612,13 @@ describe("the repo audit page DOM (repo/settings/audit_logs.tmpl × shared/audit
       await seedEvent({ timestamp: new Date(TS0.getTime() + i * 1000) });
     }
     const plain = await renderRepo();
-    // No explicit ?sort → no arrow glyph (util_misc.go:31-33).
-    expect(plain).not.toContain("octicon-triangle-up");
-    expect(plain).not.toContain("octicon-triangle-down");
+    // No explicit ?sort → no arrow glyph in the TABLE HEADER (util_misc.go:
+    // 31-33) — scoped because the page HEADER's Watch dropdown now carries
+    // its own triangle-down caret (the B-4 trio), which the whole-page
+    // negative would wrongly trip on.
+    const plainHead = plain.slice(plain.indexOf("<thead>"), plain.indexOf("</thead>"));
+    expect(plainHead).not.toContain("octicon-triangle-up");
+    expect(plainHead).not.toContain("octicon-triangle-down");
     expect(plain).toContain('href="/alice/atlas/settings/audit_logs?sort=timestamp_asc">');
     const asc = await renderRepo(new URLSearchParams({ sort: "timestamp_asc" }));
     expect(asc).toContain("octicon-triangle-up");
