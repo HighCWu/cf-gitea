@@ -436,7 +436,17 @@ export async function scanTwineForm(input: ScanTwineFormInput): Promise<ScannedT
           throw new PypiFormError("part headers exceed the scan cap");
         }
       }
-      const headerText = new TextDecoder("latin1").decode(buf.subarray(headersStart - base, headerEnd));
+      // Header values decode as UTF-8, matching Go's mime/multipart:
+      // net/textproto builds the part's MIMEHeader from the RAW header bytes
+      // (string(raw) — no charset transform), so fileHeader.Filename ends up
+      // the client's UTF-8 string unchanged (upstream FormFile at
+      // pypi.go:105 → net/http Request.FormFile → ReadForm). RFC 7578 has no
+      // charset parameter in practice — twine/curl send UTF-8 (the de facto
+      // convention); a latin1 decode here would store mojibake (ü's 0xC3 0xBC
+      // as "Ã¼") and the file would never resolve by its sent name. Invalid
+      // sequences replace as U+FFFD — the stand-in for the upstream DB's
+      // utf8mb4 coercion of bytes that are not valid UTF-8.
+      const headerText = new TextDecoder("utf-8").decode(buf.subarray(headersStart - base, headerEnd));
       const disposition = parseContentDisposition(headerText);
       fieldName = disposition.name;
       filePart = disposition.filename !== null;

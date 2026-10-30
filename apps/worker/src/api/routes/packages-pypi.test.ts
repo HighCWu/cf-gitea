@@ -21,7 +21,7 @@ import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
-import { packageVersions, users } from "../../db/schema";
+import { packageFiles, packageVersions, users } from "../../db/schema";
 import { createEcosystemProtocolRouter } from "./packages-protocols";
 import { mintFor } from "../../auth/testing/seeds";
 
@@ -210,6 +210,37 @@ describe("pypi upload → simple index → download", () => {
     expect(JSON.parse(metadata)).toMatchObject({ summary: "a tool", requires_python: ">=3.8" });
   });
 
+  it("mounts the D-6 ServeContent set on the file download (headers + the 304 arm)", async () => {
+    const owner = await seedUser("alice");
+    const writer = await token(owner, "write:package");
+    const put = await twineUpload(
+      "alice",
+      { name: "mytool", version: "1.0.0" },
+      { filename: "mytool-1.0.0.tar.gz", content: WHEEL_BYTES },
+      authHeaders(writer),
+    );
+    expect(put.status).toBe(201);
+    await put.text();
+
+    const get = await protocol()("/api/packages/alice/pypi/files/mytool/1.0.0/mytool-1.0.0.tar.gz");
+    expect(get.status).toBe(200);
+    expect(get.headers.get("content-disposition")).toBe("attachment; filename=mytool-1.0.0.tar.gz");
+    expect(get.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
+    expect(get.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(get.headers.get("content-security-policy")).toBe(
+      "sandbox allow-scripts allow-modals allow-popups allow-downloads",
+    );
+    expect(get.headers.get("access-control-expose-headers")).toBe("Content-Disposition");
+    expect(get.headers.get("accept-ranges")).toBe("bytes");
+    await get.arrayBuffer();
+
+    const conditional = await protocol()("/api/packages/alice/pypi/files/mytool/1.0.0/mytool-1.0.0.tar.gz", {
+      headers: { "If-None-Match": "*" },
+    });
+    expect(conditional.status).toBe(304);
+    await conditional.text();
+  });
+
   it("normalizes the project name both ways (upload field and /simple/{id})", async () => {
     const owner = await seedUser("alice");
     const writer = await token(owner, "write:package");
@@ -268,6 +299,70 @@ describe("pypi upload → simple index → download", () => {
     const missingFile = await protocol()("/api/packages/alice/pypi/files/real/9.9.9/x.whl");
     expect(missingFile.status).toBe(404);
     await missingFile.text();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// UTF-8 filenames in the content part's Content-Disposition — Go's
+// mime/multipart reads part headers as raw bytes (net/textproto builds its
+// MIMEHeader with string(raw)), so a client that sends UTF-8 (twine, curl —
+// RFC 7578's de facto header convention) stores that same UTF-8 string via
+// fileHeader.Filename. The scanner's header decode must do the same.
+// ---------------------------------------------------------------------------
+
+describe("pypi UTF-8 filenames (multipart header decode)", () => {
+  it("stores a UTF-8 filename as the client's UTF-8 (no latin1 mojibake) and serves it back", async () => {
+    const owner = await seedUser("alice");
+    const writer = await token(owner, "write:package");
+    const put = await twineUpload(
+      "alice",
+      { name: "nu-wheel", version: "1.0.0" },
+      { filename: "Nü-Wheel-1.0.0-py3-none-any.whl", content: WHEEL_BYTES },
+      authHeaders(writer),
+    );
+    expect(put.status).toBe(201);
+    await put.text();
+
+    // The file row carries the sent filename and its correctly-folded
+    // lower twin ("Nü" → "nü") — NOT the latin1 mojibake ("NÃ¼" → "nã¼").
+    const rows = await db().select().from(packageFiles).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.name).toBe("Nü-Wheel-1.0.0-py3-none-any.whl");
+    expect(rows[0]?.lowerName).toBe("nü-wheel-1.0.0-py3-none-any.whl");
+
+    // The simple index lists the file; the percent-encoded GET resolves.
+    const html = await (await protocol()("/api/packages/alice/pypi/simple/nu-wheel")).text();
+    expect(html).toContain(">Nü-Wheel-1.0.0-py3-none-any.whl</a><br>");
+    const get = await protocol()(
+      "/api/packages/alice/pypi/files/nu-wheel/1.0.0/N%C3%BC-Wheel-1.0.0-py3-none-any.whl",
+    );
+    expect(get.status).toBe(200);
+    // ServeContent's RFC 6266 pair: the ASCII fallback folds "ü" to "_"; the
+    // RFC 5987 twin carries the true UTF-8 (percent-encoded) filename.
+    expect(get.headers.get("content-disposition")).toBe(
+      "attachment; filename=N_-Wheel-1.0.0-py3-none-any.whl; filename*=utf-8''N%C3%BC-Wheel-1.0.0-py3-none-any.whl",
+    );
+    const served = new Uint8Array(await get.arrayBuffer());
+    expect([...served]).toEqual([...WHEEL_BYTES]);
+  });
+
+  it("keeps an ASCII filename byte-identical beside the UTF-8 path (no regression)", async () => {
+    const owner = await seedUser("alice");
+    const writer = await token(owner, "write:package");
+    const put = await twineUpload(
+      "alice",
+      { name: "ascii", version: "1.0.0" },
+      { filename: "ascii-1.0.0-py3-none-any.whl", content: WHEEL_BYTES },
+      authHeaders(writer),
+    );
+    expect(put.status).toBe(201);
+    await put.text();
+    const rows = await db().select().from(packageFiles).all();
+    expect(rows[0]?.name).toBe("ascii-1.0.0-py3-none-any.whl");
+    expect(rows[0]?.lowerName).toBe("ascii-1.0.0-py3-none-any.whl");
+    const get = await protocol()("/api/packages/alice/pypi/files/ascii/1.0.0/ascii-1.0.0-py3-none-any.whl");
+    expect(get.status).toBe(200);
+    await get.arrayBuffer();
   });
 });
 
@@ -529,7 +624,7 @@ describe("pypi auth/quota arms", () => {
     // rollback posture leaves the two landed versions untouched.
     const over = await cappedPut("3.0.0");
     expect(over.status).toBe(403);
-    expect(await over.text()).toBe("package quota count limit exceeded");
+    expect(await over.text()).toBe("maximum allowed package count exceeded");
     expect((await db().select().from(packageVersions).all())).toHaveLength(2);
   });
 
