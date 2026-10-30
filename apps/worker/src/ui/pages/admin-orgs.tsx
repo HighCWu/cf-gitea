@@ -52,9 +52,17 @@
  *               carries recentupdate/leastupdate, list.tmpl:43-46 — sorting
  *               `updated_unix` upstream, no users.updated column →
  *               created_at, the admin-t2 deviation 5 stand-in)
- *   (actions)   the pencil link → OrganisationLink()/settings =
- *               /org/{name}/settings (user.go:351-353, list.tmpl:70) — a
- *               LANDED page (org-settings.tsx), so this is a LIVE link
+ *   (actions)   the pencil link → list.tmpl:70's
+ *               `{{.OrganisationLink}}/settings` = /org/{name}/settings
+ *               (OrganisationLink, user.go:351-353; the upstream settings
+ *               group, web.go:1017). The TARGET page (org-settings.tsx) IS
+ *               landed — but at our DOCUMENTED-DIVERGENCE mount
+ *               `/{org}/settings` (the index.ts mount record; pinned at
+ *               ui/index.test.ts's org-settings family cases), with no
+ *               `/org/{name}` alias, so the emitted href follows the
+ *               MOUNTED shape, not upstream's bytes (upstream-parity rule:
+ *               the mount is the divergence, the emitter adapts — the
+ *               link-crawl A1/A4 fix, docs/usability/findings-links.md)
  *               (octicon-pencil, allowlisted)
  *
  * The header's "New Organization" button (list.tmpl:6 → /org/create) is a
@@ -420,10 +428,16 @@ export function AdminOrgsPage(props: { ctx: UiContext; data: AdminOrgsData }) {
                   <td>{org.numMembers}</td>
                   <td>{numRepos}</td>
                   <td>{formatAdminDate(org.createdAt)}</td>
-                  {/* The settings pencil (list.tmpl:70) — /org/{name}/settings
-                      is a LANDED page (org-settings.tsx), so the link is live. */}
+                  {/* The settings pencil (list.tmpl:70). Upstream emits
+                      OrganisationLink()/settings = /org/{name}/settings
+                      (user.go:351-353, web.go:1017); our org-settings mount
+                      is the DOCUMENTED DIVERGENCE at /{org}/settings (no
+                      /org/{name} alias), so the href follows the mounted
+                      shape — org-settings.tsx is landed there and the link
+                      is live (the link-crawl A1/A4 fix; the module
+                      header's actions row). */}
                   <td>
-                    <a href={`/org/${org.username}/settings`} data-tooltip-content={adminOrgsLocale.edit} aria-label={adminOrgsLocale.edit}>
+                    <a href={`/${org.username}/settings`} data-tooltip-content={adminOrgsLocale.edit} aria-label={adminOrgsLocale.edit}>
                       <Icon name="octicon-pencil" />
                     </a>
                   </td>

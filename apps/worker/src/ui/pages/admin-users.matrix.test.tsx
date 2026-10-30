@@ -19,7 +19,11 @@
  *     row projection (the Admin label, the constant Local/Auth-Source and
  *     Never-Signed-In cells, the check/x svgs, the AbsoluteShort created
  *     stamp), the no-results row, the pager hrefs — and the dead-link
- *     assertions (no per-row details/edit links, no New Account button).
+ *     assertions (no per-row details/edit links, no New Account button),
+ *     plus the row-link posture: active rows carry upstream's HomeLink
+ *     (list.tmpl:109) while prohibited rows — the synthetic
+ *     `gitea:deploy-key` negative-id identity included — render the name
+ *     PLAIN (the link-crawl D1/D2 fix; the module header).
  */
 
 import { env } from "cloudflare:test";
@@ -298,6 +302,36 @@ describe("the admin users DOM (templates/admin/user/list.tmpl at the pin)", () =
     expect(html).not.toContain('href="/-/admin/users/'); // the details/edit targets (list.tmpl:132-133)
     expect(html).not.toContain('href="/-/admin/users/new"'); // list.tmpl:6
     expect(html).not.toContain("Create User Account");
+  });
+
+  it("row links: active rows carry upstream's HomeLink; PROHIBITED rows render the name PLAIN (the D1/D2 fix)", async () => {
+    await seedBaseFixtures();
+    const html = render(await load(""));
+    // list.tmpl:109's HomeLink for every row whose profile actually renders.
+    expect(html).toContain('<a href="/root">root</a>');
+    expect(html).toContain('<a href="/alice">alice</a>');
+    expect(html).toContain('<a href="/bob">bob</a>');
+    // carol is prohibited: the profile is DEFINED to 404 for every viewer
+    // (§4.8, user-profile.tsx's visibility ladder), so §2.4.1's dead-link
+    // rule degrades the cell to plain text (the releases.tsx D1-only-tag
+    // posture) — the link-crawl D1 row.
+    expect(html).not.toContain('href="/carol"');
+    expect(html).toContain("<span>carol</span>");
+  });
+
+  it("the synthetic gitea:deploy-key identity (negative id, prohibited) never links a profile (the D2 row)", async () => {
+    await seedBaseFixtures();
+    // The migration-0020 system-principal row's shape: negative id, colon
+    // username, prohibited (services/user-accounts.ts's codified posture).
+    await env.DB.prepare(
+      "INSERT INTO users (id, username, username_lower, display_name, type, status, visibility, created_at) " +
+        "VALUES (-3, 'gitea:deploy-key', 'gitea:deploy-key', 'gitea:deploy-key', 'user', 'prohibited', 'public', unixepoch())",
+    ).run();
+    const data = await load("");
+    expect(data.items.map((row) => row.id)).toContain(-3); // the identity lists (upstream lists its system principals too)
+    const html = render(await load(""));
+    expect(html).not.toContain('href="/gitea'); // the crawl's /gitea:deploy-key dead target is never emitted
+    expect(html).toContain("<span>gitea:deploy-key</span>");
   });
 
   it("the family navbar renders the landed pages only — Identity & Access open with Users active", async () => {

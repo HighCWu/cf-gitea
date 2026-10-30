@@ -80,7 +80,22 @@
  *   (the FillIssues/FillPullRequests/FillReleases author subqueries).
  *   List ROWS render up to ACTIVITY_LIST_CAP per arm (upstream renders the
  *   unbounded list; the counts stay exact via separate COUNT reads — the
- *   documented cap divergence).
+ *   documented cap divergence). The published-releases ROW LINK: upstream's
+ *   title link emits the BARE `/src/{tag}` shape (pulse.tmpl:128) and
+ *   resolves it through the DEPRECATED `m.Get("/*")` catchall under `/src`
+ *   (web.go:1755 — "'/*' route is deprecated, and kept for backward
+ *   compatibility"), which the UI router deliberately does NOT claim (the
+ *   legacy no-prefix form 404-shells — §3.3). Emitting upstream's URL
+ *   without upstream's catchall 404s even for a live tag (the link-crawl
+ *   A3 row, docs/usability/findings-links.md), so this page emits the
+ *   MOUNTED shape `/src/tag/{tag}` — the releases list's exact arm
+ *   (releases.tsx's meta tag link) — GATED on the tag's engine existence
+ *   via the shared `tagTipsOf` read: a release whose tag exists in git
+ *   renders the title link; a D1-only release (the documented engine
+ *   boundary — creating a release does not create the tag,
+ *   api/services/releases.ts) renders the title PLAIN, §2.4.1's dead-link
+ *   rule winning over upstream's unconditional anchor (the releases page's
+ *   documented posture for the same state).
  * - **Top-authors chart** — upstream renders it CLIENT-side
  *   (`<div id="repo-activity-top-authors-chart">`, pulse.tmpl:108; the
  *   official bundle's initRepoActivityTopAuthorsChart mounts a Vue app that
@@ -132,6 +147,7 @@ import { pathEscapeSegments } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
 import { parseActivityPeriod } from "./activity-author-data";
+import { tagTipsOf } from "./releases";
 import { RepoActivityNavMenu } from "./repo-charts";
 
 /** Page chrome text (component-local, the tabLocale pattern — the strings
@@ -187,6 +203,10 @@ export interface ActivityReleaseItem {
   title: string;
   isTag: boolean;
   publishedUnix: number;
+  /** The tag's engine tip (the shared `tagTipsOf` read) — null when the tag
+   *  does not exist in git (the D1-only release row): the title then renders
+   *  PLAIN, never a dead `/src/tag/…` link (the module doc's A3 note). */
+  tagOid: string | null;
 }
 
 /** The code arm's counts — the upstream `CodeActivityStats` render subset
@@ -377,8 +397,16 @@ async function loadPullArm(d1: D1Database, repoId: string, from: Date): Promise<
 
 /** The releases arm (upstream FillReleases:324-345): published (non-draft)
  *  rows with `published_unix ≥ from`, newest first. `publishedUnix` is the
- *  plain-seconds column (§3.2), so the cutoff rides the seconds form. */
-async function loadReleaseArm(d1: D1Database, repoId: string, fromSeconds: number): Promise<ActivityReleaseStats> {
+ *  plain-seconds column (§3.2), so the cutoff rides the seconds form.
+ *  `tagTips` is the repo's engine tag universe (the caller's one
+ *  `tagTipsOf` read) — each row's `tagOid` gates its title link (the
+ *  module doc's A3 note). */
+async function loadReleaseArm(
+  d1: D1Database,
+  repoId: string,
+  fromSeconds: number,
+  tagTips: Map<string, string>,
+): Promise<ActivityReleaseStats> {
   const db = drizzle(d1);
   const where = and(eq(releases.repoId, repoId), eq(releases.isDraft, false), gte(releases.publishedUnix, fromSeconds));
   const [rows, agg] = await Promise.all([
@@ -404,7 +432,7 @@ async function loadReleaseArm(d1: D1Database, repoId: string, fromSeconds: numbe
   return {
     publishedCount: agg[0]?.total ?? 0,
     publishedAuthors: agg[0]?.authors ?? 0,
-    published: rows,
+    published: rows.map((row) => ({ ...row, tagOid: tagTips.get(row.tagName) ?? null })),
   };
 }
 
@@ -468,12 +496,18 @@ export async function loadRepoActivityData(
 
   // The unit-gated D1 arms (upstream's GetActivityStats issue/PR/release
   // halves are D1 SQL — models/activities/repo_activity.go — they stay on
-  // the landed stores).
+  // the landed stores). The releases arm also rides ONE engine tag-universe
+  // read (the shared tagTipsOf — the releases list's exact helper) so each
+  // row's title link is gated on the tag's git existence (the A3 fix);
+  // skipped entirely when the unit is off.
   const settings = await loadRepoSettings(env.DB, repo.id);
+  const tagTips = settings.hasReleases ? await tagTipsOf(env, repo) : new Map<string, string>();
   const [issueStats, pullStats, releaseStats] = await Promise.all([
     settings.hasIssues ? loadIssueArm(env.DB, repo.id, from) : Promise.resolve(null),
     settings.hasPullRequests ? loadPullArm(env.DB, repo.id, from) : Promise.resolve(null),
-    settings.hasReleases ? loadReleaseArm(env.DB, repo.id, Math.floor(from.getTime() / 1000)) : Promise.resolve(null),
+    settings.hasReleases
+      ? loadReleaseArm(env.DB, repo.id, Math.floor(from.getTime() / 1000), tagTips)
+      : Promise.resolve(null),
   ]);
 
   // The unresolved arm needs (issues OR pulls) readable, is_pull-narrowed to
@@ -803,13 +837,24 @@ export function RepoActivityPage(props: { ctx: UiContext; data: RepoActivityData
                   <p class="desc">
                     <span class="ui green label">{activityLocale.published_label}</span>
                     {row.tagName}
-                    {row.isTag ? null : (
+                    {/* pulse.tmpl:126-130: the tag name plain, then the
+                        title link for non-tag rows. The link emits our
+                        MOUNTED /src/tag/{tag} shape — upstream's bare
+                        /src/{tag} (pulse.tmpl:128) resolves only through
+                        web.go:1755's deprecated catchall the UI router does
+                        not claim — and renders only when the tag exists in
+                        git (row.tagOid, the releases page's exact gating);
+                        a D1-only release renders the title PLAIN (§2.4.1's
+                        dead-link rule, the A3 fix). */}
+                    {row.isTag ? null : row.tagOid !== null ? (
                       <>
                         {" "}
-                        <a class="title" href={`${repoLink}/src/${pathEscapeSegments(row.tagName)}`}>
+                        <a class="title" href={`${repoLink}/src/tag/${pathEscapeSegments(row.tagName)}`}>
                           {row.title === "" ? row.tagName : row.title}
                         </a>
                       </>
+                    ) : row.title === "" ? null : (
+                      <> {row.title}</>
                     )}{" "}
                     <TimeSince unixSeconds={row.publishedUnix} tz="+0000" />
                   </p>

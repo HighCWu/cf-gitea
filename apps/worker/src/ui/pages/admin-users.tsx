@@ -35,7 +35,31 @@
  * ## Row projection (list.tmpl:104-139 at the pin → the landed D1 columns)
  *
  *   ID                             users.id (sortable: oldest/newest)
- *   Username                       users.username → /{username} (HomeLink);
+ *   Username                       users.username → /{username} (HomeLink,
+ *                                  list.tmpl:109) for status='active' rows;
+ *                                  a PROHIBITED row renders the name PLAIN —
+ *                                  upstream's unconditional HomeLink is a
+ *                                  dead link here BY DESIGN (§4.8: a
+ *                                  prohibited account is invisible to every
+ *                                  viewer — the documented profile 404,
+ *                                  user-profile.tsx's IsUserVisibleToViewer
+ *                                  ladder), so §2.4.1's dead-link rule wins
+ *                                  and the cell degrades to plain text (the
+ *                                  releases.tsx D1-only-tag posture; the
+ *                                  link-crawl D1/D2 rows,
+ *                                  docs/usability/findings-links.md — the
+ *                                  synthetic `gitea:deploy-key` negative-id
+ *                                  identity (migration 0020, user_accounts:
+ *                                  its colon username has no legal profile
+ *                                  shape) is prohibited, so the status arm
+ *                                  covers it). Upstream's per-row ACTIONS
+ *                                  cell (list.tmpl:130-135) links the admin
+ *                                  details/edit surfaces — the upstream
+ *                                  intent for managing an account like
+ *                                  these — but those pages are UNMOUNTED
+ *                                  (index.ts's admin block claims only the
+ *                                  literals), and they are already omitted
+ *                                  below under the same rule.
  *                                  + the "Admin" basic label when isAdmin
  *                                  (list.tmpl:110-111); the Reserved (type 2)
  *                                  / Remote (type 5) / Bot
@@ -989,7 +1013,20 @@ export function AdminUsersPage(props: { ctx: UiContext; data: AdminUsersData }) 
                 <tr key={row.id}>
                   <td>{row.id}</td>
                   <td>
-                    <a href={`/${row.username}`}>{row.username}</a>
+                    {/* list.tmpl:109's HomeLink, emitted only when the profile
+                        actually renders: a prohibited account is invisible to
+                        every viewer (§4.8 — the documented profile 404), and
+                        the synthetic `gitea:deploy-key` negative-id identity
+                        is prohibited, so its row degrades to plain text too
+                        (the dead-link rule; the link-crawl D1/D2 fix — the
+                        module header's Username row). Upstream's per-row
+                        admin details/edit targets (list.tmpl:130-135) are
+                        unmounted → the actions column stays omitted. */}
+                    {row.status === "active" ? (
+                      <a href={`/${row.username}`}>{row.username}</a>
+                    ) : (
+                      <span>{row.username}</span>
+                    )}
                     {row.isAdmin ? <span class="ui basic label tw-py-0 tw-align-baseline">{adminUsersLocale.admin_label}</span> : null}
                   </td>
                   <td class="gt-ellipsis tw-max-w-48">{row.email ?? ""}</td>

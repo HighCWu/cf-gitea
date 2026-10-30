@@ -137,11 +137,14 @@ interface ActmxFixture {
  *  two open issues (−1h, −2d), one OLD issue closed −1h, one dormant
  *  −30d-and-untouched issue, one open PR (−1h), one PR created −2d and
  *  merged −1h (the landed merge posture: the issue row closed at the merge
- *  stamp), a published release v1.0 (−2d), a draft (−1d, excluded), and a
- *  tag-only row (−1h, upstream's FillReleases counts it). */
+ *  stamp), a published release v1.0 (−2d) whose GIT TAG is pushed at the
+ *  tip (refs/tags/v1.0 — the release row's live-link arm), a draft (−1d,
+ *  excluded), a D1-only published release v0.5-ghost (−3d: no git tag — the
+ *  engine boundary's N2 class; its title renders PLAIN), and a tag-only row
+ *  (−1h, upstream's FillReleases counts it). */
 async function seedActmxFixture(): Promise<ActmxFixture> {
   const owner = await seedVerifiedUser({ username: "actmx-owner" });
-  await ensureSeededRepo({ owner: "actmx-owner", slug: "act", commits: ACTMX_COMMITS });
+  await ensureSeededRepo({ owner: "actmx-owner", slug: "act", commits: ACTMX_COMMITS, tags: [{ name: "v1.0", commitIndex: 2 }] });
   const db = drizzle(env.DB);
   const repoRow = await db
     .select()
@@ -209,6 +212,21 @@ async function seedActmxFixture(): Promise<ActmxFixture> {
     isDraft: true,
     isPrerelease: false,
     now: at(day(1)),
+  });
+  // The D1-only release (the engine boundary — creating a release does not
+  // create the git tag, the findings' N2 class): published −3d, inside the
+  // weekly window, OUTSIDE the daily one. Its tag has no git existence, so
+  // its title renders PLAIN (never a /src/tag link — the dead-link rule).
+  await svc.createRelease({
+    repoId: repoRow.id,
+    publisherId: owner.id,
+    tagName: "v0.5-ghost",
+    target: "main",
+    title: "actmx ghost release",
+    note: "",
+    isDraft: false,
+    isPrerelease: false,
+    now: at(day(3)),
   });
   // The tag-only row (upstream FillReleases has no is_tag filter — it
   // counts; pulse.tmpl renders it as the plain tag name, no title link).
@@ -443,11 +461,19 @@ describe("the activity page mounts (period arms + counts + lists)", () => {
     expect(html).toContain('<span class="ui green label">Opened</span>');
     expect(html).toContain('<span class="ui green label">Open</span>');
 
-    // Releases: the published release links its title; the tag-only row is
-    // plain text; the draft is absent.
+    // Releases: v1.0's tag IS pushed (refs/tags/v1.0, the fixture), so its
+    // title links at the MOUNTED /src/tag shape (the A3 fix — the bare
+    // /src/{tag} shape upstream's pulse.tmpl:128 emits rides web.go:1755's
+    // deprecated catchall we don't claim, and must not be emitted); the
+    // ghost release (D1-only tag) renders its title PLAIN (the dead-link
+    // rule); the tag-only row is plain text; the draft is absent.
     expect(html).toContain('id="published-releases"');
     expect(html).toContain("v1.0");
     expect(html).toContain(">actmx first release</a>");
+    expect(html).toContain('href="/actmx-owner/act/src/tag/v1.0"');
+    expect(html).not.toContain('href="/actmx-owner/act/src/v1.0"'); // the legacy bare shape is gone
+    expect(html).toContain("actmx ghost release");
+    expect(html).not.toContain('href="/actmx-owner/act/src/tag/v0.5-ghost"'); // no git tag → no link
     expect(html).toContain("just-a-tag");
     expect(html).not.toContain("v0.9-draft");
     expect(html).not.toContain(">actmx draft</a>");
@@ -464,7 +490,7 @@ describe("the activity page mounts (period arms + counts + lists)", () => {
     expect(html).toContain(`href="/actmx-owner/act/issues/${fx.issueOpenRecent.index}"`);
     expect(html).toContain(`href="/actmx-owner/act/issues/${fx.issueOpenMid.index}"`);
     expect(html).toContain(`href="/actmx-owner/act/issues/${fx.issueDormant.index}"`);
-    expect(html).toContain('href="/actmx-owner/act/src/v1.0"');
+    expect(html).toContain('href="/actmx-owner/act/src/tag/v1.0"'); // the mounted shape, gated on the pushed tag (the A3 fix)
     // The dormant issue (created −30d, updated −2h by the fixture stamp) IS
     // the unresolved row; the old CLOSED issue and the in-window opens are
     // not (closed rows are excluded, fresh-created rows are after `from`).

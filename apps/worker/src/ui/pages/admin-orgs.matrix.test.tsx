@@ -15,7 +15,10 @@
  *     upstream copy-through quirk, kept verbatim), the panel header + total,
  *     the LIVE New Organization button (/org/create is landed), the row
  *     projection (the fullName parens, the gold octicon-lock on a private
- *     org, the counters, the LIVE /org/{name}/settings pencil), the
+ *     org, the counters, the LIVE /{name}/settings pencil — the emitted
+ *     href re-targets upstream's /org/{name}/settings shape
+ *     (OrganisationLink, user.go:351-353) onto our mounted org-settings
+ *     route, the link-crawl A1/A4 fix), the
  *     no-results row, the pager hrefs.
  */
 
@@ -212,7 +215,14 @@ describe("the admin orgs DOM (templates/admin/org/list.tmpl at the pin)", () => 
     expect(html).toContain('<span class="tw-text-gold"><svg'); // the private org's lock (embedded bytes)
     expect(html).toContain("octicon-lock");
     expect(html.split("<td>2</td>").length - 1).toBeGreaterThanOrEqual(1); // alpha's teams/repos counters
-    expect(html).toContain('<a href="/org/alpha/settings"'); // the LIVE settings pencil
+    // The settings pencil: upstream's list.tmpl:70 emits
+    // OrganisationLink()/settings = /org/{name}/settings (user.go:351-353),
+    // but our org-settings mount is the documented divergence at
+    // /{name}/settings (no /org/{name} alias — the mount would 404 the
+    // upstream shape for every org, the link-crawl A1/A4 row), so the
+    // emitted href follows the mounted shape.
+    expect(html).toContain('<a href="/alpha/settings"'); // the LIVE settings pencil
+    expect(html).not.toContain('href="/org/alpha/settings"'); // the upstream-shaped dead link is gone
     expect(html).toContain("octicon-pencil");
   });
 
