@@ -65,6 +65,21 @@
  *   checkContextUser answers a bare StatusForbidden page; the no-JS form
  *   convention re-renders — the write path re-gates every org through
  *   requireCanCreateOrgRepo either way, so nothing is gained).
+ *
+ * ## The demo quota (SPEC-0014 §4.3, usability finding B-3)
+ *
+ * The gated per-owner repository-count cap rides BOTH arms at this web call
+ * site — `assertDemoRepoQuota` (services/demo-quota.ts), the SAME helper the
+ * API create arms enforce (api/routes/user-repos.ts:198-205,
+ * api/routes/org-repos.ts:213-220), with the owner per arm (the doer row for
+ * the personal arm, the org row for the organization arm — upstream's
+ * CanCreateRepoIn counts the OWNER's repositories) and the same §2 invariant
+ * (gate off → zero D1 reads, zero checks; the admin-doer bypass rides the
+ * helper). Upstream's web CreatePost answers the limit refusal through
+ * handleCreateError's RenderWithErr (repo.go:171-175 — the
+ * `repo.form.reach_limit_of_creation_*` locale pair), so the refusal
+ * surfaces as the invalid outcome — the form re-renders with the
+ * `ui negative message` banner, never a bare 403/500.
  */
 
 import {
@@ -77,6 +92,7 @@ import { createUserRepository, findDoerRow } from "../../api/services/user-repos
 import { requireCanCreateOrgRepo } from "../../api/services/org-repos";
 import { OrgService } from "../../services/orgs/orgs";
 import { ApiError } from "../../api/errors";
+import { assertDemoRepoQuota, DemoRepoQuotaError } from "../../services/demo-quota";
 import type { CreateRepoOption } from "../../api/models/repository";
 import { saveRepoSettings } from "../../api/services/repo-settings";
 import {
@@ -127,7 +143,22 @@ export const repoCreateLocale = {
    *  checkbox whenever the effective owner is an organization. */
   org_auto_init_note:
     "Organization repositories are created empty; auto-initialization applies to personal repositories only.",
+  /** The at-quota re-render — upstream's web message pair
+   *  ("repo.form.reach_limit_of_creation_1" / "…_n", handleCreateError's
+   *  RenderWithErr arm, routers/web/repo/repo.go:171-175), the web-form
+   *  wording standing in for the API arm's 403 body text (the name_taken
+   *  precedent). Interpolated by quotaReachedMessage. */
+  quota_reached_1: "The owner has already reached the limit of 1 repository.",
+  quota_reached_n: "The owner has already reached the limit of %d repositories.",
 } as const;
+
+/** The at-quota message (upstream's TrN over MaxCreationLimit — the locale
+ *  pair above; the limit rides DemoRepoQuotaError.limit). */
+export function quotaReachedMessage(limit: number): string {
+  return limit === 1
+    ? repoCreateLocale.quota_reached_1
+    : repoCreateLocale.quota_reached_n.replace("%d", String(limit));
+}
 
 /** The owner-option cap (one page read; the new-issue picker-limit
  *  precedent — upstream's dropdown pages through the JS path). */
@@ -227,10 +258,12 @@ export interface RepoCreateEmission {
  * The write, dispatched on the owner select (module header): the user arm
  * through `createUserRepository` (auto-init included), the org arm through
  * `requireCanCreateOrgRepo` + `RepoService.create` (auto-init dropped — the
- * honest degrade). Validation and service 4xx failures surface as the
- * invalid outcome and re-render inline (the login failure convention);
- * engine transport failures propagate (the services/engine.ts posture —
- * retryable-unknown state is never a form error).
+ * honest degrade). Both arms ride the gated demo quota FIRST (the module
+ * header — the same helper the API create arms enforce). Validation, service
+ * 4xx, and quota-refusal failures surface as the invalid outcome and
+ * re-render inline (the login failure convention); engine transport failures
+ * propagate (the services/engine.ts posture — retryable-unknown state is
+ * never a form error).
  */
 export async function createRepoFromForm(
   env: Env,
@@ -251,6 +284,11 @@ export async function createRepoFromForm(
   let row: RepoRow;
   try {
     if (form.uid === null || form.uid === data.doer.id) {
+      // The demo quota FIRST (the module header — SPEC-0014 §4.3, finding
+      // B-3): the owner row IS the doer row here, the admin-doer bypass and
+      // the gate-off zero-reads invariant ride the helper — the API create
+      // arm's exact call shape (api/routes/user-repos.ts:198-205).
+      await assertDemoRepoQuota(env, d1, data.doer, data.doer.id);
       // The user arm (upstream CreatePost's doer branch) — the option
       // carries exactly the fields the arm stores; `readme` fixes the
       // arm's single-entry template catalog (resolveAutoInitReadme's
@@ -278,6 +316,10 @@ export async function createRepoFromForm(
         }
         throw error;
       }
+      // The org arm's quota (the module header — the org-API-arm fold,
+      // api/routes/org-repos.ts:213-220): the ORG is the quota owner (orgs
+      // ARE owners), the viewer carries the doer's admin bypass.
+      await assertDemoRepoQuota(env, d1, viewer, org.id);
       const created = await new RepoService(d1).create({
         owner: { id: org.id, usernameLower: org.usernameLower },
         name: form.name,
@@ -295,6 +337,9 @@ export async function createRepoFromForm(
   } catch (error) {
     if (error instanceof RepoNameCollisionError) return invalid(repoCreateLocale.name_taken);
     if (error instanceof RepoNameInvalidError) return invalid(error.message);
+    // The quota refusal — upstream's web shape (handleCreateError's
+    // RenderWithErr re-render, repo.go:171-175), NOT the API arm's bare 403.
+    if (error instanceof DemoRepoQuotaError) return invalid(quotaReachedMessage(error.limit));
     if (error instanceof ApiError && error.status < 500) return invalid(error.message);
     throw error;
   }

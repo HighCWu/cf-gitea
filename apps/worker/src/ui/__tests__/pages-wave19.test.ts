@@ -7,7 +7,13 @@
  * `POST /user/repos` arm, auto-init included) for the doer,
  * requireCanCreateOrgRepo + RepoService.create (the `POST /orgs/{org}/repos`
  * arm, auto-init DROPPED — the documented degrade) for an org, and
- * OrgService.createOrg (the `POST /orgs` arm) for the org page.
+ * OrgService.createOrg (the `POST /orgs` arm) for the org page. The demo
+ * quota arm (SPEC-0014 §4.3, finding B-3) pins the gated per-owner cap at
+ * the web call site: the SAME assertDemoRepoQuota helper the API create
+ * routes enforce, the refusal re-rendering the form with the quota banner
+ * (upstream handleCreateError's RenderWithErr shape) and the gate-off
+ * default performing zero checks — `armedUiEnv` drives the armed posts (the
+ * api/routes/demo-quota.test.ts env-copy pattern).
  *
  * Same harness posture as pages-wave2..18: the router is driven directly
  * with the synthetic ASSETS manifest. No engine seed is needed — these pages
@@ -19,12 +25,13 @@
 
 import { env } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
-import { eq } from "drizzle-orm";
+import { and, eq, like } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
-import { repoSettings, repositories, users } from "../../db/schema";
+import { repoCounters, repoSettings, repositories, users } from "../../db/schema";
+import { DEMO_MAX_REPOS_PER_OWNER } from "../../services/demo-quota";
 import { OrgService } from "../../services/orgs/orgs";
 import { handlesUiRoute, parseUiRoute, uiRouter } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
@@ -324,6 +331,172 @@ describe("POST /repo/create — the org arm (requireCanCreateOrgRepo + RepoServi
     );
     expect(forged.status).toBe(200);
     expect(await forged.text()).toContain("You are not allowed to create repositories for this owner.");
+  });
+});
+
+// --- POST /repo/create — the demo quota arm --------------------------------------
+//
+// SPEC-0014 §4.3 at the WEB call site (usability finding B-3): the
+// DEMO_MAX_REPOS_PER_OWNER cap rides createRepoFromForm's BOTH arms through
+// the SAME helper the API create routes enforce (assertDemoRepoQuota) — the
+// refusal re-renders the form with the quota banner (upstream
+// handleCreateError's RenderWithErr shape, repo.go:171-175), never a bare
+// 403/500; the gate-off default performs zero checks (the §2 invariant).
+describe("POST /repo/create — the demo quota arm (SPEC-0014 §4.3, finding B-3)", () => {
+  /** The armed env copy — the armedEnv pattern (api/routes/demo-quota.test.ts):
+   *  wrangler types a declared var by its LITERAL config value ("false"), so
+   *  a spread override alone cannot flip it. fetchUi binds uiEnv, so the
+   *  armed posts drive the router directly with the copy. */
+  function armedUiEnv(demoMode: string): typeof uiEnv {
+    const copy = { ...uiEnv };
+    (copy as { DEMO_MODE: string }).DEMO_MODE = demoMode;
+    return copy;
+  }
+
+  async function fetchUiWithEnv(path: string, init: RequestInit, requestEnv: typeof uiEnv): Promise<Response> {
+    return uiRouter.fetch(new Request(`https://test.local${path}`, init), requestEnv);
+  }
+
+  /** The quota arm's dedicated owner (alice/morgan accumulate repos from the
+   *  create tests above — the exact counts here need a clean namespace). */
+  async function ensureQuotaOwner(): Promise<{ id: number; username: string; cookie: string }> {
+    await ensureWave19Fixtures();
+    const db = drizzle(env.DB);
+    const username = "wave19quota";
+    if ((await db.select({ id: users.id }).from(users).where(eq(users.usernameLower, username)).get()) === undefined) {
+      await seedVerifiedUser({ username });
+    }
+    const owner = (await db.select().from(users).where(eq(users.usernameLower, username)).get())!;
+    return { id: owner.id, username: owner.username, cookie: await mintSession(env.DB, owner.id) };
+  }
+
+  /** Reset the owner to EXACTLY `n` repositories (fixed ids/slugs — the
+   *  demo-quota.test.ts seedQuotaRepos shape). Re-run-safe: the delete sweep
+   *  takes the owner's whole `wave19quota-` family (the created probe repos
+   *  carry the prefix too), so accumulated runs never drift the count. The
+   *  sweep takes repo_counters first — the web create's issue-index batch
+   *  seeds one per repo, and its FK to repositories blocks a bare delete. */
+  async function setQuotaRepos(ownerId: number, ownerNamespace: string, n: number): Promise<void> {
+    const db = drizzle(env.DB);
+    const family = and(eq(repositories.ownerId, ownerId), like(repositories.slug, "wave19quota-%"));
+    const stale = await db.select({ id: repositories.id }).from(repositories).where(family).all();
+    for (const row of stale) {
+      await db.delete(repoCounters).where(eq(repoCounters.repoId, row.id));
+    }
+    await db.delete(repositories).where(family);
+    for (let i = 0; i < n; i++) {
+      const id = `w19q_${ownerId}_${i}`;
+      await db.insert(repositories).values({
+        id,
+        storageKey: `r_${id}`,
+        ownerNamespace,
+        ownerId,
+        slug: `wave19quota-${i}`,
+        visibility: "public",
+        refsVersion: 1,
+        backend: "self-hosted",
+        createdAt: new Date(0),
+      });
+    }
+  }
+
+  async function countRepos(ownerId: number): Promise<number> {
+    const rows = await drizzle(env.DB)
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(eq(repositories.ownerId, ownerId))
+      .all();
+    return rows.length;
+  }
+
+  it("armed, under the cap: the create lands — 303 onto the repo home", async () => {
+    const fixture = await ensureQuotaOwner();
+    await setQuotaRepos(fixture.id, fixture.username, DEMO_MAX_REPOS_PER_OWNER - 1);
+    const name = `wave19quota-under-${suffix()}`;
+    const res = await fetchUiWithEnv(
+      "/repo/create",
+      formPost("/repo/create", { uid: "", repo_name: name, private: "on" }, fixture.cookie),
+      armedUiEnv("true"),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/${fixture.username}/${name}`);
+    expect(await countRepos(fixture.id)).toBe(DEMO_MAX_REPOS_PER_OWNER);
+  });
+
+  it("armed, at the cap: the form re-renders with the quota banner (upstream's reach_limit_of_creation web message) — nothing created", async () => {
+    const fixture = await ensureQuotaOwner();
+    await setQuotaRepos(fixture.id, fixture.username, DEMO_MAX_REPOS_PER_OWNER);
+    const name = `wave19quota-over-${suffix()}`;
+    const res = await fetchUiWithEnv(
+      "/repo/create",
+      formPost("/repo/create", { uid: "", repo_name: name, private: "on", description: "kept draft" }, fixture.cookie),
+      armedUiEnv("true"),
+    );
+    expect(res.status).toBe(200); // the re-render, NOT a 403/500
+    const html = await res.text();
+    // The banner: handleCreateError's RenderWithErr shape over this page's
+    // `ui negative message` idiom, the web locale text (repo.go:171-175).
+    expect(html).toContain(
+      `<div class="ui negative message">The owner has already reached the limit of ${DEMO_MAX_REPOS_PER_OWNER} repositories.</div>`,
+    );
+    // The kept submission re-renders (the login-failure convention).
+    expect(html).toContain(`value="${name}"`);
+    expect(html).toContain("kept draft");
+    // Nothing was created.
+    expect(await countRepos(fixture.id)).toBe(DEMO_MAX_REPOS_PER_OWNER);
+  });
+
+  it("armed, at the cap on the ORG arm: the same re-render — the count is the ORG's (orgs ARE owners)", async () => {
+    const fixture = await ensureWave19Fixtures();
+    const orgId = fixture.org.id;
+    await setQuotaRepos(orgId, fixture.org.username, DEMO_MAX_REPOS_PER_OWNER);
+    const before = await countRepos(orgId);
+    const res = await fetchUiWithEnv(
+      "/repo/create",
+      formPost(
+        "/repo/create",
+        { uid: String(orgId), repo_name: `wave19quota-org-${suffix()}`, private: "on" },
+        fixture.morganCookie,
+      ),
+      armedUiEnv("true"),
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(
+      `<div class="ui negative message">The owner has already reached the limit of ${DEMO_MAX_REPOS_PER_OWNER} repositories.</div>`,
+    );
+    expect(await countRepos(orgId)).toBe(before);
+  });
+
+  it("armed, an ADMIN doer past the cap: the upstream CanCreateRepoIn bypass — the create still lands (user.go:289-291)", async () => {
+    const db = drizzle(env.DB);
+    const username = "wave19quotadmin";
+    if ((await db.select({ id: users.id }).from(users).where(eq(users.usernameLower, username)).get()) === undefined) {
+      await seedVerifiedUser({ username, isAdmin: true });
+    }
+    const admin = (await db.select().from(users).where(eq(users.usernameLower, username)).get())!;
+    await setQuotaRepos(admin.id, admin.username, DEMO_MAX_REPOS_PER_OWNER + 2);
+    const cookie = await mintSession(env.DB, admin.id);
+    const name = `wave19quota-admin-${suffix()}`;
+    const res = await fetchUiWithEnv(
+      "/repo/create",
+      formPost("/repo/create", { uid: "", repo_name: name, private: "on" }, cookie),
+      armedUiEnv("true"),
+    );
+    expect(res.status).toBe(303);
+    expect(await countRepos(admin.id)).toBe(DEMO_MAX_REPOS_PER_OWNER + 3);
+  });
+
+  it("gate OFF (the deployed default): a past-cap create still lands — zero interference (§2)", async () => {
+    const fixture = await ensureQuotaOwner();
+    await setQuotaRepos(fixture.id, fixture.username, DEMO_MAX_REPOS_PER_OWNER + 2);
+    const name = `wave19quota-off-${suffix()}`;
+    const res = await fetchUi(
+      "/repo/create",
+      formPost("/repo/create", { uid: "", repo_name: name, private: "on" }, fixture.cookie),
+    );
+    expect(res.status).toBe(303);
+    expect(await countRepos(fixture.id)).toBe(DEMO_MAX_REPOS_PER_OWNER + 3);
   });
 });
 
