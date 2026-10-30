@@ -185,7 +185,7 @@ import {
   type RepositoryWithOwner,
   type UserRow,
 } from "../../api/services/repository";import { ReleaseAlreadyExistError } from "../../issues/errors";
-import { IssuesService, type ReleaseRow } from "../../issues/service";
+import { type ReleaseRow } from "../../issues/service";
 import { emitIssueEvent, type IssueEventRequest } from "../../services/issue-events";
 import { users } from "../../db/schema";
 import { TimeSince } from "../components/file-list";
