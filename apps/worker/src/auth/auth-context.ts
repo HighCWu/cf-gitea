@@ -14,6 +14,12 @@ export interface AuthUser {
   usernameLower: string;
   email: string | null;
   displayName: string | null;
+  /** The profile trio (usability F-1/R-1) — carried from the users row so
+   *  every User projection (incl. the auth middleware's own converter)
+   *  renders them; null = unset (renders ""). */
+  location: string | null;
+  website: string | null;
+  description: string | null;
   /** Site admin — gates sudo/admin routes (upstream `IsAdmin`). */
   isAdmin: boolean;
   status: "active" | "prohibited";
