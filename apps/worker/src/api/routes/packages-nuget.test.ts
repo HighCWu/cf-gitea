@@ -964,7 +964,7 @@ describe("nuget auth, quota, and gates", () => {
     await bypass.text();
   });
 
-  it("411s without Content-Length and 404s the family when packages are disabled", async () => {
+  it("a chunked body streams; non-zip bytes answer 400 (D-2) and the family 404s when disabled", async () => {
     const owner = await seedUser("alice");
     const writer = await token(owner, "write:package");
     const stream = new ReadableStream<Uint8Array>({
@@ -980,8 +980,10 @@ describe("nuget auth, quota, and gates", () => {
       // @ts-expect-error duplex is the streams spec's required pairing
       duplex: "half",
     });
-    expect(noLength.status).toBe(411);
-    expect(messageOf(await noLength.json())).toBe("Content-Length header is required");
+    // D-2: the spool streamed the body (no 411); "bytes" is not a zip so
+    // the package reader's 400 is the terminal answer.
+    expect(noLength.status).toBe(400);
+    expect(messageOf(await noLength.json())).toMatch(/package|zip/i);
 
     // The strict-polarity PACKAGES_ENABLED arm (only "false" disables).
     const disabled = await protocol({ PACKAGES_ENABLED: "false" })("/api/packages/alice/nuget/index.json");

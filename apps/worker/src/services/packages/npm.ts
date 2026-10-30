@@ -1244,7 +1244,8 @@ export interface UploadNpmPackageInput {
   doer: PackageDoer;
   /** The request body stream (spooled whole, then buffered under the cap). */
   content: ReadableStream<Uint8Array>;
-  declaredLength: number;
+  /** The declared Content-Length; `undefined` = a chunked body (D-2). */
+  declaredLength: number | undefined;
   quota: PackagesQuotaConfig;
   /** The request origin — the repo-link URL match domain. */
   instanceOrigin: string;

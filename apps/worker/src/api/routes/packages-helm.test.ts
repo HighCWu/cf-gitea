@@ -531,7 +531,7 @@ describe("helm auth/quota arms", () => {
     expect((await db().select().from(packageVersions).all())).toHaveLength(2);
   });
 
-  it("411s without Content-Length; PACKAGES_ENABLED=false 404s the family", async () => {
+  it("a chunked body streams; junk-not-gzip maps 500 (D-2 + the family posture); PACKAGES_ENABLED=false 404s the family", async () => {
     const owner = await seedUser("alice");
     const writer = await token(owner, "write:package");
     const stream = new ReadableStream<Uint8Array>({
@@ -547,8 +547,12 @@ describe("helm auth/quota arms", () => {
       // @ts-expect-error duplex is the streams spec's required pairing
       duplex: "half",
     });
-    expect(noLength.status).toBe(411);
-    await noLength.json();
+    // D-2: the spool streamed the unknown-length body (no 411); the bare
+    // "chunked" bytes are not gzip so the scanner's decompression error maps
+    // to 500 — the family's documented posture (corrupt gzip → 500, upstream
+    // maps non-InvalidArgument errors to 500; this file's own header).
+    expect(noLength.status).toBe(500);
+    await noLength.text();
 
     const disabled = protocol({ PACKAGES_ENABLED: "false" });
     const index = await disabled("/api/packages/alice/helm/index.yaml");

@@ -318,15 +318,19 @@ describe("generic protocol PUT/GET/HEAD/DELETE", () => {
     await res.text();
   });
 
-  it("re-uploading IDENTICAL bytes is the idempotent no-op; DIFFERENT bytes answer 409", async () => {
+  it("re-uploading ANY bytes for an existing file row 409s (upstream TryInsertFile, D-1)", async () => {
     const owner = await seedUser("alice");
     const writer = await token(owner, "write:package");
     const first = await putFile("alice", "dup", "1.0", "same.bin", "stable-bytes", { Authorization: `token ${writer}` });
     expect(first.status).toBe(201);
     await first.text();
+    // Same bytes: still the 409 — upstream's TryInsertFile
+    // (package_file.go:46-66 → generic.go:126-127) rejects the duplicate ROW
+    // regardless of blob; there is no idempotent re-upload (D-1).
     const again = await putFile("alice", "dup", "1.0", "same.bin", "stable-bytes", { Authorization: `token ${writer}` });
-    expect(again.status).toBe(201); // the §5.2 idempotent no-op
-    await again.text();
+    expect(again.status).toBe(409);
+    expect(await again.text()).toBe("package file already exists");
+    // Different bytes at the same row: the same 409.
     const conflict = await putFile("alice", "dup", "1.0", "same.bin", "changed-bytes", { Authorization: `token ${writer}` });
     expect(conflict.status).toBe(409);
     await conflict.text();
@@ -336,13 +340,15 @@ describe("generic protocol PUT/GET/HEAD/DELETE", () => {
     await other.text();
   });
 
-  it("411 without Content-Length; 400 on the upstream validation set (name/filename/version)", async () => {
+  it("a chunked body (no Content-Length) streams to 201 and round-trips (D-2); 400 on the upstream validation set", async () => {
     const owner = await seedUser("alice");
     const writer = await token(owner, "write:package");
     const caller = protocol();
     const headers = { Authorization: `token ${writer}` };
 
-    // A body WITHOUT a declared length (chunked stream) → the 411 arm.
+    // A body WITHOUT a declared length (chunked stream) streams through the
+    // store's bounded multipart spool (D-2 — upstream Go reads the stream
+    // regardless; the old 411 precondition is gone).
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(new TextEncoder().encode("chunked"));
@@ -356,8 +362,11 @@ describe("generic protocol PUT/GET/HEAD/DELETE", () => {
       // @ts-expect-error duplex is the streams spec's required pairing for a request body stream
       duplex: "half",
     });
-    expect(noLength.status).toBe(411);
+    expect(noLength.status).toBe(201);
     await noLength.text();
+    const round = await caller("/api/packages/alice/generic/v/1/f.bin", { headers });
+    expect(round.status).toBe(200);
+    expect(await round.text()).toBe("chunked");
 
     const bad = async (path: string): Promise<void> => {
       const res = await caller(path, { method: "PUT", headers, body: "x" });
@@ -388,6 +397,24 @@ describe("generic protocol PUT/GET/HEAD/DELETE", () => {
     });
     expect(denied.status).toBe(403);
     await denied.text();
+
+    // The chunked arm (no Content-Length) has no declared length to pre-check
+    // — the size quota fires POST-SPOOL with the real size (D-2; upstream's
+    // own order, packages.go:303-306) and still 403s before any row lands.
+    const chunkedDenied = await limited("/api/packages/alice/generic/q/1/g.bin", {
+      method: "PUT",
+      headers: authHeaders(writer),
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("more-than-two"));
+          controller.close();
+        },
+      }),
+      // @ts-expect-error duplex is the streams spec's required pairing for a request body stream
+      duplex: "half",
+    });
+    expect(chunkedDenied.status).toBe(403);
+    await chunkedDenied.text();
 
     // The unlimited default lets the same bytes through.
     const allowed = await putFile("alice", "q", "1", "f.bin", "more-than-two", { Authorization: `token ${writer}` });

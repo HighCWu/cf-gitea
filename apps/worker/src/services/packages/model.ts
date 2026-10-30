@@ -198,18 +198,24 @@ export interface TryInsertFileInput {
   now?: Date;
 }
 
-/** The three outcomes §5.2 pins for a duplicate file. */
+/** The three outcomes the raw layer pins for a duplicate file (see
+ *  tryInsertFile — only the OverwriteExisting callers accept "identical"). */
 export type InsertFileResult =
   | { outcome: "created"; row: PackageFileRow }
-  | { outcome: "identical"; row: PackageFileRow } // same key + same blob → the idempotent no-op
-  | { outcome: "conflict"; row: PackageFileRow }; // same key + DIFFERENT bytes → 409 (generic.go:128)
+  | { outcome: "identical"; row: PackageFileRow } // same key + same blob → the OverwriteExisting short-circuit
+  | { outcome: "conflict"; row: PackageFileRow }; // same key + DIFFERENT bytes (the OverwriteExisting replace arm)
 
 /**
- * `TryInsertFile` (package_file.go:46-58) with §5.2's duplicate semantics:
- * the UNIQUE(version_id, lower_name, composite_key) answers the existing row
- * on a duplicate; identical bytes (same blob id) are the idempotent no-op
- * upstream's GetOrInsertBlob models, different bytes are the 409 upstream's
- * ErrDuplicatePackageFile maps to at generic.go:128.
+ * The raw file-insert layer over `TryInsertFile`'s UNIQUE(version_id,
+ * lower_name, composite_key). Upstream's TryInsertFile (package_file.go:46-66)
+ * itself answers ErrDuplicatePackageFile for ANY existing row regardless of
+ * blob; the "identical" outcome here is the raw layer's SAME-BLOB answer,
+ * consumed ONLY by the OverwriteExisting callers (helm's re-publish
+ * short-circuit, packages.go:326-329 — the delete-and-reinsert arm never
+ * reaches TryInsertFile). The TryInsertFile-level callers (generic, pypi,
+ * nuget) map EVERY duplicate — identical or not — to the 409
+ * (ErrDuplicatePackageFile → routes' StatusConflict, generic.go:126-127 /
+ * pypi.go:197-198; the packages parity review's D-1).
  */
 export async function tryInsertFile(d1: D1Database, input: TryInsertFileInput): Promise<InsertFileResult> {
   const db = drizzle(d1);

@@ -1821,7 +1821,8 @@ export interface NugetProtocolInput {
   owner: PackageOwnerRow;
   doer: PackageDoer;
   content: ReadableStream<Uint8Array>;
-  declaredLength: number;
+  /** The declared Content-Length; `undefined` = a chunked body (D-2). */
+  declaredLength: number | undefined;
   quota: PackagesQuotaConfig;
   now?: Date;
   maxBytes?: number;
@@ -1840,8 +1841,10 @@ export async function uploadNugetPackage(input: NugetProtocolInput): Promise<Nug
   const now = input.now ?? new Date();
   const maxBytes = input.maxBytes ?? MAX_NUGET_UPLOAD_BYTES;
 
-  // PASS 1 — spool the nupkg (the cap checked before and while streaming).
-  if (input.declaredLength > maxBytes) throw new NugetBodyTooLargeError();
+  // PASS 1 — spool the nupkg (the cap checked before and while streaming;
+  // a chunked body has no declared length to pre-check — the streamed cap
+  // keeps the 413).
+  if (input.declaredLength !== undefined && input.declaredLength > maxBytes) throw new NugetBodyTooLargeError();
   const spooled: SpooledBlob = await spoolAndHash({
     bucket: input.bucket,
     content: input.content,
@@ -2013,7 +2016,7 @@ export interface NugetSymbolUploadResult {
 export async function uploadNugetSymbolPackage(input: NugetProtocolInput): Promise<NugetSymbolUploadResult> {
   const now = input.now ?? new Date();
   const maxBytes = input.maxBytes ?? MAX_NUGET_UPLOAD_BYTES;
-  if (input.declaredLength > maxBytes) throw new NugetBodyTooLargeError();
+  if (input.declaredLength !== undefined && input.declaredLength > maxBytes) throw new NugetBodyTooLargeError();
   const spooled: SpooledBlob = await spoolAndHash({
     bucket: input.bucket,
     content: input.content,

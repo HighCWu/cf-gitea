@@ -700,7 +700,7 @@ describe("npm publish validation arms", () => {
     expect(errorOf(await again.json())).toBe("package version already exists");
   });
 
-  it("411s without Content-Length", async () => {
+  it("a chunked body streams; non-tarball bytes answer 400 (D-2)", async () => {
     const owner = await seedUser("alice");
     const writer = await token(owner, "write:package");
     const stream = new ReadableStream<Uint8Array>({
@@ -716,7 +716,9 @@ describe("npm publish validation arms", () => {
       // @ts-expect-error duplex is the streams spec's required pairing
       duplex: "half",
     });
-    expect(put.status).toBe(411);
+    // D-2: the spool streamed the body (no 411); "{}" is not a tarball so
+    // the packument validation's 400 is the terminal answer.
+    expect(put.status).toBe(400);
     await put.text();
   });
 

@@ -930,10 +930,6 @@ export function createPackagesProtocolRouter(): Hono<{ Bindings: Env }> {
       if (!isValidPackageVersion(packageVersion)) {
         return plainResponse(400, "invalid package version");
       }
-      const declaredLength = contentLength(c.req.raw);
-      if (declaredLength === null) {
-        return plainResponse(411, "Content-Length header is required");
-      }
       const body = c.req.raw.body as ReadableStream<Uint8Array> | null;
       await uploadGenericFile({
         d1: c.env.DB,
@@ -944,7 +940,10 @@ export function createPackagesProtocolRouter(): Hono<{ Bindings: Env }> {
         packageVersion,
         filename,
         content: body ?? emptyStream(),
-        declaredLength,
+        // A missing Content-Length streams: the store spools chunked bodies
+        // through the bounded R2 multipart upload (the parity review's D-2 —
+        // upstream Go reads the stream regardless).
+        declaredLength: contentLength(c.req.raw) ?? undefined,
         quota: packagesQuotaFromEnv(c.env),
       });
       return new Response(null, { status: 201 });

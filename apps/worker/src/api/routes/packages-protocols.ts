@@ -457,10 +457,9 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
       if (doer === null) {
         return pypiErrorResponse(401, "user should have specific permission or be a site admin");
       }
-      const declaredLength = contentLength(c.req.raw);
-      if (declaredLength === null) {
-        return pypiErrorResponse(411, "Content-Length header is required");
-      }
+      // A missing Content-Length streams: the store spools chunked bodies
+      // through the bounded R2 multipart upload (the parity review's D-2 —
+      // upstream Go reads the stream regardless).
       await uploadPypiPackage({
         d1: c.env.DB,
         bucket: c.env.REPO_PACKS,
@@ -468,7 +467,7 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         doer,
         contentType: c.req.header("content-type") ?? "",
         content: bodyStream(c.req.raw),
-        declaredLength,
+        declaredLength: contentLength(c.req.raw) ?? undefined,
         quota: packagesQuotaFromEnv(c.env),
       });
       return new Response(null, { status: 201 });
@@ -649,17 +648,13 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
       if (doer === null) {
         return helmErrorResponse(401, "user should have specific permission or be a site admin");
       }
-      const declaredLength = contentLength(c.req.raw);
-      if (declaredLength === null) {
-        return helmErrorResponse(411, "Content-Length header is required");
-      }
       await uploadHelmChart({
         d1: c.env.DB,
         bucket: c.env.REPO_PACKS,
         owner,
         doer,
         content: bodyStream(c.req.raw),
-        declaredLength,
+        declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
         quota: packagesQuotaFromEnv(c.env),
       });
       return new Response(null, { status: 201 });
@@ -691,17 +686,13 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
       if (doer === null) {
         return helmErrorResponse(401, "user should have specific permission or be a site admin");
       }
-      const declaredLength = contentLength(c.req.raw);
-      if (declaredLength === null) {
-        return helmErrorResponse(411, "Content-Length header is required");
-      }
       await uploadHelmProvenance({
         d1: c.env.DB,
         bucket: c.env.REPO_PACKS,
         owner,
         doer,
         content: bodyStream(c.req.raw),
-        declaredLength,
+        declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
         quota: packagesQuotaFromEnv(c.env),
       });
       return new Response(null, { status: 201 });
@@ -816,10 +807,6 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
           "WWW-Authenticate": WWW_AUTHENTICATE,
         });
       }
-      const declaredLength = contentLength(c.req.raw);
-      if (declaredLength === null) {
-        return plainResponse(411, "Content-Length header is required");
-      }
       const wildcard = decodeMavenPathWildcard(c.req.path, c.req.param("username") ?? "");
       if (wildcard === null) return plainResponse(400, "request parameters are invalid");
       const outcome = await uploadMavenPackageFile({
@@ -830,7 +817,7 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         pathWildcard: wildcard,
         useLegacyPackageName: new URL(c.req.url).searchParams.get("use_legacy_package_name") ?? "",
         content: bodyStream(c.req.raw),
-        declaredLength,
+        declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
         quota: packagesQuotaFromEnv(c.env),
       });
       return new Response(null, { status: outcome.kind === "created" ? 201 : 200 });
@@ -859,17 +846,13 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
       if (doer === null) {
         return nugetApiError(401, "user should have specific permission or be a site admin");
       }
-      const declaredLength = contentLength(c.req.raw);
-      if (declaredLength === null) {
-        return nugetApiError(411, "Content-Length header is required");
-      }
       const input = {
         d1: c.env.DB,
         bucket: c.env.REPO_PACKS,
         owner,
         doer,
         content: bodyStream(c.req.raw),
-        declaredLength,
+        declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
         quota: packagesQuotaFromEnv(c.env),
       };
       if (kind === "dependency") {
@@ -1477,15 +1460,13 @@ async function npmDispatch(c: Context<{ Bindings: Env }>): Promise<Response> {
       case "publish": {
         const doer = cred.doer;
         if (doer === null) return npmErrorResponse(401, "user should have specific permission or be a site admin");
-        const declaredLength = contentLength(c.req.raw);
-        if (declaredLength === null) return npmErrorResponse(411, "Content-Length header is required");
         const result = await uploadNpmPackage({
           d1: c.env.DB,
           bucket: c.env.REPO_PACKS,
           owner,
           doer,
           content: bodyStream(c.req.raw),
-          declaredLength,
+          declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
           quota: packagesQuotaFromEnv(c.env),
           instanceOrigin: origin,
         });

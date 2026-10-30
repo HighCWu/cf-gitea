@@ -837,8 +837,8 @@ export interface UploadMavenPackageFileInput {
   useLegacyPackageName: string;
   /** The request body stream (spooled whole; never buffered). */
   content: ReadableStream<Uint8Array>;
-  /** The REQUIRED declared Content-Length of the body. */
-  declaredLength: number;
+  /** The declared Content-Length; `undefined` = a chunked body (D-2). */
+  declaredLength: number | undefined;
   quota: PackagesQuotaConfig;
   now?: Date;
   /** Test seams (mirroring the pypi/helm uploads'). */

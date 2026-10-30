@@ -8,8 +8,10 @@
  *   (generic.go:20-66 — ported verbatim), streams the body through the
  *   two-pass blob store (services/packages/blobs.ts), walks the GetOrInsert
  *   ladder (package → version → blob → file, §5.2) under the quota checks
- *   (403), answers 201 created / idempotent-on-identical-bytes / 409
- *   duplicate-different-bytes.
+ *   (403), answers 201 created / 409 on ANY duplicate file row — upstream's
+ *   TryInsertFile rejects duplicates regardless of blob bytes
+ *   (package_file.go:46-66 → generic.go:126-127; the packages parity review's
+ *   D-1).
  * - Download: the version → file → blob walk, the R2 content-key stream,
  *   `Content-Disposition` per upstream's ServePackageFile
  *   (helper.go:52-77), and the lead-file GET download-counter bump
@@ -81,7 +83,8 @@ export function isValidPackageVersion(packageVersion: string): boolean {
 // Upload — the CreatePackageOrAddFileToExisting walk (packages.go:84-129)
 // ---------------------------------------------------------------------------
 
-/** Thrown when the same (version, file, composite key) exists with DIFFERENT bytes (→ 409). */
+/** Thrown when the (version, file, composite key) row already exists — ANY
+ *  bytes, upstream's ErrDuplicatePackageFile shape (→ 409). */
 export class DuplicatePackageFileError extends Error {
   constructor(readonly existing: PackageFileRow) {
     super("package file already exists");
@@ -99,7 +102,8 @@ export interface UploadGenericFileInput {
   filename: string;
   /** The request body stream (spooled, never buffered). */
   content: ReadableStream<Uint8Array>;
-  declaredLength: number;
+  /** The declared Content-Length; `undefined` = a chunked body (D-2). */
+  declaredLength: number | undefined;
   quota: PackagesQuotaConfig;
   now?: Date;
   /** Test seams. */
@@ -110,7 +114,7 @@ export interface UploadGenericFileInput {
 export interface UploadGenericFileResult {
   descriptorFile: PackageFileRow;
   blob: PackageBlobRow;
-  /** false when the upload was an idempotent duplicate (§5.2). */
+  /** Always true — a duplicate row throws (the D-1 409) instead of answering. */
   createdFile: boolean;
 }
 
@@ -121,13 +125,16 @@ export interface UploadGenericFileResult {
  *      the +1 post-insert parity — upstream's versionCreated gate checks
  *      AFTER the version insert, packages.go:188-191, and throws when
  *      totalCount > limit, packages.go:380-381, so the pre-insert
- *      equivalent is count + 1 > limit);
- *   2. PASS 1 — spool-and-hash (the store owns the 413 cap + 400 mismatch);
+ *      equivalent is count + 1 > limit; the SIZE arm pre-checks a declared
+ *      length and defers the chunked arm to post-spool with the real size —
+ *      upstream's own order);
+ *   2. PASS 1 — spool-and-hash (the store owns the 413 cap + the declared
+ *      length's 400 mismatch; the chunked arm streams the MPU spool);
  *   3. get-or-insert package → version → blob (the D1 dedup decides whether
  *      the second pass runs at all);
  *   4. PASS 2 on a new blob (or a dedup hit whose object was swept) — the
  *      spool streams to the content key, then the spool is deleted;
- *   5. the file row (identical-bytes no-op / different-bytes conflict).
+ *   5. the file row (ANY duplicate → the 409, D-1).
  */
 export async function uploadGenericFile(input: UploadGenericFileInput): Promise<UploadGenericFileResult> {
   const now = input.now ?? new Date();
@@ -137,9 +144,14 @@ export async function uploadGenericFile(input: UploadGenericFileInput): Promise<
       throw new QuotaTotalCountError();
     }
   }
-  // The size quota reads the DECLARED length pre-stream (the real size is
-  // enforced identical by the FixedLengthStream); the count check needs no size.
-  await checkSizeQuotaExceeded(input.d1, input.doer.isAdmin, input.owner.id, "generic", input.declaredLength, input.quota);
+  // The size quota pre-checks the DECLARED length (reject a doomed upload
+  // without reading it); the chunked arm (no Content-Length — D-2) has no
+  // declaration and checks after the spool with the REAL size below — which
+  // is upstream's own order (addFileToPackageVersion reads Data.Size() after
+  // the read, packages.go:303-306). The count check needs no size.
+  if (input.declaredLength !== undefined) {
+    await checkSizeQuotaExceeded(input.d1, input.doer.isAdmin, input.owner.id, "generic", input.declaredLength, input.quota);
+  }
 
   const spooled: SpooledBlob = await spoolAndHash({
     bucket: input.bucket,
@@ -150,6 +162,9 @@ export async function uploadGenericFile(input: UploadGenericFileInput): Promise<
   });
 
   try {
+    if (input.declaredLength === undefined) {
+      await checkSizeQuotaExceeded(input.d1, input.doer.isAdmin, input.owner.id, "generic", spooled.size, input.quota);
+    }
     const { row: pkg } = await getOrInsertPackage(input.d1, {
       ownerId: input.owner.id,
       type: "generic",
@@ -183,6 +198,12 @@ export async function uploadGenericFile(input: UploadGenericFileInput): Promise<
     // The D1 row only became useful after the final key was durably stored
     // (object-first, §5.1). A failure from here on leaves the unreferenced
     // blob row + key to the cleanup sweep (the ratified failure window).
+    // ANY existing (version, name, composite key) row is the 409 — upstream's
+    // TryInsertFile rejects duplicates regardless of blob bytes
+    // (package_file.go:46-66 → generic.go:126-127), so a same-bytes re-upload
+    // conflicts too (the packages parity review's D-1; the same-blob
+    // short-circuit exists only on the OverwriteExisting path — helm — never
+    // here).
     const fileResult = await tryInsertFile(input.d1, {
       versionId: version.id,
       blobId: blob.id,
@@ -190,10 +211,10 @@ export async function uploadGenericFile(input: UploadGenericFileInput): Promise<
       isLead: true,
       now,
     });
-    if (fileResult.outcome === "conflict") {
+    if (fileResult.outcome !== "created") {
       throw new DuplicatePackageFileError(fileResult.row);
     }
-    return { descriptorFile: fileResult.row, blob, createdFile: fileResult.outcome === "created" };
+    return { descriptorFile: fileResult.row, blob, createdFile: true };
   } catch (error) {
     // The spool never orphans on a failure INSIDE the walk (the store's own
     // failure path already deleted it; copySpoolToContentKey deletes it on

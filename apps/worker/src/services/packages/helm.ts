@@ -560,7 +560,8 @@ export interface UploadHelmChartInput {
   doer: PackageDoer;
   /** The raw chart archive stream (the request body). */
   content: ReadableStream<Uint8Array>;
-  declaredLength: number;
+  /** The declared Content-Length; `undefined` = a chunked body (D-2). */
+  declaredLength: number | undefined;
   quota: PackagesQuotaConfig;
   now?: Date;
   maxBytes?: number;

@@ -332,7 +332,7 @@ describe("pypi upload validation arms", () => {
     await put.text();
   });
 
-  it("re-uploading IDENTICAL bytes is idempotent; DIFFERENT bytes answer 409", async () => {
+  it("ANY duplicate file answers 409 regardless of bytes (D-1 — upstream TryInsertFile)", async () => {
     const owner = await seedUser("alice");
     const writer = await token(owner, "write:package");
     const first = await twineUpload(
@@ -343,14 +343,14 @@ describe("pypi upload validation arms", () => {
     );
     expect(first.status).toBe(201);
     await first.text();
-    const again = await twineUpload(
+    const sameAgain = await twineUpload(
       "alice",
       { name: "dup", version: "1.0" },
       { filename: "same.whl", content: WHEEL_BYTES },
       authHeaders(writer),
     );
-    expect(again.status).toBe(201); // the §5.2 idempotent no-op
-    await again.text();
+    expect(sameAgain.status).toBe(409); // D-1: identical bytes 409 too — upstream's TryInsertFile row-level duplicate
+    await sameAgain.text();
     const conflict = await twineUpload(
       "alice",
       { name: "dup", version: "1.0" },
@@ -361,7 +361,7 @@ describe("pypi upload validation arms", () => {
     await conflict.text();
   });
 
-  it("411s without Content-Length", async () => {
+  it("a chunked body (no Content-Length) streams to 201 (D-2)", async () => {
     const owner = await seedUser("alice");
     const writer = await token(owner, "write:package");
     const stream = new ReadableStream<Uint8Array>({
@@ -377,7 +377,10 @@ describe("pypi upload validation arms", () => {
       // @ts-expect-error duplex is the streams spec's required pairing
       duplex: "half",
     });
-    expect(put.status).toBe(411);
+    // D-2: the spool streamed the unknown-length body (no 411); the bare
+    // "chunked" bytes are not a valid twine form so the scan's 400 is the
+    // terminal answer — the STREAMING is what this pin guards.
+    expect(put.status).toBe(400);
     await put.text();
   });
 

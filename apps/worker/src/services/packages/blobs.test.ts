@@ -4,8 +4,9 @@
  * segments throw before any R2 call), the PASS-1 spool-and-hash (digests
  * verified against crypto.subtle, the cap checked BEFORE and DURING
  * streaming, the lying-Content-Length mismatch, the spool deleted on every
- * failure path), the PASS-2 copy (content key bytes, spool gone), and the
- * D1 dedup pair.
+ * failure path — plus the CHUNKED arm, D-2: no declared length spools through
+ * the bounded R2 multipart upload with the same digests, cap and cleanup),
+ * the PASS-2 copy (content key bytes, spool gone), and the D1 dedup pair.
  */
 
 import { applyD1Migrations } from "cloudflare:test";
@@ -144,6 +145,57 @@ describe("spoolAndHash", () => {
 
   it("the default cap is the SPEC-0005 512 MiB posture", () => {
     expect(MAX_PACKAGE_BLOB_BYTES).toBe(512 * 1024 * 1024);
+  });
+
+  // --- The CHUNKED arm (no declared Content-Length — the parity review's D-2):
+  // the bounded R2 multipart spool, same digests, same cap, same cleanup. ---
+
+  it("chunked: streams a body without a declared length, digests and byte-parity intact", async () => {
+    const payload = text("chunked upload bytes");
+    const spoolKey = packageBlobSpoolKey("22222222-3333-4444-5555-666666666666");
+    const spooled = await spoolAndHash({
+      bucket: bucket(),
+      content: streamOf([payload.slice(0, 5), payload.slice(5)]), // chunk boundaries differ from the body
+      spoolKey,
+    });
+    expect(spooled.size).toBe(payload.byteLength);
+    expect(spooled.sha256).toBe(await sha256Hex(payload));
+    const stored = await bucket().get(spoolKey);
+    expect(stored).not.toBeNull();
+    expect(new Uint8Array((await stored?.arrayBuffer()) ?? new ArrayBuffer(0))).toEqual(payload);
+  });
+
+  it("chunked: a body spanning multiple 8 MiB parts completes the MPU byte-parity", async () => {
+    const first = new Uint8Array(8 * 1024 * 1024).fill(0x61); // exactly one part...
+    const tail = text("tail"); // ...plus a small final part
+    const spoolKey = packageBlobSpoolKey("33333333-4444-5555-6666-777777777777");
+    const spooled = await spoolAndHash({ bucket: bucket(), content: streamOf([first, tail]), spoolKey });
+    expect(spooled.size).toBe(first.byteLength + tail.byteLength);
+    const stored = await bucket().get(spoolKey);
+    expect(stored?.size).toBe(first.byteLength + tail.byteLength);
+    const round = new Uint8Array((await stored?.arrayBuffer()) ?? new ArrayBuffer(0));
+    expect(round.byteLength).toBe(first.byteLength + tail.byteLength);
+    expect(round.subarray(0, 8)).toEqual(first.subarray(0, 8));
+    expect(round.subarray(first.byteLength)).toEqual(tail);
+  });
+
+  it("chunked: a zero-byte body aborts the empty MPU and stores the empty object", async () => {
+    const spooled = await spoolAndHash({ bucket: bucket(), content: streamOf([]) });
+    expect(spooled.size).toBe(0);
+    expect(spooled.sha256).toBe(await sha256Hex(new Uint8Array(0)));
+    const stored = await bucket().get(spooled.spoolKey);
+    expect(stored?.size).toBe(0);
+  });
+
+  it("chunked: the cap still fires mid-stream (→ 413) and leaves no spool object", async () => {
+    await expect(
+      spoolAndHash({
+        bucket: bucket(),
+        content: streamOf([text("123456"), text("789012")]),
+        maxBytes: 10, // no declared length — only the streamed check can trip
+      }),
+    ).rejects.toThrow(PackageBlobTooLargeError);
+    expect(await listKeys(spoolPrefix)).toEqual([]);
   });
 });
 

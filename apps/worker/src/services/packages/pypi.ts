@@ -12,9 +12,11 @@
  *   pass (the store's single-pass discipline, blobs.ts). The second pass
  *   ranges exactly that span out of the spool into the content key. Upstream's
  *   arms port in order: missing content part → 400, `sha256_digest`
- *   mismatch → 400 "hash mismatch" (EqualFold, pypi.go:122), normalized name
+ *   mismatch — or ABSENCE, upstream's FormValue-empty EqualFold (pypi.go:120-124,
+ *   the parity review's D-3) — → 400 "hash mismatch", normalized name
  *   + PEP 440 version mismatch → 400 "invalid name or version"
- *   (pypi.go:132-136), duplicate file → 409, quota → 403, created → 201.
+ *   (pypi.go:132-136), duplicate file (ANY bytes — D-1) → 409, quota → 403,
+ *   created → 201.
  * - The PEP 503 simple index (`/simple/{id}`, pypi.go:47-75): all versions of
  *   the normalized package, sorted by the raw version string (upstream's
  *   strings.Compare, pypi.go:67-69), rendered through the
@@ -125,8 +127,9 @@ export class PypiMissingContentError extends Error {
   }
 }
 
-/** `sha256_digest` contradicts the streamed bytes (→ 400 "hash mismatch",
- *  pypi.go:122). */
+/** `sha256_digest` contradicts the streamed bytes, or the field is absent —
+ *  upstream's EqualFold over FormValue's empty default answers both with the
+ *  same 400 "hash mismatch" (pypi.go:120-124). */
 export class PypiHashMismatchError extends Error {
   constructor() {
     super("hash mismatch");
@@ -527,8 +530,8 @@ export interface UploadPypiPackageInput {
   contentType: string;
   /** The request body stream (spooled whole; never buffered). */
   content: ReadableStream<Uint8Array>;
-  /** The REQUIRED declared Content-Length of the multipart body. */
-  declaredLength: number;
+  /** The declared Content-Length; `undefined` = a chunked body (D-2). */
+  declaredLength: number | undefined;
   quota: PackagesQuotaConfig;
   now?: Date;
   /** Test seams (mirroring the generic upload's). */
@@ -591,8 +594,14 @@ export async function uploadPypiPackage(input: UploadPypiPackageInput): Promise<
     if (file === null || file.filename === "") {
       throw new PypiMissingContentError();
     }
-    const declaredDigest = firstField(scanned.fields, "sha256_digest");
-    if (declaredDigest !== undefined && declaredDigest.toLowerCase() !== file.sha256) {
+    // Upstream reads FormValue("sha256_digest") — an ABSENT field is the
+    // empty string, and strings.EqualFold("", hash) is false, so a digest-less
+    // upload 400s "hash mismatch" exactly like a wrong one (pypi.go:120-124):
+    // the integrity gate cannot be bypassed by omitting the field (the
+    // packages parity review's D-3). EqualFold is case-insensitive, so the
+    // declared value folds against the lowercase streamed hex.
+    const declaredDigest = firstField(scanned.fields, "sha256_digest") ?? "";
+    if (declaredDigest.toLowerCase() !== file.sha256) {
       throw new PypiHashMismatchError();
     }
     const packageName = normalizePypiName(firstField(scanned.fields, "name") ?? "");
@@ -656,6 +665,10 @@ export async function uploadPypiPackage(input: UploadPypiPackageInput): Promise<
     }
 
     // IsLead: true (pypi.go:192) — every twine upload is the lead file.
+    // ANY existing (version, name, composite key) row is the 409 — upstream's
+    // TryInsertFile rejects duplicates regardless of blob bytes
+    // (package_file.go:46-66 → pypi.go:197-198), so a same-bytes re-upload
+    // conflicts too (the packages parity review's D-1).
     const fileResult: InsertFileResult = await tryInsertFile(input.d1, {
       versionId: version.id,
       blobId: blob.id,
@@ -663,10 +676,10 @@ export async function uploadPypiPackage(input: UploadPypiPackageInput): Promise<
       isLead: true,
       now,
     });
-    if (fileResult.outcome === "conflict") {
+    if (fileResult.outcome !== "created") {
       throw new DuplicatePackageFileError(fileResult.row);
     }
-    return { descriptorFile: fileResult.row, blob, createdFile: fileResult.outcome === "created" };
+    return { descriptorFile: fileResult.row, blob, createdFile: true };
   } catch (error) {
     await input.bucket.delete(spooled.spoolKey).catch(() => undefined);
     throw error;

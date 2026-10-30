@@ -35,12 +35,23 @@
  *
  * ## Streaming discipline (AGENTS.md Workers rules)
  *
- * Content-Length is REQUIRED at the protocol layer (411 — the landed upload
- * families' rule) so the store always streams a known-length body through a
- * FixedLengthStream (a lying header errors the pipe instead of truncating).
- * The 512 MiB cap (SPEC-0005 §3.3's fixed posture) is checked BEFORE
- * streaming (declared length) and per-chunk WHILE streaming. `arrayBuffer()`
- * is never called on an unknown-size body.
+ * A DECLARED Content-Length (the common case — every real registry client
+ * sends one) streams through a FixedLengthStream (a lying header errors the
+ * pipe instead of truncating), with the 512 MiB cap checked BEFORE streaming
+ * (declared length) and per-chunk WHILE streaming.
+ *
+ * A CHUNKED body (no Content-Length — `curl -T -`, `curl --data-binary @-`;
+ * the packages parity review's D-2: upstream Go streams these) spools through
+ * a bounded R2 MULTIPART upload instead — the R2 binding rejects
+ * unknown-length streams (release-assets.ts's raw path requires the declared
+ * length for the same reason), so the unknown arm buffers 8 MiB parts at a
+ * time and uploads them as it goes: memory stays flat, the per-chunk cap
+ * still fires mid-stream (→ 413), and the completed spool object is
+ * byte-identical in role to the known-length arm's (pass 2 cannot tell the
+ * arms apart). An isolate death mid-MPU leaves uploaded parts for R2's own
+ * incomplete-part collection — the same ratified orphan window the
+ * release-asset MPU carries. `arrayBuffer()` is never called on an
+ * unknown-size body.
  */
 
 import { and, eq, type SQL } from "drizzle-orm";
@@ -143,32 +154,42 @@ export interface SpoolAndHashInput {
   bucket: R2Bucket;
   /** The request body stream (the store never calls arrayBuffer on it). */
   content: ReadableStream<Uint8Array>;
-  /** The REQUIRED declared Content-Length (the route answers 411 without it). */
-  declaredLength: number;
+  /**
+   * The declared Content-Length when the client sent one (every real registry
+   * client does). `undefined` — a chunked body (the parity review's D-2) —
+   * spools through the bounded R2 multipart upload instead of the
+   * FixedLengthStream, streaming all the same: the size-mismatch check is
+   * meaningless without a declaration, the cap still fires per-chunk.
+   */
+  declaredLength?: number;
   /** Cap override — test seam (routes use the module const). */
   maxBytes?: number;
   /** Spool key override — test seam (routes mint a random uuid). */
   spoolKey?: string;
 }
 
+/** The bounded MPU part (the release-asset posture — above R2's 5 MiB part
+ *  floor, far under the memory budget, 64 parts to the 512 MiB cap). */
+const UPLOAD_PART_BYTES = 8 * 1024 * 1024;
+
 /**
- * PASS 1 (§5.1): single-pass hash-and-forward into the spool object. The
- * 512 MiB cap is checked BEFORE streaming (declared length) and per-chunk
- * WHILE streaming; the FixedLengthStream makes a lying Content-Length error
- * the pipe (mapped to PackageSizeMismatchError). Any failure deletes the
- * spool object so confirmed bytes never orphan (the release-asset rollback).
+ * PASS 1 (§5.1) — the KNOWN-LENGTH arm: single-pass hash-and-forward into the
+ * spool object through a FixedLengthStream. The 512 MiB cap is checked BEFORE
+ * streaming (declared length) and per-chunk WHILE streaming; a lying
+ * Content-Length errors the pipe (mapped to PackageSizeMismatchError). Any
+ * failure deletes the spool object so confirmed bytes never orphan (the
+ * release-asset rollback).
  */
-export async function spoolAndHash(input: SpoolAndHashInput): Promise<SpooledBlob> {
-  const spoolKey = input.spoolKey ?? packageBlobSpoolKey(crypto.randomUUID());
-  const limit = input.maxBytes ?? MAX_PACKAGE_BLOB_BYTES;
-  // BEFORE streaming (§6 storage plan: "over-cap → 413 checked before and
-  // during streaming").
-  if (input.declaredLength > limit) {
-    throw new PackageBlobTooLargeError();
-  }
+async function spoolKnownLength(input: SpoolAndHashInput, spoolKey: string, limit: number): Promise<SpooledBlob> {
+  const declaredLength = input.declaredLength as number;
   const digests = new RunningDigests();
   let forwarded = 0;
   try {
+    // BEFORE streaming (§6 storage plan: "over-cap → 413 checked before and
+    // during streaming").
+    if (declaredLength > limit) {
+      throw new PackageBlobTooLargeError();
+    }
     const hashAndCap = new TransformStream<Uint8Array, Uint8Array>({
       transform(chunk, controller) {
         forwarded += chunk.byteLength;
@@ -180,12 +201,12 @@ export async function spoolAndHash(input: SpoolAndHashInput): Promise<SpooledBlo
       },
       flush() {
         // Typed check beats FixedLengthStream's anonymous abort.
-        if (forwarded !== input.declaredLength) {
+        if (forwarded !== declaredLength) {
           throw new PackageSizeMismatchError();
         }
       },
     });
-    const sink = hashAndCap.readable.pipeThrough(new FixedLengthStream(input.declaredLength));
+    const sink = hashAndCap.readable.pipeThrough(new FixedLengthStream(declaredLength));
     // The pump and the store run concurrently; whichever fails first fails
     // the upload, and the catch leaves no spool object behind.
     const put = input.bucket.put(spoolKey, sink);
@@ -196,6 +217,86 @@ export async function spoolAndHash(input: SpoolAndHashInput): Promise<SpooledBlo
   }
   const hexes = await digests.hexes();
   return { spoolKey, size: forwarded, ...hexes };
+}
+
+/**
+ * PASS 1 (§5.1) — the CHUNKED arm (no declared length): the same
+ * hash-and-cap walk, but the sink is a bounded R2 multipart upload — 8 MiB
+ * parts streamed as they fill, memory flat regardless of body size. The cap
+ * fires per-chunk (→ 413); no size-mismatch check exists without a
+ * declaration (there is nothing to mismatch). Failure aborts the MPU and
+ * deletes any completed spool; a zero-byte body aborts the (empty) MPU and
+ * stores the empty object directly — an MPU with no parts cannot complete.
+ */
+async function spoolUnknownLength(input: SpoolAndHashInput, spoolKey: string, limit: number): Promise<SpooledBlob> {
+  const digests = new RunningDigests();
+  const mpu = await input.bucket.createMultipartUpload(spoolKey);
+  const uploaded: R2UploadedPart[] = [];
+  let partNumber = 1;
+  let forwarded = 0;
+  try {
+    const buffer = new Uint8Array(UPLOAD_PART_BYTES);
+    let filled = 0;
+    const flush = async (): Promise<void> => {
+      if (filled === 0) return;
+      uploaded.push(await mpu.uploadPart(partNumber, buffer.slice(0, filled)));
+      partNumber += 1;
+      filled = 0;
+    };
+    const reader = input.content.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done || value === undefined) break;
+      forwarded += value.byteLength;
+      if (forwarded > limit) {
+        throw new PackageBlobTooLargeError();
+      }
+      await digests.write(value);
+      let offset = 0;
+      while (offset < value.byteLength) {
+        const room = UPLOAD_PART_BYTES - filled;
+        const count = Math.min(room, value.byteLength - offset);
+        buffer.set(value.subarray(offset, offset + count), filled);
+        filled += count;
+        offset += count;
+        if (filled === UPLOAD_PART_BYTES) {
+          await flush();
+        }
+      }
+    }
+    await flush();
+    if (uploaded.length === 0) {
+      await mpu.abort();
+      await input.bucket.put(spoolKey, new Uint8Array(0));
+    } else {
+      await mpu.complete(uploaded);
+    }
+  } catch (error) {
+    try {
+      await mpu.abort();
+    } catch {
+      // Already aborted/completed — abort failures must not mask the error.
+    }
+    await input.bucket.delete(spoolKey).catch(() => undefined);
+    throw error;
+  }
+  const hexes = await digests.hexes();
+  return { spoolKey, size: forwarded, ...hexes };
+}
+
+/**
+ * PASS 1 (§5.1): single-pass hash-and-forward into the spool object — the
+ * known-length arm through a FixedLengthStream, the chunked arm through the
+ * bounded multipart upload (see the module header's streaming discipline).
+ * Either way the 512 MiB cap is enforced WHILE streaming and any failure
+ * leaves no spool object behind.
+ */
+export async function spoolAndHash(input: SpoolAndHashInput): Promise<SpooledBlob> {
+  const spoolKey = input.spoolKey ?? packageBlobSpoolKey(crypto.randomUUID());
+  const limit = input.maxBytes ?? MAX_PACKAGE_BLOB_BYTES;
+  return input.declaredLength === undefined
+    ? spoolUnknownLength(input, spoolKey, limit)
+    : spoolKnownLength(input, spoolKey, limit);
 }
 
 /**
