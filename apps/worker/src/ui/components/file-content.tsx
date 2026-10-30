@@ -7,6 +7,14 @@
  * pipeline output), `plain-text`, `code-view` (line table; syntax
  * highlighting is client-side by Gitea's own bundles), `.view-raw`
  * (media/prompt), the too-large prompt (§4.3) and the empty prompt.
+ *
+ * The file-info size entry carries upstream's LFS badge
+ * (templates/repo/file_info.tmpl:14 — `<span class="file-info-size">…
+ * </span>{{if .IsLFSFile}}<span class="ui label">LFS</span>{{end}}`, inside
+ * the `{{if ne .FileSize nil}}` block): the caller passes `isLfsFile` from
+ * the view_file.go pointer probe (routers/web/repo/view.go:72-123
+ * getFileReader — text-gated ReadPointerFromBuffer over the first
+ * lfs.MetaFileMaxSize bytes).
  */
 
 
@@ -152,6 +160,10 @@ export function FileContentView(props: {
   text?: string;
   mediaKind?: MediaKind;
   size?: number | null;
+  /** file_info.tmpl:14's LFS badge — view_file.go:218's IsLFSFile (the
+   *  caller's pointer probe, view.go:72-123 getFileReader). Undefined/false
+   *  = plain file, no badge. */
+  isLfsFile?: boolean;
   /** Decoded line count (text variants only). */
   numLines?: number | null;
   isSymlink?: boolean;
@@ -219,6 +231,7 @@ export function FileContentView(props: {
                 {props.size != null ? (
                   <div class="file-info-entry">
                     <span class="file-info-size">{formatByteSize(props.size)}</span>
+                    {props.isLfsFile ? <span class="ui label">LFS</span> : null}
                   </div>
                 ) : null}
               </div>

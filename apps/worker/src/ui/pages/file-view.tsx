@@ -11,6 +11,14 @@
  * `data-global-init="initRepoFileView"` + `data-raw-file-link`, and the copy
  * button `data-global-click="onCopyContentButtonClick"` — the raw link
  * targets the tier-1 API raw route (§3.3, open question 3).
+ *
+ * The blob view also carries upstream's LFS badge (file_info.tmpl:14 —
+ * `<span class="ui label">LFS</span>` beside the size): the loader runs
+ * view_file.go's pointer probe (routers/web/repo/view.go:72-123
+ * getFileReader — the first lfs.MetaFileMaxSize bytes text-gated, then
+ * lfs.ReadPointerFromBuffer; a VALID pointer flags the file LFS, INCLUDING
+ * when the meta row is missing — view.go:104-110 sets lfsMeta on that error
+ * path too, so the badge is a parse-only, D1-free property).
  */
 
 import type { CommitJson, TreeEntryJson } from "@cf-gitea/git-engine";
@@ -23,9 +31,11 @@ import type { EngineClient } from "../engine";
 import { resolveRefSuffix, splitRefSuffix } from "../index";
 import type { RefType } from "../index";
 import { blameLink, treeLink } from "../links";
+import { parsePointer, POINTER_MAX_BYTES, PointerTooLargeError } from "../../services/lfs/pointer";
 import {
   classifyBlob,
   enrichTreeCommits,
+  isBinaryData,
   MAX_DISPLAY_FILE_SIZE,
   mediaKindOf,
   pathEscapeSegments,
@@ -57,6 +67,9 @@ export type FileViewData =
       siblings: TreeEntryJson[];
       entry: TreeEntryJson;
       variant: BlobViewVariant;
+      /** file_info.tmpl:14's LFS badge gate — the loader's pointer probe
+       *  (view.go:72-123 getFileReader's isLFSFile). */
+      isLfsFile: boolean;
       markupHtml?: string;
       text?: string;
       mediaKind?: MediaKind;
@@ -72,6 +85,28 @@ export type FileViewData =
 /** The directory whose listing surrounds `path` ("" at root). */
 function parentDirOf(path: string): string {
   return path.includes("/") ? path.split("/").slice(0, -1).join("/") : "";
+}
+
+/**
+ * view_file.go getFileReader's pointer probe (view.go:72-123): the first
+ * lfs.MetaFileMaxSize (= POINTER_MAX_BYTES) bytes of the GIT blob, text-gated
+ * (`if !fi.st.IsText() … return` — our landed null-byte sniff is the §4.2
+ * port of the same gate), then `lfs.ReadPointerFromBuffer`. A VALID pointer
+ * answers true — INCLUDING when the meta row is missing (view.go:104-110
+ * sets lfsMeta on that error path, so `isLFSFile()` stays true and the badge
+ * shows over pointer content). A MALFORMED pointer (the parser's
+ * InvalidPointerError — upstream's `pointer.IsValid() == false`) is a plain
+ * file; PointerTooLargeError cannot fire (the probe slices at the cap).
+ */
+function probeIsLfsFile(blobData: Uint8Array): boolean {
+  const probe = blobData.subarray(0, Math.min(blobData.byteLength, POINTER_MAX_BYTES));
+  if (probe.byteLength === 0 || isBinaryData(probe)) return false; // the IsText gate
+  try {
+    return parsePointer(probe, { strict: false }) !== null;
+  } catch (error) {
+    if (error instanceof PointerTooLargeError) throw error; // unreachable — the probe slices
+    return false; // InvalidPointerError — upstream's invalid-pointer arm
+  }
 }
 
 /** The current-dir sidebar (§2.1: one listTree call, no lazy tree v1).
@@ -218,6 +253,10 @@ export async function loadFileViewData(
       siblings: parentTree?.entries ?? [],
       entry,
       variant: "too-large",
+      // A pointer blob is ≤ lfs.MetaFileMaxSize bytes — never over the 8 MiB
+      // display cap, so the too-large arm cannot be an LFS file (and §4.3
+      // forbids the readBlob the probe would need anyway).
+      isLfsFile: false,
       // over the display cap ⇒ necessarily over the engine's 1 MiB blame cap
       blameable: false,
       latestCommit: tooLargeLog?.commits[0] ?? null,
@@ -277,6 +316,7 @@ export async function loadFileViewData(
     siblings: parentTree?.entries ?? [],
     entry,
     variant,
+    isLfsFile: probeIsLfsFile(blob.data),
     markupHtml,
     text,
     mediaKind,
@@ -381,6 +421,7 @@ export function FileViewPage(props: { ctx: UiContext; data: FileViewData; canWri
               text={data.text}
               mediaKind={data.mediaKind}
               size={data.entry.size ?? null}
+              isLfsFile={data.isLfsFile}
               numLines={data.text !== undefined ? splitLines(data.text).length : null}
               isSymlink={data.entry.mode === "120000"}
               latestCommit={data.latestCommit}

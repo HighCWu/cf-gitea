@@ -18,6 +18,26 @@
  * covers — the wiki-raw checkDownloadTokenScope note) and
  * `repo.MustBeNotEmpty` — an empty repo 404-shells before the handler body.
  *
+ * ## The LFS audit note (2026-10-30 — findings-git-e2e F4's premise corrected)
+ *
+ * F4 read upstream's raw route as `SingleDownloadOrLFS` "wired at
+ * web.go:1701" — but web.go:1701 is a line of the MEDIA group: at the pin,
+ * `/raw` is `repo.SingleDownload` (web.go:1705-1712) and `/media` is
+ * `repo.SingleDownloadOrLFS` (web.go:1699-1704). SingleDownload
+ * (download.go:105-121) calls `common.ServeBlob` DIRECTLY — no pointer
+ * probe, no LFS arm (serve.go:20-44's ServeBlob has none) — so upstream
+ * `/raw` serves the POINTER TEXT for an LFS file (a text blob → sniffed
+ * `text/plain`, the git-blob-oid ETag), exactly what this module's raw arm
+ * has always served. Upstream's own web UI corroborates the split: it links
+ * LFS files with `/media/` URLs (view_file.go:210-212 flips RawFileLink for
+ * LFS files; tests/integration/lfs_view_test.go:61,80 asserts the /media
+ * link) precisely BECAUSE raw would serve pointer bytes. The split is as old
+ * as the surfaces themselves (2a03e96bce, #5787 — 2019: the /media group is
+ * BORN on SingleDownloadOrLFS while /raw stays on SingleDownload). SPEC-0006
+ * already records the posture ("GET …/raw/{filepath} never LFS-resolves").
+ * This module therefore stays as landed — no raw-arm LFS resolution; the
+ * matrix suite pins the raw-arm pointer serving as a regression guard.
+ *
  * ## The upstream handlers (routers/web/repo/download.go)
  *
  * - `SingleDownload` (:105-121): getBlobForEntry (:69-102) — the tree entry

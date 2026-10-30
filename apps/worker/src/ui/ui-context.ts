@@ -92,6 +92,20 @@ export interface UiContext {
    *  COUNT per signed-in request). Absent/null = anonymous or a degraded
    *  count — the badge renders hidden (upstream's tw-hidden-at-0 shape). */
   notificationCount?: number | null;
+  /** The usability B-4 trio's per-viewer state (repo/header/watch.tmpl +
+   *  star.tmpl's signed arms), set by the repo-scoped prologue for USER
+   *  viewers only — absent on anonymous viewers and degraded loaders:
+   *  - `viewerWatchsRepo`: the `repo_watchers` edge (models/repo/watch.go's
+   *    GetWatch binary reduction — the landed watch substrate carries no
+   *    mode column, so "watching" is the edge's presence, "participating"
+   *    its absence; the ignore/custom modes are unrepresentable);
+   *  - `viewerStarsRepo`: the `stars` edge (star.tmpl's IsStaringRepo);
+   *  - `viewerForkOfRepo`: the doer's existing fork of this repo (fork.tmpl's
+   *    one-fork `UserAndOrgForks` arm — the direct-link state), null =
+   *    probed-none. */
+  viewerWatchsRepo?: boolean;
+  viewerStarsRepo?: boolean;
+  viewerForkOfRepo?: { ownerNamespace: string; slug: string } | null;
   /** SPEC-0014 §4.4 (M2 demo wave): the DEMO_MODE render gate for the
    *  shell's dismissible demo banner (shell.tsx). Set per-request from the
    *  env by the context assemblers — `demoModeEnabled(c.env)`

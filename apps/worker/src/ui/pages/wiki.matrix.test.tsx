@@ -316,10 +316,34 @@ describe("the window-2e wiki family claim (the escalated bug's pin — green sin
     expect(parseUiRoute("/w107gal/w107wik/wiki/blob_excerpt/abc")).toMatchObject({ family: "wiki-blob-excerpt", sha: "abc" });
   });
 
+  it("claims the SLASHED tails the family itself emits (the findings-git-e2e F5 pin)", () => {
+    // The missing-page fold's target and the dropdown's Pages item are
+    // upstream's own slashed bytes (wiki.go:238/340/400, view.tmpl:25);
+    // parseUiRoute trims the trailing slash (ui/index.ts's §4.13 rule), so
+    // the shape claims as the bare tail. The dispatcher admits it through
+    // the wikiTrailingSlash carve (8fdee92 — the lastcommit carve's twin).
+    expect(parseUiRoute("/w107gal/w107wik/wiki/")).toMatchObject({ family: "wiki", owner: "w107gal", repo: "w107wik", rawTail: "" });
+    expect(parseUiRoute("/w107gal/w107wik/wiki/Home/")).toMatchObject({ family: "wiki", rawTail: "Home" });
+    expect(handlesUiRoute("/w107gal/w107wik/wiki/")).toBe(true);
+  });
+
   it("serves the mounted view instead of the drift-guard plain 404", async () => {
     const res = await get("/w107gal/w107wik/wiki");
     expect(res.status).toBe(200);
     expect(await res.text()).toContain("repository wiki");
+  });
+
+  it("serves the SLASHED ?action=_pages fold target and the bare slashed tail in one hop", async () => {
+    // The fold target renders the pages list (the dispatch keys on the
+    // query; the trimmed rawTail "" is unused by this arm).
+    const pages = await get("/w107gal/w107wik/wiki/?action=_pages");
+    expect(pages.status).toBe(200);
+    const pagesHtml = await pages.text();
+    expect(pagesHtml).toContain('<div role="main" aria-label="Pages" class="page-content repository wiki pages">');
+    // The bare slashed tail (no action) is the view arm over Home.
+    const view = await get("/w107gal/w107wik/wiki/");
+    expect(view.status).toBe(200);
+    expect(await view.text()).toContain('<div role="main" aria-label="Home" class="page-content repository wiki">');
   });
 });
 
@@ -623,15 +647,24 @@ describe("the no-wiki arms over a settings-enabled, branch-less repo", () => {
     expect(await edit.text()).toContain("repository wiki start");
   });
 
-  it("renders the _new form with the mount's constant empty title (upstream prefills Home)", async () => {
+  it("prefills the _new title with Home on the branch-less wiki, lets ?title= override, and stays empty on a live wiki (NewWiki, wiki.go:652-663)", async () => {
+    // The branch-less arm: upstream sets title="Home" when !HasWiki.
     const res = await get("/w107gal/w107bare/wiki?action=_new", OWNER);
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('<form class="ui form form-fetch-action" action="?action=_new" method="post">');
-    // Upstream NewWiki prefills "Home" when the wiki branch is absent
-    // (wiki.go:655-663); the mount passes "" unconditionally — PINNED AS-IS
-    // (same disclosure).
-    expect(html).toContain('<input name="title" value=""');
+    expect(html).toContain('<input name="title" value="Home"');
+    // The ?title= override beats the Home prefill (upstream's non-empty
+    // FormString("title") check — the start page's create button flow's
+    // deep-link form).
+    const titled = await get("/w107gal/w107bare/wiki?action=_new&title=Setup%20Guide", OWNER);
+    expect(titled.status).toBe(200);
+    expect(await titled.text()).toContain('<input name="title" value="Setup Guide"');
+    // The live-wiki arm (w107wik's branch exists from the beforeAll seed):
+    // the title input stays empty (upstream arms no default when HasWiki).
+    const live = await get("/w107gal/w107wik/wiki?action=_new", OWNER);
+    expect(live.status).toBe(200);
+    expect(await live.text()).toContain('<input name="title" value=""');
   });
 });
 

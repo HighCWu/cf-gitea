@@ -697,7 +697,7 @@ import { parsePageNumber, pathEscapeSegments } from "./page-data";
 import { resolveRepositoryForViewer } from "./repo-view";
 import { renderNotFound, renderUiPage } from "./render";
 import { sameOriginGuard } from "./session";
-import { blobRedirectResponse, isFetchActionRequest, treeRedirectResponse } from "./pages/repo-home";
+import { blobRedirectResponse, fetchActionRedirectResponse, isFetchActionRequest, treeRedirectResponse } from "./pages/repo-home";
 import {
   loadReleaseDownload,
   openReleaseAttachment,
@@ -747,6 +747,9 @@ import { actionsJobLogsResponse, loadActionsRunJobLogs } from "./pages/repo-acti
 import { resolveActionsRunWorkflowFile } from "./pages/repo-actions-workflow";
 import { renderWorkflowBadgeSvg, resolveWorkflowBadge } from "./pages/repo-actions-badge";
 import { loadWorkflowDispatchInputsFragment } from "./pages/repo-actions-dispatch-inputs";
+import { repoStarActionResponse, repoWatchActionResponse } from "./pages/repo-header-actions";
+import { isWatchingRepo } from "../api/services/repo-watchers";
+import { isStarring } from "../api/services/stars";
 import {
   bulkAdminActionsRunners,
   deleteAdminActionsRunner,
@@ -1100,6 +1103,7 @@ import {
   renderAdminMonitorQueuePage,
   renderAdminMonitorStatsPage,
   renderAdminMonitorTracePage,
+  loadAdminMonitorCronRunState,
 } from "./pages/admin-monitor";
 import type { AdminMonitorPage } from "./pages/admin-monitor";
 // The admin listing pages (the family prologue is shared adminPagePrologue).
@@ -1701,6 +1705,8 @@ import {
   renderWikiRevisionPage,
   renderWikiStartPage,
   renderWikiViewPage,
+  wikiLocale,
+  wikiTipOf,
 } from "./pages/repo-wiki";
 import type { WikiDoer } from "../services/wiki";
 // The wiki raw byte arm (the markdown pipeline's `/wiki/raw/…` targets).
@@ -2972,6 +2978,16 @@ export interface RepoActionsDispatchInputsRoute {
   repo: string;
 }
 
+/** The repo header's fetch-action family (pages/repo-header-actions.tsx —
+ *  upstream web.go:1765-1772's POST /action/{star|unstar|watch|participate};
+ *  ignore + watch/options stay unclaimed — no watch.mode substrate). */
+export interface RepoActionRoute {
+  family: "repo-action";
+  owner: string;
+  repo: string;
+  action: "star" | "unstar" | "watch" | "participate";
+}
+
 
 /** Window-2e B2: the repo-scoped aux feeds + fragments (issues-search-aux,
  *  issue-content-fragments, pull-merge-box, compare-feeds,
@@ -3335,6 +3351,7 @@ export type ParsedUiRoute =
   | RepoActionsRunArtifactRoute
   | RepoActionsWorkflowBadgeRoute
   | RepoActionsDispatchInputsRoute
+  | RepoActionRoute
   | SiteHomeRoute
   | ExploreRoute
   | NotificationsRoute
@@ -4534,6 +4551,14 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // exact literal; the ref/workflow facets ride the query).
   if (head === "actions" && rest.length === 1 && rest[0] === "workflow-dispatch-inputs") {
     return { family: "repo-actions-dispatch-inputs", owner, repo };
+  }
+  // The repo header's fetch-action family (web.go:1765-1772 — star/unstar/
+  // watch/participate only; ignore + watch/options stay unclaimed).
+  if (head === "action") {
+    if (rest.length === 1 && (rest[0] === "star" || rest[0] === "unstar" || rest[0] === "watch" || rest[0] === "participate")) {
+      return { family: "repo-action", owner, repo, action: rest[0] };
+    }
+    return null;
   }
   // The census C4 artifacts preview subtree (pages/repo-actions-artifacts.tsx
   // — web.go:1602-1603's /artifacts/{artifact_id}/preview[/...] inside the
@@ -5765,6 +5790,17 @@ async function resolveUiRequest(c: Context<{ Bindings: Env }>): Promise<Resolved
   // re-reads the store for its MustEnableActions 404 arm (the C8 gate's
   // polarity).
   resolved.ctx.repoHasActions = settings.hasActions;
+  // The header trio's viewer state (usability B-4 Stage A): the watch/star
+  // probes ride the same request resolution, Promise.all'd — byte-neutral
+  // for fixture viewers (no edges), so the goldens' bytes survive.
+  if (resolved.viewer.kind === "user") {
+    const [watching, starring] = await Promise.all([
+      isWatchingRepo(c.env.DB, repo.id, resolved.viewer.id),
+      isStarring(c.env.DB, resolved.viewer.id, repo.id),
+    ]);
+    resolved.ctx.viewerWatchsRepo = watching;
+    resolved.ctx.viewerStarsRepo = starring;
+  }
   return { ...resolved, repo };
 }
 
@@ -6789,6 +6825,31 @@ async function repoActionsDispatchInputsRoute(c: Context<{ Bindings: Env }>): Pr
   if (outcome.status === "not-found") return respond(c.html(renderNotFound(ctx), 404));
   if (outcome.status === "throw") throw new Error(outcome.reason); // upstream's ctx.ServerError arm
   return respond(c.html(outcome.html, 200));
+}
+
+/** POST /{owner}/{repo}/action/{star|unstar|watch|participate} (web.go:1765-
+ *  1772's repo.Action family): the fetch-action JS swaps the returned
+ *  fragment (X-Gitea-Fetch-Action); anonymous answers the login redirect in
+ *  the fetch-action shape or the plain 303. */
+async function repoActionSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "repo-action") return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") {
+    if (isFetchActionRequest(c.req.raw)) {
+      return respond(fetchActionRedirectResponse(`/login?redirect_to=${encodeURIComponent(url.pathname)}`));
+    }
+    return respond(loginRedirect(url.pathname + url.search));
+  }
+  const action = resolved.route.action;
+  return respond(
+    action === "star" || action === "unstar"
+      ? await repoStarActionResponse(c.env.DB, repo, viewer, action)
+      : await repoWatchActionResponse(c.env.DB, repo, viewer, action),
+  );
 }
 
 /** POST /{owner}/{repo}/actions/runs/{run}/cancel (actions.Cancel — the
@@ -10132,7 +10193,7 @@ async function adminMonitorPage(c: Context<{ Bindings: Env }>, page: AdminMonito
       return p.respond(c.html(renderAdminMonitorStatsPage({ ctx: p.ctx, data })));
     }
     case "cron": {
-      const data = { entries: loadAdminMonitorCron(routeNow()).entries };
+      const data = await loadAdminMonitorCronRunState(c.env.DB, routeNow());
       return p.respond(c.html(renderAdminMonitorCronPage({ ctx: p.ctx, data, flash: null })));
     }
     case "queue": {
@@ -10151,7 +10212,7 @@ async function adminMonitorCronSubmit(c: Context<{ Bindings: Env }>): Promise<Re
   if (!p.ok) return p.response;
   const form = parseAdminMonitorCronForm(await readUrlEncodedForm(c.req.raw));
   const result = await applyAdminMonitorCronForm(c.env, form);
-  const data = { entries: loadAdminMonitorCron(routeNow()).entries };
+  const data = await loadAdminMonitorCronRunState(c.env.DB, routeNow());
   const flash = { kind: result.outcome === "applied" ? "positive" as const : "negative" as const, text: result.message };
   return p.respond(c.html(renderAdminMonitorCronPage({ ctx: p.ctx, data, flash })));
 }
@@ -11638,7 +11699,14 @@ async function wikiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   }
   if (action === "_new") {
     if (!canWrite) return respond(c.html(renderNotFound(ctx), 404));
-    return respond(c.html(renderWikiNewPage({ ctx, initialTitle: "", error: null }), 200));
+    // NewWiki (wiki.go:652-663): the branch-less wiki arm prefills "Home",
+    // and a NON-EMPTY ?title= overrides both (upstream's FormString("title")
+    // check reads "" as absent). wikiTipOf is the HasWiki reduction — the
+    // same tip presence loadWikiViewData's "start" outcome keys on.
+    const hasWiki = (await wikiTipOf(c.env, pair)) !== undefined;
+    const titleParam = url.searchParams.get("title");
+    const initialTitle = titleParam !== null && titleParam !== "" ? titleParam : hasWiki ? "" : wikiLocale.home;
+    return respond(c.html(renderWikiNewPage({ ctx, initialTitle, error: null }), 200));
   }
   if (action === "_edit") {
     if (!canWrite) return respond(c.html(renderNotFound(ctx), 404));
@@ -14869,6 +14937,9 @@ uiRouter.get("/:owner/:repo/actions/workflows/:workflowName/badge.svg", (c) => r
 uiRouter.post("/:owner/:repo/actions/workflows/:workflowName/badge.svg", () => methodNotAllowed("GET"));
 uiRouter.get("/:owner/:repo/actions/workflow-dispatch-inputs", (c) => repoActionsDispatchInputsRoute(c));
 uiRouter.post("/:owner/:repo/actions/workflow-dispatch-inputs", () => methodNotAllowed("GET"));
+// The repo header's fetch-action family (the fragment swap; GET twins 405).
+uiRouter.post("/:owner/:repo/action/:action{star|unstar|watch|participate}", (c) => repoActionSubmit(c));
+uiRouter.get("/:owner/:repo/action/:action{star|unstar|watch|participate}", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/activity", (c) => repoActivityPage(c));
 uiRouter.get("/:owner/:repo/activity/:period", (c) => repoActivityPage(c));
 // Window-2e C1: the global inbox.

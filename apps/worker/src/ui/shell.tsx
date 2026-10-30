@@ -255,8 +255,13 @@ export function Navbar(props: { viewer: Viewer; activeNav?: "explore"; notificat
  *  num_releases counter and the shared shell would pay a COUNT on every
  *  repo-scoped render for a label most repos never show (pages/releases.tsx
  *  header) — the releases PAGES render the real count in their header
- *  menu. */
-export type RepoTab = "code" | "issues" | "pulls" | "actions" | "packages" | "projects" | "releases" | "activity" | "commits";
+ *  menu. The wiki tab (header.tmpl:162-166, between Releases and Activity)
+ *  is the ratified divergence: upstream gates it on the wiki unit read
+ *  permission; ours renders UNCONDITIONALLY (the wiki pages family is
+ *  landed and serving; the route-level hasWiki 404 shell stays in the
+ *  family's own prologue — ui/index.ts wikiPrologue's MustEnableWiki arm),
+ *  so a settings-disabled wiki shows the tab over its 404 shell. */
+export type RepoTab = "code" | "issues" | "pulls" | "actions" | "packages" | "projects" | "releases" | "wiki" | "activity" | "commits";
 
 /** Tab chrome text for the wave-3 tabs (the components/commit-list.tsx
  *  component-local pattern — locale.ts is shared and not this wave's file). */
@@ -267,6 +272,7 @@ const tabLocale = {
   repo_packages: "Packages", // "packages.title" (header.tmpl:140-144 — SPEC-0016 M2)
   repo_projects: "Projects", // "repo.projects" (wave 45 — the projects tab)
   repo_releases: "Releases", // "repo.releases"
+  repo_wiki: "Wiki", // "repo.wiki" (header.tmpl:165 — the tab's label)
   repo_activity: "Activity", // "repo.activity" (the pulse tab)
 } as const;
 
@@ -282,6 +288,200 @@ const createLocale = {
  *  count is the difference (close/reopen moves only the closed counter). */
 function openCountOf(total: number, closed: number): number {
   return Math.max(total - closed, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Repo header right side — the Watch/Star/Fork trio (templates/repo/header/
+// watch.tmpl, star.tmpl, fork.tmpl at the pin; usability B-4)
+// ---------------------------------------------------------------------------
+
+/** The trio's chrome text (options/locale locale_en-US.json `repo.*` keys —
+ *  the component-local pattern; locale.ts is shared and not this wave's
+ *  file). The watch MODE strings carry the watch.tmpl menu's exact values. */
+const repoActionsLocale = {
+  watch: "Watch", // "repo.watch"
+  watching: "Watching", // "repo.watching"
+  unstar: "Unstar", // "repo.unstar"
+  star: "Star", // "repo.star"
+  fork: "Fork", // "repo.fork"
+  watch_guest_user: "Sign in to watch this repository.", // "repo.watch_guest_user"
+  star_guest_user: "Sign in to star this repository.", // "repo.star_guest_user"
+  fork_guest_user: "Sign in to fork this repository.", // "repo.fork_guest_user"
+  fork_from_self: "You cannot fork a repository you own.", // "repo.fork_from_self"
+  mode_participating: "Participating and mentions", // "repo.watch.mode.participating"
+  mode_participating_desc: "Receive notifications from this repository when participating or mentioned.",
+  mode_all: "All activity", // "repo.watch.mode.all"
+  mode_all_desc: "Receive notifications for all events.",
+} as const;
+
+/**
+ * The Watch button group, `div#repo-header-watch` (repo/header/watch.tmpl
+ * verbatim, reduced to the landed watch substrate). Upstream's four-mode menu
+ * (participating / all / ignore / custom) reduces to the TWO arms the binary
+ * `repo_watchers` edge can represent: "All activity" (POST /action/watch —
+ * the row insert, WatchModeNormal) and "Participating and mentions" (POST
+ * /action/participate — WatchModeNone, which upstream itself models as the
+ * ROW'S ABSENCE: GetWatch's no-row dummy carries Mode None, watch.go:61-64).
+ * The ignore (WatchModeDont) and custom (WatchModeCustom) modes need the
+ * `watch.mode` column the landed schema does not carry — their menu items and
+ * the watch_options_modal (header.tmpl:93) are NOT rendered (the dead-link
+ * rule: never emit controls the backend cannot answer). The button text and
+ * the active check-mark track the edge: watching → "Watching" + the all item
+ * checked; not watching → "Watch" + the participating item checked (upstream
+ * SelectedMode's binary reduction).
+ *
+ * Signed-in items carry the fetch-action wiring the official bundle drives
+ * (fetch-action.ts: `data-fetch-method="post"` + `data-fetch-url` + the
+ * `$body #repo-header-watch` sync that swaps this very div with the POST's
+ * fragment response); anonymous viewers get upstream's login-link variant
+ * (the login route is ours: /login, the navbar's Sign in arm — upstream's
+ * AppSubUrl + /user/login). The count is the maintained `repositories.
+ * num_watches` column (upstream `.Repository.NumWatches`, plain digits —
+ * CountFmt's k-formatting starts far above the D1-counter scale).
+ */
+export function RepoHeaderWatch(props: { repoLink: string; count: number; viewer: Viewer; watching?: boolean }) {
+  const signed = props.viewer.kind === "user";
+  const buttonLabel = signed && props.watching ? repoActionsLocale.watching : repoActionsLocale.watch;
+  return (
+    <div id="repo-header-watch" class="flex-text-block">
+      {signed ? (
+        <>
+          <button type="button" class="ui dropdown custom compact small basic button" data-global-init="initRepoWatchMenu" aria-label={buttonLabel}>
+            <Icon name="octicon-eye" />
+            <span class="not-mobile" aria-hidden="true">
+              {buttonLabel}
+            </span>
+            <span class="ui small label">{props.count}</span>
+            <Icon name="octicon-triangle-down" size={14} class="dropdown icon" />
+          </button>
+          <div class="tippy-target">
+            <a
+              class={props.watching ? "item" : "item active"}
+              role="menuitem"
+              aria-label={repoActionsLocale.mode_participating}
+              data-fetch-method="post"
+              data-fetch-url={`${props.repoLink}/action/participate`}
+              data-fetch-sync="$body #repo-header-watch"
+            >
+              <Icon name="octicon-check" size={16} class={props.watching ? "tw-invisible" : undefined} />
+              <div>
+                {repoActionsLocale.mode_participating}
+                <div class="tw-text-12 tw-text-text-light-2">{repoActionsLocale.mode_participating_desc}</div>
+              </div>
+            </a>
+            <a
+              class={props.watching ? "item active" : "item"}
+              role="menuitem"
+              aria-label={repoActionsLocale.mode_all}
+              data-fetch-method="post"
+              data-fetch-url={`${props.repoLink}/action/watch`}
+              data-fetch-sync="$body #repo-header-watch"
+            >
+              <Icon name="octicon-check" size={16} class={props.watching ? undefined : "tw-invisible"} />
+              <div>
+                {repoActionsLocale.mode_all}
+                <div class="tw-text-12 tw-text-text-light-2">{repoActionsLocale.mode_all_desc}</div>
+              </div>
+            </a>
+          </div>
+        </>
+      ) : (
+        <a
+          role="button"
+          class="ui compact small basic button"
+          href="/login"
+          aria-label={repoActionsLocale.watch}
+          data-tooltip-content={repoActionsLocale.watch_guest_user}
+        >
+          <Icon name="octicon-eye" />
+          <span class="not-mobile" aria-hidden="true">
+            {repoActionsLocale.watch}
+          </span>
+          <span class="ui small label">{props.count}</span>
+        </a>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The Star button (repo/header/star.tmpl verbatim): signed-in it POSTs
+ * /action/{star|unstar} and the bundle's default `$this` sync swaps the
+ * anchor with the POST's fragment response; anonymous it is upstream's login
+ * link (data-tooltip-content = repo.star_guest_user). The icon flips
+ * octicon-star → octicon-star-fill on the starring state (star.tmpl's Iif),
+ * the label flips Star/Unstar, and the count is the maintained
+ * `repositories.num_stars` column (.Repository.NumStars).
+ */
+export function RepoHeaderStar(props: { repoLink: string; count: number; viewer: Viewer; starring?: boolean }) {
+  const signed = props.viewer.kind === "user";
+  const buttonLabel = props.starring ? repoActionsLocale.unstar : repoActionsLocale.star;
+  return (
+    <a
+      role="button"
+      class="ui compact small basic button"
+      aria-label={buttonLabel}
+      {...(signed
+        ? { "data-fetch-method": "post", "data-fetch-url": `${props.repoLink}/action/${props.starring ? "unstar" : "star"}` }
+        : { href: "/login", "data-tooltip-content": repoActionsLocale.star_guest_user })}
+    >
+      <Icon name={props.starring ? "octicon-star-fill" : "octicon-star"} />
+      <span class="not-mobile" aria-hidden="true">
+        {buttonLabel}
+      </span>
+      <span class="ui small label">{props.count}</span>
+    </a>
+  );
+}
+
+/**
+ * The Fork button (repo/header/fork.tmpl verbatim, reduced): the count is the
+ * maintained `repositories.num_forks` column (.Repository.NumForks) and the
+ * href walks upstream's ladder as far as the landed fork substrate reaches —
+ *   - anonymous: the /login link + repo.fork_guest_user tooltip;
+ *   - a viewer who ALREADY HOLDS a fork of this repo (fork.tmpl's
+ *     `len $.UserAndOrgForks == 1` arm, ours the doer's own fork via
+ *     findForkByOwner): a direct link onto that fork;
+ *   - the repo's owner with no fork (fork.tmpl's `$canNotForkOwn` arm —
+ *     CanUserForkBetweenOwners fails for the owner): the "#" link + the
+ *     repo.fork_from_self tooltip;
+ *   - everyone else: the landed /fork create form (upstream's
+ *     `{{$.RepoLink}}/fork` default).
+ *   The modal arm (`ShowForkModal` — forks under MULTIPLE owners, user AND
+ *   orgs) is unrendered: the landed probe reads the doer's fork only and the
+ *   fork-repo-modal needs the multi-owner fork enumeration (documented
+ *   divergence, the one-fork reduction).
+ */
+export function RepoHeaderFork(props: {
+  repoLink: string;
+  count: number;
+  viewer: Viewer;
+  isOwnRepo?: boolean;
+  viewerFork?: { ownerNamespace: string; slug: string } | null;
+}) {
+  let forkHref = `${props.repoLink}/fork`;
+  let tooltip: string | undefined;
+  if (props.viewer.kind === "anonymous") {
+    forkHref = "/login";
+    tooltip = repoActionsLocale.fork_guest_user;
+  } else if (props.viewerFork !== undefined && props.viewerFork !== null) {
+    forkHref = `/${props.viewerFork.ownerNamespace}/${props.viewerFork.slug}`;
+  } else if (props.isOwnRepo === true && props.viewerFork === null) {
+    forkHref = "#";
+    tooltip = repoActionsLocale.fork_from_self;
+  }
+  return (
+    <a
+      role="button"
+      class="ui compact small basic button"
+      href={forkHref}
+      {...(tooltip !== undefined ? { "data-tooltip-content": tooltip } : {})}
+    >
+      <Icon name="octicon-repo-forked" />
+      <span class="not-mobile">{repoActionsLocale.fork}</span>
+      <span class="ui small label">{props.count}</span>
+    </a>
+  );
 }
 
 export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
@@ -317,8 +517,34 @@ export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
               )}
             </div>
           </div>
-          {/* Right side deliberately empty: star/watch/fork need write actions
-              (none without auth, §2.5) and counters (not in D1 yet, §3.1). */}
+          {/* Right side — the Watch/Star/Fork trio (header.tmpl:49-78's
+              `{{if not (or .IsBeingCreated .IsBroken)}}` gate → the row's
+              ready status; upstream's transfer/RSS arms ahead of the trio are
+              unrendered — no transfer flow and the RSS feed arm needs the
+              feed surface). Star renders unconditionally (upstream's only
+              gate is the DisableStars setting we do not carry); fork keeps
+              upstream's `{{if and (not .IsEmpty) (CanRead TypeCode)}}` empty
+              arm — nothing to fork on an unborn HEAD (the code-read half is
+              the §2.5 grant every resolved repo already satisfies). The
+              trio's per-viewer state rides the ctx fields the repo-scoped
+              prologue arms (viewerWatchsRepo/viewerStarsRepo/viewerForkOfRepo
+              — anonymous viewers render the login-link variants, which is
+              upstream's own anonymous posture). */}
+          {repo.status === "ready" ? (
+            <div class="flex-text-block tw-flex-wrap">
+              <RepoHeaderWatch repoLink={repoLink} count={repo.numWatches} viewer={props.ctx.viewer} watching={props.ctx.viewerWatchsRepo} />
+              <RepoHeaderStar repoLink={repoLink} count={repo.numStars} viewer={props.ctx.viewer} starring={props.ctx.viewerStarsRepo} />
+              {!repo.isEmpty ? (
+                <RepoHeaderFork
+                  repoLink={repoLink}
+                  count={repo.numForks}
+                  viewer={props.ctx.viewer}
+                  isOwnRepo={props.ctx.viewer.kind === "user" && props.ctx.viewer.id === repo.ownerId}
+                  viewerFork={props.ctx.viewerForkOfRepo}
+                />
+              ) : null}
+            </div>
+          ) : null}
         </div>
         <div class="secondary-info">
           Created{" "}
@@ -391,6 +617,18 @@ export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
                 label is the documented reduction (RepoTab note). */}
             <a class={activeTab === "releases" ? "active item" : "item"} href={`${repoLink}/releases`} data-shortcut-keys="g r">
               <Icon name="octicon-tag" /> {tabLocale.repo_releases}
+            </a>
+            {/* header.tmpl:162-166 — the wiki tab (the landed wiki pages
+                family, pages/repo-wiki.tsx, unlocks it; upstream's exact
+                shape: octicon-book, the g w shortcut, active on PageIsWiki
+                which the family's five renders carry as activeTab="wiki").
+                Rendered UNCONDITIONALLY — the ratified divergence (RepoTab
+                note): upstream's CanRead(TypeWiki) unit gate reduces to
+                "wiki enabled" only through the unit table this shell does
+                not carry; the family's route-level hasWiki 404 shell keeps
+                the disabled-wiki posture honest. */}
+            <a class={activeTab === "wiki" ? "active item" : "item"} href={`${repoLink}/wiki`} data-shortcut-keys="g w">
+              <Icon name="octicon-book" /> {tabLocale.repo_wiki}
             </a>
             {/* header.tmpl:177-181 — the activity/pulse tab (the R14 activity
                 page unlocks it, pages/repo-activity.tsx). Upstream gates it on

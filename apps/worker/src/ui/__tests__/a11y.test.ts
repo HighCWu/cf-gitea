@@ -723,9 +723,15 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     const root = parseHtmlTree(milestoneDetailGolden);
     const header = descendants(root).find((el) => hasClass(el, "repo-header"));
     expect(header, "the repo header").toBeDefined();
+    // The B-4 trio (Watch dropdown items + Star + Fork) renders between the
+    // breadcrumb and the tab strip — the anchors' aria-labels drive the names.
     expect(descendants(header ?? root).filter((el) => el.tag === "a").map((el) => [el.attrs.href, accessibleName(el)])).toEqual([
       ["/alice", "alice"],
       ["/alice/golden-ms", "golden-ms"],
+      [undefined, "Participating and mentions"],
+      [undefined, "All activity"],
+      [undefined, "Star"],
+      ["/alice/golden-ms/fork", "Fork0"],
     ]);
     // The page's single heading is the milestone title (R1's exactly-one
     // holds here like home's README h1).
@@ -733,6 +739,8 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     expect(headings.map((el) => accessibleName(el))).toEqual(["v1.0"]);
     // The canWrite arm's controls are named (signed-in owner golden).
     expect(descendants(root).filter((el) => el.tag === "a").filter((el) => hasClass(el, "button")).map((el) => accessibleName(el))).toEqual([
+      "Star",
+      "Fork0",
       "Edit",
       "New Issue",
     ]);
@@ -745,6 +753,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       [false, "Actions"],
       [false, "Packages"],
       [false, "Releases"],
+      [false, "Wiki"],
       [false, "Activity"],
       [false, "Commits"],
     ]);
@@ -853,6 +862,10 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     expect(descendants(header ?? root).filter((el) => el.tag === "a").map((el) => [el.attrs.href, accessibleName(el)])).toEqual([
       ["/alice", "alice"],
       ["/alice/golden", "golden"],
+      [undefined, "Participating and mentions"],
+      [undefined, "All activity"],
+      [undefined, "Star"],
+      ["/alice/golden/fork", "Fork0"],
     ]);
     // The start segment: the single heading (h2, no h1 on the page — R1's
     // at-most-one holds) plus the welcome line.
@@ -863,19 +876,27 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       descendants(root)
         .filter((el) => el.tag === "a" && hasClass(el, "button"))
         .map((el) => [el.attrs.href, accessibleName(el)]),
-    ).toEqual([["/alice/golden/wiki?action=_new", "Create the First Page"]]);
+    ).toEqual([
+      [undefined, "Star"],
+      ["/alice/golden/fork", "Fork0"],
+      ["/alice/golden/wiki?action=_new", "Create the First Page"],
+    ]);
     // The repo tab strip names every tab with its count (Code active) —
     // golden's counts (2 open issues, 1 PR) differ from milestone-detail's
     // golden-ms strip.
     const strip = descendants(root).find((el) => el.tag === "overflow-menu");
     expect(strip, "the repo tab strip").toBeDefined();
     expect(descendants(strip ?? root).filter((el) => el.tag === "a").map((el) => [hasClass(el, "active"), accessibleName(el)])).toEqual([
-      [true, "Code"],
+      [false, "Code"],
       [false, "Issues2"],
       [false, "Pull Requests1"],
       [false, "Actions"],
       [false, "Packages"],
       [false, "Releases"],
+      // The wiki-start golden renders with activeTab="wiki" (upstream arms
+      // .PageIsWiki on the /wiki group, web.go:1623) — the tab strip's
+      // wiki item carries the active arm, not Code.
+      [true, "Wiki"],
       [false, "Activity"],
       [false, "Commits"],
     ]);
@@ -944,6 +965,10 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     expect(descendants(header ?? root).filter((el) => el.tag === "a").map((el) => [el.attrs.href, accessibleName(el)])).toEqual([
       ["/alice", "alice"],
       ["/alice/golden-alt", "golden-alt"],
+      [undefined, "Participating and mentions"],
+      [undefined, "All activity"],
+      [undefined, "Star"],
+      ["/alice/golden-alt/fork", "Fork0"],
     ]);
     // The page's single heading is the CONTENT h1 (the markdown render's
     // `# Home`); the page title beside it is a plain div (upstream-faithful,

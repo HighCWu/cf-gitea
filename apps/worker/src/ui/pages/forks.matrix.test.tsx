@@ -595,14 +595,19 @@ describe("the unlanded follow/star/watch write arms", () => {
     expect(await countForkRows(fsxFixture!.paintId), "forks unchanged").toBe(forksBefore);
   });
 
-  it("the upstream /action/star literal is unclaimed both ways (no follow/star/watch surface)", async () => {
-    expect(parseUiRoute("/fsx-owner/paint/action/star")).toBeNull();
-    expect(handlesUiRoute("/fsx-owner/paint/action/star")).toBe(false);
-    expect((await get("/fsx-owner/paint/action/star")).status).toBe(404);
+  it("the upstream /action/star family landed (B-4): the parse claims it, anon GET 404-shells, the signed same-origin POST stars and answers the fragment", async () => {
+    expect(parseUiRoute("/fsx-owner/paint/action/star")).toMatchObject({ family: "repo-action", action: "star" });
+    expect(handlesUiRoute("/fsx-owner/paint/action/star")).toBe(true);
+    expect((await get("/fsx-owner/paint/action/star")).status).toBe(405);
 
     const before = await countStars(fsxFixture!.paintId);
     const res = await post("/fsx-owner/paint/action/star", {}, "fsx-owner");
-    expect(res.status).toBe(404);
-    expect(await countStars(fsxFixture!.paintId), "no star row written").toBe(before);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type") ?? "").toContain("text/html");
+    expect(await countStars(fsxFixture!.paintId), "the star row written").toBe(before + 1);
+    // Idempotent re-star: no second row.
+    const again = await post("/fsx-owner/paint/action/star", {}, "fsx-owner");
+    expect(again.status).toBe(200);
+    expect(await countStars(fsxFixture!.paintId), "idempotent").toBe(before + 1);
   });
 });

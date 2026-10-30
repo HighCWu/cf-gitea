@@ -153,6 +153,27 @@ const ALLOWLIST = [
   'octicon-triangle-down',
   'octicon-x',
   'octicon-x-circle-fill',
+  // + the wiki nav wave: the shell tab's glyph (octicon-book, header.tmpl:
+  // 164) and the four page glyphs the wiki landing had stood in for while
+  // absent from this allowlist — start's 48px book (start.tmpl:6), the
+  // pages table's git-entry chevron (pages.tmpl:21), the dropdown search
+  // input's filter (view.tmpl:18), the revision back button's home
+  // (revision.tmpl:8). octicon-triangle-down (view.tmpl:14's dropdown
+  // caret) was already landed above with the Actions wave.
+  'octicon-book',
+  'octicon-chevron-right',
+  'octicon-filter',
+  'octicon-home',
+  // The usability B-4 repo-header wave: the Watch/Star/Fork trio's glyphs
+  // (header.tmpl:70-76 → repo/header/{watch,star,fork}.tmpl — the eye (watch,
+  // watching; the ignore mode's eye-closed stays unlanded with the mode
+  // column), the filled star (the IsStaringRepo unstar state, star.tmpl's
+  // Iif), the fork mark (fork.tmpl) and the clone panel's copy mark
+  // (clone_panel.tmpl's copy_url button).
+  'octicon-copy',
+  'octicon-eye',
+  'octicon-repo-forked',
+  'octicon-star-fill',
 ];
 
 // What shell.tsx's Icon component hardcodes; a body needing anything else

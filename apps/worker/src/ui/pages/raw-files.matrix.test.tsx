@@ -28,7 +28,16 @@
  *     WITHOUT a meta row falls through (upstream's nil-meta arm — the
  *     pointer text serves), and a pointer WITH a verified row + stored
  *     object serves the LFS bytes under the pointer-oid ETag and the
- *     zero-duration private cache stamp, 304ing on the pointer ETag.
+ *     zero-duration private cache stamp, 304ing on the pointer ETag;
+ *   - the RAW arm's LFS posture (module header's audit note): upstream
+ *     `/raw` is SingleDownload — NO LFS resolution — so the pointer file
+ *     serves its POINTER TEXT with the git-blob-oid ETag (the parity guard
+ *     against re-introducing the divergence findings-git-e2e F4 asked for);
+ *   - the file view's LFS badge (file_info.tmpl:14 through pages/
+ *     file-view.tsx's view.go:72-123 pointer probe): the badge renders on a
+ *     seeded pointer file — with or without a meta row — beside the size in
+ *     the same file-info-entry, and on nothing else (plain text, plain
+ *     binary, malformed pointer).
  *
  * The fixture world is the `alice` owner's `rawserve` repo (public,
  * two commits: README.md then the PNG + the later README edit — the
@@ -74,6 +83,9 @@ const LFS_OID = "ab".repeat(32);
 const POINTER_TEXT = new TextDecoder().decode(generatePointer(LFS_OID, PNG_BYTES.byteLength));
 const GHOST_OID = "cd".repeat(32);
 const GHOST_POINTER_TEXT = `version https://git-lfs.github.com/spec/v1\noid sha256:${GHOST_OID}\nsize 4\n`;
+/** A MALFORMED pointer (valid version line, garbage oid): the parser's
+ *  InvalidPointerError arm — upstream's IsValid() == false plain file. */
+const BROKEN_POINTER_TEXT = "version https://git-lfs.github.com/spec/v1\noid sha256:nothex\nsize 4\n";
 
 const COMMITS = [
   { message: "seed: readme", time: 1_700_000_000, files: [{ path: "README.md", content: "# rawserve v1\n" }] },
@@ -88,6 +100,7 @@ const COMMITS = [
       },
       { path: "assets/big.bin", content: new TextEncoder().encode(POINTER_TEXT) },
       { path: "assets/ghost.bin", content: new TextEncoder().encode(GHOST_POINTER_TEXT) },
+      { path: "assets/broken.bin", content: new TextEncoder().encode(BROKEN_POINTER_TEXT) },
       // README untouched by this commit — the lastModified walk must not
       // stamp the README with THIS commit's time.
       { path: "NOTES.txt", content: new TextEncoder().encode("notes\n") },
@@ -101,6 +114,7 @@ const COMMITS = [
       { path: "assets/logo.png", content: PNG_BYTES },
       { path: "assets/big.bin", content: new TextEncoder().encode(POINTER_TEXT) },
       { path: "assets/ghost.bin", content: new TextEncoder().encode(GHOST_POINTER_TEXT) },
+      { path: "assets/broken.bin", content: new TextEncoder().encode(BROKEN_POINTER_TEXT) },
       { path: "NOTES.txt", content: new TextEncoder().encode("notes\n") },
     ],
   },
@@ -231,6 +245,21 @@ describe("the raw typed arm (SingleDownload's port)", () => {
     expect(new Uint8Array(await response.arrayBuffer())).toEqual(PNG_BYTES);
   });
 
+  it("serves the POINTER text for an LFS pointer file (SingleDownload has no LFS arm)", async () => {
+    // The module header's audit note: upstream `/raw` is SingleDownload →
+    // common.ServeBlob, no pointer probe — the pointer TEXT is the raw
+    // content (the parity guard; /media is the resolver, tested below).
+    const response = await fetchUi("/alice/rawserve/raw/branch/main/assets/big.bin");
+    expect(response.status).toBe(200);
+    expect(new TextDecoder().decode(await response.arrayBuffer())).toBe(POINTER_TEXT);
+    expect(response.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    // The ETag is the GIT blob oid (40 hex) — NOT the pointer oid.
+    const etag = response.headers.get("etag");
+    expect(etag).toMatch(/^"[0-9a-f]{40}"$/);
+    expect(etag).not.toBe(`"${LFS_OID}"`);
+    expect(response.headers.get("cache-control")).toBe("public, max-age=21600");
+  });
+
   it("stamps Last-Modified from the path's latest commit and answers If-Modified-Since", async () => {
     const first = await fetchUi("/alice/rawserve/raw/branch/main/README.md");
     expect(first.status).toBe(200);
@@ -354,7 +383,43 @@ describe("the media arm (SingleDownloadOrLFS's port)", () => {
   });
 });
 
-// --- 6. the 404 family ------------------------------------------------------------
+// --- 6. the file view's LFS badge (file_info.tmpl:14) -----------------------------
+
+describe("the file view's LFS badge (the view.go:72-123 pointer probe)", () => {
+  const BADGE = '<span class="ui label">LFS</span>';
+
+  it("renders the badge beside the size on a seeded pointer file", async () => {
+    const response = await fetchUi("/alice/rawserve/src/branch/main/assets/big.bin");
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    // The exact file_info.tmpl:14 adjacency: the label inside the size's
+    // file-info-entry, right after the file-info-size span (the pointer is
+    // 127 bytes → "127 B").
+    expect(html).toContain('<span class="file-info-size">127 B</span><span class="ui label">LFS</span>');
+    expect(html).toContain(BADGE);
+  });
+
+  it("renders the badge with or without a meta row (view.go:104-110's error path keeps lfsMeta)", async () => {
+    // big.bin carries a verified row + object by now (the media suite
+    // inserted them); ghost.bin's object was NEVER stored — the badge is a
+    // parse-only property, identical under both meta states.
+    for (const path of ["assets/big.bin", "assets/ghost.bin"]) {
+      const response = await fetchUi(`/alice/rawserve/src/branch/main/${path}`);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain(BADGE);
+    }
+  });
+
+  it("renders no badge on plain text, plain binary, or a malformed pointer", async () => {
+    for (const path of ["README.md", "assets/logo.png", "NOTES.txt", "assets/broken.bin"]) {
+      const response = await fetchUi(`/alice/rawserve/src/branch/main/${path}`);
+      expect(response.status).toBe(200);
+      expect(await response.text()).not.toContain(BADGE);
+    }
+  });
+});
+
+// --- 7. the 404 family ------------------------------------------------------------
 
 describe("the 404 family (unresolvable refs and paths)", () => {
   it("404-shells unknown branches and missing paths on both families", async () => {

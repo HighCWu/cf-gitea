@@ -327,15 +327,20 @@ describe("RepoHeader tab strip", () => {
     return html.slice(start, end);
   }
 
-  it("renders exactly the Code, Issues, Pulls, Releases, Activity, Commits tabs, in order, with active tracking", () => {
+  it("renders exactly the Code, Issues, Pulls, Releases, Wiki, Activity, Commits tabs, in order, with active tracking", () => {
     const strip = tabStrip(page({ ctx: repoCtx }));
-    expect(strip.match(/<a class="(?:active )?item"/g)).toHaveLength(6);
+    expect(strip.match(/<a class="(?:active )?item"/g)).toHaveLength(7);
     expect(strip).toContain('<a class="active item" href="/octocat/hello" data-shortcut-keys="g c">');
     expect(strip).toContain('<a class="item" href="/octocat/hello/issues" data-shortcut-keys="g i">');
     expect(strip).toContain('<a class="item" href="/octocat/hello/pulls" data-shortcut-keys="g p">');
     // Wave 20: the Releases tab (header.tmpl:157's shape) resolves — it was
     // the dead-tab 404 this test previously refused to render.
     expect(strip).toContain('<a class="item" href="/octocat/hello/releases" data-shortcut-keys="g r">');
+    // The wiki tab (header.tmpl:162-166's shape): upstream's g w shortcut
+    // and octicon-book glyph, rendered unconditionally (the ratified
+    // divergence — shell.tsx's RepoTab note; the disabled-wiki posture is
+    // the family's route-level hasWiki 404 shell).
+    expect(strip).toContain('<a class="item" href="/octocat/hello/wiki" data-shortcut-keys="g w">');
     // The activity/pulse tab (header.tmpl:177's shape) — unlocked by the
     // landed /activity page family, no data-shortcut-keys (upstream arms
     // none on it, unlike its strip neighbors).
@@ -347,6 +352,7 @@ describe("RepoHeader tab strip", () => {
     expect(strip).toContain('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" class="svg octicon-code"');
     expect(strip).toContain('class="svg octicon-git-pull-request"');
     expect(strip).toContain('class="svg octicon-tag"');
+    expect(strip).toContain('class="svg octicon-book"');
     expect(strip).toContain('class="svg octicon-pulse"');
     expect(strip).toContain('class="svg octicon-history"');
     expect(strip.indexOf("> Code</a>")).toBeGreaterThan(0);
@@ -354,15 +360,16 @@ describe("RepoHeader tab strip", () => {
     expect(strip.indexOf(">Issues</a>")).toBeGreaterThan(strip.indexOf("> Code</a>"));
     expect(strip.indexOf("> Pull Requests</a>")).toBeGreaterThan(strip.indexOf(">Issues</a>"));
     expect(strip.indexOf("> Releases</a>")).toBeGreaterThan(strip.indexOf("> Pull Requests</a>"));
-    expect(strip.indexOf("> Activity</a>")).toBeGreaterThan(strip.indexOf("> Releases</a>"));
+    // Upstream strip order: Wiki sits between Releases and Activity
+    // (header.tmpl:162-166).
+    expect(strip.indexOf("> Wiki</a>")).toBeGreaterThan(strip.indexOf("> Releases</a>"));
+    expect(strip.indexOf("> Activity</a>")).toBeGreaterThan(strip.indexOf("> Wiki</a>"));
     expect(strip).toContain("> Commits</a>");
     expect(strip.indexOf("> Commits</a>")).toBeGreaterThan(strip.indexOf("> Activity</a>"));
     expect(strip).not.toContain('class="svg octicon-issue-opened"');
-    // Only existing pages: no Wiki/Settings dead tabs (Releases resolved in
-    // wave 20, Activity by the R14 page family).
-    for (const dead of ["Wiki", "Settings"]) {
-      expect(strip).not.toContain(dead);
-    }
+    // Only existing pages: no Settings dead tab (Wiki resolved with the
+    // pages family; Releases in wave 20, Activity by the R14 page family).
+    expect(strip).not.toContain("Settings");
 
     const stripOnIssues = tabStrip(
       renderPage(
@@ -386,6 +393,18 @@ describe("RepoHeader tab strip", () => {
     // The commits list shares the activity page's discriminator class but
     // wins via its explicit activeTab — no double-active pulse tab.
     expect(stripOnCommits).not.toContain('<a class="active item" href="/octocat/hello/activity">');
+
+    // The wiki pages arm the tab through activeTab="wiki" (upstream arms
+    // .PageIsWiki on the whole /wiki group, web.go:1623).
+    const stripOnWiki = tabStrip(
+      renderPage(
+        <BaseLayout ctx={repoCtx} title="Home" activeTab="wiki">
+          <p>wiki</p>
+        </BaseLayout>,
+      ),
+    );
+    expect(stripOnWiki).toContain('<a class="item" href="/octocat/hello" data-shortcut-keys="g c">');
+    expect(stripOnWiki).toContain('<a class="active item" href="/octocat/hello/wiki" data-shortcut-keys="g w">');
 
     // The activity page renders `page-content repository commits` (upstream
     // activity.tmpl:2) WITHOUT an explicit activeTab — upstream tracks its
@@ -424,10 +443,141 @@ describe("RepoHeader tab strip", () => {
     expect(html).toContain('<div class="secondary-nav"><div class="ui container"><div class="repo-header flex-left-right">');
     expect(html).toContain('class="svg octicon-repo"');
     expect(html).toContain('<span class="ui basic orange label">Public Access</span>');
-    expect(html).toContain('Created <relative-time datetime="2023-11-14T22:13:20.000Z">');
+    expect(html).toContain("Created <relative-time datetime=\"2023-11-14T22:13:20.000Z\">");
     expect(html).toContain('<div class="ui tabs divider"></div>');
-    // No star/watch/fork chrome (no write actions without auth, §2.5).
-    expect(html).not.toContain("octicon-star");
+  });
+});
+
+// --- the repo header action trio (usability B-4) -------------------------------
+
+/**
+ * The Watch/Star/Fork right side (header.tmpl:49-78 → repo/header/{watch,
+ * star,fork}.tmpl at the pin). Upstream renders the trio for EVERY viewer —
+ * anonymous viewers get the login-link variants — so the anon arm is the
+ * default render, and the signed-in arms carry the fetch-action wiring the
+ * official bundle drives. The per-viewer state rides the ctx fields the
+ * repo-scoped prologue arms (ui-context.ts's trio doc); absent fields
+ * degrade to the not-watching/not-starring/unprobed arms (the loader is the
+ * only arm site).
+ */
+describe("RepoHeader action trio (usability B-4)", () => {
+  const userViewer: Viewer = { kind: "user", id: 42, username: "octocat", isAdmin: false };
+
+  function repoPage(ctx: UiContext): string {
+    return renderPage(
+      <BaseLayout ctx={ctx}>
+        <p>page body</p>
+      </BaseLayout>,
+    );
+  }
+
+  it("renders the anonymous login-link variants with the D1 counts, and no write arms", () => {
+    const html = repoPage({ ...anonymousCtx, repo: makeRepoRow({ numStars: 3, numWatches: 5, numForks: 7 }) });
+    // Watch: the login anchor inside div#repo-header-watch (watch.tmpl's
+    // else arm — aria-label, tooltip, eye glyph, count).
+    expect(html).toContain(
+      '<div id="repo-header-watch" class="flex-text-block"><a role="button" class="ui compact small basic button" href="/login" aria-label="Watch" data-tooltip-content="Sign in to watch this repository.">',
+    );
+    expect(html).toContain('class="svg octicon-eye"');
+    expect(html).toContain('<span class="not-mobile" aria-hidden="true">Watch</span><span class="ui small label">5</span>');
+    // Star: the login anchor, the hollow glyph, the count.
+    expect(html).toContain(
+      '<a role="button" class="ui compact small basic button" aria-label="Star" href="/login" data-tooltip-content="Sign in to star this repository.">',
+    );
+    expect(html).toContain('class="svg octicon-star"');
+    expect(html).toContain('<span class="not-mobile" aria-hidden="true">Star</span><span class="ui small label">3</span>');
+    // Fork: the anonymous login link (fork.tmpl's guest arm) with its
+    // tooltip, the glyph, the count.
+    expect(html).toContain(
+      '<a role="button" class="ui compact small basic button" href="/login" data-tooltip-content="Sign in to fork this repository.">',
+    );
+    expect(html).toContain('class="svg octicon-repo-forked"');
+    expect(html).toContain('<span class="not-mobile">Fork</span><span class="ui small label">7</span>');
+    // No session, no write surface: no fetch-action wiring, no dropdown.
+    expect(html).not.toContain("data-fetch-url");
+    expect(html).not.toContain("initRepoWatchMenu");
+    // The login links use the landed /login route (the navbar's convention),
+    // never upstream's /user/login literal.
+    expect(html).not.toContain("/user/login");
+  });
+
+  it("hides the fork on an empty repo (upstream's `and (not .IsEmpty) CanReadCode` gate) and the whole trio off-ready rows", () => {
+    const emptyHtml = repoPage({ ...anonymousCtx, repo: makeRepoRow({ isEmpty: true }) });
+    expect(emptyHtml).not.toContain("octicon-repo-forked");
+    expect(emptyHtml).toContain("repo-header-watch"); // watch/star still render
+    // Upstream gates the whole right side on `not (or .IsBeingCreated .IsBroken)`
+    // — the row's non-ready statuses.
+    const creatingHtml = repoPage({ ...anonymousCtx, repo: makeRepoRow({ status: "creating" }) });
+    expect(creatingHtml).not.toContain("repo-header-watch");
+    expect(creatingHtml).not.toContain("octicon-star");
+  });
+
+  it("signed-in viewers get the dropdown posture; the arms and glyphs flip with the ctx state", () => {
+    const watchingHtml = repoPage({
+      ...anonymousCtx,
+      viewer: userViewer,
+      repo: makeRepoRow({ numWatches: 2, numStars: 1 }),
+      viewerWatchsRepo: true,
+      viewerStarsRepo: true,
+    });
+    // The watch button: the dropdown posture + init hook + "Watching".
+    expect(watchingHtml).toContain(
+      '<button type="button" class="ui dropdown custom compact small basic button" data-global-init="initRepoWatchMenu" aria-label="Watching">',
+    );
+    expect(watchingHtml).toContain('<span class="not-mobile" aria-hidden="true">Watching</span><span class="ui small label">2</span>');
+    // The tippy menu: exactly the two representable arms, each POSTing with
+    // the #repo-header-watch sync; "All activity" carries the check.
+    expect(watchingHtml).toContain('<div class="tippy-target">');
+    expect(watchingHtml).toContain('<a class="item" role="menuitem" aria-label="Participating and mentions" data-fetch-method="post" data-fetch-url="/octocat/hello/action/participate" data-fetch-sync="$body #repo-header-watch">');
+    expect(watchingHtml).toContain('<a class="item active" role="menuitem" aria-label="All activity" data-fetch-method="post" data-fetch-url="/octocat/hello/action/watch" data-fetch-sync="$body #repo-header-watch">');
+    expect((watchingHtml.match(/class="svg octicon-check"/g) ?? []).length).toBe(1); // one visible check
+    expect((watchingHtml.match(/class="svg octicon-check tw-invisible"/g) ?? []).length).toBe(1);
+    // The star anchor: POST arms + the filled glyph + "Unstar".
+    expect(watchingHtml).toContain(
+      '<a role="button" class="ui compact small basic button" aria-label="Unstar" data-fetch-method="post" data-fetch-url="/octocat/hello/action/unstar">',
+    );
+    expect(watchingHtml).toContain('class="svg octicon-star-fill"');
+    expect(watchingHtml).toContain('<span class="not-mobile" aria-hidden="true">Unstar</span><span class="ui small label">1</span>');
+
+    // The not-watching / not-starring defaults: "Watch" button, participating
+    // item checked, hollow star POSTing /action/star.
+    const plainHtml = repoPage({ ...anonymousCtx, viewer: userViewer, repo: makeRepoRow({ numWatches: 0, numStars: 0 }) });
+    expect(plainHtml).toContain('data-global-init="initRepoWatchMenu" aria-label="Watch">');
+    expect(plainHtml).toContain('<a class="item active" role="menuitem" aria-label="Participating and mentions"');
+    expect(plainHtml).toContain('<a class="item" role="menuitem" aria-label="All activity"');
+    expect(plainHtml).toContain(
+      '<a role="button" class="ui compact small basic button" aria-label="Star" data-fetch-method="post" data-fetch-url="/octocat/hello/action/star">',
+    );
+    expect(plainHtml).toContain('class="svg octicon-star"');
+  });
+
+  it("the fork href walks upstream's ladder: existing fork → it; own repo without a fork → the '#' tooltip arm", () => {
+    // The doer's own repo, no fork (the probed-null arm): fork.tmpl's
+    // $canNotForkOwn posture — "#" + repo.fork_from_self.
+    const ownHtml = repoPage({
+      ...anonymousCtx,
+      viewer: { kind: "user", id: 1, username: "octocat", isAdmin: false },
+      repo: makeRepoRow({ ownerId: 1, numForks: 0 }),
+      viewerForkOfRepo: null,
+    });
+    expect(ownHtml).toContain('<a role="button" class="ui compact small basic button" href="#" data-tooltip-content="You cannot fork a repository you own.">');
+    // An existing fork (fork.tmpl's `len $.UserAndOrgForks == 1` arm): the
+    // direct link, no tooltip.
+    const forkedHtml = repoPage({
+      ...anonymousCtx,
+      viewer: { kind: "user", id: 9, username: "pal", isAdmin: false },
+      repo: makeRepoRow({ ownerId: 1 }),
+      viewerForkOfRepo: { ownerNamespace: "pal", slug: "hello" },
+    });
+    expect(forkedHtml).toContain('<a role="button" class="ui compact small basic button" href="/pal/hello">');
+    // An unprobed signed-in viewer (the loader not armed — the degraded
+    // interim) falls through to the create-form href.
+    const unprobedHtml = repoPage({
+      ...anonymousCtx,
+      viewer: { kind: "user", id: 9, username: "pal", isAdmin: false },
+      repo: makeRepoRow({ ownerId: 1 }),
+    });
+    expect(unprobedHtml).toContain('href="/octocat/hello/fork"');
   });
 });
 

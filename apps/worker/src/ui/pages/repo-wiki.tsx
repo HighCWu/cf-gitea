@@ -61,6 +61,20 @@
  * 340, 400); a whole-absent wiki renders tplWikiStart (wiki.go:471-475) or
  * redirects to P/wiki (WikiPages wiki.go:537-540, EditWiki wiki.go:692-695).
  *
+ * THE SLASHED TAILS (the findings-git-e2e F5 fix, carve 8fdee92): the
+ * family's own emits carry a TRAILING SLASH — the missing-page fold
+ * `ctx.Redirect(ctx.Repo.RepoLink + "/wiki/?action=_pages")` (the exact
+ * upstream bytes) and view.tmpl:25's dropdown Pages item this module
+ * mirrors — and upstream chi's `m.Combo("/*")` matches every slashed tail.
+ * The parent dispatcher (apps/worker/src/index.ts) used to refuse ALL
+ * slashed repo paths (the pre-UI engine-ownership rule), so the fold
+ * landed in the engine's plain-text 404; the wikiTrailingSlash carve
+ * (the RD19 lastcommit carve's twin, wide scope) now admits every slashed
+ * wiki tail whose TRIMMED path parseUiRoute claims, and the sub-app's
+ * `/:owner/:repo/wiki/*` wildcard answers it in one hop (verified against
+ * this hono pin's RegExpRouter: the wildcard matches the empty rest;
+ * parseUiRoute trims the slash so rawTail reads "").
+ *
  * ## Mount record (MOUNTED at 9516bf1, window-2e C2a — the wiring HANDOFF
  * is retired)
  *
@@ -122,9 +136,9 @@
  *
  * - start.tmpl — `.page-content.repository.wiki.start`, the centered segment
  *   with the 48px book glyph, the two welcome lines and the writer-gated
- *   "Create the First Page" button (start.tmpl:5-12). Glyph substitution:
- *   `octicon-book` is NOT in the generated icon allowlist — `octicon-repo`
- *   stands in (the editor-tails missing-glyph rule).
+ *   "Create the First Page" button (start.tmpl:5-12). The landing's
+ *   `octicon-repo` stand-in retired: `octicon-book` joined the generated
+ *   allowlist with the wiki nav wave (upstream-exact glyph).
  * - view.tmpl — page-dropdown row (the pages list for the dropdown comes
  *   from a raw tree walk WITHOUT per-page last-commit RPCs — upstream
  *   renderViewPage's PageMeta carries no UpdatedUnix, wiki.go:196-217 —
@@ -157,8 +171,8 @@
  *   link, the wiki-git-entry chevron ("View original Git file instead of
  *   using friendly link") and the last-updated cell, entries NATURALLY
  *   sorted (wiki.go:563 CustomSort(NaturalSortCompare) → localeCompare
- *   numeric). The chevron glyph substitutes `octicon-link` (no
- *   octicon-chevron-right in the allowlist).
+ *   numeric). The landing's `octicon-link` stand-in retired:
+ *   `octicon-chevron-right` joined the allowlist with the wiki nav wave.
  * - new.tmpl (BOTH the new and the edit page — upstream renders tplWikiNew
  *   for EditWiki too, wiki.go:702) — the title input (required, the
  *   `?title=`/existing name prefilled), the page_name_desc help, the
@@ -169,8 +183,9 @@
  *   `?action=_new` / `?action=_edit` (new.tmpl:12 — it posts to the current
  *   URL; the _edit value lands in WikiPost's DEFAULT arm). The
  *   PageIsWikiEdit header carries the tiny New Page button (new.tmpl:8-11).
- * - revision.tmpl — the back-to-wiki button (octicon-home substitutes
- *   octicon-repo), the last-edited line, the "{count} Commits" attached
+ * - revision.tmpl — the back-to-wiki button (octicon-home — the landing's
+ *   `octicon-repo` stand-in retired with the allowlist extension), the
+ *   last-edited line, the "{count} Commits" attached
  *   header and the landed CommitList (repo/commits_list parity) over the
  *   mapped wiki commits, plus the Newer/Older pagination at CommitsRangeSize
  *   (the service op's own page size). The commit rows link
@@ -273,7 +288,16 @@ export async function wikiTipOf(env: Env, pair: RepositoryWithOwner): Promise<Re
   return tips.get(branchRef(wikiBranchOf(pair)));
 }
 
-/** The wiki's default branch = the repo's (services/wiki.ts wikiBranch). */
+/** The wiki's default branch = the repo's (services/wiki.ts wikiBranch).
+ *  UPSTREAM PARITY at the pin (verified 2026-10-30, the findings-git-e2e
+ *  F10 record): upstream sets `repo.DefaultWikiBranch =
+ *  setting.Repository.DefaultBranch` at creation (services/repository/
+ *  create.go:148) and the setting defaults to "main" (modules/setting/
+ *  repository.go:156) — the wiki repo initializes on that branch
+ *  (services/wiki/wiki.go:43 InitWiki) and ChangeDefaultWikiBranch can
+ *  move it. So our repo.defaultBranch ("main") is exact parity; the
+ *  finding's "upstream master" premise describes pre-default-branch-pin
+ *  upstream and does not hold at fc493688. */
 function wikiBranchOf(pair: RepositoryWithOwner): string {
   return pair.repo.defaultBranch;
 }
@@ -621,12 +645,12 @@ export function WikiStartPage(props: { ctx: UiContext; canWrite: boolean }) {
   if (repo === undefined) throw new Error("WikiStartPage requires ctx.repo");
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   return (
-    <BaseLayout ctx={props.ctx} title={wikiLocale.wiki} pageClass="repository wiki start" activeTab="code">
+    <BaseLayout ctx={props.ctx} title={wikiLocale.wiki} pageClass="repository wiki start" activeTab="wiki">
       <div class="ui container">
         <div class="ui center segment tw-py-8">
-          {/* start.tmpl:6 — octicon-book is not in the generated allowlist;
-              octicon-repo stands in (the missing-glyph rule). */}
-          <Icon name="octicon-repo" size={48} />
+          {/* start.tmpl:6 — the 48px book glyph (octicon-book joined the
+              generated allowlist with the wiki nav wave). */}
+          <Icon name="octicon-book" size={48} />
           <h2>{wikiLocale.welcome}</h2>
           <p>{wikiLocale.welcome_desc}</p>
           {props.canWrite && !repo.isMirror ? (
@@ -670,7 +694,7 @@ export function WikiViewPage(props: { ctx: UiContext; data: Extract<WikiViewData
           );
         })();
   return (
-    <BaseLayout ctx={ctx} title={data.title} pageClass="repository wiki" activeTab="code">
+    <BaseLayout ctx={ctx} title={data.title} pageClass="repository wiki" activeTab="wiki">
       <div class="ui container">
         {/* The page dropdown row (view.tmpl:6-32). */}
         <div class="repo-button-row">
@@ -680,15 +704,17 @@ export function WikiViewPage(props: { ctx: UiContext; data: Extract<WikiViewData
                 <span class="text">
                   {wikiLocale.page}: <strong>{data.title}</strong>
                 </span>
-                {/* view.tmpl:14 octicon-triangle-down — not in the allowlist;
-                    octicon-search stands in (the missing-glyph rule). */}
-                <Icon name="octicon-search" size={14} class="dropdown icon" />
+                {/* view.tmpl:14 octicon-triangle-down (in the allowlist
+                    since the Actions wave — the landing's search stand-in
+                    is retired). */}
+                <Icon name="octicon-triangle-down" size={14} class="dropdown icon" />
               </div>
               <div class="menu">
                 <div class="ui icon search input">
                   <i class="icon">
-                    {/* view.tmpl:18 octicon-filter — octicon-search stands in. */}
-                    <Icon name="octicon-search" size={16} />
+                    {/* view.tmpl:18 octicon-filter (allowlisted with the wiki
+                        nav wave — the search stand-in is retired). */}
+                    <Icon name="octicon-filter" size={16} />
                   </i>
                   <input name="search" placeholder={`${wikiLocale.filter_page}...`} />
                 </div>
@@ -814,7 +840,7 @@ export function WikiPagesPage(props: { ctx: UiContext; data: Extract<WikiPagesDa
   if (repo === undefined) throw new Error("WikiPagesPage requires ctx.repo");
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   return (
-    <BaseLayout ctx={ctx} title={wikiLocale.pages} pageClass="repository wiki pages" activeTab="code">
+    <BaseLayout ctx={ctx} title={wikiLocale.pages} pageClass="repository wiki pages" activeTab="wiki">
       <div class="ui container">
         <h2 class="ui header flex-left-right">
           <span>{wikiLocale.pages}</span>
@@ -845,9 +871,9 @@ export function WikiPagesPage(props: { ctx: UiContext; data: Extract<WikiPagesDa
                     href={`${repoLink}/wiki/${pathEscapeSegments(pageMeta.gitEntryName)}`}
                     data-tooltip-content={wikiLocale.original_git_entry_tooltip}
                   >
-                    {/* pages.tmpl:21 octicon-chevron-right — not in the
-                        allowlist; octicon-link stands in. */}
-                    <Icon name="octicon-link" />
+                    {/* pages.tmpl:21 octicon-chevron-right (allowlisted with
+                        the wiki nav wave — the link stand-in is retired). */}
+                    <Icon name="octicon-chevron-right" />
                   </a>
                 </td>
                 <td class="tw-text-right">
@@ -927,7 +953,7 @@ export function WikiFormPage(props: {
   // new.tmpl:37's {{.Link}} — the page's own canonical URL (ctx.Link).
   const cancelHref = props.isEdit ? `${repoLink}/wiki/${props.pageUrl}?action=_edit` : `${repoLink}/wiki?action=_new`;
   return (
-    <BaseLayout ctx={ctx} title={props.documentTitle} pageClass="repository wiki" activeTab="code">
+    <BaseLayout ctx={ctx} title={props.documentTitle} pageClass="repository wiki" activeTab="wiki">
       <div class="ui container">
         {/* new.tmpl:5's base/alert — the error slot. */}
         {props.error !== null ? <div class="ui negative message">{props.error}</div> : null}
@@ -998,15 +1024,15 @@ export function WikiRevisionPage(props: { ctx: UiContext; data: Extract<WikiRevi
           );
         })();
   return (
-    <BaseLayout ctx={ctx} title={data.title} pageClass="repository wiki revisions" activeTab="code">
+    <BaseLayout ctx={ctx} title={data.title} pageClass="repository wiki revisions" activeTab="wiki">
       <div class="ui container">
         {/* The header row (revision.tmpl:6-20). */}
         <div class="ui dividing header flex-left-right">
           <div class="flex-text-block">
             <a class="ui basic button tw-px-3" title={wikiLocale.back_to_wiki} href={`${repoLink}/wiki/${pageUrl}`}>
-              {/* revision.tmpl:8 octicon-home — not in the allowlist;
-                  octicon-repo stands in (the missing-glyph rule). */}
-              <Icon name="octicon-repo" />
+              {/* revision.tmpl:8 octicon-home (allowlisted with the wiki
+                  nav wave — the repo stand-in is retired). */}
+              <Icon name="octicon-home" />
             </a>
             <div class="tw-flex-1 gt-ellipsis">
               {data.title}

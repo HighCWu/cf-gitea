@@ -29,6 +29,7 @@ import { BranchSelector, type SelectorRefs } from "../components/branch-selector
 import { FileContentView } from "../components/file-content";
 import { RepoFilesTable } from "../components/file-list";
 import type { EngineClient } from "../engine";
+import { locale } from "../locale";
 import { enrichTreeCommits, pickReadme, renderRepoMarkdown } from "../page-data";
 import { BaseLayout, Icon } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
@@ -47,6 +48,121 @@ const emptyRepoLocale = {
   /** "repo.push_exist_repo" */
   push_exist_repo: "Pushing an existing repository from the command line",
 };
+
+/** The clone panel's chrome text (the component-local pattern — locale.ts is
+ *  shared and not this wave's file; the panel's "Code" label reuses the
+ *  locale module's repo_code value). */
+const clonePanelLocale = {
+  /** The clone_panel.tmpl header row's plain "Clone" label (upstream
+   *  hardcodes it next to the octicon-terminal — no locale key at the pin). */
+  clone: "Clone",
+  /** "copy_url" */
+  copy_url: "Copy URL",
+  /** "repo.download_zip" / "repo.download_tar" */
+  download_zip: "Download ZIP",
+  download_tar: "Download TAR.GZ",
+} as const;
+
+/** The HTTPS clone URL for one repo (upstream ComposeHTTPSCloneURL,
+ *  models/repo/repo.go:613-615 — `{AppURL}{owner}/{repo}.git`; the request
+ *  origin is the AppURL stand-in, the empty-repo page's existing convention). */
+export function httpsCloneUrl(origin: string, ownerNamespace: string, slug: string): string {
+  return `${origin}/${ownerNamespace}/${slug}.git`;
+}
+
+/**
+ * The clone dropdown panel (templates/repo/clone_panel.tmpl at the pin,
+ * rendered by view_content.tmpl:115 on the repo home's tree root) — the
+ * `initRepoClonePanel` button plus the `.clone-panel-popup.tippy-target`
+ * sibling the official bundle turns into the click dropdown
+ * (web_src/js/features/repo-common.ts:130-141: the popup must be the
+ * button's IMMEDIATE nextElementSibling; the combo logic reads the
+ * `data-link` tabs, fills every `.js-clone-url` on the page and drives the
+ * `data-clipboard-target` copy button — the markup is the whole contract).
+ *
+ * HTTPS-only is the documented divergence: upstream renders the SSH tab
+ * when `SupportSSH` (`!setting.SSH.Disabled && (doer || ExposeAnonymous)`,
+ * models/repo/repo.go:672) and a Tea CLI tab — cf-gitea serves no SSH
+ * transport, so both tabs are unrendered (the JS falls back to the first
+ * available tab, the exact shape upstream's own admin-disabled case
+ * produces). OpenWithEditorApps is unrendered (no editor-app config
+ * surface, clone_panel.tmpl's `$showOpenWithEditorApps` arm). The download
+ * arms ride the LANDED archive route (pages/archive-files.ts, the
+ * DownloadArchiveLinkPrefix shape view_home.go:94 builds) — zip + tar.gz;
+ * the bundle arm is unrendered (the landed builder refuses the format — a
+ * dead link, the dead-link rule).
+ */
+export function RepoClonePanel(props: { cloneUrl: string; archivePrefix: string }) {
+  return (
+    <>
+      <button type="button" class="ui compact primary button" data-global-init="initRepoClonePanel">
+        <Icon name="octicon-code" size={16} />
+        <span>{locale.repo_code}</span>
+        <Icon name="octicon-triangle-down" size={14} class="dropdown icon" />
+      </button>
+      <div class="clone-panel-popup tippy-target">
+        <div class="flex-text-block clone-panel-field">
+          <Icon name="octicon-terminal" /> {clonePanelLocale.clone}
+        </div>
+        <div class="clone-panel-tab">
+          <button type="button" class="item repo-clone-https" data-link={props.cloneUrl}>
+            HTTPS
+          </button>
+        </div>
+        <div class="divider" />
+        <div class="clone-panel-field">
+          <div class="ui input tiny action">
+            <input size={30} class="repo-clone-url js-clone-url" value={props.cloneUrl} readonly />
+            <div
+              class="ui small compact icon button"
+              data-clipboard-target=".js-clone-url"
+              data-tooltip-content={clonePanelLocale.copy_url}
+              aria-label={clonePanelLocale.copy_url}
+            >
+              <Icon name="octicon-copy" size={14} />
+            </div>
+          </div>
+        </div>
+        <div class="flex-items-block clone-panel-list">
+          <a class="item muted archive-link" href={`${props.archivePrefix}.zip`} rel="nofollow">
+            <Icon name="octicon-file-zip" /> {clonePanelLocale.download_zip}
+          </a>
+          <a class="item muted archive-link" href={`${props.archivePrefix}.tar.gz`} rel="nofollow">
+            <Icon name="octicon-file-zip" /> {clonePanelLocale.download_tar}
+          </a>
+        </div>
+      </div>
+    </>
+  );
+}
+
+/**
+ * The inline clone combo (templates/repo/clone_buttons.tmpl — empty.tmpl:39
+ * renders it in the quickstart's repo-button-row): the same
+ * `initRepoCloneButtonsCombo` contract minus the dropdown — the HTTPS tab
+ * button, the readonly url input and the copy button, driven by the same
+ * bundle feature (the combo's `data-clipboard-target` scopes to the sibling
+ * input's class).
+ */
+export function RepoCloneButtonsCombo(props: { cloneUrl: string }) {
+  return (
+    <div class="ui action small input clone-buttons-combo" data-global-init="initRepoCloneButtonsCombo">
+      <button type="button" class="ui small button repo-clone-https" data-link={props.cloneUrl}>
+        HTTPS
+      </button>
+      <input size={10} class="repo-clone-url js-clone-url" value={props.cloneUrl} readonly />
+      <button
+        type="button"
+        class="ui small icon button"
+        data-clipboard-target=".repo-clone-url"
+        data-tooltip-content={clonePanelLocale.copy_url}
+        aria-label={clonePanelLocale.copy_url}
+      >
+        <Icon name="octicon-copy" size={14} />
+      </button>
+    </div>
+  );
+}
 
 /** The ref universe + resolved default branch behind one page render. */
 export interface ResolvedRefs extends SelectorRefs {
@@ -181,6 +297,13 @@ export function EmptyRepoPage(props: { ctx: UiContext }) {
                     .
                   </small>
                 </h3>
+                {/* empty.tmpl:39's repo-button-row inside the clone item — the
+                    writer's New File/Upload File arms are unrendered (dead
+                    links; the editor routes are the file-view family's), the
+                    clone combo renders (clone_buttons.tmpl verbatim). */}
+                <div class="repo-button-row">
+                  <RepoCloneButtonsCombo cloneUrl={cloneUrl} />
+                </div>
               </div>
               <div class="divider" />
               <div class="item">
@@ -243,6 +366,15 @@ export function HomePage(props: { ctx: UiContext; data: HomeData }) {
                   family="src"
                   refs={data.refs}
                   active={{ refType: "branch", ref: head }}
+                />
+              </div>
+              {/* view_content.tmpl:115's tree-root clone panel — the right
+                  group's only landed member (the file search above it is
+                  unrendered; the panel is the row's whole right side). */}
+              <div class="repo-button-row-right">
+                <RepoClonePanel
+                  cloneUrl={httpsCloneUrl(ctx.origin, repo.ownerNamespace, repo.slug)}
+                  archivePrefix={`${repoLink}/archive/${head}`}
                 />
               </div>
             </div>

@@ -113,6 +113,13 @@ describe("smoke: the start family (start.tmpl over an empty wiki)", () => {
     expect(html).toContain('<div role="main" aria-label="Wiki" class="page-content repository wiki start">');
     expect(html).toContain(`<h2>${wikiLocale.welcome}</h2>`);
     expect(html).toContain(`<p>${wikiLocale.welcome_desc}</p>`);
+    // The 48px book glyph (start.tmpl:6 — octicon-book, allowlisted with
+    // the wiki nav wave).
+    expect(html).toContain('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="48" height="48" class="svg octicon-book"');
+    // The header tab strip carries the Wiki tab, ACTIVE on the family's
+    // own pages (shell RepoTab — upstream header.tmpl:162-166: the g w
+    // shortcut + octicon-book; activeTab="wiki" = .PageIsWiki).
+    expect(html).toContain('<a class="active item" href="/alice/wikismoke/wiki" data-shortcut-keys="g w">');
     // The writer-gated Create the First Page button → ?action=_new
     // (start.tmpl:10 — the action-QUERY grammar, not a /wiki/_new route).
     expect(html).toContain(`<a class="ui primary button tw-mr-0" href="${REPO_LINK}/wiki?action=_new">Create the First Page</a>`);

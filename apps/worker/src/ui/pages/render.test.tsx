@@ -234,8 +234,9 @@ describe("loadHomeData + HomePage degradation paths", () => {
       'git remote add origin <span class="js-clone-url">https://test.local/octocat/hello.git</span>',
     );
     expect(html).toContain("git push -u origin main");
-    // The clone URL rides the two js-clone-url spans (one per block).
-    expect(html.match(/js-clone-url/g)?.length).toBe(2);
+    // The clone URL rides the two quick-start spans + the B-4 clone panel's
+    // input class (three js-clone-url occurrences on the empty repo now).
+    expect(html.match(/js-clone-url/g)?.length).toBe(3);
     expect(html.match(/git push -u origin main/g)?.length).toBe(2);
   });
 
