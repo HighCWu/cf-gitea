@@ -1,10 +1,13 @@
 # cf-gitea v1.3.1 — Release Notes (the convergence supplement)
 
-**Range**: `fe6d1a8..FINAL_HEAD_TBD` — **FINAL_COUNT_TBD commits** (46 at the
-doc-time snapshot, HEAD `e4b9f66`). v1.3 tagged `fe6d1a8`; every commit below
+**Range**: `fe6d1a8..FINAL_HEAD_TBD` — **FINAL_COUNT_TBD commits** (75 at the
+refresh snapshot, HEAD `affe9a3`; the doc's original snapshot was 46 at
+`e4b9f66`). v1.3 tagged `fe6d1a8`; every commit below
 landed after that tag, the same day (2026-10-30). This document is the
 convergence supplement the v1.3 notes' close-out pointed at; read it together
-with `docs/RELEASE-NOTES-v1.3.md`, which it does not replace.
+with `docs/RELEASE-NOTES-v1.3.md`, which it does not replace. It landed as
+`0fdc267` at the 46-commit snapshot and was refreshed at the window's tail
+to cover the grown range.
 
 The wave's shape: six read-only parity reviews (`d605d3e` auth, `9032c92`
 api, `e9358fd` webui, `db020f9` git, `27654cb` actions, `3646b72` packages),
@@ -15,7 +18,14 @@ URLs), and the five-wave usability findings/reverify sweep (`bac61a8`,
 organized below by user-visible surface. A word on method: several fix units
 died at the concurrency wall with their work complete in the tree; the
 orchestrator verified the surviving work against the pin, completed its pins,
-and landed it — those commits say so explicitly.
+and landed it — those commits say so explicitly. The window's second half —
+everything after the `0fdc267` snapshot — folds in the LFS locking family,
+the packages D-4/5/6 + serve-content wave, the api review's remainder (unit
+gates, E9, `assigned_by`, repoEdit merge fields, the counts seam, the
+release family whole), the webui merge box + branch-selector island, the
+archive git-semantics wave, and the pre-deploy verification chain (the
+convergence verification record, the gate pre-run, both local smokes) with
+the tag runbook.
 
 ## 1. Git and auth
 
@@ -43,6 +53,20 @@ and landed it — those commits say so explicitly.
   `DisablePassword` shape with an upfront notice. Login relabels its field
   "Access Token" with a helper where upstream's forgot-password slot sits.
   The wire is untouched; password managers still retain the PAT.
+- **LFS file locking is live** (`7b589c7`). The git review's locks-501
+  MEDIUM closed upstream-exact: list/create/verify/unlock with
+  `CheckAcceptMediaType` 415s, scope levels (list/verify Read,
+  create/unlock Write), signed auth on all four (anonymous 401s even on
+  public repos, realm `gitea-lfs`), the `?id=`/`?path=`/cursor paging arms
+  with upstream's page-number cursor quirk, duplicate-create 409 echoing
+  the existing lock (case-insensitive via a D1-race-safe `lower_path`
+  unique index — migration `0045`), and upstream's unlock
+  bug-compatibility kept: every delete error maps to one 500 (the pin has
+  no 404/403 arm). The 501 is retired; SPEC-0006 §2.7 rewritten as LANDED.
+- **LFS JSON envelopes drop the trailing newline** (`95cdcaf`). The locks
+  wave's recorded INFO, reconciled family-wide: batch/upload/verify bodies
+  and error arms match the pin's newline-free jsonv2 encoder
+  byte-for-byte; Go's own plain-text 404/500 shapes kept as-is.
 
 ## 2. Actions
 
@@ -84,6 +108,19 @@ and landed it — those commits say so explicitly.
   (`structs/user.go:67-73`, invisible to swagger) — renders from the login
   column on every User payload, with the contract harness teaching the
   field-level RUNTIME_ONLY class.
+- **The `/user` counts seam renders, degrades, and pins** (`58283bd`, wired
+  `40120ae`, degrade `9f883d0`, pin `93e9c0b`). Upstream renders the raw
+  `NumFollowers`/`NumFollowing` columns (`convert/user.go:107-111`); our
+  row has no counter columns, so the seam renders the requester-visible
+  live totals — a private follower never counts for a viewer who can't see
+  them (the documented divergence). `GET /users/{username}` rides the async
+  twin; `GET /user` re-reads the row for the self view (every follower
+  counts, private included); lists stay flat. The whole seam is
+  best-effort: no binding, a lookup miss, or a counts read degrades to the
+  auth middleware's sync render instead of 500-ing. The same landing
+  renders topics/licenses from their stored sets (the converter's
+  hardcoded `[]` retired) and deletes the stale identities serializer
+  copy.
 - **The profile quartet projects from the row everywhere** (`a5936fe`).
   `description`/`website`/`location` render on the tier-1 readers
   (`GET /users/{username}`, `/user`, `/users/search`, the repo listings'
@@ -96,9 +133,22 @@ and landed it — those commits say so explicitly.
   without duplication, 422 on protected tag names, 404 with no row when the
   target can't resolve, annotated tags when `tag_message` is set, drafts
   deferring the write to publish. The web create form rides the same
-  wrapper. Disclosed: `sha1`/`num_commits` stay unwritten (the engine-wave
-  tail) and the archived-repo arm keeps our 201 where upstream maps its
-  failure to a bare 500 — both recorded in `docs/residuals-v1.4.md`.
+  wrapper. Disclosed: the archived-repo arm keeps our 201 where upstream
+  maps its failure to a bare 500 — recorded in `docs/residuals-v1.4.md`;
+  the `sha1`/`num_commits` tail has since closed (`efd1916`, below).
+- **The release family is whole** (`efd1916`, `29ecd1d`). The kept-open
+  tail closed: the row fills `sha1`/`num_commits`/`created` from the TAGGED
+  COMMIT (committer time — "an old commit does not become the latest
+  release"; `num_commits` capped at the engine's 5,000-commit scan, the
+  documented honest-partial arm). UpdateRelease ported whole: every
+  published edit re-runs createTag (edit-created tags are always
+  lightweight; publish-from-draft finally lands its tag; a post-edit draft
+  zeroes `published_unix` — the withdraw arm), the fill rides every
+  published edit, and the notify fork emits "published" only when a tag
+  was actually created. Upstream never deletes the old ref on rename (the
+  old tag stays orphaned), and our `releases_repo_tag_uq` unique index
+  answers 500 on rename-onto-existing-tag where upstream would write
+  duplicate rows — recorded (`docs/residuals-v1.4.md` P3-14).
 - **Token scopes gate the whole `/api/v1` tree** (`56109ec`). The
   `requireScope` port was mounted only on the token-CRUD router — a
   `read:user`-only or scopeless token passed every other endpoint, writes
@@ -117,6 +167,41 @@ and landed it — those commits say so explicitly.
   (#{index}) from {head} into {base}", squash `{title} (#{index})`, rebase
   empty). No `.gitea/default_merge_message` template resolution — recorded
   divergence.
+- **The issue/pull family carries upstream's unit gates** (`ddf3b2a`, the
+  api review's item 10 + the auth review §7). `/issues` closes with
+  mustEnableIssuesOrPulls and `/pulls` with mustAllowPulls +
+  reqRepoReader(TypeCode) at upstream's exact chain position — a disabled
+  unit is unreadable to everyone including owner and site-admin, both
+  gates answer the exact 404 `{message:'not found',url:swagger}`, and
+  mustNotBeArchived keeps its 423. `/labels` and `/milestones` verified
+  ungated upstream and pinned so. **Behavior change**: the archived-repo
+  pulls-CREATE pin flipped 423→404 (the group gate shadows the 423 over
+  the whole `/pulls` subtree). Documented divergences: the IsEmpty arm
+  omitted until isEmpty maintenance lands, the TypeCode read vacuous, the
+  pre-existing DELETE-comment 423-on-archived kept as-is.
+- **E9: comment bodies are required and locked issues refuse non-writers**
+  (`d2fd6f0`). Create and edit both carry upstream's Required binding —
+  absent or empty body answers 422 in middleware before the handler (two
+  additive runtime-only response rows; neither op's swagger declared 422)
+  — and the lock check sits after requireIssue before the blocked-user
+  arm: non-writer 403 with upstream's exact locale message,
+  collaborator-writer and site-admin pass.
+- **repoEdit carries the fifteen merge-config fields; `assigned_by`
+  filters both list arms** (`7047639`, `4f8ade7`). The `pull_requests`
+  unit row stores the Go-marshal PullRequestsConfig JSON
+  (`has_pull_requests:false` deletes the row, re-enable at defaults;
+  flags-only PATCHes merge over the loaded config), `projects_mode` rides
+  the projects row, the update-style trio's verbatim 400s gate on the
+  caller touching one of the three fields, and the repo render reads all
+  fifteen wire keys from the settings overlay — **disclosed behavior
+  change**: `allow_manual_merge` now renders false (the pre-wave true was
+  upstream's unit-less fallback, the wrong one of its two postures).
+  Bonus, upstream-faithful: an unknown `default_branch` target on a
+  non-empty repo silently keeps the old default (upstream 500s on read
+  errors; ours degrades to skip). `assigned_by` resolves through the
+  `issue_assignees` subquery (upstream's numeric-arm INNER JOIN) on the
+  repo-scoped list and global `/repos/issues/search`; `mentioned_by`
+  stays the empty-set sentinel — no mention store.
 - **Smaller contract fixes**: repo-create echoes the sent `description`
   (the settings-row serialization gap, `1677dbb`); the release detail
   surface carries the two-item Releases/Tags sub-menu upstream renders on
@@ -125,6 +210,20 @@ and landed it — those commits say so explicitly.
 
 ## 4. Web UI
 
+- **The merge box mounts and the branch selector becomes the island**
+  (`91b7909`, the webui review's top drifts 5 and 1). The conversation
+  page mounts the full merge card server-side: OPEN PRs get the whole
+  card (checking line, blockers, status-check section, command-line
+  instructions — `pull_merge_box.go:89-191` verified faithful),
+  closed-unmerged PRs get upstream's ClosedInfo pair (the "renders
+  nothing closed" residual is gone), merged PRs render nothing (upstream's
+  `ShowMergeBox=false`). The branch selector is rewritten to
+  `branch_dropdown.tmpl`'s island shape — `data-global-init` +
+  `initRepoBranchTagSelector` and the ~20 `data-*` attrs, the menu the
+  official bundle's client-DOM render over the already-landed
+  `/branches/list` + `/tags/list` aux endpoints. Documented reductions:
+  `allow-create-new-ref` and `enable-feed` false, no server-rendered menu
+  items — exactly upstream's own page shape.
 - **The pulls list has its New Pull Request button** (`d52361b`,
   `56df8a6`). Upstream's list-header button over `MakeDefaultCompareLink`
   (`repo.go:56-66`): writers get the live compare link, signed-in
@@ -156,6 +255,21 @@ and landed it — those commits say so explicitly.
   registered the family GET-only, so no web archive download ever started.
   The POST arm now answers upstream's fast-path `{"complete":true}`
   (`web.go:1691`, `repo.go:381-390`) behind the same-origin guard.
+- **Archive downloads became git-archive semantics** (`5365236`, the git
+  review's archive MEDIUM). export-ignore honored with git's exact
+  precedence (tree-only `.gitattributes`, deeper beats shallower, last
+  matching line wins, subtree pruning, the re-include arms), zip entries
+  DEFLATE (method 8, raw CRC-32, honest sizes) instead of STORE, and
+  export-subst parsed but not substituted — the documented disposition,
+  since git expands `$Format:…$` through machinery we don't have
+  engine-side yet.
+- **The archive POST arm is pinned whole and gains upstream's empty-repo
+  gate** (`e9a6595`). The four arms pinned (the signed-in fast path,
+  guard-first 403, the 404 ladder, the anonymous POST on the fast path —
+  the group's gates are auth methods, no reqSignIn), and the pin unit's
+  probe caught a real divergence: a never-pushed repo's POST answered 200
+  where upstream's `MustBeNotEmpty` group gate 404s both arms — the check
+  is in, and the never-pushed repo now 404s like its GET twin.
 - **The branches page sorts like upstream** (`7f9241e`). The list was
   name-byte-order; it now reads tip commits for the filtered universe and
   sorts commit_time DESC, name ASC — the pin's only order
@@ -218,6 +332,29 @@ and landed it — those commits say so explicitly.
   nav-tab fold, goldens, and a11y entries. The artifacts preview's
   signed-URL golden lands behind the ROUTE_CLOCK-shaped page clock seam
   (null = exact wall clock; production byte-identical).
+- **The packages review's D-4/D-5/D-6 close** (`41eada6`). The nuget
+  service index (`/`, `/index.json`, `/$metadata`) is deliberately
+  unauthenticated upstream — ours now matches, anonymous 200 even for
+  private owners (**behavior change**; unknown owners still 404); the
+  three quota 403 sentinels byte-match upstream's texts; and a
+  serve-content port brings `ctx.ServeContent`'s whole header/byte-serving
+  set to every download arm (nosniff, the CSP family, Cache-Control,
+  Content-Disposition through the byte-verified port, RFC 7232
+  preconditions including the `If-None-Match:*` 304, single-range 206
+  with normal/suffix/open-ended/clamped Content-Range, the 416 shape).
+  One documented divergence: multi-range serves a full 200 where Go
+  answers multipart/byteranges.
+- **The pypi unicode-filename mojibake is fixed** (`2757a9e`). The
+  multipart header decode was latin1 — a UTF-8 `ü` stored as `Ã¼` and
+  GET-by-sent-name 404'd. The decode is UTF-8 now (red-first pin), the
+  remaining latin1 sites (helm/npm tar-member headers, maven's label
+  sniff) verified correct usages.
+- **A zero-start Range slices too** (`f3e9f63`). The pre-deploy smoke's
+  fix-before-deploy find: `bytes=0-9`/`bytes=0-0` answered 206 with the
+  FULL body under the full content-length — the composer's `start > 0`
+  guard was a falsy-zero check. Every 206 slices now (serve-content
+  24/24), closing the first-segment corruption resumable clients would
+  hit.
 
 ## 6. Verification records (read-only, no code)
 
@@ -239,19 +376,55 @@ The wave's evidence base, all committed under `docs/usability/`:
 - The link crawl and the runbook handover record: `71f56f2` (428 URLs,
   28 404s classified; the N2 release-tag finding fixed `6b2bedc`).
 
+The post-snapshot chain adds the window's own verification layer:
+
+- The convergence verification record (`635a573`): 98 suites, 2,551
+  results, all green, run in a detached worktree pinned at `29ecd1d`
+  (auth 392, actions 196, api 310, ui 700, packages 191, plus the
+  supplemental sweeps). Two coverage gaps found and closed in-window: the
+  archive POST pins (`e9a6595`) and the counts degrade pin (`93e9c0b`).
+- The composite gate's pre-run verdict (`8e1d44c`): PASS at `d2fd6f0`,
+  zero real reds — 342 files, 7,740 passed + 42 skipped, 0 ws1009 deaths;
+  the three phase-1 reds all adjudicated solo-green (ADR-0006's harness
+  classes). The tag-time final run still executes at the release HEAD.
+- Both pre-deploy local smokes. The git-surface smoke (`6766af5`; six
+  surfaces PASS with real git 2.43.0 / git-lfs 3.4.1) surfaced TWO HIGH
+  fix-before-deploy finds — `gdt_` deploy tokens are REJECTED by the LFS
+  endpoints (upstream mounts the LFS routes WITH AllowDeployToken,
+  `web.go:1777`), killing every deploy-token clone of an LFS repo at
+  smudge; and `PUT /repos/{o}/{r}/collaborators/{user}` 500s for
+  write/admin/empty permission, so collaborators cannot be added via the
+  API — both fixes in flight at the refresh snapshot, to land before the
+  tag. The api/ui smoke (`d21beb5`; five surfaces PASS) found one real
+  bug — the zero-start Range, fixed `f3e9f63` before deploy — and
+  recorded three LOW findings.
+- The docs chain: the v1.3.1 tag runbook (`873def4`; eight verified
+  steps, four precedent corrections — including that REMOTE needs BOTH
+  0044 and 0045, both postdating v1.3's deploy), the residuals
+  post-landing reconciliation (`dc0a5bf`; all 48 hashes verified, every
+  in-flight row resolved with its hash, the board extended P2-10,
+  P3-14, P3-15), the guides freshness sweep (`ae1de6d`), the cite audit
+  (`48d4929`; 25 renumber pairs, machine-verified), the specs index
+  refresh (`9a6804c`; seven rows, cat-file-verified), and the README
+  status-table refresh (`affe9a3`).
+
 ## 7. Engineering notes
 
 - Test-only and lint landings: the dispatch bare-404 audit shapes pinned
   (`e92f786`), the empty-repo arm flip's missed pins closed (`9c4c71a`),
   the audit sort-arrow negative scoped to the table header (`0bd9bac`),
-  and two dead-import recoveries (`c77effe`, `c8fbda2`).
-- Window scale: 218 files changed, +24.5k/-0.9k lines — the majority
+  the counts degrade arm's dedicated pin (`93e9c0b`), and two
+  dead-import recoveries (`c77effe`, `c8fbda2`).
+- Window scale: 218 files changed, +24.5k/-0.9k lines at the `e4b9f66`
+  snapshot; 278 files, +42.3k/-1.7k at the refresh — the majority
   goldens, tests, and the `docs/usability/` records.
 
 ## 8. Compatibility notes
 
-- **One new migration**: `0044` (the `cron_state` table). Apply with the
-  deploy as usual (`pnpm db:migrate:remote`).
+- **Two new migrations**: `0044` (the `cron_state` table) and `0045` (the
+  `lfs_locks` table). Apply with the deploy as usual
+  (`pnpm db:migrate:remote`); both postdate v1.3's deploy, which applied
+  only 0041-0043 (`873def4`).
 - **Behavior changes to test against**: scopeless/read-limited tokens now
   403 on gated `/api/v1` paths (`56109ec`); duplicate package files now
   409 (`3571fe8`); chunked (no Content-Length) package uploads are
@@ -259,18 +432,40 @@ The wave's evidence base, all committed under `docs/usability/`:
   (`69036c8`); the git-HTTP Basic realm string changed (`85fa2ff`); OIDC
   audience/subject values changed to the upstream-correct shapes —
   consumers keying on the old malformed values must re-bind (`e3b55a8`);
-  release creation with a fresh `tag_name` now writes the ref (`6b2bedc`);
-  signup no longer accepts password fields (`058d76e`).
+  release creation with a fresh `tag_name` now writes the ref (`6b2bedc`)
+  and every published release edit re-runs createTag with `created_at`
+  filled from the tagged commit (`29ecd1d`, `efd1916`); signup no longer
+  accepts password fields (`058d76e`); LFS locks answer upstream-exact
+  where the family 501'd (`7b589c7`) and LFS JSON bodies lost their
+  trailing newline (`95cdcaf`); the nuget service index answers
+  anonymously, private owners included (`41eada6`); the issue/pull family
+  404s on disabled units and archived-repo pulls-CREATE flipped 423→404
+  (`ddf3b2a`); comment create/edit with an absent or empty body now 422
+  and locked issues 403 non-writer comments (`d2fd6f0`);
+  `allow_manual_merge` renders false (`7047639`); archive zips carry
+  DEFLATE entries and honor export-ignore (`5365236`); a never-pushed
+  repo's archive request 404s both arms (`e9a6595`).
 - **Specs amended in-window**: SPEC-0002, SPEC-0003, SPEC-0004, SPEC-0005,
-  SPEC-0010, SPEC-0012.
+  SPEC-0006, SPEC-0010, SPEC-0012, SPEC-0016.
 
 ## 9. Known limitations
 
 The consolidated v1.4 backlog is `docs/residuals-v1.4.md` (updated in this
-window). The wave's own disclosed tails: the Actions notify/commit-status
-tails and reusable-caller cascade stage to M3 (`e4b9f66`); release
-`sha1`/`num_commits` stay unwritten and the archived-repo release arm keeps
-its 201 (`6b2bedc`); `language` renders `''` on both user serializers until
-the side store exists (`cf269f4`); API-side `followers_count`/
-`following_count`/`last_login` remain the recorded SPEC-0005 follow-up
-(`cf269f4`, `7f9241e`).
+window; the post-landing reconciliation `dc0a5bf` resolved every
+in-flight-at-doc-time row and extended the board). The wave's own disclosed
+tails: the Actions notify/commit-status tails and reusable-caller cascade
+stage to M3 (`e4b9f66`); the archived-repo release arm keeps its 201
+(`6b2bedc`; the `sha1`/`num_commits` tail has since closed, `efd1916`);
+`language` renders `''` on both user serializers until the side store
+exists (`cf269f4`); API-side `last_login` remains the recorded SPEC-0005
+follow-up — the D1 row has no column (`cf269f4`, `58283bd`; the follower/
+following counts themselves landed, §3). New in the second half: the two
+HIGH pre-deploy smoke finds (deploy-token LFS rejection, the collaborators
+PUT 500) have their fixes in flight at the refresh snapshot, to land
+before the tag (`6766af5`); export-subst is parsed but not substituted
+(`5365236`); package downloads answer a full 200 on multi-range requests
+(`41eada6`); release rename-onto-existing-tag 500s on our unique index
+where upstream would write duplicates, and every rename orphans the old
+ref as upstream does (`29ecd1d`); and the unit gates' documented
+divergences (the IsEmpty arm, the vacuous TypeCode read) stage behind
+isEmpty maintenance (`ddf3b2a`, P3-15).
