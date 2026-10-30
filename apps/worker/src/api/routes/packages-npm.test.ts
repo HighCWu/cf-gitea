@@ -896,7 +896,7 @@ describe("npm auth/quota/repo-link arms", () => {
     // rollback posture leaves the two landed versions untouched.
     const over = await cappedPut("3.0.0");
     expect(over.status).toBe(403);
-    expect(errorOf(await over.json())).toBe("package quota count limit exceeded");
+    expect(errorOf(await over.json())).toBe("maximum allowed package count exceeded");
     expect((await db().select().from(packageVersions).all())).toHaveLength(2);
   });
 

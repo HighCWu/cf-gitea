@@ -61,6 +61,7 @@ import {
 } from "../../services/packages/model";
 import { PackageSizeMismatchError, PackageBlobTooLargeError } from "../../services/packages/blobs";
 import { DuplicatePackageFileError } from "../../services/packages/generic";
+import { serveFileHeaderSet, servePackageFileResponse } from "../../services/packages/serve-content";
 import {
   PypiFormError,
   PypiHashMismatchError,
@@ -275,7 +276,7 @@ async function protocolAccessGate(
 
 async function protocolContext(
   c: Context<{ Bindings: Env }>,
-  required: "read" | "write",
+  required: "read" | "write" | "none",
   opts: { apiKeyHeader?: boolean } = {},
 ): Promise<{ owner: UserRow; cred: ResolvedCredential }> {
   if (packagesDisabled(c.env)) {
@@ -287,10 +288,19 @@ async function protocolContext(
   if (owner === null) {
     throw new HTTPException(404, { res: plainResponse(404, userRedirectDoesNotExist(username)) });
   }
-  if (ownerBlindToPublicOnly(owner, cred)) {
-    throw new HTTPException(404, { res: plainResponse(404, userRedirectDoesNotExist(owner.username)) });
+  // "none" — the nuget service-index carve-out (api.go:342-346): the
+  // `GET /`, `/index.json` and `/$metadata` group sits OUTSIDE every
+  // reqPackageAccess wrap ("Needs to be unauthenticated for the NuGet
+  // client"), so upstream's UserAssignmentWeb still 404s an unknown
+  // {username} and verifyAuth still authenticates without rejecting, but no
+  // scope/access gate and no private-owner blindness run — a private owner's
+  // index answers 200 to anonymous. Everything else keeps the gate stack.
+  if (required !== "none") {
+    if (ownerBlindToPublicOnly(owner, cred)) {
+      throw new HTTPException(404, { res: plainResponse(404, userRedirectDoesNotExist(owner.username)) });
+    }
+    await protocolAccessGate(c.env.DB, required, owner, cred);
   }
-  await protocolAccessGate(c.env.DB, required, owner, cred);
   return { owner, cred };
 }
 
@@ -414,23 +424,20 @@ function contentLength(request: Request): number | null {
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
-/** The shared byte-serving shape (the generic router's serveDownload idiom
- *  — upstream helper.ServePackageFile: attachment disposition + last-modified
- *  from the file row). */
+/** The shared byte-serving shape (the generic router's serveDownload idiom —
+ *  upstream helper.ServePackageFile → ctx.ServeContent: the review's D-6
+ *  header set (nosniff/CSP/Cache-Control/expose-headers + the RFC 5987
+ *  `filename*` disposition twin) plus the 304/412/416/206 machinery, served
+ *  through serve-content.ts). */
 function fileResponse(
   c: Context<{ Bindings: Env }>,
   download: { stream: ReadableStream; size: number; filename: string; created: Date },
 ): Response {
-  const headers = new Headers({
-    "content-type": "application/octet-stream",
-    "content-length": String(download.size),
-    "content-disposition": `attachment; filename="${download.filename.replace(/["\\]/g, "_")}"`,
-    "last-modified": download.created.toUTCString(),
-  });
-  if (c.req.method === "HEAD") {
-    return new Response(null, { status: 200, headers });
-  }
-  return new Response(download.stream, { status: 200, headers });
+  return servePackageFileResponse(
+    c.req.raw,
+    c.req.method === "HEAD" ? null : download.stream,
+    { filename: download.filename, size: download.size, created: download.created },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -779,21 +786,20 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
           headers: { "content-type": "text/plain;charset=utf-8" },
         });
       }
-      const headers = new Headers({
-        "content-type": opened.contentType,
-        "content-length": String(opened.size),
-        "last-modified": opened.file.createdUnix.toUTCString(),
-      });
-      // Upstream's HEAD-only branch sets headers WITHOUT the filename
-      // (maven.go:216-219) — no Content-Disposition; the GET arm sets it
-      // (helper.ServePackageFile).
-      if (c.req.method !== "HEAD") {
-        headers.set(
-          "content-disposition",
-          `attachment; filename="${opened.file.name.replace(/["\\]/g, "_")}"`,
-        );
+      // Upstream's HEAD-only branch runs SetServeHeaders WITHOUT the filename
+      // (maven.go:216-219) — the D-6 header set but no Content-Disposition
+      // and no byte-serving (http.ServeContent never runs there; always 200).
+      // The GET arm is helper.ServePackageFile → ctx.ServeContent: the full
+      // disposition + the 304/206 arms (review D-6).
+      const serveOpts = {
+        size: opened.size,
+        created: opened.file.createdUnix,
+        contentType: opened.contentType,
+      };
+      if (c.req.method === "HEAD") {
+        return new Response(null, { status: 200, headers: serveFileHeaderSet(serveOpts) });
       }
-      return new Response(c.req.method === "HEAD" ? null : opened.stream, { status: 200, headers });
+      return servePackageFileResponse(c.req.raw, opened.stream, { ...serveOpts, filename: opened.file.name });
     } catch (error) {
       return mavenErrorResponse(error);
     }
@@ -888,10 +894,11 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
     }
   });
 
-  // ServiceIndexV3 (nuget.go:69-86).
+  // ServiceIndexV3 (nuget.go:69-86) — the unauthenticated service-index group
+  // (api.go:342-346, review D-4/U-1): no read gate.
   app.get("/:username/nuget/index.json", async (c) => {
     try {
-      const { owner } = await protocolContext(c, "read");
+      const { owner } = await protocolContext(c, "none");
       const origin = new URL(c.req.url).origin;
       return new Response(JSON.stringify(createServiceIndexJson(nugetBaseOf(origin, owner.username))), {
         status: 200,
@@ -902,20 +909,22 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
     }
   });
 
-  // FeedCapabilityResource (nuget.go:89-91) — the static Edmx document.
+  // FeedCapabilityResource (nuget.go:89-91) — the static Edmx document; the
+  // unauthenticated service-index group (api.go:342-346, review D-4/U-1).
   app.get("/:username/nuget/$metadata", async (c) => {
     try {
-      await protocolContext(c, "read");
+      await protocolContext(c, "none");
       return nugetXmlResponse(NUGET_EDMX_METADATA_XML);
     } catch (error) {
       return nugetErrorResponse(error);
     }
   });
 
-  // ServiceIndexV2 (nuget.go:45-66) — the group's "/" shape.
+  // ServiceIndexV2 (nuget.go:45-66) — the group's "/" shape; the
+  // unauthenticated service-index group (api.go:342-346, review D-4/U-1).
   app.get("/:username/nuget", async (c) => {
     try {
-      const { owner } = await protocolContext(c, "read");
+      const { owner } = await protocolContext(c, "none");
       const origin = new URL(c.req.url).origin;
       return nugetXmlResponse(serviceIndexV2Xml(nugetBaseOf(origin, owner.username)));
     } catch (error) {
@@ -924,7 +933,7 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
   });
   app.get("/:username/nuget/", async (c) => {
     try {
-      const { owner } = await protocolContext(c, "read");
+      const { owner } = await protocolContext(c, "none");
       const origin = new URL(c.req.url).origin;
       return nugetXmlResponse(serviceIndexV2Xml(nugetBaseOf(origin, owner.username)));
     } catch (error) {

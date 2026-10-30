@@ -73,6 +73,7 @@ import {
 import { QuotaTotalSizeError } from "./model";
 import { PackageBlobTooLargeError, PackageSizeMismatchError } from "./blobs";
 import { DuplicatePackageFileError } from "./generic";
+import { serveFileHeaderSet, servePackageFileResponse } from "./serve-content";
 import type { AuthUser } from "../../auth/auth-context";
 import { basicAuthTokenCandidate, parseAuthorizationHeader } from "../../auth/httpauth";
 import { ScopeSet } from "../../auth/scopes";
@@ -345,21 +346,20 @@ function createLocalMavenRouter(): Hono<{ Bindings: Env }> {
       if (opened.kind === "checksum") {
         return mavenText(200, opened.hash);
       }
-      const headers = new Headers({
-        "content-type": opened.contentType,
-        "content-length": String(opened.size),
-        "last-modified": opened.file.createdUnix.toUTCString(),
-      });
-      // Upstream's HEAD-only branch sets headers WITHOUT the filename
-      // (maven.go:216-219) — no Content-Disposition; the GET arm sets it
-      // (helper.ServePackageFile).
-      if (c.req.method !== "HEAD") {
-        headers.set(
-          "content-disposition",
-          `attachment; filename="${opened.file.name.replace(/["\\]/g, "_")}"`,
-        );
+      // Upstream's HEAD-only branch runs SetServeHeaders WITHOUT the filename
+      // (maven.go:216-219) — the D-6 header set but no Content-Disposition
+      // and no byte-serving (http.ServeContent never runs there; always 200).
+      // The GET arm is helper.ServePackageFile → ctx.ServeContent: the full
+      // disposition + the 304/206 arms (review D-6).
+      const serveOpts = {
+        size: opened.size,
+        created: opened.file.createdUnix,
+        contentType: opened.contentType,
+      };
+      if (c.req.method === "HEAD") {
+        return new Response(null, { status: 200, headers: serveFileHeaderSet(serveOpts) });
       }
-      return new Response(c.req.method === "HEAD" ? null : opened.stream, { status: 200, headers });
+      return servePackageFileResponse(c.req.raw, opened.stream, { ...serveOpts, filename: opened.file.name });
     } catch (error) {
       return mavenErrorResponse(error);
     }
@@ -648,17 +648,57 @@ describe("maven upload → checksums → metadata → download", () => {
     expect(head.headers.get("content-length")).toBe("4");
     expect(head.headers.get("last-modified")).not.toBe("");
     expect(head.headers.get("content-disposition")).toBeNull();
+    // The D-6 set rides the HEAD-only branch too — but NOT Accept-Ranges
+    // (http.ServeContent never runs on maven HEAD, maven.go:216-219).
+    expect(head.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
+    expect(head.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(head.headers.get("accept-ranges")).toBeNull();
     await head.arrayBuffer();
 
     const get = await protocol()(url);
     expect(get.status).toBe(200);
     expect(get.headers.get("content-type")).toBe("application/java-archive");
-    expect(get.headers.get("content-disposition")).toContain("any-name.jar");
+    expect(get.headers.get("content-disposition")).toBe("attachment; filename=any-name.jar");
+    expect(get.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
+    expect(get.headers.get("accept-ranges")).toBe("bytes");
     expect([...new Uint8Array(await get.arrayBuffer())]).toEqual([...TEST_BODY]);
 
     // The jar is NOT the lead file — no download counted.
     const versionRows = await db().select().from(packageVersions).all();
     expect(versionRows[0]?.downloadCount).toBe(0);
+  });
+
+  it("serves a unicode-named file with the RFC 5987 filename* twin and the 304 arm (D-6)", async () => {
+    // The maven grammar only bars [\\/:"<>|?*] (maven.go:49), so the
+    // disposition encoder's non-ASCII arm is reachable on a real upload —
+    // the filename arrives URL-decoded off the path wildcard.
+    const owner = await seedUser("alice");
+    const writer = await token(owner, "write:package");
+    const putUrl = `/api/packages/alice/maven/com/ex/ample/1.0/nü-1.0.pkg`;
+    const put = await protocol()(putUrl, MAVEN_PUT(TEST_BODY, authHeaders(writer)));
+    expect(put.status).toBe(201);
+    await put.arrayBuffer();
+
+    const url = `/api/packages/alice/maven/com/ex/ample/1.0/${encodeURIComponent("nü-1.0.pkg")}`;
+    const get = await protocol()(url);
+    expect(get.status).toBe(200);
+    // content_disposition.go:47-67 — the safe name (ü → _) plus the
+    // pct-encoded utf-8 twin of the original (uppercase hex).
+    expect(get.headers.get("content-disposition")).toBe(
+      "attachment; filename=n_-1.0.pkg; filename*=utf-8''n%C3%BC-1.0.pkg",
+    );
+    expect(get.headers.get("access-control-expose-headers")).toBe("Content-Disposition");
+    expect(get.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
+    expect(get.headers.get("accept-ranges")).toBe("bytes");
+    expect([...new Uint8Array(await get.arrayBuffer())]).toEqual([...TEST_BODY]);
+
+    const conditional = await protocol()(url, { headers: { "If-None-Match": "*" } });
+    expect(conditional.status).toBe(304);
+    expect(conditional.headers.get("content-disposition")).toBe(
+      "attachment; filename=n_-1.0.pkg; filename*=utf-8''n%C3%BC-1.0.pkg",
+    );
+    expect(conditional.headers.get("content-type")).toBeNull();
+    await conditional.text();
   });
 
   it("verifies checksum PUTs against the stored hashes (wrong → 400, right → 200)", async () => {
@@ -958,7 +998,7 @@ describe("maven auth/quota/limits arms", () => {
     // rollback posture leaves the two landed versions untouched.
     const over = await cappedPut("3.0");
     expect(over.status).toBe(403);
-    expect(await over.text()).toBe("package quota count limit exceeded");
+    expect(await over.text()).toBe("maximum allowed package count exceeded");
     expect((await db().select().from(packageVersions).all())).toHaveLength(2);
   });
 

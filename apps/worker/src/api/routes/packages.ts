@@ -61,6 +61,7 @@ import {
   uploadGenericFile,
 } from "../../services/packages/generic";
 import { PackageSizeMismatchError } from "../../services/packages/blobs";
+import { servePackageFileResponse } from "../../services/packages/serve-content";
 
 /**
  * The package registry API surface (SPEC-0016 §3) — two mounted families in
@@ -889,16 +890,19 @@ export function createPackagesProtocolRouter(): Hono<{ Bindings: Env }> {
       if (download === null) {
         return plainResponse(404, "package file does not exist");
       }
-      const headers = new Headers({
-        "content-type": "application/octet-stream",
-        "content-length": String(download.size),
-        "content-disposition": `attachment; filename="${download.descriptor.file.name.replace(/["\\]/g, "_")}"`,
-        "last-modified": download.descriptor.file.createdUnix.toUTCString(),
-      });
-      if (c.req.method === "HEAD") {
-        return new Response(null, { status: 200, headers });
-      }
-      return new Response(download.stream, { status: 200, headers });
+      // helper.ServePackageFile → ctx.ServeContent (review D-6): the full
+      // ServeSetHeaders set with the RFC 5987 `filename*` disposition twin,
+      // plus the 304/412/416/206 byte-serving arms (serve-content.ts). HEAD
+      // suppresses the body while the byte-serving status stands.
+      return servePackageFileResponse(
+        c.req.raw,
+        c.req.method === "HEAD" ? null : download.stream,
+        {
+          filename: download.descriptor.file.name,
+          size: download.size,
+          created: download.descriptor.file.createdUnix,
+        },
+      );
     } catch (error) {
       if (error instanceof HTTPException) throw error;
       return plainResponse(500, "internal server error");

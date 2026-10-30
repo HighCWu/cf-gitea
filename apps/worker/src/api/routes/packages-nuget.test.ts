@@ -480,6 +480,15 @@ describe("nuget push → V3 read family", () => {
     // the disposition carries the stored name.
     expect(get.headers.get("content-disposition")).toContain("system.gitea.1.0.1.nupkg");
     expect(get.headers.get("content-length")).toBe(String(nupkg.byteLength));
+    // The D-6 ServeContent set (the token-safe name renders bare).
+    expect(get.headers.get("content-disposition")).toBe("attachment; filename=system.gitea.1.0.1.nupkg");
+    expect(get.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
+    expect(get.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(get.headers.get("content-security-policy")).toBe(
+      "sandbox allow-scripts allow-modals allow-popups allow-downloads",
+    );
+    expect(get.headers.get("access-control-expose-headers")).toBe("Content-Disposition");
+    expect(get.headers.get("accept-ranges")).toBe("bytes");
     const served = new Uint8Array(await get.arrayBuffer());
     expect([...served]).toEqual([...nupkg]);
     expect(await shaHex("SHA-256", served)).toBe(await shaHex("SHA-256", nupkg));
@@ -496,6 +505,20 @@ describe("nuget push → V3 read family", () => {
     expect(head.status).toBe(200);
     await head.text();
     expect((await db().select().from(packageVersions).all())[0]?.downloadCount).toBe(1);
+
+    // The 304 arm rides the same walk (If-None-Match: * matches the
+    // ETag-less file). The counter bumps BEFORE serving upstream
+    // (OpenBlobForDownload, packages.go:667-670), so a 304-answered GET
+    // counts too — parity by construction.
+    const conditional = await protocol()(
+      "/api/packages/alice/nuget/package/System.Gitea/1.0.1/System.Gitea.1.0.1.nupkg",
+      { headers: { "If-None-Match": "*" } },
+    );
+    expect(conditional.status).toBe(304);
+    expect(conditional.headers.get("content-type")).toBeNull();
+    expect(conditional.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
+    await conditional.text();
+    expect((await db().select().from(packageVersions).all())[0]?.downloadCount).toBe(2);
   });
 
   it("normalizes the version through hashicorp go-version (toNormalizedVersion)", async () => {
@@ -924,6 +947,55 @@ describe("nuget auth, quota, and gates", () => {
     expect(blind.headers.get("www-authenticate")).toBe('Basic realm="Gitea Package API"');
   });
 
+  it("leaves the service-index trio unauthenticated for the NuGet client (api.go:342-346, D-4)", async () => {
+    const owner = await seedUser("alice");
+    const writer = await token(owner, "write:package");
+    const nupkg = await makeNupkg();
+    const pushed = await push("alice", nupkg, authHeaders(writer));
+    expect(pushed.status).toBe(201);
+    await pushed.text();
+
+    // All three arms answer ANONYMOUS 200 with the upstream shapes: the V2
+    // service document, the V3 index JSON, the static Edmx.
+    const anon = protocol();
+    const v2 = await anon("/api/packages/alice/nuget");
+    expect(v2.status).toBe(200);
+    expect(v2.headers.get("content-type")).toBe("application/atom+xml; charset=utf-8");
+    expect(await v2.text()).toContain('<service base="https://example.com/api/packages/alice/nuget"');
+    const v2Slash = await anon("/api/packages/alice/nuget/");
+    expect(v2Slash.status).toBe(200);
+    await v2Slash.text();
+
+    const v3 = await anon("/api/packages/alice/nuget/index.json");
+    expect(v3.status).toBe(200);
+    const index = rec(await v3.json());
+    expect(index.version).toBe("3.0.0");
+    expect(recs(index.resources)).toHaveLength(9);
+
+    const metadata = await anon("/api/packages/alice/nuget/$metadata");
+    expect(metadata.status).toBe(200);
+    expect(await metadata.text()).toContain("<edmx:Edmx");
+
+    // The drift's core: a PRIVATE owner's index also answers anonymous —
+    // upstream's UserAssignmentWeb 404s only an unknown username and no
+    // reqPackageAccess wraps this group, so nothing gates the index.
+    const privateOwner = await seedUser("stealth", { visibility: "private" });
+    const stealthWriter = await token(privateOwner, "write:package");
+    const stealthPush = await push("stealth", nupkg, authHeaders(stealthWriter));
+    expect(stealthPush.status).toBe(201);
+    await stealthPush.text();
+    for (const path of ["/api/packages/stealth/nuget", "/api/packages/stealth/nuget/index.json", "/api/packages/stealth/nuget/$metadata"]) {
+      const res = await anon(path);
+      expect(res.status).toBe(200);
+      await res.text();
+    }
+
+    // PACKAGES_ENABLED=false still 404s the trio (the family posture).
+    const disabled = await protocol({ PACKAGES_ENABLED: "false" })("/api/packages/alice/nuget/index.json");
+    expect(disabled.status).toBe(404);
+    await disabled.text();
+  });
+
   it("403s quota with the admin bypass (the one-transaction posture: no rows land)", async () => {
     const owner = await seedUser("alice");
     const admin = await seedUser("root", { isAdmin: true });
@@ -938,7 +1010,7 @@ describe("nuget auth, quota, and gates", () => {
       body: nupkg,
     });
     expect(sizeDenied.status).toBe(403);
-    expect(messageOf(await sizeDenied.json())).toBe("package quota total size limit exceeded");
+    expect(messageOf(await sizeDenied.json())).toBe("maximum allowed package storage quota exceeded");
     // No rows landed (upstream wraps the walk in one transaction).
     expect((await db().select().from(packageVersions).all())).toHaveLength(0);
 
@@ -949,7 +1021,7 @@ describe("nuget auth, quota, and gates", () => {
       body: nupkg,
     });
     expect(countDenied.status).toBe(403);
-    expect(messageOf(await countDenied.json())).toBe("package quota count limit exceeded");
+    expect(messageOf(await countDenied.json())).toBe("maximum allowed package count exceeded");
 
     // Admins bypass both (packages.go:391-393).
     const bypass = await protocol({ PACKAGES_LIMIT_TOTAL_OWNER_SIZE: "128", PACKAGES_LIMIT_TOTAL_OWNER_COUNT: "0" })(

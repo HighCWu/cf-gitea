@@ -691,7 +691,7 @@ export function packagesQuotaFromEnv(env: PackagesQuotaEnv): PackagesQuotaConfig
 /** `ErrQuotaTotalCount` — owner version count past the cap (403 at the protocol layer). */
 export class QuotaTotalCountError extends Error {
   constructor() {
-    super("package quota count limit exceeded");
+    super("maximum allowed package count exceeded");
     this.name = "QuotaTotalCountError";
   }
 }
@@ -699,7 +699,7 @@ export class QuotaTotalCountError extends Error {
 /** `ErrQuotaTypeSize` — the single upload past the per-type cap (403). */
 export class QuotaTypeSizeError extends Error {
   constructor() {
-    super("package quota type size limit exceeded");
+    super("maximum allowed package type size exceeded");
     this.name = "QuotaTypeSizeError";
   }
 }
@@ -707,7 +707,7 @@ export class QuotaTypeSizeError extends Error {
 /** `ErrQuotaTotalSize` — owner total past the cap (403). */
 export class QuotaTotalSizeError extends Error {
   constructor() {
-    super("package quota total size limit exceeded");
+    super("maximum allowed package storage quota exceeded");
     this.name = "QuotaTotalSizeError";
   }
 }

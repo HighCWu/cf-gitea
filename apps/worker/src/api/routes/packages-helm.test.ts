@@ -527,7 +527,7 @@ describe("helm auth/quota arms", () => {
     // rollback posture leaves the two landed versions untouched.
     const over = await cappedPut("3.0.0");
     expect(over.status).toBe(403);
-    expect((await over.json<{ error: string }>()).error).toBe("package quota count limit exceeded");
+    expect((await over.json<{ error: string }>()).error).toBe("maximum allowed package count exceeded");
     expect((await db().select().from(packageVersions).all())).toHaveLength(2);
   });
 

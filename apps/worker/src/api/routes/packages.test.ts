@@ -453,7 +453,7 @@ describe("generic protocol PUT/GET/HEAD/DELETE", () => {
     // rollback posture leaves the two landed versions untouched.
     const over = await cappedPut("3.0.0");
     expect(over.status).toBe(403);
-    expect(await over.text()).toBe("package quota count limit exceeded");
+    expect(await over.text()).toBe("maximum allowed package count exceeded");
     expect((await db().select().from(packageVersions).all())).toHaveLength(2);
   });
 
@@ -498,6 +498,141 @@ describe("generic protocol PUT/GET/HEAD/DELETE", () => {
     const res = await protocol()("/api/packages/ghost/generic/n/1/f", { method: "GET" });
     expect(res.status).toBe(404);
     await res.text();
+  });
+
+  it("403s the per-type size quota with upstream's sentinel text (ErrQuotaTypeSize, D-5)", async () => {
+    const owner = await seedUser("alice");
+    const writer = await token(owner, "write:package");
+    const capped = protocol({ PACKAGES_LIMIT_SIZE_GENERIC: "4" });
+    const denied = await capped("/api/packages/alice/generic/big/1.1/big.bin", {
+      method: "PUT",
+      headers: {
+        "content-type": "application/octet-stream",
+        "content-length": "10",
+        Authorization: `token ${writer}`,
+      },
+      body: "0123456789",
+    });
+    expect(denied.status).toBe(403);
+    expect(await denied.text()).toBe("maximum allowed package type size exceeded");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The download serving set (review §3 / D-6 — helper.ServePackageFile →
+// ctx.ServeContent: the ServeSetHeaders block + the byte-serving arms)
+// ---------------------------------------------------------------------------
+
+describe("generic download serving set (D-6)", () => {
+  async function fixture(): Promise<void> {
+    const owner = await seedUser("alice");
+    const writer = await token(owner, "write:package");
+    const put = await putFile("alice", "srv", "1.0", "release.bin", "abcdefghij", {
+      Authorization: `token ${writer}`,
+    });
+    expect(put.status).toBe(201);
+    await put.text();
+  }
+
+  it("mounts the full ServeSetHeaders block on GET (nosniff/CSP/cache/expose/Accept-Ranges)", async () => {
+    await fixture();
+    const get = await protocol()("/api/packages/alice/generic/srv/1.0/release.bin", { method: "GET" });
+    expect(get.status).toBe(200);
+    expect(get.headers.get("content-type")).toBe("application/octet-stream");
+    expect(get.headers.get("content-disposition")).toBe("attachment; filename=release.bin");
+    expect(get.headers.get("access-control-expose-headers")).toBe("Content-Disposition");
+    expect(get.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(get.headers.get("content-security-policy")).toBe(
+      "sandbox allow-scripts allow-modals allow-popups allow-downloads",
+    );
+    expect(get.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
+    expect(get.headers.get("accept-ranges")).toBe("bytes");
+    expect(get.headers.get("last-modified") ?? "").toMatch(/GMT$/);
+    await get.text();
+  });
+
+  it("304s a conditional GET: If-Modified-Since echo and If-None-Match: *", async () => {
+    await fixture();
+    const caller = protocol();
+    const first = await caller("/api/packages/alice/generic/srv/1.0/release.bin", { method: "GET" });
+    const lastModified = first.headers.get("last-modified") ?? "";
+    expect(lastModified).not.toBe("");
+    await first.text();
+
+    const since = await caller("/api/packages/alice/generic/srv/1.0/release.bin", {
+      method: "GET",
+      headers: { "If-Modified-Since": lastModified },
+    });
+    expect(since.status).toBe(304);
+    expect(await since.text()).toBe("");
+    // writeNotModified: the representation headers drop, the cache metadata stands.
+    expect(since.headers.get("content-type")).toBeNull();
+    expect(since.headers.get("content-length")).toBeNull();
+    expect(since.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
+    expect(since.headers.get("last-modified")).toBe(lastModified);
+
+    const noneMatch = await caller("/api/packages/alice/generic/srv/1.0/release.bin", {
+      method: "GET",
+      headers: { "If-None-Match": "*" },
+    });
+    expect(noneMatch.status).toBe(304);
+    await noneMatch.text();
+  });
+
+  it("serves single ranges (206 + Content-Range) incl. the curl -C - suffix shape; 416 past the end", async () => {
+    await fixture();
+    const caller = protocol();
+    const mid = await caller("/api/packages/alice/generic/srv/1.0/release.bin", {
+      method: "GET",
+      headers: { Range: "bytes=2-5" },
+    });
+    expect(mid.status).toBe(206);
+    expect(mid.headers.get("content-range")).toBe("bytes 2-5/10");
+    expect(mid.headers.get("content-length")).toBe("4");
+    expect(mid.headers.get("accept-ranges")).toBe("bytes");
+    expect(await mid.text()).toBe("cdef");
+
+    const suffix = await caller("/api/packages/alice/generic/srv/1.0/release.bin", {
+      method: "GET",
+      headers: { Range: "bytes=-3" },
+    });
+    expect(suffix.status).toBe(206);
+    expect(suffix.headers.get("content-range")).toBe("bytes 7-9/10");
+    expect(await suffix.text()).toBe("hij");
+
+    const resume = await caller("/api/packages/alice/generic/srv/1.0/release.bin", {
+      method: "GET",
+      headers: { Range: "bytes=10-" },
+    });
+    expect(resume.status).toBe(416);
+    expect(resume.headers.get("content-range")).toBe("bytes */10");
+    expect(resume.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(await resume.text()).toBe("invalid range: failed to overlap\n");
+
+    // Multi-range is the documented divergence — the full 200.
+    const multi = await caller("/api/packages/alice/generic/srv/1.0/release.bin", {
+      method: "GET",
+      headers: { Range: "bytes=0-1,3-4" },
+    });
+    expect(multi.status).toBe(200);
+    expect(await multi.text()).toBe("abcdefghij");
+  });
+
+  it("HEAD carries the serving set without a body and a conditional HEAD 304s", async () => {
+    await fixture();
+    const caller = protocol();
+    const head = await caller("/api/packages/alice/generic/srv/1.0/release.bin", { method: "HEAD" });
+    expect(head.status).toBe(200);
+    expect(head.headers.get("accept-ranges")).toBe("bytes");
+    expect(head.headers.get("content-disposition")).toBe("attachment; filename=release.bin");
+    expect(await head.text()).toBe("");
+
+    const conditional = await caller("/api/packages/alice/generic/srv/1.0/release.bin", {
+      method: "HEAD",
+      headers: { "If-None-Match": "*" },
+    });
+    expect(conditional.status).toBe(304);
+    await conditional.text();
   });
 });
 
