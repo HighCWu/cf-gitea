@@ -282,5 +282,11 @@ export function rowToUser(row: typeof users.$inferSelect): AuthUser {
     isAdmin: row.isAdmin,
     status: row.status,
     createdAt: row.createdAt,
+    // The render-relevant columns the api identity conversion renders the
+    // contract `User` from (auth-context.ts note) — mapped WHERE THE ROW IS
+    // IN HAND so the auth-shape User projection stays row-derived.
+    type: row.type,
+    visibility: row.visibility,
+    numStars: row.numStars,
   };
 }

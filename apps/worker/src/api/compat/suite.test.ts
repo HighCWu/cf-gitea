@@ -2895,7 +2895,11 @@ function declaredModelFields(modelRef: string): ReadonlySet<string> {
 }
 
 const ORG_FIELDS = declaredModelFields("Organization");
-const T2_USER_FIELDS = declaredModelFields("User");
+// The declared User fields PLUS the runtime-only `username` alias
+// User.MarshalJSON adds to every payload (modules/structs/user.go:67-73) —
+// undeclared in the vendored swagger (the harness's RUNTIME_ONLY_MODEL_FIELDS
+// twin, field-level).
+const T2_USER_FIELDS = new Set([...declaredModelFields("User"), "username"]);
 
 describe("tier-2 compat scenarios — org profile, members, public members, follows (T2)", () => {
   const authed = (init?: RequestInit): RequestInit => {

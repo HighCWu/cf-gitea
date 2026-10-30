@@ -4,6 +4,7 @@ import type { AuthUser } from "../auth";
 import { ApiError } from "./errors";
 import type { ApiEnv } from "./env";
 import type { User } from "./models/user";
+import { authUserToApiUser } from "./services/user";
 
 /**
  * Seam between `/api/v1` routes and token authentication (SPEC-0002 owns the
@@ -37,42 +38,26 @@ export function extractTokenHeader(authorization: string | undefined): string | 
 }
 
 /**
- * Token auth middleware for routes that require a signed-in caller (upstream
- * `reqToken`). Absent/foreign-scheme header or unknown token → 401 with
- * Gitea's exact body — upstream messages both cases "token is required"
- * (gitea/routers/api/v1/api.go reqToken + ctx.APIError): auth failures are
- * silent and reqToken rejects unconditionally. The resolved user lands in
- * `c.get("authUser")`.
+ * Convert a SPEC-0002 verified user (the `AuthUser` context type) into the
+ * contract `User` — BY DELEGATION to the canonical row-derived converter
+ * (`authUserToApiUser`, services/user.ts → `apiUserFromRow`,
+ * services/repository.ts). The api review's drift-1 fix: the dedicated body
+ * this function used to inline hardcoded avatar_url/html_url to "",
+ * visibility to "public", type to "User" and language to "en-US"; now every
+ * consumer of the auth-shape User (GET /user, the webhook `sender`, every
+ * `Viewer.requester`) renders the same row truth as GET /users/{username}.
+ * `rowToUser` (auth/token-service.ts) carries the render-relevant columns
+ * onto AuthUser where the row is in hand; `origin` is request-scoped and
+ * comes from the caller's `c.req.url`.
+ *
+ * `origin` is optional only for the two legacy bridges that predate the
+ * seam (routes/packages.ts's credential viewer, ui/index.ts's repo-search
+ * bridge) — both consume the rendered User as a Viewer-requester SLICE
+ * (login/is_admin predicates), never as a wire payload; without an origin
+ * the URLs render root-relative. Request-path callers MUST pass it.
  */
-/**
- * Convert a SPEC-0002 verified user (D1 row shape) into the contract `User`.
- */
-export function toApiUser(u: AuthUser): User {
-  return {
-    id: u.id,
-    login: u.username,
-    email: u.email ?? "",
-    full_name: u.displayName ?? "",
-    avatar_url: "",
-    html_url: "",
-    language: "en-US",
-    location: u.location ?? "",
-    website: u.website ?? "",
-    description: u.description ?? "",
-    active: u.status === "active",
-    is_admin: u.isAdmin,
-    prohibit_login: u.status === "prohibited",
-    restricted: false,
-    login_name: "",
-    source_id: 0,
-    followers_count: 0,
-    following_count: 0,
-    starred_repos_count: 0,
-    created: u.createdAt.toISOString(),
-    last_login: "0001-01-01T00:00:00Z",
-    type: "User",
-    visibility: "public",
-  };
+export function toApiUser(u: AuthUser, origin?: string): User {
+  return authUserToApiUser(u, origin ?? "");
 }
 
 /**
@@ -80,12 +65,18 @@ export function toApiUser(u: AuthUser): User {
  * `resolveAuth` middleware mounted at `/api/v1/*` already verified the
  * credential against D1 — its `c.var.auth` result wins when present;
  * (2) standalone router usage (tests, embedding) falls back to the injected
- * resolver parsing the header itself.
+ * resolver parsing the header itself. Arm (1) is a REQUEST path, so the
+ * row-truth conversion gets the request origin (the avatar/html URLs derive
+ * from it — `viewerOf`'s same `new URL(c.req.url).origin` rule,
+ * services/repository.ts); arm (2)'s resolver returns an already-rendered
+ * contract `User`, nothing to convert.
  */
 function identityFrom(c: Context<ApiEnv>, resolver: AuthResolver): Promise<User | null> {
   const ctxAuth = c.get("auth");
   if (ctxAuth !== undefined) {
-    return Promise.resolve(ctxAuth.user === null ? null : toApiUser(ctxAuth.user));
+    return Promise.resolve(
+      ctxAuth.user === null ? null : toApiUser(ctxAuth.user, new URL(c.req.url).origin),
+    );
   }
   const token = extractTokenHeader(c.req.header("Authorization"));
   return token === null ? Promise.resolve(null) : resolver.resolveToken(token);
@@ -133,6 +124,7 @@ export function createOptionalTokenAuthMiddleware(resolver: AuthResolver): Middl
 export const STUB_USER: User = {
   id: 1,
   login: "cf-gitea-stub",
+  username: "cf-gitea-stub",
   email: "stub@cf-gitea.invalid",
   full_name: "cf-gitea Stub User",
   avatar_url: "https://avatar.invalid/cf-gitea-stub",

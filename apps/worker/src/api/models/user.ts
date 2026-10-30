@@ -45,6 +45,17 @@ export const userSchema = z.object({
     .enum(["User", "Organization", "Bot"])
     .optional()
     .openapi({ description: "the user type" }),
+  // Upstream `User.MarshalJSON`'s backward-compatibility key
+  // (modules/structs/user.go:67-73): the struct shadows itself and adds
+  // `username` = `UserName` — the same value `login` carries — so EVERY
+  // rendered User payload carries it at runtime. The vendored swagger does
+  // NOT declare it (unlike `Organization.username`, which IS declared,
+  // organization.ts) — the same contract-vs-runtime split as the documented
+  // runtime-only response codes (check-openapi.mjs RUNTIME_ONLY_RESPONSES):
+  // declared here as an optional string so the converters' wire key
+  // typechecks, rendered by the canonical converter always equal to `login`
+  // (apiUserFromRow, services/repository.ts).
+  username: z.string().optional().openapi({ description: "login of the user, same as `login`" }),
   visibility: z
     .enum(["public", "limited", "private"])
     .optional()

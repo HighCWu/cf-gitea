@@ -17,6 +17,7 @@
 import { SELF, applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { follows, orgMembers, users } from "../db/schema";
@@ -44,6 +45,15 @@ beforeEach(async () => {
 const db = () => drizzle(env.DB);
 
 const SWAGGER_USER_FIELDS = Object.keys(contractModelProperties("User")).sort();
+
+/**
+ * The declared field set PLUS the one runtime-only key upstream marshals onto
+ * every User payload without declaring it — `User.MarshalJSON`'s `username`
+ * alias of `login` (modules/structs/user.go:67-73). Our zod schema declares
+ * it for exactly this reason (models/user.ts); the frozen contract cannot
+ * see it, so the exact-field-set assertions splice it in here.
+ */
+const USER_WIRE_FIELDS = [...SWAGGER_USER_FIELDS, "username"].sort();
 
 /** Indexed access under noUncheckedIndexedAccess — explicit guard instead of `!`. */
 function firstOf<T>(items: T[]): T {
@@ -171,7 +181,7 @@ describe("GET /users/{username} (userGet)", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("application/json");
     const body = await res.json<Record<string, unknown>>();
-    expect(Object.keys(body).sort()).toEqual(SWAGGER_USER_FIELDS);
+    expect(Object.keys(body).sort()).toEqual(USER_WIRE_FIELDS);
   });
 
   it("fills D1-sourced fields, hides the email, and reports public visibility", async () => {
@@ -184,6 +194,7 @@ describe("GET /users/{username} (userGet)", () => {
     expect(body).toMatchObject({
       id: alice.id,
       login: "Alice",
+      username: "Alice", // the MarshalJSON compat key == login (user.go:67-73)
       login_name: "",
       full_name: "Alice Doe",
       email: "", // primary email only for self/admin (upstream convert.ToUser)
@@ -467,7 +478,7 @@ describe("GET /users/search (userSearch)", () => {
     const body = await res.json<{ ok: boolean; data: Array<Record<string, unknown>> }>();
     expect(body.ok).toBe(true);
     expect(body.data).toHaveLength(1);
-    expect(Object.keys(firstOf(body.data)).sort()).toEqual(SWAGGER_USER_FIELDS);
+    expect(Object.keys(firstOf(body.data)).sort()).toEqual(USER_WIRE_FIELDS);
     expect(firstOf(body.data)).toMatchObject({ id: alice.id, login: "Alice" });
   });
 
@@ -639,6 +650,42 @@ describe("mounted chain (SELF — src/index.ts's /api/v1 mounts): sudo trio", ()
   });
 });
 
+describe("mounted chain (SELF): GET /user renders row truth (api review drift 1)", () => {
+  beforeEach(async () => {
+    await resetAuthTables();
+    seededById.clear();
+  });
+
+  it("the auth-shape conversion renders the canonical row-derived fields, username == login", async () => {
+    // The dedicated auth serializer used to hardcode avatar_url/html_url "",
+    // visibility "public", type "User" and starred_repos_count 0; identityFrom
+    // now delegates to the canonical converter with the request origin, so a
+    // LIMITED user's self-view carries the row's own values.
+    const doer = await seedUser("RowTruth", { email: "truth@example.com", visibility: "limited" });
+    await db().update(users).set({ numStars: 3 }).where(eq(users.id, doer.id));
+    const minted = await mintFor(doer.id, "row-truth", "all");
+
+    const res = await SELF.fetch("https://example.com/api/v1/user", {
+      headers: { Authorization: `token ${minted.plaintext}` },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json<Record<string, unknown>>()).toMatchObject({
+      id: doer.id,
+      login: "RowTruth",
+      username: "RowTruth", // the MarshalJSON compat key == login (user.go:67-73)
+      email: "truth@example.com", // self view renders the real email
+      avatar_url: "https://example.com/avatars/rowtruth",
+      html_url: "https://example.com/RowTruth",
+      visibility: "limited", // the row's column, not the old hardcoded "public"
+      type: "User",
+      starred_repos_count: 3, // the row's maintained counter, not the old hardcoded 0
+      is_admin: false,
+      active: true,
+    });
+  });
+});
+
 describe("mounted chain (SELF): public-only route arms", () => {
   beforeEach(async () => {
     await resetAuthTables();
@@ -708,7 +755,14 @@ describe("mounted chain (SELF): public-only route arms", () => {
   });
 
   it("POST /user/repos refuses, the sibling GET stays public-only-visible (api.go:1181)", async () => {
-    const token = await seedPublicOnlyDoer("PoRepoOwner");
+    // GET /user/repos sits in upstream's nested group that requires `user`
+    // AND `repository` (api.go:1181) — the tree-wide scope gate (auth-parity
+    // H1, api/scope-gate.ts) enforces both, so the token carries
+    // read:repository and the test's point stays the PUBLIC-ONLY flag: it
+    // does not itself 403 the sibling GET.
+    const doer = await seedUser("PoRepoOwner");
+    const minted = await mintFor(doer.id, "porepoowner-po", "public-only,read:user,read:repository");
+    const token = minted.plaintext;
 
     const post = await SELF.fetch("https://example.com/api/v1/user/repos", {
       method: "POST",

@@ -3,7 +3,8 @@ import { drizzle } from "drizzle-orm/d1";
 import { alias } from "drizzle-orm/sqlite-core";
 
 import { orgMembers, users } from "../../db/schema";
-import { apiUserFromRow, type Viewer } from "./repository";
+import type { AuthUser } from "../../auth/auth-context";
+import { apiUserFromRow, type ApiUserRow, type Viewer } from "./repository";
 import { isFollowing } from "./follows";
 import type { User } from "../models/user";
 
@@ -165,6 +166,48 @@ function canSeeUserCondition(doer: UserVisibilityDoer): SQL {
  */
 export function toApiUser(viewer: Viewer, row: UserRow): User {
   return apiUserFromRow(row, viewer);
+}
+
+/**
+ * The auth middlewares' identity conversion (api/auth.ts `identityFrom`): the
+ * SPEC-0002 `AuthUser` → contract `User`, rendered through the CANONICAL
+ * row-derived converter — the api review's drift 1 fix. `rowToUser`
+ * (auth/token-service.ts) maps the row's render-relevant columns onto
+ * `AuthUser` WHERE THE ROW IS IN HAND; this adapter rebuilds the
+ * `ApiUserRow` slice from them (the `??` arms are reachable only for
+ * hand-built AuthUser literals that predate the trio — production identity
+ * always carries the row values) and renders with the requester as a
+ * SELF-viewer: upstream converts the doer as `ToUser(ctx.Doer, ctx.Doer)`
+ * (routers/api/v1/user/userGetCurrent), so the authed arm is always true
+ * here and the gated fields (email/is_admin/active/prohibit_login) render
+ * the row's real values. The gate reads only `login`/`is_admin` — the same
+ * partial-requester slice services/search.ts builds for its Viewer.
+ *
+ * `origin` is request-scoped (the avatar/html URLs derive from it), which is
+ * exactly why the conversion lives in the api middleware layer and not in
+ * token-service/resolveAuth.
+ */
+export function authUserToApiUser(u: AuthUser, origin: string): User {
+  const row: ApiUserRow = {
+    id: u.id,
+    username: u.username,
+    usernameLower: u.usernameLower,
+    email: u.email,
+    displayName: u.displayName,
+    type: u.type ?? "user",
+    isAdmin: u.isAdmin,
+    status: u.status,
+    createdAt: u.createdAt,
+    location: u.location,
+    website: u.website,
+    description: u.description,
+    visibility: u.visibility ?? "public",
+    numStars: u.numStars ?? 0,
+  };
+  return apiUserFromRow(row, {
+    origin,
+    requester: { login: u.username, is_admin: u.isAdmin },
+  });
 }
 
 export interface UserSearchOptions {

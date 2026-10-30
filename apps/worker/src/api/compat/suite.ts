@@ -169,6 +169,21 @@ export function runtimeOnlyResponseNote(path: string, method: string, status: nu
   return RUNTIME_ONLY_RESPONSES[path]?.[method as Swagger2Method]?.[String(status)];
 }
 
+/**
+ * Runtime-only RESPONSE FIELDS — the field-level twin of
+ * RUNTIME_ONLY_RESPONSES: keys upstream marshals onto a model at runtime
+ * while the frozen contract does not declare them. One entry:
+ * `User.MarshalJSON`'s `username` backward-compatibility alias of `login`
+ * (modules/structs/user.go:67-73) — sent on EVERY User payload, declared
+ * nowhere in swagger, rendered by the canonical converter since the
+ * serializer seam (the api review's drift 2; our zod schema declares it for
+ * the same reason, models/user.ts). The walk still TYPE-checks the value as
+ * a string — only the missing contract declaration is supplied here.
+ */
+const RUNTIME_ONLY_MODEL_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  User: ["username"],
+};
+
 // ---------------------------------------------------------------------------
 // Tier-1 coverage — the exact stage-(c) algorithm of scripts/check-openapi.mjs
 // (a path counts as covered only when EVERY fixture method is implemented), so
@@ -401,7 +416,7 @@ async function runScenarioCase(
   const parsed = tryParseJson(bodyText);
   switch (expectation.kind) {
     case "model":
-      assertModelShape(parsed.value, expectationBodyFields(expectation, lookup), at, problems, lookup);
+      assertModelShape(parsed.value, expectationBodyFields(expectation, lookup), at, problems, lookup, expectation.modelRef ?? undefined);
       break;
     case "model-array": {
       if (!Array.isArray(parsed.value)) {
@@ -409,7 +424,9 @@ async function runScenarioCase(
         break;
       }
       const elementFields = expectationBodyFields(expectation, lookup);
-      parsed.value.forEach((element, index) => assertModelShape(element, elementFields, `${at}[${index}]`, problems, lookup));
+      parsed.value.forEach((element, index) =>
+        assertModelShape(element, elementFields, `${at}[${index}]`, problems, lookup, expectation.modelRef ?? undefined),
+      );
       break;
     }
     case "model-map": {
@@ -573,7 +590,11 @@ function assertErrorBodyShape(parsed: JsonResult, expectation: ResponseExpectati
  * Body-shape walk: every present field must be declared (unknown fields are
  * the semantic drift the suite exists to catch) and declared fields are
  * type-checked. Nulls pass — upstream marshals absent Go values as null and
- * the contract declares no required fields on response models.
+ * the contract declares no required fields on response models. `modelName`
+ * is the model this object level validates against (undefined for
+ * inline-object bodies): the undeclared-key check consults
+ * RUNTIME_ONLY_MODEL_FIELDS under it, so a documented runtime-only key passes
+ * (still type-checked) instead of failing as drift.
  */
 function assertModelShape(
   value: unknown,
@@ -581,6 +602,7 @@ function assertModelShape(
   at: string,
   problems: string[],
   lookup: FieldLookup,
+  modelName?: string,
 ): void {
   if (!isPlainObject(value)) {
     problems.push(`${at}: expected a JSON object, got ${describe(value)}`);
@@ -590,6 +612,10 @@ function assertModelShape(
   for (const [key, actual] of Object.entries(value)) {
     const field = byName.get(key);
     if (field === undefined) {
+      if (modelName !== undefined && RUNTIME_ONLY_MODEL_FIELDS[modelName]?.includes(key)) {
+        assertFieldValue(actual, { name: key, type: "string", required: false }, at, problems, lookup);
+        continue;
+      }
       problems.push(`${at}.${key}: field not declared by the fixture model (unknown field)`);
       continue;
     }
@@ -624,7 +650,7 @@ function assertFieldValue(
       value.forEach((element, index) => {
         const elementAt = `${at}[${index}]`;
         if (itemRef !== undefined) {
-          assertModelShape(element, lookup(itemRef), elementAt, problems, lookup);
+          assertModelShape(element, lookup(itemRef), elementAt, problems, lookup, itemRef);
         } else if (itemType !== undefined && itemType !== "any") {
           assertPrimitive(element, itemType, elementAt, problems);
         }
@@ -633,7 +659,7 @@ function assertFieldValue(
     }
     case "object": {
       if (field.ref !== undefined) {
-        assertModelShape(value, lookup(field.ref), at, problems, lookup);
+        assertModelShape(value, lookup(field.ref), at, problems, lookup, field.ref);
         return;
       }
       const mapValueRef = field.mapValueRef;
@@ -643,7 +669,7 @@ function assertFieldValue(
           return;
         }
         for (const [key, element] of Object.entries(value)) {
-          assertModelShape(element, lookup(mapValueRef), `${at}.${key}`, problems, lookup);
+          assertModelShape(element, lookup(mapValueRef), `${at}.${key}`, problems, lookup, mapValueRef);
         }
         return;
       }

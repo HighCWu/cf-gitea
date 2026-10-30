@@ -49,7 +49,10 @@ beforeEach(async () => {
 
 const db = () => drizzle(env.DB);
 
-const USER_FIELDS = Object.keys(contractModelProperties("User"));
+// The declared User fields PLUS the runtime-only `username` alias
+// User.MarshalJSON adds to every payload (modules/structs/user.go:67-73) —
+// undeclared in the vendored swagger, so spliced in for the wire-key checks.
+const USER_FIELDS = [...Object.keys(contractModelProperties("User")), "username"];
 
 /** Seeded D1 users the test resolver can authenticate as (`token u<id>`). */
 const seededUsers = new Map<number, { id: number; username: string; isAdmin: boolean }>();

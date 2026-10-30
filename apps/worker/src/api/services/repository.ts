@@ -396,6 +396,36 @@ export function userTypeToApiString(type: UserRow["type"]): "User" | "Organizati
 }
 
 /**
+ * The slice of the `users` row the canonical render reads — `apiUserFromRow`'s
+ * input on purpose, not the full `UserRow`: the auth middlewares'
+ * identity conversion (api/auth.ts, via `authUserToApiUser`, services/user.ts)
+ * delegates through this converter with the SPEC-0002 `AuthUser` projection
+ * (token-service's `rowToUser` carries exactly these columns plus the row's
+ * render-relevant type/visibility/star counter), so the doer's contract `User`
+ * — GET /user, the webhook `sender`, every `Viewer.requester` — is the SAME
+ * row-derived render as GET /users/{username}. Full rows satisfy the slice
+ * structurally; a newly-read column fails to compile here instead of
+ * silently rendering a zero through the auth path.
+ */
+export type ApiUserRow = Pick<
+  UserRow,
+  | "id"
+  | "username"
+  | "usernameLower"
+  | "email"
+  | "displayName"
+  | "type"
+  | "isAdmin"
+  | "status"
+  | "createdAt"
+  | "location"
+  | "website"
+  | "description"
+  | "visibility"
+  | "numStars"
+>;
+
+/**
  * The CANONICAL `toUser` body (convert/user.go:80–118): both ToUser-shaped
  * converters render through this one function — the embedded `Repository.owner`
  * / creators (`ToUserWithAccessMode`'s projection, convert/user.go:68–76) and
@@ -417,13 +447,19 @@ export function userTypeToApiString(type: UserRow["type"]): "User" | "Organizati
  * converters that embed a `User` (commit-status creator), matching upstream
  * `convert.ToUser`.
  */
-export function apiUserFromRow(row: UserRow, viewer: Viewer): User {
+export function apiUserFromRow(row: ApiUserRow, viewer: Viewer): User {
   const authed =
     viewer.requester !== null &&
     (viewer.requester.is_admin === true || requesterLoginLower(viewer) === row.usernameLower);
   return {
     id: row.id,
     login: row.username,
+    // Upstream User.MarshalJSON's `username` compat key (modules/structs/
+    // user.go:67-73) — a plain runtime alias of `login` sent on EVERY User
+    // payload while absent from the vendored swagger declaration. Rendered
+    // here so the canonical converter (and everything delegating through it,
+    // the auth-shape render included) carries it.
+    username: row.username,
     type: userTypeToApiString(row.type),
     login_name: "",
     source_id: 0,

@@ -24,6 +24,20 @@ export interface AuthUser {
   isAdmin: boolean;
   status: "active" | "prohibited";
   createdAt: Date;
+  /**
+   * The row's render-relevant columns (parity drift 1, api review): carried
+   * by `rowToUser` so the api middlewares' contract conversion
+   * (`authUserToApiUser`, api/services/user.ts) renders the doer through the
+   * CANONICAL row-derived converter — real type/visibility/star counter in
+   * GET /user, the webhook `sender`, and every `Viewer.requester` — instead
+   * of the hardcoded defaults the dedicated auth serializer used to emit.
+   * Optional because the only production constructor is `rowToUser` (always
+   * sets them); hand-built AuthUser slices (predicate-only bridges) omit
+   * them and the adapter then renders the documented defaults.
+   */
+  type?: "user" | "org";
+  visibility?: "public" | "limited" | "private";
+  numStars?: number;
 }
 
 export interface AuthToken {
