@@ -9,10 +9,28 @@
  * Upstream shape (templates/user/auth/signup.tmpl + signup_inner.tmpl at
  * the pin): page-content `user signin` (upstream reuses the sign-in
  * page-content discriminator), the attached header/segment pair, the
- * required `user_name`/`email`/`password`/`retype` fields, the
- * `auth.create_new_account` submit, and the already-have-account footer.
- * The install page is the login page with `adminInit` set (see login.tsx —
- * upstream's install posture reduced to that panel).
+ * required `user_name`/`email` fields, the `auth.create_new_account`
+ * submit, and the already-have-account footer. The install page is the
+ * login page with `adminInit` set (see login.tsx — upstream's install
+ * posture reduced to that panel).
+ *
+ * ## The password-field omission (the B-1 usability fix, 2026-10-30)
+ *
+ * Upstream renders `password` + `retype` behind signup_inner.tmpl's
+ * `{{if not .DisablePassword}}` — an instance with password auth disabled
+ * gets NO password fields. cf-gitea is exactly that shape, permanently:
+ * PAT-only auth, no password store (SPEC-0002 §4.6.7 divergence 7). The
+ * earlier render kept the fields for bare-form parity and DISCARDED both
+ * values (services/user-accounts.ts "accepted-and-ignored") — collecting a
+ * credential the server throws away is the decoy the first-run audit
+ * flagged (docs/usability/findings-first-run.md blocker 1), so the fields
+ * are GONE and an upfront notice discloses the credential model instead,
+ * riding upstream's in-segment pre-form notice slot
+ * (signup_inner.tmpl's `{{if .IsFirstTimeRegistration}}` sign_up_tip `<p>`)
+ * with the upstream flash-banner idiom (`RenderFlashMessage`'s
+ * `ui positive message`, util_render.go:263-289 — our repo idiom drops the
+ * `flash-*` classes, admin-monitor.tsx). The POST handler reads no
+ * password fields any more (src/ui/first-run.ts).
  */
 
 import { BaseLayout, renderPage } from "../shell";
@@ -26,9 +44,12 @@ export const signUpLocale = {
   title: "Register", // "sign_up"
   user_name: "Username", // "username"
   email: "Email Address", // "email"
-  password: "Password", // "password" (accepted-and-ignored — PAT-only auth,
-  //  SPEC-0002 §4.6.7; the field keeps upstream RegisterForm's shape)
-  retype: "Confirm Password", // "re_type"
+  /** The PAT-only disclosure (cf-gitea addition — upstream needs no such
+   *  banner because upstream HAS passwords). Rendered in the upstream
+   *  sign_up_tip slot; states the credential model where the password
+   *  fields used to sit (the B-1 fix — module header). */
+  token_auth_notice:
+    "Accounts on this instance authenticate with personal access tokens, not passwords. After signing up, create a token under Settings → Applications and use it to sign in.",
   submit: "Register Account", // "auth.create_new_account"
   already_have_account: "Already have an account?", // "auth.already_have_account"
   sign_in_now: "Sign in now!", // "auth.sign_in_now"
@@ -42,7 +63,9 @@ export const signUpLocale = {
 /** The sign-up page (`user/sign_up`, auth.SignUp's render arm). `error` is
  *  the server-side inline failure (200 re-render, the §2.2 posture);
  *  `values` re-fills the typed fields like upstream's `{{.user_name}}`
- *  bindings (never the passwords). */
+ *  bindings. No password fields: PAT-only auth (the B-1 fix — module
+ *  header); the token_auth_notice discloses the credential model in the
+ *  upstream sign_up_tip slot instead. */
 export function SignUpPage(props: {
   ctx: UiContext;
   error: string | null;
@@ -55,6 +78,7 @@ export function SignUpPage(props: {
         <div class="column tw-flex tw-flex-col tw-gap-4 tw-max-w-2xl tw-m-auto">
           <h4 class="ui top attached header center">{signUpLocale.title}</h4>
           <div class="ui attached segment">
+            <div class="ui positive message">{signUpLocale.token_auth_notice}</div>
             <form class="ui form" action="/user/sign_up" method="post">
               {props.error !== null ? <div class="ui negative message">{props.error}</div> : null}
               <div class="required field">
@@ -78,20 +102,6 @@ export function SignUpPage(props: {
                   value={values.email ?? ""}
                   required
                 />
-              </div>
-              <div class="required field">
-                <label for="password">{signUpLocale.password}</label>
-                <input
-                  id="password"
-                  name="password"
-                  type="password"
-                  autocomplete="new-password"
-                  required
-                />
-              </div>
-              <div class="required field">
-                <label for="retype">{signUpLocale.retype}</label>
-                <input id="retype" name="retype" type="password" autocomplete="new-password" required />
               </div>
               <div class="inline field">
                 <button type="submit" class="ui primary button tw-w-full">

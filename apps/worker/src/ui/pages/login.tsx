@@ -11,6 +11,23 @@
  * `user_name` (owner cross-check), `password`, `remember`, and a hidden
  * `redirect_to` carried through to the POST.
  *
+ * ## The credential-label divergence (the B-1 usability fix, 2026-10-30)
+ *
+ * The credential field's VISIBLE label reads "Access Token", not
+ * "Password": upstream labels it with locale key `password` because
+ * upstream HAS a password store, while our credential is a PAT
+ * (SPEC-0002 §4.6.7 divergence 7 — no password store; SPEC-0010 §2.2
+ * token-as-password) and a "Password" label on a PAT field is the decoy
+ * the first-run audit flagged (docs/usability/findings-first-run.md
+ * blocker 1 — a just-registered "password" can never sign in). A short
+ * helper under the field names the token's source (Settings →
+ * Applications). DOCUMENTED DIVERGENCE required by the platform posture —
+ * upstream's own strings cannot be copied here truthfully. Only the label
+ * text diverges: the input keeps `name="password"`/`id="password"`,
+ * `type="password"` (secret masking) and `autocomplete="current-password"`
+ * (so password managers can retain the PAT — the wire shape is SPEC-0010
+ * §2.2 verbatim).
+ *
  * ## First-run amendment (SPEC-0010 §6, 2026-10-28)
  *
  * On a ZERO-USER instance the page additionally renders the admin-init form
@@ -59,6 +76,13 @@ export const loginFirstRunLocale = {
   /** The one-shot race loser's verdict (cf-gitea addition; upstream's
    *  install.admin_user_recreation_disallowed posture). */
   init_already_initialized: "This instance is already initialized — sign in instead.",
+  /** The sign-in credential helper (cf-gitea addition — the B-1 fix): the
+   *  field label itself diverges in locale.ts ("Access Token"); this helper
+   *  occupies the slot upstream fills with the "Forgot password?" link
+   *  (signin_inner.tmpl's tw-flex label row) — meaningless without a
+   *  password store (SPEC-0002 §4.6.7). */
+  credential_note:
+    "Sign in with a personal access token (PAT), not a password — accounts on this instance have no passwords. Create a token under Settings → Applications.",
   /** "register" (navbar-less pages use the form-footer link) */
   sign_up_now: "Register now.", // "auth.sign_up_now"
 } as const;
@@ -149,6 +173,7 @@ export function LoginPage(props: {
                   autocomplete="current-password"
                   required
                 />
+                <p class="tw-text-sm tw-text-grey">{loginFirstRunLocale.credential_note}</p>
               </div>
               <div class="inline field">
                 <div class="ui checkbox">

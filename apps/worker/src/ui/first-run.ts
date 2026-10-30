@@ -110,11 +110,16 @@ const MAX_FORM_BYTES = 8192;
 
 /** Parse the `application/x-www-form-urlencoded` body into the named
  *  string fields (bounded by the content-length cap — the login-form
- *  convention; a missing/oversized/malformed body parses as empty). */
+ *  convention; a missing/oversized/malformed body parses as empty).
+ *  `password`/`retype` are deliberately NOT parsed (the B-1 fix): the
+ *  signup form no longer sends them (the signup page discloses PAT-only
+ *  auth, SPEC-0002 §4.6.7), so a stale client's values are ignored at the
+ *  parse boundary. `admin_passwd` stays: the install form keeps its
+ *  upstream InstallForm field with its honest not-stored note. */
 async function parseAccountForm(
   req: Request,
-): Promise<{ user_name: string; admin_name: string; email: string; admin_passwd: string; password: string; retype: string }> {
-  const empty = { user_name: "", admin_name: "", email: "", admin_passwd: "", password: "", retype: "" };
+): Promise<{ user_name: string; admin_name: string; email: string; admin_passwd: string }> {
+  const empty = { user_name: "", admin_name: "", email: "", admin_passwd: "" };
   const contentType = req.headers.get("content-type") ?? "";
   const length = Number(req.headers.get("content-length") ?? "0");
   if (!contentType.startsWith("application/x-www-form-urlencoded") || length > MAX_FORM_BYTES) {
@@ -131,8 +136,6 @@ async function parseAccountForm(
     admin_name: params.get("admin_name") ?? "",
     email: params.get("email") ?? "",
     admin_passwd: params.get("admin_passwd") ?? "",
-    password: params.get("password") ?? "",
-    retype: params.get("retype") ?? "",
   };
 }
 
@@ -265,7 +268,13 @@ async function signUpPage(c: RouteContext): Promise<Response> {
 
 /** POST /user/sign_up (auth.SignUpPost) — 404 while closed; the shared
  *  account ladder validates; success mints the session (upstream's
- *  handleSignIn, auth.go:632) and 303s to `/`. */
+ *  handleSignIn, auth.go:632) and 303s to `/`. No password fields are read
+ *  (the B-1 fix, 2026-10-30): the form no longer sends them (the signup
+ *  page discloses PAT-only auth, SPEC-0002 §4.6.7), and the values were
+ *  always discarded. `AccountForm`'s `password`/`retype` arity is the
+ *  service's shared shape (adminCreateUser + the install form fill it) —
+ *  filled empty here: the retype-equality check passes vacuously and
+ *  nothing is stored, exactly as before, minus the decoy. */
 async function signUpSubmit(c: RouteContext): Promise<Response> {
   if (!allowSignup(c.env)) return signupNotFound(c);
 
@@ -280,8 +289,8 @@ async function signUpSubmit(c: RouteContext): Promise<Response> {
   const form: AccountForm = {
     username: fields.user_name.trim(),
     email: fields.email.trim(),
-    password: fields.password,
-    retype: fields.retype,
+    password: "",
+    retype: "",
   };
   const result = await registerUser(c.env.DB, form);
 

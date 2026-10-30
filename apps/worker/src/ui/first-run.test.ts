@@ -12,12 +12,16 @@
  * - THE RACE: two concurrent first-submissions → exactly one admin (the
  *   count-guarded insert's changes==0 arm), the loser's clear verdict.
  * - The non-empty table: no form, the route refuses, no row is created.
- * - Signup on/off, the shared validation ladder (usable-username/email/
- *   retype reuse, taken name/email), the live-redirect consumption, and
+ * - Signup on/off, the shared validation ladder (usable-username/email
+ *   reuse, taken name/email), the live-redirect consumption, and
  *   the session integration: the init-created admin logs in with a PAT and
  *   resolveViewer carries isAdmin (§2.5 seam).
+ * - The B-1 fix (docs/usability/findings-first-run.md blocker 1): the
+ *   signup page renders the PAT-only notice and NO password fields, the
+ *   POST ignores stale password/retype values, and the login page labels
+ *   its credential field Access Token with the PAT helper.
  * - The login page extension: default render (no panel, no link — the
- *   committed golden stays byte-stable), the panel, the register link.
+ *   committed golden), the panel, the register link.
  */
 
 import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
@@ -276,16 +280,27 @@ describe("GET/POST /user/sign_up — the ALLOW_SIGNUP gate", () => {
     expect((await request("/user/sign_up", undefined, { allowSignup: "0" })).status).toBe(404);
   });
 
-  it("renders the page while open (upstream signup shape, action + fields)", async () => {
+  it("renders the page while open (upstream signup shape, PAT-only notice, NO password fields)", async () => {
     const res = await request("/user/sign_up", undefined, { allowSignup: "true" });
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('action="/user/sign_up"');
     expect(html).toContain('name="user_name"');
     expect(html).toContain('name="email"');
-    expect(html).toContain('name="password"');
-    expect(html).toContain('name="retype"');
     expect(html).toContain("Already have an account?");
+    // The B-1 fix: the discarded password fields are GONE — collecting a
+    // credential the server throws away was the decoy (SPEC-0002 §4.6.7
+    // stores no password; upstream omits the fields under its
+    // DisablePassword arm, signup_inner.tmpl).
+    expect(html).not.toContain('name="password"');
+    expect(html).not.toContain('name="retype"');
+    expect(html).not.toContain('type="password"');
+    // ...and the credential model is disclosed upfront, in upstream's
+    // sign_up_tip slot with the flash-banner idiom (RenderFlashMessage's
+    // `ui positive message`, util_render.go:263-289).
+    expect(html).toContain('class="ui positive message"');
+    expect(html).toContain("authenticate with personal access tokens, not passwords");
+    expect(html).toContain("Settings → Applications");
   });
 
   it("creates a plain member account + session on submit (handleSignIn parity)", async () => {
@@ -305,7 +320,7 @@ describe("GET/POST /user/sign_up — the ALLOW_SIGNUP gate", () => {
     expect((await drizzle(env.DB).select().from(sessions).all())[0]?.userId).toBe(alice.id);
   });
 
-  it("reuses the shared validation ladder: invalid name / email / retype re-render at 200", async () => {
+  it("reuses the shared validation ladder: invalid name / email re-render at 200", async () => {
     const invalidName = await request(
       "/user/sign_up",
       form({ user_name: "a..b", email: "a@example.com", password: "x", retype: "x" }),
@@ -321,14 +336,23 @@ describe("GET/POST /user/sign_up — the ALLOW_SIGNUP gate", () => {
     );
     expect(await invalidEmail.text()).toContain("email address is invalid: not-an-email");
 
-    const retype = await request(
+    expect(await userCount()).toBe(0);
+  });
+
+  it("ignores stale password/retype fields (the form no longer sends them — the B-1 fix)", async () => {
+    // A legacy client still POSTing the retired fields gets them ignored at
+    // the parse boundary: no retype-mismatch error fires (the service's
+    // retype check runs on the handler's empty pair, vacuously), and a valid
+    // name/email creates the account exactly as the real form's submit does.
+    const res = await request(
       "/user/sign_up",
-      form({ user_name: "Alice", email: "a@example.com", password: "x", retype: "y" }),
+      form({ user_name: "Alice", email: "alice@example.com", password: "x", retype: "y" }),
       { allowSignup: "true" },
     );
-    expect(await retype.text()).toContain("password and re-type do not match");
-
-    expect(await userCount()).toBe(0);
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/");
+    expect(await userCount()).toBe(1);
+    expect((await drizzle(env.DB).select().from(users).all())[0]?.usernameLower).toBe("alice");
   });
 
   it("refuses a taken name (case-folded) and a used email with upstream's web copy", async () => {
@@ -419,7 +443,7 @@ describe("login page extension", () => {
     assets: shellAssetsFromManifest(manifest),
   };
 
-  it("the default render is unchanged (no panel, no link — the committed golden)", () => {
+  it("the default render matches the committed golden (no panel, no link)", () => {
     const html = renderLoginPage({ ctx, redirectTo: null, error: null });
     expect(html).not.toContain('action="/install"');
     expect(html).not.toContain("/user/sign_up");
@@ -429,6 +453,20 @@ describe("login page extension", () => {
     if (loginGolden !== "") {
       expect(html).toBe(loginGolden);
     }
+  });
+
+  it("labels the credential field Access Token with the PAT helper (the B-1 divergence)", () => {
+    const html = renderLoginPage({ ctx, redirectTo: null, error: null });
+    // The label diverges from upstream's locale `password` ("Password") —
+    // our credential is a PAT (SPEC-0002 §4.6.7), and the field's helper
+    // names the token source in the slot upstream fills with the
+    // "Forgot password?" link. The wire shape is unchanged (`password`).
+    expect(html).toContain(">Access Token</label>");
+    expect(html).not.toContain(">Password</label>");
+    expect(html).toContain("personal access token (PAT), not a password");
+    expect(html).toContain("Settings → Applications");
+    expect(html).not.toContain("Forgot password");
+    expect(html).toContain('name="password"');
   });
 
   it("renders the admin-init form when the window is open", () => {
