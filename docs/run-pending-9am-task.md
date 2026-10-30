@@ -41,6 +41,7 @@ session (this one, if alive, carries full context), or create the cron —
   an empty users table (tests wipe users, so CI cannot see it). Fix wave
   needed; harmless for the live instance (it has users). Candidate fix:
   gate on "no non-system users" instead of an empty table.
+  - **RESOLVED at `16a63b6`** (verified 2026-10-30, later window): the candidate fix shipped, refined into the identity-of-origin predicate — a system row is exactly `prohibited` + non-admin + email-less, the window now opens on "no non-system users", and the same predicate guards the atomic insert's NOT EXISTS so GET/POST can never disagree on a migrated instance; the UNFIXED text above is stale, kept verbatim for the handover record.
 - act_runner v0.2.13 is PROVEN wire-compatible (Register/Declare/FetchTask/
   UpdateTask/UpdateLog/Heartbeats + a real containerized green job, logs
   sealed to R2 and read back — docs/research/act-runner-smoke-2026-10-30.md).

@@ -19,43 +19,53 @@ in-flight block below is resolved: the user settings packages twin and the
 signed-URL preview-tail golden (with its route-clock seam) both landed in
 `74df9ad`, and the survey edit landed in the v1.3 final window.
 
-**In flight at doc time — verify at tag** (snapshot `e4b9f66`; sibling
-units are landing these as you read this — do not re-dispatch blindly, do
-not count as landed until committed, re-check each against the tag):
+**Updated at the post-v1.3.1 parity-wave snapshot `95cdcaf`** (2026-10-30,
+the window since `0fdc267`): the doc-time in-flight block that lived here
+is RESOLVED — every row landed inside the window, each landing verified
+at its hash (see the landed record below) — and the window's
+newly-recorded open items (the commit bodies' documented divergences,
+staged arms, and follow-ups) are folded into the board as new rows, under
+a fresh, much smaller in-flight block.
 
-- **Topics/licenses on the repo payloads** — the full converter
-  (`toApiRepositoryFull`, with the stored `topics` + `licenses`, fork
-  `parent`, and real mirror schedule) already sits in the tree; the
-  single-repo route swap from the sync converter is the route owner's
-  one-liner (`apps/worker/src/api/services/repository.ts` docstring; the
-  review's drifts 3+9: `docs/usability/parity-review-api.md` Top-10).
-- **The packages small items** — review-packages D-4 (nuget's three
-  service-index endpoints still require auth where upstream leaves them
-  open, verified open at `packages-protocols.ts`), D-5 (the three quota
-  403 strings), D-6 (the downloads' cache/nosniff/CSP/Accept-Ranges/304/
-  filename* header set) (`docs/usability/parity-review-packages.md`).
-- **The api unit gates** — issue/pull routes still ignore
-  `has_issues`/`has_pull_requests` (200 vs upstream 404) and any reader
-  can set labels/milestone on issue create (verified open:
-  `apps/worker/src/api/routes/issues.ts:132-133`) — review-api drift 10.
-- **The serializer counts** — `followers_count`/`following_count` always 0
-  and `last_login` the zero time on every User payload
-  (`repository.ts:474,483-484`, TODO(SPEC-0005)) — review-api drift 4.
-- **The release sha tail** — `sha1`/`num_commits` stay unwritten on
-  release rows (`6b2bedc`'s disclosed engine-wave tail,
-  `release.go:150-157`).
-- **The identities swap** — the auth test rig's contract-`User` projection
-  swapping from the convention-synced private copy to the canonical
-  `authUserToApiUser` (the test-twin of `cf269f4`'s production seam; the
-  rig's copy had already drifted — no `username` key, hardcoded
-  visibility/URLs). Uncommitted in the working tree at snapshot time
-  (`apps/worker/src/auth/testing/identities.ts` + its test).
+**In flight at this update** (snapshot `95cdcaf`; sibling units are
+landing these as you read this — do not re-dispatch blindly, do not count
+as landed until committed):
+
+- **The ~15 model.ts cite renumbers** — the mechanical upstream-cite
+  drift from `e4b9f66`'s insertions, the cite-audit pass's open finding
+  (`ae1de6d`) — sibling in flight (the working tree's uncommitted
+  `models/issue.ts` hunks).
+- **The E9 deferral record** — review-api E9's two drifts
+  (comment-create's missing locked-issue 403 gate + the accepted empty
+  body; the P2-6(e) honorable mentions) — sibling in flight right now.
+- **The archive POST-arm pin unit** — the verification record's
+  coverage-gap finding: `4e6d1cc`'s HIGH-parity archive POST fix has ZERO
+  pins anywhere (the GET arm is well pinned) — the pin unit is dispatched
+  (`635a573`).
 
 Landed in the same window, for the record (no longer open): the
 production serializer-identity swap — `GET /user` now delegates to the
 canonical converter shape (`cf269f4`), closing review-api drift 1; the
 `username` compat key (drift 2, same commit); the branch list order
 (drift 8, `7f9241e`).
+
+Landed in the window since `0fdc267`, resolving the doc-time block and
+its board mirrors (no longer open): the topics/licenses converter swap +
+the identities swap + the counts seam's serializer half (`58283bd`), the
+`GET /users/{username}` counts wiring (`40120ae`) and its no-binding
+degrade (`9f883d0`), the issue/pull unit gates (`ddf3b2a`), the packages
+D-4/D-5/D-6 batch (`41eada6`), the release sha tail (`efd1916`) completed
+by the UpdateRelease port (`29ecd1d`), repoEdit's merge-config fields +
+the assigned_by service half (`7047639`) with the assigned_by route
+wiring (`4f8ade7`), the LFS locking family (`7b589c7`), archive
+export-ignore + zip DEFLATE (`5365236`), the pypi multipart mojibake
+(`2757a9e`), and the LFS batch/upload/verify envelope trailing-newline
+reconciliation (`95cdcaf` — the locks wave's recorded INFO, fixed in the
+same window that recorded it); the `/install` first-admin window had
+already been fixed at `16a63b6` (humans-not-rows — P3-5c records it).
+The window's verification record (`635a573` — 98 suites, 2,551 results,
+all green, pinned at `29ecd1d`) rides alongside; its coverage gaps are
+board rows now.
 
 ---
 
@@ -213,27 +223,34 @@ canonical converter shape (`cf269f4`), closing review-api drift 1; the
    divergence, listed so a future parity pass either ports the 500 arm or
    re-affirms ours in SPEC-0004 §2.3. Size: **S** (decision + one arm).
 
-6. **The review-api semantic-drift remainder** — what v1.3.1 did not close
-   (source: `docs/usability/parity-review-api.md` Top-10 + honorable
-   mentions; drifts 1/2/8 landed — see the header note; 3/4/10 are the
-   in-flight block): (a) repoEdit's PR-merge configuration
-   accepted-and-ignored — clients disabling merge styles read the old
-   defaults back and actual merge gating never changes (drift 5);
-   (b) `assigned_by` issue filter returns empty though the assignee table
-   landed; sibling `mentioned_by` has no mention data yet (drift 6);
-   (c) the single-PR GET omits `additions`/`deletions`/`changed_files`,
-   and `review_comments` never emits (drift 7); (d) `/repos/search` and
-   the list paths keep the query-flat sync render — fork `parent` omitted,
-   mirror schedule zeroed, no topics/licenses (drift 9's list half; the
-   single-repo half is the in-flight swap); (e) honorable mentions kept on
-   the ledger: `mergeable: null` while checking, review-list
-   `X-Total-Count` counts only visible rows, transfer 202 vs 201,
-   auto-init repos missing `gitignores`/`license` files, user email never
-   rendered (upstream's noreply placeholder), comment-create accepts an
-   empty body and misses the locked-issue 403, annotated tag `message`
-   always empty (see P3-11), `default_branch` applied without an
-   existence gate. Sizes: **S–M** each; the whole remainder is a
-   dispatchable batch.
+6. **The review-api semantic-drift remainder** — what the post-v1.3.1
+   wave did not close (source: `docs/usability/parity-review-api.md`
+   Top-10 + honorable mentions; drifts 1/2/8 landed in v1.3.1 — see the
+   header note; drifts 3/4/10 and the single-repo half of 9 landed in the
+   window since `0fdc267` — see the header note): (a) drift 5's repoEdit
+   merge flags LANDED (`7047639` — the fifteen fields merge over the
+   settings overlay, `has_pull_requests:false` deletes the row, the
+   update-style trio 400s verbatim) with one accepted-and-ignored
+   remainder: `has_code` stays a no-op because it needs the
+   creation-seeded code unit row (the loader is ready); (b) drift 6's
+   `assigned_by` half LANDED (`7047639`'s service filter + `4f8ade7`'s
+   wiring on both list arms) — sibling `mentioned_by` still has no
+   mention data (the resolved no-rows sentinel); (c) the single-PR GET
+   omits `additions`/`deletions`/`changed_files`, and `review_comments`
+   never emits (drift 7); (d) `/repos/search` and the list paths keep the
+   query-flat sync render — fork `parent` omitted, mirror schedule
+   zeroed, no topics/licenses (drift 9's list half); (e) honorable
+   mentions kept on the ledger: `mergeable: null` while checking,
+   review-list `X-Total-Count` counts only visible rows, transfer 202 vs
+   201, auto-init repos missing `gitignores`/`license` files, user email
+   never rendered (upstream's noreply placeholder), comment-create
+   accepts an empty body and misses the locked-issue 403 (E9 — the
+   in-flight deferral), annotated tag `message` always empty (see
+   P3-11), `default_branch`'s gate updated by `7047639`: an unknown
+   target on a non-empty repo now silently KEEPS the old default and read
+   errors degrade to skip where upstream 500s (the house
+   never-fail-the-write posture, documented). Sizes: **S–M** each; the
+   whole remainder is a dispatchable batch.
 
 7. **The review-webui rendering remainder** — source:
    `docs/usability/parity-review-webui.md` top-drifts list; the New-PR
@@ -255,23 +272,57 @@ canonical converter shape (`cf269f4`), closing review-api drift 1; the
 
 8. **The review-git protocol remainder** — source:
    `docs/usability/parity-review-git.md`; the archive POST arm and the
-   GCM realm LANDED in v1.3.1 (`4e6d1cc`, `85fa2ff`). Still open
+   GCM realm LANDED in v1.3.1 (`4e6d1cc`, `85fa2ff`); the LFS locking
+   family and the archive attribute semantics LANDED in the window since
+   `0fdc267` (`7b589c7`'s four-route family + the D1-race-safe unique
+   index; `5365236`'s export-ignore + zip STORE→DEFLATE). Still open
    (engine-scope items separated in the review): receive-pack caps lack
-   atomic/push-options/report-status-v2; `.gitattributes`
-   export-ignore/export-subst un-honored in archives + our zips STORE
-   (upstream shells to real git archive); LFS locks → 501 (upstream
-   implements the family); protocol-v2 lacks fetch=filter (partial clone
-   fatal) and ls-refs=unborn; the ladder-ordering drifts (403-before-auth
-   arms, the wiki-doesn't-exist pkt-line, dumb-HTTP absent — documented).
-   Sizes: **M** each; several are engine-boundary decisions first.
+   atomic/push-options/report-status-v2; export-subst stays parsed but
+   not substituted in archives — blobs stream byte-identical with
+   `$Format:…$` literals surviving, and `[attr]`-macro patterns sit
+   outside the compiled matcher subset — the engine-side expansion is the
+   recorded future arm (`5365236`); protocol-v2 lacks fetch=filter
+   (partial clone fatal) and ls-refs=unborn; the ladder-ordering drifts
+   (403-before-auth arms, the wiki-doesn't-exist pkt-line, dumb-HTTP
+   absent — documented). Sizes: **M** each; several are engine-boundary
+   decisions first.
 
-9. **The review-packages D-4/D-5/D-6 tail — in-flight at doc time, verify
-   at tag.** D-4: nuget's three service-index endpoints require auth where
-   upstream deliberately leaves them open (`api.go:342-346`); D-5: the
-   three quota 403 strings differ from upstream's sentinels; D-6: downloads
-   lack upstream's cache/nosniff/CSP/Accept-Ranges/304/filename* set
-   (`docs/usability/parity-review-packages.md` fix-order tail; D-1/D-2/D-3
-   landed `3571fe8`). Size: **S** as one batch.
+9. **The review-packages D-4/D-5/D-6 tail — LANDED (`41eada6`).** D-4's
+   nuget service-index trio serves unauthenticated (the `none` protocol
+   mode), D-5's three quota 403 sentinels byte-match upstream, D-6's
+   serve-content port carries the whole cache/nosniff/CSP/Accept-Ranges/
+   304/filename* set (`docs/usability/parity-review-packages.md` fix-order
+   tail; D-1/D-2/D-3 landed `3571fe8`). Kept on the ledger from the same
+   landing: multi-range requests answer a full 200 where Go answers
+   multipart/byteranges — the documented divergence (upstream's own
+   ServeUserContentByReader takes the same minimal posture). Size: **S**
+   if the multi-range arm is ever dispatched.
+
+10. **Amendment to item 7 (the review-webui remainder) — the two named
+    Vue-scope drifts landed in the convergence tail (2026-10-30), read
+    item 7's other rows as still open.** (a) The merge box: the
+    conversation page now renders the FULL upstream card — the landed
+    `pull-merge-box.tsx` fragment rendered INLINE via a loader-level
+    `loadPullMergeBoxData` call (`PullMergeBoxFragment` exported beside
+    `pullMergeBoxFragmentHtml`, byte-identical by construction; upstream
+    view_content.tmpl:67-72) — so `initRepoPullMergeBox` is armed and
+    closed-unmerged PRs get the ClosedInfo pair (the residual's "renders
+    nothing closed" half). Still open from that row: the merge FORM and
+    the delete/update-branch buttons remain write-action deferrals (the
+    fragment module's own documented reduction set). (b) The branch
+    selector: the island container (`branch_dropdown.tmpl`'s
+    `data-global-init="initRepoBranchTagSelector"` + the ~20 attrs + the
+    pre-mount dummy) replaced the bare Fomantic dropdown — the menu (tab
+    strip, filter, view-all) is the official bundle's client-DOM render
+    fed by the landed `/branches/list` + `/tags/list` aux feeds. Two
+    attrs stay "false"/empty as documented reductions pending call-site
+    threading: `data-allow-create-new-ref` (no writer signal at the
+    call sites) and `data-enable-feed` (no `/rss/branch` route), and
+    `data-current-repo-default-branch` stays empty (no default-branch
+    input — the menu's "default" label degrades off). Item 7's OTHER
+    rows (Go-to-file/Add-File home row, `#issue-filters` skeleton,
+    timeline `event-{id}` anchor split, releases Source-Code archive
+    rows, header tab strip icons/Settings tab) remain open as written.
 
 ## P3 — hardening, tooling, and the small flagged items
 
@@ -341,17 +392,22 @@ canonical converter shape (`cf269f4`), closing review-api drift 1; the
    not re-sized; each is a future SPEC's call. Size: **S–L** depending on
    which reopens.
 
-7. **The serializer counts tail + the language side-store.**
-   `followers_count`/`following_count` always 0 and `last_login` the zero
-   time on every User payload — TODO(SPEC-0005), owned by the serializer
-   unit (in-flight at doc time, verify at tag; `cf269f4`, `7f9241e`).
-   Alongside it, `language` renders `''` on BOTH serializers by decision:
-   there is no users column for it — upstream keeps the language in a side
-   store, and the review graded the drift cosmetic
-   (`cf269f4`'s in-comment note; `docs/usability/parity-review-api.md`).
-   Landing either needs the store decision first (a SPEC-0005 call).
-   Size: **M** (store + two serializers); the counts alone **S** if the
-   in-flight unit lands them.
+7. **The serializer counts tail + the language side-store.** The counts
+   seam LANDED in the window since `0fdc267`: `followers_count`/
+   `following_count` render the requester-visible live totals (the
+   documented `ApiUserFollowCounts` divergence — a private follower never
+   counts for a viewer who cannot see them; `58283bd` + the `GET /user`
+   self wiring `40120ae`, with the no-binding degrade `9f883d0`). Still
+   open from the same TODO(SPEC-0005): `last_login` — the D1 row has NO
+   column (definitive over schema + migrations 0001-0044); the render
+   site documents the authed-gate shape and the TODO re-scoped to the
+   missing column (`58283bd`). Alongside it, `language` renders `''` on
+   BOTH serializers by decision: there is no users column for it —
+   upstream keeps the language in a side store, and the review graded the
+   drift cosmetic (`cf269f4`'s in-comment note;
+   `docs/usability/parity-review-api.md`). Landing either needs the store
+   decision first (a SPEC-0005 call). Size: **M** (store + two
+   serializers).
 
 8. **The review-actions lower-ranked drifts** (source:
    `docs/usability/parity-review-actions.md` ranked list, below the five
@@ -412,6 +468,25 @@ canonical converter shape (`cf269f4`), closing review-api drift 1; the
     `group%3Aartifact` name (`b9f537a`'s informational section). Size:
     **S** (docs only).
 
+14. **The release rename-onto-existing-tag 500.** Upstream's
+    UpdateRelease carries no row-collision check on a tag rename — it
+    would write duplicate release rows for one tag; ours answers 500 off
+    the `releases_repo_tag_uq` unique index instead (`29ecd1d`'s
+    documented divergence). A future parity pass either drops the index
+    to match upstream's duplicate-row semantics or re-affirms the 500 in
+    SPEC-0004's release row (the same decide-or-reaffirm shape as P2-5).
+    Size: **S** (decision + one arm).
+
+15. **The unit-gates' documented divergences** (`ddf3b2a`'s module
+    header): the pulls gate's IsEmpty arm is omitted — our `is_empty` is
+    mirror-maintained only and including it would 404 every pushed repo's
+    pulls family, so it is staged behind isEmpty maintenance; the
+    DELETE-comment arm keeps its pre-existing 423-on-archived where
+    upstream's arm is ungated; the TypeCode reader arm is vacuous (every
+    repo carries code); reactions' 403-class narrowing is out of scope.
+    Each is a small arm on the landed gate; the IsEmpty piece is the
+    staged one. Sizes: **S** each.
+
 ---
 
 ## How to consume this board
@@ -421,11 +496,13 @@ canonical converter shape (`cf269f4`), closing review-api drift 1; the
   behind the emitter/substrate M3 provides. Item 4 (auths) and items 5–6
   (M6/M7) each open with their own SPEC-attachment per the recorded
   rules — none is dispatchable as a bare UI/store unit.
-- The v1.3.1 additions (P2-5 through P2-9, P3-7 through P3-13) are mostly
-  dispatchable small batches over landed substrate; P2-8's engine-scope
-  items and P3-11 need their boundary decisions first. Verify the
-  in-flight block at the top BEFORE dispatching any of them — four of the
-  five in-flight items overlap this board's P2/P3 rows.
+- The v1.3.1 additions (P2-5 through P2-10, P3-7 through P3-13) and the
+  parity-wave additions (P3-14, P3-15) are mostly dispatchable small
+  batches over landed substrate; P2-8's engine-scope items and P3-11 need
+  their boundary decisions first. Verify the in-flight block at the top
+  BEFORE dispatching any of them — the doc-time block it replaced is
+  fully resolved (the header note), and the current three items are
+  sibling-owned.
 - P2 items are all dispatchable over landed substrate except the
   scoped-workflows pieces (P1-3).
 - P3 is the sweep list for gap waves between feature landings; the doc-debt
