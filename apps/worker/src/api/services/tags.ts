@@ -14,6 +14,16 @@
  * serialize/CAS write — and each caller composes its own upstream checks
  * (existence probe, `isTagControlAllowed`) in its surface's exact order.
  *
+ * READ side (residuals-v1.3.2 P3-11): the tags API's message/tagger arms —
+ * the annotated-tag payload through the engine's `readTag` RPC (the boundary
+ * decision this module's callers were blocked on: `readCommit` peels through
+ * tag objects, so the message was always ""), and the lightweight arm through
+ * the commit read the sha already needed (upstream serves the target
+ * commit's message for a lightweight tag — getTag's commit arm,
+ * modules/git/repo_tag.go:213-219, and GetTagInfos' `contents` of a
+ * commit-tipped ref). The renders ride the canonical converters
+ * (services/git-models.ts toTag/toAnnotatedTag) fed the served data.
+ *
  * Upstream citations (submodule pin fc4936884584):
  *   - target resolution: routers/api/v1/repo/tag.go CreateTag 209-218 —
  *     `IfZero(form.Target, DefaultBranch)` then `GetCommit(target)`, answered
@@ -28,6 +38,13 @@
  *     ref-table resolution treats a non-ref 40-hex as a commit oid (the
  *     landed tags-path behavior, kept byte-identical here) — a documented
  *     edge (SPEC-0004 §2.4), not a new divergence.
+ *   - the message arms: ToTag (services/convert/convert.go) renders
+ *     `Message: t.MessageUTF8()` for BOTH kinds — annotated = the tag
+ *     object's payload with the signature armor stripped
+ *     (parsePayloadSignature, modules/git/tag.go:29-57, applied at every
+ *     upstream tag parse), lightweight = the commit's message; ToAnnotatedTag
+ *     additionally renders `Tagger: ToCommitUser(t.Tagger)` (the
+ *     annotated-only surface).
  *
  * The ref-webhook helpers (emitRefWebhook / zeroCommitPushPayload) moved
  * here from routes/tags.ts so the release path fires the SAME create/delete
@@ -36,6 +53,7 @@
  */
 
 import { serializeTag } from "@cf-gitea/git-engine";
+import type { CommitJson, Person, RepoCell } from "@cf-gitea/git-engine";
 import type { Context } from "hono";
 
 import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
@@ -53,7 +71,9 @@ import {
   ZERO_OID,
   type RefTip,
 } from "./engine";
+import { personDate, toAnnotatedTag, toTag } from "./git-models";
 import { toApiRepository, viewerOf, type RepositoryWithOwner } from "./repository";
+import type { AnnotatedTag, Tag } from "../models/git";
 
 /** The creator identity the tagger render + protected-tag check read. */
 export interface TagCreator {
@@ -172,6 +192,102 @@ export async function writeTagRef(env: ApiEnv["Bindings"], pair: TagStoreRepo, i
     return { tag: "conflict", error: commitApiChangeError(result) };
   }
   return { tag: "written", refTip: newTarget, commitSha: input.commitSha };
+}
+
+// ---------------------------------------------------------------------------
+// The read side (residuals-v1.3.2 P3-11): the message/tagger arms the tags
+// API serves upstream. The engine's `readTag` RPC answers the annotated tag
+// OBJECT at an exact oid (which readCommit peels straight through); the
+// lightweight arm rides the commit read the sha arm already needed.
+// ---------------------------------------------------------------------------
+
+/**
+ * The engine's parsed annotated-tag surface. Derived from the RepoCell RPC
+ * type because the boundary's mod.d.ts does not name the result type (the
+ * engine's mod.ts is frozen by the P2-8 policy this window — the NOTICE
+ * 2026-10-31 row records the deviation; fold a `TagJson` re-export in when
+ * mod.ts reopens and import it instead).
+ */
+export type EngineTagJson = NonNullable<Awaited<ReturnType<RepoCell["readTag"]>>>;
+
+/** The per-tag read answer: the peeled commit sha plus the upstream message/
+ * tagger arms (module header citations). */
+export interface TagRenderData {
+  /** null = the tip does not resolve (a lightweight tag whose commit is gone)
+   * — the caller answers the family's 404, exactly as the pre-P3-11 sha arm did. */
+  commitSha: string | null;
+  message: string;
+  /** the annotated tagger; null for a lightweight tag (ToCommitUser's source) */
+  tagger: Person | null;
+}
+
+/**
+ * One read per tag answering the sha AND the message/tagger arms.
+ *   - ANNOTATED (the refs row carries a peel): `readTag(tip.target)` reads
+ *     the tag object; its message is already armor-stripped engine-side
+ *     (splitTagSignature ← upstream parsePayloadSignature) and its tagger
+ *     feeds ToAnnotatedTag's ToCommitUser.
+ *   - LIGHTWEIGHT: `readCommit(tip.target)` — the same single read the sha
+ *     arm made pre-P3-11, now also carrying the commit message the upstream
+ *     tags API serves for a commit-tipped tag.
+ * Transport and object-read failures degrade to the pre-P3-11 shape (message
+ * "" / tagger null, sha from the peel) — never a 500, the engineReads null
+ * posture; the route's annotated-only arms additionally null-check the
+ * render data through the tip's peel, not through the read.
+ */
+export async function readTagData(env: ApiEnv["Bindings"], pair: TagStoreRepo, tip: RefTip): Promise<TagRenderData> {
+  const cell = engineCell(env, pair);
+  if (tip.peeled !== undefined) {
+    let tag: EngineTagJson | null = null;
+    try {
+      tag = await cell.readTag(tip.target);
+    } catch {
+      // transport-class: degrade to the pre-P3-11 render, never a 500
+    }
+    return { commitSha: tip.peeled, message: tag === null ? "" : tag.message, tagger: tag === null ? null : tag.tagger };
+  }
+  let commit: CommitJson | null = null;
+  try {
+    commit = await cell.readCommit(tip.target);
+  } catch {
+    // transport-class: the caller 404s on the null sha, as it always has
+  }
+  return commit === null
+    ? { commitSha: null, message: "", tagger: null }
+    : { commitSha: commit.oid, message: commit.message, tagger: null };
+}
+
+/**
+ * The Tag wire render — the canonical toTag converter fed the message the
+ * boundary now serves. Spread-fed here rather than re-parameterizing the
+ * converter because services/git-models.ts is outside this unit's ownership;
+ * fold back into toTag when its owner's window opens (and retire the stale
+ * deviation note in its docstring).
+ */
+export function renderTag(name: string, tip: RefTip, commitSha: string, data: { message: string }, pair: RepositoryWithOwner, origin: string): Tag {
+  return { ...toTag(name, tip, commitSha, pair, origin), message: data.message };
+}
+
+/**
+ * The AnnotatedTag wire render — the canonical toAnnotatedTag converter fed
+ * the message + the ToCommitUser-shaped tagger (UTC RFC3339 date, the same
+ * personDate render every CommitUser here uses). Same ownership note as
+ * renderTag. `tagger` stays null when the tag object omits the header (the
+ * schema is nullable; upstream's parse defaults it to the empty identity).
+ */
+export function renderAnnotatedTag(
+  name: string,
+  tip: RefTip,
+  commitSha: string,
+  data: { message: string; tagger: Person | null },
+  pair: RepositoryWithOwner,
+  origin: string,
+): AnnotatedTag {
+  return {
+    ...toAnnotatedTag(name, tip, commitSha, pair, origin),
+    message: data.message,
+    tagger: data.tagger === null ? null : { name: data.tagger.name, email: data.tagger.email, date: personDate(data.tagger) },
+  };
 }
 
 // ---------------------------------------------------------------------------

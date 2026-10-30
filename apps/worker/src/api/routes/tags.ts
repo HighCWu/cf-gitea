@@ -15,22 +15,24 @@ import {
   tagRef,
   ZERO_OID,
 } from "../services/engine";
-import { toAnnotatedTag, toTag } from "../services/git-models";
 import { annotatedTagSchema, createTagOptionSchema, tagSchema, type Tag } from "../models/git";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { assertNotArchived, canWriteRepository, requireVisibleRepo } from "../services/repo-access";
 import { toApiRepository, viewerOf, type RepositoryWithOwner } from "../services/repository";
 import { isTagControlAllowed, listProtectedTags } from "../../services/tag-protection";
-import { emitRefWebhook, resolveTagTarget, writeTagRef, zeroCommitPushPayload } from "../services/tags";
+import { emitRefWebhook, readTagData, renderAnnotatedTag, renderTag, resolveTagTarget, writeTagRef, zeroCommitPushPayload } from "../services/tags";
 
 /**
  * Tier-1 tag routes (SPEC-0004 §2.4 rows repoListTags / repoCreateTag /
  * repoGetTag / repoDeleteTag / GetAnnotatedTag — 3 paths, 5 operations).
- * Reads render straight from the engine refs table (targets + the peel cache
- * distinguish annotated from lightweight without reading objects); creation
- * builds the tag object Worker-side through the engine's canonical
- * `serializeTag` and lands it via putApiObjects + commitApiChange (the
- * SPEC-0004 §3.4 commit-builder mapping); deletion is deleteApiRef.
+ * Reads resolve names from the engine refs table (targets + the peel cache
+ * distinguish annotated from lightweight) and render the message/tagger arms
+ * through the tags service's read side (services/tags.ts readTagData — the
+ * engine's `readTag` RPC for annotated payloads, the commit read for
+ * lightweight ones; residuals-v1.3.2 P3-11). Creation builds the tag object
+ * Worker-side through the engine's canonical `serializeTag` and lands it via
+ * putApiObjects + commitApiChange (the SPEC-0004 §3.4 commit-builder
+ * mapping); deletion is deleteApiRef.
  *
  * Upstream behavior mirrored (routers/api/v1/repo/tag.go):
  *   - POST answers **200** with the Tag — the DECLARED surface: upstream's own
@@ -49,10 +51,15 @@ import { emitRefWebhook, resolveTagTarget, writeTagRef, zeroCommitPushPayload } 
  *     (no peel on the refs row) and unknown oids → 404; a malformed param →
  *     the declared 400 "SHA not provided" family.
  *
- * Documented deviation (services/git-models.ts toTag/toAnnotatedTag): the tag
- * message and tagger render "" / null — annotated-tag object bytes are
- * engine-resident and the landed public RPC surface exposes targets + the
- * peel cache only.
+ * The message arms render upstream's ToTag/ToAnnotatedTag fields
+ * (services/convert/convert.go) through the service's renderTag /
+ * renderAnnotatedTag: `message` = the annotated tag object's payload
+ * (signature armor stripped engine-side, upstream parsePayloadSignature) or
+ * the target commit's message for a lightweight tag (getTag's commit arm,
+ * modules/git/repo_tag.go:213-219); `tagger` = the annotated tag's tagger
+ * identity (ToCommitUser) on the AnnotatedTag surface only — the Tag schema
+ * carries no tagger field. The former P3-11 deviation (message always "",
+ * tagger null) is CLOSED by the engine's readTag RPC.
  *
  * WILDCARD ADDRESSABILITY — upstream DECLARES `{tag}` single-segment in its
  * swagger but registers the two name-addressed ops under chi catch-alls
@@ -138,13 +145,6 @@ async function sortedTags(c: Context<ApiEnv>, pair: { ownerNamespace: string; sl
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 
-/** The peeled commit a tag points at (tag objects read via readCommit's peel). */
-async function tagCommitSha(c: Context<ApiEnv>, pair: { ownerNamespace: string; slug: string }, tip: TagTip): Promise<string | null> {
-  if (tip.peeled !== undefined) return tip.peeled;
-  const commit = await engineReads(c.env, pair).readCommit(tip.target);
-  return commit === null ? null : commit.oid;
-}
-
 /** True when a release row is attached to the tag (upstream release coupling). */
 async function hasRelease(d1: D1Database, repoId: string, tagName: string): Promise<boolean> {
   const row = await drizzle(d1)
@@ -169,17 +169,18 @@ const WILDCARD_ROUTE = "/repos/:owner/:repo/tags/*";
 // archived/empty/write gates so every arm gates identically.
 // ---------------------------------------------------------------------------
 
-/** repoGetTag's body — the refs-table lookup + the shared Tag render. */
+/** repoGetTag's body — the refs-table lookup + the shared Tag render (the
+ *  message/tagger arms ride the tags service's read side, readTagData). */
 async function getTagByName(c: Context<ApiEnv>, pair: RepositoryWithOwner, tagName: string): Promise<Tag> {
   const tip = refTipMap(await engineReads(c.env, pair.repo).listRefs()).get(tagRef(tagName));
   if (tip === undefined) {
     throw new ApiError(404, "tag doesn't exist: " + tagName);
   }
-  const sha = await tagCommitSha(c, pair.repo, { name: tagName, target: tip.target, ...(tip.peeled === undefined ? {} : { peeled: tip.peeled }) });
-  if (sha === null) {
+  const data = await readTagData(c.env, pair.repo, tip);
+  if (data.commitSha === null) {
     throw new ApiError(404, "tag doesn't exist: " + tagName);
   }
-  return toTag(tagName, tip, sha, pair, viewerOf(c).origin);
+  return renderTag(tagName, tip, data.commitSha, data, pair, viewerOf(c).origin);
 }
 
 /** repoDeleteTag's body — gates, the release coupling, the CAS delete, and
@@ -329,8 +330,8 @@ export function registerTagRoutes(
       const viewer = viewerOf(c);
       const rendered = await Promise.all(
         page.map(async (tip) => {
-          const sha = await tagCommitSha(c, pair.repo, tip);
-          return sha === null ? null : toTag(tip.name, tip, sha, pair, viewer.origin);
+          const data = await readTagData(c.env, pair.repo, tip);
+          return data.commitSha === null ? null : renderTag(tip.name, tip, data.commitSha, data, pair, viewer.origin);
         }),
       );
       return c.json(rendered.filter((tag) => tag !== null), 200);
@@ -448,16 +449,15 @@ export function registerTagRoutes(
       );
 
       const viewer = viewerOf(c);
-      return c.json(
-        toTag(
-          name,
-          newTarget === commitSha ? { target: newTarget } : { target: newTarget, peeled: commitSha },
-          commitSha,
-          pair,
-          viewer.origin,
-        ),
-        200,
-      );
+      // The response renders what a subsequent GET of the same name would
+      // serve: the message arm rides the same readTagData read side — for the
+      // annotated create that is the tag object's own payload (== form's
+      // message), for a lightweight create the target commit's message
+      // (upstream GetTag(form.TagName) → ToTag, tag.go:225-230). A degraded
+      // read degrades to the pre-P3-11 shape (message ""), never a 500.
+      const newTip = newTarget === commitSha ? { target: newTarget } : { target: newTarget, peeled: commitSha };
+      const data = await readTagData(c.env, pair.repo, newTip);
+      return c.json(renderTag(name, newTip, commitSha, data, pair, viewer.origin), 200);
     },
     bindValidationHook,
   );
@@ -585,7 +585,10 @@ export function registerTagRoutes(
         // unknown oid or a lightweight tag (no peel on the refs row)
         throw new ApiError(404, "not found");
       }
-      return c.json(toAnnotatedTag(tip.name, tip, tip.peeled, pair, viewerOf(c).origin), 200);
+      // The message + tagger arms ride readTag (the annotated tag OBJECT at
+      // this sha) — upstream ToAnnotatedTag's MessageUTF8 + ToCommitUser.
+      const data = await readTagData(c.env, pair.repo, tip);
+      return c.json(renderAnnotatedTag(tip.name, tip, tip.peeled, data, pair, viewerOf(c).origin), 200);
     },
   );
 }

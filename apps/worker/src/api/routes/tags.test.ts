@@ -143,6 +143,11 @@ describe("slash-tag addressability (the wildcard siblings)", () => {
   it("POST accepts a slash tag name; GET addresses it through the wildcard arm and the declared route agrees via %2F", async () => {
     const created = await createSlashedTag(TIP1, "slashed release\n");
     expect(created.name).toBe("release/v1.2");
+    // P3-11: the create response carries the annotated message (upstream
+    // CreateTag answers GetTag(form.TagName) → ToTag, tag.go:225-230) —
+    // and the wildcard + %2F GETs below toEqual the same body, pinning the
+    // message on both GET arms in one sweep.
+    expect(created.message).toBe("slashed release\n");
 
     // the LITERAL slash in the path — the single-segment {tag} route cannot
     // match this; the catch-all sibling does, rendering the SAME render
@@ -208,5 +213,67 @@ describe("slash-tag addressability (the wildcard siblings)", () => {
     const res = await root.fetch(new Request(`${ORIGIN}/api/v1${REPO_PATH}/tags/release/v1.2`, authed()), env);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual(created);
+  });
+});
+
+describe("annotated-tag message arms (residuals P3-11)", () => {
+  /** Creates a plain annotated tag through the POST arm and returns the body. */
+  async function createAnnotated(name: string, message: string, target: string): Promise<Record<string, unknown>> {
+    const res = await send(`${REPO_PATH}/tags`, jsonInit("POST", { tag_name: name, message, target }));
+    expect(res.status).toBe(200);
+    return jsonBody(res);
+  }
+
+  it("POST echoes the annotated message; GET /tags/{name} serves the tag object's payload", async () => {
+    const created = await createAnnotated("p311-annotated", "release notes\n", TIP1);
+    expect(created.message).toBe("release notes\n");
+    // the ref tip (id) is the TAG OBJECT oid for the annotated create
+    const sha = created.id as string;
+    expect(sha).not.toBe(TIP1);
+
+    const got = await jsonBody(await get(`${REPO_PATH}/tags/p311-annotated`));
+    expect(got.name).toBe("p311-annotated");
+    expect(got.id).toBe(sha);
+    expect(got.message).toBe("release notes\n");
+    // the commit meta still peels to the target commit
+    expect((got.commit as Record<string, unknown>).sha).toBe(TIP1);
+  });
+
+  it("GET /tags/{name} on a LIGHTWEIGHT tag serves the target commit's message (getTag's commit arm)", async () => {
+    const got = await jsonBody(await get(`${REPO_PATH}/tags/v1.0.0`));
+    expect(got.name).toBe("v1.0.0");
+    // the seeded lightweight tip is commitIndex 1 ("seed: second commit");
+    // upstream serves the commit's message for a commit-tipped tag
+    // (repo_tag.go:213-219 / GetTagInfos' contents) — the seed builder
+    // stores `${message}\n`
+    expect(got.message).toBe("seed: second commit\n");
+  });
+
+  it("the list arm carries both kinds' messages", async () => {
+    const body = await (await get(`${REPO_PATH}/tags`)).json<Record<string, unknown>[]>();
+    const byName = new Map(body.map((tag) => [tag.name as string, tag]));
+    expect(byName.get("p311-annotated")?.message).toBe("release notes\n");
+    expect(byName.get("v1.0.0")?.message).toBe("seed: second commit\n");
+  });
+
+  it("GET /git/tags/{sha} renders the message + the tagger identity (ToAnnotatedTag arms)", async () => {
+    const created = await createAnnotated("p311-details", "details body\n", TIP2);
+    const sha = created.id as string;
+    const body = await jsonBody(await get(`${REPO_PATH}/git/tags/${sha}`));
+    expect(body.sha).toBe(sha);
+    expect(body.tag).toBe("p311-details");
+    expect(body.message).toBe("details body\n");
+    // writeTagRef's tagger: the doer identity (login + its stored email)
+    const tagger = body.tagger as Record<string, unknown>;
+    expect(tagger.name).toBe(OWNER);
+    expect(tagger.email).toBe("stub@cf-gitea.invalid");
+    // ToCommitUser's date: an RFC3339 instant, freshly stamped at the write
+    expect(typeof tagger.date).toBe("string");
+    expect(Number.isNaN(Date.parse(tagger.date as string))).toBe(false);
+    // the annotated-object body peels to the target commit
+    expect((body.object as Record<string, unknown>).sha).toBe(TIP2);
+    // a LIGHTWEIGHT tag's commit sha 404s the annotated-only surface (unchanged)
+    const lightweight = await get(`${REPO_PATH}/git/tags/${TIP2}`);
+    expect(lightweight.status).toBe(404);
   });
 });

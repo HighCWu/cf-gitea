@@ -142,6 +142,44 @@ export function parseTag(data: Uint8Array): Tag {
   return t;
 }
 
+/**
+ * Split a trailing `-----BEGIN <X> SIGNATURE-----` … `-----END <X>
+ * SIGNATURE-----` block off a tag payload — the port of upstream's
+ * parsePayloadSignature (modules/git/tag.go:29-57), which parseTagData and
+ * parseTagRef run over EVERY tag payload they read (tag.go:94 / repo_tag.go
+ * parseTagRef): the message the tags API serves EXCLUDES the ASCII armor,
+ * and the armor block itself is reported separately. A BEGIN line must start
+ * a line (upstream cuts each line and CutPrefixes it); the END is found by a
+ * byte search of `\n-----END <X> SIGNATURE-----` exactly as upstream does.
+ * The LAST complete block in the payload wins (upstream overwrites on each
+ * full pair). No block → the payload verbatim, null signature.
+ */
+export function splitTagSignature(payload: string): { message: string; signature: string | null } {
+  let signStart = -1;
+  let signEnd = -1;
+  let pos = 0;
+  for (;;) {
+    const eol = payload.indexOf("\n", pos);
+    if (eol < 0) break;
+    const line = payload.slice(pos, eol);
+    if (line.startsWith("-----BEGIN ") && line.endsWith(" SIGNATURE-----")) {
+      const signType = line.slice("-----BEGIN ".length, line.length - " SIGNATURE-----".length);
+      const endMark = `\n-----END ${signType} SIGNATURE-----`;
+      const end = payload.indexOf(endMark, pos);
+      if (end !== -1) {
+        signStart = pos;
+        signEnd = end + endMark.length;
+      }
+    }
+    pos = eol + 1;
+  }
+  if (signStart === -1 || signEnd === -1) return { message: payload, signature: null };
+  // upstream: msgEnd = max(messageStart, signStart - 1) — the newline that
+  // precedes the armor line belongs to the signature side, not the message
+  const msgEnd = Math.max(0, signStart - 1);
+  return { message: payload.slice(0, msgEnd), signature: payload.slice(signStart, signEnd) };
+}
+
 export function parseTree(data: Uint8Array): TreeEntry[] {
   const entries: TreeEntry[] = [];
   let pos = 0;

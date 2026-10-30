@@ -85,6 +85,7 @@ import {
   parseCommit,
   parseTag,
   parseTree,
+  splitTagSignature,
   isTreeMode,
   isGitlinkMode,
   modeString,
@@ -256,6 +257,32 @@ export interface CommitJson {
   author: Person;
   committer: Person;
   subject: string;
+  message: string;
+}
+
+/**
+ * An annotated tag object's parsed surface — the read-side twin of the
+ * write-side `TagSpec` (commit/serialize.ts) and the `readTag` RPC's answer.
+ * `oid` is the tag object's own oid (the refs-row target); `object`/`type`
+ * are the parsed `object`/`type` headers (the tagged target); `message` is
+ * the payload with a trailing signature block stripped (splitTagSignature —
+ * upstream's parsePayloadSignature discipline, the field the tags API
+ * serves). Lightweight tags have no such object: their tips are commits, so
+ * `readTag` answers null for them and the caller renders the commit's own
+ * message (upstream getTag's commit arm, repo_tag.go:213-219).
+ */
+export interface TagJson {
+  oid: string;
+  /** the tagged object's oid — the `object` header */
+  object: string;
+  /** the tagged object's type — the `type` header ("commit" for every tag
+   * the API write path lands) */
+  type: string;
+  /** the tag name — the `tag` header */
+  tag: string;
+  /** the tagger identity, null when the object omits the `tagger` header */
+  tagger: Person | null;
+  /** the payload after the header block, signature armor stripped */
   message: string;
 }
 
@@ -1523,6 +1550,32 @@ export class RepoCell extends DurableObject<Env> {
       if (!rr) return null;
       const c = await this.peelToCommit(rr.oid, gate);
       return c ? commitJson(c.oid, c.commit) : null;
+    });
+  }
+
+  /**
+   * The annotated-tag read (cf-gitea residuals P3-11): the tag OBJECT at an
+   * exact oid, which `readCommit` peels straight through and loses — the gap
+   * that left the tags API's message/tagger empty. `id` is a RAW object id on
+   * purpose: name→tag-object resolution stays with the caller's listRefs (the
+   * engine's own resolveRef tries heads before tags, so a ref-style id could
+   * shadow a tag with a branch; upstream's GetTag resolves through
+   * show-ref --tags only). A missing oid, or a non-tag object at it (a
+   * commit — a lightweight tag's tip — a tree, a blob), answers null: the
+   * readCommit posture. The message strips a trailing signature block the way
+   * upstream's tag reads do (splitTagSignature ← parsePayloadSignature,
+   * modules/git/tag.go:29-57, applied to every tag payload upstream reads);
+   * the signature itself is not carried yet — this engine serves no
+   * tag-signature verification (the standing unverified posture).
+   */
+  async readTag(id: string): Promise<TagJson | null> {
+    this.rpcBind();
+    return this.withContentLease(async (gate) => {
+      const obj = await this.store.get(id, gate);
+      if (!obj || obj.type !== "tag") return null;
+      const t = parseTag(obj.data);
+      const { message } = splitTagSignature(t.message);
+      return { oid: id, object: t.object, type: t.type, tag: t.tag, tagger: t.tagger, message };
     });
   }
 
