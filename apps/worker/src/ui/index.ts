@@ -8718,7 +8718,7 @@ async function userPackagesRuleAddSubmit(c: Context<{ Bindings: Env }>): Promise
   const user = await readProfileRowForPackages(c, p.viewer.id);
   if (user === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
   const parsed = parseUserCleanupRuleForm(await readUrlEncodedForm(c.req.raw));
-  if (Object.keys(parsed.errors).length > 0) {
+  if (Object.values(parsed.errors).some(Boolean)) {
     return p.respond(c.html(renderUserCleanupRuleEditPage(p.ctx, userCleanupRuleEditDataFromForm(user, false, parsed)), 200));
   }
   const outcome = await applyUserCleanupRuleCreate(c.env.DB, user.id, parsed.values, new Date());
@@ -8754,7 +8754,7 @@ async function userPackagesRuleEditSubmit(c: Context<{ Bindings: Env }>, ruleId:
   const parsed = parseUserCleanupRuleForm(await readUrlEncodedForm(c.req.raw));
   // getCleanupRuleByContext's precedence: the form id first, then the path.
   const id = parsed.values.id !== 0 ? parsed.values.id : ruleId;
-  if (Object.keys(parsed.errors).length > 0 && parsed.values.action !== "remove") {
+  if (Object.values(parsed.errors).some(Boolean) && parsed.values.action !== "remove") {
     const data = await loadUserCleanupRuleEditPageData(c.env.DB, user, id);
     const base = data ?? userCleanupRuleEditDataFromForm(user, true, parsed);
     return p.respond(c.html(renderUserCleanupRuleEditPage(p.ctx, base), 200));
@@ -9898,7 +9898,7 @@ async function orgPackagesRuleAddSubmit(c: Context<{ Bindings: Env }>): Promise<
   const { ctx, org, respond } = resolved;
   if (resolved.route.family !== "org-settings-packages-rule-add") return respond(await c.notFound()); // drift guard
   const parsed = parseOrgCleanupRuleForm(await readUrlEncodedForm(c.req.raw));
-  if (Object.keys(parsed.errors).length > 0) {
+  if (Object.values(parsed.errors).some(Boolean)) {
     return respond(c.html(renderOrgCleanupRuleEditPage(ctx, orgCleanupRuleEditDataFromForm(org, false, parsed)), 200));
   }
   const outcome = await applyOrgCleanupRuleCreate(c.env.DB, org.id, parsed.values, new Date());
@@ -9936,7 +9936,7 @@ async function orgPackagesRuleEditSubmit(c: Context<{ Bindings: Env }>, ruleId: 
   const parsed = parseOrgCleanupRuleForm(await readUrlEncodedForm(c.req.raw));
   // getCleanupRuleByContext's precedence: the form id first, then the path.
   const id = parsed.values.id !== 0 ? parsed.values.id : ruleId;
-  if (Object.keys(parsed.errors).length > 0 && parsed.values.action !== "remove") {
+  if (Object.values(parsed.errors).some(Boolean) && parsed.values.action !== "remove") {
     const data = await loadOrgCleanupRuleEditPageData(c.env.DB, org, id);
     const base = data ?? orgCleanupRuleEditDataFromForm(org, true, parsed);
     return respond(c.html(renderOrgCleanupRuleEditPage(ctx, base), 200));
