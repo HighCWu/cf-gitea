@@ -243,7 +243,7 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   registerAdminActionsRoutes(app, requireAuth);
   // The repo workflows-extras family (P1-9 — routes/repo-actions.ts; the
   // list/get/runs/disable/enable/dispatch + getWorkflowJob + job-logs ops).
-  registerRepoActionsRoutes(app, requireAuth);
+  registerRepoActionsRoutes(app, requireAuth, optionalAuth);
   // Tier-1 tail families (REG-MERGE-3, committed 6e3c322): the archive
   // download, the diffpatch apply, the languages listing and the scheduled
   // auto-merge cancellation. All are deeper `/repos/{owner}/{repo}/<family>`

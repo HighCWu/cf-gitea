@@ -6,11 +6,14 @@ import { drizzle } from "drizzle-orm/d1";
 import { parse as yamlParse, stringify as yamlStringify } from "yaml";
 
 import {
+  actionArtifacts,
   actionLogChunks,
   actionRunAttempts,
   actionRunJobs,
   actionRuns,
   actionRunners,
+  actionTaskOutputs,
+  actionRunJobSummaries,
   actionTaskSteps,
   actionTasks,
   issues,
@@ -18,16 +21,30 @@ import {
   repositories,
   users,
 } from "../../db/schema";
-import type { RunJobRow, RunRow } from "../../services/actions/model";
-import { insertActionRun } from "../../services/actions/model";
+import type { RunJobRow, RunRow, RunAttemptRow, TaskRow } from "../../services/actions/model";
+import { increaseTaskVersion, insertActionRun } from "../../services/actions/model";
 import { loadRepoActionsConfig, saveRepoActionsConfig } from "../../services/actions/config";
+import { findReadableArtifacts, type ArtifactRow } from "../../services/actions/artifacts";
+import { getFailedJobsForRerun, rerunWorkflowRunJobs } from "../../services/actions/rerun";
+import type { RerunResult } from "../../services/actions/rerun";
+import {
+  aggregateJobStatus,
+  hasWaitingJobsToPick,
+  isDoneStatus,
+  isRunningStatus,
+  refreshRunStatus,
+  stopTask,
+} from "../../services/actions/update";
 import type { RepositoryWithOwner, UserRow } from "../services/repository";
 import { GO_ZERO_TIME, apiUserFromRow, toApiRepository, viewerOf } from "../services/repository";
 import { canWriteRepository, isRepositoryAdmin, requireVisibleRepo } from "../services/repo-access";
 import { loadRepoSettings } from "../services/repo-settings";
 import { engineReads } from "../services/engine";
+import { toApiArtifact } from "../services/actions-artifacts";
+import { workflowJobFiltersFromQuery } from "../services/secrets-variables";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
+import type { User } from "../models/user";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 
 /**
@@ -99,6 +116,84 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
  *     rows (runner-reported, M1b); runner_id/runner_name only when an
  *     effective task exists (EffectiveTaskID, run_job.go:158-163).
  *   - RunDetails (:258-262) — the dispatch's return_run_details=true body.
+ *
+ * P1-11 EXTENSION (the runs deep family — the board's row 11, P1-7's
+ * remainder slice 4 of 5; 14 ops under the /actions group's RUNS half,
+ * routers/api/v1/api.go:1348-1379, handlers repo/action.go:786-858 tasks +
+ * :1239-1814 runs + repo/actions_run.go:57-268): this file is the actions
+ * family's repo-scope home, so the runs-deep arms ride here instead of a
+ * sibling file — the existing registration carries them. Per op:
+ *
+ *   GET    …/actions/tasks                              ListActionTasks
+ *   GET    …/actions/runs/{run}                         GetWorkflowRun
+ *   GET    …/actions/runs/{run}/attempts/{attempt}      getWorkflowRunAttempt
+ *   GET    …/actions/runs/{run}/attempts/{attempt}/jobs listWorkflowRunAttemptJobs
+ *   DELETE …/actions/runs/{run}                         deleteActionRun
+ *   POST   …/actions/runs/{run}/rerun                   rerunWorkflowRun
+ *   POST   …/actions/runs/{run}/rerun-failed-jobs       rerunFailedWorkflowRun
+ *   POST   …/actions/runs/{run}/cancel                  cancelWorkflowRun
+ *   POST   …/actions/runs/{run}/force-cancel            forceCancelWorkflowRun
+ *   POST   …/actions/runs/{run}/approve                 approveWorkflowRun
+ *   GET    …/actions/runs/{run}/jobs                    listWorkflowRunJobs
+ *   POST   …/actions/runs/{run}/jobs/{job_id}/rerun     rerunWorkflowJob
+ *   GET    …/actions/runs/{run}/logs                    getWorkflowRunLogs
+ *   GET    …/actions/runs/{run}/artifacts               getArtifactsOfRun
+ *
+ * GATES (the group differs from the P1-9 groups ABOVE — api.go:1348-1379
+ * has NO reqToken at group level; the reader gate is the group ladder):
+ *   - reads (tasks/get run/attempts/jobs/artifacts-of-run): anonymous-
+ *     capable on a visible repo whose actions unit is readable — the
+ *     requireActionsReader 403 is the only rejection short of the 404;
+ *   - the write sextet (delete/rerun/rerun-failed-jobs/cancel/force-cancel/
+ *     approve) carries per-route reqToken() + reqRepoWriter(TypeActions)
+ *     (api.go:1357-1362): the ladder is reader-403 THEN token-401 THEN
+ *     writer-403, so these routes take optionalAuth and answer the 401 in
+ *     the handler (the account-aggregates requireDoer idiom);
+ *   - getWorkflowRunLogs carries reqToken() ONLY (api.go:1367 — no writer);
+ *     getArtifactsOfRun has no per-route gate at all (api.go:1368).
+ *
+ * FAMILY SEAMS (all LANDED, imported — never re-implemented here): the
+ * rerun trio rides services/actions/rerun.ts (the P1-2 port; its rejection
+ * reasons map to the API codes the web handler uses — InvalidArgument →
+ * 400, AlreadyExist → 409); the claimed-job cancel arm rides
+ * services/actions/update.ts's stopTask (the StopTask port — upstream's
+ * cancelOneJob claimed arm, run_job.go:818-829, with NO log transfer, the
+ * docstring's own note); artifacts render through
+ * api/services/actions-artifacts.ts's toApiArtifact (the P1-10 seam).
+ *
+ * PER-OP REDUCTIONS (each cites its upstream arm):
+ *   - cancel/force-cancel: the `always()`-condition job exemption
+ *     (cancel.go:79-90) needs the job YAML parse — M3; v1 rows collapse it,
+ *     so cancellable = every not-done job (the unstarted-run shortcut arm
+ *     folds into the same filter); SortMatrixGroupsByName is vacuous on v1
+ *     rows (no matrix groups).
+ *   - approve (ApproveRuns, approve.go:25-140): the v1 release arm flips
+ *     every needs-less BLOCKED job to WAITING and bumps the tasks_version —
+ *     the `if:` re-decision (evaluateJobIf) and the concurrency/label
+ *     validations are the M3 arms the landed rows never carry (the rerun
+ *     service header's verdict, applied here).
+ *   - deleteActionRun (DeleteRun, cleanup.go:168-256): the row cascade runs
+ *     as explicit deletes (no FK cascades in the landed store); the storage
+ *     deletions (task logs, artifact objects) ride the same best-effort
+ *     arm; UpdateRepoRunsNumbers is the repo_counters sequence — M3, skip.
+ *   - getWorkflowRunLogs (DownloadActionsRunAllJobLogs, common/actions.go:
+ *     42-96): the zip composes STORE-method entries in memory (log bytes
+ *     are already buffered by the landed job-logs arm — upstream deflates;
+ *     the archive contract is "a zip", the method unpinned).
+ *   - getArtifactsOfRun resolves NO run row upstream (action.go:1755-1812
+ *     filters RepoID+RunID directly) — an unknown run id answers 200/0,
+ *     pinned; the repo scoping rides the rows' repoId check (the service
+ *     read is run-scoped only).
+ *   - the run-jobs listings' accessible-repos subquery (shared/action.go:
+ *     64-67) is vacuous behind the repo+run scoping (the run resolved
+ *     against the visible repo already).
+ *
+ * HANDOFF (one arg): registerRepoActionsRoutes(app, requireAuth,
+ * optionalAuth) in api/router.ts — the optional third parameter arms the
+ * group's anonymous-capable reads and the exact reader-403-before-token-401
+ * ladder; until it lands the routes stay mounted with requireAuth only (the
+ * logged-in-only reduction, the tests pin the full posture through the
+ * explicit-optionalAuth mount).
  *
  * DECLARED SETS mirror the vendored contract minus the dead codes (each
  * documented): workflows list/get declare {200,403,404,500} of the
@@ -346,6 +441,105 @@ export const runDetailsSchema = z.object({
   run_url: z.string(),
   html_url: z.string(),
 });
+
+// --- the runs-deep family's wire shapes (structs/repo_actions.go) ----------
+
+/** `#/definitions/ActionTask` (:11-38) — the raw Status.String name, NOT the
+ *  ToActionsStatus words. */
+export const actionTaskSchema = z.object({
+  id: z.number().int().openapi({ format: "int64" }),
+  name: z.string(),
+  head_branch: z.string(),
+  head_sha: z.string(),
+  run_number: z.number().int().openapi({ format: "int64" }),
+  event: z.string(),
+  display_title: z.string(),
+  status: z.string(),
+  workflow_id: z.string(),
+  url: z.string(),
+  created_at: z.string().openapi({ format: "date-time" }),
+  updated_at: z.string().openapi({ format: "date-time" }),
+  run_started_at: z.string().openapi({ format: "date-time" }),
+});
+
+/** `ActionTaskResponse` (:41-46) — the entries key is `workflow_runs` even
+ *  though this is the TASKS listing (upstream's own struct). */
+const actionTaskListSchema = z.object({
+  workflow_runs: z.array(actionTaskSchema),
+  total_count: z.number().int().openapi({ format: "int64" }),
+});
+
+/** `ActionWorkflowJobsResponse` (:178-182) — entries key `jobs`. */
+const workflowJobsListSchema = z.object({
+  total_count: z.number().int().openapi({ format: "int64" }),
+  jobs: z.array(actionWorkflowJobSchema),
+});
+
+/** The embedded `workflow_run` of ToActionArtifact — ONLY
+ *  {id, repository_id, head_sha} carry values; the rest serializes at its
+ *  zero value (the artifacts module's schema twin). */
+const runArtifactEmbeddedRunSchema = z.object({
+  id: z.number().int().openapi({ format: "int64" }),
+  url: z.string(),
+  previous_attempt_url: z.string().nullable(),
+  html_url: z.string(),
+  jobs_url: z.string(),
+  logs_url: z.string(),
+  artifacts_url: z.string(),
+  cancel_url: z.string(),
+  rerun_url: z.string(),
+  display_title: z.string(),
+  path: z.string(),
+  event: z.string(),
+  run_attempt: z.number().int().openapi({ format: "int64" }),
+  run_number: z.number().int().openapi({ format: "int64" }),
+  repository_id: z.number().int().openapi({ format: "int64" }),
+  head_sha: z.string(),
+  status: z.string(),
+  pull_requests: z.array(z.unknown()),
+  created_at: z.string().openapi({ format: "date-time" }),
+  updated_at: z.string().openapi({ format: "date-time" }),
+  started_at: z.string().openapi({ format: "date-time" }),
+  completed_at: z.string().openapi({ format: "date-time" }),
+});
+
+/** `#/definitions/ActionArtifact` (repo_actions.go:89-104) — the P1-10
+ *  schema twin (route-local shapes; the render rides the shared
+ *  toApiArtifact seam). */
+const runArtifactSchema = z.object({
+  id: z.number().int().openapi({ format: "int64" }),
+  name: z.string().openapi({ description: "the artifact's name" }),
+  size_in_bytes: z.number().int().openapi({ format: "int64", description: "the artifact's size in bytes" }),
+  url: z.string().openapi({ description: "the artifact's API URL" }),
+  archive_download_url: z.string().openapi({ description: "the artifact's archive download URL" }),
+  expired: z.boolean().openapi({ description: "whether the artifact is expired" }),
+  workflow_run: runArtifactEmbeddedRunSchema,
+  created_at: z.string().openapi({ format: "date-time" }),
+  updated_at: z.string().openapi({ format: "date-time" }),
+  expires_at: z.string().openapi({ format: "date-time" }),
+});
+
+/** `ActionArtifactsResponse` (:160-164). */
+const runArtifactsListSchema = z.object({
+  artifacts: z.array(runArtifactSchema),
+  total_count: z.number().int().openapi({ format: "int64" }),
+});
+
+/** The run-path params shared by the 13 run-scoped ops. */
+const runParams = {
+  ...ownerRepoParams,
+  run: z.string().min(1).openapi({ description: "id of the run" }),
+};
+
+const runAttemptParams = {
+  ...runParams,
+  attempt: z.string().min(1).openapi({ description: "logical attempt number of the run" }),
+};
+
+const runJobParams = {
+  ...runParams,
+  job_id: z.string().min(1).openapi({ description: "id of the job" }),
+};
 
 /** `CreateActionWorkflowDispatch` (:50-56) — the Go binder's Required 422s
  *  are the HANDLER's arm here (the zod schema stays permissive, the
@@ -617,7 +811,7 @@ async function pullRequestsForRun(
     event === "pull_request_rejected" ||
     event === "pull_request_review_comment";
   const byIndex = /^refs\/pull\/(\d+)\/head$/.exec(run.ref);
-  let rows: Array<typeof pullRequests.$inferSelect> = [];
+  let rows: Array<typeof pullRequests.$inferSelect>;
   if ((isPrEvent || isPrReviewEvent) && byIndex !== null) {
     rows = await db
       .select()
@@ -1255,7 +1449,9 @@ function logBytes(value: unknown): Uint8Array {
 // modules/util/filename.go:23-52 + path.go:32-34)
 // ---------------------------------------------------------------------------
 
-/** PathNameValidator's invalid chars (path.go:25). */
+/** PathNameValidator's invalid chars (path.go:25) — the control range is the
+ *  upstream rule itself, hence the pragma. */
+// eslint-disable-next-line no-control-regex
 const INVALID_FILENAME_CHARS = /[<>:"/\\|?*\u0000-\u001f]/gi;
 
 function pathBaseStem(s: string): string {
@@ -1332,13 +1528,466 @@ function encodeContentDisposition(t: string, filename: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// The runs-deep family helpers (the board's P1-11 row — upstream anchors per
+// helper; the routes below consume them)
+// ---------------------------------------------------------------------------
+
+/** The signed-in doer inside an optionalAuth-mounted route (the
+ *  account-aggregates requireDoer idiom) — the in-handler reqToken arm that
+ *  keeps the reader-403-before-token-401 ladder exact (api.go:1348-1379's
+ *  group ladder runs BEFORE the per-route reqToken). The id is narrowed to
+ *  the Go non-nil doer (the wire model keeps it optional for the anonymous
+ *  projection; an authenticated row always carries it). */
+function requireTokenDoer(c: Context<ApiEnv>): User & { id: number } {
+  const doer = c.get("authUser");
+  if (doer === undefined) {
+    throw new ApiError(401, "token is required");
+  }
+  if (doer.id === undefined) {
+    throw new Error("reqToken: the authenticated doer carries no id");
+  }
+  return { ...doer, id: doer.id };
+}
+
+/** GetRunByRepoAndID (run.go:287-297) — repo-scoped; the miss renders
+ *  APIErrorAuto's wrapped not-exist text. */
+async function runByRepoAndId(d1: D1Database, repoId: string, runId: number): Promise<RunRow> {
+  const rows = await drizzle(d1)
+    .select()
+    .from(actionRuns)
+    .where(and(eq(actionRuns.id, runId), eq(actionRuns.repoId, repoId)))
+    .limit(1);
+  const run = rows[0];
+  if (run === undefined) {
+    throw new ApiError(404, `run with id ${runId}: resource does not exist`);
+  }
+  return run;
+}
+
+/** GetRunAttemptByRunIDAndAttemptNum (run_attempt.go:89-98). */
+async function runAttemptByNumber(
+  d1: D1Database,
+  runId: number,
+  attemptNum: number,
+): Promise<RunAttemptRow> {
+  const rows = await drizzle(d1)
+    .select()
+    .from(actionRunAttempts)
+    .where(and(eq(actionRunAttempts.runId, runId), eq(actionRunAttempts.attempt, attemptNum)))
+    .limit(1);
+  const attempt = rows[0];
+  if (attempt === undefined) {
+    throw new ApiError(404, `run attempt ${attemptNum} for run ${runId}: resource does not exist`);
+  }
+  return attempt;
+}
+
+/** GetLatestAttemptJobsByRun (run_job.go:264-274): the latest attempt's jobs,
+ *  id ASC; the legacy arm matches run_attempt_id = 0 rows. */
+async function latestAttemptJobsOfRun(d1: D1Database, run: RunRow): Promise<RunJobRow[]> {
+  return drizzle(d1)
+    .select()
+    .from(actionRunJobs)
+    .where(and(eq(actionRunJobs.runId, run.id), eq(actionRunJobs.runAttemptId, run.latestAttemptId)))
+    .orderBy(asc(actionRunJobs.id))
+    .all();
+}
+
+/** run.PrettyRef (run.go:130-138 over ref.go ShortName :169-186): pull refs
+ *  render "#N", branch/tag/remote render their short names, anything else
+ *  renders raw (the refs/for arm never occurs on landed rows). */
+function prettyRefOf(ref: string): string {
+  const pull = /^refs\/pull\/(\d+)\/head$/.exec(ref);
+  if (pull !== null) return `#${pull[1]}`;
+  if (ref.startsWith("refs/heads/")) return ref.slice("refs/heads/".length);
+  if (ref.startsWith("refs/tags/")) return ref.slice("refs/tags/".length);
+  if (ref.startsWith("refs/remotes/")) return ref.slice("refs/remotes/".length);
+  return ref;
+}
+
+/** Status.String (status.go:27-38) — the raw enum name the task wire uses
+ *  (convert.go:267), NOT the ToActionsStatus words the run/job wires use. */
+const TASK_STATUS_NAMES: Record<number, string> = {
+  0: "unknown",
+  1: "success",
+  2: "failure",
+  3: "cancelled",
+  4: "skipped",
+  5: "waiting",
+  6: "running",
+  7: "blocked",
+  8: "cancelling",
+  9: "pending",
+};
+
+/** ToActionTask (convert.go:248-274): the task's job + run loads are hard
+ *  dependencies (the 500 class on a missing row), the URL is MakeAbsoluteURL
+ *  of run.Link() (the encoded owner/slug HTML path + /actions/runs/{id}), and
+ *  run_started_at renders Go-zero while the task never started. */
+async function actionTaskWire(
+  d1: D1Database,
+  origin: string,
+  pair: RepositoryWithOwner,
+  task: TaskRow,
+): Promise<z.infer<typeof actionTaskSchema>> {
+  const jobRows = await drizzle(d1).select().from(actionRunJobs).where(eq(actionRunJobs.id, task.jobId)).limit(1);
+  const job = jobRows[0];
+  if (job === undefined) {
+    throw new Error(`ToActionTask: job ${task.jobId} is missing`);
+  }
+  const runRows = await drizzle(d1).select().from(actionRuns).where(eq(actionRuns.id, job.runId)).limit(1);
+  const run = runRows[0];
+  if (run === undefined) {
+    throw new Error(`ToActionTask: run ${job.runId} is missing`);
+  }
+  return {
+    id: task.id,
+    name: job.name,
+    head_branch: prettyRefOf(run.ref),
+    head_sha: job.commitSha,
+    run_number: run.index,
+    event: run.triggerEvent,
+    display_title: run.title,
+    status: TASK_STATUS_NAMES[task.status] ?? "unknown",
+    workflow_id: run.workflowId,
+    url: `${repoHtmlUrl(origin, pair)}/actions/runs/${run.id}`,
+    created_at: task.created.toISOString(),
+    updated_at: task.updated.toISOString(),
+    run_started_at: isoOrNull(task.started),
+  };
+}
+
+// --- the cancel port (services/actions/cancel.go + run_job.go:769-829) -----
+
+/** CancelJobs at v1 (the rerun service header's same unread-column verdict):
+ *  the `always()`-condition exemption (cancel.go:79-90) needs the job YAML
+ *  parse — M3 — so cancellable = every not-done job; the force shortcut and
+ *  the unstarted-run shortcut (cancel.go:76-78) fold into the same filter.
+ *  Returns the updated-job count the settle decision reads. */
+async function cancelRunJobs(d1: D1Database, jobs: RunJobRow[], force: boolean): Promise<number> {
+  const db = drizzle(d1);
+  const now = new Date();
+  let cancelled = 0;
+  for (const job of jobs) {
+    if (isDoneStatus(job.status)) {
+      continue; // cancelOneJob's done arm (run_job.go:806-808)
+    }
+    if (job.taskId === 0) {
+      // cancelOneJob's no-task arm behind the task_id = 0 claim CAS
+      // (run_job.go:810-819).
+      const updated = await db
+        .update(actionRunJobs)
+        .set({ status: STATUS_CANCELLED, stopped: now, updated: now })
+        .where(and(eq(actionRunJobs.id, job.id), eq(actionRunJobs.taskId, 0)))
+        .returning({ id: actionRunJobs.id });
+      if (updated.length > 0) cancelled += 1;
+      continue;
+    }
+    // cancelOneJob's claimed arm (run_job.go:820-829): StopTask with
+    // CANCELLING unless force; the landed stopTask port negotiates the
+    // runner handshake and does NOT transfer logs (its docstring notes
+    // upstream's cancelOneJob caller — the sweeps transfer, cancel does not).
+    await stopTask(d1, job.taskId, force ? STATUS_CANCELLED : STATUS_CANCELLING);
+    cancelled += 1;
+  }
+  return cancelled;
+}
+
+/** SettleRunAfterCancel (run_job.go:796-801) — refreshRunStatus with the
+ *  CANCELLED noJobsStatus. The landed refreshRunStatus has no noJobsStatus
+ *  parameter and aggregates ALL of a run's job rows (the rerun service's
+ *  HANDOFF note), so the attempt-scoped settle lives here (the UI view
+ *  module's settle twin's shape): the latest attempt re-aggregates from ITS
+ *  jobs (an empty family carries the CANCELLED fallback), the run mirrors. */
+async function settleRunAfterCancel(d1: D1Database, run: RunRow): Promise<void> {
+  if (isDoneStatus(run.status)) {
+    return; // run_job.go:797-799
+  }
+  const db = drizzle(d1);
+  const now = new Date();
+  const attemptRows =
+    run.latestAttemptId > 0
+      ? await db.select().from(actionRunAttempts).where(eq(actionRunAttempts.id, run.latestAttemptId)).limit(1)
+      : [];
+  const attempt = attemptRows[0];
+  const jobCols = await db
+    .select({ status: actionRunJobs.status, continueOnError: actionRunJobs.continueOnError })
+    .from(actionRunJobs)
+    .where(
+      run.latestAttemptId > 0
+        ? and(eq(actionRunJobs.runId, run.id), eq(actionRunJobs.runAttemptId, run.latestAttemptId))
+        : eq(actionRunJobs.runId, run.id), // the legacy fallback, run_job.go:574-601
+    )
+    .all();
+  const next = jobCols.length === 0 ? STATUS_CANCELLED : aggregateJobStatus(jobCols);
+  if (attempt !== undefined) {
+    const cols: { status: number; started?: Date | null; stopped?: Date | null } = { status: next };
+    if (attempt.started === null && isRunningStatus(next)) cols.started = now;
+    if (attempt.stopped === null && isDoneStatus(next)) cols.stopped = now;
+    await db
+      .update(actionRunAttempts)
+      .set({ ...cols, updated: now })
+      .where(eq(actionRunAttempts.id, attempt.id));
+    await db
+      .update(actionRuns)
+      .set({ status: next, started: cols.started ?? attempt.started, stopped: cols.stopped ?? attempt.stopped, updated: now })
+      .where(eq(actionRuns.id, run.id));
+    return;
+  }
+  const started = run.started ?? (isRunningStatus(next) ? now : null);
+  const stopped = run.stopped ?? (isDoneStatus(next) ? now : null);
+  await db
+    .update(actionRuns)
+    .set({ status: next, started, stopped, updated: now })
+    .where(eq(actionRuns.id, run.id));
+}
+
+/** cancelRun's re-load + settle (cancel.go:44-68): upstream's job-update path
+ *  refreshes the aggregate through UpdateRunJob's hook (run_job.go:504-527) —
+ *  a hook the direct writes here don't fire, so the refresh runs explicitly
+ *  after ANY cancelled job; the no-update path settles with the CANCELLED
+ *  noJobsStatus instead. */
+async function cancelRunAndReload(d1: D1Database, run: RunRow, force: boolean): Promise<RunRow> {
+  const jobs = await latestAttemptJobsOfRun(d1, run);
+  const cancelled = await cancelRunJobs(d1, jobs, force);
+  if (cancelled > 0) {
+    await refreshRunStatus(d1, run.repoId, run.id, run.latestAttemptId);
+  } else {
+    await settleRunAfterCancel(d1, run);
+  }
+  return await runByRepoAndId(d1, run.repoId, run.id);
+}
+
+// --- the approve port (services/actions/approve.go:25-140) -----------------
+
+/** ApproveRuns at v1: the flag flip (approve.go:39-43), the needs-less
+ *  BLOCKED-job release (approve.go:106-132 — the `if:` re-decision and the
+ *  concurrency/label validations are the M3 arms the landed rows never
+ *  carry), the dispatch wake (the UpdateRunJob hook's bump arm), and the
+ *  re-aggregate. Returns the re-read run. */
+async function approveRun(d1: D1Database, run: RunRow, doerId: number): Promise<RunRow> {
+  const db = drizzle(d1);
+  const now = new Date();
+  await db
+    .update(actionRuns)
+    .set({ needApproval: false, approvedBy: doerId, updated: now })
+    .where(eq(actionRuns.id, run.id));
+  const jobs = await latestAttemptJobsOfRun(d1, run);
+  let released = 0;
+  for (const job of jobs) {
+    if (job.status !== STATUS_BLOCKED) continue;
+    let needs: unknown;
+    try {
+      needs = JSON.parse(job.needs);
+    } catch {
+      needs = [];
+    }
+    if (Array.isArray(needs) && needs.length > 0) continue; // approve.go:107 — needs-carrying jobs stay blocked
+    const updated = await db
+      .update(actionRunJobs)
+      .set({ status: STATUS_WAITING, updated: now })
+      .where(and(eq(actionRunJobs.id, job.id), eq(actionRunJobs.status, STATUS_BLOCKED)))
+      .returning({ id: actionRunJobs.id });
+    released += updated.length;
+  }
+  if (released > 0) {
+    // UpdateRunJob's done-arm bump (run_job.go:504-527) — the wake fires
+    // when waiting work remains.
+    if (await hasWaitingJobsToPick(d1, run.repoId)) {
+      await increaseTaskVersion(d1, run.ownerId, run.repoId);
+    }
+    await refreshRunStatus(d1, run.repoId, run.id, run.latestAttemptId);
+  }
+  return await runByRepoAndId(d1, run.repoId, run.id);
+}
+
+// --- the DeleteRun port (services/actions/cleanup.go:168-256) --------------
+
+/** DeleteRun at v1: the row cascade as explicit deletes (no FK cascades in
+ *  the landed store) — run, attempts, jobs, tasks, steps, outputs, job
+ *  summaries, artifacts — then the best-effort storage deletions (task logs
+ *  via the sealed key, artifact objects via the storage path). Errors on the
+ *  storage arm never fail the 204 (cleanup.go:253-256). */
+async function deleteRunRows(d1: D1Database, env: ApiEnv["Bindings"], run: RunRow): Promise<void> {
+  const db = drizzle(d1);
+  const jobRows = await db
+    .select({ id: actionRunJobs.id })
+    .from(actionRunJobs)
+    .where(and(eq(actionRunJobs.repoId, run.repoId), eq(actionRunJobs.runId, run.id)))
+    .all();
+  const jobIds = jobRows.map((j) => j.id);
+  const taskRows =
+    jobIds.length > 0
+      ? await db
+          .select()
+          .from(actionTasks)
+          .where(and(eq(actionTasks.repoId, run.repoId), inArray(actionTasks.jobId, jobIds)))
+          .all()
+      : [];
+  const taskIds = taskRows.map((t) => t.id);
+  const artifactRows = await db
+    .select()
+    .from(actionArtifacts)
+    .where(and(eq(actionArtifacts.repoId, run.repoId), eq(actionArtifacts.runId, run.id)))
+    .all();
+
+  // One batch — the task-family deletes key on the collected ids; a run
+  // with no tasks targets id 0, which no row carries (the no-op arm keeps
+  // the statement tuple fixed — the store has no FK cascades, so delete
+  // order is tidiness).
+  const taskKeyIds = taskIds.length > 0 ? taskIds : [0];
+  await db.batch([
+    db.delete(actionRunJobSummaries).where(and(eq(actionRunJobSummaries.repoId, run.repoId), eq(actionRunJobSummaries.runId, run.id))),
+    db.delete(actionArtifacts).where(and(eq(actionArtifacts.repoId, run.repoId), eq(actionArtifacts.runId, run.id))),
+    db.delete(actionRunJobs).where(and(eq(actionRunJobs.repoId, run.repoId), eq(actionRunJobs.runId, run.id))),
+    db.delete(actionRunAttempts).where(and(eq(actionRunAttempts.repoId, run.repoId), eq(actionRunAttempts.runId, run.id))),
+    db.delete(actionRuns).where(and(eq(actionRuns.repoId, run.repoId), eq(actionRuns.id, run.id))),
+    db.delete(actionTaskSteps).where(inArray(actionTaskSteps.taskId, taskKeyIds)),
+    db.delete(actionTaskOutputs).where(inArray(actionTaskOutputs.taskId, taskKeyIds)),
+    db.delete(actionTasks).where(inArray(actionTasks.id, taskKeyIds)),
+  ]);
+
+  // Storage deletions (cleanup.go:250-256): log-only the best-effort arm.
+  for (const task of taskRows) {
+    if (task.logInStorage && task.logFilename !== "") {
+      await env.REPO_PACKS.delete(sealedLogKey(task.logFilename)).catch(() => {});
+    }
+  }
+  for (const art of artifactRows) {
+    if (art.storagePath !== "") {
+      await env.REPO_PACKS.delete(art.storagePath).catch(() => {});
+    }
+  }
+}
+
+// --- the run-logs zip (common/actions.go:42-96 DownloadActionsRunAllJobLogs)
+
+/** CRC-32 (IEEE 802.3, reflected 0xedb88320) — the zip entry checksum (the
+ *  artifacts-download module's table). */
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32Of(bytes: Uint8Array): number {
+  let c = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) c = CRC32_TABLE[(c ^ bytes[i]!) & 0xff]! ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+/** MS-DOS date/time pair (the zip's local timestamp fields; the DOS epoch
+ *  starts 1980 — clamped like the artifacts-download twin). */
+function dosDateTimeOf(at: Date): { time: number; date: number } {
+  const year = Math.max(at.getFullYear(), 1980);
+  return {
+    time: (at.getHours() << 11) | (at.getMinutes() << 5) | Math.floor(at.getSeconds() / 2),
+    date: ((year - 1980) << 9) | ((at.getMonth() + 1) << 5) | at.getDate(),
+  };
+}
+
+interface LogZipEntry {
+  name: string;
+  data: Uint8Array;
+  at: Date;
+}
+
+/** The STORE-method archive (the header's reduction note: upstream deflates,
+ *  the landed logs arm already buffers the bytes; the method is unpinned).
+ *  Little-endian local headers + central directory + EOCD, no data
+ *  descriptors (the sizes are known). */
+function zipStoreEntries(entries: LogZipEntry[]): Uint8Array {
+  const encoder = new TextEncoder();
+  const locals: Uint8Array[] = [];
+  const centrals: Uint8Array[] = [];
+  let offset = 0;
+  for (const entry of entries) {
+    const nameBytes = encoder.encode(entry.name);
+    const crc = crc32Of(entry.data);
+    const { time, date } = dosDateTimeOf(entry.at);
+    const local = new DataView(new ArrayBuffer(30));
+    local.setUint32(0, 0x04034b50, true);
+    local.setUint16(4, 20, true); // version needed
+    local.setUint16(6, 0, true); // flags — sizes in the header
+    local.setUint16(8, 0, true); // method STORE
+    local.setUint16(10, time, true);
+    local.setUint16(12, date, true);
+    local.setUint32(14, crc, true);
+    local.setUint32(18, entry.data.length, true); // compressed == stored
+    local.setUint32(22, entry.data.length, true);
+    local.setUint16(26, nameBytes.length, true);
+    local.setUint16(28, 0, true); // extra len
+    locals.push(new Uint8Array(local.buffer), nameBytes, entry.data);
+
+    const central = new DataView(new ArrayBuffer(46));
+    central.setUint32(0, 0x02014b50, true);
+    central.setUint16(4, 20, true); // version made by
+    central.setUint16(6, 20, true); // version needed
+    central.setUint16(8, 0, true);
+    central.setUint16(10, 0, true);
+    central.setUint16(12, time, true);
+    central.setUint16(14, date, true);
+    central.setUint32(16, crc, true);
+    central.setUint32(20, entry.data.length, true);
+    central.setUint32(24, entry.data.length, true);
+    central.setUint16(28, nameBytes.length, true);
+    central.setUint32(42, offset, true); // local header offset
+    centrals.push(new Uint8Array(central.buffer), nameBytes);
+    offset += 30 + nameBytes.length + entry.data.length;
+  }
+  const centralOffset = offset;
+  let centralSize = 0;
+  for (const part of centrals) centralSize += part.length;
+  const eocd = new DataView(new ArrayBuffer(22));
+  eocd.setUint32(0, 0x06054b50, true);
+  eocd.setUint16(8, entries.length, true);
+  eocd.setUint16(10, entries.length, true);
+  eocd.setUint32(12, centralSize, true);
+  eocd.setUint32(16, centralOffset, true);
+  const parts = [...locals, ...centrals, new Uint8Array(eocd.buffer)];
+  const total = parts.reduce((sum, p) => sum + p.length, 0);
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const part of parts) {
+    out.set(part, at);
+    at += part.length;
+  }
+  return out;
+}
+
+/** openTaskLogs (common/actions.go:24-31) over the landed store — the
+ *  sealed-R2 arm reads the storage object, the live arm concatenates the
+ *  chunk rows (the readTaskLogRawBytes twin above serves the single-job
+ *  route; this variant tolerates a missing object with null). */
+async function openTaskLogBytes(env: ApiEnv["Bindings"], task: TaskRow): Promise<Uint8Array | null> {
+  try {
+    return await readTaskLogRawBytes(env, task);
+  } catch {
+    return null; // the open-failure skip arm (common/actions.go:57-60)
+  }
+}
+
+// ---------------------------------------------------------------------------
 // The routes
 // ---------------------------------------------------------------------------
 
 export function registerRepoActionsRoutes(
   app: OpenAPIHono<ApiEnv>,
   requireAuth: MiddlewareHandler<ApiEnv>,
+  optionalAuth?: MiddlewareHandler<ApiEnv>,
 ): void {
+  // The P1-9 groups above are reqToken'd at group level (api.go:1259/1266),
+  // so every route above rides requireAuth. The P1-11 runs-deep group
+  // (api.go:1348-1379) has NO reqToken: its reads are anonymous-capable and
+  // its reqToken'd arms answer the 401 INSIDE the handler (the ladder is
+  // reader-403 THEN token-401). optionalAuth is the HANDOFF arg — the
+  // header's one-line router recipe passes it; without it the routes stay
+  // on requireAuth (the logged-in-only reduction).
+  const readAuth = optionalAuth ?? requireAuth;
   // -------------------------------------------------------------------------
   // GET /repos/{owner}/{repo}/actions/workflows (ActionsListRepositoryWorkflows)
   // -------------------------------------------------------------------------
@@ -1873,4 +2522,687 @@ export function registerRepoActionsRoutes(
       });
     },
   );
+
+  // -------------------------------------------------------------------------
+  // The runs-deep family (the board's P1-11 row — api.go:1348-1379). Reads
+  // are anonymous-capable (the group carries NO reqToken); the reqToken'd
+  // arms answer the 401 in-handler (requireTokenDoer) to keep upstream's
+  // reader-403-before-token-401 ladder exact.
+  // -------------------------------------------------------------------------
+
+  // GET /repos/{owner}/{repo}/actions/tasks (ListActionTasks,
+  // action.go:786-858) — the repo's task census, PK-ordered, WITH the
+  // pagination headers (the handler sets Link + TotalCount, :848-850).
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/repos/{owner}/{repo}/actions/tasks",
+      middleware: [readAuth],
+      tags: ["repository"],
+      summary: "List a repository's action tasks",
+      operationId: "ListActionTasks",
+      request: {
+        params: z.object(ownerRepoParams),
+        query: z.object({
+          page: z.string().optional().openapi({ description: "page number of results to return (1-based)" }),
+          limit: z.string().optional().openapi({ description: "page size of results, default maximum page size is 50" }),
+        }),
+      },
+      responses: {
+        200: {
+          description: "TaskList",
+          content: { "application/json": { schema: actionTaskListSchema } },
+        },
+        403: errorResponse,
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireActionsReader(c, pair);
+      const opts = parseListOptions(new URL(c.req.url));
+      const db = drizzle(c.env.DB);
+      const where = eq(actionTasks.repoId, pair.repo.id);
+      const [rows, totals] = await Promise.all([
+        db.select().from(actionTasks).where(where).orderBy(asc(actionTasks.id)).limit(opts.limit).offset((opts.page - 1) * opts.limit).all(),
+        db.select({ value: count() }).from(actionTasks).where(where).all(),
+      ]);
+      const total = Number(totals[0]?.value ?? 0);
+      const origin = new URL(c.req.url).origin;
+      const entries = await Promise.all(rows.map((task) => actionTaskWire(c.env.DB, origin, pair, task)));
+      setPaginationHeaders(c, total, opts);
+      return c.json({ workflow_runs: entries, total_count: total }, 200);
+    },
+  );
+
+  // GET /repos/{owner}/{repo}/actions/runs/{run} (GetWorkflowRun,
+  // action.go:1283-1306) — the run wire over the latest attempt.
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/repos/{owner}/{repo}/actions/runs/{run}",
+      middleware: [readAuth],
+      tags: ["repository"],
+      summary: "Gets a specific workflow run",
+      operationId: "GetWorkflowRun",
+      request: { params: z.object(runParams) },
+      responses: {
+        200: {
+          description: "WorkflowRun",
+          content: { "application/json": { schema: actionWorkflowRunSchema } },
+        },
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireActionsReader(c, pair);
+      const run = await runByRepoAndId(c.env.DB, pair.repo.id, parsePathId(c.req.valid("param").run));
+      const origin = new URL(c.req.url).origin;
+      const wire = await actionWorkflowRunWire({
+        d1: c.env.DB,
+        origin,
+        pair,
+        run,
+        attempt: await latestAttemptOf(c.env.DB, run),
+        excludePullRequests: false,
+      });
+      return c.json(wire, 200);
+    },
+  );
+
+  // GET /repos/{owner}/{repo}/actions/runs/{run}/attempts/{attempt}
+  // (getWorkflowRunAttempt, action.go:1308-1342) — the run wire over the
+  // GIVEN attempt (its status/timing/trigger actor, and its
+  // previous_attempt_url pointer).
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/repos/{owner}/{repo}/actions/runs/{run}/attempts/{attempt}",
+      middleware: [readAuth],
+      tags: ["repository"],
+      summary: "Gets a specific workflow run attempt",
+      operationId: "getWorkflowRunAttempt",
+      request: { params: z.object(runAttemptParams) },
+      responses: {
+        200: {
+          description: "WorkflowRun",
+          content: { "application/json": { schema: actionWorkflowRunSchema } },
+        },
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireActionsReader(c, pair);
+      const run = await runByRepoAndId(c.env.DB, pair.repo.id, parsePathId(c.req.valid("param").run));
+      const attempt = await runAttemptByNumber(c.env.DB, run.id, parsePathId(c.req.valid("param").attempt));
+      const origin = new URL(c.req.url).origin;
+      const wire = await actionWorkflowRunWire({
+        d1: c.env.DB,
+        origin,
+        pair,
+        run,
+        attempt,
+        excludePullRequests: false,
+      });
+      return c.json(wire, 200);
+    },
+  );
+
+  // GET /repos/{owner}/{repo}/actions/runs/{run}/attempts/{attempt}/jobs
+  // (listWorkflowRunAttemptJobs, action.go:1652-1700) — shared.ListJobs at
+  // (0, repoID, runID, Some(attempt.ID)).
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/repos/{owner}/{repo}/actions/runs/{run}/attempts/{attempt}/jobs",
+      middleware: [readAuth],
+      tags: ["repository"],
+      summary: "Lists all jobs for a workflow run attempt",
+      operationId: "listWorkflowRunAttemptJobs",
+      request: {
+        params: z.object(runAttemptParams),
+        query: z.object({
+          status: z.string().optional().openapi({ description: "workflow status (requested, pending, queued, in_progress, failure, success, skipped)" }),
+          page: z.string().optional().openapi({ description: "page number of results to return (1-based)" }),
+          limit: z.string().optional().openapi({ description: "page size of results" }),
+          // The attempt-jobs contract omits sort/order while the handler
+          // resolves them (shared.ListJobs does) — the landed org-jobs
+          // deviation, mirrored: a 422 here is runtime-only-undeclared.
+          sort: z.string().optional().openapi({ description: 'sort jobs by attribute. Supported values are "id". Default is "id"' }),
+          order: z.string().optional().openapi({ description: 'sort order, either "asc" (ascending) or "desc" (descending). Default is "asc"' }),
+        }),
+      },
+      responses: {
+        200: {
+          description: "WorkflowJobsList",
+          content: { "application/json": { schema: workflowJobsListSchema } },
+        },
+        400: errorResponse,
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireActionsReader(c, pair);
+      const run = await runByRepoAndId(c.env.DB, pair.repo.id, parsePathId(c.req.valid("param").run));
+      const attempt = await runAttemptByNumber(c.env.DB, run.id, parsePathId(c.req.valid("param").attempt));
+      const origin = new URL(c.req.url).origin;
+      const body = await runJobsListWire(c, pair, run, attempt.id, origin);
+      return c.json(body, 200);
+    },
+  );
+
+  // DELETE /repos/{owner}/{repo}/actions/runs/{run} (deleteActionRun,
+  // action.go:1812-1849) — reqToken + reqRepoWriter; a not-done run answers
+  // the 400; DeleteRun cascades rows + storage.
+  app.openapi(
+    createRoute({
+      method: "delete",
+      path: "/repos/{owner}/{repo}/actions/runs/{run}",
+      middleware: [readAuth],
+      tags: ["repository"],
+      summary: "Delete a workflow run",
+      operationId: "deleteActionRun",
+      request: { params: z.object(runParams) },
+      responses: {
+        204: { description: "No Content" },
+        400: errorResponse,
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireActionsReader(c, pair);
+      requireTokenDoer(c);
+      await requireActionsWriter(c, pair);
+      const run = await runByRepoAndId(c.env.DB, pair.repo.id, parsePathId(c.req.valid("param").run));
+      if (!isDoneStatus(run.status)) {
+        throw new ApiError(400, "this workflow run is not done"); // action.go:1828-1831
+      }
+      await deleteRunRows(c.env.DB, c.env, run);
+      return c.body(null, 204);
+    },
+  );
+
+  // POST /repos/{owner}/{repo}/actions/runs/{run}/rerun (rerunWorkflowRun,
+  // action.go:1344-1422) — reqToken + reqRepoWriter; rides the LANDED rerun
+  // service; 201 carries the run wire over the NEW attempt.
+  app.openapi(
+    createRoute({
+      method: "post",
+      path: "/repos/{owner}/{repo}/actions/runs/{run}/rerun",
+      middleware: [readAuth],
+      tags: ["repository"],
+      summary: "Reruns an entire workflow run",
+      operationId: "rerunWorkflowRun",
+      request: { params: z.object(runParams) },
+      responses: {
+        201: {
+          description: "WorkflowRun",
+          content: { "application/json": { schema: actionWorkflowRunSchema } },
+        },
+        400: errorResponse,
+        403: errorResponse,
+        404: notFoundResponse,
+        409: errorResponse,
+      },
+    }),
+    async (c) => {
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireActionsReader(c, pair);
+      const doer = requireTokenDoer(c);
+      await requireActionsWriter(c, pair);
+      const run = await runByRepoAndId(c.env.DB, pair.repo.id, parsePathId(c.req.valid("param").run));
+      const jobs = await latestAttemptJobsOfRun(c.env.DB, run);
+      const result = await rerunWorkflowRunJobs(c.env.DB, pair.repo.id, run, doer.id, jobs);
+      if (!result.ok) throw rerunRejectionToApiError(result);
+      const reloaded = await runByRepoAndId(c.env.DB, pair.repo.id, run.id);
+      const origin = new URL(c.req.url).origin;
+      const wire = await actionWorkflowRunWire({
+        d1: c.env.DB,
+        origin,
+        pair,
+        run: reloaded,
+        attempt: await latestAttemptOf(c.env.DB, reloaded),
+        excludePullRequests: false,
+      });
+      return c.json(wire, 201);
+    },
+  );
+
+  // POST /repos/{owner}/{repo}/actions/runs/{run}/rerun-failed-jobs
+  // (rerunFailedWorkflowRun, action.go:1424-1476) — the failed/cancelled
+  // filter (the landed GetFailedJobsForRerun port); an empty set is the 400;
+  // success answers the bare 201.
+  app.openapi(
+    createRoute({
+      method: "post",
+      path: "/repos/{owner}/{repo}/actions/runs/{run}/rerun-failed-jobs",
+      middleware: [readAuth],
+      tags: ["repository"],
+      summary: "Reruns all failed jobs in a workflow run",
+      operationId: "rerunFailedWorkflowRun",
+      request: { params: z.object(runParams) },
+      responses: {
+        201: { description: "empty" },
+        400: errorResponse,
+        403: errorResponse,
+        404: notFoundResponse,
+        409: errorResponse,
+      },
+    }),
+    async (c) => {
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireActionsReader(c, pair);
+      const doer = requireTokenDoer(c);
+      await requireActionsWriter(c, pair);
+      const run = await runByRepoAndId(c.env.DB, pair.repo.id, parsePathId(c.req.valid("param").run));
+      const jobs = await latestAttemptJobsOfRun(c.env.DB, run);
+      const failedJobs = getFailedJobsForRerun(jobs);
+      if (failedJobs.length === 0) {
+        throw new ApiError(400, "this workflow run has no failed jobs to re-run"); // action.go:1453-1456
+      }
+      const result = await rerunWorkflowRunJobs(c.env.DB, pair.repo.id, run, doer.id, failedJobs);
+      if (!result.ok) throw rerunRejectionToApiError(result);
+      return c.body(null, 201);
+    },
+  );
+
+  // POST /repos/{owner}/{repo}/actions/runs/{run}/cancel (cancelWorkflowRun,
+  // actions_run.go:57-91) and POST …/force-cancel (ForceCancelWorkflowRun,
+  // :94-131) — a done run answers the 409 BEFORE any mutation; the wire
+  // renders the reloaded run's post-cancellation state.
+  const cancelRoute = (path: string, summary: string, operationId: string, force: boolean) =>
+    app.openapi(
+      createRoute({
+        method: "post",
+        path,
+        middleware: [readAuth],
+        tags: ["repository"],
+        summary,
+        operationId,
+        request: { params: z.object(runParams) },
+        responses: {
+          200: {
+            description: "WorkflowRun",
+            content: { "application/json": { schema: actionWorkflowRunSchema } },
+          },
+          403: errorResponse,
+          404: notFoundResponse,
+          409: errorResponse,
+        },
+      }),
+      async (c) => {
+        const pair = await requireVisibleRepo(c, c.req.valid("param"));
+        await requireActionsReader(c, pair);
+        requireTokenDoer(c);
+        await requireActionsWriter(c, pair);
+        const run = await runByRepoAndId(c.env.DB, pair.repo.id, parsePathId(c.req.valid("param").run));
+        // Cancelling a finished run would change nothing, so report a
+        // conflict instead of a false success (actions_run.go:136-139).
+        if (isDoneStatus(run.status)) {
+          throw new ApiError(409, "run is already completed");
+        }
+        const reloaded = await cancelRunAndReload(c.env.DB, run, force);
+        const origin = new URL(c.req.url).origin;
+        const wire = await actionWorkflowRunWire({
+          d1: c.env.DB,
+          origin,
+          pair,
+          run: reloaded,
+          attempt: await latestAttemptOf(c.env.DB, reloaded),
+          excludePullRequests: false,
+        });
+        return c.json(wire, 200);
+      },
+    );
+  cancelRoute("/repos/{owner}/{repo}/actions/runs/{run}/cancel", "Cancel a workflow run and its jobs", "cancelWorkflowRun", false);
+  cancelRoute(
+    "/repos/{owner}/{repo}/actions/runs/{run}/force-cancel",
+    "Force-cancel a workflow run",
+    "forceCancelWorkflowRun",
+    true,
+  );
+
+  // POST /repos/{owner}/{repo}/actions/runs/{run}/approve
+  // (approveWorkflowRun, actions_run.go:160-205) — the idempotent double
+  // approve renders the run (200); a run that never awaited approval 409s.
+  app.openapi(
+    createRoute({
+      method: "post",
+      path: "/repos/{owner}/{repo}/actions/runs/{run}/approve",
+      middleware: [readAuth],
+      tags: ["repository"],
+      summary: "Approve a workflow run that requires approval",
+      operationId: "approveWorkflowRun",
+      request: { params: z.object(runParams) },
+      responses: {
+        200: {
+          description: "WorkflowRun",
+          content: { "application/json": { schema: actionWorkflowRunSchema } },
+        },
+        403: errorResponse,
+        404: notFoundResponse,
+        409: errorResponse,
+      },
+    }),
+    async (c) => {
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireActionsReader(c, pair);
+      const doer = requireTokenDoer(c);
+      await requireActionsWriter(c, pair);
+      const run = await runByRepoAndId(c.env.DB, pair.repo.id, parsePathId(c.req.valid("param").run));
+      // IsAwaitingApproval (run.go:84-86) — needApproval && !IsDone.
+      const awaiting = run.needApproval && !isDoneStatus(run.status);
+      if (!awaiting) {
+        // Approving twice is idempotent, but a run that never awaited
+        // approval gets 409 rather than GitHub's 403
+        // (actions_run.go:174-180).
+        if (run.approvedBy === 0) {
+          throw new ApiError(409, "run is not waiting for approval");
+        }
+        const origin = new URL(c.req.url).origin;
+        const wire = await actionWorkflowRunWire({
+          d1: c.env.DB,
+          origin,
+          pair,
+          run,
+          attempt: await latestAttemptOf(c.env.DB, run),
+          excludePullRequests: false,
+        });
+        return c.json(wire, 200);
+      }
+      const approved = await approveRun(c.env.DB, run, doer.id);
+      const origin = new URL(c.req.url).origin;
+      const wire = await actionWorkflowRunWire({
+        d1: c.env.DB,
+        origin,
+        pair,
+        run: approved,
+        attempt: await latestAttemptOf(c.env.DB, approved),
+        excludePullRequests: false,
+      });
+      return c.json(wire, 200);
+    },
+  );
+
+  // GET /repos/{owner}/{repo}/actions/runs/{run}/jobs (listWorkflowRunJobs,
+  // action.go:1598-1650) — the runID<=0 400 (the junk parse lands 0), the
+  // run 404, then shared.ListJobs at Some(run.LatestAttemptID); the sort/
+  // order 422s and the invalid-status 400 are the declared arms.
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/repos/{owner}/{repo}/actions/runs/{run}/jobs",
+      middleware: [readAuth],
+      tags: ["repository"],
+      summary: "Lists all jobs for a workflow run",
+      operationId: "listWorkflowRunJobs",
+      request: {
+        params: z.object(runParams),
+        query: z.object({
+          status: z.string().optional().openapi({ description: "workflow status (requested, pending, queued, in_progress, failure, success, skipped)" }),
+          page: z.string().optional().openapi({ description: "page number of results to return (1-based)" }),
+          limit: z.string().optional().openapi({ description: "page size of results" }),
+          sort: z.string().optional().openapi({ description: 'sort jobs by attribute. Supported values are "id". Default is "id"' }),
+          order: z.string().optional().openapi({ description: 'sort order, either "asc" (ascending) or "desc" (descending). Default is "asc"' }),
+        }),
+      },
+      responses: {
+        200: {
+          description: "WorkflowJobsList",
+          content: { "application/json": { schema: workflowJobsListSchema } },
+        },
+        400: errorResponse,
+        404: notFoundResponse,
+        422: errorResponse,
+      },
+    }),
+    async (c) => {
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireActionsReader(c, pair);
+      // The junk-id parse lands 0 and answers the binder's arm
+      // (action.go:1609-1612 — "runID must be a positive integer").
+      const runId = parsePathId(c.req.valid("param").run);
+      if (runId <= 0) {
+        throw new ApiError(400, "runID must be a positive integer");
+      }
+      const run = await runByRepoAndId(c.env.DB, pair.repo.id, runId);
+      const origin = new URL(c.req.url).origin;
+      const body = await runJobsListWire(c, pair, run, run.latestAttemptId, origin);
+      return c.json(body, 200);
+    },
+  );
+
+  // POST /repos/{owner}/{repo}/actions/runs/{run}/jobs/{job_id}/rerun
+  // (rerunWorkflowJob, action.go:1478-1556) — the job must belong to the
+  // run's latest attempt (the "workflow job not found" 404); 201 carries the
+  // NEW attempt's job row (matched by attempt_job_id).
+  app.openapi(
+    createRoute({
+      method: "post",
+      path: "/repos/{owner}/{repo}/actions/runs/{run}/jobs/{job_id}/rerun",
+      middleware: [readAuth],
+      tags: ["repository"],
+      summary: "Reruns a specific workflow job in a run",
+      operationId: "rerunWorkflowJob",
+      request: { params: z.object(runJobParams) },
+      responses: {
+        201: {
+          description: "WorkflowJob",
+          content: { "application/json": { schema: actionWorkflowJobSchema } },
+        },
+        400: errorResponse,
+        403: errorResponse,
+        404: notFoundResponse,
+        409: errorResponse,
+      },
+    }),
+    async (c) => {
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireActionsReader(c, pair);
+      const doer = requireTokenDoer(c);
+      await requireActionsWriter(c, pair);
+      const run = await runByRepoAndId(c.env.DB, pair.repo.id, parsePathId(c.req.valid("param").run));
+      const jobs = await latestAttemptJobsOfRun(c.env.DB, run);
+      const jobId = parsePathId(c.req.valid("param").job_id);
+      const targetJob = jobs.find((job) => job.id === jobId);
+      if (targetJob === undefined) {
+        throw new ApiError(404, "workflow job not found"); // APIErrorNotFound, action.go:1506-1508
+      }
+      const result = await rerunWorkflowRunJobs(c.env.DB, pair.repo.id, run, doer.id, [targetJob]);
+      if (!result.ok) throw rerunRejectionToApiError(result);
+      // The new attempt's row for the target job's AttemptJobID — the
+      // legacy rows' backfilled identity re-read (action.go:1523-1535).
+      let attemptJobId = targetJob.attemptJobId;
+      if (attemptJobId === 0) {
+        const reloaded = await drizzle(c.env.DB).select().from(actionRunJobs).where(eq(actionRunJobs.id, targetJob.id)).limit(1);
+        attemptJobId = reloaded[0]?.attemptJobId ?? 0;
+      }
+      const rerunJob = result.jobs.find((job) => job.attemptJobId === attemptJobId);
+      if (rerunJob === undefined) {
+        throw new Error(`rerunWorkflowJob: attempt job ${attemptJobId} is missing from the new attempt`);
+      }
+      const origin = new URL(c.req.url).origin;
+      const wire = await actionWorkflowJobWire({ d1: c.env.DB, origin, pair, run, job: rerunJob });
+      return c.json(wire, 201);
+    },
+  );
+
+  // GET /repos/{owner}/{repo}/actions/runs/{run}/logs (getWorkflowRunLogs,
+  // actions_run.go:218-268 over common/actions.go:42-96) — reqToken ONLY
+  // (api.go:1367); the per-job log entries zip under the run archive name;
+  // a run with no readable job log answers the not-exist 404.
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/repos/{owner}/{repo}/actions/runs/{run}/logs",
+      middleware: [readAuth],
+      tags: ["repository"],
+      summary: "Download workflow run logs as archive",
+      operationId: "getWorkflowRunLogs",
+      request: { params: z.object(runParams) },
+      responses: {
+        200: { description: "Logs archive" },
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireActionsReader(c, pair);
+      requireTokenDoer(c);
+      const run = await runByRepoAndId(c.env.DB, pair.repo.id, parsePathId(c.req.valid("param").run));
+      const jobs = await latestAttemptJobsOfRun(c.env.DB, run);
+      const entries: LogZipEntry[] = [];
+      for (const job of jobs) {
+        // EffectiveTaskID (run_job.go:158-163); a job without a task, or
+        // whose logs expired, is SKIPPED (common/actions.go:52-54) — the
+        // 404 fires only when NO entry composes.
+        const taskID = job.taskId > 0 ? job.taskId : job.sourceTaskId;
+        if (taskID === 0) continue;
+        const taskRows = await drizzle(c.env.DB).select().from(actionTasks).where(eq(actionTasks.id, taskID)).limit(1);
+        const task = taskRows[0];
+        if (task === undefined || task.logExpired) continue;
+        const bytes = await openTaskLogBytes(c.env, task);
+        if (bytes === null) continue;
+        entries.push({
+          name: jobLogFilename(run.workflowId, job.name, task.id),
+          data: bytes,
+          at: task.updated,
+        });
+      }
+      if (entries.length === 0) {
+        throw new ApiError(404, "logs not found"); // NewNotExistErrorf, common/actions.go:93-95
+      }
+      const archiveName = fileNameJoinFields([pathBaseStem(run.workflowId), "run", run.id, "logs", ".zip"]);
+      const zip = zipStoreEntries(entries);
+      const base = archiveName.slice(archiveName.lastIndexOf("/") + 1);
+      return new Response(zip, {
+        status: 200,
+        headers: {
+          "content-type": "application/zip",
+          "content-length": String(zip.length),
+          "content-disposition": encodeContentDisposition("attachment", base),
+          "access-control-expose-headers": "Content-Disposition",
+          "cache-control": "max-age=0, private, must-revalidate",
+        },
+      });
+    },
+  );
+
+  // GET /repos/{owner}/{repo}/actions/runs/{run}/artifacts
+  // (getArtifactsOfRun, action.go:1755-1812) — NO run resolution upstream
+  // (the RepoID+RunID filter answers an unknown run with 200/0); the
+  // finalized-v4 filter + the name filter + the silent page clamp; NO
+  // pagination headers.
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/repos/{owner}/{repo}/actions/runs/{run}/artifacts",
+      middleware: [readAuth],
+      tags: ["repository"],
+      summary: "Lists all artifacts for a repository run",
+      operationId: "getArtifactsOfRun",
+      request: {
+        params: z.object(runParams),
+        query: z.object({
+          name: z.string().optional().openapi({ description: "name of the artifact" }),
+        }),
+      },
+      responses: {
+        200: {
+          description: "ArtifactsList",
+          content: { "application/json": { schema: runArtifactsListSchema } },
+        },
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireActionsReader(c, pair);
+      const runId = parsePathId(c.req.valid("param").run);
+      const name = c.req.valid("query").name ?? "";
+      const rows = await findReadableArtifacts(c.env.DB, {
+        runId,
+        artifactName: name,
+        finalizedArtifactsV4: true,
+      });
+      // The repo scoping rides the rows' repoId (upstream ANDs RepoID; the
+      // service read is run-scoped only).
+      const scoped = rows.filter((art) => art.repoId === pair.repo.id);
+      const opts = parseListOptions(new URL(c.req.url));
+      const pageRows = scoped.slice((opts.page - 1) * opts.limit, opts.page * opts.limit);
+      const origin = new URL(c.req.url).origin;
+      return c.json(
+        {
+          artifacts: pageRows.map((art: ArtifactRow) => toApiArtifact(pair, origin, art)),
+          total_count: scoped.length,
+        },
+        200,
+      );
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The runs-deep family's route-level plumbing
+// ---------------------------------------------------------------------------
+
+/** The rerun service's rejection → the API error (the web handler's
+ *  handleWorkflowRerunError mapping, view.go:1018-1028: AlreadyExist → 409,
+ *  InvalidArgument → 400; the internal misuses are the 500 class). */
+function rerunRejectionToApiError(result: Extract<RerunResult, { ok: false }>): ApiError {
+  switch (result.reason) {
+    case "run-not-done":
+    case "workflow-disabled":
+    case "max-attempts":
+    case "job-not-in-run":
+    case "job-missing-from-latest-attempt":
+      return new ApiError(400, result.message);
+    case "attempt-already-exists":
+      return new ApiError(409, result.message);
+    default:
+      return new ApiError(500, result.message);
+  }
+}
+
+/** shared.ListJobs (shared/action.go:35-93) at the run scope: the sort/order
+ *  422s resolve FIRST, then the status words (the 400), then the filtered
+ *  page (run-scoped + attempt-scoped — the accessible-repos subquery is
+ *  vacuous behind that), rendered through the route-local job wire. */
+async function runJobsListWire(
+  c: Context<ApiEnv>,
+  pair: RepositoryWithOwner,
+  run: RunRow,
+  runAttemptId: number,
+  origin: string,
+): Promise<z.infer<typeof workflowJobsListSchema>> {
+  const url = new URL(c.req.url);
+  const filters = workflowJobFiltersFromQuery(url);
+  const opts = parseListOptions(url);
+  const db = drizzle(c.env.DB);
+  const conds = [eq(actionRunJobs.runId, run.id), eq(actionRunJobs.runAttemptId, runAttemptId)];
+  if (filters.statuses.length > 0) {
+    conds.push(inArray(actionRunJobs.status, filters.statuses));
+  }
+  const where = and(...conds);
+  const [rows, totals] = await Promise.all([
+    db
+      .select()
+      .from(actionRunJobs)
+      .where(where)
+      .orderBy(filters.order === "id ASC" ? asc(actionRunJobs.id) : desc(actionRunJobs.id))
+      .limit(opts.limit)
+      .offset((opts.page - 1) * opts.limit)
+      .all(),
+    db.select({ value: count() }).from(actionRunJobs).where(where).all(),
+  ]);
+  const total = Number(totals[0]?.value ?? 0);
+  const jobs = await Promise.all(
+    rows.map((job) => actionWorkflowJobWire({ d1: c.env.DB, origin, pair, run, job })),
+  );
+  setPaginationHeaders(c, total, opts);
+  return { total_count: total, jobs };
 }
