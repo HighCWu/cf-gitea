@@ -2077,8 +2077,9 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
   ],
   repoTransfer: [
     {
-      name: "file a pending transfer (async 202)",
-      status: 202,
+      name: "file a pending transfer (the pin's pending arm — 201 Created, transfer.go:126-130)",
+      status: 201,
+      runtimeOnlyModelRef: "Repository",
       request: (ctx) => ({
         path: `/repos/${String(ctx.seeds.repoOwner)}/compat-transfer/transfer`,
         init: ctx.withAuth({

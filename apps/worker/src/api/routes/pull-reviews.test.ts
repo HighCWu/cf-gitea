@@ -374,6 +374,11 @@ describe("GET list + single review arms (repoListPullReviews / repoGetPullReview
     const anon = await run(`/api/v1/repos/${OWNER}/${SLUG}/pulls/${pr.index}/reviews`);
     expect(anon.status).toBe(200);
     expect(anon.headers.get("X-Total-Count")).toBe("1");
+    // SetTotalCountHeader verbatim (services/context/base.go:73-77): the
+    // expose append rides the count — and ListPullReviews calls no
+    // SetLinkHeader (pull_review.go:98-103), so no Link header is sent.
+    expect(anon.headers.get("Access-Control-Expose-Headers")).toBe("X-Total-Count");
+    expect(anon.headers.get("Link")).toBe(null);
     const visible = await jsonArray(anon);
     expect(visible).toHaveLength(1);
     expect(visible[0]!.state).toBe("COMMENT");

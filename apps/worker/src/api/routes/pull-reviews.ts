@@ -141,7 +141,7 @@ import { emitIssueEvent } from "../../services/issue-events";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { embeddedUserSchema } from "../models/issue";
-import { parseListOptions, setPaginationHeaders } from "../pagination";
+import { parseListOptions } from "../pagination";
 import { assertPullsUnit } from "../services/issue-unit-gates";
 import { collaboratorModeOf } from "../services/repo-collaborators";
 import {
@@ -1203,7 +1203,10 @@ export function registerPullReviewRoutes(
   // GET /repos/{owner}/{repo}/pulls/{index}/reviews (repoListPullReviews) —
   // FindReviews order (created_unix ASC, id ASC, review_list.go:120–137),
   // pending rows filtered for non-reviewer viewers
-  // (convert/pull_review.go:69–73), X-Total-Count over the VISIBLE set
+  // (convert/pull_review.go:69–73). Headers: upstream's handler calls ONLY
+  // SetTotalCountHeader (pull_review.go:102) — X-Total-Count +
+  // Access-Control-Expose-Headers append (services/context/base.go:73–77),
+  // no SetLinkHeader — so the exact pair is set here, over the VISIBLE set
   // (upstream counts unfiltered; the header divergence is the privacy
   // filter's cost — a hidden pending row would otherwise leak its count).
   // -------------------------------------------------------------------------
@@ -1240,7 +1243,11 @@ export function registerPullReviewRoutes(
         .all();
       const visible = allRows.filter((row) => row.type !== ReviewType.Pending || canSeePending || row.reviewerId === doerId);
       const page = visible.slice((opts.page - 1) * opts.limit, (opts.page - 1) * opts.limit + opts.limit);
-      setPaginationHeaders(c, visible.length, opts);
+      // SetTotalCountHeader verbatim (base.go:73-77): the count header plus
+      // the CORS expose append — and NO Link header, upstream's
+      // ListPullReviews calls no SetLinkHeader (pull_review.go:98-103).
+      c.header("X-Total-Count", String(visible.length));
+      c.header("Access-Control-Expose-Headers", "X-Total-Count");
       const rendered = [];
       for (const row of page) {
         rendered.push(await toApiReview(c, found, issue, row, viewer));

@@ -157,6 +157,17 @@ export const RUNTIME_ONLY_RESPONSES: Readonly<
       422: "non-full-length sha input rejected at runtime (upstream resolves refs via the engine and 500s on unknown — neither reproducible without engine ref resolution); declared set stays {201,400,404}",
     },
   },
+  "/repos/{owner}/{repo}/transfer": {
+    post: {
+      // The PENDING arm: upstream's handler answers 201 Created when the repo
+      // status is RepositoryPendingTransfer
+      // (gitea/routers/api/v1/repo/transfer.go:126-130) while its swagger
+      // block documents only the 202 (transfer.go:48-58) — the 202 is the
+      // DIRECT-transfer answer (:132-133). cf-gitea always files pending, so
+      // 201 is the success code we ship.
+      201: "upstream repoTransfer answers StatusCreated on the pending arm (transfer.go:126-130); its swagger documents only the direct-transfer 202 (transfer.go:48-58 vs :132-133)",
+    },
+  },
   "/repos/{owner}/{repo}/milestones/{id}": {
     patch: {
       400: "due_on parse failure returns upstream's 'invalid date format' at runtime; undeclared in the vendored contract (same class as /user 401)",
@@ -270,6 +281,13 @@ export interface CompatScenarioCase {
   status: number;
   /** Link relations that must be present (multi-page lists seed ≥2 rows and force limit=1). */
   linkRels?: readonly string[];
+  /** For a documented runtime-only SUCCESS status (upstream sends it, the
+   * frozen contract omits it — the RUNTIME_ONLY_RESPONSES entry must exist):
+   * validate the JSON body against this contract model's field set instead of
+   * the APIError envelope the error-class runtime-only statuses carry
+   * (repoTransfer's pending-arm 201 carries the Repository its declared 202
+   * documents, transfer.go:126-130 vs the swagger block :48-58). */
+  runtimeOnlyModelRef?: string;
   request: (ctx: CompatScenarioContext) => CompatRequest | Promise<CompatRequest>;
 }
 
@@ -396,13 +414,29 @@ async function runScenarioCase(
   const expectation = operation.responses[String(response.status)];
   if (expectation === undefined) {
     // (2) Not a fixture status: only the documented runtime-only responses are
-    // acceptable, and they carry the generic APIError envelope.
+    // acceptable — the error class carries the generic APIError envelope, and
+    // a scenario declaring `runtimeOnlyModelRef` validates against that
+    // contract model (the documented runtime-only SUCCESS class).
     const note = runtimeOnlyResponseNote(operation.path, operation.method, response.status);
     if (note === undefined) {
       problems.push(
         `${at}: status ${response.status} is neither a fixture response ` +
           `{${Object.keys(operation.responses).join(", ")}} nor a documented runtime-only exception`,
       );
+      return problems;
+    }
+    if (scenarioCase.runtimeOnlyModelRef !== undefined) {
+      const contentType = response.headers.get("content-type") ?? "";
+      if (!contentType.includes(JSON_CONTENT_TYPE)) {
+        problems.push(`${at}: runtime-only model response ${response.status} (${note}) must be ${JSON_CONTENT_TYPE}, got "${contentType}"`);
+        return problems;
+      }
+      const parsedModel = tryParseJson(bodyText);
+      if (!parsedModel.ok || !isPlainObject(parsedModel.value)) {
+        problems.push(`${at}: runtime-only model response ${response.status} (${note}) must be a JSON object, got ${clip(bodyText)}`);
+        return problems;
+      }
+      assertModelShape(parsedModel.value, lookup(scenarioCase.runtimeOnlyModelRef), at, problems, lookup, scenarioCase.runtimeOnlyModelRef);
       return problems;
     }
     assertRuntimeOnlyErrorEnvelope(bodyText, response, at, note, problems);

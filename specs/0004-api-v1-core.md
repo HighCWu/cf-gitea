@@ -127,7 +127,7 @@ automation (tags + releases + assets + PR merge), CI checkout/status tooling
 - `GET /repositories/{id}` — repo by numeric id (SDK `GetRepoByID`, webhook payloads reference it).
 - `GET/PUT /repos/{owner}/{repo}/topics` — topics read/replace (terraform, badge/label tooling).
 - `GET /repos/{owner}/{repo}/collaborators`, `GET/PUT/DELETE /repos/{owner}/{repo}/collaborators/{collaborator}` — collaborator ACL management (repo-admin automation).
-- `POST /repos/{owner}/{repo}/transfer` — ownership transfer automation (`TransferRepo`, returns 202).
+- `POST /repos/{owner}/{repo}/transfer` — ownership transfer automation (`TransferRepo`, pending arm returns 201 — see the table row).
 - `GET/POST /repos/{owner}/{repo}/forks` — fork listing/creation (SDK `CreateFork`, 202 upstream).
 - `GET /repos/{owner}/{repo}/languages` — language stats (SDK `GetRepoLanguages`, badges).
 - `GET/POST /repos/{owner}/{repo}/branches`, `GET/PUT/DELETE/PATCH /repos/{owner}/{repo}/branches/{branch}` — branch list/create/get/ref-CAS-update/delete/rename; release automation creates branches, CI reads them, PUT is a direct map to the engine's ref CAS.
@@ -209,7 +209,7 @@ each time.
 | `GET/PUT /repos/{owner}/{repo}/topics` | D1 | `read:`/`write:repository` | none | PUT **replaces** the whole list; invalid names → 422 with `invalidTopics` (swagger models it as a header — same quirk as errors). |
 | `GET /repos/{owner}/{repo}/collaborators` | D1 | `read:repository` (repo admin) | none | Paginated; permission checked is admin-mode, not writer. |
 | `GET/PUT/DELETE /repos/{owner}/{repo}/collaborators/{collaborator}` | D1 | `read:`/`write:repository` (admin) | none | PUT body `Body: permission string`; DELETE → 204. |
-| `POST /repos/{owner}/{repo}/transfer` | D1 | `write:repository` (owner) | n/a | **202 Accepted** — async, pending transfer; not the final state. |
+| `POST /repos/{owner}/{repo}/transfer` | D1 | `write:repository` (owner) | n/a | **201 Created** — the pending arm: upstream answers StatusCreated whenever the repo status is `RepositoryPendingTransfer` (transfer.go:126-130; acceptance is the tier-2 transfer/accept surface). Its **202** (transfer.go:132-133) is the DIRECT-transfer arm — `transferOwnership` inline for doer-is-admin / self / org-can-create-repo (services/repository/transfer.go:458-477) — which this instance never exercises (every accepted request files pending, admin doers included). The 201 is runtime-only vs the vendored contract (its swagger block :48-58 declares only the 202) and rides a RUNTIME_ONLY_RESPONSES entry. |
 | `GET/POST /repos/{owner}/{repo}/forks` | D1 + engine strategy | `read:`/`write:repository` | n/a | POST → **202** (async fork); object-sharing model between fork parents is a SPEC-0003/0005 decision. |
 | `GET /repos/{owner}/{repo}/languages` | engine (persist result in D1) | `read:repository` | D1 after first compute | Upstream computes async in background; response is a map `language → int64 bytes`. |
 | `GET/POST /repos/{owner}/{repo}/branches` | engine + D1 (protection flags) | `read:`/`write:repository` | `refs_version` | POST → **201**; `CreateBranchRepoOption` has both `old_branch_name` and `old_ref_name`; list sends `X-Total-Count`. |
@@ -292,7 +292,10 @@ each time.
   (all 60 are mutations); **405** on `POST tags`/merge/teams = empty-repo / not-mergeable
   / wrong-repo-mode, *not* method-unsupported; **409** includes `EmptyRepository`
   (commit/status ops on a repo with no commits); **412** = feature disabled
-  (issues/projects off); **202** = async accepted (fork, transfer, org-wide delete);
+  (issues/projects off); **202** = async accepted (fork, org-wide delete) plus transfer's
+  DIRECT arm (transfer.go:132-133 — transfer's async/pending answer is the **201**
+  Created of transfer.go:126-130, runtime-only vs the contract; corrected 2026-10-31
+  against the pin — an earlier row of this SPEC carried the two statuses swapped);
   **205** = notifications read; PATCH issue returning **201**; POST tag returning **200**.
 - **Pagination**: 118 operations take `page` (1-based) + `limit` (integer query
   params, no defaults declared in the contract). Upstream runtime defaults
@@ -393,8 +396,15 @@ Deltas and pull-forwards it forces:
   → `50` — clamped silently, never a 422. `git/trees` `per_page` has its own cap
   (extract the exact value from an oracle run against a real instance).
 - **Archived repos**: every mutation on an archived repo → **423** with the error
-  body. This includes contents writes, branch/tag creation, PR merge, release edits
-  (60 operations carry `repoArchivedError`).
+  body. This includes contents writes, branch/tag creation, PR merge
+  (60 operations carry `repoArchivedError` — none of them a release-family op).
+  RELEASE EXCEPTION: the `/releases` subtree registers no route-level archived
+  gate — upstream gates create/edit INSIDE `createTag`
+  (`services/release/release.go:75-78`, after the duplicate 409 and before the
+  draft gate, drafts included), and neither handler maps `ErrRepoIsArchived`, so
+  release create/edit answer upstream's bare **500**
+  (`release.go:285-287` create / `:379-382` edit); as-built at `0b39750` (the
+  v1.3.2 board's P2-5), detailed in SPEC-0005 §2.3 + §4.14.
 - **Empty repos**: reads that need objects return 404 (branches list is empty 200),
   but commit/status endpoints return **409** `EmptyRepository`, and `POST tags` →
   **405**. The `Repository.empty` flag drives client behavior and must be accurate

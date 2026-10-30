@@ -207,7 +207,7 @@ describe("REDEPLOY8 tail — repo mutations reach the engine Registry/RepoCell",
     const filed = await apiJson("POST", "/repos/alice/gift/transfer", aliceToken, {
       new_owner: "bob",
     });
-    expect(filed.status).toBe(202);
+    expect(filed.status).toBe(201); // the pending arm (transfer.go:126-130)
     const accepted = await apiJson("POST", "/repos/alice/gift/transfer/accept", bobToken);
     expect(accepted.status).toBe(202);
 

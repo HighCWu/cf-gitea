@@ -86,10 +86,14 @@ import {
  * repoDelete runs the landed §2.5.5 pipeline (D1 cascade → DO tombstone →
  * queue purge) plus the raw-D1 housekeeping of this batch's tables.
  * repoTransfer files the pending `repo_transfer` row via the repos service
- * and answers the SPEC-pinned async 202 (SPEC-0004 §2.4: "202 Accepted —
- * async, pending transfer; not the final state"; upstream's synchronous
- * 201-on-immediate-transfer path needs the team machinery this instance
- * defers, and its pending-transfer 201 would contradict the contract).
+ * and answers upstream's PENDING arm: **201 Created** with the current
+ * Repository (transfer.go:126-130 — `Status == RepositoryPendingTransfer` →
+ * StatusCreated; the runtime answer upstream's own swagger block :48-58
+ * omits, carried as a RUNTIME_ONLY_RESPONSES entry). Upstream answers 202
+ * (transfer.go:132-133) only on its DIRECT-transfer arms — doer-is-admin /
+ * self-transfer / org-can-create-repo (services/repository/transfer.go:458-477,
+ * `transferOwnership` runs inline) — which this instance never exercises: it
+ * always files pending, so the pending 201 is the only success code emitted.
  */
 
 /**
@@ -310,9 +314,15 @@ function deleteRepoRoute(requireAuth: MiddlewareHandler<ApiEnv>) {
 
 /**
  * `POST /repos/{owner}/{repo}/transfer` — upstream `reqToken +
- * reqRepoDangerZone` (api.go:1246–1249), **202 Accepted** with the
- * Repository (SPEC-0004 §2.4: async, pending transfer). Declared responses:
- * {202, 403, 404, 422}.
+ * reqRepoDangerZone` (api.go:1246–1249), **201 Created** with the Repository
+ * on the pending arm (transfer.go:126-130 — the answer upstream's swagger
+ * block :48-58 omits; carried as a RUNTIME_ONLY_RESPONSES entry). The
+ * declared 202 is upstream's DIRECT-transfer arm (:132-133 —
+ * `transferOwnership` runs inline for doer-is-admin / self /
+ * org-can-create-repo, services/repository/transfer.go:458-477), which this
+ * instance never exercises: every accepted request files pending, so 201 is
+ * the only success code the handler emits. Declared responses: {201, 202,
+ * 403, 404, 422}.
  */
 const transferRepoRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
@@ -330,6 +340,14 @@ const transferRepoRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
       body: { content: { "application/json": { schema: transferRepoOptionSchema } } },
     },
     responses: {
+      // The pending arm's 201 is runtime-only (upstream's swagger block :48-58
+      // omits it; RUNTIME_ONLY_RESPONSES carries the cite).
+      201: {
+        description: "Repository",
+        content: { "application/json": { schema: repositorySchema } },
+      },
+      // Upstream's DIRECT-transfer arm (transfer.go:132-133) — never emitted
+      // here: every accepted request files pending (the module-header note).
       202: {
         description: "Repository",
         content: { "application/json": { schema: repositorySchema } },
@@ -752,7 +770,8 @@ export function registerRepoRoutes(
   });
 
   // -------------------------------------------------------------------------
-  // POST /repos/{owner}/{repo}/transfer (repoTransfer) — 202 + pending row.
+  // POST /repos/{owner}/{repo}/transfer (repoTransfer) — 201 + pending row
+  // (the pin's pending arm, transfer.go:126-130).
   // -------------------------------------------------------------------------
   app.openapi(
     transferRepoRoute(requireAuth),
@@ -785,8 +804,8 @@ export function registerRepoRoutes(
       // file's ownership): the site-admin doer bypasses (upstream's
       // IsAdmin direct arm), and a self-"transfer" keeps the landed
       // OwnerNotAssignableError 422 below (upstream's direct arm would
-      // transfer back silently — the landed 202-handler divergence stands),
-      // so neither reaches the probe, exactly like upstream.
+      // transfer back silently — the landed self-transfer 422 divergence
+      // stands), so neither reaches the probe, exactly like upstream.
       const requester = c.get("authUser");
       const doerIsAdmin = requester.is_admin === true;
       if (!doerIsAdmin && found.repo.ownerId !== target.id) {
@@ -815,14 +834,19 @@ export function registerRepoRoutes(
         throw error;
       }
 
-      // 202 + the CURRENT Repository — the transfer is pending, not applied
-      // (SPEC-0004 §2.4; acceptance is the tier-2 transfer/accept surface).
+      // 201 + the CURRENT Repository — the transfer is pending, not applied
+      // (upstream's pending arm, transfer.go:126-130 `Status ==
+      // RepositoryPendingTransfer` → StatusCreated; its 202 at :132-133 is
+      // the DIRECT-transfer arm this instance never exercises — every
+      // accepted request files pending, admin doers included). The vendored
+      // contract documents only 202; the 201 rides the RUNTIME_ONLY_RESPONSES
+      // entry. Acceptance is the tier-2 transfer/accept surface.
       // No webhook: upstream fires none for transfers — its webhookNotifier
       // inherits NullNotifier's no-op TransferRepository, and HookRepoAction
       // has no transfer member (modules/structs/hook.go:557-562).
       const viewer = viewerOf(c);
       const settings = await loadRepoSettings(c.env.DB, found.repo.id);
-      return c.json(toApiRepository(viewer, found, settings), 202);
+      return c.json(toApiRepository(viewer, found, settings), 201);
     },
     repoBodyHook,
   );

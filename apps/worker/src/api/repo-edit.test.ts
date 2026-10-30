@@ -7,9 +7,10 @@
  * description/website/has_* subset with the PATCH→GET round trip; the
  * accepted-and-ignored remainder), the 422 family (rename collision /
  * invalid name), the admin/danger-zone 403s, the §2.5.5 DELETE (D1 row +
- * this batch's raw stores gone), and the SPEC-pinned async 202 transfer
- * (pending repo_transfer row, current-state Repository render, the
- * anti-enumeration 404 unknown-owner message, self-transfer 422, teams 422).
+ * this batch's raw stores gone), and the pending-arm 201 transfer
+ * (transfer.go:126-130 — 201 with the current-state Repository + the pending
+ * repo_transfer row; the anti-enumeration 404 unknown-owner message,
+ * self-transfer 422, teams 422).
  */
 
 import { SELF } from "cloudflare:test";
@@ -756,13 +757,13 @@ describe("DELETE /repos/{owner}/{repo} (repoDelete)", () => {
 });
 
 describe("POST /repos/{owner}/{repo}/transfer (repoTransfer)", () => {
-  it("files a pending transfer and answers 202 with the CURRENT Repository", async () => {
+  it("files a pending transfer and answers 201 with the CURRENT Repository (the pin's pending arm, transfer.go:126-130)", async () => {
     const res = await makeApp()(`${repoPath}/transfer`, {
       method: "POST",
       headers: jsonAuth,
       body: JSON.stringify({ new_owner: "other" }),
     });
-    expect(res.status).toBe(202);
+    expect(res.status).toBe(201);
     const body = await res.json<Record<string, unknown>>();
     expect(body.full_name).toBe("cf-gitea-stub/edit-me"); // not applied yet
     const pending = await drizzle(env.DB).select().from(repoTransfer).all();
@@ -774,13 +775,24 @@ describe("POST /repos/{owner}/{repo}/transfer (repoTransfer)", () => {
     await seedHook();
     expect(
       (await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "other" }) })).status,
-    ).toBe(202);
+    ).toBe(201);
     expect(await deliveries()).toEqual([]);
   });
 
   it("re-files (upsert) a repeat request", async () => {
     await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "other" }) });
-    expect((await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "other" }) })).status).toBe(202);
+    expect((await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "other" }) })).status).toBe(201);
+    expect(await drizzle(env.DB).select().from(repoTransfer).all()).toHaveLength(1);
+  });
+
+  it("answers 201 for a SITE-ADMIN doer too (upstream's direct arm would run transferOwnership inline and answer 202 — transfer.go:132-133; the direct machinery is unlanded here, every accepted request files pending)", async () => {
+    const res = await makeApp()(`${repoPath}/transfer`, {
+      method: "POST",
+      headers: { Authorization: `token ${TOKEN_ADMIN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ new_owner: "other" }),
+    });
+    expect(res.status).toBe(201);
+    expect(await res.json<Record<string, unknown>>()).toMatchObject({ full_name: "cf-gitea-stub/edit-me" });
     expect(await drizzle(env.DB).select().from(repoTransfer).all()).toHaveLength(1);
   });
 
@@ -846,17 +858,17 @@ describe("POST /repos/{owner}/{repo}/transfer (repoTransfer)", () => {
       expect(await drizzle(env.DB).select().from(repoTransfer).all()).toHaveLength(0);
     });
 
-    it("a site-admin doer bypasses the arm (upstream's doer.IsAdmin direct arm precedes the probe)", async () => {
+    it("a site-admin doer bypasses the arm (upstream's doer.IsAdmin direct arm precedes the probe) and still files pending — 201 (the direct arm's 202 needs the unlanded transferOwnership)", async () => {
       await block(otherUserId, adminUserId);
       const res = await makeApp()(`${repoPath}/transfer`, {
         method: "POST",
         headers: { Authorization: `token ${TOKEN_ADMIN}`, "Content-Type": "application/json" },
         body: JSON.stringify({ new_owner: "other" }),
       });
-      expect(res.status).toBe(202);
+      expect(res.status).toBe(201);
     });
 
-    it("202s once no blocking row relates the pair (the arm lifts with the block)", async () => {
+    it("201s once no blocking row relates the pair (the arm lifts with the block)", async () => {
       await block(otherUserId, 1);
       await env.DB.prepare("DELETE FROM user_blocking").run();
       const res = await makeApp()(`${repoPath}/transfer`, {
@@ -864,7 +876,7 @@ describe("POST /repos/{owner}/{repo}/transfer (repoTransfer)", () => {
         headers: jsonAuth,
         body: JSON.stringify({ new_owner: "other" }),
       });
-      expect(res.status).toBe(202);
+      expect(res.status).toBe(201);
     });
   });
 });

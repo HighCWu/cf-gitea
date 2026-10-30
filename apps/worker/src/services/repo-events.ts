@@ -39,7 +39,7 @@
  *   - RepositoryPayload (modules/structs/hook.go:566): action
  *     created|deleted|renamed (HookRepoAction, :557-562 — there is NO
  *     transfer action; upstream's webhookNotifier inherits NullNotifier's
- *     no-op TransferRepository, so our pending-transfer 202 and the
+ *     no-op TransferRepository, so our pending-transfer 201 and the
  *     transfer-accept route stay silent, upstream-faithful);
  *   - ForkPayload (hook.go:272): forkee/repository/sender — the notifier
  *     fills forkee with the SOURCE (oldRepo), not the fork (the stale field
