@@ -606,7 +606,17 @@ byte format, and uncompressed log objects stream fine. Reads (UI log panel,
 - **Retention/cleanup**: an hourly-producer block joins the scheduled dispatcher
   (the SPEC-0014 §3 sanctioned-extension pattern: SELECT due work → enqueue;
   the consumer executes — artifact expiry flips + R2 deletes, log sealing
-  orphans, run/log row expiry, `StopTask` zombie sweep below).
+  orphans, run/log row expiry, `StopTask` zombie sweep below). Beside it, the
+  ALWAYS-ON sweeps family (`services/actions/sweeps.ts`) ports upstream's
+  remaining always-on actions crons with no retention knob
+  (`cron/tasks_actions.go`): `stop_endless_tasks` (RUNNING past
+  `ENDLESS_TASK_TIMEOUT` 3h keyed on `started`), `cancel_abandoned_jobs`
+  (waiting/blocked/pending quiet past `ABANDONED_JOB_TIMEOUT` 24h), and the
+  ephemeral-runner pass of `Cleanup` (decoupled from the retention arming —
+  upstream runs it unconditionally nightly). Same producer/consumer shape as
+  the zombie pair: indexed LIMIT-1 probe → at most one `{kind:
+  "actions-endless" | "actions-abandoned" | "actions-ephemeral-cleanup"}`
+  message; a quiet instance sends zero.
 - **Run numbering**: upstream's `action_run_index` named sequence
   (`services/actions/run.go:67`) maps onto `repo_counters` — a new `run_index`
   column beside `issue_index` (the `syncMaxIssueIndex` CAS idiom,
@@ -664,6 +674,32 @@ byte format, and uncompressed log objects stream fine. Reads (UI log panel,
    `wrangler.jsonc.example` documents the trio fail-closed (a default
    deployment NEVER deletes actions data — upstream's always-on defaults
    are opt-in here).
+9. RESOLVED — the always-on sweeps family and the claim-window orphan. (a)
+   The zombie stop picks its terminal status PER TASK
+   (`clear_tasks.go:160-163`: CANCELLING → CANCELLED, RUNNING → FAILURE) —
+   the first cut stopped both as FAILURE, flipping user-cancelled runs to
+   failed through the aggregate. (b) `stop_endless_tasks` /
+   `cancel_abandoned_jobs` port onto the always-on probe-gated
+   producer/consumer shape (`services/actions/sweeps.ts`, ledger entry 8's
+   zombie pair) — the M3-staged tails (`notifyAndEmitFinishedJobs`,
+   the reusable-caller cascade) stay staged. (c) `CleanupEphemeralRunners`
+   is hygiene, not retention: it moved OUT of the armed
+   `runRetentionSweep` onto its own always-on arm — upstream runs it
+   unconditionally inside every nightly `Cleanup`
+   (`cleanup.go:34-47,144-165`). (d) Upstream claims a task inside ONE
+   transaction (`claimJobForRunner`'s `db.WithTx`, `task.go:341-414`); the
+   insert-then-CAS adaptation can strand an orphan RUNNING task whose job
+   is still waiting (wedging an ephemeral runner on the one-task-per-
+   lifetime check). D1 batches cannot roll back a sibling statement
+   conditionally, so the compensating finalizer keys upstream's own
+   terminalization on the job: a terminal `StopTask` finalizes every other
+   live task row of the same job with the job's stop status, and the
+   terminal arm carries the model-hook piggybacks upstream's StopTask path
+   fires — the `UpdateRunJob` version wake (`run_job.go:511-530`), the
+   `UpdateTask` ephemeral removal (`task.go:452-464`), and, for the sweep
+   callers that pass the storage env, the `clear_tasks.go:177-187` log
+   transfer (upstream's cancel path, `run_job.go:818-829`, transfers no
+   logs — the env param mirrors that split).
 
 ## 5. Edge cases, limits, and failure modes
 

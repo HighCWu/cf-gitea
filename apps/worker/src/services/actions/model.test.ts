@@ -253,6 +253,14 @@ describe("status → result mapping", () => {
     expect(statusToResult(6)).toBe(0); // running
     expect(statusToResult(0)).toBe(0);
   });
+
+  it("maps CANCELLING to CANCELLED (AsResult, status.go:109) — the UpdateTask echo during cleanup", () => {
+    // While a cancelled job is in its post-cancel cleanup phase the task
+    // holds CANCELLING; upstream's UpdateTask response spells it
+    // task.Status.AsResult() (runner.go:278-284) = RESULT_CANCELLED, and
+    // `needs`-result consumers read the same mapping.
+    expect(statusToResult(8)).toBe(3);
+  });
 });
 
 describe("display helpers", () => {

@@ -29,8 +29,12 @@
  *   - run arm: CleanupOldRuns (@midnight cleanup_action_runs,
  *     cron/tasks_actions.go:77-87) skips on `<= 0` — runs only when
  *     ACTIONS_RUN_RETENTION_DAYS armed, with the parsed days.
- *   - ephemeral runners: always the final step of upstream's Cleanup
- *     (cleanup.go:36) — ride every armed retention message.
+ *   - ephemeral runners: NOT here anymore — upstream runs
+ *     CleanupEphemeralRunners unconditionally inside every nightly Cleanup
+ *     (cleanup.go:36), which is hygiene rather than retention, so the pass
+ *     moved to the always-on probe-gated sweep arm (sweeps.ts,
+ *     `{kind: "actions-ephemeral-cleanup"}`) and no longer rides the armed
+ *     retention messages.
  *
  * The zombie arm is NOT retention: StopZombieTasks is upstream's own
  * always-on `stop_zombie_tasks` cron (@every 5m, RunAtStart, enabled default
@@ -70,7 +74,7 @@ import {
   setArtifactExpired,
 } from "./artifacts";
 import { removeLogs } from "./logs";
-import { ACTION_STATUS_CANCELLED, ACTION_STATUS_FAILURE, ACTION_STATUS_SKIPPED, ACTION_STATUS_SUCCESS, isLiveTaskStatus } from "./model";
+import { ACTION_STATUS_CANCELLED, ACTION_STATUS_CANCELLING, ACTION_STATUS_FAILURE, ACTION_STATUS_SKIPPED, ACTION_STATUS_SUCCESS, isLiveTaskStatus } from "./model";
 import { findOldTasksToExpire, stopTask } from "./update";
 
 export interface RetentionOptions {
@@ -91,16 +95,19 @@ export const RETENTION_DEFAULTS: RetentionOptions = {
 };
 
 /**
- * Cleanup (cleanup.go:34-47): artifacts → logs → ephemeral runners. The
- * REQUIRED triple (no Partial-with-defaults merge — omitting an arm must be a
- * compile error, not a silent 90/365/400 deletion): `0` = the arm stays off
- * (upstream's `<= 0` unlimited polarity for the log arm; the artifact and
- * ephemeral arms always run within an armed message — see the header).
+ * Cleanup's retention arms (cleanup.go:34-47 MINUS CleanupEphemeralRunners,
+ * which is NOT retention and moved to the always-on sweeps module — see
+ * sweeps.ts; upstream runs the ephemeral pass unconditionally inside every
+ * nightly Cleanup, so ours runs probe-gated on its own message kind instead
+ * of only when a retention var armed the producer). The REQUIRED triple (no
+ * Partial-with-defaults merge — omitting an arm must be a compile error, not
+ * a silent 90/365/400 deletion): `0` = the arm stays off (upstream's `<= 0`
+ * unlimited polarity for the log arm; the artifact arm always runs within an
+ * armed message — see the header).
  */
 export async function runRetentionSweep(env: Env, opts: RetentionOptions): Promise<void> {
   await cleanupArtifacts(env);
   await cleanupExpiredLogs(env, opts.logRetentionDays);
-  await cleanupEphemeralRunners(env.DB);
 }
 
 /**
@@ -196,16 +203,25 @@ export async function cleanupEphemeralRunners(d1: D1Database): Promise<void> {
 export const ZOMBIE_TASK_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
- * StopZombieTasks (§5.6's consumer arm): running tasks whose `updated` went
- * quiet past the zombie timeout stop as FAILURE — upstream's zombie sweep
- * ("it will update ActionTask.Updated to avoid the task being judged as a
- * zombie task", the other side of UpdateTaskByState's touch).
+ * StopZombieTasks → stopTasks (§5.6's consumer arm; clear_tasks.go:26-30 +
+ * 151-193): running/cancelling tasks whose `updated` went quiet past the
+ * zombie timeout stop, with the stop status picked PER TASK — FAILURE for a
+ * stalled RUNNING task, CANCELLED for a stalled CANCELLING one
+ * (clear_tasks.go:160-163: `stopStatus = StatusFailure; if task.Status ==
+ * StatusCancelling { stopStatus = StatusCancelled }`). The user intent of a
+ * cancelled job whose runner died mid-cleanup must not record as a failure
+ * (which would propagate through AggregateJobStatus's hasFailure arm onto
+ * the run). When `env` is supplied the sweep also transfers each dead
+ * task's logs (clear_tasks.go:177-187 — the piggyback rides stopTask).
  */
-export async function stopZombieTasks(d1: D1Database, zombieTimeoutMs = ZOMBIE_TASK_TIMEOUT_MS): Promise<number> {
+export async function stopZombieTasks(
+  d1: D1Database,
+  options: { timeoutMs?: number; env?: Env } = {},
+): Promise<number> {
   const db = drizzle(d1);
-  const cutoff = new Date(Date.now() - zombieTimeoutMs);
+  const cutoff = new Date(Date.now() - (options.timeoutMs ?? ZOMBIE_TASK_TIMEOUT_MS));
   const stale = await db
-    .select({ id: actionTasks.id })
+    .select({ id: actionTasks.id, status: actionTasks.status })
     .from(actionTasks)
     .where(
       and(
@@ -215,11 +231,12 @@ export async function stopZombieTasks(d1: D1Database, zombieTimeoutMs = ZOMBIE_T
     );
   let stopped = 0;
   for (const task of stale) {
+    const stopStatus = task.status === ACTION_STATUS_CANCELLING ? ACTION_STATUS_CANCELLED : ACTION_STATUS_FAILURE;
     try {
-      await stopTask(d1, task.id, ACTION_STATUS_FAILURE);
+      await stopTask(d1, task.id, stopStatus, options.env);
       stopped += 1;
     } catch {
-      // the sweep never fails on one task
+      // the sweep never fails on one task (stopTasks' log.Warn + continue)
     }
   }
   return stopped;

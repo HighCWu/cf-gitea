@@ -2,7 +2,9 @@
  * The dispatch service suite (SPEC-0012 §2.2/§6.3, M1a): the pick limiter's
  * throttled answer (the stale-version echo, deterministic at the service
  * layer), the fork-PR secret suppression, the payload-assembly release path,
- * needs resolution, and the insert seam's version bump.
+ * needs resolution, and the insert seam's version bump — plus the
+ * claim-window battery: a terminal stopTask finalizes the job's stranded
+ * (crash-orphaned) tasks and carries the upstream StopTask piggybacks.
  */
 
 import { applyD1Migrations } from "cloudflare:test";
@@ -12,7 +14,9 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
 import {
+  actionLogChunks,
   actionRunJobs,
+  actionRunners,
   actionTasks,
   actionTasksVersions,
   repositories,
@@ -27,6 +31,7 @@ import {
   newRunnerTokenWithValue,
 } from "./model";
 import { fetchTask, tryPickTask } from "./dispatch";
+import { stopTask } from "./update";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -406,5 +411,125 @@ describe("the registration-token mint (the harness's token source)", () => {
       hasCancellingSupport: false,
     });
     expect(runner.id).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The claim-window orphan (SPEC §2.3's insert-then-CAS window) — upstream
+// claims inside ONE transaction (claimJobForRunner's db.WithTx, task.go:341-
+// 414) so a crash strands nothing; ours can strand an orphan RUNNING task
+// whose job is still waiting, wedging an ephemeral runner on pickTask's
+// one-task-per-lifetime check forever. The terminal stopTask finalizes the
+// stranded tasks of the job (finalizeStrandedTasksOfJob) and carries the
+// upstream StopTask piggybacks (the run_job.go:511-530 version wake, the
+// task.go:452-464 ephemeral removal, and — with the storage env — the
+// clear_tasks.go:177-187 log transfer).
+// ---------------------------------------------------------------------------
+describe("the claim window: a terminal stopTask finalizes the job's stranded tasks", () => {
+  async function seedOrphanScenario(): Promise<{ taskId: number; orphanTaskId: number; ephemeralRunnerId: number; jobVersionBefore: number }> {
+    const seedInfo = await seed();
+    const job = (await db().select().from(actionRunJobs).where(eq(actionRunJobs.jobId, "build")))[0];
+    if (job === undefined) throw new Error("build job missing");
+
+    // The crash-window state: the task row exists (inserted), the job CAS
+    // never landed — the job is still waiting with task_id = 0, and an
+    // EPHEMERAL runner holds the orphan (the wedged-runner shape).
+    const ephemeral = await createRunner(env.DB, {
+      uuid: crypto.randomUUID(),
+      name: "ephemeral",
+      version: "v1",
+      ownerId: 0,
+      repoId: seedInfo.repoId,
+      agentLabels: ["ubuntu-latest"],
+      ephemeral: true,
+      hasCancellingSupport: false,
+    });
+    const orphanRows = await db()
+      .insert(actionTasks)
+      .values({
+        jobId: job.id,
+        attempt: 1,
+        runnerId: ephemeral.id,
+        status: 6, // RUNNING — the live status that wedges pickTask
+        started: new Date(),
+        repoId: seedInfo.repoId,
+        ownerId: seedInfo.ownerId,
+        tokenHash: `orphan-${crypto.randomUUID()}`,
+        created: new Date(),
+        updated: new Date(),
+      })
+      .returning({ id: actionTasks.id });
+    const orphanTaskId = orphanRows[0]?.id;
+    if (orphanTaskId === undefined) throw new Error("orphan seed failed");
+
+    // A second runner claims the (still waiting) job; a third job keeps
+    // waiting work in the repo so the version-wake arm has work to wake.
+    const claimant = await createRunner(env.DB, {
+      uuid: crypto.randomUUID(),
+      name: "claimant",
+      version: "v1",
+      ownerId: 0,
+      repoId: seedInfo.repoId,
+      agentLabels: ["ubuntu-latest"],
+      ephemeral: false,
+      hasCancellingSupport: false,
+    });
+    const response = await fetchTask(env, env.DB, claimant, 0, "");
+    const task = requireTask(response.task);
+    await db().insert(actionRunJobs).values({
+      runId: job.runId,
+      repoId: seedInfo.repoId,
+      ownerId: seedInfo.ownerId,
+      jobId: "deploy",
+      attempt: 1,
+      workflowPayload: PAYLOAD,
+      runsOn: JSON.stringify(["nobody-serves-this"]),
+      status: 5, // waiting
+      created: new Date(),
+      updated: new Date(),
+    });
+    const jobVersionBefore =
+      (await db().select().from(actionTasksVersions).where(eq(actionTasksVersions.repoId, seedInfo.repoId)))[0]?.version ?? 0;
+    return { taskId: task.id, orphanTaskId, ephemeralRunnerId: ephemeral.id, jobVersionBefore };
+  }
+
+  it("the stranded RUNNING task goes terminal with the job and its ephemeral runner is freed", async () => {
+    const { taskId, orphanTaskId, ephemeralRunnerId, jobVersionBefore } = await seedOrphanScenario();
+
+    await stopTask(env.DB, taskId, 1 /* SUCCESS */, env);
+
+    // The orphan finalized with the job's stop status — the invariant
+    // upstream's transactional claim guarantees.
+    const orphan = (await db().select().from(actionTasks).where(eq(actionTasks.id, orphanTaskId)))[0];
+    expect(orphan?.status).toBe(1); // SUCCESS
+    expect(orphan?.stopped).not.toBeNull();
+    // The ephemeral runner holding the orphan is auto-deleted (the
+    // UpdateTask hook fires per task row upstream) — pickTask's
+    // one-task-per-lifetime wedge is gone.
+    expect(await db().select().from(actionRunners).where(eq(actionRunners.id, ephemeralRunnerId))).toHaveLength(0);
+    // The version-wake piggyback fired (waiting `deploy` remains).
+    const jobVersionAfter =
+      (await db().select().from(actionTasksVersions).where(eq(actionTasksVersions.repoId, "repo-disp")))[0]?.version ?? 0;
+    expect(jobVersionAfter).toBeGreaterThan(jobVersionBefore);
+  });
+
+  it("the stopped task's hot log seals to R2 (the sweep piggyback, clear_tasks.go:177-187)", async () => {
+    const { taskId } = await seedOrphanScenario();
+    await stopTask(env.DB, taskId, 1, env);
+    const task = (await db().select().from(actionTasks).where(eq(actionTasks.id, taskId)))[0];
+    expect(task?.logInStorage).toBe(true);
+    expect(await db().select().from(actionLogChunks).where(eq(actionLogChunks.taskId, taskId))).toHaveLength(0);
+  });
+
+  it("no waiting work left → no version bump (the hasWaitingJobsToPick gate)", async () => {
+    const seedInfo = await seed();
+    const response = await fetchTask(env, env.DB, seedInfo.runner, 0, "");
+    const task = requireTask(response.task);
+    const jobVersionBefore =
+      (await db().select().from(actionTasksVersions).where(eq(actionTasksVersions.repoId, seedInfo.repoId)))[0]?.version ?? 0;
+    await stopTask(env.DB, task.id, 1, env);
+    const jobVersionAfter =
+      (await db().select().from(actionTasksVersions).where(eq(actionTasksVersions.repoId, seedInfo.repoId)))[0]?.version ?? 0;
+    expect(jobVersionAfter).toBe(jobVersionBefore);
   });
 });

@@ -58,6 +58,11 @@ import { drizzle } from "drizzle-orm/d1";
 import { repositories, users } from "../db/schema";
 import { enqueueDueAuditRetention } from "./audit";
 import { enqueueDueActionsRetention, enqueueDueZombieStops } from "./actions/retention";
+import {
+  enqueueDueAbandonedJobCancels,
+  enqueueDueEndlessTaskStops,
+  enqueueDueEphemeralCleanup,
+} from "./actions/sweeps";
 import { enqueueDuePackagesCleanup } from "./packages/cleanup";
 import { enqueueDueMirrorSyncs } from "./mirror/sync";
 import { enqueueDuePushMirrorSyncs } from "./mirror/push-sync";
@@ -327,6 +332,27 @@ export async function handleScheduledCron(controller: ScheduledController, env: 
       );
     }
     // --- END actions-retention producer block ------------------------------
+    // --- BEGIN actions-abandoned + ephemeral producer block (SPEC-0012
+    // --- §4.5, the parity review §5; the SIXTH sanctioned extension) -------
+    // Upstream's cancel_abandoned_jobs (@every 6h) and the ephemeral half
+    // of Cleanup (@midnight) — both RunAtStart, enabled default, no
+    // retention knob (cron/tasks_actions.go:46-55, cleanup.go:144-165).
+    // They ride the HOURLY entry: both are idempotent "older than X" /
+    // state-based passes whose hourly granularity only changes kill
+    // latency, not behavior (the module header's ratified divergence).
+    // The ephemeral producer is deliberately UNGATED from the retention
+    // arming above (parity review item 3c: upstream runs it inside every
+    // nightly Cleanup unconditionally) — it deletes only ephemeral runner
+    // rows whose task set holds no live status, never user data.
+    try {
+      await enqueueDueAbandonedJobCancels(env, {});
+      await enqueueDueEphemeralCleanup(env);
+    } catch (error) {
+      console.error(
+        `[actions-sweeps] producer probes failed (retrying next tick): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    // --- END actions-abandoned + ephemeral producer block -------------------
     return;
   }
   // The mirror producers, exactly as today (index.ts scheduled) — the
@@ -353,4 +379,20 @@ export async function handleScheduledCron(controller: ScheduledController, env: 
     );
   }
   // --- END actions-zombie producer block ----------------------------------
+  // --- BEGIN actions-endless producer block (SPEC-0012 §4.5, the parity
+  // --- review §5; the FIFTH sanctioned extension) --------------------------
+  // Upstream's stop_endless_tasks: @every 30m, RunAtStart, enabled default,
+  // no retention knob (cron/tasks_actions.go:38-45). The step entry (10m)
+  // is the standing cadence closest to it — same placement logic as the
+  // zombie block above, and the same stop-family budget discipline applies
+  // (an indexed LIMIT-1 probe, zero sends on a quiet instance). Not
+  // var-gated (upstream's arm never was); deletes no user data.
+  try {
+    await enqueueDueEndlessTaskStops(env, {});
+  } catch (error) {
+    console.error(
+      `[actions-endless] producer probe failed (retrying next tick): ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  // --- END actions-endless producer block ----------------------------------
 }

@@ -12,10 +12,15 @@
  * the attempt+run aggregate recompute (refreshRunStatus, the M1b substitute
  * for the emitter's run-status leg), the tasks_version wake bumps (run_job.go
  * 504-527), and the ephemeral-runner removal (UpdateTask's IsDone arm).
+ * StopTask's terminal arm carries the same hook family on its path (the
+ * UpdateRunJob version bump, the UpdateTask ephemeral removal, and — for the
+ * sweep callers that pass the storage env — the clear_tasks.go log transfer),
+ * plus the stranded-claim finalizer for the claim window the transactional
+ * upstream claim cannot have (see finalizeStrandedTasksOfJob).
  * M3 replaces the aggregate arm with EmitJobsIfReadyByRun.
  */
 
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import {
@@ -40,6 +45,7 @@ import {
   ACTION_STATUS_WAITING,
   ellipsisDisplayString,
   increaseTaskVersion,
+  isLiveTaskStatus,
   RUNNERV1_RESULT,
   statusToResult,
 } from "./model";
@@ -200,8 +206,10 @@ export async function refreshRunStatus(d1: D1, repoId: string, runId: number, ru
   await db.update(actionRuns).set({ status: runStatus, started, stopped, updated: now }).where(eq(actionRuns.id, run.id));
 }
 
-/** hasWaitingJobsToPick (run_job.go) — only bump when waiting work remains. */
-async function hasWaitingJobsToPick(d1: D1, repoId: string): Promise<boolean> {
+/** hasWaitingJobsToPick (run_job.go:449-455) — only bump when waiting work
+ *  remains. Exported for the sweeps' cancel/stop arms, whose job-status
+ *  writes carry the same UpdateRunJob hook upstream. */
+export async function hasWaitingJobsToPick(d1: D1, repoId: string): Promise<boolean> {
   const db = drizzle(d1);
   const rows = await db
     .select({ id: actionRunJobs.id })
@@ -606,11 +614,90 @@ export async function updateTask(d1: D1, runnerId: number, req: UpdateTaskReques
 const TASK_REPORT_TIMEOUT_MS = 60 * 1000;
 
 /**
+ * The stopTasks sweep's log transfer (clear_tasks.go:177-187): seal the dead
+ * task's hot chunk rows into the R2 object, THEN flip log_in_storage and
+ * drop the rows (the object is durable first — the updateLog seal's
+ * ordering). Upstream's sweep transfers a stopped task's logs regardless of
+ * any retention setting, and a transfer failure is warn-and-continue there
+ * ("Cannot transfer logs of task %v") — callers swallow the throw the same
+ * way. The runner-driven twin is updateLog's NoMore seal; this is the
+ * sweep-driven one (the runner never said NoMore — it is gone).
+ */
+export async function archiveStoppedTaskLogs(
+  env: Env,
+  task: Pick<TaskRow, "id" | "logInStorage" | "logFilename">,
+): Promise<void> {
+  if (task.logInStorage || task.logFilename === "") {
+    return; // already sealed, or the claim crashed before the filename landed
+  }
+  await sealLogsToStorage(env, task.id, task.logFilename);
+  await drizzle(env.DB).batch([
+    drizzle(env.DB)
+      .update(actionTasks)
+      .set({ logInStorage: true, updated: new Date() })
+      .where(eq(actionTasks.id, task.id)),
+    drizzle(env.DB).delete(actionLogChunks).where(eq(actionLogChunks.taskId, task.id)),
+  ]);
+}
+
+/**
+ * The stranded-claim finalizer. Upstream claims inside ONE transaction
+ * (claimJobForRunner's db.WithTx, models/actions/task.go:341-414 — task
+ * insert, log filename, steps, conditional job update all commit or
+ * nothing), so a crash mid-claim leaves nothing behind. Ours inserts the
+ * task row and only then CASes the job (the documented M1a window), so a
+ * crash or isolate eviction between the two strands an orphan RUNNING task
+ * whose job is still waiting — and an ephemeral runner holding the orphan
+ * then fails pickTask's one-task-per-lifetime check forever. Upstream's
+ * closest mechanism is the zombie sweep's terminalization of untouched
+ * RUNNING tasks; this finalizer keys the same terminalization on the job:
+ * when a terminal stop lands for the job, every other LIVE task row of that
+ * job is finalized with the job's stop status — the task-terminal-with-job
+ * invariant the transaction guarantees upstream — its steps stop, its hot
+ * logs archive when storage is supplied, and its ephemeral runner is
+ * auto-deleted (upstream's UpdateTask hook, task.go:452-464, fires per task
+ * row).
+ */
+async function finalizeStrandedTasksOfJob(d1: D1, task: TaskRow, effective: number, now: Date, env?: Env): Promise<void> {
+  const db = drizzle(d1);
+  const stranded = await db
+    .select()
+    .from(actionTasks)
+    .where(and(eq(actionTasks.jobId, task.jobId), ne(actionTasks.id, task.id)));
+  for (const orphan of stranded) {
+    if (!isLiveTaskStatus(orphan.status)) {
+      continue;
+    }
+    await db
+      .update(actionTasks)
+      .set({ status: effective, stopped: now, updated: now })
+      .where(eq(actionTasks.id, orphan.id));
+    const orphanSteps = await getTaskSteps(d1, orphan.id);
+    for (const step of orphanSteps) {
+      stopStep(step, effective, now);
+      await persistStep(d1, step);
+    }
+    await deleteEphemeralRunner(d1, orphan.runnerId);
+    if (env !== undefined) {
+      await archiveStoppedTaskLogs(env, orphan).catch(() => {});
+    }
+  }
+}
+
+/**
  * StopTask (task.go:568-632): force-finish a task. The cancelling arm
  * negotiates (runner capability + report freshness) unless the runner is
- * gone; the terminal arm stops the task, job, and its steps outright.
+ * gone; the terminal arm stops the task, job, and its steps outright and
+ * carries the three piggybacks upstream's model hooks hang on that path:
+ * the tasks_version wake when waiting siblings remain (StopTask →
+ * UpdateRunJob → run_job.go:511-530), the ephemeral-runner auto-delete
+ * (StopTask → UpdateTask → task.go:452-464), and — when the caller supplies
+ * the storage env, as the sweeps do — the dead task's log transfer
+ * (clear_tasks.go:177-187). `env` is optional because upstream's other
+ * StopTask callers (cancelOneJob, run_job.go:818-829) do NOT transfer logs;
+ * only the sweeps do.
  */
-export async function stopTask(d1: D1, taskId: number, status: number): Promise<void> {
+export async function stopTask(d1: D1, taskId: number, status: number, env?: Env): Promise<void> {
   if (!isDoneStatus(status) && status !== ACTION_STATUS_CANCELLING) {
     throw new Error(`cannot stop task with status ${status}`);
   }
@@ -664,10 +751,28 @@ export async function stopTask(d1: D1, taskId: number, status: number): Promise<
     await persistStep(d1, step);
   }
 
+  // The stranded orphans first (they share the job; the aggregate below
+  // reads job rows, which are already terminal).
+  await finalizeStrandedTasksOfJob(d1, task, effective, now, env);
+
   const jobRows = await db.select().from(actionRunJobs).where(eq(actionRunJobs.id, task.jobId)).limit(1);
   const job = jobRows[0];
   if (job !== undefined) {
+    // Piggyback (run_job.go:511-530): the job's terminal status leaves
+    // waiting siblings pickable — bump so idle runners whose tasksVersion
+    // equals latestVersion re-poll; only when waiting work remains.
+    if (await hasWaitingJobsToPick(d1, job.repoId)) {
+      await increaseTaskVersion(d1, job.ownerId, job.repoId);
+    }
     await refreshRunStatus(d1, job.repoId, job.runId, job.runAttemptId);
+  }
+
+  // Piggyback (task.go:452-464): the task flipped done, so an ephemeral
+  // runner's lifetime ends with it.
+  await deleteEphemeralRunner(d1, task.runnerId);
+
+  if (env !== undefined) {
+    await archiveStoppedTaskLogs(env, task).catch(() => {});
   }
 }
 

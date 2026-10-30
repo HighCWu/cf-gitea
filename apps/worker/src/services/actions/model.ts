@@ -60,9 +60,13 @@ export const RUNNERV1_RESULT = {
 } as const;
 
 /**
- * Terminal-status → runnerv1.Result (Status.ToRunnerv1Result,
- * status.go:27-42): only the four terminal statuses map; everything else
- * (waiting/running/blocked/…) is RESULT_UNSPECIFIED.
+ * Terminal-status → runnerv1.Result (Status.AsResult, status.go:103-116):
+ * the four terminal statuses map, and CANCELLING maps to RESULT_CANCELLED
+ * alongside CANCELLED — a task in its post-cancel cleanup phase reports
+ * "you were cancelled" on the UpdateTask echo (runner.go:278-284 spells the
+ * response as task.Status.AsResult()) and to `needs`-result consumers
+ * through the same mapping. Everything else (waiting/running/blocked/…) is
+ * RESULT_UNSPECIFIED.
  */
 export function statusToResult(status: number): number {
   switch (status) {
@@ -71,6 +75,7 @@ export function statusToResult(status: number): number {
     case ACTION_STATUS_FAILURE:
       return RUNNERV1_RESULT.FAILURE;
     case ACTION_STATUS_CANCELLED:
+    case ACTION_STATUS_CANCELLING:
       return RUNNERV1_RESULT.CANCELLED;
     case ACTION_STATUS_SKIPPED:
       return RUNNERV1_RESULT.SKIPPED;

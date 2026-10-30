@@ -60,6 +60,14 @@ import {
   runActionsRetention,
   stopZombieTasks,
 } from "../services/actions/retention";
+import {
+  cancelAbandonedJobs,
+  cleanupEphemeralRunners,
+  isActionsAbandonedCancelMessage,
+  isActionsEndlessStopMessage,
+  isActionsEphemeralCleanupMessage,
+  stopEndlessTasks,
+} from "../services/actions/sweeps";
 import { handlePackagesCleanup, isPackageCleanupMessage } from "../services/packages/cleanup";
 import { DEMO_RETENTION_HOURS, isDemoSweepMessage } from "../services/demo-sweep";
 import { handleMirrorSync, isMirrorSyncMessage } from "../services/mirror/sync";
@@ -322,6 +330,47 @@ export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): P
         message.ack();
       } catch (error) {
         console.error(`[repo-tasks] actions-zombie ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
+        message.retry();
+      }
+      continue;
+    }
+    // The actions sweeps (SPEC-0012 §4.5, the parity review §5 — the
+    // always-on arms the retention family never covered): endless stops,
+    // abandoned-job cancels, ephemeral-runner cleanup. Same typed-arm
+    // placement and idempotence posture as the zombie arm (a stopped task
+    // no longer matches the sweep's predicate; the ephemeral delete's
+    // keep-set join re-evaluates per redelivery).
+    if (isActionsEndlessStopMessage(message.body)) {
+      try {
+        const stopped = await stopEndlessTasks(env.DB, { env });
+        console.log(`[repo-tasks] actions-endless ${message.id}: stopped ${stopped}`);
+        message.ack();
+      } catch (error) {
+        console.error(`[repo-tasks] actions-endless ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
+        message.retry();
+      }
+      continue;
+    }
+    if (isActionsAbandonedCancelMessage(message.body)) {
+      try {
+        const cancelled = await cancelAbandonedJobs(env.DB);
+        console.log(`[repo-tasks] actions-abandoned ${message.id}: cancelled ${cancelled}`);
+        message.ack();
+      } catch (error) {
+        console.error(`[repo-tasks] actions-abandoned ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
+        message.retry();
+      }
+      continue;
+    }
+    if (isActionsEphemeralCleanupMessage(message.body)) {
+      try {
+        await cleanupEphemeralRunners(env.DB);
+        console.log(`[repo-tasks] actions-ephemeral-cleanup ${message.id}: done`);
+        message.ack();
+      } catch (error) {
+        console.error(
+          `[repo-tasks] actions-ephemeral-cleanup ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`,
+        );
         message.retry();
       }
       continue;
