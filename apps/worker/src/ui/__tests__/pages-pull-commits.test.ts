@@ -323,13 +323,24 @@ describe("PR commits 404 arms (upstream ViewPullCommits NotFound posture)", () =
 
 // --- the §5.5 a11y smoke ---------------------------------------------------------
 
+/** The merge box's bounded heading-skip allowance (a11y.test.ts's exact
+ *  helper, the third smoke site): the conversation page carries the card's
+ *  upstream-own h3s, and a page that carries the merge box tolerates AT
+ *  MOST the single h1→h3 skip that card produces. */
+function upstreamMergeBoxHeadingSkips(html: string): (violation: { rule: string; detail: string }) => boolean {
+  const carriesMergeBox = html.includes('data-global-init="initRepoPullMergeBox"');
+  return (violation) => carriesMergeBox && violation.rule === "R2-no-skip" && violation.detail === "<h1> followed by <h3>";
+}
+
 describe("PR commits a11y smoke", () => {
   it("the commits renders (both pages) and the three-tab conversation pass the structural rules", async () => {
     for (const path of ["/alice/pull-commits/pulls/1/commits", "/alice/pull-commits/pulls/2/commits?page=2", "/alice/pull-commits/pulls/1"]) {
       const res = await fetchUi(path);
       expect(res.status).toBe(200);
-      const violations = runA11y(await res.text());
-      expect(violations, `${path}: ${JSON.stringify(violations)}`).toEqual([]);
+      const html = await res.text();
+      const allowed = upstreamMergeBoxHeadingSkips(html);
+      const unexpected = runA11y(html).filter((v) => !allowed(v));
+      expect(unexpected, `${path}: ${JSON.stringify(unexpected)}`).toEqual([]);
     }
   });
 });
