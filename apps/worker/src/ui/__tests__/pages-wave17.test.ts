@@ -354,13 +354,18 @@ describe("GET /{owner}/{repo}/branches (the list)", () => {
     // + the rule name (the wave-15 badge's consumer).
     expect(html).toContain("svg octicon-shield-lock");
     expect(html).toContain('<span class="ui tiny basic label">main</span>');
-    // The list excludes the default branch and sorts by name.
+    // The list excludes the default branch and sorts by the upstream default
+    // order — `FindBranchOptions.ToOrders()`' `commit_time DESC, name ASC`
+    // (models/git/branch_list.go:89-99; the tip commit's COMMITTER time,
+    // branch.go:248). Fixture tips: feature/one @ tips[3] (T0+180) newest,
+    // docs-seed @ tips[2] (T0+120) and release/1 @ tips[2] TIED (the name
+    // tiebreak keeps docs-seed first), stale @ tips[0] (T0) oldest.
     expect(html).toContain('href="/alice/wave17br/src/branch/docs-seed"');
     expect(html).toContain('href="/alice/wave17br/src/branch/feature/one"');
     expect(html).toContain('href="/alice/wave17br/src/branch/release/1"');
     expect(html).toContain('href="/alice/wave17br/src/branch/stale"');
-    expect(html.indexOf(">docs-seed<")).toBeLessThan(html.indexOf(">feature/one<"));
-    expect(html.indexOf(">feature/one<")).toBeLessThan(html.indexOf(">release/1<"));
+    expect(html.indexOf(">feature/one<")).toBeLessThan(html.indexOf(">docs-seed<"));
+    expect(html.indexOf(">docs-seed<")).toBeLessThan(html.indexOf(">release/1<"));
     expect(html.indexOf(">release/1<")).toBeLessThan(html.indexOf(">stale<"));
     // The last-commit lines (subject + short sha + Updated stamp + author).
     expect(html).toContain("wave17: commit 4");
@@ -518,7 +523,10 @@ describe("GET /{owner}/{repo}/branches (the list)", () => {
     expect(firstHtml.split("branch-name").length - 1).toBe(21); // 20 rows + the default row's anchor class
     expect(firstHtml).toContain("page=2");
     expect(firstHtml).toContain("Older");
-    // Page 1 carries p-01..p-18 (sorted: main excluded, then the p-* names).
+    // Page 1 carries p-01..p-20 (main excluded, then the p-* names — every
+    // bulk ref shares main's tip, so the upstream order's `commit_time DESC`
+    // ties resolve through its `name ASC` stability term, the padded names'
+    // byte order).
     expect(firstHtml).toContain(">p-01<");
     expect(firstHtml).not.toContain(">p-21<");
 

@@ -261,6 +261,21 @@ export interface UserProfileData {
  * description read for the page's rows (the org-home loader's pattern), and
  * the follower/following totals (the landed follows service, count-only
  * pages — the numbers are real, the tab pages are not).
+ *
+ * The totals ARE the upstream shape, verified against the pin
+ * (webui-parity count arm): profile_big_avatar.tmpl:25 renders
+ * `.NumFollowers`/`.NumFollowing` from `prepareUserProfileTabData`'s
+ * `GetUserFollowers`/`GetUserFollowing` FindAndCount totals
+ * (routers/web/user/profile.go:118-138 over models/user/user.go:355-398 —
+ * the VISIBILITY-FILTERED listings, not the raw maintained counters), so
+ * the viewer-dependent totals and the anon-invisible private-follower
+ * edges are upstream's own behavior, and the follow-tabs sibling's
+ * identical call is the same parity. The API user payload's separate
+ * `followers_count`/`following_count` (the raw maintained counters,
+ * convert/user.go) is the api/services serializer files' surface — NOT
+ * consumed here (the web profile never reads it), not duplicated (the
+ * serializer unit owns those files; its hardcoded zeros remain its open
+ * drift, parity-review-api.md:212).
  */
 export async function loadUserProfileData(
   d1: D1Database,

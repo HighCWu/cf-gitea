@@ -147,8 +147,10 @@
  *
  * ## Reads consumed vs degraded
  *
- * - `listRefs()` — the branch universe (the API LIST's filter + sort) AND
- *   the tip map the MergeMovedOn check reads.
+ * - `listRefs()` — the branch universe AND the tip map the MergeMovedOn
+ *   check reads; `readCommit()` additionally runs for every FILTERED branch
+ *   (the sort key — the order section above), the rendered slice reusing
+ *   the pre-read commits for its info line.
  * - `readCommit(branch)` — the last-commit line per rendered row (page
  *   slice only); a failed read skips the line, never the row.
  * - `countDivergence(default, branch)` — the ahead/behind pair (SPEC-0001b
@@ -262,6 +264,29 @@ export const BRANCHES_PAGE_SIZE = 20;
 // ---------------------------------------------------------------------------
 // Data loading (§3.2 — the landed reads, never a self-fetch)
 // ---------------------------------------------------------------------------
+
+// ## The list ORDER — upstream's default `commit_time DESC, name ASC`
+//
+// The webui-parity brief asked for a sort control ("default / updated /
+// oldest / newest / completed"); NO such control exists at the pin, and the
+// upstream-parity rule (AGENTS.md) binds the page to the pin's actual
+// shape: the Branches arm reads only `q` and `page`
+// (routers/web/repo/branch.go:48-53), the template renders the search combo
+// alone (templates/repo/branch/list.tmpl:82-86), and NO caller in the pin
+// ever sets `FindBranchOptions.OrderBy` — the branch_list order is
+// `ToOrders()`' default `commit_time DESC, name ASC` for every surface that
+// lists branches (models/git/branch_list.go:89-99 — "the commit_time might
+// be the same, so add the 'name' to make sure the order is stable"). The
+// key is the tip commit's COMMITTER time (Branch.CommitTime =
+// commit.Committer.When.Unix(), models/git/branch.go:248 — the same stamp
+// the info line renders). Upstream orders its branch DB TABLE; the engine
+// keeps no branch rows, so the loader reads every filtered branch's tip
+// commit (the sort key's only source) and sorts the page universe before
+// slicing — `Array.prototype.sort` stability is irrelevant (the comparator
+// is total: unique names break every time tie). A degraded tip read sorts
+// as time 0, i.e. LAST (upstream's zero-value CommitTime arm; the
+// branches-list-aux sibling keeps its own byte-order tail as a documented
+// divergence — a name feed has no call for N tip reads).
 
 /** The PR column's LatestPullRequest summary (loadOneBranch's shape reduced
  *  to what the cell renders — the module header's PR-column section). */
@@ -392,8 +417,8 @@ export async function loadBranchesData(
 ): Promise<BranchesData> {
   const reads = engineReads(env, repo);
   const refs = await reads.listRefs();
-  // The API LIST's universe: refs/heads/ filtered, name-sorted (byte order —
-  // the API route's comparator).
+  // The ref universe: refs/heads/ filtered (byte order — the input order;
+  // the RENDER order is the tip-time sort below).
   const branchNames = (refs?.refs ?? [])
     .filter((ref) => ref.name.startsWith("refs/heads/"))
     .map((ref) => ref.name.slice("refs/heads/".length))
@@ -448,21 +473,38 @@ export async function loadBranchesData(
   const others = branchNames.filter((name) => name !== defaultBranch);
   const filtered = needle === "" ? others : others.filter((name) => name.toLowerCase().includes(needle));
 
-  // Pagination (§4.11 clamps) over the filtered list; the reads run for the
-  // rendered slice only (the page-data ENRICH_MAX budget discipline).
+  // The tip-commit read over the WHOLE filtered universe — the sort key's
+  // data (upstream orders its branch TABLE by the stored commit_time; the
+  // engine keeps no branch rows, so the tip read is the only source). The
+  // rendered slice's info line reuses these commits — no re-read.
+  const filteredTips = await Promise.all(
+    filtered.map(async (name) => ({ name, commit: await reads.readCommit(name) })),
+  );
+  // The upstream default order — `FindBranchOptions.ToOrders()` with no
+  // OrderBy set (models/git/branch_list.go:89-99, the web arm's only order):
+  // `commit_time DESC, name ASC` — "the commit_time might be the same, so
+  // add the 'name' to make sure the order is stable" (:92-93). CommitTime is
+  // the tip commit's COMMITTER time (branch.go:248); a degraded tip read
+  // sorts as time 0 (upstream's zero-value CommitTime arm), ties break on
+  // the name.
+  const ordered = filteredTips.sort(
+    (a, b) =>
+      (b.commit === null ? 0 : b.commit.committer.time) - (a.commit === null ? 0 : a.commit.committer.time) ||
+      (a.name < b.name ? -1 : a.name > b.name ? 1 : 0),
+  );
+
+  // Pagination (§4.11 clamps) over the ordered list; the per-row protection
+  // predicates + divergence walks still run for the rendered slice only.
   const page = Math.max(options.page, 1);
   const start = (page - 1) * BRANCHES_PAGE_SIZE;
-  const pageNames = filtered.slice(start, start + BRANCHES_PAGE_SIZE);
-  const more = filtered.length > start + BRANCHES_PAGE_SIZE;
+  const pageEntries = ordered.slice(start, start + BRANCHES_PAGE_SIZE);
+  const more = ordered.length > start + BRANCHES_PAGE_SIZE;
 
   const rows = await Promise.all(
-    pageNames.map(async (name): Promise<BranchRowView> => {
-      const extras = await rowExtras(db, rules, access, name, false);
-      const [commit, divergence] = await Promise.all([
-        reads.readCommit(name),
-        readDivergence(reads, defaultBranch, name),
-      ]);
-      return { name, commit, divergence, latestPr: latestPrByBranch.get(name) ?? null, ...extras };
+    pageEntries.map(async (entry): Promise<BranchRowView> => {
+      const extras = await rowExtras(db, rules, access, entry.name, false);
+      const divergence = await readDivergence(reads, defaultBranch, entry.name);
+      return { name: entry.name, commit: entry.commit, divergence, latestPr: latestPrByBranch.get(entry.name) ?? null, ...extras };
     }),
   );
 

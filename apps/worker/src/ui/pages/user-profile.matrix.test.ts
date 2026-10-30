@@ -29,7 +29,13 @@
  *     a site admin),
  *   - and the owner-home family's claim pin (parse ↔ registration: the
  *     reserved/excluded/suffix refusals, the feed-suffix claims, the
- *     two-segment never-profile shape).
+ *     two-segment never-profile shape),
+ *   - the webui-parity COUNT arms: the avatar-card follower/following
+ *     totals rendered from REAL follows rows (the seeded upgal→uppal public
+ *     edge anon-visible on /uppal and /upgal; the contrasting
+ *     private-follower edge staying out of anon's total while the site
+ *     admin counts it — upstream's count IS the visibility-filtered
+ *     listing's count, profile.go:118-138 + models/user/user.go:355-398).
  *
  * Fixture posture: wave 7's idempotent ensure-once seeding (its block owns
  * its own users; this file adds a disjoint `up*` family) with sessions
@@ -145,6 +151,13 @@ async function ensureFixtures(): Promise<void> {
   const priv = (await db.select().from(users).where(eq(users.usernameLower, "uppriv")).get())!;
   const pal = (await db.select().from(users).where(eq(users.usernameLower, "uppal")).get())!;
   await followUser(env.DB, priv.id, pal.id); // uppriv follows uppal
+  // The PUBLIC follow edge (the webui-parity count arm): upgal follows
+  // uppal — an ANON-visible followers count on /uppal (both rows public, so
+  // the visibility-filtered total shows it — profile.go:118-129's
+  // GetUserFollowers renders its FindAndCount into .NumFollowers) and the
+  // mirror following count on /upgal; the uppriv edge above is the
+  // contrasting PRIVATE-follower arm (invisible to anon's counts).
+  await followUser(env.DB, gal.id, pal.id);
   await service.create({ owner: { id: priv.id, usernameLower: "uppriv" }, name: "upexposed", isPrivate: false, status: "ready" });
   await service.create({ owner: { id: priv.id, usernameLower: "uppriv" }, name: "upstash", isPrivate: true, status: "ready" });
 
@@ -487,6 +500,45 @@ describe("the sub-tab content through the route (real relations)", () => {
     const empty = await get("/uppriv?tab=watching", "uppal");
     expect(empty.status).toBe(200);
     expect(await empty.text()).toContain("<div>No matching results found.</div>");
+  });
+});
+
+// --- the avatar-card follow counts (the webui-parity arm — real follows
+// rows, anon-visible) --------------------------------------------------------
+
+describe("the avatar-card follow counts (real follows rows, anon-visible)", () => {
+  it("counts from the seeded public edge: anon sees /uppal 1 followers and /upgal 1 following", async () => {
+    // upstream renders profile_big_avatar.tmpl:25's counts from
+    // profile.go:118-138 — GetUserFollowers/GetUserFollowing's FindAndCount
+    // totals (models/user/user.go:355-398, the visibility-FILTERED
+    // listings — NOT the raw maintained counters) — the landed loader's
+    // listFollowers/listFollowing .total is that same query over the
+    // follows table. The upgal→uppal edge is all-public, so anonymous sees
+    // both counts on the repositories view.
+    const followers = await get("/uppal");
+    expect(followers.status).toBe(200);
+    const followersHtml = await followers.text();
+    expect(followersHtml).toContain('href="/uppal?tab=followers"');
+    expect(followersHtml).toContain("1 followers</a>");
+    const gal = await get("/upgal");
+    expect(gal.status).toBe(200);
+    const galHtml = await gal.text();
+    expect(galHtml).toContain('href="/upgal?tab=following"');
+    expect(galHtml).toContain("1 following</a>");
+  });
+
+  it("the private follower stays out of anon's count and in the admin's (the filter IS the count)", async () => {
+    // The uppriv→uppal edge exists, but uppriv is PRIVATE: anon's followers
+    // total counts only the public edge (user.go:1466-1501's
+    // isUserVisibleToViewerCond — upstream's count IS the filtered listing's
+    // count, never the raw row count), while the site admin's unfiltered
+    // view counts both edges.
+    const anon = await get("/uppal");
+    const anonHtml = await anon.text();
+    expect(anonHtml).toContain("1 followers</a>");
+    expect(anonHtml).not.toContain("2 followers</a>");
+    const admin = await get("/uppal", "upadmin");
+    expect(await admin.text()).toContain("2 followers</a>");
   });
 });
 

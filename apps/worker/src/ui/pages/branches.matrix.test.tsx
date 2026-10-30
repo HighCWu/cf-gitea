@@ -83,6 +83,13 @@
  *     get their explicit absence arm — documented never-pinned before; the
  *     absence is permanent while no archive endpoint or feed surface exists
  *     to target (the module header's dead-link reduction).
+ *   - the webui-parity ORDER arms over a dedicated `w100sort` fixture: the
+ *     upstream default `commit_time DESC, name ASC` (models/git/
+ *     branch_list.go:89-99 — no sort control exists at the pin, the brief's
+ *     "sort select" premise corrected, pages/branches.tsx's order section):
+ *     time-dominance over byte order at both ends, the tied-pair name
+ *     tiebreak, the unchanged default arm, and the q filter composing with
+ *     the order (pages-wave17's order pins flipped to the same semantics).
  */
 
 import { createExecutionContext, env, SELF, waitOnExecutionContext } from "cloudflare:test";
@@ -350,6 +357,29 @@ async function ensureFixtures(): Promise<void> {
     { defaultBranch: "main" },
   );
 
+  // The ORDER repo (the webui-parity sort arm): the non-default tips are
+  // chosen so the upstream default order (commit_time DESC, name ASC —
+  // models/git/branch_list.go:89-99) is the exact REVERSE of byte order at
+  // both ends — zzz @ tips[3] (T0+180, newest, byte-LAST) renders first,
+  // aaa @ tips[0] (T0, oldest, byte-FIRST) renders last; mmm @ tips[2]
+  // (T0+120) sits between; the n-aaa/n-zzz pair is TIED at tips[1] (T0+60,
+  // the name tiebreak keeps n-aaa first) and shares main's tip so the
+  // excluded default proves nothing leaks into the sort universe.
+  await ensureRepo(
+    "w100sort",
+    [
+      { name: "main", tipIndex: MAIN_TIP },
+      { name: "zzz", tipIndex: MOVED_TIP },
+      { name: "mmm", tipIndex: AHEAD_TIP },
+      { name: "n-aaa", tipIndex: MAIN_TIP },
+      { name: "n-zzz", tipIndex: MAIN_TIP },
+      { name: "aaa", tipIndex: ROOT_TIP },
+    ],
+    tips,
+    pack,
+    { defaultBranch: "main" },
+  );
+
   // The moved-on PR over w100br's `moved` branch (the wave-17 PR-column
   // seeding shape): MERGED, and its pull head sits at MAIN's tip — it
   // exists and differs from moved's own tip, so MergeMovedOn is TRUE.
@@ -509,6 +539,72 @@ describe("w100 default-branch fallback (the first-branch arm)", () => {
     const ownerView = await get(`/${OWNER}/w100fallback/branches`, OWNER);
     expect(ownerView.status).toBe(200);
     expect(await ownerView.text()).toContain(`action="/${OWNER}/w100fallback/branches/_new/branch/aaa"`);
+  });
+});
+
+// --- the list ORDER (the webui-parity arm) -------------------------------------
+//
+// Upstream's branches page has NO sort control at the pin: the Branches arm
+// reads only `q` and `page` (routers/web/repo/branch.go:48-53), the template
+// renders the search combo alone (list.tmpl:82-86), and no pin caller ever
+// sets `FindBranchOptions.OrderBy` — `ToOrders()`' default
+// `commit_time DESC, name ASC` (models/git/branch_list.go:89-99) is the
+// ONLY order. These arms pin it (the parity brief's "sort select" premise
+// corrected — pages/branches.tsx's order section).
+
+describe("w100 list order (the upstream default commit_time DESC, name ASC)", () => {
+  it("orders the list newest-tip first with the name tiebreak — the byte order inverted at both ends", async () => {
+    const res = await get(`/${OWNER}/w100sort/branches`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // zzz (T0+180) > mmm (T0+120) > n-aaa (T0+60, TIED) > n-zzz (T0+60,
+    // TIED — the `name ASC` stability term keeps n-aaa first) > aaa (T0).
+    // Byte order would read aaa, mmm, n-aaa, n-zzz, zzz.
+    const at = (name: string): number => {
+      const index = html.indexOf(`>${name}<`);
+      expect(index, name).toBeGreaterThan(-1);
+      return index;
+    };
+    const zzz = at("zzz");
+    const mmm = at("mmm");
+    const nAaa = at("n-aaa");
+    const nZzz = at("n-zzz");
+    const aaa = at("aaa");
+    expect(zzz).toBeLessThan(mmm);
+    expect(mmm).toBeLessThan(nAaa);
+    expect(nAaa).toBeLessThan(nZzz);
+    expect(nZzz).toBeLessThan(aaa);
+  });
+
+  it("leaves the default arm unchanged: main renders its own section and never joins the sorted rows", async () => {
+    const res = await get(`/${OWNER}/w100sort/branches`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('data-testid="branches-default-branch-list"');
+    expect(html).toContain('<span class="ui basic label">Default</span>');
+    // Exactly ONE main anchor — the default section's row; the sorted list
+    // excluded it even though n-aaa/n-zzz share its tip (the sort universe
+    // is the non-default names only).
+    expect(html.split(`href="/${OWNER}/w100sort/src/branch/main"`).length - 1).toBe(1);
+  });
+
+  it("keeps the q filter composing with the order (filter first, then the time sort)", async () => {
+    // Upstream answers q + order in ONE statement (WHERE name LIKE ... ORDER
+    // BY commit_time DESC, name ASC): q=zzz matches zzz (T0+180) AND n-zzz
+    // (T0+60) — time puts zzz first although byte order would read n-zzz
+    // ("n-zzz" < "zzz") first; the mmm/n-aaa/aaa rows are the filtered half.
+    const res = await get(`/${OWNER}/w100sort/branches?q=zzz`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html.indexOf(">zzz<")).toBeGreaterThan(-1);
+    expect(html.indexOf(">n-zzz<")).toBeGreaterThan(-1);
+    expect(html.indexOf(">zzz<")).toBeLessThan(html.indexOf(">n-zzz<"));
+    expect(html).not.toContain(">mmm<");
+    expect(html).not.toContain(">n-aaa<");
+    expect(html).not.toContain(">aaa<");
+    // The default section is filter-independent (upstream's separate
+    // GetBranchExisting read — the loader's unchanged arm).
+    expect(html).toContain('data-testid="branches-default-branch-list"');
   });
 });
 
