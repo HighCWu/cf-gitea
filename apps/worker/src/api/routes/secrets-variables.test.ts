@@ -1,10 +1,12 @@
 /**
- * The actions secrets/variables/runners families (routes/secrets-variables.ts
- * — the inventory's `wave-api-secrets-variables` batch extended by P1-7's 15
- * runner-management ops) on real D1 (migration 0021's `secrets` +
- * `action_variables` + the SPEC-0012 control-plane store's `action_runners`):
- * all 38 contract ops over the standalone-mount convention (the routes ARE
- * registered in router.ts by the orchestrator after this batch).
+ * The actions secrets/variables/runners + runs/jobs-listing families
+ * (routes/secrets-variables.ts — the inventory's `wave-api-secrets-variables`
+ * batch extended by P1-7's 15 runner-management ops and P1-8's 6 runs/jobs
+ * listing ops) on real D1 (migration 0021's `secrets` + `action_variables` +
+ * the SPEC-0012 control-plane store's `action_runners`/`action_runs`/
+ * `action_run_jobs`): all 44 contract ops over the standalone-mount
+ * convention (the routes ARE registered in router.ts by the orchestrator
+ * after this batch).
  *
  * Per-arm contract verification: every DECLARED response code of every op is
  * exercised — secrets list {200,404}, secret PUT {201,204,400,404}, secret
@@ -12,22 +14,32 @@
  * {201,400,409} (+ the repo/org arms' 500), variable PUT {201,204,400,404},
  * variable DELETE {200,201,204,400,404} (the user arm without the 200);
  * runners list/get {200,400,404}, token {200}, delete {204,400,404}, patch
- * {200,400,404,422}. The declared-but-unreachable arms (the reads' 400, the
- * dead 201/200 leftovers) are pinned by the `⊆ contract` check
- * (pnpm check:api), not runtime — the module header documents each. The
- * RUNTIME-ONLY codes stay undeclared per the module header and are asserted
- * as behavior: 401 (anonymous), the repo arm's reqOwner 403 (an admin-mode
- * COLLABORATOR ranks below AccessModeOwner — the precise gate this family
- * differs from deploy-keys on), the org arm's reqOrgOwnership 403, the Go
- * binder's 422 Required texts, and the runner family's two 404 shapes (the
- * not-exist text vs EditableInContext's "No permission…" foreign-scope text).
+ * {200,400,404,422}; runs list {200,400,404} (the 400 = the invalid-status
+ * word, the 404 = the actor miss and the invisible repo), jobs list
+ * {200,400,404,422} (the 422 = the sort/order resolution). The
+ * declared-but-unreachable arms (the reads' 400, the dead 201/200 leftovers)
+ * are pinned by the `⊆ contract` check (pnpm check:api), not runtime — the
+ * module header documents each. The RUNTIME-ONLY codes stay undeclared per
+ * the module header and are asserted as behavior: 401 (anonymous), the repo
+ * arm's reqOwner 403, the org arm's reqOrgOwnership 403 — and, for the
+ * runs/jobs pair, the DIFFERENT gate set: repo READER (any authed viewer of
+ * a public repo lists; an invisible repo 404s anti-enumerated) and org
+ * MEMBERSHIP ("Must be an organization member"), the Go binder's 422
+ * Required texts, and the runner family's two 404 shapes (the not-exist text
+ * vs EditableInContext's "No permission…" foreign-scope text).
  *
  * The scope encoding is pinned end-to-end: a repo row carries owner_id=0 +
  * the TEXT repo id, an owner row carries the int owner + repo_id='' — lists
  * in one scope never leak rows from another, names are stored UPPERCASE and
  * matched case-insensitively, variable values are EOL-normalized, secret
  * data never renders. The runner status matrix (active/idle/offline) is
- * pinned against runner.go's 60 s/10 s windows with seeded timestamps.
+ * pinned against runner.go's 60 s/10 s windows with seeded timestamps. The
+ * runs/jobs listings are pinned against shared/action.go's semantics: the
+ * status-word matrix (convertToInternal + ToRunActionsStatus), the
+ * index-DESC/id-DESC run orders, the JobOrderByMap sort/order 422s, the
+ * actor 404 text, the org-scope accessible-repos subquery, the embedded
+ * repository's ZERO permission block, and the pull_requests arms
+ * (push-open-PR / PR-ref / exclude).
  */
 
 import { OpenAPIHono } from "@hono/zod-openapi";
@@ -37,8 +49,34 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { count, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { actionRunners, actionTasksVersions, repositories, users } from "../../db/schema";
-import type { RunnerRow } from "../../services/actions/model";
+import {
+  actionRunAttempts,
+  actionRunJobs,
+  actionRunners,
+  actionRuns,
+  actionTaskSteps,
+  actionTasks,
+  actionTasksVersions,
+  issues,
+  pullRequests,
+  repositories,
+  users,
+} from "../../db/schema";
+import {
+  ACTION_STATUS_BLOCKED,
+  ACTION_STATUS_CANCELLED,
+  ACTION_STATUS_FAILURE,
+  ACTION_STATUS_PENDING,
+  ACTION_STATUS_RUNNING,
+  ACTION_STATUS_SKIPPED,
+  ACTION_STATUS_SUCCESS,
+  ACTION_STATUS_WAITING,
+  insertActionRun,
+  type RunnerRow,
+  type RunJobRow,
+  type RunRow,
+} from "../../services/actions/model";
+import type { PullRequestRow } from "../../issues/service";
 import { createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -54,7 +92,25 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  for (const table of ["secrets", "action_variables", "action_runners", "action_runner_tokens", "action_tasks_versions", "repo_collaborators", "repositories", "org_members", "user_redirects", "users"]) {
+  for (const table of [
+    "secrets",
+    "action_variables",
+    "action_runners",
+    "action_runner_tokens",
+    "action_tasks_versions",
+    "action_task_steps",
+    "action_tasks",
+    "action_run_attempts",
+    "action_run_jobs",
+    "action_runs",
+    "pull_requests",
+    "issues",
+    "repo_collaborators",
+    "repositories",
+    "org_members",
+    "user_redirects",
+    "users",
+  ]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   seededUsers.clear();
@@ -1103,3 +1159,694 @@ function repoScopeSeed(repoId: string): { ownerId: number; repoId: string } {
 function ownerScopeSeed(ownerId: number): { ownerId: number; repoId: string } {
   return { ownerId, repoId: "" };
 }
+
+// ---------------------------------------------------------------------------
+// RUNS/JOBS LISTING — the P1-8 family (6 ops). The rows ride the LANDED
+// insertion seam (insertActionRun — the M1a staged insert the rerun/dispatch
+// suites drive); statuses are settled with direct updates, exactly the
+// rerun-suite pattern. Pins: the wire envelopes, the status-word matrix,
+// the orders (index DESC repo-scoped / id DESC owner-scoped), the filters,
+// the sort/order 422s, the actor 404 text, the pull_requests arms, the
+// embedded repository's ZERO permission block, the per-scope gates (repo
+// READER vs org MEMBERSHIP), and the org-scope accessible-repos filter.
+// ---------------------------------------------------------------------------
+
+const GO_ZERO = "0001-01-01T00:00:00Z";
+
+interface PullRequestMinimalWire {
+  id: number;
+  number: number;
+  url: string;
+  head: { ref: string; sha: string; repo: { id: number; url: string; name: string } };
+  base: { ref: string; sha: string; repo: { id: number; url: string; name: string } };
+}
+
+interface WorkflowRunWire {
+  id: number;
+  url: string;
+  previous_attempt_url: string | null;
+  html_url: string;
+  jobs_url: string;
+  logs_url: string;
+  artifacts_url: string;
+  cancel_url: string;
+  rerun_url: string;
+  display_title: string;
+  path: string;
+  event: string;
+  run_attempt: number;
+  run_number: number;
+  head_sha: string;
+  head_branch?: string;
+  status: string;
+  conclusion?: string;
+  actor?: User;
+  trigger_actor?: User;
+  repository?: Record<string, unknown>;
+  pull_requests: PullRequestMinimalWire[];
+  created_at: string;
+  updated_at: string;
+  started_at: string;
+  completed_at: string;
+}
+
+interface WorkflowRunsEnvelope {
+  workflow_runs: WorkflowRunWire[];
+  total_count: number;
+}
+
+interface WorkflowStepWire {
+  name: string;
+  number: number;
+  status: string;
+  conclusion?: string;
+  started_at: string;
+  completed_at: string;
+}
+
+interface WorkflowJobWire {
+  id: number;
+  url: string;
+  html_url: string;
+  run_id: number;
+  run_url: string;
+  name: string;
+  labels: string[];
+  run_attempt: number;
+  head_sha: string;
+  head_branch?: string;
+  status: string;
+  conclusion?: string;
+  runner_id?: number;
+  runner_name?: string;
+  steps: WorkflowStepWire[];
+  created_at: string;
+  started_at: string;
+  completed_at: string;
+}
+
+interface WorkflowJobsEnvelope {
+  jobs: WorkflowJobWire[];
+  total_count: number;
+}
+
+/** Distinct 40-char shas (the hex rendering keeps them column-typical). */
+const sha40 = (n: number): string => n.toString(16).padStart(40, "0");
+
+const WORKFLOW_PAYLOAD = new TextEncoder().encode(
+  "name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n",
+);
+
+let actionRunSeq = 1;
+let actionTaskSeq = 5000;
+
+interface ActionRunSeed {
+  index?: number;
+  ref?: string;
+  commitSha?: string;
+  event?: string;
+  triggerEvent?: string;
+  title?: string;
+  needApproval?: boolean;
+  runStatus?: number;
+  triggerUserId?: number;
+  jobs?: Array<{
+    jobId: string;
+    name?: string;
+    runsOn?: string[];
+    status?: number;
+    started?: Date | null;
+    stopped?: Date | null;
+  }>;
+}
+
+/** One run through the LANDED insertion seam (the rerun suite's pattern),
+ *  then the caller's status overrides settled with direct updates. */
+async function seedActionRun(
+  repoId: string,
+  ownerId: number,
+  seed: ActionRunSeed = {},
+): Promise<{ run: RunRow; attemptId: number; jobIds: number[]; jobRows: RunJobRow[] }> {
+  const seq = actionRunSeq++;
+  const { run, attempt, jobRows } = await insertActionRun(
+    env.DB,
+    {
+      repoId,
+      ownerId,
+      workflowId: ".gitea/workflows/ci.yml",
+      index: seed.index ?? seq,
+      triggerUserId: seed.triggerUserId ?? ownerId,
+      ref: seed.ref ?? "refs/heads/main",
+      commitSha: seed.commitSha ?? sha40(0xa000 + seq),
+      event: seed.event ?? "push",
+      eventPayload: "{}",
+      triggerEvent: seed.triggerEvent ?? "push",
+      title: seed.title,
+    },
+    (seed.jobs ?? [{ jobId: "build", runsOn: ["ubuntu-latest"] }]).map((job) => ({
+      jobId: job.jobId,
+      name: job.name,
+      runsOn: job.runsOn,
+      workflowPayload: WORKFLOW_PAYLOAD,
+    })),
+  );
+  if (seed.runStatus !== undefined || seed.needApproval !== undefined) {
+    await db()
+      .update(actionRuns)
+      .set({
+        ...(seed.runStatus !== undefined ? { status: seed.runStatus } : {}),
+        ...(seed.needApproval !== undefined ? { needApproval: seed.needApproval } : {}),
+      })
+      .where(eq(actionRuns.id, run.id));
+    await db()
+      .update(actionRunAttempts)
+      .set({ status: seed.runStatus ?? attempt.status })
+      .where(eq(actionRunAttempts.id, attempt.id));
+  }
+  const jobsWithStatus = (seed.jobs ?? []).filter((job) => job.status !== undefined);
+  for (const job of jobsWithStatus) {
+    const row = jobRows.find((r) => r.jobId === job.jobId)!;
+    await db()
+      .update(actionRunJobs)
+      .set({ status: job.status!, started: job.started ?? null, stopped: job.stopped ?? null })
+      .where(eq(actionRunJobs.id, row.id));
+  }
+  return { run, attemptId: attempt.id, jobIds: jobRows.map((j) => j.id), jobRows };
+}
+
+/** A user-owned repo in the org's name (orgs ARE users rows — the
+ *  createOrgRepo precedent) so the repos ⋈ users join resolves it. */
+async function seedOrgRepo(orgName: string, orgId: number, visibility: "public" | "private" = "public"): Promise<{ slug: string; repoId: string }> {
+  const repoId = String(repoSeq++);
+  const slug = `orgrepo${repoId}`;
+  await db().insert(repositories).values({
+    id: repoId,
+    storageKey: `r_${repoId}`,
+    ownerNamespace: orgName,
+    ownerId: orgId,
+    slug,
+    visibility,
+    refsVersion: 1,
+    backend: "self-hosted",
+    createdAt: new Date("2026-02-03T04:05:06Z"),
+  });
+  return { slug, repoId };
+}
+
+/** A PR row pair (issue + extension) written straight into the stores. */
+async function seedPullRow(
+  repoId: string,
+  index: number,
+  headBranch: string,
+  opts: { closed?: boolean; merged?: boolean; mergeBase?: string } = {},
+): Promise<PullRequestRow> {
+  const issueRows = await db()
+    .insert(issues)
+    .values({
+      repoId,
+      index,
+      title: `pr ${index}`,
+      isPull: true,
+      isClosed: opts.closed ?? false,
+      createdAt: new Date("2026-03-01T00:00:00Z"),
+      updatedAt: new Date("2026-03-01T00:00:00Z"),
+    })
+    .returning()
+    .all();
+  const prRows = await db()
+    .insert(pullRequests)
+    .values({
+      issueId: issueRows[0]!.id,
+      index,
+      headRepoId: repoId,
+      baseRepoId: repoId,
+      headBranch,
+      baseBranch: "main",
+      hasMerged: opts.merged ?? false,
+      mergeBase: opts.mergeBase ?? sha40(0xb000 + index),
+    })
+    .returning()
+    .all();
+  return prRows[0]!;
+}
+
+describe("repo workflow runs (GET /repos/{owner}/{repo}/actions/runs)", () => {
+  it("200 with the empty envelope on a run-less repo (the M3-independent premise)", async () => {
+    const { alice } = await seedWorld();
+    const { slug } = await seedRepo(alice);
+    const res = await get(`/api/v1/repos/alice/${slug}/actions/runs`, alice.id);
+    expect(res.status).toBe(200);
+    expect(await jsonBody(res)).toEqual({ workflow_runs: [], total_count: 0 });
+    expect(res.headers.get("x-total-count")).toBe("0");
+  });
+
+  it("the ActionWorkflowRun wire pins exactly — URLs, the attempt mirror, the ZERO-permission repository embed", async () => {
+    const { alice } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    const sha = sha40(0xc001);
+    const seeded = await seedActionRun(repoId, alice.id, { commitSha: sha, title: "add ci" });
+    const res = await get(`/api/v1/repos/alice/${slug}/actions/runs`, alice.id);
+    expect(res.status).toBe(200);
+    const body = (await jsonBody<WorkflowRunsEnvelope>(res));
+    expect(body.total_count).toBe(1);
+    const api = `https://example.com/api/v1/repos/alice/${slug}`;
+    const html = `https://example.com/alice/${slug}`;
+    const { repository, actor, trigger_actor: triggerActor, ...rest } = body.workflow_runs[0]!;
+    expect(rest).toEqual({
+      id: seeded.run.id,
+      url: `${api}/actions/runs/${seeded.run.id}`,
+      previous_attempt_url: null,
+      html_url: `${html}/actions/runs/${seeded.run.id}`,
+      jobs_url: `${api}/actions/runs/${seeded.run.id}/jobs`,
+      logs_url: `${api}/actions/runs/${seeded.run.id}/logs`,
+      artifacts_url: `${api}/actions/runs/${seeded.run.id}/artifacts`,
+      cancel_url: `${api}/actions/runs/${seeded.run.id}/cancel`,
+      rerun_url: `${api}/actions/runs/${seeded.run.id}/rerun`,
+      display_title: "add ci",
+      path: `.gitea/workflows/ci.yml@refs/heads/main`,
+      event: "push",
+      run_attempt: 1,
+      run_number: seeded.run.index,
+      head_sha: sha,
+      head_branch: "main",
+      status: "queued",
+      pull_requests: [],
+      created_at: seeded.run.created.toISOString(),
+      updated_at: seeded.run.updated.toISOString(),
+      started_at: GO_ZERO,
+      completed_at: GO_ZERO,
+    });
+    expect(actor?.login).toBe("alice");
+    expect(triggerActor?.login).toBe("alice");
+    expect(repository).toMatchObject({
+      id: Number(repoId),
+      full_name: `alice/${slug}`,
+      // ToRepo with AccessModeNone (convert.go:338) — the zero block,
+      // doer-independent (repository.go:41-45).
+      permissions: { admin: false, push: false, pull: false },
+    });
+  });
+
+  it("the status-word matrix — ToRunActionsStatus over every internal rank", async () => {
+    const { alice } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    // [runStatus, needApproval, wire status, wire conclusion]
+    const matrix: Array<[number, boolean | undefined, string, string | undefined]> = [
+      [ACTION_STATUS_WAITING, undefined, "queued", undefined],
+      [ACTION_STATUS_BLOCKED, undefined, "pending", undefined],
+      [ACTION_STATUS_BLOCKED, true, "waiting", undefined],
+      [ACTION_STATUS_RUNNING, undefined, "in_progress", undefined],
+      [ACTION_STATUS_PENDING, undefined, "requested", undefined],
+      [ACTION_STATUS_SUCCESS, undefined, "completed", "success"],
+      [ACTION_STATUS_FAILURE, undefined, "completed", "failure"],
+      [ACTION_STATUS_CANCELLED, undefined, "completed", "cancelled"],
+      [ACTION_STATUS_SKIPPED, undefined, "completed", "skipped"],
+    ];
+    const numbers: number[] = [];
+    for (const [status, needApproval] of matrix) {
+      const seeded = await seedActionRun(repoId, alice.id, { runStatus: status, needApproval });
+      numbers.push(seeded.run.index);
+    }
+    const body = (await jsonBody<WorkflowRunsEnvelope>(
+      await get(`/api/v1/repos/alice/${slug}/actions/runs`, alice.id),
+    ));
+    expect(body.total_count).toBe(matrix.length);
+    for (let i = 0; i < matrix.length; i++) {
+      const run = body.workflow_runs.find((r) => r.run_number === numbers[i])!;
+      expect([run.status, run.conclusion]).toEqual([matrix[i]![2], matrix[i]![3]]);
+    }
+  });
+
+  it("repo-scope order is index DESC (the per-repo run number); pagination rides page/limit", async () => {
+    const { alice } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    for (const n of [1, 2, 3]) {
+      await seedActionRun(repoId, alice.id, { index: n, title: `run ${n}` });
+    }
+    const page1 = (await jsonBody<WorkflowRunsEnvelope>(
+      await get(`/api/v1/repos/alice/${slug}/actions/runs?page=1&limit=2`, alice.id),
+    ));
+    expect(page1.total_count).toBe(3);
+    expect(page1.workflow_runs.map((r) => r.run_number)).toEqual([3, 2]);
+    const page2 = await get(`/api/v1/repos/alice/${slug}/actions/runs?page=2&limit=2`, alice.id);
+    expect(page2.headers.get("x-total-count")).toBe("3");
+    expect(page2.headers.get("Link")).toContain('rel="prev"');
+    expect((await jsonBody<WorkflowRunsEnvelope>(page2)).workflow_runs.map((r) => r.run_number)).toEqual([1]);
+  });
+
+  it("filters — the status words, the branch→ref expansion, the event, head_sha", async () => {
+    const { alice } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    await seedActionRun(repoId, alice.id, { index: 1, runStatus: ACTION_STATUS_SUCCESS });
+    await seedActionRun(repoId, alice.id, { index: 2, runStatus: ACTION_STATUS_WAITING });
+    await seedActionRun(repoId, alice.id, { index: 3, ref: "refs/heads/feature", triggerEvent: "workflow_dispatch" });
+    await seedActionRun(repoId, alice.id, { index: 4, commitSha: sha40(0xd001) });
+
+    const names = async (q: string): Promise<number[]> =>
+      (await jsonBody<WorkflowRunsEnvelope>(await get(`/api/v1/repos/alice/${slug}/actions/runs${q}`, alice.id))).workflow_runs.map(
+        (r) => r.run_number,
+      );
+    // completed → {success, failure, skipped, cancelled} ranks (the arm's set).
+    expect(await names("?status=completed")).toEqual([1]);
+    // queued → the WAITING rank — runs 2/3/4 all rest there (index DESC).
+    expect(await names("?status=queued")).toEqual([4, 3, 2]);
+    expect(await names("?branch=feature")).toEqual([3]);
+    expect(await names("?event=workflow_dispatch")).toEqual([3]);
+    expect(await names(`?head_sha=${sha40(0xd001)}`)).toEqual([4]);
+    expect(await names("")).toHaveLength(4);
+  });
+
+  it("actor: a hit filters by trigger user; a miss 404s the ErrUserNotExist text; an invalid status word 400s", async () => {
+    const { alice, bob } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    await seedActionRun(repoId, alice.id, { index: 1, triggerUserId: bob.id });
+    await seedActionRun(repoId, alice.id, { index: 2 });
+
+    const hit = (await jsonBody<WorkflowRunsEnvelope>(
+      await get(`/api/v1/repos/alice/${slug}/actions/runs?actor=bob`, alice.id),
+    ));
+    expect(hit.workflow_runs.map((r) => r.run_number)).toEqual([1]);
+
+    const miss = await get(`/api/v1/repos/alice/${slug}/actions/runs?actor=ghost`, alice.id);
+    expect(miss.status).toBe(404);
+    expect(await messageOf(miss)).toBe("user does not exist [uid: 0, name: ghost]");
+
+    const bad = await get(`/api/v1/repos/alice/${slug}/actions/runs?status=bogus`, alice.id);
+    expect(bad.status).toBe(400);
+    expect(await messageOf(bad)).toBe("invalid status bogus");
+  });
+
+  it("pull_requests — the push open-PR arm, the PR-ref arm, the closed/missing arms, and exclude_pull_requests", async () => {
+    const { alice } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    const openPr = await seedPullRow(repoId, 1, "feature");
+    await seedPullRow(repoId, 2, "gone", { closed: true });
+    const pushRun = await seedActionRun(repoId, alice.id, { index: 1, ref: "refs/heads/feature", commitSha: sha40(0xe001) });
+    const prRun = await seedActionRun(repoId, alice.id, { index: 2, event: "pull_request", ref: "refs/pull/1/head", commitSha: sha40(0xe002) });
+    // A push to a branch with NO open PR takes the empty arm.
+    await seedActionRun(repoId, alice.id, { index: 3, ref: "refs/heads/main", event: "push" });
+
+    const api = `https://example.com/api/v1/repos/alice/${slug}`;
+    const body = (await jsonBody<WorkflowRunsEnvelope>(
+      await get(`/api/v1/repos/alice/${slug}/actions/runs`, alice.id),
+    ));
+    const byNumber = (n: number): WorkflowRunWire => body.workflow_runs.find((r) => r.run_number === n)!;
+    // The push arm: the OPEN PR whose head branch matches (the closed one excluded);
+    // head.sha carries the RUN's commit sha, base.sha the PR's merge base.
+    expect(byNumber(pushRun.run.index).pull_requests).toEqual([
+      {
+        id: openPr.id,
+        number: 1,
+        url: `${api}/pulls/1`,
+        head: { ref: "feature", sha: sha40(0xe001), repo: { id: Number(repoId), url: api, name: slug } },
+        base: { ref: "main", sha: sha40(0xb001), repo: { id: Number(repoId), url: api, name: slug } },
+      },
+    ]);
+    // The PR-ref arm: the PR the run's refs/pull/N/head points at.
+    expect(byNumber(prRun.run.index).pull_requests).toEqual([
+      {
+        id: openPr.id,
+        number: 1,
+        url: `${api}/pulls/1`,
+        head: { ref: "feature", sha: sha40(0xe002), repo: { id: Number(repoId), url: api, name: slug } },
+        base: { ref: "main", sha: sha40(0xb001), repo: { id: Number(repoId), url: api, name: slug } },
+      },
+    ]);
+    // A run whose push matches nothing open takes the empty arm.
+    expect(byNumber(3).pull_requests).toEqual([]);
+
+    // exclude_pull_requests empties the field on EVERY entry.
+    const excluded = (await jsonBody<WorkflowRunsEnvelope>(
+      await get(`/api/v1/repos/alice/${slug}/actions/runs?exclude_pull_requests=true`, alice.id),
+    ));
+    expect(excluded.workflow_runs.every((r) => r.pull_requests.length === 0)).toBe(true);
+  });
+
+  it("gates: any authed READER lists a public repo (reqReaderCheck, NOT reqOwner); an invisible repo 404s; 401 anonymous", async () => {
+    const { alice, bob } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    await seedActionRun(repoId, alice.id, { index: 1 });
+    // bob is NO owner and NO collaborator — yet the runs/jobs pair lists:
+    // the route rides addActionsRoutes' reqReaderCheck arm (api.go:992-993).
+    const bobRes = await get(`/api/v1/repos/alice/${slug}/actions/runs`, bob.id);
+    expect(bobRes.status).toBe(200);
+    expect((await jsonBody<WorkflowRunsEnvelope>(bobRes)).total_count).toBe(1);
+    // The declared 404s: an unknown repo (anti-enumeration) and 401 anonymous.
+    expect((await get("/api/v1/repos/alice/missing/actions/runs", alice.id)).status).toBe(404);
+    expect((await get(`/api/v1/repos/alice/${slug}/actions/runs`)).status).toBe(401);
+  });
+});
+
+describe("repo workflow jobs (GET /repos/{owner}/{repo}/actions/jobs)", () => {
+  it("the ActionWorkflowJob wire pins exactly (unclaimed job — no runner, empty steps)", async () => {
+    const { alice } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    const seeded = await seedActionRun(repoId, alice.id, {
+      index: 1,
+      commitSha: sha40(0xf001),
+      jobs: [{ jobId: "build", name: "build", runsOn: ["ubuntu-latest", "docker"] }],
+    });
+    const res = await get(`/api/v1/repos/alice/${slug}/actions/jobs`, alice.id);
+    expect(res.status).toBe(200);
+    const body = (await jsonBody<WorkflowJobsEnvelope>(res));
+    expect(body.total_count).toBe(1);
+    const api = `https://example.com/api/v1/repos/alice/${slug}`;
+    const html = `https://example.com/alice/${slug}`;
+    expect(body.jobs).toEqual([
+      {
+        id: seeded.jobIds[0],
+        url: `${api}/actions/jobs/${seeded.jobIds[0]}`,
+        html_url: `${html}/actions/runs/${seeded.run.id}/jobs/${seeded.jobIds[0]}`,
+        run_id: seeded.run.id,
+        run_url: `${api}/actions/runs/${seeded.run.id}`,
+        name: "build",
+        labels: ["ubuntu-latest", "docker"],
+        run_attempt: 1,
+        head_sha: sha40(0xf001),
+        head_branch: "main",
+        status: "queued",
+        steps: [],
+        created_at: seeded.jobRows[0]!.created.toISOString(),
+        started_at: GO_ZERO,
+        completed_at: GO_ZERO,
+      },
+    ]);
+  });
+
+  it("a claimed job renders runner_id/runner_name + the task's steps (number is the LOOP index, convert.go:552)", async () => {
+    const { alice } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    const runner = await seedRunner(repoScopeSeed(repoId), "claiming-runner");
+    const started = new Date("2026-04-01T10:00:00Z");
+    const stopped = new Date("2026-04-01T10:01:00Z");
+    const seeded = await seedActionRun(repoId, alice.id, {
+      index: 1,
+      runStatus: ACTION_STATUS_RUNNING,
+      jobs: [{ jobId: "build", name: "build", status: ACTION_STATUS_RUNNING, started }],
+    });
+    const taskRows = await db()
+      .insert(actionTasks)
+      .values({
+        jobId: seeded.jobIds[0]!,
+        attempt: 1,
+        runnerId: runner.id,
+        status: ACTION_STATUS_RUNNING,
+        repoId,
+        ownerId: alice.id,
+        tokenHash: `task-hash-${actionTaskSeq++}`,
+        created: started,
+        updated: started,
+      })
+      .returning()
+      .all();
+    const taskId = taskRows[0]!.id;
+    await db().update(actionRunJobs).set({ taskId }).where(eq(actionRunJobs.id, seeded.jobIds[0]!));
+    await db().insert(actionTaskSteps).values([
+      { name: "checkout", taskId, index: 0, repoId, status: ACTION_STATUS_SUCCESS, started, stopped, created: started, updated: stopped },
+      { name: "build", taskId, index: 1, repoId, status: ACTION_STATUS_RUNNING, started: stopped, stopped: null, created: stopped, updated: stopped },
+    ]);
+
+    const body = (await jsonBody<WorkflowJobsEnvelope>(
+      await get(`/api/v1/repos/alice/${slug}/actions/jobs`, alice.id),
+    ));
+    const job = body.jobs[0]!;
+    expect(job.runner_id).toBe(runner.id);
+    expect(job.runner_name).toBe("claiming-runner");
+    expect(job.status).toBe("in_progress");
+    expect(job.steps).toEqual([
+      { name: "checkout", number: 0, status: "completed", conclusion: "success", started_at: started.toISOString(), completed_at: stopped.toISOString() },
+      { name: "build", number: 1, status: "in_progress", started_at: stopped.toISOString(), completed_at: GO_ZERO },
+    ]);
+  });
+
+  it("head_sha/head_branch read the RUN row, not the job's denormalized copy", async () => {
+    const { alice } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    const seeded = await seedActionRun(repoId, alice.id, { index: 1, commitSha: sha40(0xf101) });
+    await db().update(actionRunJobs).set({ commitSha: sha40(0xffff) }).where(eq(actionRunJobs.id, seeded.jobIds[0]!));
+    const body = (await jsonBody<WorkflowJobsEnvelope>(
+      await get(`/api/v1/repos/alice/${slug}/actions/jobs`, alice.id),
+    ));
+    expect(body.jobs[0]!.head_sha).toBe(sha40(0xf101));
+  });
+
+  it("sort/order — the default id ASC (order IGNORED without sort), desc, and the two 422 texts in upstream's arm order", async () => {
+    const { alice } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    for (const n of [1, 2, 3]) {
+      await seedActionRun(repoId, alice.id, { index: n, jobs: [{ jobId: `j${n}` }] });
+    }
+    const ids = async (q: string): Promise<number[]> => {
+      const res = await get(`/api/v1/repos/alice/${slug}/actions/jobs${q}`, alice.id);
+      expect(res.status).toBe(200);
+      return (await jsonBody<WorkflowJobsEnvelope>(res)).jobs.map((j) => j.id);
+    };
+    const [first, second, third] = await ids("");
+    expect((first ?? 0) < (second ?? 0)).toBe(true);
+    expect((second ?? 0) < (third ?? 0)).toBe(true);
+    // sort ABSENT → the default order even with order=desc (ResolveSortOrder
+    // returns early, utils/sort.go:20-22).
+    expect(await ids("?order=desc")).toEqual([first, second, third]);
+    expect(await ids("?sort=id&order=desc")).toEqual([third, second, first]);
+
+    // The 422 arms — ORDER resolves BEFORE mode, so a bogus pair takes the
+    // ORDER text (utils/sort.go:26-36).
+    const badMode = await get(`/api/v1/repos/alice/${slug}/actions/jobs?sort=bogus`, alice.id);
+    expect(badMode.status).toBe(422);
+    expect(await messageOf(badMode)).toBe('Invalid sort mode: "bogus"');
+    const badOrder = await get(`/api/v1/repos/alice/${slug}/actions/jobs?sort=id&order=bogus`, alice.id);
+    expect(badOrder.status).toBe(422);
+    expect(await messageOf(badOrder)).toBe('Invalid sort order: "bogus"');
+    const both = await get(`/api/v1/repos/alice/${slug}/actions/jobs?sort=bogus&order=bogus`, alice.id);
+    expect(await messageOf(both)).toBe('Invalid sort order: "bogus"');
+  });
+
+  it("the status filter, pagination, and the gates (reader lists; 404 unknown repo; 401 anonymous)", async () => {
+    const { alice, bob } = await seedWorld();
+    const { slug, repoId } = await seedRepo(alice);
+    await seedActionRun(repoId, alice.id, {
+      index: 1,
+      runStatus: ACTION_STATUS_FAILURE,
+      jobs: [{ jobId: "build", status: ACTION_STATUS_FAILURE }],
+    });
+    await seedActionRun(repoId, alice.id, { index: 2 });
+
+    const failed = (await jsonBody<WorkflowJobsEnvelope>(
+      await get(`/api/v1/repos/alice/${slug}/actions/jobs?status=failure`, alice.id),
+    ));
+    expect(failed.total_count).toBe(1);
+    expect(failed.jobs[0]!.status).toBe("completed");
+    expect(failed.jobs[0]!.conclusion).toBe("failure");
+
+    expect((await get(`/api/v1/repos/alice/${slug}/actions/jobs?limit=1&page=2`, alice.id)).headers.get("x-total-count")).toBe("2");
+    // bob — a plain authed reader — lists (the reqReaderCheck arm).
+    expect((await get(`/api/v1/repos/alice/${slug}/actions/jobs`, bob.id)).status).toBe(200);
+    expect((await get("/api/v1/repos/alice/missing/actions/jobs", alice.id)).status).toBe(404);
+    expect((await get(`/api/v1/repos/alice/${slug}/actions/jobs`)).status).toBe(401);
+  });
+});
+
+describe("org workflow runs/jobs (GET /orgs/{org}/actions/runs|jobs)", () => {
+  it("gates: owner AND plain member list (reqOrgMembership, NOT ownership); a non-member 403s; missing org 404s; 401 anonymous", async () => {
+    const org = await seedOrg("acme");
+    const { repoId } = await seedOrgRepo("acme", org.orgId);
+    await seedActionRun(repoId, org.orgId, { index: 1 });
+
+    const memberRes = await get("/api/v1/orgs/acme/actions/runs", org.member.id);
+    expect(memberRes.status).toBe(200);
+    expect((await jsonBody<WorkflowRunsEnvelope>(memberRes)).total_count).toBe(1);
+    expect((await get("/api/v1/orgs/acme/actions/runs", org.owner.id)).status).toBe(200);
+
+    const outsider = await get("/api/v1/orgs/acme/actions/runs", org.outsider.id);
+    expect(outsider.status).toBe(403);
+    expect(await messageOf(outsider)).toBe("Must be an organization member");
+    const outsiderJobs = await get("/api/v1/orgs/acme/actions/jobs", org.outsider.id);
+    expect(outsiderJobs.status).toBe(403);
+    expect(await messageOf(outsiderJobs)).toBe("Must be an organization member");
+
+    expect((await get("/api/v1/orgs/missing/actions/runs", org.owner.id)).status).toBe(404);
+    expect((await get("/api/v1/orgs/acme/actions/runs")).status).toBe(401);
+    expect((await get("/api/v1/orgs/acme/actions/jobs")).status).toBe(401);
+  });
+
+  it("the accessible-repos subquery: a member sees only the org repos they can view; the owner and the site admin see all", async () => {
+    const org = await seedOrg("acme");
+    const publicRepo = await seedOrgRepo("acme", org.orgId, "public");
+    const privateRepo = await seedOrgRepo("acme", org.orgId, "private");
+    await seedActionRun(publicRepo.repoId, org.orgId, { index: 1 });
+    await seedActionRun(privateRepo.repoId, org.orgId, { index: 1 });
+
+    const ownerBody = (await jsonBody<WorkflowRunsEnvelope>(
+      await get("/api/v1/orgs/acme/actions/runs", org.owner.id),
+    ));
+    expect(ownerBody.total_count).toBe(2);
+    // The member's subquery covers the public repo only — the private repo's
+    // run filters away from BOTH the page and the total.
+    const memberBody = (await jsonBody<WorkflowRunsEnvelope>(
+      await get("/api/v1/orgs/acme/actions/runs", org.member.id),
+    ));
+    expect(memberBody.total_count).toBe(1);
+    expect(memberBody.workflow_runs).toHaveLength(1);
+    expect((memberBody.workflow_runs[0]!.repository as { id: number }).id).toBe(Number(publicRepo.repoId));
+    // The site admin's subquery is nil (DoerIsSiteAdminFullAccess) — all rows.
+    expect((await jsonBody<WorkflowRunsEnvelope>(await get("/api/v1/orgs/acme/actions/runs", org.admin.id))).total_count).toBe(2);
+
+    // The jobs twin carries the same filter.
+    const memberJobs = (await jsonBody<WorkflowJobsEnvelope>(
+      await get("/api/v1/orgs/acme/actions/jobs", org.member.id),
+    ));
+    expect(memberJobs.total_count).toBe(1);
+    expect((await jsonBody<WorkflowJobsEnvelope>(await get("/api/v1/orgs/acme/actions/jobs", org.owner.id))).total_count).toBe(2);
+  });
+
+  it("the empty envelope and the owner-scope id-DESC order across repos", async () => {
+    const org = await seedOrg("acme");
+    const repoA = await seedOrgRepo("acme", org.orgId);
+    const repoB = await seedOrgRepo("acme", org.orgId);
+    const first = await seedActionRun(repoA.repoId, org.orgId, { index: 1 });
+    const second = await seedActionRun(repoB.repoId, org.orgId, { index: 1 });
+    const body = (await jsonBody<WorkflowRunsEnvelope>(await get("/api/v1/orgs/acme/actions/runs", org.owner.id)));
+    // No repo scope → the global id DESC order (run_list.go:150-152).
+    expect(body.workflow_runs.map((r) => r.id)).toEqual([second.run.id, first.run.id]);
+    // A member-less org listing a run-less owner scope: the empty shape.
+    const ghost = await seedOrg("ghost-org");
+    expect((await jsonBody(await get("/api/v1/orgs/ghost-org/actions/runs", ghost.owner.id))).total_count).toBe(0);
+  });
+});
+
+describe("user workflow runs/jobs (GET /user/actions/runs|jobs)", () => {
+  it("the doer's scope covers their repos' rows; siblings stay invisible; 401 anonymous", async () => {
+    const { alice, bob } = await seedWorld();
+    const { repoId } = await seedRepo(alice);
+    const seeded = await seedActionRun(repoId, alice.id, { index: 1 });
+
+    const aliceBody = (await jsonBody<WorkflowRunsEnvelope>(await get("/api/v1/user/actions/runs", alice.id)));
+    expect(aliceBody.total_count).toBe(1);
+    expect(aliceBody.workflow_runs[0]!.id).toBe(seeded.run.id);
+    // bob's owner scope is a DIFFERENT store.
+    expect((await jsonBody<WorkflowRunsEnvelope>(await get("/api/v1/user/actions/runs", bob.id))).total_count).toBe(0);
+
+    const jobs = (await jsonBody<WorkflowJobsEnvelope>(await get("/api/v1/user/actions/jobs", alice.id)));
+    expect(jobs.total_count).toBe(1);
+    expect(jobs.jobs[0]!.run_id).toBe(seeded.run.id);
+    expect((await jsonBody<WorkflowJobsEnvelope>(await get("/api/v1/user/actions/jobs", bob.id))).total_count).toBe(0);
+
+    expect((await get("/api/v1/user/actions/runs")).status).toBe(401);
+    expect((await get("/api/v1/user/actions/jobs")).status).toBe(401);
+  });
+
+  it("the user jobs sort/order rides the same JobOrderByMap; the status filter applies", async () => {
+    const { alice } = await seedWorld();
+    const { repoId } = await seedRepo(alice);
+    await seedActionRun(repoId, alice.id, { index: 1, runStatus: ACTION_STATUS_SUCCESS, jobs: [{ jobId: "a", status: ACTION_STATUS_SUCCESS }] });
+    await seedActionRun(repoId, alice.id, { index: 2, jobs: [{ jobId: "b" }] });
+    const desc = (await jsonBody<WorkflowJobsEnvelope>(await get("/api/v1/user/actions/jobs?sort=id&order=desc", alice.id)));
+    const asc = (await jsonBody<WorkflowJobsEnvelope>(await get("/api/v1/user/actions/jobs", alice.id)));
+    expect(desc.jobs.map((j) => j.id)).toEqual([...asc.jobs.map((j) => j.id)].reverse());
+    const done = (await jsonBody<WorkflowJobsEnvelope>(await get("/api/v1/user/actions/jobs?status=success", alice.id)));
+    expect(done.total_count).toBe(1);
+    const bad = await get("/api/v1/user/actions/jobs?sort=nope", alice.id);
+    expect(bad.status).toBe(422);
+    expect(await messageOf(bad)).toBe('Invalid sort mode: "nope"');
+  });
+});

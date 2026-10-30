@@ -5,6 +5,7 @@ import { HTTPException } from "hono/http-exception";
 
 import type { RepositoryWithOwner } from "../services/repository";
 import { doerRepoAccessMode } from "../services/repository";
+import { viewerOf } from "../services/repository";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
@@ -13,12 +14,16 @@ import type { OrgDoer } from "../services/org-repos";
 import type { OrgRecord } from "../../services/orgs/orgs";
 import { OrgService } from "../../services/orgs/orgs";
 import {
+  requireOrgMembership,
   requireOrgOwnership,
   requireOrgVisible,
   resolveOrgForRequest,
 } from "../services/orgs";
 import { requireVisibleRepo } from "../services/repo-access";
+import { repositorySchema } from "../models/repository";
+import { userSchema } from "../models/user";
 import {
+  accessibleOwnerRepoIds,
   createOrUpdateSecret,
   createVariableRow,
   deleteSecretByName,
@@ -28,6 +33,8 @@ import {
   listRunnerRows,
   listSecretRows,
   listVariableRows,
+  listWorkflowJobsWire,
+  listWorkflowRunsWire,
   ownerScope,
   repoScope,
   RUNNER_FOREIGN_MESSAGE,
@@ -39,6 +46,8 @@ import {
   toApiVariable,
   updateVariableRow,
   variableNotFoundMessage,
+  workflowJobFiltersFromQuery,
+  workflowRunFiltersFromQuery,
 } from "../services/secrets-variables";
 import { deleteRunner, getOrCreateActiveRunnerToken } from "../../services/actions/model";
 
@@ -124,6 +133,44 @@ import { deleteRunner, getOrCreateActiveRunnerToken } from "../../services/actio
  * APIErrorNotFound, shared/runners.go:80). Registration-token 200s
  * {"token": …} — the raw token (GetOrCreateActiveRunnerToken reuses the
  * scope's active token until a reset, runner_token.go:127-134).
+ *
+ * RUNS/JOBS LISTING (the P1-8 extension — 6 operations, the board's slice 1):
+ * getWorkflowRuns + listWorkflowJobs at repo scope, getOrgWorkflowRuns +
+ * getOrgWorkflowJobs at org, getUserWorkflowRuns + getUserWorkflowJobs at
+ * user — shared.ListRuns/ListJobs (routers/api/v1/shared/action.go) over the
+ * LANDED action_runs/action_run_jobs store (services/actions/model.ts; the
+ * mapping lives in services/secrets-variables.ts's runs/jobs section). The
+ * code is M3-INDEPENDENT — an empty store lists empty (the board's premise).
+ * The gates DIFFER from the families above — the runs/jobs pair rides
+ * addActionsRoutes' reqReaderCheck arm, NOT reqOwnerCheck:
+ *   - repo (api.go:992-993): reqRepoReader(unit.TypeActions) — the landed
+ *     requireVisibleRepo IS the reader check (a visible repo is readable; an
+ *     invisible one 404s anti-enumerated, upstream APIErrorNotFound's arm) —
+ *     so ANY authed viewer lists a public repo's runs, unlike the 403'd
+ *     secrets/variables/runners families;
+ *   - org (api.go:1738-1742): reqOrgMEMBERSHIP (api.go:549-580) — a plain
+ *     member lists (restricted to the repos they can view,
+ *     FindUserActionsAccessibleOwnerRepoIDsSubQuery, repo_list.go:805-810 —
+ *     accessibleOwnerRepoIds), a non-member 403s "Must be an organization
+ *     member";
+ *   - user (api.go:1135-1136): the /user group's plain reqToken — the doer's
+ *     own rows (the landed posture per the P1-7 header).
+ *
+ * The declared sets carry the contract's own arms — the runs' 400 is the
+ * invalid-status word (convertToInternal, "invalid status %s"), the jobs' 422
+ * the sort/order resolution (ResolveSortOrder: order resolved BEFORE mode, so
+ * a bogus pair 422s `Invalid sort order: %q`; absent sort takes the default
+ * id-ASC with order IGNORED). RUNTIME-ONLY codes (undeclared): 401 (reqToken)
+ * everywhere and the org membership 403. The shared handler reads
+ * `exclude_pull_requests` at EVERY scope (shared/action.go:207) though only
+ * the repo contract declares it, and the org jobs contract omits sort/order
+ * while the shared handler resolves them — the runtime honors both; the dead
+ * scoped-workflow branch (workflowID != "") never fires (all three scopes
+ * pass ""). Runs order `index DESC` repo-scoped / `id DESC` owner-scoped
+ * (run_list.go:142-153); jobs order id asc/desc (JobOrderByMap). The run
+ * wire's embedded `repository` renders with the ZERO permission block
+ * (ToRepo with AccessModeNone — doer-independent, convert.go:338 +
+ * repository.go:41-45).
  *
  * EMPTY-BODY ARMS — every mutation answers a bare status (ctx.Status), no
  * body, exactly like upstream: secret PUT 201/204, secret DELETE 204,
@@ -231,6 +278,117 @@ const registrationTokenSchema = z.object({
  *  field); shared/runners.go:130-133's own nil check answers the 422. */
 const editActionRunnerOptionSchema = z.object({
   disabled: z.boolean().optional().openapi({ description: "Disable the runner" }),
+});
+
+// ---------------------------------------------------------------------------
+// Runs/jobs listing wire schemas (structs/repo_actions.go) — the P1-8
+// extension; the service renders these shapes, the routes declare them.
+// ---------------------------------------------------------------------------
+
+/** `#/definitions/PullRequestMinimalHeadRepo` (repo_actions.go:186-193). */
+const pullRequestMinimalHeadRepoSchema = z.object({
+  id: z.number().int().openapi({ format: "int64" }),
+  url: z.string().openapi({ description: "the repo's API URL" }),
+  name: z.string().openapi({ description: "the repo's name" }),
+});
+
+/** `#/definitions/PullRequestMinimalHead` (repo_actions.go:176-184). */
+const pullRequestMinimalHeadSchema = z.object({
+  ref: z.string().openapi({ description: "the branch name" }),
+  sha: z.string().openapi({ description: "the commit sha" }),
+  repo: pullRequestMinimalHeadRepoSchema,
+});
+
+/** `#/definitions/PullRequestMinimal` (repo_actions.go:169-174). */
+const pullRequestMinimalSchema = z.object({
+  id: z.number().int().openapi({ format: "int64" }),
+  number: z.number().int().openapi({ format: "int64" }),
+  url: z.string().openapi({ description: "the PR's API URL" }),
+  head: pullRequestMinimalHeadSchema,
+  base: pullRequestMinimalHeadSchema,
+});
+
+/** `#/definitions/ActionWorkflowRun` (repo_actions.go:110-157) — omitempty
+ *  fields optional; `repository_id`/`head_repository` mirror the converter's
+ *  never-set fields (optional, never rendered); `previous_attempt_url` is
+ *  deliberately non-optional (a nil renders as null,
+ *  convert.go:300-307). */
+const actionWorkflowRunSchema = z.object({
+  id: z.number().int().openapi({ format: "int64" }),
+  url: z.string(),
+  previous_attempt_url: z.string().nullable().openapi({ description: "the API URL of the previous attempt of this run, null when the current attempt is 1" }),
+  html_url: z.string(),
+  jobs_url: z.string(),
+  logs_url: z.string(),
+  artifacts_url: z.string(),
+  cancel_url: z.string(),
+  rerun_url: z.string(),
+  display_title: z.string(),
+  path: z.string(),
+  event: z.string(),
+  run_attempt: z.number().int().openapi({ format: "int64", description: "1-based attempt; 0 is a legacy-only sentinel for pre-attempt runs" }),
+  run_number: z.number().int().openapi({ format: "int64" }),
+  repository_id: z.number().int().optional().openapi({ format: "int64" }),
+  head_sha: z.string(),
+  head_branch: z.string().optional(),
+  status: z.string(),
+  actor: userSchema.optional(),
+  trigger_actor: userSchema.optional(),
+  repository: repositorySchema.optional(),
+  head_repository: repositorySchema.optional(),
+  conclusion: z.string().optional(),
+  pull_requests: z.array(pullRequestMinimalSchema),
+  created_at: z.string().openapi({ format: "date-time" }),
+  updated_at: z.string().openapi({ format: "date-time" }),
+  started_at: z.string().openapi({ format: "date-time" }),
+  completed_at: z.string().openapi({ format: "date-time" }),
+});
+
+/** `#/definitions/ActionWorkflowRunsResponse` (repo_actions.go:218-222). */
+const actionWorkflowRunsResponseSchema = z.object({
+  workflow_runs: z.array(actionWorkflowRunSchema),
+  total_count: z.number().int().openapi({ format: "int64" }),
+});
+
+/** `#/definitions/ActionWorkflowStep` (repo_actions.go:170-179) — `number`
+ *  is the step's LIST index (the converter's loop counter,
+ *  convert.go:552). */
+const actionWorkflowStepSchema = z.object({
+  name: z.string(),
+  number: z.number().int().openapi({ format: "int64" }),
+  status: z.string(),
+  conclusion: z.string().optional(),
+  started_at: z.string().openapi({ format: "date-time" }),
+  completed_at: z.string().openapi({ format: "date-time" }),
+});
+
+/** `#/definitions/ActionWorkflowJob` (repo_actions.go:190-215) — omitempty
+ *  fields optional. */
+const actionWorkflowJobSchema = z.object({
+  id: z.number().int().openapi({ format: "int64" }),
+  url: z.string(),
+  html_url: z.string(),
+  run_id: z.number().int().openapi({ format: "int64" }),
+  run_url: z.string(),
+  name: z.string(),
+  labels: z.array(z.string()),
+  run_attempt: z.number().int().openapi({ format: "int64" }),
+  head_sha: z.string(),
+  head_branch: z.string().optional(),
+  status: z.string(),
+  conclusion: z.string().optional(),
+  runner_id: z.number().int().optional().openapi({ format: "int64" }),
+  runner_name: z.string().optional(),
+  steps: z.array(actionWorkflowStepSchema),
+  created_at: z.string().openapi({ format: "date-time" }),
+  started_at: z.string().openapi({ format: "date-time" }),
+  completed_at: z.string().openapi({ format: "date-time" }),
+});
+
+/** `#/definitions/ActionWorkflowJobsResponse` (repo_actions.go:224-228). */
+const actionWorkflowJobsResponseSchema = z.object({
+  jobs: z.array(actionWorkflowJobSchema),
+  total_count: z.number().int().openapi({ format: "int64" }),
 });
 
 // ---------------------------------------------------------------------------
@@ -384,6 +542,34 @@ async function requireOrgActionsAccess(
 /** Doer slice for the org guards — requireAuth has resolved the caller. */
 function authedDoer(c: Context<ApiEnv>): OrgDoer & { id: number } {
   return orgDoerOf(c.get("authUser"));
+}
+
+/**
+ * The runs/jobs org gate — the trio with the READER arm: orgAssignment +
+ * reqOrgVisible + reqOrgMEMBERSHIP (api.go:1738-1742 passes
+ * reqOrgMembership() as addActionsRoutes' reqReaderCheck, and /runs + /jobs
+ * ride THAT gate — api.go:549-580: org member or site admin, else the exact
+ * "Must be an organization member" 403). NOT the ownership gate the
+ * secrets/variables/runners families pass as reqOwnerCheck.
+ */
+async function requireOrgActionsReadAccess(
+  d1: D1Database,
+  orgName: string,
+  doer: OrgDoer & { id: number },
+  requestPath: string,
+  requestQuery: string,
+): Promise<OrgRecord> {
+  const resolved = await resolveOrgForRequest(d1, orgName, doer, requestPath, requestQuery);
+  if (resolved.kind === "redirect") {
+    throw renamedOrgRedirect(resolved.location);
+  }
+  if (resolved.kind === "missing") {
+    throw orgNotFound();
+  }
+  const orgs = new OrgService(d1);
+  await requireOrgVisible(orgs, resolved.org, doer);
+  await requireOrgMembership(orgs, resolved.org, doer);
+  return resolved.org;
 }
 
 // ---------------------------------------------------------------------------
@@ -1808,6 +1994,343 @@ export function registerSecretsVariablesRoutes(app: OpenAPIHono<ApiEnv>, require
         throw new ApiError(404, runnerMissMessage(runnerId));
       }
       return c.json(toApiRunner(updated.row, new Date()), 200);
+    },
+  );
+
+  // =========================================================================
+  // RUNS/JOBS LISTING — the P1-8 family (shared/action.go ListRuns/ListJobs
+  // via addActionsRoutes' m.Get("/runs") + m.Get("/jobs") at all three
+  // scopes). The
+  // GATES DIFFER from the families above: repo scope rides reqReaderCheck
+  // (reqRepoReader(unit.TypeActions), api.go:992-993) — a READER lists, not
+  // an owner; org scope rides reqOrgMembership (api.go:1738-1742); user
+  // scope rides the /user group's plain reqToken (api.go:1135-1136). The
+  // declared sets carry the contract's own arms: the runs' 400 is the
+  // invalid-status word (convertToInternal), the jobs' 422 the sort/order
+  // resolution (ResolveSortOrder); 401 (reqToken) and the org membership 403
+  // stay runtime-only (undeclared, asserted in the suite).
+  // =========================================================================
+
+  // -------------------------------------------------------------------------
+  // GET /repos/{owner}/{repo}/actions/runs (getWorkflowRuns)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/repos/{owner}/{repo}/actions/runs",
+      middleware: [requireAuth],
+      tags: ["repository"],
+      summary: "Lists all runs for a repository run",
+      operationId: "getWorkflowRuns",
+      request: {
+        params: z.object(ownerRepoParams),
+        query: z.object({
+          event: z.string().optional().openapi({ description: "workflow event name" }),
+          branch: z.string().optional().openapi({ description: "workflow branch" }),
+          status: z.string().optional().openapi({ description: "workflow status (requested, pending, queued, in_progress, failure, success, skipped)" }),
+          actor: z.string().optional().openapi({ description: "triggered by user" }),
+          head_sha: z.string().optional().openapi({ description: "triggering sha of the workflow run" }),
+          exclude_pull_requests: z.string().optional().openapi({ type: "boolean", description: "if true, the `pull_requests` field on each returned run is emptied" }),
+          page: z.string().optional().openapi({ type: "integer", description: "page number of results to return (1-based)" }),
+          limit: z.string().optional().openapi({ type: "integer", description: "page size of results" }),
+        }),
+      },
+      responses: {
+        200: {
+          description: "WorkflowRunsList",
+          content: { "application/json": { schema: actionWorkflowRunsResponseSchema } },
+        },
+        400: errorResponse,
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      // reqRepoReader(unit.TypeActions) (api.go:992) — the landed shape: the
+      // visible-repo check IS the reader check (a visible repo is readable;
+      // an invisible one 404s anti-enumerated, upstream APIErrorNotFound's
+      // miss arm).
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      const url = new URL(c.req.url);
+      const opts = parseListOptions(url);
+      const filters = await workflowRunFiltersFromQuery(c.env.DB, url, {
+        ownerId: 0,
+        repoId: pair.repo.id,
+      });
+      const { totalCount, runs } = await listWorkflowRunsWire(
+        c.env.DB,
+        viewerOf(c),
+        filters,
+        opts.page,
+        opts.limit,
+        formOptionalBool(url, "exclude_pull_requests") === true,
+        // ownerID == 0 → the accessibility subquery is nil (repo_list.go:806).
+        null,
+      );
+      setPaginationHeaders(c, totalCount, opts);
+      return c.json({ workflow_runs: runs, total_count: totalCount }, 200);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // GET /repos/{owner}/{repo}/actions/jobs (listWorkflowJobs)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/repos/{owner}/{repo}/actions/jobs",
+      middleware: [requireAuth],
+      tags: ["repository"],
+      summary: "Lists all jobs for a repository",
+      operationId: "listWorkflowJobs",
+      request: {
+        params: z.object(ownerRepoParams),
+        query: z.object({
+          status: z.string().optional().openapi({ description: "workflow status (requested, pending, queued, in_progress, failure, success, skipped)" }),
+          page: z.string().optional().openapi({ type: "integer", description: "page number of results to return (1-based)" }),
+          limit: z.string().optional().openapi({ type: "integer", description: "page size of results" }),
+          sort: z.string().optional().openapi({ description: 'sort jobs by attribute. Supported values are "id". Default is "id"' }),
+          order: z.string().optional().openapi({ description: 'sort order, either "asc" (ascending) or "desc" (descending). Default is "asc"' }),
+        }),
+      },
+      responses: {
+        200: {
+          description: "WorkflowJobsList",
+          content: { "application/json": { schema: actionWorkflowJobsResponseSchema } },
+        },
+        400: errorResponse,
+        404: notFoundResponse,
+        422: { description: "validationError", content: { "application/json": { schema: apiErrorSchema } } },
+      },
+    }),
+    async (c) => {
+      const pair = await requireVisibleRepo(c, c.req.valid("param"));
+      const url = new URL(c.req.url);
+      const opts = parseListOptions(url);
+      const { statuses, order } = workflowJobFiltersFromQuery(url);
+      const { totalCount, jobs } = await listWorkflowJobsWire(
+        c.env.DB,
+        viewerOf(c),
+        { ownerId: 0, repoId: pair.repo.id, statuses },
+        order,
+        opts.page,
+        opts.limit,
+        null,
+      );
+      setPaginationHeaders(c, totalCount, opts);
+      return c.json({ jobs, total_count: totalCount }, 200);
+    },
+  );
+
+  // =========================================================================
+  // ORG SCOPE — reqOrgMembership (api.go:1738-1742): members read the org's
+  // runs/jobs, restricted to the repos they can view
+  // (FindUserActionsAccessibleOwnerRepoIDsSubQuery).
+  // =========================================================================
+
+  // -------------------------------------------------------------------------
+  // GET /orgs/{org}/actions/runs (getOrgWorkflowRuns)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/orgs/{org}/actions/runs",
+      middleware: [requireAuth],
+      tags: ["organization"],
+      summary: "Get org-level workflow runs",
+      operationId: "getOrgWorkflowRuns",
+      request: {
+        params: z.object(orgParams),
+        query: z.object({
+          event: z.string().optional().openapi({ description: "workflow event name" }),
+          branch: z.string().optional().openapi({ description: "workflow branch" }),
+          status: z.string().optional().openapi({ description: "workflow status (requested, pending, queued, in_progress, failure, success, skipped)" }),
+          actor: z.string().optional().openapi({ description: "triggered by user" }),
+          head_sha: z.string().optional().openapi({ description: "triggering sha of the workflow run" }),
+          page: z.string().optional().openapi({ type: "integer", description: "page number of results to return (1-based)" }),
+          limit: z.string().optional().openapi({ type: "integer", description: "page size of results" }),
+        }),
+      },
+      responses: {
+        200: {
+          description: "WorkflowRunsList",
+          content: { "application/json": { schema: actionWorkflowRunsResponseSchema } },
+        },
+        400: errorResponse,
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const org = await requireOrgActionsReadAccess(c.env.DB, c.req.valid("param").org, authedDoer(c), c.req.path, new URL(c.req.url).search);
+      const url = new URL(c.req.url);
+      const opts = parseListOptions(url);
+      const filters = await workflowRunFiltersFromQuery(c.env.DB, url, { ownerId: org.id, repoId: "" });
+      const { totalCount, runs } = await listWorkflowRunsWire(
+        c.env.DB,
+        viewerOf(c),
+        filters,
+        opts.page,
+        opts.limit,
+        // The shared handler reads the word at EVERY scope
+        // (shared/action.go:207) — only the repo scope's swagger declares it.
+        formOptionalBool(url, "exclude_pull_requests") === true,
+        await accessibleOwnerRepoIds(c.env.DB, org.id, viewerOf(c)),
+      );
+      setPaginationHeaders(c, totalCount, opts);
+      return c.json({ workflow_runs: runs, total_count: totalCount }, 200);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // GET /orgs/{org}/actions/jobs (getOrgWorkflowJobs) — the org contract
+  // declares NO sort/order (the repo/user siblings do); the shared handler
+  // resolves them anyway, so the runtime honors the words.
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/orgs/{org}/actions/jobs",
+      middleware: [requireAuth],
+      tags: ["organization"],
+      summary: "Get org-level workflow jobs",
+      operationId: "getOrgWorkflowJobs",
+      request: {
+        params: z.object(orgParams),
+        query: z.object({
+          status: z.string().optional().openapi({ description: "workflow status (requested, pending, queued, in_progress, failure, success, skipped)" }),
+          page: z.string().optional().openapi({ type: "integer", description: "page number of results to return (1-based)" }),
+          limit: z.string().optional().openapi({ type: "integer", description: "page size of results" }),
+        }),
+      },
+      responses: {
+        200: {
+          description: "WorkflowJobsList",
+          content: { "application/json": { schema: actionWorkflowJobsResponseSchema } },
+        },
+        400: errorResponse,
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const org = await requireOrgActionsReadAccess(c.env.DB, c.req.valid("param").org, authedDoer(c), c.req.path, new URL(c.req.url).search);
+      const url = new URL(c.req.url);
+      const opts = parseListOptions(url);
+      const { statuses, order } = workflowJobFiltersFromQuery(url);
+      const { totalCount, jobs } = await listWorkflowJobsWire(
+        c.env.DB,
+        viewerOf(c),
+        { ownerId: org.id, repoId: "", statuses },
+        order,
+        opts.page,
+        opts.limit,
+        await accessibleOwnerRepoIds(c.env.DB, org.id, viewerOf(c)),
+      );
+      setPaginationHeaders(c, totalCount, opts);
+      return c.json({ jobs, total_count: totalCount }, 200);
+    },
+  );
+
+  // =========================================================================
+  // USER SCOPE — the /user group's plain reqToken (api.go:1135-1136): the
+  // doer's own runs/jobs (upstream's rejectPublicOnly stays the landed
+  // /user group posture, per the P1-7 header).
+  // =========================================================================
+
+  // -------------------------------------------------------------------------
+  // GET /user/actions/runs (getUserWorkflowRuns)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/user/actions/runs",
+      middleware: [requireAuth],
+      tags: ["user"],
+      summary: "Get workflow runs",
+      operationId: "getUserWorkflowRuns",
+      request: {
+        query: z.object({
+          event: z.string().optional().openapi({ description: "workflow event name" }),
+          branch: z.string().optional().openapi({ description: "workflow branch" }),
+          status: z.string().optional().openapi({ description: "workflow status (requested, pending, queued, in_progress, failure, success, skipped)" }),
+          actor: z.string().optional().openapi({ description: "triggered by user" }),
+          head_sha: z.string().optional().openapi({ description: "triggering sha of the workflow run" }),
+          page: z.string().optional().openapi({ type: "integer", description: "page number of results to return (1-based)" }),
+          limit: z.string().optional().openapi({ type: "integer", description: "page size of results" }),
+        }),
+      },
+      responses: {
+        200: {
+          description: "WorkflowRunsList",
+          content: { "application/json": { schema: actionWorkflowRunsResponseSchema } },
+        },
+        400: errorResponse,
+        404: notFoundResponse,
+      },
+    }),
+    async (c) => {
+      const doer = authedDoer(c);
+      const url = new URL(c.req.url);
+      const opts = parseListOptions(url);
+      const filters = await workflowRunFiltersFromQuery(c.env.DB, url, { ownerId: doer.id, repoId: "" });
+      const { totalCount, runs } = await listWorkflowRunsWire(
+        c.env.DB,
+        viewerOf(c),
+        filters,
+        opts.page,
+        opts.limit,
+        formOptionalBool(url, "exclude_pull_requests") === true,
+        await accessibleOwnerRepoIds(c.env.DB, doer.id, viewerOf(c)),
+      );
+      setPaginationHeaders(c, totalCount, opts);
+      return c.json({ workflow_runs: runs, total_count: totalCount }, 200);
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // GET /user/actions/jobs (getUserWorkflowJobs)
+  // -------------------------------------------------------------------------
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/user/actions/jobs",
+      middleware: [requireAuth],
+      tags: ["user"],
+      summary: "Get workflow jobs",
+      operationId: "getUserWorkflowJobs",
+      request: {
+        query: z.object({
+          status: z.string().optional().openapi({ description: "workflow status (requested, pending, queued, in_progress, failure, success, skipped)" }),
+          page: z.string().optional().openapi({ type: "integer", description: "page number of results to return (1-based)" }),
+          limit: z.string().optional().openapi({ type: "integer", description: "page size of results" }),
+          sort: z.string().optional().openapi({ description: 'sort jobs by attribute. Supported values are "id". Default is "id"' }),
+          order: z.string().optional().openapi({ description: 'sort order, either "asc" (ascending) or "desc" (descending). Default is "asc"' }),
+        }),
+      },
+      responses: {
+        200: {
+          description: "WorkflowJobsList",
+          content: { "application/json": { schema: actionWorkflowJobsResponseSchema } },
+        },
+        400: errorResponse,
+        404: notFoundResponse,
+        422: { description: "validationError", content: { "application/json": { schema: apiErrorSchema } } },
+      },
+    }),
+    async (c) => {
+      const doer = authedDoer(c);
+      const url = new URL(c.req.url);
+      const opts = parseListOptions(url);
+      const { statuses, order } = workflowJobFiltersFromQuery(url);
+      const { totalCount, jobs } = await listWorkflowJobsWire(
+        c.env.DB,
+        viewerOf(c),
+        { ownerId: doer.id, repoId: "", statuses },
+        order,
+        opts.page,
+        opts.limit,
+        await accessibleOwnerRepoIds(c.env.DB, doer.id, viewerOf(c)),
+      );
+      setPaginationHeaders(c, totalCount, opts);
+      return c.json({ jobs, total_count: totalCount }, 200);
     },
   );
 }
