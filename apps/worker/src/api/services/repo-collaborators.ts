@@ -50,6 +50,28 @@ export const REPO_COLLABORATORS_DDL_STATEMENTS: readonly string[] = [
 /** Upstream `perm.AccessMode` names the wire/body strings map to. */
 export type CollaboratorMode = "read" | "write" | "admin";
 
+/**
+ * `perm.ParseAccessMode` restricted to the read/write/admin allowlist, exactly
+ * as the collaborators PUT calls it (routers/api/v1/repo/collaborators.go:
+ * `ParseAccessMode(string(*form.Permission), AccessModeRead, AccessModeWrite,
+ * AccessModeAdmin)`). Unknown strings — "owner", "" (the empty permission
+ * string decodes as present), anything unlisted — parse to `AccessModeNone`
+ * (models/perm/access_mode.go:46-61), which `AddOrUpdateCollaborator`'s range
+ * check rejects with `ErrInvalidAccessMode` before any write or blocked-arm
+ * work (services/repository/collaboration.go:27-30). The route renders that
+ * as the blanked internal 500. `null` = that invalid-mode arm.
+ */
+export function parseCollaboratorMode(permission: string): CollaboratorMode | null {
+  switch (permission) {
+    case "read":
+    case "write":
+    case "admin":
+      return permission;
+    default:
+      return null;
+  }
+}
+
 export interface CollaboratorRow {
   repoId: string;
   userId: number;

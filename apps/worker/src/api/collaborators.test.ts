@@ -9,7 +9,13 @@
  * upsert PUT (nil permission → write) and the idempotent 204 DELETE, the
  * admin gate (403 exact upstream message; collaborator-admin grant), the
  * insertion-order paginated list, and the assignees set (write-or-above
- * collaborators + owner, active only, name order, deduped).
+ * collaborators + owner, active only, name order, deduped). The permission
+ * body string is NOT enum-validated at bind — upstream decodes any string
+ * into *RepoWritePermission and ParseAccessMode maps unknown values
+ * ("owner", "") to the service's ErrInvalidAccessMode, the blanked
+ * APIErrorInternal 500 outranking the blocked-403 arm (access_mode.go:46-61,
+ * services/repository/collaboration.go:27-30); the swagger enum stays
+ * documentation-only in the generated OpenAPI document.
  */
 
 import { env } from "cloudflare:workers";
@@ -21,6 +27,7 @@ import { repositories, userBlocking, users } from "../db/schema";
 import { createStubAuthResolver, createTokenAuthMiddleware, type AuthResolver } from "./auth";
 import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
+import { getGeneratedSpec } from "./openapi";
 import { registerCollaboratorRoutes } from "./routes/collaborators";
 import { addOrUpdateCollaborator } from "./services/repo-collaborators";
 import { applyRepoExtrasDdl, resetRepoExtrasTables } from "./testing/repo-ddl";
@@ -123,6 +130,12 @@ const authCollab = { Authorization: `token ${TOKEN_COLLAB}` };
 const repoPath = "/repos/cf-gitea-stub/shared";
 const jsonAuth = { ...auth, "Content-Type": "application/json" };
 
+/** The collab user's collaboration row on the shared repo, or null. */
+async function findCollaboratorSafe() {
+  const { findCollaborator } = await import("./services/repo-collaborators");
+  return findCollaborator(env.DB, "7201", collaboratorUserId);
+}
+
 describe("PUT /repos/{owner}/{repo}/collaborators/{collaborator} (repoAddCollaborator)", () => {
   it("adds a collaborator with the default write mode (nil permission)", async () => {
     const res = await makeApp()(`${repoPath}/collaborators/collab`, { method: "PUT", headers: jsonAuth, body: "{}" });
@@ -131,19 +144,71 @@ describe("PUT /repos/{owner}/{repo}/collaborators/{collaborator} (repoAddCollabo
     expect((await findCollaborator(env.DB, "7201", collaboratorUserId))?.mode).toBe("write");
   });
 
-  it("upserts the requested mode", async () => {
-    await makeApp()(`${repoPath}/collaborators/collab`, {
+  it("upserts the requested mode (read, then admin — each 204)", async () => {
+    expect(
+      (
+        await makeApp()(`${repoPath}/collaborators/collab`, {
+          method: "PUT",
+          headers: jsonAuth,
+          body: JSON.stringify({ permission: "read" }),
+        })
+      ).status,
+    ).toBe(204);
+    expect((await findCollaboratorSafe())?.mode).toBe("read");
+    expect(
+      (
+        await makeApp()(`${repoPath}/collaborators/collab`, {
+          method: "PUT",
+          headers: jsonAuth,
+          body: JSON.stringify({ permission: "admin" }),
+        })
+      ).status,
+    ).toBe(204);
+    expect((await findCollaboratorSafe())?.mode).toBe("admin");
+  });
+
+  it("500s an unknown permission string — upstream ParseAccessMode → ErrInvalidAccessMode, NOT a bind 422", async () => {
+    // The Go bind decodes any string into *RepoWritePermission
+    // (repo_collaborator.go:32-35); "owner" parses to AccessModeNone
+    // (access_mode.go:46-61) and the service's range check answers the
+    // blanked APIErrorInternal 500 (collaboration.go:27-30 via
+    // collaborators.go:188-196) — the smoke's F2 "422 for owner" reading
+    // was the bind-time artifact of our old z.enum, not upstream.
+    const res = await makeApp()(`${repoPath}/collaborators/collab`, {
       method: "PUT",
       headers: jsonAuth,
-      body: JSON.stringify({ permission: "read" }),
+      body: JSON.stringify({ permission: "owner" }),
     });
-    await makeApp()(`${repoPath}/collaborators/collab`, {
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ message: "", url: ERROR_URL });
+    expect(await findCollaboratorSafe()).toBeNull(); // nothing written
+  });
+
+  it("500s an empty-string permission the same way (ParseAccessMode('') → none)", async () => {
+    // The empty string decodes as a PRESENT permission (non-nil pointer),
+    // so it does NOT take the write default — it parses to none → the 500.
+    const res = await makeApp()(`${repoPath}/collaborators/collab`, {
       method: "PUT",
       headers: jsonAuth,
-      body: JSON.stringify({ permission: "admin" }),
+      body: JSON.stringify({ permission: "" }),
     });
-    const { findCollaborator } = await import("./services/repo-collaborators");
-    expect((await findCollaborator(env.DB, "7201", collaboratorUserId))?.mode).toBe("admin");
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ message: "", url: ERROR_URL });
+  });
+
+  it("keeps the contract enum in the generated OpenAPI document (documentation-only)", () => {
+    const spec = getGeneratedSpec();
+    const operation = spec.paths?.["/repos/{owner}/{repo}/collaborators/{collaborator}"]?.put as
+      | { requestBody?: { content: Record<string, { schema: unknown }> } }
+      | undefined;
+    type SchemaShape = { $ref?: string; properties?: Record<string, { enum?: string[] }> };
+    const schema = operation?.requestBody?.content?.["application/json"]?.schema as SchemaShape | undefined;
+    // The declared body schema may be inline or a $ref into components —
+    // resolve either shape down to the permission property's enum.
+    const resolved: SchemaShape | undefined = schema?.$ref
+      ? (spec.components?.schemas?.[schema.$ref.split("/").pop() ?? ""] as SchemaShape | undefined)
+      : schema;
+    expect(resolved?.properties?.permission?.enum).toEqual(["read", "write", "admin"]);
   });
 
   it("422s an unknown user with the ErrUserNotExist message (NOT the 404 family)", async () => {
@@ -179,15 +244,6 @@ describe("PUT /repos/{owner}/{repo}/collaborators/{collaborator} (repoAddCollabo
       body: JSON.stringify({ permission: "read" }),
     });
     expect(res.status).toBe(204);
-  });
-
-  it("422s a permission outside the contract enum (bind hook)", async () => {
-    const res = await makeApp()(`${repoPath}/collaborators/collab`, {
-      method: "PUT",
-      headers: jsonAuth,
-      body: JSON.stringify({ permission: "owner" }),
-    });
-    expect(res.status).toBe(422);
   });
 
   it("401s an anonymous caller", async () => {
@@ -227,6 +283,15 @@ describe("GET /repos/{owner}/{repo}/collaborators/{collaborator} (repoCheckColla
     const res = await makeApp()(`${repoPath}/collaborators/nobody`, { headers: auth });
     expect(res.status).toBe(422);
     expect(await res.json()).toEqual({ message: "user does not exist [uid: 0, name: nobody]", url: ERROR_URL });
+  });
+
+  it("204s any granted mode (IsCollaborator is mode-independent)", async () => {
+    await makeApp()(`${repoPath}/collaborators/collab`, {
+      method: "PUT",
+      headers: jsonAuth,
+      body: JSON.stringify({ permission: "read" }),
+    });
+    expect((await makeApp()(`${repoPath}/collaborators/collab`, { headers: auth })).status).toBe(204);
   });
 });
 
@@ -308,5 +373,19 @@ describe("PUT collaborators: the AddOrUpdateCollaborator blocked arms", () => {
     await drizzle(env.DB).delete(userBlocking).all();
     const res = await makeApp()(`${repoPath}/collaborators/collab`, { method: "PUT", headers: jsonAuth, body: "{}" });
     expect(res.status).toBe(204);
+  });
+
+  it("ranks the invalid-permission 500 above the blocked 403 (the range check precedes the blocked arms)", async () => {
+    // Upstream order: ParseAccessMode in the route, then the service's
+    // mode range check, THEN LoadOwner + the IsUserBlockedBy pair
+    // (collaboration.go:27-37) — so an unknown permission + a blocking row
+    // still answers the internal 500.
+    await drizzle(env.DB).insert(userBlocking).values({ blockerId: 1, blockeeId: collaboratorUserId, note: "", createdAt: new Date() });
+    const res = await makeApp()(`${repoPath}/collaborators/collab`, {
+      method: "PUT",
+      headers: jsonAuth,
+      body: JSON.stringify({ permission: "owner" }),
+    });
+    expect(res.status).toBe(500);
   });
 });

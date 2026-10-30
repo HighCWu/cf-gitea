@@ -16,6 +16,7 @@ import {
   isCollaborator,
   listRepoAssignees,
   listRepoCollaborators,
+  parseCollaboratorMode,
   type CollaboratorMode,
 } from "../services/repo-collaborators";
 import { apiUserFromRow, findUserByName, viewerOf } from "../services/repository";
@@ -210,22 +211,33 @@ export function registerCollaboratorRoutes(app: OpenAPIHono<ApiEnv>, requireAuth
       if (user.status !== "active") {
         throw new ApiError(500, "");
       }
+      const form = c.req.valid("json");
+      // Nil permission defaults to write (AddOrUpdateCollaborator's
+      // ParseAccessMode fallback, collaborators.go:183-187). A PRESENT but
+      // unknown string ("owner", "", typos — the Go bind decodes any string
+      // into *RepoWritePermission, repo_collaborator.go:32-35) parses to
+      // AccessModeNone (access_mode.go:46-61) and the service's range check
+      // rejects it with ErrInvalidAccessMode BEFORE the blocked arms
+      // (services/repository/collaboration.go:27-30) → the blanked
+      // APIErrorInternal 500, the same family as the inactive arm above.
+      const parsed = form.permission === undefined ? "write" : parseCollaboratorMode(form.permission);
+      if (parsed === null) {
+        throw new ApiError(500, "");
+      }
+      const mode: CollaboratorMode = parsed;
       // AddOrUpdateCollaborator's blocked arms (services/repository/
       // collaboration.go:35-37 via collaborators.go:188): the collaborator
       // and the repo owner must not block EACH OTHER in either direction —
       // 403 "user is blocked" (site admins are never blocked-by, the
-      // IsUserBlockedBy bypass). Runs after the inactive-account arm,
-      // exactly where upstream's LoadOwner probe sits inside the service.
+      // IsUserBlockedBy bypass). Runs after the inactive-account and
+      // invalid-permission arms, exactly where upstream's LoadOwner probe
+      // sits inside the service.
       if (
         (await isUserBlockedBy(c.env.DB, user, found.repo.ownerId ?? -1)) ||
         (await isUserBlockedBy(c.env.DB, found.owner, user.id))
       ) {
         throw new ApiError(403, BLOCKED_USER_MESSAGE);
       }
-      const form = c.req.valid("json");
-      // Nil permission defaults to write (AddOrUpdateCollaborator's
-      // ParseAccessMode fallback, collaboration.go:23).
-      const mode: CollaboratorMode = form.permission ?? "write";
       await addOrUpdateCollaborator(c.env.DB, found.repo.id, user.id, mode, new Date());
       return c.body(null, 204);
     },
