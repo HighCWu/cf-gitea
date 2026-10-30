@@ -100,12 +100,13 @@
  *     tag writer — serializeTag → putApiObjects, always `object <commit>
  *     type commit`) are RE-MATERIALIZED Worker-side through the same
  *     serializeTag: `tag` from the ref name, `object`/`type` from the
- *     byte-true (peeled, commit) pair. `tagger`/`message` are unrecoverable —
- *     no read RPC exposes tag-object bytes (readCommit peels past them;
- *     listRefs carries targets + the peel cache) — so they materialize as
- *     null/"" (canonical git allows both absent; the landed toAnnotatedTag
- *     rendering already reports tagger null + message "" for every annotated
- *     tag, services/git-models.ts). FIDELITY LIMIT: the materialized oid
+ *     byte-true (peeled, commit) pair. `tagger`/`message` are unrecoverable
+ *     here (the carry materializes a fresh minimal tag object — readTag
+ *     EXISTS since P3-11 for reads, but this write path does not consult
+ *     it) — so the materialized tag carries neither (canonical git allows
+ *     both absent; the WIRE renders them correctly via the tags service's
+ *     readTagData over the ORIGINAL object, services/tags.ts). FIDELITY
+ *     LIMIT: the materialized oid
  *     differs from the source's tag oid whenever the original carried a
  *     tagger line or message (the API path always does); the carried tag has
  *     the same name and peels to the SAME commit, while pushed/packed tags

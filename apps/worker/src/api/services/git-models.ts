@@ -49,7 +49,7 @@ import type {
   Tag,
 } from "../models/git";
 import type { ContentsResponse } from "../models/contents";
-import type { EngineReads } from "./engine";
+import type { EngineReads, RefTip } from "./engine";
 import { apiUserFromRow, type RepositoryWithOwner, type UserRow, type Viewer } from "./repository";
 
 /** Files at or under this many bytes carry base64 `content` on GET contents. */
@@ -308,52 +308,108 @@ export function toBranch(
 }
 
 /**
- * Tag rendering from the refs list — the tag OBJECT bytes are engine-resident
- * and the landed public RPC surface exposes only ref targets + the peel cache,
- * so `message` renders "" and annotated vs lightweight is answered by `peeled`
- * (present = annotated). Documented SPEC-0004 deviation (message text needs a
- * read-tag RPC the boundary does not carry yet).
+ * The served message/tagger arms the tag converters render — structurally
+ * services/tags.ts's readTagData answer (upstream's git.Tag surface: the
+ * MessageUTF8 / Tagger fields ToTag and ToAnnotatedTag read in
+ * services/convert/convert.go). Declared structurally here so the tags
+ * service feeds its data with no import cycle.
  */
-export function toTag(name: string, tip: { target: string; peeled?: string }, commitSha: string, pair: RepositoryWithOwner, origin: string): Tag {
+export interface TagRenderArms {
+  /** The annotated tag object's payload (armor-stripped engine-side) or,
+   *  for a commit-tipped lightweight tag, the commit's message; "" when the
+   *  read degraded (readTagData's transport posture). */
+  message: string;
+  /** The annotated tagger; null for a lightweight tag or a dropped header
+   *  (absent on the Tag shape — the arm is annotated-only upstream). */
+  tagger?: Person | null;
+}
+
+/** True when the argument carries the arms rather than the repo pair. */
+function isTagArms(value: TagRenderArms | RepositoryWithOwner): value is TagRenderArms {
+  return "message" in value;
+}
+
+/**
+ * convert.ToTag (convert.go:227) — archive URLs on the /archive path; `id`
+ * is the ref target (the tag OBJECT oid for annotated tags, the commit oid
+ * for lightweight ones). `message` renders the served arm (upstream's
+ * t.MessageUTF8()): the annotated tag object's payload or, for a
+ * commit-tipped lightweight tag, the commit's message — callers feed the
+ * services/tags.ts readTagData answer. The arms-less call renders "" (the
+ * readTagData degraded posture) and exists only as the landed renderTag
+ * shim: that render spreads the same value over it, byte-identical wire,
+ * until its owner folds the spread into bare delegation. (The pre-P3-11
+ * SPEC-0004 deviation note — "message needs a read-tag RPC the boundary
+ * does not carry" — is CLOSED: the readTag RPC landed, residuals-v1.3.2
+ * P3-11.)
+ */
+export function toTag(name: string, tip: RefTip, commitSha: string, data: TagRenderArms, pair: RepositoryWithOwner, origin: string): Tag;
+export function toTag(name: string, tip: RefTip, commitSha: string, pair: RepositoryWithOwner, origin: string): Tag;
+export function toTag(
+  name: string,
+  tip: RefTip,
+  commitSha: string,
+  dataOrPair: TagRenderArms | RepositoryWithOwner,
+  pairOrOrigin?: RepositoryWithOwner | string,
+  origin?: string,
+): Tag {
+  const arms = isTagArms(dataOrPair) ? dataOrPair : null;
+  const pair = (arms === null ? dataOrPair : pairOrOrigin) as RepositoryWithOwner;
+  const base = (arms === null ? pairOrOrigin : origin) as string;
   const owner = encodeURIComponent(pair.repo.ownerNamespace);
   const slug = encodeURIComponent(pair.repo.slug);
-  const htmlUrl = `${origin}/${owner}/${slug}`;
+  const htmlUrl = `${base}/${owner}/${slug}`;
   return {
     name,
-    message: "",
+    message: arms?.message ?? "",
     // upstream Tag.ID = the ref target: the tag OBJECT oid for annotated
     // tags, the commit oid for lightweight ones.
     id: tip.target,
     commit: {
       sha: commitSha,
-      url: `${origin}/api/v1/repos/${owner}/${slug}/git/commits/${commitSha}`,
+      url: `${base}/api/v1/repos/${owner}/${slug}/git/commits/${commitSha}`,
     },
     zipball_url: `${htmlUrl}/archive/${encodeURIComponent(`${name}.zip`)}`,
     tarball_url: `${htmlUrl}/archive/${encodeURIComponent(`${name}.tar.gz`)}`,
   };
 }
 
-/** AnnotatedTag from refs data (same boundary note as toTag). */
+/**
+ * convert.ToAnnotatedTag (convert.go:994) — the AnnotatedTag surface
+ * (GET /git/tags/{sha}, annotated tag objects only): the same served
+ * message arm as toTag plus the `tagger` identity rendered ToCommitUser-
+ * shaped (UTC RFC3339 via personDate); null when the tag object omits the
+ * header (the schema is nullable — upstream's parse defaults it to the
+ * empty identity) or the read degraded. The arms-less call is the landed
+ * renderAnnotatedTag shim (same note as toTag).
+ */
+export function toAnnotatedTag(name: string, tip: RefTip, commitSha: string, data: TagRenderArms, pair: RepositoryWithOwner, origin: string): AnnotatedTag;
+export function toAnnotatedTag(name: string, tip: RefTip, commitSha: string, pair: RepositoryWithOwner, origin: string): AnnotatedTag;
 export function toAnnotatedTag(
   name: string,
-  tip: { target: string; peeled?: string },
+  tip: RefTip,
   commitSha: string,
-  pair: RepositoryWithOwner,
-  origin: string,
+  dataOrPair: TagRenderArms | RepositoryWithOwner,
+  pairOrOrigin?: RepositoryWithOwner | string,
+  origin?: string,
 ): AnnotatedTag {
+  const arms = isTagArms(dataOrPair) ? dataOrPair : null;
+  const pair = (arms === null ? dataOrPair : pairOrOrigin) as RepositoryWithOwner;
+  const base = (arms === null ? pairOrOrigin : origin) as string;
   const owner = encodeURIComponent(pair.repo.ownerNamespace);
   const slug = encodeURIComponent(pair.repo.slug);
+  const tagger = arms?.tagger ?? null;
   return {
     sha: tip.target,
     tag: name,
-    message: "",
+    message: arms?.message ?? "",
     object: {
       sha: commitSha,
       type: "commit",
-      url: `${origin}/api/v1/repos/${owner}/${slug}/git/commits/${commitSha}`,
+      url: `${base}/api/v1/repos/${owner}/${slug}/git/commits/${commitSha}`,
     },
-    tagger: null,
-    url: `${origin}/api/v1/repos/${owner}/${slug}/git/tags/${tip.target}`,
+    tagger: tagger === null ? null : { name: tagger.name, email: tagger.email, date: personDate(tagger) },
+    url: `${base}/api/v1/repos/${owner}/${slug}/git/tags/${tip.target}`,
     verification: null,
   };
 }
