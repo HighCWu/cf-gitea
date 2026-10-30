@@ -5707,8 +5707,14 @@ async function resolveUiSession(c: Context<{ Bindings: Env }>): Promise<Resolved
   let setCookie: string | null = null;
   let viewer: Viewer;
   try {
-    const manifest = await loadManifest(assetsBinding(c.env), url.origin);
-    const resolution = await resolveViewer(c.env, c.req.raw, { waitUntil });
+    // The P3-12 pair: the manifest fetch and the session resolution (whose
+    // chain owns the users-row read) are independent — the 06b3384 Promise.all
+    // precedent (the F1 latency lever). The bell count still follows the
+    // viewer serially (it needs viewer.id).
+    const [manifest, resolution] = await Promise.all([
+      loadManifest(assetsBinding(c.env), url.origin),
+      resolveViewer(c.env, c.req.raw, { waitUntil }),
+    ]);
     // resolveViewer's setCookie is the RAW session value (id:secret) on
     // resolveViewer's setCookie is ALWAYS a full §2.7 directive now (the
     // rotation arm wraps there) — attach as-is. The old unconditional
