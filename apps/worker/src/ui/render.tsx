@@ -52,6 +52,10 @@ export async function renderUiPage(options: {
   switch (route.family) {
     case "home": {
       const data = await loadHomeData(engine, repo, url.origin);
+      // The empty-repo arm's CanWriteCode fold gets the true D1 grant
+      // (collaborator/team arms — the same predicate the file view rides at
+      // the src arm); archived repos are read-only, so the grant folds false.
+      data.canWriteCode = repo.isArchived ? false : await canWriteRepo(env, repo, ctx.viewer);
       return { status: 200, html: renderPage(<HomePage ctx={ctx} data={data} />) };
     }
     case "commits": {

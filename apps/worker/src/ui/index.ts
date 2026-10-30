@@ -12777,6 +12777,9 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   }
   if (route.family === "issues" || route.family === "pulls") {
     const data = await loadIssuesListData(c.env.DB, repo.id, route.family, url.searchParams);
+    // The pulls arm's CanCreateNewPull fold gets the true D1 grant
+    // (collaborator/team arms — the milestones dispatch's convention).
+    data.canWriteIssues = await canWriteRepo(c.env, repo, viewer);
     return respond(c.html(renderIssuesListPage(ctx, data), 200));
   }
   // Wave-3 dispatch: the issue/PR detail page (render.tsx never sees this

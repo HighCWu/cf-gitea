@@ -72,7 +72,7 @@ import { seedVerifiedUser } from "../../auth/testing/seeds";
 import { createRepoLabel } from "../../api/services/labels";
 import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
-import { pullRequests, repositories, users } from "../../db/schema";
+import { pullRequests, repoCollaborators, repositories, users } from "../../db/schema";
 import type { UiManifest } from "../manifest";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
@@ -797,6 +797,30 @@ describe("the New Pull Request tail (list.tmpl:27-33's three viewer states over 
       '<a class="ui small primary button new-pr-button issue-list-new" href="/alice/pradmin/compare/main...main">New Pull Request</a>',
     );
     expect(html).not.toContain("issue-list-new disabled");
+  });
+
+  it("a write-granted collaborator renders the live link (the dispatch-threaded D1 grant — the static-arms-only limit retired)", async () => {
+    const repo = await seedButtonRepo("prcollab");
+    const carol = await seedVerifiedUser({ username: "carol" });
+    await drizzle(env.DB)
+      .insert(repoCollaborators)
+      .values({ repoId: repo.id, userId: carol.id, mode: "write", createdAt: new Date(), updatedAt: new Date() });
+    const html = await (
+      await fetchUi("/alice/prcollab/pulls", { headers: { cookie: await sessionHeader(carol.id) } })
+    ).text();
+    // canWriteRepo's collaborator arm (repo-access.ts via sessionRepoGrant) —
+    // the index.ts dispatch threads data.canWriteIssues, so CanCreateNewPull
+    // is true for carol despite neither static arm (not admin, not owner).
+    expect(html).toContain(
+      '<a class="ui small primary button new-pr-button issue-list-new" href="/alice/prcollab/compare/main...main">New Pull Request</a>',
+    );
+    expect(html).not.toContain("issue-list-new disabled");
+    // The control arm: a stranger WITHOUT the row keeps upstream's disabled.
+    const mallory = await seedVerifiedUser({ username: "mallory" });
+    const stranger = await (
+      await fetchUi("/alice/prcollab/pulls", { headers: { cookie: await sessionHeader(mallory.id) } })
+    ).text();
+    expect(stranger).toContain("issue-list-new disabled");
   });
 
   it("the anonymous viewer gets the live /login round-trip onto the compare target", async () => {

@@ -189,6 +189,11 @@ export interface IssuesListData {
   /** The active single filter facets, echoed into tab/pagination hrefs. */
   labelIds: number[];
   milestoneId: number | null;
+  /** The D1 write grant, set by the index.ts dispatch (canWriteRepo —
+   *  collaborator/team arms included) for the pulls arm's CanCreateNewPull
+   *  fold; the loader (d1, repoId, …) never sees the viewer, so this stays
+   *  undefined for direct-loader callers (the static arms then apply). */
+  canWriteIssues?: boolean;
 }
 
 /** `?labels=` — comma-separated label ids (upstream stringsToInts split);
@@ -532,20 +537,21 @@ export function renderIssuesListPage(ctx: UiContext, data: IssuesListData): stri
 }
 
 /**
- * The `PullRequestCtx.CanCreateNewPull` reduction this page's render path can
- * evaluate (the header comment's disclosure): `canWriteRepository`'s STATIC
- * arms only — site admin (`is_admin` → the admin matrix arm) and the repo
- * owner (the case-folded namespace fold, `requesterLoginLower`'s owner line).
- * The collaborator-row and §3.5 team arms need the D1 grant read, which the
- * fixed `(d1, repoId, listKind, params)` loader signature never sees — a
- * write-granted collaborator renders the reader arm (`disabled`), the same
- * conservative arm upstream renders a no-fork reader. Anonymous is the
- * caller's arm (the login round-trip link), never this predicate.
+ * The `PullRequestCtx.CanCreateNewPull` reduction: the static grant arms
+ * (site admin via `is_admin`, the repo owner via the case-folded namespace
+ * fold) OR the dispatch-threaded D1 grant (`data.canWriteIssues`, set by the
+ * index.ts dispatch from canWriteRepo — the collaborator-row and §3.5 team
+ * arms). Anonymous is the caller's arm (the login round-trip link), never
+ * this predicate.
  */
-export function viewerCanCreatePull(ctx: UiContext): boolean {
+export function viewerCanCreatePull(ctx: UiContext, canWriteRepoGrant?: boolean): boolean {
   const { viewer, repo } = ctx;
   if (viewer.kind !== "user" || repo === undefined) return false;
-  return viewer.isAdmin || repo.ownerNamespace.toLowerCase() === viewer.username.toLowerCase();
+  return (
+    canWriteRepoGrant === true ||
+    viewer.isAdmin ||
+    repo.ownerNamespace.toLowerCase() === viewer.username.toLowerCase()
+  );
 }
 
 /** The issues/pulls list page (§2.4.1 discriminator: `repository
@@ -604,7 +610,7 @@ export function IssuesListPage(props: { ctx: UiContext; data: IssuesListData }) 
             ) : (
               <a
                 class={
-                  viewerCanCreatePull(ctx)
+                  viewerCanCreatePull(ctx, data.canWriteIssues)
                     ? "ui small primary button new-pr-button issue-list-new"
                     : "ui small primary button new-pr-button issue-list-new disabled"
                 }

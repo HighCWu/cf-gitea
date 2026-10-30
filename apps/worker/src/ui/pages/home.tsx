@@ -216,6 +216,11 @@ export interface HomeData {
     /** The decoded source text — the plain-text variant's `<pre>` body. */
     text: string;
   } | null;
+  /** The D1 write grant for the empty-repo arm's CanWriteCode fold — set by
+   *  the renderUiPage home arm (canWriteRepo: collaborator/team arms
+   *  included), NOT the loader (engine-only, no D1). Undefined = the caller
+   *  hasn't threaded it → EmptyRepoPage falls back to the static arms. */
+  canWriteCode?: boolean;
 }
 
 /** Load the home page's data (§3.2: direct service/RPC calls, no self-fetch).
@@ -284,7 +289,7 @@ export async function loadHomeData(engine: EngineClient, repo: RepoRow, origin: 
  *  bundle plumbing this module does not own — the command blocks carry the
  *  same clone URL meanwhile. Upstream's sha256 `--object-format` arm is
  *  omitted: every landed row is sha1. */
-export function EmptyRepoPage(props: { ctx: UiContext }) {
+export function EmptyRepoPage(props: { ctx: UiContext; canWriteCode?: boolean }) {
   const { ctx } = props;
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("EmptyRepoPage requires ctx.repo");
@@ -294,11 +299,13 @@ export function EmptyRepoPage(props: { ctx: UiContext }) {
   // not `master` (empty.tmpl's `{{if ne .Repository.DefaultBranch "master"}}`).
   const checkoutLine = branch === "master" ? [] : [`git checkout -b ${branch}`];
   // empty.tmpl's arm chain (CanWriteCode → guide, else the message). The
-  // writer fold mirrors issues-list.tsx's viewerCanCreatePull (the static
-  // grant arms — see that function's disclosure).
+  // threaded prop is the D1 grant (canWriteRepo — collaborator/team arms
+  // included); the static fold is the fallback when the caller hasn't
+  // threaded it (site admin + the case-folded owner).
   const canWriteCode =
-    ctx.viewer.kind === "user" &&
-    (ctx.viewer.isAdmin || repo.ownerNamespace.toLowerCase() === ctx.viewer.username.toLowerCase());
+    props.canWriteCode ??
+    (ctx.viewer.kind === "user" &&
+      (ctx.viewer.isAdmin || repo.ownerNamespace.toLowerCase() === ctx.viewer.username.toLowerCase()));
   if (!canWriteCode) {
     return (
       <BaseLayout ctx={ctx} pageClass="repository quickstart" activeTab="code">
@@ -381,11 +388,11 @@ export function HomePage(props: { ctx: UiContext; data: HomeData }) {
   const { ctx, data } = props;
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("HomePage requires ctx.repo");
-  if (data.isEmpty) return <EmptyRepoPage ctx={ctx} />;
+  if (data.isEmpty) return <EmptyRepoPage ctx={ctx} canWriteCode={data.canWriteCode} />;
 
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   const head = data.refs.headBranch;
-  if (head === null) return <EmptyRepoPage ctx={ctx} />;
+  if (head === null) return <EmptyRepoPage ctx={ctx} canWriteCode={data.canWriteCode} />;
 
   const readme = data.readme;
   return (

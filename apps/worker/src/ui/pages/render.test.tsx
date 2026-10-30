@@ -308,6 +308,24 @@ describe("loadHomeData + HomePage degradation paths", () => {
     expect(html).not.toContain("Quick Guide");
   });
 
+  it("a write-granted collaborator renders the Quick Guide via the threaded canWriteCode grant (the D1 arm the static fold can't see)", async () => {
+    // The renderUiPage home arm threads data.canWriteCode = canWriteRepo(...)
+    // (collaborator/team arms); the component folds prop ?? static-arms, so
+    // the same signed-in stranger flips onto the writer arm when the grant
+    // rides along — and stays on the message arm when it doesn't.
+    const engine = stubEngine({ listRefs: () => Promise.resolve({ head: null, refs: [] }) });
+    const granted = await loadHomeData(engine, repo, ctx.origin);
+    granted.canWriteCode = true;
+    const html = renderToString(<HomePage ctx={readerCtx} data={granted} />);
+    expect(html).toContain("Quick Guide");
+    expect(html).toContain("git push -u origin main");
+    expect(html).not.toContain('<div class="ui segment center">This repository does not have any content.</div>');
+    // The un-prop'd twin stays on the message arm (the fallback fold).
+    const ungranted = await loadHomeData(engine, repo, ctx.origin);
+    const control = renderToString(<HomePage ctx={readerCtx} data={ungranted} />);
+    expect(control).not.toContain("Quick Guide");
+  });
+
   it("skips the README when the entry exceeds the 512KiB cap and never calls readBlob (the home twin of §4.3)", async () => {
     // Provenance: wave-polish-matrix-6 — loadHomeData's size gate
     // (`(readmeEntry.size ?? 0) <= 512 * 1024`) decides BEFORE readBlob like
