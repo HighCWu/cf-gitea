@@ -1074,11 +1074,13 @@ export function registerIssueRoutes(
     // an unknown login is the APIErrorAuto(ErrUserNotExist) 404, resolved in
     // upstream's order (created → assigned → mentioned).
     let posterId: number | null | undefined;
-    // assigned_by/mentioned_by: no assignee/mention tracking exists yet, so
-    // a RESOLVED user still matches the empty set (upstream's indexer filter
-    // AssignedUserID/MentionedUserID finds nothing) — only the unknown-login
-    // 404 above is observable today.
-    let matchesEmpty = false;
+    // assigned_by rides the issue_assignees subquery (issue_search.go:373-
+    // 383's numeric arm — the service-half seam, services/issues.ts).
+    // mentioned_by: no mention store exists yet, so a RESOLVED user matches
+    // the empty set (upstream's indexer MentionedUserID finds nothing over
+    // zero rows) — only the unknown-login 404 is observable today.
+    let assigneeId: number | null | undefined;
+    let mentionedMatchesEmpty = false;
     for (const filter of ["created_by", "assigned_by", "mentioned_by"] as const) {
       const name = (url.searchParams.get(filter) ?? "").trim();
       if (name === "") continue;
@@ -1088,11 +1090,13 @@ export function registerIssueRoutes(
       }
       if (filter === "created_by") {
         posterId = id;
+      } else if (filter === "assigned_by") {
+        assigneeId = id;
       } else {
-        matchesEmpty = true;
+        mentionedMatchesEmpty = true;
       }
     }
-    if (matchesEmpty) {
+    if (mentionedMatchesEmpty) {
       posterId = -1;
     }
 
@@ -1108,6 +1112,7 @@ export function registerIssueRoutes(
       since,
       before,
       posterId,
+      assigneeId,
       page: listOptions.page,
       limit: listOptions.limit,
     });
@@ -1858,6 +1863,25 @@ export function registerIssueRoutes(
         throw userNotExistError(createdBy);
       }
     }
+    // The global search's assigned_by rides the same issue_assignees
+    // subquery (issue_search.go:373-383's numeric arm — the shared
+    // IssueListFilters seam); mentioned_by still matches empty (no store).
+    const assignedBy = (url.searchParams.get("assigned_by") ?? "").trim();
+    let assigneeId: number | null | undefined;
+    if (assignedBy !== "") {
+      assigneeId = await userIdForFilter(c.env.DB, assignedBy);
+      if (assigneeId === null) {
+        throw userNotExistError(assignedBy);
+      }
+    }
+    const mentionedBy = (url.searchParams.get("mentioned_by") ?? "").trim();
+    if (mentionedBy !== "") {
+      const id = await userIdForFilter(c.env.DB, mentionedBy);
+      if (id === null) {
+        throw userNotExistError(mentionedBy);
+      }
+      posterId = -1; // resolved user over zero mention rows — the empty set
+    }
     const requester = c.get("authUser");
     if (requester !== undefined) {
       if (url.searchParams.get("created") === "true") {
@@ -1881,6 +1905,7 @@ export function registerIssueRoutes(
       since,
       before,
       posterId,
+      assigneeId,
       page: listOptions.page,
       limit: listOptions.limit,
     });

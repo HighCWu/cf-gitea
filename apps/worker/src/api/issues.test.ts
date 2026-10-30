@@ -578,6 +578,26 @@ describe("GET /repos/{owner}/{repo}/issues (issueListIssues)", () => {
     });
   });
 
+  it("assigned_by filters over the issue_assignees rows — the wired numeric arm (issue_search.go:373-383)", async () => {
+    const owner = await seedUser("Alice");
+    const neighbor = await seedUser("Bob");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const assigned = await seedIssue(repoId, "bob's issue", { posterId: owner.id });
+    await seedIssue(repoId, "unassigned", { posterId: owner.id });
+    await db().insert(issueAssignees).values({ issueId: assigned.id, assigneeId: neighbor.id });
+
+    const bobList = await router()("/repos/alice/visible/issues?assigned_by=BOB");
+    expect(bobList.status).toBe(200);
+    const bobRows = await bobList.json<{ title: string }[]>();
+    expect(bobRows.map((row) => row.title)).toEqual(["bob's issue"]);
+
+    // A resolved user with no assignments still matches empty (the subquery
+    // finds nothing — same observable as the pre-wiring sentinel).
+    const aliceList = await router()("/repos/alice/visible/issues?assigned_by=alice");
+    expect(aliceList.status).toBe(200);
+    expect(await aliceList.json<unknown[]>()).toEqual([]);
+  });
+
   it("404s an invisible repository", async () => {
     await seedUser("Alice");
     const res = await router()("/repos/alice/ghost/issues");
