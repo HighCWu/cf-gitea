@@ -14,8 +14,8 @@ import { SELF, env } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { basicTokenHeader, mintFor, resetAuthTables, seedVerifiedUser } from "../auth/testing/seeds";
-import { repositories } from "../db/schema";
+import { basicHeader, basicTokenHeader, mintFor, resetAuthTables, seedVerifiedUser } from "../auth/testing/seeds";
+import { deployKeys, repositories } from "../db/schema";
 import { LFS_MEDIA_TYPE } from "../services/lfs/batch";
 import {
   goParseInt64,
@@ -24,7 +24,7 @@ import {
   rfc3339Seconds,
 } from "../services/lfs/locks";
 import { applyLfsObjectsDdl, resetLfsTables } from "../services/lfs/testing";
-import { parseLfsRoute } from "./router";
+import { LFS_DEPLOY_KEY_DOER_ID, parseLfsRoute } from "./router";
 
 const LOCKS_JSON = "application/json;charset=utf-8";
 
@@ -35,6 +35,7 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   await resetAuthTables();
+  await env.DB.prepare("DELETE FROM deploy_keys").run();
   await env.DB.prepare("DELETE FROM repositories").run();
   await resetLfsTables();
 });
@@ -106,6 +107,44 @@ async function seedFixtures(): Promise<Fixtures> {
 
 function repoUrl(repo: SeededRepo): string {
   return `http://example.com/${repo.owner}/${repo.slug}.git/info/lfs`;
+}
+
+/**
+ * Mint a `gdt_` deploy-key row bound to a seeded repo — addDeployKeyToken's
+ * row shape (sha256 + key_type=2, mode 1|2), seeded locally because this
+ * suite pins the LOCKS side (the auth suite owns the verifier's own pins).
+ */
+async function seedDeployKeyToken(repoId: string, mode: 1 | 2): Promise<string> {
+  const token = `gdt_${`${crypto.randomUUID()}${crypto.randomUUID()}`.replaceAll("-", "").slice(0, 43)}`;
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+  const tokenHash = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const now = new Date();
+  await drizzle(env.DB)
+    .insert(deployKeys)
+    .values({
+      keyId: 0,
+      repoId,
+      name: "deploy",
+      keyType: 2,
+      fingerprint: `${token.slice(0, 6)}********${token.slice(-2)}`,
+      tokenHash,
+      mode,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .run();
+  return token;
+}
+
+/** Direct D1 read of a lock row (the synthetic-key lock wire-renders id-less). */
+async function firstLockRow(): Promise<{ id: number; ownerId: number; path: string }> {
+  const row = await env.DB.prepare("SELECT id, owner_id, path FROM lfs_locks LIMIT 1").first<{
+    id: number;
+    owner_id: number;
+    path: string;
+  }>();
+  if (row === null) throw new Error("no lock row seeded");
+  return { id: row.id, ownerId: row.owner_id, path: row.path };
 }
 
 function locksUrl(repo: SeededRepo, tail = ""): string {
@@ -642,6 +681,133 @@ describe("locks auth posture (requireSigned + per-verb messages)", () => {
     });
     expect(mismatch.status).toBe(404); // catch-all: no media-type check
     expect(await mismatch.text()).toBe("404 page not found\n");
+  });
+});
+
+// --- deploy-key tokens on locks (F1, upstream AllowDeployToken) ---------------------
+
+describe("deploy-key tokens on the locks family (F1)", () => {
+  /**
+   * Upstream mounts the LFS family (locks included) WITH `AllowDeployToken`
+   * (web.go:1777). A Basic `gdt_` credential signs in as the synthetic key
+   * user; the per-verb `authenticate` mode decides: list is a READ route
+   * (locks.go:67 — any key mode), create/verify/unlock are WRITE routes
+   * (locks.go:156/221/289 — verify's own asymmetry: scope Read,
+   * authenticate Write). A foreign key's zero permission
+   * (repo_permission.go:387-409 "grants nothing here") takes the same
+   * route-message 401.
+   */
+
+  it("a read-mode key lists locks but cannot create or verify (write routes)", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    const repo = await seedRepo("alice", "deployed", "private");
+    const token = await seedDeployKeyToken(repo.id, 1);
+
+    const list = await lockFetch(locksUrl(repo), { method: "GET", token });
+    expect(list.status).toBe(200);
+    expect(await list.json()).toEqual({ locks: [] });
+
+    const create = await lockFetch(locksUrl(repo), { method: "POST", token, body: { path: "x.bin" } });
+    expect(create.status).toBe(401);
+    expect(await create.json()).toEqual({ message: "You must have push access to create locks" });
+
+    const verify = await lockFetch(locksUrl(repo, "/verify"), { method: "POST", token, body: {} });
+    expect(verify.status).toBe(401);
+    // Upstream's verify asymmetry (locks.go:216 vs 221): scope Read, but the
+    // authenticate call requires WRITE — a read-only key is short of it.
+    expect(await verify.json()).toEqual({ message: "You must have push access to verify locks" });
+  });
+
+  it("a write-mode key creates, verifies and unlocks its repo's locks; the lock row carries the synthetic -3 owner", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    const repo = await seedRepo("alice", "deployed", "private");
+    const token = await seedDeployKeyToken(repo.id, 2);
+
+    const create = await lockFetch(locksUrl(repo), { method: "POST", token, body: { path: "bin/data.bin" } });
+    expect(create.status).toBe(201);
+    // The synthetic key user (upstream DeployKeyUserID -3) has NO users row,
+    // so ToLFSLock's nil-owner arm renders `"lock":null` — upstream-exact.
+    expect(await create.json()).toEqual({ lock: null });
+
+    const row = await firstLockRow();
+    expect(row.ownerId).toBe(LFS_DEPLOY_KEY_DOER_ID);
+    expect(row.path).toBe("bin/data.bin");
+
+    // verify: doer -3 matches the -3 owner → "ours".
+    const verify = await lockFetch(locksUrl(repo, "/verify"), { method: "POST", token, body: {} });
+    expect(verify.status).toBe(200);
+    expect(await verify.json()).toEqual({ ours: [null], theirs: [] });
+
+    // unlock (same key, force absent → owner match on -3) echoes the nil lock.
+    const unlock = await lockFetch(locksUrl(repo, `/${row.id}/unlock`), {
+      method: "POST",
+      token,
+      body: {},
+      extraHeaders: { authorization: basicHeader("deploy", token) },
+    });
+    expect(unlock.status).toBe(200);
+    expect(await unlock.json()).toEqual({ lock: null });
+  });
+
+  it("the REPO OWNER cannot unlock a deploy-key lock without force (the -3 owner mismatch) but force unlocks", async () => {
+    const fixtures = await seedFixtures();
+    const token = await seedDeployKeyToken(fixtures.privateRepo.id, 2);
+    const create = await lockFetch(locksUrl(fixtures.privateRepo), {
+      method: "POST",
+      token,
+      body: { path: "bin/other.bin" },
+    });
+    expect(create.status).toBe(201);
+    await create.json(); // drain the body (the -3 lock renders null)
+    const row = await firstLockRow();
+
+    // The owner's PAT: not the owner of the -3 lock, force=false → the
+    // upstream 500 bug-compat arm (locks.go:311-318) — the smoke doc's
+    // "unreachable" arm, reachable once deploy keys authenticate here.
+    const noForce = await lockFetch(locksUrl(fixtures.privateRepo, `/${row.id}/unlock`), {
+      method: "POST",
+      token: fixtures.write,
+      body: { force: false },
+    });
+    expect(noForce.status).toBe(500);
+    expect(await noForce.json()).toEqual({ message: "unable to delete lock : Internal Server Error" });
+
+    const force = await lockFetch(locksUrl(fixtures.privateRepo, `/${row.id}/unlock`), {
+      method: "POST",
+      token: fixtures.write,
+      body: { force: true },
+    });
+    expect(force.status).toBe(200);
+    expect(await force.json()).toEqual({ lock: null });
+  });
+
+  it("a FOREIGN repo's key gets the zero-perm route-message 401 (public repo included)", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    await seedVerifiedUser({ username: "Bob" });
+    const bobPublic = await seedRepo("bob", "public-lfs", "public");
+    const aliceOwn = await seedRepo("alice", "own", "private");
+    const token = await seedDeployKeyToken(aliceOwn.id, 2);
+
+    const list = await lockFetch(locksUrl(bobPublic), { method: "GET", token });
+    expect(list.status).toBe(401);
+    expect(list.headers.get("www-authenticate")).toBe('Basic realm="gitea-lfs"');
+    expect(await list.json()).toEqual({ message: "You must have pull access to list locks" });
+  });
+
+  it("an archived own repo refuses the write-armed key's create (§4.11 posture), list unaffected", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    const repo = await seedRepo("alice", "frozen", "private", { isArchived: true });
+    const token = await seedDeployKeyToken(repo.id, 2);
+
+    const create = await lockFetch(locksUrl(repo), { method: "POST", token, body: { path: "x.bin" } });
+    expect(create.status).toBe(403);
+    expect(await create.text()).toBe(
+      "This repo is archived. You can view files and clone it, but cannot push or open issues/pull-requests.",
+    );
+
+    const list = await lockFetch(locksUrl(repo), { method: "GET", token });
+    expect(list.status).toBe(200);
+    expect(await list.json()).toEqual({ locks: [] });
   });
 });
 

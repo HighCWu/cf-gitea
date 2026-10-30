@@ -20,6 +20,13 @@
  * requests 401 even on public repos, with the route-specific message:
  * "You must have pull access to list locks" / "You must have push access to
  * {create,verify,delete} locks" + `WWW-Authenticate: Basic realm="gitea-lfs"`.
+ * A `gdt_` deploy-key token signs in as the synthetic key user (upstream
+ * mounts the family WITH `AllowDeployToken`, web.go:1777): list needs the
+ * key's own repo at ANY mode, create/verify/unlock need mode >= 2 (verify is
+ * a WRITE-authenticate route at the pin, locks.go:216 vs 221); a foreign
+ * key's zero permission takes the same route-message 401 (no anonymous arm
+ * for the key user). Doer attribution uses upstream's shared synthetic user
+ * id -3 (`LFS_DEPLOY_KEY_DOER_ID`).
  * A known token lacking the scope category → `CheckRepoScopedToken` → plain
  * 403 "Forbidden\n" (`scopeForbidden`, unchanged). The no-grant arm is a 401
  * with the same route message (upstream's `authenticate` false arm) — the
@@ -46,6 +53,13 @@
  */
 
 import type { AuthUser } from "../auth/auth-context";
+import {
+  DEPLOY_TOKEN_PREFIX,
+  needsDeployKeyLastUsedTouch,
+  touchDeployKeyLastUsed,
+  verifyDeployToken,
+  type VerifiedDeployKey,
+} from "../auth/deploy-token-service";
 import { D1FailureLimiter } from "../auth/failure-limiter";
 import { basicAuthTokenCandidate, parseAuthorizationHeader } from "../auth/httpauth";
 import {
@@ -72,7 +86,7 @@ import {
   type LfsLockWire,
 } from "../services/lfs/locks";
 import type { LfsDeps, LfsRoute, ResolvedLfsRepo } from "./router";
-import { lfsNotFound, lfsRepoId, readBodyCapped } from "./router";
+import { LFS_DEPLOY_KEY_DOER_ID, decideLfsDeployKey, lfsNotFound, lfsRepoId, readBodyCapped } from "./router";
 
 /**
  * Lock bodies are one path / one force flag (git-lfs sends ~50 bytes). The
@@ -131,12 +145,17 @@ function lockWriteStatus(status: number, statusText: string): Response {
 
 /**
  * `authorizeLfsLocks` mirrors `authorizeLfs` (router.ts) decision-for-decision
- * — credential parse → failure limiter → token verify → scope → account
- * status → grants → write checks — with two locks-specific overrides: the
- * signed-in requirement (no anonymous-read pass, `requireSigned`) and the
- * 401 bodies, which carry the route-specific pull/push messages instead of
- * the generic "Unauthorized". The disabled/owner-prohibited arms keep the
- * family posture (§5.5: accountDisabled/ownerUnavailable 403s).
+ * — credential parse → failure limiter → deploy-key arm → token verify →
+ * scope → account status → grants → write checks — with two locks-specific
+ * overrides: the signed-in requirement (no anonymous-read pass,
+ * `requireSigned`) and the 401 bodies, which carry the route-specific
+ * pull/push messages instead of the generic "Unauthorized". The
+ * disabled/owner-prohibited arms keep the family posture (§5.5:
+ * accountDisabled/ownerUnavailable 403s).
+ *
+ * Success resolves the request's doer id: the verified user's id, or
+ * upstream's shared synthetic key user (-3, `LFS_DEPLOY_KEY_DOER_ID`) for a
+ * `gdt_` credential — locks ownership compares against it.
  */
 export async function authorizeLfsLocks(input: {
   req: Request;
@@ -148,14 +167,18 @@ export async function authorizeLfsLocks(input: {
   repo: ResolvedLfsRepo["repo"];
   owner: AuthUser | null;
   ownerVisibility: ResolvedLfsRepo["ownerVisibility"];
-}): Promise<Response | VerifiedAuth> {
+}): Promise<Response | { doerId: number }> {
   const { req, env, verb, access, scope, repo, owner } = input;
   const message = LOCK_MESSAGES[verb];
 
   const header = req.headers.get("authorization");
   const parsed = header === null ? null : parseAuthorizationHeader(header);
-  const credential =
-    parsed?.bearerToken?.token ?? (parsed?.basicAuth ? basicAuthTokenCandidate(parsed.basicAuth) : null);
+  // Two credential carriers, kept apart (mirrors authorizeLfs): the
+  // deploy-token method parses ONLY the Basic header, so a `Bearer gdt_…`
+  // rides the access-token arm and fails there.
+  const bearerToken = parsed?.bearerToken?.token ?? null;
+  const basicCandidate = parsed?.basicAuth ? basicAuthTokenCandidate(parsed.basicAuth) : null;
+  const credential = bearerToken ?? basicCandidate;
 
   // requireSigned (locks.go:67/156/221/289): anonymous requests never pass —
   // a public repo's locks still 401 with the route message.
@@ -174,6 +197,42 @@ export async function authorizeLfsLocks(input: {
     "unknown";
   const verdict = await limiterCheckFailOpen(limiter, ip, now);
   if (verdict.blocked) return rateLimited(verdict.retryAfterSeconds);
+
+  // Deploy-token arm — before the access-token verify, upstream's group
+  // order on the LFS routes (web.go:131-133; the family mounts WITH
+  // AllowDeployToken, web.go:1777). The `gdt_` prefix gate makes this a
+  // no-op for every other credential; a miss falls through exactly like
+  // upstream's "not a deploy token, let the other methods try"
+  // (deploy_token.go:36).
+  if (basicCandidate !== null && basicCandidate.startsWith(DEPLOY_TOKEN_PREFIX)) {
+    let key: VerifiedDeployKey | null;
+    try {
+      key = await verifyDeployToken(env.DB, basicCandidate);
+    } catch {
+      // D1 unavailable mid-request: fail closed, never fail open.
+      return new Response("internal server error\n", {
+        status: 500,
+        headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+      });
+    }
+    if (key !== null) {
+      input.waitUntil(limiterResetFailOpen(limiter, ip));
+      input.waitUntil(
+        needsDeployKeyLastUsedTouch(key, now)
+          ? touchDeployKeyLastUsed(env.DB, key.id, now)
+          : Promise.resolve(),
+      );
+      // The synthetic key user carries no token status row; the family's
+      // owner-unavailable posture (§5.5) still applies to every caller.
+      if (owner !== null && owner.status === "prohibited") return ownerUnavailable();
+      // No scope arm (the key carries no token scope — upstream
+      // CheckRepoScopedToken skips the key user): the key row IS the grant.
+      const decision = decideLfsDeployKey(access, repo, key);
+      if (decision === "zero-perm") return lockChallenge(message);
+      if (decision === "archived-write") return repositoryArchived();
+      return { doerId: LFS_DEPLOY_KEY_DOER_ID };
+    }
+  }
 
   let verified: VerifiedAuth | null;
   try {
@@ -222,7 +281,7 @@ export async function authorizeLfsLocks(input: {
     if (repo.isArchived) return repositoryArchived();
     if (!isOwner && !isSiteAdmin) return lockChallenge(message);
   }
-  return verified;
+  return { doerId: verified.user.id };
 }
 
 // ---------------------------------------------------------------------------
@@ -262,7 +321,7 @@ export async function handleLocks(
     ownerVisibility: resolved.ownerVisibility,
   });
   if (auth instanceof Response) return auth;
-  const doerId = auth.user.id;
+  const doerId = auth.doerId;
 
   const params = new URL(req.url).searchParams;
   switch (verb) {

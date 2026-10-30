@@ -25,7 +25,9 @@
  *   engine passthrough 404s for D1-missing repos); no credentials / no access
  *   → 401 + realm (upstream challenges where git-HTTP 404-masks — documented
  *   divergence from SPEC-0003 §2.4, kept per §2.2); verified token lacking
- *   `read:`/`write:repository` → 403.
+ *   `read:`/`write:repository` → 403; a `gdt_` deploy-key token authenticates
+ *   with the key's own repo at its mode (upstream mounts the family WITH
+ *   `AllowDeployToken`, web.go:1777 — see `decideLfsDeployKey` below).
  * - Batch: accept check 415 → decode 400 / unknown operation 400 / batch cap
  *   413 → auth (`upload` op writes, `download` reads) → per-object results in
  *   a 200 envelope (object-level errors never fail the request).
@@ -78,6 +80,13 @@
 import type { DurableGitHandler } from "@cf-gitea/git-engine";
 
 import type { AuthUser } from "../auth/auth-context";
+import {
+  DEPLOY_TOKEN_PREFIX,
+  needsDeployKeyLastUsedTouch,
+  touchDeployKeyLastUsed,
+  verifyDeployToken,
+  type VerifiedDeployKey,
+} from "../auth/deploy-token-service";
 import { D1FailureLimiter } from "../auth/failure-limiter";
 import { basicAuthTokenCandidate, parseAuthorizationHeader } from "../auth/httpauth";
 import {
@@ -341,8 +350,14 @@ export async function authorizeLfs(input: {
 
   const header = req.headers.get("authorization");
   const parsed = header === null ? null : parseAuthorizationHeader(header);
-  const credential =
-    parsed?.bearerToken?.token ?? (parsed?.basicAuth ? basicAuthTokenCandidate(parsed.basicAuth) : null);
+  // The two credential carriers, kept apart (same shape as the git-HTTP
+  // gate's ladder): the deploy-token method parses ONLY the Basic header
+  // (basic.go parseAuthBasic), so a `Bearer gdt_…` is not a deploy
+  // credential — it falls to the access-token arm and fails there, exactly
+  // like upstream's OAuth2 arm skipping it.
+  const bearerToken = parsed?.bearerToken?.token ?? null;
+  const basicCandidate = parsed?.basicAuth ? basicAuthTokenCandidate(parsed.basicAuth) : null;
+  const credential = bearerToken ?? basicCandidate;
 
   const ownerActive = owner !== null && owner.status === "active";
   const publiclyVisible = repo.visibility === "public" && ownerActive && input.ownerVisibility === "public";
@@ -366,6 +381,44 @@ export async function authorizeLfs(input: {
     "unknown";
   const verdict = await limiterCheckFailOpen(limiter, ip, now);
   if (verdict.blocked) return rateLimited(verdict.retryAfterSeconds);
+
+  // Deploy-token arm — BEFORE the access-token verify, upstream's group order
+  // on the LFS routes ("before Basic, which would try the token as a
+  // password", web.go:131-133; the family mounts WITH AllowDeployToken,
+  // web.go:1777). Upstream's VerifyDeployKeyToken prefix gate makes this a
+  // no-op for every non-`gdt_` Basic credential, and a miss falls through to
+  // the access-token arm exactly like upstream's "not a deploy token, let the
+  // other methods try" (deploy_token.go:36).
+  if (basicCandidate !== null && basicCandidate.startsWith(DEPLOY_TOKEN_PREFIX)) {
+    let key: VerifiedDeployKey | null;
+    try {
+      key = await verifyDeployToken(env.DB, basicCandidate);
+    } catch {
+      // D1 unavailable mid-request: fail closed, never fail open (SPEC-0002 §4.5).
+      return new Response("internal server error\n", {
+        status: 500,
+        headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+      });
+    }
+    if (key !== null) {
+      input.waitUntil(limiterResetFailOpen(limiter, ip));
+      input.waitUntil(
+        needsDeployKeyLastUsedTouch(key, now)
+          ? touchDeployKeyLastUsed(env.DB, key.id, now)
+          : Promise.resolve(),
+      );
+      // The synthetic key user carries no token status row; the family's
+      // owner-unavailable posture (§5.5) still applies to every caller.
+      if (owner !== null && owner.status === "prohibited") return ownerUnavailable();
+      const decision = decideLfsDeployKey(op, repo, key);
+      if (decision === "zero-perm") return lfsChallenge();
+      if (decision === "archived-write") return repositoryArchived();
+      return true;
+    }
+    // Unknown `gdt_` value: fall through to the access-token arm (upstream
+    // deploy_token.go:36); it cannot verify a deploy token either, so the
+    // failure below records the limiter strike and challenges.
+  }
 
   let verified: VerifiedAuth | null;
   try {
@@ -422,6 +475,63 @@ export async function authorizeLfs(input: {
   }
   return true;
 }
+
+/**
+ * The deploy-key credential's decision on an LFS route — the shared seam both
+ * family pipelines (`authorizeLfs`, `authorizeLfsLocks`) render. Upstream
+ * mounts the LFS routes WITH `AllowDeployToken` (routers/web/web.go:1777 —
+ * "Only add it to an auth group where a repo scoped credential makes
+ * sense"), whose group adds `&DeployToken{}` before Basic (web.go:131-133):
+ * a Basic `gdt_` credential resolves `ctx.Doer` to the synthetic key user,
+ * whose ONLY permission is `getDeployKeyRepoPermission`
+ * (models/perm/access/repo_permission.go:387-409) — the code unit of the
+ * key's OWN repository at the key's mode. LFS `authenticate`
+ * (services/lfs/server.go:544) then tests
+ * `perm.CanAccess(Read|Write, unit.TypeCode)`:
+ *
+ * - the key's own repo (any stored mode — 1 and 2 both satisfy Read) on the
+ *   family's READ routes (batch `download`, GET objects, locks list);
+ * - the key's own repo at mode >= 2 on the WRITE routes (batch `upload`,
+ *   PUT objects, verify, locks create/verify/unlock — locks verify is a
+ *   WRITE-authenticate route at the pin, locks.go:216 vs 221 asymmetry);
+ * - EVERYTHING else is the ZERO-permission arm ("the key belongs to another
+ *   repository, so it grants nothing here" — a foreign repo, or a read-only
+ *   key on a write route). Unlike the git-HTTP gate there is NO public/
+ *   anonymous arm for the key user (`getDeployKeyRepoPermission` never loads
+ *   the anonymous/everyone unit modes), so a foreign key 401s even on a
+ *   public repo; the caller renders the family's challenge (existence not
+ *   disclosed either way, §2.2).
+ *
+ * No scope arm and no public-only masking (the key carries no token scope —
+ * upstream GetAccessScope returns "" for the key user, so
+ * CheckRepoScopedToken skips): the key row IS the grant.
+ */
+export type LfsDeployKeyDecision = true | "zero-perm" | "archived-write";
+
+export function decideLfsDeployKey(
+  op: LfsOp,
+  repo: RepositoryRow,
+  key: VerifiedDeployKey,
+): LfsDeployKeyDecision {
+  if (key.repoId !== repo.id) return "zero-perm";
+  if (op === "read") return true;
+  if (key.mode < 2) return "zero-perm";
+  if (repo.isArchived) return "archived-write";
+  return true;
+}
+
+/**
+ * Upstream `DeployKeyUserID` (models/user/user_system.go:51) — every deploy
+ * key authenticates as ONE shared synthetic system user (id -3); the KEY's id
+ * rides `ExtDoerData` (user_system.go:89-93) and never reaches
+ * `ctx.Doer.ID`. Family handlers that attribute rows to the doer (locks
+ * ownership) therefore see -3 for deploy-key requests: a lock created via a
+ * `gdt_` token carries `owner_id = -3`, which wire-renders as `"lock":null`
+ * (no users row — the landed service's nil-owner arm, mirroring upstream's
+ * ToLFSLock nil return) and is unlockable by any write-armed key of the same
+ * repo (owner match), exactly upstream's behavior.
+ */
+export const LFS_DEPLOY_KEY_DOER_ID = -3;
 
 // ---------------------------------------------------------------------------
 // Router

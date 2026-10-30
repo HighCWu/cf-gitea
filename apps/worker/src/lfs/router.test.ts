@@ -12,9 +12,10 @@ import { SELF, env } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
+import { verifyDeployToken } from "../auth/deploy-token-service";
 import { basicHeader, basicTokenHeader, mintFor, resetAuthTables, seedVerifiedUser } from "../auth/testing/seeds";
 import { resolveRepository } from "../git-http/acl";
-import { repositories, repoRedirects } from "../db/schema";
+import { deployKeys, repositories, repoRedirects } from "../db/schema";
 import {
   DEFAULT_LFS_LIMITS,
   LFS_ACCEPT_HEADER,
@@ -41,6 +42,7 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   await resetAuthTables();
+  await env.DB.prepare("DELETE FROM deploy_keys").run();
   await env.DB.prepare("DELETE FROM repositories").run();
   await env.DB.prepare("DELETE FROM repo_redirects").run();
   await resetLfsTables();
@@ -109,6 +111,34 @@ async function seedFixtures(): Promise<Fixtures> {
  *  sha256 binding; fixtures must be honest hashes). */
 function content(ordinal: number, length = 128): Uint8Array {
   return new Uint8Array(length).fill(ordinal);
+}
+
+/**
+ * Mint a `gdt_` deploy-key row bound to a seeded repo — addDeployKeyToken's
+ * row shape (sha256 + key_type=2, mode 1|2), seeded locally because this
+ * suite pins the LFS side (the auth suite owns the verifier's own pins).
+ * The plaintext is returned for the Basic header.
+ */
+async function seedDeployKeyToken(repoId: string, mode: 1 | 2): Promise<string> {
+  const token = `gdt_${`${crypto.randomUUID()}${crypto.randomUUID()}`.replaceAll("-", "").slice(0, 43)}`;
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+  const tokenHash = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const now = new Date();
+  await drizzle(env.DB)
+    .insert(deployKeys)
+    .values({
+      keyId: 0,
+      repoId,
+      name: "deploy",
+      keyType: 2,
+      fingerprint: `${token.slice(0, 6)}********${token.slice(-2)}`,
+      tokenHash,
+      mode,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .run();
+  return token;
 }
 
 /** git-lfs batch request shape (modules/lfs/shared.go:27-32 + client headers). */
@@ -298,6 +328,215 @@ describe("LFS family auth (§2.2 split)", () => {
     expect(response.headers.get("location")).toBe(
       "https://example.com/alice/newname.git/info/lfs/objects/batch",
     );
+  });
+});
+
+// --- deploy-key tokens on the family (F1, upstream AllowDeployToken) ---------------
+
+describe("deploy-key tokens on the LFS family (F1: upstream mounts the routes WITH AllowDeployToken)", () => {
+  /**
+   * Upstream chain: web.go:1777 mounts `info/lfs` with `webAuth.AllowDeployToken`
+   * (the group adds `&DeployToken{}` before Basic, web.go:131-133), so a Basic
+   * `gdt_` credential resolves ctx.Doer to the synthetic key user whose only
+   * permission is getDeployKeyRepoPermission (repo_permission.go:387-409) — the
+   * key's own repo at its mode. LFS authenticate (server.go:544) then tests
+   * CanAccess(Read|Write, code); everything else is the zero-perm arm → the
+   * family challenge (401, gitea-lfs realm — no public arm for the key user).
+   */
+
+  /** Owner-verifiable object (store+row), so download arms have something to serve. */
+  async function seedDownloadable(repo: SeededRepo, ordinal: number): Promise<{ oid: string; bytes: Uint8Array }> {
+    const bytes = content(ordinal, 256);
+    const oid = await sha256Hex(bytes);
+    const store = new RelayLfsStore(env.REPO_PACKS);
+    await store.put(lfsKey(repo.storageKey, oid), bytes, {
+      size: bytes.byteLength,
+      expectedSha256Hex: oid,
+    });
+    await new LfsStateService(env.DB).insertVerified(lfsRepoIdOf(repo), oid, bytes.byteLength, new Date());
+    return { oid, bytes };
+  }
+
+  it("passes the F1 repro: the same gdt_ token that clones answers batch download on its own repo", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    const repo = await seedRepo("alice", "deployed", "private");
+    const { oid } = await seedDownloadable(repo, 41);
+    const token = await seedDeployKeyToken(repo.id, 2);
+
+    // The smoke repro's exact header shape: Basic `deploy:<gdt_…>`.
+    const response = await lfsBatch(`${repoUrl(repo)}/info/lfs/objects/batch`, {
+      operation: "download",
+      objects: [{ oid, size: 256 }],
+    }, { authorization: basicHeader("deploy", token) });
+
+    expect(response.status).toBe(200);
+    const body = await response.json<{
+      objects: { actions: { download?: { href: string; header: Record<string, string> } } }[];
+    }>();
+    const download = body.objects[0]?.actions.download;
+    expect(download?.href).toBe(`${repoUrl(repo)}/info/lfs/objects/${oid}`);
+    // The href echoes the credential exactly like upstream's
+    // `NewLink(...).WithHeader("Authorization", rc.Authorization)`.
+    expect(download?.header).toEqual({ Authorization: `Basic ${btoa(`deploy:${token}`)}` });
+  });
+
+  it("also accepts the token-as-username form (empty password / x-oauth-basic)", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    const repo = await seedRepo("alice", "deployed", "private");
+    const token = await seedDeployKeyToken(repo.id, 1);
+
+    const response = await lfsBatch(`${repoUrl(repo)}/info/lfs/objects/batch`, {
+      operation: "download",
+      objects: [],
+    }, { authorization: basicTokenHeader(token) });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ objects: [] });
+  });
+
+  it("a read-mode key serves GET download of its own repo but not the upload op", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    const repo = await seedRepo("alice", "deployed", "private");
+    const { oid, bytes } = await seedDownloadable(repo, 42);
+    const token = await seedDeployKeyToken(repo.id, 1);
+
+    const uploadOp = await lfsBatch(`${repoUrl(repo)}/info/lfs/objects/batch`, {
+      operation: "upload",
+      objects: [{ oid, size: bytes.byteLength }],
+    }, { authorization: basicTokenHeader(token) });
+    expect(uploadOp.status).toBe(401); // zero-perm arm: read-only key on a write route
+    expect(uploadOp.headers.get("www-authenticate")).toBe('Basic realm="gitea-lfs"');
+    expect(await uploadOp.json()).toEqual({ message: "Unauthorized" });
+
+    const get = await SELF.fetch(`${repoUrl(repo)}/info/lfs/objects/${oid}`, {
+      headers: { authorization: basicTokenHeader(token) },
+    });
+    expect(get.status).toBe(200);
+    expect(get.headers.get("x-gitea-lfs-content-length")).toBe("256");
+    expect(new Uint8Array(await get.arrayBuffer())).toEqual(bytes);
+  });
+
+  it("a write-mode key runs the upload state machine: batch hrefs → PUT → verify", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    const repo = await seedRepo("alice", "deployed", "private");
+    const bytes = content(43, 512);
+    const oid = await sha256Hex(bytes);
+    const token = await seedDeployKeyToken(repo.id, 2);
+    const auth = { authorization: basicHeader("deploy", token) };
+
+    const batch = await lfsBatch(`${repoUrl(repo)}/info/lfs/objects/batch`, {
+      operation: "upload",
+      objects: [{ oid, size: bytes.byteLength }],
+    }, auth);
+    expect(batch.status).toBe(200);
+    const shaped = await batch.json<{ objects: { actions: Record<string, { href: string }> }[] }>();
+    const uploadHref = shaped.objects[0]?.actions.upload?.href;
+    const verifyHref = shaped.objects[0]?.actions.verify?.href;
+    expect(uploadHref).toBeDefined();
+    expect(verifyHref).toBeDefined();
+
+    const put = await SELF.fetch(uploadHref as string, {
+      method: "PUT",
+      headers: { ...auth, "content-length": String(bytes.byteLength) },
+      body: bytes,
+    });
+    expect(put.status).toBe(200);
+    expect(await put.json()).toEqual({ message: "OK" });
+
+    const verify = await SELF.fetch(verifyHref as string, {
+      method: "POST",
+      headers: { accept: LFS_MEDIA_TYPE, "content-type": LFS_MEDIA_TYPE, ...auth },
+      body: JSON.stringify({ oid, size: bytes.byteLength }),
+    });
+    expect(verify.status).toBe(200);
+    expect(await verify.json()).toEqual({ message: "OK" });
+    expect(await lastRowState(lfsRepoIdOf(repo), oid)).toBe("verified");
+  });
+
+  it("a FOREIGN repo's key gets the zero-perm challenge — a public repo included (no anonymous arm for the key user)", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    await seedVerifiedUser({ username: "Bob" });
+    const bobPublic = await seedRepo("bob", "public-lfs", "public");
+    const bobPrivate = await seedRepo("bob", "private-lfs", "private");
+    const { oid, bytes } = await seedDownloadable(bobPublic, 44);
+    const aliceOwn = await seedRepo("alice", "own", "private");
+    const readToken = await seedDeployKeyToken(aliceOwn.id, 1); // alice's own repo, pointed at BOB's routes
+    const writeToken = await seedDeployKeyToken(aliceOwn.id, 2);
+
+    const foreignPublicRead = await lfsBatch(
+      `${repoUrl(bobPublic)}/info/lfs/objects/batch`,
+      { operation: "download", objects: [{ oid, size: bytes.byteLength }] },
+      { authorization: basicTokenHeader(readToken) },
+    );
+    expect(foreignPublicRead.status).toBe(401);
+    expect(foreignPublicRead.headers.get("www-authenticate")).toBe('Basic realm="gitea-lfs"');
+
+    const foreignPrivateWrite = await lfsBatch(
+      `${repoUrl(bobPrivate)}/info/lfs/objects/batch`,
+      { operation: "upload", objects: [] },
+      { authorization: basicTokenHeader(writeToken) },
+    );
+    expect(foreignPrivateWrite.status).toBe(401);
+    expect(await foreignPrivateWrite.json()).toEqual({ message: "Unauthorized" });
+  });
+
+  it("401s an unknown gdt_ value (falls through; no identity)", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    const repo = await seedRepo("alice", "deployed", "private");
+    const unknown = `gdt_${"9".repeat(43)}`;
+
+    const response = await lfsBatch(`${repoUrl(repo)}/info/lfs/objects/batch`, {
+      operation: "download",
+      objects: [],
+    }, { authorization: basicTokenHeader(unknown) });
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get("www-authenticate")).toBe('Basic realm="gitea-lfs"');
+  });
+
+  it("401s `Bearer gdt_…` — the deploy method parses only the Basic header", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    const repo = await seedRepo("alice", "deployed", "private");
+    const token = await seedDeployKeyToken(repo.id, 2);
+
+    const response = await lfsBatch(`${repoUrl(repo)}/info/lfs/objects/batch`, {
+      operation: "download",
+      objects: [],
+    }, { authorization: `Bearer ${token}` });
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get("www-authenticate")).toBe('Basic realm="gitea-lfs"');
+  });
+
+  it("an archived own repo refuses the write-armed key (§4.11 family posture)", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    const repo = await seedRepo("alice", "frozen", "private", { isArchived: true });
+    const token = await seedDeployKeyToken(repo.id, 2);
+
+    const response = await lfsBatch(`${repoUrl(repo)}/info/lfs/objects/batch`, {
+      operation: "upload",
+      objects: [],
+    }, { authorization: basicTokenHeader(token) });
+
+    expect(response.status).toBe(403);
+    expect(await response.text()).toContain("archived");
+  });
+
+  it("leaves a fresh key's last-used stamp alone (the throttled UpdateDeployKeyLastUsed touch)", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    const repo = await seedRepo("alice", "deployed", "private");
+    const token = await seedDeployKeyToken(repo.id, 1);
+    const before = await verifyDeployToken(env.DB, token);
+    // The seed stamps now; the 24 h throttle means this request must NOT touch.
+    expect(before?.updatedAt.getTime()).toBeCloseTo(Date.now(), -4);
+
+    await lfsBatch(`${repoUrl(repo)}/info/lfs/objects/batch`, {
+      operation: "download",
+      objects: [],
+    }, { authorization: basicTokenHeader(token) });
+
+    const after = await verifyDeployToken(env.DB, token);
+    expect(after?.updatedAt.getTime()).toBe(before?.updatedAt.getTime());
   });
 });
 
