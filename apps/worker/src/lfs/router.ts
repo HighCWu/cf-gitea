@@ -12,7 +12,12 @@
  *
  * Wire parity notes (upstream pin `fc49368845`, services/lfs/server.go):
  * - Error responses outside the batch envelope carry the LFS media type and a
- *   JSON body `{"message": "<status text>"}` (`writeStatusMessage`).
+ *   JSON body `{"message": "<status text>"}` (`writeStatusMessage`). ALL
+ *   family JSON bodies — writeStatus arms, the batch `{objects}` envelope,
+ *   the upload/verify 200 `{"message":"OK"}` — are COMPACT with NO trailing
+ *   newline: the pin's jsonv2 `MarshalWrite` appends nothing (verified
+ *   empirically; the `\n` the family used to ship was a recorded cosmetic
+ *   divergence, reconciled to match the locks family byte-for-byte).
  * - The 401 challenge is `WWW-Authenticate: Basic realm="gitea-lfs"` with that
  *   same JSON body (`requireAuth` → `writeStatus(401)`) — unlike the git-HTTP
  *   gate's plain-text `realm="Gitea"` challenge.
@@ -268,9 +273,15 @@ function statusText(status: number): string {
   }
 }
 
-/** `writeStatusMessage` (`server.go:530-540`): LFS media type + JSON message. */
+/**
+ * `writeStatusMessage` (`server.go:530-540`): LFS media type + JSON message.
+ * The body is COMPACT JSON WITHOUT a trailing newline — the pin's jsonv2
+ * `MarshalWrite` appends nothing (verified empirically, Go 1.25), matching
+ * the locks family's `lockWriteStatus` byte-for-byte (the family-wide
+ * reconciliation of the `\n` divergence recorded at 7b589c7).
+ */
 export function lfsError(status: number, message?: string, headers?: Record<string, string>): Response {
-  return new Response(`${JSON.stringify({ message: message ?? statusText(status) })}\n`, {
+  return new Response(JSON.stringify({ message: message ?? statusText(status) }), {
     status,
     headers: { "content-type": LFS_MEDIA_TYPE, ...headers },
   });
@@ -582,7 +593,9 @@ async function handleBatch(
     limits: deps.limits,
     now: deps.now(),
   });
-  return new Response(`${JSON.stringify({ objects })}\n`, {
+  // Compact body, no trailing newline — the pin's jsonv2 `MarshalWrite`
+  // (same wire discipline as `lfsError` / the locks family).
+  return new Response(JSON.stringify({ objects }), {
     status: 200,
     headers: { "content-type": LFS_MEDIA_TYPE },
   });

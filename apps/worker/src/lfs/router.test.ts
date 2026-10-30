@@ -369,6 +369,20 @@ describe("LFS batch envelope (§2.2, upstream error tables)", () => {
     expect(await response.json()).toEqual({ objects: [] });
   });
 
+  it("emits the {objects} envelope COMPACT with no trailing newline (the pin's jsonv2 MarshalWrite)", async () => {
+    const fixtures = await seedFixtures();
+    const response = await lfsBatch(`${repoUrl(fixtures.privateRepo)}/info/lfs/objects/batch`, {
+      operation: "upload",
+      objects: [],
+    }, { authorization: basicTokenHeader(fixtures.write) });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe(LFS_MEDIA_TYPE);
+    const text = await response.text();
+    expect(text).toBe('{"objects":[]}'); // byte-exact compact envelope
+    expect(text.endsWith("\n")).toBe(false); // MarshalWrite appends nothing — locks-family wire parity
+  });
+
   it("400s malformed JSON and unknown operations with upstream status texts", async () => {
     const fixtures = await seedFixtures();
     const url = `${repoUrl(fixtures.privateRepo)}/info/lfs/objects/batch`;
@@ -544,6 +558,36 @@ describe("relay roundtrip: batch → PUT → verify → batch download → GET",
     expect(get.headers.get("content-type")).toBe("application/octet-stream");
     expect(get.headers.get("x-gitea-lfs-content-length")).toBe(String(bytes.byteLength));
     expect(new Uint8Array(await get.arrayBuffer())).toEqual(bytes);
+  });
+
+  it("answers the relay PUT with the byte-exact writeStatus(200) body — compact, no trailing newline", async () => {
+    const fixtures = await seedFixtures();
+    const bytes = content(7);
+    const oid = await sha256Hex(bytes);
+    const auth = `Basic ${btoa(`${fixtures.write}:`)}`;
+
+    const batch = await lfsBatch(`${repoUrl(fixtures.privateRepo)}/info/lfs/objects/batch`, {
+      operation: "upload",
+      objects: [{ oid, size: bytes.byteLength }],
+    }, { authorization: basicTokenHeader(fixtures.write) });
+    const shaped = await batch.json<{ objects: { actions: Record<string, { href: string }> }[] }>();
+    const uploadHref = shaped.objects[0]?.actions.upload?.href;
+    expect(uploadHref).toBeDefined();
+
+    // The upload 200 rides the shared `lfsError` writeStatus helper — the same
+    // emitter as every upload/verify arm — so its bytes pin the whole family's
+    // writeStatus wire: compact `{"message":"OK"}`, no trailing newline (the
+    // pin's jsonv2 `MarshalWrite` appends nothing, matching the locks family).
+    const put = await SELF.fetch(uploadHref as string, {
+      method: "PUT",
+      headers: { authorization: auth, "content-length": String(bytes.byteLength) },
+      body: bytes,
+    });
+    expect(put.status).toBe(200);
+    expect(put.headers.get("content-type")).toBe(LFS_MEDIA_TYPE);
+    const text = await put.text();
+    expect(text).toBe('{"message":"OK"}'); // byte-exact writeStatus(200)
+    expect(text.endsWith("\n")).toBe(false);
   });
 
   it("422s a hash mismatch, deletes the object, and names the upstream error", async () => {
