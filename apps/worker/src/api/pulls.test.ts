@@ -5,7 +5,9 @@
  * the shared per-repo index sequence (issues?type=pulls lists the PR; PR
  * indexes interleave with issue indexes), the ToPullRequest field fidelity
  * (url/html_url on the /pulls/ path, head.ref = refs/pull/N/head, mergeable
- * NULL until the engine wave, the merged trio only when merged, WIP draft),
+ * FALSE on a checking row per the pin's non-nullable bool
+ * (models/issues/pull.go:751-756), the merged trio only when merged, WIP
+ * draft),
  * the upstream list quirks (absent/garbage state lists BOTH states; sort
  * falls back silently), POST's head==base 422 and duplicate-target 409
  * (issue_id carries the INDEX), the PATCH 201 quirk + merged-state 412
@@ -190,6 +192,46 @@ async function seedEngineBranches(ownerLower: string, slug: string, branches: st
   return tip;
 }
 
+/**
+ * One CHILD commit on `branch` (parent = parentOid) replacing the whole tree
+ * with `files` — the diff-stat pins' real engine content, the
+ * seedEngineBranches pattern (putApiObjects + commitApiChange). Callers pass
+ * the FULL file set (the seed root tree's README.md included, rewritten at
+ * will). Returns the new branch tip.
+ */
+async function landChildCommit(
+  ownerLower: string,
+  slug: string,
+  branch: string,
+  parentOid: string,
+  files: { name: string; content: string }[],
+  message: string,
+): Promise<string> {
+  const cell = env.REPO.getByName(`${ownerLower}/${slug}`);
+  const objects: { oid: string; type: "blob" | "tree" | "commit" | "tag"; data: Uint8Array }[] = [];
+  const entries: { mode: "100644"; name: string; oid: string }[] = [];
+  for (const file of files) {
+    const blob = new TextEncoder().encode(file.content);
+    const blobOid = await gitObjectOid("blob", blob);
+    objects.push({ oid: blobOid, type: "blob", data: blob });
+    entries.push({ mode: "100644", name: file.name, oid: blobOid });
+  }
+  const tree = serializeTree(entries);
+  objects.push({ oid: tree.oid, type: "tree", data: tree.data });
+  const person = { name: "seed", email: "seed@pulls.invalid", time: 1761000001, tz: "+0000" };
+  const commit = serializeCommit({ tree: tree.oid, parents: [parentOid], author: person, committer: person, message });
+  objects.push({ oid: commit.oid, type: "commit", data: commit.data });
+  const put = await cell.putApiObjects(objects);
+  if (put.tag !== "ok") {
+    throw new Error(`child commit seed putApiObjects failed: ${put.tag}`);
+  }
+  const result = await cell.commitApiChange({ ref: branchRef(branch), expectedOldOid: parentOid, newOid: commit.oid });
+  if (result.tag !== "committed") {
+    throw new Error(`child commit ref landing failed: ${result.tag}`);
+  }
+  return commit.oid;
+}
+
 async function seedLabel(repoId: string, name: string): Promise<number> {
   const rows = await db()
     .insert(labels)
@@ -322,7 +364,7 @@ describe("POST /repos/{owner}/{repo}/pulls (repoCreatePullRequest)", () => {
       merged_at: null,
       merge_commit_sha: null,
       merged_by: null,
-      mergeable: null, // engine wave: unknown, per upstream's checking semantics
+      mergeable: false, // a checking row renders FALSE — pr.Mergeable(ctx), models/issues/pull.go:751-756 (non-nullable bool, structs/pull.go:65)
       merge_base: "",
       allow_maintainer_edit: true,
       labels: [],
@@ -734,6 +776,57 @@ describe("GET /repos/{owner}/{repo}/pulls/{index} (repoGetPullRequest)", () => {
 
     const garbage = await router()("/repos/alice/visible/pulls/abc");
     expect(garbage.status).toBe(404);
+  });
+
+  it("renders the GetDiffShortStat trio (convert/pull.go:245-254) summed over the real range diff", async () => {
+    const owner = await seedUser("Alice");
+    await seedRepo(owner.usernameLower, "diffstat-a");
+    const tip = await seedEngineBranches(owner.usernameLower, "diffstat-a", ["feature"]);
+    // feature's child: README rewritten (1 add + 1 del) and notes.txt added
+    // (3 lines) — the three-dot range main...feature sums to
+    // changed_files=2, additions=4, deletions=1.
+    await landChildCommit(owner.usernameLower, "diffstat-a", "feature", tip, [
+      { name: "README.md", content: "# diffstat-a v2\n" },
+      { name: "notes.txt", content: "a\nb\nc\n" },
+    ], "child\n");
+    await createPull("/repos/Alice/diffstat-a/pulls", { title: "with content", head: "feature", base: "main" });
+
+    const res = await router()("/repos/alice/diffstat-a/pulls/1");
+    expect(res.status).toBe(200);
+    expect(await res.json<Record<string, unknown>>()).toMatchObject({
+      additions: 4,
+      deletions: 1,
+      changed_files: 2,
+    });
+  });
+
+  it("omits the trio when the engine walk truncates (the budget-bounded partial, MAX_DIFF_FILES=100 — upstream's walk is never bounded, the error-log omit posture applies)", async () => {
+    const owner = await seedUser("Alice");
+    await seedRepo(owner.usernameLower, "diffstat-b");
+    const tip = await seedEngineBranches(owner.usernameLower, "diffstat-b", ["feature"]);
+    const bulk = Array.from({ length: 101 }, (_, i) => ({ name: `f${String(i).padStart(3, "0")}.txt`, content: `line ${i}\n` }));
+    await landChildCommit(owner.usernameLower, "diffstat-b", "feature", tip, bulk, "bulk\n");
+    await createPull("/repos/Alice/diffstat-b/pulls", { title: "truncated walk", head: "feature", base: "main" });
+
+    const res = await router()("/repos/alice/diffstat-b/pulls/1");
+    expect(res.status).toBe(200);
+    const body = await res.json<Record<string, unknown>>();
+    expect(body.additions).toBeUndefined();
+    expect(body.deletions).toBeUndefined();
+    expect(body.changed_files).toBeUndefined();
+  });
+
+  it("omits the trio for a bare D1 row (no engine head ref — the error-log omit arm, convert/pull.go:247-250)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "diffstat-c");
+    await seedPull(repoId, "no refs yet");
+
+    const res = await router()("/repos/alice/diffstat-c/pulls/1");
+    expect(res.status).toBe(200);
+    const body = await res.json<Record<string, unknown>>();
+    expect(body.additions).toBeUndefined();
+    expect(body.deletions).toBeUndefined();
+    expect(body.changed_files).toBeUndefined();
   });
 });
 

@@ -170,7 +170,7 @@ describe("POST /repos/{owner}/{repo}/pulls — engine validation + refs/pull/N/h
     expect(res.status).toBe(201);
     const pr: Record<string, unknown> = await res.json();
     expect(pr.number).toBe(1);
-    expect(pr.mergeable).toBeNull(); // checking — the lazy check has not run
+    expect(pr.mergeable).toBe(false); // checking renders FALSE — pr.Mergeable(ctx), models/issues/pull.go:751-756 (non-nullable bool)
     expect(((pr.head as Record<string, unknown>).ref) as string).toBe("refs/pull/1/head");
     expect(((pr.head as Record<string, unknown>).sha) as string).not.toBe("");
 
@@ -318,7 +318,12 @@ describe("merge gating — conflict, WIP, schedule", () => {
     const pr: Record<string, unknown> = await created.json();
     const index = pr.number as number;
 
-    expect((await jsonBody(await get(`${REPO}/pulls/${index}`))).draft).toBe(true);
+    const wipRendered = await jsonBody(await get(`${REPO}/pulls/${index}`));
+    expect(wipRendered.draft).toBe(true);
+    // WIP → mergeable FALSE even when the row checks mergeable — the
+    // IsWorkInProgress arm of pr.Mergeable (models/issues/pull.go:751-756,
+    // title prefix :652-658).
+    expect(wipRendered.mergeable).toBe(false);
     const merge = await send(`${REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge" }));
     expect(merge.status).toBe(405);
     expect((await jsonBody(merge)).message).toBe("Work in progress PRs cannot be merged");
@@ -978,6 +983,12 @@ describe("PR .diff/.patch tails — the empty-range, binary and truncation-cap a
     expect(created.status).toBe(201);
     const index = (await jsonBody(created)).number as number;
 
+    // The empty-range row (Ancestor/Empty after the lazy check) renders
+    // mergeable TRUE — pr.Mergeable excludes only Checking/Conflict/Error
+    // (models/issues/pull.go:751-756); ancestor/empty pass the filter.
+    const emptyRendered = await jsonBody(await get(`${REPO}/pulls/${index}`));
+    expect(emptyRendered.mergeable).toBe(true);
+
     const diff = await get(`${REPO}/pulls/${index}.diff`);
     expect(diff.status).toBe(200);
     expect(diff.headers.get("content-type")).toContain("text/plain");
@@ -1297,6 +1308,14 @@ describe("the PR-head sync round-trip — a second push moves refs/pull/N/head a
     expect(rendered.mergeable).toBe(true);
     const merge = await send(`${REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge", merge_title_field: "Merge sync round trip" }));
     expect(merge.status).toBe(200);
+
+    // A merged row renders mergeable TRUE — upstream keeps pr.Status through
+    // the merge (MarkAsMerged passes pr.Status, services/pull/merge.go:366)
+    // and pr.Mergeable consults only the status trio + WIP
+    // (models/issues/pull.go:751-756), so the merged GET renders true.
+    const mergedRendered = await jsonBody(await get(`${REPO}/pulls/${index}`));
+    expect(mergedRendered.merged).toBe(true);
+    expect(mergedRendered.mergeable).toBe(true);
 
     // GOLD: the merge commit's SECOND parent is the NEW tip, and the merged
     // TREE carries the second commit's file — the merge executed against

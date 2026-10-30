@@ -257,7 +257,7 @@ describe("GET /user/followers (userCurrentListFollowers)", () => {
     expect(body[0]).toMatchObject({
       followers_count: 0,
       following_count: 0,
-      last_login: "0001-01-01T00:00:00Z", // no users column yet; upstream authed-gates it (convert/user.go:118-124)
+      last_login: "0001-01-01T00:00:00Z", // seeded rows are never minted into — NULL column = Go zero time; upstream authed-gates it (convert/user.go:118-124)
     });
   });
 

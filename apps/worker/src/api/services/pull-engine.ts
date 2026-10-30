@@ -54,19 +54,30 @@ export function statusFromMergeability(status: MergeabilityStatus): number {
 }
 
 /**
- * The `mergeable` render (convert.toAPIPullRequest): checking → null
- * (unknown), mergeable → true, everything else (conflict/empty/ancestor/
- * error, merged) → false.
+ * The `mergeable` render (convert.toAPIPullRequest → pr.Mergeable(ctx)):
+ * upstream's field is a NON-NULLABLE bool (structs/pull.go:65; swagger
+ * "type": "boolean", v1-swagger.generated.json:33120-33124) and the model
+ * method answers `status != Checking && status != Conflict && status !=
+ * Error && !IsWorkInProgress` (models/issues/pull.go:751-756) — so checking
+ * renders FALSE (not null: the board's "mergeable: null while checking"
+ * premise predates this pin), conflict/error render false, and
+ * ancestor/empty/unrelated pass the filter and render TRUE (only the three
+ * statuses above are excluded — the pin's exact filter). Merged rows carry
+ * their last status through the merge (upstream's MarkAsMerged keeps
+ * pr.Status, services/pull/merge.go:366; our merge write sets Mergeable,
+ * executeMerge below), so they render true like upstream. `wip` is
+ * `HasWorkInProgressPrefix(issue.title)` (models/issues/pull.go:652-658 —
+ * the title-prefix check is the whole gate).
  */
-export function mergeableOfRow(pr: PullRequestRow): boolean | null {
-  if (pr.hasMerged) return false;
+export function mergeableOfRow(pr: PullRequestRow, wip: boolean): boolean {
+  if (wip) return false;
   switch (pr.status) {
     case PRStatus.Checking:
-      return null;
-    case PRStatus.Mergeable:
-      return true;
-    default:
+    case PRStatus.Conflict:
+    case PRStatus.Error:
       return false;
+    default:
+      return true;
   }
 }
 
@@ -114,12 +125,20 @@ export async function ensurePullRequestChecked(
  * The PR diff range (three-dot): `merge_base...refs/pull/N/head`. The range
  * composition per 0001b §10.8 — a null merge base (unrelated histories)
  * renders an empty diff, exactly like `git diff base...head` upstream.
+ * `truncated` carries the engine's budget flag (repo.ts computeDiff —
+ * MAX_DIFF_FILES=100 / MAX_DIFF_BLOB=512 KiB; SPEC-0001b §3) so stat-style
+ * consumers can refuse partial sums instead of serving them as totals.
  */
 export async function pullRequestDiff(
   c: Context<ApiEnv>,
   pair: RepositoryWithOwner,
   pr: PullRequestRow,
-): Promise<{ files: import("@cf-gitea/git-engine").DiffFileJson[]; mergeBase: string | null; head: string }> {
+): Promise<{
+  files: import("@cf-gitea/git-engine").DiffFileJson[];
+  mergeBase: string | null;
+  head: string;
+  truncated: boolean;
+}> {
   const reads = engineReads(c.env, pair.repo);
   const baseTip = await reads.readCommit(branchRef(pr.baseBranch));
   const headCommit = await reads.readCommit(pullHeadRef(pr.index));
@@ -133,10 +152,51 @@ export async function pullRequestDiff(
       return base !== null && base.tag === "ok" ? base.base : null;
     })());
   if (mergeBase === null) {
-    return { files: [], mergeBase: null, head: headCommit.oid };
+    return { files: [], mergeBase: null, head: headCommit.oid, truncated: false };
   }
   const diff = await reads.readDiff(headCommit.oid, mergeBase);
-  return { files: diff?.files ?? [], mergeBase, head: headCommit.oid };
+  return { files: diff?.files ?? [], mergeBase, head: headCommit.oid, truncated: diff?.truncated ?? false };
+}
+
+/**
+ * `GetDiffShortStat`'s API-consumer port — the PR diff-stat trio
+ * `additions`/`deletions`/`changed_files` (services/convert/pull.go:245-254:
+ * the single converter fills them from a GetDiffShortStat over
+ * `pr.MergeBase..head`, and on a diff error it LOGS and leaves all three nil
+ * — :247-250). The engine read is the range diff (pullRequestDiff), so the
+ * stat is its numstat sum (`add`/`del` per file, DiffFileJson) with
+ * `files.length` as NumFiles. The nil-mapping arms, each upstream-faithful:
+ *   - a null merge base (upstream's empty `pr.MergeBase` errors the
+ *     GetDiffShortStat the same way),
+ *   - a TRUNCATED engine walk (the budget-bounded partial — upstream's walk
+ *     is never bounded, so there is no upstream equivalent; serving partial
+ *     sums as totals would misstate the PR, the error arm's omit posture),
+ *   - any engine read failure (upstream logs and omits — :247-250; the
+ *     PR itself still renders).
+ * Returns null for every omit arm; the converter renders the trio only from
+ * a non-null stat (the fields are omitempty pointers, structs/pull.go:51-55).
+ */
+export async function pullRequestDiffShortStat(
+  c: Context<ApiEnv>,
+  pair: RepositoryWithOwner,
+  pr: PullRequestRow,
+): Promise<{ additions: number; deletions: number; changedFiles: number } | null> {
+  let range: Awaited<ReturnType<typeof pullRequestDiff>>;
+  try {
+    range = await pullRequestDiff(c, pair, pr);
+  } catch {
+    return null;
+  }
+  if (range.mergeBase === null || range.truncated) {
+    return null;
+  }
+  let additions = 0;
+  let deletions = 0;
+  for (const file of range.files) {
+    additions += file.add;
+    deletions += file.del;
+  }
+  return { additions, deletions, changedFiles: range.files.length };
 }
 
 /**

@@ -13,7 +13,9 @@ import { ApiError } from "../errors";
 import type { ApiEnv } from "../env";
 import type { CreateRepoOption } from "../models/repository";
 import { branchRef, commitApiChangeError, engineCell, ZERO_OID } from "./engine";
+import { renderInitTreeFiles } from "./repo-init-templates";
 import { saveRepoSettings } from "./repo-settings";
+import { tombstoneRepoDO } from "../../repos/purge";
 
 /**
  * `POST /user/repos` service half (createCurrentUserRepo — upstream
@@ -42,11 +44,23 @@ import { saveRepoSettings } from "./repo-settings";
  *     IS the contents of options/readme/ — exactly one file, "Default" — so
  *     the single-entry catalog below is upstream-faithful, 400 message
  *     included.
- *   - `gitignores` / `license` / `issue_labels` are accepted and ignored (no
- *     template store on the instance — the createOrgRepo deferral note in
- *     routes/org-repos.ts). Upstream would render them into the initial tree;
- *     silently keeping more real clients working beats 400ing catalog names
- *     upstream ships but cf-gitea does not carry (documented divergence).
+ *   - `gitignores` / `license` render into the initial tree through
+ *     services/repo-init-templates.ts (the build-time inlined options/
+ *     catalogs): `.gitignore` is the `# ---> <name>` join of the comma-split
+ *     option (create.go:108-124) and `LICENSE` the placeholder-filled
+ *     template (create.go:126-146 → modules/repository/license.go). An
+ *     UNKNOWN template name fails the pure render AFTER the repo row has
+ *     landed (upstream reads the files inside initRepository, create.go:
+ *     113-114/:131-135) — this service then runs the cleanupRepository
+ *     rollback (create.go:236-241 → :448-456: delete the row + engine
+ *     scaffold) and rethrows, so the caller sees the same 500-then-name-is-
+ *     free posture as upstream's unmapped-error arm (repo.go:254-259). The
+ *     ENGINE transport arms below keep their retryable-unknown posture (no
+ *     rollback — the landed note stands; upstream can clean unconditionally
+ *     because its init steps are local, ours are DO RPCs whose outcomes are
+ *     not provable).
+ *   - `issue_labels` is accepted and ignored (the createOrgRepo deferral
+ *     note in routes/org-repos.ts stands — no label-template store).
  *   - commit message "Initial commit" (create.go initRepoCommit), author +
  *     committer = the owner's git signature (user.NewGitSig): display name
  *     falling back to the username, and the primary email — the noreply
@@ -126,19 +140,39 @@ function gitSignature(owner: UserRow, now: Date): Person {
 }
 
 /**
- * Build the auto-init commit objects: the rendered README.md blob, its root
- * tree, and the parentless "Initial commit" (SPEC-0001a §4.3 shapes — every
- * oid is Worker-computed; the DO re-verifies before storing).
+ * Build the auto-init commit objects: the rendered README.md blob, the
+ * template-rendered .gitignore/LICENSE blobs (create.go prepareRepoCommit's
+ * three write arms), the root tree, and the parentless "Initial commit"
+ * (SPEC-0001a §4.3 shapes — every oid is Worker-computed; the DO re-verifies
+ * before storing). THROWS on an unknown gitignores/license template name —
+ * the pure render happens BEFORE any engine write, so the caller's rollback
+ * finds exactly the just-created row (upstream's order: the DB row lands,
+ * then initRepository reads the templates, then the commit — create.go:226-294).
  */
 async function buildInitialCommitObjects(
   owner: UserRow,
-  repoName: string,
-  description: string,
+  form: CreateRepoOption,
   now: Date,
 ): Promise<{ objects: ApiObject[]; commitOid: string }> {
   // options/readme/Default verbatim: `# {Name}\n\n{Description}`.
-  const readme = await buildBlobObject(ENCODER.encode(`# ${repoName}\n\n${description}`));
-  const tree = serializeTree([{ mode: "100644", name: "README.md", oid: readme.oid }]);
+  const readme = await buildBlobObject(ENCODER.encode(`# ${form.name}\n\n${form.description ?? ""}`));
+  const templateBlobs: ApiObject[] = [];
+  const treeEntries: Array<{ mode: string; name: string; oid: string }> = [];
+  // LicenseValues (create.go:126-135): Owner=repo.OwnerName, Email=authorSig.
+  // Email (the git signature's email — the placeholder when unset), Repo=
+  // repo.Name, Year=now.Format("2006").
+  for (const file of renderInitTreeFiles(form, {
+    owner: owner.username,
+    email: gitSignature(owner, now).email,
+    repo: form.name,
+    year: String(now.getUTCFullYear()),
+  })) {
+    const blob = await buildBlobObject(file.content);
+    templateBlobs.push(blob);
+    treeEntries.push({ mode: "100644", name: file.path, oid: blob.oid });
+  }
+  // git tree byte-order: ".gitignore" < "LICENSE" < "README.md".
+  const tree = serializeTree([...treeEntries, { mode: "100644", name: "README.md", oid: readme.oid }]);
   const commit = serializeCommit({
     tree: tree.oid,
     parents: [],
@@ -149,11 +183,38 @@ async function buildInitialCommitObjects(
   return {
     objects: [
       readme,
+      ...templateBlobs,
       { oid: tree.oid, type: tree.type, data: tree.data },
       { oid: commit.oid, type: commit.type, data: commit.data },
     ],
     commitOid: commit.oid,
   };
+}
+
+/**
+ * `cleanupRepository` (create.go:448-456) — the init-failure rollback: the
+ * just-created row goes through the full §2.5.5 delete pipeline (D1 cascade
+ * → DO tombstone → queue purge), freeing the name exactly like upstream's
+ * DeleteRepositoryDirectly. Best-effort: a rollback failure is logged (the
+ * CreateRepositoryNotice arm) and never masks the original error.
+ */
+async function rollbackCreatedRepository(
+  d1: D1Database,
+  env: ApiEnv["Bindings"],
+  repo: RepoRow,
+): Promise<void> {
+  try {
+    await new RepoService(d1, {
+      registry: env.REGISTRY.getByName("registry"),
+      queue: env.REPO_TASKS,
+      tombstone: (engineName) => tombstoneRepoDO(env, engineName),
+    }).deleteRepository(repo.id);
+  } catch (error) {
+    console.error(
+      `[user-repos] cleanupRepository failed for ${repo.ownerNamespace}/${repo.slug}:`,
+      error instanceof Error ? error.message : String(error),
+    );
+  }
 }
 
 /**
@@ -197,7 +258,20 @@ export async function createUserRepository(
 
   if (form.auto_init === true) {
     const cell = engineCell(env, { ownerNamespace: repo.ownerNamespace, slug: repo.slug });
-    const built = await buildInitialCommitObjects(owner, form.name, form.description ?? "", now);
+    // The template render is pure — an unknown gitignores/license name throws
+    // before anything engine-side lands, and the rollback deletes the row
+    // (create.go:236-241's deferred cleanup; the handler then answers the
+    // unmapped-error 500, repo.go:254-259).
+    let built: { objects: ApiObject[]; commitOid: string };
+    try {
+      built = await buildInitialCommitObjects(owner, form, now);
+    } catch (error) {
+      await rollbackCreatedRepository(d1, env, repo);
+      // The template loaders' init-failure text (`GetRepoInitFile[name]…` /
+      // `getLicense[name]…`) rides the 500 envelope the way upstream's
+      // APIErrorInternal carries err.Error() (repo.go:254-259).
+      throw error instanceof ApiError ? error : new ApiError(500, error instanceof Error ? error.message : String(error));
+    }
     const put = await cell.putApiObjects(built.objects);
     if (put.tag !== "ok") {
       // Unreachable for the fixed single-file payload (budget/validation are

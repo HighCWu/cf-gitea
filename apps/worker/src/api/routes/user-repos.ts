@@ -128,7 +128,11 @@ function userCurrentListReposRoute(requireAuth: MiddlewareHandler<ApiEnv>) {
  * the upstream message; invalid/reserved name → 422 (the IsUsableRepoName
  * port; our message text differs from Go's error strings — the createOrgRepo
  * note applies). `auto_init` lands the initial commit through the engine
- * (services/user-repos.ts owns the fidelity notes and divergences).
+ * (services/user-repos.ts owns the fidelity notes and divergences); an
+ * unknown `gitignores`/`license` template name → the init-failure 500 with
+ * the row rolled back (create.go:236-241,448-456 via the unmapped-error arm
+ * repo.go:254-259; undeclared, the check-openapi RUNTIME_ONLY table's
+ * statuses/{sha} pattern records it with the cites).
  */
 function createCurrentUserRepoRoute(requireAuth: MiddlewareHandler<ApiEnv>) {
   return createRoute({

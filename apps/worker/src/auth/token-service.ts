@@ -288,5 +288,6 @@ export function rowToUser(row: typeof users.$inferSelect): AuthUser {
     type: row.type,
     visibility: row.visibility,
     numStars: row.numStars,
+    lastLoginAt: row.lastLoginAt,
   };
 }

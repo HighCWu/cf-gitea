@@ -40,16 +40,22 @@ import {
  * and flow in through `extras`. Upstream resolves `Base.Sha`/`Head.Sha`
  * through the git repo and computes mergeability asynchronously
  * (services/convert/pull.go:151–273):
- *   - `mergeable` renders from the row's status (checking → **null** —
- *     unknown; mergeable → true; otherwise false — upstream's checking
- *     status renders not-mergeable through `pr.Mergeable(ctx)` gating), the
- *     documented deviation from the contract's boolean type,
+ *   - `mergeable` renders from the row's status through `pr.Mergeable(ctx)`
+ *     semantics (models/issues/pull.go:751-756): checking/conflict/error →
+ *     false, WIP-title → false, everything else (mergeable/ancestor/empty)
+ *     → true — the field is a non-nullable bool at this pin (structs/pull.go:65;
+ *     swagger :33120-33124), never null,
  *   - `base.sha` renders "" unless the caller supplies `extras.baseSha`
  *     (the single-GET route resolves the engine tip),
  *   - `head.sha` renders from the `pull_requests.head_sha` cache ("" when
  *     the ref has not landed),
- *   - `additions`/`deletions`/`changed_files`/`review_comments` stay omitted
- *     (upstream omits them in lists too: services/convert/pull.go:488–492),
+ *   - `additions`/`deletions`/`changed_files` render from
+ *     `extras.diffStats` (the single-GET route resolves the
+ *     GetDiffShortStat port — services/pull-engine.ts
+ *     pullRequestDiffShortStat over convert/pull.go:245-254); `review_comments`
+ *     stays omitted, and LISTS omit all four (upstream's list converter
+ *     leaves the stats nil on purpose — the diff is slow — and panics in
+ *     dev/testing if set: services/convert/pull.go:488–492),
  *   - POST /pulls accepts the create per upstream shape without the
  *     base/head branch-existence check (engine read) — validated at the
  *     mergeability wave.
@@ -487,10 +493,14 @@ async function headBranchInfo(
  * visibility must not hide the head repo upstream shows.
  *
  * `extras` carries the engine-derived fields the routes resolve (the
- * mergeability wave, SPEC-0005 §3.4): `mergeable` renders from the row's
- * status machine (checking → null, mergeable → true, else false; a merged
- * PR → false) and `base.sha` from the base branch tip — list rendering keeps
- * the null/"" defaults to stay D1-only.
+ * mergeability wave, SPEC-0005 §3.4): `mergeable` renders through
+ * `pr.Mergeable(ctx)` (pull-engine.ts mergeableOfRow — checking/conflict/
+ * error/WIP → false, the rest true; non-nullable at this pin), `base.sha`
+ * from the base branch tip, and `diffStats` as the GetDiffShortStat port
+ * (pullRequestDiffShortStat — the `additions`/`deletions`/`changed_files`
+ * trio of structs/pull.go:51-55, omitempty pointers upstream renders only on
+ * the single converter, never on a list — convert/pull.go:488-492).
+ * List rendering keeps the "" base default and no diffStats to stay D1-only.
  *
  * `preloaded` (optional) is the list route's page-scoped
  * `prefetchPullRequestRenderContext` — the enrichment reads then collapse to
@@ -505,7 +515,13 @@ export async function toApiPullRequest(
   issue: IssueRow,
   pr: PullRequestRow,
   mode: "single" | "list" | "payload",
-  extras?: { mergeable?: boolean | null; baseSha?: string },
+  extras?: {
+    mergeable?: boolean;
+    baseSha?: string;
+    /** GetDiffShortStat port (pull-engine.ts pullRequestDiffShortStat) —
+     * renders the omitempty additions/deletions/changed_files trio. */
+    diffStats?: { additions: number; deletions: number; changedFiles: number };
+  },
   preloaded?: { context?: PullRequestRenderContext },
 ): Promise<PullRequest> {
   const context = preloaded?.context;
@@ -551,6 +567,17 @@ export async function toApiPullRequest(
     user: apiIssue.user,
     title: issue.title,
     body: issue.content ?? "",
+    // The GetDiffShortStat trio (convert/pull.go:245-254): rendered only when
+    // the caller resolved a stat — the omit arm mirrors upstream's error log
+    // (nil fields, structs/pull.go:51-55 omitempty) and the list guard keeps
+    // lists clean (:488-492 panics if a list carries them).
+    ...(extras?.diffStats === undefined
+      ? {}
+      : {
+          additions: extras.diffStats.additions,
+          deletions: extras.diffStats.deletions,
+          changed_files: extras.diffStats.changedFiles,
+        }),
     labels: apiIssue.labels ?? [],
     milestone: apiIssue.milestone,
     assignee: apiIssue.assignee,
@@ -567,11 +594,14 @@ export async function toApiPullRequest(
     html_url: htmlUrl,
     diff_url: `${htmlUrl}.diff`,
     patch_url: `${htmlUrl}.patch`,
-    // Mergeability state machine (SPEC-0005 §3.4): checking → null (unknown),
-    // mergeable → true, conflict/empty/ancestor/error → false. The single
-    // route resolves it lazily (ensurePullRequestChecked) and passes the
-    // value through `extras`; the list renders from the cached row.
-    mergeable: extras?.mergeable !== undefined ? extras.mergeable : mergeableOfRow(pr),
+    // Mergeability render — upstream's pr.Mergeable(ctx) (models/issues/
+    // pull.go:751-756; the field is a non-nullable bool, structs/pull.go:65):
+    // checking/conflict/error → false, WIP-title → false, everything else
+    // (mergeable/ancestor/empty, merged rows carrying their last status) →
+    // true. The single route resolves the row lazily
+    // (ensurePullRequestChecked) and passes the value through `extras`; the
+    // list renders from the cached row.
+    mergeable: extras?.mergeable !== undefined ? extras.mergeable : mergeableOfRow(pr, hasWorkInProgressPrefix(issue.title)),
     merged: pr.hasMerged,
     merged_at: mergedAt,
     merge_commit_sha: mergeCommitSha,

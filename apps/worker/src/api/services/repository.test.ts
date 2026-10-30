@@ -15,12 +15,13 @@
  */
 
 import { env } from "cloudflare:workers";
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
-import { repositories, teamMembers, teamRepoAccess, teams, type TeamAccessMode } from "../../db/schema";
+import { repositories, teamMembers, teamRepoAccess, teams, users, type TeamAccessMode } from "../../db/schema";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import { applyOrgsDdl, resetOrgTables } from "../../services/orgs/testing";
 import {
@@ -30,6 +31,7 @@ import {
   doerRepoAccessMode,
   findRepositoryByPath,
   findUserByName,
+  GO_ZERO_TIME,
   repositoryPermissions,
   repositoryPermissionsWithTeams,
   toApiRepository,
@@ -329,5 +331,59 @@ describe("apiUserFromRow — the profile quartet projects from the row (usabilit
     expect(user.description).toBe("");
     expect(user.website).toBe("");
     expect(user.location).toBe("");
+  });
+});
+
+describe("apiUserFromRow — the last_login authed gate (P3-7)", () => {
+  const anonymous: Viewer = { origin: "https://example.com", requester: null };
+  const LOGIN_AT = new Date("2026-03-04T05:06:07Z");
+
+  /** Seed a user whose row carries a real last-login instant (the
+   *  mintSession write the login POST performs — pinned in ui/session.test.ts;
+   *  here the column is set directly so the RENDER is isolated from the
+   *  mint). */
+  async function seedWithLastLogin(username: string): Promise<{ id: number; username: string }> {
+    const user = await seedVerifiedUser({ username });
+    await drizzle(env.DB).update(users).set({ lastLoginAt: LOGIN_AT }).where(eq(users.id, user.id));
+    return user;
+  }
+
+  it("the user themself sees the row's last_login_at instant (convert/user.go:118's authed arm)", async () => {
+    const user = await seedWithLastLogin("SelfSeen");
+    const row = await findUserByName(env.DB, "SelfSeen");
+    if (row === null) throw new Error("fixture user missing");
+
+    const user_ = apiUserFromRow(row, viewerFor(user));
+    expect(user_.last_login).toBe("2026-03-04T05:06:07.000Z");
+  });
+
+  it("a site admin sees another user's instant (the gate's second arm)", async () => {
+    await seedWithLastLogin("AdminSeen");
+    const admin = await seedVerifiedUser({ username: "Root", isAdmin: true });
+    const row = await findUserByName(env.DB, "AdminSeen");
+    if (row === null) throw new Error("fixture user missing");
+
+    const user_ = apiUserFromRow(row, viewerFor(admin, true));
+    expect(user_.last_login).toBe("2026-03-04T05:06:07.000Z");
+  });
+
+  it("a signed stranger and an anonymous caller get Go zero time even when the column is set", async () => {
+    await seedWithLastLogin("Gated");
+    const stranger = await seedVerifiedUser({ username: "Stranger" });
+    const row = await findUserByName(env.DB, "Gated");
+    if (row === null) throw new Error("fixture user missing");
+
+    expect(apiUserFromRow(row, viewerFor(stranger)).last_login).toBe(GO_ZERO_TIME);
+    expect(apiUserFromRow(row, anonymous).last_login).toBe(GO_ZERO_TIME);
+  });
+
+  it("a NULL column (never signed in) renders Go zero time for the self viewer too — upstream's zero TimeStamp", async () => {
+    await seedVerifiedUser({ username: "NeverLoggedIn" });
+    const row = await findUserByName(env.DB, "NeverLoggedIn");
+    if (row === null) throw new Error("fixture user missing");
+    expect(row.lastLoginAt).toBeNull();
+
+    const user_ = apiUserFromRow(row, viewerFor(row));
+    expect(user_.last_login).toBe(GO_ZERO_TIME);
   });
 });

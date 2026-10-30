@@ -26,10 +26,14 @@ import { repositorySchema } from "./repository";
  * optional and omitted at runtime until the engine wave supplies real
  * values (list never sets them: services/convert/pull.go:488-492).
  *
- * Documented deviation (SPEC-0005 §3.4 — mergeability is the 0001b engine
- * wave): the contract types `mergeable` as boolean, but upstream's value is
- * computed from the async mergeability state machine; until the engine RPCs
- * land we render `null` (unknown) per upstream's checking-status semantics.
+ * `mergeable` mirrors the contract's non-nullable boolean
+ * (v1-swagger.generated.json:33120-33124 — "type": "boolean", no x-nullable;
+ * structs/pull.go:65 `Mergeable bool`). The runtime value is
+ * `pr.Mergeable(ctx)` (models/issues/pull.go:751-756 — checking/conflict/
+ * error and WIP titles render false; everything else true), never null —
+ * SPEC-0005 §3.4's engine machine resolves a `checking` row on the single
+ * GET (ensurePullRequestChecked) and a still-checking row renders false,
+ * exactly like upstream's async checker state.
  */
 
 /** `#/definitions/PRBranchInfo` — base/head branch block. */
@@ -69,9 +73,8 @@ export const pullRequestSchema = z.object({
   merge_commit_sha: z.string().nullable().optional().openapi({ description: "The SHA of the merge commit" }),
   mergeable: z
     .boolean()
-    .nullable()
     .optional()
-    .openapi({ description: "Whether the pull request can be merged (null = unknown — the mergeability check has not run)" }),
+    .openapi({ description: "Whether the pull request can be merged" }),
   merged: z.boolean().optional().openapi({ description: "Whether the pull request has been merged" }),
   merged_at: z.string().nullable().optional().openapi({ format: "date-time" }),
   merged_by: embeddedUserSchema.nullable().optional(),

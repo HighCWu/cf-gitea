@@ -200,7 +200,10 @@ describe("GET /users/{username} (userGet)", () => {
       username: "Alice", // the MarshalJSON compat key == login (user.go:67-73)
       login_name: "",
       full_name: "Alice Doe",
-      email: "", // primary email only for self/admin (upstream convert.ToUser)
+      // The noreply PLACEHOLDER (convert/user.go:86 — `%d+%s@%s` over
+      // {ID}+{LowerName}@{NoReplyAddress}, models/user/user.go:241-243); the
+      // real email only for self/admin (convert/user.go:101-104).
+      email: `${alice.id}+alice@users.noreply.gitea.invalid`,
       avatar_url: "https://example.com/avatars/alice", // TODO(SPEC-0005): avatar storage
       html_url: "https://example.com/Alice",
       created: "2026-01-02T03:04:05.000Z",
@@ -210,7 +213,7 @@ describe("GET /users/{username} (userGet)", () => {
       active: false, // authed-gated upstream — Go-zero for anonymous viewers
       is_admin: false,
       prohibit_login: false,
-      last_login: "0001-01-01T00:00:00Z", // no users column yet; upstream gates it to self/admin (convert/user.go:118-124)
+      last_login: "0001-01-01T00:00:00Z", // authed-gated (convert/user.go:118-124); this seeded row is never minted into — NULL = Go zero time
       followers_count: 0, // the sync route render — toApiUserWithCounts carries the per-viewer totals
       following_count: 0,
       starred_repos_count: 0,
@@ -284,6 +287,64 @@ const anonViewer: Viewer = { origin: VIEWER_ORIGIN, requester: null };
 const doerViewer = (id: number, login: string, isAdmin = false): Viewer => ({
   origin: VIEWER_ORIGIN,
   requester: { id, login, is_admin: isAdmin },
+});
+
+describe("GET /users/{username} — the last_login authed gate (P3-7)", () => {
+  const LOGIN_AT = new Date("2026-03-04T05:06:07Z");
+
+  /** Seed a user whose row carries a real last-login instant (the
+   *  mintSession write — pinned in ui/session.test.ts; set directly here so
+   *  the ROUTE render is isolated from the mint). */
+  async function seedLogged(
+    username: string,
+    opts: SeedOptions = {},
+  ): Promise<{ id: number; usernameLower: string }> {
+    const user = await seedUser(username, opts);
+    await db().update(users).set({ lastLoginAt: LOGIN_AT }).where(eq(users.id, user.id));
+    return user;
+  }
+
+  it("the user themself sees the real last-login instant (convert/user.go:118's authed arm)", async () => {
+    const alice = await seedLogged("Alice");
+
+    const res = await ladderRouter()("/users/Alice", { headers: doerHeaders(alice.id) });
+    expect(res.status).toBe(200);
+    expect(await res.json<Record<string, unknown>>()).toMatchObject({
+      login: "Alice",
+      last_login: "2026-03-04T05:06:07.000Z",
+    });
+  });
+
+  it("a site admin sees another user's instant", async () => {
+    await seedLogged("Alice");
+    const admin = await seedLogged("Root", { isAdmin: true });
+
+    const res = await ladderRouter()("/users/Alice", { headers: doerHeaders(admin.id) });
+    expect(res.status).toBe(200);
+    expect(await res.json<Record<string, unknown>>()).toMatchObject({
+      login: "Alice",
+      last_login: "2026-03-04T05:06:07.000Z",
+    });
+  });
+
+  it("a signed stranger and an anonymous caller get Go zero time even when the column is set", async () => {
+    await seedLogged("Alice");
+    const stranger = await seedLogged("Stranger");
+
+    const strangerRes = await ladderRouter()("/users/Alice", { headers: doerHeaders(stranger.id) });
+    expect(strangerRes.status).toBe(200);
+    expect(await strangerRes.json<Record<string, unknown>>()).toMatchObject({
+      login: "Alice",
+      last_login: "0001-01-01T00:00:00Z",
+    });
+
+    const anonRes = await router()("/users/Alice");
+    expect(anonRes.status).toBe(200);
+    expect(await anonRes.json<Record<string, unknown>>()).toMatchObject({
+      login: "Alice",
+      last_login: "0001-01-01T00:00:00Z",
+    });
+  });
 });
 
 describe("the serializer's follow counts (toApiUserWithCounts — per-requester visibility)", () => {
@@ -393,7 +454,7 @@ describe("GET /users/{username} — the IsUserVisibleToViewer ladder (services/u
   });
 
   it("200s a limited user for any signed-in doer and renders the real visibility", async () => {
-    await seedUser("quiet", { visibility: "limited", email: "quiet@example.com" });
+    const quiet = await seedUser("quiet", { visibility: "limited", email: "quiet@example.com" });
     const viewer = await seedUser("viewer");
 
     const res = await ladderRouter()("/users/quiet", { headers: doerHeaders(viewer.id) });
@@ -402,7 +463,11 @@ describe("GET /users/{username} — the IsUserVisibleToViewer ladder (services/u
     expect(await res.json<Record<string, unknown>>()).toMatchObject({
       login: "quiet",
       visibility: "limited",
-      email: "", // authed-gated: a stranger sees no email
+      // A signed stranger gets the noreply placeholder, not the primary email
+      // (convert/user.go:101-104 — `signed && (!KeepEmailPrivate || authed)`;
+      // with no keep_email_private column the placeholder arm stands, the
+      // serializer's documented TODO(SPEC-0005) gap).
+      email: `${quiet.id}+quiet@users.noreply.gitea.invalid`,
     });
   });
 
@@ -802,6 +867,26 @@ describe("mounted chain (SELF): GET /user renders row truth (api review drift 1)
       login: "CountSelf",
       followers_count: 1, // the self view sees the private follower
       following_count: 0,
+    });
+  });
+
+  it("the self view renders the row's last_login_at (P3-7 — the rowToUser→authUserToApiUser carry)", async () => {
+    // The doer's own User projection reads the last-login instant through the
+    // auth identity conversion (authUserToApiUser over the AuthUser slice
+    // rowToUser mapped WHERE THE ROW WAS IN HAND) — upstream's authed arm
+    // (convert/user.go:118, `ToUser(ctx.Doer, ctx.Doer)` at userGetCurrent).
+    const doer = await seedUser("LoginTruth");
+    await db().update(users).set({ lastLoginAt: new Date("2026-03-04T05:06:07Z") }).where(eq(users.id, doer.id));
+    const minted = await mintFor(doer.id, "login-truth", "all");
+
+    const res = await SELF.fetch("https://example.com/api/v1/user", {
+      headers: { Authorization: `token ${minted.plaintext}` },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json<Record<string, unknown>>()).toMatchObject({
+      login: "LoginTruth",
+      last_login: "2026-03-04T05:06:07.000Z",
     });
   });
 

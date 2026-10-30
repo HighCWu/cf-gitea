@@ -74,6 +74,9 @@ const RUNTIME_ONLY_RESPONSES = {
     get: {
       401: "upstream reqToken() (token required for userCurrentListRepos); contract documents 200 only",
     },
+    post: {
+      500: "unknown gitignores/license template fails initRepository AFTER the row lands — CreateRepositoryDirectly's deferred cleanupRepository deletes it (services/repository/create.go:236-241,448-456) and CreateUserRepo's unmapped-error arm answers APIErrorInternal (repo.go:254-259; only already-exist/reserved/pattern/label-template map to 409/422); contract documents {201,400,409,422}",
+    },
   },
   "/markdown": {
     post: {
@@ -89,6 +92,20 @@ const RUNTIME_ONLY_RESPONSES = {
   "/repos/{owner}/{repo}/statuses/{sha}": {
     post: {
       422: "non-full-length sha input rejected at runtime (upstream resolves refs via the engine and 500s on unknown — neither reproducible without engine ref resolution); declared set stays {201,400,404}",
+    },
+  },
+  "/repos/{owner}/{repo}/transfer": {
+    post: {
+      // The PENDING arm: upstream's own handler answers 201 Created when the
+      // repository status is RepositoryPendingTransfer
+      // (gitea/routers/api/v1/repo/transfer.go:126-130) while its swagger
+      // block documents only the 202 (transfer.go:48-58) — the 202 is the
+      // DIRECT-transfer answer (:132-133, transferOwnership run inline for
+      // doer-is-admin / self / org-can-create-repo,
+      // services/repository/transfer.go:458-477). cf-gitea always files
+      // pending, so 201 is the success code we ship; the frozen contract
+      // carries only the never-emitted-here 202.
+      201: "upstream repoTransfer answers StatusCreated on the pending arm (transfer.go:126-130); its swagger documents only the direct-transfer 202 (transfer.go:48-58 vs :132-133)",
     },
   },
   "/user/followers": {
@@ -205,6 +222,16 @@ const RUNTIME_ONLY_RESPONSES = {
   "/repos/{owner}/{repo}/issues/comments/{id}": {
     patch: {
       422: "same Go bind arm on EditIssueCommentOption.Body's binding:\"Required\" (structs/issue_comment.go:45) — an empty/absent body 422s in the bind middleware before editIssueComment runs; the contract documents {200,204,403,404,423} only",
+    },
+  },
+  "/orgs/{org}/repos": {
+    post: {
+      500: "same initRepository rollback arm as /user/repos (create.go:236-241,448-456 via repo.go:254-259 — CreateOrgRepo delegates to CreateUserRepo, repo.go:491); contract documents {201,400,403,404}",
+    },
+  },
+  "/admin/users/{username}/repos": {
+    post: {
+      500: "same initRepository rollback arm as /user/repos (create.go:236-241,448-456 via repo.go:254-259 — the admin handler calls repo.CreateUserRepo, admin/repo.go:48); contract documents {201,400,403,404,409,422}",
     },
   },
 };

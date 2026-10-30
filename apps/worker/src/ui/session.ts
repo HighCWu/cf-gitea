@@ -416,6 +416,19 @@ export async function rotateSession(
  * the row (§2.3): every later rotation re-sets the cookie with it, so a
  * remembered login never degrades to a session cookie at the first 24 h
  * rotation.
+ *
+ * The mint is also upstream's LAST-LOGIN instant (P3-7): the same batched
+ * transaction bumps `users.last_login_at` — upstream sets `LastLoginUnix` on
+ * every sign-in path via `UpdateOptions{SetLastLogin: true}`
+ * (services/user/update.go:61,193-196 over models/user/user.go:235-237's
+ * `SetLastLogin()`): the form sign-in (handleSignInFull,
+ * routers/web/auth/auth.go:427-430), the first-user auto-admin
+ * (handleUserCreated, :713-717 — our first-run mint), account activation
+ * (:905), OAuth (oauth.go:409), and the non-interactive middleware sign-ins
+ * (services/auth/auth.go:52). Session VERIFY never touches the column —
+ * upstream's CheckAuthToken (services/auth/auth_token.go:33-69) is
+ * read-only on the user row, so a per-request verify here stays a no-op for
+ * `last_login_at` (the API-token paths don't bump either, exactly upstream).
  */
 export async function mintSession(
   d1: D1Database,
@@ -425,19 +438,24 @@ export async function mintSession(
   const now = options?.now ?? new Date();
   const id = cryptoRandomId(SESSION_ID_LENGTH);
   const secret = generateSessionSecret();
-  await drizzle(d1)
-    .insert(sessions)
-    .values({
-      id,
-      userId,
-      sha256Digest: await sha256Hex(secret),
-      previousSha256Digest: null,
-      rotatedAt: now,
-      expiresAt: new Date(now.getTime() + idleTtlMs(options?.remember ?? false)),
-      lastSeenAt: now,
-      remember: options?.remember ?? false,
-    })
-    .run();
+  const db = drizzle(d1);
+  await db.batch([
+    db
+      .insert(sessions)
+      .values({
+        id,
+        userId,
+        sha256Digest: await sha256Hex(secret),
+        previousSha256Digest: null,
+        rotatedAt: now,
+        expiresAt: new Date(now.getTime() + idleTtlMs(options?.remember ?? false)),
+        lastSeenAt: now,
+        remember: options?.remember ?? false,
+      }),
+    // The last-login bump rides the SAME transaction as the session insert —
+    // upstream writes both in one sign-in handler pass (auth.go:427-430).
+    db.update(users).set({ lastLoginAt: now }).where(eq(users.id, userId)),
+  ]);
   return `${id}:${secret}`;
 }
 

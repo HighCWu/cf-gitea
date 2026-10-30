@@ -110,6 +110,7 @@ import {
   mergeableOfRow,
   mergeUpstream as mergeUpstreamEngine,
   pullRequestDiff,
+  pullRequestDiffShortStat,
 } from "../services/pull-engine";
 import { branchRef, engineReads, isFullObjectId, refTipMap, tagRef } from "../services/engine";
 import { renderUnifiedDiff, renderPatch, toApiCommit, toChangedFiles, usernamesByEmail } from "../services/git-models";
@@ -157,9 +158,11 @@ import { requestedReviewersOf } from "./pull-reviews";
  *
  * Engine boundary (documented, this wave): POST accepts the create per
  * upstream shape WITHOUT the base/head branch-existence check (an engine
- * read) and GET renders `mergeable: null` (unknown), `base.sha: ""` and
- * `head.sha` from the pull_requests cache — validated/converted at the
- * mergeability wave (SPEC-0005 §3.4). The PATCH `base` retarget is likewise
+ * read) and GET resolves `mergeable` through pr.Mergeable(ctx) semantics
+ * (pull-engine.ts mergeableOfRow — a still-checking row renders FALSE, the
+ * pin's non-nullable bool: structs/pull.go:65, models/issues/pull.go:751-756),
+ * `base.sha: ""` and `head.sha` from the pull_requests cache. The PATCH
+ * `base` retarget is likewise
  * engine-gated upstream and is ignored this wave. The PATCH assignee fields
  * are LIVE: upstream REPLACES the assignee set (UpdateAssignees,
  * pull.go:674-694) and the machinery rides the landed issue_assignees table
@@ -1037,17 +1040,24 @@ export function registerPullRoutes(
   // mergeable/base.sha pair. The REVIEW-CONSULT (the pull-reviews wave):
   // `requested_reviewers` renders from the review-REQUEST rows
   // (services/convert/pull.go:124 LoadRequestedReviewers) instead of the
-  // converter's `[]` default — the PR-detail read arm only, like the
-  // mergeability extras.
+  // converter's `[]` default, and the diff-stat trio
+  // (`additions`/`deletions`/`changed_files`) from the GetDiffShortStat port
+  // (pullRequestDiffShortStat over convert/pull.go:245-254 — upstream's
+  // single converter fills the stats on EVERY single render; the omit arms —
+  // no merge base, truncated engine walk, engine failure — mirror its error
+  // log :247-250) — both PR-detail read arm only, like the mergeability
+  // extras.
   // -------------------------------------------------------------------------
   app.openapi(getPullRoute(optionalAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
     const { issue, pullRequest } = await requirePullRequest(c, found, c.req.valid("param").index);
     const checked = await ensurePullRequestChecked(c, found, pullRequest);
     const baseSha = (await engineReads(c.env, found.repo).readCommit(branchRef(checked.baseBranch)))?.oid;
+    const diffStats = await pullRequestDiffShortStat(c, found, checked);
     const rendered = await toApiPullRequest(c.env.DB, viewer, found, issue, checked, "single", {
-      mergeable: mergeableOfRow(checked),
+      mergeable: mergeableOfRow(checked, hasWorkInProgressPrefix(issue.title)),
       ...(baseSha === undefined ? {} : { baseSha }),
+      ...(diffStats === null ? {} : { diffStats }),
     });
     const requestedReviewers = await requestedReviewersOf(c.env.DB, issue.id, viewer);
     return c.json({ ...rendered, requested_reviewers: requestedReviewers }, 200);

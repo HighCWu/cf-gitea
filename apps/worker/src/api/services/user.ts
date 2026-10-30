@@ -162,7 +162,9 @@ function canSeeUserCondition(doer: UserVisibilityDoer): SQL {
  * viewers (the user themself or a site admin) get the gated fields
  * (is_admin/active/prohibit_login/last_login/language/login_name/source_id);
  * the gated columns that do not exist yet render documented zero/defaults
- * with TODO markers instead of inventing schema.
+ * with TODO markers instead of inventing schema (`last_login` is landed —
+ * the users.last_login_at column, P3-7; language remains the side-store
+ * decision TODO(SPEC-0005)).
  *
  * This sync render keeps the query-flat zero-defaults for the follow counts
  * (list callers cannot afford per-row count queries); the single-row GET
@@ -223,6 +225,7 @@ export function authUserToApiUser(u: AuthUser, origin: string): User {
     description: u.description,
     visibility: u.visibility ?? "public",
     numStars: u.numStars ?? 0,
+    lastLoginAt: u.lastLoginAt ?? null,
   };
   return apiUserFromRow(row, {
     origin,

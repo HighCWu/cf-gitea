@@ -426,6 +426,7 @@ export type ApiUserRow = Pick<
   | "description"
   | "visibility"
   | "numStars"
+  | "lastLoginAt"
 >;
 
 /**
@@ -445,8 +446,9 @@ export type ApiUserRow = Pick<
  * (`full_name`/`description`/`website`/`location`, SPEC-0007 §3.2) exactly
  * like upstream `toUser` (convert/user.go:84–93 — the fields come straight
  * off the user row, visible to every reader, not authed-gated). The primary
- * email shows only to the user themself or a site admin (upstream hides
- * private emails behind a placeholder we do not render yet). Exported for the
+ * email shows only to the user themself or a site admin; everyone else gets
+ * upstream's noreply placeholder (convert/user.go:86/:101-104 — the render
+ * above). Exported for the
  * converters that embed a `User` (commit-status creator), matching upstream
  * `convert.ToUser`.
  *
@@ -477,7 +479,19 @@ export function apiUserFromRow(row: ApiUserRow, viewer: Viewer, followCounts?: A
     login_name: "",
     source_id: 0,
     full_name: row.displayName ?? "",
-    email: authed ? (row.email ?? "") : "",
+    // Upstream renders the noreply PLACEHOLDER by default and swaps the real
+    // primary email only when `signed && (!KeepEmailPrivate || authed)`
+    // (convert/user.go:86 + :101-104; the format is `%d+%s@%s` over
+    // `{ID}+{LowerName}@{NoReplyAddress}`, models/user/user.go:241-243,
+    // NoReplyAddress defaulting to `noreply.<AppDomain>`,
+    // setting/service.go:212). With no keep_email_private column yet
+    // (TODO(SPEC-0005)) a signed non-privileged viewer cannot clear the
+    // keep-private default, so the non-authed arm renders the placeholder
+    // (exact for anonymous — upstream always placeholders them — and the
+    // keep-private users; the documented gap is only keep-private=false
+    // users seen by signed strangers). The domain rides the landed fixed
+    // invalid-domain stand-in (services/user-repos.ts's git-signature note).
+    email: authed ? (row.email ?? "") : `${row.id}+${row.usernameLower}@users.noreply.gitea.invalid`,
     avatar_url: `${viewer.origin}/avatars/${row.usernameLower}`, // TODO(SPEC-0005): avatar storage
     html_url: `${viewer.origin}/${row.username}`,
     language: "",
@@ -485,11 +499,11 @@ export function apiUserFromRow(row: ApiUserRow, viewer: Viewer, followCounts?: A
     // Upstream gates LastLogin inside the AUTHED block
     // (convert/user.go:118-124 — `result.LastLogin = user.LastLoginUnix.AsTime()`
     // under `if authed`; declared `json:"last_login"`, modules/structs/
-    // user.go:39): self/admin see the row's column, everyone else the Go-zero
-    // time. The `users` row has no last-login column yet — the schema owner
-    // lands it (then renders `authed ? row.<col> : GO_ZERO_TIME` here);
-    // TODO(SPEC-0005) stays for that column, NOT for the gate shape.
-    last_login: GO_ZERO_TIME,
+    // user.go:39): self/admin see the row's `last_login_at` (users
+    // column — the mintSession touch, ui/session.ts), everyone else the
+    // Go-zero time. A NULL column = never signed in — upstream's zero
+    // TimeStamp, whose AsTime() marshals the same zero time (P3-7).
+    last_login: authed ? (row.lastLoginAt?.toISOString() ?? GO_ZERO_TIME) : GO_ZERO_TIME,
     created: row.createdAt.toISOString(),
     restricted: false,
     active: authed ? row.status === "active" : false,

@@ -38,6 +38,14 @@ export interface AuthUser {
   type?: "user" | "org";
   visibility?: "public" | "limited" | "private";
   numStars?: number;
+  /** The row's `last_login_at` — the last SESSION MINT instant (upstream
+   *  `LastLoginUnix`, models/user/user.go:124; bumped by mintSession, the
+   *  port of upstream's sign-in family — routers/web/auth/auth.go:427-430,
+   *  services/auth/auth.go:52). Rendered authed-gated by the API serializer
+   *  (convert/user.go:118). Optional for the same reason as the other
+   *  render-relevant carry: hand-built AuthUser slices omit it and the
+   *  adapter renders Go zero time (upstream's zero TimeStamp). */
+  lastLoginAt?: Date | null;
 }
 
 export interface AuthToken {

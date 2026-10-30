@@ -137,6 +137,103 @@ describe("POST /user/repos create response (F6)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// auto_init seeding (prepareRepoCommit's three write arms, create.go:97-146)
+// ---------------------------------------------------------------------------
+
+/** GET /contents/<path> on the freshly created repo, base64-decoded. */
+async function readContent(owner: string, name: string, path: string): Promise<string | null> {
+  const app = createApiRouter({ auth: createStubAuthResolver(["stub-token"]) });
+  const ctx = createExecutionContext();
+  const res = await app.fetch(
+    new Request(`https://example.com/repos/${owner}/${name}/contents/${path}`, {
+      headers: { authorization: "token stub-token" },
+    }),
+    env,
+    ctx,
+  );
+  await waitOnExecutionContext(ctx);
+  if (res.status !== 200) return null;
+  const body = await res.json<{ content: string }>();
+  return atob(body.content.replace(/\n/g, ""));
+}
+
+async function repoRowExists(name: string): Promise<boolean> {
+  const row = await drizzle(env.DB)
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(eq(repositories.slug, name))
+    .get();
+  return row !== undefined;
+}
+
+describe("POST /user/repos auto_init seeding", () => {
+  const owner = STUB_USER.login ?? "cf-gitea-stub";
+
+  it("seeds README.md, .gitignore (the # ---> join) and LICENSE (placeholder-filled)", async () => {
+    await seedStubRow();
+    const res = await apiCreate({
+      name: "seeded",
+      auto_init: true,
+      description: "seed me",
+      gitignores: "Go,Node",
+      license: "MIT",
+    });
+    expect(res.status).toBe(201);
+    expect(await res.json<{ empty: boolean }>()).toMatchObject({ empty: false });
+
+    const readme = await readContent(owner, "seeded", "README.md");
+    expect(readme).toBe("# seeded\n\nseed me");
+    // The .gitignore join: one `# ---> <name>` header + body + trailing
+    // newline per comma-split entry (create.go:108-124).
+    const gitignore = await readContent(owner, "seeded", ".gitignore");
+    expect(gitignore).toContain("# ---> Go\n");
+    expect(gitignore).toContain("# ---> Node\n");
+    const gi = gitignore ?? "";
+    expect(gi.indexOf("# ---> Go")).toBeLessThan(gi.indexOf("# ---> Node"));
+    // The license placeholder fill (modules/repository/license.go) with the
+    // create values: Owner=owner login, Year=create year (now.Format("2006"),
+    // create.go:129-135); the author email rides the git signature (the row
+    // has no email → the noreply placeholder stand-in).
+    const license = await readContent(owner, "seeded", "LICENSE");
+    expect(license).toContain(`Copyright (c) ${new Date().getUTCFullYear()} `);
+    expect(license).not.toContain("<year>");
+    expect(license).not.toContain("<copyright holders>");
+  });
+
+  it("unknown gitignores template → the init-failure 500 with the row rolled back", async () => {
+    await seedStubRow();
+    // First create a same-shape repo so the name-free re-create below is
+    // proven against a REUSED name.
+    const res = await apiCreate({ name: "rollback-probe", auto_init: true, gitignores: "Not-A-Template" });
+    expect(res.status).toBe(500);
+    const body = await res.json<{ message: string }>();
+    // The init failure text (create.go:113-114 — GetRepoInitFile[%s]).
+    expect(body.message).toBe("GetRepoInitFile[Not-A-Template]: gitignore template does not exist");
+    // cleanupRepository (create.go:236-241 → :448-456): the row is GONE and
+    // the name is free again — a retry with the same name succeeds.
+    expect(await repoRowExists("rollback-probe")).toBe(false);
+    const retry = await apiCreate({ name: "rollback-probe", auto_init: true });
+    expect(retry.status).toBe(201);
+  });
+
+  it("unknown license template → the same 500 rollback (create.go:131-135)", async () => {
+    await seedStubRow();
+    const res = await apiCreate({ name: "rollback-license", auto_init: true, license: "Not-A-License" });
+    expect(res.status).toBe(500);
+    const body = await res.json<{ message: string }>();
+    expect(body.message).toBe("getLicense[Not-A-License]: license template does not exist");
+    expect(await repoRowExists("rollback-license")).toBe(false);
+  });
+
+  it("an unknown readme stays the pre-create 400 (repo.go:228-231) — no row, no rollback", async () => {
+    await seedStubRow();
+    const res = await apiCreate({ name: "bad-readme", auto_init: true, readme: "Nope" });
+    expect(res.status).toBe(400);
+    expect(await repoRowExists("bad-readme")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // toCreatedOrgRepository — the shared 201 assembly both create routes call
 // ---------------------------------------------------------------------------
 
