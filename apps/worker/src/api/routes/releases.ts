@@ -5,13 +5,13 @@ import { z } from "zod";
 
 import { ReleaseAlreadyExistError } from "../../issues/errors";
 import type { ReleaseRow } from "../../issues/service";
-import { IssuesService } from "../../issues/service";
 import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
 import type { WebhookDeliveryMessage } from "../../webhooks/consumer";
 import { ActionType, recordAction } from "../services/activity-feeds";
 import { issueErrorToApiError } from "../services/issues";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
+import { tagRef, ZERO_OID } from "../services/engine";
 import {
   createReleaseOptionSchema,
   editReleaseOptionSchema,
@@ -25,6 +25,7 @@ import { toApiRepository, viewerOf, type RepositoryWithOwner } from "../services
 import {
   assertDraftVisible,
   assertNotTagRecord,
+  createReleaseWithGitTag,
   deleteRelease,
   editRelease,
   findLatestRelease,
@@ -33,6 +34,7 @@ import {
   listReleases,
   toApiRelease,
 } from "../services/releases";
+import { emitRefWebhook, zeroCommitPushPayload } from "../services/tags";
 
 /**
  * Tier-1 release routes (SPEC-0004 §2.4 rows repoListReleases /
@@ -469,24 +471,59 @@ export function registerReleaseRoutes(
         throw new ApiError(422, "repo is empty");
       }
 
-      const target = form.target_commitish !== undefined && form.target_commitish !== "" ? form.target_commitish : found.repo.defaultBranch;
       let row: ReleaseRow;
+      let tagCreated: boolean;
+      let tagTip: string | undefined;
       try {
-        row = await new IssuesService(c.env.DB).createRelease({
-          repoId: found.repo.id,
+        // The create + git-tag sequence (upstream CreateRelease →
+        // release_service.CreateRelease → createTag) — the shared service
+        // call; a fresh tag_name lands refs/tags/<tag> from
+        // target_commitish, an existing tag rides, a protected tag answers
+        // 422 and an unresolvable target 404 "target not found".
+        const created = await createReleaseWithGitTag({
+          env: c.env,
+          d1: c.env.DB,
+          pair: found,
           publisherId: requester.id ?? 0,
+          doer: requester,
+          requestHost: new URL(c.req.url).hostname,
           tagName: form.tag_name,
-          target,
+          targetCommitish: form.target_commitish,
+          tagMessage: form.tag_message,
           title: form.name ?? "",
           note: form.body ?? "",
           isDraft: form.draft === true,
           isPrerelease: form.prerelease === true,
         });
+        row = created.row;
+        tagCreated = created.tagCreated;
+        tagTip = created.tagTip;
       } catch (error) {
         if (error instanceof ReleaseAlreadyExistError) {
           throw issueErrorToApiError(error); // the declared 409 (error-body)
         }
         throw error;
+      }
+      // The ref-webhook pair for a freshly created tag — upstream createTag
+      // notifies the created ref exactly like the tags API does
+      // (services/release/release.go:125-148 PushCommits + CreateRef); the
+      // emission is the tags route's own helpers (byte-identical payloads).
+      if (tagCreated && tagTip !== undefined) {
+        const fullName = tagRef(form.tag_name);
+        await emitRefWebhook(c, found, "push", zeroCommitPushPayload(c, found, fullName, ZERO_OID, tagTip), fullName);
+        await emitRefWebhook(
+          c,
+          found,
+          "create",
+          {
+            sha: tagTip,
+            ref: form.tag_name,
+            ref_type: "tag",
+            repository: toApiRepository(viewerOf(c), found),
+            sender: c.get("authUser") ?? null,
+          },
+          fullName,
+        );
       }
       // Webhook: NewRelease (release.go:198) — drafts stay silent.
       await emitReleaseEvent(c, found, row, "published");

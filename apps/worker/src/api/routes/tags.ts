@@ -8,8 +8,6 @@ import { releases } from "../../db/schema";
 import type { ApiEnv } from "../env";
 import { ApiError, apiErrorSchema } from "../errors";
 import {
-  branchRef,
-  commitApiChangeError,
   deleteApiRefError,
   engineCell,
   engineReads,
@@ -23,9 +21,7 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { assertNotArchived, canWriteRepository, requireVisibleRepo } from "../services/repo-access";
 import { toApiRepository, viewerOf, type RepositoryWithOwner } from "../services/repository";
 import { isTagControlAllowed, listProtectedTags } from "../../services/tag-protection";
-import { serializeTag } from "@cf-gitea/git-engine";
-import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
-import type { WebhookDeliveryMessage } from "../../webhooks/consumer";
+import { emitRefWebhook, resolveTagTarget, writeTagRef, zeroCommitPushPayload } from "../services/tags";
 
 /**
  * Tier-1 tag routes (SPEC-0004 §2.4 rows repoListTags / repoCreateTag /
@@ -282,105 +278,16 @@ function wildcardRepoPath(c: Context<ApiEnv, typeof WILDCARD_ROUTE>): { owner: s
 }
 
 // ---------------------------------------------------------------------------
-// Webhook triggers — the routes/releases.ts emit pattern (the per-file twin
-// of the branches route's helper; the api-routes emission family keeps its
-// queue probe + error sink file-local): the delivery-row insert runs INLINE
-// after the ref mutation committed; only the Queue producer ({deliveryId}
-// batch) hangs off the executionCtx-guarded waitUntil — in-process callers
-// (tests via app.request) have no executionCtx, skip the enqueue, and leave
-// the rows `pending`. Failures are logged, never propagated — a webhook miss
-// can never fail the API write (§3.5's post-commit posture).
+// Webhook triggers — the emission helpers (emitRefWebhook /
+// zeroCommitPushPayload and their queue probe) live in services/tags.ts so
+// the release-create path fires the byte-identical payload pair; the
+// delivery-row insert still runs INLINE after the ref mutation committed;
+// only the Queue producer ({deliveryId} batch) hangs off the
+// executionCtx-guarded waitUntil — in-process callers (tests via
+// app.request) have no executionCtx, skip the enqueue, and leave the rows
+// `pending`. Failures are logged, never propagated — a webhook miss can
+// never fail the API write (§3.5's post-commit posture).
 // ---------------------------------------------------------------------------
-
-/** The `WEBHOOK_DELIVERY` Queue producer, when the binding is wired. */
-function webhookDeliveryQueue(
-  env: ApiEnv["Bindings"],
-): { sendBatch(messages: { body: WebhookDeliveryMessage }[]): Promise<unknown> } | null {
-  const candidate: unknown = (env as { WEBHOOK_DELIVERY?: unknown }).WEBHOOK_DELIVERY;
-  if (candidate === undefined || candidate === null) return null;
-  const queue = candidate as { sendBatch?: (messages: { body: WebhookDeliveryMessage }[]) => Promise<unknown> };
-  return typeof queue.sendBatch === "function" ? { sendBatch: queue.sendBatch.bind(queue) } : null;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-/**
- * Fan one committed tag ref write out as a `create`/`delete` event. `refName`
- * is the FULL ref, matching what the push family passes to the branch filter
- * (emitPushFamilyUpdates); the payload itself carries upstream's SHORT name.
- */
-async function emitRefWebhook(
-  c: Context<ApiEnv>,
-  pair: RepositoryWithOwner,
-  eventType: Extract<HookEventType, "create" | "delete" | "push">,
-  payload: unknown,
-  refName: string,
-): Promise<void> {
-  let execCtx: { waitUntil(promise: Promise<unknown>): void } | undefined;
-  try {
-    execCtx = c.executionCtx;
-  } catch {
-    execCtx = undefined; // in-process caller (tests): no execution context
-  }
-  const queue = webhookDeliveryQueue(c.env);
-  try {
-    await emitWebhookDeliveries(
-      c.env.DB,
-      { repoId: pair.repo.id, ownerId: pair.repo.ownerId, eventType, payload, refName },
-      {
-        enqueue:
-          queue !== null && execCtx !== undefined
-            ? (deliveryIds) => {
-                execCtx.waitUntil(
-                  queue.sendBatch(deliveryIds.map((deliveryId) => ({ body: { deliveryId } }))).then(undefined, (error: unknown) => {
-                    console.error(`[tags] delivery enqueue failed (${eventType}): ${errorMessage(error)}`);
-                  }),
-                );
-              }
-            : undefined,
-      },
-    );
-  } catch (error) {
-    console.error(`[tags] webhook fan-out failed (${eventType}): ${errorMessage(error)}`);
-  }
-}
-
-/**
- * The zero-commit `push` payload around an API tag write — the push family's
- * created/deleted-ref shape (services/webhooks-push.ts:400-410, upstream's
- * mirror path: SyncPushCommits → notifier.go:901-909 with an empty
- * PushCommits struct, mirror_pull.go:347): FULL ref, before/after oids,
- * compare_url the bare origin + "/" (AppURL + CompareURL ""), no commits,
- * head_commit null, and `pusher` AND `sender` the authenticated caller
- * (notifier.go:919-920 — both apiPusher). Upstream's git-push/release tag
- * paths additionally set head_commit + a composed compare URL for created
- * tags (push.go:123-136, release.go:131-134) — the landed family already
- * emits the mirror-path shape for pushed tags, and this stays byte-identical
- * with it (the documented family-level deviation, not a new one).
- */
-function zeroCommitPushPayload(
-  c: Context<ApiEnv>,
-  pair: RepositoryWithOwner,
-  ref: string,
-  before: string,
-  after: string,
-): Record<string, unknown> {
-  const sender = c.get("authUser") ?? null;
-  return {
-    ref,
-    before,
-    after,
-    compare_url: `${viewerOf(c).origin}/`,
-    commits: [],
-    total_commits: 0,
-    head_commit: null,
-    repository: toApiRepository(viewerOf(c), pair),
-    pusher: sender,
-    sender,
-  };
-}
 
 export function registerTagRoutes(
   app: OpenAPIHono<ApiEnv>,
@@ -470,26 +377,17 @@ export function registerTagRoutes(
       const form = c.req.valid("json");
       const name = form.tag_name;
 
-      const reads = engineReads(c.env, pair.repo);
-      const tips = refTipMap(await reads.listRefs());
-
       // Target resolution: explicit `target` (a branch/tag name, full ref, or
-      // oid) or the default branch (CreateTag → GetTargetCommit).
-      const explicit = form.target !== undefined && form.target !== "";
-      const refParam = explicit ? (form.target as string) : pair.repo.defaultBranch;
-      let commitSha: string;
-      const tip = tips.get(branchRef(refParam)) ?? tips.get(tagRef(refParam)) ?? (explicit ? tips.get(refParam) : undefined);
-      if (tip !== undefined) {
-        const sha = await tagCommitSha(c, pair.repo, { name: refParam, target: tip.target, ...(tip.peeled === undefined ? {} : { peeled: tip.peeled }) });
-        if (sha === null) throw new ApiError(404, `target not found: ${refParam}`);
-        commitSha = sha;
-      } else if (/^[0-9a-f]{40}$/.test(refParam)) {
-        commitSha = refParam;
-      } else {
-        throw new ApiError(404, `target not found: ${refParam}`);
+      // oid) or the default branch (CreateTag → GetTargetCommit) — the
+      // shared tag-store service (services/tags.ts), one listRefs serving
+      // the duplicate check below.
+      const resolved = await resolveTagTarget(c.env, pair.repo, form.target);
+      if (resolved.tag === "not-found") {
+        throw new ApiError(404, `target not found: ${resolved.target}`);
       }
+      const commitSha = resolved.commitSha;
 
-      if (tips.has(tagRef(name))) {
+      if (resolved.tips.has(tagRef(name))) {
         throw new ApiError(409, "tag already exists");
       }
 
@@ -504,48 +402,23 @@ export function registerTagRoutes(
         throw new ApiError(422, "user not allowed to create protected tag");
       }
 
-      // A message creates the ANNOTATED tag object (serializeTag →
-      // putApiObjects → ref CAS); without one the tag is lightweight.
-      let newTarget = commitSha;
-      if (form.message !== undefined && form.message !== "") {
-        const doerRow = c.get("authUser");
-        const now = Math.floor(Date.now() / 1000);
-        const tag = serializeTag({
-          object: commitSha,
-          type: "commit",
-          tag: name,
-          tagger:
-            doerRow === undefined
-              ? null
-              : {
-                  name: doerRow.login ?? "gitea",
-                  email:
-                    doerRow.email === undefined || doerRow.email === ""
-                      ? `${doerRow.login ?? "gitea"}@noreply.${new URL(c.req.url).hostname}`
-                      : doerRow.email,
-                  time: now,
-                  tz: "+0000",
-                },
-          message: form.message,
-        });
-        const stored = await engineCell(c.env, pair.repo).putApiObjects([{ oid: tag.oid, type: tag.type, data: tag.data }]);
-        if (stored.tag !== "ok") {
-          throw new ApiError(422, stored.tag === "invalid" ? stored.reason : "tag object too large");
-        }
-        newTarget = tag.oid;
-      }
-
-      const result = await engineCell(c.env, pair.repo).commitApiChange({
-        ref: tagRef(name),
-        expectedOldOid: ZERO_OID,
-        newOid: newTarget,
+      // The write itself — a message creates the ANNOTATED tag object
+      // (serializeTag → putApiObjects → ref CAS); without one the tag is
+      // lightweight (the shared tag-store service).
+      const written = await writeTagRef(c.env, pair.repo, {
+        name,
+        commitSha,
+        message: form.message,
+        doer,
+        requestHost: new URL(c.req.url).hostname,
       });
-      if (result.tag !== "committed") {
-        if (result.tag === "invalid") {
-          throw new ApiError(422, result.reason);
-        }
-        throw commitApiChangeError(result);
+      if (written.tag === "invalid") {
+        throw new ApiError(422, written.reason);
       }
+      if (written.tag === "conflict") {
+        throw written.error;
+      }
+      const newTarget = written.refTip;
 
       // Upstream's API tag create fires the zero-commit `push` event around
       // the `create` event (services/release/release.go:136-143 — PushCommits

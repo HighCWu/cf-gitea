@@ -957,7 +957,10 @@ describe("the release_tag_header menu's Tags item (F9)", () => {
     expect(html).toContain('<h2 class="ui compact small menu small-menu-items">');
     expect(html).toContain('<a class="active item" href="/relmx-owner/rel/releases">');
     expect(html).toContain('<a class="item" href="/relmx-owner/rel/tags">');
-    expect(html).toContain("1 Tag"); // the fixture's single in-git tag, the singular arm
+    // The N2 wave: the earlier form-POST test's tag a1 now LANDS in the
+    // shared cached cell (the web create arm rides createReleaseWithGitTag)
+    // — the fixture's seed tag + a1 = the plural arm.
+    expect(html).toContain("2 Tags");
   });
 
   it("the DETAIL page renders the same two-item menu — the F9 tab gap (SingleRelease renders the same header)", async () => {
@@ -970,7 +973,7 @@ describe("the release_tag_header menu's Tags item (F9)", () => {
     expect(html).toContain('<h2 class="ui compact small menu small-menu-items">');
     expect(html).toContain('<a class="active item" href="/relmx-owner/rel/releases">');
     expect(html).toContain('<a class="item" href="/relmx-owner/rel/tags">');
-    expect(html).toContain("1 Tag");
+    expect(html).toContain("2 Tags");
   });
 
   it("a multi-tag repo renders the plural count arm on the detail page", async () => {
@@ -989,6 +992,8 @@ describe("the release_tag_header menu's Tags item (F9)", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('<a class="item" href="/relmx-owner/rel/tags">');
-    expect(html).toContain("2 Tags");
+    // The N2 wave: the cell now holds the seed tag + the form-POST test's
+    // landed a1 + this v2 = three tags.
+    expect(html).toContain("3 Tags");
   });
 });

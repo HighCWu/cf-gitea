@@ -169,6 +169,7 @@ import { inArray } from "drizzle-orm";
 import type { ReleaseAssetRow } from "../../api/services/release-assets";
 import { listReleaseAssets, toApiAttachment } from "../../api/services/release-assets";
 import {
+  createReleaseWithGitTag,
   deleteRelease,
   editRelease,
   findLatestRelease,
@@ -539,16 +540,28 @@ export async function createReleaseFromForm(input: {
 
   let row: ReleaseRow;
   try {
-    row = await new IssuesService(input.env.DB).createRelease({
-      repoId: repo.id,
+    // The N2 wave: the WEB create arm rides createReleaseWithGitTag too —
+    // a fresh tag_name lands its git tag before the row (upstream's
+    // NewReleasePost → release_service.CreateRelease → createTag; the form
+    // pre-checks the target branch above, so the wrapper's 404 arm is the
+    // unreachable guard, and its 422 protected-tag answer maps onto the
+    // form's invalid outcome like the API's).
+    const created = await createReleaseWithGitTag({
+      env: input.env,
+      d1: input.env.DB,
+      pair,
       publisherId: doer.id,
+      doer: { id: doer.id, login: doer.username, email: doer.email },
+      requestHost: new URL(origin).host,
       tagName: form.tagName,
-      target,
+      targetCommitish: target,
+      tagMessage: undefined,
       title: form.title,
       note: form.content,
       isDraft: form.draft,
       isPrerelease: form.prerelease,
     });
+    row = created.row;
   } catch (error) {
     if (error instanceof ReleaseAlreadyExistError) {
       return { outcome: "invalid", message: releasesLocale.tag_already_exist };

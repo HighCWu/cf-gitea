@@ -2,11 +2,16 @@ import { and, desc, eq, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { releaseAssets, releases, users } from "../../db/schema";
-import type { ReleaseRow } from "../../issues/service";
+import { ReleaseAlreadyExistError } from "../../issues/errors";
+import { IssuesService, type ReleaseRow } from "../../issues/service";
+import { isTagControlAllowed, listProtectedTags } from "../../services/tag-protection";
 import { ApiError } from "../errors";
+import type { ApiEnv } from "../env";
 import type { Release } from "../models/release";
 import type { User } from "../models/user";
+import { engineReads, refTipMap, tagRef } from "./engine";
 import { apiUserFromRow, type RepositoryWithOwner, type Viewer } from "./repository";
+import { resolveTagTarget, writeTagRef, type TagCreator } from "./tags";
 
 /**
  * Release reads/converters backing the tier-1 `repository`-tagged release
@@ -18,11 +23,12 @@ import { apiUserFromRow, type RepositoryWithOwner, type Viewer } from "./reposit
  * model: the filtered list/latest reads, the edit patch, the delete, and the
  * wire converter.
  *
- * Engine boundary (documented, per the batch brief — releases are D1-only
- * until assets): upstream's CreateRelease/EditRelease also create/rename the
- * GIT TAG through the engine commit-builder (SPEC-0004 §3.4) and DeleteRelease
- * deletes it; here `target_commitish`/`tag_name` are D1 values, `sha1` stays
- * null, and the git tag itself is untouched — the engine wave closes this.
+ * Engine boundary (UPDATED by the findings-links N2 fix): the CREATE path now
+ * also lands the GIT TAG for a fresh `tag_name` through the shared tag-store
+ * service (services/tags.ts — the tag-creation API's mechanism), matching
+ * upstream services/release/release.go createTag; `sha1` stays null and the
+ * EDIT/DELETE paths remain D1-only (upstream's UpdateRelease tag arm and
+ * DeleteReleaseByID's delTag stay open engine-wave items).
  *
  * Upstream citations (submodule pin fc4936884584):
  *  - list: `routers/api/v1/repo/release.go ListReleases` — FindReleases
@@ -212,6 +218,137 @@ export async function findReleaseForRepoById(d1: D1Database, repoId: string, id:
     .where(and(eq(releases.id, id), eq(releases.repoId, repoId)))
     .limit(1);
   return rows[0] ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// The create path WITH the git tag (findings-links N2): upstream
+// POST /repos/{owner}/{repo}/releases auto-creates the release's git tag —
+// routers/api/v1/repo/release.go CreateRelease 259-287 → release_service
+// .CreateRelease (services/release/release.go:173-199) → createTag
+// (release.go:69-166) — from `target_commitish` (the default branch when
+// absent). Without it every git-tag-shaped link for the release 404s.
+// ---------------------------------------------------------------------------
+
+export interface CreateReleaseWithGitTagInput {
+  /** The worker bindings — the engine cell client's source. */
+  env: ApiEnv["Bindings"];
+  /** D1 — the releases row's store. */
+  d1: D1Database;
+  /** The repo: engine cell name + D1 scope + default branch. */
+  pair: RepositoryWithOwner;
+  publisherId: number;
+  /** The authenticated creator — tagger identity + protected-tag subject. */
+  doer: TagCreator | null | undefined;
+  /** Request host, for the `<login>@noreply.<host>` tagger fallback. */
+  requestHost: string;
+  tagName: string;
+  /** `target_commitish` — absent/"" resolves the default branch. */
+  targetCommitish: string | undefined;
+  /** Non-empty → the tag is created ANNOTATED (upstream TagMessage). */
+  tagMessage: string | undefined;
+  title: string;
+  note: string;
+  isDraft: boolean;
+  isPrerelease: boolean;
+}
+
+export interface CreateReleaseWithGitTagResult {
+  row: ReleaseRow;
+  /** True when THIS call created the git tag (upstream createTag's `created`
+   *  — drives the ref-webhook pair; an existing tag rides silently). */
+  tagCreated: boolean;
+  /** The new ref's tip — the TAG OBJECT oid when annotated — the create
+   *  payload's `sha`. Defined only when tagCreated. */
+  tagTip?: string;
+}
+
+/**
+ * Create a release row AND its git tag, upstream's exact sequence:
+ *
+ *   1. duplicate release row → 409 BEFORE any git write (CreateRelease's
+ *      IsReleaseExist, release.go:174-181; exact-tagName lookup, the
+ *      IssuesService semantics — the unique index arbitrates the race);
+ *   2. a tag-only record does NOT conflict (the §2.3 conversion path —
+ *      upstream reaches it through UpdateRelease, whose createTag arm
+ *      release.go:262 lands the tag before the row write, as below);
+ *   3. published releases only (drafts defer the tag to their publish
+ *      moment — createTag's `!rel.IsDraft` gate, release.go:78), ordered
+ *      exactly like createTag: git tag exists → RIDE it, no duplicate
+ *      (release.go:78 `IsTagExist`); protected tag → 422 "release tag name
+ *      is protected [tag_name: …]" (release.go:87-102 + the handler's
+ *      IsErrProtectedTagName answer, release.go:281-282); unresolvable
+ *      target → 404 "target not found" with NO row created
+ *      (release.go:104-113 GetCommit + the handler's git.IsErrNotExist
+ *      answer, release.go:283-284); `tag_message` → annotated tag
+ *      (release.go:110-121);
+ *   4. the row rides the landed SPEC-0005 writer (IssuesService.createRelease
+ *      — the 409 race fallback + the tag-record conversion, unchanged).
+ *
+ * NOT replicated: createTag's MustNotBeArchived arm (release.go:74-77) —
+ * upstream's release handler maps none of its outcomes (an archived-repo
+ * release create dies as an internal 500 there), and the landed release
+ * surface deliberately registers no mustNotBeArchived (the pinned 201 on
+ * archived repos); the tag is created. Also kept: `sha1`/`NumCommits` stay
+ * unwritten (release.go:150-157 fills them from the tagged commit — the
+ * engine-wave tail), and the tag is dated by the row, not the commit
+ * (release.go:154's CreatedUnix = commit time).
+ */
+export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInput): Promise<CreateReleaseWithGitTagResult> {
+  const { pair } = input;
+  const repoId = pair.repo.id;
+
+  const existing = await drizzle(input.d1)
+    .select()
+    .from(releases)
+    .where(and(eq(releases.repoId, repoId), eq(releases.tagName, input.tagName)))
+    .get();
+  if (existing !== undefined && !existing.isTag) {
+    throw new ReleaseAlreadyExistError(input.tagName);
+  }
+
+  let tagCreated = false;
+  let tagTip: string | undefined;
+  if (!input.isDraft) {
+    const tips = refTipMap(await engineReads(input.env, pair.repo).listRefs());
+    if (!tips.has(tagRef(input.tagName))) {
+      if (!(await isTagControlAllowed(input.d1, await listProtectedTags(input.d1, repoId), input.tagName, input.doer?.id ?? 0))) {
+        throw new ApiError(422, `release tag name is protected [tag_name: ${input.tagName}]`);
+      }
+      const resolved = await resolveTagTarget(input.env, pair.repo, input.targetCommitish);
+      if (resolved.tag === "not-found") {
+        throw new ApiError(404, "target not found");
+      }
+      const written = await writeTagRef(input.env, pair.repo, {
+        name: input.tagName,
+        commitSha: resolved.commitSha,
+        message: input.tagMessage,
+        doer: input.doer,
+        requestHost: input.requestHost,
+      });
+      if (written.tag === "invalid") {
+        throw new ApiError(422, written.reason);
+      }
+      if (written.tag === "conflict") {
+        throw written.error;
+      }
+      tagCreated = true;
+      tagTip = written.refTip;
+    }
+  }
+
+  const target =
+    input.targetCommitish !== undefined && input.targetCommitish !== "" ? input.targetCommitish : pair.repo.defaultBranch;
+  const row = await new IssuesService(input.d1).createRelease({
+    repoId,
+    publisherId: input.publisherId,
+    tagName: input.tagName,
+    target,
+    title: input.title,
+    note: input.note,
+    isDraft: input.isDraft,
+    isPrerelease: input.isPrerelease,
+  });
+  return { row, tagCreated, tagTip };
 }
 
 export interface EditReleasePatch {

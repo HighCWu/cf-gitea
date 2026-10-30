@@ -15,21 +15,38 @@
  * unlike the topics family), and the `release` webhook emissions (published/
  * updated/deleted through emitWebhookDeliveries, the upstream `!IsDraft`
  * gate: drafts emit nothing).
+ *
+ * Findings-links N2 (the git-tag parity fix): a create with a FRESH
+ * `tag_name` now also lands the GIT TAG through the shared tag-store service
+ * (upstream release.go CreateRelease → createTag). Pinned here over REAL
+ * engine content (the push-stale.test.ts direct-seeding shape — a real
+ * `main` branch in the cf-gitea-stub/rel cell, persisted per file):
+ * the fresh tag lists in GET /tags and resolves by name (the
+ * `/src/tag/{tag}` link family's backing ref), an EXISTING tag rides without
+ * a duplicate, an unresolvable `target_commitish` answers upstream's exact
+ * 404 "target not found" with NO row created, an omitted target defaults to
+ * the default branch, a draft creates NO tag (createTag's !IsDraft gate),
+ * `tag_message` creates the ANNOTATED tag object, and the release-specific
+ * protected-tag 422 message.
  */
 
 import { env } from "cloudflare:workers";
+import { SELF } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
+import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
-import { releaseAssets, releases, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
+import { protectedTags, releaseAssets, releases, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
 import { IssuesService } from "../issues/service";
 import { createOptionalTokenAuthMiddleware, createStubAuthResolver, createTokenAuthMiddleware } from "./auth";
 import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
+import { ZERO_OID, branchRef, tagRef } from "./services/engine";
 import { registerActivityFeedRoutes } from "./routes/activity-feeds";
 import { registerReleaseRoutes } from "./routes/releases";
+import { registerTagRoutes } from "./routes/tags";
 import { applyRepoExtrasDdl, resetRepoExtrasTables } from "./testing/repo-ddl";
 import { saveRepoSettings } from "./services/repo-settings";
 
@@ -38,10 +55,28 @@ const ERROR_URL = "https://example.com/api/swagger";
 const REPO_PATH = "/repos/cf-gitea-stub/rel";
 const jsonAuth = { Authorization: `token ${TOKEN}`, "Content-Type": "application/json" };
 
+/** Worker-side object hash (workerd crypto.subtle; putApiObjects re-verifies). */
+async function gitObjectOid(type: string, data: Uint8Array): Promise<string> {
+  const header = new TextEncoder().encode(`${type} ${data.byteLength}\0`);
+  const bytes = new Uint8Array(header.byteLength + data.byteLength);
+  bytes.set(header, 0);
+  bytes.set(data, header.byteLength);
+  const digest = await crypto.subtle.digest("SHA-1", bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** The seeded engine facts every N2 pin reads (beforeAll). */
+let MAIN_TIP = "";
+let RIDE_TAG_TIP = "";
+
 function makeApp(): (path: string, init?: RequestInit) => Promise<Response> {
   const app = new OpenAPIHono<ApiEnv>();
   app.onError(giteaErrorHandler);
   registerReleaseRoutes(app, createTokenAuthMiddleware(createStubAuthResolver()), createOptionalTokenAuthMiddleware(createStubAuthResolver()));
+  // The tags family mounts too — the N2 pins read the created tag through
+  // GET /tags + GET /tags/{tag}, the same engine refs the /src/tag/{tag}
+  // UI link family resolves.
+  registerTagRoutes(app, createTokenAuthMiddleware(createStubAuthResolver()), createOptionalTokenAuthMiddleware(createStubAuthResolver()));
   return (path, init) => Promise.resolve(app.fetch(new Request(`https://example.com${path}`, init), env));
 }
 
@@ -97,6 +132,44 @@ async function deliveriesFor(hookId: number): Promise<DeliveryRow[]> {
 
 beforeAll(async () => {
   await applyRepoExtrasDdl();
+  // The engine content the N2 pins resolve against: `main` at a two-commit
+  // history plus a pre-existing `ride-tag` (the existing-tag-rides pin's
+  // fixture) — direct-seeded into the cf-gitea-stub/rel cell the same way
+  // push-stale.test.ts seeds its cells (DO storage persists per file, the
+  // D1 wipes in beforeEach never touch it; the guard keeps a re-entered
+  // beforeAll idempotent).
+  const cell = env.REPO.getByName("cf-gitea-stub/rel");
+  const refs = await cell.listRefs();
+  const hasMain = (refs.refs ?? []).some((ref) => ref.name === "refs/heads/main");
+  if (!hasMain) {
+    const person = { name: "seed", email: "seed@rel.invalid", time: 1761000000, tz: "+0000" };
+    const readme = new TextEncoder().encode("# rel\n");
+    const readmeOid = await gitObjectOid("blob", readme);
+    const tree = serializeTree([{ mode: "100644", name: "README.md", oid: readmeOid }]);
+    const root = serializeCommit({ tree: tree.oid, parents: [], author: person, committer: person, message: "root\n" });
+    const second = serializeCommit({ tree: tree.oid, parents: [root.oid], author: person, committer: person, message: "second\n" });
+    const put = await cell.putApiObjects([
+      { oid: readmeOid, type: "blob", data: readme },
+      { oid: tree.oid, type: "tree", data: tree.data },
+      { oid: root.oid, type: "commit", data: root.data },
+      { oid: second.oid, type: "commit", data: second.data },
+    ]);
+    if (put.tag !== "ok") throw new Error(`seed putApiObjects failed: ${put.tag}`);
+    for (const [ref, oid] of [
+      [branchRef("main"), second.oid],
+      [tagRef("ride-tag"), root.oid],
+    ] as const) {
+      const landed = await cell.commitApiChange({ ref, expectedOldOid: ZERO_OID, newOid: oid });
+      if (landed.tag !== "committed") throw new Error(`seed ref landing failed: ${ref}`);
+    }
+    MAIN_TIP = second.oid;
+    RIDE_TAG_TIP = root.oid;
+  } else {
+    const main = (refs.refs ?? []).find((ref) => ref.name === "refs/heads/main");
+    const ride = (refs.refs ?? []).find((ref) => ref.name === "refs/tags/ride-tag");
+    MAIN_TIP = main?.target ?? "";
+    RIDE_TAG_TIP = ride?.target ?? "";
+  }
 });
 
 beforeEach(async () => {
@@ -232,6 +305,137 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
 
   it("422s a malformed body", async () => {
     expect((await makeApp()(`${REPO_PATH}/releases`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ name: "no tag" }) })).status).toBe(422);
+  });
+
+  // -------------------------------------------------------------------------
+  // Findings-links N2 — the release create also lands the GIT TAG (upstream
+  // release.go CreateRelease → release_service.CreateRelease → createTag).
+  // -------------------------------------------------------------------------
+
+  it("creates the git tag for a fresh tag_name: GET /tags lists it and it resolves (N2)", async () => {
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "n2-fresh", name: "N2", target_commitish: "main" }),
+    });
+    expect(res.status).toBe(201);
+
+    const list = await makeApp()(`${REPO_PATH}/tags`);
+    expect(list.status).toBe(200);
+    expect((await list.json<Array<{ name: string }>>()).map((tag) => tag.name)).toContain("n2-fresh");
+
+    const one = await makeApp()(`${REPO_PATH}/tags/n2-fresh`);
+    expect(one.status).toBe(200);
+    const tag = await one.json<{ id: string; commit: { sha: string } }>();
+    expect(tag.commit.sha).toBe(MAIN_TIP); // the target_commitish tip
+    expect(tag.id).toBe(MAIN_TIP); // lightweight: the ref target IS the commit
+  });
+
+  it("resolves the created tag's /src/tag/{tag} link (the git-tag-shaped URL family N2 unbreaks)", async () => {
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "n2-ui", target_commitish: "main" }),
+    });
+    expect(res.status).toBe(201);
+    // The full worker app — the UI router's file view resolving the tag ref.
+    const page = await SELF.fetch(`https://example.com/cf-gitea-stub/rel/src/tag/n2-ui`);
+    expect(page.status).toBe(200);
+    expect(await page.text()).toContain("README"); // the repo tree AT the tag rendered
+  });
+
+  it("rides an existing git tag without duplicating it (upstream IsTagExist, release.go:78)", async () => {
+    const before = await makeApp()(`${REPO_PATH}/tags`);
+    const beforeList = await before.json<Array<{ name: string }>>();
+    expect(beforeList.map((tag) => tag.name)).toContain("ride-tag");
+
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "ride-tag", name: "Rides" }),
+    });
+    expect(res.status).toBe(201);
+
+    const after = await makeApp()(`${REPO_PATH}/tags`);
+    const afterList = await after.json<Array<{ name: string }>>();
+    expect(afterList.filter((tag) => tag.name === "ride-tag")).toHaveLength(1); // no duplicate ref
+    const one = await makeApp()(`${REPO_PATH}/tags/ride-tag`);
+    expect((await one.json<{ commit: { sha: string } }>()).commit.sha).toBe(RIDE_TAG_TIP); // untouched target
+  });
+
+  it("404s 'target not found' on an unresolvable target_commitish and creates NO row (release.go:283)", async () => {
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "n2-bad-target", target_commitish: "no-such-branch" }),
+    });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ message: "target not found", url: ERROR_URL });
+    // The upstream gate runs BEFORE the insert — no orphan release row, and
+    // no git tag either.
+    expect(await drizzle(env.DB).select().from(releases).all()).toEqual([]);
+    expect((await makeApp()(`${REPO_PATH}/tags/n2-bad-target`)).status).toBe(404);
+  });
+
+  it("defaults the tag to the default branch when target_commitish is omitted (release.go:260-262)", async () => {
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "n2-default" }),
+    });
+    expect(res.status).toBe(201);
+    expect((await res.json<Record<string, unknown>>()).target_commitish).toBe("main");
+    const one = await makeApp()(`${REPO_PATH}/tags/n2-default`);
+    expect(one.status).toBe(200);
+    expect((await one.json<{ commit: { sha: string } }>()).commit.sha).toBe(MAIN_TIP);
+  });
+
+  it("creates NO git tag for a draft (createTag's !IsDraft gate, release.go:78)", async () => {
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "n2-draft", draft: true }),
+    });
+    expect(res.status).toBe(201);
+    expect((await makeApp()(`${REPO_PATH}/tags/n2-draft`)).status).toBe(404);
+  });
+
+  it("creates an ANNOTATED tag object when tag_message is set (release.go:110-121)", async () => {
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "n2-annotated", tag_message: "annotated note" }),
+    });
+    expect(res.status).toBe(201);
+    const one = await makeApp()(`${REPO_PATH}/tags/n2-annotated`);
+    expect(one.status).toBe(200);
+    const tag = await one.json<{ id: string; commit: { sha: string } }>();
+    expect(tag.commit.sha).toBe(MAIN_TIP); // peeled to the target commit
+    expect(tag.id).not.toBe(MAIN_TIP); // the ref target is the TAG OBJECT
+  });
+
+  it("422s the release-specific protected-tag message on a fresh protected tag (release.go:281)", async () => {
+    await drizzle(env.DB).insert(protectedTags).values({
+      repoId: "7301",
+      namePattern: "n2-prot-*",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    try {
+      const res = await makeApp()(`${REPO_PATH}/releases`, {
+        method: "POST",
+        headers: jsonAuth,
+        body: JSON.stringify({ tag_name: "n2-prot-tag" }),
+      });
+      expect(res.status).toBe(422);
+      expect(await res.json()).toEqual({
+        message: "release tag name is protected [tag_name: n2-prot-tag]",
+        url: ERROR_URL,
+      });
+      expect(await drizzle(env.DB).select().from(releases).all()).toEqual([]); // no row, like upstream
+    } finally {
+      await drizzle(env.DB).delete(protectedTags).where(eq(protectedTags.repoId, "7301"));
+    }
   });
 });
 

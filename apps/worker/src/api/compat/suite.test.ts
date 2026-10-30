@@ -417,7 +417,11 @@ beforeAll(async () => {
 
   await seedRepo("9004", OWNER.toLowerCase(), "rel"); // releases: needs a non-empty repo
   // The release create's empty-gate is is_empty (d24dc0f — refs_version is
-  // observability-only and never synced); seed both honestly.
+  // observability-only and never synced); seed both honestly. The N2
+  // release-tag wave ALSO resolves the create scenario's fresh tag_name
+  // against the repo's git cell (upstream 404s "target not found" when the
+  // default branch can't resolve, release.go:283) — the main ref landing in
+  // the git-seed block below keeps the scenario on the happy path.
   await drizzle(env.DB).update(repositories).set({ refsVersion: 1, isEmpty: false }).where(eq(repositories.id, "9004"));
   await seedRepo("9005", OWNER.toLowerCase(), "compat-edit"); // repoEdit victim
   await seedRepo("9006", OWNER.toLowerCase(), "compat-transfer"); // repoTransfer victim
@@ -532,6 +536,24 @@ beforeAll(async () => {
   const gitHead = await gitCell.setHead("main");
   if (gitHead.tag !== "ok") {
     throw new Error(`git-object seed setHead failed: ${gitHead.tag}`);
+  }
+
+  // The release repo's main (the N2 wave's HANDOFF): the same three
+  // content-addressed objects land in the `rel` cell so the release-create
+  // scenario's default-branch target resolves — 201 with a REAL tag sha,
+  // not the empty-repo 404 upstream also answers (release.go:283).
+  const relCell = env.REPO.getByName(`${OWNER.toLowerCase()}/rel`);
+  const relStored = await relCell.putApiObjects([
+    { oid: gitBlobOid, type: "blob", data: gitBlobData },
+    { oid: gitTree.oid, type: "tree", data: gitTree.data },
+    { oid: gitCommit.oid, type: "commit", data: gitCommit.data },
+  ]);
+  if (relStored.tag !== "ok") {
+    throw new Error(`rel-cell git-object seed putApiObjects failed: ${relStored.tag}`);
+  }
+  const relLand = await relCell.commitApiChange({ ref: "refs/heads/main", expectedOldOid: ZERO_OID, newOid: gitCommit.oid });
+  if (relLand.tag !== "committed") {
+    throw new Error(`rel-cell git-object seed ref landing failed: ${relLand.tag}`);
   }
 
   Object.assign(seeds, {

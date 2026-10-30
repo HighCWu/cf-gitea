@@ -145,6 +145,27 @@ Citations: `gitea/models/repo/release.go`, `models/repo/attachment.go`,
   record deletes the tag, while deleting a release keeps the tag by default
   (API semantics per swagger). `is_tag=true` marks a pure tag record with no release
   metadata (created when only tags exist; converted on first release edit).
+  **As-built (findings-links N2, 2026-10-30)**: the API create path lands the tag
+  through the shared tag-store service (`apps/worker/src/api/services/tags.ts` —
+  the same `resolveTagTarget`/`writeTagRef` primitives POST /repos/{o}/{r}/tags
+  uses; no re-implementation), in upstream's exact order: duplicate release row →
+  409 **before** any git write; then, for published releases only (drafts defer the
+  tag to their publish moment — createTag's `!rel.IsDraft` gate, release.go:78),
+  git tag exists → **ride it** (no duplicate, release.go:78); protected tag → 422
+  `release tag name is protected [tag_name: …]` (release.go:87-102 + the handler
+  answer at release.go:281-282); unresolvable target → 404 `target not found` with
+  NO release row created (release.go:104-113 + release.go:283-284); absent
+  `target_commitish` → the default branch; a `tag_message` creates the ANNOTATED
+  tag object (release.go:110-121). A created tag fires the tags-API's byte-identical
+  zero-commit `push` + `create` ref-webhook pair (upstream createTag's PushCommits +
+  CreateRef, release.go:125-148). Kept as the engine tail: `sha1`/`num_commits`
+  stay unwritten and the tag is dated by the row (upstream fills them from the
+  tagged commit, release.go:150-157); the EDIT path's tag arm (upstream
+  UpdateRelease → createTag on the draft→publish flip / tag-record conversion,
+  release.go:262) and DELETE's `delTag` arm remain D1-only. createTag's
+  MustNotBeArchived arm is deliberately not replicated: upstream's release handler
+  maps none of its outcomes (an archived-repo create dies as an internal 500
+  there), and the landed release surface registers no mustNotBeArchived.
 - **Drafts/pre-releases**: `is_draft` rows are hidden from the public list and from
   `GET /releases/latest` (`GetLatestReleaseByRepoID` filters
   `is_draft=false AND is_prerelease=false AND is_tag=false`,
@@ -649,7 +670,7 @@ status create; repo create/delete/rename/fork (repository events).
 | 4.8 | **Webhook target down / slow** | One attempt, 5 s timeout, terminal failure recorded with the error text in `response_content.body` (upstream stores `Delivery: <err>`); no retry storm; replayable by the user. Consumer crashes → Queues redelivery → CAS no-op. |
 | 4.9 | **Delivery log growth** | Upstream cleans `hook_task` by cron (`OlderThan`/`PerWebhook`, `models/webhook/webhook.go:72–100`). We add `cleanupWebhookDeliveries` to the periodic job: keep the newest 100 per webhook or 30 days (config), swept in the D1 maintenance queue. |
 | 4.10 | **Release asset upload interrupted** | Presigned PUTs expire (1 h); an R2 object with no confirmed D1 row is swept by the storage-layer orphan sweep (SPEC-0001 pattern, prefix `release-assets/`, mtime > 24 h). Checksum mismatch at confirm → delete object, 422. |
-| 4.11 | **Release/tag divergence** | Creating a release for an existing tag attaches to it (sha from the tag); `409` when the repo already has a release row for the tag (upstream `ErrReleaseAlreadyExist`). Deleting a release keeps the tag; deleting a tag-only record (`is_tag`) deletes the tag via the engine ref CAS. |
+| 4.11 | **Release/tag divergence** | Creating a release for an existing tag attaches to it (upstream reads the sha from the tag; as-built `sha1` stays null — the engine tail); `409` when the repo already has a release row for the tag (upstream `ErrReleaseAlreadyExist`). A fresh `tag_name` creates the git tag from `target_commitish` via the shared tag-store service (§2.3 as-built note). Deleting a release keeps the tag; deleting a tag-only record (`is_tag`) deletes the tag via the engine ref CAS. |
 | 4.12 | **Issue delete cascade** | One D1 batch: comments (incl. xref rows where `ref_issue_id` or `dependent_issue_id` points here), `issue_labels`, `reactions`, `issue_subscriptions`, `issue_pins`, `pull_requests` (+ RepoDO `removeRef refs/pull/N/head` for PRs, `waitUntil`), status rows untouched (they are sha-scoped). Counter rows are *not* rewound. |
 | 4.13 | **Repo delete** | Webhook rows + deliveries die with the repo's D1 purge (SPEC-0003 §2.5); in-flight Queue messages hit missing rows and ack as `skipped`; R2 `release-assets/<release_id>/` keys are covered by the `repos/<storage_key>/` prefix purge — hence assets live **under** the repo prefix. |
 | 4.14 | **Archived repo** | Every mutation in this SPEC's surface → 423 (SPEC-0004 §4); includes issue create/comment/label ops, PR create/merge, release edits, webhook CRUD, `hooks/{id}/tests`. |
