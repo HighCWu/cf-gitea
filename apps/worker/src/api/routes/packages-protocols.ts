@@ -61,10 +61,36 @@ import {
   PropertyType,
   deletePackageVersionAndReferences,
 } from "../../services/packages/model";
+import {
+  buildDebianRepositoryKey,
+  DebianInvalidArchitectureError,
+  DebianInvalidDistOrComponentError,
+  DebianInvalidNameError,
+  DebianInvalidVersionError,
+  DebianMissingControlError,
+  DebianUnsupportedCompressionError,
+  deleteDebianPackageFile,
+  openDebianPoolFile,
+  openDebianRepositoryFile,
+  openDebianRepositoryFileByHash,
+  uploadDebianPackage,
+} from "../../services/packages/debian";
+import {
+  AlpineInvalidBranchError,
+  AlpineInvalidNameError,
+  AlpineInvalidVersionError,
+  AlpineMissingPkginfoError,
+  AlpinePackageInfoTooLargeError,
+  buildAlpineRepositoryKey,
+  deleteAlpinePackageFile,
+  openAlpineIndexFile,
+  openAlpinePackageFile,
+  uploadAlpinePackage,
+} from "../../services/packages/alpine";
 import { getPackageProperties } from "../../services/packages/protocol-common";
 import { PackageSizeMismatchError, PackageBlobTooLargeError, packageBlobContentKey } from "../../services/packages/blobs";
 import { DuplicatePackageFileError } from "../../services/packages/generic";
-import { serveFileHeaderSet, servePackageFileResponse } from "../../services/packages/serve-content";
+import { contentDispositionAttachment, serveFileHeaderSet, servePackageFileResponse } from "../../services/packages/serve-content";
 import {
   PypiFormError,
   PypiHashMismatchError,
@@ -470,11 +496,12 @@ function contentLength(request: Request): number | null {
 function fileResponse(
   c: Context<{ Bindings: Env }>,
   download: { stream: ReadableStream; size: number; filename: string; created: Date },
+  contentType?: string,
 ): Response {
   return servePackageFileResponse(
     c.req.raw,
     c.req.method === "HEAD" ? null : download.stream,
-    { filename: download.filename, size: download.size, created: download.created },
+    { filename: download.filename, size: download.size, created: download.created, contentType },
   );
 }
 
@@ -1243,7 +1270,297 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
     }
   });
 
+  // ------------------------------ DEBIAN (api.go:287-304) ------------------------------
+  // The M7 index-builder family: the stored-index serving arms over the
+  // internal `_debian` version + the pool upload/delete riders (the index
+  // build rides the service, services/packages/debian.ts's posture note).
+
+  app.get("/:username/debian/repository.key", async (c) => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const key = await buildDebianRepositoryKey(c.env.DB, owner.id);
+      return new Response(key, {
+        status: 200,
+        headers: {
+          "content-type": "application/pgp-keys",
+          "content-disposition": contentDispositionAttachment("repository.key"),
+        },
+      });
+    } catch (error) {
+      return debianErrorResponse(error);
+    }
+  });
+
+  // GetRepositoryFileByHash (debian.go:79-116) — the lookup ignores the
+  // component/architecture context (a hash-only search, upstream's shape).
+  const debianByHash = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const download = await openDebianRepositoryFileByHash(
+        c.env.DB,
+        c.env.REPO_PACKS,
+        owner,
+        c.req.param("algorithm") ?? "",
+        c.req.param("hash") ?? "",
+      );
+      if (download === null) return debianPlain(404, "package file does not exist");
+      return fileResponse(c, download);
+    } catch (error) {
+      return debianErrorResponse(error);
+    }
+  };
+  app.get("/:username/debian/dists/:distribution/:component/:architecture/by-hash/:algorithm/:hash", (c) => debianByHash(c));
+  app.get("/:username/debian/dists/:distribution/by-hash/:algorithm/:hash", (c) => debianByHash(c));
+
+  const debianRepositoryFile = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const distribution = c.req.param("distribution") ?? "";
+      const component = c.req.param("component") ?? "";
+      const architecture = (c.req.param("architecture") ?? "").replace(/^binary-/, "");
+      const filename = c.req.param("filename") ?? "";
+      const download = await openDebianRepositoryFile(c.env.DB, c.env.REPO_PACKS, owner, distribution, component, architecture, filename);
+      if (download === null) return debianPlain(404, "package file does not exist");
+      return fileResponse(c, download);
+    } catch (error) {
+      return debianErrorResponse(error);
+    }
+  };
+  app.get("/:username/debian/dists/:distribution/:component/:architecture/:filename", (c) => debianRepositoryFile(c));
+  app.get("/:username/debian/dists/:distribution/:filename", (c) => debianRepositoryFile(c));
+
+  const debianPoolDownload = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const file = c.req.param("file") ?? "";
+      // The `{name}_{version}_{architecture}.deb` shape (debian.go:298) —
+      // name/version never carry underscores (the GlobalVars patterns), so
+      // the split is exact.
+      const parts = file.replace(/\.deb$/, "").split("_");
+      if (parts.length !== 3) return debianPlain(404, "package file does not exist");
+      const [name, version, architecture] = parts as [string, string, string];
+      const found = await openDebianPoolFile(
+        c.env.DB,
+        c.env.REPO_PACKS,
+        owner,
+        c.req.param("distribution") ?? "",
+        c.req.param("component") ?? "",
+        name,
+        version,
+        architecture,
+        c.req.method === "HEAD" ? "HEAD" : "GET",
+      );
+      if (found === null) return debianPlain(404, "package file does not exist");
+      return fileResponse(c, found.download, "application/vnd.debian.binary-package");
+    } catch (error) {
+      return debianErrorResponse(error);
+    }
+  };
+  app.get("/:username/debian/pool/:distribution/:component/:file", (c) => debianPoolDownload(c));
+  app.on("HEAD", "/:username/debian/pool/:distribution/:component/:file", (c) => debianPoolDownload(c));
+
+  app.put("/:username/debian/pool/:distribution/:component/upload", async (c) => {
+    try {
+      const { owner, cred } = await protocolContext(c, "write");
+      const doer = cred.doer;
+      if (doer === null) {
+        return debianPlain(401, "user should have specific permission or be a site admin");
+      }
+      await uploadDebianPackage({
+        d1: c.env.DB,
+        bucket: c.env.REPO_PACKS,
+        owner,
+        doer,
+        distribution: c.req.param("distribution") ?? "",
+        component: c.req.param("component") ?? "",
+        content: bodyStream(c.req.raw),
+        declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
+        quota: packagesQuotaFromEnv(c.env),
+      });
+      return new Response(null, { status: 201 });
+    } catch (error) {
+      return debianErrorResponse(error);
+    }
+  });
+
+  app.delete("/:username/debian/pool/:distribution/:component/:name/:version/:architecture", async (c) => {
+    try {
+      const { owner, cred } = await protocolContext(c, "write");
+      const doer = cred.doer;
+      if (doer === null) {
+        return debianPlain(401, "user should have specific permission or be a site admin");
+      }
+      const deleted = await deleteDebianPackageFile(
+        c.env.DB,
+        c.env.REPO_PACKS,
+        owner,
+        c.req.param("distribution") ?? "",
+        c.req.param("component") ?? "",
+        c.req.param("name") ?? "",
+        c.req.param("version") ?? "",
+        c.req.param("architecture") ?? "",
+      );
+      if (!deleted) return debianPlain(404, "package file does not exist");
+      return new Response(null, { status: 204 });
+    } catch (error) {
+      return debianErrorResponse(error);
+    }
+  });
+
+  // ------------------------------ ALPINE (api.go:105-117) ------------------------------
+  // The M7 index-builder family: the stored APKINDEX serving arms over the
+  // internal `_alpine` version + the upload/delete riders (services/packages/
+  // alpine.ts carries the two-stream signed-archive builder).
+
+  app.get("/:username/alpine/key", async (c) => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const key = await buildAlpineRepositoryKey(c.env.DB, owner.id);
+      // GetRepositoryKey (alpine.go:32-61): the PEM with the fingerprint
+      // filename (`{lower}@{fingerprint}.rsa.pub`).
+      return new Response(key.publicPem, {
+        status: 200,
+        headers: {
+          "content-type": "application/x-pem-file",
+          "content-disposition": contentDispositionAttachment(`${owner.usernameLower}@${key.fingerprint}.rsa.pub`),
+        },
+      });
+    } catch (error) {
+      return debianErrorResponse(error);
+    }
+  });
+
+  app.put("/:username/alpine/:branch/:repository", async (c) => {
+    try {
+      const { owner, cred } = await protocolContext(c, "write");
+      const doer = cred.doer;
+      if (doer === null) {
+        return debianPlain(401, "user should have specific permission or be a site admin");
+      }
+      await uploadAlpinePackage({
+        d1: c.env.DB,
+        bucket: c.env.REPO_PACKS,
+        owner,
+        doer,
+        branch: c.req.param("branch") ?? "",
+        repository: c.req.param("repository") ?? "",
+        content: bodyStream(c.req.raw),
+        declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
+        quota: packagesQuotaFromEnv(c.env),
+      });
+      return new Response(null, { status: 201 });
+    } catch (error) {
+      return debianErrorResponse(error);
+    }
+  });
+
+  const alpineIndexDownload = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const download = await openAlpineIndexFile(
+        c.env.DB,
+        c.env.REPO_PACKS,
+        owner,
+        c.req.param("branch") ?? "",
+        c.req.param("repository") ?? "",
+        c.req.param("architecture") ?? "",
+      );
+      if (download === null) return debianPlain(404, "package file does not exist");
+      return fileResponse(c, download);
+    } catch (error) {
+      return debianErrorResponse(error);
+    }
+  };
+  // The static tail outranks the :filename arm (upstream registers the
+  // APKINDEX route first within the architecture group, alpine.go:110).
+  app.get("/:username/alpine/:branch/:repository/:architecture/APKINDEX.tar.gz", (c) => alpineIndexDownload(c));
+  app.on("HEAD", "/:username/alpine/:branch/:repository/:architecture/APKINDEX.tar.gz", (c) => alpineIndexDownload(c));
+
+  const alpinePackageDownload = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const download = await openAlpinePackageFile(
+        c.env.DB,
+        c.env.REPO_PACKS,
+        owner,
+        c.req.param("branch") ?? "",
+        c.req.param("repository") ?? "",
+        c.req.param("architecture") ?? "",
+        c.req.param("filename") ?? "",
+        c.req.method === "HEAD" ? "HEAD" : "GET",
+      );
+      if (download === null) return debianPlain(404, "package file does not exist");
+      return fileResponse(c, download);
+    } catch (error) {
+      return debianErrorResponse(error);
+    }
+  };
+  app.get("/:username/alpine/:branch/:repository/:architecture/:filename", (c) => alpinePackageDownload(c));
+  app.on("HEAD", "/:username/alpine/:branch/:repository/:architecture/:filename", (c) => alpinePackageDownload(c));
+
+  app.delete("/:username/alpine/:branch/:repository/:architecture/:filename", async (c) => {
+    try {
+      const { owner, cred } = await protocolContext(c, "write");
+      const doer = cred.doer;
+      if (doer === null) {
+        return debianPlain(401, "user should have specific permission or be a site admin");
+      }
+      const deleted = await deleteAlpinePackageFile(
+        c.env.DB,
+        c.env.REPO_PACKS,
+        owner,
+        c.req.param("branch") ?? "",
+        c.req.param("repository") ?? "",
+        c.req.param("architecture") ?? "",
+        c.req.param("filename") ?? "",
+      );
+      if (!deleted) return debianPlain(404, "package file does not exist");
+      return new Response(null, { status: 204 });
+    } catch (error) {
+      return debianErrorResponse(error);
+    }
+  });
   return app;
+}
+
+// ---------------------------------------------------------------------------
+// The M7 error/response helpers (the debian + alpine families share the
+// plain-text apiError shape — debian.go:26-29 / alpine.go:27-30, both through
+// helper.ProcessErrorForUser → ctx.PlainText)
+// ---------------------------------------------------------------------------
+
+/** The plain-text body with the upstream status (ctx.PlainText). */
+function debianPlain(status: 400 | 401 | 403 | 404 | 409 | 411 | 413 | 500, message: string): Response {
+  return plainResponse(status, message);
+}
+
+/** The family error mapper: the 400 InvalidArgument sentinels, the 409
+ *  duplicate (the D-1 any-duplicate rule), the quota 403, the caps. */
+function debianErrorResponse(error: unknown): Response {
+  if (error instanceof HTTPException) throw error;
+  if (
+    error instanceof DebianMissingControlError ||
+    error instanceof DebianUnsupportedCompressionError ||
+    error instanceof DebianInvalidNameError ||
+    error instanceof DebianInvalidVersionError ||
+    error instanceof DebianInvalidArchitectureError ||
+    error instanceof DebianInvalidDistOrComponentError ||
+    error instanceof AlpineMissingPkginfoError ||
+    error instanceof AlpineInvalidNameError ||
+    error instanceof AlpineInvalidVersionError ||
+    error instanceof AlpinePackageInfoTooLargeError ||
+    error instanceof AlpineInvalidBranchError
+  ) {
+    return debianPlain(400, error.message);
+  }
+  if (error instanceof DuplicatePackageFileError) return debianPlain(409, "package file already exists");
+  if (error instanceof PackageSizeMismatchError) return debianPlain(400, error.message);
+  if (error instanceof PackageBlobTooLargeError) return debianPlain(413, error.message);
+  if (error instanceof QuotaTotalCountError || error instanceof QuotaTypeSizeError || error instanceof QuotaTotalSizeError) {
+    return debianPlain(403, quotaMessage(error));
+  }
+  console.error("[packages-distro] request failed", error);
+  return debianPlain(500, "internal server error");
 }
 
 // ---------------------------------------------------------------------------

@@ -862,3 +862,133 @@ mount, NOT `/api/packages`; `package_blob_uploads` migration 0046):
   `specs/README.md` SPEC-0016 row ("M6 container + M7 index-builder
   pending") and the deploy-probes battery (currently five protocols) are
   the orchestrator's doc/wiring follow-ups, not this unit's files.
+
+## As-built — M7 index-builder family, half one: debian + alpine (2026-10-31 — the registry carries NINE protocols)
+
+The §2.1 M7 row's first two families landed: `services/packages/debian.ts` +
+`services/packages/alpine.ts` over the shared `services/packages/distro-common.ts`
+substrate, the route arms in `api/routes/packages-protocols.ts`
+(`api.go:287-304` debian, `api.go:105-117` alpine). rpm and arch remain
+PENDING (their additive cites below).
+
+- **The generation posture (the M7 family's answer, mirrored from upstream):
+  indices are STORED, not rendered per request.** Upstream builds on every
+  upload/delete (`BuildSpecificRepositoryFiles`, debian.go:197/300,
+  alpine.go:195/278) into files of an internal package version
+  (`GetOrCreateRepositoryVersion` → `_debian`/`_alpine` + `_repository`,
+  both rows is_internal, repository.go:34-38/alpine repository.go:39-50) and
+  the GET arms are plain file lookups. Ours: `getOrCreateInternalPackageVersion`
+  + `storeRepositoryFile`/`deleteRepositoryFile` in distro-common (the
+  OverwriteExisting internal-file arm — a same-key row with different bytes is
+  deleted with its properties and re-inserted; identical bytes keep the row),
+  built bytes hashed with all THREE WebCrypto digests into the shared blob
+  dedup. (Contrast helm — upstream's only per-request render.) model.ts is not
+  this unit's file, so the internal version get-or-insert is the local twin
+  over the same tables/UNIQUEs (same re-select on a lost race).
+- **Keypairs** (the §1 out-of-scope item resolved): per-owner RSA in
+  `user_settings_kv` — upstream's exact `user_setting` home
+  (keypair.go:18-43's GetOrCreateKeyPair: read → generate → re-read → store)
+  under upstream's setting keys `debian.key.private/public` and
+  `alpine.key.private/public`, plus `debian.key.created` pinning the OpenPGP
+  key-packet creation time (the packet bytes must be STABLE or the key
+  id/fingerprint would drift between requests). RSA-2048 RSASSA-PKCS1-v1_5 —
+  upstream 4096 (util.GenerateKeyPair / packet.Config RSABits), the documented
+  Workers-cost divergence the actions OIDC issuer carries
+  (secrets.ts:269-280). The private arm stays in the store; every consumer
+  imports per request (no module-level key state).
+- **The byte substrate (distro-common.ts)** — the Go stdlib re-implementation,
+  no new dependency (the nuget hand-built zip-reader posture):
+  - gzip via CompressionStream/DecompressionStream. workerd's decoder is
+    STRICTLY single-member (probe-verified — "Trailing bytes after end of
+    compressed data"; the landed `spike-streams.test.ts` is the platform
+    record, 161bc62), AND it discards already-decoded chunks when it errors —
+    so concatenated members (an .apk's signature‖control‖data streams) are
+    walked by grow-then-bisect EXACT-LENGTH windows: a window decodes clean
+    only when it ends at the member boundary, pinning both payload and raw
+    extent (the .apk C: checksum hashes the raw member bytes, the tee'd
+    reader in alpine metadata.go:79-108).
+  - ustar writer/reader (APKINDEX entries Mode 0o600; the .SIGN.RSA member
+    written WITHOUT end blocks — writeGzipStream's addTarEnd=false, alpine
+    repository.go:331-351) and the blakesmith/ar reader (deb(5)).
+  - a minimal OpenPGP v4 signer for debian: RSA-SHA256 signature packets
+    (hashed subpackets = creation time + issuer fingerprint v4; unhashed =
+    issuer key id), armor + CRC-24, the clearsign InRelease, the armored
+    detached Release.gpg, and the transferable public key for repository.key
+    (RFC 4880 §11.1 packet ORDER key‖uid‖self-cert — the live battery caught
+    the uid-first requirement: gpg's import tolerated a trailing uid but
+    gpgv/apt's strict ring parser rejected it, FIXED in-flight). The RSA
+    operation is WebCrypto RSASSA-PKCS1-v1_5 over the RFC 4880 hash framing
+    (the wire form); the clearsign hash covers the CRLF-canonicalized escaped
+    body MINUS the final trailing newline (the body/signature separator —
+    cross-verified against gpg's own clearsign of the same body).
+- **debian** (repository.go's full builder set): Packages paragraphs from the
+  stored `debian.control` property + Filename/Size/SHA1/SHA256/SHA512 (the
+  correlated-count property filter over non-internal is_lead files,
+  debian search.go:26-67, ordered package lower_name + version creation);
+  Release/Release.gpg/InRelease with Origin/Label "Gitea", sorted
+  Components/Architectures, RFC 1123 GMT Date, Acquire-By-Hash: yes, checksum
+  sections at `{component}/binary-{arch}/{filename}`; the empty arms delete.
+  Upload = the pypi quota shape (+1 count parity, size after parse) + the D-1
+  any-duplicate 409 + the post-write rebuild rider; the ar walk reads ONLY
+  debian-binary + control.tar (data.tar never touched — the streaming
+  spool-reader stops at control), `binary-` trimmed architecture on the GET
+  arm, by-hash arms serve by blob hash. **Documented reductions:** no
+  Packages.xz (no xz codec in the substrate; apt consumes the mandatory .gz
+  baseline); .xz/.zst control archives → 400 "unsupported compression
+  algorithm" (upstream's own default-arm message — LIVE-FIRED: this host's
+  dpkg-deb ≥ 1.21.18 defaults control.tar.zst, so modern-dpkg builders pass
+  `-Zgzip`, or a later milestone grows a zstd decoder); MD5 never computed
+  (the blobs.ts three-digest posture) → Packages omits the MD5sum line,
+  Release omits the MD5Sum section, by-hash/md5sum answers 404.
+- **alpine** (repository.go's builder set): APKINDEX paragraphs from the
+  stored `alpine.metadata` FileMetadata + the version's VersionMetadata JSON
+  (Go tag order), `A:` printing the INDEX architecture (noarch files merged
+  into every real architecture's index, repository.go:155-162), the two-gzip
+  signed archive (signature member tar-no-end ‖ unsigned index member tar),
+  `.SIGN.RSA-{lower}@{sha256-of-SPKI}.rsa.pub`; upload carries the branch/
+  repository/architecture/metadata properties, the noarch upload re-rolls
+  EVERY architecture of its branch/repository (repository.go:104-112), the
+  index + .apk serving arms fall back to noarch (alpine.go:83-97/:219-236);
+  delete has NO fallback (exactly-one search, alpine.go:251-267). The .apk
+  parse walks members and stops at the .PKGINFO member like upstream;
+  PKGINFO provides/depend capped at 1024 entries. **Documented reduction:**
+  the parse window is capped at 64 MiB (signature+control members are
+  kilobytes in real apks); index paragraph order pinned to file lower_name.
+- **Tests** (`packages-debian.test.ts` 12/12, `packages-alpine.test.ts` 8/8,
+  own-eyes): the fixture fixtures are hand-built upstream-shaped archives
+  (ar + control.tar.gz + an unread data.tar; three-member .apk with the
+  checksum asserted against the raw control member); the alpine suite runs
+  the REAL crypto verification in-suite (WebCrypto RSA-SHA1 verify of the
+  served signature over the served member bytes against the served key, plus
+  the tampered-payload failure arm). Neighbors re-run post-change: the five
+  protocol suites 109/109, blobs/cleanup/container/model/serve-content
+  124/124, the sibling's landed workerd platform record 4/4; check:api PASS
+  (zero new contract paths — the /api/packages families sit outside the
+  frozen v1 swagger inventory, the M6 precedent); tsc 0 repo-wide; scoped
+  eslint clean.
+- **The LIVE battery (real clients, this host):** dpkg-deb-built livepkg
+  uploaded → apt-get update against the dev server (sandboxed rootless:
+  Dir::* redirected, signed-by the served key.asc — upstream's own setup
+  shape, debian spec.go's RenderSetupManual) VERIFIED the InRelease signature
+  and fetched the index; `apt-get download livepkg` round-tripped the pool
+  .deb BYTE-IDENTICAL through apt's own index→Filename→pool path; gpgv on the
+  raw InRelease and Release+Release.gpg: GOOD (rc=0) both, against the served
+  repository.key. Alpine: `apk` is NOT installed on this host (disclosed) —
+  the live arms were a system-tool battery: tar/gzip-built .apk uploaded,
+  the served APKINDEX.tar.gz member-split by zlib, the .SIGN.RSA entry
+  verified by openssl (`Verified OK`, RSA-SHA1 over the exact raw unsigned
+  member), the C: checksum asserted against the uploaded control member, the
+  .apk download byte-parity; by-hash (sha256) + the delete-rebuild arms
+  exercised live on both families (204 → the index 404s on the empty arm).
+  Residual for the orchestrator's wiring wave: the deploy-probes battery
+  (currently six protocols) may gain debian/alpine arms — not this unit's
+  file.
+- **PENDING (additive rows for the next wave):** rpm (`api.go:423-434` +
+  rpm/router 471 ln + repository.go 709 ln + sign.go — the repodata XML
+  builder over the same stored-index posture, `createrepo`-shaped
+  primary/other/repomd files, the RPM header parse at modules/packages/rpm/
+  metadata.go:106+, the GPG-detached `repomd.xml.asc` arm) and arch
+  (`api.go:118-126` + arch/router 305 ln + repository.go 400 ln + vercmp.go
+  105 ln — the PathGroup wildcard grammar, the pacman .db tar built from
+  .PKGINFO desc files, the version-compare port). Both mirror this module
+  trio's substrate unchanged.
