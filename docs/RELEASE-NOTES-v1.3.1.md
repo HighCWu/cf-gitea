@@ -1,6 +1,6 @@
 # cf-gitea v1.3.1 — Release Notes (the convergence supplement)
 
-**Range**: `fe6d1a8..FINAL_HEAD_TBD` — **FINAL_COUNT_TBD commits** (75 at the
+**Range**: `fe6d1a8..d7441ad` — **79 commits** (75 at the
 refresh snapshot, HEAD `affe9a3`; the doc's original snapshot was 46 at
 `e4b9f66`). v1.3 tagged `fe6d1a8`; every commit below
 landed after that tag, the same day (2026-10-30). This document is the
