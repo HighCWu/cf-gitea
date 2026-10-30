@@ -70,23 +70,19 @@
  *     Update Settings submit). NO repo-only section renders here: the owner
  *     page's whole body is those two sections.
  *
- * ## The store gap (the recorded reduction — disclosed per page)
+ * ## The store (LANDED — this wave; the recorded reduction is retired)
  *
- * The OWNER-level OwnerActionsConfig store has NO landed home: upstream
- * persists it as a `user_setting` KV row (`models/actions/config.go:38-46`),
- * and this deployment has no generic KV table — the landed `user_settings`
- * side store is the typed-column collapse of upstream's user-preference
- * KV keys (schema.ts; the theme/language + actions-email precedents), and
- * growing it needs a migration. src/db is outside this unit's ownership, so
- * the WRITE arms are the recorded reduction: the page renders the
- * NO-SETTING posture — which is upstream's own render for any owner without
- * a saved setting (the FromDB-on-absent-row chain above: mode permissive,
- * max = write-all, enable-max false, allowed list empty) — and the POST
- * arms stay unregistered (engine-owned 404s, the repo general module's
- * landing-state precedent). Everything a store wave needs is exported here:
- * the form parsers + `parseMaxTokenPermissions` (the shared
- * ParseMaxTokenPermissions port), and the HANDOFF tail spells the mount
- * recipe plus the POST semantics to port once the store lands.
+ * The OWNER-level OwnerActionsConfig store IS landed:
+ * `user_settings_kv` (schema.ts, migration 0048 — the `user_setting`
+ * column-for-column port) + services/actions/owner-actions-config.ts (the
+ * Get/Set/parse/serialize store — the module header carries the full cite
+ * set: config.go:38-47, setting.go:186-232, setting_options.go:26). The
+ * loaders read it (an absent row still answers the fresh posture above —
+ * upstream's own semantics, now the STORE's default rather than the
+ * loader's hardcoded shape), and the POST arms' applier
+ * (`applyOwnerActionsGeneralForms` — the UpdateGeneralSettings port,
+ * general.go:100-161) rides the same store. The registrations stay the
+ * wiring HANDOFF (the tail below) — index.ts is not this module's file.
  *
  * ## Documented reductions (§6 method — never dead controls)
  *
@@ -102,12 +98,14 @@
  * - Allowed-repo rows keep upstream's `repo/icon` shape reduced to the svg
  *   arm (no avatar route — the repo general module's avatar reduction); the
  *   rows' Remove buttons keep the `link-action` + `data-url` contract
- *   verbatim (the repo general module's shape). The rows are unreachable
- *   until the store lands (the reduction above) — the render carries the
- *   template's structure, the empty arm is what serves.
- * - The success flash ("settings.saved_successfully") and the add arm's
- *   JSONError reduce to the bare responses (the no-session-flash
- *   convention) — recorded in the HANDOFF, not rendered.
+ *   verbatim (the repo general module's shape). The rows render for any
+ *   owner with saved cross-repo targets (the store read).
+ * - The success flash ("settings.saved_successfully") reduces to the bare
+ *   303 (the no-session-flash convention): the wiring maps the saved
+ *   outcome onto the redirect-back. The add arm's JSONError keeps
+ *   upstream's exact body — `OWNER_ACTIONS_REPO_NOT_EXIST_ERROR` (the
+ *   :125 literal under context.go:276-278's shape), answered 400 by the
+ *   wiring (the repo-actions-view json-outcome convention).
  * - Scoped-workflows: NOT this module (no upstream page content here at
  *   all — it rides P1-3's scoped-workflows SPEC-attachment; the nav sub-item
  *   stays the recorded dead item).
@@ -119,14 +117,21 @@ import { OrgSettingsNavbar } from "../components/settings-nav";
 import type { UiContext } from "../ui-context";
 import type { OrgRecord } from "../../services/orgs/orgs";
 import {
+  ACTIONS_TOKEN_PERMISSION_MODES,
   ACTIONS_TOKEN_UNIT_TYPES,
   makeWriteAllActionsTokenPermissions,
   type ActionsTokenPermissionMode,
   type ActionsTokenPermissions,
 } from "../../services/actions/config";
 import {
+  getOwnerActionsConfig,
+  getOwnerRepositoriesByIDs,
+  getRepositoryByName,
+  setOwnerActionsConfig,
+  type OwnerActionsConfig,
+} from "../../services/actions/owner-actions-config";
+import {
   formBool,
-  formInt64,
   repoSettingsActionsGeneralLocale,
   repoSettingsActionsGeneralUnitLocale,
 } from "./repo-settings-actions-general";
@@ -155,9 +160,10 @@ export const orgSettingsActionsGeneralLocale = {
 
 /** An allowed-repo list row (upstream's GetOwnerRepositoriesByIDs rows
  *  reduced to what the render uses — `$repo.Link` + `$repo.FullName` +
- *  `$repo.ID`; unreachable until the store lands, the module header). */
+ *  `$repo.ID`; the id is this deployment's TEXT repositories.id — the store
+ *  module header's id-space note). */
 export interface OwnerActionsGeneralAllowedRepo {
-  id: number;
+  id: string;
   fullName: string;
   link: string;
 }
@@ -173,56 +179,73 @@ export interface OwnerActionsGeneralPageData {
   allowedRepos: OwnerActionsGeneralAllowedRepo[];
 }
 
+/** The config → render-inputs mapping (general.go:70-81): the mode rides
+ *  verbatim, a nil max substitutes the write-all default (:77-79 —
+ *  `(&repo_model.ActionsConfig{}).GetMaxTokenPermissions()`), and
+ *  EnableMaxTokenPermissions is `MaxTokenPermissions != nil` (:81). The
+ *  allowed list is the loader's SECOND read (GetOwnerRepositoriesByIDs,
+ *  :84-88) and stays outside this mapping. */
+export function deriveOwnerActionsGeneralData(cfg: OwnerActionsConfig): Omit<OwnerActionsGeneralPageData, "ownerId" | "allowedRepos"> {
+  return {
+    tokenPermissionMode: cfg.tokenPermissionMode,
+    maxTokenPermissions: cfg.maxTokenPermissions ?? makeWriteAllActionsTokenPermissions(),
+    enableMaxTokenPermissions: cfg.maxTokenPermissions !== null,
+  };
+}
+
 /** The NO-SETTING OwnerActionsConfig posture — upstream's own render for a
  *  fresh owner: the absent `user_setting` row still runs FromDB (models/user/
  *  setting.go:217-223), whose EnumValue normalization answers "permissive";
  *  general.go:78-79 substitutes the write-all default for a nil max;
  *  EnableMaxTokenPermissions is `MaxTokenPermissions != nil` (:81); the
- *  allowed list starts empty (config.go:27's omitempty zero). This module's
- *  loaders answer exactly this (the store gap is the module header's
- *  recorded reduction); the owner id is the loader's own input
- *  (getRunnersCtx's OwnerID, runners.go:82-91's org/user arms). */
+ *  allowed list starts empty (config.go:27's omitempty zero). This is now
+ *  the STORE's absent-row answer (services/actions/owner-actions-config.ts's
+ *  default) flowed through `deriveOwnerActionsGeneralData` — kept exported
+ *  as the posture constant the user-scope GET renders until the wiring
+ *  HANDOFF lands, and the tests' semantic reference. */
 export const OWNER_ACTIONS_GENERAL_FRESH_DATA: Omit<OwnerActionsGeneralPageData, "ownerId"> = {
-  tokenPermissionMode: "permissive",
-  maxTokenPermissions: makeWriteAllActionsTokenPermissions(),
-  enableMaxTokenPermissions: false,
+  ...deriveOwnerActionsGeneralData({ tokenPermissionMode: "permissive", maxTokenPermissions: null, allowedCrossRepoIds: [] }),
   allowedRepos: [],
 };
 
 /**
  * The org general page's load (general.go:46-98 at the ORG scope): the
- * owner config read + the allowed-repos read both answer the no-setting
- * posture without a store (the header's reduction — the allowed list's
+ * owner config read (`GetOwnerActionsConfig`, :67-70 — the store's
+ * absent-row default answers the fresh posture for a never-saved owner)
+ * and the allowed-repos read (:84-88 — `GetOwnerRepositoriesByIDs`, whose
  * empty-ids arm is upstream's own no-query short-circuit,
- * models/repo/repo_list.go:845-847). Synchronous: there is genuinely no D1
- * read behind this load today. The org record rides in for the frame
+ * models/repo/repo_list.go:845-847). The org record rides in for the frame
  * (OrgHeader + the OrgLink); `getRunnersCtx`'s owner id is `org.id`
  * (runners.go:82-91's org arm).
  */
-export function loadOrgActionsGeneralPageData(org: OrgRecord): OwnerActionsGeneralPageData {
-  return { ownerId: org.id, ...OWNER_ACTIONS_GENERAL_FRESH_DATA };
+export async function loadOrgActionsGeneralPageData(d1: D1Database, org: OrgRecord): Promise<OwnerActionsGeneralPageData> {
+  const cfg = await getOwnerActionsConfig(d1, org.id);
+  const allowedRepos = await getOwnerRepositoriesByIDs(d1, org.id, cfg.allowedCrossRepoIds);
+  return { ownerId: org.id, ...deriveOwnerActionsGeneralData(cfg), allowedRepos };
 }
 
 // ---------------------------------------------------------------------------
-// The form parsers (upstream UpdateGeneralSettings' reads — general.go:98-141;
-// the APPLIERS are the store-gap reduction — the HANDOFF tail)
+// The form parsers (upstream UpdateGeneralSettings' reads — general.go:98-141)
 // ---------------------------------------------------------------------------
 
 /** The cross-repo form's POST body (general.go:119-139): the add arm rides
  *  the `cross_repo_add_target` FormBool + the `cross_repo_add_target_name`
  *  FormString (empty name = no-op :121), the remove arm the
- *  `cross_repo_remove_target_id` FormInt64 (0 = no-op :137-139). */
+ *  `cross_repo_remove_target_id` (upstream FormInt64, 0 = no-op :137-139 —
+ *  parsed as a STRING here: the id space is this deployment's TEXT
+ *  repositories.id, the store module header's id-space note, so the no-op
+ *  sentinel is "" and a match is exact string equality). */
 export interface OwnerActionsCrossRepoForm {
   crossRepoAddTarget: boolean;
   crossRepoAddTargetName: string;
-  crossRepoRemoveTargetId: number;
+  crossRepoRemoveTargetId: string;
 }
 
 export function parseOwnerActionsCrossRepoForm(params: URLSearchParams): OwnerActionsCrossRepoForm {
   return {
     crossRepoAddTarget: formBool(params.get("cross_repo_add_target")),
     crossRepoAddTargetName: params.get("cross_repo_add_target_name") ?? "",
-    crossRepoRemoveTargetId: formInt64(params.get("cross_repo_remove_target_id")),
+    crossRepoRemoveTargetId: params.get("cross_repo_remove_target_id") ?? "",
   };
 }
 
@@ -265,6 +288,73 @@ export function parseMaxTokenPermissions(form: OwnerActionsPermissionsForm): Act
     unitAccessModes[unitType] = raw === "write" ? 2 : raw === "read" ? 1 : 0;
   }
   return { unitAccessModes, idToken: form.maxIdToken === "write" };
+}
+
+// ---------------------------------------------------------------------------
+// The POST arm (upstream UpdateGeneralSettings, general.go:100-161 — both
+// forms post to the page URL, `.Link`; the wiring mounts it at both scopes,
+// the HANDOFF tail)
+// ---------------------------------------------------------------------------
+
+/** The add arm's JSONError body — general.go:125's LITERAL string under
+ *  context.go:276-278's shape (`buildJsonErrorMap`: a string message renders
+ *  `"renderFormat":"text"`); the wiring answers it 400 on the
+ *  `"repo-not-exist"` outcome (the repo-actions-view json-outcome
+ *  convention). */
+export const OWNER_ACTIONS_REPO_NOT_EXIST_ERROR = { errorMessage: "Repository doesn't exist", renderFormat: "text" } as const;
+
+/** The apply outcomes: `saved` is the wiring's 303 back onto the page URL
+ *  (general.go:159-160's JSONRedirect("") with the no-session-flash
+ *  reduction — the flash body never renders); `repo-not-exist` is :125's
+ *  early return — NOTHING is stored (the remove + permissions arms and the
+ *  save are all skipped, upstream's control flow verbatim). */
+export type UpdateOwnerActionsGeneralOutcome = { outcome: "saved" } | { outcome: "repo-not-exist" };
+
+/**
+ * `UpdateGeneralSettings` (general.go:100-161) over the landed owner store:
+ * the config load (:115-118 — the store's absent-row default), then BOTH
+ * arms in upstream's order over the one post body.
+ *
+ *   - Cross-repo add (:119-135): the FormBool + a NON-empty name resolve the
+ *     repo WITHIN the owner (`GetRepositoryByName` — owner-pinned,
+ *     lower_name case-folded; `getRepositoryByName`), missing → the :125
+ *     JSONError early return; otherwise append-if-absent of the id
+ *     (:131-133). An add-flag with an EMPTY name skips the resolution and
+ *     falls through to the save (:121's guard) — upstream's no-op that
+ *     still persists.
+ *   - Cross-repo remove (:137-139): a non-zero id removes ALL its
+ *     occurrences (`util.SliceRemoveAll`; "" here, the string id space).
+ *   - Permissions (:142-152): the mode must be EnumValue-valid for the
+ *     block to apply AT ALL — an INVALID mode is silently IGNORED, keeping
+ *     the stored mode/max (the owner arm has NO repo-style refusal);
+ *     enable-max on → `parseMaxTokenPermissions`, off → nil (:145-151).
+ *
+ *   Then `SetOwnerActionsConfig` (:154-157) — note upstream saves on EVERY
+ *   non-refused post, even a no-op one (a fresh owner's first save writes
+ *   the normalized default row). The flash + JSONRedirect("") ride the
+ *   outcome (the wiring's 303; the header's reductions).
+ */
+export async function applyOwnerActionsGeneralForms(
+  d1: D1Database,
+  ownerId: number,
+  crossRepo: OwnerActionsCrossRepoForm,
+  permissions: OwnerActionsPermissionsForm,
+): Promise<UpdateOwnerActionsGeneralOutcome> {
+  const cfg = await getOwnerActionsConfig(d1, ownerId);
+  if (crossRepo.crossRepoAddTarget && crossRepo.crossRepoAddTargetName !== "") {
+    const target = await getRepositoryByName(d1, ownerId, crossRepo.crossRepoAddTargetName);
+    if (target === null) return { outcome: "repo-not-exist" }; // :125 — the early return skips everything below
+    if (!cfg.allowedCrossRepoIds.includes(target.id)) cfg.allowedCrossRepoIds.push(target.id); // :131-133
+  }
+  if (crossRepo.crossRepoRemoveTargetId !== "") {
+    cfg.allowedCrossRepoIds = cfg.allowedCrossRepoIds.filter((id) => id !== crossRepo.crossRepoRemoveTargetId); // :137-139, SliceRemoveAll
+  }
+  if (ACTIONS_TOKEN_PERMISSION_MODES.includes(permissions.tokenPermissionMode as ActionsTokenPermissionMode)) {
+    cfg.tokenPermissionMode = permissions.tokenPermissionMode as ActionsTokenPermissionMode;
+    cfg.maxTokenPermissions = permissions.enableMaxPermissions ? parseMaxTokenPermissions(permissions) : null; // :145-151
+  }
+  await setOwnerActionsConfig(d1, ownerId, cfg);
+  return { outcome: "saved" };
 }
 
 // ---------------------------------------------------------------------------
@@ -336,8 +426,8 @@ export function OwnerActionsGeneralSections(props: { link: string; data: OwnerAc
             <div class="ui attached segment tw-p-2">
               <div class="ui divided relaxed list flex-items-block muted-links">
                 {/* :14-24 the rows (repo/icon + FullName link + the
-                    link-action Remove); :27-29 the empty arm. The rows are
-                    unreachable until the store lands (the module header). */}
+                    link-action Remove); :27-29 the empty arm — what serves
+                    for any owner with no saved targets yet. */}
                 {tp.allowedRepos.length > 0 ? (
                   tp.allowedRepos.map((repo) => (
                     <div class="item">
@@ -503,8 +593,8 @@ export function OwnerActionsGeneralSections(props: { link: string; data: OwnerAc
 
 // ---------------------------------------------------------------------------
 // The wiring HANDOFF (the orchestrator's index.ts window — this module is
-// not index.ts's owner; the GET mounts can land TODAY, the POST arms need
-// the store first — the module header's store-gap reduction)
+// not index.ts's owner; the GET mounts are live, the POST arms' appliers
+// are landed below — only the registrations remain)
 // ---------------------------------------------------------------------------
 //
 // Upstream web.go:1051-1061 (org) / 720-732 (user) mount, inside the
@@ -522,46 +612,75 @@ export function OwnerActionsGeneralSections(props: { link: string; data: OwnerAc
 //      Both sit INSIDE MustEnableActions (the instance-flag gate — vacuous
 //      here), so the prologues alone arm them.
 //
-//   2. THE GET PAGES (landable today — the renders serve the no-setting
-//      posture):
-//        GET  /{org}/settings/actions/general → resolveOrgForRequest →
-//              requireOrgOwnership → loadOrgActionsGeneralPageData(org) →
-//              renderOrgActionsGeneralPage. (parse arm:
-//              rest === ["settings","actions","general"] in the org block,
-//              family "org-settings-actions-general".)
-//        GET  /user/settings/actions/general  → the userSettingsTabPrologue
-//              → renderUserSettingsActionsGeneralPage(ctx) — the user
-//              module's loader needs no D1 either. (parse arm: the literal
-//              three-tail in the user-settings block, family
-//              "user-settings-actions-general".)
+//   2. THE GET PAGES (mounted; the loader lines swap to the store read —
+//      the old FRESH_DATA postures are stale until these two lines land):
+//        org (index.ts orgActionsGeneralPage — the `loadOrgActionsGeneral
+//        PageData(org)` spread becomes):
+//              const data = await loadOrgActionsGeneralPageData(c.env.DB, org);
+//              return respond(c.html(renderOrgActionsGeneralPage(ctx, { ...data, org }), 200));
+//        user (index.ts userActionsGeneralPage — the inline
+//        OWNER_ACTIONS_GENERAL_FRESH_DATA spread becomes):
+//              const data = await loadUserActionsGeneralPageData(c.env.DB, p.viewer.id);
+//              return p.respond(c.html(renderUserActionsGeneralPage(p.ctx, data), 200));
+//      (parse arms unchanged: family "org-settings-actions-general" /
+//      "user-settings-actions-general" as mounted.)
 //
-//   3. THE POST ARMS (BLOCKED on the store — upstream posts BOTH forms to
-//      the page URL itself, `.Link`; owner_general_settings.tmpl:5/:44):
+//   3. THE POST ARMS (the store IS landed — these register the mounted
+//      applier; upstream posts BOTH forms to the page URL itself, `.Link`;
+//      owner_general_settings.tmpl:5/:44):
 //        POST /{org}/settings/actions/general
 //        POST /user/settings/actions/general
-//      Upstream UpdateGeneralSettings (general.go:100-161): parse with
-//      parseOwnerActionsCrossRepoForm + parseOwnerActionsPermissionsForm;
-//      add arm — `crossRepoAddTarget && crossRepoAddTargetName !== ""`
-//      resolves the repo WITHIN the owner (GetRepositoryByName is
-//      owner-pinned + lower_name case-insensitive, models/repo/repo.go)
-//      → not-exist is ctx.JSONError("Repository doesn't exist") (a LITERAL,
-//      :125) answered 400 `{"errorMessage":…,"renderFormat":"text"}`;
-//      append-if-absent of the id (:131-133). Remove arm — a non-zero id
-//      removes all its occurrences (:137-139). Permissions arm —
-//      `token_permission_mode` must be a valid enum (util.EnumValue) for the
-//      mode/max block to apply AT ALL (:142-152: an invalid mode silently
-//      KEEPS the stored values — the owner arm has no repo-style refusal);
-//      enable-max on → parseMaxTokenPermissions(form), off → nil (:145-151).
-//      Then SetOwnerActionsConfig (:154-157), flash
-//      "settings.saved_successfully" and JSONRedirect("") (:159-160 — the
-//      no-session-flash reduction keeps the redirect, `""` = back onto the
-//      page URL).
-//      THE STORE: `user_setting` KV 'actions.config' (models/actions/
-//      config.go:38-46, SettingsKeyActionsConfig) — no landed home; the
-//      landed `user_settings` side store is typed-columns (schema.ts), so
-//      the home decision (a new KV table vs a `user_settings` JSON column —
-//      the theme/language collapse precedent needs the latter) is a src/db
-//      wave BEFORE these POSTs can register. Until then the POSTs stay
-//      engine-owned 404s (the repo general module's landing-state
-//      precedent), and the page module's exported parsers above are the
-//      wave's parse half.
+//      The applier is applyOwnerActionsGeneralForms (the UpdateGeneral-
+//      Settings port, general.go:100-161 — the add arm's within-owner
+//      resolution + :125's JSONError early return, the remove-all arm, the
+//      no-refusal EnumValue arm, the save). The glue bodies, verbatim:
+//
+//        async function orgActionsGeneralSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+//          const guard = sameOriginGuard(c.req.raw);
+//          if (guard !== null) return guard;
+//          const resolved = await resolveOrgTeamsRequest(c);
+//          if (!resolved.ok) return resolved.response;
+//          const { org, respond } = resolved;
+//          if (resolved.route.family !== "org-settings-actions-general") return respond(await c.notFound()); // drift guard
+//          const params = await readUrlEncodedForm(c.req.raw);
+//          const outcome = await applyOwnerActionsGeneralForms(c.env.DB, org.id, parseOwnerActionsCrossRepoForm(params), parseOwnerActionsPermissionsForm(params));
+//          if (outcome.outcome === "repo-not-exist") {
+//            return respond(new Response(JSON.stringify(OWNER_ACTIONS_REPO_NOT_EXIST_ERROR), { status: 400, headers: { "content-type": "application/json;charset=utf-8" } }));
+//          }
+//          return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/general` } }));
+//        }
+//
+//        async function userActionsGeneralSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+//          const p = await userSettingsTabPrologue(c, true);
+//          if (!p.ok) return p.response;
+//          const params = await readUrlEncodedForm(c.req.raw);
+//          const outcome = await applyUserActionsGeneralForms(c.env.DB, p.viewer.id, parseUserActionsCrossRepoForm(params), parseUserActionsPermissionsForm(params));
+//          if (outcome.outcome === "repo-not-exist") {
+//            return p.respond(new Response(JSON.stringify(USER_ACTIONS_REPO_NOT_EXIST_ERROR), { status: 400, headers: { "content-type": "application/json;charset=utf-8" } }));
+//          }
+//          return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/actions/general" } }));
+//        }
+//
+//      Registrations (next to the GET twins):
+//        uiRouter.post("/:owner/settings/actions/general", (c) => orgActionsGeneralSubmit(c));
+//        uiRouter.post("/user/settings/actions/general", (c) => userActionsGeneralSubmit(c));
+//      Imports to add: applyOwnerActionsGeneralForms,
+//      parseOwnerActionsCrossRepoForm, parseOwnerActionsPermissionsForm,
+//      OWNER_ACTIONS_REPO_NOT_EXIST_ERROR from this module; the user-twin
+//      aliases (applyUserActionsGeneralForms / parseUserActions*Form /
+//      USER_ACTIONS_REPO_NOT_EXIST_ERROR) from pages/
+//      user-settings-actions-general. `outcome.outcome === "saved"` maps
+//      general.go:159-160's JSONRedirect("") + flash (the no-session-flash
+//      reduction) onto the 303 back onto the page URL; "repo-not-exist" is
+//      :125's ctx.JSONError LITERAL answered 400 (context.go:276-278's
+//      {"errorMessage","renderFormat":"text"} — the repo-actions-view
+//      json-outcome convention).
+//      THE STORE (landed this wave, the recorded reduction retired):
+//      `user_settings_kv` (schema.ts migration 0048 — upstream
+//      `user_setting`'s column-for-column port) +
+//      services/actions/owner-actions-config.ts (Get/Set + the Go-marshal
+//      serialization + the absent-row default). The one adaptation: the
+//      allowed-cross-repo ids are this deployment's TEXT repositories.id
+//      (upstream int64) — the store module header's id-space note — so
+//      `cross_repo_remove_target_id` parses as a string ("" = the no-op
+//      sentinel where upstream's FormInt64 uses 0).

@@ -1,22 +1,28 @@
 /**
  * The ORG settings ACTIONS tab's GENERAL sub-tab's tests — the census C9
  * arm's owner page at the org scope (pages/org-settings-actions-general.tsx).
- * The module is store-free (the OWNER-level OwnerActionsConfig store is the
- * module header's recorded reduction), so this is the shell.test.tsx harness
- * (hono/jsx through renderPage-owned renderers, no D1): the loader's no-setting posture pins,
- * the full-document DOM contract (org/settings/actions_general.tmpl +
+ * The shell harness pieces (hono/jsx through renderPage-owned renderers)
+ * pin the full-document DOM contract (org/settings/actions_general.tmpl +
  * shared/actions/owner_general_settings.tmpl at the pin, byte-level where
  * upstream's own quirks live — the trailing-space form class, the
- * `page-content ` attribute), and the POST parsers + the
- * ParseMaxTokenPermissions port (general.go:25-44).
+ * `page-content ` attribute) and the POST parsers + the
+ * ParseMaxTokenPermissions port (general.go:25-44); the D1 pieces (real
+ * local-D1 via the auth migrations helper) pin the loader's store read —
+ * the absent-row default AND a saved-owner posture — and the POST applier
+ * `applyOwnerActionsGeneralForms` (UpdateGeneralSettings' arms:
+ * general.go:119-139's resolution arms, :142-152's no-refusal EnumValue
+ * arm, the save).
  *
  * The route-level matrix (the require-owner prologue arms, the parse
- * claims, the bare-path 303, the POST tails' engine 404s) lands WITH THE
- * MOUNT — index.ts is a shared file this unit does not edit (the module
- * header's HANDOFF).
+ * claims, the bare-path 303, the POST registrations) lands WITH THE MOUNT
+ * — index.ts is a shared file this unit does not edit (the module header's
+ * HANDOFF).
  */
 
-import { describe, expect, it } from "vitest";
+import { env } from "cloudflare:test";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
+import { setOwnerActionsConfig } from "../../services/actions/owner-actions-config";
 import type { OrgRecord } from "../../services/orgs/orgs";
 import type { UiManifest } from "../manifest";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
@@ -24,12 +30,15 @@ import type { Viewer } from "../viewer";
 import { makeWriteAllActionsTokenPermissions } from "../../services/actions/config";
 import {
   OWNER_ACTIONS_GENERAL_FRESH_DATA,
+  OWNER_ACTIONS_REPO_NOT_EXIST_ERROR,
+  applyOwnerActionsGeneralForms,
+  deriveOwnerActionsGeneralData,
   loadOrgActionsGeneralPageData,
-  renderOrgActionsGeneralPage,
-  orgSettingsActionsGeneralLocale,
-  parseMaxTokenPermissions,
   parseOwnerActionsCrossRepoForm,
   parseOwnerActionsPermissionsForm,
+  parseMaxTokenPermissions,
+  renderOrgActionsGeneralPage,
+  orgSettingsActionsGeneralLocale,
   type OrgActionsGeneralPageDataWithOrg,
 } from "./org-settings-actions-general";
 
@@ -73,26 +82,82 @@ const org: OrgRecord = {
   createdAt: T0,
 };
 
-const pageData: OrgActionsGeneralPageDataWithOrg = { org, ...loadOrgActionsGeneralPageData(org) };
+/** The no-setting page data for the DOM pins (the fresh posture, no D1 —
+ *  the store's absent-row answer IS this shape, pinned by the loader test
+ *  below). */
+const pageData: OrgActionsGeneralPageDataWithOrg = {
+  org,
+  ownerId: ORG_ID,
+  ...OWNER_ACTIONS_GENERAL_FRESH_DATA,
+};
 
-// --- the loader (general.go:46-98 at the no-setting posture) -------------------
+// --- the D1 harness ------------------------------------------------------------
 
-describe("loadOrgActionsGeneralPageData (the store-free no-setting posture)", () => {
-  it("answers upstream's fresh-owner render inputs — mode permissive, the write-all max, enable-max false, an empty allowed list", () => {
-    const data = loadOrgActionsGeneralPageData(org);
+beforeAll(async () => {
+  await applyAuthD1Migrations();
+});
+
+beforeEach(async () => {
+  for (const table of ["user_settings_kv", "repositories", "users"]) {
+    await env.DB.prepare(`DELETE FROM ${table}`).run();
+  }
+  await env.DB.prepare(
+    "INSERT INTO users (id, username, username_lower, display_name, type, created_at) VALUES (7, 'coalition', 'coalition', 'The Coalition', 'org', unixepoch())",
+  ).run();
+  await env.DB.prepare(
+    "INSERT INTO users (id, username, username_lower, display_name, type, created_at) VALUES (2, 'otherowner', 'otherowner', 'Other Owner', 'user', unixepoch())",
+  ).run();
+  await env.DB.prepare(
+    "INSERT INTO repositories (id, storage_key, owner_namespace, owner_id, slug, default_branch, visibility, created_at) VALUES ('repo-1', 'repo-1', 'coalition', 7, 'demo', 'main', 'public', unixepoch())",
+  ).run();
+  await env.DB.prepare(
+    "INSERT INTO repositories (id, storage_key, owner_namespace, owner_id, slug, default_branch, visibility, created_at) VALUES ('repo-2', 'repo-2', 'coalition', 7, 'site', 'main', 'private', unixepoch())",
+  ).run();
+  await env.DB.prepare(
+    "INSERT INTO repositories (id, storage_key, owner_namespace, owner_id, slug, default_branch, visibility, created_at) VALUES ('repo-f', 'repo-f', 'otherowner', 2, 'theirs', 'main', 'public', unixepoch())",
+  ).run();
+});
+
+// --- the loader (general.go:46-98 over the landed store) ------------------------
+
+describe("loadOrgActionsGeneralPageData (the store read)", () => {
+  it("answers the fresh-owner render inputs for an absent row — mode permissive, the write-all max, enable-max false, an empty allowed list", async () => {
+    const data = await loadOrgActionsGeneralPageData(env.DB, org);
     expect(data.tokenPermissionMode).toBe("permissive"); // the absent user_setting row's FromDB EnumValue normalization
     expect(data.maxTokenPermissions).toEqual(makeWriteAllActionsTokenPermissions()); // general.go:76-78's nil fallback
     expect(data.enableMaxTokenPermissions).toBe(false); // MaxTokenPermissions != nil, general.go:80
     expect(data.allowedRepos).toEqual([]); // GetOwnerRepositoriesByIDs' empty-ids arm, repo_list.go:845-847
     expect(data.ownerId).toBe(ORG_ID); // getRunnersCtx's org arm, runners.go:82-91
     // The shared fresh-posture constant is exactly this shape (the user
-    // twin re-exports it under OWNER_ACTIONS_GENERAL_FRESH_POSTURE).
+    // twin re-exports it under OWNER_ACTIONS_GENERAL_FRESH_POSTURE) —
+    // derived from the store's absent-row default through the same mapping.
     expect(OWNER_ACTIONS_GENERAL_FRESH_DATA).toEqual({
       tokenPermissionMode: "permissive",
       maxTokenPermissions: makeWriteAllActionsTokenPermissions(),
       enableMaxTokenPermissions: false,
       allowedRepos: [],
     });
+    expect(deriveOwnerActionsGeneralData({ tokenPermissionMode: "permissive", maxTokenPermissions: null, allowedCrossRepoIds: [] })).toEqual({
+      tokenPermissionMode: "permissive",
+      maxTokenPermissions: makeWriteAllActionsTokenPermissions(),
+      enableMaxTokenPermissions: false,
+    });
+  });
+
+  it("answers a saved-owner posture from the store — the stored mode/max/enable and the resolved allowed rows", async () => {
+    await setOwnerActionsConfig(env.DB, ORG_ID, {
+      tokenPermissionMode: "restricted",
+      maxTokenPermissions: { unitAccessModes: { 1: 2 }, idToken: true },
+      allowedCrossRepoIds: ["repo-1", "repo-2"],
+    });
+    const data = await loadOrgActionsGeneralPageData(env.DB, org);
+    expect(data.tokenPermissionMode).toBe("restricted");
+    expect(data.maxTokenPermissions).toEqual({ unitAccessModes: { 1: 2 }, idToken: true }); // explicit — no nil fallback
+    expect(data.enableMaxTokenPermissions).toBe(true); // MaxTokenPermissions != nil, general.go:80
+    expect(data.allowedRepos).toEqual([
+      { id: "repo-1", fullName: "coalition/demo", link: "/coalition/demo" },
+      { id: "repo-2", fullName: "coalition/site", link: "/coalition/site" },
+    ]);
   });
 });
 
@@ -131,7 +196,7 @@ describe("OrgActionsGeneralPage (org/settings/actions_general.tmpl + shared/acti
     expect(html).toContain(`class="ui form form-fetch-action " action="${GENERAL_LINK}" method="post"`);
     expect(html).toContain(`<div class="help">${orgSettingsActionsGeneralLocale.cross_repo_desc}</div>`);
     expect(html).toContain(`<h5 class="ui header">${orgSettingsActionsGeneralLocale.cross_repo_target_repos}</h5>`);
-    // The empty arm (:27-29) — the store gap keeps the list empty.
+    // The empty arm (:27-29) — the no-saved-targets posture.
     expect(html).toContain(`<div class="item">${orgSettingsActionsGeneralLocale.repos_none}</div>`);
     expect(html).toContain(`<h5 class="ui header">${orgSettingsActionsGeneralLocale.cross_repo_add}</h5>`);
     // The search-repo-box wrapper kept inert with upstream's attrs (:37-40) —
@@ -142,6 +207,23 @@ describe("OrgActionsGeneralPage (org/settings/actions_general.tmpl + shared/acti
     expect(html).toContain('name="cross_repo_add_target_name" required="" placeholder="Search repos…" autocomplete="off"');
     expect(html).toContain('name="cross_repo_add_target" value="true"');
     expect(html).toContain(">Add</button>");
+  });
+
+  it("renders saved allowed-repo rows — the repo/icon row shape with the link-action Remove buttons", () => {
+    const html = renderOrgActionsGeneralPage(ctx, {
+      ...pageData,
+      allowedRepos: [
+        { id: "repo-1", fullName: "coalition/demo", link: "/coalition/demo" },
+        { id: "repo-2", fullName: "coalition/site", link: "/coalition/site" },
+      ],
+    });
+    expect(html).not.toContain(`<div class="item">${orgSettingsActionsGeneralLocale.repos_none}</div>`); // the empty arm yields
+    expect(html).toContain("octicon-repo"); // the repo/icon svg arm
+    expect(html).toContain('href="/coalition/demo">coalition/demo</a>');
+    expect(html).toContain('href="/coalition/site">coalition/site</a>');
+    expect(html).toContain(`data-url="?cross_repo_remove_target_id=repo-1"`); // the string id space
+    expect(html).toContain(`data-url="?cross_repo_remove_target_id=repo-2"`);
+    expect(html).toContain(">Remove</button>");
   });
 
   it("renders the Actions Token Permissions section — the shared partials, no repo-only override checkbox", () => {
@@ -175,20 +257,24 @@ describe("OrgActionsGeneralPage (org/settings/actions_general.tmpl + shared/acti
   });
 });
 
-// --- the POST parsers (general.go:25-44 + :119-139 — the HANDOFF's parse half) --
+// --- the POST parsers (general.go:25-44 + :119-139 — the parse half) -------------
 
 describe("the form parsers (UpdateGeneralSettings' reads)", () => {
-  it("parses the cross-repo form — FormBool's spellings, the name echo, FormInt64's junk-to-0", () => {
+  it("parses the cross-repo form — FormBool's spellings, the name echo, the string remove id (empty = the no-op sentinel)", () => {
     expect(parseOwnerActionsCrossRepoForm(new URLSearchParams("cross_repo_add_target=true&cross_repo_add_target_name=repo-a"))).toEqual({
       crossRepoAddTarget: true,
       crossRepoAddTargetName: "repo-a",
-      crossRepoRemoveTargetId: 0,
+      crossRepoRemoveTargetId: "",
     });
     // The checkbox's value-less "on" spelling (upstream FormBool).
     expect(parseOwnerActionsCrossRepoForm(new URLSearchParams("cross_repo_add_target=on")).crossRepoAddTarget).toBe(true);
     expect(parseOwnerActionsCrossRepoForm(new URLSearchParams("")).crossRepoAddTarget).toBe(false);
-    expect(parseOwnerActionsCrossRepoForm(new URLSearchParams("cross_repo_remove_target_id=42")).crossRepoRemoveTargetId).toBe(42);
-    expect(parseOwnerActionsCrossRepoForm(new URLSearchParams("cross_repo_remove_target_id=junk")).crossRepoRemoveTargetId).toBe(0);
+    expect(parseOwnerActionsCrossRepoForm(new URLSearchParams("cross_repo_remove_target_id=repo-42")).crossRepoRemoveTargetId).toBe("repo-42");
+    // Upstream FormInt64's junk-to-0 no-op arm — the string id space's
+    // absent-field arm (junk ids never match a real repositories.id, so a
+    // junk value remove is a no-op by non-match).
+    expect(parseOwnerActionsCrossRepoForm(new URLSearchParams("cross_repo_remove_target_id=42")).crossRepoRemoveTargetId).toBe("42");
+    expect(parseOwnerActionsCrossRepoForm(new URLSearchParams("")).crossRepoRemoveTargetId).toBe("");
   });
 
   it("parses the permissions form — absent radios read as the empty-string none arm", () => {
@@ -212,5 +298,141 @@ describe("the form parsers (UpdateGeneralSettings' reads)", () => {
     expect(perms.unitAccessModes[5]).toBe(0); // absent parses none
     expect(perms.idToken).toBe(true);
     expect(parseMaxTokenPermissions(parseOwnerActionsPermissionsForm(new URLSearchParams("max_id_token=read"))).idToken).toBe(false);
+  });
+});
+
+// --- the POST arm (UpdateGeneralSettings, general.go:100-161) -------------------
+
+/** The owner's stored config row, parsed for the byte pins — the raw
+ *  serialized bytes ARE the store's contract (the Go-marshal pins read them
+ *  directly rather than through the typed loader). */
+async function storedConfig(userId: number): Promise<Record<string, unknown>> {
+  const row = await env.DB.prepare("SELECT setting_value FROM user_settings_kv WHERE user_id = ?").bind(userId).first<{ setting_value: string }>();
+  return JSON.parse(row!.setting_value) as Record<string, unknown>;
+}
+
+describe("applyOwnerActionsGeneralForms (UpdateGeneralSettings over the owner store)", () => {
+  it("saves the add arm — resolves the repo WITHIN the owner, appends the id once", async () => {
+    const crossRepo = parseOwnerActionsCrossRepoForm(new URLSearchParams("cross_repo_add_target=true&cross_repo_add_target_name=DEMO"));
+    const outcome = await applyOwnerActionsGeneralForms(env.DB, ORG_ID, crossRepo, parseOwnerActionsPermissionsForm(new URLSearchParams("")));
+    expect(outcome).toEqual({ outcome: "saved" }); // the wiring's 303-back arm
+    const cfg = await storedConfig(ORG_ID);
+    expect(cfg.allowed_cross_repo_ids).toEqual(["repo-1"]); // lower_name case-fold (DEMO → demo)
+    // Append-if-absent (:131-133): a second add of the same repo is a save, not a duplicate.
+    await applyOwnerActionsGeneralForms(env.DB, ORG_ID, crossRepo, parseOwnerActionsPermissionsForm(new URLSearchParams("")));
+    const cfg2 = await storedConfig(ORG_ID);
+    expect(cfg2.allowed_cross_repo_ids).toEqual(["repo-1"]);
+  });
+
+  it("refuses the add arm on an unknown repo — the :125 JSONError outcome, NOTHING stored", async () => {
+    const crossRepo = parseOwnerActionsCrossRepoForm(new URLSearchParams("cross_repo_add_target=true&cross_repo_add_target_name=missing"));
+    const outcome = await applyOwnerActionsGeneralForms(env.DB, ORG_ID, crossRepo, parseOwnerActionsPermissionsForm(new URLSearchParams("")));
+    expect(outcome).toEqual({ outcome: "repo-not-exist" });
+    const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM user_settings_kv WHERE user_id = ?").bind(ORG_ID).first<{ n: number }>();
+    expect(row?.n).toBe(0); // the early return skips the save (upstream's control flow)
+    // Another OWNER's repo name is unknown through this owner's lens
+    // (GetRepositoryByName is owner-pinned — repo.go:763's owner_id arm).
+    const foreign = parseOwnerActionsCrossRepoForm(new URLSearchParams("cross_repo_add_target=true&cross_repo_add_target_name=theirs"));
+    expect(
+      await applyOwnerActionsGeneralForms(env.DB, ORG_ID, foreign, parseOwnerActionsPermissionsForm(new URLSearchParams(""))),
+    ).toEqual({ outcome: "repo-not-exist" });
+    // And the JSONError body is the :125 literal under the context.go shape.
+    expect(OWNER_ACTIONS_REPO_NOT_EXIST_ERROR).toEqual({ errorMessage: "Repository doesn't exist", renderFormat: "text" });
+  });
+
+  it("treats an add-flag with an empty name as a no-op that STILL saves (:121's guard → the save)", async () => {
+    const crossRepo = parseOwnerActionsCrossRepoForm(new URLSearchParams("cross_repo_add_target=true&cross_repo_add_target_name="));
+    const outcome = await applyOwnerActionsGeneralForms(env.DB, ORG_ID, crossRepo, parseOwnerActionsPermissionsForm(new URLSearchParams("")));
+    expect(outcome).toEqual({ outcome: "saved" });
+    const cfg = await storedConfig(ORG_ID);
+    expect(cfg).toEqual({ token_permission_mode: "permissive" }); // the normalized default row written, no ids
+  });
+
+  it("removes all occurrences of the remove id (:137-139) — an empty id is the no-op sentinel", async () => {
+    await setOwnerActionsConfig(env.DB, ORG_ID, {
+      tokenPermissionMode: "permissive",
+      maxTokenPermissions: null,
+      allowedCrossRepoIds: ["repo-1", "repo-2", "repo-1"],
+    });
+    await applyOwnerActionsGeneralForms(
+      env.DB,
+      ORG_ID,
+      parseOwnerActionsCrossRepoForm(new URLSearchParams("cross_repo_remove_target_id=repo-1")),
+      parseOwnerActionsPermissionsForm(new URLSearchParams("")),
+    );
+    const cfg = await storedConfig(ORG_ID);
+    expect(cfg.allowed_cross_repo_ids).toEqual(["repo-2"]); // SliceRemoveAll, order kept
+    // The empty sentinel removes nothing (upstream's 0 arm).
+    await applyOwnerActionsGeneralForms(env.DB, ORG_ID, parseOwnerActionsCrossRepoForm(new URLSearchParams("")), parseOwnerActionsPermissionsForm(new URLSearchParams("")));
+    const cfg2 = await storedConfig(ORG_ID);
+    expect(cfg2.allowed_cross_repo_ids).toEqual(["repo-2"]);
+  });
+
+  it("applies the permissions arm — enable-max on parses the radios, off stores nil; loading falls back to write-all", async () => {
+    const permsForm = parseOwnerActionsPermissionsForm(
+      new URLSearchParams("token_permission_mode=restricted&enable_max_permissions=true&max_unit_access_mode_1=write&max_unit_access_mode_2=read&max_id_token=write"),
+    );
+    expect(await applyOwnerActionsGeneralForms(env.DB, ORG_ID, parseOwnerActionsCrossRepoForm(new URLSearchParams("")), permsForm)).toEqual({
+      outcome: "saved",
+    });
+    const cfg = await storedConfig(ORG_ID);
+    expect(cfg.token_permission_mode).toBe("restricted");
+    // ParseMaxTokenPermissions fills ALL eight unit keys (the loop's none
+    // default — general.go:25-44); zero-valued map entries are NOT omitted
+    // (map omitempty only drops the whole empty map).
+    expect(cfg.max_token_permissions).toEqual({ unit_access_modes: { 1: 2, 2: 1, 3: 0, 4: 0, 5: 0, 8: 0, 9: 0, 10: 0 }, id_token: true });
+    // enable-max OFF stores nil — the loader answers the write-all fallback
+    // with enable-max false (general.go:77-81). (An ON post with NO radios
+    // would store the all-none ceiling instead — the parse fills all eight.)
+    await applyOwnerActionsGeneralForms(
+      env.DB,
+      ORG_ID,
+      parseOwnerActionsCrossRepoForm(new URLSearchParams("")),
+      parseOwnerActionsPermissionsForm(new URLSearchParams("token_permission_mode=restricted")),
+    );
+    const nilRow = await storedConfig(ORG_ID);
+    expect(nilRow.token_permission_mode).toBe("restricted");
+    expect(nilRow.max_token_permissions).toBeUndefined();
+    const data = await loadOrgActionsGeneralPageData(env.DB, org);
+    expect(data.maxTokenPermissions).toEqual(makeWriteAllActionsTokenPermissions());
+    expect(data.enableMaxTokenPermissions).toBe(false);
+  });
+
+  it("IGNORES an invalid token_permission_mode — the no-refusal EnumValue arm keeps the stored values (:142-152)", async () => {
+    // A pre-saved restricted config stays restricted through a junk-mode post.
+    await setOwnerActionsConfig(env.DB, ORG_ID, {
+      tokenPermissionMode: "restricted",
+      maxTokenPermissions: { unitAccessModes: { 1: 1 }, idToken: false },
+      allowedCrossRepoIds: [],
+    });
+    const junk = parseOwnerActionsPermissionsForm(new URLSearchParams("token_permission_mode=custom&enable_max_permissions=true"));
+    expect(await applyOwnerActionsGeneralForms(env.DB, ORG_ID, parseOwnerActionsCrossRepoForm(new URLSearchParams("")), junk)).toEqual({
+      outcome: "saved", // SAVED — the owner arm has no repo-style refusal
+    });
+    const cfg = await storedConfig(ORG_ID);
+    expect(cfg.token_permission_mode).toBe("restricted"); // the stored values kept
+    expect(cfg.max_token_permissions).toEqual({ unit_access_modes: { 1: 1 } }); // the max block skipped whole
+    // A fresh owner's junk-mode post saves the normalized default row.
+    const junkFresh = await applyOwnerActionsGeneralForms(
+      env.DB,
+      2,
+      parseOwnerActionsCrossRepoForm(new URLSearchParams("")),
+      parseOwnerActionsPermissionsForm(new URLSearchParams("token_permission_mode=custom")),
+    );
+    expect(junkFresh).toEqual({ outcome: "saved" });
+    const fresh = await storedConfig(2);
+    expect(fresh).toEqual({ token_permission_mode: "permissive" });
+  });
+
+  it("keeps owners isolated through the apply — a post on one owner never touches another's row", async () => {
+    await setOwnerActionsConfig(env.DB, 2, { tokenPermissionMode: "restricted", maxTokenPermissions: null, allowedCrossRepoIds: [] });
+    await applyOwnerActionsGeneralForms(
+      env.DB,
+      ORG_ID,
+      parseOwnerActionsCrossRepoForm(new URLSearchParams("cross_repo_add_target=true&cross_repo_add_target_name=demo")),
+      parseOwnerActionsPermissionsForm(new URLSearchParams("")),
+    );
+    const other = await storedConfig(2);
+    expect(other).toEqual({ token_permission_mode: "restricted" }); // untouched
   });
 });

@@ -934,7 +934,14 @@ import {
   setOrgActionsRunnerDisabled,
   updateOrgActionsRunnerDescription,
 } from "./pages/org-settings-actions-runners";
-import { loadOrgActionsGeneralPageData, renderOrgActionsGeneralPage } from "./pages/org-settings-actions-general";
+import {
+  applyOwnerActionsGeneralForms,
+  loadOrgActionsGeneralPageData,
+  OWNER_ACTIONS_REPO_NOT_EXIST_ERROR,
+  parseOwnerActionsCrossRepoForm,
+  parseOwnerActionsPermissionsForm,
+  renderOrgActionsGeneralPage,
+} from "./pages/org-settings-actions-general";
 import {
   applyOrgCleanupRuleCreate,
   applyOrgCleanupRuleEdit,
@@ -1015,8 +1022,13 @@ import {
   setUserActionsRunnerDisabled,
   updateUserActionsRunnerDescription,
 } from "./pages/user-settings-actions-runners";
-import { renderUserActionsGeneralPage } from "./pages/user-settings-actions-general";
-import { OWNER_ACTIONS_GENERAL_FRESH_DATA } from "./pages/org-settings-actions-general";
+import {
+  applyUserActionsGeneralForms,
+  loadUserActionsGeneralPageData,
+  parseUserActionsCrossRepoForm,
+  parseUserActionsPermissionsForm,
+  renderUserActionsGeneralPage,
+} from "./pages/user-settings-actions-general";
 import {
   applyUserCleanupRuleCreate,
   applyUserCleanupRuleEdit,
@@ -8679,8 +8691,67 @@ async function userActionsGroupRedirect(c: Context<{ Bindings: Env }>): Promise<
 async function userActionsGeneralPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const p = await userSettingsTabPrologue(c, false);
   if (!p.ok) return p.response;
-  // The reuse twin renders the shared FRESH_DATA directly (no D1 read).
-  return p.respond(c.html(renderUserActionsGeneralPage(p.ctx, { ownerId: p.viewer.id, ...OWNER_ACTIONS_GENERAL_FRESH_DATA }), 200));
+  const data = await loadUserActionsGeneralPageData(c.env.DB, p.viewer.id);
+  return p.respond(c.html(renderUserActionsGeneralPage(p.ctx, data), 200));
+}
+
+/** POST /{org}/settings/actions/general (web.go:1055 UpdateGeneralSettings
+ * at the org scope): both forms parse then apply to the owner store; the
+ * add arm's repo miss answers upstream's JSONError 400 (general.go:125),
+ * success 303s back to the page. */
+async function orgActionsGeneralSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { org, respond } = resolved;
+  if (resolved.route.family !== "org-settings-actions-general") return respond(await c.notFound()); // drift guard
+  const params = await c.req.parseBody().then(
+    (body) => new URLSearchParams(Object.entries(body).map(([k, v]) => [k, String(v)])),
+    () => new URLSearchParams(),
+  );
+  const outcome = await applyOwnerActionsGeneralForms(
+    c.env.DB,
+    org.id,
+    parseOwnerActionsCrossRepoForm(params),
+    parseOwnerActionsPermissionsForm(params),
+  );
+  if (outcome.outcome === "repo-not-exist") {
+    return respond(
+      new Response(JSON.stringify(OWNER_ACTIONS_REPO_NOT_EXIST_ERROR), {
+        status: 400,
+        headers: { "content-type": "application/json;charset=utf-8" },
+      }),
+    );
+  }
+  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/general` } }));
+}
+
+/** POST /user/settings/actions/general — the reuse twin at the user scope. */
+async function userActionsGeneralSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const params = await c.req.parseBody().then(
+    (body) => new URLSearchParams(Object.entries(body).map(([k, v]) => [k, String(v)])),
+    () => new URLSearchParams(),
+  );
+  const outcome = await applyUserActionsGeneralForms(
+    c.env.DB,
+    p.viewer.id,
+    parseUserActionsCrossRepoForm(params),
+    parseUserActionsPermissionsForm(params),
+  );
+  if (outcome.outcome === "repo-not-exist") {
+    return p.respond(
+      new Response(JSON.stringify(OWNER_ACTIONS_REPO_NOT_EXIST_ERROR), {
+        status: 400,
+        headers: { "content-type": "application/json;charset=utf-8" },
+      }),
+    );
+  }
+  return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/actions/general" } }));
 }
 
 async function userActionsRunnersPage(c: Context<{ Bindings: Env }>): Promise<Response> {
@@ -9929,7 +10000,7 @@ async function orgActionsGeneralPage(c: Context<{ Bindings: Env }>): Promise<Res
   if (!resolved.ok) return resolved.response;
   const { ctx, org, respond } = resolved;
   if (resolved.route.family !== "org-settings-actions-general") return respond(await c.notFound()); // drift guard
-  const data = loadOrgActionsGeneralPageData(org);
+  const data = await loadOrgActionsGeneralPageData(c.env.DB, org);
   return respond(c.html(renderOrgActionsGeneralPage(ctx, { ...data, org }), 200));
 }
 
@@ -14528,6 +14599,7 @@ uiRouter.post("/user/settings/actions/secrets/delete", (c) => userSettingsSecret
 // arms; the GET-only edit page's POST twin answers chi's 405).
 uiRouter.get("/user/settings/actions", (c) => userActionsGroupRedirect(c));
 uiRouter.get("/user/settings/actions/general", (c) => userActionsGeneralPage(c));
+uiRouter.post("/user/settings/actions/general", (c) => userActionsGeneralSubmit(c));
 uiRouter.get("/user/settings/actions/runners", (c) => userActionsRunnersPage(c));
 uiRouter.post("/user/settings/actions/runners/reset_registration_token", (c) => userActionsRunnersTokenReset(c));
 uiRouter.get("/user/settings/actions/runners/reset_registration_token", () => methodNotAllowed("POST"));
@@ -14646,6 +14718,7 @@ uiRouter.get("/:owner/settings/blocked_users", (c) => orgBlockedUsersPage(c));
 uiRouter.post("/:owner/settings/blocked_users", (c) => orgBlockedUsersSubmit(c));
 uiRouter.get("/:owner/settings/actions", (c) => orgActionsGroupRedirect(c));
 uiRouter.get("/:owner/settings/actions/general", (c) => orgActionsGeneralPage(c));
+uiRouter.post("/:owner/settings/actions/general", (c) => orgActionsGeneralSubmit(c));
 uiRouter.get("/:owner/settings/actions/secrets", (c) => orgActionsSecretsPage(c));
 uiRouter.post("/:owner/settings/actions/secrets", (c) => orgActionsSecretsSubmit(c));
 uiRouter.post("/:owner/settings/actions/secrets/delete", (c) => orgActionsSecretsDelete(c));

@@ -40,17 +40,20 @@
  *     with the General sub-item FIRST (:43-45 — href
  *     `/user/settings/actions/general`, label `actions.general`).
  *
- * The shared body, the loaders' no-setting posture, the store gap (the
- * OWNER-level `user_setting` KV store has no landed home — the write arms
- * are the recorded reduction), the parsers and the full HANDOFF recipe live
- * on the org module's header: EVERY claim there cites the same scope-shared
- * upstream sources and carries over verbatim, the owner id being the doer's
- * (`getRunnersCtx`'s user arm — OwnerID = ctx.Doer.ID, runners.go:82-91).
+ * The shared body, the loaders (the store read at the doer's id), the
+ * landed store (the OWNER-level `user_setting` KV home —
+ * `user_settings_kv`/services/actions/owner-actions-config.ts, the org
+ * module header's store section), the POST arm's applier and the full
+ * HANDOFF recipe live on the org module's header: EVERY claim there cites
+ * the same scope-shared upstream sources and carries over verbatim, the
+ * owner id being the doer's (`getRunnersCtx`'s user arm — OwnerID =
+ * ctx.Doer.ID, runners.go:82-91).
  */
 
 import { BaseLayout, renderPage } from "../shell";
 import { UserSettingsNavbar } from "../components/settings-nav";
 import type { UiContext } from "../ui-context";
+import { getOwnerActionsConfig, getOwnerRepositoriesByIDs } from "../../services/actions/owner-actions-config";
 import {
   OWNER_ACTIONS_GENERAL_FRESH_DATA,
   OwnerActionsGeneralSections,
@@ -58,10 +61,14 @@ import {
   parseMaxTokenPermissions,
   parseOwnerActionsCrossRepoForm,
   parseOwnerActionsPermissionsForm,
+  applyOwnerActionsGeneralForms,
+  OWNER_ACTIONS_REPO_NOT_EXIST_ERROR,
+  deriveOwnerActionsGeneralData,
   type OwnerActionsCrossRepoForm,
   type OwnerActionsGeneralAllowedRepo,
   type OwnerActionsGeneralPageData,
   type OwnerActionsPermissionsForm,
+  type UpdateOwnerActionsGeneralOutcome,
 } from "./org-settings-actions-general";
 
 // ---------------------------------------------------------------------------
@@ -75,9 +82,12 @@ export type UserActionsGeneralPageData = OwnerActionsGeneralPageData;
 export type UserActionsGeneralAllowedRepo = OwnerActionsGeneralAllowedRepo;
 export type UserActionsCrossRepoForm = OwnerActionsCrossRepoForm;
 export type UserActionsPermissionsForm = OwnerActionsPermissionsForm;
+export type UpdateUserActionsGeneralOutcome = UpdateOwnerActionsGeneralOutcome;
 export const parseUserActionsCrossRepoForm = parseOwnerActionsCrossRepoForm;
 export const parseUserActionsPermissionsForm = parseOwnerActionsPermissionsForm;
 export const parseUserMaxTokenPermissions = parseMaxTokenPermissions;
+export const applyUserActionsGeneralForms = applyOwnerActionsGeneralForms;
+export const USER_ACTIONS_REPO_NOT_EXIST_ERROR = OWNER_ACTIONS_REPO_NOT_EXIST_ERROR;
 
 // ---------------------------------------------------------------------------
 // The load + render
@@ -85,12 +95,15 @@ export const parseUserMaxTokenPermissions = parseMaxTokenPermissions;
 
 /**
  * The user general page's load (general.go:46-98 at the USER scope): the
- * no-setting posture without a store — the org module's loader comment
- * carries the store-gap reduction. `getRunnersCtx`'s owner id is the doer's
- * id (runners.go:82-91's user arm).
+ * same store read as the org loader, keyed on the DOER's id —
+ * `getRunnersCtx`'s user arm (runners.go:82-91) — so the absent-row
+ * default answers the fresh posture (OWNER_ACTIONS_GENERAL_FRESH_DATA) for
+ * a never-saved owner.
  */
-export function loadUserActionsGeneralPageData(userId: number): UserActionsGeneralPageData {
-  return { ownerId: userId, ...OWNER_ACTIONS_GENERAL_FRESH_DATA };
+export async function loadUserActionsGeneralPageData(d1: D1Database, userId: number): Promise<UserActionsGeneralPageData> {
+  const cfg = await getOwnerActionsConfig(d1, userId);
+  const allowedRepos = await getOwnerRepositoriesByIDs(d1, userId, cfg.allowedCrossRepoIds);
+  return { ownerId: userId, ...deriveOwnerActionsGeneralData(cfg), allowedRepos };
 }
 
 /** The full-document render (the render.tsx pattern — `index.ts` stays a
