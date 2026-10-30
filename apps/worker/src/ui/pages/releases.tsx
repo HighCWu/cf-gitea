@@ -102,10 +102,19 @@
  *   it — home_sidebar_bottom.tmpl:15); the task brief names the Latest tag
  *   a list feature and label.tmpl carries the contract, so the newest
  *   stable release renders the green Latest label in the list too.
- * - The release_tag_header menu's Tags item (`{RepoLink}/tags`) and the RSS
- *   button are unrendered — the tags list page and the feed family do not
- *   exist (dead-link rule); the menu keeps the single live Releases item
- *   (the milestones navbar reduction).
+ * - The release_tag_header menu's Tags item (`{RepoLink}/tags`) renders on
+ *   the LIST page (wave 25, when the tags list page landed — the finding F9
+ *   tab) and, since the git-e2e F9 fix, on the DETAIL page too: upstream
+ *   renders release_tag_header on EVERY tplReleasesList render (SingleRelease
+ *   included — release.go:335 `ctx.HTML(http.StatusOK, tplReleasesList)`),
+ *   with the Tags item ACTIVE only on the tags page/single-tag arm
+ *   (`{{if or .PageIsTagList .PageIsSingleTag}}active{{end}}`) — our detail
+ *   is always a REAL release (tag-only rows 404), so Releases stays active
+ *   and Tags renders plain, the list page's exact shape. The count is the
+ *   engine refs/tags universe (the ReleasesData.numTags note upstream counts
+ *   releases-table tag records). The RSS button stays unrendered — the
+ *   feed family is the repo header's links (wave-2e), not this header's
+ *   button surface.
  * - The tab strip's Releases count label (`{{if .NumReleases}}` — computed
  *   per repo page upstream, services/context/repo.go:634) is unrendered:
  *   D1 keeps no maintained num_releases counter and the shared shell would
@@ -297,6 +306,13 @@ export interface ReleaseEntry {
   /** The tag's in-git state (the engine boundary note): when set, the meta
    *  row renders the /src/tag/ link and the /src/commit/ ShortSha link. */
   tagOid: string | null;
+  /** The in-git tag count (upstream NumTags — release_tag_header.tmpl's
+   *  second menu item renders it on the SINGLE-release render too:
+   *  SingleRelease answers the SAME list template, release.go:335). Set by
+   *  the DETAIL loader only — the tag universe is already in hand there, so
+   *  the count is free; the LIST carries it on ReleasesData.numTags instead
+   *  and leaves this undefined (enrichEntries never sets it). */
+  numTags?: number;
 }
 
 /** The entry title (upstream renders the title, falling back to the tag name
@@ -429,7 +445,11 @@ export async function loadReleaseDetailData(
   if (row.isDraft && !canWrite) return null;
   const [latest, tags] = await Promise.all([findLatestRelease(d1, repo.id), tagTipsOf(env, repo)]);
   const [entry] = await enrichEntries(env, d1, repo, [row], latest?.id ?? -1, origin, tags);
-  return entry ?? null;
+  if (entry === undefined) return null;
+  // The header menu's Tags count (F9): upstream's SingleRelease render carries
+  // release_tag_header's two-item menu, and the tag universe is already in
+  // hand here — the count rides the entry for renderReleaseDetailPage.
+  return { ...entry, numTags: tags.size };
 }
 
 // ---------------------------------------------------------------------------
@@ -739,22 +759,21 @@ export function parseReleaseDeleteForm(params: URLSearchParams): number | null {
 // ---------------------------------------------------------------------------
 
 /** The releases header (release_tag_header.tmpl's `.flex-left-right`):
- *  the counts menu (reduced to the single live item — the module header's
- *  Tags/RSS note) and the New Release button (CanCreateRelease's write &&
- *  !archived). */
+ *  the counts menu (the Releases item plus the Tags item — F9's tab; the
+ *  module header's note) and the New Release button (CanCreateRelease's
+ *  write && !archived). */
 function ReleasesHeader(props: {
   basePath: string;
   total: number;
   canCreate: boolean;
   newHref: string | null;
-  /** Wave 25's additive Tags item (release_tag_header.tmpl's second menu
-   *  entry — `{{if $canReadCode}}`, the landed tags page
-   *  pages/tags.tsx): rendered only by the LIST page, where the loader's
-   *  `numTags` is already in hand (the DETAIL page keeps the wave-20
-   *  single-item menu — no listRefs just for a menu label, the same cost
-   *  note that landed the reduction). Upstream keeps Releases ACTIVE on
-   *  the list (`PageIsReleaseList`) and hands active to Tags only on the
-   *  tags page itself — the plain item here. */
+  /** release_tag_header.tmpl's second menu entry — `{N} Tags` onto
+   *  `{RepoLink}/tags` (`{{if $canReadCode}}`, the landed tags page
+   *  pages/tags.tsx). Rendered by the LIST page (the loader's `numTags`) and
+   *  by the DETAIL page (the entry's `numTags` — SingleRelease renders the
+   *  same header). Upstream keeps Releases ACTIVE on the list and on the
+   *  real-release detail (`PageIsReleaseList && !PageIsSingleTag`) and hands
+   *  active to Tags only on the tags page itself — the plain item here. */
   tags?: { href: string; count: number };
 }) {
   return (
@@ -992,7 +1011,9 @@ export function ReleasesPage(props: { ctx: UiContext; data: ReleasesData; flash?
 
 /** The release detail page — upstream SingleRelease renders the SAME list
  *  template over one row (release.go:327 tplReleasesList); the title is the
- *  release's (or the tag's), the header menu shows the repo's totals. */
+ *  release's (or the tag's), the header menu shows the repo's totals
+ *  (F9: the Tags item included — the entry's numTags the detail loader
+ *  attaches). */
 export function renderReleaseDetailPage(options: { ctx: UiContext; entry: ReleaseEntry; total: number }): string {
   const { ctx, entry, total } = options;
   const repo = ctx.repo;
@@ -1004,7 +1025,13 @@ export function renderReleaseDetailPage(options: { ctx: UiContext; entry: Releas
         {/* SingleRelease renders the same template without the create
             button's page state — the button is the list's CanCreate arm; the
             detail page keeps the header menu + the single entry. */}
-        <ReleasesHeader basePath={`${repoLink}/releases`} total={total} canCreate={false} newHref={null} />
+        <ReleasesHeader
+          basePath={`${repoLink}/releases`}
+          total={total}
+          canCreate={false}
+          newHref={null}
+          tags={entry.numTags !== undefined ? { href: `${repoLink}/tags`, count: entry.numTags } : undefined}
+        />
         <div class="divider" />
         <ul id="release-list">
           <ReleaseEntryItem entry={entry} repoLink={repoLink} firstOpen={true} />

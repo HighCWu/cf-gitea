@@ -64,6 +64,7 @@ import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
 import { addOrUpdateCollaborator } from "../../api/services/repo-collaborators";
 import { createRepoHook } from "../../api/services/hooks";
+import { ZERO_OID } from "../../api/services/engine";
 import { saveRepoSettings } from "../../api/services/repo-settings";
 import { uploadReleaseAsset } from "../../api/services/release-assets";
 import { findReleaseByTag } from "../../api/services/releases";
@@ -934,5 +935,60 @@ describe("the release-detail render shapes (w129 batch-10: tag links, attachment
     const html = await res.text();
     expect(html).toContain('<div class="render-content markup"></div>');
     expect(html).not.toContain("No description provided."); // the issue page's placeholder never leaks here
+  });
+});
+
+// --- the release_tag_header menu's Tags item (finding F9) ------------------------
+
+describe("the release_tag_header menu's Tags item (F9)", () => {
+  // release_tag_header.tmpl renders the two-item counts menu on EVERY
+  // tplReleasesList render — Releases onto {repo}/releases (active when
+  // PageIsReleaseList && !PageIsSingleTag), Tags onto {repo}/tags (plain
+  // here: our detail is always a REAL release, tag-only rows 404). The
+  // count is the engine refs/tags universe (ReleasesData.numTags' note).
+
+  it("the LIST page renders both menu items: Releases active, Tags plain with the engine tag count", async () => {
+    const { repo } = await theFixture();
+    await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "v1", title: "Counted" });
+
+    const res = await fetchUi("/relmx-owner/rel/releases");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<h2 class="ui compact small menu small-menu-items">');
+    expect(html).toContain('<a class="active item" href="/relmx-owner/rel/releases">');
+    expect(html).toContain('<a class="item" href="/relmx-owner/rel/tags">');
+    expect(html).toContain("1 Tag"); // the fixture's single in-git tag, the singular arm
+  });
+
+  it("the DETAIL page renders the same two-item menu — the F9 tab gap (SingleRelease renders the same header)", async () => {
+    const { repo } = await theFixture();
+    await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "v1", title: "Detail tab" });
+
+    const res = await fetchUi("/relmx-owner/rel/releases/tag/v1");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<h2 class="ui compact small menu small-menu-items">');
+    expect(html).toContain('<a class="active item" href="/relmx-owner/rel/releases">');
+    expect(html).toContain('<a class="item" href="/relmx-owner/rel/tags">');
+    expect(html).toContain("1 Tag");
+  });
+
+  it("a multi-tag repo renders the plural count arm on the detail page", async () => {
+    const { repo } = await theFixture();
+    // The fixture's seed push already ran (the cached cell has a HEAD —
+    // ensureSeededRepo would skip a second push), so the second tag lands
+    // through the tags route's own RPC: a CAS create onto main's tip.
+    const cell = env.REPO.getByName("relmx-owner/rel");
+    const mainTip = (await cell.listRefs()).refs.find((entry) => entry.name === "refs/heads/main")?.target;
+    if (mainTip === undefined) throw new Error("fixture main ref missing");
+    const pushed = await cell.commitApiChange({ ref: "refs/tags/v2", expectedOldOid: ZERO_OID, newOid: mainTip });
+    expect(pushed.tag).toBe("committed");
+    await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "v1", title: "Plural" });
+
+    const res = await fetchUi("/relmx-owner/rel/releases/tag/v1");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<a class="item" href="/relmx-owner/rel/tags">');
+    expect(html).toContain("2 Tags");
   });
 });

@@ -19,6 +19,7 @@ import {
   toApiRepository,
   viewerOf,
 } from "../services/repository";
+import { loadRepoSettings } from "../services/repo-settings";
 import { createUserRepository, findDoerRow, resolveAutoInitReadme } from "../services/user-repos";
 
 /**
@@ -235,6 +236,12 @@ export function registerUserReposRoutes(
     // The CreateUserRepo tail: `convert.ToRepo(ctx, repo, Permission{
     // AccessModeOwner})` — the creator's embedded permissions block is the
     // full owner triple (services/org-repos.ts toCreatedOrgRepository).
-    return c.json(toCreatedOrgRepository(viewer, { repo, owner }), 201);
+    // Upstream reloads the row "to get a real state after creation"
+    // (repo.go:270-274) so the 201 carries the sent description; the settings
+    // read is our equivalent reload (the sweep keeps description in the
+    // repo_settings side table — the create service wrote it above). Without
+    // it the 201 rendered the empty default and dropped the field (F6).
+    const settings = await loadRepoSettings(c.env.DB, repo.id);
+    return c.json(toCreatedOrgRepository(viewer, { repo, owner }, settings), 201);
   });
 }

@@ -7,6 +7,7 @@ import { ApiError } from "../errors";
 import type { Organization } from "../models/organization";
 import type { Repository } from "../models/repository";
 import type { User } from "../models/user";
+import type { RepoSettings } from "./repo-settings";
 import { toApiRepository, type RepositoryWithOwner, type Viewer } from "./repository";
 
 /**
@@ -166,11 +167,20 @@ export async function requireCanCreateOrgRepo(
  * (routers/api/v1/repo/repo.go CreateUserRepo tail) — the creator's embedded
  * permissions block is the full owner triple regardless of the generic
  * viewer matrix (the doer just created the repo; the org-owner doer is not
- * the `ownerNamespace` login the generic predicate matches on).
+ * the `ownerNamespace` login the generic predicate matches on). `settings`
+ * threads the freshly written repo_settings row so the 201 echoes the sent
+ * description (upstream keeps Description on the repository row the handler
+ * reloads — repo.go:270-274 "reload repo from db to get a real state after
+ * creation" — so its response carries it; our sweep stores it in the side
+ * table, and without this read the create body dropped it, F6).
  */
-export function toCreatedOrgRepository(viewer: Viewer, pair: RepositoryWithOwner): Repository {
+export function toCreatedOrgRepository(
+  viewer: Viewer,
+  pair: RepositoryWithOwner,
+  settings?: RepoSettings,
+): Repository {
   return {
-    ...toApiRepository(viewer, pair),
+    ...toApiRepository(viewer, pair, settings),
     permissions: { admin: true, push: true, pull: true },
   };
 }

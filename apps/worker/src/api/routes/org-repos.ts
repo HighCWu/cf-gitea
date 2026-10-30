@@ -14,6 +14,7 @@ import type { User } from "../models/user";
 import { createRepoOptionSchema, repositoryListSchema, repositorySchema } from "../models/repository";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { createUserRepository, resolveAutoInitReadme } from "../services/user-repos";
+import { loadRepoSettings } from "../services/repo-settings";
 import {
   listOrgRepositories,
   orgDoerOf,
@@ -262,10 +263,17 @@ export function registerOrgRoutes(
       });
     }
     return c.json(
-      toCreatedOrgRepository(viewer, {
-        repo,
-        owner: ownerRow,
-      }),
+      toCreatedOrgRepository(
+        viewer,
+        {
+          repo,
+          owner: ownerRow,
+        },
+        // The user-repos create-route note (F6): the 201 echoes the sent
+        // description — upstream's reload-after-create (repo.go:270-274)
+        // carries it off the repository row; ours lives in repo_settings.
+        await loadRepoSettings(c.env.DB, repo.id),
+      ),
       201,
     );
   });
