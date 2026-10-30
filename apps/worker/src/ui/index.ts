@@ -5796,6 +5796,11 @@ async function resolveUiRequest(c: Context<{ Bindings: Env }>): Promise<Resolved
   // re-reads the store for its MustEnableActions 404 arm (the C8 gate's
   // polarity).
   resolved.ctx.repoHasActions = settings.hasActions;
+  // The Wiki unit toggle (P2-4's web-UI arm — the wiki twin of the flags
+  // above, INVERTED polarity: upstream's DefaultRepoUnits INCLUDES TypeWiki
+  // (unit.go:67-77), so absent renders the tab and only explicit false
+  // hides it — header.tmpl:165-169's CanRead gate).
+  resolved.ctx.repoHasWiki = settings.hasWiki;
   // The header trio's viewer state (usability B-4 Stage A): the watch/star
   // probes ride the same request resolution, Promise.all'd — byte-neutral
   // for fixture viewers (no edges), so the goldens' bytes survive.
