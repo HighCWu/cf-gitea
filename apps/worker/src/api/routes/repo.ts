@@ -27,13 +27,22 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
 import { requireRepoAdmin, requireRepoDangerZone, requireVisibleRepo } from "../services/repo-access";
 import { deleteRepoCollaborators } from "../services/repo-collaborators";
-import { deleteRepoSettings, loadRepoSettings, saveRepoSettings, type RepoSettings } from "../services/repo-settings";
+import {
+  deleteRepoSettings,
+  loadRepoSettings,
+  saveRepoSettings,
+  PROJECTS_MODES,
+  SQUASH_MERGE_MESSAGES,
+  validatePullRequestsUpdateSettings,
+  type PullRequestsConfig,
+  type RepoSettingsPatch,
+} from "../services/repo-settings";
 import { deleteRepoTopics } from "../services/repo-topics";
 import { clearRepoWatches, deleteRepoWatchers } from "../services/repo-watchers";
 import { clearRepoStars } from "../services/stars";
 import { emitRepoEvent, repositoryEventIdentity, repositoryEventPayload } from "../../services/repo-events";
 import { syncRepoLicensesForDefaultBranch } from "../../services/repo-licenses";
-import { engineCell } from "../services/engine";
+import { engineCell, engineReads } from "../services/engine";
 import {
   findRepositoryById,
   findRepositoryByPath,
@@ -66,10 +75,14 @@ import {
  * repos service, visibility flip (with upstream's private-flip star/watch
  * zeroing — services/stars.ts clearRepoStars + services/repo-watchers.ts
  * clearRepoWatches), default branch (D1 + best-effort engine
- * setHead), archived flip, the template flag (D1-only — upstream
+ * setHead), archived flip (with the mirror refusal — updateRepoArchivedState
+ * repo.go:985-992), the template flag (D1-only — upstream
  * updateBasicProperties repo.go:699-701), and the stored settings subset;
- * upstream registers
- * NO mustNotBeArchived on this PATCH, so 423 is never emitted here.
+ * since the repoEdit parity wave that subset includes the PR-merge
+ * configuration family + projects_mode (the repo_units config carriers,
+ * updateRepoUnits repo.go:754-985 — services/repo-settings.ts); upstream
+ * registers NO mustNotBeArchived on this PATCH, so 423 is never emitted
+ * here.
  * repoDelete runs the landed §2.5.5 pipeline (D1 cascade → DO tombstone →
  * queue purge) plus the raw-D1 housekeeping of this batch's tables.
  * repoTransfer files the pending `repo_transfer` row via the repos service
@@ -509,47 +522,65 @@ export function registerRepoRoutes(
       }
 
       // Default branch: D1 value + the engine setHead best-effort (the
-      // service logs, never throws). DEVIATION documented: upstream gates the
-      // change on branch existence (an engine read) or an empty repo; ours
-      // applies and lets the engine's own setHead guard reject unknown
-      // branches engine-side while D1 keeps the metadata.
+      // service logs, never throws). The existence gate ports upstream's
+      // `repo.IsEmpty || git.IsBranchExist(...)` conjunct (repo.go:713-746):
+      // on a NON-EMPTY repo an unknown target branch SKIPS the change
+      // silently — the PATCH answers 200 re-rendering the OLD default (no
+      // error arm exists upstream either); an empty repo applies
+      // unconditionally. readCommit(refs/heads/<name>) null IS the
+      // IsBranchExist=false read (the same unborn-ref probe the license walk
+      // rides). Divergence: upstream 500s when the existence READ itself
+      // errors; engineReads is null-on-failure, so an engine outage degrades
+      // to the skip arm (the house never-fail-the-write posture) instead of
+      // failing the PATCH.
       if (form.default_branch !== undefined && form.default_branch !== found.repo.defaultBranch) {
-        const updated = await service.setDefaultBranch(found.repo.id, form.default_branch);
-        // The default-branch license arm (repo.go:713-746): upstream's
-        // enqueuer fires ONLY when the change LANDED — the target branch
-        // exists (or the repo is empty) and the repo is non-empty (the
-        // `!repo.IsEmpty` SetDefaultBranch leg feeding
-        // AddRepoToLicenseUpdaterQueue at :739-746). The settled walk ports
-        // both conditions authoritatively — a resolvable tip IS "existing
-        // branch on a non-empty repo", and an unborn tip answers null and
-        // skips (services/repo-licenses.ts's divergence note: the D1
-        // is_empty flag is stale for the API-created population). Same
-        // never-fail-the-write posture as the branch-create arm
-        // (routes/branches.ts): caught and logged; deferred to waitUntil
-        // when the runtime provides an execution context, inline for
-        // in-process callers (tests) so the leg stays observable.
-        const licenseScan = syncRepoLicensesForDefaultBranch(c.env.DB, engineCell(c.env, updated), updated).catch(
-          (error: unknown) => {
-            console.error(
-              `[repos] ${updated.ownerNamespace}/${updated.slug}: license sync failed (the default-branch change stands): ` +
-                `${errorMessage(error)}`,
-            );
-          },
-        );
-        let execCtx: { waitUntil(promise: Promise<unknown>): void } | undefined;
-        try {
-          execCtx = c.executionCtx;
-        } catch {
-          execCtx = undefined; // in-process caller (tests): run inline
-        }
-        if (execCtx === undefined) {
-          await licenseScan;
-        } else {
-          execCtx.waitUntil(licenseScan);
+        const tip = await engineReads(c.env, found.repo).readCommit(`refs/heads/${form.default_branch}`);
+        if (found.repo.isEmpty || tip !== null) {
+          const updated = await service.setDefaultBranch(found.repo.id, form.default_branch);
+          // The default-branch license arm (repo.go:713-746): upstream's
+          // enqueuer fires ONLY when the change LANDED — the target branch
+          // exists (or the repo is empty) and the repo is non-empty (the
+          // `!repo.IsEmpty` SetDefaultBranch leg feeding
+          // AddRepoToLicenseUpdaterQueue at :739-746). The settled walk ports
+          // both conditions authoritatively — a resolvable tip IS "existing
+          // branch on a non-empty repo", and an unborn tip answers null and
+          // skips (services/repo-licenses.ts's divergence note: the D1
+          // is_empty flag is stale for the API-created population). Same
+          // never-fail-the-write posture as the branch-create arm
+          // (routes/branches.ts): caught and logged; deferred to waitUntil
+          // when the runtime provides an execution context, inline for
+          // in-process callers (tests) so the leg stays observable. (And
+          // with the existence gate above, reaching this block IS "the
+          // change landed" — the conjunct is upstream's, enforced here.)
+          const licenseScan = syncRepoLicensesForDefaultBranch(c.env.DB, engineCell(c.env, updated), updated).catch(
+            (error: unknown) => {
+              console.error(
+                `[repos] ${updated.ownerNamespace}/${updated.slug}: license sync failed (the default-branch change stands): ` +
+                  `${errorMessage(error)}`,
+              );
+            },
+          );
+          let execCtx: { waitUntil(promise: Promise<unknown>): void } | undefined;
+          try {
+            execCtx = c.executionCtx;
+          } catch {
+            execCtx = undefined; // in-process caller (tests): run inline
+          }
+          if (execCtx === undefined) {
+            await licenseScan;
+          } else {
+            execCtx.waitUntil(licenseScan);
+          }
         }
       }
 
       // Archived flip (repositories.is_archived, SPEC-0003 §2.4 row 10).
+      // Upstream's mirror refusal rides FIRST (updateRepoArchivedState,
+      // repo.go:985-992: `repo is a mirror, cannot archive/un-archive`,
+      // 422 through ctx.APIError — a declared-422 validationError).
+      if (form.archived !== undefined && found.repo.isMirror) {
+        throw new ApiError(422, "repo is a mirror, cannot archive/un-archive");
+      }
       if (form.archived !== undefined && form.archived !== found.repo.isArchived) {
         await drizzle(c.env.DB)
           .update(repositories)
@@ -570,8 +601,15 @@ export function registerRepoRoutes(
           .where(eq(repositories.id, found.repo.id));
       }
 
-      // The stored settings subset: description/website + has_* unit flags.
-      const settingsPatch: Partial<RepoSettings> = {};
+      // The stored settings subset: description/website + has_* unit flags,
+      // now including the PR-merge configuration and projects_mode (the
+      // repoEdit parity wave — upstream updateRepoUnits, repo.go:754-985,
+      // the review's E3 accepted-and-ignored drift closed). The stored
+      // settings are read FIRST: the merge-flag merge and the update-style
+      // validation both run against the would-be config (upstream's
+      // optional.AssignPtrValue arms mutate the LOADED unit config).
+      const currentSettings = await loadRepoSettings(c.env.DB, found.repo.id);
+      const settingsPatch: RepoSettingsPatch = {};
       if (form.description !== undefined) settingsPatch.description = form.description;
       if (form.website !== undefined) settingsPatch.website = form.website;
       if (form.has_issues !== undefined) settingsPatch.hasIssues = form.has_issues;
@@ -581,6 +619,77 @@ export function registerRepoRoutes(
       if (form.has_projects !== undefined) settingsPatch.hasProjects = form.has_projects;
       if (form.has_packages !== undefined) settingsPatch.hasPackages = form.has_packages;
       if (form.has_actions !== undefined) settingsPatch.hasActions = form.has_actions;
+
+      // The PR-unit merge configuration (EditRepoOption's allow_-prefixed
+      // and default_-prefixed fields → PullRequestsConfig). Upstream
+      // short-circuits the whole config block when has_pull_requests is
+      // EXPLICITLY false (mustDeletePullRequestUnit, repo.go:843-846) — a
+      // body carrying both persists the delete and silently drops the
+      // flags, faithfully.
+      if (form.has_pull_requests !== false) {
+        const pr: Partial<PullRequestsConfig> = {};
+        if (form.ignore_whitespace_conflicts !== undefined) pr.IgnoreWhitespaceConflicts = form.ignore_whitespace_conflicts;
+        if (form.allow_merge_commits !== undefined) pr.AllowMerge = form.allow_merge_commits;
+        if (form.allow_rebase !== undefined) pr.AllowRebase = form.allow_rebase;
+        if (form.allow_rebase_explicit !== undefined) pr.AllowRebaseMerge = form.allow_rebase_explicit;
+        if (form.allow_squash_merge !== undefined) pr.AllowSquash = form.allow_squash_merge;
+        if (form.allow_fast_forward_only_merge !== undefined) pr.AllowFastForwardOnly = form.allow_fast_forward_only_merge;
+        if (form.allow_manual_merge !== undefined) pr.AllowManualMerge = form.allow_manual_merge;
+        if (form.autodetect_manual_merge !== undefined) pr.AutodetectManualMerge = form.autodetect_manual_merge;
+        if (form.allow_merge_update !== undefined) pr.AllowMergeUpdate = form.allow_merge_update;
+        if (form.allow_rebase_update !== undefined) pr.AllowRebaseUpdate = form.allow_rebase_update;
+        if (form.default_delete_branch_after_merge !== undefined)
+          pr.DefaultDeleteBranchAfterMerge = form.default_delete_branch_after_merge;
+        if (form.default_allow_maintainer_edit !== undefined)
+          pr.DefaultAllowMaintainerEdit = form.default_allow_maintainer_edit;
+        if (form.default_merge_style !== undefined) pr.DefaultMergeStyle = form.default_merge_style;
+        if (form.default_update_style !== undefined) pr.DefaultUpdateStyle = form.default_update_style;
+        if (form.squash_merge_commit_message !== undefined)
+          pr.DefaultSquashMergeMessage = form.squash_merge_commit_message;
+        if (Object.keys(pr).length > 0) {
+          // The squash-message enum (repo.go:950-952 → SquashMergeMessage.
+          // IsValid, models/repo/git.go:51-53): APIErrorAuto renders
+          // ErrInvalidArgument as HTTP 400 (runtime-only status — the
+          // vendored contract declares {200,403,404,422}, upstream's own
+          // declaration included; the RUNTIME_ONLY_RESPONSES pattern).
+          if (
+            form.squash_merge_commit_message !== undefined &&
+            !SQUASH_MERGE_MESSAGES.includes(form.squash_merge_commit_message)
+          ) {
+            throw new ApiError(400, `invalid squash_merge_commit_message: ${form.squash_merge_commit_message}`);
+          }
+          // The update-style trio (repo.go:953-961 → ValidateUpdateSettings,
+          // models/repo/repo_unit.go:194-206) — gated on the caller actually
+          // touching one of the three fields, so unrelated PATCHes don't
+          // reject historical configs. Same 400-through-ErrInvalidArgument.
+          if (
+            form.allow_merge_update !== undefined ||
+            form.allow_rebase_update !== undefined ||
+            form.default_update_style !== undefined
+          ) {
+            const error = validatePullRequestsUpdateSettings({ ...currentSettings.prUnit, ...pr });
+            if (error !== null) {
+              throw new ApiError(400, error);
+            }
+          }
+          settingsPatch.prUnit = pr;
+        }
+      }
+
+      // projects_mode (EditRepoOption binding `In(repo,owner,all)`,
+      // structs/repo.go:225-227): the binding validates the value whenever
+      // present (422 validationError on a miss), but the CONFIG ARM only
+      // runs when has_projects=true rides the SAME PATCH
+      // (updateRepoUnits, repo.go:968-989 — `opts.ProjectsMode != nil` is
+      // nested inside the `*opts.HasProjects` branch). A bare
+      // projects_mode PATCH is a validated no-op, faithfully.
+      if (form.projects_mode !== undefined && !PROJECTS_MODES.includes(form.projects_mode)) {
+        throw new ApiError(422, "projects_mode must be one of: repo, owner, all");
+      }
+      if (form.has_projects === true && form.projects_mode !== undefined) {
+        settingsPatch.projectsMode = form.projects_mode;
+      }
+
       if (Object.keys(settingsPatch).length > 0) {
         await saveRepoSettings(c.env.DB, found.repo.id, settingsPatch, now);
       }

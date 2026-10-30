@@ -244,16 +244,24 @@ export type CreateRepoOption = z.infer<typeof createRepoOptionSchema>;
  * both halves):
  *  - applied: `name` (rename via the landed repos service), `description`,
  *    `website`, `private` (visibility flip), `default_branch` (D1 value +
- *    best-effort engine setHead), `archived`, and the has_* unit flags that
- *    drive the 412 feature gates (`has_issues`/`has_wiki`/`has_pull_requests`
- *    /`has_releases`/`has_projects`/`has_packages`/`has_actions` via
- *    services/repo-settings.ts);
- *  - accepted-and-ignored (no store yet — SPEC-0005 sweep): the PR-merge
- *    configuration flags, `template`, `projects_mode`,
- *    `ignore_whitespace_conflicts`, `default_*_merge_style` family,
- *    `squash_merge_commit_message`, `autodetect_manual_merge`,
- *    `default_allow_maintainer_edit`, `default_delete_branch_after_merge`,
- *    `has_code`, and the mirror fields (`mirror_interval`, `enable_prune`,
+ *    best-effort engine setHead), `archived` (with the mirror refusal),
+ *    `template`, and the has_* unit flags that drive the 412 feature gates
+ *    (`has_issues`/`has_wiki`/`has_pull_requests`/`has_releases`
+ *    /`has_projects`/`has_packages`/`has_actions` via
+ *    services/repo-settings.ts) — plus, since the repoEdit parity wave, the
+ *    PR-merge configuration family (`allow_merge_commits`, `allow_rebase`,
+ *    `allow_rebase_explicit`, `allow_squash_merge`,
+ *    `allow_fast_forward_only_merge`, `allow_manual_merge`,
+ *    `autodetect_manual_merge`, `allow_merge_update`,
+ *    `allow_rebase_update`, `default_delete_branch_after_merge`,
+ *    `default_allow_maintainer_edit`, `default_merge_style`,
+ *    `default_update_style`, `squash_merge_commit_message`,
+ *    `ignore_whitespace_conflicts` — the repo_units 'pull_requests' row's
+ *    PullRequestsConfig, upstream updateRepoUnits repo.go:855-966) and
+ *    `projects_mode` (the 'projects' row's ProjectsConfig, repo.go:968-989);
+ *  - accepted-and-ignored (no store yet — SPEC-0005 sweep): `has_code`
+ *    (needs the creation-seeded code unit row — see services/repo-settings.ts)
+ *    and the mirror fields (`mirror_interval`, `enable_prune`,
  *    `mirror_username`/`mirror_password`/`mirror_token`);
  *  - the `external_tracker`/`external_wiki`/`internal_tracker` objects are
  *    accepted per shape and ignored the same way.

@@ -830,6 +830,12 @@ export interface IssueListFilters {
   before: number | null;
   /** Poster id filter (created_by). */
   posterId?: number | null;
+  /** Assignee id filter (assigned_by) — upstream `applyAssigneeCondition`
+   *  (models/issues/issue_search.go:373-383): issues carrying an
+   *  `issue_assignees` row for the user (the INNER JOIN as an id-IN
+   *  subquery). Applies to pulls too — upstream's condition is
+   *  unit-agnostic, and the PATCH assignees arm stores both. */
+  assigneeId?: number | null;
   page: number;
   limit: number;
 }
@@ -957,6 +963,21 @@ function issueFilterConditions(d1: D1Database, repoIds: string[], filters: Issue
   }
   if (filters.posterId !== undefined && filters.posterId !== null) {
     conditions.push(eq(issues.posterId, filters.posterId));
+  }
+  if (filters.assigneeId !== undefined && filters.assigneeId !== null) {
+    // applyAssigneeCondition's numeric arm (issue_search.go:379-381): INNER
+    // JOIN issue_assignees ON issue.id AND assignee_id = ? — the id-IN
+    // subquery is the same row set, composed with the AND chain like
+    // upstream's session joins.
+    conditions.push(
+      inArray(
+        issues.id,
+        drizzle(d1)
+          .select({ issueId: issueAssignees.issueId })
+          .from(issueAssignees)
+          .where(eq(issueAssignees.assigneeId, filters.assigneeId)),
+      ),
+    );
   }
   if (filters.labelIds.length > 0) {
     // Any-of semantics (indexer IncludedLabelIDs → OR-join).

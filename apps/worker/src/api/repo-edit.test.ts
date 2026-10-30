@@ -262,6 +262,212 @@ describe("PATCH /repos/{owner}/{repo} (repoEdit) — stored settings subset", ()
   });
 });
 
+describe("PATCH /repos/{owner}/{repo} (repoEdit) — the PR-merge configuration (updateRepoUnits, repo.go:855-966)", () => {
+  /** The repo_units 'pull_requests' config row, if any. */
+  const prUnitRow = async () =>
+    (
+      await drizzle(env.DB)
+        .select()
+        .from(repoUnits)
+        .where(and(eq(repoUnits.repoId, "7401"), eq(repoUnits.type, "pull_requests")))
+        .all()
+    )[0];
+
+  it("round-trips the merge flags PATCH → GET (the E3 accepted-and-ignored drift closed)", async () => {
+    const patch = await makeApp()(repoPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({
+        allow_squash_merge: false,
+        allow_merge_commits: false,
+        ignore_whitespace_conflicts: true,
+        default_merge_style: "rebase",
+        default_allow_maintainer_edit: false,
+        default_delete_branch_after_merge: true,
+      }),
+    });
+    expect(patch.status).toBe(200);
+    await expect(patch.json<Record<string, unknown>>()).resolves.toMatchObject({
+      allow_squash_merge: false,
+      allow_merge_commits: false,
+      ignore_whitespace_conflicts: true,
+      default_merge_style: "rebase",
+      default_allow_maintainer_edit: false,
+      default_delete_branch_after_merge: true,
+    });
+
+    const get = await makeApp()(repoPath);
+    await expect(get.json<Record<string, unknown>>()).resolves.toMatchObject({
+      allow_squash_merge: false,
+      allow_merge_commits: false,
+      ignore_whitespace_conflicts: true,
+      default_merge_style: "rebase",
+      default_allow_maintainer_edit: false,
+      default_delete_branch_after_merge: true,
+      // Untouched fields keep the upstream defaults (DefaultPullRequestsConfig).
+      allow_rebase: true,
+      allow_rebase_explicit: true,
+      allow_fast_forward_only_merge: true,
+      allow_merge_update: true,
+      allow_rebase_update: true,
+    });
+
+    // The store: the repo_units 'pull_requests' row's config JSON carries the
+    // GO MARSHAL keys (repo_unit.go:167-170 — the ActionsConfig convention).
+    const row = await prUnitRow();
+    expect(row?.config).toBeTruthy();
+    expect(JSON.parse(row!.config!)).toMatchObject({ AllowSquash: false, AllowMerge: false, IgnoreWhitespaceConflicts: true });
+  });
+
+  it("overlay-merges: a second PATCH touching only description keeps the stored config", async () => {
+    await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ allow_rebase: false }) });
+    const second = await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ description: "later" }) });
+    expect(second.status).toBe(200);
+    await expect(second.json<Record<string, unknown>>()).resolves.toMatchObject({ allow_rebase: false, allow_merge_commits: true });
+  });
+
+  it("400s an invalid squash_merge_commit_message and persists nothing (repo.go:950-952)", async () => {
+    const res = await makeApp()(repoPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ squash_merge_commit_message: "NOPE" }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json<{ message: string }>()).message).toBe("invalid squash_merge_commit_message: NOPE");
+    // The rejected write left no unit row — the config block never persisted.
+    expect(await prUnitRow()).toBeUndefined();
+    expect((await (await makeApp()(repoPath)).json<Record<string, unknown>>()).squash_merge_commit_message).toBe("PR_BODY");
+  });
+
+  it("400s the update-style violations and 200s the valid combo (ValidateUpdateSettings, repo_unit.go:194-206)", async () => {
+    const bad = async (body: Record<string, unknown>, message: string) => {
+      const res = await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify(body) });
+      expect(res.status).toBe(400);
+      expect((await res.json<{ message: string }>()).message).toBe(message);
+    };
+    await bad({ default_update_style: "squash" }, "default update style must be merge or rebase");
+    await bad(
+      { allow_merge_update: false, allow_rebase_update: false },
+      "at least one pull request branch update style must be enabled",
+    );
+    await bad({ allow_merge_update: false, default_update_style: "merge" }, "default update style must be enabled");
+    await bad({ allow_rebase_update: false, default_update_style: "rebase" }, "default update style must be enabled");
+
+    // The valid combo: rebase update allowed by its own flag.
+    const good = await makeApp()(repoPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ allow_rebase_update: true, default_update_style: "rebase" }),
+    });
+    expect(good.status).toBe(200);
+    await expect(good.json<Record<string, unknown>>()).resolves.toMatchObject({
+      default_update_style: "rebase",
+      allow_rebase_update: true,
+    });
+  });
+
+  it("skips the update-style validation on unrelated PATCHes over a historical inconsistent config (repo.go:953-961's gate)", async () => {
+    await drizzle(env.DB).insert(repoUnits).values({
+      repoId: "7401",
+      type: "pull_requests",
+      config: JSON.stringify({ AllowMergeUpdate: false, AllowRebaseUpdate: false, DefaultUpdateStyle: "rebase" }),
+    });
+    // No update-style field in the body → the trio is not validated.
+    const unrelated = await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ description: "x" }) });
+    expect(unrelated.status).toBe(200);
+    // Touching one of the trio validates the MERGED config — the stored
+    // inconsistent flags fail it even though the PATCH only names the style.
+    const touching = await makeApp()(repoPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ default_update_style: "rebase" }),
+    });
+    expect(touching.status).toBe(400);
+    expect((await touching.json<{ message: string }>()).message).toBe(
+      "at least one pull request branch update style must be enabled",
+    );
+  });
+
+  it("has_pull_requests=false deletes the config row; re-enabling starts fresh (repo.go:843-846, 955-965)", async () => {
+    await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ allow_squash_merge: false }) });
+    expect(await prUnitRow()).toBeDefined();
+    const off = await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ has_pull_requests: false }) });
+    expect(off.status).toBe(200);
+    expect(await prUnitRow()).toBeUndefined();
+    // A merge flag riding the disable PATCH is dropped with the unit
+    // (upstream short-circuits the config arm on mustDeletePullRequestUnit).
+    const offWithFlags = await makeApp()(repoPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ has_pull_requests: false, allow_merge_commits: false }),
+    });
+    expect(offWithFlags.status).toBe(200);
+    expect(await prUnitRow()).toBeUndefined();
+    // Re-enable inserts the unit with the DEFAULTS (config was wiped).
+    const on = await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ has_pull_requests: true }) });
+    expect(on.status).toBe(200);
+    const reEnabled = await prUnitRow();
+    expect(reEnabled?.config).toBeTruthy();
+    expect(JSON.parse(reEnabled!.config!)).toMatchObject({ AllowSquash: true, AllowMerge: true });
+    expect((await (await makeApp()(repoPath)).json<Record<string, unknown>>()).allow_squash_merge).toBe(true);
+  });
+
+  it("applies projects_mode only alongside has_projects=true and 422s an invalid mode (repo.go:968-989)", async () => {
+    // The binding validates whenever present...
+    const invalid = await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ projects_mode: "both" }) });
+    expect(invalid.status).toBe(422);
+    // ...but the config arm is nested inside the has_projects branch — a bare
+    // projects_mode PATCH is a validated no-op.
+    const bare = await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ projects_mode: "owner" }) });
+    expect(bare.status).toBe(200);
+    expect((await bare.json<Record<string, unknown>>()).projects_mode).toBe("all");
+    // Riding has_projects=true it persists and round-trips.
+    const withFlag = await makeApp()(repoPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ has_projects: true, projects_mode: "owner" }),
+    });
+    expect(withFlag.status).toBe(200);
+    await expect(withFlag.json<Record<string, unknown>>()).resolves.toMatchObject({ has_projects: true, projects_mode: "owner" });
+    expect((await (await makeApp()(repoPath)).json<Record<string, unknown>>()).projects_mode).toBe("owner");
+    // Disabling deletes the unit row (mode wiped with it).
+    await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ has_projects: false }) });
+    expect(
+      (await drizzle(env.DB).select().from(repoUnits).where(and(eq(repoUnits.repoId, "7401"), eq(repoUnits.type, "projects"))).all()),
+    ).toEqual([]);
+    expect((await (await makeApp()(repoPath)).json<Record<string, unknown>>()).projects_mode).toBe("all");
+  });
+
+  it("422s archiving a mirror (updateRepoArchivedState, repo.go:985-992)", async () => {
+    await drizzle(env.DB).insert(repositories).values({
+      id: "7402",
+      storageKey: "r_7402",
+      ownerNamespace: "cf-gitea-stub",
+      ownerId: 1,
+      slug: "mirror-me",
+      visibility: "public",
+      refsVersion: 1,
+      backend: "self-hosted",
+      isMirror: true,
+      createdAt: new Date(),
+    });
+    const res = await makeApp()("/repos/cf-gitea-stub/mirror-me", {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ archived: true }),
+    });
+    expect(res.status).toBe(422);
+    expect((await res.json<{ message: string }>()).message).toBe("repo is a mirror, cannot archive/un-archive");
+    // Unrelated mirror PATCHes sail through — the refusal is archived-only.
+    const other = await makeApp()("/repos/cf-gitea-stub/mirror-me", {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ description: "still editable" }),
+    });
+    expect(other.status).toBe(200);
+  });
+});
+
 describe("PATCH /repos/{owner}/{repo} (repoEdit) — rename, visibility, default branch, archived", () => {
   it("renames via the landed service: new URL 200, old URL 404, redirect row kept", async () => {
     const res = await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ name: "Renamed" }) });
@@ -321,6 +527,24 @@ describe("PATCH /repos/{owner}/{repo} (repoEdit) — rename, visibility, default
     expect((await res.json<Record<string, unknown>>()).archived).toBe(true);
     // Still editable (no mustNotBeArchived on repoEdit).
     expect((await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ archived: false }) })).status).toBe(200);
+  });
+
+  it("skips an unknown default_branch on a non-empty repo; an empty repo applies it (repo.go:713-746's IsBranchExist conjunct)", async () => {
+    // The seeded 7401 row is EMPTY (the schema default) — the IsEmpty arm
+    // applies the change without an engine probe.
+    const empty = await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ default_branch: "trunk" }) });
+    expect(empty.status).toBe(200);
+    expect((await empty.json<Record<string, unknown>>()).default_branch).toBe("trunk");
+    // A non-empty repo with an unborn target keeps the OLD default — the
+    // silent skip (no error arm exists upstream either; the 200 re-renders
+    // the unchanged row).
+    await drizzle(env.DB).update(repositories).set({ isEmpty: false }).where(eq(repositories.id, "7401"));
+    const skip = await makeApp()(repoPath, { method: "PATCH", headers: jsonAuth, body: JSON.stringify({ default_branch: "ghost" }) });
+    expect(skip.status).toBe(200);
+    expect((await skip.json<Record<string, unknown>>()).default_branch).toBe("trunk");
+    // An EXISTING branch lands (the tip read resolves — the repo's cell
+    // carries the seeded pack from the license arm's flow is not needed; the
+    // empty-repo arm already proves the apply path).
   });
 
   it("403s a non-admin, grants a collaborator-admin, and 422s a wrong-typed body", async () => {

@@ -881,26 +881,38 @@ export function toApiRepository(
     has_wiki: settings?.hasWiki ?? true,
     has_pull_requests: settings?.hasPullRequests ?? true,
     has_projects: settings?.hasProjects ?? false,
-    projects_mode: "all",
+    // The TypeProjects unit's stored ProjectsConfig.ProjectsMode
+    // (repo-settings.ts projectsMode; upstream renders the unit's config at
+    // convert/repository.go:128-134, "all" when the unit is missing).
+    projects_mode: settings?.projectsMode ?? "all",
     has_releases: settings?.hasReleases ?? true,
     has_packages: settings?.hasPackages ?? false,
     has_actions: settings?.hasActions ?? false,
-    ignore_whitespace_conflicts: false,
-    // PR-unit defaults from upstream DefaultPullRequestsConfig + ToRepo.
-    allow_merge_commits: true,
-    allow_rebase: true,
-    allow_rebase_explicit: true,
-    allow_squash_merge: true,
-    allow_fast_forward_only_merge: true,
-    allow_merge_update: true,
-    allow_rebase_update: true,
-    allow_manual_merge: true,
-    autodetect_manual_merge: false,
-    default_delete_branch_after_merge: false,
-    default_merge_style: DEFAULT_MERGE_STYLE,
-    default_update_style: DEFAULT_UPDATE_STYLE,
-    squash_merge_commit_message: DEFAULT_SQUASH_MERGE_MESSAGE,
-    default_allow_maintainer_edit: true,
+    // The stored PR-unit config (the repo_units 'pull_requests' row via the
+    // settings overlay — services/repo-settings.ts prUnit, upstream
+    // `unit.PullRequestsConfig()` at convert/repository.go:107-126). The
+    // fallbacks keep the sync-path posture (list/search callers pass no
+    // settings) and render upstream's DefaultPullRequestsConfig values
+    // (repo_unit.go:139-156). NOTE allow_manual_merge renders FALSE — the
+    // normal-repo default (AllowManualMerge is the struct's zero value);
+    // the pre-wave hardcoded `true` was the unit-less ToRepo fallback
+    // (convert/repository.go:103), the wrong one of upstream's two
+    // postures.
+    ignore_whitespace_conflicts: settings?.prUnit.IgnoreWhitespaceConflicts ?? false,
+    allow_merge_commits: settings?.prUnit.AllowMerge ?? true,
+    allow_rebase: settings?.prUnit.AllowRebase ?? true,
+    allow_rebase_explicit: settings?.prUnit.AllowRebaseMerge ?? true,
+    allow_squash_merge: settings?.prUnit.AllowSquash ?? true,
+    allow_fast_forward_only_merge: settings?.prUnit.AllowFastForwardOnly ?? true,
+    allow_merge_update: settings?.prUnit.AllowMergeUpdate ?? true,
+    allow_rebase_update: settings?.prUnit.AllowRebaseUpdate ?? true,
+    allow_manual_merge: settings?.prUnit.AllowManualMerge ?? false,
+    autodetect_manual_merge: settings?.prUnit.AutodetectManualMerge ?? false,
+    default_delete_branch_after_merge: settings?.prUnit.DefaultDeleteBranchAfterMerge ?? false,
+    default_merge_style: settings?.prUnit.DefaultMergeStyle ?? DEFAULT_MERGE_STYLE,
+    default_update_style: settings?.prUnit.DefaultUpdateStyle ?? DEFAULT_UPDATE_STYLE,
+    squash_merge_commit_message: settings?.prUnit.DefaultSquashMergeMessage ?? DEFAULT_SQUASH_MERGE_MESSAGE,
+    default_allow_maintainer_edit: settings?.prUnit.DefaultAllowMaintainerEdit ?? true,
     avatar_url: "",
     internal: false,
     // The mirror schedule triple upstream gates on BOTH arms
