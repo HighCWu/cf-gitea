@@ -4,7 +4,7 @@ import { alias } from "drizzle-orm/sqlite-core";
 
 import { orgMembers, users } from "../../db/schema";
 import type { AuthUser } from "../../auth/auth-context";
-import { apiUserFromRow, type ApiUserRow, type Viewer } from "./repository";
+import { apiUserFromRow, apiUserFromRowWithCounts, type ApiUserRow, type Viewer } from "./repository";
 import { isFollowing } from "./follows";
 import type { User } from "../models/user";
 
@@ -163,9 +163,29 @@ function canSeeUserCondition(doer: UserVisibilityDoer): SQL {
  * (is_admin/active/prohibit_login/last_login/language/login_name/source_id);
  * the gated columns that do not exist yet render documented zero/defaults
  * with TODO markers instead of inventing schema.
+ *
+ * This sync render keeps the query-flat zero-defaults for the follow counts
+ * (list callers cannot afford per-row count queries); the single-row GET
+ * wiring (`GET /users/{username}`) is the route owner's one-line swap to
+ * `toApiUserWithCounts` below — the canonical `apiUserFromRowWithCounts`
+ * precedent (repository.ts), same pattern as `toApiRepositoryFull`.
  */
 export function toApiUser(viewer: Viewer, row: UserRow): User {
   return apiUserFromRow(row, viewer);
+}
+
+/**
+ * `toApiUser` with the async follow-count arm resolved
+ * (`apiUserFromRowWithCounts`, services/repository.ts): the rendered
+ * `followers_count`/`following_count` are the requester-visible totals —
+ * the profile page's own numbers (upstream profile.go:118-138 over the
+ * GetUserFollowers/GetUserFollowing FindAndCount, models/user/user.go:357-402;
+ * upstream's API renders maintained columns we do not have — see
+ * `ApiUserFollowCounts`). Single-row GETs only; list routes keep the sync
+ * render.
+ */
+export async function toApiUserWithCounts(d1: D1Database, viewer: Viewer, row: UserRow): Promise<User> {
+  return apiUserFromRowWithCounts(d1, row, viewer);
 }
 
 /**

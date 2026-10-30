@@ -49,6 +49,25 @@ describe("seedIdentity — the multi-identity mint", () => {
     expect(bob.user).toMatchObject({ id: bob.id, login: "bob" });
   });
 
+  it("the projection rides the canonical authUserToApiUser render (username key, row-derived relative URLs)", async () => {
+    const alice = await seedIdentity({ username: "alice" });
+
+    expect(alice.user).toMatchObject({
+      id: alice.id,
+      login: "alice",
+      username: "alice", // the MarshalJSON compat key (structs/user.go:67-73) — the canonical render carries it
+      avatar_url: "/avatars/alice", // the ""-origin relative shape (toApiUser's origin ?? "" arm, api/auth.ts)
+      html_url: "/alice",
+      visibility: "public", // the row's column, not the old copy's hardcoded default
+      type: "User",
+      active: true,
+      is_admin: false,
+      followers_count: 0, // the sync identity path runs no count queries (apiUserFromRow's zero-defaults)
+      following_count: 0,
+      last_login: "0001-01-01T00:00:00Z", // no users column yet; upstream authed-gates it (convert/user.go:118-124)
+    });
+  });
+
   it("issues REAL tokens — each verifies through the production TokenService to its own user", async () => {
     const admin = await seedIdentity({ username: "root", isAdmin: true });
     const peer = await seedIdentity({ username: "peer" });

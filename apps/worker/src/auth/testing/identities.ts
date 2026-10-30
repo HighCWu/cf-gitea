@@ -30,6 +30,8 @@ import { env } from "cloudflare:workers";
 
 import { STUB_USER, createStubAuthResolver, type AuthResolver } from "../../api/auth";
 import type { User } from "../../api/models/user";
+import { authUserToApiUser } from "../../api/services/user";
+import type { AuthUser } from "../../auth/auth-context";
 import { users } from "../../db/schema";
 import { mintFor, seedVerifiedUser, type SeedUserOptions } from "./seeds";
 
@@ -59,38 +61,41 @@ export interface SeedIdentityOptions extends SeedUserOptions {
 }
 
 /**
- * The contract-`User` projection the token-identity path applies: mirrors the
- * PRIVATE `toApiUser(AuthUser)` inside src/api/auth.ts (the projection
- * `identityFrom` uses for a resolved doer) — truthful is_admin/active/
- * prohibit_login, the caller's self-view. Kept in sync with that helper by
- * convention; swap to importing it if it is ever exported.
+ * The contract-`User` projection the token-identity path applies: the
+ * CANONICAL `authUserToApiUser` (api/services/user.ts) — the SAME converter
+ * the production auth middlewares' `identityFrom` rides — rendered from the
+ * `AuthUser` slice `rowToUser` (auth/token-service.ts) builds, mapped
+ * literally from the row. Upstream converts the doer as
+ * `ToUser(ctx.Doer, ctx.Doer)` (routers/api/v1/user/userGetCurrent), so the
+ * self-viewer shape renders the row's real values through
+ * `apiUserFromRow`'s authed arm (truthful is_admin/active/prohibit_login,
+ * email, visibility, type, the username compat key, the row-derived URLs) —
+ * the old convention-synced copy of the pre-canonical serializer is deleted
+ * (it had already drifted: no `username` key, hardcoded "public"/"en-US"/
+ * empty URLs while the canonical render grew row-derived values).
+ *
+ * `origin` is "" — the rig mints outside any request, so avatar/html render
+ * the same relative shape the production helper produces when no origin is
+ * known (`toApiUser`'s `origin ?? ""` arm, api/auth.ts).
  */
 export function identityUserFromRow(row: UserRow): User {
-  return {
+  const authUser: AuthUser = {
     id: row.id,
-    login: row.username,
-    email: row.email ?? "",
-    full_name: row.displayName ?? "",
-    avatar_url: "",
-    html_url: "",
-    language: "en-US",
-    location: "",
-    website: "",
-    description: "",
-    active: row.status === "active",
-    is_admin: row.isAdmin,
-    prohibit_login: row.status === "prohibited",
-    restricted: false,
-    login_name: "",
-    source_id: 0,
-    followers_count: 0,
-    following_count: 0,
-    starred_repos_count: 0,
-    created: row.createdAt.toISOString(),
-    last_login: "0001-01-01T00:00:00Z",
-    type: "User",
-    visibility: "public",
+    username: row.username,
+    usernameLower: row.usernameLower,
+    email: row.email,
+    displayName: row.displayName,
+    location: row.location,
+    website: row.website,
+    description: row.description,
+    isAdmin: row.isAdmin,
+    status: row.status,
+    createdAt: row.createdAt,
+    type: row.type,
+    visibility: row.visibility,
+    numStars: row.numStars,
   };
+  return authUserToApiUser(authUser, "");
 }
 
 /**

@@ -24,6 +24,8 @@ import { follows, orgMembers, users } from "../db/schema";
 import { STUB_USER } from "./auth";
 import { createApiRouter } from "./router";
 import { contractModelProperties } from "../compat/contract/frozen-contract";
+import type { Viewer } from "./services/repository";
+import { toApiUserWithCounts } from "./services/user";
 import { mintFor, resetAuthTables } from "../auth/testing/seeds";
 import { mintSession, SESSION_COOKIE_NAME } from "../ui/session";
 
@@ -207,8 +209,8 @@ describe("GET /users/{username} (userGet)", () => {
       active: false, // authed-gated upstream — Go-zero for anonymous viewers
       is_admin: false,
       prohibit_login: false,
-      last_login: "0001-01-01T00:00:00Z",
-      followers_count: 0,
+      last_login: "0001-01-01T00:00:00Z", // no users column yet; upstream gates it to self/admin (convert/user.go:118-124)
+      followers_count: 0, // the sync route render — toApiUserWithCounts carries the per-viewer totals
       following_count: 0,
       starred_repos_count: 0,
     });
@@ -260,6 +262,102 @@ describe("GET /users/{username} (userGet)", () => {
 
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ message: "not found", url: ERROR_URL });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The serializer's follow counts (toApiUserWithCounts →
+// resolveApiUserFollowCounts, services/repository.ts) — the SAME
+// visibility-filtered FindAndCount the profile page renders
+// (upstream profile.go:118-138 over GetUserFollowers/GetUserFollowing,
+// models/user/user.go:357-402; upstream's API converter renders maintained
+// num_followers/num_following columns that the D1 users row does not have,
+// so the API renders the requester-visible totals instead —
+// ApiUserFollowCounts' docstring). Service-level pins: the routes keep the
+// query-flat sync render (the zero-defaults above); the wiring is the route
+// owner's one-line swap, the toApiRepositoryFull precedent.
+// ---------------------------------------------------------------------------
+
+const VIEWER_ORIGIN = "https://example.com";
+const anonViewer: Viewer = { origin: VIEWER_ORIGIN, requester: null };
+const doerViewer = (id: number, login: string, isAdmin = false): Viewer => ({
+  origin: VIEWER_ORIGIN,
+  requester: { id, login, is_admin: isAdmin },
+});
+
+describe("the serializer's follow counts (toApiUserWithCounts — per-requester visibility)", () => {
+  /** alice's followers: Bob (public), Lim (limited), Priv (private — and Priv
+   *  FOLLOWS alice, the listing's followers-of-viewer arm). alice follows Bob
+   *  and the org (following includes orgs — user.go:379-398). Carol is the
+   *  unrelated stranger/admin. */
+  async function seedCountGraph() {
+    const alice = await seedUser("Alice");
+    const bob = await seedUser("Bob");
+    const lim = await seedUser("Lim", { visibility: "limited" });
+    const priv = await seedUser("Priv", { visibility: "private" });
+    const carol = await seedUser("Carol");
+    const admin = await seedUser("root", { isAdmin: true });
+    const org = await seedOrg("acme");
+    await addFollow(bob.id, alice.id); // Bob → alice
+    await addFollow(lim.id, alice.id); // Lim → alice
+    await addFollow(priv.id, alice.id); // Priv → alice (priv follows alice)
+    await addFollow(alice.id, bob.id); // alice → Bob
+    await addFollow(alice.id, org.id); // alice → acme (org among the followed)
+    const rows = await db().select().from(users).where(eq(users.usernameLower, "alice")).all();
+    const aliceRow = rows[0];
+    if (aliceRow === undefined) throw new Error("alice row missing after seed");
+    return { alice, bob, lim, priv, carol, admin, org, aliceRow };
+  }
+
+  it("anonymous counts public-type followers only (the listing ceiling)", async () => {
+    const { aliceRow } = await seedCountGraph();
+
+    const user = await toApiUserWithCounts(env.DB, anonViewer, aliceRow);
+
+    expect(user.followers_count).toBe(1); // Bob; Lim + Priv fail the public-only ceiling
+    expect(user.following_count).toBe(2); // Bob + the org (both public)
+  });
+
+  it("the self viewer counts everything visible to them — the private follower included", async () => {
+    const { alice, aliceRow } = await seedCountGraph();
+
+    const user = await toApiUserWithCounts(env.DB, doerViewer(alice.id, "Alice"), aliceRow);
+
+    // Bob + Lim (non-private) + Priv (Priv follows alice — the
+    // followers-of-viewer arm admits them to the self view).
+    expect(user.followers_count).toBe(3);
+    expect(user.following_count).toBe(2);
+  });
+
+  it("a signed-in stranger counts the non-private followers, not the unrelated private one", async () => {
+    const { carol, aliceRow } = await seedCountGraph();
+
+    const user = await toApiUserWithCounts(env.DB, doerViewer(carol.id, "Carol"), aliceRow);
+
+    expect(user.followers_count).toBe(2); // Bob + Lim; Priv relates to Carol in no way
+    expect(user.following_count).toBe(2);
+  });
+
+  it("a site admin counts every follower regardless of visibility", async () => {
+    const { admin, aliceRow } = await seedCountGraph();
+
+    const user = await toApiUserWithCounts(env.DB, doerViewer(admin.id, "root", true), aliceRow);
+
+    expect(user.followers_count).toBe(3); // no filter (followVisibilityCond's admin arm)
+    expect(user.following_count).toBe(2);
+  });
+
+  it("the gated fields still render on the async twin (self view keeps the authed arm)", async () => {
+    const alice = await seedUser("Alone", { email: "alone@example.com" });
+    const rows = await db().select().from(users).where(eq(users.usernameLower, "alone")).all();
+    const row = rows[0];
+    if (row === undefined) throw new Error("row missing after seed");
+
+    const user = await toApiUserWithCounts(env.DB, doerViewer(alice.id, "Alone"), row);
+
+    expect(user.email).toBe("alone@example.com"); // the authed arm still applies
+    expect(user.followers_count).toBe(0); // no edges — honest zero, not a skip
+    expect(user.last_login).toBe("0001-01-01T00:00:00Z"); // no users column yet (see apiUserFromRow)
   });
 });
 

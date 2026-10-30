@@ -8,7 +8,7 @@ import type { ApiEnv } from "../env";
 import { userSchema } from "../models/user";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { findUserByName, formInt64, formTrim, viewerOf } from "../services/repository";
-import { isUserVisibleToViewer, searchUsers, toApiUser, visibilityDoerOf } from "../services/user";
+import { isUserVisibleToViewer, searchUsers, toApiUser, toApiUserWithCounts, visibilityDoerOf } from "../services/user";
 
 /**
  * Tier-1 `user`-tagged directory reads (SPEC-0004 §2.4):
@@ -144,6 +144,10 @@ export function registerUsersRoutes(
       // The fake not-exist: an invisible row answers the identical 404 body.
       throw new ApiError(404, "not found");
     }
-    return c.json(toApiUser(viewer, user), 200);
+    // The single-row GET renders the counts (the toApiRepositoryFull
+    // precedent — lists stay query-flat): the requester-visible live totals
+    // through the async twin (upstream renders the raw NumFollowers columns
+    // here; our divergence is documented at ApiUserFollowCounts).
+    return c.json(await toApiUserWithCounts(c.env.DB, viewer, user), 200);
   });
 }

@@ -245,6 +245,22 @@ describe("GET /user/followers (userCurrentListFollowers)", () => {
     expect(response.headers.get("X-Total-Count")).toBe("1");
   });
 
+  it("renders the query-flat zero counts on the items (the sync render — the async twin carries live totals)", async () => {
+    const seed = await seedFollowGraph();
+    const response = await router()("/user/followers", { headers: authHeaders(seed.alice.id) });
+    expect(response.status).toBe(200);
+    const body: Array<Record<string, unknown>> = await response.json();
+    expect(body).toHaveLength(1);
+    // The listing paths keep the query-flat sync render (apiUserFromRow's
+    // zero-defaults — per-row count queries would be the N+1 the list shape
+    // avoids); the single-row GETs swap to toApiUserWithCounts.
+    expect(body[0]).toMatchObject({
+      followers_count: 0,
+      following_count: 0,
+      last_login: "0001-01-01T00:00:00Z", // no users column yet; upstream authed-gates it (convert/user.go:118-124)
+    });
+  });
+
   it("paginates with the runtime headers", async () => {
     const seed = await seedFollowGraph();
     await followUser(env.DB, seed.carol.id, seed.alice.id);

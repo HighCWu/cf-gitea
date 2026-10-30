@@ -19,6 +19,7 @@
 import { OpenAPIHono } from "@hono/zod-openapi";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { users } from "../db/schema";
@@ -29,6 +30,7 @@ import type { ApiEnv } from "./env";
 import type { User } from "./models/user";
 import { registerFollowRoutes } from "./routes/follows";
 import { FOLLOWS_DDL_STATEMENTS } from "./services/follows";
+import { resolveApiUserFollowCounts, type Viewer } from "./services/repository";
 import { OrgService } from "../services/orgs/orgs";
 import { applyOrgsDdl, resetOrgTables } from "../services/orgs/testing";
 
@@ -332,5 +334,61 @@ describe("GET /users/{username}/following/{target} (userCheckFollowing)", () => 
       headers: authHeaders(seed.admin.id),
     });
     expect(response.status).toBe(204);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The serializer's follow counts (resolveApiUserFollowCounts, services/
+// repository.ts) over the SAME seeded graph — the totals the User payload's
+// followers_count/following_count render through toApiUserWithCounts. The
+// pin: the counts ARE the listings' X-Total-Count values above, per viewer
+// (the same visibility-filtered FindAndCount — upstream profile.go:118-138
+// over user.go:357-402; upstream's API converter renders maintained columns
+// the D1 users row does not have, so the visible total is the honest render).
+// ---------------------------------------------------------------------------
+
+describe("serializer follow counts over the follow graph (resolveApiUserFollowCounts)", () => {
+  const countViewer = (user: { id: number; username: string }, isAdmin = false): Viewer => ({
+    origin: "https://example.com",
+    requester: { id: user.id, login: user.username, is_admin: isAdmin },
+  });
+  const anonViewer: Viewer = { origin: "https://example.com", requester: null };
+
+  async function rowOf(username: string): Promise<typeof users.$inferSelect> {
+    const rows = await db().select().from(users).where(eq(users.usernameLower, username.toLowerCase())).all();
+    const row = rows[0];
+    if (row === undefined) throw new Error(`row missing after seed: ${username}`);
+    return row;
+  }
+
+  it("the requester-visible follower total equals the same viewer's listing X-Total-Count", async () => {
+    const seed = await seedFollowGraph();
+    const bobRow = await rowOf(seed.bob.username);
+
+    // The listing pins above, mirrored: admin sees 2 (alice + secret),
+    // hermit 1 (alice), carol 2 (secret follows carol — the
+    // followers-of-viewer arm), anon 1 (alice only; secret is private).
+    expect(await resolveApiUserFollowCounts(env.DB, bobRow.id, countViewer(seed.admin, true))).toMatchObject({
+      followersCount: 2,
+    });
+    expect(await resolveApiUserFollowCounts(env.DB, bobRow.id, countViewer(seed.hermit))).toMatchObject({
+      followersCount: 1,
+    });
+    expect(await resolveApiUserFollowCounts(env.DB, bobRow.id, countViewer(seed.carol))).toMatchObject({
+      followersCount: 2,
+    });
+    expect(await resolveApiUserFollowCounts(env.DB, bobRow.id, anonViewer)).toMatchObject({ followersCount: 1 });
+  });
+
+  it("following_count includes the org edges the listing renders", async () => {
+    const seed = await seedFollowGraph();
+    const aliceRow = await rowOf(seed.alice.username);
+
+    // alice follows bob + the acme org (the admin listing renders both,
+    // "bob", "acme").
+    expect(await resolveApiUserFollowCounts(env.DB, aliceRow.id, countViewer(seed.admin, true))).toEqual({
+      followersCount: 1, // bob
+      followingCount: 2, // bob + acme
+    });
   });
 });

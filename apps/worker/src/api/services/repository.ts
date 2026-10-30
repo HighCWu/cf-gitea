@@ -18,9 +18,12 @@ import { ApiError } from "../errors";
 import type { Permission, Repository } from "../models/repository";
 import type { User } from "../models/user";
 import { OrgService } from "../../services/orgs/orgs";
+import { getRepoLicenses } from "../../services/repo-licenses";
 import { collaboratorModeOf } from "./repo-collaborators";
 import { renderGoDuration } from "./mirror";
+import { listRepoTopics } from "./repo-topics";
 import type { RepoSettings } from "./repo-settings";
+import { listFollowers, listFollowing, type FollowViewer } from "./follows";
 
 /**
  * Repo-metadata reads backing the tier-1 `Repository` routes (SPEC-0004
@@ -446,8 +449,18 @@ export type ApiUserRow = Pick<
  * private emails behind a placeholder we do not render yet). Exported for the
  * converters that embed a `User` (commit-status creator), matching upstream
  * `convert.ToUser`.
+ *
+ * `followCounts` (optional) carries the requester-visible follow totals the
+ * async arm (`resolveApiUserFollowCounts` below) resolved — upstream renders
+ * the counters OUTSIDE the authed gate (convert/user.go:107-111), so every
+ * viewer sees them; the numbers themselves are per-viewer (see there). The
+ * sync render stays query-flat at the documented zero-defaults: embedded
+ * projections (Repository.owner, webhook senders, assignees…) and list paths
+ * keep `0` (the same list-shape discipline as `toApiRepository`'s sync render)
+ * — the single-row GET wiring is the route owner's swap to
+ * `apiUserFromRowWithCounts` (the `toApiRepositoryFull` precedent).
  */
-export function apiUserFromRow(row: ApiUserRow, viewer: Viewer): User {
+export function apiUserFromRow(row: ApiUserRow, viewer: Viewer, followCounts?: ApiUserFollowCounts): User {
   const authed =
     viewer.requester !== null &&
     (viewer.requester.is_admin === true || requesterLoginLower(viewer) === row.usernameLower);
@@ -469,7 +482,14 @@ export function apiUserFromRow(row: ApiUserRow, viewer: Viewer): User {
     html_url: `${viewer.origin}/${row.username}`,
     language: "",
     is_admin: authed ? row.isAdmin : false,
-    last_login: GO_ZERO_TIME, // TODO(SPEC-0005): last-login tracking
+    // Upstream gates LastLogin inside the AUTHED block
+    // (convert/user.go:118-124 — `result.LastLogin = user.LastLoginUnix.AsTime()`
+    // under `if authed`; declared `json:"last_login"`, modules/structs/
+    // user.go:39): self/admin see the row's column, everyone else the Go-zero
+    // time. The `users` row has no last-login column yet — the schema owner
+    // lands it (then renders `authed ? row.<col> : GO_ZERO_TIME` here);
+    // TODO(SPEC-0005) stays for that column, NOT for the gate shape.
+    last_login: GO_ZERO_TIME,
     created: row.createdAt.toISOString(),
     restricted: false,
     active: authed ? row.status === "active" : false,
@@ -478,14 +498,82 @@ export function apiUserFromRow(row: ApiUserRow, viewer: Viewer): User {
     website: row.website ?? "",
     description: row.description ?? "",
     visibility: row.visibility,
-    followers_count: 0, // TODO(SPEC-0005): social counters
-    following_count: 0,
+    // The requester-visible follow totals — resolved by the async arm
+    // (`resolveApiUserFollowCounts` below) when the caller hands them in; the
+    // query-flat sync render keeps the zero-defaults.
+    followers_count: followCounts?.followersCount ?? 0,
+    following_count: followCounts?.followingCount ?? 0,
     // Upstream renders the maintained column (convert ToUser → StarredRepos,
     // modules/structs/user.go:60; models/user/user.go:155), not a live count:
     // the star/unstar batches bump it beside the edge (services/stars.ts,
     // star.go:48/62), as does the block cascade (services/blocks.ts).
     starred_repos_count: row.numStars,
   };
+}
+
+/**
+ * The requester-visible follow totals behind `followers_count`/
+ * `following_count` — the SAME numbers the profile page renders
+ * (ui/pages/user-profile.tsx reads `listFollowers`/`listFollowing` totals;
+ * upstream profile.go:118-138 over the `GetUserFollowers`/`GetUserFollowing`
+ * FindAndCount, models/user/user.go:357-402).
+ *
+ * Upstream's API `toUser` itself renders the MAINTAINED `num_followers`/
+ * `num_following` columns (convert/user.go:107-111, bumped beside the edge in
+ * FollowUser/UnfollowUser's transaction, follow.go:45-51/67-73). The D1
+ * `users` row has no such columns (followUser skips the counter halves —
+ * services/follows.ts), so the serializer renders the visibility-filtered
+ * LIVE totals instead: the requester-visible count, the same number the web
+ * profile shows — API and UI cannot disagree, and a private follower is
+ * never counted for a viewer who cannot see them (documented divergence from
+ * upstream's raw-column render; the raw columns do not exist to render).
+ */
+export interface ApiUserFollowCounts {
+  followersCount: number;
+  followingCount: number;
+}
+
+/**
+ * The visibility-filtered follow totals for one user row: upstream's
+ * `GetUserFollowers`/`GetUserFollowing` FindAndCount over
+ * `isUserVisibleToViewerCond(viewer)` (models/user/user.go:357-402), read
+ * through the landed `listFollowers`/`listFollowing` (services/follows.ts —
+ * the identical join directions: followers are individual-type rows only,
+ * following includes orgs). Page 1/pageSize 1 keeps the item query a LIMIT-1
+ * rider on the FindAndCount total, exactly the profile loader's shape.
+ * Anonymous counts public-type edges only; the self viewer counts everything
+ * visible to them (a private follower who follows the viewer is admitted by
+ * the listing's followers-of-viewer arm) — per-requester numbers, never a
+ * global raw count.
+ */
+export async function resolveApiUserFollowCounts(
+  d1: D1Database,
+  rowId: number,
+  viewer: Viewer,
+): Promise<ApiUserFollowCounts> {
+  const followViewer: FollowViewer = {
+    id: viewer.requester?.id ?? null,
+    isAdmin: viewer.requester?.is_admin === true,
+  };
+  const page = { page: 1, pageSize: 1 };
+  const [followers, following] = await Promise.all([
+    listFollowers(d1, rowId, followViewer, page),
+    listFollowing(d1, rowId, followViewer, page),
+  ]);
+  return { followersCount: followers.total, followingCount: following.total };
+}
+
+/**
+ * `apiUserFromRow` with the async follow-count arm resolved — the CANONICAL
+ * User render for the single-row GETs (the `toApiRepositoryFull` precedent:
+ * the wiring is the route owner's one-line swap from the sync `toApiUser`;
+ * this module does not own the routes). Single-row callers only — a list
+ * route swapping blindly turns every row into two count queries (the N+1 the
+ * query-flat list shape exists to avoid); lists keep the zero-defaults.
+ */
+export async function apiUserFromRowWithCounts(d1: D1Database, row: ApiUserRow, viewer: Viewer): Promise<User> {
+  const followCounts = await resolveApiUserFollowCounts(d1, row.id, viewer);
+  return apiUserFromRow(row, viewer, followCounts);
 }
 
 /**
@@ -513,6 +601,17 @@ export interface RepositoryRenderRelations {
   /** The repo's 1:1 `repo_mirrors` row (`findMirrorByRepoId`), feeding the
    * mirror_interval/mirror_updated/mirror_last_sync_at triple. */
   mirrorRow?: RepoMirrorRow | null;
+  /** The repo's stored topic names (`repo_topics`, name ASC — the
+   * `syncTopicsInRepository` ordering, models/repo/topic.go:340-353).
+   * Upstream renders the denormalized `repository.topics` column
+   * (convert/repository.go:265); our join table read is the same render. */
+  topics?: string[];
+  /** The repo's detected licenses (`repo_license`, license ASC —
+   * GetRepoLicenses `.Asc("license")`, models/repo/license.go:46-54, mapped
+   * 1:1 through `RepoLicenseList.StringList` — NO dedupe, license.go:30-35).
+   * Upstream renders these on every payload (convert/repository.go:190-193,
+   * :267). */
+  licenses?: string[];
 }
 
 /**
@@ -576,11 +675,14 @@ export async function findMirrorByRepoId(
 }
 
 /**
- * `toApiRepository` with both async arms resolved (upstream `innerToRepo`'s
- * GetBaseRepo + GetMirrorByRepoID passes): a fork renders `fork: true` plus
- * the `parent` payload when the doer can read the base (omitted otherwise),
- * and a mirror renders the real mirror_interval/mirror_updated/
- * mirror_last_sync_at from its repo_mirrors row. The single-repo GETs
+ * `toApiRepository` with all four async arms resolved (upstream
+ * `innerToRepo`'s GetBaseRepo + GetMirrorByRepoID passes, plus the topics +
+ * licenses reads the converter makes per payload — GetRepoLicenses,
+ * convert/repository.go:190-193): a fork renders `fork: true` plus the
+ * `parent` payload when the doer can read the base (omitted otherwise), a
+ * mirror renders the real mirror_interval/mirror_updated/
+ * mirror_last_sync_at from its repo_mirrors row, and every single-repo
+ * payload carries the stored `topics` + `licenses`. The single-repo GETs
  * (routes/repo.ts repoGet / repoGetByID) are the callers that SHOULD use
  * this — the wiring is the route owner's one-line swap from
  * `toApiRepository` (this module does not own the routes); until then the
@@ -598,11 +700,24 @@ export async function toApiRepositoryFull(
   settings?: RepoSettings,
   teamMode?: TeamAccessMode | null,
 ): Promise<Repository> {
-  const [parent, mirrorRow] = await Promise.all([
+  const [parent, mirrorRow, topics, licenseRows] = await Promise.all([
     resolveParentRepository(d1, viewer, pair.repo),
     pair.repo.isMirror ? findMirrorByRepoId(d1, pair.repo.id) : Promise.resolve(null),
+    // Upstream resolves topics with the row itself (the denormalized column)
+    // and licenses inside the converter (repository.go:190-193 — GetRepoLicenses
+    // runs unconditionally, single-repo AND list). Both arms ride this full
+    // resolver; the query-flat list paths keep `[]` (see toApiRepository).
+    listRepoTopics(d1, pair.repo.id),
+    getRepoLicenses(d1, pair.repo.id),
   ]);
-  return toApiRepository(viewer, pair, settings, teamMode, { parent, mirrorRow });
+  return toApiRepository(viewer, pair, settings, teamMode, {
+    parent,
+    mirrorRow,
+    topics,
+    // RepoLicenseList.StringList (license.go:30-35): the rows' license
+    // strings 1:1 — duplicates stay, the ASC order is the read's order.
+    licenses: licenseRows.map((row) => row.license),
+  });
 }
 
 /**
@@ -807,8 +922,15 @@ export function toApiRepository(
       mirrorRow !== null && mirrorRow.lastSyncAt !== null
         ? new Date(mirrorRow.lastSyncAt * 1000).toISOString()
         : GO_ZERO_TIME,
-    topics: [], // TODO(SPEC-0005): topics table
-    licenses: [], // TODO(SPEC-0005): licenses detection
+    // Upstream `Topics: util.SliceNilAsEmpty(repo.Topics)` /
+    // `Licenses: util.SliceNilAsEmpty(repoLicenses.StringList())`
+    // (convert/repository.go:265/267) — the stored sets on every payload.
+    // The full resolver (toApiRepositoryFull) carries the real reads; the
+    // query-flat list paths keep the empty default (the documented list
+    // divergence, parity review items 3/9 — upstream renders these on lists
+    // too, our list shape stays one query-flat converter by design).
+    topics: relations?.topics ?? [],
+    licenses: relations?.licenses ?? [],
     object_format_name: "sha1",
   };
 }
