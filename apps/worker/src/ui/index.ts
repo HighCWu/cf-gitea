@@ -1434,6 +1434,10 @@ import { loadBlameData, renderBlamePage } from "./pages/blame";
 // over the engine's grep() read RPC (SPEC-0015 M1).
 import { loadRepoSearchData, renderRepoSearchPage } from "./pages/repo-search";
 import { createPullFromForm, loadCompareData, readComparePullForm, renderComparePage } from "./pages/compare";
+// The Code tab's ref threading (the P2-7 remaining-S piece) reuses the home
+// loader's listRefs→branches/tags mapping so the resolution is the loaders'
+// byte-for-byte.
+import { resolveHeadBranch } from "./pages/home";
 import {
   applyRepoBasics,
   canAdminRepo,
@@ -5836,6 +5840,36 @@ async function resolveUiRequest(c: Context<{ Bindings: Env }>): Promise<Resolved
   // (unit.go:67-77), so absent renders the tab and only explicit false
   // hides it — header.tmpl:165-169's CanRead gate).
   resolved.ctx.repoHasWiki = settings.hasWiki;
+  // The Code tab's ref-preserving href (the P2-7 remaining-S piece —
+  // header.tmpl:100-101): the ref-carrying page families (src/commits/blame
+  // — the routes whose upstream twins run the RepoRef* middleware) thread
+  // BranchName/RefTypeNameSubURL through the ctx so the shell's Code tab can
+  // preserve a non-default ref. The resolution is the page loaders' own
+  // resolveRefSuffix walk over ONE listRefs read (the loader pays the same
+  // read again — the doubled RPC is the threading's disclosed cost; a failed
+  // or unresolvable read threads nothing and the tab keeps its plain
+  // {RepoLink} href). Everything else stays absent: upstream runs those
+  // pages without RepoRef (BranchName ""), where its own template emits
+  // `{RepoLink}/src/` — a URL whose handler redirects onto {RepoLink}
+  // (web.go:1760-1761) — so the plain href IS the upstream landing without
+  // the round-trip.
+  if (route.family === "src" || route.family === "commits" || route.family === "blame") {
+    if (route.refSuffix !== null) {
+      const split = splitRefSuffix(route.refSuffix);
+      if (split !== null) {
+        const refs = resolveHeadBranch(await engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`).listRefs(), repo.defaultBranch);
+        const resolvedRef = resolveRefSuffix(split.refType, split.rest, {
+          branches: refs.branches,
+          tags: refs.tags,
+          defaultBranch: repo.defaultBranch,
+        });
+        if (resolvedRef !== null) {
+          resolved.ctx.branchName = resolvedRef.refType === "branch" ? resolvedRef.ref : "";
+          resolved.ctx.refTypeNameSubURL = `${resolvedRef.refType}/${resolvedRef.ref}`;
+        }
+      }
+    }
+  }
   // The header trio's viewer state (usability B-4 Stage A): the watch/star
   // probes ride the same request resolution, Promise.all'd — byte-neutral
   // for fixture viewers (no edges), so the goldens' bytes survive.

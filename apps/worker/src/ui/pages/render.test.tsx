@@ -633,3 +633,66 @@ describe("file view §4.3 display cap", () => {
     expect("notFound" in data).toBe(true);
   });
 });
+
+// --- the tree-root button row (the P2-7 remaining-S home-row piece) -----------
+
+describe("the tree-root button row (view_content.tmpl's Go-to-File / Add-File / #new-pull-request)", () => {
+  /** The default two-entry data (README renders; the row lives above it). */
+  async function homeHtml(canWriteCode?: boolean): Promise<string> {
+    const engine = stubEngine();
+    const data = await loadHomeData(engine, repo, ctx.origin);
+    return renderToString(<HomePage ctx={ctx} data={{ ...data, canWriteCode }} />);
+  }
+
+  it("renders the Go-to-File search container with the bundle's exact data contract (view_content.tmpl:75-82)", async () => {
+    const html = await homeHtml();
+    expect(html).toContain('class="repo-file-search-container"');
+    expect(html).toContain('data-global-init="initRepoFileSearch"');
+    expect(html).toContain('data-repo-link="/octocat/hello"');
+    // RefTypeNameSubURL on the tree root is branch/{head} (RepoRefByType's
+    // reqPath=="" default) — both the current-ref attr and the tree-list feed
+    // carry it, and the feed is the LANDED wave-39 aux family.
+    expect(html).toContain('data-current-ref-name-sub-url="branch/main"');
+    expect(html).toContain('data-tree-list-url="/octocat/hello/tree-list/branch/main"');
+    expect(html).toContain('data-no-results-text="No matching file found"');
+    expect(html).toContain('data-placeholder="Go to file"');
+    expect(html).toContain('<input placeholder="Go to file"/>');
+    expect(html).toContain("<kbd>T</kbd>");
+  });
+
+  it("renders the Add-File dropdown DISABLED for a viewer without the write grant (the CanContentChange attr)", async () => {
+    const html = await homeHtml(undefined);
+    expect(html).toContain('class="ui dropdown basic compact jump button repo-add-file"');
+    expect(html).toMatch(/repo-add-file"[^>]*disabled=""/);
+    // The three items render inside the (disabled) dropdown, on the landed
+    // editor route literals at the root path.
+    expect(html).toContain('href="/octocat/hello/new/main"');
+    expect(html).toContain('href="/octocat/hello/upload/main"');
+    expect(html).toContain('href="/octocat/hello/patch/main"');
+    expect(html).toContain("Add File");
+    expect(html).toContain("New File");
+    expect(html).toContain("Upload File");
+    expect(html).toContain("Apply Patch");
+    expect(html).toContain("octicon-file-added");
+    expect(html).toContain("octicon-upload");
+    expect(html).toContain("octicon-diff");
+  });
+
+  it("renders the Add-File dropdown ENABLED for the write-granted viewer (collaborator arms included)", async () => {
+    const html = await homeHtml(true);
+    expect(html).toContain('class="ui dropdown basic compact jump button repo-add-file"');
+    expect(html).not.toMatch(/repo-add-file"[^>]*disabled/);
+  });
+
+  it("renders the #new-pull-request anchor only for the write-granted viewer, over ?expand=1 (view_content.tmpl:42-46)", async () => {
+    const anon = await homeHtml(undefined);
+    expect(anon).not.toContain('id="new-pull-request"');
+    const writer = await homeHtml(true);
+    expect(writer).toContain('id="new-pull-request"');
+    expect(writer).toContain('class="ui compact basic button"');
+    // MakeDefaultCompareLink's same-repo fold + QueryBuild "expand" 1.
+    expect(writer).toContain('href="/octocat/hello/compare/main...main?expand=1"');
+    expect(writer).toContain('data-tooltip-content="New Pull Request"');
+    expect(writer).toContain("octicon-git-pull-request");
+  });
+});

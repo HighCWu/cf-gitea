@@ -29,8 +29,15 @@
  *   stale-note sync).
  * - Poster names anchor the `/{username}` profile since wave 7 (the
  *   dead-link unlock — userLink; plain text before the page existed).
- * - Search box and the label/milestone management buttons are not rendered
- *   (no search route, no management pages — dead links forbidden §2.4.1).
+ * - Search box not rendered (the keyword grammar has no landed surface on
+ *   this page — ?q= is inert; the repo/issue/search template stays out).
+ *   The Labels/Milestones management buttons (list.tmpl:25-26) and the
+ *   #issue-filters toolbar skeleton (filters.tmpl:1-23 — wrapper divs,
+ *   writer-gated select-all checkbox, the openclose tabs, and the right
+ *   group's empty `ui secondary filter menu labels` container; the hidden
+ *   #issue-actions twin per list.tmpl:39-56) render since the P2-7
+ *   remaining-S wave — the filter dropdowns themselves stay unrendered (the
+ *   poster/assignee/project feeds have no landed surface).
  *   The New Issue button renders like upstream (list.tmpl, unconditional —
  *   wave 4's /issues/new page is live; anonymous viewers land on the authed
  *   page's /login round-trip) and hidden on archived repos (upstream's
@@ -102,6 +109,9 @@ export const issuesLocale = {
   new_issue: "New Issue", // "repo.issues.new" (wave 4: the /issues/new page exists)
   new_pull: "New Pull Request", // "repo.pulls.new" (list.tmpl:27's pulls-tab button)
   compare_commits_general: "Compare commits", // "action.compare_commits_general" (the archived arm, list.tmpl:32)
+  labels: "Labels", // "repo.labels" (list.tmpl:25's header button — the /labels page is live)
+  milestones: "Milestones", // "repo.milestones" (list.tmpl:26's header button — /milestones is live)
+  check_all: "Check/Uncheck all items", // "repo.issues.action_check_all" (the select-all checkbox title)
 } as const;
 
 /** Upstream `setting.UI.IssuePagingNum` (modules/setting/ui.go:89). */
@@ -614,32 +624,46 @@ export function IssuesListPage(props: { ctx: UiContext; data: IssuesListData }) 
   // config is unlanded so the target IS the default branch, and
   // CompareHeadRef folds the same-repo head to the bare branch name).
   const compareHref = compareLink(repoLink, repo.defaultBranch, repo.defaultBranch);
+  // filters.tmpl's select-all gate: `{{if and $.CanWriteIssuesOrPulls .Issues}}`
+  // — the write grant AND a non-empty list. CanWriteIssuesOrPulls (the
+  // issues/pulls unit write) rides the threaded canWriteIssues grant here —
+  // the dispatch's canWriteRepo fold, the same stand-in the New Pull Request
+  // button's CanCreateNewPull arm carries (disclosed: the issues-unit grant
+  // is the code-write reduction).
+  const showSelectAll = data.canWriteIssues === true && data.items.length > 0;
   return (
     <BaseLayout ctx={ctx} title={title} pageClass="repository issue-list">
       <div class="ui container">
-        {/* The list-header row's creation button (list.tmpl:19-35, reduced to
-            the live link — the search box and the Labels/Milestones buttons
-            above it stay unrendered, header comment). Issues arm: the New
-            Issue button, hidden on archived repos — the upstream `if not
-            .Repository.IsArchived` gate; anonymous viewers clicking it land
-            on the authed page's /login round-trip. Pulls arm: list.tmpl:27's
-            New Pull Request button over the compare target — writers live,
-            plain signed-in readers the upstream `disabled` class over the
-            same link, anonymous the /login round-trip onto the compare page
-            (upstream renders anon the inert disabled arm; the round-trip is
-            the issue-detail sign-in convention); the archived twin carries
-            list.tmpl:31-33's Compare-commits button with its exact doubled
+        {/* The list-header row (list.tmpl:24-35): the search box (the
+            repo/issue/search template) stays unrendered — the keyword grammar
+            has no landed surface on this page (?q= is inert, header comment);
+            the Labels and Milestones management buttons (list.tmpl:25-26 —
+            unconditional, both targets live routes); then the New button
+            arms. Issues arm: the New Issue button, hidden on archived repos —
+            the upstream `if not .Repository.IsArchived` gate; anonymous
+            viewers clicking it land on the authed page's /login round-trip.
+            Pulls arm: list.tmpl:27's New Pull Request button over the compare
+            target — writers live, plain signed-in readers the upstream
+            `disabled` class over the same link, anonymous the /login
+            round-trip onto the compare page (upstream renders anon the inert
+            disabled arm; the round-trip is the issue-detail sign-in
+            convention); the archived twin carries list.tmpl:31-33's
+            Compare-commits button with its exact doubled
             `small primary small` classes. */}
-        {data.listKind === "issues" && !repo.isArchived ? (
-          <div class="list-header flex-text-block">
+        <div class="list-header flex-text-block">
+          <a class="ui small button" href={`${repoLink}/labels`}>
+            {issuesLocale.labels}
+          </a>
+          <a class="ui small button" href={`${repoLink}/milestones`}>
+            {issuesLocale.milestones}
+          </a>
+          {data.listKind === "issues" && !repo.isArchived ? (
             <a class="ui small primary button issue-list-new" href={`${repoLink}/issues/new`}>
               {issuesLocale.new_issue}
             </a>
-          </div>
-        ) : null}
-        {data.listKind === "pulls" ? (
-          <div class="list-header flex-text-block">
-            {repo.isArchived ? (
+          ) : null}
+          {data.listKind === "pulls" ? (
+            repo.isArchived ? (
               <a class="ui small primary small button issue-list-new" href={compareHref}>
                 {issuesLocale.compare_commits_general}
               </a>
@@ -661,21 +685,71 @@ export function IssuesListPage(props: { ctx: UiContext; data: IssuesListData }) 
               >
                 {issuesLocale.new_pull}
               </a>
-            )}
+            )
+          ) : null}
+        </div>
+        {/* The #issue-filters toolbar (list.tmpl:37's filters.tmpl render —
+            the P2-7 toolbar skeleton): the wrapper divs with the select-all
+            checkbox (writer ∧ non-empty list — inert until the ROWS carry
+            per-issue checkboxes, issuelist.tmpl:13-16's writer arm, a
+            documented sibling posture) and the Open/Closed tabs in the left
+            group, and the right group's `ui secondary filter menu labels`
+            container. The filter dropdowns themselves (filter_list.tmpl —
+            label/milestone/project/poster/assignee menus) stay unrendered:
+            the poster/assignee search feeds and the project filters have no
+            landed surface (the aux-feed rule), so the container is the
+            skeleton the menus mount into. */}
+        <div id="issue-filters" class="issue-list-toolbar">
+          <div class="issue-list-toolbar-left">
+            {showSelectAll ? (
+              <input
+                type="checkbox"
+                autocomplete="off"
+                class="issue-checkbox-all tw-mr-4"
+                title={issuesLocale.check_all}
+                data-global-init="initRepoIssueListCheckboxes"
+              />
+            ) : null}
+            <OpenCloseTabs
+              basePath={basePath}
+              state={data.state}
+              openCount={data.openCount}
+              closedCount={data.closedCount}
+              labelIds={data.labelIds}
+              milestoneId={data.milestoneId}
+              openTitle={issuesLocale.open_title}
+              closedTitle={issuesLocale.closed_title}
+              pullList={data.listKind === "pulls"}
+            />
           </div>
-        ) : null}
-        <div class="issue-list-toolbar-left">
-          <OpenCloseTabs
-            basePath={basePath}
-            state={data.state}
-            openCount={data.openCount}
-            closedCount={data.closedCount}
-            labelIds={data.labelIds}
-            milestoneId={data.milestoneId}
-            openTitle={issuesLocale.open_title}
-            closedTitle={issuesLocale.closed_title}
-            pullList={data.listKind === "pulls"}
-          />
+          <div class="issue-list-toolbar-right">
+            <div class="ui secondary filter menu labels" />
+          </div>
+        </div>
+        {/* The #issue-actions twin (list.tmpl:39-56) — upstream renders it
+            unconditionally hidden (`tw-hidden`); the bundle's
+            initRepoIssueListCheckboxes swaps the two panels on selection and
+            queries BOTH ids unguarded (repo-issue-list.ts:18-19), so the
+            hidden twin must exist whenever the checkbox can. Its batch
+            actions (filter_actions.tmpl — open/close/delete + the batch
+            dropdowns posting /issues/{status,labels,milestone,assignee}) stay
+            unrendered: the write endpoints have no landed surface (the
+            dead-link rule), so the right group is the empty skeleton. */}
+        <div id="issue-actions" class="issue-list-toolbar tw-hidden">
+          <div class="issue-list-toolbar-left">
+            <OpenCloseTabs
+              basePath={basePath}
+              state={data.state}
+              openCount={data.openCount}
+              closedCount={data.closedCount}
+              labelIds={data.labelIds}
+              milestoneId={data.milestoneId}
+              openTitle={issuesLocale.open_title}
+              closedTitle={issuesLocale.closed_title}
+              pullList={data.listKind === "pulls"}
+            />
+          </div>
+          <div class="issue-list-toolbar-right" />
         </div>
         {data.items.length === 0 ? (
           <div class="tw-text-center tw-p-8">

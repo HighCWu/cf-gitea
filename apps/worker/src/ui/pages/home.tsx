@@ -17,6 +17,20 @@
  * release, language stats) are deferred — each needs data surfaces this
  * unit does not own; the grid already reserves their slots.
  *
+ * The tree-root button row (view_content.tmpl:22-124, the residuals P2-7
+ * home-row piece) renders in template order: the branch selector; the
+ * `#new-pull-request` anchor (view_content.tmpl:42-46's CanCreateNewPull ∧
+ * IsBranch arm — the threaded canWriteCode grant is the landed fold, hidden
+ * not disabled for readers); and the right group's Go-to-File search
+ * container (view_content.tmpl:75-82 — live over the LANDED tree-list aux
+ * feed), the Add-File dropdown (view_content.tmpl:85-105 — `disabled` via
+ * CanContentChange when the viewer lacks the write grant, its three items on
+ * the landed editor literals) and the clone panel (view_content.tmpl:110-118,
+ * the pre-existing RepoClonePanel). Upstream's row members still unrendered:
+ * the kebab More-Operations menu, the template-repo Use-Template button and
+ * the file-history button (root render has none of the three — the first two
+ * need landed surfaces the row's root arm does not carry).
+ *
  * Empty repos (§4.1: public, unborn HEAD) render upstream repo/empty.tmpl
  * branched on the viewer: writers (the canWriteRepository static arms — the
  * EmptyRepoPage disclosure) get the Quick Guide with the two command-line
@@ -33,7 +47,8 @@ import { FileContentView } from "../components/file-content";
 import { RepoFilesTable } from "../components/file-list";
 import type { EngineClient } from "../engine";
 import { locale } from "../locale";
-import { enrichTreeCommits, pickReadme, renderRepoMarkdown } from "../page-data";
+import { enrichTreeCommits, pathEscapeSegments, pickReadme, renderRepoMarkdown } from "../page-data";
+import { compareLink } from "./compare";
 import { BaseLayout, Icon } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
 import { searchPageLocale } from "./repo-search";
@@ -53,6 +68,28 @@ const emptyRepoLocale = {
   /** "repo.empty_message" — the non-writer arm (empty.tmpl:74). */
   empty_message: "This repository does not have any content.",
 };
+
+/** The tree-root row's chrome text (the component-local pattern — locale.ts
+ *  is shared and not this wave's file). Values are the pin's locale_en-US
+ *  entries the templates render through ctx.Locale.Tr. */
+const homeRowLocale = {
+  /** "repo.find_file.go_to_file" (the input placeholder + its data attr). */
+  go_to_file: "Go to file",
+  /** "repo.find_file.no_matching" (the widget's data-no-results-text). */
+  no_matching_file: "No matching file found",
+  /** "repo.editor.add_file" (the dropdown button's label). */
+  add_file: "Add File",
+  /** "repo.editor.new_file" (the dropdown's first item). */
+  new_file: "New File",
+  /** "repo.editor.upload_file" (the RepositoryUploadEnabled item). */
+  upload_file: "Upload File",
+  /** "repo.editor.patch" (the dropdown's third item). */
+  apply_patch: "Apply Patch",
+  /** "repo.pulls.compare_changes" — the #new-pull-request anchor's tooltip
+   *  (view_content.tmpl:43; the key's value at the pin IS "New Pull
+   *  Request"). */
+  compare_changes: "New Pull Request",
+} as const;
 
 /** The clone panel's chrome text (the component-local pattern — locale.ts is
  *  shared and not this wave's file; the panel's "Code" label reuses the
@@ -169,6 +206,87 @@ export function RepoCloneButtonsCombo(props: { cloneUrl: string }) {
   );
 }
 
+/**
+ * The Go-to-File widget (templates/repo/view_content.tmpl:75-82 at the pin —
+ * `repo-file-search-container`, the row's first right-side member). The
+ * container is the whole server-side contract: `data-global-init=
+ * "initRepoFileSearch"` + the four data attrs the official bundle's Vue
+ * island reads (web_src/js/features/repo-findfile.ts:73-81 — repoLink,
+ * currentRefNameSubUrl, treeListUrl, the two locale texts), and the pre-mount
+ * dummy input + `T` kbd hint the island replaces. The feed it fetches,
+ * `{RepoLink}/tree-list/{branch}/{ref}` (data-tree-list-url), is LANDED
+ * (pages/tree-list-aux.ts — web.go:1298's forced-type sub-route), so the
+ * widget is live for every viewer; upstream arms no gate on the container.
+ * RefTypeNameSubURL on the tree root is `branch/{head}` (home carries
+ * RepoRefByType(git.RefTypeBranch) — services/context/repo.go:989's
+ * reqPath=="" default), and the helper mirrors exactly that composition.
+ */
+export function RepoFileSearchBox(props: { repoLink: string; headBranch: string }) {
+  const refTypeNameSubURL = `branch/${props.headBranch}`;
+  return (
+    <div
+      class="repo-file-search-container"
+      data-global-init="initRepoFileSearch"
+      data-repo-link={props.repoLink}
+      data-current-ref-name-sub-url={refTypeNameSubURL}
+      data-tree-list-url={`${props.repoLink}/tree-list/${refTypeNameSubURL}`}
+      data-no-results-text={homeRowLocale.no_matching_file}
+      data-placeholder={homeRowLocale.go_to_file}
+    >
+      <div class="ui small input global-shortcut-wrapper">
+        <input placeholder={homeRowLocale.go_to_file} />
+        <kbd>T</kbd>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The Add-File dropdown (view_content.tmpl:85-105 at the pin — the
+ * `repo-add-file` Fomantic-shape button the official bundle turns into the
+ * click dropdown). Upstream's gate pair: the button renders on BRANCH views
+ * (`{{if .RefFullName.IsBranch}}` — always true on the tree root, whose
+ * RepoRef is RefNameFromBranch), with the `disabled` attr when
+ * `.Repository.CanContentChange` fails (the write grant + the archived
+ * refusal — the landed canWriteCode prop is exactly that fold, collaborators
+ * included). The three items point at the editor's LANDED route literals
+ * (wave-8's `new`/`upload`/`patch` — the pin's `_new`/`_upload`/`_diffpatch`
+ * are this deployment's documented route-name divergence, apps/worker/src/ui/
+ * index.ts wave-8 header) at the ROOT add-file path (TreePath "" — the
+ * wave-8 New-File convention drops the trailing empty segment, which the
+ * parser accepts either way). The Upload item carries upstream's
+ * `.RepositoryUploadEnabled` gate — default-on at the pin and the landed
+ * upload page serves, so it renders (a deployment disabling uploads has no
+ * landed surface; the setting store is a documented future arm).
+ */
+export function RepoAddFileDropdown(props: { repoLink: string; headBranch: string; canWrite: boolean }) {
+  const branch = pathEscapeSegments(props.headBranch);
+  return (
+    <button
+      type="button"
+      class="ui dropdown basic compact jump button repo-add-file"
+      {...(props.canWrite ? {} : { disabled: true })}
+    >
+      {homeRowLocale.add_file}
+      <Icon name="octicon-triangle-down" size={14} class="dropdown icon" />
+      <div class="menu">
+        <a class="item" href={`${props.repoLink}/new/${branch}`}>
+          <Icon name="octicon-file-added" size={16} class="tw-mr-2" />
+          {homeRowLocale.new_file}
+        </a>
+        <a class="item" href={`${props.repoLink}/upload/${branch}`}>
+          <Icon name="octicon-upload" size={16} class="tw-mr-2" />
+          {homeRowLocale.upload_file}
+        </a>
+        <a class="item" href={`${props.repoLink}/patch/${branch}`}>
+          <Icon name="octicon-diff" size={16} class="tw-mr-2" />
+          {homeRowLocale.apply_patch}
+        </a>
+      </div>
+    </button>
+  );
+}
+
 /** The ref universe + resolved default branch behind one page render. */
 export interface ResolvedRefs extends SelectorRefs {
   /** The branch the page renders (`listRefs().head` short name, the §4.9
@@ -216,10 +334,13 @@ export interface HomeData {
     /** The decoded source text — the plain-text variant's `<pre>` body. */
     text: string;
   } | null;
-  /** The D1 write grant for the empty-repo arm's CanWriteCode fold — set by
-   *  the renderUiPage home arm (canWriteRepo: collaborator/team arms
+  /** The D1 write grant for the tree-root row's CanContentChange fold (the
+   *  Add-File disabled attr) AND the empty-repo arm's CanWriteCode fold —
+   *  set by the renderUiPage home arm (canWriteRepo: collaborator/team arms
    *  included), NOT the loader (engine-only, no D1). Undefined = the caller
-   *  hasn't threaded it → EmptyRepoPage falls back to the static arms. */
+   *  hasn't threaded it → the Add-File button renders disabled (and the
+   *  #new-pull-request anchor is unrendered), EmptyRepoPage falls back to
+   *  the static arms. */
   canWriteCode?: boolean;
 }
 
@@ -395,6 +516,16 @@ export function HomePage(props: { ctx: UiContext; data: HomeData }) {
   if (head === null) return <EmptyRepoPage ctx={ctx} canWriteCode={data.canWriteCode} />;
 
   const readme = data.readme;
+  // CanCreateNewPull's landed fold (repo.go:56-66 = CanContentChange ∧
+  // CanWrite(Code) ∨ (IsSigned ∧ HasForkedRepo); no fork substrate → the
+  // HasForkedRepo arm is dead, so the threaded canWriteCode grant — the
+  // dispatch's canWriteRepo ∧ ¬archived fold — IS the predicate). The
+  // MakeDefaultCompareLink arm folds the same-repo head to
+  // {default}...{default} (services/context/repo.go:83-87; the issues-list's
+  // existing compareLink shape) with view_content.tmpl:43's QueryBuild
+  // "expand" 1.
+  const canCreateNewPull = data.canWriteCode === true;
+  const compareHref = `${compareLink(repoLink, repo.defaultBranch, repo.defaultBranch)}?expand=1`;
   return (
     <BaseLayout ctx={ctx} pageClass="repository file list" activeTab="code">
       <div class="ui container">
@@ -408,11 +539,28 @@ export function HomePage(props: { ctx: UiContext; data: HomeData }) {
                   refs={data.refs}
                   active={{ refType: "branch", ref: head }}
                 />
+                {/* view_content.tmpl:42-46's #new-pull-request anchor (the
+                    CanCreateNewPull ∧ IsBranch arm — hidden, not disabled,
+                    for viewers without the grant). */}
+                {canCreateNewPull ? (
+                  <a
+                    id="new-pull-request"
+                    role="button"
+                    class="ui compact basic button"
+                    href={compareHref}
+                    data-tooltip-content={homeRowLocale.compare_changes}
+                  >
+                    <Icon name="octicon-git-pull-request" />
+                  </a>
+                ) : null}
               </div>
-              {/* view_content.tmpl:115's tree-root clone panel — the right
-                  group's only landed member (the file search above it is
-                  unrendered; the panel is the row's whole right side). */}
+              {/* view_content.tmpl:75-115's right group in template order:
+                  the Go-to-File search container, the Add-File dropdown
+                  (disabled for viewers without CanContentChange), and the
+                  tree-root clone panel. */}
               <div class="repo-button-row-right">
+                <RepoFileSearchBox repoLink={repoLink} headBranch={head} />
+                <RepoAddFileDropdown repoLink={repoLink} headBranch={head} canWrite={data.canWriteCode === true} />
                 <RepoClonePanel
                   cloneUrl={httpsCloneUrl(ctx.origin, repo.ownerNamespace, repo.slug)}
                   archivePrefix={`${repoLink}/archive/${head}`}

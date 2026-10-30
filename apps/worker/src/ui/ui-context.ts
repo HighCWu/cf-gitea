@@ -92,6 +92,28 @@ export interface UiContext {
    *  upstream-default posture and the goldens byte-identical; only an
    *  explicit `false` (the loaded disabled state) hides it. */
   repoHasWiki?: boolean;
+  /** The current page's ref context — the Code tab's ref-preserving href
+   *  inputs (the P2-7 remaining-S piece; repo/header.tmpl:100-101's
+   *  `$codeLinkUseCurrentRef := and (ne .BranchName .Repository.DefaultBranch)
+   *  (not $.PageIsWiki)`):
+   *  - `branchName`: upstream ctx.Repo.BranchName — the ref's short name for
+   *    BRANCH refs only (services/context/repo.go:1016 sets it on the branch
+   *    arm; tag/commit refs leave it empty, so `ne "" default` holds and the
+   *    tab preserves the tag/commit URL);
+   *  - `refTypeNameSubURL`: upstream RefTypeNameSubURL's RefWebLinkPath —
+   *    `branch/{name}` | `tag/{name}` | `commit/{sha}` (repo.go:306-310).
+   *  Set together by resolveUiRequest from the route's refSuffix over the
+   *  SAME splitRefSuffix/resolveRefSuffix walk the page loaders run, for the
+   *  ref-carrying page families (src/commits/blame — the routes whose
+   *  upstream twins run the RepoRef* middleware); ABSENT on every other page
+   *  — upstream runs those without RepoRef (BranchName ""), where its own
+   *  template emits `{RepoLink}/src/` and the landed-equivalent landing is
+   *  the plain `{RepoLink}` (upstream's bare /src redirects onto exactly
+   *  that, web.go:1760-1761). The shell's Wiki arm needs no
+   *  `(not $.PageIsWiki)` twin: the wiki family never threads a ref, so the
+   *  fields are absent there and the tab stays plain. */
+  branchName?: string;
+  refTypeNameSubURL?: string;
   /** The global PACKAGES_ENABLED gate (SPEC-0016 M2 — the strict-polarity
    *  var; absent/true = enabled, only the exact "false" disables — the
    *  DEMO_MODE discipline). Gates the R04 tab anchors (the profile's

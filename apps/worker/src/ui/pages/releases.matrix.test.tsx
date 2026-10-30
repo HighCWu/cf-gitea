@@ -935,10 +935,15 @@ describe("the release-detail render shapes (w129 batch-10: tag links, attachment
     expect(html).toContain("<relative-time"); // the created stamp
   });
 
-  it("an asset-less release renders the open details block with the EMPTY attachment ul", async () => {
+  it("an asset-less release renders the open details block with the EMPTY attachment ul and the two Source-Code archive rows", async () => {
     // Provenance: wave-polish-matrix-10 — the empty attachment-list arm (the
-    // ul renders, zero li rows) and the detail page's always-open details
-    // (firstOpen === true unconditionally there) were unpinned together.
+    // ul renders, zero ATTACHMENT rows) and the detail page's always-open
+    // details (firstOpen === true unconditionally there) were unpinned
+    // together. The P2-7 remaining-S wave retargeted the li-count arm: the
+    // ul is no longer li-less for a published release — release/list.tmpl's
+    // Source-Code archive rows (list.tmpl:78-89, the non-draft gate) render
+    // beneath the (zero) attachments, so the pin is now "no attachment
+    // anchor + exactly the two archive rows".
     const { repo } = await theFixture();
     await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "v1", title: "Bare release" });
 
@@ -948,7 +953,25 @@ describe("the release-detail render shapes (w129 batch-10: tag links, attachment
     expect(html).toContain('<details class="download" open="">'); // firstOpen on the detail page (hono's boolean form)
     expect(html).toContain("<summary>Downloads</summary>");
     expect(html).toContain('<ul class="ui divided list attachment-list">');
-    expect(html).not.toContain('<li class="item">'); // zero attachment rows
+    expect(html).not.toContain('<a target="_blank" class="tw-flex-1 gt-ellipsis"'); // zero attachment rows (the asset anchor's exact shape)
+    expect(html).toContain('<a class="archive-link" download="" href="/relmx-owner/rel/archive/v1.zip" rel="nofollow">');
+    expect(html).toContain('<a class="archive-link" download="" href="/relmx-owner/rel/archive/v1.tar.gz" rel="nofollow">');
+    expect(html).toContain("Source Code (ZIP)");
+    expect(html).toContain("Source Code (TAR.GZ)");
+  });
+
+  it("a DRAFT release renders no Source-Code archive rows (list.tmpl:78's not-IsDraft gate)", async () => {
+    // The P2-7 wave's negative arm: the archive pair is draft-gated, the
+    // attachment rows are not.
+    const { repo, ownerCookie } = await theFixture();
+    await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "v9", title: "Draft bare", isDraft: true });
+
+    const res = await fetchUi("/relmx-owner/rel/releases/tag/v9", { headers: { cookie: ownerCookie } });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<details class="download" open="">');
+    expect(html).not.toContain('class="archive-link"'); // no archive rows on the draft
+    expect(html).not.toContain("Source Code (ZIP)");
   });
 
   it("the LIST page opens only the first entry's details (the idx==0 arm the detail page cannot show)", async () => {

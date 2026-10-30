@@ -515,6 +515,22 @@ export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   const openIssues = openCountOf(repo.numIssues, repo.numClosedIssues);
   const openPulls = openCountOf(repo.numPulls, repo.numClosedPulls);
+  // header.tmpl:100-101's Code-tab ref preservation (the P2-7 remaining-S
+  // piece): `{{$codeLinkUseCurrentRef := and (ne .BranchName
+  // .Repository.DefaultBranch) (not $.PageIsWiki)}}` → href =
+  // {RepoLink}/src/{RefTypeNameSubURL} when the page's ref is live and NOT
+  // the default branch. The ctx fields thread exactly upstream's pair —
+  // BranchName stays "" for tag/commit refs (repo.go:1016's branch-only arm),
+  // so `!== repo.defaultBranch` holds there and the tab preserves the
+  // /src/tag|commit URL. Absent fields (every page whose upstream twin runs
+  // no RepoRef — home/issues/releases/settings…) keep the plain {RepoLink}
+  // href: upstream's no-ref pages emit {RepoLink}/src/, whose handler
+  // redirects onto {RepoLink} (web.go:1760-1761) — same landing. The
+  // PageIsWiki twin needs no arm: the wiki family never threads a ref.
+  const codeTabHref =
+    props.ctx.refTypeNameSubURL !== undefined && props.ctx.branchName !== repo.defaultBranch
+      ? `${repoLink}/src/${props.ctx.refTypeNameSubURL}`
+      : repoLink;
   return (
     <div class="secondary-nav">
       <div class="ui container">
@@ -572,7 +588,7 @@ export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
       <div class="ui container">
         <overflow-menu class="ui secondary pointing menu">
           <div class="overflow-menu-items">
-            <a class={activeTab === "code" ? "active item" : "item"} href={repoLink} data-shortcut-keys="g c">
+            <a class={activeTab === "code" ? "active item" : "item"} href={codeTabHref} data-shortcut-keys="g c">
               <Icon name="octicon-code" /> {locale.repo_code}
             </a>
             <a class={activeTab === "issues" ? "active item" : "item"} href={`${repoLink}/issues`} data-shortcut-keys="g i">

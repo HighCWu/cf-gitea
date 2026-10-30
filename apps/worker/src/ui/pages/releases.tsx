@@ -148,10 +148,12 @@
  *   a draft whose git tag is missing lands `refs/tags/<tag>` at the stored
  *   target and fills sha1/created/num_commits (editReleaseFromForm's doc).
  * - Source-archive rows in the downloads block (`/archive/{tag}.zip|tar.gz`)
- *   are unrendered — the web-shape archive route does not exist (the
- *   branches page's archive reduction); the attachment rows render the
- *   landed `browser_download_url` (`/attachments/{uuid}`) whose serving
- *   route is the survey's separate S row (`/releases/attachments/{uuid}`).
+ *   render since the P2-7 remaining-S wave (release/list.tmpl:78-89 — the
+ *   non-draft gate; the wave-32 web-shape archive route the old reduction
+ *   called missing is LANDED, so the premise was stale); the attachment
+ *   rows render the landed `browser_download_url` (`/attachments/{uuid}`)
+ *   whose serving route is the survey's separate S row
+ *   (`/releases/attachments/{uuid}`).
  * - The create form's JS tag dropdown reduces to a native `<select>` over
  *   the branch universe (the file-editor target-branch select); the two
  *   submit buttons reduce to ONE Publish button + a draft CHECKBOX (the
@@ -214,7 +216,7 @@ export const releasesLocale = {
   stable: "Stable", // "repo.release.stable"
   released_this: "released this", // "repo.released_this"
   downloads: "Downloads", // "repo.release.downloads"
-  source_code: "Source Code", // "repo.release.source_code" (unrendered — archive reduction)
+  source_code: "Source Code", // "repo.release.source_code" (the archive rows' label)
   download_count: "Downloads", // "repo.release.download_count" (the tooltip prefix)
   git_tag: "Git Tag", // "repo.git_tag"
   tag_name: "Tag name", // "repo.release.tag_name"
@@ -952,6 +954,38 @@ export function ReleaseEntryItem(props: { entry: ReleaseEntry; repoLink: string;
             {entry.assets.map((asset) => (
               <ReleaseAssetItem asset={asset} />
             ))}
+            {/* The Source-Code archive rows (release/list.tmpl:78-89 at the
+                pin): `{{if and (not $.DisableDownloadSourceArchives) (not
+                $release.IsDraft) ($.Permission.CanRead TypeCode)}}` — the
+                archives setting is default-on at the pin (no landed toggle),
+                the code-read half is vacuous on this render (every resolved
+                viewer reads code — the unit-gates note), so the gate is the
+                draft state. The hrefs are the LANDED web-shape archive
+                family (wave-32's /archive/{tag}.zip|.tar.gz GET — the P2-7
+                premise that the route was missing is stale; the POST arm
+                4e6d1cc mounted too). The tags page's twin reduction
+                (pages/tags.tsx) carries the same stale premise and is NOT
+                this module's file. */}
+            {!row.isDraft ? (
+              <>
+                <li class="item">
+                  <a class="archive-link" download href={`${repoLink}/archive/${escapedTag}.zip`} rel="nofollow">
+                    <strong class="flex-text-inline">
+                      <Icon name="octicon-file-zip" size={16} class="download-icon" />
+                      {releasesLocale.source_code} (ZIP)
+                    </strong>
+                  </a>
+                </li>
+                <li class="item">
+                  <a class="archive-link" download href={`${repoLink}/archive/${escapedTag}.tar.gz`} rel="nofollow">
+                    <strong class="flex-text-inline">
+                      <Icon name="octicon-file-zip" size={16} class="download-icon" />
+                      {releasesLocale.source_code} (TAR.GZ)
+                    </strong>
+                  </a>
+                </li>
+              </>
+            ) : null}
           </ul>
         </details>
       </div>

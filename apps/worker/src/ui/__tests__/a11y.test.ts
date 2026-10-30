@@ -254,13 +254,18 @@ describe("§5.5 a11y smoke over the goldens", () => {
     expect(labelSpans[0]?.attrs.style).toContain("background-color: #ee0701");
     expect(labelSpans[0]?.attrs.style).toContain("color: #fff");
     expect(descendants(list ?? root).some((el) => hasClass(el, "milestone"))).toBe(true);
-    // Tabs: open active with the filtered count; pulls are excluded.
+    // Tabs: open active with the filtered count; pulls are excluded. The
+    // P2-7 toolbar skeleton renders the strip TWICE, upstream's own shape:
+    // the #issue-filters panel's strip and the hidden #issue-actions twin's
+    // (repo-issue-list.ts swaps the two panels on a row selection).
     const tabs = descendants(root).filter((el) => hasClass(el, "small-menu-items"));
-    expect(tabs).toHaveLength(1);
+    expect(tabs).toHaveLength(2);
     const tabItems = descendants(tabs[0] ?? root).filter((el) => el.tag === "a" && hasClass(el, "item"));
     expect(tabItems.map((el) => hasClass(el, "active"))).toEqual([true, false]);
     expect(tabItems[0] ? accessibleName(tabItems[0]) : "").toBe("2 Open");
     expect(tabItems[1] ? accessibleName(tabItems[1]) : "").toBe("1 Closed");
+    const twinItems = descendants(tabs[1] ?? root).filter((el) => el.tag === "a" && hasClass(el, "item"));
+    expect(twinItems.map((el) => accessibleName(el))).toEqual(["2 Open", "1 Closed"]);
   });
 });
 

@@ -927,3 +927,82 @@ describe("the claim pin (issues vs pulls heads, new/labels tails)", () => {
     });
   });
 });
+
+// --- the #issue-filters toolbar + the Labels/Milestones header buttons (P2-7) ---
+
+describe("the toolbar region (list.tmpl:24-56 — the Labels/Milestones buttons and the #issue-filters skeleton)", () => {
+  it("the list-header carries the Labels and Milestones buttons BEFORE the New button, on both lists", async () => {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    await seedRepo(alice, "toolbarhdr");
+    const issuesHtml = await (await fetchUi("/alice/toolbarhdr/issues")).text();
+    expect(issuesHtml).toContain('<div class="list-header flex-text-block">');
+    expect(issuesHtml).toContain('<a class="ui small button" href="/alice/toolbarhdr/labels">Labels</a>');
+    expect(issuesHtml).toContain('<a class="ui small button" href="/alice/toolbarhdr/milestones">Milestones</a>');
+    // Template order: search (unrendered), Labels, Milestones, then New.
+    expect(issuesHtml.indexOf("/alice/toolbarhdr/labels")).toBeLessThan(issuesHtml.indexOf("/alice/toolbarhdr/milestones"));
+    expect(issuesHtml.indexOf("/alice/toolbarhdr/milestones")).toBeLessThan(issuesHtml.indexOf("issue-list-new"));
+    // The pulls list shares the row (upstream renders the pair unconditionally).
+    const pullsHtml = await (await fetchUi("/alice/toolbarhdr/pulls")).text();
+    expect(pullsHtml).toContain('<a class="ui small button" href="/alice/toolbarhdr/labels">Labels</a>');
+    expect(pullsHtml).toContain('<a class="ui small button" href="/alice/toolbarhdr/milestones">Milestones</a>');
+  });
+
+  it("the #issue-filters wrapper carries the openclose tabs in its left group and the empty filter-menu container in its right", async () => {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    await seedRepo(alice, "toolbarskel");
+    const html = await (await fetchUi("/alice/toolbarskel/issues")).text();
+    expect(html).toContain('<div id="issue-filters" class="issue-list-toolbar">');
+    // The tabs render INSIDE the wrapper's left group (the filters.tmpl
+    // structure the old bare toolbar-left div replaced).
+    const filtersStart = html.indexOf('<div id="issue-filters"');
+    const actionsStart = html.indexOf('<div id="issue-actions"');
+    const filtersBlock = html.slice(filtersStart, actionsStart);
+    expect(filtersBlock).toContain('<div class="issue-list-toolbar-left">');
+    expect(filtersBlock).toContain('<div class="small-menu-items ui compact tiny menu">');
+    expect(filtersBlock).toContain('<div class="issue-list-toolbar-right">');
+    expect(filtersBlock).toContain('<div class="ui secondary filter menu labels"');
+    // The filter dropdowns themselves stay unrendered (no feeds) — the
+    // container is the skeleton, so no dropdown item chrome inside.
+    expect(filtersBlock).not.toContain("dropdown jump");
+  });
+
+  it("the hidden #issue-actions twin renders (list.tmpl:39-56 — the bundle queries both ids unguarded)", async () => {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    await seedRepo(alice, "toolbaractions");
+    const html = await (await fetchUi("/alice/toolbaractions/issues")).text();
+    expect(html).toContain('<div id="issue-actions" class="issue-list-toolbar tw-hidden">');
+    // Its left group carries the openclose twin (upstream renders the tabs
+    // in BOTH panels; the batch-action dropdowns stay unrendered).
+    const actionsBlock = html.slice(html.indexOf('<div id="issue-actions"'), html.indexOf('id="issue-list"'));
+    expect(actionsBlock).toContain('<div class="issue-list-toolbar-left">');
+    // The batch-action controls (filter_actions' `issue-action` class +
+    // data-action attrs) stay unrendered — no landed write endpoints. (The
+    // bare "issue-action" substring would prefix-match the panel's own id.)
+    expect(actionsBlock).not.toContain("data-action=");
+  });
+
+  it("the select-all checkbox renders only for the write-granted viewer with a non-empty list (filters.tmpl's gate)", async () => {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const svc = new IssuesService(env.DB);
+    const repo = await seedRepo(alice, "toolarcheck");
+    const anonymous = await (await fetchUi("/alice/toolarcheck/issues")).text();
+    expect(anonymous).not.toContain("issue-checkbox-all");
+    await seedIssue(svc, repo.id, alice.id, "checkbox fodder", 10);
+    // Anonymous + items: still no checkbox (the write grant is the gate).
+    const anonWithItems = await (await fetchUi("/alice/toolarcheck/issues")).text();
+    expect(anonWithItems).not.toContain("issue-checkbox-all");
+    // The owner (the D1 grant threads true through the dispatch): checkbox
+    // with the upstream attrs.
+    const ownerHtml = await (await fetchUi("/alice/toolarcheck/issues", { headers: { cookie: await sessionHeader(alice.id) } })).text();
+    expect(ownerHtml).toContain('class="issue-checkbox-all tw-mr-4"');
+    expect(ownerHtml).toContain('title="Check/Uncheck all items"');
+    expect(ownerHtml).toContain('data-global-init="initRepoIssueListCheckboxes"');
+    // An EMPTY list for the same writer: no checkbox (the `.Issues` half).
+    const emptyRepo = await seedRepo(alice, "toolarempty");
+    const emptyHtml = await (
+      await fetchUi("/alice/toolarempty/issues", { headers: { cookie: await sessionHeader(alice.id) } })
+    ).text();
+    expect(emptyHtml).not.toContain("issue-checkbox-all");
+    void emptyRepo;
+  });
+});

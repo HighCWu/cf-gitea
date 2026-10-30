@@ -186,6 +186,16 @@ const ALLOWLIST = [
   'octicon-project',
   'octicon-tools',
   'gitea-double-chevron-left',
+  // The P2-7 remaining-S wave (residuals v1.3.2, the review-webui remainder):
+  // the repo home row's Add-File dropdown items (view_content.tmpl's
+  // repo-add-file menu — New File / Upload File / Apply Patch: file-added is
+  // the New File item's mark, upload the RepositoryUploadEnabled item's, diff
+  // the Apply Patch item's). The Go-to-File hint needs no new grant (its
+  // octicon-search is the home sidebar form's, already granted); the
+  // 16x16 + at-least-one-path constraints hold for all three.
+  'octicon-diff',
+  'octicon-file-added',
+  'octicon-upload',
 ];
 
 // What shell.tsx's Icon component hardcodes; a body needing anything else
