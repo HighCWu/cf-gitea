@@ -15,6 +15,7 @@ import { registerAdminDegenerateRoutes } from "./routes/admin-degenerate";
 import { registerAdminOrgExtrasRoutes } from "./routes/admin-org-extras";
 import { registerDeployKeyRoutes } from "./routes/deploy-keys";
 import { registerSecretsVariablesRoutes } from "./routes/secrets-variables";
+import { registerActionsArtifactRoutes } from "./routes/actions-artifacts";
 import { registerBlockRoutes } from "./routes/blocks";
 import { registerPushMirrorRoutes } from "./routes/push-mirrors";
 import { registerTagProtectionRoutes } from "./routes/tag-protections";
@@ -230,6 +231,10 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // status-rank listing, the PATCH flip; the 39-op remainder rides the
   // board's P1-8..P1-12 rows).
   registerSecretsVariablesRoutes(app, requireAuth);
+  // The /api/v1 artifacts quartet + the raw fifth arm (P1-10 — routes/
+  // actions-artifacts.ts; requireAuth accepted for symmetry, unused: upstream
+  // carries no reqToken on these arms).
+  registerActionsArtifactRoutes(app, requireAuth, optionalAuth);
   // Tier-1 tail families (REG-MERGE-3, committed 6e3c322): the archive
   // download, the diffpatch apply, the languages listing and the scheduled
   // auto-merge cancellation. All are deeper `/repos/{owner}/{repo}/<family>`
