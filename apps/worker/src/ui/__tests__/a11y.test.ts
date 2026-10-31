@@ -412,6 +412,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     const items = descendants(nav ?? root).filter((el) => el.tag === "a");
     expect(items.map((el) => accessibleName(el))).toEqual([
       "Dashboard",
+      "Authentication Sources", // the EXTERNAL AUTH W4 arm (navbar.tmpl:19 — the group's FIRST item; the auths pages landed over the login_source store)
       "Organizations",
       "User Accounts",
       "Badges",
@@ -471,6 +472,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     const items = descendants(nav ?? root).filter((el) => el.tag === "a");
     expect(items.map((el) => accessibleName(el))).toEqual([
       "Dashboard",
+      "Authentication Sources", // the EXTERNAL AUTH W4 arm (navbar.tmpl:19 — the group's FIRST item; the auths pages landed over the login_source store)
       "Organizations",
       "User Accounts",
       "Badges",
@@ -549,6 +551,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     const items = descendants(nav ?? root).filter((el) => el.tag === "a");
     expect(items.map((el) => accessibleName(el))).toEqual([
       "Dashboard",
+      "Authentication Sources", // the EXTERNAL AUTH W4 arm (navbar.tmpl:19 — the group's FIRST item; the auths pages landed over the login_source store)
       "Organizations",
       "User Accounts",
       "Badges",
@@ -625,6 +628,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     const items = descendants(nav ?? root).filter((el) => el.tag === "a");
     expect(items.map((el) => accessibleName(el))).toEqual([
       "Dashboard",
+      "Authentication Sources", // the EXTERNAL AUTH W4 arm (navbar.tmpl:19 — the group's FIRST item; the auths pages landed over the login_source store)
       "Organizations",
       "User Accounts",
       "Badges",

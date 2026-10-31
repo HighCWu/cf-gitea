@@ -175,6 +175,9 @@ describe("the admin hooks DOM (admin/hooks.tmpl × base_list.tmpl at the pin)", 
     expect(html).toContain('class="active item" href="/-/admin/hooks"');
     expect(html).toContain('href="/-/admin/applications"');
     expect(html).toContain('href="/-/admin/emails"');
-    expect(html).not.toContain("/-/admin/auths");
+    // The EXTERNAL AUTH W4 arm landed: the auths item LEFT the omission
+    // list (specs/external-auth-sources.md §6.4 — navbar.tmpl:19's first
+    // Identity & Access entry).
+    expect(html).toContain('href="/-/admin/auths"');
   });
 });

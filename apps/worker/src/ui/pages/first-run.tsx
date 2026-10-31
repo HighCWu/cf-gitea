@@ -34,8 +34,8 @@
  */
 
 import { BaseLayout, renderPage } from "../shell";
-import type { AdminInitPanel } from "./login";
-import { renderLoginPage } from "./login";
+import type { AdminInitPanel, OAuth2LoginSourceButton } from "./login";
+import { ExternalAuthMethods, renderLoginPage } from "./login";
 import type { UiContext } from "../ui-context";
 
 /** Component-local strings (the orgCreateLocale pattern — locale.ts is
@@ -65,11 +65,16 @@ export const signUpLocale = {
  *  `values` re-fills the typed fields like upstream's `{{.user_name}}`
  *  bindings. No password fields: PAT-only auth (the B-1 fix — module
  *  header); the token_auth_notice discloses the credential model in the
- *  upstream sign_up_tip slot instead. */
+ *  upstream sign_up_tip slot instead. The EXTERNAL AUTH W4 arm (specs/
+ *  external-auth-sources.md §5.6, upstream signup_inner.tmpl:50-56) renders
+ *  the social block INSIDE the form after the fields — the same
+ *  divider+navigator pair as the login page, driven by the `oauth2Sources`
+ *  option (absent/empty = no block). */
 export function SignUpPage(props: {
   ctx: UiContext;
   error: string | null;
   values?: { userName?: string; email?: string };
+  oauth2Sources?: OAuth2LoginSourceButton[];
 }) {
   const values = props.values ?? {};
   return (
@@ -108,6 +113,12 @@ export function SignUpPage(props: {
                   {signUpLocale.submit}
                 </button>
               </div>
+              {/* signup_inner.tmpl:50-56 — the external methods block sits
+                  INSIDE the form (upstream's own markup shape), before its
+                  close. */}
+              {props.oauth2Sources !== undefined ? (
+                <ExternalAuthMethods sources={props.oauth2Sources} />
+              ) : null}
             </form>
           </div>
           <div class="ui attached segment header top tw-flex tw-flex-col tw-items-center">
@@ -127,9 +138,15 @@ export function renderSignUpPage(options: {
   ctx: UiContext;
   error: string | null;
   values?: { userName?: string; email?: string };
+  oauth2Sources?: OAuth2LoginSourceButton[];
 }): string {
   return renderPage(
-    <SignUpPage ctx={options.ctx} error={options.error} values={options.values} />,
+    <SignUpPage
+      ctx={options.ctx}
+      error={options.error}
+      values={options.values}
+      oauth2Sources={options.oauth2Sources}
+    />,
   );
 }
 

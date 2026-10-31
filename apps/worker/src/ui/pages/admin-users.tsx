@@ -197,8 +197,11 @@
  * (SPEC-0018 §3.1), Monitoring (the four live monitor items; audit_logs
  * omitted) — with the details-open + active-item arms derived from the
  * `active` prop (upstream's per-group PageIs* conditions), and OMITS every
- * group whose items are all unlanded (self_check, auths — SPEC-0018 §3.3's
- * omission verdict, actions). Survey row flipped on landing:
+ * group whose items are all unlanded (self_check, actions — auths retired
+ * from the omission list at the EXTERNAL AUTH W4 landing: the /-/admin/auths
+ * pages are landed over the login_source store, specs/external-auth-sources.md
+ * §6.4's nav arm, navbar.tmpl:19's first Identity & Access item). Survey row
+ * flipped on landing:
  * docs/compat/ui-parity-survey.md:549 (the `/-/admin/*` row — users/orgs/
  * repos go PARTIAL→listed).
  */
@@ -296,9 +299,13 @@ export function AdminEmbeddedSvg(props: { name: string; size?: number; class?: s
 /** The admin navbar union — the pages this family's scaffolding links: the
  *  listings PLUS the dashboard, the monitor family, and the census-R18 arms
  *  (emails/badges/applications/hooks — this wave's mount window). Upstream's
- *  navbar.tmpl marks the active page's item inside its open group. */
+ *  navbar.tmpl marks the active page's item inside its open group.
+ *  `auths` is the EXTERNAL AUTH W4 arm (specs/external-auth-sources.md
+ *  §6.4 — navbar.tmpl:19's first Identity & Access item; the SPEC-0018
+ *  §3.3 omission verdict retires with the landed /-/admin/auths pages). */
 export type AdminFamilyNavActive =
   | "dashboard"
+  | "auths"
   | "users"
   | "orgs"
   | "repos"
@@ -332,6 +339,7 @@ export const adminFamilyLocale = {
   maintenance: "Maintenance", // "admin.maintenance" (navbar.tmpl:5)
   dashboard: "Dashboard", // "admin.dashboard"
   identityAccess: "Identity & Access", // "admin.identity_access" (navbar.tmpl:16)
+  authentications: "Authentication Sources", // "admin.authentication" (navbar.tmpl:19 — the W4 auths item, the group's FIRST entry)
   organizations: "Organizations", // "admin.organizations"
   userAccounts: "User Accounts", // "admin.users" (the nav item + page Title)
   badges: "Badges", // "admin.badges" (the R18 arm's nav item)
@@ -359,23 +367,25 @@ export const adminFamilyLocale = {
 
 /** The admin layout's navbar (navbar.tmpl at the pin; the F7 fold — ONE
  *  shared navbar across the whole admin family): the Maintenance details
- *  (Dashboard), Identity & Access (Organizations + User Accounts + Badges +
- *  Emails — the R18 arms), Assets (Packages — the tick-18 arm, gated on the
- *  global packages flag like navbar.tmpl:34's `{{if .EnablePackages}}` —
- *  then Repositories), Integrations (Applications + Webhooks — the R18
- *  arms), the Configuration group (the SPEC-0018 §3.2 arm's Summary item,
- *  navbar.tmpl:93-102 — the settings-editor item omitted by the dead-link
- *  rule), the TOP-LEVEL System Notices item (the SPEC-0018 §3.1 arm,
- *  navbar.tmpl:104-106's position), and Monitoring (the monitor family's
- *  four live items), and the Actions group (the C6 arm's Job-queue item,
- *  the actions wave's Runners/Variables items, and the store wave's
- *  Scoped-workflows item — navbar.tmpl:73-89's landed set). Upstream's
+ *  (Dashboard), Identity & Access (Authentication Sources — the W4 auths
+ *  arm, navbar.tmpl:19's first item — + Organizations + User Accounts +
+ *  Badges + Emails — the R18 arms), Assets (Packages — the tick-18 arm,
+ *  gated on the global packages flag like navbar.tmpl:34's
+ *  `{{if .EnablePackages}}` — then Repositories), Integrations
+ *  (Applications + Webhooks — the R18 arms), the Configuration group (the
+ *  SPEC-0018 §3.2 arm's Summary item, navbar.tmpl:93-102 — the
+ *  settings-editor item omitted by the dead-link rule), the TOP-LEVEL
+ *  System Notices item (the SPEC-0018 §3.1 arm, navbar.tmpl:104-106's
+ *  position), and Monitoring (the monitor family's four live items), and
+ *  the Actions group (the C6 arm's Job-queue item, the actions wave's
+ *  Runners/Variables items, and the store wave's Scoped-workflows item —
+ *  navbar.tmpl:73-89's landed set). Upstream's
  *  per-group `PageIs*` conditions reduce to:
  *  the group containing the active page renders `open`, the active item
- *  gets the `active item` class. auths, audit_logs, self_check are
- *  omitted — all their upstream items are unlanded pages (the dead-link
- *  rule; the census's (b)/(c) classes; the auths omission is SPEC-0018
- *  §3.3's verdict). */
+ *  gets the `active item` class. audit_logs, self_check are
+ *  omitted — their upstream items are unlanded pages (the dead-link
+ *  rule; the census's (b)/(c) classes); auths LEFT that list at the W4
+ *  landing (specs/external-auth-sources.md §6.4). */
 export function AdminFamilyNav(props: { active: AdminFamilyNavActive; packagesEnabled?: boolean }) {
   const item = (href: string, label: string, active: boolean) => (
     <a class={active ? "active item" : "item"} href={href}>
@@ -386,7 +396,11 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive; packagesEn
   // derived from the active page (upstream opens the group containing it).
   const maintenanceOpen = props.active === "dashboard";
   const identityOpen =
-    props.active === "users" || props.active === "orgs" || props.active === "badges" || props.active === "emails";
+    props.active === "auths" ||
+    props.active === "users" ||
+    props.active === "orgs" ||
+    props.active === "badges" ||
+    props.active === "emails";
   // navbar.tmpl:33: `{{if or .PageIsAdminRepositories (and .EnablePackages
   // .PageIsAdminPackages)}}open{{end}}` — the packages arm only opens the
   // group while the feature is enabled.
@@ -414,6 +428,12 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive; packagesEn
         <details class="item" open={openAttr(identityOpen)}>
           <summary>{adminFamilyLocale.identityAccess}</summary>
           <div class="menu">
+            {/* navbar.tmpl:18-21 — the auths item is the group's FIRST
+                entry ("Authentication Sources" — admin.authentication); the
+                W4 landing lights it unconditionally (the SPEC's OQ-5
+                parity call: upstream's zero-source page shows the empty
+                list + the create CTA, and the CRUD is real now). */}
+            {item("/-/admin/auths", adminFamilyLocale.authentications, props.active === "auths")}
             {item("/-/admin/orgs", adminFamilyLocale.organizations, props.active === "orgs")}
             {item("/-/admin/users", adminFamilyLocale.userAccounts, props.active === "users")}
             {item("/-/admin/badges", adminFamilyLocale.badges, props.active === "badges")}

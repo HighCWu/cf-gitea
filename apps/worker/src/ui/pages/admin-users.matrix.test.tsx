@@ -348,7 +348,11 @@ describe("the admin users DOM (templates/admin/user/list.tmpl at the pin)", () =
     expect(html).toContain('href="/-/admin/applications"');
     expect(html).toContain('href="/-/admin/hooks"');
     expect(html).not.toContain("/-/admin/self_check");
-    expect(html).not.toContain("/-/admin/auths");
+    // The EXTERNAL AUTH W4 arm landed: the auths pages render over the
+    // login_source store, so the auths item LEFT the omission list (specs/
+    // external-auth-sources.md §6.4 — navbar.tmpl:19's first Identity &
+    // Access entry).
+    expect(html).toContain('href="/-/admin/auths"');
     expect(html).toContain('href="/-/admin/notices"'); // SPEC-0018 §3.1's top-level item
     expect(html).toContain('href="/-/admin/config"'); // SPEC-0018 §3.2's Configuration group (the Summary item)
     // The tick-18 packages arm landed (the nav-fold rider): the Assets

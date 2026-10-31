@@ -1139,11 +1139,13 @@ describe("§2.9 boundary (the real dispatcher via SELF)", () => {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${cookieValue}` },
     });
     expect(res.status).toBe(401);
-    // The realm follows the pin's OAuth2 switch (githttp.go:152-158): OAuth2
-    // is absent here, so upstream's disabled arm — "use another realm to
-    // avoid GCM OAuth2 attempt" — is the challenge (respond.ts
-    // BASIC_AUTH_CHALLENGE).
-    expect(res.headers.get("www-authenticate")).toBe('Basic realm="Gitea (Basic Auth)"');
+    // The realm follows the pin's OAuth2 switch (githttp.go:146-159) — LIVE
+    // per SPEC specs/oauth2-provider.md §2.11's flip: the provider is
+    // enabled by default (OAUTH2_ENABLED strict polarity, default true),
+    // so the challenge answers the GCM built-in-application realm; the
+    // disabled arm stays pinned at the challenge site
+    // (web/oauth2-wellknown.test.ts).
+    expect(res.headers.get("www-authenticate")).toBe('Basic realm="Gitea"');
   });
 });
 

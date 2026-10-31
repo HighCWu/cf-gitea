@@ -60,7 +60,8 @@ import {
   renderSignUpPage,
   signUpLocale,
 } from "./pages/first-run";
-import { loginFirstRunLocale } from "./pages/login";
+import { loginFirstRunLocale, oauth2LoginSourceButtons } from "./pages/login";
+import { listActiveOAuth2Sources } from "../services/auth-sources/store";
 import { demoModeEnabled } from "../services/demo-sweep";
 import {
   allowSignup,
@@ -263,7 +264,13 @@ async function signUpPage(c: RouteContext): Promise<Response> {
   if (signedIn !== null) return signedIn;
   const assembled = await pageContext(c);
   if ("response" in assembled) return assembled.response;
-  return c.html(renderSignUpPage({ ctx: assembled.ctx, error: null }), 200);
+  // The external-auth block (specs/external-auth-sources.md §5.6, upstream
+  // signup_inner.tmpl:52): the same one-read projection as GET /login.
+  const activeSources = await listActiveOAuth2Sources(c.env.DB);
+  return c.html(
+    renderSignUpPage({ ctx: assembled.ctx, error: null, oauth2Sources: oauth2LoginSourceButtons(activeSources) }),
+    200,
+  );
 }
 
 /** POST /user/sign_up (auth.SignUpPost) — 404 while closed; the shared

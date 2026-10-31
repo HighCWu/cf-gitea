@@ -55,11 +55,12 @@ import { ScopeSet } from "../auth/scopes";
 import { TokenService } from "../auth/token-service";
 import { demoModeEnabled } from "../services/demo-sweep";
 import { allowSignup, initWindowOpen } from "../services/user-accounts";
+import { listActiveOAuth2Sources } from "../services/auth-sources/store";
 import { sessions, users } from "../db/schema";
 import { assetsBinding, assetsNotBuilt } from "./index";
 import { locale } from "./locale";
 import { AssetBuildError, loadManifest } from "./manifest";
-import { renderLoginPage } from "./pages/login";
+import { oauth2LoginSourceButtons, renderLoginPage } from "./pages/login";
 import { shellAssetsFromManifest, type UiContext } from "./ui-context";
 
 // ---------------------------------------------------------------------------
@@ -706,12 +707,18 @@ async function loginPage(c: RouteContext): Promise<Response> {
   const assembled = await pageContext(c, { kind: "anonymous" });
   if ("response" in assembled) return assembled.response;
   const redirectTo = new URL(c.req.url).searchParams.get("redirect_to");
+  // The external-auth buttons (specs/external-auth-sources.md §5.6): ONE
+  // store read — the active OAuth2 sources, name order — projected through
+  // the page module's mapper (dead cfgs drop). Empty table ⇒ the option is
+  // undefined and the render stays the byte-stable golden.
+  const activeSources = await listActiveOAuth2Sources(c.env.DB);
   const html = renderLoginPage({
     ctx: assembled.ctx,
     redirectTo,
     error: null,
     adminInit: (await initWindowOpen(c.env.DB)) ? { open: true, error: null } : undefined,
     signUpLink: allowSignup(c.env),
+    oauth2Sources: oauth2LoginSourceButtons(activeSources),
   });
   if (setCookie === null) return c.html(html, 200);
   return c.html(html, 200, { "set-cookie": setCookie });
