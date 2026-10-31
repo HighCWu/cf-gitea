@@ -18,6 +18,7 @@ import { registerSecretsVariablesRoutes } from "./routes/secrets-variables";
 import { registerActionsArtifactRoutes } from "./routes/actions-artifacts";
 import { registerAdminActionsRoutes } from "./routes/admin-actions";
 import { registerRepoActionsRoutes } from "./routes/repo-actions";
+import { registerFederationApiRoutes } from "./routes/federation";
 import { registerBlockRoutes } from "./routes/blocks";
 import { registerPushMirrorRoutes } from "./routes/push-mirrors";
 import { registerTagProtectionRoutes } from "./routes/tag-protections";
@@ -244,6 +245,10 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // The repo workflows-extras family (P1-9 — routes/repo-actions.ts; the
   // list/get/runs/disable/enable/dispatch + getWorkflowJob + job-logs ops).
   registerRepoActionsRoutes(app, requireAuth, optionalAuth);
+  // Federation Tier A's API stubs (SPEC federation.md §6.1.1 — the gated
+  // /api/v1/nodeinfo + /activitypub/* 501 arms, plain registrations OUTSIDE
+  // the generated OpenAPI document; the pin's swagger carries no such paths).
+  registerFederationApiRoutes(app);
   // Tier-1 tail families (REG-MERGE-3, committed 6e3c322): the archive
   // download, the diffpatch apply, the languages listing and the scheduled
   // auto-merge cancellation. All are deeper `/repos/{owner}/{repo}/<family>`

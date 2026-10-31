@@ -44,6 +44,20 @@
     // anything else keeps the instance closed — the first admin comes from the
     // login page's one-shot "initialize this instance" form (zero-user instances).
     "ALLOW_SIGNUP": "false",
+    // Federation gate (specs/federation.md Tier A): ONLY the exact string
+    // "true" mounts the discovery pair (GET /.well-known/nodeinfo,
+    // GET /.well-known/webfinger) and the registered-but-501 stubs
+    // (GET /api/v1/nodeinfo, ANY /api/v1/activitypub/*); absent/anything
+    // else answers upstream's disabled posture — web pair 404 "Not Found",
+    // API arms 404 from the router (fail-closed, upstream's own default:
+    // setting.Federation.Enabled=false, modules/setting/federation.go:23;
+    // the gate wraps the web pair at web.go:409-414 and the API
+    // registration at api.go:1007-1010). Upstream retracted the ActivityPub
+    // data plane at this pin (PR #36789 — "wait until the whole design is
+    // stable and usable"), so even enabled, the webfinger JRD advertises
+    // actor IRIs that answer 501 "Not implemented" — discovery-only, by
+    // upstream's own posture.
+    "FEDERATION_ENABLED": "false",
     // SPEC-0014 §2 — the demo-operations gate. ONLY the exact string "true"
     // arms the demo sweep (hourly cron producer → {kind:"demo-sweep"} → the
     // existing delete cascade); absent/anything else stays OFF (fail-closed,

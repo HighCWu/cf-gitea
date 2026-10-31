@@ -3,6 +3,13 @@ MIRROR_ALLOWED_HOST_LIST=
 MIRROR_CREDENTIAL_KEY=z/+oz+c290fTJO5IyUZeMeCR/af0bNxWCfy6L9CH9ww=
 DEMO_MODE=false
 ALLOW_SIGNUP=false
+# Federation (specs/federation.md Tier A) — OFF by default. Flip to "true"
+# to exercise /.well-known/nodeinfo, /.well-known/webfinger and the 501
+# stubs (/api/v1/nodeinfo, /api/v1/activitypub/*) locally. Note: vars must
+# ALSO exist in your (gitignored) wrangler.jsonc copy for local dev to
+# inject them — the vitest suite passes its own env slices, so it runs
+# without these.
+FEDERATION_ENABLED=false
 # Outbound email (specs/email-outbound.md §6) — OFF by default; flip
 # MAIL_ENABLED to "true" (+ MAIL_FROM, and MAIL_PROVIDER=resend with a real
 # key) to exercise the relay locally.

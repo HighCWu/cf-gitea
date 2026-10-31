@@ -1,6 +1,7 @@
 # SPEC: Federation (ActivityPub) — the pin census, the parity verdict, and the staged build
 
 Status: **draft** (v1.4 queue; written 2026-10-31, not yet ratified).
+**Tier A (W-A1) LANDED as-built 2026-10-31 — see §6.1.1; Tier B stays parked on OQ-1.**
 Pin: `fc493688` (gitea v1.22.0-rc1-3919).
 
 ---
@@ -407,6 +408,115 @@ orchestrator's file; this SPEC only specifies the var).
   `services/federation/webfinger.ts`, the two mount edits, the test file.
   No schema, no contract change, no engine touch.
 - Test battery: §7 Tier A (vitest, workerd bindings).
+
+#### 6.1.1 As-built (W-A1, landed 2026-10-31)
+
+What landed (all gates green: suite 24/24, neighbors 64/64, `pnpm check:api`
+PASS, `tsc --noEmit` zero in the new files, scoped eslint clean):
+
+- `apps/worker/src/api/routes/federation.ts` — the whole gated family:
+  `wellKnownRouter` (the `/.well-known` pair, a plain-Hono web sub-app, the
+  avatar-serving seam shape) + `registerFederationApiRoutes` (the two API
+  stub arms, plain registrations OUTSIDE the generated OpenAPI document —
+  the imports.ts carve; the pin's swagger has no such paths, §6.3 holds).
+- `apps/worker/src/services/federation/webfinger.ts` — the resolution
+  ladder: the Go `url.Parse` scheme/opaque mimic (`parseResource`), the
+  `GetUserByName`/`GetUserByEmail` ports (user.go:1120-1135 /
+  1372-1402 — including the noreply sub-arm), the mailto private-email
+  suppression, the visibility gate over the landed
+  `isUserVisibleToViewer` (api/services/user.ts), and the JRD projection
+  in Go struct order (webfinger.go:87-121).
+- `apps/worker/wrangler.jsonc.example` + `.dev.vars.example` — the
+  `FEDERATION_ENABLED` var, default `"false"`, strict-polarity documented
+  (the DEMO_MODE/MAIL class: ONLY the exact string `"true"` arms).
+- `apps/worker/src/api/routes/federation.test.ts` — the §7 Tier A battery
+  on real D1, both routers driven standalone (24 tests).
+
+The gate wiring: `federationEnabled(env)` reads `env.FEDERATION_ENABLED ===
+"true"` per request (Workers vars are runtime env, not boot config — the
+first-run ALLOW_SIGNUP adaptation). The web pair's handler gate answers
+Go `ctx.HTTPError(404)`'s exact bytes (`Not Found\n`,
+`text/plain; charset=utf-8`, nosniff — base.go:105-111 behind
+web.go:409-414); the API arms' gate answers the router's native not-found
+(`404 Not Found` — Hono's default handler bytes), the "unregistered at
+api.go:1007" posture. The 501 stubs answer Go `http.Error`'s
+`Not implemented\n` (person.go:12-14) on EVERY method/depth under the
+wildcard, anonymous included (upstream's GetDoerTokenScope early return,
+api.go:281-283).
+
+Build-time decisions, each a recorded adaptation (none silent):
+
+1. **The activitypub token-scope gate rides the ROUTE, not the central
+   table** — `tokenRequiresScopes(ActivityPub)` is upstream's own INLINE
+   placement (api.go:1009); our inline middleware mirrors the central
+   gate's evaluation byte-for-byte (scope-gate.ts:191-221 shape, the
+   routes/packages.ts `groupScopeGate` precedent), so the central table's
+   recorded gap note (scope-gate.ts:50-51) stays true — the row is absent
+   because the family gates itself; mounting a second copy would
+   double-evaluate. A `read:activitypub`/`write:activitypub` token passes
+   at its level; any other token 403s with api.go:300's exact body.
+2. **AppURL = the appOrigin chain** — the optional `APP_URL` var, else the
+   request origin, normalized to upstream's guaranteed trailing slash
+   (server.go:50-51); the webhooks-push.ts `appOrigin` posture (upstream
+   reads `setting.AppURL` config).
+3. **Avatar link = the house canonical projection**
+   `{appUrl}avatars/{usernameLower}` (api/services/repository.ts:495 — the
+   URL every user serialization already carries, served by the
+   avatar-serving seam). Upstream's `u.AvatarLink` is
+   gravatar/federated-config dependent (models/user/avatar.go:83-86);
+   cf-gitea has no gravatar config to port.
+4. **Noreply domain = the request hostname** — upstream's
+   `NO_REPLY_ADDRESS` defaults to `"noreply." + Service.Domain`
+   (service.go:212); cf-gitea has no Service.Domain, but its OWN noreply
+   emission convention is `<login>@noreply.<hostname>`
+   (api/routes/contents.ts:260) — the lookup arm accepts exactly the
+   addresses this instance emits. The name form resolves individual rows
+   only (GetIndividualUserByName), the `<id>+<name>` form by id, ParseInt
+   errors fall to the name arm (parseLocalPartToNameID).
+5. **Orgs resolve in webfinger** — `GetUserByName` is type-blind at the
+   pin (user.go:1120-1135), so `acct:{org}@host` resolves an org row and
+   the JRD carries the degenerate `mailto:` alias (the unconditional
+   append when `!KeepEmailPrivate`, webfinger.go:91-93, against an empty
+   org email). Ported type-blind, byte-faithful.
+6. **Webfinger carries the session-viewer arm** — `ctx.Doer` upstream is
+   the web session; ours resolves `gitea_session` through `verifySession`
+   with the attachments-serving seam's exact consumption (§2.4 background
+   settle, the clear/rotation Set-Cookie directive on the response).
+   Anonymous stays the default viewer (zero D1 reads without a cookie).
+7. **OPTIONS on /.well-known/* falls to the router 404** — upstream's
+   `optionsCorsHandler` is a no-op without `[cors]` config
+   (web.go:542), which cf-gitea does not surface; identical observable.
+
+**HANDOFF — the two mounts (orchestrator-owned files, unchanged by this
+wave):**
+
+`apps/worker/src/index.ts` (two one-line edits, the avatar-serving carve
+pattern):
+
+```ts
+// 1. beside the isAvatarServing/isAttachmentServing consts in fetch():
+const isWellKnown = segments[0] === ".well-known";
+//    ...and add `&& !isWellKnown` to the isRepoScoped conjunction, so the
+//    two-segment /.well-known/* paths stop falling to gitHttpGate's
+//    headless-engine 404.
+// 2. beside the attachmentsServingRouter mount (before firstRunRouter/uiRouter):
+import { wellKnownRouter } from "./api/routes/federation";
+app.route("/", wellKnownRouter);
+```
+
+`apps/worker/src/api/router.ts` (import + one registration call beside the
+other families — placement free; the paths are family-specific and shadow
+nothing):
+
+```ts
+import { registerFederationApiRoutes } from "./routes/federation";
+registerFederationApiRoutes(app);
+```
+
+Until the mounts land, the family is inert in production (the dispatcher's
+repo-scoped branch still claims /.well-known/* — today's headless-engine
+404 is the same fail-closed shape the gate would answer, modulo bytes);
+the suite drives both routers standalone and stays green either way.
 
 ### 6.2 Tier B — beyond parity (ONLY if OQ-1 ratifies; five waves, size L)
 

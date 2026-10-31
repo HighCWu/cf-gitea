@@ -29,6 +29,7 @@ import { sessionRouter } from "./ui/session";
 import { firstRunRouter } from "./ui/first-run";
 import { avatarServingRouter } from "./web/avatar-serving";
 import { attachmentsServingRouter } from "./web/attachments-serving";
+import { wellKnownRouter } from "./api/routes/federation";
 import { securityHeaders, withSecurityHeaders } from "./web/security-headers";
 import { webhookDlqHandler } from "./webhooks/dlq";
 import { webhookQueueHandler } from "./webhooks/consumer";
@@ -280,6 +281,10 @@ app.route("/", avatarServingRouter);
 // Attachments serving (web.go:912): plain Hono seam — mounted before uiRouter
 // so the literal /attachments/:uuid route wins over any page-parser shape.
 app.route("/", attachmentsServingRouter);
+// The /.well-known pair (federation Tier A — SPEC federation.md §6.1.1's
+// mount, the same plain-Hono seam shape): nodeinfo + webfinger, the
+// FEDERATION_ENABLED gate answers 404 when off (the web pair's disabled arm).
+app.route("/", wellKnownRouter);
 // Tier-2 UI (SPEC-0008 §2.2): the sub-app claims only the page families its
 // parser owns (/:owner/:repo[/commits|/src]); the dispatcher consults
 // handlesUiRoute BEFORE Hono routes, so a miss here can never swallow an
@@ -333,6 +338,11 @@ export default {
     // Attachments carve-out (web.go:912 — the site-level /attachments/:uuid
     // download route): never repo-scoped, never the engine's.
     const isAttachmentServing = segments[0] === "attachments";
+    // The /.well-known family (federation Tier A — the nodeinfo/webfinger
+    // pair rides wellKnownRouter; SPEC federation.md §6.1.1's mount): carved
+    // out of the repo-scoped branch so the two-segment shapes stop falling
+    // to the headless engine's 404.
+    const isWellKnown = segments[0] === ".well-known";
     // THE ASSET-MISS FALLBACK TARGET (web.go:264 + modules/public/public.go —
     // the v1.2-carried "no /assets fallback target" residual closed): the
     // wrangler assets binding serves every HIT edge-side with
@@ -372,7 +382,8 @@ export default {
       segments[0] !== "twirp" &&
       segments[0] !== "v2" && // the OCI root mount (api.go:509) — /v2/{owner}/… is NOT repo-scoped
       !isAvatarServing &&
-      !isAttachmentServing;
+      !isAttachmentServing &&
+      !isWellKnown;
     if (isRepoScoped) {
       // All methods for the UI's write families (new/edit/delete file,
       // new-issue, comments, settings, milestones — waves 4-8 are POSTs on
