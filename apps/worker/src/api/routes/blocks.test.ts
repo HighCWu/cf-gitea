@@ -3,7 +3,7 @@ import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 
 import {
   follows,
@@ -457,6 +457,43 @@ describe("user blocks", () => {
     const repoRows = await db().select().from(repositories).all();
     expect(repoRows.find((row) => row.id === aliceRepo.repoId)).toMatchObject({ numStars: 1, numWatches: 0 });
     expect(repoRows.find((row) => row.id === bobRepo.repoId)).toMatchObject({ numStars: 0, numWatches: 0 });
+  });
+
+  it("retains an AUTO watch row as Dont, deletes Normal/Custom, spares pre-existing Dont rows (unwatchRepos → WatchRepoAuto(false), watch.go:163-167)", async () => {
+    const { alice, bob } = await seedWorld();
+    const autoRepo = await seedRepo(alice);
+    const normalRepo = await seedRepo(alice);
+    const dontRepo = await seedRepo(alice);
+    // The three watch modes the unwatch-on-block flow distinguishes:
+    // Auto=3 (the AutoWatchOnChanges landing), Normal=1, and an
+    // already-Dont=2 row the enumeration never lists (GetWatchedRepos'
+    // ToConds, models/repo/user_repo.go: `watch.mode <> WatchModeDont`).
+    await db().insert(repoWatchers).values([
+      { repoId: autoRepo.repoId, userId: bob.id, mode: 3, createdAt: new Date() },
+      { repoId: normalRepo.repoId, userId: bob.id, mode: 1, createdAt: new Date() },
+      { repoId: dontRepo.repoId, userId: bob.id, mode: 2, createdAt: new Date() },
+    ]);
+    await db()
+      .update(repositories)
+      .set({ numWatches: 1 })
+      .where(inArray(repositories.id, [autoRepo.repoId, normalRepo.repoId, dontRepo.repoId]));
+
+    const res = await put("/api/v1/user/blocks/bob", alice.id);
+    expect(res.status).toBe(204);
+
+    // The Auto row SURVIVES as the deliberate-off Dont state (watchRepoByMode's
+    // update arm, watch.go:145-148); Normal is deleted (None, watch.go:149-151);
+    // the persisted Dont row is untouched — mute state outlives the block.
+    expect(await db().select().from(repoWatchers).all()).toEqual([
+      expect.objectContaining({ repoId: autoRepo.repoId, userId: bob.id, mode: 2 }),
+      expect.objectContaining({ repoId: dontRepo.repoId, userId: bob.id, mode: 2 }),
+    ]);
+    // Counter arithmetic (watch.go:128-134): Auto and Normal LEFT the
+    // watching state (−1 each); the Dont repo's counter never moves.
+    const repoRows = await db().select().from(repositories).all();
+    expect(repoRows.find((row) => row.id === autoRepo.repoId)).toMatchObject({ numWatches: 0 });
+    expect(repoRows.find((row) => row.id === normalRepo.repoId)).toMatchObject({ numWatches: 0 });
+    expect(repoRows.find((row) => row.id === dontRepo.repoId)).toMatchObject({ numWatches: 1 });
   });
 
   it("the cascade floors the counters at 0 when edges predate the backfill (the migration-0030 drift insurance)", async () => {

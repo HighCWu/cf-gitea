@@ -16,6 +16,7 @@ import {
   issueAssignees,
 } from "../../db/schema";
 import type { UserRow } from "./repository";
+import { WatchMode } from "./repo-watchers";
 import { ApiError } from "../errors";
 
 /**
@@ -427,7 +428,9 @@ export async function unblockUser(
  *   - unfollow each other (UnfollowUser ×2, block.go:110-114);
  *   - unstar each other's repos (unstarRepos — starrer × repos owned by the
  *     other, block.go:150-181);
- *   - unwatch each other's repositories (unwatchRepos, block.go:183-214);
+ *   - unwatch each other's repositories (unwatchRepos, block.go:183-214) —
+ *     mode-aware: an AUTO watch row is RETAINED as Dont (watch.go:163-167),
+ *     Normal/Custom rows are deleted, persisted Dont rows are untouched;
  *   - unassign each other from issues on the other's repos (unassignIssues,
  *     block.go:259-289);
  *   - remove each other's collaborations on the other's repos
@@ -444,7 +447,9 @@ export async function unblockUser(
  * AND star.go:62's doer decrement — the per-USER twin moves with the same
  * removed edge) and unwatchRepos calls WatchRepoAuto(false) per repo
  * (block.go:206-209 → watch.go:153's repoWatchDelta) — so each removed edge
- * moves its repo's counter by exactly -1 and the starrer's user counter by
+ * moves its repo's counter by exactly -1 (a retained Auto→Dont row counts —
+ * it LEFT the watching state; a pre-existing Dont row never enumerates and
+ * moves nothing — watch.go:128-134) and the starrer's user counter by
  * exactly -1. The set-based port matches that arithmetic: each edge delete
  * is PRECEDED by one counter UPDATE in the same batch (one implicit
  * transaction) that subtracts the still-present edge count for its own
@@ -498,17 +503,49 @@ function cleanupBlockRelations(
         ), 0)`,
       })
       .where(eq(users.id, party));
+  /** The watch arm is mode-aware (unwatchRepos, services/user/block.go:
+   *  183-214, → WatchRepoAuto(watcher, repo, false) per watched repo). The
+   *  enumeration (GetWatchedRepos — models/repo/user_repo.go ToConds
+   *  `watch.mode <> WatchModeDont`) never lists a persisted Dont row, and
+   *  watch.go:163-167 lands an AUTO watch on Dont — watchRepoByMode's update
+   *  arm RETAINS the row with mode=2 (watch.go:145-148) — while every other
+   *  enumerated mode goes to None, which DELETES the row (watch.go:149-151).
+   *  Only rows leaving the watching state move the counter (watch.go:128-134
+   *  repoWatchDelta → watch.go:153's per-repo `WHERE id = ?`), so the count
+   *  is CORRELATED to each repositories row — not the scope-wide total the
+   *  flat subquery would subtract from every owner repo — and guards
+   *  `mode NOT IN (0, 2)`, the store's watchingRowPredicate
+   *  (services/repo-watchers.ts); a pre-existing Dont row's share is 0
+   *  (None never persisting, the predicate kept exact against drift rows).
+   *  Statement order: the counter UPDATE first (its subquery must see the
+   *  rows the writes are about to remove/flip — the update-before-delete
+   *  convention), then the Auto→Dont flip, then the Normal/Custom delete;
+   *  the two writes' scopes are disjoint (`mode = Auto` vs
+   *  `mode NOT IN (Dont, Auto)` — after the flip no Auto row remains), so
+   *  even reordered they cannot interfere. */
   const dropWatchesFor = (party: number, ownerId: number) =>
     db
       .update(repositories)
       .set({
         numWatches: sql`MAX(num_watches - (
           SELECT COUNT(*) FROM repo_watchers
-          WHERE user_id = ${party}
-            AND repo_id IN (SELECT owned.id FROM repositories AS owned WHERE owned.owner_id = ${ownerId})
+          WHERE repo_id = ${repositories.id}
+            AND user_id = ${party}
+            AND mode NOT IN (${WatchMode.None}, ${WatchMode.Dont})
         ), 0)`,
       })
       .where(inArray(repositories.id, reposOwnedBy(ownerId)));
+  const retainAutoWatchAsDont = (party: number, ownerId: number) =>
+    db
+      .update(repoWatchers)
+      .set({ mode: WatchMode.Dont })
+      .where(
+        and(
+          eq(repoWatchers.userId, party),
+          inArray(repoWatchers.repoId, reposOwnedBy(ownerId)),
+          eq(repoWatchers.mode, WatchMode.Auto),
+        ),
+      );
 
   return [
     db.delete(follows).where(
@@ -524,9 +561,27 @@ function cleanupBlockRelations(
     dropUserStarsFor(b, a),
     db.delete(stars).where(and(eq(stars.userId, b), inArray(stars.repoId, reposOwnedBy(a)))),
     dropWatchesFor(a, b),
-    db.delete(repoWatchers).where(and(eq(repoWatchers.userId, a), inArray(repoWatchers.repoId, reposOwnedBy(b)))),
+    retainAutoWatchAsDont(a, b),
+    db
+      .delete(repoWatchers)
+      .where(
+        and(
+          eq(repoWatchers.userId, a),
+          inArray(repoWatchers.repoId, reposOwnedBy(b)),
+          sql`${repoWatchers.mode} NOT IN (${WatchMode.Dont}, ${WatchMode.Auto})`,
+        ),
+      ),
     dropWatchesFor(b, a),
-    db.delete(repoWatchers).where(and(eq(repoWatchers.userId, b), inArray(repoWatchers.repoId, reposOwnedBy(a)))),
+    retainAutoWatchAsDont(b, a),
+    db
+      .delete(repoWatchers)
+      .where(
+        and(
+          eq(repoWatchers.userId, b),
+          inArray(repoWatchers.repoId, reposOwnedBy(a)),
+          sql`${repoWatchers.mode} NOT IN (${WatchMode.Dont}, ${WatchMode.Auto})`,
+        ),
+      ),
     db.delete(issueAssignees).where(
       and(eq(issueAssignees.assigneeId, a), inArray(issueAssignees.issueId, issuesOnReposOf(b))),
     ),

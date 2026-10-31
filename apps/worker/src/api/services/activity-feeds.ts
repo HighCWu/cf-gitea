@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray, lte, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, lte, ne, or, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { z } from "zod";
 
@@ -17,6 +17,7 @@ import {
 import { commentSchema, type Comment } from "../models/issue";
 import { repositorySchema } from "../models/repository";
 import { userSchema } from "../models/user";
+import { WatchMode } from "./repo-watchers";
 import {
   apiUserFromRow,
   findRepositoriesByIds,
@@ -153,11 +154,12 @@ export interface ActionDraft {
  * Insert the receiver fan-out for one action (SPEC §3.2): the original row
  * (`user_id = act_user_id`), the org-owner row when the repo is org-owned
  * and the actor is not the org (feed.go:55-62), and one row per repo
- * watcher (feed.go:64-100). Deviation (SPEC §3.2): upstream's write-time
- * per-watcher unit-permission/notification-pref filter is NOT ported —
- * cf-gitea has no per-unit permissions and `repo_watchers` carries no
- * prefs; the read path's per-caller filters bound visibility under our
- * model.
+ * watcher (feed.go:64-100 — the GetWatchers read, watch.go:228-241:
+ * mode <> Dont + any include on + active user; see the query below).
+ * Deviation (SPEC §3.2): upstream's write-time per-watcher
+ * unit-permission/notification-pref filter is NOT ported — cf-gitea has no
+ * per-unit permissions and `repo_watchers` carries no prefs; the read
+ * path's per-caller filters bound visibility under our model.
  *
  * Throws on D1 errors — the emitter hooks own the catch-and-log posture,
  * exactly like the webhook fan-out.
@@ -188,11 +190,31 @@ export async function recordAction(db: D1Database, draft: ActionDraft): Promise<
     }
   }
 
-  // Watcher receivers, minus the actor and the org owner.
+  // Watcher receivers, minus the actor and the org owner — the GetWatchers
+  // read (models/repo/watch.go:228-241, the query NotifyWatchers runs at
+  // feed.go:122): `mode <> Dont` (the ignore/mute state never receives),
+  // at least one include flag on (a Custom row subscribed to NO event is
+  // skipped — watch.go:232-236), and the user row ACTIVE (watch.go:237's
+  // INNER JOIN `user.is_active = true` — the landed users.status='active'
+  // mapping, the searchExploreUsers convention; `prohibit_login = false`
+  // (:238) has no column — the landed no-column divergence class, every
+  // account is login-able).
   const watcherRows = await d1
     .select({ userId: repoWatchers.userId })
     .from(repoWatchers)
-    .where(eq(repoWatchers.repoId, draft.repoId))
+    .innerJoin(users, eq(users.id, repoWatchers.userId))
+    .where(
+      and(
+        eq(repoWatchers.repoId, draft.repoId),
+        ne(repoWatchers.mode, WatchMode.Dont),
+        or(
+          eq(repoWatchers.includePullRequests, true),
+          eq(repoWatchers.includeIssues, true),
+          eq(repoWatchers.includeReleases, true),
+        ),
+        eq(users.status, "active"),
+      ),
+    )
     .all();
   for (const watcher of watcherRows) {
     if (watcher.userId !== draft.actUserId && !receivers.includes(watcher.userId)) {

@@ -21,6 +21,7 @@ import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { repositorySchema, type Repository } from "../models/repository";
 import { parseListOptions, setPaginationHeaders, type ListOptions } from "../pagination";
+import { WatchMode } from "../services/repo-watchers";
 import { requireVisibleRepo } from "../services/repo-access";
 import { goRfc3339ParseError, parseQueryTime } from "../services/issues";
 import { apiRepositoryUrl, toApiRepository, viewerOf, type Viewer } from "../services/repository";
@@ -87,12 +88,14 @@ import { apiRepositoryUrl, toApiRepository, viewerOf, type Viewer } from "../ser
  *    (exact upstream message), site admin bypasses the recipient check (and
  *    falls back to the global latest activity when they authored every
  *    event); a recipient with no foreign activity has no mailbox entry → 404.
- * 4. Recipient set reduced to our tables: owner ∪ repo_watchers ∪ issue
- *    poster ∪ explicit issue subscribers ∪ comment participants. Upstream
- *    additionally notifies assignees and requested reviewers (no assignee
- *    table at this tier) and excludes repo "ignorers" and access-revoked
- *    users (no ignore mode / revocation model); upstream also matches watch
- *    modes (issues-only vs PRs-only) — our repo_watchers rows are untyped.
+ * 4. Recipient set reduced to our tables: owner ∪ repo_watchers (mode-aware:
+ *    a Dont/ignore row does NOT qualify — the migration-0053 mode columns
+ *    closed the "untyped rows" gap; the per-type include matching upstream
+ *    applies, GetRepoWatchersIDs' include_<type> arm, watch.go:266-292,
+ *    is still not ported here) ∪ issue poster ∪ explicit issue subscribers
+ *    ∪ comment participants. Upstream additionally notifies assignees and
+ *    requested reviewers (no assignee table at this tier) and excludes
+ *    access-revoked users (no revocation model).
  * 5. Subject types are Issue/Pull only. `subject-type=commit/repository`
  *    filters are accepted (upstream maps them to valid sources) but match
  *    nothing here — no commit/repository notification source exists.
@@ -416,10 +419,18 @@ function lastAnyActivityExpr(): SQL {
 /**
  * The recipient predicate (module doc deviation 4); needs the repositories
  * join plus the repo_watchers / issue_subscriptions left joins in scope.
+ * The watch arm is MODE-aware: a row qualifies only outside the ignore
+ * state (`mode <> Dont` — upstream's watcher-recipients never enumerate
+ * Dont rows: GetRepoWatchersIDs' `watch.mode<>? WatchModeDont`,
+ * models/repo/watch.go:281, and the mailer additionally sweeps the ignorers
+ * into the visited set FIRST — "muting the repository outranks every other
+ * source, including mentions", services/mailer/mail_issue.go:88-93), so a
+ * persisted Dont watch (the Auto-unwatch landing, watch.go:164-165) does
+ * not qualify a notification recipient on its own.
  */
 function recipientExpr(userId: number): SQL {
   return sql`(
-    ${repoWatchers.userId} is not null
+    (${repoWatchers.userId} is not null and ${repoWatchers.mode} <> ${WatchMode.Dont})
     or ${repositories.ownerId} = ${userId}
     or ${issues.posterId} = ${userId}
     or ${issueSubscriptions.userId} is not null

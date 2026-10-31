@@ -37,12 +37,13 @@ import type { User } from "../models/user";
 import { registerNotificationsRoutes } from "./notifications";
 import { IssuesService } from "../../issues/service";
 import { applyRepoExtrasDdl } from "../testing/repo-ddl";
-import { watchRepo } from "../services/repo-watchers";
+import { watchRepo, watchRepoByMode, WatchMode } from "../services/repo-watchers";
 
 const TOKEN_OWNER = "owner-token";
 const TOKEN_NEIGHBOR = "neighbor-token";
 const TOKEN_CAROL = "carol-token";
 const TOKEN_ADMIN = "admin-token";
+const TOKEN_WATCHER = "watcher-token";
 
 const T1 = new Date("2026-03-01T00:00:00Z"); // issue creations (by neighbor)
 const T2 = new Date("2026-03-05T00:00:00Z"); // owner's comment on A
@@ -95,7 +96,15 @@ function resolver(): AuthResolver {
         return userPayload(1, OWNER_NS, false);
       }
       const login =
-        token === TOKEN_NEIGHBOR ? "neighbor" : token === TOKEN_CAROL ? "carol" : token === TOKEN_ADMIN ? "root-admin" : null;
+        token === TOKEN_NEIGHBOR
+          ? "neighbor"
+          : token === TOKEN_CAROL
+            ? "carol"
+            : token === TOKEN_ADMIN
+              ? "root-admin"
+              : token === TOKEN_WATCHER
+                ? "watcher"
+                : null;
       if (login === null) {
         return null;
       }
@@ -252,6 +261,50 @@ describe("GET /notifications (notifyGetList)", () => {
     expect(threads.map((thread) => thread.unread)).toEqual([true, true]);
     expect(threads.map((thread) => thread.updated_at)).toEqual(["2026-03-09T00:00:00.000Z", "2026-03-01T00:00:00.000Z"]);
     expect(threads[0]?.url).toBe(`https://example.com/api/v1/notifications/threads/${issueA.id}`);
+  });
+
+  it("a Dont watch row stops qualifying the watcher as a recipient; a picked-include Custom row still qualifies (mode-aware recipientExpr)", async () => {
+    // A user whose ONLY recipient claim is the watch row (the seeded
+    // issues are authored by the neighbor, so poster/participant claims
+    // stay out of the picture).
+    const watcherRows = await drizzle(env.DB)
+      .insert(users)
+      .values({ username: "watcher", usernameLower: "watcher", status: "active", createdAt: SEED })
+      .returning({ id: users.id })
+      .all();
+    const watcherId = watcherRows[0]!.id;
+    const foreign = await new IssuesService(env.DB).createIssue({
+      repoId: REPO_ID,
+      title: "foreign activity",
+      posterId: neighborId,
+      now: T1,
+    });
+
+    // The Normal watch qualifies (the baseline the Dont exclusion erases) —
+    // the seeded A/B threads qualify through the same row (neighbor-authored
+    // = foreign activity), so assert membership.
+    await watchRepo(env.DB, REPO_ID, watcherId, SEED);
+    const listed = await send("/notifications", authed(undefined, TOKEN_WATCHER));
+    expect((await listed.json<Thread[]>()).map((thread) => thread.id)).toContain(foreign.id);
+
+    // A picked-include Custom row still qualifies (mode <> Dont — the
+    // per-type include matching is not part of recipientExpr, deviation 4).
+    await watchRepoByMode(env.DB, REPO_ID, watcherId, WatchMode.Custom, SEED);
+    const custom = await send("/notifications", authed(undefined, TOKEN_WATCHER));
+    expect((await custom.json<Thread[]>()).map((thread) => thread.id)).toContain(foreign.id);
+
+    // The Dont row (the ignore/mute state — watch.go:164-165's landing)
+    // disqualifies the watcher: the list empties and the thread endpoint
+    // answers the non-recipient 403.
+    await watchRepoByMode(env.DB, REPO_ID, watcherId, WatchMode.Dont, SEED);
+    expect((await (await send("/notifications", authed(undefined, TOKEN_WATCHER))).json<Thread[]>()).length).toBe(0);
+    const forbidden = await send(`/notifications/threads/${foreign.id}`, authed({ method: "PATCH" }, TOKEN_WATCHER));
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.json()).toEqual(
+      expect.objectContaining({
+        message: `only user itself and admin are allowed to read/change this thread ${foreign.id}`,
+      }),
+    );
   });
 
   it("serializes the subject (URLs, latest comment) and strips repository.permissions", async () => {

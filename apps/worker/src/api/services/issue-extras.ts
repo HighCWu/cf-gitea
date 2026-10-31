@@ -1,10 +1,11 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { comments, issuePins, issueSubscriptions, issues, reactions, repoWatchers, users } from "../../db/schema";
+import { comments, issuePins, issueSubscriptions, issues, reactions, users } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import type { IssueRow } from "../../issues/service";
 import { findRepoCommentById } from "./issues";
+import { getWatch, isWatchModeWatching } from "./repo-watchers";
 
 /**
  * Tier-2 issue-family extras behind the T2 routes of the issue-extras batch
@@ -137,12 +138,22 @@ export function findRepoComment(d1: D1Database, repoId: string, commentId: numbe
 // Issue subscriptions (models/issues/issue_watch.go)
 // ---------------------------------------------------------------------------
 
-/** GetIssueWatch + the repo-watch fallback of CheckIssueWatch: an explicit
- *  row wins; the absence falls back to the repo watcher probe. */
+/** GetIssueWatch + the repo-watch fallback of CheckIssueWatch
+ *  (models/issues/issue_watch.go:73-89): an explicit `issue_watch` row wins
+ *  verbatim; the absence falls to the repo-watch read — `GetWatch`
+ *  (models/repo/watch.go:57-69, the dummy mirror: an absent row IS mode
+ *  None with every include true) decoded through `IsWatchModeWatching`
+ *  (watch.go:104-106, mode ∉ {None, Dont}) AND the per-type include the
+ *  issue's unit picks (`util.Iif(issue.IsPull, w.IncludePullRequests,
+ *  w.IncludeIssues)`, issue_watch.go:85). A persisted Dont row (the
+ *  ignore/mute state) therefore does NOT subscribe, and a Custom row
+ *  subscribes only to its picked event types. Upstream's final
+ *  participants fallback (issue_watch.go:88) is not modeled here — no
+ *  participant store at this tier (the module-level divergence class). */
 export async function checkIssueSubscription(
   d1: D1Database,
   userId: number,
-  issue: Pick<IssueRow, "id" | "repoId">,
+  issue: Pick<IssueRow, "id" | "repoId" | "isPull">,
 ): Promise<boolean> {
   const row = await drizzle(d1)
     .select({ isWatching: issueSubscriptions.isWatching })
@@ -153,13 +164,8 @@ export async function checkIssueSubscription(
   if (row !== undefined) {
     return row.isWatching;
   }
-  const watcher = await drizzle(d1)
-    .select({ userId: repoWatchers.userId })
-    .from(repoWatchers)
-    .where(and(eq(repoWatchers.repoId, issue.repoId), eq(repoWatchers.userId, userId)))
-    .limit(1)
-    .get();
-  return watcher !== undefined;
+  const watch = await getWatch(d1, issue.repoId, userId);
+  return isWatchModeWatching(watch.mode) && (issue.isPull === true ? watch.watchPullRequests : watch.watchIssues);
 }
 
 /** The explicit issue subscribers (is_watching rows) rendered as users,

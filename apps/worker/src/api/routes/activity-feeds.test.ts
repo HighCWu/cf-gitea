@@ -199,6 +199,48 @@ describe("activity feeds — write path through the emitters", () => {
     ]);
   });
 
+  it("runs the GetWatchers mode filter over the watcher receivers (watch.go:228-241) — Dont and no-include rows receive nothing, a picked-include Custom row does", async () => {
+    // Four watchers on the repo beside the actor:
+    //   neighborId    — Normal (1), the plain watcher — included;
+    //   dontId        — Dont (2), the ignore/mute state — never receives;
+    //   mutedId       — Custom (4) with EVERY include off — watch.go:232-236
+    //                   skips a subscriber to no event;
+    //   picksId       — Custom (4) with include_issues on — included.
+    const seedWatcherUser = async (username: string): Promise<number> => {
+      await env.DB.prepare("INSERT INTO users (username, username_lower, created_at) VALUES (?, ?, 0)")
+        .bind(username, username)
+        .run();
+      return Number(
+        (await env.DB.prepare("SELECT id FROM users WHERE username_lower = ?").bind(username).first<{ id: number }>())
+          ?.id,
+      );
+    };
+    const dontId = await seedWatcherUser("dont");
+    const mutedId = await seedWatcherUser("muted");
+    const picksId = await seedWatcherUser("picks");
+    await env.DB.prepare("INSERT INTO repo_watchers (repo_id, user_id) VALUES (?, ?)").bind(REPO_ID, neighborId).run();
+    await env.DB.prepare("INSERT INTO repo_watchers (repo_id, user_id, mode) VALUES (?, ?, 2)")
+      .bind(REPO_ID, dontId)
+      .run();
+    await env.DB.prepare(
+      "INSERT INTO repo_watchers (repo_id, user_id, mode, include_pull_requests, include_issues, include_releases) VALUES (?, ?, 4, 0, 0, 0)",
+    )
+      .bind(REPO_ID, mutedId)
+      .run();
+    await env.DB.prepare(
+      "INSERT INTO repo_watchers (repo_id, user_id, mode, include_pull_requests, include_issues, include_releases) VALUES (?, ?, 4, 0, 1, 0)",
+    )
+      .bind(REPO_ID, picksId)
+      .run();
+
+    await emitIssueOpened({ repoId: REPO_ID, isPrivate: false, senderId: 1, title: "Modes" });
+
+    const receiverIds = (
+      await env.DB.prepare("SELECT DISTINCT user_id FROM action WHERE repo_id = ?").bind(REPO_ID).all<{ user_id: number }>()
+    ).results.map((row) => row.user_id);
+    expect(receiverIds.sort((a, b) => a - b)).toEqual([1, neighborId, picksId].sort((a, b) => a - b));
+  });
+
   it("maps rename_repo with the old name as content", async () => {
     await emitRepoEvent(emitterRequest, {
       repoId: REPO_ID,
