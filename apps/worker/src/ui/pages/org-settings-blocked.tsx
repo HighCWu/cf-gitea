@@ -283,11 +283,18 @@ export interface OrgBlockedListItem {
 export interface OrgBlockedUsersData {
   org: OrgRecord;
   blocks: OrgBlockedListItem[];
+  /** The shared navbar's Applications gate (org navbar.tmpl:15-19's
+   *  `.EnableOAuth2` wrap): threaded by the loader's optional-trailing-param
+   *  (the applications loader's shape — the route passes
+   *  `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /** Load the list (the landed `organizationListBlocks` read arm — id ASC —
- *  plus the one batched note read for the page). */
-export async function loadOrgBlockedUsers(d1: D1Database, org: OrgRecord): Promise<OrgBlockedUsersData> {
+ *  plus the one batched note read for the page). `oauth2Enabled` (default
+ *  true) is the navbar gate read the route passes
+ *  (`oauth2FeatureEnabled(c.env)`). */
+export async function loadOrgBlockedUsers(d1: D1Database, org: OrgRecord, oauth2Enabled = true): Promise<OrgBlockedUsersData> {
   const { items } = await listBlockedUsers(d1, org.id, { page: 1, pageSize: BLOCKED_USERS_LIST_LIMIT });
   // One batched note read for the page (the hooks page's delivery-count
   // batching pattern — listBlockedUsers returns the blockee rows only).
@@ -300,7 +307,7 @@ export async function loadOrgBlockedUsers(d1: D1Database, org: OrgRecord): Promi
       .all();
     for (const row of rows) notes.set(row.blockeeId, row.note);
   }
-  return { org, blocks: items.map((blockee) => ({ blockee, note: notes.get(blockee.id) ?? "" })) };
+  return { org, blocks: items.map((blockee) => ({ blockee, note: notes.get(blockee.id) ?? "" })), oauth2Enabled };
 }
 
 /** The full-document render (the render.tsx pattern — `index.ts` stays a
@@ -327,7 +334,7 @@ export function OrgBlockedUsersPage(props: { ctx: UiContext; data: OrgBlockedUse
     <BaseLayout ctx={ctx} title={orgSettingsBlockedLocale.blocked_users} pageClass="organization settings blocked_users">
       <OrgHeader org={org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={`/${org.username}`} active="blocked" />
+        <OrgSettingsNavbar orgLink={`/${org.username}`} active="blocked" oauth2Enabled={data.oauth2Enabled} />
         <div class="flex-container-main">
           {/* The invalid-POST re-render's banner (the org hooks-page
               convention — upstream's JSONError toast, the no-JS

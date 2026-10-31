@@ -567,13 +567,20 @@ export interface AdminAuthSourceListItem {
 export interface AdminAuthsData {
   items: AdminAuthSourceListItem[];
   total: number;
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): threaded by the
+   *  loader's optional-trailing-param (the applications loader's shape —
+   *  the route passes `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /** The list load — admin.Authentications' FindAndCount over
  *  FindSourcesOptions{} (auths.go:44-56, name order per the store's
  *  FindSources), the per-row provider + linked-users reads. Upstream
- *  renders the FULL set (no pager — the template ranges everything). */
-export async function loadAdminAuthsData(d1: D1Database): Promise<AdminAuthsData> {
+ *  renders the FULL set (no pager — the template ranges everything).
+ *  `oauth2Enabled` (default true) is the Integrations gate read the route
+ *  passes (`oauth2FeatureEnabled(c.env)`). */
+export async function loadAdminAuthsData(d1: D1Database, oauth2Enabled = true): Promise<AdminAuthsData> {
   const rows = await findLoginSources(d1);
   const items: AdminAuthSourceListItem[] = [];
   for (const row of rows) {
@@ -588,7 +595,7 @@ export async function loadAdminAuthsData(d1: D1Database): Promise<AdminAuthsData
     }
     items.push({ row, provider, linkedUsers: await countLoginSourceUsers(d1, row.id) });
   }
-  return { items, total: rows.length };
+  return { items, total: rows.length, oauth2Enabled };
 }
 
 /** The full-document render (the render.tsx pattern). */
@@ -603,7 +610,7 @@ export function renderAdminAuthsPage(ctx: UiContext, data: AdminAuthsData): stri
 export function AdminAuthsPage(props: { ctx: UiContext; data: AdminAuthsData }) {
   const colCount = 9; // upstream's seven + the SPEC §6.1 Provider/Users pair
   return (
-    <AdminFamilyShell ctx={props.ctx} title={adminAuthsLocale.authentication} pageClass="admin authentication" active="auths">
+    <AdminFamilyShell ctx={props.ctx} title={adminAuthsLocale.authentication} pageClass="admin authentication" active="auths" oauth2Enabled={props.data.oauth2Enabled}>
       {/* list.tmpl:3-8: the panel header + total + the Add button (the
           new page is LANDED — a live link, upstream's own href). */}
       <h4 class="ui top attached header">
@@ -851,6 +858,11 @@ export interface AdminAuthSourceNewData {
   form: AdminAuthSourceFormValues;
   error: string | null;
   errorField: AdminAuthSourceField | null;
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): the route-built
+   *  data threads the strict-polarity read
+   *  (`oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /** The full-document render — the new page. */
@@ -868,6 +880,7 @@ export function AdminAuthSourceNewPage(props: { ctx: UiContext; data: AdminAuthS
       title={adminAuthsLocale.new}
       pageClass="admin new authentication"
       active="auths"
+      oauth2Enabled={props.data.oauth2Enabled}
     >
       <h4 class="ui top attached header">{adminAuthsLocale.new}</h4>
       <div class="ui attached segment">
@@ -931,11 +944,18 @@ export interface AdminAuthSourceEditData {
   form: AdminAuthSourceFormValues | null;
   error: string | null;
   errorField: AdminAuthSourceField | null;
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): threaded by the
+   *  loader's optional-trailing-param (the applications loader's shape —
+   *  the route passes `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /** The edit GET load — GetSourceByID + the cfg parse + the in-use count.
- *  Null = the unknown-id arm (the route 404-shells). */
-export async function loadAdminAuthSourceEditData(d1: D1Database, id: number): Promise<AdminAuthSourceEditData | null> {
+ *  Null = the unknown-id arm (the route 404-shells). `oauth2Enabled`
+ *  (default true) is the Integrations gate read the route passes
+ *  (`oauth2FeatureEnabled(c.env)`). */
+export async function loadAdminAuthSourceEditData(d1: D1Database, id: number, oauth2Enabled = true): Promise<AdminAuthSourceEditData | null> {
   const source = await getLoginSource(d1, id);
   if (source === null) return null;
   let cfg: OAuth2SourceConfig | null = null;
@@ -946,7 +966,7 @@ export async function loadAdminAuthSourceEditData(d1: D1Database, id: number): P
       cfg = null;
     }
   }
-  return { source, cfg, linkedUsers: await countLoginSourceUsers(d1, id), form: null, error: null, errorField: null };
+  return { source, cfg, linkedUsers: await countLoginSourceUsers(d1, id), form: null, error: null, errorField: null, oauth2Enabled };
 }
 
 /** The edit-page form values from the STORED row (the GET render's fill):
@@ -985,7 +1005,7 @@ export function AdminAuthSourceEditPage(props: { ctx: UiContext; data: AdminAuth
   const form = props.data.form ?? adminAuthSourceFormFromRow(source, props.data.cfg);
   const editHref = `/-/admin/auths/${source.id}`;
   return (
-    <AdminFamilyShell ctx={props.ctx} title={adminAuthsLocale.edit} pageClass="admin edit authentication" active="auths">
+    <AdminFamilyShell ctx={props.ctx} title={adminAuthsLocale.edit} pageClass="admin edit authentication" active="auths" oauth2Enabled={props.data.oauth2Enabled}>
       <h4 class="ui top attached header">{adminAuthsLocale.edit}</h4>
       <div class="ui attached segment">
         {props.data.error !== null ? (

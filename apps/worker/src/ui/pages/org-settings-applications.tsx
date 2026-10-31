@@ -237,26 +237,39 @@ export interface OrgSettingsApplicationsData {
   org: OrgRecord;
   apps: OAuth2AppRow[];
   form: OrgApplicationCreateForm;
+  /** The shared navbar's Applications gate (org navbar.tmpl:15-19's
+   *  `.EnableOAuth2` wrap): threaded by the loader's optional-trailing-param
+   *  (the applications loader's shape — the route passes
+   *  `oauth2FeatureEnabled(c.env)`). Absent/true = enabled; the mounted
+   *  route's group 403 (web.go:1030) makes the false arm's render
+   *  unreachable — the loader still skips the OAuth2 reads on it (the user
+   *  twin's applications.go:189-203 posture). */
+  oauth2Enabled?: boolean;
 }
 
 /**
  * The list load — Applications' OwnerID read (setting_oauth2.go:39-41) over
  * the landed service, looped to the render bound (the module header):
- * uid=org.id only, id DESC.
+ * uid=org.id only, id DESC. `oauth2Enabled` (default true) is the navbar
+ * gate read the route passes (`oauth2FeatureEnabled(c.env)`) — false skips
+ * the OAuth2 reads entirely (the user twin's shape).
  */
-export async function loadOrgSettingsApplications(d1: D1Database, org: OrgRecord): Promise<OrgSettingsApplicationsData> {
+export async function loadOrgSettingsApplications(d1: D1Database, org: OrgRecord, oauth2Enabled = true): Promise<OrgSettingsApplicationsData> {
   const apps: OAuth2AppRow[] = [];
-  let page = 1;
-  for (;;) {
-    const { rows, total } = await listOAuth2Applications(d1, org.id, page, SERVICE_PAGE_SIZE);
-    apps.push(...rows);
-    if (apps.length >= Math.min(total, ORG_APPLICATIONS_LIST_LIMIT) || rows.length < SERVICE_PAGE_SIZE) break;
-    page += 1;
+  if (oauth2Enabled) {
+    let page = 1;
+    for (;;) {
+      const { rows, total } = await listOAuth2Applications(d1, org.id, page, SERVICE_PAGE_SIZE);
+      apps.push(...rows);
+      if (apps.length >= Math.min(total, ORG_APPLICATIONS_LIST_LIMIT) || rows.length < SERVICE_PAGE_SIZE) break;
+      page += 1;
+    }
   }
   return {
     org,
     apps,
     form: { name: "", redirectUrisRaw: "", confidentialClient: true, skipSecondaryAuthorization: false },
+    oauth2Enabled,
   };
 }
 
@@ -337,7 +350,7 @@ export function OrgApplicationsPage(props: { ctx: UiContext; data: OrgSettingsAp
     <BaseLayout ctx={ctx} title={orgSettingsApplicationsLocale.applications} pageClass="organization settings options">
       <OrgHeader org={org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={orgLink} active="applications" />
+        <OrgSettingsNavbar orgLink={orgLink} active="applications" oauth2Enabled={data.oauth2Enabled} />
         <div class="flex-container-main">
           {/* org/settings/applications.tmpl's .org-setting-content. */}
           <div class="org-setting-content">

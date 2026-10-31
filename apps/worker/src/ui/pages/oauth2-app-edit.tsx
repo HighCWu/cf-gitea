@@ -416,12 +416,22 @@ export interface OAuth2AppEditPageData {
   formActionPath: string;
   form: OAuth2AppEditForm;
   error: string | null;
+  /** The org/admin frames' Applications nav gate (org navbar.tmpl:15-19 /
+   *  admin navbar.tmpl:68-72's `.EnableOAuth2` arms): threaded by the
+   *  assembler's optional-trailing-param (the applications loader's shape —
+   *  the route passes `oauth2FeatureEnabled(c.env)`). Absent/true = enabled;
+   *  the user twin's navbar item is UNGATED upstream and ignores the field.
+   *  Both mounted routes 403 on the same flag (web.go:373-378), so the
+   *  false arm's render is unreachable in production. */
+  oauth2Enabled?: boolean;
 }
 
 /** Assemble the render inputs for a plain show (the EditShow arm: the stored
  *  values re-rendered, no secret). The save-error arm passes the kept
- *  submission through `form` instead. */
-export function oauth2AppEditPageData(app: OAuth2AppRow, formActionPath: string, error: string | null = null): OAuth2AppEditPageData {
+ *  submission through `form` instead. `oauth2Enabled` (default true) is the
+ *  org/admin navbar gate read the route passes
+ *  (`oauth2FeatureEnabled(c.env)`). */
+export function oauth2AppEditPageData(app: OAuth2AppRow, formActionPath: string, error: string | null = null, oauth2Enabled = true): OAuth2AppEditPageData {
   return {
     app,
     clientSecret: "",
@@ -433,6 +443,7 @@ export function oauth2AppEditPageData(app: OAuth2AppRow, formActionPath: string,
       skipSecondaryAuthorization: app.skipSecondaryAuthorization,
     },
     error,
+    oauth2Enabled,
   };
 }
 
@@ -549,7 +560,7 @@ export function renderOrgOauth2AppEditPage(ctx: UiContext, org: OrgRecord, data:
     <BaseLayout ctx={ctx} title={data.app.name} pageClass="organization settings options">
       <OrgHeader org={org} signedIn={signedIn} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={orgLink} active="applications" />
+        <OrgSettingsNavbar orgLink={orgLink} active="applications" oauth2Enabled={data.oauth2Enabled} />
         <div class="flex-container-main">
           <div class="org-setting-content">
             <Oauth2AppEditFormSegment data={data} />
@@ -568,7 +579,7 @@ export function renderOrgOauth2AppEditPage(ctx: UiContext, org: OrgRecord, data:
  */
 export function renderAdminOauth2AppEditPage(ctx: UiContext, data: OAuth2AppEditPageData): string {
   return renderPage(
-    <AdminFamilyShell ctx={ctx} title={data.app.name} pageClass="admin config" active="applications">
+    <AdminFamilyShell ctx={ctx} title={data.app.name} pageClass="admin config" active="applications" oauth2Enabled={data.oauth2Enabled}>
       <Oauth2AppEditFormSegment data={data} />
     </AdminFamilyShell>,
   );

@@ -25,6 +25,7 @@ import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { blockUser } from "../../api/services/blocks";
 import { orgMembers, users } from "../../db/schema";
 import type { OrgRecord } from "../../services/orgs/orgs";
+import { oauth2FeatureEnabled } from "../../services/oauth2/token";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import { OrgSettingsNavbar } from "../components/settings-nav";
@@ -317,6 +318,26 @@ describe("the blocked-users tab DOM (shared/user/blocked_users.tmpl at the pin)"
     expect(html).toContain('target="_blank"');
     expect(html).toContain('href="https://docs.gitea.com/usage/access-control/blocking-user"');
     expect(html).toContain(orgSettingsBlockedLocale.info_docs);
+  });
+
+  it("the navbar's Applications gate: OAUTH2_ENABLED=false drops the item (org navbar.tmpl:15-19's .EnableOAuth2 wrap)", async () => {
+    // The default posture arms the item (the absent prop = enabled).
+    const enabled = await loadOrgBlockedUsers(env.DB, org.record);
+    expect(renderToString(<OrgBlockedUsersPage ctx={ctx} data={enabled} error={null} />)).toContain(
+      'href="/acme/settings/applications"',
+    );
+    // The pinned-false arm rides the strict-polarity read the route passes
+    // (`oauth2FeatureEnabled(c.env)`) through the loader into the shared
+    // navbar's optional prop. The mutation-hole cast: the generated Env
+    // pins the deployed "true" literal (admin-monitor.test.tsx's
+    // convention), so the test widens the slice to assign the polarity.
+    const armedEnv = { ...env } as { OAUTH2_ENABLED?: string };
+    armedEnv.OAUTH2_ENABLED = "false";
+    const data = await loadOrgBlockedUsers(env.DB, org.record, oauth2FeatureEnabled(armedEnv));
+    const html = renderToString(<OrgBlockedUsersPage ctx={ctx} data={data} error={null} />);
+    expect(html).not.toContain('href="/acme/settings/applications"');
+    // The gate is item-exact: the navbar's siblings stay.
+    expect(html).toContain('href="/acme/settings/blocked_users"');
   });
 
   it("renders the rows: avatar seam img, HomeLink title, the note arm, the unblock form", async () => {

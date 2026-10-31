@@ -137,10 +137,17 @@ export interface OrgHooksSettingsData {
   hooks: OrgHookListItem[];
   /** The re-rendered add-form submission ("" on the plain GET). */
   form: { name: string; payloadUrl: string; contentType: string };
+  /** The shared navbar's Applications gate (org navbar.tmpl:15-19's
+   *  `.EnableOAuth2` wrap): threaded by the loader's optional-trailing-param
+   *  (the applications loader's shape — the route passes
+   *  `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
-/** Load the list (the landed orgListHooks read arm — owner-scoped, id ASC). */
-export async function loadOrgHooksSettings(d1: D1Database, org: OrgRecord): Promise<OrgHooksSettingsData> {
+/** Load the list (the landed orgListHooks read arm — owner-scoped, id ASC).
+ *  `oauth2Enabled` (default true) is the navbar gate read the route passes
+ *  (`oauth2FeatureEnabled(c.env)`). */
+export async function loadOrgHooksSettings(d1: D1Database, org: OrgRecord, oauth2Enabled = true): Promise<OrgHooksSettingsData> {
   const { items } = await listOwnerHooks(d1, org.id, { page: 1, limit: HOOKS_LIST_LIMIT });
   // One batched delivery-count read for the page (the repo page's wave-2
   // batching pattern; listHookDeliveries is per-hook and paginated — the
@@ -159,6 +166,7 @@ export async function loadOrgHooksSettings(d1: D1Database, org: OrgRecord): Prom
     org,
     hooks: items.map((row) => ({ row, events: hookEventsArray(row.events), deliveries: counts.get(row.id) ?? 0 })),
     form: { name: "", payloadUrl: "", contentType: "json" },
+    oauth2Enabled,
   };
 }
 
@@ -209,7 +217,7 @@ export function OrgHooksSettingsPage(props: { ctx: UiContext; data: OrgHooksSett
     <BaseLayout ctx={ctx} title={orgSettingsLocale.settings} pageClass="organization settings webhooks">
       <OrgHeader org={org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={orgLink} active="hooks" />
+        <OrgSettingsNavbar orgLink={orgLink} active="hooks" oauth2Enabled={data.oauth2Enabled} />
         <div class="flex-container-main">
           {/* base_list.tmpl's header/segment pair. The h4 renders upstream's
               literal .Title — org/setting.go:151 sets it to org.settings, not
@@ -330,11 +338,18 @@ export interface OrgHookDetailData {
   /** The edit form's binding (the stored values; overwritten with the kept
    *  submission on a validation re-render). */
   form: HookEditForm;
+  /** The shared navbar's Applications gate (org navbar.tmpl:15-19's
+   *  `.EnableOAuth2` wrap): threaded by the loader's optional-trailing-param
+   *  (the applications loader's shape — the route passes
+   *  `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /** Load the per-hook page (the landed orgGetHook read + the shared delivery
- *  read). `null` = the 404 shell: an unknown or foreign-org hook id. */
-export async function loadOrgHookDetailData(d1: D1Database, org: OrgRecord, hookId: number): Promise<OrgHookDetailData | null> {
+ *  read). `null` = the 404 shell: an unknown or foreign-org hook id.
+ *  `oauth2Enabled` (default true) is the navbar gate read the route passes
+ *  (`oauth2FeatureEnabled(c.env)`). */
+export async function loadOrgHookDetailData(d1: D1Database, org: OrgRecord, hookId: number, oauth2Enabled = true): Promise<OrgHookDetailData | null> {
   const hook = await getOwnerHook(d1, org.id, hookId);
   if (hook === null) return null;
   const { items, total } = await listHookDeliveries(d1, hook.id, { page: 1, limit: HOOK_DELIVERIES_LIMIT });
@@ -347,6 +362,7 @@ export async function loadOrgHookDetailData(d1: D1Database, org: OrgRecord, hook
     deliveries: items,
     deliveryTotal: total,
     form: hookEditFormOf(hook, events),
+    oauth2Enabled,
   };
 }
 
@@ -433,7 +449,7 @@ export function OrgHookDetailPage(props: { ctx: UiContext; data: OrgHookDetailDa
     <BaseLayout ctx={ctx} title={hookDetailLocale.update_webhook} pageClass="organization settings new webhook">
       <OrgHeader org={org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={orgLink} active="hooks" />
+        <OrgSettingsNavbar orgLink={orgLink} active="hooks" oauth2Enabled={data.oauth2Enabled} />
         <div class="flex-container-main">
           {/* gitea.tmpl's form + settings.tmpl's fields (the module header's
               not-rendered notes for secret/auth-header/events). */}

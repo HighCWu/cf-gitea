@@ -17,6 +17,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { users, webhooks } from "../../db/schema";
 import { createGlobalHook } from "../../api/services/hooks";
+import { oauth2FeatureEnabled } from "../../services/oauth2/token";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
@@ -179,5 +180,29 @@ describe("the admin hooks DOM (admin/hooks.tmpl × base_list.tmpl at the pin)", 
     // list (specs/external-auth-sources.md §6.4 — navbar.tmpl:19's first
     // Identity & Access entry).
     expect(html).toContain('href="/-/admin/auths"');
+  });
+
+  it("the Integrations gate: OAUTH2_ENABLED=false drops the Applications item and collapses the group to the plain Webhooks else-arm (navbar.tmpl:63-67)", async () => {
+    await seedHookWorld();
+    // The default posture keeps the group (the absent prop arms true).
+    expect(renderToString(<AdminHooksPage ctx={ctx} data={await loadAdminHooksData(env.DB)} />)).toContain(
+      'href="/-/admin/applications"',
+    );
+    // The pinned-false arm rides the strict-polarity read the route passes
+    // (`oauth2FeatureEnabled(c.env)`) through the loader into the shell's
+    // pass-through prop. The mutation-hole cast: the generated Env pins the
+    // deployed "true" literal (admin-monitor.test.tsx's convention), so the
+    // test widens the slice to assign the polarity.
+    const armedEnv = { ...env } as { OAUTH2_ENABLED?: string };
+    armedEnv.OAUTH2_ENABLED = "false";
+    const html = renderToString(<AdminHooksPage ctx={ctx} data={await loadAdminHooksData(env.DB, oauth2FeatureEnabled(armedEnv))} />);
+    expect(html).not.toContain('href="/-/admin/applications"');
+    // The whole Integrations <details> collapses to the else-arm's PLAIN
+    // Webhooks item (navbar.tmpl:63-67) — the group header text is gone,
+    // the Webhooks link survives.
+    expect(html).not.toContain(">Integrations<");
+    expect(html).toContain('href="/-/admin/hooks"');
+    // The gate is scope-exact: the sibling items stay.
+    expect(html).toContain('href="/-/admin/emails"');
   });
 });

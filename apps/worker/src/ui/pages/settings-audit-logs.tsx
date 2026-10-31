@@ -287,6 +287,12 @@ export interface AuditLogsPageData {
   filters: AuditFilters;
   filterAction: string;
   hasActions: boolean;
+  /** The ORG twin's navbar Applications gate (org navbar.tmpl:15-19's
+   *  `.EnableOAuth2` wrap — the repo twin's navbar has no such item and
+   *  ignores the field, the hasActions symmetry): threaded by the loader's
+   *  optional-trailing-param (the applications loader's shape — the route
+   *  passes `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /**
@@ -301,6 +307,7 @@ export async function loadSettingsAuditLogs(
   d1: D1Database,
   scope: AuditScopePair,
   query: URLSearchParams,
+  oauth2Enabled = true,
 ): Promise<AuditLogsPageData> {
   const filters = parseAuditFilters(query);
   const actorId = await resolveAuditActorId(d1, filters.actor);
@@ -391,6 +398,7 @@ export async function loadSettingsAuditLogs(
     filters,
     filterAction: filters.action !== "" ? filters.action : filters.actionPrefix,
     hasActions,
+    oauth2Enabled,
   };
 }
 
@@ -696,7 +704,7 @@ export function OrgSettingsAuditLogsPage(props: { ctx: UiContext; org: OrgRecord
     <BaseLayout ctx={ctx} title={settingsAuditLogsLocale.title} pageClass="organization settings">
       <OrgHeader org={org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={orgLink} active="audit" />
+        <OrgSettingsNavbar orgLink={orgLink} active="audit" oauth2Enabled={props.data.oauth2Enabled} />
         <div class="flex-container-main">
           {/* org/settings/audit_logs.tmpl:2-5 — the content wrapper + h4. */}
           <div class="org-setting-content">

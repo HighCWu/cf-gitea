@@ -186,6 +186,14 @@ export interface AdminApplicationsData {
   apps: OAuth2AppRow[];
   form: AdminApplicationCreateForm;
   error: string | null;
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): threaded by the
+   *  loader's optional-trailing-param (the applications loader's shape —
+   *  the route passes `oauth2FeatureEnabled(c.env)`). Absent/true = enabled;
+   *  the mounted route's group 403 (web.go:896) makes the false arm's
+   *  render unreachable — the loader still skips the OAuth2 reads on it
+   *  (the user twin's applications.go:189-203 posture). */
+  oauth2Enabled?: boolean;
 }
 
 export type AdminApplicationCreateForm = OAuth2AppEditForm;
@@ -203,20 +211,26 @@ export function splitRedirectUris(raw: string): string[] {
 /**
  * The list load — Applications' IsGlobal read over the landed service,
  * looped to the render bound (the module header): uid=0 only, id DESC.
+ * `oauth2Enabled` (default true) is the Integrations gate read the route
+ * passes (`oauth2FeatureEnabled(c.env)`) — false skips the OAuth2 reads
+ * entirely (the user twin's shape).
  */
-export async function loadAdminApplicationsData(d1: D1Database): Promise<AdminApplicationsData> {
+export async function loadAdminApplicationsData(d1: D1Database, oauth2Enabled = true): Promise<AdminApplicationsData> {
   const apps: OAuth2AppRow[] = [];
-  let page = 1;
-  for (;;) {
-    const { rows, total } = await listOAuth2Applications(d1, 0, page, SERVICE_PAGE_SIZE);
-    apps.push(...rows);
-    if (apps.length >= Math.min(total, ADMIN_APPLICATIONS_LIST_LIMIT) || rows.length < SERVICE_PAGE_SIZE) break;
-    page += 1;
+  if (oauth2Enabled) {
+    let page = 1;
+    for (;;) {
+      const { rows, total } = await listOAuth2Applications(d1, 0, page, SERVICE_PAGE_SIZE);
+      apps.push(...rows);
+      if (apps.length >= Math.min(total, ADMIN_APPLICATIONS_LIST_LIMIT) || rows.length < SERVICE_PAGE_SIZE) break;
+      page += 1;
+    }
   }
   return {
     apps,
     form: { name: "", redirectUrisRaw: "", confidentialClient: true, skipSecondaryAuthorization: false },
     error: null,
+    oauth2Enabled,
   };
 }
 
@@ -285,6 +299,7 @@ export function AdminApplicationsPage(props: { ctx: UiContext; data: AdminApplic
       title={adminApplicationsLocale.applications}
       pageClass="admin config"
       active="applications"
+      oauth2Enabled={data.oauth2Enabled}
     >
       <h4 class="ui top attached header">{adminApplicationsLocale.applications}</h4>
       {data.error !== null ? (

@@ -473,13 +473,19 @@ export interface OrgActionsSecretsPageData {
   org: OrgRecord;
   secrets: SecretRow[];
   form: OrgActionsSecretForm;
+  /** The shared navbar's Applications gate (org navbar.tmpl:15-19's
+   *  `.EnableOAuth2` wrap): threaded by the loader's optional-trailing-param
+   *  (the applications loader's shape — the route passes
+   *  `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /** The secrets page load — the org's owner-scope rows, name-ordered (the
- *  service's FindSecretsOptions order). */
-export async function loadOrgActionsSecretsPageData(d1: D1Database, org: OrgRecord): Promise<OrgActionsSecretsPageData> {
+ *  service's FindSecretsOptions order). `oauth2Enabled` (default true) is
+ *  the navbar gate read the route passes (`oauth2FeatureEnabled(c.env)`). */
+export async function loadOrgActionsSecretsPageData(d1: D1Database, org: OrgRecord, oauth2Enabled = true): Promise<OrgActionsSecretsPageData> {
   const { rows } = await listSecretRows(d1, ownerScope(org.id), 1, ORG_ACTIONS_WEB_LIST_LIMIT);
-  return { org, secrets: rows, form: { name: "", data: "", description: "" } };
+  return { org, secrets: rows, form: { name: "", data: "", description: "" }, oauth2Enabled };
 }
 
 /** The variables sub-tab's render inputs. `form` re-renders the submitted add
@@ -488,12 +494,19 @@ export interface OrgActionsVariablesPageData {
   org: OrgRecord;
   variables: VariableRow[];
   form: OrgActionsVariableForm;
+  /** The shared navbar's Applications gate (org navbar.tmpl:15-19's
+   *  `.EnableOAuth2` wrap): threaded by the loader's optional-trailing-param
+   *  (the applications loader's shape — the route passes
+   *  `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
-/** The variables page load — the org's owner-scope rows, name-ordered. */
-export async function loadOrgActionsVariablesPageData(d1: D1Database, org: OrgRecord): Promise<OrgActionsVariablesPageData> {
+/** The variables page load — the org's owner-scope rows, name-ordered.
+ *  `oauth2Enabled` (default true) is the navbar gate read the route passes
+ *  (`oauth2FeatureEnabled(c.env)`). */
+export async function loadOrgActionsVariablesPageData(d1: D1Database, org: OrgRecord, oauth2Enabled = true): Promise<OrgActionsVariablesPageData> {
   const { rows } = await listVariableRows(d1, ownerScope(org.id), 1, ORG_ACTIONS_WEB_LIST_LIMIT);
-  return { org, variables: rows, form: { name: "", data: "", description: "" } };
+  return { org, variables: rows, form: { name: "", data: "", description: "" }, oauth2Enabled };
 }
 
 // ---------------------------------------------------------------------------
@@ -701,7 +714,7 @@ export function OrgActionsSecretsPage(props: { ctx: UiContext; data: OrgActionsS
     <BaseLayout ctx={ctx} title={orgSettingsActionsLocale.actions} pageClass="organization settings actions">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={orgLink} active="secrets" />
+        <OrgSettingsNavbar orgLink={orgLink} active="secrets" oauth2Enabled={data.oauth2Enabled} />
         <div class="flex-container-main">
           <div class="org-setting-content">
             {/* shared/secrets/add_list.tmpl:1-16 */}
@@ -755,7 +768,7 @@ export function OrgActionsVariablesPage(props: { ctx: UiContext; data: OrgAction
     <BaseLayout ctx={ctx} title={orgSettingsActionsLocale.variables} pageClass="organization settings actions">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={orgLink} active="variables" />
+        <OrgSettingsNavbar orgLink={orgLink} active="variables" oauth2Enabled={data.oauth2Enabled} />
         <div class="flex-container-main">
           <div class="org-setting-content">
             {/* shared/variables/variable_list.tmpl:1-64 */}

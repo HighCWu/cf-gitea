@@ -291,6 +291,7 @@ describe("the secret hygiene rule (wrangler secret values are never read)", () =
       "appUrl",
       "auditRetentionDays",
       "demoMode",
+      "oauth2Enabled", // the OAUTH2_ENABLED nav-gate var (declared, non-secret)
       "packageCleanupOlderThan",
       "packagesEnabled",
       "packagesLimitSizeGeneric",

@@ -353,6 +353,11 @@ export interface AdminActionsRunnersPageData {
   /** The GLOBAL scope's active registration token (GetOrCreateActiveRunnerToken(0, 0) —
    *  reused while active; a reset mints the next). */
   registrationToken: string;
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): threaded by the
+   *  loader's optional-trailing-param (the applications loader's shape —
+   *  the route passes `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /**
@@ -367,6 +372,7 @@ export async function loadAdminActionsRunnersPageData(
   d1: D1Database,
   search: URLSearchParams,
   now: Date = new Date(),
+  oauth2Enabled = true,
 ): Promise<AdminActionsRunnersPageData> {
   const page = Math.max(Number.parseInt(search.get("page") ?? "", 10) || 1, 1);
   const query = search.get("q") ?? "";
@@ -437,6 +443,7 @@ export async function loadAdminActionsRunnersPageData(
     query,
     sortType,
     registrationToken: token.token,
+    oauth2Enabled,
   };
 }
 
@@ -611,6 +618,11 @@ export interface AdminActionsRunnerEditPageData {
   tasks: RunnerTaskView[];
   page: number;
   more: boolean;
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): threaded by the
+   *  loader's optional-trailing-param (the applications loader's shape —
+   *  the route passes `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /**
@@ -624,6 +636,7 @@ export async function loadAdminActionsRunnerEditPageData(
   runnerId: number,
   search: URLSearchParams,
   now: Date = new Date(),
+  oauth2Enabled = true,
 ): Promise<AdminActionsRunnerEditPageData | null> {
   const runner = await findAdminRunner(d1, runnerId);
   if (runner === null) {
@@ -711,6 +724,7 @@ export async function loadAdminActionsRunnerEditPageData(
     }),
     page,
     more: page * RUNNER_EDIT_TASKS_PAGE_SIZE < total,
+    oauth2Enabled,
   };
 }
 
@@ -735,7 +749,7 @@ export function AdminActionsRunnersPage(props: { ctx: UiContext; data: AdminActi
   if (data.query !== "") pagerQuery.set("q", data.query);
   if (data.sortType !== "") pagerQuery.set("sort", data.sortType);
   return (
-    <AdminFamilyShell ctx={ctx} title={repoSettingsRunnersLocale.actions} pageClass="admin actions" active="actions-runners">
+    <AdminFamilyShell ctx={ctx} title={repoSettingsRunnersLocale.actions} pageClass="admin actions" active="actions-runners" oauth2Enabled={data.oauth2Enabled}>
       {/* runner_list.tmpl:3-37 — the header with the count in the
           admin.total form ("Total: %d") and the token panel (the
           dropdown reduced inline; the module header). */}
@@ -904,7 +918,7 @@ export function AdminActionsRunnerEditPage(props: { ctx: UiContext; data: AdminA
   const base = "/-/admin/actions/runners";
   const runnerLink = `${base}/${data.runner.id}`;
   return (
-    <AdminFamilyShell ctx={ctx} title={adminActionsRunnersLocale.edit_runner} pageClass="admin runners" active="actions-runners">
+    <AdminFamilyShell ctx={ctx} title={adminActionsRunnersLocale.edit_runner} pageClass="admin runners" active="actions-runners" oauth2Enabled={data.oauth2Enabled}>
       {/* runner_edit.tmpl:2-4 (shared/actions/runner_edit) — the
           header. */}
       <h4 class="ui top attached header">

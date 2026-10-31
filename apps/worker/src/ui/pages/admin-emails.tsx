@@ -238,6 +238,11 @@ export interface AdminEmailsData {
   total: number;
   more: boolean;
   items: AdminEmailEntry[];
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): threaded by the
+   *  loader's optional-trailing-param (the applications loader's shape —
+   *  the route passes `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /**
@@ -255,6 +260,7 @@ export async function loadAdminEmailsData(
   d1: D1Database,
   doerId: number,
   search: URLSearchParams,
+  oauth2Enabled = true,
 ): Promise<AdminEmailsData> {
   const params = parseAdminEmailsListParams(search);
   const db = drizzle(d1);
@@ -372,7 +378,7 @@ export async function loadAdminEmailsData(
   if (params.isPrimary !== null) query.set("is_primary", params.isPrimary);
   if (params.isActivated !== null) query.set("is_activated", params.isActivated);
 
-  return { params, query, total, more: params.page * ADMIN_EMAILS_PAGE_SIZE < total, items };
+  return { params, query, total, more: params.page * ADMIN_EMAILS_PAGE_SIZE < total, items, oauth2Enabled };
 }
 
 // ---------------------------------------------------------------------------
@@ -536,6 +542,7 @@ export function AdminEmailsPage(props: { ctx: UiContext; data: AdminEmailsData }
       title={adminEmailsLocale.email_manage_panel}
       pageClass="admin user"
       active="emails"
+      oauth2Enabled={props.data.oauth2Enabled}
     >
       {/* The header (list.tmpl:3-6): panel name + total. */}
       <h4 class="ui top attached header">

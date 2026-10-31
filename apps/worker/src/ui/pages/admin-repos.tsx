@@ -314,6 +314,11 @@ export interface AdminReposData {
   total: number;
   more: boolean;
   items: RepositoryWithOwner[];
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): threaded by the
+   *  loader's optional-trailing-param (the applications loader's shape —
+   *  the route passes `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /**
@@ -322,7 +327,7 @@ export interface AdminReposData {
  * is_admin short-circuit IS upstream's Private:true), the keyword, the
  * tri-state facets, the mapped sort, one page of 50.
  */
-export async function loadAdminReposData(d1: D1Database, viewer: Viewer, search: URLSearchParams): Promise<AdminReposData> {
+export async function loadAdminReposData(d1: D1Database, viewer: Viewer, search: URLSearchParams, oauth2Enabled = true): Promise<AdminReposData> {
   const params = parseAdminReposListParams(search);
   // The service Viewer seam (the searchExploreRepos shape,
   // services/search.ts:106-109): the session viewer's two fields the WHERE
@@ -361,7 +366,7 @@ export async function loadAdminReposData(d1: D1Database, viewer: Viewer, search:
   if (params.template !== null) query.set("template", params.template);
   if (params.private !== null) query.set("private", params.private);
 
-  return { params, query, total: listing.total, more: params.page * ADMIN_REPOS_PAGE_SIZE < listing.total, items: listing.items };
+  return { params, query, total: listing.total, more: params.page * ADMIN_REPOS_PAGE_SIZE < listing.total, items: listing.items, oauth2Enabled };
 }
 
 // ---------------------------------------------------------------------------
@@ -401,7 +406,7 @@ export function AdminReposPage(props: { ctx: UiContext; data: AdminReposData }) 
     </button>
   );
   return (
-    <AdminFamilyShell ctx={props.ctx} title={adminReposLocale.repositories} pageClass="admin" active="repos">
+    <AdminFamilyShell ctx={props.ctx} title={adminReposLocale.repositories} pageClass="admin" active="repos" oauth2Enabled={props.data.oauth2Enabled}>
       {/* The header (list.tmpl:3-8): panel name + total. The "Unadopted
           Repositories" button is omitted — the page is unlanded (the module
           header). */}

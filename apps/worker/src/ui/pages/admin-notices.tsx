@@ -143,15 +143,22 @@ export interface AdminNoticesData {
   page: number;
   more: boolean;
   items: NoticeRow[];
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): threaded by the
+   *  loader's optional-trailing-param (the applications loader's shape —
+   *  the route passes `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
-export function loadAdminNoticesData(d1: D1Database, search: URLSearchParams): Promise<AdminNoticesData> {
+/** `oauth2Enabled` (default true) is the Integrations gate read the route
+ *  passes (`oauth2FeatureEnabled(c.env)`). */
+export function loadAdminNoticesData(d1: D1Database, search: URLSearchParams, oauth2Enabled = true): Promise<AdminNoticesData> {
   // The service wraps drizzle internally (the raw-binding convention —
   // callers never pre-wrap, services/notices.ts).
   const page = parsePageNumber(search.get("page"));
   return (async () => {
     const [total, items] = await Promise.all([countNotices(d1), listNotices(d1, page)]);
-    return { total, page, more: page * ADMIN_NOTICES_PAGE_SIZE < total, items };
+    return { total, page, more: page * ADMIN_NOTICES_PAGE_SIZE < total, items, oauth2Enabled };
   })();
 }
 
@@ -204,6 +211,7 @@ export function AdminNoticesPage(props: {
       title={adminNoticesLocale.notices}
       pageClass="admin notice"
       active="notices"
+      oauth2Enabled={props.data.oauth2Enabled}
     >
       {/* The header (notice.tmpl:3-5): panel name + total. */}
       <h4 class="ui top attached header">

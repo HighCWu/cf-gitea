@@ -108,17 +108,24 @@ export const ADMIN_HOOKS_LIST_LIMIT = 50;
 export interface AdminHooksData {
   systemHooks: WebhookRow[];
   defaultHooks: WebhookRow[];
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): threaded by the
+   *  loader's optional-trailing-param (the applications loader's shape —
+   *  the route passes `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /**
  * The list load — hooks.go:35-58's two reads over the landed service: the
  * system globals (`type: "system"`) and the default globals
  * (`type: "default"`), each id ASC through the service's own order.
+ * `oauth2Enabled` (default true) is the Integrations gate read the route
+ * passes (`oauth2FeatureEnabled(c.env)`).
  */
-export async function loadAdminHooksData(d1: D1Database): Promise<AdminHooksData> {
+export async function loadAdminHooksData(d1: D1Database, oauth2Enabled = true): Promise<AdminHooksData> {
   const system = await listGlobalHooks(d1, { page: 1, limit: ADMIN_HOOKS_LIST_LIMIT }, "system");
   const def = await listGlobalHooks(d1, { page: 1, limit: ADMIN_HOOKS_LIST_LIMIT }, "default");
-  return { systemHooks: system.items, defaultHooks: def.items };
+  return { systemHooks: system.items, defaultHooks: def.items, oauth2Enabled };
 }
 
 /** DeleteDefaultOrSystemWebhook's write half — the form's id into
@@ -205,7 +212,7 @@ export function renderAdminHooksPage(ctx: UiContext, data: AdminHooksData): stri
  *  pageClass, hooks.tmpl:1; upstream Title is ctx.Tr "admin.hooks"). */
 export function AdminHooksPage(props: { ctx: UiContext; data: AdminHooksData }) {
   return (
-    <AdminFamilyShell ctx={props.ctx} title={adminHooksLocale.hooks} pageClass="admin hooks" active="hooks">
+    <AdminFamilyShell ctx={props.ctx} title={adminHooksLocale.hooks} pageClass="admin hooks" active="hooks" oauth2Enabled={props.data.oauth2Enabled}>
       {/* hooks.tmpl:2-3 — SystemWebhooks FIRST, then DefaultWebhooks. */}
       <HookListSection
         title={adminHooksLocale.systemhooks}

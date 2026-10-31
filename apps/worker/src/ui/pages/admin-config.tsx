@@ -119,6 +119,11 @@ export interface AdminConfigVars {
   packagesLimitTotalOwnerSize: string;
   packagesEnabled: string;
   packageCleanupOlderThan: string;
+  /** The OAUTH2_ENABLED raw var (the nav Integrations gate's read — the
+   *  strict-polarity `oauth2FeatureEnabled` discipline, ONLY the exact
+   *  "false" disables). Optional like the packages vars: absent = the code
+   *  default (enabled). */
+  oauth2Enabled?: string;
 }
 
 /** The env slice `adminConfigVarsFromEnv` reads — a WEAK STRUCTURAL slice,
@@ -126,14 +131,15 @@ export interface AdminConfigVars {
  *  string fields keep the generated Env assignable (its deployed literal
  *  types widen) without the page module pinning the operator's literals,
  *  and keep the tests free to flip values. The four core vars are required
- *  (the generated Env always declares them); the five packages vars are
- *  optional (their readers' own slices declare them optional — absent = the
- *  code default). */
+ *  (the generated Env always declares them); the packages vars and
+ *  OAUTH2_ENABLED are optional (their readers' own slices declare them
+ *  optional — absent = the code default). */
 export type AdminConfigEnv = {
   APP_URL: string;
   ALLOW_SIGNUP: string;
   DEMO_MODE: string;
   AUDIT_RETENTION_DAYS: string;
+  OAUTH2_ENABLED?: string;
   PACKAGES_LIMIT_SIZE_GENERIC?: string;
   PACKAGES_LIMIT_TOTAL_OWNER_COUNT?: string;
   PACKAGES_LIMIT_TOTAL_OWNER_SIZE?: string;
@@ -154,6 +160,10 @@ const PACKAGES_VAR_DEFAULTS = {
   cleanupHours: "24",
 } as const;
 
+/** The optional OAUTH2_ENABLED var's code default (the strict-polarity
+ *  reader's own posture — absent = enabled). */
+const OAUTH2_VAR_DEFAULT = "true";
+
 /** Project the env slice onto the page's vars struct (the handler's only
  *  env touchpoint — secrets are not in the slice type). */
 export function adminConfigVarsFromEnv(env: AdminConfigEnv): AdminConfigVars {
@@ -167,6 +177,7 @@ export function adminConfigVarsFromEnv(env: AdminConfigEnv): AdminConfigVars {
     packagesLimitTotalOwnerSize: env.PACKAGES_LIMIT_TOTAL_OWNER_SIZE ?? PACKAGES_VAR_DEFAULTS.totalOwnerSize,
     packagesEnabled: env.PACKAGES_ENABLED ?? PACKAGES_VAR_DEFAULTS.enabled,
     packageCleanupOlderThan: env.PACKAGE_CLEANUP_OLDER_THAN ?? PACKAGES_VAR_DEFAULTS.cleanupHours,
+    oauth2Enabled: env.OAUTH2_ENABLED ?? OAUTH2_VAR_DEFAULT,
   };
 }
 
@@ -243,6 +254,11 @@ export interface AdminConfigPublished {
 export interface AdminConfigData {
   published: AdminConfigPublished;
   sections: AdminConfigSection[];
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): the loader arms
+   *  it from the vars slice (`vars.oauth2Enabled !== "false"` — the
+   *  strict-polarity read, `oauth2FeatureEnabled`'s discipline). */
+  oauth2Enabled: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -594,7 +610,7 @@ export function loadAdminConfigData(vars: AdminConfigVars): Promise<AdminConfigD
       ],
     },
   ];
-  return Promise.resolve({ published, sections });
+  return Promise.resolve({ published, sections, oauth2Enabled: vars.oauth2Enabled !== "false" });
 }
 
 /** A section by key (the tests' lookup helper; the render walks the array). */
@@ -644,7 +660,7 @@ function ConfigRow(props: { row: AdminConfigRow }) {
  *  config.go:61). Pure GET — no forms, no flash arm, no write path. */
 export function AdminConfigPage(props: { ctx: UiContext; data: AdminConfigData }) {
   return (
-    <AdminFamilyShell ctx={props.ctx} title={adminConfigLocale.title} pageClass="admin config" active="config">
+    <AdminFamilyShell ctx={props.ctx} title={adminConfigLocale.title} pageClass="admin config" active="config" oauth2Enabled={props.data.oauth2Enabled}>
       {props.data.sections.map((section) => (
         <div key={section.key}>
           <h4 class="ui top attached header">{section.title}</h4>

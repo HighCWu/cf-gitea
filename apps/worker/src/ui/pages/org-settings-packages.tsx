@@ -418,10 +418,17 @@ export async function hasOrgCleanupRuleForType(d1: D1Database, orgId: number, ty
 export interface OrgPackagesSettingsPageData {
   org: OrgRecord;
   rules: PackageCleanupRuleRow[];
+  /** The shared navbar's Applications gate (org navbar.tmpl:15-19's
+   *  `.EnableOAuth2` wrap): threaded by the loader's optional-trailing-param
+   *  (the applications loader's shape — the route passes
+   *  `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
-export async function loadOrgPackagesSettingsPageData(d1: D1Database, org: OrgRecord): Promise<OrgPackagesSettingsPageData> {
-  return { org, rules: await listOrgCleanupRules(d1, org.id) };
+/** `oauth2Enabled` (default true) is the navbar gate read the route passes
+ *  (`oauth2FeatureEnabled(c.env)`). */
+export async function loadOrgPackagesSettingsPageData(d1: D1Database, org: OrgRecord, oauth2Enabled = true): Promise<OrgPackagesSettingsPageData> {
+  return { org, rules: await listOrgCleanupRules(d1, org.id), oauth2Enabled };
 }
 
 // ---------------------------------------------------------------------------
@@ -654,6 +661,11 @@ export interface OrgCleanupRuleEditPageData {
   /** The flash-error banner line (the already-exists text; the no-JS
    *  reduction — upstream carries it as a flash toast). */
   error: string | null;
+  /** The shared navbar's Applications gate (org navbar.tmpl:15-19's
+   *  `.EnableOAuth2` wrap): threaded by the builders' optional-trailing-params
+   *  (the applications loader's shape — the route passes
+   *  `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 function formViewOfRow(rule: PackageCleanupRuleRow): OrgCleanupRuleFormView {
@@ -672,8 +684,9 @@ function formViewOfRow(rule: PackageCleanupRuleRow): OrgCleanupRuleFormView {
 const EMPTY_ERRORS: OrgCleanupRuleFormErrors = { id: false, action: false, type: false, keepCount: false, keepPattern: false, removeDays: false, removePattern: false };
 
 /** `SetRuleAddContext` (shared/packages.go:33-35 → setRuleEditContext(nil)) —
- *  the zero rule, add mode. */
-export function orgCleanupRuleEditDataForAdd(org: OrgRecord): OrgCleanupRuleEditPageData {
+ *  the zero rule, add mode. `oauth2Enabled` (default true) is the navbar
+ *  gate read the route passes (`oauth2FeatureEnabled(c.env)`). */
+export function orgCleanupRuleEditDataForAdd(org: OrgRecord, oauth2Enabled = true): OrgCleanupRuleEditPageData {
   return {
     org,
     isEditRule: false,
@@ -681,16 +694,20 @@ export function orgCleanupRuleEditDataForAdd(org: OrgRecord): OrgCleanupRuleEdit
     errType: false,
     errors: { ...EMPTY_ERRORS },
     error: null,
+    oauth2Enabled,
   };
 }
 
 /** The invalid-POST re-render's echo (performRuleEditPost's ctx.Data arm,
- *  :98-105 — the submitted values ride back into the fields). */
+ *  :98-105 — the submitted values ride back into the fields).
+ *  `oauth2Enabled` (default true) is the navbar gate read the route passes
+ *  (`oauth2FeatureEnabled(c.env)`). */
 export function orgCleanupRuleEditDataFromForm(
   org: OrgRecord,
   isEditRule: boolean,
   parsed: OrgCleanupRuleParsedForm,
   extra: { errType?: boolean; error?: string | null } = {},
+  oauth2Enabled = true,
 ): OrgCleanupRuleEditPageData {
   return {
     org,
@@ -708,15 +725,17 @@ export function orgCleanupRuleEditDataFromForm(
     errType: extra.errType ?? false,
     errors: parsed.errors,
     error: extra.error ?? null,
+    oauth2Enabled,
   };
 }
 
 /** `SetRuleEditContext` (shared/packages.go:37-44) — the scoped row; null
- *  is the NotFound arm. */
-export async function loadOrgCleanupRuleEditPageData(d1: D1Database, org: OrgRecord, ruleId: number): Promise<OrgCleanupRuleEditPageData | null> {
+ *  is the NotFound arm. `oauth2Enabled` (default true) is the navbar gate
+ *  read the route passes (`oauth2FeatureEnabled(c.env)`). */
+export async function loadOrgCleanupRuleEditPageData(d1: D1Database, org: OrgRecord, ruleId: number, oauth2Enabled = true): Promise<OrgCleanupRuleEditPageData | null> {
   const rule = await findOrgScopedCleanupRule(d1, org.id, ruleId);
   if (rule === null) return null;
-  return { org, isEditRule: true, rule: formViewOfRow(rule), errType: false, errors: { ...EMPTY_ERRORS }, error: null };
+  return { org, isEditRule: true, rule: formViewOfRow(rule), errType: false, errors: { ...EMPTY_ERRORS }, error: null, oauth2Enabled };
 }
 
 // ---------------------------------------------------------------------------
@@ -740,7 +759,17 @@ export interface OrgCleanupRulePreviewRow {
 
 export type OrgCleanupRulePreviewData =
   | { kind: "missing" }
-  | { kind: "ok"; org: OrgRecord; rule: PackageCleanupRuleRow; rows: OrgCleanupRulePreviewRow[] };
+  | {
+      kind: "ok";
+      org: OrgRecord;
+      rule: PackageCleanupRuleRow;
+      rows: OrgCleanupRulePreviewRow[];
+      /** The shared navbar's Applications gate (org navbar.tmpl:15-19's
+       *  `.EnableOAuth2` wrap): threaded by the loader's
+       *  optional-trailing-param (the applications loader's shape — the
+       *  route passes `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+      oauth2Enabled?: boolean;
+    };
 
 /**
  * The GET-only preview arm. The rule resolves scope-guarded
@@ -755,7 +784,13 @@ export type OrgCleanupRulePreviewData =
  * remove-pattern gate — each survivor assembled through
  * getPackageDescriptor for the table's size cell.
  */
-export async function loadOrgCleanupRulePreview(d1: D1Database, org: OrgRecord, ruleId: number, now: Date = new Date()): Promise<OrgCleanupRulePreviewData> {
+export async function loadOrgCleanupRulePreview(
+  d1: D1Database,
+  org: OrgRecord,
+  ruleId: number,
+  now: Date = new Date(),
+  oauth2Enabled = true,
+): Promise<OrgCleanupRulePreviewData> {
   const rule = await findOrgScopedCleanupRule(d1, org.id, ruleId);
   if (rule === null) return { kind: "missing" };
 
@@ -820,7 +855,7 @@ export async function loadOrgCleanupRulePreview(d1: D1Database, org: OrgRecord, 
   }
   for (const row of rows) row.creatorName = creators.get(row.version.creatorId) ?? null;
 
-  return { kind: "ok", org, rule, rows };
+  return { kind: "ok", org, rule, rows, oauth2Enabled };
 }
 
 // ---------------------------------------------------------------------------
@@ -844,7 +879,7 @@ export function OrgPackagesSettingsPage(props: { ctx: UiContext; data: OrgPackag
     <BaseLayout ctx={ctx} title={orgSettingsPackagesLocale.title} pageClass="organization settings packages">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={`/${data.org.username}`} active="packages" />
+        <OrgSettingsNavbar orgLink={`/${data.org.username}`} active="packages" oauth2Enabled={data.oauth2Enabled} />
         <div class="flex-container-main">
           <div class="org-setting-content">
             {/* list.tmpl:1-5 — the header + the Add button. */}
@@ -946,7 +981,7 @@ export function OrgCleanupRuleEditPage(props: { ctx: UiContext; data: OrgCleanup
     <BaseLayout ctx={ctx} title={orgSettingsPackagesLocale.title} pageClass="organization settings packages">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={`/${data.org.username}`} active="packages" />
+        <OrgSettingsNavbar orgLink={`/${data.org.username}`} active="packages" oauth2Enabled={data.oauth2Enabled} />
         <div class="flex-container-main">
           <div class="org-setting-content">
             <h4 class="ui top attached header">
@@ -1071,7 +1106,7 @@ export function OrgCleanupRulePreviewPage(props: { ctx: UiContext; data: Extract
     <BaseLayout ctx={ctx} title={orgSettingsPackagesLocale.title} pageClass="organization settings packages">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={`/${data.org.username}`} active="packages" />
+        <OrgSettingsNavbar orgLink={`/${data.org.username}`} active="packages" oauth2Enabled={data.oauth2Enabled} />
         <div class="flex-container-main">
           <div class="org-setting-content">
             <h4 class="ui top attached header">{orgSettingsPackagesLocale.preview}</h4>

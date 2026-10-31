@@ -169,6 +169,11 @@ export interface OrgActionsRunnersPageData {
   /** The scope's active registration token (GetOrCreateActiveRunnerToken —
    *  reused while active; a reset mints the next). */
   registrationToken: string;
+  /** The shared navbar's Applications gate (org navbar.tmpl:15-19's
+   *  `.EnableOAuth2` wrap): threaded by the loader's optional-trailing-param
+   *  (the applications loader's shape — the route passes
+   *  `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /**
@@ -182,6 +187,7 @@ export async function loadOrgActionsRunnersPageData(
   org: OrgRecord,
   search: URLSearchParams,
   now: Date = new Date(),
+  oauth2Enabled = true,
 ): Promise<OrgActionsRunnersPageData> {
   const page = Math.max(Number.parseInt(search.get("page") ?? "", 10) || 1, 1);
   const query = search.get("q") ?? "";
@@ -253,6 +259,7 @@ export async function loadOrgActionsRunnersPageData(
     query,
     sortType,
     registrationToken: token.token,
+    oauth2Enabled,
   };
 }
 
@@ -374,6 +381,11 @@ export interface OrgActionsRunnerEditPageData {
   tasks: RunnerTaskView[];
   page: number;
   more: boolean;
+  /** The shared navbar's Applications gate (org navbar.tmpl:15-19's
+   *  `.EnableOAuth2` wrap): threaded by the loader's optional-trailing-param
+   *  (the applications loader's shape — the route passes
+   *  `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /**
@@ -388,6 +400,7 @@ export async function loadOrgActionsRunnerEditPageData(
   runnerId: number,
   search: URLSearchParams,
   now: Date = new Date(),
+  oauth2Enabled = true,
 ): Promise<OrgActionsRunnerEditPageData | null> {
   const runner = await findOrgScopedRunner(d1, org.id, runnerId);
   if (runner === null) {
@@ -455,6 +468,7 @@ export async function loadOrgActionsRunnerEditPageData(
     }),
     page,
     more: page * RUNNER_EDIT_TASKS_PAGE_SIZE < total,
+    oauth2Enabled,
   };
 }
 
@@ -490,7 +504,7 @@ export function OrgActionsRunnersPage(props: { ctx: UiContext; data: OrgActionsR
     <BaseLayout ctx={ctx} title={repoSettingsRunnersLocale.actions} pageClass="organization settings actions">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={orgLink} active="runners" />
+        <OrgSettingsNavbar orgLink={orgLink} active="runners" oauth2Enabled={data.oauth2Enabled} />
         <div class="flex-container-main">
           <div class="org-setting-content">
             {/* runner_list.tmpl:3-32 — the header with the token panel (the
@@ -652,7 +666,7 @@ export function OrgActionsRunnerEditPage(props: { ctx: UiContext; data: OrgActio
     <BaseLayout ctx={ctx} title={orgSettingsRunnersLocale.edit_runner} pageClass="organization settings runners">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={orgLink} active="runners" />
+        <OrgSettingsNavbar orgLink={orgLink} active="runners" oauth2Enabled={data.oauth2Enabled} />
         <div class="flex-container-main">
           <div class="org-setting-content">
             {/* runner_edit.tmpl:2-4 (shared/actions/runner_edit) — the

@@ -231,6 +231,11 @@ export interface AdminPackagesData {
   /** The pager's param set (q + type, page excluded — base/paginate keeps
    *  the active facets). */
   pagerQuery: URLSearchParams;
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): threaded by the
+   *  loader's optional-trailing-param (the applications loader's shape —
+   *  the route passes `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /**
@@ -240,7 +245,7 @@ export interface AdminPackagesData {
  * q + type facets), the batched owner/creator/repo enrichment (the wave-2
  * batching pattern), and the two module-local blob-size totals.
  */
-export async function loadAdminPackagesData(d1: D1Database, search: URLSearchParams): Promise<AdminPackagesData> {
+export async function loadAdminPackagesData(d1: D1Database, search: URLSearchParams, oauth2Enabled = true): Promise<AdminPackagesData> {
   const page = parsePageNumber(search.get("page"));
   const query = (search.get("q") ?? "").trim();
   const typeFilter = parseTypeFacet(search.get("type"));
@@ -326,6 +331,7 @@ export async function loadAdminPackagesData(d1: D1Database, search: URLSearchPar
     query,
     typeFilter,
     pagerQuery,
+    oauth2Enabled,
   };
 }
 
@@ -346,7 +352,7 @@ export function AdminPackagesPage(props: { ctx: UiContext; data: AdminPackagesDa
   const colCount = 9; // the live columns (the Op column omitted — the module header)
   const base = "/-/admin/packages";
   return (
-    <AdminFamilyShell ctx={props.ctx} title={adminPackagesLocale.title} pageClass="admin user" active="packages">
+    <AdminFamilyShell ctx={props.ctx} title={adminPackagesLocale.title} pageClass="admin user" active="packages" oauth2Enabled={props.data.oauth2Enabled}>
       {/* The header (list.tmpl:3-8): panel name + the total + the two size
           totals. The Cleanup form (list.tmpl:9-13) is omitted — its POST
           target is an unlanded write (the module header). */}

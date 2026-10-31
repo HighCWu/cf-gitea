@@ -190,6 +190,11 @@ export interface AdminBadgesData {
   total: number;
   more: boolean;
   items: BadgeCatalogRow[];
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): threaded by the
+   *  loader's optional-trailing-param (the applications loader's shape —
+   *  the route passes `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /**
@@ -197,7 +202,7 @@ export interface AdminBadgesData {
  * keyword (the instr() stand-in), the four sorts (id/slug ASC-DESC pairs),
  * one page of 50.
  */
-export async function loadAdminBadgesData(d1: D1Database, search: URLSearchParams): Promise<AdminBadgesData> {
+export async function loadAdminBadgesData(d1: D1Database, search: URLSearchParams, oauth2Enabled = true): Promise<AdminBadgesData> {
   const params = parseAdminBadgesListParams(search);
   const conditions: SQL[] = [];
   if (params.keyword !== "") {
@@ -229,7 +234,7 @@ export async function loadAdminBadgesData(d1: D1Database, search: URLSearchParam
   if (params.keyword !== "") query.set("q", params.keyword);
   if (params.sort !== "oldest") query.set("sort", params.sort);
 
-  return { params, query, total, more: params.page * ADMIN_BADGES_PAGE_SIZE < total, items };
+  return { params, query, total, more: params.page * ADMIN_BADGES_PAGE_SIZE < total, items, oauth2Enabled };
 }
 
 /** GetBadge (badge.go GetBadge by slug) — null on the miss (the caller 303s
@@ -382,6 +387,11 @@ export interface AdminBadgeEditData {
   badge: BadgeCatalogRow;
   form: Pick<AdminBadgeForm, "description" | "imageUrl">;
   error: string | null;
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): the route-built
+   *  data threads the strict-polarity read
+   *  (`oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /** The new page's model (new.tmpl — the submitted values re-render on an
@@ -389,6 +399,11 @@ export interface AdminBadgeEditData {
 export interface AdminBadgeNewData {
   form: AdminBadgeForm;
   error: string | null;
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): the route-built
+   *  data threads the strict-polarity read
+   *  (`oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /** The view page's model (view.tmpl: badge info + the users preview). */
@@ -396,6 +411,11 @@ export interface AdminBadgeViewData {
   badge: BadgeCatalogRow;
   usersTotal: number;
   usersPreview: { id: number; username: string }[];
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): the route-built
+   *  data threads the strict-polarity read
+   *  (`oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /** The users page's model (users.tmpl: the add form + the paged list). */
@@ -408,6 +428,11 @@ export interface AdminBadgeUsersData {
   query: URLSearchParams;
   error: string | null;
   submittedUser: string;
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): the route-built
+   *  data threads the strict-polarity read
+   *  (`oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +459,7 @@ export function AdminBadgesPage(props: { ctx: UiContext; data: AdminBadgesData }
       title={adminBadgesLocale.badges_manage_panel}
       pageClass="admin badge"
       active="badges"
+      oauth2Enabled={props.data.oauth2Enabled}
     >
       {/* The header (list.tmpl:3-9): panel + total + the Create button (the
           new page is LANDED — a live link). */}
@@ -572,7 +598,7 @@ export function renderAdminBadgeNewPage(ctx: UiContext, data: AdminBadgeNewData)
  *  new.tmpl:1). */
 export function AdminBadgeNewPage(props: { ctx: UiContext; data: AdminBadgeNewData }) {
   return (
-    <AdminFamilyShell ctx={props.ctx} title={adminBadgesLocale.new_badge} pageClass="admin new badge" active="badges">
+    <AdminFamilyShell ctx={props.ctx} title={adminBadgesLocale.new_badge} pageClass="admin new badge" active="badges" oauth2Enabled={props.data.oauth2Enabled}>
       <h4 class="ui top attached header">{adminBadgesLocale.new_badge}</h4>
       <div class="ui attached segment">
         {props.data.error !== null ? (
@@ -618,7 +644,7 @@ export function renderAdminBadgeViewPage(ctx: UiContext, data: AdminBadgeViewDat
 export function AdminBadgeViewPage(props: { ctx: UiContext; data: AdminBadgeViewData }) {
   const badge = props.data.badge;
   return (
-    <AdminFamilyShell ctx={props.ctx} title={adminBadgesLocale.details} pageClass="admin" active="badges">
+    <AdminFamilyShell ctx={props.ctx} title={adminBadgesLocale.details} pageClass="admin" active="badges" oauth2Enabled={props.data.oauth2Enabled}>
       {/* view.tmpl's two-section column: the badge info segment with the
           Edit button (the edit page is LANDED — a live link), then the users
           header + Manage Users button (the users page is LANDED). */}
@@ -687,6 +713,7 @@ export function AdminBadgeEditPage(props: { ctx: UiContext; data: AdminBadgeEdit
       title={adminBadgesLocale.edit_badge}
       pageClass="admin edit badge"
       active="badges"
+      oauth2Enabled={props.data.oauth2Enabled}
     >
       <h4 class="ui top attached header">{adminBadgesLocale.edit_badge}</h4>
       <div class="ui attached segment">
@@ -751,6 +778,7 @@ export function AdminBadgeUsersPage(props: { ctx: UiContext; data: AdminBadgeUse
       title={adminBadgesLocale.users_with_badge.replace("%s", badge.slug)}
       pageClass="admin badge"
       active="badges"
+      oauth2Enabled={props.data.oauth2Enabled}
     >
       <h4 class="ui top attached header">{adminBadgesLocale.users_with_badge.replace("%s", badge.slug)}</h4>
       <div class="ui attached segment">

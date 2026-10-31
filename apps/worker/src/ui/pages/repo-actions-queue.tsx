@@ -402,6 +402,12 @@ export interface JobQueuePageData {
   filterRepos: JobQueueFilterRepo[];
   refreshLink: string;
   refreshIntervalMs: number;
+  /** The ADMIN shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop — the repo twin's
+   *  page has no such nav item and ignores the field): threaded by the
+   *  loader's optional-trailing-param (the applications loader's shape —
+   *  the route passes `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /**
@@ -500,7 +506,7 @@ export async function loadJobQueueFilterOptions(
  * renderJobQueueFilterOptions only runs when repoID == 0); the admin scope
  * computes the filter options and applies owner_id/repo_id.
  */
-export async function loadJobQueuePageData(d1: D1Database, scope: JobQueueScope, search: URLSearchParams): Promise<JobQueuePageData> {
+export async function loadJobQueuePageData(d1: D1Database, scope: JobQueueScope, search: URLSearchParams, oauth2Enabled = true): Promise<JobQueuePageData> {
   const page = Math.max(Number.parseInt(search.get("page") ?? "", 10) || 1, 1);
   let filterStatus = search.get("status") ?? "";
   if (filterStatus !== "running" && filterStatus !== "waiting") {
@@ -610,6 +616,7 @@ export async function loadJobQueuePageData(d1: D1Database, scope: JobQueueScope,
     filterRepos: repos,
     refreshLink: `${refreshPath}?${pageQuery.toString()}`,
     refreshIntervalMs: actionsQueueRefreshIntervalMs(views.length > 0),
+    oauth2Enabled,
   };
 }
 
@@ -860,7 +867,7 @@ export function renderAdminActionsJobQueuePage(ctx: UiContext, data: JobQueuePag
  *  admin/layout_head's pageClass dict, admin/actions.tmpl:1). */
 export function AdminActionsJobQueuePage(props: { ctx: UiContext; data: JobQueuePageData }) {
   return (
-    <AdminFamilyShell ctx={props.ctx} title={actionsQueueLocale.actions} pageClass="admin actions" active="actions-job-queue">
+    <AdminFamilyShell ctx={props.ctx} title={actionsQueueLocale.actions} pageClass="admin actions" active="actions-job-queue" oauth2Enabled={props.data.oauth2Enabled}>
       <JobQueueFragment data={props.data} />
     </AdminFamilyShell>
   );

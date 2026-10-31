@@ -195,6 +195,11 @@ export interface AdminOrgsData {
   total: number;
   more: boolean;
   items: AdminOrgRow[];
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): threaded by the
+   *  loader's optional-trailing-param (the applications loader's shape —
+   *  the route passes `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /**
@@ -205,7 +210,7 @@ export interface AdminOrgsData {
  * the sort, one page of 50; then the page's Teams/Repos counters as two
  * GROUP BY reads (the module header).
  */
-export async function loadAdminOrgsData(d1: D1Database, search: URLSearchParams): Promise<AdminOrgsData> {
+export async function loadAdminOrgsData(d1: D1Database, search: URLSearchParams, oauth2Enabled = true): Promise<AdminOrgsData> {
   const params = parseAdminOrgsListParams(search);
   const conditions: SQL[] = [eq(users.type, "org")];
   if (params.keyword !== "") {
@@ -262,6 +267,7 @@ export async function loadAdminOrgsData(d1: D1Database, search: URLSearchParams)
     total,
     more: params.page * ADMIN_ORGS_PAGE_SIZE < total,
     items: rows.map((org) => ({ org, numTeams: teamCounts.get(org.id) ?? 0, numRepos: repoCounts.get(org.id) ?? 0 })),
+    oauth2Enabled,
   };
 }
 
@@ -316,7 +322,7 @@ export function AdminOrgsPage(props: { ctx: UiContext; data: AdminOrgsData }) {
     </a>
   );
   return (
-    <AdminFamilyShell ctx={props.ctx} title={adminOrgsLocale.organizations} pageClass="admin user" active="orgs">
+    <AdminFamilyShell ctx={props.ctx} title={adminOrgsLocale.organizations} pageClass="admin user" active="orgs" oauth2Enabled={props.data.oauth2Enabled}>
       {/* The header (list.tmpl:3-8): panel name + total + the LIVE New
           Organization button (org-create is landed — the module header). */}
       <h4 class="ui top attached header">

@@ -588,6 +588,12 @@ function DangerRow(props: { title: string; body: string; action: string; childre
 export interface OrgSettingsData {
   org: OrgRecord;
   error: string | null;
+  /** The shared navbar's Applications gate (org navbar.tmpl:15-19's
+   *  `.EnableOAuth2` wrap): the strict-polarity read the route threads as
+   *  `oauth2FeatureEnabled(c.env)` (the applications loader's
+   *  optional-trailing-param shape — this page's data is route-assembled,
+   *  so the field rides the literal). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /** The full-document render (the render.tsx pattern — `index.ts` stays a
@@ -610,7 +616,7 @@ export function OrgSettingsPage(props: { ctx: UiContext; data: OrgSettingsData }
     <BaseLayout ctx={ctx} title={orgDisplayName(org)} pageClass="organization settings options">
       <OrgHeader org={org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={orgLink} active="options" />
+        <OrgSettingsNavbar orgLink={orgLink} active="options" oauth2Enabled={data.oauth2Enabled} />
         <div class="flex-container-main">
           {data.error !== null ? <div class="ui negative message">{data.error}</div> : null}
           <div class="org-setting-content">

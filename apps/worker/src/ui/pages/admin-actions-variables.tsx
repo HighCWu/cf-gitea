@@ -221,13 +221,20 @@ const GLOBAL_SCOPE = { ownerId: 0, repoId: "" };
 export interface AdminActionsVariablesPageData {
   variables: VariableRow[];
   form: AdminActionsVariableForm;
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): threaded by the
+   *  loader's optional-trailing-param (the applications loader's shape —
+   *  the route passes `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /** The variables page load — the GLOBAL scope's rows only, name-ordered
- *  (the service's FindVariablesOptions order). */
-export async function loadAdminActionsVariablesPageData(d1: D1Database): Promise<AdminActionsVariablesPageData> {
+ *  (the service's FindVariablesOptions order). `oauth2Enabled` (default
+ *  true) is the Integrations gate read the route passes
+ *  (`oauth2FeatureEnabled(c.env)`). */
+export async function loadAdminActionsVariablesPageData(d1: D1Database, oauth2Enabled = true): Promise<AdminActionsVariablesPageData> {
   const { rows } = await listVariableRows(d1, GLOBAL_SCOPE, 1, REPO_ACTIONS_WEB_LIST_LIMIT);
-  return { variables: rows, form: { name: "", data: "", description: "" } };
+  return { variables: rows, form: { name: "", data: "", description: "" }, oauth2Enabled };
 }
 
 // ---------------------------------------------------------------------------
@@ -473,7 +480,7 @@ export function AdminActionsVariablesPage(props: { ctx: UiContext; data: AdminAc
   const { ctx } = props;
   const base = "/-/admin/actions/variables";
   return (
-    <AdminFamilyShell ctx={ctx} title={repoSettingsActionsLocale.variables_nav} pageClass="admin actions" active="actions-variables">
+    <AdminFamilyShell ctx={ctx} title={repoSettingsActionsLocale.variables_nav} pageClass="admin actions" active="actions-variables" oauth2Enabled={props.data.oauth2Enabled}>
       {/* shared/variables/variable_list.tmpl:1-17 */}
       <h4 class="ui top attached header">{repoSettingsActionsLocale.variables_management}</h4>
       <div class="ui attached segment">

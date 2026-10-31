@@ -178,6 +178,13 @@ export interface OwnerActionsGeneralPageData {
   maxTokenPermissions: ActionsTokenPermissions;
   enableMaxTokenPermissions: boolean;
   allowedRepos: OwnerActionsGeneralAllowedRepo[];
+  /** The shared ORG navbar's Applications gate (org navbar.tmpl:15-19's
+   *  `.EnableOAuth2` wrap): threaded by the ORG loader's
+   *  optional-trailing-param (the applications loader's shape — the route
+   *  passes `oauth2FeatureEnabled(c.env)`). Absent/true = enabled. The USER
+   *  twin consumes the same interface but its navbar item is UNGATED
+   *  upstream (user navbar.tmpl:28-30) and ignores the field. */
+  oauth2Enabled?: boolean;
 }
 
 /** The config → render-inputs mapping (general.go:70-81): the mode rides
@@ -217,12 +224,14 @@ export const OWNER_ACTIONS_GENERAL_FRESH_DATA: Omit<OwnerActionsGeneralPageData,
  * empty-ids arm is upstream's own no-query short-circuit,
  * models/repo/repo_list.go:845-847). The org record rides in for the frame
  * (OrgHeader + the OrgLink); `getRunnersCtx`'s owner id is `org.id`
- * (runners.go:82-91's org arm).
+ * (runners.go:82-91's org arm). `oauth2Enabled` (default true) is the org
+ * navbar's Applications gate read the route passes
+ * (`oauth2FeatureEnabled(c.env)`).
  */
-export async function loadOrgActionsGeneralPageData(d1: D1Database, org: OrgRecord): Promise<OwnerActionsGeneralPageData> {
+export async function loadOrgActionsGeneralPageData(d1: D1Database, org: OrgRecord, oauth2Enabled = true): Promise<OwnerActionsGeneralPageData> {
   const cfg = await getOwnerActionsConfig(d1, org.id);
   const allowedRepos = await getOwnerRepositoriesByIDs(d1, org.id, cfg.allowedCrossRepoIds);
-  return { ownerId: org.id, ...deriveOwnerActionsGeneralData(cfg), allowedRepos };
+  return { ownerId: org.id, ...deriveOwnerActionsGeneralData(cfg), allowedRepos, oauth2Enabled };
 }
 
 // ---------------------------------------------------------------------------
@@ -389,7 +398,7 @@ export function OrgActionsGeneralPage(props: { ctx: UiContext; data: OrgActionsG
     <BaseLayout ctx={ctx} title={orgSettingsActionsGeneralLocale.actions} pageClass="">
       <OrgHeader org={props.data.org} signedIn={ctx.viewer.kind === "user"} />
       <div class="ui container flex-container">
-        <OrgSettingsNavbar orgLink={orgLink} active="actions-general" />
+        <OrgSettingsNavbar orgLink={orgLink} active="actions-general" oauth2Enabled={props.data.oauth2Enabled} />
         <div class="flex-container-main">
           {/* actions_general.tmpl:2-4 — the org wrapper. */}
           <div class="org-setting-content">
