@@ -1372,8 +1372,14 @@ OMIT verdict).
   open items**: the **`/install` first-admin window is DEAD on any
   migrated instance** — migration 0003 seeds the assets system user,
   defeating the empty-users-table premise, and tests wipe users so CI
-  cannot see it; UNFIXED at this snapshot, pending the flying fix
-  unit (harmless for the live instance, which has users). And
+  cannot see it; found UNFIXED at this snapshot, FIXED after it at
+  `16a63b6` — the window gate counts HUMANS, not rows (the
+  identity-of-origin predicate: a system row is exactly
+  status='prohibited' AND is_admin=0 AND no email, read identically by
+  the gate and the atomic insert's NOT EXISTS guard), so the seeded
+  system principals no longer kill a freshly-migrated instance's
+  one-shot window (four regression arms pin the migrated state; the
+  live instance was never harmed — it has users). And
   **act_runner 5.x is UNVERIFIED** — the wire-compatible verdict
   covers v0.2.13 only (0.2.x is still what dl.gitea.com's classic
   line hosts); the guide's pin stands.

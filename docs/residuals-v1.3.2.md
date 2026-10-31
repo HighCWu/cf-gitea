@@ -248,7 +248,7 @@ board row flips — this closes a flag, not a listed residual.
    orphan drops, required-orphan kept) — parameterized over parsed
    files/liveSet/configs so the staged store and pages consume it
    unchanged (suite 24/24; actions family 235/235; the full dependency
-   map in the module header). LANDED THIS WAVE (`DISCLOSED-HASH`): the
+   map in the module header). LANDED THIS WAVE (`9fb8ffd`): the
    PAGES + the parse assembly — `apps/worker/src/ui/pages/
    actions-scoped-workflows.tsx` (the scope-neutral core: the
    `ScopedWorkflowSourcesStore` seam, each method citing its upstream op;
@@ -306,14 +306,19 @@ board row flips — this closes a flag, not a listed residual.
    own auths management has no API to mirror. Size: — (resolved; the
    reopen gate unchanged in SPEC-0018 §3.3).
 
-5. **SPEC-0016 M6 — the container (OCI) registry.** The seventh protocol
-   family, and "the only milestone that may need new infrastructure
-   posture": JWT token flow, chunked blob uploads with an upload-state
-   machine (the pre-read question — R2 multipart-upload handles vs a D1
-   upload-rows model — is explicitly deferred to the M6 SPEC-attachment),
-   manifests, `PropertyDigest` file properties, GC-aware deletes
-   (`specs/0016-packages.md` §7 M6 + §8.6; `specs/README.md` SPEC-0016 row:
-   "M6 container + M7 index-builder pending"). Size: **L**.
+5. **SPEC-0016 M6 — the container (OCI) registry — LANDED (2026-10-31, the
+   /v2 OCI root; `specs/0016-packages.md`'s "As-built — M6 container/OCI"
+   section carries it — the SEVENTH protocol at that landing).** "The only
+   milestone that may need new infrastructure posture": JWT token flow,
+   chunked blob uploads with an upload-state machine (the pre-read
+   question resolved — the `package_blob_uploads` D1 row + per-chunk R2
+   objects, migration 0046; R2's native multipart handles were REJECTED by
+   the as-built), manifests, `PropertyDigest` file properties, GC-aware
+   deletes (`specs/0016-packages.md` §7 M6 + §8.6; the SPEC-README row's
+   "M6 container + M7 index-builder pending" quote is retired — M6 and
+   M7's debian/alpine/rpm/arch halves all landed). The registry's count
+   now stands at TWENTY-ONE protocols (the six-minor wave `28a40b5` —
+   full parity per its record). Size: — (resolved).
 
 6. **SPEC-0016 M7 — the index-builder family** (debian/alpine/rpm/arch
    metadata index renders; cargo LAST — the git-backed `_cargo_index` repo
@@ -490,7 +495,7 @@ board row flips — this closes a flag, not a listed residual.
     notify/commit-status/reusable-caller rows: (a) the parser's YAML
     half — `GetEventsFromContent` + `deriveScopedStatusContexts` ride
     jobparser (upstream's own `scoped_workflow.go` parse arm): the
-    SETTINGS-PAGE half of this arm is now LANDED (`DISCLOSED-HASH` — P1
+    SETTINGS-PAGE half of this arm is now LANDED (`9fb8ffd` — P1
     item 3's parse assembly over M3-P's `getEventsFromContent` +
     `splitWorkflowPayloads`, the matrix/expression context-preview
     reduction documented on the core module), while the TRIGGER half
@@ -505,7 +510,7 @@ board row flips — this closes a flag, not a listed residual.
     schema table port and the store service are M3-INDEPENDENT (the
     pages unit's HANDOFF — the seam interface + port spec landed in the
     core header). Cites: `e24455c`'s module-header dependency map +
-    `DISCLOSED-HASH`'s core header. Size: — (the trigger half rides
+    `9fb8ffd`'s core header. Size: — (the trigger half rides
     P1-1's M3 + the store wave; listed so the M3 SPEC-attachment does
     not miss them).
 
@@ -620,7 +625,7 @@ board row flips — this closes a flag, not a listed residual.
    reduction is retired. The route-level matrix (guard-first, the
    anonymous login 303, the doer-keyed scoping) is pinned in the page
    suite. Scoped-workflows at this scope: the page module LANDED
-   committed-unmounted (`DISCLOSED-HASH` — P1 item 3's user frame; the
+   committed-unmounted (`9fb8ffd` — P1 item 3's user frame; the
    sub-tab stays the dead nav item and the routes the honest 404s until
    the store HANDOFF + mount flip). Settings-nav/goldens: both unions
    gained actions-general, 8 golden files re-baselined with token deltas
@@ -646,7 +651,7 @@ board row flips — this closes a flag, not a listed residual.
    add target (nothing stored), the 303 back onto the page URL; the
    route-level matrix is pinned in the org page suite (the org-vs-user
    scoping included). Scoped-workflows rides P1 item 3 (the org frame
-   LANDED committed-unmounted, `DISCLOSED-HASH`; the dead-item posture
+   LANDED committed-unmounted, `9fb8ffd`; the dead-item posture
    stands until the store wave). Size: — (closed).
 
 3. **The admin scoped-workflows page** (listed for traceability; consumed
@@ -655,7 +660,7 @@ board row flips — this closes a flag, not a listed residual.
    `92d2e87`'s stale-pin fixes keep it as the negative pin)
    (`docs/RELEASE-NOTES-v1.3.md` §4; `docs/compat/ui-parity-survey.md`
    tick-20 note "scoped-workflows is the documented-reduced honest 404").
-   The admin FRAME landed committed-unmounted (`DISCLOSED-HASH` — P1
+   The admin FRAME landed committed-unmounted (`9fb8ffd` — P1
    item 3); the 404 + the omitted nav item stand until the store
    HANDOFF + mount flip. Size: — (rides P1-3's store window).
 
@@ -810,8 +815,8 @@ board row flips — this closes a flag, not a listed residual.
    STILL OPEN (engine-scope items separated in the review): the
    ladder-ordering drifts (403-before-auth arms, the
    wiki-doesn't-exist pkt-line, dumb-HTTP absent — documented).
-   **LANDED slice 2026-10-31 — the attr-macro arm (DISCLOSED-HASH
-   placeholder fills at the notes window):** the engine-boundary decision
+   **LANDED slice 2026-10-31 — the attr-macro arm (`599d655`):** the
+   engine-boundary decision
    recorded (`docs/research/attr-macro-boundary.md`): macro expansion
    belongs in the attribute MATCHER, and the matcher is ENGINE-side —
    `src/git/attributes.ts`, the attr.c analog, the language moved verbatim
@@ -1193,7 +1198,8 @@ board row flips — this closes a flag, not a listed residual.
     staged one. Sizes: **S** each.
 
 16. **The SPEC-0016 long-tail `go` family — LANDED (2026-10-31, the
-    registry carries TWELVE protocols).** The Go module proxy protocol
+    registry carried TWELVE protocols at that landing).** The Go module
+    proxy protocol
     (`routers/api/packages/goproxy/goproxy.go` + `modules/packages/
     goproxy/metadata.go` at the pin): the five read arms (`@latest`,
     `@v/list`, `.info`/`.mod`/`.zip`) + `PUT /go/upload` + the sumdb probe
@@ -1203,10 +1209,17 @@ board row flips — this closes a flag, not a listed residual.
     download + unpinned `go get` via `@latest`, the go.sum h1 equals
     x/mod dirhash over our zip); suite 22/22, neighbors 58/58, check:api
     PASS. The as-built (endpoint map, the 404/410 posture, reductions,
-    both live batteries) is `specs/0016-packages.md`'s go section. This
-    narrows the §2.1 long-tail row to conan/composer/chef/conda/cran/pub/
-    rubygems/swift/terraform/vagrant — still demand-driven, no new queue
-    entries opened. Size: — (resolved).
+    both live batteries) is `specs/0016-packages.md`'s go section. The
+    §2.1 long-tail row RESOLVED since this landing: cargo + swift +
+    rubygems at the protocol wave `5721dcc` (FIFTEEN), chef + composer +
+    conan + cran + pub + vagrant at the six-minor wave `28a40b5` — the
+    registry carries TWENTY-ONE protocols, the wave's declared FULL PARITY
+    with the pin's package surface. Record note for the wave's owner: of
+    that landing-time ten-family list, conda + terraform remain
+    module-absent on our side (the pin routes both — `api.go:263`
+    `/conda/*` and `:474` `/terraform/state`) — whether they sit inside
+    the wave's parity claim is its own record to adjudicate. Size: —
+    (resolved).
 
 ---
 

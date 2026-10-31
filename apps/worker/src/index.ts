@@ -528,9 +528,13 @@ export default {
   // (loadAdminMonitorCronRunState) — "did the crons run today" is
   // certifiable from the product surface.
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
-    // SPEC-0014 M1 dispatch: the hourly string runs ONLY the demo sweep
-    // producer (gate-checked, silent when off); every other cadence runs the
-    // mirror producers unconditionally (their CAS absorbs overlaps).
+    // SPEC-0014 M1 dispatch + the sanctioned extensions: the hourly string
+    // runs the FULL census arms — the demo sweep producer (gate-checked,
+    // silent when off) plus the audit/packages/actions-retention producers
+    // and the actions-abandoned + ephemeral pair; every other cadence runs
+    // the mirror producers unconditionally (their CAS absorbs overlaps)
+    // joined by the zombie/endless stop producers. services/cron-state.ts's
+    // armsForEntry is the census mirror of exactly this dispatch.
     const arms = armsForEntry(controller.cron);
     try {
       await handleScheduledCron(controller, env);

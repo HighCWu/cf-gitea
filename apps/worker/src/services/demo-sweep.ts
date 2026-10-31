@@ -37,16 +37,24 @@
  * index.ts's `scheduled` handler is the single delegation
  * `await handleScheduledCron(controller, env)`. The dispatcher
  * reproduces the pre-M1 inline behavior on every non-hourly entry — the
- * mirror producers run unconditionally, joined (M2 wiring, SPEC-0012 §4.5's
- * zombie arm) by the probe-gated actions-zombie producer (upstream's own
- * always-on `stop_zombie_tasks` @every 5m, cron/tasks_actions.go:26-35 — the
- * SPEC-0016 §4.4 packages ratification shape) — and runs FOUR producer
- * blocks on the hourly "0 * * * *" entry (carried by wrangler.jsonc.example):
- * the (self-gated) demo producer, the (self-gated) audit-retention producer,
- * the (probe-gated, ratified non-demo-gated) packages-cleanup producer, and
- * the (self-gated on the ACTIONS_*_RETENTION_DAYS trio) actions-retention
- * producer (SPEC-0015 §4.3 + SPEC-0016 §4.4 + SPEC-0012 §4.5 — the THREE
- * sanctioned extensions; see the marked blocks in handleScheduledCron).
+ * mirror producers run unconditionally, joined by the TWO actions-stop
+ * extension blocks (the probe-gated actions-zombie producer, upstream's
+ * own always-on `stop_zombie_tasks` @every 5m, cron/tasks_actions.go:26-35
+ * — the SPEC-0016 §4.4 packages ratification shape and the FOURTH
+ * sanctioned extension; the actions-endless producer, upstream's
+ * `stop_endless_tasks`, tasks_actions.go:38-45 — the FIFTH) — and runs
+ * FIVE producer blocks (SIX producer calls) on the hourly "0 * * * *"
+ * entry (carried by wrangler.jsonc.example): the (self-gated) demo
+ * producer, the (self-gated) audit-retention producer (the FIRST
+ * sanctioned extension), the (probe-gated, ratified non-demo-gated)
+ * packages-cleanup producer (the SECOND), the (self-gated on the
+ * ACTIONS_*_RETENTION_DAYS trio) actions-retention producer (the THIRD),
+ * and the actions-abandoned + ephemeral block (the SIXTH — the ungated
+ * `cancel_abandoned_jobs` + `cleanup_ephemeral_runners` pair;
+ * SPEC-0015 §4.3 + SPEC-0016 §4.4 + SPEC-0012 §4.5 — SIX sanctioned
+ * extensions total, ten producer calls across the two entries, the exact
+ * mirror of services/cron-state.ts's CRON_ARMS census: six hourly arms,
+ * four step arms; see the marked blocks in handleScheduledCron).
  * Tests exercise `handleScheduledCron` / `enqueueDueDemoSweeps` / the
  * purge.ts consumer arms directly with fabricated ScheduledControllers —
  * the delegation itself is one await.
