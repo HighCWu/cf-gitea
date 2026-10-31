@@ -138,7 +138,7 @@ describe("the composer p2 metadata ROUTE (the folded-label regression)", () => {
     const { get, owner, token } = await seedApp("c/pkg-a");
     const res = await get(`/api/packages/${owner}/composer/p2/c/pkg-a.json`, token);
     expect(res.status).toBe(200);
-    const doc = (await res.json()) as Record<string, unknown>;
+    const doc: Record<string, unknown> = await res.json();
     expect(Object.keys(doc)).toContain("packages");
   });
 
@@ -146,7 +146,7 @@ describe("the composer p2 metadata ROUTE (the folded-label regression)", () => {
     const { get, owner, token } = await seedApp("c/pkg-dev");
     const res = await get(`/api/packages/${owner}/composer/p2/c/pkg-dev~dev.json`, token);
     expect(res.status).toBe(200);
-    const doc = (await res.json()) as Record<string, unknown>;
+    const doc: Record<string, unknown> = await res.json();
     expect(Object.keys(doc)).toContain("packages");
   });
 
