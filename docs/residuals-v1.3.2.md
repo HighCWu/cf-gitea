@@ -564,6 +564,36 @@ board row flips — this closes a flag, not a listed residual.
     W6 battery + the SPEC-0018 ledger edit). Size: **L** (six waves,
     SPEC-attached; dispatches after ratification).
 
+16. **The federation (ActivityPub) surface — the design pass; SPEC written
+    (2026-10-31, `specs/federation.md`, draft pending ratification).** The
+    honest census is the headline: the pin's gated surface is tiny and
+    upstream retracted its implementation (PR #36789, `1592576fa5` — 1083
+    lines deleted: actor, signature middleware, delivery client, per-user
+    keypairs, nodeinfo-data, all tests; "wait until the whole design is
+    stable and usable"). What the gate actually serves at `fc493688`:
+    `GET /.well-known/nodeinfo` + a full real webfinger
+    (`webfinger.go:38-122`) behind `federationEnabled` with
+    `Enabled=false` default (`federation.go:23`), and the API side is
+    registered-but-501 stubs (`api.go:1007-1010`; `NotImplemented` is the
+    activitypub package's entire content). The SPEC therefore splits the
+    queue item in two: **Tier A — the parity-committed discovery tier**
+    (one S wave, zero schema, the `FEDERATION_ENABLED` fail-closed var,
+    the exact disabled arm: web 404 / API unmounted; the frozen contract
+    gains nothing — the paths are absent from the pin's swagger), and
+    **Tier B — the deleted upstream architecture staged as
+    design-complete-but-gated** (person actor over numeric-ID IRIs,
+    RSA-3072 keypairs in `user_settings_kv` per the debian.ts precedent,
+    hand-rolled zero-dependency draft-cavage verify over WebCrypto, the
+    remote-key TTL cache as the recorded divergence, delivery on the
+    producer→Queue→DLQ idiom, the inbox a faithful 204 black hole).
+    Moderation: nothing to port — `federation_block` never existed
+    upstream (Forgejo-only; checked `git log --all -S` in the submodule).
+    Six open questions recorded; the decisive one (OQ-5): no upstream
+    anchor exists for ANY fediverse feature, so beyond-parity building
+    needs a product owner, and the delivery wave does not dispatch until
+    it has cargo. Size: **S** (Tier A, one wave) / **L** (Tier B, five
+    waves, gated on ratification).
+
 ## P2 — parity polish
 
 1. **The user actions settings group's remaining sub-tabs — LANDED
