@@ -54,9 +54,11 @@ are still uncommitted and keep their places):
   `package_blob_uploads` M6 upload store (P1-5's SPEC-0016 substrate —
   recorded here only as the wave's rider; P1-5 itself is not reconciled
   in this pass).
-- **The owner-store wave** — the OwnerActionsConfig KV home + the two
-  actions-settings POST arms (P2-12), in flight per dispatch; its schema
-  hunk is not yet visible in the tree.
+- **The owner-store wave — LANDED at `4bffff0`** (2026-10-31, verified
+  against the tree): the `user_settings_kv` home (schema `bf7be9e`,
+  migration 0048 `26ce795`) + the OwnerActionsConfig store
+  (`services/actions/owner-actions-config.ts`) + the two actions-settings
+  POST arms (P2-12) — the bullet is closed; see the P2-12 row.
 - **P3-11's annotated-tag read-tag RPC** — the engine-boundary wave is
   uncommitted in the tree (`packages/git-engine` `src/repo.ts` +
   `src/git/objects.ts` modified, the new `e2e/check-tag-read.mjs` check).
@@ -471,46 +473,54 @@ board row flips — this closes a flag, not a listed residual.
 
 ## P2 — parity polish
 
-1. **The user actions settings group's remaining sub-tabs — the pages +
-   mounts LANDED (`6bdd91f` + `180b409`); the write arms STAGED on the
-   owner-store wave (in flight, P2-12).** The bare
+1. **The user actions settings group's remaining sub-tabs — LANDED
+   whole: the pages + mounts (`6bdd91f` + `180b409`), the write arms
+   (`4bffff0`, the owner-store wave — P2-12 closed).** The bare
    `/user/settings/actions` redirect answers 303 with the LITERAL
    `./actions/general` bytes (upstream `web.go:722`'s
    misc.LocationRedirect — the adminActionsGroupRedirect convention) and
    the general page rides `userSettingsTabPrologue` + the reuse twin over
-   `OWNER_ACTIONS_GENERAL_FRESH_DATA` with the viewer's ownerId (its
-   loader needs no D1) — mounted literal-first in the parse arms (the
+   the owner store (the loader reads
+   `services/actions/owner-actions-config.ts`, the absent row answering
+   the fresh posture) — mounted literal-first in the parse arms (the
    bare `actions` before `actions/runners`), four parse-table pins (the
    nesting-bug guard class). The pages render the NO-SETTING
    OwnerActionsConfig posture — upstream's own render for any owner
    without a saved user_setting row (`setting.go:210-232`'s absent-row
    FromDB → permissive; `general.go:78-79`'s write-all max; the
    empty-list short-circuit) — with byte-level fidelity pinned. The POST
-   arms stay engine-owned 404s until the owner-store KV home lands
-   (`6bdd91f`'s recorded reduction: upstream persists OwnerActionsConfig
-   as a user_setting KV row, `config.go:38-46`; see P2-12). Scoped-
-   workflows stays the recorded dead item at this scope (rides P1-3's
-   staged store). Settings-nav/goldens: both unions gained
+   arm is LIVE (`4bffff0`): `POST /user/settings/actions/general` parses
+   both forms, applies over the store (the `applyOwnerActionsGeneralForms`
+   port of `UpdateGeneralSettings`, `general.go:100-161`), answers the
+   :125 JSONError 400 literal on an unknown add target (nothing stored)
+   and 303s back onto the page URL; the `6bdd91f`-era engine-owned-404
+   reduction is retired. The route-level matrix (guard-first, the
+   anonymous login 303, the doer-keyed scoping) is pinned in the page
+   suite. Scoped-workflows stays the recorded dead item at this scope
+   (rides P1-3's staged store). Settings-nav/goldens: both unions gained
    actions-general, 8 golden files re-baselined with token deltas
-   verified; suites 351/351 + 194/194 neighbors. Size: **S** (the write
-   arms only, riding P2-12).
+   verified. Size: — (closed).
 
-2. **The org actions settings tab's remaining pieces — the general page +
-   bare redirect LANDED (`6bdd91f` + `180b409`); writes STAGED on the
-   owner-store wave (in flight, P2-12).** `GET /{org}/settings/actions`
-   303s the literal `./actions/general` bytes (`web.go:1052`'s twin) and
-   `GET /{org}/settings/actions/general` rides `resolveOrgTeamsRequest`
-   (the owner prologue) + the shared `loadOrgActionsGeneralPageData` —
-   the shared core (locale, fresh-data, loaders, the
-   `ParseMaxTokenPermissions` port `general.go:25-44`) lives in
-   `org-settings-actions-general.tsx`, the user page is the reuse twin
+2. **The org actions settings tab's remaining pieces — LANDED whole: the
+   general page + bare redirect (`6bdd91f` + `180b409`), the write arms
+   (`4bffff0`, the owner-store wave — P2-12 closed).** `GET
+   /{org}/settings/actions` 303s the literal `./actions/general` bytes
+   (`web.go:1052`'s twin) and `GET /{org}/settings/actions/general` rides
+   `resolveOrgTeamsRequest` (the owner prologue) + the shared
+   `loadOrgActionsGeneralPageData` — the shared core (locale, fresh-data,
+   loaders, the `ParseMaxTokenPermissions` port `general.go:25-44`) lives
+   in `org-settings-actions-general.tsx`, the user page is the reuse twin
    (the packages-twin aliasing style); the navbars put General FIRST
    (user `navbar.tmpl:43-45` href `/user/settings/actions/general`, org
    `:32-34` upstream's own BARE `{OrgLink}/settings/actions` — the
-   redirect URL mirrored exactly). The POST arms stay engine-owned 404s
-   until the owner-store KV home lands (P2-12; the recipe's full
-   UpdateGeneralSettings semantics ride the org module's HANDOFF tail).
-   Scoped-workflows rides P1 item 3. Size: **S** (the write arms only).
+   redirect URL mirrored exactly). The POST arm is LIVE (`4bffff0`):
+   `POST /{org}/settings/actions/general` runs the same
+   `applyOwnerActionsGeneralForms` port over the ORG's owner id — the
+   require-owner prologue on the write (anonymous 303s to login, a
+   signed-in non-owner 404-shells), the :125 JSONError 400 on an unknown
+   add target (nothing stored), the 303 back onto the page URL; the
+   route-level matrix is pinned in the org page suite (the org-vs-user
+   scoping included). Scoped-workflows rides P1 item 3. Size: — (closed).
 
 3. **The admin scoped-workflows page** (listed for traceability; consumed
    by P1 item 3): the honest 404 with the omitted nav item is the
@@ -763,19 +773,25 @@ board row flips — this closes a flag, not a listed residual.
     rows, and the Code tab's ref-preserving href) LANDED at `c732812`
     (item 7's record — the row is closed).
 
-12. **The owner-store KV prerequisite — the actions-settings POST arms'
-    staged substrate (`6bdd91f`/`180b409`'s recorded reduction; the
-    store wave IN FLIGHT at this update).** Upstream persists
-    OwnerActionsConfig as a user_setting KV row (`config.go:38-46`), and
-    the two general pages' POST arms (upstream posts both forms to the
-    page URL) stay engine-owned 404s until this deployment's
-    typed-columns side store grows the KV home — `src/db` was outside
-    the pages wave by ownership. The render is correct for every
-    never-saved owner (upstream's own absent-row posture), so only the
-    write arms wait; the full UpdateGeneralSettings semantics ride the
-    org module's HANDOFF tail (the recipe recorded at `180b409`).
-    In flight — do not re-dispatch the store; see the in-flight block.
-    Size: **S–M** (one store wave + two POST arms).
+12. **The owner-store KV prerequisite — LANDED (`4bffff0`, the
+    owner-store wave; the schema hunk rode `bf7be9e`, migration 0048
+    `26ce795`).** Upstream persists OwnerActionsConfig as a user_setting
+    KV row (`config.go:38-46`) — upstream's own answer is the GENERIC KV
+    (setting.go:22-29, eight keys on the one table, setting_options.go), so
+    the landed home is `user_settings_kv` (column-for-column) + the
+    store service `services/actions/owner-actions-config.ts`
+    (Get/Set/parse/serialize, the Go-marshal bytes, the absent-row
+    FromDB→permissive default; the one adaptation: the allowed ids are
+    this deployment's TEXT repositories.id). Both general pages' POST
+    arms are LIVE over it (upstream posts both forms to the page URL):
+    the `applyOwnerActionsGeneralForms` port of UpdateGeneralSettings
+    (`general.go:100-161` — the within-owner add resolution + the :125
+    JSONError early return, the remove-all arm, the no-refusal
+    EnumValue arm, the save) mounted at both scopes with the
+    guard-first prologues, and the route-level matrices pinned in both
+    page suites. The `6bdd91f`/`180b409`-era engine-owned-404 reduction
+    and the org module's HANDOFF tail are retired.
+    Size: **S–M** (one store wave + two POST arms — closed).
 
 13. **Amendment to item 6 — the tail's in-flight arms at this update
     (sibling-owned; do not re-dispatch; not landed until committed).**

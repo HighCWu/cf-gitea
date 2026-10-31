@@ -81,8 +81,9 @@
  * upstream's own semantics, now the STORE's default rather than the
  * loader's hardcoded shape), and the POST arms' applier
  * (`applyOwnerActionsGeneralForms` — the UpdateGeneralSettings port,
- * general.go:100-161) rides the same store. The registrations stay the
- * wiring HANDOFF (the tail below) — index.ts is not this module's file.
+ * general.go:100-161) rides the same store. The registrations are LIVE
+ * (`4bffff0` — index.ts's two POST arms over the module's recipe; the
+ * tail below is the executed recipe's record).
  *
  * ## Documented reductions (§6 method — never dead controls)
  *
@@ -293,7 +294,7 @@ export function parseMaxTokenPermissions(form: OwnerActionsPermissionsForm): Act
 // ---------------------------------------------------------------------------
 // The POST arm (upstream UpdateGeneralSettings, general.go:100-161 — both
 // forms post to the page URL, `.Link`; the wiring mounts it at both scopes,
-// the HANDOFF tail)
+// `4bffff0`)
 // ---------------------------------------------------------------------------
 
 /** The add arm's JSONError body — general.go:125's LITERAL string under
@@ -592,9 +593,8 @@ export function OwnerActionsGeneralSections(props: { link: string; data: OwnerAc
 }
 
 // ---------------------------------------------------------------------------
-// The wiring HANDOFF (the orchestrator's index.ts window — this module is
-// not index.ts's owner; the GET mounts are live, the POST arms' appliers
-// are landed below — only the registrations remain)
+// The wiring record (the HANDOFF EXECUTED — `4bffff0`, the owner-store
+// wave; the recipe below is kept as the executed record, verbatim)
 // ---------------------------------------------------------------------------
 //
 // Upstream web.go:1051-1061 (org) / 720-732 (user) mount, inside the

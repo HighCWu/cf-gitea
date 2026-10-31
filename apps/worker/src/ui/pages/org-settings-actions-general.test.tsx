@@ -14,17 +14,23 @@
  * arm, the save).
  *
  * The route-level matrix (the require-owner prologue arms, the parse
- * claims, the bare-path 303, the POST registrations) lands WITH THE MOUNT
- * — index.ts is a shared file this unit does not edit (the module header's
- * HANDOFF).
+ * claims, the bare-path 303, the POST registrations) rides the MOUNTED
+ * router (`uiRouter.fetch`, the wave-49 convention) — index.ts stays a
+ * file this suite does not edit; the POST registrations landed at `4bffff0`
+ * (the owner-store wave) and their route-level arms are pinned at the
+ * bottom of this file.
  */
 
 import { env } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
+import { seedVerifiedUser } from "../../auth/testing/seeds";
 import { setOwnerActionsConfig } from "../../services/actions/owner-actions-config";
-import type { OrgRecord } from "../../services/orgs/orgs";
+import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import type { UiManifest } from "../manifest";
+import { uiRouter } from "../index";
+import { mintSession, SESSION_COOKIE_NAME } from "../session";
+import { uiEnv } from "../__tests__/harness";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { Viewer } from "../viewer";
 import { makeWriteAllActionsTokenPermissions } from "../../services/actions/config";
@@ -434,5 +440,142 @@ describe("applyOwnerActionsGeneralForms (UpdateGeneralSettings over the owner st
     );
     const other = await storedConfig(2);
     expect(other).toEqual({ token_permission_mode: "restricted" }); // untouched
+  });
+});
+
+// --- the mounted POST (the 4bffff0 glue's route-level matrix) --------------------
+//
+// The registrations (index.ts: POST /{org}/settings/actions/general → the
+// orgActionsGeneralSubmit glue) ride the require-owner prologue
+// (resolveOrgTeamsRequest: session → org resolution → the anonymous login
+// 303 → the non-owner 404 shell) with sameOriginGuard FIRST (§2.8 layer 2),
+// parse BOTH forms, apply over the owner store, and answer the two
+// outcomes: the :125 JSONError literal 400 (nothing stored) and the 303
+// back onto the page URL (general.go:159-160's JSONRedirect("") + flash,
+// the no-session-flash reduction).
+
+async function postUi(path: string, init: RequestInit): Promise<Response> {
+  return uiRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
+}
+
+function formPost(body: Record<string, string>, cookie?: string, origin = "https://test.local"): RequestInit {
+  return {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      ...(origin === "" ? {} : { origin }),
+      ...(cookie === undefined ? {} : { cookie: `${SESSION_COOKIE_NAME}=${cookie}` }),
+    },
+    body: new URLSearchParams(body).toString(),
+  };
+}
+
+/** A fresh org + its owner/member sessions, seeded per test (the file's
+ *  beforeEach wipes users/repositories/user_settings_kv): the org rides the
+ *  LANDED OrgService (the owner membership row is the route prologue's
+ *  isOrgOwner gate), the member is the non-owner 404-shell arm. */
+async function seedRouteOrg(): Promise<{ org: OrgRecord; ownerCookie: string; memberCookie: string; ownerId: number }> {
+  const owner = await seedVerifiedUser({ username: "genowner" });
+  const member = await seedVerifiedUser({ username: "genmember" });
+  const orgs = new OrgService(env.DB);
+  const org = await orgs.createOrg({ name: "actionsorg", ownerId: owner.id, visibility: "public", now: T0 });
+  await orgs.addMember(org.id, member.id, { now: new Date(T0.getTime() + 1000) });
+  return {
+    org,
+    ownerId: owner.id,
+    ownerCookie: await mintSession(env.DB, owner.id),
+    memberCookie: await mintSession(env.DB, member.id),
+  };
+}
+
+describe("the mounted POST /{org}/settings/actions/general (the route-level matrix)", () => {
+  it("saves through the router — the permissions post 303s back onto the page and writes the ORG's row", async () => {
+    const f = await seedRouteOrg();
+    const path = `/${f.org.username}/settings/actions/general`;
+    const res = await postUi(
+      path,
+      formPost({
+        token_permission_mode: "restricted",
+        enable_max_permissions: "true",
+        max_unit_access_mode_1: "write",
+        max_unit_access_mode_2: "read",
+        max_id_token: "write",
+      }, f.ownerCookie),
+    );
+    expect(res.status).toBe(303); // JSONRedirect("") mapped onto the redirect-back
+    expect(res.headers.get("location")).toBe(path);
+    const cfg = await storedConfig(f.org.id);
+    expect(cfg.token_permission_mode).toBe("restricted");
+    // ParseMaxTokenPermissions fills all eight unit keys (the loop's none
+    // default) — the same byte pin the applier suite carries.
+    expect(cfg.max_token_permissions).toEqual({ unit_access_modes: { 1: 2, 2: 1, 3: 0, 4: 0, 5: 0, 8: 0, 9: 0, 10: 0 }, id_token: true });
+  });
+
+  it("adds a cross-repo target through the router — the within-owner resolution lands the id once", async () => {
+    const f = await seedRouteOrg();
+    const path = `/${f.org.username}/settings/actions/general`;
+    const repoId = `route-${f.org.id}`;
+    await env.DB.prepare(
+      "INSERT INTO repositories (id, storage_key, owner_namespace, owner_id, slug, default_branch, visibility, created_at) VALUES (?, ?, ?, ?, 'demo', 'main', 'public', unixepoch())",
+    )
+      .bind(repoId, repoId, f.org.usernameLower, f.org.id)
+      .run();
+    const res = await postUi(path, formPost({ cross_repo_add_target: "true", cross_repo_add_target_name: "DEMO" }, f.ownerCookie));
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(path);
+    const cfg = await storedConfig(f.org.id);
+    expect(cfg.allowed_cross_repo_ids).toEqual([repoId]); // lower_name case-fold (DEMO → demo)
+    // A second add is a save, not a duplicate (append-if-absent, :131-133).
+    await postUi(path, formPost({ cross_repo_add_target: "true", cross_repo_add_target_name: "demo" }, f.ownerCookie));
+    expect((await storedConfig(f.org.id)).allowed_cross_repo_ids).toEqual([repoId]);
+  });
+
+  it("answers the :125 JSONError 400 through the router — the literal body, NOTHING stored", async () => {
+    const f = await seedRouteOrg();
+    const path = `/${f.org.username}/settings/actions/general`;
+    const res = await postUi(path, formPost({ cross_repo_add_target: "true", cross_repo_add_target_name: "missing" }, f.ownerCookie));
+    expect(res.status).toBe(400);
+    expect(res.headers.get("content-type")).toBe("application/json;charset=utf-8");
+    expect(await res.json()).toEqual(OWNER_ACTIONS_REPO_NOT_EXIST_ERROR); // context.go:276-278's shape
+    const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM user_settings_kv WHERE user_id = ?").bind(f.org.id).first<{ n: number }>();
+    expect(row?.n).toBe(0); // the early return skips the save
+  });
+
+  it("keeps the require-owner prologue on the POST — anonymous 303s to login, a signed-in non-owner 404-shells, an unknown org 404-shells", async () => {
+    const f = await seedRouteOrg();
+    const path = `/${f.org.username}/settings/actions/general`;
+    const body = { token_permission_mode: "restricted" };
+    const anon = await postUi(path, formPost(body));
+    expect(anon.status).toBe(303);
+    expect(anon.headers.get("location")).toBe(`/login?redirect_to=${encodeURIComponent(path)}`);
+    const member = await postUi(path, formPost(body, f.memberCookie));
+    expect(member.status).toBe(404); // the non-owner shell — no org context leaks
+    const unknown = await postUi("/no-such-org/settings/actions/general", formPost(body, f.ownerCookie));
+    expect(unknown.status).toBe(404);
+    // The refused posts wrote nothing.
+    const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM user_settings_kv").first<{ n: number }>();
+    expect(row?.n).toBe(0);
+  });
+
+  it("rejects a cross-origin write before the session gate (§2.8 layer 2 — the guard answers first)", async () => {
+    const f = await seedRouteOrg();
+    const path = `/${f.org.username}/settings/actions/general`;
+    // No cookie AND a foreign origin: the guard's 403 wins over the login 303.
+    const res = await postUi(path, formPost({ token_permission_mode: "restricted" }, undefined, "https://evil.example"));
+    expect(res.status).toBe(403);
+    expect(await res.text()).toBe("cross-origin request rejected\n");
+    // Same answer with the owner's cookie — the origin, not the session, decides.
+    const ownered = await postUi(path, formPost({ token_permission_mode: "restricted" }, f.ownerCookie, "https://evil.example"));
+    expect(ownered.status).toBe(403);
+  });
+
+  it("scopes the write to the ORG's owner id — the doer's own user-scope row is never touched", async () => {
+    const f = await seedRouteOrg();
+    await setOwnerActionsConfig(env.DB, f.ownerId, { tokenPermissionMode: "restricted", maxTokenPermissions: null, allowedCrossRepoIds: [] });
+    const path = `/${f.org.username}/settings/actions/general`;
+    const res = await postUi(path, formPost({ token_permission_mode: "permissive" }, f.ownerCookie));
+    expect(res.status).toBe(303);
+    expect((await storedConfig(f.org.id)).token_permission_mode).toBe("permissive"); // the org's row written
+    expect(await storedConfig(f.ownerId)).toEqual({ token_permission_mode: "restricted" }); // the doer's row untouched
   });
 });
