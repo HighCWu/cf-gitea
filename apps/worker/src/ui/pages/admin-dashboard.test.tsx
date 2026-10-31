@@ -73,14 +73,38 @@ beforeEach(async () => {
 // --- the loader (the landed cron registry) -------------------------------------
 
 describe("loadAdminDashboardData (the landed registry, the monitor loader's rows)", () => {
-  it("answers the one landed maintenance row with the computed next fire", async () => {
+  it("answers the FIVE runnable maintenance rows with computed next fires (the census absorption 067449a grew the set — the pinned spec shapes per arm)", async () => {
     const { maintenance } = await loadAdminDashboardData(NOW);
-    expect(maintenance).toHaveLength(1);
-    expect(maintenance[0]!.name).toBe("update_mirrors");
+    // The runnable registry (CRON_RUN_BODIES): update_mirrors, update_push_mirrors,
+    // demo_sweep, delete_old_audit_events, cleanup_packages — the census order.
+    expect(maintenance.map((row) => row.name)).toEqual([
+      "update_mirrors",
+      "update_push_mirrors",
+      "demo_sweep",
+      "delete_old_audit_events",
+      "cleanup_packages",
+    ]);
     expect(maintenance[0]!.spec).toBe("*/10 * * * *");
     expect(maintenance[0]!.next).toEqual(new Date("2026-01-01T00:10:00Z")); // the next UTC step
-    expect(maintenance[0]!.prev).toBeNull(); // never fired — the registry keeps no history
-    expect(maintenance[0]!.execTimes).toBe(0);
+    // The second step arm (update_push_mirrors rides the same */10 entry).
+    expect(maintenance[1]!.name).toBe("update_push_mirrors");
+    expect(maintenance[1]!.spec).toBe("*/10 * * * *");
+    expect(maintenance[1]!.next).toEqual(new Date("2026-01-01T00:10:00Z"));
+    // The three hourly arms (0 * * * * — the top of the next hour).
+    const hourly = maintenance.slice(2);
+    expect(hourly.map((row) => row.name)).toEqual([
+      "demo_sweep",
+      "delete_old_audit_events",
+      "cleanup_packages",
+    ]);
+    for (const row of hourly) {
+      expect(row.spec).toBe("0 * * * *");
+      expect(row.next).toEqual(new Date("2026-01-01T01:00:00Z"));
+    }
+    for (const row of maintenance) {
+      expect(row.prev).toBeNull(); // never fired — the registry keeps no history
+      expect(row.execTimes).toBe(0);
+    }
   });
 });
 
