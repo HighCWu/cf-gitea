@@ -1116,10 +1116,14 @@ runs the regexp):
   SetIssueReadBy, notification.go:338 — the issue-view mark-read), the
   issue indexer's `GetIssueMentionIDs` (modules/indexer/issues/util.go:53
   — no indexer), the search filter joins (issue_search.go:396-398 powering
-  `/repos/issues/search`'s `mentioned`/`mentioned_by` and
-  repo_list.go:259-267's UserMentionedRepoCond — the routes exist and
-  still stub the filters as the empty set; wiring them is the search
-  surface owner's precise hunk now that the store exists).
+  `/repos/issues/search`'s `mentioned`/`mentioned_by` — LANDED since: the
+  `IssueListFilters.mentionedId` filter (api/services/issues.ts) wired
+  through the repo-scoped list, the global search (incl. the signed
+  `mentioned` doer-flag, repo/issue.go:223-225) and the web aux feed, per
+  applyMentionedCondition; repo_list.go:259-267's UserMentionedRepoCond
+  stays STAGED — its only caller is issuePullAccessibleRepoCond
+  (issue_search.go:342-371), the web dashboard's accessible-repo
+  condition, a surface this backend does not carry).
 - `services/mentions/service.ts` — the `findIssueMentions` entry
   (parse → resolve), the FindAndUpdateIssueMentions shape minus the two
   schema-absent arms.
@@ -1327,38 +1331,47 @@ runs the regexp):
   shipped posture is the fold's fail-closed control, and the DELETE's
   zero rows pin the receiver's removal self-gate.
 
-### 14.6 The review-family extraction sketch (the STAGED family's precise shape)
+### 14.6 The review-family extraction as-built (api/services/pull-reviews.ts)
 
-The staged receivers (`PullRequestReview` notify.go:98-111,
-`PullRequestCodeComment` :113-117, `PullRequestReviewRequest` :129-136)
-all fire — upstream — from `services/pull/review.go` AFTER the review
-writes commit. Our tree has no such service layer: the review writes live
-inline in `api/routes/pull-reviews.ts` (1977 lines), whose D1 writes
-(~48 drizzle call sites) are route-handler writes — against the method.
-The extraction that un-blocks the family:
+The extraction this SPEC staged is LANDED (the prerequisite the review
+mail family rides; the receivers themselves stay the NEXT wave — this
+wave emits NO mail):
 
-- Extract `submitReview` (pull-reviews.ts:852-1032 — the review-submission
-  core: the review row upsert, the pending-review folding, the official-
-  reviewer gate inputs, the review-comment rows) into an
-  `api/services/pull-reviews.ts` service whose handlers take the notify
-  env alongside the write inputs, exactly the `IssuesService(d1, mailEnv)`
-  precedent (§8.3).
-- With it, the two request-writer cores `addReviewRequest` (:1033-) /
-  `removeReviewRequest` (:1098-) move the same way — the
-  `PullRequestReviewRequest` arm's emit site (its mail half is
-  `notifyIssueAssigneeChanged`'s shape with the review-request `ct`,
-  notify.go:131-136 — `SendIssueAssignedMail` over `{ActionType: 0,
-  Content: "Requested to review <htmlurl>.", Comment: <the request
-  comment>}` to the reviewer).
-- `PullRequestReview` (:98-111) composes over the review's type-22/23/24/25
-  comment thread (the APPROVED/REJECT/default→"approve"|"reject"|"review"
-  template names via actionToTemplate's commentType switch) — the compose
-  is the comment arm's shape with the REVIEW comment, so the extraction
-  feeds the existing hub core unchanged.
-- `PullRequestCodeComment` (:113-117) additionally needs the mention
-  resolution over the code-comment body (`MailMentionsComment`,
-  mail_comment.go:42-62) — the parser half is landed (§13); the arm rides
-  the same extraction.
+- `submitReview` + `addReviewRequest` / `removeReviewRequest` moved
+  VERBATIM out of `api/routes/pull-reviews.ts` (1977 → 1641 lines) into
+  `api/services/pull-reviews.ts` as `PullReviewsService(d1, mailEnv?)` —
+  the `IssuesService(d1, mailEnv)` §8.3 constructor threading. The route
+  handlers stay parse+validate+respond and construct
+  `new PullReviewsService(c.env.DB, c.env)` at the three write arms (the
+  two review submits + the request pair's USER loops); the read consults
+  the route's own gates still need (`currentPendingReview`,
+  `latestDecisionReview`) are service-module exports, and
+  `isOfficialReviewer` is the service's private (the three cores are its
+  only callers). Behavior byte-identical: the route suite's 31 assertions
+  pass UNCHANGED (the refactor's proof), and
+  `api/services/pull-reviews.test.ts` (16 arms) pins the cores directly —
+  the SubmitReview state machine, the request pair's skip/403/official
+  semantics, and the seam posture below.
+- SEAM MARKERS (the next wave's firing points, upstream-shaped): BOTH
+  `PullRequestReview` (notify.go:98-111) and `PullRequestCodeComment`
+  (:113-117, the `MailMentionsComment` mention resolution over the
+  attached code comments' bodies — the parser half landed §13) fire from
+  ONE upstream body — `SubmitReview` (services/pull/review.go:316 and
+  :323-331) — so both `SEAM` comments sit in the service's `submitReview`
+  after the writes commit. `PullRequestReviewRequest` (notify.go:129-136,
+  `SendIssueAssignedMail` over `{ActionType: 0, Content: "Requested to
+  review <htmlurl>.", Comment: <the request comment>}`) fires from the
+  request model arm (services/issue/review_request.go:38 — `comment !=
+  nil`): the service's `addReviewRequest` and `removeReviewRequest` carry
+  the SEAM comments (the removal receiver self-gates off `!isRequest`,
+  notify.go:132). The route's TEAM-add block carries its own seam note —
+  upstream's team arm notifies through `teamReviewRequestNotify`
+  (review_request.go:233) while TEAM-request removal is silent (:44-47) —
+  so its mail fold rides the route, not the service cores.
+- Posture: absent env the arms are off (every construction site's
+  fail-closed default); an ARMED constructor performs byte-identical
+  writes and lands ZERO `email_outbox` rows (the service suite pins both —
+  this wave's tripwire against premature emission).
 
 ---
 

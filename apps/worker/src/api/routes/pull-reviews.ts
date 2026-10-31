@@ -118,6 +118,13 @@
  * render our TEXT repo id verbatim in upstream's ` [user_id: N, repo_id: R]`
  * suffix format.
  *
+ * The WRITE CORES live in services/pull-reviews.ts — `submitReview` +
+ * `addReviewRequest`/`removeReviewRequest`, the §14.6 extraction
+ * (specs/email-outbound.md): the handlers below stay parse+validate+respond
+ * and construct `new PullReviewsService(c.env.DB, c.env)` at the write arms
+ * (the IssuesService(d1, mailEnv) mail seam — the review family's receivers
+ * fire from the service in the NEXT wave; this wave emits no mail).
+ *
  * Auth (routers/api/v1/api.go:1457–1474): the GET arms ride the group's
  * reqRepoReader (anonymous-capable on public repos → optionalAuth); every
  * write arm carries reqToken → requireAuth. Repo resolution follows the
@@ -134,7 +141,7 @@ import { z } from "zod";
 
 import type { DiffFileJson } from "@cf-gitea/git-engine";
 
-import { ReviewType, comments, issues, pullReviews, teamMembers, teams, users } from "../../db/schema";
+import { ReviewType, comments, issues, pullReviews, teams, users } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { emitIssueEvent } from "../../services/issue-events";
@@ -165,9 +172,12 @@ import {
 } from "../services/repository";
 import { engineReads } from "../services/engine";
 import { pullRequestDiff, pullRequestDiffShortStat } from "../services/pull-engine";
-import { findRule, isUserOfficialReviewer, parseRuleConfig, principalAccessOfRow } from "../../services/branch-protection";
-
-type ReviewRow = typeof pullReviews.$inferSelect;
+// The write cores (§14.6's extraction — specs/email-outbound.md): submitReview
+// + the reviewer-request pair live in the service (the IssuesService(d1,
+// mailEnv) seam; this route passes `c.env` at the write arms). The read
+// consults stay local imports — the route's handlers + arms still look up
+// pending/decision rows for their own gates.
+import { PullReviewsService, currentPendingReview, latestDecisionReview, type ReviewRow } from "../services/pull-reviews";
 
 // ---------------------------------------------------------------------------
 // Contract models (vendored definitions rendered inline, misc-t2 convention;
@@ -380,22 +390,6 @@ async function prepareSingleReview(
   return { review, issue, pullRequest };
 }
 
-/**
- * IsOfficialReviewer (models/issues/review.go:276–306) over the SPEC-0013
- * rule service: the base branch's first-match rule decides — without a rule,
- * or without `enable_approvals_whitelist`, a reviewer with WRITE access on
- * the base repo makes official reviews; with the whitelist, the approvals
- * whitelist (user/team) only. Takes the reviewer's row — not the request
- * doer — because request arms evaluate the REVIEWER's officialness, and the
- * PR's base branch (the rule is matched against the BASE).
- */
-async function isOfficialReviewer(d1: D1Database, found: RepositoryWithOwner, baseBranch: string, reviewer: UserRow | null): Promise<boolean> {
-  if (reviewer === null) return false;
-  const rule = await findRule(d1, found.repo.id, baseBranch);
-  const access = await principalAccessOfRow(d1, found.repo, reviewer);
-  return isUserOfficialReviewer(d1, rule === null ? null : parseRuleConfig(rule.rules), access);
-}
-
 /** The doer's full user row (requireAuth guarantees presence on write arms). */
 async function doerRowOf(c: Context<ApiEnv>, doerId: number): Promise<UserRow | null> {
   const rows = await drizzle(c.env.DB).select().from(users).where(eq(users.id, doerId)).limit(1).all();
@@ -415,39 +409,6 @@ async function canDoerChangeReviewRequests(c: Context<ApiEnv>, found: Repository
   if (issue.posterId !== null && doer.id === issue.posterId) return true;
   if (doer.id === found.repo.ownerId) return true;
   return (await collaboratorModeOf(c.env.DB, found.repo.id, doer.id ?? 0)) !== "none";
-}
-
-/**
- * The reviewer's latest approve/reject/request review
- * (GetReviewByIssueIDAndUserID, models/issues/review.go:586–604 — id DESC).
- */
-async function latestDecisionReview(d1: D1Database, issueId: number, reviewerId: number): Promise<ReviewRow | null> {
-  const rows = await drizzle(d1)
-    .select()
-    .from(pullReviews)
-    .where(
-      and(
-        eq(pullReviews.issueId, issueId),
-        eq(pullReviews.reviewerId, reviewerId),
-        inArray(pullReviews.type, [ReviewType.Approve, ReviewType.Reject, ReviewType.Request]),
-      ),
-    )
-    .orderBy(sql`id desc`)
-    .limit(1)
-    .all();
-  return rows[0] ?? null;
-}
-
-/** GetCurrentReview (models/issues/review.go:430–447) — the latest PENDING row. */
-async function currentPendingReview(d1: D1Database, issueId: number, reviewerId: number): Promise<ReviewRow | null> {
-  const rows = await drizzle(d1)
-    .select()
-    .from(pullReviews)
-    .where(and(eq(pullReviews.issueId, issueId), eq(pullReviews.reviewerId, reviewerId), eq(pullReviews.type, ReviewType.Pending)))
-    .orderBy(sql`id desc`)
-    .limit(1)
-    .all();
-  return rows[0] ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -822,318 +783,13 @@ async function emitReviewSubmitted(
 }
 
 // ---------------------------------------------------------------------------
-// The SubmitReview pipeline (models/issues/review.go:467–584).
+// The write cores — `submitReview` + the reviewer-request pair — moved to
+// api/services/pull-reviews.ts (the §14.6 extraction, specs/email-outbound.md;
+// the IssuesService(d1, mailEnv) mail seam threads `c.env` at the call
+// sites below). This file keeps the route surface: guards, renderers, and
+// the read consults (`latestDecisionReview` / `currentPendingReview` are
+// the service module's exports now).
 // ---------------------------------------------------------------------------
-
-/** ContentEmptyErr (models/issues/review.go:455–465) — the routes' 422. */
-class ContentEmptyError extends ApiError {
-  constructor() {
-    super(422, "review requires a body or a comment");
-  }
-}
-
-interface SubmitReviewInput {
-  doerId: number;
-  doerRow: UserRow | null;
-  issue: IssueRow;
-  /** The PR's base branch — the official predicate matches the rule on it. */
-  baseBranch: string;
-  reviewType: number;
-  content: string;
-  commitId: string;
-}
-
-/**
- * Port of SubmitReview: converts the doer's latest PENDING review (or
- * creates a fresh row), applies the CreateReview side-effects, lands the
- * CommentTypeReview system comment and returns the row. The OFFICIAL
- * computation needs the caller's repo pair (base-repo write access).
- */
-async function submitReview(c: Context<ApiEnv>, found: RepositoryWithOwner, input: SubmitReviewInput): Promise<ReviewRow> {
-  const db = drizzle(c.env.DB);
-  const now = new Date();
-  const { doerId, issue } = input;
-  const reviewType = input.reviewType;
-  const isDecision = reviewType === ReviewType.Approve || reviewType === ReviewType.Reject;
-
-  const pending = await currentPendingReview(c.env.DB, issue.id, doerId);
-  if (pending === null && reviewType !== ReviewType.Approve && input.content.trim() === "") {
-    throw new ContentEmptyError();
-  }
-  if (isDecision && issue.isClosed) {
-    // ErrSubmitReviewOnClosedPR (services/pull/review.go:46–47 + :289–294 —
-    // approve/reject on a closed or merged PR; comment/pending stay legal).
-    throw new ApiError(422, "can't submit review for a closed or merged PR");
-  }
-
-  let official = false;
-  if (isDecision) {
-    // "Only reviewers latest review of type approve and reject shall count
-    // as official" (:524–528 / :538–542) — clear, then recompute.
-    await db
-      .update(pullReviews)
-      .set({ official: false })
-      .where(and(eq(pullReviews.issueId, issue.id), eq(pullReviews.reviewerId, doerId)))
-      .run();
-    official = await isOfficialReviewer(c.env.DB, found, input.baseBranch, input.doerRow);
-  }
-
-  // CreateReview's side-effects (models/issues/review.go:396–428): a
-  // non-pending review clears the reviewer's outstanding REQUEST rows
-  // (:403–406); an approve/reject dismisses the previous decision rows
-  // (:408–412). On the conversion arm the leftover-request cleanup repeats
-  // after the update (:560–566).
-  const clearOutstandingRequests = reviewType !== ReviewType.Pending;
-  const dismissPreviousDecisions = isDecision;
-
-  let review: ReviewRow;
-  if (pending === null) {
-    // CreateReview's transactional order (:396–428) — side effects first.
-    if (clearOutstandingRequests) {
-      await db
-        .delete(pullReviews)
-        .where(
-          and(
-            eq(pullReviews.issueId, issue.id),
-            eq(pullReviews.reviewerId, doerId),
-            eq(pullReviews.type, ReviewType.Request),
-          ),
-        )
-        .run();
-    }
-    if (dismissPreviousDecisions) {
-      await db
-        .update(pullReviews)
-        .set({ dismissed: true })
-        .where(
-          and(
-            eq(pullReviews.issueId, issue.id),
-            eq(pullReviews.reviewerId, doerId),
-            inArray(pullReviews.type, [ReviewType.Approve, ReviewType.Reject]),
-          ),
-        )
-        .run();
-    }
-    const inserted = await db
-      .insert(pullReviews)
-      .values({
-        type: reviewType,
-        reviewerId: doerId,
-        issueId: issue.id,
-        content: input.content,
-        official,
-        commitId: input.commitId,
-        stale: false,
-        dismissed: false,
-        createdAt: now,
-        updatedAt: now,
-      })
-      .returning()
-      .all();
-    review = inserted[0]!;
-  } else {
-    // The pending-row conversion (:543–559) + its side effects (:560–566
-    // and CreateReview's :408–412, scoped to the OTHER decision rows).
-    if (clearOutstandingRequests) {
-      await db
-        .delete(pullReviews)
-        .where(
-          and(
-            eq(pullReviews.issueId, issue.id),
-            eq(pullReviews.reviewerId, doerId),
-            eq(pullReviews.type, ReviewType.Request),
-          ),
-        )
-        .run();
-    }
-    if (dismissPreviousDecisions) {
-      await db
-        .update(pullReviews)
-        .set({ dismissed: true })
-        .where(
-          and(
-            eq(pullReviews.issueId, issue.id),
-            eq(pullReviews.reviewerId, doerId),
-            inArray(pullReviews.type, [ReviewType.Approve, ReviewType.Reject]),
-            sql`id != ${pending.id}`,
-          ),
-        )
-        .run();
-    }
-    await db
-      .update(pullReviews)
-      .set({ type: reviewType, content: input.content, official, commitId: input.commitId, stale: false, updatedAt: now })
-      .where(eq(pullReviews.id, pending.id))
-      .run();
-    review = {
-      ...pending,
-      type: reviewType,
-      content: input.content,
-      official,
-      commitId: input.commitId,
-      stale: false,
-      updatedAt: now,
-    };
-  }
-
-  // The CommentTypeReview (22) system comment (:551–563) — the local
-  // num_comments discipline bumps alongside every inserted comment.
-  await db.batch([
-    db.insert(comments).values({
-      type: CommentType.Review,
-      posterId: doerId,
-      issueId: issue.id,
-      content: input.content,
-      reviewId: review.id,
-      createdAt: now,
-      updatedAt: now,
-    }),
-    db.update(issues).set({ numComments: sql`num_comments + 1`, updatedAt: now }).where(eq(issues.id, issue.id)),
-  ]);
-
-  // Team-request cleanup on an org-owned repo (:563–584): an approve/reject
-  // by a team member clears that team's REQUEST row.
-  if (found.repo.ownerId !== null && isDecision) {
-    const doerTeams = await db
-      .select({ teamId: teamMembers.teamId })
-      .from(teamMembers)
-      .where(and(eq(teamMembers.orgId, found.repo.ownerId), eq(teamMembers.userId, doerId)))
-      .all();
-    if (doerTeams.length > 0) {
-      await db
-        .delete(pullReviews)
-        .where(
-          and(
-            eq(pullReviews.issueId, issue.id),
-            eq(pullReviews.type, ReviewType.Request),
-            sql`${pullReviews.reviewerTeamId} > 0`,
-            inArray(
-              pullReviews.reviewerTeamId,
-              doerTeams.map((team) => team.teamId),
-            ),
-          ),
-        )
-        .run();
-    }
-  }
-
-  return review;
-}
-
-// ---------------------------------------------------------------------------
-// Review-request model arms (models/issues/review.go:697–820).
-// ---------------------------------------------------------------------------
-
-/**
- * AddReviewRequest (models/issues/review.go:697–768): the already-requested
- * skip, the closed/merged 403, the official-flag clear, the REQUEST row,
- * the CommentTypeReviewRequest (27) comment. Returns the created row or
- * null (skipped).
- */
-async function addReviewRequest(
-  c: Context<ApiEnv>,
-  found: RepositoryWithOwner,
-  issue: IssueRow,
-  pullRequest: PullRequestRow,
-  reviewer: UserRow,
-): Promise<ReviewRow | null> {
-  const db = drizzle(c.env.DB);
-  const doer = c.get("authUser");
-  const doerId = doer.id ?? 0; // requireAuth guarantees the id
-  const now = new Date();
-
-  const lastReview = await latestDecisionReview(c.env.DB, issue.id, reviewer.id);
-  if (lastReview !== null && lastReview.type === ReviewType.Request) {
-    return null; // already requested — silent skip (:706–710)
-  }
-  if (issue.isClosed || pullRequest.hasMerged) {
-    // ErrReviewRequestOnClosedPR (review.go:70–86) → 403.
-    throw new ApiError(403, "cannot request a re-review on a closed or merged PR");
-  }
-
-  const official = await isOfficialReviewer(c.env.DB, found, pullRequest.baseBranch, reviewer);
-  if (official) {
-    await db
-      .update(pullReviews)
-      .set({ official: false })
-      .where(and(eq(pullReviews.issueId, issue.id), eq(pullReviews.reviewerId, reviewer.id)))
-      .run();
-  }
-
-  // CreateReview carries the official flag ON the request row
-  // (models/issues/review.go:759 `Official: official`) — the SPEC-0013
-  // block_on_official_review_requests arm reads exactly it.
-  const inserted = await db
-    .insert(pullReviews)
-    .values({ type: ReviewType.Request, reviewerId: reviewer.id, issueId: issue.id, content: "", official, createdAt: now, updatedAt: now })
-    .returning()
-    .all();
-  const review = inserted[0]!;
-
-  await db.batch([
-    db.insert(comments).values({
-      type: CommentType.ReviewRequest,
-      posterId: doerId,
-      issueId: issue.id,
-      assigneeId: reviewer.id,
-      removedAssignee: 0,
-      reviewId: review.id,
-      createdAt: now,
-      updatedAt: now,
-    }),
-    db.update(issues).set({ numComments: sql`num_comments + 1`, updatedAt: now }).where(eq(issues.id, issue.id)),
-  ]);
-
-  return review;
-}
-
-/**
- * RemoveReviewRequest (models/issues/review.go:770–804): the latest
- * approve/reject/request row must be a REQUEST row (else silent no-op);
- * the row is deleted, an official reviewer's latest decision review
- * restores its flag (restoreLatestOfficialReview :806–820, quirk faithful),
- * and a removal comment lands. Returns whether anything was removed (the
- * caller's webhook gate — upstream notifies only when a comment landed).
- */
-async function removeReviewRequest(
-  c: Context<ApiEnv>,
-  found: RepositoryWithOwner,
-  issue: IssueRow,
-  baseBranch: string,
-  reviewer: UserRow,
-): Promise<boolean> {
-  const db = drizzle(c.env.DB);
-  const doer = c.get("authUser");
-  const doerId = doer.id ?? 0; // requireAuth guarantees the id
-  const now = new Date();
-
-  const lastReview = await latestDecisionReview(c.env.DB, issue.id, reviewer.id);
-  if (lastReview === null || lastReview.type !== ReviewType.Request) {
-    return false; // nothing to remove — silent no-op (:777–780)
-  }
-  await db.delete(pullReviews).where(eq(pullReviews.id, lastReview.id)).run();
-
-  if (await isOfficialReviewer(c.env.DB, found, baseBranch, reviewer)) {
-    const restored = await latestDecisionReview(c.env.DB, issue.id, reviewer.id);
-    if (restored !== null) {
-      await db.update(pullReviews).set({ official: true }).where(eq(pullReviews.id, restored.id)).run();
-    }
-  }
-
-  await db.batch([
-    db.insert(comments).values({
-      type: CommentType.ReviewRequest,
-      posterId: doerId,
-      issueId: issue.id,
-      assigneeId: reviewer.id,
-      removedAssignee: 1,
-      createdAt: now,
-      updatedAt: now,
-    }),
-    db.update(issues).set({ numComments: sql`num_comments + 1`, updatedAt: now }).where(eq(issues.id, issue.id)),
-  ]);
-  return true;
-}
 
 // ---------------------------------------------------------------------------
 // Read consult for routes/pulls.ts: the PR's requested reviewers
@@ -1362,7 +1018,7 @@ export function registerPullReviewRoutes(
         ]);
       }
 
-      const review = await submitReview(c, found, {
+      const review = await new PullReviewsService(c.env.DB, c.env).submitReview(found, {
         doerId,
         doerRow: await doerRowOf(c, doerId),
         issue,
@@ -1445,7 +1101,7 @@ export function registerPullReviewRoutes(
       }
 
       const head = await engineReads(c.env, found.repo).readCommit(pullHeadRefName(issue.index));
-      const submitted = await submitReview(c, found, {
+      const submitted = await new PullReviewsService(c.env.DB, c.env).submitReview(found, {
         doerId,
         doerRow: await doerRowOf(c, doerId),
         issue,
@@ -1766,6 +1422,10 @@ export function registerPullReviewRoutes(
     // isValidReviewRequest (services/issue/review_request.go:41–129).
     const doer = c.get("authUser");
     const doerId = doer.id ?? 0; // requireAuth guarantees the id
+    // The USER-request write cores (§14.6's service extraction) — one
+    // instance carries both loops' writes; `c.env` threads the mail seam
+    // (the PullRequestReviewRequest arm rides the service, next wave).
+    const reviews = new PullReviewsService(c.env.DB, c.env);
     const canDoerChange = await canDoerChangeReviewRequests(c, found, issue);
     for (const reviewer of reviewers) {
       if (reviewer.type === "org") {
@@ -1817,7 +1477,7 @@ export function registerPullReviewRoutes(
     if (isAdd) {
       const created: ReviewRow[] = [];
       for (const reviewer of reviewers) {
-        const result = await addReviewRequest(c, found, issue, pullRequest, reviewer);
+        const result = await reviews.addReviewRequest(found, issue, pullRequest, reviewer, doerId);
         if (result !== null) {
           created.push(result);
           // The PullRequestReviewRequest event (notifier.go:793–815) — per
@@ -1840,6 +1500,10 @@ export function registerPullReviewRoutes(
       // Team arms (AddTeamReviewRequest, review.go:822–876): rows land; one
       // webhook per request with requested_reviewer omitted (deviation
       // documented in the module header).
+      // SEAM (next wave): upstream's TEAM-request add notifies too
+      // (teamReviewRequestNotify, review_request.go:233) — its mail arm
+      // folds HERE beside the webhook emit; TEAM-request REMOVAL is silent
+      // (:44–47), so the team block below stays mail-off.
       for (const team of teamReviewers) {
         const existing = (
           await drizzle(c.env.DB)
@@ -1906,7 +1570,7 @@ export function registerPullReviewRoutes(
     // SILENT (:44–47 — `!isAdd` returns before the notifier). Silence on
     // no-ops (nothing removed → no event, upstream comment == nil).
     for (const reviewer of reviewers) {
-      const removed = await removeReviewRequest(c, found, issue, pullRequest.baseBranch, reviewer);
+      const removed = await reviews.removeReviewRequest(found, issue, pullRequest.baseBranch, reviewer, doerId);
       if (removed) {
         await emitIssueEvent(c, {
           repoId: found.repo.id,
