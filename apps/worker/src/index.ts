@@ -34,6 +34,7 @@ import { attachmentsServingRouter } from "./web/attachments-serving";
 import { oauth2Router } from "./web/oauth2-token";
 import { wellKnownRouter } from "./api/routes/federation";
 import { oauth2WellKnownRouter } from "./web/oauth2-wellknown";
+import { webWellKnownRouter } from "./web/well-known";
 import { securityHeaders, withSecurityHeaders } from "./web/security-headers";
 import { webhookDlqHandler } from "./webhooks/dlq";
 import { webhookQueueHandler } from "./webhooks/consumer";
@@ -293,6 +294,11 @@ app.route("/", wellKnownRouter);
 // openid-configuration — the W6 battery's find: the W4 wave exported the
 // router but its mount handoff never executed.
 app.route("/", oauth2WellKnownRouter);
+// The /.well-known web group's remaining tails (census #16): change-password,
+// passkey-endpoints, and the group's static-file fallback (the landed trio
+// above keeps winning by Hono's static-beats-wildcard specificity — the
+// module's mount-parity test proves it).
+app.route("/", webWellKnownRouter);
 
 // The OAuth2 provider's stateless JSON arms (SPEC specs/oauth2-provider.md
 // §2.3/§2.6, W2's route-home decision in web/oauth2-token.ts's header):
