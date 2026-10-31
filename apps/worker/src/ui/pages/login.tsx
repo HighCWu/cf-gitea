@@ -170,23 +170,33 @@ const OAUTH2_PROVIDER_GLYPHS: Record<string, { viewBox: string; paths: Array<{ d
   },
 };
 
-/** The `$provider.IconHTML 24` render (providers.go:63-72): the cfg
- *  IconURL's img markup verbatim, else the brand glyph (24px, external_auth_methods.tmpl:3's
- *  size), else the octicon-globe fallback. */
-function ProviderIcon(props: { source: OAuth2LoginSourceButton }) {
+/** The `$provider.IconHTML size` render (providers.go:63-72): the cfg
+ *  IconURL's img markup verbatim, else the brand glyph (the provider-keyed
+ *  OAUTH2_PROVIDER_GLYPHS pick — providers_base.go:36-45's
+ *  `svg.RenderHTML("gitea-"+name, size)` with the gplus→gitea-google /
+ *  github→octicon-mark-github special cases + providers_openid.go:34-37's
+ *  gitea-openid), else the octicon-globe fallback. `size` is IconHTML's
+ *  size argument: the login navigator renders 24
+ *  (external_auth_methods.tmpl:4 — the default), the security page's
+ *  account-links arms render 20 (accountlinks.tmpl:13/32). Exported for
+ *  the security page's account-links rows (the extauth W5 cosmetic: the
+ *  brand-glyph arm upstream renders there too, previously reduced away to
+ *  the img-or-globe pair). */
+export function ProviderIcon(props: { source: OAuth2LoginSourceButton; size?: number }) {
+  const size = props.size ?? 24;
   if (props.source.iconUrl !== null) {
     // providers.go:63-70's img arm verbatim (alt = DisplayName).
     return (
-      <img class="tw-object-contain" width="24" height="24" src={props.source.iconUrl} alt={props.source.name} />
+      <img class="tw-object-contain" width={size} height={size} src={props.source.iconUrl} alt={props.source.name} />
     );
   }
   const glyph = OAUTH2_PROVIDER_GLYPHS[props.source.provider];
   if (glyph === undefined) {
     // The SPEC §5.6 "icon-or-fallback" arm — the allowlisted globe.
-    return <Icon name="octicon-globe" size={24} />;
+    return <Icon name="octicon-globe" size={size} />;
   }
   return (
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox={glyph.viewBox} width="24" height="24" aria-hidden="true">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox={glyph.viewBox} width={size} height={size} aria-hidden="true">
       {glyph.paths.map((p) => (
         <path d={p.d} fill={p.fill} />
       ))}

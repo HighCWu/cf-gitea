@@ -385,8 +385,19 @@ export const adminFamilyLocale = {
  *  gets the `active item` class. audit_logs, self_check are
  *  omitted — their upstream items are unlanded pages (the dead-link
  *  rule; the census's (b)/(c) classes); auths LEFT that list at the W4
- *  landing (specs/external-auth-sources.md §6.4). */
-export function AdminFamilyNav(props: { active: AdminFamilyNavActive; packagesEnabled?: boolean }) {
+ *  landing (specs/external-auth-sources.md §6.4). The Integrations group
+ *  carries upstream's navbar.tmpl:50-77 dual gate: the template's own
+ *  comment ("Webhooks and OAuth can be both disabled here, so add this if
+ *  statement to display different ui") wraps the group in
+ *  `and (not DisableWebhooks) .EnableOAuth2` with two else-arm fallbacks —
+ *  cf-gitea's webhook store has no DisableWebhooks seam (constant-false,
+ *  the landed posture), so the wrap reduces to `.EnableOAuth2`: the
+ *  strict-polarity `oauth2Enabled?: boolean` prop (absent/true = enabled)
+ *  keeps the group verbatim, an explicit `false` collapses it to the
+ *  else-arm's PLAIN Webhooks item (navbar.tmpl:63-67) and drops the
+ *  Applications item (the applications route's W5 403 makes it
+ *  unreachable — the dead-link rule). */
+export function AdminFamilyNav(props: { active: AdminFamilyNavActive; packagesEnabled?: boolean; oauth2Enabled?: boolean }) {
   const item = (href: string, label: string, active: boolean) => (
     <a class={active ? "active item" : "item"} href={href}>
       {label}
@@ -453,13 +464,26 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive; packagesEn
             {item("/-/admin/repos", adminFamilyLocale.repositories, props.active === "repos")}
           </div>
         </details>
-        <details class="item" open={openAttr(integrationsOpen)}>
-          <summary>{adminFamilyLocale.integrations}</summary>
-          <div class="menu">
-            {item("/-/admin/applications", adminFamilyLocale.applications, props.active === "applications")}
-            {item("/-/admin/hooks", adminFamilyLocale.hooks, props.active === "hooks")}
-          </div>
-        </details>
+        {/* navbar.tmpl:50-77 — the Integrations group inside upstream's
+            `{{if and (not DisableWebhooks) .EnableOAuth2}}` wrap (the
+            template's own dual-disable comment); with no DisableWebhooks
+            seam the wrap reduces to the `oauth2Enabled` prop's arm, and an
+            explicit `false` renders the else-arm's PLAIN Webhooks item
+            (navbar.tmpl:63-67) while the Applications item
+            (:68-72's `{{if .EnableOAuth2}}` arm) does not render — the
+            mounted route 403s on the same flag (web.go:896's group wrap),
+            so the nav never links onto the forbidden page. */}
+        {props.oauth2Enabled !== false ? (
+          <details class="item" open={openAttr(integrationsOpen)}>
+            <summary>{adminFamilyLocale.integrations}</summary>
+            <div class="menu">
+              {item("/-/admin/applications", adminFamilyLocale.applications, props.active === "applications")}
+              {item("/-/admin/hooks", adminFamilyLocale.hooks, props.active === "hooks")}
+            </div>
+          </details>
+        ) : (
+          item("/-/admin/hooks", adminFamilyLocale.hooks, props.active === "hooks")
+        )}
         {/* The SPEC-0018 §3.2 config arm — upstream's Configuration group
             (navbar.tmpl:93-102) between Integrations and the top-level
             System Notices item, carrying its Summary item only: the
@@ -504,12 +528,28 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive; packagesEn
  *  block): the family pageClass, the fluid padded flex container, the
  *  navbar, then `.flex-container-main` wrapping `.admin-setting-content`.
  *  The shell threads ctx.packagesEnabled into the nav (the Assets group's
- *  Packages item arms on it — navbar.tmpl's EnablePackages condition). */
-export function AdminFamilyShell(props: { ctx: UiContext; title: string; pageClass: string; active: AdminFamilyNavActive; children: Child }) {
+ *  Packages item arms on it — navbar.tmpl's EnablePackages condition);
+ *  `oauth2Enabled` passes through verbatim (the Integrations group's
+ *  navbar.tmpl:50-77 gate — the pages' loaders thread the same
+ *  `oauth2FeatureEnabled(c.env)` read the mounted applications group's
+ *  403 arm answers, the applications loader's optional-trailing-param
+ *  shape). */
+export function AdminFamilyShell(props: {
+  ctx: UiContext;
+  title: string;
+  pageClass: string;
+  active: AdminFamilyNavActive;
+  children: Child;
+  oauth2Enabled?: boolean;
+}) {
   return (
     <BaseLayout ctx={props.ctx} title={props.title} pageClass={props.pageClass}>
       <div class="ui container fluid padded flex-container">
-        <AdminFamilyNav active={props.active} packagesEnabled={props.ctx.packagesEnabled !== false} />
+        <AdminFamilyNav
+          active={props.active}
+          packagesEnabled={props.ctx.packagesEnabled !== false}
+          oauth2Enabled={props.oauth2Enabled}
+        />
         <div class="flex-container-main">
           <div class="admin-setting-content">{props.children}</div>
         </div>

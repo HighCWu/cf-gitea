@@ -45,7 +45,11 @@
  *     with the P2-1/P2-2 owner general pages' modules; and the SCOPED-
  *     WORKFLOWS sub-items lit with the store wave's mounts — pages/
  *     actions-scoped-workflows.tsx + the three frames, web.go:517-523's
- *     shared four-route group at the user/org/admin scopes).
+ *     shared four-route group at the user/org/admin scopes). Applications
+ *     additionally carries its upstream flag gate — the W5
+ *     `oauth2Enabled?: boolean` optional prop (org navbar.tmpl:15-19's
+ *     `.EnableOAuth2` wrap; the USER family's Applications item has NO
+ *     upstream gate and stays unconditional).
  *   - The Labels item keeps the landed href `{orgLink}/labels` — upstream's
  *     `{.OrgLink}}/settings/labels` target is the DOCUMENTED wave-14 URL
  *     divergence (pages/org-settings.tsx header: "the target exists so the
@@ -300,12 +304,19 @@ export function UserSettingsNavbar(props: { active: UserSettingsNavTab }) {
 
 /**
  * The shared ORG settings navbar. `orgLink` is `/{org}` (the family's
- * OrgLink); `active` marks the rendered page's tab. Item order is
- * navbar.tmpl's exact order with the dead items dropped: Options, Hooks,
- * Labels, Applications, Blocked users, Actions▸(General, Runners, Secrets,
+ * OrgLink); `active` marks the rendered page's tab. `oauth2Enabled` is the
+ * W5 navbar gate read (`oauth2FeatureEnabled(c.env)`, the strict-polarity
+ * class — absent/true = enabled, only an explicit `false` hides the item;
+ * the same polarity `packagesEnabled` carries elsewhere): upstream gates
+ * the item on `.EnableOAuth2` (org navbar.tmpl:15-19's
+ * `{{if .EnableOAuth2}}` wrap) and the mounted applications route 403s on
+ * the same flag, so an explicit `false` drops the item rather than leaving
+ * a nav link onto a 403 (the dead-link rule). Item order is navbar.tmpl's
+ * exact order with the dead items dropped: Options, Hooks, Labels,
+ * Applications, Blocked users, Actions▸(General, Runners, Secrets,
  * Variables), Audit.
  */
-export function OrgSettingsNavbar(props: { orgLink: string; active: OrgSettingsNavTab }) {
+export function OrgSettingsNavbar(props: { orgLink: string; active: OrgSettingsNavTab; oauth2Enabled?: boolean }) {
   const item = (tab: OrgSettingsNavTab) => (props.active === tab ? "active item" : "item");
   return (
     <div class="flex-container-nav">
@@ -325,13 +336,19 @@ export function OrgSettingsNavbar(props: { orgLink: string; active: OrgSettingsN
         <a class={item("labels")} href={`${props.orgLink}/labels`}>
           {settingsNavLocale.labels}
         </a>
-        {/* navbar.tmpl:15-19 — lit by the org settings applications tab's
-            mount (the a43d9b1 dead-link omission retired: the target page
-            is landed); upstream gates the item on .EnableOAuth2, cf-gitea's
-            OAuth2 store is unconditional (the page module header). */}
-        <a class={item("applications")} href={`${props.orgLink}/settings/applications`}>
-          {settingsNavLocale.applications}
-        </a>
+        {/* navbar.tmpl:15-19 — the item sits inside upstream's
+            `{{if .EnableOAuth2}}` wrap (org navbar.tmpl:15-19): rendered
+            while the provider flag arms true (the default; the applications
+            tab's mount lit it — the a43d9b1 dead-link omission retired),
+            dropped when the caller passes the strict-polarity read false —
+            the route's W5 403 (web.go:1030's oauth2Enabled group wrap)
+            makes the target unreachable, so the nav follows the same flag
+            instead of linking onto the forbidden page. */}
+        {props.oauth2Enabled !== false ? (
+          <a class={item("applications")} href={`${props.orgLink}/settings/applications`}>
+            {settingsNavLocale.applications}
+          </a>
+        ) : null}
         {/* navbar.tmpl:20-22 (Packages :23-27 dead) — the blocked_users
             module is committed-unmounted. */}
         <a class={item("blocked")} href={`${props.orgLink}/settings/blocked_users`}>

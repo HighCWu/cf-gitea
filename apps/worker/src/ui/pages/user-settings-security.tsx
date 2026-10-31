@@ -134,7 +134,7 @@
 
 import { UserSettingsNavbar } from "../components/settings-nav";
 import { BaseLayout, Icon, renderPage } from "../shell";
-import { oauth2LoginSourceButtons } from "./login";
+import { oauth2LoginSourceButtons, ProviderIcon } from "./login";
 import { getProviderDescriptor } from "../../services/auth-sources/registry";
 import { parseOAuth2SourceConfig } from "../../services/auth-sources/cfg";
 import { findExternalLogins, getLoginSource, listActiveOAuth2Sources, removeExternalLogin } from "../../services/auth-sources/store";
@@ -374,10 +374,14 @@ export function UserSettingsSecurityPage(props: {
 }
 
 /** The account-links section (accountlinks.tmpl at the pin — the W5 arm;
- *  the module header holds the dropdown/dialog reductions). The row icon is
- *  the img-or-globe arm (providers.go:63-70's img markup; the brand-glyph
- *  arm stays the login page's — the icons.ts allowlist carries no provider
- *  brand set here, the recorded reduction). */
+ *  the module header holds the dropdown/dialog reductions). The icons are
+ *  the login page's exported ProviderIcon at IconHTML's 20
+ *  (accountlinks.tmpl:13's dropdown + :32's row-leading `IconHTML 20`):
+ *  the img arm (providers.go:63-70), the brand-glyph arm (the
+ *  provider-keyed pick — previously reduced away to img-or-globe here, the
+ *  icons.ts-allowlist note retired with the export), and the
+ *  octicon-globe fallback (a dead stored cfg's honest-degrade arm, the
+ *  loader's "" provider). */
 function AccountLinksSection(props: { data: UserSettingsSecurityPageData }) {
   const { data } = props;
   return (
@@ -397,11 +401,10 @@ function AccountLinksSection(props: { data: UserSettingsSecurityPageData }) {
                 href={`/user/oauth2/${encodeURIComponent(button.name)}`}
                 title={button.displayName}
               >
-                {button.iconUrl !== null ? (
-                  <img class="tw-object-contain" width="20" height="20" src={button.iconUrl} alt={button.displayName} />
-                ) : (
-                  <Icon name="octicon-globe" size={20} />
-                )}{" "}
+                <ProviderIcon
+                  source={{ name: button.displayName, provider: button.provider, iconUrl: button.iconUrl }}
+                  size={20}
+                />{" "}
                 {button.displayName}
               </a>
             ))}
@@ -414,11 +417,7 @@ function AccountLinksSection(props: { data: UserSettingsSecurityPageData }) {
           {data.accountLinks.map((link) => (
             <div class="item">
               <div class="item-leading">
-                {link.iconUrl !== null ? (
-                  <img class="tw-object-contain" width="20" height="20" src={link.iconUrl} alt={link.displayName} />
-                ) : (
-                  <Icon name="octicon-globe" size={20} />
-                )}
+                <ProviderIcon source={{ name: link.displayName, provider: link.provider, iconUrl: link.iconUrl }} size={20} />
               </div>
               <div class="item-main">
                 <span class="item-title" data-tooltip-content={link.displayName}>

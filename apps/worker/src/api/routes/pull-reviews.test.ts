@@ -13,18 +13,21 @@
  * 422, the closed-PR 403, the unknown-user 404, the self-decline escape),
  * the four webhook events (review approved/rejected/comment + review
  * requested/removed) with their payload shapes, and the SILENCE arms
- * (pending submissions, dismissal, review deletion emit nothing).
+ * (pending submissions, dismissal, review deletion emit nothing), plus the
+ * TEAM-add review-request mail fan-out (the review-mail wave's end-to-end
+ * route arm: the members expand, the poster member is skipped, the outbox
+ * rows land per survivor).
  */
 
 import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { comments, issues, pullReviews, repositories, webhookDeliveries, webhooks } from "../../db/schema";
+import { comments, emailOutbox, issues, pullReviews, repositories, teamMembers, teams, webhookDeliveries, webhooks } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import { IssuesService } from "../../issues/service";
 import { ZERO_OID, branchRef, engineReads, refTipMap } from "../services/engine";
@@ -938,5 +941,106 @@ describe("pull_request_review_* + pull_request_review_request webhook emissions"
     // the cheaper adapter), so both carry the same 5/3/2.
     expect(added.pull_request).toMatchObject({ additions: 5, deletions: 3, changed_files: 2 });
     expect(removed.pull_request).toMatchObject({ additions: 5, deletions: 3, changed_files: 2 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The TEAM-add review-request mail fan-out (the review-mail wave's
+// end-to-end route arm — upstream TeamReviewRequest folds
+// teamReviewRequestNotify, services/issue/review_request.go:214-237, on its
+// add path: the members expand per GetTeamMembers, the POSTER member is
+// skipped (:228-230), and each survivor rides the SAME
+// PullRequestReviewRequest receiver the user arm uses (notify.go:129-136 —
+// "Requested to review <htmlurl>.").
+// ---------------------------------------------------------------------------
+
+describe("POST …/requested_reviewers team_reviewers mail fan-out (teamReviewRequestNotify)", () => {
+  it("fans the receiver to each team member minus the poster (the outbox rows land per survivor)", async () => {
+    // Self-contained fixture (the shared beforeEach covers its own table
+    // set): wipe the team/mail rows this arm seeds, then build the
+    // ORG-owned repo the team arm requires (team resolution keys
+    // teams.org_id on the owner row, review_request.go:826-865's arm).
+    for (const table of ["email_outbox", "team_members", "teams"]) {
+      await env.DB.prepare(`DELETE FROM ${table}`).run();
+    }
+    // The org owner row + two member rows — the mail receiver's IsMailable
+    // gate needs active user rows with emails.
+    for (const [id, username, email, type] of [
+      [10, "acme", null, "org"],
+      [11, "mercer", "mercer@example.com", "user"],
+      [12, "nadia", "nadia@example.com", "user"],
+    ] as const) {
+      await env.DB.prepare(
+        "INSERT INTO users (id, username, username_lower, email, type, status, created_at) VALUES (?, ?, ?, ?, ?, 'active', 0)",
+      )
+        .bind(id, username, username, email, type)
+        .run();
+    }
+    const repoId = String(repoSeq++);
+    await db().insert(repositories).values({
+      id: repoId,
+      storageKey: `r_${repoId}`,
+      ownerNamespace: "acme",
+      ownerId: 10,
+      slug: SLUG,
+      visibility: "public",
+      isArchived: false,
+      refsVersion: 1,
+      backend: "self-hosted",
+      createdAt: new Date("2026-02-03T04:05:06Z"),
+    });
+    await service().ensureRepoCounters(repoId);
+    const teamId = (
+      await db()
+        .insert(teams)
+        .values({ orgId: 10, lowerName: "reviewers", name: "Reviewers" })
+        .returning({ id: teams.id })
+        .all()
+    )[0]!.id;
+    // mercer + nadia + THE POSTER (bob — the PR's poster id 2): the
+    // poster-member skip (review_request.go:241-243) is the assertion's
+    // minus arm.
+    for (const userId of [11, 12, 2]) {
+      await db().insert(teamMembers).values({ orgId: 10, teamId, userId });
+    }
+    const pr = await seedPull(repoId);
+
+    // The mail-armed mount (the issue-tables-t2 sendArmed shape — the
+    // shipped env carries MAIL_ENABLED="false", so the armed merge is what
+    // the route's c.env receiver read needs).
+    const a = app();
+    const armed: ApiEnv["Bindings"] = Object.assign({}, env, {
+      MAIL_ENABLED: "true",
+      MAIL_PROVIDER: "dummy",
+      MAIL_FROM: "Gitea <noreply@example.com>",
+    });
+    const run = (path: string, init?: RequestInit): Promise<Response> =>
+      Promise.resolve(a.fetch(new Request(`https://example.com${path.replace(/^\/api\/v1/, "")}`, init), armed));
+
+    const res = await run(
+      `/api/v1/repos/acme/${SLUG}/pulls/${pr.index}/requested_reviewers`,
+      authed(POSTER_TOKEN, { method: "POST", body: JSON.stringify({ team_reviewers: ["reviewers"] }) }),
+    );
+    expect(res.status).toBe(201);
+    const created = await jsonArray(res);
+    expect(created).toHaveLength(1); // the team REQUEST row renders
+    expect(created[0]!.state).toBe("REQUEST_REVIEW");
+    expect(created[0]!.team).toBe(null); // the documented null-team render
+
+    const rows = await db().select().from(emailOutbox).orderBy(asc(emailOutbox.id)).all();
+    // Per member minus the poster: mercer + nadia, never bob — the
+    // expansion order (full_name, name) with the poster dropped.
+    expect(rows.map((row) => row.toAddr)).toEqual(["mercer@example.com", "nadia@example.com"]);
+    // The SAME receiver the user arm uses: one shared type-27 comment (the
+    // route composes every member's mail over it), the rendered
+    // "Requested to review" body, the per-member dedupe keys.
+    const commentIds = rows.map((row) => (row.dedupeKey ?? "").split(":")[1]);
+    expect(commentIds[0]).toBe(commentIds[1]);
+    for (const row of rows) {
+      expect(row.info).toContain("issue assigned");
+      expect(row.bodyHtml).toContain("Requested to review");
+    }
+    expect(rows[0]!.dedupeKey).toBe(`pull-review-request:${commentIds[0]}:11`);
+    expect(rows[1]!.dedupeKey).toBe(`pull-review-request:${commentIds[1]}:12`);
   });
 });
