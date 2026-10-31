@@ -468,7 +468,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerDir = path.join(repoRoot, "apps", "worker");
 const DEFAULT_USER = "p0probe";
-const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "packages-protocols", "packages-minor", "auth-oauth2", "cleanup-audit", "all"];
+const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "packages-protocols", "packages-minor", "packages-terraform", "auth-oauth2", "cleanup-audit", "all"];
 /** Batteries that make NO HTTP calls (they read D1 via wrangler only):
  *  --base-url and --token-file are OPTIONAL for these (REDEPLOY15 friction
  *  (a): the D1-only audit still demanded a PAT, forcing a scratch-mint +
@@ -564,6 +564,8 @@ const usage = () =>
   "  packages-registry: (no extra options — the row-cleanup arm reuses --d1-scope and needs wrangler auth, the fixwave precedent)\n" +
   "  packages-distro: (no extra options — the husk row-cleanup arm reuses --d1-scope and needs wrangler auth, the packages-registry precedent; the internal _rpm/_arch rows + keypair are standing owner infrastructure)\n" +
   "  packages-protocols: (no extra options — the go/cargo REAL-CLIENT arms degrade to a [warn] when the toolchain is off the probe host; the cargo client rides an in-script header-stripping proxy on plain-HTTP targets; the husk row-cleanup arm reuses --d1-scope and needs wrangler auth)\n" +
+  "  packages-minor: (no extra options — pure HTTP + the run PAT, every fixture generated inline; the husk row sweep reuses --d1-scope and needs wrangler auth, the packages-registry precedent)\n" +
+  "  packages-terraform: (no extra options — pure HTTP + the run PAT; the whole-state DELETE is its own row cascade, so unlike the other packages batteries there is NO D1 arm and no wrangler auth)\n" +
   "  auth-oauth2:   (no extra options — needs wrangler auth for the D1 arms: the builtin-seed read, the revoke row delete, the husk sweep, and the external-auth source seed/cleanup; --d1-scope picks the database, keep it in step with --base-url — the discovery arm's issuer==origin assert keys off it)\n" +
   "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (2 — the standing bootstrap set)\n" +
   "  any battery:   --force-red <check-id>    (self-test: force that check red UNRUN — exercises the failure-tail sweep; an unmatched id warns)";
@@ -6544,6 +6546,408 @@ const packagesMinorSteps = (ctx) => {
   ];
 };
 
+// ---------- battery: packages-terraform (the terraform state backend) ----------
+
+/**
+ * The TERRAFORM STATE BACKEND battery (SPEC-0016 §7's
+ * `/api/packages/{owner}/terraform/state/{name}` family — the GitLab-compatible
+ * backend, upstream routers/api/packages/terraform/terraform.go over
+ * modules/packages/terraform/{state,lock}.go at the pin; the service is
+ * apps/worker/src/services/packages/terraform.ts, the route registrations
+ * packages-protocols.ts:2510-2528). ONE family over ONE owner-scoped fixture
+ * set — a public probe repo as the owner vehicle + the run PAT — driven
+ * CHAINED (the branch-protection posture, NOT the distro independent shape):
+ * the state machine is genuinely sequential (the upload feeds the lock dance,
+ * the lock dance feeds the unlock arms, the delete arms need the exact serial
+ * set), so a red mid-battery chain-skips the arms that need it and the
+ * failureTail sweeps what the run created.
+ *
+ * The probes (each arm's asserts cite the service line that owns the shape):
+ *   - the unauthenticated posture: anonymous WRITE touches (state POST, lock
+ *     POST, lock DELETE, state DELETE) answer the 401 challenge
+ *     ("user should have specific permission or be a site admin" +
+ *     `Basic realm="Gitea Package API"` — packageAccessChallenge,
+ *     packages-protocols.ts:529-535; the gate refuses before any body read),
+ *     while an anonymous READ passes the gate on a PUBLIC owner
+ *     (determinePackageAccessMode's anonymous-public read arm,
+ *     model.ts:891 — users.visibility defaults public) and lands the family's
+ *     EMPTY-body 404 for a missing state (terraform.go:33-36's nil-error
+ *     PlainText — terraformPlainText(404), packages-protocols.ts:4740);
+ *   - the state round-trip: POST a `{serial, lineage, …}` document → 201
+ *     EMPTY; GET latest answers the stored bytes VERBATIM (the `tfstate` lead
+ *     file — uploadTerraformState terraform.ts:562-569,
+ *     openTerraformStateForDownload :419-444), so the serial/lineage re-parse
+ *     off the wire; HEAD rides the GET walk (packages-protocols.ts:2521);
+ *     GET /versions/{serial} pins the serial version;
+ *   - the serial model + delete arms: a second serial posts beside the first
+ *     (one VERSION per serial, version = FormatUint(serial),
+ *     terraform.ts:540-545); the same-serial re-post is the
+ *     ErrDuplicatePackageFile 409 "package file already exists"
+ *     (terraform.ts:570-572); DELETE of the LATEST serial is the 403 "cannot
+ *     delete the latest version" (deleteTerraformStateBySerial
+ *     terraform.ts:595-608, route packages-protocols.ts:4840); DELETE of a
+ *     non-latest serial → 204 and the serial GET 404s EMPTY after;
+ *   - the lock dance: POST lock sets (200 EMPTY); a second lock POST answers
+ *     423 with the CURRENT lock JSON in Go's struct field order
+ *     [ID, Operation, Info, Who, Version, Created, Path] (terraformLockBody
+ *     packages-protocols.ts:4714-4724 over lock.go:20-29's json-tag order);
+ *     there is NO lock-info GET in the pin (routes :2520-2528 register
+ *     GET/POST/DELETE state + POST/DELETE lock only — upstream's own surface),
+ *     so the 423 lock JSON bodies ARE the lock reads; the upload honors the
+ *     PRE-BODY `?ID=` gate (assertTerraformStateWritable terraform.ts:463-476,
+ *     route packages-protocols.ts:4766-4768): a MISMATCHED ID refuses 423 with
+ *     a request body that would fail the state parse (the lock check runs
+ *     before the body is read — a 423, never the 400 parse error), the
+ *     matching ID admits the write, and the lock SURVIVES the matched upload;
+ *     the whole-state DELETE while locked is the 423 "terraform state is
+ *     locked" PLAIN text (deleteTerraformState terraform.ts:617-624, route
+ *     :4819 — the non-JSON locked arm); DELETE lock with a mismatched ID is
+ *     the 423 "lock ID mismatch" PLAIN text (unlockTerraformState
+ *     terraform.ts:679-700, route :4878 — NOT the JSON lock body); the right
+ *     ID frees (200 EMPTY) and the freed CAS provably re-sets;
+ *   - the lock ALLOCATES the package when missing (lockTerraformState
+ *     terraform.ts:655-660): a never-uploaded name locks 200, its state GET
+ *     still 404s EMPTY (a versionless package), and the whole-state DELETE
+ *     removes the husk via the protocol cascade (deletePackageAndReferences,
+ *     terraform.ts:622) — which is why this battery needs NO D1 sweep arm: the
+ *     whole-state DELETE folds package + versions + files + the lock property
+ *     in one call, so the cleanup is pure HTTP.
+ *
+ * Fixtures are INLINE JSON documents (a terraform-v4-shaped state + the
+ * LockInfo struct); every name is unique per run (a same-serial duplicate is
+ * the probed 409, a name collision a 409 red would mislabel); a green run
+ * leaves NOTHING (both packages protocol-deleted, the repo DELETEd) so
+ * cleanup-audit needs no new expectations. A red run sweeps the two state
+ * packages (unlock with the run's own lock id — the missing/not-locked arms
+ * answer 200 per terraform.ts:693-696, so the unlock is unconditional — then
+ * the whole-state DELETE) + the repo (the failureTail).
+ */
+
+/** lock.go:20-29's json-tag order verbatim — the Go Marshal order the 423
+ *  lock body renders (terraformLockBody, packages-protocols.ts:4714-4724;
+ *  JSON.parse preserves string-key insertion order, so Object.keys reads the
+ *  wire order back). */
+const LOCK_FIELD_ORDER = ["ID", "Operation", "Info", "Who", "Version", "Created", "Path"];
+
+/** The LockInfo `Created` value every lock POST of a run carries (an RFC3339
+ *  shape parseTerraformLockInfo accepts, terraform.ts:182) — one shared
+ *  constant so the 423 round-trip assert is exact. */
+const lockCreated = new Date().toISOString();
+
+const packagesTerraformContext = () => ({
+  user: opts.user, repo: `ptf-${hexId()}`, tmp: null,
+  repoCreated: false, repoFullName: null, repoGone: false,
+  mainName: `ptf-state-${hexId()}`, mainGone: false,
+  allocName: `ptf-alloc-${hexId()}`, allocGone: false,
+  unknownName: `ptf-unknown-${hexId()}`,
+  lockId: `ptf-lock-${hexId()}`,
+});
+
+const packagesTerraformFailureCleanup = async (ctx) => {
+  const acts = [];
+  // The whole-state DELETE is the family's own cascade (the package row goes
+  // with it — terraform.ts:622), so the tail is pure protocol: unlock (any id
+  // — the missing/not-locked arms answer 200) then DELETE whole per tracked
+  // name. No D1 arms, no wrangler auth.
+  for (const [label, name, goneKey] of [["state", ctx.mainName, "mainGone"], ["alloc", ctx.allocName, "allocGone"]]) {
+    if (ctx[goneKey] === true) continue;
+    try {
+      const unlock = await pkgFetch(`/${ctx.user}/terraform/state/${name}/lock`, {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: Buffer.from(JSON.stringify({ ID: ctx.lockId }), "utf8"),
+      });
+      const del = await pkgFetch(`/${ctx.user}/terraform/state/${name}`, { method: "DELETE" });
+      if (del.status === 200 || del.status === 404) {
+        ctx[goneKey] = true;
+        acts.push(`${label} ${name} swept (unlock ${unlock.status}, DELETE ${del.status})`);
+      } else {
+        leftBehind.push(`terraform ${label} state ${name} (DELETE returned ${del.status})`);
+        acts.push(`${label} ${name} LEFT BEHIND — DELETE returned ${del.status} ${del.text.slice(0, 60)}`);
+      }
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      leftBehind.push(`terraform ${label} state ${name} (failure-cleanup tail: ${why})`);
+      acts.push(`${label} delete FAILED — ${why}`);
+    }
+  }
+  if (ctx.repoCreated === true && ctx.repoGone !== true) {
+    const [owner, repo] = String(ctx.repoFullName ?? `${ctx.user}/${ctx.repo}`).split("/");
+    try {
+      const out = await deleteRepo(owner, repo);
+      acts.push(typeof out === "string" ? out : out.detail);
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      leftBehind.push(`repo ${owner}/${repo} (failure-cleanup tail: DELETE threw: ${why})`);
+      acts.push(`repo ${owner}/${repo} LEFT BEHIND — DELETE threw: ${why}`);
+    }
+  }
+  if (acts.length) log(`  [tail] ptf-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
+};
+
+const packagesTerraformSteps = (ctx) => {
+  const stateUrl = (name, tail = "") => `/${ctx.user}/terraform/state/${name}${tail}`;
+  const postState = (name, bytes, query = "") => pkgFetch(stateUrl(name, query), {
+    method: "POST",
+    headers: { "content-type": "application/octet-stream" },
+    body: bytes,
+  });
+  const postLock = (name, id) => pkgFetch(stateUrl(name, "/lock"), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: Buffer.from(JSON.stringify({
+      ID: id, Operation: "OperationTypeApply", Info: "",
+      Who: "deploy-probes", Version: "1.9.0", Created: lockCreated, Path: "",
+    }), "utf8"),
+  });
+  const deleteLock = (name, id) => pkgFetch(stateUrl(name, "/lock"), {
+    method: "DELETE",
+    headers: { "content-type": "application/json" },
+    body: Buffer.from(JSON.stringify({ ID: id }), "utf8"),
+  });
+  /** The 423 LOCK body's shared shape (terraform.go's ONE JSON exception —
+   *  ctx.JSON(423, lock), packages-protocols.ts:4714-4724): status +
+   *  application/json;charset=utf-8 + the Go struct field order + the CURRENT
+   *  lock's ID. Returns the parsed body for value-level asserts. */
+  const expectLock423 = (res, wantId, where) => {
+    expect(res.status === 423, `${where} status ${res.status} ${res.text.slice(0, 120)} (expected 423)`);
+    expect(String(res.headers.get("content-type") ?? "") === "application/json;charset=utf-8",
+      `${where} content-type ${JSON.stringify(res.headers.get("content-type"))} (expected application/json;charset=utf-8)`);
+    let parsed;
+    try {
+      parsed = JSON.parse(res.text);
+    } catch {
+      throw new Error(`${where} body is not the lock JSON: ${res.text.slice(0, 120)}`);
+    }
+    expect(JSON.stringify(Object.keys(parsed)) === JSON.stringify(LOCK_FIELD_ORDER),
+      `${where} lock JSON key order ${JSON.stringify(Object.keys(parsed))} (expected the Go marshal order ${JSON.stringify(LOCK_FIELD_ORDER)})`);
+    expect(parsed.ID === wantId, `${where} lock ID ${JSON.stringify(parsed.ID)} (expected the CURRENT lock ${JSON.stringify(wantId)})`);
+    return parsed;
+  };
+  // The terraform-v4-shaped state documents (parseTerraformState
+  // terraform.ts:138-159 reads exactly {serial, lineage} — serial a safe
+  // integer >= 1, lineage non-empty; the extra keys ride Go's ignored-fields
+  // decode). The GET answers these bytes VERBATIM off the `tfstate` blob.
+  const lineage1 = `ptf-${hexId()}`;
+  const stateBytes = (serial, lineage) => Buffer.from(JSON.stringify({
+    version: 4, serial, lineage,
+    terraform_version: "1.9.0", outputs: {}, resources: [],
+  }), "utf8");
+  const state1Bytes = stateBytes(1, lineage1);
+  const state2Bytes = stateBytes(2, `ptf-${hexId()}`);
+  const state3Bytes = stateBytes(3, `ptf-${hexId()}`);
+  return [
+    {
+      id: "ptf-create-repo-201",
+      expect: `POST /api/v1/user/repos {"name":"${ctx.repo}","auto_init":true} → 201 (the owner fixture vehicle — the terraform family is OWNER-scoped, the repo only proves coexistence)`,
+      run: async () => {
+        const res = await api("/user/repos", { method: "POST", body: { name: ctx.repo, private: false, auto_init: true } });
+        expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+        ctx.repoCreated = true; // the failure-cleanup tail deletes it if a later arm reds
+        ctx.repoFullName = String(res.json?.full_name ?? `${ctx.user}/${ctx.repo}`);
+        return `created ${res.json?.full_name}`;
+      },
+    },
+    {
+      id: "ptf-anon-write-401",
+      expect: `the family's WRITE posture: anonymous state POST, lock POST, lock DELETE and state DELETE on ${ctx.mainName} all answer 401 "user should have specific permission or be a site admin" + www-authenticate Basic realm="Gitea Package API" (packageAccessChallenge, packages-protocols.ts:529-535 — the gate refuses before any body read)`,
+      run: async () => {
+        const anon = async (tail, init) => {
+          const res = await fetchT(`${opts.baseUrl}/api/packages${stateUrl(ctx.mainName, tail)}`, init);
+          const text = await res.text();
+          return { status: res.status, text, headers: res.headers };
+        };
+        for (const [where, tail, init] of [
+          ["state POST", "", { method: "POST", headers: { "content-type": "application/octet-stream" }, body: Buffer.from("deploy-probes anonymous write probe", "utf8") }],
+          ["lock POST", "/lock", { method: "POST", headers: { "content-type": "application/json" }, body: Buffer.from(JSON.stringify({ ID: `anon-${ctx.lockId}` }), "utf8") }],
+          ["lock DELETE", "/lock", { method: "DELETE" }],
+          ["state DELETE", "", { method: "DELETE" }],
+        ]) {
+          const res = await anon(tail, init);
+          expect(res.status === 401, `anonymous ${where} status ${res.status} (expected 401)`);
+          expect(res.text === "user should have specific permission or be a site admin",
+            `anonymous ${where} body ${JSON.stringify(res.text.slice(0, 120))} (expected the packageAccessChallenge text)`);
+        }
+        const probe = await anon("/lock", { method: "POST", headers: { "content-type": "application/json" }, body: Buffer.from(JSON.stringify({ ID: `anon-${ctx.lockId}` }), "utf8") });
+        expect(probe.headers.get("www-authenticate") === 'Basic realm="Gitea Package API"',
+          `www-authenticate ${JSON.stringify(probe.headers.get("www-authenticate"))} (expected Basic realm="Gitea Package API", packages-protocols.ts:454)`);
+        return "state POST / lock POST / lock DELETE / state DELETE all 401 + the Basic realm challenge";
+      },
+    },
+    {
+      id: "ptf-anon-read-404-empty",
+      expect: `the family's READ posture: anonymous GET of the UNKNOWN state ${ctx.unknownName} passes the gate on a public owner (determinePackageAccessMode's anonymous-public read arm) and answers the EMPTY-body 404 (terraform.go:33-36's nil-error PlainText — no message, text/plain;charset=utf-8 + nosniff)`,
+      run: async () => {
+        const res = await fetchT(`${opts.baseUrl}/api/packages${stateUrl(ctx.unknownName)}`);
+        const bytes = Buffer.from(await res.arrayBuffer());
+        expect(res.status === 404, `anonymous GET status ${res.status} (expected 404; a 401 here means the --user owner row is not public — users.visibility defaults public)`);
+        expect(bytes.length === 0, `anonymous GET body ${bytes.length}B (expected the EMPTY nil-error body, NOT "package does not exist")`);
+        expect(String(res.headers.get("content-type") ?? "") === "text/plain;charset=utf-8",
+          `content-type ${JSON.stringify(res.headers.get("content-type"))} (expected text/plain;charset=utf-8)`);
+        expect(String(res.headers.get("x-content-type-options") ?? "") === "nosniff",
+          `x-content-type-options ${JSON.stringify(res.headers.get("x-content-type-options"))} (expected nosniff)`);
+        return "anonymous read passes the public-owner gate → the EMPTY 404 (the nil-error arm)";
+      },
+    },
+    {
+      id: "ptf-state-roundtrip",
+      expect: `the state round-trip: POST ${ctx.mainName} a {serial:1, lineage, …} document → 201 EMPTY; GET latest answers the stored bytes VERBATIM (the tfstate lead file) so serial 1 + the lineage re-parse off the wire; the disposition carries tfstate; HEAD → 200 (rides the GET walk); GET /versions/1 → the same bytes (terraform.ts:138-159/419-444, packages-protocols.ts:4729-4752)`,
+      run: async () => {
+        const put = await postState(ctx.mainName, state1Bytes);
+        expect(put.status === 201 && put.bytes.length === 0, `state POST ${put.status} ${put.text.slice(0, 120)} (expected the 201 EMPTY)`);
+        const get = await pkgFetch(stateUrl(ctx.mainName));
+        expect(get.status === 200, `GET latest status ${get.status} ${get.text.slice(0, 120)} (expected 200)`);
+        expect(get.bytes.equals(state1Bytes), `GET latest bytes != the uploaded state (${get.bytes.length}B vs ${state1Bytes.length}B — the tfstate blob must round-trip verbatim)`);
+        const wire = JSON.parse(get.text);
+        expect(wire.serial === 1 && wire.lineage === lineage1,
+          `wire serial/lineage ${JSON.stringify(wire.serial)}/${JSON.stringify(wire.lineage)} (expected 1/${lineage1})`);
+        expect(String(get.headers.get("content-disposition") ?? "").includes("tfstate"),
+          `disposition ${JSON.stringify(get.headers.get("content-disposition"))} missing the tfstate lead-file name`);
+        const head = await pkgFetch(stateUrl(ctx.mainName), { method: "HEAD" });
+        expect(head.status === 200, `HEAD status ${head.status} (expected 200 — HEAD rides the GET walk, packages-protocols.ts:2521)`);
+        const bySerial = await pkgFetch(stateUrl(ctx.mainName, "/versions/1"));
+        expect(bySerial.status === 200 && bySerial.bytes.equals(state1Bytes),
+          `GET /versions/1 ${bySerial.status} ${bySerial.bytes.length}B (expected 200 with the same bytes)`);
+        return "POST 201 EMPTY → GET latest byte parity (serial/lineage re-parsed) → HEAD 200 → GET /versions/1 parity";
+      },
+    },
+    {
+      id: "ptf-serial-delete-arms",
+      expect: `the serial model + delete arms: POST serial 2 → 201 beside serial 1 (one VERSION per serial); the SAME-serial re-post → 409 "package file already exists"; GET latest parses serial 2; DELETE /versions/2 (the LATEST) → 403 "cannot delete the latest version"; DELETE /versions/1 → 204 EMPTY; GET /versions/1 → the EMPTY-body 404 (terraform.ts:540-545/570-572/595-608, packages-protocols.ts:4839-4841)`,
+      run: async () => {
+        const put2 = await postState(ctx.mainName, state2Bytes);
+        expect(put2.status === 201 && put2.bytes.length === 0, `serial-2 POST ${put2.status} ${put2.text.slice(0, 120)} (expected the 201 EMPTY)`);
+        const dup = await postState(ctx.mainName, state2Bytes);
+        expect(dup.status === 409 && dup.text === "package file already exists",
+          `same-serial re-post ${dup.status} ${dup.text.slice(0, 120)} (expected the 409 "package file already exists")`);
+        const latest = await pkgFetch(stateUrl(ctx.mainName));
+        expect(latest.status === 200 && JSON.parse(latest.text).serial === 2,
+          `GET latest ${latest.status} serial ${JSON.stringify(latest.status === 200 ? (() => { try { return JSON.parse(latest.text).serial; } catch { return "?"; } })() : "?")} (expected 200 serial 2)`);
+        const delLatest = await pkgFetch(stateUrl(ctx.mainName, "/versions/2"), { method: "DELETE" });
+        expect(delLatest.status === 403 && delLatest.text === "cannot delete the latest version",
+          `latest-serial DELETE ${delLatest.status} ${delLatest.text.slice(0, 120)} (expected the 403 "cannot delete the latest version")`);
+        const delOld = await pkgFetch(stateUrl(ctx.mainName, "/versions/1"), { method: "DELETE" });
+        expect(delOld.status === 204 && delOld.bytes.length === 0, `non-latest DELETE ${delOld.status} (expected the 204 EMPTY)`);
+        const gone = await pkgFetch(stateUrl(ctx.mainName, "/versions/1"));
+        expect(gone.status === 404 && gone.bytes.length === 0, `deleted-serial GET ${gone.status} ${gone.bytes.length}B (expected the EMPTY-body 404)`);
+        return "serial-2 201 → duplicate 409 → latest reads serial 2 → DELETE latest 403 → DELETE old 204 → serial GET 404 EMPTY";
+      },
+    },
+    {
+      id: "ptf-lock-set-423-locked",
+      expect: `the lock dance: POST /lock {ID:${ctx.lockId}, Operation, Who, Version, Created} → 200 EMPTY; a second lock POST with another ID → 423 application/json;charset=utf-8 whose body is the CURRENT lock JSON in the Go struct field order [ID, Operation, Info, Who, Version, Created, Path] with our submitted values round-tripped (terraformLockBody, packages-protocols.ts:4714-4724 — there is NO lock-info GET in the pin, so the 423 body IS the lock read)`,
+      run: async () => {
+        const set = await postLock(ctx.mainName, ctx.lockId);
+        expect(set.status === 200 && set.bytes.length === 0, `lock POST ${set.status} ${set.text.slice(0, 120)} (expected the 200 EMPTY)`);
+        const again = await postLock(ctx.mainName, `ptf-other-${hexId()}`);
+        const lock = expectLock423(again, ctx.lockId, "second lock POST");
+        expect(lock.Operation === "OperationTypeApply" && lock.Who === "deploy-probes" && lock.Version === "1.9.0" && lock.Created === lockCreated && lock.Path === "" && lock.Info === "",
+          `lock JSON values ${JSON.stringify({ Operation: lock.Operation, Who: lock.Who, Version: lock.Version, Created: lock.Created, Path: lock.Path, Info: lock.Info })} (expected the submitted LockInfo round-tripped)`);
+        return `lock set 200 EMPTY → second lock 423 (Go field order, CURRENT id ${ctx.lockId}) — no GET lock route exists; the 423 body is the read`;
+      },
+    },
+    {
+      id: "ptf-upload-locked-idgate",
+      expect: `the PRE-BODY ?ID= gate on the upload: POST the state with ?ID=<mismatched> and a body that would FAIL the state parse → 423 with the CURRENT lock JSON (never the 400 — assertTerraformStateWritable runs before the body is read, terraform.ts:463-476); POST with ?ID=<the lock's id> → 201; GET latest parses serial 3; the lock SURVIVES the matched upload (a second lock POST still 423s with the original id)`,
+      run: async () => {
+        const refused = await postState(ctx.mainName, Buffer.from("not a {serial, lineage} document on purpose", "utf8"), `?ID=${encodeURIComponent(`ptf-wrong-${hexId()}`)}`);
+        expectLock423(refused, ctx.lockId, "locked upload ?ID= mismatch");
+        const admitted = await postState(ctx.mainName, state3Bytes, `?ID=${encodeURIComponent(ctx.lockId)}`);
+        expect(admitted.status === 201 && admitted.bytes.length === 0, `matched-ID upload ${admitted.status} ${admitted.text.slice(0, 120)} (expected the 201 EMPTY)`);
+        const latest = await pkgFetch(stateUrl(ctx.mainName));
+        expect(latest.status === 200 && JSON.parse(latest.text).serial === 3,
+          `GET latest ${latest.status} serial ${JSON.stringify(latest.status === 200 ? (() => { try { return JSON.parse(latest.text).serial; } catch { return "?"; } })() : "?")} (expected 200 serial 3)`);
+        const still = await postLock(ctx.mainName, `ptf-other-${hexId()}`);
+        expectLock423(still, ctx.lockId, "post-upload lock re-check");
+        return "mismatched ?ID= → 423 lock JSON with the parse-hostile body unread → matched ?ID= 201 → latest serial 3 → lock survives";
+      },
+    },
+    {
+      id: "ptf-delete-locked-423",
+      expect: `DELETE the whole state while locked → 423 "terraform state is locked" as PLAIN text (deleteTerraformState's locked arm, terraform.ts:617-624, route packages-protocols.ts:4819 — the non-JSON locked arm, distinct from the lock/upload 423 JSON bodies)`,
+      run: async () => {
+        const del = await pkgFetch(stateUrl(ctx.mainName), { method: "DELETE" });
+        expect(del.status === 423 && del.text === "terraform state is locked",
+          `whole DELETE ${del.status} ${del.text.slice(0, 120)} (expected the 423 "terraform state is locked")`);
+        expect(String(del.headers.get("content-type") ?? "") === "text/plain;charset=utf-8",
+          `content-type ${JSON.stringify(del.headers.get("content-type"))} (expected text/plain;charset=utf-8 — the PLAIN locked arm)`);
+        return "whole DELETE while locked → 423 plain 'terraform state is locked'";
+      },
+    },
+    {
+      id: "ptf-unlock-mismatch-423",
+      expect: `DELETE /lock with a MISMATCHED ID → 423 "lock ID mismatch" as PLAIN text (unlockTerraformState's mismatch arm, terraform.ts:679-700, route packages-protocols.ts:4878 — NOT the JSON lock body) and the state stays locked (the whole DELETE still 423s)`,
+      run: async () => {
+        const unlock = await deleteLock(ctx.mainName, `ptf-wrong-${hexId()}`);
+        expect(unlock.status === 423 && unlock.text === "lock ID mismatch",
+          `mismatched unlock ${unlock.status} ${unlock.text.slice(0, 120)} (expected the 423 "lock ID mismatch")`);
+        expect(String(unlock.headers.get("content-type") ?? "") === "text/plain;charset=utf-8",
+          `content-type ${JSON.stringify(unlock.headers.get("content-type"))} (expected text/plain;charset=utf-8)`);
+        const del = await pkgFetch(stateUrl(ctx.mainName), { method: "DELETE" });
+        expect(del.status === 423, `post-mismatch whole DELETE ${del.status} (expected 423 — the refusal refused nothing)`);
+        return "mismatched unlock → 423 plain 'lock ID mismatch' → whole DELETE still 423 (nothing changed)";
+      },
+    },
+    {
+      id: "ptf-unlock-right-200",
+      expect: `DELETE /lock with the RIGHT ID → 200 EMPTY; the freed proof: a fresh lock POST → 200 (SetLock's CAS only succeeds when unlocked — terraform.ts:306-327, here the UPDATE arm since the row exists) and the fresh lock unlocks 200 too`,
+      run: async () => {
+        const unlock = await deleteLock(ctx.mainName, ctx.lockId);
+        expect(unlock.status === 200 && unlock.bytes.length === 0, `right-ID unlock ${unlock.status} ${unlock.text.slice(0, 120)} (expected the 200 EMPTY)`);
+        const freshId = `ptf-fresh-${hexId()}`;
+        const reset = await postLock(ctx.mainName, freshId);
+        expect(reset.status === 200 && reset.bytes.length === 0, `re-lock after unlock ${reset.status} (expected 200 — the freed CAS proof)`);
+        const clean = await deleteLock(ctx.mainName, freshId);
+        expect(clean.status === 200 && clean.bytes.length === 0, `fresh-lock unlock ${clean.status} (expected the 200 EMPTY)`);
+        return "right-ID unlock 200 → re-lock 200 (freed) → fresh unlock 200";
+      },
+    },
+    {
+      id: "ptf-lock-allocates-package",
+      expect: `the lock ALLOCATES the package (terraform.ts:655-660): POST /lock on the NEVER-uploaded ${ctx.allocName} → 200 EMPTY; GET its state → the EMPTY-body 404 (a versionless package); unlock → 200; DELETE the whole state → 200 EMPTY (the protocol cascade removes the husk package + the lock property — no D1 sweep) and the GET 404s empty after`,
+      run: async () => {
+        const set = await postLock(ctx.allocName, ctx.lockId);
+        expect(set.status === 200 && set.bytes.length === 0, `lock on a never-uploaded name ${set.status} ${set.text.slice(0, 120)} (expected the 200 EMPTY allocation)`);
+        const get = await pkgFetch(stateUrl(ctx.allocName));
+        expect(get.status === 404 && get.bytes.length === 0, `allocated-but-versionless GET ${get.status} ${get.bytes.length}B (expected the EMPTY-body 404)`);
+        const unlock = await deleteLock(ctx.allocName, ctx.lockId);
+        expect(unlock.status === 200 && unlock.bytes.length === 0, `alloc unlock ${unlock.status} (expected the 200 EMPTY)`);
+        const del = await pkgFetch(stateUrl(ctx.allocName), { method: "DELETE" });
+        expect(del.status === 200 && del.bytes.length === 0, `alloc husk DELETE ${del.status} ${del.text.slice(0, 120)} (expected the 200 EMPTY cascade)`);
+        ctx.allocGone = true;
+        const gone = await pkgFetch(stateUrl(ctx.allocName));
+        expect(gone.status === 404 && gone.bytes.length === 0, `alloc GET after delete ${gone.status} ${gone.bytes.length}B (expected the EMPTY-body 404)`);
+        return "lock allocates → versionless GET 404 EMPTY → unlock → whole DELETE 200 (the husk cascade) → 404 EMPTY";
+      },
+    },
+    {
+      id: "ptf-state-delete-whole-200",
+      expect: `the whole-state delete: DELETE of the UNKNOWN name → 404 "package does not exist" (the NON-empty delete 404 — the contrast to the GET's empty 404, route packages-protocols.ts:4818); DELETE ${ctx.mainName} → 200 EMPTY (the cascade folds versions + files + the lock property); GET latest → the EMPTY-body 404 — dead at t+0`,
+      run: async () => {
+        const unknownDel = await pkgFetch(stateUrl(ctx.unknownName), { method: "DELETE" });
+        expect(unknownDel.status === 404 && unknownDel.text === "package does not exist",
+          `unknown-name DELETE ${unknownDel.status} ${unknownDel.text.slice(0, 120)} (expected the 404 "package does not exist")`);
+        const del = await pkgFetch(stateUrl(ctx.mainName), { method: "DELETE" });
+        expect(del.status === 200 && del.bytes.length === 0, `whole DELETE ${del.status} ${del.text.slice(0, 120)} (expected the 200 EMPTY)`);
+        ctx.mainGone = true;
+        const gone = await pkgFetch(stateUrl(ctx.mainName));
+        expect(gone.status === 404 && gone.bytes.length === 0, `post-delete GET ${gone.status} ${gone.bytes.length}B (expected the EMPTY-body 404)`);
+        return "unknown DELETE 404 (non-empty) → whole DELETE 200 EMPTY → GET 404 EMPTY at t+0";
+      },
+    },
+    {
+      id: "ptf-cleanup-repo-204",
+      expect: `DELETE /api/v1/repos/${ctx.user}/${ctx.repo} → 204 (the owner vehicle leaves; both terraform packages were protocol-deleted in-arm — the whole-state DELETE IS the row cascade, so no D1 sweep exists in this battery)`,
+      run: async () => {
+        const res = await api(`/repos/${ctx.user}/${ctx.repo}`, { method: "DELETE" });
+        expect(res.status === 204, `status ${res.status} (expected 204)`);
+        ctx.repoGone = true;
+        return "204";
+      },
+    },
+  ];
+};
+
 // ---------- battery: auth-oauth2 (the OAuth2 provider + external-auth W6 battery) ----------
 
 /**
@@ -7398,6 +7802,13 @@ const BATTERIES = {
   // provider array + sha512 → download → management delete), then the D1
   // husk row sweep + repo delete.
   "packages-minor": { title: "packages minor six (SPEC-0016 §7: chef cookbook tar.gz → universe + search + cookbook/version metadata (the 1_0_1 knife quirk) → download → protocol delete, composer raw zip PUT ?version= → packages.json/list.json/p2 (%2F dist url + sha1 shasum) → download → management delete, conan v2 recipe revision → revisions/latest + pinned revision-files {\"conanfile.py\":null} → pinned download → pinned delete, cran DESCRIPTION tar.gz → PACKAGES(.gz) block (MD5sum EMPTY) → download → management delete, pub request-upload → multipart → finalize → normalized enumerate → archive download → management delete, vagrant box PUT → HEAD probe → provider array (sha512) → download → management delete, then the D1 husk row sweep + repo delete)", context: packagesMinorContext, steps: packagesMinorSteps, failureTail: packagesMinorFailureCleanup, independent: true },
+  // CHAINED (the branch-protection posture — the terraform state machine is
+  // genuinely sequential: the upload feeds the lock dance, the lock dance the
+  // unlock arms, the delete arms the exact serial set; a red chain-skips the
+  // arms that need it). Pure HTTP + the run PAT: the whole-state DELETE is its
+  // own row cascade (deletePackageAndReferences), so NO wrangler auth / D1
+  // arms — the only packages battery without one.
+  "packages-terraform": { title: "packages terraform state backend (SPEC-0016 §7: anonymous write 401s + the anonymous read-through to the EMPTY 404, state upload → GET byte-parity round-trip with the serial/lineage re-parsed off the wire, duplicate-serial 409, latest-serial DELETE 403 + non-latest 204, lock set/locked 423 with the Go field order JSON (no GET lock route — the 423 body IS the read), the PRE-BODY ?ID= upload gate (mismatch 423 over a parse-hostile body, match 201, lock survives), whole-DELETE locked 423 plain, unlock mismatch 423 plain / right ID 200 + the freed re-lock proof, the lock's package allocation + husk cascade, the unknown-name DELETE 404 contrast, whole-state delete t+0 + repo delete — no D1 arms)", context: packagesTerraformContext, steps: packagesTerraformSteps, failureTail: packagesTerraformFailureCleanup },
   // Independent (the fixwave/distro posture — one red family never hides the
   // others): the scripted third-party client (registration → session → the
   // consent dance with in-script PKCE S256 → the form + Basic exchanges →
@@ -7413,7 +7824,7 @@ const BATTERIES = {
   "cleanup-audit": { title: "post-run D1 count shapes", context: () => ({}), steps: auditSteps, independent: true },
 };
 
-const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "packages-protocols", "packages-minor", "auth-oauth2", "cleanup-audit"] : [opts.battery];
+const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "packages-protocols", "packages-minor", "packages-terraform", "auth-oauth2", "cleanup-audit"] : [opts.battery];
 
 // ---------- dry-run ----------
 

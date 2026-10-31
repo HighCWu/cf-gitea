@@ -18,13 +18,13 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
                                                       # D1-only: --base-url/--token-file optional
 ```
 
-- Batteries (18): `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
+- Batteries (19): `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
   `ui-login`, `window2-mounts`, `window3-mounts`, `fixwave-parity`,
   `branch-protection`, `demo`, `wiki-git`, `packages-registry`,
-  `packages-distro`, `packages-protocols`, `packages-minor`, `auth-oauth2`,
-  `cleanup-audit`,
-  `all` (runs the 18 in that order, audit last). `all --dry-run` plans
-  **219 probes** across them (the counts in the table below were read off
+  `packages-distro`, `packages-protocols`, `packages-minor`,
+  `packages-terraform`, `auth-oauth2`, `cleanup-audit`,
+  `all` (runs the 19 in that order, audit last). `all --dry-run` plans
+  **232 probes** across them (the counts in the table below were read off
   that dry-run at this writing; `registry` scales with `--trials`).
 - **The `cleanup-audit` battery is D1-only** (wrangler d1 execute, no HTTP): it
   takes neither `--base-url` nor `--token-file` — a missing token only errors
@@ -72,7 +72,7 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
 
 ## Batteries and their canonical expectations
 
-The registry at this writing — 18 batteries, **219 probes** (`all
+The registry at this writing — 19 batteries, **232 probes** (`all
 --dry-run`; `registry`'s count scales with `--trials`, here at its
 default 3):
 
@@ -94,9 +94,10 @@ default 3):
 | `packages-distro` | 5 | the M7 distro tail: rpm (hand-built fixture → .repo configs + repomd.xml + primary.xml.gz + repository.key → delete → repodata gone) + arch (.PKGINFO package → packages.db tar + symlink-dance aliases + .sig → delete → index 404 empty) + the D1 husk sweep + repo delete | HTTP + **wrangler auth** (the husk row sweep rides `--d1-scope`) |
 | `packages-protocols` | 9 | the SPEC-0016 §7 long tail: go (module zip → list/@latest/.info/.mod/.zip + sumdb 404 + missing-module 404s, + real `go mod download` when the toolchain is on the host) + cargo (.crate container → the {"ok"} shapes + config.json + sparse index + yank/unyank + download, + real `cargo fetch` through the in-script h2c-stripping proxy on plain-HTTP) + swift (login pair → multipart PUT → enumerate + Link → metadata + Digest zip → manifest 200/303 → identifiers) + rubygems (.gem → compact index → specs marshal → byte-parity download → gemspec.rz → yank) + the D1 husk sweep + repo delete | HTTP + **wrangler auth** (the husk row sweep rides `--d1-scope`); the two REAL-CLIENT arms degrade to a documented `[warn]` when `go`/`cargo` is off the probe host |
 | `packages-minor` | 9 | the SPEC-0016 §7 minor six: chef (cookbook tar.gz → universe + search + cookbook/version metadata with the 1_0_1 knife quirk → download → protocol version delete) + composer (raw zip PUT ?version= → packages.json/list.json/p2 with the %2F dist url + sha1 → download → management delete) + conan (v2 recipe revision → revisions/latest + the pinned revision-files list {"conanfile.py":null} → pinned download → pinned v2 delete) + cran (DESCRIPTION tar.gz → PACKAGES(.gz) block with the EMPTY MD5sum → download → management delete) + pub (request-upload → multipart → finalize → the normalized enumerate → download → management delete) + vagrant (box PUT → HEAD probe → the provider array + sha512 → download → management delete) + the D1 husk sweep + repo delete | HTTP + **wrangler auth** (the husk row sweep rides `--d1-scope`) |
+| `packages-terraform` | 13 | the SPEC-0016 §7 terraform state backend: anonymous write 401s + the anonymous read-through to the EMPTY 404, state upload → GET byte-parity round-trip (serial/lineage re-parsed off the wire, HEAD parity), duplicate-serial 409, latest-serial DELETE 403 + non-latest 204, lock set/locked 423 with the Go field-order JSON (the 423 body IS the lock read — no GET lock route in the pin), the PRE-BODY `?ID=` upload gate (mismatch 423 over a parse-hostile body, match 201, lock survives), whole-DELETE locked 423 plain, unlock mismatch 423 plain / right ID 200 + the freed re-lock proof, the lock's package allocation + protocol-husk cascade, the unknown-name DELETE 404 contrast, whole-state delete t+0 + repo delete | HTTP (no D1 arms — the whole-state DELETE is its own row cascade) |
 | `auth-oauth2` | 20 | the OAuth2 provider W6 battery + the external-auth tail: the scripted third-party client (registration with the exactly-once secret → login session → the consent dance with in-script PKCE S256 → form + Basic exchanges → the dotted dispatch → userinfo (+PAT-401) → the offline JWKS verify (WebCrypto, id_token claims pinned) → refresh → introspect (active/junk/401) → the revoke-kills-token row delete → app delete + the D1 husk sweep) + the realm check + the discovery shape + the builtin seed + the external-auth source family | HTTP (login cookie + Bearer JWTs) + **wrangler auth** (the builtin-seed read, the revoke row delete, the husk sweep, and the source seed/cleanup ride `--d1-scope`; the discovery arm's issuer==origin assert keys off it) |
 | `cleanup-audit` | 10 | post-run D1 count shapes (independent counts) | **D1-only** — wrangler auth, `--d1-scope remote\|local` (default remote); takes NEITHER `--base-url` NOR `--token-file` |
-| **`all`** | **219** | every battery in registry order, audit last | union of the above |
+| **`all`** | **232** | every battery in registry order, audit last | union of the above |
 
 Expectations are ported from `docs/design/p0-evidence.md` — the REDEPLOY13
 block (2026-10-26, ~lines 1507-1697) for the shallow trio, generate, ui-login,
@@ -704,6 +705,57 @@ prints all of them verbatim.
   the fullName the create returned (logged on one
   `[tail] pmin-leftover-sweep` line; failures feed `left_behind`, never
   fatal; a green run no-ops silently).
+- **packages-terraform** — the SPEC-0016 §7 terraform STATE BACKEND family
+  (`/api/packages/{owner}/terraform/state/{name}` — the GitLab-compatible
+  backend; one probe repo vehicle + the run PAT; inline JSON fixtures, no
+  registry tooling). CHAINED (the branch-protection posture, not the distro
+  independent shape — the state machine is genuinely sequential: the upload
+  feeds the lock dance, the lock dance the unlock arms, the delete arms the
+  exact serial set; a red chain-skips the arms that need it):
+  **ptf-anon-write-401** — anonymous state POST / lock POST / lock DELETE /
+  state DELETE all answer 401 "user should have specific permission or be a
+  site admin" + `Basic realm="Gitea Package API"` (the write gate refuses
+  before any body read). **ptf-anon-read-404-empty** — an anonymous GET of an
+  UNKNOWN state passes the gate on a public owner and answers the family's
+  EMPTY-body 404 (the nil-error PlainText arm — no message, nosniff; a 401
+  here means the `--user` owner row is not public, users.visibility defaults
+  public). **ptf-state-roundtrip** — POST a `{serial, lineage, …}` document →
+  201 EMPTY; GET latest answers the stored bytes VERBATIM (the `tfstate` lead
+  file) so serial/lineage re-parse off the wire; the disposition carries
+  `tfstate`; HEAD → 200; GET `/versions/1` → the same bytes.
+  **ptf-serial-delete-arms** — serial 2 posts beside serial 1 (one VERSION per
+  serial); the same-serial re-post is the 409 "package file already exists";
+  GET latest parses serial 2; DELETE of the LATEST serial → 403 "cannot delete
+  the latest version"; DELETE of the non-latest → 204 and the serial GET 404s
+  EMPTY. **ptf-lock-set-423-locked** — lock POST → 200 EMPTY; a second lock
+  POST → 423 `application/json;charset=utf-8` whose body is the CURRENT lock
+  JSON in the Go struct field order `[ID, Operation, Info, Who, Version,
+  Created, Path]` with the submitted values round-tripped (there is NO
+  lock-info GET in the pin — the 423 body IS the lock read).
+  **ptf-upload-locked-idgate** — the PRE-BODY `?ID=` gate: a locked upload
+  with a mismatched ID and a parse-hostile body answers 423 with the lock JSON
+  (never the 400 — the lock check runs before the body is read); the matching
+  ID uploads 201; the lock SURVIVES the matched upload.
+  **ptf-delete-locked-423** — the whole-state DELETE while locked → 423
+  "terraform state is locked" as PLAIN text (the non-JSON locked arm).
+  **ptf-unlock-mismatch-423** — DELETE lock with a mismatched ID → 423
+  "lock ID mismatch" PLAIN text (not the JSON body) and the state stays
+  locked. **ptf-unlock-right-200** — the right ID frees (200 EMPTY) with the
+  freed CAS proof (a fresh lock re-sets 200, then unlocks 200).
+  **ptf-lock-allocates-package** — locking a NEVER-uploaded name allocates the
+  package (its state GET still 404s EMPTY — versionless), and the whole-state
+  DELETE removes the husk via the protocol cascade.
+  **ptf-state-delete-whole-200** — the unknown-name DELETE 404s NON-empty
+  ("package does not exist" — the contrast to the GET's empty 404); the main
+  state's whole DELETE → 200 EMPTY and the GET is dead at t+0.
+  Cleanup needs NO D1 arms (the only packages battery without any): the
+  whole-state DELETE is its own row cascade (package + versions + files + the
+  lock property go together), and the probe repo DELETEs 204. **Failure
+  cleanup (the consistency posture):** a finally-style tail unlock+sweeps the
+  two tracked state packages (the unlock is unconditional — the
+  missing/not-locked arms answer 200) and deletes the probe repo (logged on
+  one `[tail] ptf-leftover-sweep` line; failures feed `left_behind`, never
+  fatal; a green run no-ops silently).
 - **auth-oauth2** — the OAuth2 provider's W6 battery (specs/oauth2-provider.md
   §5's live battery arm) plus the external-auth tail
   (specs/external-auth-sources.md §8), over one scripted THIRD-PARTY client —
@@ -858,6 +910,12 @@ prints all of them verbatim.
     anything, so nothing to sweep there), then its package rows (D1 — the
     version deletes leave the empty package husks), then its probe repo;
     `[tail] pmin-leftover-sweep`.
+  - `packages-terraform` — its two tracked state packages (unlock with the
+    run's own lock id — the missing/not-locked arms answer 200, so the unlock
+    is unconditional — then the whole-state DELETE, gone-flagged; the
+    whole-state DELETE IS the row cascade, so unlike the other packages
+    batteries there is no D1 sweep), then its probe repo;
+    `[tail] ptf-leftover-sweep`.
   - `auth-oauth2` — its external-auth source row (D1), then its probe
     grant rows (D1 — the app delete cascades codes+grants, so this covers a
     red before that delete; skipped when the in-chain husk sweep already
@@ -967,6 +1025,16 @@ prints all of them verbatim.
     silent (nothing the run created survived; a mid-arm red after a real PUT
     is what the tail's gone-flagged management deletes + row sweep cover,
     and that shape is not deterministically forceable).
+  - `packages-terraform --force-red ptf-lock-set-423-locked` — the CHAINED
+    posture: the forced arm reds UNRUN after the repo, the two anonymous
+    posture arms, the state round-trip, and the serial/delete arms ran green
+    (serial 2 is the latest, the state UNLOCKED); the lock/unlock/allocation/
+    delete arms chain-skip, and the `[tail] ptf-leftover-sweep` line must
+    list the main state's unlock+whole-DELETE sweep (unlock 200 via the
+    not-locked arm, DELETE 200) beside the alloc name's 404 skip and the repo
+    delete. Forcing an arm before the first creation (e.g.
+    `ptf-create-repo-201`) leaves nothing to sweep — the tail stays silent
+    (both state DELETEs 404-skip, the repo was never created).
   - `auth-oauth2 --force-red ext-source-cleanup-d1` — the forced arm reds
     UNRUN while the other steps still run green (the whole provider dance,
     the app delete, the husk sweep, and the source seed/render/404 arms);
