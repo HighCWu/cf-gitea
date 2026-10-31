@@ -424,6 +424,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "System Notices", // SPEC-0018 §3.1's top-level item (navbar.tmpl:104-106's position)
       "Runners", // the actions wave's landed Runners item (navbar.tmpl:78-80, the Actions group)
       "Variables", // the actions wave's landed Variables item (navbar.tmpl:81-83, the Actions group)
+      "Scoped Workflows", // the scoped-workflows nav wave's landed item (the Actions group, after Variables)
       "Job queue", // the census C6 arm's landed item (navbar.tmpl:87-89, the Actions group)
       "Stats",
       "Cron Tasks",
@@ -482,6 +483,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "System Notices", // SPEC-0018 §3.1's top-level item (navbar.tmpl:104-106's position)
       "Runners", // the actions wave's landed Runners item (navbar.tmpl:78-80, the Actions group)
       "Variables", // the actions wave's landed Variables item (navbar.tmpl:81-83, the Actions group)
+      "Scoped Workflows", // the scoped-workflows nav wave's landed item (the Actions group, after Variables)
       "Job queue", // the census C6 arm's landed item (navbar.tmpl:87-89, the Actions group)
       "Stats",
       "Cron Tasks",
@@ -559,6 +561,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "System Notices", // SPEC-0018 §3.1's top-level item (navbar.tmpl:104-106's position)
       "Runners", // the actions wave's landed Runners item (navbar.tmpl:78-80, the Actions group)
       "Variables", // the actions wave's landed Variables item (navbar.tmpl:81-83, the Actions group)
+      "Scoped Workflows", // the scoped-workflows nav wave's landed item (the Actions group, after Variables)
       "Job queue", // the census C6 arm's landed item (navbar.tmpl:87-89, the Actions group)
       "Stats",
       "Cron Tasks",
@@ -634,6 +637,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "System Notices", // SPEC-0018 §3.1's top-level item (navbar.tmpl:104-106's position)
       "Runners", // the actions wave's landed Runners item (navbar.tmpl:78-80, the Actions group)
       "Variables", // the actions wave's landed Variables item (navbar.tmpl:81-83, the Actions group)
+      "Scoped Workflows", // the scoped-workflows nav wave's landed item (the Actions group, after Variables)
       "Job queue", // the census C6 arm's landed item (navbar.tmpl:87-89, the Actions group)
       "Stats",
       "Cron Tasks",
@@ -706,6 +710,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Runners",
       "Secrets",
       "Variables",
+      "Scoped Workflows",
       "Packages",
       "Webhooks",
       "Organizations",
@@ -760,6 +765,8 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       ["/alice/golden-ms", "golden-ms"],
       [undefined, "Participating and mentions"],
       [undefined, "All activity"],
+      [undefined, "Ignore"],
+      [undefined, "Custom"],
       [undefined, "Star"],
       ["/alice/golden-ms/fork", "Fork0"],
     ]);
@@ -814,6 +821,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Runners",
       "Secrets",
       "Variables",
+      "Scoped Workflows",
       "Packages",
       "Webhooks",
       "Organizations",
@@ -898,6 +906,8 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       ["/alice/golden", "golden"],
       [undefined, "Participating and mentions"],
       [undefined, "All activity"],
+      [undefined, "Ignore"],
+      [undefined, "Custom"],
       [undefined, "Star"],
       ["/alice/golden/fork", "Fork0"],
     ]);
@@ -1003,6 +1013,8 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       ["/alice/golden-alt", "golden-alt"],
       [undefined, "Participating and mentions"],
       [undefined, "All activity"],
+      [undefined, "Ignore"],
+      [undefined, "Custom"],
       [undefined, "Star"],
       ["/alice/golden-alt/fork", "Fork0"],
     ]);
