@@ -56,11 +56,11 @@
  *     canDelete := !IsDeleted && DefaultBranch != name && pullRequestTargetBranch != name
  *     if isProtected && canDelete { canDelete = canDelete && rule.CanUserDelete(...) }
  *
- * reduced to the landed model: no deleted-branch rows exist (no
- * `deleted_branches` table — the restore column cannot render), and
- * GetPullRequestTargetBranch folds to the default branch for a same-repo
- * target, so the first two arms are one `name != defaultBranch` check.
- * `rule.CanUserDelete` is the LANDED port (`canUserDelete`,
+ * reduced to the landed model: no deleted-branch rows exist (the
+ * deleted-branches ADJUDICATION section below — the restore column cannot
+ * render), and GetPullRequestTargetBranch folds to the default branch for a
+ * same-repo target, so the first two arms are one `name != defaultBranch`
+ * check. `rule.CanUserDelete` is the LANDED port (`canUserDelete`,
  * services/branch-protection.ts — write access + the rule's deletion arm +
  * the push predicate + the deletion allowlist). The button posts to this
  * page's own POST arm (below), the confirm modal reduced to a direct form
@@ -88,14 +88,76 @@
  * `repo.branch.deletion_success` / `default_deletion_failed` /
  * `protected_deletion_failed` / `deletion_failed`.
  *
+ * ## The deleted-branch rows + the restore POST — census gap #10(a):
+ *    ADJUDICATED a recorded REDUCTION (no substrate exists)
+ *
+ * Upstream's deleted-branch substrate is NOT a separate table: the `branch`
+ * table keeps EVERY branch ever seen and a web/API delete only FLAGS the
+ * row (`MarkBranchAsDeleted`, models/git/branch.go:254-269 — `is_deleted=
+ * true, deleted_by_id, deleted_unix`, the name/CommitID columns untouched:
+ * the sha survives with the row; every live-branch read filters
+ * `is_deleted=false`, and the list order is `is_deleted ASC, commit_time
+ * DESC, name ASC` — branch_list.go:96, deleted rows sort last). The page
+ * renders flagged rows in the SAME table (list.tmpl:93-99: a plain-text
+ * name — no tree link, the ref is gone — the copy button, and a
+ * `Deleted by {user} {TimeSince}` info line in place of the commit line)
+ * and offers its writer the restore control (list.tmpl:195-204,
+ * `restore-branch-button`, `octicon-reply`, non-protected deleted rows
+ * only) posting web.go:1485's `m.Post("/restore",
+ * repo.RestoreBranchPost)` under the web.go:1484-1489 group's gates
+ * (`RepoMustNotBeArchived, reqRepoCodeWriter, MustBeNotEmpty`).
+ * `RestoreBranchPost` (routers/web/repo/branch.go:108-135): form
+ * `branch_id` → `GetDeletedBranchByID` (models/git/branch.go:209-217 — id
+ * + repo_id + is_deleted, else ErrBranchNotExist → JSONErrorAuto) →
+ * `PushManaged` with `Branch: "{CommitID}:refs/heads/{Name}"` — the push
+ * restoring the ref AT THE RECORDED SHA; a push error containing "already
+ * exists" flashes `repo.branch.already_exists`, any other failure
+ * `repo.branch.restore_failed`, success re-synthesizes the push update
+ * (empty OldCommitID → the sha as NewCommitID) and flashes
+ * `repo.branch.restore_success`.
+ *
+ * This backend carries NO such substrate: the engine keeps refs ONLY (no
+ * branch rows, no reflog — the public RPC surface has no ref history),
+ * D1 has no branch table at all (the loader derives the universe from
+ * listRefs), and the landed delete flow (`applyBranchDelete`, this file)
+ * CAS-deletes the ref and emits the DeleteRef webhook — whose payload
+ * carries the NAME, never the sha; no audit event registers branch
+ * deletes (services/audit.ts). Nothing anywhere retains the
+ * `{name → sha}` pair a restore needs, and the ref itself is gone — a
+ * deleted branch is unrecoverable BY CONSTRUCTION, so the deleted-row
+ * render and the restore POST are an honest REDUCTION (there is no row to
+ * render and no sha to restore from), not an unmounted surface. The
+ * absence is pinned (branches.matrix.test.tsx's restore-absence arm).
+ *
+ * Reopen trigger (the parity row this leaves open, in dependency order):
+ * (1) a `deleted_branches` D1 table — upstream's column subset `id,
+ *     repo_id, name, commit_id, deleted_by_id, deleted_unix` — written by
+ *     `applyBranchDelete`'s landing arm before the CAS delete (a generated
+ *     migration; SPEC-first per AGENTS.md — OUTSIDE this unit's file
+ *     ownership);
+ * (2) a `loadDeletedBranches` arm in loadBranchesData + the list.tmpl:93-99
+ *     deleted-row render (plain-text name, deleted_by info line, the
+ *     is_deleted-last sort) + the restore form (list.tmpl:195-204's
+ *     control, the no-JS direct-POST reduction like the delete button);
+ * (3) the restore POST seam replaying PushManaged as
+ *     `commitApiChange({ref: "refs/heads/{name}", expectedOldOid:
+ *     ZERO_OID, newOid: sha})` + the DeleteRef-style webhook for the
+ *     create event, with the already_exists / restore_failed /
+ *     restore_success flash arms (the delete arm's `?deleted=` /
+ *     `?delete_error=` display-param convention).
+ * Until (1) lands, this page keeps upstream's live-row shape exactly and
+ * quietly never renders a deleted row — the honest posture the census
+ * asked this unit to adjudicate.
+ *
  * ## The writer block — create + rename (two-stage; POST arms mounted)
  *
  * Upstream's default-section and per-row actions render under `and $.IsWriter
  * $.Repository.CanContentChange (not .IsDeleted)` (list.tmpl:34,56,163,185):
  * reduced here to the loader's write grant (principalAccessOfRow's write —
  * IsWriter's CanWrite(TypeCode)) plus `!repo.isArchived` (CanContentChange;
- * no mirror column is landed) — deleted rows cannot exist (no
- * `deleted_branches` table). Each modal button is reduced to an inline no-JS
+ * no mirror column is landed) — deleted rows cannot exist (the
+ * deleted-branches ADJUDICATION section above). Each modal button is
+ * reduced to an inline no-JS
  * form carrying upstream's EXACT route and fields, so the mount wave can
  * serve them verbatim:
  *
@@ -170,8 +232,12 @@
  *
  * - The Download / RSS buttons (upstream's EnableFeed /
  *   DisableDownloadSourceArchives block, list.tmpl:44-52/:173-181) stay
- *   unrendered: the per-branch RSS still has no feed surface to target (no
- *   `rss/branch` route — the dead-link rule), but the archive half's
+ *   unrendered: the per-branch RSS feed MODULE is landed
+ *   (pages/branch-feed-xml.ts — census gap #10(b), both envelopes) but its
+ *   route seam is the orchestrator's fold (the module doc's route-seam
+ *   HANDOFF carries the recipe), and until that mount the anchor would
+ *   target a 404 (the dead-link rule); the w129 batch-14 absence pin
+ *   (branches.matrix.test.tsx) flips with the fold. The archive half's
  *   premise is stale — the web-shape archive endpoint IS landed
  *   (wave-ui-parity-6's `/archive/{ref}.{format}`, branches resolve), so
  *   the unrendered dropdown is this page's own open parity row, not a

@@ -844,6 +844,14 @@ describe("w100 feed/archive absence (w129 batch-14: the documented never-pinned 
     // Provenance: wave-polish-matrix-14 (census gap a3, branches.tsx's
     // Reductions block). The render is exercised signed-in (the owner sees
     // the full writer chrome) so the absence cannot be a gate artifact.
+    // Census gap #10(b) landed the feed MODULE (pages/branch-feed-xml.ts —
+    // both envelopes over the log read) but NOT its route seam: ui/index.ts
+    // is the orchestrator's fold window, and until that mount lands the
+    // anchor would target a 404 (the dead-link rule). The absence holds
+    // until the module doc's route-seam HANDOFF executes — that fold flips
+    // this pin deliberately to the rendered-button arms (list.tmpl:44-45/
+    // :173-174's EnableFeed anchor: octicon-rss + the rss_feed tooltip +
+    // the /rss/branch/ href with PathEscapeSegments).
     const res = await get(`/${OWNER}/w100br/branches`, OWNER);
     expect(res.status).toBe(200);
     const html = await res.text();
@@ -853,5 +861,60 @@ describe("w100 feed/archive absence (w129 batch-14: the documented never-pinned 
     expect(html).not.toContain("archive-link"); // the ZIP/TAR.GZ anchor class
     expect(html).not.toContain("/archive/"); // the archive href shape
     expect(html).not.toContain("octicon-file-zip"); // the archive glyph
+  });
+});
+
+// --- the deleted-branch rows + restore POST absence (census gap #10(a)) -----
+// pages/branches.tsx's ADJUDICATION: upstream flags deletes on its `branch`
+// TABLE (is_deleted rows keep the sha — models/git/branch.go:254-269) and
+// restores from the recorded sha (RestoreBranchPost, branch.go:108-135,
+// web.go:1485 POST /branches/restore with branch_id); this backend keeps
+// NO substrate (no branch rows in D1, no reflog in the engine, the delete
+// flow's webhook carries the name but never the sha) — a deleted branch is
+// unrecoverable by construction, so the deleted-row render and the restore
+// POST are a recorded REDUCTION, not an unmounted surface. These arms pin
+// the render half of that adjudication; the POST tail (`/branches/restore`)
+// is DOCUMENTED unclaimed — parseUiRoute answers null and the engine 404s
+// the POST, never pinned so the reopen (the module header's trigger list)
+// flips them deliberately.
+
+describe("w100 deleted-branch rows + restore absence (census gap #10(a): the adjudication pin)", () => {
+  it("no deleted-row render and no restore control — on the default or any listed branch", async () => {
+    // The signed-in owner sees the full writer chrome (the batch-14
+    // convention) so the absence cannot be a gate artifact. Upstream's
+    // deleted rows would render list.tmpl:93-99's plain-text name + the
+    // `Deleted by` info line, and its writers get list.tmpl:195-204's
+    // restore-branch-button (octicon-reply, blue); none of that exists here.
+    const res = await get(`/${OWNER}/w100br/branches`, OWNER);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).not.toContain("restore-branch-button"); // the restore control's class
+    expect(html).not.toContain("octicon-reply"); // its glyph
+    expect(html).not.toContain("Restore Branch"); // its tooltip literal (repo.branch.restore)
+    expect(html).not.toContain("/branches/restore"); // its action URL shape
+    expect(html).not.toContain("branch_id="); // its form field
+    expect(html).not.toContain("Deleted by"); // the deleted-row info line (repo.branch.deleted_by)
+    // And every listed row stays a LIVE row: a tree link per branch name
+    // (deleted rows render plain text upstream — no tree link).
+    for (const name of ["stale", "ahead", "flat", "moved"]) {
+      expect(html).toContain(`href="/${OWNER}/w100br/src/branch/${name}"`);
+    }
+  });
+
+  it("the restore POST tail is engine-owned: unclaimed by the parser, 404-shelled on POST (documented, not pinned — the reopen flips it)", async () => {
+    // Documented (never pinned as a claim): parseUiRoute(/branches/restore)
+    // → null — the mount wave flips it deliberately, per the file's own
+    // claim-pin convention. The POST's 404 IS pinned (the write-seam half,
+    // the archived delete's precedent) so the reopen cannot silently drop
+    // the refusal either.
+    expect(parseUiRoute(`/${OWNER}/w100br/branches/restore`)).toBeNull();
+    const res = await fetchUi(
+      `/${OWNER}/w100br/branches/restore`,
+      formPost(`/${OWNER}/w100br/branches/restore`, { branch_id: "1", name: "moved" }, await cookieFor(OWNER)),
+    );
+    expect(res.status).toBe(404);
+    // The refs stand untouched (nothing was restored).
+    const names = (await env.REPO.getByName(`${OWNER}/w100br`).listRefs()).refs.map((ref) => ref.name);
+    expect(names).toContain("refs/heads/moved");
   });
 });
