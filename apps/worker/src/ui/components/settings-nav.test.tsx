@@ -46,6 +46,7 @@ const USER_HREF_ORDER = [
   'href="/user/settings/actions/general"', // lit by the user general page's module (P2-1)
   'href="/user/settings/actions/secrets"',
   'href="/user/settings/actions/variables"',
+  'href="/user/settings/actions/scoped-workflows"', // lit by the store wave's mount (pages/user-settings-actions-scoped-workflows.tsx)
   'href="/user/settings/hooks"',
   'href="/user/settings/organization"',
 ];
@@ -80,6 +81,7 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
       settingsNavLocale.actions_general, // "actions.general" (lit by the user general page's module)
       settingsNavLocale.secrets, // "secrets.secrets"
       settingsNavLocale.variables, // "actions.variables"
+      settingsNavLocale.scoped_workflows, // "actions.scoped_workflows" (lit by the store wave's mount)
       settingsNavLocale.hooks, // "repo.settings.hooks"
       settingsNavLocale.organization, // "settings.organization"
     ]) {
@@ -102,13 +104,9 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
     ]) {
       expect(html).not.toContain(dead);
     }
-    // The Actions Scoped-workflows sub-item (:55-57) has no landed page
-    // (P1-3's substrate); General (:43-45) lit with the user general page's
-    // module (P2-1, committed-unmounted), Runners (:46-48) landed with the
-    // user twin's mount.
-    for (const deadSub of ['href="/user/settings/actions/scoped-workflows"']) {
-      expect(html).not.toContain(deadSub);
-    }
+    // The Actions Scoped-workflows sub-item (:55-56) RENDERED with the
+    // store wave's mount (pages/user-settings-actions-scoped-workflows.tsx
+    // — the href-order pin above carries it).
   });
 
   it("marks exactly the active tab's anchor (every union member)", () => {
@@ -125,6 +123,7 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
       keys: 'href="/user/settings/keys"',
       secrets: 'href="/user/settings/actions/secrets"',
       variables: 'href="/user/settings/actions/variables"',
+      "actions-scoped-workflows": 'href="/user/settings/actions/scoped-workflows"', // the store wave's page
       hooks: 'href="/user/settings/hooks"',
       organization: 'href="/user/settings/organization"',
       repos: 'href="/user/settings/repos"',
@@ -141,6 +140,7 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
     expect(renderToString(<UserSettingsNavbar active="actions-general" />)).toContain('<details class="item" open');
     expect(renderToString(<UserSettingsNavbar active="secrets" />)).toContain('<details class="item" open');
     expect(renderToString(<UserSettingsNavbar active="variables" />)).toContain('<details class="item" open');
+    expect(renderToString(<UserSettingsNavbar active="actions-scoped-workflows" />)).toContain('<details class="item" open');
     const closed = renderToString(<UserSettingsNavbar active="profile" />);
     expect(closed).toContain('<details class="item">'); // no open attribute
     expect(closed).not.toContain("open");
@@ -190,6 +190,7 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
       settingsNavLocale.runners, // "actions.runners" (lit by the C7 org twin's mount)
       settingsNavLocale.secrets, // "secrets.secrets"
       settingsNavLocale.variables, // "actions.variables"
+      settingsNavLocale.scoped_workflows, // "actions.scoped_workflows" (lit by the store wave's org mount)
       settingsNavLocale.audit, // "audit.title" (lit by the census R13 org arm's mount)
     ]) {
       expect(html).toContain(text);
@@ -207,6 +208,7 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
       'href="/acme/settings/actions/runners"', // lit by the C7 org twin's mount — navbar.tmpl:35-37, before Secrets
       'href="/acme/settings/actions/secrets"',
       'href="/acme/settings/actions/variables"',
+      'href="/acme/settings/actions/scoped-workflows"', // lit by the store wave's org mount — navbar.tmpl:44-45
       'href="/acme/settings/audit_logs"', // lit by the census R13 org arm's mount — LAST, navbar.tmpl:50-52
     ]);
   });
@@ -217,13 +219,15 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
     expect(html).not.toContain('href="/acme/settings/labels"');
   });
 
-  it("renders NO dead items — the Scoped-workflows sub-item is omitted (Applications landed with the R20-a tab, Audit with the census R13 org arm, Runners with the C7 org twin's mount, Packages with the org settings packages tab's mount, General with the org general page's module)", () => {
+  it("renders NO dead items — every Actions sub-item is landed (Applications landed with the R20-a tab, Audit with the census R13 org arm, Runners with the C7 org twin's mount, Packages with the org settings packages tab's mount, General with the org general page's module, Scoped-workflows with the store wave's org mount)", () => {
     const html = renderToString(<OrgSettingsNavbar orgLink="/acme" active="options" />);
-    // The General sub-item (:32-34) now renders with upstream's own bare
+    // The General sub-item (:32-34) renders with upstream's own bare
     // `{OrgLink}/settings/actions` href — the quoted attribute shape
     // disambiguates it from the landed tails' longer hrefs.
     expect(html).toContain('href="/acme/settings/actions"');
-    expect(html).not.toContain('href="/acme/settings/actions/scoped-workflows"'); // :44-46, dead (P1-3)
+    // The Scoped-workflows sub-item (:44-45) rendered with the store wave's
+    // mount (pages/org-settings-actions-scoped-workflows.tsx).
+    expect(html).toContain('href="/acme/settings/actions/scoped-workflows"');
   });
 
   it("marks exactly the active tab's anchor (every union member)", () => {
@@ -237,6 +241,7 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
       runners: 'href="/acme/settings/actions/runners"',
       secrets: 'href="/acme/settings/actions/secrets"',
       variables: 'href="/acme/settings/actions/variables"',
+      "actions-scoped-workflows": 'href="/acme/settings/actions/scoped-workflows"', // the store wave's org page
       audit: 'href="/acme/settings/audit_logs"',
     };
     for (const [tab, href] of Object.entries(expectations)) {
@@ -254,6 +259,7 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
               | "runners"
               | "secrets"
               | "variables"
+              | "actions-scoped-workflows"
               | "audit"
           }
         />,
@@ -268,6 +274,7 @@ describe("OrgSettingsNavbar (org/settings/navbar.tmpl reduced)", () => {
     expect(renderToString(<OrgSettingsNavbar orgLink="/acme" active="runners" />)).toContain('<details class="item" open');
     expect(renderToString(<OrgSettingsNavbar orgLink="/acme" active="secrets" />)).toContain('<details class="item" open');
     expect(renderToString(<OrgSettingsNavbar orgLink="/acme" active="variables" />)).toContain('<details class="item" open');
+    expect(renderToString(<OrgSettingsNavbar orgLink="/acme" active="actions-scoped-workflows" />)).toContain('<details class="item" open');
     const closed = renderToString(<OrgSettingsNavbar orgLink="/acme" active="blocked" />);
     expect(closed).toContain('<details class="item">');
     expect(closed).not.toContain("open");

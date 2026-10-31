@@ -318,9 +318,11 @@ export type AdminFamilyNavActive =
   | "actions-job-queue"
   // The actions wave's tail pages (the integrator fold of the modules'
   // former local AdminActionsNav — navbar.tmpl:78-80's Runners and
-  // :81-83's Variables items).
+  // :81-83's Variables items), plus the store wave's scoped-workflows page
+  // (navbar.tmpl:84-86's item — pages/admin-actions-scoped-workflows.tsx).
   | "actions-runners"
-  | "actions-variables";
+  | "actions-variables"
+  | "actions-scoped-workflows";
 
 /** The family page chrome (component-local, the adminMonitorLocale pattern —
  *  locale.ts is shared and not this wave's file; upstream locale keys cited
@@ -347,6 +349,7 @@ export const adminFamilyLocale = {
   jobQueue: "Job queue", // "actions.job_queue.title" (navbar.tmpl:88 — the C6 arm's item)
   runners: "Runners", // "actions.runners" (navbar.tmpl:78 — the actions-wave Runners item)
   variables: "Variables", // "actions.variables" (navbar.tmpl:81 — the actions-wave Variables item)
+  scopedWorkflows: "Scoped Workflows", // "actions.scoped_workflows" (navbar.tmpl:84 — the store wave's scoped-workflows item)
   monitoring: "Monitoring", // "admin.monitor"
   stats: "Stats", // "admin.monitor.stats"
   cron: "Cron Tasks", // "admin.monitor.cron"
@@ -364,15 +367,15 @@ export const adminFamilyLocale = {
  *  navbar.tmpl:93-102 — the settings-editor item omitted by the dead-link
  *  rule), the TOP-LEVEL System Notices item (the SPEC-0018 §3.1 arm,
  *  navbar.tmpl:104-106's position), and Monitoring (the monitor family's
- *  four live items), and the Actions group (the C6 arm's Job-queue item plus
- *  the actions wave's Runners/Variables items — navbar.tmpl:73-89's landed
- *  set). Upstream's per-group `PageIs*` conditions reduce to:
+ *  four live items), and the Actions group (the C6 arm's Job-queue item,
+ *  the actions wave's Runners/Variables items, and the store wave's
+ *  Scoped-workflows item — navbar.tmpl:73-89's landed set). Upstream's
+ *  per-group `PageIs*` conditions reduce to:
  *  the group containing the active page renders `open`, the active item
  *  gets the `active item` class. auths, audit_logs, self_check are
  *  omitted — all their upstream items are unlanded pages (the dead-link
  *  rule; the census's (b)/(c) classes; the auths omission is SPEC-0018
- *  §3.3's verdict); the Actions group's Scoped-workflows item is omitted
- *  under the same rule (its page is not served). */
+ *  §3.3's verdict). */
 export function AdminFamilyNav(props: { active: AdminFamilyNavActive; packagesEnabled?: boolean }) {
   const item = (href: string, label: string, active: boolean) => (
     <a class={active ? "active item" : "item"} href={href}>
@@ -392,11 +395,13 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive; packagesEn
   const configOpen = props.active === "config";
   const monitorOpen = props.active === "stats" || props.active === "cron" || props.active === "queue" || props.active === "trace";
   // The census C6 arm — navbar.tmpl:73-89's Actions group opens with its
-  // landed items (the job queue + the actions wave's Runners/Variables; the
-  // Scoped-workflows item stays omitted — its admin page is not served, the
-  // dead-link rule; the AdminFamilyNavActive note).
+  // landed items (the job queue, the actions wave's Runners/Variables, and
+  // the store wave's Scoped-workflows — the AdminFamilyNavActive note).
   const actionsOpen =
-    props.active === "actions-job-queue" || props.active === "actions-runners" || props.active === "actions-variables";
+    props.active === "actions-job-queue" ||
+    props.active === "actions-runners" ||
+    props.active === "actions-variables" ||
+    props.active === "actions-scoped-workflows";
   const openAttr = (open: boolean) => (open ? true : undefined);
   return (
     <div class="flex-container-nav">
@@ -450,15 +455,14 @@ export function AdminFamilyNav(props: { active: AdminFamilyNavActive; packagesEn
         {item("/-/admin/notices", adminFamilyLocale.notices, props.active === "notices")}
         {/* navbar.tmpl:73-89 — the Actions group, between Notices and
             Monitor. The landed items: the actions wave's Runners (:78-80)
-            and Variables (:81-83) before the C6 Job-queue item (:87-89);
-            the Scoped-workflows item (:84-86) stays omitted — its admin
-            page is not served (the dead-link rule, the family's fold-note
-            convention). */}
+            and Variables (:81-83), the store wave's Scoped-workflows item
+            (:84-86), then the C6 Job-queue item (:87-89). */}
         <details class="item" open={openAttr(actionsOpen)}>
           <summary>{adminFamilyLocale.actions}</summary>
           <div class="menu">
             {item("/-/admin/actions/runners", adminFamilyLocale.runners, props.active === "actions-runners")}
             {item("/-/admin/actions/variables", adminFamilyLocale.variables, props.active === "actions-variables")}
+            {item("/-/admin/actions/scoped-workflows", adminFamilyLocale.scopedWorkflows, props.active === "actions-scoped-workflows")}
             {item("/-/admin/actions/job_queue", adminFamilyLocale.jobQueue, props.active === "actions-job-queue")}
           </div>
         </details>

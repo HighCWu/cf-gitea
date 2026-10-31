@@ -356,14 +356,14 @@ describe("the admin users DOM (templates/admin/user/list.tmpl at the pin)", () =
     // armed by default).
     expect(html).toContain('href="/-/admin/packages"');
     // The census C6 arm landed (the Actions group, navbar.tmpl:73-89) with
-    // its full landed set: Job queue (pages/repo-actions-queue.tsx's mount)
-    // and the actions wave's Runners + Variables (the integrator fold of the
-    // modules' local AdminActionsNav); the Scoped-workflows item stays a
-    // dead link (its page is not served — the dead-link rule).
+    // its full landed set: Job queue (pages/repo-actions-queue.tsx's mount),
+    // the actions wave's Runners + Variables (the integrator fold of the
+    // modules' local AdminActionsNav), and the store wave's Scoped-workflows
+    // item (pages/admin-actions-scoped-workflows.tsx's mount).
     expect(html).toContain('href="/-/admin/actions/job_queue"');
     expect(html).toContain('href="/-/admin/actions/runners"');
     expect(html).toContain('href="/-/admin/actions/variables"');
-    expect(html).not.toContain("/-/admin/actions/scoped-workflows");
+    expect(html).toContain('href="/-/admin/actions/scoped-workflows"');
   });
 
   it("the sortable headers are links — ID toggles oldest/newest, Username carries the default arrow", async () => {

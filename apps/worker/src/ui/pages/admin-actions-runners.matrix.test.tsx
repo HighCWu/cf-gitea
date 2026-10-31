@@ -467,12 +467,13 @@ describe("the page renders (admin/actions.tmpl PageType runners + admin/runners/
     // The admin.total count form ("Total: %d" — the admin arm's own shape).
     expect(html).toContain(`${adminActionsRunnersLocale.total_count} ${data.total}`);
     // The nav: the Actions group OPEN, Runners active, Variables linked,
-    // Job queue linked, Scoped Workflows omitted (the dead-link rule).
+    // Job queue linked, Scoped Workflows linked (the store wave's fold —
+    // the family nav's fourth landed item).
     expect(html).toContain('<details class="item" open');
     expect(html).toContain(`class="active item" href="${BASE}"`);
     expect(html).toContain('href="/-/admin/actions/variables"');
     expect(html).toContain('href="/-/admin/actions/job_queue"');
-    expect(html).not.toContain("/-/admin/actions/scoped-workflows");
+    expect(html).toContain('href="/-/admin/actions/scoped-workflows"');
     // The token panel: the readonly input + the clipboard hook + the reset form.
     expect(html).toContain(`value="${data.registrationToken}"`);
     expect(html).toContain(`data-clipboard-text="${data.registrationToken}"`);

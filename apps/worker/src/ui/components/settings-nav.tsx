@@ -32,22 +32,20 @@
  * are live links for the index.ts window to route.
  *
  * Per-template reductions applied:
- *   - user nav: Blocked users (no user-scope module), Audit, Packages,
- *     Repos, and the Actions Scoped-workflows sub-item are UNRENDERED (no
- *     landed pages). Account and Notifications RENDER —
+ *   - user nav: Blocked users (no user-scope module) and Audit are
+ *     UNRENDERED (no landed pages). Account and Notifications RENDER —
  *     their pages landed (upstream gates them on disabled-features /
  *     EnableNotifyMail; both settings pin FALSE/TRUE so the items always
  *     render — the modules' SPEC §3 reduction).
- *   - org nav: Packages and the Actions Scoped-workflows sub-item
- *     are UNRENDERED (Applications joined the landed set with the R20-a tab,
- *     Audit with the census R13 org arm, and Runners with the census C7 org
- *     twin's mount — pages/org-settings-actions-runners.tsx; the USER
- *     twin's Runners item lit with its own module's mount — pages/
- *     user-settings-actions-runners.tsx; the GENERAL sub-items lit with the
- *     P2-1/P2-2 owner general pages' modules — pages/
- *     org-settings-actions-general.tsx + pages/user-settings-actions-
- *     general.tsx; both are committed-unmounted, live links for the
- *     index.ts window to route).
+ *   - org nav: no dead items remain (Applications joined the landed set
+ *     with the R20-a tab, Audit with the census R13 org arm, Runners with
+ *     the census C7 org twin's mount — pages/org-settings-actions-runners.
+ *     tsx; the USER twin's Runners item lit with its own module's mount —
+ *     pages/user-settings-actions-runners.tsx; the GENERAL sub-items lit
+ *     with the P2-1/P2-2 owner general pages' modules; and the SCOPED-
+ *     WORKFLOWS sub-items lit with the store wave's mounts — pages/
+ *     actions-scoped-workflows.tsx + the three frames, web.go:517-523's
+ *     shared four-route group at the user/org/admin scopes).
  *   - The Labels item keeps the landed href `{orgLink}/labels` — upstream's
  *     `{.OrgLink}}/settings/labels` target is the DOCUMENTED wave-14 URL
  *     divergence (pages/org-settings.tsx header: "the target exists so the
@@ -131,6 +129,7 @@ export const settingsNavLocale = {
   actions: "Actions", // "actions.actions" (the <details> summary, :41)
   actions_general: "General", // "actions.general" (user navbar.tmpl:43-45) / "settings.general" (org navbar.tmpl:32-34 — the same English word; lit by BOTH owner general pages: org-settings-actions-general + user-settings-actions-general)
   runners: "Runners", // "actions.runners" (navbar.tmpl:35-37/43-48 — lit by BOTH twins' mounts: org-settings-actions-runners + user-settings-actions-runners)
+  scoped_workflows: "Scoped Workflows", // "actions.scoped_workflows" (user navbar.tmpl:55-56 / org navbar.tmpl:44-45 — lit by the store wave's scoped-workflows mounts, pages/actions-scoped-workflows.tsx + the three frames)
   packages: "Packages", // "packages.title" (navbar.tmpl:25/61-65 — lit by BOTH packages settings tabs' mounts: org + user)
   secrets: "Secrets", // "secrets.secrets" (:50)
   variables: "Variables", // "actions.variables" (:53)
@@ -158,6 +157,7 @@ export type UserSettingsNavTab =
   | "keys" // pages/user-settings-keys.tsx
   | "actions-general" // pages/user-settings-actions-general.tsx
   | "runners" // pages/user-settings-actions-runners.tsx
+  | "actions-scoped-workflows" // pages/user-settings-actions-scoped-workflows.tsx (the store wave's mount)
   | "packages" // pages/user-settings-packages.tsx
   | "secrets" // pages/user-settings-secrets.tsx
   | "variables" // pages/user-settings-variables.tsx
@@ -180,6 +180,7 @@ export type OrgSettingsNavTab =
   | "packages"
   | "actions-general" // pages/org-settings-actions-general.tsx
   | "runners"
+  | "actions-scoped-workflows" // pages/org-settings-actions-scoped-workflows.tsx (the store wave's mount)
   | "secrets"
   | "variables"
   | "audit";
@@ -233,12 +234,18 @@ export function UserSettingsNavbar(props: { active: UserSettingsNavTab }) {
         {/* navbar.tmpl:39-60 — General (:43-45) lit by the user general
             page's module (pages/user-settings-actions-general.tsx); Runners
             (:46-48) lit by the user twin's mount, Secrets (:49-51) +
-            Variables (:52-54) landed; Scoped-workflows (:55-57) dead. Open
-            while any of the four is the active page (:40's or-arm). */}
+            Variables (:52-54) landed; Scoped-workflows (:55-56) lit by the
+            store wave's mount (pages/user-settings-actions-scoped-
+            workflows.tsx). Open while any of the five is the active page
+            (:40's or-arm). */}
         <details
           class="item"
           open={
-            props.active === "actions-general" || props.active === "runners" || props.active === "secrets" || props.active === "variables"
+            props.active === "actions-general" ||
+            props.active === "runners" ||
+            props.active === "secrets" ||
+            props.active === "variables" ||
+            props.active === "actions-scoped-workflows"
               ? true
               : undefined
           }
@@ -256,6 +263,9 @@ export function UserSettingsNavbar(props: { active: UserSettingsNavTab }) {
             </a>
             <a class={item("variables")} href="/user/settings/actions/variables">
               {settingsNavLocale.variables}
+            </a>
+            <a class={item("actions-scoped-workflows")} href="/user/settings/actions/scoped-workflows">
+              {settingsNavLocale.scoped_workflows}
             </a>
           </div>
         </details>
@@ -338,12 +348,18 @@ export function OrgSettingsNavbar(props: { orgLink: string; active: OrgSettingsN
             actions URL the LocationRedirect serves (web.go:1052), not the
             page URL. Runners (:35-37) lit by the census C7 org twin's mount
             (pages/org-settings-actions-runners.tsx), Secrets (:38-40) +
-            Variables (:41-43) landed; Scoped-workflows (:44-46) dead. Open
-            while any of the four is the active page (:29's or-arm). */}
+            Variables (:41-43) landed; Scoped-workflows (:44-45) lit by the
+            store wave's mount (pages/org-settings-actions-scoped-
+            workflows.tsx). Open while any of the five is the active page
+            (:29's or-arm). */}
         <details
           class="item"
           open={
-            props.active === "actions-general" || props.active === "runners" || props.active === "secrets" || props.active === "variables"
+            props.active === "actions-general" ||
+            props.active === "runners" ||
+            props.active === "secrets" ||
+            props.active === "variables" ||
+            props.active === "actions-scoped-workflows"
               ? true
               : undefined
           }
@@ -361,6 +377,9 @@ export function OrgSettingsNavbar(props: { orgLink: string; active: OrgSettingsN
             </a>
             <a class={item("variables")} href={`${props.orgLink}/settings/actions/variables`}>
               {settingsNavLocale.variables}
+            </a>
+            <a class={item("actions-scoped-workflows")} href={`${props.orgLink}/settings/actions/scoped-workflows`}>
+              {settingsNavLocale.scoped_workflows}
             </a>
           </div>
         </details>

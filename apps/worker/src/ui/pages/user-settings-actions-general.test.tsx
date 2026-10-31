@@ -160,16 +160,18 @@ describe("UserActionsGeneralPage (user/settings/actions_general.tmpl + the share
     expect(html).toContain('<details class="item" open');
     expect(html).toContain('class="active item" href="/user/settings/actions/general"');
     // Upstream's item order inside the disclosure: General, Runners,
-    // Secrets, Variables — Scoped-workflows stays the dead item.
+    // Secrets, Variables, Scoped-workflows (lit by the store wave's mount —
+    // navbar.tmpl:55-56).
     const general = html.indexOf('href="/user/settings/actions/general"');
     const runners = html.indexOf('href="/user/settings/actions/runners"');
     const secrets = html.indexOf('href="/user/settings/actions/secrets"');
     const variables = html.indexOf('href="/user/settings/actions/variables"');
+    const scoped = html.indexOf('href="/user/settings/actions/scoped-workflows"');
     expect(general).toBeGreaterThanOrEqual(0);
     expect(general).toBeLessThan(runners);
     expect(runners).toBeLessThan(secrets);
     expect(secrets).toBeLessThan(variables);
-    expect(html).not.toContain("scoped-workflows");
+    expect(variables).toBeLessThan(scoped);
   });
 
   it("renders the shared owner body inside the user frame (the sections' headline pairs + the forms on .Link)", async () => {

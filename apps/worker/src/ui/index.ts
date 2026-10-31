@@ -943,6 +943,32 @@ import {
   setOrgActionsRunnerDisabled,
   updateOrgActionsRunnerDescription,
 } from "./pages/org-settings-actions-runners";
+// The store wave's SCOPED-WORKFLOWS settings surface: the shared core (the
+// POST appliers + form parsers + the JSONError bodies over the landed
+// ScopedWorkflowSourcesStore seam), the three scope frame modules (loaders +
+// full-document renders), the shared navbars' fold and the drizzle SOURCE-
+// REGISTRATION store (the five-op seam over action_scoped_workflow_source).
+import {
+  applyScopedWorkflowAdd,
+  applyScopedWorkflowRemove,
+  applyScopedWorkflowRequired,
+  parseScopedWorkflowAddForm,
+  parseScopedWorkflowRequiredForm,
+  parseScopedWorkflowRemoveForm,
+  SCOPED_WORKFLOWS_PATTERNS_EMPTY_ERROR,
+  SCOPED_WORKFLOWS_SOURCE_NOT_FOUND_ERROR,
+  scopedWorkflowsScopeContext,
+  type ScopedWorkflowAddOutcome,
+  type ScopedWorkflowFileReads,
+  type ScopedWorkflowRemoveOutcome,
+  type ScopedWorkflowRequiredOutcome,
+  type ScopedWorkflowSourceRepoView,
+  type ScopedWorkflowsScope,
+} from "./pages/actions-scoped-workflows";
+import { loadOrgScopedWorkflowsPageData, renderOrgScopedWorkflowsPage } from "./pages/org-settings-actions-scoped-workflows";
+import { loadUserScopedWorkflowsPageData, renderUserScopedWorkflowsPage } from "./pages/user-settings-actions-scoped-workflows";
+import { loadAdminScopedWorkflowsPageData, renderAdminScopedWorkflowsPage } from "./pages/admin-actions-scoped-workflows";
+import { scopedWorkflowSourcesStore } from "../services/actions/scoped-workflow-sources";
 import {
   applyOwnerActionsGeneralForms,
   loadOrgActionsGeneralPageData,
@@ -1130,7 +1156,8 @@ import {
 } from "./pages/admin-monitor";
 import type { AdminMonitorPage } from "./pages/admin-monitor";
 // The admin listing pages (the family prologue is shared adminPagePrologue).
-import { loadAdminUsersData, renderAdminUsersPage } from "./pages/admin-users";
+import { AdminFamilyNav, loadAdminUsersData, renderAdminUsersPage } from "./pages/admin-users";
+import { OrgSettingsNavbar, UserSettingsNavbar } from "./components/settings-nav";
 import { loadAdminOrgsData, renderAdminOrgsPage } from "./pages/admin-orgs";
 import { loadAdminReposData, renderAdminReposPage } from "./pages/admin-repos";
 // The tick-18 packages arm (pages/admin-packages.tsx — upstream
@@ -3105,9 +3132,9 @@ export interface AdminRoute {
     // VARIABLES pages and write arms (pages/admin-actions-runners.tsx /
     // admin-actions-variables.tsx — web.go:898-902's addSettingsRunnersRoutes
     // + addSettingsVariablesRoutes + the bare group's ./actions/runners
-    // LocationRedirect). The scoped-workflows tail (web.go:903) stays
-    // unclaimed — its action_scoped_workflow_source store has no substrate
-    // (the module's documented reduction, the dead-link rule).
+    // LocationRedirect), and the store wave's SCOPED-WORKFLOWS four-route
+    // group (pages/admin-actions-scoped-workflows.tsx — web.go:903's
+    // addSettingsScopedWorkflowsRoutes behind adminReq).
     | "admin-actions-job-queue"
     | "admin-actions-redirect"
     | "admin-actions-runners"
@@ -3119,7 +3146,11 @@ export interface AdminRoute {
     | "admin-actions-variables"
     | "admin-actions-variables-new"
     | "admin-actions-variables-edit"
-    | "admin-actions-variables-delete";
+    | "admin-actions-variables-delete"
+    | "admin-actions-scoped-workflows" // GET /-/admin/actions/scoped-workflows (web.go:903)
+    | "admin-actions-scoped-workflows-add" // POST .../scoped-workflows/add
+    | "admin-actions-scoped-workflows-required" // POST .../scoped-workflows/required
+    | "admin-actions-scoped-workflows-remove"; // POST .../scoped-workflows/remove
   /** The monitor page (stats/cron/queue/stacktrace → the module's
    *  AdminMonitorPage union); absent on the dashboard family and the three
    *  listing families. */
@@ -3156,6 +3187,14 @@ export interface UserSettingsTabRoute {
     | "user-settings-actions-runners-edit"
     | "user-settings-actions-runners-update"
     | "user-settings-actions-runners-delete"
+    // The store wave's SCOPED-WORKFLOWS four-route group (pages/
+    // user-settings-actions-scoped-workflows.tsx — web.go:730's
+    // addSettingsScopedWorkflowsRoutes inside the reqSignIn
+    // /user/settings/actions group): the GET page + the three write POSTs.
+    | "user-settings-actions-scoped-workflows"
+    | "user-settings-actions-scoped-workflows-add"
+    | "user-settings-actions-scoped-workflows-required"
+    | "user-settings-actions-scoped-workflows-remove"
     | "user-settings-packages"
     | "user-settings-packages-rule-add"
     | "user-settings-packages-rule-edit"
@@ -3267,6 +3306,14 @@ export interface OrgSettingsRoute {
     | "org-actions-runners-edit" // GET+POST .../runners/{id} (page + the description update)
     | "org-actions-runners-update" // POST .../runners/{id}/update-runner
     | "org-actions-runners-delete" // POST .../runners/{id}/delete
+    // The store wave's SCOPED-WORKFLOWS four-route group (pages/
+    // org-settings-actions-scoped-workflows.tsx — web.go:1060's
+    // addSettingsScopedWorkflowsRoutes inside the org /settings subtree):
+    // the GET page + the three write POSTs.
+    | "org-actions-scoped-workflows" // GET /{org}/settings/actions/scoped-workflows
+    | "org-actions-scoped-workflows-add" // POST .../scoped-workflows/add
+    | "org-actions-scoped-workflows-required" // POST .../scoped-workflows/required
+    | "org-actions-scoped-workflows-remove" // POST .../scoped-workflows/remove
     | "org-settings-packages" // GET /{org}/settings/packages (the cleanup-rules list)
     | "org-settings-packages-rule-add" // GET+POST /{org}/settings/packages/rules/add
     | "org-settings-packages-rule-edit" // GET+POST /{org}/settings/packages/rules/{id}
@@ -3610,6 +3657,17 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       const id = numericId(tail[2]);
       return id === null ? null : { family: "user-settings-variables-delete", id };
     }
+    // The store wave's SCOPED-WORKFLOWS group (pages/user-settings-actions-
+    // scoped-workflows.tsx — web.go:730's addSettingsScopedWorkflowsRoutes
+    // inside the reqSignIn /user/settings/actions group): the bare GET page
+    // literal + the three static write tails (chi's static dispatch — no
+    // {id} combos to order around).
+    if (tail.length === 2 && tail[0] === "actions" && tail[1] === "scoped-workflows") {
+      return { family: "user-settings-actions-scoped-workflows", id: null };
+    }
+    if (tail.length === 3 && tail[0] === "actions" && tail[1] === "scoped-workflows" && (tail[2] === "add" || tail[2] === "required" || tail[2] === "remove")) {
+      return { family: `user-settings-actions-scoped-workflows-${tail[2]}`, id: null };
+    }
     if (tail.length === 1 && tail[0] === "hooks") return { family: "user-settings-hooks", id: null };
     if (tail.length === 2) {
       const id = numericId(tail[1]);
@@ -3880,10 +3938,19 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (tail.length === 2 && tail[0] === "actions" && tail[1] === "variables") {
       return { family: "admin-actions-variables" };
     }
+    // The store wave's SCOPED-WORKFLOWS group (pages/admin-actions-scoped-
+    // workflows.tsx — web.go:903's addSettingsScopedWorkflowsRoutes behind
+    // adminReq): the bare GET page literal + the three static write tails.
+    if (tail.length === 2 && tail[0] === "actions" && tail[1] === "scoped-workflows") {
+      return { family: "admin-actions-scoped-workflows" };
+    }
+    if (tail.length === 3 && tail[0] === "actions" && tail[1] === "scoped-workflows" && (tail[2] === "add" || tail[2] === "required" || tail[2] === "remove")) {
+      return { family: `admin-actions-scoped-workflows-${tail[2]}` };
+    }
     // The bare group literal (web.go:898's GET "" — misc.LocationRedirect's
     // 303 onto ./actions/runners, mounted INSIDE adminReq so the prologue
-    // gates the redirect). The scoped-workflows tail (web.go:903) stays
-    // unclaimed — no substrate (the module's documented reduction).
+    // gates the redirect). The scoped-workflows tail (web.go:903) CLAIMED
+    // above with the store wave's mount.
     if (tail.length === 1 && tail[0] === "actions") {
       return { family: "admin-actions-redirect" };
     }
@@ -4170,6 +4237,16 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     if (raw.length === 7 && raw[3] === "actions" && raw[4] === "runners" && raw[6] === "delete" && /^-?\d+$/.test(raw[5] as string)) {
       return { family: "org-actions-runners-delete", owner, id: Number.parseInt(raw[5] as string, 10) };
+    }
+    // The store wave's SCOPED-WORKFLOWS group (pages/org-settings-actions-
+    // scoped-workflows.tsx — web.go:1060's addSettingsScopedWorkflowsRoutes
+    // inside the org /settings subtree): the bare GET page literal + the
+    // three static write tails.
+    if (raw.length === 5 && raw[3] === "actions" && raw[4] === "scoped-workflows") {
+      return { family: "org-actions-scoped-workflows", owner };
+    }
+    if (raw.length === 6 && raw[3] === "actions" && raw[4] === "scoped-workflows" && (raw[5] === "add" || raw[5] === "required" || raw[5] === "remove")) {
+      return { family: `org-actions-scoped-workflows-${raw[5]}`, owner };
     }
     // The org settings PACKAGES family (pages/org-settings-packages.tsx —
     // web.go:1069-1085's cleanup-rules group; the rules/add literal claims
@@ -10344,6 +10421,229 @@ async function orgActionsRunnerDelete(c: Context<{ Bindings: Env }>, runnerId: n
 }
 
 // ---------------------------------------------------------------------------
+// The store wave's SCOPED-WORKFLOWS settings surface (pages/
+// actions-scoped-workflows.tsx is the scope-neutral core; the three frames
+// are the org/user/admin twins). Upstream's ONE shared four-route group
+// (web.go:517-523 addSettingsScopedWorkflowsRoutes) mounted at the THREE
+// scopes — USER: web.go:730 inside the reqSignIn /user/settings/actions
+// group (MustEnableActions is compile-time true at the owner scopes — the
+// runners twins' gate posture; the tab prologue's session gate); ORG:
+// web.go:1060 inside the /{org}/settings subtree (the require-owner
+// prologue); ADMIN: web.go:903 behind adminReq (the shared adminPagePrologue).
+// The GET page renders the shared body with the scope's navbar; the POSTs
+// run sameOriginGuard-first and map the appliers' outcomes (the header's
+// flash reduction: success = the bare 303 onto the scope's RedirectLink,
+// the JSONError refusals answer 400 with the locale bodies — context.go:
+// 276-278's shape, the owner-general module's convention — and "throw" is
+// the 500 shell, upstream's ServerError class). The store is the drizzle
+// port (services/actions/scoped-workflow-sources.ts) over
+// action_scoped_workflow_source; the parse reads ride the engine client
+// through the core's ScopedWorkflowFileReads seam.
+// ---------------------------------------------------------------------------
+
+/** The engine reads the core's parse assembly consumes (the repo-actions-
+ *  workflow module's WorkflowFileReads precedent): engineReads over the
+ *  source view's `owner/slug` pair — the FIRST "/" is the exact split
+ *  (owner namespaces and repo slugs never carry one). listTree/readBlob are
+ *  the engine's null-on-failure RPC twins; the richer result shapes (oid,
+ *  mode) absorb into the seam's field-wise interface structurally. */
+function scopedWorkflowEngineReads(env: Env, repo: ScopedWorkflowSourceRepoView): ScopedWorkflowFileReads {
+  const at = repo.fullName.indexOf("/");
+  const reads = engineReads(env, { ownerNamespace: repo.fullName.slice(0, at), slug: repo.fullName.slice(at + 1) });
+  return {
+    listTree: (ref, path) => reads.listTree(ref, path),
+    readBlob: (ref, path) => reads.readBlob(ref, path),
+  };
+}
+
+/** The POST arms' shared outcome mapping (the section header's flash
+ *  reduction). The navbars are constructed by DIRECT component invocation
+ *  (this module stays pure TS): hono's JSXFunctionNode defers function
+ *  components to render, and the three navbar components are pure functions
+ *  of their props (the settings-nav header's contract), so a direct call is
+ *  byte-identical to a JSX invocation. */
+async function respondScopedWorkflowOutcome(
+  env: Env,
+  request: Request,
+  respond: (r: Response, status?: number) => Response,
+  scope: ScopedWorkflowsScope,
+  outcome: ScopedWorkflowAddOutcome | ScopedWorkflowRequiredOutcome | ScopedWorkflowRemoveOutcome,
+): Promise<Response> {
+  if (outcome.outcome === "added" || outcome.outcome === "saved" || outcome.outcome === "removed") {
+    return respond(new Response(null, { status: 303, headers: { location: scopedWorkflowsScopeContext(scope).redirectLink } }));
+  }
+  const jsonError = (body: { errorMessage: string; renderFormat: string }): Response =>
+    respond(new Response(JSON.stringify(body), { status: 400, headers: { "content-type": "application/json;charset=utf-8" } }));
+  if (outcome.outcome === "source-not-found") return jsonError(SCOPED_WORKFLOWS_SOURCE_NOT_FOUND_ERROR);
+  if (outcome.outcome === "patterns-empty") return jsonError(SCOPED_WORKFLOWS_PATTERNS_EMPTY_ERROR);
+  return renderServerErrorShellResponse(env, request); // "throw" — the ServerError class
+}
+
+// --- the USER scope (web.go:730) ---------------------------------------------
+
+/** GET /user/settings/actions/scoped-workflows — the shared ScopedWorkflows
+ *  arm at the USER scope (the doer is the owner, getScopedWorkflowsCtx's
+ *  user arm, scoped_workflows.go:60-66). */
+async function userScopedWorkflowsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const data = await loadUserScopedWorkflowsPageData(scopedWorkflowSourcesStore(c.env.DB), c.env.DB, (repo) => scopedWorkflowEngineReads(c.env, repo), p.viewer.id);
+  return p.respond(c.html(renderUserScopedWorkflowsPage(p.ctx, data, UserSettingsNavbar({ active: "actions-scoped-workflows" })), 200));
+}
+
+/** POST .../add (ScopedWorkflowAdd, scoped_workflows.go:245-280 — the OWNER
+ *  scopes resolve WITHIN the doer, :266-268's GetRepositoryByName). */
+async function userScopedWorkflowsAdd(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const scope: ScopedWorkflowsScope = { kind: "user", ownerId: p.viewer.id };
+  const outcome = await applyScopedWorkflowAdd(scopedWorkflowSourcesStore(c.env.DB), c.env.DB, scope, parseScopedWorkflowAddForm(await readUrlEncodedForm(c.req.raw)));
+  return respondScopedWorkflowOutcome(c.env, c.req.raw, p.respond, scope, outcome);
+}
+
+/** POST .../required (ScopedWorkflowSetRequired, scoped_workflows.go:282-349
+ *  — the parse arms ride the engine reads, :310-320). */
+async function userScopedWorkflowsRequired(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const scope: ScopedWorkflowsScope = { kind: "user", ownerId: p.viewer.id };
+  const outcome = await applyScopedWorkflowRequired(
+    scopedWorkflowSourcesStore(c.env.DB),
+    c.env.DB,
+    (repo) => scopedWorkflowEngineReads(c.env, repo),
+    scope,
+    parseScopedWorkflowRequiredForm(await readUrlEncodedForm(c.req.raw)),
+  );
+  return respondScopedWorkflowOutcome(c.env, c.req.raw, p.respond, scope, outcome);
+}
+
+/** POST .../remove (ScopedWorkflowRemove, scoped_workflows.go:351-368 — the
+ *  unconditional success, no not-found arm). */
+async function userScopedWorkflowsRemove(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const scope: ScopedWorkflowsScope = { kind: "user", ownerId: p.viewer.id };
+  const outcome = await applyScopedWorkflowRemove(scopedWorkflowSourcesStore(c.env.DB), scope, parseScopedWorkflowRemoveForm(await readUrlEncodedForm(c.req.raw)));
+  return respondScopedWorkflowOutcome(c.env, c.req.raw, p.respond, scope, outcome);
+}
+
+// --- the ORG scope (web.go:1060, the require-owner prologue) -------------------
+
+/** GET /{org}/settings/actions/scoped-workflows — the shared arm at the ORG
+ *  scope (the org is the owner, getScopedWorkflowsCtx's org arm,
+ *  scoped_workflows.go:50-56). */
+async function orgScopedWorkflowsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-actions-scoped-workflows") return respond(await c.notFound()); // drift guard
+  const data = await loadOrgScopedWorkflowsPageData(scopedWorkflowSourcesStore(c.env.DB), c.env.DB, (repo) => scopedWorkflowEngineReads(c.env, repo), org);
+  return respond(
+    c.html(renderOrgScopedWorkflowsPage(ctx, data, org, OrgSettingsNavbar({ orgLink: `/${org.username}`, active: "actions-scoped-workflows" })), 200),
+  );
+}
+
+/** POST .../add (ScopedWorkflowAdd at the org scope — the resolution is the
+ *  org-pinned lens, :266-268). */
+async function orgScopedWorkflowsAdd(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { org, respond } = resolved;
+  if (resolved.route.family !== "org-actions-scoped-workflows-add") return respond(await c.notFound()); // drift guard
+  const scope: ScopedWorkflowsScope = { kind: "org", ownerId: org.id, orgLink: `/${org.username}` };
+  const outcome = await applyScopedWorkflowAdd(scopedWorkflowSourcesStore(c.env.DB), c.env.DB, scope, parseScopedWorkflowAddForm(await readUrlEncodedForm(c.req.raw)));
+  return respondScopedWorkflowOutcome(c.env, c.req.raw, respond, scope, outcome);
+}
+
+/** POST .../required (ScopedWorkflowSetRequired at the org scope). */
+async function orgScopedWorkflowsRequired(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { org, respond } = resolved;
+  if (resolved.route.family !== "org-actions-scoped-workflows-required") return respond(await c.notFound()); // drift guard
+  const scope: ScopedWorkflowsScope = { kind: "org", ownerId: org.id, orgLink: `/${org.username}` };
+  const outcome = await applyScopedWorkflowRequired(
+    scopedWorkflowSourcesStore(c.env.DB),
+    c.env.DB,
+    (repo) => scopedWorkflowEngineReads(c.env, repo),
+    scope,
+    parseScopedWorkflowRequiredForm(await readUrlEncodedForm(c.req.raw)),
+  );
+  return respondScopedWorkflowOutcome(c.env, c.req.raw, respond, scope, outcome);
+}
+
+/** POST .../remove (ScopedWorkflowRemove at the org scope). */
+async function orgScopedWorkflowsRemove(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { org, respond } = resolved;
+  if (resolved.route.family !== "org-actions-scoped-workflows-remove") return respond(await c.notFound()); // drift guard
+  const scope: ScopedWorkflowsScope = { kind: "org", ownerId: org.id, orgLink: `/${org.username}` };
+  const outcome = await applyScopedWorkflowRemove(scopedWorkflowSourcesStore(c.env.DB), scope, parseScopedWorkflowRemoveForm(await readUrlEncodedForm(c.req.raw)));
+  return respondScopedWorkflowOutcome(c.env, c.req.raw, respond, scope, outcome);
+}
+
+// --- the ADMIN scope (web.go:903, adminReq) ------------------------------------
+
+/** GET /-/admin/actions/scoped-workflows — the shared arm at the INSTANCE
+ *  scope (OwnerID 0, getScopedWorkflowsCtx's admin arm,
+ *  scoped_workflows.go:69-77). */
+async function adminScopedWorkflowsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminScopedWorkflowsPageData(scopedWorkflowSourcesStore(c.env.DB), c.env.DB, (repo) => scopedWorkflowEngineReads(c.env, repo));
+  return p.respond(
+    c.html(renderAdminScopedWorkflowsPage(p.ctx, data, AdminFamilyNav({ active: "actions-scoped-workflows", packagesEnabled: p.ctx.packagesEnabled !== false })), 200),
+  );
+}
+
+/** POST .../add (ScopedWorkflowAdd's GLOBAL scope — the `owner/name` form
+ *  spelling resolves ANY repo on the instance, :257-264's strings.Cut). */
+async function adminScopedWorkflowsAdd(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const scope: ScopedWorkflowsScope = { kind: "admin" };
+  const outcome = await applyScopedWorkflowAdd(scopedWorkflowSourcesStore(c.env.DB), c.env.DB, scope, parseScopedWorkflowAddForm(await readUrlEncodedForm(c.req.raw)));
+  return respondScopedWorkflowOutcome(c.env, c.req.raw, p.respond, scope, outcome);
+}
+
+/** POST .../required (ScopedWorkflowSetRequired at the instance scope). */
+async function adminScopedWorkflowsRequired(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const scope: ScopedWorkflowsScope = { kind: "admin" };
+  const outcome = await applyScopedWorkflowRequired(
+    scopedWorkflowSourcesStore(c.env.DB),
+    c.env.DB,
+    (repo) => scopedWorkflowEngineReads(c.env, repo),
+    scope,
+    parseScopedWorkflowRequiredForm(await readUrlEncodedForm(c.req.raw)),
+  );
+  return respondScopedWorkflowOutcome(c.env, c.req.raw, p.respond, scope, outcome);
+}
+
+/** POST .../remove (ScopedWorkflowRemove at the instance scope). */
+async function adminScopedWorkflowsRemove(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const scope: ScopedWorkflowsScope = { kind: "admin" };
+  const outcome = await applyScopedWorkflowRemove(scopedWorkflowSourcesStore(c.env.DB), scope, parseScopedWorkflowRemoveForm(await readUrlEncodedForm(c.req.raw)));
+  return respondScopedWorkflowOutcome(c.env, c.req.raw, p.respond, scope, outcome);
+}
+
+// ---------------------------------------------------------------------------
 // The census R20 (a) arm: the org settings applications tab (pages/
 // org-settings-applications.tsx — upstream web.go:1027-1037's /applications
 // group; the org-OWNED oauth2 applications over the landed service's
@@ -14773,6 +15073,17 @@ uiRouter.get("/user/settings/actions/variables", (c) => userSettingsVariablesPag
 uiRouter.post("/user/settings/actions/variables/new", (c) => userSettingsVariablesNew(c));
 uiRouter.post("/user/settings/actions/variables/:id/edit", (c) => userSettingsVariablesEdit(c, Number(c.req.param("id"))));
 uiRouter.post("/user/settings/actions/variables/:id/delete", (c) => userSettingsVariablesDelete(c, Number(c.req.param("id"))));
+// The store wave's SCOPED-WORKFLOWS group (parseUiRoute claims exactly these
+// shapes — web.go:730's addSettingsScopedWorkflowsRoutes in the user
+// /settings/actions group; the static write tails need no {id} ordering, and
+// the POST-only shapes' GET twins answer chi's 405).
+uiRouter.get("/user/settings/actions/scoped-workflows", (c) => userScopedWorkflowsPage(c));
+uiRouter.post("/user/settings/actions/scoped-workflows/add", (c) => userScopedWorkflowsAdd(c));
+uiRouter.get("/user/settings/actions/scoped-workflows/add", () => methodNotAllowed("POST"));
+uiRouter.post("/user/settings/actions/scoped-workflows/required", (c) => userScopedWorkflowsRequired(c));
+uiRouter.get("/user/settings/actions/scoped-workflows/required", () => methodNotAllowed("POST"));
+uiRouter.post("/user/settings/actions/scoped-workflows/remove", (c) => userScopedWorkflowsRemove(c));
+uiRouter.get("/user/settings/actions/scoped-workflows/remove", () => methodNotAllowed("POST"));
 uiRouter.get("/user/settings/hooks", (c) => userSettingsHooksPage(c));
 uiRouter.post("/user/settings/hooks", (c) => userSettingsHooksCreate(c));
 uiRouter.get("/user/settings/hooks/:id", (c) => userHookDetailPage(c, Number(c.req.param("id"))));
@@ -14903,6 +15214,17 @@ uiRouter.get("/:owner/settings/actions/runners/:id/update-runner", () => methodN
 uiRouter.post("/:owner/settings/actions/runners/:id/update-runner", (c) => orgActionsRunnerUpdate(c, Number(c.req.param("id"))));
 uiRouter.get("/:owner/settings/actions/runners/:id/delete", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/settings/actions/runners/:id/delete", (c) => orgActionsRunnerDelete(c, Number(c.req.param("id"))));
+// The store wave's SCOPED-WORKFLOWS group (parseUiRoute claims exactly these
+// shapes — web.go:1060's addSettingsScopedWorkflowsRoutes inside the org
+// /settings subtree, the require-owner prologue as the gate; the static
+// write tails need no {id} ordering, and the GET twins answer chi's 405).
+uiRouter.get("/:owner/settings/actions/scoped-workflows", (c) => orgScopedWorkflowsPage(c));
+uiRouter.post("/:owner/settings/actions/scoped-workflows/add", (c) => orgScopedWorkflowsAdd(c));
+uiRouter.get("/:owner/settings/actions/scoped-workflows/add", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/settings/actions/scoped-workflows/required", (c) => orgScopedWorkflowsRequired(c));
+uiRouter.get("/:owner/settings/actions/scoped-workflows/required", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/settings/actions/scoped-workflows/remove", (c) => orgScopedWorkflowsRemove(c));
+uiRouter.get("/:owner/settings/actions/scoped-workflows/remove", () => methodNotAllowed("POST"));
 // The census R20 (a) arm: the applications tab (parseUiRoute claims exactly
 // these shapes — web.go:1027-1037's /applications group: the bare list GET,
 // the create POST, the {id}/delete write). No earlier registration can
@@ -14999,6 +15321,17 @@ uiRouter.post("/-/admin/actions/variables/:id{(\\d+)}/edit", (c) => adminActions
 uiRouter.get("/-/admin/actions/variables/:id{(\\d+)}/edit", () => methodNotAllowed("POST"));
 uiRouter.post("/-/admin/actions/variables/:id{(\\d+)}/delete", (c) => adminActionsVariableDelete(c, Number.parseInt(c.req.param("id") ?? "0", 10)));
 uiRouter.get("/-/admin/actions/variables/:id{(\\d+)}/delete", () => methodNotAllowed("POST"));
+// The store wave's SCOPED-WORKFLOWS group (parseUiRoute claims exactly these
+// shapes — web.go:903's addSettingsScopedWorkflowsRoutes behind adminReq;
+// the POSTs run sameOriginGuard-first, the family convention, and the GET
+// twins answer chi's 405).
+uiRouter.get("/-/admin/actions/scoped-workflows", (c) => adminScopedWorkflowsPage(c));
+uiRouter.post("/-/admin/actions/scoped-workflows/add", (c) => adminScopedWorkflowsAdd(c));
+uiRouter.get("/-/admin/actions/scoped-workflows/add", () => methodNotAllowed("POST"));
+uiRouter.post("/-/admin/actions/scoped-workflows/required", (c) => adminScopedWorkflowsRequired(c));
+uiRouter.get("/-/admin/actions/scoped-workflows/required", () => methodNotAllowed("POST"));
+uiRouter.post("/-/admin/actions/scoped-workflows/remove", (c) => adminScopedWorkflowsRemove(c));
+uiRouter.get("/-/admin/actions/scoped-workflows/remove", () => methodNotAllowed("POST"));
 // The POST-only shapes' GET twins answer the methodNotAllowed arm (the
 // method-blind parse convention — upstream chi's own 405 posture).
 uiRouter.get("/-/admin/emails/activate", () => methodNotAllowed("POST"));

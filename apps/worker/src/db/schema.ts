@@ -2522,6 +2522,74 @@ export const actionVariables = sqliteTable(
   ],
 );
 
+/**
+ * Scoped-workflow SOURCE registrations (mirrors `ActionScopedWorkflowSource`,
+ * gitea/models/actions/scoped_workflow.go:19-32): one row per registered
+ * source repository, either under an owner (user/org — `owner_id` carries the
+ * users.id; orgs are user rows, SPEC-0007 §3.2) or at the INSTANCE level
+ * (`owner_id` 0 — upstream's same sentinel, scoped_workflow.go:22-23). A
+ * source's workflow files under the scoped workflow directories of its
+ * default branch run on every repository the scope covers (the settings
+ * pages over this table: routers/web/shared/actions/scoped_workflows.go,
+ * mounted web.go:517-523 at the user/org/admin scopes).
+ *
+ * The per-workflow merge-gate configs ride `workflow_configs` as the JSON of
+ * upstream's `map[string]*ScopedWorkflowConfig` (scoped_workflow.go:28, the
+ * `JSON TEXT` column; the value shape is scoped_workflow.go:34-38's
+ * `{required, patterns[]}`, keyed by the workflow ENTRY NAME). cf-gitea's
+ * writers always store at least `{}` — upstream's nil-map insert (xorm JSON
+ * nil → SQL NULL) collapses to the same empty read (`{}` on decode), and a
+ * null config VALUE (upstream `*ScopedWorkflowConfig == nil`) round-trips
+ * verbatim — the settings merge's documented skip arm.
+ *
+ * ID-SPACE NOTE (the one adaptation, the owner-actions-config store's
+ * id-space twin): upstream `SourceRepoID` is int64; this deployment's
+ * repositories.id is TEXT (the SPEC-0003 uuid convention), so the column is
+ * TEXT and the handlers' `repo_id` form fields parse as strings (a junk id
+ * never matches a row — the FormInt64 junk-to-0 miss twin). The xorm INDEX
+ * on SourceRepoID (scoped_workflow.go:25) lands as the scalar repo index;
+ * the UNIQUE(owner_repo) pair (scoped_workflow.go:23-25) lands as the
+ * composite unique that also arbitrates the duplicate-add race (the
+ * AddScopedWorkflowSource re-check arm, scoped_workflow.go:162-167).
+ */
+export const actionScopedWorkflowSources = sqliteTable(
+  "action_scoped_workflow_source",
+  {
+    /** Row id (upstream `ID int64 xorm:"pk autoincr"`). */
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** users.id for org/user-scope rows; the 0 sentinel = instance-level
+     *  (upstream `OwnerID … NOT NULL DEFAULT 0`, scoped_workflow.go:23). */
+    ownerId: integer("owner_id").notNull().default(0),
+    /** TEXT repositories.id — the source repository providing the workflow
+     *  files (upstream `SourceRepoID int64 INDEX UNIQUE(owner_repo) NOT NULL
+     *  DEFAULT 0`, scoped_workflow.go:25 — the TEXT id space is the house
+     *  adaptation; the DEFAULT 0 sentinel has no TEXT twin and the writers
+     *  always provide the id). */
+    sourceRepoId: text("source_repo_id").notNull(),
+    /** JSON `Record<string, {required, patterns[]} | null>` keyed by the
+     *  workflow entry name (upstream `WorkflowConfigs map[string]*
+     *  ScopedWorkflowConfig xorm:"JSON TEXT 'workflow_configs'"`,
+     *  scoped_workflow.go:28). */
+    workflowConfigs: text("workflow_configs").notNull().default("{}"),
+    /** Row creation (upstream `CreatedUnix timeutil.TimeStamp xorm:"created"`). */
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+    /** Last configs replace (upstream `UpdatedUnix timeutil.TimeStamp
+     *  xorm:"updated"`); equals createdAt at insert (the deploy_keys
+     *  convention). */
+    updatedAt: integer("updated_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // Upstream's UNIQUE(owner_repo) (scoped_workflow.go:23-25) — the
+    // (owner, source) pair is the row's identity and the add-race
+    // arbitration point.
+    uniqueIndex("action_scoped_workflow_owner_repo_uq").on(t.ownerId, t.sourceRepoId),
+    // Upstream's xorm INDEX on SourceRepoID (scoped_workflow.go:25) — the
+    // consumer-side probes (GetEffectiveScopedWorkflowSources' SourceRepoID
+    // condition, scoped_workflow.go:66).
+    index("action_scoped_workflow_source_repo_idx").on(t.sourceRepoId),
+  ],
+);
+
 // ---------------------------------------------------------------------------
 // SPEC-0004 appendix A — user blocks (inventory batch 9, wave-api-blocks).
 // ---------------------------------------------------------------------------

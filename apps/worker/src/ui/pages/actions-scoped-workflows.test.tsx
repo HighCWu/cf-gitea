@@ -12,16 +12,26 @@
  * in-memory store fake + the REAL local D1 for the repo lookups (the org
  * general module's mixed harness).
  *
- * The route-level matrix (the prologue gates, the parse claims, the POST
- * registrations) lands WITH THE MOUNT — the routes stay the honest 404s
- * until the store HANDOFF lands (the core header); index.ts is a shared
- * file this suite does not edit.
+ * The store wave appended the two HANDOFF-tail suites: the REAL drizzle
+ * store's integration arms (services/actions/scoped-workflow-sources.ts —
+ * the appliers' semantics re-pinned over the actual
+ * action_scoped_workflow_source table) and the route-level matrix (the
+ * prologue gates, the POST registrations and the navbar folds, driven
+ * through the mounted uiRouter on the minted-session pattern — the
+ * org-settings-actions module's harness; the parse claims live in
+ * index.test.ts's pure table).
  */
 
-import { env } from "cloudflare:test";
+import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
+import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
+import { seedVerifiedUser } from "../../auth/testing/seeds";
+import { orgMembers, users } from "../../db/schema";
+import { scopedWorkflowSourcesStore } from "../../services/actions/scoped-workflow-sources";
+import { uiRouter, type UiAssetsFetcher } from "../index";
 import type { UiManifest } from "../manifest";
+import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { Viewer } from "../viewer";
 import {
@@ -166,7 +176,9 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  for (const table of ["repositories", "users"]) {
+  // The source table rides the wipe too (the store wave's table; users
+  // cascades sessions + org_members for the minted-session arms).
+  for (const table of ["action_scoped_workflow_source", "repositories", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   await env.DB.prepare(
@@ -743,5 +755,309 @@ describe("the three frames (the switchyard layouts)", () => {
     expect(html).toContain('action="/-/admin/actions/scoped-workflows/add"');
     expect(html).toContain('data-full-name="true"'); // :145 — the instance scope submits owner/name
     expect(html).not.toContain('data-exclusive="true"');
+  });
+});
+
+// --- the REAL drizzle store (the store wave's integration arms) -----------------
+//
+// The page-fake suites above pin the appliers' SEMANTICS over the in-memory
+// store; these arms re-pin the same appliers over the REAL drizzle store
+// (services/actions/scoped-workflow-sources.ts — the actual
+// action_scoped_workflow_source table through migration 0051), so the seam
+// contract (the five ops' shapes, the JSON round-trip, the duplicate no-op)
+// is exercised end-to-end through the page's own entry points.
+
+describe("the drizzle source store through the page arms (the store wave's integration)", () => {
+  it("rides add → GET → required → remove over the REAL table (the full round-trip)", async () => {
+    const store = scopedWorkflowSourcesStore(env.DB);
+    const reads = treeReads({ ".gitea/scoped_workflows/deploy.yml": DEPLOY_WF });
+    const scope = { kind: "org", ownerId: ORG_ID, orgLink: "/coalition" } as const;
+
+    // The add resolves within the owner and registers through the real table.
+    expect(await applyScopedWorkflowAdd(store, env.DB, scope, { repoName: "demo" })).toEqual({ outcome: "added" });
+
+    // The GET assembly lists the source with the fresh row's empty configs.
+    const fresh = await loadScopedWorkflowsPageData(store, env.DB, () => reads, scope);
+    expect(fresh.sources).toHaveLength(1);
+    expect(fresh.sources[0]?.repo.id).toBe("repo-1");
+    expect(fresh.sources[0]?.infos[0]?.required).toBe(false);
+
+    // SetRequired persists the configs through the real JSON column — and
+    // the GET assembly merges them back into the rendered row.
+    expect(
+      await applyScopedWorkflowRequired(store, env.DB, () => reads, scope, {
+        repoId: "repo-1",
+        workflowIds: [".gitea/scoped_workflows/deploy.yml"],
+        requiredWorkflowIds: [".gitea/scoped_workflows/deploy.yml"],
+        patternsByWorkflowId: { ".gitea/scoped_workflows/deploy.yml": "coalition/demo: Deploy / build (push)" },
+      }),
+    ).toEqual({ outcome: "saved" });
+    expect((await store.getSource(ORG_ID, "repo-1"))?.workflowConfigs).toEqual({
+      ".gitea/scoped_workflows/deploy.yml": { required: true, patterns: ["coalition/demo: Deploy / build (push)"] },
+    });
+    const saved = await loadScopedWorkflowsPageData(store, env.DB, () => reads, scope);
+    expect(saved.sources[0]?.infos[0]?.required).toBe(true);
+    expect(saved.sources[0]?.infos[0]?.patterns).toBe("coalition/demo: Deploy / build (push)");
+
+    // A duplicate add is the store's no-op (the real uq in place).
+    expect(await applyScopedWorkflowAdd(store, env.DB, scope, { repoName: "DEMO" })).toEqual({ outcome: "added" });
+    expect(await store.listSourcesByOwner(ORG_ID)).toHaveLength(1);
+
+    // The remove takes the row out through the real delete.
+    expect(await applyScopedWorkflowRemove(store, scope, { repoId: "repo-1" })).toEqual({ outcome: "removed" });
+    expect(await store.listSourcesByOwner(ORG_ID)).toEqual([]);
+  });
+
+  it("registers the INSTANCE scope through the real store (the admin arm's owner_id 0 rows)", async () => {
+    const store = scopedWorkflowSourcesStore(env.DB);
+    expect(await applyScopedWorkflowAdd(store, env.DB, { kind: "admin" }, { repoName: "coalition/demo" })).toEqual({ outcome: "added" });
+    expect((await store.listSourcesByOwner(0)).map((r) => r.sourceRepoId)).toEqual(["repo-1"]);
+    const data = await loadScopedWorkflowsPageData(store, env.DB, () => treeReads({}), { kind: "admin" });
+    expect(data.ownerId).toBe(0);
+    expect(data.redirectLink).toBe("/-/admin/actions/scoped-workflows");
+    expect(data.sources[0]?.repo.fullName).toBe("coalition/demo");
+  });
+});
+
+// --- the mounted routes (the store wave's minted-session route-level matrix) ----
+
+type RouteEnv = Omit<Env, "ASSETS"> & { ASSETS?: UiAssetsFetcher };
+
+const routeEnv: RouteEnv = {
+  ...env,
+  ASSETS: { fetch: () => Promise.resolve(new Response(JSON.stringify(manifest), { status: 200 })) },
+};
+
+/** The real production path: parse → resolveUiSession → the scope gate →
+ *  load → render, on the mounted uiRouter with the synthetic manifest; the
+ *  execution context is awaited so waitUntil side-effects settle. */
+async function fetchRoute(path: string, init?: RequestInit): Promise<Response> {
+  const context = createExecutionContext();
+  const response = await uiRouter.fetch(new Request(`https://test.local${path}`, init), routeEnv, context);
+  await waitOnExecutionContext(context);
+  return response;
+}
+
+/** A minted session cookie header (per request — the users wipe cascades
+ *  the sessions table; the value is never rendered). */
+async function routeCookie(userId: number): Promise<string> {
+  return `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, userId)}`;
+}
+
+/** A GET through the mount (`userId: null` is the anonymous arm). */
+async function getRoute(path: string, userId: number | null): Promise<Response> {
+  return fetchRoute(path, { headers: userId === null ? {} : { cookie: await routeCookie(userId) } });
+}
+
+/** A urlencoded POST through the mount (same-origin by default — the
+ *  sameOriginGuard's happy path). */
+async function postRoute(path: string, userId: number, fields: Record<string, string>, origin = ORIGIN): Promise<Response> {
+  return fetchRoute(path, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      origin,
+      cookie: await routeCookie(userId),
+    },
+    body: new URLSearchParams(fields).toString(),
+  });
+}
+
+/** The route world's DOER (the file-level beforeEach's otherowner row,
+ *  id 2 — the module-level USER_ID const is the render fixture's id and has
+ *  no D1 row): the doer owns repo-f, and this stage makes it the coalition
+ *  OWNER (the org arms' gate), seeds a plain member (bob) and a site admin
+ *  (root) for the gate matrix. */
+const DOER_ID = 2;
+
+/** The route world: the file-level beforeEach seeded coalition (org 7) +
+ *  otherowner (user 2) and the two repos; this stage makes otherowner the
+ *  coalition OWNER (the org arms' gate) and seeds a plain member (bob) and
+ *  a site admin (root) for the gate matrix. */
+interface RouteWorld {
+  bobId: number;
+  rootId: number;
+}
+
+describe("the mounted scoped-workflows routes (the store wave's route-level matrix)", () => {
+  let world: RouteWorld;
+
+  beforeEach(async () => {
+    // The file-level beforeEach has wiped users (cascading sessions +
+    // org_members) and re-seeded ids 7/2; this stage seeds the gate rows.
+    await drizzle(env.DB).insert(orgMembers).values({ orgId: ORG_ID, userId: DOER_ID, role: "owner", createdAt: new Date() }).run();
+    const [bob] = await drizzle(env.DB)
+      .insert(users)
+      .values({ username: "bob", usernameLower: "bob", status: "active", createdAt: new Date() })
+      .returning()
+      .all();
+    const root = await seedVerifiedUser({ username: "root", isAdmin: true });
+    if (bob === undefined) throw new Error("route world seed failed");
+    world = { bobId: bob.id, rootId: root.id };
+  });
+
+  it("the parse claims the four-route group at all three scopes (the static tails, chi's dispatch)", async () => {
+    // Handled at the handler level below; the pure-table pins live in
+    // index.test.ts — here only the CLAIMED-ness of the POST tails pins.
+    for (const path of [
+      "/user/settings/actions/scoped-workflows/add",
+      "/coalition/settings/actions/scoped-workflows/required",
+      "/-/admin/actions/scoped-workflows/remove",
+    ]) {
+      const res = await fetchRoute(path, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", origin: ORIGIN }, body: "" });
+      // Not the router's plain 404: the family claimed and the prologue
+      // answered (anonymous → the login 303; the guard/auth ladder).
+      expect(res.status, path).not.toBe(404);
+    }
+  });
+
+  // -- the USER scope (web.go:730 — the tab prologue's session gate) --------
+
+  it("user: 303s an anonymous GET onto the login round-trip", async () => {
+    const res = await getRoute("/user/settings/actions/scoped-workflows", null);
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent("/user/settings/actions/scoped-workflows")}`,
+    );
+  });
+
+  it("user: the doer's page renders with the shared navbar's sub-item ACTIVE, and the add POST round-trips", async () => {
+    const page = await getRoute("/user/settings/actions/scoped-workflows", DOER_ID);
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).toContain('class="page-content user settings actions"');
+    expect(html).toContain("<title>Scoped Workflows - cf-gitea</title>");
+    expect(html).toContain('class="active item" href="/user/settings/actions/scoped-workflows"'); // the fold
+    expect(html).toContain('action="/user/settings/actions/scoped-workflows/add"');
+
+    // The add POST (otherowner owns repo-f "theirs") 303s onto the page and
+    // the row lands in the real table under the doer's owner id.
+    const added = await postRoute("/user/settings/actions/scoped-workflows/add", DOER_ID, { repo_name: "theirs" });
+    expect(added.status).toBe(303);
+    expect(added.headers.get("location")).toBe("/user/settings/actions/scoped-workflows");
+    const store = scopedWorkflowSourcesStore(env.DB);
+    expect((await store.listSourcesByOwner(DOER_ID)).map((r) => r.sourceRepoId)).toEqual(["repo-f"]);
+
+    // The follow-up GET renders the source's remove form.
+    const withSource = await getRoute("/user/settings/actions/scoped-workflows", DOER_ID);
+    expect(withSource.status).toBe(200);
+    expect(await withSource.text()).toContain('action="/user/settings/actions/scoped-workflows/remove"');
+  });
+
+  it("user: the add miss answers the JSONError 400 body; the guard-first cross-origin POST answers 403", async () => {
+    const miss = await postRoute("/user/settings/actions/scoped-workflows/add", DOER_ID, { repo_name: "demo" }); // coalition's repo — outside the doer's lens
+    expect(miss.status).toBe(400);
+    expect(await miss.text()).toBe(JSON.stringify(SCOPED_WORKFLOWS_SOURCE_NOT_FOUND_ERROR));
+
+    const cross = await fetchRoute("/user/settings/actions/scoped-workflows/add", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://evil.example", cookie: await routeCookie(DOER_ID) },
+      body: new URLSearchParams({ repo_name: "theirs" }).toString(),
+    });
+    expect(cross.status).toBe(403);
+    expect((await scopedWorkflowSourcesStore(env.DB).listSourcesByOwner(DOER_ID))).toHaveLength(0); // nothing written
+  });
+
+  it("user: the required arm persists through the mount and the patterns-empty refusal answers 400", async () => {
+    const store = scopedWorkflowSourcesStore(env.DB);
+    await store.addSource(DOER_ID, "repo-f");
+
+    const saved = await postRoute("/user/settings/actions/scoped-workflows/required", DOER_ID, {
+      repo_id: "repo-f",
+      // The engine cell is empty for this fixture, so the live set is empty
+      // and every submitted row is an orphan — an UNCHECKED orphan drops,
+      // an empty submission saves the empty map.
+      workflow_ids: ".gitea/scoped_workflows/deploy.yml",
+      "required_patterns[.gitea/scoped_workflows/deploy.yml]": "p",
+    });
+    expect(saved.status).toBe(303);
+    expect(saved.headers.get("location")).toBe("/user/settings/actions/scoped-workflows");
+    expect((await store.getSource(DOER_ID, "repo-f"))?.workflowConfigs).toEqual({});
+
+    const refused = await postRoute("/user/settings/actions/scoped-workflows/required", DOER_ID, {
+      repo_id: "repo-f",
+      workflow_ids: "x.yml",
+      required_workflow_ids: "x.yml",
+      "required_patterns[x.yml]": "   ",
+    });
+    expect(refused.status).toBe(400);
+    expect(await refused.text()).toBe(JSON.stringify(SCOPED_WORKFLOWS_PATTERNS_EMPTY_ERROR));
+  });
+
+  it("user: the remove POST takes the registration out (the silent success after)", async () => {
+    const store = scopedWorkflowSourcesStore(env.DB);
+    await store.addSource(DOER_ID, "repo-f");
+    const removed = await postRoute("/user/settings/actions/scoped-workflows/remove", DOER_ID, { repo_id: "repo-f" });
+    expect(removed.status).toBe(303);
+    expect(removed.headers.get("location")).toBe("/user/settings/actions/scoped-workflows");
+    expect(await store.listSourcesByOwner(DOER_ID)).toEqual([]);
+    const again = await postRoute("/user/settings/actions/scoped-workflows/remove", DOER_ID, { repo_id: "repo-f" });
+    expect(again.status).toBe(303); // the zero-row arm answers success identically
+  });
+
+  // -- the ORG scope (web.go:1060 — the require-owner prologue) ---------------
+
+  it("org: 303s an anonymous GET, 404-shells a plain member, and serves the owner", async () => {
+    const anon = await getRoute("/coalition/settings/actions/scoped-workflows", null);
+    expect(anon.status).toBe(303);
+    expect(anon.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent("/coalition/settings/actions/scoped-workflows")}`,
+    );
+
+    const member = await getRoute("/coalition/settings/actions/scoped-workflows", world.bobId);
+    expect(member.status).toBe(404);
+
+    const owner = await getRoute("/coalition/settings/actions/scoped-workflows", DOER_ID);
+    expect(owner.status).toBe(200);
+    const html = await owner.text();
+    expect(html).toContain('class="page-content organization settings actions"');
+    expect(html).toContain('class="active item" href="/coalition/settings/actions/scoped-workflows"'); // the org fold
+    expect(html).toContain('action="/coalition/settings/actions/scoped-workflows/add"');
+  });
+
+  it("org: the owner's add POST registers under the org's owner id and the remove takes it out", async () => {
+    const store = scopedWorkflowSourcesStore(env.DB);
+    const added = await postRoute("/coalition/settings/actions/scoped-workflows/add", DOER_ID, { repo_name: "DEMO" });
+    expect(added.status).toBe(303);
+    expect(added.headers.get("location")).toBe("/coalition/settings/actions/scoped-workflows");
+    expect((await store.listSourcesByOwner(ORG_ID)).map((r) => r.sourceRepoId)).toEqual(["repo-1"]); // the ORG id, case-folded add
+
+    const removed = await postRoute("/coalition/settings/actions/scoped-workflows/remove", DOER_ID, { repo_id: "repo-1" });
+    expect(removed.status).toBe(303);
+    expect(await store.listSourcesByOwner(ORG_ID)).toEqual([]);
+  });
+
+  // -- the ADMIN scope (web.go:903 — adminReq) ---------------------------------
+
+  it("admin: 303s an anonymous GET, 404-shells a non-admin, and serves the site admin with the instance search flag", async () => {
+    const anon = await getRoute("/-/admin/actions/scoped-workflows", null);
+    expect(anon.status).toBe(303);
+
+    const nonAdmin = await getRoute("/-/admin/actions/scoped-workflows", DOER_ID);
+    expect(nonAdmin.status).toBe(404);
+
+    const admin = await getRoute("/-/admin/actions/scoped-workflows", world.rootId);
+    expect(admin.status).toBe(200);
+    const html = await admin.text();
+    expect(html).toContain('class="page-content admin actions"');
+    expect(html).toContain('class="active item" href="/-/admin/actions/scoped-workflows"'); // the admin fold
+    expect(html).toContain('data-full-name="true"'); // the instance scope's search spelling
+    expect(html).toContain('action="/-/admin/actions/scoped-workflows/add"');
+  });
+
+  it("admin: the owner/name add registers an owner_id 0 row and the remove takes it out", async () => {
+    const store = scopedWorkflowSourcesStore(env.DB);
+    const added = await postRoute("/-/admin/actions/scoped-workflows/add", world.rootId, { repo_name: "coalition/demo" });
+    expect(added.status).toBe(303);
+    expect(added.headers.get("location")).toBe("/-/admin/actions/scoped-workflows");
+    expect((await store.listSourcesByOwner(0)).map((r) => r.sourceRepoId)).toEqual(["repo-1"]); // the instance sentinel
+
+    const miss = await postRoute("/-/admin/actions/scoped-workflows/add", world.rootId, { repo_name: "no-slash" });
+    expect(miss.status).toBe(400); // the strings.Cut not-found arm
+    expect(await miss.text()).toBe(JSON.stringify(SCOPED_WORKFLOWS_SOURCE_NOT_FOUND_ERROR));
+
+    const removed = await postRoute("/-/admin/actions/scoped-workflows/remove", world.rootId, { repo_id: "repo-1" });
+    expect(removed.status).toBe(303);
+    expect(await store.listSourcesByOwner(0)).toEqual([]);
   });
 });

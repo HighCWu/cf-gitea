@@ -190,8 +190,8 @@ describe("OrgActionsGeneralPage (org/settings/actions_general.tmpl + shared/acti
     expect(html).toContain(`href="${ORG_LINK}/settings/actions/runners"`);
     expect(html).toContain(`href="${ORG_LINK}/settings/actions/secrets"`);
     expect(html).toContain(`href="${ORG_LINK}/settings/actions/variables"`);
-    // Scoped-workflows stays the dead sub-item (P1-3's substrate).
-    expect(html).not.toContain("scoped-workflows");
+    // Scoped-workflows RENDERED with the store wave's mount (navbar.tmpl:44-45).
+    expect(html).toContain(`href="${ORG_LINK}/settings/actions/scoped-workflows"`);
   });
 
   it("renders the Cross-Repository Access section with upstream's contract (the trailing-space form class included)", () => {

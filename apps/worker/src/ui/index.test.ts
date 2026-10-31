@@ -437,6 +437,27 @@ describe("parseUiRoute", () => {
     ["/acme/settings/actions/general", { family: "org-settings-actions-general", owner: "acme" }],
     ["/user/settings/actions", { family: "user-settings-actions-redirect", id: null }],
     ["/user/settings/actions/general", { family: "user-settings-actions-general", id: null }],
+    // The store wave's SCOPED-WORKFLOWS mounts (web.go:517-523's shared
+    // four-route group at the three scopes — web.go:730 user, :1060 org,
+    // :903 admin): the GET page literals + the three static write tails.
+    ["/user/settings/actions/scoped-workflows", { family: "user-settings-actions-scoped-workflows", id: null }],
+    ["/user/settings/actions/scoped-workflows/add", { family: "user-settings-actions-scoped-workflows-add", id: null }],
+    ["/user/settings/actions/scoped-workflows/required", { family: "user-settings-actions-scoped-workflows-required", id: null }],
+    ["/user/settings/actions/scoped-workflows/remove", { family: "user-settings-actions-scoped-workflows-remove", id: null }],
+    ["/user/settings/actions/scoped-workflows/extra", null], // junk deeper tail
+    ["/acme/settings/actions/scoped-workflows", { family: "org-actions-scoped-workflows", owner: "acme" }],
+    ["/acme/settings/actions/scoped-workflows/add", { family: "org-actions-scoped-workflows-add", owner: "acme" }],
+    ["/acme/settings/actions/scoped-workflows/required", { family: "org-actions-scoped-workflows-required", owner: "acme" }],
+    ["/acme/settings/actions/scoped-workflows/remove", { family: "org-actions-scoped-workflows-remove", owner: "acme" }],
+    ["/acme/settings/actions/scoped-workflows/extra", null],
+    ["/-/admin/actions/scoped-workflows", { family: "admin-actions-scoped-workflows" }],
+    ["/-/admin/actions/scoped-workflows/add", { family: "admin-actions-scoped-workflows-add" }],
+    ["/-/admin/actions/scoped-workflows/required", { family: "admin-actions-scoped-workflows-required" }],
+    ["/-/admin/actions/scoped-workflows/remove", { family: "admin-actions-scoped-workflows-remove" }],
+    ["/-/admin/actions/scoped-workflows/extra", null],
+    // The repo-scoped twin stays unclaimed — the repo settings actions
+    // family has no scoped-workflows tail (the engine's 404).
+    ["/alice/demo/settings/actions/scoped-workflows", null],
   ];
 
   it.each(table)("parses %s", (pathname, expected) => {
