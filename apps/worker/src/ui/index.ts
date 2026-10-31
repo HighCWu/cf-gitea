@@ -868,6 +868,20 @@ import {
   orgLabelInitializeSubmit,
   repoLabelInitializeSubmit,
 } from "./pages/issue-write-tails";
+// The issue/pull SIDEBAR write cluster (web.go:1362-1405 — census gap #1
+// part one's ten self-contained handlers).
+import {
+  issueAssigneeSubmit,
+  issueDeadlineSubmit,
+  issueLockSubmit,
+  issueMilestoneSubmit,
+  issueMovePinSubmit,
+  issuePinSubmit,
+  issueProjectsSubmit,
+  issueUnpinSubmit,
+  issueUnlockSubmit,
+  issueWatchSubmit,
+} from "./pages/issue-sidebar-writes";
 import { loadOrgHomeData, renderOrgHomePage, resolveOrgHome } from "./pages/org-home";
 // The census R06 org dashboard (web.go:982-985's /org/{org}/dashboard
 // family) — the member-only page over the landed org-feed reads.
@@ -2101,6 +2115,30 @@ export interface IssueCommentRoute {
   repo: string;
   urlKind: "issues" | "pulls";
   index: number;
+}
+
+/** The issue/pull SIDEBAR write families (pages/issue-sidebar-writes.ts —
+ *  upstream web.go:1362-1405's addIssuesPullsUpdateRoutes over BOTH URL
+ *  families): the repo-scope combo POSTs (milestone/projects/assignee/
+ *  move_pin), the {index} writes (deadline/watch/lock/unlock/pin), and the
+ *  DELETE unpin tail. */
+export interface IssueSidebarWriteRoute {
+  family:
+    | "issue-milestone"
+    | "issue-projects"
+    | "issue-assignee"
+    | "issue-move-pin"
+    | "issue-deadline"
+    | "issue-watch"
+    | "issue-lock"
+    | "issue-unlock"
+    | "issue-pin"
+    | "issue-unpin";
+  owner: string;
+  repo: string;
+  urlKind: "issues" | "pulls";
+  /** The {index} families only. */
+  index?: number;
 }
 
 /** The wave-5 label-write family (pages/issue-detail.tsx): upstream
@@ -3611,6 +3649,7 @@ export type ParsedUiRoute =
   | IssueNewRoute
   | SettingsRoute
   | IssueCommentRoute
+  | IssueSidebarWriteRoute
   | IssueLabelsRoute
   | PullFilesRoute
   | PullCommitsRoute
@@ -5049,6 +5088,12 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (rest[0] === "attachments") return { family: "issue-attachments-upload", owner, repo };
       // Wave-5: the sidebar label-write POST (upstream data-update-url).
       if (head === "issues" && rest[0] === "labels") return { family: "issue-labels", owner, repo };
+      // The sidebar combo POSTs (web.go:1398-1405 — repo-scope under BOTH
+      // families, the ids ride the form).
+      if (rest[0] === "milestone") return { family: "issue-milestone", owner, repo, urlKind: head };
+      if (rest[0] === "projects") return { family: "issue-projects", owner, repo, urlKind: head };
+      if (rest[0] === "assignee") return { family: "issue-assignee", owner, repo, urlKind: head };
+      if (rest[0] === "move_pin") return { family: "issue-move-pin", owner, repo, urlKind: head };
       // Wave-11: the review-request + dismiss POSTs (web.go:1435-1436 —
       // repo-scoped, the issue/review ids ride the form fields).
       if (head === "issues" && rest[0] === "request_review") return { family: "issue-request-review", owner, repo };
@@ -5075,6 +5120,13 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (rest.length === 2 && /^-?\d+$/.test(rest[0] as string)) {
       const index = Number.parseInt(rest[0] as string, 10);
       if (rest[1] === "comments") return { family: "issue-comment", owner, repo, urlKind: head, index };
+      // The {index} sidebar writes (web.go:1367-1389 — deadline/watch/lock/
+      // unlock/pin; POST-only under BOTH families).
+      if (rest[1] === "deadline") return { family: "issue-deadline", owner, repo, urlKind: head, index };
+      if (rest[1] === "watch") return { family: "issue-watch", owner, repo, urlKind: head, index };
+      if (rest[1] === "lock") return { family: "issue-lock", owner, repo, urlKind: head, index };
+      if (rest[1] === "unlock") return { family: "issue-unlock", owner, repo, urlKind: head, index };
+      if (rest[1] === "pin") return { family: "issue-pin", owner, repo, urlKind: head, index };
       if (head === "pulls" && rest[1] === "files") return { family: "pull-files", owner, repo, index };
       if (head === "pulls" && rest[1] === "commits") return { family: "pull-commits", owner, repo, index };
       // Window-2e B2: the info/attachments fragments (web.go:1321-1334,
@@ -5110,6 +5162,11 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       // group): the detail arm's exact three-segment tail shape, POST-only.
       if (rest[1] === "content-history" && rest[2] === "soft-delete") {
         return { family: "issue-content-history-soft-delete", owner, repo, urlKind: head, index };
+      }
+      // The unpin DELETE tail (web.go:1404 — the index rides the THIRD
+      // segment here, not the first).
+      if (rest[1] === "unpin" && /^-?\d+$/.test(rest[2] as string)) {
+        return { family: "issue-unpin", owner, repo, urlKind: head, index: Number.parseInt(rest[2] as string, 10) };
       }
       // The byte-serving alias: upstream mounts the uuid arm at
       // /{index}/attachments/{uuid} (web.go:1337) driving the same seam as
@@ -16704,6 +16761,25 @@ uiRouter.get("/:owner/:repo/issues/dismiss_review", () => methodNotAllowed("POST
 // BEFORE the /issues/:index GET catch below (static-before-dynamic).
 uiRouter.post("/:owner/:repo/issues/resolve_conversation", (c) => pullReviewResolveSubmit(c));
 uiRouter.get("/:owner/:repo/issues/resolve_conversation", () => methodNotAllowed("POST"));
+// The issue/pull SIDEBAR write arms (web.go:1362-1405, pages/
+// issue-sidebar-writes.ts — the repo-scope combo POSTs first
+// static-before-dynamic).
+uiRouter.post("/:owner/:repo/issues/milestone", (c) => issueMilestoneSubmit(c));
+uiRouter.get("/:owner/:repo/issues/milestone", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/milestone", (c) => issueMilestoneSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/milestone", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/projects", (c) => issueProjectsSubmit(c));
+uiRouter.get("/:owner/:repo/issues/projects", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/projects", (c) => issueProjectsSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/projects", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/assignee", (c) => issueAssigneeSubmit(c));
+uiRouter.get("/:owner/:repo/issues/assignee", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/assignee", (c) => issueAssigneeSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/assignee", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/move_pin", (c) => issueMovePinSubmit(c));
+uiRouter.get("/:owner/:repo/issues/move_pin", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/move_pin", (c) => issueMovePinSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/move_pin", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/issues/:index", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/pulls", (c) => uiPage(c));
 // Wave-29 diffpatch downloads (parseUiRoute claims exactly the dotted
@@ -16721,6 +16797,32 @@ uiRouter.get("/:owner/:repo/pulls/:index", (c) => uiPage(c));
 uiRouter.post("/:owner/:repo/issues/:index/comments", (c) => issueCommentSubmit(c));
 uiRouter.post("/:owner/:repo/pulls/:index/comments", (c) => issueCommentSubmit(c));
 uiRouter.get("/:owner/:repo/issues/:index/comments", () => methodNotAllowed("POST"));
+// The {index} sidebar writes (web.go:1367-1389) + the unpin DELETE tail
+// (:1404) — both URL families, chi-405 twins per method.
+uiRouter.post("/:owner/:repo/issues/:index/deadline", (c) => issueDeadlineSubmit(c));
+uiRouter.get("/:owner/:repo/issues/:index/deadline", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index/deadline", (c) => issueDeadlineSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/:index/deadline", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/:index/watch", (c) => issueWatchSubmit(c));
+uiRouter.get("/:owner/:repo/issues/:index/watch", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index/watch", (c) => issueWatchSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/:index/watch", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/:index/lock", (c) => issueLockSubmit(c));
+uiRouter.get("/:owner/:repo/issues/:index/lock", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index/lock", (c) => issueLockSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/:index/lock", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/:index/unlock", (c) => issueUnlockSubmit(c));
+uiRouter.get("/:owner/:repo/issues/:index/unlock", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index/unlock", (c) => issueUnlockSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/:index/unlock", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/:index/pin", (c) => issuePinSubmit(c));
+uiRouter.get("/:owner/:repo/issues/:index/pin", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index/pin", (c) => issuePinSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/:index/pin", () => methodNotAllowed("POST"));
+uiRouter.delete("/:owner/:repo/issues/unpin/:index", (c) => issueUnpinSubmit(c));
+uiRouter.get("/:owner/:repo/issues/unpin/:index", () => methodNotAllowed("DELETE"));
+uiRouter.delete("/:owner/:repo/pulls/unpin/:index", (c) => issueUnpinSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/unpin/:index", () => methodNotAllowed("DELETE"));
 uiRouter.get("/:owner/:repo/pulls/:index/comments", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/pulls/:index/files", (c) => uiPage(c));
 // The PR commits tab (parseUiRoute claims exactly this shape — GET only,

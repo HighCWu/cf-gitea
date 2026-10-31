@@ -745,16 +745,34 @@ describe("the sidebar write arms", () => {
     expect(res.status).toBe(404);
   });
 
-  it("upstream's milestone/assignee/status sidebar write POSTs stay unclaimed (plain non-page 404 — the no-JS reduction's documented shape; web.go:1400-1404)", async () => {
+  it("the sidebar write POSTs are LIVE (the issue-sidebar-writes fold): milestone/assignee answer the write ladder's non-page arm; the status tail stays engine-owned (never an upstream literal)", async () => {
     const fixture = await ensureIssueDetailFixtures();
-    for (const tail of ["milestone", "assignee", "status"]) {
+    // A THROWAWAY issue — the writes are live now and must not disturb the
+    // shared fixture's seeded sidebar state (the display arms below).
+    const svc = new IssuesService(env.DB);
+    const sharedRow = await drizzle(env.DB)
+      .select({ repoId: issues.repoId })
+      .from(issues)
+      .where(eq(issues.id, fixture.openPrIssueId))
+      .get();
+    if (sharedRow === undefined) throw new Error("sidebar-write seed: shared row missing");
+    const throwaway = await svc.createIssue({ repoId: sharedRow.repoId, title: "mx: sidebar-write target", posterId: fixture.ownerId, now: new Date() });
+    for (const tail of ["milestone", "assignee"]) {
+      // The CLEAR arm (no id fields): the write ladder's 303 — proves the
+      // route LIVE through the real router without seeding a milestone.
+      // `issue_ids` carries the issue ROW id (getIssueById), not the index.
       const res = await fetchUi(
         `/${OWNER_NAME}/${REPO_SLUG}/issues/${tail}`,
-        withCookie(formPost({ issue_ids: String(fixture.openPrIssueId) }), fixture.ownerCookie),
+        withCookie(formPost({ issue_ids: String(throwaway.id) }), fixture.ownerCookie),
       );
-      expect(res.status, `POST /issues/${tail}`).toBe(404);
-      expect(await res.text(), `POST /issues/${tail}`).not.toContain("page-content");
+      expect(res.status, `POST /issues/${tail}`).toBe(303);
     }
+    // /issues/status was NEVER an upstream literal — the engine keeps it.
+    const status = await fetchUi(
+      `/${OWNER_NAME}/${REPO_SLUG}/issues/status`,
+      withCookie(formPost({ issue_ids: String(throwaway.id) }), fixture.ownerCookie),
+    );
+    expect(status.status).toBe(404);
   });
 });
 
@@ -885,19 +903,26 @@ describe("the sidebar combo divs (w129 batch-10: the ?div-only edit fragments)",
     expect(edge.length).toBeGreaterThanOrEqual(1);
   });
 
-  it("the subscribe seam's upstream POST tails stay unclaimed: /{issues,pulls}/{n}/watch 404 (web.go:1368) and issue_subscriptions is untouched", async () => {
-    // Provenance: wave-polish-matrix-10. The subscribe button's write —
-    // upstream `m.Post("/watch", repo.IssueWatch)` under BOTH the issues and
-    // pulls groups (web.go:1368) — never landed; the sidebar-write 404 pin
-    // above covers only the /issues/{tail} literal shapes. A valid
-    // same-origin POST writes no issue_subscriptions row.
+  it("the subscribe seam's watch POSTs are LIVE (the issue-sidebar-writes fold): BOTH families answer the write ladder (web.go:1368) on a throwaway row", async () => {
+    // Provenance: wave-polish-matrix-10's unclaimed pin flipped at the
+    // sidebar-write fold. A THROWAWAY issue: the write is live and must not
+    // seed a subscription row on the shared fixture's PR (other arms read
+    // its subscription state).
     const fixture = await ensureIssueDetailFixtures();
+    const svc = new IssuesService(env.DB);
+    const sharedRow = await drizzle(env.DB)
+      .select({ repoId: issues.repoId })
+      .from(issues)
+      .where(eq(issues.id, fixture.openPrIssueId))
+      .get();
+    if (sharedRow === undefined) throw new Error("watch-write seed: shared row missing");
+    const throwaway = await svc.createIssue({ repoId: sharedRow.repoId, title: "mx: watch target", posterId: fixture.ownerId, now: new Date() });
     for (const path of [
-      `/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.openPrIssueId}/watch`,
-      `/${OWNER_NAME}/${REPO_SLUG}/pulls/${fixture.openPrIssueId}/watch`,
+      `/${OWNER_NAME}/${REPO_SLUG}/issues/${throwaway.index}/watch`,
+      `/${OWNER_NAME}/${REPO_SLUG}/pulls/${throwaway.index}/watch`,
     ]) {
       const res = await fetchUi(path, withCookie(formPost({}), fixture.ownerCookie));
-      expect(res.status, `POST ${path}`).toBe(404);
+      expect(res.status, `POST ${path}`).not.toBe(404);
       expect(await res.text(), `POST ${path}`).not.toContain("page-content");
     }
     expect(
