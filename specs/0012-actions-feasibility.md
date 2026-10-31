@@ -1205,8 +1205,9 @@ is a dispatch call, not a design one. The §7 M3 row's **L** sizing holds; its
 risk note changes from "port-fidelity risk" to "fidelity is
 conformance-testable against actionslib's own testdata" (§D4).
 
-**§D5 AS-BUILT (2026-10-31, the E-tier call-site wave).** All three tiers
-landed and wired: P (`0e9b0c1`), S (`667d349`), E core (`240d67d`), and the
+**§D5 AS-BUILT (2026-10-31; the E-tier call-site wave + the E5 model-port
+wave, same day).** All three tiers landed and wired, and the staged E5
+block below closed: P (`0e9b0c1`), S (`667d349`), E core (`240d67d`), and the
 call-sites in `cf-gitea:apps/worker/src/services/actions/trigger.ts`:
 
 - **E2 (§D2 #1) run-name** — `insertTriggeredRunSplit` interpolates the raw
@@ -1244,18 +1245,48 @@ call-sites in `cf-gitea:apps/worker/src/services/actions/trigger.ts`:
   `newJobEvaluator` (model.go:297-303) reads the parsed combo's
   strategy+matrix; the raw node stores (run.go:251-256) with
   `is_concurrency_evaluated=false`.
-- **E5 (§D2 #7) deferred-matrix expansion — STAGED, exactly-what-is-missing**:
-  the YAML workflow model port (actionslib `pkg/model` + in-tree
-  jobparser's Job/Strategy decode, `Strategy.resolve`, `MatrixCombinations`/
-  `buildMatrixCombos`, `ExpandMatrixWithNeeds`) plus expreval's
-  `EvaluateYamlNode` (evaluator.go:96-260 — the seam the landed
-  expression-eval records in its evaluator.ts header). Until it lands the
-  INSERT GATE is matrix-shaped: a workflow whose jobs carry
-  `strategy.matrix` inserts NO run (upstream's static combos insert N jobs
-  at Parse, jobparser.go:112-126; half-wiring a placeholder-only insert
-  would diverge from the run's published shape — rejected). Every other
-  `${{` surface now flows; step-level expressions ride the payload
-  verbatim (§D3, runner-side upstream too).
+- **E5 (§D2 #7) deferred-matrix expansion — LANDED 2026-10-31 (the model
+  port wave)**: the YAML workflow model lives in
+  `apps/worker/src/services/actions/workflow-model/` (actionslib
+  `pkg/model`'s matrix expansion + in-tree jobparser's Job/Strategy decode,
+  `Strategy.resolve`, `MatrixCombinations`/`buildMatrixCombos`,
+  `ExpandMatrixWithNeeds`) and expreval's `EvaluateYamlNode`
+  (evaluator.go:96-260) landed in `expression-eval/evaluator.ts` — the seam
+  its header recorded. `trigger.ts` wires it: the model split runs INSIDE
+  `insertTriggeredRunSplit` after the run row exists (run.go:106-111's own
+  order — github.run_id/run_number interpolate for real); a parse error
+  aborts the insert with upstream's outcome (no run row, the compensating
+  delete — "parse workflow: %w", run.go:121-123). Static combos insert one
+  row per combination (job id, needs, the baked single-value matrix with
+  job-index/job-total, the interpolated name/runs-on/continue-on-error with
+  the runner's expression escapes, jobparser.go:225-274); a needs-reading
+  matrix plans as the deferred placeholder (is_matrix_deferred +
+  deferred_matrix_payload) and the emitter's expandDeferredMatrixOfJob
+  (matrix.go:43-204) expands it over the completed needs — combination 0
+  reuses the placeholder behind the (is_matrix_deferred, status) CAS claim,
+  the siblings insert BLOCKED with fresh attempt_job_ids, and an expansion
+  failure terminal-fails the placeholder (the D5 late posture,
+  matrix.go:52-71). The job-level concurrency gate (§D2 #5-6) landed with
+  it: the fill model evaluates at insert for a job entering its group
+  (run.go:264-269 over EvaluateConcurrency, model.go:315-335) and at the
+  emitter for a needs-blocked one (updateConcurrencyEvaluationForJobWithNeeds,
+  job_emitter.go:684-702), PrepareToStartJobWithConcurrency cancels-or-
+  blocks (clear_tasks.go:106-125), the admitted-group gate keeps a second
+  entrant blocked (job_emitter.go:655-657), and checkRunConcurrency's full
+  collection (run group + done jobs' evaluated groups) wakes the waiters.
+  The insert-time max-parallel slot map (applyMaxParallel,
+  max_parallel.go:74-79) and the runs-on schema arm (run.go:253-256 +
+  invalidRunsOn, job_emitter.go:629-635) ride the same loop. The insert
+  gate is UN-NARROWED: a `strategy.matrix` workflow flows end-to-end.
+  Fixtures: pkg/model matrix_test.go's tables port row-for-row
+  (workflow-model/matrix.test.ts, 33 rows); jobparser's testdata + test
+  tables port in workflow-model/combos.test.ts (the comparison adapts from
+  go-yaml's encoder bytes to semantic deep-equal — the payload-bytes
+  deviation this SPEC already records); evaluator_test.go's
+  TestEvaluateYamlNode rows live in expression-eval/expression-eval.test.ts.
+  One byte divergence recorded there: this emitter renders float64 1e15 as
+  "1000000000000000" where go-yaml writes "1E+15" — same parsed value,
+  writing the Go-side coerced text instead would flip the parsed type.
 - **Run numbering** — the HANDOFF closed: `repo_counters.run_index`
   (migration 0050, drizzle-generated) + `nextRunIndex` as the atomic
   counter CAS (bootstrap-at-max → never-rewind repair → bump+read, one D1

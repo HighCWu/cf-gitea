@@ -11,8 +11,9 @@
 //   - the glob/filesystem rows of TestFunctionHashFiles (glob.go is dropped
 //     per SPEC-0012 §D4; the server's pinned posture is the
 //     "hashFiles is only available in steps" error, asserted here);
-//   - TestEvaluateYamlNode (the YAML-node arm needs the workflow model —
-//     the model tier's seam, staged per the module header);
+//   - TestEvaluateYamlNode rides below (the EvaluateYamlNode port landed
+//     with the workflow-model tier; the node walker adapts go-yaml's
+//     node-kind mapping — see evaluator.ts's header);
 //   - TestResolveWorkflowCallInputs / TestEvaluateWorkflowCallOutputs /
 //     TestEvaluateCallerSecrets (expreval/workflow_call.go, v2-staged, §D2
 //     #12);
@@ -22,7 +23,10 @@
 //
 // The JSON reader's dialect rows live here too (json_test.go).
 
+import { parseDocument, type Node as YamlNode } from "yaml";
 import { describe, expect, it } from "vitest";
+
+import { evaluateYamlNode } from "./evaluator";
 
 import {
   DefaultStatusCheck,
@@ -1145,4 +1149,83 @@ describe("truthiness (interpreter.go IsTruthy)", () => {
       expect(isTruthy(row.input)).toBe(row.want);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// TestEvaluateYamlNode (pkg/expreval/evaluator_test.go:125-185, row-for-row)
+// ---------------------------------------------------------------------------
+
+describe("TestEvaluateYamlNode (the YAML-node walker)", () => {
+  /** testEvaluator (evaluator_test.go:16-30): the bare environment. */
+  const interpeter = newInterpeter({}, {});
+  const evaluator = new Evaluator((input, check) => interpeter.evaluate(input, check));
+
+  for (const tt of [
+    {
+      name: "scalar keeps its type and number formatting",
+      // the parsed VALUES are the fixture parity; the 1e15 row is the recorded byte
+      // divergence (go-yaml renders "1E+15", this emitter "1000000000000000" — same parsed
+      // number; see evaluator.ts's header)
+      input: "value: ${{ fromJSON('[1234567,1e15,{\"id\":2500000}]') }}\n",
+      want: ["value:", "  - 1234567", "  - 1000000000000000", "  - id: 2500000"],
+    },
+    {
+      name: "untouched value keeps its style",
+      input: "value: 'plain'\n",
+      want: ["value: 'plain'"],
+    },
+    {
+      name: "an evaluated entry does not strip the comments around it",
+      input: "a: 1 # before\nb: ${{ 1 }}\nc: 3 # after\n",
+      want: ["a: 1 # before", "b: 1", "c: 3 # after"],
+    },
+    {
+      name: "insert directive merges the nested map",
+      input: "a: 1\n${{ insert }}: ${{ fromJSON('{\"b\":2}') }}\n",
+      want: ["a: 1", "b: 2"],
+    },
+    {
+      name: "an evaluated sequence merges into its parent",
+      input: "- a\n- ${{ fromJSON('[\"b\",\"c\"]') }}\n",
+      want: ["- a", "- b", "- c"],
+    },
+    {
+      name: "a nested sequence stays nested",
+      input: "- a\n- - ${{ 'b' }}\n",
+      want: ["- a", "- - b"],
+    },
+    {
+      name: "binary scalar evaluates its decoded expression",
+      input: "value: !!binary JHt7IDEgfX0=\n",
+      want: ["value: 1"],
+    },
+  ] as Array<{ name: string; input: string; want: string[] }>) {
+    it(tt.name, () => {
+      const doc = parseDocument(tt.input);
+      expect(doc.errors).toEqual([]);
+      const node = doc.contents as YamlNode;
+      const outcome = evaluateYamlNode(evaluator, node);
+      expect(outcome.error).toBeNull();
+      expect(tt.name === "untouched value keeps its style" ? outcome.replacement === null : outcome.replacement !== null).toBe(true);
+      // the replacement is grafted back (the caller's slot — here the doc root)
+      if (outcome.replacement !== null) {
+        doc.contents = outcome.replacement as typeof doc.contents;
+      }
+      const lines = (doc.toString({ lineWidth: 0 })).replace(/\n$/, "").split("\n");
+      expect(lines).toEqual(tt.want);
+    });
+  }
+
+  it("an untouched value answers no replacement", () => {
+    const doc = parseDocument("value: 'plain'\n");
+    const outcome = evaluateYamlNode(evaluator, doc.contents as YamlNode);
+    expect(outcome.error).toBeNull();
+    expect(outcome.replacement).toBeNull();
+  });
+
+  it("TestEvaluateYamlNodeInsertNonMapping — an insert of a non-mapping errors", () => {
+    const doc = parseDocument("${{ insert }}: ${{ 'text' }}\n");
+    const outcome = evaluateYamlNode(evaluator, doc.contents as YamlNode);
+    expect(outcome.error?.message).toContain("expected MappingNode");
+  });
 });

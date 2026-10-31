@@ -969,7 +969,7 @@ jobs:
     expect(byId["dependent"]).toBe(ACTION_STATUS_SKIPPED);
   });
 
-  it("E3 (staged surface) — a job-level concurrency node stores raw and unevaluated", async () => {
+  it("E4 — a job-level concurrency node stores raw AND evaluates at insert (the fill model)", async () => {
     await seedRepo();
     const { jobs } = await insertTriggeredRun(
       env.DB,
@@ -984,9 +984,10 @@ jobs:
       - run: y
 `,
     );
-    expect(jobs[0]?.status).toBe(ACTION_STATUS_WAITING); // no gate on the job level yet
+    expect(jobs[0]?.status).toBe(ACTION_STATUS_WAITING);
     expect(jobs[0]?.rawConcurrency).toContain("group: build-${{ github.ref }}");
-    expect(jobs[0]?.isConcurrencyEvaluated).toBe(false);
+    expect(jobs[0]?.isConcurrencyEvaluated).toBe(true);
+    expect(jobs[0]?.concurrencyGroup).toBe("build-refs/heads/main");
   });
 
   it("an all-pending run (every job has needs) skips the task-version bump", async () => {
@@ -999,6 +1000,276 @@ jobs:
     const jobs = await db().select().from(actionRunJobs);
     expect(jobs.every((j) => j.status === ACTION_STATUS_PENDING)).toBe(true);
     expect(await getTasksVersionByScope(env.DB, 0, REPO_ID)).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The E5 matrix arms (the model port wired at insert + the emitter)
+// ---------------------------------------------------------------------------
+
+describe("insertTriggeredRun E5 (matrix expansion + combos + job-level concurrency)", () => {
+  it("static combos expand with interpolated name/runs-on/continue-on-error and the baked strategy", async () => {
+    await seedRepo();
+    const { jobs } = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/ci.yml"),
+      `on: push
+jobs:
+  build:
+    name: build-\${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [linux, mac]
+        version: [1.20]
+    runs-on: \${{ matrix.os }}
+    continue-on-error: \${{ matrix.os == 'mac' }}
+    steps:
+      - run: make
+`,
+    );
+    expect(jobs).toHaveLength(2);
+    const byRunsOn = new Map(jobs.map((j) => [(JSON.parse(j.runsOn) as string[])[0] as string, j]));
+    const linux = byRunsOn.get("linux");
+    const mac = byRunsOn.get("mac");
+    expect(linux?.name).toBe("build-linux");
+    expect(mac?.name).toBe("build-mac");
+    expect(linux?.continueOnError).toBe(false);
+    expect(mac?.continueOnError).toBe(true);
+    // the payload's baked matrix + job-index/job-total (the runner's own view)
+    const linuxPayload = new TextDecoder().decode(linux!.workflowPayload as Uint8Array);
+    expect(linuxPayload).toContain("- linux");
+    expect(linuxPayload).toContain("job-total: 2");
+    expect(linuxPayload).not.toContain("job-index"); // the zero index omits (the .out.yaml parity)
+    const macPayload = new TextDecoder().decode(mac!.workflowPayload as Uint8Array);
+    expect(macPayload).toContain("job-index: 1");
+    expect(macPayload).toContain("job-total: 2");
+    expect(linuxPayload).toContain("name: build-linux"); // the runner keeps the expression escapes' evaluation
+    expect(linuxPayload).not.toContain("needs:"); // insertRunJob's EraseNeeds
+    expect(linux?.status).toBe(ACTION_STATUS_WAITING);
+    expect(linux?.isMatrixDeferred).toBe(false);
+  });
+
+  it("a needs-reading matrix plans as the deferred placeholder; the emitter expands it when the need finishes", async () => {
+    await seedRepo();
+    const { run, jobs } = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/ci.yml"),
+      `on: push
+jobs:
+  setup:
+    steps: [{run: echo}]
+  build:
+    needs: setup
+    runs-on: \${{ matrix.os }}
+    strategy:
+      matrix:
+        os: \${{ fromJSON(needs.setup.outputs.oses) }}
+    steps:
+      - run: make
+`,
+    );
+    const placeholder = jobs.find((j) => j.jobId === "build");
+    expect(placeholder).toBeDefined();
+    expect(placeholder?.isMatrixDeferred).toBe(true);
+    expect(placeholder?.deferredMatrixPayload).not.toBeNull();
+    expect(placeholder?.status).toBe(ACTION_STATUS_PENDING); // waiting on setup
+
+    // setup finishes (its task outputs carry the matrix values)
+    await db()
+      .update(actionRunJobs)
+      .set({ status: ACTION_STATUS_SUCCESS, stopped: new Date(), taskId: 77 })
+      .where(eq(actionRunJobs.jobId, "setup"));
+    await db().insert(actionTaskOutputs).values({
+      taskId: 77,
+      outputKey: "oses",
+      outputValue: `["linux","mac"]`,
+    });
+    await db()
+      .update(actionRuns)
+      .set({ status: ACTION_STATUS_WAITING })
+      .where(eq(actionRuns.id, run.id));
+    await checkJobsOfRun(env.DB, run.id);
+
+    const after = await db().select().from(actionRunJobs).orderBy(actionRunJobs.id);
+    const expanded = after.filter((j) => j.jobId === "build");
+    expect(expanded).toHaveLength(2);
+    expect(expanded.every((j) => j.isMatrixDeferred === false)).toBe(true);
+    expect(expanded.map((j) => (JSON.parse(j.runsOn) as string[])[0] as string).sort()).toEqual(["linux", "mac"]);
+    const setup = after.find((j) => j.jobId === "setup");
+    expect(setup?.status).toBe(ACTION_STATUS_SUCCESS);
+  });
+
+  it("a matrix expansion failure terminal-fails the placeholder (the D5 late posture)", async () => {
+    await seedRepo();
+    const { run, jobs } = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/ci.yml"),
+      `on: push
+jobs:
+  setup:
+    steps: [{run: echo}]
+  build:
+    needs: setup
+    strategy:
+      matrix:
+        os: \${{ fromJSON(needs.setup.outputs.oses) }}
+    runs-on: x
+    steps: [{run: echo}]
+`,
+    );
+    const placeholder = jobs.find((j) => j.jobId === "build");
+    expect(placeholder?.isMatrixDeferred).toBe(true);
+    await db()
+      .update(actionRunJobs)
+      .set({ status: ACTION_STATUS_SUCCESS, stopped: new Date() })
+      .where(eq(actionRunJobs.jobId, "setup"));
+    // the output is NOT a JSON array of values → the expansion fails late
+    await db()
+      .update(actionRunJobs)
+      .set({ status: ACTION_STATUS_SUCCESS, stopped: new Date(), taskId: 78 })
+      .where(eq(actionRunJobs.jobId, "setup"));
+    await db().insert(actionTaskOutputs).values({
+      taskId: 78,
+      outputKey: "oses",
+      outputValue: `{"a":1}`,
+    });
+    await checkJobsOfRun(env.DB, run.id);
+    const after = await db().select().from(actionRunJobs);
+    const build = after.find((j) => j.jobId === "build");
+    expect(build?.status).toBe(ACTION_STATUS_FAILURE);
+  });
+
+  it("a job-level concurrency cancel-in-progress clears the group's earlier job", async () => {
+    await seedRepo();
+    const first = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/ci.yml"),
+      `on: push
+jobs:
+  a:
+    concurrency:
+      group: shared
+    runs-on: x
+    steps:
+      - run: y
+`,
+    );
+    expect(first.jobs[0]?.status).toBe(ACTION_STATUS_WAITING);
+    const second = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/ci.yml"),
+      `on: push
+jobs:
+  b:
+    concurrency:
+      group: shared
+      cancel-in-progress: true
+    runs-on: x
+    steps:
+      - run: y
+`,
+    );
+    expect(second.jobs[0]?.isConcurrencyEvaluated).toBe(true);
+    expect(second.jobs[0]?.concurrencyGroup).toBe("shared");
+    const jobs = await db().select().from(actionRunJobs);
+    const a = jobs.find((j) => j.jobId === "a");
+    expect(a?.status).toBe(ACTION_STATUS_CANCELLED); // cancel-in-progress cleared the group's holder
+  });
+
+  it("a job-level concurrency group blocks a second entrant (plain concurrency)", async () => {
+    await seedRepo();
+    const first = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/ci.yml"),
+      `on: push
+jobs:
+  a:
+    concurrency:
+      group: serial
+    runs-on: x
+    steps:
+      - run: y
+`,
+    );
+    expect(first.jobs[0]?.concurrencyGroup).toBe("serial");
+    const second = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/ci.yml"),
+      `on: push
+jobs:
+  b:
+    concurrency:
+      group: serial
+    runs-on: x
+    steps:
+      - run: y
+`,
+    );
+    expect(second.jobs[0]?.status).toBe(ACTION_STATUS_BLOCKED);
+  });
+
+  it("a PENDING job with a concurrency node stores it unevaluated (the emitter resolves it)", async () => {
+    await seedRepo();
+    const { jobs } = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/ci.yml"),
+      `on: push
+jobs:
+  setup:
+    steps: [{run: echo}]
+  build:
+    needs: setup
+    concurrency:
+      group: g-\${{ needs.setup.outputs.v }}
+    runs-on: x
+    steps: [{run: echo}]
+`,
+    );
+    const build = jobs.find((j) => j.jobId === "build");
+    expect(build?.status).toBe(ACTION_STATUS_PENDING);
+    expect(build?.rawConcurrency).toContain("group: g-");
+    expect(build?.isConcurrencyEvaluated).toBe(false);
+    expect(build?.concurrencyGroup).toBe("");
+  });
+
+  it("max-parallel blocks the combos over the limit at insert (applyMaxParallel)", async () => {
+    await seedRepo();
+    const { jobs } = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/ci.yml"),
+      `on: push
+jobs:
+  build:
+    strategy:
+      max-parallel: 1
+      matrix:
+        os: [a, b, c]
+    runs-on: x
+    steps: [{run: echo}]
+`,
+    );
+    expect(jobs).toHaveLength(3);
+    const waiting = jobs.filter((j) => j.status === ACTION_STATUS_WAITING);
+    const blocked = jobs.filter((j) => j.status === ACTION_STATUS_BLOCKED);
+    expect(waiting).toHaveLength(1);
+    expect(blocked).toHaveLength(2);
+  });
+
+  it("a stored runs-on that fails the schema fails the job with its summary (the runs-on arm)", async () => {
+    await seedRepo();
+    const { jobs, run } = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/ci.yml"),
+      `on: push
+jobs:
+  a:
+    runs-on: [[deep]]
+    steps: [{run: echo}]
+`,
+    );
+    expect(jobs[0]?.status).toBe(ACTION_STATUS_FAILURE);
+    const summaries = await db().select().from(actionRunJobSummaries);
+    expect(summaries.some((s) => s.content.includes("runs-on") && s.runId === run.id)).toBe(true);
   });
 });
 
@@ -1676,7 +1947,7 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
     expect(runs[0]?.title).toBe("CI for main");
   });
 
-  it("a matrix workflow waits for the model port (the E5 gate) — no run", async () => {
+  it("a matrix workflow flows end-to-end (the E5 gate un-narrowed): one job row per combination", async () => {
     const { owner, slug, userId } = await seedE2eRepo("matrix");
     const token = (await mintFor(userId, "t-matrix", "write:repository")).plaintext;
     const wf =
@@ -1687,7 +1958,18 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
     const tip = tips[0]!;
     const response = await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tip }], pack, token);
     expect(response.status).toBe(200);
-    expect(await db().select().from(actionRuns)).toHaveLength(0);
+    const runs = await db().select().from(actionRuns);
+    expect(runs).toHaveLength(1);
+    const jobs = await db().select().from(actionRunJobs).orderBy(actionRunJobs.id);
+    expect(jobs).toHaveLength(2);
+    expect(jobs.map((j) => JSON.parse(j.runsOn) as string[])).toEqual([["linux"], ["mac"]]);
+    expect(jobs.map((j) => j.name)).toEqual(["build (linux)", "build (mac)"]);
+    for (const job of jobs) {
+      expect(job.isMatrixDeferred).toBe(false);
+      // the payload's baked strategy carries the single-value matrix + the combo index
+      const text = new TextDecoder().decode(job.workflowPayload as Uint8Array);
+      expect(text).toContain("job-total: 2");
+    }
   });
 
   it("the static-validation seam: a push landing a context-violating workflow records its FAILED run (error verbatim) while a clean workflow still matches", async () => {

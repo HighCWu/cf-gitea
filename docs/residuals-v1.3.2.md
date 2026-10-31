@@ -195,15 +195,24 @@ board row flips — this closes a flag, not a listed residual.
    workflow-level concurrency gate at run creation incl. the cancel arms
    and the blocked-run wake; `repo_counters.run_index` CAS replaces the
    MAX+1 interim; the static-invalid → FAILED-run push seam exercised
-   end-to-end). Remaining STAGED inside this row: the YAML workflow model
-   port (actionslib `pkg/model` + jobparser's Job/Strategy decode,
-   `Strategy.resolve`/`MatrixCombinations`/`buildMatrixCombos` +
-   expreval's `EvaluateYamlNode`) carries the matrix arms — static combos,
-   deferred expansion, the combo name/runs-on/continue-on-error
-   interpolation, and the job-level concurrency evaluation — so a
-   `strategy.matrix` workflow still inserts NO run (the narrowed insert
-   gate, module-header documented); schedules (§1.4), the other notifier
-   hooks, and the reusable-workflow family keep their own staged rows.
+   end-to-end). **Remaining STAGED inside this row CLOSED 2026-10-31 (the
+   E5 model-port wave)**: the YAML workflow model landed as
+   `apps/worker/src/services/actions/workflow-model/` (actionslib
+   `pkg/model`'s MatrixCombinations + jobparser's Job/Strategy decode,
+   `Strategy.resolve`/`buildMatrixCombos`/`ExpandMatrixWithNeeds`, over
+   expreval's `EvaluateYamlNode` in `expression-eval/evaluator.ts` — the
+   recorded seam) and `trigger.ts` wired the arms: static combos expand at
+   insert into one row per combination (the baked strategy matrix +
+   interpolated name/runs-on/continue-on-error), needs-reading matrices
+   plan as deferred placeholders the emitter expands over the completed
+   needs (`ExpandMatrixWithNeeds`, terminal-fail on expansion error), the
+   job-level concurrency fill model evaluates at insert and at the emitter
+   (cancel-or-block per group, the admitted-group gate, the full
+   checkRunConcurrency collection), and the insert-time max-parallel slot
+   map plus the runs-on schema arm ride the combo loop. A
+   `strategy.matrix` workflow flows end-to-end. Schedules (§1.4), the
+   other notifier hooks, and the reusable-workflow family keep their own
+   staged rows.
 
 2. **C5's run-mutation remainder: rerun + rerun-failed — LANDED
    (`613aa31`), including the v1.3.1 artifact-inheritance addition.** The
@@ -517,6 +526,43 @@ board row flips — this closes a flag, not a listed residual.
     (`githttp.go:146–159`; the current constant is the OAuth2-disabled arm
     SPEC-0002 §2.6 chose deliberately). Six-wave decomposition in the SPEC's
     §6; dispatches after ratification. Size: **L** (six waves, SPEC-attached).
+
+15. **The external auth sources — the SPEC-0018 §3.3 reopen gate FIRES;
+    SPEC written (2026-10-31, `specs/external-auth-sources.md`, draft
+    pending ratification).** The user re-opened the surface for the v1.4
+    queue; the SPEC delivers the design pass the gate demanded. The
+    viable-set verdict, each type adjudicated against the platform with
+    cites (`source.go:28-37`'s seven-value lattice): OAuth2/OIDC client
+    sources BUILD — plain HTTPS + JWT verification over the LANDED
+    `services/oauth2/jws.ts` substrate (the provider SPEC's W1), the
+    generic `openidConnect` discovery arm plus named GitHub/Google
+    clients; LDAP/DLDAP viable-in-principle but DEFERRED (outbound TCP
+    exists — `connect()` from `cloudflare:sockets`, workers-types
+    `index.d.ts:2245`/`:3876-3892` with `startTls` — but the platform
+    disallows private-network/localhost addresses, where enterprise
+    directories live, and no BER/ASN.1 client exists in-house); SMTP
+    DEFERRED (same economics + it resurrects a password-form login the
+    PAT posture replaced); PAM/SSPI platform-IMPOSSIBLE, permanent
+    (host-OS CGO `modules/auth/pam/pam.go:5-8`; the Windows SSPI API,
+    `source.go:56`). The design: `login_source` + `external_login_user`
+    D1 tables (upstream `source.go:109-126` / `external_login_user.go:50-70`),
+    the `sessions.oauth2_login_state` dance column (the provider SPEC's
+    `oauth_state` column pattern), `/user/oauth2/{source}` +
+    `/callback` with a UUID state dance, the link-account family
+    (`/user/link_account*`, `web.go:597-599`) with the `ALLOW_SIGNUP`
+    gate and a recorded admin-init-window guard (an external sign-in
+    never closes the one-shot `/install`), and the admin `/-/admin/auths`
+    WEB CRUD — the SPEC-0018 as-built forward note enforced: web-only,
+    NO `/api/v1` family (none exists upstream at the pin or main;
+    `check-openapi` would hard-fail the invention). Security postures
+    recorded: no email-match linking (upstream's `auto` mode is a
+    takeover hazard, not ported), provider-token columns carried but
+    written empty until a consumer lands, bounded dance state (the
+    upstream `MaxTokenLength` cookie-trap answered with a D1 column).
+    Six-wave decomposition in §9 (W1 tables/store, W2 OIDC flow, W3
+    github+google, W4 admin CRUD + login buttons, W5 linking + settings,
+    W6 battery + the SPEC-0018 ledger edit). Size: **L** (six waves,
+    SPEC-attached; dispatches after ratification).
 
 ## P2 — parity polish
 

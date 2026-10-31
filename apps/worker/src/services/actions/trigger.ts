@@ -30,33 +30,42 @@
  *   rewrite (services/actions/task.go:176-186) served by dispatch at claim
  *   time.
  *
- * ## The staged boundary (per §D5's staging sentence, narrowed by the E wave)
+ * ## The expression boundary (all §D5 rows wired; the E5 model port landed)
  *
- *   - The insert gate is now MATRIX-SHAPED, not the P-tier `${{` byte scan:
- *     a workflow whose jobs carry `strategy.matrix` inserts NO run (the E5
- *     expansion arm — static combos jobparser.go:112-126 and the deferred
- *     emitter expansion matrix.go:43-204 — needs the YAML workflow model
- *     port: actionslib pkg/model + in-tree jobparser's Job/Strategy decode,
- *     Strategy.resolve, MatrixCombinations/buildMatrixCombos, plus
- *     expreval's EvaluateYamlNode (evaluator.go:96-260) — the exact seam the
- *     landed expression-eval records in its evaluator.ts header. Recorded as
- *     exactly-what-is-missing; never half-wired). All other expression
- *     surfaces now flow: run-name, job `if:`, workflow-level concurrency are
- *     evaluated server-side; step-level `${{` rides the payload verbatim
- *     (runner-side upstream too — §D3).
- *   - The E2 combo-interpolation surfaces (combo name:/runs-on:/
- *     continue-on-error, jobparser.go:225-297) stage WITH the matrix model:
- *     a non-matrix job whose name/runs-on/continue-on-error carries `${{`
- *     inserts with the RAW string (documented divergence; upstream
- *     interpolates through the combo evaluator). Job `if:` and run-name are
- *     evaluated — see above.
- *   - The job-level concurrency gate (§D2 #5-6: EvaluateJobConcurrencyFillModel
- *     at insertRunJob run.go:250-280 + updateConcurrencyEvaluationForJobWithNeeds
- *     job_emitter.go:684-702) stages with the matrix model too: its
- *     newJobEvaluator (model.go:297-303) reads the parsed combo's
- *     strategy+matrix. The RAW node is stored (job.RawConcurrency parity,
- *     run.go:251-256) with is_concurrency_evaluated = false; v1 rows never
- *     gate on it.
+ *   - The E5 model split is WIRED: insertTriggeredRunSplit expands the
+ *     workflow through ./workflow-model (the port of actionslib pkg/model's
+ *     MatrixCombinations + the submodule jobparser's Job/Strategy decode,
+ *     Strategy.resolve, buildMatrixCombos and ExpandMatrixWithNeeds, over
+ *     expression-eval's EvaluateYamlNode) AFTER the run row exists —
+ *     run.go:106-111's own order, so github.run_id/run_number interpolate
+ *     for real. Static combos insert one row per combination (job id, needs,
+ *     the combo's baked strategy matrix, interpolated name/runs-on/
+ *     continue-on-error — jobparser.go:225-274); a needs-reading matrix
+ *     plans as the deferred placeholder (is_matrix_deferred +
+ *     deferred_matrix_payload) and the emitter's expandDeferredMatrixOfJob
+ *     (matrix.go:43-204) expands it when the needs finish. An expansion
+ *     failure terminal-fails the placeholder (the D5 late posture,
+ *     matrix.go:52-71). A parse error aborts the insert with upstream's
+ *     outcome (no run row — "parse workflow: %w", run.go:121-123).
+ *   - The job-level concurrency gate (§D2 #5-6) is WIRED: the fill model
+ *     evaluates a job entering its group at insert (run.go:264-269 over
+ *     EvaluateJobConcurrency, model.go:315-335 — the newJobEvaluator reads
+ *     the combo's strategy+matrix), PrepareToStartJobWithConcurrency
+ *     cancels-or-blocks (clear_tasks.go:106-125), a PENDING job stores the
+ *     node unevaluated (blocked by clear_tasks.go:76-79's arm) and the
+ *     emitter's updateConcurrencyEvaluationForJobWithNeeds
+ *     (job_emitter.go:684-702) resolves it when the needs finish. Invalid
+ *     evaluations take the summary+FAILURE arm ("concurrency"); the
+ *     emitter's admitted-group gate keeps a second entrant blocked
+ *     (job_emitter.go:655-657), and checkRunConcurrency's full collection
+ *     (run group + done jobs' evaluated groups) wakes the blocked waiters.
+ *   - The insert-time max-parallel slot map (applyMaxParallel,
+ *     max_parallel.go:74-79) builds through the combo loop; the runs-on
+ *     schema arm (run.go:253-256 + invalidRunsOn job_emitter.go:629-635)
+ *     fails a job with its "runs-on" summary instead of starting it.
+ *   - Step-level `${{` rides the payload verbatim (runner-side upstream too
+ *     — §D3); the combo payloads keep the runner's expression escapes
+ *     (escapeExpressions, jobparser.go:205-214).
  *   - The S-tier seam is WIRED: the detection loop runs the landed
  *     `expression-syntax` wrapper's static scan (validate.go:47-62's two
  *     context arms — the YAML-model half of ValidateWorkflowStatic, :22-46,
@@ -136,6 +145,21 @@ import {
 } from "./expression-eval";
 import { jobConditionContexts, unavailableContext, validateStaticExpressions } from "./expression-syntax";
 import { handleInvalidWorkflows, type InvalidWorkflowParseError } from "./invalid-workflow";
+import {
+  readRawConcurrencyNode,
+  evaluateJobConcurrency,
+  expandMatrixWithNeeds,
+  getContinueOnError,
+  jobNeeds,
+  jobRunsOn,
+  marshalComboPayload,
+  maxParallelOfCombo,
+  parseRawSingleWorkflow,
+  parseWorkflowCombos,
+  runsOnProblem,
+  unescapeExpressions,
+  type WorkflowJobCombo,
+} from "./workflow-model";
 import {
   ACTION_STATUS_BLOCKED,
   ACTION_STATUS_CANCELLING,
@@ -1070,6 +1094,12 @@ function stringifyYamlNode(node: YamlNode): string {
   return doc.toString({ lineWidth: 0 });
 }
 
+/** The stored job.rawConcurrency text (insertRunJob's yaml.Marshal of the
+ *  node, run.go:251-256); "" when the job carries none. */
+function rawConcurrencyText(node: YamlNode | undefined): string {
+  return node === undefined ? "" : stringifyYamlNode(node);
+}
+
 // ---------------------------------------------------------------------------
 // The E-tier call-site machinery (SPEC-0012 §D5 E2/E3/E4; the evaluator
 // assembly per newServerInterpeter's server shapes — §D2's environment
@@ -1144,7 +1174,8 @@ export interface GithubContextInput {
   appUrl: string;
 }
 
-async function buildGithubContext(d1: D1Database, input: GithubContextInput): Promise<Record<string, unknown>> {
+/** Exported for rerun.ts's expression-bearing concurrency fill (the CAS-swap wave's HANDOFF — the rerun evaluator env's two context sources). */
+export async function buildGithubContext(d1: D1Database, input: GithubContextInput): Promise<Record<string, unknown>> {
   const userRows = await drizzle(d1)
     .select({ username: users.username })
     .from(users)
@@ -1249,7 +1280,8 @@ function serverEvaluator(
  * repo, later scope wins. The landed dispatch.ts port is claim-shaped; the
  * six-line merge is repeated here rather than claiming a task to read it.
  */
-async function loadActionsVariables(d1: D1Database, ownerId: number, repoId: string): Promise<Record<string, string>> {
+/** Exported for rerun.ts's expression-bearing concurrency fill (the CAS-swap wave's HANDOFF — GetVariablesOfRun's twin). */
+export async function loadActionsVariables(d1: D1Database, ownerId: number, repoId: string): Promise<Record<string, string>> {
   const db = drizzle(d1);
   const out: Record<string, string> = {};
   const globalVars = await db.select().from(actionVariables).where(and(eq(actionVariables.ownerId, 0), eq(actionVariables.repoId, "")));
@@ -1547,6 +1579,74 @@ export async function cancelPreviousJobsByRunConcurrency(
   }
   const affectedRunIds = [...new Set(cancelled.map((j) => j.runId))].filter((id) => id !== scope.runId);
   return { cancelled, affectedRunIds };
+}
+
+/** The job-level concurrency scope (ConcurrencyJobScope ≈ the job row's
+ *  identity the two gates read). */
+export interface ConcurrencyJobScope {
+  repoId: string;
+  runId: number;
+  runAttemptId: number;
+  jobId: string;
+  concurrencyGroup: string;
+  concurrencyCancel: boolean;
+}
+
+/** CancelPreviousJobsByJobConcurrency (models/actions/run_job.go:789-816):
+ *  an evaluated group only; cancel-in-progress clears the group's UNFINISHED
+ *  entries, plain concurrency its BLOCKED waiters; the job's own row and its
+ *  own attempt are excluded (v1 rows carry no callers, so the ancestor set
+ *  is empty). Returns the cancelled rows. */
+export async function cancelPreviousJobsByJobConcurrency(
+  d1: D1Database,
+  scope: ConcurrencyJobScope,
+): Promise<{ cancelled: RunJobRow[] }> {
+  if (scope.concurrencyGroup === "") return { cancelled: [] };
+  const entries = scope.concurrencyCancel
+    ? await (async () => {
+        const db = drizzle(d1);
+        const unfinished = [ACTION_STATUS_BLOCKED, ACTION_STATUS_WAITING, ACTION_STATUS_RUNNING, ACTION_STATUS_CANCELLING];
+        const attempts = await db
+          .select({ id: actionRunAttempts.id, runId: actionRunAttempts.runId })
+          .from(actionRunAttempts)
+          .where(and(eq(actionRunAttempts.repoId, scope.repoId), eq(actionRunAttempts.concurrencyGroup, scope.concurrencyGroup), inArray(actionRunAttempts.status, unfinished)));
+        const jobs = await db
+          .select()
+          .from(actionRunJobs)
+          .where(and(eq(actionRunJobs.repoId, scope.repoId), eq(actionRunJobs.concurrencyGroup, scope.concurrencyGroup), inArray(actionRunJobs.status, unfinished)));
+        return { attempts, jobs };
+      })()
+    : await getConcurrencyWaiters(d1, scope.repoId, scope.concurrencyGroup);
+
+  const otherJobs = entries.jobs.filter((j) => !(j.runId === scope.runId && j.jobId === scope.jobId));
+  const otherAttempts = entries.attempts.filter((a) => a.id !== scope.runAttemptId);
+  const attemptJobs =
+    otherAttempts.length > 0
+      ? await drizzle(d1)
+          .select()
+          .from(actionRunJobs)
+          .where(inArray(actionRunJobs.runAttemptId, otherAttempts.map((a) => a.id)))
+      : [];
+
+  const cancelled: RunJobRow[] = [];
+  for (const job of [...otherJobs, ...attemptJobs]) {
+    const row = await cancelOneJob(d1, job);
+    if (row !== null) cancelled.push(row);
+  }
+  return { cancelled };
+}
+
+/** shouldBlockJobByConcurrency (clear_tasks.go:74-101): an unevaluated raw
+ *  concurrency blocks (re-evaluated when the needs finish); an evaluated
+ *  empty group never blocks; otherwise the group's holders block — the
+ *  job's own attempt excluded, and v1's caller set is empty. */
+export async function shouldBlockJobByConcurrency(d1: D1Database, scope: ConcurrencyJobScope): Promise<boolean> {
+  if (scope.concurrencyGroup === "") return false;
+  const { attempts, jobs } = await getConcurrencyHolders(d1, scope.repoId, scope.concurrencyGroup);
+  return (
+    attempts.some((a) => a.id !== scope.runAttemptId) ||
+    jobs.some((j) => j.runAttemptId !== scope.runAttemptId && !(j.runId === scope.runId && j.jobId === scope.jobId))
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -2197,21 +2297,26 @@ export async function insertTriggeredRun(
   input: TriggeredRunInput,
   workflowContent: string,
 ): Promise<TriggerRunOutcome> {
-  const split = splitWorkflowPayloads(workflowContent);
+  // the structural pre-check (upstream's Parse aborts the run on a malformed
+  // jobs mapping — "parse workflow: %w", run.go:121-123); the E5 model split
+  // re-runs inside the insert with the full github context (run.go:106-111)
+  splitWorkflowPayloads(workflowContent);
   const rawConcurrency = readWorkflowRawConcurrency(workflowContent);
-  return insertTriggeredRunSplit(d1, input, split, rawConcurrency);
+  return insertTriggeredRunSplit(d1, input, workflowContent, rawConcurrency);
 }
 
 /**
  * The insert half split from the payload split so the emitter's re-entry and
- * tests can drive a pre-computed split (upstream Parse then InsertRun).
+ * tests can drive it directly (upstream Parse then InsertRun). `content` is
+ * the workflow source the E5 model split expands after the run row exists
+ * (the github context needs run_id/run_number — run.go:106-111's own order);
  * `wfRawConcurrency` is PrepareRunAndInsert's ReadWorkflowRawConcurrency
  * product (run.go:39-41).
  */
 export async function insertTriggeredRunSplit(
   d1: D1Database,
   input: TriggeredRunInput,
-  split: SingleJobPayload[],
+  content: string,
   wfRawConcurrency: RawConcurrency | null = null,
 ): Promise<TriggerRunOutcome> {
   const db = drizzle(d1);
@@ -2314,6 +2419,24 @@ export async function insertTriggeredRunSplit(
         appUrl: input.appUrl,
       });
 
+      // The P-tier structural slice (the run-name source + the "invalid
+      // jobs" shape check the pre-insert already ran).
+      const split = splitWorkflowPayloads(content);
+
+      // E5 — the model split (run.go:106-111: jobs, err := jobparser.Parse
+      // with the context). A parse/expansion error aborts the insert the
+      // way upstream's "parse workflow: %w" rolls the transaction back.
+      let combos: WorkflowJobCombo[] = [];
+      try {
+        const parsed = parseWorkflowCombos(content, { gitContext: githubContext, vars, inputs: undefined, eraseNeeds: true });
+        if (parsed.error !== null) {
+          throw parsed.error;
+        }
+        combos = parsed.combos;
+      } catch (err) {
+        await abort(err, "parse workflow"); // abort throws — the loop never proceeds
+      }
+
       // E2 — the run-name render (jobparser.go:103-106 interpolates
       // workflow.RunName with github/vars/inputs only; run.go:121-127 lifts
       // jobs[0].RunName over the commit-subject title when non-empty).
@@ -2372,23 +2495,45 @@ export async function insertTriggeredRunSplit(
         }
       }
 
-      // insertRunJob's status arm (run.go:214-216 + the blocked-attempt
-      // carry, :233-235): blocked attempt → blocked; else waiting; PENDING
-      // while it has needs. decideJobIf (:246) then decides each WAITING
-      // job's `if:` before insertion. attempt_job_id allocates 1..N per
-      // attempt (GetNextAttemptJobID).
-      const jobValues = split.map((job, i) => {
+      // insertRunJob over the combos (run.go:212-286): the status arm
+      // (blocked attempt → blocked; else waiting; PENDING while it has
+      // needs), decideJobIf (:246), the job-level concurrency fill model +
+      // PrepareToStartJobWithConcurrency (:250-280), applyMaxParallel
+      // (max_parallel.go:74-79 — the insert-time slot map builds through the
+      // loop), the runs-on problem arm (:253-256), and attempt_job_id
+      // allocating 1..N per attempt (GetNextAttemptJobID).
+      const slotHolds = new Map<string, number>();
+      const slotKeyOf = (jobKey: string): string => `0:${jobKey}`; // v1 rows carry no callers (ParentJobID 0)
+      const slotAvailable = (jobKey: string, maxParallel: number): boolean =>
+        maxParallel <= 0 || (slotHolds.get(slotKeyOf(jobKey)) ?? 0) < maxParallel;
+      const slotTake = (jobKey: string, maxParallel: number): boolean => {
+        if (!slotAvailable(jobKey, maxParallel)) return false;
+        if (maxParallel > 0) slotHolds.set(slotKeyOf(jobKey), (slotHolds.get(slotKeyOf(jobKey)) ?? 0) + 1);
+        return true;
+      };
+
+      const jobValues: Array<{
+        values: typeof actionRunJobs.$inferInsert;
+        invalidIf: string | null;
+        invalidRunsOn: string | null;
+      }> = [];
+      for (let i = 0; i < combos.length; i += 1) {
+        const combo = combos[i]!;
+        const needs = jobNeeds(combo.job.rawNeeds);
+        const maxParallel = maxParallelOfCombo(combo.jobId, combo.job.strategy);
+        const runsOn = jobRunsOn(combo.job);
+        const payload = combo.payload ?? new TextEncoder().encode("");
         let status =
           attemptStatus === ACTION_STATUS_BLOCKED
             ? ACTION_STATUS_BLOCKED
-            : job.needs.length > 0
+            : needs.length > 0
               ? ACTION_STATUS_PENDING
               : ACTION_STATUS_WAITING;
         let invalidIf: string | null = null;
         if (status === ACTION_STATUS_WAITING) {
           const decision = decideJobIfAtInsert({
-            jobId: job.jobId,
-            rawIf: job.rawIf,
+            jobId: combo.jobId,
+            rawIf: combo.job.rawIf,
             githubContext,
             vars,
           });
@@ -2397,34 +2542,114 @@ export async function insertTriggeredRunSplit(
             status = ACTION_STATUS_SKIPPED; // decideJobIf helper.go:141-143
           }
         }
-        return {
+
+        // The job-level concurrency (§D2 #5-6): the fill model evaluates the
+        // stored node for a job entering its group NOW (run.go:264-269 —
+        // waiting + slot available); a PENDING job stores it unevaluated and
+        // the emitter's updateConcurrencyEvaluationForJobWithNeeds resolves
+        // it when the needs finish (shouldBlockJobByConcurrency's
+        // unevaluated arm blocks it meanwhile, clear_tasks.go:76-79).
+        let concurrencyGroup = "";
+        let concurrencyCancel = false;
+        let isConcurrencyEvaluated = false;
+        if (combo.job.rawConcurrency !== undefined && status === ACTION_STATUS_WAITING && slotAvailable(combo.jobId, maxParallel)) {
+          const rc = readRawConcurrencyNode(combo.job.rawConcurrency);
+          if (rc !== null) {
+            let evaluated: { group: string; cancel: boolean; error: Error | null };
+            try {
+              const results = await needsJobResults(d1, { jobId: combo.jobId, needs: JSON.stringify(needs), runId: run.id }, new Map());
+              evaluated = evaluateJobConcurrency({
+                rc,
+                jobId: combo.jobId,
+                job: combo.job,
+                gitContext: githubContext,
+                results,
+                vars,
+                inputs: undefined,
+              });
+            } catch (err) {
+              evaluated = { group: "", cancel: false, error: err instanceof Error ? err : new Error(String(err)) };
+            }
+            if (evaluated.error !== null) {
+              // the fill model failure aborts the insert (run.go:270-272's
+              // "evaluate job concurrency: %w" rolls the transaction back)
+              await abort(evaluated.error, "evaluate job concurrency");
+            }
+            concurrencyGroup = evaluated.group;
+            concurrencyCancel = evaluated.cancel;
+            isConcurrencyEvaluated = true;
+          }
+        }
+
+        // PrepareToStartJobWithConcurrency (clear_tasks.go:106-125) for an
+        // entering job: cancel the group's previous entries, then block or
+        // proceed. The cancelled rows settle through the post-insert passes.
+        if (isConcurrencyEvaluated && status === ACTION_STATUS_WAITING) {
+          const scope: ConcurrencyJobScope = {
+            repoId: input.repoId,
+            runId: run.id,
+            runAttemptId: runAttempt.id,
+            jobId: combo.jobId,
+            concurrencyGroup,
+            concurrencyCancel,
+          };
+          const { cancelled } = await cancelPreviousJobsByJobConcurrency(d1, scope);
+          for (const c of cancelled) {
+            if (!affectedByCancel.includes(c.runId)) affectedByCancel.push(c.runId);
+          }
+          if (await shouldBlockJobByConcurrency(d1, scope)) {
+            status = ACTION_STATUS_BLOCKED;
+          }
+        }
+
+        // applyMaxParallel (max_parallel.go:74-79): a ready job without a
+        // free slot demotes to BLOCKED; the emitter promotes it later.
+        if (status === ACTION_STATUS_WAITING && !slotTake(combo.jobId, maxParallel)) {
+          status = ACTION_STATUS_BLOCKED;
+        }
+
+        // the runs-on problem arm (run.go:253-256): an invalid stored
+        // runs-on fails the job with its summary instead of starting it
+        let invalidRunsOn: string | null = null;
+        if (runsOnProblem(combo.job.rawRunsOn) !== "" && status === ACTION_STATUS_WAITING && slotAvailable(combo.jobId, maxParallel)) {
+          invalidRunsOn = runsOnProblem(combo.job.rawRunsOn);
+          status = ACTION_STATUS_FAILURE;
+        }
+
+        const entry = {
           values: {
             runId: run.id,
             repoId: input.repoId,
             ownerId: input.ownerId,
             commitSha: input.commitSha,
             isForkPullRequest: input.isForkPullRequest,
-            name: ellipsisDisplayString(job.name, 255),
+            name: ellipsisDisplayString(unescapeExpressions(combo.job.name), 255), // DisplayName
             attempt: 1,
-            workflowPayload: job.payload,
-            jobId: job.jobId,
-            needs: JSON.stringify(job.needs),
-            runsOn: JSON.stringify(job.runsOn),
+            workflowPayload: payload,
+            jobId: combo.jobId,
+            needs: JSON.stringify(needs),
+            runsOn: JSON.stringify(runsOn),
             status,
-            rawConcurrency: job.rawConcurrency,
-            isConcurrencyEvaluated: false, // the job-level gate stages with the matrix model
-            maxParallel: job.maxParallel,
-            continueOnError: job.continueOnError,
+            rawConcurrency: rawConcurrencyText(combo.job.rawConcurrency),
+            isConcurrencyEvaluated,
+            concurrencyGroup,
+            concurrencyCancel,
+            maxParallel,
+            continueOnError: getContinueOnError(combo.job.rawContinueOnError),
+            isMatrixDeferred: combo.deferred,
+            deferredMatrixPayload: combo.deferred ? payload : null,
             runAttemptId: runAttempt.id,
             attemptJobId: i + 1,
             created: now,
             updated: now,
           },
           invalidIf,
+          invalidRunsOn,
         };
-      });
+        jobValues.push(entry);
+      }
       const jobRows: RunJobRow[] = [];
-      const invalidIfRows: Array<{ row: RunJobRow; summary: string | null }> = [];
+      const invalidRows: Array<{ row: RunJobRow; key: string; summary: string }> = [];
       const CHUNK = 2; // the ~40-column bind cap (model.ts's idiom)
       for (let i = 0; i < jobValues.length; i += CHUNK) {
         const chunk = jobValues.slice(i, i + CHUNK);
@@ -2436,13 +2661,12 @@ export async function insertTriggeredRunSplit(
         const entry = jobValues[i];
         const row = jobRows[i];
         if (entry === undefined || row === undefined) continue;
-        invalidIfRows.push({ row, summary: entry.invalidIf });
+        if (entry.invalidIf !== null) invalidRows.push({ row, key: "if", summary: entry.invalidIf });
+        if (entry.invalidRunsOn !== null) invalidRows.push({ row, key: "runs-on", summary: entry.invalidRunsOn });
       }
       // upsertJobErrorSummary AFTER the job insert (run.go:282-286)
-      for (const { row, summary } of invalidIfRows) {
-        if (summary !== null) {
-          await upsertJobErrorSummary(d1, row, "if", new Error(summary));
-        }
+      for (const { row, key, summary } of invalidRows) {
+        await upsertJobErrorSummary(d1, row, key, new Error(summary));
       }
 
       // AggregateJobStatus (run.go:233-234) — the attempt settles to its
@@ -2722,6 +2946,13 @@ export async function checkJobsOfRun(d1: D1Database, runId: number): Promise<voi
 
   const updatedJobIds: number[] = [];
   const now = new Date();
+  // The E5/concurrency pass state: groups a job of THIS pass already entered
+  // (r.admittedGroups, job_emitter.go:655-657 — a second entrant stays
+  // blocked for the next pass), the jobs the group cancels
+  // (r.cancelledJobs), and whether a blocked job must re-gate (r.gateDeferred).
+  const admittedGroups = new Set<string>();
+  const cancelledByConcurrency: RunJobRow[] = [];
+  let gateDeferred = false;
   // Resolve to a fixpoint (jobStatusResolver.Resolve's loop, :507-527).
   for (let round = 0; round <= jobs.length; round += 1) {
     const updates = new Map<number, number>();
@@ -2775,9 +3006,118 @@ export async function checkJobsOfRun(d1: D1Database, runId: number): Promise<voi
         continue;
       }
 
-      if (!slotAvailable(job)) continue; // a slot-starved job stays blocked
-      const newStatus = ACTION_STATUS_WAITING;
-      if (!slotTake(job)) continue;
+      // E5 — expand a needs-dependent matrix now that its needs are done and
+      // the job is going to run (job_emitter.go:597-620 → expandDeferredMatrix,
+      // matrix.go:43-204). The placeholder is reused as the first combination
+      // behind an atomic claim; the siblings insert BLOCKED and the pass
+      // restarts so they join the resolver's maps. An expansion failure
+      // terminal-fails the placeholder in place (the D5 late posture).
+      if (job.isMatrixDeferred) {
+        const outcome = await expandDeferredMatrixOfJob(d1, job, {
+          run,
+          repoOwnerNamespace: repoRecordNamespace,
+          repoSlug: repoRecordSlug,
+          attemptNumber,
+          vars: passVars ?? (await loadActionsVariables(d1, run.ownerId, run.repoId)),
+          githubContext: await githubContextOnce(),
+        });
+        if (outcome === "claimed") {
+          // the placeholder row changed under us — restart with DB truth
+          await checkJobsOfRun(d1, run.id);
+          return;
+        }
+        if (outcome === "failed") {
+          statuses.set(id, ACTION_STATUS_FAILURE);
+          job.status = ACTION_STATUS_FAILURE;
+          updates.set(id, ACTION_STATUS_FAILURE);
+          continue;
+        }
+        // "expanded" (siblings inserted): the fresh rows must join the pass
+        await checkJobsOfRun(d1, run.id);
+        return;
+      }
+
+      // invalidRunsOn (job_emitter.go:629-635): a stored runs-on that fails
+      // github.com's schema fails the job with its summary.
+      const runsOnProblemText = storedRunsOnProblem(job);
+      if (runsOnProblemText !== "" && slotAvailable(job)) {
+        await upsertJobErrorSummary(d1, job, "runs-on", new Error(runsOnProblemText));
+        statuses.set(id, ACTION_STATUS_FAILURE);
+        job.status = ACTION_STATUS_FAILURE;
+        updates.set(id, ACTION_STATUS_FAILURE);
+        continue;
+      }
+
+      // updateConcurrencyEvaluationForJobWithNeeds (job_emitter.go:684-702):
+      // the stored node evaluates now that the needs can answer; an invalid
+      // evaluation writes the summary and fails the job, a DB-side failure
+      // logs and leaves the job blocked (the pass retries).
+      if (job.rawConcurrency !== "") {
+        const evaluated = await evaluateJobConcurrencyForStoredJob(d1, job, {
+          run,
+          attemptNumber,
+          vars: passVars ?? (await loadActionsVariables(d1, run.ownerId, run.repoId)),
+          githubContext: await githubContextOnce(),
+          rowsById,
+        });
+        if (evaluated.outcome === "invalid") {
+          await upsertJobErrorSummary(d1, job, "concurrency", new Error(evaluated.message ?? "invalid concurrency"));
+          statuses.set(id, ACTION_STATUS_FAILURE);
+          job.status = ACTION_STATUS_FAILURE;
+          updates.set(id, ACTION_STATUS_FAILURE);
+          continue;
+        }
+        if (evaluated.outcome === "error") {
+          continue; // the job stays blocked; job_emitter.go:664-667 logs and retries
+        }
+        const group = evaluated.group ?? "";
+        const cancel = evaluated.cancel ?? false;
+        if (group !== "" && admittedGroups.has(group)) {
+          gateDeferred = true;
+          continue; // another job of this pass already entered the group
+        }
+        job.concurrencyGroup = group;
+        job.concurrencyCancel = cancel;
+        job.isConcurrencyEvaluated = true;
+      }
+
+      // PrepareToStartJobWithConcurrency (clear_tasks.go:106-125): the
+      // entering job cancels the group's previous entries, then blocks or
+      // proceeds behind the admitted-group gate.
+      let newStatus = ACTION_STATUS_WAITING;
+      if (job.isConcurrencyEvaluated && job.concurrencyGroup !== "") {
+        if (admittedGroups.has(job.concurrencyGroup)) {
+          gateDeferred = true;
+          continue;
+        }
+        const { cancelled } = await cancelPreviousJobsByJobConcurrency(d1, {
+          repoId: job.repoId,
+          runId: job.runId,
+          runAttemptId: job.runAttemptId,
+          jobId: job.jobId,
+          concurrencyGroup: job.concurrencyGroup,
+          concurrencyCancel: job.concurrencyCancel,
+        });
+        for (const c of cancelled) {
+          if (!cancelledByConcurrency.some((x) => x.id === c.id)) cancelledByConcurrency.push(c);
+        }
+        if (await shouldBlockJobByConcurrency(d1, {
+          repoId: job.repoId,
+          runId: job.runId,
+          runAttemptId: job.runAttemptId,
+          jobId: job.jobId,
+          concurrencyGroup: job.concurrencyGroup,
+          concurrencyCancel: job.concurrencyCancel,
+        })) {
+          newStatus = ACTION_STATUS_BLOCKED;
+        }
+      }
+
+      if (newStatus === ACTION_STATUS_WAITING && !slotAvailable(job)) continue; // a slot-starved job stays blocked
+      if (newStatus === ACTION_STATUS_WAITING && !slotTake(job)) continue;
+      if (newStatus === ACTION_STATUS_WAITING && job.concurrencyGroup !== "" && job.isConcurrencyEvaluated) {
+        admittedGroups.add(job.concurrencyGroup);
+      }
       statuses.set(id, newStatus);
       job.status = newStatus;
       updates.set(id, newStatus);
@@ -2856,11 +3196,29 @@ export async function checkJobsOfRun(d1: D1Database, runId: number): Promise<voi
     await db.update(actionRuns).set(runPatch).where(eq(actionRuns.id, run.id));
   }
 
+  // The concurrency-cancelled jobs settle the way the insert tail's
+  // affectedByCancel arm does (notifyAndEmitFinishedJobs, run.go:155-160):
+  // an emitter pass per affected run, then their statuses re-post.
+  for (const cancelled of cancelledByConcurrency) {
+    if (cancelled.runId !== run.id) {
+      await checkJobsOfRun(d1, cancelled.runId);
+    }
+  }
+  if (cancelledByConcurrency.length > 0) {
+    const affectedRunIds = [...new Set(cancelledByConcurrency.map((j) => j.runId))];
+    await createCommitStatusesForJobsByRun(d1, affectedRunIds);
+  }
+
+  // r.gateDeferred (job_emitter.go:655-657): a job stayed blocked on a group
+  // this pass already admitted — one more pass lets the next entrant in.
+  if (gateDeferred) {
+    await checkJobsOfRun(d1, run.id);
+  }
+
   // checkRunConcurrency (job_emitter.go:181-234): this pass's run may hold
   // a group a blocked waiter can now enter — wake it (its own pass runs the
   // unblock re-check above). The group set is the run-level group (the
-  // attempt's evaluated group) plus the done jobs' evaluated groups; v1 job
-  // rows store unevaluated (the module header), so the job arm is dead.
+  // attempt's evaluated group) plus the done jobs' evaluated groups.
   if (updatedJobIds.length > 0) {
     const passGroups = new Set<string>();
     if (attemptConcurrencyGroup !== "") passGroups.add(attemptConcurrencyGroup);
@@ -2908,6 +3266,252 @@ function jobRawIf(job: RunJobRow): string {
   } catch {
     return "";
   }
+}
+
+// ---------------------------------------------------------------------------
+// The E5 deferred-matrix expansion + the job-level concurrency fill model
+// (services/actions/matrix.go:43-204, job_emitter.go:636-702,
+// concurrency.go:46-81)
+// ---------------------------------------------------------------------------
+
+/** A stored single-job payload read back into the model (ParseRawSingleWorkflow). */
+function storedJobModel(job: RunJobRow): { header: Array<[string, YamlNode]>; model: ReturnType<typeof import("./workflow-model").decodeJobModel> } | null {
+  try {
+    const parsed = parseRawSingleWorkflow(payloadText(job.workflowPayload));
+    if (parsed.error !== null) return null;
+    return { header: parsed.header, model: parsed.job };
+  } catch {
+    return null;
+  }
+}
+
+/** The stored runs-on's schema problem (invalidRunsOn, job_emitter.go:629-635
+ *  over job.RunsOnProblem). Unreadable payload → "" (the dispatch claim
+ *  releases on it instead). */
+function storedRunsOnProblem(job: RunJobRow): string {
+  const stored = storedJobModel(job);
+  if (stored === null) return "";
+  return runsOnProblem(stored.model.rawRunsOn);
+}
+
+interface StoredJobPassContext {
+  run: RunRow;
+  repoOwnerNamespace: string;
+  repoSlug: string;
+  attemptNumber: number;
+  vars: Record<string, string>;
+  githubContext: Record<string, unknown>;
+}
+
+/**
+ * expandDeferredMatrixOfJob is the matrix.go:43-204 port over our rows: the
+ * placeholder's stored payload parses, the strategy resolves against the
+ * completed needs (ExpandMatrixWithNeeds), combination 0 reuses the
+ * placeholder row behind the (is_matrix_deferred, blocked) CAS claim, and
+ * the siblings insert BLOCKED with fresh attempt_job_ids. Outcomes:
+ *   - "failed" — the placeholder terminal-failed in place (the D5 posture);
+ *   - "claimed" — a concurrent pass won the claim, this pass leaves it;
+ *   - "expanded" — the placeholder flipped and the siblings are in.
+ */
+async function expandDeferredMatrixOfJob(
+  d1: D1Database,
+  job: RunJobRow,
+  pass: StoredJobPassContext,
+): Promise<"failed" | "claimed" | "expanded"> {
+  const db = drizzle(d1);
+  const failTerminal = async (): Promise<"failed"> => {
+    const stopped = new Date();
+    const result = await db
+      .update(actionRunJobs)
+      .set({ status: ACTION_STATUS_FAILURE, stopped, updated: stopped })
+      .where(
+        and(
+          eq(actionRunJobs.id, job.id),
+          eq(actionRunJobs.isMatrixDeferred, true),
+          inArray(actionRunJobs.status, [ACTION_STATUS_PENDING, ACTION_STATUS_BLOCKED]),
+        ),
+      )
+      .returning();
+    if (result.length > 0) {
+      job.status = ACTION_STATUS_FAILURE;
+      job.stopped = stopped;
+    }
+    return "failed";
+  };
+
+  // findJobNeedsAndFillJobResults over the current rows (the resolver only
+  // calls the expansion once every need is done)
+  const jobRows = await db
+    .select()
+    .from(actionRunJobs)
+    .where(and(eq(actionRunJobs.runId, job.runId), eq(actionRunJobs.runAttemptId, job.runAttemptId)))
+    .orderBy(actionRunJobs.id);
+  const rowsById = new Map<string, RunJobRow[]>();
+  for (const row of jobRows) {
+    const list = rowsById.get(row.jobId);
+    if (list === undefined) rowsById.set(row.jobId, [row]);
+    else list.push(row);
+  }
+  let results: Record<string, ServerJobResult>;
+  try {
+    results = await needsJobResults(d1, job, rowsById);
+  } catch {
+    return failTerminal();
+  }
+
+  const stored = storedJobModel(job);
+  if (stored === null) {
+    return failTerminal();
+  }
+
+  const existingJobs = jobRows.length;
+  // the placeholder is reused as the first combination, so the attempt only
+  // grows by len-1 (matrix.go:104-107)
+  const maxCombinations = Math.max(1, MAX_JOB_NUM_PER_RUN - existingJobs + 1);
+
+  const expanded = expandMatrixWithNeeds({
+    jobId: job.jobId,
+    job: stored.model,
+    gitContext: pass.githubContext,
+    results,
+    vars: pass.vars,
+    inputs: undefined,
+    maxCombinations,
+  });
+  if (expanded.error !== null) {
+    console.error(`[actions-trigger] matrix expansion failed for job ${job.id} (${job.jobId}): ${expanded.error.message}`);
+    return failTerminal();
+  }
+
+  const applyCombo = (combo: WorkflowJobCombo): { payload: Uint8Array; name: string; runsOn: string[]; continueOnError: boolean; maxParallel: number } => {
+    const payload = marshalComboPayload(stored.header, combo.job, { eraseNeeds: true });
+    return {
+      payload,
+      name: ellipsisDisplayString(unescapeExpressions(combo.job.name), 255),
+      runsOn: jobRunsOn(combo.job),
+      continueOnError: getContinueOnError(combo.job.rawContinueOnError),
+      maxParallel: maxParallelOfCombo(combo.jobId, combo.job.strategy),
+    };
+  };
+
+  const siblings: Array<typeof actionRunJobs.$inferInsert> = [];
+  for (const combo of expanded.combos.slice(1)) {
+    const applied = applyCombo(combo);
+    siblings.push({
+      runId: job.runId,
+      repoId: job.repoId,
+      ownerId: job.ownerId,
+      commitSha: job.commitSha,
+      isForkPullRequest: job.isForkPullRequest,
+      name: applied.name,
+      attempt: job.attempt,
+      workflowPayload: applied.payload,
+      jobId: job.jobId,
+      needs: job.needs,
+      runsOn: JSON.stringify(applied.runsOn),
+      status: ACTION_STATUS_BLOCKED,
+      rawConcurrency: job.rawConcurrency,
+      isConcurrencyEvaluated: false,
+      maxParallel: applied.maxParallel,
+      continueOnError: applied.continueOnError,
+      runAttemptId: job.runAttemptId,
+      attemptJobId: 0, // allocated after the claim lands
+      created: new Date(),
+      updated: new Date(),
+    });
+  }
+
+  // claim the placeholder (matrix.go:174-192): only the caller that flips
+  // is_matrix_deferred owns the siblings
+  const first = expanded.combos[0];
+  if (first === undefined) {
+    return failTerminal();
+  }
+  const appliedFirst = applyCombo(first);
+  const now = new Date();
+  const claimed = await db
+    .update(actionRunJobs)
+    .set({
+      name: appliedFirst.name,
+      workflowPayload: appliedFirst.payload,
+      runsOn: JSON.stringify(appliedFirst.runsOn),
+      continueOnError: appliedFirst.continueOnError,
+      maxParallel: appliedFirst.maxParallel,
+      isMatrixDeferred: false,
+      updated: now,
+    })
+    .where(
+      and(
+        eq(actionRunJobs.id, job.id),
+        eq(actionRunJobs.isMatrixDeferred, true),
+        inArray(actionRunJobs.status, [ACTION_STATUS_PENDING, ACTION_STATUS_BLOCKED]),
+      ),
+    )
+    .returning();
+  if (claimed.length === 0) {
+    return "claimed"; // a concurrent pass won; its rows join the next pass
+  }
+  job.isMatrixDeferred = false;
+  job.name = appliedFirst.name;
+  job.workflowPayload = appliedFirst.payload;
+
+  if (siblings.length === 0) {
+    return "expanded";
+  }
+  // GetNextAttemptJobID per sibling (max+1 within the attempt)
+  let nextAttemptJobId = jobRows.reduce((max, row) => Math.max(max, row.attemptJobId), 0);
+  for (const sibling of siblings) {
+    nextAttemptJobId += 1;
+    sibling.attemptJobId = nextAttemptJobId;
+  }
+  await db.insert(actionRunJobs).values(siblings);
+  return "expanded";
+}
+
+/** The fill model over a STORED job (EvaluateJobConcurrencyFillModel,
+ *  concurrency.go:46-81): the stored node decodes, the needs results fill
+ *  from the current rows, and the model evaluates. Outcomes: "ok" carries
+ *  the evaluated group/cancel; "invalid" is the util.ErrInvalidArgument arm
+ *  (a persisted summary + FAILURE); "error" is a DB-side failure (the job
+ *  stays blocked, the pass retries). */
+async function evaluateJobConcurrencyForStoredJob(
+  d1: D1Database,
+  job: RunJobRow,
+  pass: { run: RunRow; attemptNumber: number; vars: Record<string, string>; githubContext: Record<string, unknown>; rowsById: Map<string, RunJobRow[]> },
+): Promise<{ outcome: "ok" | "invalid" | "error"; group?: string; cancel?: boolean; message?: string }> {
+  const stored = storedJobModel(job);
+  if (stored === null) {
+    return { outcome: "error" };
+  }
+  let rc: { group: string; cancelInProgress: string; rawExpression: string } | null;
+  try {
+    const doc = parseDocument(job.rawConcurrency);
+    rc = readRawConcurrencyNode(doc.contents as YamlNode | undefined);
+  } catch {
+    rc = null;
+  }
+  if (rc === null) {
+    return { outcome: "error" };
+  }
+  let results: Record<string, ServerJobResult>;
+  try {
+    results = await needsJobResults(d1, job, pass.rowsById);
+  } catch {
+    return { outcome: "error" };
+  }
+  const evaluated = evaluateJobConcurrency({
+    rc,
+    jobId: job.jobId,
+    job: stored.model,
+    gitContext: pass.githubContext,
+    results,
+    vars: pass.vars,
+    inputs: undefined,
+  });
+  if (evaluated.error !== null) {
+    return { outcome: "invalid", message: evaluated.error.message };
+  }
+  return { outcome: "ok", group: evaluated.group, cancel: evaluated.cancel };
 }
 
 // ---------------------------------------------------------------------------
@@ -3206,7 +3810,7 @@ async function triggerForEvent(
       );
       continue;
     }
-    if (split.some((job) => job.hasMatrix)) continue;
+    void split;
     try {
       await insertTriggeredRunSplit(
         env.DB,
@@ -3226,7 +3830,7 @@ async function triggerForEvent(
           repoSlug: repo.slug,
           appUrl,
         },
-        split,
+        file.content,
         readWorkflowRawConcurrency(file.content),
       );
     } catch (err) {
