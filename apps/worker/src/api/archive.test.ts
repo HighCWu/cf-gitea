@@ -32,7 +32,9 @@ import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
 import { registerArchiveRoutes } from "./routes/archive";
 import { registerLanguageRoutes } from "./routes/languages";
-import { parseGitattributes, ruleMatches } from "./services/archive";
+// the matcher is engine-side (P2-8's attr-macro boundary decision —
+// docs/research/attr-macro-boundary.md); the walk consumes expanded rules
+import { parseGitattributes, ruleMatches } from "@cf-gitea/git-engine";
 import { engineCell, ZERO_OID } from "./services/engine";
 import { RepoService } from "../repos/service";
 import type { User } from "./models/user";
@@ -95,6 +97,62 @@ const ATTR_COMMITS = [
       { path: "tests/sub/deep.txt", content: "deep\n" },
       { path: "docs/notes.md", content: "notes\n" },
       { path: "VERSION", content: ATTR_VERSION },
+    ],
+  },
+];
+
+// The macro-attributes fixture repo (P2-8): every macro arm git 2.43 pins,
+// exercised through the full route (the engine matcher expands, the walk
+// resolves unchanged). Definitions live in the TOP-LEVEL file only; the
+// deeper lib/.gitattributes CONSUMES a root macro and carries a definition
+// of its own that git ignores (localized "not allowed" warning, no effect).
+const MACRO_SLUG = "macro-repo";
+const MACRO_PATH = `/repos/${OWNER}/${MACRO_SLUG}`;
+const MACRO_VERSION = "ver=$Format:%H$\n";
+
+const MACRO_COMMITS = [
+  {
+    message: "seed: macro attributes",
+    time: T0,
+    files: [
+      {
+        path: ".gitattributes",
+        content: [
+          "[attr]arc export-ignore",
+          "[attr]keep -export-ignore",
+          "[attr]pub export-subst",
+          "[attr]chain mid",
+          "[attr]mid arc",
+          "[attr]cyc other",
+          "[attr]other cyc",
+          "secret* arc",
+          "*.log arc",
+          "keep.log keep",
+          "ghost.txt undefinedmacro",
+          "cycle.txt cyc",
+          "chained.txt chain",
+          "valued.txt pub=x",
+          "pic.png binary",
+          "VERSION pub",
+          "",
+        ].join("\n"),
+      },
+      // consumes the ROOT macro (the walk threads the registry deeper) and
+      // carries a `[attr]` definition of its own — top-level-only per
+      // gitattributes(5), the definition is ignored
+      { path: "lib/.gitattributes", content: "[attr]x export-ignore\nlibsecret arc\nignored.txt x\n" },
+      { path: "README.md", content: "# macro suite\n" },
+      { path: "secret.txt", content: "s\n" },
+      { path: "chained.txt", content: "chain\n" },
+      { path: "keep.log", content: "kept via macro re-include\n" },
+      { path: "drop.log", content: "dropped via macro\n" },
+      { path: "ghost.txt", content: "undefined macro is no-op\n" },
+      { path: "cycle.txt", content: "cycle terminates silently\n" },
+      { path: "valued.txt", content: "value form never expands\n" },
+      { path: "pic.png", content: "PNG-ish\n" },
+      { path: "lib/libsecret", content: "root macro via deeper use\n" },
+      { path: "lib/ignored.txt", content: "subdir macro definition ignored\n" },
+      { path: "VERSION", content: MACRO_VERSION },
     ],
   },
 ];
@@ -191,12 +249,14 @@ const SUBST_COMMITS = [
 let OWNER_ID = 1;
 let ATTR_TIP = "";
 let SUBST_TIPS: string[] = [];
+let MACRO_TIP = "";
 
 beforeAll(async () => {
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
   await applyAuthD1Migrations();
   await ensureSeededRepo({ owner: OWNER, slug: SLUG, commits: SEED_COMMITS });
   ATTR_TIP = (await ensureSeededRepo({ owner: OWNER, slug: ATTR_SLUG, commits: ATTR_COMMITS })).tips[0] as string;
+  MACRO_TIP = (await ensureSeededRepo({ owner: OWNER, slug: MACRO_SLUG, commits: MACRO_COMMITS })).tips[0] as string;
   SUBST_TIPS = (
     await ensureSeededRepo({
       owner: OWNER,
@@ -515,6 +575,64 @@ describe("archive .gitattributes export rules", () => {
 });
 
 // ---------------------------------------------------------------------------
+// macro attributes (P2-8 — [attr] expansion in the engine matcher; every arm
+// pinned against stock git 2.43.0 fixture repos, see
+// docs/research/attr-macro-boundary.md)
+// ---------------------------------------------------------------------------
+
+describe("archive macro attributes ([attr] expansion through the route)", () => {
+  const KEPT = [
+    `${MACRO_SLUG}/.gitattributes`,
+    `${MACRO_SLUG}/README.md`,
+    `${MACRO_SLUG}/VERSION`,
+    `${MACRO_SLUG}/cycle.txt`,
+    `${MACRO_SLUG}/ghost.txt`,
+    `${MACRO_SLUG}/keep.log`,
+    `${MACRO_SLUG}/lib/.gitattributes`,
+    `${MACRO_SLUG}/lib/ignored.txt`,
+    `${MACRO_SLUG}/pic.png`,
+    `${MACRO_SLUG}/valued.txt`,
+  ].sort();
+
+  it("excludes via macros: a user macro, a two-level chain, and a root macro consumed by a deeper .gitattributes", async () => {
+    const res = await fetchRoute(`${MACRO_PATH}/archive/main.tar.gz`);
+    expect(res.status).toBe(200);
+    const gz = new Uint8Array(await res.arrayBuffer());
+    const entries = parseTar(
+      new Uint8Array(await new Response(new Blob([gz]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer()),
+    );
+    expect(entries.map((e) => e.name).sort()).toEqual(KEPT);
+    // secret* arc (direct user macro); chained.txt via [attr]chain mid +
+    // [attr]mid arc (recursive expansion); lib/libsecret via the deeper
+    // file's `libsecret arc` consuming the ROOT definition (registry
+    // threading). drop.log goes via `*.log arc` while keep.log's later
+    // `[attr]keep -export-ignore` line re-includes (expansion rides the
+    // expanding line; the last matching line still wins).
+    const names = entries.map((e) => e.name);
+    expect(names.some((n) => n.endsWith("/secret.txt") || n.endsWith("/chained.txt") || n.endsWith("/libsecret") || n.endsWith("/drop.log"))).toBe(false);
+    expect(names).toContain(`${MACRO_SLUG}/keep.log`);
+  });
+
+  it("keeps the no-op forms: undefined macro, macro cycle, value form, bare builtin binary, subdir definition", async () => {
+    const res = await fetchRoute(`${MACRO_PATH}/archive/main.zip`);
+    expect(res.status).toBe(200);
+    const entries = await parseZip(new Uint8Array(await res.arrayBuffer()));
+    expect(entries.map((e) => e.name).sort()).toEqual(KEPT);
+    expect(entries.find((e) => e.name === `${MACRO_SLUG}/cycle.txt`)?.content).toBe("cycle terminates silently\n");
+  });
+
+  it("expands macro-carried export-subst: `[attr]pub export-subst` + `VERSION pub` renders the oid", async () => {
+    const res = await fetchRoute(`${MACRO_PATH}/archive/main.tar.gz`);
+    expect(res.status).toBe(200);
+    const gz = new Uint8Array(await res.arrayBuffer());
+    const entries = parseTar(
+      new Uint8Array(await new Response(new Blob([gz]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer()),
+    );
+    expect(entries.find((e) => e.name === `${MACRO_SLUG}/VERSION`)?.content).toBe(`ver=${MACRO_TIP}\n`);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // export-subst expansion (the residuals item-8 arm — the git 2.43.0 port)
 // ---------------------------------------------------------------------------
 
@@ -691,8 +809,70 @@ describe("parseGitattributes matching rules", () => {
     expect(excluded("!x.txt export-ignore\n", "", "x.txt")).toBe(false);
   });
 
-  it("comments, blank lines and [attr] macro lines produce no rules (macros are outside the subset)", () => {
-    expect(parseGitattributes("# comment\n\n[attr]macro export-ignore\n", "")).toEqual([]);
+  it("comments and blank lines produce no rules; an [attr] line DEFINES a macro (top-level) instead of compiling one", () => {
+    expect(parseGitattributes("# comment\n\n", "")).toEqual([]);
+    // the definition line itself never compiles a rule
+    expect(parseGitattributes("[attr]arc export-ignore\n", "")).toEqual([]);
+  });
+
+  it("expands macros: user macro, chain, re-include, use-above-definition, redefinition last-wins", () => {
+    expect(excluded("[attr]arc export-ignore\nsecret* arc\n", "", "secret.txt")).toBe(true);
+    expect(excluded("[attr]arc export-ignore\nsecret* arc\n", "", "keep.txt")).toBe(false);
+    // transitive chain: a → b → export-ignore
+    expect(excluded("[attr]a b\n[attr]b export-ignore\nf a\n", "", "f")).toBe(true);
+    // `[attr]keep -export-ignore` re-includes at the line's position
+    expect(excluded("*.log export-ignore\n[attr]keep -export-ignore\nkeep.log keep\n", "", "keep.log")).toBe(false);
+    expect(excluded("*.log export-ignore\n[attr]keep -export-ignore\nkeep.log keep\n", "", "drop.log")).toBe(true);
+    // parse-then-resolve: the use line ABOVE the definition still expands
+    expect(excluded("f m\n[attr]m export-ignore\n", "", "f")).toBe(true);
+    // a redefinition overwrites: LAST definition wins
+    expect(excluded("[attr]m export-ignore\n[attr]m -export-ignore\nf m\n", "", "f")).toBe(false);
+  });
+
+  it("within one line, tokens resolve RIGHT-TO-LEFT (git's fill order) and a macro expands at its token", () => {
+    // rightmost explicit token beats the leftward macro's body
+    expect(excluded("[attr]m -export-ignore\nf m export-ignore\n", "", "f")).toBe(true);
+    // the macro's body beats the leftward explicit token
+    expect(excluded("[attr]m -export-ignore\nf export-ignore m\n", "", "f")).toBe(false);
+    // plain duplicate tokens: rightmost wins (git fill_one reversed walk)
+    expect(excluded("f export-ignore -export-ignore\n", "", "f")).toBe(false);
+    expect(excluded("f -export-ignore export-ignore\n", "", "f")).toBe(true);
+    // two macros on one line: the rightmost wins on conflict
+    expect(excluded("[attr]a export-ignore\n[attr]b -export-ignore\nf a b\n", "", "f")).toBe(false);
+    expect(excluded("[attr]a export-ignore\n[attr]b -export-ignore\nf b a\n", "", "f")).toBe(true);
+  });
+
+  it("macro lines outside the TOP-LEVEL file are ignored (gitattributes(5): top-level-only definitions)", () => {
+    // dir "lib": the [attr] definition has no effect and libsecret gets no rule
+    expect(excluded("[attr]x export-ignore\nf x\n", "lib", "lib/f")).toBe(false);
+  });
+
+  it("macros expand only on the SET value; value/unset/! forms never expand", () => {
+    expect(excluded("[attr]m export-ignore\nf1 m=123\n", "", "f1")).toBe(false);
+    expect(excluded("[attr]m export-ignore\nf2 -m\n", "", "f2")).toBe(false);
+    expect(excluded("[attr]m export-ignore\nf3 !m\n", "", "f3")).toBe(false);
+    expect(excluded("[attr]m export-ignore\nf4 m\n", "", "f4")).toBe(true);
+  });
+
+  it("undefined macro names are ordinary attributes (no expansion, no rule); cycles terminate silently", () => {
+    expect(excluded("f undefinedmacro\n", "", "f")).toBe(false);
+    // a→b→a: git's already-set guard stops the recursion with no diagnostic
+    expect(excluded("[attr]a b\n[attr]b a\nf a\n", "", "f")).toBe(false);
+  });
+
+  it("the builtin binary macro recurses (archive-neutral alone, chainable with archive attrs)", () => {
+    // bare `binary` never affects the archive subset
+    expect(excluded("f.png binary\n", "", "f.png")).toBe(false);
+    // binary inside a user chain expands (-diff -merge -text) while the
+    // chain's own export-ignore applies
+    expect(excluded("[attr]a binary export-ignore\nf.png a\n", "", "f.png")).toBe(true);
+    // a user [attr]binary REPLACES the builtin (text/diff become unspecified
+    // in git — check-attr pinned; here the override drives export-ignore)
+    expect(excluded("[attr]binary export-ignore\nf.png binary\n", "", "f.png")).toBe(true);
+  });
+
+  it("!attr inside a macro body is the unspecified value and can re-open an attribute", () => {
+    expect(excluded("*.q export-ignore\n[attr]m !export-ignore\nf.q m\n", "", "f.q")).toBe(false);
   });
 
   it("patterns without a slash match the basename at any depth; anchored patterns do not", () => {

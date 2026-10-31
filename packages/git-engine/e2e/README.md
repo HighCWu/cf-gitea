@@ -348,3 +348,33 @@ any failing site in them fails the run naming file:line (never commit one).
 TSX=$(ls -d node_modules/.pnpm/tsx@*/node_modules/tsx/dist/cli.mjs | head -1)
 node "$TSX" packages/git-engine/e2e/check-drain-discipline.mjs   # 4 checks (tree) + selftest; prints the site census
 ```
+
+## P2-8 attr-macro check (tsx, no dev server)
+
+`check-archive-attrs.mjs` — the .gitattributes language (patterns, matching,
+MACRO ATTRIBUTES) differential-tested against a real `git archive` oracle, the
+boundary decision recorded in `docs/research/attr-macro-boundary.md`: the
+language lives engine-side (`src/git/attributes.ts`, the attr.c analog — moved
+from the worker's archive walk that compiled rules inline since 5365236) and
+the worker walk consumes expanded rules unchanged. 24 checks: every fixture
+builds a real repo, runs real `git archive HEAD`, and requires our walk
+emulator's file set to equal git's exactly — the builtin binary macro
+(archive-neutral alone, chainable, user-overridable), user macros, transitive
+chains, the re-include arm, use-above-definition, redefinition last-wins,
+within-line right-to-left resolution, cross-file registry threading,
+top-level-only definitions, silent cycle stop, value/unset/`!` non-expansion,
+`!attr` bodies, dir-pattern prunes through macros, and macro-carried
+export-subst pinned at the CONTENT level (git's expanded bytes vs our
+exportSubstActive flag). Mutation-checked: flipping the within-line scan to
+left-to-right fails exactly the three ordering fixtures; dropping the
+seen-guard fails the cycle fixture (stack overflow).
+
+```bash
+TSX=$(ls -d node_modules/.pnpm/tsx@*/node_modules/tsx/dist/cli.mjs | head -1)
+node "$TSX" packages/git-engine/e2e/check-archive-attrs.mjs   # 24 checks
+```
+
+Every run's git output carries git's own localized "negative patterns are
+ignored" / "not allowed [attr]…" warnings on stderr — git's CLI diagnostics
+for lines our matcher skips silently (the archive SEMANTICS are the skip, and
+that is what the differential pins).

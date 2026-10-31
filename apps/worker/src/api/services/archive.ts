@@ -41,6 +41,16 @@
  *     slash makes it directory-only; a matching DIRECTORY prunes its whole
  *     subtree. Outside the honored subset (documented): `[...]` character
  *     classes, brace expansion and escaped wildcards;
+ *   - MACRO ATTRIBUTES expand in the matcher (the engine's src/git/attributes
+ *     module — the P2-8 boundary decision, docs/research/attr-macro-boundary.md):
+ *     `[attr]name …` lines define macros in the TOP-LEVEL .gitattributes only
+ *     (deeper definitions are ignored, git 2.43's warned-and-skipped posture),
+ *     the builtin `binary` macro is seeded, a macro expands where its SET line
+ *     sits (git's right-to-left first-assignment-wins within a line, silent
+ *     cycle stop, last definition wins), and the walk threads one registry so
+ *     a root macro reaches deeper files' rules — every macro-carried
+ *     export-ignore/export-subst assignment lands in the expanded rules and the
+ *     resolution below is unchanged;
  *   - `!pattern` negative-pattern lines are SKIPPED (git 2.43 warns "negative
  *     patterns are ignored in git attributes" and does the same);
  *     `-export-ignore` is the re-include arm — a deeper file's unset beats a
@@ -86,6 +96,14 @@ import type { EngineReads } from "./engine";
 import { branchRef, refTipMap, tagRef } from "./engine";
 import { ApiError } from "../errors";
 import { buildDecorations, EMPTY_MAILMAP, expandExportSubst, parseMailmap, type SubstContext } from "./export-subst";
+import {
+  createAttrMacros,
+  exportIgnoreExcluded,
+  exportSubstActive,
+  parseGitattributes,
+  type AttrMacros,
+  type GitattributesRule,
+} from "@cf-gitea/git-engine";
 
 /** One file to archive: full tree path + entry metadata (blob bytes stream later). */
 export interface ArchiveEntry {
@@ -138,194 +156,14 @@ export function resolveArchiveRef(tips: ReturnType<typeof refTipMap>, ref: strin
 }
 
 // ---------------------------------------------------------------------------
-// .gitattributes export rules (export-ignore + export-subst honored)
+// .gitattributes export rules (export-ignore + export-subst honored; the
+// language — patterns, matching and MACRO ATTRIBUTES — is the engine's
+// src/git/attributes module, the P2-8 boundary decision recorded in
+// docs/research/attr-macro-boundary.md; this walk threads one macro registry
+// root→leaf and resolves the EXPANDED rules unchanged)
 // ---------------------------------------------------------------------------
 
 const TD = new TextDecoder();
-
-/**
- * One parsed .gitattributes line that assigns one of the archive-relevant
- * attributes. Lines assigning neither export-ignore nor export-subst are
- * dropped at parse time (they cannot affect the archive). Assignment values
- * follow gitattributes(5): `attr` = true, `-attr` = false (unset), `!attr` =
- * null (explicitly unspecified), `attr=value` = undefined (neither TRUE nor
- * UNSET — the archive check is git's ATTR_TRUE, so value forms never match).
- */
-export interface GitattributesRule {
-  re: RegExp;
-  /** pattern ended with `/` — matches directories only */
-  dirOnly: boolean;
-  /** pattern had no slash — matched against the basename at any depth */
-  basenameOnly: boolean;
-  exportIgnore?: boolean | null;
-  exportSubst?: boolean | null;
-}
-
-/**
- * gitignore(5) matching for one rule: anchored patterns match the whole
- * repo-root-relative path; basename patterns match at any depth; dirOnly
- * rules never match a file entry. Directory matches prune the subtree at the
- * walk site (upstream: "patterns that match a directory do not recursively
- * match paths inside that directory" — the prune is what archives get).
- */
-export function ruleMatches(rule: GitattributesRule, path: string, isDir: boolean): boolean {
-  if (rule.dirOnly && !isDir) return false;
-  if (rule.basenameOnly) {
-    const base = path.slice(path.lastIndexOf("/") + 1);
-    return rule.re.test(base);
-  }
-  return rule.re.test(path);
-}
-
-/**
- * The LAST matching export-ignore assignment in rule order wins; rule order
- * is root→leaf files with each file's lines in order, which reproduces
- * gitattributes(5)'s precedence (deeper file beats shallower, later line
- * beats earlier). No matching assignment → unspecified → include.
- */
-function exportIgnoreExcluded(rules: GitattributesRule[], path: string, isDir: boolean): boolean {
-  let value: boolean | null | undefined;
-  for (const rule of rules) {
-    if (rule.exportIgnore === undefined) continue;
-    if (ruleMatches(rule, path, isDir)) value = rule.exportIgnore;
-  }
-  return value === true;
-}
-
-/**
- * export-subst's mirror of the resolution above: the LAST matching export-subst
- * assignment in rule order wins; `-export-subst` in a deeper file re-includes.
- * Only git's ATTR_TRUE expands — value forms never match, like export-ignore.
- */
-function exportSubstActive(rules: GitattributesRule[], path: string, isDir: boolean): boolean {
-  let value: boolean | null | undefined;
-  for (const rule of rules) {
-    if (rule.exportSubst === undefined) continue;
-    if (ruleMatches(rule, path, isDir)) value = rule.exportSubst;
-  }
-  return value === true;
-}
-
-/** One unanchored segment: `*`/`?` never cross `/` (gitignore wildmatch). */
-function compileSegment(segment: string): string {
-  let out = "";
-  for (const ch of segment) {
-    if (ch === "*") out += "[^/]*";
-    else if (ch === "?") out += "[^/]";
-    else out += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  }
-  return out;
-}
-
-function compilePattern(pattern: string, dirOnly: boolean, basenameOnly: boolean): GitattributesRule {
-  let source: string;
-  if (basenameOnly) {
-    source = `^${compileSegment(pattern)}$`;
-  } else {
-    // `**` as a whole segment crosses directories; `**/` also matches zero of
-    // them (gitignore wildmatch). Leading `**/x` → x at any depth; `x/**`
-    // matches everything below x but not x itself.
-    source = "^";
-    const segments = pattern.split("/");
-    for (let i = 0; i < segments.length; i++) {
-      const segment = segments[i] as string;
-      const last = i === segments.length - 1;
-      if (segment === "**") {
-        source += last ? ".*" : "(?:.*/)?";
-        continue;
-      }
-      source += compileSegment(segment);
-      if (!last) source += "/";
-    }
-    source += "$";
-  }
-  return { re: new RegExp(source, "u"), dirOnly, basenameOnly };
-}
-
-/**
- * Field split with gitattributes' backslash escapes (`foo\ bar` is one field
- * whose space is literal); the backslash itself is dropped from the field.
- */
-function splitAttrFields(line: string): string[] {
-  const fields: string[] = [];
-  let current = "";
-  let escaped = false;
-  for (const ch of line) {
-    if (escaped) {
-      current += ch;
-      escaped = false;
-      continue;
-    }
-    if (ch === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (ch === " " || ch === "\t") {
-      if (current !== "") {
-        fields.push(current);
-        current = "";
-      }
-      continue;
-    }
-    current += ch;
-  }
-  if (escaped) current += "\\";
-  if (current !== "") fields.push(current);
-  return fields;
-}
-
-/** `name` → true; `-name` → false; `!name` → null; `name=value` → undefined. */
-function attrAssignment(token: string): { name: string; value: boolean | null | undefined } | null {
-  if (token.startsWith("-")) return { name: token.slice(1), value: false };
-  if (token.startsWith("!")) return { name: token.slice(1), value: null };
-  const eq = token.indexOf("=");
-  if (eq >= 0) return { name: token.slice(0, eq), value: undefined };
-  return { name: token, value: true };
-}
-
-/**
- * Parse one .gitattributes blob's text as found at tree directory `dir`
- * ("" for the root). gitattributes(5) line grammar with the archive subset:
- * comments (`#`), blank lines, `[attr]` macro lines and `!pattern`
- * negative-pattern lines are skipped (git 2.43 ignores the latter with a
- * warning); the remaining lines compile one pattern each. Patterns anchor to
- * `dir` when they contain a slash, otherwise match basenames at any depth.
- */
-export function parseGitattributes(text: string, dir: string): GitattributesRule[] {
-  const rules: GitattributesRule[] = [];
-  const dirPrefix = dir === "" ? "" : `${dir}/`;
-  for (const rawLine of text.split("\n")) {
-    const line = rawLine.replace(/\r$/, "");
-    if (line === "" || line.startsWith("#") || line.startsWith("!") || line.startsWith("[attr]")) continue;
-    const fields = splitAttrFields(line);
-    const pattern = fields[0];
-    if (pattern === undefined) continue;
-    let dirOnly = false;
-    let body = pattern;
-    if (body.endsWith("/")) {
-      dirOnly = true;
-      body = body.slice(0, -1);
-    }
-    const basenameOnly = !body.includes("/");
-    if (body.startsWith("/")) body = body.slice(1);
-    if (body === "") continue;
-    let compiled: GitattributesRule;
-    try {
-      compiled = compilePattern(basenameOnly ? body : dirPrefix + body, dirOnly, basenameOnly);
-    } catch {
-      continue; // an uncompilable pattern matches nothing, like git's skip
-    }
-    const rule: GitattributesRule = { re: compiled.re, dirOnly: compiled.dirOnly, basenameOnly: compiled.basenameOnly };
-    for (const token of fields.slice(1)) {
-      const assignment = attrAssignment(token);
-      if (assignment === null) continue;
-      if (assignment.name === "export-ignore" && rule.exportIgnore === undefined) rule.exportIgnore = assignment.value;
-      if (assignment.name === "export-subst" && rule.exportSubst === undefined) rule.exportSubst = assignment.value;
-    }
-    if (rule.exportIgnore !== undefined || rule.exportSubst !== undefined) rules.push(rule);
-  }
-  return rules;
-}
 
 /**
  * Bounded depth-first flatten of the ref's tree through per-level listTree
@@ -345,6 +183,7 @@ export async function collectArchiveEntries(
 ): Promise<ArchiveEntry[]> {
   const out: ArchiveEntry[] = [];
   let dirs = 0;
+  const macros: AttrMacros = createAttrMacros(); // builtin binary seed; the ROOT file's [attr] lines register here
   const matches = (path: string): boolean =>
     subPaths.length === 0 || subPaths.some((p) => path === p || path.startsWith(`${p}/`) || p.startsWith(`${path}/`));
   const walk = async (prefix: string, inherited: GitattributesRule[]): Promise<void> => {
@@ -354,7 +193,7 @@ export async function collectArchiveEntries(
     const attrEntry = tree.entries.find((e) => e.name === ".gitattributes" && e.type === "blob");
     if (attrEntry !== undefined) {
       const blob = await reads.readBlob(refTarget, prefix === "" ? ".gitattributes" : `${prefix}/.gitattributes`);
-      if (blob !== null) rules.push(...parseGitattributes(TD.decode(blob.data), prefix));
+      if (blob !== null) rules.push(...parseGitattributes(TD.decode(blob.data), prefix, macros));
     }
     for (const entry of tree.entries) {
       const path = prefix === "" ? entry.name : `${prefix}/${entry.name}`;

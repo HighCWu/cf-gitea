@@ -41,6 +41,20 @@ export { MAX_BLAME_LINES } from "./git/blame";
 export type { Person } from "./git/objects";
 // object serializers (SPEC-0001a §4.1): the Worker-side builders construct the
 // canonical bytes that putApiObjects verifies and stores
+// the .gitattributes language subset the archive surface consumes (P2-8's
+// attr-macro arm): pattern compile + match, export-ignore/export-subst
+// resolution, MACRO ATTRIBUTES. Boundary decision:
+// docs/research/attr-macro-boundary.md (the matcher is engine-side — this
+// package's git-semantics layer — and the worker walk consumes expanded
+// rules unchanged).
+export {
+  createAttrMacros,
+  exportIgnoreExcluded,
+  exportSubstActive,
+  parseGitattributes,
+  ruleMatches,
+} from "./git/attributes";
+export type { AttrMacros, GitattributesRule } from "./git/attributes";
 export {
   serializeCommit,
   serializeCommit as serializeCommitObject,

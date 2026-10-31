@@ -713,12 +713,31 @@ board row flips — this closes a flag, not a listed residual.
    next `$` — git's observed behavior, the disposition pinned);
    substituted at the walk's blob stream, export-ignore unchanged;
    archive.test 16→23 (each placeholder class from a fixture commit).
-   STILL OPEN (engine-scope items separated in the review):
-   `[attr]`-macro patterns sit outside the compiled matcher subset —
-   the engine-side expansion is the recorded future arm (`5365236`);
-   the ladder-ordering drifts (403-before-auth arms, the
-   wiki-doesn't-exist pkt-line, dumb-HTTP absent — documented). Sizes:
-   **M**; the attr-macro half is an engine-boundary decision first.
+   STILL OPEN (engine-scope items separated in the review): the
+   ladder-ordering drifts (403-before-auth arms, the
+   wiki-doesn't-exist pkt-line, dumb-HTTP absent — documented).
+   **LANDED slice 2026-10-31 — the attr-macro arm (DISCLOSED-HASH
+   placeholder fills at the notes window):** the engine-boundary decision
+   recorded (`docs/research/attr-macro-boundary.md`): macro expansion
+   belongs in the attribute MATCHER, and the matcher is ENGINE-side —
+   `src/git/attributes.ts`, the attr.c analog, the language moved verbatim
+   out of the worker's archive walk (the board's "packages/git-engine's
+   attr-pattern compilation" premise was wrong as-built — 5365236 compiled
+   worker-side; the decision doc corrects it against the layering pattern:
+   every git-semantics re-implementation lives engine-side with a real-git
+   tsx gate) — the walk threads one macro registry root→leaf and resolves
+   expanded rules unchanged. Every arm pinned against stock git 2.43.0
+   fixture repos (builtin `binary` seed + user override, top-level-only
+   definitions, right-to-left within-line first-assignment-wins, silent
+   cycle stop, value/unset/`!` non-expansion, redefinition last-wins,
+   `!attr` bodies, dir-prune-beats-macro-reinclude) and
+   differential-checked live by the new engine gate
+   `check-archive-attrs` (24/24 vs real `git archive`, mutation-checked
+   both ways); macro-carried export-subst flows into the landed expansion
+   unchanged. archive.test 23→31 (route-level macro repo + white-box
+   arms; the "macros are outside the subset" pin flipped). NOTICE rows
+   recorded (module + mod.ts export set — the P3-11-recorded mod.ts
+   freeze folds for this arm, its own policy unit). Size: **M**.
 
 9. **The review-packages D-4/D-5/D-6 tail — LANDED (`41eada6`).** D-4's
    nuget service-index trio serves unauthenticated (the `none` protocol
