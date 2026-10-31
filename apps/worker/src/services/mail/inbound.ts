@@ -16,9 +16,13 @@
  *     lifetime (:29), constant-time compare (:106). THE KEY DIVERGES
  *     (SPEC §3.2): upstream keys per-user `user.Rands` (:66) — our users
  *     table carries no per-user secret column — so the MAC is
- *     HMAC-SHA256(MAIL_INBOUND_SECRET, "cf-gitea/mail-reply/v1" ‖ the
- *     covered 22-byte prefix)[0:10] over EVERYTHING (version ‖ userId ‖
- *     expiry ‖ refType ‖ refId), the tighter all-covered shape.
+ *     HMAC-SHA256(MAIL_INBOUND_SECRET, domain ‖ the covered 22-byte
+ *     prefix)[0:10] over EVERYTHING (version ‖ userId ‖ expiry ‖ refType ‖
+ *     refId), the tighter all-covered shape. Upstream's handlerType byte
+ *     (token.go:32-38) becomes the MAC's family domain — `reply` (this
+ *     pipeline) and `unsubscribe` (the notify compose's List-Unsubscribe
+ *     mailto arm, SPEC §9; its inbound handler is §1.3's follow-up slice) —
+ *     so a token of one family never verifies as the other.
  *   - the token search  — incoming.go:searchTokenInHeaders (:283-320):
  *     To → Delivered-To address candidates against the reply-address
  *     template split around `%{token}` (extractToken :272-281,
@@ -101,9 +105,30 @@ const TOKEN_VERSION = 0x01;
 const TOKEN_BYTES = 32;
 const TOKEN_MAC_OFFSET = 22;
 const TOKEN_MAC_BYTES = 10;
-/** Domain separation — keeps a future token family (Unsubscribe) off this
- *  secret's forge surface (SPEC §3.2). */
-const TOKEN_DOMAIN = new TextEncoder().encode("cf-gitea/mail-reply/v1");
+/**
+ * Domain separation per token FAMILY (SPEC §3.2: "the domain-separation
+ * prefix keeps this secret usable for later token families — Unsubscribe —
+ * without cross-family forgery"). The layout is shared; only the MAC domain
+ * differs, so a token of one family can never verify as another:
+ *   - `reply`       — the Reply-To/List-Post/References carrier on
+ *                     notification mail (upstream ReplyHandlerType, token
+ *                     token.go:36); verified by decodeReplyToken's default
+ *                     and by the pipeline below.
+ *   - `unsubscribe` — the List-Unsubscribe mailto arm on the same mail
+ *                     (upstream UnsubscribeHandlerType, token.go:37 /
+ *                     mail_issue_common.go:195-201). The inbound
+ *                     UnsubscribeHandler is SPEC §1.3's own follow-up
+ *                     slice — until it lands, a mail to the unsubscribe
+ *                     address fails the reply-family MAC and drops
+ *                     dropped-invalid-token (fail-closed: it can NEVER
+ *                     create a comment).
+ */
+const TOKEN_DOMAINS = {
+  reply: new TextEncoder().encode("cf-gitea/mail-reply/v1"),
+  unsubscribe: new TextEncoder().encode("cf-gitea/mail-unsubscribe/v1"),
+} as const;
+
+export type ReplyTokenFamily = keyof typeof TOKEN_DOMAINS;
 
 const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
@@ -211,13 +236,26 @@ export interface CreateReplyTokenInput {
   userId: number;
   refType: ReplyRefType;
   refId: number;
+  /** The token family (see TOKEN_DOMAINS) — default `"reply"`. The notify
+   *  compose's List-Unsubscribe arm mints `"unsubscribe"`. */
+  family?: ReplyTokenFamily;
   now?: Date;
 }
 
+/** The MAC's covered bytes: the family domain prepended to the body
+ *  (everything is covered — the SPEC §3.2 tighter shape). */
+function coveredBytes(domain: Uint8Array, body: Uint8Array): Uint8Array {
+  const covered = new Uint8Array(domain.length + body.length);
+  covered.set(domain);
+  covered.set(body, domain.length);
+  return covered;
+}
+
 /**
- * Mint one recipient's reply token (upstream CreateToken, token.go:55-75).
- * Exported for the SPEC §9 HANDOFF owner (the notify compose fold); slice
- * one's only caller is the test suite.
+ * Mint one recipient's reply token (upstream CreateToken, token.go:55-75 —
+ * the handlerType byte becomes the MAC domain, SPEC §3.2). Exported for the
+ * SPEC §9 HANDOFF fold (the notify compose); the pipeline itself never
+ * mints.
  */
 export async function createReplyToken(secret: string, input: CreateReplyTokenInput): Promise<string> {
   const expiry = Math.floor((input.now ?? new Date()).getTime() / 1000) + TOKEN_LIFETIME_SECONDS;
@@ -228,10 +266,7 @@ export async function createReplyToken(secret: string, input: CreateReplyTokenIn
   view.setUint32(9, expiry, false);
   view.setUint8(13, REF_TYPE_BYTE[input.refType]);
   view.setBigUint64(14, BigInt(input.refId), false);
-  const covered = new Uint8Array(TOKEN_DOMAIN.length + body.length);
-  covered.set(TOKEN_DOMAIN);
-  covered.set(body, TOKEN_DOMAIN.length);
-  const mac = await hmac10(secret, covered);
+  const mac = await hmac10(secret, coveredBytes(TOKEN_DOMAINS[input.family ?? "reply"], body));
   const token = new Uint8Array(TOKEN_BYTES);
   token.set(body);
   token.set(mac, TOKEN_MAC_OFFSET);
@@ -247,9 +282,16 @@ export type DecodedReplyToken =
  * load — the orchestrator owns that D1 read; the split is documented in
  * the module header). Malformed (decode/version/length) and invalid (MAC)
  * both render as dropped-invalid-token downstream; expired is its own
- * verdict (upstream's "token expired" ErrToken, :117-119).
+ * verdict (upstream's "token expired" ErrToken, :117-119). `family` names
+ * the MAC domain to verify under (default `"reply"`) — the cross-family
+ * arm renders as `invalid`, the domain separation's whole point (a
+ * reply-verify of an unsubscribe token can never pass, and vice versa).
  */
-export async function decodeReplyToken(secret: string, token: string): Promise<DecodedReplyToken> {
+export async function decodeReplyToken(
+  secret: string,
+  token: string,
+  family: ReplyTokenFamily = "reply",
+): Promise<DecodedReplyToken> {
   // MTAs may lowercase the local-part (RFC 5321 §2.4) — upstream's
   // strings.ToUpper normalization first (token.go:79-81).
   const data = base32Decode(token.toUpperCase());
@@ -258,10 +300,7 @@ export async function decodeReplyToken(secret: string, token: string): Promise<D
   }
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const body = data.slice(0, TOKEN_MAC_OFFSET);
-  const covered = new Uint8Array(TOKEN_DOMAIN.length + body.length);
-  covered.set(TOKEN_DOMAIN);
-  covered.set(body, TOKEN_DOMAIN.length);
-  const expected = await hmac10(secret, covered);
+  const expected = await hmac10(secret, coveredBytes(TOKEN_DOMAINS[family], body));
   const mac = data.slice(TOKEN_MAC_OFFSET);
   if (!constantTimeEqual(expected, mac)) return { ok: false, reason: "invalid" };
   const userId = Number(view.getBigUint64(1, false));

@@ -30,6 +30,15 @@
  *     `IssueChangeAssignee` (:119-127, the assigned mail — the one arm whose
  *     recipient is NOT the participants resolution, SPEC §12).
  *
+ * The inbound fold (specs/email-inbound.md §9 — mail_issue_common.go:
+ * 181-202) rides the same loop: with `MAIL_INBOUND_ENABLED=true` (+ secret +
+ * a valid `%{token}` reply-address template) every recipient's mail carries
+ * the per-recipient REPLY token (`Reply-To` + `List-Post` mailto + the
+ * `<reply-<token>@AppDomain>` References carrier) and the UNSUBSCRIBE token
+ * (the `List-Unsubscribe` mailto arm), minted through
+ * `services/mail/inbound.ts`'s exported primitives. Without the vars the
+ * headers stay absent — the pre-fold bytes, fail-closed.
+ *
  * The emit sites are the real write paths (`IssuesService.addComment` /
  * `createIssue` / `closeIssue`+`reopenIssue` — upstream fires notify from
  * the model layer too: CreateIssueComment's notify call rides the
@@ -87,6 +96,12 @@ import {
 import { WatchMode } from "../../api/services/repo-watchers";
 import { loadRepoSettings } from "../../api/services/repo-settings";
 import { CommentType } from "../../issues/comment-types";
+import {
+  createReplyToken,
+  parseReplyAddressTemplate,
+  replyAddressFor,
+  type ReplyRefType,
+} from "./inbound";
 import { appDomainFromAppUrl, parseMailFrom, sanitizeSubject } from "./message";
 import { enqueueMailOutbox, type EnqueueOutcome, type MailOutboxEnv } from "./outbox";
 import { appUrlWithSlash, GITEA_APP_NAME, isMailable } from "./register-notify";
@@ -124,10 +139,15 @@ export type MailNotifyEvent =
   | "NewPullRequest"
   | "IssueChangeAssignee";
 
-/** The env slice the hub reads (both bindings ride the outbox). */
+/** The env slice the hub reads (both bindings ride the outbox; the
+ *  MAIL_INBOUND_* trio arms the per-recipient token carriers — SPEC
+ *  email-inbound §9). */
 export type MailNotifyEnv = Pick<MailOutboxEnv, "DB" | "REPO_TASKS" | "APP_URL"> & {
   MAIL_ENABLED?: string;
   MAIL_FROM?: string;
+  MAIL_INBOUND_ENABLED?: string;
+  MAIL_INBOUND_REPLY_ADDRESS?: string;
+  MAIL_INBOUND_SECRET?: string;
 };
 
 export interface NotifyIssueCommentInput {
@@ -212,9 +232,10 @@ function issueActionMessageId(
  * 180-198), `generateSenderRecipientHeaders` (mail.go:200-208) and
  * `generateReasonHeaders` (mail.go:210-216). Every header the family sets is
  * single-valued, so the row's `Record<string, string>` storage holds it
- * whole (SPEC §4.4). `References`/`List-Unsubscribe` carry only the
- * no-incoming-email arm of upstream's lists (the reply/mailto tokens ride
- * `IncomingEmail`, mail_issue_common.go:181-202 — not landed).
+ * whole (SPEC §4.4). The token carriers (Reply-To/List-Post, the References
+ * tail, the List-Unsubscribe mailto arm) are NOT here — upstream sets them
+ * on the message before this family (:175-205), and they ride the compose
+ * sites' per-recipient `inboundTokenCarriers` arm below.
  */
 function issueMailHeaders(input: {
   repoPath: string;
@@ -254,6 +275,115 @@ function issueMailHeaders(input: {
     "X-Gitea-Issue-ID": String(input.issueIndex),
     "X-Gitea-Issue-Link": input.issueUrl,
     "X-GitLab-Issue-IID": String(input.issueIndex),
+  };
+}
+
+/**
+ * The compose-side inbound arm — mail_issue_common.go:181's
+ * `setting.IncomingEmail.Enabled` gate. Armed ONLY when
+ * `MAIL_INBOUND_ENABLED==="true"` AND the secret is present AND the
+ * reply-address template validates (`parseReplyAddressTemplate` — exactly
+ * one `%{token}`, in the user part, no display name; upstream Fatal's at
+ * boot, incoming_email.go:47-63 — we have no boot step, so the arm degrades
+ * to the un-armed shape with a warn, the inbound handler's own
+ * dropped-misconfigured posture). EVERY other state leaves the token
+ * headers absent — the pre-fold behavior, byte-identical (fail-closed in
+ * both directions: an armed inbound with an unarmed compose just keeps
+ * logging dropped-no-token, which is safe).
+ */
+type InboundCompose = { armed: false } | { armed: true; secret: string; replyAddressTemplate: string };
+
+function inboundComposeOf(env: MailNotifyEnv): InboundCompose {
+  if (env.MAIL_INBOUND_ENABLED !== "true") return { armed: false };
+  const secret = env.MAIL_INBOUND_SECRET ?? "";
+  const replyAddressTemplate = env.MAIL_INBOUND_REPLY_ADDRESS ?? "";
+  if (secret === "" || parseReplyAddressTemplate(replyAddressTemplate) === null) {
+    console.warn(
+      "[mail] MAIL_INBOUND_ENABLED=true but MAIL_INBOUND_SECRET/MAIL_INBOUND_REPLY_ADDRESS is missing or invalid; reply headers omitted",
+    );
+    return { armed: false };
+  }
+  return { armed: true, secret, replyAddressTemplate };
+}
+
+/**
+ * One recipient's token carriers (mail_issue_common.go:181-202 — per
+ * RECIPIENT under the Enabled gate). Upstream sets, in order:
+ *   - `Reply-To` = REPLY_TO_ADDRESS with `%{token}` replaced once by the
+ *     per-recipient REPLY token (`msg.ReplyTo`, :186-188; the placeholder
+ *     sits in the user part, validated by `inboundComposeOf`);
+ *   - `List-Post` = `<mailto:replyAddress>` (:189);
+ *   - `References` += `<reply-<token>@AppDomain>` (:191) — the SECOND
+ *     carrier so a plain group-reply delivers the token even when the
+ *     client replies to From/References instead of Reply-To;
+ *   - `List-Unsubscribe` += `<mailto:addr-with-UNSUBSCRIBE-token>`
+ *     (:195-201) — UNCONDITIONAL per recipient (NOT gated on the reply
+ *     payload); the issue-url arm stays first (:179).
+ * Our rows store one string per header, so upstream's two-value gomail
+ * lists (mail_test.go:134/:137 pin the pairs) collapse: `References`
+ * space-joined (RFC 5322 §3.6.4's *msg-id list) and `List-Unsubscribe`
+ * comma-joined (RFC 2369's list syntax). Un-armed, everything is ABSENT and
+ * the headers return the pre-fold bytes (References = the bare thread id,
+ * List-Unsubscribe = the url arm only, no Reply-To on the row).
+ *
+ * The REPLY token binds (recipient, reply reference) — refType "comment"
+ * with the comment id when the arm composes over a comment (types 0 and 9
+ * are the hub's only comment arms and both carry HasMailReplySupport at the
+ * pin, models/issues/comment.go:196-201, so upstream's nil-payload gate at
+ * :149 never triggers here), refType "issue" for the comment-nil arms
+ * (:147-154). The UNSUBSCRIBE token binds the ISSUE always (:159) and is
+ * minted under the `unsubscribe` FAMILY (SPEC §3.2's domain separation) — a
+ * reply-family verify of it can never pass, so a mail sent to the
+ * unsubscribe address drops dropped-invalid-token until the
+ * UnsubscribeHandler slice lands (SPEC §1.3); it can never masquerade as a
+ * reply.
+ */
+async function inboundTokenCarriers(
+  inbound: InboundCompose,
+  input: {
+    recipientId: number;
+    replyRefType: ReplyRefType;
+    replyRefId: number;
+    issueId: number;
+    threadId: string;
+    issueUrl: string;
+    appDomain: string;
+    now?: Date;
+  },
+): Promise<{
+  replyTo: string | null;
+  listPost: string | undefined;
+  references: string;
+  listUnsubscribe: string;
+}> {
+  if (!inbound.armed) {
+    return {
+      replyTo: null,
+      listPost: undefined,
+      references: input.threadId,
+      listUnsubscribe: `<${input.issueUrl}>`,
+    };
+  }
+  const replyToken = await createReplyToken(inbound.secret, {
+    userId: input.recipientId,
+    refType: input.replyRefType,
+    refId: input.replyRefId,
+    now: input.now,
+  });
+  const replyAddress = replyAddressFor(inbound.replyAddressTemplate, replyToken);
+  const unsubscribeToken = await createReplyToken(inbound.secret, {
+    userId: input.recipientId,
+    refType: "issue",
+    refId: input.issueId,
+    family: "unsubscribe",
+    now: input.now,
+  });
+  const unsubscribeAddress = replyAddressFor(inbound.replyAddressTemplate, unsubscribeToken);
+  return {
+    replyTo: replyAddress,
+    listPost: `<mailto:${replyAddress}>`,
+    references: `${input.threadId} <reply-${replyToken}@${input.appDomain}>`,
+    listUnsubscribe: `<${input.issueUrl}>, <mailto:${unsubscribeAddress}>`,
   };
 }
 
@@ -584,11 +714,26 @@ export async function notifyIssueComment(
   // Upstream `msg.Info = "Subject: %s, %s"` with the batch info "issue
   // comments" (mail_issue.go:159, mail_issue_common.go:173).
   const info = `Subject: ${sanitized}, issue comments`;
+  // The per-recipient token gate (mail_issue_common.go:181) — resolved once,
+  // consulted per recipient in the loop.
+  const inbound = inboundComposeOf(env);
 
   const enqueue: EnqueueOutcome[] = [];
   const recipientIds: number[] = [];
   for (const recipient of recipients) {
     recipientIds.push(recipient.id);
+    // The token carriers for THIS recipient (the comment arm replies over
+    // the type-0 comment — mail_issue_common.go:148-151).
+    const carriers = await inboundTokenCarriers(inbound, {
+      recipientId: recipient.id,
+      replyRefType: "comment",
+      replyRefId: input.comment.id,
+      issueId: input.issue.id,
+      threadId,
+      issueUrl,
+      appDomain,
+      now: options.now,
+    });
     enqueue.push(
       await enqueueMailOutbox(
         env,
@@ -597,7 +742,7 @@ export async function notifyIssueComment(
           fromAddress: from.address,
           fromDisplayName,
           toAddr: recipient.email!,
-          replyTo: null, // the Reply-To arm rides IncomingEmail (not landed)
+          replyTo: carriers.replyTo,
           subject,
           bodyHtml: renderIssueCommentMail({
             subject: sanitized,
@@ -610,8 +755,9 @@ export async function notifyIssueComment(
           headers: JSON.stringify({
             "Message-ID": messageId,
             "In-Reply-To": threadId,
-            References: threadId,
-            "List-Unsubscribe": `<${issueUrl}>`,
+            ...(carriers.listPost === undefined ? {} : { "List-Post": carriers.listPost }),
+            References: carriers.references,
+            "List-Unsubscribe": carriers.listUnsubscribe,
             ...issueMailHeaders({
               repoPath,
               repoName: pair.repo.slug,
@@ -778,11 +924,25 @@ async function notifyIssueArm(
         );
   const threadId = issueMessageId(repoPath, input.issue.isPull, input.issue.index, appDomain);
   const info = `Subject: ${sanitized}, issue comments`;
+  // The per-recipient token gate (mail_issue_common.go:181).
+  const inbound = inboundComposeOf(env);
 
   const enqueue: EnqueueOutcome[] = [];
   const recipientIds: number[] = [];
   for (const recipient of recipients) {
     recipientIds.push(recipient.id);
+    // The token carriers for THIS recipient (the comment-nil arms reply over
+    // the ISSUE — mail_issue_common.go:152-154).
+    const carriers = await inboundTokenCarriers(inbound, {
+      recipientId: recipient.id,
+      replyRefType: "issue",
+      replyRefId: input.issue.id,
+      issueId: input.issue.id,
+      threadId,
+      issueUrl,
+      appDomain,
+      now: options.now,
+    });
     enqueue.push(
       await enqueueMailOutbox(
         env,
@@ -791,7 +951,7 @@ async function notifyIssueArm(
           fromAddress: from.address,
           fromDisplayName,
           toAddr: recipient.email!,
-          replyTo: null, // the Reply-To arm rides IncomingEmail (not landed)
+          replyTo: carriers.replyTo,
           subject,
           bodyHtml: renderIssueActionMail({
             subject: sanitized,
@@ -806,8 +966,9 @@ async function notifyIssueArm(
           headers: JSON.stringify({
             "Message-ID": messageId,
             "In-Reply-To": threadId,
-            References: threadId,
-            "List-Unsubscribe": `<${issueUrl}>`,
+            ...(carriers.listPost === undefined ? {} : { "List-Post": carriers.listPost }),
+            References: carriers.references,
+            "List-Unsubscribe": carriers.listUnsubscribe,
             ...issueMailHeaders({
               repoPath,
               repoName: pair.repo.slug,
@@ -1031,6 +1192,22 @@ export async function notifyIssueAssigneeChanged(
   const threadId = issueMessageId(repoPath, input.issue.isPull, input.issue.index, appDomain);
   // Upstream `msg.Info` with SendIssueAssignedMail's batch info (mail_issue.go:221).
   const info = `Subject: ${sanitized}, issue assigned`;
+  // The token gate (mail_issue_common.go:181 — SendIssueAssignedMail rides
+  // the same composeIssueCommentMessages loop).
+  const inbound = inboundComposeOf(env);
+  // The token carriers for the assignee (the type-9 comment carries
+  // HasMailReplySupport at the pin, models/issues/comment.go:196-201, so
+  // the reply token binds the comment — mail_issue_common.go:148-151).
+  const carriers = await inboundTokenCarriers(inbound, {
+    recipientId: input.assignee.id,
+    replyRefType: "comment",
+    replyRefId: input.comment.id,
+    issueId: input.issue.id,
+    threadId,
+    issueUrl,
+    appDomain,
+    now: options.now,
+  });
 
   const enqueue = await enqueueMailOutbox(
     env,
@@ -1039,7 +1216,7 @@ export async function notifyIssueAssigneeChanged(
       fromAddress: from.address,
       fromDisplayName,
       toAddr: input.assignee.email!,
-      replyTo: null, // the Reply-To arm rides IncomingEmail (not landed)
+      replyTo: carriers.replyTo,
       subject,
       bodyHtml: renderIssueAssignedMail({
         subject: sanitized,
@@ -1055,8 +1232,9 @@ export async function notifyIssueAssigneeChanged(
       headers: JSON.stringify({
         "Message-ID": messageId,
         "In-Reply-To": threadId,
-        References: threadId,
-        "List-Unsubscribe": `<${issueUrl}>`,
+        ...(carriers.listPost === undefined ? {} : { "List-Post": carriers.listPost }),
+        References: carriers.references,
+        "List-Unsubscribe": carriers.listUnsubscribe,
         ...issueMailHeaders({
           repoPath,
           repoName: pair.repo.slug,

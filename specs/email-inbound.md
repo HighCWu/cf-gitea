@@ -553,22 +553,61 @@ the runbook records this as the intended kill switch.
 
 ## 9. HANDOFF — the outbound token embedding (notify.ts owner)
 
-`issueMailHeaders` (notify.ts, the "no-incoming-email arm" note) and the
-compose sites gain, when `MAIL_INBOUND_ENABLED=true` (upstream `CanReply`,
-mail_issue_common.go:181-202) — per RECIPIENT:
+**AS BUILT (2026-10-31, the fold landed).** All three compose sites —
+`notifyIssueComment` (the type-0 comment arm), `notifyIssueArm` (the
+comment-nil new/close/reopen/ready family) and `notifyIssueAssigneeChanged`
+(the type-9 assigned arm) — resolve an inbound arm per invocation
+(`inboundComposeOf`): armed ONLY when `MAIL_INBOUND_ENABLED="true"` AND
+`MAIL_INBOUND_SECRET` is set AND `MAIL_INBOUND_REPLY_ADDRESS` validates
+(`parseReplyAddressTemplate` — one `%{token}`, user part, no display name;
+upstream Fatal's at boot, we degrade to the un-armed shape with a warn).
+Per RECIPIENT when armed (`inboundTokenCarriers`, upstream
+mail_issue_common.go:181-202 — the pin carries every header the HANDOFF
+named, including the List-Unsubscribe mailto):
 
-```ts
-const token = createReplyToken(env.MAIL_INBOUND_SECRET!, {
-  userId: recipient.id,
-  refType: comment === undefined ? "issue" : "comment",
-  refId: comment?.id ?? issue.id,
-  now,
-});
-const replyAddress = replyAddressFor(env.MAIL_INBOUND_REPLY_ADDRESS!, token);
-// row.replyTo = replyAddress; headers["List-Post"] = `<mailto:${replyAddress}>`;
-// headers["References"] += `<reply-${token}@${appDomain}>`;
-// List-Unsubscribe's mailto arm is the UNsubscribe token's follow-up.
-```
+- `Reply-To` = the template with the recipient's REPLY token substituted
+  once (:186-188) — the token binds (recipient, ref): refType `comment`
+  with the comment id for the two comment arms (types 0 and 9 both carry
+  `HasMailReplySupport` at the pin, models/issues/comment.go:196-201, so
+  upstream's nil-payload gate never triggers in this hub), refType `issue`
+  for the comment-nil arms (:147-154);
+- `List-Post` = `<mailto:replyAddress>` (:189);
+- `References` = the thread id + ` <reply-<token>@AppDomain>` — the SECOND
+  carrier for the reply-all arm (:191). Our rows store one string per
+  header, so upstream's two-value gomail list (mail_test.go:134 pins the
+  pair) collapses space-joined (RFC 5322 §3.6.4's *msg-id list);
+- `List-Unsubscribe` = the issue-url arm + `, <mailto:addr-with-
+  UNSUBSCRIBE-token>` (:179 + :195-201 — UNCONDITIONAL per recipient, not
+  gated on the reply payload; mail_test.go:137 pins the pair). The
+  unsubscribe token is minted under the `unsubscribe` TOKEN FAMILY
+  (§3.2's domain separation, now two domains): a reply-family verify of it
+  can NEVER pass, so a mail to the unsubscribe address drops
+  `dropped-invalid-token` — it cannot masquerade as a reply while the
+  `UnsubscribeHandler` slice (§1.3) is still pending. That handler remains
+  the enumerated follow-up; this fold ships its outbound half, as §1.3
+  planned.
+
+Un-armed (or misconfigured), every carrier is ABSENT and the headers
+return the pre-fold bytes: `reply_to` null, no `List-Post`,
+`References` = the bare thread id, `List-Unsubscribe` = the url arm only —
+fail-closed in both directions (an armed inbound with an unarmed compose
+keeps logging dropped-no-token, which is safe). Zero schema work: the row's
+`reply_to` column (email-outbound §4.1) already carried the arm.
+
+Tests (notify.test.ts, the "notify inbound fold" describe): the four
+carriers byte-pinned per recipient against freshly-minted expected tokens;
+per-recipient distinctness + the decode of each token binding its OWN user
+and ref; the comment-nil and assigned arms' issue/comment ref shapes; the
+four un-armed/misconfigured arms pinning the absence bytes; and the
+END-TO-END CLOSURE — a reply sent to the minted Reply-To address AND a
+reply-all carrying only the References carrier both decode + verify through
+`handleIncomingEmail` and post the recipient's comment, while the
+unsubscribe address's mail drops `dropped-invalid-token` with no comment.
+
+---
+
+HISTORY — the handoff as slice one wrote it (the fold recipe the landing
+followed):
 
 `createReplyToken` + the validation helper are exported from
 `services/mail/inbound.ts` for exactly this fold; the mint needs the

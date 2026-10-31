@@ -27,6 +27,7 @@ import { WatchMode } from "../../api/services/repo-watchers";
 
 import {
   comments,
+  emailInbound,
   emailOutbox,
   issues,
   issueAssignees,
@@ -39,9 +40,17 @@ import {
 } from "../../db/schema";
 import { IssuesService, type IssueRow } from "../../issues/service";
 import { CommentType } from "../../issues/comment-types";
+import {
+  createReplyToken,
+  decodeReplyToken,
+  handleIncomingEmail,
+  type InboundEmailEnv,
+  type InboundEmailMessage,
+} from "./inbound";
 import { isMailOutboxMessage, processMailOutbox, type MailOutboxMessage } from "./outbox";
 import {
   notifyIssueAssigneeChanged,
+  notifyIssueComment,
   notifyIssueCreated,
   notifyIssueStatusChanged,
   notifyIssueTitleChanged,
@@ -149,6 +158,7 @@ async function seedIssue(title = "Issue title"): Promise<IssueRow> {
 
 beforeEach(async () => {
   for (const table of [
+    "email_inbound",
     "email_outbox",
     "issue_subscriptions",
     "issue_assignees",
@@ -1320,5 +1330,286 @@ describe("resolveIssueMailRecipients — the mentions batch (SPEC §13)", () => 
       expect.arrayContaining(["rw@example.com", "poster@example.com"]),
     );
     expect(rows.map((row) => row.toAddr)).not.toContain("om@example.com");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The inbound fold (specs/email-inbound.md §9) — the per-recipient token
+// carriers of mail_issue_common.go:181-202 over the three compose sites.
+// Armed = MAIL_INBOUND_ENABLED=true + MAIL_INBOUND_SECRET +
+// MAIL_INBOUND_REPLY_ADDRESS (validated); un-armed = the pre-fold bytes.
+// ---------------------------------------------------------------------------
+
+describe("notify inbound fold — the per-recipient token carriers (mail_issue_common.go:181-202)", () => {
+  const INBOUND_SECRET = "notify-fold-secret";
+  const REPLY_TEMPLATE = "reply+%{token}@mail.example";
+  // The mint clock — the REAL present (the token's 1-year expiry is checked
+  // against the real clock at decode, so a fixed historical date would
+  // mint already-expired tokens; one Date instance shared by the embed and
+  // the expected-mint keeps the byte pins exact at second granularity).
+  const NOW = new Date();
+
+  /** The armed compose env (outbound + inbound). */
+  const inboundArm = (overrides: Partial<MailNotifyEnv> = {}): MailNotifyEnv =>
+    armedEnv({
+      MAIL_INBOUND_ENABLED: "true",
+      MAIL_INBOUND_REPLY_ADDRESS: REPLY_TEMPLATE,
+      MAIL_INBOUND_SECRET: INBOUND_SECRET,
+      ...overrides,
+    });
+
+  /** The token inside a `reply+<token>@mail.example` address. */
+  function tokenOf(address: string): string {
+    const m = /^reply\+(.+)@mail\.example$/.exec(address);
+    expect(m).not.toBeNull();
+    return m![1]!;
+  }
+
+  /** The comment arm over the seeded fixture issue, inbound armed. */
+  async function composeCommentArm(mailEnv: MailNotifyEnv) {
+    const issue = await seedIssue();
+    const bare = new IssuesService(env.DB); // no mail env — the setup write is quiet
+    const comment = await bare.addComment({ issueId: issue.id, posterId: 60, content: "hello world" });
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    const outcome = await notifyIssueComment(mailEnv, { issue, comment, doer }, { now: NOW });
+    expect(outcome.outcome).toBe("enqueued");
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows).toHaveLength(5);
+    return { issue, comment, rows };
+  }
+
+  /** A fake inbound message in the inbound.test.ts shape (To + optional
+   *  References + a unique Message-ID over a plain text body). */
+  function inboundMessage(input: { to: string; references?: string; body?: string }): InboundEmailMessage {
+    const messageId = `<fold-rt-${crypto.randomUUID()}@sender.example>`;
+    const headers = new Headers({
+      From: "repowatcher <rw@example.com>",
+      To: input.to,
+      Subject: "Re: [repoowner/repo] Issue title (#1)",
+      Date: "Fri, 31 Oct 2026 00:00:00 +0000",
+      "Message-ID": messageId,
+    });
+    if (input.references !== undefined) headers.set("References", input.references);
+    const raw = [
+      "From: repowatcher <rw@example.com>",
+      `To: ${input.to}`,
+      "Subject: Re: [repoowner/repo] Issue title (#1)",
+      "Date: Fri, 31 Oct 2026 00:00:00 +0000",
+      `Message-ID: ${messageId}`,
+      'Content-Type: text/plain; charset="utf-8"',
+      "",
+      input.body ?? "a fresh reply body",
+    ].join("\r\n");
+    const bytes = new TextEncoder().encode(raw);
+    return {
+      from: "rw@example.com",
+      to: input.to,
+      headers,
+      raw: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(bytes);
+          controller.close();
+        },
+      }),
+      rawSize: bytes.byteLength,
+      setReject: () => {},
+    };
+  }
+
+  /** The inbound handler env over the same D1 (the fan kept quiet — the
+   *  closure asserts the comment, not the fan). */
+  const closureEnv = (): InboundEmailEnv => ({
+    DB: env.DB,
+    APP_URL: "https://mail.example",
+    MAIL_ENABLED: "false",
+    MAIL_INBOUND_ENABLED: "true",
+    MAIL_INBOUND_REPLY_ADDRESS: REPLY_TEMPLATE,
+    MAIL_INBOUND_SECRET: INBOUND_SECRET,
+  });
+
+  it("the comment arm pins all four carriers byte-for-byte, per recipient (mail_issue_common.go:186-201)", async () => {
+    const { issue, comment, rows } = await composeCommentArm(inboundArm());
+    const threadId = `<repoowner/repo/issues/${issue.index}@mail.example>`;
+    for (const row of rows) {
+      const recipientId = recipientIdOf(row);
+      const replyToken = await createReplyToken(INBOUND_SECRET, {
+        userId: recipientId,
+        refType: "comment",
+        refId: comment.id,
+        now: NOW,
+      });
+      const unsubToken = await createReplyToken(INBOUND_SECRET, {
+        userId: recipientId,
+        refType: "issue",
+        refId: issue.id,
+        family: "unsubscribe",
+        now: NOW,
+      });
+      const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+      // Reply-To = the template with the recipient's REPLY token
+      // (:186-188); List-Post = the mailto of the same address (:189);
+      // References = thread id + the reply- carrier, space-joined (:191,
+      // mail_test.go:134's two-value list); List-Unsubscribe = the url arm
+      // + the UNSUBSCRIBE-token mailto, comma-joined (:179+:195-201,
+      // mail_test.go:137's two-value list).
+      expect(row.replyTo).toBe(`reply+${replyToken}@mail.example`);
+      expect(headers["List-Post"]).toBe(`<mailto:reply+${replyToken}@mail.example>`);
+      expect(headers["References"]).toBe(`${threadId} <reply-${replyToken}@mail.example>`);
+      expect(headers["List-Unsubscribe"]).toBe(
+        `<https://mail.example/repoowner/repo/issues/${issue.index}>, <mailto:reply+${unsubToken}@mail.example>`,
+      );
+    }
+  });
+
+  it("every recipient's token is distinct and binds ITS OWN user + the comment ref", async () => {
+    const { comment, rows } = await composeCommentArm(inboundArm());
+    expect(new Set(rows.map((row) => row.replyTo)).size).toBe(5);
+    for (const row of rows) {
+      const decoded = await decodeReplyToken(INBOUND_SECRET, tokenOf(row.replyTo!));
+      expect(decoded).toMatchObject({
+        ok: true,
+        userId: recipientIdOf(row),
+        refType: "comment",
+        refId: comment.id,
+      });
+      // The 1-year life, unexpired at decode (token.go:29, :117-119).
+      expect(decoded.ok && decoded.expiresAt.getTime() > Date.now()).toBe(true);
+    }
+  });
+
+  it("the comment-nil arms bind the ISSUE ref (notifyIssueCreated over the same funnel)", async () => {
+    const issue = await seedIssue();
+    const poster = (await db().select().from(users).where(eq(users.id, 10)).get())!;
+    const outcome = await notifyIssueCreated(inboundArm(), { issue, doer: poster }, { now: NOW });
+    expect(outcome.outcome).toBe("enqueued");
+    const rows = await db().select().from(emailOutbox).all();
+    expect(new Set(rows.map((row) => row.toAddr))).toEqual(
+      new Set(["rw@example.com", "as@example.com", "part@example.com", "iw@example.com"]),
+    );
+    const threadId = `<repoowner/repo/issues/${issue.index}@mail.example>`;
+    for (const row of rows) {
+      const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+      expect(headers["References"]).toBe(`${threadId} <reply-${tokenOf(row.replyTo!)}@mail.example>`);
+      const decoded = await decodeReplyToken(INBOUND_SECRET, tokenOf(row.replyTo!));
+      expect(decoded).toMatchObject({ ok: true, userId: recipientIdOf(row), refType: "issue", refId: issue.id });
+    }
+  });
+
+  it("the assigned arm rides the same carriers, the type-9 comment as the reply ref", async () => {
+    const issue = await seedIssue();
+    const seeded = (
+      await db()
+        .insert(comments)
+        .values({
+          type: CommentType.Assignees,
+          posterId: 60,
+          issueId: issue.id,
+          assigneeId: 50,
+          removedAssignee: 0,
+          content: "",
+          createdAt: new Date(0),
+          updatedAt: new Date(0),
+        })
+        .returning()
+    )[0]!;
+    const assignee = (await db().select().from(users).where(eq(users.id, 50)).get())!;
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    const outcome = await notifyIssueAssigneeChanged(
+      inboundArm(),
+      { issue, comment: seeded, doer, assignee, removed: false },
+      { now: NOW },
+    );
+    expect(outcome.outcome).toBe("enqueued");
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows).toHaveLength(1);
+    const headers = JSON.parse(rows[0]!.headers ?? "{}") as Record<string, string>;
+    expect(headers["List-Post"]).toBe(`<mailto:${rows[0]!.replyTo}>`);
+    const decoded = await decodeReplyToken(INBOUND_SECRET, tokenOf(rows[0]!.replyTo!));
+    expect(decoded).toMatchObject({ ok: true, userId: 50, refType: "comment", refId: seeded.id });
+  });
+
+  it("un-armed (or misconfigured) the headers stay ABSENT — the pre-fold bytes, byte-identical", async () => {
+    const { issue, comment } = await composeCommentArm(inboundArm());
+    const threadId = `<repoowner/repo/issues/${issue.index}@mail.example>`;
+    const issueUrl = `https://mail.example/repoowner/repo/issues/${issue.index}`;
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    const absent = async (mailEnv: MailNotifyEnv) => {
+      await db().delete(emailOutbox);
+      expect((await notifyIssueComment(mailEnv, { issue, comment, doer }, { now: NOW })).outcome).toBe("enqueued");
+      for (const row of await db().select().from(emailOutbox).all()) {
+        const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+        expect(row.replyTo).toBeNull();
+        expect("List-Post" in headers).toBe(false);
+        expect(headers["References"]).toBe(threadId);
+        expect(headers["List-Unsubscribe"]).toBe(`<${issueUrl}>`);
+      }
+    };
+    await absent(armedEnv()); // no MAIL_INBOUND_* at all
+    await absent(armedEnv({ MAIL_INBOUND_ENABLED: "true" })); // secret + template missing
+    await absent(
+      armedEnv({
+        MAIL_INBOUND_ENABLED: "true",
+        MAIL_INBOUND_SECRET: INBOUND_SECRET,
+        MAIL_INBOUND_REPLY_ADDRESS: "no-placeholder@example.com", // %{token} absent
+      }),
+    );
+    await absent(
+      armedEnv({
+        MAIL_INBOUND_ENABLED: "true",
+        MAIL_INBOUND_SECRET: INBOUND_SECRET,
+        MAIL_INBOUND_REPLY_ADDRESS: "%{token}@mail.example <%{token}>", // display-name shape: invalid
+      }),
+    );
+  });
+
+  it("ROUND-TRIP via Reply-To: a reply sent to the minted address posts the recipient's comment", async () => {
+    const { issue, rows } = await composeCommentArm(inboundArm());
+    const row = rows.find((r) => recipientIdOf(r) === 20)!;
+    const outcome = await handleIncomingEmail(closureEnv(), inboundMessage({ to: row.replyTo! }));
+    if (outcome.outcome !== "comment-created") throw new Error(`expected comment-created, got ${outcome.outcome}`);
+    const posted = await db().select().from(comments).where(eq(comments.id, outcome.commentId)).get();
+    expect(posted!.posterId).toBe(20);
+    expect(posted!.content).toBe("a fresh reply body");
+    expect(posted!.issueId).toBe(issue.id);
+  });
+
+  it("ROUND-TRIP via References: the reply-all arm delivers the token when the client ignores Reply-To", async () => {
+    const { rows } = await composeCommentArm(inboundArm());
+    const row = rows.find((r) => recipientIdOf(r) === 50)!;
+    const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+    const outcome = await handleIncomingEmail(
+      closureEnv(),
+      inboundMessage({ to: "as@example.com", references: headers["References"] }),
+    );
+    if (outcome.outcome !== "comment-created") throw new Error(`expected comment-created, got ${outcome.outcome}`);
+    const posted = await db().select().from(comments).where(eq(comments.id, outcome.commentId)).get();
+    expect(posted!.posterId).toBe(50);
+  });
+
+  it("the UNSUBSCRIBE token never verifies as a reply — a mail to it drops, never comments (SPEC §3.2's cross-family safety)", async () => {
+    const { issue, rows } = await composeCommentArm(inboundArm());
+    const headers = JSON.parse(rows[0]!.headers ?? "{}") as Record<string, string>;
+    const unsubAddress = /<mailto:(.+?)>/.exec(headers["List-Unsubscribe"]!)![1]!;
+    const unsubToken = tokenOf(unsubAddress);
+    // The reply-family verify (what the pipeline runs) REJECTS it…
+    expect(await decodeReplyToken(INBOUND_SECRET, unsubToken)).toEqual({ ok: false, reason: "invalid" });
+    // …the unsubscribe family verifies it, bound to the issue.
+    expect(await decodeReplyToken(INBOUND_SECRET, unsubToken, "unsubscribe")).toMatchObject({
+      ok: true,
+      userId: recipientIdOf(rows[0]!),
+      refType: "issue",
+      refId: issue.id,
+    });
+    // And the mail itself: the token search FINDS it, the decode rejects it.
+    const before = (await db().select().from(comments).all()).length;
+    const drop = await handleIncomingEmail(closureEnv(), inboundMessage({ to: unsubAddress }));
+    expect(drop).toEqual({ outcome: "dropped-invalid-token" });
+    expect((await db().select().from(comments).all()).length).toBe(before);
+    const inboundRow = await db()
+      .select()
+      .from(emailInbound)
+      .where(eq(emailInbound.tokenStatus, "invalid"))
+      .get();
+    expect(inboundRow).toBeDefined();
   });
 });
