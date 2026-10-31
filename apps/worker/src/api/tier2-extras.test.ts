@@ -444,24 +444,32 @@ describe("issue + comment reactions (issue-t2)", () => {
 
 describe("issue subscriptions (issue-t2)", () => {
   it("PUT subscribes (201) / repeats (200); GET lists; check renders WatchInfo; DELETE unsubscribes", async () => {
-    expect((await issueT2Send(`/repos/cf-gitea-stub/extras/issues/${issueA.index}/subscriptions/neighbor`, authed({ method: "PUT" }, TOKEN_NEIGHBOR))).status).toBe(201);
+    // Neighbor COMMENTED on issueA (the fixture's seed comment) — upstream's
+    // CheckIssueWatch participants fallback (issue_watch.go:85-89 →
+    // IsUserParticipantsOfIssue) counts a commenter as subscribed-by-default,
+    // so neighbor's FIRST PUT answers 200 (already watching), not 201. The
+    // clean 201 arm rides issueB (neighbor never touched it).
     expect((await issueT2Send(`/repos/cf-gitea-stub/extras/issues/${issueA.index}/subscriptions/neighbor`, authed({ method: "PUT" }, TOKEN_NEIGHBOR))).status).toBe(200);
+    expect((await issueT2Send(`/repos/cf-gitea-stub/extras/issues/${issueB.index}/subscriptions/neighbor`, authed({ method: "PUT" }, TOKEN_NEIGHBOR))).status).toBe(201);
+    expect((await issueT2Send(`/repos/cf-gitea-stub/extras/issues/${issueB.index}/subscriptions/neighbor`, authed({ method: "PUT" }, TOKEN_NEIGHBOR))).status).toBe(200);
 
-    const list = await issueT2Send(`/repos/cf-gitea-stub/extras/issues/${issueA.index}/subscriptions`);
+    // The explicit-row surface (the list reads issue_subscriptions rows only)
+    // and the WatchInfo/unsub arms ride issueB — its 201 PUT wrote the row.
+    const list = await issueT2Send(`/repos/cf-gitea-stub/extras/issues/${issueB.index}/subscriptions`);
     expect(list.status).toBe(200);
     const subscribers: Array<Record<string, unknown>> = await list.json();
     expect(subscribers.map((entry) => entry.login)).toEqual(["neighbor"]);
 
-    const check = await issueT2Send(`/repos/cf-gitea-stub/extras/issues/${issueA.index}/subscriptions/check`, authed(undefined, TOKEN_NEIGHBOR));
+    const check = await issueT2Send(`/repos/cf-gitea-stub/extras/issues/${issueB.index}/subscriptions/check`, authed(undefined, TOKEN_NEIGHBOR));
     expect(check.status).toBe(200);
     const watch: Record<string, unknown> = await check.json();
     expect(watch.subscribed).toBe(true);
     expect(watch.ignored).toBe(false);
-    expect(watch.url).toBe(`https://example.com/api/v1/repos/cf-gitea-stub/extras/issues/${issueA.index}/subscriptions`);
+    expect(watch.url).toBe(`https://example.com/api/v1/repos/cf-gitea-stub/extras/issues/${issueB.index}/subscriptions`);
 
     // A third party may not flip someone else's subscription (the 403 arm).
-    expect((await issueT2Send(`/repos/cf-gitea-stub/extras/issues/${issueA.index}/subscriptions/neighbor`, authed({ method: "DELETE" }))).status).toBe(403);
-    expect((await issueT2Send(`/repos/cf-gitea-stub/extras/issues/${issueA.index}/subscriptions/neighbor`, authed({ method: "DELETE" }, TOKEN_NEIGHBOR))).status).toBe(201);
+    expect((await issueT2Send(`/repos/cf-gitea-stub/extras/issues/${issueB.index}/subscriptions/neighbor`, authed({ method: "DELETE" }))).status).toBe(403);
+    expect((await issueT2Send(`/repos/cf-gitea-stub/extras/issues/${issueB.index}/subscriptions/neighbor`, authed({ method: "DELETE" }, TOKEN_NEIGHBOR))).status).toBe(201);
     expect((await issueT2Send(`/repos/cf-gitea-stub/extras/issues/${issueA.index}/subscriptions/ghost`, authed({ method: "PUT" }))).status).toBe(404);
   });
 });

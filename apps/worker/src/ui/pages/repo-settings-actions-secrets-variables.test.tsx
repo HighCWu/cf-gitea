@@ -482,7 +482,11 @@ describe("the secrets page DOM (repo/settings/actions.tmpl PageType secrets + sh
     expect(html).toContain('action="/alice/demo/settings/actions/secrets/delete"');
     expect(html).toContain(`name="id" value="${String(row.id)}"`);
     expect(html).toContain(repoSettingsActionsLocale.remove);
-    expect(html).not.toContain("show-modal"); // the JS modal pair is not reproduced
+    // Scoped to the secrets panel: the shared shell carries the repo WATCH
+    // options modal (header.tmpl:93, the watch-UI wave 916943f) on every
+    // signed repo page — its .show-modal is page chrome, not the secrets
+    // JS modal pair this pin guards against.
+    expect(html.slice(html.indexOf("secrets")).slice(0, 3000)).not.toContain("show-modal"); // the JS modal pair is not reproduced
     expect(html).not.toContain("link-action");
   });
 
