@@ -1226,6 +1226,23 @@ import {
   type AdminBadgeEditData,
   type AdminBadgeUsersData,
 } from "./pages/admin-badges";
+// The W4 external-auth arm (pages/admin-auths.tsx — upstream's /-/admin
+// auths group, web.go:874-880 + routers/web/admin/auths.go): the list, the
+// new combo, the {authid} edit combo and the delete POST over the W1
+// login-source store (the module header's mount recipe).
+import {
+  adminAuthsLocale,
+  applyAdminAuthSourceCreate,
+  applyAdminAuthSourceDelete,
+  applyAdminAuthSourceUpdate,
+  loadAdminAuthSourceEditData,
+  loadAdminAuthsData,
+  newAdminAuthSourceFormValues,
+  parseAdminAuthSourceForm,
+  renderAdminAuthSourceEditPage,
+  renderAdminAuthSourceNewPage,
+  renderAdminAuthsPage,
+} from "./pages/admin-auths";
 import {
   applyAdminApplicationCreate,
   applyAdminApplicationDelete,
@@ -3137,9 +3154,10 @@ export interface UserSettingsRoute {
  *  pages/admin-monitor.tsx + the wave's users/orgs/repos pages — upstream's
  *  /-/admin group). The census R18 (a) arms extend the family union
  *  additively: emails / hooks / badges / applications, SPEC-0018 §3.1's
- *  notices arm and §3.2's config summary (each module's header carries its
- *  mount record; the remaining upstream arms stay unclaimed — auths is the
- *  census's remaining (b) class, packages/actions the (c) gate). */
+ *  notices arm and §3.2's config summary, and SPEC-0018 §9 W4's external-auth
+ *  arm (pages/admin-auths.tsx — web.go:874-880's /auths group, the module
+ *  header's mount record; each mounted module's header carries it; the
+ *  remaining upstream arms stay unclaimed — packages/actions the (c) gate). */
 export interface AdminRoute {
   family:
     | "admin-dashboard"
@@ -3160,6 +3178,14 @@ export interface AdminRoute {
     | "admin-badge-delete"
     | "admin-badge-users"
     | "admin-badge-users-delete"
+    // The W4 external-auth arm (pages/admin-auths.tsx — web.go:874-880's
+    // /auths group): the list GET, the new combo (GET page + POST submit),
+    // the {authid} edit combo (GET page + POST save) and the delete POST
+    // (the module header's mount record).
+    | "admin-auths"
+    | "admin-auths-new"
+    | "admin-auths-edit"
+    | "admin-auths-delete"
     | "admin-applications"
     | "admin-application-create"
     | "admin-application-delete"
@@ -3207,6 +3233,9 @@ export interface AdminRoute {
   /** The positive-integer {id} (the application-delete family — the landed
    *  PathParamInt64 posture; "007" parses as 7). */
   applicationId?: number;
+  /** The positive-integer {authid} (the auths edit/delete families —
+   *  web.go:876-879's param; the same digits-only PathParamInt64 posture). */
+  authId?: number;
   /** The positive-integer {id} for the admin actions families — the
    *  runners edit/update/delete combos and the variables edit/delete
    *  combos (digits-only claims, the same PathParamInt64 posture). */
@@ -3935,6 +3964,19 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (tail.length === 4 && tail[3] === "delete") return { family: "admin-badge-delete", badgeSlug };
       if (tail.length === 4 && tail[3] === "users") return { family: "admin-badge-users", badgeSlug };
       if (tail.length === 5 && tail[3] === "users" && tail[4] === "delete") return { family: "admin-badge-users-delete", badgeSlug };
+    }
+    // The W4 external-auth arm (pages/admin-auths.tsx — web.go:874-880's
+    // /auths group, upstream order beside the applications arm): the list
+    // GET, the new combo, the digits-only {authid} edit combo and the delete
+    // POST (the PathParamInt64 posture — junk segments stay unclaimed → the
+    // engine's 404).
+    if (tail.length === 1 && tail[0] === "auths") return { family: "admin-auths" };
+    if (tail.length === 2 && tail[0] === "auths" && tail[1] === "new") return { family: "admin-auths-new" };
+    if (tail.length === 2 && tail[0] === "auths" && /^\d+$/.test(tail[1] as string)) {
+      return { family: "admin-auths-edit", authId: Number.parseInt(tail[1] as string, 10) };
+    }
+    if (tail.length === 3 && tail[0] === "auths" && /^\d+$/.test(tail[1] as string) && tail[2] === "delete") {
+      return { family: "admin-auths-delete", authId: Number.parseInt(tail[1] as string, 10) };
     }
     // The R18 applications arm (web.go:865-872's /applications group): the
     // list GET, the create POST, the positive-integer delete POST — plus
@@ -11523,6 +11565,127 @@ async function adminBadgeUsersDelete(c: Context<{ Bindings: Env }>, badgeSlug: s
   );
 }
 
+// --- the W4 external-auth arm (pages/admin-auths.tsx — upstream's /-/admin
+// auths group, web.go:874-880 + routers/web/admin/auths.go; the shared
+// adminPagePrologue; the writes add the §2.8 sameOriginGuard) --------------
+
+/** GET /-/admin/auths (admin.Authentications, auths.go:44-56): the prologue
+ *  → the name-ordered full listing (no pager — the template ranges
+ *  everything). */
+async function adminAuthsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminAuthsData(c.env.DB, oauth2FeatureEnabled(c.env));
+  return p.respond(c.html(renderAdminAuthsPage(p.ctx, data)));
+}
+
+/** GET /-/admin/auths/new (admin.NewAuthSource, auths.go:74-97): the fresh
+ *  form — is_active CHECKED (auths.go:85's default), the first executable
+ *  provider the default (the module's newAdminAuthSourceFormValues). */
+async function adminAuthsNewPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  return p.respond(
+    c.html(
+      renderAdminAuthSourceNewPage(p.ctx, {
+        form: newAdminAuthSourceFormValues(),
+        error: null,
+        errorField: null,
+        oauth2Enabled: oauth2FeatureEnabled(c.env),
+      }),
+    ),
+  );
+}
+
+/** POST /-/admin/auths/new (admin.NewAuthSourcePost, auths.go:238-341): the
+ *  §2.8 guard + the prologue, then the create — "created" 303s the list
+ *  (upstream's Redirect, auths.go:339), the invalid arms re-render the new
+ *  page at 200 with the message + the Err_ field flag (RenderWithErr's
+ *  posture, the badge-new ladder). */
+async function adminAuthsNewSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const values = parseAdminAuthSourceForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await applyAdminAuthSourceCreate(c.env.DB, values);
+  if (outcome.outcome === "created") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/auths" } }));
+  }
+  if (outcome.outcome === "invalid") {
+    return p.respond(
+      c.html(
+        renderAdminAuthSourceNewPage(p.ctx, {
+          form: outcome.form,
+          error: outcome.message,
+          errorField: outcome.field,
+          oauth2Enabled: oauth2FeatureEnabled(c.env),
+        }),
+      ),
+    );
+  }
+  throw new Error("unreachable: applyAdminAuthSourceCreate never answers saved");
+}
+
+/** GET /-/admin/auths/{authid} (admin.EditAuthSource, auths.go:343-369):
+ *  the stored row + the parsed cfg + the in-use count; the unknown id
+ *  404-shells (the honest posture over upstream's ServerError arm). */
+async function adminAuthsEditPage(c: Context<{ Bindings: Env }>, authId: number): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminAuthSourceEditData(c.env.DB, authId, oauth2FeatureEnabled(c.env));
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderAdminAuthSourceEditPage(p.ctx, data)));
+}
+
+/** POST /-/admin/auths/{authid} (admin.EditAuthSourcePost, auths.go:349-456):
+ *  the §2.8 guard + the prologue, then the update — "saved" 303s the edit
+ *  page (upstream's Redirect target, auths.go:454), the invalid arms
+ *  re-render the edit page at 200 with the posted values (RenderWithErr …
+ *  form); a vanished source 404-shells (the GET arm's posture). */
+async function adminAuthsEditSubmit(c: Context<{ Bindings: Env }>, authId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const values = parseAdminAuthSourceForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await applyAdminAuthSourceUpdate(c.env.DB, authId, values);
+  if (outcome.outcome === "saved") {
+    return p.respond(new Response(null, { status: 303, headers: { location: `/-/admin/auths/${authId}` } }));
+  }
+  if (outcome.outcome === "invalid") {
+    const data = await loadAdminAuthSourceEditData(c.env.DB, authId, oauth2FeatureEnabled(c.env));
+    if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+    data.form = outcome.form;
+    data.error = outcome.message;
+    data.errorField = outcome.field;
+    return p.respond(c.html(renderAdminAuthSourceEditPage(p.ctx, data)));
+  }
+  throw new Error("unreachable: applyAdminAuthSourceUpdate never answers created");
+}
+
+/** POST /-/admin/auths/{authid}/delete (admin.DeleteAuthSource,
+ *  auths.go:459-480): "deleted" 303s the list (upstream's JSONRedirect
+ *  target), "in-use" re-renders the edit page at 200 with the still_in_used
+ *  message (upstream flashes + JSONRedirects to the edit page — the message
+ *  must survive; the notices re-render idiom is the house no-JS answer),
+ *  "missing" 404-shells. */
+async function adminAuthsDelete(c: Context<{ Bindings: Env }>, authId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const outcome = await applyAdminAuthSourceDelete(c.env.DB, authId);
+  if (outcome === "deleted") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/auths" } }));
+  }
+  if (outcome === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  const data = await loadAdminAuthSourceEditData(c.env.DB, authId, oauth2FeatureEnabled(c.env));
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  data.error = adminAuthsLocale.still_in_used;
+  return p.respond(c.html(renderAdminAuthSourceEditPage(p.ctx, data)));
+}
+
 /** GET /-/admin/applications (pages/admin-applications.tsx): the prologue →
  *  the uid=0 instance-wide list, behind the group's W5 gate (web.go:896's
  *  oauth2Enabled wrap). */
@@ -15779,6 +15942,17 @@ uiRouter.post("/-/admin/badges/slug/:slug/delete", (c) => adminBadgeDeleteSubmit
 uiRouter.get("/-/admin/badges/slug/:slug/users", (c) => adminBadgeUsersPage(c, c.req.param("slug"), null, ""));
 uiRouter.post("/-/admin/badges/slug/:slug/users", (c) => adminBadgeUsersAdd(c, c.req.param("slug")));
 uiRouter.post("/-/admin/badges/slug/:slug/users/delete", (c) => adminBadgeUsersDelete(c, c.req.param("slug")));
+// The W4 external-auth arm (parseUiRoute claims exactly these shapes —
+// web.go:874-880's /auths group; the new + {authid} arms are GET/POST combos
+// like upstream's chi m.Combo, the delete tail is POST-only — its GET twin
+// answers chi's 405, the hooks-family convention).
+uiRouter.get("/-/admin/auths", (c) => adminAuthsPage(c));
+uiRouter.get("/-/admin/auths/new", (c) => adminAuthsNewPage(c));
+uiRouter.post("/-/admin/auths/new", (c) => adminAuthsNewSubmit(c));
+uiRouter.get("/-/admin/auths/:authid{\\d+}", (c) => adminAuthsEditPage(c, Number.parseInt(c.req.param("authid"), 10)));
+uiRouter.post("/-/admin/auths/:authid{\\d+}", (c) => adminAuthsEditSubmit(c, Number.parseInt(c.req.param("authid"), 10)));
+uiRouter.post("/-/admin/auths/:authid{\\d+}/delete", (c) => adminAuthsDelete(c, Number.parseInt(c.req.param("authid"), 10)));
+uiRouter.get("/-/admin/auths/:authid{\\d+}/delete", () => methodNotAllowed("POST"));
 uiRouter.get("/-/admin/applications", (c) => adminApplicationsPage(c));
 uiRouter.post("/-/admin/applications/oauth2", (c) => adminApplicationCreate(c));
 uiRouter.post("/-/admin/applications/oauth2/:id{\\d+}/delete", (c) => adminApplicationDelete(c, Number.parseInt(c.req.param("id"), 10)));

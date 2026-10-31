@@ -20,10 +20,11 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../auth/testing/seeds";
-import { repositories, repoSettings, users } from "../db/schema";
+import { loginSources, repositories, repoSettings, users } from "../db/schema";
 import { getOrInsertBlob, packageBlobContentKey } from "../services/packages/blobs";
 import { getOrInsertPackage, getOrInsertVersion, tryInsertFile } from "../services/packages/model";
 import { resetManifestCache, type UiManifest } from "./manifest";
+import { mintSession, SESSION_COOKIE_NAME } from "./session";
 import {
   assetsBinding,
   handlesUiRoute,
@@ -162,6 +163,11 @@ beforeEach(async () => {
     "repo_counters",
     "repo_redirects",
     "repositories",
+    // The W4 external-auth fixtures (the link rows first) + the sessions the
+    // signed-in fetches mint.
+    "external_login_user",
+    "login_source",
+    "sessions",
     "users",
   ]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
@@ -455,6 +461,20 @@ describe("parseUiRoute", () => {
     ["/-/admin/actions/scoped-workflows/required", { family: "admin-actions-scoped-workflows-required" }],
     ["/-/admin/actions/scoped-workflows/remove", { family: "admin-actions-scoped-workflows-remove" }],
     ["/-/admin/actions/scoped-workflows/extra", null],
+    // The W4 external-auth arm (pages/admin-auths.tsx — web.go:874-880's
+    // /auths group): the list literal, the new combo, the digits-only
+    // {authid} edit combo + delete tail (the PathParamInt64 parity —
+    // zero-padded parses; junk stays unclaimed → the engine's 404).
+    ["/-/admin/auths", { family: "admin-auths" }],
+    ["/-/admin/auths/new", { family: "admin-auths-new" }],
+    ["/-/admin/auths/7", { family: "admin-auths-edit", authId: 7 }],
+    ["/-/admin/auths/007", { family: "admin-auths-edit", authId: 7 }], // zero-padded parses as 7
+    ["/-/admin/auths/7/delete", { family: "admin-auths-delete", authId: 7 }],
+    ["/-/admin/auths/x", null], // junk authid
+    ["/-/admin/auths/x/delete", null], // junk authid under the delete tail
+    ["/-/admin/auths/7/extra", null], // deeper tails stay engine-owned
+    ["/-/admin/auths/new/delete", null], // the delete tail claims digits only
+    ["/-/admin/auths/extra", null], // unknown literal sibling
     // The repo-scoped twin stays unclaimed — the repo settings actions
     // family has no scoped-workflows tail (the engine's 404).
     ["/alice/demo/settings/actions/scoped-workflows", null],
@@ -826,5 +846,132 @@ describe("uiRouter", () => {
     const ownHtml = await own.text();
     expect(ownHtml).toContain("<title>Code - cf-gitea</title>");
     expect(ownHtml).toContain('action="/Alice/-/code"');
+  });
+
+  // --- the W4 external-auth mount (pages/admin-auths.tsx — web.go:874-880's
+  // /-/admin auths group; the parse claims above, the gate arms here) --------
+
+  /** The signed-in fetch helper for the admin gate arms (the
+   *  oauth2-authorize suite's cookie shape — mintSession returns id:secret).
+   *  The ASSETS binding and any extra headers ride the options. */
+  async function fetchAuthed(
+    path: string,
+    cookie: string,
+    options: { method?: string; body?: string; headers?: Record<string, string> } = {},
+  ): Promise<Response> {
+    return uiRouter.fetch(
+      new Request(`https://test.local${path}`, {
+        method: options.method ?? "GET",
+        headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}`, ...options.headers },
+        body: options.body,
+      }),
+      uiEnv,
+    );
+  }
+
+  it("mounts the admin auths pages behind the admin gate (list 200 for the admin, the anonymous 303 and the non-admin 404 arms)", async () => {
+    const admin = await seedVerifiedUser({ username: "Root", isAdmin: true });
+    const cookie = await mintSession(env.DB, admin.id);
+
+    // The list (GET /-/admin/auths): the admin chrome over the empty table.
+    const list = await fetchAuthed("/-/admin/auths", cookie);
+    expect(list.status).toBe(200);
+    const listHtml = await list.text();
+    expect(listHtml).toContain('class="page-content admin authentication"');
+    expect(listHtml).toContain("Authentication Source Management");
+    expect(listHtml).toContain('href="/-/admin/auths/new"');
+
+    // The anonymous arm: the prologue 303s onto the login round-trip.
+    const bounce = await fetchUi("/-/admin/auths");
+    expect(bounce.status).toBe(303);
+    expect(bounce.headers.get("location")).toBe(`/login?redirect_to=${encodeURIComponent("/-/admin/auths")}`);
+
+    // The signed-in non-admin arm: the hidden admin surface 404-shells.
+    const peon = await seedVerifiedUser({ username: "Peon" });
+    const peonCookie = await mintSession(env.DB, peon.id);
+    const forbidden = await fetchAuthed("/-/admin/auths", peonCookie);
+    expect(forbidden.status).toBe(404);
+    expect(await forbidden.text()).toContain("<title>Page Not Found - cf-gitea</title>");
+  });
+
+  it("serves the auths CRUD over the mounted routes (new form → create 303 → edit page → delete 303 → miss 404)", async () => {
+    const admin = await seedVerifiedUser({ username: "Root", isAdmin: true });
+    const cookie = await mintSession(env.DB, admin.id);
+    const formHeaders = { "content-type": "application/x-www-form-urlencoded", origin: "https://test.local" };
+
+    // The fresh new-form page.
+    const fresh = await fetchAuthed("/-/admin/auths/new", cookie);
+    expect(fresh.status).toBe(200);
+    expect(await fresh.text()).toContain('action="/-/admin/auths/new"');
+
+    // The create POST (upstream's wire fields): 303 onto the list.
+    const create = await fetchAuthed("/-/admin/auths/new", cookie, {
+      method: "POST",
+      headers: formHeaders,
+      body: new URLSearchParams({
+        name: "corp-oidc",
+        oauth2_provider: "openidConnect",
+        oauth2_key: "client-abc",
+        oauth2_secret: "s3cret",
+        open_id_connect_auto_discovery_url: "https://idp.example.com/.well-known/openid-configuration",
+        is_active: "on",
+      }).toString(),
+    });
+    expect(create.status).toBe(303);
+    expect(create.headers.get("location")).toBe("/-/admin/auths");
+
+    const row = await drizzle(env.DB).select().from(loginSources).get();
+    expect(row?.name).toBe("corp-oidc");
+    const id = row!.id;
+
+    // The list carries the row; the edit combo's GET renders it — the secret
+    // stays write-only (never echoes).
+    const listHtml = await (await fetchAuthed("/-/admin/auths", cookie)).text();
+    expect(listHtml).toContain(`href="/-/admin/auths/${id}"`);
+    const edit = await fetchAuthed(`/-/admin/auths/${id}`, cookie);
+    expect(edit.status).toBe(200);
+    const editHtml = await edit.text();
+    expect(editHtml).toContain('value="corp-oidc"');
+    expect(editHtml).not.toContain("s3cret");
+
+    // The delete POST: 303 back onto the list, the row gone — the edit GET
+    // then 404-shells (the loader's null-miss arm through the route).
+    const remove = await fetchAuthed(`/-/admin/auths/${id}/delete`, cookie, { method: "POST", headers: formHeaders });
+    expect(remove.status).toBe(303);
+    expect(remove.headers.get("location")).toBe("/-/admin/auths");
+    const miss = await fetchAuthed(`/-/admin/auths/${id}`, cookie);
+    expect(miss.status).toBe(404);
+    expect(await miss.text()).toContain("<title>Page Not Found - cf-gitea</title>");
+  });
+
+  it("arms the auths POST guards (the cross-origin reject, the invalid re-render) and the delete tail's GET 405 twin", async () => {
+    const admin = await seedVerifiedUser({ username: "Root", isAdmin: true });
+    const cookie = await mintSession(env.DB, admin.id);
+
+    // The §2.8 sameOriginGuard: a cross-origin POST is rejected before the
+    // prologue's write.
+    const forged = await fetchAuthed("/-/admin/auths/new", cookie, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://evil.example" },
+      body: "name=evil&oauth2_provider=github&oauth2_key=k&oauth2_secret=s",
+    });
+    expect(forged.status).toBe(403);
+
+    // The invalid create arm re-renders the new page at 200 with the message
+    // (the RenderWithErr posture — no row written).
+    const invalid = await fetchAuthed("/-/admin/auths/new", cookie, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://test.local" },
+      body: "name=&oauth2_provider=github&oauth2_key=k&oauth2_secret=s",
+    });
+    expect(invalid.status).toBe(200);
+    const invalidHtml = await invalid.text();
+    expect(invalidHtml).toContain("cannot be empty");
+    expect(await drizzle(env.DB).select().from(loginSources).all()).toHaveLength(0);
+
+    // The POST-only delete tail's GET twin answers chi's 405 (Allow: POST).
+    const twin = await fetchAuthed("/-/admin/auths/1/delete", cookie);
+    expect(twin.status).toBe(405);
+    expect(twin.headers.get("allow")).toBe("POST");
   });
 });
