@@ -1382,7 +1382,7 @@ text is a version-scoped package_property row, the zip the ONE lead file
   fix, upstream's own contract working as intended. The battery's PAT row
   was deleted and its 0600 token file shredded after the run.
 
-## As-built — M7 tail: cargo (2026-10-31 — the registry carries TWELVE protocols; the census's sparse-index family lands, the git mirror stays its own milestone)
+## As-built — M7 tail: cargo (2026-10-31 — the registry carried THIRTEEN at this landing; TWELVE was the go heading's count — a heading drift caught in the doc sweep; the census's sparse-index family lands, the git mirror stays its own milestone)
 
 Upstream `routers/api/packages/cargo/cargo.go` + `services/packages/cargo/index.go` +
 `modules/packages/cargo/parser.go` at the pin, ported as `src/services/packages/cargo.ts`

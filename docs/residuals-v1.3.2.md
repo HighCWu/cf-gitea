@@ -625,7 +625,7 @@ board row flips — this closes a flag, not a listed residual.
    reduction is retired. The route-level matrix (guard-first, the
    anonymous login 303, the doer-keyed scoping) is pinned in the page
    suite. Scoped-workflows at this scope: the page module LANDED
-   committed-unmounted (`9fb8ffd` — P1 item 3's user frame; the
+   MOUNTED LIVE by the store wave 630a6da (12 routes x 3 scopes; the page layer `9fb8ffd` — P1 item 3's user frame; the
    sub-tab stays the dead nav item and the routes the honest 404s until
    the store HANDOFF + mount flip). Settings-nav/goldens: both unions
    gained actions-general, 8 golden files re-baselined with token deltas
@@ -651,7 +651,7 @@ board row flips — this closes a flag, not a listed residual.
    add target (nothing stored), the 303 back onto the page URL; the
    route-level matrix is pinned in the org page suite (the org-vs-user
    scoping included). Scoped-workflows rides P1 item 3 (the org frame
-   LANDED committed-unmounted, `9fb8ffd`; the dead-item posture
+   LANDED + MOUNTED (9fb8ffd pages, 630a6da store+routes); the dead-item posture
    stands until the store wave). Size: — (closed).
 
 3. **The admin scoped-workflows page** (listed for traceability; consumed
@@ -660,7 +660,7 @@ board row flips — this closes a flag, not a listed residual.
    `92d2e87`'s stale-pin fixes keep it as the negative pin)
    (`docs/RELEASE-NOTES-v1.3.md` §4; `docs/compat/ui-parity-survey.md`
    tick-20 note "scoped-workflows is the documented-reduced honest 404").
-   The admin FRAME landed committed-unmounted (`9fb8ffd` — P1
+   The admin FRAME landed (9fb8ffd) and MOUNTED by the store wave (630a6da) — P1
    item 3); the 404 + the omitted nav item stand until the store
    HANDOFF + mount flip. Size: — (rides P1-3's store window).
 
