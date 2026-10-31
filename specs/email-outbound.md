@@ -55,12 +55,9 @@ upstream's shape impossible and multiple equally faithful adaptations exist
   (`mailIssueCommentToParticipants`, mail_issue.go:28-120) and the
   `mail/repo/issue/default.tmpl` comment render. Slice THREE (same file,
   §9) lands the next two arms in upstream notify.go order — `NewIssue`
-  (:53) and `IssueChangeStatus` (:59). STILL FOLLOW-UP, in upstream
-  notify.go order:
-  - `NewPullRequest` (:92) — the pull-create twin of `NewIssue`; the
-    `createPullRequest` service deliberately emits nothing today and the
-    pulls-create route keeps its bare `IssuesService(c.env.DB)`
-    construction (§9.4's handoff line);
+  (:53) and `IssueChangeStatus` (:59). Slice FOUR (same file, §10) lands
+  the pull-create arm — `NewPullRequest` (:88-93), with the pulls-create
+  route fold. STILL FOLLOW-UP, in upstream notify.go order:
   - `IssueChangeTitle`'s WIP-ready branch (:80);
   - mentions (`services/mentions` — the `onmention` preference stays
     unreachable until it lands, see §8's reduction ledger);
@@ -682,9 +679,10 @@ Upstream fires these receivers from the model layer (the issue-create and
 state-transition services), never the router — the emits sit at:
 
 - `createIssue` → `notifyMailNewIssue` (doer = `issue.posterId`; skipped
-  for poster-less creates). `createPullRequest` deliberately emits
-  NOTHING: pull creation is the separate `NewPullRequest` receiver
-  (notify.go:88-93, §1.3) — upstream's `NewIssue` arm is the issue arm.
+  for poster-less creates). `createPullRequest` emits nothing HERE —
+  pull creation is the separate `NewPullRequest` receiver (notify.go:
+  88-93), landed at §10.3 as its own emit; upstream's `NewIssue` arm is
+  the issue arm.
 - `transitionClosed` (the CAS winner only — a loser's batch fully no-ops
   and upstream never notifies a lost transition) →
   `notifyMailIssueStatus` (doer = `options.actorId`; skipped for
@@ -707,12 +705,99 @@ read; arms no-op unless `MAIL_ENABLED === "true"`). Folded at landing:
 - `api/routes/pulls.ts` `editPullRoute` handler — arms the pull
   close/reopen transitions (IssueChangeStatus covers IsPull).
 
-HANDOFF (not folded — no arm fires there yet): `api/routes/pulls.ts`'s
-`createPullRoute` handler still constructs `IssuesService(c.env.DB)`;
-the NewPullRequest arm's landing folds it to
-`new IssuesService(c.env.DB, c.env)` — one line, the §9.3
-`createPullRequest` emit lands with it. The UI write paths and the
-push-webhook close paths stay bare (§1.3's last bullet).
+`api/routes/pulls.ts`'s `createPullRoute` handler was handed off bare
+(`IssuesService(c.env.DB)`) — slice four folded it to
+`new IssuesService(c.env.DB, c.env)` when the NewPullRequest arm landed
+(§10.3). The UI write paths and the push-webhook close paths stay bare
+(§1.3's last bullet).
+
+---
+
+## 10. SLICE FOUR AS-BUILT — the NewPullRequest arm
+
+### 10.1 The pin's chain map (verified at fc493688)
+
+`NewPullRequest` (services/mailer/notify.go:88-93) is the pull-create
+twin of `NewIssue` — one line into the SAME middle slice three ports:
+
+- `MailParticipants(ctx, pr.Issue, pr.Issue.Poster,
+  ActionCreatePullRequest, mentions)` — the doer is the PR issue's
+  POSTER (not an actor; notify.go:89); mentions ride the §8.2 reduction
+  (no parser, passed nil-shaped).
+- `MailParticipants` (mail_issue.go:173-202) keeps the content —
+  ActionCreatePullRequest is NOT in the :180-185 empty list — and builds
+  the `mailComment` with `Comment: nil`, then
+  `mailIssueCommentToParticipants` → `composeIssueCommentMessages`, all
+  shared.
+- The ONE behavioral difference lives in the recipient resolution:
+  mail_issue.go:67-76's repo-watcher gate is
+  `IsPull && PullRequest.IsWorkInProgress && ActionType !=
+  ActionCreatePullRequest` — the CREATE arm keeps the repo watchers even
+  on a WIP pull (the create mail IS the notification that tells them a
+  PR exists; every other pull arm drops them). `IsWorkInProgress`
+  recomputes from the title prefix (models/issues/pull.go:652-658) — the
+  landed `hasWorkInProgressPrefix` proxy is upstream-true.
+- Template resolution: actionToTemplate (mail_issue_common.go:228-230)
+  maps ActionCreatePullRequest to the SAME "new" name as
+  ActionCreateIssue — no "Re: " prefix (:88-91), and the fallback chain
+  `mail/repo/pull/new` → `mail/repo/issue/new` → `mail/repo/pull/default`
+  → `mail/repo/issue/default` lands on issue/default.tmpl (only
+  assigned + default exist under `templates/mail/repo/issue/`; there is
+  no `mail/repo/pull/` at all) — byte-identical to the issue-new arm for
+  the same inputs (default.tmpl has no `.IsPull` branch).
+- Message-ID: the :285-294 switch has NO case for
+  ActionCreatePullRequest — the plain
+  `<owner/repo/pulls/#idx@domain>`, pinned by mail_test.go:417-422's
+  "Open Pull" fixture; In-Reply-To/References stay the plain thread id
+  (the reference is generated with ActionType(0), :165).
+- Subject/info: the fallback `[owner/repo] Title (#Index)` with no
+  prefix, and the batch info stays "issue comments" (mail_issue.go:161).
+
+### 10.2 The arm as-built (services/mail/notify.ts)
+
+- `notifyPullRequestCreated(env, {issue, doer})` — a thin wrapper over
+  the shared `notifyIssueArm` compose: `actionName: "new"`,
+  `content = issue.content ?? ""`, doer = the poster, PLUS the new
+  `pullCreate` flag threaded into `resolveIssueMailRecipients`, whose
+  WIP gate gains the upstream negation
+  (`isPull && hasWorkInProgressPrefix && !pullCreate`).
+- No templates.ts change: the pull-create render IS the issue-new render
+  (§10.1's fallback chain; no `.IsPull` branch in default.tmpl).
+- Dedupe key family: `pull-new:<issueId>:<recipientId>` — a DIFFERENT
+  trigger than the issue one (upstream's separate receiver; issueId is
+  unique, the commentId discipline).
+- `MailNotifyEvent` gains `"NewPullRequest"`.
+
+### 10.3 The emit site + the fold (src/issues/service.ts, api/routes/pulls.ts)
+
+- `createPullRequest` → `notifyMailNewPullRequest` after the winning
+  batch (upstream fires from the model layer): doer = `issue.posterId`
+  (notify.go:89), skipped for poster-less creates; the same fail-closed,
+  best-effort posture as the sibling arms (never throws; the write stays
+  committed).
+- `api/routes/pulls.ts`'s `createPullRoute` handler folded
+  `new IssuesService(c.env.DB)` → `new IssuesService(c.env.DB, c.env)`
+  (the §9.4 handoff line, applied). The route test env stays in the
+  fail-closed posture (`MAIL_ENABLED=false`, ADR-0005 D3), so no route
+  test arms.
+
+### 10.4 Test coverage (notify.test.ts, +5 over the 97 baseline)
+
+- The receiver's thread-root pins: no "Re: ", the PLAIN
+  `<owner/repo/pulls/#idx@domain>` Message-ID with the
+  In-Reply-To/References coincidence (the "Open Pull" fixture), reason
+  header "pull", no comment anchor, `/pulls/` link, the content kept as
+  body, `pull-new` dedupe keys.
+- The WIP exception twice: at the resolution level
+  (`resolveIssueMailRecipients` with `pullCreate: true` returns watcher
+  20 first) and end-to-end (a WIP pull's CREATE mail keeps the watcher
+  the same pull's comment/status arms drop).
+- The service-level emit: armed `createPullRequest` lands `pull-new`
+  rows (subject/Message-ID/reason/dedupe pinned, poster-doer excluded);
+  the poster-less pull create skips while the write lands; disabled/
+  malformed-config outcomes and the consume-to-sent consumer path ride
+  the sibling arms' assertions. (The pre-slice-four "createPullRequest
+  emits NOTHING" test is superseded by this family.)
 
 ---
 
@@ -821,8 +906,10 @@ Slice three adds (same files, same posture):
     emptied content, the closed/reopened line, the pull twin with the
     WIP gate); plus the service-level emits — armed `createIssue` /
     `closeIssue` / `reopenIssue` land rows, the CAS loser and the
-    poster-less / actor-less creates skip, `createPullRequest` emits
-    nothing, and the bare-construction posture stays silent.
+    poster-less / actor-less creates skip, and the bare-construction
+    posture stays silent. (Slice four's pull-create arm adds §10.4's
+    pins; the pre-slice-four "`createPullRequest` emits nothing"
+    assertion is superseded there.)
 
 Gate: the new suites green own-eyes (`pnpm test <files>`); bare
 `tsc --noEmit` zero errors; scoped eslint clean; `pnpm db:generate`

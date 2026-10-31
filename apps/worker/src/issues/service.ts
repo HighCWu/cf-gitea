@@ -46,7 +46,13 @@ import {
   ReleaseAlreadyExistError,
   RepositoryNotExistError,
 } from "./errors";
-import { notifyIssueComment, notifyIssueCreated, notifyIssueStatusChanged, type MailNotifyEnv } from "../services/mail/notify";
+import {
+  notifyIssueComment,
+  notifyIssueCreated,
+  notifyIssueStatusChanged,
+  notifyPullRequestCreated,
+  type MailNotifyEnv,
+} from "../services/mail/notify";
 
 export type IssueRow = typeof issues.$inferSelect;
 export type CommentRow = typeof comments.$inferSelect;
@@ -228,11 +234,12 @@ export class IssuesService {
    * the write paths fan the notify mail through the receiver arms —
    * `addComment` the plain-comment one (upstream CreateIssueComment,
    * services/mailer/notify.go:31-51), `createIssue` the NewIssue one
-   * (:53-58) and `closeIssue`/`reopenIssue` the IssueChangeStatus one
-   * (:59-76) — notify fires from the model layer, never the router.
-   * Absent (every existing construction site passes D1 only) the arms are
-   * off — the same fail-closed posture as `MAIL_ENABLED != "true"`, so
-   * callers are untouched.
+   * (:53-58), `closeIssue`/`reopenIssue` the IssueChangeStatus one (:59-76)
+   * and `createPullRequest` the NewPullRequest one (:88-93) — notify fires
+   * from the model layer, never the router. Absent (every existing
+   * construction site passes D1 only) the arms are off — the same
+   * fail-closed posture as `MAIL_ENABLED != "true"`, so callers are
+   * untouched.
    */
   private readonly mailEnv?: MailNotifyEnv;
 
@@ -382,6 +389,7 @@ export class IssuesService {
     if (issue === undefined || pullRequest === undefined) {
       throw new Error("issue/PR creation batch committed without returning rows");
     }
+    await this.notifyMailNewPullRequest(issue, input.now ?? new Date());
     return { issue, pullRequest };
   }
 
@@ -690,9 +698,9 @@ export class IssuesService {
    * The NewIssue receiver arm (specs/email-outbound.md §8; upstream
    * services/mailer/notify.go:53-58, fired from the issue-create service
    * with doer = issue.Poster). Only issues ride it — pull creation is the
-   * separate NewPullRequest receiver (notify.go:88-93, SPEC §1.3), so
-   * createPullRequest emits nothing here. Best-effort, never throws (the
-   * write above stays committed).
+   * separate NewPullRequest receiver (notify.go:88-93,
+   * `notifyMailNewPullRequest` below), and upstream's NewIssue arm is the
+   * issue arm. Best-effort, never throws (the write above stays committed).
    */
   private async notifyMailNewIssue(issue: IssueRow, now: Date): Promise<void> {
     if (this.mailEnv === undefined) return;
@@ -711,6 +719,36 @@ export class IssuesService {
     } catch (error) {
       console.error(
         `[issues] new-issue notify failed (issue ${issue.id}): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
+   * The NewPullRequest receiver arm (specs/email-outbound.md §10; upstream
+   * services/mailer/notify.go:88-93 — MailParticipants over the PR's issue
+   * row with ActionCreatePullRequest, doer = pr.Issue.Poster). Fires from
+   * the PR-create service exactly like upstream's model-layer notify; the
+   * compose is the thread-root "new" arm with IsPull = true and the
+   * repo-watcher WIP gate lifted (mail_issue.go:67-76's create-arm
+   * exception). Best-effort, never throws (the write above stays
+   * committed).
+   */
+  private async notifyMailNewPullRequest(issue: IssueRow, now: Date): Promise<void> {
+    if (this.mailEnv === undefined) return;
+    if (issue.posterId === null) return;
+    try {
+      const doer = (await this.db.select().from(users).where(eq(users.id, issue.posterId)).get()) ?? null;
+      if (doer === null) {
+        console.error(`[issues] new-pull notify skipped: poster row missing [id: ${issue.posterId}]`);
+        return;
+      }
+      const outcome = await notifyPullRequestCreated(this.mailEnv, { issue, doer }, { now });
+      if (outcome.outcome === "enqueued" && outcome.enqueue.some((e) => e.outcome === "pending-unqueued")) {
+        console.warn(`[issues] new-pull notify: some rows stayed pending-unqueued (issue ${issue.id})`);
+      }
+    } catch (error) {
+      console.error(
+        `[issues] new-pull notify failed (issue ${issue.id}): ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   }

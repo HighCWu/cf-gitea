@@ -830,7 +830,11 @@ export function registerPullRoutes(
       const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
       assertNotArchived(found);
       const form = c.req.valid("json");
-      const service = new IssuesService(c.env.DB);
+      // The notify env hop (specs/email-outbound.md §10.3): the service's
+      // createPullRequest emit rides it (the NewPullRequest receiver,
+      // services/mailer/notify.go:88-93); the arm no-ops unless
+      // MAIL_ENABLED === "true".
+      const service = new IssuesService(c.env.DB, c.env);
       const requester = c.get("authUser");
 
       // Upstream fail-fast: head == base has nothing to merge (422).

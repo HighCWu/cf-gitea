@@ -37,7 +37,13 @@ import {
 import { IssuesService, type IssueRow } from "../../issues/service";
 import { CommentType } from "../../issues/comment-types";
 import { isMailOutboxMessage, processMailOutbox, type MailOutboxMessage } from "./outbox";
-import { notifyIssueCreated, notifyIssueStatusChanged, resolveIssueMailRecipients, type MailNotifyEnv } from "./notify";
+import {
+  notifyIssueCreated,
+  notifyIssueStatusChanged,
+  notifyPullRequestCreated,
+  resolveIssueMailRecipients,
+  type MailNotifyEnv,
+} from "./notify";
 import { issueMailFallbackSubject, renderIssueCommentMail } from "./templates";
 
 beforeAll(async () => {
@@ -251,6 +257,20 @@ describe("resolveIssueMailRecipients — the mailIssueCommentToParticipants port
     const repo = (await db().select().from(repositories).where(eq(repositories.id, REPO_ID)).get())!;
     const recipients = await resolveIssueMailRecipients(env.DB, { issue: fresh, repo, doer });
     expect(recipients.map((u) => u.id)).toEqual([10, 50, 40, 30]);
+  });
+
+  it("pullCreate lifts the WIP gate for the repo watchers (mail_issue.go:67-76's ActionCreatePullRequest exception)", async () => {
+    const issue = await seedIssue("WIP: draft thing");
+    await env.DB.prepare("UPDATE issues SET is_pull = 1 WHERE id = ?").bind(issue.id).run();
+    const fresh = (await db().select().from(issues).where(eq(issues.id, issue.id)).get())!;
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    const repo = (await db().select().from(repositories).where(eq(repositories.id, REPO_ID)).get())!;
+    const recipients = await resolveIssueMailRecipients(env.DB, { issue: fresh, repo, doer, pullCreate: true });
+    // Upstream's gate is `IsPull && IsWorkInProgress && ActionType !=
+    // ActionCreatePullRequest` — false for the create mail, so watcher 20 is
+    // back at the head of the source order (70 explicit unwatch, 80
+    // onmention, 95 org, 96 prohibited stay out).
+    expect(recipients.map((u) => u.id)).toEqual([20, 10, 50, 40, 30]);
   });
 
   it("absent user_settings row = the 'enabled' default (admin.go:32)", async () => {
@@ -604,8 +624,100 @@ describe("notifyIssueStatusChanged — the IssueChangeStatus receiver", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The service-level emit sites — IssuesService.createIssue / closeIssue /
-// reopenIssue (upstream fires from the model layer; the router never does)
+// The NewPullRequest arm (notify.go:88-93) — MailParticipants over the PR's
+// issue row with ActionCreatePullRequest, doer = pr.Issue.Poster; the
+// repo-watcher WIP exception (mail_issue.go:67-76) is its one unique
+// behavior (SPEC §10)
+// ---------------------------------------------------------------------------
+
+describe("notifyPullRequestCreated — the NewPullRequest receiver", () => {
+  /** seedIssue + the is_pull flip (the PR twin of the issue fixtures). */
+  async function seedPull(title = "a pull"): Promise<IssueRow> {
+    const issue = await seedIssue(title);
+    await env.DB.prepare("UPDATE issues SET is_pull = 1 WHERE id = ?").bind(issue.id).run();
+    return (await db().select().from(issues).where(eq(issues.id, issue.id)).get())!;
+  }
+
+  it("the pull thread-root mail: no Re: prefix, the PLAIN /pulls/ Message-ID (the mail_test.go:417-422 'Open Pull' fixture), no anchor, content kept", async () => {
+    const pr = await seedPull();
+    const mailEnv = armedEnv();
+    const poster = (await db().select().from(users).where(eq(users.id, 10)).get())!;
+    const outcome = await notifyPullRequestCreated(mailEnv, { issue: pr, doer: poster }, { now: new Date(1_700_000_000_000) });
+    expect(outcome.outcome).toBe("enqueued");
+    const rows = await db().select().from(emailOutbox).all();
+    // Same resolution core over the seeded fixture: repo watcher 20,
+    // assignee 50, participant 40, issue watcher 30 — the POSTER is the
+    // doer (notify.go:89 passes pr.Issue.Poster) and is excluded by
+    // mail_issue.go:94-97.
+    expect(new Set(rows.map((row) => row.toAddr))).toEqual(
+      new Set(["rw@example.com", "as@example.com", "part@example.com", "iw@example.com"]),
+    );
+    for (const row of rows) {
+      expect(row.subject).toBe(`[repoowner/repo] ${pr.title} (#${pr.index})`); // NO "Re: "
+      expect(row.info).toBe(`Subject: [repoowner/repo] ${pr.title} (#${pr.index}), issue comments`);
+      expect(row.dedupeKey).toBe(`pull-new:${pr.id}:${recipientIdOf(row)}`);
+      const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+      // ActionCreatePullRequest has NO Message-ID extra (mail_issue_common.go:
+      // 285-294's switch has no case for it — the mail_test.go:417-422 "Open
+      // Pull" fixture pins the plain prefix); the create mail IS the thread
+      // root, so all three ids coincide, In-Reply-To/References generated
+      // with ActionType(0) (:165).
+      expect(headers["Message-ID"]).toBe(`<repoowner/repo/pulls/${pr.index}@mail.example>`);
+      expect(headers["In-Reply-To"]).toBe(`<repoowner/repo/pulls/${pr.index}@mail.example>`);
+      expect(headers["References"]).toBe(`<repoowner/repo/pulls/${pr.index}@mail.example>`);
+      expect(headers["X-Gitea-Reason"]).toBe("pull");
+      expect(headers["X-Gitea-Sender"]).toBe("poster");
+      // The link carries no comment anchor and rides /pulls/ (Comment nil,
+      // mail_issue_common.go:60-64; Issue.HTMLURL's IsPull half).
+      expect(row.bodyHtml).toContain(
+        `<a href="https://mail.example/repoowner/repo/pulls/${pr.index}">#${pr.index}</a>`,
+      );
+      expect(row.bodyHtml).not.toContain("issuecomment-");
+      // MailParticipants KEEPS the content for ActionCreatePullRequest (NOT
+      // in mail_issue.go:180-185's empty list) — the body IS the
+      // description.
+      expect(row.bodyHtml).toContain("<p>body</p>");
+    }
+  });
+
+  it("the create-arm WIP exception: repo watchers stay IN on a WIP pull (the same pull drops them on the comment/status arms)", async () => {
+    const pr = await seedPull("WIP: draft thing");
+    const mailEnv = armedEnv();
+    const poster = (await db().select().from(users).where(eq(users.id, 10)).get())!;
+    await notifyPullRequestCreated(mailEnv, { issue: pr, doer: poster }, {});
+    const rows = await db().select().from(emailOutbox).all();
+    // Watcher 20 rides (mail_issue.go:70's negation for the create arm);
+    // 70 explicit unwatch, 80 onmention, 95 org, 96 prohibited stay out.
+    expect(new Set(rows.map((row) => row.toAddr))).toEqual(
+      new Set(["rw@example.com", "as@example.com", "part@example.com", "iw@example.com"]),
+    );
+  });
+
+  it("consumes to 'sent' through the landed consumer arm", async () => {
+    const pr = await seedPull();
+    const mailEnv = armedEnv();
+    const poster = (await db().select().from(users).where(eq(users.id, 10)).get())!;
+    await notifyPullRequestCreated(mailEnv, { issue: pr, doer: poster }, {});
+    const spy = mailEnv.REPO_TASKS as unknown as { sendBodies: MailOutboxMessage[] };
+    const outcome = await processMailOutbox(mailEnv, spy.sendBodies[0]!);
+    expect(outcome).toEqual({ kind: "sent" });
+  });
+
+  it("MAIL_ENABLED off and malformed MAIL_FROM degrade like the sibling arms", async () => {
+    const pr = await seedPull();
+    const poster = (await db().select().from(users).where(eq(users.id, 10)).get())!;
+    const off = armedEnv({ MAIL_ENABLED: "false" });
+    expect((await notifyPullRequestCreated(off, { issue: pr, doer: poster }, {})).outcome).toBe("disabled");
+    const malformed = armedEnv({ MAIL_FROM: "no address here" });
+    expect((await notifyPullRequestCreated(malformed, { issue: pr, doer: poster }, {})).outcome).toBe("misconfigured");
+    expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The service-level emit sites — IssuesService.createIssue / createPullRequest
+// / closeIssue / reopenIssue (upstream fires from the model layer; the router
+// never does)
 // ---------------------------------------------------------------------------
 
 describe("IssuesService notify arms — createIssue + close/reopen emits", () => {
@@ -631,21 +743,39 @@ describe("IssuesService notify arms — createIssue + close/reopen emits", () =>
     expect((mailEnv.REPO_TASKS as unknown as { sends: number }).sends).toBe(2);
   });
 
-  it("createPullRequest emits NOTHING (NewPullRequest is the pull-create arm, SPEC §1.3)", async () => {
+  it("createPullRequest through an armed service lands pull-new rows (the NewPullRequest receiver, SPEC §10)", async () => {
     await seedRepo();
+    await db().insert(repoWatchers).values([
+      { repoId: REPO_ID, userId: 20 },
+      { repoId: REPO_ID, userId: 70 },
+    ]);
+    const now = new Date(1_700_000_000_000);
     const mailEnv = armedEnv();
     const service = new IssuesService(env.DB, mailEnv);
-    await service.createPullRequest({
+    const { issue } = await service.createPullRequest({
       repoId: REPO_ID,
       title: "a pull",
-      content: "desc",
+      content: "pr desc",
       posterId: 10,
       headRepoId: REPO_ID,
       baseBranch: "main",
       headBranch: "topic",
+      now,
     });
-    expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
-    expect((mailEnv.REPO_TASKS as unknown as { sends: number }).sends).toBe(0);
+    const rows = await db().select().from(emailOutbox).all();
+    // Both repo watchers are sources; poster 10 is the DOER (notify.go:89
+    // passes pr.Issue.Poster) and is excluded.
+    expect(rows.map((row) => row.toAddr)).toEqual(["rw@example.com", "un@example.com"]);
+    for (const row of rows) {
+      expect(row.dedupeKey).toMatch(new RegExp(`^pull-new:${issue.id}:(20|70)$`));
+      expect(row.subject).toBe("[repoowner/repo] a pull (#1)"); // NO "Re: "
+      const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+      expect(headers["Message-ID"]).toBe(`<repoowner/repo/pulls/${issue.index}@mail.example>`);
+      expect(headers["In-Reply-To"]).toBe(`<repoowner/repo/pulls/${issue.index}@mail.example>`);
+      expect(headers["X-Gitea-Reason"]).toBe("pull");
+      expect(row.bodyHtml).toContain("<p>pr desc</p>");
+    }
+    expect((mailEnv.REPO_TASKS as unknown as { sends: number }).sends).toBe(2);
   });
 
   it("closeIssue/reopenIssue through an armed service land issue-status rows (CAS winner only)", async () => {
@@ -698,12 +828,22 @@ describe("IssuesService notify arms — createIssue + close/reopen emits", () =>
     expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
   });
 
-  it("a poster-less create and an actor-less close skip the mail but keep the writes", async () => {
+  it("a poster-less create (issue and pull) and an actor-less close skip the mail but keep the writes", async () => {
     const mailEnv = armedEnv();
     const service = new IssuesService(env.DB, mailEnv);
     await seedRepo();
     const issue = await service.createIssue({ repoId: REPO_ID, title: "ghost", content: null, posterId: null });
     expect(issue.id).toBeGreaterThan(0);
+    const pr = await service.createPullRequest({
+      repoId: REPO_ID,
+      title: "ghost pull",
+      content: null,
+      posterId: null,
+      headRepoId: REPO_ID,
+      baseBranch: "main",
+      headBranch: "topic",
+    });
+    expect(pr.issue.id).toBeGreaterThan(0);
     await service.closeIssue(issue.id, { actorId: null });
     expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
     expect((mailEnv.REPO_TASKS as unknown as { sends: number }).sends).toBe(0);

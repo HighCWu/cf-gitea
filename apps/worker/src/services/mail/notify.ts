@@ -20,9 +20,11 @@
  *     outbox row is transport-agnostic). The remaining notify surfaces are
  *     additive entries against the same core — the recipient resolution and
  *     the compose below are exactly upstream's shared middle, so
- *     `NewIssue` / `IssueChangeStatus` (notify.go:53-76, landed here) and
- *     `NewPullRequest` (:88, SPEC §1.3's remaining arm) are thin wrappers
- *     passing a different action type and `comment = null`.
+ *     `NewIssue` / `IssueChangeStatus` (notify.go:53-76) and
+ *     `NewPullRequest` (:88-93) are thin wrappers passing a different
+ *     action type and `comment = null` (all three landed here; slice four
+ *     records the pull arm in SPEC §10 — its one unique behavior is the
+ *     repo-watcher WIP-gate exception, mail_issue.go:67-76).
  *
  * The emit sites are the real write paths (`IssuesService.addComment` /
  * `createIssue` / `closeIssue`+`reopenIssue` — upstream fires notify from
@@ -90,12 +92,17 @@ type CommentMailRow = typeof comments.$inferSelect;
 
 /**
  * The notify-event vocabulary — upstream's `Notifier` method names
- * (services/notify/notifier.go). The three issue-thread arms land here
+ * (services/notify/notifier.go). The issue-thread arms land here
  * (CreateIssueComment notify.go:31-51, NewIssue :53-58, IssueChangeStatus
- * :59-76); the rest are the additive entries SPEC §1.3 enumerates (each
- * lands as a thin wrapper over the same resolution + compose core below).
+ * :59-76, NewPullRequest :88-93); the rest are the additive entries SPEC
+ * §1.3 enumerates (each lands as a thin wrapper over the same resolution +
+ * compose core below).
  */
-export type MailNotifyEvent = "CreateIssueComment" | "NewIssue" | "IssueChangeStatus";
+export type MailNotifyEvent =
+  | "CreateIssueComment"
+  | "NewIssue"
+  | "IssueChangeStatus"
+  | "NewPullRequest";
 
 /** The env slice the hub reads (both bindings ride the outbox). */
 export type MailNotifyEnv = Pick<MailOutboxEnv, "DB" | "REPO_TASKS" | "APP_URL"> & {
@@ -273,6 +280,15 @@ export async function resolveIssueMailRecipients(
     issue: Pick<IssueMailRow, "id" | "repoId" | "posterId" | "isPull" | "title">;
     repo: Pick<RepositoryRow, "id" | "ownerId" | "visibility">;
     doer: UserRow;
+    /** The mailIssueCommentToParticipants create-arm exception
+     *  (mail_issue.go:67-76): upstream's gate is
+     *  `IsPull && IsWorkInProgress && ActionType != ActionCreatePullRequest`,
+     *  so the PULL-CREATE mail keeps the repo watchers even on a WIP pull
+     *  (the create mail is the notification that tells them a PR exists);
+     *  every other pull arm drops them. `IsWorkInProgress` recomputes from
+     *  the title prefix (models/issues/pull.go:652-658) — the landed
+     *  `hasWorkInProgressPrefix` proxy. */
+    pullCreate?: boolean;
   },
 ): Promise<UserRow[]> {
   const db = drizzle(d1);
@@ -283,13 +299,15 @@ export async function resolveIssueMailRecipients(
     return [];
   }
 
-  // =========== Repo watchers (WIP-gated, mail_issue.go:67-76) ===========
-  const repoWatcherIds =
-    input.issue.isPull && hasWorkInProgressPrefix(input.issue.title)
-      ? []
-      : (
-          await db.select({ id: repoWatchers.userId }).from(repoWatchers).where(eq(repoWatchers.repoId, input.issue.repoId)).all()
-        ).map((row) => row.id);
+  // =========== Repo watchers (WIP-gated, mail_issue.go:67-76 — the gate
+  // carries the ActionCreatePullRequest exception: false for the create arm) ==
+  const wipGate =
+    input.issue.isPull && hasWorkInProgressPrefix(input.issue.title) && !input.pullCreate;
+  const repoWatcherIds = wipGate
+    ? []
+    : (
+        await db.select({ id: repoWatchers.userId }).from(repoWatchers).where(eq(repoWatchers.repoId, input.issue.repoId)).all()
+      ).map((row) => row.id);
 
   // =========== Original poster (mail_issue.go:43-44) ===========
   const posterIds = input.issue.posterId === null ? [] : [input.issue.posterId];
@@ -512,36 +530,43 @@ export async function notifyIssueComment(
  *  mail_issue.go:188-198). */
 interface NotifyIssueArmInput {
   issue: IssueMailRow;
-  /** The mail's doer — issue.Poster for NewIssue (notify.go:55), the actor
-   *  for IssueChangeStatus (notify.go:76). */
+  /** The mail's doer — issue.Poster for NewIssue (notify.go:55) AND for
+   *  NewPullRequest (notify.go:89 `pr.Issue.Poster`), the actor for
+   *  IssueChangeStatus (notify.go:76). */
   doer: UserRow;
   /** actionToTemplate's name for the arm (mail_issue_common.go:227-246):
-   *  ActionCreateIssue → "new"; ActionCloseIssue|ClosePullRequest → "close";
+   *  ActionCreateIssue AND ActionCreatePullRequest → "new";
+   *  ActionCloseIssue|ClosePullRequest → "close";
    *  ActionReopenIssue|ReopenPullRequest → "reopen" (IsPull picks the
    *  activities constant, not the name — notify.go:63-73). */
   actionName: "new" | "close" | "reopen";
   /** MailParticipants' content rule (mail_issue.go:179-185): the issue
-   *  content for "new"; "" for close/reopen (upstream empties it). */
+   *  content for "new" (ActionCreatePullRequest is NOT in the empty list);
+   *  "" for close/reopen (upstream empties it). */
   content: string;
   /** The dedupe-key family (SPEC §8.3's trigger-level idempotency). */
-  dedupePrefix: "issue-new" | "issue-status";
+  dedupePrefix: "issue-new" | "issue-status" | "pull-new";
+  /** The pull-create arm's repo-watcher WIP-gate exception (the
+   *  resolveIssueMailRecipients flag, mail_issue.go:67-76). */
+  pullCreate?: boolean;
 }
 
 /**
- * The comment-nil arm compose — the shared middle behind NewIssue and
- * IssueChangeStatus: `MailParticipants` (mail_issue.go:173-202) with
- * `Comment: nil` → `mailIssueCommentToParticipants` (the same resolution
- * core the comment arm uses) → `composeIssueCommentMessages` over the
- * default.tmpl non-comment branches. Differences from the comment arm, all
- * pinned:
+ * The comment-nil arm compose — the shared middle behind NewIssue,
+ * IssueChangeStatus and NewPullRequest: `MailParticipants`
+ * (mail_issue.go:173-202) with `Comment: nil` →
+ * `mailIssueCommentToParticipants` (the same resolution core the comment
+ * arm uses) → `composeIssueCommentMessages` over the default.tmpl
+ * non-comment branches. Differences from the comment arm, all pinned:
  *   - link = `Issue.HTMLURL`, no anchor (mail_issue_common.go:60-64 —
  *     Comment nil);
  *   - subject prefix "Re: " only when actName != "new" (:88-91) — the new
  *     mail is the thread's root;
  *   - Message-ID: "new" carries NO extra (mail_issue_common.go:285-294's
- *     switch has no ActionCreateIssue case — the mail_test.go:412 fixture
- *     pins the plain `<owner/repo/issues/#idx@domain>`); close/reopen carry
- *     `/close|reopen/<unixMilli>` (the :446/:462 fixtures);
+ *     switch has no ActionCreateIssue/ActionCreatePullRequest case — the
+ *     mail_test.go:412 "Open Issue" and :417-422 "Open Pull" fixtures pin
+ *     the plain `<owner/repo/issues|pulls/#idx@domain>`); close/reopen
+ *     carry `/close|reopen/<unixMilli>` (the :446/:462 fixtures);
  *   - In-Reply-To/References stay the plain thread id for both arms (the
  *     reference is generated with ActionType(0), :165);
  *   - the body is the ISSUE content for new and empty for close/reopen, so
@@ -549,8 +574,10 @@ interface NotifyIssueArmInput {
  *     interpolated with DisplayNameWithFullName) instead of a body for
  *     close/reopen and for empty new-issue descriptions;
  *   - info stays "issue comments" (mail_issue.go:159's batch string).
- * Dedupe keys: `issue-new:<issueId>:<recipientId>` (issueId is unique — the
- * comment arm's commentId discipline) and
+ * Dedupe keys: `issue-new:<issueId>:<recipientId>` /
+ * `pull-new:<issueId>:<recipientId>` (issueId is unique — the comment arm's
+ * commentId discipline; the pull arm is a DIFFERENT trigger than the issue
+ * one, upstream's separate NewPullRequest receiver) and
  * `issue-status:<issueId>:<action>:<unixMilli>:<recipientId>` (the ms rides
  * the key exactly as it rides the Message-ID — repeated close/reopen cycles
  * over one issue must each mail).
@@ -560,7 +587,7 @@ async function notifyIssueArm(
   input: NotifyIssueArmInput,
   options: { now?: Date },
 ): Promise<MailNotifyOutcome> {
-  const armName = input.actionName === "new" ? "new-issue mail" : "issue-status mail";
+  const armName = input.pullCreate ? "new-pull mail" : input.actionName === "new" ? "new-issue mail" : "issue-status mail";
   const pre = await mailArmPrelude(env, armName, `${armName} for issue ${input.issue.id}`, input.issue.repoId);
   if (!pre.ok) return pre.outcome;
   const { from, pair } = pre;
@@ -569,6 +596,7 @@ async function notifyIssueArm(
     issue: input.issue,
     repo: pair.repo,
     doer: input.doer,
+    pullCreate: input.pullCreate,
   });
   if (recipients.length === 0) return { outcome: "no-recipients" };
 
@@ -660,8 +688,8 @@ async function notifyIssueArm(
             }),
           }),
           dedupeKey:
-            input.dedupePrefix === "issue-new"
-              ? `issue-new:${input.issue.id}:${recipient.id}`
+            input.dedupePrefix === "issue-new" || input.dedupePrefix === "pull-new"
+              ? `${input.dedupePrefix}:${input.issue.id}:${recipient.id}`
               : `issue-status:${input.issue.id}:${input.actionName}:${unixMilli}:${recipient.id}`,
         },
         options,
@@ -675,7 +703,7 @@ async function notifyIssueArm(
  * The `NewIssue` arm's mail (notify.go:53-58 → MailParticipants with
  * ActionCreateIssue, doer = `issue.Poster`, mentions nil-unported per the
  * §8.2 reductions). Only issues ride it — pull creation is the separate
- * `NewPullRequest` receiver (notify.go:88-93, SPEC §1.3).
+ * `NewPullRequest` receiver (notify.go:88-93, notifyPullRequestCreated).
  */
 export async function notifyIssueCreated(
   env: MailNotifyEnv,
@@ -690,6 +718,40 @@ export async function notifyIssueCreated(
       actionName: "new",
       content: input.issue.content ?? "",
       dedupePrefix: "issue-new",
+    },
+    options,
+  );
+}
+
+/**
+ * The `NewPullRequest` arm's mail (notify.go:88-93 → MailParticipants over
+ * the PR's issue row with ActionCreatePullRequest, doer = `pr.Issue.Poster`,
+ * mentions nil-unported per the §8.2 reductions — SPEC §10). Compose-wise
+ * it is the thread-root "new" arm with IsPull = true: ActionCreatePullRequest
+ * maps to the SAME "new" name as ActionCreateIssue (actionToTemplate,
+ * mail_issue_common.go:228-230), keeps the issue content (NOT in
+ * MailParticipants' :180-185 empty list), and carries NO Message-ID extra
+ * (the :285-294 switch — the mail_test.go:417-422 "Open Pull" fixture pins
+ * the plain `<owner/repo/pulls/#idx@domain>`); the render falls through to
+ * issue/default.tmpl (no `mail/repo/pull/` exists at the pin), byte-identical
+ * to the issue-new arm. Its ONE unique behavior: the repo-watcher WIP gate
+ * does NOT apply (mail_issue.go:67-76's ActionCreatePullRequest exception —
+ * `pullCreate` below).
+ */
+export async function notifyPullRequestCreated(
+  env: MailNotifyEnv,
+  input: { issue: IssueMailRow; doer: UserRow },
+  options: { now?: Date } = {},
+): Promise<MailNotifyOutcome> {
+  return notifyIssueArm(
+    env,
+    {
+      issue: input.issue,
+      doer: input.doer,
+      pullCreate: true,
+      actionName: "new",
+      content: input.issue.content ?? "",
+      dedupePrefix: "pull-new",
     },
     options,
   );
