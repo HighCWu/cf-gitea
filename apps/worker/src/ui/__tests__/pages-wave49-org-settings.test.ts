@@ -190,10 +190,23 @@ describe("wave-49 parser families (parseUiRoute / handlesUiRoute)", () => {
       owner: "acme",
       id: 7,
     });
-    // The show/edit + regenerate_secret shapes stay unclaimed (no landed
-    // edit page — the module header).
-    expect(parseUiRoute("/acme/settings/applications/oauth2/7")).toBeNull();
-    expect(parseUiRoute("/acme/settings/applications/oauth2/7/regenerate_secret")).toBeNull();
+    // The W5 edit arms (b91dd1c's landed edit page —
+    // pages/oauth2-app-edit.tsx mounted via the org-settings-applications
+    // module): the wave-49 pin below predates b91dd1c and held these shapes
+    // unclaimed, so the stale toBeNull pins updated to the claimed shapes
+    // (the window-2b / R20-a precedents). Upstream web.go:1025-1027: the
+    // /oauth2/{id} group's Combo("") (GET show + POST save — one parse
+    // shape, two methods) and the literal regenerate_secret POST.
+    expect(parseUiRoute("/acme/settings/applications/oauth2/7")).toEqual({
+      family: "org-settings-applications-app",
+      owner: "acme",
+      id: 7,
+    });
+    expect(parseUiRoute("/acme/settings/applications/oauth2/7/regenerate_secret")).toEqual({
+      family: "org-settings-applications-regenerate",
+      owner: "acme",
+      id: 7,
+    });
     // Window-2b (4f2805f) mounted the blocked-users tab — the stale
     // toBeNull pin updated to the claimed shape (the org-settings matrix's
     // escalation).
