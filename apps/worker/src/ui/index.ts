@@ -747,8 +747,12 @@ import { actionsJobLogsResponse, loadActionsRunJobLogs } from "./pages/repo-acti
 import { resolveActionsRunWorkflowFile } from "./pages/repo-actions-workflow";
 import { renderWorkflowBadgeSvg, resolveWorkflowBadge } from "./pages/repo-actions-badge";
 import { loadWorkflowDispatchInputsFragment } from "./pages/repo-actions-dispatch-inputs";
-import { repoStarActionResponse, repoWatchActionResponse } from "./pages/repo-header-actions";
-import { isWatchingRepo } from "../api/services/repo-watchers";
+import {
+  repoStarActionResponse,
+  repoWatchActionResponse,
+  repoWatchOptionsActionResponse,
+} from "./pages/repo-header-actions";
+import { getWatch } from "../api/services/repo-watchers";
 import { isStarring } from "../api/services/stars";
 import {
   bulkAdminActionsRunners,
@@ -3037,13 +3041,25 @@ export interface RepoActionsDispatchInputsRoute {
 }
 
 /** The repo header's fetch-action family (pages/repo-header-actions.tsx —
- *  upstream web.go:1765-1772's POST /action/{star|unstar|watch|participate};
- *  ignore + watch/options stay unclaimed — no watch.mode substrate). */
+ *  upstream web.go:1765-1772's POST /action/{star|unstar|watch|participate|
+ *  ignore}, routers/web/repo/watch.go:16-47's three watch modes over the
+ *  landed watchRepoWithOptions). */
 export interface RepoActionRoute {
   family: "repo-action";
   owner: string;
   repo: string;
-  action: "star" | "unstar" | "watch" | "participate";
+  action: "star" | "unstar" | "watch" | "participate" | "ignore";
+}
+
+/** The custom watch-options form (pages/repo-header-actions.tsx's
+ *  repoWatchOptionsActionResponse — upstream web.go:1771's
+ *  POST /action/watch/options, routers/web/repo/watch.go:49-60's
+ *  ActionWatchOptions over the watch_options_modal; the three-segment
+ *  literal, matched ahead of the action-word arm). */
+export interface RepoActionWatchOptionsRoute {
+  family: "repo-action-watch-options";
+  owner: string;
+  repo: string;
 }
 
 
@@ -3434,6 +3450,7 @@ export type ParsedUiRoute =
   | RepoActionsWorkflowBadgeRoute
   | RepoActionsDispatchInputsRoute
   | RepoActionRoute
+  | RepoActionWatchOptionsRoute
   | SiteHomeRoute
   | ExploreRoute
   | NotificationsRoute
@@ -4681,9 +4698,16 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     return { family: "repo-actions-dispatch-inputs", owner, repo };
   }
   // The repo header's fetch-action family (web.go:1765-1772 — star/unstar/
-  // watch/participate only; ignore + watch/options stay unclaimed).
+  // watch/participate/ignore) + the custom watch-options form (web.go:1771,
+  // the exact "watch/options" two-segment literal, matched first).
   if (head === "action") {
-    if (rest.length === 1 && (rest[0] === "star" || rest[0] === "unstar" || rest[0] === "watch" || rest[0] === "participate")) {
+    if (rest.length === 2 && rest[0] === "watch" && rest[1] === "options") {
+      return { family: "repo-action-watch-options", owner, repo };
+    }
+    if (
+      rest.length === 1 &&
+      (rest[0] === "star" || rest[0] === "unstar" || rest[0] === "watch" || rest[0] === "participate" || rest[0] === "ignore")
+    ) {
       return { family: "repo-action", owner, repo, action: rest[0] };
     }
     return null;
@@ -5971,15 +5995,17 @@ async function resolveUiRequest(c: Context<{ Bindings: Env }>): Promise<Resolved
       }
     }
   }
-  // The header trio's viewer state (usability B-4 Stage A): the watch/star
-  // probes ride the same request resolution, Promise.all'd — byte-neutral
-  // for fixture viewers (no edges), so the goldens' bytes survive.
+  // The header trio's viewer state (usability B-4): the watch GetWatch read
+  // (the full mode row the four-mode menu renders — watch.tmpl's $.RepoWatch)
+  // and the star probe ride the same request resolution, Promise.all'd —
+  // byte-neutral for fixture viewers (no edges), so the anonymous goldens'
+  // bytes survive.
   if (resolved.viewer.kind === "user") {
-    const [watching, starring] = await Promise.all([
-      isWatchingRepo(c.env.DB, repo.id, resolved.viewer.id),
+    const [repoWatch, starring] = await Promise.all([
+      getWatch(c.env.DB, repo.id, resolved.viewer.id),
       isStarring(c.env.DB, resolved.viewer.id, repo.id),
     ]);
-    resolved.ctx.viewerWatchsRepo = watching;
+    resolved.ctx.viewerRepoWatch = repoWatch;
     resolved.ctx.viewerStarsRepo = starring;
   }
   return { ...resolved, repo };
@@ -7008,10 +7034,10 @@ async function repoActionsDispatchInputsRoute(c: Context<{ Bindings: Env }>): Pr
   return respond(c.html(outcome.html, 200));
 }
 
-/** POST /{owner}/{repo}/action/{star|unstar|watch|participate} (web.go:1765-
- *  1772's repo.Action family): the fetch-action JS swaps the returned
- *  fragment (X-Gitea-Fetch-Action); anonymous answers the login redirect in
- *  the fetch-action shape or the plain 303. */
+/** POST /{owner}/{repo}/action/{star|unstar|watch|participate|ignore}
+ *  (web.go:1765-1772's repo.Action family): the fetch-action JS swaps the
+ *  returned fragment (X-Gitea-Fetch-Action); anonymous answers the login
+ *  redirect in the fetch-action shape or the plain 303. */
 async function repoActionSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
   const guard = sameOriginGuard(c.req.raw);
   if (guard !== null) return guard;
@@ -7031,6 +7057,33 @@ async function repoActionSubmit(c: Context<{ Bindings: Env }>): Promise<Response
       ? await repoStarActionResponse(c.env.DB, repo, viewer, action)
       : await repoWatchActionResponse(c.env.DB, repo, viewer, action),
   );
+}
+
+/** POST /{owner}/{repo}/action/watch/options (web.go:1771's
+ *  repo.ActionWatchOptions, routers/web/repo/watch.go:49-60): the custom
+ *  watch modal's form-fetch-action submit — the same prologue + anonymous
+ *  ladder as repoActionSubmit, then the parsed body (the official bundle
+ *  posts `new FormData(formEl)` — a bounded, tiny body; parseBody's
+ *  string-value convention lands it in a URLSearchParams) and the
+ *  `{"redirect": ""}` JSON the fetch-action JS reloads on. */
+async function repoWatchOptionsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "repo-action-watch-options") return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") {
+    if (isFetchActionRequest(c.req.raw)) {
+      return respond(fetchActionRedirectResponse(`/login?redirect_to=${encodeURIComponent(url.pathname)}`));
+    }
+    return respond(loginRedirect(url.pathname + url.search));
+  }
+  const form = await c.req.parseBody().then(
+    (body) => new URLSearchParams(Object.entries(body).map(([k, v]) => [k, typeof v === "string" ? v : v.name])),
+    () => new URLSearchParams(),
+  );
+  return respond(await repoWatchOptionsActionResponse(c.env.DB, repo, viewer, form));
 }
 
 /** POST /{owner}/{repo}/actions/runs/{run}/cancel (actions.Cancel — the
@@ -15619,9 +15672,16 @@ uiRouter.get("/:owner/:repo/actions/workflows/:workflowName/badge.svg", (c) => r
 uiRouter.post("/:owner/:repo/actions/workflows/:workflowName/badge.svg", () => methodNotAllowed("GET"));
 uiRouter.get("/:owner/:repo/actions/workflow-dispatch-inputs", (c) => repoActionsDispatchInputsRoute(c));
 uiRouter.post("/:owner/:repo/actions/workflow-dispatch-inputs", () => methodNotAllowed("GET"));
-// The repo header's fetch-action family (the fragment swap; GET twins 405).
-uiRouter.post("/:owner/:repo/action/:action{star|unstar|watch|participate}", (c) => repoActionSubmit(c));
-uiRouter.get("/:owner/:repo/action/:action{star|unstar|watch|participate}", () => methodNotAllowed("POST"));
+// The repo header's fetch-action family (the fragment swap; GET twins 405)
+// + the custom watch-options form (the modal's JSONRedirect arm). The
+// watch/options LITERAL registers FIRST — this Hono pin's RegExpRouter lets
+// the earlier :action{...} param pattern's unanchored match swallow the
+// longer literal path into repoActionSubmit's drift guard (the wave-9
+// static-before-dynamic rule, re-verified for the param-regex shape).
+uiRouter.post("/:owner/:repo/action/watch/options", (c) => repoWatchOptionsSubmit(c));
+uiRouter.get("/:owner/:repo/action/watch/options", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/action/:action{star|unstar|watch|participate|ignore}", (c) => repoActionSubmit(c));
+uiRouter.get("/:owner/:repo/action/:action{star|unstar|watch|participate|ignore}", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/activity", (c) => repoActivityPage(c));
 uiRouter.get("/:owner/:repo/activity/:period", (c) => repoActivityPage(c));
 // Window-2e C1: the global inbox.

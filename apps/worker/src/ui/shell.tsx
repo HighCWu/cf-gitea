@@ -11,6 +11,7 @@
 import { renderToString } from "hono/jsx/dom/server";
 import type { Child } from "hono/jsx";
 
+import { isWatchModeWatching, WatchMode, type RepoWatch } from "../api/services/repo-watchers";
 import { locale, configI18n } from "./locale";
 import { userLink } from "./links";
 import { ICON_PATHS, type IconName } from "./icons";
@@ -319,10 +320,12 @@ function openCountOf(total: number, closed: number): number {
 
 /** The trio's chrome text (options/locale locale_en-US.json `repo.*` keys —
  *  the component-local pattern; locale.ts is shared and not this wave's
- *  file). The watch MODE strings carry the watch.tmpl menu's exact values. */
+ *  file). The watch MODE strings carry the watch.tmpl menu's exact values
+ *  (all four modes + the custom-options modal's texts). */
 const repoActionsLocale = {
   watch: "Watch", // "repo.watch"
   watching: "Watching", // "repo.watching"
+  ignoring: "Ignoring", // "repo.ignoring"
   unstar: "Unstar", // "repo.unstar"
   star: "Star", // "repo.star"
   fork: "Fork", // "repo.fork"
@@ -334,42 +337,92 @@ const repoActionsLocale = {
   mode_participating_desc: "Receive notifications from this repository when participating or mentioned.",
   mode_all: "All activity", // "repo.watch.mode.all"
   mode_all_desc: "Receive notifications for all events.",
+  mode_ignore: "Ignore", // "repo.watch.mode.ignore"
+  mode_ignore_desc: "Never receive notifications from this repository.",
+  mode_custom: "Custom", // "repo.watch.mode.custom"
+  mode_custom_desc: "Select events you want to be notified of, in addition to participating and mentions.",
+  watch_options_modal_header: "Notifications", // "notifications" (watch_options_modal.tmpl's header)
+  options_issues: "Issues", // "repo.watch.options.issues"
+  options_pull_requests: "Pull Requests", // "repo.watch.options.pull_requests"
+  options_releases: "Releases", // "repo.watch.options.releases"
+  modal_cancel: "Cancel", // "modal.cancel" (modal_actions_confirm's "confirm" arm)
+  modal_confirm: "Confirm", // "modal.confirm"
 } as const;
+
+/** The Watch model's template helpers, ported where the watch menu reads
+ *  them (models/repo/watch.go:70-97 — the service module is landed and this
+ *  wave imports it, never edits it): IsIgnoring (:71-73), IsWatching (:76-78
+ *  = IsWatchModeWatching), IsWatchingAll (:81-83), IsWatchingAny (:86-87) and
+ *  SelectedMode (:90-97 — the watch.tmpl menu's mode string). */
+function watchIsIgnoring(watch: RepoWatch): boolean {
+  return watch.mode === WatchMode.Dont;
+}
+function watchIsWatchingAll(watch: RepoWatch): boolean {
+  return watch.mode !== WatchMode.Custom && watch.watchPullRequests && watch.watchIssues && watch.watchReleases;
+}
+function watchIsWatchingAny(watch: RepoWatch): boolean {
+  return watch.watchPullRequests || watch.watchIssues || watch.watchReleases;
+}
+export function watchSelectedMode(watch: RepoWatch): "ignore" | "participate" | "all" | "custom" {
+  if (watchIsIgnoring(watch)) return "ignore";
+  if (!isWatchModeWatching(watch.mode) || !watchIsWatchingAny(watch)) return "participate"; // also the default while there is no watch row
+  if (watchIsWatchingAll(watch)) return "all";
+  return "custom";
+}
 
 /**
  * The Watch button group, `div#repo-header-watch` (repo/header/watch.tmpl
- * verbatim, reduced to the landed watch substrate). Upstream's four-mode menu
- * (participating / all / ignore / custom) reduces to the TWO arms the binary
- * `repo_watchers` edge can represent: "All activity" (POST /action/watch —
- * the row insert, WatchModeNormal) and "Participating and mentions" (POST
+ * verbatim over the LANDED mode substrate — migration 0053's `mode` +
+ * `include_*` columns, the same `repo_watchers` rows upstream writes). The
+ * four-mode menu (watch.tmpl:10-41): "Participating and mentions" (POST
  * /action/participate — WatchModeNone, which upstream itself models as the
- * ROW'S ABSENCE: GetWatch's no-row dummy carries Mode None, watch.go:61-64).
- * The ignore (WatchModeDont) and custom (WatchModeCustom) modes need the
- * `watch.mode` column the landed schema does not carry — their menu items and
- * the watch_options_modal (header.tmpl:93) are NOT rendered (the dead-link
- * rule: never emit controls the backend cannot answer). The button text and
- * the active check-mark track the edge: watching → "Watching" + the all item
- * checked; not watching → "Watch" + the participating item checked (upstream
- * SelectedMode's binary reduction).
+ * ROW'S ABSENCE: GetWatch's no-row dummy carries Mode None, watch.go:61-64),
+ * "All activity" (POST /action/watch — WatchModeNormal + every event toggle,
+ * watch.go:22-25), "Ignore" (POST /action/ignore — WatchModeDont,
+ * watch.go:18-20) and "Custom" (the show-modal item — it fills and opens the
+ * repo-watch-options-modal, whose form POSTs /action/watch/options).
+ * Button text/icon/active checks read the full Watch state: ignoring →
+ * "Ignoring" + the eye-closed glyph (the Iif on $isIgnoring), watching →
+ * "Watching", else "Watch" (:2-3, :9-10); SelectedMode picks the checked
+ * item (:5-8).
  *
  * Signed-in items carry the fetch-action wiring the official bundle drives
  * (fetch-action.ts: `data-fetch-method="post"` + `data-fetch-url` + the
  * `$body #repo-header-watch` sync that swaps this very div with the POST's
- * fragment response); anonymous viewers get upstream's login-link variant
- * (the login route is ours: /login, the navbar's Sign in arm — upstream's
+ * fragment response; the custom item's data-modal-* attributes are
+ * common-button.ts's fill-the-modal contract — `data-modal-form.url` sets
+ * the form's action, the data-modal-<input-name> booleans check the
+ * checkboxes). Anonymous viewers get upstream's login-link variant (the
+ * login route is ours: /login, the navbar's Sign in arm — upstream's
  * AppSubUrl + /user/login). The count is the maintained `repositories.
  * num_watches` column (upstream `.Repository.NumWatches`, plain digits —
  * CountFmt's k-formatting starts far above the D1-counter scale).
+ *
+ * `repoWatch` is the ctx's GetWatch state (ui-context's viewerRepoWatch,
+ * armed signed-only like upstream's RepoAssignment, services/context/
+ * repo.go:681-684); absent degrades to the no-row dummy (mode None, every
+ * include true — watch.go:62-63), the "not watching" posture.
  */
-export function RepoHeaderWatch(props: { repoLink: string; count: number; viewer: Viewer; watching?: boolean }) {
+export function RepoHeaderWatch(props: { repoLink: string; count: number; viewer: Viewer; repoWatch?: RepoWatch }) {
   const signed = props.viewer.kind === "user";
-  const buttonLabel = signed && props.watching ? repoActionsLocale.watching : repoActionsLocale.watch;
+  const watch: RepoWatch =
+    props.repoWatch ?? { repoId: "", userId: 0, mode: WatchMode.None, watchPullRequests: true, watchIssues: true, watchReleases: true };
+  const isIgnoring = signed && watchIsIgnoring(watch);
+  const buttonLabel = isIgnoring
+    ? repoActionsLocale.ignoring
+    : signed && isWatchModeWatching(watch.mode)
+      ? repoActionsLocale.watching
+      : repoActionsLocale.watch;
+  const mode = watchSelectedMode(watch);
+  const isAll = mode === "all";
+  const isCustom = mode === "custom";
+  const isParticipating = mode === "participate";
   return (
     <div id="repo-header-watch" class="flex-text-block">
       {signed ? (
         <>
           <button type="button" class="ui dropdown custom compact small basic button" data-global-init="initRepoWatchMenu" aria-label={buttonLabel}>
-            <Icon name="octicon-eye" />
+            <Icon name={isIgnoring ? "octicon-eye-closed" : "octicon-eye"} />
             <span class="not-mobile" aria-hidden="true">
               {buttonLabel}
             </span>
@@ -378,31 +431,65 @@ export function RepoHeaderWatch(props: { repoLink: string; count: number; viewer
           </button>
           <div class="tippy-target">
             <a
-              class={props.watching ? "item" : "item active"}
+              class={isParticipating ? "item active" : "item"}
               role="menuitem"
               aria-label={repoActionsLocale.mode_participating}
               data-fetch-method="post"
               data-fetch-url={`${props.repoLink}/action/participate`}
               data-fetch-sync="$body #repo-header-watch"
             >
-              <Icon name="octicon-check" size={16} class={props.watching ? "tw-invisible" : undefined} />
+              <Icon name="octicon-check" size={16} class={isParticipating ? undefined : "tw-invisible"} />
               <div>
                 {repoActionsLocale.mode_participating}
                 <div class="tw-text-12 tw-text-text-light-2">{repoActionsLocale.mode_participating_desc}</div>
               </div>
             </a>
             <a
-              class={props.watching ? "item active" : "item"}
+              class={isAll ? "item active" : "item"}
               role="menuitem"
               aria-label={repoActionsLocale.mode_all}
               data-fetch-method="post"
               data-fetch-url={`${props.repoLink}/action/watch`}
               data-fetch-sync="$body #repo-header-watch"
             >
-              <Icon name="octicon-check" size={16} class={props.watching ? undefined : "tw-invisible"} />
+              <Icon name="octicon-check" size={16} class={isAll ? undefined : "tw-invisible"} />
               <div>
                 {repoActionsLocale.mode_all}
                 <div class="tw-text-12 tw-text-text-light-2">{repoActionsLocale.mode_all_desc}</div>
+              </div>
+            </a>
+            <a
+              class={isIgnoring ? "item active" : "item"}
+              role="menuitem"
+              aria-label={repoActionsLocale.mode_ignore}
+              data-fetch-method="post"
+              data-fetch-url={`${props.repoLink}/action/ignore`}
+              data-fetch-sync="$body #repo-header-watch"
+            >
+              <Icon name="octicon-check" size={16} class={isIgnoring ? undefined : "tw-invisible"} />
+              <div>
+                {repoActionsLocale.mode_ignore}
+                <div class="tw-text-12 tw-text-text-light-2">{repoActionsLocale.mode_ignore_desc}</div>
+              </div>
+            </a>
+            <a
+              class={isCustom ? "item active show-modal" : "item show-modal"}
+              role="menuitem"
+              aria-label={repoActionsLocale.mode_custom}
+              data-modal="#repo-watch-options-modal"
+              /* The dotted attribute name is JSX-illegal as a literal —
+                 spread it (components/file-list.tsx's quoted-key convention;
+                 common-button.ts:56-59 requires the exact `data-modal-form.url`
+                 spelling: it is the template-escaped form.action setter). */
+              {...{ "data-modal-form.url": `${props.repoLink}/action/watch/options` }}
+              data-modal-issues={String(watch.watchIssues)}
+              data-modal-pull_requests={String(watch.watchPullRequests)}
+              data-modal-releases={String(watch.watchReleases)}
+            >
+              <Icon name="octicon-check" size={16} class={isCustom ? undefined : "tw-invisible"} />
+              <div>
+                {repoActionsLocale.mode_custom}
+                <div class="tw-text-12 tw-text-text-light-2">{repoActionsLocale.mode_custom_desc}</div>
               </div>
             </a>
           </div>
@@ -423,6 +510,50 @@ export function RepoHeaderWatch(props: { repoLink: string; count: number; viewer
         </a>
       )}
     </div>
+  );
+}
+
+/**
+ * The custom watch-options modal (repo/watch_options_modal.tmpl verbatim +
+ * modal_actions_confirm.tmpl's ModalButtonTypes "confirm" arm) — mounted
+ * once per repo page for SIGNED viewers only (header.tmpl:93's
+ * `{{if .IsSigned}}` gate; the dialog renders no layout DOM, the official
+ * bundle's common-button.ts fills its checkboxes from the Custom item's
+ * data-modal-* attributes and its fetch-action form POSTs the picked events
+ * to /action/watch/options — ctx.JSONRedirect("") reloads the page,
+ * fetch-action.ts:74-79's empty-redirect arm).
+ */
+export function RepoWatchOptionsModal() {
+  return (
+    <dialog class="modal-dialog" id="repo-watch-options-modal">
+      <div class="header">{repoActionsLocale.watch_options_modal_header}</div>
+      <form class="ui form form-fetch-action" method="post">
+        <div class="content">
+          <div class="flex-relaxed-list tw-gap-4">
+            <div class="ui checkbox">
+              <input name="issues" type="checkbox" />
+              <label>{repoActionsLocale.options_issues}</label>
+            </div>
+            <div class="ui checkbox">
+              <input name="pull_requests" type="checkbox" />
+              <label>{repoActionsLocale.options_pull_requests}</label>
+            </div>
+            <div class="ui checkbox">
+              <input name="releases" type="checkbox" />
+              <label>{repoActionsLocale.options_releases}</label>
+            </div>
+          </div>
+        </div>
+        <div class="actions">
+          <button type="button" class="ui cancel button">
+            <Icon name="octicon-x" /> {repoActionsLocale.modal_cancel}
+          </button>
+          <button type="submit" class="ui primary ok button">
+            <Icon name="octicon-check" /> {repoActionsLocale.modal_confirm}
+          </button>
+        </div>
+      </form>
+    </dialog>
   );
 }
 
@@ -570,7 +701,7 @@ export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
               upstream's own anonymous posture). */}
           {repo.status === "ready" ? (
             <div class="flex-text-block tw-flex-wrap">
-              <RepoHeaderWatch repoLink={repoLink} count={repo.numWatches} viewer={props.ctx.viewer} watching={props.ctx.viewerWatchsRepo} />
+              <RepoHeaderWatch repoLink={repoLink} count={repo.numWatches} viewer={props.ctx.viewer} repoWatch={props.ctx.viewerRepoWatch} />
               <RepoHeaderStar repoLink={repoLink} count={repo.numStars} viewer={props.ctx.viewer} starring={props.ctx.viewerStarsRepo} />
               {!repo.isEmpty ? (
                 <RepoHeaderFork
@@ -585,6 +716,12 @@ export function RepoHeader(props: { ctx: UiContext; activeTab?: RepoTab }) {
           ) : null}
         </div>
       </div>
+      {/* The watch-options modal rides the header's close (header.tmpl:93's
+          `{{if .IsSigned}}{{template "repo/watch_options_modal"}}{{end}}` —
+          after the whole repo-header block, before the tabs container), the
+          Custom menu item's data-modal target. Signed viewers only — the
+          same gate upstream arms $.RepoWatch under. */}
+      {props.ctx.viewer.kind === "user" ? <RepoWatchOptionsModal /> : null}
       <div class="ui container">
         <overflow-menu class="ui secondary pointing menu">
           <div class="overflow-menu-items">

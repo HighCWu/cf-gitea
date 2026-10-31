@@ -166,12 +166,14 @@ const ALLOWLIST = [
   'octicon-home',
   // The usability B-4 repo-header wave: the Watch/Star/Fork trio's glyphs
   // (header.tmpl:70-76 → repo/header/{watch,star,fork}.tmpl — the eye (watch,
-  // watching; the ignore mode's eye-closed stays unlanded with the mode
-  // column), the filled star (the IsStaringRepo unstar state, star.tmpl's
-  // Iif), the fork mark (fork.tmpl) and the clone panel's copy mark
-  // (clone_panel.tmpl's copy_url button).
+  // watching) and its closed twin (the ignore mode's button glyph,
+  // watch.tmpl:10's Iif — landed with the watch.mode columns), the filled
+  // star (the IsStaringRepo unstar state, star.tmpl's Iif), the fork mark
+  // (fork.tmpl) and the clone panel's copy mark (clone_panel.tmpl's
+  // copy_url button).
   'octicon-copy',
   'octicon-eye',
+  'octicon-eye-closed',
   'octicon-repo-forked',
   'octicon-star-fill',
   // The v1.3.2 review-webui window (residuals P2-7, Top-10 #10 + the

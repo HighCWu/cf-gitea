@@ -4,17 +4,20 @@
  *
  *     m.Post("/action/{action:star|unstar}", reqSignIn, starsEnabled, repo.ActionStar)
  *     m.Post("/action/{action:watch|participate|ignore}", reqSignIn, repo.ActionWatch)
+ *     m.Post("/action/watch/options", reqSignIn, repo.ActionWatchOptions)
  *
- * reduced to the arms the landed substrate represents (routers/web/repo/
- * star.go:16-32 + watch.go:16-47): star/unstar over services/stars.ts's
- * counter-moving batch, watch/participate over services/repo-watchers.ts's
- * binary edge — upstream's "participate" IS the row's absence (models/repo/
- * watch.go:61-64: GetWatch's no-row dummy carries Mode None; ActionWatch's
- * participate case writes WatchModeNone, watch.go:27-29, which watchRepoByMode
- * lands as a row DELETE, :146-148). The ignore arm (WatchModeDont) and the
- * custom watch-options POST (/action/watch/options + the watch_options_modal)
- * are NOT built: the `watch.mode` column the landed schema does not carry is
- * their only substrate.
+ * star/unstar over services/stars.ts's counter-moving batch (star.go:16-32);
+ * the three watch modes over services/repo-watchers.ts's
+ * watchRepoWithOptions (the WatchOptions setter, models/repo/watch.go:
+ * 189-206 — landed with migration 0053's mode columns): "watch" →
+ * WatchModeNormal + every event toggle (watch.go:22-25), "participate" →
+ * WatchModeNone (watch.go:27-29 — the row's absence, watchRepoByMode's
+ * DELETE arm :146-148), "ignore" → WatchModeDont (watch.go:18-20); the
+ * custom form (/action/watch/options + the watch_options_modal, the shell's
+ * RepoWatchOptionsModal) → WatchModeCustom with the form's three FormBool
+ * event toggles (watch.go:50-60), answering ctx.JSONRedirect("") — the
+ * fetch-action JS reloads the page on the empty redirect
+ * (fetch-action.ts:74-79).
  *
  * The responses are FRAGMENTS, not pages — upstream ctx.HTML(200, tplStar… /
  * tplWatch) renders repo/header/star.tmpl / repo/header/watch.tmpl alone,
@@ -29,9 +32,10 @@
  * Handler shape (the HANDOFF recipe's thin adapter calls these): the §2.8
  * sameOriginGuard and the repo/viewer resolution run index.ts-side (the
  * resolveUiRequest prologue); these builders take the resolved pair and
- * answer 200 text/html. Upstream's error ladder (repo.go:287-299) has no
- * landed arm here — star/watch writes carry no blocked/limit surfaces — so a
- * failing write propagates and the route answers its plain 500 (the landed
+ * answer 200 text/html (the watch arms) / 200 JSON (the options form).
+ * Upstream's error ladder (repo.go:287-299) has no landed arm here —
+ * star/watch writes carry no blocked/limit surfaces — so a failing write
+ * propagates and the route answers its plain 500 (the landed
  * transient-failure convention); the fetch-action JS toasts non-ok responses
  * (fetch-action.ts:168-171).
  *
@@ -47,9 +51,10 @@ import { drizzle } from "drizzle-orm/d1";
 import { renderToString } from "hono/jsx/dom/server";
 
 import { findForkByOwner } from "../../api/services/forks";
-import { isWatchingRepo, unwatchRepo, watchRepo } from "../../api/services/repo-watchers";
+import { getWatch, watchRepoWithOptions, WatchMode, type RepoWatch } from "../../api/services/repo-watchers";
 import { isStarring, starRepo, unstarRepo } from "../../api/services/stars";
 import { repositories } from "../../db/schema";
+import { fetchActionRedirectResponse } from "./repo-home";
 import { RepoHeaderStar, RepoHeaderWatch } from "../shell";
 import type { RepoRow } from "../ui-context";
 import type { Viewer } from "../viewer";
@@ -67,35 +72,37 @@ export function renderRepoHeaderStarFragment(repo: RepoRow, viewer: Viewer, star
 
 /** The watch fragment (upstream tplWatch — repo/header/watch.tmpl): the whole
  *  `div#repo-header-watch` (the sync selector's target). watch.go:33-46
- *  re-reads GetWatch + the repository row for exactly these two inputs. */
-export function renderRepoHeaderWatchFragment(repo: RepoRow, viewer: Viewer, watching: boolean): string {
+ *  re-reads GetWatch + the repository row for exactly these two inputs; the
+ *  full Watch state (mode + include flags) drives the four-mode menu's
+ *  SelectedMode checks and the Custom item's data-modal-* fills. */
+export function renderRepoHeaderWatchFragment(repo: RepoRow, viewer: Viewer, repoWatch: RepoWatch): string {
   return renderToString(
-    <RepoHeaderWatch repoLink={`/${repo.ownerNamespace}/${repo.slug}`} count={repo.numWatches} viewer={viewer} watching={watching} />,
+    <RepoHeaderWatch repoLink={`/${repo.ownerNamespace}/${repo.slug}`} count={repo.numWatches} viewer={viewer} repoWatch={repoWatch} />,
   );
 }
 
 /** The per-viewer trio state for one repo page render (the HANDOFF recipe's
- *  loader extension — resolveUiRequest arms ctx.viewerWatchsRepo /
+ *  loader extension — resolveUiRequest arms ctx.viewerRepoWatch /
  *  ctx.viewerStarsRepo / ctx.viewerForkOfRepo from this for USER viewers;
  *  anonymous viewers skip the reads entirely, the ctx fields stay absent and
  *  the shell renders the login-link variants). One probe per edge:
- *  isWatchingRepo (repo_watchers), isStarring (stars), findForkByOwner
- *  (fork.tmpl's direct-link arm — the doer's own fork only, the one-fork
- *  reduction documented on shell.tsx's RepoHeaderFork). The fork probe
- *  projects to the shell's two-field shape (the row id is write-path data,
- *  never rendered). */
+ *  getWatch (repo_watchers — the full row, the mode menu's input),
+ *  isStarring (stars), findForkByOwner (fork.tmpl's direct-link arm — the
+ *  doer's own fork only, the one-fork reduction documented on shell.tsx's
+ *  RepoHeaderFork). The fork probe projects to the shell's two-field shape
+ *  (the row id is write-path data, never rendered). */
 export async function loadRepoHeaderActionState(
   d1: D1Database,
   repoId: string,
   userId: number,
-): Promise<{ watching: boolean; starring: boolean; fork: { ownerNamespace: string; slug: string } | null }> {
-  const [watching, starring, fork] = await Promise.all([
-    isWatchingRepo(d1, repoId, userId),
+): Promise<{ repoWatch: RepoWatch; starring: boolean; fork: { ownerNamespace: string; slug: string } | null }> {
+  const [repoWatch, starring, fork] = await Promise.all([
+    getWatch(d1, repoId, userId),
     isStarring(d1, userId, repoId),
     findForkByOwner(d1, repoId, userId),
   ]);
   return {
-    watching,
+    repoWatch,
     starring,
     fork: fork === null ? null : { ownerNamespace: fork.ownerNamespace, slug: fork.slug },
   };
@@ -133,24 +140,91 @@ export async function repoStarActionResponse(
 }
 
 /**
- * POST /{owner}/{repo}/action/{watch|participate} (repo.ActionWatch's two
- * representable arms): watch → the edge insert (WatchModeNormal + all three
- * event toggles, watch.go:22-25), participate → the edge delete (WatchModeNone,
- * watch.go:27-29). The upstream ignore arm is unreachable by construction —
- * the recipe's parser claims exactly these two action segments.
+ * POST /{owner}/{repo}/action/{watch|participate|ignore} (repo.ActionWatch,
+ * routers/web/repo/watch.go:16-47): every arm rides the landed
+ * watchRepoWithOptions with upstream's exact WatchOptions — watch →
+ * WatchModeNormal + all three event toggles (:22-25), participate →
+ * WatchModeNone (:27-29, the row's absence), ignore → WatchModeDont (:18-20)
+ * — then the fragment over the re-read pair (GetWatch + the repository row,
+ * :33-46). Idempotent by construction (watchRepoByMode's same-mode no-op).
  */
 export async function repoWatchActionResponse(
   d1: D1Database,
   repo: RepoRow,
   viewer: Extract<Viewer, { kind: "user" }>,
-  action: "watch" | "participate",
+  action: "watch" | "participate" | "ignore",
 ): Promise<Response> {
+  const now = new Date();
   if (action === "watch") {
-    await watchRepo(d1, repo.id, viewer.id, new Date());
+    await watchRepoWithOptions(
+      d1,
+      repo.id,
+      viewer.id,
+      { mode: WatchMode.Normal, watchPullRequests: true, watchIssues: true, watchReleases: true },
+      now,
+    );
+  } else if (action === "participate") {
+    await watchRepoWithOptions(
+      d1,
+      repo.id,
+      viewer.id,
+      { mode: WatchMode.None, watchPullRequests: false, watchIssues: false, watchReleases: false },
+      now,
+    );
   } else {
-    await unwatchRepo(d1, repo.id, viewer.id);
+    await watchRepoWithOptions(
+      d1,
+      repo.id,
+      viewer.id,
+      { mode: WatchMode.Dont, watchPullRequests: false, watchIssues: false, watchReleases: false },
+      now,
+    );
   }
-  const [freshRow, watching] = await Promise.all([rereadRepoRow(d1, repo.id), isWatchingRepo(d1, repo.id, viewer.id)]);
-  const html = renderRepoHeaderWatchFragment(freshRow, viewer, watching);
+  const [freshRow, repoWatch] = await Promise.all([rereadRepoRow(d1, repo.id), getWatch(d1, repo.id, viewer.id)]);
+  const html = renderRepoHeaderWatchFragment(freshRow, viewer, repoWatch);
   return new Response(html, { status: 200, headers: { "content-type": "text/html;charset=utf-8" } });
+}
+
+/** `Base.FormBool` (services/context/base_form.go:62-66): ParseBool's true
+ *  set ("1", "t", "T", "TRUE", "true", "True") plus the case-insensitive
+ *  "on" — the HTML checkbox's default submit value. */
+export function formBool(value: string | null | undefined): boolean {
+  if (typeof value !== "string") return false;
+  return (
+    value === "1" || value === "t" || value === "T" || value === "TRUE" || value === "true" || value === "True" ||
+    value.toLowerCase() === "on"
+  );
+}
+
+/**
+ * POST /{owner}/{repo}/action/watch/options (repo.ActionWatchOptions,
+ * routers/web/repo/watch.go:49-60): the custom watch menu — the modal's
+ * form-fetch-action POSTs the picked events (fetch-action.ts:197-213's
+ * `new FormData(formEl)`), Mode lands Custom with the three FormBool event
+ * toggles (clearing every event is allowed — it leaves the participating
+ * state, watch.go:50-54's comment), and the answer is ctx.JSONRedirect("") —
+ * `{"redirect": ""}` — which the fetch-action JS turns into a page reload
+ * (fetch-action.ts:74-79's empty-redirect arm). `form` is the parsed body
+ * (the route adapter's URLSearchParams convention, ui/forms.ts's reader
+ * shape).
+ */
+export async function repoWatchOptionsActionResponse(
+  d1: D1Database,
+  repo: RepoRow,
+  viewer: Extract<Viewer, { kind: "user" }>,
+  form: URLSearchParams,
+): Promise<Response> {
+  await watchRepoWithOptions(
+    d1,
+    repo.id,
+    viewer.id,
+    {
+      mode: WatchMode.Custom,
+      watchPullRequests: formBool(form.get("pull_requests")),
+      watchIssues: formBool(form.get("issues")),
+      watchReleases: formBool(form.get("releases")),
+    },
+    new Date(),
+  );
+  return fetchActionRedirectResponse("");
 }

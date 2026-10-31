@@ -7,6 +7,7 @@
  */
 
 import { assetURI, cssLinks, type UiManifest } from "./manifest";
+import type { RepoWatch } from "../api/services/repo-watchers";
 import type { repositories } from "../db/schema";
 import type { Viewer } from "./viewer";
 
@@ -130,15 +131,18 @@ export interface UiContext {
   /** The usability B-4 trio's per-viewer state (repo/header/watch.tmpl +
    *  star.tmpl's signed arms), set by the repo-scoped prologue for USER
    *  viewers only — absent on anonymous viewers and degraded loaders:
-   *  - `viewerWatchsRepo`: the `repo_watchers` edge (models/repo/watch.go's
-   *    GetWatch binary reduction — the landed watch substrate carries no
-   *    mode column, so "watching" is the edge's presence, "participating"
-   *    its absence; the ignore/custom modes are unrepresentable);
+   *  - `viewerRepoWatch`: the full `repo_watchers` state through GetWatch
+   *    (models/repo/watch.go:57-69 — the mode + the three include flags; the
+   *    no-row dummy mirrors the column defaults), the input the watch menu's
+   *    four-mode rendering reads (watch.tmpl's $.RepoWatch: SelectedMode,
+   *    IsIgnoring, Include{Issues,PullRequests,Releases}); upstream arms it
+   *    signed-only too (services/context/repo.go:681-684 — the store's mode
+   *    columns landed with migration 0053);
    *  - `viewerStarsRepo`: the `stars` edge (star.tmpl's IsStaringRepo);
    *  - `viewerForkOfRepo`: the doer's existing fork of this repo (fork.tmpl's
    *    one-fork `UserAndOrgForks` arm — the direct-link state), null =
    *    probed-none. */
-  viewerWatchsRepo?: boolean;
+  viewerRepoWatch?: RepoWatch;
   viewerStarsRepo?: boolean;
   viewerForkOfRepo?: { ownerNamespace: string; slug: string } | null;
   /** SPEC-0014 §4.4 (M2 demo wave): the DEMO_MODE render gate for the

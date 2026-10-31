@@ -12,6 +12,7 @@ import { renderToString } from "hono/jsx/dom/server";
 import { assetURI, type UiManifest } from "./manifest";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "./ui-context";
 import type { Viewer } from "./viewer";
+import { WatchMode, type RepoWatch } from "../api/services/repo-watchers";
 import { configI18n } from "./locale";
 import {
   BaseLayout,
@@ -524,17 +525,28 @@ describe("RepoHeader tab strip", () => {
 // --- the repo header action trio (usability B-4) -------------------------------
 
 /**
- * The Watch/Star/Fork right side (header.tmpl:49-78 → repo/header/{watch,
- * star,fork}.tmpl at the pin). Upstream renders the trio for EVERY viewer —
- * anonymous viewers get the login-link variants — so the anon arm is the
- * default render, and the signed-in arms carry the fetch-action wiring the
- * official bundle drives. The per-viewer state rides the ctx fields the
- * repo-scoped prologue arms (ui-context.ts's trio doc); absent fields
- * degrade to the not-watching/not-starring/unprobed arms (the loader is the
- * only arm site).
+ * The Watch/Star/Fork right side (header.tmpl:49-78 + :93 → repo/header/
+ * {watch,star,fork}.tmpl + watch_options_modal.tmpl at the pin). Upstream
+ * renders the trio for EVERY viewer — anonymous viewers get the login-link
+ * variants — so the anon arm is the default render, and the signed-in arms
+ * carry the fetch-action wiring the official bundle drives. The per-viewer
+ * state rides the ctx fields the repo-scoped prologue arms (ui-context.ts's
+ * trio doc); the watch menu renders the FULL four-mode state over
+ * viewerRepoWatch (absent = the GetWatch no-row dummy — mode None).
  */
 describe("RepoHeader action trio (usability B-4)", () => {
   const userViewer: Viewer = { kind: "user", id: 42, username: "octocat", isAdmin: false };
+
+  /** GetWatch's plain-watching row (watchRepoByMode's Normal + reset
+   *  includes) — the fixture the watching arms render from. */
+  const NORMAL_WATCH: RepoWatch = {
+    repoId: "r",
+    userId: 42,
+    mode: WatchMode.Normal,
+    watchPullRequests: true,
+    watchIssues: true,
+    watchReleases: true,
+  };
 
   function repoPage(ctx: UiContext): string {
     return renderPage(
@@ -566,9 +578,11 @@ describe("RepoHeader action trio (usability B-4)", () => {
     );
     expect(html).toContain('class="svg octicon-repo-forked"');
     expect(html).toContain('<span class="not-mobile">Fork</span><span class="ui small label">7</span>');
-    // No session, no write surface: no fetch-action wiring, no dropdown.
+    // No session, no write surface: no fetch-action wiring, no dropdown, no
+    // watch-options modal (header.tmpl:93's IsSigned gate).
     expect(html).not.toContain("data-fetch-url");
     expect(html).not.toContain("initRepoWatchMenu");
+    expect(html).not.toContain("repo-watch-options-modal");
     // The login links use the landed /login route (the navbar's convention),
     // never upstream's /user/login literal.
     expect(html).not.toContain("/user/login");
@@ -590,7 +604,7 @@ describe("RepoHeader action trio (usability B-4)", () => {
       ...anonymousCtx,
       viewer: userViewer,
       repo: makeRepoRow({ numWatches: 2, numStars: 1 }),
-      viewerWatchsRepo: true,
+      viewerRepoWatch: NORMAL_WATCH,
       viewerStarsRepo: true,
     });
     // The watch button: the dropdown posture + init hook + "Watching".
@@ -598,13 +612,28 @@ describe("RepoHeader action trio (usability B-4)", () => {
       '<button type="button" class="ui dropdown custom compact small basic button" data-global-init="initRepoWatchMenu" aria-label="Watching">',
     );
     expect(watchingHtml).toContain('<span class="not-mobile" aria-hidden="true">Watching</span><span class="ui small label">2</span>');
-    // The tippy menu: exactly the two representable arms, each POSTing with
-    // the #repo-header-watch sync; "All activity" carries the check.
+    // The tippy menu: the FULL four-mode arm set (watch.tmpl:15-41), each
+    // POSTing with the #repo-header-watch sync; "All activity" carries the
+    // check (SelectedMode "all" — Normal + every include true).
     expect(watchingHtml).toContain('<div class="tippy-target">');
     expect(watchingHtml).toContain('<a class="item" role="menuitem" aria-label="Participating and mentions" data-fetch-method="post" data-fetch-url="/octocat/hello/action/participate" data-fetch-sync="$body #repo-header-watch">');
     expect(watchingHtml).toContain('<a class="item active" role="menuitem" aria-label="All activity" data-fetch-method="post" data-fetch-url="/octocat/hello/action/watch" data-fetch-sync="$body #repo-header-watch">');
-    expect((watchingHtml.match(/class="svg octicon-check"/g) ?? []).length).toBe(1); // one visible check
-    expect((watchingHtml.match(/class="svg octicon-check tw-invisible"/g) ?? []).length).toBe(1);
+    expect(watchingHtml).toContain('<a class="item" role="menuitem" aria-label="Ignore" data-fetch-method="post" data-fetch-url="/octocat/hello/action/ignore" data-fetch-sync="$body #repo-header-watch">');
+    expect((watchingHtml.match(/class="svg octicon-check"/g) ?? []).length).toBe(2); // one menu check + the modal's confirm button
+    expect((watchingHtml.match(/class="svg octicon-check tw-invisible"/g) ?? []).length).toBe(3);
+    // The custom item: the show-modal wiring — the dialog selector, the form
+    // URL (the dotted attribute, common-button.ts's action setter), the
+    // include fills ("true" — every include on).
+    expect(watchingHtml).toContain('<a class="item show-modal" role="menuitem" aria-label="Custom" data-modal="#repo-watch-options-modal"');
+    expect(watchingHtml).toContain('data-modal-form.url="/octocat/hello/action/watch/options"');
+    expect(watchingHtml).toContain('data-modal-issues="true" data-modal-pull_requests="true" data-modal-releases="true"');
+    // The watch_options_modal rides the header's close (header.tmpl:93),
+    // signed viewers only.
+    expect(watchingHtml).toContain('<dialog class="modal-dialog" id="repo-watch-options-modal">');
+    expect(watchingHtml).toContain('<form class="ui form form-fetch-action" method="post">');
+    expect(watchingHtml).toContain('<input name="issues" type="checkbox"/>');
+    expect(watchingHtml).toContain('<input name="pull_requests" type="checkbox"/>');
+    expect(watchingHtml).toContain('<input name="releases" type="checkbox"/>');
     // The star anchor: POST arms + the filled glyph + "Unstar".
     expect(watchingHtml).toContain(
       '<a role="button" class="ui compact small basic button" aria-label="Unstar" data-fetch-method="post" data-fetch-url="/octocat/hello/action/unstar">',
@@ -613,15 +642,83 @@ describe("RepoHeader action trio (usability B-4)", () => {
     expect(watchingHtml).toContain('<span class="not-mobile" aria-hidden="true">Unstar</span><span class="ui small label">1</span>');
 
     // The not-watching / not-starring defaults: "Watch" button, participating
-    // item checked, hollow star POSTing /action/star.
+    // item checked (the GetWatch no-row dummy — viewerRepoWatch absent),
+    // hollow star POSTing /action/star.
     const plainHtml = repoPage({ ...anonymousCtx, viewer: userViewer, repo: makeRepoRow({ numWatches: 0, numStars: 0 }) });
     expect(plainHtml).toContain('data-global-init="initRepoWatchMenu" aria-label="Watch">');
     expect(plainHtml).toContain('<a class="item active" role="menuitem" aria-label="Participating and mentions"');
     expect(plainHtml).toContain('<a class="item" role="menuitem" aria-label="All activity"');
+    expect(plainHtml).toContain('<a class="item show-modal" role="menuitem" aria-label="Custom"');
+    expect(plainHtml).toContain('data-modal-issues="true" data-modal-pull_requests="true" data-modal-releases="true"');
     expect(plainHtml).toContain(
       '<a role="button" class="ui compact small basic button" aria-label="Star" data-fetch-method="post" data-fetch-url="/octocat/hello/action/star">',
     );
     expect(plainHtml).toContain('class="svg octicon-star"');
+  });
+
+  it("renders the ignoring posture (the eye-closed button + the checked Ignore item) and the custom mode's checked item + include fills", () => {
+    // The persisted Dont row (the Auto-unwatch landing or the menu's Ignore
+    // POST): button text "Ignoring", the eye-closed glyph, Ignore checked —
+    // watch.tmpl:3's Iif + :10's glyph Iif + the isIgnoring active arm.
+    const ignoringHtml = repoPage({
+      ...anonymousCtx,
+      viewer: userViewer,
+      repo: makeRepoRow({ numWatches: 4 }),
+      viewerRepoWatch: {
+        repoId: "r",
+        userId: 42,
+        mode: WatchMode.Dont,
+        watchPullRequests: false,
+        watchIssues: false,
+        watchReleases: false,
+      },
+    });
+    expect(ignoringHtml).toContain(
+      '<button type="button" class="ui dropdown custom compact small basic button" data-global-init="initRepoWatchMenu" aria-label="Ignoring">',
+    );
+    expect(ignoringHtml).toContain('class="svg octicon-eye-closed"');
+    expect(ignoringHtml).toContain('<span class="not-mobile" aria-hidden="true">Ignoring</span><span class="ui small label">4</span>');
+    expect(ignoringHtml).toContain('<a class="item active" role="menuitem" aria-label="Ignore" data-fetch-method="post" data-fetch-url="/octocat/hello/action/ignore" data-fetch-sync="$body #repo-header-watch">');
+    expect(ignoringHtml).toContain('<a class="item" role="menuitem" aria-label="Participating and mentions" data-fetch-method="post"');
+
+    // A Custom row with a partial event selection (SelectedMode's fallthrough
+    // — not watching-all, watching-any): the Custom item checks AND the
+    // modal fills carry the picked set (data-modal-issues="false" — the
+    // common-button.ts checked = value==='true' contract).
+    const customHtml = repoPage({
+      ...anonymousCtx,
+      viewer: userViewer,
+      repo: makeRepoRow({ numWatches: 1 }),
+      viewerRepoWatch: {
+        repoId: "r",
+        userId: 42,
+        mode: WatchMode.Custom,
+        watchPullRequests: true,
+        watchIssues: false,
+        watchReleases: false,
+      },
+    });
+    expect(customHtml).toContain('data-global-init="initRepoWatchMenu" aria-label="Watching">');
+    expect(customHtml).toContain('<a class="item active show-modal" role="menuitem" aria-label="Custom" data-modal="#repo-watch-options-modal"');
+    expect(customHtml).toContain('data-modal-issues="false" data-modal-pull_requests="true" data-modal-releases="false"');
+    // A Custom row with NO event selected still reads "participating"
+    // (SelectedMode's !IsWatchingAny arm) — the state watch.go:50-54's
+    // "clearing every event leaves the participating state" comment names.
+    const customEmptyHtml = repoPage({
+      ...anonymousCtx,
+      viewer: userViewer,
+      repo: makeRepoRow({ numWatches: 1 }),
+      viewerRepoWatch: {
+        repoId: "r",
+        userId: 42,
+        mode: WatchMode.Custom,
+        watchPullRequests: false,
+        watchIssues: false,
+        watchReleases: false,
+      },
+    });
+    expect(customEmptyHtml).toContain('<a class="item active" role="menuitem" aria-label="Participating and mentions"');
+    expect(customEmptyHtml).toContain('<a class="item show-modal" role="menuitem" aria-label="Custom"');
   });
 
   it("the fork href walks upstream's ladder: existing fork → it; own repo without a fork → the '#' tooltip arm", () => {
