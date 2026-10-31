@@ -1194,8 +1194,8 @@ the shared index.
   the two POST arms over §5.5), the account-links section on
   `ui/pages/user-settings-security.tsx` (the linked list, the unlink
   POST, the link-start buttons per active source — upstream
-  `accountlinks.tmpl` reduced to the landed page's idioms), the
-  unlink service arm, tests + goldens. Gates: the linking suite,
+  `accountlinks.tmpl` reduced to the landed page's idioms), the unlink
+  service arm, tests + goldens. Gates: the linking suite,
   the settings round-trip. **W2 as-built note:** the page reads W2's
   redirect HINTS (`oauth2_source`, `oauth2_username_hint`,
   `redirect_to` — untrusted, pre-fill only), not a parked identity
@@ -1204,6 +1204,172 @@ the shared index.
   mints the session, and re-dances via
   `303 /user/oauth2/{source}?redirect_to=…&oauth2_continue=signin-link|signup`
   — the callback completes the link against the IdP-re-asserted identity.
+
+  **As-built (2026-10-31):** landed as `ui/pages/link-account.tsx` (the
+  page render + the load/parse/apply seams — the admin-auths split) +
+  `ui/pages/link-account-router.ts` (the JSX-free router: `GET
+  /user/link_account`, `POST /user/link_account_signin`,
+  `POST /user/link_account_signup`, exported as `linkAccountRouter`) +
+  the account-links section on `user-settings-security.tsx` (loader
+  projections, section render, the unlink parse/apply seams and the
+  notice slot). Suites: `link-account.test.tsx` (19 — both arms' FULL
+  ladders end-to-end on the W2 stub IdP through BOTH routers: dance →
+  anonymous-miss link page → credential arm → the re-dance with the
+  continuation marker riding the parked row state → the callback links
+  the IdP-RE-ASSERTED identity onto the parked returnTo; the gate matrix —
+  the init-window refusal BEFORE credential work on both arms and
+  outranking ALLOW_SIGNUP, the closed-gate 404 polarity, the
+  unknown/deactivated-source 404 shells, the off-site redirect hint
+  validating away; the credential ladder's failure re-renders —
+  incorrect/scope/prohibited at 200, no session; the DOM contract + the
+  user_exists tab probe) + `user-settings-security.test.tsx` (25 — the
+  loader projections incl. the login_source_id DESC order, the
+  missing-source skip arm, the dead-cfg degrade, the section guard's
+  empty arm keeping the wave-56 bytes, the linked render's row anatomy
+  (icon arm, name, Active badge, Remove form, the dialog), the
+  buttons-only render, the a11y smoke, and the unlink seams incl. the
+  recorded no-last-link-guard posture). Gates with own eyes: the two
+  suites 44/44, the W1-W3 family + flow re-run 140/140 in ONE
+  invocation, session+first-run 77/77, login-external-auth 7/7, the
+  goldens battery's 96 cases green on this wave's diff minus ONE
+  sibling-in-flight failure (`admin-applications.tsx` mid-edit by the
+  concurrent pool — not this wave's bytes), a11y 90/90 (the two new
+  EXPANSION_ARMS entries included), bare `tsc --noEmit` zero in the
+  touched files, scoped eslint clean. Deviations/clarifications
+  recorded:
+
+  (a) **The re-dance contract honored verbatim — zero
+  `web/oauth2-login.ts` hunks needed.** The arms mint (a FRESH session
+  row each — the fixation posture asserted by the session-count pins)
+  and answer `303 /user/oauth2/{name}?redirect_to={validated}&
+  oauth2_continue=signin-link|signup`; the redirect_to parameter is
+  OMITTED when the hint is absent/off-site (safeRedirectTarget's "/"
+  answer normalizes to the empty hidden-input value on the render and
+  the parameter-less re-dance URL). The tests observe the marker inside
+  the parked dance state (`continue` riding the session-row carrier) —
+  the W2 callback's discriminator arm as tested there.
+
+  (b) **The page's hint set is exactly W2's three, and the email
+  prefill is EMPTY**: upstream prefills `gothUser.Email`
+  (linkaccount.go:72) from the parked identity — there is none on this
+  substrate and W2's redirect carries no email hint, so the signup
+  arm's email field renders empty and the POST requires the typed
+  address (the recorded consequence of the re-dance; §2.5's "email from
+  the verified provider claim" stays UNIMPLEMENTED by design until a
+  parked-identity arm ever lands). The `user_exists` tab probe
+  (linkaccount.go:76-94) reduces to its USERNAME half for the same
+  reason (the email half has no input); the sanitized hint picks only
+  WHICH TAB renders active — never a trust decision.
+
+  (c) **The arms' guard order is the W2 contract, enforced**:
+  sameOriginGuard → `externalSignupBlockedByInitWindow` (303
+  `/user/login`) → the signup arm's ALLOW_SIGNUP 404 (the full-shell
+  renderNotFound, the first-run posture) → the source hint RE-RESOLVED
+  through `getActiveOAuth2SourceByName` (a miss is the honest 404 shell —
+  the hints are untrusted) → the credential ladder. The init-window
+  guard outranks the ALLOW_SIGNUP gate (test-pinned): a zero-user
+  instance cannot be signed into or registered into from the link page,
+  exactly §5.5.3's strengthening. The GET renders ungated (upstream
+  mounts the family outside reqSignIn/reqSignOut, web.go:597-599; the
+  viewer resolves honestly — a signed-in visitor sees the page with
+  their navbar).
+
+  (d) **The signin arm's ladder is the login POST's steps 2-4**
+  (ui/session.ts): TokenService.verify + the case-insensitive owner
+  cross-check (a mismatch is the incorrect arm), the capability gate
+  (read:repository + not public-only — the minted session carries the
+  USER's web identity), the prohibited refusal. Failures re-render at
+  200 with the failed arm's tab active; the messages are the login
+  page's (`form.username_password_incorrect` copy + `locale`'s
+  scope/prohibited strings) — upstream's prohibit_login PAGE render
+  (handleSignInError) reduces to the inline message, the login-page
+  posture. No remember checkbox (upstream's LinkAccountMode hides it,
+  signin_inner.tmpl's `{{if not .LinkAccountMode}}`); the mint is
+  session-scope. The credential label is "Access Token" (the B-1
+  divergence, `locale.password`) with the wire field `password`
+  unchanged.
+
+  (e) **The signup arm is the shared `registerUser` ladder** (§5.5.3's
+  reuse): invalid (the service's message) / name-taken / email-taken
+  re-render at 200 with the typed values re-filled (upstream's
+  RenderWithErr posture) and the signup tab active; created
+  ⇒ mint + re-dance with `oauth2_continue=signup`. Password/retype
+  fields render nowhere (PAT-only — upstream's DisablePassword default
+  posture, linkaccount.go:30; the B-1 disclosure rides the
+  sign_up_tip slot).
+
+  (f) **The unlink arm's route is the HANDOFF** (the settings prologue
+  `userSettingsTabPrologue` is ui/index.ts-module-private): the seams
+  (`parseAccountLinkUnlinkForm` — digits-only with the 0-is-not-given
+  arm; `applyAccountLinkUnlink` — removed/not-exist over the W1
+  `removeExternalLogin`) live in the page module, and the module header
+  carries the exact ui/index.ts hunks (the appearanceSubmit-shaped
+  handler + the `POST /user/settings/security/account_link` mount + the
+  methodNotAllowed GET twin). Success 303s the canonical URL and the
+  not-exist arm re-renders at 200 with a negative notice — upstream
+  flashes + JSONRedirects on BOTH outcomes (security.go:50-70); the
+  plain-form reduction keeps the failure message alive no-JS (the W4
+  delete-refusal posture) and leaves the success feedback to the row's
+  absence. **The pin carries NO last-link guard** (RemoveAccountLink
+  deletes unconditionally, external_login_user.go:107-118 — the
+  mission's conditional resolved negative), and the doer may unlink
+  every identity (PAT sign-in keeps working). **The audit emit is NOT
+  wired**: upstream records `UserExternalLoginRemove`
+  (security.go:59-61, action.go:90's `user:externallogin:remove`) but
+  the audit registry row lives in services/audit.ts, outside this
+  wave's ownership — the exact registration hunk (`UserExternalLoginRemove:
+  defineAction("user:externallogin:remove", "Removed external login
+  from authentication source {auth_source_id} for user {scope}.")` +
+  the emit in the HANDOFF handler) rides the W6 tail.
+
+  (g) **The section's two reductions (each recorded at the render
+  site)**: the "Link Account" Fomantic dropdown (accountlinks.tmpl:5-20,
+  JS-opened) renders as always-visible `ui primary tiny button`
+  anchors per ACTIVE source — a JS-gated menu is a dead control in the
+  no-JS shell; the Remove control is a PLAIN-FORM POST (upstream's
+  `link-action` button is type="button", JS-driven — the form makes
+  unlink work with JS disabled, the admin-pages delete idiom) carrying
+  upstream's `data-modal-confirm` hook, and the `#delete-account-link`
+  dialog bytes render (the repo-wiki dialog precedent; its own buttons
+  stay inert no-JS exactly like upstream's). The row/button icons are
+  the img-or-globe arm (providers.go:63-70's img markup; the
+  brand-glyph arm stays login.tsx's — `ProviderIcon` is module-private
+  there and login.tsx was outside this wave's ownership; the one-word
+  `export` + the icon-arm swap is a recorded follow-up, cosmetic only).
+
+  (h) **The provider display name is the registry's** (`displayName` —
+  upstream's cfg `DisplayName()/Name()` chain reduced: our cfg carries
+  no displayName field, the lattice is the single source; a dead cfg
+  falls back to the source name and renders the globe). The link-row
+  list orders `login_source_id DESC` (loadSecurityData's OrderBy) with
+  the sort in the loader — the W1 store read stays untouched; a link
+  whose source row is gone drops from the list (security.go's
+  `err == nil` skip arm — unreachable through the admin flow, whose
+  delete refuses an in-use source).
+
+  (i) **The router module's graph is leaf-only** — `assetsBinding`/
+  `assetsNotBuilt` are duplicated byte-for-byte from ui/index.ts (the
+  first-run import twin, cited) so the suite drives the router without
+  the dispatcher's module churn (observed live: a sibling's mid-write
+  ui/index.ts import broke every session-importing suite tree-wide,
+  W2's own included). The mount HANDOFFS: src/index.ts
+  `app.route("/", linkAccountRouter)` BEFORE the uiRouter (9d77172 —
+  the /user/link_account* statics are two segments) beside the
+  firstRunRouter mount, and the ui/index.ts unlink hunks of (f).
+
+  (j) **Goldens**: `user-settings-security.html` (the LINKED render —
+  the beforeAll fixture pair: two ACTIVE sources with alice linked to
+  the OIDC one; login_source + external_login_user are first-read by
+  the goldens battery here, zero prior bytes move; the section renders
+  no timestamps so the fixtures carry no clock pins) and
+  `link-account.html` (its own describe drives the router module
+  directly — the route's mount is the HANDOFF, so the shared
+  renderRoute path cannot reach it yet; ALLOW_SIGNUP pinned "true" on
+  the render env, the demo-gate pin's rationale one gate over; the
+  hints render: the sanitized prefill, the hidden source/redirect
+  carriers, the signup tab active on the probe miss). a11y coverage via
+  the two explicit EXPANSION_ARMS entries (the no-auto-declaration
+  rule), both first-sight CLEAN with no pre-fix.
 - **W6 — battery + docs tail** (last; size **S**). Owns: the
   deploy-probes battery arm (§8), the SPEC as-built amendments,
   SPEC-0018 §3.3's ledger-entry edit (the omission paragraph becomes

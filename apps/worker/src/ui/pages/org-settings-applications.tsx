@@ -124,16 +124,47 @@
  * mount; the a43d9b1 dead-link omission is retired). The page Title is
  * settings.applications ("Applications" — org/setting_oauth2.go:35, the
  * same text the h4 renders).
+ *
+ * ## W5 (2026-10-31) — the edit/regenerate arms + the upstream create answer
+ * (specs/oauth2-provider.md §6 W5's OQ2 resolution: the landed brief's
+ * "edit shapes stay UNCLAIMED" note staged them for exactly this wave — the
+ * upstream org twin carries the full family, web.go:1025-1029's
+ * `m.Combo("").Get(org.OAuth2ApplicationShow).Post(... org.OAuth2ApplicationEdit)`
+ * + `POST /regenerate_secret`, setting_oauth2.go:66-93)
+ *
+ *   - The per-row Edit button RENDERS now (applications_oauth2_list.tmpl:23-26
+ *     verbatim) → the shared edit page (pages/oauth2-app-edit.tsx — the
+ *     OAuth2CommonHandlers port; the org variant renders this page's chrome
+ *     with the edit-form segment). The parse-tree claims ride the W5 handoff
+ *     (ui/index.ts): GET/POST /{org}/settings/applications/oauth2/{id} and
+ *     POST .../{id}/regenerate_secret, all inside the landed applications
+ *     group's `oauth2Enabled` gate (web.go:1030 — the group wrap answers
+ *     oauth2SettingsForbidden's 403 when OAUTH2_ENABLED=false; the landed
+ *     "the arm always serves" divergence above retires with the W4 seam).
+ *   - The create answer upgrades to upstream's AddApp shape: the EDIT PAGE
+ *     rendered with the once-only plaintext secret (oauth2_common.go:79-87)
+ *     — the list re-render that stood in ("with no landed edit page",
+ *     above) retires; the create/write arms now go through the shared
+ *     module's form+binder (validateOauth2ApplicationForm — adding the
+ *     Required redirect_uris bind arm and the exact `RedirectURIs: "<uri>"
+ *     is not a valid URL.` composite the generic reductions approximated).
+ *   - The once-only secret block leaves THIS list page (it was the edit
+ *     page's stand-in); the data model drops newClientSecret/newClientId.
+ *
+ * The uid=org.id isolation is untouched (the shared arms key on ownerId
+ * the same way); the builtin lock is unreachable on org rows (builtins are
+ * uid=0) but the shared delete/edit arms carry it anyway (upstream's model
+ * lock applies to every twin).
  */
 
+import { listOAuth2Applications, toApiOAuth2Application, type OAuth2AppRow } from "../../api/services/oauth2-apps";
 import {
-  createOAuth2Application,
-  deleteOAuth2Application,
-  detectInvalidOAuth2ApplicationRedirectURI,
-  listOAuth2Applications,
-  toApiOAuth2Application,
-  type OAuth2AppRow,
-} from "../../api/services/oauth2-apps";
+  createOauth2ApplicationFromForm,
+  deleteOauth2ApplicationFromForm,
+  parseOauth2AppEditForm,
+  splitRedirectUris as splitRedirectUrisShared,
+  type OAuth2AppEditForm,
+} from "./oauth2-app-edit";
 import type { OrgRecord } from "../../services/orgs/orgs";
 import type { IconName } from "../icons";
 import { BaseLayout, Icon, renderPage } from "../shell";
@@ -158,9 +189,7 @@ export const orgSettingsApplicationsLocale = {
   remove_confirm:
     "Removing an OAuth2 application will prevent it from accessing authorized user accounts on this instance. Continue?", // "settings.oauth2_application_remove_description" (the confirm-dialog reduction's aria)
   no_apps: "No applications yet", // the empty-list arm (upstream's {{range}} renders none; the explicit line is the settings pages' cf-gitea convention)
-  create_success: "You have successfully created a new OAuth2 application.", // "settings.create_oauth2_application_success"
-  client_secret_hint:
-    "The secret will not be shown again after you leave or refresh this page. Please ensure that you have saved it.", // "settings.oauth2_client_secret_hint"
+  edit: "Edit", // "settings.oauth2_application_edit" (the W5 row link — the shared edit page)
   create_oauth2_application: "Create a new OAuth2 Application", // "settings.create_oauth2_application" (the details summary)
   application_name: "Application Name", // "settings.oauth2_application_name"
   redirect_uris: "Redirect URIs. Please use a new line for every URI.", // "settings.oauth2_redirect_uris" (strong stripped)
@@ -169,8 +198,11 @@ export const orgSettingsApplicationsLocale = {
   skip_secondary_authorization:
     "Skip authorization for public clients after granting access once. May pose a security risk.", // "settings.oauth2_skip_secondary_authorization" (strong stripped)
   create_oauth2_application_button: "Create Application", // "settings.create_oauth2_application_button"
-  error_name_required: "Name cannot be empty.", // the required-name bind arm (forms' Required binding → the re-render error)
-  error_redirect_uri: "Invalid redirect URI.", // the DetectInvalid arm's generic line (the exact URI rides the browser log upstream)
+  // The bind-error texts moved to the SHARED binder (oauth2-app-edit.tsx's
+  // validateOauth2ApplicationForm — form.require_error "Name cannot be
+  // empty." and the exact `RedirectURIs: "<uri>" is not a valid URL.`
+  // composite); the former generic "Invalid redirect URI." reduction is
+  // retired with the W5 shared binder.
 } as const;
 
 /** The leading row glyph stand-in (the module header's reduction note). */
@@ -182,48 +214,28 @@ const APP_ICON: IconName = "octicon-package";
 export const ORG_APPLICATIONS_LIST_LIMIT = 500;
 const SERVICE_PAGE_SIZE = 100;
 
-/** The create POST body (upstream EditOAuth2ApplicationForm — the template's
- *  verbatim field names: application_name Required;MaxSize(255),
- *  redirect_uris Required (the newline-separated textarea),
- *  confidential_client + skip_secondary_authorization bools —
- *  user_form.go:248-254). */
-export interface OrgApplicationCreateForm {
-  name: string;
-  redirectUrisRaw: string;
-  confidentialClient: boolean;
-  skipSecondaryAuthorization: boolean;
-}
+/** The create POST body (upstream EditOAuth2ApplicationForm — the shared
+ *  shape since W5; this alias keeps the landed export names). */
+export type OrgApplicationCreateForm = OAuth2AppEditForm;
 
 export function parseOrgApplicationCreateForm(form: URLSearchParams): OrgApplicationCreateForm {
-  const textarea = form.get("redirect_uris") ?? "";
-  return {
-    name: (form.get("application_name") ?? "").trim(),
-    redirectUrisRaw: textarea,
-    // The checkbox tri-state: present+non-empty = checked (the HTML form
-    // contract; upstream's web.FormBool).
-    confidentialClient: (form.get("confidential_client") ?? "") !== "",
-    skipSecondaryAuthorization: (form.get("skip_secondary_authorization") ?? "") !== "",
-  };
+  return parseOauth2AppEditForm(form);
 }
 
-/** `util.SplitTrimSpace(form.RedirectURIs, "\n")` (oauth2_common.go:69). */
+/** `util.SplitTrimSpace(form.RedirectURIs, "\n")` (oauth2_common.go:69) —
+ *  the shared module's split since W5. */
 export function splitRedirectUris(raw: string): string[] {
-  return raw
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line !== "");
+  return splitRedirectUrisShared(raw);
 }
 
 /** The applications tab's render inputs — the uid=org.id rows (id DESC, the
- *  service's order) plus the once-only secret pair from a just-served
- *  create ("" outside the create re-render — the module header's secret
- *  note) and the re-rendered create submission ("" / unchecked on the
- *  plain GET). */
+ *  service's order) and the re-rendered create submission ("" / unchecked on
+ *  the plain GET). The W5 once-only secret pair retired: the create answer
+ *  is the shared EDIT page (the module header's W5 record), so the list
+ *  carries no secret state. */
 export interface OrgSettingsApplicationsData {
   org: OrgRecord;
   apps: OAuth2AppRow[];
-  newClientSecret: string;
-  newClientId: string;
   form: OrgApplicationCreateForm;
 }
 
@@ -244,8 +256,6 @@ export async function loadOrgSettingsApplications(d1: D1Database, org: OrgRecord
   return {
     org,
     apps,
-    newClientSecret: "",
-    newClientId: "",
     form: { name: "", redirectUrisRaw: "", confidentialClient: true, skipSecondaryAuthorization: false },
   };
 }
@@ -255,49 +265,41 @@ export type OrgApplicationCreateResult =
   | { outcome: "invalid"; message: string };
 
 /**
- * OAuthApplicationsPost → AddApp's write half (oauth2_common.go:56-88) over
- * the landed service with uid=org.id: the required-name bind, the redirect
- * -URI validation (the binder's Validate arm — the FIRST bad URI answers
- * the generic line), then the create. The service's insert-failure ApiError
- * propagates (upstream's ServerError arm — unexpected, not a form error).
- * The once-only plaintext rides the outcome for the caller's re-render
- * (the module header's reduction).
+ * OAuthApplicationsPost → AddApp's write half (oauth2_common.go:56-88) —
+ * the SHARED create since W5 (uid=org.id): the full binder (name
+ * Required/MaxSize, redirect_uris Required, the DetectInvalid URL hook —
+ * the shared module's exact composites), then CreateOAuth2Application +
+ * GenerateClientSecret. The service's insert-failure ApiError propagates
+ * (upstream's ServerError arm — unexpected, not a form error). The caller
+ * answers the created arm with the shared EDIT page carrying the once-only
+ * secret (the module header's W5 record).
  */
 export async function applyOrgApplicationCreate(
   d1: D1Database,
   org: OrgRecord,
   form: OrgApplicationCreateForm,
 ): Promise<OrgApplicationCreateResult> {
-  if (form.name === "") {
-    return { outcome: "invalid", message: orgSettingsApplicationsLocale.error_name_required };
+  const result = await createOauth2ApplicationFromForm(d1, org.id, form, new Date());
+  if (result.kind === "invalid") {
+    return { outcome: "invalid", message: result.message };
   }
-  const uris = splitRedirectUris(form.redirectUrisRaw);
-  const invalid = detectInvalidOAuth2ApplicationRedirectURI(uris);
-  if (invalid !== "") {
-    return { outcome: "invalid", message: orgSettingsApplicationsLocale.error_redirect_uri };
-  }
-  const { row, secret } = await createOAuth2Application(
-    d1,
-    {
-      uid: org.id,
-      name: form.name,
-      redirectUris: uris,
-      confidentialClient: form.confidentialClient,
-      skipSecondaryAuthorization: form.skipSecondaryAuthorization,
-    },
-    new Date(),
-  );
-  return { outcome: "created", row, secret };
+  return { outcome: "created", row: result.row, secret: result.secret };
 }
 
 /**
- * DeleteApp's write half — the (id, uid=org.id) delete over the landed
- * service (oauth2.go:386-401): true when a row was deleted, false on the
- * unknown/foreign arm (the caller 404-shells — the module header's
- * divergence note; existence stays hidden).
+ * DeleteApp's write half — the shared delete since W5 (oauth2_common.go:
+ * 177-193 over oauth2.go:386-401 + the builtin lock): "deleted" on the hit,
+ * "not_found" on the unknown/foreign arm (the caller 404-shells — the
+ * module header's divergence note; existence stays hidden). The lock arm is
+ * unreachable on uid=org.id rows (builtins are uid=0) but the shared arm
+ * carries it for the family.
  */
-export async function deleteOrgApplication(d1: D1Database, org: OrgRecord, id: number): Promise<boolean> {
-  return deleteOAuth2Application(d1, id, org.id);
+export async function deleteOrgApplication(
+  d1: D1Database,
+  org: OrgRecord,
+  id: number,
+): Promise<{ kind: "deleted" } | { kind: "not_found" } | { kind: "locked" }> {
+  return deleteOauth2ApplicationFromForm(d1, org.id, id);
 }
 
 // ---------------------------------------------------------------------------
@@ -341,24 +343,6 @@ export function OrgApplicationsPage(props: { ctx: UiContext; data: OrgSettingsAp
           <div class="org-setting-content">
             {/* applications.tmpl:3-5 — the h4. */}
             <h4 class="ui top attached header">{orgSettingsApplicationsLocale.applications}</h4>
-            {data.newClientSecret !== "" ? (
-              // The create flow's once-only secret (the admin page's exact
-              // reduction — the user-settings newToken precedent): the
-              // positive message + the client id + the plaintext code + the
-              // hint. Upstream renders it on the edit page
-              // (oauth2_common.go:79-86); with no landed edit page the full
-              // list re-render is the honest no-JS analog.
-              <div class="ui positive message">
-                <p>{orgSettingsApplicationsLocale.create_success}</p>
-                <p>
-                  {orgSettingsApplicationsLocale.client_id}: <code class="new-oauth2-client-id">{data.newClientId}</code>
-                </p>
-                <div class="ui segment">
-                  <code id="new-oauth2-client-secret">{data.newClientSecret}</code>
-                </div>
-                <p>{orgSettingsApplicationsLocale.client_secret_hint}</p>
-              </div>
-            ) : null}
             {props.error !== null ? <div class="ui negative message">{props.error}</div> : null}
             {/* applications_oauth2_list.tmpl:1-48 — the attached segment:
                 the description line, the rows, else the empty arm. */}
@@ -390,13 +374,19 @@ export function OrgApplicationsPage(props: { ctx: UiContext; data: OrgSettingsAp
                           </div>
                         </div>
                         <div class="item-trailing">
-                          {/* NO Edit button: the edit page has no landed
-                              analog (the module header) — a rendered anchor
-                              would be a dead link. The BuiltinApplications
-                              "locked" arm is unreachable (no pre-registered
-                              apps). The Remove button rides the landed
-                              delete — the plain-form POST (the confirm-dialog
-                              reduction; the desc text is the aria label). */}
+                          {/* applications_oauth2_list.tmpl:23-26 — the Edit
+                              link rides the W5 shared edit page (the module
+                              header's W5 record; the former dead-link
+                              omission retired). The BuiltinApplications
+                              "locked" arm is unreachable (org rows are
+                              uid=org.id, builtins uid=0). The Remove button
+                              rides the shared delete — the plain-form POST
+                              (the confirm-dialog reduction; the desc text is
+                              the aria label). */}
+                          <a href={`${pageLink}/oauth2/${app.id}`} class="ui primary tiny button">
+                            <Icon name="octicon-pencil" />
+                            {` ${orgSettingsApplicationsLocale.edit}`}
+                          </a>
                           <form method="post" action={`${pageLink}/oauth2/${app.id}/delete`} class="tw-inline">
                             <input type="hidden" name="id" value={String(app.id)} />
                             <button

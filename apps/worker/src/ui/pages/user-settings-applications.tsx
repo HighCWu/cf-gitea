@@ -44,6 +44,57 @@
  * components/settings-nav UserSettingsNavbar (the wave-114 swap) with this
  * tab's Applications item active.
  *
+ * ## W5 (2026-10-31) — the OAuth2 halves (specs/oauth2-provider.md §2.8, §6
+ * W5; the deferral note below RETIRES with this record)
+ *
+ * applications.tmpl:5-8 renders, gated on `.EnableOAuth2` (the landed
+ * `oauth2FeatureEnabled` — OAUTH2_ENABLED's strict polarity), two sections
+ * after the PAT panel, and this module now carries both:
+ *
+ *   - **grants_oauth2** (templates/user/settings/grants_oauth2.tmpl): the
+ *     user's authorized OAuth2 grants — the W1 grants store's
+ *     `listGrantsByUserID` (the INNER-JOINed application per grant) — each
+ *     row the application name + the Added-on date + the Revoke button.
+ *     Upstream's revoke POSTs `/user/settings/applications/oauth2/
+ *     {ApplicationID}/revoke/{GrantID}` (grants_oauth2.tmpl:22; web.go:688
+ *     RevokeOAuth2Grant); the handler 404-shells a missing/foreign grant
+ *     (oauth2_common.go:196-207 — grants belong to individual users; the
+ *     org/admin twins refuse) and 303s home on success. NO empty-list arm:
+ *     the description line always renders (upstream-exact; the org/admin
+ *     pages' "No applications yet" line is THEIR store's convention, the
+ *     grants template has none).
+ *   - **applications_oauth2** (applications_oauth2.tmpl + _list.tmpl): the
+ *     user's OAuth2 applications — the landed CRUD service's
+ *     `listOAuth2Applications(d1, doer.id, …)` (uid-scoped, id DESC) — each
+ *     row the glyph + name + Client ID label + the Edit link (the shared
+ *     edit page, pages/oauth2-app-edit.tsx — the OAuth2CommonHandlers
+ *     module) + the Remove form (`POST .../oauth2/{id}/delete`). The bottom
+ *     segment is the create form (`POST /user/settings/applications/oauth2`);
+ *     the details' open arm is upstream-exact (`{{if .application_name}}` —
+ *     the kept submitted name only, applications_oauth2_list.tmpl:51). The
+ *     create ANSWER is upstream's AddApp shape: the shared edit page
+ *     rendered with the plaintext client secret (oauth2_common.go:79-87);
+ *     the bind-error arm re-renders THIS page with the negative line + the
+ *     kept submission (upstream flashes + redirects to the list — the
+ *     no-flash posture).
+ *
+ * The builtin lock arm (applications_oauth2_list.tmpl:18-21) renders never
+ * on THIS page: the builtin rows are uid=0 and the list is uid-scoped to the
+ * doer (upstream doesn't pass BuiltinApplications here either — only the
+ * admin Applications handler does, applications.go:182-204 has no such key).
+ * The list rows' secret stays blank (app.go's hide-on-list arm — the landed
+ * toApiOAuth2Application's "" arg); the plaintext exists only on the edit
+ * page after create/regenerate (the secret-shown-once posture, the shared
+ * module's header).
+ *
+ * ## Documented reductions (§6 method — never dead controls)
+ *
+ * - The OAuth2 halves of applications.tmpl (grants_oauth2 + applications_
+ *   oauth2, gated on .EnableOAuth2) are UNRENDERED: the landed OAuth2 store
+ *   is API-only (routes/oauth2-apps.ts) with no web UI surface — this brief
+ *   pins the PAT panel (access_tokens.tmpl). [RETIRED W5 — the halves render
+ *   above; the original note is kept for the wave trail.]
+ *
  * ## Data (§3.2 — the landed tokens family, never a self-fetch)
  *
  * The brief's landed family is routes/account-aggregates.ts's
@@ -124,6 +175,9 @@ import { TokenService } from "../../auth/token-service";
 import type { AuthToken } from "../../auth/auth-context";
 import { InvalidScopeError, normalizeScope, SCOPE_CATEGORIES, ScopeSet, scopeStringSlice } from "../../auth/scopes";
 import { TokenNameExistsError, TokenNameTooLongError } from "../../auth/errors";
+import { listOAuth2Applications, toApiOAuth2Application, type OAuth2AppRow } from "../../api/services/oauth2-apps";
+import { listGrantsByUserID, type OAuth2GrantRow, type OAuth2ApplicationRow } from "../../services/oauth2/grants";
+import type { OAuth2AppEditForm } from "./oauth2-app-edit";
 import { UserSettingsNavbar } from "../components/settings-nav";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { IconName } from "../icons";
@@ -161,6 +215,53 @@ export const userSettingsApplicationsLocale = {
   generate_token: "Generate Token", // "settings.generate_token"
   at_least_one_permission: "You must select at least one permission to create a token", // "settings.at_least_one_permission"
   delete_token_success: "The token has been deleted. Applications using it no longer have access to your account.", // "settings.delete_token_success" (the flash reduction never renders it — kept for the outcome docs)
+
+  // --- the W5 OAuth2 halves (grants_oauth2.tmpl + applications_oauth2*.tmpl
+  //     at the pin; en-US values) ---
+  /** "settings.authorized_oauth2_applications" — the grants section's h4. */
+  authorized_oauth2_applications: "Authorized OAuth2 Applications",
+  /** "settings.authorized_oauth2_applications_description" — the grants
+   *  section's lead line. */
+  authorized_oauth2_applications_description:
+    "You have granted access to your personal Gitea account to these third-party applications. Please revoke access for applications you no longer need.",
+  /** "settings.revoke_key" — the grants row's button (grants_oauth2.tmpl:23). */
+  revoke_key: "Revoke",
+  /** "settings.revoke_oauth2_grant_description" — the revoke confirm-dialog
+   *  reduction's aria label (grants_oauth2.tmpl:36). */
+  revoke_oauth2_grant_description:
+    "Revoking access for this third-party application will prevent this application from accessing your data. Are you sure?",
+  /** "settings.manage_oauth2_applications" — the applications section's h4
+   *  (applications_oauth2.tmpl:2). */
+  manage_oauth2_applications: "Manage OAuth2 Applications",
+  /** "settings.oauth2_application_create_description" — the list's first
+   *  item (applications_oauth2_list.tmpl:4). */
+  oauth2_application_create_description:
+    "OAuth2 applications give your third-party application access to user accounts on this instance.",
+  /** "settings.oauth2_client_id" — the row body's label (_list.tmpl:14). */
+  oauth2_client_id: "Client ID",
+  /** "settings.oauth2_application_edit" — the Edit link (_list.tmpl:25). */
+  oauth2_application_edit: "Edit",
+  /** "remove" — the Remove button (_list.tmpl:30). */
+  remove: "Remove",
+  /** "settings.oauth2_application_remove_description" — the confirm-dialog
+   *  reduction's aria label (the org/admin twins' convention). */
+  oauth2_application_remove_description:
+    "Removing an OAuth2 application will prevent it from accessing authorized user accounts on this instance. Continue?",
+  /** "settings.create_oauth2_application" — the create details' summary
+   *  (_list.tmpl:52). */
+  create_oauth2_application: "Create a new OAuth2 Application",
+  /** "settings.oauth2_application_name" (_list.tmpl:55). */
+  oauth2_application_name: "Application Name",
+  /** "settings.oauth2_redirect_uris" (_list.tmpl:59). */
+  oauth2_redirect_uris: "Redirect URIs. Please use a new line for every URI.",
+  /** "settings.oauth2_confidential_client" (_list.tmpl:64). */
+  oauth2_confidential_client:
+    "Confidential Client. Select for apps that keep the secret confidential, such as web apps. Do not select for native apps, including desktop and mobile apps.",
+  /** "settings.oauth2_skip_secondary_authorization" (_list.tmpl:70) — the
+   *  <strong> tail stripped. */
+  oauth2_skip_secondary_authorization: "Skip authorization for public clients after granting access once. May pose a security risk.",
+  /** "settings.create_oauth2_application_button" (_list.tmpl:75). */
+  create_oauth2_application_button: "Create Application",
 } as const;
 
 /** The create/revoke outcomes the POST handlers render (the
@@ -199,24 +300,45 @@ export interface TokenListItem {
 
 /** The applications tab's render inputs. `form` re-renders the submitted
  *  name ("" on the plain GET); `newToken` carries the minted plaintext
- *  exactly once (the create POST's full-page re-render). */
+ *  exactly once (the create POST's full-page re-render). The W5 tail is the
+ *  OAuth2 half: `oauth2Enabled` gates the two sections
+ *  (applications.tmpl:5), `apps`/`grants` are the uid-scoped reads, and
+ *  `oauth2Form`/`oauth2Error` re-render a failed oauth2 create (the kept
+ *  submission + the negative line — "" / null on the plain GET). */
 export interface UserSettingsApplicationsPageData {
   tokens: TokenListItem[];
   scopeCategories: string[];
   form: { name: string };
   newToken: string | null;
+  oauth2Enabled: boolean;
+  apps: OAuth2AppRow[];
+  grants: { grant: OAuth2GrantRow; application: OAuth2ApplicationRow }[];
+  oauth2Form: OAuth2AppEditForm;
+  oauth2Error: string | null;
 }
 
-/** The page load — `now` is the HasRecentActivity clock (fixed-clock tests,
- *  the milestones loader pattern). */
+/**
+ * The page load — `now` is the HasRecentActivity clock (fixed-clock tests,
+ *  the milestones loader pattern). `oauth2Enabled` (default true) is the
+ *  landed gate read the mounted handler passes
+ *  (`oauth2FeatureEnabled(c.env)`) — false skips the OAuth2 reads entirely
+ *  (upstream's loadApplicationsData reads Applications/Grants only when
+ *  setting.OAuth2.Enabled, applications.go:189-203).
+ */
 export async function loadUserSettingsApplicationsPageData(
   d1: D1Database,
   userId: number,
   isAdmin: boolean,
   now: Date = new Date(),
+  oauth2Enabled = true,
 ): Promise<UserSettingsApplicationsPageData> {
   const service = new TokenService(d1);
   const page = await service.list(userId, 1, TOKENS_LIST_LIMIT);
+  // The web panel is the unpaginated upstream list at the render bound (the
+  // org/admin twins' loop convention — one bounded service page here, the
+  // 500-row cap).
+  const apps = oauth2Enabled ? (await listOAuth2Applications(d1, userId, 1, TOKENS_LIST_LIMIT)).rows : [];
+  const grants = oauth2Enabled ? await listGrantsByUserID(d1, userId) : [];
   return {
     tokens: page.tokens.map((token) => {
       const set = ScopeSet.parseLenient(token.scopes);
@@ -231,6 +353,11 @@ export async function loadUserSettingsApplicationsPageData(
     scopeCategories: tokenScopeCategories(isAdmin),
     form: { name: "" },
     newToken: null,
+    oauth2Enabled,
+    apps,
+    grants,
+    oauth2Form: { name: "", redirectUrisRaw: "", confidentialClient: true, skipSecondaryAuthorization: false },
+    oauth2Error: null,
   };
 }
 
@@ -345,6 +472,18 @@ export function formatTokenDate(date: Date): string {
  *  feeds-glyph convention; a later allowlist extension swaps it per this
  *  one-line site). */
 const TOKEN_ICON: IconName = "octicon-mail";
+
+/** The oauth2 application row's leading glyph — upstream renders
+ *  `{{svg "octicon-apps" 32}}` (applications_oauth2_list.tmpl:9); octicon-apps
+ *  is outside the generated icon allowlist — octicon-package is the
+ *  documented stand-in (the org twin's exact convention, its module header). */
+const OAUTH2_APP_ICON: IconName = "octicon-package";
+
+/** The grants row's leading glyph — upstream renders `{{svg "octicon-key"
+ *  32}}` (grants_oauth2.tmpl:12); octicon-key is outside the allowlist —
+ *  octicon-shield-lock is the documented stand-in (the authorization
+ *  semantic's nearest glyph, the feeds-glyph convention). */
+const GRANT_ICON: IconName = "octicon-shield-lock";
 
 /** The full-document render (the render.tsx pattern). `error` carries the
  *  failed create's message (null otherwise). */
@@ -509,6 +648,163 @@ export function UserSettingsApplicationsPage(props: { ctx: UiContext; data: User
               </details>
             </div>
           </div>
+          {data.oauth2Enabled ? (
+            <>
+              {/* applications.tmpl:6 — the grants_oauth2 section. NO
+                  empty-list arm: the description line always renders
+                  (upstream-exact — the template has no range-else). */}
+              <h4 class="ui top attached header">{userSettingsApplicationsLocale.authorized_oauth2_applications}</h4>
+              <div class="ui attached segment">
+                <div class="flex-divided-list items-with-main">
+                  <div class="item">{userSettingsApplicationsLocale.authorized_oauth2_applications_description}</div>
+                  {data.grants.map(({ grant, application }) => (
+                    <div class="item" key={grant.id}>
+                      <div class="item-leading">
+                        {/* {{svg "octicon-key" 32}} — outside the allowlist;
+                            octicon-shield-lock is the documented stand-in. */}
+                        <Icon name={GRANT_ICON} size={32} />
+                      </div>
+                      <div class="item-main">
+                        <div class="item-title">{application.name}</div>
+                        <div class="item-body">
+                          <i>
+                            {userSettingsApplicationsLocale.added_on} {formatTokenDate(grant.createdAt)}
+                          </i>
+                        </div>
+                      </div>
+                      <div class="item-trailing">
+                        {/* grants_oauth2.tmpl:21-24 — the revoke button; the
+                            confirm dialog reduces to the plain form POST (the
+                            hooks-list reduction; the description text is the
+                            aria label). The {application.id} URL segment is
+                            upstream's data-url shape — the handler keys on
+                            the grant id alone (oauth2_common.go:196-207). */}
+                        <form
+                          method="post"
+                          action={`/user/settings/applications/oauth2/${application.id}/revoke/${grant.id}`}
+                          class="tw-inline"
+                        >
+                          <button
+                            type="submit"
+                            class="ui red tiny button link-action"
+                            aria-label={userSettingsApplicationsLocale.revoke_oauth2_grant_description}
+                          >
+                            {userSettingsApplicationsLocale.revoke_key}
+                          </button>
+                        </form>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              {/* applications.tmpl:7 — the applications_oauth2 section
+                  (applications_oauth2.tmpl + _list.tmpl). */}
+              <h4 class="ui top attached header">{userSettingsApplicationsLocale.manage_oauth2_applications}</h4>
+              <div class="ui attached segment">
+                <div class="flex-divided-list items-with-main">
+                  <div class="item">{userSettingsApplicationsLocale.oauth2_application_create_description}</div>
+                  {data.apps.map((app) => {
+                    // toApiOAuth2Application is the render's client-id
+                    // projection; the secret arg is the list's "" blank
+                    // (app.go's hide-on-list arm). The builtin lock arm
+                    // renders never here — the rows are uid-scoped to the
+                    // doer and the builtins are uid=0 (the module header).
+                    const view = toApiOAuth2Application(app, "");
+                    return (
+                      <div class="item tw-items-center" key={app.id}>
+                        <div class="item-leading">
+                          {/* {{svg "octicon-apps" 32}} — outside the
+                              allowlist; octicon-package is the documented
+                              stand-in (the org twin's convention). */}
+                          <Icon name={OAUTH2_APP_ICON} size={32} />
+                        </div>
+                        <div class="item-main">
+                          <div class="item-title">{view.name}</div>
+                          <div class="item-body">
+                            {userSettingsApplicationsLocale.oauth2_client_id}
+                            <span class="ui label"> {view.client_id}</span>
+                          </div>
+                        </div>
+                        <div class="item-trailing">
+                          <a href={`/user/settings/applications/oauth2/${app.id}`} class="ui primary tiny button">
+                            <Icon name="octicon-pencil" />
+                            {` ${userSettingsApplicationsLocale.oauth2_application_edit}`}
+                          </a>
+                          <form
+                            method="post"
+                            action={`/user/settings/applications/oauth2/${app.id}/delete`}
+                            class="tw-inline"
+                          >
+                            <button
+                              type="submit"
+                              class="ui red tiny button link-action"
+                              aria-label={userSettingsApplicationsLocale.oauth2_application_remove_description}
+                            >
+                              <Icon name="octicon-trash" />
+                              {` ${userSettingsApplicationsLocale.remove}`}
+                            </button>
+                          </form>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+              {/* _list.tmpl:50-79 — the create segment. The details' open arm
+                  is the kept submitted name (the upstream `{{if
+                  .application_name}}` intent — the flash-redirect never
+                  carries it upstream, the no-flash re-render does here). */}
+              <div class="ui bottom attached segment">
+                <details open={data.oauth2Error !== null || data.oauth2Form.name !== "" ? true : undefined}>
+                  <summary>
+                    <h4 class="ui header tw-inline-block tw-my-2">{userSettingsApplicationsLocale.create_oauth2_application}</h4>
+                  </summary>
+                  <form class="ui form ignore-dirty" action="/user/settings/applications/oauth2" method="post">
+                    {data.oauth2Error !== null ? <div class="ui negative message">{data.oauth2Error}</div> : null}
+                    <div class="field">
+                      <label for="application-name">{userSettingsApplicationsLocale.oauth2_application_name}</label>
+                      <input
+                        id="application-name"
+                        name="application_name"
+                        value={data.oauth2Form.name}
+                        required
+                        maxlength={255}
+                      />
+                    </div>
+                    <div class="field">
+                      <label for="redirect-uris">{userSettingsApplicationsLocale.oauth2_redirect_uris}</label>
+                      <textarea name="redirect_uris" id="redirect-uris">
+                        {data.oauth2Form.redirectUrisRaw}
+                      </textarea>
+                    </div>
+                    <div class="field">
+                      <div class="ui checkbox">
+                        <label>{userSettingsApplicationsLocale.oauth2_confidential_client}</label>
+                        <input
+                          type="checkbox"
+                          name="confidential_client"
+                          checked={data.oauth2Form.confidentialClient ? true : undefined}
+                        />
+                      </div>
+                    </div>
+                    <div class="field">
+                      <div class="ui checkbox">
+                        <label>{userSettingsApplicationsLocale.oauth2_skip_secondary_authorization}</label>
+                        <input
+                          type="checkbox"
+                          name="skip_secondary_authorization"
+                          checked={data.oauth2Form.skipSecondaryAuthorization ? true : undefined}
+                        />
+                      </div>
+                    </div>
+                    <button type="submit" class="ui primary button">
+                      {userSettingsApplicationsLocale.create_oauth2_application_button}
+                    </button>
+                  </form>
+                </details>
+              </div>
+            </>
+          ) : null}
         </div>
       </div>
     </BaseLayout>

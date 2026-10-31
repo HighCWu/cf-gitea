@@ -12,6 +12,7 @@ import { accessibleName, descendants, getElementById, parseHtmlTree, runA11y } f
 // NEW_GOLDEN_CASES) — covered EXPLICITLY by the expansion arms below, never
 // through harness.ts's GOLDEN_CASES (that table feeds the smoke loop above
 // too; entries added there would silently grow this suite without review).
+import adminApplicationsEditGolden from "./goldens/admin-applications-edit.html?raw";
 import adminMonitorCronGolden from "./goldens/admin-monitor-cron.html?raw";
 import adminMonitorQueueGolden from "./goldens/admin-monitor-queue.html?raw";
 import adminMonitorStatsGolden from "./goldens/admin-monitor-stats.html?raw";
@@ -76,6 +77,8 @@ import userSettingsAccountGolden from "./goldens/user-settings-account.html?raw"
 import userSettingsNotificationsGolden from "./goldens/user-settings-notifications.html?raw";
 import userSettingsProfileGolden from "./goldens/user-settings-profile.html?raw";
 import userSettingsReposGolden from "./goldens/user-settings-repos.html?raw";
+import userSettingsSecurityGolden from "./goldens/user-settings-security.html?raw";
+import linkAccountGolden from "./goldens/link-account.html?raw";
 import wikiStartGolden from "./goldens/wiki-start.html?raw";
 import wikiViewHomeGolden from "./goldens/wiki-view-home.html?raw";
 import { GOLDEN_CASES } from "./harness";
@@ -371,6 +374,30 @@ const EXPANSION_ARMS: ExpansionArm[] = [
   // text, and the page renders NO table (R6 moot, thWithoutScope 0 by
   // absence).
   { file: "wiki-view-home.html", golden: wikiViewHomeGolden, mainAriaLabel: "Home", mainClassTokens: ["repository", "wiki"], thWithoutScope: 0 },
+  // The EXTERNAL AUTH W5 goldens (the explicit-import posture — goldens.test.ts's
+  // case comment holds the rationale). First sight, same protocol:
+  //
+  //   - user-settings-security: the twofa section (text) + the accountlinks
+  //     section — the header text, the two Link-Account button anchors (text
+  //     + the icon img alt / aria-hidden globe), the linked row's span title
+  //     + badge text, the Remove submit button (text), and the dialog's
+  //     cancel/ok buttons (text). NO tables (the divided-list shape — R6
+  //     moot, thWithoutScope 0 by absence). The h4 sections are same-level —
+  //     the R2 walk stays flat; zero h1 (R1's at-most-one holds).
+  //   - link-account: the tab strip's two named anchors, both forms'
+  //     labeled fields (the Access-Token label divergence included), the
+  //     submit buttons (text). No tables, zero h1.
+  { file: "user-settings-security.html", golden: userSettingsSecurityGolden, mainAriaLabel: "Security", mainClassTokens: ["user", "settings", "security"], thWithoutScope: 0 },
+  { file: "link-account.html", golden: linkAccountGolden, mainAriaLabel: "Link Account", mainClassTokens: ["user", "link-account"], thWithoutScope: 0 },
+  // The W5 OAuth2 halves' addition (goldens.test.ts's case comment holds the
+  // rationale): the admin twin's shared EDIT page over the fixture's
+  // non-builtin uid=0 row. First sight, same protocol: CLEAN — the form
+  // fields all carry labels (client-id/client-secret/application-name/
+  // redirect-uris), the buttons are text (Regenerate Secret / Save), the
+  // page renders NO table (R6 moot, thWithoutScope 0 by absence), zero h1
+  // (the h4 header), and the role=main aria-label is the app name (the
+  // edit-page title carries it — the oauth2-grant page's divergence).
+  { file: "admin-applications-edit.html", golden: adminApplicationsEditGolden, mainAriaLabel: "instance-ci", mainClassTokens: ["admin", "config"], thWithoutScope: 0 },
 ];
 
 describe("wave-129 expansion arms (explicit cases, not the shared table)", () => {

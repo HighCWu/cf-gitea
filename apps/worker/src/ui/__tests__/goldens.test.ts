@@ -50,11 +50,15 @@ import {
   users,
   webhooks,
 } from "../../db/schema";
+import { loginSources } from "../../db/schema";
 import { ARTIFACT_STATUS_UPLOAD_CONFIRMED } from "../../services/actions/artifacts";
 import { saveRepoSettings } from "../../api/services/repo-settings";
 import { createGlobalHook } from "../../api/services/hooks";
 import { demoModeEnabled } from "../../services/demo-sweep";
 import { AuditActions, emitAudit } from "../../services/audit";
+import { serializeOAuth2SourceConfig } from "../../services/auth-sources/cfg";
+import { createLoginSource, ensureExternalLogin, LoginSourceType } from "../../services/auth-sources/store";
+import { createLinkAccountRouter } from "../pages/link-account-router";
 import { __setArtifactPreviewClockForTests } from "../pages/repo-actions-artifacts";
 import { __setRouteClockForTests, uiRouter } from "../index";
 import { ensureSeededFixedIdRepo } from "../testing/seed-repo";
@@ -395,6 +399,37 @@ beforeAll(async () => {
         },
       ])
       .run();
+  }
+  {
+    // The W5 admin-applications goldens' NON-builtin row (the wave's own
+    // fixture — migration 0052 seeds the five builtins, so the guard above
+    // SKIPS (the table is non-empty) and instance-ci/aaa-mobile never land;
+    // without a non-builtin uid=0 row the list golden would render ONLY
+    // Locked labels and never exercise the Edit/Remove arms). Fixed client
+    // id + T0 stamps: the edit page renders the clientId verbatim and the
+    // list's row order rides the id (the autoincrement lands after the five
+    // builtins — id 6, deterministic through the fixed seed order).
+    const existingApp = await drizzle(env.DB)
+      .select({ id: oauth2Applications.id })
+      .from(oauth2Applications)
+      .where(eq(oauth2Applications.clientId, "golden-ci-client"))
+      .get();
+    if (existingApp === undefined) {
+      await drizzle(env.DB)
+        .insert(oauth2Applications)
+        .values({
+          uid: 0,
+          name: "instance-ci",
+          clientId: "golden-ci-client",
+          clientSecret: "golden-hash-ci",
+          confidentialClient: true,
+          skipSecondaryAuthorization: false,
+          redirectUris: JSON.stringify(["https://ci.example.com/cb"]),
+          createdAt: new Date(T0 * 1000),
+          updatedAt: new Date(T0 * 1000),
+        })
+        .run();
+    }
   }
   {
     // Two GLOBAL webhook rows (one system, one default) through the landed
@@ -803,6 +838,55 @@ beforeAll(async () => {
       }
     }
   }
+  {
+    // The EXTERNAL AUTH W5 account-links golden's fixtures (this wave):
+    // two ACTIVE OAuth2 login sources with alice linked to the OIDC one.
+    // login_source + external_login_user are FIRST-READ here (no committed
+    // page reads them; the admin-auths pages carry no committed golden), so
+    // zero existing bytes move. The source ids ride the fixed seed order
+    // (corp-oidc 1, hub-github 2 — the fresh file storage's first inserts,
+    // the milestone-detail precedent) and the section renders NO timestamps,
+    // so the fixtures carry no clock pins. One linked + one unlinked ACTIVE
+    // source exercises BOTH arms of the section in one render: the linked
+    // row (icon, name, the Active badge, the Remove form with id 1) and the
+    // Link-Account buttons (both sources, name order).
+    const seededSources = await drizzle(env.DB).select({ id: loginSources.id }).from(loginSources).limit(1).all();
+    if (seededSources.length === 0) {
+      const oidcRow = await createLoginSource(env.DB, {
+        type: LoginSourceType.OAuth2,
+        name: "corp-oidc",
+        isActive: true,
+        cfg: serializeOAuth2SourceConfig({
+          v: 1,
+          provider: "openidConnect",
+          clientId: "golden-oidc-client",
+          clientSecret: "golden-oidc-secret",
+          discoveryUrl: "https://idp.example.com",
+        }),
+      });
+      await createLoginSource(env.DB, {
+        type: LoginSourceType.OAuth2,
+        name: "hub-github",
+        isActive: true,
+        cfg: serializeOAuth2SourceConfig({ v: 1, provider: "github", clientId: "golden-gh-client", clientSecret: "golden-gh-secret" }),
+      });
+      const aliceLink = await drizzle(env.DB)
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.usernameLower, "alice"))
+        .get();
+      if (aliceLink === undefined) throw new Error("alice row missing before the account-links seeding");
+      await ensureExternalLogin(env.DB, {
+        externalId: "sub-golden-oidc",
+        loginSourceId: oidcRow.id,
+        userId: aliceLink.id,
+        provider: "openidConnect",
+        email: "alice-corp@example.com",
+        name: "Alice Corporate",
+        nickName: "alice-corp",
+      });
+    }
+  }
 });
 
 /** The one copy of the §5.2 assertion/marker protocol, shared by both case
@@ -1098,6 +1182,19 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
   { file: "admin-hooks.html", path: "/-/admin/hooks", status: 200, signedIn: true, sessionUser: "morgan" },
   { file: "admin-badges.html", path: "/-/admin/badges", status: 200, signedIn: true, sessionUser: "morgan" },
   { file: "admin-applications.html", path: "/-/admin/applications", status: 200, signedIn: true, sessionUser: "morgan" },
+  // The W5 OAuth2 halves' addition: the admin twin's shared EDIT page over
+  // the fixture's non-builtin uid=0 row (instance-ci, id 6 — the fixed seed
+  // order after the migration's five builtins). Pins the whole
+  // applications_oauth2_edit_form.tmpl chrome through the real route: the
+  // Client ID field, the MASKED client secret (the `averysecuresecret`
+  // placeholder — the shown-once arm's else shape), the regenerate form, and
+  // the save form with the stored redirect URIs. NO timestamps on the page
+  // (the template renders none — the fixture wall-clock hazard the
+  // user-settings-applications golden would carry through mintFor's real
+  // clock, which is why THAT surface pins in its module suite only). Its
+  // a11y coverage rides the EXPANSION_ARMS arm in a11y.test.ts (the explicit
+  // import posture, never auto-declared through the shared table).
+  { file: "admin-applications-edit.html", path: "/-/admin/applications/oauth2/6", status: 200, signedIn: true, sessionUser: "morgan" },
   // ---------------------------------------------------------------------------
   // The census R13 audit-arms batch (this wave): the two settings audit
   // mounts through the real route path over the fixtures seeded in the
@@ -1287,6 +1384,28 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
     signedIn: true,
     sessionUser: "morgan",
   },
+  // ---------------------------------------------------------------------------
+  // The EXTERNAL AUTH W5 batch (this wave): the user settings SECURITY tab
+  // with the account-links section LIVE — the W5 surfaces' goldens.
+  //
+  //   - user-settings-security: /user/settings/security signed in as alice.
+  //     Pins the wave-56 twofa section (the derived not-enrolled posture)
+  //     PLUS the accountlinks.tmpl render over the beforeAll's fixture pair:
+  //     the "Manage Linked Accounts" header, both Link-Account buttons (the
+  //     OrderedOAuth2Names arm — corp-oidc + hub-github, name order), the
+  //     desc item, alice's one linked row (icon, name, the Active badge, the
+  //     Remove form with the source id 1 — the fixed seed order), and the
+  //     #delete-account-link confirm dialog. No tables (R6 moot) and no
+  //     timestamps — the section's bytes are fixture-pure. Its a11y
+  //     coverage rides the EXPANSION_ARMS arm in a11y.test.ts (the explicit
+  //     import posture, never auto-declared through the shared table).
+  //   - link-account renders in its OWN describe below (the route is NOT
+  //     mounted in the dispatcher yet — the W5 mount is the orchestrator's
+  //     registration-window HANDOFF — so the shared renderRoute path cannot
+  //     reach it; the describe drives the router module directly, the W2
+  //     harness shape).
+  // ---------------------------------------------------------------------------
+  { file: "user-settings-security.html", path: "/user/settings/security", status: 200, signedIn: true },
 ];
 
 describe("wave-129 expansion goldens", () => {
@@ -1295,6 +1414,54 @@ describe("wave-129 expansion goldens", () => {
       await renderGoldenCase(golden);
     });
   }
+});
+
+/**
+ * The link-account page golden (the EXTERNAL AUTH W5 arm — the case comment
+ * above holds the own-describe rationale): the router module driven directly
+ * over the beforeAll's source fixtures. The page reads UNTRUSTED redirect
+ * hints (the SPEC §9 W2 as-built (b) — there is no parked identity), so the
+ * golden IS the hint render: `oauth2_source=corp-oidc` into the hidden
+ * inputs, the sanitized `oauth2_username_hint` prefill (no user row matches,
+ * so the SIGNUP tab renders active — upstream's user_exists probe's miss
+ * arm), and the validated `redirect_to` carried through. ALLOW_SIGNUP is
+ * pinned "true" on the render env (the operator-local var must not reach
+ * the committed bytes — the demo-gate pin's rationale, one gate over); the
+ * anonymous navbar renders (no session presented). The same marker protocol
+ * asserts/regenerates the committed bytes.
+ */
+describe("link-account golden (the router-module drive)", () => {
+  it("renders link-account.html byte-identical (200)", async () => {
+    const envOverride = { ...uiEnv, ALLOW_SIGNUP: "true" };
+    const router = createLinkAccountRouter();
+    const res = await router.request(
+      "https://test.local/user/link_account?oauth2_source=corp-oidc&oauth2_username_hint=golden-user&redirect_to=%2Fafter",
+      undefined,
+      envOverride,
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+
+    const committed = goldenBody("link-account.html");
+    if (updateMode || committed === undefined) {
+      console.log(`${GOLDEN_MARKER_START}link-account.html\n${html}\n${GOLDEN_MARKER_END}`);
+      if (!updateMode) {
+        throw new Error(
+          "golden file goldens/link-account.html is missing — regenerate with: node src/ui/__tests__/update-goldens.mjs",
+        );
+      }
+      return;
+    }
+    if (committed === "") {
+      throw new Error(
+        "golden file goldens/link-account.html is empty (interrupted regeneration?) — rerun: node src/ui/__tests__/update-goldens.mjs",
+      );
+    }
+    if (html !== committed) {
+      throw new Error(`render differs from goldens/link-account.html: ${diffWindow(html, committed)}`);
+    }
+    expect(html).toBe(committed); // the assertion of record
+  });
 });
 
 /**

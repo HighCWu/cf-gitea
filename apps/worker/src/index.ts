@@ -315,6 +315,11 @@ app.route("/", oauth2Router);
 // router (the /explore rule documented at uiRouter's literal block — the
 // first-run HANDOFF's "order immaterial" claim was wrong for this path).
 app.route("/", firstRunRouter);
+// The external-auth link-account family (SPEC external-auth-sources.md W5,
+// web.go:597-599's ungated mounts): the two-segment /user/link_account GET+
+// POSTs ride their own router BEFORE uiRouter per the 9d77172 rule.
+import { linkAccountRouter } from "./ui/pages/link-account-router";
+app.route("/", linkAccountRouter);
 app.route("/", uiRouter);
 // SPEC-0010: /login + /logout are single-segment top level routes (§2.1) —
 // never repo-scoped, so the dispatcher and the engine never see them.
@@ -378,6 +383,28 @@ export default {
     // and the headless engine 404s them (the /.well-known carve's twin —
     // the W3 authorize/consent arms ride the same mount family).
     const isLoginPath = segments[0] === "login";
+    // The /user auth-page family carve (SPEC external-auth-sources.md §5.2/
+    // §2.5 — the isLoginPath twin): the OIDC client flow's legs
+    // (/user/oauth2/{provider}[/callback] — web.go:768-771's group) and the
+    // link-account trio (/user/link_account[_signin|_signup] —
+    // web.go:597-599) live in Hono-land on their own mounts
+    // (oauth2LoginRouter + linkAccountRouter above). Without the carve the
+    // two-segment-and-deeper /user/... shapes fall into the repo-scoped
+    // branch and the headless engine 404s them BEFORE Hono sees the mounts —
+    // the W6 battery's live finding (ext-unknown-source-404 answered the
+    // dispatcher's shell/engine pair, the flow legs unreachable). The
+    // literals bind under segments[0] === "user", a RESERVED username
+    // upstream (models/user/user.go:642's reservedUsernames — "user
+    // login/activate/settings, etc"), so the family can never shadow an
+    // /owner/repo pair, and the carve hands the whole prefix to Hono at the
+    // isLoginPath grain (unregistered tails — /user/oauth2/{x}/junk — take
+    // Hono's default 404, upstream's own unregistered-route posture).
+    const isUserAuthPath =
+      segments[0] === "user" &&
+      (segments[1] === "oauth2" ||
+        segments[1] === "link_account" ||
+        segments[1] === "link_account_signin" ||
+        segments[1] === "link_account_signup");
     // THE ASSET-MISS FALLBACK TARGET (web.go:264 + modules/public/public.go —
     // the v1.2-carried "no /assets fallback target" residual closed): the
     // wrangler assets binding serves every HIT edge-side with
@@ -419,7 +446,8 @@ export default {
       !isAvatarServing &&
       !isAttachmentServing &&
       !isWellKnown &&
-      !isLoginPath;
+      !isLoginPath &&
+      !isUserAuthPath;
     if (isRepoScoped) {
       // All methods for the UI's write families (new/edit/delete file,
       // new-issue, comments, settings, milestones — waves 4-8 are POSTs on

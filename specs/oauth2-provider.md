@@ -876,6 +876,99 @@ not edit the shared index themselves).
   recorded deferral note (the note retires with this wave); org page's
   edit/regenerate arms only if its brief staged them. Gates: goldens + a11y +
   the CRUD round-trip suite over the landed service.
+  **LANDED 2026-10-31** — the shared edit page at
+  `ui/pages/oauth2-app-edit.tsx` (the OAuth2CommonHandlers port: one
+  applications_oauth2_edit_form render in the three twins' chromes + the
+  owner-parameterized write arms), the user page's two sections + the
+  mounted `/user/settings/applications/oauth2[...]` subgroup, the org page's
+  Edit links + show/save/regenerate arms, the admin page's BuiltinApplications
+  lock arm + edit arms (OQ4 resolved: trivial over the shared service), and
+  the ui/index.ts wiring executed in-place (handlers + the parse-tree claims
+  `user-settings-oauth2-*` / `admin-application-app|regenerate` /
+  `org-settings-applications-app|regenerate` + registrations). Suites
+  own-eyes: user-settings-applications 41/41, org-settings-applications
+  38/38, admin-applications.matrix 13/13, W1 substrate 59/59 unregressed,
+  the apps API route suite 19/19 unregressed, the W3 authorize/consent
+  suites 35/35 + 91/91 unregressed, goldens + a11y batteries 188/188 after
+  the re-baseline (admin-applications.html + the knock-on
+  admin-monitor-stats.html Oauth-count 5→6 — see the fixture note — plus
+  the new admin-applications-edit.html case + its a11y EXPANSION_ARM);
+  tsc zero in the wave's files; scoped eslint clean. As-built discoveries,
+  each with its pin cite:
+  - **The WEB SAVE NEVER ROTATES THE CLIENT SECRET**
+    (models/auth/oauth2.go:321-352 — the model update overwrites
+    name/redirect_uris/flags and clears the in-memory secret; the
+    rotation-on-every-PATCH is the API contract,
+    routers/api/v1/user/app.go UpdateOauth2Application). The landed
+    `updateOAuth2Application` service folds the rotation in per the API
+    contract (its header), so the web EditSave arm carries its own
+    page-local UPDATE in oauth2-app-edit.tsx — folding the web arm into the
+    rotating service would kill every deployed integration's stored secret
+    on a plain rename. The regenerate arm persists ONLY the client_secret
+    column (`Cols("client_secret")`, oauth2.go:221) and carries NO builtin
+    lock (upstream's RegenerateSecret has none — a builtin's empty seeded
+    secret may be given a real value).
+  - **The builtin lock** (BuiltinApplications, oauth2.go:64-101 + the seed
+    migration's five client IDs): the admin list renders the Locked label
+    instead of the edit/delete controls (applications_oauth2_list.tmpl:18-21)
+    and edit/delete refuse builtins (:330-334, :391-396) with the landed
+    404-shell posture (upstream ServerErrors both — the family's documented
+    divergence; existence and lock indistinguishable). The user/org lists
+    render the lock arm never (their rows are uid-scoped non-zero; the
+    builtins are uid=0 — upstream doesn't pass BuiltinApplications on those
+    handlers either).
+  - **OQ2 resolved (org edit/regenerate arms LANDED)** — the landed org
+    brief's "edit shapes stay UNCLAIMED" note staged them for this wave
+    (upstream web.go:1025-1029 carries the full family on the org twin).
+    The org create answer upgraded to upstream's AddApp shape — the EDIT
+    page rendered with the once-only secret (oauth2_common.go:79-87); the
+    org/admin list re-renders that stood in retire (their headers'
+    "with no landed edit page" clause). The admin create answer is the same
+    shape (its Owner is nil → uid=0).
+  - **The binder texts unified to the locale composites** — the shared
+    validateOauth2ApplicationForm renders form.require_error
+    ("Name cannot be empty." / "RedirectURIs cannot be empty."),
+    form.max_size_error ("Name must contain at most 255 characters.") and
+    the DetectInvalid hook's exact `RedirectURIs: "<uri>" is not a valid
+    URL.` composite (user_form.go:248-273 over form.url_error); the org/admin
+    pages' generic "Invalid redirect URI." reduction retired.
+  - **The gate closes the landed unconditional-arm divergences** — the user
+    /oauth2 subgroup (web.go:682-689), the whole org applications group
+    (web.go:1030) and the whole admin applications group (web.go:896) now
+    answer web.go:373-378's 403 ("Forbidden\n" — the landed provider wrap's
+    bytes) when OAUTH2_ENABLED=false; the user applications PAGE itself
+    stays ungated (applications.tmpl:5 — the PAT panel renders, the two
+    OAuth2 sections hide, applications.go:189-203's conditional read).
+  - **The grants section is user-only** (grants_oauth2.tmpl is included only
+    from user/settings/applications.tmpl; upstream's RevokeGrant refuses the
+    org/admin owners outright, oauth2_common.go:204). The revoke handler
+    keys on the GRANT id alone (the {id} URL segment is the template's
+    data-url shape; :196-224), 404-shells missing/foreign grants, and 303s
+    onto the tab. NO empty-list arm on the section (the template renders the
+    description line unconditionally — the org/admin pages' "No applications
+    yet" line is their own store convention, not the grants template's).
+  - **Upstream's `{{if .application_name}}` details-open arm is DEAD at the
+    pin** — no handler sets the data key (the flash-redirect never carries
+    the form), so the kept-submission reopen is the house no-flash intent
+    port; the user page opens on the kept name/error, the org/admin keep
+    their landed error-or-empty arm.
+  - **The knock-on fixture find** — goldens.test.ts's census-R18 oauth2
+    fixture block was dead since migration 0052 (its presence guard saw the
+    five seeded builtins and skipped), so the admin-applications golden
+    carried ONLY builtin rows; W5 adds an independent-guarded non-builtin
+    uid=0 row (instance-ci, fixed clientId golden-ci-client) which the list
+    golden now exercises (Edit/Remove arms) and the new
+    admin-applications-edit.html golden pins (the masked-secret edit chrome;
+    no timestamps on the page — mintFor's real-clock PAT fixtures are why
+    the user-settings-applications surface pins in its module suite only).
+    The row shifts the admin-monitor-stats golden's Oauth count 5→6 (the
+    stats table counts the store — deterministic, re-baselined).
+  - **Navbar gates ride the landing review** — the org settings navbar item
+    (navbar.tmpl:15-19) and the admin Integrations group (admin
+    navbar.tmpl:50-77) are EnableOAuth2-gated upstream; the shared nav
+    components are outside this wave's file ownership, so the OrgSettingsNavbar/
+    AdminFamilyNav gate hunks are handed off (the pages' own section gates
+    + the route 403s are landed here).
 - **W6 — the battery + docs tail** (last). Owns: the deploy-probes OAuth2 battery
   arm (§5 live battery), the upstream-fixture sweep across all suites, the SPEC's
   as-built amendments, the SPEC-0002 §2.8 deferral-note retirement. Gates: full
@@ -897,10 +990,15 @@ shared hunks — W4 owns both; W1–W3/W5 never touch them.
    stateless arms should follow the same family.)
 2. **Org settings edit/regenerate arms** — landed org page carries create/delete
    only; confirm at W5 dispatch whether its brief staged the remaining arms (the
-   upstream org twin shares all handlers).
+   upstream org twin shares all handlers). (RESOLVED at W5, 2026-10-31: LANDED —
+   the landed brief's "edit shapes stay UNCLAIMED" note staged them; see §6 W5's
+   as-built.)
 3. **`iat` enforcement on refresh tokens** — upstream checks `iat` only in the API
    auth path (`services/auth/oauth2.go:53`), not in `ParseToken` at the refresh
    flow; port the asymmetry verbatim (no smoothing).
 4. **Admin global-applications write arms** — out of scope (§2.8) unless the W5
    wave finds them trivial over the shared service; keep the landed list-only
-   reduction recorded either way.
+   reduction recorded either way. (RESOLVED at W5, 2026-10-31: they ARE trivial —
+   the user/org twins' edit machinery IS the admin twin's with uid=0 — so the
+   full upstream family LANDED (create → edit-page-with-secret, the
+   BuiltinApplications lock arm, show/save/regenerate); see §6 W5's as-built.)

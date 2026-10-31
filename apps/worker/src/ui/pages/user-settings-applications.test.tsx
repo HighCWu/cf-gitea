@@ -23,7 +23,10 @@ import { eq } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { personalAccessTokens, users } from "../../db/schema";
+import { oauth2Applications, oauth2Grants, personalAccessTokens, users } from "../../db/schema";
+import { createOAuth2Application, verifyClientSecret } from "../../api/services/oauth2-apps";
+import { getOrCreateGrant } from "../../services/oauth2/grants";
+import { BUILTIN_OAUTH2_CLIENT_IDS, oauth2AppEditLocale } from "./oauth2-app-edit";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
@@ -76,8 +79,10 @@ async function seedUser(username: string, isAdmin: boolean): Promise<number> {
 
 async function resetTables(): Promise<void> {
   // "sessions" too: the mounted-route matrix below mints session rows (the
-  // users delete would cascade them, but the reset stays explicit).
-  for (const table of ["personal_access_tokens", "sessions", "users"]) {
+  // users delete would cascade them, but the reset stays explicit). The W5
+  // oauth2 pair rides the reset too (the builtin seed rows are wiped per
+  // test — the lock-arm test seeds its own builtin-clientId row).
+  for (const table of ["personal_access_tokens", "sessions", "users", "oauth2_grant", "oauth2_application"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
 }
@@ -540,5 +545,336 @@ describe("the mounted /user/settings/applications routes (window-2a over this mo
     expect(html).toContain("Public only"); // DisplayPublicOnly()
     expect(html).toContain("<li>read:user</li>");
     expect(html).not.toContain("<li>public-only</li>"); // access_tokens.tmpl's ne-filter
+  });
+});
+
+// =================================================================================
+// W5 (specs/oauth2-provider.md §6 W5): the applications.tmpl OAuth2 halves —
+// the grants section (grants_oauth2.tmpl), the applications_oauth2 section
+// (applications_oauth2*.tmpl) over the shared edit page
+// (pages/oauth2-app-edit.tsx — the OAuth2CommonHandlers port), the
+// secret-shown-once posture, and the /oauth2 subgroup's gate.
+// =================================================================================
+
+/** Seed one OAuth2 application owned by alice (the landed service). */
+async function seedApp(name: string, uid: number, overrides: { clientId?: string } = {}) {
+  const { row, secret } = await createOAuth2Application(
+    env.DB,
+    { uid, name, redirectUris: ["https://ci.example/cb"], confidentialClient: true, skipSecondaryAuthorization: false },
+    NOW,
+  );
+  if (overrides.clientId !== undefined) {
+    await drizzle(env.DB).update(oauth2Applications).set({ clientId: overrides.clientId }).where(eq(oauth2Applications.id, row.id));
+  }
+  return { ...row, clientId: overrides.clientId ?? row.clientId, secret };
+}
+
+describe("the loader's OAuth2 half (applications.go:189-203's conditional shape)", () => {
+  it("loads the uid-scoped apps + the joined grants when the gate is on", async () => {
+    const app = await seedApp("my app", aliceId);
+    const { grant } = await getOrCreateGrant(env.DB, { userId: aliceId, applicationId: app.id, scope: "openid read:user" }, NOW);
+    const data = await loadUserSettingsApplicationsPageData(env.DB, aliceId, false, NOW, true);
+    expect(data.oauth2Enabled).toBe(true);
+    expect(data.apps.map((row) => row.id)).toEqual([app.id]);
+    expect(data.grants).toHaveLength(1);
+    expect(data.grants[0]?.grant.id).toBe(grant.id);
+    expect(data.grants[0]?.application.name).toBe("my app");
+    expect(data.oauth2Error).toBeNull();
+    expect(data.oauth2Form).toEqual({ name: "", redirectUrisRaw: "", confidentialClient: true, skipSecondaryAuthorization: false });
+  });
+
+  it("skips the OAuth2 reads entirely when the gate is off (applications.tmpl:5)", async () => {
+    await seedApp("my app", aliceId);
+    await getOrCreateGrant(env.DB, { userId: aliceId, applicationId: (await seedApp("second", aliceId)).id, scope: "openid" }, NOW);
+    const data = await loadUserSettingsApplicationsPageData(env.DB, aliceId, false, NOW, false);
+    expect(data.oauth2Enabled).toBe(false);
+    expect(data.apps).toEqual([]);
+    expect(data.grants).toEqual([]);
+  });
+});
+
+describe("the render's OAuth2 sections (grants_oauth2.tmpl + applications_oauth2*.tmpl DOM)", () => {
+  it("renders the grants section rows with the revoke forms (NO empty-list arm — upstream-exact)", async () => {
+    const app = await seedApp("my app", aliceId);
+    const { grant } = await getOrCreateGrant(env.DB, { userId: aliceId, applicationId: app.id, scope: "openid read:user" }, NOW);
+    const data = await loadUserSettingsApplicationsPageData(env.DB, aliceId, false, NOW, true);
+    const html = renderUserSettingsApplicationsPage(ctx, data);
+    expect(html).toContain("Authorized OAuth2 Applications");
+    expect(html).toContain(userSettingsApplicationsLocale.authorized_oauth2_applications_description);
+    expect(html).toContain(`<div class="item-title">my app</div>`);
+    expect(html).toContain(`Added on ${formatTokenDate(grant.createdAt)}`);
+    expect(html).toContain(`action="/user/settings/applications/oauth2/${app.id}/revoke/${grant.id}"`);
+    expect(html).toContain(`>${userSettingsApplicationsLocale.revoke_key}</button>`);
+    expect(html).not.toContain("No applications yet"); // the grants template has no empty arm (nor does the app list)
+  });
+
+  it("renders the oauth2 application rows with Edit links + Remove forms and the create form", async () => {
+    const app = await seedApp("my app", aliceId);
+    const data = await loadUserSettingsApplicationsPageData(env.DB, aliceId, false, NOW, true);
+    const html = renderUserSettingsApplicationsPage(ctx, data);
+    expect(html).toContain("Manage OAuth2 Applications");
+    expect(html).toContain(`href="/user/settings/applications/oauth2/${app.id}"`); // the Edit link
+    expect(html).toContain("octicon-pencil");
+    expect(html).toContain(`action="/user/settings/applications/oauth2/${app.id}/delete"`);
+    expect(html).toContain(` ${userSettingsApplicationsLocale.remove}</button>`); // the trash icon precedes the label
+    expect(html).toContain(`<span class="ui label"> ${app.clientId}</span>`);
+    // The create form's field set (applications_oauth2_list.tmpl:53-77).
+    expect(html).toContain('action="/user/settings/applications/oauth2" method="post"');
+    expect(html).toContain('name="application_name"');
+    expect(html).toContain('name="redirect_uris"');
+    expect(html).toContain('name="confidential_client" checked');
+    expect(html).toContain('name="skip_secondary_authorization"');
+    // The create details stays CLOSED (a fresh GET carries no kept name).
+    expect(html).toContain("<details>"); // the PAT generate form... and the oauth2 create
+  });
+
+  it("hides BOTH sections when the gate is off; the PAT panel renders regardless", async () => {
+    await seedApp("my app", aliceId);
+    const data = await loadUserSettingsApplicationsPageData(env.DB, aliceId, false, NOW, false);
+    const html = renderUserSettingsApplicationsPage(ctx, data);
+    expect(html).toContain("Manage Access Tokens"); // the PAT panel (never gated)
+    expect(html).not.toContain("Authorized OAuth2 Applications");
+    expect(html).not.toContain("Manage OAuth2 Applications");
+    expect(html).not.toContain('action="/user/settings/applications/oauth2"');
+  });
+
+  it("re-renders a failed oauth2 create: the kept submission opens the details with the negative banner", async () => {
+    const data = await loadUserSettingsApplicationsPageData(env.DB, aliceId, false, NOW, true);
+    data.oauth2Form = { name: "kept", redirectUrisRaw: "not-a-uri", confidentialClient: false, skipSecondaryAuthorization: false };
+    const html = renderUserSettingsApplicationsPage(ctx, { ...data, oauth2Error: "RedirectURIs is bad" });
+    expect(html).toContain('class="ui negative message">RedirectURIs is bad');
+    expect(html).toContain('value="kept"');
+  });
+});
+
+// --- the mounted /user/settings/applications/oauth2[...] subgroup -----------------
+
+describe("the mounted /oauth2 subgroup (web.go:682-689 over the shared edit page)", () => {
+  /** A session cookie for the shared beforeEach-seeded alice (the mounted
+   *  routes describe's helper is describe-scoped, re-minted here). */
+  function aliceCookie(): Promise<string> {
+    return mintSession(env.DB, aliceId);
+  }
+
+  function getRoute(path: string, cookie: string): Promise<Response> | Response {
+    return uiRouter.fetch(
+      new Request(`https://test.local${path}`, { headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}` } }),
+      uiEnv,
+    );
+  }
+
+  function oauth2Get(path: string, cookie: string, overrides: Record<string, string> = {}): Promise<Response> | Response {
+    return uiRouter.fetch(
+      new Request(`https://test.local${path}`, { headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}` } }),
+      { ...uiEnv, ...overrides },
+    );
+  }
+
+  function oauth2Post(path: string, cookie: string, body: string, overrides: Record<string, string> = {}): Promise<Response> | Response {
+    return uiRouter.fetch(
+      new Request(`https://test.local${path}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          origin: "https://test.local",
+          cookie: `${SESSION_COOKIE_NAME}=${cookie}`,
+        },
+        body,
+      }),
+      { ...uiEnv, ...overrides },
+    );
+  }
+
+  it("create renders the shared EDIT page with the plaintext exactly once; the store keeps the hash and the reload masks it", async () => {
+    const cookie = await aliceCookie();
+    const created = await oauth2Post(
+      "/user/settings/applications/oauth2",
+      cookie,
+      new URLSearchParams({ application_name: "ci app", redirect_uris: "https://ci.example/cb", confidential_client: "on" }).toString(),
+    );
+    expect(created.status).toBe(200);
+    const html = await created.text();
+    const plaintext = /gto_[a-z2-7]{52}/.exec(html)?.[0] ?? "";
+    expect(plaintext).not.toBe("");
+    expect(html).toContain('id="client-secret" type="text" readonly'); // the shown-once arm
+    expect(html).toContain(`value="${plaintext}"`);
+    expect(html).toContain('class="page-content user settings applications"'); // the user chrome
+    expect(html).toContain('class="active item" href="/user/settings/applications"'); // the Applications tab active
+    const row = (await drizzle(env.DB).select().from(oauth2Applications).all())[0]!;
+    expect(row.uid).toBe(aliceId);
+    expect(await verifyClientSecret(row.clientSecret, plaintext)).toBe(true);
+    expect(JSON.stringify(row)).not.toContain(plaintext); // the store keeps the hash only
+
+    // The plain show: the masked placeholder replaces the plaintext.
+    const show = await oauth2Get(`/user/settings/applications/oauth2/${row.id}`, cookie);
+    expect(show.status).toBe(200);
+    const showHtml = await show.text();
+    expect(showHtml).toContain('id="client-secret" type="password" readonly');
+    expect(showHtml).toContain(oauth2AppEditLocale.masked_secret_placeholder);
+    expect(showHtml).not.toContain(plaintext);
+    expect(showHtml).toContain(`action="/user/settings/applications/oauth2/${row.id}/regenerate_secret"`);
+    // The follow-up list renders the Edit link + the client id.
+    const list = await getRoute("/user/settings/applications", cookie);
+    const listHtml = await (list).text();
+    expect(listHtml).toContain(`href="/user/settings/applications/oauth2/${row.id}"`);
+    expect(listHtml).not.toContain(plaintext); // the plaintext never re-renders
+  });
+
+  it("create answers the bind arms with the list re-render and writes nothing", async () => {
+    const cookie = await aliceCookie();
+    const res = await oauth2Post(
+      "/user/settings/applications/oauth2",
+      cookie,
+      new URLSearchParams({ application_name: "", redirect_uris: "https://ci.example/cb" }).toString(),
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="ui negative message">Name cannot be empty.');
+    expect(await drizzle(env.DB).select().from(oauth2Applications).all()).toHaveLength(0);
+    const badUri = await oauth2Post(
+      "/user/settings/applications/oauth2",
+      cookie,
+      new URLSearchParams({ application_name: "x", redirect_uris: "not-a-uri" }).toString(),
+    );
+    const badHtml = await (badUri).text();
+    expect(badHtml).toContain("RedirectURIs: &quot;not-a-uri&quot; is not a valid URL."); // the escaped composite
+    expect(await drizzle(env.DB).select().from(oauth2Applications).all()).toHaveLength(0);
+  });
+
+  it("save updates WITHOUT rotating the secret and 303s home; a bind error re-renders the edit page; a foreign uid 404-shells", async () => {
+    const cookie = await aliceCookie();
+    const app = await seedApp("ci app", aliceId);
+    const saved = await oauth2Post(
+      `/user/settings/applications/oauth2/${app.id}`,
+      cookie,
+      new URLSearchParams({ application_name: "renamed", redirect_uris: "https://new.example/cb", skip_secondary_authorization: "on" }).toString(),
+    );
+    expect(saved.status).toBe(303);
+    expect((saved).headers.get("location")).toBe("/user/settings/applications");
+    const row = (await drizzle(env.DB).select().from(oauth2Applications).all())[0]!;
+    expect(row.name).toBe("renamed");
+    expect(JSON.parse(row.redirectUris)).toEqual(["https://new.example/cb"]);
+    expect(row.skipSecondaryAuthorization).toBe(true);
+    // THE WEB SAVE NEVER ROTATES — the original plaintext still verifies.
+    expect(await verifyClientSecret(row.clientSecret, app.secret)).toBe(true);
+
+    // The bind-error arm: 200 + the negative line + the kept values, the
+    // masked secret (no leak on the error arm), nothing written.
+    const invalid = await oauth2Post(
+      `/user/settings/applications/oauth2/${app.id}`,
+      cookie,
+      new URLSearchParams({ application_name: "", redirect_uris: "https://ci.example/cb" }).toString(),
+    );
+    expect(invalid.status).toBe(200);
+    const invalidHtml = await (invalid).text();
+    expect(invalidHtml).toContain('class="ui negative message">Name cannot be empty.');
+    expect(invalidHtml).toContain('id="client-secret" type="password" readonly');
+    const untouched = (await drizzle(env.DB).select().from(oauth2Applications).all())[0]!;
+    expect(untouched.name).toBe("renamed");
+
+    // bob's session on alice's app: the EditShow UID check 404-shells.
+    const bobId = await seedUser("bob", false);
+    const bobCookie = await mintSession(env.DB, bobId);
+    const foreign = await oauth2Get(`/user/settings/applications/oauth2/${app.id}`, bobCookie);
+    expect(foreign.status).toBe(404);
+    const foreignSave = await oauth2Post(
+      `/user/settings/applications/oauth2/${app.id}`,
+      bobCookie,
+      new URLSearchParams({ application_name: "hijack", redirect_uris: "https://evil.example/cb" }).toString(),
+    );
+    expect(foreignSave.status).toBe(404);
+    expect(((await drizzle(env.DB).select().from(oauth2Applications).all())[0] as { name: string }).name).toBe("renamed");
+  });
+
+  it("regenerate_secret re-renders with a FRESH plaintext once; the old secret stops verifying", async () => {
+    const cookie = await aliceCookie();
+    const app = await seedApp("ci app", aliceId);
+    const res = await oauth2Post(`/user/settings/applications/oauth2/${app.id}/regenerate_secret`, cookie, "");
+    expect(res.status).toBe(200);
+    const html = await (res).text();
+    const fresh = /gto_[a-z2-7]{52}/.exec(html)?.[0] ?? "";
+    expect(fresh).not.toBe("");
+    expect(fresh).not.toBe(app.secret);
+    expect(html).toContain('id="client-secret" type="text" readonly');
+    const row = (await drizzle(env.DB).select().from(oauth2Applications).all())[0]!;
+    expect(await verifyClientSecret(row.clientSecret, fresh)).toBe(true);
+    expect(await verifyClientSecret(row.clientSecret, app.secret)).toBe(false);
+  });
+
+  it("delete 303s home; the builtin lock 404-shells and the row survives", async () => {
+    const cookie = await aliceCookie();
+    const app = await seedApp("doomed", aliceId);
+    const res = await oauth2Post(`/user/settings/applications/oauth2/${app.id}/delete`, cookie, "");
+    expect(res.status).toBe(303);
+    expect((res).headers.get("location")).toBe("/user/settings/applications");
+    expect(await drizzle(env.DB).select().from(oauth2Applications).all()).toHaveLength(0);
+
+    // A user-owned row carrying a builtin client id (a crafted collision):
+    // the lock refuses — the list never renders the controls for it, and
+    // the crafted POST takes the 404 shell (the landed divergence posture).
+    const locked = await seedApp("locked", aliceId, { clientId: BUILTIN_OAUTH2_CLIENT_IDS[0] });
+    const lockRes = await oauth2Post(`/user/settings/applications/oauth2/${locked.id}/delete`, cookie, "");
+    expect(lockRes.status).toBe(404);
+    expect(await drizzle(env.DB).select().from(oauth2Applications).all()).toHaveLength(1);
+  });
+
+  it("revoke 303s home and the grant dies; a foreign or missing grant 404-shells", async () => {
+    const cookie = await aliceCookie();
+    const app = await seedApp("granted app", aliceId);
+    const { grant } = await getOrCreateGrant(env.DB, { userId: aliceId, applicationId: app.id, scope: "openid" }, NOW);
+    const res = await oauth2Post(`/user/settings/applications/oauth2/${app.id}/revoke/${grant.id}`, cookie, "");
+    expect(res.status).toBe(303);
+    expect((res).headers.get("location")).toBe("/user/settings/applications");
+    expect(await drizzle(env.DB).select().from(oauth2Grants).all()).toHaveLength(0);
+
+    // A foreign grant (bob's) 404-shells; grants belong to individual users
+    // (oauth2_common.go:204).
+    const bobId = await seedUser("bob", false);
+    const bobApp = await seedApp("bob app", bobId);
+    const bobGrant = await getOrCreateGrant(env.DB, { userId: bobId, applicationId: bobApp.id, scope: "openid" }, NOW);
+    const foreign = await oauth2Post(`/user/settings/applications/oauth2/${bobApp.id}/revoke/${bobGrant.grant.id}`, cookie, "");
+    expect(foreign.status).toBe(404);
+    expect(await drizzle(env.DB).select().from(oauth2Grants).all()).toHaveLength(1);
+    // A missing grant 404-shells too.
+    const missing = await oauth2Post(`/user/settings/applications/oauth2/${app.id}/revoke/9999`, cookie, "");
+    expect(missing.status).toBe(404);
+  });
+
+  it("the gate: OAUTH2_ENABLED=false 403s every subgroup arm and hides the sections on the list page", async () => {
+    const cookie = await aliceCookie();
+    await seedApp("my app", aliceId);
+    for (const [method, path, body] of [
+      ["GET", "/user/settings/applications/oauth2/1", ""],
+      ["POST", "/user/settings/applications/oauth2", "application_name=x&redirect_uris=https://x.example/cb"],
+      ["POST", "/user/settings/applications/oauth2/1", "application_name=x&redirect_uris=https://x.example/cb"],
+      ["POST", "/user/settings/applications/oauth2/1/regenerate_secret", ""],
+      ["POST", "/user/settings/applications/oauth2/1/delete", ""],
+      ["POST", "/user/settings/applications/oauth2/1/revoke/1", ""],
+    ] as const) {
+      const res =
+        method === "GET" ? await oauth2Get(path, cookie, { OAUTH2_ENABLED: "false" }) : await oauth2Post(path, cookie, body, { OAUTH2_ENABLED: "false" });
+      expect(res.status).toBe(403);
+      expect(await (res).text()).toBe("Forbidden\n"); // web.go:373-378's body
+    }
+    // The list page still 200s (the PAT panel renders) with both sections
+    // hidden.
+    const list = await oauth2Get("/user/settings/applications", cookie, { OAUTH2_ENABLED: "false" });
+    expect(list.status).toBe(200);
+    const listHtml = await (list).text();
+    expect(listHtml).toContain("Manage Access Tokens");
+    expect(listHtml).not.toContain("Manage OAuth2 Applications");
+    expect(listHtml).not.toContain("Authorized OAuth2 Applications");
+  });
+
+  it("the POST-only tails answer GET with 405", async () => {
+    const cookie = await aliceCookie();
+    const create = await oauth2Get("/user/settings/applications/oauth2", cookie);
+    expect(create.status).toBe(405);
+    const regen = await oauth2Get("/user/settings/applications/oauth2/1/regenerate_secret", cookie);
+    expect(regen.status).toBe(405);
+    const del = await oauth2Get("/user/settings/applications/oauth2/1/delete", cookie);
+    expect(del.status).toBe(405);
+    const revoke = await oauth2Get("/user/settings/applications/oauth2/1/revoke/1", cookie);
+    expect(revoke.status).toBe(405);
   });
 });

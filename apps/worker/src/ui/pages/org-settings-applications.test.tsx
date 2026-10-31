@@ -47,6 +47,7 @@ import {
   renderOrgApplicationsPage,
   splitRedirectUris,
 } from "./org-settings-applications";
+import { oauth2AppEditLocale, oauth2AppEditPageData, renderOrgOauth2AppEditPage } from "./oauth2-app-edit";
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -174,10 +175,8 @@ describe("loadOrgSettingsApplications (the OwnerID read arm, uid=org.id)", () =>
     expect(data.apps).toEqual([]);
   });
 
-  it("the plain GET's render inputs: empty once-only secret pair, fresh form", async () => {
+  it("the plain GET's render inputs: fresh form (no secret state — the W5 create answer is the shared edit page)", async () => {
     const data = await loadOrgSettingsApplications(env.DB, org.record);
-    expect(data.newClientSecret).toBe("");
-    expect(data.newClientId).toBe("");
     expect(data.form).toEqual({ name: "", redirectUrisRaw: "", confidentialClient: true, skipSecondaryAuthorization: false });
   });
 });
@@ -243,39 +242,50 @@ describe("applyOrgApplicationCreate (AddApp's write half over the landed service
     expect(data.apps.map((app) => app.id)).toEqual([result.row.id]);
   });
 
-  it("a blank name — the Required bind arm", async () => {
+  it("a blank name — the Required bind arm (the shared binder's form.require_error)", async () => {
     const result = await applyOrgApplicationCreate(env.DB, org.record, {
       name: "",
       redirectUrisRaw: "https://ci.example/cb",
       confidentialClient: true,
       skipSecondaryAuthorization: false,
     });
-    expect(result).toEqual({ outcome: "invalid", message: orgSettingsApplicationsLocale.error_name_required });
+    expect(result).toEqual({ outcome: "invalid", message: "Name cannot be empty." });
   });
 
-  it("a rejected redirect URI — the DetectInvalid validate arm", async () => {
+  it("a rejected redirect URI — the DetectInvalid validate arm (the exact user_form.go:267-269 composite)", async () => {
     const result = await applyOrgApplicationCreate(env.DB, org.record, {
       name: "bad uris",
       redirectUrisRaw: "not-a-uri",
       confidentialClient: true,
       skipSecondaryAuthorization: false,
     });
-    expect(result).toEqual({ outcome: "invalid", message: orgSettingsApplicationsLocale.error_redirect_uri });
+    expect(result).toEqual({ outcome: "invalid", message: `RedirectURIs: "${"not-a-uri"}" is not a valid URL.` });
     expect((await loadOrgSettingsApplications(env.DB, org.record)).apps).toEqual([]); // nothing written
+  });
+
+  it("an empty textarea — the redirect_uris Required bind arm (nothing written)", async () => {
+    const result = await applyOrgApplicationCreate(env.DB, org.record, {
+      name: "no uris",
+      redirectUrisRaw: "",
+      confidentialClient: true,
+      skipSecondaryAuthorization: false,
+    });
+    expect(result).toEqual({ outcome: "invalid", message: "RedirectURIs cannot be empty." });
+    expect((await loadOrgSettingsApplications(env.DB, org.record)).apps).toEqual([]);
   });
 });
 
-describe("deleteOrgApplication (the (id, uid=org.id) delete)", () => {
+describe("deleteOrgApplication (the shared (id, uid=org.id) delete + the builtin lock)", () => {
   it("deletes the org's own app", async () => {
     const app = await seedApp("doomed", org.id);
-    expect(await deleteOrgApplication(env.DB, org.record, app.id)).toBe(true);
+    expect(await deleteOrgApplication(env.DB, org.record, app.id)).toEqual({ kind: "deleted" });
     expect((await loadOrgSettingsApplications(env.DB, org.record)).apps).toEqual([]);
   });
 
   it("a user-owned app is the miss arm (the (id, uid) pair never satisfies)", async () => {
     const aliceId = viewer.kind === "user" ? viewer.id : 0;
     const app = await seedApp("alice private app", aliceId);
-    expect(await deleteOrgApplication(env.DB, org.record, app.id)).toBe(false);
+    expect(await deleteOrgApplication(env.DB, org.record, app.id)).toEqual({ kind: "not_found" });
     const still = await drizzle(env.DB).select().from(oauth2Applications).where(eq(oauth2Applications.id, app.id)).all();
     expect(still).toHaveLength(1); // existence stays hidden, the row survives
   });
@@ -313,7 +323,7 @@ describe("the applications tab DOM (org/settings/applications.tmpl × applicatio
     expect(html).toContain(orgSettingsApplicationsLocale.redirect_uris);
   });
 
-  it("renders the rows: the glyph stand-in, the name, the Client ID label, the remove form — and NO Edit dead link", async () => {
+  it("renders the rows: the glyph stand-in, the name, the Client ID label, the W5 Edit link + the remove form", async () => {
     const app = await seedApp("row app", org.id);
     const data = await loadOrgSettingsApplications(env.DB, org.record);
     const html = renderToString(<OrgApplicationsPage ctx={ctx} data={data} error={null} />);
@@ -323,11 +333,12 @@ describe("the applications tab DOM (org/settings/applications.tmpl × applicatio
     expect(html).toContain(`action="/acme/settings/applications/oauth2/${app.id}/delete"`);
     expect(html).toContain(`name="id" value="${String(app.id)}"`);
     expect(html).toContain(orgSettingsApplicationsLocale.remove);
-    // The Edit anchor (applications_oauth2_list.tmpl:23-26) is OMITTED — no
-    // landed edit page (the module header); the remove form is an action=,
-    // never an href onto the edit shape.
-    expect(html).not.toContain('href="/acme/settings/applications/oauth2/');
-    expect(html).not.toContain("remove-gitea-oauth2-application"); // no confirm dialog
+    // The W5 Edit anchor (applications_oauth2_list.tmpl:23-26) rides the
+    // shared edit page (the module header's W5 record); the confirm dialog
+    // stays unreproduced.
+    expect(html).toContain(`href="/acme/settings/applications/oauth2/${app.id}"`);
+    expect(html).toContain("octicon-pencil");
+    expect(html).not.toContain("remove-gitea-oauth2-application");
   });
 
   it("renders the empty arm when the org owns no applications", async () => {
@@ -343,30 +354,34 @@ describe("the applications tab DOM (org/settings/applications.tmpl × applicatio
     const loaded = await loadOrgSettingsApplications(env.DB, org.record);
     expect(renderToString(<OrgApplicationsPage ctx={ctx} data={loaded} error={null} />)).toContain("<details>");
     expect(
-      renderToString(<OrgApplicationsPage ctx={ctx} data={loaded} error={orgSettingsApplicationsLocale.error_name_required} />),
+      renderToString(<OrgApplicationsPage ctx={ctx} data={loaded} error="Name cannot be empty." />),
     ).toContain("<details open");
     void app;
   });
 
-  it("the create re-render carries the once-only secret block", async () => {
-    const data = await loadOrgSettingsApplications(env.DB, org.record);
-    data.newClientSecret = "gto_plaintext-once";
-    data.newClientId = "11111111-2222-3333-4444-555555555555";
-    const html = renderToString(<OrgApplicationsPage ctx={ctx} data={data} error={null} />);
-    expect(html).toContain('class="ui positive message"');
-    expect(html).toContain(orgSettingsApplicationsLocale.create_success);
-    expect(html).toContain('id="new-oauth2-client-secret"');
-    expect(html).toContain("gto_plaintext-once");
-    expect(html).toContain(orgSettingsApplicationsLocale.client_secret_hint);
+  it("the W5 shared edit page renders in the ORG chrome: the masked arm on a plain show, the plaintext arm on a regenerate", async () => {
+    const app = await seedApp("edit me", org.id);
+    const showData = oauth2AppEditPageData(app, `/acme/settings/applications/oauth2/${app.id}`);
+    const showHtml = renderOrgOauth2AppEditPage(ctx, org.record, showData, true);
+    expect(showHtml).toContain("organization settings options"); // the org chrome quirk
+    expect(showHtml).toContain(`action="/acme/settings/applications/oauth2/${app.id}/regenerate_secret"`);
+    expect(showHtml).toContain('id="client-secret" type="password" readonly'); // the masked arm
+    expect(showHtml).toContain(oauth2AppEditLocale.masked_secret_placeholder);
+    const regenData = oauth2AppEditPageData(app, `/acme/settings/applications/oauth2/${app.id}`);
+    regenData.clientSecret = "gto_plaintext-once-value";
+    const regenHtml = renderOrgOauth2AppEditPage(ctx, org.record, regenData, true);
+    expect(regenHtml).toContain('id="client-secret" type="text" readonly'); // the shown-once arm
+    expect(regenHtml).toContain("gto_plaintext-once-value");
+    expect(regenHtml).not.toContain(oauth2AppEditLocale.masked_secret_placeholder);
   });
 
   it("the invalid-POST re-render carries the negative message banner", async () => {
     const data = await loadOrgSettingsApplications(env.DB, org.record);
-    const html = renderToString(
-      <OrgApplicationsPage ctx={ctx} data={data} error={orgSettingsApplicationsLocale.error_redirect_uri} />,
-    );
+    const html = renderToString(<OrgApplicationsPage ctx={ctx} data={data} error={`RedirectURIs: "${"not-a-uri"}" is not a valid URL.`} />);
     expect(html).toContain('class="ui negative message"');
-    expect(html).toContain(orgSettingsApplicationsLocale.error_redirect_uri);
+    // The banner text is HTML-escaped in the DOM (hono/jsx) — the quotes
+    // render as &quot;.
+    expect(html).toContain("RedirectURIs: &quot;not-a-uri&quot; is not a valid URL.");
   });
 
   it("the shared navbar renders the Applications item active between Labels and Blocked users", () => {
@@ -394,10 +409,11 @@ const routeEnv: RouteEnv = {
 /** The real production path: parse → resolveUiSession → the org-teams
  *  prologue → load → render, on the mounted uiRouter with the synthetic
  *  manifest; the execution context is awaited so waitUntil side-effects
- *  settle before assertions. */
-async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
+ *  settle before assertions. `envOverrides` re-spells wrangler vars (the W5
+ *  gate arms). */
+async function fetchUi(path: string, init?: RequestInit, envOverrides: Record<string, string> = {}): Promise<Response> {
   const context = createExecutionContext();
-  const response = await uiRouter.fetch(new Request(`https://test.local${path}`, init), routeEnv, context);
+  const response = await uiRouter.fetch(new Request(`https://test.local${path}`, init), { ...routeEnv, ...envOverrides }, context);
   await waitOnExecutionContext(context);
   return response;
 }
@@ -430,17 +446,22 @@ async function createPost(
   fields: Record<string, string>,
   session: string | null = "owner",
   origin: string = ORIGIN,
+  envOverrides: Record<string, string> = {},
 ): Promise<Response> {
   const cookie = session === "owner" ? await ownerSessionHeader() : session;
-  return fetchUi(`/${org.username}/settings/applications/oauth2`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/x-www-form-urlencoded",
-      ...(origin !== "" ? { origin } : {}),
-      ...(cookie !== null ? { cookie } : {}),
+  return fetchUi(
+    `/${org.username}/settings/applications/oauth2`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        ...(origin !== "" ? { origin } : {}),
+        ...(cookie !== null ? { cookie } : {}),
+      },
+      body: new URLSearchParams(fields).toString(),
     },
-    body: new URLSearchParams(fields).toString(),
-  });
+    envOverrides,
+  );
 }
 
 /** A delete POST through the real route (same-origin by default). */
@@ -532,31 +553,46 @@ describe("the mounted routes (the R20-a arm through the org-teams prologue)", ()
     expect(html).toContain(orgSettingsApplicationsLocale.no_apps); // the empty arm
   });
 
-  it("a create POST re-renders at 200 with the once-only secret, the row lands, and the follow-up GET lists it", async () => {
+  it("a create POST renders the shared EDIT page with the once-only secret, the row lands, and the follow-up GET masks it", async () => {
     const res = await createPost({
       application_name: "ci badge",
       redirect_uris: "https://ci.example/cb",
       confidential_client: "on",
     });
-    // Upstream renders the (unlanded) edit page on success; the no-JS
-    // reduction answers 200 with the full list carrying the once-only
-    // secret (the module header) — NOT a redirect.
+    // Upstream AddApp answers by rendering the edit page with the plaintext
+    // secret (oauth2_common.go:79-87) — the W5 shared edit page serves
+    // exactly that in the org chrome; NOT a redirect, NOT the list.
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain('id="new-oauth2-client-secret"');
-    expect(html).toContain(orgSettingsApplicationsLocale.create_success);
+    const plaintext = /gto_[a-z2-7]{52}/.exec(html)?.[0] ?? "";
+    expect(plaintext).not.toBe("");
+    expect(html).toContain('id="client-secret" type="text" readonly'); // the shown-once arm
+    expect(html).toContain(`value="${plaintext}"`);
+    expect(html).toContain("organization settings options"); // the org chrome
+    expect(html).toMatch(/action="\/acme\/settings\/applications\/oauth2\/\d+"/); // the FormActionPath
     const data = await loadOrgSettingsApplications(env.DB, org.record);
     expect(data.apps).toHaveLength(1);
     expect(data.apps[0]?.uid).toBe(org.id);
+    expect(JSON.stringify(data.apps)).not.toContain(plaintext); // the store keeps the hash only
+
+    // The follow-up GET lists the app; the plaintext never re-renders.
     const clientId = data.apps[0]?.clientId ?? "";
     const page = await applicationsGet();
     expect(page.status).toBe(200);
     const pageHtml = await page.text();
-    expect(pageHtml).toContain(`<span class="ui label"> ${clientId}</span>`); // the follow-up list shows the app
-    expect(pageHtml).not.toContain("new-oauth2-client-secret"); // the plaintext renders exactly once
+    expect(pageHtml).toContain(`<span class="ui label"> ${clientId}</span>`);
+    expect(pageHtml).not.toContain(plaintext);
+    // The plain show re-renders the MASKED placeholder instead.
+    const show = await fetchUi(`/${org.username}/settings/applications/oauth2/${data.apps[0]?.id}`, {
+      headers: { cookie: await ownerSessionHeader() },
+    });
+    expect(show.status).toBe(200);
+    const showHtml = await show.text();
+    expect(showHtml).toContain('id="client-secret" type="password" readonly');
+    expect(showHtml).not.toContain(plaintext);
   });
 
-  it("an invalid create POST re-renders at 200 with the banner and the kept submission, nothing written", async () => {
+  it("an invalid create POST re-renders the list at 200 with the banner and the kept submission, nothing written", async () => {
     const res = await createPost({
       application_name: "bad uris app",
       redirect_uris: "not-a-uri",
@@ -564,10 +600,100 @@ describe("the mounted routes (the R20-a arm through the org-teams prologue)", ()
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('class="ui negative message"');
-    expect(html).toContain(orgSettingsApplicationsLocale.error_redirect_uri);
+    expect(html).toContain("RedirectURIs: &quot;not-a-uri&quot; is not a valid URL."); // the escaped banner
     expect(html).toContain('value="bad uris app"'); // the kept name
     expect(html).toContain("not-a-uri"); // the kept textarea
     expect((await loadOrgSettingsApplications(env.DB, org.record)).apps).toEqual([]);
+  });
+
+  it("the W5 edit arms: save updates WITHOUT rotating the secret and 303s home; a bind error re-renders the edit page with the kept values", async () => {
+    const created = await applyOrgApplicationCreate(env.DB, org.record, {
+      name: "ci badge",
+      redirectUrisRaw: "https://ci.example/cb",
+      confidentialClient: true,
+      skipSecondaryAuthorization: false,
+    });
+    if (created.outcome !== "created") throw new Error("seed create failed");
+    const firstSecret = created.secret;
+
+    const saved = await fetchUi(`/${org.username}/settings/applications/oauth2/${created.row.id}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: ORIGIN,
+        cookie: await ownerSessionHeader(),
+      },
+      body: new URLSearchParams({ application_name: "renamed", redirect_uris: "https://new.example/cb" }).toString(),
+    });
+    expect(saved.status).toBe(303);
+    expect(saved.headers.get("location")).toBe(`/${org.username}/settings/applications`);
+    const row = await drizzle(env.DB).select().from(oauth2Applications).where(eq(oauth2Applications.id, created.row.id)).get();
+    expect(row?.name).toBe("renamed");
+    expect(JSON.parse(row?.redirectUris ?? "[]")).toEqual(["https://new.example/cb"]);
+    // THE WEB SAVE NEVER ROTATES — the original plaintext still verifies.
+    expect(await verifyClientSecret(row?.clientSecret ?? "", firstSecret)).toBe(true);
+
+    // A bind error re-renders the edit page (200) with the negative line +
+    // the kept submission.
+    const invalid = await fetchUi(`/${org.username}/settings/applications/oauth2/${created.row.id}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: ORIGIN,
+        cookie: await ownerSessionHeader(),
+      },
+      body: new URLSearchParams({ application_name: "", redirect_uris: "https://ci.example/cb" }).toString(),
+    });
+    expect(invalid.status).toBe(200);
+    const invalidHtml = await invalid.text();
+    expect(invalidHtml).toContain('class="ui negative message">Name cannot be empty.');
+    expect(invalidHtml).toContain('id="client-secret" type="password" readonly'); // no secret leak on the error arm
+    const untouched = await drizzle(env.DB).select().from(oauth2Applications).where(eq(oauth2Applications.id, created.row.id)).get();
+    expect(untouched?.name).toBe("renamed"); // nothing written
+  });
+
+  it("the W5 regenerate arm re-renders the edit page with a FRESH plaintext once; the old secret stops verifying", async () => {
+    const created = await applyOrgApplicationCreate(env.DB, org.record, {
+      name: "ci badge",
+      redirectUrisRaw: "https://ci.example/cb",
+      confidentialClient: true,
+      skipSecondaryAuthorization: false,
+    });
+    if (created.outcome !== "created") throw new Error("seed create failed");
+    const regen = await fetchUi(`/${org.username}/settings/applications/oauth2/${created.row.id}/regenerate_secret`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: ORIGIN,
+        cookie: await ownerSessionHeader(),
+      },
+      body: "",
+    });
+    expect(regen.status).toBe(200);
+    const html = await regen.text();
+    const fresh = /gto_[a-z2-7]{52}/.exec(html)?.[0] ?? "";
+    expect(fresh).not.toBe("");
+    expect(fresh).not.toBe(created.secret);
+    expect(html).toContain('id="client-secret" type="text" readonly');
+    const row = await drizzle(env.DB).select().from(oauth2Applications).where(eq(oauth2Applications.id, created.row.id)).get();
+    expect(await verifyClientSecret(row?.clientSecret ?? "", fresh)).toBe(true);
+    expect(await verifyClientSecret(row?.clientSecret ?? "", created.secret)).toBe(false);
+  });
+
+  it("the W5 gate: OAUTH2_ENABLED=false answers the group's 403 on the list and every write arm", async () => {
+    const gatedList = await fetchUi(`/${org.username}/settings/applications`, {
+      headers: { cookie: await ownerSessionHeader() },
+    }, { OAUTH2_ENABLED: "false" });
+    expect(gatedList.status).toBe(403);
+    expect(await gatedList.text()).toBe("Forbidden\n"); // web.go:373-378's body
+    const gatedCreate = await createPost(
+      { application_name: "x", redirect_uris: "https://ci.example/cb" },
+      "owner",
+      ORIGIN,
+      { OAUTH2_ENABLED: "false" },
+    );
+    expect(gatedCreate.status).toBe(403);
+    expect(await gatedCreate.text()).toBe("Forbidden\n");
   });
 
   it("a delete POST 303s back onto the tab and the row is gone", async () => {
@@ -620,8 +746,8 @@ describe("the mounted routes (the R20-a arm through the org-teams prologue)", ()
 
 // --- the route claim pin (parse ↔ registration — the blocked-matrix pin) -----------
 
-describe("the route claim pin (the settings family claims exactly the applications arm)", () => {
-  it("parses the three shapes; misspellings and the edit shapes stay unclaimed", () => {
+describe("the route claim pin (the settings family claims exactly the applications family)", () => {
+  it("parses the five shapes; misspellings and junk ids stay unclaimed", () => {
     expect(parseUiRoute(`/${org.username}/settings/applications`)).toEqual({
       family: "org-settings-applications",
       owner: org.username,
@@ -635,18 +761,27 @@ describe("the route claim pin (the settings family claims exactly the applicatio
       owner: org.username,
       id: 7,
     });
+    // The W5 edit arms: the {id} combo (GET show + POST save) + the
+    // regenerate tail.
+    expect(parseUiRoute(`/${org.username}/settings/applications/oauth2/7`)).toEqual({
+      family: "org-settings-applications-app",
+      owner: org.username,
+      id: 7,
+    });
+    expect(parseUiRoute(`/${org.username}/settings/applications/oauth2/7/regenerate_secret`)).toEqual({
+      family: "org-settings-applications-regenerate",
+      owner: org.username,
+      id: 7,
+    });
     expect(handlesUiRoute(`/${org.username}/settings/applications`)).toBe(true);
+    expect(handlesUiRoute(`/${org.username}/settings/applications/oauth2/7`)).toBe(true);
     // The singular misspelling and deeper tails.
     expect(parseUiRoute(`/${org.username}/settings/application`)).toBeNull();
     expect(parseUiRoute(`/${org.username}/settings/applications/extra`)).toBeNull();
     expect(handlesUiRoute(`/${org.username}/settings/applications/extra`)).toBe(false);
-    // The show/edit combo + regenerate_secret shapes stay unclaimed (no
-    // landed edit page — the module header): the engine's 404, upstream's
-    // unregistered-route answer.
-    expect(parseUiRoute(`/${org.username}/settings/applications/oauth2/7`)).toBeNull();
-    expect(parseUiRoute(`/${org.username}/settings/applications/oauth2/7/regenerate_secret`)).toBeNull();
-    expect(handlesUiRoute(`/${org.username}/settings/applications/oauth2/7`)).toBe(false);
-    // A junk delete id never claims (the hooks-family integer parity).
+    // A junk id never claims (the hooks-family integer parity).
     expect(parseUiRoute(`/${org.username}/settings/applications/oauth2/xx/delete`)).toBeNull();
+    expect(parseUiRoute(`/${org.username}/settings/applications/oauth2/xx`)).toBeNull();
+    expect(parseUiRoute(`/${org.username}/settings/applications/oauth2/7/unknown`)).toBeNull();
   });
 });

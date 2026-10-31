@@ -1005,6 +1005,23 @@ import {
   parseOrgApplicationCreateForm,
   renderOrgApplicationsPage,
 } from "./pages/org-settings-applications";
+// The W5 OAuth2 halves: the SHARED edit page (the OAuth2CommonHandlers port
+// — pages/oauth2-app-edit.tsx) serving the user/org/admin twins' show/save/
+// regenerate arms, and the grants store for the user page's revoke.
+import {
+  createOauth2ApplicationFromForm,
+  deleteOauth2ApplicationFromForm,
+  oauth2AppEditPageData,
+  oauth2SettingsForbidden,
+  parseOauth2AppEditForm,
+  regenerateOauth2ApplicationSecret,
+  saveOauth2ApplicationFromForm,
+  showOauth2Application,
+  renderAdminOauth2AppEditPage,
+  renderOrgOauth2AppEditPage,
+  renderUserOauth2AppEditPage,
+} from "./pages/oauth2-app-edit";
+import { getGrantByID, revokeGrant } from "../services/oauth2/grants";
 // The census R13 arm: the settings audit log pages (ONE shared module —
 // upstream routers/web/shared/audit — with the repo and the org mounts; the
 // scope pairs key the M4 instrumentation's encodings).
@@ -1030,8 +1047,11 @@ import {
   renderUserSettingsAppearancePage,
 } from "./pages/user-settings-appearance";
 import {
+  applyAccountLinkUnlink,
   loadUserSettingsSecurityPageData,
+  parseAccountLinkUnlinkForm,
   renderUserSettingsSecurityPage,
+  userSettingsSecurityLocale,
 } from "./pages/user-settings-security";
 import {
   applyUserSettingsSecretForm,
@@ -1111,6 +1131,7 @@ import {
   renderUserSettingsApplicationsPage,
   revokeTokenFromForm,
 } from "./pages/user-settings-applications";
+import { oauth2FeatureEnabled } from "../services/oauth2/token";
 import {
   applyUserSettingsAccountDeleteForm,
   applyUserSettingsAccountEmailForm,
@@ -3138,6 +3159,11 @@ export interface AdminRoute {
     | "admin-applications"
     | "admin-application-create"
     | "admin-application-delete"
+    // The W5 edit arms (web.go:891-895's combo + regenerate tail — the
+    // shared edit page's family; the app COMBO shape serves GET show + POST
+    // save like upstream's chi combo).
+    | "admin-application-app"
+    | "admin-application-regenerate"
     | "admin-config"
     | "admin-notices"
     | "admin-notices-delete"
@@ -3226,6 +3252,16 @@ export interface UserSettingsTabRoute {
     | "user-settings-keys-delete"
     | "user-settings-applications"
     | "user-settings-applications-delete"
+    // The W5 /oauth2 subgroup (web.go:682-689 — the shared edit page's
+    // family; the app COMBO shape serves GET show + POST save like
+    // upstream's chi combo, and the revoke family's `id` carries the
+    // GRANT id — the {id} URL segment is the template's data-url shape
+    // only, the handler keys on the grant, oauth2_common.go:196-207).
+    | "user-settings-oauth2-create"
+    | "user-settings-oauth2-app"
+    | "user-settings-oauth2-regenerate"
+    | "user-settings-oauth2-delete"
+    | "user-settings-oauth2-revoke"
     | "user-settings-account"
     | "user-settings-account-email"
     | "user-settings-account-email-delete"
@@ -3308,6 +3344,8 @@ export interface OrgSettingsRoute {
     | "org-settings-applications" // GET /{org}/settings/applications (the R20-a oauth2 list)
     | "org-settings-applications-create" // POST /{org}/settings/applications/oauth2 (the R20-a create)
     | "org-settings-applications-delete" // POST /{org}/settings/applications/oauth2/{id}/delete (the R20-a delete)
+    | "org-settings-applications-app" // GET show + POST save on /{org}/settings/applications/oauth2/{id} (the W5 combo — web.go:1025)
+    | "org-settings-applications-regenerate" // POST /{org}/settings/applications/oauth2/{id}/regenerate_secret (the W5 tail — web.go:1027)
     | "org-settings-audit-logs" // GET /{org}/settings/audit_logs (the R20 +audit arm / R13 org mount — GET only upstream, web.go:1069)
     | "org-actions-secrets" // GET+POST /{org}/settings/actions/secrets (window-2b)
     | "org-actions-secrets-delete" // POST .../secrets/delete (window-2b)
@@ -3702,6 +3740,33 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (tail.length === 2 && tail[0] === "applications" && tail[1] === "delete") {
       return { family: "user-settings-applications-delete", id: null };
     }
+    // The W5 /oauth2 subgroup (web.go:682-689's exact route set over the
+    // shared edit page — the app COMBO shape claims GET show + POST save;
+    // the revoke family's id carries the GRANT id, the {id} segment is the
+    // template's data-url shape only). Positive integers only (the
+    // uiRouter registrations' :id{\d+} posture).
+    if (tail.length === 2 && tail[0] === "applications" && tail[1] === "oauth2") {
+      return { family: "user-settings-oauth2-create", id: null };
+    }
+    if (tail.length === 3 && tail[0] === "applications" && tail[1] === "oauth2" && /^\d+$/.test(tail[2] as string)) {
+      return { family: "user-settings-oauth2-app", id: Number.parseInt(tail[2] as string, 10) };
+    }
+    if (tail.length === 4 && tail[0] === "applications" && tail[1] === "oauth2" && /^\d+$/.test(tail[2] as string) && tail[3] === "regenerate_secret") {
+      return { family: "user-settings-oauth2-regenerate", id: Number.parseInt(tail[2] as string, 10) };
+    }
+    if (tail.length === 4 && tail[0] === "applications" && tail[1] === "oauth2" && /^\d+$/.test(tail[2] as string) && tail[3] === "delete") {
+      return { family: "user-settings-oauth2-delete", id: Number.parseInt(tail[2] as string, 10) };
+    }
+    if (
+      tail.length === 5 &&
+      tail[0] === "applications" &&
+      tail[1] === "oauth2" &&
+      /^\d+$/.test(tail[2] as string) &&
+      tail[3] === "revoke" &&
+      /^\d+$/.test(tail[4] as string)
+    ) {
+      return { family: "user-settings-oauth2-revoke", id: Number.parseInt(tail[4] as string, 10) };
+    }
     // The account tab (navbar.tmpl:7-11; upstream EmailPost/DeleteEmail/
     // DeleteAccount over the landed email + PAT stores).
     if (tail.length === 1 && tail[0] === "account") return { family: "user-settings-account", id: null };
@@ -3858,10 +3923,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (tail.length === 5 && tail[3] === "users" && tail[4] === "delete") return { family: "admin-badge-users-delete", badgeSlug };
     }
     // The R18 applications arm (web.go:865-872's /applications group): the
-    // list GET, the create POST, the positive-integer delete POST. The
-    // /oauth2/{id} edit combo + regenerate_secret stay unclaimed (unlanded
-    // — the module's dead-link note; the engine's 404, upstream's own
-    // unregistered-route answer for the same shapes minus these two).
+    // list GET, the create POST, the positive-integer delete POST — plus
+    // the W5 /oauth2/{id} edit combo + regenerate_secret (the shared edit
+    // page's family, the module header's W5 record).
     if (tail.length === 1 && tail[0] === "applications") return { family: "admin-applications" };
     if (tail.length === 2 && tail[0] === "applications" && tail[1] === "oauth2") return { family: "admin-application-create" };
     if (
@@ -3872,6 +3936,21 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       tail[3] === "delete"
     ) {
       return { family: "admin-application-delete", applicationId: Number.parseInt(tail[2] as string, 10) };
+    }
+    // The W5 edit arms (web.go:891-895's combo + regenerate tail — the
+    // shared edit page's family; the app COMBO shape claims GET show + POST
+    // save like upstream's chi combo).
+    if (tail.length === 3 && tail[0] === "applications" && tail[1] === "oauth2" && /^\d+$/.test(tail[2] as string)) {
+      return { family: "admin-application-app", applicationId: Number.parseInt(tail[2] as string, 10) };
+    }
+    if (
+      tail.length === 4 &&
+      tail[0] === "applications" &&
+      tail[1] === "oauth2" &&
+      /^\d+$/.test(tail[2] as string) &&
+      tail[3] === "regenerate_secret"
+    ) {
+      return { family: "admin-application-regenerate", applicationId: Number.parseInt(tail[2] as string, 10) };
     }
     // The SPEC-0018 §3.2 config arm (web.go:788-794's /config group): the
     // read-only summary GET beside the notices arm. Upstream's ChangeConfig
@@ -4290,11 +4369,20 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (raw.length === 6 && raw[3] === "hooks" && /^-?\d+$/.test(raw[4] as string) && raw[5] === "delete") {
       return { family: "org-settings-hook-delete", owner, id: Number.parseInt(raw[4] as string, 10) };
     }
+    // The W5 edit arms (the module header's W5 record — web.go:1025-1029's
+    // family): the {id} COMBO shape (GET show / POST save — one parse shape,
+    // two methods exactly like upstream's m.Combo) and the regenerate tail,
+    // claimed AHEAD of the delete tail (chi's static-first dispatch: the
+    // literal `delete` outranks the combo in upstream's tree too).
+    if (raw.length === 6 && raw[3] === "applications" && raw[4] === "oauth2" && /^-?\d+$/.test(raw[5] as string)) {
+      return { family: "org-settings-applications-app", owner, id: Number.parseInt(raw[5] as string, 10) };
+    }
+    if (raw.length === 7 && raw[3] === "applications" && raw[4] === "oauth2" && /^-?\d+$/.test(raw[5] as string) && raw[6] === "regenerate_secret") {
+      return { family: "org-settings-applications-regenerate", owner, id: Number.parseInt(raw[5] as string, 10) };
+    }
     // The R20-a delete tail (the landed arm-scoped convention — upstream's
     // shared list-template `data-url` target; the integer-id claim is the
-    // hooks-family PathParamInt64 parity). The /oauth2/{id} SHOW/EDIT and
-    // regenerate_secret shapes stay UNCLAIMED → the engine's 404 (no landed
-    // edit page — the module header's reduction).
+    // hooks-family PathParamInt64 parity).
     if (raw.length === 7 && raw[3] === "applications" && raw[4] === "oauth2" && /^-?\d+$/.test(raw[5] as string) && raw[6] === "delete") {
       return { family: "org-settings-applications-delete", owner, id: Number.parseInt(raw[5] as string, 10) };
     }
@@ -9451,7 +9539,10 @@ async function userSettingsKeysDelete(c: Context<{ Bindings: Env }>): Promise<Re
 async function userSettingsApplicationsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const p = await userSettingsTabPrologue(c, false);
   if (!p.ok) return p.response;
-  const data = await loadUserSettingsApplicationsPageData(c.env.DB, p.viewer.id, p.viewer.isAdmin);
+  // applications.tmpl:5's .EnableOAuth2 — the W5 sections gate on the landed
+  // OAUTH2_ENABLED read (the loader skips the OAuth2 reads when off,
+  // applications.go:189-203's conditional shape).
+  const data = await loadUserSettingsApplicationsPageData(c.env.DB, p.viewer.id, p.viewer.isAdmin, new Date(), oauth2FeatureEnabled(c.env));
   return p.respond(c.html(renderUserSettingsApplicationsPage(p.ctx, data)));
 }
 
@@ -9478,6 +9569,131 @@ async function userSettingsApplicationsDelete(c: Context<{ Bindings: Env }>): Pr
   if (!p.ok) return p.response;
   const form = parseUserSettingsApplicationsDeleteForm(await readUrlEncodedForm(c.req.raw));
   await revokeTokenFromForm(c.env.DB, p.viewer.id, form.id ?? 0);
+  return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/applications" } }));
+}
+
+// --- W5 (specs/oauth2-provider.md §6 W5): the /oauth2 subgroup
+// (web.go:682-689's user settings group half — ALL of it inside the group's
+// `oauth2Enabled` wrap; the handlers call the shared
+// pages/oauth2-app-edit.tsx OAuth2CommonHandlers port) -----------------------
+
+/** The subgroup's gate (web.go:689's oauth2Enabled → ctx.HTTPError(403)). */
+function userSettingsOauth2Gate(c: Context<{ Bindings: Env }>): Response | null {
+  return oauth2FeatureEnabled(c.env) ? null : oauth2SettingsForbidden();
+}
+
+const USER_OAUTH2_EDIT_PREFIX = "/user/settings/applications/oauth2";
+
+/** POST /user/settings/applications/oauth2 (web.go:686 → AddApp,
+ *  oauth2_common.go:56-88): the binder (the shared validateOauth2Application
+ *  Form), then the create; the created arm renders the EDIT PAGE with the
+ *  once-only plaintext secret (:79-87 — the upstream answer shape); the
+ *  bind-error arm re-renders the LIST page with the negative line + the kept
+ *  submission (upstream flashes + redirects to the list — the no-flash
+ *  posture the family documents). */
+async function userSettingsOauth2Create(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const gate = userSettingsOauth2Gate(c);
+  if (gate !== null) return gate;
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const form = parseOauth2AppEditForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await createOauth2ApplicationFromForm(c.env.DB, p.viewer.id, form);
+  if (outcome.kind === "created") {
+    const data = oauth2AppEditPageData(outcome.row, `${USER_OAUTH2_EDIT_PREFIX}/${outcome.row.id}`);
+    data.clientSecret = outcome.secret;
+    return p.respond(c.html(renderUserOauth2AppEditPage(p.ctx, data)));
+  }
+  const data = await loadUserSettingsApplicationsPageData(c.env.DB, p.viewer.id, p.viewer.isAdmin, new Date(), true);
+  data.oauth2Form = form;
+  data.oauth2Error = outcome.message;
+  return p.respond(c.html(renderUserSettingsApplicationsPage(p.ctx, data)));
+}
+
+/** GET /user/settings/applications/oauth2/{id} (web.go:683 → EditShow,
+ *  oauth2_common.go:91-106): load + owner check; the miss 404-shells. The
+ *  secret renders BLANK (the masked placeholder field). */
+async function userSettingsOauth2Show(c: Context<{ Bindings: Env }>, id: number): Promise<Response> {
+  const gate = userSettingsOauth2Gate(c);
+  if (gate !== null) return gate;
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const shown = await showOauth2Application(c.env.DB, p.viewer.id, id);
+  if (shown.kind === "not_found") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderUserOauth2AppEditPage(p.ctx, oauth2AppEditPageData(shown.app, `${USER_OAUTH2_EDIT_PREFIX}/${id}`))));
+}
+
+/** POST /user/settings/applications/oauth2/{id} (web.go:684 → EditSave,
+ *  oauth2_common.go:109-147): the binder, then the WEB update — NO client
+ *  secret rotation (the web contract; the shared module's header) — and the
+ *  303 home. The bind-error arm re-renders the edit page with the negative
+ *  line + the kept submission (upstream's HasError arm reloads and renders
+ *  the page, :112-127); miss/lock 404-shell (the landed divergence — the
+ *  shared module's header). */
+async function userSettingsOauth2Save(c: Context<{ Bindings: Env }>, id: number): Promise<Response> {
+  const gate = userSettingsOauth2Gate(c);
+  if (gate !== null) return gate;
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const form = parseOauth2AppEditForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await saveOauth2ApplicationFromForm(c.env.DB, p.viewer.id, id, form);
+  if (outcome.kind === "saved") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/applications" } }));
+  }
+  if (outcome.kind === "invalid") {
+    const shown = await showOauth2Application(c.env.DB, p.viewer.id, id);
+    if (shown.kind === "not_found") return p.respond(c.html(renderNotFound(p.ctx), 404));
+    const data = oauth2AppEditPageData(shown.app, `${USER_OAUTH2_EDIT_PREFIX}/${id}`, outcome.message);
+    data.form = form;
+    return p.respond(c.html(renderUserOauth2AppEditPage(p.ctx, data)));
+  }
+  return p.respond(c.html(renderNotFound(p.ctx), 404));
+}
+
+/** POST /user/settings/applications/oauth2/{id}/regenerate_secret (web.go:685
+ *  → RegenerateSecret, oauth2_common.go:150-174): the shared port; the ok
+ *  arm re-renders the edit page with the fresh plaintext (shown once), the
+ *  miss 404-shells. */
+async function userSettingsOauth2Regenerate(c: Context<{ Bindings: Env }>, id: number): Promise<Response> {
+  const gate = userSettingsOauth2Gate(c);
+  if (gate !== null) return gate;
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const outcome = await regenerateOauth2ApplicationSecret(c.env.DB, p.viewer.id, id);
+  if (outcome.kind === "not_found") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  const data = oauth2AppEditPageData(outcome.app, `${USER_OAUTH2_EDIT_PREFIX}/${id}`);
+  data.clientSecret = outcome.secret;
+  return p.respond(c.html(renderUserOauth2AppEditPage(p.ctx, data)));
+}
+
+/** POST /user/settings/applications/oauth2/{id}/delete (web.go:687 →
+ *  DeleteApp, oauth2_common.go:177-193): the shared delete; the hit 303s
+ *  home (upstream JSONRedirect's target); miss/lock 404-shell. */
+async function userSettingsOauth2Delete(c: Context<{ Bindings: Env }>, id: number): Promise<Response> {
+  const gate = userSettingsOauth2Gate(c);
+  if (gate !== null) return gate;
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const outcome = await deleteOauth2ApplicationFromForm(c.env.DB, p.viewer.id, id);
+  if (outcome.kind === "deleted") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/applications" } }));
+  }
+  return p.respond(c.html(renderNotFound(p.ctx), 404));
+}
+
+/** POST /user/settings/applications/oauth2/{id}/revoke/{grantId} (web.go:688
+ *  → RevokeGrant, oauth2_common.go:196-224): the grant must exist AND belong
+ *  to the doer (grants belong to individual users — the org/admin twins
+ *  refuse by construction, :204); the {id} URL segment is the template's
+ *  data-url shape only (the handler keys on the grant alone). Success 303s
+ *  onto the applications tab (upstream's JSONRedirect target). */
+async function userSettingsOauth2Revoke(c: Context<{ Bindings: Env }>, grantId: number): Promise<Response> {
+  const gate = userSettingsOauth2Gate(c);
+  if (gate !== null) return gate;
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const grant = await getGrantByID(c.env.DB, grantId);
+  if (grant === null || grant.userId !== p.viewer.id) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  await revokeGrant(c.env.DB, grant.id, p.viewer.id);
   return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/applications" } }));
 }
 
@@ -10715,6 +10931,10 @@ async function orgApplicationsPage(c: Context<{ Bindings: Env }>): Promise<Respo
   if (!resolved.ok) return resolved.response;
   const { ctx, respond } = resolved;
   if (resolved.route.family !== "org-settings-applications") return respond(await c.notFound()); // drift guard
+  // The group's W5 gate (web.go:1030's oauth2Enabled — the whole org
+  // applications group 403s while the provider is disabled; the landed
+  // "the arm always serves" divergence retires with the W4 seam).
+  if (!oauth2FeatureEnabled(c.env)) return respond(oauth2SettingsForbidden());
   const data = await loadOrgSettingsApplications(c.env.DB, resolved.org);
   return respond(c.html(renderOrgApplicationsPage({ ctx, data, error: null }), 200));
 }
@@ -10722,13 +10942,14 @@ async function orgApplicationsPage(c: Context<{ Bindings: Env }>): Promise<Respo
 /**
  * POST /{org}/settings/applications/oauth2 — the create (upstream
  * OAuthApplicationsPost → AddApp's write half, oauth2_common.go:56-88): the
- * §2.8 guard, the shared prologue, the drift guard, then the form write.
- * Upstream answers success by rendering the EDIT page with the once-only
- * secret; with no landed edit page the honest no-JS analog is the FULL LIST
- * re-rendered at 200 carrying the once-only secret (the admin applications
- * page's exact reduction — the module header). An invalid form re-renders
- * at 200 with the banner + the kept submission (the org-team-new
- * RenderWithErr arm; upstream flashes and redirects to the list).
+ * §2.8 guard, the shared prologue, the drift guard, the W5 gate (web.go:1030
+ * — the group's oauth2Enabled wrap), then the form write. Upstream answers
+ * success by rendering the EDIT page with the once-only secret
+ * (oauth2_common.go:79-87) — the W5 shared edit page serves exactly that
+ * (the former list re-render reduction retired, the org module header's W5
+ * record). An invalid form re-renders the list at 200 with the banner + the
+ * kept submission (the org-team-new RenderWithErr arm; upstream flashes and
+ * redirects to the list).
  */
 async function orgApplicationsCreateSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
   const guard = sameOriginGuard(c.req.raw);
@@ -10737,13 +10958,13 @@ async function orgApplicationsCreateSubmit(c: Context<{ Bindings: Env }>): Promi
   if (!resolved.ok) return resolved.response;
   const { ctx, org, respond } = resolved;
   if (resolved.route.family !== "org-settings-applications-create") return respond(await c.notFound()); // drift guard
+  if (!oauth2FeatureEnabled(c.env)) return respond(oauth2SettingsForbidden());
   const form = parseOrgApplicationCreateForm(await readUrlEncodedForm(c.req.raw));
   const result = await applyOrgApplicationCreate(c.env.DB, org, form);
   if (result.outcome === "created") {
-    const data = await loadOrgSettingsApplications(c.env.DB, org);
-    data.newClientSecret = result.secret;
-    data.newClientId = result.row.clientId;
-    return respond(c.html(renderOrgApplicationsPage({ ctx, data, error: null }), 200));
+    const data = oauth2AppEditPageData(result.row, `/${org.username}/settings/applications/oauth2/${result.row.id}`);
+    data.clientSecret = result.secret;
+    return respond(c.html(renderOrgOauth2AppEditPage(ctx, org, data, ctx.viewer.kind === "user")));
   }
   const data = await loadOrgSettingsApplications(c.env.DB, org);
   data.form = form;
@@ -10753,11 +10974,12 @@ async function orgApplicationsCreateSubmit(c: Context<{ Bindings: Env }>): Promi
 /**
  * POST /{org}/settings/applications/oauth2/{id}/delete — the delete
  * (upstream DeleteApp's write half, oauth2_common.go:177-193, over the
- * landed (id, uid=org.id) delete): success 303s onto the list (upstream
- * JSONRedirect's target); a miss 404-shells (the org hooks-page delete
- * convention and the admin page's identical posture — upstream
- * ServerErrors a miss instead, the module header's documented divergence;
- * existence stays hidden either way).
+ * shared (id, uid=org.id) delete + the builtin lock): the hit 303s onto the
+ * list (upstream JSONRedirect's target); a miss/lock 404-shells (the org
+ * hooks-page delete convention and the admin page's identical posture —
+ * upstream ServerErrors both instead, the module header's documented
+ * divergence; existence stays hidden either way). The W5 gate rides first
+ * (web.go:1030).
  */
 async function orgApplicationsDeleteSubmit(c: Context<{ Bindings: Env }>, id: number): Promise<Response> {
   const guard = sameOriginGuard(c.req.raw);
@@ -10766,9 +10988,76 @@ async function orgApplicationsDeleteSubmit(c: Context<{ Bindings: Env }>, id: nu
   if (!resolved.ok) return resolved.response;
   const { ctx, org, respond } = resolved;
   if (resolved.route.family !== "org-settings-applications-delete") return respond(await c.notFound()); // drift guard
-  const deleted = await deleteOrgApplication(c.env.DB, org, id);
-  if (!deleted) return respond(c.html(renderNotFound(ctx), 404));
+  if (!oauth2FeatureEnabled(c.env)) return respond(oauth2SettingsForbidden());
+  const outcome = await deleteOrgApplication(c.env.DB, org, id);
+  if (outcome.kind !== "deleted") return respond(c.html(renderNotFound(ctx), 404));
   return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/applications` } }));
+}
+
+// --- W5: the org edit arms (web.go:1025-1029's combo + regenerate tail,
+// setting_oauth2.go:66-93 — the shared OAuth2CommonHandlers over
+// uid=org.id; the claims ride the org parse tree's applications family) -----
+
+/** GET /{org}/settings/applications/oauth2/{id} (org.OAuth2ApplicationShow →
+ *  EditShow): load + owner check, the shared edit page in the org chrome;
+ *  miss 404-shells. */
+async function orgApplicationsShow(c: Context<{ Bindings: Env }>, id: number): Promise<Response> {
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-settings-applications-app") return respond(await c.notFound()); // drift guard
+  if (!oauth2FeatureEnabled(c.env)) return respond(oauth2SettingsForbidden());
+  const shown = await showOauth2Application(c.env.DB, org.id, id);
+  if (shown.kind === "not_found") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(
+    c.html(renderOrgOauth2AppEditPage(ctx, org, oauth2AppEditPageData(shown.app, `/${org.username}/settings/applications/oauth2/${id}`), ctx.viewer.kind === "user"), 200),
+  );
+}
+
+/** POST /{org}/settings/applications/oauth2/{id} (org.OAuth2ApplicationEdit →
+ *  EditSave): the binder, the WEB update (NO secret rotation — the shared
+ *  module's header), the 303 home; the bind-error arm re-renders the edit
+ *  page with the negative line + the kept submission; miss/lock 404-shell. */
+async function orgApplicationsSave(c: Context<{ Bindings: Env }>, id: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-settings-applications-app") return respond(await c.notFound()); // drift guard
+  if (!oauth2FeatureEnabled(c.env)) return respond(oauth2SettingsForbidden());
+  const form = parseOauth2AppEditForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await saveOauth2ApplicationFromForm(c.env.DB, org.id, id, form);
+  if (outcome.kind === "saved") {
+    return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/applications` } }));
+  }
+  if (outcome.kind === "invalid") {
+    const shown = await showOauth2Application(c.env.DB, org.id, id);
+    if (shown.kind === "not_found") return respond(c.html(renderNotFound(ctx), 404));
+    const data = oauth2AppEditPageData(shown.app, `/${org.username}/settings/applications/oauth2/${id}`, outcome.message);
+    data.form = form;
+    return respond(c.html(renderOrgOauth2AppEditPage(ctx, org, data, ctx.viewer.kind === "user")));
+  }
+  return respond(c.html(renderNotFound(ctx), 404));
+}
+
+/** POST /{org}/settings/applications/oauth2/{id}/regenerate_secret
+ *  (org.OAuthApplicationsRegenerateSecret → RegenerateSecret): the shared
+ *  port; the ok arm re-renders the edit page with the fresh plaintext (shown
+ *  once), the miss 404-shells. */
+async function orgApplicationsRegenerate(c: Context<{ Bindings: Env }>, id: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, respond } = resolved;
+  if (resolved.route.family !== "org-settings-applications-regenerate") return respond(await c.notFound()); // drift guard
+  if (!oauth2FeatureEnabled(c.env)) return respond(oauth2SettingsForbidden());
+  const outcome = await regenerateOauth2ApplicationSecret(c.env.DB, org.id, id);
+  if (outcome.kind === "not_found") return respond(c.html(renderNotFound(ctx), 404));
+  const data = oauth2AppEditPageData(outcome.app, `/${org.username}/settings/applications/oauth2/${id}`);
+  data.clientSecret = outcome.secret;
+  return respond(c.html(renderOrgOauth2AppEditPage(ctx, org, data, ctx.viewer.kind === "user")));
 }
 
 /**
@@ -11200,43 +11489,114 @@ async function adminBadgeUsersDelete(c: Context<{ Bindings: Env }>, badgeSlug: s
 }
 
 /** GET /-/admin/applications (pages/admin-applications.tsx): the prologue →
- *  the uid=0 instance-wide list. */
+ *  the uid=0 instance-wide list, behind the group's W5 gate (web.go:896's
+ *  oauth2Enabled wrap). */
 async function adminApplicationsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
+  if (!oauth2FeatureEnabled(c.env)) return p.respond(oauth2SettingsForbidden());
   const data = await loadAdminApplicationsData(c.env.DB);
   return p.respond(c.html(renderAdminApplicationsPage(p.ctx, data)));
 }
 
 /**
- * POST /-/admin/applications/oauth2 (upstream ApplicationsPost → AddApp):
- * the §2.8 guard + the prologue, the textarea form (redirect URIs
- * one-per-line), then the landed create — the invalid arms re-render the
- * full page with the error + the submitted values, the created arm
- * re-renders with the once-only secret (the module's reduction notes).
+ * POST /-/admin/applications/oauth2 (upstream ApplicationsPost → AddApp,
+ *  oauth2_common.go:56-88): the §2.8 guard + the prologue + the W5 gate,
+ *  then the shared create — the created arm renders the EDIT PAGE with the
+ *  once-only secret (the upstream answer shape; the list re-render reduction
+ *  retired, the admin module header's W5 record), the invalid arms re-render
+ *  the list with the error + the submitted values.
  */
 async function adminApplicationCreate(c: Context<{ Bindings: Env }>): Promise<Response> {
   const guard = sameOriginGuard(c.req.raw);
   if (guard !== null) return guard;
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
+  if (!oauth2FeatureEnabled(c.env)) return p.respond(oauth2SettingsForbidden());
   const form = parseAdminApplicationCreateForm(await readUrlEncodedForm(c.req.raw));
   const outcome = await applyAdminApplicationCreate(c.env.DB, form);
-  return p.respond(c.html(renderAdminApplicationsPage(p.ctx, outcome.data)));
+  if (outcome.kind === "created") {
+    const data = oauth2AppEditPageData(outcome.row, `/-/admin/applications/oauth2/${outcome.row.id}`);
+    data.clientSecret = outcome.secret;
+    return p.respond(c.html(renderAdminOauth2AppEditPage(p.ctx, data)));
+  }
+  const data = await loadAdminApplicationsData(c.env.DB);
+  data.form = form;
+  data.error = outcome.message;
+  return p.respond(c.html(renderAdminApplicationsPage(p.ctx, data)));
 }
 
 /** POST /-/admin/applications/oauth2/{id}/delete (upstream DeleteApp): the
- *  (id, uid=0) delete — the miss 404-shells (upstream NotFound on the same
- *  arm), the hit 303s back onto the list. */
+ *  shared (id, uid=0) delete + the builtin lock — miss/lock 404-shell (the
+ *  landed divergence posture), the hit 303s back onto the list. */
 async function adminApplicationDelete(c: Context<{ Bindings: Env }>, applicationId: number): Promise<Response> {
   const guard = sameOriginGuard(c.req.raw);
   if (guard !== null) return guard;
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
-  if (!(await applyAdminApplicationDelete(c.env.DB, applicationId))) {
+  if (!oauth2FeatureEnabled(c.env)) return p.respond(oauth2SettingsForbidden());
+  const outcome = await applyAdminApplicationDelete(c.env.DB, applicationId);
+  if (outcome.kind !== "deleted") {
     return p.respond(c.html(renderNotFound(p.ctx), 404));
   }
   return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/applications" } }));
+}
+
+// --- W5: the admin edit arms (web.go:891-895's combo + regenerate tail —
+// the shared OAuth2CommonHandlers with Owner nil, uid=0) ---------------------
+
+/** GET /-/admin/applications/oauth2/{id} (admin.EditApplication → EditShow):
+ *  load + owner check over uid=0, the shared edit page in the admin chrome;
+ *  miss 404-shells. */
+async function adminApplicationShow(c: Context<{ Bindings: Env }>, id: number): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  if (!oauth2FeatureEnabled(c.env)) return p.respond(oauth2SettingsForbidden());
+  const shown = await showOauth2Application(c.env.DB, 0, id);
+  if (shown.kind === "not_found") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderAdminOauth2AppEditPage(p.ctx, oauth2AppEditPageData(shown.app, `/-/admin/applications/oauth2/${id}`))));
+}
+
+/** POST /-/admin/applications/oauth2/{id} (admin.EditApplicationPost →
+ *  EditSave): the binder, the WEB update (NO secret rotation — the shared
+ *  module's header), the 303 home; the bind-error arm re-renders the edit
+ *  page with the negative line + the kept submission; miss/lock 404-shell. */
+async function adminApplicationSave(c: Context<{ Bindings: Env }>, id: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  if (!oauth2FeatureEnabled(c.env)) return p.respond(oauth2SettingsForbidden());
+  const form = parseOauth2AppEditForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await saveOauth2ApplicationFromForm(c.env.DB, 0, id, form);
+  if (outcome.kind === "saved") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/applications" } }));
+  }
+  if (outcome.kind === "invalid") {
+    const shown = await showOauth2Application(c.env.DB, 0, id);
+    if (shown.kind === "not_found") return p.respond(c.html(renderNotFound(p.ctx), 404));
+    const data = oauth2AppEditPageData(shown.app, `/-/admin/applications/oauth2/${id}`, outcome.message);
+    data.form = form;
+    return p.respond(c.html(renderAdminOauth2AppEditPage(p.ctx, data)));
+  }
+  return p.respond(c.html(renderNotFound(p.ctx), 404));
+}
+
+/** POST /-/admin/applications/oauth2/{id}/regenerate_secret
+ *  (admin.ApplicationsRegenerateSecret → RegenerateSecret): the shared
+ *  port; the ok arm re-renders the edit page with the fresh plaintext (shown
+ *  once), the miss 404-shells. */
+async function adminApplicationRegenerate(c: Context<{ Bindings: Env }>, id: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  if (!oauth2FeatureEnabled(c.env)) return p.respond(oauth2SettingsForbidden());
+  const outcome = await regenerateOauth2ApplicationSecret(c.env.DB, 0, id);
+  if (outcome.kind === "not_found") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  const data = oauth2AppEditPageData(outcome.app, `/-/admin/applications/oauth2/${id}`);
+  data.clientSecret = outcome.secret;
+  return p.respond(c.html(renderAdminOauth2AppEditPage(p.ctx, data)));
 }
 
 // --- the SPEC-0018 §3.1 notices arm (pages/admin-notices.tsx — upstream's
@@ -15096,6 +15456,28 @@ uiRouter.get("/user/settings/appearance", (c) => userSettingsAppearancePage(c));
 uiRouter.post("/user/settings/appearance/theme", (c) => userSettingsAppearanceSubmit(c, "theme"));
 uiRouter.post("/user/settings/appearance/language", (c) => userSettingsAppearanceSubmit(c, "language"));
 uiRouter.get("/user/settings/security", (c) => userSettingsSecurityPage(c));
+// The account-link unlink POST (SPEC external-auth-sources.md W5's handoff;
+// upstream security.go:50-70 + RemoveAccountLink external_login_user.go:
+// 107-118 — NO last-link guard at the pin, test-pinned): the plain-form
+// reduction flashes via a 200 re-render notice, 303s the success.
+uiRouter.get("/user/settings/security/account_link", () => methodNotAllowed("POST"));
+uiRouter.post("/user/settings/security/account_link", async (c) => {
+  const p = await userSettingsTabPrologue(c, true); // the origin guard rides the POST
+  if (!p.ok) return p.response;
+  const form = parseAccountLinkUnlinkForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = form.id === null
+    ? { outcome: "not-exist" as const }
+    : await applyAccountLinkUnlink(c.env.DB, p.viewer.id, form.id);
+  if (outcome.outcome === "removed") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/security" } }));
+  }
+  // security.go:55-57's id arm and the store's not-exist both render the
+  // missing-link notice (the union carries no invalid-id arm).
+  const data = await loadUserSettingsSecurityPageData(c.env.DB, p.viewer.id);
+  return p.respond(c.html(renderUserSettingsSecurityPage(p.ctx, data, {
+    notice: { kind: "negative", message: userSettingsSecurityLocale.unlink_missing },
+  })), 200);
+});
 uiRouter.get("/user/settings/actions/secrets", (c) => userSettingsSecretsPage(c));
 uiRouter.post("/user/settings/actions/secrets", (c) => userSettingsSecretsSubmit(c));
 uiRouter.post("/user/settings/actions/secrets/delete", (c) => userSettingsSecretsDelete(c));
@@ -15148,6 +15530,23 @@ uiRouter.post("/user/settings/keys/delete", (c) => userSettingsKeysDelete(c));
 uiRouter.get("/user/settings/applications", (c) => userSettingsApplicationsPage(c));
 uiRouter.post("/user/settings/applications", (c) => userSettingsApplicationsSubmit(c));
 uiRouter.post("/user/settings/applications/delete", (c) => userSettingsApplicationsDelete(c));
+// The W5 /oauth2 subgroup (web.go:682-689's exact route set — upstream
+// orders GET/{id} → POST/{id} → regenerate_secret → POST "" → delete →
+// revoke/{grantId}, all inside the oauth2Enabled gate the handlers carry).
+uiRouter.get("/user/settings/applications/oauth2/:id{\\d+}", (c) => userSettingsOauth2Show(c, Number.parseInt(c.req.param("id"), 10)));
+uiRouter.post("/user/settings/applications/oauth2/:id{\\d+}", (c) => userSettingsOauth2Save(c, Number.parseInt(c.req.param("id"), 10)));
+uiRouter.post("/user/settings/applications/oauth2/:id{\\d+}/regenerate_secret", (c) =>
+  userSettingsOauth2Regenerate(c, Number.parseInt(c.req.param("id"), 10)),
+);
+uiRouter.get("/user/settings/applications/oauth2/:id{\\d+}/regenerate_secret", () => methodNotAllowed("POST"));
+uiRouter.post("/user/settings/applications/oauth2", (c) => userSettingsOauth2Create(c));
+uiRouter.get("/user/settings/applications/oauth2", () => methodNotAllowed("POST"));
+uiRouter.post("/user/settings/applications/oauth2/:id{\\d+}/delete", (c) => userSettingsOauth2Delete(c, Number.parseInt(c.req.param("id"), 10)));
+uiRouter.get("/user/settings/applications/oauth2/:id{\\d+}/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/user/settings/applications/oauth2/:id{\\d+}/revoke/:grantId{\\d+}", (c) =>
+  userSettingsOauth2Revoke(c, Number.parseInt(c.req.param("grantId"), 10)),
+);
+uiRouter.get("/user/settings/applications/oauth2/:id{\\d+}/revoke/:grantId{\\d+}", () => methodNotAllowed("POST"));
 // The account tab (navbar.tmpl:7-11 — the GET page + the three POST arms).
 uiRouter.get("/user/settings/account", (c) => userSettingsAccountPage(c));
 uiRouter.post("/user/settings/account/email", (c) => userSettingsAccountEmailSubmit(c));
@@ -15290,6 +15689,15 @@ uiRouter.get("/:owner/settings/actions/scoped-workflows/remove", () => methodNot
 uiRouter.get("/:owner/settings/applications", (c) => orgApplicationsPage(c));
 uiRouter.post("/:owner/settings/applications/oauth2", (c) => orgApplicationsCreateSubmit(c));
 uiRouter.get("/:owner/settings/applications/oauth2", () => methodNotAllowed("POST"));
+// The W5 edit arms (web.go:1025-1029's combo + regenerate tail — the {id}
+// GET/POST pair and the regenerate write; GET 405s mirror the family's
+// POST-only-tail convention).
+uiRouter.get("/:owner/settings/applications/oauth2/:id{\\d+}", (c) => orgApplicationsShow(c, Number.parseInt(c.req.param("id"), 10)));
+uiRouter.post("/:owner/settings/applications/oauth2/:id{\\d+}", (c) => orgApplicationsSave(c, Number.parseInt(c.req.param("id"), 10)));
+uiRouter.post("/:owner/settings/applications/oauth2/:id{\\d+}/regenerate_secret", (c) =>
+  orgApplicationsRegenerate(c, Number.parseInt(c.req.param("id"), 10)),
+);
+uiRouter.get("/:owner/settings/applications/oauth2/:id{\\d+}/regenerate_secret", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/settings/applications/oauth2/:id/delete", (c) => orgApplicationsDeleteSubmit(c, Number(c.req.param("id"))));
 uiRouter.get("/:owner/settings/applications/oauth2/:id/delete", () => methodNotAllowed("POST"));
 // The R20 +audit_logs arm / census R13 org mount (parseUiRoute claims
@@ -15335,6 +15743,15 @@ uiRouter.post("/-/admin/badges/slug/:slug/users/delete", (c) => adminBadgeUsersD
 uiRouter.get("/-/admin/applications", (c) => adminApplicationsPage(c));
 uiRouter.post("/-/admin/applications/oauth2", (c) => adminApplicationCreate(c));
 uiRouter.post("/-/admin/applications/oauth2/:id{\\d+}/delete", (c) => adminApplicationDelete(c, Number.parseInt(c.req.param("id"), 10)));
+// The W5 edit arms (web.go:891-895's combo + regenerate tail — the {id}
+// GET/POST pair and the regenerate write, all inside the group's gate the
+// handlers carry).
+uiRouter.get("/-/admin/applications/oauth2/:id{\\d+}", (c) => adminApplicationShow(c, Number.parseInt(c.req.param("id"), 10)));
+uiRouter.post("/-/admin/applications/oauth2/:id{\\d+}", (c) => adminApplicationSave(c, Number.parseInt(c.req.param("id"), 10)));
+uiRouter.post("/-/admin/applications/oauth2/:id{\\d+}/regenerate_secret", (c) =>
+  adminApplicationRegenerate(c, Number.parseInt(c.req.param("id"), 10)),
+);
+uiRouter.get("/-/admin/applications/oauth2/:id{\\d+}/regenerate_secret", () => methodNotAllowed("POST"));
 // The SPEC-0018 §3.1 notices arm (parseUiRoute claims exactly these shapes —
 // the same static literals; the writes are POST-only).
 uiRouter.get("/-/admin/notices", (c) => adminNoticesPage(c));

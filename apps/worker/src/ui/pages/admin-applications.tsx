@@ -86,14 +86,60 @@
  *
  * All claims sit in the landed admin literal family block (static literals;
  * the `{id}` is the positive-integer param — the landed DELETE arm's
- * PathParamInt64 posture). The unlanded `/oauth2/{id}` GET/POST edit shapes
- * stay unclaimed → the engine's 404, exactly upstream's unregistered-route
- * answer. The family navbar gains the Integrations group with the
- * Applications item (upstream navbar.tmpl order: Applications BEFORE
- * Webhooks).
+ * PathParamInt64 posture). The family navbar gains the Integrations group
+ * with the Applications item (upstream navbar.tmpl order: Applications
+ * BEFORE Webhooks).
+ *
+ * ## W5 (2026-10-31) — the full upstream family (specs/oauth2-provider.md
+ * §6 W5's OQ4 resolution: the write arms ARE trivial over the shared
+ * service — the user/org twins' edit machinery IS the admin twin's, owner
+ * uid=0)
+ *
+ * Upstream's admin group carries the complete write set (web.go:888-897):
+ * `POST /oauth2` (AddApp), the `/oauth2/{id}` COMBO (GET EditApplication /
+ * POST EditApplicationPost), `POST /{id}/regenerate_secret`
+ * (ApplicationsRegenerateSecret), `POST /{id}/delete` (DeleteApplication) —
+ * all through the SAME OAuth2CommonHandlers with Owner nil, and the list
+ * carries `ctx.Data["BuiltinApplications"]` (applications.go:44) so the
+ * five pre-registered applications render the Locked label instead of the
+ * edit/delete controls (applications_oauth2_list.tmpl:18-21). W5 lands:
+ *
+ *   - The BuiltinApplications lock arm (pages/oauth2-app-edit.tsx's
+ *     isBuiltinOauth2Application — the migration 0052 seed's five client
+ *     IDs): builtin rows render `<span class="ui basic label"
+ *     data-tooltip-content="{settings.oauth2_application_locked}">Locked</span>`;
+ *     the write arms refuse them (upstream's model lock errors → ServerError;
+ *     the shell answers the landed 404-shell posture — the divergence note
+ *     above, existence and lock indistinguishable).
+ *   - The Edit link on non-builtin rows → the shared edit page (the admin
+ *     variant chrome, pages/oauth2-app-edit.tsx).
+ *   - The create answer upgrades to upstream's AddApp shape — the EDIT PAGE
+ *     rendered with the once-only plaintext secret (oauth2_common.go:79-87);
+ *     the list re-render that stood in ("with no landed edit page", above)
+ *     retires and the once-only secret block leaves this list page.
+ *   - The create/write arms go through the shared module's form+binder
+ *     (validateOauth2ApplicationForm — adding the Required redirect_uris
+ *     bind arm and the exact `RedirectURIs: "<uri>" is not a valid URL.`
+ *     composite the generic reductions approximated).
+ *   - The regenerate arm rides the shared RegenerateSecret port (no builtin
+ *     lock there — upstream parity, the shared module's header).
+ *
+ * The route claims for the new shapes ride the W5 handoff (ui/index.ts),
+ * inside the landed group's `oauth2Enabled` gate (web.go:896 — the group
+ * wrap answers 403 when OAUTH2_ENABLED=false; the landed unconditional
+ * posture retires with the W4 seam).
  */
 
-import { createOAuth2Application, deleteOAuth2Application, detectInvalidOAuth2ApplicationRedirectURI, listOAuth2Applications, toApiOAuth2Application, type OAuth2AppRow } from "../../api/services/oauth2-apps";
+import { listOAuth2Applications, toApiOAuth2Application, type OAuth2AppRow } from "../../api/services/oauth2-apps";
+import {
+  createOauth2ApplicationFromForm,
+  deleteOauth2ApplicationFromForm,
+  isBuiltinOauth2Application,
+  oauth2AppEditLocale,
+  parseOauth2AppEditForm,
+  splitRedirectUris as splitRedirectUrisShared,
+  type OAuth2AppEditForm,
+} from "./oauth2-app-edit";
 import type { UiContext } from "../ui-context";
 import { AdminEmbeddedSvg, AdminFamilyShell } from "./admin-users";
 import { renderPage } from "../shell";
@@ -112,17 +158,18 @@ export const adminApplicationsLocale = {
   remove_confirm: "Removing an OAuth2 application will prevent it from accessing authorized user accounts on this instance. Continue?", // "settings.oauth2_application_remove_description" (the remove button's aria — the confirm-dialog reduction)
   create_oauth2_application: "Create a new OAuth2 Application", // "settings.create_oauth2_application" (the details summary)
   create_oauth2_application_button: "Create Application", // "settings.create_oauth2_application_button"
-  create_success: "You have successfully created a new OAuth2 application.", // "settings.create_oauth2_application_success"
   application_name: "Application Name", // "settings.oauth2_application_name"
   redirect_uris: "Redirect URIs. Please use a new line for every URI.", // "settings.oauth2_redirect_uris" (strong stripped)
   confidential_client:
     "Confidential Client. Select for apps that keep the secret confidential, such as web apps. Do not select for native apps, including desktop and mobile apps.", // "settings.oauth2_confidential_client"
   skip_secondary_authorization:
     "Skip authorization for public clients after granting access once. May pose a security risk.", // "settings.oauth2_skip_secondary_authorization" (strong stripped)
-  client_secret_hint: "The secret will not be shown again after you leave or refresh this page. Please ensure that you have saved it.", // "settings.oauth2_client_secret_hint"
-  error_name_required: "Name cannot be empty.", // the required-name bind arm (forms' Required binding → the re-render error)
-  error_redirect_uri: "Invalid redirect URI.", // the DetectInvalid arm's generic line (the exact URI rides the browser log upstream)
   no_apps: "No applications yet", // the empty-list arm (upstream's {{range}} renders none; the explicit line is the settings pages' cf-gitea convention)
+  // The bind-error texts moved to the SHARED binder (oauth2-app-edit.tsx's
+  // validateOauth2ApplicationForm); the former generic "Invalid redirect
+  // URI." reduction is retired with the W5 shared binder. The Locked label's
+  // text + tooltip ride the shared module's oauth2AppEditLocale
+  // (locked/application_locked — applications_oauth2_list.tmpl:21).
 } as const;
 
 /** The render bound over the NO-pager upstream list: the loop walks the
@@ -132,42 +179,25 @@ export const ADMIN_APPLICATIONS_LIST_LIMIT = 500;
 const SERVICE_PAGE_SIZE = 100;
 
 /** The list page's render inputs: the uid=0 rows, id DESC (the service's
- *  order) — plus the once-only secret pair from a just-served create. */
+ *  order) — plus the re-rendered create submission. The W5 once-only secret
+ *  pair retired: the create answer is the shared EDIT page (the module
+ *  header's W5 record), so the list carries no secret state. */
 export interface AdminApplicationsData {
   apps: OAuth2AppRow[];
-  /** The create flow's once-only plaintext (empty outside the create
-   *  re-render — the module header's secret note), with its client id. */
-  newClientSecret: string;
-  newClientId: string;
   form: AdminApplicationCreateForm;
   error: string | null;
 }
 
-export interface AdminApplicationCreateForm {
-  name: string;
-  redirectUrisRaw: string;
-  confidentialClient: boolean;
-  skipSecondaryAuthorization: boolean;
-}
+export type AdminApplicationCreateForm = OAuth2AppEditForm;
 
 export function parseAdminApplicationCreateForm(form: URLSearchParams): AdminApplicationCreateForm {
-  const textarea = form.get("redirect_uris") ?? "";
-  return {
-    name: (form.get("application_name") ?? "").trim(),
-    redirectUrisRaw: textarea,
-    // The checkbox tri-state: present+non-empty = checked (the HTML form
-    // contract; upstream's web.FormBool).
-    confidentialClient: (form.get("confidential_client") ?? "") !== "",
-    skipSecondaryAuthorization: (form.get("skip_secondary_authorization") ?? "") !== "",
-  };
+  return parseOauth2AppEditForm(form);
 }
 
-/** `util.SplitTrimSpace(form.RedirectURIs, "\n")` (oauth2_common.go:69). */
+/** `util.SplitTrimSpace(form.RedirectURIs, "\n")` (oauth2_common.go:69) —
+ *  the shared module's split since W5. */
 export function splitRedirectUris(raw: string): string[] {
-  return raw
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line !== "");
+  return splitRedirectUrisShared(raw);
 }
 
 /**
@@ -185,60 +215,31 @@ export async function loadAdminApplicationsData(d1: D1Database): Promise<AdminAp
   }
   return {
     apps,
-    newClientSecret: "",
-    newClientId: "",
     form: { name: "", redirectUrisRaw: "", confidentialClient: true, skipSecondaryAuthorization: false },
     error: null,
   };
 }
 
 export type AdminApplicationCreateOutcome =
-  | { kind: "created"; data: AdminApplicationsData }
-  | { kind: "invalid"; data: AdminApplicationsData };
+  | { kind: "created"; row: OAuth2AppRow; secret: string }
+  | { kind: "invalid"; message: string };
 
 /**
- * ApplicationsPost → AddApp (oauth2_common.go:56-86) over the landed
- * service: the required-name bind, the redirect-URI validation, the uid=0
- * create, then the once-only secret rendered on the re-rendered list (the
- * module header's reduction). The outcome carries the FULL re-render model
- * either way — the caller answers 200 with it.
+ * ApplicationsPost → AddApp (oauth2_common.go:56-86) — the SHARED create
+ * since W5 (uid=0): the full binder (name Required/MaxSize, redirect_uris
+ * Required, the DetectInvalid URL hook), then CreateOAuth2Application +
+ * GenerateClientSecret. The caller answers the created arm with the shared
+ * EDIT page carrying the once-only secret (the module header's W5 record).
  */
 export async function applyAdminApplicationCreate(
   d1: D1Database,
   form: AdminApplicationCreateForm,
 ): Promise<AdminApplicationCreateOutcome> {
-  const base = await loadAdminApplicationsData(d1);
-  if (form.name === "") {
-    return { kind: "invalid", data: { ...base, form, error: adminApplicationsLocale.error_name_required } };
+  const result = await createOauth2ApplicationFromForm(d1, 0, form, new Date());
+  if (result.kind === "invalid") {
+    return { kind: "invalid", message: result.message };
   }
-  const uris = splitRedirectUris(form.redirectUrisRaw);
-  const invalid = detectInvalidOAuth2ApplicationRedirectURI(uris);
-  if (invalid !== "") {
-    return { kind: "invalid", data: { ...base, form, error: adminApplicationsLocale.error_redirect_uri } };
-  }
-  const { row, secret } = await createOAuth2Application(
-    d1,
-    {
-      uid: 0,
-      name: form.name,
-      redirectUris: uris,
-      confidentialClient: form.confidentialClient,
-      skipSecondaryAuthorization: form.skipSecondaryAuthorization,
-    },
-    new Date(),
-  );
-  const fresh = await loadAdminApplicationsData(d1);
-  return {
-    kind: "created",
-    data: {
-      ...fresh,
-      newClientSecret: secret,
-      newClientId: row.clientId,
-      form,
-      error: null,
-      apps: [row, ...fresh.apps.filter((app) => app.id !== row.id)],
-    },
-  };
+  return { kind: "created", row: result.row, secret: result.secret };
 }
 
 export interface AdminApplicationDeleteForm {
@@ -250,11 +251,17 @@ export function parseAdminApplicationDeleteForm(form: URLSearchParams): AdminApp
 }
 
 /**
- * DeleteApp's write half — the (id, uid=0) delete; false is the
- * unknown/foreign arm the caller answers with the 404 shell.
+ * DeleteApp's write half — the SHARED delete since W5 (oauth2_common.go:
+ * 177-193 over oauth2.go:386-401 + the builtin lock :391-396): "deleted" on
+ * the hit; "not_found"/"locked" both take the caller's 404 shell (the
+ * divergence note — upstream ServerErrors both; existence and lock stay
+ * indistinguishable).
  */
-export async function applyAdminApplicationDelete(d1: D1Database, id: number): Promise<boolean> {
-  return deleteOAuth2Application(d1, id, 0);
+export async function applyAdminApplicationDelete(
+  d1: D1Database,
+  id: number,
+): Promise<{ kind: "deleted" } | { kind: "not_found" } | { kind: "locked" }> {
+  return deleteOauth2ApplicationFromForm(d1, 0, id);
 }
 
 // ---------------------------------------------------------------------------
@@ -280,21 +287,6 @@ export function AdminApplicationsPage(props: { ctx: UiContext; data: AdminApplic
       active="applications"
     >
       <h4 class="ui top attached header">{adminApplicationsLocale.applications}</h4>
-      {data.newClientSecret !== "" ? (
-        // The create flow's once-only secret (the user-settings newToken
-        // precedent): the positive message + the client id + the plaintext
-        // code + the hint.
-        <div class="ui positive message">
-          <p>{adminApplicationsLocale.create_success}</p>
-          <p>
-            {adminApplicationsLocale.client_id}: <code class="new-oauth2-client-id">{data.newClientId}</code>
-          </p>
-          <div class="ui segment">
-            <code id="new-oauth2-client-secret">{data.newClientSecret}</code>
-          </div>
-          <p>{adminApplicationsLocale.client_secret_hint}</p>
-        </div>
-      ) : null}
       {data.error !== null ? (
         <div class="ui negative message">
           <p>{data.error}</p>
@@ -328,18 +320,33 @@ export function AdminApplicationsPage(props: { ctx: UiContext; data: AdminApplic
                     </div>
                   </div>
                   <div class="item-trailing">
-                    {/* The Edit button (unlanded edit page) is OMITTED — the
-                        dead-link rule; the BuiltinApplications "locked" arm
-                        is unreachable (no pre-registered apps in this
-                        store). The Remove button rides the landed delete —
-                        the plain-form POST (the confirm-dialog reduction;
-                        the desc text is the aria label). */}
-                    <form method="post" action={`/-/admin/applications/oauth2/${app.id}/delete`} class="tw-inline">
-                      <input type="hidden" name="id" value={String(app.id)} />
-                      <button type="submit" class="ui red tiny button link-action negative" aria-label={adminApplicationsLocale.remove_confirm}>
-                        {adminApplicationsLocale.remove}
-                      </button>
-                    </form>
+                    {/* applications_oauth2_list.tmpl:18-32 — the builtin lock
+                        arm RENDERS here (unlike the user/org twins, this
+                        list's rows ARE the uid=0 family the five seeded
+                        builtins belong to): the Locked label replaces BOTH
+                        controls for the seeded client IDs; non-builtins get
+                        the W5 Edit link (the shared edit page) + the Remove
+                        form (the plain-form POST — the confirm-dialog
+                        reduction; the desc text is the aria label). */}
+                    {isBuiltinOauth2Application(view.client_id) ? (
+                      <span class="ui basic label" data-tooltip-content={oauth2AppEditLocale.application_locked}>
+                        {oauth2AppEditLocale.locked}
+                      </span>
+                    ) : (
+                      <>
+                        <a href={`/-/admin/applications/oauth2/${app.id}`} class="ui primary tiny button">
+                          <AdminEmbeddedSvg name="octicon-pencil" />
+                          {` ${adminApplicationsLocale.edit}`}
+                        </a>
+                        <form method="post" action={`/-/admin/applications/oauth2/${app.id}/delete`} class="tw-inline">
+                          <input type="hidden" name="id" value={String(app.id)} />
+                          <button type="submit" class="ui red tiny button link-action negative" aria-label={adminApplicationsLocale.remove_confirm}>
+                            <AdminEmbeddedSvg name="octicon-trash" />
+                            {` ${adminApplicationsLocale.remove}`}
+                          </button>
+                        </form>
+                      </>
+                    )}
                   </div>
                 </div>
               );
