@@ -292,8 +292,9 @@ describe("wave-14 parser families (parseUiRoute / handlesUiRoute)", () => {
     expect(parseUiRoute("/acme/labels/")).toEqual({ family: "org-labels", owner: "acme" });
   });
 
-  it("leaves the initialize loader and deeper tails with the engine", () => {
-    expect(parseUiRoute("/acme/labels/initialize")).toBeNull();
+  it("claims the initialize write; deeper tails stay with the engine", () => {
+    // The org initialize write LANDED (the issue-write-tails fold).
+    expect(parseUiRoute("/acme/labels/initialize")).toEqual({ family: "org-label-initialize", owner: "acme" });
     expect(parseUiRoute("/acme/labels/new/more")).toBeNull();
     expect(parseUiRoute("/acme/labels/abc")).toBeNull();
   });

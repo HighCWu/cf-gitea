@@ -860,6 +860,14 @@ import {
   renderMilestonesPage,
   renderNewMilestonePage,
 } from "./pages/milestones";
+// The milestone + label write tails (web.go:1429-1430 + :1421/:1048 — the
+// b91dd1c handoff module's four self-contained POST handlers).
+import {
+  milestoneActionSubmit,
+  milestoneDeleteSubmit,
+  orgLabelInitializeSubmit,
+  repoLabelInitializeSubmit,
+} from "./pages/issue-write-tails";
 import { loadOrgHomeData, renderOrgHomePage, resolveOrgHome } from "./pages/org-home";
 // The census R06 org dashboard (web.go:982-985's /org/{org}/dashboard
 // family) — the member-only page over the landed org-feed reads.
@@ -1067,6 +1075,15 @@ import {
   renderUserSettingsSecurityPage,
   userSettingsSecurityLocale,
 } from "./pages/user-settings-security";
+// The user-scope blocked-users settings pair (web.go:750-752 — census
+// gap #14, the org twin's user-scope sibling).
+import {
+  applyUserBlockedForm,
+  loadUserBlockedUsers,
+  parseUserBlockedForm,
+  renderUserSettingsBlockedPage,
+} from "./pages/user-settings-blocked";
+import type { BlockDoer } from "../api/services/blocks";
 import {
   applyUserSettingsSecretForm,
   deleteUserSettingsSecret,
@@ -1334,11 +1351,30 @@ import {
   resolveLatestVersionRedirect,
   resolvePackagesOwner,
   type PackagesOwner,
+  ownerNameOf,
+  ownerPackagesAccessMode,
+  ownerVisibilityOf,
+  packageSettingsLink,
+  versionWebLink,
 } from "./pages/packages";
+// The packages UI write arms' settings module (web.go:1121-1130 + :1115 +
+// :1117-1120 — census gap #5's seams).
+import {
+  applyPackageSettingsDelete,
+  applyPackageSettingsLink,
+  deletePackageVersionGuarded,
+  loadPackageSettingsData,
+  lockPackageTerraformState,
+  packagesSettingsLocale,
+  parsePackageSettingsForm,
+  renderPackageSettingsPage,
+  resolveVersionDeleteRedirect,
+  unlockPackageTerraformState,
+} from "./pages/package-settings";
 // The SPEC-0016 M2 quota/env config (the profile tab's strict-polarity
 // global — resolveUiSession arms `ctx.packagesEnabled` from it, and the R04
 // prologue 404-shells the subtree when the feature is off).
-import { getVersionByNameAndVersion, packagesQuotaFromEnv } from "../services/packages/model";
+import { accessModeAtLeast, getPackageByName, getVersionByNameAndVersion, packagesQuotaFromEnv } from "../services/packages/model";
 // The codesearch-M1 owner code-search family (pages/user-code-search.tsx —
 // the `/-` namespace's code tail over the federation seeds; the packages
 // family's owner-resolution twin without the package-access gate).
@@ -1766,6 +1802,21 @@ import {
   softDeleteContentHistoryFragment,
 } from "./pages/issue-content-fragments";
 import { loadPullMergeBoxData, pullMergeBoxFragmentHtml, pullMergeBoxFragmentResponse } from "./pages/pull-merge-box";
+// The merge-box write seams (web.go:1665-1669 + :1439 — the six POSTs).
+import {
+  cancelAutoMergeFromWeb,
+  changeTargetBranchFromWeb,
+  cleanupPullRequestFromWeb,
+  mergePullRequestFromWeb,
+  parseAllowMaintainerEditForm,
+  parseMergePullRequestWebForm,
+  parseTargetBranchForm,
+  parseUpdateBranchStyle,
+  setAllowMaintainerEditFromWeb,
+  updatePullRequestFromWeb,
+  type PullMergeBoxWriteContext,
+  type PullMergeBoxWriteOutcome,
+} from "./pages/pull-merge-box";
 import {
   compareFeedServerErrorResponse,
   compareFeedTextResponse,
@@ -1804,6 +1855,14 @@ import {
   commentAttachmentsFragmentResponse,
   loadCommentAttachmentsFragment,
 } from "./pages/comment-attachments-fragment";
+// The attachment web WRITE arms (web.go:1394-1395 — the dropzone pair).
+import {
+  issueAttachmentRemoveResponse,
+  issueAttachmentUploadResponse,
+  removeAttachmentByUuid,
+  removeAttachmentFormValue,
+  uploadIssueAttachmentFromMultipart,
+} from "./pages/issue-attachments-write";
 // Window-2e C2: the wiki family.
 import {
   createWikiPageFromForm,
@@ -2283,6 +2342,9 @@ export interface OwnerPackagesRoute {
     | "owner-package-versions" // GET /packages/{type}/{name}/versions
     | "owner-package-version-view" // GET /packages/{type}/{name}/{version}
     | "owner-package-file-download" // GET .../{version}/files/{fileid}
+    | "owner-package-settings" // GET+POST .../settings/{type}/{name} (write-gated)
+    | "owner-package-terraform-lock" // POST .../{version}/terraform/lock
+    | "owner-package-terraform-unlock" // POST .../{version}/terraform/unlock
   ;
   /** Decoded owner segment (user-or-org rows at resolve time). */
   owner: string;
@@ -2507,7 +2569,7 @@ export interface TagsRoute {
  *  `/labels/initialize` template loader and every deeper tail stay
  *  unclaimed → the engine's 404. */
 export interface RepoLabelsRoute {
-  family: "repo-labels" | "repo-label-new" | "repo-label-edit" | "repo-label-delete";
+  family: "repo-labels" | "repo-label-new" | "repo-label-edit" | "repo-label-delete" | "repo-label-initialize";
   owner: string;
   repo: string;
 }
@@ -2533,15 +2595,29 @@ export interface MilestoneDetailRoute {
  *  `{id}/edit` combo under the plural /milestones group (web.go:1427-1428 —
  *  `m.Get("/{id}/edit", repo.EditMilestone)` + the POST
  *  EditMilestonePost), the write group's gate running at the handlers (the
- *  labels-write convention). Upstream's sibling writes — `/{id}/{action}`
- *  (ChangeMilestoneStatus close/open) and `/delete` — stay unclaimed → the
- *  engine's 404: this slice renders no dead controls for them. */
+ *  labels-write convention). The sibling writes LANDED (pages/
+ *  issue-write-tails.ts): the `/{id}/{action}` status combo and `/delete`
+ *  ride the MilestoneWriteTailRoute below. */
 export interface MilestoneEditRoute {
   family: "milestone-edit";
   owner: string;
   repo: string;
   /** The decoded id segment (validated at load time, not parse time). */
   id: string;
+}
+
+/** The milestone WRITE TAILS (pages/issue-write-tails.ts — upstream
+ *  web.go:1429-1430): the `{id}/{open|close}` status combo
+ *  (ChangeMilestoneStatus — redirects to `?state={action}` VERBATIM) and
+ *  the `/delete` literal (the nil-on-not-exist idempotent cascade). */
+export interface MilestoneWriteTailRoute {
+  family: "milestone-action" | "milestone-delete";
+  owner: string;
+  repo: string;
+  /** The decoded id segment (the action family only). */
+  id?: string;
+  /** The decoded action segment (open|close; the action family only). */
+  action?: string;
 }
 
 /** The wave-26 fork-form family (pages/repo-fork.tsx): upstream's
@@ -3148,8 +3224,16 @@ export interface IssueAuxRoute {
     | "issue-content-history-list"
     | "issue-content-history-detail"
     | "issue-content-history-soft-delete"
+    | "issue-attachments-upload"
+    | "issue-attachments-remove"
     | "issue-attachments-alias"
     | "pull-merge-box"
+    | "pull-merge"
+    | "pull-merge-cancel-auto"
+    | "pull-merge-update"
+    | "pull-merge-allow-edits"
+    | "pull-merge-cleanup"
+    | "pull-target-branch"
     | "pull-files-range"
     | "pull-commit-files"
     | "activity-author-data"
@@ -3305,6 +3389,7 @@ export interface UserSettingsTabRoute {
     | "user-settings-packages-rule-edit"
     | "user-settings-packages-rule-preview"
     | "user-settings-packages-chef-regenerate" // POST /user/settings/packages/chef/regenerate_keypair (web.go:718)
+    | "user-settings-blocked-users" // GET+POST /user/settings/blocked_users (web.go:750-752)
     | "user-settings-variables"
     | "user-settings-variables-new"
     | "user-settings-variables-edit"
@@ -3374,7 +3459,7 @@ export interface OrgTeamsRoute {
  *  repo parse, the teams precedent). The `/labels/initialize` template
  *  loader and any deeper tail stay unclaimed → the engine's 404. */
 export interface OrgLabelsRoute {
-  family: "org-labels" | "org-label-new" | "org-label-edit" | "org-label-delete";
+  family: "org-labels" | "org-label-new" | "org-label-edit" | "org-label-delete" | "org-label-initialize";
   /** Decoded org segment. */
   owner: string;
 }
@@ -3585,6 +3670,7 @@ export type ParsedUiRoute =
   | RepoLabelsRoute
   | MilestoneDetailRoute
   | MilestoneEditRoute
+  | MilestoneWriteTailRoute
   | RepoForkRoute
   | DiffPatchRoute
   | RepoArchiveRoute
@@ -3710,6 +3796,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       return { family: "user-settings-appearance-language", id: null };
     }
     if (tail.length === 1 && tail[0] === "security") return { family: "user-settings-security", id: null };
+    // The blocked-users pair (web.go:750-752 — the navbar's order puts it
+    // between Security and Applications).
+    if (tail.length === 1 && tail[0] === "blocked_users") return { family: "user-settings-blocked-users", id: null };
     if (tail.length === 2 && tail[0] === "actions" && tail[1] === "secrets") {
       return { family: "user-settings-secrets", id: null };
     }
@@ -4319,6 +4408,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (raw[3] === "new") return { family: "org-label-new", owner };
       if (raw[3] === "edit") return { family: "org-label-edit", owner };
       if (raw[3] === "delete") return { family: "org-label-delete", owner };
+      // The template-initialize write (web.go:1048 — the org twin of the
+      // repo arm, under require-owner).
+      if (raw[3] === "initialize") return { family: "org-label-initialize", owner };
     }
     return null;
   }
@@ -4535,6 +4627,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (raw.length === 6) return { family: "owner-package-redirect", owner, type, name };
     if (raw.length === 7) {
       if (raw[6] === "versions") return { family: "owner-package-versions", owner, type, name };
+      // The settings literal claims FIRST (static-before-dynamic, the
+      // versions-tail precedent — web.go:1121-1127's write-gated pair).
+      if (raw[6] === "settings") return { family: "owner-package-settings", owner, type, name };
       let version: string;
       try {
         version = decodeURIComponent(raw[6] as string);
@@ -4542,6 +4637,21 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
         return null;
       }
       return { family: "owner-package-version-view", owner, type, name, version };
+    }
+    if (raw.length === 9 && raw[7] === "terraform" && (raw[8] === "lock" || raw[8] === "unlock")) {
+      let version: string;
+      try {
+        version = decodeURIComponent(raw[6] as string);
+      } catch {
+        return null;
+      }
+      return {
+        family: raw[8] === "lock" ? "owner-package-terraform-lock" : "owner-package-terraform-unlock",
+        owner,
+        type,
+        name,
+        version,
+      };
     }
     if (raw.length === 9 && raw[7] === "files" && /^\d+$/.test(raw[8] as string)) {
       let version: string;
@@ -4934,6 +5044,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     if (rest.length === 1) {
       if (head === "issues" && rest[0] === "new") return { family: "issue-new", owner, repo };
+      // The attachment upload (web.go:1394 — REPO-LEVEL, no {index}; both
+      // families share the handler; POST-only).
+      if (rest[0] === "attachments") return { family: "issue-attachments-upload", owner, repo };
       // Wave-5: the sidebar label-write POST (upstream data-update-url).
       if (head === "issues" && rest[0] === "labels") return { family: "issue-labels", owner, repo };
       // Wave-11: the review-request + dismiss POSTs (web.go:1435-1436 —
@@ -4954,6 +5067,11 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     // Wave-5: the comment write + the PR files view, under BOTH families'
     // index tails (upstream hangs /comments on `/{type:issues|pulls}/{index}`
     // — web.go:1376 — and /files on the pulls group only — web.go:1670).
+    // The attachment-remove write (web.go:1395 — REPO-LEVEL, both families,
+    // the uuid rides the form's `file` field; POST-only).
+    if (rest.length === 2 && rest[0] === "attachments" && rest[1] === "remove") {
+      return { family: "issue-attachments-remove", owner, repo };
+    }
     if (rest.length === 2 && /^-?\d+$/.test(rest[0] as string)) {
       const index = Number.parseInt(rest[0] as string, 10);
       if (rest[1] === "comments") return { family: "issue-comment", owner, repo, urlKind: head, index };
@@ -4964,6 +5082,13 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (rest[1] === "info") return { family: "issue-info", owner, repo, urlKind: head, index };
       if (rest[1] === "attachments") return { family: "issue-attachments", owner, repo, urlKind: head, index };
       if (head === "pulls" && rest[1] === "merge_box") return { family: "pull-merge-box", owner, repo, index };
+      // The merge-box write arms (web.go:1665-1669 — pages/pull-merge-box.tsx
+      // owns the seams; POST-only, the chi-405 GET twins register beside).
+      if (head === "pulls" && rest[1] === "merge") return { family: "pull-merge", owner, repo, index };
+      if (head === "pulls" && rest[1] === "cancel_auto_merge") return { family: "pull-merge-cancel-auto", owner, repo, index };
+      if (head === "pulls" && rest[1] === "update") return { family: "pull-merge-update", owner, repo, index };
+      if (head === "pulls" && rest[1] === "set_allow_maintainer_edit") return { family: "pull-merge-allow-edits", owner, repo, index };
+      if (head === "pulls" && rest[1] === "cleanup") return { family: "pull-merge-cleanup", owner, repo, index };
     }
     if (rest.length === 3 && /^-?\d+$/.test(rest[0] as string)) {
       const index = Number.parseInt(rest[0] as string, 10);
@@ -5040,6 +5165,12 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       }
     }
     return null;
+  }
+  // The base-change form (web.go:1439 — the SINGULAR /pull group's
+  // target_branch write, repo-level like the wiki/pull singular heads;
+  // POST-only, the branch rides the form's field).
+  if (head === "pull" && rest.length === 2 && /^-?\d+$/.test(rest[0] as string) && rest[1] === "target_branch") {
+    return { family: "pull-target-branch", owner, repo, index: Number.parseInt(rest[0] as string, 10) };
   }
   if (head === "settings") {
     if (rest.length === 0) return { family: "settings", owner, repo };
@@ -5238,6 +5369,7 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   if (head === "milestones") {
     if (rest.length === 0) return { family: "milestones", owner, repo };
     if (rest.length === 1 && rest[0] === "new") return { family: "milestone-new", owner, repo };
+    if (rest.length === 1 && rest[0] === "delete") return { family: "milestone-delete", owner, repo };
     if (rest.length === 2 && rest[1] === "edit") {
       let id: string;
       try {
@@ -5246,6 +5378,21 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
         return null;
       }
       return { family: "milestone-edit", owner, repo, id };
+    }
+    // The status-write tail (web.go:1429's ChangeMilestoneStatus combo —
+    // the {id}/{open|close} action; both segments decode verbatim, an
+    // unknown action claims the shape and the handler redirects, exactly
+    // upstream's no-404 quirk).
+    if (rest.length === 2 && (rest[1] === "open" || rest[1] === "close")) {
+      let id: string;
+      let action: string;
+      try {
+        id = decodeURIComponent(rest[0] as string);
+        action = decodeURIComponent(rest[1]);
+      } catch {
+        return null;
+      }
+      return { family: "milestone-action", owner, repo, id, action };
     }
     return null;
   }
@@ -5656,6 +5803,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (rest[0] === "new") return { family: "repo-label-new", owner, repo };
       if (rest[0] === "edit") return { family: "repo-label-edit", owner, repo };
       if (rest[0] === "delete") return { family: "repo-label-delete", owner, repo };
+      // The template-initialize write (web.go:1421 — the empty list's
+      // label_load_template select posts here).
+      if (rest[0] === "initialize") return { family: "repo-label-initialize", owner, repo };
     }
     return null;
   }
@@ -8211,6 +8361,42 @@ async function issueAttachmentsAliasRoute(c: Context<{ Bindings: Env }>): Promis
   return respond(new Response(null, { status: 302, headers: { location: `/attachments/${route.segment}` } }));
 }
 
+/** POST /{owner}/{repo}/{issues|pulls}/attachments (web.go:1394 — the
+ *  dropzone upload; REPO-LEVEL, no {index}, the multipart `file` part
+ *  streams; the web-tier RepoMustNotBeArchived is ctx.NotFound, not the
+ *  API 423). The answer is the dropzone JS's {"uuid":…} 200. */
+async function issueAttachmentsUploadRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, repo, respond, viewer } = resolved;
+  const route = resolved.route;
+  if (route.family !== "issue-attachments-upload") return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search)); // reqSignIn
+  if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404)); // RepoMustNotBeArchived
+  const outcome = await uploadIssueAttachmentFromMultipart(c.env, repo, viewer.id, c.req.raw);
+  return respond(issueAttachmentUploadResponse(outcome));
+}
+
+/** POST /{owner}/{repo}/{issues|pulls}/attachments/remove (web.go:1395 —
+ *  the uuid rides the form's `file` field, query-fallback per Go FormValue). */
+async function issueAttachmentsRemoveRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, repo, respond, viewer } = resolved;
+  const route = resolved.route;
+  if (route.family !== "issue-attachments-remove") return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search)); // reqSignIn
+  if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404)); // RepoMustNotBeArchived
+  const form = await readUrlEncodedForm(c.req.raw);
+  const file = removeAttachmentFormValue(form, url);
+  const outcome = await removeAttachmentByUuid(c.env, repo, viewer, file);
+  return respond(issueAttachmentRemoveResponse(outcome));
+}
+
 async function pullMergeBoxRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
@@ -8219,10 +8405,98 @@ async function pullMergeBoxRoute(c: Context<{ Bindings: Env }>): Promise<Respons
   if (route.family !== "pull-merge-box" || route.index === undefined) return respond(await c.notFound()); // drift guard
   const found = await findPullRequestByIndex(c.env.DB, repo.id, route.index);
   if (found === null) return respond(c.html(renderNotFound(ctx), 404));
-  const data = await loadPullMergeBoxData(c.env.DB, { repo, issue: found.issue, pr: found.pullRequest, viewer, origin: url.origin });
+  const data = await loadPullMergeBoxData(c.env.DB, {
+    repo,
+    issue: found.issue,
+    pr: found.pullRequest,
+    viewer,
+    origin: url.origin,
+    // The merged box gates on real branch existence (absent = the assumed-
+    // deletable degradation; the cleanup POST re-checks).
+    listTips: (pair) => engineReads(c.env, pair).listRefs(),
+  });
   // null → the EMPTY fragment (upstream's ShowMergeBox=false arm — the
   // bundle's reload stop signal).
   return respond(pullMergeBoxFragmentResponse(data === null ? "" : pullMergeBoxFragmentHtml(data)));
+}
+
+/** The merge-box write arms' shared ladder (web.go:1665-1669 — the group's
+ *  §2.8 Origin guard, reqSignIn posture, and RepoMustNotBeArchived; the
+ *  seam's outcome maps redirect→303, not-found→the 404 shell, error→the
+ *  issue-comment re-render convention with the message in the form-error
+ *  slot). */
+async function pullMergeBoxWriteRoute(
+  c: Context<{ Bindings: Env }>,
+  errorContent: string,
+  write: (ctx: PullMergeBoxWriteContext) => Promise<PullMergeBoxWriteOutcome>,
+): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, repo, viewer, respond } = resolved;
+  const route = resolved.route;
+  if (
+    route.family !== "pull-merge" &&
+    route.family !== "pull-merge-cancel-auto" &&
+    route.family !== "pull-merge-update" &&
+    route.family !== "pull-merge-allow-edits" &&
+    route.family !== "pull-merge-cleanup" &&
+    route.family !== "pull-target-branch"
+  ) {
+    return respond(await c.notFound()); // drift guard
+  }
+  if (route.index === undefined) return respond(await c.notFound());
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search)); // reqSignIn
+  if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404)); // RepoMustNotBeArchived
+  const found = await findPullRequestByIndex(c.env.DB, repo.id, route.index);
+  if (found === null) return respond(c.html(renderNotFound(ctx), 404));
+  const outcome = await write({ c, repo, issue: found.issue, pr: found.pullRequest, viewer });
+  if (outcome.outcome === "redirect") {
+    return respond(new Response(null, { status: 303, headers: { location: outcome.location } }));
+  }
+  if (outcome.outcome === "not-found") return respond(c.html(renderNotFound(ctx), 404));
+  const data = await loadIssueDetailData(c.env.DB, repo, found.issue.isPull ? "pulls" : "issues", route.index, url.origin, viewer);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404));
+  const access = await resolveIssueDetailAccess(c.env, repo, viewer, data.issue);
+  return respond(c.html(renderIssueDetailPage(ctx, data, access, undefined, { content: errorContent, error: outcome.message }), 200));
+}
+
+/** POST /{owner}/{repo}/pulls/{index}/merge — the verdict form. */
+async function pullMergeWebPost(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const form = parseMergePullRequestWebForm(await readUrlEncodedForm(c.req.raw));
+  return pullMergeBoxWriteRoute(c, form.mergeMessageField, (ctx) => mergePullRequestFromWeb(ctx, form));
+}
+
+/** POST /{owner}/{repo}/pulls/{index}/cancel_auto_merge — the honest
+ *  not-scheduled 404 (no scheduled-merge table; the API stub's twin). */
+async function pullMergeCancelAutoPost(c: Context<{ Bindings: Env }>): Promise<Response> {
+  return pullMergeBoxWriteRoute(c, "", (ctx) => cancelAutoMergeFromWeb(ctx));
+}
+
+/** POST /{owner}/{repo}/pulls/{index}/update?style=merge|rebase — the
+ *  update-BRANCH write (web.go:1667's UpdatePullRequest, NOT a title edit). */
+async function pullMergeUpdatePost(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const style = parseUpdateBranchStyle(new URL(c.req.raw.url).searchParams.get("style"));
+  if (style === null) return pullMergeBoxWriteRoute(c, "", () => Promise.resolve({ outcome: "error" as const, message: "Unable to update pull request" }));
+  return pullMergeBoxWriteRoute(c, "", (ctx) => updatePullRequestFromWeb(ctx, style));
+}
+
+/** POST /{owner}/{repo}/pulls/{index}/set_allow_maintainer_edit. */
+async function pullMergeAllowEditsPost(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const form = parseAllowMaintainerEditForm(await readUrlEncodedForm(c.req.raw));
+  return pullMergeBoxWriteRoute(c, "", (ctx) => setAllowMaintainerEditFromWeb(ctx, form));
+}
+
+/** POST /{owner}/{repo}/pulls/{index}/cleanup — the delete-branch-after-merge. */
+async function pullMergeCleanupPost(c: Context<{ Bindings: Env }>): Promise<Response> {
+  return pullMergeBoxWriteRoute(c, "", (ctx) => cleanupPullRequestFromWeb(ctx));
+}
+
+/** POST /{owner}/{repo}/pull/{index}/target_branch — the base-change form. */
+async function pullTargetBranchPost(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const form = parseTargetBranchForm(await readUrlEncodedForm(c.req.raw));
+  return pullMergeBoxWriteRoute(c, form.targetBranch, (ctx) => changeTargetBranchFromWeb(ctx, form));
 }
 
 async function pullFilesRangeRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
@@ -9106,6 +9380,30 @@ async function userSettingsSecurityPage(c: Context<{ Bindings: Env }>): Promise<
   if (!p.ok) return p.response;
   const data = await loadUserSettingsSecurityPageData(c.env.DB, p.viewer.id);
   return p.respond(c.html(renderUserSettingsSecurityPage(p.ctx, data), 200));
+}
+
+/** GET /user/settings/blocked_users (web.go:750-751 — the user-scope twin;
+ *  plain reqSignIn, no ownership gate: the doer IS the blocker). */
+async function userSettingsBlockedUsersPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  const data = await loadUserBlockedUsers(c.env.DB, p.viewer.id);
+  return p.respond(c.html(renderUserSettingsBlockedPage({ ctx: p.ctx, data, error: null }), 200));
+}
+
+/** POST /user/settings/blocked_users (BlockUserForm — block | unblock;
+ *  applied 303s back, invalid re-renders at 200 with the banner). */
+async function userSettingsBlockedUsersSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const form = parseUserBlockedForm(await readUrlEncodedForm(c.req.raw));
+  const doer: BlockDoer = { id: p.viewer.id, isAdmin: p.viewer.isAdmin };
+  const result = await applyUserBlockedForm(c.env.DB, doer, form);
+  if (result.outcome === "applied") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/blocked_users" } }));
+  }
+  const data = await loadUserBlockedUsers(c.env.DB, p.viewer.id);
+  return p.respond(c.html(renderUserSettingsBlockedPage({ ctx: p.ctx, data, error: result.message }), 200));
 }
 
 async function userSettingsSecretsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
@@ -14373,7 +14671,10 @@ function isOwnerPackagesRoute(route: ParsedUiRoute): route is OwnerPackagesRoute
     route.family === "owner-package-redirect" ||
     route.family === "owner-package-versions" ||
     route.family === "owner-package-version-view" ||
-    route.family === "owner-package-file-download"
+    route.family === "owner-package-file-download" ||
+    route.family === "owner-package-settings" ||
+    route.family === "owner-package-terraform-lock" ||
+    route.family === "owner-package-terraform-unlock"
   );
 }
 
@@ -14519,6 +14820,140 @@ async function ownerPackageFileDownload(c: Context<{ Bindings: Env }>): Promise<
   if (download.kind === "not-found") return respond(c.html(renderNotFound(ctx), 404));
   return respond(
     packageFileDownloadResponse(download, { ifModifiedSince: c.req.header("if-modified-since") ?? null }),
+  );
+}
+
+/** The write gate shared by the packages UI write arms (web.go:937-941's
+ *  reqPackageAccess(write) closure — the `< mode` arm answers 404). */
+async function ownerPackagesWriteGate(
+  c: Context<{ Bindings: Env }>,
+  owner: PackagesOwner,
+  viewer: Viewer,
+  ctx: UiContext,
+): Promise<Response | null> {
+  const mode = await ownerPackagesAccessMode(c.env.DB, {
+    id: packagesOwnerIdOf(owner),
+    type: owner.kind === "org" ? "org" : "user",
+    visibility: ownerVisibilityOf(owner),
+  }, viewer.kind === "user" ? { id: viewer.id, isAdmin: viewer.isAdmin } : { id: null, isAdmin: false });
+  if (!accessModeAtLeast(mode, "write")) return c.html(renderNotFound(ctx), 404);
+  return null;
+}
+
+/** GET /{owner}/-/packages/settings/{type}/{name} (web.go:1121-1127's GET —
+ *  user.PackageSettings, write-gated). */
+async function ownerPackageSettingsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveOwnerPackagesRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, respond, route, owner } = resolved;
+  if (route.family !== "owner-package-settings") return respond(await c.notFound()); // drift guard
+  const gate = await ownerPackagesWriteGate(c, owner, viewer, ctx);
+  if (gate !== null) return respond(gate);
+  const pkg = await getPackageByName(c.env.DB, packagesOwnerIdOf(owner), route.type ?? "", route.name ?? "");
+  if (pkg === null) return respond(c.html(renderNotFound(ctx), 404));
+  const data = await loadPackageSettingsData(c.env.DB, owner, viewer, resolved.url.origin, pkg);
+  return respond(c.html(renderPackageSettingsPage(ctx, data), 200));
+}
+
+/** POST /{owner}/-/packages/settings/{type}/{name} (PackageSettingsPost's
+ *  action switch — link | delete; other actions NotFound upstream). */
+async function ownerPackageSettingsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOwnerPackagesRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, respond, route, owner } = resolved;
+  if (route.family !== "owner-package-settings") return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(resolved.url.pathname + resolved.url.search));
+  const gate = await ownerPackagesWriteGate(c, owner, viewer, ctx);
+  if (gate !== null) return respond(gate);
+  const pkg = await getPackageByName(c.env.DB, packagesOwnerIdOf(owner), route.type ?? "", route.name ?? "");
+  if (pkg === null) return respond(c.html(renderNotFound(ctx), 404));
+  const form = parsePackageSettingsForm(await readUrlEncodedForm(c.req.raw));
+  if (form.action === "link") {
+    const outcome = await applyPackageSettingsLink(c.env.DB, packagesOwnerIdOf(owner), pkg, form.repoName);
+    if (outcome.kind === "repo-missing") {
+      const data = await loadPackageSettingsData(c.env.DB, owner, viewer, resolved.url.origin, pkg);
+      return respond(
+        c.html(
+          renderPackageSettingsPage(ctx, data, {
+            kind: "negative",
+            text: `${packagesSettingsLocale.repo_not_found_prefix}${outcome.repoName}${packagesSettingsLocale.repo_not_found_tail}`,
+          }),
+          200,
+        ),
+      );
+    }
+    return respond(new Response(null, { status: 303, headers: { location: packageSettingsLink(ownerNameOf(owner), pkg.type, pkg.name) } }));
+  }
+  if (form.action === "delete") {
+    const outcome = await applyPackageSettingsDelete(c.env.DB, pkg, form.packageName);
+    if (outcome === "ok") {
+      return respond(new Response(null, { status: 303, headers: { location: `/${ownerNameOf(owner)}/-/packages` } }));
+    }
+    const data = await loadPackageSettingsData(c.env.DB, owner, viewer, resolved.url.origin, pkg);
+    return respond(
+      c.html(
+        renderPackageSettingsPage(ctx, data, {
+          kind: "negative",
+          text: outcome === "locked" ? packagesSettingsLocale.terraform_delete_locked : packagesSettingsLocale.delete_invalid_package_name,
+        }),
+        200,
+      ),
+    );
+  }
+  return respond(await c.notFound()); // upstream's unknown-action NotFound
+}
+
+/** POST /{owner}/-/packages/{type}/{name}/{version} (web.go:1115 —
+ *  PackageVersionDelete, write-gated; the terraform LOCKED/LATEST guards
+ *  run before the write; both guard arms answer the SAME redirect). */
+async function ownerPackageVersionDelete(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOwnerPackagesRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, respond, route, owner } = resolved;
+  if (route.family !== "owner-package-version-view") return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(resolved.url.pathname + resolved.url.search));
+  const gate = await ownerPackagesWriteGate(c, owner, viewer, ctx);
+  if (gate !== null) return respond(gate);
+  const pkg = await getPackageByName(c.env.DB, packagesOwnerIdOf(owner), route.type ?? "", route.name ?? "");
+  if (pkg === null) return respond(c.html(renderNotFound(ctx), 404));
+  const versionRow = await getVersionByNameAndVersion(c.env.DB, packagesOwnerIdOf(owner), pkg.type, pkg.name, route.version ?? "");
+  if (versionRow === null) return respond(c.html(renderNotFound(ctx), 404));
+  await deletePackageVersionGuarded(c.env.DB, pkg, versionRow);
+  const location = await resolveVersionDeleteRedirect(c.env.DB, ownerNameOf(owner), pkg);
+  return respond(new Response(null, { status: 303, headers: { location } }));
+}
+
+/** POST /{owner}/-/packages/{type}/{name}/{version}/terraform/{lock,unlock}
+ *  (web.go:1117-1120 — the manual state lock buttons, write-gated,
+ *  terraform-only). */
+async function ownerPackageTerraformLockToggle(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOwnerPackagesRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, respond, route, owner } = resolved;
+  const isLock = route.family === "owner-package-terraform-lock";
+  if (!isLock && route.family !== "owner-package-terraform-unlock") return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(resolved.url.pathname + resolved.url.search));
+  const gate = await ownerPackagesWriteGate(c, owner, viewer, ctx);
+  if (gate !== null) return respond(gate);
+  if (route.type !== "terraform") return respond(c.html(renderNotFound(ctx), 404));
+  const pkg = await getPackageByName(c.env.DB, packagesOwnerIdOf(owner), route.type, route.name ?? "");
+  if (pkg === null) return respond(c.html(renderNotFound(ctx), 404));
+  const versionRow = await getVersionByNameAndVersion(c.env.DB, packagesOwnerIdOf(owner), pkg.type, pkg.name, route.version ?? "");
+  if (versionRow === null) return respond(c.html(renderNotFound(ctx), 404));
+  if (isLock) {
+    await lockPackageTerraformState(c.env.DB, pkg, viewer.username);
+  } else {
+    await unlockPackageTerraformState(c.env.DB, pkg);
+  }
+  const ownerName = ownerNameOf(owner);
+  return respond(
+    new Response(null, { status: 303, headers: { location: versionWebLink(ownerName, pkg.type, pkg.name, versionRow.version) } }),
   );
 }
 
@@ -15832,6 +16267,10 @@ uiRouter.get("/user/settings/appearance", (c) => userSettingsAppearancePage(c));
 uiRouter.post("/user/settings/appearance/theme", (c) => userSettingsAppearanceSubmit(c, "theme"));
 uiRouter.post("/user/settings/appearance/language", (c) => userSettingsAppearanceSubmit(c, "language"));
 uiRouter.get("/user/settings/security", (c) => userSettingsSecurityPage(c));
+// The blocked-users pair (web.go:750-752 — BOTH methods are upstream
+// routes; no chi-405 twin).
+uiRouter.get("/user/settings/blocked_users", (c) => userSettingsBlockedUsersPage(c));
+uiRouter.post("/user/settings/blocked_users", (c) => userSettingsBlockedUsersSubmit(c));
 // The account-link unlink POST (SPEC external-auth-sources.md W5's handoff;
 // upstream security.go:50-70 + RemoveAccountLink external_login_user.go:
 // 107-118 — NO last-link guard at the pin, test-pinned): the plain-form
@@ -16216,6 +16655,10 @@ uiRouter.post("/:owner/labels/edit", (c) => orgLabelEditSubmit(c));
 uiRouter.get("/:owner/labels/edit", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/labels/delete", (c) => orgLabelDeleteSubmit(c));
 uiRouter.get("/:owner/labels/delete", () => methodNotAllowed("POST"));
+// The org label-template initialize write (web.go:1048, under require-owner
+// — the gate runs at the handler).
+uiRouter.post("/:owner/labels/initialize", (c) => orgLabelInitializeSubmit(c));
+uiRouter.get("/:owner/labels/initialize", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/commits", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/commits/*", (c) => uiPage(c));
@@ -16407,6 +16850,12 @@ uiRouter.get("/:owner/:repo/:segment{^tags\\.(rss|atom)$}", (c) => tagsFeedRoute
 uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/info", (c) => issueInfoFragmentRoute(c));
 uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/attachments", (c) => issueAttachmentsFragmentRoute(c));
 uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/attachments/:uuid", (c) => issueAttachmentsAliasRoute(c));
+// The attachment web WRITE pair (web.go:1394-1395 — repo-level, one segment
+// shallower than the GET list above; POST-only, chi-405 GET twins).
+uiRouter.post("/:owner/:repo/:kind{issues|pulls}/attachments", (c) => issueAttachmentsUploadRoute(c));
+uiRouter.get("/:owner/:repo/:kind{issues|pulls}/attachments", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/:kind{issues|pulls}/attachments/remove", (c) => issueAttachmentsRemoveRoute(c));
+uiRouter.get("/:owner/:repo/:kind{issues|pulls}/attachments/remove", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/content-history/overview", (c) => issueContentOverviewRoute(c));
 // The content-history list/detail dropdown arms (the same constrained-param
 // form; the parser's numeric guard stays `-?\d+` — the registration's `\d+`
@@ -16419,6 +16868,20 @@ uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/content-history/det
 // web.go:1391's UPDATE group).
 uiRouter.post("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/content-history/soft-delete", (c) => issueContentHistorySoftDeleteRoute(c));
 uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/merge_box", (c) => pullMergeBoxRoute(c));
+// The merge-box write arms (web.go:1665-1669 — POST-only, chi-405 GET twins).
+uiRouter.post("/:owner/:repo/pulls/:index{\\d+}/merge", (c) => pullMergeWebPost(c));
+uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/merge", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index{\\d+}/cancel_auto_merge", (c) => pullMergeCancelAutoPost(c));
+uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/cancel_auto_merge", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index{\\d+}/update", (c) => pullMergeUpdatePost(c));
+uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/update", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index{\\d+}/set_allow_maintainer_edit", (c) => pullMergeAllowEditsPost(c));
+uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/set_allow_maintainer_edit", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index{\\d+}/cleanup", (c) => pullMergeCleanupPost(c));
+uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/cleanup", () => methodNotAllowed("POST"));
+// The base-change form (web.go:1439 — the SINGULAR /pull group).
+uiRouter.post("/:owner/:repo/pull/:index{\\d+}/target_branch", (c) => pullTargetBranchPost(c));
+uiRouter.get("/:owner/:repo/pull/:index{\\d+}/target_branch", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/files/:segment{^[a-f0-9]{7,64}(\\.\\.[a-f0-9]{7,64})?$}", (c) => pullFilesRangeRoute(c));
 uiRouter.get("/:owner/:repo/pulls/:index{\\d+}/commits/:sha{^[a-f0-9]{7,64}$}", (c) => pullCommitFilesRoute(c));
 uiRouter.get("/:owner/:repo/comments/:id/attachments", (c) => commentAttachmentsRoute(c));
@@ -16698,6 +17161,10 @@ uiRouter.post("/:owner/:repo/labels/edit", (c) => repoLabelEditSubmit(c));
 uiRouter.get("/:owner/:repo/labels/edit", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/:repo/labels/delete", (c) => repoLabelDeleteSubmit(c));
 uiRouter.get("/:owner/:repo/labels/delete", () => methodNotAllowed("POST"));
+// The repo label-template initialize write (web.go:1421 — the empty list's
+// label_load_template select posts here).
+uiRouter.post("/:owner/:repo/labels/initialize", (c) => repoLabelInitializeSubmit(c));
+uiRouter.get("/:owner/:repo/labels/initialize", () => methodNotAllowed("POST"));
 // Wave-45 repo projects (web.go:1544-1563 — pages/repo-projects.tsx): the
 // literal list + the write group's /new combo + the numeric-{id} board,
 // write and workflow shapes (chi static-before-dynamic — the literals
@@ -16747,6 +17214,15 @@ uiRouter.get("/:owner/:repo{[^-].*}/projects/:id/workflows/:wid/delete", () => m
 uiRouter.get("/:owner/:repo/milestone/:id", (c) => milestoneDetailPage(c));
 uiRouter.get("/:owner/:repo/milestones/:id/edit", (c) => milestoneEditPage(c));
 uiRouter.post("/:owner/:repo/milestones/:id/edit", (c) => milestoneEditSubmit(c));
+// The milestone write tails (web.go:1429-1430, pages/issue-write-tails.ts):
+// the {id}/{open|close} status combo and the /delete literal. The static
+// :id/edit above wins over the dynamic :action arm regardless of order
+// (Hono ranks static over param); the action grammar rides the handler
+// (unknown actions redirect, upstream's no-404 quirk).
+uiRouter.post("/:owner/:repo/milestones/:id/:action{(open|close)}", (c) => milestoneActionSubmit(c));
+uiRouter.get("/:owner/:repo/milestones/:id/:action{(open|close)}", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/milestones/delete", (c) => milestoneDeleteSubmit(c));
+uiRouter.get("/:owner/:repo/milestones/delete", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/fork", (c) => repoForkPage(c));
 uiRouter.post("/:owner/:repo/fork", (c) => repoForkSubmit(c));
 // Wave-32 archive download + commit aux JSON (parseUiRoute claims exactly
@@ -16943,5 +17419,13 @@ uiRouter.get("/:owner/-/packages", (c) => ownerPackagesPage(c));
 uiRouter.get("/:owner/-/packages/:type/:name", (c) => ownerPackageLatestRedirect(c));
 uiRouter.get("/:owner/-/packages/:type/:name/versions", (c) => ownerPackageVersionsPage(c));
 uiRouter.get("/:owner/-/packages/:type/:name/:version", (c) => ownerPackageVersionViewPage(c));
+// The packages UI write arms (census gap #5 — the settings pair registers
+// BEFORE the dynamic :version patterns; the version-delete shares the view
+// shape, method-disambiguated; the terraform pair is one deeper).
+uiRouter.get("/:owner/-/packages/settings/:type/:name", (c) => ownerPackageSettingsPage(c));
+uiRouter.post("/:owner/-/packages/settings/:type/:name", (c) => ownerPackageSettingsSubmit(c));
+uiRouter.post("/:owner/-/packages/:type/:name/:version", (c) => ownerPackageVersionDelete(c));
+uiRouter.post("/:owner/-/packages/:type/:name/:version/terraform/lock", (c) => ownerPackageTerraformLockToggle(c));
+uiRouter.post("/:owner/-/packages/:type/:name/:version/terraform/unlock", (c) => ownerPackageTerraformLockToggle(c));
 uiRouter.get("/:owner/-/packages/:type/:name/:version/files/:fileid{[0-9]+}", (c) => ownerPackageFileDownload(c));
 uiRouter.get("/:owner/:repo{[^-].*}/packages", (c) => repoPackagesPage(c));

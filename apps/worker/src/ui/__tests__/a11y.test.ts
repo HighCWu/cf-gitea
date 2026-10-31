@@ -735,6 +735,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Notifications",
       "Appearance",
       "Security",
+      "Blocked users", // lit by the user blocked-users tab's module (pages/user-settings-blocked.tsx, navbar.tmpl:25-27)
       "Applications",
       "SSH / GPG Keys",
       "General", // the P2-1 user general page's module lit the Actions group's General sub-item (navbar.tmpl:43-45)
@@ -846,6 +847,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Notifications",
       "Appearance",
       "Security",
+      "Blocked users", // lit by the user blocked-users tab's module (pages/user-settings-blocked.tsx, navbar.tmpl:25-27)
       "Applications",
       "SSH / GPG Keys",
       "General", // the P2-1 user general page's module lit the Actions group's General sub-item (navbar.tmpl:43-45)

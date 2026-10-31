@@ -242,7 +242,9 @@ describe("wave-25 parser claims", () => {
     expect(parseUiRoute("/wave25-owner/labeled/tags.rss")).toMatchObject({ family: "tags-feed-rss" });
     expect(parseUiRoute("/wave25-owner/labeled/tags.atom")).toMatchObject({ family: "tags-feed-atom" });
     expect(parseUiRoute("/wave25-owner/labeled/tags.rss/extra")).toBeNull();
-    expect(parseUiRoute("/wave25-owner/labeled/labels/initialize")).toBeNull();
+    // The initialize write LANDED (the issue-write-tails fold) — the label
+    // family's template-loader tail is CLAIMED now.
+    expect(parseUiRoute("/wave25-owner/labeled/labels/initialize")).toMatchObject({ family: "repo-label-initialize" });
     expect(parseUiRoute("/wave25-owner/labeled/labels/other")).toBeNull();
     expect(parseUiRoute("/wave25-owner/labeled/tags/extra")).toBeNull();
     // handlesUiRoute (the dispatcher's gate) answers the same.

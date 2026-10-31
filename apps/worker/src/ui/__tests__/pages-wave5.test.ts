@@ -410,7 +410,12 @@ describe("detail-page write chrome", () => {
       expect(html).toContain('<div class="ui purple label issue-state-label">');
       expect(html).toContain("Merged");
       expect(html).not.toContain('id="status-button"');
-      expect(html).not.toContain("pull-merge-box");
+      // The MERGED box renders again (the merge-box write arms' landing:
+      // ShowMergeBox = !HasMerged || IsPullBranchDeletable — the merged
+      // success arm + the cleanup form).
+      expect(html).toContain("pull-merge-box");
+      expect(html).toContain("successfully merged");
+      expect(html).toContain('action="/alice/wave5/pulls/1/cleanup"');
       // The comment form itself stays (comments on merged PRs are legal).
       expect(html).toContain('id="comment-form"');
     } finally {

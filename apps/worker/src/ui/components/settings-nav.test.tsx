@@ -41,6 +41,7 @@ const USER_HREF_ORDER = [
   'href="/user/settings/notifications"',
   'href="/user/settings/appearance"',
   'href="/user/settings/security"',
+  'href="/user/settings/blocked_users"', // lit by the user blocked-users tab's module (pages/user-settings-blocked.tsx)
   'href="/user/settings/applications"',
   'href="/user/settings/keys"',
   'href="/user/settings/actions/general"', // lit by the user general page's module (P2-1)
@@ -75,6 +76,7 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
       settingsNavLocale.notifications, // "notifications"
       settingsNavLocale.appearance, // "settings.appearance"
       settingsNavLocale.security, // "settings.security"
+      settingsNavLocale.blocked_users, // "user.block.list" (lit by the user blocked-users tab's module)
       settingsNavLocale.applications, // "settings.applications"
       settingsNavLocale.ssh_gpg_keys, // "settings.ssh_gpg_keys"
       settingsNavLocale.actions, // "actions.actions" (the summary)
@@ -95,13 +97,11 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
 
   it("renders NO dead items — the unlanded upstream targets are omitted, never dead anchors", () => {
     const html = renderToString(<UserSettingsNavbar active="profile" />);
-    // Account (:7-11), Notifications (:12-16) and Repos (:74-76) RENDER
-    // (their pages landed); Blocked users (:25-27), Audit (:36-38) stay
-    // omitted; Packages (:61-65) landed with the user packages tab's mount.
-    for (const dead of [
-      'href="/user/settings/blocked_users"',
-      'href="/user/settings/audit_logs"',
-    ]) {
+    // Account (:7-11), Notifications (:12-16), Blocked users (:25-27) and
+    // Repos (:74-76) RENDER (their pages landed — blocked-users with
+    // pages/user-settings-blocked.tsx); Audit (:36-38) stays omitted;
+    // Packages (:61-65) landed with the user packages tab's mount.
+    for (const dead of ['href="/user/settings/audit_logs"']) {
       expect(html).not.toContain(dead);
     }
     // The Actions Scoped-workflows sub-item (:55-56) RENDERED with the
@@ -119,6 +119,7 @@ describe("UserSettingsNavbar (user/settings/navbar.tmpl reduced)", () => {
       runners: 'href="/user/settings/actions/runners"',
       packages: 'href="/user/settings/packages"',
       security: 'href="/user/settings/security"',
+      "blocked-users": 'href="/user/settings/blocked_users"', // the user blocked-users tab's module (committed-unmounted at its writing)
       applications: 'href="/user/settings/applications"',
       keys: 'href="/user/settings/keys"',
       secrets: 'href="/user/settings/actions/secrets"',

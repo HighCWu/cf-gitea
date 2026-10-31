@@ -406,15 +406,13 @@ beforeAll(async () => {
 // --- the claim pins (route-level — wave14/25 pin the parse shapes only) ---------
 
 describe("claim pins (route-level answers the parse pins leave open)", () => {
-  it("the /labels/initialize template-loader tail stays engine-owned on BOTH scopes (404, never the management page)", async () => {
+  it("the /labels/initialize template-loader write is LIVE on BOTH scopes (the issue-write-tails fold — chi's 405 on GET)", async () => {
     await ensureLabelsFixtures();
     const repoScope = await fetchUi(`/labelmx/${REPO_SLUG}/labels/initialize`);
-    expect(repoScope.status).toBe(404);
-    expect(await repoScope.text()).not.toContain("page-content repository labels");
+    expect(repoScope.status).toBe(405);
 
     const orgScope = await fetchUi(`/${ORG_NAME}/labels/initialize`);
-    expect(orgScope.status).toBe(404);
-    expect(await orgScope.text()).not.toContain("page-content organization settings labels");
+    expect(orgScope.status).toBe(405);
   });
 
   it("the ORG write tails answer GET with chi's 405 (the convention wave25 pins repo-side only)", async () => {

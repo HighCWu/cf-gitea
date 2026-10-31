@@ -860,30 +860,31 @@ describe("the claim pins (the delete tail + the GET-only surface)", () => {
       repo: "hello",
       id: "7",
     });
-    // Upstream web.go:1430 registers POST /milestones/{id}/delete — this
-    // slice renders no delete controls and claims no delete shape (the
-    // dead-link rule), for any segment value.
+    // Upstream web.go:1430 registers POST /milestones/{id}/delete — LANDED
+    // (the issue-write-tails fold): the bare /delete literal is CLAIMED; a
+    // deeper {id}/delete tail stays engine-owned (upstream has no such
+    // route either — the id rides the form).
     expect(parseUiRoute("/octo/hello/milestones/7/delete")).toBeNull();
     expect(handlesUiRoute("/octo/hello/milestones/7/delete")).toBe(false);
-    expect(parseUiRoute("/octo/hello/milestones/delete")).toBeNull();
+    expect(parseUiRoute("/octo/hello/milestones/delete")).toEqual({ family: "milestone-delete", owner: "octo", repo: "hello" });
   });
 
-  it("a live POST to the delete tail and to the bare list both 404 unwritten; the milestone row survives", async () => {
+  it("a live POST to the bare-list miss 404s unwritten; the live delete now CASCADES through the fold (the pre-fold 404 retired)", async () => {
     const alice = await seedVerifiedUser({ username: "alice" });
     const repo = await seedRepo(alice, "claims");
     const svc = new IssuesService(env.DB);
     const m = await seedMilestone(svc, repo.id, "survivor", 10);
     const cookie = await sessionHeader(alice.id);
 
-    const del = await fetchUi(`/alice/claims/milestones/${m.id}/delete`, formPost(`/alice/claims/milestones/${m.id}/delete`, {}, cookie));
-    expect(del.status).toBe(404);
+    const del = await fetchUi(`/alice/claims/milestones/delete`, formPost(`/alice/claims/milestones/delete`, { id: String(m.id) }, cookie));
+    expect(del.status).toBe(303);
 
     const bareListPost = await fetchUi("/alice/claims/milestones", formPost("/alice/claims/milestones", { title: "nope" }, cookie));
     expect(bareListPost.status).toBe(404);
 
-    // Neither miss wrote anything: the row is untouched in D1.
+    // The delete wrote: the row is gone.
     const row = await drizzle(env.DB).select().from(milestones).where(eq(milestones.id, m.id)).get();
-    expect(row?.name).toBe("survivor");
+    expect(row).toBeUndefined();
   });
 });
 

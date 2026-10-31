@@ -32,8 +32,11 @@
  * are live links for the index.ts window to route.
  *
  * Per-template reductions applied:
- *   - user nav: Blocked users (no user-scope module) and Audit are
- *     UNRENDERED (no landed pages). Account and Notifications RENDER —
+ *   - user nav: Blocked users RENDERED since the user-scope module landed
+ *     (pages/user-settings-blocked.tsx — committed-unmounted at its
+ *     writing, a live link for the index.ts window to route; the org
+ *     twin's dead-link life cycle). Audit remains UNRENDERED (no landed
+ *     page). Account and Notifications RENDER —
  *     their pages landed (upstream gates them on disabled-features /
  *     EnableNotifyMail; both settings pin FALSE/TRUE so the items always
  *     render — the modules' SPEC §3 reduction).
@@ -144,7 +147,7 @@ export const settingsNavLocale = {
   org_settings: "Settings", // "org.settings" (the header, :3)
   org_options: "Organization", // "org.settings.options" (:5)
   labels: "Labels", // "repo.labels" (:13)
-  blocked_users: "Blocked users", // "user.block.list" (:21)
+  blocked_users: "Blocked users", // "user.block.list" (user navbar.tmpl:26 + org navbar.tmpl:21 — the same key serves both families' item)
   audit: "Audit Log", // "audit.title" (:51 — the census R13 org arm's item)
 } as const;
 
@@ -157,6 +160,7 @@ export type UserSettingsNavTab =
   | "notifications" // pages/user-settings-notifications.tsx
   | "appearance" // pages/user-settings-appearance.tsx
   | "security" // pages/user-settings-security.tsx
+  | "blocked-users" // pages/user-settings-blocked.tsx (committed-unmounted at its writing — the link goes live at the index.ts fold)
   | "applications" // pages/user-settings-applications.tsx
   | "keys" // pages/user-settings-keys.tsx
   | "actions-general" // pages/user-settings-actions-general.tsx
@@ -198,7 +202,7 @@ export type OrgSettingsNavTab =
  * the Actions <details> opens while an actions-group page renders
  * (navbar.tmpl:40's or-arm) and stays closed otherwise. Item order is
  * navbar.tmpl's exact order with the dead items dropped: Profile, Account,
- * Notifications, Appearance, Security, Applications, Keys,
+ * Notifications, Appearance, Security, Blocked users, Applications, Keys,
  * Actions▸(General, Runners, Secrets, Variables), Hooks, Organizations.
  */
 export function UserSettingsNavbar(props: { active: UserSettingsNavTab }) {
@@ -219,13 +223,19 @@ export function UserSettingsNavbar(props: { active: UserSettingsNavTab }) {
         <a class={item("notifications")} href="/user/settings/notifications">
           {settingsNavLocale.notifications}
         </a>
-        {/* navbar.tmpl:17-19 (Blocked users :25-27 dead) */}
+        {/* navbar.tmpl:17-19 */}
         <a class={item("appearance")} href="/user/settings/appearance">
           {settingsNavLocale.appearance}
         </a>
-        {/* navbar.tmpl:20-24 (Blocked users :25-27 dead) */}
+        {/* navbar.tmpl:20-24 */}
         <a class={item("security")} href="/user/settings/security">
           {settingsNavLocale.security}
+        </a>
+        {/* navbar.tmpl:25-27 — lit by the user settings blocked-users tab's
+            module (pages/user-settings-blocked.tsx; committed-unmounted at
+            its writing, the org twin's life cycle). */}
+        <a class={item("blocked-users")} href="/user/settings/blocked_users">
+          {settingsNavLocale.blocked_users}
         </a>
         {/* navbar.tmpl:28-30 */}
         <a class={item("applications")} href="/user/settings/applications">
