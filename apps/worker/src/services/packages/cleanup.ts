@@ -69,6 +69,7 @@ import {
   findUnreferencedPackages,
   deletePackageFile,
   deletePackageVersionAndReferences,
+  searchVersions,
 } from "./model";
 import { packageBlobContentKey } from "./blobs";
 import { PropertyType, getOrCreateInternalPackageVersion } from "./distro-common";
@@ -129,10 +130,18 @@ export function cleanupOlderThanHoursFromEnv(env: { PACKAGE_CLEANUP_OLDER_THAN?:
   return hours > 0 ? hours : DEFAULT_CLEANUP_OLDER_THAN_HOURS;
 }
 
-/** Per-tick bounds (the audit prune's page posture; a throw → redelivery). */
+/** Per-tick bounds (the audit prune's page posture; a throw → redelivery).
+ *  These bound ONLY the R2 spool walk — an R2 list is inherently paged and
+ *  the budget-overrun throw is the redelivery seam. The rule version walk
+ *  carries no cap: upstream's own cleanup passes no Paginator
+ *  (cleanup.go:37-41 → searchVersionsBySession's Paginator-nil arm,
+ *  package_version.go:300-306 — the unbounded Find), so the sweep rides the
+ *  same paginator-less searchVersions fork the preview loaders do and
+ *  preview/sweep evaluate the identical version set. (The former private
+ *  RULE_VERSIONS_CAP=1000 walk was our own invention, not upstream's —
+ *  retired with the unification.) */
 const TMP_LIST_PAGE = 100;
 const TMP_MAX_LIST_CALLS = 40;
-const RULE_VERSIONS_CAP = 1000;
 
 /**
  * The hourly producer (§4.4): unconditional (ratified non-demo-gated), but
@@ -399,15 +408,21 @@ async function executeCleanupOneRule(
   // the rebuild rider fires ONCE per rule, after the loop.
   let anyVersionDeleted = false;
   for (const pkg of targets) {
-    // SearchVersions with SortCreatedDesc (cleanup.go:70-75) — created desc,
-    // id desc for the stable order; capped per package per tick (a backlog
-    // continues next tick; every delete is state the next run re-derives).
-    const versions = await d1
-      .select()
-      .from(packageVersions)
-      .where(and(eq(packageVersions.packageId, pkg.id), eq(packageVersions.isInternal, false)))
-      .orderBy(sql`${packageVersions.createdUnix} DESC, ${packageVersions.id} DESC`)
-      .limit(RULE_VERSIONS_CAP);
+    // SearchVersions{PackageID, IsInternal: Some(false), SortCreatedDesc} —
+    // the exact option set upstream's rule loop passes, and NO Paginator
+    // (cleanup.go:37-44): through the landed searchVersions twin that is
+    // packageId + excludeInternal with page/limit OMITTED — the
+    // paginator-less Find (searchVersionsBySession's Paginator-nil arm,
+    // package_version.go:300-306), the same fetch the cleanup-rule preview
+    // loaders make. Created desc, id desc is searchVersions' fixed order
+    // (configureOrderBy :279-295 — SortCreatedDesc rides the default arm
+    // plus the id tiebreak), so the positional keep-count trim below sees
+    // upstream's pvs order.
+    const { rows: found } = await searchVersions(env.DB, {
+      packageId: pkg.id,
+      excludeInternal: true,
+    });
+    const versions = found.map((row) => row.version);
     const candidates: PackageVersionRow[] = [];
     for (const [index, version] of versions.entries()) {
       // keep-count: the FIRST keepCount rows of the created-desc order (the

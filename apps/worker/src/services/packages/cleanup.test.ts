@@ -3,7 +3,8 @@
  * producer probes (no rules + no orphans → zero queue sends; each probe arm
  * alone arms the single enqueue), the window parsing, and the consumer's two
  * arms — ExecuteCleanupRules (keep-count, remove-days, keep/remove patterns,
- * match_full_name, the un-compilable-pattern skip) and CleanupExpiredData
+ * match_full_name, the un-compilable-pattern skip, the unbounded
+ * paginator-less version walk) and CleanupExpiredData
  * (unreferenced package rows, the expired unreferenced blob rows + their R2
  * content keys — the SOLE content-key deleter — and the orphan spool sweep),
  * with the idempotency re-run pin.
@@ -368,6 +369,41 @@ describe("handlePackagesCleanup — ExecuteCleanupRules", () => {
     const left = (await db().select().from(packageVersions).all()).map((v) => v.lowerVersion);
     expect(left).toEqual(["2.0"]); // keepme/2.0 matched nothing (name differs); dropme/2.0 matched and fell
     void doomed;
+  });
+
+  it("the version walk is UNBOUNDED — upstream's cleanup passes no Paginator (cleanup.go:37-41), so a backlog past the retired per-tick cap dies in one run", async () => {
+    // The former private LIMIT-1000 walk left the OLDEST rows (the
+    // created-desc tail) for a later tick; the paginator-less searchVersions
+    // fork (searchVersionsBySession's Paginator-nil arm, package_version.go:
+    // 300-306 — the fetch the preview loaders share) enumerates them all,
+    // so preview and sweep evaluate the identical version set.
+    const ownerId = await seedUser("backlog-owner");
+    const old = new Date("2026-01-01T00:00:00Z");
+    const { row: pkg } = await getOrInsertPackage(env.DB, { ownerId, type: "generic", name: "bulk", now: old });
+    const TOTAL = 1001; // one past the retired cap's reach
+    const CHUNK = 12; // 12 rows x 8 params stays under D1's 100-variable statement cap
+    const bulk: (typeof packageVersions.$inferInsert)[] = [];
+    for (let i = 0; i < TOTAL; i++) {
+      const version = `9.0.${String(i).padStart(4, "0")}`;
+      bulk.push({
+        packageId: pkg.id,
+        creatorId: 0,
+        version,
+        lowerVersion: version,
+        createdUnix: new Date(old.getTime() + i * 1000), // created asc — the tail is the oldest
+        isInternal: false,
+        metadataJson: null,
+        downloadCount: 0,
+      });
+    }
+    for (let i = 0; i < bulk.length; i += CHUNK) {
+      await db().insert(packageVersions).values(bulk.slice(i, i + CHUNK));
+    }
+    await seedRule({ ownerId, removeDays: 1 });
+
+    await handlePackagesCleanup(consumerEnv(), { now: NOW });
+
+    expect(await db().select().from(packageVersions).all()).toHaveLength(0);
   });
 
   it("an un-compilable keep pattern skips the rule (upstream logs and moves on)", async () => {
