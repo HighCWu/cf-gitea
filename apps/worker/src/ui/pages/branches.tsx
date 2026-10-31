@@ -169,8 +169,13 @@
  * ## Reductions (documented divergences)
  *
  * - The Download / RSS buttons (upstream's EnableFeed /
- *   DisableDownloadSourceArchives block) stay unrendered: no archive
- *   endpoint or feed surface exists to target (the dead-link rule).
+ *   DisableDownloadSourceArchives block, list.tmpl:44-52/:173-181) stay
+ *   unrendered: the per-branch RSS still has no feed surface to target (no
+ *   `rss/branch` route — the dead-link rule), but the archive half's
+ *   premise is stale — the web-shape archive endpoint IS landed
+ *   (wave-ui-parity-6's `/archive/{ref}.{format}`, branches resolve), so
+ *   the unrendered dropdown is this page's own open parity row, not a
+ *   dead-link arm.
  * - The per-name copy-to-clipboard button (list.tmpl's octicon-copy
  *   `data-clipboard-text` control) stays unrendered — a JS clipboard
  *   control with no no-JS posture.

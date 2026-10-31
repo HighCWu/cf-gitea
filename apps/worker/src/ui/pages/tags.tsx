@@ -40,8 +40,10 @@
  * and tag-only tags fall to upstream's OWN else-arm target `/src/tag/{name}`
  * (the dead-link rule — the landed file view resolves tag refs). The meta
  * line: the ShortSha commit link onto `/src/commit/{oid}` (octicon-git-commit
- * — allowlisted), then the upstream action links this slice renders:
- * "New Release" onto `/releases/new?tag={name}` when the tag is NOT
+ * — allowlisted), then the ZIP / TAR.GZ archive pair onto the LANDED
+ * web-shape archive route (below), then the upstream action links this
+ * slice renders: "New Release" onto `/releases/new?tag={name}` when the
+ * tag is NOT
  * release-backed and the viewer holds CanCreateRelease (= CanWrite(Releases)
  * && !IsArchived — TagsList:230; the write seam's canWriteRepo predicate),
  * "Detail" onto `/releases/tag/{name}` when it is (both octicon-tag).
@@ -53,9 +55,16 @@
  *   table row (the push-synced tag record), and the engine boundary carries
  *   no tag timestamps — the API's own Tag model renders none. A D1 tag-only
  *   row's CreatedUnix would fake a git fact; nothing renders instead.
- * - The ZIP / TAR.GZ archive links are unrendered: the web-shape archive
- *   route is the survey's separate bench row, not landed (the branches
- *   page's archive reduction — dead-link rule).
+ * - The ZIP / TAR.GZ archive links render on every row (tag/list.tmpl:36-39
+ *   at the pin: the inline `archive-link flex-text-inline` anchors under
+ *   `{{if not $.DisableDownloadSourceArchives}}` — a setting the landed
+ *   model does not keep, default-on per pages/archive-files.ts's gate note,
+ *   inside the code-read block whose grant is vacuous here — the module's
+ *   gates note). The hrefs are the LANDED web-shape archive family
+ *   (wave-ui-parity-6's `/archive/{ref}.{format}` GET, tags resolve branch →
+ *   tag → oid); the old reduction's "the route is not landed" premise was
+ *   stale — the same stale premise corrected in pages/releases.tsx at
+ *   c732812 (the mount this module's owner owed).
  * - The per-row Delete Tag control (web.go:1501's `POST /tags/delete`) is
  *   the wave-33 tail (the survey's top-5 #2): writer-gated
  *   (`canDeleteTag` = CanWrite(code) && CanContentChange — no mirrors, the
@@ -124,6 +133,9 @@ export const tagsLocale = {
   tags: "Tags", // "repo.release.tags" (TrN plural arm)
   search_placeholder: "Search tags…", // "search.tag_kind"
   new_release: "New Release", // "repo.release.new_release"
+  /** Upstream literals (tag/list.tmpl:37-38 — no locale key at the pin). */
+  archive_zip: "ZIP",
+  archive_targz: "TAR.GZ",
   detail: "Detail", // "repo.release.detail"
   no_results: "No results found.", // "no_results_found"
   delete_tag: "Delete Tag", // "repo.release.delete_tag" (the wave-33 control)
@@ -289,8 +301,9 @@ function TagsReleaseHeader(props: { repoLink: string; releaseCount: number; tagC
 }
 
 /** The meta line (list.tmpl's flex-text-block): the ShortSha commit link,
- *  then the action links the slice renders (the header's reductions cover
- *  the time span and the archive pair). The wave-33 Delete Tag control is
+ *  the ZIP / TAR.GZ archive pair (tag/list.tmpl:36-39 — every row, no write
+ *  gate), then the action links the slice renders (the header's reduction
+ *  covers the time span). The wave-33 Delete Tag control is
  *  the plain form POST the labels page carries (upstream's link-action +
  *  confirm dialog is the documented no-JS reduction); it renders for
  *  writers on non-release-backed rows exactly like upstream's
@@ -307,6 +320,21 @@ function TagMetaLine(props: { repoLink: string; row: TagRowView; canCreateReleas
           {shortSha(row.commitOid)}
         </a>
       ) : null}
+      {/* The ZIP / TAR.GZ archive pair (tag/list.tmpl:36-39 at the pin):
+          every row, reader-facing (no write gate — only the not-modeled
+          DisableDownloadSourceArchives setting, default-on), onto the LANDED
+          /archive/{ref}.{format} route (the old missing-route premise
+          corrected — the module header's archive bullet). The escaped
+          slash-tag hrefs re-parse to the same route (index.ts's archive
+          arm keeps multi-segment tails). */}
+      <a class="archive-link flex-text-inline" href={`${props.repoLink}/archive/${pathEscapeSegments(row.name)}.zip`} rel="nofollow">
+        <Icon name="octicon-file-zip" />
+        {tagsLocale.archive_zip}
+      </a>
+      <a class="archive-link flex-text-inline" href={`${props.repoLink}/archive/${pathEscapeSegments(row.name)}.tar.gz`} rel="nofollow">
+        <Icon name="octicon-file-zip" />
+        {tagsLocale.archive_targz}
+      </a>
       {props.canCreateRelease && !row.releaseBacked ? (
         <a class="flex-text-inline" href={`${props.repoLink}/releases/new?tag=${pathEscapeSegments(row.name)}`}>
           <Icon name="octicon-tag" />

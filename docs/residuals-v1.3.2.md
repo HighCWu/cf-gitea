@@ -254,8 +254,10 @@ board rows now.
    (`apps/worker/src/ui/pages/org-settings-packages.tsx` header note +
    documented-reductions section; the omission recorded in
    `specs/README.md`'s 0016 row and commit `6bf9c17`).
-   **Landed slice 2026-10-31 — rpm, half two of M7** (uncommitted in the
-   tree at this update): `services/packages/rpm.ts` + the rpm route arms in
+   **Landed slice 2026-10-31 — rpm, half two of M7** (COMMITTED `fbace73`
+   — the dual-tenant wave salvaged complete from the sixth wall, both units
+   died post-completion pre-report; the verification is the green suites on
+   the tree, 38/38 rpm+arch own-eyes): `services/packages/rpm.ts` + the rpm route arms in
    `api/routes/packages-protocols.ts` — the binary header reader (header.go
    ported: lead/sig/header sections + the SHA-256/SHA-1 digest gates), the
    tag extraction, the createrepo-shaped repodata build over the stored-
@@ -271,10 +273,11 @@ board rows now.
    `specs/0016-packages.md`'s M7 section. Reductions documented there: the
    upload `?sign=true` re-sign arm unported (MD5 + region-rewrite), the
    empty-group arm narrowed to the family's per-key delete.
-   **Landed slice 2026-10-31 — arch, half three of M7** (the dual-tenant
-   wave's second half, sharing `packages-protocols.ts` with the rpm unit
-   above — hunks attributed per family; uncommitted in the tree at this
-   update): `services/packages/arch.ts` + the arch route arms — the pacman
+   **Landed slice 2026-10-31 — arch, half three of M7** (COMMITTED
+   `fbace73` — the dual-tenant wave's second half, sharing
+   `packages-protocols.ts` with the rpm unit above — hunks attributed per
+   family; 8/8 own-eyes, debian+alpine neighbors 20/20 unregressed):
+   `services/packages/arch.ts` + the arch route arms — the pacman
    `.db` tar builder (the `{name}-{version}/files`+`/desc` pairs in
    repository.go's files-first order, the be_sync.c 23-field layout,
    `joinFields`' newline-forgery gates), the vercmp.go port (upstream's
@@ -298,8 +301,9 @@ board rows now.
    precedent), the pinned index member order, `arch.key.created`.
    Still open in this row: the cargo tail only; the cleanup rebuild-arm
    wiring (cleanup.go:115-145's BuildAllRepositoryFiles family —
-   debian/alpine/rpm/arch builders are exported and un-wired) rides the
-   orchestrator's wiring wave.
+   debian/alpine/rpm/arch builders are exported and un-wired) and the
+   deploy-probes distro arms ride the orchestrator's wiring wave
+   (fbace73's recorded re-dispatch items).
    Size: **L** for cargo, demand-gated; — for the four non-git families.
 
 7. **The `/api/v1` Actions registry-management ops — the 54
@@ -551,28 +555,42 @@ board rows now.
    never-fail-the-write posture, documented). Sizes: **S–M** each; the
    whole remainder is a dispatchable batch.
 
-7. **The review-webui rendering remainder — NARROWED by `7e72149`
-   (read items 10 and 11 for the landed drifts' detail).** Source:
+7. **The review-webui rendering remainder — LANDED COMPLETE (`c732812`,
+   the row's last four S pieces; read items 10 and 11 for the earlier
+   landed drifts' detail).** Source:
    `docs/usability/parity-review-webui.md` top-drifts list; the New-PR
    button, empty-repo anon arm, branches order, and collaborator grants
    LANDED in v1.3.1 (`d52361b`, `56df8a6`, `7f9241e`); the two Vue
    islands (merge box, branch selector) LANDED per item 10; the timeline
    anchor split, the issues/pulls rows, and the header tab strip's four
    pieces LANDED at `7e72149` per item 11 (with the merge-line anchor
-   premise corrected there). REMAINING — four S pieces, no M left: the
-   Go-to-file/New-PR/Add-File home row (`pages/home.tsx`); the issues
-   list's `#issue-filters` toolbar skeleton + Labels/Milestones buttons
-   (`list.tmpl:25-56` — the New buttons are in, the
-   wrapper/checkboxes/filters are not); the releases Source-Code archive
-   rows (`pages/releases.tsx`, although `/archive` serves — the POST arm
-   `4e6d1cc` mounted); and the Code tab's ref-preserving href
-   (`header.tmpl:100-101` — the `7e72149`-deferred piece, needs the
-   current BranchName/RefTypeNameSubURL threaded through the `ui/index.ts`
-   ctx assembly). Sizes: **S** each.
+   premise corrected there). The four REMAINING S pieces all LANDED at
+   `c732812`, each verified at the pin: (1) the home row's Go-to-File +
+   Add-File (view_content.tmpl:75-105 — the search container verbatim
+   over the landed wave-39 aux, the writer-gated Add-File dropdown, plus
+   the writer-only #new-pull-request anchor); (2) the issues list's
+   `#issue-filters` skeleton + Labels/Milestones buttons (list.tmpl:25-26
+   live routes, filters.tmpl's toolbar skeleton with the select-all
+   checkbox disclosed inert until rows carry checkboxes, the hidden
+   #issue-actions twin); (3) the releases Source-Code pair
+   (release/list.tmpl:78-89 verbatim, gated !isDraft, serving list AND
+   detail — the module's stale "web archive route does not exist"
+   reduction corrected in place: wave-32's GET + `4e6d1cc`'s POST both
+   serve; the tags page's twin stale note + mount closed by its owner in
+   the same window, tag/list.tmpl:36-39); (4) the Code tab's
+   ref-preserving href (header.tmpl:100-101 — branchName +
+   refTypeNameSubURL threaded through UiContext and resolveUiRequest's 34
+   pure insertions; the disclosed cost: one doubled listRefs on those
+   page loads; no-ref pages' plain href IS upstream's landing per
+   web.go:1760-1761). Pins: render 28/28 (+4), issues matrix 37/37 (+4),
+   releases 35/35, code-tab-ref 6/6 NEW (mounted, real receive-pack
+   seed), goldens 91/91 (7 files re-baselined, pure insertions; icons
+   allowlist 76), a11y 88/88. Size: — (landed).
 
 8. **The review-git protocol remainder — the receive-pack caps pair and
-   the protocol-v2 pair LANDED (`e454a75`); the export-subst/attr-macro
-   engine arm and the ladder-ordering drifts stay.** Source:
+   the protocol-v2 pair LANDED (`e454a75`); export-subst LANDED
+   (`761ff28`); the attr-macro arm and the ladder-ordering drifts
+   stay.** Source:
    `docs/usability/parity-review-git.md`; the archive POST arm and the
    GCM realm LANDED in v1.3.1 (`4e6d1cc`, `85fa2ff`); the LFS locking
    family and the archive attribute semantics LANDED in the window since
@@ -597,15 +615,26 @@ board rows now.
    blobs stay unmarked with the directly-wanted-blob lazy-fetch
    carve-out; under a filter the want gate relaxes to upstream's
    has-object rule; both full-clone fast paths exclude filtered
-   requests). STILL OPEN (engine-scope items separated in the review):
-   export-subst stays parsed but not substituted in archives — blobs
-   stream byte-identical with `$Format:…$` literals surviving, and
+   requests). **LANDED slice 2026-10-31 — export-subst (`761ff28`, the
+   staged arm salvaged complete from the sixth wall, 23/23 own-eyes on
+   the tree):** the pretty-format expansion over the ARCHIVE COMMIT's
+   fields, worker-side (`api/services/export-subst.ts` + the walk's
+   hook in `api/services/archive.ts` — the engine untouched, the
+   recorded "verify no NOTICE row was owed" open item resolved by that
+   same fact): the empirically-observed placeholder set (%H %h %T %P,
+   the author/committer identities incl. %aI/%cI RFC3339 and %aD/%cD,
+   %s %f %b, the %d/%D ref decorations resolved against the walk's ref
+   context, the %%/%n literals), the multi-line marker semantics, and
+   the UNTERMINATED-marker steal (an open `$Format:` consumes to the
+   next `$` — git's observed behavior, the disposition pinned);
+   substituted at the walk's blob stream, export-ignore unchanged;
+   archive.test 16→23 (each placeholder class from a fixture commit).
+   STILL OPEN (engine-scope items separated in the review):
    `[attr]`-macro patterns sit outside the compiled matcher subset —
    the engine-side expansion is the recorded future arm (`5365236`);
    the ladder-ordering drifts (403-before-auth arms, the
    wiki-doesn't-exist pkt-line, dumb-HTTP absent — documented). Sizes:
-   **M** each; the export-subst/attr pair is an engine-boundary decision
-   first.
+   **M**; the attr-macro half is an engine-boundary decision first.
 
 9. **The review-packages D-4/D-5/D-6 tail — LANDED (`41eada6`).** D-4's
    nuget service-index trio serves unauthenticated (the `none` protocol
@@ -640,9 +669,9 @@ board rows now.
     call sites) and `data-enable-feed` (no `/rss/branch` route), and
     `data-current-repo-default-branch` stays empty (no default-branch
     input — the menu's "default" label degrades off). Item 7's OTHER
-    rows (Go-to-file/Add-File home row, `#issue-filters` skeleton,
-    timeline `event-{id}` anchor split, releases Source-Code archive
-    rows, header tab strip icons/Settings tab) remain open as written.
+    rows are now ALL LANDED (the timeline anchor split + the header tab
+    strip at `7e72149` per item 11; the remaining four pieces at
+    `c732812` per item 7 — nothing of item 7 is open).
 
 11. **Amendment to item 7 — the timeline anchor split, the issues/pulls
     rows, and the header tab strip LANDED in the v1.3.2 window
@@ -689,14 +718,11 @@ board rows now.
     `octicon-tools`, `gitea-double-chevron-left` (the first gitea-
     namespaced glyph; 73 entries). Goldens regenerated via the sentinel
     (41 files, token deltas = exactly the five shapes above). Still
-    open from item 7, unchanged: the Go-to-file/Add-File home row
-    (pages/home.tsx), the `#issue-filters` toolbar skeleton + the
-    Labels/Milestones buttons (list.tmpl:25-56 — the New buttons are
-    in, the wrapper/checkboxes/filters are not), the releases
-    Source-Code archive rows (pages/releases.tsx), and the Code tab's
-    ref-preserving href (header.tmpl:100-101 — needs the current
-    BranchName/RefTypeNameSubURL threaded through the ui/index.ts ctx
-    assembly).
+    open from item 7: NOTHING — the four remaining pieces (the
+    Go-to-file/Add-File home row, the `#issue-filters` toolbar skeleton
+    + the Labels/Milestones buttons, the releases Source-Code archive
+    rows, and the Code tab's ref-preserving href) LANDED at `c732812`
+    (item 7's record — the row is closed).
 
 12. **The owner-store KV prerequisite — the actions-settings POST arms'
     staged substrate (`6bdd91f`/`180b409`'s recorded reduction; the
@@ -930,7 +956,7 @@ board rows now.
   rules — none is dispatchable as a bare UI/store unit.
 - The v1.3.1 additions (P2-5 through P2-10, P3-7 through P3-13) and the
   parity-wave additions (P3-14, P3-15) are mostly dispatchable small
-  batches over landed substrate; P2-8's remaining engine-scope items and
+  batches over landed substrate; P2-8's remaining attr-macro arm and
   P3-11 need their boundary decisions first. Verify the in-flight block
   at the top BEFORE dispatching any of them — the doc-time block it
   replaced is fully resolved (the header note), and the block's items

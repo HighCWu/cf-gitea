@@ -81,8 +81,11 @@
  *     per-branch RSS-feed and download-source-archive buttons (list.tmpl's
  *     EnableFeed / DisableDownloadSourceArchives block, :44-52/:173-181)
  *     get their explicit absence arm — documented never-pinned before; the
- *     absence is permanent while no archive endpoint or feed surface exists
- *     to target (the module header's dead-link reduction).
+ *     absence holds while the per-branch RSS has no feed surface to target
+ *     (no `rss/branch` route) and the archive dropdown stays unmounted —
+ *     the archive ENDPOINT itself is landed (wave-ui-parity-6's
+ *     `/archive/{ref}.{format}`; the old "no archive endpoint exists"
+ *     premise was stale, corrected in the module header + here).
  *   - the webui-parity ORDER arms over a dedicated `w100sort` fixture: the
  *     upstream default `commit_time DESC, name ASC` (models/git/
  *     branch_list.go:89-99 — no sort control exists at the pin, the brief's
@@ -828,10 +831,13 @@ describe("w100 rename write (POST /branches/rename)", () => {
 // :173-174 per-branch) and a download-source-archive dropdown
 // (DisableDownloadSourceArchives, :47-52 / :176-181 — the ZIP/TAR.GZ
 // archive-link anchors) on every row; pages/branches.tsx renders neither
-// (the module header's Reductions block: no archive endpoint or feed surface
-// exists to target — the dead-link rule). The census classifies this as the
+// (the module header's Reductions block: no per-branch feed surface exists,
+// and the archive dropdown is unmounted — the archive ENDPOINT itself is
+// landed since wave-ui-parity-6, so the dropdown's absence is an open
+// parity row, NOT a dead-link arm; the block's stale "no archive endpoint"
+// premise corrected). The census classifies this as the
 // dangerous unrendered-AND-unpinned class, so the absence gets its explicit
-// arm; it holds until an archive/feed surface lands and flips it deliberately.
+// arm; it holds until the dropdown/feed mount lands and flips it deliberately.
 
 describe("w100 feed/archive absence (w129 batch-14: the documented never-pinned pair)", () => {
   it("no per-branch RSS button and no download-source-archive anchors render — on the default or any listed branch", async () => {

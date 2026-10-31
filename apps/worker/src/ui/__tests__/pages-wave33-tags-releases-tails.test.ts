@@ -300,6 +300,27 @@ describe("the tags page delete control (wave-33 hunks)", () => {
     const readHtml = await (await fetchUi("/wave33-owner/tagged/tags", withCookie("/x", readCookie))).text();
     expect(readHtml).not.toContain("/tags/delete");
   });
+
+  it("renders the per-row ZIP / TAR.GZ archive pair for every reader (tag/list.tmpl:36-39)", async () => {
+    // The pair is reader-facing (no write gate — only the not-modeled
+    // DisableDownloadSourceArchives setting, default-on): the anonymous page
+    // carries it on EVERY row, release-backed or tag-only, onto the LANDED
+    // web-shape archive route (wave-32; the ref resolves branch → tag →
+    // oid). Slash tag names keep their slashes (the route re-parses
+    // multi-segment tails); the old "the archive links are unrendered"
+    // reduction carried the stale missing-route premise.
+    const anonHtml = await (await fetchUi("/wave33-owner/tagged/tags")).text();
+    expect(anonHtml).toContain('class="archive-link flex-text-inline" href="/wave33-owner/tagged/archive/v1.zip"');
+    expect(anonHtml).toContain('href="/wave33-owner/tagged/archive/v1.tar.gz"');
+    expect(anonHtml).toContain('href="/wave33-owner/tagged/archive/rel/1.0.zip"');
+    expect(anonHtml).toContain('href="/wave33-owner/tagged/archive/rel/1.0.tar.gz"');
+    expect(anonHtml).toContain('href="/wave33-owner/tagged/archive/v2.zip"');
+    expect(anonHtml).toContain('href="/wave33-owner/tagged/archive/keep/me.tar.gz"');
+    // The links WORK: one of them serves the archive bytes end-to-end
+    // (the dead-link rule — the mount is not decorative).
+    const zip = await fetchUi("/wave33-owner/tagged/archive/v2.zip");
+    expect(zip.status).toBe(200);
+  });
 });
 
 // --- the tag delete write --------------------------------------------------------

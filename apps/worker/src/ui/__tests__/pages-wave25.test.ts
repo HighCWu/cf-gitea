@@ -288,8 +288,15 @@ describe("tags page /{owner}/{repo}/tags", () => {
     expect(html).toContain(`href="/wave25-owner/labeled/src/commit/${fixture.tips[1]}"`);
     // The anonymous viewer holds no CanCreateRelease — no New Release links.
     expect(html).not.toContain("/releases/new?tag=");
-    // No archive or delete-tag dead links (the module header's reductions).
-    expect(html).not.toContain("archive/");
+    // The archive pair renders for every reader since the tags.tsx mount
+    // (tag/list.tmpl:36-39 at the pin — the old "no archive links"
+    // reduction carried the stale missing-route premise; the web-shape
+    // archive route landed wave-ui-parity-6). Both rows, both formats.
+    expect(html).toContain('href="/wave25-owner/labeled/archive/v1.0.0.zip"');
+    expect(html).toContain('href="/wave25-owner/labeled/archive/v1.0.0.tar.gz"');
+    expect(html).toContain('href="/wave25-owner/labeled/archive/v2.0.0-rc.zip"');
+    expect(html).toContain('href="/wave25-owner/labeled/archive/v2.0.0-rc.tar.gz"');
+    // The delete-tag control stays writer-gated (the wave-33 mount).
     expect(html).not.toContain("tags/delete");
   });
 
