@@ -122,7 +122,7 @@ wire-format module):
 | nuget (`api.go:348-378`) | 698 ln | V2 OData + V3 JSON service index, registration, symbols | yes — the largest single-ecosystem wire | M4 |
 | container (`api.go:509-547`) | ≈2,000 ln (routers 1,459: container 796 + blob 195 + manifest 416 + errors 52; plus services 314 + the wire module 204) | OCI: token → blob POST/PATCH/PUT chunked uploads, manifests | yes — JWT flow + upload state + digests | M5 |
 | debian / alpine / rpm / arch | each 300-600 ln | repo metadata index BUILDERS (`Packages`/`Release`/`APKINDEX`/`repodata`/`.repo` files) regenerated on upload/delete (`gitea/services/packages/cleanup/cleanup.go:115-145` rebuild arms) | yes — index files | M6 |
-| cargo (`api.go:156-172`) | ~600 ln + index.go | sparse/git index: `config.json` + `1|2|3/{name}` version lists **in a real git repo** (`_cargo-index`, index.go:29; commits via the files service, index.go:112) | yes — a git repo | M7 |
+| cargo (`api.go:156-172`) | ~600 ln + index.go | sparse index: `config.json` + `1|2|3/{name}` version lists derived on read (upstream's HTTP face builds them from the DB per request, cargo.go:66-87 → index.go:139-183); the **git repo** (`_cargo-index`, index.go:29) is only the traditional git-protocol mirror and stays the separate SPEC-attached milestone | yes — D1-derived; the git mirror deferred | **M7 LANDED** (see the cargo as-built) |
 | conan / composer / chef / conda / cran / go / pub / rubygems / swift / terraform / vagrant | each 150-700 ln | per-client wire contracts | protocol-only | long tail, demand-driven |
 
 Verdict: the MODEL is the one shared prerequisite; the protocols are a
@@ -483,9 +483,12 @@ demo-sweep.ts mount record — §2.6's quote anchors): SELECT due cleanup work a
    `buildAllRpmRepositoryFiles`; the other three composed: internal-version
    file sweep, then the family's distinct-property enumeration through the
    landed BuildSpecific twins). Upstream's arch arm rides a globallock we do
-   not carry (the serialized REPO_TASKS consumer is the writer gate); the
-   per-package cargo rider (cleanup.go:110-118) stays unwired until cargo
-   lands.
+   not carry (the serialized REPO_TASKS consumer is the writer gate). The
+   per-package cargo rider (cleanup.go:108-118) is WIRED since the cargo
+   family landed — INSIDE the rule's package loop, per package that lost a
+   version, distinct from the distro post-loop rebuild; it resolves to
+   upstream's own repo-absent no-op (index.go:94-99; the git mirror is §1's
+   separate milestone, the sparse index derives on read).
 
 The arm never runs unless a rule is enabled or orphans exist; no DEMO-gating
 parallel — this is upstream's own midnight job, not the demo sweep's
@@ -1234,3 +1237,530 @@ separately, neither unit touched the other's arms.
   (the debian gpgv battery's in-suite twin). A future `pacman -Syu`
   battery (a repo-add-built sync db cross-checked against ours) is the
   residual, gated on a host with pacman.
+
+## As-built — the long-tail `go` family: the Go module proxy protocol (2026-10-31 — the registry carries TWELVE protocols)
+
+The §2.1 long-tail row's `go` family landed: `services/packages/goproxy.ts`
++ the api.go:305-316 route arms in `api/routes/packages-protocols.ts`
+(upstream `routers/api/packages/goproxy/goproxy.go` 223 ln +
+`modules/packages/goproxy/metadata.go` 103 ln + the upstream integration
+test `tests/integration/api_packages_goproxy_test.go` as the client-shape
+oracle), over the same substrate unchanged (no new tables — the go.mod
+text is a version-scoped package_property row, the zip the ONE lead file
+`{version}.zip`, the blob bytes verbatim through the two-pass store).
+
+- **The endpoint map (pin cites):** `PUT /go/upload` (api.go:306, write) →
+  UploadPackage; `GET /go/sumdb/sum.golang.org/supported` (api.go:308) →
+  `http.NotFound` — the checksum-DB mirror probe answers the Go not-found
+  page, the protocol's "this proxy does not mirror sum.golang.org"; the
+  PathGroup (api.go:309-316) reads `/{name}/@latest`,
+  `/{name}/@v/list`, `/{name}/@v/{version}.zip/.info/.mod` with the whole
+  group wrapped in reqPackageAccess(read). chi's `<name:*>` is greedy
+  (`.*`), so the LAST `@latest`/`@v` marker wins (a module path may carry a
+  `@v` segment); `<version>` is `[^/]+` — an empty version tail (`.zip`
+  with nothing before the dot) falls off the grammar. Ported as the npm
+  walk: the `/:username/go/*` wildcard hands the raw remainder to
+  `parseGoTarget` (decode-once-fully, the npm path discipline); the statics
+  (`upload`, the sumdb probe) outrank the wildcard; chi runs the group
+  middleware BEFORE the router 404s, so the gate stack precedes the
+  not-found page.
+- **The 404/410 missing contract:** the protocol lets a proxy answer 404 OR
+  410 for a missing module/version (the go tool treats the pair alike);
+  upstream answers uniformly 404 — the list miss is `apiError(404, nil)`
+  (the EMPTY body, goproxy.go:35-37), the resolve misses carry
+  ErrPackageNotExist's "package does not exist" (goproxy.go:54-56/:93-95);
+  410 appears nowhere in the pin, so this family serves 404 and never 410.
+  Unmatched shapes serve chi's router page ("404 page not found\n",
+  text/plain; charset=utf-8 + nosniff) AFTER the gate.
+- **The parse (metadata.go:37-103, go.dev/ref/mod#zip-files):** the module
+  name and version come from the FIRST central-directory entry whose
+  path.Dir carries `@` (SplitN "@" 2 → SplitN "/" 2); the version is gated
+  by x/mod/semver.IsValid (→ 400 "package version is invalid"); entries
+  below the `{module}@{version}/` root are skipped; the first root-level
+  go.mod reads as the version PROPERTY `go.mod` (16 MiB recorded-size cap
+  → 400, metadata.go:20); no `@`-entry → 400 "package has invalid
+  structure"; `@`-entries but no root go.mod synthesize `module {name}`
+  (metadata.go:100). The zip bytes store VERBATIM (IsLead), so downloads
+  are byte-parity by construction.
+- **The version grammar:** `isGoSemverValid` is x/mod/semver's parse ported
+  anchor-for-anchor (parseInt's leading-zero rule, the prerelease's
+  numeric-identifier rule, the build's laxer identifiers). Short forms
+  (`v1`, `v1.0`) are VALID (the parse short-circuits), and Go's
+  pseudo-versions (`v0.0.0-20230101000000-abcdefabcdef`) are simply
+  canonical semver with a prerelease — there is no separate pseudo-version
+  grammar in the pin. The upstream metadata_test.go arms + the x/mod
+  acceptance/rejection table are pinned in the suite.
+- **Wire shapes:** @v/list renders one version per line, CreatedUnix ASC
+  (the handler's sort.Slice — ours adds the id tiebreak for determinism),
+  text/plain;charset=utf-8, 404-EMPTY when the module is unknown;
+  @latest/{version}.info answer ctx.JSON's `{"Version", "Time"}` in
+  declaration order, application/json;charset=utf-8 (base.go:112-119) —
+  Time renders RFC3339Nano with the UTC `Z` (the AsLocalTime reduction:
+  workerd has no TZ database; upstream's second-granular column never
+  emits a fraction, and neither do ours); {version}.mod serves the stored
+  property verbatim (a missing property is upstream's 500 — the prod body);
+  {version}.zip rides helper.ServePackageFile → the D-6 serve set with
+  application/octet-stream (ServeSetHeaders' IfZero default — serve.go:75,
+  the zip is NOT sniffed) and the lead GET counter bump (packages.go:664-668).
+  Upload error mapping (goproxy.go:172-180/:211-217): the three
+  ErrInvalidArgument sentinels → 400; ErrDuplicatePackageVersion → 409
+  ALWAYS (allowDuplicate=false — even same bytes, the integration test's
+  conflict arm); quota → 403 (the +1 count parity, the landed sweep's
+  shape); zip.NewReader's plain error and a duplicate FILE row hit the
+  DEFAULT arm → 500. "latest" resolves via SearchLatestVersions
+  (`len != 1` → not exist), the max(id)-per-package shape.
+- **Documented reductions:** the upload capped at 64 MiB (413 — the
+  nuget/arch parse-family precedent; upstream spools with no explicit cap,
+  ours materializes for the zip walk); the self-hosted zip reader is
+  self-contained in goproxy.ts (EOCD + central-directory walk, stored +
+  deflate-raw, the bomb gate — nuget's extractor is module-private); the
+  lying-Content-Length store failure maps 500 (the npm/nuget
+  non-InvalidArgument posture); wrong-method requests on read shapes fall
+  off the sub-app (Hono) where chi would answer 405 — the helm/pypi mount
+  precedent.
+- **Tests** (`packages-go.test.ts` 22/22, own eyes): the round-trip (201 →
+  the type "go" package + version + the go.mod property + the lead
+  {version}.zip; list order via a pinned created_unix; @latest vs .info;
+  byte-parity zip with the disposition + the counter bump — HEAD never
+  counts); the zip layout arms (below-root skip → synthesized `module
+  {name}`, greedy first-@ capture, short `v2` acceptance, non-semver 400,
+  no-@-entry 400, corrupt body 500, the recorded-size go.mod cap 400, the
+  deflate arm + the zip-bomb gate 500, the always-409 re-publish with the
+  property-not-doubled assert); the semver table (14 valid + 16 invalid
+  forms incl. pseudo-versions, short forms, leading zeros, bad prerelease
+  numerics, non-ASCII, empty identifiers); the 404/410 contract (the EMPTY
+  list-miss body; "package does not exist" on every resolve miss; the
+  router page for unmatched shapes; the sumdb probe); the auth/quota arms
+  (401 challenges, public-anonymous/private-challenge reads incl. the sumdb
+  probe's gate, the size + +1-count 403s with the admin bypass,
+  PACKAGES_ENABLED=false, the unknown-owner redirect message, the service
+  seams for the 64 MiB cap + the archive sentinel). Neighbors re-run
+  post-change: debian + alpine + rpm + arch 58/58.
+- **The LIVE battery (real client, this host):** `go` 1.25.1 linux/amd64 IS
+  installed — the full proxy round-trip ran against the real dev server
+  (vite + workerd, local D1 + R2, the bootstrap-admin PAT): a two-file
+  module zip (`goproxy.local/hello@v1.0.0/go.mod` + `hello.go`, built with
+  python zipfile in a scratch dir) PUT → 201 (duplicate → 409); curl swept
+  the shapes (list 200 "v1.0.0\n" then the pseudo-version; @latest → the
+  newest row; .info RFC3339; .mod verbatim; .zip 200 size=625 = the exact
+  upload size; sumdb probe 404 page); then the REAL client:
+  `GOPROXY=http://127.0.0.1:5174/api/packages/goproxyer/go GONOPROXY=none
+  GONOSUMDB='*' GOFLAGS=-mod=mod go mod download goproxy.local/hello` →
+  exit 0 (the module cache holds `list`, `v1.0.0.info`, `v1.0.0.mod`,
+  `v1.0.0.zip` + ziphash — the client fetched ALL FOUR shapes from this
+  family), `go build -buildvcs=false` → the consumer binary printed
+  "hello from the cf-gitea proxy" (the served zip's code compiles and
+  runs), the pseudo-version `v0.0.0-20230101000000-abcdefabcdef` downloaded
+  (exit 0, both versions' go.sum h1: hashes computed from OUR bytes), and
+  the missing-version arm through the client (`v1.9.9`) reads the 404
+  verbatim: "server response: package does not exist" — the protocol's
+  missing-module contract end-to-end. Two client postures disclosed:
+  `GOPRIVATE='*'` is WRONG for a GOPROXY-only host (it sets GONOPROXY too —
+  go bypasses the proxy for VCS fetch); the working posture is
+  `GONOPROXY=none GONOSUMDB='*'` (proxy everything, skip the checksum DB —
+  consistent with the sumdb probe's 404). A `-buildvcs=false` consumer
+  build (the scratch dir sits outside any git repo; VCS stamping fails in
+  /tmp — client-side, not a proxy behavior).
+- **Independent re-verification (the gap-fill unit, same day):** the whole
+  gate set re-run with own eyes against the final bytes — the suite 22/22,
+  the neighbors (debian + alpine + rpm + arch) 58/58, check:api PASS, bare
+  tsc zero errors in the family's files, scoped eslint clean — plus a
+  second live battery (user `gobattery`, the 5173 server, module
+  `gitea.local/battery/hello`): upload 201 → list/@latest/sumdb-probe via
+  curl; `go mod download` exit 0 (cache holds `list`, `.info`, `.mod`,
+  `.zip` + ziphash), and the UNPINNED `go get` resolving through `@latest`
+  → the version row added. **The checksum parity assert:** the go.sum h1
+  the client pinned (`h1:d26unde…LdI=`) equals `dirhash.HashZip(zip,
+  dirhash.Hash1)` (golang.org/x/mod@v0.42.0, the authoritative library)
+  computed over OUR uploaded zip — the H1 dirhash is over the EXTRACTED
+  files, not the zip bytes, and the client's acceptance of our served
+  bytes is what produced the hash. The mission's literal command
+  (`GOPROXY=… GOFLAGS=-mod=mod go mod download`, default GOSUMDB) fails by
+  design: the client honors our /supported 404, goes DIRECT to
+  sum.golang.org, and the public DB rejects a private module — the
+  disclosed private-module posture (`GONOSUMDB='gitea.local/*'`) is the
+  fix, upstream's own contract working as intended. The battery's PAT row
+  was deleted and its 0600 token file shredded after the run.
+
+## As-built — M7 tail: cargo (2026-10-31 — the registry carries TWELVE protocols; the census's sparse-index family lands, the git mirror stays its own milestone)
+
+Upstream `routers/api/packages/cargo/cargo.go` + `services/packages/cargo/index.go` +
+`modules/packages/cargo/parser.go` at the pin, ported as `src/services/packages/cargo.ts`
++ the cargo arms in `packages-protocols.ts` (the section after the GO family —
+the file's per-family split). Mount: the sparse-index family over
+`/api/packages/{owner}/cargo` — `GET config.json` (index.go:260-272:
+`{dl, api, auth-required}`; `auth-required` = the non-public owner — the
+`RequireSignInViewStrict` OR-arm is off-by-default and not carried in our
+config surface), the sparse index through all FOUR path shapes
+(`/1/{p}`, `/2/{p}`, `/3/{_}/{p}`, `/{_}/{__}/{p}` — the placeholders are
+dummies, the name is the last segment; registration order mirrors upstream
+api.go:129-145, statics first so the generic 3-segment shape cannot shadow
+the search route), `GET api/v1/crates` search, `PUT api/v1/crates/new`
+publish, `GET .../{p}/{v}/download` (byte parity, the lead-file GET counter),
+`DELETE .../yank` + `PUT .../unyank`, `GET .../{p}/owners`.
+
+**The index storage posture (the family's one real decision, recorded):**
+upstream maintains the `_cargo-index` GIT repository (index.go:24) as the
+traditional git-protocol mirror, but the sparse HTTP endpoints never read it
+— `EnumeratePackageVersions` derives every NDJSON line from D1 at request
+time (cargo.go:66-87 → BuildPackageIndex, index.go:139-183), and
+`UpdatePackageIndexIfExists` itself defines the seam this port rides:
+"cargo http index does not rely on the repo itself, so if the repo does not
+exist, we just do nothing" (index.go:94-99). Our tree never creates the repo
+(§1 keeps it a SPEC-attached milestone), so `updateCargoPackageIndex` is
+permanently the repo-absent arm — one repositories-row probe keyed
+owner+`_cargo-index`, then the no-op (a present row logs the reduction). Every
+write arm still calls it at upstream's call-site shape, so the git-mirror
+milestone hangs off one seam.
+
+As-built pins: the .crate publish container (`uint32-LE metadata length |
+metadata JSON | uint32-LE content length | .crate bytes`, parser.go:57-71;
+32 MiB metadata cap, limited_reader.go:14 → 400 "content exceeds the size
+limit"; short content → 400 "invalid content size" cargo.go:181-184; TRAILING
+bytes past the declared length are the upstream LimitReader truncation and
+succeed); the name regex `\A[a-zA-Z][a-zA-Z0-9-_]{0,63}\z` + hashicorp/go-version
+`NewSemver` via npm.ts's `parseGoSemver` port (parser.go:53/:63); the rename
+resolution (`explicit_name_in_toml` names the dep, the original moves to
+`package`, parser.go:105-124); non-absolute http(s) URLs blank out
+(parser.go:66-71). The index-entry line is `IndexVersionEntry` struct order —
+`{name, vers, deps, cksum, features, yanked, links?}` with deps nil → [] and
+features nil → {} (index.go:157-165), cksum = the LEAD file's blob sha256
+(index.go:171), yanked from the `cargo.yanked` version property
+(strconv.ParseBool ignored-error → false), links omitempty; served as
+text/plain NDJSON, one line per version, in upstream SortVersionAsc order —
+`ORDER BY version ASC, id DESC`, the RAW version string (package_version.go:
+287-294 — NOT a semver-aware sort: `1.0.10` sorts BEFORE `1.0.2`; recorded
+because cargo clients expect semver order, and upstream-parity wins until a
+real client pins otherwise). Zero versions → the nil-index 404 with the EMPTY
+detail (cargo.go:80-82 → apiError(404, nil)). Every error answers the
+StatusResponse wrap `{"ok":false,"errors":[{"detail":…}]}`, every success
+`{"ok":true}` (cargo.go:19-49), 500s stripped to "internal server error"
+(helper.go:30-49 prod posture). Divergences recorded in cargo.ts's header:
+the transport cap is the store's 512 MiB (upstream cargo carries no
+MaxBytesReader), container parse error messages are JS text where upstream
+carries Go runtime text (the status and wrap are exact), and the yank walk's
+"Property not found" 500 (cargo.go:256-259) answers the stripped prod body.
+
+The cleanup rider (upstream cleanup.go:108-118) LANDED with the family, per
+§4.4 above — inside `executeCleanupOneRule`'s package loop, per package that
+lost a version, `rule.type === "cargo"` gated, DISTINCT from the four distro
+families' post-loop rebuild (the df868d2 record's "stays unwired" note is
+superseded). Suites: cargo.test 17/17 (publish round-trip through every
+sparse shape + the D1 posture, the rename resolution, the string-sort
+ordering pin, the nil-index 404, config.json's private-owner arm, search
+clamps, owners, download byte-parity/counter, yank/unyank index flips, the
+parser sentinels incl. the 65-char name + the parser_test.go invalid-version
+set, short-content 400 + trailing-bytes OK, 409/403/401 arms,
+PACKAGES_ENABLED=false) and cleanup.test 22→24 (the rider arm: per-package
+loop shape over two cargo packages, the repo-row-present arm resolving, no
+internal `_cargo` rows fabricated). The REAL-CLIENT battery rode cargo
+1.94.0 against the live dev server (5174; a disclosed local python shim
+proxied 9911→5174 stripping the `Upgrade: h2c`/`HTTP2-Settings` headers the
+miniflare-beta dev dispatch crashes on — client-side only, the PROTOCOL
+arms were exercised unmodified): server-side publish via curl with
+`Authorization: token <PAT>` → `{"ok":true}` 200; `cargo fetch` in a
+consumer crate → config.json 200 (cargo parsed `{dl, api}`), the sparse
+index GET `cf/-b/cf-battery` 200 (cargo's own two-line version resolution
+picked 0.1.1 over 0.1.0), the `dl` download 200 with the cache file's
+sha256 `ad5ab0f7…df68fc` == the stored payload, and `cargo build` COMPILED
+the crate — cargo's cksum gate accepted our served bytes. The PUBLISH side
+from the real client is a documented PARITY WALL, not a bug: cargo 1.94's
+credential provider sends `Authorization: <token>` BARE (header captured
+live), and upstream's own auth chain at the pin accepts only the 2-part
+`token|bearer|Basic` grammar (httpauth.ParseAuthorizationHeader, basic.go
+parseAuthBasic — both trees identical), so a bare-token `PUT /new` answers
+401 against upstream Gitea TOO (verified against the pin's source; live
+`cargo publish` here reproduced the 401 with the gate challenge body). The
+bare-token acceptance would be a cross-family divergence beyond the pin —
+recorded as an open question for the orchestrator, NOT landed. Battery
+teardown: the battery user row deleted, the PAT swept, the 0600 token file
+shredded.
+
+## As-built — the long-tail `swift` family: the Swift package registry protocol (2026-10-31 — the census's Swift registry lands; the registry carries FOURTEEN protocols)
+
+Upstream `routers/api/packages/swift/swift.go` (507 ln) +
+`modules/packages/swift/metadata.go` (258 ln) at the pin, with
+`tests/integration/api_packages_swift_test.go` + the module's
+`metadata_test.go` as the shape oracles, ported as
+`src/services/packages/swift.ts` + the swift arms in `packages-protocols.ts`
+(the section after the CARGO family; the walk + wire helpers in the file's
+per-family helper split). Mount: `/api/packages/{owner}/swift` over
+`POST ""`/`POST /login` (CheckAuthenticate — the UNAUTHENTICATED group,
+api.go:452-455: Doer-nil is the only check, any valid credential passes
+REGARDLESS of token scope; the bare 200 carries NO Content-Version), the
+`{scope}/{name}` family (enumerate bare + `.json`, the chi PathGroup
+`/*` shapes `<version>` / `<version>.json` / `<version>.zip` /
+`<version>/Package.swift` / PUT `<version>`, api.go:462-468) and
+`GET /identifiers?url=…` (api.go:470). The scope/name/version params are
+chi `[^/]+` single segments — the walk decodes PER SEGMENT (the arch
+precedent); the `.json`/`.zip` suffix routes strip their suffixes the way
+chi's static-tail branches win over the bare param route (a valid package
+name can never carry a dot — namePattern), so `1.0.0.exe` rides the BARE
+version route into the metadata lookup's Problem 404 while a four-segment
+shape runs the read gate then chi's router page (the go family's
+gate-before-404 posture).
+
+- **The storage posture (unchanged substrate):** the zip stores VERBATIM as
+  the ONE lead file `{name}-{version}.zip` (byte-parity downloads by
+  construction); the manifest texts + author + description/keywords/
+  license/licenseURL/codeRepository ride the version's MetadataJSON (the
+  SwiftMetadata shape, upstream tag order, Go's sorted-map manifests keys);
+  `swift.scope`/`swift.name` are PACKAGE properties; each metadata
+  `repositoryURLs` entry becomes a `swift.repository_url` VERSION property
+  (insert errors logged, never fatal — swift.go:411-416); the package id is
+  `scope.name` with `SemverCompatible` true.
+- **The version grammar = hashicorp/go-version v1.9.0** (gitea/go.mod; the
+  source verified against the real library on this host): the upload gate
+  and the manifest filename/tools-version gates ride `NewSemver`
+  (SemverRegexpRaw — the prerelease REQUIRES its separator), the
+  `swift-version` query param rides `NewVersion` (VersionRegexpRaw — the
+  laxer `-?` letter form). Ported anchor-for-anchor: parse/String()/
+  TrimmedVersionString/Compare, quirks included (the letter class
+  `[-A-Za-z~]` EATS a trailing hyphen, so NewVersion accepts `1.0.6-`
+  rendering "1.0.6--" while NewSemver rejects it — the integration test's
+  upload-400 arm; numeric prerelease parts sort BELOW non-numeric ones;
+  1-2 segment forms canonicalize to three). Enumerate sorts
+  SemVer.LessThan ASC (id tiebreak for determinism) with the Link
+  `rel="latest-version"` carrying the LAST row's RAW version while the
+  releases map keys render `SemVer.String()` — a "1.0" upload enumerates
+  under "1.0.0" with the Link pointing at the raw "1.0".
+- **The parse (metadata.go:118-245):** the SELECTED manifest set is the
+  SHALLOWEST manifest directory, ties by dir name, never archive order —
+  the nested-package rule (test fixtures/examples must not replace the
+  package manifest; `swift package archive-source`'s single top-level dir
+  and the leading-slash entry are pinned by the metadata_test.go arms).
+  Caps ride the RECORDED uncompressed sizes: 128 KiB per file, 64 files,
+  8 MiB total. The default (no-suffix) manifest MUST exist. The optional
+  metadata form part decodes as the schema.org SoftwareSourceCode document
+  with Go's case-insensitive field fallback; codeRepository/licenseURL
+  validate as absolute http(s) (else blanked — validation.IsValidURL) while
+  `repositoryURLs` is NOT validated; an absent author name synthesizes from
+  given/middle/family (`Person.String()`).
+- **Wire shapes:** every swift response carries `Content-Version: 1`
+  (setResponseHeaders) EXCEPT CheckAuthenticate's 200; errors are the RFC
+  7807 Problem document `{"status",detail}\n` over
+  application/problem+json (json.Encoder's trailing newline; ProcessErrorForUser
+  semantics: an err's message, fmt.Sprint of a string, "" for nil; 500s
+  stripped to the prod body). Enumerate renders Go's key-sorted map over
+  baseURL'd RAW-version URLs (`{"releases":{…}}`); metadata renders the
+  declaration-order PackageVersionMetadataResponse + SoftwareSourceCode
+  (the resources pair names the source-archive with the blob sha256 as
+  checksum; author present only when ANY name part is set;
+  `repositoryURLs` omitempty); DownloadPackageFile sets
+  `Digest: sha256=<hash>` + application/zip through the D-6 serve set with
+  the lead GET counter bump (HEAD never counts); DownloadManifest serves
+  the stored text verbatim as text/x-swift (the query param normalized
+  through NewVersion+TrimmedVersionString — `5.6.0` → `5.6`), a MISS
+  answering 303 SeeOther with the bare RAW Location (no query param). The
+  Accept media-type contract: a PRESENT-but-different Accept answers the
+  400 Problem naming the required type on every read shape + the PUT
+  (absent/empty passes — swift.go:96).
+- **Documented reductions:** the multipart/urlencoded body capped at 64 MiB
+  (413 — the goproxy/nuget parse-family posture; upstream spools with no
+  cap, ours materializes for the multipart walk); the metadata part bounds
+  at upstream's own 32 MiB MaxMetadataSize (limited_reader.go:14 — an
+  over-size document errors the JSON decode upstream, the 500 default arm);
+  a corrupt zip / a zip-bomb-shaped archive / an undecodable metadata JSON
+  are PLAIN errors upstream → the DEFAULT arm → 500 (only the
+  ErrInvalidArgument sentinels answer 400; an empty metadata VALUE part is
+  FormValue's "" → the nil reader — ABSENT, while an empty FILE part still
+  fails the decode); a vanished R2 content object answers the honest 404
+  (the families' sole-sweeper posture); wrong-method requests fall off the
+  sub-app where chi would answer 405 (the helm/pypi mount precedent);
+  JSON rendering via JSON.stringify (no Go Marshal HTML escaping — the
+  landed families' wire posture); `GET /swift` bare falls off the sub-app
+  (upstream chi answers the router page — no route there either).
+- **Tests** (`swift.test.ts` 27/27 + `packages-swift.test.ts` 20/20, own
+  eyes): the parse battery against the metadata_test.go oracle (the
+  selection-tie arms incl. the prefixed-archive + leading-slash +
+  name-decides cases, the 64-file boundary at > not >=, the recorded-size
+  lies firing the caps without materializing bytes, the deflate arm +
+  bomb gate, the metadata decode arms incl. author synthesis + URL
+  validation + the EMPTY document); the TrimmedVersionString table; the
+  go-version port tables (String canonicalization, Compare incl. the
+  numeric-below-non-numeric prerelease rule and the jagged segments, the
+  strict/lax acceptance split verified against go-version v1.9.0 itself);
+  the route battery's round-trip (201 → the properties + MetadataJSON +
+  the lead `{name}-{version}.zip`; the always-409 re-publish that must not
+  double a property row; byte-parity download with the Digest header + the
+  counter bump), the Accept contract sweep over all seven shapes, the
+  SemVer-sorted enumerate with the Link header + the `.json` twin, the
+  metadata document's exact shape, the manifest default/trim/303 arms, the
+  identifiers trio, the login probe pair's 401-Problem-vs-bare-200 split,
+  the bad-scope/name/version triples (the go-version error text as the
+  Problem detail), the auth challenges, the +1 count boundary + the size
+  cap + the admin bypass, PACKAGES_ENABLED=false, the unknown-owner
+  redirect message, the gated-vs-ungated 404 split, and the walk grammar's
+  suffix/gating table. NO live swift client battery — no swift toolchain on
+  this host (the hand-built zip + multipart fixtures are the battery, the
+  rpm/arch builder pattern); the wire shapes were pinned against the
+  upstream integration test's assertions instead of a real
+  `swift package` run — flagged as the follow-up when a toolchain host is
+  available. Neighbors re-run post-change: debian + alpine + rpm + arch +
+  go + helm + nuget 112/112; check:api PASS; scoped eslint clean; bare tsc
+  zero errors in the swift files (a concurrent rubygems unit's in-flight
+  file carried the only repo-visible tsc error — not this unit's).
+
+## As-built — the long-tail `rubygems` family: the RubyGems registry protocol (2026-10-31 — the registry carries FIFTEEN protocols)
+
+The §2.1 long-tail row's `rubygems` family landed: `services/packages/rubygems.ts`
++ the api.go:437-447 route arms in `api/routes/packages-protocols.ts`
+(upstream `routers/api/packages/rubygems/rubygems.go` 466 ln +
+`modules/packages/rubygems/marshal.go` 312 ln + `metadata.go` 247 ln at the
+pin fc493688, with `tests/integration/api_packages_rubygems_test.go` as the
+client-shape oracle), over the same substrate unchanged (no new tables; the
+Metadata struct serializes into the version row's MetadataJSON, the .gem
+bytes store VERBATIM as the ONE lead file through the two-pass store).
+
+- **The endpoint map (pin cites):** the whole `/rubygems` group carries
+  reqPackageAccess(read) (api.go:447), the `/api/v1/gems` subgroup adding
+  write (api.go:445-446): `GET /specs.4.8.gz` → EnumeratePackages (every
+  version, GetVersionsByPackageType), `GET /latest_specs.4.8.gz` →
+  EnumeratePackagesLatest (SearchLatestVersions), `GET
+  /prerelease_specs.4.8.gz` → EnumeratePackagesPreRelease (ALWAYS the empty
+  list — rubygems.go:59-61), `GET /quick/Marshal.4.8/{filename}` →
+  ServePackageSpecification, `GET /gems/{filename}` → DownloadPackageFile,
+  `GET /info/{packagename}` → GetPackageInfo, `GET /versions` →
+  GetAllPackagesVersions (the compact-index pair, rubygems.org-compact-index
+  shaped, rubygems.go:300-302), `POST /api/v1/gems` (+ its `/` twin — chi's
+  group-index shape, the pypi double-registration precedent) →
+  UploadPackageFile, `DELETE /api/v1/gems/yank` → DeletePackage. HEAD rides
+  the download/gemspec GET walks (the pypi/helm precedent — upstream
+  registers GET only); the enumerations stay GET-only (the helm index.yaml
+  precedent).
+- **THE MISSION-BRIEF CORRECTION — the pin parses YAML, not Marshal:** the
+  mission brief said the gem container's metadata.gz holds "the Marshal-4.8
+  spec"; at the pin it is a gzipped YAML document with `!ruby/object:Gem::*`
+  tags (Ruby's `Gem::Specification#to_yaml` output) parsed by
+  go.yaml.in/yaml/v4 into a typed gemspec struct (metadata.go:184), and
+  `marshal.go` is ENCODER-ONLY — grep-verified: no `MarshalDecoder` exists
+  anywhere in the pin tree (the historical decoder was removed when the
+  parse moved to YAML). Marshal 4.8 remains the wire format on the READ
+  sides: the specs.4.8 enumerations and the quick/Marshal.4.8 gemspec render.
+  Both halves ported anchor-for-anchor; the upload parse rides the `yaml`
+  package's parseDocument with source tokens.
+- **The Marshal encoder (marshal.go ported):** `MarshalEncoder` carries the
+  4.8 header, the fixnum single-byte forms (0; +5/-5 offsets for
+  1..122/-123..-1), the positive/negative length forms (ErrInvalidIntRange
+  outside ±0x40000000), the IVar-wrapped string with the single `E`=true
+  instance variable, the deduped symbol table (':' spelling then ';'+index
+  links), arrays, RubyUserMarshal ('U'), RubyUserDef ('u' — the value encodes
+  through a FRESH encoder INCLUDING its own 4.8 header, then
+  length-prefixed), and RubyObject ('o', insertion-ordered members where Go's
+  map order is undefined — no wire path emits one). The marshal_test.go
+  TestMinimalEncoder byte vectors pin the port exactly.
+- **The gemspec.rz oracle:** the served zlib inflate matches the integration
+  test's EXACT Marshal byte string (api_packages_rubygems_test.go:254) — the
+  19 @-fields in upstream's literal order ("3.2.3", 4, name, the
+  Gem::Version usermarshal, nil date, summary, nil × 2, platform, [],
+  nil, "", authors, description, project_url, true, platform, nil,
+  licenses). Note the byte string is a GO byte string: the test reads it
+  through latin-1 code units (`\xc3` = the 195 length prefix of the inner
+  encoding, one byte — a JS literal would UTF-8-encode U+00C3 as two).
+- **The parse (metadata.go):** the .gem is a tar whose `metadata.gz` member
+  returns EARLY (a malformed member after it never read — the walk keeps
+  Go's tar.Next early-return plus its header-checksum/partial-block 500
+  arms); the inflate caps at MaxMetadataSize 32 MiB (limited_reader.go:14 —
+  enforced after inflating, upstream trips mid-stream; same
+  ErrContentTooLarge 400); the YAML decode walks the gemspec struct's field
+  set (name/version/platform/authors/description/homepage/licenses/summary/
+  dependencies/required_ruby_version/required_rubygems_version) where a
+  collection in a scalar field is yaml.v3's type error (the 500 arm) and
+  unknown fields are ignored. String scalars render `n.Value` — the scalar's
+  TEXT (`version: 1.0` stays "1.0"), which the platform parser loses to
+  float resolution; the decode reads plain scalars through their
+  `srcToken.source` (verbatim text) and quoted/block scalars through the
+  unescaped value (Go unescapes the same way). Validations: the
+  VALID_NAME_PATTERN `\A[\w.-]+\z` and the versionMatcher
+  `\A[0-9]+(?:\.[0-9a-zA-Z]+)*(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\z` →
+  ErrInvalidName/ErrInvalidVersion 400s; AsVersionRequirement (the
+  `[[restriction, {version}], …]` rows, skipping malformed entries AND the
+  `>= 0` default pair); the homepage URL validation (invalid → dropped);
+  the dependency split on `type: ":runtime"`; and the compact-index
+  line-forgery gate — any indexed value (platform, dep names, requirement
+  restrictions/versions) carrying \r or \n → ErrInvalidMetadata 400
+  (metadata.go:228-239, c52e7c0cd2).
+- **Version semantics:** stored VERBATIM from the gemspec — no server-side
+  Gem::Version normalization exists in the pin (Ruby normalizes client-side);
+  the gate is versionMatcher, the package row is SemverCompatible (upload:
+  rubygems.go:243), and Gem::Version appears on the wire only as the marshal
+  wrapper `U:\x11Gem::Version[\x06{version}`.
+- **Wire shapes:** the enumerations answer SetServeHeaders +
+  gzip-writer streams (rubygems.go:82-94): octet-stream + nosniff + the
+  sandbox CSP, the prod Cache-Control, the attachment disposition +
+  expose-headers echo, and NO Last-Modified (a zero ServeHeaderOptions time —
+  serve.go:101-104 skips it) and no byte-serving (never ctx.ServeContent);
+  Go's zw.Name ("specs.4.8") rides the gzip FNAME field, which the platform
+  encoder cannot set — every consumer compares DECOMPRESSED payloads (the
+  integration test does exactly that, and its base64 vectors pin our served
+  gunzip byte-for-byte). /info + /versions are ctx.PlainText
+  (text/plain;charset=utf-8 + nosniff); the compact line is
+  `VERSION[-PLATFORM] RUNTIME_DEPS|checksum:SHA256[,ruby:REQS][,rubygems:
+  REQS]` — RUNTIME deps only (rubygems.go:421's range), requirements
+  `&`-joined with the `>= 0` default, the md5 of the info text closing each
+  /versions line (the maven family's md5Hex — Workers' WebCrypto carries no
+  MD5); packages render in GetPackagesByType order (upstream's Find is
+  unordered — ours pins id ASC), versions in GetVersionsByPackageName order
+  (created DESC); a non-"ruby" platform renders `VERSION_platform` on the
+  versions line and `VERSION-PLATFORM` on the info line.
+- **Error shapes (apiError → ProcessErrorForUser → ctx.PlainText):** 400 —
+  the five InvalidArgument sentinels (missing metadata.gz, invalid name,
+  invalid version, invalid metadata, the 32 MiB cap); 404 — the yank miss
+  WITH "package does not exist" (rubygems.go:292-293) and the EMPTY-body
+  nil-detail 404s (the len!=1 file searches rubygems.go:111-113/:175-177,
+  the info miss); 409 — ErrDuplicatePackageVersion (always); 403 — quota;
+  501 — the quick filename without `.gemspec.rz` (rubygems.go:100-103,
+  EMPTY); 500 — everything else: corrupt tar/gzip/YAML (plain Go errors
+  upstream — tar.Next, gzip.NewReader, yaml.Decode are not
+  InvalidArgument), a duplicate file row, the prod body strip.
+  Upload: the RAW body is the .gem (ctx.UploadStream — the integration test
+  posts bare bytes, no multipart); yank: ParseMultipartForm FIRST — a
+  non-multipart content type is Go's ErrNotMultipart → the 500 DEFAULT arm
+  (the integration test posts multipart fields; the pin's literal shape),
+  gem_name/version read in Go's r.Form order (URL query first, body fields
+  append), success = Go's write-nothing handler answer 200 EMPTY, and the
+  delete cascade is RemovePackageVersionByNameAndVersion (packages.go:505)
+  over DeletePackageVersionAndReferences — blobs defer to the sweep
+  (PACKAGE-DEFER-STORAGE-DELETE), rubygems registers no
+  OnBeforeRemovePackageVersion hook.
+- **Documented reductions:** the upload capped at 64 MiB (413 — the
+  go/nuget/arch parse-family precedent); the 32 MiB metadata cap enforced
+  post-inflate; the tar walk self-contained in rubygems.ts (distro-common's
+  reader answers a finished list — the early-return needs the incremental
+  walk); concatenated-member gzip decode rides walkGzipMembers (Go's
+  multistream default), a body with no gzip magic errors; parseDocument
+  reads a single document (Go's Decoder.Decode reads the first of a
+  stream); multi-line plain scalars would read their raw source through
+  srcToken (Go renders the folded value) — pathological for the indexed
+  field set, and the newline gate rejects any \r\n carrier anyway; the
+  lying-Content-Length store failure maps 500 (the npm/nuget posture).
+- **Tests** (`packages-rubygems.test.ts` 33/33, own eyes: `Tests  33
+  passed (33)`): the Marshal encoder vectors (marshal_test.go's table +
+  the length-form arms + the error sentinels + the symbol-dedup shape); the
+  parse battery (the fixture field set, the missing-member/structural tar
+  arms, the invalid-name rows, the versionMatcher accept/reject tables, the
+  newline-forgery rows, the empty-metadata 500 arm, the 32 MiB cap, the
+  AsVersionRequirement skip table); the round-trip (201 → the
+  SemverCompatible package + MetadataJSON + the ONE lead
+  `{name}-{version}.gem`; the always-409 re-publish; byte-parity download +
+  the counter bump — HEAD never counts; the gemspec.rz EXACT-byte oracle
+  twice — through the route and through buildRubyGemSpecification; the 501
+  gate; the enumerate vectors byte-for-byte incl. the always-empty
+  prerelease; the compact-index info + versions text exactly as the
+  integration test asserts; the platform-gem filename + `_platform` index
+  suffix); the yank walk (multipart 200 → the 404s after; the unknown-gem
+  404 message; the non-multipart 500 arm; the EMPTY-404 download/
+  gemspec misses); the auth/quota arms (401s, public-anonymous/
+  private-challenge reads, the size + +1-count 403s with the admin bypass,
+  PACKAGES_ENABLED=false, the unknown-owner redirect message, the corrupt-
+  body sentinel mapping). Neighbors re-run post-change: debian + alpine +
+  rpm + arch + go 80/80. check:api PASS. Scoped eslint clean
+  (rubygems.ts, packages-rubygems.test.ts, packages-protocols.ts). Bare tsc
+  zero errors in the family's files.
+- **Open issues:** none blocking. The no-`gem`-CLI-on-this-host posture
+  stands (the go family's live-battery pattern would need a ruby toolchain
+  with `gem` + a bundled Gitea source plugin — `gem` speaks the same compact
+  index + Marshal shapes the integration test pins, and every byte-level
+  consumer shape is already double-pinned by upstream's own vectors); if a
+  ruby toolchain lands, the live battery should push the built fixture gem
+  through the real client and sweep info/versions/specs.4.8.gz.

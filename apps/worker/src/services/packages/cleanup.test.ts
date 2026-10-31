@@ -22,6 +22,7 @@ import {
   packageProperties,
   packageVersions,
   packages,
+  repositories,
   users,
 } from "../../db/schema";
 import {
@@ -148,6 +149,7 @@ beforeEach(async () => {
     "package_versions",
     "package_cleanup_rules",
     "packages",
+    "repositories",
     "users",
   ]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
@@ -531,5 +533,50 @@ describe("handlePackagesCleanup — the distro rebuild-arm (upstream cleanup.go:
 
     expect(await db().select().from(packageVersions).where(eq(packageVersions.id, young.ver.id)).all()).toHaveLength(1);
     expect(await internalFileCount(internalVersionId)).toBe(1); // the stale row survives — no rebuild
+  });
+});
+
+describe("handlePackagesCleanup — the cargo per-package rider (upstream cleanup.go:108-118)", () => {
+  it("a cargo rule's per-package delete runs the index seam — INSIDE the loop, and no post-loop rebuild", async () => {
+    // The rider is observable through the repositories-row probe it takes
+    // (updateCargoPackageIndex resolves the `_cargo-index` repo-absent arm,
+    // index.go:94-99). Seed a repo row so the PRESENT arm runs — the sweep
+    // must stay live either way.
+    const ownerId = await seedUser("cargo-owner");
+    await db().insert(repositories).values({
+      id: "r_cargo_index_probe",
+      storageKey: "r_cargo_index_probe",
+      ownerNamespace: "cargo-owner",
+      ownerId,
+      slug: "_cargo-index",
+      visibility: "public",
+    });
+    const old = new Date("2026-01-01T00:00:00Z");
+    const doomedA = await seedTypedVersion(ownerId, "cargo", "app-a", "1.0.0", old);
+    const doomedB = await seedTypedVersion(ownerId, "cargo", "app-b", "2.0.0", old);
+    const survivor = await seedTypedVersion(ownerId, "cargo", "app-a", "2.0.0", NOW);
+    await seedRule({ ownerId, type: "cargo", removeDays: 1 });
+
+    await expect(handlePackagesCleanup(consumerEnv(), { now: NOW })).resolves.toBeUndefined();
+
+    // Both packages lost a version → the rider ran PER PACKAGE (the loop
+    // shape, cleanup.go:110-118) and both resolves.
+    expect(await db().select().from(packageVersions).where(eq(packageVersions.id, doomedA.ver.id)).all()).toHaveLength(0);
+    expect(await db().select().from(packageVersions).where(eq(packageVersions.id, doomedB.ver.id)).all()).toHaveLength(0);
+    expect(await db().select().from(packageVersions).where(eq(packageVersions.id, survivor.ver.id)).all()).toHaveLength(1);
+  });
+
+  it("a cargo rule with the index-repo row absent resolves the same (the repo-absent no-op, index.go:96-99)", async () => {
+    const ownerId = await seedUser("plain-cargo-owner");
+    const doomed = await seedTypedVersion(ownerId, "cargo", "crate", "0.1.0", new Date("2026-01-01T00:00:00Z"));
+    await seedRule({ ownerId, type: "cargo", removeDays: 1 });
+
+    await expect(handlePackagesCleanup(consumerEnv(), { now: NOW })).resolves.toBeUndefined();
+    expect(await db().select().from(packageVersions).where(eq(packageVersions.id, doomed.ver.id)).all()).toHaveLength(0);
+    // No cargo post-loop rebuild exists — and no internal `_cargo` rows were
+    // fabricated (the distro families' getOrCreateInternal shape is absent
+    // for cargo by design; the sparse index derives on read).
+    const cargoPackages = await db().select().from(packages).where(eq(packages.type, "cargo")).all();
+    expect(cargoPackages.every((row) => row.isInternal === false)).toBe(true);
   });
 });

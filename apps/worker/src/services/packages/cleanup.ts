@@ -18,7 +18,14 @@
  *      arch/repository.go:40-42); our tree carries no globallock (the
  *      landed arch module ships none either) — the serialized REPO_TASKS
  *      consumer is the writer gate. Upstream's per-package cargo rider
- *      (cleanup.go:110-118) stays unwired — no cargo ecosystem is landed.
+ *      (cleanup.go:108-118) is WIRED since the cargo family landed: inside
+ *      the rule's package loop, each package that lost a version runs
+ *      cargo.UpdatePackageIndexIfExists — DISTINCT from the distro
+ *      families' post-loop rebuild. The seam is the repo-absent no-op by
+ *      upstream's own contract (index.go:94-99: "cargo http index does not
+ *      rely on the repo itself …"; services/packages/cargo.ts's posture
+ *      note — the git-backed `_cargo-index` mirror is SPEC-0016 §1's
+ *      separate milestone; the sparse index derives on read).
  *   2. `CleanupExpiredData` — unreferenced PACKAGE rows (zero versions left),
  *      then `package_blobs` rows with zero file references older than the
  *      window, deleting their `packages/blobs/…` R2 keys — THIS SWEEP IS THE
@@ -89,6 +96,7 @@ import {
   buildAlpineRepositoryFiles,
 } from "./alpine";
 import { buildAllRpmRepositoryFiles } from "./rpm";
+import { updateCargoPackageIndex } from "./cargo";
 
 /** The REPO_TASKS message kind the producer enqueues. */
 export interface PackageCleanupMessage {
@@ -412,9 +420,20 @@ async function executeCleanupOneRule(
       if (removeMatcher !== null && !removeMatcher.test(toMatch)) continue;
       candidates.push(version);
     }
+    let versionDeleted = false;
     for (const version of candidates) {
       await deletePackageVersionAndReferences(env.DB, version.id);
       anyVersionDeleted = true;
+      versionDeleted = true;
+    }
+    // The per-package cargo rider (cleanup.go:108-118) — INSIDE the rule's
+    // package loop, distinct from the distro families' post-loop rebuild:
+    // each package that lost a version refreshes its index entry
+    // (cargo.UpdatePackageIndexIfExists; a throw fails the message → the
+    // queue redelivers). Our seam is upstream's repo-absent arm
+    // (index.go:94-99) — see cargo.ts's posture note.
+    if (versionDeleted && rule.type === "cargo") {
+      await updateCargoPackageIndex(env.DB, rule.ownerId, pkg.id);
     }
   }
 
@@ -445,8 +464,9 @@ async function executeCleanupOneRule(
       break;
     default:
       // Upstream's switch has no default arm — the generic and the other
-      // non-distro types rebuild nothing. The per-package cargo rider
-      // (cleanup.go:110-118) stays unwired: no cargo ecosystem is landed.
+      // non-distro types rebuild nothing. Cargo rebuilds nothing HERE
+      // either: its rider runs PER PACKAGE inside the loop above
+      // (cleanup.go:108-118), not post-loop.
       break;
   }
 }

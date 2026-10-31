@@ -259,6 +259,94 @@ import {
   uploadNugetSymbolPackage,
 } from "../../services/packages/nuget";
 
+import {
+  GoDuplicateVersionError,
+  GoFileSetInvalidError,
+  GoInvalidStructureError,
+  GoModFileTooLargeError,
+  GoModPropertyMissingError,
+  GoPackageNotExistError,
+  GoInvalidVersionError,
+  goTimeJson,
+  getGoModContent,
+  listGoPackageVersions,
+  openGoZipForDownload,
+  resolveGoPackageVersion,
+  uploadGoPackage,
+} from "../../services/packages/goproxy";
+
+import {
+  CARGO_CONFIG_FILE_NAME,
+  CargoContentSizeMismatchError,
+  CargoDuplicateVersionError,
+  CargoFileNotExistError,
+  CargoInvalidNameError,
+  CargoInvalidVersionError,
+  CargoMetadataTooLargeError,
+  CargoPackageNotExistError,
+  CargoParseError,
+  buildCargoPackageIndex,
+  buildCargoRegistryConfig,
+  openCargoFileForDownload,
+  searchCargoPackages,
+  setCargoPackageYanked,
+  uploadCargoPackage,
+} from "../../services/packages/cargo";
+
+import {
+  MAX_SWIFT_UPLOAD_BYTES,
+  SWIFT_ACCEPT_JSON,
+  SWIFT_ACCEPT_SWIFT,
+  SWIFT_ACCEPT_ZIP,
+  SwiftDuplicateVersionError,
+  SwiftInvalidManifestVersionError,
+  SwiftInvalidNameError,
+  SwiftInvalidScopeError,
+  SwiftInvalidVersionError,
+  SwiftManifestFileTooLargeError,
+  SwiftManifestFilesTooLargeError,
+  SwiftMissingManifestFileError,
+  SwiftMissingSourceArchiveError,
+  SwiftPackageNotExistError,
+  buildSwiftMetadataResponseJson,
+  buildSwiftPackageID,
+  buildSwiftEnumerateJson,
+  getSwiftVersionDescriptor,
+  isSwiftNameValid,
+  isSwiftScopeValid,
+  listSwiftPackageVersions,
+  lookupSwiftIdentifiers,
+  openSwiftZipForDownload,
+  parseSwiftVersionLax,
+  parseSwiftVersionStrict,
+  swiftTrimmedVersionString,
+  uploadSwiftPackage,
+} from "../../services/packages/swift";
+
+import {
+  RubyContentTooLargeError,
+  RubyDuplicateVersionError,
+  RubyInvalidMetadataError,
+  RubyInvalidNameError,
+  RubyInvalidVersionError,
+  RubyMissingMetadataFileError,
+  RubyPackageNotExistError,
+  buildRubyGemCompactIndex,
+  buildRubyGemEmptySpecsPayload,
+  buildRubyGemSpecification,
+  buildRubyGemSpecsPayload,
+  findRubyGemVersionsByFilename,
+  gzipRubyGemArchive,
+  listLatestRubyGemVersions,
+  listRubyGemVersionsByType,
+  listRubyGemVersionsByName,
+  makeRubyGemPackageInfo,
+  openRubyGemForDownload,
+  removeRubyGemVersion,
+  uploadRubyGem,
+  zlibRubyGemArchive,
+} from "../../services/packages/rubygems";
+
 const WWW_AUTHENTICATE = 'Basic realm="Gitea Package API"';
 
 // ---------------------------------------------------------------------------
@@ -1853,7 +1941,850 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
   app.get("/:username/arch/*", (c) => archDispatch(c));
   app.on("HEAD", "/:username/arch/*", (c) => archDispatch(c));
   app.delete("/:username/arch/*", (c) => archDispatch(c));
+
+  // ------------------------------ GO (api.go:305-316) ------------------------------
+  // The Go module proxy protocol: the PUT /upload write arm, the sumdb
+  // checksum-DB mirror probe (http.NotFound — "this proxy does not mirror
+  // sum.golang.org"), and the PathGroup read family whose `<name:*>` spans
+  // segments (module paths carry slashes). The wildcard hands the raw
+  // remainder to goDispatch (the npm walk's posture); the statics outrank it
+  // in Hono's router.
+
+  app.put("/:username/go/upload", async (c) => {
+    try {
+      const { owner, cred } = await protocolContext(c, "write");
+      const doer = cred.doer;
+      if (doer === null) {
+        return goPlain(401, "user should have specific permission or be a site admin");
+      }
+      await uploadGoPackage({
+        d1: c.env.DB,
+        bucket: c.env.REPO_PACKS,
+        owner,
+        doer,
+        content: bodyStream(c.req.raw),
+        declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
+        quota: packagesQuotaFromEnv(c.env),
+      });
+      return new Response(null, { status: 201 });
+    } catch (error) {
+      return goErrorResponse(error);
+    }
+  });
+
+  // api.go:308 — r.Get("/sumdb/sum.golang.org/supported", http.NotFound).
+  // The 404 is the PROTOCOL ANSWER (the client concludes "no checksum-DB
+  // mirror"); chi still runs the group's read gate before the handler, so
+  // the probe keeps the gate stack.
+  app.on(["GET", "HEAD"], "/:username/go/sumdb/sum.golang.org/supported", async (c) => {
+    await protocolContext(c, "read");
+    return goNotFoundPage();
+  });
+
+  app.on(["GET", "HEAD"], "/:username/go/*", (c) => goDispatch(c));
+
+  // ------------------------------ CARGO (api.go:127-146) ------------------------------
+  // The Rust sparse-index family: config.json + the four sparse-path shapes
+  // (`/1/{package}`, `/2/{package}`, `/3/{_}/{package}`, `/{_}/{__}/{package}`
+  // — the placeholders are dummies, the package name is always the LAST
+  // segment, index.go:31-45), the crates.io API group (search / publish /
+  // download / yank / unyank / owners). Every error answers the
+  // StatusResponse wrap `{"ok":false,"errors":[{"detail":…}]}` and every
+  // success `{"ok":true}` (cargo.go:19-49); the index lines serve as
+  // text/plain NDJSON (ctx.PlainTextBytes). The git-backed `_cargo-index`
+  // mirror is v1 out-of-scope (SPEC-0016 §1) — the sparse HTTP face derives
+  // on read exactly as upstream's does (see cargo.ts's posture note).
+
+  const cargoIndex = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const pkg = await getPackageByName(c.env.DB, owner.id, "cargo", c.req.param("package") ?? "");
+      if (pkg === null) {
+        // EnumeratePackageVersions' name miss (cargo.go:68-72) → 404
+        // "package does not exist" through the wrap.
+        return cargoApiError(404, "package does not exist");
+      }
+      const index = await buildCargoPackageIndex(c.env.DB, pkg);
+      if (index === null) {
+        // apiError(ctx, 404, nil) — the EMPTY detail (cargo.go:80-82).
+        return cargoApiError(404, "");
+      }
+      return new Response(index, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+    } catch (error) {
+      return cargoErrorResponse(error);
+    }
+  };
+  // The STATIC shapes register FIRST — upstream's own order (the api/v1/crates
+  // group at api.go:129-138, config.json at :140, then the sparse paths at
+  // :141-145) and Hono's tie-break: the 3-segment generic sparse shape below
+  // would otherwise shadow the static search route.
+  app.get(`/:username/cargo/${CARGO_CONFIG_FILE_NAME}`, async (c) => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const origin = new URL(c.req.url).origin;
+      return new Response(JSON.stringify(buildCargoRegistryConfig(owner, origin)), {
+        status: 200,
+        headers: { "content-type": "application/json;charset=utf-8" },
+      });
+    } catch (error) {
+      return cargoErrorResponse(error);
+    }
+  });
+
+  app.get("/:username/cargo/api/v1/crates", async (c) => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const params = new URL(c.req.url).searchParams;
+      const result = await searchCargoPackages(
+        c.env.DB,
+        owner.id,
+        (params.get("q") ?? "").trim(),
+        formInt(params, "page"),
+        formInt(params, "per_page"),
+      );
+      return new Response(JSON.stringify(result), {
+        status: 200,
+        headers: { "content-type": "application/json;charset=utf-8" },
+      });
+    } catch (error) {
+      return cargoErrorResponse(error);
+    }
+  });
+
+  app.put("/:username/cargo/api/v1/crates/new", async (c) => {
+    try {
+      const { owner, cred } = await protocolContext(c, "write");
+      const doer = cred.doer;
+      if (doer === null) {
+        return cargoApiError(401, "user should have specific permission or be a site admin");
+      }
+      await uploadCargoPackage({
+        d1: c.env.DB,
+        bucket: c.env.REPO_PACKS,
+        owner,
+        doer,
+        content: bodyStream(c.req.raw),
+        declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
+        quota: packagesQuotaFromEnv(c.env),
+      });
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json;charset=utf-8" },
+      });
+    } catch (error) {
+      return cargoErrorResponse(error);
+    }
+  });
+
+  const cargoDownload = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const download = await openCargoFileForDownload(
+        c.env.DB,
+        c.env.REPO_PACKS,
+        owner.id,
+        c.req.param("package") ?? "",
+        c.req.param("version") ?? "",
+        c.req.method === "HEAD" ? "HEAD" : "GET",
+      );
+      return fileResponse(c, download);
+    } catch (error) {
+      return cargoErrorResponse(error);
+    }
+  };
+  app.get("/:username/cargo/api/v1/crates/:package/:version/download", (c) => cargoDownload(c));
+  app.on("HEAD", "/:username/cargo/api/v1/crates/:package/:version/download", (c) => cargoDownload(c));
+
+  const cargoYank = (yank: boolean) => async (c: Context<{ Bindings: Env }>): Promise<Response> => {
+    try {
+      const { owner, cred } = await protocolContext(c, "write");
+      const doer = cred.doer;
+      if (doer === null) {
+        return cargoApiError(401, "user should have specific permission or be a site admin");
+      }
+      await setCargoPackageYanked(
+        c.env.DB,
+        owner.id,
+        c.req.param("package") ?? "",
+        c.req.param("version") ?? "",
+        yank,
+      );
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json;charset=utf-8" },
+      });
+    } catch (error) {
+      return cargoErrorResponse(error);
+    }
+  };
+  app.delete("/:username/cargo/api/v1/crates/:package/:version/yank", (c) => cargoYank(true)(c));
+  app.put("/:username/cargo/api/v1/crates/:package/:version/unyank", (c) => cargoYank(false)(c));
+
+  app.get("/:username/cargo/api/v1/crates/:package/owners", async (c) => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      // The :package segment only pins the route shape; the OWNER answers
+      // (cargo.go:152-155 — the scope's single owner entry).
+      return new Response(
+        JSON.stringify({
+          users: [{ id: owner.id, login: owner.username, name: owner.displayName ?? owner.username }],
+        }),
+        { status: 200, headers: { "content-type": "application/json;charset=utf-8" } },
+      );
+    } catch (error) {
+      return cargoErrorResponse(error);
+    }
+  });
+
+  // The four sparse shapes register LAST (upstream api.go:141-145's tail): the
+  // statics above outrank them, and a `/3/a/b` request hits the static "3"
+  // route over the generic param shape in both routers.
+  app.get(`/:username/cargo/1/:package`, (c) => cargoIndex(c));
+  app.get(`/:username/cargo/2/:package`, (c) => cargoIndex(c));
+  app.get("/:username/cargo/3/:cargoDash/:package", (c) => cargoIndex(c));
+  app.get("/:username/cargo/:cargoDash/:cargoDash2/:package", (c) => cargoIndex(c));
+
+  // ------------------------------ SWIFT (api.go:451-471) ------------------------------
+  // The Swift Package Manager registry family: the login probe pair (the
+  // UNAUTHENTICATED group — Doer-nil is the only check, any valid credential
+  // passes regardless of scope), the identifiers lookup, and the
+  // {scope}/{name} family whose chi PathGroup (`/*`) carries the version
+  // shapes (version / version.json / version.zip / version/Package.swift /
+  // PUT version). The scope/name/version params are chi `[^/]+` single
+  // segments, so the walk decodes PER SEGMENT (the arch precedent — chi's
+  // per-param unescape); the `.json` suffix routes strip the suffix the way
+  // chi's static-tail branches do (valid package names can never carry a
+  // dot — namePattern). Unmatched shapes UNDER {scope}/{name} run the read
+  // gate first (chi PathGroup's middleware precedes its internal 404 — the
+  // go family's posture), then chi's router page; anything shallower 404s
+  // without a gate (no route there to carry middleware).
+
+  app.post("/:username/swift", (c) => swiftCheckAuthenticate(c));
+  app.post("/:username/swift/login", (c) => swiftCheckAuthenticate(c));
+
+  const swiftDispatch = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
+    try {
+      const rawPath = c.req.path;
+      const segments = rawPath.split("/");
+      // ["", "api", "packages", {username}, "swift", ...] — the arch walk's
+      // per-segment decode (a malformed escape falls to the 404 page).
+      const prefix = `/api/packages/${segments[3] ?? ""}/swift`;
+      const notFoundPage = (): Response => swiftNotFoundPage();
+      if (!rawPath.startsWith(`${prefix}/`)) {
+        return notFoundPage();
+      }
+      const rawRemainder = rawPath.slice(prefix.length).replace(/^\//, "");
+      const parts: string[] = [];
+      if (rawRemainder !== "") {
+        for (const part of rawRemainder.split("/")) {
+          try {
+            parts.push(decodeURIComponent(part));
+          } catch {
+            return notFoundPage();
+          }
+        }
+      } else {
+        parts.push("");
+      }
+      const target = parseSwiftTarget(parts, c.req.method);
+      if (target.arm === "not-found") {
+        if (target.gated === true) {
+          // The PathGroup node matched — chi runs the group's read gate
+          // before its internal 404 (the go family's posture).
+          await protocolContext(c, "read");
+        }
+        return notFoundPage();
+      }
+      const origin = new URL(c.req.url).origin;
+      if (target.arm === "identifiers") {
+        // LookupPackageIdentifiers (swift.go:465-506): the read gate rides
+        // the group; the Accept check precedes the url-param 400.
+        const { owner } = await protocolContext(c, "read");
+        const acceptError = swiftAcceptMismatch(c, SWIFT_ACCEPT_JSON);
+        if (acceptError !== null) return acceptError;
+        const url = c.req.query("url") ?? "";
+        if (url === "") {
+          return swiftProblemResponse(400, "");
+        }
+        const identifiers = await lookupSwiftIdentifiers(c.env.DB, owner.id, url);
+        if (identifiers.length === 0) {
+          return swiftProblemResponse(404, "");
+        }
+        return new Response(JSON.stringify({ identifiers }), {
+          status: 200,
+          headers: { "content-type": "application/json;charset=utf-8", "content-version": "1" },
+        });
+      }
+      if (target.arm === "enumerate") {
+        const { owner } = await protocolContext(c, "read");
+        const acceptError = swiftAcceptMismatch(c, SWIFT_ACCEPT_JSON);
+        if (acceptError !== null) return acceptError;
+        const versions = await listSwiftPackageVersions(c.env.DB, owner.id, target.scope, target.name);
+        if (versions.length === 0) {
+          // apiError(ctx, 404, nil) — the EMPTY detail (swift.go:134-136).
+          return swiftProblemResponse(404, "");
+        }
+        // baseURL (swift.go:149): AppURL + api/packages/{PathEscape
+        // lowerowner}/swift/{PathEscape scope}/{PathEscape name}/ — the JS
+        // twin of PathEscape is encodeURIComponent (the helm precedent).
+        const baseURL = `${origin}/api/packages/${encodeURIComponent(owner.usernameLower)}/swift/${encodeURIComponent(target.scope)}/${encodeURIComponent(target.name)}/`;
+        // Link (swift.go:159-161): the LAST sorted row's RAW version.
+        const last = versions[versions.length - 1]?.version ?? "";
+        return new Response(buildSwiftEnumerateJson(baseURL, versions), {
+          status: 200,
+          headers: {
+            "content-type": "application/json;charset=utf-8",
+            "content-version": "1",
+            link: `<${baseURL}${encodeURIComponent(last)}>; rel="latest-version"`,
+          },
+        });
+      }
+      if (target.arm === "metadata") {
+        const { owner } = await protocolContext(c, "read");
+        const acceptError = swiftAcceptMismatch(c, SWIFT_ACCEPT_JSON);
+        if (acceptError !== null) return acceptError;
+        const descriptor = await getSwiftVersionDescriptor(c.env.DB, owner.id, target.scope, target.name, target.version);
+        if (descriptor === null) {
+          return swiftProblemResponse(404, "package does not exist");
+        }
+        return new Response(
+          buildSwiftMetadataResponseJson({
+            id: buildSwiftPackageID(target.scope, target.name),
+            version: descriptor.version.version,
+            checksum: descriptor.blob.hashSha256,
+            metadata: descriptor.metadata,
+            packageName: descriptor.nameProperty,
+            repositoryURLs: descriptor.repositoryURLs,
+          }),
+          { status: 200, headers: { "content-type": "application/json;charset=utf-8", "content-version": "1" } },
+        );
+      }
+      if (target.arm === "download") {
+        const { owner } = await protocolContext(c, "read");
+        const acceptError = swiftAcceptMismatch(c, SWIFT_ACCEPT_ZIP);
+        if (acceptError !== null) return acceptError;
+        // DownloadPackageFile (swift.go:424-458): the Digest header rides
+        // setResponseHeaders BEFORE the serve; the content-type is
+        // application/zip; the lead GET bumps the counter.
+        const download = await openSwiftZipForDownload(
+          c.env.DB,
+          c.env.REPO_PACKS,
+          owner,
+          target.scope,
+          target.name,
+          target.version,
+          c.req.method === "HEAD" ? "HEAD" : "GET",
+        );
+        if (download === null) {
+          // The vanished-content honest 404 (the families' sole-sweeper
+          // posture; upstream's storage failure would map 500).
+          return swiftProblemResponse(404, "package does not exist");
+        }
+        const response = fileResponse(
+          c,
+          { stream: download.stream, size: download.size, filename: download.file.name, created: download.created },
+          "application/zip",
+        );
+        response.headers.set("Digest", `sha256=${download.blob.hashSha256}`);
+        response.headers.set("Content-Version", "1");
+        return response;
+      }
+      if (target.arm === "manifest") {
+        const { owner } = await protocolContext(c, "read");
+        const acceptError = swiftAcceptMismatch(c, SWIFT_ACCEPT_SWIFT);
+        if (acceptError !== null) return acceptError;
+        const descriptor = await getSwiftVersionDescriptor(c.env.DB, owner.id, target.scope, target.name, target.version);
+        if (descriptor === null) {
+          return swiftProblemResponse(404, "package does not exist");
+        }
+        // The swift-version param normalizes through NewVersion +
+        // TrimmedVersionString (swift.go:275-281); an unparseable value
+        // rides RAW into the manifests lookup (→ the redirect).
+        let swiftVersion = c.req.query("swift-version") ?? "";
+        if (swiftVersion !== "") {
+          const parsed = parseSwiftVersionLax(swiftVersion);
+          if (parsed !== null) {
+            swiftVersion = swiftTrimmedVersionString(parsed);
+          }
+        }
+        const manifest = descriptor.metadata.manifests[swiftVersion];
+        if (manifest === undefined) {
+          // 303 SeeOther with the bare Location (owner lower name, scope,
+          // name, version RAW — swift.go:284-288) + Content-Version.
+          return new Response(null, {
+            status: 303,
+            headers: {
+              location: `${origin}/api/packages/${owner.usernameLower}/swift/${target.scope}/${target.name}/${target.version}/Package.swift`,
+              "content-version": "1",
+            },
+          });
+        }
+        const filename = swiftVersion === "" ? "Package.swift" : `Package@swift-${swiftVersion}.swift`;
+        const bytes = new TextEncoder().encode(manifest.content);
+        const response = servePackageFileResponse(
+          c.req.raw,
+          c.req.method === "HEAD" ? null : new Response(bytes).body,
+          {
+            filename,
+            size: bytes.byteLength,
+            created: descriptor.version.createdUnix,
+            contentType: "text/x-swift",
+          },
+        );
+        response.headers.set("Content-Version", "1");
+        return response;
+      }
+      // arm === "upload" — PUT /<version> (swift.go:323-421): the write gate
+      // rides protocolContext (upstream's group read gate + the route's
+      // reqPackageAccess(write) pair collapse), then the Accept check.
+      const { owner, cred } = await protocolContext(c, "write");
+      const doer = cred.doer;
+      if (doer === null) {
+        return swiftProblemResponse(401, "user should have specific permission or be a site admin");
+      }
+      const acceptError = swiftAcceptMismatch(c, SWIFT_ACCEPT_JSON);
+      if (acceptError !== null) return acceptError;
+      // The URL-param validation (swift.go:328-333) runs BEFORE the body is
+      // read: NewSemver's error (when the version failed) IS the Problem
+      // detail, else a pattern miss carries the EMPTY detail — ONE shared
+      // 400 arm.
+      const versionParsed = parseSwiftVersionStrict(target.version);
+      if (versionParsed === null) {
+        return swiftProblemResponse(400, new SwiftInvalidVersionError(target.version).message);
+      }
+      if (!isSwiftScopeValid(target.scope) || !isSwiftNameValid(target.name)) {
+        return swiftProblemResponse(400, "");
+      }
+      await uploadSwiftPackage({
+        d1: c.env.DB,
+        bucket: c.env.REPO_PACKS,
+        owner,
+        doer,
+        scope: target.scope,
+        name: target.name,
+        version: target.version,
+        contentType: c.req.header("content-type") ?? "",
+        content: bodyStream(c.req.raw),
+        declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
+        quota: packagesQuotaFromEnv(c.env),
+        maxBytes: MAX_SWIFT_UPLOAD_BYTES,
+      });
+      return new Response(null, { status: 201, headers: { "content-version": "1" } });
+    } catch (error) {
+      return swiftErrorResponse(error);
+    }
+  };
+  app.get("/:username/swift/*", (c) => swiftDispatch(c));
+  app.on("HEAD", "/:username/swift/*", (c) => swiftDispatch(c));
+  app.put("/:username/swift/*", (c) => swiftDispatch(c));
+
+  // ------------------------------ RUBYGEMS (api.go:437-447) ------------------------------
+  // The RubyGems registry: the three Marshal-4.8 specs enumerations (the
+  // gem/Bundler store base), the quick/Marshal.4.8 gemspec render, the .gem
+  // download, the compact-index pair (info + versions), and the api/v1/gems
+  // write group (POST push + DELETE yank). The group's read wrap rides every
+  // read arm through protocolContext(c, "read"); the write arms add the
+  // doer-bearing write gate (the go upload arm's posture). HEAD rides the
+  // download/gemspec GET walks (the pypi/helm precedent — upstream registers
+  // GET only). The enumerations' + gemspec's archive responses are the
+  // SetServeHeaders streaming shape (no Last-Modified, no byte-serving — see
+  // rubygemsArchiveResponse); only the .gem download rides the D-6 machinery.
+
+  app.get("/:username/rubygems/specs.4.8.gz", (c) => rubygemsEnumerate(c, "specs"));
+  app.get("/:username/rubygems/latest_specs.4.8.gz", (c) => rubygemsEnumerate(c, "latest"));
+  app.get("/:username/rubygems/prerelease_specs.4.8.gz", (c) => rubygemsEnumerate(c, "prerelease"));
+  app.get("/:username/rubygems/quick/Marshal.4.8/:filename", (c) => rubygemsGemspec(c));
+  app.on("HEAD", "/:username/rubygems/quick/Marshal.4.8/:filename", (c) => rubygemsGemspec(c));
+  app.get("/:username/rubygems/gems/:filename", (c) => rubygemsDownload(c));
+  app.on("HEAD", "/:username/rubygems/gems/:filename", (c) => rubygemsDownload(c));
+  app.get("/:username/rubygems/info/:packagename", (c) => rubygemsInfo(c));
+  app.get("/:username/rubygems/versions", (c) => rubygemsVersions(c));
+  app.post("/:username/rubygems/api/v1/gems/", (c) => rubygemsUpload(c));
+  app.post("/:username/rubygems/api/v1/gems", (c) => rubygemsUpload(c)); // the bare twin (the pypi double-registration precedent)
+  app.delete("/:username/rubygems/api/v1/gems/yank", (c) => rubygemsYank(c));
+
   return app;
+}
+
+// ---------------------------------------------------------------------------
+// The GO proxy walk — upstream's PathGroup (api.go:309-316) as a manual
+// grammar over the decoded remainder. chi's `<name:*>` is greedy (`.*`), so
+// the LAST `@latest` / `@v` marker wins (a module path may itself carry a
+// `@v` segment); `<version>` is chi's `[^/]+` — an empty version tail
+// (.zip/.info/.mod with nothing before the dot) falls off the grammar to the
+// router's 404 page.
+// ---------------------------------------------------------------------------
+
+type GoArm = "latest" | "list" | "info" | "mod" | "zip";
+
+interface GoTarget {
+  arm: GoArm;
+  /** The module path — spans segments, may be empty (chi's `<name:*>`). */
+  name: string;
+  version?: string;
+}
+
+export function parseGoTarget(decoded: string): GoTarget | null {
+  const parts = decoded.split("/");
+  const last = parts[parts.length - 1] ?? "";
+  const prev = parts[parts.length - 2] ?? "";
+  // Registration order is chi's own: @latest first, then the @v tails. The
+  // arms are mutually exclusive on the marker segment, so the walk order
+  // only matters for greedy name capture — both walk arms take the LAST
+  // marker, matching chi's greedy `<name:*>`.
+  if (last === "@latest") {
+    return { arm: "latest", name: parts.slice(0, -1).join("/") };
+  }
+  if (prev === "@v") {
+    const name = parts.slice(0, -2).join("/");
+    if (last === "list") return { arm: "list", name };
+    if (last.endsWith(".zip") && last.length > ".zip".length) {
+      return { arm: "zip", name, version: last.slice(0, -".zip".length) };
+    }
+    if (last.endsWith(".info") && last.length > ".info".length) {
+      return { arm: "info", name, version: last.slice(0, -".info".length) };
+    }
+    if (last.endsWith(".mod") && last.length > ".mod".length) {
+      return { arm: "mod", name, version: last.slice(0, -".mod".length) };
+    }
+  }
+  return null;
+}
+
+/** Go http.NotFound (net/http/server.go Error): the exact page chi serves
+ *  for an unmatched shape AFTER the group's gate stack has run. */
+function goNotFoundPage(): Response {
+  return new Response("404 page not found\n", {
+    status: 404,
+    headers: { "content-type": "text/plain; charset=utf-8", "x-content-type-options": "nosniff" },
+  });
+}
+
+/** goproxy.go:24-27 — the family's plain-text apiError (helper
+ *  ProcessErrorForUser → ctx.PlainText). */
+function goPlain(status: 400 | 401 | 403 | 404 | 409 | 411 | 413 | 500, message: string): Response {
+  return plainResponse(status, message);
+}
+
+/**
+ * UploadPackage's error switch (goproxy.go:172-180 / :211-217): the three
+ * ErrInvalidArgument sentinels → 400; ErrDuplicatePackageVersion → 409;
+ * quota → 403. Everything else (zip.NewReader's plain error, a duplicate
+ * file row, the store's read failures) hits the DEFAULT arm → the prod
+ * 500 body — EXCEPT the store caps, which are our reduction statuses (413)
+ * and the lying-Content-Length analog (the npm/nuget non-InvalidArgument
+ * posture → 500).
+ */
+function goErrorResponse(error: unknown): Response {
+  if (error instanceof HTTPException) throw error;
+  if (
+    error instanceof GoInvalidStructureError ||
+    error instanceof GoInvalidVersionError ||
+    error instanceof GoModFileTooLargeError
+  ) {
+    return goPlain(400, error.message);
+  }
+  if (error instanceof GoPackageNotExistError) return goPlain(404, error.message);
+  if (error instanceof GoDuplicateVersionError) return goPlain(409, error.message);
+  if (error instanceof QuotaTotalCountError || error instanceof QuotaTypeSizeError || error instanceof QuotaTotalSizeError) {
+    return goPlain(403, quotaMessage(error));
+  }
+  if (error instanceof PackageBlobTooLargeError) return goPlain(413, error.message);
+  if (error instanceof PackageSizeMismatchError) {
+    // The lying-Content-Length store failure — upstream's non-ErrInvalidArgument
+    // read arm → 500 (the npm/nuget posture).
+    return goPlain(500, "internal server error");
+  }
+  console.error("[packages-go] request failed", error);
+  return goPlain(500, "internal server error");
+}
+
+async function goDispatch(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const rawPath = c.req.path;
+    const segments = rawPath.split("/");
+    // ["", "api", "packages", {username}, "go", ...] — the npm walk's path
+    // discipline: RESERVED escapes survive in c.req.path; the remainder
+    // decodes FULLY (a malformed escape cannot match the grammar and 404s
+    // on the router page).
+    const prefix = `/api/packages/${segments[3] ?? ""}/go/`;
+    if (!rawPath.startsWith(prefix)) {
+      return goNotFoundPage();
+    }
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(rawPath.slice(prefix.length));
+    } catch {
+      return goNotFoundPage();
+    }
+    const target = parseGoTarget(decoded);
+    // chi runs the group middleware BEFORE the router 404s — the gate stack
+    // precedes the not-found page.
+    const { owner } = await protocolContext(c, "read");
+    if (target === null) {
+      return goNotFoundPage();
+    }
+    if (target.arm === "list") {
+      // EnumeratePackageVersions (goproxy.go:29-49): the empty module is
+      // apiError(404, nil) — the EMPTY body; hits render one version per
+      // line, text/plain;charset=utf-8.
+      const versions = await listGoPackageVersions(c.env.DB, owner.id, target.name);
+      if (versions.length === 0) {
+        return goPlain(404, "");
+      }
+      return new Response(versions.map((version) => `${version}\n`).join(""), {
+        status: 200,
+        headers: { "content-type": "text/plain;charset=utf-8" },
+      });
+    }
+    // PackageVersionMetadata / GoModContent / DownloadPackageFile share
+    // resolvePackage — the null answer is 404 "package does not exist"
+    // (ErrPackageNotExist's message through ProcessErrorForUser).
+    if (target.arm === "latest" || target.arm === "info") {
+      const version = target.arm === "latest" ? "latest" : (target.version ?? "");
+      const pv = await resolveGoPackageVersion(c.env.DB, owner.id, target.name, version);
+      if (pv === null) return goPlain(404, new GoPackageNotExistError().message);
+      // ctx.JSON (base.go:112-119 — application/json;charset=utf-8), the
+      // {Version, Time} struct in declaration order; Time renders
+      // RFC3339Nano (goTimeJson — the AsLocalTime reduction).
+      return new Response(JSON.stringify({ Version: pv.version, Time: goTimeJson(pv.createdUnix) }), {
+        status: 200,
+        headers: { "content-type": "application/json;charset=utf-8" },
+      });
+    }
+    if (target.arm === "mod") {
+      const pv = await resolveGoPackageVersion(c.env.DB, owner.id, target.name, target.version ?? "");
+      if (pv === null) return goPlain(404, new GoPackageNotExistError().message);
+      const goMod = await getGoModContent(c.env.DB, pv.id);
+      return new Response(goMod, {
+        status: 200,
+        headers: { "content-type": "text/plain;charset=utf-8" },
+      });
+    }
+    // arm === "zip" — DownloadPackageFile (goproxy.go:91-119): the ONE file
+    // through helper.ServePackageFile (the D-6 set, octet-stream per
+    // ServeSetHeaders' IfZero default); the lead GET bumps the counter.
+    const download = await openGoZipForDownload(
+      c.env.DB,
+      c.env.REPO_PACKS,
+      owner,
+      target.name,
+      target.version ?? "",
+      c.req.method === "HEAD" ? "HEAD" : "GET",
+    );
+    return fileResponse(c, {
+      stream: download.stream,
+      size: download.size,
+      filename: download.filename,
+      created: download.created,
+    });
+  } catch (error) {
+    if (error instanceof GoFileSetInvalidError || error instanceof GoModPropertyMissingError) {
+      // The download walk's 500 sentinels ride the family mapper's DEFAULT
+      // arm (goproxy.go:102-106 / :82-86 → apiError(500, …)).
+      console.error("[packages-go] read arm failed", error);
+      return goPlain(500, "internal server error");
+    }
+    return goErrorResponse(error);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The CARGO error/response helpers — cargo.go:19-49: apiError wraps EVERY
+// error (any status) in the StatusResponse shape
+// `{"ok":false,"errors":[{"detail":message}]}` while successes answer
+// `{"ok":true}`; ProcessErrorForUser (helper.go:30-49) strips 500s to the
+// prod "internal server error" posture. Content types follow ctx.JSON /
+// ctx.PlainTextBytes (application/json;charset=utf-8 / text/plain).
+// ---------------------------------------------------------------------------
+
+/** apiError (cargo.go:28-36) — the wrap with the upstream status. */
+function cargoApiError(status: ContentfulStatus, message: string): Response {
+  return new Response(JSON.stringify({ ok: false, errors: [{ detail: message }] }), {
+    status,
+    headers: { "content-type": "application/json;charset=utf-8" },
+  });
+}
+
+/** The cargo family's error mapper — the 400 parse sentinels, the 409
+ *  duplicate, the 404 not-exist pair, the quota 403, the caps. */
+function cargoErrorResponse(error: unknown): Response {
+  if (error instanceof HTTPException) throw error;
+  if (
+    error instanceof CargoParseError ||
+    error instanceof CargoInvalidNameError ||
+    error instanceof CargoInvalidVersionError ||
+    error instanceof CargoMetadataTooLargeError ||
+    error instanceof CargoContentSizeMismatchError
+  ) {
+    return cargoApiError(400, error.message);
+  }
+  if (error instanceof CargoDuplicateVersionError) return cargoApiError(409, error.message);
+  if (error instanceof CargoPackageNotExistError) return cargoApiError(404, error.message);
+  if (error instanceof CargoFileNotExistError) return cargoApiError(404, error.message);
+  if (error instanceof QuotaTotalCountError || error instanceof QuotaTypeSizeError || error instanceof QuotaTotalSizeError) {
+    return cargoApiError(403, quotaMessage(error));
+  }
+  if (error instanceof PackageBlobTooLargeError) return cargoApiError(413, error.message);
+  if (error instanceof PackageSizeMismatchError) {
+    // The lying-Content-Length store failure — upstream's non-sentinel read
+    // arm → the 500 default (the npm/nuget posture).
+    return cargoApiError(500, "internal server error");
+  }
+  // CargoYankedPropertyMissingError and everything else ride the default arm
+  // — helper.ProcessErrorForUser strips 500 details to the prod message.
+  console.error("[packages-cargo] request failed", error);
+  return cargoApiError(500, "internal server error");
+}
+
+// ---------------------------------------------------------------------------
+// The SWIFT walk + wire helpers — upstream's {scope}/{name} chi PathGroup
+// (api.go:462-468) as a manual grammar over the per-segment-decoded
+// remainder. chi's `<version>` is `[^/]+`; the `.json`/`.zip` suffix routes
+// strip their suffixes (chi's static-tail branches win over the bare param
+// route, and a valid package name can never carry a dot — namePattern).
+// Every swift response carries Content-Version: 1 (setResponseHeaders,
+// swift.go:54-71) — EXCEPT CheckAuthenticate's bare 200.
+// ---------------------------------------------------------------------------
+
+type SwiftArm =
+  | { arm: "enumerate"; scope: string; name: string }
+  | { arm: "identifiers" }
+  | { arm: "metadata"; scope: string; name: string; version: string }
+  | { arm: "download"; scope: string; name: string; version: string }
+  | { arm: "manifest"; scope: string; name: string; version: string }
+  | { arm: "upload"; scope: string; name: string; version: string }
+  /** gated=false — the shape has no upstream route NOR gate; gated=true —
+   *  the PathGroup node matched, so the read gate precedes the 404 page. */
+  | { arm: "not-found"; gated: boolean };
+
+/**
+ * The PathGroup grammar. parts[0] = "identifiers" (the static lookup route,
+ * api.go:470) or a lone scope (no route); parts[0..1] = scope/name
+ * (two-segment shapes ride the plain group: enumerate bare + .json; ANY
+ * other method is ungated); parts[2..] = the PathGroup shapes, with any
+ * ≥3-part shape gated.
+ */
+export function parseSwiftTarget(parts: string[], method: string): SwiftArm {
+  if (parts.length === 1) {
+    if ((parts[0] ?? "") === "identifiers" && (method === "GET" || method === "HEAD")) {
+      return { arm: "identifiers" };
+    }
+    return { arm: "not-found", gated: false };
+  }
+  if (parts.length < 2) return { arm: "not-found", gated: false };
+  const scope = parts[0] ?? "";
+  const name = parts[1] ?? "";
+  if (parts.length === 2) {
+    if (method === "GET" || method === "HEAD") {
+      // The `.json` static-tail branch: the suffix strips (chi's trie picks
+      // the suffix route over the bare param).
+      const stripped = name.endsWith(".json") ? name.slice(0, -".json".length) : name;
+      return { arm: "enumerate", scope, name: stripped };
+    }
+    return { arm: "not-found", gated: false };
+  }
+  const rest = parts.slice(2);
+  const version = rest[0] ?? "";
+  if (method === "GET" || method === "HEAD") {
+    if (rest.length === 1) {
+      if (version.endsWith(".json") && version.length > ".json".length) {
+        return { arm: "metadata", scope, name, version: version.slice(0, -".json".length) };
+      }
+      if (version.endsWith(".zip") && version.length > ".zip".length) {
+        return { arm: "download", scope, name, version: version.slice(0, -".zip".length) };
+      }
+      return { arm: "metadata", scope, name, version };
+    }
+    if (rest.length === 2 && rest[1] === "Package.swift") {
+      return { arm: "manifest", scope, name, version };
+    }
+    return { arm: "not-found", gated: true };
+  }
+  if (method === "PUT" && rest.length === 1) {
+    return { arm: "upload", scope, name, version };
+  }
+  return { arm: "not-found", gated: true };
+}
+
+/** CheckAuthenticate (swift.go:103-110) — the unauthenticated group's pair:
+ *  the 401 Problem for an anonymous credential, the bare 200 (NO
+ *  Content-Version — ctx.Status only) otherwise. The {username} owner
+ *  resolution still applies (the outer group's UserAssignment). */
+async function swiftCheckAuthenticate(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { cred } = await protocolContext(c, "none");
+    if (cred.doer === null) {
+      return swiftProblemResponse(401, "");
+    }
+    return new Response(null, { status: 200 });
+  } catch (error) {
+    return swiftErrorResponse(error);
+  }
+}
+
+/** CheckAcceptMediaType (swift.go:93-100): a PRESENT-but-different Accept
+ *  answers the 400 Problem; absent/empty passes. */
+function swiftAcceptMismatch(c: Context<{ Bindings: Env }>, required: string): Response | null {
+  const accept = c.req.header("Accept");
+  if (accept !== undefined && accept !== "" && accept !== required) {
+    return swiftProblemResponse(400, `Unexpected accept header. Should be '${required}'.`);
+  }
+  return null;
+}
+
+/** apiError (swift.go:74-90): the RFC 7807 Problem document
+ *  `{"status":…,"detail":…}\n` (json.Encoder's trailing newline),
+ *  application/problem+json + Content-Version: 1. */
+function swiftProblemResponse(status: ContentfulStatus, detail: string): Response {
+  return new Response(`${JSON.stringify({ status, detail })}\n`, {
+    status,
+    headers: { "content-type": "application/problem+json", "content-version": "1" },
+  });
+}
+
+/** chi's default NotFoundHandler (the go family's http.NotFound page). */
+function swiftNotFoundPage(): Response {
+  return new Response("404 page not found\n", {
+    status: 404,
+    headers: { "content-type": "text/plain; charset=utf-8", "x-content-type-options": "nosniff" },
+  });
+}
+
+/**
+ * UploadPackageFile's error switch (swift.go:399-409) + the read arms': the
+ * ErrInvalidArgument sentinels → 400; ErrDuplicatePackageVersion → 409;
+ * ErrPackageNotExist → 404; quota → 403; the store caps (413) and the
+ * lying-Content-Length (500, the npm/nuget posture) are our reductions;
+ * zip.NewReader / metadata-JSON decode failures are PLAIN errors upstream →
+ * the DEFAULT arm → 500 (the prod body).
+ */
+function swiftErrorResponse(error: unknown): Response {
+  if (error instanceof HTTPException) throw error;
+  if (
+    error instanceof SwiftInvalidVersionError ||
+    error instanceof SwiftInvalidScopeError ||
+    error instanceof SwiftInvalidNameError ||
+    error instanceof SwiftMissingSourceArchiveError ||
+    error instanceof SwiftMissingManifestFileError ||
+    error instanceof SwiftManifestFileTooLargeError ||
+    error instanceof SwiftManifestFilesTooLargeError ||
+    error instanceof SwiftInvalidManifestVersionError
+  ) {
+    return swiftProblemResponse(400, error.message);
+  }
+  if (error instanceof SwiftDuplicateVersionError) return swiftProblemResponse(409, error.message);
+  if (error instanceof SwiftPackageNotExistError) return swiftProblemResponse(404, error.message);
+  if (error instanceof QuotaTotalCountError || error instanceof QuotaTypeSizeError || error instanceof QuotaTotalSizeError) {
+    return swiftProblemResponse(403, quotaMessage(error));
+  }
+  if (error instanceof PackageBlobTooLargeError) return swiftProblemResponse(413, error.message);
+  if (error instanceof PackageSizeMismatchError) {
+    return swiftProblemResponse(500, "internal server error");
+  }
+  // SwiftInvalidArchiveError and everything else ride the default arm.
+  console.error("[packages-swift] request failed", error);
+  return swiftProblemResponse(500, "internal server error");
 }
 
 // ---------------------------------------------------------------------------
@@ -3114,4 +4045,279 @@ export function createContainerProtocolRouter(): Hono<{ Bindings: Env }> {
   app.get("/_catalog", (c) => containerCatalog(c));
   app.on(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"], "/*", (c) => containerDispatch(c));
   return app;
+}
+
+// ---------------------------------------------------------------------------
+// The RUBYGEMS response helpers — rubygems.go:27-30: apiError wraps
+// ProcessErrorForUser's message in ctx.PlainText (the plain-text family
+// shape); the archive responses ride SetServeHeaders + the gzip/zlib writers
+// (rubygems.go:82-94 / :122-127) — ServeSetHeaders with a ZERO LastModified
+// skips the header (serve.go:101-104), Content-Type falls to the
+// octet-stream default (serve.go:60), and NO byte-serving runs (upstream
+// never routes these through ServeContent).
+// ---------------------------------------------------------------------------
+
+/** rubygems.go:27-30 — the plain-text apiError (the ctx.PlainText set). */
+function rubygemsPlain(status: ContentfulStatus, message: string): Response {
+  return plainResponse(status, message);
+}
+
+/** ctx.PlainText(200, …) for the compact-index pair (base.go:128-135 — the
+ *  text/plain;charset=utf-8 + nosniff set). */
+function rubygemsTextResponse(text: string): Response {
+  return new Response(text, {
+    status: 200,
+    headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+  });
+}
+
+/** apiError(status, nil) — the EMPTY-detail body (fmt.Sprint of nil), the
+ *  404 file-search / info misses and the 501 quick-filename gate. */
+function rubygemsEmptyDetail(status: 404 | 501): Response {
+  return new Response("", {
+    status,
+    headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+  });
+}
+
+/** SetServeHeaders({Filename}) + the compressed archive bytes — the exact
+ *  upstream header set: octet-stream + nosniff + the sandbox CSP
+ *  (serveSetHeaderContentRelated), the prod Cache-Control posture
+ *  (httpcache.go:31-35), the attachment disposition + expose-headers echo
+ *  (serve.go:87-94), and NO Last-Modified (a zero ServeHeaderOptions time —
+ *  serve.go:101-104's skip). */
+function rubygemsArchiveResponse(filename: string, body: Uint8Array): Response {
+  const base = filename.slice(filename.lastIndexOf("/") + 1);
+  return new Response(body.slice(), {
+    status: 200,
+    headers: {
+      "content-type": "application/octet-stream",
+      "x-content-type-options": "nosniff",
+      "content-security-policy": "sandbox allow-scripts allow-modals allow-popups allow-downloads",
+      "cache-control": "max-age=0, private, must-revalidate",
+      "content-disposition": contentDispositionAttachment(base),
+      "access-control-expose-headers": "Content-Disposition",
+    },
+  });
+}
+
+/**
+ * UploadPackageFile's error switch (rubygems.go:218-226 / :256-264): the
+ * util-ErrInvalidArgument sentinels (the metadata parse family + the 32 MiB
+ * cap) → 400; ErrDuplicatePackageVersion → 409; quota → 403. Everything
+ * else — the corrupt tar/gzip/YAML plain errors (upstream's tar.Next,
+ * gzip.NewReader and yaml.Decode failures), a duplicate file row, the store
+ * caps — hits the DEFAULT arm → the prod 500 body, EXCEPT the blob cap
+ * (our 413 reduction) and the lying-Content-Length store failure (the
+ * npm/nuget non-InvalidArgument posture → 500).
+ */
+function rubygemsErrorResponse(error: unknown): Response {
+  if (error instanceof HTTPException) throw error;
+  if (
+    error instanceof RubyMissingMetadataFileError ||
+    error instanceof RubyInvalidNameError ||
+    error instanceof RubyInvalidVersionError ||
+    error instanceof RubyInvalidMetadataError ||
+    error instanceof RubyContentTooLargeError
+  ) {
+    return rubygemsPlain(400, error.message);
+  }
+  if (error instanceof RubyPackageNotExistError) return rubygemsPlain(404, error.message);
+  if (error instanceof RubyDuplicateVersionError) return rubygemsPlain(409, error.message);
+  if (error instanceof QuotaTotalCountError || error instanceof QuotaTypeSizeError || error instanceof QuotaTotalSizeError) {
+    return rubygemsPlain(403, quotaMessage(error));
+  }
+  if (error instanceof PackageBlobTooLargeError) return rubygemsPlain(413, error.message);
+  if (error instanceof PackageSizeMismatchError) {
+    // The lying-Content-Length store failure — upstream's non-sentinel
+    // default arm (the npm/nuget posture).
+    return rubygemsPlain(500, "internal server error");
+  }
+  console.error("[packages-rubygems] request failed", error);
+  return rubygemsPlain(500, "internal server error");
+}
+
+// The read arms — every one through the group's read gate (api.go:437-447's
+// reqPackageAccess(read) wrap).
+
+/** The specs.4.8 / latest_specs.4.8 / prerelease_specs.4.8 enumerations —
+ *  the Marshal payloads gzipped through the streaming writer shape. */
+async function rubygemsEnumerate(c: Context<{ Bindings: Env }>, kind: "specs" | "latest" | "prerelease"): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const filename = kind === "specs" ? "specs.4.8" : kind === "latest" ? "latest_specs.4.8" : "prerelease_specs.4.8";
+    const payload =
+      kind === "prerelease"
+        ? buildRubyGemEmptySpecsPayload()
+        : buildRubyGemSpecsPayload(
+            kind === "specs"
+              ? await listRubyGemVersionsByType(c.env.DB, owner.id)
+              : await listLatestRubyGemVersions(c.env.DB, owner.id),
+          );
+    return rubygemsArchiveResponse(`${filename}.gz`, await gzipRubyGemArchive(payload));
+  } catch (error) {
+    return rubygemsErrorResponse(error);
+  }
+}
+
+/**
+ * ServePackageSpecification (rubygems.go:97-163): the filename MUST end
+ * `.gemspec.rz` (else the 501 EMPTY gate); it names the stored gem
+ * (`filename[:len-10] + "gem"`), whose version row renders the
+ * Gem::Specification USERDEF, served zlib-compressed; `len(pvs) != 1` is the
+ * EMPTY-404.
+ */
+async function rubygemsGemspec(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const filename = c.req.param("filename") ?? "";
+    if (!filename.endsWith(".gemspec.rz")) {
+      return rubygemsEmptyDetail(501);
+    }
+    const gemFilename = `${filename.slice(0, filename.length - 10)}gem`;
+    const matches = await findRubyGemVersionsByFilename(c.env.DB, owner.id, gemFilename);
+    if (matches.length !== 1) {
+      return rubygemsEmptyDetail(404);
+    }
+    const match = matches[0];
+    if (match === undefined) return rubygemsEmptyDetail(404);
+    const payload = buildRubyGemSpecification(match.pkg.name, match.version.version, match.metadata);
+    return rubygemsArchiveResponse(filename, await zlibRubyGemArchive(payload));
+  } catch (error) {
+    return rubygemsErrorResponse(error);
+  }
+}
+
+/** DownloadPackageFile (rubygems.go:166-198) — the stored .gem through the
+ *  D-6 serve shape; the search's `len != 1` is the EMPTY-404 sentinel. */
+async function rubygemsDownload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const download = await openRubyGemForDownload(
+      c.env.DB,
+      c.env.REPO_PACKS,
+      owner.id,
+      c.req.param("filename") ?? "",
+      c.req.method === "HEAD" ? "HEAD" : "GET",
+    );
+    return fileResponse(c, {
+      stream: download.stream,
+      size: download.size,
+      filename: download.filename,
+      created: download.created,
+    });
+  } catch (error) {
+    if (error instanceof RubyPackageNotExistError) {
+      // apiError(404, nil) — the len != 1 EMPTY body (rubygems.go:175-177).
+      return rubygemsEmptyDetail(404);
+    }
+    return rubygemsErrorResponse(error);
+  }
+}
+
+/** GetPackageInfo (rubygems.go:302-319) — the one-gem compact index; the
+ *  version miss is the EMPTY-404, the body ctx.PlainText(200). */
+async function rubygemsInfo(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const versions = await listRubyGemVersionsByName(c.env.DB, owner.id, c.req.param("packagename") ?? "");
+    if (versions.length === 0) {
+      return rubygemsEmptyDetail(404);
+    }
+    return rubygemsTextResponse(await makeRubyGemPackageInfo(c.env.DB, versions));
+  } catch (error) {
+    if (error instanceof HTTPException) throw error;
+    console.error("[packages-rubygems] info failed", error);
+    return rubygemsPlain(500, "internal server error");
+  }
+}
+
+/** GetAllPackagesVersions (rubygems.go:321-366) — the whole-store compact
+ *  index (empty store → the bare `---\n`). */
+async function rubygemsVersions(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    return rubygemsTextResponse(await buildRubyGemCompactIndex(c.env.DB, owner.id));
+  } catch (error) {
+    if (error instanceof HTTPException) throw error;
+    console.error("[packages-rubygems] versions failed", error);
+    return rubygemsPlain(500, "internal server error");
+  }
+}
+
+// The write arms — api/v1/gems' reqPackageAccess(write) subgroup; a null
+// doer is the challenge (the go upload arm's posture).
+
+/** UploadPackageFile (rubygems.go:201-269) — the RAW body is the .gem
+ *  (ctx.UploadStream; the integration test posts bare bytes), created → 201
+ *  EMPTY. */
+async function rubygemsUpload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner, cred } = await protocolContext(c, "write");
+    const doer = cred.doer;
+    if (doer === null) {
+      return rubygemsPlain(401, "user should have specific permission or be a site admin");
+    }
+    await uploadRubyGem({
+      d1: c.env.DB,
+      bucket: c.env.REPO_PACKS,
+      owner,
+      doer,
+      content: bodyStream(c.req.raw),
+      declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
+      quota: packagesQuotaFromEnv(c.env),
+    });
+    return new Response(null, { status: 201 });
+  } catch (error) {
+    return rubygemsErrorResponse(error);
+  }
+}
+
+/**
+ * DeletePackage (rubygems.go:272-298): ParseMultipartForm FIRST — a
+ * non-multipart content type is Go's ErrNotMultipart → the 500 DEFAULT arm
+ * (the pin's literal shape; the integration test posts multipart fields);
+ * gem_name/version read through Go's r.Form order (URL query first —
+ * ParseForm merges the query ahead of the body — then the multipart
+ * fields). The miss is the ErrPackageNotExist 404 WITH its message; success
+ * is Go's write-nothing handler answer: 200 EMPTY.
+ */
+async function rubygemsYank(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner, cred } = await protocolContext(c, "write");
+    const doer = cred.doer;
+    if (doer === null) {
+      return rubygemsPlain(401, "user should have specific permission or be a site admin");
+    }
+    const contentType = c.req.header("content-type") ?? "";
+    if (!contentType.toLowerCase().startsWith("multipart/form-data")) {
+      // Go ParseMultipartForm's ErrNotMultipart — the DEFAULT arm.
+      return rubygemsPlain(500, "internal server error");
+    }
+    let form: FormData;
+    try {
+      form = await c.req.raw.formData();
+    } catch {
+      // ErrMissingBoundary / a malformed body — the DEFAULT arm.
+      return rubygemsPlain(500, "internal server error");
+    }
+    // Go r.Form order: the URL query values lead (ParseForm), the body
+    // fields append; FormString takes the FIRST hit.
+    const params = new URLSearchParams(new URL(c.req.url).search);
+    for (const [key, value] of form.entries()) {
+      if (typeof value === "string") params.append(key, value);
+    }
+    const removed = await removeRubyGemVersion(
+      c.env.DB,
+      owner.id,
+      params.get("gem_name") ?? "",
+      params.get("version") ?? "",
+    );
+    if (removed === null) {
+      return rubygemsPlain(404, new RubyPackageNotExistError().message);
+    }
+    return new Response(null, { status: 200 });
+  } catch (error) {
+    return rubygemsErrorResponse(error);
+  }
 }
