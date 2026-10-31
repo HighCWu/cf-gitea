@@ -786,8 +786,17 @@ import {
 } from "./pages/repo-settings-actions-runners";
 import {
   applyRepoActionsUnitToggle,
+  applyRepoTokenPermissions,
+  applyRepoCollaborativeOwnerAdd,
+  applyRepoCollaborativeOwnerDelete,
   loadRepoActionsGeneralPageData,
   parseRepoActionsUnitForm,
+  parseRepoTokenPermissionsForm,
+  parseRepoCollaborativeOwnerAddForm,
+  parseRepoCollaborativeOwnerDeleteForm,
+  readRepoActionsGeneralFormParams,
+  REPO_ACTIONS_USER_NOT_EXIST_ERROR,
+  REPO_ACTIONS_NOT_FOUND_ERROR,
   REPO_ACTIONS_GENERAL_REDIRECT_TARGET,
   renderRepoActionsGeneralPage,
 } from "./pages/repo-settings-actions-general";
@@ -1922,7 +1931,10 @@ export interface SettingsRoute {
     // unit arm INSIDE the gate (the enabled unit's shortcut).
     | "settings-actions" // GET /settings/actions (the redirect onto ./actions/general)
     | "settings-actions-general" // GET /settings/actions/general
-    | "settings-actions-general-unit"; // POST /settings/actions/general/actions_unit
+    | "settings-actions-general-unit" // POST /settings/actions/general/actions_unit
+    | "settings-actions-general-collaborative-add" // POST /settings/actions/general/collaborative_owner/add (web.go:1273)
+    | "settings-actions-general-collaborative-delete" // POST /settings/actions/general/collaborative_owner/delete (web.go:1274)
+    | "settings-actions-general-token-permissions"; // POST /settings/actions/general/token_permissions (web.go:1276)
   owner: string;
   repo: string;
   /** The hook id (the detail/test/delete families only) or the rule id (the
@@ -4866,6 +4878,18 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (rest.length === 3 && rest[0] === "actions" && rest[1] === "general" && rest[2] === "actions_unit") {
       return { family: "settings-actions-general-unit", owner, repo };
     }
+    // The three POST tails INSIDE MustEnableActions (web.go:1266-1278 — the
+    // disabled-unit 404 rides the HANDLERS, not this parse): the repo
+    // module's collaborative_owner pair + token_permissions.
+    if (rest.length === 4 && rest[0] === "actions" && rest[1] === "general" && rest[2] === "collaborative_owner" && rest[3] === "add") {
+      return { family: "settings-actions-general-collaborative-add", owner, repo };
+    }
+    if (rest.length === 4 && rest[0] === "actions" && rest[1] === "general" && rest[2] === "collaborative_owner" && rest[3] === "delete") {
+      return { family: "settings-actions-general-collaborative-delete", owner, repo };
+    }
+    if (rest.length === 3 && rest[0] === "actions" && rest[1] === "general" && rest[2] === "token_permissions") {
+      return { family: "settings-actions-general-token-permissions", owner, repo };
+    }
     if (rest.length === 1 && rest[0] === "public_access") {
       return { family: "settings-public-access", owner, repo };
     }
@@ -7344,6 +7368,99 @@ async function repoActionsUnitSubmit(c: Context<{ Bindings: Env }>): Promise<Res
   const form = parseRepoActionsUnitForm(await readUrlEncodedForm(c.req.raw));
   await applyRepoActionsUnitToggle(c.env.DB, repo.id, form);
   return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/actions/general` } }));
+}
+
+/**
+ * The token_permissions POST tail (upstream UpdateTokenPermissions,
+ * repo/setting/actions.go:145-191): override_owner_config always written,
+ * the mode/max arms gate on shouldUpdate (invalid mode = the 303 with the
+ * error flash, NO save); "saved" | "invalid-mode" BOTH 303 (:166-168/:190 —
+ * the flash is the no-session-flash reduction's only casualty); "missing"
+ * is unreachable behind the settings gate.
+ */
+async function repoActionsTokenPermissionsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions-general-token-permissions") return respond(await c.notFound()); // drift guard
+  if (!(await loadRepoSettings(c.env.DB, repo.id)).hasActions) return respond(c.html(renderNotFound(ctx), 404)); // MustEnableActions' group 404 (web.go:1266)
+  const form = parseRepoTokenPermissionsForm(await readRepoActionsGeneralFormParams(c.req.raw));
+  await applyRepoTokenPermissions(c.env.DB, repo.id, form);
+  return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/actions/general` } }));
+}
+
+/**
+ * The collaborative_owner/add POST tail (upstream AddCollaborativeOwner,
+ * repo/setting/actions.go:95-119): the unknown-name arm answers
+ * ctx.JSONError's 400 body (context.go:276-278 — the fetch-action JS
+ * surfaces it), success ctx.JSONOK's {"ok":true} (context.go:243-245) —
+ * explicit Responses carry Base.JSON's exact content-type bytes
+ * (base.go:113-118; c.json would emit Hono's spaced variant).
+ */
+async function repoActionsCollaborativeAddSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions-general-collaborative-add") return respond(await c.notFound()); // drift guard
+  if (!(await loadRepoSettings(c.env.DB, repo.id)).hasActions) return respond(c.html(renderNotFound(ctx), 404));
+  const outcome = await applyRepoCollaborativeOwnerAdd(
+    c.env.DB,
+    repo.id,
+    parseRepoCollaborativeOwnerAddForm(await readRepoActionsGeneralFormParams(c.req.raw)),
+  );
+  if (outcome === "user-not-found") {
+    return respond(new Response(JSON.stringify(REPO_ACTIONS_USER_NOT_EXIST_ERROR), {
+      status: 400,
+      headers: { "content-type": "application/json;charset=utf-8" },
+    }));
+  }
+  return respond(new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: { "content-type": "application/json;charset=utf-8" },
+  }));
+}
+
+/**
+ * The collaborative_owner/delete POST tail (upstream DeleteCollaborativeOwner,
+ * repo/setting/actions.go:121-142): the not-an-owner arm answers
+ * JSONErrorNotFound's 404 body (context.go:286-292 — upstream ALSO flashes
+ * the collaborative_owner_not_exist line at :130-131; the flash is the
+ * reduction casualty, the body/contract is upstream's). The `id` rides the
+ * QUERY on this tail — readRepoActionsGeneralFormParams' body+query merge.
+ */
+async function repoActionsCollaborativeDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const { ctx, repo, respond } = resolved;
+  if (resolved.route.family !== "settings-actions-general-collaborative-delete") return respond(await c.notFound()); // drift guard
+  if (!(await loadRepoSettings(c.env.DB, repo.id)).hasActions) return respond(c.html(renderNotFound(ctx), 404));
+  const outcome = await applyRepoCollaborativeOwnerDelete(
+    c.env.DB,
+    repo.id,
+    parseRepoCollaborativeOwnerDeleteForm(await readRepoActionsGeneralFormParams(c.req.raw)),
+  );
+  if (outcome === "not-an-owner") {
+    return respond(new Response(JSON.stringify(REPO_ACTIONS_NOT_FOUND_ERROR), {
+      status: 404,
+      headers: { "content-type": "application/json;charset=utf-8" },
+    }));
+  }
+  return respond(new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: { "content-type": "application/json;charset=utf-8" },
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -15059,6 +15176,14 @@ uiRouter.get("/:owner/:repo/settings/actions/general", (c) => repoActionsGeneral
 uiRouter.post("/:owner/:repo/settings/actions/general", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/settings/actions/general/actions_unit", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/:repo/settings/actions/general/actions_unit", (c) => repoActionsUnitSubmit(c));
+// The three MustEnableActions-gated POST tails (web.go:1266-1278): chi's
+// 405 GET twins, the same audit convention as the actions_unit pair above.
+uiRouter.get("/:owner/:repo/settings/actions/general/token_permissions", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/settings/actions/general/token_permissions", (c) => repoActionsTokenPermissionsSubmit(c));
+uiRouter.get("/:owner/:repo/settings/actions/general/collaborative_owner/add", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/settings/actions/general/collaborative_owner/add", (c) => repoActionsCollaborativeAddSubmit(c));
+uiRouter.get("/:owner/:repo/settings/actions/general/collaborative_owner/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/settings/actions/general/collaborative_owner/delete", (c) => repoActionsCollaborativeDeleteSubmit(c));
 // Window-2e pass 1: sitemap + search aux.
 uiRouter.get("/sitemap.xml", (c) => sitemapRoute(c));
 uiRouter.get("/explore/repos/sitemap-:file", (c) => sitemapRoute(c));

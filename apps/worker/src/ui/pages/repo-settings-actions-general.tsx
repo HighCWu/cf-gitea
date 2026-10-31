@@ -14,14 +14,14 @@
  *     The group inside the gate keeps `GET ""` → `misc.LocationRedirect(
  *     "./actions/general")` (web.go:1267) plus the collaborative-owner and
  *     token-permission POSTs (web.go:1270-1274).
- *   - `routers/web/repo/setting/actions.go:23-101` —
+ *   - `routers/web/repo/setting/actions.go:23-93` —
  *     `ActionsGeneralSettings` (Title "actions.general", PageType "general",
  *     PageIsActionsSettingsGeneral; the no-unit early render at :34-36) and
  *     `ActionsUnitPost` (the `enable_actions` FormBool →
  *     UpdateRepositoryUnits add/remove, flash success,
  *     `ctx.Redirect(RepoLink + "/settings/actions/general")` — base.go:157's
  *     default is 303 See Other).
- *   - `routers/web/repo/setting/actions.go:103-191` — the POST tails this
+ *   - `routers/web/repo/setting/actions.go:95-191` — the POST tails this
  *     module arms: `AddCollaborativeOwner` (GetUserByName → not-exist is a
  *     JSONError, append-if-absent, JSONOK), `DeleteCollaborativeOwner`
  *     (FormInt64 id, IsCollaborativeOwner or JSONErrorNotFound, remove,
@@ -29,7 +29,7 @@
  *     written; mode + max ceiling only WHEN overriding, an invalid mode
  *     REFUSES the save with a flash-error redirect, enable-max false
  *     stores nil, then flash success + the 303 back onto the general page).
- *   - `routers/web/shared/actions` `ParseMaxTokenPermissions` (:38-55) —
+ *   - `routers/web/shared/actions` `ParseMaxTokenPermissions` (:25-43) —
  *     `max_unit_access_mode_{unitType}` per ActionsTokenUnitTypes, "write"/
  *     "read" keywords, everything (incl. absent) none; `max_id_token`
  *     grants on the literal "write".
@@ -96,7 +96,7 @@
  * lifetime is upstream's own: the toggle's lockstep unit-row delete wipes it
  * on disable, and re-enabling starts fresh (newRepoUnit's nil config).
  *
- * The OWNER-config fallback (actions.go:51-60): when the repo isn't
+ * The OWNER-config fallback (actions.go:50-59): when the repo isn't
  * overriding, upstream renders the OWNER-level OwnerActionsConfig
  * (models/actions/config.go:40-47 — a `user_setting` 'actions.config' JSON
  * row). That store has no landed home (the owner token-permission page is
@@ -113,11 +113,20 @@
  * POST tails stay engine-owned 404s until the orchestrator's registration
  * window (this module is not index.ts's owner). Everything the handlers
  * need is exported from here: the parsers (`parseRepoTokenPermissionsForm`,
- * `parseRepoCollaborativeOwnerAddForm`, `parseRepoCollaborativeOwnerDeleteForm`)
- * and the appliers (`applyRepoTokenPermissions` — the service
+ * `parseRepoCollaborativeOwnerAddForm`, `parseRepoCollaborativeOwnerDeleteForm`
+ * — each verified line-by-line against the pin this wave: the FormBool/
+ * FormString/FormInt64 reads of actions.go:158-177/:96/:122, the unit-type
+ * radios matching repo_unit_actions.go:38-47's ActionsTokenUnitTypes in
+ * order, the merged body-then-query form read of Go's FormValue) and the
+ * appliers (`applyRepoTokenPermissions` — the service
  * `applyRepoTokenPermissionsForm` — plus `applyRepoCollaborativeOwnerAdd`/
- * `Delete`); the HANDOFF recipe in this module's tail comment spells the
- * three route families and their exact upstream response shapes.
+ * `Delete`, verified order-exact: name resolution before the unit read on
+ * add, unit existence before the ownership check on delete) plus the
+ * upstream response bytes (`REPO_ACTIONS_USER_NOT_EXIST_ERROR` /
+ * `REPO_ACTIONS_NOT_FOUND_ERROR`, context.go:276-278/:286-292) and
+ * `readRepoActionsGeneralFormParams`. The HANDOFF recipe in this module's
+ * tail comment carries the exact registration lines; the route-level POST
+ * matrix pins the same glue on the test's fresh-app mount.
  *
  * ## Documented reductions (§6 method — never dead controls)
  *
@@ -150,6 +159,7 @@
 
 import { findUserByName } from "../../api/services/repository";
 import { loadRepoSettings, saveRepoSettings } from "../../api/services/repo-settings";
+import { readUrlEncodedForm } from "../forms";
 import { inArray, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { repositories, users } from "../../db/schema";
@@ -217,8 +227,8 @@ export const repoSettingsActionsGeneralLocale = {
   read_access_helper: "Members can view and clone team repositories.", // .read_access_helper
   write_access_helper: "Members can read and push to team repositories.", // .write_access_helper
   remove: "Remove", // "remove" (the link-action button label, actions_general.tmpl:78)
-  user_not_exist: "The user does not exist.", // "form.user_not_exist" (AddCollaborativeOwner's JSONError body, actions.go:108)
-  not_found: "The target couldn't be found.", // "error.not_found" (DeleteCollaborativeOwner's JSONErrorNotFound body, :128-129)
+  user_not_exist: "The user does not exist.", // "form.user_not_exist" (AddCollaborativeOwner's JSONError body, actions.go:99)
+  not_found: "The target couldn't be found.", // "error.not_found" (DeleteCollaborativeOwner's JSONErrorNotFound body, :130-132)
 } as const;
 
 /** permissions_table.tmpl's rendered unit rows — the template's own list and
@@ -241,6 +251,20 @@ export const repoSettingsActionsGeneralUnitLocale: ReadonlyArray<{ type: number;
  *  (web.go:1267, misc.go:76-80; the browser resolves it against
  *  `/…/settings/actions` → `/…/settings/actions/general`). */
 export const REPO_ACTIONS_GENERAL_REDIRECT_TARGET = "./actions/general";
+
+/** The two JSONError bodies the POST tails answer (context.go:276-278 /
+ *  :286-292 `buildJsonErrorMap`'s text shape — Go marshals the two-key map
+ *  in declaration order; Base.JSON's `application/json;charset=utf-8`
+ *  header rides every one, base.go:113-118). */
+export const REPO_ACTIONS_USER_NOT_EXIST_ERROR = {
+  errorMessage: repoSettingsActionsGeneralLocale.user_not_exist, // actions.go:98-99
+  renderFormat: "text",
+} as const;
+
+export const REPO_ACTIONS_NOT_FOUND_ERROR = {
+  errorMessage: repoSettingsActionsGeneralLocale.not_found, // actions.go:130-133's JSONErrorNotFound
+  renderFormat: "text",
+} as const;
 
 // ---------------------------------------------------------------------------
 // The toggle write arm (upstream ActionsUnitPost, actions.go:74-93)
@@ -277,6 +301,20 @@ export function parseRepoActionsUnitForm(params: URLSearchParams): RepoActionsUn
   return { enableActions: formBool(params.get("enable_actions")) };
 }
 
+/** The form read all three POST tails share: the urlencoded body MERGED with
+ *  the URL query, body first — Go's `http.Request.FormValue` order, the read
+ *  every `ctx.FormString`/`FormBool`/`FormInt64` rides (context.go's form
+ *  helpers); `get` answers the first hit, so a body field wins its query
+ *  twin. The delete tail's `?id=` arrives on the QUERY (the link-action
+ *  button's data-url contract, actions_general.tmpl:75), so the bare body
+ *  read is not upstream-shaped for it. */
+export async function readRepoActionsGeneralFormParams(request: Request): Promise<URLSearchParams> {
+  const params = await readUrlEncodedForm(request);
+  const query = new URL(request.url).searchParams;
+  for (const [key, value] of query) params.append(key, value);
+  return params;
+}
+
 /**
  * The toggle write — upstream ActionsUnitPost's UpdateRepositoryUnits
  * add/remove (actions.go:80-84) collapsed to the landed unit flag (the
@@ -292,15 +330,16 @@ export async function applyRepoActionsUnitToggle(d1: D1Database, repoId: string,
 
 // ---------------------------------------------------------------------------
 // The token_permissions POST arm (upstream UpdateTokenPermissions,
-// actions.go:139-191 — the write semantics live in
+// actions.go:145-191 — the write semantics live in
 // services/actions/config.ts applyRepoTokenPermissionsForm; this module
 // owns the form parse)
 // ---------------------------------------------------------------------------
 
 /** Parse the urlencoded token_permissions POST: the override + enable-max
- *  FormBools, the mode string, and one `max_unit_access_mode_{unitType}`
- *  radio per ACTIONS_TOKEN_UNIT_TYPES (absent parses "" — the apply's none
- *  arm, exactly ParseMaxTokenPermissions' default). */
+ *  FormBools (actions.go:158/:174), the mode string (:164), and one
+ *  `max_unit_access_mode_{unitType}` radio per ACTIONS_TOKEN_UNIT_TYPES
+ *  (absent parses "" — the apply's none arm, exactly ParseMaxTokenPermissions'
+ *  default, shared general.go:27-31). */
 export function parseRepoTokenPermissionsForm(params: URLSearchParams): RepoTokenPermissionsForm {
   const maxUnitAccessModes: Record<number, string> = {};
   for (const unitType of ACTIONS_TOKEN_UNIT_TYPES) {
@@ -326,7 +365,7 @@ export function applyRepoTokenPermissions(d1: D1Database, repoId: string, form: 
 
 // ---------------------------------------------------------------------------
 // The collaborative_owner POST arms (upstream AddCollaborativeOwner /
-// DeleteCollaborativeOwner, actions.go:103-137 — the store arms live in
+// DeleteCollaborativeOwner, actions.go:95-142 — the store arms live in
 // services/actions/config.ts; this module owns the name→id resolution)
 // ---------------------------------------------------------------------------
 
@@ -352,7 +391,7 @@ export function parseRepoCollaborativeOwnerDeleteForm(params: URLSearchParams): 
 }
 
 /** AddCollaborativeOwner's GetUserByName → ActionsConfig.AddCollaborativeOwner
- *  chain (actions.go:104-119): the name resolves against the users table
+ *  chain (actions.go:96-118): the name resolves against the users table
  *  (orgs included — upstream orgs ARE users; findUserByName is
  *  case-insensitive like upstream's lower_name lookup). The index.ts
  *  handler maps `"added"` → JSONOK `{"ok":true}` (200),
@@ -369,7 +408,7 @@ export async function applyRepoCollaborativeOwnerAdd(
 }
 
 /** DeleteCollaborativeOwner's IsCollaborativeOwner → Remove chain
- *  (actions.go:121-137): the handler maps `"removed"` → JSONOK (200),
+ *  (actions.go:121-141): the handler maps `"removed"` → JSONOK (200),
  *  `"not-an-owner"` → JSONErrorNotFound `{"errorMessage":<error.not_found>,
  *  "renderFormat":"text"}` (404), `"missing"` → the gate 404. */
 export function applyRepoCollaborativeOwnerDelete(
@@ -431,7 +470,7 @@ export async function loadRepoActionsGeneralPageData(d1: D1Database, repoId: str
     return { isActionsEnabled: false, tokenPermissions: { ...OWNER_ACTIONS_CONFIG_FALLBACK_DATA }, collaborativeOwners: [] };
   }
   const cfg = await loadRepoActionsConfig(d1, repoId);
-  // actions.go:41-60: the repo's own config when overriding, the owner's
+  // actions.go:41-59: the repo's own config when overriding, the owner's
   // otherwise (the header's fallback reduction — no landed owner store).
   const tokenPermissions: RepoActionsGeneralTokenPermissionsData = cfg.overrideOwnerConfig
     ? {
@@ -441,7 +480,7 @@ export async function loadRepoActionsGeneralPageData(d1: D1Database, repoId: str
         enableMaxTokenPermissions: cfg.maxTokenPermissions !== null,
       }
     : { ...OWNER_ACTIONS_CONFIG_FALLBACK_DATA };
-  // actions.go:62-69: the collaborative owners load ONLY on a private repo
+  // actions.go:61-69: the collaborative owners load ONLY on a private repo
   // (actions_general.tmpl:57-58's arm), by the config's id order.
   const collaborativeOwners: RepoActionsGeneralCollaborativeOwner[] = [];
   const repoRow = await drizzle(d1).select({ visibility: repositories.visibility }).from(repositories).where(eq(repositories.id, repoId)).get();
@@ -725,53 +764,116 @@ export function RepoActionsGeneralPage(props: { ctx: UiContext; data: RepoAction
 
 // ---------------------------------------------------------------------------
 // The wiring HANDOFF (the orchestrator's index.ts window — this module is
-// not index.ts's owner; everything the handlers need is exported above)
+// not index.ts's owner; everything the handlers need is exported above and
+// the route-level matrix pins this exact glue on the test's fresh-app mount,
+// repo-settings-actions-general.test.tsx's "the mounted POST tails")
 // ---------------------------------------------------------------------------
 //
-// Upstream web.go:1270-1274 mounts three POSTs inside MustEnableActions'
+// Upstream web.go:1271-1277 mounts three POSTs inside MustEnableActions'
 // /actions group (the settingsGate + the has-actions 404 arm — the bare
 // literal's redirect handler `repoActionsSettingsRedirect` already carries
-// that exact gate shape, index.ts:6830-6841). The recipe, upstream-shape
-// for shape:
+// that exact gate shape, index.ts:7304-7318). The fold, upstream-shape for
+// shape — the exact lines:
 //
-//   1. PARSE — add to the settings family's resolveUiRequest switch (the
-//      literal-armlist at index.ts:4603-4617):
-//        rest.length === 4 && rest[0] === "actions" && rest[1] === "general"
-//          && rest[2] === "collaborative_owner" && rest[3] === "add"
-//            → family "settings-actions-general-collaborative-add"
-//        rest.length === 4 && … rest[3] === "delete"
-//            → family "settings-actions-general-collaborative-delete"
-//        rest.length === 3 && rest[2] === "token_permissions"
-//            → family "settings-actions-general-token-permissions"
-//      (extend the family union at index.ts:1848-1854 accordingly).
+//   1. PARSE — in the settings family's resolveUiRequest switch, AFTER the
+//      actions_unit literal (the arms sit at index.ts:4855-4868):
+//
+//        if (rest.length === 4 && rest[0] === "actions" && rest[1] === "general" && rest[2] === "collaborative_owner" && rest[3] === "add") {
+//          return { family: "settings-actions-general-collaborative-add", owner, repo };
+//        }
+//        if (rest.length === 4 && rest[0] === "actions" && rest[1] === "general" && rest[2] === "collaborative_owner" && rest[3] === "delete") {
+//          return { family: "settings-actions-general-collaborative-delete", owner, repo };
+//        }
+//        if (rest.length === 3 && rest[0] === "actions" && rest[1] === "general" && rest[2] === "token_permissions") {
+//          return { family: "settings-actions-general-token-permissions", owner, repo };
+//        }
+//
+//      (and extend the SettingsRoute family union's three literals at
+//      index.ts:1925, replacing the union's trailing semicolon arm.)
 //
 //   2. HANDLERS — three functions beside `repoActionsUnitSubmit`
-//      (index.ts:6865-6881), each: sameOriginGuard → resolveUiRequest →
-//      settingsGate → MustEnableActions' repo arm (`loadRepoSettings`;
-//      !hasActions → respond(c.html(renderNotFound(ctx), 404)) — upstream's
-//      MustEnableActions 404, NOT a drift guard) → drift guard → form via
-//      readUrlEncodedForm + the parser → the applier. Then:
-//        - token_permissions ("settings-actions-general-token-permissions"):
-//          applyRepoTokenPermissions; "saved" | "invalid-mode" → BOTH 303
-//          location `${repoLinkOf(repo)}/settings/actions/general`
-//          (upstream :182-185/:189-190 — the success flash and the
-//          invalid-mode flash both land on the redirect; the
-//          no-session-flash reduction drops only the flash itself);
-//          "missing" is unreachable behind the gate.
-//        - collaborative add: applyRepoCollaborativeOwnerAdd; "added" →
-//          respond(c.json({ ok: true }), 200) (ctx.JSONOK,
-//          services/context/context.go:243-245); "user-not-found" →
-//          respond(c.json({ errorMessage: repoSettingsActionsGeneralLocale.user_not_exist,
-//          renderFormat: "text" }), 400) (ctx.JSONError, context.go:276-278 —
-//          the fetch-action JS surfaces it); "missing" unreachable.
-//        - collaborative delete: applyRepoCollaborativeOwnerDelete;
-//          "removed" → c.json({ ok: true }) 200; "not-an-owner" →
-//          respond(c.json({ errorMessage: repoSettingsActionsGeneralLocale.not_found,
-//          renderFormat: "text" }), 404) (ctx.JSONErrorNotFound,
-//          context.go:286-292 — upstream ALSO flashes the
-//          collaborative_owner_not_exist line; the flash is the reduction
-//          casualty, the body/contract is upstream's).
+//      (index.ts:7335-7350), each: sameOriginGuard → resolveUiRequest →
+//      settingsGate → drift guard → MustEnableActions' repo arm
+//      (`loadRepoSettings`; !hasActions → respond(c.html(renderNotFound(ctx),
+//      404)) — upstream's group placement 404, NOT a drift guard) → the form
+//      via readRepoActionsGeneralFormParams (the body+query merge — NOT the
+//      body-only readUrlEncodedForm; the delete tail's ?id= rides the query)
+//      + the parser → the applier. The JSON bodies go out as explicit
+//      Responses with upstream's exact content-type bytes (Base.JSON,
+//      services/context/base.go:113-118 — c.json would emit Hono's
+//      "application/json; charset=UTF-8"):
 //
-//   3. REGISTER — the three families on the settings POST arm (the same
-//      app.post table repoActionsUnitSubmit rides), so a disabled unit's
-//      POST 404-shells through the gate arm (upstream's group placement).
+//        async function repoActionsTokenPermissionsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+//          const guard = sameOriginGuard(c.req.raw);
+//          if (guard !== null) return guard;
+//          const resolved = await resolveUiRequest(c);
+//          if (!resolved.ok) return resolved.response;
+//          const gate = await settingsGate(c, resolved);
+//          if (gate !== null) return gate;
+//          const { ctx, repo, respond } = resolved;
+//          if (resolved.route.family !== "settings-actions-general-token-permissions") return respond(await c.notFound()); // drift guard
+//          if (!(await loadRepoSettings(c.env.DB, repo.id)).hasActions) return respond(c.html(renderNotFound(ctx), 404));
+//          const form = parseRepoTokenPermissionsForm(await readRepoActionsGeneralFormParams(c.req.raw));
+//          await applyRepoTokenPermissions(c.env.DB, repo.id, form);
+//          // "saved" | "invalid-mode" BOTH 303 (upstream :166-168/:190 —
+//          // the success flash and the invalid-mode flash both land on the
+//          // redirect; the no-session-flash reduction drops only the flash);
+//          // "missing" is unreachable behind the gate.
+//          return respond(new Response(null, { status: 303, headers: { location: `${repoLinkOf(repo)}/settings/actions/general` } }));
+//        }
+//
+//        async function repoActionsCollaborativeAddSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+//          // guard → resolveUiRequest → settingsGate → drift guard
+//          // (family !== "settings-actions-general-collaborative-add") →
+//          // the has-actions 404 arm — identical prologue to the above;
+//          // then:
+//          const outcome = await applyRepoCollaborativeOwnerAdd(
+//            c.env.DB,
+//            repo.id,
+//            parseRepoCollaborativeOwnerAddForm(await readRepoActionsGeneralFormParams(c.req.raw)),
+//          );
+//          if (outcome === "user-not-found") {
+//            return respond(new Response(JSON.stringify(REPO_ACTIONS_USER_NOT_EXIST_ERROR), {
+//              status: 400,
+//              headers: { "content-type": "application/json;charset=utf-8" },
+//            })); // ctx.JSONError, context.go:276-278 (the fetch-action JS surfaces it)
+//          }
+//          return respond(new Response(JSON.stringify({ ok: true }), {
+//            status: 200,
+//            headers: { "content-type": "application/json;charset=utf-8" },
+//          })); // ctx.JSONOK, context.go:243-245; "missing" unreachable
+//        }
+//
+//        async function repoActionsCollaborativeDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+//          // identical prologue (family !== "settings-actions-general-collaborative-delete");
+//          // then:
+//          const outcome = await applyRepoCollaborativeOwnerDelete(
+//            c.env.DB,
+//            repo.id,
+//            parseRepoCollaborativeOwnerDeleteForm(await readRepoActionsGeneralFormParams(c.req.raw)),
+//          );
+//          if (outcome === "not-an-owner") {
+//            return respond(new Response(JSON.stringify(REPO_ACTIONS_NOT_FOUND_ERROR), {
+//              status: 404,
+//              headers: { "content-type": "application/json;charset=utf-8" },
+//            })); // ctx.JSONErrorNotFound, context.go:286-292 — upstream ALSO
+//            // flashes the collaborative_owner_not_exist line (:130-131); the
+//            // flash is the reduction casualty, the body/contract is upstream's
+//          }
+//          return respond(new Response(JSON.stringify({ ok: true }), {
+//            status: 200,
+//            headers: { "content-type": "application/json;charset=utf-8" },
+//          })); // "removed"
+//        }
+//
+//   3. REGISTER — on the same uiRouter table repoActionsUnitSubmit rides
+//      (index.ts:15056-15061), POST-only tails with chi's 405 GET twins
+//      (the runners pattern), so a disabled unit's POST 404-shells through
+//      the gate arm (upstream's group placement):
+//
+//        uiRouter.get("/:owner/:repo/settings/actions/general/token_permissions", () => methodNotAllowed("POST"));
+//        uiRouter.post("/:owner/:repo/settings/actions/general/token_permissions", (c) => repoActionsTokenPermissionsSubmit(c));
+//        uiRouter.get("/:owner/:repo/settings/actions/general/collaborative_owner/add", () => methodNotAllowed("POST"));
+//        uiRouter.post("/:owner/:repo/settings/actions/general/collaborative_owner/add", (c) => repoActionsCollaborativeAddSubmit(c));
+//        uiRouter.get("/:owner/:repo/settings/actions/general/collaborative_owner/delete", () => methodNotAllowed("POST"));
+//        uiRouter.post("/:owner/:repo/settings/actions/general/collaborative_owner/delete", (c) => repoActionsCollaborativeDeleteSubmit(c));
