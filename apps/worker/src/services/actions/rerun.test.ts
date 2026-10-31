@@ -22,6 +22,7 @@ import {
   actionRunJobs,
   actionRuns,
   actionTasksVersions,
+  actionVariables,
   repositories,
   repoUnits,
   users,
@@ -434,10 +435,12 @@ describe("the run-level concurrency fill + gate (rerun.go:209-233)", () => {
     expect((await jobsOfRun(holder.runId))[0]!.status).toBe(ACTION_STATUS_WAITING);
   });
 
-  it("an expression-bearing raw stages the fill — no group, the rerun stays Waiting (the module header's HANDOFF)", async () => {
+  it("an expression-bearing raw fills through the run github context (rerun.go:209-221 — GenerateGiteaContext over the NEW attempt, concurrency.go:28)", async () => {
     await seedRepo();
     const seeded = await seedRun(1, [{ jobId: "build" }]);
-    await wearRawConcurrency(seeded.runId, "group: deploy-${{ github.ref_name }}\n");
+    // The trigger test's expression pair (run.ref refs/heads/main → ref_name
+    // "main"): the group interpolates github.ref_name, cancel rides "true".
+    await wearRawConcurrency(seeded.runId, "group: deploy-${{ github.ref_name }}\ncancel-in-progress: true\n");
     await finishRun(seeded.runId, seeded.attemptId, ACTION_STATUS_FAILURE, [
       { id: seeded.jobIds[0]!, status: ACTION_STATUS_FAILURE },
     ]);
@@ -445,8 +448,60 @@ describe("the run-level concurrency fill + gate (rerun.go:209-233)", () => {
     const result = await rerunWorkflowRunJobs(env.DB, REPO_ID, await runRow(seeded.runId), USER_ID, []);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
+    // EvaluateRunConcurrencyFillModel's write with the real context: the
+    // same values evaluateRunConcurrency pins against the github env in the
+    // trigger suite — "deploy-main" + cancel — and the free group waits.
     const attempt = (await db().select().from(actionRunAttempts).where(eq(actionRunAttempts.id, result.attempt.id)))[0]!;
-    expect(attempt.concurrencyGroup).toBe("");
+    expect(attempt.concurrencyGroup).toBe("deploy-main");
+    expect(attempt.concurrencyCancel).toBe(true);
+    expect(attempt.status).toBe(ACTION_STATUS_WAITING);
+  });
+
+  it("the scalar raw arm fills through the context too (the whole-value expression re-decodes as the RawExpression arm)", async () => {
+    await seedRepo();
+    const seeded = await seedRun(1, [{ jobId: "build" }]);
+    await wearRawConcurrency(seeded.runId, "${{ github.ref_name }}-build\n");
+    await finishRun(seeded.runId, seeded.attemptId, ACTION_STATUS_FAILURE, [
+      { id: seeded.jobIds[0]!, status: ACTION_STATUS_FAILURE },
+    ]);
+
+    const result = await rerunWorkflowRunJobs(env.DB, REPO_ID, await runRow(seeded.runId), USER_ID, []);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // The whole-value expression evaluates, then re-decodes as the
+    // RawExpression arm: group "main-build", no cancel (the trigger suite's
+    // same arm).
+    const attempt = (await db().select().from(actionRunAttempts).where(eq(actionRunAttempts.id, result.attempt.id)))[0]!;
+    expect(attempt.concurrencyGroup).toBe("main-build");
+    expect(attempt.concurrencyCancel).toBe(false);
+    expect(attempt.status).toBe(ACTION_STATUS_WAITING);
+  });
+
+  it("the fill's env carries the actions variables and the github actor (rerun.go:196's GetVariablesOfRun + the context's trigger-user lookup)", async () => {
+    await seedRepo();
+    await db().insert(actionVariables).values({
+      ownerId: 0,
+      repoId: REPO_ID,
+      name: "DEPLOY_GROUP",
+      data: "prod-eu",
+      createdAt: T0,
+      updatedAt: T0,
+    });
+    const seeded = await seedRun(1, [{ jobId: "build" }]);
+    await wearRawConcurrency(seeded.runId, "group: ${{ vars.DEPLOY_GROUP }}-${{ github.actor }}\n");
+    await finishRun(seeded.runId, seeded.attemptId, ACTION_STATUS_FAILURE, [
+      { id: seeded.jobIds[0]!, status: ACTION_STATUS_FAILURE },
+    ]);
+
+    const result = await rerunWorkflowRunJobs(env.DB, REPO_ID, await runRow(seeded.runId), USER_ID, []);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // vars resolve through loadActionsVariables (the repo-scoped row) and
+    // github.actor through the context's users read (run.triggerUserId 7 →
+    // "alice") — the assembled evaluator env, not the empty interim one.
+    const attempt = (await db().select().from(actionRunAttempts).where(eq(actionRunAttempts.id, result.attempt.id)))[0]!;
+    expect(attempt.concurrencyGroup).toBe("prod-eu-alice");
+    expect(attempt.concurrencyCancel).toBe(false);
     expect(attempt.status).toBe(ACTION_STATUS_WAITING);
   });
 });

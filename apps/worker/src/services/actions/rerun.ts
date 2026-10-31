@@ -24,10 +24,11 @@
  *      gate cancels-or-blocks on the group (the clear_tasks.go:121-150 pair —
  *      the same split the trigger insert runs). The evaluator reads
  *      github/vars only THROUGH expressions, so an expression-free raw is
- *      exact without the run github-context seam; an EXPRESSION-bearing raw
- *      stages that seam (buildGithubContext/GetVariablesOfRun are
- *      trigger.ts-private — the module-tail HANDOFF) and skips the fill with
- *      a logged warning: the pre-M3 posture, never a mis-evaluation. The
+ *      exact without the run github-context seam (the empty env); an
+ *      EXPRESSION-bearing raw assembles that seam through the trigger
+ *      exports — buildGithubContext + loadActionsVariables, the same context
+ *      + variables pair the insert path evaluates with (the former
+ *      module-tail HANDOFF, wired 2026-10-31). The
  *      JOB-level twin (EvaluateJobConcurrencyFillModel +
  *      PrepareToStartJobWithConcurrency, rerun.go:312-321) stays staged: its
  *      slots/maxParallel machinery rides the matrix model port (trigger's
@@ -44,8 +45,7 @@
  * EmitJobsIfReadyByRun) stay the staged seam they were at this port — the
  * emitter substance the trigger runs inline (checkJobsOfRun) IS wired here
  * for the runs the concurrency cancel touches (notifyAndEmitFinishedJobs'
- * cancelledConcurrencyJobs argument, rerun.go:388); the expression-bearing
- * concurrency fill waits on the run github-context seam above.
+ * cancelledConcurrencyJobs argument, rerun.go:388).
  *
  * The ARTIFACT-INHERITANCE mechanism (the board's v1.3.1 addition: "a rerun's
  * artifacts must resolve to the new attempt") is upstream's
@@ -65,7 +65,7 @@ import { and, asc, eq, inArray, ne } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { isMap, isScalar, parseDocument, type Node as YamlNode } from "yaml";
 
-import { actionArtifacts, actionRunAttempts, actionRunJobs, actionRuns } from "../../db/schema";
+import { actionArtifacts, actionRunAttempts, actionRunJobs, actionRuns, repositories } from "../../db/schema";
 import { loadRepoActionsConfig } from "./config";
 import {
   ACTION_STATUS_BLOCKED,
@@ -79,10 +79,12 @@ import {
 } from "./model";
 import { aggregateJobStatus, isDoneStatus, isRunningStatus } from "./update";
 import {
+  buildGithubContext,
   cancelPreviousJobsByRunConcurrency,
   checkJobsOfRun,
   containsExpression,
   evaluateRunConcurrency,
+  loadActionsVariables,
   shouldBlockRunByConcurrency,
   type RawConcurrency,
 } from "./trigger";
@@ -491,18 +493,52 @@ export async function rerunWorkflowRunJobs(
   // pair) cancels-or-blocks on the group (the same exported split the
   // trigger insert runs). The evaluator reads github/vars only THROUGH
   // expressions, so an expression-free raw is exact without the run
-  // github-context seam; an expression-bearing raw stages that seam (the
-  // module header's HANDOFF) and skips the fill with a logged warning — the
-  // pre-M3 posture, never a mis-evaluation.
+  // github-context seam (the empty env, zero reads); an EXPRESSION-bearing
+  // raw assembles that seam — GetVariablesOfRun (rerun.go:196) through
+  // loadActionsVariables and GenerateGiteaContext(ctx, run, attempt, nil)
+  // (concurrency.go:28) through buildGithubContext, the same context +
+  // variables pair the insert path evaluates with. An evaluation error
+  // propagates: the fill-model failure fails the rerun (rerun.go:218-220).
   const newAttemptNum = templateAttempt.attempt + 1;
   let concurrencyGroup = "";
   let concurrencyCancel = false;
   if (run.rawConcurrency !== "") {
     const raw = unmarshalRawConcurrency(run.rawConcurrency);
     if (containsExpression(run.rawConcurrency)) {
-      console.warn(
-        `[actions-rerun] run ${run.id}: expression-bearing workflow concurrency stages the run github-context seam; the rerun fills no concurrency group`,
-      );
+      const vars = await loadActionsVariables(d1, run.ownerId, run.repoId);
+      // The stored-run rebuild (checkJobsOfRun's githubContextOnce shape):
+      // the repo identity rides the repositories row and appUrl stays ""
+      // (the v1 rebuild posture); run_attempt is the NEW attempt's number
+      // (upstream passes newAttempt — context.go:133's precedence);
+      // triggerUserId rides run.TriggerUserID (the context.go:83/112 actor
+      // sources — a rerun's github.actor stays the original trigger user;
+      // the single-seam export collapses triggering_actor onto it).
+      // workflow_sha is the run commit: v1 rows never carry
+      // workflow_commit_sha (SPEC §1.4) and the push family's workflow
+      // content commit IS the run commit (the insert path's equation).
+      const repoRecordRows = await db
+        .select({ ownerNamespace: repositories.ownerNamespace, slug: repositories.slug })
+        .from(repositories)
+        .where(eq(repositories.id, run.repoId))
+        .limit(1);
+      const githubContext = await buildGithubContext(d1, {
+        repoId: run.repoId,
+        ownerId: run.ownerId,
+        repoOwnerNamespace: repoRecordRows[0]?.ownerNamespace ?? "",
+        repoSlug: repoRecordRows[0]?.slug ?? "",
+        runId: run.id,
+        runNumber: run.index,
+        runAttempt: String(newAttemptNum),
+        triggerUserId: run.triggerUserId,
+        ref: run.ref,
+        commitSha: run.commitSha,
+        workflowId: run.workflowId,
+        workflowSha: run.commitSha,
+        eventName: run.triggerEvent,
+        eventPayloadJson: run.eventPayload,
+        appUrl: "",
+      });
+      ({ group: concurrencyGroup, cancel: concurrencyCancel } = evaluateRunConcurrency(githubContext, raw, vars));
     } else {
       ({ group: concurrencyGroup, cancel: concurrencyCancel } = evaluateRunConcurrency({}, raw, {}));
     }
