@@ -28,3 +28,15 @@ MAIL_PROVIDER_API_KEY=
 MAIL_INBOUND_ENABLED=false
 MAIL_INBOUND_REPLY_ADDRESS=
 MAIL_INBOUND_SECRET=dev-inbound-secret-change-me
+# OAuth2 provider (specs/oauth2-provider.md §2.10-§2.11, W4) — enabled by
+# default (upstream's setting.OAuth2.Enabled default, modules/setting/
+# oauth2.go:104); only the exact string "false" disables. OAUTH2_SIGNING_
+# ALGORITHM picks the id_token/JWKS key (RS256 default; HS*/ES* per the
+# SPEC's alg table) and OAUTH2_JWT_CLAIM_ISSUER overrides the OIDC `iss` +
+# discovery issuer (empty = APP_URL sans trailing slash). Note: vars must
+# ALSO exist in your (gitignored) wrangler.jsonc copy for local dev to
+# inject them — the vitest suite passes its own env slices, so it runs
+# without these.
+OAUTH2_ENABLED=true
+OAUTH2_SIGNING_ALGORITHM=RS256
+OAUTH2_JWT_CLAIM_ISSUER=
