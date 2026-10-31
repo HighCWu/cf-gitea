@@ -532,3 +532,171 @@ describe("failure limiter fails open (production finding ef2c049)", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// THE OAUTH2 DISPATCH (SPEC specs/oauth2-provider.md §2.7 — W2): a dotted
+// Bearer credential resolves through the grant (verifyJws → grant → the
+// strict time bounds), carrying GrantAdditionalScopes as its scope —
+// feeding the landed gates UNCHANGED. The actions-JWT arm of upstream's
+// dotted dispatch is not ported (no Actions-user API identity).
+// ---------------------------------------------------------------------------
+
+describe("the OAuth2 Bearer-dots dispatch (services/auth/oauth2.go:110-128)", () => {
+  let oauth2Seq = 0;
+
+  /** A grant + a signed access token over a seeded user (the W2 mint). */
+  async function seedOAuth2Token(scope: string): Promise<{ token: string; grantId: number; userId: number }> {
+    const { drizzle } = await import("drizzle-orm/d1");
+    const { oauth2Applications } = await import("../db/schema");
+    const { getOrCreateGrant } = await import("../services/oauth2/grants");
+    const { loadOAuth2SigningMaterial, mintTokenTrio } = await import("../services/oauth2/token");
+    oauth2Seq += 1;
+    const user = await seedVerifiedUser({ username: `Oauth2User${oauth2Seq}` });
+    const clientId = `mw-client-${oauth2Seq}`;
+    const appRow = (
+      await drizzle(env.DB)
+        .insert(oauth2Applications)
+        .values({
+          uid: 0,
+          name: `mw-app-${oauth2Seq}`,
+          clientId,
+          clientSecret: "",
+          confidentialClient: false,
+          redirectUris: '["http://127.0.0.1"]',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .returning()
+    )[0]!;
+    const T0 = new Date(Date.now() - 60_000);
+    const { grant } = await getOrCreateGrant(env.DB, { userId: user.id, applicationId: appRow.id, scope }, T0);
+    const material = await loadOAuth2SigningMaterial(env.DB);
+    const result = await mintTokenTrio({
+      db: env.DB,
+      grant,
+      application: appRow,
+      user: (await drizzle(env.DB).select().from(users).where(eq(users.id, user.id)).get())!,
+      material,
+      issuer: "https://example.com",
+      appUrl: "https://example.com/",
+      now: T0,
+    });
+    if (!result.ok) throw new Error("oauth2 mint failed");
+    return { token: (result.response as { access_token: string }).access_token, grantId: grant.id, userId: user.id };
+  }
+
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM oauth2_authorization_code").run();
+    await env.DB.prepare("DELETE FROM oauth2_grant").run();
+    await env.DB.prepare("DELETE FROM oauth2_application").run();
+    const { resetOAuth2KeyCachesForTests } = await import("../services/oauth2/keys");
+    resetOAuth2KeyCachesForTests();
+  });
+
+  it("a dotted Bearer OAuth2 access token resolves the doer + the grant scope through the same gates", async () => {
+    const seeded = await seedOAuth2Token("read:repository,write:issue");
+    const ok = await call("https://example.com/_repo", { headers: { Authorization: `Bearer ${seeded.token}` } });
+    expect(ok.status).toBe(200);
+    const who = await call("https://example.com/_whoami", { headers: { Authorization: `Bearer ${seeded.token}` } });
+    const identity = await who.json<{ user: string; scope: string }>();
+    expect(identity.user).toBe(`Oauth2User${oauth2Seq}`);
+    expect(identity.scope).toBe("write:issue,read:repository"); // the bitmap order; write:issue absorbs read:issue
+  });
+
+  it("an OIDC-only grant carries the legacy `all` authority", async () => {
+    const seeded = await seedOAuth2Token("openid profile");
+    const who = await call("https://example.com/_whoami", { headers: { Authorization: `Bearer ${seeded.token}` } });
+    const identity = await who.json<{ scope: string }>();
+    expect(identity.scope).toBe("all");
+    const ok = await call("https://example.com/_repo", { headers: { Authorization: `Bearer ${seeded.token}` } });
+    expect(ok.status).toBe(200);
+  });
+
+  it("the grant scope FEEDS the gate: a missing category answers the same 403 body with the grant scope", async () => {
+    const seeded = await seedOAuth2Token("read:user");
+    const denied = await call("https://example.com/_repo", { headers: { Authorization: `Bearer ${seeded.token}` } });
+    expect(denied.status).toBe(403);
+    expect(await denied.json()).toEqual({
+      message: scopeErrorMessage("read:repository", "read:user"),
+      url: SWAGGER_URL,
+    });
+  });
+
+  it("a REFRESH-kind token as Bearer → 401 (the kind check)", async () => {
+    const { drizzle } = await import("drizzle-orm/d1");
+    const { oauth2Applications } = await import("../db/schema");
+    const { getOrCreateGrant } = await import("../services/oauth2/grants");
+    const { loadOAuth2SigningMaterial, mintTokenTrio } = await import("../services/oauth2/token");
+    oauth2Seq += 1;
+    const user = await seedVerifiedUser({ username: `Oauth2Refresh${oauth2Seq}` });
+    const appRow = (
+      await drizzle(env.DB)
+        .insert(oauth2Applications)
+        .values({
+          uid: 0,
+          name: `mw-refresh-${oauth2Seq}`,
+          clientId: `mw-refresh-${oauth2Seq}`,
+          clientSecret: "",
+          confidentialClient: false,
+          redirectUris: '["http://127.0.0.1"]',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .returning()
+    )[0]!;
+    const T0 = new Date(Date.now() - 60_000);
+    const { grant } = await getOrCreateGrant(env.DB, { userId: user.id, applicationId: appRow.id, scope: "" }, T0);
+    const result = await mintTokenTrio({
+      db: env.DB,
+      grant,
+      application: appRow,
+      user: (await drizzle(env.DB).select().from(users).where(eq(users.id, user.id)).get())!,
+      material: await loadOAuth2SigningMaterial(env.DB),
+      issuer: "https://example.com",
+      appUrl: "https://example.com/",
+      now: T0,
+    });
+    if (!result.ok) throw new Error("mint failed");
+    const refresh = (result.response as { refresh_token: string }).refresh_token;
+    const denied = await call("https://example.com/_whoami", { headers: { Authorization: `Bearer ${refresh}` } });
+    expect(denied.status).toBe(401);
+    expect(await denied.json()).toEqual(INVALID_CREDENTIALS);
+  });
+
+  it("a Basic-carried JWT stays the PAT lookup (upstream's Basic method) → 401", async () => {
+    const seeded = await seedOAuth2Token("");
+    const denied = await call("https://example.com/_whoami", {
+      headers: { Authorization: `Basic ${btoa(`${seeded.token}:`)}` },
+    });
+    expect(denied.status).toBe(401);
+    expect(await denied.json()).toEqual(INVALID_CREDENTIALS);
+  });
+
+  it("an OAuth2 grant credential never touches the PAT last-used write (the dotless arm owns it)", async () => {
+    const { drizzle } = await import("drizzle-orm/d1");
+    const { personalAccessTokens } = await import("../db/schema");
+    const { TokenService } = await import("./token-service");
+    const seeded = await seedOAuth2Token("");
+    const touchSpy = vi.spyOn(TokenService.prototype, "touchLastUsed");
+    const ok = await call("https://example.com/_whoami", { headers: { Authorization: `Bearer ${seeded.token}` } });
+    expect(ok.status).toBe(200);
+    // settle the background queue (runBackground awaits inline under
+    // direct-invocation requests)
+    expect(touchSpy).not.toHaveBeenCalled();
+    touchSpy.mockRestore();
+    void personalAccessTokens;
+    void drizzle;
+  });
+
+  it("a disabled provider (OAUTH2_ENABLED=false) kills its tokens on the API too", async () => {
+    const seeded = await seedOAuth2Token("");
+    const disabledEnv = { ...env, OAUTH2_ENABLED: "false" };
+    const denied = await app.request(
+      "https://example.com/_whoami",
+      { headers: { Authorization: `Bearer ${seeded.token}` } },
+      disabledEnv,
+    );
+    expect(denied.status).toBe(401);
+    expect(await denied.json()).toEqual(INVALID_CREDENTIALS);
+  });
+});

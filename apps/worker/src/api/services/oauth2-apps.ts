@@ -65,10 +65,14 @@ import { ApiError } from "../errors";
  *                          (models/auth/oauth2_list.go:12-33): uid filter,
  *                          `id DESC` ordering, paginated.
  *
- * SCOPE BOUNDARY (settled) — CRUD ONLY. The OAuth2 authorize/token flow is
- * web-UI territory: no token issuance, no grants, no authorization codes, no
- * ContainsRedirectURI matching (oauth2.go:164-193 — consumed by /login/oauth/
- * authorize, not by this family). The API contract
+ * SCOPE BOUNDARY (settled; amended by W3 2026-10-31) — CRUD ONLY. The
+ * OAuth2 authorize/token flow is web-UI territory: no token issuance, no
+ * grants, no authorization codes. (The W3 wave moved `containsRedirectURI`
+ * HERE — oauth2.go:164-205's membership check is a pure application-row
+ * predicate both flow halves consume: the authorize handler at
+ * /login/oauth/authorize and the token endpoint's exchange check — the
+ * original note excluded it because no flow consumer existed yet; see
+ * specs/oauth2-provider.md §6 W3.) The API contract
  * (`v1-swagger.generated.json`) defines NO `scopes` field on
  * OAuth2Application/CreateOAuth2ApplicationOptions in this pin — scopes live
  * on OAuth2Grant (oauth2.go:510), so there is no application-level scope
@@ -201,6 +205,123 @@ export function detectInvalidOAuth2ApplicationRedirectURI(uris: string[]): strin
     }
   }
   return "";
+}
+
+// ---------------------------------------------------------------------------
+// Redirect-URI membership (oauth2.go:164-205) — the authorize-dance check
+// (SPEC specs/oauth2-provider.md §2.2 step 3, W3): exact match after
+// normalization against every registered URI; PUBLIC clients additionally
+// accept the port-stripped loopback variant (RFC 8252 §7.3).
+// ---------------------------------------------------------------------------
+
+/** util.ToLowerASCII's fold — ASCII letters only (the call site is
+ *  oauth2.go:200; JS `toLowerCase()` is Unicode-aware and would fold
+ *  non-ASCII letters Go leaves alone). */
+function toLowerAscii(s: string): string {
+  return s.replace(/[A-Z]/g, (c) => c.toLowerCase());
+}
+
+/** normalizeRedirectURIForComparison (oauth2.go:199-201): ASCII-lowercase
+ *  plus ONE trailing-slash trim (Go's strings.TrimSuffix removes a single
+ *  suffix occurrence — "a//" keeps its final slash). */
+function normalizeRedirectURIForComparison(redirectURI: string): string {
+  const lowered = toLowerAscii(redirectURI);
+  return lowered.endsWith("/") ? lowered.slice(0, -1) : lowered;
+}
+
+/** net.ParseIP + IsLoopback over the dotted-quad and plain-IPv6 textual
+ *  forms (oauth2.go:203-216's hostname arm): IPv4 loopback = 127.0.0.0/8,
+ *  IPv6 loopback = ::1 exactly. Leading-zero IPv4 octets are refused
+ *  (Go's net.ParseIP rejects them since 1.17 — "127.0.0.01" is not an IP). */
+function isLoopbackIP(host: string): boolean {
+  if (host.includes(":")) {
+    // IPv6: expand the :: shorthand to a fixed 8-group form, then require
+    // the all-zero address with a 1 in the last group (::1).
+    const halves = host.split("::");
+    if (halves.length > 2) return false;
+    const parseGroups = (part: string): string[] | null => {
+      if (part === "") return [];
+      const groups = part.split(":");
+      for (const group of groups) {
+        if (!/^[0-9a-fA-F]{1,4}$/.test(group)) return null;
+      }
+      return groups;
+    };
+    const left = parseGroups(halves[0] ?? "");
+    const right = halves.length === 2 ? parseGroups(halves[1] ?? "") : [];
+    if (left === null || right === null) return false;
+    const middle: string[] = new Array<string>(8 - left.length - right.length).fill("0");
+    const groups = [...left, ...middle, ...right];
+    if (groups.length !== 8) return false;
+    return groups.slice(0, 7).every((g) => parseInt(g, 16) === 0) && parseInt(groups[7] ?? "", 16) === 1;
+  }
+  const parts = host.split(".");
+  if (parts.length !== 4) return false;
+  let firstOctet = -1;
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return false;
+    if (part.length > 1 && part.startsWith("0")) return false;
+    const value = Number(part);
+    if (value > 255) return false;
+    if (firstOctet === -1) firstOctet = value;
+  }
+  return firstOctet === 127;
+}
+
+/** normalizePublicClientRedirectURI (oauth2.go:203-216): the presented URI
+ *  must parse, carry the http scheme and a NON-EMPTY port, and sit on a
+ *  loopback IP; the match candidate is the same URI with the port stripped
+ *  (Go sets Host = Hostname and re-renders — IPv6 re-brackets, an empty
+ *  path renders slash-less). Null when any arm fails (no candidate added). */
+function normalizePublicClientRedirectURI(redirectURI: string): string | null {
+  let u: URL;
+  try {
+    u = new URL(redirectURI);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "http:" || u.port === "") return null;
+  // WHATWG keeps the brackets in `hostname` for IPv6; the IP parse wants the
+  // bare address (Go's Hostname() also de-brackets).
+  const bareHost = u.hostname.startsWith("[") && u.hostname.endsWith("]") ? u.hostname.slice(1, -1) : u.hostname;
+  if (!isLoopbackIP(bareHost)) return null;
+  const path = u.pathname === "/" ? "" : u.pathname;
+  // The re-spell uses the BARE address (brackets OFF): Go's url.URL.String()
+  // with Host = Hostname() over a text IPv6 host renders the bare form, so a
+  // presented `http://[::1]:3456/` lands on `http://::1` and matches a
+  // registered `http://::1/` — the pin's fixture (oauth2_test.go:87-106,
+  // the W2 wave's find: WHATWG's hostname KEEPS the brackets).
+  return `${u.protocol}//${bareHost}${path}${u.search}${u.hash}`;
+}
+
+/**
+ * ContainsRedirectURI (oauth2.go:164-193): the registered-list membership
+ * check behind the authorize ladder's "Unregistered Redirect URI" arm and
+ * the token endpoint's exchange check. Exact match ONLY (RFC 6819 §5.2.3.3
+ * — no dynamic parts): every candidate is ASCII-lowercased and trailing-
+ * slash-trimmed before comparison. Non-confidential (public) clients get
+ * the one RFC 8252 §7.3 port variance: a loopback http URI with an explicit
+ * port also matches its port-stripped form, so a native app presenting
+ * `http://127.0.0.1:<ephemeral>` lands on the seeded `http://127.0.0.1`.
+ * The equality check downstream (code vs presented URI) compares RAW
+ * strings — this normalization never applies there (SPEC §4.4).
+ */
+export function containsRedirectURI(app: OAuth2AppRow, redirectURI: string): boolean {
+  const registered = JSON.parse(app.redirectUris) as string[];
+  const candidates = [redirectURI];
+  if (!app.confidentialClient) {
+    const loopback = normalizePublicClientRedirectURI(redirectURI);
+    if (loopback !== null) candidates.push(loopback);
+  }
+  for (const candidate of candidates) {
+    const normalizedCandidate = normalizeRedirectURIForComparison(candidate);
+    for (const uri of registered) {
+      if (normalizeRedirectURIForComparison(uri) === normalizedCandidate) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------

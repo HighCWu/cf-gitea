@@ -751,6 +751,78 @@ not edit the shared index themselves).
   dots dispatch + `GetOAuthAccessTokenScopeAndUserID` port) feeding the landed
   `apiScopeGate` unchanged. Gates: token-matrix + userinfo/introspect suites; the
   scope-gate matrix untouched-green.
+  **LANDED 2026-10-31** — `services/oauth2/token.ts` (the model seam: the
+  grant-scope family, PKCE verify, the trio mint, groups, the userinfo/
+  introspection claim assembly, the dispatch resolution) +
+  `web/oauth2-token.ts` (the four routes + the bare-OPTIONS 405 deny arms)
+  + the `resolveAuth` dispatch hunk (`src/auth/middleware.ts`: a dotted
+  BEARER credential resolves through `resolveOAuth2AccessTokenCredential`;
+  the synthetic AuthInfo token carries `GrantAdditionalScopes` so
+  `apiScopeGate` and the scope-gate 403 body read it exactly like a PAT;
+  the PAT last-used touch stays the dotless arm's — upstream's
+  UpdateAccessToken is the dotless path only). Suites green own-eyes:
+  token 28/28, routes 48/48 (incl. the upstream ContainsRedirectURI fixture
+  table), middleware 44/44 (7 new dispatch arms), W1 unregressed (jws 24 +
+  keys 15 + grants 20 = 59/59), index 67/67, `check:api` PASS, scoped
+  eslint clean, tsc zero in W2 files, `pnpm test:full` NOT run (ADR-0006 —
+  the scopes above are the wave's own-eyes set). Mount EXECUTED in
+  src/index.ts (the federation fold precedent): `app.route("/",
+  oauth2Router)` before uiRouter + the `isLoginPath` dispatcher carve.
+  Open question 1's AS-BUILT answer is the hybrid: the stateless JSON arms
+  live in the `web/` seam (this wave), the session arms in the ui family
+  (W3's landing) — one mount window.
+  As-built discoveries, each with its pin cite:
+  - **The JSON writer** (§2.4/§2.6 bodies): the pin's `ctx.JSON` is jsonv2
+    `MarshalWrite` (modules/json/jsonv2.go) — compact, NO trailing newline,
+    `FormatNilSliceAsNull(true)` (userinfo `groups` renders null for an
+    org-less user), struct member order preserved; `OIDCKeys` marshals a
+    MAP so the JWK members emit alphabetically. Every response builder
+    spells Go struct field order literally.
+  - **`email_verified` is a Go bool omitempty** (token.go:82): the claim
+    appears ONLY when true; a null-email ACTIVE account mints
+    `email_verified:true` with NO `email` member (Email = "" omits,
+    EmailVerified = IsActive rides — upstream sets them independently).
+    `updated_at` always omits (no `users.updated_unix` column — the zero
+    stamp upstream's omitempty drops too; §2.4 adaptation recorded).
+  - **Sequential replay is 'client is not authorized'** (oauth2_provider.go
+    :660-667): the consumed code row is DELETED (the consumption IS the
+    DELETE), so a second presentation misses at the code LOAD, before any
+    Invalidate rowcount can report it — the "authorization code already
+    used" arm (:700-712) is the load-then-delete RACE loser. §4.1's
+    "second presentation ⇒ invalid_grant 'authorization code already
+    used'" wording is corrected by this note; the route test pins the
+    sequential arm, the store suite pins the rowcount signal.
+  - **Go's `r.Form` body-over-query precedence** (FormValue reads the
+    merged slice head): `parseTokenForm` lets body values overwrite query
+    values; the JSON arm per §4.16(g).
+  - **The refresh unknown-client message is `%q`** — Go's double-quoting
+    (`…client id: "x"`, :571) vs the authorization_code arm's plain single
+    quotes (`'x'`, :638). Ported verbatim.
+  - **`OAUTH2_INVALIDATE_REFRESH_TOKENS`** rides the widened env alias
+    (strict polarity, ONLY "true" enables; default false = the
+    no-default-rotation trap) — readable before W4's example-config entry;
+    the rotation arms (CAS + moved cnt + the stale-CAS "cannot increase
+    the grant counter") are suite-driven through it.
+  - **The empty-client-secret HS id_token arm** diverges observably:
+    workerd rejects empty HMAC key material where upstream signs a
+    degenerate empty-key id_token — the route answers upstream's own
+    create-key failure arm, invalid_request "Error creating signing key"
+    (:543-551). RS256 default unaffected. Appended to §4.16's list.
+  - **userinfo/introspect plain-text error lines** are Go `PlainText`
+    (`text/plain;charset=utf-8`, no space + nosniff, body verbatim) with
+    the exact `WWW-Authenticate` challenges (`Bearer realm=`/`Basic
+    realm="Gitea OAuth2"`).
+  - **The `[::1]` loopback-variance fixture** (models/auth/oauth2_test.go
+    :87-106): WHATWG `URL.hostname` keeps IPv6 brackets — the port-strip
+    rebuild must de-bracket to the bare address (Go's `String()` over
+    `Host = Hostname()`), so `http://[::1]:3456/` matches a registered
+    `http://::1/`. Pinned in the route suite; the same fix is needed in
+    `api/services/oauth2-apps.ts`'s shared `containsRedirectURI` (W3's
+    file — the cross-unit find is reported to the orchestrator, alongside
+    the duplicate `normalizeGrantScope`/`grantAdditionalScopes` pair this
+    module carries beside `ui/oauth2-authorize.ts`'s: same upstream port,
+    one should absorb the other at integration; the services copy is the
+    mint/dispatch consumer's home).
 - **W3 — authorize + consent** (depends W1). Owns: GET/POST
   `/login/oauth/authorize` + POST `/login/oauth/grant` handlers, the session-state
   column read/write via the SPEC-0010 session seam, `ui/pages/oauth2-grant.tsx`
@@ -758,6 +830,37 @@ not edit the shared index themselves).
   `ContainsRedirectURI` port (with the public-client loopback arm) as a shared
   service (consumable by W2's exchange check). Gates: dance decision-table suite,
   goldens, a11y smoke.
+  **LANDED 2026-10-31** — the handlers at `ui/oauth2-authorize.ts` (open
+  question 1 resolved per its recommendation: the session-router family;
+  MOUNT HANDOFF for the orchestrator's registration window:
+  `app.route("/", oauth2AuthorizeRouter);` beside the sessionRouter mount —
+  the `oauth2Enabled` 403 wrap is W4's, the slot is commented at the router),
+  the consent + `grant_error` pages at `ui/pages/oauth2-grant.tsx`,
+  `containsRedirectURI` in `api/services/oauth2-apps.ts` (the module header's
+  scope-boundary note amended — the check is a pure application-row predicate
+  both flow halves consume), and the scope services (`normalizeGrantScope`/
+  `grantAdditionalScopes`, access_token.go:87-134) co-located with the
+  handlers for W2's token/introspect consumers. Suite 33/33 own-eyes (the
+  §2.2 decision table + ContainsRedirectURI units incl. the IPv6/https/
+  confidential-loopback refusals + scope pins + the two goldens + a11y);
+  oauth2-apps 19/19, grants 20/20, session 56/56 neighbors green; tsc 0 in
+  W3 files; eslint clean; check:api PASS. Decisions taken: (1) the dance
+  state rides `sessions.oauth_state` as ONE JSON blob with a CAS
+  read-and-clear at POST /grant — the compare-and-set on the read value is
+  the one-consumer guarantee (a second consent POST takes the 400 arm;
+  upstream's persistent session keys would verify twice — the schema
+  comment's read-and-clear posture wins); (2) the auto-consent path never
+  stashes (nothing reads it back — upstream writes its session keys there
+  too, un-read); (3) `granted` parses with Go's ParseBool set (the handler
+  bug "false binds true" caught by the denied-path test); (4) the consent
+  page's title fills the role=main aria-label slot upstream leaves empty
+  (house a11y R3 — one recorded divergence); (5) grant_error keeps
+  upstream's h1→h3 VERBATIM and pins the single expected R2 violation
+  in-suite instead of bending the page; (6) the
+  audit.UserOAuth2ApplicationGrant event (oauth2_provider.go:451-453) is a
+  RECORDED OPEN ISSUE — the landed audit action registry (services/audit.ts)
+  has no OAuth2 family entry and the const is a shared-file hunk outside
+  W3's ownership; lands with the W4/W6 audit-registry window.
 - **W4 — discovery, gate, realm flip** (depends W2). Owns: GET
   `/.well-known/openid-configuration`; the `OAUTH2_ENABLED` var plumbing
   (strict polarity, example-config entry), the endpoint gating, the settings
@@ -789,6 +892,9 @@ shared hunks — W4 owns both; W1–W3/W5 never touch them.
    Recommend the UI router family: the authorize endpoints ARE session-bound UI
    pages; the token/introspect/userinfo/keys arms are stateless JSON and can sit in
    the same family with `resolveUiSession` skipped. Decide at W2/W3 dispatch.
+   (RESOLVED at W3, 2026-10-31: the session-router family — W3's authorize/grant
+   router lives at `ui/oauth2-authorize.ts`, mounted beside `sessionRouter`; W2's
+   stateless arms should follow the same family.)
 2. **Org settings edit/regenerate arms** — landed org page carries create/delete
    only; confirm at W5 dispatch whether its brief staged the remaining arms (the
    upstream org twin shares all handlers).

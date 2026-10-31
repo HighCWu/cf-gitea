@@ -26,9 +26,11 @@ import { handleIncomingEmail } from "./services/mail/inbound";
 import { armsForEntry, recordArmsFailure, recordArmsSuccess } from "./services/cron-state";
 import { handlesUiRoute, uiRouter } from "./ui";
 import { sessionRouter } from "./ui/session";
+import { oauth2AuthorizeRouter } from "./ui/oauth2-authorize";
 import { firstRunRouter } from "./ui/first-run";
 import { avatarServingRouter } from "./web/avatar-serving";
 import { attachmentsServingRouter } from "./web/attachments-serving";
+import { oauth2Router } from "./web/oauth2-token";
 import { wellKnownRouter } from "./api/routes/federation";
 import { securityHeaders, withSecurityHeaders } from "./web/security-headers";
 import { webhookDlqHandler } from "./webhooks/dlq";
@@ -285,6 +287,16 @@ app.route("/", attachmentsServingRouter);
 // mount, the same plain-Hono seam shape): nodeinfo + webfinger, the
 // FEDERATION_ENABLED gate answers 404 when off (the web pair's disabled arm).
 app.route("/", wellKnownRouter);
+// The OAuth2 provider's stateless JSON arms (SPEC specs/oauth2-provider.md
+// §2.3/§2.6, W2's route-home decision in web/oauth2-token.ts's header):
+// POST /login/oauth/access_token, POST /login/oauth/introspect,
+// GET/POST /login/oauth/userinfo, GET /login/oauth/keys + the bare-OPTIONS
+// 405 deny arms. Mounted BEFORE uiRouter (the first-run HANDOFF's
+// precedence finding) and carved out of the repo-scoped branch (the
+// isLoginPath carve above); W3's authorize/consent arms join this family
+// and W4 wraps the group in the OAUTH2_ENABLED 403 (web.go:631's
+// oauth2Enabled — ungated until then).
+app.route("/", oauth2Router);
 // Tier-2 UI (SPEC-0008 §2.2): the sub-app claims only the page families its
 // parser owns (/:owner/:repo[/commits|/src]); the dispatcher consults
 // handlesUiRoute BEFORE Hono routes, so a miss here can never swallow an
@@ -297,9 +309,14 @@ app.route("/", wellKnownRouter);
 // first-run HANDOFF's "order immaterial" claim was wrong for this path).
 app.route("/", firstRunRouter);
 app.route("/", uiRouter);
-// SPEC-0010: /login + /logout are single-segment top-level routes (§2.1) —
+// SPEC-0010: /login + /logout are single-segment top level routes (§2.1) —
 // never repo-scoped, so the dispatcher and the engine never see them.
 app.route("/", sessionRouter);
+// The OAuth2 authorize pair (SPEC oauth2-provider.md W3): /login/oauth/
+// authorize + /login/oauth/grant — session-bound UI routes in the session
+// family; the oauth2Enabled 403 wrap rides W4 (the commented slot at the
+// router export).
+app.route("/", oauth2AuthorizeRouter);
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -343,6 +360,13 @@ export default {
     // out of the repo-scoped branch so the two-segment shapes stop falling
     // to the headless engine's 404.
     const isWellKnown = segments[0] === ".well-known";
+    // The /login family carve (SPEC specs/oauth2-provider.md §2.1/§6 W2):
+    // the OAuth2 provider group (/login/oauth/* — web.go:617-631) and the
+    // session router's /login live in Hono-land; without the carve the
+    // multi-segment /login/oauth/* shapes fall into the repo-scoped branch
+    // and the headless engine 404s them (the /.well-known carve's twin —
+    // the W3 authorize/consent arms ride the same mount family).
+    const isLoginPath = segments[0] === "login";
     // THE ASSET-MISS FALLBACK TARGET (web.go:264 + modules/public/public.go —
     // the v1.2-carried "no /assets fallback target" residual closed): the
     // wrangler assets binding serves every HIT edge-side with
@@ -383,7 +407,8 @@ export default {
       segments[0] !== "v2" && // the OCI root mount (api.go:509) — /v2/{owner}/… is NOT repo-scoped
       !isAvatarServing &&
       !isAttachmentServing &&
-      !isWellKnown;
+      !isWellKnown &&
+      !isLoginPath;
     if (isRepoScoped) {
       // All methods for the UI's write families (new/edit/delete file,
       // new-issue, comments, settings, milestones — waves 4-8 are POSTs on

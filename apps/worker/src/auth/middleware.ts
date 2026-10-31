@@ -17,11 +17,12 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { users } from "../db/schema";
-import type { AuthEnv, AuthInfo, AuthUser } from "./auth-context";
+import type { AuthEnv, AuthInfo, AuthToken, AuthUser } from "./auth-context";
 import { basicAuthTokenCandidate, parseAuthorizationHeader } from "./httpauth";
 import { D1FailureLimiter, type RateLimitHook, type RateLimitVerdict } from "./failure-limiter";
 import { requiredScopeNames, type ScopeCategory, ScopeSet, type ScopeLevel } from "./scopes";
 import { TokenService } from "./token-service";
+import { oauth2FeatureEnabled, resolveOAuth2AccessTokenCredential, type ResolvedOAuth2Credential } from "../services/oauth2/token";
 
 /** Message used for every bad/expired/revoked credential (api.go:862–875). */
 const INVALID_CREDENTIAL_MESSAGE = "invalid username, password or token";
@@ -45,6 +46,18 @@ export interface ResolveAuthOptions {
   /** Override the failure-limit backend (defaults to the D1 limiter). */
   failureLimiter?: (env: Env) => RateLimitHook;
 }
+
+/**
+ * The OAuth2 vars the Bearer-dots dispatch reads — the widened alias (the
+ * FederationEnv posture: Omit + optional members) so the dispatch works
+ * before AND after W4's wrangler plumbing types the vars.
+ */
+type OAuth2DispatchEnv = Omit<Env, "OAUTH2_ENABLED" | "OAUTH2_SIGNING_ALGORITHM"> & {
+  /** Strict polarity: ONLY the exact string "false" disables. */
+  OAUTH2_ENABLED?: string;
+  /** Default RS256 (modules/setting/oauth2.go:108). */
+  OAUTH2_SIGNING_ALGORITHM?: string;
+};
 
 // --- API error helpers ------------------------------------------------------
 
@@ -121,7 +134,8 @@ export function resolveAuth(options: ResolveAuthOptions = {}): MiddlewareHandler
 
     const header = c.req.header("Authorization");
     const parsed = header === undefined ? null : parseAuthorizationHeader(header);
-    const credential = parsed?.bearerToken?.token ?? (parsed?.basicAuth ? basicAuthTokenCandidate(parsed.basicAuth) : null);
+    const bearerCredential = parsed?.bearerToken?.token ?? null;
+    const credential = bearerCredential ?? (parsed?.basicAuth ? basicAuthTokenCandidate(parsed.basicAuth) : null);
 
     if (parsed === null || credential === null) {
       // Malformed Authorization parses as *no credentials* → anonymous doer
@@ -141,7 +155,28 @@ export function resolveAuth(options: ResolveAuthOptions = {}): MiddlewareHandler
       });
     }
 
-    const verified = await service.verify(credential, { now });
+    // THE OAUTH2 DISPATCH (SPEC specs/oauth2-provider.md §2.7): a dotted
+    // BEARER credential is OAuth2-grant shape (services/auth/oauth2.go:
+    // 110-128 — the token extraction takes Bearer/query; a Basic-carried
+    // JWT stays the PAT lookup like upstream's Basic method). verifyJws
+    // pins the instance alg, assertApiTimeBounds applies the strict
+    // exp/iat bounds, and the grant lookup resolves the doer + the access
+    // scope — feeding the landed apiScopeGate UNCHANGED (§2.7: the token
+    // resolves to (doer, scope) before the gate reads it, exactly like a
+    // PAT). Upstream's actions-JWT arm of the dotted dispatch is not
+    // ported (no Actions-user API identity; the recorded divergence note
+    // in resolveOAuth2AccessTokenCredential's header).
+    const oauth2Env: OAuth2DispatchEnv = c.env;
+    const oauth2Resolved =
+      bearerCredential !== null && bearerCredential.includes(".")
+        ? await resolveOAuth2AccessTokenCredential(c.env.DB, bearerCredential, {
+            enabled: oauth2FeatureEnabled(oauth2Env),
+            configuredAlgorithm: oauth2Env.OAUTH2_SIGNING_ALGORITHM,
+            now,
+          })
+        : null;
+    const verified: { token: AuthToken; user: AuthUser } | null =
+      oauth2Resolved !== null ? oauth2CredentialAuth(oauth2Resolved) : await service.verify(credential, { now });
     if (verified === null) {
       // The 401 must not depend on the limiter backend's health.
       await limiterRecordFailureFailOpen(limiter, ip, now);
@@ -171,13 +206,57 @@ export function resolveAuth(options: ResolveAuthOptions = {}): MiddlewareHandler
     c.set("auth", auth);
 
     // Throttled `last_used_at` (24 h) and failure-counter reset run in the
-    // background (SPEC-0002 §2.7).
-    await runBackground(c, service.needsLastUsedTouch(verified.token, now)
-      ? service.touchLastUsed(verified.token.id, now)
-      : Promise.resolve());
+    // background (SPEC-0002 §2.7). The PAT touch is the PAT path ONLY — an
+    // OAuth2 grant credential must not write personal_access_tokens rows
+    // (upstream's UpdateAccessToken sits in the dotless arm,
+    // services/auth/oauth2.go:141-144).
+    if (oauth2Resolved === null) {
+      await runBackground(c, service.needsLastUsedTouch(verified.token, now)
+        ? service.touchLastUsed(verified.token.id, now)
+        : Promise.resolve());
+    }
     await runBackground(c, limiterResetFailOpen(limiter, ip));
 
     await next();
+  };
+}
+
+/**
+ * The OAuth2 grant credential as an AuthInfo carrier: the grant IS the
+ * token-row analogue (id = grant id, scopes = GrantAdditionalScopes), so
+ * the scope-gate 403 body renders `token scope=<grant scope>` exactly like
+ * upstream's ExtDoerData-backed GetDoerTokenScope (user_extdata.go) —
+ * `all` for OIDC-only grants, the normalized access words otherwise.
+ */
+function oauth2CredentialAuth(resolved: ResolvedOAuth2Credential): { token: AuthToken; user: AuthUser } {
+  return {
+    token: {
+      id: resolved.grantId,
+      userId: resolved.grant.userId,
+      name: "oauth2-grant",
+      prefix: "",
+      scopes: resolved.scope,
+      expiresAt: null,
+      lastUsedAt: null,
+      createdAt: resolved.grant.createdAt,
+    },
+    user: {
+      id: resolved.user.id,
+      username: resolved.user.username,
+      usernameLower: resolved.user.usernameLower,
+      email: resolved.user.email,
+      displayName: resolved.user.displayName,
+      location: resolved.user.location,
+      website: resolved.user.website,
+      description: resolved.user.description,
+      isAdmin: resolved.user.isAdmin,
+      status: resolved.user.status,
+      createdAt: resolved.user.createdAt,
+      type: resolved.user.type,
+      visibility: resolved.user.visibility,
+      numStars: resolved.user.numStars,
+      lastLoginAt: resolved.user.lastLoginAt,
+    },
   };
 }
 
