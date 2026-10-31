@@ -1102,6 +1102,10 @@ import {
   userCleanupRuleEditDataFromForm,
   userSettingsPackagesLocale,
 } from "./pages/user-settings-packages";
+// The chef keypair web arm (pages/user-settings-packages-chef.tsx — web.go:
+// 718's POST over the landed chef-auth service; the section's fold-back
+// recipe rides that module's header).
+import { chefKeypairDownloadResponse, regenerateChefKeypair } from "./pages/user-settings-packages-chef";
 import type { UserProfileRow } from "./pages/user-profile";
 import {
   createUserHookFromForm,
@@ -3241,6 +3245,7 @@ export interface UserSettingsTabRoute {
     | "user-settings-packages-rule-add"
     | "user-settings-packages-rule-edit"
     | "user-settings-packages-rule-preview"
+    | "user-settings-packages-chef-regenerate" // POST /user/settings/packages/chef/regenerate_keypair (web.go:718)
     | "user-settings-variables"
     | "user-settings-variables-new"
     | "user-settings-variables-edit"
@@ -3675,7 +3680,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     // The USER-scope packages family (pages/user-settings-packages.tsx —
     // web.go:701-719's cleanup-rules group at user scope; rules/add literal
-    // before the {id} combos; cargo/chef tails unregistered — no substrate).
+    // before the {id} combos; the cargo tail stays unregistered — no cargo
+    // substrate — while the chef tail below IS claimed over the landed
+    // chef-auth service).
     if (tail.length === 1 && tail[0] === "packages") {
       return { family: "user-settings-packages", id: null };
     }
@@ -3689,6 +3696,13 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (tail.length === 4 && tail[0] === "packages" && tail[1] === "rules" && tail[3] === "preview") {
       const id = numericId(tail[2]);
       return id === null ? null : { family: "user-settings-packages-rule-preview", id };
+    }
+    // The chef keypair arm (web.go:718 — RegenerateChefKeyPair over
+    // pages/user-settings-packages-chef.tsx; POST-only upstream, the GET
+    // twin answers the 405; the junk/deeper tails stay unclaimed → the
+    // engine's 404).
+    if (tail.length === 3 && tail[0] === "packages" && tail[1] === "chef" && tail[2] === "regenerate_keypair") {
+      return { family: "user-settings-packages-chef-regenerate", id: null };
     }
     if (tail.length === 1 && tail[0] === "actions") {
       // web.go:722: GET /user/settings/actions -> LocationRedirect("./actions/general").
@@ -9269,6 +9283,23 @@ async function userPackagesRulePreviewPage(c: Context<{ Bindings: Env }>, ruleId
   const data = await loadUserCleanupRulePreview(c.env.DB, user, ruleId);
   if (data.kind === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
   return p.respond(c.html(renderUserCleanupRulePreviewPage(p.ctx, data), 200));
+}
+
+/** POST /user/settings/packages/chef/regenerate_keypair (web.go:718 →
+ *  setting/packages.go:103-119, over pages/user-settings-packages-chef.tsx):
+ *  the §2.8 same-origin guard, the doer row read (the family convention),
+ *  then generate → store ONLY the public PEM → stream the private PEM ONCE
+ *  as the `{username}.priv` download. No input fields — there is no bind
+ *  ladder; a seam failure propagates to the app-level onError (upstream's
+ *  two bare ServerError arms). The private bytes ride the response only —
+ *  no state carries them, a reload shows nothing. */
+async function userPackagesChefRegenerateKeypair(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const user = await readProfileRowForPackages(c, p.viewer.id);
+  if (user === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  const privatePem = await regenerateChefKeypair(c.env.DB, user.id);
+  return p.respond(chefKeypairDownloadResponse(user.username, privatePem));
 }
 
 // --- the account tab (pages/user-settings-account.tsx — upstream EmailPost /
@@ -15503,6 +15534,10 @@ uiRouter.get("/user/settings/packages/rules/:id{(\\d+)}", (c) => userPackagesRul
 uiRouter.post("/user/settings/packages/rules/:id{(\\d+)}", (c) => userPackagesRuleEditSubmit(c, Number(c.req.param("id"))));
 uiRouter.get("/user/settings/packages/rules/:id{(\\d+)}/preview", (c) => userPackagesRulePreviewPage(c, Number(c.req.param("id"))));
 uiRouter.post("/user/settings/packages/rules/:id{(\\d+)}/preview", () => methodNotAllowed("GET"));
+// The chef keypair arm (web.go:718 — POST-only upstream; the GET twin
+// answers chi's 405).
+uiRouter.post("/user/settings/packages/chef/regenerate_keypair", (c) => userPackagesChefRegenerateKeypair(c));
+uiRouter.get("/user/settings/packages/chef/regenerate_keypair", () => methodNotAllowed("POST"));
 uiRouter.get("/user/settings/actions/runners/:id{(\\d+)}/delete", () => methodNotAllowed("POST"));
 uiRouter.get("/user/settings/actions/variables", (c) => userSettingsVariablesPage(c));
 uiRouter.post("/user/settings/actions/variables/new", (c) => userSettingsVariablesNew(c));

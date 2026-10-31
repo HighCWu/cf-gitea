@@ -64,21 +64,19 @@
  *   shared partials' verbatim (the same `package/shared/cleanup_rules/*`
  *   templates the org pages render).
  *
- * ## Documented omissions — cargo AND chef (no substrate at either)
+ * ## Documented omissions — cargo only (the chef arm LANDED)
  *
  *   - The CARGO section (cargo.tmpl + web.go:715-718's initialize/rebuild
  *     POSTs) is NOT RENDERED and NOT ROUTED: no cargo registry/index
  *     service exists (the org twin's documented dead-control reduction).
- *   - The CHEF section (packages.tmpl:9-24's keypair form +
- *     web.go:718's `POST /chef/regenerate_keypair` →
- *     `RegenerateChefKeyPair` — GenerateKeyPair + SetUserSetting of the
- *     chef public PEM, setting/packages.go:110-124) is NOT RENDERED and
- *     NOT ROUTED: there is no chef substrate either (no
- *     `modules/packages/chef`, no user-setting keystore; "chef" appears in
- *     the landed tree only as the TypeList NAME and a gitignore template).
- *     The keypair button would POST into a dead end — the no-dead-controls
- *     rule. A chef cleanup RULE stays functional and in the dropdown, the
- *     cargo-rule reasoning verbatim.
+ *   - The CHEF keypair section (packages.tmpl:9-24's form) LANDED with
+ *     b6c6cb8's chef-auth substrate: the section renders below
+ *     (./user-settings-packages-chef.tsx — the exact template markup) and
+ *     web.go:718's `POST /chef/regenerate_keypair` is ROUTED in
+ *     ui/index.ts (GenerateKeyPair + SetUserSetting of the public PEM,
+ *     setting/packages.go:110-124; the private key streams ONCE per the
+ *     secret-once posture). A chef cleanup RULE stays functional in the
+ *     dropdown as before.
  *
  * ## The mount posture + HANDOFF recipes (the shared files are NOT edited
  * by this unit — settings-nav.tsx and ui/index.ts)
@@ -194,15 +192,17 @@
  *        uiRouter.post("/user/settings/packages/rules/:id{(\\d+)}/preview", () => methodNotAllowed("GET"));
  *
  *      The cargo tails (`/user/settings/packages/cargo/initialize|rebuild`)
- *      and the chef tail (`/user/settings/packages/chef/regenerate_keypair`)
- *      stay UNREGISTERED (the engine's 404 — the omissions above). The
+ *      stay UNREGISTERED (the engine's 404 — the omissions above); the
+ *      chef tail (`/user/settings/packages/chef/regenerate_keypair`) IS
+ *      REGISTERED (the landed keypair POST —
+ *      ./user-settings-packages-chef.tsx's mount). The
  *      preview loader's compile failure THROWS (upstream ServerError) —
  *      the app-level onError answers; unreachable through this page's own
  *      forms but honored for hand-seeded rows.
  *   4. tests — the mount window adds the route-level matrix (the
  *      user-settings family pattern): the anonymous 303, the cross-origin
  *      403 ahead of every write, the four parse claims + the junk-id/
- *      deeper-tail nulls and the cargo/chef tails' engine 404s. The
+ *      deeper-tail nulls and the cargo tail's engine 404. The
  *      module-level battery below covers every loader/apply/render arm.
  */
 
@@ -249,6 +249,7 @@ import {
   type OrgCleanupRuleParsedForm as UserCleanupRuleParsedForm,
   type OrgCleanupRulePreviewRow as UserCleanupRulePreviewRow,
 } from "./org-settings-packages";
+import { ChefKeypairSection } from "./user-settings-packages-chef";
 
 // ---------------------------------------------------------------------------
 // The re-exports (the owner-agnostic logic — the HANDOFF's one-stop import
@@ -475,8 +476,9 @@ export function renderUserSettingsPackagesPage(ctx: UiContext, data: UserPackage
 }
 
 /** The list page (user/settings/packages.tmpl → cleanup_rules/list.tmpl).
- *  The cargo AND chef sections are NOT rendered — no substrate for either
- *  (the module header's documented dead-control omissions). */
+ *  The cargo section is NOT rendered (the documented dead-control
+ *  omission); the CHEF keypair section renders — the landed
+ *  ./user-settings-packages-chef module (packages.tmpl:9-24). */
 export function UserSettingsPackagesPage(props: { ctx: UiContext; data: UserPackagesSettingsPageData }) {
   const { ctx, data } = props;
   const base = "/user/settings/packages";
@@ -553,9 +555,11 @@ export function UserSettingsPackagesPage(props: { ctx: UiContext; data: UserPack
                 )}
               </div>
             </div>
-            {/* package/shared/cargo.tmpl: NOT RENDERED — no cargo substrate.
-                The chef keypair section (packages.tmpl:9-24): NOT RENDERED —
-                no chef substrate either (the module header's omissions). */}
+            {/* The chef keypair section (packages.tmpl:9-24) — the landed
+                ./user-settings-packages-chef module; the POST streams the
+                private key ONCE. package/shared/cargo.tmpl: NOT RENDERED —
+                no cargo substrate (the module header's omission). */}
+            <ChefKeypairSection base={base} />
           </div>
         </div>
       </div>

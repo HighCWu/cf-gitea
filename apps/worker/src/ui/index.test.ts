@@ -429,7 +429,7 @@ describe("parseUiRoute", () => {
     ["/user/settings/packages/rules/add", { family: "user-settings-packages-rule-add", id: null }],
     ["/user/settings/packages/rules/7", { family: "user-settings-packages-rule-edit", id: 7 }],
     ["/user/settings/packages/rules/7/preview", { family: "user-settings-packages-rule-preview", id: 7 }],
-    ["/user/settings/packages/cargo/initialize", null], // cargo/chef tails unregistered
+    ["/user/settings/packages/cargo/initialize", null], // the cargo tail stays unregistered (the chef tail is claimed)
     ["/user/settings/packages/rules/junk", null], // non-numeric id
     // The P2-1/P2-2 actions-general mounts (web.go:722/:724 user,
     // :1052/:1054 org — the bare group redirects + the General pages).

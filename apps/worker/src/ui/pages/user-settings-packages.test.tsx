@@ -370,10 +370,13 @@ describe("the list page render (user/settings/packages.tmpl → cleanup_rules/li
     expect(html).toContain(`<i>${userSettingsPackagesLocale.remove_pattern}:</i> rc-.*`);
     expect(html).toContain(`href="/user/settings/packages/rules/${ruleId}">Edit`);
     expect(html).toContain(`href="/user/settings/packages/rules/${ruleId}/preview"`);
-    // Neither substrate section renders (the documented omissions).
+    // The cargo section stays UNRENDERED (the documented dead-control
+    // omission); the CHEF keypair section RENDERS (the landed
+    // ./user-settings-packages-chef module — the fold-back with the
+    // keypair POST's routing).
     expect(html.toLowerCase()).not.toContain("cargo");
-    expect(html).not.toContain("chef/regenerate_keypair");
-    expect(html).not.toContain("Chef Registry"); // the chef section's header (locale key packages.owner.settings.chef.title)
+    expect(html).toContain("chef/regenerate_keypair"); // the keypair form's action
+    expect(html).toContain("Chef Registry"); // the chef section's header (locale key packages.owner.settings.chef.title)
     // The scaffold nav's Packages item is the active one (the mount swaps
     // in the shared UserSettingsNavbar with the same href).
     expect(html).toContain(`class="active item" href="/user/settings/packages"`);
