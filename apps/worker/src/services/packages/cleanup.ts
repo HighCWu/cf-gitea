@@ -9,9 +9,16 @@
  *   1. `ExecuteCleanupRules` — per enabled PackageCleanupRule (keep-count /
  *      keep-pattern / remove-days / remove-pattern, case-insensitive
  *      anchored regexes, package_cleanup_rule.go:41-54), delete matching
- *      versions + references. The index-rebuild riders of upstream
- *      cleanup.go:115-145 do NOT exist in v1 (no non-generic ecosystems —
- *      they arrive per-ecosystem).
+ *      versions + references — then the rebuild rider of upstream
+ *      cleanup.go:122-147: when the rule deleted at least one version
+ *      (`anyVersionDeleted`), the rule TYPE's registry index files rebuild
+ *      WHOLE, once per rule — debian/alpine/rpm/arch each through their
+ *      BuildAllRepositoryFiles. Upstream wraps the arch arm in its global
+ *      lock (`packages_arch_<ownerID>`, cleanup.go:137-141 →
+ *      arch/repository.go:40-42); our tree carries no globallock (the
+ *      landed arch module ships none either) — the serialized REPO_TASKS
+ *      consumer is the writer gate. Upstream's per-package cargo rider
+ *      (cleanup.go:110-118) stays unwired — no cargo ecosystem is landed.
  *   2. `CleanupExpiredData` — unreferenced PACKAGE rows (zero versions left),
  *      then `package_blobs` rows with zero file references older than the
  *      window, deleting their `packages/blobs/…` R2 keys — THIS SWEEP IS THE
@@ -47,14 +54,41 @@ import {
   packageProperties,
   packages,
   packageVersions,
+  users,
 } from "../../db/schema";
 import {
   type PackageRow,
   type PackageVersionRow,
   findUnreferencedPackages,
+  deletePackageFile,
   deletePackageVersionAndReferences,
 } from "./model";
 import { packageBlobContentKey } from "./blobs";
+import { PropertyType, getOrCreateInternalPackageVersion } from "./distro-common";
+import {
+  ARCH_PROPERTY_ARCHITECTURE,
+  ARCH_PROPERTY_REPOSITORY,
+  ARCH_REPOSITORY_PACKAGE,
+  ARCH_REPOSITORY_VERSION,
+  buildArchRepositoryFiles,
+} from "./arch";
+import {
+  DEBIAN_PROPERTY_ARCHITECTURE,
+  DEBIAN_PROPERTY_COMPONENT,
+  DEBIAN_PROPERTY_DISTRIBUTION,
+  DEBIAN_REPOSITORY_PACKAGE,
+  DEBIAN_REPOSITORY_VERSION,
+  buildDebianRepositoryFiles,
+} from "./debian";
+import {
+  ALPINE_PROPERTY_ARCHITECTURE,
+  ALPINE_PROPERTY_BRANCH,
+  ALPINE_PROPERTY_REPOSITORY,
+  ALPINE_REPOSITORY_PACKAGE,
+  ALPINE_REPOSITORY_VERSION,
+  buildAlpineRepositoryFiles,
+} from "./alpine";
+import { buildAllRpmRepositoryFiles } from "./rpm";
 
 /** The REPO_TASKS message kind the producer enqueues. */
 export interface PackageCleanupMessage {
@@ -159,8 +193,182 @@ function compileRulePattern(pattern: string): RegExp | null {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The rebuild arm (upstream cleanup.go:122-147) — one BuildAllRepositoryFiles
+// per distro rule type, after the rule's package loop deleted at least one
+// version.
+// ---------------------------------------------------------------------------
+
+/** The owner slice the family builders read — one users-row projection
+ *  satisfying model.ts's PackageOwnerRow ({id, type, visibility}) and
+ *  alpine.ts's AlpineOwner ({id, usernameLower, visibility, type}); orgs ARE
+ *  user rows (schema.ts users.type, upstream's own trick). */
+interface CleanupOwnerRow {
+  id: number;
+  type: "user" | "org";
+  visibility: "public" | "limited" | "private";
+  usernameLower: string;
+}
+
+/** The rule owner's row (upstream passes only the ownerID everywhere — the
+ *  build paths read owner.id). The null arm is defensive: rules die with
+ *  their owner upstream (FK cascade); here the caller logs and skips rather
+ *  than fabricating internal rows under a vanished owner. */
+async function loadCleanupOwner(db: D1Database, ownerId: number): Promise<CleanupOwnerRow | null> {
+  const row = await drizzle(db).select().from(users).where(eq(users.id, ownerId)).get();
+  if (row === undefined) return null;
+  return { id: row.id, type: row.type, visibility: row.visibility, usernameLower: row.usernameLower };
+}
+
+/**
+ * GetDistinctPropertyValues (models/packages/package_property.go:148-175):
+ * the distinct FILE-property values across the owner's non-internal packages
+ * of `packageType` — each entry of `dependencies` pins a sibling property's
+ * value onto the same file row (upstream's DistinctPropertyDependency
+ * exists-subquery), the landed family twins' enumeration shape
+ * (arch.ts listArchArchitectures, alpine.ts listAlpineArchitectures — with
+ * their isInternal filters; upstream's raw query needs none because the
+ * internal `_family` files carry no family properties). This is the
+ * iteration source the BuildAllRepositoryFiles arms walk
+ * (models/packages/arch/search.go:14-38, debian/search.go:120-151,
+ * alpine/search.go:14-37).
+ */
+async function listDistinctFileProperties(
+  db: D1Database,
+  ownerId: number,
+  packageType: string,
+  propertyName: string,
+  dependencies: { name: string; value: string }[] = [],
+): Promise<string[]> {
+  const rows = await drizzle(db)
+    .selectDistinct({ value: packageProperties.value })
+    .from(packageProperties)
+    .innerJoin(packageFilesProbe, eq(packageFilesProbe.id, packageProperties.refId))
+    .innerJoin(packageVersions, eq(packageVersions.id, packageFilesProbe.versionId))
+    .innerJoin(packages, eq(packages.id, packageVersions.packageId))
+    .where(
+      and(
+        eq(packageProperties.refType, PropertyType.File),
+        eq(packageProperties.name, propertyName),
+        eq(packages.type, packageType),
+        eq(packages.ownerId, ownerId),
+        eq(packages.isInternal, false),
+        eq(packageVersions.isInternal, false),
+        ...dependencies.map(
+          (dep) =>
+            sql`exists (select 1 from package_properties pp where pp.ref_type = ${PropertyType.File}
+                  and pp.ref_id = ${packageFilesProbe.id}
+                  and pp.name = ${dep.name} and pp.value = ${dep.value})`,
+        ),
+      ),
+    )
+    .all();
+  return rows.map((row) => row.value);
+}
+
+/** BuildAllRepositoryFiles step 1 — "Delete all existing repository files"
+ *  (arch/repository.go:116-126, debian/repository.go:88-97,
+ *  alpine/repository.go:58-68; rpm's landed twin does the same inside
+ *  buildAllRpmRepositoryFiles): the internal `_family`/`_repository`
+ *  version's file rows go through DeletePackageFile (row + properties — the
+ *  R2 content keys ride the expired-unreferenced-blob sweep, ratification
+ *  4's sole-deleter posture). */
+async function deleteInternalRepositoryFiles(db: D1Database, internalVersionId: number): Promise<void> {
+  const rows = await drizzle(db)
+    .select({ id: packageFilesProbe.id })
+    .from(packageFilesProbe)
+    .where(eq(packageFilesProbe.versionId, internalVersionId))
+    .all();
+  for (const row of rows) {
+    await deletePackageFile(db, row.id);
+  }
+}
+
+/**
+ * BuildAllRepositoryFiles (services/packages/arch/repository.go:109-146):
+ * the internal version's files die, then every repository × architecture
+ * (GetRepositories / GetArchitectures, models/packages/arch/search.go:14-38)
+ * rebuilds through buildArchRepositoryFiles — the landed
+ * BuildSpecificRepositoryFiles twin, its any-arch propagation included.
+ * Upstream wraps THIS call in the globallock `packages_arch_<ownerID>`
+ * (cleanup.go:137-141 → arch/repository.go:40-42); our tree carries no
+ * globallock and the landed arch module ships none either — the serialized
+ * REPO_TASKS consumer is the writer gate.
+ */
+async function buildAllArchRepositoryFiles(db: D1Database, bucket: R2Bucket, owner: CleanupOwnerRow, now: Date): Promise<void> {
+  const repoVersion = await getOrCreateInternalPackageVersion(db, owner.id, "arch", ARCH_REPOSITORY_PACKAGE, ARCH_REPOSITORY_VERSION);
+  await deleteInternalRepositoryFiles(db, repoVersion.version.id);
+  for (const repository of await listDistinctFileProperties(db, owner.id, "arch", ARCH_PROPERTY_REPOSITORY)) {
+    for (const architecture of await listDistinctFileProperties(db, owner.id, "arch", ARCH_PROPERTY_ARCHITECTURE, [
+      { name: ARCH_PROPERTY_REPOSITORY, value: repository },
+    ])) {
+      await buildArchRepositoryFiles(db, bucket, owner, repository, architecture, now);
+    }
+  }
+}
+
+/**
+ * BuildAllRepositoryFiles (services/packages/debian/repository.go:82-124):
+ * delete, then every distribution × component × architecture
+ * (GetDistributions / GetComponents / GetArchitectures — the architecture
+ * list hangs off the DISTRIBUTION, not the component,
+ * models/packages/debian/search.go:120-151) through
+ * buildDebianRepositoryFiles — the landed BuildSpecificRepositoryFiles twin
+ * (the Packages pair for the exact triple + the whole distribution's
+ * Release trio).
+ */
+async function buildAllDebianRepositoryFiles(db: D1Database, bucket: R2Bucket, owner: CleanupOwnerRow, now: Date): Promise<void> {
+  const repoVersion = await getOrCreateInternalPackageVersion(db, owner.id, "debian", DEBIAN_REPOSITORY_PACKAGE, DEBIAN_REPOSITORY_VERSION);
+  await deleteInternalRepositoryFiles(db, repoVersion.version.id);
+  for (const distribution of await listDistinctFileProperties(db, owner.id, "debian", DEBIAN_PROPERTY_DISTRIBUTION)) {
+    const components = await listDistinctFileProperties(db, owner.id, "debian", DEBIAN_PROPERTY_COMPONENT, [
+      { name: DEBIAN_PROPERTY_DISTRIBUTION, value: distribution },
+    ]);
+    const architectures = await listDistinctFileProperties(db, owner.id, "debian", DEBIAN_PROPERTY_ARCHITECTURE, [
+      { name: DEBIAN_PROPERTY_DISTRIBUTION, value: distribution },
+    ]);
+    for (const component of components) {
+      for (const architecture of architectures) {
+        await buildDebianRepositoryFiles(db, bucket, owner, distribution, component, architecture, now);
+      }
+    }
+  }
+}
+
+/**
+ * BuildAllRepositoryFiles (services/packages/alpine/repository.go:52-89):
+ * delete, then every branch × repository × architecture (GetBranches /
+ * GetRepositories / GetArchitectures, models/packages/alpine/search.go:14-37
+ * — the landed enumeration keys the architectures by branch AND repository
+ * (alpine.ts listAlpineArchitectures) where upstream keys the repository
+ * name alone; the tighter shape cannot cross branches' same-named
+ * repositories) through buildAlpineRepositoryFiles — the landed
+ * BuildSpecificRepositoryFiles twin, its noarch propagation included.
+ */
+async function buildAllAlpineRepositoryFiles(db: D1Database, bucket: R2Bucket, owner: CleanupOwnerRow, now: Date): Promise<void> {
+  const repoVersion = await getOrCreateInternalPackageVersion(db, owner.id, "alpine", ALPINE_REPOSITORY_PACKAGE, ALPINE_REPOSITORY_VERSION);
+  await deleteInternalRepositoryFiles(db, repoVersion.version.id);
+  for (const branch of await listDistinctFileProperties(db, owner.id, "alpine", ALPINE_PROPERTY_BRANCH)) {
+    for (const repository of await listDistinctFileProperties(db, owner.id, "alpine", ALPINE_PROPERTY_REPOSITORY, [
+      { name: ALPINE_PROPERTY_BRANCH, value: branch },
+    ])) {
+      for (const architecture of await listDistinctFileProperties(db, owner.id, "alpine", ALPINE_PROPERTY_ARCHITECTURE, [
+        { name: ALPINE_PROPERTY_BRANCH, value: branch },
+        { name: ALPINE_PROPERTY_REPOSITORY, value: repository },
+      ])) {
+        await buildAlpineRepositoryFiles(db, bucket, owner, branch, repository, architecture, now);
+      }
+    }
+  }
+}
+
 /** One enabled rule's sweep over its owner+type packages (cleanup.go:61-112). */
-async function executeCleanupOneRule(env: PackagesCleanupEnv, rule: typeof packageCleanupRules.$inferSelect, now: Date): Promise<void> {
+async function executeCleanupOneRule(
+  env: PackagesCleanupEnv,
+  bucket: R2Bucket,
+  rule: typeof packageCleanupRules.$inferSelect,
+  now: Date,
+): Promise<void> {
   if (env.DB === undefined) throw new Error("DB not bound");
   const d1 = drizzle(env.DB);
   const keepMatcher = compileRulePattern(rule.keepPattern);
@@ -179,6 +387,9 @@ async function executeCleanupOneRule(env: PackagesCleanupEnv, rule: typeof packa
     .from(packages)
     .where(and(eq(packages.ownerId, rule.ownerId), eq(packages.type, rule.type)))
     .all();
+  // anyVersionDeleted accumulates across the rule's packages (cleanup.go:97-108);
+  // the rebuild rider fires ONCE per rule, after the loop.
+  let anyVersionDeleted = false;
   for (const pkg of targets) {
     // SearchVersions with SortCreatedDesc (cleanup.go:70-75) — created desc,
     // id desc for the stable order; capped per package per tick (a backlog
@@ -203,7 +414,40 @@ async function executeCleanupOneRule(env: PackagesCleanupEnv, rule: typeof packa
     }
     for (const version of candidates) {
       await deletePackageVersionAndReferences(env.DB, version.id);
+      anyVersionDeleted = true;
     }
+  }
+
+  // The rebuild rider (cleanup.go:122-147): once per rule, AFTER the whole
+  // package loop, only when the rule deleted at least one version
+  // (`anyVersionDeleted`). A throw here fails the message → the queue
+  // redelivers and the sweep re-derives (the consumer's idempotency).
+  if (!anyVersionDeleted) return;
+  const owner = await loadCleanupOwner(env.DB, rule.ownerId);
+  if (owner === null) {
+    console.error(`[package-cleanup] rule ${rule.id}: owner ${rule.ownerId} vanished — skipping the ${rule.type} repository rebuild`);
+    return;
+  }
+  switch (rule.type) {
+    case "debian":
+      await buildAllDebianRepositoryFiles(env.DB, bucket, owner, now);
+      break;
+    case "alpine":
+      await buildAllAlpineRepositoryFiles(env.DB, bucket, owner, now);
+      break;
+    case "rpm":
+      // rpm's landed BuildAllRepositoryFiles twin owns the whole arm
+      // (repository.go:74-104 — delete-all, then every group).
+      await buildAllRpmRepositoryFiles(env.DB, bucket, owner.id, now);
+      break;
+    case "arch":
+      await buildAllArchRepositoryFiles(env.DB, bucket, owner, now);
+      break;
+    default:
+      // Upstream's switch has no default arm — the generic and the other
+      // non-distro types rebuild nothing. The per-package cargo rider
+      // (cleanup.go:110-118) stays unwired: no cargo ecosystem is landed.
+      break;
   }
 }
 
@@ -230,10 +474,11 @@ export async function handlePackagesCleanup(
   const cut = new Date(now.getTime() - hours * 60 * 60 * 1000);
   const d1 = drizzle(db);
 
-  // Arm 1 — ExecuteCleanupRules.
+  // Arm 1 — ExecuteCleanupRules (each rule's rebuild rider rides its own
+  // sweep — a throw fails the message and the queue redelivers).
   const rules = await d1.select().from(packageCleanupRules).where(eq(packageCleanupRules.enabled, true)).all();
   for (const rule of rules) {
-    await executeCleanupOneRule(env, rule, now);
+    await executeCleanupOneRule(env, bucket, rule, now);
   }
 
   // Arm 2 — CleanupExpiredData (cleanup.go:167-214), upstream's order:

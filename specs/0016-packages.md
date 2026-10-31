@@ -474,9 +474,18 @@ demo-sweep.ts mount record — §2.6's quote anchors): SELECT due cleanup work a
    var (default 24h, upstream's `OLDER_THAN`), then `bucket.delete` their
    `packages/blobs/…` keys.
 2. `ExecuteCleanupRules`: iterate enabled rules (keep-count / keep-pattern /
-   remove-days / remove-pattern) deleting matching versions — the
-   index-rebuild riders of upstream cleanup.go:115-145 do NOT exist in v1
-   (no non-generic ecosystems yet) and arrive per-ecosystem.
+   remove-days / remove-pattern) deleting matching versions — then the
+   index-rebuild rider of upstream cleanup.go:122-147 (LANDED with the distro
+   tail): when a rule deleted at least one version (`anyVersionDeleted`), the
+   rule type's registry index files rebuild whole, once per rule — debian /
+   alpine / rpm / arch each through their BuildAllRepositoryFiles arm in
+   `src/services/packages/cleanup.ts` (rpm via the landed
+   `buildAllRpmRepositoryFiles`; the other three composed: internal-version
+   file sweep, then the family's distinct-property enumeration through the
+   landed BuildSpecific twins). Upstream's arch arm rides a globallock we do
+   not carry (the serialized REPO_TASKS consumer is the writer gate); the
+   per-package cargo rider (cleanup.go:110-118) stays unwired until cargo
+   lands.
 
 The arm never runs unless a rule is enabled or orphans exist; no DEMO-gating
 parallel — this is upstream's own midnight job, not the demo sweep's
@@ -579,7 +588,9 @@ the landed suites):
   (two repos, one owner — each tab sees only its own).
 - **Cleanup arm**: orphan blob + orphan spool sweep (a tmp object and an
   unreferenced blob older than the window are gone; young ones survive);
-  rule execution (keep-count, remove-days) without index rebuilds; the
+  rule execution (keep-count, remove-days) WITH the distro rebuild rider
+  (a type-matched delete rebuilds the family's internal index files whole;
+  a non-distro rule and a no-deletion run rebuild nothing); the
   producer gate (no rules enabled + no orphans → zero queue sends).
 - **Quota**: owner-total accumulation across two packages; admin bypass;
   `-1` defaults disable every check (the strict-polarity tripwire test

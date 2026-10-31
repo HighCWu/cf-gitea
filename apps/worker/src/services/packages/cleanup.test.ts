@@ -19,6 +19,7 @@ import {
   packageBlobs,
   packageCleanupRules,
   packageFiles,
+  packageProperties,
   packageVersions,
   packages,
   users,
@@ -31,6 +32,11 @@ import {
 } from "./cleanup";
 import { getOrInsertPackage, getOrInsertVersion } from "./model";
 import { getOrInsertBlob, packageBlobContentKey, packageBlobSpoolKey, spoolAndHash } from "./blobs";
+import { PropertyType, getOrCreateInternalPackageVersion } from "./distro-common";
+import { RPM_PROPERTY_GROUP, RPM_REPOSITORY_PACKAGE, RPM_REPOSITORY_VERSION } from "./rpm";
+import { ARCH_REPOSITORY_PACKAGE, ARCH_REPOSITORY_VERSION } from "./arch";
+import { DEBIAN_REPOSITORY_PACKAGE, DEBIAN_REPOSITORY_VERSION } from "./debian";
+import { ALPINE_REPOSITORY_PACKAGE, ALPINE_REPOSITORY_VERSION } from "./alpine";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -105,6 +111,24 @@ async function seedVersion(ownerId: number, pkgName: string, version: string, at
   const { row: pkg } = await getOrInsertPackage(env.DB, { ownerId, type: "generic", name: pkgName, now: at });
   const { row: ver } = await getOrInsertVersion(env.DB, { packageId: pkg.id, creatorId: 0, version, now: at });
   return { pkg, ver };
+}
+
+/** A version row under a package of an explicit registry type. */
+async function seedTypedVersion(ownerId: number, type: string, pkgName: string, version: string, at: Date) {
+  const { row: pkg } = await getOrInsertPackage(env.DB, { ownerId, type, name: pkgName, now: at });
+  const { row: ver } = await getOrInsertVersion(env.DB, { packageId: pkg.id, creatorId: 0, version, now: at });
+  return { pkg, ver };
+}
+
+/** An enabled cleanup rule (one per owner+type, the UNIQUE's arbitration). */
+async function seedRule(input: Partial<typeof packageCleanupRules.$inferInsert> & { ownerId: number }) {
+  await db().insert(packageCleanupRules).values({
+    enabled: true,
+    type: "generic",
+    ...input,
+    createdUnix: NOW,
+    updatedUnix: NOW,
+  });
 }
 
 /** An unreferenced blob row created at `at` (optionally with its R2 key). */
@@ -282,16 +306,6 @@ describe("handlePackagesCleanup — CleanupExpiredData (the sole content-key del
 });
 
 describe("handlePackagesCleanup — ExecuteCleanupRules", () => {
-  async function seedRule(input: Partial<typeof packageCleanupRules.$inferInsert> & { ownerId: number }) {
-    await db().insert(packageCleanupRules).values({
-      enabled: true,
-      type: "generic",
-      ...input,
-      createdUnix: NOW,
-      updatedUnix: NOW,
-    });
-  }
-
   it("keep-count keeps the newest N versions by created desc", async () => {
     const ownerId = await seedUser("alice");
     const v1 = await seedVersion(ownerId, "app", "1.0", new Date("2026-01-01T00:00:00Z"));
@@ -389,5 +403,133 @@ describe("handlePackagesCleanup — ExecuteCleanupRules", () => {
     await handlePackagesCleanup(consumerEnv(), { now: NOW });
     await expect(handlePackagesCleanup(consumerEnv(), { now: NOW })).resolves.toBeUndefined();
     expect(await db().select().from(packageVersions).all()).toHaveLength(0);
+  });
+});
+
+describe("handlePackagesCleanup — the distro rebuild-arm (upstream cleanup.go:122-147)", () => {
+  let blobSeq = 0;
+
+  /** A unique 64-hex blob sha (the table's hex-only content key). */
+  const nextSha = () => (++blobSeq).toString(16).padStart(64, "0");
+
+  /** A stale index file row under the family's internal `_family/_repository`
+   *  version — BuildAllRepositoryFiles' step 1 (the delete-all of the
+   *  internal version's files) sweeps it whenever the rebuild fires. */
+  async function seedStaleIndexFile(
+    ownerId: number,
+    family: { type: string; repositoryPackage: string; repositoryVersion: string },
+  ): Promise<number> {
+    const repoVersion = await getOrCreateInternalPackageVersion(env.DB, ownerId, family.type, family.repositoryPackage, family.repositoryVersion);
+    const blob = (await getOrInsertBlob(env.DB, { size: 1, sha256: nextSha(), now: NOW })).row;
+    await db().insert(packageFiles).values({
+      versionId: repoVersion.version.id,
+      blobId: blob.id,
+      name: "stale-index.xml",
+      lowerName: "stale-index.xml",
+      compositeKey: "stale",
+      createdUnix: NOW,
+    });
+    return repoVersion.version.id;
+  }
+
+  const internalFileCount = (versionId: number) =>
+    db()
+      .select({ id: packageFiles.id })
+      .from(packageFiles)
+      .where(eq(packageFiles.versionId, versionId))
+      .all()
+      .then((rows) => rows.length);
+
+  // The four families upstream's switch names (cleanup.go:124-145) — each
+  // with its internal repository package/version constants.
+  const FAMILIES = [
+    { type: "debian", repositoryPackage: DEBIAN_REPOSITORY_PACKAGE, repositoryVersion: DEBIAN_REPOSITORY_VERSION },
+    { type: "alpine", repositoryPackage: ALPINE_REPOSITORY_PACKAGE, repositoryVersion: ALPINE_REPOSITORY_VERSION },
+    { type: "rpm", repositoryPackage: RPM_REPOSITORY_PACKAGE, repositoryVersion: RPM_REPOSITORY_VERSION },
+    { type: "arch", repositoryPackage: ARCH_REPOSITORY_PACKAGE, repositoryVersion: ARCH_REPOSITORY_VERSION },
+  ] as const;
+  const RPM_FAMILY = FAMILIES[2];
+
+  it("a rule-type-matched version delete triggers the family's rebuild — the internal version's files are deleted whole (all four families)", async () => {
+    const old = new Date("2026-01-01T00:00:00Z");
+    for (const family of FAMILIES) {
+      const ownerId = await seedUser(`owner-${family.type}`);
+      const internalVersionId = await seedStaleIndexFile(ownerId, family);
+      const doomed = await seedTypedVersion(ownerId, family.type, "app", "1.0", old);
+      await seedRule({ ownerId, type: family.type, removeDays: 1 });
+
+      await handlePackagesCleanup(consumerEnv(), { now: NOW });
+
+      // The rule's delete ran...
+      expect(
+        await db().select().from(packageVersions).where(eq(packageVersions.id, doomed.ver.id)).all(),
+        `${family.type}: the doomed version fell`,
+      ).toHaveLength(0);
+      // ...and the rebuild fired: the stale internal index file is gone
+      // (BuildAllRepositoryFiles' step 1 — the fresh enumeration is empty
+      // here, so nothing is re-added).
+      expect(await internalFileCount(internalVersionId), `${family.type}: the rebuild swept the internal files`).toBe(0);
+    }
+  });
+
+  it("the rpm rebuild renders fresh repodata for the surviving group (the full BuildAll path, rpm repository.go:74-104)", async () => {
+    const ownerId = await seedUser("rebuilder");
+    const internalVersionId = await seedStaleIndexFile(ownerId, RPM_FAMILY);
+    const old = new Date("2026-01-01T00:00:00Z");
+    await seedTypedVersion(ownerId, "rpm", "doomed", "1.0", old);
+    const survivor = await seedTypedVersion(ownerId, "rpm", "survivor", "2.0", NOW);
+    const blob = (await getOrInsertBlob(env.DB, { size: 10, sha256: nextSha(), now: NOW })).row;
+    const inserted = await db()
+      .insert(packageFiles)
+      .values({
+        versionId: survivor.ver.id,
+        blobId: blob.id,
+        name: "survivor-2.0-1.noarch.rpm",
+        lowerName: "survivor-2.0-1.noarch.rpm",
+        compositeKey: "devel",
+        createdUnix: NOW,
+      })
+      .returning()
+      .all();
+    const file = inserted[0];
+    if (file === undefined) throw new Error("file seed failed");
+    // The group property drives buildAllRpmRepositoryFiles' enumeration
+    // (listRpmGroups — the rpm.group file property).
+    await db().insert(packageProperties).values({ refType: PropertyType.File, refId: file.id, name: RPM_PROPERTY_GROUP, value: "devel" });
+    await seedRule({ ownerId, type: "rpm", removeDays: 1 });
+
+    await handlePackagesCleanup(consumerEnv(), { now: NOW });
+
+    const rebuilt = await db().select().from(packageFiles).where(eq(packageFiles.versionId, internalVersionId)).all();
+    const names = rebuilt.map((row) => row.lowerName).sort();
+    // The stale row is gone; the devel group's fresh repodata took its place.
+    expect(names).toContain("repomd.xml");
+    expect(names).toContain("repomd.xml.asc"); // the detached signature arm
+    expect(names).toContain("primary.xml.gz");
+    expect(rebuilt.every((row) => row.compositeKey === "devel")).toBe(true);
+  });
+
+  it("a non-distro rule type deletes its versions but rebuilds nothing (upstream's switch has no arm for it)", async () => {
+    const ownerId = await seedUser("generic-owner");
+    const internalVersionId = await seedStaleIndexFile(ownerId, RPM_FAMILY);
+    const doomed = await seedTypedVersion(ownerId, "generic", "app", "1.0", new Date("2026-01-01T00:00:00Z"));
+    await seedRule({ ownerId, type: "generic", removeDays: 1 });
+
+    await handlePackagesCleanup(consumerEnv(), { now: NOW });
+
+    expect(await db().select().from(packageVersions).where(eq(packageVersions.id, doomed.ver.id)).all()).toHaveLength(0);
+    expect(await internalFileCount(internalVersionId)).toBe(1); // the stale row survives — no rebuild
+  });
+
+  it("no deletion → no rebuild (upstream's anyVersionDeleted gate, cleanup.go:122)", async () => {
+    const ownerId = await seedUser("young-owner");
+    const internalVersionId = await seedStaleIndexFile(ownerId, RPM_FAMILY);
+    const young = await seedTypedVersion(ownerId, "rpm", "app", "1.0", NOW); // young — remove-days keeps it
+    await seedRule({ ownerId, type: "rpm", removeDays: 1 });
+
+    await handlePackagesCleanup(consumerEnv(), { now: NOW });
+
+    expect(await db().select().from(packageVersions).where(eq(packageVersions.id, young.ver.id)).all()).toHaveLength(1);
+    expect(await internalFileCount(internalVersionId)).toBe(1); // the stale row survives — no rebuild
   });
 });
