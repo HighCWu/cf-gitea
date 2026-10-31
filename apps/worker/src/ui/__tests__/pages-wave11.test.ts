@@ -190,12 +190,24 @@ describe("wave-11 parser families (parseUiRoute / handlesUiRoute)", () => {
     expect(handlesUiRoute("/alice/wave11/issues/request_review")).toBe(true);
   });
 
-  it("leaves the code-comment siblings and deeper tails with the engine", () => {
-    // Upstream's unclaimed siblings: the new_comment GET form and the
-    // code-comment POST (no landed UI), plus every deeper tail.
+  it("leaves the bare reviews group and deeper tails with the engine", () => {
+    // The code-comment siblings LANDED (pages/pull-review-comments.tsx — the
+    // bc89d05 fold): the new_comment GET form and the code-comment POST are
+    // CLAIMED now; upstream's group has no bare handler, and every deeper
+    // tail stays engine-owned.
     expect(parseUiRoute("/alice/wave11/pulls/1/files/reviews")).toBeNull();
-    expect(parseUiRoute("/alice/wave11/pulls/1/files/reviews/comments")).toBeNull();
-    expect(parseUiRoute("/alice/wave11/pulls/1/files/reviews/new_comment")).toBeNull();
+    expect(parseUiRoute("/alice/wave11/pulls/1/files/reviews/comments")).toEqual({
+      family: "pull-review-code-comment",
+      owner: "alice",
+      repo: "wave11",
+      index: 1,
+    });
+    expect(parseUiRoute("/alice/wave11/pulls/1/files/reviews/new_comment")).toEqual({
+      family: "pull-review-new-comment",
+      owner: "alice",
+      repo: "wave11",
+      index: 1,
+    });
     expect(parseUiRoute("/alice/wave11/issues/request_review/extra")).toBeNull();
     expect(parseUiRoute("/alice/wave11/issues/request_review/1")).toBeNull();
   });

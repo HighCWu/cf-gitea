@@ -825,6 +825,20 @@ import {
   submitReviewFromForm,
 } from "./pages/pull-reviews";
 import {
+  conversationFragmentHtml,
+  conversationFragmentResponse,
+  conversationOutdatedFragmentHtml,
+  createCodeCommentFromForm,
+  loadConversationData,
+  loadNewCodeCommentData,
+  newCommentFragmentHtml,
+  newCommentFragmentResponse,
+  parseCodeCommentForm,
+  parseResolveConversationForm,
+  PullCommentError,
+  resolveConversationFromForm,
+} from "./pages/pull-review-comments";
+import {
   countUnreadNotifications,
   loadNotificationsData,
   isOwnMailboxThread,
@@ -2708,6 +2722,22 @@ export interface PullReviewRoute {
   index?: number;
 }
 
+/** The code-comment conversation families (pages/pull-review-comments.tsx —
+ *  upstream's reviews-group trio web.go:1674-1675 + the repo-scoped resolve
+ *  POST web.go:1437, ALL under reqSignIn + RepoMustNotBeArchived — the GET
+ *  fragment included): the new_comment form fragment, the code-comment
+ *  write, and the conversation resolve toggle. */
+export interface PullCommentRoute {
+  family:
+    | "pull-review-new-comment"
+    | "pull-review-code-comment"
+    | "issue-resolve-conversation";
+  owner: string;
+  repo: string;
+  /** The PR index (the two files/reviews tails only). */
+  index?: number;
+}
+
 /** The wave-6 milestones list family (pages/milestones.tsx): upstream
  *  `m.Get("/milestones", repo.Milestones)` (web.go:1339) — GET, `?state=`
  *  facet. Wave 26 moved the `{id}/edit` claim into MilestoneEditRoute and
@@ -3500,6 +3530,7 @@ export type ParsedUiRoute =
   | PullFilesRoute
   | PullCommitsRoute
   | PullReviewRoute
+  | PullCommentRoute
   | MilestonesRoute
   | MilestoneNewRoute
   | OwnerHomeRoute
@@ -4908,6 +4939,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       // Wave-11: the review-request + dismiss POSTs (web.go:1435-1436 —
       // repo-scoped, the issue/review ids ride the form fields).
       if (head === "issues" && rest[0] === "request_review") return { family: "issue-request-review", owner, repo };
+      // The conversation resolve toggle (web.go:1437 — the issue id rides
+      // the form, exactly upstream's field-carried shape; POST-only).
+      if (head === "issues" && rest[0] === "resolve_conversation") return { family: "issue-resolve-conversation", owner, repo };
       if (head === "issues" && rest[0] === "dismiss_review") return { family: "issue-dismiss-review", owner, repo };
       // Window-2e B2: the aux feeds (upstream web.go:1341/1359 — the
       // suggestions route sits in the labels/milestones sibling group).
@@ -4970,18 +5004,22 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
         return { family: "pull-commit-files", owner, repo, index, segment: rest[2] };
       }
     }
-    // Wave-11: the review verdict form POST (web.go:1678 — the
-    // /pulls/{index}/files/reviews group's /submit tail; the GET new_comment
-    // + POST comments code-comment siblings stay unclaimed, no landed UI).
+    // Wave-11 + the conversation fold: the /pulls/{index}/files/reviews
+    // group's three tails (web.go:1673-1675 — the /submit verdict POST, the
+    // GET new_comment form fragment, and the POST comments code-comment
+    // write; the module pages/pull-review-comments.tsx owns the latter two).
     if (
       head === "pulls" &&
       rest.length === 4 &&
       /^-?\d+$/.test(rest[0] as string) &&
       rest[1] === "files" &&
       rest[2] === "reviews" &&
-      rest[3] === "submit"
+      (rest[3] === "submit" || rest[3] === "new_comment" || rest[3] === "comments")
     ) {
-      return { family: "pull-review-submit", owner, repo, index: Number.parseInt(rest[0] as string, 10) };
+      const index = Number.parseInt(rest[0] as string, 10);
+      if (rest[3] === "new_comment") return { family: "pull-review-new-comment", owner, repo, index };
+      if (rest[3] === "comments") return { family: "pull-review-code-comment", owner, repo, index };
+      return { family: "pull-review-submit", owner, repo, index };
     }
     // Wave-29 (the survey's row 4): the raw-text download tails
     // `/{index}.{diff|patch}` — upstream web.go:1657-1658's pair under the
@@ -12670,6 +12708,146 @@ function pullReviewStatusError(status: number, message: string): Response {
 }
 
 /**
+ * GET /{owner}/{repo}/pulls/{index}/files/reviews/new_comment (pages/
+ * pull-review-comments.tsx — upstream RenderNewCodeCommentForm, routers/web/
+ * repo/pull_review.go:36-57): the reviews group wraps ALL THREE arms in
+ * reqSignIn + RepoMustNotBeArchived (web.go:1671-1675 — the GET fragment
+ * included, verified at the pin); the head-ref tip resolves AfterCommitID,
+ * the pending-review presence decides the button set. Fragment response
+ * (the empty side/line/path the JS fills).
+ */
+async function pullReviewNewComment(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "pull-review-new-comment" || route.index === undefined) return respond(await c.notFound());
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search)); // reqSignIn
+  if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404)); // RepoMustNotBeArchived
+
+  const data = await loadNewCodeCommentData(c.env, c.env.DB, repo, route.index, viewer);
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404)); // !issue.IsPull / missing
+  return respond(newCommentFragmentResponse(newCommentFragmentHtml(data, `/${repo.ownerNamespace}/${repo.slug}`)));
+}
+
+/**
+ * POST /{owner}/{repo}/pulls/{index}/files/reviews/comments (upstream
+ * CreateCodeComment, pull_review.go:63-115 over the landed seam): the
+ * group's reqSignIn + not-archived + the §2.8 Origin guard; web.Bind's
+ * HasError arm 303s onto the files page; previous side stores NEGATIVE;
+ * the single_review arm rides submitReviewFromForm inside the module. The
+ * answer is the reloaded conversation fragment (the outdated shell when
+ * the row filters out).
+ */
+async function pullReviewCodeComment(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "pull-review-code-comment" || route.index === undefined) return respond(await c.notFound());
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search)); // reqSignIn
+  if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404)); // RepoMustNotBeArchived
+
+  const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+  const form = parseCodeCommentForm(await readUrlEncodedForm(c.req.raw));
+  if (form === null) {
+    // web.Bind's HasError arm: back onto the files page.
+    return respond(new Response(null, { status: 303, headers: { location: `${repoLink}/pulls/${route.index}/files` } }));
+  }
+  const issue = await findIssueByRepoAndIndex(c.env.DB, repo.id, route.index);
+  if (issue === null || !issue.isPull) return respond(c.html(renderNotFound(ctx), 404)); // upstream `if !issue.IsPull`
+  const joined = await findPullRequestByIndex(c.env.DB, repo.id, route.index);
+  if (joined === null) return respond(c.html(renderNotFound(ctx), 404));
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+
+  try {
+    const created = await createCodeCommentFromForm({
+      request: c,
+      origin: url.origin,
+      env: c.env,
+      d1: c.env.DB,
+      pair,
+      repo,
+      issue,
+      pr: joined.pullRequest,
+      doerId: viewer.id,
+      form,
+    });
+    if (!created.created) {
+      return respond(new Response(null, { status: 303, headers: { location: `${repoLink}/pulls/${route.index}/files` } }));
+    }
+    const conversation = await loadConversationData({
+      env: c.env,
+      d1: c.env.DB,
+      repo,
+      issue,
+      treePath: form.path,
+      line: form.side === "previous" ? -form.line : form.line,
+      viewer,
+      origin: form.origin,
+      urlOrigin: url.origin,
+      showOutdated: form.origin === "timeline",
+    });
+    return respond(
+      conversationFragmentResponse(
+        conversation === null ? conversationOutdatedFragmentHtml() : conversationFragmentHtml(conversation, repoLink),
+      ),
+    );
+  } catch (error) {
+    if (error instanceof PullCommentError) {
+      if (error.status === 404) return respond(c.html(renderNotFound(ctx), 404));
+      return respond(pullReviewStatusError(error.status, error.message));
+    }
+    throw error;
+  }
+}
+
+/**
+ * POST /{owner}/{repo}/issues/resolve_conversation (upstream
+ * UpdateResolveConversation, pull_review.go:118-165): the issue POST
+ * group's reqSignIn + RepoMustNotBeArchived posture (web.go:1437, the
+ * wave-11 twins' ladder); the module's CanMarkConversation gate + the
+ * IDEMPOTENT resolve_doer_id flip; the answer reloads the conversation
+ * fragment (the outdated shell when the row filters out).
+ */
+async function pullReviewResolveSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "issue-resolve-conversation") return respond(await c.notFound());
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search)); // reqSignIn
+  if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404)); // RepoMustNotBeArchived
+
+  const form = parseResolveConversationForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await resolveConversationFromForm({
+    env: c.env,
+    d1: c.env.DB,
+    repo,
+    viewer,
+    urlOrigin: url.origin,
+    form,
+  });
+  if (!outcome.ok) {
+    if (outcome.status === 404) return respond(c.html(renderNotFound(ctx), 404));
+    return respond(pullReviewStatusError(outcome.status, outcome.message));
+  }
+  const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+  return respond(
+    conversationFragmentResponse(
+      outcome.conversation === null
+        ? conversationOutdatedFragmentHtml()
+        : conversationFragmentHtml(outcome.conversation, repoLink),
+    ),
+  );
+}
+
+/**
  * POST /{owner}/{repo}/issues/dismiss_review (pages/pull-reviews.tsx —
  * upstream DismissReview, routers/web/repo/pull_review.go:280-293 over the
  * landed dismissal arm): the settings predicate stands in for reqRepoAdmin
@@ -16079,6 +16257,10 @@ uiRouter.post("/:owner/:repo/issues/request_review", (c) => pullReviewRequestSub
 uiRouter.get("/:owner/:repo/issues/request_review", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/:repo/issues/dismiss_review", (c) => pullReviewDismissSubmit(c));
 uiRouter.get("/:owner/:repo/issues/dismiss_review", () => methodNotAllowed("POST"));
+// The conversation resolve toggle (web.go:1437) — the literal pair rides
+// BEFORE the /issues/:index GET catch below (static-before-dynamic).
+uiRouter.post("/:owner/:repo/issues/resolve_conversation", (c) => pullReviewResolveSubmit(c));
+uiRouter.get("/:owner/:repo/issues/resolve_conversation", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/issues/:index", (c) => uiPage(c));
 uiRouter.get("/:owner/:repo/pulls", (c) => uiPage(c));
 // Wave-29 diffpatch downloads (parseUiRoute claims exactly the dotted
@@ -16105,6 +16287,12 @@ uiRouter.get("/:owner/:repo/pulls/:index/commits", (c) => uiPage(c));
 // shorter POST/GET pattern can absorb it; the GET answers chi's 405).
 	uiRouter.post("/:owner/:repo/pulls/:index/files/reviews/submit", (c) => pullReviewSubmit(c));
 	uiRouter.get("/:owner/:repo/pulls/:index/files/reviews/submit", () => methodNotAllowed("POST"));
+	// The code-comment conversation pair (web.go:1674-1675): the GET-only
+	// new_comment fragment (POST 405s) + the POST-only comments write.
+	uiRouter.get("/:owner/:repo/pulls/:index/files/reviews/new_comment", (c) => pullReviewNewComment(c));
+	uiRouter.post("/:owner/:repo/pulls/:index/files/reviews/new_comment", () => methodNotAllowed("GET"));
+	uiRouter.post("/:owner/:repo/pulls/:index/files/reviews/comments", (c) => pullReviewCodeComment(c));
+	uiRouter.get("/:owner/:repo/pulls/:index/files/reviews/comments", () => methodNotAllowed("POST"));
 	// Wave-13 compare family (parseUiRoute claims exactly these shapes; the
 	// bare URL is GET-only — upstream registers `m.Get("/compare")` outside
 	// the POST path group, so a POST answers chi's 405 — and the form always
