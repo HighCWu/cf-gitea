@@ -18,13 +18,13 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
                                                       # D1-only: --base-url/--token-file optional
 ```
 
-- Batteries (15): `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
+- Batteries (16): `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
   `ui-login`, `window2-mounts`, `window3-mounts`, `fixwave-parity`,
   `branch-protection`, `demo`, `wiki-git`, `packages-registry`,
-  `packages-distro`, `cleanup-audit`, `all` (runs the 15 in that order, audit
-  last). `all --dry-run` plans **181 probes** across them (the counts in the
-  table below were read off that dry-run at this writing; `registry`
-  scales with `--trials`).
+  `packages-distro`, `packages-protocols`, `cleanup-audit`, `all` (runs the 16
+  in that order, audit last). `all --dry-run` plans **190 probes** across them
+  (the counts in the table below were read off that dry-run at this writing;
+  `registry` scales with `--trials`).
 - **The `cleanup-audit` battery is D1-only** (wrangler d1 execute, no HTTP): it
   takes neither `--base-url` nor `--token-file` — a missing token only errors
   when a selected battery actually makes HTTP calls (REDEPLOY15 friction: the
@@ -46,7 +46,7 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
   row sweep reuse `--d1-scope`); mint the
   PAT with `node scripts/bootstrap-admin.mjs <user>` on local D1, and pass the
   matching `--user`. A local self-test (the seven batteries committed at the
-  time — `window2-mounts` landed after; the toolkit now carries 15) was run green
+  time — `window2-mounts` landed after; the toolkit now carries 16) was run green
   from this tree; see "Local self-test fixtures" below.
 - `--json` puts only the final JSON summary on stdout (progress to stderr),
   same contract as deploy-smoke.
@@ -71,7 +71,7 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
 
 ## Batteries and their canonical expectations
 
-The registry at this writing — 15 batteries, **181 probes** (`all
+The registry at this writing — 16 batteries, **190 probes** (`all
 --dry-run`; `registry`'s count scales with `--trials`, here at its
 default 3):
 
@@ -91,8 +91,9 @@ default 3):
 | `wiki-git` | 7 | the `.wiki.git` wire: REST page create → real clone carries the root commit → push → read-back → privacy tail → t+0 tombstone | HTTP |
 | `packages-registry` | 11 | all SIX protocols end-to-end (generic/pypi/npm/helm/maven/nuget) + the D1 row sweep + repo delete | HTTP + **wrangler auth** (the row sweep rides `--d1-scope`) |
 | `packages-distro` | 5 | the M7 distro tail: rpm (hand-built fixture → .repo configs + repomd.xml + primary.xml.gz + repository.key → delete → repodata gone) + arch (.PKGINFO package → packages.db tar + symlink-dance aliases + .sig → delete → index 404 empty) + the D1 husk sweep + repo delete | HTTP + **wrangler auth** (the husk row sweep rides `--d1-scope`) |
+| `packages-protocols` | 9 | the SPEC-0016 §7 long tail: go (module zip → list/@latest/.info/.mod/.zip + sumdb 404 + missing-module 404s, + real `go mod download` when the toolchain is on the host) + cargo (.crate container → the {"ok"} shapes + config.json + sparse index + yank/unyank + download, + real `cargo fetch` through the in-script h2c-stripping proxy on plain-HTTP) + swift (login pair → multipart PUT → enumerate + Link → metadata + Digest zip → manifest 200/303 → identifiers) + rubygems (.gem → compact index → specs marshal → byte-parity download → gemspec.rz → yank) + the D1 husk sweep + repo delete | HTTP + **wrangler auth** (the husk row sweep rides `--d1-scope`); the two REAL-CLIENT arms degrade to a documented `[warn]` when `go`/`cargo` is off the probe host |
 | `cleanup-audit` | 10 | post-run D1 count shapes (independent counts) | **D1-only** — wrangler auth, `--d1-scope remote\|local` (default remote); takes NEITHER `--base-url` NOR `--token-file` |
-| **`all`** | **181** | every battery in registry order, audit last | union of the above |
+| **`all`** | **190** | every battery in registry order, audit last | union of the above |
 
 Expectations are ported from `docs/design/p0-evidence.md` — the REDEPLOY13
 block (2026-10-26, ~lines 1507-1697) for the shallow trio, generate, ui-login,
@@ -543,6 +544,94 @@ prints all of them verbatim.
   fullName the create returned (logged on one
   `[tail] distro-leftover-sweep` line; failures feed `left_behind`, never
   fatal; a green run no-ops silently).
+- **packages-protocols** — the SPEC-0016 §7 protocol long tail's FOUR
+  families in ONE owner-scoped sweep (one probe repo vehicle + the run PAT;
+  every fixture GENERATED INLINE — the landed suites' hand-built builders, no
+  registry tooling required on the probe host). INDEPENDENT (the distro
+  posture — one red family never hides the others; every arm self-contains
+  its family):
+  **proto-go-roundtrip** — PUT `/go/upload` a hand-built module zip (the
+  go.dev/ref/mod layout: `{module}@{version}/`-prefixed entries + the root
+  go.mod, stored-entry zip) → 201; `@v/list` answers 200
+  `text/plain;charset=utf-8` with `v1.0.0\n`; `@latest` and `.info` answer the
+  exact `{"Version","Time"}` JSON (RFC3339 Z); `.mod` the stored go.mod text
+  verbatim; `.zip` byte parity (octet-stream — NOT sniffed — with the
+  `{version}.zip` disposition); the sumdb `/supported` probe answers
+  http.NotFound's exact 404 page; the missing-module contract: an unknown
+  module's `@v/list` 404s with the EMPTY body, an unknown version's `.info`
+  404s "package does not exist"; the management version delete → 204 and the
+  read 404s after. **proto-go-client-download** — a REAL
+  `GOPROXY=… GONOPROXY=none GONOSUMDB='*' GOFLAGS=-mod=mod go mod download
+  <module>@v1.0.0` against a second uploaded module (SPEC-0016's as-built
+  client posture: GOPRIVATE would bypass the proxy; GONOSUMDB rides the
+  /supported 404) → exit 0 with the module cache holding
+  `v1.0.0.info/.mod/.zip` whose contents answer the upload; the dot-bearing
+  single-segment module name keeps the management `{name}` param
+  one-segment-clean. **proto-cargo-roundtrip** — PUT `api/v1/crates/new` a
+  hand-built `.crate` container (uint32-LE metadata length | metadata JSON |
+  uint32-LE content length | the .crate bytes; the content a properly-rooted
+  `{name}-{version}/` tar+gzip crate — cargo's unpack gate) → `{"ok":true}`;
+  the duplicate re-publish is the `{"ok":false}` error shape (409 "package
+  version already exists"); `config.json` answers the exact
+  `{dl, api, auth-required:false}` document off the request origin; the
+  sparse index (`{2}/{2}/{name}`, BuildPackagePath's ≥4-char shard) renders
+  the ONE `IndexVersionEntry` NDJSON line whose `cksum` == the stored sha256;
+  yank/unyank flip the line's `yanked`; the download rides byte parity under
+  the same checksum; management delete → 204 → the zero-version nil-index
+  404. **proto-cargo-client-fetch** — a REAL `cargo fetch` in a consumer
+  crate (a `{version, registry = "probe"}` dependency against a
+  `sparse+…` index) → exit 0 with the fetched cache crate's sha256 == the
+  published payload (cargo's cksum gate). On plain-HTTP targets the client
+  rides an IN-SCRIPT header-stripping proxy: cargo 1.94 offers
+  `Upgrade: h2c`/`HTTP2-Settings` and the miniflare-beta dev dispatch dies on
+  them (SPEC-0016's disclosed shim posture — the proxy also rewrites
+  config.json's `dl`/`api` onto the proxy origin so the dl download rides it
+  too); `https://` targets go direct. **proto-swift-roundtrip** — the login
+  pair (any valid credential → the BARE 200 with NO Content-Version;
+  anonymous → the 401 Problem document + Content-Version: 1); PUT
+  `{scope}/{name}/{version}` (multipart: the source-archive FILE part — a
+  zip whose root Package.swift is the shallowest manifest — plus the
+  schema.org metadata VALUE part whose `repositoryURLs` become the
+  `swift.repository_url` properties) → 201 EMPTY + Content-Version: 1; the
+  enumerate answers `{"releases":{"1.0.0":{"url":…}}}` + the
+  `Link rel="latest-version"` header (the `.json` twin byte-identical); the
+  metadata document carries id = `scope.name` + `resources[0].checksum` ==
+  the archive sha256; the `.zip` download carries `Digest: sha256=<hash>`
+  byte parity; the manifest answers 200 `text/x-swift` and 303 SeeOther on
+  the version-keyed miss (`?swift-version=5.6` with no
+  `Package@swift-5.6.swift` — the bare RAW Location); the identifiers
+  lookup answers the package id for the uploaded repository URL; management
+  delete → 204 → enumerate 404. **proto-rubygems-roundtrip** — POST
+  `api/v1/gems` a hand-built `.gem` (tar{data.tar.gz, metadata.gz,
+  checksums.yaml.gz} over the gzipped YAML gemspec — the upstream
+  integration test's makeRubyGem shape) → 201 EMPTY; the compact index
+  (`info/{name}`) renders the `---\n` + the version line with the runtime
+  requirement, the stored checksum, and the ruby/rubygems requirement
+  tails; `specs.4.8.gz` decompresses to a marshal payload carrying the name
+  + version; the `.gem` download is byte parity; the
+  `quick/Marshal.4.8/{name}-{version}.gemspec.rz` inflate names the gem;
+  the protocol YANK (`DELETE api/v1/gems/yank`, multipart gem_name/version)
+  → 200 — upstream's DeletePackage fold, the version row GOES — and the
+  compact index 404s after. Cleanup is self-cleaning at the version layer
+  PLUS one D1 husk sweep arm (`proto-cleanup-rows-d1`, the
+  packages-registry/distro precedent — wrangler auth, `--d1-scope`): the
+  go/cargo/swift protocol groups carry NO delete route, so those version
+  deletes ride the management API and fold version + files upstream-parity
+  (rubygems' yank IS its protocol delete), so the empty package HUSKS sweep
+  via D1 with the zero-rows assert; the distro-internal rows
+  (`_rpm`/`_arch`/`_debian`/`_alpine` + the owner keypairs) are STANDING
+  per-owner infrastructure the sweep never touches, and unreferenced blob
+  content rides the >24 h cleanup queue as documented residue. The probe
+  repo DELETEs 204 (`proto-cleanup-repo-204`). The two REAL-CLIENT arms
+  degrade to a documented `[warn]` when `go`/`cargo` is off the probe host
+  (the curl-shape arms still carry the protocol). **Failure cleanup (the
+  consistency posture):** a finally-style tail best-effort
+  management-deletes exactly what the arms uploaded and have not already
+  deleted (the per-family gone flags), then sweeps the package rows (D1,
+  unless the in-chain sweep already ran), then deletes the probe repo under
+  the fullName the create returned (logged on one
+  `[tail] proto-leftover-sweep` line; failures feed `left_behind`, never
+  fatal; a green run no-ops silently).
 - **cleanup-audit** — one wrangler d1 execute (`--d1-scope remote|local`,
   default remote) runs the whole count shape; **D1-only, so it runs without
   `--base-url`/`--token-file`**; the checks are INDEPENDENT (one red count
@@ -612,6 +701,13 @@ prints all of them verbatim.
     arm never uploaded anything, so nothing to sweep there), then its
     package rows (D1 — the protocol deletes leave the empty package husks),
     then its probe repo; `[tail] distro-leftover-sweep`.
+  - `packages-protocols` — its uploaded go module versions (both), its
+    cargo crates (both), its swift version, and its rubygems version (all
+    best-effort management deletes, gone-flagged — the rubygems yank counts
+    as its own delete — and a forced-red arm never uploaded anything, so
+    nothing to sweep there), then its package rows (D1 — the version
+    deletes leave the empty package husks), then its probe repo;
+    `[tail] proto-leftover-sweep`.
   One `[tail]` line logs every action; failures feed `left_behind`, never
   fatal; a green run no-ops silently (the battery's own cleanup arms already
   emptied everything, and the gone flags skip the rest). The audit battery
@@ -691,6 +787,22 @@ prints all of them verbatim.
     swept itself in-chain; a mid-arm red after the real PUT is what the
     tail's gone-flagged protocol deletes + row sweep cover, and that shape
     is not deterministically forceable).
+  - `packages-protocols --force-red proto-go-roundtrip` — the same
+    INDEPENDENT posture: the forced arm reds UNRUN while the other steps
+    still run green (the create, the go client arm — which uploads its OWN
+    module, fetches it with the real client, and deletes it — the cargo
+    roundtrip + client arms, the swift arm, the rubygems arm, the husk row
+    sweep — which answers "already clean" for the never-uploaded go
+    fixture among the registered names — and the repo cleanup); the
+    `[tail] proto-leftover-sweep` line legitimately stays silent (nothing
+    the run created survived; a mid-arm red after a real PUT is what the
+    tail's gone-flagged management deletes + row sweep cover, and that
+    shape is not deterministically forceable). The REAL-CLIENT arms need
+    the toolchains: on a host without `go`/`cargo` the rehearsal still
+    exercises the tail (the arms report the documented `[warn]`, which
+    never fails the battery — force a fixture-creating arm like
+    `proto-swift-roundtrip` instead to see the forced-red shape on such a
+    host).
   The rehearsal convention: each forced-red run is followed by a
   `cleanup-audit` run, and the audit going green is the sweep's proof.
 - The mirror battery can also be forced honestly through its real budget
@@ -715,7 +827,9 @@ the v1.3 pair landed later and 49a1502's landing window ran its own
 local green suite battery-by-battery. Local scratch keeps: the `dpprobe` user
 (bootstrap-admin, several local tokens — pass the real count via
 `--expect-tokens` for local audits) and its private `p0-shallow` fixture
-(tip `8582c5545ac5cbc4eafca46363dd5141c7ae87f9`). Production runs use
+(tip re-seeded 2026-10-31 by the packages-protocols battery's husk sweep —
+the pre-067449a-era husk died, the self-seed rebuilt it; the tip drifts with
+re-seeds, never pin local). Production runs use
 `p0probe` and the standing fixture pinned by `--fixture-oid` instead. A
 fresh scratch user needs NO pre-seeding anymore — the p0 battery
 self-seeds its fixture on first contact and keeps it on green (the next

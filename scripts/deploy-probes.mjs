@@ -226,6 +226,58 @@
  *                  reuses them; the p0 standing-fixture precedent). A red run
  *                  sweeps the uploaded files' rows + the repo (the
  *                  failureTail).
+ *   packages-protocols The protocol long-tail's FOUR families in ONE
+ *                  owner-scoped sweep (the go/cargo/swift/rubygems rows of
+ *                  SPEC-0016 §7; one probe repo vehicle + the run PAT; every
+ *                  fixture GENERATED INLINE — the landed suites' hand-built
+ *                  builders): the go arm PUTs a hand-built module zip (the
+ *                  go.dev/ref/mod layout — {module}@{version}/ prefixed
+ *                  entries + the root go.mod) → 201, @v/list (text/plain,
+ *                  one version per line), @latest + .info (the {Version,Time}
+ *                  JSON), .mod (the stored property), .zip (octet-stream byte
+ *                  parity), the sumdb /supported 404 page, the missing-module
+ *                  404s (the EMPTY list-miss body), then the management
+ *                  version delete → the read 404s; a REAL
+ *                  `GOPROXY=… go mod download` arm rides the spec's disclosed
+ *                  client posture (GONOPROXY=none GONOSUMDB='*') and asserts
+ *                  the module cache holds .info/.mod/.zip when `go` is on the
+ *                  probe host (a [warn] degradation when it is not); the cargo
+ *                  arm PUTs a hand-built .crate container (the
+ *                  uint32-LE|metadata JSON|uint32-LE|bytes shape) → {"ok":true},
+ *                  the duplicate re-publish is the {"ok":false} error shape,
+ *                  config.json answers exactly, the sparse index (the 2-2-name
+ *                  path) renders the NDJSON entry with cksum == the stored
+ *                  sha256, yank/unyank flip the index line, the download byte
+ *                  parity rides the same checksum, and a REAL `cargo fetch`
+ *                  consumer arm (through an in-script header-stripping proxy
+ *                  on plain-HTTP targets — cargo 1.94's h2c upgrade headers
+ *                  crash the local dev dispatch) asserts the fetched cache
+ *                  crate's sha256 == the published payload; the swift arm
+ *                  proves the login pair (any valid credential → the bare 200,
+ *                  anonymous → the 401 Problem), PUTs a hand-built source
+ *                  archive (multipart source-archive + the schema.org
+ *                  metadata part), reads the SemVer-sorted enumerate JSON with
+ *                  the Link latest-version header, the metadata document, the
+ *                  .zip download (Digest: sha256 == the stored hash), the
+ *                  manifest (200 + the 303-on-miss for a version-keyed miss),
+ *                  the identifiers lookup, and the management delete; the
+ *                  rubygems arm POSTs a hand-built .gem (tar{data.tar.gz,
+ *                  metadata.gz, checksums.yaml.gz} over the gzipped YAML
+ *                  gemspec) → 201, the compact index line, the specs.4.8
+ *                  marshal enumeration, the .gem byte parity, the
+ *                  .gemspec.rz zlib arm, then the protocol yank (the upstream
+ *                  DeletePackage fold — the version row goes). Cleanup: the
+ *                  version deletes ride the management API (the go/cargo/
+ *                  swift protocol groups carry NO delete) and fold version +
+ *                  files upstream-parity — the empty package HUSKS sweep via
+ *                  D1 (the packages-registry/distro precedent, wrangler auth,
+ *                  --d1-scope) with the zero-rows assert; the distro-internal
+ *                  rows (_rpm/_arch/_debian/_alpine + the owner keypairs) are
+ *                  STANDING per-owner infrastructure the sweep never touches.
+ *                  INDEPENDENT (the distro posture — one red family never
+ *                  hides the others; every arm self-contains its family). A
+ *                  red run sweeps the uploaded versions' rows + the repo (the
+ *                  failureTail).
  *   cleanup-audit  The post-run D1 count shapes (wrangler d1 execute; see the
  *                  audit SQL below for the exact tables).
  *   all            Every battery in the order above (audit last).
@@ -317,8 +369,9 @@ import console from "node:console";
 import { createHash, randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { gunzipSync, gzipSync } from "node:zlib";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { gunzipSync, gzipSync, inflateSync } from "node:zlib";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -329,7 +382,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerDir = path.join(repoRoot, "apps", "worker");
 const DEFAULT_USER = "p0probe";
-const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "cleanup-audit", "all"];
+const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "packages-protocols", "cleanup-audit", "all"];
 /** Batteries that make NO HTTP calls (they read D1 via wrangler only):
  *  --base-url and --token-file are OPTIONAL for these (REDEPLOY15 friction
  *  (a): the D1-only audit still demanded a PAT, forcing a scratch-mint +
@@ -424,6 +477,7 @@ const usage = () =>
   "  wiki-git:      (no extra options)\n" +
   "  packages-registry: (no extra options — the row-cleanup arm reuses --d1-scope and needs wrangler auth, the fixwave precedent)\n" +
   "  packages-distro: (no extra options — the husk row-cleanup arm reuses --d1-scope and needs wrangler auth, the packages-registry precedent; the internal _rpm/_arch rows + keypair are standing owner infrastructure)\n" +
+  "  packages-protocols: (no extra options — the go/cargo REAL-CLIENT arms degrade to a [warn] when the toolchain is off the probe host; the cargo client rides an in-script header-stripping proxy on plain-HTTP targets; the husk row-cleanup arm reuses --d1-scope and needs wrangler auth)\n" +
   "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (2 — the standing bootstrap set)\n" +
   "  any battery:   --force-red <check-id>    (self-test: force that check red UNRUN — exercises the failure-tail sweep; an unmatched id warns)";
 
@@ -4222,11 +4276,12 @@ const twineMultipart = (fields, filename, fileBytes) => {
 
 /** The protocol families' raw-body PUT/POST/GET (the Authorization rides the
  *  run PAT; Content-Length is REQUIRED by every write arm — fetch sets it
- *  for a Buffer body). `raw` skips the api() JSON wrapper. */
-const pkgFetch = async (apiPath, { method = "GET", body } = {}) => {
+ *  for a Buffer body). `headers` merges extras (the swift family's Accept
+ *  contract arms). */
+const pkgFetch = async (apiPath, { method = "GET", body, headers: extraHeaders } = {}) => {
   const res = await fetchT(`${opts.baseUrl}/api/packages${apiPath}`, {
     method,
-    headers: { authorization: `token ${TOKEN}` },
+    headers: { authorization: `token ${TOKEN}`, ...(extraHeaders ?? {}) },
     ...(body === undefined ? {} : { body }),
   });
   const bytes = Buffer.from(await res.arrayBuffer());
@@ -5016,6 +5071,772 @@ const packagesDistroSteps = (ctx) => {
   ];
 };
 
+// ---------- battery: packages-protocols (the go/cargo/swift/rubygems long tail) ----------
+
+/**
+ * The protocol long-tail (SPEC-0016 §7's go/cargo/swift/rubygems rows — the
+ * registry's THIRD family group after packages-registry's six registry
+ * protocols and packages-distro's rpm/arch): FOUR families over ONE
+ * owner-scoped fixture set — a public probe repo as the owner vehicle + the
+ * run PAT (write:package via `all`). Every fixture is GENERATED INLINE (the
+ * landed suites' hand-built builders — no go/cargo/swift/gem tooling required
+ * on the probe host for the fixtures):
+ *
+ *   - go      a hand-built module zip ({module}@{version}/-prefixed entries +
+ *             the root go.mod, stored entries — the zipStoredBytes layout the
+ *             central-directory walk reads): PUT /go/upload → 201, @v/list
+ *             (text/plain;charset=utf-8, one version per line), @latest +
+ *             .info ({Version,Time} JSON, RFC3339 Z), .mod (the stored
+ *             go.mod property verbatim), .zip (octet-stream byte parity,
+ *             the {version}.zip disposition), the sumdb /supported probe
+ *             (http.NotFound's exact page), the missing-module contract (the
+ *             EMPTY-body list miss + the "package does not exist" resolve
+ *             miss), then the management version delete → the read 404s.
+ *             A REAL-CLIENT arm rides it when `go` is on the host: a second
+ *             module uploaded, then `GOPROXY=… GONOPROXY=none GONOSUMDB='*'
+ *             GOFLAGS=-mod=mod go mod download <module>@v1.0.0` (SPEC-0016's
+ *             as-built posture — GOPRIVATE would bypass the proxy; the sumdb
+ *             stays skipped, consistent with the /supported 404) asserting
+ *             exit 0 AND the module cache holding v1.0.0.info/.mod/.zip whose
+ *             contents answer the upload (a [warn] degradation when no go).
+ *   - cargo   a hand-built .crate container (uint32-LE metadata length |
+ *             metadata JSON | uint32-LE content length | the .crate bytes —
+ *             parser.go:57-71; the content a properly-rooted
+ *             {name}-{version}/ tar+gzip crate): PUT api/v1/crates/new →
+ *             {"ok":true}; the duplicate re-publish is the {"ok":false}
+ *             error shape (409 "package version already exists"); config.json
+ *             answers the exact {dl, api, auth-required:false} document off
+ *             the request origin; the sparse index (the 2-2-name path) renders
+ *             the NDJSON IndexVersionEntry line (cksum == the stored sha256,
+ *             yanked:false); yank/unyank flip the line; the download is byte
+ *             parity under the same checksum. A REAL-CLIENT arm rides it when
+ *             `cargo` is on the host: a second crate published, then
+ *             `cargo fetch` in a consumer crate against a sparse+ index —
+ *             through an IN-SCRIPT header-stripping proxy on plain-HTTP
+ *             targets (cargo 1.94 offers `Upgrade: h2c` and the miniflare-beta
+ *             dev dispatch dies on it — SPEC-0016's disclosed shim posture,
+ *             the proxy also rewrites config.json's dl/api onto the proxy
+ *             origin so the dl download rides it too; https:// targets go
+ *             direct) — asserting exit 0 AND the cache crate's sha256 ==
+ *             the published payload (cargo's cksum gate) ([warn] when no
+ *             cargo).
+ *   - swift   the login pair (any valid credential → the BARE 200 with NO
+ *             Content-Version; anonymous → the 401 Problem document), PUT
+ *             {scope}/{name}/{version} (multipart: the source-archive FILE
+ *             part — a hand-built zip whose root Package.swift is the
+ *             shallowest manifest dir — plus the schema.org metadata VALUE
+ *             part whose repositoryURLs become the swift.repository_url
+ *             properties) → 201 + Content-Version: 1, the SemVer-sorted
+ *             enumerate JSON + the Link rel="latest-version" header, the
+ *             .json twin, the metadata document (id = scope.name, the blob
+ *             sha256 as checksum), the .zip download (Digest: sha256 ==
+ *             the stored hash, byte parity), the manifest (200 text/x-swift)
+ *             with the 303-on-miss for a version-keyed lookup the manifest
+ *             set lacks, the identifiers lookup answering the package id for
+ *             the uploaded repository URL, then the management version
+ *             delete.
+ *   - rubygems a hand-built .gem (tar{data.tar.gz, metadata.gz,
+ *             checksums.yaml.gz} over the gzipped YAML gemspec — the upstream
+ *             integration test's makeRubyGem shape): POST api/v1/gems (the
+ *             RAW body) → 201 EMPTY, the compact index (info/{name}: the
+ *             version line with the dependency requirements + the stored
+ *             checksum), the specs.4.8 marshal enumeration (the decompressed
+ *             payload carries the name + version), the .gem download byte
+ *             parity, the .gemspec.rz zlib arm (inflate → the name), then the
+ *             protocol YANK (DELETE api/v1/gems/yank, multipart gem_name/
+ *             version → 200 — upstream's DeletePackage fold: the version row
+ *             GOES) and the compact index 404s after.
+ *
+ * Deletes + the husk sweep (the packages-registry/distro precedent): the
+ * go/cargo/swift protocol groups carry NO delete route, so the version
+ * deletes ride the management API (DELETE /api/v1/packages/{owner}/{type}/
+ * {name}/{version} → 204) and fold version + files upstream-parity — the
+ * empty package HUSKS sweep via D1 with the zero-rows assert (rubygems'
+ * yank IS the protocol version delete). The distro-internal rows
+ * (_rpm/_arch/_debian/_alpine + the owner keypairs) are STANDING per-owner
+ * infrastructure the sweep never touches; unreferenced blob content rides
+ * the >24 h cleanup queue as documented residue. Package names are unique
+ * per run. INDEPENDENT (the distro posture): every arm self-contains its
+ * family — a red never hides the others. A red run sweeps the uploaded
+ * versions' rows + the repo (the failureTail).
+ */
+
+/** The go module zip fixture ({module}@{version}/-prefixed entries over the
+ *  shared stored-entry zip substrate — go.dev/ref/mod#zip-files' layout). */
+const buildModuleZip = (name, version, goModText) => zipStoredBytes([
+  [`${name}@${version}/go.mod`, Buffer.from(goModText, "utf8")],
+  [`${name}@${version}/hello.go`, Buffer.from(`package hello\n\n// deploy-probes module fixture\n`, "utf8")],
+]);
+
+/** The .crate container (parser.go:57-71 — uint32-LE metadata length |
+ *  metadata JSON | uint32-LE content length | the .crate bytes). The content
+ *  is a properly-rooted {name}-{version}/ crate (cargo's unpack gate roots
+ *  every member under the package dir). */
+const u32le = (value) => {
+  const buf = Buffer.alloc(4);
+  buf.writeUInt32LE(value >>> 0, 0);
+  return buf;
+};
+
+const buildCrateContainer = (name, version) => {
+  const metadata = {
+    name, vers: version, deps: [], features: {}, authors: ["deploy-probes"],
+    description: "deploy-probes cargo round-trip probe", license: "MIT",
+  };
+  const content = gzipSync(tarBytes([
+    [`${name}-${version}/Cargo.toml`, Buffer.from(`[package]\nname = "${name}"\nversion = "${version}"\nedition = "2021"\n`, "utf8")],
+    [`${name}-${version}/src/lib.rs`, Buffer.from(`pub fn probe() {}\n`, "utf8")],
+  ]));
+  const metaJson = Buffer.from(JSON.stringify(metadata), "utf8");
+  return Buffer.concat([u32le(metaJson.length), metaJson, u32le(content.length), content]);
+};
+
+/** The swift upload form (the packages-swift.test.ts makeMultipart shape —
+ *  the FILE part carries the filename, the metadata part rides as a plain
+ *  VALUE part). */
+const swiftUploadMultipart = (parts) => {
+  const boundary = `probe-swift-${hexId(16)}`;
+  const chunks = [];
+  for (const part of parts) {
+    const disposition = `Content-Disposition: form-data; name="${part.name}"` +
+      (part.filename !== undefined ? `; filename="${part.filename}"` : "");
+    chunks.push(Buffer.from(`--${boundary}\r\n${disposition}\r\n\r\n`, "utf8"));
+    chunks.push(part.body);
+    chunks.push(Buffer.from("\r\n", "utf8"));
+  }
+  chunks.push(Buffer.from(`--${boundary}--\r\n`, "utf8"));
+  return { contentType: `multipart/form-data; boundary=${boundary}`, body: Buffer.concat(chunks) };
+};
+
+/** The minimal .gem (the upstream integration test's makeRubyGem shape):
+ *  tar{data.tar.gz, metadata.gz, checksums.yaml.gz} over the gzipped YAML
+ *  gemspec — the decode needs name/version/platform/authors/description/
+ *  homepage/licenses/summary + the two requirement maps. */
+const rubyGemspecFor = (name, version) => `--- !ruby/object:Gem::Specification
+name: ${name}
+version: !ruby/object:Gem::Version
+  version: ${version}
+platform: ruby
+authors:
+- deploy-probes
+description: deploy-probes rubygems round-trip probe
+homepage: https://gitea.io/
+licenses:
+- MIT
+required_ruby_version: !ruby/object:Gem::Requirement
+  requirements:
+  - - ">="
+    - !ruby/object:Gem::Version
+      version: 2.3.0
+required_rubygems_version: !ruby/object:Gem::Requirement
+  requirements:
+  - - ">="
+    - !ruby/object:Gem::Version
+      version: '1.0'
+summary: deploy-probes gem probe
+dependencies:
+- !ruby/object:Gem::Dependency
+  name: runtime-dep
+  requirement: !ruby/object:Gem::Requirement
+    requirements:
+    - - ">="
+      - !ruby/object:Gem::Version
+        version: 1.2.0
+  type: :runtime
+  prerelease: false
+  version_requirements: !ruby/object:Gem::Requirement
+    requirements:
+    - - ">="
+      - !ruby/object:Gem::Version
+        version: 1.2.0
+`;
+
+const buildMinimalGem = (name, version) => {
+  const metadataGz = gzipSync(Buffer.from(rubyGemspecFor(name, version), "utf8"));
+  const dataTarGz = gzipSync(tarBytes([["lib/probe.rb", Buffer.from("class Probe\nend\n", "utf8")]]));
+  const checksumsYaml = `---\nSHA256:\n  metadata.gz: ${shaHex("sha256", metadataGz)}\n  data.tar.gz: ${shaHex("sha256", dataTarGz)}\n`;
+  return tarBytes([
+    ["data.tar.gz", dataTarGz],
+    ["metadata.gz", metadataGz],
+    ["checksums.yaml.gz", gzipSync(Buffer.from(checksumsYaml, "utf8"))],
+  ]);
+};
+
+/** Is the toolchain on the probe host? (The REAL-CLIENT arms degrade to a
+ *  documented [warn] when it is not — the window-mounts posture.) Each tool
+ *  carries its own version-args shape: `go version` (go has no --version),
+ *  `cargo --version`. */
+const toolOnHost = async (cmd, versionArgs) => (await run(cmd, versionArgs)).ok;
+
+/** The in-script cargo fetch proxy (SPEC-0016's disclosed shim posture,
+ *  inlined): strips cargo 1.94's `Upgrade: h2c` / `HTTP2-Settings` hop-by-hop
+ *  headers the miniflare-beta dev dispatch dies on, and rewrites config.json's
+ *  `dl`/`api` onto the PROXY origin so the dl download rides it too. https://
+ *  targets never need it (no cleartext h2c offer) and go direct. */
+const cargoProxyStart = (targetOrigin) =>
+  new Promise((resolve) => {
+    const server = http.createServer(async (req, res) => {
+      try {
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        const headers = { ...req.headers };
+        delete headers.upgrade;
+        delete headers["http2-settings"];
+        delete headers.connection;
+        delete headers.host;
+        delete headers["content-length"];
+        const upstream = await fetch(new URL(req.url, targetOrigin), {
+          method: req.method,
+          headers,
+          body: chunks.length > 0 ? Buffer.concat(chunks) : undefined,
+        });
+        const buf = Buffer.from(await upstream.arrayBuffer());
+        // Only the config document carries absolute URLs — rewrite that one,
+        // stream everything else untouched (downloads must stay byte-exact).
+        const text = buf.toString("utf8");
+        const proxyOrigin = `http://127.0.0.1:${server.address().port}`;
+        const out = text.includes('"dl"') && text.includes(targetOrigin)
+          ? Buffer.from(text.split(targetOrigin).join(proxyOrigin), "utf8")
+          : buf;
+        const outHeaders = {};
+        upstream.headers.forEach((value, key) => {
+          if (!["content-length", "transfer-encoding", "connection", "keep-alive"].includes(key)) outHeaders[key] = value;
+        });
+        outHeaders["content-length"] = String(out.length);
+        res.writeHead(upstream.status, outHeaders);
+        res.end(out);
+      } catch (err) {
+        res.writeHead(502, { "content-type": "text/plain;charset=utf-8" });
+        res.end(String(err));
+      }
+    });
+    server.listen(0, "127.0.0.1", () => resolve({ server, origin: `http://127.0.0.1:${server.address().port}` }));
+  });
+
+const cargoProxyStop = (proxy) => {
+  if (!proxy) return Promise.resolve();
+  proxy.server.closeAllConnections();
+  return new Promise((resolve) => proxy.server.close(resolve));
+};
+
+/** The management version delete (the go/cargo/swift protocol groups carry
+ *  NO delete route; rubygems' yank IS its protocol delete). The go version is
+ *  the `v`-prefixed string the zip path carries (verbatim per upstream). */
+const pkgMgmtDeleteVersion = async (user, type, name, version) =>
+  api(`/packages/${user}/${type}/${encodeURIComponent(name)}/${encodeURIComponent(version)}`, { method: "DELETE" });
+
+/** `go`/`cargo`/`ruby`/`swift`-family state + the shared tracking fields:
+ *  `packageNames` is registered at step-list construction (the distro
+ *  posture — the tail's D1 sweep covers them even when a forced-red arm
+ *  never uploaded, the sweep answering "already clean"), the per-family
+ *  `<family>`/`<family>Gone` pairs drive the tail's best-effort version
+ *  deletes, and the repo pair the vehicle delete. */
+const packagesProtocolsContext = () => ({
+  user: opts.user, repo: `proto-${hexId()}`, tmp: null,
+  repoCreated: false, repoFullName: null, repoGone: false,
+  go: null, goGone: false, goClient: null, goClientGone: false,
+  cargo: null, cargoGone: false, cargoClient: null, cargoClientGone: false,
+  swift: null, swiftGone: false, ruby: null, rubyGone: false,
+  packageNames: [], rowsSwept: false,
+});
+
+const packagesProtocolsFailureCleanup = async (ctx) => {
+  const acts = [];
+  const versionDeletes = [
+    ["go", ctx.go, ctx.goGone],
+    ["go", ctx.goClient, ctx.goClientGone],
+    ["cargo", ctx.cargo, ctx.cargoGone],
+    ["cargo", ctx.cargoClient, ctx.cargoClientGone],
+    ["swift", ctx.swift, ctx.swiftGone],
+    ["rubygems", ctx.ruby, ctx.rubyGone],
+  ];
+  for (const [type, state, gone] of versionDeletes) {
+    if (state === null || gone === true) continue;
+    try {
+      const del = await pkgMgmtDeleteVersion(ctx.user, type, state.name, state.version);
+      if (del.status === 204) acts.push(`${type} ${state.name}@${state.version} deleted`);
+      else if (del.status === 404) acts.push(`${type} ${state.name}@${state.version} already gone (the row sweep got there first)`);
+      else {
+        leftBehind.push(`${type} ${state.name}@${state.version} (DELETE returned ${del.status})`);
+        acts.push(`${type} ${state.name}@${state.version} LEFT BEHIND — DELETE returned ${del.status}`);
+      }
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      leftBehind.push(`${type} ${state.name}@${state.version} (failure-cleanup tail: ${why})`);
+      acts.push(`${type} delete FAILED — ${why}`);
+    }
+  }
+  if (ctx.rowsSwept !== true && ctx.packageNames.length > 0) {
+    try {
+      acts.push(...(await packagesDeleteProbeRows(ctx)));
+    } catch (err) {
+      leftBehind.push(`package rows ${ctx.packageNames.join(", ")} (failure-cleanup tail: ${err instanceof Error ? err.message : String(err)})`);
+      acts.push(`package-row sweep FAILED — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (ctx.repoCreated === true && ctx.repoGone !== true) {
+    const [owner, repo] = String(ctx.repoFullName ?? `${ctx.user}/${ctx.repo}`).split("/");
+    try {
+      const out = await deleteRepo(owner, repo);
+      acts.push(typeof out === "string" ? out : out.detail);
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      leftBehind.push(`repo ${owner}/${repo} (failure-cleanup tail: DELETE threw: ${why})`);
+      acts.push(`repo ${owner}/${repo} LEFT BEHIND — DELETE threw: ${why}`);
+    }
+  }
+  if (acts.length) log(`  [tail] proto-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
+};
+
+const packagesProtocolsSteps = (ctx) => {
+  const origin = opts.baseUrl; // the config/Location asserts render off the request origin
+  // --- go ---
+  const goName = `pprobes${hexId()}.local`; // dot-bearing single-segment module path (the management API's {name} is one segment — no slash)
+  const goVersion = "v1.0.0"; // the zip-path form upstream stores VERBATIM (the v prefix)
+  const goModText = `module ${goName}\n\ngo 1.21\n`;
+  const goZip = buildModuleZip(goName, goVersion, goModText);
+  const goClientName = `pprobes${hexId()}.local`;
+  const goClientZip = buildModuleZip(goClientName, goVersion, `module ${goClientName}\n\ngo 1.21\n`);
+  // --- cargo ---
+  const cargoName = `probe-cargo-${hexId()}`;
+  const cargoVersion = "0.1.0";
+  const cargoContainer = buildCrateContainer(cargoName, cargoVersion);
+  const cargoCrateBytes = cargoContainer.subarray(
+    4 + cargoContainer.readUInt32LE(0) + 4,
+  ); // the content window (what the server stores)
+  const cargoClientName = `probe-cargoc-${hexId()}`;
+  const cargoClientContainer = buildCrateContainer(cargoClientName, cargoVersion);
+  const cargoClientBytes = cargoClientContainer.subarray(4 + cargoClientContainer.readUInt32LE(0) + 4);
+  const cargoIndexPath = (name) => {
+    const lower = name.toLowerCase();
+    return `${lower.slice(0, 2)}/${lower.slice(2, 4)}/${lower}`; // BuildPackagePath's ≥4-char shard
+  };
+  // --- swift ---
+  const swiftScope = "probescope";
+  const swiftName = `probe-pkg-${hexId()}`;
+  const swiftVersion = "1.0.0";
+  const swiftRepoUrl = `https://probe.invalid/${hexId(12)}/repo`;
+  const swiftManifest = `// swift-tools-version:5.7\nimport PackageDescription\n\nlet package = Package(name: "${swiftName}")\n`;
+  const swiftZip = zipStoredBytes([["Package.swift", Buffer.from(swiftManifest, "utf8")]]);
+  const swiftMetadataDoc = JSON.stringify({
+    name: swiftName,
+    version: swiftVersion,
+    description: "deploy-probes swift package probe",
+    codeRepository: swiftRepoUrl,
+    author: { givenName: "deploy-probes" },
+    repositoryURLs: [swiftRepoUrl],
+  });
+  const swiftForm = swiftUploadMultipart([
+    { name: "source-archive", filename: "source-archive.zip", body: swiftZip },
+    { name: "metadata", body: Buffer.from(swiftMetadataDoc, "utf8") },
+  ]);
+  // --- rubygems ---
+  const rubyName = `probe-ruby-${hexId()}`;
+  const rubyVersion = "1.0.0";
+  const rubyGem = buildMinimalGem(rubyName, rubyVersion);
+  // All probe names registered at step-list construction (the distro posture).
+  ctx.packageNames = [goName, goClientName, cargoName, cargoClientName, `${swiftScope}.${swiftName}`, rubyName];
+  return [
+    {
+      id: "proto-create-repo-201",
+      expect: `POST /api/v1/user/repos {"name":"${ctx.repo}","auto_init":true} → 201 (the owner fixture vehicle — all four families are OWNER-scoped rows, the repo only proves coexistence)`,
+      run: async () => {
+        const res = await api("/user/repos", { method: "POST", body: { name: ctx.repo, private: false, auto_init: true } });
+        expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+        ctx.repoCreated = true; // the failure-cleanup tail deletes it if a later arm reds
+        ctx.repoFullName = String(res.json?.full_name ?? `${ctx.user}/${ctx.repo}`);
+        return `created ${res.json?.full_name}`;
+      },
+    },
+    {
+      id: "proto-go-roundtrip",
+      expect: `go: PUT /go/upload the hand-built module zip (${goName}@${goVersion}/go.mod + hello.go) → 201; GET @v/list → 200 text/plain "${goVersion}\\n"; GET @latest + @v/${goVersion}.info → 200 application/json {"Version","Time"} (RFC3339 Z); GET @v/${goVersion}.mod → the go.mod text verbatim; GET @v/${goVersion}.zip → application/octet-stream byte parity + the disposition; GET the sumdb /supported probe → the exact 404 page; the missing-module contract: an unknown module's @v/list 404s with the EMPTY body and an unknown version's .info 404s "package does not exist"; DELETE /api/v1/packages/.../go/${goName}/${goVersion} → 204 and the .info 404s after`,
+      run: async () => {
+        const put = await pkgFetch(`/${ctx.user}/go/upload`, { method: "PUT", body: goZip });
+        expect(put.status === 201, `upload status ${put.status} (expected 201): ${put.text.slice(0, 160) || "(empty body)"}`);
+        ctx.go = { name: goName, version: goVersion };
+        const base = `/${ctx.user}/go/${goName}`;
+        const list = await pkgFetch(`${base}/@v/list`);
+        expect(list.status === 200, `@v/list status ${list.status} (expected 200)`);
+        expect(String(list.headers.get("content-type") ?? "") === "text/plain;charset=utf-8",
+          `list content-type ${JSON.stringify(list.headers.get("content-type"))} (expected text/plain;charset=utf-8)`);
+        expect(list.text === `${goVersion}\n`, `list body ${JSON.stringify(list.text)} (expected "${goVersion}\\n")`);
+        const timeShape = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+        for (const tail of ["@latest", `@v/${goVersion}.info`]) {
+          const info = await pkgFetch(`${base}/${tail}`);
+          expect(info.status === 200, `${tail} status ${info.status} (expected 200)`);
+          expect(String(info.headers.get("content-type") ?? "") === "application/json;charset=utf-8",
+            `${tail} content-type ${JSON.stringify(info.headers.get("content-type"))} (expected application/json;charset=utf-8)`);
+          const parsed = JSON.parse(info.text);
+          expect(JSON.stringify(Object.keys(parsed)) === JSON.stringify(["Version", "Time"]),
+            `${tail} keys ${JSON.stringify(Object.keys(parsed))} (expected exactly Version,Time)`);
+          expect(parsed.Version === goVersion, `${tail} Version ${JSON.stringify(parsed.Version)} (expected ${goVersion})`);
+          expect(timeShape.test(parsed.Time), `${tail} Time ${JSON.stringify(parsed.Time)} (expected the RFC3339 Z shape)`);
+        }
+        const mod = await pkgFetch(`${base}/@v/${goVersion}.mod`);
+        expect(mod.status === 200, `.mod status ${mod.status} (expected 200)`);
+        expect(mod.text === goModText, `.mod body drift: ${JSON.stringify(mod.text)}`);
+        const zip = await pkgFetch(`${base}/@v/${goVersion}.zip`);
+        expect(zip.status === 200, `.zip status ${zip.status} (expected 200)`);
+        expect(String(zip.headers.get("content-type") ?? "").includes("application/octet-stream"),
+          `.zip content-type ${JSON.stringify(zip.headers.get("content-type"))} (expected octet-stream — the zip is NOT sniffed)`);
+        expect(zip.bytes.equals(goZip), `.zip bytes != the uploaded module (${zip.bytes.length} vs ${goZip.length})`);
+        expect(String(zip.headers.get("content-disposition") ?? "").includes(`${goVersion}.zip`),
+          `.zip disposition missing the ${goVersion}.zip filename`);
+        const sumdb = await pkgFetch(`/${ctx.user}/go/sumdb/sum.golang.org/supported`);
+        expect(sumdb.status === 404, `sumdb /supported status ${sumdb.status} (expected 404 — this proxy does not mirror the checksum DB)`);
+        expect(sumdb.text === "404 page not found\n", `sumdb body ${JSON.stringify(sumdb.text)} (expected http.NotFound's page)`);
+        const ghostList = await pkgFetch(`/${ctx.user}/go/ghost${hexId()}.local/@v/list`);
+        expect(ghostList.status === 404 && ghostList.bytes.length === 0,
+          `missing-module @v/list ${ghostList.status} ${ghostList.bytes.length}B (expected the 404 with the EMPTY body)`);
+        const ghostInfo = await pkgFetch(`${base}/@v/v9.9.9.info`);
+        expect(ghostInfo.status === 404 && ghostInfo.text === "package does not exist",
+          `missing-version .info ${ghostInfo.status} ${JSON.stringify(ghostInfo.text)} (expected 404 "package does not exist")`);
+        const del = await pkgMgmtDeleteVersion(ctx.user, "go", goName, goVersion);
+        expect(del.status === 204, `management delete status ${del.status} (expected 204)`);
+        ctx.goGone = true;
+        const gone = await pkgFetch(`${base}/@v/${goVersion}.info`);
+        expect(gone.status === 404, `post-delete .info status ${gone.status} (expected 404)`);
+        return `upload 201 → list/@latest/.info/.mod/.zip exact → sumdb 404 page → missing-module 404s → delete 204 → read 404`;
+      },
+    },
+    {
+      id: "proto-go-client-download",
+      expect: `go REAL CLIENT (needs go on the probe host; [warn] degradation when absent): PUT a second module zip, then GOPROXY=…/api/packages/${ctx.user}/go GONOPROXY=none GONOSUMDB='*' GOFLAGS=-mod=mod go mod download ${goClientName}@${goVersion} → exit 0 and the module cache holds ${goVersion}.info/.mod/.zip (the .info JSON answers Version ${goVersion}, the .mod the uploaded text — the spec's disclosed posture: GOPRIVATE would bypass the proxy, GONOSUMDB rides the /supported 404), then the management delete → 204`,
+      run: async () => {
+        if (!(await toolOnHost("go", ["version"]))) {
+          return { status: "warn", detail: "go is not on the probe host — the client arm skipped (the roundtrip arm's curl shapes carry the protocol)" };
+        }
+        const put = await pkgFetch(`/${ctx.user}/go/upload`, { method: "PUT", body: goClientZip });
+        expect(put.status === 201, `upload status ${put.status} (expected 201): ${put.text.slice(0, 160) || "(empty body)"}`);
+        ctx.goClient = { name: goClientName, version: goVersion };
+        const scratch = path.join(ctx.tmp, "go-client");
+        const gomodcache = path.join(scratch, "gomodcache");
+        const gopath = path.join(scratch, "gopath");
+        await mkdir(gomodcache, { recursive: true });
+        await mkdir(gopath, { recursive: true });
+        await writeFile(path.join(scratch, "go.mod"), `module pprobes-consumer.local\n\ngo 1.21\n`, "utf8");
+        try {
+          const client = await run("go", ["mod", "download", `${goClientName}@${goVersion}`], {
+            cwd: scratch,
+            timeoutMs: 120_000,
+            env: {
+              GOPROXY: `${origin}/api/packages/${ctx.user}/go`,
+              GONOPROXY: "none",
+              GONOSUMDB: "*",
+              GOFLAGS: "-mod=mod",
+              GOMODCACHE: gomodcache,
+              GOPATH: gopath,
+              GOTOOLCHAIN: "local",
+              GOTELEMETRY: "off",
+              HOME: scratch,
+            },
+          });
+          expect(client.ok, `go mod download exit ${client.code}: ${(client.stderr || client.stdout).trim().slice(0, 300)}`);
+          const vdir = path.join(gomodcache, "cache", "download", goClientName, "@v");
+          const cached = await readdir(vdir).catch(() => []);
+          for (const file of [`${goVersion}.info`, `${goVersion}.mod`, `${goVersion}.zip`]) {
+            expect(cached.includes(file), `module cache missing ${file} (holds: ${cached.join(", ") || "nothing"})`);
+          }
+          const cachedInfo = JSON.parse(await readFile(path.join(vdir, `${goVersion}.info`), "utf8"));
+          expect(cachedInfo.Version === goVersion, `cached .info Version ${JSON.stringify(cachedInfo.Version)} (expected ${goVersion})`);
+          const cachedMod = await readFile(path.join(vdir, `${goVersion}.mod`), "utf8");
+          expect(cachedMod === `module ${goClientName}\n\ngo 1.21\n`, `cached .mod drift: ${JSON.stringify(cachedMod.slice(0, 80))}`);
+        } finally {
+          // go marks its module cache read-only (0444 files / 0555 dirs by
+          // design) — the battery's shared tmp rm would die EACCES on it;
+          // hand the tree back writable on EVERY path through here.
+          await run("chmod", ["-R", "u+w", scratch]);
+        }
+        const del = await pkgMgmtDeleteVersion(ctx.user, "go", goClientName, goVersion);
+        expect(del.status === 204, `management delete status ${del.status} (expected 204)`);
+        ctx.goClientGone = true;
+        return `go ${goVersion} exit 0 — the client fetched .info/.mod/.zip into its cache and accepted our bytes`;
+      },
+    },
+    {
+      id: "proto-cargo-roundtrip",
+      expect: `cargo: PUT api/v1/crates/new the hand-built .crate container (${cargoName} ${cargoVersion}) → 200 {"ok":true}; the duplicate re-publish → 409 {"ok":false,"errors":[{"detail":"package version already exists"}]}; GET config.json → the exact {dl, api, auth-required:false} document off the request origin; GET the sparse index ${cargoIndexPath(cargoName)} → 200 text/plain with ONE IndexVersionEntry line whose cksum == the stored sha256 and yanked:false; yank → {"ok":true} + the line flips yanked:true; unyank → yanked:false; GET api/v1/crates/${cargoName}/${cargoVersion}/download → byte parity under the same checksum; DELETE /api/v1/packages/.../cargo/${cargoName}/${cargoVersion} → 204`,
+      run: async () => {
+        const put = await fetchT(`${origin}/api/packages/${ctx.user}/cargo/api/v1/crates/new`, {
+          method: "PUT",
+          headers: { authorization: `token ${TOKEN}`, "content-type": "application/octet-stream" },
+          body: cargoContainer,
+        });
+        const putText = Buffer.from(await put.arrayBuffer()).toString("utf8");
+        expect(put.status === 200 && putText === '{"ok":true}', `publish ${put.status} ${putText.slice(0, 120)} (expected 200 {"ok":true})`);
+        ctx.cargo = { name: cargoName, version: cargoVersion };
+        const dupe = await fetchT(`${origin}/api/packages/${ctx.user}/cargo/api/v1/crates/new`, {
+          method: "PUT",
+          headers: { authorization: `token ${TOKEN}`, "content-type": "application/octet-stream" },
+          body: cargoContainer,
+        });
+        const dupeText = Buffer.from(await dupe.arrayBuffer()).toString("utf8");
+        const dupeJson = JSON.parse(dupeText);
+        expect(dupe.status === 409, `duplicate publish status ${dupe.status} (expected 409)`);
+        expect(dupeJson.ok === false && Array.isArray(dupeJson.errors) && dupeJson.errors[0]?.detail === "package version already exists",
+          `duplicate error shape ${dupeText.slice(0, 160)} (expected the {"ok":false,"errors":[{"detail":…}]} wrap)`);
+        const config = await pkgFetch(`/${ctx.user}/cargo/config.json`);
+        expect(config.status === 200, `config.json status ${config.status} (expected 200)`);
+        const expectedConfig = JSON.stringify({
+          dl: `${origin}/api/packages/${ctx.user}/cargo/api/v1/crates`,
+          api: `${origin}/api/packages/${ctx.user}/cargo`,
+          "auth-required": false,
+        });
+        expect(config.text === expectedConfig, `config.json drift: ${config.text.slice(0, 200)}`);
+        const checksum = shaHex("sha256", cargoCrateBytes);
+        const index = await pkgFetch(`/${ctx.user}/cargo/${cargoIndexPath(cargoName)}`);
+        expect(index.status === 200, `sparse index status ${index.status} (expected 200)`);
+        expect(String(index.headers.get("content-type") ?? "").includes("text/plain"),
+          `index content-type ${JSON.stringify(index.headers.get("content-type"))} (expected text/plain NDJSON)`);
+        const lines = index.text.split("\n").filter((line) => line !== "");
+        expect(lines.length === 1, `index carries ${lines.length} lines (expected 1)`);
+        const entry = JSON.parse(lines[0]);
+        expect(entry.name === cargoName && entry.vers === cargoVersion, `index name/vers ${JSON.stringify(entry.name)}/${JSON.stringify(entry.vers)}`);
+        expect(Array.isArray(entry.deps) && entry.deps.length === 0, `index deps ${JSON.stringify(entry.deps)} (expected [])`);
+        expect(entry.cksum === checksum, `index cksum ${JSON.stringify(entry.cksum)} != the stored sha256 ${checksum}`);
+        expect(entry.features && typeof entry.features === "object" && Object.keys(entry.features).length === 0,
+          `index features ${JSON.stringify(entry.features)} (expected {})`);
+        expect(entry.yanked === false, `index yanked ${JSON.stringify(entry.yanked)} (expected false)`);
+        const yank = await pkgFetch(`/${ctx.user}/cargo/api/v1/crates/${cargoName}/${cargoVersion}/yank`, { method: "DELETE" });
+        expect(yank.status === 200 && yank.text === '{"ok":true}', `yank ${yank.status} ${yank.text.slice(0, 80)} (expected 200 {"ok":true})`);
+        const yankedLine = JSON.parse((await pkgFetch(`/${ctx.user}/cargo/${cargoIndexPath(cargoName)}`)).text.split("\n")[0]);
+        expect(yankedLine.yanked === true, `post-yank index yanked ${JSON.stringify(yankedLine.yanked)} (expected true)`);
+        const unyank = await pkgFetch(`/${ctx.user}/cargo/api/v1/crates/${cargoName}/${cargoVersion}/unyank`, { method: "PUT" });
+        expect(unyank.status === 200 && unyank.text === '{"ok":true}', `unyank ${unyank.status} (expected 200 {"ok":true})`);
+        const unyankedLine = JSON.parse((await pkgFetch(`/${ctx.user}/cargo/${cargoIndexPath(cargoName)}`)).text.split("\n")[0]);
+        expect(unyankedLine.yanked === false, `post-unyank index yanked ${JSON.stringify(unyankedLine.yanked)} (expected false)`);
+        const download = await pkgFetch(`/${ctx.user}/cargo/api/v1/crates/${cargoName}/${cargoVersion}/download`);
+        expect(download.status === 200, `download status ${download.status} (expected 200)`);
+        expect(download.bytes.equals(cargoCrateBytes), `download bytes != the container content (${download.bytes.length} vs ${cargoCrateBytes.length})`);
+        expect(shaHex("sha256", download.bytes) === checksum, `download sha256 != the index cksum (cargo's cksum gate would reject)`);
+        const del = await pkgMgmtDeleteVersion(ctx.user, "cargo", cargoName, cargoVersion);
+        expect(del.status === 204, `management delete status ${del.status} (expected 204)`);
+        ctx.cargoGone = true;
+        const indexGone = await pkgFetch(`/${ctx.user}/cargo/${cargoIndexPath(cargoName)}`);
+        expect(indexGone.status === 404, `post-delete index status ${indexGone.status} (expected 404 — the zero-version nil-index arm)`);
+        return `publish {"ok":true} → duplicate 409 {"ok":false} → config exact → index NDJSON (cksum parity) → yank/unyank flips → download byte parity → delete 204 → index 404`;
+      },
+    },
+    {
+      id: "proto-cargo-client-fetch",
+      expect: `cargo REAL CLIENT (needs cargo on the probe host; [warn] degradation when absent): publish a second crate, then cargo fetch in a consumer crate against the sparse+${ctx.user} index → exit 0 and the fetched cache crate's sha256 == the published payload (cargo's cksum gate); on plain-HTTP targets the client rides an in-script header-stripping proxy (cargo 1.94's Upgrade: h2c offer crashes the local dev dispatch — the spec's disclosed shim posture; config.json's dl/api rewrite onto the proxy origin), https targets go direct; then the management delete → 204`,
+      run: async () => {
+        if (!(await toolOnHost("cargo", ["--version"]))) {
+          return { status: "warn", detail: "cargo is not on the probe host — the client arm skipped (the roundtrip arm's curl shapes carry the protocol)" };
+        }
+        const put = await fetchT(`${origin}/api/packages/${ctx.user}/cargo/api/v1/crates/new`, {
+          method: "PUT",
+          headers: { authorization: `token ${TOKEN}`, "content-type": "application/octet-stream" },
+          body: cargoClientContainer,
+        });
+        const putText = Buffer.from(await put.arrayBuffer()).toString("utf8");
+        expect(put.status === 200 && putText === '{"ok":true}', `publish status ${put.status} ${putText.slice(0, 120)} (expected 200 {"ok":true})`);
+        ctx.cargoClient = { name: cargoClientName, version: cargoVersion };
+        const proxy = origin.startsWith("https://") ? null : await cargoProxyStart(origin);
+        try {
+          const indexOrigin = proxy ? proxy.origin : origin;
+          const scratch = path.join(ctx.tmp, "cargo-client");
+          const cargoHome = path.join(scratch, "cargo-home");
+          const consumer = path.join(scratch, "consumer");
+          await mkdir(path.join(consumer, "src"), { recursive: true });
+          await mkdir(cargoHome, { recursive: true });
+          await writeFile(path.join(consumer, "Cargo.toml"),
+            `[package]\nname = "probe-consumer"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n${cargoClientName} = { version = "${cargoVersion}", registry = "probe" }\n`, "utf8");
+          await writeFile(path.join(consumer, "src", "lib.rs"), `pub fn probe() {}\n`, "utf8");
+          await mkdir(path.join(consumer, ".cargo"), { recursive: true });
+          await writeFile(path.join(consumer, ".cargo", "config.toml"),
+            `[registries.probe]\nindex = "sparse+${indexOrigin}/api/packages/${ctx.user}/cargo/"\n`, "utf8");
+          // CARGO_HOME isolates the registry cache; HOME stays the operator's
+          // (a rustup-shimmed cargo resolves its toolchain under
+          // $HOME/.rustup — a scratch HOME strands it with no default).
+          const client = await run("cargo", ["fetch"], {
+            cwd: consumer,
+            timeoutMs: 120_000,
+            env: { CARGO_HOME: cargoHome },
+          });
+          expect(client.ok, `cargo fetch exit ${client.code}: ${(client.stderr || client.stdout).trim().slice(0, 300)}`);
+          const cacheRoot = path.join(cargoHome, "registry", "cache");
+          const hashDirs = await readdir(cacheRoot).catch(() => []);
+          let cachedBytes = null;
+          for (const dir of hashDirs) {
+            const candidate = path.join(cacheRoot, dir, `${cargoClientName}-${cargoVersion}.crate`);
+            cachedBytes = await readFile(candidate).catch(() => null);
+            if (cachedBytes !== null) break;
+          }
+          expect(cachedBytes !== null, `cargo cache holds no ${cargoClientName}-${cargoVersion}.crate under ${cacheRoot}`);
+          expect(shaHex("sha256", cachedBytes) === shaHex("sha256", cargoClientBytes),
+            `fetched cache crate sha256 != the published payload (cargo's cksum gate accepted the wrong bytes?)`);
+          const del = await pkgMgmtDeleteVersion(ctx.user, "cargo", cargoClientName, cargoVersion);
+          expect(del.status === 204, `management delete status ${del.status} (expected 204)`);
+          ctx.cargoClientGone = true;
+          return `cargo fetch exit 0 — the client resolved the index and its cksum gate accepted our served bytes`;
+        } finally {
+          await cargoProxyStop(proxy);
+        }
+      },
+    },
+    {
+      id: "proto-swift-roundtrip",
+      expect: `swift: POST /swift/login with any valid credential → the BARE 200 (NO Content-Version); anonymous → the 401 Problem {"status":401,"detail":""} + Content-Version: 1; PUT ${swiftScope}/${swiftName}/${swiftVersion} (multipart source-archive zip + the schema.org metadata VALUE part, Accept v1+json) → 201 EMPTY + Content-Version: 1; GET the enumerate → 200 {"releases":{"${swiftVersion}":{"url":…}}} + Link rel="latest-version" + Content-Version: 1; GET ${swiftVersion}.json → the same body; GET ${swiftVersion}.json metadata → 200 with id ${swiftScope}.${swiftName} + resources[0].checksum == the archive sha256; GET ${swiftVersion}.zip → 200 application/zip + Digest: sha256 (byte parity); GET ${swiftVersion}/Package.swift → 200 text/x-swift; the same with ?swift-version=5.6 → 303 SeeOther on the bare Location; GET /identifiers?url=<the uploaded repository URL> → {"identifiers":["${swiftScope}.${swiftName}"]}; DELETE /api/v1/packages/.../swift/${swiftScope}.${swiftName}/${swiftVersion} → 204`,
+      run: async () => {
+        const SWIFT_ACCEPT_JSON = "application/vnd.swift.registry.v1+json";
+        const SWIFT_ACCEPT_SWIFT = "application/vnd.swift.registry.v1+swift";
+        const SWIFT_ACCEPT_ZIP = "application/vnd.swift.registry.v1+zip";
+        const familyBase = `${origin}/api/packages/${ctx.user}/swift`;
+        const pkgBase = `${familyBase}/${swiftScope}/${swiftName}`;
+        const loginAuthed = await pkgFetch(`/${ctx.user}/swift/login`, { method: "POST", body: Buffer.alloc(0) });
+        expect(loginAuthed.status === 200, `login (authed) status ${loginAuthed.status} (expected 200)`);
+        expect(loginAuthed.headers.get("content-version") === null,
+          `login carried Content-Version ${JSON.stringify(loginAuthed.headers.get("content-version"))} (expected NONE — the bare 200)`);
+        const loginAnon = await fetchT(`${familyBase}/login`, { method: "POST", body: "" });
+        const loginAnonText = Buffer.from(await loginAnon.arrayBuffer()).toString("utf8");
+        expect(loginAnon.status === 401 && loginAnonText === '{"status":401,"detail":""}\n',
+          `anonymous login ${loginAnon.status} ${loginAnonText.slice(0, 80)} (expected the 401 Problem document)`);
+        expect(loginAnon.headers.get("content-type") === "application/problem+json",
+          `anonymous login content-type ${JSON.stringify(loginAnon.headers.get("content-type"))} (expected application/problem+json)`);
+        expect(loginAnon.headers.get("content-version") === "1",
+          `anonymous login Content-Version ${JSON.stringify(loginAnon.headers.get("content-version"))} (expected 1)`);
+        const put = await fetchT(`${pkgBase}/${swiftVersion}`, {
+          method: "PUT",
+          headers: {
+            authorization: `token ${TOKEN}`,
+            "content-type": swiftForm.contentType,
+            accept: SWIFT_ACCEPT_JSON,
+          },
+          body: swiftForm.body,
+        });
+        const putText = Buffer.from(await put.arrayBuffer()).toString("utf8");
+        expect(put.status === 201 && putText === "", `upload ${put.status} ${putText.slice(0, 120)} (expected the 201 EMPTY)`);
+        expect(put.headers.get("content-version") === "1", `upload Content-Version ${JSON.stringify(put.headers.get("content-version"))} (expected 1)`);
+        ctx.swift = { name: `${swiftScope}.${swiftName}`, version: swiftVersion };
+        const enumerate = await pkgFetch(`/${ctx.user}/swift/${swiftScope}/${swiftName}`, { headers: { accept: SWIFT_ACCEPT_JSON } });
+        expect(enumerate.status === 200, `enumerate status ${enumerate.status} (expected 200)`);
+        expect(String(enumerate.headers.get("content-type") ?? "") === "application/json;charset=utf-8",
+          `enumerate content-type ${JSON.stringify(enumerate.headers.get("content-type"))}`);
+        expect(enumerate.headers.get("content-version") === "1", `enumerate Content-Version (expected 1)`);
+        const baseURL = `${familyBase}/${swiftScope}/${swiftName}/`;
+        expect(enumerate.text === `{"releases":{"${swiftVersion}":{"url":${JSON.stringify(`${baseURL}${swiftVersion}`)}}}}`,
+          `enumerate body drift: ${enumerate.text.slice(0, 200)}`);
+        expect(enumerate.headers.get("link") === `<${baseURL}${encodeURIComponent(swiftVersion)}>; rel="latest-version"`,
+          `enumerate Link ${JSON.stringify(enumerate.headers.get("link"))} (expected the latest-version form)`);
+        const enumerateJson = await pkgFetch(`/${ctx.user}/swift/${swiftScope}/${swiftName}.json`, { headers: { accept: SWIFT_ACCEPT_JSON } });
+        expect(enumerateJson.status === 200 && enumerateJson.text === enumerate.text,
+          `.json twin ${enumerateJson.status} body mismatch vs the bare enumerate`);
+        const meta = await pkgFetch(`/${ctx.user}/swift/${swiftScope}/${swiftName}/${swiftVersion}.json`, { headers: { accept: SWIFT_ACCEPT_JSON } });
+        expect(meta.status === 200, `metadata status ${meta.status} (expected 200)`);
+        const metaJson = JSON.parse(meta.text);
+        expect(metaJson.id === `${swiftScope}.${swiftName}` && metaJson.version === swiftVersion,
+          `metadata id/version ${JSON.stringify(metaJson.id)}/${JSON.stringify(metaJson.version)}`);
+        expect(Array.isArray(metaJson.resources) && metaJson.resources[0]?.name === "source-archive" &&
+          metaJson.resources[0]?.type === "application/zip" && metaJson.resources[0]?.checksum === shaHex("sha256", swiftZip),
+          `metadata resources ${JSON.stringify(metaJson.resources)} (expected the source-archive pair with the archive sha256)`);
+        expect(meta.headers.get("content-version") === "1", `metadata Content-Version (expected 1)`);
+        const download = await pkgFetch(`/${ctx.user}/swift/${swiftScope}/${swiftName}/${swiftVersion}.zip`, { headers: { accept: SWIFT_ACCEPT_ZIP } });
+        expect(download.status === 200, `download status ${download.status} (expected 200)`);
+        expect(String(download.headers.get("content-type") ?? "").includes("application/zip"),
+          `download content-type ${JSON.stringify(download.headers.get("content-type"))} (expected application/zip)`);
+        expect(download.headers.get("digest") === `sha256=${shaHex("sha256", swiftZip)}`,
+          `download Digest ${JSON.stringify(download.headers.get("digest"))} (expected sha256=<the stored hash>)`);
+        expect(download.bytes.equals(swiftZip), `download bytes != the uploaded archive (${download.bytes.length} vs ${swiftZip.length})`);
+        const manifest = await pkgFetch(`/${ctx.user}/swift/${swiftScope}/${swiftName}/${swiftVersion}/Package.swift`, { headers: { accept: SWIFT_ACCEPT_SWIFT } });
+        expect(manifest.status === 200, `manifest status ${manifest.status} (expected 200)`);
+        expect(String(manifest.headers.get("content-type") ?? "").includes("text/x-swift"),
+          `manifest content-type ${JSON.stringify(manifest.headers.get("content-type"))} (expected text/x-swift)`);
+        expect(manifest.text === swiftManifest, `manifest body drift: ${manifest.text.slice(0, 80)}`);
+        const miss = await pkgFetch(`/${ctx.user}/swift/${swiftScope}/${swiftName}/${swiftVersion}/Package.swift?swift-version=5.6`, { headers: { accept: SWIFT_ACCEPT_SWIFT } });
+        expect(miss.status === 303, `manifest miss status ${miss.status} (expected 303 SeeOther)`);
+        expect(miss.headers.get("location") === `${familyBase}/${swiftScope}/${swiftName}/${swiftVersion}/Package.swift`,
+          `manifest miss Location ${JSON.stringify(miss.headers.get("location"))} (expected the bare Package.swift URL)`);
+        expect(miss.headers.get("content-version") === "1", `manifest miss Content-Version (expected 1)`);
+        const identifiers = await pkgFetch(`/${ctx.user}/swift/identifiers?url=${encodeURIComponent(swiftRepoUrl)}`, { headers: { accept: SWIFT_ACCEPT_JSON } });
+        expect(identifiers.status === 200, `identifiers status ${identifiers.status} (expected 200)`);
+        expect(identifiers.text === JSON.stringify({ identifiers: [`${swiftScope}.${swiftName}`] }),
+          `identifiers body ${identifiers.text.slice(0, 120)} (expected the package id)`);
+        const del = await pkgMgmtDeleteVersion(ctx.user, "swift", `${swiftScope}.${swiftName}`, swiftVersion);
+        expect(del.status === 204, `management delete status ${del.status} (expected 204)`);
+        ctx.swiftGone = true;
+        const gone = await pkgFetch(`/${ctx.user}/swift/${swiftScope}/${swiftName}.json`, { headers: { accept: SWIFT_ACCEPT_JSON } });
+        expect(gone.status === 404, `post-delete enumerate status ${gone.status} (expected 404)`);
+        return `login pair (bare 200 / 401 Problem) → upload 201 → enumerate + Link → metadata doc → Digest zip → manifest 200 + 303-on-miss → identifiers → delete 204 → enumerate 404`;
+      },
+    },
+    {
+      id: "proto-rubygems-roundtrip",
+      expect: `rubygems: POST api/v1/gems the hand-built .gem (tar{data.tar.gz, metadata.gz, checksums.yaml.gz} over the gzipped YAML gemspec) → 201 EMPTY; GET info/${rubyName} → 200 text/plain "---\\n" + the ${rubyVersion} line carrying the runtime requirement + checksum:${shaHex("sha256", rubyGem).slice(0, 12)}…; GET specs.4.8.gz → 200 whose decompressed marshal payload carries the name + version; GET gems/${rubyName}-${rubyVersion}.gem → byte parity; GET quick/Marshal.4.8/${rubyName}-${rubyVersion}.gemspec.rz → 200 whose inflate names the gem; DELETE api/v1/gems/yank (multipart gem_name/version) → 200 (the upstream DeletePackage fold — the version row GOES) and the compact index 404s after`,
+      run: async () => {
+        const put = await fetchT(`${origin}/api/packages/${ctx.user}/rubygems/api/v1/gems`, {
+          method: "POST",
+          headers: { authorization: `token ${TOKEN}`, "content-type": "application/octet-stream" },
+          body: rubyGem,
+        });
+        const putText = Buffer.from(await put.arrayBuffer()).toString("utf8");
+        expect(put.status === 201 && putText === "", `upload ${put.status} ${putText.slice(0, 120)} (expected the 201 EMPTY)`);
+        ctx.ruby = { name: rubyName, version: rubyVersion };
+        const checksum = shaHex("sha256", rubyGem);
+        const info = await pkgFetch(`/${ctx.user}/rubygems/info/${rubyName}`);
+        expect(info.status === 200, `info status ${info.status} (expected 200)`);
+        expect(String(info.headers.get("content-type") ?? "").includes("text/plain"),
+          `info content-type ${JSON.stringify(info.headers.get("content-type"))} (expected the compact index text)`);
+        expect(info.text.startsWith("---\n"), `info missing the "---\\n" head: ${JSON.stringify(info.text.slice(0, 40))}`);
+        const line = info.text.split("\n")[1] ?? "";
+        expect(line.startsWith(`${rubyVersion} `), `info line ${JSON.stringify(line.slice(0, 60))} (expected the ${rubyVersion} version lead)`);
+        expect(line.includes(`runtime-dep:>= 1.2.0`), `info line missing the runtime requirement (${line.slice(0, 120)})`);
+        expect(line.includes(`checksum:${checksum}`), `info line checksum != the stored sha256`);
+        expect(line.includes(`ruby:>= 2.3.0`) && line.includes(`rubygems:>= 1.0`), `info line missing the ruby/rubygems requirement tails`);
+        const specs = await pkgFetch(`/${ctx.user}/rubygems/specs.4.8.gz`);
+        expect(specs.status === 200, `specs.4.8.gz status ${specs.status} (expected 200)`);
+        const marshal = gunzipSync(specs.bytes);
+        expect(marshal.includes(Buffer.from(rubyName, "utf8")) && marshal.includes(Buffer.from(rubyVersion, "utf8")),
+          `specs marshal payload does not carry the ${rubyName}/${rubyVersion} entry`);
+        const download = await pkgFetch(`/${ctx.user}/rubygems/gems/${rubyName}-${rubyVersion}.gem`);
+        expect(download.status === 200, `download status ${download.status} (expected 200)`);
+        expect(download.bytes.equals(rubyGem), `download bytes != the uploaded gem (${download.bytes.length} vs ${rubyGem.length})`);
+        const gemspec = await pkgFetch(`/${ctx.user}/rubygems/quick/Marshal.4.8/${rubyName}-${rubyVersion}.gemspec.rz`);
+        expect(gemspec.status === 200 && gemspec.bytes.length > 0, `gemspec.rz ${gemspec.status} ${gemspec.bytes.length}B (expected 200 non-empty)`);
+        const inflated = inflateSync(gemspec.bytes);
+        expect(inflated.includes(Buffer.from(rubyName, "utf8")), `gemspec.rz inflate does not name the gem`);
+        const yank = await fetchT(`${origin}/api/packages/${ctx.user}/rubygems/api/v1/gems/yank`, {
+          method: "DELETE",
+          headers: {
+            authorization: `token ${TOKEN}`,
+            "content-type": "multipart/form-data; boundary=probe-yank",
+          },
+          body: Buffer.from(
+            `--probe-yank\r\nContent-Disposition: form-data; name="gem_name"\r\n\r\n${rubyName}\r\n` +
+            `--probe-yank\r\nContent-Disposition: form-data; name="version"\r\n\r\n${rubyVersion}\r\n` +
+            `--probe-yank--\r\n`, "utf8"),
+        });
+        const yankText = Buffer.from(await yank.arrayBuffer()).toString("utf8");
+        expect(yank.status === 200 && yankText === "", `yank ${yank.status} ${yankText.slice(0, 120)} (expected the 200 EMPTY)`);
+        ctx.rubyGone = true; // the yank IS the version delete (upstream's DeletePackage fold)
+        const infoGone = await pkgFetch(`/${ctx.user}/rubygems/info/${rubyName}`);
+        expect(infoGone.status === 404, `post-yank info status ${infoGone.status} (expected 404)`);
+        return `upload 201 → compact index line (checksum parity) → specs marshal names the gem → .gem byte parity → .gemspec.rz inflate → yank 200 → info 404`;
+      },
+    },
+    {
+      id: "proto-cleanup-rows-d1",
+      expect: `the husk row sweep (wrangler d1 --${opts.d1Scope}; needs wrangler auth): the version deletes folded version + files upstream-parity (the go/cargo/swift protocol groups carry NO delete route — the deletes rode the management API; the rubygems yank IS its protocol delete) and LEFT the empty package rows, so the probe's package husks delete via D1 with the zero-rows assert; the distro-internal rows (_rpm/_arch/_debian/_alpine + the owner keypairs) are STANDING per-owner infrastructure the sweep never touches`,
+      run: async () => {
+        const acts = await packagesDeleteProbeRows(ctx);
+        ctx.rowsSwept = true; // the failure tail no-ops on a green sweep
+        return `${acts.join("; ")} — husks gone; internal rows stay`;
+      },
+    },
+    {
+      id: "proto-cleanup-repo-204",
+      expect: `DELETE /api/v1/repos/${ctx.user}/${ctx.repo} → 204 (the owner vehicle leaves; the package rows were version-deleted in-arm and husk-swept — the repo delete never touches them)`,
+      run: async () => {
+        const res = await api(`/repos/${ctx.user}/${ctx.repo}`, { method: "DELETE" });
+        expect(res.status === 204, `status ${res.status} (expected 204)`);
+        ctx.repoGone = true;
+        return "204";
+      },
+    },
+  ];
+};
+
 // ---------- battery: cleanup-audit (the D1 count shapes) ----------
 
 const AUDIT_TABLES = [
@@ -5155,11 +5976,22 @@ const BATTERIES = {
   // (fbace73's recorded open item): inline hand-built fixtures, protocol-layer
   // deletes, standing internal rows (see the battery header).
   "packages-distro": { title: "packages distro tail (M7: rpm hand-built fixture → .repo configs + repomd.xml + primary.xml.gz + the group-less repository.key → delete → repodata gone, arch .PKGINFO package → packages.db tar (files+desc, 0o777) + the symlink-dance aliases + .sig → delete → index 404 empty, then the D1 husk row sweep + repo delete)", context: packagesDistroContext, steps: packagesDistroSteps, failureTail: packagesDistroFailureCleanup, independent: true },
+  // Independent (the distro posture — the four protocol families are all
+  // OWNER-scoped, so the arms do not chain; each self-contains its family):
+  // go (module zip → the goproxy read shapes + the real `go mod download`
+  // client), cargo (.crate container → the sparse index + config.json + the
+  // real `cargo fetch` client through the h2c-stripping proxy on plain-HTTP),
+  // swift (login pair → multipart PUT → enumerate/metadata/zip/manifest/
+  // identifiers), rubygems (.gem → compact index/specs marshal/download/
+  // gemspec.rz → the yank), then the D1 husk row sweep + repo delete. The
+  // REAL-CLIENT arms degrade to a documented [warn] when the toolchain is off
+  // the probe host.
+  "packages-protocols": { title: "packages protocol long tail (SPEC-0016 §7: go module zip → list/@latest/.info/.mod/.zip + sumdb 404 + missing-module 404s (+ real `go mod download`), cargo .crate container → {ok} shapes + config.json + sparse index + yank/unyank + download (+ real `cargo fetch`), swift login pair → multipart PUT → enumerate + Link → metadata + Digest zip → manifest 200/303 → identifiers, rubygems .gem → compact index → specs marshal → byte-parity download → gemspec.rz → yank, then the D1 husk row sweep + repo delete)", context: packagesProtocolsContext, steps: packagesProtocolsSteps, failureTail: packagesProtocolsFailureCleanup, independent: true },
   // Independent counts — one red count never hides the rest of the shape.
   "cleanup-audit": { title: "post-run D1 count shapes", context: () => ({}), steps: auditSteps, independent: true },
 };
 
-const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "cleanup-audit"] : [opts.battery];
+const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "packages-protocols", "cleanup-audit"] : [opts.battery];
 
 // ---------- dry-run ----------
 
