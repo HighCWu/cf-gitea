@@ -78,9 +78,14 @@
  *   the page was absent (the §2.4.1 dead-link rule won then) — the milestone
  *   detail page landed ui-parity-5 (ca4eb58) and the link went live with it.
  *   Label badges link into the LIVE list filters (`/{issues|pulls}?labels=
- *   {id}` — wave-2 QueryBuild parity). The sidebar's edit dropdowns (label/
- *   milestone pickers) are write actions — not rendered (§2.5); the section
- *   headings stay.
+ *   {id}` — wave-2 QueryBuild parity). The sidebar's edit dropdowns were
+ *   write actions — not rendered (§2.5) until census gap #1 (this window):
+ *   the label form landed at wave 5 and the milestone/project/assignee
+ *   selects + the header buttons (watch, deadline, pin, lock) land as the
+ *   no-JS reductions posting to pages/issue-sidebar-writes.ts's routes (the
+ *   routes themselves mount at the orchestrator's fold — that module's
+ *   header carries the exact recipe; the sidebar renders regardless, since
+ *   the controls' posture is writer/admin-gated by resolveIssueDetailAccess).
  * - Avatar images are not rendered (no avatar route exists; an `<img>` to a
  *   missing route is a dead link) — the timeline items keep the upstream
  *   content structure without the `.timeline-avatar` slots.
@@ -147,7 +152,7 @@
  * degrades to the plain no-content variant (markdown never breaks the page).
  */
 
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { renderMarkdownToHtml } from "../../api/services/markdown";
@@ -156,16 +161,22 @@ import {
   findIssueByRepoAndIndex,
   hasWorkInProgressPrefix,
   issueLabelRows,
+  listIssueAssignees,
   listIssueTimeline,
 } from "../../api/services/issues";
+import { checkIssueSubscription } from "../../api/services/issue-extras";
+import { listProjects, repoProjectScope, type ProjectRow } from "../../api/services/projects";
+import type { UserRow } from "../../api/services/repository";
 import { collaboratorModeOf } from "../../api/services/repo-collaborators";
 import { findPullRequestByIndex } from "../../api/services/pulls";
-import { milestones, users } from "../../db/schema";
+import { getRepoAssignees } from "../../services/mentions/repo-assignees";
+import { issuePins, issues as issuesTable, milestones, projectIssues, projects, users } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import { IssuesService } from "../../issues/service";
 import { IssueAlreadyChangedError, IssueError } from "../../issues/errors";
 import { setIssueReadBy } from "../../services/mentions/carrier";
 import type { CommentRow, IssueRow, LabelRow, MilestoneRow, PullRequestRow } from "../../issues/service";
+import { canWriteRepo } from "./file-editor";
 import { loadPullMergeBoxData, PullMergeBoxFragment, type PullMergeBoxData } from "./pull-merge-box";
 import { TimeSince } from "../components/file-list";
 import { userLink } from "../links";
@@ -220,7 +231,44 @@ export const issueDetailLocale = {
   tab_files: "Files Changed",
   save: "Save", // "repo.issues.save" (the no-JS label form's submit)
   comment_placeholder: "", // "repo.diff.comment.placeholder" left empty: the plain-textarea reduction (new-issue pattern)
+  // Census gap #1 (the sidebar combo writes + header buttons — the upstream
+  // locale strings verbatim; the POST routes live in pages/
+  // issue-sidebar-writes.ts, the mount recipe is that module's header).
+  projects: "Projects", // "repo.issues.new.projects"
+  no_projects: "No projects", // "repo.issues.new.no_projects"
+  open_projects: "Open Projects", // "repo.issues.new.open_projects"
+  closed_projects: "Closed Projects", // "repo.issues.new.closed_projects"
+  open_milestones: "Open", // "repo.issues.filter_milestone_open" (the select's optgroup label)
+  closed_milestones: "Closed", // "repo.issues.filter_milestone_closed"
+  assignees: "Assignees", // "repo.issues.new.assignees"
+  no_assignees: "No Assignees", // "repo.issues.new.no_assignees"
+  notifications: "Notifications", // "notification.notifications"
+  subscribe: "Subscribe", // "repo.issues.subscribe"
+  unsubscribe: "Unsubscribe", // "repo.issues.unsubscribe"
+  due_date: "Due Date", // "repo.issues.due_date"
+  due_date_not_set: "No due date set.", // "repo.issues.due_date_not_set"
+  due_date_form: "yyyy-mm-dd", // "repo.issues.due_date_form"
+  due_date_edit: "Edit", // "repo.issues.due_date_form_edit" (the submit button's label)
+  due_date_remove: "Remove", // "repo.issues.due_date_form_remove" (the empty submit's label)
+  due_date_overdue: "Overdue", // "repo.issues.due_date_overdue" (the tooltip text; renders as the red class's title)
+  pin: "Pin", // "pin"
+  unpin: "Unpin", // "unpin"
+  lock: "Lock conversation", // "repo.issues.lock"
+  unlock: "Unlock conversation", // "repo.issues.unlock"
+  lock_reason: "Reason for locking", // "repo.issues.lock.reason"
+  lock_confirm: "Lock", // "repo.issues.lock_confirm"
+  unlock_confirm: "Unlock", // "repo.issues.unlock_confirm"
 } as const;
+
+/** `setting.Repository.Issue.MaxPinned` default (modules/setting/repository.go:223
+ *  — the upstream cap the pin button's enabled arm and the write seam both
+ *  enforce; the write seam is pages/issue-sidebar-writes.ts, which imports
+ *  THIS constant — the render→write import direction keeps the pair acyclic). */
+export const ISSUE_DETAIL_MAX_PINNED = 3;
+
+/** The lock-reason dropdown's choices — upstream's default
+ *  `setting.Repository.Issue.LockReasons` (modules/setting/repository.go:222). */
+export const ISSUE_LOCK_REASONS: readonly string[] = ["Too heated", "Off-topic", "Spam", "Resolved"];
 
 /** Timeline cap (upstream renders the full timeline unpaginated; the cap
  *  bounds the render for pathological threads without changing the order). */
@@ -248,6 +296,12 @@ export interface IssueDetailData {
   mergeBox: PullMergeBoxData | null;
   labels: LabelRow[];
   milestone: MilestoneRow | null;
+  /** Census gap #1: the sidebar's assignee/project DISPLAY lists — upstream
+   *  renders both for every reader (retrieveAssigneesData +
+   *  retrieveProjectCardsForExistingIssue run unconditionally in
+   *  issue_page_meta.go), so they load outside the writer gates. */
+  assignees: UserRow[];
+  projects: ProjectRow[];
   /** Display-cased poster username; `null` = no user row (mirrored imports). */
   posterName: string | null;
   mergerName: string | null;
@@ -284,6 +338,15 @@ export function renderIssueMarkdown(input: { text: string; repo: RepoRow; origin
 
 function unixSeconds(date: Date): number {
   return Math.floor(date.getTime() / 1000);
+}
+
+/** The milestones page's formatDueDate twin (pages/milestones.tsx:194 — the
+ *  sibling-owned module this render deliberately does NOT import; the UTC
+ *  "Jan 2, 2006" shape the sidebar's due-date line and upstream's
+ *  DateUtils render share). */
+function formatDueDate(date: Date): string {
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return `${months[date.getUTCMonth()]} ${date.getUTCDate()}, ${date.getUTCFullYear()}`;
 }
 
 /**
@@ -341,7 +404,7 @@ export async function loadIssueDetailData(
       ? await loadPullMergeBoxData(d1, { repo, issue, pr, viewer, origin })
       : null;
 
-  const [labels, timelineRows, milestoneRow] = await Promise.all([
+  const [labels, timelineRows, milestoneRow, assigneeRows, projectRows] = await Promise.all([
     issueLabelRows(d1, issue.id),
     listIssueTimeline(d1, issue.id, null, null, 1, TIMELINE_LIMIT),
     issue.milestoneId === null
@@ -352,6 +415,15 @@ export async function loadIssueDetailData(
           .where(eq(milestones.id, issue.milestoneId))
           .limit(1)
           .then((rows) => rows[0] ?? null),
+    // The sidebar display lists (the census-gap-#1 note on IssueDetailData).
+    listIssueAssignees(d1, issue.id),
+    drizzle(d1)
+      .select({ project: projects })
+      .from(projectIssues)
+      .innerJoin(projects, eq(projects.id, projectIssues.projectId))
+      .where(eq(projectIssues.issueId, issue.id))
+      .all()
+      .then((rows) => rows.map((row) => row.project)),
   ]);
 
   // One batched name lookup for every person the render mentions (§3.2's
@@ -399,6 +471,8 @@ export async function loadIssueDetailData(
     reviews,
     labels,
     milestone: milestoneRow,
+    assignees: assigneeRows,
+    projects: projectRows,
     posterName: nameOf(issue.posterId),
     mergerName: pr !== null && pr.hasMerged ? nameOf(pr.mergerId ?? null) : null,
     bodyHtml: renderIssueMarkdown({ text: issue.content ?? "", repo, origin }),
@@ -447,13 +521,47 @@ export interface IssueDetailAccess {
    *  (issue_page_meta.go:477-478 — `canAdminRepo`, the settings predicate,
    *  stands in for `ctx.Repo.Permission.IsAdmin()`). */
   canDismissReviews: boolean;
+  /** Census gap #1: upstream `CanModifyIssueOrPull` (issue_page_meta.go:117
+   *  — CanWriteIssuesOrPulls && !archived) over the SAME predicate the
+   *  write seams enforce (`canWriteRepo`, the repo-grants.ts bridge rule);
+   *  gates the milestone/project/assignee selects + the deadline form. */
+  canModifyIssueOrPull: boolean;
+  /** Census gap #1: the issue_management block's gate (sidebar/
+   *  issue_management.tmpl's `and .IsRepoAdmin (not .Repository.IsArchived)`
+   *  — `canAdminRepo` is the IsRepoAdmin stand-in). */
+  canManageIssue: boolean;
+  /** Census gap #1: the pin button's state (issue_view.go:645-659) —
+   *  `pinned` (the issue_pins row exists) and `canAddPin` (upstream
+   *  NewPinAllowed = IsNewPinAllowed: the type-half count sits under
+   *  ISSUE_DETAIL_MAX_PINNED); `null` = not an admin (the block never
+   *  renders, the reads stay unloaded). */
+  pin: { pinned: boolean; canAddPin: boolean } | null;
+  /** Census gap #1: the signed viewer's CheckIssueWatch state
+   *  (issue_view.go:573-584 → the landed checkIssueSubscription); `null` =
+   *  anonymous (the subscribe button never renders). */
+  watching: boolean | null;
+  /** Census gap #1: the milestone select's options — open + closed, the
+   *  upstream retrieveMilestonesDataForIssueWriter grouping; `null` = not
+   *  a writer (canModifyIssueOrPull false — the upstream gate that wraps
+   *  the retrieval). */
+  milestoneOptions: { open: MilestoneRow[]; closed: MilestoneRow[] } | null;
+  /** Census gap #1: the project select's options — the repo-scope + owner-
+   *  scope lists (retrieveProjectsInternal's two arms), open + closed;
+   *  `null` = not a writer. */
+  projectOptions: { open: ProjectRow[]; closed: ProjectRow[] } | null;
+  /** Census gap #1: the assignee select's candidates — GetRepoAssignees
+   *  (retrieveAssigneesData's enumeration); `null` = not a writer. */
+  assigneeOptions: UserRow[] | null;
 }
 
 /** Resolve both grants in one place (the settings gate's order: anonymous
  *  viewers never qualify). The admin arm rides the landed `isRepositoryAdmin`
  *  through `canAdminRepo` (../repo-grants.ts's bridge) — it needs the full
  *  `Env` the service predicates read; the issue-unit arms keep their D1-only
- *  collaborator/poster reads. */
+ *  collaborator/poster reads. Census gap #1 extends the same resolver with
+ *  the sidebar writes' grants + their option lists (the writer/admin-gated
+ *  reads stay inside this one seam so the GET page and every failure
+ *  re-render carry identical data). */
 export async function resolveIssueDetailAccess(
   env: Env,
   repo: RepoRow,
@@ -461,7 +569,19 @@ export async function resolveIssueDetailAccess(
   issue: IssueRow,
 ): Promise<IssueDetailAccess> {
   if (viewer.kind === "anonymous") {
-    return { canChangeState: false, labelOptions: null, canChangeReviewRequests: false, canDismissReviews: false };
+    return {
+      canChangeState: false,
+      labelOptions: null,
+      canChangeReviewRequests: false,
+      canDismissReviews: false,
+      canModifyIssueOrPull: false,
+      canManageIssue: false,
+      pin: null,
+      watching: null,
+      milestoneOptions: null,
+      projectOptions: null,
+      assigneeOptions: null,
+    };
   }
   const d1 = env.DB;
   const isOwner = repo.ownerNamespace.toLowerCase() === viewer.username.toLowerCase();
@@ -471,13 +591,103 @@ export async function resolveIssueDetailAccess(
   const canChangeState =
     viewer.isAdmin || isOwner || issue.posterId === viewer.id || collabMode === "write" || collabMode === "admin";
   const admin = await canAdminRepo(env, repo, viewer);
-  const labelOptions = admin ? (await listRepoLabels(d1, repo.id, "", 1, ISSUE_DETAIL_PICKER_LIMIT)).items : null;
-  // Wave-11: the request predicate (pull-reviews.ts:388-396) — poster /
-  // site admin / repo owner / collaborator, never on an archived repo.
-  const canChangeReviewRequests =
-    !repo.isArchived &&
-    (viewer.isAdmin || isOwner || issue.posterId === viewer.id || collabMode !== "none");
-  return { canChangeState, labelOptions, canChangeReviewRequests, canDismissReviews: admin };
+  // Census gap #1: the writer grant rides the SAME predicate the write
+  // seams enforce (canWriteRepo → canWriteRepository, the repo-grants.ts
+  // rule) — the local owner/collab arms here would drop the §3.5 team arm.
+  const [writer, labelOptions, pinRow] = await Promise.all([
+    repo.isArchived ? Promise.resolve(false) : canWriteRepo(env, repo, viewer),
+    admin ? listRepoLabels(d1, repo.id, "", 1, ISSUE_DETAIL_PICKER_LIMIT).then((page) => page.items) : Promise.resolve(null),
+    admin
+      ? drizzle(d1)
+          .select({ pinOrder: issuePins.pinOrder })
+          .from(issuePins)
+          .where(eq(issuePins.issueId, issue.id))
+          .limit(1)
+          .get()
+      : Promise.resolve(undefined),
+  ]);
+  const labelOptionsValue = labelOptions;
+  // The option lists + assignee candidates load for writers only (upstream's
+  // retrieve*ForIssueWriter gate); the pin STATE row loads for admins only
+  // (the issue_management block is admin-gated — anonymous and plain readers
+  // never see it, so the reads stay unloaded).
+  const canModifyIssueOrPull = writer;
+  const canManageIssue = admin && !repo.isArchived;
+  const ownerProjectScope =
+    canModifyIssueOrPull && repo.ownerId !== null
+      ? await drizzle(d1)
+          .select({ type: users.type })
+          .from(users)
+          .where(eq(users.id, repo.ownerId))
+          .limit(1)
+          .get()
+      : undefined;
+  const [openMilestones, closedMilestones, openProjects, closedProjects, ownerProjects, assigneeCandidates, currentAssignees, watching] =
+    await Promise.all([
+      canModifyIssueOrPull ? new IssuesService(d1).listMilestones(repo.id, "open") : Promise.resolve([]),
+      canModifyIssueOrPull ? new IssuesService(d1).listMilestones(repo.id, "closed") : Promise.resolve([]),
+      canModifyIssueOrPull ? listProjects(d1, repoProjectScope(repo.id), false, 1, ISSUE_DETAIL_PICKER_LIMIT).then((page) => page.items) : Promise.resolve([]),
+      canModifyIssueOrPull ? listProjects(d1, repoProjectScope(repo.id), true, 1, ISSUE_DETAIL_PICKER_LIMIT).then((page) => page.items) : Promise.resolve([]),
+      // retrieveProjectsInternal's owner arm: the owning user/org's own
+      // projects (the scope kind follows the owner row's type).
+      ownerProjectScope !== undefined && ownerProjectScope !== null
+        ? listProjects(
+            d1,
+            { kind: ownerProjectScope.type === "org" ? "organization" : "individual", repoId: null, ownerId: repo.ownerId },
+            false,
+            1,
+            ISSUE_DETAIL_PICKER_LIMIT,
+          ).then((page) => page.items)
+        : Promise.resolve([]),
+      canModifyIssueOrPull ? getRepoAssignees(d1, { id: repo.id, ownerId: repo.ownerId }) : Promise.resolve([]),
+      // The CURRENT assignees join the candidate set: upstream's combo value
+      // is SelectedAssigneeIDs (every current assignee, candidate or not —
+      // issue_page_meta.go:253-260), so an out-of-band assignee must stay
+      // represented in the picker or a resubmit would silently detach them
+      // (the diff's baseline is the full set, not the candidates).
+      canModifyIssueOrPull ? listIssueAssignees(d1, issue.id) : Promise.resolve([]),
+      checkIssueSubscription(d1, viewer.id, issue),
+    ]);
+  const assigneeOptions: UserRow[] = [...assigneeCandidates];
+  for (const current of currentAssignees) {
+    if (!assigneeOptions.some((candidate) => candidate.id === current.id)) {
+      assigneeOptions.push(current);
+    }
+  }
+  return {
+    canChangeState,
+    labelOptions: labelOptionsValue,
+    canChangeReviewRequests:
+      !repo.isArchived &&
+      (viewer.isAdmin || isOwner || issue.posterId === viewer.id || collabMode !== "none"),
+    canDismissReviews: admin,
+    canModifyIssueOrPull,
+    canManageIssue,
+    pin:
+      admin && !repo.isArchived
+        ? {
+            pinned: pinRow !== undefined,
+            canAddPin:
+              pinRow !== undefined ? true : (await countTypePins(d1, repo.id, issue.isPull)) < ISSUE_DETAIL_MAX_PINNED,
+          }
+        : null,
+    watching,
+    milestoneOptions: canModifyIssueOrPull ? { open: openMilestones, closed: closedMilestones } : null,
+    projectOptions: canModifyIssueOrPull ? { open: [...openProjects, ...ownerProjects], closed: closedProjects } : null,
+    assigneeOptions: canModifyIssueOrPull ? assigneeOptions : null,
+  };
+}
+
+/** getPinnedIssuesNum's port (issue_pin.go:119-127 — the type-half count the
+ *  NewPinAllowed arm reads; the write seam re-ports the max sibling). */
+async function countTypePins(d1: D1Database, repoId: string, isPull: boolean): Promise<number> {
+  const rows = await drizzle(d1)
+    .select({ pinOrder: issuePins.pinOrder })
+    .from(issuePins)
+    .innerJoin(issuesTable, eq(issuesTable.id, issuePins.issueId))
+    .where(and(eq(issuePins.repoId, repoId), eq(issuesTable.isPull, isPull)))
+    .all();
+  return rows.length;
 }
 
 /** The parsed `application/x-www-form-urlencoded` comment POST (`content`
@@ -933,21 +1143,37 @@ function TimelineEvent(props: { data: IssueDetailData; entry: Extract<TimelineEn
   );
 }
 
-/** The reduced sidebar (`view_content/sidebar.tmpl`): PRs lead with the
- *  wave-11 Reviewers section (sidebar.tmpl:5-9 mounts reviewer_list first
- *  for is_pull rows), then the labels list (badges linking into the live
- *  list filters) and the milestone (upstream's `/milestone/{id}` link —
- *  w129 batch-14: the detail page landed at ca4eb58, so the name anchors it
- *  like milestone_list.tmpl:49; plain text before that). Wave 5: an admin
- *  viewer gets the no-JS label edit form above the badge list (the
- *  two-control reduction of sidebar/label_list.tmpl's JS dropdown — the
- *  upstream `issue_ids`/`label_ids` field names); everyone sees the badges
- *  re-rendered with ContrastColor as before. */
+/** The sidebar (`view_content/sidebar.tmpl`): PRs lead with the wave-11
+ *  Reviewers section (sidebar.tmpl:5-9 mounts reviewer_list first for
+ *  is_pull rows), then the labels list (badges linking into the live list
+ *  filters) and the milestone (upstream's `/milestone/{id}` link — w129
+ *  batch-14: the detail page landed at ca4eb58, so the name anchors it like
+ *  milestone_list.tmpl:49). Wave 5: an admin viewer gets the no-JS label
+ *  edit form above the badge list. Census gap #1: the sidebar combo writes
+ *  + header buttons — the milestone select, the project select, the
+ *  assignee select (the no-JS checkbox/select reductions of
+ *  sidebar/{milestone_list,project_list,assignee_list}.tmpl's JS dropdowns,
+ *  posting the upstream `issue_ids` + `id` field shapes to the routes
+ *  pages/issue-sidebar-writes.ts serves), the Notifications subscribe
+ *  toggle (sidebar/watch_notification.tmpl's button — the eye pair stands
+ *  in for the ungenerated mute/unmute octicons), the Due Date section
+ *  (sidebar/due_date.tmpl — the remove affordance reduces to the empty
+ *  submit: upstream's `required` input is dropped so a no-JS clear exists)
+ *  and the issue_management pin/lock forms (sidebar/issue_management.tmpl —
+ *  the lock dialog reduces to the inline reason form; the delete button is
+ *  the later parts' surface). Everyone sees the display lists; Participants
+ *  (participant_list), the stopwatch/timetracker, the dependencies, the
+ *  reference link and the wip/allow-maintainer-edit switches stay
+ *  unrendered (the later parts' surface — the §2.4.1 rule keeps them off
+ *  rather than approximated). */
 function IssueSidebar(props: {
   repoLink: string;
   data: IssueDetailData;
   /** The resolved repo row (the Reviewers section's archived gate). */
   repo: RepoRow;
+  /** The projects unit toggle (ctx.repoHasProjects — the
+   *  `{{if .IsProjectsEnabled}}` gate around project_list). */
+  hasProjects: boolean;
   /** Repo labels for the edit form; `null` = display-only (non-admin). */
   labelOptions: LabelRow[] | null;
   /** Wave-11 grants (the Reviewers section's control + dismiss forms). */
@@ -956,10 +1182,15 @@ function IssueSidebar(props: {
   canDismissReviews: boolean;
   /** The re-rendered request-review failure (null = pristine GET). */
   reviewersError: string | null;
+  /** Census gap #1: the sidebar-write grants + option lists. */
+  access: IssueDetailAccess;
 }) {
   const { labels, milestone, issue, pr } = props.data;
+  const { access } = props;
   const listBase = `${props.repoLink}/${issue.isPull ? "pulls" : "issues"}`;
+  const canonicalPath = `${props.repoLink}/${issue.isPull ? "pulls" : "issues"}/${issue.index}`;
   const selectedIds = new Set(labels.map((label) => label.id));
+  const nowMs = Date.now();
   return (
     <div class="issue-content-right ui segment">
       {issue.isPull ? (
@@ -1028,6 +1259,40 @@ function IssueSidebar(props: {
         <div class="fixed-text muted">
           <strong>{issueDetailLocale.milestone}</strong>
         </div>
+        {/* milestone_list.tmpl's JS dropdown reduced to the native select —
+            the same single-`id` field the upstream combolist posts (the
+            clear selection is the empty value). */}
+        {access.milestoneOptions !== null ? (
+          <form class="ui form" action={`${props.repoLink}/issues/milestone`} method="post">
+            <input type="hidden" name="issue_ids" value={String(issue.id)} />
+            <div class="field flex-text-block">
+              <select name="id" class="ui selection dropdown" aria-label={issueDetailLocale.milestone}>
+                <option value="">{issueDetailLocale.no_milestone}</option>
+                {access.milestoneOptions.open.length > 0 ? (
+                  <optgroup label={issueDetailLocale.open_milestones}>
+                    {access.milestoneOptions.open.map((option) => (
+                      <option value={String(option.id)} selected={issue.milestoneId === option.id}>
+                        {option.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                ) : null}
+                {access.milestoneOptions.closed.length > 0 ? (
+                  <optgroup label={issueDetailLocale.closed_milestones}>
+                    {access.milestoneOptions.closed.map((option) => (
+                      <option value={String(option.id)} selected={issue.milestoneId === option.id}>
+                        {option.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                ) : null}
+              </select>
+              <button type="submit" class="ui tiny primary button">
+                {issueDetailLocale.save}
+              </button>
+            </div>
+          </form>
+        ) : null}
         <div class="ui list muted-links flex-items-block">
           {milestone === null ? (
             <span class="item empty-list">{issueDetailLocale.no_milestone}</span>
@@ -1042,8 +1307,242 @@ function IssueSidebar(props: {
           )}
         </div>
       </div>
+      {props.hasProjects ? (
+        <>
+          <div class="divider" />
+          {/* project_list.tmpl — the repo/owner project picker reduced to
+              the checkbox group (upstream's multi-select "all" algo posts
+              the comma-joined `id` set; the checkboxes post the same ids as
+              separate values, both parse). The display list anchors the
+              live board pages (repo-scope `/{owner}/{repo}/projects/{id}`,
+              owner-scope `/{owner}/-/projects/{id}`). */}
+          <div class="issue-sidebar-combo sidebar-project-combo" data-selection-mode="multiple" data-update-algo="all">
+            <div class="fixed-text muted">
+              <strong>{issueDetailLocale.projects}</strong>
+            </div>
+            {access.projectOptions !== null ? (
+              <form class="ui form" action={`${props.repoLink}/issues/projects`} method="post">
+                <input type="hidden" name="issue_ids" value={String(issue.id)} />
+                {access.projectOptions.open.length === 0 && access.projectOptions.closed.length === 0 ? (
+                  <span class="item empty-list">{issueDetailLocale.no_projects}</span>
+                ) : (
+                  <div class="ui list labels-list">
+                    {access.projectOptions.open.length > 0 ? (
+                      <div class="header">{issueDetailLocale.open_projects}</div>
+                    ) : null}
+                    {access.projectOptions.open.map((project) => (
+                      <ProjectCheckbox key={project.id} project={project} checked={props.data.projects.some((p) => p.id === project.id)} />
+                    ))}
+                    {access.projectOptions.closed.length > 0 ? (
+                      <div class="header">{issueDetailLocale.closed_projects}</div>
+                    ) : null}
+                    {access.projectOptions.closed.map((project) => (
+                      <ProjectCheckbox key={project.id} project={project} checked={props.data.projects.some((p) => p.id === project.id)} />
+                    ))}
+                  </div>
+                )}
+                <div class="field">
+                  <button type="submit" class="ui tiny primary button">
+                    {issueDetailLocale.save}
+                  </button>
+                </div>
+              </form>
+            ) : null}
+            <div class="ui list muted-links flex-items-block">
+              {props.data.projects.length === 0 ? (
+                <span class="item empty-list">{issueDetailLocale.no_projects}</span>
+              ) : (
+                props.data.projects.map((project) => (
+                  <a class="item" href={projectBoardLink(props.repo, project)}>
+                    <Icon name="octicon-project" size={16} class="tw-shrink-0" />
+                    <span class="tw-flex-1 gt-ellipsis">{project.title}</span>
+                  </a>
+                ))
+              )}
+            </div>
+          </div>
+        </>
+      ) : null}
+      <div class="divider" />
+      {/* assignee_list.tmpl — the candidate picker reduced to the checkbox
+          group (upstream's multi-select "diff" algo posts per-item
+          attach/detach toggles; the checkbox set diffs server-side — the
+          labels-form reduction). The display list is upstream's (avatars
+          stay unrendered — no avatar route). */}
+      <div class="issue-sidebar-combo" data-selection-mode="multiple" data-update-algo="diff">
+        <div class="fixed-text muted">
+          <strong>{issueDetailLocale.assignees}</strong>
+        </div>
+        {access.assigneeOptions !== null ? (
+          <form class="ui form" action={`${props.repoLink}/issues/assignee`} method="post">
+            <input type="hidden" name="issue_ids" value={String(issue.id)} />
+            {access.assigneeOptions.length === 0 ? (
+              <span class="item empty-list">{issueDetailLocale.no_assignees}</span>
+            ) : (
+              <div class="ui list labels-list">
+                {access.assigneeOptions.map((user) => {
+                  const id = `issue-assignee-${user.id}`;
+                  return (
+                    <div class="item">
+                      <div class="ui checkbox">
+                        <input
+                          id={id}
+                          name="id"
+                          type="checkbox"
+                          value={String(user.id)}
+                          checked={props.data.assignees.some((assignee) => assignee.id === user.id)}
+                        />
+                        <label for={id}>{user.username}</label>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <div class="field">
+              <button type="submit" class="ui tiny primary button">
+                {issueDetailLocale.save}
+              </button>
+            </div>
+          </form>
+        ) : null}
+        <div class="ui relaxed list muted-links flex-items-block">
+          {props.data.assignees.length === 0 ? (
+            <span class="item empty-list">{issueDetailLocale.no_assignees}</span>
+          ) : (
+            props.data.assignees.map((assignee) => (
+              <span class="item flex-text-inline">
+                <a class="muted flex-text-inline" href={userLink(assignee.username)}>
+                  {assignee.username}
+                </a>
+              </span>
+            ))
+          )}
+        </div>
+      </div>
+      {/* watch_notification.tmpl — the subscribe toggle, signed-in viewers
+          on a live repo (upstream renders the block for every viewer but
+          the write would nil-deref anonymous there; the session gate is the
+          landed posture). The eye pair stands in for the ungenerated
+          octicon-mute/unmute (the icon-allowlist degrade rule). */}
+      {props.viewer.kind === "user" && !props.repo.isArchived ? (
+        <>
+          <div class="divider" />
+          <div class="ui watching">
+            <span class="text">
+              <strong>{issueDetailLocale.notifications}</strong>
+            </span>
+            <div class="tw-mt-2">
+              <form method="post" action={`${canonicalPath}/watch?watch=${access.watching ? "false" : "true"}`}>
+                <button class="fluid ui button" type="submit">
+                  <Icon name={access.watching ? "octicon-eye-closed" : "octicon-eye"} size={16} />{" "}
+                  {access.watching ? issueDetailLocale.unsubscribe : issueDetailLocale.subscribe}
+                </button>
+              </form>
+            </div>
+          </div>
+        </>
+      ) : null}
+      {/* due_date.tmpl — the display for everyone, the edit form for
+          writers. The remove affordance reduces to the EMPTY submit (the
+          upstream `required` attribute is dropped so a no-JS clear exists —
+          the parser treats empty/unparseable as the remove arm, exactly
+          upstream's ignored-parse-error posture). */}
+      <div class="divider" />
+      <span class="text">
+        <strong>{issueDetailLocale.due_date}</strong>
+      </span>
+      <div class="ui form tw-mt-2">
+        {issue.deadlineAt !== null ? (
+          <div class="flex-left-right">
+            <div
+              class={`due-date ${issue.deadlineAt.getTime() < nowMs ? "tw-text-red" : ""}`}
+              title={issue.deadlineAt.getTime() < nowMs ? issueDetailLocale.due_date_overdue : undefined}
+            >
+              <Icon name="octicon-calendar" size={16} /> {formatDueDate(issue.deadlineAt)}
+            </div>
+          </div>
+        ) : (
+          <div>{issueDetailLocale.due_date_not_set}</div>
+        )}
+        {access.canModifyIssueOrPull ? (
+          <form class="ui fluid action input issue-due-form tw-mt-2" method="post" action={`${canonicalPath}/deadline`}>
+            <input type="date" name="deadline" placeholder={issueDetailLocale.due_date_form} value={isoDueDate(issue.deadlineAt)} aria-label={issueDetailLocale.due_date} />
+            <button
+              type="submit"
+              class="ui icon button"
+              aria-label={issue.deadlineAt !== null ? issueDetailLocale.due_date_edit : issueDetailLocale.due_date_form}
+            >
+              <Icon name={issue.deadlineAt !== null ? "octicon-pencil" : "octicon-plus"} size={14} />
+            </button>
+          </form>
+        ) : null}
+      </div>
+      {/* issue_management.tmpl — the pin toggle + the lock/unlock form for
+          repo admins on a live repo (the delete button is the later parts'
+          surface). The lock modal reduces to the inline reason form; the
+          key/lock octicons stand in as the single shield-lock glyph (the
+          allowlist degrade). */}
+      {access.canManageIssue && access.pin !== null ? (
+        <>
+          <div class="divider" />
+          <form class="tw-mt-1 single-button-form" method="post" action={`${canonicalPath}/pin`}>
+            <button type="submit" class="fluid ui button" disabled={!access.pin.canAddPin && !access.pin.pinned}>
+              <Icon name="octicon-pin" size={16} /> {access.pin.pinned ? issueDetailLocale.unpin : issueDetailLocale.pin}
+            </button>
+          </form>
+          <form class="ui form tw-mt-1" method="post" action={`${canonicalPath}/${issue.isLocked ? "unlock" : "lock"}`}>
+            {!issue.isLocked ? (
+              <div class="field">
+                <label for="issue-lock-reason">{issueDetailLocale.lock_reason}</label>
+                <select id="issue-lock-reason" name="reason" class="ui selection dropdown">
+                  <option value="" />
+                  {ISSUE_LOCK_REASONS.map((reason) => (
+                    <option value={reason}>{reason}</option>
+                  ))}
+                </select>
+              </div>
+            ) : null}
+            <button type="submit" class={`ui ${issue.isLocked ? "" : "red"} button`}>
+              {issue.isLocked ? issueDetailLocale.unlock_confirm : issueDetailLocale.lock_confirm}
+            </button>
+          </form>
+        </>
+      ) : null}
     </div>
   );
+}
+
+/** One project checkbox of the picker form (the label-form's checkbox
+ *  anatomy — id + wrapping label so the click target is the row). */
+function ProjectCheckbox(props: { project: ProjectRow; checked: boolean }) {
+  const id = `issue-project-${props.project.id}`;
+  return (
+    <div class="item">
+      <div class="ui checkbox">
+        <input id={id} name="id" type="checkbox" value={String(props.project.id)} checked={props.checked} />
+        <label for={id}>{props.project.title}</label>
+      </div>
+    </div>
+  );
+}
+
+/** The live board page for a project row: repo-scope
+ *  `/{owner}/{repo}/projects/{id}` (pages/repo-projects.tsx), owner-scope
+ *  `/{owner}/-/projects/{id}` (pages/owner-project-board.tsx). */
+function projectBoardLink(repo: RepoRow, project: ProjectRow): string {
+  if (project.repoId !== "") return `/${repo.ownerNamespace}/${repo.slug}/projects/${project.id}`;
+  return `/${repo.ownerNamespace}/-/projects/${project.id}`;
+}
+
+/** yyyy-mm-dd for the date input's pre-filled value (UTC — the parser's
+ *  zone rule). */
+function isoDueDate(deadline: Date | null): string | undefined {
+  if (deadline === null) return undefined;
+  const year = String(deadline.getUTCFullYear()).padStart(4, "0");
+  const month = String(deadline.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(deadline.getUTCDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 /** The signed-in comment form (`view_content.tmpl:71-136` reduced: no
@@ -1162,7 +1661,21 @@ export function renderIssueDetailPage(
     <IssueDetailPage
       ctx={ctx}
       data={data}
-      access={access ?? { canChangeState: false, labelOptions: null, canChangeReviewRequests: false, canDismissReviews: false }}
+      access={
+        access ?? {
+          canChangeState: false,
+          labelOptions: null,
+          canChangeReviewRequests: false,
+          canDismissReviews: false,
+          canModifyIssueOrPull: false,
+          canManageIssue: false,
+          pin: null,
+          watching: null,
+          milestoneOptions: null,
+          projectOptions: null,
+          assigneeOptions: null,
+        }
+      }
       form={form ?? { content: "", error: null }}
       reviewForm={reviewForm ?? { content: "", error: null }}
       reviewersError={reviewersError ?? null}
@@ -1237,11 +1750,13 @@ export function IssueDetailPage(props: {
             repoLink={repoLink}
             data={data}
             repo={repo}
+            hasProjects={ctx.repoHasProjects === true}
             labelOptions={props.access.labelOptions}
             viewer={ctx.viewer}
             canChangeReviewRequests={props.access.canChangeReviewRequests}
             canDismissReviews={props.access.canDismissReviews}
             reviewersError={props.reviewersError}
+            access={props.access}
           />
         </div>
       </div>

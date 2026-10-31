@@ -112,6 +112,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { createRepoLabel } from "../../api/services/labels";
+import { addIssueToColumn, createProject, mustDefaultColumn, repoProjectScope } from "../../api/services/projects";
 import {
   comments,
   issueAssignees,
@@ -121,11 +122,15 @@ import {
   issues,
   milestones,
   notificationStates,
+  projectIssues,
+  projects,
   pullRequests,
   pullReviews,
   repositories,
   users,
 } from "../../db/schema";
+import { saveRepoSettings } from "../../api/services/repo-settings";
+
 import { CommentType, type CommentTypeValue } from "../../issues/comment-types";
 import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
@@ -258,6 +263,11 @@ async function ensureIssueDetailFixtures(): Promise<IssueDetailFixture> {
   if (archivedRow !== undefined && !archivedRow.isArchived) {
     await db.update(repositories).set({ isArchived: true }).where(eq(repositories.id, archivedRepoId));
   }
+  // Census gap #1 fixture: the lab repo's projects unit is ON (the sidebar's
+  // Projects section renders — repo_settings.has_projects defaults false,
+  // and the archived twin stays default). Converging: the save merges into
+  // the current row.
+  await saveRepoSettings(env.DB, labRepoId, { hasProjects: true }, t(0));
 
   // The D1 issue block (existence-checked as one unit, the wave-2 posture:
   // any issue row in the lab skips the whole seed).
@@ -360,6 +370,10 @@ async function ensureIssueDetailFixtures(): Promise<IssueDetailFixture> {
     });
     await db.update(issues).set({ milestoneId: sidebarMilestone.id }).where(eq(issues.id, closed.id));
     await db.insert(issueAssignees).values({ issueId: openPr.issue.id, assigneeId: bob.id }).onConflictDoNothing();
+    // Census gap #1: a PAST deadline on the closed issue (the due-date
+    // line's overdue red arm; the write path sets end-of-day stamps, the
+    // direct update is the fixture posture).
+    await db.update(issues).set({ deadlineAt: new Date(Date.UTC(2020, 0, 1, 23, 59, 59)) }).where(eq(issues.id, closed.id));
   } else {
     // Rehydrate (the seeded block never mutates after landing except the
     // converging labels diff below): the label id rides the first
@@ -420,6 +434,16 @@ async function ensureIssueDetailFixtures(): Promise<IssueDetailFixture> {
     if (assigneeEdge === undefined) {
       await db.insert(issueAssignees).values({ issueId: open.issueId, assigneeId: bob.id }).onConflictDoNothing();
     }
+    // Census gap #1 convergence: the past deadline (the seed block's direct
+    // update) — only when a rehydrated row has none.
+    const deadlineRow = await db
+      .select({ id: issues.id, deadlineAt: issues.deadlineAt })
+      .from(issues)
+      .where(and(eq(issues.repoId, labRepoId), eq(issues.title, "mx: closed issue")))
+      .get();
+    if (deadlineRow !== undefined && deadlineRow.deadlineAt === null) {
+      await db.update(issues).set({ deadlineAt: new Date(Date.UTC(2020, 0, 1, 23, 59, 59)) }).where(eq(issues.id, deadlineRow.id));
+    }
   }
 
   // The archived twin: one issue + one PR so both nocomment message arms
@@ -436,6 +460,44 @@ async function ensureIssueDetailFixtures(): Promise<IssueDetailFixture> {
       headBranch: "mx-arch",
       now: t(80),
     });
+  }
+
+  // ...and one OPEN repo project for the picker (converging by title),
+  // ATTACHED to the closed issue so the checked arm + the display-list
+  // anchor have data (the landed addIssueToColumn — the same seam the web
+  // write calls, landing the row in the default column).
+  const existingProject = await db
+    .select({ id: projects.id })
+    .from(projects)
+    .where(and(eq(projects.repoId, labRepoId), eq(projects.title, "mx: sidebar project")))
+    .get();
+  let projectId: number;
+  if (existingProject === undefined) {
+    const created = await createProject(env.DB, repoProjectScope(labRepoId), {
+      title: "mx: sidebar project",
+      creatorId: ownerId,
+      now: t(56),
+    });
+    projectId = created.id;
+  } else {
+    projectId = existingProject.id;
+  }
+  const closedIssueForProject = await db
+    .select({ id: issues.id })
+    .from(issues)
+    .where(and(eq(issues.repoId, labRepoId), eq(issues.title, "mx: closed issue")))
+    .get();
+  if (closedIssueForProject === undefined) throw new Error("census-gap-#1 fixture: closed issue missing");
+  const existingMembership = await db
+    .select({ projectId: projectIssues.projectId })
+    .from(projectIssues)
+    .where(and(eq(projectIssues.issueId, closedIssueForProject.id), eq(projectIssues.projectId, projectId)))
+    .get();
+  if (existingMembership === undefined) {
+    const projectRow = await drizzle(env.DB).select().from(projects).where(eq(projects.id, projectId)).get();
+    const issueRow = await drizzle(env.DB).select().from(issues).where(eq(issues.id, closedIssueForProject.id)).get();
+    if (projectRow === undefined || issueRow === undefined) throw new Error("census-gap-#1 fixture: attach rows missing");
+    await addIssueToColumn(env.DB, projectRow, issueRow, await mustDefaultColumn(env.DB, projectRow, t(57)), ownerId, t(57));
   }
 
   issueDetailFixture = {
@@ -768,33 +830,57 @@ describe("the sidebar combo divs (w129 batch-10: the ?div-only edit fragments)",
     expect(html).not.toContain('<span class="item empty-list">No Milestone</span>'); // the empty arm yielded
   });
 
-  it("the assignee/participant/subscribe sections render nothing — even with an assignee row bound (the unlanded seam, reported)", async () => {
-    // Provenance: wave-polish-matrix-10. Upstream's sidebar carries
-    // Assignees + Participants + a Subscribe button (sidebar.tmpl's
-    // assignee_list/participant_list/watch block); this repo lands none of
-    // them — and the arm proves the absence is the RENDER's posture, not
-    // missing data: the fixture above binds a real issue_assignees edge to
-    // the open PR, and the page still renders no assignee section. The
-    // sections (and the subscribe button) are REPORTED unlanded, not built.
+  it("census gap #1 FLIPPED: the assignee display list renders for every reader (the bound assignee shows by name), Participants stays absent, the subscribe button stays anonymous-gated", async () => {
+    // Provenance: wave-polish-matrix-10 pinned the three sections ABSENT
+    // (the unlanded seam, reported). Census gap #1 (this window) landed the
+    // sidebar combo writes + header buttons' RENDER half: the Assignees
+    // combo now renders for every reader (upstream retrieveAssigneesData
+    // runs unconditionally), the bound assignee shows in the display list,
+    // the Due Date section renders its not-set arm, while Participants
+    // (participant_list) and the stopwatch stay unrendered (the later
+    // parts' surface) and the Subscribe button stays signed-in-only (the
+    // anonymous GETs here must stay button-less).
     const fixture = await ensureIssueDetailFixtures();
     for (const path of [
-      `/${OWNER_NAME}/${REPO_SLUG}/pulls/${fixture.wipPrIndex}`, // same repo, live PR render
+      `/${OWNER_NAME}/${REPO_SLUG}/pulls/${fixture.wipPrIndex}`,
       `/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}`,
     ]) {
       const res = await fetchUi(path);
       expect(res.status, path).toBe(200);
       const html = await res.text();
-      expect(html, path).not.toContain("Assignees");
+      expect(html, path).toContain("<strong>Assignees</strong>");
+      expect(html, path).toContain('<span class="item empty-list">No Assignees</span>');
+      expect(html, path).toContain("<strong>Due Date</strong>");
       expect(html, path).not.toContain("Participants");
       expect(html, path).not.toContain(">Subscribe<");
       expect(html, path).not.toContain(">Unsubscribe<");
+      // The write forms stay writer-gated: the anonymous GETs carry no
+      // combo forms at all (milestone select, assignee checkboxes, the
+      // deadline input).
+      expect(html, path).not.toContain('name="issue_ids"');
+      expect(html, path).not.toContain('name="deadline"');
     }
+    // The due-date arms split: the WIP PR (no deadline) renders the not-set
+    // arm; the closed issue (the fixture's past deadline) renders the
+    // overdue red line — both anonymous-visible (upstream renders the
+    // due_date display for every reader).
+    const wipRes = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/pulls/${fixture.wipPrIndex}`);
+    expect(await wipRes.text()).toContain("<div>No due date set.</div>");
+    const closedRes = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}`);
+    const closedHtml = await closedRes.text();
+    expect(closedHtml).toContain('class="due-date tw-text-red"');
+    expect(closedHtml).toContain("Jan 1, 2020");
+    // The open PR carries the fixture's bound assignee edge — the display
+    // list renders the username (the avatar-less posture).
+    const openPrRes = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/pulls/2`);
+    expect(openPrRes.status).toBe(200);
+    const openPrHtml = await openPrRes.text();
+    expect(openPrHtml).toContain(`href="/${BOB_NAME}">${BOB_NAME}</a>`);
     // The bound edge exists (the differential's data half).
-    const prIssueId = fixture.openPrIssueId;
     const edge = await drizzle(env.DB)
       .select({ id: issueAssignees.id })
       .from(issueAssignees)
-      .where(eq(issueAssignees.issueId, prIssueId))
+      .where(eq(issueAssignees.issueId, fixture.openPrIssueId))
       .all();
     expect(edge.length).toBeGreaterThanOrEqual(1);
   });
@@ -824,7 +910,114 @@ describe("the sidebar combo divs (w129 batch-10: the ?div-only edit fragments)",
   });
 });
 
-// --- the state machine through the DETAIL route ---------------------------------------
+// --- census gap #1: the sidebar combo writes' RENDER half (pages/
+// --- issue-detail.tsx's new sections, live through the mounted uiRouter —
+// --- the WRITE half is pages/issue-sidebar-writes.ts, unmounted until the
+// --- fold; its ladders live in that module's own test file) ---------------
+
+describe("census gap #1: the sidebar combo forms + header buttons (render half)", () => {
+  it("the OWNER (writer+admin) sees every form: the milestone select with the populated option, the projects checkbox group with the seeded project, the assignee checkboxes, the deadline input, the watch toggle, the pin + lock forms", async () => {
+    const fixture = await ensureIssueDetailFixtures();
+    const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+
+    // The milestone select (single-`id` field, the hidden issue_ids, the
+    // populated milestone riding selected inside the Open optgroup).
+    expect(html).toContain('<form class="ui form" action="/' + OWNER_NAME + '/' + REPO_SLUG + '/issues/milestone" method="post">');
+    expect(html).toMatch(/<input type="hidden" name="issue_ids" value="\d+"\/>/);
+    expect(html).toContain('<option value="">' + "No Milestone</option>");
+    expect(html).toContain('<optgroup label="Open">');
+    // The renderer emits boolean attrs as `attr=""` (the selected option's
+    // shape).
+    expect(html).toMatch(new RegExp(`<option value="\\d+" selected="">${SIDEBAR_MILESTONE_NAME.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}</option>`));
+
+    // The projects picker (the unit is ON in this fixture): the Open header,
+    // the seeded project's checkbox row (the fixture ATTACHES it to the
+    // closed issue, so it rides checked), the display list anchoring the
+    // live board page.
+    expect(html).toContain("<strong>Projects</strong>");
+    expect(html).toMatch(/<form class="ui form" action="\/[^"]+\/issues\/projects" method="post">/);
+    expect(html).toContain(">Open Projects</div>");
+    expect(html).toMatch(new RegExp(`id="issue-project-\\d+" name="id" type="checkbox" value="\\d+" checked(?:="")?`));
+    expect(html).toMatch(new RegExp(`<a class="item" href="/${OWNER_NAME}/${REPO_SLUG}/projects/\\d+">`));
+
+    // The assignee picker: the candidates (owner + bob, the repo assignees)
+    // as checkbox rows; the display list's No Assignees empty arm (the
+    // closed issue carries none).
+    expect(html).toContain("<strong>Assignees</strong>");
+    expect(html).toMatch(new RegExp(`id="issue-assignee-\\d+" name="id" type="checkbox" value="\\d+"`));
+    expect(html).toContain('<span class="item empty-list">No Assignees</span>');
+
+    // The deadline: the past stamp renders the overdue red + the Jan 1,
+    // 2020 date, and the writer form carries the pre-filled yyyy-mm-dd.
+    expect(html).toContain('class="due-date tw-text-red"');
+    expect(html).toContain("Jan 1, 2020");
+    expect(html).toContain('<input type="date" name="deadline"');
+    expect(html).toContain('value="2020-01-01"');
+    expect(html).toContain('action="/' + OWNER_NAME + '/' + REPO_SLUG + '/issues/' + fixture.closedIssueIndex + '/deadline"');
+
+    // The watch toggle: the owner is the ISSUE'S POSTER — the participants
+    // fallback of CheckIssueWatch makes them watching (Unsubscribe arm,
+    // watch=false next).
+    expect(html).toContain("Unsubscribe</button>");
+    expect(html).toContain("octicon-eye-closed");
+    expect(html).toMatch(new RegExp(`action="/[^"]+/issues/${fixture.closedIssueIndex}/watch\\?watch=false"`));
+
+    // The pin + lock block (admin): the Pin button (unpinned, enabled) and
+    // the inline lock form with the reason select.
+    expect(html).toContain('action="/' + OWNER_NAME + '/' + REPO_SLUG + '/issues/' + fixture.closedIssueIndex + '/pin"');
+    expect(html).toContain(" Pin</button>");
+    expect(html).toContain('action="/' + OWNER_NAME + '/' + REPO_SLUG + '/issues/' + fixture.closedIssueIndex + '/lock"');
+    expect(html).toContain('id="issue-lock-reason"');
+    expect(html).toContain("<option value=\"Too heated\">Too heated</option>");
+    expect(html).toContain("Lock</button>");
+  });
+
+  it("a signed-in NON-writer sees the display lists + the watch toggle but NO combo forms, NO deadline input, NO pin/lock block", async () => {
+    const fixture = await ensureIssueDetailFixtures();
+    const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.bobCookie}` },
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The display halves render (upstream renders them for every reader).
+    expect(html).toContain("<strong>Milestone</strong>");
+    expect(html).toContain("<strong>Projects</strong>");
+    expect(html).toContain("<strong>Assignees</strong>");
+    // The write halves stay gated (canModifyIssueOrPull false, admin false).
+    expect(html).not.toContain('name="issue_ids"');
+    expect(html).not.toContain('name="deadline"');
+    expect(html).not.toContain("/pin\"");
+    expect(html).not.toContain("/lock\"");
+    // The watch toggle is ANY signed-in viewer (the bare-group posture).
+    expect(html).toContain("Subscribe</button>");
+  });
+
+  it("the open PR renders the bound assignee CHECKED in the writer form (the diff's baseline) and the pulls-family forms post through /issues/* like upstream's templates", async () => {
+    const fixture = await ensureIssueDetailFixtures();
+    const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/pulls/2`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The combo forms post through the ISSUES literals on BOTH families
+    // (milestone_list/project_list/assignee_list.tmpl's hardcoded
+    // data-update-url shapes).
+    expect(html).toMatch(new RegExp(`action="/${OWNER_NAME}/${REPO_SLUG}/issues/assignee" method="post"`));
+    expect(html).toMatch(new RegExp(`action="/${OWNER_NAME}/${REPO_SLUG}/issues/milestone" method="post"`));
+    // The header-button forms carry the ROW's own family (upstream
+    // Issue.Link()): the pulls canonical path.
+    expect(html).toMatch(new RegExp(`action="/${OWNER_NAME}/${REPO_SLUG}/pulls/2/watch\\?watch=`));
+    // The bound assignee rides checked (bob — the fixture edge; the
+    // picker carries the OUT-OF-BAND assignee too, upstream's
+    // SelectedAssigneeIDs combo-value semantics).
+    expect(html).toMatch(new RegExp(`name="id" type="checkbox" value="${fixture.bobId}" checked(?:="")?`));
+  });
+});
+
 
 describe("the state machine through the detail route", () => {
   it("the WIP-prefixed open PR renders the grey DRAFT badge and the merge box's WIP line (the list matrix pins the row glyph — the page badge was unpinned)", async () => {
