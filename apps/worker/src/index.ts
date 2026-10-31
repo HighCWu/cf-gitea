@@ -27,6 +27,7 @@ import { armsForEntry, recordArmsFailure, recordArmsSuccess } from "./services/c
 import { handlesUiRoute, uiRouter } from "./ui";
 import { sessionRouter } from "./ui/session";
 import { oauth2AuthorizeRouter } from "./ui/oauth2-authorize";
+import { oauth2LoginRouter } from "./web/oauth2-login";
 import { firstRunRouter } from "./ui/first-run";
 import { avatarServingRouter } from "./web/avatar-serving";
 import { attachmentsServingRouter } from "./web/attachments-serving";
@@ -317,6 +318,10 @@ app.route("/", sessionRouter);
 // family; the oauth2Enabled 403 wrap rides W4 (the commented slot at the
 // router export).
 app.route("/", oauth2AuthorizeRouter);
+// The EXTERNAL-AUTH login pair (SPEC external-auth-sources.md W2):
+// /user/oauth2/{source} + its /callback — the OIDC client flow's legs
+// (web.go:768-771's mounts).
+app.route("/", oauth2LoginRouter);
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {

@@ -566,6 +566,16 @@ server-side session-store dependency — the SPEC-0010 session row already
 carries the identity, the TTLs, and the cascade path, and the consent
 column of the provider SPEC set the exact precedent.
 
+**W2 as-built amendment:** the row requires a user (`sessions.user_id`
+NOT NULL), so the ANONYMOUS dance — the primary leg, started from the
+logged-out buttons — cannot park here. The carrier is composite: the row
+when a session exists, a short-lived `gitea_oauth2_state` cookie (the
+same encoded state, double-submit compare) otherwise; the identity is
+never parked client-side either way. The full rationale and the
+re-dance contract are recorded in §9 W2's as-built (deviations (a)/(b));
+this paragraph's row-only claim is the design intent, the as-built is
+the operative arm.
+
 ## 5. The flow on our substrate
 
 ### 5.1 The client registry seam (no runtime provider objects)
@@ -941,6 +951,73 @@ the shared index.
   service (`services/auth-sources/identity.ts` — the §5.5 ladder,
   stale-link cleanup, the init-window guard), tests with the fetch-stub
   IdP. Gates: the flow suite + the verify matrix green.
+
+  **As-built (2026-10-31):** all of the above landed. Suites:
+  `oidc-client.test.ts` (35 — the verify matrix with REAL WebCrypto-signed
+  id_tokens: RS256/ES256/HS256 good arms; wrong iss/aud; expired;
+  iat-future; nonce miss/match; kid miss; the single-key kidless JWKS;
+  alg confusion `none` rejected pre-keywork; the RFC 8724 HS arm —
+  structurally dead, the HMAC key is ALWAYS the client secret; tamper;
+  ExternalIDClaim override; the discovery memo/freshness-hint; the
+  authorize parameter set) + `identity.test.ts` (19 — the encoder
+  round-trip + §7.6 bound with the never-truncate fields, the dance
+  cookie parse, the constant-time compare, the ladder rungs over real D1
+  incl. the org-stale cleanup and the structural FK cascade note, the
+  link upsert with §7.8-empty token columns, the init-window guard
+  predicate) + `web/oauth2-login.test.ts` (18 — both legs end-to-end on
+  the stub IdP: the honest 404s, the PathEscape'd-name parity, the
+  referer/redirect_to park, both carriers, the errCallback mapping, the
+  spent-state arms, the fresh-row mint + last-login bump, the
+  prohibited arm, the settings/security link arm, the re-dance
+  continuation). Gates with own eyes: the six-file run 114/114 (W1's
+  42 + these 72), `session.test.ts` 56/56, tsc zero in the six files,
+  scoped eslint clean, `check:api` PASS. Deviations/clarifications
+  recorded: (a) **the anonymous-leg state carrier** — §4.4/§5.3 park the
+  dance on the session row, but `sessions.user_id` is NOT NULL (W1's
+  0013) and the primary dance starts logged-out; upstream's own carrier
+  (an anonymous server-side session, gorilla key/data rows with no user
+  binding) is impossible on this schema. As-built: the SAME encoded
+  state rides the row when a session exists and a short-lived
+  `gitea_oauth2_state` cookie (double-submit compare, 10-min Max-Age,
+  session-cookie flags) otherwise; planting a known state requires
+  setting OUR cookie, which only OUR authorize leg can do (fresh UUID
+  each time), so the login-CSRF posture holds; (b) **the identity is
+  NEVER parked client-side** — the §5.5.3 link arms verify the
+  credential, MINT the session, and re-dance
+  (`303 /user/oauth2/{source}?redirect_to=…&oauth2_continue=signin-link
+  |signup` — the W5 arms' contract, enforced by
+  `externalSignupBlockedByInitWindow` before any credential work); the
+  callback completes the link against the IdP-RE-ASSERTED identity and
+  lands on the parked `returnTo` (not settings/security — the
+  continuation marker discriminates); the link-account page (W5) reads
+  the UNTRUSTED redirect hints (`oauth2_source`,
+  `oauth2_username_hint`, `redirect_to`) instead of a parked gothUser —
+  W5's brief adjusts accordingly; (c) the §4.4 state JSON's identity
+  fields stay DEFINED but W2's flow never writes them (nothing parks a
+  client-supplied identity); the encoder (fixed key order, 8 KiB,
+  externalId/email/name never truncate) is the delivered W1-tail item —
+  its first as-written draft had a non-terminating halving loop at the
+  1-char fixed point, fixed by dropping the field (caught by the
+  never-truncate test's timeout, not by review); (d) the discovery
+  memo is keyed `(sourceId, updatedAt)` — the row edit IS the freshness
+  hint, a 4xx/iss-mismatch re-verify reads the same document, and any
+  isolate fetching once per row version is the §7.9 posture; (e)
+  github/gplus rows resolve to the `provider_unavailable` failure arm
+  until W3's client modules land; (f) the flash divergence: failures
+  redirect `/login?oauth2_error={access_denied|temporarily_unavailable
+  |internal|state|prohibited|provider_unavailable}` — FIXED codes only,
+  the provider's `error_description` text is dropped (no reflection
+  into our UI), the marker is inert until W4 renders it; (g) the
+  upstream "direct callback fast path" (oauth.go:48-58) collapses into
+  the 303-through-IdP (a live IdP SSO session bounces in one hop; v1
+  persists no provider tokens to resume, §7.8); (h) the stale-link
+  cleanup's user-gone arm is STRUCTURAL here (the FK cascade removes
+  the link with the user row) — the check stays as the belt; the
+  org-linked row is the reachable stale case and is tested; (i) no
+  session.ts hunks were needed — SPEC-0010's `mintSession` seam (fresh
+  row + the batched last-login bump) served verbatim; the mount of
+  `oauth2LoginRouter` hands off to the orchestrator's registration
+  window.
 - **W3 — github + google clients** (depends W2; size **S/M**). Owns:
   `services/auth-sources/providers/github.ts` (profile + email
   endpoints, CustomURLMapping overrides), `providers/google.ts`
@@ -963,7 +1040,14 @@ the shared index.
   POST, the link-start buttons per active source — upstream
   `accountlinks.tmpl` reduced to the landed page's idioms), the
   unlink service arm, tests + goldens. Gates: the linking suite,
-  the settings round-trip.
+  the settings round-trip. **W2 as-built note:** the page reads W2's
+  redirect HINTS (`oauth2_source`, `oauth2_username_hint`,
+  `redirect_to` — untrusted, pre-fill only), not a parked identity
+  (there is none — §9 W2's as-built (a)/(b)); each POST arm runs
+  `externalSignupBlockedByInitWindow` FIRST, verifies its credential,
+  mints the session, and re-dances via
+  `303 /user/oauth2/{source}?redirect_to=…&oauth2_continue=signin-link|signup`
+  — the callback completes the link against the IdP-re-asserted identity.
 - **W6 — battery + docs tail** (last; size **S**). Owns: the
   deploy-probes battery arm (§8), the SPEC as-built amendments,
   SPEC-0018 §3.3's ledger-entry edit (the omission paragraph becomes
