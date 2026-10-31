@@ -25,6 +25,7 @@ import type { RunJobRow, RunRow, RunAttemptRow, TaskRow } from "../../services/a
 import { increaseTaskVersion, insertActionRun } from "../../services/actions/model";
 import { loadRepoActionsConfig, saveRepoActionsConfig } from "../../services/actions/config";
 import { findReadableArtifacts, type ArtifactRow } from "../../services/actions/artifacts";
+import { nextRunIndex } from "../../services/actions/trigger";
 import { getFailedJobsForRerun, rerunWorkflowRunJobs } from "../../services/actions/rerun";
 import type { RerunResult } from "../../services/actions/rerun";
 import {
@@ -218,9 +219,12 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
  *     machinery, ValidateWorkflowStatic's needs graph) is M3 — the dispatch
  *     stores per-job single-job YAML payloads built by re-dumping the raw
  *     job mapping (the staged shape dispatch.test.ts pins).
- *   - The dispatch's run index comes from max(index)+1 (the repo_counters
- *     run_index sequence is M3, SPEC-0012 §4.5 — the model header's note);
- *     the UNIQUE(repo_id, index) index arbitrates a lost race with a 500.
+ *   - The dispatch's run index rides the LANDED repo_counters.run_index CAS
+ *     (services/actions/trigger.ts nextRunIndex — SPEC-0012 §4.5, upstream's
+ *     GetNextResourceIndex named sequence, models/db/index.go:115-168); the
+ *     UNIQUE(repo_id, index) arbitration stays as defense-in-depth only —
+ *     the CAS never issues one value twice, so the lost-race 500 the old
+ *     max+1 reduction surfaced has no producer left.
  *   - scoped_workflow_source_repo_id > 0 answers 404 (the scoped-workflow
  *     source family is C10/post-M3; isScopedRun is never written — the
  *     dispatch-inputs UI module's same documented reduction).
@@ -1250,15 +1254,9 @@ export async function dispatchActionWorkflow(input: {
 
   // The run row (workflow.go:122-125): title = the commit's message title,
   // event/triggerEvent workflow_dispatch, status waiting; index = the
-  // M3-free max+1 (the module header's reduction).
-  const db = drizzle(d1);
-  const indexRows = await db
-    .select({ maxIndex: actionRuns.index })
-    .from(actionRuns)
-    .where(eq(actionRuns.repoId, pair.repo.id))
-    .orderBy(desc(actionRuns.index))
-    .limit(1);
-  const nextIndex = (indexRows[0]?.maxIndex ?? 0) + 1;
+  // repo_counters.run_index CAS (the module header's note — the same
+  // allocation every run producer shares).
+  const nextIndex = await nextRunIndex(d1, pair.repo.id);
 
   const settings = await loadRepoSettings(d1, pair.repo.id);
   const senderRow = await userRowOrNull(d1, doerId);

@@ -3,36 +3,49 @@
  * P1-2, docs/residuals-v1.3.2.md) — ported from services/actions/rerun.go
  * (upstream pin fc493688) at the M1 store's stage.
  *
- * THE M3-BOUNDARY VERDICT (the question the dispatch brief poses): rerun is
- * NOT emitter territory on the write side. Upstream's rerun never re-parses
- * the workflow from the repo and never rides the push-event parser —
+ * THE M3-BOUNDARY VERDICT (as landed by the M3 call-site wave, 6cdc698):
+ * rerun is NOT emitter territory on the write side. Upstream's rerun never
+ * re-parses the workflow from the repo and never rides the push-event parser —
  * buildRerunPlan (rerun.go:151-186) clones the LATEST ATTEMPT's stored job
  * rows (their WorkflowPayload/JobID/Needs/RunsOn ride over verbatim through
  * cloneRunJobForAttempt, rerun.go:534-572) into a NEW ActionRunAttempt, so a
  * manual rerun can synthesize the new job rows directly from the existing
- * rows. The M3-dependent arms are exactly three, and all three are guarded
- * upstream by data v1 rows never carry:
+ * rows. The M3-dependent arms, at the current store's truth:
  *
  *   1. `if:` re-decision (decideJobIf, rerun.go:306) — the OQ-1 expression
  *      evaluator; v1 rows never carry a decided-if state (the M1a staged
  *      insert writes waiting/pending rows directly, model.ts insertActionRun),
  *      so the rerun writes the same waiting/pending shapes.
- *   2. run/job concurrency (EvaluateRunConcurrencyFillModel, rerun.go:218;
- *      PrepareToStartRunWithConcurrency, rerun.go:227) — guarded by
- *      `plan.run.RawConcurrency != ""` (rerun.go:209) and the job twin
- *      (rerun.go:312); v1 rows carry rawConcurrency '' everywhere, so the
- *      blocked arm (shouldBlock, rerun.go:233) is unreachable and the new
- *      attempt starts Waiting.
+ *   2. RUN-level concurrency (EvaluateRunConcurrencyFillModel, rerun.go:209-221
+ *      + PrepareToStartRunWithConcurrency, rerun.go:227-233) — LIVE for the
+ *      rows the trigger insert fills (run.RawConcurrency rides run.go:83-89
+ *      since 6cdc698): the raw text decodes (the rerun.go-local yaml.Unmarshal
+ *      contract), the group/cancel evaluate into the new attempt, and the
+ *      gate cancels-or-blocks on the group (the clear_tasks.go:121-150 pair —
+ *      the same split the trigger insert runs). The evaluator reads
+ *      github/vars only THROUGH expressions, so an expression-free raw is
+ *      exact without the run github-context seam; an EXPRESSION-bearing raw
+ *      stages that seam (buildGithubContext/GetVariablesOfRun are
+ *      trigger.ts-private — the module-tail HANDOFF) and skips the fill with
+ *      a logged warning: the pre-M3 posture, never a mis-evaluation. The
+ *      JOB-level twin (EvaluateJobConcurrencyFillModel +
+ *      PrepareToStartJobWithConcurrency, rerun.go:312-321) stays staged: its
+ *      slots/maxParallel machinery rides the matrix model port (trigger's
+ *      staging note), and the reset arm's concurrency fields clear either way
+ *      (rerun.go:297-299).
  *   3. the reusable-caller cascade + deferred-matrix collapse
  *      (collectResetCallerDescendants / collectMatrixCollapse, rerun.go:516,
  *      638) — v1 rows never carry isReusableCaller/isMatrixDeferred (SPEC
  *      §1.4 unread columns), so the skip-clone sets stay empty.
  *
- * The M3 surface that REMAINS for rerun after this unit: none on the write
- * path — the post-commit notify/commit-status/emitter tails (rerun.go:388-396,
- * EmitJobsIfReadyByRun) ride M3's notifier/status work as they do for every
- * other producer, and the `if:`/concurrency/matrix arms above arm themselves
- * when M3 lands (the guards here are the ports' insertion points).
+ * The M3 surface that REMAINS for rerun: the post-commit notify/
+ * commit-status tails for the rerun's OWN rows (rerun.go:389-396,
+ * CreateCommitStatusForRunJobs + NotifyWorkflowJobsAndRunsStatusUpdate +
+ * EmitJobsIfReadyByRun) stay the staged seam they were at this port — the
+ * emitter substance the trigger runs inline (checkJobsOfRun) IS wired here
+ * for the runs the concurrency cancel touches (notifyAndEmitFinishedJobs'
+ * cancelledConcurrencyJobs argument, rerun.go:388); the expression-bearing
+ * concurrency fill waits on the run github-context seam above.
  *
  * The ARTIFACT-INHERITANCE mechanism (the board's v1.3.1 addition: "a rerun's
  * artifacts must resolve to the new attempt") is upstream's
@@ -50,10 +63,12 @@
 
 import { and, asc, eq, inArray, ne } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
+import { isMap, isScalar, parseDocument, type Node as YamlNode } from "yaml";
 
 import { actionArtifacts, actionRunAttempts, actionRunJobs, actionRuns } from "../../db/schema";
 import { loadRepoActionsConfig } from "./config";
 import {
+  ACTION_STATUS_BLOCKED,
   ACTION_STATUS_PENDING,
   ACTION_STATUS_WAITING,
   increaseTaskVersion,
@@ -63,11 +78,55 @@ import {
   type RunRow,
 } from "./model";
 import { aggregateJobStatus, isDoneStatus, isRunningStatus } from "./update";
+import {
+  cancelPreviousJobsByRunConcurrency,
+  checkJobsOfRun,
+  containsExpression,
+  evaluateRunConcurrency,
+  shouldBlockRunByConcurrency,
+  type RawConcurrency,
+} from "./trigger";
 
 /** MAX_RERUN_ATTEMPTS' default (modules/setting/actions.go:17
  *  defaultMaxRerunAttempts = 50, :54 the assignment; our wrangler carries no
  *  [actions] override, so the default IS the value). */
 export const MAX_RERUN_ATTEMPTS = 50;
+
+/** The RawConcurrency decode of the STORED text — rerun.go:209-213's local
+ *  yaml.Unmarshal over the RawConcurrency contract (workflow.go:1201-1220):
+ *  a bare scalar decodes into rawExpression (UnmarshalYAML tries the string
+ *  first), a mapping into group + cancel-in-progress — both Go strings, a
+ *  YAML bool arriving as its text ("true"). A malformed or non-scalar/map
+ *  document is the unmarshal ERROR upstream fails the rerun with
+ *  (rerun.go:212). (The decode mirrors trigger.ts's readWorkflowRawConcurrency
+ *  contract applied to the marshaled shape — rerun-local, as upstream's
+ *  unmarshal is.) */
+export function unmarshalRawConcurrency(text: string): RawConcurrency {
+  const scalarText = (node: YamlNode | null): string => {
+    if (node === null || !isScalar(node)) return "";
+    const v = node.value;
+    if (typeof v === "string") return v;
+    if (typeof v === "boolean") return v ? "true" : "false";
+    if (typeof v === "number") return String(v);
+    return "";
+  };
+  const doc = parseDocument(text);
+  if (doc.errors.length > 0) {
+    throw new Error(`unmarshal raw concurrency: ${doc.errors[0]?.message ?? "parse error"}`);
+  }
+  const node: YamlNode | null = doc.contents;
+  if (isScalar(node)) {
+    return { group: "", cancelInProgress: "", rawExpression: scalarText(node) };
+  }
+  if (isMap(node)) {
+    return {
+      group: scalarText(node.get("group", true) as YamlNode | null),
+      cancelInProgress: scalarText(node.get("cancel-in-progress", true) as YamlNode | null),
+      rawExpression: "",
+    };
+  }
+  throw new Error("unmarshal raw concurrency: the stored concurrency is neither a scalar nor a mapping");
+}
 
 /** GetFailedJobsForRerun (rerun.go:26-36): the failed OR cancelled jobs —
  *  both are what the "Re-run failed jobs" button re-runs. */
@@ -360,14 +419,17 @@ function effectiveTaskId(job: RunJobRow): number {
  * (rerun.go:39; the rerun-all button and the API rerun endpoint pass the
  * full list, which the empty-expansion covers the same way). The attempt
  * caps, disabled-workflow and done-run validations run first
- * (validateRerun); the rerun-set jobs reset to waiting (pending when they
+ * (validateRerun); a run carrying the workflow's raw concurrency takes the
+ * run-level fill + gate before the clone (rerun.go:209-233 — the module
+ * header's §2); the rerun-set jobs reset to waiting (pending when they
  * have needs — rerun.go:289-292, insertRunJob's status shape at
- * run.go:199-202), every other job clones through as PASS-THROUGH keeping
- * its terminal status, timing, and source task (rerun.go:325-332); the run's
- * latest_attempt_id moves to the new attempt and an awaiting-approval run is
- * approved by the act of rerunning (rerun.go:242-248). The dispatch wake
- * (increaseTaskVersion) fires only when a dispatchable waiting job exists
- * (rerun.go:350-352, 372-376 — insertActionRun's twin shape).
+ * run.go:199-202; BLOCKED when the gate holds), every other job clones
+ * through as PASS-THROUGH keeping its terminal status, timing, and source
+ * task (rerun.go:325-332); the run's latest_attempt_id moves to the new
+ * attempt and an awaiting-approval run is approved by the act of rerunning
+ * (rerun.go:242-248). The dispatch wake (increaseTaskVersion) fires only
+ * when a dispatchable waiting job exists (rerun.go:350-352, 372-376 —
+ * insertActionRun's twin shape).
  */
 export async function rerunWorkflowRunJobs(
   d1: D1,
@@ -402,6 +464,11 @@ export async function rerunWorkflowRunJobs(
   }
   templateJobs = await backfillTemplateAttemptJobIds(d1, templateAttempt.id, templateJobs);
 
+  // The runs the concurrency cancel touches (upstream's
+  // cancelledConcurrencyJobs runs) — settled after the clone
+  // (notifyAndEmitFinishedJobs, rerun.go:388).
+  const affectedRunsByCancel: number[] = [];
+
   const expanded = expandRerunJobIds(templateJobs, jobsToRerun);
   if (expanded === null) {
     return rejected(
@@ -416,12 +483,45 @@ export async function rerunWorkflowRunJobs(
   // header. Every template row clones.
 
   // execRerunPlan's pre-transaction construction (rerun.go:201-221): the new
-  // attempt waits; the concurrency fill (rerun.go:209-221) and
-  // PrepareToStartRunWithConcurrency's blocked arm (rerun.go:227-233,
-  // clear_tasks.go:137-150) need the raw-concurrency data v1 rows never
-  // carry — shouldBlock stays false.
+  // attempt waits; a run row that carries the workflow's raw `concurrency:`
+  // (the trigger insert's run.RawConcurrency fill, run.go:83-89) takes the
+  // RUN-LEVEL fill + gate — EvaluateRunConcurrencyFillModel (rerun.go:209-221,
+  // concurrency.go:19-44) evaluates group/cancel into the attempt, and
+  // PrepareToStartRunWithConcurrency (rerun.go:227-233, clear_tasks.go's
+  // pair) cancels-or-blocks on the group (the same exported split the
+  // trigger insert runs). The evaluator reads github/vars only THROUGH
+  // expressions, so an expression-free raw is exact without the run
+  // github-context seam; an expression-bearing raw stages that seam (the
+  // module header's HANDOFF) and skips the fill with a logged warning — the
+  // pre-M3 posture, never a mis-evaluation.
   const newAttemptNum = templateAttempt.attempt + 1;
-  const shouldBlock = false;
+  let concurrencyGroup = "";
+  let concurrencyCancel = false;
+  if (run.rawConcurrency !== "") {
+    const raw = unmarshalRawConcurrency(run.rawConcurrency);
+    if (containsExpression(run.rawConcurrency)) {
+      console.warn(
+        `[actions-rerun] run ${run.id}: expression-bearing workflow concurrency stages the run github-context seam; the rerun fills no concurrency group`,
+      );
+    } else {
+      ({ group: concurrencyGroup, cancel: concurrencyCancel } = evaluateRunConcurrency({}, raw, {}));
+    }
+  }
+  let shouldBlock = false;
+  if (concurrencyGroup !== "") {
+    const scope = {
+      repoId: run.repoId,
+      runId: run.id,
+      runAttemptId: 0, // read by neither gate half — identity rides runId
+      concurrencyGroup,
+      concurrencyCancel,
+    };
+    const { affectedRunIds } = await cancelPreviousJobsByRunConcurrency(d1, scope);
+    if (await shouldBlockRunByConcurrency(d1, scope)) {
+      shouldBlock = true; // rerun.go:233 — the reset arm inserts Blocked
+    }
+    affectedRunsByCancel.push(...affectedRunIds);
+  }
 
   const existing = await getAttemptByRunIdAndAttemptNum(d1, run.id, newAttemptNum);
   if (existing !== null) {
@@ -431,6 +531,10 @@ export async function rerunWorkflowRunJobs(
     );
   }
 
+  // The insert carries the gate's outcome (upstream assigns
+  // newAttempt.Status = newAttemptStatus before db.Insert, rerun.go:232-235)
+  // and the fill's evaluated columns (EvaluateRunConcurrencyFillModel's
+  // attempt.ConcurrencyGroup/ConcurrencyCancel write).
   const insertedAttemptRows = await db
     .insert(actionRunAttempts)
     .values({
@@ -438,7 +542,9 @@ export async function rerunWorkflowRunJobs(
       runId: run.id,
       attempt: newAttemptNum,
       triggerUserId,
-      status: ACTION_STATUS_WAITING,
+      status: shouldBlock ? ACTION_STATUS_BLOCKED : ACTION_STATUS_WAITING,
+      concurrencyGroup,
+      concurrencyCancel,
       created: now,
       updated: now,
     })
@@ -520,9 +626,10 @@ export async function rerunWorkflowRunJobs(
       // OQ-1 evaluator (module header): the v1 rows carry no decided-if
       // state and the staged insert writes waiting/pending directly — the
       // same shape here. The job-level concurrency fill (rerun.go:312-321)
-      // is guarded by rawConcurrency '' and skipped.
+      // stays staged with the matrix model (module header §2) — the gate
+      // that DID run is the run-level one above.
       const status =
-        shouldBlock ? 7 /* StatusBlocked */ : ACTION_STATUS_WAITING; // rerun.go:289
+        shouldBlock ? ACTION_STATUS_BLOCKED : ACTION_STATUS_WAITING; // rerun.go:289
       return {
         ...base,
         status: status === ACTION_STATUS_WAITING && needs.length > 0 ? ACTION_STATUS_PENDING : status,
@@ -575,10 +682,21 @@ export async function rerunWorkflowRunJobs(
     await increaseTaskVersion(d1, run.ownerId, run.repoId);
   }
 
-  // Post-commit (rerun.go:388-396): notifyAndEmitFinishedJobs,
-  // CreateCommitStatusForRunJobs, NotifyWorkflowJobsAndRunsStatusUpdate and
-  // EmitJobsIfReadyByRun ride M3's notifier/status/emitter work (module
-  // header) — the same tails every other producer defers.
+  // notifyAndEmitFinishedJobs' cancelledConcurrencyJobs half (rerun.go:388):
+  // the runs whose group entries the gate cancelled settle through the
+  // exported emitter pass — the same inline settle the trigger insert runs
+  // (its affectedByCancel tail). The status-repost twin
+  // (createCommitStatusesForJobsByRun) is trigger-private and stays in the
+  // deferred block below.
+  for (const affectedRunId of [...new Set(affectedRunsByCancel)]) {
+    if (affectedRunId === run.id) continue;
+    await checkJobsOfRun(d1, affectedRunId);
+  }
+
+  // Post-commit (rerun.go:389-396): CreateCommitStatusForRunJobs,
+  // NotifyWorkflowJobsAndRunsStatusUpdate and EmitJobsIfReadyByRun for the
+  // rerun's own rows (plus the cancelled runs' status reposts) ride M3's
+  // notifier/status work — the module header's staged seam.
 
   return { ok: true, attempt: newAttempt, jobs: newJobs };
 }

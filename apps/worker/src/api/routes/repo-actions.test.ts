@@ -57,6 +57,7 @@ import {
   actionRunJobs,
   actionRuns,
   actionTasks,
+  repoCounters,
   repoSettings,
   repoUnits,
   users,
@@ -197,6 +198,29 @@ beforeAll(async () => {
   EMPTY_REPO_ID = emptyRow.id;
   await db.update(repoSettings).set({ hasActions: false }).where(eq(repoSettings.repoId, EMPTY_REPO_ID));
   await db.delete(repoUnits).where(eq(repoUnits.repoId, EMPTY_REPO_ID));
+
+  // The M3 trigger wiring (6cdc698) rides the engine's onPush seam — fired
+  // in waitUntil AFTER the receive answers — so the seeds' REAL pushes above
+  // insert trigger runs of their own (ci.yml / notify.yml / deploy.yml all
+  // declare `on: push`), possibly a beat AFTER the push returns. The run
+  // family and the run_index counters wipe so the suites below start from
+  // the empty-run posture their fixtures were written against (they seed
+  // their own runs); the wipe loops until a pass stays empty across a settle
+  // window, so a late waitUntil insert cannot survive it.
+  const wipeRunFamily = async (): Promise<number> => {
+    for (const table of ["action_run_job_summaries", "action_run_attempts", "action_run_jobs", "action_runs", "repo_counters"]) {
+      await env.DB.prepare(`DELETE FROM ${table}`).run();
+    }
+    const left = await env.DB.prepare("SELECT count(*) AS n FROM action_runs").first<{ n: number }>();
+    return left?.n ?? 0;
+  };
+  await new Promise((resolve) => setTimeout(resolve, 400)); // let the in-flight waitUntil inserts land
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if ((await wipeRunFamily()) === 0) break;
+  }
+  if ((await env.DB.prepare("SELECT count(*) AS n FROM action_runs").first<{ n: number }>())?.n !== 0) {
+    throw new Error("the seeds' trigger runs never settled — the run-family wipe did not converge");
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -552,6 +576,11 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
     const rows = await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.workflowId, "ci.yml")).all();
     const dispatched = rows.find((r) => r.index === expectedIndex);
     expect(dispatched).toBeDefined();
+    // the index rode the repo_counters.run_index CAS (nextRunIndex — the
+    // counter bootstraps at the repo max, then bumps; the module header's
+    // note)
+    const counter = await drizzle(env.DB).select().from(repoCounters).where(eq(repoCounters.repoId, SUITE_REPO_ID)).get();
+    expect(counter?.runIndex).toBe(dispatched?.index);
     expect(dispatched?.status).toBe(5); // waiting
     expect(dispatched?.event).toBe("workflow_dispatch");
     expect(dispatched?.triggerEvent).toBe("workflow_dispatch");

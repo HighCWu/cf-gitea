@@ -19,20 +19,24 @@
 //     (services/actions/notifier.go:41-784) is likewise the P-tier landing.
 //
 // The run-index is upstream's GetNextResourceIndex(ctx, "action_run_index",
-// RepoID) (invalid_workflow.go:59-61); cf-gitea's M3-free reduction is
-// max(index)+1 over the repo's runs (the landed dispatch pattern,
-// src/api/routes/repo-actions.ts:1255-1261), with the
-// UNIQUE(repo_id, index) arbitration (action_runs_repo_index_uq) as the
-// concurrent-push backstop — upstream's named sequence avoids the collision
-// where this one surfaces it; recorded as the known staging divergence.
+// RepoID) (invalid_workflow.go:59-61); it rides the LANDED
+// repo_counters.run_index CAS (trigger.ts nextRunIndex — the same atomic
+// bootstrap-at-max → never-rewind-repair → bump+RETURNING allocation every
+// run producer shares, so a push's triggered run and a failed-run record
+// interleave strictly sequentially). The UNIQUE(repo_id, index) arbitration
+// (action_runs_repo_index_uq) stays as defense-in-depth only: the CAS never
+// hands two callers one value, so the constraint is unreachable on
+// counter-allocated rows; retiring it is a migration decision outside this
+// module (the schema comment's note now covers all three writers).
 
-import { desc, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { actionRunAttempts, actionRunJobSummaries, actionRuns } from "../../db/schema";
 import { loadRepoActionsConfig } from "./config";
 import { ACTION_STATUS_FAILURE, ellipsisDisplayString } from "./model";
 import type { RunRow } from "./model";
+import { nextRunIndex } from "./trigger";
 
 /** The run fields upstream's handleInvalidWorkflows assembles from the push
  * notify input (invalid_workflow.go:33-41). The caller (the trigger chain) —
@@ -82,14 +86,9 @@ export async function insertInvalidWorkflowRun(
   const db = drizzle(d1);
   const now = new Date();
 
-  // The per-repo index (the M3-free max+1 reduction, repo-actions.ts:1261).
-  const indexRows = await db
-    .select({ maxIndex: actionRuns.index })
-    .from(actionRuns)
-    .where(eq(actionRuns.repoId, run.repoId))
-    .orderBy(desc(actionRuns.index))
-    .limit(1);
-  const index = (indexRows[0]?.maxIndex ?? 0) + 1;
+  // The per-repo index (invalid_workflow.go:59-61) — the repo_counters
+  // run_index CAS (module header), shared with every other run producer.
+  const index = await nextRunIndex(d1, run.repoId);
 
   const content = summaryContent(run.workflowId, parseErr);
   const contentSize = new TextEncoder().encode(content).length; // byte length, not units

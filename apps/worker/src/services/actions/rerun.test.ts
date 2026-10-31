@@ -3,10 +3,11 @@
  * services/actions/rerun.go ported at the M1 store's stage. Pins: rerun-all
  * (the new attempt + per-attempt job reset + the run linkage),
  * rerun-failed's pass-through split (the succeeded jobs keep status/timing/
- * source task), the artifact-inheritance chain (run_attempt.go:104-148 —
- * a partial rerun's attempts inherit; a full rerun starts over), the
- * downstream-needs expansion, the approval arm, and every validation arm
- * with its upstream message.
+ * source task), the run-level concurrency fill + gate (rerun.go:209-233 —
+ * live for the rows the trigger insert fills), the artifact-inheritance
+ * chain (run_attempt.go:104-148 — a partial rerun's attempts inherit; a full
+ * rerun starts over), the downstream-needs expansion, the approval arm, and
+ * every validation arm with its upstream message.
  */
 
 import { applyD1Migrations } from "cloudflare:test";
@@ -26,6 +27,7 @@ import {
   users,
 } from "../../db/schema";
 import {
+  ACTION_STATUS_BLOCKED,
   ACTION_STATUS_CANCELLED,
   ACTION_STATUS_FAILURE,
   ACTION_STATUS_PENDING,
@@ -34,7 +36,7 @@ import {
   insertActionRun,
 } from "./model";
 import { parseRepoActionsConfig, saveRepoActionsConfig } from "./config";
-import { getArtifactAttemptIds, getFailedJobsForRerun, MAX_RERUN_ATTEMPTS, rerunWorkflowRunJobs } from "./rerun";
+import { unmarshalRawConcurrency, getArtifactAttemptIds, getFailedJobsForRerun, MAX_RERUN_ATTEMPTS, rerunWorkflowRunJobs } from "./rerun";
 
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
@@ -292,6 +294,160 @@ describe("rerun-failed (GetFailedJobsForRerun's set — view.go:1002-1008)", () 
     expect(newBuild.sourceTaskId).toBe(42); // EffectiveTaskID (run_job.go:158-163)
     expect(newBuild.started).toEqual(T0);
     expect(newBuild.stopped).toEqual(new Date(T0.getTime() + 1000));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The run-level concurrency fill + gate (rerun.go:209-233) — live for the
+// rows the trigger insert fills (run.RawConcurrency rides run.go:83-89). The
+// seeded runs below wear the marshaled raw text the trigger stores
+// (marshalRawConcurrency's shapes) to simulate exactly those rows.
+// ---------------------------------------------------------------------------
+
+/** Wear the trigger insert's run.RawConcurrency fill onto a seeded run. */
+async function wearRawConcurrency(runId: number, raw: string): Promise<void> {
+  await db().update(actionRuns).set({ rawConcurrency: raw }).where(eq(actionRuns.id, runId));
+}
+
+describe("unmarshalRawConcurrency (rerun.go:209-213 over workflow.go:1201-1220)", () => {
+  it("decodes the marshaled scalar arm into rawExpression and the map arm into group/cancel", () => {
+    expect(unmarshalRawConcurrency("deploy-env\n")).toEqual({ group: "", cancelInProgress: "", rawExpression: "deploy-env" });
+    expect(unmarshalRawConcurrency("group: prod\ncancel-in-progress: true\n")).toEqual({
+      group: "prod",
+      cancelInProgress: "true",
+      rawExpression: "",
+    });
+    expect(unmarshalRawConcurrency("group: prod\n")).toEqual({ group: "prod", cancelInProgress: "", rawExpression: "" });
+  });
+
+  it("throws the unmarshal error upstream fails the rerun with (rerun.go:212)", () => {
+    expect(() => unmarshalRawConcurrency("]: nope")).toThrow(/unmarshal raw concurrency/);
+  });
+});
+
+describe("the run-level concurrency fill + gate (rerun.go:209-233)", () => {
+  it("fills the new attempt's group/cancel from the raw and waits when the group is free", async () => {
+    await seedRepo();
+    const seeded = await seedRun(1, [{ jobId: "build" }, { jobId: "test", needs: ["build"] }]);
+    await wearRawConcurrency(seeded.runId, "group: prod\ncancel-in-progress: true\n");
+    await finishRun(seeded.runId, seeded.attemptId, ACTION_STATUS_FAILURE, [
+      { id: seeded.jobIds[0]!, status: ACTION_STATUS_SUCCESS },
+      { id: seeded.jobIds[1]!, status: ACTION_STATUS_FAILURE },
+    ]);
+
+    const result = await rerunWorkflowRunJobs(env.DB, REPO_ID, await runRow(seeded.runId), USER_ID, []);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    // EvaluateRunConcurrencyFillModel's write (concurrency.go:19-44): the
+    // evaluated group/cancel land on the attempt; the field is free →
+    // Waiting (PrepareToStartRunWithConcurrency's unblocked arm).
+    const attempt = (await db().select().from(actionRunAttempts).where(eq(actionRunAttempts.id, result.attempt.id)))[0]!;
+    expect(attempt.concurrencyGroup).toBe("prod");
+    expect(attempt.concurrencyCancel).toBe(true);
+    expect(attempt.status).toBe(ACTION_STATUS_WAITING);
+    // the reset arm's needs-less shape survives the fill (rerun.go:289-292)
+    const attempt2Jobs = (await jobsOfRun(seeded.runId)).filter((job) => job.runAttemptId === result.attempt.id);
+    expect(attempt2Jobs.find((job) => job.jobId === "build")!.status).toBe(ACTION_STATUS_WAITING);
+  });
+
+  it("the scalar raw arm fills the group with no cancel (the rawExpression decode)", async () => {
+    await seedRepo();
+    const seeded = await seedRun(1, [{ jobId: "build" }]);
+    await wearRawConcurrency(seeded.runId, "deploy-env\n");
+    await finishRun(seeded.runId, seeded.attemptId, ACTION_STATUS_FAILURE, [
+      { id: seeded.jobIds[0]!, status: ACTION_STATUS_FAILURE },
+    ]);
+
+    const result = await rerunWorkflowRunJobs(env.DB, REPO_ID, await runRow(seeded.runId), USER_ID, []);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const attempt = (await db().select().from(actionRunAttempts).where(eq(actionRunAttempts.id, result.attempt.id)))[0]!;
+    expect(attempt.concurrencyGroup).toBe("deploy-env");
+    expect(attempt.concurrencyCancel).toBe(false);
+    expect(attempt.status).toBe(ACTION_STATUS_WAITING);
+  });
+
+  it("cancel-in-progress clears the group's other holders (CancelPreviousJobsByRunConcurrency)", async () => {
+    await seedRepo();
+    const seeded = await seedRun(1, [{ jobId: "build" }]);
+    await wearRawConcurrency(seeded.runId, "group: prod\ncancel-in-progress: true\n");
+    await finishRun(seeded.runId, seeded.attemptId, ACTION_STATUS_FAILURE, [
+      { id: seeded.jobIds[0]!, status: ACTION_STATUS_FAILURE },
+    ]);
+    // Another run holds `prod`: its waiting job rides the group.
+    const holder = await seedRun(2, [{ jobId: "hold" }]);
+    const holderJobs = await jobsOfRun(holder.runId);
+    await db()
+      .update(actionRunJobs)
+      .set({ concurrencyGroup: "prod", status: ACTION_STATUS_WAITING })
+      .where(eq(actionRunJobs.id, holderJobs[0]!.id));
+
+    const result = await rerunWorkflowRunJobs(env.DB, REPO_ID, await runRow(seeded.runId), USER_ID, []);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    // The holder's unclaimed job CASes straight to cancelled (run.go:407-426
+    // through cancelOneJob's task_id=0 arm), the rerun proceeds unblocked.
+    const swept = (await jobsOfRun(holder.runId))[0]!;
+    expect(swept.status).toBe(ACTION_STATUS_CANCELLED);
+    expect(swept.stopped).not.toBeNull();
+    const attempt = (await db().select().from(actionRunAttempts).where(eq(actionRunAttempts.id, result.attempt.id)))[0]!;
+    expect(attempt.status).toBe(ACTION_STATUS_WAITING);
+    expect(attempt.concurrencyGroup).toBe("prod");
+  });
+
+  it("blocks the rerun when another run holds the group without cancel-in-progress (rerun.go:233)", async () => {
+    await seedRepo();
+    const seeded = await seedRun(1, [{ jobId: "build" }, { jobId: "test", needs: ["build"] }]);
+    await wearRawConcurrency(seeded.runId, "group: prod\n");
+    await finishRun(seeded.runId, seeded.attemptId, ACTION_STATUS_FAILURE, [
+      { id: seeded.jobIds[0]!, status: ACTION_STATUS_SUCCESS },
+      { id: seeded.jobIds[1]!, status: ACTION_STATUS_FAILURE },
+    ]);
+    const holder = await seedRun(2, [{ jobId: "hold" }]);
+    const holderJobs = await jobsOfRun(holder.runId);
+    await db()
+      .update(actionRunJobs)
+      .set({ concurrencyGroup: "prod", status: ACTION_STATUS_WAITING })
+      .where(eq(actionRunJobs.id, holderJobs[0]!.id));
+
+    const before = (await db().select().from(actionTasksVersions).where(eq(actionTasksVersions.repoId, REPO_ID)))[0]!.version;
+    const result = await rerunWorkflowRunJobs(env.DB, REPO_ID, await runRow(seeded.runId), USER_ID, []);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    // The new attempt inserts BLOCKED and the reset arm writes Blocked
+    // regardless of needs (rerun.go:289); the aggregate mirrors onto the run.
+    const attempt = (await db().select().from(actionRunAttempts).where(eq(actionRunAttempts.id, result.attempt.id)))[0]!;
+    expect(attempt.status).toBe(ACTION_STATUS_BLOCKED);
+    expect(attempt.concurrencyGroup).toBe("prod");
+    const attempt2Jobs = (await jobsOfRun(seeded.runId)).filter((job) => job.runAttemptId === result.attempt.id);
+    for (const job of attempt2Jobs) {
+      expect(job.status).toBe(ACTION_STATUS_BLOCKED);
+    }
+    expect((await runRow(seeded.runId)).status).toBe(ACTION_STATUS_BLOCKED);
+    // blocked work is not dispatchable — no version bump (rerun.go:372-376)
+    const after = (await db().select().from(actionTasksVersions).where(eq(actionTasksVersions.repoId, REPO_ID)))[0]!.version;
+    expect(after).toBe(before);
+    // the holder's job survives (plain concurrency never cancels holders)
+    expect((await jobsOfRun(holder.runId))[0]!.status).toBe(ACTION_STATUS_WAITING);
+  });
+
+  it("an expression-bearing raw stages the fill — no group, the rerun stays Waiting (the module header's HANDOFF)", async () => {
+    await seedRepo();
+    const seeded = await seedRun(1, [{ jobId: "build" }]);
+    await wearRawConcurrency(seeded.runId, "group: deploy-${{ github.ref_name }}\n");
+    await finishRun(seeded.runId, seeded.attemptId, ACTION_STATUS_FAILURE, [
+      { id: seeded.jobIds[0]!, status: ACTION_STATUS_FAILURE },
+    ]);
+
+    const result = await rerunWorkflowRunJobs(env.DB, REPO_ID, await runRow(seeded.runId), USER_ID, []);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const attempt = (await db().select().from(actionRunAttempts).where(eq(actionRunAttempts.id, result.attempt.id)))[0]!;
+    expect(attempt.concurrencyGroup).toBe("");
+    expect(attempt.status).toBe(ACTION_STATUS_WAITING);
   });
 });
 

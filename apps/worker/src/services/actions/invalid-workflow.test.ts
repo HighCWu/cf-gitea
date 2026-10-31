@@ -4,7 +4,9 @@
 // The invalid-workflow failed-run arm's suite (services/actions/
 // invalid_workflow.go at the pin fc493688, SPEC-0012 §D2 #9's push arm).
 // Each case pins one upstream arm: the failure posture (failed run, started
-// = stopped = now), the per-repo index, the attempt-1 row + latest-attempt
+// = stopped = now), the per-repo index over the repo_counters.run_index CAS
+// (GetNextResourceIndex's named-sequence shape, shared with every run
+// producer), the attempt-1 row + latest-attempt
 // link, the summary body with the parse error verbatim, the byte ContentSize,
 // the zero JobID/StepIndex key space, and the disabled-workflow skip.
 
@@ -19,6 +21,7 @@ import {
   actionRunJobSummaries,
   actionRuns,
   repositories,
+  repoCounters,
   repoUnits,
   users,
 } from "../../db/schema";
@@ -32,7 +35,7 @@ beforeAll(async () => {
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
 });
 
-const CLEANUP_TABLES = ["action_run_job_summaries", "action_run_attempts", "action_runs", "repo_units", "repositories", "users"];
+const CLEANUP_TABLES = ["action_run_job_summaries", "action_run_attempts", "action_runs", "repo_counters", "repo_units", "repositories", "users"];
 
 beforeEach(async () => {
   for (const table of CLEANUP_TABLES) {
@@ -128,6 +131,38 @@ describe("insertInvalidWorkflowRun (invalid_workflow.go:48-101)", () => {
     const second = await insertInvalidWorkflowRun(env.DB, { ...RUN_INPUT, workflowId: ".github/workflows/worse.yml" }, "worse YAML");
     expect(first.index).toBe(1);
     expect(second.index).toBe(2);
+  });
+
+  it("the index rides the repo_counters.run_index CAS (GetNextResourceIndex's named-sequence shape)", async () => {
+    await seedRepo();
+    await insertInvalidWorkflowRun(env.DB, RUN_INPUT, "bad YAML");
+    await insertInvalidWorkflowRun(env.DB, { ...RUN_INPUT, workflowId: ".github/workflows/worse.yml" }, "worse YAML");
+    // the counter row carries the allocation (the same counter every run
+    // producer shares — a triggered run and a failed-run record interleave)
+    const counters = await db().select().from(repoCounters);
+    expect(counters).toHaveLength(1);
+    expect(counters[0]?.repoId).toBe(REPO_ID);
+    expect(counters[0]?.runIndex).toBe(2);
+    expect(counters[0]?.issueIndex).toBe(0);
+    // and a failed-run record CONTINUES a counter a triggered run moved
+    // (bootstrap-at-max: the rows stand, the counter bumps past them)
+    await db().update(repoCounters).set({ runIndex: 5 }).where(eq(repoCounters.repoId, REPO_ID));
+    const third = await insertInvalidWorkflowRun(env.DB, { ...RUN_INPUT, workflowId: ".github/workflows/worst.yml" }, "worst YAML");
+    expect(third.index).toBe(6);
+  });
+
+  it("a stale counter self-heals to the repo max before the bump (the never-rewind repair)", async () => {
+    await seedRepo();
+    const first = await insertInvalidWorkflowRun(env.DB, RUN_INPUT, "bad YAML");
+    expect(first.index).toBe(1);
+    // simulate a pre-column repo: the counter at 0 while a run row sits at 1
+    await db().update(repoCounters).set({ runIndex: 0 }).where(eq(repoCounters.repoId, REPO_ID));
+    const second = await insertInvalidWorkflowRun(env.DB, { ...RUN_INPUT, workflowId: ".github/workflows/worse.yml" }, "worse YAML");
+    expect(second.index).toBe(2);
+    // a counter AHEAD of the rows never rewinds either
+    await db().update(repoCounters).set({ runIndex: 9 }).where(eq(repoCounters.repoId, REPO_ID));
+    const third = await insertInvalidWorkflowRun(env.DB, { ...RUN_INPUT, workflowId: ".github/workflows/worst.yml" }, "worst YAML");
+    expect(third.index).toBe(10);
   });
 
   it("keeps a valid run untouched next to the failed one", async () => {
