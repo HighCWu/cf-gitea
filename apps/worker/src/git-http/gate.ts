@@ -137,6 +137,7 @@ import { RepoNameCollisionError, RepoService, lookupRedirect } from "../repos/se
 import { assertDemoRepoQuota } from "../services/demo-quota";
 import { emitRepoEventInline, repositoryEventIdentity, repositoryEventPayload } from "../services/repo-events";
 import { appOrigin } from "../services/webhooks-push";
+import { oauth2FeatureEnabled } from "../services/oauth2/token";
 
 /**
  * Requests the gate has already authorized. The engine `authorize` hook
@@ -685,9 +686,11 @@ async function handleUnknownRepository(
   // Only receive-pack (advert probe or RPC) reaches the push-create surface.
   if (route.kind !== "receive-pack" && !probe) return engineKnownRead(req, env, ctx, engine, route);
 
-  // Row 15: anonymous pushes never reach push-create logic — 401 + challenge.
+  // Row 15: anonymous pushes never reach push-create logic — 401 + challenge
+  // (the realm follows the pin's OAuth2 switch, githttp.go:146-159 —
+  // SPEC specs/oauth2-provider.md §2.11's flip).
   const credential = requestCredential(req);
-  if (credential === null) return basicChallenge();
+  if (credential === null) return basicChallenge(oauth2FeatureEnabled(env));
 
   // Verify SPEC-0002-style, WITHOUT limiter side effects: unverifiable
   // credentials (the engine's GIT_TOKEN population, incl. the e2e suite)

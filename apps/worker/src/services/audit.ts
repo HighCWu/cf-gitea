@@ -134,6 +134,17 @@ export function renderMessage(action: string, vars: Record<string, string> = {})
  * ported without rewording). Ordering follows upstream's blocks.
  */
 export const AuditActions = {
+  // user:* (action.go:64-110) — the slice grows one row at a time as the
+  // owning wave lands its emit. This row is the OAuth2 provider's first
+  // consent (SPEC specs/oauth2-provider.md §2.2/§6 W4):
+  // audit.Record(..., UserOAuth2ApplicationGrant, ctx.Doer,
+  // "oauth2_application", app.Name, "granted_scope", form.Scope) at
+  // oauth2_provider.go:449-453 — FIRST-consent grant creation only (the
+  // re-consent scope-update branch records nothing upstream, :455-461).
+  UserOAuth2ApplicationGrant: defineAction(
+    "user:oauth2application:grant",
+    "Granted OAuth2 application {oauth2_application} access to user {scope}.",
+  ),
   // organization:* (action.go:114-134)
   OrganizationCreate: defineAction("organization:create", "Created organization {scope}."),
   OrganizationDelete: defineAction("organization:delete", "Deleted organization {scope}."),

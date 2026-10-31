@@ -39,7 +39,7 @@ import {
   getGrantByUserID,
   type OAuth2ApplicationRow,
 } from "../services/oauth2/grants";
-import { oauth2Applications, oauth2AuthorizationCodes, oauth2Grants, sessions, users } from "../db/schema";
+import { auditEvents, oauth2Applications, oauth2AuthorizationCodes, oauth2Grants, sessions, users } from "../db/schema";
 import { demoModeEnabled } from "../services/demo-sweep";
 import type { UiAssetsFetcher } from "./index";
 import type { UiManifest } from "./manifest";
@@ -617,6 +617,61 @@ describe("POST /login/oauth/grant", () => {
     const grants = await drizzle(env.DB).select().from(oauth2Grants).all();
     expect(grants).toHaveLength(1);
     expect(grants[0]?.scope).toBe(normalizeScope("read:repository,write:issue,read:issue").split(",").join(" "));
+  });
+});
+
+// ---------------------------------------------------------------------------------
+// The audit record (W4 — oauth2_provider.go:449-453, audit_model.
+// UserOAuth2ApplicationGrant): FIRST-consent grant creation only.
+// ---------------------------------------------------------------------------------
+
+describe("POST /login/oauth/grant — the audit record (W4)", () => {
+  const grantAuditRows = async (): Promise<Array<typeof auditEvents.$inferSelect>> =>
+    await drizzle(env.DB).select().from(auditEvents).all();
+
+  it("the first consent records user:oauth2application:grant (scope = the doer, metadata carries app + granted_scope)", async () => {
+    // the file's earlier grant dances emit too (the create arm is live) —
+    // clear the table so this arm counts ONLY its own dance.
+    await env.DB.prepare("DELETE FROM audit_event").run();
+    const user = await seedUser("AuditAnchor");
+    const app = await seedConsentFixture({ clientId: "audit-client" });
+    const fields = await harvestConsentForm(user, { clientId: "audit-client", query: "&scope=openid%20read%3Auser&code_challenge_method=S256&code_challenge=abc" });
+    const res = await request("/login/oauth/grant", {
+      method: "POST",
+      headers: { ...FORM_HEADERS, cookie: `gitea_session=${user.cookie}` },
+      body: formBody({ ...fields, granted: "true" }),
+    });
+    expect(res.status).toBe(303);
+
+    const rows = await grantAuditRows();
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.action).toBe("user:oauth2application:grant");
+    expect(row.actorId).toBe(user.id);
+    expect(row.actorName).toBe("AuditAnchor");
+    expect(row.scopeType).toBe("user");
+    expect(row.scopeId).toBe(String(user.id));
+    expect(row.scopeName).toBe("AuditAnchor");
+    expect(row.origin).toBe("ui");
+    expect(row.message).toBe(`Granted OAuth2 application ${app.name} access to user AuditAnchor.`);
+    const metadata = JSON.parse(row.metadata ?? "{}") as Record<string, unknown>;
+    expect(metadata.oauth2_application).toBe(app.name);
+    expect(metadata.granted_scope).toBe("openid read:user");
+  });
+
+  it("a re-consent (existing grant) records NOTHING — the scope-update branch is silent upstream too", async () => {
+    await env.DB.prepare("DELETE FROM audit_event").run();
+    const user = await seedUser("AuditAnchor2");
+    const app = await seedConsentFixture({ clientId: "audit-client-2" });
+    await seedGrant(user.id, app.id, "openid");
+    const fields = await harvestConsentForm(user, { clientId: "audit-client-2", query: "&scope=openid&code_challenge_method=S256&code_challenge=abc" });
+    const res = await request("/login/oauth/grant", {
+      method: "POST",
+      headers: { ...FORM_HEADERS, cookie: `gitea_session=${user.cookie}` },
+      body: formBody({ ...fields, granted: "true" }),
+    });
+    expect(res.status).toBe(303);
+    expect(await grantAuditRows()).toHaveLength(0);
   });
 });
 

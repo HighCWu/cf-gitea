@@ -91,6 +91,30 @@
     "PACKAGES_LIMIT_TOTAL_OWNER_SIZE": "-1",
     "PACKAGES_ENABLED": "true",
     "PACKAGE_CLEANUP_OLDER_THAN": "24",
+    // OAuth2 provider (specs/oauth2-provider.md §2.11, W4): strict polarity —
+    // ONLY the exact string "false" disables; default "true" is upstream's
+    // (setting.OAuth2.Enabled, modules/setting/oauth2.go:104). False ⇒ 403
+    // on the whole /login/oauth group (web.go:373-378/631's oauth2Enabled),
+    // 404 on /.well-known/openid-configuration (oauth2_wellknown.go:17-20),
+    // and the git-HTTP 401 realm reverting to `Basic realm="Gitea (Basic
+    // Auth)"` (githttp.go:146-159 — enabled answers `realm="Gitea"` so GCM
+    // drives its built-in OAuth2 application, git-credential-manager#1442).
+    "OAUTH2_ENABLED": "true",
+    // The id_token/JWKS signing algorithm (specs/oauth2-provider.md §2.10):
+    // one of HS256/384/512, RS256/384/512, ES256/384/512 (upstream's set,
+    // modules/setting/oauth2.go:108; EdDSA is rejected-until-proven on
+    // workerd — SPEC divergence (c)). The key lives in the `system_keystore`
+    // `oauth2_signing_key` row (get-or-create on first use); HS* reuses the
+    // shared general-token-signing-secret row (upstream's JWT_SECRET role).
+    // RS256 stays the default and the recommended arm.
+    "OAUTH2_SIGNING_ALGORITHM": "RS256",
+    // The OIDC `iss` claim + discovery `issuer` override ([oauth2]
+    // JWT_CLAIM_ISSUER, access_token.go:142-145). Empty/unset derives the
+    // issuer from APP_URL minus the trailing slash — the
+    // openid-connect-discovery §4 rule (the issuer MUST equal the URL
+    // /.well-known/openid-configuration was fetched from). Only moves the
+    // `issuer` member; the endpoint URLs always follow APP_URL.
+    "OAUTH2_JWT_CLAIM_ISSUER": "",
     // Outbound email (specs/email-outbound.md §6): strict-polarity, OFF by
     // default — a self-hosted deployment NEVER sends mail until armed, the
     // same fail-closed class as DEMO_MODE. Arming = MAIL_ENABLED "true" +

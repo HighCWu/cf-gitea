@@ -18,17 +18,32 @@ export const NO_CACHE_HEADERS: Record<string, string> = {
 };
 
 /**
- * The 401 challenge realm — the pin's OAuth2 switch (githttp.go:152-158):
- * `setting.OAuth2.Enabled` answers `Basic realm="Gitea"`, which tells GCM to
- * attempt its BUILT-IN OAUTH2 APPLICATION (git-credential-manager#1442);
- * the disabled arm deliberately answers `Basic realm="Gitea (Basic Auth)"` —
- * "If OAuth2 is disabled, then use another realm to avoid GCM OAuth2
- * attempt" — so credential managers fall back to prompting instead of
- * looping on an OAuth2 endpoint that does not exist. cf-gitea has no OAuth2
- * authorization server (only the application-management API surface has
- * landed), so the pin's disabled arm is our constant.
+ * The 401 challenge realm — the pin's OAuth2 switch (githttp.go:146-159),
+ * now CONDITIONAL on the provider (SPEC specs/oauth2-provider.md §2.11's
+ * flip): with the provider enabled (the `OAUTH2_ENABLED` var, default true
+ * = upstream's `setting.OAuth2.Enabled` default), the challenge answers
+ * `Basic realm="Gitea"`, which tells GCM to attempt its BUILT-IN OAUTH2
+ * APPLICATION (git-credential-manager#1442 — the seeded builtin
+ * applications make the attempt land); the disabled arm deliberately
+ * answers `Basic realm="Gitea (Basic Auth)"` — "If OAuth2 is disabled, then
+ * use another realm to avoid GCM OAuth2 attempt" — so credential managers
+ * fall back to prompting instead of looping on an OAuth2 endpoint that
+ * does not exist.
  */
+export const OAUTH2_BASIC_CHALLENGE = 'Basic realm="Gitea"';
+/** The disabled arm — the pre-provider constant, kept verbatim. */
 export const BASIC_AUTH_CHALLENGE = 'Basic realm="Gitea (Basic Auth)"';
+
+/**
+ * 401 authentication challenge (upstream sets `WWW-Authenticate` then
+ * `HTTPError(401)`, githttp.go:146-160 + base.go:105-111 → `http.Error`
+ * appends the trailing newline). The realm follows the pin's OAuth2 switch:
+ * provider enabled ⇒ OAUTH2_BASIC_CHALLENGE, disabled ⇒ BASIC_AUTH_CHALLENGE.
+ * Callers pass the strict-polarity gate read (`oauth2FeatureEnabled(env)`).
+ */
+export function basicChallenge(oauth2Enabled: boolean): Response {
+  return plainText(401, "Unauthorized\n", { "www-authenticate": oauth2Enabled ? OAUTH2_BASIC_CHALLENGE : BASIC_AUTH_CHALLENGE });
+}
 
 /** `Base.plainTextInternal` (services/context/base.go:130-139). */
 function plainText(status: number, body: string, headers?: Record<string, string>): Response {
@@ -36,16 +51,6 @@ function plainText(status: number, body: string, headers?: Record<string, string
     status,
     headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff", ...headers },
   });
-}
-
-/**
- * 401 authentication challenge (upstream sets `WWW-Authenticate` then
- * `HTTPError(401)`, githttp.go:146-160 + base.go:105-111 → `http.Error`
- * appends the trailing newline). The realm is BASIC_AUTH_CHALLENGE — the
- * pin's OAuth2-disabled arm.
- */
-export function basicChallenge(): Response {
-  return plainText(401, "Unauthorized\n", { "www-authenticate": BASIC_AUTH_CHALLENGE });
 }
 
 /** `PlainText(404, "Repository not found")` (githttp.go:198/211) — no newline. */

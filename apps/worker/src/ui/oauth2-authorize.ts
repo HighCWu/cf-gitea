@@ -18,9 +18,9 @@
  * claims).
  *
  * The gate slot: upstream wraps the group in `oauth2Enabled` (web.go:631 —
- * setting.OAuth2.Enabled false ⇒ 403 on every endpoint). The OAUTH2_ENABLED
- * var plumbing + gating is W4's hunk (SPEC §6); W3 ships the handlers
- * ungated with this slot recorded.
+ * setting.OAuth2.Enabled false ⇒ 403 on every endpoint). WIRED in W4: the
+ * router export below carries the group 403 wrap over the OAUTH2_ENABLED
+ * var (SPEC §6/§2.11), the outermost middleware before any session read.
  *
  * ## The session-state seam (the one adaptation upstream forces)
  *
@@ -52,11 +52,10 @@
  * token endpoint's JSON arm is W2's surface). Bodies are capped at 8 KiB
  * before parsing (the login form's guard).
  *
- * Audit slot: upstream records audit.UserOAuth2ApplicationGrant on
- * first-consent grant creation (:451-453); the landed audit registry
- * (services/audit.ts) has no OAuth2 family entry and that const is a
- * shared-file hunk outside this wave's ownership — recorded as the W4/W6
- * open issue, not silently dropped.
+ * Audit: upstream records audit.UserOAuth2ApplicationGrant on first-consent
+ * grant creation (:449-453); the registry row (services/audit.ts's
+ * `user:oauth2application:grant`, action.go:98 verbatim) and the emit ride
+ * the grantPost create arm below (W4 — the W3 open issue closed).
  */
 
 import { Hono, type Context } from "hono";
@@ -72,7 +71,9 @@ import {
   setGrantNonce,
   updateGrantScope,
 } from "../services/oauth2/grants";
+import { oauth2FeatureEnabled } from "../services/oauth2/token";
 import { oauth2Applications, sessions, users } from "../db/schema";
+import { AuditActions, emitAudit } from "../services/audit";
 import { demoModeEnabled } from "../services/demo-sweep";
 import { assetsBinding, assetsNotBuilt } from "./index";
 import {
@@ -688,9 +689,36 @@ async function grantPost(c: RouteContext): Promise<Response> {
   form.scope = normalizeGrantScope(form.scope);
 
   if (grant === null) {
-    // CreateGrant (:436-443) + the audit slot (see the module header —
-    // audit.UserOAuth2ApplicationGrant lands with the audit-registry entry).
-    await getOrCreateGrant(c.env.DB, { userId: doer.id, applicationId: app.id, scope: form.scope }, new Date());
+    // CreateGrant (:436-443) + the audit record (:449-453 — FIRST-consent
+    // grant creation only; the re-consent scope-update branch records
+    // nothing, :455-461). The store's `created` flag arbitrates the consent
+    // race, so exactly one of two concurrent first-consents emits.
+    const { created } = await getOrCreateGrant(c.env.DB, { userId: doer.id, applicationId: app.id, scope: form.scope }, new Date());
+    if (created) {
+      // audit.Record(ctx, audit_model.UserOAuth2ApplicationGrant, ctx.Doer,
+      // "oauth2_application", app.Name, "granted_scope", form.Scope):
+      // scope = the doer (user), metadata pairs oauth2_application +
+      // granted_scope (the template renders {oauth2_application} and the
+      // reserved {scope}). Upstream's writeEvent LOGS failures and never
+      // fails the request (services/audit/event.go:136-140) — the catch
+      // keeps that posture.
+      try {
+        await emitAudit(drizzle(c.env.DB), {
+          action: AuditActions.UserOAuth2ApplicationGrant,
+          actorId: doer.id,
+          actorName: doer.username,
+          scopeType: "user",
+          scopeId: doer.id,
+          scopeName: doer.username,
+          origin: "ui",
+          ipAddress: c.req.header("cf-connecting-ip") ?? null,
+          vars: { scope: doer.username, oauth2_application: app.name },
+          metadata: { oauth2_application: app.name, granted_scope: form.scope },
+        });
+      } catch (error) {
+        console.error("oauth2: unable to record the grant audit event", error);
+      }
+    }
   } else if (grant.scope !== form.scope) {
     // UpdateGrantScope (:445-449) — the scope column only.
     await updateGrantScope(c.env.DB, grant.id, form.scope);
@@ -733,11 +761,37 @@ async function grantPost(c: RouteContext): Promise<Response> {
 
 // ---------------------------------------------------------------------------
 // The router — MOUNT (orchestrator handoff): `app.route("/",
-// oauth2AuthorizeRouter);` beside the sessionRouter mount. The
-// oauth2Enabled 403 gate wraps this group in W4 (web.go:631).
+// oauth2AuthorizeRouter);` beside the sessionRouter mount.
 // ---------------------------------------------------------------------------
 
 export const oauth2AuthorizeRouter = new Hono<{ Bindings: Env }>();
+
+/** ctx.HTTPError(http.StatusForbidden) (services/context/base.go:105-111 →
+ *  net/http http.Error): body "Forbidden\n", `text/plain; charset=utf-8`
+ *  (WITH the space — http.Error's own spelling; Gitea's PlainText omits
+ *  it), nosniff. */
+function httpForbidden(): Response {
+  return new Response("Forbidden\n", {
+    status: 403,
+    headers: { "content-type": "text/plain; charset=utf-8", "x-content-type-options": "nosniff" },
+  });
+}
+
+// THE GATE SLOT, WIRED (W4): oauth2Enabled (web.go:373-378 —
+// setting.OAuth2.Enabled false ⇒ 403) as the OUTERMOST middleware of the
+// group (web.go:631 — the group option runs before reqSignIn, so a disabled
+// provider 403s the authorize/grant pair before any session read). The gate
+// reads the OAUTH2_ENABLED var through the landed strict-polarity helper
+// (oauth2FeatureEnabled — ONLY the exact string "false" disables, default
+// true is upstream's, modules/setting/oauth2.go:104); the widened read
+// below is the Env-posture (the generated Env may not type the var yet —
+// the OAuth2TokenEnv alias note, web/oauth2-token.ts).
+oauth2AuthorizeRouter.use("*", async (c, next) => {
+  if (!oauth2FeatureEnabled(c.env)) {
+    return httpForbidden();
+  }
+  await next();
+});
 
 // upstream registers GET and POST on /authorize with the same handler
 // (web.go:622-630 — the POST arm carries the TODO comment verbatim there).

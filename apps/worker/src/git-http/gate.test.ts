@@ -112,11 +112,15 @@ beforeEach(async () => {
 
 const RECEIVE_CT = "application/x-git-receive-pack-request";
 const UPLOAD_CT = "application/x-git-upload-pack-request";
-// The pin's OAuth2-DISABLED challenge arm (githttp.go:152-158): realm="Gitea"
-// is reserved for an enabled OAuth2 server (GCM then attempts its built-in
-// OAuth2 application); cf-gitea has no OAuth2 server, so the deliberate
-// switch lands on "Gitea (Basic Auth)" — the GCM-loop fix (SPEC-0002 §2.6).
-const CHALLENGE = 'Basic realm="Gitea (Basic Auth)"';
+// The challenge realm follows the pin's OAuth2 switch (githttp.go:152-158,
+// now LIVE — SPEC specs/oauth2-provider.md §2.11's flip): the provider is
+// ENABLED by default (OAUTH2_ENABLED strict polarity, default true =
+// upstream's setting.OAuth2.Enabled), so the challenge answers realm="Gitea"
+// — GCM then attempts its BUILT-IN OAuth2 application (the seeded builtin
+// rows make the attempt land, git-credential-manager#1442). The disabled
+// polarity reverts to "Gitea (Basic Auth)" — the GCM-loop fix (SPEC-0002
+// §2.6), pinned at the challenge site in web/oauth2-wellknown.test.ts.
+const CHALLENGE = 'Basic realm="Gitea"';
 
 /** Push-create `alice/<slug>` (SPEC-0003 §2.5.2) with a real one-commit pack,
  *  then run the §2.5.2 settle handshake the gate schedules via waitUntil. */
@@ -1603,22 +1607,25 @@ describe("the *.wiki git family (upstream githttp.go:94-101 — the wiki SPEC's 
 });
 
 // ---------------------------------------------------------------------------------
-// The 401 realm follows the pin's OAuth2 switch (githttp.go:152-158) and deploy
-// tokens authenticate git-HTTP (the upstream DeployToken method, web.go:135-136)
+// The 401 realm follows the pin's OAuth2 switch (githttp.go:152-158 — LIVE per
+// SPEC specs/oauth2-provider.md §2.11) and deploy tokens authenticate git-HTTP
+// (the upstream DeployToken method, web.go:135-136)
 // ---------------------------------------------------------------------------------
 
-describe("the 401 challenge realm is the pin's OAuth2-disabled arm (parity-review-git)", () => {
-  it("answers Basic realm=\"Gitea (Basic Auth)\" — never the GCM OAuth2-bait realm without an OAuth2 server", async () => {
+describe("the 401 challenge realm follows the OAuth2 provider gate (SPEC oauth2-provider §2.11)", () => {
+  it("answers Basic realm=\"Gitea\" under the enabled-by-default provider — the GCM built-in-application realm", async () => {
     await pushCreateAndSettle("realmonly");
     const challenge = await SELF.fetch(
       "https://example.com/alice/realmonly.git/info/refs?service=git-upload-pack",
     );
     expect(challenge.status).toBe(401);
-    // The exact pin: `setting.OAuth2.Enabled` selects `realm="Gitea"` (GCM then
-    // attempts its built-in OAuth2 application, git-credential-manager#1442);
-    // the disabled arm deliberately switches so credential managers prompt
-    // instead of looping. cf-gitea has no OAuth2 server.
-    expect(challenge.headers.get("www-authenticate")).toBe('Basic realm="Gitea (Basic Auth)"');
+    // The exact pin: `setting.OAuth2.Enabled` (default true; our
+    // OAUTH2_ENABLED strict polarity) selects `realm="Gitea"` — GCM then
+    // attempts its built-in OAuth2 application (git-credential-manager#1442;
+    // the migration-0052 builtin seed makes the attempt land). The disabled
+    // arm ("Gitea (Basic Auth)") is pinned at the challenge site in
+    // web/oauth2-wellknown.test.ts.
+    expect(challenge.headers.get("www-authenticate")).toBe('Basic realm="Gitea"');
   });
 });
 

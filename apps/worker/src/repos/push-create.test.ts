@@ -210,7 +210,7 @@ describe("push-create ACL (SPEC-0003 §2.4 rows 15-20)", () => {
 
     expect(response.status).toBe(matrixCase.expectStatus);
     if (matrixCase.expectChallenge) {
-      expect(response.headers.get("www-authenticate")).toBe('Basic realm="Gitea (Basic Auth)"');
+      expect(response.headers.get("www-authenticate")).toBe('Basic realm="Gitea"'); // the OAuth2-enabled realm (SPEC oauth2-provider §2.11 flip)
     } else {
       expect(response.headers.get("www-authenticate")).toBeNull();
     }

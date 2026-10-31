@@ -28,14 +28,17 @@
  * per-path `.all` fallbacks below also give the wrong-method arms chi's
  * body-empty 405 (the mux's MethodNotAllowedHandler default).
  *
- * ## Gate note (W4's)
+ * ## The gate (W4's wrap — live)
  *
  * Upstream wraps the group in `oauth2Enabled` (403 when disabled,
- * web.go:373-378/631) — that 403 arm is W4's OAUTH2_ENABLED plumbing
- * (SPEC §6 W4). This module ships the routes ungated; the API-side half of
- * the gate (a disabled provider kills its tokens — services/auth/
- * oauth2.go:32-34) rides resolveOAuth2AccessTokenCredential and IS live
- * here via oauth2FeatureEnabled.
+ * web.go:373-378/631) — the OAUTH2_ENABLED 403 middleware below is that
+ * wrap, the OUTERMOST group middleware (upstream's group option runs
+ * before optionsCorsHandler, so a disabled provider answers 403 for every
+ * method INCLUDING the bare-OPTIONS probes; enabled, those still take the
+ * 405 deny arms). The API-side half of the gate (a disabled provider kills
+ * its tokens — services/auth/oauth2.go:32-34) rides
+ * resolveOAuth2AccessTokenCredential and stays live via
+ * oauth2FeatureEnabled.
  *
  * ## Byte shapes
  *
@@ -227,6 +230,30 @@ function appUrlOf(c: Context<{ Bindings: OAuth2TokenEnv }>): string {
 // ---------------------------------------------------------------------------
 
 export const oauth2Router = new Hono<{ Bindings: OAuth2TokenEnv }>();
+
+/** ctx.HTTPError(http.StatusForbidden) (services/context/base.go:105-111 →
+ *  net/http http.Error): body "Forbidden\n", `text/plain; charset=utf-8`
+ *  (WITH the space — http.Error's own spelling; Gitea's PlainText omits
+ *  it), nosniff. */
+function httpForbidden(): Response {
+  return new Response("Forbidden\n", {
+    status: 403,
+    headers: { "content-type": "text/plain; charset=utf-8", "x-content-type-options": "nosniff" },
+  });
+}
+
+// The group wrap (W4): oauth2Enabled (web.go:373-378 — setting.OAuth2.Enabled
+// false ⇒ 403) as the OUTERMOST middleware of this group, exactly upstream's
+// group option order (it runs before optionsCorsHandler, so a disabled
+// provider 403s even the OPTIONS probes). Registered FIRST so it wraps every
+// route below (Hono composes in registration order). The well-known route
+// answers 404 instead (oauth2_wellknown.go:17-20 — it self-gates).
+oauth2Router.use("*", async (c, next) => {
+  if (!oauth2FeatureEnabled(c.env)) {
+    return httpForbidden();
+  }
+  await next();
+});
 
 // ---------------------------------------------------------------------------
 // POST /login/oauth/access_token (AccessTokenOAuth, oauth2_provider.go:506-564)

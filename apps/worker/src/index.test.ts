@@ -328,7 +328,11 @@ describe("gitHttpGate ACL matrix (SPEC-0003 §2.4 rows 1-14)", () => {
 
     expect(response.status).toBe(matrixCase.expectStatus);
     if (matrixCase.expectChallenge) {
-      expect(response.headers.get("www-authenticate")).toBe('Basic realm="Gitea (Basic Auth)"');
+      // The realm follows the pin's OAuth2 switch (githttp.go:146-159) —
+      // the provider is enabled by default (SPEC specs/oauth2-provider.md
+      // §2.11's flip; the disabled arm is pinned at the challenge site,
+      // web/oauth2-wellknown.test.ts).
+      expect(response.headers.get("www-authenticate")).toBe('Basic realm="Gitea"');
     } else {
       expect(response.headers.get("www-authenticate")).toBeNull();
     }
@@ -517,7 +521,9 @@ describe("gitHttpGate synthetic HEAD endpoint (route table row 4)", () => {
     const response = await SELF.fetch("https://example.com/alice/private.git/HEAD");
 
     expect(response.status).toBe(401);
-    expect(response.headers.get("www-authenticate")).toBe('Basic realm="Gitea (Basic Auth)"');
+    // The realm follows the OAuth2 switch (githttp.go:146-159) — enabled by
+    // default (SPEC specs/oauth2-provider.md §2.11's flip).
+    expect(response.headers.get("www-authenticate")).toBe('Basic realm="Gitea"');
   });
 
   it("404-masks a non-owner's HEAD on a private repo", async () => {
@@ -670,7 +676,7 @@ describe("gitHttpGate LFS interception (SPEC-0006 §2.1)", () => {
 
     // The family answers for D1-backed repos: an anonymous upload on a
     // private repo is the LFS 401 challenge with realm="gitea-lfs" — not the
-    // git-HTTP `realm="Gitea (Basic Auth)"` challenge and not the engine's JSON 404 —
+    // git-HTTP `realm="Gitea"` challenge and not the engine's JSON 404 —
     // proving the interception branch (not the git routes) handled it.
     expect(response.status).toBe(401);
     expect(response.headers.get("www-authenticate")).toBe('Basic realm="gitea-lfs"');

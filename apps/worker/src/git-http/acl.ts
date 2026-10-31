@@ -38,6 +38,7 @@ import {
   limiterResetFailOpen,
 } from "../auth/middleware";
 import { basicAuthTokenCandidate, parseAuthorizationHeader } from "../auth/httpauth";
+import { oauth2FeatureEnabled } from "../services/oauth2/token";
 import { ScopeSet } from "../auth/scopes";
 import { TokenService, type VerifiedAuth } from "../auth/token-service";
 import {
@@ -240,9 +241,11 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
     }
     if (verified === null) {
       // Unknown/revoked/expired/malformed credential → 401 challenge
-      // (identity not established; §2.4 edge 4.14).
+      // (identity not established; §2.4 edge 4.14). Upstream answers the
+      // failed-credential arm at the SAME challenge site (githttp.go:146-159
+      // — !ctx.IsSigned), so the realm follows the OAuth2 switch here too.
       input.waitUntil(limiterRecordFailureFailOpen(limiter, ip, now));
-      return basicChallenge();
+      return basicChallenge(oauth2FeatureEnabled(env));
     }
 
     const scope = ScopeSet.parseLenient(verified.token.scopes);
@@ -258,10 +261,10 @@ export async function authorizeGitHttp(input: GitHttpAclInput): Promise<Response
     // predicate the API visibility layer resolves; 'none' when the doer
     // holds no grant).
     const teamMode = await doerRepoAccessMode(env.DB, { id: repo.id, ownerId: repo.ownerId }, verified.user.id);
-    return decide(op, repo, owner, input.ownerVisibility, input.unitAnonymousRead, verified.user, scope, teamMode);
+    return decide(op, repo, owner, input.ownerVisibility, input.unitAnonymousRead, verified.user, scope, teamMode, oauth2FeatureEnabled(env));
   }
 
-  return decide(op, repo, owner, input.ownerVisibility, input.unitAnonymousRead, null, null, "none");
+  return decide(op, repo, owner, input.ownerVisibility, input.unitAnonymousRead, null, null, "none", oauth2FeatureEnabled(env));
 }
 
 /**
@@ -306,7 +309,9 @@ export function readGrant(input: {
  * alongside it. `teamMode` is the authenticated doer's resolved grant
  * (SPEC-0007 §3.5 org/team arms + SPEC-0005 collaborator row, resolved by
  * `authorizeGitHttp` from the shared repository-service predicate) — 'none'
- * when anonymous. See the table in SPEC-0003 §2.4.
+ * when anonymous. `oauth2Enabled` selects the 401 challenge's realm (the
+ * pin's OAuth2 switch, githttp.go:146-159 — SPEC specs/oauth2-provider.md
+ * §2.11's flip). See the table in SPEC-0003 §2.4.
  */
 function decide(
   op: GitHttpOp,
@@ -317,6 +322,7 @@ function decide(
   doer: AuthUser | null,
   scope: ScopeSet | null,
   teamMode: TeamAccessMode,
+  oauth2Enabled: boolean,
 ): Response | true {
   // Visibility model (§2.5.6): repo `visibility` × owner `users.visibility`.
   // Row 1: public repo + active PUBLIC owner. Row 2's limited/private-owner
@@ -338,8 +344,9 @@ function decide(
   if (doer === null) {
     if (anonymousUnitRead || (op === "read" && publiclyVisible)) return true;
     // Rows 2/3/5: every other anonymous request challenges — pushes always
-    // need identity, and unit read never grants write (test :184).
-    return basicChallenge();
+    // need identity, and unit read never grants write (test :184). The
+    // realm follows the pin's OAuth2 switch (githttp.go:146-159).
+    return basicChallenge(oauth2Enabled);
   }
 
   // Row 7: known token lacking the repository-category scope for the op
