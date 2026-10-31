@@ -87,6 +87,32 @@ import {
   openAlpinePackageFile,
   uploadAlpinePackage,
 } from "../../services/packages/alpine";
+import {
+  ArchInvalidArchitectureError,
+  ArchInvalidNameError,
+  ArchInvalidVersionError,
+  ArchMissingPkginfoError,
+  ArchPkginfoTooLargeError,
+  ArchTooManyFileEntriesError,
+  ArchUnsupportedFormatError,
+  buildArchRepositoryKey,
+  deleteArchPackageVersion,
+  openArchRepositoryFile,
+  uploadArchPackage,
+} from "../../services/packages/arch";
+import {
+  MAX_RPM_ERRATA_BODY_BYTES,
+  RpmInvalidPackageError,
+  RpmPackageNotExistError,
+  buildRpmRepositoryKey,
+  deleteRpmPackageFile,
+  openRpmPackageFile,
+  openRpmRepositoryFile,
+  parseRpmTarget,
+  renderRpmRepositoryConfig,
+  uploadRpmErrata,
+  uploadRpmPackage,
+} from "../../services/packages/rpm";
 import { getPackageProperties } from "../../services/packages/protocol-common";
 import { PackageSizeMismatchError, PackageBlobTooLargeError, packageBlobContentKey } from "../../services/packages/blobs";
 import { DuplicatePackageFileError } from "../../services/packages/generic";
@@ -1520,13 +1546,320 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
       return debianErrorResponse(error);
     }
   });
+
+  // ------------------------------ RPM (api.go:423-435) ------------------------------
+  // The M7 index-builder family: the stored repodata serving arms over the
+  // internal `_rpm` version + the upload/delete/errata riders (services/
+  // packages/rpm.ts carries the createrepo-shaped builder + the binary header
+  // parse). The group spans segments upstream (`<group:*>`), so the
+  // `/:username/rpm/*` wildcard hands the remainder to parseRpmTarget — the
+  // npm walk's precedent — and the sibling `/rpm.repo` route is the group=""
+  // config (api.go:423).
+
+  const rpmRepoConfig = async (c: Context<{ Bindings: Env }>, group: string): Promise<Response> => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      const origin = new URL(c.req.url).origin;
+      // GetRepositoryConfig (rpm.go:36-52): setting.AppURL renders as the
+      // request origin, AppName as the literal "Gitea" (the instance-name
+      // posture).
+      const body = renderRpmRepositoryConfig(owner.username, owner.usernameLower, group, `${origin}/api/packages/${owner.username}/rpm`, "Gitea");
+      return new Response(body, { status: 200, headers: { "content-type": "text/plain;charset=utf-8" } });
+    } catch (error) {
+      return rpmErrorResponse(error);
+    }
+  };
+  app.on(["HEAD", "GET"], "/:username/rpm.repo", (c) => rpmRepoConfig(c, ""));
+
+  const rpmDispatch = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
+    try {
+      const rawPath = c.req.path;
+      const segments = rawPath.split("/");
+      // ["", "api", "packages", {username}, "rpm", ...] — the npm walk's
+      // path discipline: RESERVED escapes survive in c.req.path; this walk
+      // decodes the remainder FULLY (a malformed escape cannot match the
+      // grammar below and 404s).
+      const prefix = `/api/packages/${segments[3] ?? ""}/rpm/`;
+      if (!rawPath.startsWith(prefix)) {
+        return rpmPlain(404, "package file does not exist");
+      }
+      let decoded: string;
+      try {
+        decoded = decodeURIComponent(rawPath.slice(prefix.length));
+      } catch {
+        return rpmPlain(404, "package file does not exist");
+      }
+      const target = parseRpmTarget(decoded, c.req.method);
+      if (target === null) {
+        return rpmPlain(404, "package file does not exist");
+      }
+      const READ_ARMS: ReadonlySet<string> = new Set(["key", "repo-config", "repodata", "download"]);
+      const { owner, cred } = await protocolContext(c, READ_ARMS.has(target.arm) ? "read" : "write");
+
+      switch (target.arm) {
+        case "key": {
+          // GetRepositoryKey (rpm.go:55-66): the armored transferable public
+          // key, application/pgp-keys, filename repository.key.
+          const key = await buildRpmRepositoryKey(c.env.DB, owner.id);
+          return new Response(key, {
+            status: 200,
+            headers: {
+              "content-type": "application/pgp-keys",
+              "content-disposition": contentDispositionAttachment("repository.key"),
+            },
+          });
+        }
+        case "repo-config":
+          return rpmRepoConfig(c, target.group);
+        case "repodata": {
+          // HEAD → CheckRepositoryFileExistence (rpm.go:68-90, bare
+          // headers); GET → GetRepositoryFile (rpm.go:93-119). The internal
+          // files are IsLead=false, so the counter never moves.
+          const download = await openRpmRepositoryFile(c.env.DB, c.env.REPO_PACKS, owner.id, target.group, target.filename ?? "");
+          if (download === null) return rpmPlain(404, "package file does not exist");
+          return fileResponse(c, download);
+        }
+        case "upload": {
+          // UploadPackageFile (rpm.go:121-219): the PUT stream, the parse,
+          // the properties triple, the rebuild rider. The `sign` query arm
+          // is accepted and ignored (the rpm.ts module-header reduction).
+          const doer = cred.doer;
+          if (doer === null) {
+            return rpmPlain(401, "user should have specific permission or be a site admin");
+          }
+          await uploadRpmPackage({
+            d1: c.env.DB,
+            bucket: c.env.REPO_PACKS,
+            owner,
+            doer,
+            group: target.group,
+            content: bodyStream(c.req.raw),
+            declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
+            quota: packagesQuotaFromEnv(c.env),
+          });
+          return new Response(null, { status: 201 });
+        }
+        case "errata": {
+          // UploadErrata (rpm.go:331-471): the JSON updates array merged
+          // into the version's metadata, the rebuild, 200. The body is a
+          // bounded read (the npm put-tag posture).
+          const doer = cred.doer;
+          if (doer === null) {
+            return rpmPlain(401, "user should have specific permission or be a site admin");
+          }
+          const body = await c.req.raw.text();
+          if (body.length > MAX_RPM_ERRATA_BODY_BYTES) {
+            return rpmPlain(400, "invalid update info");
+          }
+          let updates: unknown;
+          try {
+            updates = JSON.parse(body);
+          } catch (error) {
+            return rpmPlain(400, error instanceof Error ? error.message : "invalid update info");
+          }
+          if (!Array.isArray(updates)) {
+            return rpmPlain(400, "invalid update info");
+          }
+          await uploadRpmErrata(c.env.DB, c.env.REPO_PACKS, owner.id, target.group, target.name ?? "", target.version ?? "", updates);
+          return new Response(null, { status: 200 });
+        }
+        case "download": {
+          // DownloadPackageFile (rpm.go:221-257): the two URL shapes share
+          // one handler — the {filename} tail is ignored (the upstream
+          // comment on the route), the noarch fallback applies, GET bumps
+          // the lead counter.
+          const download = await openRpmPackageFile(
+            c.env.DB,
+            c.env.REPO_PACKS,
+            owner.id,
+            target.group,
+            target.name ?? "",
+            target.version ?? "",
+            target.architecture ?? "",
+            c.req.method === "HEAD" ? "HEAD" : "GET",
+          );
+          if (download === null) return rpmPlain(404, "package file does not exist");
+          return fileResponse(c, download);
+        }
+        case "delete": {
+          // DeletePackageFile (rpm.go:259-328): the exact-architecture file
+          // (no fallback), the unreferenced-version fold, the rebuild, 204.
+          const doer = cred.doer;
+          if (doer === null) {
+            return rpmPlain(401, "user should have specific permission or be a site admin");
+          }
+          const deleted = await deleteRpmPackageFile(
+            c.env.DB,
+            c.env.REPO_PACKS,
+            owner.id,
+            target.group,
+            target.name ?? "",
+            target.version ?? "",
+            target.architecture ?? "",
+          );
+          if (!deleted) return rpmPlain(404, "package file does not exist");
+          return new Response(null, { status: 204 });
+        }
+        default:
+          return rpmPlain(404, "package file does not exist");
+      }
+    } catch (error) {
+      return rpmErrorResponse(error);
+    }
+  };
+  app.on(["HEAD", "GET"], "/:username/rpm/*", (c) => rpmDispatch(c));
+  app.on("PUT", "/:username/rpm/*", (c) => rpmDispatch(c));
+  app.on("POST", "/:username/rpm/*", (c) => rpmDispatch(c));
+  app.on("DELETE", "/:username/rpm/*", (c) => rpmDispatch(c));
+
+  // ------------------------------ ARCH (api.go:118-126) ------------------------------
+  // The pacman family: the repository.generic PKGINFO index builder lives in
+  // services/packages/arch.ts (the .db tar + the vercmp port). The route
+  // grammar is upstream's PathGroup wildcard — `<repository:*>` spans
+  // segments AND can be empty (chi's catch-all matches zero segments; the
+  // integration test's repository "" arms ride it), with the literal tail
+  // segments pinning the arm:
+  //   PUT  /<repository:*>                              → upload (repository = the whole remainder, TrimSpace'd)
+  //   GET  /<repository:*>/<architecture>/<filename>    → GetPackageOrRepositoryFile
+  //   DEL  /<repository:*>/<name>/<version>/<architecture> → DeletePackageVersion
+  // so the GET arm pins the last TWO segments and the DELETE arm the last
+  // THREE. Hono params cannot span segments, so the /:username/arch/*
+  // wildcard hands the raw remainder to the walk (the npm PathGroup
+  // posture), decoding PER SEGMENT (chi matches the raw path and unescapes
+  // each param — an encoded slash stays within its segment).
+
+  const archKey = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
+    try {
+      const { owner } = await protocolContext(c, "read");
+      // GetRepositoryKey (arch.go:31-41): application/pgp-keys, ServeContent
+      // with no filename — no attachment disposition.
+      const key = await buildArchRepositoryKey(c.env.DB, owner.id);
+      return new Response(key, { status: 200, headers: { "content-type": "application/pgp-keys" } });
+    } catch (error) {
+      return debianErrorResponse(error);
+    }
+  };
+  app.get("/:username/arch/repository.key", (c) => archKey(c));
+  app.on("HEAD", "/:username/arch/repository.key", (c) => archKey(c));
+
+  type ArchTarget =
+    | { arm: "upload"; repository: string }
+    | { arm: "file"; repository: string; architecture: string; filename: string }
+    | { arm: "delete"; repository: string; name: string; version: string; architecture: string };
+
+  const archTargetFrom = (parts: string[], method: string): ArchTarget | null => {
+    if (method === "PUT") {
+      return { arm: "upload", repository: parts.join("/") };
+    }
+    if (method === "GET" || method === "HEAD") {
+      if (parts.length < 2) return null;
+      const architecture = parts[parts.length - 2] ?? "";
+      const filename = parts[parts.length - 1] ?? "";
+      return { arm: "file", repository: parts.slice(0, -2).join("/"), architecture, filename };
+    }
+    if (method === "DELETE") {
+      if (parts.length < 3) return null;
+      const name = parts[parts.length - 3] ?? "";
+      const version = parts[parts.length - 2] ?? "";
+      const architecture = parts[parts.length - 1] ?? "";
+      return { arm: "delete", repository: parts.slice(0, -3).join("/"), name, version, architecture };
+    }
+    return null;
+  };
+
+  const archDispatch = async (c: Context<{ Bindings: Env }>): Promise<Response> => {
+    try {
+      const rawPath = c.req.path;
+      const segments = rawPath.split("/");
+      // ["", "api", "packages", {username}, "arch", ...] — the npm walk's
+      // path discipline: RESERVED escapes survive in c.req.path; this walk
+      // decodes each segment (chi's per-param unescape; a malformed escape
+      // cannot match the grammar below and 404s).
+      const prefix = `/api/packages/${segments[3] ?? ""}/arch`;
+      if (!rawPath.startsWith(`${prefix}/`) && rawPath !== prefix) {
+        return debianPlain(404, "");
+      }
+      const rawRemainder = rawPath.slice(prefix.length).replace(/^\//, "");
+      const parts: string[] = [];
+      if (rawRemainder !== "") {
+        for (const part of rawRemainder.split("/")) {
+          try {
+            parts.push(decodeURIComponent(part));
+          } catch {
+            return debianPlain(404, "");
+          }
+        }
+      }
+      const target = archTargetFrom(parts, c.req.method);
+      if (target === null) return debianPlain(404, "");
+      if (target.arm === "upload") {
+        const { owner, cred } = await protocolContext(c, "write");
+        const doer = cred.doer;
+        if (doer === null) {
+          return debianPlain(401, "user should have specific permission or be a site admin");
+        }
+        await uploadArchPackage({
+          d1: c.env.DB,
+          bucket: c.env.REPO_PACKS,
+          owner,
+          doer,
+          repository: target.repository,
+          content: bodyStream(c.req.raw),
+          declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
+          quota: packagesQuotaFromEnv(c.env),
+        });
+        return new Response(null, { status: 201 });
+      }
+      if (target.arm === "file") {
+        const { owner } = await protocolContext(c, "read");
+        const download = await openArchRepositoryFile(
+          c.env.DB,
+          c.env.REPO_PACKS,
+          owner.id,
+          target.repository,
+          target.architecture,
+          target.filename,
+        );
+        if (download === null) return debianPlain(404, "");
+        return fileResponse(c, download);
+      }
+      const { owner, cred } = await protocolContext(c, "write");
+      const doer = cred.doer;
+      if (doer === null) {
+        return debianPlain(401, "user should have specific permission or be a site admin");
+      }
+      const deleted = await deleteArchPackageVersion(
+        c.env.DB,
+        c.env.REPO_PACKS,
+        owner,
+        target.repository,
+        target.architecture,
+        target.name,
+        target.version,
+      );
+      if (!deleted.ok) {
+        // The version miss carries upstream's not-exist sentinel body; the
+        // file-search miss is the nil-object EMPTY body (arch.go:268-275 vs
+        // :285-288).
+        return debianPlain(404, deleted.missing === "version" ? "resource does not exist" : "");
+      }
+      return new Response(null, { status: 204 });
+    } catch (error) {
+      return debianErrorResponse(error);
+    }
+  };
+  app.put("/:username/arch", (c) => archDispatch(c)); // api.go:120 — the no-repository arm
+  app.put("/:username/arch/*", (c) => archDispatch(c));
+  app.get("/:username/arch/*", (c) => archDispatch(c));
+  app.on("HEAD", "/:username/arch/*", (c) => archDispatch(c));
+  app.delete("/:username/arch/*", (c) => archDispatch(c));
   return app;
 }
 
 // ---------------------------------------------------------------------------
 // The M7 error/response helpers (the debian + alpine families share the
-// plain-text apiError shape — debian.go:26-29 / alpine.go:27-30, both through
-// helper.ProcessErrorForUser → ctx.PlainText)
+// plain-text apiError shape — debian.go:26-29 / alpine.go:27-30 /
+// arch.go:26-29, all through helper.ProcessErrorForUser → ctx.PlainText)
 // ---------------------------------------------------------------------------
 
 /** The plain-text body with the upstream status (ctx.PlainText). */
@@ -1549,7 +1882,14 @@ function debianErrorResponse(error: unknown): Response {
     error instanceof AlpineInvalidNameError ||
     error instanceof AlpineInvalidVersionError ||
     error instanceof AlpinePackageInfoTooLargeError ||
-    error instanceof AlpineInvalidBranchError
+    error instanceof AlpineInvalidBranchError ||
+    error instanceof ArchMissingPkginfoError ||
+    error instanceof ArchUnsupportedFormatError ||
+    error instanceof ArchInvalidNameError ||
+    error instanceof ArchInvalidVersionError ||
+    error instanceof ArchInvalidArchitectureError ||
+    error instanceof ArchPkginfoTooLargeError ||
+    error instanceof ArchTooManyFileEntriesError
   ) {
     return debianPlain(400, error.message);
   }
@@ -1561,6 +1901,32 @@ function debianErrorResponse(error: unknown): Response {
   }
   console.error("[packages-distro] request failed", error);
   return debianPlain(500, "internal server error");
+}
+
+// ---------------------------------------------------------------------------
+// The RPM response helpers (rpm.go:30-33 — the plain-text apiError shape,
+// helper.ProcessErrorForUser → ctx.PlainText; the status map rides
+// UploadPackageFile's switch: 400 ErrInvalidArgument / 409 duplicates /
+// 403 quota / 404 not-exist)
+// ---------------------------------------------------------------------------
+
+function rpmPlain(status: 400 | 401 | 403 | 404 | 409 | 411 | 413 | 500, message: string): Response {
+  return plainResponse(status, message);
+}
+
+function rpmErrorResponse(error: unknown): Response {
+  if (error instanceof HTTPException) throw error;
+  if (error instanceof RpmInvalidPackageError || error instanceof PackageSizeMismatchError) {
+    return rpmPlain(400, error.message);
+  }
+  if (error instanceof RpmPackageNotExistError) return rpmPlain(404, error.message);
+  if (error instanceof DuplicatePackageFileError) return rpmPlain(409, "package file already exists");
+  if (error instanceof PackageBlobTooLargeError) return rpmPlain(413, error.message);
+  if (error instanceof QuotaTotalCountError || error instanceof QuotaTypeSizeError || error instanceof QuotaTotalSizeError) {
+    return rpmPlain(403, quotaMessage(error));
+  }
+  console.error("[packages-rpm] request failed", error);
+  return rpmPlain(500, "internal server error");
 }
 
 // ---------------------------------------------------------------------------

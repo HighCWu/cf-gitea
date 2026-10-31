@@ -983,12 +983,243 @@ PENDING (their additive cites below).
   Residual for the orchestrator's wiring wave: the deploy-probes battery
   (currently six protocols) may gain debian/alpine arms — not this unit's
   file.
-- **PENDING (additive rows for the next wave):** rpm (`api.go:423-434` +
-  rpm/router 471 ln + repository.go 709 ln + sign.go — the repodata XML
-  builder over the same stored-index posture, `createrepo`-shaped
-  primary/other/repomd files, the RPM header parse at modules/packages/rpm/
-  metadata.go:106+, the GPG-detached `repomd.xml.asc` arm) and arch
-  (`api.go:118-126` + arch/router 305 ln + repository.go 400 ln + vercmp.go
-  105 ln — the PathGroup wildcard grammar, the pacman .db tar built from
-  .PKGINFO desc files, the version-compare port). Both mirror this module
-  trio's substrate unchanged.
+- **As-built — M7 half two: rpm (2026-10-31 — the registry carries TEN
+  protocols):** `services/packages/rpm.ts` + the rpm route arms in
+  `api/routes/packages-protocols.ts` (upstream `routers/api/packages/rpm/
+  rpm.go` 471 ln + `services/packages/rpm/repository.go` 709 ln +
+  `services/packages/rpm/sign.go` + `modules/packages/rpm/header.go` 259 ln
+  + `metadata.go` 303 ln + `models/packages/rpm/search.go`), all over the
+  debian/alpine trio's substrate unchanged.
+  - **The binary header reader** (header.go ported byte-for-byte): the
+    96-byte lead (magic 0xedabeedb), the signature section (≤32 entries,
+    ≤64 MiB) with the 8-byte alignment pad, the main section (≤0xffff
+    entries, ≤0x0fffffff data), the hdrblobVerifyInfo index validation
+    (monotonic offsets, per-type length bounds, the ≤63 region tag skipped
+    at position 0), and the sigTagSHA256/SHA1 digest over the main header
+    bytes. The parse consumes ONLY the header region off the spool stream
+    (bounded at 64 MiB total — the documented window; real sections are
+    tens of KiB), never the payload — upstream's io.Reader shape.
+  - **The tag extraction** (metadata.go port): name/version/release/epoch/
+    arch, the provides/requires/conflicts/obsoletes triples folded into
+    flag-tagged entries (GE/LE/GT/LT/EQ over the sense bits, the
+    epoch:version-release split), the dirnames+basenames+dirindexes file
+    list with the ghost/dir/executable mode fold, the changelog triple;
+    the version string is `{ver}-{rel}` prefixed `{epoch}-` when non-zero
+    and the stored file is `{name}-{version}.{arch}.rpm` with composite
+    key = the group segment. The FileMetadata property is serialized in
+    Go's json.Marshal field order with omitempty.
+  - **The stored-index build** (repository.go's builder set): the
+    createrepo-shaped `primary.xml.gz`/`filelists.xml.gz`/`other.xml.gz`
+    (+ `updateinfo.xml.gz` when any version carries errata updates),
+    rendered in Go's encoding/xml shape — struct field order, explicit
+    open+close pairs, EscapeText's escapes (`&#xA;` newlines, `&#34;`
+    quotes — live-fired on the rpmbuild battery) — then `repomd.xml` with
+    the compressed/uncompressed checksum+size pairs per data entry, and
+    `repomd.xml.asc`, the armored detached RSA-SHA256 signature. All
+    stored into the internal `_rpm` + `_repository` version keyed by the
+    group (the family's OverwriteExisting posture), the empty-group arm
+    deleting the group's own files (upstream wipes EVERY group there; the
+    debian/alpine per-key posture kept — documented). The search mirrors
+    the generic SearchFiles toConds (is_internal=false subselect, the
+    `%.rpm` lower_name filter, the composite filter DROPPED for the empty
+    group — package_file.go's own guard), order pinned to file lower_name.
+  - **The signing posture (the keypair answer):** upstream serves the
+    owner-scoped OpenPGP pair (`rpm.key.private/public`) as
+    `repository.key` and signs repomd with `openpgp.ArmoredDetachSign` —
+    exactly the debian twin's signer subset, so distro-common covers it
+    unchanged; the third `rpm.key.created` row pins the OpenPGP key-packet
+    creation time (the debian.key.created posture — the packet bytes must
+    be STABLE or the key id/fingerprint would drift). The served uid is
+    "(RPM Registry)" (go-crypto's NewEntity("", "RPM Registry", "")
+    rendering — gpg verified it live, below).
+  - **Documented reductions:** the upload-time package re-sign arm
+    (`?sign=true` / DefaultRPMSignEnabled, upstream default OFF) is NOT
+    ported — it needs the signature-region rewrite plus MD5 payload
+    verification (WebCrypto has no MD5, the debian MD5 posture);
+    rpmsign-signed packages pass through untouched. RSA-2048 (the
+    Workers-cost divergence). The errata arm's 400 body is the engine's
+    JSON error text (Go/V8 spellings differ).
+  - **The routes:** the sibling `/rpm.repo` config (group "" — upstream
+    api.go:423) plus the `/:username/rpm/*` wildcard walk
+    (`parseRpmTarget`, the npm walk's precedent — the group spans
+    segments upstream via chi's `<group:*>`, so every arm is
+    tail-anchored). repository.key is GROUP-LESS (one owner keypair; the
+    .repo gpgkey line points there for every group, rpm.go:51's exact
+    body). The errata POST is a bounded 4 MiB JSON read; GET repodata
+    never bumps the counter (IsLead=false), GET .rpm downloads bump per
+    GET (packages.go:665-670's IsLead gate), the noarch fallback applies
+    on download only (the delete arm is exact, rpm.go:259-328).
+  - **Tests** (`packages-rpm.test.ts` 17/17, own-eyes): the CORE fixture
+    is upstream's OWN test rpm (metadata_test.go's
+    `base64RpmsignSignedPackage`, a real rpmsign-signed package, embedded
+    byte-exact) — the parse-parity test asserts EVERY field value the Go
+    test asserts (build time 1678225964, installed size 13, archive size
+    272, the provides/requires/files/changelog sets); the round-trip
+    asserts the repodata XML shape, the repomd checksums re-hashing the
+    SERVED bytes, and the sig-armor structure; a hand-built minimal rpm
+    (lead + sig section with a real SHA-256 + pad + main header) pins the
+    exact-read walk and the noarch fallback; the rejection arms pin the
+    lead magic, the digest mismatch, the oversized-array bound
+    (metadata_test.go:200-209's arm), the D-1 409, the quota +1 parity,
+    the 401 challenge, and PACKAGES_ENABLED=false. Neighbors re-run
+    post-change: debian 12/12 + alpine 8/8 (no regression), the other
+    protocol suites + blobs/cleanup/model/serve-content 190/190;
+    check:api PASS (the /api/packages families sit outside the frozen v1
+    swagger, the M6 precedent); tsc 0 in the touched files (the two
+    remaining repo errors are another unit's in-flight src/services/
+    actions/trigger.ts); scoped eslint clean.
+  - **The LIVE battery (real clients, this host):** `rpm` 4.18.2 and
+    `rpmbuild` are installed; dnf/yum/createrepo/createrepo_c/zypper are
+    NOT (disclosed). `rpm -qp` on the upstream fixture read exactly the
+    metadata the Go test asserts (the pre-upload parse parity); a real
+    `rpmbuild`-built hello-rpm-1.2.3-2.x86_64.rpm was PUT via curl → 201,
+    the served primary.xml.gz carries the real header's metadata (the
+    description newline escaped `&#xA;`, the packager email `&lt;`,
+    provides with EQ flags, size 6576/21/284), ALL TWELVE repomd
+    checksum/size fields cross-verified against the served bytes
+    (python3 gzip+sha256), the download round-tripped BYTE-IDENTICAL and
+    `rpm -qp` parsed the downloaded copy, the served repository.key
+    imported into a fresh GNUPGHOME verified repomd.xml.asc with
+    `gpg: Good signature from "(RPM Registry)"` (rc=0 — the real OpenPGP
+    crypto, the debian gpgv battery's twin), and the DELETE → 204 left
+    the group's repodata 404ing while the persisted key still serves.
+- **PENDING (the remaining M7 row):** arch (`api.go:118-126` +
+  arch/router 305 ln + repository.go 400 ln + vercmp.go 105 ln — the
+  PathGroup wildcard grammar, the pacman .db tar built from .PKGINFO desc
+  files, the version-compare port), mirroring this substrate unchanged.
+
+## As-built — M7 index-builder family, half three: arch (2026-10-31 — the registry carries ELEVEN protocols; the §7 M7 index-builder family is COMPLETE of its four non-git families, cargo alone pending)
+
+The §2.1 M7 row's arch family landed: `services/packages/arch.ts` + the
+arch route arms in `api/routes/packages-protocols.ts` (upstream
+`routers/api/packages/arch/arch.go` 306 ln + `services/packages/arch/
+repository.go` 401 ln + `vercmp.go` 105 ln + `models/packages/arch/
+search.go` + `modules/packages/arch/metadata.go` 269 ln + the upstream
+integration test `tests/integration/api_packages_arch_test.go` as the
+client-shape oracle), over the same substrate unchanged. The
+dual-tenant note: this section and the rpm half two above landed as one
+disclosed wave in `packages-protocols.ts` — each family's hunks attributed
+separately, neither unit touched the other's arms.
+
+- **The generation posture** — unchanged (stored, not per-request): every
+  upload/delete ends with `BuildSpecificRepositoryFiles` (arch.go:160/299 →
+  repository.go:149-171) and the GET arm is a plain file lookup
+  (arch.go:168-252). **The symlink dance resolved:** pacman's repo-add
+  re-points the `{repository}.db` symlink at each new `.db.tar.gz`; upstream
+  Gitea reproduces the CLIENT-VISIBLE effect with filename NORMALIZATION —
+  every `.db`/`.db.tar.gz`/`.files`/`.files.tar.gz` spelling (plus the
+  repository-generic `index.*`/`packages.*` spellings pacman clients emit)
+  normalizes to the ONE stored `packages.db` of the internal `_arch` +
+  `_repository` version under composite key `{repository}|{architecture}`
+  (arch.go:186-197) — the integration test's six-name sweep
+  (`packages.db`, `packages.db.tar.gz`, `index.db`, `index.db.tar.gz`,
+  `index.files`, `index.files.tar.gz`, each with a working `.sig` arm)
+  pins it. There is no literal symlink anywhere in the pin.
+- **The .db format** (repository.go:237-321): ONE gzip member whose ustar
+  carries the per-package pairs `{name}-{version}/files` + `{name}-{version}/
+  desc` (files FIRST — repository.go:282-287), each a `%KEY%\nvalue\n\n`
+  field document with empty values skipped and Mode `os.ModePerm` = 0o777;
+  desc's 23-field order is the be_sync.c layout verbatim (FILENAME through
+  CHECKDEPENDS, repository.go:353-379); FILES = the package's tar member
+  names, and `joinFields` DROPS entries carrying \n or \r (the pacman
+  line-forgery gate, repository.go:339-344 — the same gate lives at the
+  parse side in metadata.go:158-160). The archive is signed (SignData, the
+  RAW detached RSA-SHA256 packet — no armor) with the base64 stored as the
+  index file's `arch.signature` property (the `{filename}.sig` arm decodes
+  and serves it, arch.go:222-239); each desc's PGPSIG is the PACKAGE file's
+  own stored signature property verbatim.
+- **vercmp** (vercmp.go, ported whole): parseEVR's epoch=0/release=1
+  defaults, numeric-vs-alpha segment ordering with the empty-segment-is-
+  numeric and Go's ignored-Atoi-overflow quirks mirrored, the epoch →
+  dot-split version → release ladder. Its registry consumer is the index
+  build's highest-version fold (repository.go:225-235 — the pacman
+  downgrade-hazard comment carried): a package's older versions never
+  "downgrade" the entry; the upstream `vercmp_test.go` table (the two
+  man-vercmp.8 chains + the three epoch/release arms) and
+  `metadata_test.go`'s Regexp table (`1.2_3~4+5` valid, `a:1.0.0-1`,
+  `0.0.1/1-1`, `1.0.0 -1` rejected) are pinned verbatim in the suite.
+- **The PathGroup wildcard grammar** (api.go:118-126): `<repository:*>`
+  spans segments AND matches EMPTY (the integration test's repository ""
+  arms ride it — chi's catch-all); the literal tails pin the arms — GET
+  `/<repository:*>/<architecture>/<filename>` (last TWO segments), DELETE
+  `/<repository:*>/<name>/<version>/<architecture>` (last THREE), PUT's
+  whole remainder IS the repository (TrimSpace'd, per arch.go:44 — the
+  read/delete arms do NOT trim). Ported as the npm-family walk: the
+  `/:username/arch/*` wildcard hands the raw remainder to a per-segment
+  decoder (chi matches raw + unescapes per param — an encoded slash stays
+  inside its segment), short remainders 404 at the walk. The bare
+  `PUT /arch` (api.go:120's no-repository arm) and the static
+  `repository.key` (arch.go:31-41, `application/pgp-keys`, ServeContent
+  with no filename — no attachment disposition, the alpine key arm's
+  contrast) register beside the wildcard; the static route outranks the
+  wildcard for the key.
+- **The any-arch folds** — unchanged from upstream: an `any` upload
+  re-rolls EVERY architecture's index of the repository
+  (repository.go:155-163 via GetArchitectures, models/packages/arch/
+  search.go:25-36), every real-architecture index merges the any files in
+  (repository.go:194-201) with their OWN `ARCH` field in desc (metadata.go
+  writes FileMetadata.Architecture — unlike alpine's A: index-arch rule),
+  and the serving arms fall back to `repository|any` (arch.go:204-216,
+  uniform for index AND package files — the integration test's
+  any/aarch64/myarch sweep).
+- **Documented reductions:** `.pkg.tar.zst`/`.pkg.tar.xz` → 400 "unsupported
+  package container format" (upstream's own sentinel — no zstd/xz codec in
+  the substrate; workerd ships gzip only); the upload capped at 64 MiB
+  (413) — SignData holds the whole document for the RFC 4880 hash framing
+  (WebCrypto cannot stream it) and the parse materializes the walked
+  members' payloads; desc omits `%MD5SUM%` (the blobs.ts three-digest
+  posture — the empty field is skipped by writeFields, the debian
+  precedent); the index member order is package lower_name/version
+  ascending (upstream folds a Go map — random; the alpine paragraph-order
+  precedent); `arch.key.created` pins the v4 key-packet creation time (the
+  `debian.key.created` precedent — upstream freezes it inside the
+  serialized openpgp entity, ours stores a raw PEM); userid
+  `(Arch Registry)` mirrors upstream's `NewEntity("", "Arch Registry", "",
+  nil)` comment-only rendering. **A platform record worth keeping:** the
+  streaming DecompressionStream delivers ZERO output when the input has
+  trailing bytes (the concatenated-multistream input errors before any
+  chunk surfaces — probe-verified this unit), so the parse walks the
+  members with distro-common's exact-length windows and concatenates the
+  payloads (upstream Go gzip.Reader is multistream by default; the tar
+  walk then stays incremental over the payload — only .PKGINFO's bytes and
+  the member names retained, the tar.Next() posture).
+- **Tests** (`packages-arch.test.ts` 21/21, own eyes): the vercmp table +
+  EVR parser pins; the PKGINFO reader (the metadata_test.go Valid field
+  sweep — xdata/backup/group/conflict/makedepend/checkdepend included —
+  plus the rejection arms); the round-trip with the desc/files tar shape
+  (exact member order files-then-desc, Mode 0o777 read off the header
+  bytes, the field documents byte-shaped, the six index spellings serving
+  IDENTICAL bytes each with a 200 .sig); the REAL crypto — the index .sig
+  and the desc's PGPSIG both verify (WebCrypto RSASSA-PKCS1-v1_5 SHA-256)
+  over the exact signed documents reconstructed from the packets' own
+  hashed-subpacket areas (doc ‖ prefix ‖ trailer, RFC 4880 §5.2.4) against
+  the n/e parsed out of the SERVED repository.key armor (the full OpenPGP
+  framing end-to-end), each with a tampered-payload failure arm; the
+  any-merge/fallback sweep; the KeepLastVersion vercmp fold (upload 1.0.0
+  then 1.0.1 → only 1.0.1 in the .db; delete 1.0.1 → 1.0.0 restored); the
+  delete arms' two 404 BODIES (the version miss's "resource does not
+  exist" vs the file-search miss's EMPTY body — arch.go:268-275 vs
+  :285-288); multi-segment + empty repositories; the unsupported-format,
+  PKGINFO-less, 409, 401, quota and PACKAGES_ENABLED gates; the wildcard
+  grammar's short-remainder 404s; the multistream concat fixture
+  (end-block-less first member — Go's tar.Reader stops at the
+  end-of-archive marker, so the parity shape continues into member B).
+  Neighbors re-run post-change: debian 12/12 + alpine 8/8 (the
+  sibling-counted 20/20), blobs/cleanup/model/serve-content/spike-streams
+  + generic 120/120, npm/nuget/pypi/helm/maven/container 145/145;
+  check:api PASS (the /api/packages families sit outside the frozen v1
+  swagger, the M6 precedent); tsc 0 in the touched files (the remaining
+  tree errors are other units' in-flight files — actions expression-syntax/
+  trigger, export-subst); scoped eslint clean.
+- **The LIVE battery (real clients, this host):** `pacman`, `repo-add`,
+  `makepkg` and `pkgfile` are NOT installed (disclosed — the alpine `apk`
+  precedent). The live arms were the byte-level battery: upstream's OWN
+  test vectors (vercmp_test.go's table, metadata_test.go's Regexp + Valid
+  sweeps, the integration test's six-name sweep / KeepLastVersion shape /
+  the `with/slash` + empty-repository arms) replayed against the real D1 +
+  R2 bindings, plus the WebCrypto signature verifications above — the
+  desc PGPSIG verifies over the UPLOADED package bytes and the index .sig
+  over the SERVED .db bytes, both against the n/e of the served armor
+  (the debian gpgv battery's in-suite twin). A future `pacman -Syu`
+  battery (a repo-add-built sync db cross-checked against ours) is the
+  residual, gated on a host with pacman.

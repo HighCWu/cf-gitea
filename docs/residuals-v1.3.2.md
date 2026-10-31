@@ -253,8 +253,54 @@ board rows now.
    initialize/rebuild tails for exactly this reason
    (`apps/worker/src/ui/pages/org-settings-packages.tsx` header note +
    documented-reductions section; the omission recorded in
-   `specs/README.md`'s 0016 row and commit `6bf9c17`). Size: **L** each,
-   demand-gated.
+   `specs/README.md`'s 0016 row and commit `6bf9c17`).
+   **Landed slice 2026-10-31 — rpm, half two of M7** (uncommitted in the
+   tree at this update): `services/packages/rpm.ts` + the rpm route arms in
+   `api/routes/packages-protocols.ts` — the binary header reader (header.go
+   ported: lead/sig/header sections + the SHA-256/SHA-1 digest gates), the
+   tag extraction, the createrepo-shaped repodata build over the stored-
+   index posture (primary/filelists/other(/updateinfo).xml.gz + repomd.xml
+   + the GPG-detached repomd.xml.asc from the shared OpenPGP signer), the
+   group-grammar wildcard routes, the errata arm. Pinned 17/17 in
+   `packages-rpm.test.ts` (the core fixture is upstream's own
+   rpmsign-signed test rpm, every metadata_test.go value asserted), the
+   live battery verified the real clients this host carries (rpm -qp parse
+   parity, an rpmbuild-built rpm round-tripped byte-identical, gpg "Good
+   signature" on repomd.xml.asc against the served repository.key; dnf/
+   createrepo absent — disclosed); the as-built is in
+   `specs/0016-packages.md`'s M7 section. Reductions documented there: the
+   upload `?sign=true` re-sign arm unported (MD5 + region-rewrite), the
+   empty-group arm narrowed to the family's per-key delete.
+   **Landed slice 2026-10-31 — arch, half three of M7** (the dual-tenant
+   wave's second half, sharing `packages-protocols.ts` with the rpm unit
+   above — hunks attributed per family; uncommitted in the tree at this
+   update): `services/packages/arch.ts` + the arch route arms — the pacman
+   `.db` tar builder (the `{name}-{version}/files`+`/desc` pairs in
+   repository.go's files-first order, the be_sync.c 23-field layout,
+   `joinFields`' newline-forgery gates), the vercmp.go port (upstream's
+   own vercmp_test.go table pinned) with its registry consumer (the
+   index's highest-version fold, repository.go:225-235), the
+   `<repository:*>` PathGroup grammar (chi's catch-all: EMPTY +
+   multi-segment repositories; the symlink-dance resolved as the six
+   filename spellings' normalization to one stored `packages.db`), the
+   any-arch merge + serving fallback, the SignData/repository.key arms
+   over the shared OpenPGP signer. Pinned 21/21 in
+   `packages-rpm.test.ts`'s sibling `packages-arch.test.ts` (upstream's
+   vercmp_test.go + metadata_test.go vectors, the integration test's
+   six-name sweep + KeepLastVersion fold + `with/slash`/empty-repository
+   arms, real WebCrypto verification of BOTH signature arms against the
+   n/e parsed out of the served repository.key armor); pacman/repo-add/
+   makepkg are NOT installed on this host (disclosed — the apk
+   precedent); the as-built is in `specs/0016-packages.md`'s M7 section.
+   Reductions documented there: .pkg.tar.zst/.xz → 400 unsupported (no
+   codec in the substrate), the 64 MiB sign window (WebCrypto cannot
+   stream the RFC 4880 framing), the omitted %MD5SUM% (the debian
+   precedent), the pinned index member order, `arch.key.created`.
+   Still open in this row: the cargo tail only; the cleanup rebuild-arm
+   wiring (cleanup.go:115-145's BuildAllRepositoryFiles family —
+   debian/alpine/rpm/arch builders are exported and un-wired) rides the
+   orchestrator's wiring wave.
+   Size: **L** for cargo, demand-gated; — for the four non-git families.
 
 7. **The `/api/v1` Actions registry-management ops — the 54
    FEATURE-ABSENT contract operations.** The declared contract stands at
