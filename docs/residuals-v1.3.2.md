@@ -1213,13 +1213,25 @@ board row flips — this closes a flag, not a listed residual.
     §2.1 long-tail row RESOLVED since this landing: cargo + swift +
     rubygems at the protocol wave `5721dcc` (FIFTEEN), chef + composer +
     conan + cran + pub + vagrant at the six-minor wave `28a40b5` — the
-    registry carries TWENTY-ONE protocols, the wave's declared FULL PARITY
-    with the pin's package surface. Record note for the wave's owner: of
-    that landing-time ten-family list, conda + terraform remain
-    module-absent on our side (the pin routes both — `api.go:263`
-    `/conda/*` and `:474` `/terraform/state`) — whether they sit inside
-    the wave's parity claim is its own record to adjudicate. Size: —
-    (resolved).
+    registry carried TWENTY-ONE protocols at that landing, but the wave's
+    declared "FULL PARITY" NEVER HELD: the pin's `CommonRoutes()` carries
+    22 route groups (the wave's own census list named all 22 — the "21"
+    was a tally miss) plus the OCI container API = 23 surfaces. ADJUDICATED
+    (2026-11-01, the conda+terraform unit): **terraform LANDED** — the
+    state backend (`/terraform/state/{name}`, api.go:466-476; seven arms,
+    the lock machine over the `terraform.lock` property, serial-versioned
+    `tfstate` files; services/packages/terraform.ts + the route arms;
+    suites 23/23 + 8/8, neighbors 115/115 + 80/80, check:api PASS — the
+    as-built is SPEC-0016's terraform section; the pin has NO module
+    registry / .well-known discovery, so none was built) — the registry
+    carries TWENTY-TWO of TWENTY-THREE. **conda STAGED** — three Workers
+    codec walls (`.tar.bz2` upload needs a bzip2 decoder — the composer
+    unit's bz2.ts is in flight decode-only; `.conda` needs a zstd decoder
+    — none exists anywhere; `repodata.json.bz2` needs a bzip2 ENCODER —
+    decode-only ports don't serve it), without which every read arm would
+    404 forever and the family would be dead arms; exactly-what's-missing
+    + the S-M residual size recorded in SPEC-0016's conda staging note.
+    Size: — (resolved: 1 built, 1 staged with its walls named).
 
 ---
 

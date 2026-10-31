@@ -45,13 +45,14 @@
  * Divergences (documented per AGENTS.md): upstream registers chef.Auth
  * (the X-Ops signed-header RSA method over the user's
  * `chef.public_pem` setting, auth.go) as an ADDITIONAL auth method — the
- * signed-request verification rides the auth module's credential pass
- * this repo resolves per-token (SPEC-0002); the six protocol arms here
- * consume the resolved doer exactly like the other families, and the
- * X-Ops method is recorded as the OPEN auth-surface item rather than
- * ported into the service (the user-setting store + the four signature
- * versions are upstream's auth-method surface, not the registry's).
- * The SemVer sort pins a stable id tiebreak (Go's slice sort is
+ * signed-request verification is PORTED in chef-auth.ts (the four
+ * signature versions, the 10-minute window, the `user_settings_kv`
+ * `chef.public_pem` store arm) and the route arm resolves it AFTER the
+ * standard credential pass (the auth-group order: Basic/token WIN,
+ * X-Ops fires only when they yield no user; a failed X-Ops attempt is
+ * the 401 "Failed to authenticate user" plain-text body). The six
+ * protocol arms here consume the resolved doer exactly like the other
+ * families. The SemVer sort pins a stable id tiebreak (Go's slice sort is
  * unspecified for equal keys); JSON rendering via JSON.stringify (no Go
  * Marshal HTML escaping — the landed families' posture); `versions` /
  * `items` empty answers render [] not null (Go marshals a nil slice as

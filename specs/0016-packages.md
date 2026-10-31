@@ -44,9 +44,14 @@ not one feature but two stacked ones:
 1. **A package model + blob store** — owner-scoped (user OR org), repo-linked
    (optional), with content-addressed deduplicated blobs. Every registry type
    and every UI page rides this.
-2. **Per-ecosystem registry protocols** — 21 protocol families on
-   `/api/packages/{username}/…` (`api.go:91` `CommonRoutes`) plus the OCI
-   distribution API on `/v2/…` (`api.go:509` `ContainerRoutes`). Each is a
+2. **Per-ecosystem registry protocols** — 22 protocol families on
+   `/api/packages/{username}/…` (`api.go:91` `CommonRoutes` — the full
+   route-group census: alpine, arch, cargo, chef, composer, conan, **conda**,
+   cran, debian, go, generic, helm, maven, nuget, npm, pub, pypi, rpm,
+   rubygems, swift, **terraform**, vagrant; the earlier "21" missed two
+   groups in its own tally — the adjudication note at the terraform as-built)
+   plus the OCI distribution API on `/v2/…` (`api.go:509` `ContainerRoutes`)
+   — TWENTY-THREE protocol surfaces at the pin. Each is a
    wire contract a real package-manager client speaks (`npm publish`,
    `pip install`, `docker push`, …), and their weights differ by an order of
    magnitude (pypi ≈ 230 lines upstream; nuget ≈ 700; the container family
@@ -86,7 +91,7 @@ Out of scope (each named so it is not silently re-decided):
 
 ## 2. The subsystem — upstream cites, our substrate, the gap
 
-### 2.1 The registry-type census: 23 model types, 21 protocol families, 1 container API
+### 2.1 The registry-type census: 23 model types, 22 CommonRoutes protocol families, 1 container API
 
 The model's type list is 23 constants (`gitea/models/packages/package.go:33-53`:
 `TypeAlpine … TypeVagrant`, the `TypeList` at `:55-77`). The protocol surface
@@ -94,7 +99,10 @@ is two routers (`api.go`):
 
 - **`CommonRoutes()`** (`api.go:91`) mounted on `/api/packages` (NOT
   `/api/v1` — the file's comment: "These are mounted on `/api/packages` (not
-  `/api/v1/packages`)"): 21 ecosystem groups, each wrapped in
+  `/api/v1/packages`)"): 22 ecosystem groups (the census correction —
+  conda `api.go:263` and terraform `api.go:466-476` route too; the "21" was
+  this document's own tally miss, caught at the 2026-11-01 conda+terraform
+  adjudication), each wrapped in
   `reqPackageAccess(perm.AccessModeRead)` with write arms inside
   (`reqPackageAccess(perm.AccessModeWrite)`), over auth methods
   `{OAuth2, Basic, nuget.Auth, Auth, chef.Auth}` (`api.go:97-102`). The
@@ -123,7 +131,7 @@ wire-format module):
 | container (`api.go:509-547`) | ≈2,000 ln (routers 1,459: container 796 + blob 195 + manifest 416 + errors 52; plus services 314 + the wire module 204) | OCI: token → blob POST/PATCH/PUT chunked uploads, manifests | yes — JWT flow + upload state + digests | M5 |
 | debian / alpine / rpm / arch | each 300-600 ln | repo metadata index BUILDERS (`Packages`/`Release`/`APKINDEX`/`repodata`/`.repo` files) regenerated on upload/delete (`gitea/services/packages/cleanup/cleanup.go:115-145` rebuild arms) | yes — index files | M6 |
 | cargo (`api.go:156-172`) | ~600 ln + index.go | sparse index: `config.json` + `1|2|3/{name}` version lists derived on read (upstream's HTTP face builds them from the DB per request, cargo.go:66-87 → index.go:139-183); the **git repo** (`_cargo-index`, index.go:29) is only the traditional git-protocol mirror and stays the separate SPEC-attached milestone | yes — D1-derived; the git mirror deferred | **M7 LANDED** (see the cargo as-built) |
-| conan / composer / chef / conda / cran / go / pub / rubygems / swift / terraform / vagrant | each 150-700 ln | per-client wire contracts | protocol-only | long tail, demand-driven |
+| conan / composer / chef / conda / cran / go / pub / rubygems / swift / terraform / vagrant | each 150-700 ln | per-client wire contracts | protocol-only | long tail, demand-driven — RESOLVED per family at the 2026-11-01 adjudication: terraform **LANDED** (the as-built at the tail), conda **STAGED** (the three Workers codec walls, same as-built) |
 
 Verdict: the MODEL is the one shared prerequisite; the protocols are a
 staged family. Only **generic** is "plain UI/API CRUD"-sized — every other
@@ -640,7 +648,9 @@ idiom applies only where the vendored engine grows).
   repo needs the files-service write path to exist for owner-scoped repos).
 - **The long tail** (conan/composer/chef/conda/cran/go/pub/rubygems/swift/
   terraform/vagrant): no committed milestone — each is a client wire contract
-  over the SAME model; dispatch on demand, sizes S-M.
+  over the SAME model; dispatch on demand, sizes S-M. (The 2026-11-01
+  adjudication disposition: terraform LANDED — the as-built at the tail;
+  conda STAGED on the Workers codec walls, same as-built.)
 
 Entry criteria: ratified SPEC (this document → accepted), then M1 as a
 worker unit; M2+ per the census's wave discipline. Each ecosystem milestone
@@ -1828,9 +1838,10 @@ the D1 model).
     the landed page/limit search cannot express an arbitrary skip, so
     the window slices a start+items fetch), the created-DESC-id-DESC
     recently_updated order.
-  - *composer* — the zip/tar.gz/bz2 detection (bz2 DETECTED then
-    REJECTED — no bzip2 decoder on Workers; the documented reduction),
-    the ?version= fallback with the BOTH-missing route 400
+  - *composer* — the zip/tar.gz/bz2 detection with the bz2 arm LIVE
+    through the vendored bzip2 decoder port (`./bz2.ts` — see the
+    as-built decision record below), the ?version= fallback with the
+    BOTH-missing route 400
     (ParsePackage itself TOLERATES the empty version — metadata.go's
     optional-arg), the `composer.type` VERSION property, the p2
     metadata with the url.PathEscape'd dist path (%2F — api.go:141)
@@ -1859,14 +1870,14 @@ the D1 model).
   application/vnd.pub.v2+json; chef `{"error_messages":[…]}`;
   composer `{"errors":[{status,message}]}`; conan `{"message":…}`
   over application/json WITH the json.Encoder trailing newline.
-- **The conan auth seam (the recorded reduction):** upstream
-  registers chef.Auth (the X-Ops RSA signed headers over the user's
-  `chef.public_pem` setting) as an additional auth method, and conan's
-  /users/authenticate mints a scoped authorization token the client
-  echoes back. The chef X-Ops method is NOT ported (the auth-method
-  surface rides the auth module — recorded as the open item); conan's
-  authenticate mints through the auth module's container-token seam
-  (mintContainerToken) and the conan gate accepts the minted token
+- **The conan auth seam and the chef X-Ops method (the 2026-11-01
+  chef-auth flip):** upstream registers chef.Auth (the X-Ops RSA signed
+  headers over the user's `chef.public_pem` setting) as an additional
+  auth method, and conan's /users/authenticate mints a scoped
+  authorization token the client echoes back. The chef X-Ops method IS
+  NOW PORTED (services/packages/chef-auth.ts — the as-built note below);
+  conan's authenticate mints through the auth module's container-token
+  seam (mintContainerToken) and the conan gate accepts the minted token
   beside the standard credentials (Basic password / Bearer) — the
   CreateAuthorizationToken flow's function.
 - **The route posture:** every family's read arms ride
@@ -1888,6 +1899,253 @@ the D1 model).
   pinned the wire contracts: the chef metadata.json, the cran
   DESCRIPTION, the pub pubspec.yaml, the composer composer.json, the
   conan conanfile/conaninfo texts, the vagrant info.json).
-- **Open issues:** the chef X-Ops auth method (recorded above); the
-  composer .tar.bz2 rejection (a bzip2 decoder would lift it); the
-  cran zip CRC verification skipped (the blob sha256 gates the bytes).
+- **Open issues:** the cran zip CRC verification skipped (the blob
+  sha256 gates the bytes). ~~the chef X-Ops auth method~~ RESOLVED
+  2026-11-01 (the chef-auth flip — the as-built note below).
+
+## As-built — the composer `.tar.bz2` decision record: the reduction LIFTED by the vendored bzip2 decoder (2026-11-01)
+
+The six-minor wave's recorded reduction ("bz2 DETECTED then REJECTED —
+no bzip2 decoder on Workers") is lifted: `.tar.bz2` uploads now take
+upstream's full acceptance path (metadata.go:146-149's
+`compress/bzip2.NewReader` + tar walk). The adjudication, in full:
+
+- **The platform claim, verified at the pin's compatibility_date
+  2026-10-23:** workerd offers NO bzip2 surface. The generated
+  `DecompressionStream` union is exactly `"gzip" | "deflate" |
+  "deflate-raw"`, and a live probe in the vitest workerd rejects
+  `bzip2`/`bz2`/`x-bzip2`/`bzip` (and `br`/`zstd`/`lzma`/`xz`) with
+  "The compression format must be either 'deflate', 'deflate-raw' or
+  'gzip'"; no bzip-like global exists. So the arm cannot ride a
+  platform primitive — it needed a decoder, same as the cran zip reader
+  did.
+- **Why BUILD instead of keeping the reduction:** (a) upstream parity is
+  the default decision (AGENTS.md) — upstream accepts bz2 fully, so the
+  rejection was a divergence, not parity; (b) the decoder's scope is a
+  single hand-rolled substrate: ~530 decode-only lines, the same family
+  and size as the OpenPGP v4 subset (~250 ln) and the bounded YAML
+  reader (~300 ln) this repo already hand-rolled — the port follows Go's
+  compress/bzip2 decoder (go1.25.1: bzip2.go/huffman.go/move_to_front.go,
+  the EXACT library upstream imports) rather than libbz2; (c) the format
+  is self-verifying — every block carries a CRC and the stream a combined
+  CRC — so real-fixture correctness is checkable loudly, which the
+  battery does.
+- **The landed posture (`services/packages/bz2.ts`):** decode-only,
+  zero-dependency, whole-buffer; canonical Huffman tables reconstructed
+  from the transmitted lengths (limit/firstCode/offset/perm), selector
+  list MTF+unary coded with a table switch every 50 symbols,
+  RUNA/RUNB run accumulation, MTF undo, the single-array inverse BWT
+  (SRC-RR-124 §4.2), the RLE1 undo with Go's lazy-repeat state machine
+  (pending repeats at block END flush into the block output), block +
+  combined CRC verification, concatenated-stream continuations. Go's own
+  simplifications kept for parity: RANDOMIZED blocks are REJECTED
+  (StructuralError upstream — the encoder stopped emitting them in
+  bzip2 0.9.5, 1999), and every malformed/CRC-failing stream maps onto
+  the invalid-archive arm (ComposerArchiveError, the route's 500
+  default — the same mapping the corrupt-gzip arm rides).
+- **The verification:** fixtures are REAL system-bzip2 archives
+  (bzip2 1.0.8 `-<level> -c` at authoring time, embedded base64) across
+  levels 1/5/9, multi-block (110000B at -1), the exact block capacity
+  (900000B at -9), RUNA/RUNB-heavy runs, single-symbol alphabets,
+  incompressible PRNG bytes, the trailing pending-repeats edge, the
+  empty stream, and concatenated streams; the CONTENT side regenerates
+  in-test from the same deterministic formulas, and the composer
+  fixture's tar side is byte-verified against the repo's OWN buildTar.
+  An authoring-time cross-check (not committed) decoded 23 further
+  bzip2-generated cases byte-exactly, including block boundaries and a
+  2MB multi-block stream. Tests: bz2.test.ts 17, composer.test.ts 17
+  (was 14 — the parse/corrupt/upload arms grew).
+- **Reopen trigger:** none needed for Workers — if workerd ever gains a
+  native bzip2 format, the arm can swap `bzip2Decompress` for the
+  platform stream in one call site (`composerTarBz2Members`); the
+  randomized-block rejection tracks Go's stdlib and only revisits if
+  upstream Gitea's Go dependency learns to read them.
+
+## As-built — the chef X-Ops auth method: the recorded reduction PORTED (2026-11-01)
+
+The six-minor batch's open item — chef.Auth — landed as
+`services/packages/chef-auth.ts` (+ `chef-auth.test.ts`), wired into the
+chef family's handlers through `chefProtocolContext`
+(`api/routes/packages-protocols.ts`, the CHEF section). Upstream
+routers/api/packages/chef/auth.go at the pin, cross-verified against its
+own integration test's signRequest
+(tests/integration/api_packages_chef_test.go:171-251).
+
+- **The acceptance order (the adjudication):** upstream runs
+  `{OAuth2, Basic, nuget.Auth, Auth, chef.Auth}` through the auth group
+  (api.go:96-102), whose semantics are first-user-wins with the first
+  error remembered (services/auth/group.go:44-63); verifyAuth answers
+  the remembered error with `ctx.HTTPError(401, "Failed to authenticate
+  user")` (api.go:82-85 → base.go:105-112, Go http.Error's plain-text
+  shape). Basic/token credentials therefore WIN and chef.Auth fires only
+  when they yield no user — upstream's own integration test uploads with
+  AddBasicAuth (:296). The port keeps the token seam as the PRIMARY pass
+  (`resolveCredential` first) and layers X-Ops second; the seam STAYS.
+  Scope note: upstream's chain makes X-Ops technically live on every
+  /api/packages family; the port scopes it to the chef family's handlers
+  (a chef-signed request has no client on other families' paths).
+- **The method surface (auth.go, in order):** the applicability probe —
+  an absent `X-Ops-Userid` is the (nil, nil) not-applicable pair
+  (:93-100); the GetUserByName walk (case-insensitive, :99); the
+  `chef.public_pem` setting read + PKIX/RSA parse BEFORE the timestamp
+  arm (:102-111 precede :113), non-RSA rejected (:81-84); the RFC3339
+  timestamp with the ±10 min window (:34, :113-134); the X-Ops-Sign
+  version gate {1.0, 1.1, 1.2, 1.3} with `algorithm=sha1` (or `sha256`
+  on 1.3 only) (:136-161); the `X-Ops-Authorization-N` chunk join in
+  index order, gaps rejected (:181-205); the canonical check data
+  (:207-239) — 1.3's `Method/Path/X-Ops-Sign:version/X-Ops-Timestamp/
+  X-Ops-UserId/X-Ops-Server-API-Version` over `path.Clean(URL.Path)`
+  with the raw username, 1.0-1.2's `Hashed Path` shape with the
+  sha1-b64 username for 1.1/1.2; the signature dispatch (:241-280) —
+  1.3 RSASSA-PKCS1-v1_5-SHA256, 1.2 RSASSA-PKCS1-v1_5-SHA1 (WebCrypto's
+  verify hashes the message itself — the VerifyPKCS1v15 composition),
+  1.0/1.1 the RAW RSA private_encrypt composition: signature^e mod n
+  (BigInt — WebCrypto has no raw RSA), the PKCS#1 v1.5 padding stripped
+  by the 0xFF-0x00 scan from index 2 (:264-273), the remainder compared
+  byte-exactly with the check data (:275).
+- **The key store arm:** upstream exposes the SET only through the user
+  settings page — POST /user/settings/packages/chef/regenerate_keypair
+  (web.go:718 → routers/web/user/setting/packages.go:103-119,
+  GenerateKeyPair(KeyBits=4096), SetUserSetting(chef.public_pem, pub),
+  the private PEM streamed once as {user}.priv). The port carries the
+  same set/get pair on `user_settings_kv` (the distro-common
+  signing-key precedent) + `generateChefKeyPair` (SPKI `PUBLIC KEY` PEM
+  byte-format-identical; the private arm renders PKCS#1
+  `RSA PRIVATE KEY` via a PKCS#8 DER unwrap — util/keypair.go's exact
+  label set). The `POST /user/settings/packages/chef/regenerate_keypair`
+  web handler is NOT yet mounted (the worker has no
+  /user/settings/packages page; index.ts is the shared mount) — the
+  service pair is in place for the web arm to call; knife users cannot
+  yet self-serve keypairs.
+- **Divergences (documented):** upstream's X-Ops-Authorization-0 index
+  panics the slice walk (Go tmp[-1] → the 500-recovery page); the port
+  folds it into the invalid-headers error (the same 401 body). Upstream
+  `pem.Decode` returning nil derefs at :108 (500-recovery); the port
+  answers the method error (401). A missing X-Ops-Authorization family
+  with otherwise-valid headers errors at the strict base64 decode vs
+  upstream's empty-signature verify failure — the same 401 body either
+  way. `path.Clean` is ported byte-exactly (src/path/path.go, the
+  rooted-slash upfront append included).
+- **Tests:** chef-auth.test.ts 53 — the store round-trip, the keypair
+  shape (PKCS#1 private / SPKI public, e=65537, the 4096 default), the
+  applicability/lookup/no-key/non-RSA/garbage-PEM arms, the timestamp
+  window both ways with the edge + fractional seconds, the version and
+  algorithm gates, the chunk join (order/gap/zero-index/garbage), the
+  pathClean table, the canonical check data byte-exactly, SIGN/VERIFY
+  round-trips for ALL FOUR versions (the upstream test's signing walk —
+  raw-RSA d-exponent for 1.0/1.1, WebCrypto for 1.2/1.3, 60-char
+  chunking), the different-path and tampered-signature rejections, and
+  the route-face acceptance order (X-Ops-alone upload 201 on all four
+  versions, Basic still 201, the byte-exact
+  `Failed to authenticate user\n` 401 with nosniff on the
+  bad-signature/stale-timestamp/no-key arms, anonymous read 200, the
+  anonymous upload challenge preserved).
+
+## As-built — the long-tail `terraform` family + the conda adjudication (2026-11-01 — the registry carries TWENTY-TWO of the pin's TWENTY-THREE protocol surfaces; the six-minor wave's "FULL PARITY 21" claim corrected)
+
+The row-16 flag adjudicated (docs/residuals-v1.3.2.md): the pin's
+`CommonRoutes()` carries **22** route groups (the full census at §1 —
+conda `api.go:263` and terraform `api.go:466-476` route too), plus
+`ContainerRoutes()` = **23** protocol surfaces. The wave's 21 was a tally
+miss in its own list (the §2.1 out-of-scope list named all 22), so
+"FULL PARITY" never held. This unit closes the census: terraform BUILT,
+conda STAGED with its walls named.
+
+### terraform — the state backend, LANDED
+
+Upstream's surface is the GitLab-compatible TERRAFORM STATE backend — the
+route group's own comment cites GitLab's fine-grained-permissions reference
+(api.go:465-466). The pin has NO module registry / `.well-known/
+terraform.json` discovery anywhere (grep across routers/ + modules/ is
+empty); any registry-protocol work would be pin-silent invention and is
+NOT built. One package per state name (type `terraform`, package.go:54),
+one version per serial (`version = FormatUint(serial)`), one lead file
+`tfstate`, the lock a package-type property `terraform.lock` holding the
+LockInfo JSON.
+
+The seven arms (`api/routes/packages-protocols.ts`, between the rubygems
+and vagrant blocks — the pin's swift→terraform→vagrant adjacency):
+
+- `GET /:username/terraform/state/:name` (+HEAD) — the LATEST version's
+  state (terraform.go:39-50; SearchLatestVersions exact-name, the
+  GET-only download bump packages.go:668);
+- `GET …/versions/:serial` (+HEAD) — the pinned serial (:53-55);
+- `POST …` — upload (write): the name gate (`\A[-_+.\w]+\z` + not ".." +
+  the lone-char letter/number rule, terraform_test.go's vectors verbatim),
+  the PRE-BODY lock enforcement (`?ID=` — ctx.FormString reads the query;
+  mismatch → **423 + the current lock JSON** :117-121), spool → size quota
+  → ParseState (`{serial, lineage}`, serial ≥ 1, :149-154) → create →
+  **201**; a same-serial re-post is the duplicate 409;
+- `DELETE …` — the whole state (write): locked → **423**
+  "terraform state is locked", else every version + package cascade →
+  **200** (:238-297);
+- `DELETE …/versions/:serial` — the LATEST serial is the **403**
+  "cannot delete the latest version", else **204** (:196-234);
+- `POST …/lock` — the 64 KiB ID-required lock parse (lock.go:38-52), the
+  package ALLOCATION when missing (:327-342), locked → **423 + lock JSON**,
+  set → **200**;
+- `DELETE …/lock` — missing/not-locked → **200**, ID mismatch → **423**
+  "lock ID mismatch", else clear → **200** (:366-422).
+
+Error bodies are PLAIN TEXT (terraform.go:33-36) with the EMPTY body on
+the nil-error 404s (ProcessErrorForUser's zero message) + nosniff
+(base.go:140-147); the 423 lock bodies are the ONE JSON exception
+(ctx.JSON) with the Go struct field order
+`ID/Operation/Info/Who/Version/Created/Path` (lock.go:20-29).
+
+Documented divergences: upstream's globallock (redis/inproc) → the D1
+conditional-update CAS (the SetLock `value=''` / RemoveLock `value!=''`
+guards ported literally — lock.go:87-101's "failed to update lock state"
+arm kept), the constraint-arbitrated posture every landed family uses;
+`Created` round-trips as its RFC3339-shaped string with an absent field
+rendering Go's zero time `0001-01-01T00:00:00Z` (the Go round-trip's
+observable shape); serials are safe integers (Go's uint64 decode admits
+more digits); the store's 512 MiB cap maps to 413 and a lying
+Content-Length to 500 (upstream's unbounded spool has neither arm); no
+count-quota arm on upload (upstream checks size only, :140).
+
+Tests (own eyes): services `terraform.test.ts` **23/23** + route arms
+`packages-terraform.test.ts` **8/8** (both quoted: `Tests 31 passed (31)`
+over the pair; `Tests 8 passed (8)` solo) — the pin's own
+TestValidatePackageName vectors, the ParseState/ParseLockInfo arms, the
+lock machine incl. the CAS clear, the lifecycle round-trip with byte
+parity + the GET-only bump, the 423 JSON shape with the field order, the
+allocation arm, the 401 challenge / private-owner 401 / quota 403 +
+admin bypass / PACKAGES_ENABLED=false arms. Neighbors unregressed:
+debian + rpm + cran service+route suites 115/115, blobs/model/serve-content
++ cleanup 80/80 (one load-flake in a concurrent pass re-ran green solo).
+`pnpm check:api` PASS; tsc zero in the unit's files; scoped eslint clean.
+
+### conda — STAGED (the three Workers codec walls, exactly what's missing)
+
+The family is NOT built; staging it honestly requires deciding (repo-level,
+SPEC-attached) how to source three codecs the platform lacks at
+compatibility_date 2026-10-23 — `DecompressionStream`/`CompressionStream`
+admit exactly gzip/deflate/deflate-raw (the composer/arch units' documented
+reductions precedent, composer.ts:340-354 / arch.ts:64):
+
+1. **`.tar.bz2` upload parse** (conda.go:213-217 → ParsePackageBZ2) needs a
+   bzip2 DECODER + the tar walk over `info/index.json` + `info/about.json`
+   (metadata.go:94-98). A zero-dependency bzip2 decoder is IN FLIGHT from
+   the composer unit (`services/packages/bz2.ts`, decode-only, CRC-
+   verified) — adoptable here once landed, but it does not exist as a
+   landed dependency today and its header scopes it to composer.
+2. **`.conda` upload parse** (ParsePackageConda, metadata.go:101-130) needs
+   zip (available — the cran/nuget readers) PLUS a **zstd decoder** for the
+   inner `info-*.tar.zst` — no zstd surface exists on the platform or in
+   the dependency tree, and no unit has one in flight.
+3. **`repodata.json.bz2` serving** (conda.go:170-183) needs a bzip2
+   ENCODER — decode-only ports don't help; the honest reduction would 404
+   the `.bz2` arms (conda clients fall back to plain `repodata.json`) and
+   that shape needs its own SPEC row.
+
+Without uploads BOTH formats 400 (the parse is the name/version source),
+so every read arm would answer its empty-404 forever — a family of
+dead arms misrepresents parity. The staged row unblocks when (1)'s
+decoder lands + a zstd decision + the encoder-or-404 reduction SPEC.
+Size then: the route dispatch (ListOrGetPackages' four repodata names vs
+the package-filename split), the RepoData JSON family
+(`info.packages`/`packages.conda`/`removed` + the subdir echo), the
+channel-prefixed names, the subdir composite key — an S-M unit once the
+codecs are decided. NOT counted toward the registry's parity claim until
+then: **the registry carries TWENTY-TWO of TWENTY-THREE**.

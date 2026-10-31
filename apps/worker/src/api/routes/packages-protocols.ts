@@ -358,6 +358,20 @@ import {
   vagrantBoxExists,
 } from "../../services/packages/vagrant";
 import {
+  TerraformInvalidStateError,
+  TerraformInvalidStateNameError,
+  TerraformLockInfoError,
+  TerraformLockStateError,
+  assertTerraformStateWritable,
+  deleteTerraformState,
+  deleteTerraformStateBySerial,
+  lockTerraformState,
+  openTerraformStateForDownload,
+  unlockTerraformState,
+  uploadTerraformState,
+  type TerraformLockInfo,
+} from "../../services/packages/terraform";
+import {
   CRAN_TYPE_BINARY,
   CRAN_TYPE_SOURCE,
   CranArchiveError,
@@ -398,6 +412,7 @@ import {
   searchChefPackages,
   uploadChefPackage,
 } from "../../services/packages/chef";
+import { authenticateChefXOps, type ChefXOpsAuthResult } from "../../services/packages/chef-auth";
 import {
   ComposerArchiveError,
   ComposerInvalidNameError,
@@ -2491,6 +2506,26 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
   app.post("/:username/rubygems/api/v1/gems/", (c) => rubygemsUpload(c));
   app.post("/:username/rubygems/api/v1/gems", (c) => rubygemsUpload(c)); // the bare twin (the pypi double-registration precedent)
   app.delete("/:username/rubygems/api/v1/gems/yank", (c) => rubygemsYank(c));
+
+  // ------------------------------ TERRAFORM (api.go:466-476) ------------------------------
+  // The state backend (the GitLab-compatible `/terraform/state/{name}` group —
+  // the route group's own upstream comment cites the GitLab
+  // fine-grained-permissions reference; the pin carries NO module registry /
+  // .well-known discovery). The error bodies are PLAIN TEXT
+  // (terraform.go:33-36's ctx.PlainText) with the EMPTY body on the
+  // nil-error 404s; the ONE JSON exception is the 423 lock body
+  // (ctx.JSON(423, lock)). HEAD rides the GET walks (the pypi/helm
+  // precedent — upstream registers GET only).
+
+  app.get("/:username/terraform/state/:name", (c) => terraformGetState(c, null));
+  app.on("HEAD", "/:username/terraform/state/:name", (c) => terraformGetState(c, null));
+  app.get("/:username/terraform/state/:name/versions/:serial", (c) => terraformGetState(c, c.req.param("serial") ?? ""));
+  app.on("HEAD", "/:username/terraform/state/:name/versions/:serial", (c) => terraformGetState(c, c.req.param("serial") ?? ""));
+  app.post("/:username/terraform/state/:name", (c) => terraformUpload(c));
+  app.delete("/:username/terraform/state/:name", (c) => terraformDelete(c));
+  app.delete("/:username/terraform/state/:name/versions/:serial", (c) => terraformDeleteBySerial(c));
+  app.post("/:username/terraform/state/:name/lock", (c) => terraformLock(c));
+  app.delete("/:username/terraform/state/:name/lock", (c) => terraformUnlock(c));
 
   // ------------------------------ VAGRANT (api.go:488-498) ------------------------------
   // The boxes family: the authenticate probe (the bare Doer-nil check —
@@ -4657,6 +4692,199 @@ async function vagrantDownload(c: Context<{ Bindings: Env }>): Promise<Response>
 }
 
 // ---------------------------------------------------------------------------
+// TERRAFORM — terraform.go:33-36 (the PLAIN TEXT apiError, the EMPTY body on
+// the nil-error arms) + the api.go:466-476 state-backend arms.
+// ---------------------------------------------------------------------------
+
+/** ctx.PlainText (base.go:140-147): `text/plain;charset=utf-8` + nosniff. */
+function terraformPlainText(status: number, message = ""): Response {
+  return new Response(message, {
+    status,
+    headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+  });
+}
+
+/** ctx.JSON (base.go:114-121) — the 423 lock body's renderer. */
+function terraformJson(status: number, body: string): Response {
+  return new Response(body, { status, headers: { "content-type": "application/json;charset=utf-8" } });
+}
+
+/** The lock JSON body exactly as Go marshals the struct (lock.go:20-29's
+ *  field order; Created carries its rendered string). */
+function terraformLockBody(lock: TerraformLockInfo): string {
+  return JSON.stringify({
+    ID: lock.ID,
+    Operation: lock.Operation,
+    Info: lock.Info,
+    Who: lock.Who,
+    Version: lock.Version,
+    Created: lock.Created,
+    Path: lock.Path,
+  });
+}
+
+/** GetTerraformState / GetTerraformStateBySerial (terraform.go:39-78): the
+ *  serial arm pins the version, the null-serial arm rides the latest. A miss
+ *  is the EMPTY-body 404 (ProcessErrorForUser's zero message). */
+async function terraformGetState(c: Context<{ Bindings: Env }>, serial: string | null): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const download = await openTerraformStateForDownload(
+      c.env.DB,
+      c.env.REPO_PACKS,
+      owner,
+      c.req.param("name") ?? "",
+      serial,
+      c.req.method === "HEAD" ? "HEAD" : "GET",
+    );
+    if (download === null) return terraformPlainText(404);
+    return fileResponse(c, {
+      stream: download.stream,
+      size: download.size,
+      filename: download.file.name,
+      created: download.file.createdUnix,
+    });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    console.error("[packages-terraform] state read failed", error);
+    return terraformPlainText(500, "internal server error");
+  }
+}
+
+/** UploadState (terraform.go:88-193): the name gate → the pre-body lock
+ *  enforcement (the ?ID= form value) → the spool/quota/parse/create chain. */
+async function terraformUpload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner, cred } = await protocolContext(c, "write");
+    const doer = cred.doer;
+    if (doer === null) {
+      return terraformPlainText(401, "user should have specific permission or be a site admin");
+    }
+    const name = c.req.param("name") ?? "";
+    // terraform.go:108-121 — the lock check BEFORE the body is read; the
+    // mismatch answers 423 with the CURRENT lock JSON.
+    const writable = await assertTerraformStateWritable(c.env.DB, owner.id, name, c.req.query("ID") ?? "");
+    if (writable.kind === "locked") {
+      return terraformJson(423, terraformLockBody(writable.lock));
+    }
+    await uploadTerraformState({
+      d1: c.env.DB,
+      bucket: c.env.REPO_PACKS,
+      owner,
+      doer,
+      name,
+      content: bodyStream(c.req.raw),
+      declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
+      quota: packagesQuotaFromEnv(c.env),
+    });
+    return new Response(null, { status: 201 });
+  } catch (error) {
+    return terraformUploadError(error);
+  }
+}
+
+function terraformUploadError(error: unknown): Response {
+  if (error instanceof HTTPException) return error.getResponse();
+  if (error instanceof TerraformInvalidStateNameError) return terraformPlainText(400, error.message);
+  if (error instanceof TerraformInvalidStateError || error instanceof TerraformLockInfoError) {
+    return terraformPlainText(400, error.message);
+  }
+  if (error instanceof DuplicatePackageFileError) return terraformPlainText(409, "package file already exists");
+  if (error instanceof QuotaTypeSizeError || error instanceof QuotaTotalSizeError) {
+    return terraformPlainText(403, quotaMessage(error));
+  }
+  if (error instanceof TerraformLockStateError) {
+    console.error("[packages-terraform] lock write failed", error);
+    return terraformPlainText(500, "internal server error");
+  }
+  // The store-cap classes (the documented divergences — upstream's unbounded
+  // spool has neither arm).
+  if (error instanceof PackageSizeMismatchError) {
+    return terraformPlainText(500, "internal server error");
+  }
+  if (error instanceof PackageBlobTooLargeError) {
+    return terraformPlainText(413, "package file is too large");
+  }
+  console.error("[packages-terraform] upload failed", error);
+  return terraformPlainText(500, "internal server error");
+}
+
+/** DeleteState (terraform.go:238-297): 404 / 423 / the whole-package
+ *  cascade → 200 (no body). */
+async function terraformDelete(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "write");
+    const outcome = await deleteTerraformState(c.env.DB, owner.id, c.req.param("name") ?? "");
+    if (outcome.kind === "not-found") return terraformPlainText(404, "package does not exist");
+    if (outcome.kind === "locked") return terraformPlainText(423, "terraform state is locked");
+    return new Response(null, { status: 200 });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    console.error("[packages-terraform] delete failed", error);
+    return terraformPlainText(500, "internal server error");
+  }
+}
+
+/** DeleteStateBySerial (terraform.go:196-234): 404 / the latest-serial 403 /
+ *  the version cascade → 204. */
+async function terraformDeleteBySerial(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "write");
+    const outcome = await deleteTerraformStateBySerial(
+      c.env.DB,
+      owner.id,
+      c.req.param("name") ?? "",
+      c.req.param("serial") ?? "",
+    );
+    if (outcome.kind === "not-found") return terraformPlainText(404, "package does not exist");
+    if (outcome.kind === "latest") return terraformPlainText(403, "cannot delete the latest version");
+    return new Response(null, { status: 204 });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    console.error("[packages-terraform] delete-by-serial failed", error);
+    return terraformPlainText(500, "internal server error");
+  }
+}
+
+/** LockState (terraform.go:302-362): the 64 KiB body parse → the allocate +
+ *  set dance; locked answers 423 with the CURRENT lock JSON. */
+async function terraformLock(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "write");
+    const body = new Uint8Array(await c.req.raw.arrayBuffer());
+    const outcome = await lockTerraformState(c.env.DB, owner.id, c.req.param("name") ?? "", body);
+    if (outcome.kind === "bad-name") return terraformPlainText(400, "invalid package name");
+    if (outcome.kind === "bad-lock") return terraformPlainText(400, "terraform lock is missing an ID");
+    if (outcome.kind === "locked") {
+      return terraformJson(423, terraformLockBody(outcome.lock));
+    }
+    return new Response(null, { status: 200 });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    console.error("[packages-terraform] lock failed", error);
+    return terraformPlainText(500, "internal server error");
+  }
+}
+
+/** UnlockState (terraform.go:366-422): the missing/not-locked → 200 arms,
+ *  the ID-mismatch 423, the clear → 200. */
+async function terraformUnlock(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "write");
+    const body = new Uint8Array(await c.req.raw.arrayBuffer());
+    const outcome = await unlockTerraformState(c.env.DB, owner.id, c.req.param("name") ?? "", body);
+    if (outcome.kind === "bad-name") return terraformPlainText(400, "invalid package name");
+    if (outcome.kind === "bad-lock") return terraformPlainText(400, "terraform lock is missing an ID");
+    if (outcome.kind === "mismatch") return terraformPlainText(423, "lock ID mismatch");
+    return new Response(null, { status: 200 });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    console.error("[packages-terraform] unlock failed", error);
+    return terraformPlainText(500, "internal server error");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // CRAN — cran.go:27-30 (the PLAIN TEXT apiError) + the api.go:300-318 arms.
 // ---------------------------------------------------------------------------
 
@@ -4972,10 +5200,65 @@ function chefErrorResponse(status: ContentfulStatus, message: string): Response 
   });
 }
 
+/**
+ * The auth-group failure body — upstream verifyAuth's
+ * `ctx.HTTPError(401, "Failed to authenticate user")` (api.go:82-85) is
+ * Go http.Error: the plain-text shape with the trailing newline and the
+ * nosniff guard (base.go:105-112), byte-exact.
+ */
+function chefAuthUnauthorized(): Response {
+  return new Response("Failed to authenticate user\n", {
+    status: 401,
+    headers: { "content-type": "text/plain; charset=utf-8", "x-content-type-options": "nosniff" },
+  });
+}
+
+/**
+ * The chef family's credential pass — the auth-group order ported for the
+ * family (api.go:96-102): the STANDARD credentials resolve first
+ * (`{OAuth2, Basic}` — resolveCredential; the group's earlier methods win,
+ * group.go:44-63 — the integration test uploads via AddBasicAuth,
+ * api_packages_chef_test.go:296), and chef.Auth's X-Ops signed-header
+ * verification (routers/api/packages/chef/auth.go) fires ONLY when they
+ * yield no user. A failed X-Ops attempt is the group's remembered error →
+ * the 401 "Failed to authenticate user" body; a non-applicable one (no
+ * X-Ops-Userid) stays anonymous and the reqPackageAccess gate answers as
+ * before. The rest of the stack (packages 404, owner blindness, the
+ * access gate) is protocolContext verbatim.
+ */
+async function chefProtocolContext(
+  c: Context<{ Bindings: Env }>,
+  required: "read" | "write",
+): Promise<{ owner: UserRow; cred: ResolvedCredential }> {
+  if (packagesDisabled(c.env)) {
+    throw new HTTPException(404, { res: plainResponse(404, "not found") });
+  }
+  let cred = await resolveCredential(c.env.DB, c.req.raw);
+  if (cred.doer === null) {
+    const xops: ChefXOpsAuthResult = await authenticateChefXOps(c.env.DB, c.req.raw);
+    if (xops.error !== null) {
+      throw new HTTPException(401, { res: chefAuthUnauthorized() });
+    }
+    if (xops.user !== null) {
+      cred = { doer: xops.user, scope: null }; // the X-Ops method carries no token scope
+    }
+  }
+  const username = c.req.param("username") ?? "";
+  const owner = await resolveOwnerRow(c.env.DB, username);
+  if (owner === null) {
+    throw new HTTPException(404, { res: plainResponse(404, userRedirectDoesNotExist(username)) });
+  }
+  if (ownerBlindToPublicOnly(owner, cred)) {
+    throw new HTTPException(404, { res: plainResponse(404, userRedirectDoesNotExist(owner.username)) });
+  }
+  await protocolAccessGate(c.env.DB, required, owner, cred);
+  return { owner, cred };
+}
+
 /** PackagesUniverse (chef.go:35-72). */
 async function chefUniverse(c: Context<{ Bindings: Env }>): Promise<Response> {
   try {
-    const { owner } = await protocolContext(c, "read");
+    const { owner } = await chefProtocolContext(c, "read");
     const origin = new URL(c.req.url).origin;
     const baseURL = `${origin}/api/packages/${owner.username}/chef/api/v1`;
     const universe = await buildChefUniverse(c.env.DB, owner, baseURL);
@@ -4989,7 +5272,7 @@ async function chefUniverse(c: Context<{ Bindings: Env }>): Promise<Response> {
 /** EnumeratePackages (chef.go:75-136) — /search AND the /cookbooks root. */
 async function chefEnumerate(c: Context<{ Bindings: Env }>): Promise<Response> {
   try {
-    const { owner } = await protocolContext(c, "read");
+    const { owner } = await chefProtocolContext(c, "read");
     const origin = new URL(c.req.url).origin;
     const baseURL = `${origin}/api/packages/${owner.username}/chef/api/v1/cookbooks/`;
     const result = await searchChefPackages(
@@ -5017,7 +5300,7 @@ async function chefEnumerate(c: Context<{ Bindings: Env }>): Promise<Response> {
 /** UploadPackage (chef.go:201-251): the multipart POST. */
 async function chefUpload(c: Context<{ Bindings: Env }>): Promise<Response> {
   try {
-    const { owner, cred } = await protocolContext(c, "write");
+    const { owner, cred } = await chefProtocolContext(c, "write");
     const doer = cred.doer;
     if (doer === null) {
       return chefErrorResponse(401, "user should have specific permission or be a site admin");
@@ -5062,7 +5345,7 @@ async function chefUpload(c: Context<{ Bindings: Env }>): Promise<Response> {
 /** PackageMetadata (chef.go:139-186). */
 async function chefCookbookMetadata(c: Context<{ Bindings: Env }>): Promise<Response> {
   try {
-    const { owner } = await protocolContext(c, "read");
+    const { owner } = await chefProtocolContext(c, "read");
     const origin = new URL(c.req.url).origin;
     const name = c.req.param("name") ?? "";
     const versionsBaseURL = `${origin}/api/packages/${owner.username}/chef/api/v1/cookbooks/${encodeURIComponent(name)}/versions/`;
@@ -5080,7 +5363,7 @@ async function chefCookbookMetadata(c: Context<{ Bindings: Env }>): Promise<Resp
 /** PackageVersionMetadata (chef.go:189-236). */
 async function chefVersionMetadata(c: Context<{ Bindings: Env }>): Promise<Response> {
   try {
-    const { owner } = await protocolContext(c, "read");
+    const { owner } = await chefProtocolContext(c, "read");
     const origin = new URL(c.req.url).origin;
     const name = c.req.param("name") ?? "";
     const cookbookBaseURL = `${origin}/api/packages/${owner.username}/chef/api/v1/cookbooks/${encodeURIComponent(name)}`;
@@ -5098,7 +5381,7 @@ async function chefVersionMetadata(c: Context<{ Bindings: Env }>): Promise<Respo
 /** DownloadPackage (chef.go:239-264). */
 async function chefDownload(c: Context<{ Bindings: Env }>): Promise<Response> {
   try {
-    const { owner } = await protocolContext(c, "read");
+    const { owner } = await chefProtocolContext(c, "read");
     const download = await openChefPackageForDownload(
       c.env.DB,
       c.env.REPO_PACKS,
@@ -5123,7 +5406,7 @@ async function chefDownload(c: Context<{ Bindings: Env }>): Promise<Response> {
 /** DeletePackageVersion (chef.go:267-286) — write. */
 async function chefDeleteVersion(c: Context<{ Bindings: Env }>): Promise<Response> {
   try {
-    const { owner, cred } = await protocolContext(c, "write");
+    const { owner, cred } = await chefProtocolContext(c, "write");
     const doer = cred.doer;
     if (doer === null) {
       return chefErrorResponse(401, "user should have specific permission or be a site admin");
@@ -5140,7 +5423,7 @@ async function chefDeleteVersion(c: Context<{ Bindings: Env }>): Promise<Respons
 /** DeletePackage (chef.go:289-316) — write. */
 async function chefDeleteCookbook(c: Context<{ Bindings: Env }>): Promise<Response> {
   try {
-    const { owner, cred } = await protocolContext(c, "write");
+    const { owner, cred } = await chefProtocolContext(c, "write");
     const doer = cred.doer;
     if (doer === null) {
       return chefErrorResponse(401, "user should have specific permission or be a site admin");
