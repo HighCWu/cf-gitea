@@ -49,6 +49,7 @@ import { TokenService } from "../../auth/token-service";
 import { findUserByName, type UserRow } from "../services/repository";
 import {
   type PackageAccessMode,
+  DuplicatePackageVersionError,
   QuotaTotalCountError,
   QuotaTotalSizeError,
   QuotaTypeSizeError,
@@ -346,6 +347,94 @@ import {
   uploadRubyGem,
   zlibRubyGemArchive,
 } from "../../services/packages/rubygems";
+import {
+  VagrantInvalidProviderError,
+  VagrantInvalidVersionError,
+  isVagrantProviderNameValid,
+  parseVagrantSemver,
+  enumerateVagrantBox,
+  openVagrantBoxForDownload,
+  uploadVagrantBox,
+  vagrantBoxExists,
+} from "../../services/packages/vagrant";
+import {
+  CRAN_TYPE_BINARY,
+  CRAN_TYPE_SOURCE,
+  CranArchiveError,
+  CranInvalidNameError,
+  CranInvalidVersionError,
+  CranMissingDescriptionError,
+  enumerateCranPackages,
+  openCranFileForDownload,
+  renderCranPackagesIndex,
+  uploadCranBinaryPackage,
+  uploadCranSourcePackage,
+} from "../../services/packages/cran";
+import {
+  PubArchiveError,
+  PubInvalidNameError,
+  PubInvalidVersionError,
+  PubMissingFileError,
+  PubMissingPubspecError,
+  PubPubspecTooLargeError,
+  enumeratePubPackage,
+  getPubVersionMetadata,
+  openPubFileForDownload,
+  pubVersionExists,
+  uploadPubPackage,
+} from "../../services/packages/pub";
+import {
+  ChefArchiveError,
+  ChefInvalidNameError,
+  ChefInvalidVersionError,
+  ChefMissingMetadataError,
+  ChefMissingTarballError,
+  buildChefUniverse,
+  deleteChefPackage,
+  deleteChefPackageVersion,
+  getChefCookbookMetadata,
+  getChefVersionMetadata,
+  openChefPackageForDownload,
+  searchChefPackages,
+  uploadChefPackage,
+} from "../../services/packages/chef";
+import {
+  ComposerArchiveError,
+  ComposerInvalidNameError,
+  ComposerInvalidVersionError,
+  ComposerMissingComposerJsonError,
+  buildComposerServiceIndex,
+  getComposerPackageMetadata,
+  listComposerPackages,
+  openComposerFileForDownload,
+  searchComposerPackages,
+  uploadComposerPackage,
+} from "../../services/packages/composer";
+import {
+  type ConanPackageReference,
+  type ConanRecipeReference,
+  buildConanDownloadUrls,
+  buildConanSnapshot,
+  buildConanUploadUrls,
+  conanPackageAsKey,
+  conanPackageLinkName,
+  conanRecipeAsKey,
+  conanRecipeLinkName,
+  deleteConanPackageV1,
+  deleteConanPackageV2,
+  deleteConanRecipeV1,
+  deleteConanRecipeV2,
+  getConanLatestPackageRevision,
+  getConanLatestRecipeRevision,
+  listConanPackageRevisionsJson,
+  listConanRecipeRevisionsJson,
+  listConanRevisionFiles,
+  newConanRecipeReference,
+  openConanFileForDownload,
+  searchConanPackages,
+  searchConanRecipes,
+  uploadConanFile,
+} from "../../services/packages/conan";
 
 const WWW_AUTHENTICATE = 'Basic realm="Gitea Package API"';
 
@@ -2403,6 +2492,106 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
   app.post("/:username/rubygems/api/v1/gems", (c) => rubygemsUpload(c)); // the bare twin (the pypi double-registration precedent)
   app.delete("/:username/rubygems/api/v1/gems/yank", (c) => rubygemsYank(c));
 
+  // ------------------------------ VAGRANT (api.go:488-498) ------------------------------
+  // The boxes family: the authenticate probe (the bare Doer-nil check —
+  // ANY valid credential passes), the box HEAD/GET enumerate pair, and the
+  // {version}/{provider} download/upload pair. The group's read wrap rides
+  // the download/enumerate arms through protocolContext(c, "read"); the
+  // PUT adds the write gate. HEAD rides the enumerate GET walk (the
+  // pypi/helm precedent — upstream registers HEAD only on the box arm).
+
+  app.get("/:username/vagrant/authenticate", (c) => vagrantAuthenticate(c));
+  app.on("HEAD", "/:username/vagrant/:name", (c) => vagrantBoxProbe(c));
+  app.get("/:username/vagrant/:name", (c) => vagrantEnumerate(c));
+  app.get("/:username/vagrant/:name/:version/:provider", (c) => vagrantDownload(c));
+  app.on("HEAD", "/:username/vagrant/:name/:version/:provider", (c) => vagrantDownload(c));
+  app.put("/:username/vagrant/:name/:version/:provider", (c) => vagrantUpload(c));
+
+  // ------------------------------ CRAN (api.go:300-318) ------------------------------
+  // The R family: the src/contrib + bin/{platform}/contrib/{rversion}
+  // PACKAGES(.gz) enumerations, the filename downloads (the Archive shape
+  // shares the handler — the filename pins), and the src/bin PUTs (the
+  // binary arm reads the platform/rversion query pair). The error bodies
+  // are the PLAIN TEXT family shape (cran.go:27-30's ctx.PlainText).
+
+  app.get("/:username/cran/src/contrib/PACKAGES", (c) => cranEnumerate(c, CRAN_TYPE_SOURCE, "", ""));
+  app.get("/:username/cran/src/contrib/PACKAGES.gz", (c) => cranEnumerate(c, CRAN_TYPE_SOURCE, "", ""));
+  app.get("/:username/cran/src/contrib/Archive/:packagename/:filename", (c) => cranDownload(c, CRAN_TYPE_SOURCE, "", ""));
+  app.on("HEAD", "/:username/cran/src/contrib/Archive/:packagename/:filename", (c) => cranDownload(c, CRAN_TYPE_SOURCE, "", ""));
+  app.get("/:username/cran/src/contrib/:filename", (c) => cranDownload(c, CRAN_TYPE_SOURCE, "", ""));
+  app.on("HEAD", "/:username/cran/src/contrib/:filename", (c) => cranDownload(c, CRAN_TYPE_SOURCE, "", ""));
+  app.put("/:username/cran/src", (c) => cranUpload(c, "source"));
+  app.get("/:username/cran/bin/:platform/contrib/:rversion/PACKAGES", (c) =>
+    cranEnumerate(c, CRAN_TYPE_BINARY, c.req.param("platform") ?? "", c.req.param("rversion") ?? ""),
+  );
+  app.get("/:username/cran/bin/:platform/contrib/:rversion/PACKAGES.gz", (c) =>
+    cranEnumerate(c, CRAN_TYPE_BINARY, c.req.param("platform") ?? "", c.req.param("rversion") ?? ""),
+  );
+  app.get("/:username/cran/bin/:platform/contrib/:rversion/:filename", (c) =>
+    cranDownload(c, CRAN_TYPE_BINARY, c.req.param("platform") ?? "", c.req.param("rversion") ?? ""),
+  );
+  app.on("HEAD", "/:username/cran/bin/:platform/contrib/:rversion/:filename", (c) =>
+    cranDownload(c, CRAN_TYPE_BINARY, c.req.param("platform") ?? "", c.req.param("rversion") ?? ""),
+  );
+  app.put("/:username/cran/bin", (c) => cranUpload(c, "binary"));
+
+  // ------------------------------ PUB (api.go:398-413) ------------------------------
+  // The dart pub family: the versions/new publish dance (the upload-url
+  // request, the multipart POST, the finalize probe — ALL under the write
+  // gate, api.go:401-406) and the {id} read group (enumerate, files,
+  // version metadata). The JSON bodies carry the
+  // application/vnd.pub.v2+json content type; errors are the
+  // {"error":{code,message}} wrapper.
+
+  app.get("/:username/pub/api/packages/versions/new", (c) => pubRequestUpload(c));
+  app.post("/:username/pub/api/packages/versions/new/upload", (c) => pubUpload(c));
+  app.get("/:username/pub/api/packages/versions/new/finalize/:id/:version", (c) => pubFinalize(c));
+  app.get("/:username/pub/api/packages/:id", (c) => pubEnumerate(c));
+  app.get("/:username/pub/api/packages/:id/files/:version", (c) => pubDownload(c));
+  app.on("HEAD", "/:username/pub/api/packages/:id/files/:version", (c) => pubDownload(c));
+  app.get("/:username/pub/api/packages/:id/:version", (c) => pubVersionMetadata(c));
+
+  // ------------------------------ CHEF (api.go:147-164) ------------------------------
+  // The supermarket family: the universe + search enumerations, the
+  // cookbooks collection (enumerate GET + upload POST), the cookbook and
+  // version metadata shapes, the download, and the two delete arms. The
+  // error bodies are the {"error_messages":[…]} wrapper.
+
+  app.get("/:username/chef/api/v1/universe", (c) => chefUniverse(c));
+  app.get("/:username/chef/api/v1/search", (c) => chefEnumerate(c));
+  app.get("/:username/chef/api/v1/cookbooks", (c) => chefEnumerate(c));
+  app.post("/:username/chef/api/v1/cookbooks", (c) => chefUpload(c));
+  app.get("/:username/chef/api/v1/cookbooks/:name", (c) => chefCookbookMetadata(c));
+  app.delete("/:username/chef/api/v1/cookbooks/:name", (c) => chefDeleteCookbook(c));
+  app.get("/:username/chef/api/v1/cookbooks/:name/versions/:version", (c) => chefVersionMetadata(c));
+  app.delete("/:username/chef/api/v1/cookbooks/:name/versions/:version", (c) => chefDeleteVersion(c));
+  app.get("/:username/chef/api/v1/cookbooks/:name/versions/:version/download", (c) => chefDownload(c));
+  app.on("HEAD", "/:username/chef/api/v1/cookbooks/:name/versions/:version/download", (c) => chefDownload(c));
+
+  // ------------------------------ COMPOSER (api.go:166-175) ------------------------------
+  // The packagist family: the service index, the search/list pair, the p2
+  // metadata (~dev.json shares the handler — the suffix strips), the
+  // download, and the RAW-body PUT (the ?version= query fallback).
+
+  app.get("/:username/composer/packages.json", (c) => composerServiceIndex(c));
+  app.get("/:username/composer/search.json", (c) => composerSearch(c));
+  app.get("/:username/composer/list.json", (c) => composerList(c));
+  app.get("/:username/composer/p2/:vendor/:project~dev.json", (c) => composerMetadata(c));
+  app.get("/:username/composer/p2/:vendor/:project.json", (c) => composerMetadata(c));
+  app.get("/:username/composer/files/:package/:version/:filename", (c) => composerDownload(c));
+  app.on("HEAD", "/:username/composer/files/:package/:version/:filename", (c) => composerDownload(c));
+  app.put("/:username/composer", (c) => composerUpload(c));
+
+  // ------------------------------ CONAN (api.go:175-290) ------------------------------
+  // The conan family: the v1+v2 tables ride ONE decoded-remainder walk
+  // (the npm/rpm/swift posture — Hono params cannot express chi's nested
+  // optional tails). The group's read wrap rides the walk; the write arms
+  // carry the doer-bearing gate. The authenticate mints a package-scoped
+  // token the client echoes back (verified beside the standard
+  // credentials in conanGate).
+
+  app.on(["GET", "DELETE", "POST", "PUT"], "/:username/conan/*", (c) => conanDispatch(c));
+
   return app;
 }
 
@@ -4321,3 +4510,1296 @@ async function rubygemsYank(c: Context<{ Bindings: Env }>): Promise<Response> {
     return rubygemsErrorResponse(error);
   }
 }
+
+// ===========================================================================
+// The SIX LONG-TAIL FAMILIES (SPEC-0016 §7) — vagrant, cran, pub, chef,
+// composer, conan. The handlers live at module level (the rubygems split);
+// the registrations sit inside createEcosystemProtocolRouter.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// VAGRANT — vagrant.go:24-31 ({"errors":[…]}) + the api.go:488-498 arms.
+// ---------------------------------------------------------------------------
+
+function vagrantErrorResponse(status: ContentfulStatus, message: string): Response {
+  return new Response(JSON.stringify({ errors: [message] }), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/** CheckAuthenticate (vagrant.go:33-53): the bare doer-nil check — the
+ *  group's read gate has ALREADY verified the credential. */
+async function vagrantAuthenticate(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { cred } = await protocolContext(c, "read");
+    if (cred.doer === null) {
+      return vagrantErrorResponse(401, "Invalid access token");
+    }
+    return new Response(null, { status: 200 });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** CheckBoxAvailable (vagrant.go:33-53) — HEAD; the enumerate gate. */
+async function vagrantBoxProbe(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    if (!(await vagrantBoxExists(c.env.DB, owner, c.req.param("name") ?? ""))) {
+      return vagrantErrorResponse(404, "");
+    }
+    return new Response(null, { status: 200, headers: { "content-type": "application/json" } });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** EnumeratePackageVersions (vagrant.go:55-95). */
+async function vagrantEnumerate(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const origin = new URL(c.req.url).origin;
+    const baseURL = `${origin}/api/packages/${owner.username}/vagrant/${encodeURIComponent(c.req.param("name") ?? "")}`;
+    const enumerate = await enumerateVagrantBox(c.env.DB, owner, c.req.param("name") ?? "", baseURL);
+    if (enumerate === null) {
+      return vagrantErrorResponse(404, "");
+    }
+    return new Response(JSON.stringify(enumerate), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** UploadPackageFile (vagrant.go:97-171): the PUT walk. */
+async function vagrantUpload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const version = c.req.param("version") ?? "";
+  const provider = c.req.param("provider") ?? "";
+  try {
+    const { owner, cred } = await protocolContext(c, "write");
+    const doer = cred.doer;
+    if (doer === null) {
+      return vagrantErrorResponse(401, "user should have specific permission or be a site admin");
+    }
+    if (parseVagrantSemver(version) === null) {
+      return vagrantErrorResponse(400, "package version is invalid");
+    }
+    if (!isVagrantProviderNameValid(provider)) {
+      return vagrantErrorResponse(400, "provider name is invalid");
+    }
+    await uploadVagrantBox({
+      d1: c.env.DB,
+      bucket: c.env.REPO_PACKS,
+      owner,
+      doer,
+      name: c.req.param("name") ?? "",
+      version,
+      provider,
+      content: bodyStream(c.req.raw),
+      declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
+      quota: packagesQuotaFromEnv(c.env),
+    });
+    return new Response(null, { status: 201 });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    if (error instanceof VagrantInvalidVersionError || error instanceof VagrantInvalidProviderError) {
+      return vagrantErrorResponse(400, error.message);
+    }
+    if (error instanceof DuplicatePackageFileError) return vagrantErrorResponse(409, "package file already exists");
+    if (
+      error instanceof QuotaTotalCountError ||
+      error instanceof QuotaTypeSizeError ||
+      error instanceof QuotaTotalSizeError
+    ) {
+      return vagrantErrorResponse(403, quotaMessage(error));
+    }
+    console.error("[packages-vagrant] upload failed", error);
+    return vagrantErrorResponse(500, "internal server error");
+  }
+}
+
+/** DownloadPackageFile (vagrant.go:173-189). */
+async function vagrantDownload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const download = await openVagrantBoxForDownload(
+      c.env.DB,
+      c.env.REPO_PACKS,
+      owner,
+      c.req.param("name") ?? "",
+      c.req.param("version") ?? "",
+      c.req.param("provider") ?? "",
+      c.req.method === "HEAD" ? "HEAD" : "GET",
+    );
+    if (download === null) return vagrantErrorResponse(404, "");
+    return fileResponse(c, {
+      stream: download.stream,
+      size: download.size,
+      filename: download.file.name,
+      created: download.file.createdUnix,
+    });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CRAN — cran.go:27-30 (the PLAIN TEXT apiError) + the api.go:300-318 arms.
+// ---------------------------------------------------------------------------
+
+/** apiError(404, nil) / apiError(400, nil) — the EMPTY-detail bodies. */
+function cranEmptyDetail(status: 400 | 401 | 404): Response {
+  return plainResponse(status, "");
+}
+
+/** enumeratePackages (cran.go:49-111): the PACKAGES(.gz) body — an EMPTY
+ *  answer is the 404-nil; the `.gz` suffix renders the gzipped form
+ *  (application/x-gzip). */
+async function cranEnumerate(c: Context<{ Bindings: Env }>, fileType: string, platform: string, rversion: string): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const gz = (c.req.path.endsWith(".gz") ? ".gz" : "") !== "";
+    if (gz && !c.req.path.endsWith("PACKAGES.gz")) {
+      return cranEmptyDetail(404);
+    }
+    const entries = await enumerateCranPackages(c.env.DB, owner, fileType, platform, rversion);
+    if (entries.length === 0) {
+      return cranEmptyDetail(404);
+    }
+    const body = renderCranPackagesIndex(entries);
+    if (gz) {
+      const { gzipCompress } = await import("../../services/packages/distro-common");
+      const bytes = await gzipCompress(new TextEncoder().encode(body));
+      return new Response(new Uint8Array(bytes), {
+        status: 200,
+        headers: { "content-type": "application/x-gzip" },
+      });
+    }
+    return new Response(body, {
+      status: 200,
+      headers: { "content-type": "text/plain;charset=utf-8" },
+    });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    console.error("[packages-cran] enumerate failed", error);
+    return plainResponse(500, "internal server error");
+  }
+}
+
+/** downloadPackageFile (cran.go:208-253). */
+async function cranDownload(c: Context<{ Bindings: Env }>, fileType: string, platform: string, rversion: string): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const download = await openCranFileForDownload(
+      c.env.DB,
+      c.env.REPO_PACKS,
+      owner,
+      fileType,
+      platform,
+      rversion,
+      c.req.param("filename") ?? "",
+    );
+    if (download === null) return cranEmptyDetail(404);
+    return fileResponse(c, {
+      stream: download.stream,
+      size: download.size,
+      filename: download.file.name,
+      created: download.file.createdUnix,
+    });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** uploadPackageFile (cran.go:113-206): the src/bin PUTs; the binary arm
+ *  reads the platform/rversion query pair (the 400-nil missing arm). */
+async function cranUpload(c: Context<{ Bindings: Env }>, kind: "source" | "binary"): Promise<Response> {
+  try {
+    const { owner, cred } = await protocolContext(c, "write");
+    const doer = cred.doer;
+    if (doer === null) {
+      return cranEmptyDetail(401);
+    }
+    let platform = "";
+    let rversion = "";
+    if (kind === "binary") {
+      platform = c.req.query("platform") ?? "";
+      rversion = c.req.query("rversion") ?? "";
+      if (platform === "" || rversion === "") {
+        return cranEmptyDetail(400);
+      }
+    }
+    const input = {
+      d1: c.env.DB,
+      bucket: c.env.REPO_PACKS,
+      owner,
+      doer,
+      content: bodyStream(c.req.raw),
+      declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
+      quota: packagesQuotaFromEnv(c.env),
+    };
+    if (kind === "source") {
+      await uploadCranSourcePackage(input);
+    } else {
+      await uploadCranBinaryPackage(input, platform, rversion);
+    }
+    return new Response(null, { status: 201 });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    if (
+      error instanceof CranMissingDescriptionError ||
+      error instanceof CranInvalidNameError ||
+      error instanceof CranInvalidVersionError
+    ) {
+      return plainResponse(400, error.message);
+    }
+    if (error instanceof DuplicatePackageFileError) return plainResponse(409, "package file already exists");
+    if (
+      error instanceof QuotaTotalCountError ||
+      error instanceof QuotaTypeSizeError ||
+      error instanceof QuotaTotalSizeError
+    ) {
+      return plainResponse(403, quotaMessage(error));
+    }
+    // The corrupt-archive class (plain Go errors upstream) and everything
+    // else — the 500 default arm.
+    if (error instanceof CranArchiveError) {
+      console.error("[packages-cran] upload failed", error);
+    }
+    return plainResponse(500, "internal server error");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PUB — pub.go:25-39 ({"error":{code,message}} over
+// application/vnd.pub.v2+json) + the api.go:398-413 arms.
+// ---------------------------------------------------------------------------
+
+const PUB_CONTENT_TYPE = "application/vnd.pub.v2+json";
+
+function pubJsonResponse(status: 200 | ContentfulStatus, body: unknown): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": PUB_CONTENT_TYPE } });
+}
+
+/** apiError (pub.go:25-39) — the StatusText code + the message. */
+function pubErrorResponse(status: ContentfulStatus, message: string): Response {
+  return pubJsonResponse(status, { error: { code: httpStatusText(status), message } });
+}
+
+/** Go's http.StatusText for the codes the family answers. */
+function httpStatusText(status: ContentfulStatus): string {
+  const texts: Record<number, string> = {
+    400: "Bad Request",
+    401: "Unauthorized",
+    403: "Forbidden",
+    404: "Not Found",
+    409: "Conflict",
+    411: "Length Required",
+    413: "Request Entity Too Large",
+    500: "Internal Server Error",
+  };
+  return texts[status] ?? "";
+}
+
+function pubOriginBaseURL(c: Context<{ Bindings: Env }>, owner: UserRow): string {
+  const origin = new URL(c.req.url).origin;
+  return `${origin}/api/packages/${owner.username}/pub/api/packages`;
+}
+
+/** RequestUpload (pub.go:99-112): the upload-url form (the fields map is
+ *  ALWAYS empty — the direct-upload answer). */
+async function pubRequestUpload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "write");
+    return pubJsonResponse(200, {
+      url: `${pubOriginBaseURL(c, owner)}/versions/new/upload`,
+      fields: {},
+    });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** UploadPackageFile (pub.go:117-190): the multipart POST; 204 carries the
+ *  Location finalize header. */
+async function pubUpload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner, cred } = await protocolContext(c, "write");
+    const doer = cred.doer;
+    if (doer === null) {
+      return pubErrorResponse(401, "user should have specific permission or be a site admin");
+    }
+    const result = await uploadPubPackage({
+      d1: c.env.DB,
+      bucket: c.env.REPO_PACKS,
+      owner,
+      doer,
+      contentType: c.req.header("content-type") ?? "",
+      content: bodyStream(c.req.raw),
+      declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
+      quota: packagesQuotaFromEnv(c.env),
+    });
+    return new Response(null, {
+      status: 204,
+      headers: {
+        location: `${pubOriginBaseURL(c, owner)}/versions/new/finalize/${encodeURIComponent(result.parsed.name)}/${encodeURIComponent(result.parsed.version)}`,
+      },
+    });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    if (
+      error instanceof PubMissingPubspecError ||
+      error instanceof PubPubspecTooLargeError ||
+      error instanceof PubInvalidNameError ||
+      error instanceof PubInvalidVersionError ||
+      error instanceof PubMissingFileError ||
+      error instanceof PubArchiveError
+    ) {
+      return pubErrorResponse(400, error.message);
+    }
+    if (error instanceof DuplicatePackageVersionError) return pubErrorResponse(409, error.message);
+    if (
+      error instanceof QuotaTotalCountError ||
+      error instanceof QuotaTypeSizeError ||
+      error instanceof QuotaTotalSizeError
+    ) {
+      return pubErrorResponse(403, quotaMessage(error));
+    }
+    console.error("[packages-pub] upload failed", error);
+    return pubErrorResponse(500, "internal server error");
+  }
+}
+
+/** FinalizePackage (pub.go:130-154): {"success":{}} 200 / the 404 arm. */
+async function pubFinalize(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "write");
+    if (!(await pubVersionExists(c.env.DB, owner, c.req.param("id") ?? "", c.req.param("version") ?? ""))) {
+      return pubErrorResponse(404, "");
+    }
+    return pubJsonResponse(200, { success: { message: "" } });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** EnumeratePackageVersions (pub.go:52-99). */
+async function pubEnumerate(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const id = c.req.param("id") ?? "";
+    const enumerate = await enumeratePubPackage(c.env.DB, owner, id, pubOriginBaseURL(c, owner));
+    if (enumerate === null) {
+      return pubErrorResponse(404, "");
+    }
+    return pubJsonResponse(200, enumerate);
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** PackageVersionMetadata (pub.go:101-128). */
+async function pubVersionMetadata(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const metadata = await getPubVersionMetadata(
+      c.env.DB,
+      owner,
+      c.req.param("id") ?? "",
+      c.req.param("version") ?? "",
+      pubOriginBaseURL(c, owner),
+    );
+    if (metadata === null) {
+      return pubErrorResponse(404, "");
+    }
+    return pubJsonResponse(200, metadata);
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** DownloadPackageFile (pub.go:192-222). */
+async function pubDownload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const download = await openPubFileForDownload(
+      c.env.DB,
+      c.env.REPO_PACKS,
+      owner,
+      c.req.param("id") ?? "",
+      c.req.param("version") ?? "",
+      c.req.method === "HEAD" ? "HEAD" : "GET",
+    );
+    if (download === null) return pubErrorResponse(404, "");
+    return fileResponse(c, {
+      stream: download.stream,
+      size: download.size,
+      filename: download.file.name,
+      created: download.file.createdUnix,
+    });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CHEF — chef.go:24-31 ({"error_messages":[…]}) + the api.go:147-164 arms.
+// ---------------------------------------------------------------------------
+
+function chefErrorResponse(status: ContentfulStatus, message: string): Response {
+  return new Response(JSON.stringify({ error_messages: [message] }), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/** PackagesUniverse (chef.go:35-72). */
+async function chefUniverse(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const origin = new URL(c.req.url).origin;
+    const baseURL = `${origin}/api/packages/${owner.username}/chef/api/v1`;
+    const universe = await buildChefUniverse(c.env.DB, owner, baseURL);
+    return new Response(JSON.stringify(universe), { status: 200, headers: { "content-type": "application/json" } });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** EnumeratePackages (chef.go:75-136) — /search AND the /cookbooks root. */
+async function chefEnumerate(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const origin = new URL(c.req.url).origin;
+    const baseURL = `${origin}/api/packages/${owner.username}/chef/api/v1/cookbooks/`;
+    const result = await searchChefPackages(
+      c.env.DB,
+      owner,
+      c.req.query("q") ?? "",
+      c.req.query("order") ?? "",
+      Number.parseInt(c.req.query("start") ?? "0", 10) || 0,
+      Number.parseInt(c.req.query("items") ?? "0", 10) || 0,
+      baseURL,
+    );
+    return new Response(JSON.stringify(result), { status: 200, headers: { "content-type": "application/json" } });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** UploadPackage (chef.go:201-251): the multipart POST. */
+async function chefUpload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner, cred } = await protocolContext(c, "write");
+    const doer = cred.doer;
+    if (doer === null) {
+      return chefErrorResponse(401, "user should have specific permission or be a site admin");
+    }
+    await uploadChefPackage({
+      d1: c.env.DB,
+      bucket: c.env.REPO_PACKS,
+      owner,
+      doer,
+      contentType: c.req.header("content-type") ?? "",
+      content: bodyStream(c.req.raw),
+      declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
+      quota: packagesQuotaFromEnv(c.env),
+    });
+    return new Response(JSON.stringify({}), { status: 201, headers: { "content-type": "application/json" } });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    if (
+      error instanceof ChefMissingMetadataError ||
+      error instanceof ChefInvalidNameError ||
+      error instanceof ChefInvalidVersionError ||
+      error instanceof ChefMissingTarballError
+    ) {
+      return chefErrorResponse(400, error.message);
+    }
+    if (error instanceof DuplicatePackageVersionError) return chefErrorResponse(409, error.message);
+    if (
+      error instanceof QuotaTotalCountError ||
+      error instanceof QuotaTypeSizeError ||
+      error instanceof QuotaTotalSizeError
+    ) {
+      return chefErrorResponse(403, quotaMessage(error));
+    }
+    // The corrupt-archive class — the 500 default arm (chef.go:216-222).
+    if (error instanceof ChefArchiveError) {
+      console.error("[packages-chef] upload failed", error);
+    }
+    return chefErrorResponse(500, "internal server error");
+  }
+}
+
+/** PackageMetadata (chef.go:139-186). */
+async function chefCookbookMetadata(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const origin = new URL(c.req.url).origin;
+    const name = c.req.param("name") ?? "";
+    const versionsBaseURL = `${origin}/api/packages/${owner.username}/chef/api/v1/cookbooks/${encodeURIComponent(name)}/versions/`;
+    const metadata = await getChefCookbookMetadata(c.env.DB, owner, name, versionsBaseURL);
+    if (metadata === null) {
+      return chefErrorResponse(404, "");
+    }
+    return new Response(JSON.stringify(metadata), { status: 200, headers: { "content-type": "application/json" } });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** PackageVersionMetadata (chef.go:189-236). */
+async function chefVersionMetadata(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const origin = new URL(c.req.url).origin;
+    const name = c.req.param("name") ?? "";
+    const cookbookBaseURL = `${origin}/api/packages/${owner.username}/chef/api/v1/cookbooks/${encodeURIComponent(name)}`;
+    const metadata = await getChefVersionMetadata(c.env.DB, owner, name, c.req.param("version") ?? "", cookbookBaseURL);
+    if (metadata === null) {
+      return chefErrorResponse(404, "");
+    }
+    return new Response(JSON.stringify(metadata), { status: 200, headers: { "content-type": "application/json" } });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** DownloadPackage (chef.go:239-264). */
+async function chefDownload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const download = await openChefPackageForDownload(
+      c.env.DB,
+      c.env.REPO_PACKS,
+      owner,
+      c.req.param("name") ?? "",
+      c.req.param("version") ?? "",
+      c.req.method === "HEAD" ? "HEAD" : "GET",
+    );
+    if (download === null) return chefErrorResponse(404, "");
+    return fileResponse(c, {
+      stream: download.stream,
+      size: download.size,
+      filename: download.file.name,
+      created: download.file.createdUnix,
+    });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** DeletePackageVersion (chef.go:267-286) — write. */
+async function chefDeleteVersion(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner, cred } = await protocolContext(c, "write");
+    const doer = cred.doer;
+    if (doer === null) {
+      return chefErrorResponse(401, "user should have specific permission or be a site admin");
+    }
+    const deleted = await deleteChefPackageVersion(c.env.DB, owner, c.req.param("name") ?? "", c.req.param("version") ?? "");
+    if (!deleted) return chefErrorResponse(404, "");
+    return new Response(null, { status: 200 });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** DeletePackage (chef.go:289-316) — write. */
+async function chefDeleteCookbook(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner, cred } = await protocolContext(c, "write");
+    const doer = cred.doer;
+    if (doer === null) {
+      return chefErrorResponse(401, "user should have specific permission or be a site admin");
+    }
+    const deleted = await deleteChefPackage(c.env.DB, owner, c.req.param("name") ?? "");
+    if (!deleted) return chefErrorResponse(404, "");
+    return new Response(null, { status: 200 });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// COMPOSER — composer.go:39-49 ({"errors":[{status,message}]}) + the
+// api.go:166-175 arms.
+// ---------------------------------------------------------------------------
+
+function composerErrorResponse(status: ContentfulStatus, message: string): Response {
+  return new Response(JSON.stringify({ errors: [{ status, message }] }), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/** ServiceIndex (api.go:18-28). */
+async function composerServiceIndex(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const origin = new URL(c.req.url).origin;
+    const index = buildComposerServiceIndex(`${origin}/api/packages/${owner.username}/composer`);
+    return new Response(JSON.stringify(index), { status: 200, headers: { "content-type": "application/json" } });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** SearchPackages (api.go:34-91). */
+async function composerSearch(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const origin = new URL(c.req.url).origin;
+    const result = await searchComposerPackages(
+      c.env.DB,
+      owner,
+      c.req.query("q") ?? "",
+      c.req.query("type") ?? "",
+      Number.parseInt(c.req.query("page") ?? "1", 10) || 1,
+      Number.parseInt(c.req.query("per_page") ?? "0", 10) || 0,
+      `${origin}/api/packages/${owner.username}/composer/search.json`,
+    );
+    return new Response(JSON.stringify(result), { status: 200, headers: { "content-type": "application/json" } });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** EnumeratePackages (api.go:97-110). */
+async function composerList(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const names = await listComposerPackages(c.env.DB, owner);
+    return new Response(JSON.stringify({ packageNames: names }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** PackageMetadata (api.go:113-176) — the ~dev.json twin strips its suffix. */
+async function composerMetadata(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner, cred } = await protocolContext(c, "read");
+    const origin = new URL(c.req.url).origin;
+    const registryURL = `${origin}/api/packages/${owner.username}/composer`;
+    let project = c.req.param("project") ?? "";
+    if (project.endsWith("~dev")) {
+      project = project.slice(0, -"~dev".length);
+    }
+    const metadata = await getComposerPackageMetadata(
+      c.env.DB,
+      owner,
+      c.req.param("vendor") ?? "",
+      project,
+      registryURL,
+      origin,
+      cred.doer === null ? null : { id: cred.doer.id, isAdmin: cred.doer.isAdmin },
+    );
+    if (metadata === null) {
+      return composerErrorResponse(404, "package does not exist");
+    }
+    return new Response(JSON.stringify(metadata), { status: 200, headers: { "content-type": "application/json" } });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** DownloadPackageFile (composer.go:121-146). */
+async function composerDownload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner } = await protocolContext(c, "read");
+    const download = await openComposerFileForDownload(
+      c.env.DB,
+      c.env.REPO_PACKS,
+      owner,
+      c.req.param("package") ?? "",
+      c.req.param("version") ?? "",
+      c.req.param("filename") ?? "",
+      c.req.method === "HEAD" ? "HEAD" : "GET",
+    );
+    if (download === null) return composerErrorResponse(404, "package does not exist");
+    return fileResponse(c, {
+      stream: download.stream,
+      size: download.size,
+      filename: download.file.name,
+      created: download.file.createdUnix,
+    });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** UploadPackage (composer.go:151-223): the RAW body PUT. */
+async function composerUpload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const { owner, cred } = await protocolContext(c, "write");
+    const doer = cred.doer;
+    if (doer === null) {
+      return composerErrorResponse(401, "user should have specific permission or be a site admin");
+    }
+    await uploadComposerPackage({
+      d1: c.env.DB,
+      bucket: c.env.REPO_PACKS,
+      owner,
+      doer,
+      content: bodyStream(c.req.raw),
+      declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
+      versionParam: c.req.query("version") ?? "",
+      quota: packagesQuotaFromEnv(c.env),
+    });
+    return new Response(null, { status: 201 });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    if (
+      error instanceof ComposerMissingComposerJsonError ||
+      error instanceof ComposerInvalidNameError ||
+      error instanceof ComposerInvalidVersionError
+    ) {
+      return composerErrorResponse(400, error.message);
+    }
+    if (error instanceof DuplicatePackageVersionError) return composerErrorResponse(409, error.message);
+    if (
+      error instanceof QuotaTotalCountError ||
+      error instanceof QuotaTypeSizeError ||
+      error instanceof QuotaTotalSizeError
+    ) {
+      return composerErrorResponse(403, quotaMessage(error));
+    }
+    // The corrupt-archive / missing-version arms ride the default here —
+    // the missing-version arm is the route's OWN 400 (composer.go:172-176).
+    if (error instanceof ComposerArchiveError) {
+      console.error("[packages-composer] upload failed", error);
+    }
+    return composerErrorResponse(500, "internal server error");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CONAN — conan.go:54-66 ({"message": …} over application/json) + the
+// api.go:175-290 v1/v2 tables, ONE decoded-remainder walk.
+// ---------------------------------------------------------------------------
+
+/** jsonResponse (conan.go:54-59) — Go's json.Encoder appends the newline. */
+function conanJsonResponse(status: 200 | 201 | 404, body: unknown): Response {
+  return new Response(`${JSON.stringify(body)}\n`, { status, headers: { "content-type": "application/json" } });
+}
+
+function conanErrorResponseRaw(status: ContentfulStatus, message: string): Response {
+  return new Response(`${JSON.stringify({ message })}\n`, {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+interface ConanGate {
+  owner: UserRow;
+  cred: ResolvedCredential;
+}
+
+/**
+ * The conan credential pass: the STANDARD gate first (protocolContext), a
+ * minted authenticate token riding the Basic password / Bearer header
+ * second (the client echoes /users/authenticate's token back — upstream's
+ * CreateAuthorizationToken flow, verified beside the shared credentials).
+ */
+async function conanGate(c: Context<{ Bindings: Env }>, required: "read" | "write"): Promise<ConanGate> {
+  try {
+    return await protocolContext(c, required);
+  } catch (error) {
+    if (!(error instanceof HTTPException)) throw error;
+    if (error.getResponse().status !== 401) throw error;
+    const gate = await conanMintedGate(c, required);
+    if (gate !== null) return gate;
+    throw error;
+  }
+}
+
+/** The minted-token fallback (upstream's CreateAuthorizationToken/verify
+ *  pair reduced to the auth module's mint seam). */
+async function conanMintedGate(c: Context<{ Bindings: Env }>, required: "read" | "write"): Promise<ConanGate | null> {
+  const header = c.req.raw.headers.get("Authorization");
+  let token = "";
+  if (header !== null) {
+    const lower = header.toLowerCase();
+    if (lower.startsWith("bearer ")) token = header.slice(7).trim();
+    if (lower.startsWith("basic ")) {
+      const decoded = atob(header.slice(6).trim());
+      const colon = decoded.indexOf(":");
+      token = colon === -1 ? "" : decoded.slice(colon + 1);
+    }
+  }
+  if (token === "") return null;
+  const claims = await verifyContainerToken(c.env.DB, token);
+  if (claims === null || claims.userId === CONTAINER_GHOST_USER_ID) return null;
+  const owner = await resolveOwnerRow(c.env.DB, c.req.param("username") ?? "");
+  if (owner === null) return null;
+  const row = (await drizzle(c.env.DB).select().from(users).where(eq(users.id, claims.userId)).get()) ?? null;
+  if (row === null) return null;
+  const doer = rowToAuthUser(row);
+  await protocolAccessGate(c.env.DB, required, owner, { doer, scope: ScopeSet.parseLenient("write:package") });
+  return { owner, cred: { doer, scope: ScopeSet.parseLenient("write:package") } };
+}
+
+/** The v1/v2 write arms answer the bare challenge (the go upload posture). */
+function conanUnauthorized(): Response {
+  return conanErrorResponseRaw(401, "user should have specific permission or be a site admin");
+}
+
+function conanFileURLBase(c: Context<{ Bindings: Env }>, owner: UserRow, recipeLinkName: string): string {
+  const origin = new URL(c.req.url).origin;
+  return `${origin}/api/packages/${owner.username}/conan/v1/files/${recipeLinkName}`;
+}
+
+interface ConanRouteTarget {
+  version: "v1" | "v2";
+  arm: string;
+  recipe: ConanRecipeReference;
+  pref: ConanPackageReference | null;
+  filename: string;
+}
+
+/**
+ * The walk over the decoded remainder (the npm posture — the RESERVED
+ * escapes survive in c.req.path; the walk decodes per segment, a malformed
+ * escape 404s). Returns null = the router-page 404.
+ */
+function parseConanTarget(parts: string[], method: string): ConanRouteTarget | null {
+  const version = parts[0] === "v1" ? "v1" : parts[0] === "v2" ? "v2" : null;
+  if (version === null) return null;
+  const rest = parts.slice(1);
+  // ping / users/{authenticate,check_credentials} / conans/search
+  if (rest[0] === undefined || rest[0] === "ping") {
+    return { version, arm: "ping", recipe: newConanRecipeReference("x", "1.0", "_", "_", ""), pref: null, filename: "" };
+  }
+  if (rest[0] === "users") {
+    if (rest[1] === "authenticate" || rest[1] === "check_credentials") {
+      return { version, arm: rest[1], recipe: newConanRecipeReference("x", "1.0", "_", "_", ""), pref: null, filename: "" };
+    }
+    return null;
+  }
+  if (rest[0] !== "conans") return null;
+  if (rest[1] === "search") {
+    return { version, arm: "recipe-search", recipe: newConanRecipeReference("x", "1.0", "_", "_", ""), pref: null, filename: "" };
+  }
+  // conans/{name}/{version}/{user}/{channel}[/…]
+  const name = rest[1];
+  const recipeVersion = rest[2];
+  const user = rest[3];
+  const channel = rest[4];
+  if (name === undefined || recipeVersion === undefined || user === undefined || channel === undefined) return null;
+  let recipe: ConanRecipeReference;
+  try {
+    recipe = newConanRecipeReference(name, recipeVersion, user, channel, "");
+  } catch {
+    return null;
+  }
+  const tail = rest.slice(5);
+  const pinRevision = (revision: string): ConanRouteTarget | null => {
+    try {
+      recipe = newConanRecipeReference(name, recipeVersion, user, channel, revision);
+      return null;
+    } catch {
+      return null;
+    }
+  };
+  void pinRevision;
+  const withRevision = (revision: string): ConanRecipeReference | null => {
+    try {
+      return newConanRecipeReference(name, recipeVersion, user, channel, revision);
+    } catch {
+      return null;
+    }
+  };
+
+  // No tail: GET snapshot / DELETE (v1 always, v2 by-revision-or-all).
+  if (tail.length === 0) {
+    return { version, arm: method === "DELETE" ? "delete-recipe" : "snapshot", recipe, pref: null, filename: "" };
+  }
+  const head = tail[0] ?? "";
+  if (tail.length === 1 && head === "search") return { version, arm: "package-search", recipe, pref: null, filename: "" };
+  if (tail.length === 1 && head === "digest") return { version, arm: "recipe-urls", recipe, pref: null, filename: "" };
+  if (tail.length === 1 && head === "download_urls") return { version, arm: "recipe-urls", recipe, pref: null, filename: "" };
+  if (tail.length === 1 && head === "upload_urls") return { version, arm: "recipe-upload-urls", recipe, pref: null, filename: "" };
+  if (tail.length === 1 && head === "latest" && version === "v2") {
+    return { version, arm: "recipe-latest", recipe, pref: null, filename: "" };
+  }
+  if (tail.length === 1 && head === "revisions" && version === "v2") {
+    if (method === "DELETE") return { version, arm: "delete-recipe", recipe, pref: null, filename: "" };
+    return { version, arm: "recipe-revisions", recipe, pref: null, filename: "" };
+  }
+  if (head === "packages" && tail.length >= 2) {
+    if (tail[1] === "delete" && tail.length === 2) {
+      return { version, arm: "delete-packages-v1", recipe, pref: null, filename: "" };
+    }
+    const reference = tail[1] ?? "";
+    if (reference === "" || reference === "delete") return null;
+    const packageTail = tail.slice(2);
+    const barePref = (): ConanPackageReference => ({ recipe, reference, revision: "" });
+    if (packageTail.length === 0) {
+      return { version, arm: method === "DELETE" ? "delete-package" : "package-snapshot", recipe, pref: barePref(), filename: "" };
+    }
+    const pkgHead = packageTail[0] ?? "";
+    if (pkgHead === "digest" && packageTail.length === 1) {
+      return { version, arm: "package-urls", recipe, pref: barePref(), filename: "" };
+    }
+    if (pkgHead === "download_urls" && packageTail.length === 1) {
+      return { version, arm: "package-urls", recipe, pref: barePref(), filename: "" };
+    }
+    if (pkgHead === "upload_urls" && packageTail.length === 1) {
+      return { version, arm: "package-upload-urls", recipe, pref: barePref(), filename: "" };
+    }
+    if (pkgHead === "latest" && packageTail.length === 1 && version === "v2") {
+      return { version, arm: "package-latest", recipe, pref: barePref(), filename: "" };
+    }
+    if (pkgHead === "revisions" && version === "v2") {
+      const pkgTail = packageTail.slice(1);
+      if (pkgTail.length === 0) {
+        if (method === "DELETE") return { version, arm: "delete-package", recipe, pref: null, filename: "" };
+        return { version, arm: "package-revisions", recipe, pref: null, filename: "" };
+      }
+      const prev = pkgTail[0] ?? "";
+      const deep = pkgTail.slice(1);
+      if (deep.length === 0) {
+        if (method === "DELETE") {
+          return { version, arm: "delete-package", recipe, pref: { recipe, reference, revision: prev }, filename: "" };
+        }
+        return { version, arm: "package-revision-files", recipe, pref: { recipe, reference, revision: prev }, filename: "" };
+      }
+      if (deep[0] === "files" && deep.length === 1) {
+        return { version, arm: "package-revision-files", recipe, pref: { recipe, reference, revision: prev }, filename: "" };
+      }
+      if (deep[0] === "files" && deep.length === 2) {
+        return { version, arm: "package-file", recipe, pref: { recipe, reference, revision: prev }, filename: deep[1] ?? "" };
+      }
+      return null;
+    }
+    return null;
+  }
+  if (head === "revisions" && version === "v2" && tail.length >= 2) {
+    const revision = tail[1] ?? "";
+    const pinned = withRevision(revision);
+    if (pinned === null) return null;
+    const revTail = tail.slice(2);
+    if (revTail.length === 0) {
+      if (method === "DELETE") return { version, arm: "delete-recipe", recipe: pinned, pref: null, filename: "" };
+      return { version, arm: "recipe-revision-files", recipe: pinned, pref: null, filename: "" };
+    }
+    if (revTail[0] === "search" && revTail.length === 1) {
+      return { version, arm: "package-search", recipe: pinned, pref: null, filename: "" };
+    }
+    if (revTail[0] === "files") {
+      const fileTail = revTail.slice(1);
+      if (fileTail.length === 0) {
+        return { version, arm: "recipe-revision-files", recipe: pinned, pref: null, filename: "" };
+      }
+      if (fileTail.length === 1) {
+        return { version, arm: "recipe-file", recipe: pinned, pref: null, filename: fileTail[0] ?? "" };
+      }
+      // recipe/{reference}/{prev}/... — the v2 PACKAGE file shapes ride
+      // /revisions/{rev}/packages (handled below) — anything else 404s.
+      return null;
+    }
+    if (revTail[0] === "packages" && revTail.length >= 2) {
+      const reference = revTail[1] ?? "";
+      if (reference === "" || reference === "delete") return null;
+      const pkgTail = revTail.slice(2);
+      if (pkgTail.length === 0) {
+        if (method === "DELETE") {
+          return { version, arm: "delete-package", recipe: pinned, pref: null, filename: "" };
+        }
+        return { version, arm: "package-snapshot", recipe: pinned, pref: null, filename: "" };
+      }
+      const pkgHead = pkgTail[0] ?? "";
+      if (pkgHead === "latest" && pkgTail.length === 1) {
+        return { version, arm: "package-latest", recipe: pinned, pref: null, filename: "" };
+      }
+      if (pkgHead === "revisions") {
+        const deep = pkgTail.slice(1);
+        if (deep.length === 0) {
+          if (method === "DELETE") return { version, arm: "delete-package", recipe: pinned, pref: null, filename: "" };
+          return { version, arm: "package-revisions", recipe: pinned, pref: null, filename: "" };
+        }
+        const prev = deep[0] ?? "";
+        const deepest = deep.slice(1);
+        if (deepest.length === 0) {
+          if (method === "DELETE") {
+            return { version, arm: "delete-package", recipe: pinned, pref: { recipe, reference, revision: prev }, filename: "" };
+          }
+          return { version, arm: "package-revision-files", recipe: pinned, pref: { recipe, reference, revision: prev }, filename: "" };
+        }
+        if (deepest[0] === "files" && deepest.length === 1) {
+          return { version, arm: "package-revision-files", recipe: pinned, pref: { recipe, reference, revision: prev }, filename: "" };
+        }
+        if (deepest[0] === "files" && deepest.length === 2) {
+          return { version, arm: "package-file", recipe: pinned, pref: { recipe, reference, revision: prev }, filename: deepest[1] ?? "" };
+        }
+        return null;
+      }
+      return null;
+    }
+    return null;
+  }
+  return null;
+}
+
+async function conanDispatch(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    const rawPath = c.req.path;
+    const segments = rawPath.split("/");
+    // ["", "api", "packages", {username}, "conan", …]
+    const prefix = `/api/packages/${segments[3] ?? ""}/conan`;
+    if (!rawPath.startsWith(`${prefix}/`)) {
+      return conanErrorResponseRaw(404, "");
+    }
+    const parts: string[] = [];
+    for (const part of rawPath.slice(prefix.length + 1).split("/")) {
+      try {
+        parts.push(decodeURIComponent(part));
+      } catch {
+        return conanErrorResponseRaw(404, "");
+      }
+    }
+    const target = parseConanTarget(parts, c.req.method);
+    if (target === null) {
+      return conanErrorResponseRaw(404, "");
+    }
+    if (target.arm === "ping") {
+      return new Response(null, { status: 200, headers: { "x-conan-server-capabilities": "revisions" } });
+    }
+    if (target.arm === "authenticate") {
+      const { cred } = await conanGate(c, "read");
+      if (cred.doer === null) {
+        return conanErrorResponseRaw(400, "");
+      }
+      return new Response(await mintContainerToken(c.env.DB, cred.doer.id, "package:read,package:write"), { status: 200 });
+    }
+    if (target.arm === "check_credentials") {
+      const { cred } = await conanGate(c, "read");
+      return cred.doer === null ? new Response(null, { status: 401 }) : new Response(null, { status: 200 });
+    }
+    if (target.arm === "recipe-search") {
+      const { owner } = await conanGate(c, "read");
+      return conanJsonResponse(200, { results: await searchConanRecipes(c.env.DB, owner.id, c.req.query("q") ?? "") });
+    }
+    if (target.arm === "snapshot" || target.arm === "recipe-revision-files") {
+      const { owner } = await conanGate(c, "read");
+      if (target.arm === "snapshot" && c.req.method === "GET") {
+        const files = await buildConanSnapshot(c.env.DB, owner.id, target.recipe, conanRecipeAsKey(target.recipe));
+        if (files === null) return conanErrorResponseRaw(404, "");
+        return conanJsonResponse(200, files);
+      }
+      const files = await listConanRevisionFiles(c.env.DB, owner.id, target.recipe, conanRecipeAsKey(target.recipe));
+      if (files === null) return conanErrorResponseRaw(404, "");
+      return conanJsonResponse(200, files);
+    }
+    if (target.arm === "recipe-urls") {
+      const { owner } = await conanGate(c, "read");
+      const urls = await buildConanDownloadUrls(
+        c.env.DB,
+        owner.id,
+        target.recipe,
+        conanRecipeAsKey(target.recipe),
+        `${conanFileURLBase(c, owner, conanRecipeLinkName(target.recipe))}/recipe`,
+      );
+      if (urls === null) return conanErrorResponseRaw(404, "");
+      return conanJsonResponse(200, urls);
+    }
+    if (target.arm === "recipe-upload-urls" || target.arm === "package-upload-urls") {
+      if (c.req.method !== "POST") return conanErrorResponseRaw(404, "");
+      const { owner, cred } = await conanGate(c, "write");
+      const doer = cred.doer;
+      if (doer === null) return conanUnauthorized();
+      const hasPackage = target.arm === "package-upload-urls";
+      let sizes: Record<string, number>;
+      try {
+        const parsed: unknown = await c.req.json();
+        if (parsed === null || typeof parsed !== "object") {
+          return conanErrorResponseRaw(400, "");
+        }
+        sizes = parsed as Record<string, number>;
+      } catch {
+        return conanErrorResponseRaw(400, "");
+      }
+      const urlBase = hasPackage
+        ? `${conanFileURLBase(c, owner, conanRecipeLinkName(target.recipe))}/package/${target.pref === null ? "" : conanPackageLinkName(target.pref)}`
+        : `${conanFileURLBase(c, owner, conanRecipeLinkName(target.recipe))}/recipe`;
+      return conanJsonResponse(200, buildConanUploadUrls(sizes ?? {}, hasPackage, urlBase));
+    }
+    if (target.arm === "recipe-file" || target.arm === "package-file") {
+      const hasPackage = target.arm === "package-file";
+      if (c.req.method === "PUT") {
+        const { owner, cred } = await conanGate(c, "write");
+        const doer = cred.doer;
+        if (doer === null) return conanUnauthorized();
+        try {
+          await uploadConanFile({
+            d1: c.env.DB,
+            bucket: c.env.REPO_PACKS,
+            owner,
+            doer,
+            recipe: target.recipe,
+            packageReference: target.pref,
+            filename: target.filename,
+            content: bodyStream(c.req.raw),
+            declaredLength: contentLength(c.req.raw) ?? undefined,
+            quota: packagesQuotaFromEnv(c.env),
+          });
+        } catch (error) {
+          if (error instanceof QuotaTotalCountError || error instanceof QuotaTypeSizeError || error instanceof QuotaTotalSizeError) {
+            return conanErrorResponseRaw(403, quotaMessage(error));
+          }
+          throw error;
+        }
+        return new Response(null, { status: 201 });
+      }
+      if (c.req.method !== "GET" && c.req.method !== "HEAD") return conanErrorResponseRaw(404, "");
+      const { owner } = await conanGate(c, "read");
+      const fileKey = hasPackage && target.pref !== null ? conanPackageAsKey(target.pref) : conanRecipeAsKey(target.recipe);
+      const download = await openConanFileForDownload(
+        c.env.DB,
+        c.env.REPO_PACKS,
+        owner.id,
+        target.recipe,
+        fileKey,
+        target.filename,
+        c.req.method === "HEAD" ? "HEAD" : "GET",
+      );
+      if (download === null) return conanErrorResponseRaw(404, "");
+      return fileResponse(c, {
+        stream: download.stream,
+        size: download.size,
+        filename: download.file.name,
+        created: download.file.createdUnix,
+      });
+    }
+    if (target.arm === "package-snapshot" || target.arm === "package-urls" || target.arm === "package-revision-files") {
+      const { owner } = await conanGate(c, "read");
+      if (target.arm === "package-snapshot" && c.req.method === "GET") {
+        const pref = target.pref;
+        if (pref === null) return conanErrorResponseRaw(404, "");
+        const files = await buildConanSnapshot(c.env.DB, owner.id, target.recipe, conanPackageAsKey(pref));
+        if (files === null) return conanErrorResponseRaw(404, "");
+        return conanJsonResponse(200, files);
+      }
+      if (target.arm === "package-revision-files") {
+        const pref = target.pref;
+        if (pref === null) return conanErrorResponseRaw(404, "");
+        const files = await listConanRevisionFiles(c.env.DB, owner.id, target.recipe, conanPackageAsKey(pref));
+        if (files === null) return conanErrorResponseRaw(404, "");
+        return conanJsonResponse(200, files);
+      }
+      const pref = target.pref;
+      if (pref === null) return conanErrorResponseRaw(404, "");
+      const urls = await buildConanDownloadUrls(
+        c.env.DB,
+        owner.id,
+        target.recipe,
+        conanPackageAsKey(pref),
+        `${conanFileURLBase(c, owner, conanRecipeLinkName(target.recipe))}/package/${conanPackageLinkName(pref)}`,
+      );
+      if (urls === null) return conanErrorResponseRaw(404, "");
+      return conanJsonResponse(200, urls);
+    }
+    if (target.arm === "recipe-latest") {
+      const { owner } = await conanGate(c, "read");
+      const latest = await getConanLatestRecipeRevision(c.env.DB, owner.id, target.recipe);
+      if (latest === null) return conanErrorResponseRaw(404, "");
+      return conanJsonResponse(200, { revision: latest.revision, time: latest.time });
+    }
+    if (target.arm === "recipe-revisions") {
+      const { owner } = await conanGate(c, "read");
+      const revisions = await listConanRecipeRevisionsJson(c.env.DB, owner.id, target.recipe);
+      if (revisions === null) return conanErrorResponseRaw(404, "");
+      return conanJsonResponse(200, revisions);
+    }
+    if (target.arm === "package-latest") {
+      const { owner } = await conanGate(c, "read");
+      const pref = target.pref;
+      if (pref === null) return conanErrorResponseRaw(404, "");
+      const latest = await getConanLatestPackageRevision(c.env.DB, owner.id, pref);
+      if (latest === null) return conanErrorResponseRaw(404, "");
+      return conanJsonResponse(200, { revision: latest.revision, time: latest.time });
+    }
+    if (target.arm === "package-revisions") {
+      const { owner } = await conanGate(c, "read");
+      const pref = target.pref;
+      if (pref === null) return conanErrorResponseRaw(404, "");
+      const revisions = await listConanPackageRevisionsJson(c.env.DB, owner.id, pref);
+      if (revisions === null) return conanErrorResponseRaw(404, "");
+      return conanJsonResponse(200, revisions);
+    }
+    if (target.arm === "package-search") {
+      const { owner } = await conanGate(c, "read");
+      const result = await searchConanPackages(c.env.DB, owner.id, target.recipe, target.version === "v1");
+      if (result === null) return conanErrorResponseRaw(404, "");
+      return conanJsonResponse(200, result);
+    }
+    if (target.arm === "delete-recipe") {
+      const { owner } = await conanGate(c, "write");
+      const outcome =
+        target.version === "v1"
+          ? await deleteConanRecipeV1(c.env.DB, owner.id, target.recipe)
+          : await deleteConanRecipeV2(c.env.DB, owner.id, target.recipe);
+      if (outcome.kind === "not-found") return conanErrorResponseRaw(404, "");
+      if (outcome.kind === "reference-not-exist") return conanErrorResponseRaw(404, "");
+      return new Response(null, { status: 200 });
+    }
+    if (target.arm === "delete-packages-v1") {
+      const { owner } = await conanGate(c, "write");
+      let body: { package_ids?: string[] } = {};
+      try {
+        const parsed = (await c.req.json()) as unknown;
+        if (parsed !== null && typeof parsed === "object") {
+          body = parsed;
+        }
+      } catch {
+        return conanErrorResponseRaw(500, "internal server error");
+      }
+      const outcome = await deleteConanPackageV1(c.env.DB, owner.id, target.recipe, body.package_ids ?? []);
+      if (outcome.kind !== "deleted") return conanErrorResponseRaw(404, "");
+      return new Response(null, { status: 200 });
+    }
+    if (target.arm === "delete-package") {
+      const { owner } = await conanGate(c, "write");
+      const outcome = await deleteConanPackageV2(c.env.DB, owner.id, target.recipe, target.pref);
+      if (outcome.kind === "not-found") return conanErrorResponseRaw(404, "");
+      if (outcome.kind === "reference-not-exist") return conanErrorResponseRaw(404, "");
+      return new Response(null, { status: 200 });
+    }
+    return conanErrorResponseRaw(404, "");
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    console.error("[packages-conan] request failed", error);
+    return conanErrorResponseRaw(500, "internal server error");
+  }
+}
+

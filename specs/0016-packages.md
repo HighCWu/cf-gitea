@@ -1764,3 +1764,130 @@ bytes store VERBATIM as the ONE lead file through the two-pass store).
   consumer shape is already double-pinned by upstream's own vectors); if a
   ruby toolchain lands, the live battery should push the built fixture gem
   through the real client and sweep info/versions/specs.4.8.gz.
+
+## As-built — the six-minor protocol batch: vagrant, cran, pub, chef, composer, conan (2026-10-31 — the registry carries TWENTY-ONE protocols)
+
+The §2.1 long-tail row's six families landed in ONE wave:
+`services/packages/{vagrant,cran,pub,chef,composer,conan}.ts` + their
+service batteries, + the api.go route arms in
+`api/routes/packages-protocols.ts` (per-family registrations inside
+`createEcosystemProtocolRouter`; the handlers at module level — the
+rubygems split), over the same substrate unchanged (no new tables, no new
+migrations; every family stores through the landed two-pass blob store and
+the D1 model).
+
+- **Sizes as-honest:** vagrant is the small boxes family (5 arms);
+  cran the PACKAGES-index family (8 arms, the property-matched search);
+  pub the dart publish dance (7 arms, the YAML-subset reader); chef the
+  supermarket (9 arms, the universe/search/cookbook metadata shapes);
+  composer the packagist shapes (8 arms, the p2 metadata + the search
+  pagination); conan is the BIG one (the full v1+v2 revisions protocol,
+  ~30 arms through ONE decoded-remainder walk). Each family's module
+  header carries its own pin map.
+- **The storage posture (unchanged substrate):** every family uploads
+  through `spoolAndHash` (the two-pass store) and stores the EXTRACTED
+  file bytes at the content key — the multipart/archive envelopes never
+  store (chef's tarball and pub's `file` part are extracted in memory;
+  composer/conan/cran/vagrant bodies ARE the file). Properties land per
+  upstream's lattice: vagrant `vagrant.provider` (file), cran
+  `cran.type`/`cran.platform`/`cran.rvserion` (the UPSTREAM KEY TYPO
+  verbatim; file), chef none (metadata JSON only), composer
+  `composer.type` (VERSION), conan the six-key lattice (user/channel/
+  recipe-revision/package-reference/package-revision/package-info), pub
+  none.
+- **The distinctive arms, per family:**
+  - *vagrant* — the .box parse (a gzip'd tar whose OPTIONAL info.json
+    feeds the case-insensitive key walk; a MISSING member is the ZERO
+    metadata, no error — metadata.go:48), the go-version NewSemver gate
+    (the swift port reused — the SAME hashicorp library), the sha512
+    checksum + provider array in the enumerate, the path-name (never
+    the archive's) as the package name.
+  - *cran* — the PACKAGES index: per-package LATEST version by the
+    NaturalSort port (the x/text collation reduced to byte order — the
+    documented reduction), the DESCRIPTION field blocks with the
+    continuation-line rule and the Author parenthetical strip, the
+    gzip-magic tar.gz/zip dispatch (a self-contained zip reader — the
+    swift walk's inverse), the binary `platform|rversion` composite
+    key + the three-property triple, the MD5sum line rendering the
+    EMPTY value (the WebCrypto reduction).
+  - *pub* — the bounded YAML subset reader (block maps/sequences, flow
+    forms, quoted scalars, comments, int/bool/null resolution —
+    anchors/aliases/block scalars/multi-doc are the documented
+    reductions; an unparseable document is the plain-error arm), the
+    unquoted-float version (`version: 1.0`) riding go-yaml's DECODE
+    ERROR arm (the plain-error 500 class, NOT the invalid-version 400),
+    the go-version v.String() normalization ("v1.0.0" stores "1.0.0"),
+    the `latest` = last entry enumerate shape, the 204-with-Location
+    publish answer, the multipart `file` extraction.
+  - *chef* — the one-slash metadata.json pick, the `\A\S+\z` /
+    `\d+\.\d+(\.\d+)?` gates, the maintainer→author /
+    source_url→repository_url mapping, the universe/search/cookbook
+    metadata URL shapes (location_type "opscode", the `category: ""` /
+    `deprecated: false` constants), the `{"error_messages":[…]}` body,
+    the ABSOLUTE start/items search window ( Paginator.GetSkipTake —
+    the landed page/limit search cannot express an arbitrary skip, so
+    the window slices a start+items fetch), the created-DESC-id-DESC
+    recently_updated order.
+  - *composer* — the zip/tar.gz/bz2 detection (bz2 DETECTED then
+    REJECTED — no bzip2 decoder on Workers; the documented reduction),
+    the ?version= fallback with the BOTH-missing route 400
+    (ParsePackage itself TOLERATES the empty version — metadata.go's
+    optional-arg), the `composer.type` VERSION property, the p2
+    metadata with the url.PathEscape'd dist path (%2F — api.go:141)
+    and the sha1 shasum, the linked-repo SOURCE arm gated on the repo
+    visibility/owner/admin (the HasAnyUnitAccessOrPublicAccess
+    reduction), the property-filtered search TOTAL (upstream filters
+    in SQL; ours pre-resolves the matching version ids and slices —
+    registry-small).
+  - *conan* — THE REVISIONS DANCE: recipe/package revisions as
+    created-DESC property-value aggregates (references.go:35-76's
+    count-subquery reproduced as the property-map ⊇ filter walk), the
+    composite keys `user|channel|recipeRev[|ref|pkgRev]`, the
+    unpinned raw-revision filter answering EMPTY (upstream's own
+    shape — GetPackageReferences filters the RAW revision), the
+    name+version filter in EVERY walk (findPropertyValues' cond —
+    the bug the service battery caught before landing), the
+    OverwriteExisting delete-and-reinsert (identical bytes short-
+    circuit idempotently, properties never duplicate), the conanfile
+    metadata UPDATE in place on an existing version (conan.go:404-419),
+    the conaninfo section parser (the pre-section invalid arm), the v1
+    delete that IGNORES the revision vs the v2 pin, the search query
+    grammar (@→/ split, `*` wildcards, `_` literal).
+- **Error bodies per family (each upstream apiError helper's wire
+  shape):** vagrant `{"errors":[…]}`; cran PLAIN TEXT (the empty
+  detail on the nil arms); pub `{"error":{code,message}}` over
+  application/vnd.pub.v2+json; chef `{"error_messages":[…]}`;
+  composer `{"errors":[{status,message}]}`; conan `{"message":…}`
+  over application/json WITH the json.Encoder trailing newline.
+- **The conan auth seam (the recorded reduction):** upstream
+  registers chef.Auth (the X-Ops RSA signed headers over the user's
+  `chef.public_pem` setting) as an additional auth method, and conan's
+  /users/authenticate mints a scoped authorization token the client
+  echoes back. The chef X-Ops method is NOT ported (the auth-method
+  surface rides the auth module — recorded as the open item); conan's
+  authenticate mints through the auth module's container-token seam
+  (mintContainerToken) and the conan gate accepts the minted token
+  beside the standard credentials (Basic password / Bearer) — the
+  CreateAuthorizationToken flow's function.
+- **The route posture:** every family's read arms ride
+  protocolContext(c, "read") (the shared gate stack); the write arms
+  the "write" gate; HEAD rides the GET walks (the pypi/helm
+  precedent). The conan arms ride ONE conanDispatch walk (the
+  npm/rpm/swift posture) over the decoded remainder — chi's nested
+  optional tails are not expressible as Hono params.
+- **Tests** (own eyes, `Tests 215 passed (215)` across the eleven
+  files of the batch + the neighbors sweep — per family: vagrant 14,
+  cran 14, pub 16, chef 16, composer 14, conan 22; the route-level
+  arms of OTHER families re-ran green through the shared file after
+  every edit: go + rubygems + swift + cargo 119/119). Each family's
+  battery: the parse oracle arms, the upload/list/download/delete
+  round-trip on real D1 + REPO_PACKS, the distinctive arms, the error
+  shapes with codes+bodies, and the quota/auth boundaries. NO live
+  toolchains on this host (the hand-built fixture posture — the
+  rpm/arch builder pattern; upstream's OWN integration-test shapes
+  pinned the wire contracts: the chef metadata.json, the cran
+  DESCRIPTION, the pub pubspec.yaml, the composer composer.json, the
+  conan conanfile/conaninfo texts, the vagrant info.json).
+- **Open issues:** the chef X-Ops auth method (recorded above); the
+  composer .tar.bz2 rejection (a bzip2 decoder would lift it); the
+  cran zip CRC verification skipped (the blob sha256 gates the bytes).
