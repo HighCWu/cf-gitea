@@ -91,7 +91,19 @@
     "MAIL_PROVIDER": "dummy",
     "MAIL_FROM": "",
     "MAIL_SUBJECT_PREFIX": "",
-    "MAIL_API_BASE": ""
+    "MAIL_API_BASE": "",
+    // Inbound email (specs/email-inbound.md §8): strict-polarity, OFF by
+    // default — Cloudflare Email Routing delivers to the Worker's `email()`
+    // handler (NO binding; the handler export is the whole story). Arming =
+    // MAIL_INBOUND_ENABLED "true" + MAIL_INBOUND_REPLY_ADDRESS carrying
+    // %{token} exactly once in the user part (upstream REPLY_TO_ADDRESS,
+    // modules/setting/incoming_email.go:15,47-63) + `wrangler secret put
+    // MAIL_INBOUND_SECRET` + an Email Routing rule on the zone delivering
+    // to this Worker. Until the outbound notify fold (email-inbound §9
+    // HANDOFF) no mail carries a token, so an armed inbound drops
+    // everything at the no-token gate — fail-closed end to end.
+    "MAIL_INBOUND_ENABLED": "false",
+    "MAIL_INBOUND_REPLY_ADDRESS": ""
   },
   "observability": {
     "enabled": true,
@@ -226,8 +238,12 @@
   // MAIL_PROVIDER_API_KEY is specs/email-outbound.md §6: consumed ONLY when
   // MAIL_PROVIDER=resend; mail stays disabled by default, so most
   // deployments provision the name here and never set a value.
+  // MAIL_INBOUND_SECRET is specs/email-inbound.md §8: the reply-token HMAC
+  // key — consumed ONLY when MAIL_INBOUND_ENABLED=true; rotating it
+  // invalidates every outstanding token at the next decode (the kill
+  // switch, the runbook's inbound posture).
   "secrets": {
-    "required": ["GIT_TOKEN", "MIRROR_ALLOWED_HOST_LIST", "MIRROR_CREDENTIAL_KEY", "MAIL_PROVIDER_API_KEY"]
+    "required": ["GIT_TOKEN", "MIRROR_ALLOWED_HOST_LIST", "MIRROR_CREDENTIAL_KEY", "MAIL_PROVIDER_API_KEY", "MAIL_INBOUND_SECRET"]
   },
   "migrations": [
     {

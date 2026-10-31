@@ -22,6 +22,7 @@ import { handleUserPushEvent } from "./services/webhooks-push";
 import { handleActionsPushEvent } from "./services/actions/trigger";
 import { enqueuePushMirrorSyncsOnCommit } from "./services/mirror/push-sync";
 import { handleScheduledCron } from "./services/demo-sweep";
+import { handleIncomingEmail } from "./services/mail/inbound";
 import { armsForEntry, recordArmsFailure, recordArmsSuccess } from "./services/cron-state";
 import { handlesUiRoute, uiRouter } from "./ui";
 import { sessionRouter } from "./ui/session";
@@ -525,6 +526,20 @@ export default {
       return repoTasksDlqHandler(batch, env, _ctx);
     }
     await handleRepoTasks(batch, env);
+  },
+
+  // Inbound email (specs/email-inbound.md §3.1/§6): Cloudflare Email
+  // Routing delivers to this arm — NO binding, NO wrangler config (the
+  // export is the whole story; `send_email` in the config schema is the
+  // outbound-only binding the outbound SPEC already rejected). Thin mount
+  // by construction: the vitest plugin cannot deliver to an email handler
+  // (no runtime email test exists), so ALL behavior lives in
+  // services/mail/inbound.ts behind the structural InboundEmailMessage
+  // surface and the suite drives it at the service level. A persistence
+  // failure THROWS out (the platform processing-failure signal); every
+  // other outcome is logged + recorded in `email_inbound` and consumed.
+  async email(message: ForwardableEmailMessage, env: Env, _ctx: ExecutionContext): Promise<void> {
+    await handleIncomingEmail(env, message);
   },
 } satisfies ExportedHandler<Env>;
 

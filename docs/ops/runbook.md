@@ -228,6 +228,57 @@ provider's status/body excerpt capped at 1 KiB). Provider 4xx = terminal
 `MAIL_ENABLED=true` with a missing/unparseable `MAIL_FROM` logs a warning
 and skips — it never fails the admin 201.
 
+### Inbound email — reply-by-mail (specs/email-inbound.md)
+
+Off by default (strict polarity). Cloudflare Email Routing delivers
+inbound mail to the Worker's `email()` handler — there is NO binding and
+NO wrangler config for it; the handler export is the whole story. Arming:
+
+1. **Zone/route** (dashboard or API, on the domain that will carry the
+   reply address): Email Routing → enable on the zone → add a routing
+   rule (the reply address, or catch-all) whose action is **Send to a
+   Worker** → this Worker. Inbound messages cap at 25 MiB; our own gate
+   is upstream's 10 MiB default and rejects larger with a permanent SMTP
+   error.
+2. **Vars** (then `pnpm build` + `pnpm deploy` — deploy ships dist's
+   generated config):
+   - `"MAIL_INBOUND_ENABLED": "true"`,
+   - `"MAIL_INBOUND_REPLY_ADDRESS": "reply+%{token}@yourdomain"` — the
+     `%{token}` placeholder must appear exactly once in the user part
+     (upstream `REPLY_TO_ADDRESS`, modules/setting/incoming_email.go).
+3. **Secret**: `wrangler secret put MAIL_INBOUND_SECRET` — the reply-token
+   HMAC key. **Rotation = kill switch**: every outstanding token fails
+   verification at the next decode the moment the secret changes (a reply
+   older than the rotation no longer works; senders re-ask by getting a
+   fresh notification mail). Set the SAME secret in `.dev.vars` locally.
+4. Outbound (`MAIL_ENABLED=true` + `MAIL_FROM`) must be armed too, or
+   notification mails — the only mails that ever carry reply tokens — do
+   not exist (until the email-inbound §9 HANDOFF fold lands, NO mail
+   carries a token and an armed inbound logs every message
+   `dropped-no-token`: harmless, fail-closed).
+
+Behavior/verification: every delivery is logged in the `email_inbound`
+table keyed by Message-ID (`outcome` column = the verdict; duplicates
+from at-least-once redelivery collapse at the UNIQUE `dedupe_key`).
+Valid replies post a comment as the token's user through the SAME
+`IssuesService.addComment` path as the web — the notification fan fires
+normally. Spoofed senders and token-less mail are consumed silently
+(`dropped-no-token`) — never bounced; oversized mail IS bounced
+(`rejected-oversize`). Auto-replies (vacation responders,
+`Auto-Submitted` ≠ "no") drop before the token search — the loop guard.
+Cloudflare's own `Authentication-Results` header (identifier
+`mx.cloudflare.net`) is stored in `auth_results` for forensics; it is
+never a gate — the token is the only authority.
+
+Troubleshooting quick reads:
+
+- `dropped-misconfigured` rows: enabled but the secret is missing or the
+  reply address template is invalid — fix config, nothing else.
+- `dropped-permission`: the token's user lost access (or the issue is
+  locked and they are not a writer) — expected after access changes.
+- `dropped-expired-token`: the reply is older than 1 year (upstream's
+  token lifetime) or the secret was rotated.
+
 ### Building from a fresh worktree
 
 A fresh `git worktree add` checks out neither `gitea/` (submodule dirs start
@@ -283,10 +334,11 @@ stale dist.
 
 - `rules` ignored under Vite — wrangler notes the config's `rules` block does
   not apply because the Vite plugin owns bundling.
-- The missing-secrets trio — `GIT_TOKEN`, `MIRROR_ALLOWED_HOST_LIST`,
-  `MIRROR_CREDENTIAL_KEY` (the `secrets.required` list): real secrets live
+- The missing-secrets warnings — `GIT_TOKEN`, `MIRROR_ALLOWED_HOST_LIST`,
+  `MIRROR_CREDENTIAL_KEY`, `MAIL_PROVIDER_API_KEY`, `MAIL_INBOUND_SECRET`
+  (the `secrets.required` list): real secrets live
   server-side (`wrangler secret put`), and a clean worktree has no `.dev.vars`,
-  so build/deploy output warns about all three. Expected, not a fault.
+  so build/deploy output warns about all of them. Expected, not a fault.
 
 ## Benchmarks
 

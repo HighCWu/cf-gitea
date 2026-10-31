@@ -12,3 +12,12 @@ MAIL_FROM=
 MAIL_SUBJECT_PREFIX=
 MAIL_API_BASE=
 MAIL_PROVIDER_API_KEY=
+# Inbound email (specs/email-inbound.md §8) — OFF by default. Local
+# exercise: set MAIL_INBOUND_ENABLED=true, a reply address carrying
+# %{token} in the user part (the routed zone's domain), and any dev
+# secret. Note: vars must ALSO exist in your (gitignored) wrangler.jsonc
+# copy for local dev to inject them — the vitest suite passes its own env
+# slices, so it runs without these.
+MAIL_INBOUND_ENABLED=false
+MAIL_INBOUND_REPLY_ADDRESS=
+MAIL_INBOUND_SECRET=dev-inbound-secret-change-me
