@@ -105,7 +105,7 @@ function composerArchive(name: string, version: string): Uint8Array {
 function fetcher(): (path: string, init?: RequestInit) => Promise<Response> {
   const parent = new Hono<{ Bindings: Env }>();
   parent.route("/api/packages", createEcosystemProtocolRouter());
-  return (path, init) => parent.fetch(new Request(`https://example.com${path}`, init), env);
+  return async (path, init) => await parent.fetch(new Request(`https://example.com${path}`, init), env);
 }
 
 /** Seed an owner + PAT, PUBLISH via the real PUT wire, return the fetcher + auth. */
