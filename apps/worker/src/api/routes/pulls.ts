@@ -85,7 +85,7 @@ import { changedFileListSchema, commitListSchema } from "../models/git";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { ActionType, recordAction, type ActionDraft } from "../services/activity-feeds";
 import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
-import { changeIssueBody, changeIssueDeadline, changeIssueMilestone, changeIssueTitle, hasWorkInProgressPrefix, issueErrorToApiError, replaceIssueAssignees } from "../services/issues";
+import { changeIssueBody, changeIssueDeadline, changeIssueMilestone, hasWorkInProgressPrefix, issueErrorToApiError } from "../services/issues";
 import { assertPullsUnit } from "../services/issue-unit-gates";
 import { parseMilestoneDeadline } from "../services/milestones";
 import {
@@ -522,8 +522,9 @@ function pullRequestPayload(
  */
 async function replacePullAssignees(c: Context<ApiEnv>, found: RepositoryWithOwner, issue: IssueRow, names: string[]): Promise<void> {
   const doer = c.get("authUser");
-  await replaceIssueAssignees(
-    c.env.DB,
+  // The IssuesService fold fans the IssueChangeAssignee mail receiver in
+  // beside the webhook emitter (services/mailer/notify.go:119-127).
+  await new IssuesService(c.env.DB, c.env).changeAssignees(
     found,
     issue,
     names,
@@ -1144,7 +1145,10 @@ export function registerPullRoutes(
       const title = patchField(form.title);
       if (title !== undefined && title.length > 0 && title !== issue.title) {
         const oldTitle = issue.title;
-        const updated = await changeIssueTitle(c.env.DB, issue, title, actorId, now);
+        // The IssuesService fold carries the IssueChangeTitle mail receiver
+        // (services/mailer/notify.go:80-90 — upstream fires it from
+        // ChangeTitle, issue.go:127).
+        const updated = await service.changeTitle(issue, title, actorId, now);
         if (updated !== null) {
           issue = updated;
         }

@@ -1623,20 +1623,24 @@ async function validateAssignee(d1: D1Database, found: RepositoryWithOwner, doer
 /** The type-9 (assignees) comment + the num_comments fold — the
  *  issue-tables-t2 writeAssigneeComment port (toggleIssueAssignee,
  *  models/issues/assignees.go:107-140). */
-async function writeAssigneeComment(d1: D1Database, issue: IssueRow, assigneeId: number, removed: boolean, actorId: number, now: Date): Promise<void> {
-  await drizzle(d1).batch([
-    drizzle(d1).insert(comments).values({
-      type: CommentType.Assignees,
-      posterId: actorId,
-      issueId: issue.id,
-      assigneeId,
-      removedAssignee: removed ? 1 : 0,
-      content: "",
-      createdAt: now,
-      updatedAt: now,
-    }),
+async function writeAssigneeComment(d1: D1Database, issue: IssueRow, assigneeId: number, removed: boolean, actorId: number, now: Date): Promise<CommentRow> {
+  const results = await drizzle(d1).batch([
+    drizzle(d1)
+      .insert(comments)
+      .values({
+        type: CommentType.Assignees,
+        posterId: actorId,
+        issueId: issue.id,
+        assigneeId,
+        removedAssignee: removed ? 1 : 0,
+        content: "",
+        createdAt: now,
+        updatedAt: now,
+      })
+      .returning(),
     drizzle(d1).update(issues).set({ numComments: sql`num_comments + 1` }).where(eq(issues.id, issue.id)),
-  ]);
+  ] as const);
+  return results[0][0]!;
 }
 
 /**
@@ -1732,13 +1736,16 @@ export async function removeIssueAssignees(d1: D1Database, issue: IssueRow, assi
  * Invokes `onAssignee` once per ACTUALLY-changed assignee after the writes
  * — removals first, then adds, upstream's post-tx notify order
  * (assignee.go:155-166) feeding IssueChangeAssignee (services/webhook/
- * notifier.go:161-202). No-op when the requested set equals the current
- * one: nothing removed, every add skipped, no comment, no notification.
+ * notifier.go:161-202). The callback carries the type-9 comment row
+ * (upstream's `comment` argument, assignee.go:155/:161) — the mail arm's
+ * anchor and Message-ID comment. No-op when the requested set equals the
+ * current one: nothing removed, every add skipped, no comment, no
+ * notification.
  *
  * `doer` feeds the validateAssignee blocked arm; `now` stamps the type-9
- * comments. Emits nothing itself — the route passes its emitter (the pulls
- * PATCH's pull_request_assign delivery, the issues PATCH's IsPull
- * discriminant assign event).
+ * comments. Emits nothing itself — the caller passes its emitter (the
+ * IssuesService changeAssignees wrapper: webhook delivery + the
+ * IssueChangeAssignee mail arm).
  */
 export async function replaceIssueAssignees(
   d1: D1Database,
@@ -1746,7 +1753,7 @@ export async function replaceIssueAssignees(
   issue: IssueRow,
   names: string[],
   doer: { id: number; isAdmin: boolean },
-  onAssignee: (user: UserRow, removed: boolean) => Promise<void>,
+  onAssignee: (user: UserRow, removed: boolean, comment: CommentRow) => Promise<void>,
 ): Promise<void> {
   const actorId = doer.id;
   const now = new Date();
@@ -1758,8 +1765,8 @@ export async function replaceIssueAssignees(
   const current = await listIssueAssignees(d1, issue.id);
   const requestedIds = new Set(requested.map((user) => user.id));
 
-  const added: UserRow[] = [];
-  const removed: UserRow[] = [];
+  const added: Array<{ user: UserRow; comment: CommentRow }> = [];
+  const removed: Array<{ user: UserRow; comment: CommentRow }> = [];
   // Removals first (upstream's tx order), then adds with the skip.
   for (const user of current) {
     if (requestedIds.has(user.id)) continue;
@@ -1768,8 +1775,8 @@ export async function replaceIssueAssignees(
       .where(and(eq(issueAssignees.issueId, issue.id), eq(issueAssignees.assigneeId, user.id)))
       .returning({ id: issueAssignees.id });
     if (deleted.length === 0) continue;
-    removed.push(user);
-    await writeAssigneeComment(d1, issue, user.id, true, actorId, now);
+    const comment = await writeAssigneeComment(d1, issue, user.id, true, actorId, now);
+    removed.push({ user, comment });
   }
   for (const user of requested) {
     const existing = await drizzle(d1)
@@ -1785,15 +1792,15 @@ export async function replaceIssueAssignees(
       .onConflictDoNothing()
       .returning({ id: issueAssignees.id });
     if (inserted.length === 0) continue; // a concurrent add won the unique index
-    added.push(user);
-    await writeAssigneeComment(d1, issue, user.id, false, actorId, now);
+    const comment = await writeAssigneeComment(d1, issue, user.id, false, actorId, now);
+    added.push({ user, comment });
   }
 
-  for (const user of removed) {
-    await onAssignee(user, true);
+  for (const { user, comment } of removed) {
+    await onAssignee(user, true, comment);
   }
-  for (const user of added) {
-    await onAssignee(user, false);
+  for (const { user, comment } of added) {
+    await onAssignee(user, false, comment);
   }
 }
 

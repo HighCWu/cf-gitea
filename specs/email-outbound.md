@@ -57,14 +57,37 @@ upstream's shape impossible and multiple equally faithful adaptations exist
   §9) lands the next two arms in upstream notify.go order — `NewIssue`
   (:53) and `IssueChangeStatus` (:59). Slice FOUR (same file, §10) lands
   the pull-create arm — `NewPullRequest` (:88-93), with the pulls-create
-  route fold. STILL FOLLOW-UP, in upstream notify.go order:
-  - `IssueChangeTitle`'s WIP-ready branch (:80);
-  - mentions (`services/mentions` — the `onmention` preference stays
-    unreachable until it lands, see §8's reduction ledger);
-  - `SendIssueAssignedMail` (`mail_issue.go:201-234`) + the
-    `IssueChangeAssignee`/`PullRequestReviewRequest` receivers
-    (notify.go:119-136) — the assigned.tmpl family;
-  - `MailMentionsComment` (code-comment mentions, mail_comment.go:42-62).
+  route fold. Slice FIVE (same file, §11-§12) lands the next pair in
+  upstream notify.go order — `IssueChangeTitle` (:80-90) and
+  `IssueChangeAssignee` (:119-127, the assigned.tmpl family). STILL
+  FOLLOW-UP, in upstream notify.go order:
+  - `PullRequestReview` (:98-111) — STAGED: the write lives inline in
+    `api/routes/pull-reviews.ts` (route-handler D1 writes; no review
+    service layer exists to host the emit, and route-handler emits are
+    against the method) — extracting the review-submission service is the
+    exactly-what-is-missing;
+  - `PullRequestCodeComment` (:113-117) — STAGED: its sole recipient
+    source is mentions (`MailMentionsComment`) and the mention parser is
+    not ported (§8.2);
+  - `PullRequestReviewRequest` (:129-136) — STAGED with the review family
+    (the same route-handler write site); its mail half is the landed
+    `notifyIssueAssigneeChanged` shape with a review-request `ct`;
+  - `MergePullRequest` (:138-146) + `AutoMergePullRequest` (:148-156) —
+    the merge write's emit site (`api/services/pull-engine.ts`) had a
+    sibling wave in flight at this slice; fold when the file settles;
+  - the `/assignees` trio's `AddAssignees`/`RemoveAssignees` notify arms
+    (upstream assignee.go:242/:281) — the same landed
+    `notifyIssueAssigneeChanged` receiver; their call sites live in
+    `api/routes/issue-tables-t2.ts` handlers that construct no service,
+    so the fold is that file owner's;
+  - mentions — LANDED (SPEC §13): `services/mentions/` (the parser + the
+    visibility resolution) with the `mentions` parameter threaded through
+    the hub arms and the comment/issue/PR-create emit sites; the
+    `onmention` preference reaches its upstream source. The remaining
+    follow-up is the `issue_user.is_mentioned` carrier HANDOFF (§13.2);
+  - `MailMentionsComment` (code-comment mentions, mail_comment.go:42-62) —
+    the parser half is now landed; the arm itself still rides the review
+    service extraction (the STAGED family above).
 - `SendActivateAccountMail` (upstream `mail_user.go:52`) + the
   `REGISTER_EMAIL_CONFIRM` flow: needs an activation-code store and the
   `/user/activate` web arm.
@@ -76,7 +99,7 @@ upstream's shape impossible and multiple equally faithful adaptations exist
   `email_address` table (we store one primary email on `users`).
 - Release mail (`mail_release.go`), repo-transfer mail (`mail_repo.go`),
   team-invite mail (`mail_team_invite.go`), Actions run-status mail
-  (`mail_workflow_run.go`), assigned/review-request mail (`mail_issue.go`).
+  (`mail_workflow_run.go`).
 - Admin "send test mail" surface (upstream `mail.go:41-47` SendTestMail).
 - Bounce/COMPLAINT ingestion (§5.4 keeps the posture; the webhook endpoint
   is a follow-up).
@@ -502,14 +525,42 @@ Our schema carries the FULL core recipient model — no table was invented:
 
 The documented REDUCTIONS (schema-absent upstream pieces, none invented):
 
-1. **Repo-watch modes**: upstream's `watch` table carries mode + include_
-   flags (models/repo/watch.go:17-43); ours is (repo_id, user_id). Every
-   watcher receives issue AND pull mail; there are no ignorers
-   (GetRepoIgnorersIDs) and no custom watchers.
-2. **Mentions**: no mention parser — the mentions batch (mail_issue.go:
-   99-102) is unported, so `onmention`-preference users have no reachable
-   source (mentions and custom watchers are both absent) and are excluded
-   everywhere. Additive when the mentions service lands.
+1. **Repo-watch modes**: CLOSED (was the slice-two reduction "every watcher
+   receives issue AND pull mail, no ignorers, no custom watchers"). The
+   `repo_watchers` table now carries the full `Watch` mode model
+   (models/repo/watch.go:17-50, migration 0053): `mode` (None=0 /
+   Normal=1 / Dont=2 / Auto=3 / Custom=4 — `SMALLINT NOT NULL DEFAULT 1`
+   verbatim; None is never persisted, an absent row IS None via the
+   GetWatch dummy) plus the three `include_{pull_requests,issues,releases}`
+   flags (`NOT NULL DEFAULT true` verbatim — Custom is LIVE at the pin
+   with this per-type granularity, not a 1.23-era placeholder). The mail
+   arms read them exactly upstream: the watcher source gates on
+   `mode <> Dont AND include_<pull_requests|issues>` by IsPull
+   (GetRepoWatchersIDs, watch.go:253-258/266-292), the custom-watch set
+   (`mode = Custom OR any include false`, GetRepoCustomWatchersIDs
+   :260-264) drives the onmention allowance of the batch filter
+   (mail_issue.go:141-146; GetMailableUsersByIDs' isMention prefilter arm,
+   user.go:1157-1179, folded with it), and ignorers (`mode = Dont`) join
+   `visited` ahead of every source including mentions (GetRepoIgnorersIDs,
+   mail_issue.go:87-92) — always, WIP gate included. The transition model
+   (watchRepoByMode, watch.go:114-156: same-mode no-op, Auto-only-from-
+   None, the include reset when starting to watch, insert/update/delete by
+   mode, the flipping-only `num_watches` delta) lives in
+   services/repo-watchers.ts with the WatchRepoAuto API arms; the Custom
+   and ignore SETTERS are web-form surfaces (POST /action/watch|participate
+   |ignore and /action/watch/options, routers/web/repo/watch.go) whose
+   routes ride the UI window — the store primitive
+   (`watchRepoWithOptions`) is landed. WatchInfo's `ignored` field stays
+   the upstream-literal hardcoded false (routers/api/v1/user/watch.go
+   renders it from the constant, not the mode).
+2. **Mentions**: CLOSED (was "no mention parser — the mentions batch
+   (mail_issue.go:99-102) is unported, so `fromMention` is always false").
+   The parser + visibility resolution landed in `services/mentions/` and
+   every batch arm carries a `mentions` parameter — §13 has the as-built.
+   Still schema-absent (HANDOFF, not a mail reduction): the
+   `issue_user.is_mentioned` persistence carrier (issue_update.go:567 —
+   upstream's mention writes go to `issue_user`, NEVER `issue_watch`, so no
+   subscription row is written here either).
 3. **`emoji.ReplaceAliases`** on the subject (mail_issue_common.go:133):
    no alias table ported — the fallback subject carries the title verbatim.
 4. **Incoming-email header arms**: Reply-To/List-Post and the mailto
@@ -801,6 +852,250 @@ twin of `NewIssue` — one line into the SAME middle slice three ports:
 
 ---
 
+## 11. SLICE FIVE AS-BUILT — the IssueChangeTitle arm (the WIP-ready rename mail)
+
+### 11.1 The pin's chain map (verified at fc493688)
+
+`IssueChangeTitle` (services/mailer/notify.go:80-90) fires from
+`issue_service.ChangeTitle` AFTER the update (services/issue/issue.go:127)
+with the UPDATED issue and oldTitle. The receiver gates FIRST —
+`issue.IsPull && issues_model.HasWorkInProgressPrefix(oldTitle) &&
+!issue.PullRequest.IsWorkInProgress(ctx)` — then the SAME middle slices
+two-four port:
+
+- `MailParticipants(ctx, issue, doer, ActionPullRequestReadyForReview,
+  nil)` — a plain-issue rename mails NOTHING (the `IsPull` conjunct);
+  `IsWorkInProgress` recomputes from the CURRENT title prefix
+  (models/issues/pull.go:652-658 — the landed `hasWorkInProgressPrefix`
+  proxy), so the gate is exactly "old WIP, new not-WIP".
+- Content: ActionPullRequestReadyForReview is NOT in MailParticipants'
+  empty list (mail_issue.go:179-185) — the kept description renders
+  BELOW the ready line (default.tmpl's first action chain + the body
+  else-branch are independent); an empty description renders the line
+  alone (byte-identical to the close/reopen shape).
+- Template: actionToTemplate (:248) names it "ready_for_review"; no
+  `ready_for_review` template file exists (only assigned + default under
+  `templates/mail/repo/issue/`), but default.tmpl's first action chain
+  HAS the branch — the render falls through to issue/default.tmpl like
+  every other named arm (`mail/repo/pull/` does not exist at the pin).
+- Subject: "Re: " + fallback (the :88-91 rule — any non-"new" name).
+- Message-ID: the :285-294 switch HAS a dedicated case (:303-304) —
+  `<owner/repo/pulls/#idx/ready/<unixMilli>@domain>`; In-Reply-To/
+  References stay the plain thread id (generated with ActionType(0)).
+- Recipients: the full participants resolution — the repo watchers ride
+  (the resolution's own WIP gate recomputes on the NEW non-WIP title, so
+  it is false on its own terms; `pullCreate` is NOT set).
+- Dedupe: `pull-ready:<issueId>:ready_for_review:<unixMilli>:
+  <recipientId>` — the ms rides the key exactly as it rides the
+  Message-ID (the issue-status discipline; repeated WIP cycles each
+  mail).
+
+### 11.2 The arm as-built (services/mail/notify.ts + templates.ts)
+
+- `notifyIssueTitleChanged(env, {issue, doer, oldTitle})` — the receiver:
+  the three gate-offs (non-pull, non-WIP old title, still-WIP new title)
+  return `no-recipients` BEFORE the prelude (upstream's receiver returns
+  before MailParticipants), then the shared `notifyIssueArm` compose
+  with `actionName: "ready_for_review"`, `content = issue.content ?? ""`,
+  dedupe prefix `pull-ready`.
+- `notifyIssueArm` gains the ready branch: the always-rendered action
+  line via the new `issueActionReadyForReviewLine`
+  (`mail.issue.action.ready_for_review` = `<b>%[1]s</b> marked this pull
+  request ready for review.` — no index argument, locale_en-US.json),
+  the `/ready` Message-ID extra, and `renderIssueActionMail`'s FOURTH
+  `<p>` shape — an action line AND a non-empty body (the `{{- if}}`
+  trims the whitespace between the chain's `{{end}}` and the body
+  branch). Upstream the close/reopen arms can never reach that shape
+  (MailParticipants empties them), so the landed close/reopen bytes are
+  unchanged.
+
+### 11.3 The emit site + the folds
+
+- `IssuesService.changeTitle(issue, title, actorId, now)` — wraps the
+  shared `changeIssueTitle` write (untouched) and notifies with the
+  UPDATED row + oldTitle after a winning write (upstream's :127
+  position); best-effort, never throws. Folded at landing:
+  - `api/routes/issues.ts` `editIssueRoute` title block —
+    `changeIssueTitle(c.env.DB, ...)` → `service.changeTitle(...)`
+    (the handler constructs `IssuesService(c.env.DB, c.env)` already);
+  - `api/routes/pulls.ts` `editPullRoute` title block — the same fold.
+
+---
+
+## 12. SLICE FIVE AS-BUILT — the IssueChangeAssignee arm (the assigned mail)
+
+### 12.1 The pin's chain map (verified at fc493688)
+
+`IssueChangeAssignee` (services/mailer/notify.go:119-127) fires from
+`UpdateAssignees`' post-tx loops (services/issue/assignee.go:155-166 —
+removals first, then adds, `comment != nil` for adds only) — per
+ACTUALLY-changed assignee, carrying that toggle's type-9 comment. Its
+mail is NOT the participants funnel:
+
+- Receiver gates (notify.go:121): `!removed && doer.ID != assignee.ID &&
+  assignee.EmailNotificationsPreference != Disabled` — note the ONLY
+  rule is not-disabled: `onmention` users DO get assigned mail (the
+  participants prefilter's enabled/andyourown rule does not apply).
+- `SendIssueAssignedMail` (mail_issue.go:200-232): the MailService gate,
+  the repo load, a `langMap` whose only filter is `IsMailable`
+  (:208-210), then `composeIssueCommentMessages` over
+  `{ActionType: 0, Content: "Assigned #<index>.", Comment: <the type-9
+  row>}` with info "issue assigned". NO CheckRepoUnitUser re-check — the
+  assignee was `CanBeAssigned`-validated at add time.
+- Compose consequences of `Comment != nil` (mail_issue_common.go:56-61,
+  :167-170): the link AND the Message-ID carry the type-9 comment
+  (`#issuecomment-<id>` anchor; `<owner/repo/issues|pulls/#idx/comment/
+  <id>@domain>`); the thread In-Reply-To/References stay plain
+  (ActionType(0)).
+- Template: actionToTemplate's default case keys `CommentTypeAssignees`
+  → name "assigned" → `mail/repo/issue/assigned` — the ONE named issue
+  template that exists at the pin. It renders ONLY the
+  `mail.issue_assigned.pull|issue` locale line (`%[1]s assigned you to
+  pull request|issue %[2]s in repository %[3]s.`): the compose's Content
+  string is rendered but never printed. TrHTML escapes plain-string args
+  (i18n/localestore.go:156-171) while the HTMLFormat-built anchors pass
+  through raw with the template's own SINGLE-quoted hrefs.
+- Subject: "Re: " + fallback (assigned.tmpl has no subject section —
+  the `---` split rule, modules/templates/mail.go:107/:158).
+
+### 12.2 The arm as-built (services/mail/notify.ts + templates.ts + api/services/issues.ts)
+
+- `notifyIssueAssigneeChanged(env, {issue, comment, doer, assignee,
+  removed})` — the receiver gates verbatim (side-store preference read,
+  absent row = 'enabled'), then the prelude, `isMailable`, and the
+  single-recipient compose via the new `renderIssueAssignedMail`
+  (templates.ts — the assigned.tmpl byte trace: the head gap's three
+  bare newlines, the 3-tab locale `<p>`, the dropped
+  `{{if .CanReply}}`'s own `\t\n`, the footer). Dedupe
+  `issue-assigned:<commentId>:<recipientId>` (the comment arm's
+  commentId discipline — a re-assign after unassign creates a NEW
+  comment and mails again).
+- The write core's seam widened: `replaceIssueAssignees`
+  (api/services/issues.ts) passes each toggle's type-9 comment row
+  through `onAssignee(user, removed, comment)` (upstream's `comment`
+  argument, assignee.go:155/:161); `writeAssigneeComment` returns the
+  inserted row. The /assignees trio's `addIssueAssignees`/
+  `removeIssueAssignees` callers are untouched (their notify arms are
+  §1.3's staged fold).
+
+### 12.3 The emit site + the folds
+
+- `IssuesService.changeAssignees(found, issue, names, doer, onAssignee)`
+  — wraps `replaceIssueAssignees` and fans BOTH IssueChangeAssignee
+  receivers in per changed assignee (upstream's notify dispatch hands
+  the event to the webhook AND the mail notifier): the caller's webhook
+  emitter runs first, the mail arm after, removals before adds (the
+  core's post-tx order); best-effort, never throws. Folded at landing:
+  - `api/routes/issues.ts` `editIssueRoute` assignee block —
+    `replaceIssueAssignees(c.env.DB, ...)` → `service.changeAssignees(...)`;
+  - `api/routes/pulls.ts` `replacePullAssignees` helper — the same fold
+    onto `new IssuesService(c.env.DB, c.env)`.
+
+---
+
+## 13. SLICE SIX AS-BUILT — the mentions arm (the @mentions parser + the onmention lift)
+
+### 13.1 The pin's parser map (verified at fc493688)
+
+The old `models/repo/mention.go` no longer exists at the pin — the
+extraction consolidated into the references package, and the routers/
+web/shared/mention package is only the autocomplete collector (it never
+runs the regexp):
+
+- `mentionPattern` — gitea/modules/references/references.go:33: matches
+  `@user` or `@org/team`; the lead class `(\s|^|\(|\[)` is the email
+  exclusion (a word char before `@` kills the match) and the trailing class
+  `(\s|$|[:,;.?!](\s|$)|'|\)|\])` rejects glued punctuation (`@gitea!this`).
+- `FindAllMentionsBytes` (:219-240) — the iterative pos-advance scan
+  (FindAllSubmatchIndex cannot be used: the lead/trailing `\s` guards make
+  consecutive mentions share the space); `spaceTrimmedPattern` (:45) is the
+  notrail backoff, dead for mentions by construction (the capture classes
+  `[-.\w]` admit no `\s`).
+- `FindAllMentionsMarkdown` (:207-215) — strip first, scan second, names
+  without the `@`; the strip is `mdstripper.StripMarkdownBytes`
+  (modules/markup/mdstripper/mdstripper.go:146-171), a goldmark parse walked
+  by a renderer emitting ONLY non-raw `ast.Text` nodes: fenced/indented code
+  blocks carry no Text children, code-span text is raw, link children are
+  skipped (WalkSkipChildren — link text and linkified URLs, email
+  autolinks included, never reach the scan), raw HTML is not Text, image alt
+  text IS walked, line breaks become `\n`, and adjacent Text siblings
+  coalesce while a new inline container's first text child gets a `\n`
+  (mdstripper.go:41-67).
+- Fixtures at the pin: `TestRegExp_mentionPattern`
+  (references_test.go:429-484 — 23 true + 14 false rows) and
+  `TestFindAllMentions` (:358-367 — the exact spans). NO
+  FindAllMentionsMarkdown unit fixtures exist at the pin — the strip's
+  exclusion arms are cite-marked derived in parser.test.ts.
+
+### 13.2 As-built: services/mentions/ + the threading
+
+- `services/mentions/parser.ts` — the regexp verbatim (one mechanical
+  translation: Go's ASCII `\s` spelled `[\t\n\f\r ]`; JS `\s` also eats
+  Unicode spaces) + the scan + `stripMarkdownForScan` over markdown-it (the
+  landed dependency): markdown-it's flat inline token list has open/close
+  tokens exactly at goldmark's container edges, so "previous emitted chunk
+  was text" reproduces the coalesce rule, and skipping everything between
+  `link_open`/`link_close` is WalkSkipChildren. The strip instance parses
+  `html: true, linkify: true` (goldmark's strip posture, html.WithUnsafe);
+  its output only feeds the scanner, never a renderer — no XSS surface.
+- `services/mentions/resolve.ts` — `ResolveIssueMentionsByVisibility`
+  (models/issues/issue_update.go:575-696): the case-fold + dedupe `resolved`
+  map, the doer pre-seed, the `@org/team` branch (org-owned repos only,
+  prefix = the repo owner), team expansion through the teams joined to THIS
+  repo (the `team_repo` join → our `team_repo_access`) gated on
+  `UnitEnabled(TypeIssues|TypePullRequests)` (team.go:194-214, max(team
+  mode, unit override) — our `teams.unitsMap` collapse, keys
+  `repo.issues`/`repo.pulls` per structs/org_team.go:34) and expanded to
+  active members (`users.status='active'` = upstream's is_active +
+  !prohibit_login), then individual users (active, org rows skipped, the
+  INDIVIDUAL read gate — repo_permission.go:426-491, deliberately without
+  team grants so a team member named directly must come through the team
+  arm). Folded reductions, recorded in the module header: the
+  `HasOrgOrUserVisible` private-owner arm (no landed single predicate; the
+  mail arm's CheckRepoUnitUser fold re-gates every survivor downstream) and
+  upstream's `IsUserBlockedBy` filter (issue_update.go:559-565 — no block
+  table).
+- NO database write: upstream's `FindAndUpdateIssueMentions` persists
+  `issue_user.is_mentioned` (issue_update.go:567 → issue_user.go:64-86);
+  the `issue_user` table has no landed carrier and `issue_subscriptions`
+  here IS upstream's `issue_watch` — a mention never touches it at the pin.
+  HANDOFF for the next schema wave: an `issue_mentions (issue_id, user_id)`
+  carrier + the resolver's insert arm; the mail path needs no carrier.
+- `services/mentions/service.ts` — the `findIssueMentions` entry
+  (parse → resolve), the FindAndUpdateIssueMentions shape minus the two
+  schema-absent arms.
+- The hub threading (`services/mail/notify.ts`): `resolveIssueMailRecipients`
+  takes `mentions?: UserRow[]` — the mention ids head the union (the
+  mention batch mails first, mail_issue.go:99-102), the batch filter's
+  onmention allowance is `onmention && (in the mention set || custom
+  watch)` (:135-137, the custom half landed with the watch-mode slice), and
+  the visited semantics are batch-1's for mention ids: ignorers and the
+  doer exclude, explicit issue-unwatchers do NOT (the unwatcher block joins
+  visited after the mention batch, :104-109). `notifyIssueComment`,
+  `notifyIssueCreated` and `notifyPullRequestCreated` carry the parameter;
+  the status/title arms take none (upstream passes nil — services/issue/
+  status.go:43/:56, issue.go:127).
+- The emit sites (`issues/service.ts`): `resolveMailMentions` runs parse +
+  resolve inside the notify helpers (upstream runs FindAndUpdateIssueMentions
+  in the same services before the notify — comments.go:81, issue.go:68,
+  pull.go:184), best-effort, only when the mail env is armed (no write to
+  gate it). Comment EDIT does not re-mention (upstream UpdateComment
+  re-runs neither).
+
+### 13.3 Tests (parser.test.ts 53, resolve.test.ts 19, notify.test.ts +6)
+
+- Parser: the pin's 37 pattern rows + the span fixture 1:1; the strip arms
+  are cite-marked derived (fence/indented/code-span/link/linkify/email/
+  image-alt/raw-HTML/emphasis-split/unclosed-fence).
+- Resolver: derived arms (upstream has no unit test for the function at the
+  pin) — every filter line cited in the test's expect comment.
+- The mail arms: mention-first ordering, the onmention lift + its negative,
+  the mentioned-unwatcher exception, the mentioned-doer exclusion, and two
+  end-to-end arms through `addComment` (the onmention row lands first; a
+  code-span mention does not resolve).
+
+---
+
 ## 6. API/config surface
 
 No new bindings (the arm reads `DB` + `REPO_TASKS`, both landed). Vars
@@ -910,6 +1205,30 @@ Slice three adds (same files, same posture):
     posture stays silent. (Slice four's pull-create arm adds §10.4's
     pins; the pre-slice-four "`createPullRequest` emits nothing"
     assertion is superseded there.)
+
+Slice five adds (same files, same posture):
+
+12. **The new template shapes** (`templates.test.ts`):
+    `issueActionReadyForReviewLine` verbatim; the ready arm's
+    line+body `<p>` shape (and its empty-body byte-equality with the
+    close shape); `renderIssueAssignedMail`'s byte trace — the head gap,
+    the single-quoted locale line with the type-9 anchor, the IsPull
+    word choice, the escaping set, the dropped-CanReply line, the
+    footer.
+13. **The two receivers** (`notify.test.ts`): the ready mail's pins —
+    `/ready/<ms>` Message-ID over the plain reference, Re: subject,
+    watchers riding a non-WIP new title, the kept description below the
+    ready line, the `pull-ready` dedupe, the three gate-offs
+    (non-pull / non-WIP old / still-WIP new), consume-to-sent, disabled/
+    malformed; the assigned mail's pins — one row to the assignee, the
+    `/comment/<id>` Message-ID with the plain thread reference,
+    `issue assigned` info, the assigned.tmpl line with anchor, the
+    receiver gates (removed / self-assign / disabled / non-mailable)
+    with `onmention` PASSING, consume-to-sent, disabled/malformed; the
+    service-level emits — armed `changeTitle` (WIP → ready lands,
+    plain rename silent) and armed `changeAssignees` (each add lands,
+    the webhook emitter rides the same receiver, removals and no-ops
+    mail nothing).
 
 Gate: the new suites green own-eyes (`pnpm test <files>`); bare
 `tsc --noEmit` zero errors; scoped eslint clean; `pnpm db:generate`

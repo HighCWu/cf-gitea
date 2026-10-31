@@ -200,6 +200,8 @@ export function displayNameWithFullName(username: string, fullName: string | nul
 //   mail.issue.action.new     = `<b>%[1]s</b> created #%[2]d.`
 //   mail.issue.action.close   = `<b>%[1]s</b> closed #%[2]d.`
 //   mail.issue.action.reopen  = `<b>%[1]s</b> reopened #%[2]d.`
+//   mail.issue.action.ready_for_review = `<b>%[1]s</b> marked this pull
+//     request ready for review.`
 
 /** `mail.issue.action.new` — the empty-body branch of the "new" arm. */
 export function issueActionNewLine(doerDisplayName: string, issueIndex: number): string {
@@ -216,14 +218,23 @@ export function issueActionReopenLine(doerDisplayName: string, issueIndex: numbe
   return `<b>${escapeHtml(doerDisplayName)}</b> reopened #${issueIndex}.`;
 }
 
+/** `mail.issue.action.ready_for_review` — the IssueChangeTitle arm's line
+ *  (default.tmpl's first action chain has the branch even though no
+ *  `ready_for_review` template file exists — the render falls through to
+ *  issue/default like every other named arm). */
+export function issueActionReadyForReviewLine(doerDisplayName: string): string {
+  return `<b>${escapeHtml(doerDisplayName)}</b> marked this pull request ready for review.`;
+}
+
 /** Data for `renderIssueActionMail` (the default.tmpl data map's used slice
  *  for the new/close/reopen arms — the comment twin is IssueCommentMailData). */
 export interface IssueActionMailData {
   /** Upstream `.Subject` — the compose-time SANITIZED subject. */
   subject: string;
   /** Upstream `.ActionName` — actionToTemplate's arm name
-   *  (mail_issue_common.go:227-246): "new" | "close" | "reopen" | "comment". */
-  actionName: "new" | "close" | "reopen" | "comment";
+   *  (mail_issue_common.go:227-246): "new" | "close" | "reopen" | "comment" |
+   *  "ready_for_review". */
+  actionName: "new" | "close" | "reopen" | "comment" | "ready_for_review";
   /** Upstream `.Body` — the content rendered to HTML (the issue content for
    *  "new", emptied by MailParticipants for close/reopen, mail_issue.go:
    *  180-185); "" selects the template's empty-body branch. */
@@ -247,14 +258,21 @@ export interface IssueActionMailData {
  * `templates/mail/repo/issue/default.tmpl` for the new/close/reopen arms —
  * byte-faithful traces of the Go template with `.IsMention` false, empty
  * `.ReviewComments`, `.CanReply` false (no incoming email). The `<p>` block
- * has three reachable shapes (both dropped `{{if}}` lines above it and the
+ * has four reachable shapes (both dropped `{{if}}` lines above it and the
  * second dropped push `{{if}}` below it leave their tab+newline):
- *   - a NON-EMPTY body (comment, or "new" with content): the else branch
- *     renders it 3-tab indented — the shape renderIssueCommentMail pinned;
- *   - "close"/"reopen" (body always emptied by MailParticipants): the FIRST
- *     action chain emits the locale line 3-tab indented, then the empty-body
- *     branch contributes its two skipped-`{{if}}` lines ("\t\t" and "\t\t\t")
- *     after it;
+ *   - a NON-EMPTY body with no action line (comment, or "new" with content):
+ *     the else branch renders it 3-tab indented — the shape
+ *     renderIssueCommentMail pinned;
+ *   - an action line with an EMPTY body ("close"/"reopen" — their content is
+ *     always emptied by MailParticipants; "ready_for_review" on a
+ *     description-less pull): the FIRST action chain emits the locale line
+ *     3-tab indented, then the empty-body branch contributes its two
+ *     skipped-`{{if}}` lines ("\t\t" and "\t\t\t") after it;
+ *   - an action line AND a non-empty body ("ready_for_review" with a kept
+ *     description — MailParticipants' empty list, mail_issue.go:179-185, does
+ *     not cover it; upstream the close/reopen arms can never reach this
+ *     shape): the line renders 3-tab indented, then the else branch renders
+ *     the body 3-tab indented after it;
  *   - "new" with an EMPTY body: the action chain is skipped, and the nested
  *     `{{if eq .ActionName "new"}}` emits its locale line 4-tab indented
  *     after the empty branch's own "\t\t\t" line.
@@ -269,6 +287,8 @@ export function renderIssueActionMail(data: IssueActionMailData): string {
   let pBlock: string;
   if (data.actionLineHtml !== null && data.actionName === "new") {
     pBlock = `\t<p>\n\t\t\n\t\t\t\n\t\t\t\t${data.actionLineHtml}\n\t\t</p>`;
+  } else if (data.actionLineHtml !== null && data.bodyHtml !== "") {
+    pBlock = `\t<p>\n\t\t\n\t\t\t${data.actionLineHtml}\n\t\t\n\t\t\t${data.bodyHtml}\n\t\t</p>`;
   } else if (data.actionLineHtml !== null) {
     pBlock = `\t<p>\n\t\t\n\t\t\t${data.actionLineHtml}\n\t\t\n\t\t\t\n\t\t</p>`;
   } else {
@@ -302,4 +322,70 @@ export function renderIssueCommentMail(data: IssueCommentMailData): string {
     appName: data.appName,
     appUrl: data.appUrl,
   });
+}
+
+// ---------------------------------------------------------------------------
+// The assigned mail (templates/mail/repo/issue/assigned.tmpl) — the
+// IssueChangeAssignee arm's landing template
+// ---------------------------------------------------------------------------
+
+/** Data for `renderIssueAssignedMail` (the assigned.tmpl data map's used
+ *  slice). */
+export interface IssueAssignedMailData {
+  /** Upstream `.Subject` — the compose-time SANITIZED subject. */
+  subject: string;
+  /** Upstream `.IsPull` — picks the `mail.issue_assigned.pull|issue` line. */
+  isPull: boolean;
+  /** Upstream `.Doer.DisplayNameWithFullName` (the line's %[1]s). */
+  doerDisplayName: string;
+  /** Upstream `.Link` — Issue.HTMLURL + `#issuecomment-<id>` (Comment is the
+   *  type-9 assignee comment, mail_issue_common.go:56-61; the `%[2]s` arg). */
+  link: string;
+  /** Upstream `.Issue.Index` (the link text `%d`). */
+  issueIndex: number;
+  /** Upstream `.Issue.Repo.HTMLURL` (the `%[3]s` arg). */
+  repoHtmlUrl: string;
+  /** Upstream `.Issue.Repo.FullName` (the repo link's text). */
+  repoPath: string;
+  /** Upstream `AppName` (the head footer's link text). */
+  appName: string;
+  /** Upstream `AppUrl` — trailing-slash form. */
+  appUrl: string;
+}
+
+/**
+ * `templates/mail/repo/issue/assigned.tmpl` — byte-faithful trace with
+ * `.CanReply` false (no incoming email). The template renders ONLY the locale
+ * line — the compose's Content ("Assigned #<index>.") is rendered by
+ * composeIssueCommentMessages but this template never prints `.Body`
+ * (assigned.tmpl renders `mail.issue_assigned.pull|issue` —
+ * locale_en-US.json: `%[1]s assigned you to pull request %[2]s in repository
+ * %[3]s.`). The locale line carries NO <b> wrapper (unlike default.tmpl's
+ * action lines); the #idx and repo anchors are HTMLFormat-built
+ * (modules/templates/helper.go) — template.HTML values that TrHTML passes
+ * through raw (i18n/localestore.go:156-171 escapes only plain-string args),
+ * with the anchors' arg-escaping done by HTMLFormat and the SINGLE-quoted
+ * hrefs being the template literal's own. The blank line + the two dropped
+ * variable declarations after `</head>` leave three bare newlines before
+ * `<body>`; the dropped `{{if .CanReply}}` leaves its own "\t\n".
+ */
+export function renderIssueAssignedMail(data: IssueAssignedMailData): string {
+  const title = escapeHtml(data.subject);
+  const doer = escapeHtml(data.doerDisplayName);
+  const link = escapeHtml(data.link);
+  const repoUrl = escapeHtml(data.repoHtmlUrl);
+  const repoPath = escapeHtml(data.repoPath);
+  const line = data.isPull
+    ? `${doer} assigned you to pull request <a href='${link}'>#${data.issueIndex}</a> in repository <a href='${repoUrl}'>${repoPath}</a>.`
+    : `${doer} assigned you to issue <a href='${link}'>#${data.issueIndex}</a> in repository <a href='${repoUrl}'>${repoPath}</a>.`;
+  return `${baseHead(title)}\n\n\n<body>
+\t<p>
+\t\t
+\t\t\t${line}
+\t\t
+\t</p>
+\t
+\t${baseFooter(data.appUrl, data.appName)}
+</body>
+</html>`;
 }

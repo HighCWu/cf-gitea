@@ -37,7 +37,6 @@ import {
   changeIssueDeadline,
   changeIssueMilestone,
   changeIssueRef,
-  changeIssueTitle,
   commentHasContentSupport,
   commentNotExistError,
   deleteComment,
@@ -64,7 +63,6 @@ import {
   prefetchCommentPosters,
   prefetchIssueRenderContext,
   prefetchTimelineContext,
-  replaceIssueAssignees,
   searchIssuesGlobally,
   toApiComment,
   toApiIssue,
@@ -1447,7 +1445,10 @@ export function registerIssueRoutes(
         found.repo.ownerId,
       );
       const oldTitle = issue.title;
-      const updated = await changeIssueTitle(c.env.DB, issue, title, actorId, now);
+      // The IssuesService fold carries the IssueChangeTitle mail receiver
+      // (services/mailer/notify.go:80-90 — upstream fires it from
+      // ChangeTitle, issue.go:127).
+      const updated = await service.changeTitle(issue, title, actorId, now);
       if (updated !== null) {
         issue = updated;
       }
@@ -1551,8 +1552,9 @@ export function registerIssueRoutes(
         repositoryPermissions(viewerOf(c), found.repo).push === true) &&
       ((form.assignees !== undefined && form.assignees !== null) || (form.assignee !== undefined && form.assignee !== null))
     ) {
-      await replaceIssueAssignees(
-        c.env.DB,
+      // The IssuesService fold fans the IssueChangeAssignee mail receiver in
+      // beside the webhook emitter (services/mailer/notify.go:119-127).
+      await service.changeAssignees(
         found,
         issue,
         [...(form.assignees ?? []), ...(form.assignee ? [form.assignee] : [])],

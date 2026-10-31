@@ -14,9 +14,11 @@ import {
   escapeHtml,
   issueActionCloseLine,
   issueActionNewLine,
+  issueActionReadyForReviewLine,
   issueActionReopenLine,
   registerNotifySubject,
   renderIssueActionMail,
+  renderIssueAssignedMail,
   renderIssueCommentMail,
   renderRegisterNotify,
 } from "./templates";
@@ -210,5 +212,95 @@ describe("renderIssueActionMail — default.tmpl non-comment branches", () => {
     });
     expect(action).toBe(comment);
     expect(action).toContain("\t<p>\n\t\t\n\t\t\t<p>a fresh description</p>\n\n\t\t</p>\n");
+  });
+
+  it("ready_for_review with a KEPT description: the ready line AND the body render (MailParticipants keeps the content, mail_issue.go:179-185)", () => {
+    const html = render({
+      actionName: "ready_for_review",
+      actionLineHtml: issueActionReadyForReviewLine("user2"),
+      bodyHtml: "<p>the description</p>\n",
+    });
+    // The line rides the FIRST chain 3-tab indented; the else branch renders
+    // the body 3-tab indented after it (the `{{- if}}` trims the whitespace
+    // between {{end}} and the body branch — mail_issue_common.go's compose).
+    expect(html).toContain(
+      "\t<p>\n\t\t\n\t\t\t<b>user2</b> marked this pull request ready for review.\n\t\t\n\t\t\t<p>the description</p>\n\n\t\t</p>\n",
+    );
+  });
+
+  it("ready_for_review with an EMPTY body: byte-identical to the close/reopen shape", () => {
+    const ready = render({
+      actionName: "ready_for_review",
+      actionLineHtml: issueActionReadyForReviewLine("user2"),
+    });
+    const close = render();
+    // The only difference is the line itself — the surrounding whitespace is
+    // the shared first-chain + empty-branch trace.
+    expect(ready.replace("marked this pull request ready for review.", "closed #1.")).toBe(close);
+  });
+});
+
+describe("issueActionReadyForReviewLine (mail.issue.action.ready_for_review)", () => {
+  it("'<b>%[1]s</b> marked this pull request ready for review.' — no index argument", () => {
+    expect(issueActionReadyForReviewLine("user2 (Mister X)")).toBe(
+      "<b>user2 (Mister X)</b> marked this pull request ready for review.",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The assigned mail — templates/mail/repo/issue/assigned.tmpl (the ONE named
+// issue template at the pin; the IssueChangeAssignee arm's render,
+// mail_issue.go:200-232 → composeIssueCommentMessages' CommentTypeAssignees
+// branch, mail_issue_common.go:261)
+// ---------------------------------------------------------------------------
+
+describe("renderIssueAssignedMail (assigned.tmpl layout)", () => {
+  const render = (over: Partial<Parameters<typeof renderIssueAssignedMail>[0]> = {}) =>
+    renderIssueAssignedMail({
+      subject: "Re: [user2/repo1] issue1 (#1)",
+      isPull: false,
+      doerDisplayName: "user2",
+      link: "https://x.example/user2/repo1/issues/1#issuecomment-9",
+      issueIndex: 1,
+      repoHtmlUrl: "https://x.example/user2/repo1",
+      repoPath: "user2/repo1",
+      appName: "Gitea",
+      appUrl: "https://x.example/",
+      ...over,
+    });
+
+  it("pins the assigned.tmpl byte trace: the head gap, the single locale <p>, the dropped CanReply line, the footer", () => {
+    const html = render();
+    // </head> + the blank line + the two dropped {{$var}} declarations leave
+    // three bare newlines; the locale line rides 3-tab indented with the
+    // template's own SINGLE-quoted HTMLFormat anchors; the dropped
+    // {{if .CanReply}} leaves its own "\t\n" before the footer's "\t".
+    expect(html).toContain(
+      "</head>\n\n\n\n<body>\n\t<p>\n\t\t\n\t\t\tuser2 assigned you to issue <a href='https://x.example/user2/repo1/issues/1#issuecomment-9'>#1</a> in repository <a href='https://x.example/user2/repo1'>user2/repo1</a>.\n\t\t\n\t</p>\n\t\n\t<table",
+    );
+    expect(html.startsWith("<!DOCTYPE html>\n<html>\n<head>\n\t<meta")).toBe(true);
+    expect(html).toContain("<title>Re: [user2/repo1] issue1 (#1)</title>");
+    expect(html).toContain('<a href="https://x.example/">Gitea</a>');
+    expect(html.endsWith("</table>\n\n</body>\n</html>")).toBe(true);
+  });
+
+  it("IsPull picks mail.issue_assigned.pull — 'assigned you to pull request'", () => {
+    expect(
+      render({ isPull: true }).includes("user2 assigned you to pull request <a href="),
+    ).toBe(true);
+    expect(render().includes("assigned you to issue <a href=")).toBe(true);
+  });
+
+  it("escapes the display name, the link and the repo path (html/template element context); the locale line carries NO <b> wrapper", () => {
+    const hostile = render({
+      doerDisplayName: "<b>Eve</b> & Sons",
+      link: "https://x.example/o/r/issues/1?a=1&b=2#issuecomment-9",
+      repoPath: "o/r & co",
+    });
+    expect(hostile).toContain("&lt;b&gt;Eve&lt;/b&gt; &amp; Sons assigned you to issue");
+    expect(hostile).toContain("<a href='https://x.example/o/r/issues/1?a=1&amp;b=2#issuecomment-9'>");
+    expect(hostile).toContain(">o/r &amp; co</a>");
+    expect(hostile).not.toContain("<b>user2</b> assigned");
   });
 });

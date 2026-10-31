@@ -46,13 +46,18 @@ import {
   ReleaseAlreadyExistError,
   RepositoryNotExistError,
 } from "./errors";
+import { changeIssueTitle, replaceIssueAssignees } from "../api/services/issues";
+import { findRepositoryById, type RepositoryWithOwner, type UserRow } from "../api/services/repository";
 import {
+  notifyIssueAssigneeChanged,
   notifyIssueComment,
   notifyIssueCreated,
   notifyIssueStatusChanged,
+  notifyIssueTitleChanged,
   notifyPullRequestCreated,
   type MailNotifyEnv,
 } from "../services/mail/notify";
+import { findIssueMentions } from "../services/mentions/service";
 
 export type IssueRow = typeof issues.$inferSelect;
 export type CommentRow = typeof comments.$inferSelect;
@@ -590,6 +595,83 @@ export class IssuesService {
   }
 
   /**
+   * `issue_service.ChangeTitle` (services/issue/issue.go:86-128) — the title
+   * write through the shared changeIssueTitle plus the IssueChangeTitle
+   * receiver arm: upstream notifies AFTER the update with the UPDATED issue
+   * and oldTitle (issue.go:127), so the mail sees the new title and the
+   * receiver's WIP-transition gate keys on the pair (notifyIssueTitleChanged).
+   * Best-effort — the write above stays committed.
+   */
+  async changeTitle(issue: IssueRow, title: string, actorId: number | null, now: Date): Promise<IssueRow | null> {
+    const oldTitle = issue.title;
+    const updated = await changeIssueTitle(this.d1, issue, title, actorId, now);
+    if (updated !== null) await this.notifyMailTitleChanged(updated, oldTitle, actorId, now);
+    return updated;
+  }
+
+  /** The IssueChangeTitle receiver arm's caller — best-effort, never throws
+   *  (the errors log; the write above stays committed). */
+  private async notifyMailTitleChanged(issue: IssueRow, oldTitle: string, actorId: number | null, now: Date): Promise<void> {
+    if (this.mailEnv === undefined) return;
+    if (actorId === null) return;
+    try {
+      const doer = (await this.db.select().from(users).where(eq(users.id, actorId)).get()) ?? null;
+      if (doer === null) {
+        console.error(`[issues] title notify skipped: actor row missing [id: ${actorId}]`);
+        return;
+      }
+      const outcome = await notifyIssueTitleChanged(this.mailEnv, { issue, doer, oldTitle }, { now });
+      if (outcome.outcome === "enqueued" && outcome.enqueue.some((e) => e.outcome === "pending-unqueued")) {
+        console.warn(`[issues] title notify: some rows stayed pending-unqueued (issue ${issue.id})`);
+      }
+    } catch (error) {
+      console.error(`[issues] title notify failed (issue ${issue.id}): ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * UpdateAssignees' notify position (services/issue/assignee.go:94-166) —
+   * the shared replaceIssueAssignees write core with this service's
+   * IssueChangeAssignee receivers fanned in: upstream's notify dispatch
+   * hands each actually-changed assignee to BOTH the webhook and the mail
+   * notifier (notifier.go:161-202 / mailer/notify.go:119-127), so the
+   * caller's webhook emitter runs first and the mail arm rides after, per
+   * assignee, removals before adds (the core's post-tx order). Best-effort —
+   * the writes stay committed.
+   */
+  async changeAssignees(
+    found: RepositoryWithOwner,
+    issue: IssueRow,
+    names: string[],
+    doer: { id: number; isAdmin: boolean },
+    onAssignee: (user: UserRow, removed: boolean) => Promise<void> | void,
+  ): Promise<void> {
+    await replaceIssueAssignees(this.d1, found, issue, names, doer, async (user, removed, comment) => {
+      await onAssignee(user, removed);
+      await this.notifyMailAssigneeChanged(issue, comment, user, removed, doer.id);
+    });
+  }
+
+  /** The IssueChangeAssignee receiver arm's caller — best-effort, never
+   *  throws (the receiver gates removed/self/preference itself). */
+  private async notifyMailAssigneeChanged(issue: IssueRow, comment: CommentRow, assignee: UserRow, removed: boolean, doerId: number): Promise<void> {
+    if (this.mailEnv === undefined) return;
+    try {
+      const doer = (await this.db.select().from(users).where(eq(users.id, doerId)).get()) ?? null;
+      if (doer === null) {
+        console.error(`[issues] assignee notify skipped: doer row missing [id: ${doerId}]`);
+        return;
+      }
+      const outcome = await notifyIssueAssigneeChanged(this.mailEnv, { issue, comment, doer, assignee, removed });
+      if (outcome.outcome === "enqueued" && outcome.enqueue.some((e) => e.outcome === "pending-unqueued")) {
+        console.warn(`[issues] assignee notify: some rows stayed pending-unqueued (comment ${comment.id})`);
+      }
+    } catch (error) {
+      console.error(`[issues] assignee notify failed (comment ${comment.id}): ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
    * The expression list for a FROM-less gated `INSERT ... SELECT`, matching
    * drizzle's `comments` column order (buildInsertQuery lists every column
    * for select-based inserts). Unlisted columns fall back to their declared
@@ -664,6 +746,19 @@ export class IssuesService {
     return rows[0];
   }
 
+  /** The mentions half of FindAndUpdateIssueMentions (upstream runs the
+   *  whole function in the issue service BEFORE the notify fires —
+   *  services/issue/comments.go:81, issue.go:68, pull.go:184 — and hands
+   *  the resolved users to the receiver). Our shape: parse + visibility
+   *  resolution only (services/mentions — the issue_user persistence arm
+   *  is the recorded HANDOFF), best-effort: a resolution failure degrades
+   *  the mail fan-out, never the write. */
+  private async resolveMailMentions(issue: IssueRow, doer: UserRow, content: string): Promise<UserRow[]> {
+    const pair = await findRepositoryById(this.d1, issue.repoId);
+    if (pair === null) return [];
+    return findIssueMentions(this.d1, { repo: pair.repo, issue, doer, content });
+  }
+
   /** The CreateIssueComment receiver arm — best-effort, never throws (the
    *  errors log; the write above stays committed). */
   private async notifyCommentCreated(
@@ -681,7 +776,8 @@ export class IssuesService {
         console.error(`[issues] comment notify skipped: doer row missing [id: ${input.posterId}]`);
         return;
       }
-      const outcome = await notifyIssueComment(this.mailEnv, { issue, comment, doer }, { now });
+      const mentions = await this.resolveMailMentions(issue, doer, comment.content ?? "");
+      const outcome = await notifyIssueComment(this.mailEnv, { issue, comment, doer, mentions }, { now });
       if (outcome.outcome === "enqueued" && outcome.enqueue.some((e) => e.outcome === "pending-unqueued")) {
         console.warn(
           `[issues] comment notify: some rows stayed pending-unqueued (comment ${comment.id})`,
@@ -712,7 +808,9 @@ export class IssuesService {
         console.error(`[issues] new-issue notify skipped: poster row missing [id: ${issue.posterId}]`);
         return;
       }
-      const outcome = await notifyIssueCreated(this.mailEnv, { issue, doer }, { now });
+      // Upstream services/issue/issue.go:68 — the issue body's mentions.
+      const mentions = await this.resolveMailMentions(issue, doer, issue.content ?? "");
+      const outcome = await notifyIssueCreated(this.mailEnv, { issue, doer, mentions }, { now });
       if (outcome.outcome === "enqueued" && outcome.enqueue.some((e) => e.outcome === "pending-unqueued")) {
         console.warn(`[issues] new-issue notify: some rows stayed pending-unqueued (issue ${issue.id})`);
       }
@@ -742,7 +840,9 @@ export class IssuesService {
         console.error(`[issues] new-pull notify skipped: poster row missing [id: ${issue.posterId}]`);
         return;
       }
-      const outcome = await notifyPullRequestCreated(this.mailEnv, { issue, doer }, { now });
+      // Upstream services/pull/pull.go:184 — the PR body's mentions.
+      const mentions = await this.resolveMailMentions(issue, doer, issue.content ?? "");
+      const outcome = await notifyPullRequestCreated(this.mailEnv, { issue, doer, mentions }, { now });
       if (outcome.outcome === "enqueued" && outcome.enqueue.some((e) => e.outcome === "pending-unqueued")) {
         console.warn(`[issues] new-pull notify: some rows stayed pending-unqueued (issue ${issue.id})`);
       }

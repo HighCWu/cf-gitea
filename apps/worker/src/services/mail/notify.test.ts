@@ -20,10 +20,13 @@
 import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
+import { WatchMode } from "../../api/services/repo-watchers";
+
 import {
+  comments,
   emailOutbox,
   issues,
   issueAssignees,
@@ -38,8 +41,10 @@ import { IssuesService, type IssueRow } from "../../issues/service";
 import { CommentType } from "../../issues/comment-types";
 import { isMailOutboxMessage, processMailOutbox, type MailOutboxMessage } from "./outbox";
 import {
+  notifyIssueAssigneeChanged,
   notifyIssueCreated,
   notifyIssueStatusChanged,
+  notifyIssueTitleChanged,
   notifyPullRequestCreated,
   resolveIssueMailRecipients,
   type MailNotifyEnv,
@@ -314,6 +319,78 @@ describe("resolveIssueMailRecipients — the mailIssueCommentToParticipants port
     const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
     const repo = (await db().select().from(repositories).where(eq(repositories.id, REPO_ID)).get())!;
     expect(await resolveIssueMailRecipients(env.DB, { issue, repo, doer })).toEqual([]);
+  });
+});
+
+/**
+ * The repo-watch MODE arms (migration 0053 — GetRepoWatchersIDs /
+ * GetRepoCustomWatchersIDs / GetRepoIgnorersIDs, models/repo/watch.go:
+ * 244-292, over mail_issue.go:67-92). seedIssue() seeds watchers 20, 70,
+ * 80, 95, 96 at the mode defaults (Normal, every include true); these flip
+ * individual rows and pin the resolution change.
+ */
+describe("resolveIssueMailRecipients — the repo-watch MODE arms (migration 0053)", () => {
+  const setWatch = (userId: number, values: Partial<typeof repoWatchers.$inferInsert>) =>
+    db().update(repoWatchers).set(values).where(and(eq(repoWatchers.repoId, REPO_ID), eq(repoWatchers.userId, userId)));
+
+  async function resolve(issue: IssueRow): Promise<Array<{ id: number }>> {
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    const repo = (await db().select().from(repositories).where(eq(repositories.id, REPO_ID)).get())!;
+    return (await resolveIssueMailRecipients(env.DB, { issue, repo, doer })).map((u) => ({ id: u.id }));
+  }
+
+  const flipToPull = async (issue: IssueRow): Promise<IssueRow> => {
+    await env.DB.prepare("UPDATE issues SET is_pull = 1 WHERE id = ?").bind(issue.id).run();
+    return (await db().select().from(issues).where(eq(issues.id, issue.id)).get())!;
+  };
+
+  it("an issues-only CUSTOM watcher rides issue mail at the head of the source order, drops off pull mail (watch.go:283-289's customOnly arm)", async () => {
+    const issue = await seedIssue();
+    await setWatch(20, { mode: WatchMode.Custom, includePullRequests: false, includeIssues: true, includeReleases: true });
+    const issueIds = (await resolve(issue)).map((u) => u.id);
+    expect(issueIds[0]).toBe(20); // still the watcher arm's head — NOT a separate recipient source
+    const pullIds = (await resolve(await flipToPull(issue))).map((u) => u.id);
+    expect(pullIds).not.toContain(20); // include_pull_requests false
+  });
+
+  it("a Normal watcher with include_issues=false drops off issue mail (GetRepoWatchersIDs' watchColName gate)", async () => {
+    const issue = await seedIssue();
+    await setWatch(20, { mode: WatchMode.Normal, includeIssues: false });
+    expect((await resolve(issue)).map((u) => u.id)).not.toContain(20);
+  });
+
+  it("a custom watch lifts the onmention preference (mail_issue.go:141-146's customWatchers allowance)", async () => {
+    const issue = await seedIssue();
+    // The plain Normal seed does NOT lift onmention (the pre-mode drop arm).
+    expect((await resolve(issue)).map((u) => u.id)).not.toContain(80);
+    await setWatch(80, { mode: WatchMode.Custom, includePullRequests: false, includeIssues: true, includeReleases: true });
+    const issueIds = (await resolve(issue)).map((u) => u.id);
+    expect(issueIds).toContain(80); // issues custom watch → the onmention allowance
+    expect((await resolve(await flipToPull(issue))).map((u) => u.id)).not.toContain(80); // pulls excluded
+  });
+
+  it("an ignorer (mode=Dont) receives nothing — muting outranks their assignee and participant sources (mail_issue.go:87-92)", async () => {
+    const issue = await seedIssue();
+    await setWatch(20, { mode: WatchMode.Dont });
+    await db().insert(issueAssignees).values({ issueId: issue.id, assigneeId: 20 });
+    const bare = new IssuesService(env.DB);
+    await bare.addComment({ issueId: issue.id, posterId: 20, content: "the ignorer spoke" });
+    expect((await resolve(issue)).map((u) => u.id)).not.toContain(20);
+  });
+
+  it("ignorers still visit under the WIP gate (upstream's ignorers block sits OUTSIDE the WIP if, mail_issue.go:85-92)", async () => {
+    const issue = await seedIssue("WIP: draft thing");
+    await flipToPull(issue);
+    await setWatch(20, { mode: WatchMode.Dont });
+    await db().insert(issueAssignees).values({ issueId: issue.id, assigneeId: 20 });
+    expect((await resolve(issue)).map((u) => u.id)).not.toContain(20);
+  });
+
+  it("the WIP gate empties the custom set — an onmention custom watcher gets no allowance on a WIP pull", async () => {
+    const issue = await seedIssue("WIP: draft thing");
+    const fresh = await flipToPull(issue);
+    await setWatch(80, { mode: WatchMode.Custom, includePullRequests: true, includeIssues: true, includeReleases: true });
+    expect((await resolve(fresh)).map((u) => u.id)).not.toContain(80);
   });
 });
 
@@ -715,6 +792,220 @@ describe("notifyPullRequestCreated — the NewPullRequest receiver", () => {
 });
 
 // ---------------------------------------------------------------------------
+// The IssueChangeTitle arm (notify.go:80-90) — a pull renamed WIP → non-WIP
+// mails ActionPullRequestReadyForReview over the participants funnel; the
+// receiver's gate keys on (oldTitle WIP) && (current title not WIP)
+// ---------------------------------------------------------------------------
+
+describe("notifyIssueTitleChanged — the IssueChangeTitle receiver", () => {
+  /** seedIssue + the is_pull flip (the arm is pull-only upstream). */
+  async function seedPull(title: string): Promise<IssueRow> {
+    const issue = await seedIssue(title);
+    await env.DB.prepare("UPDATE issues SET is_pull = 1 WHERE id = ?").bind(issue.id).run();
+    return (await db().select().from(issues).where(eq(issues.id, issue.id)).get())!;
+  }
+
+  it("the WIP → ready transition mail: Re: subject, the /ready/<ms> Message-ID over the plain thread reference, the kept description rides BELOW the ready line", async () => {
+    const pr = await seedPull("WIP: draft thing");
+    // The UPDATED row (the receiver runs post-update, issue.go:127 — the
+    // gate's IsWorkInProgress half recomputes on the NEW title).
+    const updated = { ...pr, title: "ready thing" };
+    const now = new Date(1_700_000_000_000);
+    const mailEnv = armedEnv();
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    const outcome = await notifyIssueTitleChanged(mailEnv, { issue: updated, doer, oldTitle: "WIP: draft thing" }, { now });
+    expect(outcome.outcome).toBe("enqueued");
+    const rows = await db().select().from(emailOutbox).all();
+    // The FULL source set — the repo watchers RIDE because the new title is
+    // non-WIP (resolveIssueMailRecipients' gate recomputes on it); doer 60
+    // is excluded (mail_issue.go:94-97).
+    expect(new Set(rows.map((row) => row.toAddr))).toEqual(
+      new Set(["rw@example.com", "poster@example.com", "as@example.com", "part@example.com", "iw@example.com"]),
+    );
+    for (const row of rows) {
+      expect(row.subject).toBe(`Re: [repoowner/repo] ready thing (#${pr.index})`);
+      expect(row.info).toBe(`Subject: Re: [repoowner/repo] ready thing (#${pr.index}), issue comments`);
+      expect(row.dedupeKey).toBe(`pull-ready:${pr.id}:ready_for_review:${now.getTime()}:${recipientIdOf(row)}`);
+      const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+      // The switch's dedicated case (mail_issue_common.go:303-304).
+      expect(headers["Message-ID"]).toBe(`<repoowner/repo/pulls/${pr.index}/ready/${now.getTime()}@mail.example>`);
+      expect(headers["In-Reply-To"]).toBe(`<repoowner/repo/pulls/${pr.index}@mail.example>`);
+      expect(headers["References"]).toBe(`<repoowner/repo/pulls/${pr.index}@mail.example>`);
+      expect(headers["X-Gitea-Reason"]).toBe("pull");
+      expect(headers["X-Gitea-Sender"]).toBe("doer");
+      // ActionPullRequestReadyForReview is NOT in MailParticipants' empty
+      // list (mail_issue.go:179-185): the ready line renders above the kept
+      // description.
+      expect(row.bodyHtml).toContain("<b>doer</b> marked this pull request ready for review.");
+      expect(row.bodyHtml).toContain("<p>body</p>");
+    }
+  });
+
+  it("an empty description renders the ready line alone (byte-identical to the close/reopen shape)", async () => {
+    const pr = await seedPull("WIP: lonely");
+    await env.DB.prepare("UPDATE issues SET content = '' WHERE id = ?").bind(pr.id).run();
+    const updated = { ...(await db().select().from(issues).where(eq(issues.id, pr.id)).get())!, title: "ready now" };
+    const mailEnv = armedEnv();
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    await notifyIssueTitleChanged(mailEnv, { issue: updated, doer, oldTitle: "WIP: lonely" }, {});
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      expect(row.bodyHtml).toContain("<b>doer</b> marked this pull request ready for review.");
+      expect(row.bodyHtml).not.toContain("<p>body</p>");
+    }
+  });
+
+  it("gate-offs — a plain-issue rename, a non-WIP old title, a still-WIP new title: the receiver returns before MailParticipants", async () => {
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    // Non-pull: notify.go:85's issue.IsPull conjunct.
+    const issue = await seedIssue("WIP: not a pull");
+    expect(
+      (await notifyIssueTitleChanged(armedEnv(), { issue: { ...issue, title: "renamed" }, doer, oldTitle: "WIP: not a pull" }, {})).outcome,
+    ).toBe("no-recipients");
+    // The same issue as a pull: old title not WIP → nothing; new title
+    // still WIP → nothing.
+    await env.DB.prepare("UPDATE issues SET is_pull = 1 WHERE id = ?").bind(issue.id).run();
+    const pr = (await db().select().from(issues).where(eq(issues.id, issue.id)).get())!;
+    expect(
+      (await notifyIssueTitleChanged(armedEnv(), { issue: { ...pr, title: "other" }, doer, oldTitle: "already ready" }, {})).outcome,
+    ).toBe("no-recipients");
+    expect(
+      (await notifyIssueTitleChanged(armedEnv(), { issue: { ...pr, title: "WIP: still draft" }, doer, oldTitle: "WIP: still draft" }, {})).outcome,
+    ).toBe("no-recipients");
+    expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
+  });
+
+  it("consumes to 'sent' through the landed consumer arm; MAIL off / malformed degrade like the siblings", async () => {
+    const pr = await seedPull("WIP: draft thing");
+    const mailEnv = armedEnv();
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    await notifyIssueTitleChanged(mailEnv, { issue: { ...pr, title: "ready thing" }, doer, oldTitle: "WIP: draft thing" }, {});
+    const spy = mailEnv.REPO_TASKS as unknown as { sendBodies: MailOutboxMessage[] };
+    expect(await processMailOutbox(mailEnv, spy.sendBodies[0]!)).toEqual({ kind: "sent" });
+    const off = armedEnv({ MAIL_ENABLED: "false" });
+    expect((await notifyIssueTitleChanged(off, { issue: { ...pr, title: "ready thing" }, doer, oldTitle: "WIP: draft thing" }, {})).outcome).toBe("disabled");
+    const malformed = armedEnv({ MAIL_FROM: "no address here" });
+    expect((await notifyIssueTitleChanged(malformed, { issue: { ...pr, title: "ready thing" }, doer, oldTitle: "WIP: draft thing" }, {})).outcome).toBe("misconfigured");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The IssueChangeAssignee arm (notify.go:119-127 → SendIssueAssignedMail,
+// mail_issue.go:200-232) — the one arm whose sole recipient is NOT the
+// participants resolution: the added assignee, gated and mailed directly
+// ---------------------------------------------------------------------------
+
+describe("notifyIssueAssigneeChanged — the IssueChangeAssignee receiver", () => {
+  /** A type-9 assignee comment over the seeded issue (the mail's anchor +
+   *  Message-ID comment). */
+  async function seedAssigneeComment(issueId: number, assigneeId: number, removed = false) {
+    const rows = await db()
+      .insert(comments)
+      .values({
+        type: CommentType.Assignees,
+        posterId: 60,
+        issueId,
+        assigneeId,
+        removedAssignee: removed ? 1 : 0,
+        content: "",
+        createdAt: new Date(0),
+        updatedAt: new Date(0),
+      })
+      .returning();
+    return rows[0]!;
+  }
+
+  it("the add mail: ONE row to the assignee, the assigned.tmpl line with the type-9 anchor, the /comment/<id> Message-ID, 'issue assigned' info", async () => {
+    const issue = await seedIssue();
+    const comment = await seedAssigneeComment(issue.id, 50);
+    const assignee = (await db().select().from(users).where(eq(users.id, 50)).get())!;
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    const outcome = await notifyIssueAssigneeChanged(armedEnv(), { issue, comment, doer, assignee, removed: false }, { now: new Date(1_700_000_000_000) });
+    expect(outcome.outcome).toBe("enqueued");
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.toAddr).toBe("as@example.com");
+    expect(row.subject).toBe(`Re: [repoowner/repo] ${issue.title} (#${issue.index})`);
+    // SendIssueAssignedMail's batch info (mail_issue.go:222).
+    expect(row.info).toBe(`Subject: Re: [repoowner/repo] ${issue.title} (#${issue.index}), issue assigned`);
+    expect(row.dedupeKey).toBe(`issue-assigned:${comment.id}:50`);
+    const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+    // Comment non-nil: the Message-ID carries the type-9 comment
+    // (generateMessageIDForIssue's comment branch); the thread reference
+    // stays plain (generated with ActionType(0)).
+    expect(headers["Message-ID"]).toBe(`<repoowner/repo/issues/${issue.index}/comment/${comment.id}@mail.example>`);
+    expect(headers["In-Reply-To"]).toBe(`<repoowner/repo/issues/${issue.index}@mail.example>`);
+    expect(headers["References"]).toBe(`<repoowner/repo/issues/${issue.index}@mail.example>`);
+    expect(headers["X-Gitea-Recipient"]).toBe("assignee");
+    expect(headers["X-Gitea-Sender"]).toBe("doer");
+    expect(headers["X-Gitea-Reason"]).toBe("issue");
+    // assigned.tmpl's locale line — NO <b> wrapper, the single-quoted
+    // HTMLFormat anchors, the #issuecomment anchor riding .Link.
+    expect(row.bodyHtml).toContain(
+      `doer assigned you to issue <a href='https://mail.example/repoowner/repo/issues/${issue.index}#issuecomment-${comment.id}'>#${issue.index}</a> in repository <a href='https://mail.example/repoowner/repo'>repoowner/repo</a>.`,
+    );
+    expect(row.bodyHtml).not.toContain("<b>doer</b>");
+    expect(row.bodyHtml).not.toContain("<p>body</p>");
+  });
+
+  it("the pull twin: 'assigned you to pull request', the /pulls/ path and the pull reason", async () => {
+    const issue = await seedIssue();
+    await env.DB.prepare("UPDATE issues SET is_pull = 1 WHERE id = ?").bind(issue.id).run();
+    const fresh = (await db().select().from(issues).where(eq(issues.id, issue.id)).get())!;
+    const comment = await seedAssigneeComment(issue.id, 50);
+    const assignee = (await db().select().from(users).where(eq(users.id, 50)).get())!;
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    await notifyIssueAssigneeChanged(armedEnv(), { issue: fresh, comment, doer, assignee, removed: false }, {});
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows).toHaveLength(1);
+    const headers = JSON.parse(rows[0]!.headers ?? "{}") as Record<string, string>;
+    expect(headers["X-Gitea-Reason"]).toBe("pull");
+    expect(headers["Message-ID"]).toBe(`<repoowner/repo/pulls/${issue.index}/comment/${comment.id}@mail.example>`);
+    expect(rows[0]!.bodyHtml).toContain("doer assigned you to pull request <a href='");
+  });
+
+  it("the receiver gates — removed, self-assign, disabled preference, non-mailable mail NOTHING; onmention PASSES (notify.go:121's only-disabled gate)", async () => {
+    const issue = await seedIssue();
+    const comment = await seedAssigneeComment(issue.id, 50);
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    const assignee = (await db().select().from(users).where(eq(users.id, 50)).get())!;
+    const env0 = armedEnv();
+    expect((await notifyIssueAssigneeChanged(env0, { issue, comment, doer, assignee, removed: true }, {})).outcome).toBe("no-recipients");
+    expect((await notifyIssueAssigneeChanged(env0, { issue, comment, doer, assignee: doer, removed: false }, {})).outcome).toBe("no-recipients");
+    await db().insert(userSettings).values({ userId: 50, emailNotificationsPreference: "disabled" });
+    expect((await notifyIssueAssigneeChanged(env0, { issue, comment, doer, assignee, removed: false }, {})).outcome).toBe("no-recipients");
+    await db().delete(userSettings).where(eq(userSettings.userId, 50));
+    // Non-mailable: the SendIssueAssignedMail langMap filter (frozen 96).
+    const frozen = (await db().select().from(users).where(eq(users.id, 96)).get())!;
+    expect((await notifyIssueAssigneeChanged(env0, { issue, comment, doer, assignee: frozen, removed: false }, {})).outcome).toBe("no-recipients");
+    // onmention is NOT disabled — the assigned mail reaches them (the
+    // participants prefilter's enabled/andyourown rule does NOT apply here).
+    const mentioner = (await db().select().from(users).where(eq(users.id, 80)).get())!;
+    expect(
+      (await notifyIssueAssigneeChanged(env0, { issue, comment, doer, assignee: mentioner, removed: false }, {})).outcome,
+    ).toBe("enqueued");
+    expect((await db().select().from(emailOutbox).all()).map((r) => r.toAddr)).toEqual(["om@example.com"]);
+  });
+
+  it("consumes to 'sent'; MAIL off / malformed degrade like the siblings", async () => {
+    const issue = await seedIssue();
+    const comment = await seedAssigneeComment(issue.id, 50);
+    const assignee = (await db().select().from(users).where(eq(users.id, 50)).get())!;
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    const mailEnv = armedEnv();
+    await notifyIssueAssigneeChanged(mailEnv, { issue, comment, doer, assignee, removed: false }, {});
+    const spy = mailEnv.REPO_TASKS as unknown as { sendBodies: MailOutboxMessage[] };
+    expect(await processMailOutbox(mailEnv, spy.sendBodies[0]!)).toEqual({ kind: "sent" });
+    const off = armedEnv({ MAIL_ENABLED: "false" });
+    expect((await notifyIssueAssigneeChanged(off, { issue, comment, doer, assignee, removed: false }, {})).outcome).toBe("disabled");
+    const malformed = armedEnv({ MAIL_FROM: "no address here" });
+    expect((await notifyIssueAssigneeChanged(malformed, { issue, comment, doer, assignee, removed: false }, {})).outcome).toBe("misconfigured");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The service-level emit sites — IssuesService.createIssue / createPullRequest
 // / closeIssue / reopenIssue (upstream fires from the model layer; the router
 // never does)
@@ -847,5 +1138,187 @@ describe("IssuesService notify arms — createIssue + close/reopen emits", () =>
     await service.closeIssue(issue.id, { actorId: null });
     expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
     expect((mailEnv.REPO_TASKS as unknown as { sends: number }).sends).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The slice-five emit sites — IssuesService.changeTitle (upstream
+// ChangeTitle, issue.go:127) and IssuesService.changeAssignees (upstream
+// UpdateAssignees' post-tx notify loops, assignee.go:155-166)
+// ---------------------------------------------------------------------------
+
+describe("IssuesService notify arms — changeTitle + changeAssignees emits", () => {
+  it("changeTitle through an armed service: the WIP → ready rename lands pull-ready rows; a plain rename lands nothing", async () => {
+    const bare = new IssuesService(env.DB);
+    await seedRepo();
+    await db().insert(repoWatchers).values({ repoId: REPO_ID, userId: 20 });
+    const { issue } = await bare.createPullRequest({
+      repoId: REPO_ID,
+      title: "WIP: draft",
+      content: "desc",
+      posterId: 10,
+      headRepoId: REPO_ID,
+      baseBranch: "main",
+      headBranch: "topic",
+    });
+    const now = new Date(1_700_000_000_000);
+    const armed = new IssuesService(env.DB, armedEnv());
+    const updated = await armed.changeTitle(issue, "ready thing", 60, now);
+    expect(updated?.title).toBe("ready thing");
+    let rows = await db().select().from(emailOutbox).all();
+    // Watcher 20 + poster 10 (the doer 60 is excluded); the write itself
+    // (title + the type-10 comment) is changeIssueTitle's, untouched.
+    expect(new Set(rows.map((row) => row.toAddr))).toEqual(new Set(["rw@example.com", "poster@example.com"]));
+    for (const row of rows) {
+      expect(row.dedupeKey).toBe(`pull-ready:${issue.id}:ready_for_review:${now.getTime()}:${recipientIdOf(row)}`);
+      expect(row.bodyHtml).toContain("<b>doer</b> marked this pull request ready for review.");
+    }
+    // A rename with NO WIP transition (either direction non-WIP → non-WIP)
+    // mails nothing.
+    const before = rows.length;
+    await armed.changeTitle(updated!, "other thing", 60, new Date(1_700_000_100_000));
+    rows = await db().select().from(emailOutbox).all();
+    expect(rows).toHaveLength(before);
+  });
+
+  it("changeAssignees through an armed service: each add lands issue-assigned (the webhook emitter still rides the same receiver); removals mail nothing", async () => {
+    const bare = new IssuesService(env.DB);
+    await seedRepo();
+    const issue = await bare.createIssue({ repoId: REPO_ID, title: "assigned", content: null, posterId: 10 });
+    const mailEnv = armedEnv();
+    const armed = new IssuesService(env.DB, mailEnv);
+    const found = {
+      repo: (await db().select().from(repositories).where(eq(repositories.id, REPO_ID)).get())!,
+      owner: (await db().select().from(users).where(eq(users.id, 1)).get())!,
+    };
+    const events: Array<[number, boolean]> = [];
+    // The actor (60) differs from the assignee (20) — upstream's
+    // doer.ID != assignee.ID gate keeps a self-assignment silent.
+    await armed.changeAssignees(found, issue, ["repowatcher"], { id: 60, isAdmin: false }, (user, removed) => {
+      events.push([user.id, removed]);
+    });
+    // Upstream's post-tx notify order: the webhook emitter runs, then the
+    // mail arm (both IssueChangeAssignee receivers).
+    expect(events).toEqual([[20, false]]);
+    let rows = await db().select().from(emailOutbox).all();
+    expect(rows.map((row) => row.toAddr)).toEqual(["rw@example.com"]);
+    expect(rows[0]!.dedupeKey).toMatch(new RegExp(`^issue-assigned:\\d+:20$`));
+    expect(rows[0]!.bodyHtml).toContain("doer assigned you to issue <a href='");
+    // The removal arm: the receiver gates it (notify.go:121's !removed) —
+    // the webhook still fires, the outbox does not grow.
+    await armed.changeAssignees(found, issue, [], { id: 60, isAdmin: false }, (user, removed) => {
+      events.push([user.id, removed]);
+    });
+    expect(events).toEqual([
+      [20, false],
+      [20, true],
+    ]);
+    rows = await db().select().from(emailOutbox).all();
+    expect(rows.map((row) => row.toAddr)).toEqual(["rw@example.com"]);
+    // A no-op set (already empty) notifies nothing.
+    await armed.changeAssignees(found, issue, [], { id: 60, isAdmin: false }, (user, removed) => {
+      events.push([user.id, removed]);
+    });
+    expect(events).toHaveLength(2);
+    expect((mailEnv.REPO_TASKS as unknown as { sends: number }).sends).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The mentions batch (mail_issue.go:99-102 + :135-137 — SPEC §13's lift of
+// the §8.2 reduction). Mentions arrive RESOLVED (services/mentions —
+// upstream's FindAndUpdateIssueMentions in the write service), ride FIRST
+// in the union (the mention batch mails before the participants batch),
+// unlock the onmention preference for their own ids, and dodge only the
+// POST-batch visited joins — explicit issue-unwatchers — while ignorers and
+// the doer (batch-1 visited) still exclude.
+// ---------------------------------------------------------------------------
+
+describe("resolveIssueMailRecipients — the mentions batch (SPEC §13)", () => {
+  const userOf = async (id: number) => (await db().select().from(users).where(eq(users.id, id)).get())!;
+  const doerOf = () => userOf(60);
+  const repoOf = async () => (await db().select().from(repositories).where(eq(repositories.id, REPO_ID)).get())!;
+
+  it("a mention rides FIRST and unlocks the onmention preference (mail_issue.go:99-102, :135-137)", async () => {
+    const issue = await seedIssue();
+    const recipients = await resolveIssueMailRecipients(env.DB, {
+      issue,
+      repo: await repoOf(),
+      doer: await doerOf(),
+      mentions: [await userOf(80)],
+    });
+    // 80 heads the order (the mention batch), then the batch-2 sources —
+    // watcher 20, poster 10, assignee 50, participant 40, issue watcher 30
+    // (70 explicit unwatch, 95 org, 96 prohibited stay out). 80's onmention
+    // preference passes ONLY because they are mentioned.
+    expect(recipients.map((u) => u.id)).toEqual([80, 20, 10, 50, 40, 30]);
+  });
+
+  it("an onmention user named in the mentions param only — a different mention does not lift them (:137 fromMention is the batch flag)", async () => {
+    const issue = await seedIssue();
+    const recipients = await resolveIssueMailRecipients(env.DB, {
+      issue,
+      repo: await repoOf(),
+      doer: await doerOf(),
+      mentions: [await userOf(90)],
+    });
+    // 90 is mentioned (enabled pref, no source — comes in via the mention
+    // batch); 80's onmention preference has neither a custom watch nor the
+    // mention and stays out.
+    expect(recipients.map((u) => u.id)).toEqual([90, 20, 10, 50, 40, 30]);
+  });
+
+  it("a mentioned explicit issue-unwatcher still receives the mention mail (visited joins AFTER the mention batch, :104-109)", async () => {
+    const issue = await seedIssue();
+    const recipients = await resolveIssueMailRecipients(env.DB, {
+      issue,
+      repo: await repoOf(),
+      doer: await doerOf(),
+      mentions: [await userOf(70)],
+    });
+    // 70 is the seeded explicit unwatcher (is_watching=false) AND a repo
+    // watcher source — the mention batch mails them before the unwatcher
+    // block joins visited; the batch-2 pass then visits them (one mail).
+    expect(recipients.map((u) => u.id)).toEqual([70, 20, 10, 50, 40, 30]);
+  });
+
+  it("a mentioned doer stays excluded (the doer join precedes the mention batch, :94-97)", async () => {
+    const issue = await seedIssue();
+    const recipients = await resolveIssueMailRecipients(env.DB, {
+      issue,
+      repo: await repoOf(),
+      doer: await doerOf(),
+      mentions: [await doerOf()],
+    });
+    expect(recipients.map((u) => u.id)).toEqual([20, 10, 50, 40, 30]);
+  });
+
+  it("end to end: addComment('@onmention …') lands the onmention user the FIRST row (comments.go:81's threading)", async () => {
+    const issue = await seedIssue();
+    const mailEnv = armedEnv();
+    const service = new IssuesService(env.DB, mailEnv);
+    await service.addComment({ issueId: issue.id, posterId: 60, content: "hey @onmention take a look" });
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows.map((row) => row.toAddr)).toEqual([
+      "om@example.com", // the mention, first
+      "rw@example.com",
+      "poster@example.com",
+      "as@example.com",
+      "part@example.com",
+      "iw@example.com",
+    ]);
+    expect(rows[0]!.dedupeKey).toMatch(/^issue-comment:\d+:80$/);
+  });
+
+  it("end to end: a mention inside a code span does NOT resolve (the parser's code exclusion rides the emit)", async () => {
+    const issue = await seedIssue();
+    const mailEnv = armedEnv();
+    const service = new IssuesService(env.DB, mailEnv);
+    await service.addComment({ issueId: issue.id, posterId: 60, content: "see `@onmention` literal" });
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows.map((row) => row.toAddr)).toEqual(
+      expect.arrayContaining(["rw@example.com", "poster@example.com"]),
+    );
+    expect(rows.map((row) => row.toAddr)).not.toContain("om@example.com");
   });
 });
