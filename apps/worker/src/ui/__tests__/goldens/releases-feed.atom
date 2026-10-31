@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Releases for alice/golden</title>
+  <id>https://test.local/alice/golden/release</id>
+  <updated>2023-11-14T22:13:20Z</updated>
+  <link href="https://test.local/alice/golden/release"></link>
+  <entry>
+    <title>Golden v1</title>
+    <updated>2023-11-14T22:14:50Z</updated>
+    <id>1: https://test.local/alice/golden/releases/tag/v1</id>
+    <content type="html">&lt;p&gt;First golden release.&lt;/p&gt;&#xA;&lt;p&gt;Ships the &lt;strong&gt;seed&lt;/strong&gt; fixtures.&lt;/p&gt;&#xA;</content>
+    <link href="https://test.local/alice/golden/releases/tag/v1" rel="alternate"></link>
+    <author>
+      <name>alice</name>
+    </author>
+  </entry>
+</feed>

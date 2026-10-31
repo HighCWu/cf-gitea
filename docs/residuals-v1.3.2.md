@@ -765,20 +765,22 @@ board rows now.
    Size: **S** (manual smoke + guide/spec sync).
 
 2. **The ROUTE_CLOCK seam's remaining candidates.** The seam un-skipped
-   the admin-monitor-cron golden (`df348c8`); the wallclock audit's
-   follow-up list names what is left
+   the admin-monitor-cron golden (`df348c8`) and made the feed XML goldens
+   landable; the wallclock audit's follow-up list tracks the family
    (`docs/research/render-wallclock-audit.md` §Recommended follow-ups):
-   (a) the harness route-clock hop for the feed XML goldens — the loaders
-   take `now` but the `ui/index.ts` call sites hardcode `new Date()`
-   (releases/tags/user atom+rss); (b) the API-tier route clocks (`toApiCron`
-   in `api/routes/admin-degenerate.ts:339`, the heatmap minute-cutoffs) —
-   only if API JSON goldens ever land; (c) the class-(c) stored-object
-   writers: `wikiPerson`'s clock into wiki commits and the
-   `mergePerson`/`mergePersonOf` twins ignoring `MergeInput.now` — needs
-   engine-level object writes, "a wave of its own". The artifacts-preview
-   page clock LANDED in v1.3.1 (`74df9ad`, the ARTIFACT_PREVIEW_CLOCK seam
-   + the signed-URL tail golden) and is no longer a candidate. Sizes:
-   (a) **S**, (b) **S**, (c) **M**.
+   (a) the harness route-clock hop for the feed XML goldens — LANDED
+   <pending> (the orchestrator fills the landing hash): the `ui/index.ts`
+   call sites read `routeNow()` (`df348c8`), the RSS trio landed as
+   `abd512f`, and the `.atom` twins (releases/tags/user) closed the audit's
+   list — six route-driven feed goldens over the pinned clock; (b) the
+   API-tier route clocks (`toApiCron` in `api/routes/admin-degenerate.ts:339`,
+   the heatmap minute-cutoffs) — only if API JSON goldens ever land; (c) the
+   class-(c) stored-object writers: `wikiPerson`'s clock into wiki commits
+   and the `mergePerson`/`mergePersonOf` twins ignoring `MergeInput.now` —
+   needs engine-level object writes, "a wave of its own". The
+   artifacts-preview page clock LANDED in v1.3.1 (`74df9ad`, the
+   ARTIFACT_PREVIEW_CLOCK seam + the signed-URL tail golden) and is no
+   longer a candidate. Sizes: (a) — (landed), (b) **S**, (c) **M**.
 
 3. **The cleanup-rule preview's PackageID-filter upgrade note.** Upstream's
    preview pins per-package `SearchVersions{PackageID}`; the landed page
@@ -941,6 +943,22 @@ board rows now.
     repo carries code); reactions' 403-class narrowing is out of scope.
     Each is a small arm on the landed gate; the IsEmpty piece is the
     staged one. Sizes: **S** each.
+
+16. **The SPEC-0016 long-tail `go` family — LANDED (2026-10-31, the
+    registry carries TWELVE protocols).** The Go module proxy protocol
+    (`routers/api/packages/goproxy/goproxy.go` + `modules/packages/
+    goproxy/metadata.go` at the pin): the five read arms (`@latest`,
+    `@v/list`, `.info`/`.mod`/`.zip`) + `PUT /go/upload` + the sumdb probe
+    404, the x/mod/semver.IsValid version gate (pseudo-versions are
+    canonical semver with a prerelease), the go.mod text as a version
+    property, no new tables. Verified live with a real `go` client (mod
+    download + unpinned `go get` via `@latest`, the go.sum h1 equals
+    x/mod dirhash over our zip); suite 22/22, neighbors 58/58, check:api
+    PASS. The as-built (endpoint map, the 404/410 posture, reductions,
+    both live batteries) is `specs/0016-packages.md`'s go section. This
+    narrows the §2.1 long-tail row to conan/composer/chef/conda/cran/pub/
+    rubygems/swift/terraform/vagrant — still demand-driven, no new queue
+    entries opened. Size: — (resolved).
 
 ---
 

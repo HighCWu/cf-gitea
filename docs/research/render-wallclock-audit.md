@@ -38,15 +38,14 @@ Classes:
 
 ## Golden surfaces this unlocks
 
-- **admin-monitor cron golden** (still skipped in
-  `src/ui/__tests__/goldens.test.ts`): the loader seam already existed — the
-  remaining hop is the route call site in `ui/index.ts` passing `new Date()`.
-  Unlocking it needs a route-level clock override in the golden harness — an
-  index.ts-owned change (see follow-ups).
+- **admin-monitor cron golden** (LANDED `df348c8` — no longer skipped): the
+  loader seam already existed; the route call site now reads the harness
+  route clock (follow-up 1), so the Next Time column pins under
+  `__setRouteClockForTests` through the real route.
 - **Feed goldens** (`/{owner}/{repo}/releases.rss|.atom`, `tags.rss|.atom`,
-  `/{owner}/atom`): the three loaders now accept a pinned clock, so a
-  loader+renderer-direct golden (not going through `ui/index.ts`) can pin the
-  full document bytes; route-driven goldens still need the harness clock.
+  `/{owner}/atom`) — LANDED: the RSS trio (`abd512f`) and the `.atom` twins
+  (the P3-2(a) closure) render through the real routes under the same
+  pinned clock, all six envelopes fixture bytes.
 - **Profile-activity-style goldens without the post-hoc UPDATE**: the
   emitter seam lets any suite driving `emitIssueEvent` pin the action-row
   stamps at write time (proven by the new now-arm in
@@ -59,11 +58,17 @@ Classes:
 
 ## Recommended follow-ups (not in this wave)
 
-1. **Golden-harness route clock (index.ts-owned).** The three golden skips
-   converge on `ui/index.ts` call sites hardcoding `new Date()`. A harness
-   clock override (e.g. a test-only binding or route-context field the
-   handlers read) unlocks the admin-monitor cron golden AND route-driven feed
-   goldens in one move. Needs care: no request-visible surface change.
+1. **Golden-harness route clock (index.ts-owned) — LANDED <pending> (the
+   orchestrator fills the landing hash).** The three golden skips converged
+   on `ui/index.ts` call sites hardcoding `new Date()`. Landed as the
+   module-scope, test-only `ROUTE_CLOCK` + `__setRouteClockForTests` seam
+   (`routeNow()`, null = exact wall clock — no request-visible surface
+   change): the admin-monitor cron golden un-skipped (`df348c8`), the feed
+   XML goldens landed on the same seam (RSS trio `abd512f`; the `.atom`
+   twins — `releases.atom`, `tags.atom`, `/{owner}.atom`, the audit's list
+   here — the P3-2(a) closure). The admin-monitor-cron golden's CURRENT
+   red is a later landing's stale fixture (`a63adfb` landed the per-row
+   Run buttons without regenerating it), not this seam.
 2. **Wiki fixed-time object writer (sized, NOT implemented).** `applyWikiChanges`
    stamps `wikiPerson`'s clock into stored commits; a fixed-time variant would
    (i) thread `now?: Date` through the wiki service write API

@@ -82,14 +82,16 @@ import {
 export const ADMIN_GOLDEN_REPO_ID = "00000000-0000-4000-8000-000000000001";
 
 /** Committed golden bytes, read through Vite's `?raw` transform (byte-exact;
- *  typing in raw-modules.d.ts). Two globs merged: the HTML page goldens AND
- *  the wave-golden-feeds XML envelopes (goldens/*.rss — the .rss extension
- *  is the content-honest label for the three feed goldens, and the glob arm
- *  is the ONE harness adaptation their non-HTML content type needed: the
- *  marker/update machinery itself is content-type-blind text extraction). */
+ *  typing in raw-modules.d.ts). Three globs merged: the HTML page goldens AND
+ *  the wave-golden-feeds XML envelopes (goldens/*.rss + goldens/*.atom — the
+ *  extensions are the content-honest labels for the feed goldens, RSS and
+ *  Atom twins per surface, and the glob arms are the ONE harness adaptation
+ *  their non-HTML content type needed: the marker/update machinery itself is
+ *  content-type-blind text extraction). */
 const goldenBodies: Record<string, string> = {
   ...import.meta.glob("./goldens/*.html", { query: "?raw", import: "default", eager: true }),
   ...import.meta.glob("./goldens/*.rss", { query: "?raw", import: "default", eager: true }),
+  ...import.meta.glob("./goldens/*.atom", { query: "?raw", import: "default", eager: true }),
 };
 
 /** Update mode = the regeneration script's sentinel file is present. The mjs
@@ -1369,6 +1371,10 @@ const CRON_PINNED_NEXT_TIME = "Nov 14, 2023 22:20:00";
  *  `<pubDate>` (formatRfc1123z(T0) — 2023-11-14 was a Tuesday). */
 const FEED_PINNED_CHANNEL_STAMP = "Tue, 14 Nov 2023 22:13:20 +0000";
 
+/** The same pinned clock in the Atom envelope's format — formatRfc3339(T0),
+ *  the `<updated>` channel stamp the .atom twins render. */
+const FEED_PINNED_CHANNEL_STAMP_ATOM = "2023-11-14T22:13:20Z";
+
 describe("admin-monitor-cron golden (the wave-route-clock closure)", () => {
   it("renders admin-monitor-cron.html byte-identical (200) under the pinned route clock", async () => {
     __setRouteClockForTests(() => new Date(T0 * 1000));
@@ -1420,18 +1426,25 @@ describe("route-clock override arm (set/unset behavior)", () => {
   it("the pin reaches the feed routes' channel stamps (the loader-default hop closed)", async () => {
     // The feed loaders defaulted `now` internally; the route call sites now
     // forward the route clock, so the CHANNEL stamp (not the seeded item
-    // stamps) pins: releases.rss under T0 renders the fixed RFC-1123 literal.
+    // stamps) pins: releases.rss under T0 renders the fixed RFC-1123 literal,
+    // and the .atom twin proves the same hop through the family's other
+    // serializer arm (the RFC-3339 `<updated>` form).
     __setRouteClockForTests(() => new Date(T0 * 1000));
     let rss: string;
+    let atom: string;
     try {
       rss = (await renderRoute("/alice/golden/releases.rss")).html;
+      atom = (await renderRoute("/alice/golden/releases.atom")).html;
     } finally {
       __setRouteClockForTests(null);
     }
     expect(rss).toContain(FEED_PINNED_CHANNEL_STAMP);
+    expect(atom).toContain(FEED_PINNED_CHANNEL_STAMP_ATOM);
 
     const liveRss = (await renderRoute("/alice/golden/releases.rss")).html;
     expect(liveRss).not.toContain(FEED_PINNED_CHANNEL_STAMP);
+    const liveAtom = (await renderRoute("/alice/golden/releases.atom")).html;
+    expect(liveAtom).not.toContain(FEED_PINNED_CHANNEL_STAMP_ATOM);
   });
 });
 
@@ -1572,33 +1585,54 @@ describe("artifact-preview page-clock override arm (set/unset behavior)", () => 
  *     with the smokes (the envelope's one golden needs the seeded-join
  *     posture to stay deterministic).
  *
+ * The .atom twins (the P3-2(a) closure — the audit's feed list named both
+ * tails, `releases.rss|.atom` / `tags.rss|.atom` / `/{owner}/atom`, and
+ * abd512f landed the RSS half only): each atom golden renders the SAME
+ * loader output through the family's `render*FeedAtom` — identical channel
+ * fields and items, so every determinism argument above transfers
+ * verbatim; only the gorilla WriteAtom envelope shape differs (the
+ * `<feed>` root, RFC-3339 stamps — the channel's is
+ * FEED_PINNED_CHANNEL_STAMP_ATOM, the same pinned clock in the other
+ * format — `<id>` as the channel link, the empty-description subtitle
+ * drop, `<content type="html">` escaping instead of CDATA, the item
+ * `<summary>` only where the projection sets a description — the user
+ * feed's create_repo rows set none). Upstream renders both tails through
+ * ONE `writeFeed` helper (profile.go:91-104) — the twins are the port's
+ * own two serializer arms over the same Feed struct, so pairing them on
+ * one fixture set is upstream's own shape, not a convenience reduction.
+ *
  * XML-harness notes (the wave brief's non-HTML check):
- *   - The committed files carry the content-honest `.rss` extension;
- *     goldens.test.ts owns the `?raw` read, so the goldenBodies glob above
- *     grew the `./goldens/*.rss` arm. Nothing else assumed HTML:
+ *   - The committed files carry the content-honest `.rss`/`.atom`
+ *     extensions; goldens.test.ts owns the `?raw` read, so the
+ *     goldenBodies glob above grew the `./goldens/*.rss` and
+ *     `./goldens/*.atom` arms. Nothing else assumed HTML:
  *     renderCase/renderRoute compare body TEXT (res.text()), and
  *     update-goldens.mjs is marker-based text extraction — no HTML
  *     parsing anywhere in the harness.
  *   - Known caveat (update-goldens.mjs is OUTSIDE this wave's ownership):
- *     the script enumerates/empties `goldens/*.html` only. `.rss` goldens
- *     are written through the union with the rendered marker names, so
- *     regeneration works, but a case REMOVED from FEED_GOLDEN_CASES leaves
- *     its stale file behind without the loud no-render failure the .html
- *     enumeration provides. The orchestrator should extend the script's
- *     `.html` filter when convenient.
+ *     the script enumerates/empties `goldens/*.html` only. `.rss`/`.atom`
+ *     goldens are written through the union with the rendered marker
+ *     names, so regeneration works, but a case REMOVED from
+ *     FEED_GOLDEN_CASES leaves its stale file behind without the loud
+ *     no-render failure the .html enumeration provides. The `.rss` arm
+ *     was taken post-abd512f (19d15a1); the `.atom` arm rides the same
+ *     one-line pattern.
  *   - Content-type determinism: the goldens assert the BODY (the envelope
- *     bytes); the a11y EXPANSION_ARMS are NOT applicable to these three —
+ *     bytes); the a11y EXPANSION_ARMS are NOT applicable to these six —
  *     that suite parses goldens as HTML DOM trees (landmarks/headings/
- *     table-header rules) and RSS envelopes carry none of those structures,
- *     so no arms are declared for them in a11y.test.ts (the file is outside
- *     this wave's ownership anyway; its per-file `?raw` imports never see
- *     `.rss` names). The route's content-type header choice is pinned
- *     separately below (the gorilla writeFeed strings).
+ *     table-header rules) and RSS/Atom envelopes carry none of those
+ *     structures, so no arms are declared for them in a11y.test.ts (the
+ *     file is outside this wave's ownership anyway; its per-file `?raw`
+ *     imports never see the XML names). The route's content-type header
+ *     choice is pinned separately below (the gorilla writeFeed strings).
  */
 const FEED_GOLDEN_CASES: GoldenCase[] = [
   { file: "user-feed-alice.rss", path: "/alice.rss", status: 200, signedIn: true },
   { file: "releases-feed.rss", path: "/alice/golden/releases.rss", status: 200 },
   { file: "tags-feed.rss", path: "/alice/golden/tags.rss", status: 200 },
+  { file: "user-feed-alice.atom", path: "/alice.atom", status: 200, signedIn: true },
+  { file: "releases-feed.atom", path: "/alice/golden/releases.atom", status: 200 },
+  { file: "tags-feed.atom", path: "/alice/golden/tags.atom", status: 200 },
 ];
 
 describe("feed goldens (the wave-golden-feeds closures)", () => {
@@ -1618,7 +1652,7 @@ describe("feed goldens (the wave-golden-feeds closures)", () => {
     });
   }
 
-  it("serves the gorilla writeFeed content types on all three feed routes", async () => {
+  it("serves the gorilla writeFeed content types on all six feed routes", async () => {
     // The case table pins the envelope BYTES; this pins the ROUTE's
     // content-type header choice (index.ts's per-family dispatch) — the
     // one non-body byte the XML surfaces carry that a body golden cannot
@@ -1628,6 +1662,9 @@ describe("feed goldens (the wave-golden-feeds closures)", () => {
       ["/alice.rss", "application/rss+xml;charset=utf-8"],
       ["/alice/golden/releases.rss", "application/rss+xml;charset=utf-8"],
       ["/alice/golden/tags.rss", "application/rss+xml;charset=utf-8"],
+      ["/alice.atom", "application/atom+xml;charset=utf-8"],
+      ["/alice/golden/releases.atom", "application/atom+xml;charset=utf-8"],
+      ["/alice/golden/tags.atom", "application/atom+xml;charset=utf-8"],
     ] as const) {
       const res = await uiRouter.fetch(new Request(`https://test.local${path}`), uiEnv);
       expect(res.headers.get("content-type"), path).toBe(contentType);

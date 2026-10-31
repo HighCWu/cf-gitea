@@ -31,9 +31,12 @@ const goldensDir = join(here, "goldens");
 const sentinel = join(here, "goldens-update-mode");
 const workerDir = join(here, "..", "..", "..");
 
-// .html + the .rss feed envelopes (abd512f): a removed case must go loud
-// (the sentinel walk), never leave a stale file the tests still read whole.
-const goldenFiles = readdirSync(goldensDir).filter((name) => name.endsWith(".html") || name.endsWith(".rss"));
+// .html + the .rss/.atom feed envelopes (abd512f / the .atom twins, 19d15a1's
+// one-line pattern): a removed case must go loud (the sentinel walk), never
+// leave a stale file the tests still read whole.
+const goldenFiles = readdirSync(goldensDir).filter(
+  (name) => name.endsWith(".html") || name.endsWith(".rss") || name.endsWith(".atom"),
+);
 for (const name of goldenFiles) {
   writeFileSync(join(goldensDir, name), "");
 }

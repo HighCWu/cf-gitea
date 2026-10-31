@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Feed of &#34;alice&#34;</title>
+  <id>https://test.local/alice</id>
+  <updated>2023-11-14T22:13:20Z</updated>
+  <link href="https://test.local/alice"></link>
+  <entry>
+    <title>alice created repository &lt;a href=&#34;https://test.local/alice/golden-ms&#34;&gt;alice/golden-ms&lt;/a&gt;</title>
+    <updated>2023-11-14T22:13:20Z</updated>
+    <id>3: https://test.local/alice/golden-ms</id>
+    <link href="https://test.local/alice/golden-ms" rel="alternate"></link>
+    <author>
+      <name>alice</name>
+    </author>
+  </entry>
+  <entry>
+    <title>alice created repository &lt;a href=&#34;https://test.local/alice/golden-alt&#34;&gt;alice/golden-alt&lt;/a&gt;</title>
+    <updated>2023-11-14T22:13:20Z</updated>
+    <id>2: https://test.local/alice/golden-alt</id>
+    <link href="https://test.local/alice/golden-alt" rel="alternate"></link>
+    <author>
+      <name>alice</name>
+    </author>
+  </entry>
+  <entry>
+    <title>alice created repository &lt;a href=&#34;https://test.local/alice/golden&#34;&gt;alice/golden&lt;/a&gt;</title>
+    <updated>2023-11-14T22:13:20Z</updated>
+    <id>1: https://test.local/alice/golden</id>
+    <link href="https://test.local/alice/golden" rel="alternate"></link>
+    <author>
+      <name>alice</name>
+    </author>
+  </entry>
+</feed>
