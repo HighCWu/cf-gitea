@@ -30,12 +30,15 @@
  * seat arithmetic; the mark-read consumer of `is_read`
  * (UpdateIssueUserByRead, issue_user.go:58-61) is UPDATE-only, so these
  * seeded seats are what make a later read-tracking write land at all.
+ * That read-tracking write is `setIssueReadBy` below — the §13.4 mark-read
+ * arm (the view seam + the API merge), added AFTER this module landed
+ * (disclosed additive hunk, specs/email-outbound.md §13.4).
  */
 
 import { and, asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { issueUsers } from "../../db/schema";
+import { issueUsers, notificationStates } from "../../db/schema";
 import type { UserRow } from "../../api/services/repository";
 
 /**
@@ -116,4 +119,58 @@ export async function seedIssueUsers(
   await drizzle(d1)
     .insert(issueUsers)
     .values(rows.map((row) => ({ ...row, issueId })));
+}
+
+/**
+ * `SetIssueReadBy` (models/activities/notification.go:338-343) — the
+ * mark-read write both of the §13.4 surfaces ride (specs/email-outbound.md):
+ * the signed issue/PR page VIEW (routers/web/repo/issue_view.go:386-391 and
+ * the PR twin pull.go:150-155, both `ctx.IsSigned`-gated, issue ID + doer
+ * ID) and the API MERGE (routers/api/v1/repo/pull.go:909-914 — the merging
+ * doer, never the poster or a reviewer). Upstream composes TWO halves in
+ * one call and both of ours stamp both:
+ *
+ *   1. `UpdateIssueUserByRead` (models/issues/issue_user.go:58-61): the
+ *      UPDATE-only `is_read` flip over the `(uid, issue_id)` arbiter. A
+ *      viewer without a NewIssueUsers seat (the seed above) matches zero
+ *      rows — no error, no row, exactly upstream's bare UPDATE semantics;
+ *      the seeded seats are what make this half land at all.
+ *   2. `setIssueNotificationStatusReadIfUnread` (notification.go:346-362):
+ *      the notification-status twin. Upstream's half is materialized-row
+ *      shaped — a GetIssueNotification miss no-ops, Pinned/Read statuses
+ *      no-op, only Unread→Read writes. Our mailbox derives the same answer
+ *      from `notification_states` (unread iff lastActivity > readAtUnix;
+ *      later activity re-marks unread with no write-path hook), so the
+ *      §13.4 decision note's compatible stamp is `read_at_unix = now` —
+ *      an upsert over the same `(user_id, issue_id)` key the mark
+ *      endpoints write (routes/notifications.ts markThreads' shape), with
+ *      the divergence that keeps upstream's semantics: the conflict update
+ *      sets ONLY the read marker + updatedAt, never `pinned` (upstream's
+ *      view stamp skips Pinned rows untouched — only SetNotificationStatus,
+ *      the endpoints' whole-status replace, clears a pin). A fresh row
+ *      inserts around the column defaults; a state row for a mailbox
+ *      non-recipient is inert (threads derive from the recipient
+ *      predicate — the states only join).
+ *
+ * Upstream's bool result ("the unread count actually decreased, so callers
+ * can skip a push on no-op", notification.go:336-337) has no consumer at
+ * the pin's three call sites and none in this tree — dropped.
+ */
+export async function setIssueReadBy(d1: D1Database, issueId: number, userId: number, now: Date): Promise<void> {
+  const db = drizzle(d1);
+  const readAtUnix = Math.floor(now.getTime() / 1000);
+  await db
+    .update(issueUsers)
+    .set({ isRead: true })
+    .where(and(eq(issueUsers.userId, userId), eq(issueUsers.issueId, issueId)));
+  await db
+    .insert(notificationStates)
+    .values({ userId, issueId, readAtUnix, updatedAt: now })
+    .onConflictDoUpdate({
+      target: [notificationStates.userId, notificationStates.issueId],
+      // The view stamp never clears a pin (notification.go:351-353 — only
+      // Unread→Read; the mark endpoints' `pinned: false` is SetNotification
+      // Status's whole-status replace, a different upstream write).
+      set: { readAtUnix, updatedAt: now },
+    });
 }

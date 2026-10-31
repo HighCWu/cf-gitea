@@ -24,6 +24,7 @@ import { IssuesService } from "../../issues/service";
 import type { ApiEnv } from "../env";
 import { ApiError } from "../errors";
 import { notifyMergePullRequest } from "../../services/mail/notify";
+import { setIssueReadBy } from "../../services/mentions/carrier";
 import { carryLooseRefs, type CarrySource, type CarryTarget } from "../../repos/carry";
 import { canUserDelete, findRule, parseRuleConfig, principalAccessOf } from "../../services/branch-protection";
 import {
@@ -593,6 +594,23 @@ export async function mergePullRequest(
   // closed issue. Best-effort, never throws: the merge has already landed,
   // exactly like upstream logs notify errors past the merge (:865-867).
   if (merged.length > 0) {
+    // The §13.4 merge arm (specs/email-outbound.md): upstream's Merge
+    // handler stamps the PR's issue read for the merging doer BEFORE the
+    // mergeability checks (routers/api/v1/repo/pull.go:909-914 —
+    // `if ctx.IsSigned { SetIssueReadBy(ctx, pr.Issue.ID, ctx.Doer.ID) }`).
+    // The arm rides the winning landing here (the route owns the checks,
+    // routes stay service-free of the write per the fold precedent), so a
+    // refused merge (405/409 before the service call) marks nothing where
+    // upstream's mark already ran — the disclosed placement divergence;
+    // the merger-consumed-the-thread semantics are the same. Both halves
+    // stamp (carrier's setIssueReadBy: issue_user.is_read + the derived
+    // mailbox's read_at_unix = now). Best-effort like the notify beside
+    // it — a mark failure must not fail a landed merge.
+    try {
+      await setIssueReadBy(c.env.DB, issue.id, opts.doerId, opts.now);
+    } catch (error) {
+      console.error(`[pull-engine] merge mark-read failed (issue ${issue.id}): ${error instanceof Error ? error.message : String(error)}`);
+    }
     await notifyMailMergePullRequest(c.env, mergedIssue, opts.doerId, pr.baseBranch, opts.now);
   }
 

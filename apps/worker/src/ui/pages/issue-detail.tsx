@@ -164,6 +164,7 @@ import { milestones, users } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import { IssuesService } from "../../issues/service";
 import { IssueAlreadyChangedError, IssueError } from "../../issues/errors";
+import { setIssueReadBy } from "../../services/mentions/carrier";
 import type { CommentRow, IssueRow, LabelRow, MilestoneRow, PullRequestRow } from "../../issues/service";
 import { loadPullMergeBoxData, PullMergeBoxFragment, type PullMergeBoxData } from "./pull-merge-box";
 import { TimeSince } from "../components/file-list";
@@ -292,6 +293,23 @@ function unixSeconds(date: Date): number {
  * Wave-11: the viewer drives the review-row privacy filter (PENDING rows
  * are visible to their reviewer and site admins only — the landed list
  * arm's filter), so a PR's `reviews` load rides the same call.
+ *
+ * The §13.4 view arm (specs/email-outbound.md): a signed viewer's load
+ * marks the issue read for THEM — upstream ViewIssue's
+ * `if ctx.IsSigned { SetIssueReadBy(...) }` (issue_view.go:386-391), and
+ * because this one loader serves both families, the PR twin
+ * (pull.go:150-155) rides the same call. Both halves stamp (the carrier's
+ * setIssueReadBy): issue_user.is_read and the derived mailbox's
+ * read_at_unix = now. Anonymous loads skip it (ctx.IsSigned's negative).
+ * Two deliberate over-fires against the pin's narrower placement, both
+ * idempotent no-ops-or-equivalents: (1) the four POST-failure re-render
+ * callers of this loader also mark, where upstream's POST handlers don't
+ * — their SUCCESS paths 303 onto this page and mark through the view
+ * anyway; (2) the mark precedes the caller's crossFamilyRedirect, so a
+ * wrong-family URL marks before its 303 (upstream redirects first,
+ * issue_view.go:347-352 — the redirect target's own view then marks once).
+ * Error posture is upstream's: a failed mark fails the view
+ * (issue_view.go:390-392, ctx.ServerError("ReadBy", err)).
  */
 export async function loadIssueDetailData(
   d1: D1Database,
@@ -303,6 +321,13 @@ export async function loadIssueDetailData(
 ): Promise<IssueDetailData | null> {
   const issue = await findIssueByRepoAndIndex(d1, repo.id, index);
   if (issue === null) return null;
+
+  // The view seam's read-mark — the signed viewer only (issue_view.go:386-
+  // 391; the header note's over-fire inventory). Runs before the render
+  // assembly, upstream's mark position ahead of the page metadata.
+  if (viewer.kind === "user") {
+    await setIssueReadBy(d1, issue.id, viewer.id, new Date());
+  }
 
   const pr = issue.isPull ? ((await findPullRequestByIndex(d1, repo.id, index))?.pullRequest ?? null) : null;
   const reviews = pr === null ? [] : await loadPullReviewEntries(d1, issue.id, viewer);

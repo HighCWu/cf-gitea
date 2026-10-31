@@ -1149,7 +1149,7 @@ runs the regexp):
   mail-gated. Comment EDIT does not re-mention (upstream UpdateComment
   re-runs neither).
 
-### 13.3 Tests (parser.test.ts 53, resolve.test.ts 19, carrier.test.ts 25 — 16 carrier + 9 the §13.4 seed, notify.test.ts +6, issue-extras-subscription.test.ts +7)
+### 13.3 Tests (parser.test.ts 53, resolve.test.ts 19, carrier.test.ts 31 — 16 carrier + 9 the §13.4 seed + 6 the §13.4 mark, notify.test.ts +6, issue-extras-subscription.test.ts +7)
 
 - Parser: the pin's 37 pattern rows + the span fixture 1:1; the strip arms
   are cite-marked derived (fence/indented/code-span/link/linkify/email/
@@ -1160,7 +1160,7 @@ runs the regexp):
   the mentioned-unwatcher exception, the mentioned-doer exclusion, and two
   end-to-end arms through `addComment` (the onmention row lands first; a
   code-span mention does not resolve).
-- The carrier (carrier.test.ts 25): the upsert round trip (is_mentioned=1,
+- The carrier (carrier.test.ts 31): the upsert round trip (is_mentioned=1,
   is_read=0), the empty fast-path, single-row dedupe (same-call repeat +
   cross-call re-mention), the is_read-preserving re-mention
   (issue_user.go:77), the GetIssueMentionIDs filter (a non-mention carrier
@@ -1174,7 +1174,17 @@ runs the regexp):
   collaborator filter, the org-team arm (units-gated member seated, the
   code-unit team gated OUT, the org owner unseated), the PR-create seats,
   the standalone write shape, the seat arithmetic, and the seed never
-  feeding GetIssueMentionIDs.
+  feeding GetIssueMentionIDs. The mark arms (§13.4): the seeded seat
+  flips is_read with is_mentioned and the other seats untouched, the
+  seatless viewer's UPDATE-only no-op + the twin stamp, the pin surviving
+  a view, the re-read staying one row, the mention thread flipping
+  unread → read through the mailbox route, and one viewer's mark leaving
+  the other user's thread state alone. The view seam's route-level arms
+  ride issue-detail.matrix.test.tsx (+4: seated seat-flip + stamp, the
+  unseated viewer's seatless stamp, the anonymous negative, the pulls
+  twin) and the merge arm's ride api/pull-engine.test.ts (+2: the
+  winning merge stamps both halves, the refused merge marks nothing —
+  on their own seeded repo, the shared fixture's fork-walk budget).
 - The subscription fallback (issue-extras-subscription.test.ts +7): the
   poster seat with zero comments, the poster skipping the active filter
   (the append sits outside the query), the 0/21/22 comment-type set, the
@@ -1210,36 +1220,69 @@ runs the regexp):
 - `UpdateIssueUserByRead` (issue_user.go:58-61 via SetIssueReadBy,
   models/activities/notification.go:338; callers routers/web/repo/
   issue_view.go:389, routers/web/repo/pull.go:153, routers/api/v1/repo/
-  pull.go:911): the issue-view mark-read write — **STAYS STAGED**, with
-  the decision note this line promised. THE ADJUDICATION (at pin
+  pull.go:911): the issue-view mark-read write — **LANDED** (2026-11-01),
+  per the adjudication below. THE ADJUDICATION (at pin
   fc493688): upstream stamps TWO halves in one call, and both fire at the
   same seams — the signed user VIEWING the issue/PR page (the "mailbox UI
   reads the issue" moment) and the API merge. Half 1 is the issue_user
   flag itself (update-only). Half 2 is `setIssueNotificationStatusReadIfUnread`
   (notification.go:346-362) — the notification-status twin. Our derived
   mailbox HAS read-tracking (`notification_states.readAtUnix`), but its
-  only writers are the notifications mark endpoints (PUT /notifications,
+  only writers were the notifications mark endpoints (PUT /notifications,
   PATCH /threads/{id}) — exactly upstream's OWN API counterpart, which
   likewise never touches issue_user (upstream's notify handlers call
-  SetNotificationStatus only). The VIEW seam performs no write in this
-  tree: the issue/pull detail page families render read-only, and the
-  merge route has not ported pull.go:911's arm. Upstream's only is_read
+  SetNotificationStatus only). Upstream's only is_read
   CONSUMER is `LoadIsRead` (issue_list.go:488-508, the web issue list) —
   feeding a field the pin's templates never render (grep over
   templates/ finds no `.IsRead` read): dead data at fc493688, and our
-  tree carries no consumer either. So the arm lands when the view seam
-  lands, and the decision recorded here is: (a) the page families
-  (ui/index.ts issue-detail/pull-detail) gain the view-time write for the
-  signed viewer — ui/index.ts is not a mentions-unit file; (b) the view
+  tree carries no consumer either. The recorded decision: (a) the page
+  families gain the view-time write for the signed viewer; (b) the view
   ALSO stamps `notification_states.readAtUnix = now` — upstream stamps
   both halves in one call, and the derived unread arithmetic (unread iff
   lastActivity > readAtUnix; later activity re-marks unread with no
   write-path hook) is semantically compatible with upstream's
-  unread-on-activity re-mark; (c) the merge route (pulls.ts) ports the
-  pull.go:911 arm beside it. The seeded seats above are the
-  precondition; STAGING GAP, exactly: no landed surface performs the
-  issue-view mark, and the write's only consumer is unported dead data at
-  the pin — not invented.
+  unread-on-activity re-mark; (c) the merge arm ports the pull.go:911
+  write. THE LANDING, as-built: the write is the carrier's
+  `setIssueReadBy` (services/mentions/carrier.ts — one helper composes
+  both halves exactly as upstream's SetIssueReadBy does), and both
+  surfaces ride it:
+  - the VIEW seam: `loadIssueDetailData` (pages/issue-detail.tsx — the
+    is_pull-aware loader serving BOTH families) marks for the signed
+    viewer (`viewer.kind === "user"` — ctx.IsSigned's collapse), after the
+    row lookup and before the render assembly, upstream's mark position
+    (issue_view.go:386-391; the PR twin pull.go:150-155 rides the same
+    call). Error posture is upstream's: a failed mark fails the view
+    (issue_view.go:390-392, ServerError). Two disclosed over-fires against
+    the pin's narrower placement, both no-ops-or-equivalents: the loader's
+    four POST-failure re-render callers also mark (their SUCCESS paths 303
+    onto this page and mark through the view anyway), and the mark
+    precedes the caller's crossFamilyRedirect (upstream redirects first,
+    issue_view.go:347-352 — the redirect target's own view then marks
+    once; both marks stamp the same values).
+  - the MERGE arm: `mergePullRequest`'s winning landing
+    (api/services/pull-engine.ts, beside the winning-merge mail arm) —
+    the merger (`opts.doerId`) stamps with the merge flow's clock
+    (`opts.now`), best-effort (a mark failure must not fail a landed
+    merge, the notify arm's discipline). DISCLOSED PLACEMENT DIVERGENCE:
+    upstream marks BEFORE CheckPullMergeable (pull.go:909-914 — a refused
+    merge marks too); ours rides the landing because the route owns the
+    preconditions and the fold precedent keeps the write service-layer —
+    a refused merge (405/409 before the service call) marks nothing. The
+    mark is CAS-gated with the mail arm (`merged.length > 0` — a losing
+    racer marks no more than it mails).
+  The helper's half-2 shape vs upstream's twin: the upsert keys the mark
+  endpoints' `(user_id, issue_id)` arbiter (routes/notifications.ts
+  markThreads' shape) but the conflict update sets ONLY
+  `read_at_unix + updated_at` — never `pinned` (upstream's view stamp
+  skips Pinned rows untouched, notification.go:351-353; only
+  SetNotificationStatus — the endpoints' whole-status replace — clears a
+  pin). A fresh row inserts around the column defaults (upstream's
+  GetIssueNotification miss no-ops; the derived model needs the stamp to
+  express "read" at all, and a state row for a mailbox non-recipient is
+  inert — threads derive from the recipient predicate, states only
+  join). Upstream's bool return ("the unread count actually decreased,
+  skip a push") has no consumer at the pin's three call sites and none
+  here — dropped. The seeded seats above remain the half-1 precondition.
 - The search-surface residue — **CLOSED for `assigned`** (2026-10-31):
   the mention filters landed with the search wave (§13.2); the GLOBAL
   `assigned` doer-flag now rides the same shape (issue.go:226-228 —

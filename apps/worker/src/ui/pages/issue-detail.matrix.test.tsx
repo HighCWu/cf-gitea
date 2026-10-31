@@ -117,8 +117,10 @@ import {
   issueAssignees,
   issueLabels,
   issueSubscriptions,
+  issueUsers,
   issues,
   milestones,
+  notificationStates,
   pullRequests,
   pullReviews,
   repositories,
@@ -179,6 +181,9 @@ const SIDEBAR_MILESTONE_NAME = "mx: sidebar milestone";
 interface IssueDetailFixture {
   ownerCookie: string;
   bobCookie: string;
+  /** The principals' ids — the §13.4 view mark-read arms' D1 read-backs. */
+  ownerId: number;
+  bobId: number;
   labelId: number;
   /** #1 — the locked issue (the lock gate's target). */
   lockedIssueIndex: number;
@@ -436,6 +441,8 @@ async function ensureIssueDetailFixtures(): Promise<IssueDetailFixture> {
   issueDetailFixture = {
     ownerCookie: await mintSession(env.DB, owner.id),
     bobCookie: await mintSession(env.DB, bob.id),
+    ownerId: owner.id,
+    bobId: bob.id,
     labelId,
     lockedIssueIndex,
     openPrIssueId,
@@ -1175,5 +1182,140 @@ describe("the timeline's unrendered system-event arms (w129 batch-13)", () => {
     const html = await res.text();
     expect(html).toContain('<div class="status-page-error">');
     expect(html).toContain("repo-header");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The §13.4 view mark-read arm (specs/email-outbound.md): a signed viewer's
+// detail-page load marks the issue read for THEM — upstream ViewIssue's
+// `if ctx.IsSigned { SetIssueReadBy(...) }` (issue_view.go:386-391) and,
+// through the same is_pull-aware loader, the PR twin (pull.go:150-155).
+// Both halves assert here: issue_user.is_read (issue_user.go:58-61 —
+// UPDATE-only, so the unseated viewer writes no seat) and the derived
+// mailbox's notification_states.read_at_unix = now. Each arm normalizes the
+// marks first — the earlier signed GETs in this file (and every other ui
+// suite) mark too, so the arms pin the write against a reset baseline and
+// reruns converge.
+// ---------------------------------------------------------------------------
+
+describe("the view seam's mark-read (issue_view.go:386-391 + pull.go:150-155, §13.4)", () => {
+  async function labIssueId(index: number): Promise<number> {
+    const db = drizzle(env.DB);
+    const repo = await db
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, OWNER_NAME), eq(repositories.slug, REPO_SLUG)))
+      .get();
+    if (repo === undefined) throw new Error("view mark-read arm: lab repo missing");
+    const issue = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(eq(issues.repoId, repo.id), eq(issues.index, index)))
+      .get();
+    if (issue === undefined) throw new Error("view mark-read arm: fixture issue missing");
+    return issue.id;
+  }
+
+  async function normalizeMarks(issueId: number): Promise<void> {
+    const db = drizzle(env.DB);
+    await db.update(issueUsers).set({ isRead: false }).where(eq(issueUsers.issueId, issueId));
+    await db.delete(notificationStates).where(eq(notificationStates.issueId, issueId));
+  }
+
+  it("the signed SEATED viewer's load flips their seat's is_read and stamps the mailbox marker", async () => {
+    const fixture = await ensureIssueDetailFixtures();
+    const issueId = await labIssueId(fixture.closedIssueIndex);
+    await normalizeMarks(issueId);
+
+    const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
+    });
+    expect(res.status).toBe(200);
+
+    const seat = await drizzle(env.DB)
+      .select()
+      .from(issueUsers)
+      .where(and(eq(issueUsers.issueId, issueId), eq(issueUsers.userId, fixture.ownerId)))
+      .get();
+    expect(seat).toBeDefined();
+    expect(seat?.isRead).toBe(true);
+    expect(seat?.isMentioned).toBe(false);
+    const state = await drizzle(env.DB)
+      .select()
+      .from(notificationStates)
+      .where(and(eq(notificationStates.issueId, issueId), eq(notificationStates.userId, fixture.ownerId)))
+      .get();
+    expect(state?.readAtUnix ?? 0).toBeGreaterThan(0);
+    expect(state?.pinned).toBe(false);
+  });
+
+  it("the signed UNSEATED viewer's load writes no seat (the UPDATE-only half) yet stamps the derived mailbox", async () => {
+    const fixture = await ensureIssueDetailFixtures();
+    const issueId = await labIssueId(fixture.closedIssueIndex);
+    await normalizeMarks(issueId);
+
+    const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.bobCookie}` },
+    });
+    expect(res.status).toBe(200);
+
+    const seat = await drizzle(env.DB)
+      .select()
+      .from(issueUsers)
+      .where(and(eq(issueUsers.issueId, issueId), eq(issueUsers.userId, fixture.bobId)))
+      .get();
+    expect(seat).toBeUndefined();
+    const state = await drizzle(env.DB)
+      .select()
+      .from(notificationStates)
+      .where(and(eq(notificationStates.issueId, issueId), eq(notificationStates.userId, fixture.bobId)))
+      .get();
+    expect(state?.readAtUnix ?? 0).toBeGreaterThan(0);
+  });
+
+  it("the anonymous load marks nothing (ctx.IsSigned's negative)", async () => {
+    const fixture = await ensureIssueDetailFixtures();
+    const issueId = await labIssueId(fixture.closedIssueIndex);
+    await normalizeMarks(issueId);
+
+    const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}`);
+    expect(res.status).toBe(200);
+
+    const seat = await drizzle(env.DB)
+      .select()
+      .from(issueUsers)
+      .where(and(eq(issueUsers.issueId, issueId), eq(issueUsers.userId, fixture.ownerId)))
+      .get();
+    expect(seat?.isRead).toBe(false);
+    const states = await drizzle(env.DB)
+      .select()
+      .from(notificationStates)
+      .where(eq(notificationStates.issueId, issueId))
+      .all();
+    expect(states).toEqual([]);
+  });
+
+  it("the PULLS family rides the same seam — the owner's view marks the PR's issue (pull.go:150-155)", async () => {
+    const fixture = await ensureIssueDetailFixtures();
+    const issueId = await labIssueId(fixture.mergedPrIndex);
+    await normalizeMarks(issueId);
+
+    const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/pulls/${fixture.mergedPrIndex}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
+    });
+    expect(res.status).toBe(200);
+
+    const seat = await drizzle(env.DB)
+      .select()
+      .from(issueUsers)
+      .where(and(eq(issueUsers.issueId, issueId), eq(issueUsers.userId, fixture.ownerId)))
+      .get();
+    expect(seat?.isRead).toBe(true);
+    const state = await drizzle(env.DB)
+      .select()
+      .from(notificationStates)
+      .where(and(eq(notificationStates.issueId, issueId), eq(notificationStates.userId, fixture.ownerId)))
+      .get();
+    expect(state?.readAtUnix ?? 0).toBeGreaterThan(0);
   });
 });

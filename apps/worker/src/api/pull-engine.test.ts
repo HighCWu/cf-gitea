@@ -31,7 +31,7 @@ import { ensureSeededRepo, buildHistoryPack, buildReceivePackBody, type SeedComm
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor } from "../auth/testing/seeds";
-import { users, protectedBranches, repositories, comments, PRStatus, pullRequests } from "../db/schema";
+import { users, protectedBranches, repositories, comments, issueUsers, notificationStates, PRStatus, pullRequests } from "../db/schema";
 import { CommentType } from "../issues/comment-types";
 import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "./auth";
@@ -408,6 +408,107 @@ describe("POST …/merge — the styles over the engine's landing primitives", (
     const pr = await jsonBody(await get(`${REPO}/pulls/${index}`));
     expect(pr.merged).toBe(true);
     expect(pr.merge_commit_sha).toBe(mainTip);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The §13.4 merge mark-read arm (specs/email-outbound.md): upstream's Merge
+// handler stamps the PR's issue read for the merging doer BEFORE the
+// mergeability checks (routers/api/v1/repo/pull.go:909-914 —
+// `if ctx.IsSigned { SetIssueReadBy(...) }`, models/activities/
+// notification.go:338-343). The arm rides the winning landing inside
+// mergePullRequest here (the route owns the preconditions — the fold
+// precedent keeps the write service-layer), so a LANDING stamps both halves
+// (issue_user.is_read, issue_user.go:58-61 — the create-seeded seat;
+// notification_states.read_at_unix = now, the derived twin) and a REFUSED
+// merge marks nothing — the disclosed ordering divergence against
+// pull.go:911's pre-check position.
+//
+// Its OWN seeded repo (apisuite/pulls-markread, the clock block's
+// rationale): merges on the shared `apisuite/pulls` fixture grow main's
+// closure and tip the fork arms' pr-create base-fetch walk over budget
+// (observed: seedForkHeadPr 500s).
+// ---------------------------------------------------------------------------
+
+describe("POST …/merge — the mark-read arm (pull.go:909-914, §13.4)", () => {
+  const MARK_SLUG = "pulls-markread";
+  const MARK_REPO = `/repos/${OWNER}/${MARK_SLUG}`;
+
+  beforeAll(async () => {
+    await ensureSeededRepo({ owner: OWNER, slug: MARK_SLUG, commits: SEED_COMMITS });
+  });
+
+  const seedBranch = async (branch: string, path: string, content: string): Promise<void> => {
+    const made = await send(`${MARK_REPO}/branches`, jsonInit("POST", { new_branch_name: branch }));
+    expect(made.status).toBe(201);
+    const written = await send(`${MARK_REPO}/contents/${path}`, jsonInit("POST", { content: btoa(content), branch, message: `${branch}: ${path}` }));
+    expect(written.status).toBe(201);
+  };
+
+  const issueIdOfPr = async (index: number): Promise<number> => {
+    const repoRow = await drizzle(env.DB)
+      .select()
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, MARK_SLUG)))
+      .get();
+    if (repoRow === undefined) throw new Error("mark-read arm: repo row missing");
+    const joined = await findPullRequestByIndex(env.DB, repoRow.id, index);
+    if (joined === null) throw new Error("mark-read arm: pr row missing");
+    return joined.issue.id;
+  };
+
+  const seatOf = (issueId: number) =>
+    drizzle(env.DB)
+      .select()
+      .from(issueUsers)
+      .where(and(eq(issueUsers.issueId, issueId), eq(issueUsers.userId, OWNER_ID)))
+      .get();
+
+  const stateOf = (issueId: number) =>
+    drizzle(env.DB)
+      .select()
+      .from(notificationStates)
+      .where(and(eq(notificationStates.issueId, issueId), eq(notificationStates.userId, OWNER_ID)))
+      .get();
+
+  it("the winning merge stamps the merger's is_read seat and the mailbox read marker", async () => {
+    await seedBranch("markread", "markread.txt", "mark read on merge\n");
+    const created = await send(`${MARK_REPO}/pulls`, jsonInit("POST", { title: "Mark read on merge", head: "markread", base: "main" }));
+    const index = (await jsonBody(created)).number as number;
+    const issueId = await issueIdOfPr(index);
+
+    // The create-seeded seat (NewIssueUsers — the poster/owner seat) is
+    // unread, and the mailbox holds no state row yet (the derived thread is
+    // unread by absence).
+    expect((await seatOf(issueId))?.isRead).toBe(false);
+    expect(await stateOf(issueId)).toBeUndefined();
+
+    expect((await send(`${MARK_REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge" }))).status).toBe(200);
+
+    const seatAfter = await seatOf(issueId);
+    expect(seatAfter?.isRead).toBe(true);
+    expect(seatAfter?.isMentioned).toBe(false);
+    const stateAfter = await stateOf(issueId);
+    expect(stateAfter).toBeDefined();
+    expect(stateAfter!.pinned).toBe(false);
+    expect(stateAfter!.readAtUnix).toBeGreaterThan(0);
+  });
+
+  it("a refused merge marks nothing — the winning-landing placement (the pull.go:911 ordering divergence)", async () => {
+    await seedBranch("markclash", "markclash.txt", "from markclash\n");
+    // the same path on main with different content — add/add conflict
+    const onMain = await send(`${MARK_REPO}/contents/markclash.txt`, jsonInit("POST", { content: btoa("from main\n"), branch: "main", message: "main: markclash.txt" }));
+    expect(onMain.status).toBe(201);
+    const created = await send(`${MARK_REPO}/pulls`, jsonInit("POST", { title: "Refused merge leaves the mark off", head: "markclash", base: "main" }));
+    const index = (await jsonBody(created)).number as number;
+    const issueId = await issueIdOfPr(index);
+
+    const refused = await send(`${MARK_REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge" }));
+    expect(refused.status).toBe(405);
+
+    // No mark: the seeded seat stays unread, no mailbox row was written.
+    expect((await seatOf(issueId))?.isRead).toBe(false);
+    expect(await stateOf(issueId)).toBeUndefined();
   });
 });
 

@@ -23,14 +23,14 @@ import { and, asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { issueUsers, issues, pullRequests, repoCollaborators, repoCounters, repositories, teamMembers, teamRepoAccess, teams, users } from "../../db/schema";
+import { issueUsers, issues, notificationStates, pullRequests, repoCollaborators, repoCounters, repositories, teamMembers, teamRepoAccess, teams, users } from "../../db/schema";
 import { createTokenAuthMiddleware, type AuthResolver } from "../../api/auth";
 import { giteaErrorHandler } from "../../api/errors";
 import type { ApiEnv } from "../../api/env";
 import type { User } from "../../api/models/user";
 import { registerNotificationsRoutes } from "../../api/routes/notifications";
 import { IssuesService } from "../../issues/service";
-import { getIssueMentionIds, newIssueUserSeedRows, seedIssueUsers, updateIssueMentions } from "./carrier";
+import { getIssueMentionIds, newIssueUserSeedRows, seedIssueUsers, setIssueReadBy, updateIssueMentions } from "./carrier";
 
 const AUTHOR_ID = 10;
 const ALICE_ID = 20;
@@ -357,6 +357,9 @@ describe("the emit positions — FindAndUpdateIssueMentions threaded ungated (co
 // The derived mailbox's mention arm (routes/notifications.ts recipientExpr)
 // ---------------------------------------------------------------------------
 
+// The mailbox read-back helpers live at module scope — the §13.4 mark-read
+// describe below rides the same app (one copy; hoisted from the mention-arm
+// describe when the mark-read arms landed).
 function userPayload(id: number, username: string): User {
   return {
     id,
@@ -400,17 +403,17 @@ interface Thread {
   unread: boolean;
 }
 
+function mentionedApp(): (path: string, init?: RequestInit) => Promise<Response> {
+  const app = new OpenAPIHono<ApiEnv>();
+  app.onError(giteaErrorHandler);
+  registerNotificationsRoutes(app, createTokenAuthMiddleware(resolver()));
+  return async (path: string, init?: RequestInit): Promise<Response> =>
+    Promise.resolve(app.fetch(new Request(`https://example.com${path}`, init), env));
+}
+
+const authed = (token: string): RequestInit => ({ headers: { Authorization: `token ${token}` } });
+
 describe("the notifications mention arm — a mentioned user reads the thread (mail_issue.go:99-105)", () => {
-  function mentionedApp(): (path: string, init?: RequestInit) => Promise<Response> {
-    const app = new OpenAPIHono<ApiEnv>();
-    app.onError(giteaErrorHandler);
-    registerNotificationsRoutes(app, createTokenAuthMiddleware(resolver()));
-    return async (path: string, init?: RequestInit): Promise<Response> =>
-      Promise.resolve(app.fetch(new Request(`https://example.com${path}`, init), env));
-  }
-
-  const authed = (token: string): RequestInit => ({ headers: { Authorization: `token ${token}` } });
-
   it("the carrier row alone qualifies the mentioned user's mailbox — no watch, no subscription, no comment", async () => {
     const service = new IssuesService(env.DB);
     const issue = await service.createIssue({
@@ -457,6 +460,106 @@ describe("the notifications mention arm — a mentioned user reads the thread (m
     const send = mentionedApp();
     const response = await send("/notifications", authed("alice-token"));
     expect(response.headers.get("X-Total-Count")).toBe("0");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The §13.4 mark-read arm — setIssueReadBy (notification.go:338-343): the
+// write both upstream surfaces ride (the signed view, issue_view.go:386-391
+// + pull.go:150-155; the API merge, routers/api/v1/repo/pull.go:909-914).
+// ---------------------------------------------------------------------------
+
+describe("setIssueReadBy — the SetIssueReadBy mark (notification.go:338-343, §13.4)", () => {
+  const MARK = new Date(T0.getTime() + 60_000);
+
+  it("the seeded seat flips is_read=true; is_mentioned and other seats stay untouched (issue_user.go:58-61)", async () => {
+    const alice = await userRow(ALICE_ID);
+    if (alice === undefined) throw new Error("fixture missing");
+    await seedIssueUsers(env.DB, 601, [alice], AUTHOR_ID);
+    await setIssueReadBy(env.DB, 601, ALICE_ID, MARK);
+    const rows = await drizzle(env.DB).select().from(issueUsers).where(eq(issueUsers.issueId, 601)).all();
+    const byUser = new Map(rows.map((row) => [row.userId, row]));
+    expect(byUser.get(ALICE_ID)?.isRead).toBe(true);
+    expect(byUser.get(ALICE_ID)?.isMentioned).toBe(false);
+    expect(byUser.get(AUTHOR_ID)?.isRead).toBe(false);
+    expect(byUser.get(AUTHOR_ID)?.isMentioned).toBe(false);
+  });
+
+  it("a seatless viewer no-ops issue_user (the UPDATE-only half) yet stamps notification_states (the twin)", async () => {
+    await setIssueReadBy(env.DB, 602, BYSTANDER_ID, MARK);
+    expect(await drizzle(env.DB).select().from(issueUsers).where(eq(issueUsers.issueId, 602)).all()).toEqual([]);
+    const state = await drizzle(env.DB)
+      .select()
+      .from(notificationStates)
+      .where(and(eq(notificationStates.issueId, 602), eq(notificationStates.userId, BYSTANDER_ID)))
+      .get();
+    expect(state?.readAtUnix).toBe(Math.floor(MARK.getTime() / 1000));
+    expect(state?.pinned).toBe(false);
+  });
+
+  it("a pinned thread keeps its pin — the view stamp never clears it (notification.go:351-353)", async () => {
+    await drizzle(env.DB)
+      .insert(notificationStates)
+      .values({ userId: ALICE_ID, issueId: 603, pinned: true, readAtUnix: 5, updatedAt: T0 });
+    await setIssueReadBy(env.DB, 603, ALICE_ID, MARK);
+    const state = await drizzle(env.DB)
+      .select()
+      .from(notificationStates)
+      .where(and(eq(notificationStates.issueId, 603), eq(notificationStates.userId, ALICE_ID)))
+      .get();
+    expect(state?.pinned).toBe(true);
+  });
+
+  it("a re-read stays ONE carrier row (the bare UPDATE re-fires, no insert arm)", async () => {
+    const alice = await userRow(ALICE_ID);
+    if (alice === undefined) throw new Error("fixture missing");
+    await seedIssueUsers(env.DB, 604, [alice], null);
+    await setIssueReadBy(env.DB, 604, ALICE_ID, MARK);
+    await setIssueReadBy(env.DB, 604, ALICE_ID, MARK);
+    const rows = await drizzle(env.DB).select().from(issueUsers).where(eq(issueUsers.issueId, 604)).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.isRead).toBe(true);
+  });
+
+  it("the view mark reads the derived mailbox: the mention thread flips unread → read (§13.4 half 2)", async () => {
+    const service = new IssuesService(env.DB);
+    const issue = await service.createIssue({
+      repoId: REPO_ID,
+      title: "read me",
+      content: "heads up @alice",
+      posterId: AUTHOR_ID,
+      now: T0,
+    });
+    const send = mentionedApp();
+    const before = await send("/notifications", authed("alice-token"));
+    expect(before.headers.get("X-Total-Count")).toBe("1");
+    expect((await before.json<Thread[]>())[0]?.unread).toBe(true);
+
+    await setIssueReadBy(env.DB, issue.id, ALICE_ID, MARK);
+
+    // The unread bucket empties; the whole-mailbox view keeps the thread, read.
+    const after = await send("/notifications", authed("alice-token"));
+    expect(after.headers.get("X-Total-Count")).toBe("0");
+    const everything = await send("/notifications?all=true", authed("alice-token"));
+    const threads = await everything.json<Thread[]>();
+    expect(threads.map((thread) => thread.id)).toEqual([issue.id]);
+    expect(threads[0]?.unread).toBe(false);
+  });
+
+  it("the other user's thread state is untouched by one viewer's mark", async () => {
+    const service = new IssuesService(env.DB);
+    const issue = await service.createIssue({
+      repoId: REPO_ID,
+      title: "for someone else",
+      content: "heads up @alice",
+      posterId: AUTHOR_ID,
+      now: T0,
+    });
+    await setIssueReadBy(env.DB, issue.id, BYSTANDER_ID, MARK);
+    const send = mentionedApp();
+    const response = await send("/notifications", authed("alice-token"));
+    expect(response.headers.get("X-Total-Count")).toBe("1");
+    expect((await response.json<Thread[]>())[0]?.unread).toBe(true);
   });
 });
 
