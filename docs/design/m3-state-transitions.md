@@ -25,7 +25,13 @@ Every `file:line` below is from the current tree. Writers cited:
 
 Amended same-day by the D3 engine-fix unit (compaction.ts touched — the T1
 row's compaction.ts/check-compaction.mjs line cites were refreshed to the
-post-fix tree; D3 marked FIXED; §6 item 1 resolved).
+post-fix tree; D3 marked FIXED; §6 item 1 resolved) — the fix is commit
+`6545edd`, the rows-10/11 pins are commit `849885e`, and the README
+script-list housekeeping (§6 item 3's remainder) landed in `f9a63ec`.
+Re-verified 2026-10-31 (board row P3-4 closure): the fix and pins confirmed
+against the tree unchanged, the FULL 30-script engine e2e family green
+(PASS=30 FAIL=0, incl. check-compaction 10/10 and check-fault-matrix 6/6),
+engine `tsc -p tsconfig.build.json` clean with dist-types regenerated.
 
 ## 1. The states as the code holds them
 
@@ -189,7 +195,7 @@ and should be re-worded (recommendation only).
 
 ### D3 — FIXED: graceful error exits of T1 now keep the lease row so the sweep converges the orphan (was: stranding)
 
-**Status: FIXED (2026-10-28).** The original gap: the orphan convergence of
+**Status: FIXED (2026-10-28, commit `6545edd`).** The original gap: the orphan convergence of
 §5.3 ("prefix + catalog state converge; never assumed") is implemented as
 **payload + catalog state** — the only sweeper that can delete an unpublished
 compaction output is the compaction branch of `sweepExpiredLeases`, which acts
@@ -289,7 +295,7 @@ assessment (`docs/research/spec-0011-m35-state.md:107-128`), restated here
 with the pinning work as landed (both pinned 2026-10-28, see the Pinned
 records below).
 
-### Row 10 — stream prefetch probe ("nothing depends on pause-stops-I/O"): PINNED (2026-10-28; was structural, unpinned)
+### Row 10 — stream prefetch probe ("nothing depends on pause-stops-I/O"): PINNED (2026-10-28, commit `849885e`; was structural, unpinned)
 
 The design eliminated the assumption rather than testing it: reads are
 explicit bounded R2 Range GETs, not stream-chunk pauses ("pausing
@@ -302,8 +308,8 @@ check-segmented-serve asserts every GET is ≤ `SERVE_SEGMENT_BYTES` and
 check-fault-matrix row 1 exercises reads across a live publish. Nothing
 asserts the negative ("no read path pauses and assumes I/O stops") as such.
 
-Pinned (2026-10-28, `e2e/check-fault-matrix.mjs:823`, engine source
-untouched) as the row-10 check, both prescribed halves: (a) the runtime
+Pinned (2026-10-28, commit `849885e`, `e2e/check-fault-matrix.mjs:823`,
+engine source untouched) as the row-10 check, both prescribed halves: (a) the runtime
 probe — a 74-object fixture (12 × 6 chunk-spread packed entries + loose
 tree/commit, deliberately above one pull batch's 64-object bound so emission
 is genuinely mid-stream) is read until the response's queue holds exactly one
@@ -322,7 +328,7 @@ seam-guard verified (exactly-one live lease, plan member). (b) the tripwire
 contains `pause()`/`releaseLock()` plumbing. (a) is the load-bearing half;
 (b) is the tripwire, as prescribed.
 
-### Row 11 — valid-but-incomplete pack ("server-side plan rejection is the contract"): PINNED (2026-10-28; was partial, unpinned)
+### Row 11 — valid-but-incomplete pack ("server-side plan rejection is the contract"): PINNED (2026-10-28, commit `849885e`; was partial, unpinned)
 
 No serve-side fixture constructs a pack whose checksum is correct but whose
 negotiated-object closure is incomplete. What exists covers the
@@ -334,7 +340,7 @@ objects", check-correctness-tier). The general case — want resolvable, one
 closure object's bytes missing while the plan is being computed → the
 SERVER-side plan/walk rejects before any byte ships — is unpinned.
 
-Pinned (2026-10-28, `e2e/check-fault-matrix.mjs:917`): the row-11 check
+Pinned (2026-10-28, commit `849885e`, `e2e/check-fault-matrix.mjs:917`): the row-11 check
 drives the REAL `uploadPack` arm at BOTH failure depths of the one
 corruption (closure bytes deleted from the R2 stub — packed storage has no
 per-object R2 addressability, so the pack object holding the closure
@@ -357,18 +363,20 @@ defense-in-depth.
 
 ## 6. Open issues for the next wave
 
-1. **D3 — RESOLVED (2026-10-28)**: the T1 graceful-error orphan-stranding gap
+1. **D3 — RESOLVED (2026-10-28, commit `6545edd`)**: the T1 graceful-error
+   orphan-stranding gap
    is fixed (keep-lease-row-on-failed-publish; `compaction.ts:216,242,277`) and
    pinned by the two §5.3 graceful-failure checks
    (`e2e/check-compaction.mjs:674,723`, mutation-tested) + the NOTICE.md
    deviation rows and the SPEC-0011 §5.3 as-built amendment. Nothing open.
 2. **D1/D2**: §2/§5 normative-text amendments (spec edit; owner: the spec).
-3. **Row 10/11 pins** (§5 above): RESOLVED (2026-10-28) — both landed as
+3. **Row 10/11 pins** (§5 above): RESOLVED (2026-10-28, commit `849885e`) —
+   both landed as
    checks in `e2e/check-fault-matrix.mjs` (4 → 6 checks; the §5 Pinned
-   records). Still open from this item: the assessment's §6 item 3
-   housekeeping (the three M3.5 scripts missing from
-   `packages/git-engine/e2e/README.md`'s script list —
-   `docs/research/engine-e2e-health-2026-10-26.md:149-156`).
+   records). The item's remaining housekeeping is ALSO closed: the three
+   M3.5 scripts were added to `packages/git-engine/e2e/README.md`'s script
+   list by `f9a63ec` (the check-fault-matrix / check-correctness-tier /
+   check-capability-matrix section). Nothing open.
 4. **OQ4** (clone-cache retention policy) and **Q3** (sqlite-row cleanup)
    remain open in spec §10; the as-built postures are lease-drain-only and
    row-removal-with-`pack_data` respectively (§3 side ledger, D5).
