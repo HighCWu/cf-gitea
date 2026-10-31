@@ -407,6 +407,19 @@ cf-gitea adaptation (decisions):
   only the configured alg, so HS deployments get upstream's (deliberately broken for
   third-party OIDC clients) JWKS-for-oct behavior — parity preserved, don't "fix" it.
 
+> **As-built (W1, 2026-10-31):** the key lives at `services/oauth2/keys.ts`
+> and the JWS primitives at `services/oauth2/jws.ts`. Three implementation
+> discoveries recorded: (1) workerd validates a JWK's `key_ops` against the
+> requested usages on `importKey`, so every import strips the transport
+> members (`key_ops`/`ext`) and the public-JWK half never inherits the
+> private key's `["sign","verify"]` — pinned in-suite; (2) the stored row's
+> alg is family-checked against the configured one and a mismatch fails
+> closed with "rotate the keystore row" named (upstream's startup
+> type-check analog, jwtsigningkey.go:240–295); (3) the HS arm reuses the
+> Actions module's 32-byte-hex recipe on a cold shared row
+> (insert-or-nothing + read-back — whichever module reaches it first wins,
+> the loser adopts), and never touches the `oauth2_signing_key` row.
+
 ### 2.11 The gate + the git-HTTP realm flip
 
 - Upstream gate: `setting.OAuth2.Enabled` (default **true**); `oauth2Enabled`
@@ -554,6 +567,14 @@ ALTER TABLE `sessions` ADD `oauth_state` text;
 Plus the builtin-application seed rows (§2.9) appended to the same migration with
 `INSERT OR IGNORE` (exact client IDs + redirect URIs from
 `models/auth/oauth2.go:68–101`).
+
+> **As-built (W1, 2026-10-31):** migration landed as `0052_redundant_zarek`
+> (drizzle-generated from the §3 schema exactly — both tables + the
+> `sessions.oauth_state` ALTER — with the §2.9 seed appended as five
+> `INSERT OR IGNORE` statements keyed on the `client_id` UNIQUE index,
+> `uid=0`, `confidential_client=0`, empty `client_secret`, `unixepoch()`
+> stamps; the seed lines carry the upstream cite inline). A repo-watch
+> sibling's migration lands after this one and numbers 0053 — expected.
 
 ## 4. Edge cases, limits, failure modes
 
@@ -713,6 +734,14 @@ not edit the shared index themselves).
   find/consume/increase-counter + the `gta_` code format reusing the landed base32).
   Gates: JWS/keystore/store suites green, tsc 0, eslint clean, `pnpm db:generate`
   output = 0052 only.
+  **LANDED 2026-10-31** — migration `0052_redundant_zarek` (as-built note in
+  §3.1), the three services + suites under `services/oauth2/`; suites green
+  (jws 24/24, keys, grants — counts in the wave report), tsc 0 in W1 files,
+  eslint clean. One disclosed deviation: the `gta_` base32 encoder is
+  duplicated from `oauth2-apps.ts:91` (module-private there, this module is
+  ownership-separated — upstream itself spells the encoder once per model
+  file). ES256's JOSE-raw signature alignment is pinned in-suite against
+  RFC 7515 appendix A.3's fixed vector.
 - **W2 — token endpoint + auth method** (depends W1). Owns:
   `web/oauth2-token.ts` (or `ui/` per the mount family — the orchestrator's
   registration window decides the file home): POST `/login/oauth/access_token`
