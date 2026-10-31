@@ -597,7 +597,6 @@ describe("archive export-subst expansion", () => {
   }
 
   it("expands every honored placeholder class from the archived commit in the tar", async () => {
-    const refs = await engineCell(env, { ownerNamespace: OWNER.toLowerCase(), slug: SUBST_SLUG }).listRefs();
     const tip = SUBST_TIPS[1] as string;
     const commit = await engineCell(env, { ownerNamespace: OWNER.toLowerCase(), slug: SUBST_SLUG }).readCommit(tip);
     expect(commit).not.toBeNull();
