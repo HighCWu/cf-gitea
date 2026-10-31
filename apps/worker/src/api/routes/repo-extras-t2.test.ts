@@ -44,7 +44,8 @@ import {
 } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
-import { registerRepoExtrasT2Routes } from "./repo-extras-t2";
+import { registerRepoExtrasT2Routes, updatePullRequestBranch } from "./repo-extras-t2";
+import type { Context } from "hono";
 import { IssuesService } from "../../issues/service";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { ensureSeededRepo, type SeedCommit } from "../../ui/testing/seed-repo";
@@ -790,12 +791,62 @@ describe("POST .../pulls/{index}/update (repo-extras-t2)", () => {
   });
 
   it("422s already-merged pulls", async () => {
-    const { pull } = await seedPullWithCodeComment({ posterId: ownerId, reviewId: 0 });
+    const { pull } = await seedPullWithCodeComment({ posterId: ownerId });
     await drizzle(env.DB).update(pullRequests).set({ hasMerged: true }).where(eq(pullRequests.issueId, pull.issue.id));
     const response = await send(`${REPO_PATH}/pulls/${pull.pullRequest.index}/update`, authed({ method: "POST" }));
     expect(response.status).toBe(422);
     const body: { message: string } = await response.json();
     expect(body.message).toBe("pull request is already merged");
+  });
+
+  it("stamps the update merge commit with the pinned clock (the wallclock-audit class-(c) twin arm)", async () => {
+    // A captured authenticated Context drives the exported helper directly —
+    // the route handler keeps the wall-clock default, so production bytes are
+    // unchanged; the pin rides the now parameter (the same seam shape as
+    // pull-engine's mergePerson honoring MergePullOptions.now). The stamp
+    // lands in a STORED git object, which is why the pin must sit at the
+    // write.
+    let captured: Context<ApiEnv> | null = null;
+    const capture = new OpenAPIHono<ApiEnv>();
+    capture.onError(giteaErrorHandler);
+    capture.get("/capture", createTokenAuthMiddleware(resolver()), (c) => {
+      captured = c;
+      return c.json({});
+    });
+    expect(
+      (await capture.fetch(new Request("https://example.com/capture", { headers: { Authorization: `token ${TOKEN}` } }), env))
+        .status,
+    ).toBe(200);
+    if (captured === null) throw new Error("clock arm: context capture failed");
+
+    // topic back at TIP1 (one behind main = TIP2) — the idempotent
+    // reposition dance of the arm above.
+    const cell = engineCell(env, { ownerNamespace: OWNER, slug: SLUG });
+    const existingTopic = (await cell.listRefs()).refs.find((ref) => ref.name === "refs/heads/topic");
+    if (existingTopic !== undefined && existingTopic.target !== TIP1) {
+      const deleted = await cell.deleteApiRef({ ref: "refs/heads/topic", expectedOid: existingTopic.target });
+      if (deleted.tag !== "deleted") throw new Error(`topic ref delete rejected: ${JSON.stringify(deleted)}`);
+    }
+    if (existingTopic === undefined || existingTopic.target !== TIP1) {
+      const created = await cell.commitApiChange({ ref: "refs/heads/topic", expectedOldOid: ZERO_OID, newOid: TIP1 });
+      if (created.tag !== "committed") throw new Error(`topic ref rejected: ${JSON.stringify(created)}`);
+    }
+
+    const { pull } = await seedPullWithCodeComment({ posterId: ownerId });
+    const repoRow = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, engineRepoId)).get();
+    if (repoRow === undefined) throw new Error("clock arm: repo row missing");
+    const ownerRow = await drizzle(env.DB).select().from(users).where(eq(users.id, ownerId)).get();
+    if (ownerRow === undefined) throw new Error("clock arm: owner row missing");
+
+    const PIN = new Date("2024-06-07T08:09:10Z");
+    await updatePullRequestBranch(captured, { repo: repoRow, owner: ownerRow }, pull, false, PIN);
+
+    const tip = (await cell.listRefs()).refs.find((ref) => ref.name === "refs/heads/topic")?.target;
+    const mergeCommit = await cell.readCommit(tip);
+    expect(mergeCommit?.parents).toEqual([TIP1, TIP2]); // the true merge of base into head
+    expect(mergeCommit?.message).toContain("Merge branch 'main' into topic");
+    expect(mergeCommit?.author.time).toBe(Math.floor(PIN.getTime() / 1000));
+    expect(mergeCommit?.committer.time).toBe(Math.floor(PIN.getTime() / 1000));
   });
 });
 

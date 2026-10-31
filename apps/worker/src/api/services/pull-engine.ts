@@ -378,12 +378,22 @@ export async function composeMergeMessage(
   return message;
 }
 
-function mergePerson(c: Context<ApiEnv>): Person {
+/**
+ * The merge commit's author/committer lines, stamped with the merge FLOW's
+ * clock (`opts.now` — the same Date the row's merged_at and the merge_pull
+ * close comment carry), not a fresh wall read. The render-wallclock audit's
+ * class-(c) fix: the stamp lands in STORED git objects, so a pinned clock can
+ * only hold the bytes at the write path — and production gets one clock per
+ * merge flow (commit stamps == row stamps) instead of two reads a handler
+ * apart. Upstream parity: MergePullContext stamps everything from one
+ * time.Now (routers/api/v1/repo/pull.go merge handler → pull.Merge).
+ */
+function mergePerson(c: Context<ApiEnv>, now: Date): Person {
   const doer = c.get("authUser");
   const hostname = new URL(c.req.url).hostname;
   const name = doer?.login ?? "Gitea";
   const email = doer?.email && doer.email !== "" ? doer.email : `${name.toLowerCase()}@noreply.${hostname}`;
-  return { name, email, time: Math.floor(Date.now() / 1000), tz: "+0000" };
+  return { name, email, time: Math.floor(now.getTime() / 1000), tz: "+0000" };
 }
 
 /**
@@ -437,7 +447,7 @@ export async function mergePullRequest(
       const replay: RebaseOutcome = await cell.rebaseOnto({
         head: headRef,
         onto: baseTip,
-        committer: mergePerson(c),
+        committer: mergePerson(c, opts.now),
       });
       if (replay.tag !== "rebased") {
         throw new ApiError(405, replay.tag === "conflict" ? "rebase would conflict" : replay.tag === "too_many" ? `too many commits to rebase [count: ${replay.count}]` : replay.tag);
@@ -456,8 +466,8 @@ export async function mergePullRequest(
       head,
       expectedBaseOid: baseTip,
       message: opts.message,
-      author: mergePerson(c),
-      committer: mergePerson(c),
+      author: mergePerson(c, opts.now),
+      committer: mergePerson(c, opts.now),
       extraRefUpdates: [],
     });
     if (result.tag !== "committed") {

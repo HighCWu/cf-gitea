@@ -41,7 +41,10 @@ import { registerBranchRoutes } from "./routes/branches";
 import { registerCommitRoutes } from "./routes/commits";
 import { registerContentsRoutes } from "./routes/contents";
 import { registerPullRoutes } from "./routes/pulls";
+import { mergePullRequest } from "./services/pull-engine";
 import { engineReads, refTipMap, ZERO_OID } from "./services/engine";
+import { findPullRequestByIndex } from "./services/pulls";
+import type { Context } from "hono";
 import { RepoService } from "../repos/service";
 import type { User } from "./models/user";
 
@@ -405,6 +408,125 @@ describe("POST …/merge — the styles over the engine's landing primitives", (
     const pr = await jsonBody(await get(`${REPO}/pulls/${index}`));
     expect(pr.merged).toBe(true);
     expect(pr.merge_commit_sha).toBe(mainTip);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The flow clock (the render-wallclock audit's class-(c) twins): the merge
+// commit's author/committer stamps ride MergePullOptions.now — the SAME Date
+// as the row's merged_at and the merge_pull close comment — instead of a
+// fresh wall read. The stamps land in STORED git objects, so the pin has to
+// happen at the write; the route keeps `now: new Date()` (production
+// unchanged), so these arms drive the service directly with a pinned clock
+// through a captured authenticated Context.
+//
+// They run on their OWN seeded repo (apisuite/pulls-clock), NOT the shared
+// `apisuite/pulls` fixture: every fork-head create carries the base tip's
+// closure through carryLooseRefs' fixed walk budget (WALK_MAX_RPC=400,
+// repos/carry.ts), so ANY growth of the shared repo's main closure — these
+// arms' merges included — tips the later fork arms' pr-create base-fetch
+// walk over budget (observed: "RPC budget exceeded" 500s). The clock repo
+// is forked by nothing; its graph is free to grow.
+// ---------------------------------------------------------------------------
+
+describe("merge commits ride the flow's clock (mergePerson honors MergePullOptions.now)", () => {
+  const CLOCK_SLUG = "pulls-clock";
+  const CLOCK_REPO = `/repos/${OWNER}/${CLOCK_SLUG}`;
+  const PIN = new Date("2024-04-05T06:07:08Z");
+  const PIN_S = Math.floor(PIN.getTime() / 1000);
+
+  beforeAll(async () => {
+    await ensureSeededRepo({ owner: OWNER, slug: CLOCK_SLUG, commits: SEED_COMMITS });
+  });
+
+  /** A real authenticated Context (authUser + request URL) for the direct
+   *  service calls — the same shape mergePerson reads on the route path. */
+  async function captureContext(): Promise<Context<ApiEnv>> {
+    let captured: Context<ApiEnv> | null = null;
+    const a = new OpenAPIHono<ApiEnv>();
+    a.onError(giteaErrorHandler);
+    a.get("/clock-capture", createTokenAuthMiddleware(resolver), (c) => {
+      captured = c;
+      return c.json({});
+    });
+    const res = await a.fetch(new Request(`${ORIGIN}/clock-capture`, { headers: { Authorization: `token ${TOKEN}` } }), env);
+    expect(res.status).toBe(200);
+    if (captured === null) throw new Error("clock-capture: context missing");
+    return captured;
+  }
+
+  /** Branch + one content commit through the API's own write paths, on the
+   *  clock repo (the shared suite helper is `pulls`-repo bound). */
+  async function seedClockBranch(branch: string, path: string, content: string): Promise<void> {
+    const created = await send(`${CLOCK_REPO}/branches`, jsonInit("POST", { new_branch_name: branch }));
+    expect(created.status).toBe(201);
+    const written = await send(`${CLOCK_REPO}/contents/${path}`, jsonInit("POST", { content: btoa(content), branch, message: `${branch}: ${path}` }));
+    expect(written.status).toBe(201);
+  }
+
+  /** The pair/issue/pr rows of one fresh PR on the clock repo. */
+  async function pullRows(headBranch: string, title: string) {
+    const created = await send(`${CLOCK_REPO}/pulls`, jsonInit("POST", { title, head: headBranch, base: "main" }));
+    expect(created.status).toBe(201);
+    const index = (await jsonBody(created)).number as number;
+    const repoRow = await drizzle(env.DB)
+      .select()
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, CLOCK_SLUG)))
+      .get();
+    if (repoRow === undefined) throw new Error("clock arm: repo row missing");
+    const ownerRow = await drizzle(env.DB).select().from(users).where(eq(users.id, OWNER_ID)).get();
+    if (ownerRow === undefined) throw new Error("clock arm: owner row missing");
+    const found = await findPullRequestByIndex(env.DB, repoRow.id, index);
+    if (found === null) throw new Error("clock arm: pr row missing");
+    return { pair: { repo: repoRow, owner: ownerRow }, issue: found.issue, pr: found.pullRequest };
+  }
+
+  it("the merge-style landing stamps author+committer from opts.now; the row's merged_at carries the same clock", async () => {
+    const captured = await captureContext();
+    await seedClockBranch("clock-merge", "clock-m.txt", "clock m\n");
+    const { pair, issue, pr } = await pullRows("clock-merge", "Clock merge");
+
+    const { commitOid } = await mergePullRequest(captured, pair, issue, pr, {
+      style: "merge",
+      message: "clock: pinned merge\n",
+      deleteBranchAfterMerge: false,
+      doerId: OWNER_ID,
+      now: PIN,
+    });
+    if (commitOid === null) throw new Error("clock arm: merge landed no commit");
+
+    const commit = await engineReads(env, { ownerNamespace: OWNER, slug: CLOCK_SLUG }).readCommit(commitOid);
+    expect(commit?.author.time).toBe(PIN_S);
+    expect(commit?.committer.time).toBe(PIN_S);
+
+    const after = await findPullRequestByIndex(env.DB, pair.repo.id, pr.index);
+    expect(after?.pullRequest.mergedAt?.getTime()).toBe(PIN.getTime());
+  });
+
+  it("the rebase replay stamps the replayed commits' committer from opts.now (author dates preserved)", async () => {
+    const captured = await captureContext();
+    // diverge first: branch at the current main, THEN advance main, so the
+    // rebase actually replays (an up-to-date head is the 405 arm).
+    await seedClockBranch("clock-rebase", "clock-r.txt", "clock r\n");
+    await send(`${CLOCK_REPO}/contents/main-clock.txt`, jsonInit("POST", { content: btoa("main advance\n"), branch: "main", message: "main: clock advance" }));
+    const { pair, issue, pr } = await pullRows("clock-rebase", "Clock rebase");
+
+    await mergePullRequest(captured, pair, issue, pr, {
+      style: "rebase",
+      message: "",
+      deleteBranchAfterMerge: false,
+      doerId: OWNER_ID,
+      now: PIN,
+    });
+
+    const tips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: CLOCK_SLUG }).listRefs());
+    const mainTip = tips.get("refs/heads/main")?.target;
+    const replayed = await engineReads(env, { ownerNamespace: OWNER, slug: CLOCK_SLUG }).readCommit(mainTip);
+    // the replay re-stamps ONLY the committer line (RebaseOntoInput's
+    // contract: "authors/author dates are preserved from each commit")
+    expect(replayed?.committer.time).toBe(PIN_S);
+    expect(replayed?.author.time).not.toBe(PIN_S);
   });
 });
 

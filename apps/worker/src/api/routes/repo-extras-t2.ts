@@ -634,12 +634,20 @@ async function posterUserOf(d1: D1Database, posterId: number | null, viewer: Vie
 // pulls/{index}/update helpers (routers/api/v1/repo/pull.go UpdatePullRequest)
 // ---------------------------------------------------------------------------
 
-function mergePersonOf(c: Context<ApiEnv>): { name: string; email: string; time: number; tz: string } {
+/**
+ * The update-op twin of pull-engine's mergePerson, stamped with the op's flow
+ * clock (`now` — absent = the wall clock, every existing caller unchanged).
+ * The render-wallclock audit's class-(c) fix: the stamp lands in STORED git
+ * objects, so a pinned clock can only hold the bytes at the write path.
+ * Upstream parity: UpdatePullRequest stamps its merge from one time.Now
+ * (routers/api/v1/repo/pull.go UpdatePullRequest → pull.Update).
+ */
+function mergePersonOf(c: Context<ApiEnv>, now?: Date): { name: string; email: string; time: number; tz: string } {
   const doer = c.get("authUser");
   const hostname = new URL(c.req.url).hostname;
   const name = doer?.login ?? "Gitea";
   const email = doer?.email && doer.email !== "" ? doer.email : `${name.toLowerCase()}@noreply.${hostname}`;
-  return { name, email, time: Math.floor(Date.now() / 1000), tz: "+0000" };
+  return { name, email, time: Math.floor((now ?? new Date()).getTime() / 1000), tz: "+0000" };
 }
 
 /**
@@ -651,12 +659,17 @@ function mergePersonOf(c: Context<ApiEnv>): { name: string; email: string; time:
  * 405 arm belongs to the merge op and is intentionally not reused: update
  * declares 409 where merge declares 405 (upstream IsErrMergeConflicts → 409
  * here).
+ *
+ * `now` pins the merge commit's person stamps (the wall clock when absent);
+ * exported for the pinned-clock test arm — the route handler keeps the
+ * default, so production bytes are unchanged.
  */
-async function updatePullRequestBranch(
+export async function updatePullRequestBranch(
   c: Context<ApiEnv>,
   pair: RepoPair,
   pr: PullRequestWithIssue,
   rebase: boolean,
+  now?: Date,
 ): Promise<void> {
   const cell = engineCell(c.env, pair.repo);
   const reads = engineReads(c.env, pair.repo);
@@ -668,7 +681,7 @@ async function updatePullRequestBranch(
   }
   const headRef = branchRef(pr.pullRequest.headBranch);
   const message = `Merge branch '${pr.pullRequest.baseBranch}' into ${pr.pullRequest.headBranch}`;
-  const person = mergePersonOf(c);
+  const person = mergePersonOf(c, now);
 
   let style: MergeStyle = "merge";
   let head: string = branchRef(pr.pullRequest.baseBranch);

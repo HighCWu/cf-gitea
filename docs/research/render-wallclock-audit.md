@@ -30,8 +30,8 @@ Classes:
 | `ui/pages/activity-author-data.ts` (`options.now ?? new Date()`) | activity period window | (a) | none |
 | `ui/pages/milestones.tsx`, `milestone-detail.tsx`, `global-inbox.tsx`, `user-settings-applications.tsx`, `user-settings-keys.tsx`, `repo-settings-deploy-keys.tsx` loaders (`now: Date = new Date()`) | over-due / added stamps | (a) — the house convention this audit extends | none |
 | `api/services/activity-feeds.ts` `recordAction` (`draft.createdAt ?? new Date()`) | action rows | (a) | none |
-| `services/wiki.ts` `wikiPerson` — `Date.now()` into author/committer of wiki commit objects | wiki view's last-edited TimeSince + commit oid | (c) — stamped into STORED git objects (engine/R2); the view reads the stored commit, so no render-site fixture can pin it | documented; follow-up below (sized, NOT implemented) |
-| `api/routes/repo-extras-t2.ts` `mergePersonOf` / `api/services/pull-engine.ts` `mergePerson` — `Date.now()` person stamps | merge-commit author/committer → commit-list TimeSince bytes | (c) — same stored-git-object class as wiki (note: `pull-engine`'s `MergeInput` already carries `now: Date`, but `mergePerson` ignores it) | documented; same follow-up family |
+| `services/wiki.ts` `wikiPerson` — `Date.now()` into author/committer of wiki commit objects | wiki view's last-edited TimeSince + commit oid | (c) — stamped into STORED git objects (engine/R2); the view reads the stored commit, so no render-site fixture can pin it | **Seam landed**: `WikiWriteOptions.now` through applyWikiChanges/create/edit/delete (a9fe3b6; the goldens' seed-wiki.ts writer + view golden); stored-byte determinism arms in wiki.test.ts |
+| `api/routes/repo-extras-t2.ts` `mergePersonOf` / `api/services/pull-engine.ts` `mergePerson` — `Date.now()` person stamps | merge-commit author/committer → commit-list TimeSince bytes | (c) — same stored-git-object class as wiki (note: `pull-engine`'s `MergeInput` already carries `now: Date`, but `mergePerson` ignores it) | **Seam landed**: `mergePerson(c, opts.now)` — the commit stamps ride `MergePullOptions.now` (one clock per merge flow, commit == merged_at); `mergePersonOf(c, now?)` + `updatePullRequestBranch(…, now?)` (wall-clock default, route unchanged); pinned-clock arms in both suites |
 | Write-path stamps across `ui/pages/*.tsx` / `api/routes/*` / `api/services/*` (`updatedAt`/`createdAt` inserts, e.g. `repo-create.tsx`, `pull-reviews.tsx`, `branch-protections.ts`) | stored metadata that some pages later render | (a-via-seeds) — goldens seed D1 directly with fixed stamps, so these never block | none |
 | `api/routes/admin-degenerate.ts:339` `toApiCron(task, new Date())`; `account-aggregates.ts` / `misc-t3.ts` / `user-read-t2.ts` heatmap minute-cutoffs | API-tier JSON timestamps | route-layer clocks over JSON, not HTML/feeds — out of this audit's render scope; same follow-up family | none |
 | `ui/session.ts`, `web/attachments-serving.ts` (`resolveOptionalCredential`) | auth limiter / token-verify clocks — no rendered bytes | n/a | none |
@@ -69,18 +69,25 @@ Classes:
    here — the P3-2(a) closure). The admin-monitor-cron golden's CURRENT
    red is a later landing's stale fixture (`a63adfb` landed the per-row
    Run buttons without regenerating it), not this seam.
-2. **Wiki fixed-time object writer (sized, NOT implemented).** `applyWikiChanges`
-   stamps `wikiPerson`'s clock into stored commits; a fixed-time variant would
-   (i) thread `now?: Date` through the wiki service write API
-   (`saveWikiPage`/`deleteWikiPage` and their route/session callers), and
-   (ii) give the golden seed a raw-object writer path (write the wiki commit
-   with a pinned author/committer time around the landed service — the
-   goldens.test.ts skip note's "not trivially file-local" caveat). Sizing:
-   the service signature change is small, but the seed path needs engine-level
-   object writes, so it is a wave of its own. Same family: route
-   `MergeInput.now` into `pull-engine.mergePerson` (and the
-   `repo-extras-t2.mergePersonOf` twin) so merge commits share the flow's
-   clock.
+2. **Wiki fixed-time object writer — LANDED (P3-2(c) closure).** The raw-object
+   variant was retired for the cheaper seam: `services/wiki.ts` took
+   `WikiWriteOptions { now }` (unix seconds, absent = wall clock) threaded
+   through `applyWikiChanges`/`createWikiPage`/`editWikiPage`/`deleteWikiPage`
+   (a9fe3b6), and the golden seed rides the LANDED service through
+   `ui/testing/seed-wiki.ts` (`now: T0 + 210` — real cell, only stamp +
+   identity pinned; the deterministic commit oid falls out of
+   same-tree+same-person-lines = same SHA-1). The wiki-view golden +
+   double-render byte equality pin the rendered bytes
+   (goldens.test.ts); wiki.test.ts pins the STORED objects (same edit at one
+   pinned clock → byte-identical commits in two fresh cells; a different pin
+   rides the bytes). Same family LANDED: `pull-engine.mergePerson` now stamps
+   from `MergePullOptions.now` (the flow's one clock — commit stamps ==
+   `merged_at` == the close comment), and the `repo-extras-t2.mergePersonOf`
+   twin takes `now?` through `updatePullRequestBranch` (route call site keeps
+   the wall-clock default — production bytes unchanged). Both merge suites
+   carry pinned-clock arms; the engine needed NO changes (`ExecuteMergeInput`
+   and `RebaseOntoInput` already take explicit `Person.time` stamps — the
+   leak was purely the worker's person construction).
 3. **API-tier route clocks** (cron `toApiCron`, heatmap cutoffs): same
    harness-clock follow-up if API JSON goldens ever land.
 

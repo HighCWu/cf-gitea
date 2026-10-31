@@ -49,6 +49,7 @@ import type { User } from "../models/user";
 import { registerWikiRoutes } from "./wiki";
 import { contract } from "../../compat/contract/frozen-contract";
 import {
+  createWikiPage,
   gitPathToWebPath,
   goQuote,
   pathJoinRelX,
@@ -57,6 +58,7 @@ import {
   webPathToGitPath,
   webPathToUserTitle,
 } from "../../services/wiki";
+import type { RepositoryWithOwner } from "../services/repository";
 
 // wave-129 full-run contention budget: this file's beforeAll seeding (the
 // receive-flow wiki repo) measured a 4.59s hook share of the 30s default IN a
@@ -728,5 +730,54 @@ describe("disabled wiki (mustEnableUnit(unit.TypeWiki) over repo_settings.hasWik
     const res = await get(`${MAIN_PATH}/wiki/pages`);
     expect(res.status).toBe(200);
     expect(res.headers.get("X-Total-Count")).not.toBe("0");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The fixed-time writer's stored-byte determinism (the render-wallclock
+// audit's class-(c) gate, services/wiki.ts WikiWriteOptions.now): the stamps
+// live in STORED git objects, so the pin is the write's only clock input.
+// The same edit under the same pin lands byte-identical stored commits (a
+// git oid IS the SHA-1 of the object bytes — equal oids mean equal bytes);
+// a different pin rides the bytes (different oid). The goldens suite pins
+// the RENDERED view over this same seam (ui/testing/seed-wiki.ts); these
+// arms pin the STORED objects at the service level.
+// ---------------------------------------------------------------------------
+
+describe("wiki write clock pin — stored-byte determinism (WikiWriteOptions.now)", () => {
+  const PIN = 1_700_000_000; // 2023-11-14T22:13:20Z
+  const PIN_LATER = PIN + 600; // 2023-11-14T22:23:20Z
+  const PAGE = { title: "ClockPin", content: new TextEncoder().encode("# pinned\n"), message: "Add \"ClockPin\"" };
+  const DOER = { name: OWNER, email: `${OWNER}@example.com` };
+
+  async function clockPair(slug: string): Promise<RepositoryWithOwner> {
+    await ensureSeededRepo({
+      owner: OWNER,
+      slug,
+      commits: [{ message: "seed: clock-pin host", time: 1_760_000_000, files: [{ path: "README.md", content: "# seed\n" }] }],
+    });
+    const repoRow = await drizzle(env.DB).select().from(repositories).where(eq(repositories.slug, slug)).get();
+    if (repoRow === undefined) throw new Error(`clock-pin repo row missing: ${slug}`);
+    const ownerRow = await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, OWNER)).get();
+    if (ownerRow === undefined) throw new Error("clock-pin owner row missing");
+    return { repo: repoRow, owner: ownerRow };
+  }
+
+  it("the same edit at the same pinned clock lands byte-identical stored commits in two fresh cells", async () => {
+    const first = await createWikiPage(env, await clockPair("wpin-a"), DOER, { ...PAGE }, ORIGIN, { now: PIN });
+    const second = await createWikiPage(env, await clockPair("wpin-b"), DOER, { ...PAGE }, ORIGIN, { now: PIN });
+    // same tree bytes + same person lines → same SHA-1: the STORED commit is
+    // identical across cells, so fixtures can pin stored-object bytes.
+    expect(second.last_commit?.sha).toBe(first.last_commit?.sha);
+    expect(first.last_commit?.author.date).toBe("2023-11-14T22:13:20Z");
+    expect(first.last_commit?.commiter.date).toBe("2023-11-14T22:13:20Z");
+  });
+
+  it("a different pinned clock rides the stored bytes (different oid, pinned dates)", async () => {
+    const pinned = await createWikiPage(env, await clockPair("wpin-c"), DOER, { ...PAGE }, ORIGIN, { now: PIN });
+    const later = await createWikiPage(env, await clockPair("wpin-d"), DOER, { ...PAGE }, ORIGIN, { now: PIN_LATER });
+    expect(later.last_commit?.sha).not.toBe(pinned.last_commit?.sha);
+    expect(later.last_commit?.author.date).toBe("2023-11-14T22:23:20Z");
+    expect(later.last_commit?.commiter.date).toBe("2023-11-14T22:23:20Z");
   });
 });
