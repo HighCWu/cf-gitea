@@ -12,12 +12,12 @@
  * re-running one is always safe.
  */
 
-import { and, eq, ne } from "drizzle-orm";
+import { and, eq, ne, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import type { Context } from "hono";
 import type { MergeabilityStatus, MergeStyle, Person, RebaseOutcome } from "@cf-gitea/git-engine";
 
-import { PRFlow, PRStatus, issues, pullRequests, users } from "../../db/schema";
+import { PRFlow, PRStatus, comments, issues, pullRequests, users } from "../../db/schema";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { CommentType } from "../../issues/comment-types";
 import { IssuesService } from "../../issues/service";
@@ -33,6 +33,7 @@ import {
   engineReads,
   executeMergeError,
   pullHeadRef,
+  refTipMap,
   ZERO_OID,
 } from "./engine";
 import type { EngineMergeBaseResult, EngineReads } from "./engine";
@@ -284,7 +285,7 @@ export async function pullRequestDiffShortStat(
  * runs before the D1 landing, so this PR's row is excluded explicitly by
  * issue id.
  */
-async function hasUnmergedPullRequestsByHeadInfo(d1: D1Database, headRepoId: string, headBranch: string, excludeIssueId: number): Promise<boolean> {
+export async function hasUnmergedPullRequestsByHeadInfo(d1: D1Database, headRepoId: string, headBranch: string, excludeIssueId: number): Promise<boolean> {
   const rows = await drizzle(d1)
     .select({ id: pullRequests.id })
     .from(pullRequests)
@@ -829,4 +830,309 @@ export async function carryForkHeadIntoBase(
     await packedCatalogOids(baseSource),
     `${headPair.repo.ownerNamespace}/${headPair.repo.slug} -> ${basePair.repo.ownerNamespace}/${basePair.repo.slug} (pr-create head carry)`,
   );
+}
+
+// ---------------------------------------------------------------------------
+// The pull merge-box web write arms (the merge-box census's POST family): the
+// §3.4-family services the API merge route does not carry — the update-branch
+// execution (services/pull/update.go Update), the standalone post-merge
+// cleanup (services/repository/branch.go DeleteBranchAfterMerge — the web
+// CleanUpPullRequest arm's service) and the target-branch retarget
+// (services/pull/pull.go ChangeTargetBranch). The UI merge-box module
+// (ui/pages/pull-merge-box.tsx) owns the handler ladders — permission gates,
+// form mapping, outcome mapping — over these seams, exactly like the API
+// merge route owns its ladder over mergePullRequest above.
+// ---------------------------------------------------------------------------
+
+/**
+ * Update the PR's head branch with the base branch (services/pull/update.go
+ * Update, :24-99): style merge lands the reverse-PR merge commit (base =
+ * the HEAD branch — the ref that MOVES — head = the BASE branch, exactly the
+ * FakePR swap at :77-90); style rebase replays the head onto the base tip and
+ * fast-forwards (updateHeadByRebaseOnToBase, §4.5's choreography). The row
+ * then CAS-resets to `checking` with mergeBase/conflicts cleared — upstream
+ * re-checks mergeability inline through the post-web-operation task
+ * (addTestPullRequestTaskAfterWebOperation, :69); ours delegates to the lazy
+ * check the next GET runs (§3.4's self-healing posture, the same reset the
+ * target-branch retarget below takes).
+ *
+ * Same-repo heads ONLY: a fork head's cell carries the base branch as a
+ * FORK-POINT SNAPSHOT (SPEC-0001b §5.2 replication), so merging it would
+ * silently drop the base's newer commits — the cross-cell live fetch upstream
+ * runs (it fetches pr.BaseRepo into the head repo) has no landed primitive,
+ * and a wrong-content merge is worse than a refusal (ApiError 405; the UI
+ * render gates the arm to same-repo heads).
+ *
+ * Refusals, upstream order: AGit flow → the unsupported error (500, the
+ * update.go:26-29 TODO); the pull ref unresolvable or behind == 0 → 405
+ * ("HeadBranch of PR N is up to date", update.go:44-51 — the handler renders
+ * it a flash error); missing head/base branch → 405 (the merge route's own
+ * text). Ref CAS races surface through executeMerge's tags
+ * (conflict / not_fast_forward / ref_conflict — executeMergeError).
+ */
+export async function updatePullRequestBranch(
+  c: Context<ApiEnv>,
+  pair: RepositoryWithOwner,
+  pr: PullRequestRow,
+  opts: { style: "merge" | "rebase"; message: string; now: Date },
+): Promise<{ headTip: string }> {
+  if (pr.flow !== PRFlow.Github) {
+    throw new ApiError(500, "update of agit flow pull request's head branch is unsupported");
+  }
+  if (pr.headRepoId !== pair.repo.id) {
+    throw new ApiError(405, "fork head update requires the cross-cell base fetch (not landed)");
+  }
+  const cell = engineCell(c.env, pair.repo);
+  const reads = engineReads(c.env, pair.repo);
+  const headBranchRef = branchRef(pr.headBranch);
+  const baseBranchRef = branchRef(pr.baseBranch);
+  const tips = refTipMap(await reads.listRefs());
+  const headTip = tips.get(headBranchRef)?.target;
+  const baseTip = tips.get(baseBranchRef)?.target;
+  if (headTip === undefined) {
+    throw new ApiError(405, `head branch is missing [name: ${pr.headBranch}]`);
+  }
+  if (baseTip === undefined) {
+    throw new ApiError(405, `base branch is missing [name: ${pr.baseBranch}]`);
+  }
+  // GetDiverging(base, refs/pull/N/head).Behind == 0 → up to date (:44-51);
+  // the ref's absence is the same refusal class (the PR head never landed).
+  const divergence = await cell.countDivergence(baseBranchRef, pullHeadRef(pr.index));
+  if (divergence.tag !== "ok") {
+    throw new ApiError(405, `pull head ref is missing [ref: ${pullHeadRef(pr.index)}]`);
+  }
+  if (divergence.behind === 0) {
+    throw new ApiError(405, `HeadBranch of PR ${pr.index} is up to date`);
+  }
+
+  let newTip: string;
+  if (opts.style === "rebase") {
+    const replay: RebaseOutcome = await cell.rebaseOnto({ head: headBranchRef, onto: baseTip, committer: mergePerson(c, opts.now) });
+    if (replay.tag !== "rebased") {
+      throw new ApiError(
+        405,
+        replay.tag === "conflict" ? "rebase would conflict" : replay.tag === "too_many" ? `too many commits to rebase [count: ${replay.count}]` : replay.tag,
+      );
+    }
+    const stored = await cell.putRebaseObjects(replay.objects);
+    if (stored.tag !== "ok") {
+      throw new ApiError(405, stored.tag === "invalid" ? stored.reason : "rebase too large");
+    }
+    const ff = await cell.executeMerge({
+      style: "fast-forward-only",
+      base: headBranchRef,
+      head: replay.headOid,
+      expectedBaseOid: headTip,
+      message: "",
+      author: mergePerson(c, opts.now),
+      committer: mergePerson(c, opts.now),
+      extraRefUpdates: [],
+    });
+    if (ff.tag !== "committed") throw executeMergeError(ff);
+    newTip = ff.commitOid;
+  } else {
+    const result = await cell.executeMerge({
+      style: "merge",
+      base: headBranchRef,
+      head: baseBranchRef,
+      expectedBaseOid: headTip,
+      message: opts.message,
+      author: mergePerson(c, opts.now),
+      committer: mergePerson(c, opts.now),
+      extraRefUpdates: [],
+    });
+    if (result.tag !== "committed") throw executeMergeError(result);
+    newTip = result.commitOid;
+  }
+
+  // UpdateColsIfNotMerged over the reset (§3.4's CAS guard): a racing merge
+  // wins over a late branch update.
+  await drizzle(c.env.DB)
+    .update(pullRequests)
+    .set({ status: PRStatus.Checking, mergeBase: null, conflictedFiles: null, headSha: newTip })
+    .where(and(eq(pullRequests.id, pr.id), eq(pullRequests.hasMerged, false)));
+  return { headTip: newTip };
+}
+
+/**
+ * The web cleanup's service — DeleteBranchAfterMerge (services/repository/
+ * branch.go:808-884) with the CanDeleteBranch ladder (the default arm, the
+ * head-repo write arm and the protected-rule arm, :561-584 — the same
+ * predicates the embedded merge-time delete above ports) and the
+ * tip-equality gate (:866-873, "the branch has no new commits after
+ * merging": refs/pull/N/head in the BASE cell must still point at the head
+ * branch's tip in the HEAD cell). Outcome classes map onto
+ * deleteBranchAfterMergeAndFlashMessage (routers/web/repo/pull.go:1233-1253):
+ * "skipped" = the silently-ignored permission/not-exist arms; "failed" = the
+ * flash-error arms (deletion_failed / delete_branch_has_new_commits — the
+ * locale texts verbatim, the flash's only content); "deleted" = the success
+ * flash. The delete-branch system comment (AddDeletePRBranchComment, the
+ * landed type-11 push-cascade twin, services/webhooks-push.ts:1002-1016)
+ * rides success — best-effort like upstream ("intentionally ignore the
+ * following error", branch.go:877-881). The RefDelete webhook stays deferred
+ * with the embedded arm's tier-2 surface (the same skip-not-error posture).
+ */
+export type DeleteBranchAfterMergeOutcome =
+  | { outcome: "deleted"; fullBranchName: string }
+  | { outcome: "skipped"; fullBranchName: string }
+  | { outcome: "failed"; fullBranchName: string; message: string };
+
+const deletionFailedMessage = (fullBranchName: string): string => `Failed to delete branch "${fullBranchName}".`;
+
+export async function deleteBranchAfterMerge(
+  c: Context<ApiEnv>,
+  pair: RepositoryWithOwner,
+  issue: IssueRow,
+  pr: PullRequestRow,
+  opts: { doerId: number; now: Date },
+): Promise<DeleteBranchAfterMergeOutcome> {
+  const headPair = await findRepositoryById(c.env.DB, pr.headRepoId);
+  // Deleted fork → ErrNotExist wrapped (branch.go:822-825) → the flash
+  // helper's silent skip (pull.go:1237-1240).
+  if (headPair === null) {
+    return { outcome: "skipped", fullBranchName: `(deleted-repo):${pr.headBranch}` };
+  }
+  const fullBranchName = `${headPair.repo.ownerNamespace}/${headPair.repo.slug}:${pr.headBranch}`;
+  // "Don't clean up unmerged and unclosed PRs and agit PRs" (:839-842) — an
+  // unprocessable → deletion_failed flash.
+  if (!pr.hasMerged && !issue.isClosed && pr.flow !== PRFlow.Github) {
+    return { outcome: "failed", fullBranchName, message: deletionFailedMessage(fullBranchName) };
+  }
+  // "Don't clean up when there are other PR's that use this branch as head
+  // branch" (:844-849) — the shared-head probe above, exclusion aside.
+  if (await hasUnmergedPullRequestsByHeadInfo(c.env.DB, pr.headRepoId, pr.headBranch, issue.id)) {
+    return { outcome: "failed", fullBranchName, message: deletionFailedMessage(fullBranchName) };
+  }
+  // CanDeleteBranch's ladder (:561-584): the default/target arm, the write
+  // arm, the protected-rule arm — every refusal the deletion_failed flash
+  // (the permission class of the silent skip is unreachable here: the button
+  // only renders for viewers who passed the same ladder).
+  if (pr.headBranch === headPair.repo.defaultBranch) {
+    return { outcome: "failed", fullBranchName, message: deletionFailedMessage(fullBranchName) };
+  }
+  const doerRow = (await drizzle(c.env.DB).select().from(users).where(eq(users.id, opts.doerId)).get()) ?? null;
+  const access = await principalAccessOf(c.env.DB, headPair.repo, doerRow === null ? null : { id: doerRow.id, login: doerRow.username, is_admin: doerRow.isAdmin });
+  if (!access.write) {
+    return { outcome: "failed", fullBranchName, message: deletionFailedMessage(fullBranchName) };
+  }
+  const rule = await findRule(c.env.DB, headPair.repo.id, pr.headBranch);
+  if (rule !== null && !(await canUserDelete(c.env.DB, parseRuleConfig(rule.rules), access))) {
+    return { outcome: "failed", fullBranchName, message: deletionFailedMessage(fullBranchName) };
+  }
+  // The tip-equality gate (:866-873): the PR's internal ref must still point
+  // at the head branch tip — a post-merge push refuses with the
+  // has_new_commits flash.
+  const pullTip = refTipMap(await engineReads(c.env, pair.repo).listRefs()).get(pullHeadRef(pr.index))?.target;
+  const branchTip = refTipMap(await engineReads(c.env, headPair.repo).listRefs()).get(branchRef(pr.headBranch))?.target;
+  if (pullTip === undefined || branchTip === undefined || pullTip !== branchTip) {
+    return {
+      outcome: "failed",
+      fullBranchName,
+      message: `Branch "${fullBranchName}" cannot be deleted because new commits have been added after merging.`,
+    };
+  }
+  const result = await engineCell(c.env, headPair.repo).deleteApiRef({ ref: branchRef(pr.headBranch), expectedOid: branchTip });
+  if (result.tag !== "deleted") {
+    return { outcome: "failed", fullBranchName, message: deletionFailedMessage(fullBranchName) };
+  }
+  try {
+    await drizzle(c.env.DB).batch([
+      drizzle(c.env.DB).insert(comments).values({
+        type: CommentType.DeleteBranch,
+        posterId: opts.doerId,
+        issueId: issue.id,
+        oldRef: pr.headBranch,
+        createdAt: opts.now,
+      }),
+      drizzle(c.env.DB)
+        .update(issues)
+        .set({ numComments: sql`num_comments + 1`, updatedAt: opts.now })
+        .where(eq(issues.id, issue.id)),
+    ]);
+  } catch (error) {
+    console.error(`[pull-engine] delete-branch comment failed (issue ${issue.id}): ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return { outcome: "deleted", fullBranchName };
+}
+
+/**
+ * Change a pull request's target branch (services/pull/pull.go
+ * ChangeTargetBranch, :226-320): the five refusals in upstream order (the
+ * no-op same-branch return, the closed 409, the merged 409, the missing
+ * target 400, the branches-equal 400), the duplicate-open-PR 409, then the
+ * CAS landing over UpdateColsIfNotMerged's columns. The mergeability
+ * re-check upstream runs inline (checkPullRequestBranchMergeable) delegates
+ * here to the lazy check: the row CAS-resets to `checking` with
+ * mergeBase/conflicts cleared and the next GET rewrites
+ * status/conflicts/divergence/mergeBase (§3.4 — the PR is CREATED as
+ * `checking`; a retarget is the same re-derivation). The branches-equal
+ * comparison rides the BASE cell (the pull ref is the landed projection of
+ * the fork head — carryForkHeadIntoBase), so the cross-repo compare stays
+ * same-cell like every PR read (§10.8).
+ */
+export async function changePullRequestTargetBranch(
+  c: Context<ApiEnv>,
+  pair: RepositoryWithOwner,
+  issue: IssueRow,
+  pr: PullRequestRow,
+  input: { targetBranch: string; now: Date },
+): Promise<{ baseBranch: string }> {
+  // "Current target branch is already the same" (:234-236) — the no-op.
+  if (pr.baseBranch === input.targetBranch) {
+    return { baseBranch: pr.baseBranch };
+  }
+  if (issue.isClosed) {
+    throw new ApiError(409, "The pull request has been closed.");
+  }
+  if (pr.hasMerged) {
+    throw new ApiError(409, "Failed: The pull request has been merged. You cannot merge again or change the target branch.");
+  }
+  const tips = refTipMap(await engineReads(c.env, pair.repo).listRefs());
+  const targetTip = tips.get(branchRef(input.targetBranch))?.target;
+  if (targetTip === undefined) {
+    throw new ApiError(400, "Target branch does not exist.");
+  }
+  // IsHeadEqualWithBranch → ErrBranchesEqual (:261-268): the head tip (the
+  // pull ref) equals the target tip — the retarget changes nothing.
+  const headTip = tips.get(pullHeadRef(pr.index))?.target;
+  if (headTip !== undefined && headTip === targetTip) {
+    throw new ApiError(400, "There are no differences to show. There is no need to create a pull request.");
+  }
+  // GetUnmergedPullRequest duplicate (:270-282): an open unmerged Github-flow
+  // PR already spans head → target. The user_error is has_pull_request's
+  // sentence with the link stripped to text (the flash is plain text).
+  const duplicate = await drizzle(c.env.DB)
+    .select({ index: pullRequests.index })
+    .from(pullRequests)
+    .innerJoin(issues, eq(issues.id, pullRequests.issueId))
+    .where(
+      and(
+        eq(pullRequests.headRepoId, pr.headRepoId),
+        eq(pullRequests.headBranch, pr.headBranch),
+        eq(pullRequests.baseRepoId, pr.baseRepoId),
+        eq(pullRequests.baseBranch, input.targetBranch),
+        eq(pullRequests.hasMerged, false),
+        eq(issues.isClosed, false),
+        eq(pullRequests.flow, PRFlow.Github),
+        ne(pullRequests.issueId, issue.id),
+      ),
+    )
+    .limit(1)
+    .all();
+  if (duplicate.length > 0) {
+    throw new ApiError(
+      409,
+      `A pull request between these branches already exists: ${pair.repo.ownerNamespace}/${pair.repo.slug}#${duplicate[0]!.index}`,
+    );
+  }
+  const updated = await drizzle(c.env.DB)
+    .update(pullRequests)
+    .set({ baseBranch: input.targetBranch, status: PRStatus.Checking, mergeBase: null, conflictedFiles: null })
+    .where(and(eq(pullRequests.id, pr.id), eq(pullRequests.hasMerged, false)))
+    .returning({ id: pullRequests.id });
+  if (updated.length === 0) {
+    // Lost the UpdateColsIfNotMerged race — the PR merged in between.
+    throw new ApiError(409, "Failed: The pull request has been merged. You cannot merge again or change the target branch.");
+  }
+  return { baseBranch: input.targetBranch };
 }

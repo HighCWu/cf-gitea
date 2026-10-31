@@ -15,11 +15,16 @@ import { env } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
 import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
+import { Context } from "hono";
+import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { createCommitStatus } from "../../api/services/commit-status";
 import { findPullRequestByIndex } from "../../api/services/pulls";
+import { ZERO_OID, branchRef, engineReads, refTipMap, pullHeadRef } from "../../api/services/engine";
 import {
+  comments,
+  issues,
   PRFlow,
   PRStatus,
   protectedBranches,
@@ -30,15 +35,26 @@ import {
   users,
 } from "../../db/schema";
 import { IssuesService } from "../../issues/service";
+import { CommentType } from "../../issues/comment-types";
 import { emptyRuleConfig, serializeRuleConfig } from "../../services/branch-protection";
 import { RepoService } from "../../repos/service";
 import type { RepoRow } from "../ui-context";
 import {
+  cancelAutoMergeFromWeb,
+  changeTargetBranchFromWeb,
+  cleanupPullRequestFromWeb,
   loadPullMergeBoxData,
+  mergePullRequestFromWeb,
+  parseMergePullRequestWebForm,
+  parseTargetBranchForm,
+  parseUpdateBranchStyle,
   pullMergeBoxFragmentHtml,
   pullMergeBoxFragmentResponse,
+  setAllowMaintainerEditFromWeb,
   shellEscape,
+  updatePullRequestFromWeb,
   type PullMergeBoxData,
+  type PullMergeBoxWriteContext,
 } from "./pull-merge-box";
 
 // --- fixtures ----------------------------------------------------------------
@@ -48,6 +64,7 @@ const ORIGIN = "https://test.local";
 
 const alice = { kind: "user", id: 101, username: "alice", isAdmin: false } as const;
 const bob = { kind: "user", id: 102, username: "bob", isAdmin: false } as const;
+const cara = { kind: "user", id: 103, username: "cara", isAdmin: false } as const;
 const anonymous = { kind: "anonymous" } as const;
 
 let plainRepoId = "";
@@ -115,6 +132,7 @@ beforeAll(async () => {
     // Explicit high ids — the migrations seed ids 1 ('assets') and -3.
     { id: alice.id, username: "alice", usernameLower: "alice", displayName: "Alice Doe", createdAt: new Date(T0 * 1000) },
     { id: bob.id, username: "bob", usernameLower: "bob", displayName: "Bob Banner", createdAt: new Date(T0 * 1000) },
+    { id: cara.id, username: "cara", usernameLower: "cara", displayName: "Cara Null", createdAt: new Date(T0 * 1000) },
   ]);
   const repo = await new RepoService(env.DB).create({
     owner: { id: alice.id, usernameLower: "alice" },
@@ -240,7 +258,10 @@ async function indexPr(name: string): Promise<number> {
   return rows[0]!.index;
 }
 
-/** Load + project one fixture PR (fresh rows — the seed's updates landed). */
+/** Load + project one fixture PR (fresh rows — the seed's updates landed).
+ *  The engine seam rides the REAL DO cells (the deletable tip checks read
+ *  them; the row-only fixtures' branches don't exist in git, exactly the
+ *  degradation the module doc discloses). */
 async function load(
   name: string,
   viewer: typeof alice | typeof bob | typeof anonymous = alice,
@@ -253,6 +274,7 @@ async function load(
     pr: found.pullRequest,
     viewer,
     origin: ORIGIN,
+    listTips: (pair) => engineReads(env, pair).listRefs(),
   });
 }
 
@@ -479,16 +501,49 @@ describe("pullMergeBoxFragmentHtml DOM contract", () => {
     expect(html).toContain('class="svg gitea-running rotate-clockwise"');
   });
 
-  it("never renders the merge form island, delete button, or update arm", async () => {
+  it("never renders the Vue island or the cleanup link on an open box", async () => {
     for (const name of ["mergeable", "statuses", "wip"] as const) {
       const html = pullMergeBoxFragmentHtml(await load(name));
+      // The Vue island stays unrendered (the no-JS form replaced it — the
+      // write-arm tests below pin its fields); the merged box's cleanup link
+      // and the update arm stay off these fixtures (no merged rows, no
+      // commits-behind), as does the WIP toggle button.
       expect(html).not.toContain("pull-request-merge-form");
       expect(html).not.toContain("data-merge-form-props");
-      expect(html).not.toContain("delete-branch-after-merge");
+      expect(html).not.toContain("/cleanup");
       expect(html).not.toContain("out-of-date with the base branch");
       expect(html).not.toContain("initPullRequestWipToggle");
-      expect(html).not.toContain("/cleanup");
     }
+  });
+
+  it("renders the no-JS merge form with upstream's field names for a permitted viewer", async () => {
+    const html = pullMergeBoxFragmentHtml(await load("mergeable"));
+    expect(html).toContain('<form class="ui form form-fetch-action" action="/alice/mergetest/pulls/1/merge" method="post">');
+    expect(html).toContain('name="head_commit_id" value=""'); // the head_sha cache is null on this fixture
+    expect(html).toContain('name="merge_when_checks_succeed" value="false"');
+    expect(html).toContain('name="force_merge" value="false"');
+    // The composed default title (composeMergeMessage's default arm).
+    expect(html).toContain(
+      `name="merge_title_field" value="Merge pull request &#39;feat: mergeable&#39; (#${await indexPr("mergeable")}) from feature into main"`,
+    );
+    expect(html).toContain('<textarea name="merge_message_field" rows="5" placeholder="Add an optional extended description…">');
+    // The style select (the dropdown's no-JS stand-in) + the submit text.
+    expect(html).toContain('<select name="do">');
+    expect(html).toContain('<option value="merge" selected="">');
+    for (const style of ["rebase", "rebase-merge", "squash", "fast-forward-only"]) {
+      expect(html).toContain(`<option value="${style}">`);
+    }
+    expect(html).toContain("<button type=\"submit\" class=\"ui primary button\">Create merge commit</button>");
+  });
+
+  it("withholds the merge form from a non-write viewer and the delete checkbox from a missing branch", async () => {
+    const asBob = pullMergeBoxFragmentHtml(await load("mergeable", bob));
+    expect(asBob).not.toContain('action="/alice/mergetest/pulls/1/merge"');
+    // The checkbox gate: the fixture's head branch does not exist in git
+    // (the engine seam answers), so even the owner's render has none.
+    const html = pullMergeBoxFragmentHtml(await load("mergeable"));
+    expect(html).not.toContain("delete_branch_after_merge");
+    expect(html).not.toContain("delete-branch-after-merge");
   });
 
   it("renders the closed arm's h3 + body", async () => {
@@ -815,3 +870,398 @@ function htmlConflictedList(html: string): string {
   const match = /<ul class="tw-pl-\[36px\]"><li>([^<]*)<\/li><\/ul>/.exec(html);
   return match === null ? "" : match[1]!;
 }
+
+
+// --- the web write arms (census gap #2) -----------------------------------------
+// The POST ladders over REAL engine cells: a dedicated repo carries real
+// branch tips (root commit R on main; the divergent feature tip C), the PR
+// rows are stamped to the matching states, and every write drives the module
+// seams with constructed contexts (the house's non-mounted handler test
+// convention — the mounted arms are index-owned, the handoff recipe rides the
+// module report).
+
+let writeRepoId = "";
+const writePrIds: Record<string, number> = {};
+const writeIssueIds: Record<string, number> = {};
+let rootOid = "";
+let featureOid = "";
+
+const writeRepoOf = async (): Promise<RepoRow> => repoRow(writeRepoId);
+
+/** Worker-side object hash + one commit landed on a ref (the pulls.test.ts
+ *  seed twin). */
+async function gitObjectOid(type: string, data: Uint8Array): Promise<string> {
+  const header = new TextEncoder().encode(`${type} ${data.byteLength}\0`);
+  const bytes = new Uint8Array(header.byteLength + data.byteLength);
+  bytes.set(header, 0);
+  bytes.set(data, header.byteLength);
+  const digest = await crypto.subtle.digest("SHA-1", bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function landCommit(
+  repo: { ownerNamespace: string; slug: string },
+  ref: string,
+  input: { parents: string[]; message: string; fileName: string; content: string; /** The ref's CURRENT tip when moving an existing branch. */ replaceOid?: string },
+): Promise<string> {
+  const cell = env.REPO.getByName(`${repo.ownerNamespace}/${repo.slug}`);
+  const blob = new TextEncoder().encode(input.content);
+  const blobOid = await gitObjectOid("blob", blob);
+  const tree = serializeTree([{ mode: "100644", name: input.fileName, oid: blobOid }]);
+  const person = { name: "seed", email: "seed@mergetest.invalid", time: 1_700_000_000, tz: "+0000" };
+  const commit = serializeCommit({ tree: tree.oid, parents: input.parents, author: person, committer: person, message: `${input.message}\n` });
+  const put = await cell.putApiObjects([
+    { oid: blobOid, type: "blob", data: blob },
+    { oid: tree.oid, type: "tree", data: tree.data },
+    { oid: commit.oid, type: "commit", data: commit.data },
+  ]);
+  if (put.tag !== "ok") throw new Error(`seed putApiObjects failed: ${put.tag}`);
+  const landed = await cell.commitApiChange({ ref, expectedOldOid: input.replaceOid ?? ZERO_OID, newOid: commit.oid });
+  if (landed.tag !== "committed") throw new Error(`seed ref landing failed: ${ref} (${landed.tag})`);
+  return commit.oid;
+}
+
+async function landPullRef(index: number, oid: string): Promise<void> {
+  const landed = await env.REPO.getByName("alice/wrepo").commitApiChange({ ref: pullHeadRef(index), expectedOldOid: ZERO_OID, newOid: oid });
+  if (landed.tag !== "committed") throw new Error(`pull ref landing failed (${landed.tag})`);
+}
+
+async function seedWritePr(
+  name: string,
+  input: { title: string; headBranch: string; baseBranch?: string; posterId?: number },
+  state: Partial<{ status: number; headSha: string | null; commitsBehind: number; conflictedFiles: string | null }>,
+): Promise<number> {
+  const service = new IssuesService(env.DB);
+  const { issue, pullRequest } = await service.createPullRequest({
+    repoId: writeRepoId,
+    title: input.title,
+    posterId: input.posterId ?? bob.id,
+    headRepoId: writeRepoId,
+    baseBranch: input.baseBranch ?? "main",
+    headBranch: input.headBranch,
+    now: new Date((T0 + 200) * 1000),
+  });
+  writePrIds[name] = pullRequest.id;
+  writeIssueIds[name] = issue.id;
+  await d1()
+    .update(pullRequests)
+    .set({
+      status: state.status ?? PRStatus.Mergeable,
+      headSha: state.headSha ?? null,
+      commitsBehind: state.commitsBehind ?? 0,
+      conflictedFiles: state.conflictedFiles ?? null,
+    })
+    .where(eq(pullRequests.id, pullRequest.id));
+  return pullRequest.index;
+}
+
+/** The constructed write context (the mounted route's `c` with the resolved
+ *  rows — the session/anonymous gates precede, so the viewer is always a
+ *  user). */
+async function writeCtx(prName: string, viewer: typeof alice | typeof bob | typeof cara): Promise<PullMergeBoxWriteContext> {
+  const index = await writeIndex(prName);
+  const found = await findPullRequestByIndex(env.DB, writeRepoId, index);
+  if (found === null) throw new Error(`fixture ${prName} missing`);
+  return {
+    c: new Context(new Request(`${ORIGIN}/alice/wrepo/pulls/${index}`, { method: "POST" }), { env }),
+    repo: await writeRepoOf(),
+    issue: found.issue,
+    pr: found.pullRequest,
+    viewer,
+  };
+}
+
+async function writeIndex(name: string): Promise<number> {
+  const rows = await d1().select().from(pullRequests).where(eq(pullRequests.id, writePrIds[name]!)).all();
+  return rows[0]!.index;
+}
+
+const mergeFormOf = (overrides: Record<string, string | undefined> = {}) => {
+  const params = new URLSearchParams({ do: "merge", force_merge: "false", merge_when_checks_succeed: "false" });
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) continue;
+    params.set(key, value);
+  }
+  return parseMergePullRequestWebForm(params);
+};
+
+describe("the web write arms", () => {
+  beforeAll(async () => {
+    const repo = await new RepoService(env.DB).create({
+      owner: { id: alice.id, usernameLower: "alice" },
+      name: "wrepo",
+      isPrivate: false,
+      status: "ready",
+    });
+    writeRepoId = repo.id;
+    const pair = { ownerNamespace: "alice", slug: "wrepo" };
+    // R on main; the divergent C on feature; the release branch (the
+    // target-branch fixture's target) at R.
+    rootOid = await landCommit(pair, branchRef("main"), { parents: [], message: "root", fileName: "README.md", content: "# wrepo\n" });
+    featureOid = await landCommit(pair, branchRef("feature"), { parents: [rootOid], message: "feature work", fileName: "feat.ts", content: "export {}\n" });
+    const okOid = await landCommit(pair, branchRef("okbranch"), { parents: [rootOid], message: "ok work", fileName: "ok.ts", content: "ok\n" });
+    await landCommit(pair, branchRef("release"), { parents: [rootOid], message: "release cut", fileName: "VERSION", content: "1.0.0\n" });
+    await env.REPO.getByName("alice/wrepo").setHead("main");
+
+    // The PR rows. ok/manual/behind get real pull refs below; the refusal
+    // fixtures refuse before any engine read matters.
+    await seedWritePr("ok", { title: "feat: ok", headBranch: "okbranch" }, { headSha: okOid });
+    await seedWritePr("wip", { title: "WIP: stalled", headBranch: "feature" }, { headSha: featureOid });
+    await seedWritePr("conflicted", { title: "fix: conflicted", headBranch: "feature" }, { status: PRStatus.Conflict, headSha: featureOid });
+    await seedWritePr("closedpr", { title: "feat: closed", headBranch: "feature" }, { headSha: featureOid });
+    await new IssuesService(env.DB).closeIssue(writeIssueIds.closedpr!, { actorId: alice.id, now: new Date((T0 + 210) * 1000) });
+    await seedWritePr("manual", { title: "misc: manual", headBranch: "feature" }, { headSha: rootOid });
+    await seedWritePr("behind", { title: "feat: behind", headBranch: "feature" }, { headSha: rootOid, commitsBehind: 1 });
+    await seedWritePr("fresh", { title: "feat: fresh", headBranch: "feature" }, { headSha: featureOid, commitsBehind: 0 });
+    await seedWritePr("edits", { title: "feat: edits", headBranch: "feature", posterId: bob.id }, { headSha: featureOid });
+    await seedWritePr("editsok", { title: "feat: edits ok", headBranch: "feature", posterId: alice.id }, { headSha: featureOid });
+    await seedWritePr("retarget", { title: "feat: retarget", headBranch: "feature", posterId: bob.id }, { headSha: featureOid });
+
+    await landPullRef(await writeIndex("ok"), okOid);
+    await landPullRef(await writeIndex("manual"), rootOid);
+    await landPullRef(await writeIndex("behind"), rootOid);
+
+    // The main advance LAST: base tip moves past R (the behind PR's live
+    // divergence) while the refs above stay put.
+    await landCommit(pair, branchRef("main"), { parents: [rootOid], message: "main advance", fileName: "NEXT.md", content: "next\n", replaceOid: rootOid });
+  });
+
+  it("merges an open mergeable PR: redirect, merged row, close comment", async () => {
+    const ctx = await writeCtx("ok", alice);
+    const result = await mergePullRequestFromWeb(ctx, mergeFormOf({ merge_title_field: "", merge_message_field: "" }));
+    expect(result).toEqual({ outcome: "redirect", location: `/alice/wrepo/pulls/${await writeIndex("ok")}` });
+    const after = (await findPullRequestByIndex(env.DB, writeRepoId, await writeIndex("ok")))!;
+    expect(after.pullRequest.hasMerged).toBe(true);
+    expect(after.pullRequest.mergedCommitId).not.toBeNull();
+    expect(after.issue.isClosed).toBe(true);
+    // The merge_pull system comment (the close service's write).
+    const rows = await d1().select().from(comments).where(eq(comments.issueId, after.issue.id)).all();
+    expect(rows.some((row) => row.type === CommentType.MergePull)).toBe(true);
+  });
+
+  it("refuses the merge for a non-write viewer (the update_not_allowed flash)", async () => {
+    const ctx = await writeCtx("conflicted", bob);
+    const result = await mergePullRequestFromWeb(ctx, mergeFormOf());
+    expect(result).toEqual({ outcome: "error", message: "You are not allowed to update branch" });
+  });
+
+  it("maps CheckPullMergeable's refusal arms to their flash texts", async () => {
+    expect(await mergePullRequestFromWeb(await writeCtx("wip", alice), mergeFormOf())).toEqual({
+      outcome: "error",
+      message: "This pull request cannot be merged because it is marked as being a work in progress.",
+    });
+    expect(await mergePullRequestFromWeb(await writeCtx("closedpr", alice), mergeFormOf())).toEqual({
+      outcome: "error",
+      message: "The pull request has been closed.",
+    });
+    expect(await mergePullRequestFromWeb(await writeCtx("conflicted", alice), mergeFormOf())).toEqual({
+      outcome: "error",
+      message: "This pull request is not ready to be merged. Check review status and status checks.",
+    });
+    expect(await mergePullRequestFromWeb(await writeCtx("conflicted", alice), mergeFormOf({ do: "explode" }))).toEqual({
+      outcome: "error",
+      message: "You cannot use this merge option for this pull request.",
+    });
+    expect(await mergePullRequestFromWeb(await writeCtx("conflicted", alice), mergeFormOf({ merge_when_checks_succeed: "true" }))).toEqual({
+      outcome: "error",
+      message: "scheduled auto-merge is not supported",
+    });
+  });
+
+  it("marks a manually-merged PR from an ancestor commit id", async () => {
+    const ctx = await writeCtx("manual", alice);
+    const result = await mergePullRequestFromWeb(ctx, mergeFormOf({ do: "manually-merged", merge_commit_id: rootOid }));
+    expect(result).toEqual({ outcome: "redirect", location: `/alice/wrepo/pulls/${await writeIndex("manual")}` });
+    const after = (await findPullRequestByIndex(env.DB, writeRepoId, await writeIndex("manual")))!;
+    expect(after.pullRequest.hasMerged).toBe(true);
+    expect(after.pullRequest.mergedCommitId).toBe(rootOid);
+  });
+
+  it("refuses a manually-merged mark whose commit is not on the base (wrong_commit_id)", async () => {
+    // A side-branch commit is never an ancestor of main (the merge-base
+    // verification's refusal arm).
+    const sideOid = await landCommit({ ownerNamespace: "alice", slug: "wrepo" }, branchRef("sidebranch"), {
+      parents: [rootOid],
+      message: "side work",
+      fileName: "side.ts",
+      content: "side\n",
+    });
+    const ctx = await writeCtx("fresh", alice);
+    const result = await mergePullRequestFromWeb(ctx, mergeFormOf({ do: "manually-merged", merge_commit_id: sideOid }));
+    expect(result).toEqual({ outcome: "error", message: "commit ID must be a commit ID on the target branch" });
+  });
+
+  it("answers the not-scheduled 404 for cancel_auto_merge", async () => {
+    expect(await cancelAutoMergeFromWeb(await writeCtx("fresh", alice))).toEqual({ outcome: "not-found" });
+  });
+
+  it("updates the head branch by merge: redirect, moved ref, checking row", async () => {
+    const before = refTipMap(await engineReads(env, { ownerNamespace: "alice", slug: "wrepo" }).listRefs()).get(branchRef("feature"))!.target;
+    const ctx = await writeCtx("behind", alice);
+    expect(parseUpdateBranchStyle("merge")).toBe("merge");
+    expect(parseUpdateBranchStyle("rebase")).toBe("rebase");
+    expect(parseUpdateBranchStyle("squash")).toBeNull();
+    const result = await updatePullRequestFromWeb(ctx, "merge");
+    expect(result).toEqual({ outcome: "redirect", location: `/alice/wrepo/pulls/${await writeIndex("behind")}` });
+    const after = refTipMap(await engineReads(env, { ownerNamespace: "alice", slug: "wrepo" }).listRefs()).get(branchRef("feature"))!.target;
+    expect(after).not.toBe(before);
+    const row = (await findPullRequestByIndex(env.DB, writeRepoId, await writeIndex("behind")))!;
+    expect(row.pullRequest.status).toBe(PRStatus.Checking);
+    expect(row.pullRequest.headSha).toBe(after);
+  });
+
+  it("refuses the update for a non-write viewer and the up-to-date twin", async () => {
+    expect(await updatePullRequestFromWeb(await writeCtx("behind", bob), "merge")).toEqual({
+      outcome: "error",
+      message: "You are not allowed to update branch",
+    });
+    // The up-to-date twin: fresh's pull ref rides main's live tip → behind 0.
+    const mainTip = refTipMap(await engineReads(env, { ownerNamespace: "alice", slug: "wrepo" }).listRefs()).get(branchRef("main"))!.target;
+    await landPullRef(await writeIndex("fresh"), mainTip);
+    expect(await updatePullRequestFromWeb(await writeCtx("fresh", alice), "rebase")).toEqual({
+      outcome: "error",
+      message: "Unable to update pull request",
+    });
+  });
+
+  it("toggles allow_maintainer_edit for a poster with head write; refuses the others", async () => {
+    // bob posted `edits` but holds no write in alice's repo → refused.
+    expect(await setAllowMaintainerEditFromWeb(await writeCtx("edits", bob), { allowMaintainerEdit: true })).toEqual({
+      outcome: "error",
+      message: "user not allowed to do this action",
+    });
+    // alice holds the write but is not the poster → refused (edits.go's
+    // poster-first gate).
+    expect(await setAllowMaintainerEditFromWeb(await writeCtx("edits", alice), { allowMaintainerEdit: true })).toEqual({
+      outcome: "error",
+      message: "user not allowed to do this action",
+    });
+    // The poster WITH head write.
+    expect(await setAllowMaintainerEditFromWeb(await writeCtx("editsok", alice), { allowMaintainerEdit: true })).toEqual({
+      outcome: "redirect",
+      location: `/alice/wrepo/pulls/${await writeIndex("editsok")}`,
+    });
+    const row = (await findPullRequestByIndex(env.DB, writeRepoId, await writeIndex("editsok")))!;
+    expect(row.pullRequest.allowMaintainerEdit).toBe(true);
+  });
+
+  it("cleans up the merged PR's branch: redirect, ref gone, type-11 comment", async () => {
+    const ctx = await writeCtx("ok", alice);
+    const result = await cleanupPullRequestFromWeb(ctx);
+    expect(result).toEqual({ outcome: "redirect", location: `/alice/wrepo/pulls/${await writeIndex("ok")}` });
+    const tips = refTipMap(await engineReads(env, { ownerNamespace: "alice", slug: "wrepo" }).listRefs());
+    expect(tips.get(branchRef("okbranch"))).toBeUndefined();
+    const after = (await findPullRequestByIndex(env.DB, writeRepoId, await writeIndex("ok")))!;
+    const rows = await d1().select().from(comments).where(eq(comments.issueId, after.issue.id)).all();
+    expect(rows.some((row) => row.type === CommentType.DeleteBranch && row.oldRef === "okbranch")).toBe(true);
+  });
+
+  it("refuses the cleanup when the branch moved past the pull ref", async () => {
+    // A dedicated merged PR on its own branch; the branch then gains a
+    // commit the pull ref never saw → the has_new_commits flash.
+    const index = await seedWritePr("stuck", { title: "misc: stuck", headBranch: "stuck" }, { headSha: rootOid });
+    const stuckOid = await landCommit({ ownerNamespace: "alice", slug: "wrepo" }, branchRef("stuck"), {
+      parents: [rootOid],
+      message: "stuck base",
+      fileName: "STUCK.md",
+      content: "s\n",
+    });
+    await landPullRef(index, stuckOid);
+    await d1().update(pullRequests).set({ hasMerged: true, mergedCommitId: rootOid, mergerId: alice.id }).where(eq(pullRequests.id, writePrIds.stuck!));
+    await landCommit({ ownerNamespace: "alice", slug: "wrepo" }, branchRef("stuck"), {
+      parents: [stuckOid],
+      message: "post-merge push",
+      fileName: "STUCK2.md",
+      content: "s2\n",
+      replaceOid: stuckOid,
+    });
+    const ctx = await writeCtx("stuck", alice);
+    const result = await cleanupPullRequestFromWeb(ctx);
+    expect(result.outcome === "error" && result.message.includes("new commits have been added after merging")).toBe(true);
+  });
+
+  it("retargets a PR: redirect, new base, checking row", async () => {
+    const ctx = await writeCtx("retarget", bob);
+    const result = await changeTargetBranchFromWeb(ctx, parseTargetBranchForm(new URLSearchParams({ target_branch: "release" })));
+    expect(result).toEqual({ outcome: "redirect", location: `/alice/wrepo/pulls/${await writeIndex("retarget")}` });
+    const row = (await findPullRequestByIndex(env.DB, writeRepoId, await writeIndex("retarget")))!;
+    expect(row.pullRequest.baseBranch).toBe("release");
+    expect(row.pullRequest.status).toBe(PRStatus.Checking);
+  });
+
+  it("maps ChangeTargetBranch's refusals", async () => {
+    // Missing target branch.
+    expect(await changeTargetBranchFromWeb(await writeCtx("fresh", alice), parseTargetBranchForm(new URLSearchParams({ target_branch: "nope" })))).toEqual({
+      outcome: "error",
+      message: "Target branch does not exist.",
+    });
+    // The same-branch no-op (retarget's base IS release now).
+    expect(await changeTargetBranchFromWeb(await writeCtx("retarget", bob), parseTargetBranchForm(new URLSearchParams({ target_branch: "release" })))).toEqual({
+      outcome: "redirect",
+      location: `/alice/wrepo/pulls/${await writeIndex("retarget")}`,
+    });
+    // A closed PR refuses (409 flash text).
+    await d1().update(issues).set({ isClosed: true }).where(eq(issues.id, writeIssueIds.editsok!));
+    expect(await changeTargetBranchFromWeb(await writeCtx("editsok", alice), parseTargetBranchForm(new URLSearchParams({ target_branch: "release" })))).toEqual({
+      outcome: "error",
+      message: "The pull request has been closed.",
+    });
+    // A non-writer, non-poster viewer is the shell-hidden refusal. (bob IS
+    // fresh's poster — the gate passes and the duplicate-PR 409 fires
+    // instead, pinned above as the retarget refusal.)
+    expect(
+      await changeTargetBranchFromWeb(await writeCtx("fresh", bob), parseTargetBranchForm(new URLSearchParams({ target_branch: "release" }))),
+    ).toEqual({ outcome: "error", message: "A pull request between these branches already exists: alice/wrepo#10" });
+    expect(await changeTargetBranchFromWeb(await writeCtx("fresh", cara), parseTargetBranchForm(new URLSearchParams({ target_branch: "release" })))).toEqual({
+      outcome: "not-found",
+    });
+  });
+});
+
+// --- the merged box's cleanup arm (the second ShowMergeBox half) ----------------
+
+describe("the merged box renders the cleanup delete", () => {
+  it("renders the merged ClosedInfo pair, the purple icon and the delete form", async () => {
+    const index = await seedWritePr("gone", { title: "misc: merged deletable", headBranch: "wipdelete", posterId: alice.id }, { status: PRStatus.Mergeable });
+    const branchOid = await landCommit({ ownerNamespace: "alice", slug: "wrepo" }, branchRef("wipdelete"), {
+      parents: [rootOid],
+      message: "doomed",
+      fileName: "DOOMED.md",
+      content: "gone soon\n",
+    });
+    await landPullRef(index, branchOid);
+    await d1()
+      .update(pullRequests)
+      .set({ hasMerged: true, mergedCommitId: rootOid, mergerId: alice.id, headSha: branchOid })
+      .where(eq(pullRequests.id, writePrIds.gone!));
+    await d1().update(issues).set({ isClosed: true }).where(eq(issues.id, writeIssueIds.gone!));
+
+    const found = (await findPullRequestByIndex(env.DB, writeRepoId, index))!;
+    const data = await loadPullMergeBoxData(env.DB, {
+      repo: await writeRepoOf(),
+      issue: found.issue,
+      pr: found.pullRequest,
+      viewer: alice,
+      origin: ORIGIN,
+      listTips: (pair) => engineReads(env, pair).listRefs(),
+    });
+    expect(data).not.toBeNull();
+    expect(data!.timelineIconClass).toBe("tw-text-purple");
+    expect(data!.closedInfo!.title).toBe("Pull request successfully merged and closed");
+    expect(data!.deleteBranch).toEqual({ link: `/alice/wrepo/pulls/${index}/cleanup`, headTarget: "wipdelete" });
+    const html = pullMergeBoxFragmentHtml(data);
+    expect(html).toContain("The branch <code>wipdelete</code> can now be deleted.");
+    expect(html).toContain(`<form action="/alice/wrepo/pulls/${index}/cleanup" method="post">`);
+    expect(html).toContain('class="ui button link-action delete-branch-after-merge"');
+    // A viewer without head write sees no box at all.
+    const asBob = await loadPullMergeBoxData(env.DB, {
+      repo: await writeRepoOf(),
+      issue: found.issue,
+      pr: found.pullRequest,
+      viewer: bob,
+      origin: ORIGIN,
+      listTips: (pair) => engineReads(env, pair).listRefs(),
+    });
+    expect(asBob).toBeNull();
+  });
+});

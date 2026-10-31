@@ -51,25 +51,30 @@
  *
  * ## Documented divergences (no landed source — honest reductions, §6)
  *
- * - THE MERGE FORM (`$data.MergeFormProps`, the Vue island div
- *   `#pull-request-merge-form[data-merge-form-props]`) is NOT rendered:
- *   (a) it POSTs `/{index}/merge` on the web session — the landed merge write
- *   is the token-auth API route only (SPEC-0004 repoMergePullRequest), a
- *   form pointing there is a dead control (§2.4.1/§2.5); (b) the merge-style
+ * - THE MERGE FORM (the `$data.MergeFormProps` Vue island div
+ *   `#pull-request-merge-form[data-merge-form-props]`) renders as the no-JS
+ *   form with upstream's field names since the write arms landed (the
+ *   write-arm section below); the ISLAND itself stays unrendered — (a) the
+ *   island payload rides upstream's pageData, which our shell emits as null
+ *   (the issue-detail reduction's cite, verbatim); (b) the merge-style
  *   allowlist/default (`PullRequestsConfig`) has no D1 home — `repo_units`
- *   carries 'code' only, so `defaultMergeStyle`/`mergeStyles[].allowed` have
- *   no source; (c) the island payload rides upstream's pageData, which our
- *   shell emits as null (the issue-detail reduction's cite, verbatim).
+ *   carries 'code' only, so the form carries the config DEFAULTS
+ *   (repo_unit.go's DefaultPullRequestsConfig: merge/rebase/rebase-merge/
+ *   squash/fast-forward-only allowed, manually-merged not, default style
+ *   merge) instead of a per-repo allowlist; (c) the style dropdown is the
+ *   pull-reviews select reduction (the Vue menu is JS-only).
  * - THE UPDATE-BRANCH ARM (`ShowUpdatePullInfo`, update_branch_by_merge.tmpl)
- *   is NOT rendered: `commitsBehind > 0` IS in the row, but the arm exists to
- *   carry the `POST ?/update?style=merge|rebase` buttons — write actions with
- *   no landed web route (§2.5). The `pull_requests.commits_behind` count
- *   stays available to the merge gate (`blockOnOutdatedBranch`).
+ *   renders since the write arms landed (below); it stays gated to same-repo
+ *   heads (the engine's fork refusal) and the `PullRequestsConfig` style
+ *   gates ride the upstream defaults. The `pull_requests.commits_behind`
+ *   count feeds the render gate (`blockOnOutdatedBranch` keeps the merge
+ *   gate's access).
  * - THE DELETE-BRANCH BUTTON (`IsPullBranchDeletable` +
- *   `data-url="{issue}/cleanup"`) is NOT rendered: `POST /cleanup` is not
- *   landed, and the deletable computation needs the engine branch-existence
- *   read the conversation loader has always declined (issue-detail header).
- *   Consequence stated above (merged → no box).
+ *   `data-url="{issue}/cleanup"`) renders since the cleanup POST landed
+ *   (below); its deletable computation rides the optional `listTips` engine
+ *   seam — callers without it (the issue-detail inline mount's loader call
+ *   today) get the assumed-true degradation (the POST re-checks and
+ *   refuses; the merged box then renders for every merged PR).
  * - COMMIT SIGNING (`prepareMergeBoxCommitSigning`: requireSigned/willSign,
  *   the `repo.signing.*` prompts and the require_signed_wont_sign blocker)
  *   has no source — no signing service exists; `canMergeNow`'s signing half
@@ -111,6 +116,58 @@
  *   the allowlisted rest ride the shared ICON_PATHS. `gitea-exclamation`
  *   keeps its upstream `-1 -1 26 26` viewBox.
  *
+ * ## The WRITE arms (census gap #2 — the merge-box POST family)
+ *
+ * The upstream writes hang off the SAME pulls/{index} group (web.go:1665-1669)
+ * plus the base-change form (web.go:1439, `POST /pull/{index}/target_branch`):
+ *
+ *   POST /{owner}/{repo}/pulls/{index}/merge                     web.go:1665
+ *   POST /{owner}/{repo}/pulls/{index}/cancel_auto_merge         web.go:1666
+ *   POST /{owner}/{repo}/pulls/{index}/update                    web.go:1667
+ *   POST /{owner}/{repo}/pulls/{index}/set_allow_maintainer_edit web.go:1668
+ *   POST /{owner}/{repo}/pulls/{index}/cleanup                   web.go:1669
+ *   POST /{owner}/{repo}/pull/{index}/target_branch              web.go:1439
+ *
+ * (web.go:1667's `UpdatePullRequest` is the UPDATE-BRANCH write — merge or
+ * rebase the base into the PR head branch, services/pull/update.go — NOT a
+ * title/body edit; the title/body posts live on the `/{type}/{index}/title`
+ * and `/content` routes, issue.go:274/326.) The handler ladders below are
+ * this module's; the git choreography rides the landed pull-engine seams
+ * (`mergePullRequest` — the API merge route's own service — plus the new
+ * `updatePullRequestBranch` / `deleteBranchAfterMerge` /
+ * `changePullRequestTargetBranch`), and the permission predicates ride the
+ * same branch-protection/repo-access services the GET loader and the API
+ * routes use. Response shapes are the house's web-POST convention (the
+ * issue-comment POST posture): success → redirect outcome (the mounted
+ * handler answers 303 onto the PR page, upstream JSONRedirect/Redirect's
+ * target), failure → the error outcome carrying the upstream flash/locale
+ * text (the mounted handler re-renders the conversation page with it), and
+ * the upstream NotFound arms → the not-found outcome (the 404 shell).
+ *
+ * Per-write divergences (each cite inline at the seam):
+ * - merge: the auto-merge schedule refuses with the API route's landed
+ *   contract ("scheduled auto-merge is not supported" — no scheduled-merge
+ *   table exists, routes/pull-automerge.ts); the webhook + feed action ride
+ *   the route's own payload assembly re-issued over importable service
+ *   pieces (emitIssueEvent + recordAction — pullRequestPayload's §2.7 shape
+ *   with citations); `cancel_auto_merge` is the honest not-scheduled 404
+ *   (no scheduled row can exist — the API DELETE route's mirror); the
+ *   merge form renders upstream's field names (PullRequestMergeForm.vue +
+ *   forms.MergePullRequestForm) reduced to the no-JS select (the
+ *   pull-reviews combobox reduction precedent — the Vue island is JS-only).
+ * - update: same-repo heads only (the engine fork refusal — the fork cell's
+ *   base branch is a fork-point snapshot); the PR-unit config gates default
+ *   true (repo_unit.go's DefaultPullRequestsConfig — no D1 home).
+ * - set_allow_maintainer_edit + target_branch: upstream answers JSON for the
+ *   sidebar/title JS islands; ours are the no-JS form posts that 303 back
+ *   (the allow-edits checkbox and the base select render in the SIDEBAR and
+ *   TITLE families, not the merge box — allow_maintainer_edit.tmpl +
+ *   view_title.tmpl:94 — so this module ships their seams for those folds).
+ * - cleanup: the merged box's delete button renders again (ShowMergeBox =
+ *   `!HasMerged || IsPullBranchDeletable`, issue_view.go:974 — the loader's
+ *   merged arm now computes the deletable pair, purple icon included) as a
+ *   no-JS form around upstream's link-action button.
+ *
  * ## Mount record (MOUNTED at 22599e4, window-2e B2 — the wiring HANDOFF
  * is retired)
  *
@@ -148,13 +205,37 @@
  */
 
 import { renderToString } from "hono/jsx/dom/server";
+import { Context } from "hono";
+import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
+import type { RefsResult } from "@cf-gitea/git-engine";
 
 import { latestCommitStatuses, combinedStateOf } from "../../api/services/commit-status";
 import type { CommitStatusState } from "../../api/models/commit-status";
 import { hasWorkInProgressPrefix } from "../../api/services/issues";
-import { findRepositoryById } from "../../api/services/repository";
+import type { User } from "../../api/models/user";
+import type { ApiEnv } from "../../api/env";
+import { ApiError } from "../../api/errors";
+import {
+  composeMergeMessage,
+  deleteBranchAfterMerge,
+  changePullRequestTargetBranch,
+  ensurePullRequestChecked,
+  hasUnmergedPullRequestsByHeadInfo,
+  mergePullRequest,
+  pullRequestDiffShortStat,
+  updatePullRequestBranch,
+} from "../../api/services/pull-engine";
+import { findPullRequestByIndex, toApiPullRequest } from "../../api/services/pulls";
+import { findRepositoryById, toApiRepository } from "../../api/services/repository";
+import { ActionType, recordAction } from "../../api/services/activity-feeds";
+import { emitIssueEvent } from "../../services/issue-events";
 import {
   canBypassBranchProtection,
+  canUserDelete,
+  canUserForcePush,
+  canUserPush,
+  checkPullBranchProtections,
   findRule,
   isUserMergeWhitelisted,
   mergeBlockedByOfficialReviewRequests,
@@ -162,11 +243,12 @@ import {
   mergeBlockedByRejectedReview,
   grantedApprovalsCount,
   parseRuleConfig,
+  principalAccessOf,
   principalAccessOfRow,
   type PrincipalAccess,
   type ProtectedBranchConfig,
 } from "../../services/branch-protection";
-import { PRFlow, PRStatus, type CommitStatusRow } from "../../db/schema";
+import { PRFlow, PRStatus, pullRequests, users, type CommitStatusRow } from "../../db/schema";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { ICON_PATHS } from "../icons";
 import type { RepoRow } from "../ui-context";
@@ -218,6 +300,43 @@ export const pullMergeBoxLocale = {
   cmd_instruction_merge_warning:
     'Warning: This operation cannot merge pull request because "autodetect manual merge" is not enabled.', // "repo.pulls.cmd_instruction_merge_warning"
   git_guide_remote_name: "origin", // SystemConfig Repository.GitGuideRemoteName default (setting/config.go:79)
+} as const;
+
+/** The write-arm locale (the same en-US file at the pin — the merge form's
+ *  strings, the update-branch arm, the cleanup flashes and the write refusals
+ *  the handler ladders surface). */
+export const pullMergeWriteLocale = {
+  // the merge form (PullRequestMergeForm.vue's props strings)
+  merge_pull_request: "Create merge commit", // "repo.pulls.merge_pull_request"
+  rebase_merge_pull_request: "Rebase, then fast-forward", // "repo.pulls.rebase_merge_pull_request"
+  rebase_merge_commit_pull_request: "Rebase, then create merge commit", // "repo.pulls.rebase_merge_commit_pull_request"
+  squash_merge_pull_request: "Create squash commit", // "repo.pulls.squash_merge_pull_request"
+  fast_forward_only_merge_pull_request: "Fast-forward only", // "repo.pulls.fast_forward_only_merge_pull_request"
+  commit_message_desc: "Add an optional extended description…", // "repo.editor.commit_message_desc"
+  merge_commit_id: "The merge commit ID", // "repo.pulls.merge_commit_id"
+  branch_delete_button: "Delete Branch", // "repo.branch.delete_html" (the merged box's cleanup button)
+  branch_delete_checkbox: 'Delete Branch "{branch}"', // "repo.branch.delete" (the form checkbox label)
+  // the merged box (prepareMergeBoxInfoItems' merged arm)
+  merged_success: "Pull request successfully merged and closed", // "repo.pulls.merged_success"
+  merged_info_prefix: "The branch ", // "repo.pulls.merged_info_text" around the <code> target
+  merged_info_suffix: " can now be deleted.",
+  // the update-branch arm (update_branch_by_merge.tmpl + preparePullUpdateActions)
+  outdated_with_base_branch: "This branch is out-of-date with the base branch", // "repo.pulls.outdated_with_base_branch"
+  update_branch: "Update branch by merge", // "repo.pulls.update_branch"
+  update_branch_rebase: "Update branch by rebase", // "repo.pulls.update_branch_rebase"
+  // the POST refusal flashes (the handler ladders' error texts)
+  is_closed: "The pull request has been closed.", // "repo.pulls.is_closed"
+  has_merged: "Failed: The pull request has been merged. You cannot merge again or change the target branch.", // "repo.pulls.has_merged"
+  no_merge_wip: "This pull request cannot be merged because it is marked as being a work in progress.", // "repo.pulls.no_merge_wip"
+  no_merge_not_ready: "This pull request is not ready to be merged. Check review status and status checks.", // "repo.pulls.no_merge_not_ready"
+  update_not_allowed: "You are not allowed to update branch", // "repo.pulls.update_not_allowed" (ErrNoPermissionToMerge's arm)
+  invalid_merge_option: "You cannot use this merge option for this pull request.", // "repo.pulls.invalid_merge_option"
+  wrong_commit_id: "commit ID must be a commit ID on the target branch", // "repo.pulls.wrong_commit_id"
+  merge_conflict: "Merge Failed: There was a conflict while merging. Hint: Try a different strategy.", // "repo.pulls.merge_conflict"
+  merge_out_of_date: "Merge Failed: While generating the merge, the base was updated. Hint: Try again.", // "repo.pulls.merge_out_of_date"
+  unable_to_update: "Unable to update pull request", // UpdatePullRequest's fallback JSONError text
+  branch_deletion_success: 'Branch "{branch}" has been deleted.', // "repo.branch.deletion_success"
+  no_permission_for_action: "user not allowed to do this action", // pull.ErrUserHasNoPermissionForAction's text
 } as const;
 
 /** The conflicted-files list cap (pull_merge_box.go:112-115): > 10 keeps 10
@@ -357,19 +476,59 @@ export interface PullMergeBoxData {
   reloadingInterval: number;
   /** `.timeline-avatar` color class (prepareMergeBoxIconColor). */
   timelineIconClass: string;
-  /** The closed arm (`ClosedInfoTitle`/`ClosedInfoBody`) — merged PRs never
-   *  reach the render (the loader nulls them), so only the closed-unmerged
-   *  shape exists. `null` = open PR. */
-  closedInfo: { title: string; body: string } | null;
-  statusChecks: PullMergeBoxStatusCheckData | null;
-  /** The `InfoSections` — one section per `.item` div (the commit-blocker /
-   *  protection-blocker / merge-prompt collection split, pull_merge_box.go:185-190);
-   *  sections with no items render nothing (the template's own `{{if}}`). */
-  infoSections: PullMergeBoxInfoItem[][];
-  /** The WIP line renders when the title carries a prefix (the toggle button
-   *  is not rendered — module doc). */
-  isWorkInProgress: boolean;
-  commands: PullMergeBoxCommands | null;
+/** The closed arm (`ClosedInfoTitle`/`ClosedInfoBody`). The closed-unmerged
+ *  shape is the plain `{title, body}` pair; the MERGED arm (reachable again
+ *  since the write arms landed — ShowMergeBox's deletable half) carries the
+ *  code-embedded target: `prefix <code>code</code> suffix` (the
+ *  merged_info_text HTMLFormat). `null` = open PR. */
+closedInfo:
+  | { title: string; body: string; bodyCode?: undefined }
+  | { title: string; body?: undefined; bodyCode: { prefix: string; code: string; suffix: string } }
+  | null;
+statusChecks: PullMergeBoxStatusCheckData | null;
+/** The `InfoSections` — one section per `.item` div (the commit-blocker /
+ *  protection-blocker / merge-prompt collection split, pull_merge_box.go:185-190);
+ *  sections with no items render nothing (the template's own `{{if}}`). */
+infoSections: PullMergeBoxInfoItem[][];
+/** The WIP line renders when the title carries a prefix (the toggle button
+ *  is not rendered — module doc). */
+isWorkInProgress: boolean;
+commands: PullMergeBoxCommands | null;
+/** The merge form (the `$data.MergeFormProps` island reduced to the no-JS
+ *  form — the module doc's write-arm section). Fields are
+ *  forms.MergePullRequestForm + PullRequestMergeForm.vue's names. `null` =
+ *  the island's absence (closed/merged rows, or `!hasPermToMerge`). */
+mergeForm: {
+  /** The form action base — `{issueLink}/merge` (PullRequestMergeForm.vue's
+   *  `baseLink+'/merge'`). */
+  issueLink: string;
+  /** `head_commit_id` — the head_sha cache (CompareInfo.HeadCommitID's
+   *  landed projection; the write ignores it like the API body contract). */
+  headCommitId: string;
+  /** The `force_merge` hidden input's v-model (the Vue computed:
+   *  `canMergeNow && !allOverridableChecksOk`). */
+  forceMerge: boolean;
+  /** The allowed styles (the PR-unit allowlist defaults: merge/rebase/
+   *  rebase-merge/squash always, fast-forward-only when the row is not
+   *  behind — pull_merge_form.go:147-163 over repo_unit.go's defaults;
+   *  manually-merged stays excluded, AllowManualMerge defaults false). */
+  styles: { name: string; text: string; hideMessageFields: boolean }[];
+  /** The preselected `do` (the DefaultMergeStyle default, "merge"). */
+  defaultStyle: string;
+  /** The title field's prefill — the default style's composed default
+   *  (composeMergeMessage's default arm, re-issued for the render). */
+  defaultTitle: string;
+  /** The delete checkbox (the Vue `isPullBranchDeletable`). */
+  isPullBranchDeletable: boolean;
+  /** The checkbox label's branch target (the `textDeleteBranch` arg). */
+  headTarget: string;
+} | null;
+/** The update-branch arm (`ShowUpdatePullInfo` + the update_branch_by_merge
+ *  template's buttons, reduced to one no-JS form per style). `null` when the
+ *  arm does not render. */
+updateBranch: { options: { style: "merge" | "rebase"; text: string; url: string }[] } | null;
+/** The merged box's cleanup delete (`DeleteBranchLink` + the button). */
+deleteBranch: { link: string; headTarget: string } | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -519,13 +678,18 @@ function mergeRequiredContextsCommitStatus(statuses: CommitStatusRow[], required
 
 /** The loader input — the rows the route prologue has already resolved
  *  (the repo row is the BASE repo; §2.5's resolution owns visibility) plus
- *  the request origin (the fork fetch line's HeadRepo.HTMLURL absolute half). */
+ *  the request origin (the fork fetch line's HeadRepo.HTMLURL absolute half).
+ *  `listTips` is the optional engine ref-read seam the branch-deletable tip
+ *  checks ride (issue_view.go:632-648's HeadBranchCommitID/IsBranchExist
+ *  reads): absent → the RENDER assumes the checks true (the POST seams
+ *  re-check against the engine and refuse — the disclosed degradation). */
 export interface PullMergeBoxInput {
   repo: RepoRow;
   issue: IssueRow;
   pr: PullRequestRow;
   viewer: Viewer;
   origin: string;
+  listTips?: (pair: { ownerNamespace: string; slug: string }) => Promise<RefsResult | null>;
 }
 
 /** Tolerant conflictedFiles decode (the engine check's JSON array). */
@@ -601,17 +765,161 @@ function statusCheckPrompt(requiredChecksState: CommitStatusState, combined: Com
   return pullMergeBoxLocale.status_checking;
 }
 
+/** The `headTarget` display string (setTemplateDataMergeTarget,
+ *  routers/web/repo/pull.go:161-172): same-owner heads carry the bare branch,
+ *  a deleted fork the "(deleted):branch" placeholder, a fork the
+ *  `owner/name:branch` full name. */
+export function headTargetOf(baseRepo: RepoRow, headRepo: { ownerNamespace: string; slug: string } | null, pr: PullRequestRow): string {
+  if (headRepo === null) return `(deleted):${pr.headBranch}`; // "repo.pull.deleted_branch"
+  if (pr.headRepoId === baseRepo.id || headRepo.ownerNamespace === baseRepo.ownerNamespace) return pr.headBranch;
+  return `${headRepo.ownerNamespace}/${headRepo.slug}:${pr.headBranch}`;
+}
+
+/** The tip read over the optional engine seam (RefsResult → the ref's target,
+ *  null-seam tolerant). */
+function tipOf(refs: RefsResult | null, ref: string): string | undefined {
+  return refs?.refs.find((entry) => entry.name === ref)?.target;
+}
+
+/**
+ * `IsPullBranchDeletable` (prepareMergeBoxDeleteBranch,
+ * routers/web/repo/issue_view.go:632-648) over the landed predicates:
+ *
+ *   canDelete (CanDeleteBranchWithPermission — the head write + the rule's
+ *              CanUserDelete; the default branch never deletes)
+ *   && HeadRepo != nil
+ *   && (!HasMerged || HeadBranchCommitID == CompareInfo.HeadCommitID)
+ *   && IsBranchExist(head branch)
+ *   && (closed → no shared-head open PR, :642-647)
+ *
+ * `merged=true` is the cleanup button's gate (the merged arm above);
+ * `merged=false` gates the merge form's delete checkbox (the open arm — the
+ * tip equality and shared-head arms collapse away). The tip checks ride the
+ * optional `listTips` engine seam; without it they are assumed-true for the
+ * render — the POST seams re-check against the engine and refuse (the
+ * disclosed degradation in the input's doc). The AGit flow has no head
+ * branch to delete.
+ */
+async function pullBranchDeletable(
+  d1: D1Database,
+  input: PullMergeBoxInput,
+  access: PrincipalAccess,
+  headRepo: Awaited<ReturnType<typeof findRepositoryById>>,
+  merged: boolean,
+): Promise<boolean> {
+  const { repo, issue, pr, viewer } = input;
+  if (pr.flow !== PRFlow.Github) return false;
+  if (headRepo === null) return false;
+  if (pr.headBranch === headRepo.repo.defaultBranch) return false; // CanDeleteBranch's default arm
+  // The write arm runs in the HEAD repo (a fork's own permission — the
+  // maintainer-edit grant reaches the fork's CODE write only through a real
+  // collaborator grant, the pull-engine fork-delete ladder's reading).
+  let headAccess = access;
+  if (pr.headRepoId !== repo.id) {
+    headAccess =
+      viewer.kind === "user"
+        ? await principalAccessOfRow(d1, headRepo.repo, { id: viewer.id, username: viewer.username, isAdmin: viewer.isAdmin })
+        : { userId: 0, write: false, admin: false };
+  }
+  if (!headAccess.write) return false;
+  const rule = await findRule(d1, headRepo.repo.id, pr.headBranch);
+  if (rule !== null && !(await canUserDelete(d1, parseRuleConfig(rule.rules), headAccess))) return false;
+  // The closed arm's shared-head check (issue_view.go:642-647) — a merged PR
+  // is closed, so the merged arm always pays it.
+  if (issue.isClosed && (await hasUnmergedPullRequestsByHeadInfo(d1, pr.headRepoId, pr.headBranch, issue.id))) return false;
+  if (merged && input.listTips !== undefined) {
+    // HeadBranchCommitID == CompareInfo.HeadCommitID + IsBranchExist — the
+    // base cell's pull ref must still point at the head branch's tip.
+    const branchTip = tipOf(await input.listTips({ ownerNamespace: headRepo.repo.ownerNamespace, slug: headRepo.repo.slug }), `refs/heads/${pr.headBranch}`);
+    if (branchTip === undefined) return false;
+    const pullTip = tipOf(await input.listTips({ ownerNamespace: repo.ownerNamespace, slug: repo.slug }), `refs/pull/${pr.index}/head`);
+    if (pullTip === undefined || pullTip !== branchTip) return false;
+  }
+  if (!merged && input.listTips !== undefined) {
+    // IsBranchExist only (the unmerged arm's tip check collapses to true
+    // upstream — `!HasMerged ||` short-circuits).
+    const branchTip = tipOf(await input.listTips({ ownerNamespace: headRepo.repo.ownerNamespace, slug: headRepo.repo.slug }), `refs/heads/${pr.headBranch}`);
+    if (branchTip === undefined) return false;
+  }
+  return true;
+}
+
+/**
+ * `CheckUserAllowedToUpdate` (services/pull/update.go:132-190) over the
+ * landed predicates: the head-branch push right = the HEAD repo's write +
+ * (no rule → allowed | rule → canUserPush); rebase = canUserForcePush. The
+ * PR-unit config gates (AllowMergeUpdate/AllowRebaseUpdate) have no D1 home →
+ * upstream defaults (true — repo_unit.go:146-147). The maintainer-edit
+ * inheritance (:163-186): when the PR allows maintainer edits and a style is
+ * missing, a doer who may merge in the BASE (the merge route's two gates)
+ * inherits the POSTER's head-branch push/force-push rights. The AGit flow
+ * and the doer-less call answer all-false (:139, :161-162).
+ */
+export async function checkUserAllowedToUpdate(
+  d1: D1Database,
+  repo: RepoRow,
+  headRepo: Awaited<ReturnType<typeof findRepositoryById>>,
+  issue: IssueRow,
+  pr: PullRequestRow,
+  access: PrincipalAccess,
+  viewer: Viewer,
+): Promise<{ mergeAllowed: boolean; rebaseAllowed: boolean }> {
+  if (pr.flow !== PRFlow.Github) return { mergeAllowed: false, rebaseAllowed: false };
+  if (headRepo === null) return { mergeAllowed: false, rebaseAllowed: false };
+  if (viewer.kind !== "user") return { mergeAllowed: false, rebaseAllowed: false };
+  // The head-branch rule gates the push rights (isUserAllowedToPushOrForce
+  // PushInRepoBranch, update.go:101-130); the doer's HEAD-repo access pair
+  // re-resolves through the row-keyed bridge for fork heads.
+  const headAccess =
+    pr.headRepoId === repo.id
+      ? access
+      : await principalAccessOfRow(d1, headRepo.repo, { id: viewer.id, username: viewer.username, isAdmin: viewer.isAdmin });
+  const headRule = await findRule(d1, headRepo.repo.id, pr.headBranch).then((rule) => (rule === null ? null : parseRuleConfig(rule.rules)));
+  let mergeAllowed = headAccess.write && (headRule === null || (await canUserPush(d1, headRule, headAccess)));
+  let rebaseAllowed = headAccess.write && (headRule === null || (await canUserForcePush(d1, headRule, headAccess)));
+  // The maintainer-edit inheritance (:163-186): missing style + the flag +
+  // the doer may merge in the base (the merge route's two gates) → the
+  // POSTER's head-branch rights.
+  if (pr.allowMaintainerEdit && (!mergeAllowed || !rebaseAllowed) && issue.posterId !== null) {
+    const baseRule = await findRule(d1, repo.id, pr.baseBranch).then((rule) => (rule === null ? null : parseRuleConfig(rule.rules)));
+    const doerMayMergeInBase = access.write && (baseRule === null || (await isUserMergeWhitelisted(d1, baseRule, access)));
+    if (doerMayMergeInBase) {
+      const posterRow = (await drizzle(d1).select().from(users).where(eq(users.id, issue.posterId)).get()) ?? null;
+      if (posterRow !== null) {
+        const posterAccess = await principalAccessOf(d1, headRepo.repo, { id: posterRow.id, login: posterRow.username, is_admin: posterRow.isAdmin });
+        const posterRule = await findRule(d1, headRepo.repo.id, pr.headBranch).then((rule) => (rule === null ? null : parseRuleConfig(rule.rules)));
+        mergeAllowed = posterAccess.write && (posterRule === null || (await canUserPush(d1, posterRule, posterAccess)));
+        rebaseAllowed = posterAccess.write && (posterRule === null || (await canUserForcePush(d1, posterRule, posterAccess)));
+      }
+    }
+  }
+  return { mergeAllowed, rebaseAllowed };
+}
+
+/** The merge form's title prefill — composeMergeMessage's default-title arm
+ *  re-issued for the render (the pull-reviews re-issue precedent: the same
+ *  string-building over D1 rows, the write seam itself keeps the service as
+ *  its single source of truth). `pull.tests` pins the two agree. */
+function defaultMergeTitleOf(issue: IssueRow, pr: PullRequestRow, headRepo: { ownerNamespace: string; slug: string } | null, style: string): string {
+  if (style === "rebase") return "";
+  if (style === "squash") return `${issue.title} (#${pr.index})`;
+  if (pr.headRepoId === pr.baseRepoId) {
+    return `Merge pull request '${issue.title}' (#${pr.index}) from ${pr.headBranch} into ${pr.baseBranch}`;
+  }
+  const from = headRepo === null ? `<deleted>:${pr.headBranch}` : `${headRepo.ownerNamespace}/${headRepo.slug}:${pr.headBranch}`;
+  return `Merge pull request '${issue.title}' (#${pr.index}) from ${from} into ${pr.baseBranch}`;
+}
+
 /**
  * Load the merge box's render inputs. `null` = the route does not render the
  * fragment: the issue is not a pull (upstream's 404), or the PR has merged
- * (upstream's ShowMergeBox=false arm — its only content, the delete-branch
- * button, has no landed write route; module doc). Closed-unmerged PRs DO
+ * WITHOUT a deletable head branch (ShowMergeBox = `!HasMerged ||
+ * IsPullBranchDeletable` — the merged arm above). Closed-unmerged PRs DO
  * render (the closed arm), exactly like upstream.
  */
 export async function loadPullMergeBoxData(d1: D1Database, input: PullMergeBoxInput): Promise<PullMergeBoxData | null> {
   const { repo, issue, pr, viewer, origin } = input;
   if (!issue.isPull) return null; // ViewPullMergeBox's !issue.IsPull → NotFound
-  if (pr.hasMerged) return null; // ShowMergeBox = !HasMerged || IsPullBranchDeletable (delete arm not landed)
 
   const issueLink = `/${repo.ownerNamespace}/${repo.slug}/pulls/${issue.index}`;
   const isClosed = issue.isClosed;
@@ -625,6 +933,44 @@ export async function loadPullMergeBoxData(d1: D1Database, input: PullMergeBoxIn
   // The head repo row (fork or same-repo). Missing row = the broken arm
   // (upstream's deleted-fork IsPullRequestBroken; module doc).
   const headRepo = await findRepositoryById(d1, pr.headRepoId);
+  const headTarget = headTargetOf(repo, headRepo === null ? null : headRepo.repo, pr);
+
+  // --- the doer's access pair (the merge route's own port,
+  // principalAccessOfRow) — computed before the arm split now: the merged
+  // arm's delete gate reads it too (upstream's prepareMergeBox resolves the
+  // doer permission before any arm splits, issue_view.go:888-931).
+  const access: PrincipalAccess =
+    viewer.kind === "user"
+      ? await principalAccessOfRow(d1, repo, { id: viewer.id, username: viewer.username, isAdmin: viewer.isAdmin })
+      : { userId: 0, write: false, admin: false };
+
+  // --- the MERGED arm (ShowMergeBox = !HasMerged || IsPullBranchDeletable,
+  // issue_view.go:974): with the cleanup POST landed the box exists again for
+  // a merged PR whose head branch can go — the merged ClosedInfo pair plus
+  // the delete button (prepareMergeBoxInfoItems' merged arm,
+  // pull_merge_box.go:93-97). A non-deletable merged PR answers null (the
+  // ShowMergeBox=false empty fragment — "there is nothing to do",
+  // issue_view.go:974's own comment).
+  if (pr.hasMerged) {
+    const deletable = await pullBranchDeletable(d1, input, access, headRepo, true);
+    if (!deletable) return null;
+    return {
+      issueLink,
+      reloadingInterval: 0,
+      timelineIconClass: "tw-text-purple", // prepareMergeBoxIconColor's merged arm — reachable again
+      closedInfo: {
+        title: pullMergeWriteLocale.merged_success,
+        bodyCode: { prefix: pullMergeWriteLocale.merged_info_prefix, code: headTarget, suffix: pullMergeWriteLocale.merged_info_suffix },
+      },
+      statusChecks: null,
+      infoSections: [],
+      isWorkInProgress,
+      commands: null,
+      mergeForm: null,
+      updateBranch: null,
+      deleteBranch: { link: `${issueLink}/cleanup`, headTarget },
+    };
+  }
 
   // --- the status-check section (prepareMergeBoxStatusCheckData, pull.go:397)
   // Open PRs with a resolvable head sha only (the headCommitID=="" and
@@ -677,15 +1023,11 @@ export async function loadPullMergeBoxData(d1: D1Database, input: PullMergeBoxIn
       infoSections: [],
       isWorkInProgress,
       commands: null, // ShowPullCommands requires the open state
+      mergeForm: null,
+      updateBranch: null,
+      deleteBranch: null,
     };
   }
-
-  // --- the doer's access pair (open PRs only, like upstream's ctx.IsSigned
-  // arms — the merge route's own port, principalAccessOfRow) ---------------
-  const access: PrincipalAccess =
-    viewer.kind === "user"
-      ? await principalAccessOfRow(d1, repo, { id: viewer.id, username: viewer.username, isAdmin: viewer.isAdmin })
-      : { userId: 0, write: false, admin: false };
 
   // IsUserAllowedToMerge's landed shape (the API merge route's two gates):
   // base write always, then the rule's merge whitelist.
@@ -921,6 +1263,42 @@ export async function loadPullMergeBoxData(d1: D1Database, input: PullMergeBoxIn
     };
   }
 
+  // --- the write-arm data (the census gap #2 section) ----------------------
+  // The merge form's allowed styles (prepareMergeBoxFormProps over the PR-unit
+  // defaults — merge/rebase/rebase-merge/squash always, fast-forward-only
+  // when the head is not behind, pull_merge_form.go:147-163;
+  // manually-merged stays excluded, AllowManualMerge defaults false,
+  // repo_unit.go:127). The preselected style is the DefaultMergeStyle
+  // default ("merge", repo_unit.go:152-153).
+  const ffAllowed = (pr.commitsBehind ?? 0) === 0;
+  const styleOptions: { name: string; text: string; hideMessageFields: boolean }[] = [
+    { name: "merge", text: pullMergeWriteLocale.merge_pull_request, hideMessageFields: false },
+    { name: "rebase", text: pullMergeWriteLocale.rebase_merge_pull_request, hideMessageFields: true },
+    { name: "rebase-merge", text: pullMergeWriteLocale.rebase_merge_commit_pull_request, hideMessageFields: false },
+    { name: "squash", text: pullMergeWriteLocale.squash_merge_pull_request, hideMessageFields: false },
+    ...(ffAllowed ? [{ name: "fast-forward-only", text: pullMergeWriteLocale.fast_forward_only_merge_pull_request, hideMessageFields: true }] : []),
+  ];
+  // The delete-branch checkbox + the merged-box twin's gate
+  // (prepareMergeBoxDeleteBranch for the open arm: canDelete + the branch
+  // exists — no tip check and no shared-head check until closed).
+  const openBranchDeletable = await pullBranchDeletable(d1, input, access, headRepo, false);
+  // The update-branch arm (ShowUpdatePullInfo, issue_view.go:889 + the
+  // preparePullUpdateActions buttons): behind, open, past the checking/
+  // conflicted states, unbroken, same-repo (updatePullRequestBranch's fork
+  // refusal), and the doer holds at least one update style.
+  const updateStyles = await checkUserAllowedToUpdate(d1, repo, headRepo, issue, pr, access, viewer);
+  const showUpdatePullInfo =
+    (pr.commitsBehind ?? 0) > 0 && !isChecking && !isConflicted && headRepo !== null && pr.headRepoId === pr.baseRepoId && (updateStyles.mergeAllowed || updateStyles.rebaseAllowed);
+  const updateOptions: { style: "merge" | "rebase"; text: string; url: string }[] = [];
+  if (showUpdatePullInfo) {
+    if (updateStyles.mergeAllowed) {
+      updateOptions.push({ style: "merge", text: pullMergeWriteLocale.update_branch, url: `${issueLink}/update?style=merge` });
+    }
+    if (updateStyles.rebaseAllowed) {
+      updateOptions.push({ style: "rebase", text: pullMergeWriteLocale.update_branch_rebase, url: `${issueLink}/update?style=rebase` });
+    }
+  }
+
   return {
     issueLink,
     reloadingInterval: isChecking ? 5000 : 0,
@@ -930,6 +1308,20 @@ export async function loadPullMergeBoxData(d1: D1Database, input: PullMergeBoxIn
     infoSections,
     isWorkInProgress,
     commands,
+    mergeForm: hasPermToMerge
+      ? {
+          issueLink,
+          headCommitId: pr.headSha ?? "",
+          forceMerge: canMergeNow && hasOverridableBlockers, // the Vue forceMerge computed
+          styles: styleOptions,
+          defaultStyle: "merge",
+          defaultTitle: defaultMergeTitleOf(issue, pr, headRepo === null ? null : headRepo.repo, "merge"),
+          isPullBranchDeletable: openBranchDeletable,
+          headTarget,
+        }
+      : null,
+    updateBranch: updateOptions.length > 0 ? { options: updateOptions } : null,
+    deleteBranch: null,
   };
 }
 
@@ -984,6 +1376,13 @@ function StatusItemIcon(props: { state: CommitStatusState }) {
  * pullMergeBoxFragmentHtml's output by construction — the html builder wraps
  * this component in renderToString.
  */
+/** The preselected style option (the Vue onMounted default: the default style
+ *  when allowed, else the first allowed — pull_merge_form.go's default is
+ *  always in the allowed set here). */
+function selectedMergeStyle(form: NonNullable<PullMergeBoxData["mergeForm"]>): { name: string; text: string; hideMessageFields: boolean } {
+  return form.styles.find((style) => style.name === form.defaultStyle) ?? form.styles[0]!;
+}
+
 export function PullMergeBoxFragment(props: { data: PullMergeBoxData }) {
   const data = props.data;
   return (
@@ -1047,8 +1446,27 @@ export function PullMergeBoxFragment(props: { data: PullMergeBoxData }) {
               <div class="item flex-left-right">
                 <div>
                   <h3 class="tw-mb-2">{data.closedInfo.title}</h3>
-                  <div>{data.closedInfo.body}</div>
+                  {data.closedInfo.bodyCode !== undefined ? (
+                    <div>
+                      {data.closedInfo.bodyCode.prefix}
+                      <code>{data.closedInfo.bodyCode.code}</code>
+                      {data.closedInfo.bodyCode.suffix}
+                    </div>
+                  ) : (
+                    <div>{data.closedInfo.body}</div>
+                  )}
                 </div>
+                {data.deleteBranch !== null ? (
+                  // The cleanup button (pull_merge_box.tmpl's
+                  // delete-branch-after-merge, `data-url="{DeleteBranchLink}}"`)
+                  // as the no-JS form post — the POST is this module's
+                  // cleanupPullRequestFromWeb seam.
+                  <form action={data.deleteBranch.link} method="post">
+                    <button type="submit" class="ui button link-action delete-branch-after-merge">
+                      {pullMergeWriteLocale.branch_delete_button}
+                    </button>
+                  </form>
+                ) : null}
               </div>
             ) : null}
             {data.infoSections
@@ -1060,11 +1478,86 @@ export function PullMergeBoxFragment(props: { data: PullMergeBoxData }) {
                   ))}
                 </div>
               ))}
+            {data.updateBranch !== null ? (
+              // The update-branch arm (update_branch_by_merge.tmpl): the
+              // alert line + the style buttons as no-JS form posts (upstream's
+              // link-action buttons + JS dropdown reduced — the pull-reviews
+              // select precedent's form twin).
+              <div class="item">
+                <div class="tw-w-full flex-left-right">
+                  <div class="flex-text-block">
+                    <MergeBoxSvg name="octicon-alert" /> {pullMergeWriteLocale.outdated_with_base_branch}
+                  </div>
+                  <div class="ui buttons">
+                    {data.updateBranch.options.map((option) => (
+                      <form action={option.url} method="post" key={option.style}>
+                        <button type="submit" class="ui button link-action">
+                          {option.text}
+                        </button>
+                      </form>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            ) : null}
             {data.isWorkInProgress ? (
               <div class="item flex-left-right">
                 <div class="flex-text-block">
                   <MergeBoxSvg name="octicon-x" /> {pullMergeBoxLocale.cannot_merge_work_in_progress}
                 </div>
+              </div>
+            ) : null}
+            {data.mergeForm !== null ? (
+              // The merge form (the #pull-request-merge-form island reduced to
+              // the no-JS form — PullRequestMergeForm.vue's field names
+              // verbatim: head_commit_id / merge_when_checks_succeed /
+              // force_merge hidden, merge_title_field + merge_message_field,
+              // the manually-merged merge_commit_id, the `do` select (the
+              // style dropdown's no-JS stand-in) and the
+              // delete_branch_after_merge checkbox).
+              <div class="item">
+                <form class="ui form form-fetch-action" action={`${data.mergeForm.issueLink}/merge`} method="post">
+                  <input type="hidden" name="head_commit_id" value={data.mergeForm.headCommitId} />
+                  <input type="hidden" name="merge_when_checks_succeed" value="false" />
+                  <input type="hidden" name="force_merge" value={data.mergeForm.forceMerge ? "true" : "false"} />
+                  {selectedMergeStyle(data.mergeForm).hideMessageFields ? null : (
+                    <>
+                      <div class="field">
+                        <input type="text" name="merge_title_field" value={data.mergeForm.defaultTitle} />
+                      </div>
+                      <div class="field">
+                        <textarea name="merge_message_field" rows={5} placeholder={pullMergeWriteLocale.commit_message_desc} />
+                      </div>
+                    </>
+                  )}
+                  {selectedMergeStyle(data.mergeForm).name === "manually-merged" ? (
+                    <div class="field">
+                      <input type="text" name="merge_commit_id" placeholder={pullMergeWriteLocale.merge_commit_id} />
+                    </div>
+                  ) : null}
+                  <div class="field">
+                    <select name="do">
+                      {data.mergeForm.styles.map((style) => (
+                        <option value={style.name} selected={style.name === data.mergeForm?.defaultStyle} key={style.name}>
+                          {style.text}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div class="flex-text-block tw-gap-3">
+                    <button type="submit" class="ui primary button">
+                      {selectedMergeStyle(data.mergeForm).text}
+                    </button>
+                    {data.mergeForm.isPullBranchDeletable ? (
+                      <div class="ui checkbox">
+                        <input name="delete_branch_after_merge" type="checkbox" id="delete-branch-after-merge" value="true" />
+                        <label for="delete-branch-after-merge">
+                          {pullMergeWriteLocale.branch_delete_checkbox.replaceAll("{branch}", data.mergeForm.headTarget)}
+                        </label>
+                      </div>
+                    ) : null}
+                  </div>
+                </form>
               </div>
             ) : null}
             {data.commands !== null ? (
@@ -1136,4 +1629,450 @@ export function pullMergeBoxFragmentResponse(html: string): Response {
       "cache-control": "max-age=0, private, must-revalidate",
     },
   });
+}
+
+// ---------------------------------------------------------------------------
+// The web write arms (census gap #2) — the POST handler ladders over the
+// landed services. Response shapes are the house web-POST convention (the
+// issue-comment POST posture): success → the redirect outcome (the mounted
+// handler answers 303 onto the PR page — upstream JSONRedirect/Redirect's
+// target), failure → the error outcome carrying the upstream flash text (the
+// mounted handler re-renders the conversation page with it), the upstream
+// NotFound arms → the not-found outcome (the 404 shell).
+// ---------------------------------------------------------------------------
+
+export type PullMergeBoxWriteOutcome =
+  | { outcome: "redirect"; location: string }
+  | { outcome: "error"; message: string }
+  | { outcome: "not-found" };
+
+/** The constructed context the seams take — the mounted route's `c` (the
+ *  session prologue has resolved repo + viewer before the seam runs; the
+ *  session gate precedes it) with the resolved rows. Tests construct it
+ *  directly (`new Context(req, { env })` — the repo-grants precedent). */
+export interface PullMergeBoxWriteContext {
+  c: Context<{ Bindings: Env }>;
+  /** The BASE repo row (the route prologue's resolution). */
+  repo: RepoRow;
+  issue: IssueRow;
+  pr: PullRequestRow;
+  /** The signed-in doer (the mounted handler's anonymous gate precedes). */
+  viewer: Extract<Viewer, { kind: "user" }>;
+}
+
+// --- form parsers (the urlencoded fields the templates post) -----------------
+
+/** `forms.MergePullRequestForm` (services/forms/repo_form.go:416-429) over
+ *  PullRequestMergeForm.vue's input names: `do`, `merge_title_field`,
+ *  `merge_message_field`, `merge_commit_id`, `head_commit_id`, `force_merge`,
+ *  `merge_when_checks_succeed` (the hidden v-models render "true"/"false")
+ *  and the `delete_branch_after_merge` checkbox (present = true — the *bool
+ *  binding). */
+export interface MergePullRequestWebForm {
+  /** The bound style — "" when the field is missing/foreign (the enum's
+   *  binding refusal maps to invalid_merge_option in the ladder). */
+  do: (typeof MERGE_STYLE_ENUM)[number] | "";
+  mergeTitleField: string;
+  mergeMessageField: string;
+  mergeCommitId: string;
+  headCommitId: string;
+  forceMerge: boolean;
+  mergeWhenChecksSucceed: boolean;
+  deleteBranchAfterMerge: boolean;
+}
+
+export function parseMergePullRequestWebForm(params: URLSearchParams): MergePullRequestWebForm {
+  return {
+    do: styleEnumOf(params.get("do") ?? ""),
+    mergeTitleField: params.get("merge_title_field") ?? "",
+    mergeMessageField: params.get("merge_message_field") ?? "",
+    mergeCommitId: params.get("merge_commit_id") ?? "",
+    headCommitId: params.get("head_commit_id") ?? "",
+    forceMerge: (params.get("force_merge") ?? "") === "true",
+    mergeWhenChecksSucceed: (params.get("merge_when_checks_succeed") ?? "") === "true",
+    deleteBranchAfterMerge: params.has("delete_branch_after_merge"),
+  };
+}
+
+/** `forms.UpdateAllowEditsForm` (repo_form.go:522-525): the sidebar JS posts
+ *  `allow_maintainer_edit: String(checkbox.checked)` ("true"/"false"); the
+ *  no-JS checkbox posts "on" or nothing. */
+export function parseAllowMaintainerEditForm(params: URLSearchParams): { allowMaintainerEdit: boolean } {
+  const raw = params.get("allow_maintainer_edit") ?? "";
+  return { allowMaintainerEdit: raw === "true" || raw === "on" || raw === "1" };
+}
+
+/** `POST /pull/{index}/target_branch`'s `target_branch` field
+ *  (ctx.FormTrim, pull.go:1517). */
+export function parseTargetBranchForm(params: URLSearchParams): { targetBranch: string } {
+  return { targetBranch: (params.get("target_branch") ?? "").trim() };
+}
+
+/** The update-branch style (the `?style=` query — upstream reads FormString
+ *  with the user's default fallback; the no-JS forms post the style in the
+ *  URL). */
+export function parseUpdateBranchStyle(style: string | null): "merge" | "rebase" | null {
+  return style === "rebase" ? "rebase" : style === "merge" ? "merge" : null;
+}
+
+// --- the seam plumbing --------------------------------------------------------
+
+/** The api-service bridge (repo-grants/cherrypick precedent): a fresh
+ *  `Context<ApiEnv>` over the same request + bindings carrying the doer's
+ *  User projection — mergePerson's commit stamps read login+email, the access
+ *  predicates read id/login/is_admin. */
+function apiContextFor(ctx: PullMergeBoxWriteContext, doer: User): Context<ApiEnv> {
+  const api = new Context<ApiEnv>(ctx.c.req.raw, { env: ctx.c.env });
+  api.set("authUser", doer);
+  return api;
+}
+
+/** The doer's UserRow → the minimal User projection the engine seams read
+ *  (mergePerson: login/email; principalAccessOf: id/login/is_admin). The
+ *  noreply fallback rides mergePerson's own hostname arm — the projection
+ *  carries the row's email verbatim. */
+async function doerProjection(ctx: PullMergeBoxWriteContext): Promise<User | null> {
+  const row = (await drizzle(ctx.c.env.DB).select().from(users).where(eq(users.id, ctx.viewer.id)).get()) ?? null;
+  if (row === null) return null; // the vanished session doer
+  return { id: row.id, login: row.username, is_admin: row.isAdmin, email: row.email ?? undefined };
+}
+
+/** The engine ApiError → the flash text (the web handler's catch arms). */
+function mergeEngineErrorMessage(message: string): string {
+  if (message.includes("conflict")) return pullMergeWriteLocale.merge_conflict;
+  if (message.startsWith("not a fast forward") || message.startsWith("The merge has failed, the base ref moved")) {
+    return pullMergeWriteLocale.merge_out_of_date;
+  }
+  if (message.startsWith("The merge commit")) return pullMergeWriteLocale.wrong_commit_id;
+  return message;
+}
+
+const MERGE_STYLE_ENUM = ["merge", "rebase", "rebase-merge", "squash", "fast-forward-only", "manually-merged"] as const;
+
+/** The enum-bound style read (web.Bind's In() as a type guard — no cast:
+ *  the union member returns only on a real match). */
+function styleEnumOf(raw: string): (typeof MERGE_STYLE_ENUM)[number] | "" {
+  for (const style of MERGE_STYLE_ENUM) {
+    if (style === raw) return style;
+  }
+  return "";
+}
+
+/** The shared prologue the ladders repeat (getPullInfo's row checks + the
+ *  doer/pair resolution). */
+async function writePrologue(
+  ctx: PullMergeBoxWriteContext,
+): Promise<{ ok: true; pair: NonNullable<Awaited<ReturnType<typeof findRepositoryById>>>; doer: User; api: Context<ApiEnv>; issueLink: string } | { ok: false; outcome: PullMergeBoxWriteOutcome }> {
+  if (!ctx.issue.isPull) {
+    // getPullInfo's non-pull redirect (pull.go:136-139) — the issues twin.
+    return { ok: false, outcome: { outcome: "redirect", location: `/${ctx.repo.ownerNamespace}/${ctx.repo.slug}/issues/${ctx.issue.index}` } };
+  }
+  const pair = await findRepositoryById(ctx.c.env.DB, ctx.repo.id);
+  if (pair === null) return { ok: false, outcome: { outcome: "not-found" } };
+  const doer = await doerProjection(ctx);
+  if (doer === null) return { ok: false, outcome: { outcome: "not-found" } };
+  return {
+    ok: true,
+    pair,
+    doer,
+    api: apiContextFor(ctx, doer),
+    issueLink: `/${ctx.repo.ownerNamespace}/${ctx.repo.slug}/pulls/${ctx.issue.index}`,
+  };
+}
+
+// --- POST /pulls/{index}/merge (web.go:1665 → pull.go:1044-1231) --------------
+
+/**
+ * The web merge ladder: CheckPullMergeable's arm order (check.go:142-207 —
+ * merged, closed, the permission pair, [manual short-circuit], WIP,
+ * mergeable state) with the schedule refusal in the landed API route's slot,
+ * the lazy-check precondition, the protection gate with the force_merge
+ * bypass, composeMergeMessage, and the engine merge — the API merge route's
+ * exact service seams with the web flash mapping. The success webhook + feed
+ * action re-issue the route's private emit arms over importable pieces (the
+ * payload assembly is pullRequestPayload's §2.7 wrapper shape; the PR render
+ * the canonical converter; the fan-out emitIssueEvent; the feed row the
+ * route's pullActionDraft merge discriminant — closed + merged=true →
+ * ActionType.MergePullRequest, content `index|title`).
+ */
+export async function mergePullRequestFromWeb(ctx: PullMergeBoxWriteContext, form: MergePullRequestWebForm): Promise<PullMergeBoxWriteOutcome> {
+  const prologue = await writePrologue(ctx);
+  if (!prologue.ok) return prologue.outcome;
+  const { pair, doer, api, issueLink } = prologue;
+  const db = ctx.c.env.DB;
+  // The form binding's enum (web.Bind In() — repo_form.go:420).
+  if (form.do === "") {
+    return { outcome: "error", message: pullMergeWriteLocale.invalid_merge_option };
+  }
+  // CheckPullMergeable's order: merged, closed, then the permission pair.
+  if (ctx.pr.hasMerged) return { outcome: "error", message: pullMergeWriteLocale.has_merged };
+  if (ctx.issue.isClosed) return { outcome: "error", message: pullMergeWriteLocale.is_closed };
+  const rule = await findRule(db, ctx.repo.id, ctx.pr.baseBranch);
+  const access = await principalAccessOf(db, pair.repo, doer);
+  if (!(access.write && (rule === null || (await isUserMergeWhitelisted(db, parseRuleConfig(rule.rules), access))))) {
+    // ErrNoPermissionToMerge's flash (pull.go:1077).
+    return { outcome: "error", message: pullMergeWriteLocale.update_not_allowed };
+  }
+  // The schedule refusal (the API route's landed contract — no scheduled-
+  // merge table exists, routes/pull-automerge.ts).
+  if (form.mergeWhenChecksSucceed) {
+    return { outcome: "error", message: "scheduled auto-merge is not supported" };
+  }
+  // The manual short-circuit (check.go:162-165): manually-merged skips the
+  // WIP / mergeable-state / protection checks entirely.
+  if (form.do !== "manually-merged") {
+    if (hasWorkInProgressPrefix(ctx.issue.title)) {
+      return { outcome: "error", message: pullMergeWriteLocale.no_merge_wip };
+    }
+    // The mergeable precondition runs the lazy check (the API route's pass).
+    const checked = await ensurePullRequestChecked(api, pair, ctx.pr);
+    if (checked.hasMerged || checked.status === PRStatus.Ancestor) {
+      return { outcome: "error", message: pullMergeWriteLocale.has_merged };
+    }
+    if (checked.status !== PRStatus.Mergeable) {
+      return { outcome: "error", message: pullMergeWriteLocale.no_merge_not_ready };
+    }
+    if (rule !== null) {
+      const failure = await checkPullBranchProtections(db, rule, { issueId: ctx.issue.id, commitsBehind: checked.commitsBehind ?? 0 });
+      if (failure !== null) {
+        const bypass = form.forceMerge && (await canBypassBranchProtection(db, parseRuleConfig(rule.rules), access));
+        if (!bypass) {
+          // ErrNotReadyToMerge's flash — the web handler maps the protection
+          // refusal to the not-ready text (pull.go:1084-1086), not the API's
+          // verbatim failure string.
+          return { outcome: "error", message: pullMergeWriteLocale.no_merge_not_ready };
+        }
+      }
+    }
+    const message = await composeMergeMessage(api, pair, ctx.issue, checked, {
+      style: form.do,
+      mergeTitleField: form.mergeTitleField,
+      mergeMessageField: form.mergeMessageField,
+    });
+    return runMergeLanding(ctx, {
+      api,
+      pair,
+      doer,
+      access,
+      issueLink,
+      checked,
+      style: form.do,
+      message,
+      deleteBranchAfterMerge: form.deleteBranchAfterMerge,
+      mergeCommitId: form.mergeCommitId === "" ? undefined : form.mergeCommitId,
+    });
+  }
+  return runMergeLanding(ctx, {
+    api,
+    pair,
+    doer,
+    access,
+    issueLink,
+    checked: ctx.pr,
+    style: "manually-merged",
+    message: "",
+    deleteBranchAfterMerge: form.deleteBranchAfterMerge,
+    mergeCommitId: form.mergeCommitId === "" ? undefined : form.mergeCommitId,
+  });
+}
+
+/** The engine-merge call + its catch mapping + the webhook/feed arms (the
+ *  shared tail of the merge ladder). */
+async function runMergeLanding(
+  ctx: PullMergeBoxWriteContext,
+  input: {
+    api: Context<ApiEnv>;
+    pair: NonNullable<Awaited<ReturnType<typeof findRepositoryById>>>;
+    doer: User;
+    access: PrincipalAccess;
+    issueLink: string;
+    checked: PullRequestRow;
+    style: (typeof MERGE_STYLE_ENUM)[number];
+    message: string;
+    deleteBranchAfterMerge: boolean;
+    mergeCommitId: string | undefined;
+  },
+): Promise<PullMergeBoxWriteOutcome> {
+  let commitOid: string | null;
+  try {
+    const landed = await mergePullRequest(input.api, input.pair, ctx.issue, input.checked, {
+      style: input.style,
+      message: input.message,
+      deleteBranchAfterMerge: input.deleteBranchAfterMerge,
+      mergeCommitId: input.mergeCommitId,
+      doerId: ctx.viewer.id,
+      now: new Date(),
+    });
+    commitOid = landed.commitOid;
+  } catch (error) {
+    if (!(error instanceof ApiError)) throw error;
+    return { outcome: "error", message: mergeEngineErrorMessage(error.message) };
+  }
+  // The webhook + feed (see the seam's doc — the route arms re-issued).
+  const merged = await findPullRequestByIndex(ctx.c.env.DB, ctx.repo.id, input.checked.index);
+  if (merged !== null) {
+    try {
+      const origin = new URL(ctx.c.req.url).origin;
+      const viewer = { origin, requester: input.doer };
+      const diffStats = await pullRequestDiffShortStat(input.api, input.pair, merged.pullRequest);
+      const rendered = await toApiPullRequest(ctx.c.env.DB, viewer, input.pair, merged.issue, merged.pullRequest, "payload", diffStats === null ? undefined : { diffStats });
+      await emitIssueEvent(ctx.c, {
+        repoId: ctx.repo.id,
+        ownerId: ctx.repo.ownerId,
+        eventType: "pull_request",
+        payload: {
+          action: "closed",
+          number: merged.issue.index,
+          pull_request: rendered,
+          repository: toApiRepository(viewer, input.pair),
+          sender: input.doer,
+          commit_id: commitOid ?? "",
+        },
+      });
+    } catch (error) {
+      console.error(`[pull-merge-box] merge webhook failed (issue ${ctx.issue.id}): ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
+      // pullActionDraft's merge discriminant (routes/pulls.ts): closed +
+      // merged=true → MergePullRequest, content `index|title`.
+      await recordAction(ctx.c.env.DB, {
+        actUserId: ctx.viewer.id,
+        repoId: ctx.repo.id,
+        opType: ActionType.MergePullRequest,
+        isPrivate: ctx.repo.visibility === "private",
+        content: `${merged.issue.index}|${merged.issue.title}`,
+      });
+    } catch (error) {
+      console.error(`[pull-merge-box] merge action row failed (issue ${ctx.issue.id}): ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return { outcome: "redirect", location: input.issueLink };
+}
+
+// --- POST /pulls/{index}/cancel_auto_merge (web.go:1666 → pull.go:1251-1290) --
+
+/**
+ * The cancel arm: GetScheduledMergeByPullID's `!exist` → NotFound is the ONLY
+ * reachable upstream behavior — this backend has no scheduled-merge table
+ * (the API DELETE route's contract, routes/pull-automerge.ts; POST /merge
+ * refuses the schedule). The doer-mismatch 403 and the success flash arms are
+ * unreachable past that 404.
+ */
+export async function cancelAutoMergeFromWeb(ctx: PullMergeBoxWriteContext): Promise<PullMergeBoxWriteOutcome> {
+  const prologue = await writePrologue(ctx);
+  if (!prologue.ok) return prologue.outcome;
+  return { outcome: "not-found" };
+}
+
+// --- POST /pulls/{index}/update (web.go:1667 → pull.go:968-1041) --------------
+
+/**
+ * The update-branch arm: closed/merged → NotFound, CheckUserAllowedToUpdate's
+ * landed predicate over the requested style (the default fallback is merge —
+ * upstream's userUpdateStyles.DefaultUpdateStyle default, repo_unit.go:148),
+ * then the engine execution with the handler's default message. Failure maps:
+ * conflicts → the merge_conflict flash, everything else → the handler's
+ * "Unable to update pull request" JSONError text.
+ */
+export async function updatePullRequestFromWeb(ctx: PullMergeBoxWriteContext, style: "merge" | "rebase"): Promise<PullMergeBoxWriteOutcome> {
+  const prologue = await writePrologue(ctx);
+  if (!prologue.ok) return prologue.outcome;
+  const { pair, api, issueLink } = prologue;
+  if (ctx.issue.isClosed || ctx.pr.hasMerged) return { outcome: "not-found" }; // pull.go:972-979
+  const access = await principalAccessOf(ctx.c.env.DB, pair.repo, await doerProjection(ctx));
+  const headRepo = await findRepositoryById(ctx.c.env.DB, ctx.pr.headRepoId);
+  const styles = await checkUserAllowedToUpdate(ctx.c.env.DB, ctx.repo, headRepo, ctx.issue, ctx.pr, access, ctx.viewer);
+  if (!(style === "rebase" ? styles.rebaseAllowed : styles.mergeAllowed)) {
+    // The update_not_allowed flash (pull.go:995-997).
+    return { outcome: "error", message: pullMergeWriteLocale.update_not_allowed };
+  }
+  // The handler's default message (pull.go:1000).
+  const message = `Merge branch '${ctx.pr.baseBranch}' into ${ctx.pr.headBranch}`;
+  try {
+    await updatePullRequestBranch(api, pair, ctx.pr, { style, message, now: new Date() });
+  } catch (error) {
+    if (!(error instanceof ApiError)) throw error;
+    if (error.message.includes("conflict")) return { outcome: "error", message: pullMergeWriteLocale.merge_conflict };
+    return { outcome: "error", message: pullMergeWriteLocale.unable_to_update };
+  }
+  // The success flash ("Branch update was successful") rides the redirect —
+  // the house's no-flash redirect (the reloaded page shows the fresh counts).
+  return { outcome: "redirect", location: issueLink };
+}
+
+// --- POST /pulls/{index}/set_allow_maintainer_edit (web.go:1668 →
+// pull.go:1579-1605 over services/pull/edits.go) -------------------------------
+
+/**
+ * The maintainer-edit toggle: SetAllowEdits' two refusals (edits.go:21-23 the
+ * poster gate, :34-36 the HEAD repo's code write) — the upstream 403 maps to
+ * the error outcome carrying the service's own ErrUserHasNoPermissionForAction
+ * text (the re-render's message; upstream's 403 has no body). The write is
+ * the bare column update (UpdateAllowEdits); the toggle 303s back (upstream's
+ * JS updates the checkbox in place — the no-JS form reload).
+ */
+export async function setAllowMaintainerEditFromWeb(ctx: PullMergeBoxWriteContext, form: { allowMaintainerEdit: boolean }): Promise<PullMergeBoxWriteOutcome> {
+  const prologue = await writePrologue(ctx);
+  if (!prologue.ok) return prologue.outcome;
+  const { pair, issueLink } = prologue;
+  const headRepo = await findRepositoryById(ctx.c.env.DB, ctx.pr.headRepoId);
+  if (headRepo === null) return { outcome: "not-found" }; // LoadHeadRepo's error arm
+  const isPoster = ctx.issue.posterId !== null && ctx.issue.posterId === ctx.viewer.id;
+  const headAccess =
+    ctx.pr.headRepoId === ctx.repo.id
+      ? await principalAccessOf(ctx.c.env.DB, pair.repo, await doerProjection(ctx))
+      : await principalAccessOfRow(ctx.c.env.DB, headRepo.repo, { id: ctx.viewer.id, username: ctx.viewer.username, isAdmin: ctx.viewer.isAdmin });
+  if (!isPoster || !headAccess.write) {
+    return { outcome: "error", message: pullMergeWriteLocale.no_permission_for_action };
+  }
+  await drizzle(ctx.c.env.DB)
+    .update(pullRequests)
+    .set({ allowMaintainerEdit: form.allowMaintainerEdit })
+    .where(eq(pullRequests.id, ctx.pr.id));
+  return { outcome: "redirect", location: issueLink };
+}
+
+// --- POST /pulls/{index}/cleanup (web.go:1669 → pull.go:1457-1465) ------------
+
+/**
+ * The post-merge cleanup: deleteBranchAfterMergeAndFlashMessage's outcome
+ * mapping — the failed arms re-render with the flash text, the deleted and
+ * silently-skipped arms land back on the PR page (the deletion's durable
+ * trace is the type-11 comment; the skip is silent upstream too,
+ * pull.go:1237-1240).
+ */
+export async function cleanupPullRequestFromWeb(ctx: PullMergeBoxWriteContext): Promise<PullMergeBoxWriteOutcome> {
+  const prologue = await writePrologue(ctx);
+  if (!prologue.ok) return prologue.outcome;
+  const result = await deleteBranchAfterMerge(prologue.api, prologue.pair, ctx.issue, ctx.pr, { doerId: ctx.viewer.id, now: new Date() });
+  if (result.outcome === "failed") {
+    return { outcome: "error", message: result.message };
+  }
+  return { outcome: "redirect", location: prologue.issueLink };
+}
+
+// --- POST /pull/{index}/target_branch (web.go:1439 → pull.go:1500-1576) -------
+
+/**
+ * The base-change form: GetActionIssue's poster-or-pulls-writer gate (the
+ * labels-write 404-shell posture — upstream answers 403, the shell hides
+ * it), the non-pull 404, the empty-target no-op (upstream's StatusNoContent —
+ * the no-JS form reloads), then ChangeTargetBranch with its five refusal
+ * texts as the error messages.
+ */
+export async function changeTargetBranchFromWeb(ctx: PullMergeBoxWriteContext, form: { targetBranch: string }): Promise<PullMergeBoxWriteOutcome> {
+  const prologue = await writePrologue(ctx);
+  if (!prologue.ok) return prologue.outcome;
+  const { pair, api, issueLink } = prologue;
+  const isPoster = ctx.issue.posterId !== null && ctx.issue.posterId === ctx.viewer.id;
+  const access = await principalAccessOf(ctx.c.env.DB, pair.repo, await doerProjection(ctx));
+  if (!isPoster && !access.write) return { outcome: "not-found" }; // pull.go:1512-1515's 403, shell-hidden
+  if (form.targetBranch === "") return { outcome: "redirect", location: issueLink }; // StatusNoContent → reload
+  try {
+    await changePullRequestTargetBranch(api, pair, ctx.issue, ctx.pr, { targetBranch: form.targetBranch, now: new Date() });
+  } catch (error) {
+    if (!(error instanceof ApiError)) throw error;
+    return { outcome: "error", message: error.message };
+  }
+  return { outcome: "redirect", location: issueLink };
 }
