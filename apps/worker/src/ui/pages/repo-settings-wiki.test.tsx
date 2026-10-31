@@ -235,7 +235,12 @@ describe("the wiki panel DOM (options.tmpl:319-355 + 873-880 + 1046-1062 at the 
     expect(enabledHtml).toContain(wikiSettingsLocale.wiki_delete);
     expect(enabledHtml).toContain(wikiSettingsLocale.wiki_delete_desc);
     expect(enabledHtml).toContain(wikiSettingsLocale.delete_unavailable);
-    expect(enabledHtml).not.toContain("show-modal"); // the #delete-wiki-modal opener is not reproduced
+    // Scoped to the danger segment: the shared shell now carries the repo
+    // WATCH options modal (header.tmpl:93, the watch-UI wave 916943f) on every
+    // signed repo page — its .show-modal is legit page chrome, not the wiki
+    // delete modal this pin guards against.
+    const danger = enabledHtml.slice(enabledHtml.indexOf(wikiSettingsLocale.wiki_delete_desc));
+    expect(danger.slice(0, 2000)).not.toContain("show-modal"); // the #delete-wiki-modal opener is not reproduced
     expect(enabledHtml).not.toContain("delete-wiki-modal");
     expect(enabledHtml).not.toContain('name="action" value="delete-wiki"');
 
@@ -461,7 +466,7 @@ describe("the mounted routes (GET + POST /{owner}/{repo}/settings/wiki)", () => 
     expect(html).not.toContain('name="external_wiki_url"');
     expect(html).not.toContain('name="default_wiki_branch"');
     expect(html).not.toContain('type="url"');
-    expect(html).not.toContain("show-modal");
+    expect(html.slice(html.indexOf("Wiki"))).not.toContain("delete-wiki-modal");
     expect(html).not.toContain("delete-wiki-modal");
     // The read-only reductions render through the route.
     expect(html).toContain(wikiSettingsLocale.use_internal_wiki);
