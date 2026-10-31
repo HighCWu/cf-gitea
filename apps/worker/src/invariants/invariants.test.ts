@@ -53,12 +53,12 @@
 
 import { SELF, env } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
-import { repositories, users } from "../db/schema";
+import { repositories, users, repoUnits } from "../db/schema";
 import { RepoService } from "../repos/service";
 import { checkRepoInvariants, type InvariantsEnv, type InvariantReport } from "./check";
 import type { CommitJson, PackCatalogEntry } from "@cf-gitea/git-engine";
@@ -126,6 +126,14 @@ async function createRepo(slug: string): Promise<{ storageKey: string; repoId: s
     name: slug,
     isPrivate: false,
   });
+  // Disable the actions unit (the M3 trigger's own gate skips unit-less
+  // repos, notifier_helper.go:162-166): the trigger's per-push workflow scan
+  // reads each pushed commit's tree, and those reads populate/promote the
+  // DO's object-cache chunks — keeping pack1's chunk HOT and breaking the
+  // chunk-LRU eviction assumption the whole eviction fixture rests on (the
+  // deleted pack's content then reads from cache, no closure-broken fires).
+  // The license-leg workaround above covers the same class for webhooks.
+  await drizzle(env.DB).delete(repoUnits).where(and(eq(repoUnits.repoId, repo.id), eq(repoUnits.type, "actions")));
   const token = (await mintFor(aliceId, `w-${slug}`, "write:repository")).plaintext;
   return { storageKey: repo.storageKey, repoId: repo.id, token };
 }
