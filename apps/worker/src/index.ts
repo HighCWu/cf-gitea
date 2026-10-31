@@ -332,6 +332,35 @@ export default {
     // Attachments carve-out (web.go:912 — the site-level /attachments/:uuid
     // download route): never repo-scoped, never the engine's.
     const isAttachmentServing = segments[0] === "attachments";
+    // THE ASSET-MISS FALLBACK TARGET (web.go:264 + modules/public/public.go —
+    // the v1.2-carried "no /assets fallback target" residual closed): the
+    // wrangler assets binding serves every HIT edge-side with
+    // not_found_handling "none", so a /assets/* request reaching THIS
+    // dispatcher is by construction a MISS — and upstream answers misses
+    // itself: FileHandlerFunc's non-GET/HEAD arm 405s (public.go:46-48),
+    // handleRequest's not-exist and directory arms are the BARE empty 404
+    // (:78-79/:93-94 — no styled shell; the browser's asset request never
+    // gets HTML), and OPTIONS rides web.go:264's AssetsCors() preflight
+    // (public.go:33-39 — AllowedOrigins *, methods HEAD/GET, MaxAge 86400).
+    // Without this carve the miss fell to the unclaimed-path shell/engine
+    // pair below — a browser received styled HTML for an asset path.
+    const isAssetMiss = segments[0] === "assets" && segments.length >= 2;
+    if (isAssetMiss) {
+      if (req.method === "OPTIONS") {
+        return new Response(null, {
+          status: 204,
+          headers: {
+            "access-control-allow-origin": "*",
+            "access-control-allow-methods": "HEAD,GET",
+            "access-control-max-age": "86400",
+          },
+        });
+      }
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        return new Response(null, { status: 405 });
+      }
+      return new Response(null, { status: 404 });
+    }
     // "twirp" joins "api" in Hono-land: the artifacts-v4 mount (SPEC-0012
     // §2.1, init.go:205-206) lives at /twirp/github.actions.results.api.v1.
     // ArtifactService and is never repo-scoped.

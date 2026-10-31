@@ -801,6 +801,41 @@ describe("Tier-2 UI mount (dispatcher branch order: api → ui → gate)", () =>
 
 // --- the unclaimed-repo-path 404 carve (usability sweep, 2026-10-29) ----------
 
+describe("the asset-miss fallback target (upstream web.go:264 + modules/public/public.go)", () => {
+  // The wrangler assets binding serves every HIT edge-side; a /assets/*
+  // request reaching the dispatcher is by construction a MISS, and upstream
+  // answers misses itself — the BARE empty 404 (public.go:78-79/:93-94, no
+  // styled shell: a browser's asset request never gets HTML), 405 for
+  // non-GET/HEAD (:46-48), and the AssetsCors() preflight for OPTIONS
+  // (:33-39 — origins *, methods HEAD/GET, MaxAge 86400).
+  it("answers a GET miss with the bare empty 404 — never the styled shell", async () => {
+    const response = await SELF.fetch("https://example.com/assets/no-such-file.css", {
+      headers: { accept: "text/html" },
+    });
+    expect(response.status).toBe(404);
+    expect(response.headers.get("content-type")).not.toBe("text/html; charset=UTF-8");
+    expect(await response.text()).toBe("");
+  });
+
+  it("keeps HEAD on the same bare-404 arm", async () => {
+    const response = await SELF.fetch("https://example.com/assets/no-such.js", { method: "HEAD" });
+    expect(response.status).toBe(404);
+  });
+
+  it("405s the non-GET/HEAD methods (public.go:46-48)", async () => {
+    const response = await SELF.fetch("https://example.com/assets/no-such.css", { method: "POST" });
+    expect(response.status).toBe(405);
+  });
+
+  it("answers the OPTIONS preflight with AssetsCors' arms (public.go:33-39)", async () => {
+    const response = await SELF.fetch("https://example.com/assets/no-such.css", { method: "OPTIONS" });
+    expect(response.status).toBe(204);
+    expect(response.headers.get("access-control-allow-origin")).toBe("*");
+    expect(response.headers.get("access-control-allow-methods")).toBe("HEAD,GET");
+    expect(response.headers.get("access-control-max-age")).toBe("86400");
+  });
+});
+
 describe("the unclaimed-repo-path 404 carve (upstream context_response.go:129-151)", () => {
   // Upstream's NotFound renders the full status/404.tmpl chrome for
   // text/html requests and a plain line otherwise; the headless engine only
