@@ -810,6 +810,37 @@ describe("commits family (repoGetAllCommits / repoGetSingleCommit / dot-diff / c
     expect((await get(`${REPO}/compare/main...ghost`)).status).toBe(404);
   });
 
+  it("routes SLASHED ref names in the basehead tail (upstream chi /compare/*)", async () => {
+    // Upstream registers /compare/* (api.go:1240) so slashed branch names
+    // reach CompareDiff (the swagger's "including branch names that contain
+    // slashes"); hono's single-segment {basehead} 404'd them (census #12) —
+    // the plain catch-all twin carries the multi-segment tails now.
+    await seedBranchWithCommit("feature/deep", "fx.txt", "fx\n");
+
+    // slashed BASE: feature/deep...main — main has nothing the branch lacks
+    const slashedBase = await get(`${REPO}/compare/feature/deep...main`);
+    expect(slashedBase.status).toBe(200);
+    expect((await jsonBody(slashedBase)).total_commits).toBe(0);
+
+    // slashed HEAD: the branch's one commit is the whole range
+    const slashedHead = await get(`${REPO}/compare/main...feature/deep`);
+    expect(slashedHead.status).toBe(200);
+    const compare = await jsonBody(slashedHead);
+    expect(compare.total_commits).toBe(1);
+    expect(
+      ((compare.commits as Array<Record<string, unknown>>)[0]?.commit as Record<string, unknown>).message,
+    ).toContain("feature/deep: fx.txt");
+
+    const diff = await get(`${REPO}/compare/main...feature/deep?output=diff`);
+    expect(diff.status).toBe(200);
+    expect(await diff.text()).toContain("diff --git a/fx.txt");
+
+    // the two-dot form routes the same slashed tail
+    const twoDot = await get(`${REPO}/compare/main..feature/deep`);
+    expect(twoDot.status).toBe(200);
+    expect((await jsonBody(twoDot)).total_commits).toBe(1);
+  });
+
   it("serves the compare commit list newest-first (upstream git-log order)", async () => {
     // two commits on one branch: the newest must render first
     await seedBranchWithCommit("cmporder", "one.txt", "one\n");

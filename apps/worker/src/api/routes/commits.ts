@@ -352,8 +352,108 @@ export function registerCommitRoutes(
   // -------------------------------------------------------------------------
   // GET /repos/{owner}/{repo}/compare/{basehead} (repoCompareDiff) —
   // `base...head` / `base..head`; output=diff|patch answers raw text.
+  //
+  // Upstream registers the chi WILDCARD `/compare/*` (api.go:1240), so the
+  // tail matches SLASHED ref names — the swagger's own "including branch
+  // names that contain slashes". Hono's single-segment `{basehead}` cannot,
+  // so the doc stays doc-only (the git/commits dot-suffix idiom) and TWO
+  // plain arms share the handler: the single-segment param route (wins the
+  // shared prefix — the branch_protections probe) and a catch-all twin for
+  // the multi-segment tails (the contents raw/media pair). Split parity
+  // note: upstream's ParseCompareRouterParam answers a separator-less tail
+  // as head-vs-default-branch; this handler keeps the declared 400 (the
+  // compat suite pins it) — documented divergence, like the unmodeled
+  // `headOwner:headRef` fork forms.
   // -------------------------------------------------------------------------
-  app.openapi(
+  const handleCompare = async (c: Context<ApiEnv>, owner: string, repo: string, basehead: string): Promise<Response> => {
+    const pair = await requireVisibleRepo(c, { owner, repo });
+    const url = new URL(c.req.url);
+    const sep = basehead.includes("...") ? "..." : basehead.includes("..") ? ".." : null;
+    if (sep === null) {
+      throw new ApiError(400, "invalid basehead format: must be base...head or base..head");
+    }
+    const colon = basehead.indexOf(sep);
+    const baseParam = basehead.slice(0, colon);
+    const headParam = basehead.slice(colon + sep.length);
+
+    const reads = engineReads(c.env, pair.repo);
+    const tips = refTipMap(await reads.listRefs());
+    // STRICT resolution (no default-branch fallback): an unknown side is
+    // the upstream 404, not a silent compare against the default branch.
+    const resolveSide = (param: string): string | null => {
+      const direct = tips.get(branchRef(param)) ?? tips.get(tagRef(param)) ?? tips.get(param);
+      if (direct !== undefined) return direct.target;
+      return /^[0-9a-f]{40}$/.test(param) ? param : null;
+    };
+    const baseTarget = resolveSide(baseParam);
+    const headTarget = resolveSide(headParam);
+    if (baseTarget === null || headTarget === null) {
+      throw new ApiError(404, "not found");
+    }
+    const baseCommit = await reads.readCommit(baseTarget);
+    const headCommit = await reads.readCommit(headTarget);
+    if (baseCommit === null || headCommit === null) {
+      throw new ApiError(404, "not found");
+    }
+    // three-dot diffs/commits from the merge base; two-dot from base itself.
+    // Upstream GetCompareInfo returns EARLY EMPTY on a null merge base
+    // (unrelated histories — compare.go:91-93 `CompareBase == ""` return):
+    // zero commits and an empty raw diff/patch (git's `base...head` has no
+    // merge-base side). The PR twin already honors this (pull-engine.ts
+    // pullRequestDiff). The engine's budget-exhausted merge-base walk also
+    // reports base=null — the same EMPTY shape, our documented exhaustion
+    // posture (SPEC-0001b §6).
+    let rangeStart: string | null = baseCommit.oid;
+    if (sep === "...") {
+      const base = await reads.mergeBase(baseCommit.oid, headCommit.oid);
+      rangeStart = base !== null && base.tag === "ok" ? base.base : null;
+    }
+    if (rangeStart === null) {
+      const output = url.searchParams.get("output") ?? "";
+      if (output === "diff") {
+        return c.text("", 200);
+      }
+      if (output === "patch") {
+        // The route's landed empty-range patch shape (the header-only mail,
+        // the /pulls/{index}.patch twin) — upstream's format-patch prints
+        // nothing; kept for render consistency, documented divergence.
+        return c.text(renderPatch(headCommit, []), 200);
+      }
+      return c.json({ total_commits: 0, commits: [] }, 200);
+    }
+
+    const output = url.searchParams.get("output") ?? "";
+    if (output === "diff" || output === "patch") {
+      const diff = await reads.readDiff(headCommit.oid, rangeStart);
+      const files = diff?.files ?? [];
+      if (output === "patch") {
+        const headJson = headCommit;
+        return c.text(renderPatch(headJson, files), 200);
+      }
+      return c.text(renderUnifiedDiff(files), 200);
+    }
+
+    const walked = (await reads.listCommitsRange(rangeStart, headCommit.oid, COMPARE_COMMIT_BOUND)) ?? { commits: [], more: false };
+    const statFlag = formBoolDefault(url, "stat");
+    const filesFlag = formBoolDefault(url, "files");
+    const userRows = await userRowsByEmail(c.env.DB, walked.commits);
+    // Upstream serves the compare commit list in git-log order (newest
+    // first — compare.go's ShowPrettyFormatLogToList); the engine's
+    // listCommitsRange is oldest-first (SPEC-0001b §4.1), so the render
+    // reverses the walk (the push-payload precedent, webhooks-push.ts).
+    const newestFirst = [...walked.commits].reverse();
+    const rendered = await Promise.all(
+      newestFirst.map((commit) =>
+        toApiCommit(c.env.DB, reads, viewerOf(c), pair, commit, undefined, { stat: statFlag, files: filesFlag, userRows }),
+      ),
+    );
+    return c.json({ total_commits: walked.commits.length, commits: rendered }, 200);
+  };
+
+  // Doc-only registration (the git/commits dot-suffix idiom — a zod-openapi
+  // typed handler cannot share the Promise<Response> helper with the plain
+  // arms); the two wire arms below serve the path.
+  app.openAPIRegistry.registerPath(
     createRoute({
       method: "get",
       path: "/repos/{owner}/{repo}/compare/{basehead}",
@@ -364,7 +464,7 @@ export function registerCommitRoutes(
       request: {
         params: z.object({
           ...ownerRepoParams,
-          basehead: z.string().min(1).openapi({ description: "the base and head, formatted as base...head (three-dot) or base..head (two-dot)" }),
+          basehead: z.string().min(1).openapi({ description: "the base and head, formatted as base...head (three-dot) or base..head (two-dot); refs may be branch names that contain slashes" }),
         }),
         query: z.object({
           output: z.string().optional().openapi({ type: "string", enum: ["diff", "patch", ""], description: "output format; diff or patch answers raw text" }),
@@ -378,92 +478,28 @@ export function registerCommitRoutes(
         404: notFoundResponse,
       },
     }),
-    async (c) => {
-      const pair = await requireVisibleRepo(c, c.req.valid("param"));
-      const basehead = c.req.valid("param").basehead;
-      const sep = basehead.includes("...") ? "..." : basehead.includes("..") ? ".." : null;
-      if (sep === null) {
-        throw new ApiError(400, "invalid basehead format: must be base...head or base..head");
-      }
-      const colon = basehead.indexOf(sep);
-      const baseParam = basehead.slice(0, colon);
-      const headParam = basehead.slice(colon + sep.length);
-
-      const reads = engineReads(c.env, pair.repo);
-      const tips = refTipMap(await reads.listRefs());
-      // STRICT resolution (no default-branch fallback): an unknown side is
-      // the upstream 404, not a silent compare against the default branch.
-      const resolveSide = (param: string): string | null => {
-        const direct = tips.get(branchRef(param)) ?? tips.get(tagRef(param)) ?? tips.get(param);
-        if (direct !== undefined) return direct.target;
-        return /^[0-9a-f]{40}$/.test(param) ? param : null;
-      };
-      const baseTarget = resolveSide(baseParam);
-      const headTarget = resolveSide(headParam);
-      if (baseTarget === null || headTarget === null) {
-        throw new ApiError(404, "not found");
-      }
-      const baseCommit = await reads.readCommit(baseTarget);
-      const headCommit = await reads.readCommit(headTarget);
-      if (baseCommit === null || headCommit === null) {
-        throw new ApiError(404, "not found");
-      }
-      // three-dot diffs/commits from the merge base; two-dot from base itself.
-      // Upstream GetCompareInfo returns EARLY EMPTY on a null merge base
-      // (unrelated histories — compare.go:91-93 `CompareBase == ""` return):
-      // zero commits and an empty raw diff/patch (git's `base...head` has no
-      // merge-base side). The PR twin already honors this (pull-engine.ts
-      // pullRequestDiff). The engine's budget-exhausted merge-base walk also
-      // reports base=null — the same EMPTY shape, our documented exhaustion
-      // posture (SPEC-0001b §6).
-      let rangeStart: string | null = baseCommit.oid;
-      if (sep === "...") {
-        const base = await reads.mergeBase(baseCommit.oid, headCommit.oid);
-        rangeStart = base !== null && base.tag === "ok" ? base.base : null;
-      }
-      if (rangeStart === null) {
-        const output = c.req.valid("query").output ?? "";
-        if (output === "diff") {
-          return c.text("", 200);
-        }
-        if (output === "patch") {
-          // The route's landed empty-range patch shape (the header-only mail,
-          // the /pulls/{index}.patch twin) — upstream's format-patch prints
-          // nothing; kept for render consistency, documented divergence.
-          return c.text(renderPatch(headCommit, []), 200);
-        }
-        return c.json({ total_commits: 0, commits: [] }, 200);
-      }
-
-      const output = c.req.valid("query").output ?? "";
-      if (output === "diff" || output === "patch") {
-        const diff = await reads.readDiff(headCommit.oid, rangeStart);
-        const files = diff?.files ?? [];
-        if (output === "patch") {
-          const headJson = headCommit;
-          return c.text(renderPatch(headJson, files), 200);
-        }
-        return c.text(renderUnifiedDiff(files), 200);
-      }
-
-      const walked = (await reads.listCommitsRange(rangeStart, headCommit.oid, COMPARE_COMMIT_BOUND)) ?? { commits: [], more: false };
-      const url = new URL(c.req.url);
-      const statFlag = formBoolDefault(url, "stat");
-      const filesFlag = formBoolDefault(url, "files");
-      const userRows = await userRowsByEmail(c.env.DB, walked.commits);
-      // Upstream serves the compare commit list in git-log order (newest
-      // first — compare.go's ShowPrettyFormatLogToList); the engine's
-      // listCommitsRange is oldest-first (SPEC-0001b §4.1), so the render
-      // reverses the walk (the push-payload precedent, webhooks-push.ts).
-      const newestFirst = [...walked.commits].reverse();
-      const rendered = await Promise.all(
-        newestFirst.map((commit) =>
-          toApiCommit(c.env.DB, reads, viewerOf(c), pair, commit, undefined, { stat: statFlag, files: filesFlag, userRows }),
-        ),
-      );
-      return c.json({ total_commits: walked.commits.length, commits: rendered }, 200);
-    },
   );
+
+  // The single-segment arm (kept first: the param route wins the shared
+  // prefix — the branch_protections probe) and the slashed-tail twin that
+  // answers everything it cannot bind (multi-segment baseheads) — the
+  // contents raw/media pair, both on the SAME handler.
+  app.get("/repos/:owner/:repo/compare/:basehead", optionalAuth, (c) => {
+    const { owner, repo, basehead } = c.req.param();
+    return handleCompare(c, owner, repo, basehead);
+  });
+
+  app.get("/repos/:owner/:repo/compare/*", optionalAuth, (c) => {
+    const { owner, repo } = c.req.param();
+    return handleCompare(c, owner, repo, tailAfter(c, `/${owner}/${repo}/compare/`));
+  });
+}
+
+/** The repo-relative tail of a plain catchall path (the contents.ts raw/media
+ *  idiom — owner/repo may carry case; the tail decodes %-escapes). */
+function tailAfter(c: Context<ApiEnv>, prefix: string): string {
+  const index = c.req.path.indexOf(prefix);
+  return decodeURIComponent(index < 0 ? "" : c.req.path.slice(index + prefix.length));
 }
 
 /** Compare renders at most this many commits (upstream's own page cap). */
