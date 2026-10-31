@@ -737,6 +737,11 @@ export interface AdminUsersData {
   total: number;
   more: boolean;
   items: (typeof users.$inferSelect)[];
+  /** The shell's Integrations gate (admin navbar.tmpl:50-77's reduced
+   *  `.EnableOAuth2` wrap, the shell's pass-through prop): the route threads
+   *  the strict-polarity read (`oauth2FeatureEnabled(c.env)`).
+   *  Absent/true = enabled. */
+  oauth2Enabled?: boolean;
 }
 
 /**
@@ -745,8 +750,11 @@ export interface AdminUsersData {
  * the admin-actor keyword triple (username/full name/email — SearchByEmail,
  * the API twin's exact instr() predicate), the five status filters (the
  * header's mapping) + the user_type arm, the sort, one page of 50.
+ * `oauth2Enabled` (default true) is the navbar gate read the route passes
+ * (`oauth2FeatureEnabled(c.env)`) — the sibling loaders' optional
+ * trailing-param shape.
  */
-export async function loadAdminUsersData(d1: D1Database, search: URLSearchParams): Promise<AdminUsersData> {
+export async function loadAdminUsersData(d1: D1Database, search: URLSearchParams, oauth2Enabled = true): Promise<AdminUsersData> {
   const params = parseAdminUsersListParams(search);
   const conditions: SQL[] = [eq(users.type, "user")];
 
@@ -802,7 +810,7 @@ export async function loadAdminUsersData(d1: D1Database, search: URLSearchParams
   }
   if (params.sort !== "alphabetically") query.set("sort", params.sort);
 
-  return { params, query, total, more: params.page * ADMIN_USERS_PAGE_SIZE < total, items };
+  return { params, query, total, more: params.page * ADMIN_USERS_PAGE_SIZE < total, items, oauth2Enabled };
 }
 
 // ---------------------------------------------------------------------------
@@ -880,7 +888,7 @@ export function AdminUsersPage(props: { ctx: UiContext; data: AdminUsersData }) 
     return qs === "" ? "/-/admin/users" : `/-/admin/users?${qs}`;
   };
   return (
-    <AdminFamilyShell ctx={props.ctx} title={adminUsersLocale.user_manage_panel} pageClass="admin user" active="users">
+    <AdminFamilyShell ctx={props.ctx} title={adminUsersLocale.user_manage_panel} pageClass="admin user" active="users" oauth2Enabled={props.data.oauth2Enabled}>
       {/* The header (list.tmpl:3-8): panel name + total. The "Create User
           Account" button is omitted — /-/admin/users/new is unlanded (the
           module header). */}

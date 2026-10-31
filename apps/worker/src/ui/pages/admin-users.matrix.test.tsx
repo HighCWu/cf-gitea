@@ -31,6 +31,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { renderToString } from "hono/jsx/dom/server";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
+import { oauth2FeatureEnabled } from "../../services/oauth2/token";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
@@ -368,6 +369,27 @@ describe("the admin users DOM (templates/admin/user/list.tmpl at the pin)", () =
     expect(html).toContain('href="/-/admin/actions/runners"');
     expect(html).toContain('href="/-/admin/actions/variables"');
     expect(html).toContain('href="/-/admin/actions/scoped-workflows"');
+  });
+
+  it("the navbar's Applications gate: OAUTH2_ENABLED=false drops the item (admin navbar.tmpl:50-77's .EnableOAuth2 wrap)", async () => {
+    await seedBaseFixtures();
+    // The default posture arms the item (the absent prop = enabled).
+    expect(render(await load(""))).toContain('href="/-/admin/applications"');
+    // The pinned-false arm rides the strict-polarity read the route passes
+    // (`oauth2FeatureEnabled(c.env)`) through the loader into the shell's
+    // optional prop. The mutation-hole cast: the generated Env pins the
+    // deployed "true" literal (admin-monitor.test.tsx's convention), so the
+    // test widens the slice to assign the polarity.
+    const armedEnv = { ...env } as { OAUTH2_ENABLED?: string };
+    armedEnv.OAUTH2_ENABLED = "false";
+    const html = renderToString(
+      <AdminUsersPage ctx={ctx} data={await loadAdminUsersData(env.DB, new URLSearchParams(), oauth2FeatureEnabled(armedEnv))} />,
+    );
+    expect(html).not.toContain('href="/-/admin/applications"');
+    // The gate is group-exact: the Integrations group collapses to the
+    // plain Webhooks item (navbar.tmpl:63-67) and the siblings stay.
+    expect(html).toContain('href="/-/admin/hooks"');
+    expect(html).toContain('href="/-/admin/users"');
   });
 
   it("the sortable headers are links — ID toggles oldest/newest, Username carries the default arrow", async () => {

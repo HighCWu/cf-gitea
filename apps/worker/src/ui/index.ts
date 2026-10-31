@@ -7266,7 +7266,7 @@ async function adminActionsJobQueuePage(c: Context<{ Bindings: Env }>): Promise<
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
   const search = new URL(c.req.raw.url).searchParams;
-  const data = await loadJobQueuePageData(c.env.DB, { kind: "admin" }, search);
+  const data = await loadJobQueuePageData(c.env.DB, { kind: "admin" }, search, oauth2FeatureEnabled(c.env));
   if (search.has("refresh")) {
     return p.respond(c.html(renderJobQueueFragment(data), 200));
   }
@@ -7287,7 +7287,7 @@ async function adminActionsGroupRedirect(c: Context<{ Bindings: Env }>): Promise
 async function adminActionsRunnersPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
-  const data = await loadAdminActionsRunnersPageData(c.env.DB, new URL(c.req.raw.url).searchParams);
+  const data = await loadAdminActionsRunnersPageData(c.env.DB, new URL(c.req.raw.url).searchParams, new Date(), oauth2FeatureEnabled(c.env));
   return p.respond(c.html(renderAdminActionsRunnersPage(p.ctx, data), 200));
 }
 
@@ -7303,7 +7303,7 @@ async function adminActionsRunnersTokenReset(c: Context<{ Bindings: Env }>): Pro
 async function adminActionsRunnerEditPage(c: Context<{ Bindings: Env }>, runnerId: number): Promise<Response> {
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
-  const data = await loadAdminActionsRunnerEditPageData(c.env.DB, runnerId, new URL(c.req.raw.url).searchParams);
+  const data = await loadAdminActionsRunnerEditPageData(c.env.DB, runnerId, new URL(c.req.raw.url).searchParams, new Date(), oauth2FeatureEnabled(c.env));
   if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
   return p.respond(c.html(renderAdminActionsRunnerEditPage(p.ctx, data), 200));
 }
@@ -7379,7 +7379,7 @@ async function adminActionsRunnersBulk(c: Context<{ Bindings: Env }>): Promise<R
 async function adminActionsVariablesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
-  const data = await loadAdminActionsVariablesPageData(c.env.DB);
+  const data = await loadAdminActionsVariablesPageData(c.env.DB, oauth2FeatureEnabled(c.env));
   return p.respond(c.html(renderAdminActionsVariablesPage(p.ctx, data), 200));
 }
 
@@ -7396,7 +7396,7 @@ async function adminActionsVariableCreate(c: Context<{ Bindings: Env }>): Promis
   // The shared union's arm — unreachable at create (no path id), answered
   // defensively rather than de-narrowed.
   if (outcome.outcome === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
-  const data = await loadAdminActionsVariablesPageData(c.env.DB);
+  const data = await loadAdminActionsVariablesPageData(c.env.DB, oauth2FeatureEnabled(c.env));
   return p.respond(c.html(renderAdminActionsVariablesPage(p.ctx, data, outcome.message), 200));
 }
 
@@ -7411,7 +7411,7 @@ async function adminActionsVariableEdit(c: Context<{ Bindings: Env }>, variableI
     return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/actions/variables" } }));
   }
   if (outcome.outcome === "missing") return p.respond(c.html(renderNotFound(p.ctx), 404));
-  const data = await loadAdminActionsVariablesPageData(c.env.DB);
+  const data = await loadAdminActionsVariablesPageData(c.env.DB, oauth2FeatureEnabled(c.env));
   return p.respond(c.html(renderAdminActionsVariablesPage(p.ctx, data, outcome.message), 200));
 }
 
@@ -10124,7 +10124,7 @@ async function orgSettingsPage(c: Context<{ Bindings: Env }>): Promise<Response>
   if (!resolved.ok) return resolved.response;
   const { ctx, respond } = resolved;
   if (resolved.route.family !== "org-settings") return respond(await c.notFound()); // drift guard
-  return respond(c.html(renderOrgSettingsPage(ctx, { org: resolved.org, error: null }), 200));
+  return respond(c.html(renderOrgSettingsPage(ctx, { org: resolved.org, error: null, oauth2Enabled: oauth2FeatureEnabled(c.env) }), 200));
 }
 
 /**
@@ -10204,7 +10204,7 @@ async function orgSettingsRenameSubmit(c: Context<{ Bindings: Env }>): Promise<R
   if (result.outcome === "applied") {
     return respond(new Response(null, { status: 303, headers: { location: `/${result.org.username}/settings` } }));
   }
-  return respond(c.html(renderOrgSettingsPage(ctx, { org, error: result.message }), 200));
+  return respond(c.html(renderOrgSettingsPage(ctx, { org, error: result.message, oauth2Enabled: oauth2FeatureEnabled(c.env) }), 200));
 }
 
 /**
@@ -10226,7 +10226,7 @@ async function orgSettingsDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<R
   if (result.outcome === "deleted") {
     return respond(new Response(null, { status: 303, headers: { location: `/` } }));
   }
-  return respond(c.html(renderOrgSettingsPage(ctx, { org, error: result.message }), 200));
+  return respond(c.html(renderOrgSettingsPage(ctx, { org, error: result.message, oauth2Enabled: oauth2FeatureEnabled(c.env) }), 200));
 }
 
 /**
@@ -10267,7 +10267,7 @@ async function orgHooksSettingsPage(c: Context<{ Bindings: Env }>): Promise<Resp
   if (!resolved.ok) return resolved.response;
   const { ctx, respond } = resolved;
   if (resolved.route.family !== "org-settings-hooks") return respond(await c.notFound()); // drift guard
-  const data = await loadOrgHooksSettings(c.env.DB, resolved.org);
+  const data = await loadOrgHooksSettings(c.env.DB, resolved.org, oauth2FeatureEnabled(c.env));
   return respond(c.html(renderOrgHooksSettingsPage({ ctx, data, error: null }), 200));
 }
 
@@ -10292,7 +10292,7 @@ async function orgHooksSettingsSubmit(c: Context<{ Bindings: Env }>): Promise<Re
   if (result.outcome === "created") {
     return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/hooks` } }));
   }
-  const data = await loadOrgHooksSettings(c.env.DB, org);
+  const data = await loadOrgHooksSettings(c.env.DB, org, oauth2FeatureEnabled(c.env));
   data.form = { name: form.name, payloadUrl: form.payloadUrl, contentType: form.contentType };
   return respond(c.html(renderOrgHooksSettingsPage({ ctx, data, error: result.message }), 200));
 }
@@ -10309,7 +10309,7 @@ async function orgHookDetailPage(c: Context<{ Bindings: Env }>): Promise<Respons
   const { ctx, respond } = resolved;
   const route = resolved.route;
   if (route.family !== "org-settings-hook-detail" || route.id === undefined) return respond(await c.notFound()); // drift guard
-  const data = await loadOrgHookDetailData(c.env.DB, resolved.org, route.id);
+  const data = await loadOrgHookDetailData(c.env.DB, resolved.org, route.id, oauth2FeatureEnabled(c.env));
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   return respond(c.html(renderOrgHookDetailPage({ ctx, data, error: null }), 200));
 }
@@ -10341,7 +10341,7 @@ async function orgHookDetailSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
   if (result.outcome === "saved") {
     return respond(new Response(null, { status: 303, headers: { location: hookLink } }));
   }
-  const data = await loadOrgHookDetailData(c.env.DB, org, hook.id);
+  const data = await loadOrgHookDetailData(c.env.DB, org, hook.id, oauth2FeatureEnabled(c.env));
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   data.form = form;
   return respond(c.html(renderOrgHookDetailPage({ ctx, data, error: result.message }), 200));
@@ -10378,7 +10378,7 @@ async function orgBlockedUsersPage(c: Context<{ Bindings: Env }>): Promise<Respo
   if (!resolved.ok) return resolved.response;
   const { ctx, respond } = resolved;
   if (resolved.route.family !== "org-settings-blocked") return respond(await c.notFound()); // drift guard
-  const data = await loadOrgBlockedUsers(c.env.DB, resolved.org);
+  const data = await loadOrgBlockedUsers(c.env.DB, resolved.org, oauth2FeatureEnabled(c.env));
   return respond(c.html(renderOrgBlockedUsersPage({ ctx, data, error: null }), 200));
 }
 
@@ -10395,7 +10395,7 @@ async function orgBlockedUsersSubmit(c: Context<{ Bindings: Env }>): Promise<Res
   if (result.outcome === "applied") {
     return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/blocked_users` } }));
   }
-  const data = await loadOrgBlockedUsers(c.env.DB, org);
+  const data = await loadOrgBlockedUsers(c.env.DB, org, oauth2FeatureEnabled(c.env));
   return respond(c.html(renderOrgBlockedUsersPage({ ctx, data, error: result.message }), 200));
 }
 
@@ -10404,7 +10404,7 @@ async function orgActionsSecretsPage(c: Context<{ Bindings: Env }>): Promise<Res
   if (!resolved.ok) return resolved.response;
   const { ctx, respond } = resolved;
   if (resolved.route.family !== "org-actions-secrets") return respond(await c.notFound()); // drift guard
-  const data = await loadOrgActionsSecretsPageData(c.env.DB, resolved.org);
+  const data = await loadOrgActionsSecretsPageData(c.env.DB, resolved.org, oauth2FeatureEnabled(c.env));
   return respond(c.html(renderOrgActionsSecretsPage(ctx, data), 200));
 }
 
@@ -10420,7 +10420,7 @@ async function orgActionsSecretsSubmit(c: Context<{ Bindings: Env }>): Promise<R
   if (outcome.outcome === "saved") {
     return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/secrets` } }));
   }
-  const data = await loadOrgActionsSecretsPageData(c.env.DB, org);
+  const data = await loadOrgActionsSecretsPageData(c.env.DB, org, oauth2FeatureEnabled(c.env));
   // Carried name/description only — plaintext never enters the DOM.
   data.form = { name: form.name, data: "", description: form.description };
   return respond(c.html(renderOrgActionsSecretsPage(ctx, data, outcome.message)));
@@ -10443,7 +10443,7 @@ async function orgActionsVariablesPage(c: Context<{ Bindings: Env }>): Promise<R
   if (!resolved.ok) return resolved.response;
   const { ctx, respond } = resolved;
   if (resolved.route.family !== "org-actions-variables") return respond(await c.notFound()); // drift guard
-  const data = await loadOrgActionsVariablesPageData(c.env.DB, resolved.org);
+  const data = await loadOrgActionsVariablesPageData(c.env.DB, resolved.org, oauth2FeatureEnabled(c.env));
   return respond(c.html(renderOrgActionsVariablesPage(ctx, data), 200));
 }
 
@@ -10459,7 +10459,7 @@ async function orgActionsVariablesNew(c: Context<{ Bindings: Env }>): Promise<Re
   if (outcome.outcome === "saved") {
     return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/actions/variables` } }));
   }
-  const data = await loadOrgActionsVariablesPageData(c.env.DB, org);
+  const data = await loadOrgActionsVariablesPageData(c.env.DB, org, oauth2FeatureEnabled(c.env));
   if (outcome.outcome === "invalid") {
     data.form = { name: form.name, data: form.data, description: form.description };
     return respond(c.html(renderOrgActionsVariablesPage(ctx, data, outcome.message)));
@@ -10484,7 +10484,7 @@ async function orgActionsVariablesEdit(c: Context<{ Bindings: Env }>, variableId
     // 404 (the module handoff's fidelity call).
     return respond(c.html(renderNotFound(ctx), 404));
   }
-  const data = await loadOrgActionsVariablesPageData(c.env.DB, org);
+  const data = await loadOrgActionsVariablesPageData(c.env.DB, org, oauth2FeatureEnabled(c.env));
   data.form = { name: form.name, data: form.data, description: form.description };
   return respond(c.html(renderOrgActionsVariablesPage(ctx, data, outcome.message)));
 }
@@ -10528,7 +10528,7 @@ async function orgActionsGeneralPage(c: Context<{ Bindings: Env }>): Promise<Res
   if (!resolved.ok) return resolved.response;
   const { ctx, org, respond } = resolved;
   if (resolved.route.family !== "org-settings-actions-general") return respond(await c.notFound()); // drift guard
-  const data = await loadOrgActionsGeneralPageData(c.env.DB, org);
+  const data = await loadOrgActionsGeneralPageData(c.env.DB, org, oauth2FeatureEnabled(c.env));
   return respond(c.html(renderOrgActionsGeneralPage(ctx, { ...data, org }), 200));
 }
 
@@ -10539,7 +10539,7 @@ async function orgActionsRunnersPage(c: Context<{ Bindings: Env }>): Promise<Res
   if (!resolved.ok) return resolved.response;
   const { ctx, org, respond } = resolved;
   if (resolved.route.family !== "org-actions-runners") return respond(await c.notFound()); // drift guard
-  const data = await loadOrgActionsRunnersPageData(c.env.DB, org, new URL(c.req.raw.url).searchParams);
+  const data = await loadOrgActionsRunnersPageData(c.env.DB, org, new URL(c.req.raw.url).searchParams, new Date(), oauth2FeatureEnabled(c.env));
   return respond(c.html(renderOrgActionsRunnersPage(ctx, data), 200));
 }
 
@@ -10551,7 +10551,7 @@ async function orgPackagesPage(c: Context<{ Bindings: Env }>): Promise<Response>
   if (!resolved.ok) return resolved.response;
   const { ctx, org, respond } = resolved;
   if (resolved.route.family !== "org-settings-packages") return respond(await c.notFound()); // drift guard
-  const data = await loadOrgPackagesSettingsPageData(c.env.DB, org);
+  const data = await loadOrgPackagesSettingsPageData(c.env.DB, org, oauth2FeatureEnabled(c.env));
   return respond(c.html(renderOrgSettingsPackagesPage(ctx, data), 200));
 }
 
@@ -10560,7 +10560,7 @@ async function orgPackagesRuleAddPage(c: Context<{ Bindings: Env }>): Promise<Re
   if (!resolved.ok) return resolved.response;
   const { ctx, org, respond } = resolved;
   if (resolved.route.family !== "org-settings-packages-rule-add") return respond(await c.notFound()); // drift guard
-  return respond(c.html(renderOrgCleanupRuleEditPage(ctx, orgCleanupRuleEditDataForAdd(org)), 200));
+  return respond(c.html(renderOrgCleanupRuleEditPage(ctx, orgCleanupRuleEditDataForAdd(org, oauth2FeatureEnabled(c.env))), 200));
 }
 
 async function orgPackagesRuleAddSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
@@ -10572,7 +10572,7 @@ async function orgPackagesRuleAddSubmit(c: Context<{ Bindings: Env }>): Promise<
   if (resolved.route.family !== "org-settings-packages-rule-add") return respond(await c.notFound()); // drift guard
   const parsed = parseOrgCleanupRuleForm(await readUrlEncodedForm(c.req.raw));
   if (Object.values(parsed.errors).some(Boolean)) {
-    return respond(c.html(renderOrgCleanupRuleEditPage(ctx, orgCleanupRuleEditDataFromForm(org, false, parsed)), 200));
+    return respond(c.html(renderOrgCleanupRuleEditPage(ctx, orgCleanupRuleEditDataFromForm(org, false, parsed, {}, oauth2FeatureEnabled(c.env))), 200));
   }
   const outcome = await applyOrgCleanupRuleCreate(c.env.DB, org.id, parsed.values, new Date());
   if (outcome.outcome === "duplicate-type") {
@@ -10580,7 +10580,7 @@ async function orgPackagesRuleAddSubmit(c: Context<{ Bindings: Env }>): Promise<
       c.html(
         renderOrgCleanupRuleEditPage(
           ctx,
-          orgCleanupRuleEditDataFromForm(org, false, parsed, { errType: true, error: orgSettingsPackagesLocale.already_exists }),
+          orgCleanupRuleEditDataFromForm(org, false, parsed, { errType: true, error: orgSettingsPackagesLocale.already_exists }, oauth2FeatureEnabled(c.env)),
         ),
         200,
       ),
@@ -10594,7 +10594,7 @@ async function orgPackagesRuleEditPage(c: Context<{ Bindings: Env }>, ruleId: nu
   if (!resolved.ok) return resolved.response;
   const { ctx, org, respond } = resolved;
   if (resolved.route.family !== "org-settings-packages-rule-edit") return respond(await c.notFound()); // drift guard
-  const data = await loadOrgCleanupRuleEditPageData(c.env.DB, org, ruleId);
+  const data = await loadOrgCleanupRuleEditPageData(c.env.DB, org, ruleId, oauth2FeatureEnabled(c.env));
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   return respond(c.html(renderOrgCleanupRuleEditPage(ctx, data), 200));
 }
@@ -10610,8 +10610,8 @@ async function orgPackagesRuleEditSubmit(c: Context<{ Bindings: Env }>, ruleId: 
   // getCleanupRuleByContext's precedence: the form id first, then the path.
   const id = parsed.values.id !== 0 ? parsed.values.id : ruleId;
   if (Object.values(parsed.errors).some(Boolean) && parsed.values.action !== "remove") {
-    const data = await loadOrgCleanupRuleEditPageData(c.env.DB, org, id);
-    const base = data ?? orgCleanupRuleEditDataFromForm(org, true, parsed);
+    const data = await loadOrgCleanupRuleEditPageData(c.env.DB, org, id, oauth2FeatureEnabled(c.env));
+    const base = data ?? orgCleanupRuleEditDataFromForm(org, true, parsed, {}, oauth2FeatureEnabled(c.env));
     return respond(c.html(renderOrgCleanupRuleEditPage(ctx, base), 200));
   }
   const outcome = await applyOrgCleanupRuleEdit(c.env.DB, org.id, id, parsed.values, new Date());
@@ -10629,7 +10629,7 @@ async function orgPackagesRulePreviewPage(c: Context<{ Bindings: Env }>, ruleId:
   if (resolved.route.family !== "org-settings-packages-rule-preview") return respond(await c.notFound()); // drift guard
   // A stored pattern that fails to compile THROWS from the loader —
   // upstream's ServerError arm (the app-level onError answers the 500).
-  const data = await loadOrgCleanupRulePreview(c.env.DB, org, ruleId);
+  const data = await loadOrgCleanupRulePreview(c.env.DB, org, ruleId, new Date(), oauth2FeatureEnabled(c.env));
   if (data.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
   return respond(c.html(renderOrgCleanupRulePreviewPage(ctx, data), 200));
 }
@@ -10660,7 +10660,7 @@ async function orgActionsRunnerEditPage(c: Context<{ Bindings: Env }>, runnerId:
   if (!resolved.ok) return resolved.response;
   const { ctx, org, respond } = resolved;
   if (resolved.route.family !== "org-actions-runners-edit") return respond(await c.notFound()); // drift guard
-  const data = await loadOrgActionsRunnerEditPageData(c.env.DB, org, runnerId, new URL(c.req.raw.url).searchParams);
+  const data = await loadOrgActionsRunnerEditPageData(c.env.DB, org, runnerId, new URL(c.req.raw.url).searchParams, new Date(), oauth2FeatureEnabled(c.env));
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   return respond(c.html(renderOrgActionsRunnerEditPage(ctx, data), 200));
 }
@@ -10839,7 +10839,7 @@ async function orgScopedWorkflowsPage(c: Context<{ Bindings: Env }>): Promise<Re
   if (resolved.route.family !== "org-actions-scoped-workflows") return respond(await c.notFound()); // drift guard
   const data = await loadOrgScopedWorkflowsPageData(scopedWorkflowSourcesStore(c.env.DB), c.env.DB, (repo) => scopedWorkflowEngineReads(c.env, repo), org);
   return respond(
-    c.html(renderOrgScopedWorkflowsPage(ctx, data, org, OrgSettingsNavbar({ orgLink: `/${org.username}`, active: "actions-scoped-workflows" })), 200),
+    c.html(renderOrgScopedWorkflowsPage(ctx, data, org, OrgSettingsNavbar({ orgLink: `/${org.username}`, active: "actions-scoped-workflows", oauth2Enabled: oauth2FeatureEnabled(c.env) })), 200),
   );
 }
 
@@ -10899,7 +10899,7 @@ async function adminScopedWorkflowsPage(c: Context<{ Bindings: Env }>): Promise<
   if (!p.ok) return p.response;
   const data = await loadAdminScopedWorkflowsPageData(scopedWorkflowSourcesStore(c.env.DB), c.env.DB, (repo) => scopedWorkflowEngineReads(c.env, repo));
   return p.respond(
-    c.html(renderAdminScopedWorkflowsPage(p.ctx, data, AdminFamilyNav({ active: "actions-scoped-workflows", packagesEnabled: p.ctx.packagesEnabled !== false })), 200),
+    c.html(renderAdminScopedWorkflowsPage(p.ctx, data, AdminFamilyNav({ active: "actions-scoped-workflows", packagesEnabled: p.ctx.packagesEnabled !== false, oauth2Enabled: oauth2FeatureEnabled(c.env) })), 200),
   );
 }
 
@@ -10966,7 +10966,7 @@ async function orgApplicationsPage(c: Context<{ Bindings: Env }>): Promise<Respo
   // applications group 403s while the provider is disabled; the landed
   // "the arm always serves" divergence retires with the W4 seam).
   if (!oauth2FeatureEnabled(c.env)) return respond(oauth2SettingsForbidden());
-  const data = await loadOrgSettingsApplications(c.env.DB, resolved.org);
+  const data = await loadOrgSettingsApplications(c.env.DB, resolved.org, oauth2FeatureEnabled(c.env));
   return respond(c.html(renderOrgApplicationsPage({ ctx, data, error: null }), 200));
 }
 
@@ -10993,11 +10993,11 @@ async function orgApplicationsCreateSubmit(c: Context<{ Bindings: Env }>): Promi
   const form = parseOrgApplicationCreateForm(await readUrlEncodedForm(c.req.raw));
   const result = await applyOrgApplicationCreate(c.env.DB, org, form);
   if (result.outcome === "created") {
-    const data = oauth2AppEditPageData(result.row, `/${org.username}/settings/applications/oauth2/${result.row.id}`);
+    const data = oauth2AppEditPageData(result.row, `/${org.username}/settings/applications/oauth2/${result.row.id}`, null, oauth2FeatureEnabled(c.env));
     data.clientSecret = result.secret;
     return respond(c.html(renderOrgOauth2AppEditPage(ctx, org, data, ctx.viewer.kind === "user")));
   }
-  const data = await loadOrgSettingsApplications(c.env.DB, org);
+  const data = await loadOrgSettingsApplications(c.env.DB, org, oauth2FeatureEnabled(c.env));
   data.form = form;
   return respond(c.html(renderOrgApplicationsPage({ ctx, data, error: result.message }), 200));
 }
@@ -11041,7 +11041,7 @@ async function orgApplicationsShow(c: Context<{ Bindings: Env }>, id: number): P
   const shown = await showOauth2Application(c.env.DB, org.id, id);
   if (shown.kind === "not_found") return respond(c.html(renderNotFound(ctx), 404));
   return respond(
-    c.html(renderOrgOauth2AppEditPage(ctx, org, oauth2AppEditPageData(shown.app, `/${org.username}/settings/applications/oauth2/${id}`), ctx.viewer.kind === "user"), 200),
+    c.html(renderOrgOauth2AppEditPage(ctx, org, oauth2AppEditPageData(shown.app, `/${org.username}/settings/applications/oauth2/${id}`, null, oauth2FeatureEnabled(c.env)), ctx.viewer.kind === "user"), 200),
   );
 }
 
@@ -11065,7 +11065,7 @@ async function orgApplicationsSave(c: Context<{ Bindings: Env }>, id: number): P
   if (outcome.kind === "invalid") {
     const shown = await showOauth2Application(c.env.DB, org.id, id);
     if (shown.kind === "not_found") return respond(c.html(renderNotFound(ctx), 404));
-    const data = oauth2AppEditPageData(shown.app, `/${org.username}/settings/applications/oauth2/${id}`, outcome.message);
+    const data = oauth2AppEditPageData(shown.app, `/${org.username}/settings/applications/oauth2/${id}`, outcome.message, oauth2FeatureEnabled(c.env));
     data.form = form;
     return respond(c.html(renderOrgOauth2AppEditPage(ctx, org, data, ctx.viewer.kind === "user")));
   }
@@ -11086,7 +11086,7 @@ async function orgApplicationsRegenerate(c: Context<{ Bindings: Env }>, id: numb
   if (!oauth2FeatureEnabled(c.env)) return respond(oauth2SettingsForbidden());
   const outcome = await regenerateOauth2ApplicationSecret(c.env.DB, org.id, id);
   if (outcome.kind === "not_found") return respond(c.html(renderNotFound(ctx), 404));
-  const data = oauth2AppEditPageData(outcome.app, `/${org.username}/settings/applications/oauth2/${id}`);
+  const data = oauth2AppEditPageData(outcome.app, `/${org.username}/settings/applications/oauth2/${id}`, null, oauth2FeatureEnabled(c.env));
   data.clientSecret = outcome.secret;
   return respond(c.html(renderOrgOauth2AppEditPage(ctx, org, data, ctx.viewer.kind === "user")));
 }
@@ -11109,7 +11109,7 @@ async function orgAuditLogsPage(c: Context<{ Bindings: Env }>): Promise<Response
   if (!resolved.ok) return resolved.response;
   const { url, ctx, org, respond } = resolved;
   if (resolved.route.family !== "org-settings-audit-logs") return respond(await c.notFound()); // drift guard
-  const data = await loadSettingsAuditLogs(c.env.DB, { type: "organization", id: String(org.id) }, url.searchParams);
+  const data = await loadSettingsAuditLogs(c.env.DB, { type: "organization", id: String(org.id) }, url.searchParams, oauth2FeatureEnabled(c.env));
   return respond(c.html(renderOrgSettingsAuditLogsPage({ ctx, org, data }), 200));
 }
 
@@ -11196,7 +11196,7 @@ async function adminMonitorCronSubmit(c: Context<{ Bindings: Env }>): Promise<Re
 async function adminUsersPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
-  const data = await loadAdminUsersData(c.env.DB, new URL(c.req.raw.url).searchParams);
+  const data = await loadAdminUsersData(c.env.DB, new URL(c.req.raw.url).searchParams, oauth2FeatureEnabled(c.env));
   return p.respond(c.html(renderAdminUsersPage(p.ctx, data)));
 }
 
@@ -11204,7 +11204,7 @@ async function adminUsersPage(c: Context<{ Bindings: Env }>): Promise<Response> 
 async function adminOrgsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
-  const data = await loadAdminOrgsData(c.env.DB, new URL(c.req.raw.url).searchParams);
+  const data = await loadAdminOrgsData(c.env.DB, new URL(c.req.raw.url).searchParams, oauth2FeatureEnabled(c.env));
   return p.respond(c.html(renderAdminOrgsPage(p.ctx, data)));
 }
 
@@ -11213,7 +11213,7 @@ async function adminOrgsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
 async function adminReposPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
-  const data = await loadAdminReposData(c.env.DB, p.ctx.viewer, new URL(c.req.raw.url).searchParams);
+  const data = await loadAdminReposData(c.env.DB, p.ctx.viewer, new URL(c.req.raw.url).searchParams, oauth2FeatureEnabled(c.env));
   return p.respond(c.html(renderAdminReposPage(p.ctx, data)));
 }
 
@@ -11228,7 +11228,7 @@ async function adminPackagesPage(c: Context<{ Bindings: Env }>): Promise<Respons
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
   if (p.ctx.packagesEnabled === false) return p.respond(c.html(renderNotFound(p.ctx), 404));
-  const data = await loadAdminPackagesData(c.env.DB, new URL(c.req.raw.url).searchParams);
+  const data = await loadAdminPackagesData(c.env.DB, new URL(c.req.raw.url).searchParams, oauth2FeatureEnabled(c.env));
   return p.respond(c.html(renderAdminPackagesPage(p.ctx, data)));
 }
 
@@ -11245,7 +11245,7 @@ async function adminEmailsPage(c: Context<{ Bindings: Env }>): Promise<Response>
   if (!p.ok) return p.response;
   const viewer = p.ctx.viewer;
   const doerId = viewer.kind === "user" ? viewer.id : 0;
-  const data = await loadAdminEmailsData(c.env.DB, doerId, new URL(c.req.raw.url).searchParams);
+  const data = await loadAdminEmailsData(c.env.DB, doerId, new URL(c.req.raw.url).searchParams, oauth2FeatureEnabled(c.env));
   return p.respond(c.html(renderAdminEmailsPage(p.ctx, data)));
 }
 
@@ -11313,7 +11313,7 @@ async function adminEmailsDelete(c: Context<{ Bindings: Env }>): Promise<Respons
 async function adminHooksPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
-  const data = await loadAdminHooksData(c.env.DB);
+  const data = await loadAdminHooksData(c.env.DB, oauth2FeatureEnabled(c.env));
   return p.respond(c.html(renderAdminHooksPage(p.ctx, data)));
 }
 
@@ -11337,7 +11337,7 @@ async function adminHooksDelete(c: Context<{ Bindings: Env }>): Promise<Response
 async function adminBadgesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
-  const data = await loadAdminBadgesData(c.env.DB, new URL(c.req.raw.url).searchParams);
+  const data = await loadAdminBadgesData(c.env.DB, new URL(c.req.raw.url).searchParams, oauth2FeatureEnabled(c.env));
   return p.respond(c.html(renderAdminBadgesPage(p.ctx, data)));
 }
 
@@ -11351,7 +11351,7 @@ async function adminBadgeNewPage(c: Context<{ Bindings: Env }>): Promise<Respons
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
   return p.respond(
-    c.html(renderAdminBadgeNewPage(p.ctx, { form: { slug: "", description: "", imageUrl: "" }, error: null })),
+    c.html(renderAdminBadgeNewPage(p.ctx, { form: { slug: "", description: "", imageUrl: "" }, error: null, oauth2Enabled: oauth2FeatureEnabled(c.env) })),
   );
 }
 
@@ -11369,7 +11369,7 @@ async function adminBadgeNewSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
   }
   const error =
     outcome === "slug-taken" ? adminBadgesLocale.slug_been_taken : adminBadgesLocale.required_field;
-  return p.respond(c.html(renderAdminBadgeNewPage(p.ctx, { form, error })));
+  return p.respond(c.html(renderAdminBadgeNewPage(p.ctx, { form, error, oauth2Enabled: oauth2FeatureEnabled(c.env) })));
 }
 
 /** GET /-/admin/badges/slug/{slug} (upstream ViewBadge): the badge info +
@@ -11390,6 +11390,7 @@ async function adminBadgeViewPage(c: Context<{ Bindings: Env }>, badgeSlug: stri
         badge,
         usersTotal: usersPage.total,
         usersPreview: usersPage.items.map((user) => ({ id: user.id, username: user.username })),
+        oauth2Enabled: oauth2FeatureEnabled(c.env),
       }),
     ),
   );
@@ -11413,6 +11414,7 @@ async function adminBadgeEditPage(c: Context<{ Bindings: Env }>, badgeSlug: stri
     badge,
     form: { description: badge.description ?? "", imageUrl: badge.imageUrl ?? "" },
     error: null,
+    oauth2Enabled: oauth2FeatureEnabled(c.env),
   };
   return p.respond(c.html(renderAdminBadgeEditPage(p.ctx, data)));
 }
@@ -11438,6 +11440,7 @@ async function adminBadgeEditSubmit(c: Context<{ Bindings: Env }>, badgeSlug: st
     badge,
     form: { description: form.description, imageUrl: form.imageUrl },
     error: adminBadgesLocale.required_field,
+    oauth2Enabled: oauth2FeatureEnabled(c.env),
   };
   return p.respond(c.html(renderAdminBadgeEditPage(p.ctx, data)));
 }
@@ -11481,6 +11484,7 @@ async function adminBadgeUsersPage(c: Context<{ Bindings: Env }>, badgeSlug: str
     query,
     error,
     submittedUser,
+    oauth2Enabled: oauth2FeatureEnabled(c.env),
   };
   return p.respond(c.html(renderAdminBadgeUsersPage(p.ctx, data)));
 }
@@ -11526,7 +11530,7 @@ async function adminApplicationsPage(c: Context<{ Bindings: Env }>): Promise<Res
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
   if (!oauth2FeatureEnabled(c.env)) return p.respond(oauth2SettingsForbidden());
-  const data = await loadAdminApplicationsData(c.env.DB);
+  const data = await loadAdminApplicationsData(c.env.DB, oauth2FeatureEnabled(c.env));
   return p.respond(c.html(renderAdminApplicationsPage(p.ctx, data)));
 }
 
@@ -11547,11 +11551,11 @@ async function adminApplicationCreate(c: Context<{ Bindings: Env }>): Promise<Re
   const form = parseAdminApplicationCreateForm(await readUrlEncodedForm(c.req.raw));
   const outcome = await applyAdminApplicationCreate(c.env.DB, form);
   if (outcome.kind === "created") {
-    const data = oauth2AppEditPageData(outcome.row, `/-/admin/applications/oauth2/${outcome.row.id}`);
+    const data = oauth2AppEditPageData(outcome.row, `/-/admin/applications/oauth2/${outcome.row.id}`, null, oauth2FeatureEnabled(c.env));
     data.clientSecret = outcome.secret;
     return p.respond(c.html(renderAdminOauth2AppEditPage(p.ctx, data)));
   }
-  const data = await loadAdminApplicationsData(c.env.DB);
+  const data = await loadAdminApplicationsData(c.env.DB, oauth2FeatureEnabled(c.env));
   data.form = form;
   data.error = outcome.message;
   return p.respond(c.html(renderAdminApplicationsPage(p.ctx, data)));
@@ -11585,7 +11589,7 @@ async function adminApplicationShow(c: Context<{ Bindings: Env }>, id: number): 
   if (!oauth2FeatureEnabled(c.env)) return p.respond(oauth2SettingsForbidden());
   const shown = await showOauth2Application(c.env.DB, 0, id);
   if (shown.kind === "not_found") return p.respond(c.html(renderNotFound(p.ctx), 404));
-  return p.respond(c.html(renderAdminOauth2AppEditPage(p.ctx, oauth2AppEditPageData(shown.app, `/-/admin/applications/oauth2/${id}`))));
+  return p.respond(c.html(renderAdminOauth2AppEditPage(p.ctx, oauth2AppEditPageData(shown.app, `/-/admin/applications/oauth2/${id}`, null, oauth2FeatureEnabled(c.env)))));
 }
 
 /** POST /-/admin/applications/oauth2/{id} (admin.EditApplicationPost →
@@ -11606,7 +11610,7 @@ async function adminApplicationSave(c: Context<{ Bindings: Env }>, id: number): 
   if (outcome.kind === "invalid") {
     const shown = await showOauth2Application(c.env.DB, 0, id);
     if (shown.kind === "not_found") return p.respond(c.html(renderNotFound(p.ctx), 404));
-    const data = oauth2AppEditPageData(shown.app, `/-/admin/applications/oauth2/${id}`, outcome.message);
+    const data = oauth2AppEditPageData(shown.app, `/-/admin/applications/oauth2/${id}`, outcome.message, oauth2FeatureEnabled(c.env));
     data.form = form;
     return p.respond(c.html(renderAdminOauth2AppEditPage(p.ctx, data)));
   }
@@ -11625,7 +11629,7 @@ async function adminApplicationRegenerate(c: Context<{ Bindings: Env }>, id: num
   if (!oauth2FeatureEnabled(c.env)) return p.respond(oauth2SettingsForbidden());
   const outcome = await regenerateOauth2ApplicationSecret(c.env.DB, 0, id);
   if (outcome.kind === "not_found") return p.respond(c.html(renderNotFound(p.ctx), 404));
-  const data = oauth2AppEditPageData(outcome.app, `/-/admin/applications/oauth2/${id}`);
+  const data = oauth2AppEditPageData(outcome.app, `/-/admin/applications/oauth2/${id}`, null, oauth2FeatureEnabled(c.env));
   data.clientSecret = outcome.secret;
   return p.respond(c.html(renderAdminOauth2AppEditPage(p.ctx, data)));
 }
@@ -11639,7 +11643,7 @@ async function adminApplicationRegenerate(c: Context<{ Bindings: Env }>, id: num
 async function adminNoticesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
-  const data = await loadAdminNoticesData(c.env.DB, new URL(c.req.raw.url).searchParams);
+  const data = await loadAdminNoticesData(c.env.DB, new URL(c.req.raw.url).searchParams, oauth2FeatureEnabled(c.env));
   return p.respond(c.html(renderAdminNoticesPage(p.ctx, data)));
 }
 
@@ -11659,7 +11663,7 @@ async function adminNoticesDelete(c: Context<{ Bindings: Env }>): Promise<Respon
   if (!p.ok) return p.response;
   const form = await readUrlEncodedForm(c.req.raw);
   await deleteNoticesByIds(c.env.DB, parseNoticeIds(form.getAll("ids[]")));
-  const data = await loadAdminNoticesData(c.env.DB, new URL(c.req.raw.url).searchParams);
+  const data = await loadAdminNoticesData(c.env.DB, new URL(c.req.raw.url).searchParams, oauth2FeatureEnabled(c.env));
   return p.respond(c.html(renderAdminNoticesPage(p.ctx, data, { kind: "positive", text: adminNoticesLocale.deleteSuccess })));
 }
 
@@ -11674,7 +11678,7 @@ async function adminNoticesEmpty(c: Context<{ Bindings: Env }>): Promise<Respons
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
   await emptyNotices(c.env.DB);
-  const data = await loadAdminNoticesData(c.env.DB, new URL(c.req.raw.url).searchParams);
+  const data = await loadAdminNoticesData(c.env.DB, new URL(c.req.raw.url).searchParams, oauth2FeatureEnabled(c.env));
   return p.respond(c.html(renderAdminNoticesPage(p.ctx, data, { kind: "positive", text: adminNoticesLocale.deleteSuccess })));
 }
 
