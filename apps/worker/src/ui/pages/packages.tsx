@@ -101,11 +101,19 @@
  *
  * ## Documented v1 degradations (§6 method — dead links forbidden)
  *
- * - The write arms stay unclaimed → the engine's 404: `POST .../{version}`
- *   (PackageVersionDelete, package.go:503) and the settings pair
- *   (web.go:1121-1127) — no delete modal, no settings link, no
- *   `PackageSettingsLink` anchor renders (their pages are the downstream
- *   wave; the census's arms-rider split).
+ * - The packages UI WRITE arms are CLAIMED as of this wave (census gap #5):
+ *   `POST .../{version}` (PackageVersionDelete, package.go:503), the
+ *   settings pair `GET+POST /settings/{type}/{name}` (web.go:1121-1127 →
+ *   pages/package-settings.tsx), and the terraform manual lock/unlock POSTs
+ *   (web.go:1117-1120 — VERIFIED at the pin: they are the package view's
+ *   lock/unlock buttons for terraform-state packages, not a settings
+ *   surface). The view renders the write sidebar (Settings anchor + the
+ *   delete-version form + the terraform lock-status block) behind
+ *   `canWritePackages`; the POST handlers mount through pages/
+ *   package-settings.tsx's seams (the module header's mount recipe).
+ *   Upstream's `{{if .HasRepositoryAccess}}` issues anchor renders beside
+ *   them (the viewer-visible linked repo, the same predicate the
+ *   published-by arm reads).
  * - The `/{version_sub}` container arm (web.go:1117's ViewPackageVersion
  *   sub-route) stays unclaimed — container is SPEC-0016 M5's protocol; the
  *   generic view renders one detail shape.
@@ -157,6 +165,7 @@ import { loadRepoSettings } from "../../api/services/repo-settings";
 import { canViewRepositoryWithTeams, type RepositoryRow } from "../../api/services/repository";
 import { packageFiles, packageVersions, packages, repositories, users } from "../../db/schema";
 import { getBlobById, packageBlobContentKey, type PackageBlobRow } from "../../services/packages/blobs";
+import { getTerraformLock, isTerraformLockLocked, type TerraformLockInfo } from "../../services/packages/terraform";
 import type { OrgRecord } from "../../services/orgs/orgs";
 import type { User as ApiUser } from "../../api/models/user";
 import type { Viewer as ApiViewer } from "../../api/services/repository";
@@ -168,6 +177,7 @@ import {
   getVersionByNameAndVersion,
   incrementDownloadCounter,
   searchLatestVersions,
+  type PackageAccessMode,
   type PackageDoer,
   type PackageFileDescriptor,
   type PackageOwnerRow,
@@ -232,7 +242,20 @@ export const packagesLocale = {
   sort_newest: "Newest", // "repo.issues.filter_sort.latest"
   newer: "Newer", // the pager's label
   older: "Older", // the pager's label
+  settings: "Settings", // "repo.settings"
+  issues: "Issues", // "repo.issues"
+  delete_version: "Delete version", // "packages.settings.delete.version"
+  delete_notice_pre: "You are about to delete ", // "packages.settings.delete.notice" (pre-name)
+  delete_notice_tail: ". This operation is irreversible, are you sure?", // (post "name (version)")
+  modal_yes: "Yes", // "modal.yes" (modal_actions_confirm's default submit)
+  terraform_lock_status: "Lock Status", // "packages.terraform.lock_status"
+  terraform_unlocked: "Unlocked", // "packages.terraform.unlocked"
+  terraform_lock: "Lock", // "packages.terraform.lock"
+  terraform_unlock: "Unlock", // "packages.terraform.unlock"
 } as const;
+
+/** "packages.terraform.locked_by" — "Locked by %s" (the %s is structural). */
+export const TERRAFORM_LOCKED_BY_PREFIX = "Locked by ";
 
 /** The documentation targets (the locale strings' literal hrefs). */
 const DOCS_PACKAGES_URL = "https://docs.gitea.com/usage/packages/overview";
@@ -291,6 +314,12 @@ export function packageWebLink(ownerName: string, type: string, lowerName: strin
 
 export function versionWebLink(ownerName: string, type: string, lowerName: string, lowerVersion: string): string {
   return `${packageWebLink(ownerName, type, lowerName)}/${pathEscapeSegments(lowerVersion)}`;
+}
+
+/** The settings page link (descriptor.go:84-87 — PackageSettingsLink over
+ *  the LOWER name, one `/settings` depth above the package link). */
+export function packageSettingsLink(ownerName: string, type: string, lowerName: string): string {
+  return `/${ownerName}/-/packages/settings/${type}/${pathEscapeSegments(lowerName)}`;
 }
 
 /** The download tail (package.go:530's route — `/files/{fileid}`). */
@@ -378,12 +407,25 @@ export async function resolvePackagesOwner(
   return readable ? { kind: "user", user: profile.user } : { kind: "missing" };
 }
 
+/** The subtree's mode resolution (the group-wrap's `ctx.Package.AccessMode`
+ *  value): the LANDED ladder over the admitted owner row (a null doer is the
+ *  anonymous arm). The read gate below and this wave's write arms (the
+ *  version-delete POST + the settings pair + the terraform lock POSTs —
+ *  web.go:1115/1121-1127's `reqPackageAccess(perm.AccessModeWrite)`, whose
+ *  `< mode` arm is upstream's 404) all read it. */
+export async function ownerPackagesAccessMode(
+  d1: D1Database,
+  owner: PackageOwnerRow,
+  doer: ProfileDoer,
+): Promise<PackageAccessMode> {
+  const pkgDoer: PackageDoer | null = doer.id === null ? null : { id: doer.id, isAdmin: doer.isAdmin };
+  return determinePackageAccessMode(d1, owner, pkgDoer, { ownerVisibleToDoer: true });
+}
+
 /** The subtree's read gate — `reqPackageAccess(perm.AccessModeRead)`'s mode
  *  half over the LANDED ladder (a null doer is the anonymous arm). */
 async function ownerPackagesReadable(d1: D1Database, owner: PackageOwnerRow, doer: ProfileDoer): Promise<boolean> {
-  const pkgDoer: PackageDoer | null = doer.id === null ? null : { id: doer.id, isAdmin: doer.isAdmin };
-  const mode = await determinePackageAccessMode(d1, owner, pkgDoer, { ownerVisibleToDoer: true });
-  return accessModeAtLeast(mode, "read");
+  return accessModeAtLeast(await ownerPackagesAccessMode(d1, owner, doer), "read");
 }
 
 /** The R16 gate (the module header's reduction): the repo's
@@ -504,6 +546,31 @@ export async function hasRepositoryPackages(d1: D1Database, repoId: string): Pro
   return rows.length > 0;
 }
 
+/** `ExistVersion` (packages.go — PackageVersionDelete's redirect split, :517-520):
+ *  whether the package still carries ANY non-internal version — true keeps
+ *  the redirect ON the package page, false falls to the owner list. */
+export async function hasNonInternalVersion(d1: D1Database, packageId: number): Promise<boolean> {
+  const rows = await drizzle(d1)
+    .select({ id: packageVersions.id })
+    .from(packageVersions)
+    .where(and(eq(packageVersions.packageId, packageId), eq(packageVersions.isInternal, false)))
+    .limit(1)
+    .all();
+  return rows.length > 0;
+}
+
+/** The chrome counts the packages pages render beside the profile tabs /
+ *  org menu (the loaders' shared read) — exported for pages/
+ *  package-settings.tsx, the settings page's chrome. */
+export async function ownerPackagesChrome(
+  d1: D1Database,
+  owner: PackagesOwner,
+  doer: ProfileDoer,
+): Promise<{ repoCount: number; followers: number; following: number }> {
+  if (owner.kind === "user") return userProfileChrome(d1, owner.user, doer);
+  return ownerRepoCount(d1, ownerIdOf(owner), doer).then((repoCount) => ({ repoCount, followers: 0, following: 0 }));
+}
+
 /** The type facet's accepted values (the select's value arm): "", "all"
  *  clear it; anything else rides the query (an unknown value simply matches
  *  nothing — the open string set). */
@@ -568,11 +635,15 @@ function ownerIdOf(owner: PackagesOwner): number {
   return owner.kind === "org" ? owner.org.id : owner.user.id;
 }
 
-function ownerNameOf(owner: PackagesOwner): string {
+/** The owner's display name segment (both arms' link/anchor inputs) —
+ *  exported for pages/package-settings.tsx. */
+export function ownerNameOf(owner: PackagesOwner): string {
   return owner.kind === "org" ? owner.org.username : owner.user.username;
 }
 
-function ownerVisibilityOf(owner: PackagesOwner): "public" | "limited" | "private" {
+/** The owner's visibility (the badge chain's input) — exported for pages/
+ *  package-settings.tsx. */
+export function ownerVisibilityOf(owner: PackagesOwner): "public" | "limited" | "private" {
   return owner.kind === "org" ? owner.org.visibility : owner.user.visibility;
 }
 
@@ -869,6 +940,16 @@ export interface PackageVersionViewData {
   repoCount: number;
   followers: number;
   following: number;
+  /** `CanWritePackages` (package.go:306) — the write-mode rank of the SAME
+   *  ladder the route gate ran; arms the settings/delete sidebar block and
+   *  the terraform lock forms. */
+  canWritePackages: boolean;
+  /** The terraform specialization's view data (services/packages/terraform/
+   *  spec.go:31-55 — GetViewPackageVersionData, reduced): isLatestVersion
+   *  + the LOCK when this is the latest version of a terraform package and
+   *  it is locked. Both stay at their zero answers for every other type. */
+  isLatestVersion: boolean;
+  terraformLock: TerraformLockInfo | null;
 }
 
 /**
@@ -929,6 +1010,40 @@ export async function loadOwnerPackageVersionViewData(
       ? await userProfileChrome(d1, owner.user, doer)
       : { repoCount: await ownerRepoCount(d1, ownerId, doer), followers: 0, following: 0 };
 
+  // The write-mode rank (package.go:306's CanWritePackages — the same
+  // determinePackageAccessMode ladder the route gate ran, now at write).
+  const canWritePackages = accessModeAtLeast(
+    await ownerPackagesAccessMode(
+      d1,
+      { id: ownerId, type: owner.kind === "org" ? "org" : "user", visibility: ownerVisibilityOf(owner) },
+      doer,
+    ),
+    "write",
+  );
+
+  // The terraform specialization's view data (spec.go:31-55, reduced): the
+  // latest-version comparison over the SAME SearchLatestVersions arm, then
+  // the lock read ONLY when this is the latest version. Other types keep
+  // the zero answers (the specialization registers for terraform alone).
+  let isLatestVersion = false;
+  let terraformLock: TerraformLockInfo | null = null;
+  if (pkg.type === "terraform") {
+    const latest = await searchLatestVersions(d1, {
+      ownerId,
+      type: pkg.type,
+      name: pkg.lowerName,
+      exact: true,
+      excludeInternal: true,
+      page: 1,
+      limit: 1,
+    });
+    isLatestVersion = latest.rows[0]?.version.id === versionRow.id;
+    if (isLatestVersion) {
+      const lock = await getTerraformLock(d1, pkg.id);
+      if (isTerraformLockLocked(lock)) terraformLock = lock;
+    }
+  }
+
   const blobSize = descriptor.files.reduce((sum, file) => sum + file.blob.size, 0);
   return {
     owner,
@@ -945,6 +1060,9 @@ export async function loadOwnerPackageVersionViewData(
     repoCount: chrome.repoCount,
     followers: chrome.followers,
     following: chrome.following,
+    canWritePackages,
+    isLatestVersion,
+    terraformLock,
   };
 }
 
@@ -1153,8 +1271,9 @@ function PackagesPagination(props: { base: string; page: number; more: boolean; 
 }
 
 /** The visibility badge (package/shared/visibility_badge.tmpl — the
- *  internal/private/limited chain; null renders nothing). */
-function PackageVisibilityBadge(props: { kind: "internal" | "private" | null }) {
+ *  internal/private/limited chain; null renders nothing) — exported for
+ *  pages/package-settings.tsx's breadcrumb. */
+export function PackageVisibilityBadge(props: { kind: "internal" | "private" | null }) {
   if (props.kind === "internal") return <span class="ui basic label">{packagesLocale.badge_internal}</span>;
   if (props.kind === "private") return <span class="ui basic label">{packagesLocale.badge_private}</span>;
   return null;
@@ -1344,8 +1463,9 @@ function UserProfileGrid(props: {
 }
 
 /** The org chrome both org-arm pages share (org/header + org/menu with the
- *  Packages tab ACTIVE). */
-function OrgPackagesChrome(props: {
+ *  Packages tab ACTIVE) — exported for pages/package-settings.tsx, the
+ *  settings page's org arm. */
+export function OrgPackagesChrome(props: {
   ctx: UiContext;
   org: OrgRecord;
   repoCount: number;
@@ -1532,6 +1652,85 @@ function GenericInstallBlock(props: { data: PackageVersionViewData }) {
   );
 }
 
+/** The terraform lock-status block (package/metadata/terraform.tmpl — the
+ *  details-list item after the download row; the type gate rides the caller,
+ *  the IsLatestVersion gate renders nothing off-latest). The lock/unlock
+ *  buttons are the web.go:1117-1120 POST arms' forms (one bare POST each —
+ *  no fields, the manual lock is "Manual UI Lock" server-side). GLYPH
+ *  DEGRADATION: octicon-lock/octicon-unlock are not in the landed octicon
+ *  allowlist — locked degrades to octicon-shield-lock, unlocked to
+ *  octicon-check; the red/green text classes and the Locked-by/Unlocked
+ *  texts carry the state. The Created timestamp renders TimeSince off the
+ *  RFC3339 lock string (an unparsable one renders the operation alone). */
+function TerraformLockStatusBlock(props: { data: PackageVersionViewData }) {
+  const { data } = props;
+  if (!data.isLatestVersion) return null;
+  const ownerName = ownerNameOf(data.owner);
+  const lock = data.terraformLock;
+  const lockCreated = lock !== null && !Number.isNaN(new Date(lock.Created).getTime()) ? new Date(lock.Created) : null;
+  return (
+    <>
+      <div class="divider"></div>
+      <div class="item tw-flex tw-flex-col tw-gap-2">
+        <div>
+          <strong>{packagesLocale.terraform_lock_status}</strong>
+        </div>
+        <div>
+          {lock !== null ? (
+            <>
+              <div class="flex-text-block">
+                <Icon name="octicon-shield-lock" class="tw-text-red" />{" "}
+                <span>
+                  {TERRAFORM_LOCKED_BY_PREFIX}
+                  {lock.Who}
+                </span>
+              </div>
+              <div class="tw-text-xs tw-ml-6 tw-break-anywhere">
+                {lockCreated !== null ? (
+                  <>
+                    <TimeSince unixSeconds={Math.floor(lockCreated.getTime() / 1000)} tz="+0000" />{" "}
+                  </>
+                ) : null}
+                ({lock.Operation})
+              </div>
+              {data.canWritePackages ? (
+                <div>
+                  <form
+                    action={`${versionWebLink(ownerName, data.pkg.type, data.pkg.lowerName, data.version.lowerVersion)}/terraform/unlock`}
+                    method="post"
+                  >
+                    <button type="submit" class="ui tiny button tw-w-full">
+                      {packagesLocale.terraform_unlock}
+                    </button>
+                  </form>
+                </div>
+              ) : null}
+            </>
+          ) : (
+            <>
+              <div class="flex-text-block">
+                <Icon name="octicon-check" class="tw-text-green" /> <span>{packagesLocale.terraform_unlocked}</span>
+              </div>
+              {data.canWritePackages ? (
+                <div>
+                  <form
+                    action={`${versionWebLink(ownerName, data.pkg.type, data.pkg.lowerName, data.version.lowerVersion)}/terraform/lock`}
+                    method="post"
+                  >
+                    <button type="submit" class="ui tiny button tw-w-full">
+                      {packagesLocale.terraform_lock}
+                    </button>
+                  </form>
+                </div>
+              ) : null}
+            </>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
 /** The view block (package/shared/view.tmpl — the title header + the
  *  packages-content grid). */
 function PackageVersionViewBlock(props: { data: PackageVersionViewData }) {
@@ -1589,6 +1788,7 @@ function PackageVersionViewBlock(props: { data: PackageVersionViewData }) {
             <div class="item">
               <Icon name="octicon-download" /> {data.downloadCount}
             </div>
+            {data.pkg.type === "terraform" ? <TerraformLockStatusBlock data={data} /> : null}
             <div class="item">
               <Icon name="octicon-database" /> {data.blobSizeText}
             </div>
@@ -1626,6 +1826,47 @@ function PackageVersionViewBlock(props: { data: PackageVersionViewData }) {
               </div>
             ))}
           </div>
+          {data.canWritePackages || data.repository !== null ? (
+            <>
+              <div class="divider"></div>
+              <div class="ui relaxed list flex-items-block">
+                {data.repository !== null ? (
+                  <div class="item">
+                    <Icon name="octicon-issue-opened" />{" "}
+                    <a href={`${data.repository.link}/issues`}>{packagesLocale.issues}</a>
+                  </div>
+                ) : null}
+                {data.canWritePackages ? (
+                  <>
+                    <div class="item">
+                      <Icon name="octicon-tools" />{" "}
+                      <a href={packageSettingsLink(ownerName, data.pkg.type, data.pkg.lowerName)}>
+                        {packagesLocale.settings}
+                      </a>
+                    </div>
+                    <div class="item">
+                      <Icon name="octicon-trash" />{" "}
+                      <details class="ui basic red button tw-p-0">
+                        <summary class="tw-p-2">{packagesLocale.delete_version}</summary>
+                        <div class="ui attached segment tw-text-left">
+                          <form class="ui form" action={versionLink} method="post">
+                            <div class="ui warning message tw-break-anywhere">
+                              {packagesLocale.delete_notice_pre}
+                              {data.pkg.name} ({data.version.version})
+                              {packagesLocale.delete_notice_tail}
+                            </div>
+                            <button type="submit" class="ui red ok button">
+                              <Icon name="octicon-check" /> {packagesLocale.modal_yes}
+                            </button>
+                          </form>
+                        </div>
+                      </details>
+                    </div>
+                  </>
+                ) : null}
+              </div>
+            </>
+          ) : null}
         </div>
       </div>
     </>

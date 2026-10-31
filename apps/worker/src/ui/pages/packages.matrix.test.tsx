@@ -26,6 +26,12 @@
  *   - the version view: the assets list with sizes, the summed blob size,
  *     the versions sidebar + total, the generic curl lines, the
  *     missing-version null;
+ *   - the version view WRITE arms (the census gap #5 rider): the
+ *     canWritePackages sidebar (Settings anchor + the bare version-delete
+ *     POST + the notice, writer-only) and the terraform lock block (the
+ *     lock/unlock POST forms writer-only on the latest version, the
+ *     Locked-by status, the off-latest silence — the seams themselves live
+ *     in package-settings.test.tsx);
  *   - the download pair: the id-pair arbitration, the attachment
  *     disposition + nosniff + extension content type, the skip-compression
  *     hint, the If-Modified-Since 304, the IsLead counter gate (GET bumps a
@@ -67,6 +73,7 @@ import {
   linkPackageToRepo,
   tryInsertFile,
 } from "../../services/packages/model";
+import { lockPackageTerraformState } from "./package-settings";
 import { follows, packageVersions, packages, repoSettings, repoUnits, users } from "../../db/schema";
 import { BaseLayout } from "../shell";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "../ui-context";
@@ -599,6 +606,77 @@ describe("the version view — assets, sidebar, install lines", () => {
     const owner = { kind: "user" as const, user: await rowOf(world.alice.id) };
     expect(await loadOwnerPackageVersionViewData(env.DB, owner, { kind: "anonymous" }, ORIGIN, "generic", "app-tools", "9.9.9")).toBeNull();
     expect(await loadOwnerPackageVersionViewData(env.DB, owner, { kind: "anonymous" }, ORIGIN, "generic", "ghost", "1.0.0")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The version view WRITE arms (the census gap #5 rider — the write sidebar
+// whose seams live in pages/package-settings.tsx + the terraform lock block)
+// ---------------------------------------------------------------------------
+
+describe("the version view write arms — the write sidebar, the terraform lock block", () => {
+  it("arms the settings/delete sidebar for writers and leaves both off for readers", async () => {
+    const world = await seedListWorld();
+    const owner = { kind: "user" as const, user: await rowOf(world.alice.id) };
+    const aliceViewer: Viewer = { kind: "user", id: world.alice.id, username: "alice", isAdmin: false };
+    const data = await loadOwnerPackageVersionViewData(env.DB, owner, aliceViewer, ORIGIN, "generic", "app-tools", "v1.1.0");
+    if (data === null) throw new Error("view load failed");
+    expect(data.canWritePackages).toBe(true);
+    const html = renderOwnerPackageVersionViewPage(pageCtx(aliceViewer), data);
+    // The Settings anchor (PackageSettingsLink) + the bare version-delete
+    // POST (no fields — the dialog form's shape, reduced inline) + the
+    // notice text.
+    expect(html).toContain('href="/alice/-/packages/settings/generic/app-tools"');
+    expect(html).toContain('action="/alice/-/packages/generic/app-tools/v1.1.0" method="post"');
+    expect(html).toContain("You are about to delete app-tools (V1.1.0)");
+
+    const anon = await loadOwnerPackageVersionViewData(env.DB, owner, { kind: "anonymous" }, ORIGIN, "generic", "app-tools", "v1.1.0");
+    if (anon === null) throw new Error("anon view load failed");
+    expect(anon.canWritePackages).toBe(false);
+    const anonHtml = renderOwnerPackageVersionViewPage(pageCtx({ kind: "anonymous" }), anon);
+    expect(anonHtml).not.toContain("/packages/settings/generic/app-tools");
+    expect(anonHtml).not.toContain("octicon-trash");
+  });
+
+  it("renders the terraform lock block: the lock form unlocked, the unlock form + locked-by when locked, nothing off-latest or for readers", async () => {
+    const towner = await seedUser("tftester");
+    await seedPackageVersion(towner.id, "tfstate", "v1", { type: "terraform", now: new Date(T0.getTime() + 1000) });
+    const latest = await seedPackageVersion(towner.id, "tfstate", "v2", { type: "terraform", now: new Date(T0.getTime() + 2000) });
+    const owner = { kind: "user" as const, user: await rowOf(towner.id) };
+    const ownerViewer: Viewer = { kind: "user", id: towner.id, username: "tftester", isAdmin: false };
+
+    const data = await loadOwnerPackageVersionViewData(env.DB, owner, ownerViewer, ORIGIN, "terraform", "tfstate", "v2");
+    if (data === null) throw new Error("view load failed");
+    expect(data.isLatestVersion).toBe(true);
+    expect(data.terraformLock).toBeNull();
+    const html = renderOwnerPackageVersionViewPage(pageCtx(ownerViewer), data);
+    expect(html).toContain('action="/tftester/-/packages/terraform/tfstate/v2/terraform/lock" method="post"');
+    expect(html).not.toContain("/terraform/unlock");
+
+    await lockPackageTerraformState(env.DB, latest.pkg, "tftester", T0);
+    const locked = await loadOwnerPackageVersionViewData(env.DB, owner, ownerViewer, ORIGIN, "terraform", "tfstate", "v2");
+    if (locked === null) throw new Error("locked view load failed");
+    expect(locked.terraformLock?.Who).toBe("tftester");
+    const lockedHtml = renderOwnerPackageVersionViewPage(pageCtx(ownerViewer), locked);
+    expect(lockedHtml).toContain('action="/tftester/-/packages/terraform/tfstate/v2/terraform/unlock" method="post"');
+    expect(lockedHtml).toContain("Locked by tftester");
+
+    // Off-latest: the specialization renders nothing (spec.go's
+    // IsLatestVersion gate).
+    const older = await loadOwnerPackageVersionViewData(env.DB, owner, ownerViewer, ORIGIN, "terraform", "tfstate", "v1");
+    if (older === null) throw new Error("older view load failed");
+    expect(older.isLatestVersion).toBe(false);
+    expect(renderOwnerPackageVersionViewPage(pageCtx(ownerViewer), older)).not.toContain("Lock Status");
+
+    // A reader (anonymous on a public owner) sees the STATUS — the lock
+    // landed earlier in this test — but never the forms
+    // (CanWritePackages gates both).
+    const anon = await loadOwnerPackageVersionViewData(env.DB, owner, { kind: "anonymous" }, ORIGIN, "terraform", "tfstate", "v2");
+    if (anon === null) throw new Error("anon view load failed");
+    const anonHtml = renderOwnerPackageVersionViewPage(pageCtx({ kind: "anonymous" }), anon);
+    expect(anonHtml).toContain("Locked by tftester");
+    expect(anonHtml).not.toContain("/terraform/lock");
+    expect(anonHtml).not.toContain("/terraform/unlock");
   });
 });
 
