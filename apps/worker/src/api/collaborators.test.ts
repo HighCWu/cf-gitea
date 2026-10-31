@@ -8,8 +8,10 @@
  * unknown-user 422 `user does not exist [uid: 0, name: X]`, the idempotent
  * upsert PUT (nil permission → write) and the idempotent 204 DELETE, the
  * admin gate (403 exact upstream message; collaborator-admin grant), the
- * insertion-order paginated list, and the assignees set (write-or-above
- * collaborators + owner, active only, name order, deduped). The permission
+ * insertion-order paginated list, and the assignees set (the UNIFIED
+ * GetRepoAssignees port — services/mentions/repo-assignees.ts
+ * getRepoAssignees: write-or-above collaborators, the ORG-team arm, active
+ * only, name order, the NON-org owner seat). The permission
  * body string is NOT enum-validated at bind — upstream decodes any string
  * into *RepoWritePermission and ParseAccessMode maps unknown values
  * ("owner", "") to the service's ErrInvalidAccessMode, the blanked
@@ -23,7 +25,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { repositories, userBlocking, users } from "../db/schema";
+import { repositories, teamMembers, teamRepoAccess, teams, userBlocking, users } from "../db/schema";
 import { createStubAuthResolver, createTokenAuthMiddleware, type AuthResolver } from "./auth";
 import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
@@ -37,6 +39,7 @@ const TOKEN_COLLAB = "collab-token"; // resolves to the seeded collaborator row
 const ERROR_URL = "https://example.com/api/swagger";
 
 let collaboratorUserId = 0;
+let carolUserId = 0;
 
 function collaboratorIdentity() {
   return {
@@ -86,7 +89,7 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   await resetRepoExtrasTables();
-  for (const table of ["user_blocking", "repo_collaborators", "repositories", "users"]) {
+  for (const table of ["team_members", "team_repo_access", "teams", "user_blocking", "repo_collaborators", "repositories", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   // STUB_USER (id 1) owns the repo; 'collab' and 'carol' are candidates.
@@ -99,7 +102,12 @@ beforeEach(async () => {
     .returning({ id: users.id })
     .all();
   collaboratorUserId = collab[0]!.id;
-  await drizzle(env.DB).insert(users).values({ username: "carol", usernameLower: "carol", status: "active", createdAt: new Date() });
+  const carol = await drizzle(env.DB)
+    .insert(users)
+    .values({ username: "carol", usernameLower: "carol", status: "active", createdAt: new Date() })
+    .returning({ id: users.id })
+    .all();
+  carolUserId = carol[0]!.id;
   await drizzle(env.DB).insert(users).values({ username: "ghost-user", usernameLower: "ghost-user", status: "prohibited", createdAt: new Date() });
   await drizzle(env.DB).insert(repositories).values({
     id: "7201",
@@ -312,7 +320,7 @@ describe("DELETE /repos/{owner}/{repo}/collaborators/{collaborator} (repoDeleteC
 });
 
 describe("GET /repos/{owner}/{repo}/assignees (repoGetAssignees)", () => {
-  it("lists the owner plus write-or-above collaborators, name order, active only", async () => {
+  it("lists write-or-above collaborators in name order plus the owner seat appended last, active only", async () => {
     // read-mode collaborator: NOT an assignee.
     await addOrUpdateCollaborator(env.DB, "7201", collaboratorUserId, "read", new Date());
     const writer = await drizzle(env.DB)
@@ -331,9 +339,76 @@ describe("GET /repos/{owner}/{repo}/assignees (repoGetAssignees)", () => {
     const res = await makeApp()(`${repoPath}/assignees`, { headers: auth });
     expect(res.status).toBe(200);
     const body = await res.json<Array<{ login: string }>>();
-    // name order: cf-gitea-stub < zoe; read-mode and inactive users dropped;
-    // the owner appears exactly once.
-    expect(body.map((u) => u.login)).toEqual(["cf-gitea-stub", "zoe"]);
+    // read-mode and inactive users dropped; the owner appears exactly once —
+    // appended AFTER the sorted enumeration (user_repo.go:151-153 appends
+    // repo.Owner raw, it is not sorted in), so zoe precedes the owner even
+    // though "cf-gitea-stub" < "zoe" in name order.
+    expect(body.map((u) => u.login)).toEqual(["zoe", "cf-gitea-stub"]);
+  });
+
+  /** The org-team arm's fixture: an org-owned repo, "acme/orgrepo"
+   *  (mirrors carrier.test.ts's seed shape for the same enumeration). */
+  async function seedOrgRepo() {
+    await drizzle(env.DB).insert(users).values({ id: 90, username: "acme", usernameLower: "acme", type: "org", status: "active", createdAt: new Date() });
+    await drizzle(env.DB).insert(repositories).values({
+      id: "7301",
+      storageKey: "r_7301",
+      ownerNamespace: "acme",
+      ownerId: 90,
+      slug: "orgrepo",
+      visibility: "public",
+      refsVersion: 1,
+      backend: "self-hosted",
+      createdAt: new Date("2026-02-03T04:05:06Z"),
+    });
+  }
+
+  it("an org owner's own row is NOT an assignee (the non-organization seat, user_repo.go:151-153)", async () => {
+    // The old reduced read appended the owner row without upstream's
+    // `!repo.Owner.IsOrganization()` condition — an org owner wrongly
+    // appeared as an assignee. Unified on the full port: the org owner
+    // brings no seat; enumerated collaborators stay.
+    await seedOrgRepo();
+    await addOrUpdateCollaborator(env.DB, "7301", collaboratorUserId, "write", new Date());
+
+    const res = await makeApp()("/repos/acme/orgrepo/assignees", { headers: auth });
+    expect(res.status).toBe(200);
+    const body = await res.json<Array<{ login: string }>>();
+    expect(body.map((u) => u.login)).toEqual(["collab"]);
+  });
+
+  it("members of an org team granted on an assignable unit ARE assignees; a unit-gated-out member is not (GetTeamUserIDsWithAccessToAnyRepoUnit, team_repo.go:85-96)", async () => {
+    // The old reduced read had no org-team arm — team members never
+    // appeared. Unified: teams joined to the repo through team_repo_access
+    // qualify on `authorize >= read` OR the issues/pulls unitsMap override
+    // `>= read`; the org owner still brings no seat (:151).
+    await seedOrgRepo();
+    const teamie = await drizzle(env.DB)
+      .insert(users)
+      .values({ username: "teamie", usernameLower: "teamie", status: "active", createdAt: new Date() })
+      .returning({ id: users.id })
+      .all();
+    await drizzle(env.DB).insert(teams).values([
+      { id: 60, orgId: 90, lowerName: "devs", name: "devs", authorize: "none", unitsMap: JSON.stringify({ "repo.issues": "read" }) },
+      { id: 61, orgId: 90, lowerName: "ops", name: "ops", authorize: "none", unitsMap: JSON.stringify({ "repo.code": "read" }) }, // no issues/pulls unit
+      { id: 62, orgId: 90, lowerName: "viewers", name: "viewers", authorize: "read" }, // plain-permission team: the authorize rank alone qualifies
+    ]);
+    await drizzle(env.DB).insert(teamRepoAccess).values([
+      { orgId: 90, teamId: 60, repoId: "7301" },
+      { orgId: 90, teamId: 61, repoId: "7301" },
+      { orgId: 90, teamId: 62, repoId: "7301" },
+    ]);
+    await drizzle(env.DB).insert(teamMembers).values([
+      { orgId: 90, teamId: 60, userId: collaboratorUserId },
+      { orgId: 90, teamId: 61, userId: carolUserId }, // gated out: the code unit is not assignable
+      { orgId: 90, teamId: 62, userId: teamie[0]!.id },
+    ]);
+
+    const res = await makeApp()("/repos/acme/orgrepo/assignees", { headers: auth });
+    expect(res.status).toBe(200);
+    const body = await res.json<Array<{ login: string }>>();
+    // name order: collab < teamie; the gated-out carol and the org owner stay out.
+    expect(body.map((u) => u.login)).toEqual(["collab", "teamie"]);
   });
 
   it("404s an invisible repo", async () => {

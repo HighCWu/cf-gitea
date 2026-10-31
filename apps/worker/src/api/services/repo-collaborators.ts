@@ -2,6 +2,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { and, eq, inArray, sql } from "drizzle-orm";
 
 import { repoCollaborators, users } from "../../db/schema";
+import { getRepoAssignees } from "../../services/mentions/repo-assignees";
 import type { UserRow } from "./repository";
 
 /**
@@ -24,9 +25,14 @@ import type { UserRow } from "./repository";
  *    `user does not exist [uid: 0, name: X]`; DELETE is idempotent 204
  *    (a missing collaboration deletes zero rows and still succeeds);
  *  - the list orders by `collaboration.id` = insertion order (our rowid);
- *  - assignees (GetRepoAssignees, models/repo/user_repo.go:117–152) = the
- *    write-or-above collaborators plus the owner, active users only, name
- *    order, deduped.
+ *  - assignees (GetRepoAssignees, models/repo/user_repo.go:117–152) read
+ *    through the landed FULL port — services/mentions/repo-assignees.ts
+ *    `getRepoAssignees` (the collaborator arm, the ORG-team arm, active
+ *    users only, name order, the NON-org owner seat). `listRepoAssignees`
+ *    is the delegate both assignee surfaces ride (the
+ *    /repos/{owner}/{repo}/assignees list and the /assignees/{assignee}
+ *    eligibility check) — upstream serves them from the ONE function
+ *    (specs/email-outbound.md §13.4, the flipped ledger row).
  */
 
 /**
@@ -193,28 +199,22 @@ export async function listRepoCollaborators(
 }
 
 /**
- * `GetRepoAssignees` (user_repo.go:117–152) — write-or-above collaborators
- * plus the (non-org) owner; active users only; `GetOrderByName()` order
- * (username ASC); the owner never appears twice.
+ * `GetRepoAssignees` (user_repo.go:117–152) — UNIFIED on the landed full
+ * port, services/mentions/repo-assignees.ts `getRepoAssignees`: the
+ * write-or-above collaborator arm, the ORG-team arm (teams joined to this
+ * repo granting read on the issues/pulls units — the old reduced read
+ * under-listed them), active users only in `GetOrderByName()` order
+ * (username ASC), and the NON-org owner seat appended raw (the old read
+ * appended the owner without upstream's `!IsOrganization()` condition,
+ * :151, so an org owner wrongly appeared as an assignee). Both assignee
+ * surfaces ride this delegate — upstream serves them from the ONE
+ * function.
  */
-export async function listRepoAssignees(
+export function listRepoAssignees(
   d1: D1Database,
   repo: { id: string; ownerId: number | null },
 ): Promise<UserRow[]> {
-  const rows = await drizzle(d1)
-    .select({ userId: repoCollaborators.userId })
-    .from(repoCollaborators)
-    .where(and(eq(repoCollaborators.repoId, repo.id), inArray(repoCollaborators.mode, ["write", "admin"])))
-    .orderBy(sql`rowid ASC`)
-    .all();
-  const ids = rows.map((row) => row.userId);
-  if (repo.ownerId !== null && !ids.includes(repo.ownerId)) {
-    ids.push(repo.ownerId);
-  }
-  const usersById = await userRowsByIds(d1, ids);
-  return [...usersById.values()]
-    .filter((user) => user.status === "active")
-    .sort((a, b) => (a.username < b.username ? -1 : a.username > b.username ? 1 : 0));
+  return getRepoAssignees(d1, repo);
 }
 
 /** Effective collaboration mode of one user on one repo ("none" when absent —

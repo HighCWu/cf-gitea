@@ -1254,16 +1254,24 @@ runs the regexp):
   — no indexer in this tree), and UserMentionedRepoCond
   (repo_list.go:259-267 — its only caller is the web dashboard's
   accessible-repo condition, a surface this backend does not carry).
-- DIVERGENCE LEDGER (for the collaborators owner): the seed enumerates
-  through the FULL `GetRepoAssignees` port (repo-assignees.ts), while the
-  `/repos/{owner}/{repo}/assignees` route keeps its REDUCED
+- DIVERGENCE LEDGER — RESOLVED (the assignees read unified, 2026-11-01):
+  the route no longer keeps the reduced read. The reduced
   `listRepoAssignees` (api/services/repo-collaborators.ts —
-  collaborators + owner, no org-team arm); upstream serves both from ONE
-  function, so the route under-lists org teams. That route's port also
-  appends the owner row without the non-organization condition
-  (:151) — an org owner's own user row can appear as an "assignee".
-  Unifying both reads on repo-assignees.ts is that surface owner's call;
-  recorded here so the split is deliberate, not accidental.
+  collaborators + owner, no org-team arm, owner appended without the
+  non-organization condition) is retired; `listRepoAssignees` is now a
+  delegate onto the landed FULL port
+  (`services/mentions/repo-assignees.ts` `getRepoAssignees`), so BOTH
+  assignee surfaces read ONE enumeration — the
+  `/repos/{owner}/{repo}/assignees` list (routes/collaborators.ts) and
+  the `/repos/{owner}/{repo}/assignees/{assignee}` eligibility check
+  (routes/repo-extras-t2.ts, our `CanBeAssigned` approximation) — the
+  same one-function shape upstream serves them from. The flip retires
+  the two recorded gaps: the ORG-team arm now reaches the route (members
+  of a team joined to the repo granting read on the issues/pulls units
+  enumerate), and the owner seat honors the non-organization condition
+  (user_repo.go:151 — an org owner's own row no longer appears as an
+  "assignee"); the owner is also appended raw after the sorted
+  enumeration (:151-153), no longer sorted in.
 
 ---
 
