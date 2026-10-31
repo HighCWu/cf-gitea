@@ -18,11 +18,11 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
                                                       # D1-only: --base-url/--token-file optional
 ```
 
-- Batteries (14): `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
+- Batteries (15): `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
   `ui-login`, `window2-mounts`, `window3-mounts`, `fixwave-parity`,
   `branch-protection`, `demo`, `wiki-git`, `packages-registry`,
-  `cleanup-audit`, `all` (runs the 14 in that order, audit last).
-  `all --dry-run` plans **176 probes** across them (the counts in the
+  `packages-distro`, `cleanup-audit`, `all` (runs the 15 in that order, audit
+  last). `all --dry-run` plans **181 probes** across them (the counts in the
   table below were read off that dry-run at this writing; `registry`
   scales with `--trials`).
 - **The `cleanup-audit` battery is D1-only** (wrangler d1 execute, no HTTP): it
@@ -46,7 +46,7 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
   row sweep reuse `--d1-scope`); mint the
   PAT with `node scripts/bootstrap-admin.mjs <user>` on local D1, and pass the
   matching `--user`. A local self-test (the seven batteries committed at the
-  time — `window2-mounts` landed after; the toolkit now carries 14) was run green
+  time — `window2-mounts` landed after; the toolkit now carries 15) was run green
   from this tree; see "Local self-test fixtures" below.
 - `--json` puts only the final JSON summary on stdout (progress to stderr),
   same contract as deploy-smoke.
@@ -71,7 +71,7 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
 
 ## Batteries and their canonical expectations
 
-The registry at this writing — 14 batteries, **176 probes** (`all
+The registry at this writing — 15 batteries, **181 probes** (`all
 --dry-run`; `registry`'s count scales with `--trials`, here at its
 default 3):
 
@@ -90,8 +90,9 @@ default 3):
 | `demo` | 4 | demo posture: committed-config machinery, `DEMO_MODE`-off default, open signup, the §4.4 banner ([warn] pre-M2) | HTTP against the demo instance; the TTL-mechanics arm is LOCAL-only (`--d1-scope local` + `DEMO_MODE=true` in `.dev.vars` against `pnpm dev`) |
 | `wiki-git` | 7 | the `.wiki.git` wire: REST page create → real clone carries the root commit → push → read-back → privacy tail → t+0 tombstone | HTTP |
 | `packages-registry` | 11 | all SIX protocols end-to-end (generic/pypi/npm/helm/maven/nuget) + the D1 row sweep + repo delete | HTTP + **wrangler auth** (the row sweep rides `--d1-scope`) |
+| `packages-distro` | 5 | the M7 distro tail: rpm (hand-built fixture → .repo configs + repomd.xml + primary.xml.gz + repository.key → delete → repodata gone) + arch (.PKGINFO package → packages.db tar + symlink-dance aliases + .sig → delete → index 404 empty) + the D1 husk sweep + repo delete | HTTP + **wrangler auth** (the husk row sweep rides `--d1-scope`) |
 | `cleanup-audit` | 10 | post-run D1 count shapes (independent counts) | **D1-only** — wrangler auth, `--d1-scope remote\|local` (default remote); takes NEITHER `--base-url` NOR `--token-file` |
-| **`all`** | **176** | every battery in registry order, audit last | union of the above |
+| **`all`** | **181** | every battery in registry order, audit last | union of the above |
 
 Expectations are ported from `docs/design/p0-evidence.md` — the REDEPLOY13
 block (2026-10-26, ~lines 1507-1697) for the shallow trio, generate, ui-login,
@@ -489,6 +490,59 @@ prints all of them verbatim.
   under the fullName the create returned (logged on one
   `[tail] pkg-leftover-sweep` line; failures feed `left_behind`, never
   fatal; a green run no-ops silently).
+- **packages-distro** — the M7 distro tail's two protocol families in ONE
+  owner-scoped sweep (fbace73's recorded open item; one probe repo vehicle +
+  the run PAT; both fixtures GENERATED INLINE — no rpmbuild/pacman on the
+  probe host, the byte shapes are the landed suites' own hand-built builders).
+  INDEPENDENT (the fixwave posture shape — one red family never hides the
+  other; both families are OWNER-scoped, so the arms do not chain):
+  **distro-rpm-roundtrip** — PUT a hand-built minimal rpm (`probe-rpm-<hex>`,
+  the packages-rpm.test.ts builder shape: 96-byte lead + signature section
+  with a REAL SHA-256 digest over the main header + the payload size + the
+  alignment pad + the name/version/release/arch/summary tags) → 201; the
+  group-less `/rpm.repo` AND the grouped `/rpm/el9.repo` render the exact
+  `renderRpmRepositoryConfig` strings off the request origin (the
+  `[gitea-<user>]` id, `name=<user> - Gitea`, the baseurl, gpgcheck 1, the
+  group-less gpgkey href); `repodata/repomd.xml` carries the three data
+  entries (primary/filelists/other, no updateinfo without errata);
+  `primary.xml.gz` decompresses to the parsed tags (name/noarch, the
+  `epoch="0" ver= rel=` version, the summary); the GROUP-LESS
+  `/rpm/repository.key` answers the armored public key
+  (`application/pgp-keys` + the repository.key disposition) while the
+  group-qualified path 404s (upstream registers the key group-less only);
+  DELETE the package → 204 → the emptied group's repomd.xml is GONE at t+0.
+  **distro-arch-roundtrip** — PUT a minimal pacman package
+  (`probe-arch-<hex>`, `.PKGINFO` + two file members over the shared
+  ustar+gzip substrate) → 201; `packages.db` decompresses to ONE gzip
+  member's ustar with exactly the `{name}-{version}/files` + `/desc` pair
+  (files FIRST, Mode 0o777 — os.ModePerm) whose `%FIELD%` documents carry
+  FILENAME/SHA256SUM/PGPSIG/CSIZE(== the upload size)/ISIZE/NAME/BASE/ARCH/
+  VERSION/DESC/LICENSE/PROVIDES/DEPENDS while MD5SUM and the empty fields are
+  SKIPPED, and the files member lists the package's tar members; the
+  symlink-dance normalization (arch.go:186-197 — the aliases ARE the dance,
+  there is no literal symlink) serves the IDENTICAL stored bytes under
+  `index.db.tar.gz` and `main.db`, and `packages.db.sig` answers non-empty;
+  DELETE the version → 204 → the index 404s with the EMPTY body.
+  Cleanup is SELF-CLEANING at the protocol layer PLUS one D1 sweep arm (the
+  packages-registry precedent — wrangler auth, `--d1-scope`): the protocol
+  deletes fold the version + files (upstream's exact DeletePackageFile fold —
+  routers/api/packages/rpm/rpm.go:299-302 deletes the VERSION and its
+  references; the PACKAGE row itself stays, upstream's own cleanup sweep owns
+  orphaned packages too), so the empty package HUSKS the arms leave sweep
+  via D1 with the zero-rows assert (`distro-cleanup-rows-d1`,
+  deletePackageAndReferences' cascade order scoped to the run's probe names);
+  the internal `_rpm`/`_arch` rows + the owner keypair are STANDING
+  per-owner infrastructure (the getOrCreate posture — every later run reuses
+  them, the p0 standing-fixture precedent) the sweep never touches, and
+  unreferenced blob content rides the >24 h cleanup queue as documented
+  residue, so cleanup-audit needs no new expectations. **Failure cleanup
+  (the consistency posture):** a finally-style tail best-effort
+  protocol-DELETEs exactly what the arms uploaded and have not already
+  deleted (gone-flagged), then sweeps the package rows (D1, unless the
+  in-chain sweep already ran), then deletes the probe repo under the
+  fullName the create returned (logged on one
+  `[tail] distro-leftover-sweep` line; failures feed `left_behind`, never
+  fatal; a green run no-ops silently).
 - **cleanup-audit** — one wrangler d1 execute (`--d1-scope remote|local`,
   default remote) runs the whole count shape; **D1-only, so it runs without
   `--base-url`/`--token-file`**; the checks are INDEPENDENT (one red count
@@ -553,6 +607,11 @@ prints all of them verbatim.
   - `packages-registry` — its package rows (D1, unless the in-chain
     sweep already ran), then its probe repo;
     `[tail] pkg-leftover-sweep`.
+  - `packages-distro` — its uploaded rpm package file, then its arch
+    version (both best-effort protocol deletes, gone-flagged — a forced-red
+    arm never uploaded anything, so nothing to sweep there), then its
+    package rows (D1 — the protocol deletes leave the empty package husks),
+    then its probe repo; `[tail] distro-leftover-sweep`.
   One `[tail]` line logs every action; failures feed `left_behind`, never
   fatal; a green run no-ops silently (the battery's own cleanup arms already
   emptied everything, and the gone flags skip the rest). The audit battery
@@ -623,6 +682,15 @@ prints all of them verbatim.
     reds after every protocol arm greened and the in-chain row sweep
     already ran — the tail then carries only the repo delete (the
     `rowsSwept` gone-flag skipping the row sweep, the documented shape).
+  - `packages-distro --force-red distro-rpm-roundtrip` — the INDEPENDENT
+    posture, not the chain: the forced arm reds UNRUN while the OTHER
+    steps still run green (create, the arch arm, the husk row sweep — which
+    removes the arch arm's empty package husk — and the repo cleanup); the
+    `[tail] distro-leftover-sweep` line legitimately stays silent (the rpm
+    fixture was never uploaded and everything that WAS created already
+    swept itself in-chain; a mid-arm red after the real PUT is what the
+    tail's gone-flagged protocol deletes + row sweep cover, and that shape
+    is not deterministically forceable).
   The rehearsal convention: each forced-red run is followed by a
   `cleanup-audit` run, and the audit going green is the sweep's proof.
 - The mirror battery can also be forced honestly through its real budget

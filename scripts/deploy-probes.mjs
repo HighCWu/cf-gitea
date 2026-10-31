@@ -190,6 +190,42 @@
  *                  204 (packages are owner-scoped — the repo delete never
  *                  touches them, which is exactly why the D1 sweep exists).
  *                  A red run sweeps the rows + the repo (the failureTail).
+ *   packages-distro The M7 distro tail's two protocol families in ONE
+ *                  owner-scoped sweep (the fbace73 open item; one probe repo
+ *                  vehicle + the run PAT; both fixtures GENERATED INLINE — no
+ *                  rpmbuild/pacman on the probe host): the rpm arm PUTs a
+ *                  hand-built minimal rpm (the packages-rpm.test.ts builder
+ *                  shape — 96-byte lead + a signature section carrying a REAL
+ *                  SHA-256 digest over the main header + the payload size +
+ *                  the alignment pad + the main header's five tags) → 201,
+ *                  reads back the group-less + grouped .repo configs (the
+ *                  exact renderRpmRepositoryConfig strings off the request
+ *                  origin), repomd.xml (the three data entries, no updateinfo),
+ *                  primary.xml.gz (the parsed tags) and the GROUP-LESS
+ *                  repository.key (armored, application/pgp-keys; the
+ *                  group-qualified path 404s), then DELETEs the package → 204
+ *                  → the emptied group's repodata is GONE; the arch arm PUTs
+ *                  a minimal pacman package (.PKGINFO + file members over the
+ *                  shared ustar+gzip substrate) → 201, reads back packages.db
+ *                  (ONE gzip member's ustar: the {name}-{version}/files +
+ *                  /desc pair, files FIRST, Mode 0o777, the %FIELD% documents
+ *                  — MD5SUM and empty fields skipped), proves the
+ *                  symlink-dance normalization (the alias spellings
+ *                  index.db.tar.gz + {repository}.db serve the IDENTICAL
+ *                  stored bytes; the .sig arm answers), then DELETEs the
+ *                  version → 204 → the index 404s with the EMPTY body.
+ *                  Self-cleaning at the protocol layer PLUS one D1 sweep arm
+ *                  (wrangler auth, --d1-scope — the packages-registry
+ *                  precedent): the protocol deletes fold the version + files
+ *                  (upstream's exact DeletePackageFile fold — the PACKAGE row
+ *                  itself stays, upstream's cleanup sweep owns orphans too),
+ *                  so the empty package HUSKS the arms leave sweep via D1
+ *                  with the zero-rows assert. The internal `_rpm`/`_arch`
+ *                  rows + the owner keypair are STANDING per-owner
+ *                  infrastructure (the getOrCreate posture — every later run
+ *                  reuses them; the p0 standing-fixture precedent). A red run
+ *                  sweeps the uploaded files' rows + the repo (the
+ *                  failureTail).
  *   cleanup-audit  The post-run D1 count shapes (wrangler d1 execute; see the
  *                  audit SQL below for the exact tables).
  *   all            Every battery in the order above (audit last).
@@ -275,14 +311,14 @@
  * This file deliberately does NOT touch docs/design/p0-evidence.md (it is
  * REDEPLOY14's in-flight document); the conventions note lives here.
  */
-/* global fetch, AbortSignal, URLSearchParams -- Web globals provided by Node >= 22 (no node: module exports them) */
+/* global fetch, AbortSignal, URLSearchParams, URL -- Web globals provided by Node >= 22 (no node: module exports them) */
 import { execFile } from "node:child_process";
 import console from "node:console";
 import { createHash, randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { gzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -293,7 +329,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerDir = path.join(repoRoot, "apps", "worker");
 const DEFAULT_USER = "p0probe";
-const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "cleanup-audit", "all"];
+const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "cleanup-audit", "all"];
 /** Batteries that make NO HTTP calls (they read D1 via wrangler only):
  *  --base-url and --token-file are OPTIONAL for these (REDEPLOY15 friction
  *  (a): the D1-only audit still demanded a PAT, forcing a scratch-mint +
@@ -387,6 +423,7 @@ const usage = () =>
   "  demo:          --d1-scope local (against pnpm dev with DEMO_MODE=true in .dev.vars) runs the deep TTL-mechanics arm; a deployed target records an ops-note [info] there (the sweep log is not API-reachable). The banner arm warns until the M2 wave lands.\n" +
   "  wiki-git:      (no extra options)\n" +
   "  packages-registry: (no extra options — the row-cleanup arm reuses --d1-scope and needs wrangler auth, the fixwave precedent)\n" +
+  "  packages-distro: (no extra options — the husk row-cleanup arm reuses --d1-scope and needs wrangler auth, the packages-registry precedent; the internal _rpm/_arch rows + keypair are standing owner infrastructure)\n" +
   "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (2 — the standing bootstrap set)\n" +
   "  any battery:   --force-red <check-id>    (self-test: force that check red UNRUN — exercises the failure-tail sweep; an unmatched id warns)";
 
@@ -4598,6 +4635,387 @@ const packagesSteps = (ctx) => {
   ];
 };
 
+// ---------- battery: packages-distro (the rpm + arch distro families) ----------
+
+/**
+ * The M7 distro tail (SPEC-0016 §7 — fbace73's recorded open item): the rpm
+ * (yum/dnf) and arch (pacman) families over ONE owner-scoped fixture set — a
+ * public probe repo as the owner vehicle + the run PAT (write:package via
+ * `all`). Both fixtures are GENERATED INLINE (zero local tooling — no
+ * rpmbuild, no pacman/repo-add on the probe host; the byte shapes are the
+ * landed suites' own hand-built builders):
+ *
+ *   - rpm     a hand-built minimal rpm (lead + a signature section carrying a
+ *             REAL SHA-256 digest over the main header + the payload size +
+ *             rpmbuild's alignment rule + the main header's
+ *             name/version/release/arch/summary tags + the payload): PUT
+ *             /{owner}/rpm/{group}/upload → 201, the group-less `.repo` and
+ *             the grouped `{group}.repo` render renderRpmRepositoryConfig
+ *             EXACTLY off the request origin, repomd.xml lists the three
+ *             data entries (and no updateinfo without errata),
+ *             primary.xml.gz carries the parsed tags, the GROUP-LESS
+ *             repository.key answers the armored public key while the
+ *             group-qualified path 404s (upstream registers the key
+ *             group-less only), then DELETE the package → 204 → the emptied
+ *             group's repodata is GONE at t+0.
+ *   - arch    a minimal pacman package (.PKGINFO + two file members over the
+ *             shared ustar+gzip substrate — tarBytes above IS the builder):
+ *             PUT /{owner}/arch/{repository} → 201, packages.db is ONE gzip
+ *             member whose ustar carries the {name}-{version}/files +
+ *             /desc pair (files FIRST, Mode 0o777 — os.ModePerm) with the
+ *             %FIELD% documents (FILENAME/SHA256SUM/PGPSIG/CSIZE/ISIZE/NAME/
+ *             BASE/ARCH/VERSION/DESC/LICENSE/PROVIDES/DEPENDS — MD5SUM and
+ *             the empty fields skipped), the SYMLINK-DANCE normalization
+ *             serves the IDENTICAL stored bytes under the alias spellings
+ *             (index.db.tar.gz, {repository}.db — arch.go:186-197; there is
+ *             no literal symlink, the aliases ARE the dance) and the .sig
+ *             arm answers, then DELETE the version → 204 → the
+ *             empty-repository index 404s with the EMPTY body.
+ *
+ * Self-cleaning at the protocol layer PLUS one D1 sweep arm (wrangler auth,
+ * --d1-scope — the packages-registry precedent): both families carry real
+ * protocol deletes, but the fold is upstream's exact DeletePackageFile shape
+ * — version + files go, the empty PACKAGE row stays (upstream's own cleanup
+ * sweep owns orphaned packages too) — so the empty husks sweep via D1 with
+ * the zero-rows assert (deletePackageAndReferences' cascade order, scoped to
+ * the run's probe names; the internal `_rpm`/`_arch` rows + the owner
+ * keypair are STANDING per-owner infrastructure — getOrCreateInternalPackage
+ * Version/getOrCreateOwnerKeyPair, every later run reuses them, the p0
+ * standing-fixture precedent — and the sweep never touches them).
+ * Unreferenced blob content rides the >24 h cleanup queue as documented
+ * residue. Package names are unique per run (the any-duplicate 409 would red
+ * a re-run otherwise). A red run sweeps the rows + the repo (the
+ * failureTail).
+ */
+
+// The minimal-rpm fixture builder (packages-rpm.test.ts's hand-built shape —
+// the binary header reader's exact-read walk: 96-byte lead, signature section
+// carrying a REAL SHA-256 digest over the main header + the payload size,
+// rpmbuild's alignment rule, the main header's five tags, then the payload).
+
+const RPM_TYPE_STRING = 6;
+const RPM_TYPE_INT32 = 4;
+const RPM_TYPE_I18NSTRING = 9;
+
+const rpmBe32 = (value) => {
+  const buf = Buffer.alloc(4);
+  buf.writeUInt32BE(value >>> 0, 0);
+  return buf;
+};
+
+/** One header section: intro (magic, reserved, indexCount, dataSize) + index
+ *  entries + the store, each entry's data aligned to its type width (strings
+ *  align 1 — rpmbuild's rule the reader walks). */
+const rpmHeaderSection = (tags) => {
+  const widths = new Map([[1, 1], [2, 1], [3, 2], [4, 4], [5, 8], [7, 1]]);
+  const parts = [];
+  const indexParts = [];
+  let storeSize = 0;
+  for (const tag of tags) {
+    const width = widths.get(tag.type) ?? 1;
+    const pad = (width - (storeSize % width)) % width;
+    if (pad > 0) {
+      parts.push(Buffer.alloc(pad));
+      storeSize += pad;
+    }
+    indexParts.push(Buffer.concat([rpmBe32(tag.tag), rpmBe32(tag.type), rpmBe32(storeSize), rpmBe32(tag.count)]));
+    parts.push(tag.data);
+    storeSize += tag.data.length;
+  }
+  const intro = Buffer.concat([rpmBe32(0x8eade801), rpmBe32(0), rpmBe32(tags.length), rpmBe32(storeSize)]);
+  return Buffer.concat([intro, ...indexParts, ...parts]);
+};
+
+const rpmStringTag = (tag, value) => ({ tag, type: RPM_TYPE_STRING, data: Buffer.from(`${value}\0`, "latin1"), count: 1 });
+
+/** lead || signature (SHA-256 over the main header + payload size) || pad ||
+ *  main header || payload — a well-formed minimal rpm the server's reader
+ *  parses (the suite drives this exact builder shape). */
+const buildMinimalRpm = (fields, payload) => {
+  const main = rpmHeaderSection([
+    rpmStringTag(1000, fields.name),
+    rpmStringTag(1001, fields.version),
+    rpmStringTag(1002, fields.release),
+    rpmStringTag(1022, fields.arch),
+    { tag: 1004, type: RPM_TYPE_I18NSTRING, data: Buffer.from(`${fields.summary}\0`, "latin1"), count: 1 },
+  ]);
+  const sig = rpmHeaderSection([
+    rpmStringTag(273, shaHex("sha256", main)),
+    { tag: 1007, type: RPM_TYPE_INT32, data: rpmBe32(payload.length), count: 1 },
+  ]);
+  const pad = (8 - (sig.length % 8)) % 8;
+  const lead = Buffer.alloc(96);
+  lead.set([0xed, 0xab, 0xee, 0xdb], 0);
+  return Buffer.concat([lead, sig, Buffer.alloc(pad), main, payload]);
+};
+
+// The minimal arch package fixture (the packages-arch suite's shape: ONE gzip
+// member whose ustar carries .PKGINFO + the file members).
+
+const archPkginfoFor = (name, version, architecture) => [
+  `pkgname = ${name}`,
+  `pkgbase = ${name}`,
+  `pkgver = ${version}`,
+  "pkgdesc = deploy-probes arch package probe",
+  "# comment",
+  "builddate = 1678834800",
+  "size = 8",
+  `arch = ${architecture}`,
+  "packager = deploy-probes Builder <builder@example.com>",
+  "license = MIT",
+  "depend = glibc",
+  `provides = ${name}=${version}`,
+  "",
+].join("\n");
+
+const buildMinimalArchPackage = (name, version, architecture) => gzipSync(tarBytes([
+  [".PKGINFO", Buffer.from(archPkginfoFor(name, version, architecture), "utf8")],
+  ["etc/dummy", Buffer.from("test", "utf8")],
+  ["opt/file/bin", Buffer.from("test", "utf8")],
+]));
+
+/** The ustar member walk that KEEPS the mode field (the packages-arch suite's
+ *  tarEntriesWithMode shape — the desc/files members' 0o777 is the upstream
+ *  pin). */
+const tarMembersWithMode = (bytes) => {
+  const members = [];
+  let offset = 0;
+  while (offset + 512 <= bytes.length) {
+    if (bytes[offset] === 0) break; // the end block(s)
+    const size = Number.parseInt(bytes.toString("latin1", offset + 124, offset + 136).replace(/\0.*/, "").trim(), 8);
+    const mode = Number.parseInt(bytes.toString("latin1", offset + 100, offset + 108).replace(/\0.*/, "").trim(), 8);
+    let end = offset;
+    while (end < offset + 100 && bytes[end] !== 0) end++;
+    members.push({ name: bytes.toString("latin1", offset, end), mode, data: bytes.subarray(offset + 512, offset + 512 + size) });
+    offset = offset + 512 + size + ((512 - (size % 512)) % 512);
+  }
+  return members;
+};
+
+/** `packageNames`/`rowsSwept` drive the failure-cleanup tail's D1 row sweep
+ *  (the packages-registry shape), `rpm`/`rpmGone`/`arch`/`archGone` its
+ *  best-effort protocol deletes, and the repo tracking the vehicle delete:
+ *  a red run protocol-DELETEs what the arms uploaded and have not yet
+ *  deleted, sweeps the package rows (D1 — the version fold leaves the empty
+ *  package husks, and a red-before-delete leaves a live chain), then deletes
+ *  the probe repo. */
+const packagesDistroContext = () => ({
+  user: opts.user, repo: `distro-${hexId()}`, tmp: null,
+  repoCreated: false, repoFullName: null, repoGone: false,
+  rpm: null, rpmGone: false, arch: null, archGone: false,
+  packageNames: [], rowsSwept: false,
+});
+
+const packagesDistroFailureCleanup = async (ctx) => {
+  const acts = [];
+  if (ctx.rpm !== null && ctx.rpmGone !== true) {
+    const { group, name, version, architecture } = ctx.rpm;
+    try {
+      const del = await pkgFetch(`/${ctx.user}/rpm/${group}/package/${name}/${version}/${architecture}`, { method: "DELETE" });
+      if (del.status === 204) acts.push(`rpm ${name}-${version} deleted`);
+      else {
+        leftBehind.push(`rpm package ${group}/${name}-${version} (DELETE returned ${del.status})`);
+        acts.push(`rpm ${name}-${version} LEFT BEHIND — DELETE returned ${del.status}`);
+      }
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      leftBehind.push(`rpm package ${group}/${name}-${version} (failure-cleanup tail: ${why})`);
+      acts.push(`rpm delete FAILED — ${why}`);
+    }
+  }
+  if (ctx.arch !== null && ctx.archGone !== true) {
+    const { repository, name, version, architecture } = ctx.arch;
+    try {
+      const del = await pkgFetch(`/${ctx.user}/arch/${repository}/${name}/${version}/${architecture}`, { method: "DELETE" });
+      if (del.status === 204) acts.push(`arch ${name}-${version} deleted`);
+      else {
+        leftBehind.push(`arch package ${repository}/${name}-${version} (DELETE returned ${del.status})`);
+        acts.push(`arch ${name}-${version} LEFT BEHIND — DELETE returned ${del.status}`);
+      }
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      leftBehind.push(`arch package ${repository}/${name}-${version} (failure-cleanup tail: ${why})`);
+      acts.push(`arch delete FAILED — ${why}`);
+    }
+  }
+  if (ctx.rowsSwept !== true && ctx.packageNames.length > 0) {
+    try {
+      acts.push(...(await packagesDeleteProbeRows(ctx)));
+    } catch (err) {
+      leftBehind.push(`package rows ${ctx.packageNames.join(", ")} (failure-cleanup tail: ${err instanceof Error ? err.message : String(err)})`);
+      acts.push(`package-row sweep FAILED — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (ctx.repoCreated === true && ctx.repoGone !== true) {
+    const [owner, repo] = String(ctx.repoFullName ?? `${ctx.user}/${ctx.repo}`).split("/");
+    try {
+      const out = await deleteRepo(owner, repo);
+      acts.push(typeof out === "string" ? out : out.detail);
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      leftBehind.push(`repo ${owner}/${repo} (failure-cleanup tail: DELETE threw: ${why})`);
+      acts.push(`repo ${owner}/${repo} LEFT BEHIND — DELETE threw: ${why}`);
+    }
+  }
+  if (acts.length) log(`  [tail] distro-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
+};
+
+const packagesDistroSteps = (ctx) => {
+  const group = "el9";
+  const repository = "main";
+  // Unique-per-run package names — the D-1 any-duplicate rule 409s an
+  // identical re-upload, so a re-run against a standing instance must not
+  // reuse them.
+  const rpmName = `probe-rpm-${hexId()}`;
+  const rpmVer = "1.0.0", rpmRel = "1";
+  const rpmVersion = `${rpmVer}-${rpmRel}`; // the {ver}-{rel} composite the registry indexes
+  const rpmSummary = "deploy-probes rpm probe";
+  const archName = `probe-arch-${hexId()}`;
+  const archVersion = "1.0.0-1";
+  const archLeadName = `${archName}-${archVersion}-x86_64.pkg.tar.gz`;
+  // Both probe names registered at step-list construction (the packages-
+  // registry posture): the tail's D1 sweep covers them even when a forced-red
+  // arm never uploaded (the sweep answers "already clean").
+  ctx.packageNames = [rpmName, archName];
+  const rpmBytes = buildMinimalRpm(
+    { name: rpmName, version: rpmVer, release: rpmRel, arch: "noarch", summary: rpmSummary },
+    Buffer.from(`deploy-probes rpm payload ${rpmName}\n`, "utf8"),
+  );
+  const archBytes = buildMinimalArchPackage(archName, archVersion, "x86_64");
+  return [
+    {
+      id: "distro-create-repo-201",
+      expect: `POST /api/v1/user/repos {"name":"${ctx.repo}","auto_init":true} → 201 (the owner fixture vehicle — both families are OWNER-scoped rows, the repo only proves coexistence)`,
+      run: async () => {
+        const res = await api("/user/repos", { method: "POST", body: { name: ctx.repo, private: false, auto_init: true } });
+        expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+        ctx.repoCreated = true; // the failure-cleanup tail deletes it if a later arm reds
+        ctx.repoFullName = String(res.json?.full_name ?? `${ctx.user}/${ctx.repo}`);
+        return `created ${res.json?.full_name}`;
+      },
+    },
+    {
+      id: "distro-rpm-roundtrip",
+      expect: `rpm: PUT /rpm/${group}/upload the hand-built minimal ${rpmName} (inline lead+headers fixture, no rpmbuild) → 201; GET /rpm.repo + /rpm/${group}.repo → the exact renderRpmRepositoryConfig strings off the request origin; GET repodata/repomd.xml → the three data entries (no updateinfo); GET primary.xml.gz carries the parsed tags; GET /rpm/repository.key (GROUP-LESS) → the armored key, the group-qualified path 404s; DELETE the package → 204 → the emptied group's repodata is GONE`,
+      run: async () => {
+        const origin = new URL(opts.baseUrl).origin;
+        const configBase = `${origin}/api/packages/${ctx.user}/rpm`;
+        const put = await pkgFetch(`/${ctx.user}/rpm/${group}/upload`, { method: "PUT", body: rpmBytes });
+        expect(put.status === 201, `upload status ${put.status} (expected 201): ${put.text.slice(0, 160) || "(empty body)"}`);
+        ctx.rpm = { group, name: rpmName, version: rpmVersion, architecture: "noarch" };
+        const topConfig = await pkgFetch(`/${ctx.user}/rpm.repo`);
+        expect(topConfig.status === 200, `group-less .repo status ${topConfig.status} (expected 200)`);
+        expect(String(topConfig.headers.get("content-type") ?? "").includes("text/plain"),
+          `group-less .repo content-type ${JSON.stringify(topConfig.headers.get("content-type"))} (expected text/plain)`);
+        expect(topConfig.text === `[gitea-${ctx.user}]\nname=${ctx.user} - Gitea\nbaseurl=${configBase}\nenabled=1\ngpgcheck=1\ngpgkey=${configBase}/repository.key`,
+          `group-less .repo body drift: ${JSON.stringify(topConfig.text)}`);
+        const grouped = await pkgFetch(`/${ctx.user}/rpm/${group}.repo`);
+        expect(grouped.status === 200, `grouped .repo status ${grouped.status} (expected 200)`);
+        expect(grouped.text === `[gitea-${ctx.user}-${group}]\nname=${ctx.user} - Gitea - ${group}\nbaseurl=${configBase}/${group}\nenabled=1\ngpgcheck=1\ngpgkey=${configBase}/repository.key`,
+          `grouped .repo body drift: ${JSON.stringify(grouped.text)}`);
+        const repomd = await pkgFetch(`/${ctx.user}/rpm/${group}/repodata/repomd.xml`);
+        expect(repomd.status === 200, `repomd.xml status ${repomd.status} (expected 200)`);
+        expect(repomd.text.startsWith('<?xml version="1.0" encoding="UTF-8"?>'), "repomd.xml missing the xml declaration");
+        expect(repomd.text.includes('<repomd xmlns="http://linux.duke.edu/metadata/repo" xmlns:rpm="http://linux.duke.edu/metadata/rpm">'),
+          "repomd.xml missing the repomd root element");
+        for (const type of ["primary", "filelists", "other"]) {
+          expect(repomd.text.includes(`<data type="${type}">`) && repomd.text.includes(`<location href="repodata/${type}.xml.gz"></location>`),
+            `repomd.xml missing the ${type} data entry`);
+        }
+        expect(!repomd.text.includes('<data type="updateinfo">'), "repomd.xml lists updateinfo without errata");
+        const primary = await pkgFetch(`/${ctx.user}/rpm/${group}/repodata/primary.xml.gz`);
+        expect(primary.status === 200, `primary.xml.gz status ${primary.status} (expected 200)`);
+        const primaryXml = gunzipSync(primary.bytes).toString("utf8");
+        expect(primaryXml.includes(`<name>${rpmName}</name>`) && primaryXml.includes("<arch>noarch</arch>"),
+          `primary.xml missing the ${rpmName}/noarch entry`);
+        expect(primaryXml.includes(`<version epoch="0" ver="${rpmVer}" rel="${rpmRel}"></version>`) && primaryXml.includes(`<summary>${rpmSummary}</summary>`),
+          "primary.xml missing the version/summary tags");
+        const key = await pkgFetch(`/${ctx.user}/rpm/repository.key`);
+        expect(key.status === 200, `repository.key status ${key.status} (expected 200)`);
+        expect(key.headers.get("content-type") === "application/pgp-keys",
+          `repository.key content-type ${JSON.stringify(key.headers.get("content-type"))} (expected application/pgp-keys)`);
+        expect(String(key.headers.get("content-disposition") ?? "").includes("repository.key"),
+          "repository.key disposition missing the filename");
+        expect(key.text.startsWith("-----BEGIN PGP PUBLIC KEY BLOCK-----"), "repository.key is not an armored public key");
+        const groupKey = await pkgFetch(`/${ctx.user}/rpm/${group}/repository.key`);
+        expect(groupKey.status === 404, `group-qualified repository.key status ${groupKey.status} (expected 404 — upstream registers the key GROUP-LESS only)`);
+        const del = await pkgFetch(`/${ctx.user}/rpm/${group}/package/${rpmName}/${rpmVersion}/noarch`, { method: "DELETE" });
+        expect(del.status === 204, `delete status ${del.status} (expected 204)`);
+        ctx.rpmGone = true;
+        const repomdGone = await pkgFetch(`/${ctx.user}/rpm/${group}/repodata/repomd.xml`);
+        expect(repomdGone.status === 404, `post-delete repomd.xml status ${repomdGone.status} (expected 404 — the emptied group's repodata is gone)`);
+        return `upload 201 → .repo configs exact → repomd 3 data entries → primary carries the tags → key armored (group-qualified 404) → delete 204 → repodata 404`;
+      },
+    },
+    {
+      id: "distro-arch-roundtrip",
+      expect: `arch: PUT /arch/${repository} the minimal .PKGINFO package → 201; GET /arch/${repository}/x86_64/packages.db → ONE gzip member whose ustar carries ${archName}-${archVersion}/files + /desc (files FIRST, Mode 0o777, the %FIELD% documents — MD5SUM + empty fields skipped); the symlink-dance aliases (index.db.tar.gz, ${repository}.db) serve the IDENTICAL stored bytes and the .sig arm answers; DELETE the version → 204 → the index 404s with the EMPTY body`,
+      run: async () => {
+        const put = await pkgFetch(`/${ctx.user}/arch/${repository}`, { method: "PUT", body: archBytes });
+        expect(put.status === 201, `upload status ${put.status} (expected 201): ${put.text.slice(0, 160) || "(empty body)"}`);
+        ctx.arch = { repository, name: archName, version: archVersion, architecture: "x86_64" };
+        const db = await pkgFetch(`/${ctx.user}/arch/${repository}/x86_64/packages.db`);
+        expect(db.status === 200, `packages.db status ${db.status} (expected 200)`);
+        const members = tarMembersWithMode(gunzipSync(db.bytes));
+        expect(members.map((m) => m.name).join("|") === `${archName}-${archVersion}/files|${archName}-${archVersion}/desc`,
+          `index members ${JSON.stringify(members.map((m) => m.name))} (expected the files+desc pair, files FIRST)`);
+        for (const member of members) {
+          expect(member.mode === 0o777, `member ${member.name} mode ${member.mode.toString(8)} (expected 777 — os.ModePerm)`);
+        }
+        const desc = (members[1]?.data ?? Buffer.alloc(0)).toString("utf8");
+        expect(desc.includes(`%FILENAME%\n${archLeadName}\n\n`), "desc missing %FILENAME%");
+        expect(/%SHA256SUM%\n[0-9a-f]{64}\n\n/.test(desc), "desc missing %SHA256SUM%");
+        expect(/%PGPSIG%\n[A-Za-z0-9+/=]+\n\n/.test(desc), "desc missing %PGPSIG%");
+        expect(!desc.includes("%MD5SUM%"), "desc carries %MD5SUM% (the no-MD5 posture skips it)");
+        expect(desc.includes(`%CSIZE%\n${archBytes.length}\n\n`), `desc %CSIZE% != the upload size ${archBytes.length}`);
+        expect(desc.includes("%ISIZE%\n8\n\n"), "desc %ISIZE% != 8");
+        expect(desc.includes(`%NAME%\n${archName}\n\n`) && desc.includes(`%BASE%\n${archName}\n\n`) &&
+          desc.includes("%ARCH%\nx86_64\n\n") && desc.includes(`%VERSION%\n${archVersion}\n\n`),
+          "desc missing NAME/BASE/ARCH/VERSION");
+        expect(desc.includes("%DESC%\ndeploy-probes arch package probe\n\n") && desc.includes("%LICENSE%\nMIT\n\n") &&
+          desc.includes(`%PROVIDES%\n${archName}=${archVersion}\n\n`) && desc.includes("%DEPENDS%\nglibc\n\n"),
+          "desc missing DESC/LICENSE/PROVIDES/DEPENDS");
+        expect(!desc.includes("%URL%"), "desc carries %URL% (empty fields must be skipped)");
+        expect((members[0]?.data ?? Buffer.alloc(0)).toString("utf8") === "%FILES%\netc/dummy\nopt/file/bin\n\n",
+          "files member missing the package's member list");
+        for (const alias of ["index.db.tar.gz", `${repository}.db`]) {
+          const served = await pkgFetch(`/${ctx.user}/arch/${repository}/x86_64/${alias}`);
+          expect(served.status === 200 && served.bytes.equals(db.bytes),
+            `alias ${alias} ${served.status} ${served.bytes.length}B (expected 200 with the IDENTICAL stored bytes)`);
+        }
+        const sig = await pkgFetch(`/${ctx.user}/arch/${repository}/x86_64/packages.db.sig`);
+        expect(sig.status === 200 && sig.bytes.length > 0, `packages.db.sig ${sig.status} ${sig.bytes.length}B (expected 200 non-empty)`);
+        const del = await pkgFetch(`/${ctx.user}/arch/${repository}/${archName}/${archVersion}/x86_64`, { method: "DELETE" });
+        expect(del.status === 204, `delete status ${del.status} (expected 204)`);
+        ctx.archGone = true;
+        const indexGone = await pkgFetch(`/${ctx.user}/arch/${repository}/x86_64/packages.db`);
+        expect(indexGone.status === 404 && indexGone.bytes.length === 0,
+          `post-delete packages.db ${indexGone.status} ${indexGone.bytes.length}B (expected the 404 with the EMPTY body)`);
+        return `upload 201 → packages.db tar (files+desc, 0o777, %FIELD% docs) → aliases byte-identical + .sig 200 → delete 204 → index 404 empty`;
+      },
+    },
+    {
+      id: "distro-cleanup-rows-d1",
+      expect: `the row sweep (wrangler d1 --${opts.d1Scope}; needs wrangler auth): the protocol deletes folded the versions + files but LEFT the empty package rows (upstream's exact DeletePackageFile fold — upstream's cleanup sweep owns orphans too), so the probe's package husks delete via D1 with the zero-rows assert; the internal _rpm/_arch rows + keypair are STANDING per-owner infrastructure the sweep never touches`,
+      run: async () => {
+        const acts = await packagesDeleteProbeRows(ctx);
+        ctx.rowsSwept = true; // the failure tail no-ops on a green sweep
+        return `${acts.join("; ")} — husks gone; internal rows stay`;
+      },
+    },
+    {
+      id: "distro-cleanup-repo-204",
+      expect: `DELETE /api/v1/repos/${ctx.user}/${ctx.repo} → 204 (the owner vehicle leaves; the package rows were protocol-deleted in-arm — the internal _rpm/_arch rows + keypair are STANDING per-owner infrastructure, the getOrCreate posture)`,
+      run: async () => {
+        const res = await api(`/repos/${ctx.user}/${ctx.repo}`, { method: "DELETE" });
+        expect(res.status === 204, `status ${res.status} (expected 204)`);
+        ctx.repoGone = true;
+        return "204";
+      },
+    },
+  ];
+};
+
 // ---------- battery: cleanup-audit (the D1 count shapes) ----------
 
 const AUDIT_TABLES = [
@@ -4731,11 +5149,17 @@ const BATTERIES = {
   // required — the fixwave/branch-protection precedent). The R2 content-key
   // residue is documented in the battery header.
   "packages-registry": { title: "packages registry (v1.3: generic round-trip + delete, pypi multipart → simple index, npm publish → packument → unpublish, helm chart → index.yaml, maven pom/jar → metadata.xml, nuget V3 publish (X-NuGet-ApiKey, normalized version) → registration/leaf/download + V2 Edmx/Packages(Id=..) → the management purge, then the D1 row sweep + repo delete)", context: packagesContext, steps: packagesSteps, failureTail: packagesFailureCleanup },
+  // Independent (the fixwave posture shape — one red family never hides the
+  // other): both distro families are OWNER-scoped (the probe repo is only the
+  // coexistence vehicle), so the arms do not chain. The M7 distro tail
+  // (fbace73's recorded open item): inline hand-built fixtures, protocol-layer
+  // deletes, standing internal rows (see the battery header).
+  "packages-distro": { title: "packages distro tail (M7: rpm hand-built fixture → .repo configs + repomd.xml + primary.xml.gz + the group-less repository.key → delete → repodata gone, arch .PKGINFO package → packages.db tar (files+desc, 0o777) + the symlink-dance aliases + .sig → delete → index 404 empty, then the D1 husk row sweep + repo delete)", context: packagesDistroContext, steps: packagesDistroSteps, failureTail: packagesDistroFailureCleanup, independent: true },
   // Independent counts — one red count never hides the rest of the shape.
   "cleanup-audit": { title: "post-run D1 count shapes", context: () => ({}), steps: auditSteps, independent: true },
 };
 
-const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "cleanup-audit"] : [opts.battery];
+const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "cleanup-audit"] : [opts.battery];
 
 // ---------- dry-run ----------
 
