@@ -1205,6 +1205,64 @@ is a dispatch call, not a design one. The §7 M3 row's **L** sizing holds; its
 risk note changes from "port-fidelity risk" to "fidelity is
 conformance-testable against actionslib's own testdata" (§D4).
 
+**§D5 AS-BUILT (2026-10-31, the E-tier call-site wave).** All three tiers
+landed and wired: P (`0e9b0c1`), S (`667d349`), E core (`240d67d`), and the
+call-sites in `cf-gitea:apps/worker/src/services/actions/trigger.ts`:
+
+- **E2 (§D2 #1) run-name** — `insertTriggeredRunSplit` interpolates the raw
+  `run-name` through `newServerInterpeter` (github/vars/inputs; no
+  strategy/matrix/needs — jobparser.go:101's env) AFTER the run row insert
+  so `github.run_id`/`run_number` are real (run.go:80-89's own order);
+  `jobs[0].RunName != ""` lifts the title (run.go:121-127). An evaluation
+  error aborts the insert with the upstream outcome (no run row) via a
+  compensating delete + guarded counter rollback — the D1 substitute for
+  upstream's single transaction. NOT wired with it: the combo
+  name/runs-on/continue-on-error interpolation (§D2 #2) — those ride the
+  matrix arm below; such jobs insert with the raw strings (documented).
+- **E3 (§D2 #8) the job `if:` gate** — `decideJobIfAtInsert` (helper.go:132-144:
+  waiting jobs only; empty → implicit success; false/invalid → SKIPPED) and
+  the emitter gate in `checkJobsOfRun` (job_emitter.go:589-596) with
+  `evaluateJobIfExpression` (model.go:489-498): the restricted-context
+  defensive re-check + `EvalBool` under DefaultStatusCheckSuccess; needs
+  results + outputs per `findJobNeedsAndFillJobResults` (helper.go:196-226);
+  `gitCtx["job"] = ""` (helper.go:171). Invalid `if:` → the
+  `upsertJobErrorSummary` row ("Error when evaluating `if` for job `X`",
+  helper.go:152-156) + SKIPPED — the D5 "late, not insert-time" posture.
+  A skipped/failed insert kicks the pass (run.go:172-178's
+  needPostCommitEmit).
+- **E4 (§D2 #4) workflow-level concurrency at run creation** — the raw
+  node read (model.go:288-293 minus the model validation), the fill-model
+  evaluation (concurrency.go:19-44: group/cancel over the string-level
+  evaluator — exact on the two-scalar RawConcurrency shape,
+  workflow.go:1201-1228; the bare scalar decodes as the RawExpression arm),
+  the cancel arms (models/actions/run.go:407-426 + run_job.go:804-832:
+  claimed jobs through the graceful StopTask handshake, unclaimed through
+  the task_id=0 CAS with UpdateRunJob's refreshRunStatus piggyback,
+  run_job.go:542), the block gate (clear_tasks.go:121-134), and the
+  emitter's blocked-run re-check + wake arm (job_emitter.go:243-255,
+  :181-234). **Job-level concurrency (§D2 #5-6) STAGES**: its
+  `newJobEvaluator` (model.go:297-303) reads the parsed combo's
+  strategy+matrix; the raw node stores (run.go:251-256) with
+  `is_concurrency_evaluated=false`.
+- **E5 (§D2 #7) deferred-matrix expansion — STAGED, exactly-what-is-missing**:
+  the YAML workflow model port (actionslib `pkg/model` + in-tree
+  jobparser's Job/Strategy decode, `Strategy.resolve`, `MatrixCombinations`/
+  `buildMatrixCombos`, `ExpandMatrixWithNeeds`) plus expreval's
+  `EvaluateYamlNode` (evaluator.go:96-260 — the seam the landed
+  expression-eval records in its evaluator.ts header). Until it lands the
+  INSERT GATE is matrix-shaped: a workflow whose jobs carry
+  `strategy.matrix` inserts NO run (upstream's static combos insert N jobs
+  at Parse, jobparser.go:112-126; half-wiring a placeholder-only insert
+  would diverge from the run's published shape — rejected). Every other
+  `${{` surface now flows; step-level expressions ride the payload
+  verbatim (§D3, runner-side upstream too).
+- **Run numbering** — the HANDOFF closed: `repo_counters.run_index`
+  (migration 0050, drizzle-generated) + `nextRunIndex` as the atomic
+  counter CAS (bootstrap-at-max → never-rewind repair → bump+read, one D1
+  batch = one transaction; the §4.5 mapping). The two max+1 writers outside
+  the counter (invalid-workflow runs, repo-actions routes) keep
+  UNIQUE(repo_id, index) as their backstop.
+
 ### D6. Downstream notes this record corrects or arms
 
 - The board row P1-1's "OQ-1 sits in front of all of it" softens to "OQ-1's

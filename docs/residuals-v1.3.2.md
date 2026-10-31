@@ -186,7 +186,22 @@ board row flips — this closes a flag, not a listed residual.
    `${{`-byte-scan classification at `workflows.go:134` is the coverage
    gate), with the expression-ful gap documented until E lands. Size:
    **L** (one wave, or split into P+S + E dispatch units — a dispatch call,
-   per §D5).
+   per §D5). **AS-BUILT 2026-10-31: all three tiers landed** — P
+   (`0e9b0c1`), S (`667d349`), E evaluator core (`240d67d`), and the E-tier
+   call-sites wired in `trigger.ts` (run-name at insert, the job `if:` gate
+   at insert+emitter with the invalid-`if:` job summaries, the
+   workflow-level concurrency gate at run creation incl. the cancel arms
+   and the blocked-run wake; `repo_counters.run_index` CAS replaces the
+   MAX+1 interim; the static-invalid → FAILED-run push seam exercised
+   end-to-end). Remaining STAGED inside this row: the YAML workflow model
+   port (actionslib `pkg/model` + jobparser's Job/Strategy decode,
+   `Strategy.resolve`/`MatrixCombinations`/`buildMatrixCombos` +
+   expreval's `EvaluateYamlNode`) carries the matrix arms — static combos,
+   deferred expansion, the combo name/runs-on/continue-on-error
+   interpolation, and the job-level concurrency evaluation — so a
+   `strategy.matrix` workflow still inserts NO run (the narrowed insert
+   gate, module-header documented); schedules (§1.4), the other notifier
+   hooks, and the reusable-workflow family keep their own staged rows.
 
 2. **C5's run-mutation remainder: rerun + rerun-failed — LANDED
    (`613aa31`), including the v1.3.1 artifact-inheritance addition.** The

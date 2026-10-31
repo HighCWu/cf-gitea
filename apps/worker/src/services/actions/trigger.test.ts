@@ -1,15 +1,16 @@
 /**
- * The M3-P trigger suite (SPEC-0012 §6.4's P slice): the glob +
- * workflowpattern differential (upstream's OWN vector table —
- * workflowpattern_test.go TestMatchPattern, ported row-for-row), the `on:`
+ * The M3 trigger suite (SPEC-0012 §6.4): the P slice (the glob +
+ * workflowpattern differential over upstream's OWN vector table —
+ * workflowpattern_test.go TestMatchPattern, ported row-for-row, the `on:`
  * event extraction, the push matchers, the [skip ci] scan on BOTH surfaces,
- * the 1 MiB enumeration cap + first-existing-dir rule, the `${{` insert
- * gate, InsertRun mechanics (run/attempt/job rows, the per-repo index,
- * commit-status creation, the task-version arms), the emitter's needs-graph
- * ordering (implicit-success skip cascade, continue-on-error need, the
- * aggregate refresh, the version wake), the claim-payload `if: always()`
+ * the 1 MiB enumeration cap + first-existing-dir rule, InsertRun mechanics,
+ * the emitter's needs-graph ordering, the claim-payload `if: always()`
  * rewrite, and the live receive-pack → rows end-to-end arm over the
- * entrypoint's engine composition.
+ * entrypoint's engine composition) plus the E-tier call-site arms (§D5
+ * E2/E3/E4): run-name interpolation, the job `if:` gate at insert and
+ * emitter (the invalid-`if:` summaries), the workflow-level concurrency
+ * gate, the repo_counters.run_index CAS, and the static-invalid →
+ * FAILED-run seam through the real receive-pack harness.
  */
 
 import { applyD1Migrations } from "cloudflare:test";
@@ -20,8 +21,21 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { parseDocument } from "yaml";
 
-import { actionRuns, actionRunJobs, actionRunAttempts, commitStatuses, repoUnits, repositories, users } from "../../db/schema";
 import {
+  actionRunJobSummaries,
+  actionRuns,
+  actionRunJobs,
+  actionRunAttempts,
+  actionTaskOutputs,
+  actionVariables,
+  commitStatuses,
+  repoCounters,
+  repoUnits,
+  repositories,
+  users,
+} from "../../db/schema";
+import {
+  ACTION_STATUS_BLOCKED,
   ACTION_STATUS_CANCELLED,
   ACTION_STATUS_FAILURE,
   ACTION_STATUS_PENDING,
@@ -42,13 +56,17 @@ import {
   createSkippedCommitStatusForFilteredWorkflow,
   createWorkflowCommitStatus,
   detectWorkflowMatch,
+  evaluateJobIfExpression,
+  evaluateRunConcurrency,
   filterPatterns,
   getEventsFromContent,
   insertTriggeredRun,
   isWorkflowPath,
   listWorkflows,
+  marshalRawConcurrency,
   matchPushEvent,
   parseRawOn,
+  readWorkflowRawConcurrency,
   runnerWorkflowPayload,
   shouldEventCreateCommitStatus,
   skipPatterns,
@@ -75,6 +93,8 @@ const CLEANUP_TABLES = [
   "action_runs",
   "action_run_jobs",
   "action_run_attempts",
+  "action_run_job_summaries",
+  "action_task_outputs",
   "action_tasks",
   "action_tasks_versions",
   "protected_branches",
@@ -452,6 +472,103 @@ jobs:
     expect(split[0]?.maxParallel).toBe(2);
     expect(split[0]?.continueOnError).toBe(true);
   });
+
+  it("the E-tier reads: run-name, job rawConcurrency, hasMatrix (the E5 gate flag)", () => {
+    const split = splitWorkflowPayloads(
+      `run-name: Deploy \${{ github.ref_name }}
+on: push
+concurrency:
+  group: prod
+  cancel-in-progress: true
+jobs:
+  build:
+    concurrency:
+      group: build-\${{ github.ref }}
+    strategy:
+      matrix:
+        os: [linux, mac]
+    runs-on: x
+    steps:
+      - run: y
+  solo:
+    runs-on: x
+    steps:
+      - run: y
+`,
+    );
+    // the run-name rides RAW (the interpolation happens at insert, after
+    // run.ID exists — run.go's insert-before-parse order)
+    expect(split.every((j) => j.runName === "Deploy ${{ github.ref_name }}")).toBe(true);
+    // the workflow-level concurrency is NOT per-job
+    expect(split[0]?.rawConcurrency).toBe("group: build-${{ github.ref }}\n");
+    // the matrix job flags (the staged E5 gate)
+    expect(split[0]?.hasMatrix).toBe(true);
+    expect(split[1]?.hasMatrix).toBe(false);
+    expect(split[1]?.rawConcurrency).toBe("");
+    // `matrix:` null is not a matrix (the empty-strategy shape upstream
+    // resolves to one combo)
+    const nullMatrix = splitWorkflowPayloads("on: push\njobs:\n  a:\n    strategy:\n      matrix:\n    runs-on: x\n    steps:\n      - run: y\n");
+    expect(nullMatrix[0]?.hasMatrix).toBe(false);
+  });
+
+  it("a bool `if:` decodes to its text (the RawConcurrency string-field contract)", () => {
+    const split = splitWorkflowPayloads("on: push\njobs:\n  a:\n    if: false\n    runs-on: x\n    steps:\n      - run: y\n");
+    expect(split[0]?.rawIf).toBe("false");
+  });
+
+  it("readWorkflowRawConcurrency + marshalRawConcurrency (model.go:288-293, workflow.go:1201-1228)", () => {
+    expect(readWorkflowRawConcurrency("on: push\njobs: {}\n")).toBeNull();
+    // mapping form: group + cancel-in-progress (bool → its text)
+    expect(readWorkflowRawConcurrency("concurrency:\n  group: prod\n  cancel-in-progress: true\njobs: {}\n")).toEqual({
+      group: "prod",
+      cancelInProgress: "true",
+      rawExpression: "",
+    });
+    // bare scalar → the RawExpression arm (UnmarshalYAML tries the string first)
+    expect(readWorkflowRawConcurrency("concurrency: deploy-main\njobs: {}\n")).toEqual({
+      group: "",
+      cancelInProgress: "",
+      rawExpression: "deploy-main",
+    });
+    // marshal: omitempty struct order; the expression renders as a plain scalar
+    expect(marshalRawConcurrency({ group: "prod", cancelInProgress: "true", rawExpression: "" })).toBe('group: prod\ncancel-in-progress: "true"\n');
+    expect(marshalRawConcurrency({ group: "", cancelInProgress: "", rawExpression: "${{ github.ref }}-build" })).toBe("${{ github.ref }}-build\n");
+  });
+
+  it("evaluateRunConcurrency interpolates the server env (concurrency.go:32-35's nil-job set)", () => {
+    const github = { ref: "refs/heads/main", ref_name: "main" };
+    expect(evaluateRunConcurrency(github, { group: "prod", cancelInProgress: "false", rawExpression: "" }, {})).toEqual({
+      group: "prod",
+      cancel: false,
+    });
+    expect(evaluateRunConcurrency(github, { group: "deploy-${{ github.ref_name }}", cancelInProgress: "true", rawExpression: "" }, {})).toEqual({
+      group: "deploy-main",
+      cancel: true,
+    });
+    // the whole-value expression re-decodes as the RawExpression arm (no cancel)
+    expect(evaluateRunConcurrency(github, { group: "", cancelInProgress: "", rawExpression: "${{ github.ref_name }}-build" }, {})).toEqual({
+      group: "main-build",
+      cancel: false,
+    });
+    // YAML 1.2 truthiness only (ParseYamlBool)
+    expect(evaluateRunConcurrency(github, { group: "g", cancelInProgress: "yes", rawExpression: "" }, {}).cancel).toBe(false);
+  });
+
+  it("evaluateJobIfExpression pins the restricted-context re-check and the verdicts", () => {
+    const github = { ref_name: "main", env: { FORBIDDEN: "x" } };
+    // success verdict under the implicit success default
+    expect(evaluateJobIfExpression({ jobId: "b", rawIf: "success()", githubContext: github, results: { b: {} }, vars: undefined })).toEqual({
+      value: true,
+      invalidSummary: null,
+    });
+    // the defensive unavailableContext arm (a stored job before validation)
+    expect(evaluateJobIfExpression({ jobId: "b", rawIf: "${{ env.FORBIDDEN }}", githubContext: github, results: {}, vars: undefined })).toEqual({
+      value: false,
+      invalidSummary: "job b: Unrecognized named-value: 'env', update the workflow and trigger a new run",
+    });
+    // a bare condition reads as one expression (IfExpression's wrap)
+    expect(evaluateJobIfExpression({ jobId: "b", rawIf: "false", githubContext: github, results: {}, vars: undefined }).value).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -613,12 +730,263 @@ describe("insertTriggeredRun (InsertRun rows + index + statuses)", () => {
     expect(await getTasksVersionByScope(env.DB, 0, REPO_ID)).toBe(1);
   });
 
-  it("the per-repo index increments across runs (the HANDOFF interim allocator)", async () => {
+  it("the per-repo index rides the repo_counters.run_index CAS (GetNextResourceIndex's named-sequence shape)", async () => {
     await seedRepo();
     const first = await insertTriggeredRun(env.DB, runInput(".github/workflows/a.yml"), "on: push\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: y\n");
     const second = await insertTriggeredRun(env.DB, runInput(".github/workflows/b.yml"), "on: push\njobs:\n  b:\n    runs-on: x\n    steps:\n      - run: y\n");
     expect(first.run.index).toBe(1);
     expect(second.run.index).toBe(2);
+    const counters = await db().select().from(repoCounters);
+    expect(counters).toHaveLength(1);
+    expect(counters[0]?.runIndex).toBe(2);
+    expect(counters[0]?.issueIndex).toBe(0);
+  });
+
+  it("a stale counter self-heals to the repo max before the bump (the never-rewind repair)", async () => {
+    await seedRepo();
+    const first = await insertTriggeredRun(env.DB, runInput(".github/workflows/a.yml"), "on: push\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: y\n");
+    expect(first.run.index).toBe(1);
+    // simulate a pre-column repo: the counter at 0 while a run row sits at 1
+    await db().update(repoCounters).set({ runIndex: 0 }).where(eq(repoCounters.repoId, REPO_ID));
+    const second = await insertTriggeredRun(env.DB, runInput(".github/workflows/b.yml"), "on: push\njobs:\n  b:\n    runs-on: x\n    steps:\n      - run: y\n");
+    expect(second.run.index).toBe(2);
+    // a counter AHEAD of the rows never rewinds either
+    await db().update(repoCounters).set({ runIndex: 9 }).where(eq(repoCounters.repoId, REPO_ID));
+    const third = await insertTriggeredRun(env.DB, runInput(".github/workflows/c.yml"), "on: push\njobs:\n  c:\n    runs-on: x\n    steps:\n      - run: y\n");
+    expect(third.run.index).toBe(10);
+  });
+
+  it("E2 — a run-name interpolates over the commit-subject title (github/vars/inputs)", async () => {
+    await seedRepo();
+    const { run } = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/deploy.yml"),
+      `run-name: Deploy \${{ github.ref_name }} by \${{ github.actor }}
+on: push
+jobs:
+  build:
+    runs-on: x
+    steps:
+      - run: y
+`,
+    );
+    expect(run.title).toBe("Deploy main by alice");
+    // vars come from the action_variables store (GetVariablesOfRun's merge);
+    // github.event reads the stored payload
+    await db().insert(actionVariables).values({ ownerId: 0, repoId: REPO_ID, name: "ENV_NAME", data: "production", createdAt: new Date(0), updatedAt: new Date(0) });
+    const withVars = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/env.yml"),
+      `run-name: "[\${{ vars.ENV_NAME }}] \${{ github.event.head_commit.id }}"
+on: push
+jobs:
+  build:
+    runs-on: x
+    steps:
+      - run: y
+`,
+    );
+    expect(withVars.run.title).toBe(`[production] ${HEAD}`);
+  });
+
+  it("E2 — a run-name evaluation error aborts the insert (no run; the counter rolls back)", async () => {
+    await seedRepo();
+    await expect(
+      insertTriggeredRun(
+        env.DB,
+        runInput(".github/workflows/bad.yml"),
+        `run-name: "\${{ fromJSON('not json') }}"
+on: push
+jobs:
+  build:
+    runs-on: x
+    steps:
+      - run: y
+`,
+      ),
+    ).rejects.toThrow(/interpolate run-name/);
+    expect(await db().select().from(actionRuns)).toHaveLength(0);
+    expect(await db().select().from(actionRunAttempts)).toHaveLength(0);
+    // the consumed index rolled back — the next run is 1 again
+    const next = await insertTriggeredRun(env.DB, runInput(".github/workflows/ok.yml"), "on: push\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: y\n");
+    expect(next.run.index).toBe(1);
+  });
+
+  it("E4 — a literal workflow-level concurrency blocks the second run of the group", async () => {
+    await seedRepo();
+    const wf = (cancel: string) => `on: push\nconcurrency:\n  group: prod\n  cancel-in-progress: ${cancel}\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: y\n`;
+    const first = await insertTriggeredRun(env.DB, runInput(".github/workflows/one.yml"), wf("false"));
+    expect(first.run.status).toBe(ACTION_STATUS_WAITING);
+    expect((await db().select().from(actionRunAttempts))[0]?.concurrencyGroup).toBe("prod");
+
+    const second = await insertTriggeredRun(env.DB, runInput(".github/workflows/two.yml"), wf("false"));
+    expect(second.run.status).toBe(ACTION_STATUS_BLOCKED);
+    expect(second.jobs[0]?.status).toBe(ACTION_STATUS_BLOCKED);
+    // the blocked run never wakes a runner
+    expect(await getTasksVersionByScope(env.DB, 0, REPO_ID)).toBe(1);
+    // rawConcurrency stored (run.go:83-89)
+    const runRow = (await db().select().from(actionRuns).where(eq(actionRuns.id, second.run.id)))[0];
+    expect(runRow?.rawConcurrency).toContain("group: prod");
+  });
+
+  it("E4 — cancel-in-progress clears the group's unfinished members and starts", async () => {
+    await seedRepo();
+    const wf = (cancel: string) => `on: push\nconcurrency:\n  group: prod\n  cancel-in-progress: ${cancel}\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: y\n`;
+    const first = await insertTriggeredRun(env.DB, runInput(".github/workflows/one.yml"), wf("false"));
+    const blocker = await insertTriggeredRun(env.DB, runInput(".github/workflows/two.yml"), wf("false"));
+    expect(blocker.run.status).toBe(ACTION_STATUS_BLOCKED);
+
+    const third = await insertTriggeredRun(env.DB, runInput(".github/workflows/three.yml"), wf("true"));
+    // cancel=true clears the unfinished entries (the holder + the blocked
+    // waiter — getConcurrencyEntriesToReplace's unfinished arm) and starts
+    expect(third.run.status).toBe(ACTION_STATUS_WAITING);
+    const byRun = await db().select().from(actionRunJobs);
+    expect(byRun.filter((j) => j.runId === first.run.id).every((j) => j.status === ACTION_STATUS_CANCELLED)).toBe(true);
+    const blockerJobs = byRun.filter((j) => j.runId === blocker.run.id);
+    expect(blockerJobs.every((j) => j.status === ACTION_STATUS_CANCELLED)).toBe(true);
+    const thirdJobs = byRun.filter((j) => j.runId === third.run.id);
+    expect(thirdJobs.every((j) => j.status === ACTION_STATUS_WAITING)).toBe(true);
+    // the cancelled runs settled to cancelled aggregates (the
+    // UpdateRunJob refresh piggyback, run_job.go:542)
+    const runRows = await db().select().from(actionRuns);
+    expect(runRows.find((r) => r.id === first.run.id)?.status).toBe(ACTION_STATUS_CANCELLED);
+    expect(runRows.find((r) => r.id === blocker.run.id)?.status).toBe(ACTION_STATUS_CANCELLED);
+    expect(runRows.find((r) => r.id === third.run.id)?.status).toBe(ACTION_STATUS_WAITING);
+  });
+
+  it("E4 — a concurrency evaluation error aborts the insert (no run)", async () => {
+    await seedRepo();
+    await expect(
+      insertTriggeredRun(
+        env.DB,
+        runInput(".github/workflows/bad.yml"),
+        `on: push
+concurrency:
+  group: "\${{ fromJSON('nope[') }}"
+jobs:
+  a:
+    runs-on: x
+    steps:
+      - run: y
+`,
+      ),
+    ).rejects.toThrow(/evaluate concurrency/);
+    expect(await db().select().from(actionRuns)).toHaveLength(0);
+  });
+
+  it("E3 — decideJobIf: a false `if:` inserts the job SKIPPED; a passing one waits", async () => {
+    await seedRepo();
+    const { jobs } = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/ci.yml"),
+      `on: push
+jobs:
+  never:
+    if: \${{ github.ref_name == 'nope' }}
+    runs-on: x
+    steps:
+      - run: y
+  always:
+    if: \${{ always() }}
+    runs-on: x
+    steps:
+      - run: y
+  bare-false:
+    if: false
+    runs-on: x
+    steps:
+      - run: y
+`,
+    );
+    const byId = Object.fromEntries(jobs.map((j) => [j.jobId, j.status]));
+    expect(byId["never"]).toBe(ACTION_STATUS_SKIPPED);
+    expect(byId["always"]).toBe(ACTION_STATUS_WAITING);
+    expect(byId["bare-false"]).toBe(ACTION_STATUS_SKIPPED);
+  });
+
+  it("E3 — an invalid `if:` skips the job and writes its summary (helper.go:123-156)", async () => {
+    await seedRepo();
+    const { run, jobs } = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/ci.yml"),
+      "on: push\njobs:\n  bad:\n    if: ${{ env.FORBIDDEN }}\n    runs-on: x\n    steps:\n      - run: y\n",
+    );
+    expect(jobs[0]?.status).toBe(ACTION_STATUS_SKIPPED);
+    const summaries = await db().select().from(actionRunJobSummaries);
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]?.jobId).toBe(jobs[0]?.id);
+    expect(summaries[0]?.stepIndex).toBe(0);
+    expect(summaries[0]?.content).toContain("Error when evaluating `if` for job `bad`.");
+    expect(summaries[0]?.content).toContain("Unrecognized named-value: 'env'");
+    expect(summaries[0]?.contentType).toBe("text/markdown");
+    // the run settles skipped (all jobs skipped)
+    const runRow = (await db().select().from(actionRuns).where(eq(actionRuns.id, run.id)))[0];
+    expect(runRow?.status).toBe(ACTION_STATUS_SKIPPED);
+  });
+
+  it("E3 — a runtime evaluation error in `if:` takes the same invalid-summary arm (resolveJobIf's wrap)", async () => {
+    await seedRepo();
+    const { jobs } = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/ci.yml"),
+      `on: push
+jobs:
+  bad:
+    if: "\${{ fromJSON('not json') }}"
+    runs-on: x
+    steps:
+      - run: y
+`,
+    );
+    expect(jobs[0]?.status).toBe(ACTION_STATUS_SKIPPED);
+    const summaries = await db().select().from(actionRunJobSummaries);
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]?.content).toContain("Error when evaluating `if` for job `bad`.");
+  });
+
+  it("E3 — a skipped insert kick resolves the dependents (needPostCommitEmit, run.go:172-178)", async () => {
+    await seedRepo();
+    const { jobs } = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/ci.yml"),
+      `on: push
+jobs:
+  gate:
+    if: "\${{ false }}"
+    runs-on: x
+    steps:
+      - run: y
+  dependent:
+    needs: gate
+    runs-on: x
+    steps:
+      - run: y
+`,
+    );
+    const byId = Object.fromEntries(jobs.map((j) => [j.jobId, j.status]));
+    // the insert tail ran the emitter: gate skipped → dependent skipped
+    expect(byId["gate"]).toBe(ACTION_STATUS_SKIPPED);
+    expect(byId["dependent"]).toBe(ACTION_STATUS_SKIPPED);
+  });
+
+  it("E3 (staged surface) — a job-level concurrency node stores raw and unevaluated", async () => {
+    await seedRepo();
+    const { jobs } = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/ci.yml"),
+      `on: push
+jobs:
+  a:
+    concurrency:
+      group: build-\${{ github.ref }}
+    runs-on: x
+    steps:
+      - run: y
+`,
+    );
+    expect(jobs[0]?.status).toBe(ACTION_STATUS_WAITING); // no gate on the job level yet
+    expect(jobs[0]?.rawConcurrency).toContain("group: build-${{ github.ref }}");
+    expect(jobs[0]?.isConcurrencyEvaluated).toBe(false);
   });
 
   it("an all-pending run (every job has needs) skips the task-version bump", async () => {
@@ -727,6 +1095,123 @@ describe("checkJobsOfRun (needs ordering + skip cascade + aggregates)", () => {
     await checkJobsOfRun(env.DB, run.id);
     const test = (await db().select().from(actionRunJobs)).find((j) => j.jobId === "test");
     expect(test?.status).toBe(ACTION_STATUS_PENDING);
+  });
+
+  it("E3 — the emitter evaluates a non-empty `if:` against needs results and outputs", async () => {
+    await seedRepo();
+    const { run, jobs } = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/ci.yml"),
+      `on: push
+jobs:
+  build:
+    runs-on: x
+    steps:
+      - run: make
+  on-ok:
+    needs: build
+    if: \${{ needs.build.result == 'success' }}
+    runs-on: x
+    steps:
+      - run: y
+  on-fail:
+    needs: build
+    if: "\${{ failure() }}"
+    runs-on: x
+    steps:
+      - run: y
+  on-output:
+    needs: build
+    if: \${{ needs.build.outputs.tag == 'v1' }}
+    runs-on: x
+    steps:
+      - run: y
+`,
+    );
+    const build = jobs.find((j) => j.jobId === "build")!;
+    const now = new Date();
+    await db().update(actionRunJobs).set({ status: ACTION_STATUS_SUCCESS, started: now, stopped: now }).where(eq(actionRunJobs.id, build.id));
+    // build's task outputs feed needs.build.outputs
+    await db().update(actionRunJobs).set({ taskId: 777 }).where(eq(actionRunJobs.id, build.id));
+    await db().insert(actionTaskOutputs).values({ taskId: 777, outputKey: "tag", outputValue: "v1" });
+
+    await checkJobsOfRun(env.DB, run.id);
+
+    const byId = Object.fromEntries((await db().select().from(actionRunJobs)).map((j) => [j.jobId, j.status]));
+    expect(byId["on-ok"]).toBe(ACTION_STATUS_WAITING);
+    expect(byId["on-fail"]).toBe(ACTION_STATUS_SKIPPED); // nothing failed → failure() is false
+    expect(byId["on-output"]).toBe(ACTION_STATUS_WAITING);
+    expect(await db().select().from(actionRunJobSummaries)).toHaveLength(0);
+  });
+
+  it("E3 — an invalid `if:` at the emitter writes the summary and skips (evaluateJobIf helper.go:123-131)", async () => {
+    await seedRepo();
+    const { run, jobs } = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/ci.yml"),
+      `on: push
+jobs:
+  build:
+    runs-on: x
+    steps:
+      - run: make
+  bad:
+    needs: build
+    if: "\${{ fromJSON('oops[') }}"
+    runs-on: x
+    steps:
+      - run: y
+`,
+    );
+    const build = jobs.find((j) => j.jobId === "build")!;
+    const now = new Date();
+    await db().update(actionRunJobs).set({ status: ACTION_STATUS_SUCCESS, started: now, stopped: now }).where(eq(actionRunJobs.id, build.id));
+
+    await checkJobsOfRun(env.DB, run.id);
+
+    const byId = Object.fromEntries((await db().select().from(actionRunJobs)).map((j) => [j.jobId, j.status]));
+    expect(byId["bad"]).toBe(ACTION_STATUS_SKIPPED);
+    const summaries = await db().select().from(actionRunJobSummaries);
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]?.content).toContain("Error when evaluating `if` for job `bad`.");
+    // the run aggregates: success + skipped → success
+    const runRow = (await db().select().from(actionRuns).where(eq(actionRuns.id, run.id)))[0];
+    expect(runRow?.status).toBe(ACTION_STATUS_SUCCESS);
+  });
+
+  it("E3 — a failed need skips a bare-`if:` dependent and an if-true dependent still runs", async () => {
+    await seedRepo();
+    const { run, jobs } = await insertTriggeredRun(
+      env.DB,
+      runInput(".github/workflows/ci.yml"),
+      `on: push
+jobs:
+  build:
+    runs-on: x
+    steps:
+      - run: make
+  implicit:
+    needs: build
+    runs-on: x
+    steps:
+      - run: y
+  explicit-always:
+    needs: build
+    if: "\${{ always() }}"
+    runs-on: x
+    steps:
+      - run: y
+`,
+    );
+    const build = jobs.find((j) => j.jobId === "build")!;
+    const now = new Date();
+    await db().update(actionRunJobs).set({ status: ACTION_STATUS_FAILURE, started: now, stopped: now }).where(eq(actionRunJobs.id, build.id));
+
+    await checkJobsOfRun(env.DB, run.id);
+
+    const byId = Object.fromEntries((await db().select().from(actionRunJobs)).map((j) => [j.jobId, j.status]));
+    expect(byId["implicit"]).toBe(ACTION_STATUS_SKIPPED);
+    expect(byId["explicit-always"]).toBe(ACTION_STATUS_WAITING);
   });
 
   it("aggregateJobStatus pins the precedence (run_job.go:509-554)", () => {
@@ -1159,7 +1644,7 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
     expect(await db().select().from(commitStatuses)).toHaveLength(0);
   });
 
-  it("an expression-ful workflow waits for the E tier (the ${{ gate) — no run", async () => {
+  it("an expression-ful `if:` now decides (the E tier): always() inserts and starts the job", async () => {
     const { owner, slug, userId } = await seedE2eRepo("expr");
     const token = (await mintFor(userId, "t-expr", "write:repository")).plaintext;
     const wf = 'name: CI\non: push\njobs:\n  build:\n    if: ${{ always() }}\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n';
@@ -1169,7 +1654,96 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
     const tip = tips[0]!;
     const response = await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tip }], pack, token);
     expect(response.status).toBe(200);
+    const runs = await db().select().from(actionRuns);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.title).toBe("seed"); // no run-name → the commit subject stands
+    const jobRows = await db().select().from(actionRunJobs);
+    expect(jobRows[0]?.status).toBe(ACTION_STATUS_WAITING);
+  });
+
+  it("a run-name renders through the evaluator end-to-end", async () => {
+    const { owner, slug, userId } = await seedE2eRepo("runname");
+    const token = (await mintFor(userId, "t-run", "write:repository")).plaintext;
+    const wf = 'run-name: "CI for ${{ github.ref_name }}"\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n';
+    const { tips, pack } = await buildChainPack(null, [
+      { message: "seed", files: [{ path: ".gitea/workflows/ci.yml", content: wf }] },
+    ]);
+    const tip = tips[0]!;
+    const response = await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tip }], pack, token);
+    expect(response.status).toBe(200);
+    const runs = await db().select().from(actionRuns);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.title).toBe("CI for main");
+  });
+
+  it("a matrix workflow waits for the model port (the E5 gate) — no run", async () => {
+    const { owner, slug, userId } = await seedE2eRepo("matrix");
+    const token = (await mintFor(userId, "t-matrix", "write:repository")).plaintext;
+    const wf =
+      "name: CI\non: push\njobs:\n  build:\n    strategy:\n      matrix:\n        os: [linux, mac]\n    runs-on: ${{ matrix.os }}\n    steps:\n      - run: make\n";
+    const { tips, pack } = await buildChainPack(null, [
+      { message: "seed", files: [{ path: ".gitea/workflows/ci.yml", content: wf }] },
+    ]);
+    const tip = tips[0]!;
+    const response = await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tip }], pack, token);
+    expect(response.status).toBe(200);
     expect(await db().select().from(actionRuns)).toHaveLength(0);
+  });
+
+  it("the static-validation seam: a push landing a context-violating workflow records its FAILED run (error verbatim) while a clean workflow still matches", async () => {
+    const { owner, slug, userId } = await seedE2eRepo("seam");
+    const token = (await mintFor(userId, "t-seam", "write:repository")).plaintext;
+    // bad.yml reads `env` in a job `if:` — jobConditionContexts excludes it
+    // (validate.go:19-20); good.yml is plain push CI.
+    const badWf = 'name: Bad\non: push\njobs:\n  bad:\n    if: ${{ env.FORBIDDEN }}\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n';
+    const goodWf = "name: Good\non: push\njobs:\n  ok:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n";
+    const { tips, pack } = await buildChainPack(null, [
+      {
+        message: "seed: both workflows",
+        files: [
+          { path: ".gitea/workflows/bad.yml", content: badWf },
+          { path: ".gitea/workflows/good.yml", content: goodWf },
+        ],
+      },
+    ]);
+    const tip = tips[0]!;
+    const response = await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tip }], pack, token);
+    expect(response.status).toBe(200);
+
+    const runs = await db().select().from(actionRuns).orderBy(actionRuns.id);
+    expect(runs).toHaveLength(2);
+    const badRun = runs.find((r) => r.workflowId === ".gitea/workflows/bad.yml");
+    const goodRun = runs.find((r) => r.workflowId === ".gitea/workflows/good.yml");
+    expect(badRun).toBeDefined();
+    expect(goodRun).toBeDefined();
+
+    // the invalid arm: FAILED with started/stopped pinned (invalid_workflow.go:48-79)
+    expect(badRun?.status).toBe(ACTION_STATUS_FAILURE);
+    expect(badRun?.started).not.toBeNull();
+    expect(badRun?.stopped).not.toBeNull();
+    expect(badRun?.title).toBe("seed: both workflows");
+    expect(badRun?.triggerEvent).toBe("push");
+    expect(badRun?.index).toBeGreaterThan(0);
+
+    // the summary carries the parse error verbatim (invalid_workflow.go:81)
+    const summaries = await db().select().from(actionRunJobSummaries).where(eq(actionRunJobSummaries.runId, badRun?.id ?? 0));
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]?.contentType).toBe("text/markdown");
+    expect(summaries[0]?.content).toBe(
+      "**Invalid workflow file: .gitea/workflows/bad.yml**\n\n```\njob bad: Unrecognized named-value: 'env'\n```\n",
+    );
+    expect(summaries[0]?.contentSize).toBe(new TextEncoder().encode(summaries[0]?.content ?? "").length);
+
+    // the clean workflow ran the whole trigger chain: run + waiting job +
+    // commit status + a pickable task version
+    expect(goodRun?.status).toBe(ACTION_STATUS_WAITING);
+    const goodJobs = await db().select().from(actionRunJobs).where(eq(actionRunJobs.runId, goodRun?.id ?? 0));
+    expect(goodJobs).toHaveLength(1);
+    expect(goodJobs[0]?.jobId).toBe("ok");
+    expect(goodJobs[0]?.status).toBe(ACTION_STATUS_WAITING);
+    const statuses = await db().select().from(commitStatuses);
+    expect(statuses.map((s) => s.context)).toEqual(["Good / ok (push)"]);
+    expect(await getTasksVersionByScope(env.DB, 0, goodRun?.repoId ?? "")).toBeGreaterThan(0);
   });
 
   it("a branch-filtered workflow (not the pushed branch) posts no run and no skipped status without required checks", async () => {
