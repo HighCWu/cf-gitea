@@ -49,17 +49,18 @@
  *   - attribute exclusion applies REGARDLESS of `path` subpaths (verified
  *     against git 2.43: `git archive HEAD <ignored path>` answers an empty
  *     archive — a pathspec cannot resurrect an export-ignored path);
- *   - export-subst is PARSED but intentionally NOT substituted. Upstream
- *     expands `$Format:…$` through git's full pretty-format machinery —
- *     verified against git 2.43.0, every log placeholder expands (even %h
- *     abbreviation, %d decorations, multi-line formats; a `$Format:` without
- *     its closing `$` even steals the next `$` in the file). Faithfulness
- *     there is engine-deep (%h/%p need object-graph abbreviation, %d/%D need
- *     ref decorations, %aN/%aE need mailmap), and a partial substitution is a
- *     state git never produces — so blobs stream byte-identical to the
- *     committed content and `$Format:…$` literals survive verbatim. The
- *     disposition is pinned in archive.test.ts; moving it engine-side is the
- *     recorded future arm.
+ *   - export-subst EXPANDS (services/export-subst.ts — the residuals-v1.3.2
+ *     item-8 arm): a file with the attribute set has its `$Format:…$`
+ *     markers substituted with git 2.43.0's pretty-format rendering of the
+ *     ARCHIVED commit's fields — the marker scan, placeholder set, date
+ *     modes, bare-repo HEAD:.mailmap semantics, ref decorations and the
+ *     documented reductions are that module's doc; here the walk only
+ *     resolves the attribute per entry (same last-match-wins precedence as
+ *     export-ignore) and the chunk emitters run the byte-level expansion on
+ *     regular-file blobs (symlinks stream raw, like git's S_ISREG gate). The
+ *     archive-size budget counts EXPANDED bytes — the header sizes describe
+ *     the content git's own archive would carry. A failed context read
+ *     degrades to literal bytes, never a failed archive;
  *
  * zip entries DEFLATE (method 8, raw deflate via CompressionStream):
  * `git archive --format=zip` deflates at the zlib default level (archive-zip.c
@@ -84,6 +85,7 @@
 import type { EngineReads } from "./engine";
 import { branchRef, refTipMap, tagRef } from "./engine";
 import { ApiError } from "../errors";
+import { buildDecorations, EMPTY_MAILMAP, expandExportSubst, parseMailmap, type SubstContext } from "./export-subst";
 
 /** One file to archive: full tree path + entry metadata (blob bytes stream later). */
 export interface ArchiveEntry {
@@ -91,6 +93,8 @@ export interface ArchiveEntry {
   oid: string;
   /** engine mode string: "100644" | "100755" | "120000" (symlink) */
   mode: string;
+  /** the entry's export-subst attribute resolved to git's ATTR_TRUE */
+  exportSubst: boolean;
 }
 
 export type ArchiveFormat = "tar.gz" | "zip" | "bundle";
@@ -134,7 +138,7 @@ export function resolveArchiveRef(tips: ReturnType<typeof refTipMap>, ref: strin
 }
 
 // ---------------------------------------------------------------------------
-// .gitattributes export rules (export-ignore honored; export-subst parsed)
+// .gitattributes export rules (export-ignore + export-subst honored)
 // ---------------------------------------------------------------------------
 
 const TD = new TextDecoder();
@@ -184,6 +188,20 @@ function exportIgnoreExcluded(rules: GitattributesRule[], path: string, isDir: b
   for (const rule of rules) {
     if (rule.exportIgnore === undefined) continue;
     if (ruleMatches(rule, path, isDir)) value = rule.exportIgnore;
+  }
+  return value === true;
+}
+
+/**
+ * export-subst's mirror of the resolution above: the LAST matching export-subst
+ * assignment in rule order wins; `-export-subst` in a deeper file re-includes.
+ * Only git's ATTR_TRUE expands — value forms never match, like export-ignore.
+ */
+function exportSubstActive(rules: GitattributesRule[], path: string, isDir: boolean): boolean {
+  let value: boolean | null | undefined;
+  for (const rule of rules) {
+    if (rule.exportSubst === undefined) continue;
+    if (ruleMatches(rule, path, isDir)) value = rule.exportSubst;
   }
   return value === true;
 }
@@ -314,11 +332,11 @@ export function parseGitattributes(text: string, dir: string): GitattributesRule
  * RPCs (collectTreeRecursive's interim pattern, with archive-scale budgets).
  * Gitlink (submodule) entries are skipped; symlinks carry their mode. Paths
  * not matching any subPath pathspec are pruned before recursion, and
- * .gitattributes export-ignore rules collected along the walked chain exclude
- * entries before they reach the archive (see the module doc): a directory
- * match prunes its whole subtree, and exclusion holds regardless of the
- * pathspec — a `path` subpath cannot resurrect an export-ignored path, like
- * git archive.
+ * .gitattributes export rules collected along the walked chain decide each
+ * entry before it reaches the archive (see the module doc): export-ignore
+ * excludes (a directory match prunes its whole subtree; a `path` subpath
+ * cannot resurrect an ignored path), export-subst marks the entry for the
+ * byte-level `$Format:…$` expansion applied at stream time.
  */
 export async function collectArchiveEntries(
   reads: EngineReads,
@@ -353,7 +371,7 @@ export async function collectArchiveEntries(
         if (out.length >= MAX_ARCHIVE_FILES) {
           throw new ApiError(422, "repository tree exceeds the archive walk budget");
         }
-        out.push({ path, oid: entry.oid, mode: entry.mode });
+        out.push({ path, oid: entry.oid, mode: entry.mode, exportSubst: exportSubstActive(rules, path, false) });
       }
       // type "commit" (submodule): skipped, like upstream git archive
     }
@@ -482,6 +500,37 @@ interface ArchiveStreamOptions {
   refTarget: string;
   /** commit committer time (unix secs) — every entry's mtime */
   mtime: number;
+  /** the export-subst rendering context; null = nothing to substitute */
+  subst: SubstContext | null;
+}
+
+/**
+ * The substitution context over the ARCHIVED commit (one readCommit + one
+ * listRefs + one HEAD:.mailmap readBlob, only when some entry carries the
+ * attribute). Any read failure degrades per export-subst.ts's module doc —
+ * null here leaves `$Format:…$` literals intact.
+ */
+async function substContext(reads: EngineReads, refTarget: string): Promise<SubstContext | null> {
+  const commit = await reads.readCommit(refTarget);
+  if (commit === null) return null;
+  const refs = await reads.listRefs();
+  const head = refs?.head ?? null;
+  let mailmap = EMPTY_MAILMAP;
+  if (head !== null) {
+    const file = await reads.readBlob(head, ".mailmap");
+    if (file !== null) mailmap = parseMailmap(TD.decode(file.data));
+  }
+  return {
+    commit,
+    decorations: buildDecorations(refs?.refs ?? [], head, refTarget),
+    mailmap,
+  };
+}
+
+/** The bytes one entry streams: the blob, export-subst-expanded when marked. */
+function entryData(options: ArchiveStreamOptions, entry: ArchiveEntry, blob: { data: Uint8Array }): Uint8Array {
+  if (entry.mode === "120000" || !entry.exportSubst || options.subst === null) return blob.data;
+  return expandExportSubst(blob.data, options.subst);
 }
 
 /**
@@ -497,17 +546,18 @@ async function* tarChunks(options: ArchiveStreamOptions): AsyncGenerator<Uint8Ar
   for (const entry of entries) {
     const blob = await reads.readBlob(refTarget, entry.path);
     if (blob === null) continue; // raced with a push — skip, like git archive's missing-object tolerance
+    const data = entryData(options, entry, blob);
     const symlink = entry.mode === "120000";
     const target = symlink ? new TextDecoder().decode(blob.data) : "";
-    const size = symlink ? 0 : blob.data.byteLength;
+    const size = symlink ? 0 : data.byteLength;
     yield tarHeader(`${prefix}/${entry.path}`, entry.mode, size, mtime, symlink ? "2" : "0", target);
-    if (!symlink && blob.data.byteLength > 0) {
-      total += blob.data.byteLength;
+    if (!symlink && data.byteLength > 0) {
+      total += data.byteLength;
       if (total > MAX_ARCHIVE_TOTAL_BYTES) {
         throw new Error("archive exceeds the total size budget");
       }
-      yield blob.data;
-      const pad = (512 - (blob.data.byteLength % 512)) % 512;
+      yield data;
+      const pad = (512 - (data.byteLength % 512)) % 512;
       if (pad > 0) yield new Uint8Array(pad);
     }
   }
@@ -540,14 +590,15 @@ async function* zipChunks(options: ArchiveStreamOptions): AsyncGenerator<Uint8Ar
   for (const entry of entries) {
     const blob = await reads.readBlob(refTarget, entry.path);
     if (blob === null) continue;
+    const data = entryData(options, entry, blob);
     const name = TE.encode(`${prefix}/${entry.path}`);
-    const crc = crc32(blob.data);
-    const size = blob.data.byteLength;
+    const crc = crc32(data);
+    const size = data.byteLength;
     total += size;
     if (total > MAX_ARCHIVE_TOTAL_BYTES) {
       throw new Error("archive exceeds the total size budget");
     }
-    const stored = await deflateRaw(blob.data);
+    const stored = await deflateRaw(data);
     const externalAttrs = (((entry.mode === "120000" ? 0o120777 : 0o100000 | (entry.mode === "100755" ? 0o755 : 0o644)) << 16) >>> 0);
 
     const local = new Uint8Array(30 + name.byteLength);
@@ -625,7 +676,8 @@ export async function buildArchive(
   }
   const prefix = repoSlug.toLowerCase();
   const downloadName = `${repoSlug}-${ref.replaceAll("/", "-")}.${format}`;
-  const options: ArchiveStreamOptions = { prefix, entries, reads, refTarget, mtime };
+  const subst = entries.some((e) => e.exportSubst) ? await substContext(reads, refTarget) : null;
+  const options: ArchiveStreamOptions = { prefix, entries, reads, refTarget, mtime, subst };
   const body =
     format === "tar.gz"
       ? readableFromChunks(tarChunks(options)).pipeThrough(new CompressionStream("gzip"))

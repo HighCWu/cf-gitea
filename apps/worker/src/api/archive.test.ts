@@ -44,6 +44,8 @@ const SLUG = "archive-me";
 const REPO_PATH = `/repos/${OWNER}/${SLUG}`;
 const T0 = 1_765_000_000;
 
+const ENC = new TextEncoder();
+
 const SEED_COMMITS = [
   {
     message: "seed: layout",
@@ -97,13 +99,112 @@ const ATTR_COMMITS = [
   },
 ];
 
+// The export-subst fixture repo (residuals-v1.3.2 item 8): every file marked,
+// a battery file carrying each honored placeholder class, the marker
+// semantics probes (multi-line, unterminated steal, EOF literal, empty
+// format, $$ adjacency), a binary file, a deeper -export-subst re-include,
+// a .mailmap at HEAD (the bare posture's only live source), and a wrapped
+// first commit archived by oid (unmapped author + no decorations arm).
+const SUBST_SLUG = "subst-repo";
+const SUBST_PATH = `/repos/${OWNER}/${SUBST_SLUG}`;
+const T1 = 1_800_000_000; // Fri Jan 15 08:00:00 2027 +0000
+const SUBST_MESSAGE = "flat subject only";
+const WRAPPED_MESSAGE = "wrapped subject\nline two\n\nbody line";
+
+const SUBST_BATTERY = [
+  "H=[$Format:%H$]",
+  "h=[$Format:%h$]",
+  "T=[$Format:%T$]",
+  "t=[$Format:%t$]",
+  "P=[$Format:%P$]",
+  "p=[$Format:%p$]",
+  "an=[$Format:%an$]",
+  "ae=[$Format:%ae$]",
+  "aN=[$Format:%aN$]",
+  "aE=[$Format:%aE$]",
+  "ad=[$Format:%ad$]",
+  "aD=[$Format:%aD$]",
+  "aI=[$Format:%aI$]",
+  "ai=[$Format:%ai$]",
+  "at=[$Format:%at$]",
+  "cn=[$Format:%cn$]",
+  "ce=[$Format:%ce$]",
+  "cd=[$Format:%cd$]",
+  "cI=[$Format:%cI$]",
+  "ct=[$Format:%ct$]",
+  "s=[$Format:%s$]",
+  "f=[$Format:%f$]",
+  "b=[$Format:%b$]",
+  "B=[$Format:%B$]",
+  "d=[$Format:%d$]",
+  "D=[$Format:%D$]",
+  "pct=[$Format:%%$]",
+  "n=[$Format:%n$]END",
+  "unknown=[$Format:%ZZ$]",
+  "",
+].join("\n");
+
+const SUBST_MARKERS = [
+  "line1",
+  "$Format:%d",
+  "subject=%s$",
+  "line-after",
+  "start $Format:%H middle $ between $Format:%h$ end",
+  "tail $Format:%ct",
+  "a $Format:$ b",
+  "$$Format:%H$$",
+  "pair: $Format:%s$ also $Format:%h$",
+  "",
+].join("\n");
+
+const SUBST_BINARY = "A\u0000B\u0000$Format:%H$\u0000C\n";
+
+const SUBST_PROBE0 = ["an=[$Format:%an$]", "aN=[$Format:%aN$]", "s=[$Format:%s$]", "f=[$Format:%f$]", "b=[$Format:%b$]", "d=[$Format:%d$]", "D=[$Format:%D$]", ""].join("\n");
+
+const SUBST_COMMITS = [
+  {
+    message: WRAPPED_MESSAGE,
+    time: T1,
+    author: { name: "Author Two", email: "author@example.com" },
+    files: [
+      { path: ".gitattributes", content: "* export-subst\n" },
+      { path: "raw/.gitattributes", content: "* -export-subst\n" },
+      { path: "raw/plain.txt", content: "literal $Format:%H$ survives\n" },
+      { path: "probe0.txt", content: SUBST_PROBE0 },
+    ],
+  },
+  {
+    message: SUBST_MESSAGE,
+    time: T1,
+    files: [
+      { path: ".gitattributes", content: "* export-subst\n" },
+      { path: "raw/.gitattributes", content: "* -export-subst\n" },
+      { path: "raw/plain.txt", content: "literal $Format:%H$ survives\n" },
+      { path: ".mailmap", content: "Proper Person <proper@example.com> <test@example.com>\n" },
+      { path: "battery.txt", content: SUBST_BATTERY },
+      { path: "markers.txt", content: SUBST_MARKERS },
+      { path: "binary.bin", content: ENC.encode(SUBST_BINARY) },
+    ],
+  },
+];
+
 let OWNER_ID = 1;
+let ATTR_TIP = "";
+let SUBST_TIPS: string[] = [];
 
 beforeAll(async () => {
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
   await applyAuthD1Migrations();
   await ensureSeededRepo({ owner: OWNER, slug: SLUG, commits: SEED_COMMITS });
-  await ensureSeededRepo({ owner: OWNER, slug: ATTR_SLUG, commits: ATTR_COMMITS });
+  ATTR_TIP = (await ensureSeededRepo({ owner: OWNER, slug: ATTR_SLUG, commits: ATTR_COMMITS })).tips[0] as string;
+  SUBST_TIPS = (
+    await ensureSeededRepo({
+      owner: OWNER,
+      slug: SUBST_SLUG,
+      commits: SUBST_COMMITS,
+      tags: [{ name: "v1", commitIndex: 1 }],
+    })
+  ).tips;
   const row = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, OWNER)).get();
   if (row === undefined) throw new Error("seed owner missing");
   OWNER_ID = row.id;
@@ -389,27 +490,178 @@ describe("archive .gitattributes export rules", () => {
     }
   });
 
-  it("pins the export-subst disposition: parsed, NOT substituted — $Format:…$ survives byte-identical", async () => {
-    // Upstream (real git archive) expands $Format:…$ through git's full
-    // pretty-format machinery; that is engine-deep here (object-graph
-    // abbreviation for %h, ref decorations for %d, mailmap for %aN), and a
-    // partial substitution is a state git never produces — so the blob
-    // streams byte-identical and the literal survives. Documented in the
-    // service module doc; this pin marks the disposition as DELIBERATE.
+  it("expands the export-subst file: $Format:%H$ renders the archived commit's oid in BOTH formats", async () => {
+    // Upstream expands $Format:…$ through git's pretty-format machinery
+    // (services/export-subst.ts — the git 2.43.0 port; the former
+    // parsed-but-not-substituted disposition is superseded). The ARCHIVED
+    // commit's oid fills the marker, byte-for-byte as git archive does.
     for (const tail of ["main.tar.gz", "main.zip"]) {
       const res = await fetchRoute(`${ATTR_PATH}/archive/${tail}`);
       expect(res.status).toBe(200);
+      const expanded = `ver=${ATTR_TIP}\n`;
       if (tail.endsWith(".zip")) {
         const entries = await parseZip(new Uint8Array(await res.arrayBuffer()));
-        expect(entries.find((e) => e.name === `${ATTR_SLUG}/VERSION`)?.content).toBe(ATTR_VERSION);
+        expect(entries.find((e) => e.name === `${ATTR_SLUG}/VERSION`)?.content).toBe(expanded);
       } else {
-        const gz = new Uint8Array(await res.arrayBuffer());
-        const tarBytes = new Uint8Array(
-          await new Response(new Blob([gz]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer(),
+        const entries = parseTar(
+          new Uint8Array(
+            await new Response(new Blob([new Uint8Array(await res.arrayBuffer())]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer(),
+          ),
         );
-        expect(new TextDecoder().decode(tarBytes)).toContain(ATTR_VERSION);
+        expect(entries.find((e) => e.name === `${ATTR_SLUG}/VERSION`)?.content).toBe(expanded);
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// export-subst expansion (the residuals item-8 arm — the git 2.43.0 port)
+// ---------------------------------------------------------------------------
+
+describe("archive export-subst expansion", () => {
+  /** The tip's identity/date constants the battery pins against (T1, +0000). */
+  const TIP_DATE = "Fri Jan 15 08:00:00 2027 +0000";
+  const TIP_RFC2822 = "Fri, 15 Jan 2027 08:00:00 +0000";
+  const TIP_ISO_STRICT = "2027-01-15T08:00:00+00:00";
+  const TIP_ISO = "2027-01-15 08:00:00 +0000";
+  const DECORATIONS = " (HEAD -> main, tag: v1)";
+  const DECORATIONS_BARE = "HEAD -> main, tag: v1";
+
+  /** The tip battery's full expected rendering (git 2.43.0 byte parity). */
+  function batteryExpected(tip: string, parent: string, tree: string): string {
+    const short = (oid: string): string => oid.slice(0, 7);
+    return [
+      `H=[${tip}]`,
+      `h=[${short(tip)}]`,
+      `T=[${tree}]`,
+      `t=[${short(tree)}]`,
+      `P=[${parent}]`,
+      `p=[${short(parent)}]`,
+      "an=[Test User]",
+      "ae=[test@example.com]",
+      "aN=[Proper Person]", // .mailmap at HEAD maps the test identity
+      "aE=[proper@example.com]",
+      `ad=[${TIP_DATE}]`,
+      `aD=[${TIP_RFC2822}]`,
+      `aI=[${TIP_ISO_STRICT}]`,
+      `ai=[${TIP_ISO}]`,
+      "at=[1800000000]",
+      "cn=[Test User]",
+      "ce=[test@example.com]",
+      `cd=[${TIP_DATE}]`,
+      `cI=[${TIP_ISO_STRICT}]`,
+      "ct=[1800000000]",
+      "s=[flat subject only]",
+      "f=[flat-subject-only]",
+      "b=[]",
+      "B=[flat subject only\n]",
+      `d=[${DECORATIONS}]`,
+      `D=[${DECORATIONS_BARE}]`,
+      "pct=[%]",
+      "n=[\n]END",
+      "unknown=[%ZZ]", // outside the honored set: the marker is consumed, the placeholder stays literal
+      "",
+    ].join("\n");
+  }
+
+  /**
+   * The markers.txt rendering — byte-cascaded exactly as git's scan does:
+   * the `tail $Format:%ct` marker STEALS the next `$` (the empty-format
+   * marker's closer), the leftover text keeps `Format:$ b`, and the `$$`
+   * pair's second `$` opens the next matched marker. (Byte-verified against
+   * a real `git archive` run over the same marker layout.)
+   */
+  function markersExpected(tip: string): string {
+    const short = tip.slice(0, 7);
+    return [
+      "line1",
+      DECORATIONS,
+      "subject=flat subject only",
+      "line-after",
+      `start ${tip} middle  between ${short} end`,
+      "tail 1800000000",
+      "a Format:$ b",
+      `$${tip}$`,
+      "pair: flat subject only also " + short,
+      "",
+    ].join("\n");
+  }
+
+  async function fetchTarGzEntries(path: string): Promise<ReturnType<typeof parseTar>> {
+    const res = await fetchRoute(`${path}/archive/main.tar.gz`);
+    expect(res.status).toBe(200);
+    const gz = new Uint8Array(await res.arrayBuffer());
+    return parseTar(
+      new Uint8Array(await new Response(new Blob([gz]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer()),
+    );
+  }
+
+  it("expands every honored placeholder class from the archived commit in the tar", async () => {
+    const refs = await engineCell(env, { ownerNamespace: OWNER.toLowerCase(), slug: SUBST_SLUG }).listRefs();
+    const tip = SUBST_TIPS[1] as string;
+    const commit = await engineCell(env, { ownerNamespace: OWNER.toLowerCase(), slug: SUBST_SLUG }).readCommit(tip);
+    expect(commit).not.toBeNull();
+    const entries = await fetchTarGzEntries(SUBST_PATH);
+    expect(entries.map((e) => e.name).sort()).toEqual(
+      [
+        `${SUBST_SLUG}/.gitattributes`,
+        `${SUBST_SLUG}/.mailmap`,
+        `${SUBST_SLUG}/battery.txt`,
+        `${SUBST_SLUG}/binary.bin`,
+        `${SUBST_SLUG}/markers.txt`,
+        `${SUBST_SLUG}/raw/.gitattributes`,
+        `${SUBST_SLUG}/raw/plain.txt`,
+      ].sort(),
+    );
+    expect(entries.find((e) => e.name === `${SUBST_SLUG}/battery.txt`)?.content).toBe(
+      batteryExpected(tip, SUBST_TIPS[0] as string, (commit as { tree: string }).tree),
+    );
+    expect(entries.find((e) => e.name === `${SUBST_SLUG}/markers.txt`)?.content).toBe(markersExpected(tip));
+    expect(entries.find((e) => e.name === `${SUBST_SLUG}/binary.bin`)?.content).toBe(
+      SUBST_BINARY.replace("$Format:%H$", tip),
+    );
+    // the deeper `-export-subst` re-include: the marker survives literal
+    expect(entries.find((e) => e.name === `${SUBST_SLUG}/raw/plain.txt`)?.content).toBe(
+      "literal $Format:%H$ survives\n",
+    );
+  });
+
+  it("expands the same content in the zip (both formats share the entry pipeline)", async () => {
+    const refs = await engineCell(env, { ownerNamespace: OWNER.toLowerCase(), slug: SUBST_SLUG }).listRefs();
+    const tip = SUBST_TIPS[1] as string;
+    const res = await fetchRoute(`${SUBST_PATH}/archive/main.zip`);
+    expect(res.status).toBe(200);
+    const entries = await parseZip(new Uint8Array(await res.arrayBuffer()));
+    expect(entries.find((e) => e.name === `${SUBST_SLUG}/markers.txt`)?.content).toBe(markersExpected(tip));
+    expect(entries.find((e) => e.name === `${SUBST_SLUG}/battery.txt`)?.content).toContain("aN=[Proper Person]");
+    expect(entries.find((e) => e.name === `${SUBST_SLUG}/raw/plain.txt`)?.content).toBe(
+      "literal $Format:%H$ survives\n",
+    );
+    void refs;
+  });
+
+  it("archives an OLDER commit by oid: wrapped-subject split, unmapped mailmap identity, no decorations", async () => {
+    const first = SUBST_TIPS[0] as string;
+    const entries = await fetchTarGzEntries(`${SUBST_PATH}`);
+    void entries;
+    const res = await fetchRoute(`${SUBST_PATH}/archive/${first}.tar.gz`);
+    expect(res.status).toBe(200);
+    const gz = new Uint8Array(await res.arrayBuffer());
+    const tarEntries = parseTar(
+      new Uint8Array(await new Response(new Blob([gz]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer()),
+    );
+    expect(tarEntries.find((e) => e.name === `${SUBST_SLUG}/probe0.txt`)?.content).toBe(
+      [
+        "an=[Author Two]",
+        "aN=[Author Two]", // the .mailmap rides HEAD, not the archived tree; this author is unmapped
+        "s=[wrapped subject line two]", // the wrapped paragraph joins with spaces
+        "f=[wrapped-subject]", // %f sanitizes the FIRST line only
+        "b=[body line\n]",
+        "d=[]", // no ref points at this commit
+        "D=[]",
+        "",
+      ].join("\n"),
+    );
   });
 });
 
