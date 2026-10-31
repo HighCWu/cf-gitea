@@ -1,8 +1,9 @@
 /**
  * The five RUNTIME-ONLY admin ops (routes/admin-degenerate.ts — the
  * inventory's `wave-api-admin-degenerate` batch): adminCronList/adminCronRun
- * (GET/POST /admin/cron) over the wrangler-declared static task registry, and
- * the unadopted-repository trio (GET /admin/unadopted,
+ * (GET/POST /admin/cron) over the scheduled dispatcher's arm census
+ * (CRON_ARMS — the cron_state store's registry) with the runnable-producer
+ * run gate, and the unadopted-repository trio (GET /admin/unadopted,
  * POST/DELETE /admin/unadopted/{owner}/{repo}) over the structurally-empty
  * unadopted set. Per-arm contract verification: every declared response code
  * of every op is exercised, including the two RUNTIME_ONLY_RESPONSES-documented
@@ -18,7 +19,9 @@
  * api/mirror.test.ts pattern — nothing here performs a real queue send): a
  * due repo_mirrors row must flip idle→queued and land exactly one
  * {kind: "mirror-sync"} message; a not-due row must stay untouched (the
- * producer's next_sync_at != 0 filter).
+ * producer's next_sync_at != 0 filter). The manual run's recorded tick lands
+ * in cron_state (the monitor's applyAdminMonitorCronForm shape) and the
+ * census render merges those rows into prev/exec_times.
  */
 
 import { env } from "cloudflare:workers";
@@ -26,7 +29,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { repoMirrors, repositories, users } from "../../db/schema";
+import { cronState, repoMirrors, repositories, users } from "../../db/schema";
 import { createStubAuthResolver, createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -108,7 +111,7 @@ beforeAll(async () => {
 
 /** Fresh rows per test: the plain stub user (id 1), a neighbor, the admin. */
 beforeEach(async () => {
-  for (const table of ["repo_mirrors", "repositories", "users"]) {
+  for (const table of ["cron_state", "repo_mirrors", "repositories", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
 
@@ -160,6 +163,12 @@ async function seedMirrorRow(repoId: string, due: boolean): Promise<void> {
   });
 }
 
+/** Insert a cron_state tick row (the scheduled handler's recorder shape) —
+ *  `runs` completed ticks at `lastSuccessAt`. */
+async function seedCronStateRow(arm: string, lastSuccessAt: Date, runs: number): Promise<void> {
+  await drizzle(env.DB).insert(cronState).values({ arm, lastSuccessUnix: lastSuccessAt, runs });
+}
+
 // ---------------------------------------------------------------------------
 // The admin gate (reqToken + reqSiteAdmin, api.go:1824-)
 // ---------------------------------------------------------------------------
@@ -192,49 +201,96 @@ describe("admin gating", () => {
 });
 
 // ---------------------------------------------------------------------------
-// adminCronList — GET /admin/cron (cron.go ListCronTasks over the static
-// registry: the wrangler.jsonc triggers.crons mirror)
+// adminCronList — GET /admin/cron (cron.go ListCronTasks over the scheduled
+// dispatcher's arm census — CRON_ARMS — with the cron_state ticks merged)
 // ---------------------------------------------------------------------------
 
 describe("adminCronList (GET /admin/cron)", () => {
-  it("renders the wrangler-declared task registry under upstream's Cron shape", async () => {
+  it("renders the full arm census under upstream's Cron shape (zero state when nothing recorded)", async () => {
     const res = await adminSend("/admin/cron", authed());
     expect(res.status).toBe(200);
-    expect(res.headers.get("X-Total-Count")).toBe("1");
+    // The census: the step entry's three arms, then the hourly entry's four
+    // (services/cron-state.ts CRON_ARMS order — the monitor's render order).
+    expect(res.headers.get("X-Total-Count")).toBe("7");
     const list: Record<string, unknown>[] = await res.json();
-    expect(list).toHaveLength(1);
-    const entry = list[0]!;
-    expect(entry.name).toBe("update_mirrors");
-    expect(entry.schedule).toBe("*/10 * * * *");
-    expect(entry.prev).toBe("0001-01-01T00:00:00Z");
-    expect(entry.exec_times).toBe(0);
-    // `next` is the computed next */10 UTC boundary — strictly future, on the
-    // minute, minute a multiple of 10.
-    const next = new Date(String(entry.next));
-    expect(Number.isNaN(next.getTime())).toBe(false);
-    expect(next.getTime()).toBeGreaterThan(Date.now());
-    expect(next.getUTCSeconds()).toBe(0);
-    expect(next.getUTCMilliseconds()).toBe(0);
-    expect(next.getUTCMinutes() % 10).toBe(0);
+    expect(list).toHaveLength(7);
+    expect(list.map((entry) => entry.name)).toEqual([
+      "update_mirrors",
+      "update_push_mirrors",
+      "stop_zombie_tasks",
+      "demo_sweep",
+      "delete_old_audit_events",
+      "cleanup_packages",
+      "cleanup_actions",
+    ]);
+    expect(list.map((entry) => entry.schedule)).toEqual([
+      "*/10 * * * *",
+      "*/10 * * * *",
+      "*/10 * * * *",
+      "0 * * * *",
+      "0 * * * *",
+      "0 * * * *",
+      "0 * * * *",
+    ]);
+    // Nothing recorded yet → the Go zero pair on every arm.
+    for (const entry of list) {
+      expect(entry.prev).toBe("0001-01-01T00:00:00Z");
+      expect(entry.exec_times).toBe(0);
+    }
+    // `next` is computed per spec shape: the step arms land on a future */10
+    // UTC boundary, the hourly arms on a future top-of-the-hour boundary.
+    for (const entry of list) {
+      const next = new Date(String(entry.next));
+      expect(Number.isNaN(next.getTime()), String(entry.name)).toBe(false);
+      expect(next.getTime()).toBeGreaterThan(Date.now());
+      expect(next.getUTCSeconds()).toBe(0);
+      expect(next.getUTCMilliseconds()).toBe(0);
+      if (entry.schedule === "*/10 * * * *") {
+        expect(next.getUTCMinutes() % 10).toBe(0);
+      } else {
+        expect(next.getUTCMinutes()).toBe(0);
+      }
+    }
+  });
+
+  it("merges the recorded cron_state ticks (prev = last_success, exec_times = runs)", async () => {
+    const tick = new Date("2026-02-03T04:05:06Z");
+    await seedCronStateRow("update_mirrors", tick, 3);
+    await seedCronStateRow("demo_sweep", new Date("2026-02-03T05:00:00Z"), 1);
+    const res = await adminSend("/admin/cron", authed());
+    expect(res.status).toBe(200);
+    const list: Record<string, unknown>[] = await res.json();
+    const mirrors = list.find((entry) => entry.name === "update_mirrors")!;
+    expect(mirrors.prev).toBe("2026-02-03T04:05:06.000Z");
+    expect(mirrors.exec_times).toBe(3);
+    const sweep = list.find((entry) => entry.name === "demo_sweep")!;
+    expect(sweep.prev).toBe("2026-02-03T05:00:00.000Z");
+    expect(sweep.exec_times).toBe(1);
+    // Rowless arms keep the never-fired posture.
+    const zombie = list.find((entry) => entry.name === "stop_zombie_tasks")!;
+    expect(zombie.prev).toBe("0001-01-01T00:00:00Z");
+    expect(zombie.exec_times).toBe(0);
   });
 
   it("paginates like upstream (page beyond the set → empty, total kept)", async () => {
-    const page2 = await adminSend("/admin/cron?page=2", authed());
+    const page2 = await adminSend("/admin/cron?page=2&limit=5", authed());
     expect(page2.status).toBe(200);
-    expect(page2.headers.get("X-Total-Count")).toBe("1");
-    const empty: unknown[] = await page2.json();
-    expect(empty).toEqual([]);
+    expect(page2.headers.get("X-Total-Count")).toBe("7");
+    const page2List: Record<string, unknown>[] = await page2.json();
+    expect(page2List.map((entry) => entry.name)).toEqual(["cleanup_packages", "cleanup_actions"]);
 
     const page1 = await adminSend("/admin/cron?page=1&limit=1", authed());
     expect(page1.status).toBe(200);
-    const firstPage: unknown[] = await page1.json();
-    expect(firstPage.length).toBe(1);
+    const firstPage: Record<string, unknown>[] = await page1.json();
+    expect(firstPage.map((entry) => entry.name)).toEqual(["update_mirrors"]);
   });
 });
 
 // ---------------------------------------------------------------------------
 // adminCronRun — POST /admin/cron/{task} (cron.go PostCronTask: unknown task
-// 404; known task runs the scheduled handler's enqueue body)
+// 404; a runnable task executes its scheduled producer body and records the
+// manual tick; a listed-but-unrunnable census arm 404s like an unknown one —
+// the monitor's RUNNABLE_CRON_ARMS adjudication)
 // ---------------------------------------------------------------------------
 
 describe("adminCronRun (POST /admin/cron/{task})", () => {
@@ -245,13 +301,30 @@ describe("adminCronRun (POST /admin/cron/{task})", () => {
     expect(body.message).toBe("not found");
   });
 
-  it("runs the known task and answers 204 — no due mirrors, queue untouched", async () => {
+  it("404s a listed-but-unrunnable census arm exactly like an unknown task, recording nothing", async () => {
+    // stop_zombie_tasks IS in the list's census (its producer module is an
+    // in-flight sibling's ownership) — the run gate answers the same 404.
+    const res = await adminSend("/admin/cron/stop_zombie_tasks", authed({ method: "POST" }));
+    expect(res.status).toBe(404);
+    const body: Record<string, unknown> = await res.json();
+    expect(body.message).toBe("not found");
+    const rows = await drizzle(env.DB).select().from(cronState).all();
+    expect(rows).toEqual([]);
+  });
+
+  it("runs the known task and answers 204 — no due mirrors, queue untouched, tick recorded", async () => {
     const queue = recordingQueue();
     const send = familyApp(queue);
     const res = await send("/admin/cron/update_mirrors", authed({ method: "POST" }));
     expect(res.status).toBe(204);
     expect(await res.text()).toBe("");
     expect(queue.sent).toEqual([]);
+    // The manual run records its completed tick (the monitor's form shape).
+    const rows = await drizzle(env.DB).select().from(cronState).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.arm).toBe("update_mirrors");
+    expect(rows[0]!.runs).toBe(1);
+    expect(rows[0]!.lastSuccessUnix).not.toBeNull();
   });
 
   it("enqueues exactly the due mirrors (idle→queued CAS; not-due rows stay idle)", async () => {
@@ -274,6 +347,39 @@ describe("adminCronRun (POST /admin/cron/{task})", () => {
       "7401": "queued",
       "7402": "idle",
     });
+  });
+
+  it("increments exec_times across runs (runs += 1 per manual tick)", async () => {
+    const queue = recordingQueue();
+    const send = familyApp(queue);
+    await send("/admin/cron/update_mirrors", authed({ method: "POST" }));
+    await send("/admin/cron/update_mirrors", authed({ method: "POST" }));
+    const rows = await drizzle(env.DB).select().from(cronState).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.runs).toBe(2);
+  });
+
+  it("runs the other four runnable arms — each a quiet no-op that records its tick", async () => {
+    const queue = recordingQueue();
+    const send = familyApp(queue);
+    for (const task of ["update_push_mirrors", "demo_sweep", "delete_old_audit_events", "cleanup_packages"]) {
+      // Each producer is self-gated (no mirrors / DEMO_MODE unset /
+      // AUDIT_RETENTION_DAYS unset / no cleanup work) — 204, zero sends.
+      const res = await send(`/admin/cron/${task}`, authed({ method: "POST" }));
+      expect(res.status, task).toBe(204);
+      expect(await res.text(), task).toBe("");
+    }
+    expect(queue.sent).toEqual([]);
+    const rows = await drizzle(env.DB).select().from(cronState).all();
+    expect(rows.map((row) => row.arm).sort()).toEqual([
+      "cleanup_packages",
+      "delete_old_audit_events",
+      "demo_sweep",
+      "update_push_mirrors",
+    ]);
+    for (const row of rows) {
+      expect(row.runs).toBe(1);
+    }
   });
 });
 

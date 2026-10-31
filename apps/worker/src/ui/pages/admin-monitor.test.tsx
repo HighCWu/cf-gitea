@@ -3,9 +3,9 @@
  * window-2c e31c0cf — GET /-/admin/monitor/{stats,cron,queue,stacktrace} +
  * POST cron at ui/index.ts): the stats/queue loaders over real D1 (generated
  * migrations in beforeAll; the counts read the same tables the API families
- * write), the cron registry/parse/apply matrix (the run arm drives the landed
- * `enqueueDueMirrorSyncs` producer against a recording queue — the
- * sync.test.ts stub), and the DOM contract of the four page renders —
+ * write), the cron registry/parse/apply matrix (the run arms drive the landed
+ * CRON_RUN_BODIES producers against recording queues — the sync.test.ts
+ * stub), and the DOM contract of the four page renders —
  * hono/jsx renderToString, the module driven directly. The deferred-test
  * matrix also drives the real routes (the org-blocked matrix's minted-session
  * uiRouter pattern): the adminPagePrologue's anonymous-303 / non-admin-404-
@@ -24,6 +24,7 @@ import { renderToString } from "hono/jsx/dom/server";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import {
+  auditEvents,
   comments,
   commitStatuses,
   follows,
@@ -32,9 +33,11 @@ import {
   labels,
   milestones,
   oauth2Applications,
+  packageCleanupRules,
   projectColumns,
   projects,
   publicKeys,
+  pushMirrors,
   releaseAssets,
   releases,
   repoMirrors,
@@ -98,6 +101,7 @@ const AT = new Date("2026-01-01T00:00:00Z");
  *  seed teams/projects/columns/stars/watchers/commit-statuses whose rows
  *  reference the users/repositories rows the sweep also clears. */
 const FIXTURE_TABLES = [
+  "audit_event",
   "comments",
   "commit_statuses",
   "cron_state",
@@ -107,9 +111,11 @@ const FIXTURE_TABLES = [
   "labels",
   "milestones",
   "oauth2_application",
+  "package_cleanup_rules",
   "project_columns",
   "projects",
   "public_keys",
+  "push_mirrors",
   "release_assets",
   "releases",
   "repo_mirrors",
@@ -364,9 +370,16 @@ describe("loadAdminMonitorCron (the FULL landed arm census — the usability F3 
       expect(entry.execTimes).toBe(0);
       expect(entry.result).toEqual({ status: "none", message: null, at: null });
     }
-    // The run button renders ONLY on the run-capable row (the landed run
-    // body — admin-degenerate's registry posture; never a dead control).
-    expect(entries.filter((entry) => entry.runnable).map((entry) => entry.name)).toEqual(["update_mirrors"]);
+    // The run button renders ONLY on the run-capable arms (the landed run
+    // bodies — admin-degenerate's CRON_RUN_BODIES posture; never a dead
+    // control); the two actions-family census arms stay bodyless.
+    expect(entries.filter((entry) => entry.runnable).map((entry) => entry.name)).toEqual([
+      "update_mirrors",
+      "update_push_mirrors",
+      "demo_sweep",
+      "delete_old_audit_events",
+      "cleanup_packages",
+    ]);
   });
 
   it("computes Next for BOTH landed spec families from the real expressions", () => {
@@ -450,8 +463,8 @@ describe("loadAdminMonitorCronRunState (the state-bearing loader — the route s
     // The error arm renders the x glyph with the stored one-liner tooltip.
     expect(html).toContain('data-tooltip-content="producer probes failed"');
     expect(html).toContain('class="svg octicon-x"');
-    // Exactly ONE run button (the runnable row) among seven rows.
-    expect((html.match(/name="op" value=/g) ?? []).length).toBe(1);
+    // Exactly FIVE run buttons (the runnable arms) among seven rows.
+    expect((html.match(/name="op" value=/g) ?? []).length).toBe(5);
   });
 });
 
@@ -499,6 +512,14 @@ describe("applyAdminMonitorCronForm (DashboardPost's task arm over the landed pr
       .run();
   }
 
+  /** One bare repositories row (the stats fixtures' registry shape). */
+  async function seedRepoRow(id: string, ownerId: number, ownerNamespace: string, slug: string, createdAt: Date): Promise<void> {
+    await drizzle(env.DB)
+      .insert(repositories)
+      .values({ id, storageKey: `r_${id}`, ownerNamespace, ownerId, slug, visibility: "public", createdAt })
+      .run();
+  }
+
   it("the known task runs the landed producer — run = enqueue, row flips queued, tick recorded", async () => {
     await seedDueMirror();
     const queue = recordingQueue();
@@ -511,6 +532,115 @@ describe("applyAdminMonitorCronForm (DashboardPost's task arm over the landed pr
     // dashboard trigger too — tasks.go:95-97) on the update_mirrors row.
     const state = await listCronState(env.DB);
     expect(state.get("update_mirrors")).toMatchObject({ runs: 1, lastSuccess: NOW, lastError: null });
+  });
+
+  it("update_push_mirrors runs its producer — the due push mirror enqueues, row flips queued, tick recorded", async () => {
+    const db = drizzle(env.DB);
+    const owner = (
+      await db
+        .insert(users)
+        .values({ username: "pusher", usernameLower: "pusher", type: "user", status: "active", createdAt: AT })
+        .returning({ id: users.id })
+        .all()
+    )[0]!.id;
+    await seedRepoRow("p1", owner, "pusher", "push-me", AT);
+    await db
+      .insert(pushMirrors)
+      .values({
+        repoId: "p1",
+        remoteName: "remote_mirror_abc123",
+        remoteAddress: "https://dest.test/pusher/push-me.git",
+        intervalSeconds: 600,
+        createdAt: AT,
+        nextSyncAt: Math.floor(NOW.getTime() / 1000) - 60, // due a minute ago
+        syncState: "idle",
+      })
+      .run();
+    const queue = recordingQueue();
+    const result = await applyAdminMonitorCronForm(
+      { ...env, MIRROR_SYNC_QUEUE: queue },
+      { op: "update_push_mirrors", from: "monitor" },
+      { now: NOW },
+    );
+    expect(result).toEqual({ outcome: "applied", message: "Started Task: Update Push Mirrors" });
+    // The push producer's message shape (the CAS claim wins the enqueue).
+    expect(queue.batches).toEqual([[{ kind: "push-mirror-sync", repoId: "p1", pushMirrorId: 1 }]]);
+    const row = await db.select().from(pushMirrors).all();
+    expect(row[0]!.syncState).toBe("queued");
+    // The manual run records ITS tick on the update_push_mirrors row.
+    const state = await listCronState(env.DB);
+    expect(state.get("update_push_mirrors")).toMatchObject({ runs: 1, lastSuccess: NOW, lastError: null });
+  });
+
+  it("demo_sweep runs its producer — DEMO_MODE-armed, the stale non-admin repo enqueues, tick recorded", async () => {
+    const db = drizzle(env.DB);
+    const owner = (
+      await db
+        .insert(users)
+        .values({ username: "demoer", usernameLower: "demoer", type: "user", status: "active", createdAt: AT })
+        .returning({ id: users.id })
+        .all()
+    )[0]!.id;
+    // Older than the 72 h window (the cut is now − 72 h; a fresh row escapes).
+    await seedRepoRow("d1", owner, "demoer", "stale", new Date(NOW.getTime() - 100 * 60 * 60 * 1000));
+    const tasks = recordingQueue();
+    // DEMO_MODE armed explicitly — hermetic against the local config posture
+    // (the vitest plugin injects the wrangler VARS into the test env). The
+    // var is literal-typed in the generated Env — the same documented
+    // mutation-hole override the audit test below uses.
+    const armed: Env = { ...env, REPO_TASKS: tasks };
+    (armed as { DEMO_MODE?: string }).DEMO_MODE = "true";
+    const result = await applyAdminMonitorCronForm(
+      armed,
+      { op: "demo_sweep", from: "monitor" },
+      { now: NOW },
+    );
+    expect(result).toEqual({ outcome: "applied", message: "Started Task: Demo Sweep" });
+    expect(tasks.batches).toEqual([[{ kind: "demo-sweep", repoId: "d1" }]]);
+    const state = await listCronState(env.DB);
+    expect(state.get("demo_sweep")).toMatchObject({ runs: 1, lastSuccess: NOW, lastError: null });
+  });
+
+  it("delete_old_audit_events runs its producer — armed retention, the expired audit row enqueues one sweep, tick recorded", async () => {
+    // The var is literal-typed in the generated Env — the documented
+    // mutation-hole override (audit.test.ts:604) pins the window hermetically.
+    const tasks = recordingQueue();
+    const armed: Env = { ...env, REPO_TASKS: tasks };
+    (armed as { AUDIT_RETENTION_DAYS?: string }).AUDIT_RETENTION_DAYS = "7";
+    await drizzle(env.DB)
+      .insert(auditEvents)
+      .values({
+        action: "repository:create",
+        actorId: 1,
+        scopeType: "system",
+        origin: "system",
+        createdUnix: new Date(NOW.getTime() - 8 * 24 * 60 * 60 * 1000), // past the 7 d window
+      })
+      .run();
+    const result = await applyAdminMonitorCronForm(armed, { op: "delete_old_audit_events", from: "monitor" }, { now: NOW });
+    expect(result).toEqual({ outcome: "applied", message: "Started Task: Delete audit events older than the retention period" });
+    expect(tasks.batches).toEqual([[{ kind: "audit-retention" }]]);
+    const state = await listCronState(env.DB);
+    expect(state.get("delete_old_audit_events")).toMatchObject({ runs: 1, lastSuccess: NOW, lastError: null });
+  });
+
+  it("cleanup_packages runs its producer — an enabled rule probe enqueues one sweep, tick recorded", async () => {
+    await drizzle(env.DB)
+      .insert(packageCleanupRules)
+      .values({ enabled: true, type: "", createdUnix: AT, updatedUnix: AT })
+      .run();
+    const tasks = recordingQueue();
+    // REPO_PACKS rides the real (empty) bucket — the spool probe misses, the
+    // rule probe alone arms the single enqueue.
+    const result = await applyAdminMonitorCronForm(
+      { ...env, REPO_TASKS: tasks },
+      { op: "cleanup_packages", from: "monitor" },
+      { now: NOW },
+    );
+    expect(result).toEqual({ outcome: "applied", message: "Started Task: Clean up expired packages" });
+    expect(tasks.batches).toEqual([[{ kind: "package-cleanup" }]]);
+    const state = await listCronState(env.DB);
+    expect(state.get("cleanup_packages")).toMatchObject({ runs: 1, lastSuccess: NOW, lastError: null });
   });
 
   it("an unknown task answers task.unknown WITHOUT running anything", async () => {
@@ -530,6 +660,24 @@ describe("applyAdminMonitorCronForm (DashboardPost's task arm over the landed pr
     const result = await applyAdminMonitorCronForm({ ...env, MIRROR_SYNC_QUEUE: queue }, { op: null, from: "monitor" }, { now: NOW });
     expect(result).toEqual({ outcome: "invalid", message: "Unknown task: " });
     expect(queue.batches).toEqual([]);
+  });
+
+  it("the still-bodyless census arms answer task.unknown exactly like an unknown op — nothing runs, no tick", async () => {
+    // stop_zombie_tasks and cleanup_actions ARE in the rendered census (the
+    // scheduled dispatcher's lens) but their producer modules are an in-flight
+    // sibling's ownership — the form's run gate answers the unknown flash for
+    // both, never a wrong body (the API twin's listed-but-unrunnable posture).
+    await seedDueMirror();
+    const queue = recordingQueue();
+    for (const op of ["stop_zombie_tasks", "cleanup_actions"]) {
+      const result = await applyAdminMonitorCronForm({ ...env, MIRROR_SYNC_QUEUE: queue }, { op, from: "monitor" }, { now: NOW });
+      expect(result, op).toEqual({ outcome: "invalid", message: `Unknown task: ${op}` });
+    }
+    expect(queue.batches).toEqual([]);
+    const row = await drizzle(env.DB).select().from(repoMirrors).all();
+    expect(row[0]!.syncState).toBe("idle"); // untouched
+    const state = await listCronState(env.DB);
+    expect(state.size).toBe(0); // never a tick for a bodyless arm
   });
 });
 

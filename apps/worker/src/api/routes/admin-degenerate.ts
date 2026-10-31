@@ -3,7 +3,18 @@ import type { OpenAPIHono } from "@hono/zod-openapi";
 import type { MiddlewareHandler } from "hono";
 import { z } from "zod";
 
+import { enqueueDueAuditRetention } from "../../services/audit";
+import { enqueueDueDemoSweeps } from "../../services/demo-sweep";
 import { enqueueDueMirrorSyncs } from "../../services/mirror/sync";
+import { enqueueDuePushMirrorSyncs } from "../../services/mirror/push-sync";
+import { enqueueDuePackagesCleanup } from "../../services/packages/cleanup";
+import {
+  CRON_ARMS,
+  listCronState,
+  recordArmsSuccess,
+  type CronArm,
+  type CronStateRow,
+} from "../../services/cron-state";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
@@ -18,17 +29,41 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
  *
  *   cron      GET  /admin/cron                     (adminCronList)
  *             POST /admin/cron/{task}              (adminCronRun)
- *             — upstream renders the in-code cron registry
- *               (gitea/routers/api/v1/admin/cron.go over services/cron);
- *               cf-gitea has no cron daemon — the ONE maintenance task we
- *               actually run is the wrangler.jsonc `triggers.crons` trigger
- *               (the every-10-minutes expression, the SPEC-0009 §2.6
- *               mirror-sync producer the Worker's `scheduled` handler
- *               serves). The static registry
- *               below mirrors that declaration under upstream's own task name
- *               (`update_mirrors`, services/cron/tasks_basic.go:31); the run
- *               arm executes the scheduled handler's exact body
- *               (enqueueDueMirrorSyncs) — "run = enqueue".
+ *             — upstream renders its in-code cron registry
+ *               (gitea/routers/api/v1/admin/cron.go ListCronTasks over
+ *               services/cron: every registered task, with the live
+ *               Next/Prev/ExecTimes triple, cron.go:119-127) and runs ONE
+ *               named task (PostCronTask → task.Run(), which counts
+ *               ExecTimes at start and stamps LastRun before the body —
+ *               services/cron/tasks.go:95-115). cf-gitea's analog registry
+ *               is the scheduled dispatcher's arm census — CRON_ARMS
+ *               (services/cron-state.ts), the same names the scheduled
+ *               handler's recorder keys and the admin monitor's cron page
+ *               renders — and its analog tick store is the `cron_state`
+ *               table the recorder upserts per entry (upstream keeps the
+ *               triple in memory on its long-lived Task structs; Workers
+ *               isolates are ephemeral, hence the store). The LIST renders
+ *               the full census with the recorded state merged (prev =
+ *               last_success — upstream's Prev is a run START while the
+ *               store's granularity is entry completion, the store's own
+ *               disclosed note — and exec_times = runs); the RUN arm
+ *               executes the arm's scheduled producer body ("run =
+ *               enqueue", the landed posture the monitor's form cites) and
+ *               records the manual tick exactly like the monitor does
+ *               (recordArmsSuccess, log-and-continue — upstream's
+ *               ExecTimes counts manual runs too, tasks.go:95-97).
+ *
+ *             The registry SPLIT the two surfaces keep (disclosed): the
+ *             census (7 arms) is the SCHEDULER's lens while the API's run
+ *             gate is the runnable subset whose producer bodies are landed
+ *             here — upstream's registry is its runnable set, but upstream
+ *             is one process where we are two invocation kinds (fetch vs
+ *             scheduled). A listed-but-unrunnable task answers the same 404
+ *             as an unknown one — the monitor's adjudicated arm
+ *             ("a listed-but-unrunnable arm must answer task.unknown
+ *             exactly like an unknown op", admin-monitor.tsx
+ *             RUNNABLE_CRON_ARMS); extending run capability extends BOTH
+ *             this map and the monitor's set (its extension rule says so).
  *   unadopted GET  /admin/unadopted                (adminUnadoptedList)
  *             POST /admin/unadopted/{owner}/{repo} (adminAdoptRepository)
  *             DELETE …/{owner}/{repo}              (adminDeleteUnadoptedRepository)
@@ -69,16 +104,18 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
  *     but its handler answers APIErrorNotFound() for every miss (adopt.go);
  *     in cf-gitea that miss is EVERY call, so the 404 is declared.
  *
- * Degenerate-value notes (the Cron render): `prev` and `exec_times` are not
- * tracked anywhere in cf-gitea (the wrangler trigger fires outside the
- * Worker; no counter is kept), so they render Go's zero values —
+ * Degenerate-value notes (the Cron render): an arm with no `cron_state` row
+ * (nothing recorded yet — a fresh deployment) renders Go's zero values —
  * `0001-01-01T00:00:00Z` / `0`, byte-identical to upstream's unset
- * time.Time/int64. `next` is REAL: the trigger expression is a minute-step
- * spec, so the next UTC firing is computable exactly (unsupported spec
- * shapes — a future wrangler cron the helper does not parse — render the
- * zero time rather than a wrong time). `schedule` renders the wrangler
- * expression verbatim (the every-10-minutes string), not upstream's
- * `@every 10m` config string — the expression is literally what runs.
+ * time.Time/int64; an arm WITH recorded ticks renders them
+ * (last_success / runs — the merge the monitor's state loader performs).
+ * `next` is REAL for the census's two spec shapes (the minute-step and the
+ * hourly-at-minute expressions): the next UTC firing is computable exactly
+ * (unsupported spec shapes — a future wrangler cron the helper does not
+ * parse — render the zero time rather than a wrong time). `schedule`
+ * renders the wrangler expression verbatim (the census's own convention),
+ * not upstream's `@every 10m` config string — the expression is literally
+ * what runs.
  */
 
 const notFoundResponse = {
@@ -116,39 +153,44 @@ const cronListSchema = z.array(cronSchema);
 const stringSliceSchema = z.array(z.string());
 
 // ---------------------------------------------------------------------------
-// The static cron task registry — the mirror of wrangler.jsonc
-// `triggers.crons` (the single source of truth for bindings, AGENTS.md).
-// The Worker's `scheduled` handler (src/index.ts) serves that trigger with
-// exactly the run body recorded here; a cron added to wrangler.jsonc joins
-// this registry under its upstream task name in the same change.
+// The cron registry — the arm census (CRON_ARMS, services/cron-state.ts) for
+// the LIST, and the runnable producer bodies for the RUN arm. The census is
+// the single source both the scheduled handler's recorder and the admin
+// monitor's cron page key on, so an API row, its tick row and the monitor
+// row can never drift apart; a census arm's producer body joins the run map
+// in the same change (the monitor's RUNNABLE_CRON_ARMS extension rule).
 // ---------------------------------------------------------------------------
 
-interface CronTask {
-  /** Upstream's task name (services/cron tasks_basic.go register calls). */
-  name: string;
-  /** The wrangler-declared trigger expression — rendered verbatim. */
-  spec: string;
-  /** The scheduled-handler body this task runs (the POST /admin/cron arm). */
-  run: (env: Env) => Promise<number>;
-}
+/** The env shapes the five producers take are structural subsets of Env; the
+ *  map's value type pins only what the callers share. */
+type CronRunBody = (env: Env) => Promise<number>;
 
-const CRON_TASKS: CronTask[] = [
-  {
-    name: "update_mirrors",
-    spec: "*/10 * * * *",
-    run: (env) => enqueueDueMirrorSyncs(env, {}),
-  },
-];
+/**
+ * The runnable arms — the census entries whose scheduled producer body is
+ * landed here (services/cron-state.ts's census holds the per-arm upstream
+ * cites; the bodies are the scheduled dispatcher's exact producer calls,
+ * "run = enqueue" — "crons enqueue, consumers do the work"). A census arm
+ * absent from this map (the actions-family arms, whose producer modules are
+ * an in-flight sibling's ownership) answers the run arm's 404 exactly like
+ * an unknown task — the monitor's adjudicated arm — and extending run
+ * capability extends the monitor's RUNNABLE_CRON_ARMS in the same landing.
+ */
+const CRON_RUN_BODIES: Readonly<Record<string, CronRunBody>> = {
+  update_mirrors: (env) => enqueueDueMirrorSyncs(env, {}),
+  update_push_mirrors: (env) => enqueueDuePushMirrorSyncs(env, {}),
+  demo_sweep: (env) => enqueueDueDemoSweeps(env, {}),
+  delete_old_audit_events: (env) => enqueueDueAuditRetention(env, {}),
+  cleanup_packages: (env) => enqueueDuePackagesCleanup(env, {}),
+};
 
 /** Go's zero time.Time as json.Marshal renders it (services/cron leaves
- *  task.Prev unset until the first fire; we never set it). */
+ *  task.Prev unset until the first fire; an arm without a cron_state row is
+ *  exactly that posture). */
 const GO_ZERO_TIME = "0001-01-01T00:00:00Z";
 
 /**
  * The minute-step subset of cron expressions (a star-slash-N minute field
- * followed by `* * * * *`) → the step in minutes, or null for anything else
- * (a future wrangler spec the helper does not parse renders the zero `next`
- * — never a wrong time).
+ * followed by `* * * * *`) → the step in minutes, or null for anything else.
  */
 function minuteStepMinutes(spec: string): number | null {
   if (spec === "* * * * *") {
@@ -160,6 +202,19 @@ function minuteStepMinutes(spec: string): number | null {
   }
   const step = Number.parseInt(match[1]!, 10);
   return step >= 1 ? step : null;
+}
+
+/**
+ * The hourly-at-minute subset (`M * * * *`, the DEMO_SWEEP_CRON shape) → the
+ * fire minute, or null for anything else.
+ */
+function hourlyEntryMinute(spec: string): number | null {
+  const match = /^(\d{1,2}) \* \* \* \*$/.exec(spec);
+  if (match === null) {
+    return null;
+  }
+  const minute = Number.parseInt(match[1]!, 10);
+  return minute >= 0 && minute <= 59 ? minute : null;
 }
 
 /**
@@ -175,15 +230,42 @@ function nextMinuteStepFire(stepMinutes: number, from: Date): Date {
   return next;
 }
 
-/** structs.Cron render — the cron.go ListCronTasks field mapping. */
-function toApiCron(task: CronTask, now: Date) {
-  const step = minuteStepMinutes(task.spec);
+/** The next UTC firing of an hourly-at-minute spec after `from`. */
+function nextHourlyFire(minute: number, from: Date): Date {
+  const next = new Date(from.getTime());
+  next.setUTCMinutes(minute, 0, 0);
+  if (next.getTime() <= from.getTime()) {
+    next.setUTCHours(next.getUTCHours() + 1);
+  }
+  return next;
+}
+
+/** The supported families' dispatch — null renders the zero time (never a
+ *  wrong time, the parser's own posture for an unsupported future spec;
+ *  mirrored from the monitor's nextFireForSpec). */
+function nextFireForSpec(spec: string, from: Date): Date | null {
+  const step = minuteStepMinutes(spec);
+  if (step !== null) {
+    return nextMinuteStepFire(step, from);
+  }
+  const minute = hourlyEntryMinute(spec);
+  if (minute !== null) {
+    return nextHourlyFire(minute, from);
+  }
+  return null;
+}
+
+/** structs.Cron render — the cron.go ListCronTasks field mapping over the
+ *  census arm and its recorded state (prev = last_success, exec_times =
+ *  runs; a rowless arm renders the zero pair). */
+function toApiCron(task: CronArm, now: Date, state: CronStateRow | undefined) {
+  const next = nextFireForSpec(task.spec, now);
   return {
-    name: task.name,
+    name: task.arm,
     schedule: task.spec,
-    next: step === null ? GO_ZERO_TIME : nextMinuteStepFire(step, now).toISOString(),
-    prev: GO_ZERO_TIME,
-    exec_times: 0,
+    next: next === null ? GO_ZERO_TIME : next.toISOString(),
+    prev: state === undefined || state.lastSuccess === null ? GO_ZERO_TIME : state.lastSuccess.toISOString(),
+    exec_times: state?.runs ?? 0,
   };
 }
 
@@ -329,26 +411,41 @@ const adminDeleteUnadoptedRepositoryRoute = (requireAuth: MiddlewareHandler<ApiE
 // ---------------------------------------------------------------------------
 
 export function registerAdminDegenerateRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>): void {
-  // GET /admin/cron — the static registry, upstream-paginated (cron.go:
-  // ListCronTasks — count before the slice, X-Total-Count over the full set).
-  app.openapi(adminCronListRoute(requireAuth), (c) => {
+  // GET /admin/cron — the full arm census, upstream-paginated (cron.go:
+  // ListCronTasks — count before the slice, X-Total-Count over the full
+  // registry) with the recorded tick state merged (the monitor's loader
+  // shape; one point scan of a ≤7-row table).
+  app.openapi(adminCronListRoute(requireAuth), async (c) => {
     const options = parseListOptions(new URL(c.req.url));
     const start = (options.page - 1) * options.limit;
-    const page = CRON_TASKS.slice(start, start + options.limit);
-    setPaginationHeaders(c, CRON_TASKS.length, options);
-    return c.json(page.map((task) => toApiCron(task, new Date())), 200);
+    const state = await listCronState(c.env.DB);
+    const now = new Date();
+    const page = CRON_ARMS.slice(start, start + options.limit).map((arm) => toApiCron(arm, now, state.get(arm.arm)));
+    setPaginationHeaders(c, CRON_ARMS.length, options);
+    return c.json(page, 200);
   });
 
-  // POST /admin/cron/{task} — unknown task → APIErrorNotFound() (cron.go:
-  // PostCronTask); a known task runs its scheduled-handler body inline (the
-  // enqueue is a bounded SELECT + sendBatch, sub-second) and answers 204.
+  // POST /admin/cron/{task} — unknown AND listed-but-unrunnable →
+  // APIErrorNotFound() (cron.go PostCronTask's miss arm; the monitor's
+  // adjudicated posture for the census/runnable split). A runnable task
+  // executes its scheduled producer body inline (each body is a bounded
+  // probe + enqueue, sub-second) and then records the manual tick exactly
+  // like the monitor's form does — recordArmsSuccess AFTER the body,
+  // log-and-continue (upstream counts manual runs too, tasks.go:95-97; a
+  // failed run records nothing — recordArmsSuccess is a COMPLETED tick).
   app.openapi(adminCronRunRoute(requireAuth), async (c) => {
     const { task } = c.req.valid("param");
-    const known = CRON_TASKS.find((entry) => entry.name === task);
-    if (known === undefined) {
+    const run = CRON_RUN_BODIES[task];
+    if (run === undefined) {
       throw new ApiError(404, "not found");
     }
-    await known.run(c.env);
+    await run(c.env);
+    const arm = CRON_ARMS.find((entry) => entry.arm === task);
+    if (arm !== undefined) {
+      await recordArmsSuccess(c.env.DB, [arm]).catch((recordError: unknown) => {
+        console.error("[cron-state] manual run tick not recorded", recordError);
+      });
+    }
     return c.body(null, 204);
   });
 
