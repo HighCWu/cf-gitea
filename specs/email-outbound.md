@@ -1,6 +1,7 @@
 # SPEC: Outbound Email (the mailer service, transport decision, first trigger)
 
-Status: **DESIGN + FIRST VERTICAL SLICE** (gap-fill queue #8, 2026-10-31).
+Status: **DESIGN + TWO VERTICAL SLICES** (gap-fill queue #8, 2026-10-31; slice
+two — the mail notify hub + the issue-comment surface — same day).
 Upstream references are at the submodule pin `fc4936884584a41931906553d96c2601d750e6ef`.
 
 Companion to `specs/user-notification-settings.md` (which stores the
@@ -47,11 +48,25 @@ upstream's shape impossible and multiple equally faithful adaptations exist
 
 ### 1.3 Out of scope (enumerated follow-ups, in upstream-surface order)
 
-- The **mail notifier arm** (upstream `services/mailer/notify.go` —
-  `MailParticipants`/`MailParticipantsComment` fanning issue/PR/comment
-  events to watchers): needs the watch/subscription fan-out read plus the
-  `mail/repo/issue/*` template family. Largest follow-up; lands after this
-  slice proves the pipe.
+- The **mail notifier arm** — slice two landed its FIRST surface (§8): the
+  notify hub (`services/mail/notify.ts`, the `CreateIssueComment` receiver's
+  plain type-0 comment arm) over the full recipient resolution
+  (`mailIssueCommentToParticipants`, mail_issue.go:28-120) and the
+  `mail/repo/issue/default.tmpl` comment render. STILL FOLLOW-UP, in
+  upstream notify.go order:
+  - the sibling arms over the SAME resolution core — `NewIssue`
+    (notify.go:53), `IssueChangeStatus` (close/reopen, :59), `NewPullRequest`
+    (:92), `IssueChangeTitle`'s WIP-ready branch (:80) — each a thin wrapper
+    passing a different action type and `comment = null` (the hub is
+    structured for exactly this); note `CreateIssueComment`'s own
+    Close/Reopen/Code/PullRequestPush comment-type branches ride those
+    arms' write paths, not the plain-comment one;
+  - mentions (`services/mentions` — the `onmention` preference stays
+    unreachable until it lands, see §8's reduction ledger);
+  - `SendIssueAssignedMail` (`mail_issue.go:201-234`) + the
+    `IssueChangeAssignee`/`PullRequestReviewRequest` receivers
+    (notify.go:119-136) — the assigned.tmpl family;
+  - `MailMentionsComment` (code-comment mentions, mail_comment.go:42-62).
 - `SendActivateAccountMail` (upstream `mail_user.go:52`) + the
   `REGISTER_EMAIL_CONFIRM` flow: needs an activation-code store and the
   `/user/activate` web arm.
@@ -69,6 +84,10 @@ upstream's shape impossible and multiple equally faithful adaptations exist
   is a follow-up).
 - A stranded-`pending` re-drive sweep (§4.5 records the known gap; the
   webhook-delivery sweep precedent is the model).
+- The API route wiring handoff (§8.4): the `issueCreateComment` route still
+  constructs `IssuesService(c.env.DB)` — the one-line pass-through of the
+  notify env rides the routes owner's landing window (the emit itself is in
+  the service, upstream-shaped; never in a route handler).
 
 ---
 
@@ -412,6 +431,164 @@ at the recipient; the header-injection `emailToReplacer` strip
 
 ---
 
+## 8. SLICE TWO AS-BUILT — the notify hub + the issue-comment surface
+
+### 8.1 The pin's notify map (what slice two ports)
+
+- The receiver: `services/mailer/notify.go` — `mailNotifier` implements the
+  40+ arm `Notifier` interface (`services/notify/notifier.go:21-92`). The
+  FIRST arm in file order is `CreateIssueComment` (notify.go:31-51): a
+  type-0 comment maps to `ActionCommentIssue` (:40-43 — regardless of
+  IsPull) and fires `MailParticipantsComment` (`mail_comment.go:19-40`,
+  doer = `Comment.Poster`). Downstream both funnel into the shared
+  `mailIssueCommentToParticipants` (mail_issue.go:28-120) and
+  `composeIssueCommentMessages` (mail_issue_common.go:47-215) — the exact
+  middle our hub ports, so the remaining arms are additive wrappers.
+- Template resolution: `actionToTemplate` (mail_issue_common.go:219-278)
+  maps ActionCommentIssue → name "comment" → template
+  `mail/repo/issue/comment`, which does NOT exist upstream either — the
+  stock fallback chain lands on `mail/repo/issue/default.tmpl`. The subject
+  half of default.tmpl is EMPTY (no `---` split, modules/templates/
+  mail.go:119-163) so the subject is `util.IfZero(subject, fallback)` —
+  the fallback `fallbackIssueMailSubject` (`[owner/repo] Title (#Index)`,
+  mail_issue_common.go:34-36) prefixed `Re: ` because `actName != "new"`
+  (:88-91). Upstream's own test pins it: `Re: [user2/repo1] issue1 (#1)`
+  (services/mailer/mail_test.go:312,353).
+- Message identity: `generateMessageIDForIssue` (mail_issue_common.go:
+  280-305) — `<owner/repo/issues|pulls/#index[/comment/<id>]@AppDomain>`;
+  In-Reply-To/References = the thread root (comment nil, action 0).
+  Verified against mail_test.go:130-133.
+- Headers: `generateAdditionalHeadersForIssue` (mail_issue_common.go:
+  307-321) over `generateMetadataHeaders` (mail.go:180-198: List-ID
+  `owner/repo <repo.owner.domain>`, List-Archive, X-Mailer, X-Gitea-
+  Repository*, X-GitLab-Project*), `generateSenderRecipientHeaders`
+  (mail.go:200-208, per-recipient — the reason one row per recipient is
+  load-bearing) and `generateReasonHeaders` (mail.go:210-216; reason =
+  "issue"|"pull" by IsPull, mail_issue_common.go:207 passes actType).
+- Recipient sources (mail_issue.go:43-76, upstream order): poster,
+  assignees (`GetAssigneeIDsByIssue`), participants
+  (`GetParticipantsIDsByIssueID`, models/issues/issue.go:620-627 — DISTINCT
+  poster over comment types 0/21/22), issue watchers
+  (`GetIssueWatchersIDs(issueID, true)`), repo watchers
+  (`GetRepoWatchersIDs` — prepended ahead of the accumulated slice,
+  mail_issue.go:76). Exclusions: ignorers (:87-92), the doer unless
+  `EmailNotificationsAndYourOwn` (:94-97), mentions batch first (:99-102),
+  explicit issue unwatchers (:104-109), then `GetMailableUsersByIDs`
+  (models/user/user.go — individual, !prohibit_login, is_active,
+  preference ∈ enabled/andyourown) and the per-recipient batch filter
+  (`IsMailable`, the preference gate with the mention/custom allowance,
+  the visited dedupe, `CheckRepoUnitUser` — models/perm/access/
+  repo_permission.go:660-672 — admin ⇢ true, public reads to everyone,
+  private needs a grant).
+- The WIP gate: repo watchers are dropped when `issue.IsPull &&
+  PullRequest.IsWorkInProgress` (mail_issue.go:70 — IsWorkInProgress IS the
+  title-prefix check, models/issues/pull.go; a comment arm's action is
+  never ActionCreatePullRequest so upstream's third clause holds).
+
+### 8.2 The recipient-model inventory verdict (what exists vs the reduction)
+
+Our schema carries the FULL core recipient model — no table was invented:
+
+- `issues.posterId`, `issue_assignees`, `issue_subscriptions`
+  (is_watching both arms — the explicit-unwatch exclusion works),
+  `repo_watchers`, `comments.posterId` (the participants source), the
+  typed `user_settings.email_notifications_preference` (upstream's exact
+  enum; an ABSENT row IS upstream's 'enabled' default, admin.go:32 — the
+  LEFT JOIN + default mirrors upstream's users-column read, the SPEC
+  user-notification-settings collapse) and `users` (status/type/email/
+  is_admin/full_name).
+- The grant predicate for the private-repo arm of CheckRepoUnitUser is the
+  landed single predicate `doerRepoAccessMode` (the repo_permission.go:
+  448-508 fold per its header); the unit-ENABLED half reads the landed
+  `repo_settings`/`repo_units` flags via `loadRepoSettings`.
+
+The documented REDUCTIONS (schema-absent upstream pieces, none invented):
+
+1. **Repo-watch modes**: upstream's `watch` table carries mode + include_
+   flags (models/repo/watch.go:17-43); ours is (repo_id, user_id). Every
+   watcher receives issue AND pull mail; there are no ignorers
+   (GetRepoIgnorersIDs) and no custom watchers.
+2. **Mentions**: no mention parser — the mentions batch (mail_issue.go:
+   99-102) is unported, so `onmention`-preference users have no reachable
+   source (mentions and custom watchers are both absent) and are excluded
+   everywhere. Additive when the mentions service lands.
+3. **`emoji.ReplaceAliases`** on the subject (mail_issue_common.go:133):
+   no alias table ported — the fallback subject carries the title verbatim.
+4. **Incoming-email header arms**: Reply-To/List-Post and the mailto
+   tokens in References/List-Unsubscribe ride `IncomingEmail` (mail_issue_
+   common.go:181-202, `CanReply`) — not landed; the lists carry the URL
+   arm only.
+5. The comment body renders through the shared markdown service's
+   "comment" mode with absolute links (upstream renderhelper
+   NewRenderContextRepoComment + WithUseAbsoluteLink(true)) — the
+   SPEC-0008 §3.4 markdown-it posture.
+
+### 8.3 The hub's shape and the emit site
+
+- `services/mail/notify.ts` carries the notify-event vocabulary
+  (`MailNotifyEvent` — upstream's Notifier method names) and ONE enqueue
+  entry, `notifyIssueComment(env, {issue, comment, doer})`: gate (§5.1)
+  → MAIL_FROM parse (§5.2) → repo pair → recipient resolution (§8.1/8.2)
+  → compose → one `enqueueMailOutbox` per recipient. Dedupe keys are
+  `issue-comment:<commentId>:<recipientUserId>` — the same trigger-level
+  idempotency discipline as slice one's `register-notify:<userId>` (a
+  re-driven emit re-inserts nothing; the arbiter settles the winner).
+  One row per recipient IS upstream's leak prevention
+  (mail_issue_common.go:143,164-212 — independent Messages); upstream's
+  100-batch `SendAsync` grouping is a queue-feed optimization ours doesn't
+  need (each row carries its own queue message).
+- The emit site is the REAL write path: `IssuesService.addComment`
+  (src/issues/service.ts) — upstream fires notify from the model layer
+  too (services/issues/comments.go → services/notify), never the router.
+  The service takes an OPTIONAL second constructor argument (the notify
+  env); every existing construction site (`new IssuesService(c.env.DB)`,
+  20+ sites) is untouched and the arm stays OFF there — the same
+  fail-closed posture as `MAIL_ENABLED != "true"`. Failures are caught and
+  logged (upstream logs at the receiver, notify.go:48-50); the write stays
+  committed. The plain type-0 guard scopes the arm: close/reopen system
+  comments ride `transitionClosed` (the IssueChangeStatus surface),
+  code/review/push comments their own arms (§1.3).
+
+### 8.4 HANDOFF — the API route wiring (one line, routes-owner)
+
+`api/routes/issues.ts`'s `issueCreateComment` handler still constructs
+`IssuesService(c.env.DB)` — the HTTP path's notify arm is OFF until the
+route passes the notify source. The proposed wiring (routes-owner to fold
+into a landing window; no other line changes):
+
+```ts
+const service = new IssuesService(c.env.DB, c.env); // was: new IssuesService(c.env.DB)
+```
+
+(`c.env` satisfies `MailNotifyEnv` structurally — DB + the four MAIL_*/
+APP_URL vars it reads; the arm no-ops unless `MAIL_ENABLED === "true"`.)
+The service-level vertical (write → outbox rows → consumer → sent) is
+proven green in src/services/mail/notify.test.ts; the route pass-through
+adds no logic, only the env hop. The UI session path (src/ui/**, not
+ours) carries the same one-line option when its comment posting lands.
+
+### 8.5 As-built details (recorded at implementation, same change)
+
+- The recipient ORDER is upstream's list order (repo watchers prepended
+  first, then poster, assignees, participants, issue watchers), deduped by
+  first occurrence — upstream's container.Set at mail_issue.go:85.
+- The mail URL join: `Issue.HTMLURL` = `Repo.HTMLURL()` + "/issues|pulls/"
+  + index (issue.go:386-394) — our origin arrives in AppUrl's
+  trailing-slash form and the join absorbs it (`origin + owner/...`,
+  no double slash); the comment anchor is `#issuecomment-<id>`
+  (CommentHashTag, models/issues/comment.go:554-556).
+- `msg.Info` = `"Subject: <sanitized>, issue comments"` — the batch info
+  string is "issue comments" (mail_issue.go:159) inside upstream's
+  `"Subject: %s, %s"` (mail_issue_common.go:173).
+- The From display name: `fromDisplayName(doer)`'s default template
+  (mail.go:157-175) — `FullName (username)` when a full name is set, else
+  the username; distinct from the recipient-side `EmailTo` shape.
+- The head title slot carries the SANITIZED subject (upstream sets
+  `mailMeta["Subject"]` post-sanitize, mail_issue_common.go:135) while the
+  row stores the raw one (§4.2) — sanitize is idempotent at consume.
+
+---
+
 ## 6. API/config surface
 
 No new bindings (the arm reads `DB` + `REPO_TASKS`, both landed). Vars
@@ -475,6 +652,30 @@ shape) so no real provider is ever contacted:
 6. **purge.ts dispatch**: the new arm drives the consumer for a
    `{kind: "mail-outbox"}` body and leaves every existing arm's
    behavior untouched (the other kinds' fixtures asserted un-regressed).
+
+Slice two adds (all in `src/services/mail/notify.test.ts`, same workerd +
+real-D1 posture, the queue stubbed):
+
+7. **Template byte-shape**: `renderIssueCommentMail` pins the Go-template
+   whitespace trace verbatim (the two dropped-`{{if}}` lines, the `<p>`
+   block's else-branch indentation, the bare link line), the head-title
+   escaping, and `issueMailFallbackSubject` against mail_test.go's own
+   `[user2/repo1] issue1 (#1)` shape.
+8. **Recipient resolution** (`resolveIssueMailRecipients`, the
+   mailIssueCommentToParticipants port): the full source union with
+   upstream's order; the doer exclusion (+ the andyourown exception with a
+   source); the explicit-unwatch exclusion; the preference prefilter
+   through `user_settings` (absent row = enabled); the mailable filter
+   (org/prohibited/no-email); the WIP repo-watcher gate (issue + PR
+   twins); the private-repo grant gate (collaborator row in, everyone
+   else out); the unit-enabled gate; the empty-recipient skip.
+9. **The end-to-end surface**: `IssuesService.addComment` (armed env) →
+   one outbox row per resolved recipient with the right dedupe key +
+   subject/info/headers/Message-ID/In-Reply-To byte pins → one queue
+   message each → the landed consumer arm settles `sent`; MAIL_ENABLED
+   off → zero rows; malformed MAIL_FROM → the write still succeeds; no
+   env → the arm is off (every existing construction site's posture);
+   system-comment types never ride this arm.
 
 Gate: the new suites green own-eyes (`pnpm test <files>`); bare
 `tsc --noEmit` zero errors; scoped eslint clean; `pnpm db:generate`

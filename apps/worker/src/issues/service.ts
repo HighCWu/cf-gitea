@@ -33,6 +33,7 @@ import {
   releases,
   repoCounters,
   repositories,
+  users,
   PRFlow,
   PRStatus,
 } from "../db/schema";
@@ -45,6 +46,7 @@ import {
   ReleaseAlreadyExistError,
   RepositoryNotExistError,
 } from "./errors";
+import { notifyIssueComment, type MailNotifyEnv } from "../services/mail/notify";
 
 export type IssueRow = typeof issues.$inferSelect;
 export type CommentRow = typeof comments.$inferSelect;
@@ -220,9 +222,21 @@ export type MilestoneStateFilter = "open" | "closed" | "all";
 
 export class IssuesService {
   private readonly db: DrizzleD1Database;
+  private readonly d1: D1Database;
+  /**
+   * The mail-notify arm's env (specs/email-outbound.md §8): when present,
+   * `addComment` fans the plain-comment notify mail (upstream's
+   * CreateIssueComment receiver, services/mailer/notify.go:31-51 — notify
+   * fires from the model layer, never the router). Absent (every existing
+   * construction site passes D1 only) the arm is off — the same fail-closed
+   * posture as `MAIL_ENABLED != "true"`, so callers are untouched.
+   */
+  private readonly mailEnv?: MailNotifyEnv;
 
-  constructor(d1: D1Database) {
+  constructor(d1: D1Database, mailEnv?: MailNotifyEnv) {
+    this.d1 = d1;
     this.db = drizzle(d1);
+    this.mailEnv = mailEnv;
   }
 
   // ---------------------------------------------------------------------------
@@ -599,6 +613,16 @@ export class IssuesService {
    * Add a comment: the comment row and the `num_comments` increment (plus
    * `updated_unix`) land in one batch. Lock gating is a route-level
    * permission check (§2.2); the service stays permission-free.
+   *
+   * The mail-notify arm (specs/email-outbound.md §8): a plain type-0 comment
+   * fanned to the notify hub when the constructor carries a mail env —
+   * upstream fires `notify.CreateIssueComment` inside the comment-create
+   * service too (services/issues/comments.go → services/notify), never from
+   * the router. Awaited inline (the register-notify posture: the outbox
+   * INSERT is the durable record), failures caught and logged — a mailer
+   * outage must never fail the write (upstream logs at the receiver,
+   * notify.go:48-50). The system-comment types (close/reopen/labels/…) ride
+   * their own notify arms, not this one (SPEC §1.3 follow-ups).
    */
   async addComment(input: AddCommentInput): Promise<CommentRow> {
     const issue = await this.getIssueById(input.issueId);
@@ -623,7 +647,38 @@ export class IssuesService {
     ] as const);
     const rows = batchRows<CommentRow>(results[0], "comment insert");
     if (rows[0] === undefined) throw new Error("comment batch committed without returning rows");
+    await this.notifyCommentCreated(issue, rows[0], input, now);
     return rows[0];
+  }
+
+  /** The CreateIssueComment receiver arm — best-effort, never throws (the
+   *  errors log; the write above stays committed). */
+  private async notifyCommentCreated(
+    issue: IssueRow,
+    comment: CommentRow,
+    input: AddCommentInput,
+    now: Date,
+  ): Promise<void> {
+    if (this.mailEnv === undefined) return;
+    if ((input.type ?? CommentType.Comment) !== CommentType.Comment) return;
+    if (input.posterId === null || input.posterId === undefined) return;
+    try {
+      const doer = (await this.db.select().from(users).where(eq(users.id, input.posterId)).get()) ?? null;
+      if (doer === null) {
+        console.error(`[issues] comment notify skipped: doer row missing [id: ${input.posterId}]`);
+        return;
+      }
+      const outcome = await notifyIssueComment(this.mailEnv, { issue, comment, doer }, { now });
+      if (outcome.outcome === "enqueued" && outcome.enqueue.some((e) => e.outcome === "pending-unqueued")) {
+        console.warn(
+          `[issues] comment notify: some rows stayed pending-unqueued (comment ${comment.id})`,
+        );
+      }
+    } catch (error) {
+      console.error(
+        `[issues] comment notify failed (comment ${comment.id}): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   // ---------------------------------------------------------------------------

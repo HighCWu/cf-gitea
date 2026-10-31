@@ -1682,7 +1682,10 @@ export function registerIssueRoutes(
         throw new ApiError(403, "You cannot comment on a locked issue.");
       }
       const form = c.req.valid("json");
-      const service = new IssuesService(c.env.DB);
+      // The mail-notify arm (SPEC email-outbound §8.4's fold): the env arms
+      // the hub — CreateIssueComment's fan-out (notify.go:31-51) fires from
+      // the service's addComment, upstream-shaped; fail-closed without it.
+      const service = new IssuesService(c.env.DB, c.env);
       const requester = c.get("authUser");
       // CreateIssueComment's blocked arm (services/issue/comments.go:63-65
       // via routers/api/v1/repo/issue_comment.go:387): the doer blocked by

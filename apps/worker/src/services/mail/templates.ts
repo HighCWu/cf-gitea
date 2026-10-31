@@ -6,13 +6,21 @@
  * `options/locale/locale_en-US.json`; our tree serves English only and has
  * no Go-template runtime, so the strings are pinned verbatim here).
  *
- * This file carries the first surface only:
+ * This file carries two surfaces:
  *
  *   - `renderRegisterNotify` — `templates/mail/user/auth/register_notify.tmpl`
  *     over `templates/mail/base/head.tmpl` + `footer.tmpl` (the layout
  *     verbatim: the meta/color-scheme head, the style block, the three
  *     locale paragraphs, the `user/login` + `user/forgot_password` links,
  *     the AppUrl footer table).
+ *   - `renderIssueCommentMail` — the notify family's landing template:
+ *     `templates/mail/repo/issue/default.tmpl` rendered for the plain-comment
+ *     arm (action name "comment" — actionToTemplate,
+ *     services/mailer/mail_issue_common.go:219-278: "mail/repo/issue/comment"
+ *     does not exist upstream either, so the stock render falls through to
+ *     default). The same template file serves the additive arms
+ *     (new/close/reopen/merge) with different `.ActionName` branches, so the
+ *     later surfaces extend this family in place.
  *
  * DotEscape (modules/templates/mail.go:41-43) is applied to the display
  * name exactly where the upstream template applies it (the title's
@@ -118,7 +126,7 @@ export function renderRegisterNotify(data: RegisterNotifyData): string {
   const loginUrl = `${appUrl}user/login`;
   const setPwdUrl = `${appUrl}user/forgot_password`;
 
-  return `${baseHead(escapeHtml(registerNotifySubject(dotEscaped, appName)))}
+	return `${baseHead(escapeHtml(registerNotifySubject(dotEscaped, appName)))}
 <body>
 	<p>Hi <b>${displayName}</b>,</p>
 	<p>This is your registration confirmation email for ${appName}!</p>
@@ -127,6 +135,72 @@ export function renderRegisterNotify(data: RegisterNotifyData): string {
 	<p>Not working? Try copying and pasting it to your browser.</p>
 
 	${baseFooter(appUrl, appName)}
+</body>
+</html>`;
+}
+
+// ---------------------------------------------------------------------------
+// The notify family (templates/mail/repo/issue/default.tmpl)
+// ---------------------------------------------------------------------------
+
+/**
+ * `fallbackIssueMailSubject` (services/mailer/mail_issue_common.go:34-36) —
+ * `[FullName] Title (#Index)` over `repo.FullName()` ("owner/repo"). The
+ * stock default.tmpl carries no subject section (no `---` split,
+ * modules/templates/mail.go:119-163), so every comment-arm mail's subject IS
+ * this fallback with the `Re: ` prefix applied by the caller when
+ * `actName != "new"` (mail_issue_common.go:88-91).
+ */
+export function issueMailFallbackSubject(repoPath: string, title: string, index: number): string {
+  return `[${repoPath}] ${title} (#${index})`;
+}
+
+/** Data for `renderIssueCommentMail` (the upstream template data map's used
+ *  slice for the comment branch). */
+export interface IssueCommentMailData {
+  /** Upstream `.Subject` — the compose-time SANITIZED subject
+   *  (mail_issue_common.go:127-135: sanitize → IfZero fallback → into the
+   *  meta map), html/template-escaped into the head title slot. */
+  subject: string;
+  /** Upstream `.Body` — the comment content rendered to HTML
+   *  (mail_issue_common.go:71-72 RenderString over the repo-comment context
+   *  with absolute links); inserted RAW like upstream does. */
+  bodyHtml: string;
+  /** Upstream `.Link` — Issue.HTMLURL, plus `#issuecomment-<id>` for a
+   *  comment mail (`Comment.HashTag`, models/issues/comment.go:554-556). */
+  link: string;
+  /** Upstream `.Issue.Index`. */
+  issueIndex: number;
+  /** Upstream `AppName` (the head footer's link text). */
+  appName: string;
+  /** Upstream `AppUrl` — trailing-slash form. */
+  appUrl: string;
+}
+
+/**
+ * `templates/mail/repo/issue/default.tmpl` for the comment arm — byte-faithful
+ * trace of the Go template with `.IsMention` false, `.ActionName` "comment",
+ * non-empty `.Body`, empty `.ReviewComments`, `.CanReply` false (no incoming
+ * email): the two dropped `{{if}}` lines leave their tab+newline, the `<p>`
+ * block renders the body inside the else-branch's tab indentation, and the
+ * link line follows. Upstream's `emoji.ReplaceAliases` on the subject
+ * (mail_issue_common.go:133) is NOT applied — no emoji alias table is ported
+ * (recorded divergence; additive later).
+ */
+export function renderIssueCommentMail(data: IssueCommentMailData): string {
+  const title = escapeHtml(data.subject);
+  const link = escapeHtml(data.link);
+  return `${baseHead(title)}
+<body>
+\t
+\t
+\t<p>
+\t\t
+\t\t\t${data.bodyHtml}
+\t\t</p>
+\t
+\t<p><a href="${link}">#${data.issueIndex}</a>.</p>
+\t${baseFooter(data.appUrl, data.appName)}
 </body>
 </html>`;
 }
