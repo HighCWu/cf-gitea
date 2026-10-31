@@ -59,16 +59,38 @@
  *   writer's per-row Edit link now target).
  * - The issue-navbar compact menu reduces to the single live item
  *   (Milestones): the Labels list page does not exist (dead-link rule).
- * - The row's close/delete controls are not rendered — upstream's
- *   `/{id}/{action}` and `/delete` write routes have no pages in this UI's
- *   inventory (the §2.4.1 "dead links are not emitted" rule; the Edit link
- *   is live — pages/milestone-detail.tsx's edit form).
+ * - The row's close/delete controls WERE unrendered through wave 26 (the
+ *   §2.4.1 dead-link rule over the then-unclaimed routes); the write-tails
+ *   section below claims them (census gap #7 — the routes + controls went
+ *   live together, the no-JS form reduction documented there).
  * - The search box and the `?sort=` / `?q=` facets are not wired (no search
  *   route); the state facet is.
  * - Total tracked time has no landed source (no timetracker) — the clock
  *   chip renders only for the updated/closed stamps.
  * - Pagination is the list pages' Older/Newer shape (upstream
  *   base/paginate), page size upstream `setting.UI.IssuePagingNum` = 20.
+ *
+ * ## The write tails (census gap #7 — milestone close/open + delete)
+ *
+ * The row's writer controls render the upstream milestones.tmpl action
+ * trio in full now: the Edit link (wave 26), the close/open toggle
+ * (`milestones/{id}/{action}` — web.go:1429 ChangeMilestoneStatus, the
+ * `{open,close}` grammar: an OPEN row shows the Close button posting
+ * `{id}/close`, a CLOSED row the Open button posting `{id}/open`) and the
+ * delete button (`milestones/delete` + the hidden form `id` — web.go:1430
+ * DeleteMilestone, the labels-delete form shape). Upstream renders the
+ * toggle as a JS `link-action` anchor and the delete behind a
+ * data-modal-confirm dialog (milestones.tmpl's
+ * #repo-milestone-delete-modal); the no-JS reduction is the landed
+ * labels-row posture — plain `<form method="post">` buttons, the confirm
+ * dialog dropped (the repo-labels delete convention). The POSTs run the
+ * §2.8 sameOriginGuard + the labels-write gate (reqSignIn +
+ * RepoMustNotBeArchived + reqRepoIssuesOrPullsWriter — the faithful port,
+ * NOT the /new form's admin reduction) and ride
+ * pages/issue-write-tails.ts's handlers; the page module itself carries no
+ * write seam for them (the handlers resolve, gate and 303 exactly like the
+ * landed labels writes; `?state={action}` is upstream's verbatim redirect,
+ * including its `?state=close` lands-on-the-open-tab quirk).
  */
 
 import { IssuesService } from "../../issues/service";
@@ -99,6 +121,10 @@ export const milestonesLocale = {
   desc: "Description", // "repo.milestones.desc"
   create: "Create Milestone", // "repo.milestones.create"
   new_subheader: "Milestones can help you organize issues and track their progress.", // "repo.milestones.new_subheader"
+  edit: "Edit", // "repo.issues.label_edit" (the row's Edit link — the milestones.tmpl anchor text)
+  open: "Open", // "repo.milestones.open" (the closed row's toggle button)
+  close: "Close", // "repo.milestones.close" (the open row's toggle button)
+  remove: "Delete", // "repo.issues.label_delete" (the row's delete button — upstream's anchor text is the label_delete key)
   /** The invalid-deadline re-render message — upstream's exact string. */
   invalid_due_date_format: "Due date format must be 'yyyy-mm-dd'.", // "repo.milestones.invalid_due_date_format"
   /** cf-gitea addition: upstream's HTML5 `required` catches the empty title
@@ -336,10 +362,14 @@ function MilestonesPagination(props: { basePath: string; state: "open" | "closed
 
 /** One `.item.flex-relaxed-list` row of milestones.tmpl (reductions in the
  *  module header). Wave 26: the title links onto the milestone DETAIL page
- *  (upstream's `<a class="muted" href="{RepoLink}/milestone/{id}">`) and
- *  the writer's per-row Edit link renders beside the counts (upstream's
- *  admin-controls div reduced to the live link — the close/delete POSTs
- *  stay unrendered). */
+ *  (upstream's `<a class="muted" href="{RepoLink}/milestone/{id}">`).
+ *  Census gap #7: the writer controls render the template's full action
+ *  trio — the Edit link, the close/open toggle (form POST onto
+ *  `{id}/{open|close}` — an open row shows Close, a closed row Open, the
+ *  upstream anchor glyphs dropped for the landed button shape) and the
+ *  delete button (form POST onto `/milestones/delete` + the hidden `id`,
+ *  the labels-row form shape; upstream's data-modal-confirm dialog is the
+ *  documented drop). */
 function MilestoneListItemRow(props: { item: MilestoneListItem; repoLink: string; canWriteIssues: boolean }) {
   const { row, completeness } = props.item;
   return (
@@ -395,8 +425,25 @@ function MilestoneListItemRow(props: { item: MilestoneListItem; repoLink: string
         {props.canWriteIssues ? (
           <div class="flex-text-block tw-flex-wrap">
             <a class="flex-text-inline" href={`${props.repoLink}/milestones/${row.id}/edit`}>
-              <Icon name="octicon-pencil" size={14} /> Edit
+              <Icon name="octicon-pencil" size={14} /> {milestonesLocale.edit}
             </a>
+            {/* The close/open toggle (web.go:1429's {id}/{action} — the
+                action is the OPPOSITE of the row's state, upstream's
+                link-action anchor reduced to the no-JS form). */}
+            <form class="tw-inline-block" action={`${props.repoLink}/milestones/${row.id}/${row.isClosed ? "open" : "close"}`} method="post">
+              <button type="submit" class="ui tiny button">
+                {row.isClosed ? milestonesLocale.open : milestonesLocale.close}
+              </button>
+            </form>
+            {/* The delete button (web.go:1430 — the form-borne `id` field;
+                upstream's confirm dialog dropped, the labels-delete
+                convention). */}
+            <form class="tw-inline-block" action={`${props.repoLink}/milestones/delete`} method="post">
+              <input type="hidden" name="id" value={row.id} />
+              <button type="submit" class="ui tiny button tw-text-red">
+                {milestonesLocale.remove}
+              </button>
+            </form>
           </div>
         ) : null}
       </div>

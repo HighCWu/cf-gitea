@@ -55,7 +55,17 @@
  *   - the claim pins: upstream's POST /milestones/{id}/delete (web.go:1430)
  *     and the bare-list POST stay engine-owned — unclaimed shapes answer the
  *     parent's 404 and the delete tail writes NOTHING (the milestone row
- *     survives in D1);
+ *     survives in D1). FLIPS AT THE FOLD: the census-gap-#7 unit claims
+ *     {id}/{action} + /delete (issue-write-tails.ts's handlers + the
+ *     index.ts recipe); the fold rewrites this describe's null pins to the
+ *     claimed families and re-answers the route-level 404 pin with the
+ *     write ladder (the module header there names the exact lines);
+ *   - census gap #7 itself — the write tails' ladders (close, reopen, the
+ *     no-op guard, the junk-action redirect, the delete cascade, the
+ *     gate/posture arms) driven DIRECTLY over the module's own
+ *     createIssueWriteTailsRouter() (the recipe step 6 assembled) — green
+ *     pre-fold by construction, since the mounted uiRouter carries none of
+ *     it until the orchestrator's fold;
  *   - batch-11 deepening — the deadline parse shapes the waves leave open
  *     (parseMilestoneDeadline's full formatAttempts family, api/services/
  *     milestones.ts:42-62): the space-separated "yyyy-mm-dd HH:MM:SS" shape
@@ -87,11 +97,12 @@ import { seedVerifiedUser } from "../../auth/testing/seeds";
 import { addOrUpdateCollaborator } from "../../api/services/repo-collaborators";
 import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
-import { milestones, repositories } from "../../db/schema";
+import { issues, milestones, repositories } from "../../db/schema";
 import type { UiManifest } from "../manifest";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import type { RepoRow } from "../ui-context";
+import { createIssueWriteTailsRouter } from "./issue-write-tails";
 
 // --- the minted-session route harness (the issues-list 88ac2ee pattern) ---------
 
@@ -873,5 +884,219 @@ describe("the claim pins (the delete tail + the GET-only surface)", () => {
     // Neither miss wrote anything: the row is untouched in D1.
     const row = await drizzle(env.DB).select().from(milestones).where(eq(milestones.id, m.id)).get();
     expect(row?.name).toBe("survivor");
+  });
+});
+
+// --- census gap #7: the write tails (issue-write-tails.ts, handlers driven
+// --- directly over the module's own recipe router — the b91dd1c posture) ---
+
+describe("the milestone write tails (close/open + delete — the census gap #7 ladders)", () => {
+  /** The module's recipe step 6 assembled — the same patterns the fold
+   *  registers on uiRouter; driving it keeps this file green pre-fold. */
+  const tailsRouter = createIssueWriteTailsRouter();
+
+  async function fetchTail(path: string, init?: RequestInit): Promise<Response> {
+    const context = createExecutionContext();
+    const response = await tailsRouter.fetch(new Request(`https://test.local${path}`, init), routeEnv, context);
+    await waitOnExecutionContext(context);
+    return response;
+  }
+
+  it("close: 303 ?state=close (upstream's verbatim target, quirk included), the row flips closed with the stamp, the closed tab carries it and the toggle renders Open", async () => {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const repo = await seedRepo(alice, "tails");
+    const svc = new IssuesService(env.DB);
+    const m = await seedMilestone(svc, repo.id, "closer", 10);
+    const cookie = await sessionHeader(alice.id);
+
+    const res = await fetchTail(`/alice/tails/milestones/${m.id}/close`, formPost(`/alice/tails/milestones/${m.id}/close`, {}, cookie));
+    expect(res.status).toBe(303);
+    // Upstream ChangeMilestoneStatus JSONRedirects onto
+    // /milestones?state={action} — `state=close`, which the list's parser
+    // reads as OPEN (the carried quirk, the module header).
+    expect(res.headers.get("location")).toBe(`/alice/tails/milestones?state=close`);
+
+    const row = await drizzle(env.DB).select().from(milestones).where(eq(milestones.id, m.id)).get();
+    expect(row?.isClosed).toBe(true);
+    expect(row?.closedDateAt).not.toBeNull();
+
+    // The closed tab carries the row; the writer's toggle now posts open.
+    const list = await (await fetchUi("/alice/tails/milestones?state=closed", { headers: { cookie } })).text();
+    expect(list).toContain("closer");
+    expect(list).toContain(`action="/alice/tails/milestones/${m.id}/open"`);
+    expect(list).not.toContain(`action="/alice/tails/milestones/${m.id}/close"`);
+  });
+
+  it("reopen: 303 ?state=open, closedDateAt nulled (the landed service's flip arm); a second close keeps the FIRST stamp (upstream's 0-row WHERE is_closed guard)", async () => {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const repo = await seedRepo(alice, "tails");
+    const svc = new IssuesService(env.DB);
+    const m = await seedMilestone(svc, repo.id, "flipper", 10);
+    const cookie = await sessionHeader(alice.id);
+
+    const close = await fetchTail(`/alice/tails/milestones/${m.id}/close`, formPost("/x", {}, cookie));
+    expect(close.headers.get("location")).toBe(`/alice/tails/milestones?state=close`);
+    const stamped = await drizzle(env.DB).select().from(milestones).where(eq(milestones.id, m.id)).get();
+    expect(stamped?.closedDateAt?.getTime()).toBeGreaterThan(0);
+
+    const reopen = await fetchTail(`/alice/tails/milestones/${m.id}/open`, formPost("/x", {}, cookie));
+    expect(reopen.status).toBe(303);
+    expect(reopen.headers.get("location")).toBe(`/alice/tails/milestones?state=open`);
+    const reopened = await drizzle(env.DB).select().from(milestones).where(eq(milestones.id, m.id)).get();
+    expect(reopened?.isClosed).toBe(false);
+    expect(reopened?.closedDateAt).toBeNull();
+
+    // Closing again re-stamps; closing a SECOND time is the zero-row no-op —
+    // the first close's stamp must survive untouched.
+    await fetchTail(`/alice/tails/milestones/${m.id}/close`, formPost("/x", {}, cookie));
+    const firstStamp = (await drizzle(env.DB).select().from(milestones).where(eq(milestones.id, m.id)).get())
+      ?.closedDateAt?.getTime();
+    await fetchTail(`/alice/tails/milestones/${m.id}/close`, formPost("/x", {}, cookie));
+    const secondStamp = (await drizzle(env.DB).select().from(milestones).where(eq(milestones.id, m.id)).get())
+      ?.closedDateAt?.getTime();
+    expect(secondStamp).toBe(firstStamp);
+  });
+
+  it("an unknown action 303s onto the bare list untouched (upstream's JSONRedirect default arm — no 404, no write)", async () => {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const repo = await seedRepo(alice, "tails");
+    const svc = new IssuesService(env.DB);
+    const m = await seedMilestone(svc, repo.id, "steady", 10);
+    const cookie = await sessionHeader(alice.id);
+
+    const res = await fetchTail(`/alice/tails/milestones/${m.id}/archive`, formPost("/x", {}, cookie));
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/alice/tails/milestones`);
+    const row = await drizzle(env.DB).select().from(milestones).where(eq(milestones.id, m.id)).get();
+    expect(row?.isClosed).toBe(false);
+    expect(row?.closedDateAt).toBeNull();
+  });
+
+  it("a missing, foreign or garbage path id 404-shells before any write (ErrMilestoneNotExist's NotFound; the foreign row survives)", async () => {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const repo = await seedRepo(alice, "tails");
+    const svc = new IssuesService(env.DB);
+    const m = await seedMilestone(svc, repo.id, "target", 10);
+
+    const bob = await seedVerifiedUser({ username: "tailsbob" });
+    const bobRepo = await seedRepo(bob, "other");
+    const foreign = await seedMilestone(svc, bobRepo.id, "foreigner", 11);
+    const cookie = await sessionHeader(alice.id);
+
+    expect((await fetchTail(`/alice/tails/milestones/999999/close`, formPost("/x", {}, cookie))).status).toBe(404);
+    expect((await fetchTail(`/alice/tails/milestones/abc/close`, formPost("/x", {}, cookie))).status).toBe(404);
+    expect((await fetchTail(`/alice/tails/milestones/${foreign.id}/close`, formPost("/x", {}, cookie))).status).toBe(404);
+    expect((await fetchTail(`/alice/tails/milestones/${m.id}/close`, formPost("/x", {}, cookie))).status).toBe(303);
+
+    const foreignRow = await drizzle(env.DB).select().from(milestones).where(eq(milestones.id, foreign.id)).get();
+    expect(foreignRow?.isClosed).toBe(false); // the cross-repo id never leaked
+    expect((await drizzle(env.DB).select().from(milestones).where(eq(milestones.id, m.id)).get())?.isClosed).toBe(true);
+  });
+
+  it("delete: 303 onto the list, the row gone, the attached issue unlinked, num_milestones decremented (the landed cascade)", async () => {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const repo = await seedRepo(alice, "tails");
+    const svc = new IssuesService(env.DB);
+    const m = await seedMilestone(svc, repo.id, "cascader", 10);
+    const issue = await svc.createIssue({ repoId: repo.id, title: "attached", milestoneId: m.id, now: new Date() });
+    const cookie = await sessionHeader(alice.id);
+
+    const res = await fetchTail("/alice/tails/milestones/delete", formPost("/alice/tails/milestones/delete", { id: String(m.id) }, cookie));
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/alice/tails/milestones`);
+
+    expect(await drizzle(env.DB).select().from(milestones).where(eq(milestones.id, m.id)).get()).toBeUndefined();
+    const unlinked = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issue.id)).get();
+    expect(unlinked?.milestoneId).toBeNull();
+    const repoRow = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repo.id)).get();
+    expect(repoRow?.numMilestones).toBe(0);
+  });
+
+  it("delete is idempotent on every miss: a missing id, a garbage id and a FOREIGN repo's id all 303 — the foreign row survives (upstream's nil-on-not-exist success)", async () => {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    await seedRepo(alice, "tails");
+    const bob = await seedVerifiedUser({ username: "tailsbob2" });
+    const bobRepo = await seedRepo(bob, "other");
+    const svc = new IssuesService(env.DB);
+    const foreign = await seedMilestone(svc, bobRepo.id, "survivor", 10);
+    const cookie = await sessionHeader(alice.id);
+
+    for (const body of [{ id: "999999" }, { id: "1.5" }, { id: String(foreign.id) }]) {
+      const res = await fetchTail("/alice/tails/milestones/delete", formPost("/x", body, cookie));
+      expect(res.status).toBe(303);
+      expect(res.headers.get("location")).toBe(`/alice/tails/milestones`);
+    }
+    const foreignRow = await drizzle(env.DB).select().from(milestones).where(eq(milestones.id, foreign.id)).get();
+    expect(foreignRow?.name).toBe("survivor"); // the repo-scoped guard held
+  });
+
+  it("the gates: anonymous 303s onto the login round-trip carrying the path, a signed-in non-writer 404s, a WRITE collaborator passes, a READ collaborator 404s, an archived repo 404s even the owner, and a cross-origin POST 403s before everything", async () => {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const repo = await seedRepo(alice, "tails");
+    const svc = new IssuesService(env.DB);
+    const m = await seedMilestone(svc, repo.id, "gated", 10);
+    const carol = await seedVerifiedUser({ username: "tailscarol" });
+    const dave = await seedVerifiedUser({ username: "tailsdave" });
+    await addOrUpdateCollaborator(env.DB, repo.id, carol.id, "write", new Date());
+    await addOrUpdateCollaborator(env.DB, repo.id, dave.id, "read", new Date());
+
+    const anon = await fetchTail(`/alice/tails/milestones/${m.id}/close`, formPost("/x", {}));
+    expect(anon.status).toBe(303);
+    expect(anon.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent(`/alice/tails/milestones/${m.id}/close`)}`,
+    );
+
+    expect(
+      (await fetchTail(`/alice/tails/milestones/${m.id}/close`, formPost("/x", {}, await sessionHeader(dave.id)))).status,
+    ).toBe(404);
+
+    const writer = await fetchTail(`/alice/tails/milestones/${m.id}/close`, formPost("/x", {}, await sessionHeader(carol.id)));
+    expect(writer.status).toBe(303); // the labels-write gate — the faithful writer port, not /new's admin reduction
+    expect((await drizzle(env.DB).select().from(milestones).where(eq(milestones.id, m.id)).get())?.isClosed).toBe(true);
+
+    // The archived twin: RepoMustNotBeArchived precedes the grant — the
+    // owner is refused too, on BOTH tails.
+    await drizzle(env.DB).update(repositories).set({ isArchived: true }).where(eq(repositories.id, repo.id));
+    expect(
+      (await fetchTail(`/alice/tails/milestones/${m.id}/open`, formPost("/x", {}, await sessionHeader(alice.id)))).status,
+    ).toBe(404);
+    expect(
+      (await fetchTail("/alice/tails/milestones/delete", formPost("/x", { id: String(m.id) }, await sessionHeader(alice.id))))
+        .status,
+    ).toBe(404);
+    const still = await drizzle(env.DB).select().from(milestones).where(eq(milestones.id, m.id)).get();
+    expect(still?.isClosed).toBe(true); // the archived refuses touched nothing
+
+    // The §2.8 guard fronts the gates: a cross-origin POST with a valid
+    // owner cookie is a 403 and writes nothing.
+    await drizzle(env.DB).update(repositories).set({ isArchived: false }).where(eq(repositories.id, repo.id));
+    const evil = await fetchTail(`/alice/tails/milestones/${m.id}/open`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://evil.example", cookie: `gitea_session=x` },
+      body: new URLSearchParams({}).toString(),
+    });
+    expect(evil.status).toBe(403);
+    expect(await evil.text()).toContain("cross-origin request rejected");
+  });
+
+  it("the page renders the writer's full action trio (Edit link + toggle + delete form with the hidden id) and hides it from a non-writer", async () => {
+    const alice = await seedVerifiedUser({ username: "alice" });
+    const repo = await seedRepo(alice, "tails");
+    const svc = new IssuesService(env.DB);
+    const m = await seedMilestone(svc, repo.id, "rendered", 10);
+
+    const writer = await (await fetchUi("/alice/tails/milestones", { headers: { cookie: await sessionHeader(alice.id) } })).text();
+    expect(writer).toContain(`href="/alice/tails/milestones/${m.id}/edit"`);
+    expect(writer).toContain(`action="/alice/tails/milestones/${m.id}/close"`);
+    expect(writer).toContain(`action="/alice/tails/milestones/delete"`);
+    expect(writer).toContain(`<input type="hidden" name="id" value="${m.id}"/>`);
+
+    const bob = await seedVerifiedUser({ username: "tailsbob3" });
+    const nonWriter = await (
+      await fetchUi("/alice/tails/milestones", { headers: { cookie: await sessionHeader(bob.id) } })
+    ).text();
+    expect(nonWriter).toContain("rendered"); // the row renders for the viewer...
+    expect(nonWriter).not.toContain(`action="/alice/tails/milestones/${m.id}/close"`); // ...without any controls
+    expect(nonWriter).not.toContain(`action="/alice/tails/milestones/delete"`);
   });
 });

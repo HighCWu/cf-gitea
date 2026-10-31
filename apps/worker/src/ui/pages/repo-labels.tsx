@@ -25,9 +25,11 @@
  *   landed `canWriteRepository` — the units model is absent, the general
  *   write grant is the writer arm the grants bridge evaluates; the render
  *   gate and the write seam share the one predicate, repo-grants.ts).
- * - `POST /labels/initialize` (the upstream label-template loader) stays
- *   unclaimed → the engine's 404: no landed template catalog (the
- *   org-labels precedent).
+ * - `POST /labels/initialize` (the upstream label-template loader) rides
+ *   pages/issue-write-tails.ts's handler (census gap #8 — the template
+ *   catalog IS the landed misc-t2 embed, options/label/'s exact shipped
+ *   pair Advanced + Default); the loader block renders below on the
+ *   writer's empty list.
  *
  * ## DOM contract (templates/repo/issue/labels.tmpl +
  *  labels/label_list.tmpl + label_edit_modal.tmpl + label_archived.tmpl at
@@ -90,9 +92,13 @@
  *   header; the modal's exclusive/exclusive_order/is_archived/description
  *   fields are not rendered.
  * - The label-template loader block (label_load_template.tmpl, rendered to
- *   writers on an empty list) is unrendered: no landed template catalog
- *   (the same arm that keeps /labels/initialize unclaimed). The empty list
- *   renders the org-labels page's cf-gitea "No labels yet." line instead.
+ *   writers on an empty list) WAS unrendered through wave 25 — no template
+ *   catalog existed; census gap #8 claims the POST (issue-write-tails.ts's
+ *   repoLabelInitializeSubmit) and the block now renders on the writer's
+ *   empty list as a native select (upstream's JS dropdown reduction — the
+ *   two names, Default selected like the template's hidden input; the
+ *   descriptions stay in the data, the select shows the names). The
+ *   non-writer empty arm keeps the org-labels "No labels yet." line.
  * - The list caps at one page of 50 with no pager (the org-labels cap
  *   pattern — upstream RetrieveLabelsForList lists unbounded); the count
  *   header carries the pagination-independent total (upstream NumLabels =
@@ -110,6 +116,7 @@
  */
 
 import { ApiError } from "../../api/errors";
+import { LABEL_TEMPLATE_DISPLAY_NAMES } from "../../api/routes/misc-t2";
 import {
   createRepoLabel,
   deleteRepoLabel,
@@ -151,6 +158,9 @@ export const repoLabelsLocale = {
   org_labels_manage: "(manage)", // "repo.org_labels_desc_manage"
   none: "No labels yet.", // cf-gitea addition (the org-labels page's empty arm)
   title_required: "Label name cannot be empty.", // cf-gitea addition (HTML5 required backs this)
+  templates_info: "No labels exist yet. Create a label with 'New Label' or use a predefined label set:", // "repo.issues.label_templates.info"
+  templates_helper: "Select a label set", // "repo.issues.label_templates.helper"
+  templates_use: "Use Label Set", // "repo.issues.label_templates.use"
 } as const;
 
 /** List page cap (listRepoLabels is paginated; one page serves the slice —
@@ -446,6 +456,42 @@ function OrgLabelRowLine(props: { repoLink: string; label: LabelRow }) {
   );
 }
 
+/**
+ * The label-template loader block (label_load_template.tmpl — census gap
+ * #8): the info sentence, the template select (upstream's JS dropdown
+ * reduced to a native select — the two shipped names with Default
+ * preselected exactly like the template's hidden input; the descriptions
+ * stay in the misc-t2 embed, the select shows the names) and the submit,
+ * posting `template_name` to the initialize tail (issue-write-tails.ts's
+ * repoLabelInitializeSubmit; the write gate runs there).
+ */
+function LabelTemplateLoader(props: { repoLink: string }) {
+  return (
+    <div class="ui centered grid">
+      <div class="twelve wide computer column">
+        <p>{repoLabelsLocale.templates_info}</p>
+        <form class="ui form center" action={`${props.repoLink}/labels/initialize`} method="post">
+          <div class="field">
+            <label for="label-template-name" class="sr-only">
+              {repoLabelsLocale.templates_helper}
+            </label>
+            <select id="label-template-name" name="template_name">
+              {LABEL_TEMPLATE_DISPLAY_NAMES.map((name) => (
+                <option value={name} selected={name === "Default"}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <button type="submit" class="ui primary button">
+            {repoLabelsLocale.templates_use}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 /** The `.issue-navbar` compact menu (repo/issue/navbar.tmpl) — Labels
  *  ACTIVE, Milestones the sibling item (both pages landed; the milestones
  *  page carries the reciprocal item since this wave). */
@@ -509,11 +555,21 @@ export function RepoLabelsPage(props: { ctx: UiContext; data: RepoLabelsData; fo
           {data.total} {repoLabelsLocale.labels_count}
         </h3>
         <div class="ui attached segment">
+          {/* The template loader (label_list.tmpl's empty+writer arm —
+              `(eq .NumLabels 0)` and the write gate; the POST lands on the
+              initialize tail). The "No labels yet." fallback yields to it
+              on the writer's empty list. */}
+          {canEdit && data.total === 0 ? (
+            <>
+              <LabelTemplateLoader repoLink={repoLink} />
+              <div class="divider"></div>
+            </>
+          ) : null}
           {/* The list renders whenever EITHER arm has rows — an org-owned
               repo with no repo labels still shows the .OrgLabels section
               (label_list.tmpl keeps the single ul around both arms). */}
           {data.labels.length === 0 && data.orgSection === null ? (
-            <div>{repoLabelsLocale.none}</div>
+            canEdit && data.total === 0 ? null : <div>{repoLabelsLocale.none}</div>
           ) : (
             <ul class="issue-label-list muted-links">
               {data.labels.map((label) => (

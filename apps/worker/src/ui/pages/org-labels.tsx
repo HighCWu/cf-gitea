@@ -41,8 +41,14 @@
  *   the modal's exclusive/exclusive_order/is_archived/description fields are
  *   not rendered (the brief's fields only — the landed PATCH arm keeps each
  *   of them when the form does not send it).
- * - `/labels/initialize` (the upstream label-template loader) stays
- *   unclaimed → the engine's 404: no landed template catalog.
+ * - `/labels/initialize` (the upstream label-template loader) rides
+ *   issue-write-tails.ts's orgLabelInitializeSubmit (census gap #8 — the
+ *   catalog is the landed misc-t2 embed, options/label/'s exact pair; the
+ *   303 target is this page's live URL, upstream's
+ *   /org/{org}/settings/labels target being the documented divergence the
+ *   landed org writes share), and the loader block renders on the empty
+ *   list (org/settings/labels.tmpl renders it on `(eq .NumLabels 0)` — the
+ *   page is owner-only, so no extra gate).
  *
  * ## Write paths (§3.2 — the landed services, never a self-fetch)
  *
@@ -78,6 +84,7 @@
  */
 
 import { ApiError } from "../../api/errors";
+import { LABEL_TEMPLATE_DISPLAY_NAMES } from "../../api/routes/misc-t2";
 import {
   createOrgLabel,
   findOrgLabelById,
@@ -113,6 +120,9 @@ export const orgLabelsLocale = {
   open_issues: "open issues/pull requests", // "repo.issues.label_open_issues"'s %d tail
   none: "No labels yet.", // cf-gitea addition (upstream renders the template loader's empty block)
   title_required: "Label name cannot be empty.", // cf-gitea addition (HTML5 required backs this)
+  templates_info: "No labels exist yet. Create a label with 'New Label' or use a predefined label set:", // "repo.issues.label_templates.info"
+  templates_helper: "Select a label set", // "repo.issues.label_templates.helper"
+  templates_use: "Use Label Set", // "repo.issues.label_templates.use"
 } as const;
 
 /** The modal color input's default (label_edit_modal.tmpl's value="#70c24a"). */
@@ -262,6 +272,40 @@ export function LabelColorSwatch(props: { color: string }) {
   );
 }
 
+/**
+ * The label-template loader block (label_load_template.tmpl — census gap
+ * #8, the org twin): the native-select reduction of upstream's JS dropdown
+ * (Default preselected like the template's hidden input), posting
+ * `template_name` to `/{org}/labels/initialize` (issue-write-tails.ts's
+ * orgLabelInitializeSubmit; the require-owner gate runs there).
+ */
+function OrgLabelTemplateLoader(props: { orgLink: string }) {
+  return (
+    <div class="ui centered grid">
+      <div class="twelve wide computer column">
+        <p>{orgLabelsLocale.templates_info}</p>
+        <form class="ui form center" action={`${props.orgLink}/labels/initialize`} method="post">
+          <div class="field">
+            <label for="org-label-template-name" class="sr-only">
+              {orgLabelsLocale.templates_helper}
+            </label>
+            <select id="org-label-template-name" name="template_name">
+              {LABEL_TEMPLATE_DISPLAY_NAMES.map((name) => (
+                <option value={name} selected={name === "Default"}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <button type="submit" class="ui primary button">
+            {orgLabelsLocale.templates_use}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 /** The two-field label form body (title + color + the preview swatch) —
  *  shared shape of the create form and the per-row edit disclosure. `id`
  *  prefixes the field ids/names so the per-row forms stay unique. */
@@ -406,8 +450,17 @@ export function OrgLabelsPage(props: { ctx: UiContext; data: OrgLabelsData; form
           {data.total} {orgLabelsLocale.labels_count}
         </h4>
         <div class="ui attached segment">
+          {/* The template loader (the org arm of label_list.tmpl's
+              empty+writer block — `(eq .NumLabels 0)`, the page is
+              owner-only). The "No labels yet." fallback yields to it. */}
+          {data.total === 0 ? (
+            <>
+              <OrgLabelTemplateLoader orgLink={orgLink} />
+              <div class="divider"></div>
+            </>
+          ) : null}
           {data.labels.length === 0 ? (
-            <div>{orgLabelsLocale.none}</div>
+            data.total === 0 ? null : <div>{orgLabelsLocale.none}</div>
           ) : (
             <ul class="issue-label-list muted-links">
               {data.labels.map((label) => (

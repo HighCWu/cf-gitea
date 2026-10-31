@@ -40,7 +40,13 @@
  *   - the claim pins wave14/25 carry at parse level only, answered
  *     route-level here: the /labels/initialize template-loader tail stays
  *     engine-owned on BOTH scopes (404), and the ORG write tails answer GET
- *     with chi's 405 (the repo-side 405s are wave25's);
+ *     with chi's 405 (the repo-side 405s are wave25's). FLIPS AT THE FOLD:
+ *     the census-gap-#8 unit claims /labels/initialize on BOTH scopes
+ *     (issue-write-tails.ts's handlers + the index.ts recipe); the fold
+ *     rewrites this initialize 404 pin to the gate ladders' answers (the
+ *     module header there names the exact lines) — the block at the bottom
+ *     of this file already drives the ladders directly over the module's
+ *     own recipe router, green pre-fold by construction;
  *   - batch-11 deepening (the create/edit forms' remaining validation arms):
  *     the color shapes the waves leave open — the trimmed-to-empty banner
  *     ("invalid color: " prints the empty normalization), the hash-prefixed
@@ -79,7 +85,7 @@
  * deletes a seeded row — reruns converge.
  */
 
-import { env } from "cloudflare:test";
+import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
 import { and, eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
@@ -99,6 +105,7 @@ import { OrgService } from "../../services/orgs/orgs";
 import { uiRouter } from "../index";
 import { uiEnv } from "../__tests__/harness";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
+import { createIssueWriteTailsRouter } from "./issue-write-tails";
 
 async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
   return uiRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
@@ -144,6 +151,11 @@ const ARCHIVED_SLUG = "lx-archived";
 const ORG_REPO_SLUG = "lx-org-repo";
 const EMPTY_ORG_NAME = "labelmxempty";
 const EMPTY_ORG_REPO_SLUG = "lx-bare-repo";
+// The census-gap-#8 initialize arms' LABEL-LESS targets: two user-owned
+// repos (Default + Advanced) and one org the owner controls (the org twin).
+const INIT_REPO_SLUG = "lx-init-repo";
+const INIT_ADV_SLUG = "lx-init-adv";
+const INIT_ORG_NAME = "labelmxinit";
 
 interface LabelsFixture {
   ownerCookie: string;
@@ -157,6 +169,9 @@ interface LabelsFixture {
   orgLightLabelId: number;
   orgRepoId: string;
   emptyOrgRepoId: string;
+  initRepoId: string;
+  initAdvRepoId: string;
+  initOrgId: number;
 }
 
 let labelsFixture: LabelsFixture | null = null;
@@ -338,6 +353,33 @@ async function ensureLabelsFixtures(): Promise<LabelsFixture> {
     emptyOrgRepoId = existingBareRepo.id;
   }
 
+  // The census-gap-#8 initialize targets: two LABEL-LESS user-owned repos
+  // (Default + Advanced round-trips) and a LABEL-LESS org the owner
+  // controls (the org twin; labelmx itself is excluded — its rows back the
+  // org-section arms above).
+  const rowOnlyRepo = async (slug: string): Promise<string> => {
+    const existing = await db
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, "labelmx"), eq(repositories.slug, slug)))
+      .get();
+    if (existing !== undefined) return existing.id;
+    return (
+      await service.create({
+        owner: { id: owner.id, usernameLower: "labelmx" },
+        name: slug,
+        isPrivate: false,
+        status: "ready",
+      })
+    ).id;
+  };
+  const initRepoId = await rowOnlyRepo(INIT_REPO_SLUG);
+  const initAdvRepoId = await rowOnlyRepo(INIT_ADV_SLUG);
+  let initOrg = await orgs.getOrgByUsername(INIT_ORG_NAME);
+  if (initOrg === null) {
+    initOrg = await orgs.createOrg({ name: INIT_ORG_NAME, ownerId: owner.id, visibility: "public", now: new Date() });
+  }
+
   labelsFixture = {
     ownerCookie: await mintSession(env.DB, owner.id),
     adminCookie: await mintSession(env.DB, admin.id),
@@ -350,6 +392,9 @@ async function ensureLabelsFixtures(): Promise<LabelsFixture> {
     orgLightLabelId: orgLight.id,
     orgRepoId,
     emptyOrgRepoId,
+    initRepoId,
+    initAdvRepoId,
+    initOrgId: initOrg.id,
   };
   return labelsFixture;
 }
@@ -904,7 +949,7 @@ describe("the org-scoped arms on the repo page (batch 11)", () => {
     expect(plainHtml.indexOf("lx-org-blocked")).toBeLessThan(plainHtml.indexOf("lx-org-light"));
   });
 
-  it("an org-owned repo whose org carries no labels renders NO org section (label_list.tmpl's {{if .OrgLabels}} guard)", async () => {
+  it("an org-owned repo whose org carries no labels renders NO org section (label_list.tmpl's {{if .OrgLabels}} guard); the writer's empty arm shows the template loader (census gap #8), a non-writer's keeps the bare line", async () => {
     const fixture = await ensureLabelsFixtures();
     const res = await fetchUi(`/labelmxempty/${EMPTY_ORG_REPO_SLUG}/labels`, {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
@@ -913,6 +958,289 @@ describe("the org-scoped arms on the repo page (batch 11)", () => {
     const html = await res.text();
     expect(html).toContain('class="page-content repository labels"');
     expect(html).not.toContain("Organization-level labels");
-    expect(html).toContain("No labels yet."); // the bare empty arm — no intro row either
+    // The writer's empty list: the loader block replaced the bare line
+    // (label_load_template.tmpl's `(eq .NumLabels 0)` writer arm — the org
+    // owner carries the repo-write grant, so the loader renders).
+    // The JSX text escapes the single quotes around New Label.
+    expect(html).toContain(
+      "No labels exist yet. Create a label with &#39;New Label&#39; or use a predefined label set:",
+    );
+    expect(html).toContain('name="template_name"');
+    expect(html).not.toContain("No labels yet.");
+
+    // The non-writer's empty arm keeps the bare line (the loader is
+    // writer-only) — the anonymous viewer on the public repo.
+    const anon = await fetchUi(`/labelmxempty/${EMPTY_ORG_REPO_SLUG}/labels`);
+    expect(anon.status).toBe(200);
+    const anonHtml = await anon.text();
+    expect(anonHtml).toContain("No labels yet.");
+    expect(anonHtml).not.toContain('name="template_name"');
+  });
+});
+
+// --- census gap #8: the /labels/initialize template loader (issue-write-tails.ts,
+// --- handlers driven directly over the module's own recipe router — the b91dd1c
+// --- posture; the fold mounts these patterns on uiRouter) ------------------------
+
+describe("the /labels/initialize template loader (census gap #8 — the initialize ladders)", () => {
+  const tailsRouter = createIssueWriteTailsRouter();
+
+  /** The rerun-convergence purge: the initialize tests' targets persist
+   *  across suite runs (the fixture posture), so every initialize arm first
+   *  strips any rows a previous run's template POST left behind (through
+   *  the landed cascade arms, like purgeRepoLabelNamed above). */
+  async function purgeInitTargets(fixture: LabelsFixture): Promise<void> {
+    const repoRows = await Promise.all([
+      listRepoLabels(env.DB, fixture.initRepoId, "", 1, 200),
+      listRepoLabels(env.DB, fixture.initAdvRepoId, "", 1, 200),
+    ]);
+    for (const { items } of repoRows) {
+      for (const row of items) await deleteRepoLabel(env.DB, row);
+    }
+    for (const row of (await listOrgLabels(env.DB, fixture.initOrgId, "", 1, 200)).items) {
+      await deleteRepoLabel(env.DB, row);
+    }
+  }
+
+  async function fetchTail(path: string, init?: RequestInit): Promise<Response> {
+    const context = createExecutionContext();
+    const response = await tailsRouter.fetch(new Request(`https://test.local${path}`, init), routeEnv, context);
+    await waitOnExecutionContext(context);
+    return response;
+  }
+
+  /** The route-env for the tails router — the labels matrix has no manifest
+   *  fixture of its own (the pages never read the engine), so build the
+   *  synthetic one here (the milestones matrix's shape). */
+  const manifest: Record<string, { file: string; css?: string[] }> = {
+    "web_src/js/iife.ts": { file: "js/iife.abcd1234.js" },
+    "web_src/js/index.ts": { file: "js/index.deadbeef.js", css: ["css/index.1111aaaa.css"] },
+    "web_src/css/themes/theme-gitea-light.css": { file: "css/theme-gitea-light.4444dddd.css" },
+    "web_src/js/user-events.sharedworker.ts": { file: "js/user-events.5555eeee.js" },
+  };
+  const routeEnv = {
+    ...env,
+    ASSETS: { fetch: () => Promise.resolve(new Response(JSON.stringify(manifest), { status: 200 })) },
+  };
+
+  it("the Default initialize: 303 onto the list, the seven preset labels stored with their exact colors and descriptions, none exclusive, none archived", async () => {
+    const fixture = await ensureLabelsFixtures();
+    await purgeInitTargets(fixture);
+    const res = await fetchTail(
+      `/labelmx/${INIT_REPO_SLUG}/labels/initialize`,
+      withCookie(formPost({ template_name: "Default" }), fixture.ownerCookie),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/labelmx/${INIT_REPO_SLUG}/labels`);
+
+    const rows = (await listRepoLabels(env.DB, fixture.initRepoId, "", 1, 50)).items;
+    expect(rows.map((row) => row.name)).toEqual([
+      "bug",
+      "duplicate",
+      "enhancement",
+      "help wanted",
+      "invalid",
+      "question",
+      "wontfix",
+    ]);
+    const byName = new Map(rows.map((row) => [row.name, row]));
+    expect(byName.get("bug")?.color).toBe("#ee0701");
+    expect(byName.get("bug")?.description).toBe("Something is not working");
+    expect(byName.get("wontfix")?.color).toBe("#ffffff");
+    expect(byName.get("question")?.description).toBe("More information is needed");
+    for (const row of rows) {
+      expect(row.exclusive).toBe(false); // the legacy-format template carries no exclusivity
+      expect(row.exclusiveOrder ?? 0).toBe(0);
+      expect(row.archivedAt).toBeNull();
+    }
+  });
+
+  it("the Advanced initialize: the eighteen YAML labels with exclusivity and exclusive_order exactly as InitializeLabels copies them", async () => {
+    const fixture = await ensureLabelsFixtures();
+    await purgeInitTargets(fixture);
+    const res = await fetchTail(
+      `/labelmx/${INIT_ADV_SLUG}/labels/initialize`,
+      withCookie(formPost({ template_name: "Advanced" }), fixture.ownerCookie),
+    );
+    expect(res.status).toBe(303);
+
+    const rows = (await listRepoLabels(env.DB, fixture.initAdvRepoId, "", 1, 50)).items;
+    expect(rows).toHaveLength(18);
+    const byName = new Map(rows.map((row) => [row.name, row]));
+    expect(byName.get("Kind/Bug")?.color).toBe("#ee0701");
+    expect(byName.get("Kind/Bug")?.exclusive).toBe(false);
+    expect(byName.get("Reviewed/Confirmed")?.exclusive).toBe(true);
+    expect(byName.get("Reviewed/Confirmed")?.exclusiveOrder).toBe(1);
+    expect(byName.get("Status/Blocked")?.exclusive).toBe(true);
+    expect(byName.get("Status/Blocked")?.exclusiveOrder).toBe(1);
+    expect(byName.get("Priority/Low")?.exclusiveOrder).toBe(4);
+    expect(byName.get("Priority/Low")?.description).toBe("The priority is low");
+    // The template's priority field is NOT copied (upstream InitializeLabels
+    // takes name/exclusive/exclusive_order/description/color only).
+    expect(rows.every((row) => row.archivedAt === null)).toBe(true);
+  });
+
+  it("an unknown template name: the 200 re-render carries the exact fail_to_load_file banner and nothing is written", async () => {
+    const fixture = await ensureLabelsFixtures();
+    const before = await listRepoLabels(env.DB, fixture.initRepoId, "", 1, 1);
+    const res = await fetchTail(
+      `/labelmx/${INIT_REPO_SLUG}/labels/initialize`,
+      withCookie(formPost({ template_name: "Nope" }), fixture.ownerCookie),
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('class="page-content repository labels"');
+    // The JSX banner escapes the double quotes (Fail to load's %s pair).
+    expect(html).toContain("Failed to load label template file &quot;Nope&quot;: label template &quot;Nope&quot; not found");
+    expect((await listRepoLabels(env.DB, fixture.initRepoId, "", 1, 1)).total).toBe(before.total);
+  });
+
+  it("an empty template_name is the Required binding failure: the plain 303, nothing written", async () => {
+    const fixture = await ensureLabelsFixtures();
+    const before = await listRepoLabels(env.DB, fixture.initRepoId, "", 1, 1);
+    const res = await fetchTail(
+      `/labelmx/${INIT_REPO_SLUG}/labels/initialize`,
+      withCookie(formPost({ template_name: "" }), fixture.ownerCookie),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/labelmx/${INIT_REPO_SLUG}/labels`);
+    expect((await listRepoLabels(env.DB, fixture.initRepoId, "", 1, 1)).total).toBe(before.total);
+  });
+
+  it("initializing twice doubles the rows (upstream NewLabel is a plain insert — the documented non-refusal), and the loader yields once the list is non-empty", async () => {
+    const fixture = await ensureLabelsFixtures();
+    await purgeInitTargets(fixture);
+    // The writer's EMPTY list carries the loader block (the select posting
+    // template_name; Default preselected like upstream's hidden input).
+    const before = await fetchUi(`/labelmx/${INIT_ADV_SLUG}/labels`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
+    });
+    const beforeHtml = await before.text();
+    expect(beforeHtml).toContain(
+      "No labels exist yet. Create a label with &#39;New Label&#39; or use a predefined label set:",
+    );
+    expect(beforeHtml).toContain('name="template_name"');
+    expect(beforeHtml).toContain('value="Advanced"');
+    expect(beforeHtml).toContain('value="Default" selected');
+    expect(beforeHtml).toContain(`action="/labelmx/${INIT_ADV_SLUG}/labels/initialize"`);
+
+    const first = await fetchTail(
+      `/labelmx/${INIT_ADV_SLUG}/labels/initialize`,
+      withCookie(formPost({ template_name: "Advanced" }), fixture.ownerCookie),
+    );
+    expect(first.status).toBe(303);
+    expect((await listRepoLabels(env.DB, fixture.initAdvRepoId, "", 1, 50)).total).toBe(18);
+
+    const second = await fetchTail(
+      `/labelmx/${INIT_ADV_SLUG}/labels/initialize`,
+      withCookie(formPost({ template_name: "Advanced" }), fixture.ownerCookie),
+    );
+    expect(second.status).toBe(303);
+    expect((await listRepoLabels(env.DB, fixture.initAdvRepoId, "", 1, 50)).total).toBe(36);
+
+    // The loader block renders on the writer's EMPTY list only.
+    const listHtml = await (
+      await fetchUi(`/labelmx/${INIT_ADV_SLUG}/labels`, {
+        headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
+      })
+    ).text();
+    expect(listHtml).not.toContain("No labels exist yet. Create a label with 'New Label'");
+  });
+
+  it("the gates: anonymous 303s onto the login round-trip, a signed-in non-writer 404s, the archived repo 404s even the owner, a cross-origin POST 403s before everything", async () => {
+    const fixture = await ensureLabelsFixtures();
+
+    const anon = await fetchTail(`/labelmx/${INIT_REPO_SLUG}/labels/initialize`, formPost({ template_name: "Default" }));
+    expect(anon.status).toBe(303);
+    expect(anon.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent(`/labelmx/${INIT_REPO_SLUG}/labels/initialize`)}`,
+    );
+
+    const beforePal = (await listRepoLabels(env.DB, fixture.initRepoId, "", 1, 1)).total;
+    expect(
+      (
+        await fetchTail(
+          `/labelmx/${INIT_REPO_SLUG}/labels/initialize`,
+          withCookie(formPost({ template_name: "Default" }), fixture.palCookie),
+        )
+      ).status,
+    ).toBe(404);
+    expect((await listRepoLabels(env.DB, fixture.initRepoId, "", 1, 1)).total).toBe(beforePal);
+
+    const archived = await fetchTail(
+      `/labelmx/${ARCHIVED_SLUG}/labels/initialize`,
+      withCookie(formPost({ template_name: "Default" }), fixture.ownerCookie),
+    );
+    expect(archived.status).toBe(404);
+
+    const evil = await fetchTail(
+      `/labelmx/${INIT_REPO_SLUG}/labels/initialize`,
+      crossOriginPost({ template_name: "Default" }, fixture.ownerCookie),
+    );
+    const beforeEvil = (await listRepoLabels(env.DB, fixture.initRepoId, "", 1, 1)).total;
+    expect(evil.status).toBe(403);
+    expect(await evil.text()).toContain("cross-origin request rejected");
+    expect((await listRepoLabels(env.DB, fixture.initRepoId, "", 1, 1)).total).toBe(beforeEvil);
+  });
+
+  it("the ORG twin: Default on the owner's label-less org stores seven org-scoped rows (repo_id NULL); unknown re-renders the org page with the banner; the gates hold", async () => {
+    const fixture = await ensureLabelsFixtures();
+    await purgeInitTargets(fixture);
+    const res = await fetchTail(
+      `/${INIT_ORG_NAME}/labels/initialize`,
+      withCookie(formPost({ template_name: "Default" }), fixture.ownerCookie),
+    );
+    expect(res.status).toBe(303);
+    // The landed org page's URL is the 303 target (upstream's
+    // /org/{org}/settings/labels being the documented divergence).
+    expect(res.headers.get("location")).toBe(`/${INIT_ORG_NAME}/labels`);
+
+    const rows = (await listOrgLabels(env.DB, fixture.initOrgId, "", 1, 50)).items;
+    expect(rows.map((row) => row.name)).toEqual([
+      "bug",
+      "duplicate",
+      "enhancement",
+      "help wanted",
+      "invalid",
+      "question",
+      "wontfix",
+    ]);
+    expect(rows.every((row) => row.repoId === null)).toBe(true);
+
+    const unknown = await fetchTail(
+      `/${INIT_ORG_NAME}/labels/initialize`,
+      withCookie(formPost({ template_name: "Nope" }), fixture.ownerCookie),
+    );
+    expect(unknown.status).toBe(200);
+    expect(await unknown.text()).toContain(
+      "Failed to load label template file &quot;Nope&quot;: label template &quot;Nope&quot; not found",
+    );
+
+    // A signed-in NON-OWNER 404s (requireOrgOwnership); anonymous 303s.
+    expect(
+      (
+        await fetchTail(
+          `/${INIT_ORG_NAME}/labels/initialize`,
+          withCookie(formPost({ template_name: "Default" }), fixture.palCookie),
+        )
+      ).status,
+    ).toBe(404);
+    const anon = await fetchTail(`/${INIT_ORG_NAME}/labels/initialize`, formPost({ template_name: "Default" }));
+    expect(anon.status).toBe(303);
+    expect(anon.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent(`/${INIT_ORG_NAME}/labels/initialize`)}`,
+    );
+
+    // The org page renders the loader on its empty list (owner view) —
+    // labelmxempty stayed label-less, so it shows the block; labelmxinit
+    // now carries rows and does not.
+    const emptyOrgPage = await fetchUi(`/${EMPTY_ORG_NAME}/labels`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
+    });
+    expect(await emptyOrgPage.text()).toContain('name="template_name"');
+    const initOrgPage = await fetchUi(`/${INIT_ORG_NAME}/labels`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
+    });
+    expect(await initOrgPage.text()).not.toContain('name="template_name"');
   });
 });
