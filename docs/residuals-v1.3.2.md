@@ -806,16 +806,27 @@ board row flips — this closes a flag, not a listed residual.
    ARTIFACT_PREVIEW_CLOCK seam + the signed-URL tail golden) and is no
    longer a candidate. Sizes: (a) — (landed), (b) **S**, (c) **M**.
 
-3. **The cleanup-rule preview's PackageID-filter upgrade note.** Upstream's
-   preview pins per-package `SearchVersions{PackageID}`; the landed page
-   reduces it to the unique key (`ownerId + type + exact lowerName`) over
-   `searchVersions`, and the paginator-less `Find` stands in as
-   `RULE_PREVIEW_VERSIONS_LIMIT = 10_000` — the module's own recorded seam,
-   to upgrade if `searchVersions` ever grows a packageId option
-   (`apps/worker/src/ui/pages/org-settings-packages.tsx` header lines
-   92-97, the constant at :729, the loader comment at :783-791; the twin
-   re-exports it in `apps/worker/src/ui/pages/user-settings-packages.tsx`).
-   Size: **S** (conditional on the store growing the option).
+3. **The cleanup-rule preview's PackageID-filter upgrade note — LANDED
+   (2026-10-31).** The note's condition held: `searchVersions` grew the
+   `packageId` option — upstream's filter verbatim
+   (`PackageSearchOptions.PackageID`, package_version.go:194; ToConds'
+   `package.id = :id` arm at :222-224 over the SearchVersions INNER JOIN
+   :309-315) — and both settings-pages loaders pass it directly (the
+   shared/packages.go:158-162 option set), retiring the unique-key
+   reduction AND the `RULE_PREVIEW_VERSIONS_LIMIT = 10_000` stand-in (the
+   constant is gone from org-settings-packages.tsx and from the twin's
+   re-export). The paginator question pinned: upstream does NOT paginate
+   the preview (the :158-162 call passes no `Paginator` →
+   searchVersionsBySession :297-306's paginator-less `Find`, and
+   cleanup_rules/preview.tmpl ranges the full survivor table — no pager),
+   and the landed page already rendered that shape — so `searchVersions`
+   mirrored upstream's fork rather than rebuilding the page: page/limit
+   passed rides the FindAndCount shape (unchanged for every landed
+   caller — verified all pass both), absent runs the unbounded Find with
+   count = the row length. Parity pins: model.test.ts (packageId
+   selectivity within owner+type, the undefined/0 no-filter defaults, the
+   12-row unbounded arm) and both settings-pages suites (the
+   12-candidate preview rows, identical before/after).
 
 4. **SPEC-0011's queued engine residual: D3 + the unpinned rows — RESOLVED
    before dispatch (`6545edd` the D3 fix + `849885e` the rows 10-11 pins,

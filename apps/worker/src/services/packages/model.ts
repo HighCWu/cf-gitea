@@ -397,14 +397,21 @@ export async function getPackageDescriptor(
 
 // ---------------------------------------------------------------------------
 // Search — upstream SearchVersions / SearchLatestVersions reduced to the
-// filters the 9 ops + admin list actually pass (owner, repo, type, name,
-// is-internal false, page/limit)
+// filters the ops + admin list actually pass (owner, repo, type, packageId,
+// name, is-internal false, page/limit — packageId is the cleanup-rule
+// preview consumer's per-package pin)
 // ---------------------------------------------------------------------------
 
 export interface PackageSearchOptions {
   ownerId?: number;
   repoId?: string;
   type?: string;
+  /** Upstream PackageSearchOptions.PackageID (package_version.go:194): the
+   *  `package.id = :id` arm over the INNER JOIN when non-zero (ToConds
+   *  :222-224) — the per-package version fetch the cleanup-rule preview
+   *  makes (shared/packages.go:158-162). Absent or 0 filters nothing,
+   *  mirroring upstream's zero-value-is-no-filter options doc (:190-192). */
+  packageId?: number;
   /** Name filter; `exact` pins the lower-cased equality (path-param lookups). */
   name?: string;
   exact?: boolean;
@@ -420,6 +427,9 @@ function searchConditions(opts: PackageSearchOptions): SQL[] {
   if (opts.ownerId !== undefined) conditions.push(eq(packages.ownerId, opts.ownerId));
   if (opts.repoId !== undefined) conditions.push(eq(packages.repoId, opts.repoId));
   if (opts.type !== undefined && opts.type !== "") conditions.push(eq(packages.type, opts.type));
+  // Upstream ToConds (:222-224): `if opts.PackageID != 0` — the zero value
+  // filters nothing (the options doc :190-192).
+  if (opts.packageId !== undefined && opts.packageId !== 0) conditions.push(eq(packages.id, opts.packageId));
   if (opts.name !== undefined && opts.name !== "") {
     conditions.push(
       opts.exact
@@ -443,20 +453,28 @@ function searchResultsQuery(d1: D1Database, opts: PackageSearchOptions) {
 }
 
 /**
- * `SearchVersions` (package_version.go:398-405): the joined pair filtered by
+ * `SearchVersions` (package_version.go:309-315): the joined pair filtered by
  * the options, `created_unix DESC, id DESC` (the configureOrderBy default,
- * :277-291 — §5.7's insertion-recency order), plus the total count for the
- * pagination headers.
+ * :279-292 — §5.7's insertion-recency order). The page/limit pair is
+ * upstream's `Paginator` (searchVersionsBySession :297-306): passed, it runs
+ * the FindAndCount shape (LIMIT/OFFSET + the total count for the pagination
+ * headers); absent, it is the paginator-less `Find` — no LIMIT, the count
+ * is the row length — the cleanup-rule preview's fetch
+ * (shared/packages.go:158-162 passes no Paginator either).
  */
 export async function searchVersions(
   d1: D1Database,
   opts: PackageSearchOptions,
 ): Promise<{ rows: { version: PackageVersionRow; pkg: PackageRow }[]; count: number }> {
   const filtered = searchResultsQuery(d1, opts);
+  const ordered = () => filtered.orderBy(desc(packageVersions.createdUnix), desc(packageVersions.id));
+  if (opts.page === undefined && opts.limit === undefined) {
+    const rows = await ordered().all();
+    return { rows, count: rows.length };
+  }
   const page = Math.max(opts.page ?? 1, 1);
   const limit = Math.max(opts.limit ?? 10, 1);
-  const rows = await filtered
-    .orderBy(desc(packageVersions.createdUnix), desc(packageVersions.id))
+  const rows = await ordered()
     .limit(limit)
     .offset((page - 1) * limit)
     .all();

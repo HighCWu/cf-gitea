@@ -280,6 +280,45 @@ describe("searchVersions / searchLatestVersions", () => {
     expect(none.count).toBe(0);
   });
 
+  it("packageId narrows within owner+type — upstream's SearchVersions{PackageID} filter (ToConds :222-224)", async () => {
+    const owner = await seedUser("alice");
+    const other = await seedUser("bob");
+    const app = (await seedPackageVersion(owner.id, "app", "1.0")).pkg;
+    await seedPackageVersion(owner.id, "app", "2.0");
+    await seedPackageVersion(owner.id, "lib", "9.0");
+    await seedPackageVersion(other.id, "app", "1.0");
+
+    // Selectivity: narrows the owner+type set to the one package's versions.
+    const ofPackage = await searchVersions(env.DB, { ownerId: owner.id, type: "generic", packageId: app.id });
+    expect(ofPackage.count).toBe(2);
+    expect(ofPackage.rows.every((r) => r.pkg.id === app.id)).toBe(true);
+
+    // The preview consumer's exact option set (shared/packages.go:158-162):
+    // PackageID alone — the id is globally unique, no owner/type needed.
+    const idOnly = await searchVersions(env.DB, { packageId: app.id });
+    expect(idOnly.count).toBe(2);
+    expect(idOnly.rows.every((r) => r.pkg.ownerId === owner.id)).toBe(true);
+
+    // undefined AND the 0 zero-value filter nothing (the options doc
+    // :190-192 — "not used if they have their default value").
+    const noFilter = await searchVersions(env.DB, { ownerId: owner.id, packageId: undefined });
+    expect(noFilter.count).toBe(3);
+    const zeroValue = await searchVersions(env.DB, { ownerId: owner.id, packageId: 0 });
+    expect(zeroValue.count).toBe(3);
+  });
+
+  it("no page/limit IS the paginator-less Find — unbounded, count = the row length (searchVersionsBySession :297-306)", async () => {
+    const owner = await seedUser("alice");
+    for (let i = 1; i <= 12; i++) {
+      await seedPackageVersion(owner.id, "app", `1.${i}`, 0, new Date(Date.UTC(2026, 0, i)));
+    }
+    // 12 rows ride where the retired default-limit shape would have capped 10.
+    const found = await searchVersions(env.DB, { ownerId: owner.id });
+    expect(found.rows).toHaveLength(12);
+    expect(found.count).toBe(12);
+    expect(found.rows[0]?.version.lowerVersion).toBe("1.12"); // created desc, id desc
+  });
+
   it("pagination returns the requested page window", async () => {
     const owner = await seedUser("alice");
     await seedPackageVersion(owner.id, "app", "1.0", 0, new Date("2026-01-01T00:00:00Z"));

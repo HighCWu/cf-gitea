@@ -48,13 +48,12 @@
  *   helpers — the owner param is `package_cleanup_rules.owner_id`, the same
  *   column at both scopes): the form parser + the In lists, the create/edit
  *   appliers, the list/scoped-find/dup-gate reads, the pattern compile, the
- *   ellipsis, the %d locale helpers, the preview's Find stand-in limit, and
- *   the locale object itself (both scopes render the SAME shared partials,
- *   so every string rides). The owner-named pieces alias onto the
- *   user-facing names at the import (`applyUserCleanupRuleCreate`,
- *   `userSettingsPackagesLocale`, … — the wiki-raw aliasing style), so this
- *   module's consumers never see an org name; the scope-neutral helpers
- *   keep their names.
+ *   ellipsis, the %d locale helpers, and the locale object itself (both
+ *   scopes render the SAME shared partials, so every string rides). The
+ *   owner-named pieces alias onto the user-facing names at the import
+ *   (`applyUserCleanupRuleCreate`, `userSettingsPackagesLocale`, … — the
+ *   wiki-raw aliasing style), so this module's consumers never see an org
+ *   name; the scope-neutral helpers keep their names.
  *   DUPLICATED (the record shapes that genuinely differ): the page-data
  *   records + the edit-data builders carry `UserProfileRow` (the users row —
  *   username for VersionWebLink, visibility for the badge) instead of
@@ -232,7 +231,6 @@ import type { UserProfileRow } from "./user-profile";
 import {
   CLEANUP_RULE_KEEP_COUNTS,
   CLEANUP_RULE_REMOVE_DAYS,
-  RULE_PREVIEW_VERSIONS_LIMIT,
   applyOrgCleanupRuleCreate as applyUserCleanupRuleCreate,
   applyOrgCleanupRuleEdit as applyUserCleanupRuleEdit,
   cleanupRuleDays,
@@ -263,7 +261,6 @@ import {
 export {
   CLEANUP_RULE_KEEP_COUNTS,
   CLEANUP_RULE_REMOVE_DAYS,
-  RULE_PREVIEW_VERSIONS_LIMIT,
   applyUserCleanupRuleCreate,
   applyUserCleanupRuleEdit,
   cleanupRuleDays,
@@ -419,16 +416,14 @@ export async function loadUserCleanupRulePreview(d1: D1Database, user: UserProfi
   const rows: UserCleanupRulePreviewRow[] = [];
   for (const pkg of pkgs) {
     // Upstream SearchVersions{PackageID, IsInternal: false, SortCreatedDesc}
-    // through the landed searchVersions (the unique-key pin; the
-    // paginator-less Find rides the beyond-any-store limit).
+    // through the landed searchVersions: packageId IS upstream's filter
+    // (ToConds' `package.id = :id` arm, package_version.go:222-224, over
+    // the INNER JOIN :309-315), and omitting page/limit IS the
+    // paginator-less Find (searchVersionsBySession's Paginator-nil arm,
+    // :297-306 — upstream passes no Paginator here either).
     const { rows: versions } = await searchVersions(d1, {
-      ownerId: rule.ownerId,
-      type: rule.type,
-      name: pkg.lowerName,
-      exact: true,
+      packageId: pkg.id,
       excludeInternal: true,
-      page: 1,
-      limit: RULE_PREVIEW_VERSIONS_LIMIT,
     });
     // The positional keep-count trim (upstream pvs[KeepCount:]).
     const pool = rule.keepCount > 0 ? versions.slice(rule.keepCount) : versions;

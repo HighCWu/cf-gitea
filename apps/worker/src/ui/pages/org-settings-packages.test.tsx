@@ -62,7 +62,6 @@ import {
   renderOrgCleanupRuleEditPage,
   renderOrgCleanupRulePreviewPage,
   renderOrgSettingsPackagesPage,
-  RULE_PREVIEW_VERSIONS_LIMIT,
 } from "./org-settings-packages";
 
 // --- fixtures ----------------------------------------------------------------
@@ -239,7 +238,6 @@ describe("the locale helpers (the parameterized upstream strings)", () => {
     expect(cleanupRulePreviewOverview(2)).toBe("2 packages are scheduled to be removed.");
     expect(CLEANUP_RULE_KEEP_COUNTS).toEqual([0, 1, 5, 10, 25, 50, 100]);
     expect(CLEANUP_RULE_REMOVE_DAYS).toEqual([0, 7, 14, 30, 60, 90, 180]);
-    expect(RULE_PREVIEW_VERSIONS_LIMIT).toBeGreaterThan(0);
   });
 });
 
@@ -482,6 +480,18 @@ describe("loadOrgCleanupRulePreview (SetRulePreviewContext — shared/packages.g
 
     // The preview never deletes (GET only).
     expect(await db().select().from(packageVersions).where(eq(packageVersions.packageId, pkgId)).all()).toHaveLength(4);
+  });
+
+  it("the fetch is unbounded: 12 candidates all ride (the paginator-less Find — searchVersions' no-page/limit arm; identical rows before/after the searchVersions{PackageID} upgrade)", async () => {
+    const pkgId = (await seedPackage(org.id, "Many")).id;
+    for (let i = 1; i <= 12; i++) {
+      await seedVersion(pkgId, `1.${i}`, new Date(NOW.getTime() - i * DAY));
+    }
+    const ruleId = await seedRule({ ownerId: org.id, type: "generic", removeDays: 0 });
+    const data = await loadOrgCleanupRulePreview(env.DB, org, ruleId, NOW);
+    if (data.kind !== "ok") throw new Error("expected ok");
+    expect(data.rows).toHaveLength(12);
+    expect(data.rows[0]?.version.version).toBe("1.1"); // the newest candidate first (created desc)
   });
 
   it("the keep pattern is an anchored skip: matching versions stay even past the days", async () => {

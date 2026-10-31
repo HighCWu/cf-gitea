@@ -39,7 +39,6 @@ import type { Viewer } from "../viewer";
 import {
   CLEANUP_RULE_KEEP_COUNTS,
   CLEANUP_RULE_REMOVE_DAYS,
-  RULE_PREVIEW_VERSIONS_LIMIT,
   applyUserCleanupRuleCreate,
   applyUserCleanupRuleEdit,
   cleanupRuleDays,
@@ -188,7 +187,6 @@ describe("the re-export surface (the owner-agnostic logic rides the org module)"
     expect(parseUserCleanupRuleForm(fullForm).values.type).toBe("generic");
     expect(CLEANUP_RULE_KEEP_COUNTS).toEqual([0, 1, 5, 10, 25, 50, 100]);
     expect(CLEANUP_RULE_REMOVE_DAYS).toEqual([0, 7, 14, 30, 60, 90, 180]);
-    expect(RULE_PREVIEW_VERSIONS_LIMIT).toBeGreaterThan(0);
     expect(compileOrgCleanupRulePattern("v1")!.test("V1")).toBe(true); // the shared compile
     expect(ellipsisPattern("a".repeat(120), 100)).toBe("a".repeat(99) + "…");
 
@@ -314,6 +312,21 @@ describe("loadUserCleanupRulePreview (SetRulePreviewContext over ctx.Doer)", () 
     expect(data.rows.every((row) => row.versionLink.startsWith(`/${alice.username}/-/packages/generic/app/`))).toBe(true);
     // The preview never deletes (GET only).
     expect(await db().select().from(packageVersions).where(eq(packageVersions.packageId, pkgId)).all()).toHaveLength(4);
+  });
+
+  it("the fetch is unbounded: 12 candidates all ride (the paginator-less Find — the same rows the org twin's loader yields on the same seed)", async () => {
+    const alice = await seedUserRow("alice");
+    const pkgId = (await seedPackage(alice.id, "Many")).id;
+    for (let i = 1; i <= 12; i++) {
+      await seedVersion(pkgId, `1.${i}`, new Date(NOW.getTime() - i * DAY));
+    }
+    const ruleId = await seedRule({ ownerId: alice.id, type: "generic", removeDays: 0 });
+    const data = await loadUserCleanupRulePreview(env.DB, alice, ruleId, NOW);
+    if (data.kind !== "ok") throw new Error("expected ok");
+    expect(data.rows).toHaveLength(12);
+    expect(data.rows.map((row) => row.version.version)).toEqual(
+      Array.from({ length: 12 }, (_, k) => `1.${k + 1}`),
+    );
   });
 
   it("the descriptor cells: the creator renders by name, creator_id 0 renders Ghost at the page; the size sums the blobs", async () => {

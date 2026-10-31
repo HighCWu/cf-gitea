@@ -82,19 +82,20 @@
  * table, no service layer, no schema change: list/get-scope-guarded/
  * exists-check/insert/update/delete mirroring package_cleanup_rule.go's
  * six functions. The preview rides the LANDED model reads:
- * `searchVersions` (model.ts:445 — created desc, id desc, the
+ * `searchVersions` (model.ts:465 — created desc, id desc, the
  * configureOrderBy default) + `getPackageDescriptor` (model.ts:384 — files
  * joined to blobs for CalculateBlobSize), with cleanup.ts:153's EXACT
  * anchored case-insensitive compile (`^(?:pattern)$`, "i") and the
  * consumer's candidate ladder (cleanup.ts:193-203 = upstream preview
  * packages.go:157-203 minus the container ShouldBeSkipped arm — no
  * container substrate, the sweep's documented v1 reduction). Upstream's
- * per-package `SearchVersions{PackageID}` pin reduces to the landed search
- * option set: `{ownerId, type, name: pkg.lowerName, exact: true}` — the
- * package unique key (owner_id,type,lower_name) resolves the identical row
- * set; the paginator-less `Find` (package_version.go:323-327, unbounded)
- * reduces to the beyond-any-store limit (the org secrets/variables twins'
- * `*_WEB_LIST_LIMIT` seam).
+ * per-package `SearchVersions{PackageID}` pin rides the model's packageId
+ * option verbatim (`package.id = :id` over the INNER JOIN,
+ * package_version.go:222-224 with the join :309-315) — no unique-key
+ * reduction; the paginator-less `Find` (searchVersionsBySession
+ * :297-306's Paginator-nil arm, unbounded) rides the model's no-page/limit
+ * arm — no stand-in limit either (the preview page renders the FULL
+ * survivor table, exactly upstream's cleanup_rules/preview.tmpl `range`).
  *
  * ## Documented reductions (§6 method — never dead controls)
  *
@@ -723,11 +724,6 @@ export async function loadOrgCleanupRuleEditPageData(d1: D1Database, org: OrgRec
 // cleanup consumer's candidate ladder over searchVersions + descriptors)
 // ---------------------------------------------------------------------------
 
-/** The beyond-any-store limit standing in for upstream's paginator-less
- *  `Find` (package_version.go:323-327) — the org secrets/variables twins'
- *  documented seam. */
-export const RULE_PREVIEW_VERSIONS_LIMIT = 10_000;
-
 /** One preview table row (preview.tmpl's tbody cells). */
 export interface OrgCleanupRulePreviewRow {
   pkg: PackageRow;
@@ -781,19 +777,15 @@ export async function loadOrgCleanupRulePreview(d1: D1Database, org: OrgRecord, 
   const rows: OrgCleanupRulePreviewRow[] = [];
   for (const pkg of pkgs) {
     // Upstream SearchVersions{PackageID, IsInternal: false, SortCreatedDesc}
-    // (:158-162) through the landed searchVersions: the unique-key pin
-    // (ownerId+type+exact lowerName) resolves the identical row set, the
-    // created-desc/id-desc order is searchVersions' default, and the
-    // paginator-less Find rides the beyond-any-store limit (the module
-    // header's seam).
+    // (:158-162) through the landed searchVersions: packageId IS upstream's
+    // filter (ToConds' `package.id = :id` arm, package_version.go:222-224,
+    // over the INNER JOIN :309-315), the created-desc/id-desc order is
+    // searchVersions' default, and omitting page/limit IS the paginator-less
+    // Find (searchVersionsBySession's Paginator-nil arm, :297-306 —
+    // upstream passes no Paginator here either).
     const { rows: versions } = await searchVersions(d1, {
-      ownerId: rule.ownerId,
-      type: rule.type,
-      name: pkg.lowerName,
-      exact: true,
+      packageId: pkg.id,
       excludeInternal: true,
-      page: 1,
-      limit: RULE_PREVIEW_VERSIONS_LIMIT,
     });
     // The positional keep-count trim (upstream pvs[KeepCount:], :167-173).
     const pool = rule.keepCount > 0 ? versions.slice(rule.keepCount) : versions;
