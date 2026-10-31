@@ -7147,16 +7147,16 @@ const oauth2Steps = (ctx) => [
   },
   {
     id: "ext-unknown-source-404",
-    expect: `GET /user/oauth2/no-such-source-<hex> → 404 (the resolve-arm contract at BOTH layers; the FULL flow legs — discovery, id_token verify, the identity ladder — are unit-tested against the stub IdP in web/oauth2-login.test.ts and stay out of probe scope). The BODY reads the mount state AT RUN TIME (the window2 convention): the W2 router's own honest-404 line 'Not Found' (the recorded §5.2 divergence from upstream's ServerError) asserts hard; the dispatcher's lowercase 'not found' unclaimed-path answer is the documented [warn] — /user/oauth2/* is not yet carved out of the repo-scoped dispatcher branch, so the flow legs are unreachable live`,
+    expect: `GET /user/oauth2/no-such-source-<hex> → 404 (the resolve-arm contract at BOTH layers; the FULL flow legs — discovery, id_token verify, the identity ladder — are unit-tested against the stub IdP in web/oauth2-login.test.ts and stay out of probe scope). The dispatcher carve has landed (the isUserAuthPath conjunction — the isLoginPath twin), so the W2 router's own honest-404 line 'Not Found' (the recorded §5.2 divergence from upstream's ServerError) asserts UNCONDITIONALLY now; the dispatcher's old lowercase 'not found' unclaimed-path answer is a RED regression tripwire (it would mean the repo-scoped branch reclaimed the family and the flow legs went dark again)`,
     run: async () => {
       const res = await fetchT(`${opts.baseUrl}/user/oauth2/no-such-source-${hexId(8)}`);
       const text = await res.text();
       expect(res.status === 404, `status ${res.status} (expected 404)`);
       if (text.startsWith("Not Found")) {
-        return "404 with the W2 router's honest-404 line ('Not Found')";
+        return "404 with the W2 router's honest-404 line ('Not Found') — answered through the dispatcher carve";
       }
       if (text.startsWith("not found")) {
-        return { status: "warn", detail: `404 but the DISPATCHER's unclaimed-path carve answered ('${text.slice(0, 20).replace(/\n/, "")}') — /user/oauth2/* is not carved out of the repo-scoped dispatcher branch (handlesUiRoute does not claim it), so the W2 flow legs are unreachable live on this deployment; the router's own 404 line asserts once the carve lands` };
+        throw new Error(`404 but the ENGINE's unclaimed-path answer came back ('${text.slice(0, 20).replace(/\n/, "")}') — the /user/oauth2 carve has regressed to the repo-scoped dispatcher branch; the W2 flow legs are unreachable again`);
       }
       throw new Error(`404 with an unexpected body ${JSON.stringify(text.slice(0, 40))} (expected the plain Not Found line)`);
     },

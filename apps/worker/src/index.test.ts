@@ -984,6 +984,131 @@ describe("the unclaimed-repo-path 404 carve (upstream context_response.go:129-15
   });
 });
 
+// --- the /user auth-page family carve (external-auth §5.2/§2.5) ---------------
+//
+// /user/oauth2/{source}[/callback] (web.go:768-771's group) and the
+// /user/link_account[_signin|_signup] trio (web.go:597-599) are served by
+// their own Hono mounts (oauth2LoginRouter + linkAccountRouter) — the
+// isLoginPath twin at the dispatcher. Before the carve the two-segment-
+// and-deeper /user/... shapes fell into the repo-scoped branch and the
+// headless engine 404'd them before Hono ever saw the mounts (the W6
+// battery's live finding: ext-unknown-source-404 answered the dispatcher's
+// lowercase `not found`). These arms pin the dispatch through the WHOLE
+// worker — the mounts themselves are unit-covered in web/oauth2-login.test.ts
+// and ui/pages/link-account.test.tsx.
+
+describe("the /user auth-page family carve (upstream web.go:597-599 + 768-771)", () => {
+  // The battery's seed shape (deploy-probes.mjs ext-source-seed-d1): one
+  // ACTIVE type-6 login_source row. The GITHUB provider cfg keeps the start
+  // leg OFF the network — the simple arms build the authorize URL straight
+  // from the registry endpoint set (github-client.ts's
+  // buildGithubAuthorizeUrl, no discovery fetch) — so the 303's Location is
+  // deterministic in workerd.
+  const sourceName = "probe-github-source";
+
+  async function seedGithubSource(): Promise<void> {
+    const cfg = JSON.stringify({ v: 1, provider: "github", clientId: "probe-client-0001", clientSecret: "probe-secret" });
+    await env.DB.prepare(
+      "INSERT INTO login_source (type, name, is_active, is_sync_enabled, two_factor_policy, cfg, created_unix, updated_unix) " +
+        "VALUES (6, ?, 1, 0, '', ?, unixepoch(), unixepoch())",
+    )
+      .bind(sourceName, cfg)
+      .run();
+  }
+
+  async function deleteSource(): Promise<void> {
+    await env.DB.prepare("DELETE FROM login_source WHERE name = ?").bind(sourceName).run();
+  }
+
+  it("hands GET /user/oauth2/{source} to the mounted router — the start leg's 303 authorize redirect", async () => {
+    await seedGithubSource();
+    try {
+      // (redirect: "manual" — SELF.fetch follows by default.)
+      const res = await SELF.fetch(`https://example.com/user/oauth2/${sourceName}`, { redirect: "manual" });
+      expect(res.status).toBe(303);
+      const location = new URL(res.headers.get("location") ?? "");
+      expect(location.origin).toBe("https://github.com");
+      expect(location.pathname).toBe("/login/oauth/authorize");
+      expect(location.searchParams.get("client_id")).toBe("probe-client-0001");
+      // The source-NAME-bound redirect_uri (§5.2) — and it names OUR callback,
+      // the second leg this same carve admits.
+      expect(location.searchParams.get("redirect_uri")).toBe(
+        `https://example.com/user/oauth2/${sourceName}/callback`,
+      );
+      expect(location.searchParams.get("state")).not.toBe(null);
+      // The dance state parks on the anonymous carrier (no session in this
+      // request — the gitea_oauth2_state cookie rides the redirect).
+      expect(res.headers.get("set-cookie")).toContain("gitea_oauth2_state=");
+    } finally {
+      await deleteSource();
+    }
+  });
+
+  it("hands GET /user/oauth2/{source}/callback to the mounted router — the provider-error ladder answers", async () => {
+    await seedGithubSource();
+    try {
+      const res = await SELF.fetch(`https://example.com/user/oauth2/${sourceName}/callback?error=access_denied`, {
+        redirect: "manual",
+      });
+      // errCallback's access_denied arm (oauth.go:111-130) — the fixed-code
+      // flash marker, spent dance cookies riding along.
+      expect(res.status).toBe(303);
+      expect(res.headers.get("location")).toBe("/login?oauth2_error=access_denied");
+      expect(res.headers.get("set-cookie")).toContain("gitea_oauth2_state=");
+    } finally {
+      await deleteSource();
+    }
+  });
+
+  it("answers the unknown source with the router's honest 404 line — the engine's lowercase 'not found' is unreachable", async () => {
+    // The exact live shape the W6 battery's ext-unknown-source-404 arm runs
+    // (§5.2's recorded divergence from upstream's ServerError): the router's
+    // own `Not Found\n`, never the engine's `not found\n` and never the HTML
+    // shell.
+    const res = await SELF.fetch(`https://example.com/user/oauth2/no-such-source-${Date.now()}`, {
+      headers: { accept: "text/html" },
+    });
+    expect(res.status).toBe(404);
+    expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(await res.text()).toBe("Not Found\n");
+  });
+
+  it("keeps unregistered tails under the family on Hono's default 404 (the isLoginPath grain)", async () => {
+    // The carve hands the WHOLE /user/{oauth2,link_account*} prefix to Hono;
+    // a shape no mount registers takes Hono's default plain 404 — upstream's
+    // own unregistered-route posture (chi answers its 404 the same way), the
+    // /login/junk twin's established answer.
+    for (const path of [`/user/oauth2/${sourceName}/junk`, "/user/link_account/junk"]) {
+      const res = await SELF.fetch(`https://example.com${path}`, { redirect: "manual" });
+      expect(res.status).toBe(404);
+      expect(res.headers.get("content-type")).toBe("text/plain; charset=UTF-8");
+      expect(await res.text()).toBe("404 Not Found");
+    }
+  });
+
+  it("hands the link-account POST pair to its mounted router — the init window answers through the dispatch", async () => {
+    // The file-level beforeEach empties `users`, so the init window is open
+    // and both POST arms take the §5.5.3 guard arm (303 /user/login) BEFORE
+    // any credential work — a mount-level answer that never existed on the
+    // pre-carve engine path (its 401 challenge / plain 404).
+    for (const path of ["/user/link_account_signin", "/user/link_account_signup"]) {
+      const res = await SELF.fetch(`https://example.com${path}`, { method: "POST", redirect: "manual" });
+      expect(res.status).toBe(303);
+      expect(res.headers.get("location")).toBe("/user/login");
+    }
+  });
+
+  it.skipIf(!UI_ASSETS_BUILT)("answers GET /user/link_account with the page render", async () => {
+    // ROUTE-answers assertion (the page body is the W5 sibling's covered
+    // surface — link-account.test.tsx + the goldens): the carve admits the
+    // two-segment shape and the mounted router renders text/html 200 where
+    // the pre-carve dispatcher answered the shell/engine 404 pair.
+    const res = await SELF.fetch("https://example.com/user/link_account", { headers: { accept: "text/html" } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/html; charset=UTF-8");
+  });
+});
+
 // --- the app.onError 500 chrome arm (usability sweep, 2026-10-29) --------------
 
 describe("the app.onError 500 chrome arm (upstream routers/common/errpage.go)", () => {
