@@ -20,14 +20,16 @@
  *     outbox row is transport-agnostic). The remaining notify surfaces are
  *     additive entries against the same core — the recipient resolution and
  *     the compose below are exactly upstream's shared middle, so
- *     `NewIssue` / `IssueChangeStatus` / `NewPullRequest` (notify.go:53-96,
- *     SPEC §1.3's next arms) become thin wrappers passing a different
- *     action type and `comment = null`.
+ *     `NewIssue` / `IssueChangeStatus` (notify.go:53-76, landed here) and
+ *     `NewPullRequest` (:88, SPEC §1.3's remaining arm) are thin wrappers
+ *     passing a different action type and `comment = null`.
  *
- * The emit site is the real write path (`IssuesService.addComment` —
- * upstream fires notify from the model layer too: CreateIssueComment's
- * notify call rides the comment-create service, not the router). Failures
- * are logged, never propagated (upstream logs at the receiver,
+ * The emit sites are the real write paths (`IssuesService.addComment` /
+ * `createIssue` / `closeIssue`+`reopenIssue` — upstream fires notify from
+ * the model layer too: CreateIssueComment's notify call rides the
+ * comment-create service, NewIssue's rides the issue-create service and
+ * IssueChangeStatus's the state-transition service, never the router).
+ * Failures are logged, never propagated (upstream logs at the receiver,
  * notify.go:48-50 `log.Error("MailParticipantsComment: %v", err)`); the
  * write stays committed.
  *
@@ -63,6 +65,7 @@ import {
   doerRepoAccessMode,
   findRepositoryById,
   type RepositoryRow,
+  type RepositoryWithOwner,
   type UserRow,
 } from "../../api/services/repository";
 import { loadRepoSettings } from "../../api/services/repo-settings";
@@ -70,7 +73,15 @@ import { CommentType } from "../../issues/comment-types";
 import { appDomainFromAppUrl, parseMailFrom, sanitizeSubject } from "./message";
 import { enqueueMailOutbox, type EnqueueOutcome, type MailOutboxEnv } from "./outbox";
 import { appUrlWithSlash, GITEA_APP_NAME, isMailable } from "./register-notify";
-import { issueMailFallbackSubject, renderIssueCommentMail } from "./templates";
+import {
+  displayNameWithFullName,
+  issueActionCloseLine,
+  issueActionNewLine,
+  issueActionReopenLine,
+  issueMailFallbackSubject,
+  renderIssueActionMail,
+  renderIssueCommentMail,
+} from "./templates";
 
 /** The issue row the arm composes over (schema-derived; no issues/service
  *  import — the emit site imports US). */
@@ -79,11 +90,12 @@ type CommentMailRow = typeof comments.$inferSelect;
 
 /**
  * The notify-event vocabulary — upstream's `Notifier` method names
- * (services/notify/notifier.go). This slice fires the FIRST arm only;
- * the rest are the additive entries SPEC §1.3 enumerates (each lands as a
- * thin wrapper over the same resolution + compose core below).
+ * (services/notify/notifier.go). The three issue-thread arms land here
+ * (CreateIssueComment notify.go:31-51, NewIssue :53-58, IssueChangeStatus
+ * :59-76); the rest are the additive entries SPEC §1.3 enumerates (each
+ * lands as a thin wrapper over the same resolution + compose core below).
  */
-export type MailNotifyEvent = "CreateIssueComment";
+export type MailNotifyEvent = "CreateIssueComment" | "NewIssue" | "IssueChangeStatus";
 
 /** The env slice the hub reads (both bindings ride the outbox). */
 export type MailNotifyEnv = Pick<MailOutboxEnv, "DB" | "REPO_TASKS" | "APP_URL"> & {
@@ -129,7 +141,7 @@ function mailFromDisplayName(user: UserRow): string {
 
 /** `generateMessageIDForIssue` (mail_issue_common.go:280-305) —
  *  `<owner/repo/issues|pulls/#index[/comment/<id>]@AppDomain>`; the
- *  close/reopen/merge timestamp suffixes belong to the later arms. */
+ *  close/reopen timestamp suffix lives in `issueActionMessageId`. */
 function issueMessageId(
   repoPath: string,
   isPull: boolean,
@@ -140,6 +152,26 @@ function issueMessageId(
   const path = isPull ? "pulls" : "issues";
   const extra = commentId === undefined ? "" : `/comment/${commentId}`;
   return `<${repoPath}/${path}/${index}${extra}@${appDomain}>`;
+}
+
+/** `generateMessageIDForIssue`'s close/reopen extras (mail_issue_common.go:
+ *  286-293 — ActionCloseIssue/ClosePullRequest → `/close/<unixMilli>`,
+ *  ActionReopenIssue/ReopenPullRequest → `/reopen/<unixMilli>`): every
+ *  status mail's Message-ID is distinct across repeated close/reopen cycles
+ *  over one issue (upstream's own uniqueness mechanism — the pin's test at
+ *  mail_test.go:446/:462 asserts exactly the `/close/` and `/reopen/`
+ *  prefixes). The "new" arm has NO extra (ActionCreateIssue falls through
+ *  the switch, mail_test.go:407-418), so it reuses `issueMessageId` plain. */
+function issueActionMessageId(
+  repoPath: string,
+  isPull: boolean,
+  index: number,
+  appDomain: string,
+  action: "close" | "reopen",
+  unixMilli: number,
+): string {
+  const path = isPull ? "pulls" : "issues";
+  return `<${repoPath}/${path}/${index}/${action}/${unixMilli}@${appDomain}>`;
 }
 
 /**
@@ -350,6 +382,34 @@ export async function resolveIssueMailRecipients(
 }
 
 /**
+ * The arms' shared prelude — the master gate (SPEC §5.1, upstream
+ * `setting.MailService == nil`), the MAIL_FROM parse (§5.2) and the repo
+ * pair load (upstream loads the repo before composing, mail_issue.go:30-32;
+ * a missing row logs and skips — the push-wave degradation rule). `mailName`
+ * names the arm in both log lines; notifyIssueComment's landed messages are
+ * byte-identical through it.
+ */
+type MailArmPrelude =
+  | { ok: false; outcome: MailNotifyOutcome }
+  | { ok: true; from: { displayName: string; address: string }; pair: RepositoryWithOwner };
+
+async function mailArmPrelude(env: MailNotifyEnv, mailName: string, warnDetail: string, repoId: string): Promise<MailArmPrelude> {
+  if (env.MAIL_ENABLED !== "true") return { ok: false, outcome: { outcome: "disabled" } };
+  const from = parseMailFrom(env.MAIL_FROM ?? "");
+  if (from === null) {
+    const message = `[mail] MAIL_ENABLED=true but MAIL_FROM is missing or unparseable; skipping ${warnDetail}`;
+    console.warn(message);
+    return { ok: false, outcome: { outcome: "misconfigured", message } };
+  }
+  const pair = await findRepositoryById(env.DB, repoId);
+  if (pair === null) {
+    console.error(`[mail] ${mailName} skipped: repository row missing [id: ${repoId}]`);
+    return { ok: false, outcome: { outcome: "no-recipients" } };
+  }
+  return { ok: true, from, pair };
+}
+
+/**
  * The `CreateIssueComment` arm's mail (notify.go:31-51 →
  * MailParticipantsComment → mailIssueCommentToParticipants →
  * composeIssueCommentMessages). Gate → resolve → compose → outbox, never
@@ -361,23 +421,9 @@ export async function notifyIssueComment(
   input: NotifyIssueCommentInput,
   options: { now?: Date } = {},
 ): Promise<MailNotifyOutcome> {
-  // The master gate — upstream `setting.MailService == nil` parity (SPEC §5.1).
-  if (env.MAIL_ENABLED !== "true") return { outcome: "disabled" };
-  const from = parseMailFrom(env.MAIL_FROM ?? "");
-  if (from === null) {
-    const message = `[mail] MAIL_ENABLED=true but MAIL_FROM is missing or unparseable; skipping issue-comment mail for comment ${input.comment.id}`;
-    console.warn(message);
-    return { outcome: "misconfigured", message };
-  }
-
-  // The repo pair — the subject/link/repo-header source (upstream loads the
-  // repo before composing, mail_issue.go:30-32). A missing row (orphaned
-  // repo) logs and skips — the push-wave degradation rule.
-  const pair = await findRepositoryById(env.DB, input.issue.repoId);
-  if (pair === null) {
-    console.error(`[mail] issue-comment mail skipped: repository row missing [id: ${input.issue.repoId}]`);
-    return { outcome: "no-recipients" };
-  }
+  const pre = await mailArmPrelude(env, "issue-comment mail", `issue-comment mail for comment ${input.comment.id}`, input.issue.repoId);
+  if (!pre.ok) return pre.outcome;
+  const { from, pair } = pre;
 
   const recipients = await resolveIssueMailRecipients(env.DB, {
     issue: input.issue,
@@ -460,4 +506,218 @@ export async function notifyIssueComment(
     );
   }
   return { outcome: "enqueued", recipientIds, enqueue };
+}
+
+/** The comment-nil arms' input (upstream `mailComment` with `Comment: nil`,
+ *  mail_issue.go:188-198). */
+interface NotifyIssueArmInput {
+  issue: IssueMailRow;
+  /** The mail's doer — issue.Poster for NewIssue (notify.go:55), the actor
+   *  for IssueChangeStatus (notify.go:76). */
+  doer: UserRow;
+  /** actionToTemplate's name for the arm (mail_issue_common.go:227-246):
+   *  ActionCreateIssue → "new"; ActionCloseIssue|ClosePullRequest → "close";
+   *  ActionReopenIssue|ReopenPullRequest → "reopen" (IsPull picks the
+   *  activities constant, not the name — notify.go:63-73). */
+  actionName: "new" | "close" | "reopen";
+  /** MailParticipants' content rule (mail_issue.go:179-185): the issue
+   *  content for "new"; "" for close/reopen (upstream empties it). */
+  content: string;
+  /** The dedupe-key family (SPEC §8.3's trigger-level idempotency). */
+  dedupePrefix: "issue-new" | "issue-status";
+}
+
+/**
+ * The comment-nil arm compose — the shared middle behind NewIssue and
+ * IssueChangeStatus: `MailParticipants` (mail_issue.go:173-202) with
+ * `Comment: nil` → `mailIssueCommentToParticipants` (the same resolution
+ * core the comment arm uses) → `composeIssueCommentMessages` over the
+ * default.tmpl non-comment branches. Differences from the comment arm, all
+ * pinned:
+ *   - link = `Issue.HTMLURL`, no anchor (mail_issue_common.go:60-64 —
+ *     Comment nil);
+ *   - subject prefix "Re: " only when actName != "new" (:88-91) — the new
+ *     mail is the thread's root;
+ *   - Message-ID: "new" carries NO extra (mail_issue_common.go:285-294's
+ *     switch has no ActionCreateIssue case — the mail_test.go:412 fixture
+ *     pins the plain `<owner/repo/issues/#idx@domain>`); close/reopen carry
+ *     `/close|reopen/<unixMilli>` (the :446/:462 fixtures);
+ *   - In-Reply-To/References stay the plain thread id for both arms (the
+ *     reference is generated with ActionType(0), :165);
+ *   - the body is the ISSUE content for new and empty for close/reopen, so
+ *     default.tmpl renders the locale action line (`mail.issue.action.*`,
+ *     interpolated with DisplayNameWithFullName) instead of a body for
+ *     close/reopen and for empty new-issue descriptions;
+ *   - info stays "issue comments" (mail_issue.go:159's batch string).
+ * Dedupe keys: `issue-new:<issueId>:<recipientId>` (issueId is unique — the
+ * comment arm's commentId discipline) and
+ * `issue-status:<issueId>:<action>:<unixMilli>:<recipientId>` (the ms rides
+ * the key exactly as it rides the Message-ID — repeated close/reopen cycles
+ * over one issue must each mail).
+ */
+async function notifyIssueArm(
+  env: MailNotifyEnv,
+  input: NotifyIssueArmInput,
+  options: { now?: Date },
+): Promise<MailNotifyOutcome> {
+  const armName = input.actionName === "new" ? "new-issue mail" : "issue-status mail";
+  const pre = await mailArmPrelude(env, armName, `${armName} for issue ${input.issue.id}`, input.issue.repoId);
+  if (!pre.ok) return pre.outcome;
+  const { from, pair } = pre;
+
+  const recipients = await resolveIssueMailRecipients(env.DB, {
+    issue: input.issue,
+    repo: pair.repo,
+    doer: input.doer,
+  });
+  if (recipients.length === 0) return { outcome: "no-recipients" };
+
+  // ---- compose (composeIssueCommentMessages' comment-nil slice) ----
+  const unixMilli = (options.now ?? new Date()).getTime();
+  const repoPath = `${pair.repo.ownerNamespace}/${pair.repo.slug}`;
+  const origin = appUrlWithSlash(env.APP_URL);
+  const appDomain = appDomainFromAppUrl(env.APP_URL);
+  const repoHtmlUrl = `${origin}${encodeURIComponent(pair.repo.ownerNamespace)}/${encodeURIComponent(pair.repo.slug)}`;
+  const issueUrl = issueMailUrl(origin, pair.repo.ownerNamespace, pair.repo.slug, input.issue.isPull, input.issue.index);
+  const link = issueUrl;
+  const prefix = input.actionName === "new" ? "" : "Re: ";
+  const subject = `${prefix}${issueMailFallbackSubject(repoPath, input.issue.title, input.issue.index)}`;
+  const sanitized = sanitizeSubject(subject);
+  // The body: rendered with absolute links like the comment arm
+  // (mail_issue_common.go:71-72); "" short-circuits to the template's
+  // empty-body branch (markdown.RenderString of "" IS "" — the `eq .Body
+  // ""` check keys on the rendered value).
+  const bodyHtml =
+    input.content === ""
+      ? ""
+      : renderMarkdownToHtml({
+          text: input.content,
+          mode: "comment",
+          context: repoPath,
+          wiki: false,
+          origin,
+        });
+  // The action line: close/reopen render theirs ALWAYS (default.tmpl's
+  // first action chain — MailParticipants guarantees Body == "" for them);
+  // "new" renders its line only when the body is empty (the nested
+  // `{{if eq .ActionName "new"}}`).
+  const doerDisplay = displayNameWithFullName(input.doer.username, input.doer.fullName);
+  const actionLineHtml =
+    input.actionName === "close"
+      ? issueActionCloseLine(doerDisplay, input.issue.index)
+      : input.actionName === "reopen"
+        ? issueActionReopenLine(doerDisplay, input.issue.index)
+        : bodyHtml === ""
+          ? issueActionNewLine(doerDisplay, input.issue.index)
+          : null;
+  const fromDisplayName = mailFromDisplayName(input.doer);
+  const messageId =
+    input.actionName === "new"
+      ? issueMessageId(repoPath, input.issue.isPull, input.issue.index, appDomain)
+      : issueActionMessageId(repoPath, input.issue.isPull, input.issue.index, appDomain, input.actionName, unixMilli);
+  const threadId = issueMessageId(repoPath, input.issue.isPull, input.issue.index, appDomain);
+  const info = `Subject: ${sanitized}, issue comments`;
+
+  const enqueue: EnqueueOutcome[] = [];
+  const recipientIds: number[] = [];
+  for (const recipient of recipients) {
+    recipientIds.push(recipient.id);
+    enqueue.push(
+      await enqueueMailOutbox(
+        env,
+        {
+          info,
+          fromAddress: from.address,
+          fromDisplayName,
+          toAddr: recipient.email!,
+          replyTo: null, // the Reply-To arm rides IncomingEmail (not landed)
+          subject,
+          bodyHtml: renderIssueActionMail({
+            subject: sanitized,
+            actionName: input.actionName,
+            bodyHtml,
+            actionLineHtml,
+            link,
+            issueIndex: input.issue.index,
+            appName: GITEA_APP_NAME,
+            appUrl: origin,
+          }),
+          headers: JSON.stringify({
+            "Message-ID": messageId,
+            "In-Reply-To": threadId,
+            References: threadId,
+            "List-Unsubscribe": `<${issueUrl}>`,
+            ...issueMailHeaders({
+              repoPath,
+              repoName: pair.repo.slug,
+              repoHtmlUrl,
+              issueUrl,
+              issueIndex: input.issue.index,
+              isPull: input.issue.isPull,
+              appDomain,
+              sender: input.doer,
+              recipient,
+            }),
+          }),
+          dedupeKey:
+            input.dedupePrefix === "issue-new"
+              ? `issue-new:${input.issue.id}:${recipient.id}`
+              : `issue-status:${input.issue.id}:${input.actionName}:${unixMilli}:${recipient.id}`,
+        },
+        options,
+      ),
+    );
+  }
+  return { outcome: "enqueued", recipientIds, enqueue };
+}
+
+/**
+ * The `NewIssue` arm's mail (notify.go:53-58 → MailParticipants with
+ * ActionCreateIssue, doer = `issue.Poster`, mentions nil-unported per the
+ * §8.2 reductions). Only issues ride it — pull creation is the separate
+ * `NewPullRequest` receiver (notify.go:88-93, SPEC §1.3).
+ */
+export async function notifyIssueCreated(
+  env: MailNotifyEnv,
+  input: { issue: IssueMailRow; doer: UserRow },
+  options: { now?: Date } = {},
+): Promise<MailNotifyOutcome> {
+  return notifyIssueArm(
+    env,
+    {
+      issue: input.issue,
+      doer: input.doer,
+      actionName: "new",
+      content: input.issue.content ?? "",
+      dedupePrefix: "issue-new",
+    },
+    options,
+  );
+}
+
+/**
+ * The `IssueChangeStatus` arm's mail (notify.go:59-76 → MailParticipants
+ * with ActionCloseIssue|ActionClosePullRequest when closing,
+ * ActionReopenIssue|ActionReopenPullRequest when reopening — IsPull picks
+ * the activities constant — doer = the actor, mentions nil). The closed/
+ * reopened family, NOT a MailIssueClearComment chain: no such function
+ * exists at the pin. MailParticipants empties the content for these ops
+ * (mail_issue.go:180-185), so the action line IS the body.
+ */
+export async function notifyIssueStatusChanged(
+  env: MailNotifyEnv,
+  input: { issue: IssueMailRow; doer: UserRow; isClosed: boolean },
+  options: { now?: Date } = {},
+): Promise<MailNotifyOutcome> {
+  return notifyIssueArm(
+    env,
+    {
+      issue: input.issue,
+      doer: input.doer,
+      actionName: input.isClosed ? "close" : "reopen",
+      content: "",
+      dedupePrefix: "issue-status",
+    },
+    options,
+  );
 }

@@ -1121,7 +1121,7 @@ export function registerPullRoutes(
         return diffStatsMemo === null ? undefined : { diffStats: diffStatsMemo };
       };
       const form = c.req.valid("json");
-      const service = new IssuesService(c.env.DB);
+      const service = new IssuesService(c.env.DB, c.env);
       const requester = c.get("authUser");
       if (requester === undefined) {
         throw new ApiError(401, "token is required"); // unreachable behind requireAuth

@@ -1,7 +1,8 @@
 # SPEC: Outbound Email (the mailer service, transport decision, first trigger)
 
-Status: **DESIGN + TWO VERTICAL SLICES** (gap-fill queue #8, 2026-10-31; slice
-two — the mail notify hub + the issue-comment surface — same day).
+Status: **DESIGN + THREE VERTICAL SLICES** (gap-fill queue #8, 2026-10-31;
+slice two — the mail notify hub + the issue-comment surface — and slice
+three — the NewIssue + IssueChangeStatus arms — same day).
 Upstream references are at the submodule pin `fc4936884584a41931906553d96c2601d750e6ef`.
 
 Companion to `specs/user-notification-settings.md` (which stores the
@@ -52,15 +53,15 @@ upstream's shape impossible and multiple equally faithful adaptations exist
   notify hub (`services/mail/notify.ts`, the `CreateIssueComment` receiver's
   plain type-0 comment arm) over the full recipient resolution
   (`mailIssueCommentToParticipants`, mail_issue.go:28-120) and the
-  `mail/repo/issue/default.tmpl` comment render. STILL FOLLOW-UP, in
-  upstream notify.go order:
-  - the sibling arms over the SAME resolution core — `NewIssue`
-    (notify.go:53), `IssueChangeStatus` (close/reopen, :59), `NewPullRequest`
-    (:92), `IssueChangeTitle`'s WIP-ready branch (:80) — each a thin wrapper
-    passing a different action type and `comment = null` (the hub is
-    structured for exactly this); note `CreateIssueComment`'s own
-    Close/Reopen/Code/PullRequestPush comment-type branches ride those
-    arms' write paths, not the plain-comment one;
+  `mail/repo/issue/default.tmpl` comment render. Slice THREE (same file,
+  §9) lands the next two arms in upstream notify.go order — `NewIssue`
+  (:53) and `IssueChangeStatus` (:59). STILL FOLLOW-UP, in upstream
+  notify.go order:
+  - `NewPullRequest` (:92) — the pull-create twin of `NewIssue`; the
+    `createPullRequest` service deliberately emits nothing today and the
+    pulls-create route keeps its bare `IssuesService(c.env.DB)`
+    construction (§9.4's handoff line);
+  - `IssueChangeTitle`'s WIP-ready branch (:80);
   - mentions (`services/mentions` — the `onmention` preference stays
     unreachable until it lands, see §8's reduction ledger);
   - `SendIssueAssignedMail` (`mail_issue.go:201-234`) + the
@@ -84,10 +85,10 @@ upstream's shape impossible and multiple equally faithful adaptations exist
   is a follow-up).
 - A stranded-`pending` re-drive sweep (§4.5 records the known gap; the
   webhook-delivery sweep precedent is the model).
-- The API route wiring handoff (§8.4): the `issueCreateComment` route still
-  constructs `IssuesService(c.env.DB)` — the one-line pass-through of the
-  notify env rides the routes owner's landing window (the emit itself is in
-  the service, upstream-shaped; never in a route handler).
+- The UI write paths (src/ui/**) and the push-webhook close paths
+  (services/webhooks-push.ts) construct bare `IssuesService(...)` — their
+  notify arms stay OFF until their owners pass the notify env (the same
+  one-line hop as §9.4; outside this unit's file ownership).
 
 ---
 
@@ -589,6 +590,132 @@ ours) carries the same one-line option when its comment posting lands.
 
 ---
 
+## 9. SLICE THREE AS-BUILT — the NewIssue + IssueChangeStatus arms
+
+### 9.1 The pin's two-arm chain map (verified at fc493688)
+
+Both arms funnel into the SAME middle slice two ports — no new resolution
+or compose core:
+
+- `NewIssue` (services/mailer/notify.go:53-58):
+  `MailParticipants(ctx, issue, issue.Poster, ActionCreateIssue, mentions)`
+  — the doer is the POSTER; mentions ride the §8.2 reduction (no parser,
+  passed nil-shaped).
+- `IssueChangeStatus` (notify.go:59-76): the IsPull branch picks
+  `ActionClosePullRequest`/`ActionReopenPullRequest` vs
+  `ActionCloseIssue`/`ActionReopenIssue`, then
+  `MailParticipants(ctx, issue, doer, actionType, nil)` — doer = the
+  actor. This is the closed/reopened family, NOT a
+  `MailIssueClearComment` chain: no such function exists at the pin (the
+  pin's mailer has only `MailParticipants` and `MailParticipantsComment`).
+- `MailParticipants` (mail_issue.go:173-202) builds a `mailComment` with
+  `Comment: nil` and `Content = issue.Content` — EMPTIED to `""` for the
+  close/reopen/merge ops (:180-185) — then
+  `mailIssueCommentToParticipants` (the shared recipient resolution) and
+  `composeIssueCommentMessages` with the batch info string
+  "issue comments" (mail_issue.go:161).
+- Template resolution: `actionToTemplate` (mail_issue_common.go:227-246)
+  names the arms "new"/"close"/"reopen"; no
+  `mail/repo/issue/new|close|reopen` template exists at the pin (only
+  assigned + default in `templates/mail/repo/issue/`, and no
+  `mail/repo/pull/` at all), so EVERY arm renders default.tmpl — the same
+  file the comment arm pinned, through its `.ActionName` branches.
+- default.tmpl has NO subject section (the §8.1 `---` absence), so the
+  subjects are the fallback with the :88-91 prefix rule:
+  `[owner/repo] Title (#Index)` for "new" (NO "Re: " — the new mail is
+  the thread root), `Re: [owner/repo] Title (#Index)` for close/reopen.
+  Upstream's own mail_test.go pins the close subject
+  (`Re: [user2/repo1] issue1 (#1)`, :312) and — for "new" under a MOCKED
+  subject template (:220-240) — the Message-ID/In-Reply-To/References
+  TRIPLE-COINCIDENCE on the plain thread id.
+- Message-ID extras (mail_issue_common.go:285-294): ActionCreateIssue has
+  NO extra (the plain `<owner/repo/issues|pulls/#idx@domain>`,
+  mail_test.go:407-418 "Open Issue"/"Open Pull"); close carries
+  `/close/<unixMilli>` and reopen `/reopen/<unixMilli>`
+  (mail_test.go:446/:462 pin exactly the prefixes). In-Reply-To/References
+  stay the PLAIN thread id for every arm (the reference is generated with
+  `ActionType(0)`, :165).
+- The body locale lines (`options/locale/locale_en-US.json`,
+  interpolated by default.tmpl with `.Doer.DisplayNameWithFullName`):
+  `mail.issue.action.new` = `<b>%[1]s</b> created #%[2]d.`,
+  `.close` = `<b>%[1]s</b> closed #%[2]d.`, `.reopen` =
+  `<b>%[1]s</b> reopened #%[2]d.` — shown for close/reopen ALWAYS (their
+  first action chain; the body is guaranteed empty), and for "new" only
+  when the RENDERED body is empty (the nested
+  `{{if eq .ActionName "new"}}`; the `eq .Body ""` check keys on the
+  rendered value).
+- The body display name is `User.DisplayNameWithFullName`
+  (models/user/user.go:495-501) = `username (FullName)` — USERNAME first,
+  the Sprintf argument order — DISTINCT from mail.go's `fromDisplayName`
+  (the From header, `FullName (username)` first; both pinned).
+
+### 9.2 The arms as-built (services/mail/notify.ts + templates.ts)
+
+- `notifyIssueCreated(env, {issue, doer})` and
+  `notifyIssueStatusChanged(env, {issue, doer, isClosed})` are thin
+  wrappers over the shared `notifyIssueArm` compose (the comment-nil slice
+  of `composeIssueCommentMessages`) — the same gate → MAIL_FROM parse →
+  repo pair → `resolveIssueMailRecipients` → outbox shape as
+  `notifyIssueComment`, with the shared prelude factored into
+  `mailArmPrelude` (byte-identical log messages for the comment arm).
+- Per-arm differences, all §9.1-pinned: the prefix rule; the content rule
+  (issue content for new — rendered through the SAME
+  repo-comment-context markdown service; "" for close/reopen); the
+  Message-ID extras; the link without a comment anchor; the locale action
+  line (`renderIssueActionMail`'s three byte-traced `<p>` shapes: the
+  body branch — identical bytes to the comment arm — the close/reopen
+  first-chain shape, and the nested new-if shape); info stays
+  "issue comments" for both arms.
+- Dedupe keys (§8.3's trigger-level idempotency discipline):
+  `issue-new:<issueId>:<recipientId>` (issueId is unique — the commentId
+  discipline) and `issue-status:<issueId>:<close|reopen>:<unixMilli>:
+  <recipientId>` — the ms rides the key exactly as it rides the
+  Message-ID, because repeated close/reopen cycles over one issue must
+  EACH mail (upstream's own uniqueness mechanism is that timestamp).
+- Headers (`issueMailHeaders`) are arm-independent: the reason header is
+  issue|pull by IsPull for every arm (actType = typeName at
+  mail_issue_common.go:207).
+
+### 9.3 The emit sites (src/issues/service.ts)
+
+Upstream fires these receivers from the model layer (the issue-create and
+state-transition services), never the router — the emits sit at:
+
+- `createIssue` → `notifyMailNewIssue` (doer = `issue.posterId`; skipped
+  for poster-less creates). `createPullRequest` deliberately emits
+  NOTHING: pull creation is the separate `NewPullRequest` receiver
+  (notify.go:88-93, §1.3) — upstream's `NewIssue` arm is the issue arm.
+- `transitionClosed` (the CAS winner only — a loser's batch fully no-ops
+  and upstream never notifies a lost transition) →
+  `notifyMailIssueStatus` (doer = `options.actorId`; skipped for
+  actor-less transitions). The same `closeIssue`/`reopenIssue` service
+  entries serve the issues routes, the pulls routes AND the create-route's
+  `closed: true` arm, so one emit covers every HTTP path.
+- The same fail-closed posture as §8.3: arms fire only when the optional
+  constructor env is present and `MAIL_ENABLED === "true"`; failures are
+  caught and logged; the write stays committed.
+
+### 9.4 The route folds (applied, one line each)
+
+`c.env` satisfies `MailNotifyEnv` structurally (DB + the vars the arms
+read; arms no-op unless `MAIL_ENABLED === "true"`). Folded at landing:
+
+- `api/routes/issues.ts` `createIssueRoute` handler — arms NewIssue AND
+  its `closed: true` close transition (both ride this handler's service).
+- `api/routes/issues.ts` `editIssueRoute` handler — arms the issue
+  close/reopen transitions.
+- `api/routes/pulls.ts` `editPullRoute` handler — arms the pull
+  close/reopen transitions (IssueChangeStatus covers IsPull).
+
+HANDOFF (not folded — no arm fires there yet): `api/routes/pulls.ts`'s
+`createPullRoute` handler still constructs `IssuesService(c.env.DB)`;
+the NewPullRequest arm's landing folds it to
+`new IssuesService(c.env.DB, c.env)` — one line, the §9.3
+`createPullRequest` emit lands with it. The UI write paths and the
+push-webhook close paths stay bare (§1.3's last bullet).
+
+---
+
 ## 6. API/config surface
 
 No new bindings (the arm reads `DB` + `REPO_TASKS`, both landed). Vars
@@ -676,6 +803,26 @@ real-D1 posture, the queue stubbed):
    off → zero rows; malformed MAIL_FROM → the write still succeeds; no
    env → the arm is off (every existing construction site's posture);
    system-comment types never ride this arm.
+
+Slice three adds (same files, same posture):
+
+10. **The arm template byte-shapes** (`templates.test.ts`):
+    `displayNameWithFullName`'s username-first order (vs the From header's
+    FullName-first — the mail.go/user.go Sprintf distinction), the three
+    locale action lines verbatim with display-name escaping, and
+    `renderIssueActionMail`'s three `<p>` shapes — the close/reopen
+    first-chain trace, the nested new-if trace, and the body branch's
+    byte-equality with `renderIssueCommentMail`.
+11. **The arms end to end** (`notify.test.ts`): `notifyIssueCreated`'s
+    thread-root pins (no Re:, the Message-ID triple-coincidence, no
+    comment anchor, the issue content as body — or the created-line when
+    empty) and `notifyIssueStatusChanged`'s status pins (Re: subject,
+    `/close|reopen/<ms>` Message-ID over the plain reference, the
+    emptied content, the closed/reopened line, the pull twin with the
+    WIP gate); plus the service-level emits — armed `createIssue` /
+    `closeIssue` / `reopenIssue` land rows, the CAS loser and the
+    poster-less / actor-less creates skip, `createPullRequest` emits
+    nothing, and the bare-construction posture stays silent.
 
 Gate: the new suites green own-eyes (`pnpm test <files>`); bare
 `tsc --noEmit` zero errors; scoped eslint clean; `pnpm db:generate`

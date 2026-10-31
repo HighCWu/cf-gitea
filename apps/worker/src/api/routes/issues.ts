@@ -1163,7 +1163,7 @@ export function registerIssueRoutes(
       // even though the group gate passed via the pulls fallback.
       await assertIssuesUnitReadable(c.env.DB, found);
       const form = c.req.valid("json");
-      const service = new IssuesService(c.env.DB);
+      const service = new IssuesService(c.env.DB, c.env);
       const requester = c.get("authUser");
       const event = issueEventContext(c, found);
 
@@ -1415,7 +1415,7 @@ export function registerIssueRoutes(
       throw new ApiError(403, "");
     }
     const form = c.req.valid("json");
-    const service = new IssuesService(c.env.DB);
+    const service = new IssuesService(c.env.DB, c.env);
     const requester = c.get("authUser");
     if (requester === undefined) {
       throw new ApiError(401, "token is required"); // unreachable behind requireAuth

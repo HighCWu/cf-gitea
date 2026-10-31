@@ -9,9 +9,15 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  displayNameWithFullName,
   dotEscape,
   escapeHtml,
+  issueActionCloseLine,
+  issueActionNewLine,
+  issueActionReopenLine,
   registerNotifySubject,
+  renderIssueActionMail,
+  renderIssueCommentMail,
   renderRegisterNotify,
 } from "./templates";
 
@@ -88,5 +94,121 @@ describe("renderRegisterNotify (register_notify.tmpl layout)", () => {
     expect(hostile).toContain("<p>Hi <b>&lt;b&gt;Eve&lt;/b&gt; &amp; Sons</b>,</p>");
     expect(hostile).toContain("username: x&quot;y.");
     expect(hostile).not.toContain("<b>Eve</b> & Sons");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The action arms — default.tmpl's new/close/reopen branches
+// (services/mailer/mail_issue_common.go:227-246's names over
+// templates/mail/repo/issue/default.tmpl; no mail/repo/issue/new|close|
+// reopen template exists at the pin, so every arm renders default.tmpl)
+// ---------------------------------------------------------------------------
+
+describe("displayNameWithFullName (models/user/user.go:495-501)", () => {
+  it("is 'username (FullName)' when set — USERNAME first, the Sprintf argument order", () => {
+    expect(displayNameWithFullName("user2", "Mister X")).toBe("user2 (Mister X)");
+  });
+  it("is the bare username otherwise (and trims the full name first)", () => {
+    expect(displayNameWithFullName("user2", "")).toBe("user2");
+    expect(displayNameWithFullName("user2", null)).toBe("user2");
+    expect(displayNameWithFullName("user2", "   ")).toBe("user2");
+  });
+  it("is DISTINCT from mail.go's fromDisplayName, which is FullName first", () => {
+    // mail.go:157-175's fallback builds FullName + " (" + Name + ")"; the
+    // body templates interpolate the user.go order. Both are pinned; this
+    // helper is the body one.
+    expect(displayNameWithFullName("tmp", "Mister X")).toBe("tmp (Mister X)");
+    expect(displayNameWithFullName("tmp", "Mister X")).not.toBe("Mister X (tmp)");
+  });
+});
+
+describe("locale action lines (options/locale/locale_en-US.json)", () => {
+  it("mail.issue.action.new — '<b>%[1]s</b> created #%[2]d.'", () => {
+    expect(issueActionNewLine("user2 (Mister X)", 1)).toBe("<b>user2 (Mister X)</b> created #1.");
+  });
+  it("mail.issue.action.close — '<b>%[1]s</b> closed #%[2]d.'", () => {
+    expect(issueActionCloseLine("user2", 3)).toBe("<b>user2</b> closed #3.");
+  });
+  it("mail.issue.action.reopen — '<b>%[1]s</b> reopened #%[2]d.'", () => {
+    expect(issueActionReopenLine("user2", 3)).toBe("<b>user2</b> reopened #3.");
+  });
+  it("escapes the interpolated display name (html/template element context)", () => {
+    expect(issueActionCloseLine('<b>Eve</b> & Sons', 1)).toBe(
+      "<b>&lt;b&gt;Eve&lt;/b&gt; &amp; Sons</b> closed #1.",
+    );
+  });
+});
+
+describe("renderIssueActionMail — default.tmpl non-comment branches", () => {
+  const render = (over: Partial<Parameters<typeof renderIssueActionMail>[0]> = {}) =>
+    renderIssueActionMail({
+      subject: "Re: [user2/repo1] issue1 (#1)",
+      actionName: "close",
+      bodyHtml: "",
+      actionLineHtml: issueActionCloseLine("user2", 1),
+      link: "https://x.example/user2/repo1/issues/1",
+      issueIndex: 1,
+      appName: "Gitea",
+      appUrl: "https://x.example/",
+      ...over,
+    });
+
+  it("close arm: the locale line rides the FIRST action chain, the empty-body branch leaves its two skipped-if lines after it", () => {
+    const html = render();
+    // Byte trace of default.tmpl for ActionName "close" with .Body "":
+    // "\t<p>\n" + "\t\t\n" (skipped close-chain if) + "\t\t\t" + locale +
+    // "\t\t\n" (empty-branch's leading text) + "\t\t\t\n" (the nested
+    // {{if new}} skipped area) + "\t\t</p>".
+    expect(html).toContain(
+      "<body>\n\t\n\t\n\t<p>\n\t\t\n\t\t\t<b>user2</b> closed #1.\n\t\t\n\t\t\t\n\t\t</p>\n\t\n\t<p><a href=\"https://x.example/user2/repo1/issues/1\">#1</a>.</p>\n\t<table",
+    );
+    expect(html).toContain("<title>Re: [user2/repo1] issue1 (#1)</title>");
+    expect(html).toContain('<a href="https://x.example/">Gitea</a>');
+  });
+
+  it("reopen arm: the same shape with the reopened locale line", () => {
+    const html = render({
+      actionName: "reopen",
+      actionLineHtml: issueActionReopenLine("user2", 1),
+    });
+    expect(html).toContain(
+      "\t<p>\n\t\t\n\t\t\t<b>user2</b> reopened #1.\n\t\t\n\t\t\t\n\t\t</p>\n",
+    );
+  });
+
+  it("new arm with an EMPTY body: the locale line rides the nested new-if, 4-tab indented after the empty branch's own line", () => {
+    const html = render({
+      subject: "[user2/repo1] issue1 (#1)",
+      actionName: "new",
+      actionLineHtml: issueActionNewLine("user2", 1),
+    });
+    expect(html).toContain(
+      "\t<p>\n\t\t\n\t\t\t\n\t\t\t\t<b>user2</b> created #1.\n\t\t</p>\n",
+    );
+    expect(html).toContain("<title>[user2/repo1] issue1 (#1)</title>");
+  });
+
+  it("new arm with a body: identical bytes to the comment arm's else-branch shape", () => {
+    const body = "<p>a fresh description</p>\n";
+    const action = renderIssueActionMail({
+      subject: "[user2/repo1] issue1 (#1)",
+      actionName: "new",
+      bodyHtml: body,
+      actionLineHtml: null,
+      link: "https://x.example/user2/repo1/issues/1",
+      issueIndex: 1,
+      appName: "Gitea",
+      appUrl: "https://x.example/",
+    });
+    const comment = renderIssueCommentMail({
+      subject: "[user2/repo1] issue1 (#1)",
+      bodyHtml: body,
+      link: "https://x.example/user2/repo1/issues/1",
+      issueIndex: 1,
+      appName: "Gitea",
+      appUrl: "https://x.example/",
+    });
+    expect(action).toBe(comment);
+    expect(action).toContain("\t<p>\n\t\t\n\t\t\t<p>a fresh description</p>\n\n\t\t</p>\n");
   });
 });

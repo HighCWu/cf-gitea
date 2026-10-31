@@ -37,7 +37,7 @@ import {
 import { IssuesService, type IssueRow } from "../../issues/service";
 import { CommentType } from "../../issues/comment-types";
 import { isMailOutboxMessage, processMailOutbox, type MailOutboxMessage } from "./outbox";
-import { resolveIssueMailRecipients, type MailNotifyEnv } from "./notify";
+import { notifyIssueCreated, notifyIssueStatusChanged, resolveIssueMailRecipients, type MailNotifyEnv } from "./notify";
 import { issueMailFallbackSubject, renderIssueCommentMail } from "./templates";
 
 beforeAll(async () => {
@@ -427,9 +427,11 @@ describe("addComment notify arm — the CreateIssueComment receiver, end to end"
   });
 });
 
-/** The recipient id encoded in the row's dedupe key. */
+/** The recipient id encoded in the row's dedupe key (the LAST colon part —
+ *  every family ends `:<recipientId>`; the prefix assertion lives in the
+ *  per-arm tests). */
 function recipientIdOf(row: { dedupeKey: string | null }): number {
-  const id = Number(dedupeParts(row)[2]);
+  const id = Number((row.dedupeKey ?? "").split(":").at(-1));
   expect(Number.isInteger(id)).toBe(true);
   return id;
 }
@@ -446,3 +448,264 @@ function dedupeParts(row: { dedupeKey: string | null }): string[] {
   expect(parts[0]).toBe("issue-comment");
   return parts;
 }
+
+// ---------------------------------------------------------------------------
+// The NewIssue arm (notify.go:53-58) — MailParticipants with
+// ActionCreateIssue, doer = issue.Poster, comment = nil
+// ---------------------------------------------------------------------------
+
+describe("notifyIssueCreated — the NewIssue receiver", () => {
+  it("the thread-root mail: no Re: prefix, plain Message-ID == In-Reply-To == References, no anchor in the link", async () => {
+    const issue = await seedIssue();
+    const now = new Date(1_700_000_000_000);
+    const mailEnv = armedEnv();
+    const poster = (await db().select().from(users).where(eq(users.id, 10)).get())!;
+    const outcome = await notifyIssueCreated(mailEnv, { issue, doer: poster }, { now });
+    expect(outcome.outcome).toBe("enqueued");
+    const rows = await db().select().from(emailOutbox).all();
+    // Recipients over the seeded fixture issue: repo watcher 20, assignee 50,
+    // participant 40, issue watcher 30 — the POSTER is the doer here
+    // (notify.go:55 passes issue.Poster) and is excluded by mail_issue.go:
+    // 94-97 (4 recipients, not 5).
+    expect(new Set(rows.map((row) => row.toAddr))).toEqual(
+      new Set(["rw@example.com", "as@example.com", "part@example.com", "iw@example.com"]),
+    );
+    for (const row of rows) {
+      expect(row.subject).toBe(`[repoowner/repo] ${issue.title} (#${issue.index})`); // NO "Re: "
+      expect(row.info).toBe(`Subject: [repoowner/repo] ${issue.title} (#${issue.index}), issue comments`);
+      expect(row.dedupeKey).toBe(`issue-new:${issue.id}:${recipientIdOf(row)}`);
+      const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+      // ActionCreateIssue has NO Message-ID extra (mail_issue_common.go:285-294;
+      // the mail_test.go:412 fixture) — the new mail IS the thread root, so all
+      // three ids coincide (mail_test.go:127-133 pins the coincidence).
+      expect(headers["Message-ID"]).toBe(`<repoowner/repo/issues/${issue.index}@mail.example>`);
+      expect(headers["In-Reply-To"]).toBe(`<repoowner/repo/issues/${issue.index}@mail.example>`);
+      expect(headers["References"]).toBe(`<repoowner/repo/issues/${issue.index}@mail.example>`);
+      expect(headers["X-Gitea-Sender"]).toBe("poster");
+      // The link carries no comment anchor (Comment nil, mail_issue_common.go:60-64).
+      expect(row.bodyHtml).toContain(
+        `<a href="https://mail.example/repoowner/repo/issues/${issue.index}">#${issue.index}</a>`,
+      );
+      expect(row.bodyHtml).not.toContain("issuecomment-");
+      // The body IS the issue content (MailParticipants keeps it for the new arm).
+      expect(row.bodyHtml).toContain("<p>body</p>");
+    }
+  });
+
+  it("an empty description renders the mail.issue.action.new locale line instead", async () => {
+    const service = new IssuesService(env.DB);
+    await seedRepo();
+    await db().insert(repoWatchers).values({ repoId: REPO_ID, userId: 20 });
+    const issue = await service.createIssue({ repoId: REPO_ID, title: "empty", content: null, posterId: 10 });
+    const mailEnv = armedEnv();
+    const poster = (await db().select().from(users).where(eq(users.id, 10)).get())!;
+    await notifyIssueCreated(mailEnv, { issue, doer: poster }, {});
+    const rows = await db().select().from(emailOutbox).all();
+    // Watcher 20 is the only source left once the poster/doer is excluded.
+    expect(rows.map((row) => row.toAddr)).toEqual(["rw@example.com"]);
+    for (const row of rows) {
+      expect(row.bodyHtml).toContain("<b>poster</b> created #1.");
+    }
+  });
+
+  it("consumes to 'sent' through the landed consumer arm", async () => {
+    const issue = await seedIssue();
+    const mailEnv = armedEnv();
+    const poster = (await db().select().from(users).where(eq(users.id, 10)).get())!;
+    await notifyIssueCreated(mailEnv, { issue, doer: poster }, {});
+    const spy = mailEnv.REPO_TASKS as unknown as { sendBodies: MailOutboxMessage[] };
+    const outcome = await processMailOutbox(mailEnv, spy.sendBodies[0]!);
+    expect(outcome).toEqual({ kind: "sent" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The IssueChangeStatus arm (notify.go:59-76) — MailParticipants with the
+// close/reopen family (IsPull picks the PullRequest constants), doer = the
+// actor; MailParticipants empties the content (mail_issue.go:180-185)
+// ---------------------------------------------------------------------------
+
+describe("notifyIssueStatusChanged — the IssueChangeStatus receiver", () => {
+  it("close: Re: subject, /close/<ms> Message-ID over the plain thread reference, the closed action line as the body", async () => {
+    const issue = await seedIssue();
+    const now = new Date(1_700_000_000_000);
+    const mailEnv = armedEnv();
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    const outcome = await notifyIssueStatusChanged(mailEnv, { issue, doer, isClosed: true }, { now });
+    expect(outcome.outcome).toBe("enqueued");
+    const rows = await db().select().from(emailOutbox).all();
+    expect(new Set(rows.map((row) => row.toAddr))).toEqual(
+      new Set(["rw@example.com", "poster@example.com", "as@example.com", "part@example.com", "iw@example.com"]),
+    );
+    for (const row of rows) {
+      expect(row.subject).toBe(`Re: [repoowner/repo] ${issue.title} (#${issue.index})`);
+      expect(row.info).toBe(`Subject: Re: [repoowner/repo] ${issue.title} (#${issue.index}), issue comments`);
+      expect(row.dedupeKey).toBe(`issue-status:${issue.id}:close:${now.getTime()}:${recipientIdOf(row)}`);
+      const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+      // The close extra rides the compose-time unixMilli (mail_issue_common.go:
+      // 286-289; the mail_test.go:446 fixture pins the /close/ prefix); the
+      // thread reference stays plain (:165 — generated with ActionType(0)).
+      expect(headers["Message-ID"]).toBe(`<repoowner/repo/issues/${issue.index}/close/${now.getTime()}@mail.example>`);
+      expect(headers["In-Reply-To"]).toBe(`<repoowner/repo/issues/${issue.index}@mail.example>`);
+      expect(headers["References"]).toBe(`<repoowner/repo/issues/${issue.index}@mail.example>`);
+      expect(headers["X-Gitea-Sender"]).toBe("doer");
+      // The content is EMPTIED for close (mail_issue.go:180-185): the body is
+      // the action line, not the issue description.
+      expect(row.bodyHtml).toContain("<b>doer</b> closed #1.");
+      expect(row.bodyHtml).not.toContain("<p>body</p>");
+    }
+  });
+
+  it("reopen: the /reopen/<ms> extra and the reopened line (the :462 fixture twin)", async () => {
+    const issue = await seedIssue();
+    const now = new Date(1_700_000_000_123);
+    const mailEnv = armedEnv();
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    await notifyIssueStatusChanged(mailEnv, { issue, doer, isClosed: false }, { now });
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+      expect(headers["Message-ID"]).toBe(`<repoowner/repo/issues/${issue.index}/reopen/${now.getTime()}@mail.example>`);
+      expect(row.bodyHtml).toContain("<b>doer</b> reopened #1.");
+      expect(row.dedupeKey).toBe(`issue-status:${issue.id}:reopen:${now.getTime()}:${recipientIdOf(row)}`);
+    }
+  });
+
+  it("the pull twin: /pulls/ path, reason 'pull', the WIP gate still drops the repo watchers", async () => {
+    const issue = await seedIssue("WIP: draft thing");
+    await env.DB.prepare("UPDATE issues SET is_pull = 1 WHERE id = ?").bind(issue.id).run();
+    const fresh = (await db().select().from(issues).where(eq(issues.id, issue.id)).get())!;
+    const now = new Date(1_700_000_000_000);
+    const mailEnv = armedEnv();
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    await notifyIssueStatusChanged(mailEnv, { issue: fresh, doer, isClosed: true }, { now });
+    const rows = await db().select().from(emailOutbox).all();
+    expect(new Set(rows.map((row) => row.toAddr))).toEqual(
+      new Set(["poster@example.com", "as@example.com", "part@example.com", "iw@example.com"]),
+    );
+    for (const row of rows) {
+      const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+      expect(headers["X-Gitea-Reason"]).toBe("pull");
+      expect(headers["Message-ID"]).toBe(`<repoowner/repo/pulls/${issue.index}/close/${now.getTime()}@mail.example>`);
+      expect(row.subject).toBe(`Re: [repoowner/repo] WIP: draft thing (#${issue.index})`);
+    }
+  });
+
+  it("MAIL_ENABLED off and disabled recipients behave like the comment arm", async () => {
+    const issue = await seedIssue();
+    const off = armedEnv({ MAIL_ENABLED: "false" });
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    expect((await notifyIssueStatusChanged(off, { issue, doer, isClosed: true }, {})).outcome).toBe("disabled");
+    const malformed = armedEnv({ MAIL_FROM: "no address here" });
+    expect((await notifyIssueStatusChanged(malformed, { issue, doer, isClosed: true }, {})).outcome).toBe("misconfigured");
+    expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The service-level emit sites — IssuesService.createIssue / closeIssue /
+// reopenIssue (upstream fires from the model layer; the router never does)
+// ---------------------------------------------------------------------------
+
+describe("IssuesService notify arms — createIssue + close/reopen emits", () => {
+  it("createIssue through an armed service lands issue-new rows; the poster/doer exclusion holds", async () => {
+    await seedRepo();
+    await db().insert(repoWatchers).values([
+      { repoId: REPO_ID, userId: 20 },
+      { repoId: REPO_ID, userId: 70 },
+    ]);
+    const now = new Date(1_700_000_000_000);
+    const mailEnv = armedEnv();
+    const service = new IssuesService(env.DB, mailEnv);
+    const issue = await service.createIssue({ repoId: REPO_ID, title: "fresh", content: "desc", posterId: 10, now });
+    const rows = await db().select().from(emailOutbox).all();
+    // Both repo watchers (20, 70) are sources; poster 10 is the DOER
+    // (notify.go:55 passes issue.Poster as the doer) and is excluded.
+    expect(rows.map((row) => row.toAddr)).toEqual(["rw@example.com", "un@example.com"]);
+    for (const row of rows) {
+      expect(row.dedupeKey).toMatch(new RegExp(`^issue-new:${issue.id}:(20|70)$`));
+      expect(row.subject).toBe("[repoowner/repo] fresh (#1)");
+      expect(row.bodyHtml).toContain("<p>desc</p>");
+    }
+    expect((mailEnv.REPO_TASKS as unknown as { sends: number }).sends).toBe(2);
+  });
+
+  it("createPullRequest emits NOTHING (NewPullRequest is the pull-create arm, SPEC §1.3)", async () => {
+    await seedRepo();
+    const mailEnv = armedEnv();
+    const service = new IssuesService(env.DB, mailEnv);
+    await service.createPullRequest({
+      repoId: REPO_ID,
+      title: "a pull",
+      content: "desc",
+      posterId: 10,
+      headRepoId: REPO_ID,
+      baseBranch: "main",
+      headBranch: "topic",
+    });
+    expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
+    expect((mailEnv.REPO_TASKS as unknown as { sends: number }).sends).toBe(0);
+  });
+
+  it("closeIssue/reopenIssue through an armed service land issue-status rows (CAS winner only)", async () => {
+    const service = new IssuesService(env.DB);
+    await seedRepo();
+    const issue = await service.createIssue({ repoId: REPO_ID, title: "cycle", content: "x", posterId: 10 });
+    const now = new Date(1_700_000_000_000);
+    const mailEnv = armedEnv();
+    const armed = new IssuesService(env.DB, mailEnv);
+    await armed.closeIssue(issue.id, { actorId: 60, now });
+    let rows = await db().select().from(emailOutbox).all();
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      expect(row.dedupeKey).toBe(`issue-status:${issue.id}:close:${now.getTime()}:${recipientIdOf(row)}`);
+      expect(row.bodyHtml).toContain("closed #1.");
+    }
+    const before = rows.length;
+    // The CAS loser (already closed) throws and emits nothing.
+    await expect(armed.closeIssue(issue.id, { actorId: 60, now })).rejects.toThrow();
+    expect(await db().select().from(emailOutbox).all()).toHaveLength(before);
+
+    const reopenNow = new Date(1_700_000_100_000);
+    await armed.reopenIssue(issue.id, { actorId: 60, now: reopenNow });
+    rows = await db().select().from(emailOutbox).all();
+    const reopenRows = rows.filter((row) => row.dedupeKey?.includes(":reopen:"));
+    expect(reopenRows.length).toBeGreaterThan(0);
+    for (const row of reopenRows) {
+      expect(row.dedupeKey).toBe(`issue-status:${issue.id}:reopen:${reopenNow.getTime()}:${recipientIdOf(row)}`);
+      expect(row.bodyHtml).toContain("reopened #1.");
+    }
+    // A second close cycle gets FRESH keys (the ms rides the key — upstream's
+    // own uniqueness mechanism, mail_issue_common.go:286-293); the first
+    // close's rows stay (dedupe never overwrites).
+    const secondClose = new Date(1_700_000_200_000);
+    await armed.closeIssue(issue.id, { actorId: 60, now: secondClose });
+    rows = await db().select().from(emailOutbox).all();
+    const secondKeys = rows
+      .filter((row) => row.dedupeKey?.includes(`:close:${secondClose.getTime()}:`))
+      .map((row) => row.dedupeKey);
+    expect(secondKeys.length).toBeGreaterThan(0);
+    expect(rows.some((row) => row.dedupeKey?.includes(`:close:${now.getTime()}:`))).toBe(true);
+  });
+
+  it("no env → both arms are off (every existing construction site's posture)", async () => {
+    const service = new IssuesService(env.DB);
+    await seedRepo();
+    const issue = await service.createIssue({ repoId: REPO_ID, title: "bare", content: null, posterId: 10 });
+    await service.closeIssue(issue.id, { actorId: 60 });
+    await service.reopenIssue(issue.id, { actorId: 60 });
+    expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
+  });
+
+  it("a poster-less create and an actor-less close skip the mail but keep the writes", async () => {
+    const mailEnv = armedEnv();
+    const service = new IssuesService(env.DB, mailEnv);
+    await seedRepo();
+    const issue = await service.createIssue({ repoId: REPO_ID, title: "ghost", content: null, posterId: null });
+    expect(issue.id).toBeGreaterThan(0);
+    await service.closeIssue(issue.id, { actorId: null });
+    expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
+    expect((mailEnv.REPO_TASKS as unknown as { sends: number }).sends).toBe(0);
+  });
+});

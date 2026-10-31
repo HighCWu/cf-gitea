@@ -20,7 +20,11 @@
  *     does not exist upstream either, so the stock render falls through to
  *     default). The same template file serves the additive arms
  *     (new/close/reopen/merge) with different `.ActionName` branches, so the
- *     later surfaces extend this family in place.
+ *     later surfaces extend this family in place — `renderIssueActionMail`
+ *     carries the new/close/reopen branches (the `NewIssue` and
+ *     `IssueChangeStatus` receivers, notify.go:53-76) and the comment render
+ *     delegates to it (identical bytes — "comment" takes the non-empty-body
+ *     branch of the same template).
  *
  * DotEscape (modules/templates/mail.go:41-43) is applied to the display
  * name exactly where the upstream template applies it (the title's
@@ -178,29 +182,124 @@ export interface IssueCommentMailData {
 }
 
 /**
- * `templates/mail/repo/issue/default.tmpl` for the comment arm — byte-faithful
- * trace of the Go template with `.IsMention` false, `.ActionName` "comment",
- * non-empty `.Body`, empty `.ReviewComments`, `.CanReply` false (no incoming
- * email): the two dropped `{{if}}` lines leave their tab+newline, the `<p>`
- * block renders the body inside the else-branch's tab indentation, and the
- * link line follows. Upstream's `emoji.ReplaceAliases` on the subject
- * (mail_issue_common.go:133) is NOT applied — no emoji alias table is ported
- * (recorded divergence; additive later).
+ * Upstream `User.DisplayNameWithFullName` (models/user/user.go:495-501) —
+ * the display name the default.tmpl BODY locale lines interpolate
+ * (`.Doer.DisplayNameWithFullName`): `username (FullName)` when a full name
+ * is set, else the username. DISTINCT from `fromDisplayName` (mail.go:
+ * 157-175, the From header — "FullName (username)", full name first); the
+ * body order is pinned by the struct's own Sprintf argument order.
  */
-export function renderIssueCommentMail(data: IssueCommentMailData): string {
+export function displayNameWithFullName(username: string, fullName: string | null): string {
+  const trimmed = (fullName ?? "").trim();
+  return trimmed === "" ? username : `${username} (${trimmed})`;
+}
+
+// The locale action lines (`options/locale/locale_en-US.json`, interpolated
+// by default.tmpl with .Doer.DisplayNameWithFullName + .Issue.Index — the
+// HTML <b> wrapper is the locale string's own):
+//   mail.issue.action.new     = `<b>%[1]s</b> created #%[2]d.`
+//   mail.issue.action.close   = `<b>%[1]s</b> closed #%[2]d.`
+//   mail.issue.action.reopen  = `<b>%[1]s</b> reopened #%[2]d.`
+
+/** `mail.issue.action.new` — the empty-body branch of the "new" arm. */
+export function issueActionNewLine(doerDisplayName: string, issueIndex: number): string {
+  return `<b>${escapeHtml(doerDisplayName)}</b> created #${issueIndex}.`;
+}
+
+/** `mail.issue.action.close` — the close arm's action line. */
+export function issueActionCloseLine(doerDisplayName: string, issueIndex: number): string {
+  return `<b>${escapeHtml(doerDisplayName)}</b> closed #${issueIndex}.`;
+}
+
+/** `mail.issue.action.reopen` — the reopen arm's action line. */
+export function issueActionReopenLine(doerDisplayName: string, issueIndex: number): string {
+  return `<b>${escapeHtml(doerDisplayName)}</b> reopened #${issueIndex}.`;
+}
+
+/** Data for `renderIssueActionMail` (the default.tmpl data map's used slice
+ *  for the new/close/reopen arms — the comment twin is IssueCommentMailData). */
+export interface IssueActionMailData {
+  /** Upstream `.Subject` — the compose-time SANITIZED subject. */
+  subject: string;
+  /** Upstream `.ActionName` — actionToTemplate's arm name
+   *  (mail_issue_common.go:227-246): "new" | "close" | "reopen" | "comment". */
+  actionName: "new" | "close" | "reopen" | "comment";
+  /** Upstream `.Body` — the content rendered to HTML (the issue content for
+   *  "new", emptied by MailParticipants for close/reopen, mail_issue.go:
+   *  180-185); "" selects the template's empty-body branch. */
+  bodyHtml: string;
+  /** The locale action line for the branches that render one — the
+   *  close/reopen arms ALWAYS (their first-chain line, independent of the
+   *  body) and the "new" arm only when the body is empty (the nested
+   *  `{{if eq .ActionName "new"}}`); null = the body branch renders. */
+  actionLineHtml: string | null;
+  /** Upstream `.Link` — Issue.HTMLURL (no comment anchor — Comment nil). */
+  link: string;
+  /** Upstream `.Issue.Index`. */
+  issueIndex: number;
+  /** Upstream `AppName` (the head footer's link text). */
+  appName: string;
+  /** Upstream `AppUrl` — trailing-slash form. */
+  appUrl: string;
+}
+
+/**
+ * `templates/mail/repo/issue/default.tmpl` for the new/close/reopen arms —
+ * byte-faithful traces of the Go template with `.IsMention` false, empty
+ * `.ReviewComments`, `.CanReply` false (no incoming email). The `<p>` block
+ * has three reachable shapes (both dropped `{{if}}` lines above it and the
+ * second dropped push `{{if}}` below it leave their tab+newline):
+ *   - a NON-EMPTY body (comment, or "new" with content): the else branch
+ *     renders it 3-tab indented — the shape renderIssueCommentMail pinned;
+ *   - "close"/"reopen" (body always emptied by MailParticipants): the FIRST
+ *     action chain emits the locale line 3-tab indented, then the empty-body
+ *     branch contributes its two skipped-`{{if}}` lines ("\t\t" and "\t\t\t")
+ *     after it;
+ *   - "new" with an EMPTY body: the action chain is skipped, and the nested
+ *     `{{if eq .ActionName "new"}}` emits its locale line 4-tab indented
+ *     after the empty branch's own "\t\t\t" line.
+ * Upstream's `emoji.ReplaceAliases` on the subject is NOT applied (the
+ * recorded §8.2 divergence).
+ */
+export function renderIssueActionMail(data: IssueActionMailData): string {
   const title = escapeHtml(data.subject);
   const link = escapeHtml(data.link);
+  // The <p> block per branch — see the shape table in the doc comment (no
+  // trailing newline; the skeleton below supplies the line break).
+  let pBlock: string;
+  if (data.actionLineHtml !== null && data.actionName === "new") {
+    pBlock = `\t<p>\n\t\t\n\t\t\t\n\t\t\t\t${data.actionLineHtml}\n\t\t</p>`;
+  } else if (data.actionLineHtml !== null) {
+    pBlock = `\t<p>\n\t\t\n\t\t\t${data.actionLineHtml}\n\t\t\n\t\t\t\n\t\t</p>`;
+  } else {
+    pBlock = `\t<p>\n\t\t\n\t\t\t${data.bodyHtml}\n\t\t</p>`;
+  }
   return `${baseHead(title)}
 <body>
 \t
 \t
-\t<p>
-\t\t
-\t\t\t${data.bodyHtml}
-\t\t</p>
+${pBlock}
 \t
 \t<p><a href="${link}">#${data.issueIndex}</a>.</p>
 \t${baseFooter(data.appUrl, data.appName)}
 </body>
 </html>`;
+}
+
+/**
+ * `templates/mail/repo/issue/default.tmpl` for the comment arm — the non-empty
+ * body branch of `renderIssueActionMail` (identical bytes: with `.ActionName`
+ * "comment" the action chains skip and the else branch renders `.Body`).
+ */
+export function renderIssueCommentMail(data: IssueCommentMailData): string {
+  return renderIssueActionMail({
+    subject: data.subject,
+    actionName: "comment",
+    bodyHtml: data.bodyHtml,
+    actionLineHtml: null,
+    link: data.link,
+    issueIndex: data.issueIndex,
+    appName: data.appName,
+    appUrl: data.appUrl,
+  });
 }

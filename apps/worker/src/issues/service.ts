@@ -46,7 +46,7 @@ import {
   ReleaseAlreadyExistError,
   RepositoryNotExistError,
 } from "./errors";
-import { notifyIssueComment, type MailNotifyEnv } from "../services/mail/notify";
+import { notifyIssueComment, notifyIssueCreated, notifyIssueStatusChanged, type MailNotifyEnv } from "../services/mail/notify";
 
 export type IssueRow = typeof issues.$inferSelect;
 export type CommentRow = typeof comments.$inferSelect;
@@ -224,12 +224,15 @@ export class IssuesService {
   private readonly db: DrizzleD1Database;
   private readonly d1: D1Database;
   /**
-   * The mail-notify arm's env (specs/email-outbound.md §8): when present,
-   * `addComment` fans the plain-comment notify mail (upstream's
-   * CreateIssueComment receiver, services/mailer/notify.go:31-51 — notify
-   * fires from the model layer, never the router). Absent (every existing
-   * construction site passes D1 only) the arm is off — the same fail-closed
-   * posture as `MAIL_ENABLED != "true"`, so callers are untouched.
+   * The mail-notify arms' env (specs/email-outbound.md §8): when present,
+   * the write paths fan the notify mail through the receiver arms —
+   * `addComment` the plain-comment one (upstream CreateIssueComment,
+   * services/mailer/notify.go:31-51), `createIssue` the NewIssue one
+   * (:53-58) and `closeIssue`/`reopenIssue` the IssueChangeStatus one
+   * (:59-76) — notify fires from the model layer, never the router.
+   * Absent (every existing construction site passes D1 only) the arms are
+   * off — the same fail-closed posture as `MAIL_ENABLED != "true"`, so
+   * callers are untouched.
    */
   private readonly mailEnv?: MailNotifyEnv;
 
@@ -338,6 +341,7 @@ export class IssuesService {
     if (rows[0] === undefined) {
       throw new Error("issue creation batch committed without returning rows");
     }
+    await this.notifyMailNewIssue(rows[0], input.now ?? new Date());
     return rows[0];
   }
 
@@ -573,6 +577,7 @@ export class IssuesService {
       // CAS loser: every gated statement above has modified zero rows.
       throw new IssueAlreadyChangedError();
     }
+    await this.notifyMailIssueStatus(updated[0]!, close, options.actorId ?? null, now);
     return updated[0]!;
   }
 
@@ -677,6 +682,62 @@ export class IssuesService {
     } catch (error) {
       console.error(
         `[issues] comment notify failed (comment ${comment.id}): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
+   * The NewIssue receiver arm (specs/email-outbound.md §8; upstream
+   * services/mailer/notify.go:53-58, fired from the issue-create service
+   * with doer = issue.Poster). Only issues ride it — pull creation is the
+   * separate NewPullRequest receiver (notify.go:88-93, SPEC §1.3), so
+   * createPullRequest emits nothing here. Best-effort, never throws (the
+   * write above stays committed).
+   */
+  private async notifyMailNewIssue(issue: IssueRow, now: Date): Promise<void> {
+    if (this.mailEnv === undefined) return;
+    if (issue.isPull) return;
+    if (issue.posterId === null) return;
+    try {
+      const doer = (await this.db.select().from(users).where(eq(users.id, issue.posterId)).get()) ?? null;
+      if (doer === null) {
+        console.error(`[issues] new-issue notify skipped: poster row missing [id: ${issue.posterId}]`);
+        return;
+      }
+      const outcome = await notifyIssueCreated(this.mailEnv, { issue, doer }, { now });
+      if (outcome.outcome === "enqueued" && outcome.enqueue.some((e) => e.outcome === "pending-unqueued")) {
+        console.warn(`[issues] new-issue notify: some rows stayed pending-unqueued (issue ${issue.id})`);
+      }
+    } catch (error) {
+      console.error(
+        `[issues] new-issue notify failed (issue ${issue.id}): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
+   * The IssueChangeStatus receiver arm (upstream services/mailer/notify.go:
+   * 59-76 — the closed/reopened family via MailParticipants, doer = the
+   * actor; the IsPull branch picks the PullRequest activities constants).
+   * CAS winners only — the loser's batch no-opped and upstream never
+   * notifies a lost transition either. Best-effort, never throws.
+   */
+  private async notifyMailIssueStatus(issue: IssueRow, isClosed: boolean, actorId: number | null, now: Date): Promise<void> {
+    if (this.mailEnv === undefined) return;
+    if (actorId === null) return;
+    try {
+      const doer = (await this.db.select().from(users).where(eq(users.id, actorId)).get()) ?? null;
+      if (doer === null) {
+        console.error(`[issues] status notify skipped: actor row missing [id: ${actorId}]`);
+        return;
+      }
+      const outcome = await notifyIssueStatusChanged(this.mailEnv, { issue, doer, isClosed }, { now });
+      if (outcome.outcome === "enqueued" && outcome.enqueue.some((e) => e.outcome === "pending-unqueued")) {
+        console.warn(`[issues] status notify: some rows stayed pending-unqueued (issue ${issue.id})`);
+      }
+    } catch (error) {
+      console.error(
+        `[issues] status notify failed (issue ${issue.id}): ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   }
