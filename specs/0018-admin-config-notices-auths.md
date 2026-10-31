@@ -777,3 +777,42 @@ documented omission verdict (§3.3 — no build)"), and the survey's admin row
 + NEEDS-API-FIRST paragraph (`docs/compat/ui-parity-survey.md:1276`,
 `:1551`). No code, no migration, no nav edit ships with this amendment;
 M1/M2 (`7381c0d`, `9d7ccd6`) remain the SPEC's only build output.
+
+---
+
+## Amendment (2026-10-31) — the auths arm REOPENS; the §3.3 gate fires
+
+**Re-opening recorded.** The user re-opened the external-auth surface for
+the v1.4 queue (2026-10-31 direction; the v1.3.2 board's P1-4 row and the
+as-built amendment above remain the accurate record of why the arm was
+omitted — they are history, not the posture). This fires §3.3's own reopen
+gate verbatim: "this verdict is superseded the day a SPEC lands any
+external login chain … At that point the arm reopens as the upstream-shape
+CRUD over the new store; §3.3's ledger entry is then obsolete and gets
+edited, not argued with" (§3.3.4). Per that rule, §3.3's verdict text and
+its ledger entry are SUPERSEDED (not deleted — §3.3 and the as-built above
+stay as the omission rationale's record); the reopened arm is owned by
+[specs/external-auth-sources.md](external-auth-sources.md), which carries:
+
+- the viable-set adjudication at the pin (`source.go:28-37`'s seven-value
+  lattice, each type judged against the Workers platform with cites —
+  OAuth2/OIDC client sources BUILD; LDAP/SMTP deferred with the
+  transport-exists honesty; PAM/SSPI platform-impossible);
+- the `login_source` + `external_login_user` stores §3.3.3 found missing
+  ("config for chains that cannot sign anyone in" — the chains now sign
+  people in);
+- the §3.3 gate's promised arm shape: the upstream-shape **WEB CRUD**
+  (`web.go:874-880`'s five arms) — the as-built forward note's
+  "must NOT be specced as an API-first ladder" discipline enforced (§6
+  of the new SPEC; no `/api/v1` family exists upstream to mirror);
+- the upstream-parity posture §3.3.2 invoked (the conditional-navbar
+  precedent): the nav item lights now that the surface is servable.
+
+Status of the SPEC's other arms: unchanged — M1 (notices) and M2 (config)
+stand as landed; the auths omission verdict is superseded only in its
+"omission" outcome, and its four reasons remain the documented history of
+why the omission was correct until the substrate SPEC existed. The
+`AdminFamilyNav` omission note and the README/survey ledger lines listed
+above retire with the implementing wave's landing (SPEC-0018 §7's
+registration-window rule governs the nav edit; the new SPEC's W6 owns the
+ledger edit).
