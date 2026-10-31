@@ -239,21 +239,41 @@ board row flips — this closes a flag, not a listed residual.
    orphan drops, required-orphan kept) — parameterized over parsed
    files/liveSet/configs so the staged store and pages consume it
    unchanged (suite 24/24; actions family 235/235; the full dependency
-   map in the module header). STAGED: the `action_scoped_workflow_source`
-   schema table port (schema HANDOFF — no landed table), the store
-   service, the three page modules + `ui/index.ts` route recipes (four
-   routes x three scopes), and the M3 arms (the parser's YAML half —
-   `GetEventsFromContent`/`deriveScopedStatusContexts` ride jobparser,
-   the named M3 row; the merge-gate; the notifier arms — see P1-13).
-   Until the pages land, the admin scoped-workflows page stays the
-   documented-reduced honest 404 with the nav item omitted (`b5923ed`,
-   recorded in release notes §4; survey tick-21's user/org sub-tab
-   reductions stand), and the nav folds stay folded OFF (the dead-link
-   rule — no fold until the pages land; P2-3's honest 404 stands). The
-   ActionsConfig `DisabledWorkflows`/`DisabledScopedWorkflows` note
+   map in the module header). LANDED THIS WAVE (`DISCLOSED-HASH`): the
+   PAGES + the parse assembly — `apps/worker/src/ui/pages/
+   actions-scoped-workflows.tsx` (the scope-neutral core: the
+   `ScopedWorkflowSourcesStore` seam, each method citing its upstream op;
+   the `parseScopedWorkflowFiles` walk + `deriveScopedStatusContexts`
+   assembled over the landed M3-P exports — `getEventsFromContent` +
+   `splitWorkflowPayloads` — with the E-tier matrix/expression preview
+   reduction documented; the GET assembly `loadScopedWorkflowsPageData`
+   with the missing-repo-row skip; the three POST appliers
+   `applyScopedWorkflowAdd/Required/Remove` porting
+   `ScopedWorkflowAdd`/`ScopedWorkflowSetRequired`/`ScopedWorkflowRemove`
+   over the seam; the form parsers; the shared body rendering
+   `scoped_workflows.tmpl` byte-level, the space-before-missing-label
+   included) + the three frames (`org-settings-actions-scoped-workflows` /
+   `user-settings-actions-scoped-workflows` /
+   `admin-actions-scoped-workflows`, the owner-general twins' split) +
+   their suite (the DOM contract, the parse assembly, the appliers over a
+   store fake + real local D1). STILL STAGED (the store HANDOFF): the
+   `action_scoped_workflow_source` schema table port + the drizzle
+   `ScopedWorkflowSourcesStore` implementation (src/db + services/actions
+   were ownership-forbidden to the pages unit — the core header carries
+   the exact port spec per op), the `ui/index.ts` mounts (four routes x
+   three scopes — the recipes are the core's HANDOFF tail; the routes
+   stay the documented honest 404s until the store lands), and the nav
+   folds (the sub-items stay the recorded dead items; the fold hunks ride
+   the same tail). Until the store lands, the admin scoped-workflows page
+   stays the documented-reduced honest 404 with the nav item omitted
+   (`b5923ed`, recorded in release notes §4; survey tick-21's user/org
+   sub-tab reductions stand), and the nav folds stay folded OFF (the
+   dead-link rule — no fold until the routes serve; P2-3's honest 404
+   stands). The ActionsConfig
+   `DisabledWorkflows`/`DisabledScopedWorkflows` note
    (`apps/worker/src/services/actions/config.ts:14-16`) is unchanged.
-   Size: **L** minus the landed helpers (store + parser + pages; needs
-   its SPEC-attachment first).
+   Size: **S** (the store port + the mount/flip window — everything else
+   landed).
 
 4. **The admin auths row — RESOLVED to the documented divergence
    (`faeec92`, the S arm; SPEC-0018's as-built amendment).** The verdict
@@ -460,16 +480,25 @@ board row flips — this closes a flag, not a listed residual.
     named rows for the M3 SPEC-attachment alongside P1-1's
     notify/commit-status/reusable-caller rows: (a) the parser's YAML
     half — `GetEventsFromContent` + `deriveScopedStatusContexts` ride
-    jobparser (upstream's own `scoped_workflow.go` parse arm), so scoped
-    workflows cannot be detected or matched until M3's YAML model port;
-    (b) the merge-gate arm — `applyScopedWorkflowRequiredForm`'s inputs
-    (the live set, the config) come from the store + parse, so required/
-    orphan adjudication activates only when both exist; (c) the notifier
-    arm — `shouldEventCreateCommitStatus`'s six-event allowlist fires
-    from the M3 event seams, not before. The schema table port and the
-    store service are M3-INDEPENDENT (staged separately in P1-3's list).
-    Cites: `e24455c`'s module-header dependency map. Size: — (rides
-    P1-1's M3; listed so the M3 SPEC-attachment does not miss them).
+    jobparser (upstream's own `scoped_workflow.go` parse arm): the
+    SETTINGS-PAGE half of this arm is now LANDED (`DISCLOSED-HASH` — P1
+    item 3's parse assembly over M3-P's `getEventsFromContent` +
+    `splitWorkflowPayloads`, the matrix/expression context-preview
+    reduction documented on the core module), while the TRIGGER half
+    (scoped-run detection/matching on consuming events) rides the store
+    + the M3 seams; (b) the merge-gate arm —
+    `applyScopedWorkflowRequiredForm`'s inputs (the live set, the
+    config) come from the store + parse, so required/orphan
+    adjudication activates only when both exist (the page-side applier
+    is landed and pinned over the seam; activation waits the store
+    HANDOFF); (c) the notifier arm — `shouldEventCreateCommitStatus`'s
+    six-event allowlist fires from the M3 event seams, not before. The
+    schema table port and the store service are M3-INDEPENDENT (the
+    pages unit's HANDOFF — the seam interface + port spec landed in the
+    core header). Cites: `e24455c`'s module-header dependency map +
+    `DISCLOSED-HASH`'s core header. Size: — (the trigger half rides
+    P1-1's M3 + the store wave; listed so the M3 SPEC-attachment does
+    not miss them).
 
 ## P2 — parity polish
 
@@ -496,9 +525,11 @@ board row flips — this closes a flag, not a listed residual.
    and 303s back onto the page URL; the `6bdd91f`-era engine-owned-404
    reduction is retired. The route-level matrix (guard-first, the
    anonymous login 303, the doer-keyed scoping) is pinned in the page
-   suite. Scoped-workflows stays the recorded dead item at this scope
-   (rides P1-3's staged store). Settings-nav/goldens: both unions gained
-   actions-general, 8 golden files re-baselined with token deltas
+   suite. Scoped-workflows at this scope: the page module LANDED
+   committed-unmounted (`DISCLOSED-HASH` — P1 item 3's user frame; the
+   sub-tab stays the dead nav item and the routes the honest 404s until
+   the store HANDOFF + mount flip). Settings-nav/goldens: both unions
+   gained actions-general, 8 golden files re-baselined with token deltas
    verified. Size: — (closed).
 
 2. **The org actions settings tab's remaining pieces — LANDED whole: the
@@ -520,7 +551,9 @@ board row flips — this closes a flag, not a listed residual.
    signed-in non-owner 404-shells), the :125 JSONError 400 on an unknown
    add target (nothing stored), the 303 back onto the page URL; the
    route-level matrix is pinned in the org page suite (the org-vs-user
-   scoping included). Scoped-workflows rides P1 item 3. Size: — (closed).
+   scoping included). Scoped-workflows rides P1 item 3 (the org frame
+   LANDED committed-unmounted, `DISCLOSED-HASH`; the dead-item posture
+   stands until the store wave). Size: — (closed).
 
 3. **The admin scoped-workflows page** (listed for traceability; consumed
    by P1 item 3): the honest 404 with the omitted nav item is the
@@ -528,7 +561,9 @@ board row flips — this closes a flag, not a listed residual.
    `92d2e87`'s stale-pin fixes keep it as the negative pin)
    (`docs/RELEASE-NOTES-v1.3.md` §4; `docs/compat/ui-parity-survey.md`
    tick-20 note "scoped-workflows is the documented-reduced honest 404").
-   No standalone work — see item P1-3. Size: — (rides P1-3).
+   The admin FRAME landed committed-unmounted (`DISCLOSED-HASH` — P1
+   item 3); the 404 + the omitted nav item stand until the store
+   HANDOFF + mount flip. Size: — (rides P1-3's store window).
 
 4. **Wiki unit gating — the web-UI arm LANDED (`a803843` + `4a04d46`);
    the API + git-HTTP arms stay.** The standing divergence narrowed to
