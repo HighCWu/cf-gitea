@@ -863,6 +863,13 @@ describe("nuget validation and delete arms", () => {
 
     // Not a zip → the archive sentinel carries the reason.
     await pushExpect(new TextEncoder().encode("definitely not a zip"), 400, "unable to parse package meta: zip: not a valid zip file");
+    // A corrupt member CRC — a flipped nuspec byte no longer matches the
+    // central directory (Go's archive/zip readDataEOF → checkSum,
+    // ErrChecksum when the data is exhausted): the same archive sentinel.
+    const crcNupkg = await makeNupkg();
+    const crcDataAt = 30 + "package.nuspec".length;
+    crcNupkg[crcDataAt + 5] = (crcNupkg[crcDataAt + 5] ?? 0) ^ 0xff;
+    await pushExpect(crcNupkg, 400, "unable to parse package meta: zip: checksum error");
     // A zip without a root nuspec.
     await pushExpect(await makeZip([{ name: "sub/package.nuspec", data: new TextEncoder().encode(nuspecXml()) }]), 400, "Nuspec file is missing");
     // An empty nuspec → the XML decode arm (500, non-InvalidArgument).

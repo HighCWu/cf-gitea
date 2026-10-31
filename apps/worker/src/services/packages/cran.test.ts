@@ -339,6 +339,14 @@ describe("parseCranPackage (metadata.go:63-220)", () => {
     const badZip = makeZip([{ name: "x/DESCRIPTION", data: encoder.encode("Package: x\nVersion: 1.0\n") }]);
     badZip[40] = 0xff;
     await expect(parseCranPackage(badZip)).rejects.toThrow();
+    // A corrupt member CRC — a flipped DESCRIPTION byte no longer matches the
+    // central directory (Go's archive/zip readDataEOF → checkSum, ErrChecksum
+    // when the data is exhausted): the same archive-error class, so the
+    // upload rejects, nothing stores.
+    const crcZip = makeZip([{ name: "x/DESCRIPTION", data: encoder.encode("Package: x\nVersion: 1.0\n") }]);
+    const crcDataAt = 30 + "x/DESCRIPTION".length;
+    crcZip[crcDataAt + 2] = (crcZip[crcDataAt + 2] ?? 0) ^ 0xff;
+    await expect(parseCranPackage(crcZip)).rejects.toBeInstanceOf(CranArchiveError);
   });
 });
 

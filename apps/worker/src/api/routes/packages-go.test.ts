@@ -772,5 +772,22 @@ describe("go auth/quota arms", () => {
         quota: { limitTotalOwnerCount: -1, limitTotalOwnerSize: -1, limitSizeGeneric: -1, packagesEnabled: true },
       }),
     ).rejects.toBeInstanceOf(GoInvalidArchiveError);
+    // A corrupt member CRC — a flipped go.mod byte no longer matches the
+    // central directory (Go's archive/zip readDataEOF → checkSum,
+    // ErrChecksum when the data is exhausted): the same archive sentinel.
+    const crcZip = await makeModuleZip([goModEntry("gitea.local/crc", "v1.0.0", GO_MOD)]);
+    const crcDataAt = 30 + "gitea.local/crc@v1.0.0/go.mod".length;
+    crcZip[crcDataAt + 3] = (crcZip[crcDataAt + 3] ?? 0) ^ 0xff;
+    await expect(
+      uploadGoPackage({
+        d1: env.DB,
+        bucket: env.REPO_PACKS,
+        owner: { id: owner.id, type: "user", visibility: "public" },
+        doer: { id: owner.id, isAdmin: false },
+        content: new Response(crcZip.slice()).body as ReadableStream<Uint8Array>,
+        declaredLength: crcZip.byteLength,
+        quota: { limitTotalOwnerCount: -1, limitTotalOwnerSize: -1, limitSizeGeneric: -1, packagesEnabled: true },
+      }),
+    ).rejects.toBeInstanceOf(GoInvalidArchiveError);
   });
 });

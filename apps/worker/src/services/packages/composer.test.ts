@@ -304,6 +304,20 @@ describe("detectComposerExtName + parseComposerPackage (metadata.go)", () => {
     await expect(parseComposerPackage(good.subarray(0, 20))).rejects.toBeInstanceOf(ComposerArchiveError);
   });
 
+  it("a corrupt zip member CRC is the invalid-archive arm (the same bytes still parse untouched)", async () => {
+    // A flipped composer.json byte no longer matches the central-directory
+    // CRC32 — Go's archive/zip readDataEOF → checkSum (ErrChecksum when the
+    // member's data is exhausted, over the UNcompressed bytes): the same
+    // ComposerArchiveError as every other structural zip failure, so the
+    // upload rejects, nothing stores.
+    const good = composerArchive("1.0.0");
+    const bad = good.slice();
+    const dataAt = 30 + "composer.json".length;
+    bad[dataAt + 5] = (bad[dataAt + 5] ?? 0) ^ 0xff;
+    await expect(parseComposerPackage(bad)).rejects.toBeInstanceOf(ComposerArchiveError);
+    await expect(parseComposerPackage(good)).resolves.toBeDefined();
+  });
+
   it("the composer.json extraction: the fields, the filename, the readme fold", async () => {
     const parsed = await parseComposerPackage(composerArchive("1.0.3"));
     expect(parsed.name).toBe("gitea/composer-package");

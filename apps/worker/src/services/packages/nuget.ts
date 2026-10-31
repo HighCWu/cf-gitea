@@ -65,7 +65,10 @@
  * cap check runs BEFORE the parse); dependency-group map order is
  * deterministic (sorted framework keys — upstream iterates a Go map,
  * unspecified); the zip reader is an EOCD + central-directory walk (stored +
- * deflate-raw entries; zip64 not needed under the cap); PDB EOF error texts
+ * deflate-raw entries; zip64 not needed under the cap) whose member reads
+ * verify the central-directory CRC32 at data EOF — Go's archive/zip
+ * readDataEOF → checkSum, the mismatch riding ErrChecksum's "zip: checksum
+ * error" text; PDB EOF error texts
  * carry "unexpected EOF" where Go's binary.Read says "EOF"; error texts carry
  * our parse-error wording where Go embeds decoder line numbers.
  */
@@ -103,6 +106,7 @@ import {
   type SpooledBlob,
 } from "./blobs";
 import { goQueryEscape, parseGoSemver, parseGoVersion, type GoVersion } from "./npm";
+import { crc32 } from "./distro-common";
 
 // ---------------------------------------------------------------------------
 // Errors — metadata.go's InvalidArgument sentinels answer 400 at the route;
@@ -517,7 +521,9 @@ const XML_HEADER = '<?xml version="1.0" encoding="UTF-8"?>\n';
 // The zip reader — an EOCD + central-directory walk (the tar-scan idiom:
 // hand-built binary parse, no deps). Stored (method 0) and deflate (method 8,
 // DecompressionStream("deflate-raw")) entries; zip64 is out of scope under
-// the upload cap.
+// the upload cap. Member reads verify the central-directory CRC32 at data
+// EOF (Go's readDataEOF → checkSum — "zip: checksum error", the
+// invalid-archive class).
 // ---------------------------------------------------------------------------
 
 export interface ZipEntry {
@@ -530,6 +536,7 @@ export interface ZipEntry {
 interface ZipEntryRaw {
   name: string;
   method: number;
+  crc32: number;
   compressedSize: number;
   uncompressedSize: number;
   localHeaderOffset: number;
@@ -591,6 +598,7 @@ export function readZipEntries(bytes: Uint8Array): ZipEntry[] {
     entries.push({
       name: (flags & 0x800) !== 0 ? new TextDecoder().decode(nameBytes) : latin1(nameBytes),
       method: u16(bytes, cursor + 10),
+      crc32: u32(bytes, cursor + 16),
       compressedSize: u32(bytes, cursor + 20),
       uncompressedSize: u32(bytes, cursor + 24),
       localHeaderOffset: u32(bytes, cursor + 42),
@@ -615,8 +623,16 @@ async function extractEntry(bytes: Uint8Array, entry: ZipEntryRaw): Promise<Uint
   const extraLength = u16(bytes, entry.localHeaderOffset + 28);
   const dataStart = entry.localHeaderOffset + 30 + nameLength + extraLength;
   const compressed = bytes.subarray(dataStart, dataStart + entry.compressedSize);
+  // The data-EOF CRC gate (Go's readDataEOF → checkSum): the mismatch rides
+  // ErrChecksum's text in the family's invalid-archive class — the upload
+  // rejects, nothing stores. A deflated member's CRC is over the
+  // UNcompressed bytes; a stored member's over the stored bytes.
+  const checkSum = (data: Uint8Array): Uint8Array => {
+    if (crc32(data) !== entry.crc32) throw new NugetInvalidPackageArchiveError("zip: checksum error");
+    return data;
+  };
   if (entry.method === 0) {
-    return compressed.slice();
+    return checkSum(compressed.slice());
   }
   if (entry.method === 8) {
     const inflated = new Response(compressed.slice()).body!.pipeThrough(new DecompressionStream("deflate-raw"));
@@ -644,7 +660,7 @@ async function extractEntry(bytes: Uint8Array, entry: ZipEntryRaw): Promise<Uint
       out.set(chunk, offset);
       offset += chunk.byteLength;
     }
-    return out;
+    return checkSum(out);
   }
   throw new Error(`zip: unsupported compression method ${entry.method}`);
 }

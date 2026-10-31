@@ -108,6 +108,7 @@ import {
 } from "./model";
 import { copySpoolToContentKey, getOrInsertBlob, packageBlobContentKey, spoolAndHash, type SpooledBlob } from "./blobs";
 import { getPackageProperties } from "./protocol-common";
+import { crc32 } from "./distro-common";
 
 // ---------------------------------------------------------------------------
 // Upstream sentinels (metadata.go:23-27 + goproxy.go's error arms)
@@ -337,12 +338,16 @@ function goPathBase(name: string): string {
 // The zip reader — EOCD + central-directory walk (the nuget reader's idiom,
 // re-landed here self-contained: the parse needs entry BYTES and nuget's
 // extractor is module-private; stored + deflate-raw, zip64 out of scope
-// under the 64 MiB parse cap)
+// under the 64 MiB parse cap). Member reads verify the central-directory
+// CRC32 at data EOF (Go's archive/zip readDataEOF → checkSum — a deflated
+// member's CRC is over the UNcompressed bytes); the mismatch is the same
+// plain-error arm as every other structural zip failure.
 // ---------------------------------------------------------------------------
 
 interface GoZipEntryRaw {
   name: string;
   method: number;
+  crc32: number;
   compressedSize: number;
   uncompressedSize: number;
   localHeaderOffset: number;
@@ -372,7 +377,9 @@ function zipLatin1(bytes: Uint8Array): string {
 }
 
 /** One entry's bytes — stored copied, deflate inflated (the claimed
- *  uncompressed size bounds the output, the zip-bomb gate). */
+ *  uncompressed size bounds the output, the zip-bomb gate). Both arms
+ *  verify the central-directory CRC32 at data EOF (Go's readDataEOF →
+ *  checkSum); the mismatch is the same plain-error arm. */
 async function zipExtractEntry(bytes: Uint8Array, entry: GoZipEntryRaw): Promise<Uint8Array> {
   if (entry.localHeaderOffset + 30 > bytes.byteLength || zipU32(bytes, entry.localHeaderOffset) !== ZIP_LOCAL_SIGNATURE) {
     throw new GoInvalidArchiveError();
@@ -381,8 +388,12 @@ async function zipExtractEntry(bytes: Uint8Array, entry: GoZipEntryRaw): Promise
   const extraLength = zipU16(bytes, entry.localHeaderOffset + 28);
   const dataStart = entry.localHeaderOffset + 30 + nameLength + extraLength;
   const compressed = bytes.subarray(dataStart, dataStart + entry.compressedSize);
+  const checkSum = (data: Uint8Array): Uint8Array => {
+    if (crc32(data) !== entry.crc32) throw new GoInvalidArchiveError();
+    return data;
+  };
   if (entry.method === 0) {
-    return compressed.slice();
+    return checkSum(compressed.slice());
   }
   if (entry.method === 8) {
     const inflated = new Response(compressed.slice()).body?.pipeThrough(new DecompressionStream("deflate-raw"));
@@ -412,7 +423,7 @@ async function zipExtractEntry(bytes: Uint8Array, entry: GoZipEntryRaw): Promise
       out.set(chunk, offset);
       offset += chunk.byteLength;
     }
-    return out;
+    return checkSum(out);
   }
   throw new GoInvalidArchiveError();
 }
@@ -449,6 +460,7 @@ function readGoZipEntries(bytes: Uint8Array): GoZipEntryRaw[] {
     entries.push({
       name: (flags & 0x800) !== 0 ? new TextDecoder().decode(nameBytes) : zipLatin1(nameBytes),
       method: zipU16(bytes, cursor + 10),
+      crc32: zipU32(bytes, cursor + 16),
       compressedSize: zipU32(bytes, cursor + 20),
       uncompressedSize: zipU32(bytes, cursor + 24),
       localHeaderOffset: zipU32(bytes, cursor + 42),

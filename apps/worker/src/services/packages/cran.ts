@@ -32,9 +32,8 @@
  * - Download (cran.go:208-253): SearchFile by (type, platform, rversion,
  *   filename) — the Archive/{package}/{filename} route shares the handler.
  *
- * Divergences (documented per AGENTS.md): the zip CRC is not verified (Go's
- * archive/zip verifies on read; the blob sha256 gates the bytes at the
- * store); MD5sum renders the EMPTY value (Workers' WebCrypto has no MD5 —
+ * Divergences (documented per AGENTS.md): MD5sum renders the EMPTY value
+ * (Workers' WebCrypto has no MD5 —
  * the landed blob-row note; upstream prints the hash_md5 hex);
  * NaturalSortCompare's x/text English collation for non-numeric parts
  * reduces to byte order (identical for the ASCII digit/dot alphabet the
@@ -72,7 +71,7 @@ import {
 import { writeVersionMetadata } from "./protocol-common";
 import { DuplicatePackageFileError } from "./generic";
 
-import { readTarMembers } from "./distro-common";
+import { crc32, readTarMembers } from "./distro-common";
 
 // ---------------------------------------------------------------------------
 // The module metadata (modules/packages/cran/metadata.go)
@@ -293,10 +292,16 @@ async function parseCranPackageTarGz(bytes: Uint8Array): Promise<CranPackage> {
 }
 
 // -- The zip reader (self-contained; the swift walk's inverse) --------------
+// Member reads verify the central-directory CRC32 at data EOF (Go's
+// archive/zip readDataEOF → checkSum: the checksum failure surfaces when
+// the file's data is exhausted — ErrChecksum, the same plain-error arm as
+// every other structural zip failure). A deflated member's CRC is over the
+// UNcompressed bytes; a stored member's over the stored bytes.
 
 interface CranZipEntry {
   name: string;
   method: number;
+  crc32: number;
   compressedSize: number;
   uncompressedSize: number;
   localHeaderOffset: number;
@@ -340,6 +345,7 @@ function readCranZipEntries(bytes: Uint8Array): CranZipEntry[] {
     entries.push({
       name: (flags & 0x800) !== 0 ? new TextDecoder().decode(nameBytes) : latin1(nameBytes),
       method: zipU16(bytes, cursor + 10),
+      crc32: zipU32(bytes, cursor + 16),
       compressedSize: zipU32(bytes, cursor + 20),
       uncompressedSize: zipU32(bytes, cursor + 24),
       localHeaderOffset: zipU32(bytes, cursor + 42),
@@ -363,7 +369,13 @@ async function zipExtract(bytes: Uint8Array, entry: CranZipEntry): Promise<Uint8
   const extraLength = zipU16(bytes, entry.localHeaderOffset + 28);
   const dataStart = entry.localHeaderOffset + 30 + nameLength + extraLength;
   const compressed = bytes.subarray(dataStart, dataStart + entry.compressedSize);
-  if (entry.method === 0) return compressed.slice();
+  // The data-EOF CRC gate (Go's checkSum): a mismatch is the same archive
+  // error the structural walk throws — the upload rejects, nothing stores.
+  const checkSum = (data: Uint8Array): Uint8Array => {
+    if (crc32(data) !== entry.crc32) throw new CranArchiveError();
+    return data;
+  };
+  if (entry.method === 0) return checkSum(compressed.slice());
   if (entry.method !== 8) throw new CranArchiveError();
   const inflated = new Response(compressed.slice()).body?.pipeThrough(new DecompressionStream("deflate-raw"));
   if (inflated === undefined) throw new CranArchiveError();
@@ -390,7 +402,7 @@ async function zipExtract(bytes: Uint8Array, entry: CranZipEntry): Promise<Uint8
     out.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return out;
+  return checkSum(out);
 }
 
 async function parseCranPackageZip(bytes: Uint8Array): Promise<CranPackage> {

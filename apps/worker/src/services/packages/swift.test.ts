@@ -181,6 +181,24 @@ describe("parseSwiftPackage (the metadata_test.go oracle)", () => {
     await expect(parseSwiftPackage(zip, null)).rejects.toBeInstanceOf(SwiftMissingManifestFileError);
   });
 
+  it("a corrupt member CRC is the invalid-archive arm — stored AND deflated (the CRC is over the UNcompressed bytes)", async () => {
+    // Go's archive/zip readDataEOF → checkSum: when the member's data is
+    // exhausted the CRC32 must match the central directory, else ErrChecksum
+    // — the same SwiftInvalidArchiveError arm as every structural failure.
+    const dataAt = 30 + "Package.swift".length;
+    const stored = await makeSwiftZip([swiftEntry("Package.swift", MANIFEST_1)]);
+    stored[dataAt + 4] = (stored[dataAt + 4] ?? 0) ^ 0xff;
+    await expect(parseSwiftPackage(stored, null)).rejects.toBeInstanceOf(SwiftInvalidArchiveError);
+    // The deflated arm patches the CENTRAL-DIRECTORY CRC field instead (a
+    // flipped compressed byte could kill the deflate stream itself): the
+    // payload inflates untouched, so the produced (uncompressed) bytes no
+    // longer match the recorded CRC.
+    const deflated = await makeSwiftZip([swiftEntry("Package.swift", MANIFEST_1, { method: 8 })]);
+    const cdCrcAt = deflated.byteLength - 22 - (46 + "Package.swift".length) + 16;
+    deflated[cdCrcAt] = (deflated[cdCrcAt] ?? 0) ^ 0xff;
+    await expect(parseSwiftPackage(deflated, null)).rejects.toBeInstanceOf(SwiftInvalidArchiveError);
+  });
+
   it("a deeper manifest alone does not stand in for the missing root one (AltManifestOnlyInRootDirectory)", async () => {
     const zip = await makeSwiftZip([
       swiftEntry("Package@swift-5.5.swift", "// swift-tools-version:5.5"),

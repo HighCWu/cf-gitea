@@ -1899,8 +1899,20 @@ the D1 model).
   pinned the wire contracts: the chef metadata.json, the cran
   DESCRIPTION, the pub pubspec.yaml, the composer composer.json, the
   conan conanfile/conaninfo texts, the vagrant info.json).
-- **Open issues:** the cran zip CRC verification skipped (the blob
-  sha256 gates the bytes). ~~the chef X-Ops auth method~~ RESOLVED
+- **Open issues:** ~~the cran zip CRC verification skipped (the blob
+  sha256 gates the bytes)~~ RESOLVED 2026-11-01 (every zip member read
+  across the package families — cran, composer, nuget, go, swift — now
+  verifies the central-directory CRC32 at member-data EOF, Go's
+  archive/zip readDataEOF → checkSum: a deflated member's CRC is over
+  the UNcompressed bytes, a stored member's over the stored bytes; the
+  check reuses distro-common's crc32 table (Go's crc32.ChecksumIEEE) and
+  the mismatch throws the family's existing invalid-archive class —
+  CranArchiveError / ComposerArchiveError /
+  NugetInvalidPackageArchiveError ("zip: checksum error", Go's
+  ErrChecksum text) / GoInvalidArchiveError / SwiftInvalidArchiveError —
+  so a corrupt-CRC zip is rejected at the parse, nothing stores; per
+  family a corrupt-CRC test arm pins it, valid archives still parse).
+  ~~the chef X-Ops auth method~~ RESOLVED
   2026-11-01 (the chef-auth flip — the as-built note below).
 
 ## As-built — the composer `.tar.bz2` decision record: the reduction LIFTED by the vendored bzip2 decoder (2026-11-01)

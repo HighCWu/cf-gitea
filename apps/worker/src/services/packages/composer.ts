@@ -41,8 +41,7 @@
  * - Download (composer.go:121-146): the version → file-by-name walk with
  *   the lead GET bump; the 404 arms ride helper.PackageErrorStatus.
  *
- * Divergences (documented per AGENTS.md): the zip CRC is not verified
- * (the blob sha256 gates the bytes); the repo-source arm resolves
+ * Divergences (documented per AGENTS.md): the repo-source arm resolves
  * visibility/owner/admin, not the per-unit permission lattice (the
  * landed org/repo model's posture); JSON.stringify rendering (no Go
  * Marshal HTML escaping). (.tar.bz2 uploads used to be REJECTED as the
@@ -84,7 +83,7 @@ import {
   type SpooledBlob,
 } from "./blobs";
 import { isValidAbsoluteHttpUrl, writeVersionMetadata } from "./protocol-common";
-import { readTarMembers } from "./distro-common";
+import { crc32, readTarMembers } from "./distro-common";
 import { bzip2Decompress } from "./bz2";
 import { parseSwiftVersionStrict, swiftVersionString } from "./swift";
 
@@ -185,6 +184,11 @@ function composerFindCaseInsensitive(entries: { name: string; data: Uint8Array }
   return null;
 }
 
+/** The zip member walk. Every member read verifies the central-directory
+ *  CRC32 at data EOF (Go's archive/zip readDataEOF → checkSum — ErrChecksum
+ *  over the UNcompressed bytes for method 8, over the stored bytes for
+ *  method 0); the mismatch is the same ComposerArchiveError as every other
+ *  structural zip failure — the upload rejects, nothing stores. */
 async function composerZipMembers(bytes: Uint8Array): Promise<{ name: string; data: Uint8Array }[]> {
   const window = Math.min(bytes.byteLength, 22 + 65535);
   let eocd = -1;
@@ -206,6 +210,7 @@ async function composerZipMembers(bytes: Uint8Array): Promise<{ name: string; da
     const nameBytes = bytes.subarray(cursor + 46, cursor + 46 + nameLength);
     const name = (flags & 0x800) !== 0 ? new TextDecoder().decode(nameBytes) : latin1(nameBytes);
     const method = readU16(bytes, cursor + 10);
+    const crc = readU32(bytes, cursor + 16);
     const compressedSize = readU32(bytes, cursor + 20);
     const uncompressedSize = readU32(bytes, cursor + 24);
     const localOffset = readU32(bytes, cursor + 42);
@@ -214,7 +219,7 @@ async function composerZipMembers(bytes: Uint8Array): Promise<{ name: string; da
     const localExtraLength = readU16(bytes, localOffset + 28);
     const dataStart = localOffset + 30 + localNameLength + localExtraLength;
     const compressed = bytes.subarray(dataStart, dataStart + compressedSize);
-    entries.push({ name, data: await inflateComposerEntry(compressed, method, uncompressedSize) });
+    entries.push({ name, data: await inflateComposerEntry(compressed, method, uncompressedSize, crc) });
     cursor += 46 + nameLength + readU16(bytes, cursor + 30) + readU16(bytes, cursor + 32);
   }
   return entries;
@@ -240,8 +245,14 @@ function latin1(bytes: Uint8Array): string {
   return out;
 }
 
-async function inflateComposerEntry(compressed: Uint8Array, method: number, uncompressedSize: number): Promise<Uint8Array> {
-  if (method === 0) return compressed.slice();
+async function inflateComposerEntry(compressed: Uint8Array, method: number, uncompressedSize: number, crc: number): Promise<Uint8Array> {
+  // The data-EOF CRC gate (Go's checkSum): a mismatch is the same archive
+  // error the structural walk throws — the upload rejects, nothing stores.
+  const checkSum = (data: Uint8Array): Uint8Array => {
+    if (crc32(data) !== crc) throw new ComposerArchiveError();
+    return data;
+  };
+  if (method === 0) return checkSum(compressed.slice());
   if (method !== 8) throw new ComposerArchiveError();
   const stream = new Response(compressed.slice()).body?.pipeThrough(new DecompressionStream("deflate-raw"));
   if (stream === undefined) throw new ComposerArchiveError();
@@ -268,7 +279,7 @@ async function inflateComposerEntry(compressed: Uint8Array, method: number, unco
     out.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return out;
+  return checkSum(out);
 }
 
 async function composerTarGzMembers(bytes: Uint8Array): Promise<{ name: string; data: Uint8Array }[]> {
