@@ -5,20 +5,20 @@
  *
  * THE STAGED SHAPE (SPEC §3, mission brief): the trigger chain is M3, so
  * runs/jobs arrive through the model's insertActionRun seam (tests, the
- * fake-runner harness, and M3's future producer). buildRunnerTask assembles
- * the full claim payload (context, secrets/vars reads, needs) except where a
- * stage is explicitly deferred:
- *   - workflow_payload: the stored single-job bytes VERBATIM — the
- *     `if: always()` claim-time rewrite needs the actionslib YAML model
- *     (M3's port; the server-side decision still stands, the runner just
- *     receives the raw stored job until the parser lands);
+ * fake-runner harness, and M3's trigger producer — landed, ./trigger.ts).
+ * buildRunnerTask assembles the full claim payload (context, secrets/vars
+ * reads, needs) except where a stage is explicitly deferred:
+ *   - workflow_payload: the `if: always()` claim-time rewrite LANDED (the
+ *     M3 P-tier row, task.go:176-186 via runnerWorkflowPayload) — the M1a
+ *     verbatim-bytes stage is retired; a payload that no longer parses
+ *     throws and the claim releases (task.go's assembly-failure posture);
  *   - gitea_runtime_token / actions_id_token_request_*: omitted — they ride
  *     M1b's HS256 signer (§4.4's token-signing secret);
  *   - ref_protected: false — the SPEC-0013 protected-branch match service
  *     is wired at M3 with the commit-status family;
  *   - step rows: none inserted at claim (upstream parses them from the
- *     workflow payload via actionslib — M3); runner-REPORTED steps arrive
- *     through M1b's UpdateTask.
+ *     workflow payload via actionslib — the S/E tier's model rows);
+ *     runner-REPORTED steps arrive through M1b's UpdateTask.
  */
 
 import { and, eq } from "drizzle-orm";
@@ -52,6 +52,7 @@ import {
 } from "./model";
 import { taskAllowsOidcToken } from "./oidc";
 import { createAuthorizationToken, oidcIssuer, signActionsClaims } from "./secrets";
+import { runnerWorkflowPayload } from "./trigger";
 import type { Task, TaskNeed } from "./wire";
 
 /** The D1/database binding spelling shared by the service functions. */
@@ -342,9 +343,11 @@ async function buildRunnerTask(env: Env, d1: D1, claimed: ClaimedTask, appUrl: s
 
   return {
     id: claimed.id,
-    // STAGED: the stored bytes verbatim — the `if: always()` rewrite is the
-    // M3 parser's (see the module header).
-    workflowPayload: asBytes(job.workflowPayload),
+    // task.go:176-186 (runnerWorkflowPayload): the job `if:` forced to the
+    // literal `always()` — "as Gitea has decided it and a runner must not
+    // re-evaluate it" (SPEC-0012 §2.3 + the M3 P-tier row). The M1a stage
+    // served the stored bytes verbatim (the module header's resolved note).
+    workflowPayload: runnerWorkflowPayload(asBytes(job.workflowPayload)),
     context,
     secrets,
     machine: "",

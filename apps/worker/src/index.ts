@@ -19,6 +19,7 @@ import { gitHttpGate } from "./git-http/gate";
 import { handleRepoTasks } from "./repos/purge";
 import { repoTasksDlqHandler } from "./repos/dlq";
 import { handleUserPushEvent } from "./services/webhooks-push";
+import { handleActionsPushEvent } from "./services/actions/trigger";
 import { enqueuePushMirrorSyncsOnCommit } from "./services/mirror/push-sync";
 import { handleScheduledCron } from "./services/demo-sweep";
 import { armsForEntry, recordArmsFailure, recordArmsSuccess } from "./services/cron-state";
@@ -48,7 +49,9 @@ import { renderNotFoundShellResponse, renderServerErrorShellResponse } from "./u
  * - `onPush` (SPEC-0005 §3, wired fff6094): after finalizeReceive commits,
  *   the engine fires the hook in waitUntil with the APPLIED updates delta —
  *   the user-push webhook family (pusher = repo owner until the engine
- *   plumbs authenticated identity). Mirror/import receives use their own
+ *   plumbs authenticated identity) and, beside it, the M3 Actions trigger
+ *   chain (SPEC-0012 §2.9, `handleActionsPushEvent` — its own never-fail
+ *   posture: the applied push stands). Mirror/import receives use their own
  *   engine instances without the hook (no double emission).
  * - `REPO_PACKS` (R2) is bound and used by the engine's receive path for
  *   pack staging + final packs (SPEC-0001a §3 Step 1). The full-clone cache
@@ -58,12 +61,15 @@ const gitHttp = createDurableGit<Env>({
   authorize,
   ui: false,
   namespaces: true,
-  onPush: (event, env) => {
+  onPush: async (event, env) => {
     // Sync-on-commit producer (SPEC specs/push-mirror-outbound.md §4.1;
     // upstream syncPushMirrorWithSyncOnCommit, mirror_push.go:250-260) —
     // best-effort enqueue, never fails the push (the helper catches its own).
     void enqueuePushMirrorSyncsOnCommit(env, event.repo);
-    return handleUserPushEvent(env, event);
+    await handleUserPushEvent(env, event);
+    // The Actions trigger (SPEC-0012 M3 tier P) — the same waitUntil, the
+    // same never-fail-the-push posture (it catches its own errors).
+    await handleActionsPushEvent(env, event);
   },
 });
 
