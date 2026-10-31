@@ -22,8 +22,13 @@ import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
+import { Context } from "hono";
+import { emptyTree, serializeCommit } from "@cf-gitea/git-engine";
 
 import { WatchMode } from "../../api/services/repo-watchers";
+import { engineCell, ZERO_OID } from "../../api/services/engine";
+import { mergePullRequest } from "../../api/services/pull-engine";
+import type { ApiEnv } from "../../api/env";
 
 import {
   comments,
@@ -38,7 +43,7 @@ import {
   userSettings,
   users,
 } from "../../db/schema";
-import { IssuesService, type IssueRow } from "../../issues/service";
+import { IssuesService, type IssueRow, type PullRequestRow } from "../../issues/service";
 import { CommentType } from "../../issues/comment-types";
 import {
   createReplyToken,
@@ -54,6 +59,7 @@ import {
   notifyIssueCreated,
   notifyIssueStatusChanged,
   notifyIssueTitleChanged,
+  notifyMergePullRequest,
   notifyPullRequestCreated,
   resolveIssueMailRecipients,
   type MailNotifyEnv,
@@ -1012,6 +1018,196 @@ describe("notifyIssueAssigneeChanged — the IssueChangeAssignee receiver", () =
     expect((await notifyIssueAssigneeChanged(off, { issue, comment, doer, assignee, removed: false }, {})).outcome).toBe("disabled");
     const malformed = armedEnv({ MAIL_FROM: "no address here" });
     expect((await notifyIssueAssigneeChanged(malformed, { issue, comment, doer, assignee, removed: false }, {})).outcome).toBe("misconfigured");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The MergePullRequest arm — the winning-merge mail (services/pull/merge.go:
+// 385-412 markAsMergedPostProcess → notify.go:138-146 → MailParticipants with
+// ActionMergePullRequest). The AutoMergePullRequest twin is STAGED
+// (unreachable — no scheduled-merge store; SPEC §1.3).
+// ---------------------------------------------------------------------------
+
+describe("notifyMergePullRequest — the MergePullRequest receiver", () => {
+  /** A PR issue over the seeded fixture (IsPull picks the pulls path
+   *  everywhere; baseBranch feeds the merge line's %[3]s). */
+  async function seedPullIssue(title = "Merge me"): Promise<IssueRow> {
+    const issue = await seedIssue(title);
+    await env.DB.prepare("UPDATE issues SET is_pull = 1 WHERE id = ?").bind(issue.id).run();
+    return (await db().select().from(issues).where(eq(issues.id, issue.id)).get())!;
+  }
+
+  it("the merge mail: Re: subject, the /merge/<ms> Message-ID over the plain reference, the merge line with the base branch, the emptied content, 'issue comments' info, pull-merge dedupe", async () => {
+    const issue = await seedPullIssue();
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    const now = new Date(1_700_000_045_678);
+    const outcome = await notifyMergePullRequest(armedEnv(), { issue, doer, baseBranch: "main" }, { now });
+    expect(outcome.outcome).toBe("enqueued");
+    const rows = await db().select().from(emailOutbox).all();
+    // The participants resolution over the seeded fixture: repo watcher 20
+    // first, then poster 10, assignee 50, participant 40, issue watcher 30;
+    // unwatcher 70 and the doer (60) excluded.
+    expect(rows.map((row) => row.toAddr)).toEqual(["rw@example.com", "poster@example.com", "as@example.com", "part@example.com", "iw@example.com"]);
+    for (const row of rows) {
+      expect(row.subject).toBe(`Re: [repoowner/repo] ${issue.title} (#${issue.index})`);
+      expect(row.info).toBe(`Subject: Re: [repoowner/repo] ${issue.title} (#${issue.index}), issue comments`);
+      const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+      expect(headers["Message-ID"]).toBe(`<repoowner/repo/pulls/${issue.index}/merge/${now.getTime()}@mail.example>`);
+      expect(headers["In-Reply-To"]).toBe(`<repoowner/repo/pulls/${issue.index}@mail.example>`);
+      expect(headers["References"]).toBe(`<repoowner/repo/pulls/${issue.index}@mail.example>`);
+      expect(headers["X-Gitea-Reason"]).toBe("pull");
+      // MailParticipants empties the content for merge (mail_issue.go:184) —
+      // the merge line IS the body; the issue description never renders.
+      expect(row.bodyHtml).toContain(`<b>doer</b> merged #${issue.index} into main.`);
+      expect(row.bodyHtml).not.toContain("<p>body</p>");
+      expect(row.dedupeKey).toMatch(new RegExp(`^pull-merge:${issue.id}:merge:${now.getTime()}:\\d+$`));
+    }
+  });
+
+  it("the merge line escapes the base branch like every plain-string locale arg (TrHTML)", async () => {
+    const issue = await seedPullIssue();
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    await notifyMergePullRequest(armedEnv(), { issue, doer, baseBranch: 'rel<"1">&main' }, {});
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows[0]!.bodyHtml).toContain("merged #");
+    expect(rows[0]!.bodyHtml).toContain("into rel&lt;&quot;1&quot;&gt;&amp;main.");
+    expect(rows[0]!.bodyHtml).not.toContain('rel<"1">');
+  });
+
+  it("the WIP-titled pull's merge drops the repo watchers (pullCreate NOT set — mail_issue.go:67-76 without the create exception)", async () => {
+    const issue = await seedPullIssue("WIP: merge me");
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    const outcome = await notifyMergePullRequest(armedEnv(), { issue, doer, baseBranch: "main" }, {});
+    expect(outcome.outcome).toBe("enqueued");
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows.map((row) => row.toAddr)).not.toContain("rw@example.com");
+    expect(rows.map((row) => row.toAddr)).toContain("poster@example.com");
+  });
+
+  it("consumes to 'sent'; MAIL off / malformed degrade like the siblings", async () => {
+    const issue = await seedPullIssue();
+    const doer = (await db().select().from(users).where(eq(users.id, 60)).get())!;
+    const mailEnv = armedEnv();
+    await notifyMergePullRequest(mailEnv, { issue, doer, baseBranch: "main" }, {});
+    const spy = mailEnv.REPO_TASKS as unknown as { sendBodies: MailOutboxMessage[] };
+    expect(await processMailOutbox(mailEnv, spy.sendBodies[0]!)).toEqual({ kind: "sent" });
+    const off = armedEnv({ MAIL_ENABLED: "false" });
+    expect((await notifyMergePullRequest(off, { issue, doer, baseBranch: "main" }, {})).outcome).toBe("disabled");
+    const malformed = armedEnv({ MAIL_FROM: "no address here" });
+    expect((await notifyMergePullRequest(malformed, { issue, doer, baseBranch: "main" }, {})).outcome).toBe("misconfigured");
+  });
+});
+
+describe("mergePullRequest's winning-merge emit — the real merge flow (pull-engine.ts, markAsMergedPostProcess shape)", () => {
+  /**
+   * The engine cell's minimal mergeable state: ONE commit on refs/heads/main
+   * (the manually-merged ancestor check only needs the base tip present).
+   * Each call seeds its OWN repo row + cell name — the DO namespace survives
+   * across tests, so a shared name would collide on refs/heads/main.
+   */
+  async function seedMergablePull(repoId: string, ownerNamespace: string, slug: string): Promise<{
+    issue: IssueRow;
+    pr: PullRequestRow;
+    pair: { repo: typeof repositories.$inferSelect; owner: typeof users.$inferSelect };
+    mainTip: string;
+  }> {
+    await db().insert(repositories).values({
+      id: repoId,
+      storageKey: `r_${repoId}`,
+      ownerNamespace,
+      ownerId: 1,
+      slug,
+      visibility: "public",
+      status: "ready",
+    });
+    await db().insert(repoWatchers).values({ repoId, userId: 20 });
+    const service = new IssuesService(env.DB); // bare — no notify on setup writes
+    const { issue, pullRequest } = await service.createPullRequest({
+      repoId,
+      title: "engine merge",
+      content: "desc",
+      posterId: 10,
+      headRepoId: repoId,
+      baseBranch: "main",
+      headBranch: "topic",
+    });
+    const pair = {
+      repo: (await db().select().from(repositories).where(eq(repositories.id, repoId)).get())!,
+      owner: (await db().select().from(users).where(eq(users.id, 1)).get())!,
+    };
+    const cell = engineCell(env, pair.repo);
+    const tree = emptyTree();
+    const commit = serializeCommit({
+      tree: tree.oid,
+      parents: [],
+      author: { name: "Seed", email: "seed@example.com", time: 1_700_000_000, tz: "+0000" },
+      committer: { name: "Seed", email: "seed@example.com", time: 1_700_000_000, tz: "+0000" },
+      message: "seed main\n",
+    });
+    const put = await cell.putApiObjects([tree, commit]);
+    if (put.tag !== "ok") throw new Error(`seed put failed: ${put.tag}`);
+    const moved = await cell.commitApiChange({ ref: "refs/heads/main", expectedOldOid: ZERO_OID, newOid: commit.oid });
+    if (moved.tag !== "committed") throw new Error(`seed ref move failed: ${moved.tag}`);
+    return { issue, pr: pullRequest, pair, mainTip: commit.oid };
+  }
+
+  /** A hono Context over the ARMED bindings (the merged env satisfies the
+   *  Bindings interface; the literal-typed vars carry the armed values at
+   *  runtime; APP_URL pinned to the hub's test origin). mergePullRequest
+   *  reads env (the engine cell + the mail vars), never authUser
+   *  (deleteBranchAfterMerge is false in these arms). */
+  function mergeContext(bindings: ApiEnv["Bindings"]): Context<ApiEnv> {
+    return new Context(new Request("https://mail.example/repos/x/y/pulls/1/merge"), { env: bindings });
+  }
+
+  function armedBindings(): ApiEnv["Bindings"] {
+    return Object.assign({}, env, {
+      APP_URL: "https://mail.example",
+      MAIL_ENABLED: "true",
+      MAIL_PROVIDER: "dummy",
+      MAIL_FROM: "Gitea <noreply@example.com>",
+      REPO_TASKS: spyQueue(),
+    });
+  }
+
+  it("an armed merge lands pull-merge rows for the landing winner — and NO issue-status rows (the bare close never mails)", async () => {
+    const { issue, pr, pair, mainTip } = await seedMergablePull("510", "repoowner", "merge-mail-a");
+    const now = new Date(1_700_000_123_456);
+    const { commitOid } = await mergePullRequest(mergeContext(armedBindings()), pair, issue, pr, {
+      style: "manually-merged",
+      message: "",
+      deleteBranchAfterMerge: false,
+      mergeCommitId: mainTip,
+      doerId: 60,
+      now,
+    });
+    expect(commitOid).toBe(mainTip);
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows).toHaveLength(2); // watcher 20 + poster 10; the doer excluded
+    expect(rows.map((row) => row.toAddr)).toEqual(["rw@example.com", "poster@example.com"]);
+    for (const row of rows) {
+      expect(row.dedupeKey).toMatch(new RegExp(`^pull-merge:${issue.id}:merge:${now.getTime()}:\\d+$`));
+      const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+      expect(headers["Message-ID"]).toBe(`<repoowner/merge-mail-a/pulls/${issue.index}/merge/${now.getTime()}@mail.example>`);
+    }
+    // The close service inside the merge is constructed BARE — the merge's
+    // ONLY mail is MergePullRequest, never IssueChangeStatus's close
+    // (upstream: SetIssueAsClosed is model-level, merge.go:838).
+    expect(rows.some((row) => row.dedupeKey?.startsWith(`issue-status:${issue.id}:`))).toBe(false);
+  });
+
+  it("the shipped mail-off posture merges with ZERO outbox rows (the emit site's fail-closed tripwire)", async () => {
+    const { issue, pr, pair, mainTip } = await seedMergablePull("511", "repoowner", "merge-mail-b");
+    const bindings = Object.assign({}, env, { REPO_TASKS: spyQueue() }); // MAIL_ENABLED="false" as shipped
+    await mergePullRequest(mergeContext(bindings), pair, issue, pr, {
+      style: "manually-merged",
+      message: "",
+      deleteBranchAfterMerge: false,
+      mergeCommitId: mainTip,
+      doerId: 60,
+      now: new Date(1_700_000_123_456),
+    });
+    expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
   });
 });
 

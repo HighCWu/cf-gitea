@@ -226,6 +226,16 @@ export function issueActionReadyForReviewLine(doerDisplayName: string): string {
   return `<b>${escapeHtml(doerDisplayName)}</b> marked this pull request ready for review.`;
 }
 
+/** `mail.issue.action.merge` (locale_en-US.json: `<b>%[1]s</b> merged
+ *  #%[2]d into %[3]s.`) — the MergePullRequest arm's line: default.tmpl's
+ *  merge branch interpolates `.Doer.DisplayNameWithFullName`, `.Issue.Index`
+ *  and `.Issue.PullRequest.BaseBranch`. The branch name is a plain-string
+ *  locale arg, so it escapes like the display name (TrHTML,
+ *  i18n/localestore.go:156-171 — the ready line's precedent). */
+export function issueActionMergeLine(doerDisplayName: string, issueIndex: number, baseBranch: string): string {
+  return `<b>${escapeHtml(doerDisplayName)}</b> merged #${issueIndex} into ${escapeHtml(baseBranch)}.`;
+}
+
 /** Data for `renderIssueActionMail` (the default.tmpl data map's used slice
  *  for the new/close/reopen arms — the comment twin is IssueCommentMailData). */
 export interface IssueActionMailData {
@@ -233,8 +243,8 @@ export interface IssueActionMailData {
   subject: string;
   /** Upstream `.ActionName` — actionToTemplate's arm name
    *  (mail_issue_common.go:227-246): "new" | "close" | "reopen" | "comment" |
-   *  "ready_for_review". */
-  actionName: "new" | "close" | "reopen" | "comment" | "ready_for_review";
+   *  "ready_for_review" | "merge". */
+  actionName: "new" | "close" | "reopen" | "comment" | "ready_for_review" | "merge";
   /** Upstream `.Body` — the content rendered to HTML (the issue content for
    *  "new", emptied by MailParticipants for close/reopen, mail_issue.go:
    *  180-185); "" selects the template's empty-body branch. */
@@ -264,10 +274,11 @@ export interface IssueActionMailData {
  *     the else branch renders it 3-tab indented — the shape
  *     renderIssueCommentMail pinned;
  *   - an action line with an EMPTY body ("close"/"reopen" — their content is
- *     always emptied by MailParticipants; "ready_for_review" on a
- *     description-less pull): the FIRST action chain emits the locale line
- *     3-tab indented, then the empty-body branch contributes its two
- *     skipped-`{{if}}` lines ("\t\t" and "\t\t\t") after it;
+ *     always emptied by MailParticipants; "merge" the same way,
+ *     mail_issue.go:184; "ready_for_review" on a description-less pull): the
+ *     FIRST action chain emits the locale line 3-tab indented, then the
+ *     empty-body branch contributes its two skipped-`{{if}}` lines ("\t\t"
+ *     and "\t\t\t") after it;
  *   - an action line AND a non-empty body ("ready_for_review" with a kept
  *     description — MailParticipants' empty list, mail_issue.go:179-185, does
  *     not cover it; upstream the close/reopen arms can never reach this

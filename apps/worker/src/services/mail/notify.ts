@@ -28,7 +28,12 @@
  *     the next two file-order arms: `IssueChangeTitle` (:80-90, the WIP →
  *     ready-for-review rename mail over the same funnel, SPEC §11) and
  *     `IssueChangeAssignee` (:119-127, the assigned mail — the one arm whose
- *     recipient is NOT the participants resolution, SPEC §12).
+ *     recipient is NOT the participants resolution, SPEC §12). Slice six
+ *     adds `MergePullRequest` (:138-146 — the winning-merge mail over the
+ *     same funnel, SPEC §12.4); its `AutoMergePullRequest` twin (:148-156)
+ *     stays STAGED — unreachable while no scheduled-merge store exists
+ *     (SPEC §1.3), and the review family (:98-117, :129-136) stays staged
+ *     behind the review-service extraction.
  *
  * The inbound fold (specs/email-inbound.md §9 — mail_issue_common.go:
  * 181-202) rides the same loop: with `MAIL_INBOUND_ENABLED=true` (+ secret +
@@ -108,6 +113,7 @@ import { appUrlWithSlash, GITEA_APP_NAME, isMailable } from "./register-notify";
 import {
   displayNameWithFullName,
   issueActionCloseLine,
+  issueActionMergeLine,
   issueActionNewLine,
   issueActionReadyForReviewLine,
   issueActionReopenLine,
@@ -137,7 +143,8 @@ export type MailNotifyEvent =
   | "IssueChangeStatus"
   | "IssueChangeTitle"
   | "NewPullRequest"
-  | "IssueChangeAssignee";
+  | "IssueChangeAssignee"
+  | "MergePullRequest";
 
 /** The env slice the hub reads (both bindings ride the outbox; the
  *  MAIL_INBOUND_* trio arms the per-recipient token carriers — SPEC
@@ -208,18 +215,20 @@ function issueMessageId(
 /** `generateMessageIDForIssue`'s close/reopen extras (mail_issue_common.go:
  *  286-293 — ActionCloseIssue/ClosePullRequest → `/close/<unixMilli>`,
  *  ActionReopenIssue/ReopenPullRequest → `/reopen/<unixMilli>`,
- *  ActionPullRequestReadyForReview → `/ready/<unixMilli>` :303-304): every
- *  status mail's Message-ID is distinct across repeated close/reopen cycles
- *  over one issue (upstream's own uniqueness mechanism — the pin's test at
- *  mail_test.go:446/:462 asserts exactly the `/close/` and `/reopen/`
- *  prefixes). The "new" arm has NO extra (ActionCreateIssue falls through
- *  the switch, mail_test.go:407-418), so it reuses `issueMessageId` plain. */
+ *  ActionMergePullRequest|ActionAutoMergePullRequest → `/merge/<unixMilli>`
+ *  :296-297, ActionPullRequestReadyForReview → `/ready/<unixMilli>`
+ *  :303-304): every status mail's Message-ID is distinct across repeated
+ *  close/reopen cycles over one issue (upstream's own uniqueness mechanism —
+ *  the pin's test at mail_test.go:446/:462 asserts exactly the `/close/` and
+ *  `/reopen/` prefixes). The "new" arm has NO extra (ActionCreateIssue falls
+ *  through the switch, mail_test.go:407-418), so it reuses `issueMessageId`
+ *  plain. */
 function issueActionMessageId(
   repoPath: string,
   isPull: boolean,
   index: number,
   appDomain: string,
-  action: "close" | "reopen" | "ready",
+  action: "close" | "reopen" | "ready" | "merge",
   unixMilli: number,
 ): string {
   const path = isPull ? "pulls" : "issues";
@@ -792,18 +801,24 @@ interface NotifyIssueArmInput {
    *  ActionCloseIssue|ClosePullRequest → "close";
    *  ActionReopenIssue|ReopenPullRequest → "reopen" (IsPull picks the
    *  activities constant, not the name — notify.go:63-73);
-   *  ActionPullRequestReadyForReview → "ready_for_review" (:248). */
-  actionName: "new" | "close" | "reopen" | "ready_for_review";
+   *  ActionPullRequestReadyForReview → "ready_for_review" (:248);
+   *  ActionMergePullRequest|ActionAutoMergePullRequest → "merge" (:235-236). */
+  actionName: "new" | "close" | "reopen" | "ready_for_review" | "merge";
   /** MailParticipants' content rule (mail_issue.go:179-185): the issue
    *  content for "new" AND "ready_for_review" (ActionCreatePullRequest is
    *  NOT in the empty list; neither is ActionPullRequestReadyForReview);
-   *  "" for close/reopen (upstream empties it). */
+   *  "" for close/reopen AND merge/auto-merge (upstream empties them,
+   *  :184-185). */
   content: string;
   /** The dedupe-key family (SPEC §8.3's trigger-level idempotency). */
-  dedupePrefix: "issue-new" | "issue-status" | "pull-new" | "pull-ready";
+  dedupePrefix: "issue-new" | "issue-status" | "pull-new" | "pull-ready" | "pull-merge";
   /** The pull-create arm's repo-watcher WIP-gate exception (the
    *  resolveIssueMailRecipients flag, mail_issue.go:67-76). */
   pullCreate?: boolean;
+  /** `.Issue.PullRequest.BaseBranch` — the merge line's %[3]s locale arg
+   *  (default.tmpl's merge branch; the merge arm passes the PR row's
+   *  baseBranch, every other arm leaves it unset). */
+  baseBranch?: string;
   /** The content's resolved mentions (upstream `mentions []*User`): the
    *  create arms pass FindAndUpdateIssueMentions' result (services/issue/
    *  issue.go:68, services/pull/pull.go:184); the status/title arms pass
@@ -855,7 +870,9 @@ async function notifyIssueArm(
       ? "new-issue mail"
       : input.actionName === "ready_for_review"
         ? "ready-for-review mail"
-        : "issue-status mail";
+        : input.actionName === "merge"
+          ? "merge mail"
+          : "issue-status mail";
   const pre = await mailArmPrelude(env, armName, `${armName} for issue ${input.issue.id}`, input.issue.repoId);
   if (!pre.ok) return pre.outcome;
   const { from, pair } = pre;
@@ -907,9 +924,11 @@ async function notifyIssueArm(
         ? issueActionReopenLine(doerDisplay, input.issue.index)
         : input.actionName === "ready_for_review"
           ? issueActionReadyForReviewLine(doerDisplay)
-          : bodyHtml === ""
-            ? issueActionNewLine(doerDisplay, input.issue.index)
-            : null;
+          : input.actionName === "merge"
+            ? issueActionMergeLine(doerDisplay, input.issue.index, input.baseBranch ?? "")
+            : bodyHtml === ""
+              ? issueActionNewLine(doerDisplay, input.issue.index)
+              : null;
   const fromDisplayName = mailFromDisplayName(input.doer);
   const messageId =
     input.actionName === "new"
@@ -1120,6 +1139,50 @@ export async function notifyIssueTitleChanged(
       actionName: "ready_for_review",
       content: input.issue.content ?? "",
       dedupePrefix: "pull-ready",
+    },
+    options,
+  );
+}
+
+/**
+ * The `MergePullRequest` arm's mail (notify.go:138-146 → MailParticipants
+ * with ActionMergePullRequest, doer = the merger, mentions nil) — upstream
+ * fires it from `markAsMergedPostProcess` (services/pull/merge.go:385-412,
+ * `wasAutoMerged` false :406) AFTER the merge tx, with the issue RELOADED
+ * closed. Compose-wise it is the "Re: "-prefixed status-family arm whose
+ * content is EMPTIED (ActionMergePullRequest is in MailParticipants'
+ * :180-185 empty list — the merge line IS the body), the Message-ID carries
+ * the `/merge/<unixMilli>` extra (mail_issue_common.go:296-297 — the switch
+ * covers ActionAutoMergePullRequest too), and default.tmpl's merge branch
+ * renders `<b>%[1]s</b> merged #%[2]d into %[3]s.` — %[3]s is
+ * `.Issue.PullRequest.BaseBranch` (`baseBranch` below, escaped like every
+ * plain-string locale arg). Recipients: the full participants resolution,
+ * `pullCreate` NOT set (a merge of a WIP-titled pull drops the repo
+ * watchers upstream-shaped, mail_issue.go:67-76; our merge route refuses WIP
+ * anyway, the same unreachable-but-faithful posture). Dedupe
+ * `pull-merge:<issueId>:merge:<unixMilli>:<recipientId>` — the ms discipline
+ * (the issue-status family). The sibling `AutoMergePullRequest` receiver
+ * (notify.go:148-156) is STAGED, not landed: its only differences are the
+ * ActionAutoMergePullRequest constant (same "merge" template name,
+ * :235-236), the same `/merge/` Message-ID extra and
+ * `ForceDoerNotification` (mail_issue.go:191 — the merger receives their
+ * own merge mail bypassing the :94-97 doer exclusion); none is reachable
+ * while this backend has no scheduled-merge store (see SPEC §1.3).
+ */
+export async function notifyMergePullRequest(
+  env: MailNotifyEnv,
+  input: { issue: IssueMailRow; doer: UserRow; baseBranch: string },
+  options: { now?: Date } = {},
+): Promise<MailNotifyOutcome> {
+  return notifyIssueArm(
+    env,
+    {
+      issue: input.issue,
+      doer: input.doer,
+      actionName: "merge",
+      content: "",
+      dedupePrefix: "pull-merge",
+      baseBranch: input.baseBranch,
     },
     options,
   );

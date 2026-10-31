@@ -1,7 +1,7 @@
 import { createRoute } from "@hono/zod-openapi";
 import type { OpenAPIHono } from "@hono/zod-openapi";
 import type { Context, MiddlewareHandler } from "hono";
-import { and, asc, eq, gte, inArray, lt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, lt, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { z } from "zod";
 
@@ -17,7 +17,7 @@ import {
 } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import { IssueNotExistError } from "../../issues/errors";
-import type { IssueRow } from "../../issues/service";
+import type { CommentRow, IssueRow } from "../../issues/service";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
@@ -33,7 +33,7 @@ import {
   findUserByName,
   viewerOf,
 } from "../services/repository";
-import type { RepositoryRow, RepositoryWithOwner, Viewer } from "../services/repository";
+import type { RepositoryRow, RepositoryWithOwner, UserRow, Viewer } from "../services/repository";
 import {
   addIssueAssignees,
   findIssueByRepoAndIndex,
@@ -49,6 +49,7 @@ import {
   type IssueRenderContext,
 } from "../services/issues";
 import { emitAssignEvent } from "./issues";
+import { notifyIssueAssigneeChanged } from "../../services/mail/notify";
 
 /**
  * Tier-2 issue TABLE-family routes — the operations the issue-write wave
@@ -156,6 +157,11 @@ import { emitAssignEvent } from "./issues";
  * (services/issue/assignee.go:236-247 / :274-286 → services/webhook/
  * notifier.go IssueChangeAssignee:161-202; `changes.added_assignees` /
  * `changes.removed_assignees`, the IsPull discriminant picks the type).
+ * Mail triggers: the same notify position now fans the MAIL notifier beside
+ * the webhook one (upstream's single IssueChangeAssignee dispatch reaches
+ * both) — notifyAssigneeMail below hands each toggle's type-9 comment to
+ * services/mail/notify.ts's landed receiver (mailer/notify.go:119-127;
+ * removals ride along and self-gate off there, notify.go:121).
  *
  * The assignee write core (name resolution, assignability, the guarded
  * add/remove loops, the type-9 comments, the enriched wire render) lives in
@@ -1092,6 +1098,74 @@ async function findIssueById(d1: D1Database, id: number): Promise<IssueRow | nul
 // Handlers
 // ---------------------------------------------------------------------------
 
+/**
+ * The type-9 comment of ONE toggle, read back after the write — the trio's
+ * addIssueAssignees/removeIssueAssignees cores write the comment but return
+ * only the changed user (upstream's ToggleIssueAssignee returns
+ * `(removed, comment)` in one shape, models/issues/assignees.go:96-140), so
+ * the mail arm's `comment` argument is recovered by the row's own key set:
+ * (issue, type 9, assignee, removed flag, poster = the doer), latest id —
+ * the just-inserted row under any same-key replay. Null = the write's
+ * comment is gone (never observed) and the arm skips: the anchor and the
+ * Message-ID's `/comment/<id>` extra need the row, and composing without it
+ * would not be upstream's compose (mail_issue.go:214-222 builds the message
+ * FROM the comment).
+ */
+async function latestAssigneeComment(d1: D1Database, issueId: number, assigneeId: number, doerId: number, removed: boolean): Promise<CommentRow | null> {
+  return (
+    (await drizzle(d1)
+      .select()
+      .from(comments)
+      .where(
+        and(
+          eq(comments.issueId, issueId),
+          eq(comments.type, CommentType.Assignees),
+          eq(comments.assigneeId, assigneeId),
+          eq(comments.removedAssignee, removed ? 1 : 0),
+          eq(comments.posterId, doerId),
+        ),
+      )
+      .orderBy(desc(comments.id))
+      .limit(1)
+      .get()) ?? null
+  );
+}
+
+/**
+ * The trio's IssueChangeAssignee MAIL arms (services/issue/assignee.go:242
+ * AddAssignees / :281 RemoveAssignees — per ACTUALLY-changed assignee, the
+ * same event upstream's notify dispatch fans to the webhook AND the mail
+ * notifier): the webhook emitter has run; this fires the landed
+ * `notifyIssueAssigneeChanged` receiver (services/mailer/notify.go:119-127)
+ * beside it, per assignee, with the toggle's type-9 comment. Upstream
+ * dispatches removals too and the MAIL receiver self-gates them off
+ * (notify.go:121's `!removed`) — mirrored: the removal arm calls and the
+ * receiver answers no-recipients. Best-effort, never throws: the writes
+ * above stay committed (the landed service-level arms' posture).
+ */
+async function notifyAssigneeMail(
+  c: Context<ApiEnv>,
+  issue: IssueRow,
+  assignees: UserRow[],
+  doerId: number,
+  removed: boolean,
+): Promise<void> {
+  const doer = (await drizzle(c.env.DB).select().from(users).where(eq(users.id, doerId)).get()) ?? null;
+  if (doer === null) {
+    console.error(`[issue-assignee] mail skipped: doer row missing [id: ${doerId}]`);
+    return;
+  }
+  for (const user of assignees) {
+    try {
+      const comment = await latestAssigneeComment(c.env.DB, issue.id, user.id, doerId, removed);
+      if (comment === null) continue;
+      await notifyIssueAssigneeChanged(c.env, { issue, comment, doer, assignee: user, removed });
+    } catch (error) {
+      console.error(`[issue-assignee] mail failed (issue ${issue.id}, assignee ${user.id}): ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
 export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>, optionalAuth: MiddlewareHandler<ApiEnv>): void {
   // -------------------------------------------------------------------------
   // POST …/issues/{index}/assignees (issueAddAssignees) — writer-only,
@@ -1099,6 +1173,9 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // 403 access); new assignees get the type-9 comment; 201 with the issue.
   // Webhook: one issue_assign / pull_request_assign `assigned` event per
   // actually-added assignee (IssueChangeAssignee:161, post-write).
+  // Mail: the trio's AddAssignees notify arm (services/issue/assignee.go:242
+  // — the same event fanned to the mail notifier; the receiver self-gates
+  // the per-recipient rules) — notifyAssigneeMail below.
   // -------------------------------------------------------------------------
   app.openapi(addAssigneesRoute(requireAuth), async (c) => {
     const { viewer, found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
@@ -1107,11 +1184,13 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
     await assertIssueWriter(c, found);
     const names = c.req.valid("json").assignees ?? [];
     const assignees = await resolveAssigneesByName(c.env.DB, names);
-    const added = await addIssueAssignees(c.env.DB, found, issue, assignees, { id: requireDoerId(c), isAdmin: c.get("authUser")?.is_admin === true });
+    const doerId = requireDoerId(c);
+    const added = await addIssueAssignees(c.env.DB, found, issue, assignees, { id: doerId, isAdmin: c.get("authUser")?.is_admin === true });
     const reloaded = (await findIssueByRepoAndIndex(c.env.DB, found.repo.id, issue.index)) ?? issue;
     for (const user of added) {
       await emitAssignEvent(c, found, reloaded, user, false);
     }
+    await notifyAssigneeMail(c, reloaded, added, doerId, false);
     return c.json(await toApiIssueWithAssignees(c.env.DB, viewer, found, reloaded), 201);
   });
 
@@ -1120,6 +1199,9 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
   // twin: assigned users drop with the type-9 removal comment; 200.
   // Webhook: one `unassigned` event per actually-removed assignee
   // (IssueChangeAssignee:161 with removed=true, post-write).
+  // Mail: the RemoveAssignees arm (assignee.go:281) — upstream dispatches
+  // the removal event too and the MAIL receiver self-gates it off
+  // (notify.go:121's `!removed`); mirrored via notifyAssigneeMail.
   // -------------------------------------------------------------------------
   app.openapi(removeAssigneesRoute(requireAuth), async (c) => {
     const { viewer, found, units } = await requireVisibleRepoPair(c, c.req.valid("param"));
@@ -1128,11 +1210,13 @@ export function registerIssueTablesT2Routes(app: OpenAPIHono<ApiEnv>, requireAut
     await assertIssueWriter(c, found);
     const names = c.req.valid("json").assignees ?? [];
     const assignees = await resolveAssigneesByName(c.env.DB, names);
-    const removed = await removeIssueAssignees(c.env.DB, issue, assignees, requireDoerId(c));
+    const doerId = requireDoerId(c);
+    const removed = await removeIssueAssignees(c.env.DB, issue, assignees, doerId);
     const reloaded = (await findIssueByRepoAndIndex(c.env.DB, found.repo.id, issue.index)) ?? issue;
     for (const user of removed) {
       await emitAssignEvent(c, found, reloaded, user, true);
     }
+    await notifyAssigneeMail(c, reloaded, removed, doerId, true);
     return c.json(await toApiIssueWithAssignees(c.env.DB, viewer, found, reloaded), 200);
   });
 

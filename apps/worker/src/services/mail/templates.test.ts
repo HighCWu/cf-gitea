@@ -14,6 +14,7 @@ import {
   escapeHtml,
   issueActionCloseLine,
   issueActionNewLine,
+  issueActionMergeLine,
   issueActionReadyForReviewLine,
   issueActionReopenLine,
   registerNotifySubject,
@@ -244,6 +245,17 @@ describe("issueActionReadyForReviewLine (mail.issue.action.ready_for_review)", (
   it("'<b>%[1]s</b> marked this pull request ready for review.' — no index argument", () => {
     expect(issueActionReadyForReviewLine("user2 (Mister X)")).toBe(
       "<b>user2 (Mister X)</b> marked this pull request ready for review.",
+    );
+  });
+});
+
+describe("issueActionMergeLine (mail.issue.action.merge — the MergePullRequest arm)", () => {
+  it("'<b>%[1]s</b> merged #%[2]d into %[3]s.' — the base branch escapes like the display name (TrHTML plain-string args)", () => {
+    expect(issueActionMergeLine("user2 (Mister X)", 7, "main")).toBe(
+      "<b>user2 (Mister X)</b> merged #7 into main.",
+    );
+    expect(issueActionMergeLine("user2", 7, 'rel<"1">&x')).toBe(
+      "<b>user2</b> merged #7 into rel&lt;&quot;1&quot;&gt;&amp;x.",
     );
   });
 });

@@ -24,6 +24,7 @@ import { OpenAPIHono } from "@hono/zod-openapi";
 
 import {
   comments,
+  emailOutbox,
   issueAssignees,
   issueDependencies,
   issuePins,
@@ -36,6 +37,7 @@ import {
   webhookDeliveries,
   webhooks,
 } from "../../db/schema";
+import { CommentType } from "../../issues/comment-types";
 import {
   STUB_USER,
   createOptionalTokenAuthMiddleware,
@@ -108,11 +110,15 @@ function resolver(): AuthResolver {
 }
 
 function familyApp(register: (app: OpenAPIHono<ApiEnv>) => void) {
+  return familyAppWithBindings(register, env);
+}
+
+function familyAppWithBindings(register: (app: OpenAPIHono<ApiEnv>) => void, bindings: ApiEnv["Bindings"]) {
   const app = new OpenAPIHono<ApiEnv>();
   app.onError(giteaErrorHandler);
   register(app);
   return async (path: string, init?: RequestInit): Promise<Response> =>
-    Promise.resolve(app.fetch(new Request(`https://example.com${path}`, init), env));
+    Promise.resolve(app.fetch(new Request(`https://example.com${path}`, init), bindings));
 }
 
 const authed = (init?: RequestInit, token = TOKEN): RequestInit => {
@@ -131,6 +137,19 @@ const send = familyApp((app) =>
   registerIssueTablesT2Routes(app, createTokenAuthMiddleware(resolver()), createOptionalTokenAuthMiddleware(resolver())),
 );
 
+/** The mail-armed mount — the same router over the merged bindings with the
+ *  MAIL_* vars armed (the register-notify.test.ts env-merge shape; the
+ *  shipped env carries MAIL_ENABLED="false", so the unarmed `send` above is
+ *  the fold's own fail-closed control). */
+const sendArmed = familyAppWithBindings((app) =>
+  registerIssueTablesT2Routes(app, createTokenAuthMiddleware(resolver()), createOptionalTokenAuthMiddleware(resolver())),
+  Object.assign({}, env, {
+    MAIL_ENABLED: "true",
+    MAIL_PROVIDER: "dummy",
+    MAIL_FROM: "Gitea <noreply@example.com>",
+  }),
+);
+
 beforeAll(async () => {
   if (env.TEST_MIGRATIONS === undefined) {
     throw new Error("TEST_MIGRATIONS binding missing — vitest.config.ts must inject readD1Migrations()");
@@ -142,6 +161,7 @@ beforeAll(async () => {
 beforeEach(async () => {
   ownerIsAdmin = false;
   for (const table of [
+    "email_outbox",
     "webhook_deliveries",
     "webhooks",
     "reactions",
@@ -506,6 +526,76 @@ describe("assignee webhook emissions (issueAddAssignees / issueRemoveAssignees)"
     // A pull_request_assign-subscribed hook never sees issue_assign traffic.
     expect(await deliveriesFor(issuesHook)).toHaveLength(0);
     expect(await drizzle(env.DB).select().from(webhookDeliveries).all()).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The assignees trio's MAIL arms — the same notify position upstream's
+// AddAssignees/RemoveAssignees hold (services/issue/assignee.go:242/:281)
+// fanned to the mail notifier beside the webhook emitter above: each
+// actually-changed assignee's type-9 comment feeds the landed
+// notifyIssueAssigneeChanged receiver (services/mailer/notify.go:119-127).
+// The shipped unarmed posture is the sibling mounts' own control.
+// ---------------------------------------------------------------------------
+
+describe("the assignees trio's mail arms (notifyIssueAssigneeChanged, SPEC §12.5)", () => {
+  const ASSIGNEES_PATH = (index: number) => `/repos/cf-gitea-stub/writes/issues/${index}/assignees`;
+
+  /** Two MAILABLE assignees (real addresses — isMailable gates on it) on the
+   *  public repo (CanBeAssigned reads true for everyone there). */
+  async function seedMailers(): Promise<number[]> {
+    const rows = await drizzle(env.DB)
+      .insert(users)
+      .values([
+        { username: "mailer1", usernameLower: "mailer1", email: "m1@example.com", status: "active", type: "user", createdAt: NOW },
+        { username: "mailer2", usernameLower: "mailer2", email: "m2@example.com", status: "active", type: "user", createdAt: NOW },
+      ])
+      .returning({ id: users.id });
+    return rows.map((row) => row.id);
+  }
+
+  it("POST lands one issue-assigned row per added assignee — the type-9 anchor/Message-ID, 'issue assigned' info, the comment dedupe", async () => {
+    const [id1, id2] = await seedMailers();
+    const res = await sendArmed(ASSIGNEES_PATH(issueA.index), authed(jsonBody({ assignees: ["mailer1", "mailer2"] })));
+    expect(res.status).toBe(201);
+    const rows = await drizzle(env.DB).select().from(emailOutbox).orderBy(asc(emailOutbox.id)).all();
+    expect(rows.map((row) => row.toAddr)).toEqual(["m1@example.com", "m2@example.com"]);
+    // The per-toggle type-9 comments — the mail's anchor, Message-ID extra
+    // and dedupe key all key on them (upstream composes FROM the comment,
+    // mail_issue.go:214-222).
+    const toggles = await systemComments(issueA.id, CommentType.Assignees);
+    expect(toggles).toHaveLength(2);
+    const domain = new URL(env.APP_URL).host;
+    for (const [i, row] of rows.entries()) {
+      const comment = toggles[i]!;
+      expect(row.info).toContain(", issue assigned");
+      expect(row.dedupeKey).toBe(`issue-assigned:${comment.id}:${[id1, id2][i]}`);
+      const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+      expect(headers["Message-ID"]).toBe(`<cf-gitea-stub/writes/issues/${issueA.index}/comment/${comment.id}@${domain}>`);
+      expect(row.bodyHtml).toContain(`assigned you to issue <a href='`);
+    }
+  });
+
+  it("DELETE rides along and the receiver self-gates removals — zero rows (notify.go:121's !removed)", async () => {
+    await seedMailers();
+    // The ADD rides the UNARMED mount (the shipped posture — no rows), so the
+    // DELETE's silence is attributable to the removal arm alone.
+    expect((await send(ASSIGNEES_PATH(issueA.index), authed(jsonBody({ assignees: ["mailer1"] })))).status).toBe(201);
+    expect(await drizzle(env.DB).select().from(emailOutbox).all()).toHaveLength(0);
+    expect((await sendArmed(ASSIGNEES_PATH(issueA.index), authed(jsonBody({ assignees: ["mailer1"] }, "DELETE")))).status).toBe(200);
+    expect(await drizzle(env.DB).select().from(emailOutbox).all()).toHaveLength(0);
+  });
+
+  it("a no-op re-add lands nothing new; the unarmed posture (MAIL off) is the fold's fail-closed control", async () => {
+    await seedMailers();
+    expect((await sendArmed(ASSIGNEES_PATH(issueA.index), authed(jsonBody({ assignees: ["mailer1"] })))).status).toBe(201);
+    expect((await drizzle(env.DB).select().from(emailOutbox).all()).map((r) => r.toAddr)).toEqual(["m1@example.com"]);
+    // Already-assigned → AddAssigneeIfNotAssigned skips: no comment, no row.
+    expect((await sendArmed(ASSIGNEES_PATH(issueA.index), authed(jsonBody({ assignees: ["mailer1"] })))).status).toBe(201);
+    expect(await drizzle(env.DB).select().from(emailOutbox).all()).toHaveLength(1);
+    // The shipped unarmed mount (MAIL_ENABLED="false") arms nothing.
+    expect((await send(ASSIGNEES_PATH(issueA.index), authed(jsonBody({ assignees: ["mailer2"] })))).status).toBe(201);
+    expect((await drizzle(env.DB).select().from(emailOutbox).all()).map((r) => r.toAddr)).toEqual(["m1@example.com"]);
   });
 });
 

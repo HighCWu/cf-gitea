@@ -17,12 +17,13 @@ import { drizzle } from "drizzle-orm/d1";
 import type { Context } from "hono";
 import type { MergeabilityStatus, MergeStyle, Person, RebaseOutcome } from "@cf-gitea/git-engine";
 
-import { PRFlow, PRStatus, issues, pullRequests } from "../../db/schema";
+import { PRFlow, PRStatus, issues, pullRequests, users } from "../../db/schema";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { CommentType } from "../../issues/comment-types";
 import { IssuesService } from "../../issues/service";
 import type { ApiEnv } from "../env";
 import { ApiError } from "../errors";
+import { notifyMergePullRequest } from "../../services/mail/notify";
 import { carryLooseRefs, type CarrySource, type CarryTarget } from "../../repos/carry";
 import { canUserDelete, findRule, parseRuleConfig, principalAccessOf } from "../../services/branch-protection";
 import {
@@ -562,14 +563,18 @@ export async function mergePullRequest(
   // D1 landing: mark merged + close the issue with the merge_pull (28)
   // system comment (§3.4). The close runs first (it owns the repo counters
   // and the system comment inside one batch); the PR row update is guarded
-  // by has_merged=0 so a racing merge wins.
+  // by has_merged=0 so a racing merge wins. The close service stays BARE —
+  // no mail env: upstream's merge close is the MODEL-level SetIssueAsClosed
+  // (services/pull/merge.go:838 — no notify fires from it; the merge's only
+  // mail is MergePullRequest below, never IssueChangeStatus's close).
   const service = new IssuesService(c.env.DB);
+  let mergedIssue = issue;
   try {
-    await service.closeIssue(issue.id, { actorId: opts.doerId, commentType: CommentType.MergePull, now: opts.now });
+    mergedIssue = await service.closeIssue(issue.id, { actorId: opts.doerId, commentType: CommentType.MergePull, now: opts.now });
   } catch {
     // already closed (upstream tolerates the closed state on merge)
   }
-  await drizzle(c.env.DB)
+  const merged = await drizzle(c.env.DB)
     .update(pullRequests)
     .set({
       hasMerged: true,
@@ -578,9 +583,48 @@ export async function mergePullRequest(
       mergedAt: opts.now,
       status: PRStatus.Mergeable,
     })
-    .where(and(eq(pullRequests.id, pr.id), eq(pullRequests.hasMerged, false)));
+    .where(and(eq(pullRequests.id, pr.id), eq(pullRequests.hasMerged, false)))
+    .returning({ id: pullRequests.id });
+
+  // The winning-merge mail arm — upstream's markAsMergedPostProcess
+  // (services/pull/merge.go:385-412): the MergePullRequest receiver fires
+  // ONLY for the landing winner (the CAS `cnt != 1 → ErrIssueAlreadyChanged`
+  // guard at :848-852 — a loser must not mail) and carries the RELOADED
+  // closed issue. Best-effort, never throws: the merge has already landed,
+  // exactly like upstream logs notify errors past the merge (:865-867).
+  if (merged.length > 0) {
+    await notifyMailMergePullRequest(c.env, mergedIssue, opts.doerId, pr.baseBranch, opts.now);
+  }
 
   return { commitOid };
+}
+
+/**
+ * The emit site's best-effort wrapper — loads the merger (upstream passes
+ * the `merger` user to markAsMergedPostProcess, merge.go:863) and hands the
+ * arm to the notify hub (notifyMergePullRequest — services/mailer/notify.go:
+ * 138-146). Failures log; the merge stays committed.
+ */
+async function notifyMailMergePullRequest(
+  env: ApiEnv["Bindings"],
+  issue: IssueRow,
+  doerId: number,
+  baseBranch: string,
+  now: Date,
+): Promise<void> {
+  try {
+    const doer = (await drizzle(env.DB).select().from(users).where(eq(users.id, doerId)).get()) ?? null;
+    if (doer === null) {
+      console.error(`[pull-engine] merge notify skipped: doer row missing [id: ${doerId}]`);
+      return;
+    }
+    const outcome = await notifyMergePullRequest(env, { issue, doer, baseBranch }, { now });
+    if (outcome.outcome === "enqueued" && outcome.enqueue.some((e) => e.outcome === "pending-unqueued")) {
+      console.warn(`[pull-engine] merge notify: some rows stayed pending-unqueued (issue ${issue.id})`);
+    }
+  } catch (error) {
+    console.error(`[pull-engine] merge notify failed (issue ${issue.id}): ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 /**
