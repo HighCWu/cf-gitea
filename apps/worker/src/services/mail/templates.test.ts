@@ -12,11 +12,14 @@ import {
   displayNameWithFullName,
   dotEscape,
   escapeHtml,
+  issueActionApproveLine,
   issueActionCloseLine,
   issueActionNewLine,
   issueActionMergeLine,
   issueActionReadyForReviewLine,
+  issueActionRejectLine,
   issueActionReopenLine,
+  issueActionReviewLine,
   registerNotifySubject,
   renderIssueActionMail,
   renderIssueAssignedMail,
@@ -314,5 +317,62 @@ describe("renderIssueAssignedMail (assigned.tmpl layout)", () => {
     expect(hostile).toContain("<a href='https://x.example/o/r/issues/1?a=1&amp;b=2#issuecomment-9'>");
     expect(hostile).toContain(">o/r &amp; co</a>");
     expect(hostile).not.toContain("<b>user2</b> assigned");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The review family's render pieces (SPEC §14.6): the verdict action lines
+// (actionToTemplate's CommentTypeReview branch) + the IsMention batch line
+// (default.tmpl's x_mentioned_you if above the <p> block).
+// ---------------------------------------------------------------------------
+
+describe("the review verdict lines (mail.issue.action.approve|reject|review)", () => {
+  it("pins the three locale lines verbatim, the display name escaped", () => {
+    expect(issueActionApproveLine("user2")).toBe("<b>user2</b> approved this pull request.");
+    expect(issueActionRejectLine("user2")).toBe("<b>user2</b> requested changes on this pull request.");
+    expect(issueActionReviewLine("user2")).toBe("<b>user2</b> commented on this pull request.");
+    expect(issueActionApproveLine('<b>Eve</b>')).toBe("<b>&lt;b&gt;Eve&lt;/b&gt;</b> approved this pull request.");
+  });
+
+  it("the approve arm renders the line ALWAYS (empty or kept body) — default.tmpl's first action chain", () => {
+    const base = {
+      subject: "Re: [user2/repo1] issue1 (#1)",
+      link: "https://x.example/user2/repo1/pulls/1",
+      issueIndex: 1,
+      appName: "Gitea",
+      appUrl: "https://x.example/",
+    };
+    // Kept body: the line + body shape (the ready_for_review twin's).
+    const withBody = renderIssueActionMail({ ...base, actionName: "approve", bodyHtml: "<p>lgtm</p>\n", actionLineHtml: issueActionApproveLine("user2") });
+    expect(withBody).toContain("\t<p>\n\t\t\n\t\t\t<b>user2</b> approved this pull request.\n\t\t\n\t\t\t<p>lgtm</p>\n\n\t\t</p>");
+    // Empty body: the line + the empty-body branch.
+    const noBody = renderIssueActionMail({ ...base, actionName: "reject", bodyHtml: "", actionLineHtml: issueActionRejectLine("user2") });
+    expect(noBody).toContain("\t<p>\n\t\t\n\t\t\t<b>user2</b> requested changes on this pull request.\n\t\t\n\t\t\t\n\t\t</p>");
+  });
+});
+
+describe("the IsMention line (mail.issue.x_mentioned_you — default.tmpl's first body line)", () => {
+  const base = {
+    subject: "Re: [user2/repo1] issue1 (#1)",
+    actionName: "comment" as const,
+    bodyHtml: "<p>look here</p>\n",
+    actionLineHtml: null,
+    link: "https://x.example/user2/repo1/pulls/1#issuecomment-9",
+    issueIndex: 1,
+    appName: "Gitea",
+    appUrl: "https://x.example/",
+  };
+
+  it("isMention renders the locale line on the first tab line — .Doer.Name RAW, escaped", () => {
+    const html = renderIssueActionMail({ ...base, isMention: true, doerName: "doer" });
+    expect(html).toContain("<body>\n\t<p><b>doer</b> mentioned you:</p>\n\t\n\t<p>");
+    const hostile = renderIssueActionMail({ ...base, isMention: true, doerName: "<script>" });
+    expect(hostile).toContain("<p><b>&lt;script&gt;</b> mentioned you:</p>");
+  });
+
+  it("absent (the pre-fold default) leaves the bare tab line — byte-identical to every landed arm", () => {
+    const html = renderIssueActionMail(base);
+    expect(html).toContain("<body>\n\t\n\t\n\t<p>");
+    expect(html).not.toContain("mentioned you");
   });
 });

@@ -16,33 +16,48 @@
  *     REQUEST-row-only removal, the restoreLatestOfficialReview quirk
  *     (:806–820), the removal comment.
  *
- * MAIL SEAM (the next wave rides this; this wave emits nothing): upstream
- * fires the family's mail receivers from the model/service layer AFTER the
- * writes commit, never the router —
+ * MAIL ARMS (the §14.6 receivers, LANDED): upstream fires the family's
+ * mail receivers from the model/service layer AFTER the writes commit,
+ * never the router —
  *   - `PullRequestReview` (services/mailer/notify.go:98–111) from
  *     SubmitReview (services/pull/review.go:316) over the review's type-22
- *     comment thread,
+ *     comment,
  *   - `PullRequestCodeComment` (notify.go:113–117, the MailMentionsComment
- *     mention resolution) from the same SubmitReview body (:323–331) over
- *     the submitted review's attached code comments,
+ *     mention resolution) from the same SubmitReview body (:323–331) per
+ *     code comment attached to the submitted review,
  *   - `PullRequestReviewRequest` (notify.go:129–136, SendIssueAssignedMail
  *     "Requested to review <htmlurl>.") from the request model arm
- *     (services/issue/review_request.go:38 — `comment != nil`).
- * The marked SEAM comments below name each firing point; the constructor's
- * optional env (the IssuesService threading — routes pass `c.env`) arms
- * them. Absent env = arms off, the same fail-closed posture as
- * MAIL_ENABLED != "true", so today's callers are untouched.
+ *     (services/issue/review_request.go:38 — `comment != nil`; the removal
+ *     reaches the receiver and is self-gated off `!isRequest`,
+ *     notify.go:130–131).
+ * The emit rides the constructor's optional env (the IssuesService
+ * threading — routes pass `c.env`): absent env = the notify half is off
+ * (the same fail-closed posture as MAIL_ENABLED != "true"), while the
+ * mentions resolve + carrier persist stay UNCONDITIONAL exactly like the
+ * landed IssuesService emit positions (§13 — upstream runs
+ * FindAndUpdateIssueMentions with no mailer). Failures are logged, never
+ * propagated: the writes above stay committed. The org TEAM-request arm is
+ * NOT here — upstream's team arm notifies through teamReviewRequestNotify
+ * (services/issue/review_request.go:233) from the ROUTE block where the
+ * team request is created (this service carries only the USER cores).
  */
 
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import type { DrizzleD1Database } from "drizzle-orm/d1";
 
-import { ReviewType, comments, issues, pullReviews, teamMembers } from "../../db/schema";
+import { ReviewType, comments, issues, pullReviews, teamMembers, users } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { findRule, isUserOfficialReviewer, parseRuleConfig, principalAccessOfRow } from "../../services/branch-protection";
-import type { MailNotifyEnv } from "../../services/mail/notify";
+import {
+  notifyPullRequestCodeComment,
+  notifyPullRequestReview,
+  notifyPullRequestReviewRequest,
+  type MailNotifyEnv,
+} from "../../services/mail/notify";
+import { updateIssueMentions } from "../../services/mentions/carrier";
+import { findIssueMentions } from "../../services/mentions/service";
 import { ApiError } from "../errors";
 import type { RepositoryWithOwner, UserRow } from "./repository";
 
@@ -128,10 +143,12 @@ export class PullReviewsService {
    * from SubmitReview, services/pull/review.go:316/:323–331),
    * `addReviewRequest`/`removeReviewRequest` the PullRequestReviewRequest
    * one (review_request.go:38) — notify fires from the model layer, never
-   * the router. THE RECEIVERS ARE THE NEXT WAVE: this wave threads the env
-   * only (the SEAM comments below mark each firing point), so every existing
-   * construction site's posture stays byte-identical. Absent (or armed) the
-   * writes below are identical — the arms are additive-only over this seam.
+   * the router. The receivers are LANDED (§14.6's arms): an armed env
+   * emits; an absent env keeps every existing construction site's
+   * fail-closed posture (and the mentions resolve + carrier persist run
+   * unconditionally either way, the IssuesService §13 discipline). The
+   * writes below are identical in both postures — the arms are additive-only
+   * over this seam.
    */
   private readonly mailEnv?: MailNotifyEnv;
 
@@ -275,8 +292,10 @@ export class PullReviewsService {
     }
 
     // The CommentTypeReview (22) system comment (:551–563) — the local
-    // num_comments discipline bumps alongside every inserted comment.
-    await db.batch([
+    // num_comments discipline bumps alongside every inserted comment. The
+    // insert RETURNS its row: the mail arms compose over it (the anchor,
+    // Message-ID and content carrier — upstream's `comm`).
+    const [commentRows] = await db.batch([
       db.insert(comments).values({
         type: CommentType.Review,
         posterId: doerId,
@@ -285,9 +304,10 @@ export class PullReviewsService {
         reviewId: review.id,
         createdAt: now,
         updatedAt: now,
-      }),
+      }).returning(),
       db.update(issues).set({ numComments: sql`num_comments + 1`, updatedAt: now }).where(eq(issues.id, issue.id)),
     ]);
+    const reviewComment = commentRows[0]!;
 
     // Team-request cleanup on an org-owned repo (:563–584): an approve/reject
     // by a team member clears that team's REQUEST row.
@@ -315,19 +335,96 @@ export class PullReviewsService {
       }
     }
 
-    // SEAM (next wave — PullRequestReview, services/mailer/notify.go:98–111):
-    // upstream fires it HERE, after the writes commit (SubmitReview
-    // services/pull/review.go:316, over the type-22 comment `comm` this
-    // method just landed + the doer's resolved mentions). The receiver
-    // composes over the review's type-22/23/24/25 thread through the landed
-    // hub core (§14.6); `this.mailEnv` arms it, absent = off.
-    // SEAM (next wave — PullRequestCodeComment, notify.go:113–117): fired in
-    // the SAME upstream body (:323–331) per code comment attached to the
-    // submitted review — read this review's CommentType.Code rows and fan
-    // the MailMentionsComment mention resolution (the parser half is landed,
-    // §13). `this.mailEnv` arms it, absent = off.
+    // THE FIRING POINT (SubmitReview services/pull/review.go:310–331): the
+    // type-22 comment's mentions + PullRequestReview, then per attached
+    // code comment PullRequestCodeComment — both from ONE upstream body.
+    await this.emitReviewMail(found, issue, input.doerRow, review, reviewComment);
 
     return review;
+  }
+
+  /**
+   * The review-submission emit — upstream SubmitReview's tail
+   * (services/pull/review.go:310–331): `FindAndUpdateIssueMentions` over
+   * the type-22 comment's content, `notify.PullRequestReview`, then per
+   * code comment attached to the submitted review a fresh
+   * `FindAndUpdateIssueMentions` + `notify.PullRequestCodeComment`
+   * (:323–331). The mentions resolve + carrier persist run UNCONDITIONALLY
+   * (the IssuesService §13 posture — upstream runs FindAndUpdateIssueMentions
+   * with no mailer; the carrier feeds reads that work without one); the
+   * notify half is gated on the constructor's env. Best-effort, never
+   * throws — a failure logs and the writes above stay committed (the
+   * receiver posture, notify.go:102-110's log-and-return).
+   */
+  private async emitReviewMail(
+    found: RepositoryWithOwner,
+    issue: IssueRow,
+    doerRow: UserRow | null,
+    review: ReviewRow,
+    reviewComment: typeof comments.$inferSelect,
+  ): Promise<void> {
+    if (doerRow === null) {
+      // The cores tolerate a null doer row (the official predicate treats it
+      // as not-official); the mail has no upstream shape without the doer —
+      // log and skip, like the hub's missing-row degradations.
+      console.error(`[pull-reviews] review mail skipped: doer row missing [id: ${review.reviewerId}]`);
+      return;
+    }
+    try {
+      // FindAndUpdateIssueMentions over comm.Content (review.go:310–314):
+      // parse + visibility resolve (services/mentions) + the issue_user
+      // carrier upsert.
+      const mentions = await findIssueMentions(this.d1, {
+        repo: found.repo,
+        issue,
+        doer: doerRow,
+        content: reviewComment.content ?? "",
+      });
+      if (mentions.length > 0) {
+        await updateIssueMentions(this.d1, issue.id, mentions);
+      }
+      if (this.mailEnv !== undefined) {
+        await notifyPullRequestReview(this.mailEnv, {
+          issue,
+          comment: reviewComment,
+          reviewType: review.type,
+          doer: doerRow,
+          mentions,
+        });
+      }
+      // Per attached code comment (:323–331): the review's CommentType.Code
+      // rows (the pending-review comments this submission converted — they
+      // keep the review's id), each with its OWN mentions resolution.
+      const codeComments = await this.db
+        .select()
+        .from(comments)
+        .where(and(eq(comments.issueId, issue.id), eq(comments.reviewId, review.id), eq(comments.type, CommentType.Code)))
+        .orderBy(comments.id)
+        .all();
+      for (const codeComment of codeComments) {
+        const codeMentions = await findIssueMentions(this.d1, {
+          repo: found.repo,
+          issue,
+          doer: doerRow,
+          content: codeComment.content ?? "",
+        });
+        if (codeMentions.length > 0) {
+          await updateIssueMentions(this.d1, issue.id, codeMentions);
+        }
+        if (this.mailEnv !== undefined) {
+          await notifyPullRequestCodeComment(this.mailEnv, {
+            issue,
+            comment: codeComment,
+            doer: doerRow,
+            mentions: codeMentions,
+          });
+        }
+      }
+    } catch (error) {
+      console.error(
+        `[pull-reviews] review mail failed (review ${review.id}): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   /**
@@ -374,7 +471,9 @@ export class PullReviewsService {
       .all();
     const review = inserted[0]!;
 
-    await db.batch([
+    // The type-27 comment RETURNS its row — the mail arm composes over it
+    // (upstream's `comment`, review_request.go:38).
+    const [commentRows] = await db.batch([
       db.insert(comments).values({
         type: CommentType.ReviewRequest,
         posterId: doerId,
@@ -384,19 +483,48 @@ export class PullReviewsService {
         reviewId: review.id,
         createdAt: now,
         updatedAt: now,
-      }),
+      }).returning(),
       db.update(issues).set({ numComments: sql`num_comments + 1`, updatedAt: now }).where(eq(issues.id, issue.id)),
     ]);
+    const requestComment = commentRows[0]!;
 
-    // SEAM (next wave — PullRequestReviewRequest, services/mailer/
-    // notify.go:129–136): upstream fires it HERE for the USER request, after
-    // the comment lands (services/issue/review_request.go:38 — `comment !=
-    // nil`), SendIssueAssignedMail over `{ActionType: 0, Content: "Requested
-    // to review <htmlurl>.", Comment: <this type-27 row>}` to the reviewer —
-    // the notifyIssueAssigneeChanged shape with the review-request `ct`.
-    // `this.mailEnv` arms it, absent = off.
+    // THE FIRING POINT (services/issue/review_request.go:36-39): `comment !=
+    // nil` → notify.PullRequestReviewRequest — SendIssueAssignedMail's
+    // "Requested to review <htmlurl>." to the reviewer (notify.go:129-136).
+    await this.emitReviewRequestMail(issue, doerId, reviewer, requestComment, true);
 
     return review;
+  }
+
+  /**
+   * The reviewer-request emit — upstream ReviewRequest's tail
+   * (services/issue/review_request.go:36-39): whenever the model returned a
+   * comment (add AND remove), `notify.PullRequestReviewRequest` fires and
+   * the RECEIVER gates (notify.go:130-131): only the add mails, never to
+   * self, never a disabled preference — the removal lands here with
+   * `isRequest=false` and the receiver self-gates it off, upstream-shaped.
+   * Best-effort, never throws (the writes stay committed).
+   */
+  private async emitReviewRequestMail(
+    issue: IssueRow,
+    doerId: number,
+    reviewer: UserRow,
+    comment: typeof comments.$inferSelect,
+    isRequest: boolean,
+  ): Promise<void> {
+    if (this.mailEnv === undefined) return;
+    try {
+      const doer = (await this.db.select().from(users).where(eq(users.id, doerId)).get()) ?? null;
+      if (doer === null) {
+        console.error(`[pull-reviews] review-request mail skipped: doer row missing [id: ${doerId}]`);
+        return;
+      }
+      await notifyPullRequestReviewRequest(this.mailEnv, { issue, comment, doer, reviewer, isRequest });
+    } catch (error) {
+      console.error(
+        `[pull-reviews] review-request mail failed (issue ${issue.id}, reviewer ${reviewer.id}): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   /**
@@ -430,7 +558,9 @@ export class PullReviewsService {
       }
     }
 
-    await db.batch([
+    // The removal comment RETURNS its row — the firing point composes over
+    // it (upstream's `comment`, review_request.go:38).
+    const [commentRows] = await db.batch([
       db.insert(comments).values({
         type: CommentType.ReviewRequest,
         posterId: doerId,
@@ -439,16 +569,16 @@ export class PullReviewsService {
         removedAssignee: 1,
         createdAt: now,
         updatedAt: now,
-      }),
+      }).returning(),
       db.update(issues).set({ numComments: sql`num_comments + 1`, updatedAt: now }).where(eq(issues.id, issue.id)),
     ]);
+    const removalComment = commentRows[0]!;
 
-    // SEAM (next wave — PullRequestReviewRequest, services/mailer/
-    // notify.go:129–136): upstream fires it HERE for the USER removal, when
-    // the comment landed (review_request.go:38 `comment != nil`; the silent
-    // no-op above returns before any of this) — the receiver self-gates the
-    // removal off (notify.go:132 `!isRequest`, the IssueChangeAssignee
-    // twin's posture). `this.mailEnv` arms it, absent = off.
+    // THE FIRING POINT (services/issue/review_request.go:36-39): the removal
+    // lands here with `isRequest=false` — the receiver self-gates it off
+    // (notify.go:130-131), upstream-shaped; the silent no-op above returned
+    // before any of this (upstream's comment == nil arm).
+    await this.emitReviewRequestMail(issue, doerId, reviewer, removalComment, false);
 
     return true;
   }

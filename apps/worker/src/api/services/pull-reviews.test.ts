@@ -24,7 +24,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { CommentType } from "../../issues/comment-types";
 import { IssuesService } from "../../issues/service";
-import { ReviewType, comments, emailOutbox, issues, pullRequests, pullReviews, repositories, teamMembers, teams, users } from "../../db/schema";
+import { ReviewType, comments, emailOutbox, issueUsers, issues, pullRequests, pullReviews, repositories, teamMembers, teams, users } from "../../db/schema";
 import type { RepositoryWithOwner, UserRow } from "./repository";
 import { ContentEmptyError, PullReviewsService, currentPendingReview, latestDecisionReview } from "./pull-reviews";
 
@@ -46,6 +46,7 @@ beforeEach(async () => {
     "pull_reviews",
     "comments",
     "email_outbox",
+    "issue_user",
     "team_members",
     "teams",
     "issue_labels",
@@ -77,10 +78,38 @@ beforeEach(async () => {
 const db = () => drizzle(env.DB);
 const service = () => new IssuesService(env.DB);
 const bare = () => new PullReviewsService(env.DB); // the no-env posture (today's callers)
+
+/** Recording Queue — counts sends AND captures every body (the notify
+ *  suite's shape; the armed seam's REPO_TASKS). */
+function spyQueue(): Queue & { sends: number; sendBodies: unknown[] } {
+  const metadata = { metrics: { backlogCount: 0, backlogBytes: 0 } };
+  const queue = {
+    sends: 0,
+    sendBodies: [] as unknown[],
+    send: (body: unknown) => {
+      queue.sends += 1;
+      queue.sendBodies.push(body);
+      return Promise.resolve({ metadata });
+    },
+    sendBatch: (messages: MessageSendRequest[]) => {
+      queue.sends += messages.length;
+      for (const m of messages) queue.sendBodies.push(m.body);
+      return Promise.resolve({ metadata });
+    },
+    metrics: () => Promise.resolve(metadata.metrics),
+  };
+  return queue;
+}
 const armed = () =>
   // The route posture (`new PullReviewsService(c.env.DB, c.env)` with the
-  // MAIL_* vars armed) — the seam's env, threaded but receiver-less.
-  new PullReviewsService(env.DB, { DB: env.DB, MAIL_ENABLED: "true", MAIL_FROM: "gitea@tests.invalid" });
+  // MAIL_* vars armed) — the seam's env, the §14.6 receivers LIVE over it.
+  new PullReviewsService(env.DB, {
+    DB: env.DB,
+    REPO_TASKS: spyQueue(),
+    APP_URL: "https://mail.example",
+    MAIL_ENABLED: "true",
+    MAIL_FROM: "gitea@tests.invalid",
+  });
 
 let repoSeq = 4200;
 
@@ -529,16 +558,32 @@ describe("PullReviewsService.removeReviewRequest", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The mail seam — threaded but silent (this wave emits NOTHING; the three
-// receivers fire in the next wave over the constructor's env)
+// The mail seam — the §14.6 receivers LANDED: an ARMED constructor emits the
+// review family over the constructor's env (the IssuesService posture), the
+// mentions resolve + carrier persist run even BARE (unconditional, §13 —
+// upstream runs FindAndUpdateIssueMentions with no mailer), and the bare
+// constructor keeps its fail-closed silence.
 // ---------------------------------------------------------------------------
 
-describe("the mail seam (§14.6) — env threaded, arms absent", () => {
-  it("an armed env constructor performs byte-identical writes and lands ZERO outbox rows", async () => {
+describe("the mail seam (§14.6) — the armed emits, the bare silence", () => {
+  /** The fixture users need deliverable addresses for the mailable filter. */
+  async function giveEmails(...ids: number[]) {
+    for (const id of ids) {
+      await env.DB.prepare("UPDATE users SET email = ? WHERE id = ?")
+        .bind(`user${id}@example.com`, id)
+        .run();
+    }
+  }
+
+  async function outboxRows() {
+    return db().select().from(emailOutbox).all();
+  }
+
+  it("armed submitReview emits the PullRequestReview mail beside byte-identical writes (the funnel: the poster receives, the doer is excluded)", async () => {
     const repoId = await seedRepo(OWNER);
-    const { issue, pullRequest } = await seedPull(repoId);
+    const { issue } = await seedPull(repoId);
     const found = await foundOf(repoId);
-    const reviewer = await userRow(REVIEWER);
+    await giveEmails(OWNER, REVIEWER);
 
     const review = await armed().submitReview(found, {
       doerId: OWNER,
@@ -546,27 +591,121 @@ describe("the mail seam (§14.6) — env threaded, arms absent", () => {
       issue,
       baseBranch: "main",
       reviewType: ReviewType.Approve,
-      content: "armed-seam approve",
+      content: "lgtm @bob", // the mention resolves + persists BEFORE the notify half
       commitId: "abc123",
     });
-    const request = await armed().addReviewRequest(found, issue, pullRequest, reviewer, DOER);
-    const removed = await armed().removeReviewRequest(found, issue, "main", reviewer, DOER);
 
-    expect(review.official).toBe(true);
-    expect(request).not.toBeNull();
-    expect(removed).toBe(true);
-    // The write side-effects are identical to the bare constructor's:
-    expect((await commentRows(issue.id)).map((row) => row.type).sort()).toEqual(
-      [CommentType.Review, CommentType.ReviewRequest, CommentType.ReviewRequest].sort(),
-    );
-    // ...and the seam is SILENT this wave — no mail ever lands.
-    expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
+    expect(review.official).toBe(true); // the writes are unchanged
+    expect((await commentRows(issue.id)).map((row) => row.type)).toEqual([CommentType.Review]);
+    expect(await numCommentsOf(issue.id)).toBe(1);
+    // The review mail: ONE row to the PR poster (repo has no watchers;
+    // the mention rides first but the doer-alice is excluded either way).
+    const rows = await outboxRows();
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.toAddr).toBe("user2@example.com");
+    expect(row.subject).toBe(`Re: [alice/visible] reviewable change (#${issue.index})`);
+    expect(row.dedupeKey).toBe(`pull-review:${(await commentRows(issue.id))[0]!.id}:${REVIEWER}`);
+    expect(row.bodyHtml).toContain("<b>alice</b> approved this pull request.");
+    expect(row.bodyHtml).toContain("lgtm");
+    // The mention line on the mentioned recipient's copy.
+    expect(row.bodyHtml).toContain("<b>alice</b> mentioned you:</p>");
+    // The carrier persisted (the unconditional §13 half) — the resolve's
+    // doer pre-seed means the write covers the DOER too (issue_update.go:
+    // 575-696, resolved[doer] first — upstream's UpdateIssueMentions takes
+    // the whole resolved set).
+    const carrier = await db().select().from(issueUsers).all();
+    expect(carrier.map((row) => row.userId).sort((a, b) => a - b)).toEqual([REVIEWER, OWNER]);
+    expect(carrier.find((row) => row.userId === REVIEWER)!.isMentioned).toBe(true);
   });
 
-  it("the bare constructor (every existing call site's posture) writes identically", async () => {
+  it("armed submitReview fans PullRequestCodeComment over the converted pending review's attached code comments (mentions-only — the poster here IS the mention)", async () => {
     const repoId = await seedRepo(OWNER);
     const { issue } = await seedPull(repoId);
     const found = await foundOf(repoId);
+    await giveEmails(OWNER, REVIEWER);
+    // The route's create-arm shape: a pending review + its attached code
+    // comment (the submit converts the pending row IN PLACE, so the code
+    // comment stays attached to the submitted review's id).
+    const pending = (
+      await db()
+        .insert(pullReviews)
+        .values({ type: ReviewType.Pending, reviewerId: OWNER, issueId: issue.id, content: "", commitId: "", createdAt: T0, updatedAt: T0 })
+        .returning()
+        .all()
+    )[0]!;
+    await db().insert(comments).values({
+      type: CommentType.Code,
+      posterId: OWNER,
+      issueId: issue.id,
+      content: "@bob this dereference is unsafe",
+      reviewId: pending.id,
+      createdAt: T0,
+      updatedAt: T0,
+    });
+
+    await armed().submitReview(found, {
+      doerId: OWNER,
+      doerRow: await userRow(OWNER),
+      issue,
+      baseBranch: "main",
+      reviewType: ReviewType.Approve,
+      content: "",
+      commitId: "abc123",
+    });
+
+    // TWO mails: the review arm (the empty-body approve → the action line
+    // only) + the code-comment arm (mentions-only: bob is mentioned, alice
+    // is the doer — nobody else exists to receive).
+    const rows = await outboxRows();
+    expect(rows).toHaveLength(2);
+    const reviewMail = rows.find((row) => row.dedupeKey!.startsWith("pull-review:"))!;
+    const codeMail = rows.find((row) => row.dedupeKey!.startsWith("pull-code-comment:"))!;
+    expect(reviewMail).toBeDefined();
+    expect(codeMail).toBeDefined();
+    expect(reviewMail.toAddr).toBe("user2@example.com");
+    expect(reviewMail.bodyHtml).toContain("<b>alice</b> approved this pull request.");
+    expect(codeMail.toAddr).toBe("user2@example.com");
+    expect(codeMail.bodyHtml).toContain("this dereference is unsafe");
+    expect(codeMail.bodyHtml).toContain("<b>alice</b> mentioned you:</p>");
+  });
+
+  it("armed addReviewRequest mails the reviewer 'Requested to review <url>.'; the armed removal self-gates SILENT (notify.go:130-131)", async () => {
+    const repoId = await seedRepo(OWNER);
+    const { issue, pullRequest } = await seedPull(repoId);
+    const found = await foundOf(repoId);
+    await giveEmails(OWNER, REVIEWER);
+    // The reviewer row read FRESH — the receiver gates IsMailable on the
+    // passed row (upstream hands the loaded reviewer over).
+    const reviewer = await userRow(REVIEWER);
+
+    const request = await armed().addReviewRequest(found, issue, pullRequest, reviewer, OWNER);
+    expect(request).not.toBeNull();
+    const rows = await outboxRows();
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.toAddr).toBe("user2@example.com");
+    expect(row.subject).toBe(`Re: [alice/visible] reviewable change (#${issue.index})`);
+    expect(row.info).toBe(`Subject: Re: [alice/visible] reviewable change (#${issue.index}), issue assigned`);
+    expect(row.dedupeKey).toBe(`pull-review-request:${(await commentRows(issue.id))[0]!.id}:${REVIEWER}`);
+    expect(row.replyTo).toBeNull(); // type-27 carries no HasMailReplySupport
+    expect(row.bodyHtml).toContain(
+      `Requested to review <a href="https://mail.example/alice/visible/pulls/${issue.index}"`,
+    );
+    expect(row.bodyHtml).not.toContain("<b>alice");
+
+    // The removal fires the receiver with isRequest=false — self-gated off,
+    // upstream-shaped (review_request.go:38 `comment != nil` still calls).
+    const removed = await armed().removeReviewRequest(found, issue, "main", reviewer, OWNER);
+    expect(removed).toBe(true);
+    expect(await outboxRows()).toHaveLength(1);
+  });
+
+  it("the bare constructor (every existing call site's posture) writes identically, persists the mention carrier, and emits NOTHING", async () => {
+    const repoId = await seedRepo(OWNER);
+    const { issue } = await seedPull(repoId);
+    const found = await foundOf(repoId);
+    await giveEmails(OWNER, REVIEWER);
 
     const review = await bare().submitReview(found, {
       doerId: OWNER,
@@ -574,10 +713,15 @@ describe("the mail seam (§14.6) — env threaded, arms absent", () => {
       issue,
       baseBranch: "main",
       reviewType: ReviewType.Approve,
-      content: "bare approve",
+      content: "cc @bob quietly",
       commitId: "abc123",
     });
     expect(review.official).toBe(true);
-    expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
+    // The fail-closed posture: ZERO mail despite the mention.
+    expect(await outboxRows()).toHaveLength(0);
+    // ...but the unconditional carrier half still persisted (§13 — the
+    // carrier feeds reads that work without a mailer), doer pre-seed row
+    // included (issue_update.go:575-696).
+    expect((await db().select().from(issueUsers).all()).map((row) => row.userId).sort((a, b) => a - b)).toEqual([REVIEWER, OWNER]);
   });
 });

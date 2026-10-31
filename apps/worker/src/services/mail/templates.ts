@@ -202,6 +202,13 @@ export function displayNameWithFullName(username: string, fullName: string | nul
 //   mail.issue.action.reopen  = `<b>%[1]s</b> reopened #%[2]d.`
 //   mail.issue.action.ready_for_review = `<b>%[1]s</b> marked this pull
 //     request ready for review.`
+//   mail.issue.action.approve = `<b>%[1]s</b> approved this pull request.`
+//   mail.issue.action.reject  = `<b>%[1]s</b> requested changes on this pull
+//     request.`
+//   mail.issue.action.review  = `<b>%[1]s</b> commented on this pull
+//     request.`
+//   mail.issue.x_mentioned_you = `<b>%s</b> mentioned you:` (the IsMention
+//     line above the <p> block — .Doer.Name, the RAW username, as the arg).
 
 /** `mail.issue.action.new` — the empty-body branch of the "new" arm. */
 export function issueActionNewLine(doerDisplayName: string, issueIndex: number): string {
@@ -236,6 +243,32 @@ export function issueActionMergeLine(doerDisplayName: string, issueIndex: number
   return `<b>${escapeHtml(doerDisplayName)}</b> merged #${issueIndex} into ${escapeHtml(baseBranch)}.`;
 }
 
+/** `mail.issue.action.approve` — the PullRequestReview arm's line for a
+ *  ReviewTypeApprove submit (actionToTemplate's CommentTypeReview branch,
+ *  mail_issue_common.go:248-257 — default.tmpl's approve case). */
+export function issueActionApproveLine(doerDisplayName: string): string {
+  return `<b>${escapeHtml(doerDisplayName)}</b> approved this pull request.`;
+}
+
+/** `mail.issue.action.reject` — the ReviewTypeReject line (the reject case). */
+export function issueActionRejectLine(doerDisplayName: string): string {
+  return `<b>${escapeHtml(doerDisplayName)}</b> requested changes on this pull request.`;
+}
+
+/** `mail.issue.action.review` — every other review type's line (the default
+ *  case: Comment, and the never-mailed Pending/Request rows). */
+export function issueActionReviewLine(doerDisplayName: string): string {
+  return `<b>${escapeHtml(doerDisplayName)}</b> commented on this pull request.`;
+}
+
+/** `mail.issue.x_mentioned_you` — the IsMention batch's line above the <p>
+ *  block (`{{if .IsMention}}<p>{{.locale.Tr "mail.issue.x_mentioned_you"
+ *  .Doer.Name}}</p>{{end}}`). The arg is `.Doer.Name` — the RAW username,
+ *  not the display name — escaped like every plain-string locale arg. */
+export function issueMentionedYouLine(doerName: string): string {
+  return `<p><b>${escapeHtml(doerName)}</b> mentioned you:</p>`;
+}
+
 /** Data for `renderIssueActionMail` (the default.tmpl data map's used slice
  *  for the new/close/reopen arms — the comment twin is IssueCommentMailData). */
 export interface IssueActionMailData {
@@ -243,8 +276,20 @@ export interface IssueActionMailData {
   subject: string;
   /** Upstream `.ActionName` — actionToTemplate's arm name
    *  (mail_issue_common.go:227-246): "new" | "close" | "reopen" | "comment" |
-   *  "ready_for_review" | "merge". */
-  actionName: "new" | "close" | "reopen" | "comment" | "ready_for_review" | "merge";
+   *  "ready_for_review" | "merge" | "approve" | "reject" | "review"
+   *  (CommentTypeReview's default branch, :248-257) | "default"
+   *  (CommentTypeReviewRequest's fall-through, :258-268). */
+  actionName:
+    | "new"
+    | "close"
+    | "reopen"
+    | "comment"
+    | "ready_for_review"
+    | "merge"
+    | "approve"
+    | "reject"
+    | "review"
+    | "default";
   /** Upstream `.Body` — the content rendered to HTML (the issue content for
    *  "new", emptied by MailParticipants for close/reopen, mail_issue.go:
    *  180-185); "" selects the template's empty-body branch. */
@@ -262,12 +307,22 @@ export interface IssueActionMailData {
   appName: string;
   /** Upstream `AppUrl` — trailing-slash form. */
   appUrl: string;
+  /** Upstream `.IsMention` — the recipient's batch membership (compose's
+   *  fromMention, mail_issue.go:101/115: the mention batch mails with it,
+   *  the participants batch without). Default (absent/false) renders the
+   *  pre-fold dropped-if bytes. */
+  isMention?: boolean;
+  /** Upstream `.Doer.Name` — the RAW username the mention line interpolates
+   *  (default.tmpl's `mail.issue.x_mentioned_you` arg). Required when
+   *  isMention is true; ignored otherwise. */
+  doerName?: string;
 }
 
 /**
  * `templates/mail/repo/issue/default.tmpl` for the new/close/reopen arms —
- * byte-faithful traces of the Go template with `.IsMention` false, empty
- * `.ReviewComments`, `.CanReply` false (no incoming email). The `<p>` block
+ * byte-faithful traces of the Go template with `.IsMention` false (pass
+ * `isMention` for the mention-batch copies), empty `.ReviewComments`,
+ * `.CanReply` false (no incoming email). The `<p>` block
  * has four reachable shapes (both dropped `{{if}}` lines above it and the
  * second dropped push `{{if}}` below it leave their tab+newline):
  *   - a NON-EMPTY body with no action line (comment, or "new" with content):
@@ -305,9 +360,15 @@ export function renderIssueActionMail(data: IssueActionMailData): string {
   } else {
     pBlock = `\t<p>\n\t\t\n\t\t\t${data.bodyHtml}\n\t\t</p>`;
   }
+  // The IsMention line: `{{if .IsMention}}<p>…</p>{{end}}` — true renders the
+  // locale line on the first tab line, false leaves the bare "\t".
+  const mentionLine =
+    data.isMention === true && data.doerName !== undefined
+      ? `\t${issueMentionedYouLine(data.doerName)}`
+      : "\t";
   return `${baseHead(title)}
 <body>
-\t
+${mentionLine}
 \t
 ${pBlock}
 \t

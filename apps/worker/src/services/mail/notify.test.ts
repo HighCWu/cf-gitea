@@ -60,7 +60,10 @@ import {
   notifyIssueStatusChanged,
   notifyIssueTitleChanged,
   notifyMergePullRequest,
+  notifyPullRequestCodeComment,
   notifyPullRequestCreated,
+  notifyPullRequestReview,
+  notifyPullRequestReviewRequest,
   resolveIssueMailRecipients,
   type MailNotifyEnv,
 } from "./notify";
@@ -1807,5 +1810,292 @@ describe("notify inbound fold — the per-recipient token carriers (mail_issue_c
       .where(eq(emailInbound.tokenStatus, "invalid"))
       .get();
     expect(inboundRow).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The review family (SPEC §14.6) — PullRequestReview (:98-111),
+// PullRequestCodeComment (:113-117, MailMentionsComment) and
+// PullRequestReviewRequest (:129-136, SendIssueAssignedMail's twin). The
+// firing points live in api/services/pull-reviews.ts (submitReview's tail /
+// the request pair); these arms pin each receiver's compose + filters.
+// ---------------------------------------------------------------------------
+
+/** A pull-issue fixture + a type-22 review comment over it (the SubmitReview
+ *  system comment: poster = the doer, content = the review body). */
+async function seedReviewFixture(reviewContent: string, title = "Review me"): Promise<{
+  issue: IssueRow;
+  comment: typeof comments.$inferSelect;
+  doer: Awaited<ReturnType<typeof userRow>>;
+}> {
+  const issue = await seedIssue(title);
+  await env.DB.prepare("UPDATE issues SET is_pull = 1 WHERE id = ?").bind(issue.id).run();
+  const fresh = (await db().select().from(issues).where(eq(issues.id, issue.id)).get())!;
+  const rows = await db()
+    .insert(comments)
+    .values({
+      type: CommentType.Review,
+      posterId: 60,
+      issueId: issue.id,
+      content: reviewContent,
+      reviewId: 9001,
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+    })
+    .returning();
+  return { issue: fresh, comment: rows[0]!, doer: await userRow(60) };
+}
+
+async function userRow(id: number) {
+  return (await db().select().from(users).where(eq(users.id, id)).get())!;
+}
+
+describe("notifyPullRequestReview — the PullRequestReview receiver (notify.go:98-111)", () => {
+  it("the approve mail: the funnel recipients (mentions FIRST), the approve action line + kept body, the /comment/<id> Message-ID over the plain reference, pull-review dedupe", async () => {
+    // The review body mentions the assignee — the write service resolves
+    // BEFORE the receiver fires (services/pull/review.go:310-314).
+    const { issue, comment, doer } = await seedReviewFixture("lgtm, @assignee take a look");
+    const mentions = [await userRow(50)];
+    const outcome = await notifyPullRequestReview(armedEnv(), { issue, comment, reviewType: 1, doer, mentions }, { now: new Date(1_700_000_000_000) });
+    expect(outcome.outcome).toBe("enqueued");
+    const rows = await db().select().from(emailOutbox).all();
+    // Mention batch first (50), then the funnel order: repo watcher 20,
+    // poster 10, assignee 50 (visited), participant 40, issue watcher 30;
+    // unwatcher 70 + the doer 60 excluded.
+    expect(rows.map((row) => row.toAddr)).toEqual(["as@example.com", "rw@example.com", "poster@example.com", "part@example.com", "iw@example.com"]);
+    for (const row of rows) {
+      expect(row.subject).toBe(`Re: [repoowner/repo] ${issue.title} (#${issue.index})`);
+      expect(row.info).toBe(`Subject: Re: [repoowner/repo] ${issue.title} (#${issue.index}), issue comments`);
+      const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+      // The type-22 comment carries the anchor + Message-ID extra; the
+      // thread reference stays plain (ActionType(0) + nil comment).
+      expect(headers["Message-ID"]).toBe(`<repoowner/repo/pulls/${issue.index}/comment/${comment.id}@mail.example>`);
+      expect(headers["In-Reply-To"]).toBe(`<repoowner/repo/pulls/${issue.index}@mail.example>`);
+      expect(headers["References"]).toBe(`<repoowner/repo/pulls/${issue.index}@mail.example>`);
+      expect(headers["X-Gitea-Reason"]).toBe("pull");
+      expect(row.dedupeKey).toBe(`pull-review:${comment.id}:${recipientIdOf(row)}`);
+      // default.tmpl's approve branch + the KEPT body (MailParticipantsComment
+      // empties only the push type) — link anchor on the footer line.
+      expect(row.bodyHtml).toContain("<b>doer</b> approved this pull request.");
+      expect(row.bodyHtml).toContain(`#issuecomment-${comment.id}`);
+    }
+    // The mention line ONLY on the mention batch's copy (compose's
+    // fromMention, mail_issue.go:101/115).
+    const mentionCopy = rows.find((row) => row.toAddr === "as@example.com")!;
+    expect(mentionCopy.bodyHtml).toContain("<b>doer</b> mentioned you:</p>");
+    expect(rows.find((row) => row.toAddr === "rw@example.com")!.bodyHtml).not.toContain("mentioned you");
+    // The body renders the review content with the mention resolved.
+    expect(mentionCopy.bodyHtml).toContain("lgtm");
+  });
+
+  it("the reject verdict picks its locale line (actionToTemplate's CommentTypeReview branch, :248-257)", async () => {
+    const { issue, comment, doer } = await seedReviewFixture("blocking: @repowatcher");
+    const mentions = [await userRow(20)];
+    await notifyPullRequestReview(armedEnv(), { issue, comment, reviewType: 3, doer, mentions }, {});
+    const rows = await db().select().from(emailOutbox).all();
+    // The review arm is the FULL funnel (the mentions ride first) — the
+    // mentioned watcher 20, then poster 10, assignee 50, participant 40,
+    // issue watcher 30.
+    expect(rows.map((row) => row.toAddr)).toEqual(["rw@example.com", "poster@example.com", "as@example.com", "part@example.com", "iw@example.com"]);
+    expect(rows[0]!.bodyHtml).toContain("<b>doer</b> requested changes on this pull request.");
+    expect(rows[0]!.bodyHtml).toContain("blocking:");
+    expect(rows[0]!.bodyHtml).toContain("<b>doer</b> mentioned you:</p>");
+  });
+
+  it("the comment verdict picks its locale line; no mentions — the plain funnel order", async () => {
+    const { issue, comment, doer } = await seedReviewFixture("notes only");
+    await notifyPullRequestReview(armedEnv(), { issue, comment, reviewType: 2, doer }, {});
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows.map((row) => row.toAddr)).toEqual(["rw@example.com", "poster@example.com", "as@example.com", "part@example.com", "iw@example.com"]);
+    for (const row of rows) expect(row.bodyHtml).toContain("<b>doer</b> commented on this pull request.");
+    expect(rows[0]!.bodyHtml).toContain("notes only");
+  });
+
+  it("a WIP-titled pull drops the repo watchers (ActionType(0) != ActionCreatePullRequest — no create exception)", async () => {
+    const { issue, comment, doer } = await seedReviewFixture("wip approve", "WIP: review me");
+    const outcome = await notifyPullRequestReview(armedEnv(), { issue, comment, reviewType: 1, doer }, {});
+    expect(outcome.outcome).toBe("enqueued");
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows.map((row) => row.toAddr)).not.toContain("rw@example.com");
+    expect(rows.map((row) => row.toAddr)).toContain("poster@example.com");
+  });
+
+  it("consumes to 'sent'; MAIL off / malformed degrade like the siblings", async () => {
+    const { issue, comment, doer } = await seedReviewFixture("ship it");
+    const mailEnv = armedEnv();
+    await notifyPullRequestReview(mailEnv, { issue, comment, reviewType: 1, doer }, {});
+    const spy = mailEnv.REPO_TASKS as unknown as { sendBodies: MailOutboxMessage[] };
+    expect(await processMailOutbox(mailEnv, spy.sendBodies[0]!)).toEqual({ kind: "sent" });
+    const off = armedEnv({ MAIL_ENABLED: "false" });
+    expect((await notifyPullRequestReview(off, { issue, comment, reviewType: 1, doer }, {})).outcome).toBe("disabled");
+    const malformed = armedEnv({ MAIL_FROM: "no address here" });
+    expect((await notifyPullRequestReview(malformed, { issue, comment, reviewType: 1, doer }, {})).outcome).toBe("misconfigured");
+  });
+});
+
+describe("notifyPullRequestCodeComment — the MailMentionsComment receiver (notify.go:113-117)", () => {
+  /** A type-21 code comment over the pull fixture (the pending-review
+   *  comment the submission carries). */
+  async function seedCodeComment(content: string) {
+    const issue = await seedIssue("Code review");
+    await env.DB.prepare("UPDATE issues SET is_pull = 1 WHERE id = ?").bind(issue.id).run();
+    const fresh = (await db().select().from(issues).where(eq(issues.id, issue.id)).get())!;
+    const rows = await db()
+      .insert(comments)
+      .values({
+        type: CommentType.Code,
+        posterId: 60,
+        issueId: issue.id,
+        content,
+        reviewId: 9002,
+        createdAt: new Date(0),
+        updatedAt: new Date(0),
+      })
+      .returning();
+    return { issue: fresh, comment: rows[0]!, doer: await userRow(60) };
+  }
+
+  it("mails ONLY the mention batch — a non-mentioned watcher gets nothing, the mentioned unwatcher still does, the poster-doer never self-mails", async () => {
+    // Mentioned: assignee 50 (enabled), unwatcher 70 (explicit-unwatch does
+    // NOT exclude — MailMentionsComment's visited is ONLY the poster,
+    // mail_comment.go:53), onmention 80 (fromMention=true admits),
+    // poster 10 (not the doer). Not mentioned: watcher 20, participant 40,
+    // issue watcher 30 — silent.
+    const { issue, comment, doer } = await seedCodeComment("@assignee @unwatcher @onmention @poster look here");
+    const mentions = [await userRow(50), await userRow(70), await userRow(80), await userRow(10)];
+    const outcome = await notifyPullRequestCodeComment(armedEnv(), { issue, comment, doer, mentions }, { now: new Date(1_700_000_000_000) });
+    expect(outcome.outcome).toBe("enqueued");
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows.map((row) => row.toAddr)).toEqual(["as@example.com", "un@example.com", "om@example.com", "poster@example.com"]);
+    for (const row of rows) {
+      const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+      expect(headers["Message-ID"]).toBe(`<repoowner/repo/pulls/${issue.index}/comment/${comment.id}@mail.example>`);
+      expect(row.dedupeKey).toBe(`pull-code-comment:${comment.id}:${recipientIdOf(row)}`);
+      // actionToTemplate's CommentTypeCode branch → name "comment" → no
+      // action line; the code comment's content IS the body; EVERY copy
+      // carries the IsMention line (fromMention=true for the whole batch).
+      expect(row.bodyHtml).not.toContain("approved this pull request");
+      expect(row.bodyHtml).toContain("look here");
+      expect(row.bodyHtml).toContain("<b>doer</b> mentioned you:</p>");
+    }
+  });
+
+  it("the batch filters: disabled preference and non-mailable mentions drop, onmention passes (fromMention=true)", async () => {
+    const { issue, comment, doer } = await seedCodeComment("@frozen @onmention");
+    const mentions = [await userRow(96), await userRow(80)];
+    const outcome = await notifyPullRequestCodeComment(armedEnv(), { issue, comment, doer, mentions }, {});
+    expect(outcome.outcome).toBe("enqueued");
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows.map((row) => row.toAddr)).toEqual(["om@example.com"]); // the frozen mention dropped, onmention admitted
+  });
+
+  it("zero survivors (no mentions) mail nothing; MAIL off degrades", async () => {
+    const { issue, comment, doer } = await seedCodeComment("no mentions here");
+    expect((await notifyPullRequestCodeComment(armedEnv(), { issue, comment, doer, mentions: [] }, {})).outcome).toBe("no-recipients");
+    // The MAIL-off gate returns before any read — the same fixture is fine.
+    const off = armedEnv({ MAIL_ENABLED: "false" });
+    expect(
+      (await notifyPullRequestCodeComment(off, { issue, comment, doer, mentions: [await userRow(50)] }, {})).outcome,
+    ).toBe("disabled");
+  });
+});
+
+describe("notifyPullRequestReviewRequest — the PullRequestReviewRequest receiver (notify.go:129-136)", () => {
+  /** A type-27 review-request comment over the pull fixture (the add arm's
+   *  row: poster = the requesting doer). */
+  async function seedRequestComment() {
+    const issue = await seedIssue("Request my review");
+    await env.DB.prepare("UPDATE issues SET is_pull = 1 WHERE id = ?").bind(issue.id).run();
+    const fresh = (await db().select().from(issues).where(eq(issues.id, issue.id)).get())!;
+    const rows = await db()
+      .insert(comments)
+      .values({
+        type: CommentType.ReviewRequest,
+        posterId: 60,
+        issueId: issue.id,
+        assigneeId: 50,
+        removedAssignee: 0,
+        reviewId: 9003,
+        createdAt: new Date(0),
+        updatedAt: new Date(0),
+      })
+      .returning();
+    return { issue: fresh, comment: rows[0]!, doer: await userRow(60), reviewer: await userRow(50) };
+  }
+
+  it("the add mail: ONE row to the reviewer, the rendered 'Requested to review <url>.' body over default.tmpl (CommentTypeReviewRequest → name 'default'), the /comment/<id> Message-ID, 'issue assigned' info", async () => {
+    const { issue, comment, doer, reviewer } = await seedRequestComment();
+    const outcome = await notifyPullRequestReviewRequest(armedEnv(), { issue, comment, doer, reviewer, isRequest: true }, { now: new Date(1_700_000_000_000) });
+    expect(outcome.outcome).toBe("enqueued");
+    const rows = await db().select().from(emailOutbox).all();
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.toAddr).toBe("as@example.com");
+    expect(row.subject).toBe(`Re: [repoowner/repo] ${issue.title} (#${issue.index})`);
+    // SendIssueAssignedMail's batch info (mail_issue.go:222).
+    expect(row.info).toBe(`Subject: Re: [repoowner/repo] ${issue.title} (#${issue.index}), issue assigned`);
+    expect(row.dedupeKey).toBe(`pull-review-request:${comment.id}:50`);
+    const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+    expect(headers["Message-ID"]).toBe(`<repoowner/repo/pulls/${issue.index}/comment/${comment.id}@mail.example>`);
+    expect(headers["In-Reply-To"]).toBe(`<repoowner/repo/pulls/${issue.index}@mail.example>`);
+    expect(headers["References"]).toBe(`<repoowner/repo/pulls/${issue.index}@mail.example>`);
+    expect(headers["X-Gitea-Reason"]).toBe("pull");
+    // The type-27 comment carries NO HasMailReplySupport (comment.go:196-201)
+    // → the reply payload is nil: no action line in the body (name
+    // "default"), the rendered ct IS the body, no mention line.
+    expect(row.bodyHtml).toContain("Requested to review");
+    expect(row.bodyHtml).toContain(`https://mail.example/repoowner/repo/pulls/${issue.index}`);
+    expect(row.bodyHtml).not.toContain("<b>doer</b>");
+    expect(row.bodyHtml).not.toContain("mentioned you");
+    expect(row.replyTo).toBeNull();
+  });
+
+  it("the receiver gates — the removal self-gates off, self-request, disabled preference, non-mailable reviewer all mail NOTHING (notify.go:130-131)", async () => {
+    const { issue, comment, doer, reviewer } = await seedRequestComment();
+    const env0 = armedEnv();
+    expect((await notifyPullRequestReviewRequest(env0, { issue, comment, doer, reviewer, isRequest: false }, {})).outcome).toBe("no-recipients");
+    expect((await notifyPullRequestReviewRequest(env0, { issue, comment, doer, reviewer: doer, isRequest: true }, {})).outcome).toBe("no-recipients");
+    await db().insert(userSettings).values({ userId: 50, emailNotificationsPreference: "disabled" });
+    expect((await notifyPullRequestReviewRequest(env0, { issue, comment, doer, reviewer, isRequest: true }, {})).outcome).toBe("no-recipients");
+    await db().delete(userSettings).where(eq(userSettings.userId, 50));
+    const frozen = await userRow(96);
+    expect((await notifyPullRequestReviewRequest(env0, { issue, comment, doer, reviewer: frozen, isRequest: true }, {})).outcome).toBe("no-recipients");
+    expect(await db().select().from(emailOutbox).all()).toHaveLength(0);
+  });
+
+  it("inbound armed: the nil reply payload keeps Reply-To/List-Post absent while the issue-bound unsubscribe token still rides (mail_issue_common.go:148-201)", async () => {
+    const { issue, comment, doer, reviewer } = await seedRequestComment();
+    const outcome = await notifyPullRequestReviewRequest(
+      armedEnv({
+        MAIL_INBOUND_ENABLED: "true",
+        MAIL_INBOUND_REPLY_ADDRESS: "reply+%{token}@mail.example",
+        MAIL_INBOUND_SECRET: "review-request-secret",
+      }),
+      { issue, comment, doer, reviewer, isRequest: true },
+      { now: new Date() },
+    );
+    expect(outcome.outcome).toBe("enqueued");
+    const row = (await db().select().from(emailOutbox).all())[0]!;
+    expect(row.replyTo).toBeNull();
+    const headers = JSON.parse(row.headers ?? "{}") as Record<string, string>;
+    expect(headers["List-Post"]).toBeUndefined();
+    // References stays the bare thread (no reply-token carrier)…
+    expect(headers["References"]).toBe(`<repoowner/repo/pulls/${issue.index}@mail.example>`);
+    // …but List-Unsubscribe grew the mailto arm (the unsubscribe token is
+    // independent of the reply payload, :195-201).
+    expect(headers["List-Unsubscribe"]).toContain(`https://mail.example/repoowner/repo/pulls/${issue.index}`);
+    expect(headers["List-Unsubscribe"]).toContain("<mailto:reply+");
+  });
+
+  it("consumes to 'sent'; MAIL off / malformed degrade like the siblings", async () => {
+    const { issue, comment, doer, reviewer } = await seedRequestComment();
+    const mailEnv = armedEnv();
+    await notifyPullRequestReviewRequest(mailEnv, { issue, comment, doer, reviewer, isRequest: true }, {});
+    const spy = mailEnv.REPO_TASKS as unknown as { sendBodies: MailOutboxMessage[] };
+    expect(await processMailOutbox(mailEnv, spy.sendBodies[0]!)).toEqual({ kind: "sent" });
+    const off = armedEnv({ MAIL_ENABLED: "false" });
+    expect((await notifyPullRequestReviewRequest(off, { issue, comment, doer, reviewer, isRequest: true }, {})).outcome).toBe("disabled");
+    const malformed = armedEnv({ MAIL_FROM: "no address here" });
+    expect((await notifyPullRequestReviewRequest(malformed, { issue, comment, doer, reviewer, isRequest: true }, {})).outcome).toBe("misconfigured");
   });
 });

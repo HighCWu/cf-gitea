@@ -123,7 +123,8 @@
  * (specs/email-outbound.md): the handlers below stay parse+validate+respond
  * and construct `new PullReviewsService(c.env.DB, c.env)` at the write arms
  * (the IssuesService(d1, mailEnv) mail seam — the review family's receivers
- * fire from the service in the NEXT wave; this wave emits no mail).
+ * fire from the service, LANDED; the TEAM-request add's mail alone rides
+ * THIS file's team block, teamReviewRequestNotify's expansion).
  *
  * Auth (routers/api/v1/api.go:1457–1474): the GET arms ride the group's
  * reqRepoReader (anonymous-capable on public repos → optionalAuth); every
@@ -141,7 +142,7 @@ import { z } from "zod";
 
 import type { DiffFileJson } from "@cf-gitea/git-engine";
 
-import { ReviewType, comments, issues, pullReviews, teams, users } from "../../db/schema";
+import { ReviewType, comments, issues, pullReviews, teamMembers, teams, users } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { emitIssueEvent } from "../../services/issue-events";
@@ -177,6 +178,7 @@ import { pullRequestDiff, pullRequestDiffShortStat } from "../services/pull-engi
 // mailEnv) seam; this route passes `c.env` at the write arms). The read
 // consults stay local imports — the route's handlers + arms still look up
 // pending/decision rows for their own gates.
+import { notifyPullRequestReviewRequest } from "../../services/mail/notify";
 import { PullReviewsService, currentPendingReview, latestDecisionReview, type ReviewRow } from "../services/pull-reviews";
 
 // ---------------------------------------------------------------------------
@@ -1500,10 +1502,17 @@ export function registerPullReviewRoutes(
       // Team arms (AddTeamReviewRequest, review.go:822–876): rows land; one
       // webhook per request with requested_reviewer omitted (deviation
       // documented in the module header).
-      // SEAM (next wave): upstream's TEAM-request add notifies too
-      // (teamReviewRequestNotify, review_request.go:233) — its mail arm
-      // folds HERE beside the webhook emit; TEAM-request REMOVAL is silent
-      // (:44–47), so the team block below stays mail-off.
+      // TEAM-request add NOTIFIES (the §14.6 team arm): upstream's
+      // TeamReviewRequest folds teamReviewRequestNotify
+      // (services/issue/review_request.go:233-252) on its add path — the
+      // team's members expand per GetTeamMembers (team_user.go:40-56,
+      // ORDER BY full_name, name), the POSTER member is skipped (:241-243),
+      // and each survivor rides the SAME PullRequestReviewRequest receiver
+      // the user arm uses (the "Requested to review <htmlurl>." mail,
+      // notify.go:129-136 — its own gates: not-to-self, not-disabled,
+      // IsMailable). TEAM-request REMOVAL is silent (:44-47 — `!isAdd`
+      // returns before the notifier), so the remove block below stays
+      // mail-off.
       for (const team of teamReviewers) {
         const existing = (
           await drizzle(c.env.DB)
@@ -1533,7 +1542,11 @@ export function registerPullReviewRoutes(
           .returning()
           .all();
         const review = inserted[0]!;
-        await db.batch([
+        // The comment RETURNS its row — teamReviewRequestNotify composes the
+        // per-member mail over the SAME type-27 comment (review_request.go:
+        // 235-247; upstream's per-member AssigneeID mutation is inert for
+        // the compose — the mail keys on the comment id, never the field).
+        const [teamCommentRows] = await db.batch([
           db.insert(comments).values({
             type: CommentType.ReviewRequest,
             posterId: doerId,
@@ -1541,9 +1554,10 @@ export function registerPullReviewRoutes(
             reviewId: review.id,
             createdAt: now,
             updatedAt: now,
-          }),
+          }).returning(),
           numCommentsBump(db, issue.id, now),
         ]);
+        const teamComment = teamCommentRows[0]!;
         created.push(review);
         await emitIssueEvent(c, {
           repoId: found.repo.id,
@@ -1557,6 +1571,37 @@ export function registerPullReviewRoutes(
             sender: doer,
           }),
         });
+        // The team-members expansion + per-member mail (teamReviewRequestNotify,
+        // review_request.go:233-252) — best-effort, never fails the request.
+        try {
+          const doerRow = (await drizzle(c.env.DB).select().from(users).where(eq(users.id, doerId)).limit(1).all())[0] ?? null;
+          if (doerRow === null) {
+            console.error(`[pull-reviews] team review-request mail skipped: doer row missing [id: ${doerId}]`);
+          } else {
+            const members = await db
+              .select({ user: users })
+              .from(teamMembers)
+              .innerJoin(users, eq(users.id, teamMembers.userId))
+              .where(eq(teamMembers.teamId, team.id))
+              .orderBy(users.fullName, users.username);
+            for (const { user: member } of members) {
+              if (issue.posterId !== null && member.id === issue.posterId) {
+                continue; // the poster member is skipped (review_request.go:241-243)
+              }
+              await notifyPullRequestReviewRequest(c.env, {
+                issue,
+                comment: teamComment,
+                doer: doerRow,
+                reviewer: member,
+                isRequest: true,
+              });
+            }
+          }
+        } catch (mailError) {
+          console.error(
+            `[pull-reviews] team review-request mail failed (team ${team.id}, issue ${issue.id}): ${mailError instanceof Error ? mailError.message : String(mailError)}`,
+          );
+        }
       }
       const rendered = [];
       for (const review of created) {
