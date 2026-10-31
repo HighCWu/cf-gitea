@@ -352,16 +352,19 @@ describe("loadAdminMonitorStats (GetStatistic's landed-table subset, sorted keys
 const NOW = new Date("2026-01-01T12:07:33Z");
 
 describe("loadAdminMonitorCron (the FULL landed arm census — the usability F3 listing)", () => {
-  it("carries all seven landed arms with their wrangler schedules in registry order", () => {
+  it("carries all ten landed arms with their wrangler schedules in registry order", () => {
     const { entries } = loadAdminMonitorCron(NOW);
     expect(entries.map((entry) => [entry.name, entry.spec])).toEqual([
       ["update_mirrors", "*/10 * * * *"],
       ["update_push_mirrors", "*/10 * * * *"],
       ["stop_zombie_tasks", "*/10 * * * *"],
+      ["stop_endless_tasks", "*/10 * * * *"],
       ["demo_sweep", "0 * * * *"],
       ["delete_old_audit_events", "0 * * * *"],
       ["cleanup_packages", "0 * * * *"],
       ["cleanup_actions", "0 * * * *"],
+      ["cancel_abandoned_jobs", "0 * * * *"],
+      ["cleanup_ephemeral_runners", "0 * * * *"],
     ]);
     // The never-fired posture without recorded state (the sync loader's
     // shape): prev null, zero executions, the empty-Status result arm.
@@ -372,7 +375,7 @@ describe("loadAdminMonitorCron (the FULL landed arm census — the usability F3 
     }
     // The run button renders ONLY on the run-capable arms (the landed run
     // bodies — admin-degenerate's CRON_RUN_BODIES posture; never a dead
-    // control); the two actions-family census arms stay bodyless.
+    // control); the five actions-family census arms stay bodyless.
     expect(entries.filter((entry) => entry.runnable).map((entry) => entry.name)).toEqual([
       "update_mirrors",
       "update_push_mirrors",
@@ -463,7 +466,7 @@ describe("loadAdminMonitorCronRunState (the state-bearing loader — the route s
     // The error arm renders the x glyph with the stored one-liner tooltip.
     expect(html).toContain('data-tooltip-content="producer probes failed"');
     expect(html).toContain('class="svg octicon-x"');
-    // Exactly FIVE run buttons (the runnable arms) among seven rows.
+    // Exactly FIVE run buttons (the runnable arms) among ten rows.
     expect((html.match(/name="op" value=/g) ?? []).length).toBe(5);
   });
 });
@@ -663,13 +666,20 @@ describe("applyAdminMonitorCronForm (DashboardPost's task arm over the landed pr
   });
 
   it("the still-bodyless census arms answer task.unknown exactly like an unknown op — nothing runs, no tick", async () => {
-    // stop_zombie_tasks and cleanup_actions ARE in the rendered census (the
-    // scheduled dispatcher's lens) but their producer modules are an in-flight
-    // sibling's ownership — the form's run gate answers the unknown flash for
-    // both, never a wrong body (the API twin's listed-but-unrunnable posture).
+    // All five actions-family census arms ARE in the rendered census (the
+    // scheduled dispatcher's lens) but their producer modules live in
+    // services/actions/** (an in-flight sibling's ownership) — the form's run
+    // gate answers the unknown flash for each, never a wrong body (the API
+    // twin's listed-but-unrunnable posture).
     await seedDueMirror();
     const queue = recordingQueue();
-    for (const op of ["stop_zombie_tasks", "cleanup_actions"]) {
+    for (const op of [
+      "stop_zombie_tasks",
+      "cleanup_actions",
+      "stop_endless_tasks",
+      "cancel_abandoned_jobs",
+      "cleanup_ephemeral_runners",
+    ]) {
       const result = await applyAdminMonitorCronForm({ ...env, MIRROR_SYNC_QUEUE: queue }, { op, from: "monitor" }, { now: NOW });
       expect(result, op).toEqual({ outcome: "invalid", message: `Unknown task: ${op}` });
     }

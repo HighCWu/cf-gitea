@@ -21,27 +21,39 @@
  * per entry mirror handleScheduledCron's dispatch EXACTLY
  * (services/demo-sweep.ts — the mount record in its module header):
  *
- *   - the hourly entry (`0 * * * *`, DEMO_SWEEP_CRON) carries FOUR producer
+ *   - the hourly entry (`0 * * * *`, DEMO_SWEEP_CRON) carries SIX producer
  *     arms: demo_sweep (SPEC-0014), delete_old_audit_events (SPEC-0015
- *     §4.3), cleanup_packages (SPEC-0016 §4.4) and cleanup_actions
- *     (SPEC-0012 §4.5);
+ *     §4.3), cleanup_packages (SPEC-0016 §4.4), cleanup_actions
+ *     (SPEC-0012 §4.5), cancel_abandoned_jobs and cleanup_ephemeral_runners
+ *     (SPEC-0012 §4.5's parity-review sweeps — the dispatcher's actions-
+ *     abandoned + ephemeral block, its SIXTH sanctioned extension);
  *   - EVERY OTHER entry (today the standing 10-minute step) carries the
- *     THREE unconditional arms: update_mirrors + update_push_mirrors
- *     (SPEC-0009 §2.6 / specs/push-mirror-outbound.md) and stop_zombie_tasks
- *     (SPEC-0012 §4.5/§5.6) — matching the dispatcher's unconditional else
- *     (a future config entry runs the step arms, never the hourly ones).
+ *     FOUR unconditional arms: update_mirrors + update_push_mirrors
+ *     (SPEC-0009 §2.6 / specs/push-mirror-outbound.md), stop_zombie_tasks
+ *     and stop_endless_tasks (SPEC-0012 §4.5/§5.6, the parity-review §5's
+ *     stop family — the dispatcher's FOURTH/FIFTH sanctioned extensions) —
+ *     matching the dispatcher's unconditional else (a future config entry
+ *     runs the step arms, never the hourly ones).
  *
  * Names are upstream's registered task name where a faithful twin exists at
  * the pin (tasks_basic.go:31 update_mirrors; tasks_actions.go:27
- * stop_zombie_tasks; tasks_basic.go:140 cleanup_packages; tasks_extended.go
- * :146 delete_old_audit_events; tasks_actions.go:70/:80 — our single
- * actions-retention producer carries the cleanup_actions +
- * cleanup_action_runs pair's bodies, folded per SPEC-0012 §4.5). Two arms
- * are cf-gitea extensions with no upstream task: demo_sweep (SPEC-0014)
- * and update_push_mirrors — upstream folds BOTH mirror families into the
- * ONE update_mirrors task (mirror.go:34-110 iterates pull and push mirrors
- * under one body); ours runs two producers, so the push twin gets the
- * convention-following name and the split is recorded here.
+ * stop_zombie_tasks; tasks_actions.go:38 stop_endless_tasks;
+ * tasks_actions.go:46 cancel_abandoned_jobs; tasks_basic.go:140
+ * cleanup_packages; tasks_extended.go:146 delete_old_audit_events;
+ * tasks_actions.go:70/:80 — our single actions-retention producer carries
+ * the cleanup_actions + cleanup_action_runs pair's bodies, folded per
+ * SPEC-0012 §4.5). Three arms are cf-gitea extensions with no upstream
+ * registered task: demo_sweep (SPEC-0014), update_push_mirrors — upstream
+ * folds BOTH mirror families into the ONE update_mirrors task
+ * (mirror.go:34-110 iterates pull and push mirrors under one body); ours
+ * runs two producers, so the push twin gets the convention-following name
+ * and the split is recorded here — and cleanup_ephemeral_runners: upstream
+ * folds the ephemeral-runner sweep into the ONE cleanup_actions task body
+ * (cleanup.go:34-39 runs CleanupEphemeralRunners inside every Cleanup),
+ * ours decouples it as an always-on UNGATED producer (SPEC-0012 §4.5,
+ * parity-review item 3c — upstream runs it in every nightly Cleanup with
+ * no retention knob), so it takes upstream's function name and the split
+ * is recorded here.
  *
  * Schedules render the WRANGLER EXPRESSION verbatim (the registries'
  * standing convention — the expression is literally what runs), not
@@ -106,6 +118,10 @@ export const CRON_ARMS: readonly CronArm[] = [
   // upstream tasks_actions.go:27 (@every 5m) — rides the 10-minute step, the
   // standing cadence closest to upstream's (the dispatcher's own note).
   { arm: "stop_zombie_tasks", spec: STEP_ENTRY_CRON },
+  // upstream tasks_actions.go:38 (@every 30m) — the endless-stop producer
+  // (SPEC-0012 §4.5's stop family, the FIFTH sanctioned extension), same
+  // always-on placement logic as the zombie arm (the dispatcher's own note).
+  { arm: "stop_endless_tasks", spec: STEP_ENTRY_CRON },
   // --- the hourly entry (DEMO_SWEEP_CRON ONLY) ----------------------------
   // SPEC-0014 §3.1 — the demo sweep producer; NO upstream task (the
   // sanctioned extension, self-gated on DEMO_MODE).
@@ -121,6 +137,16 @@ export const CRON_ARMS: readonly CronArm[] = [
   // retention, SPEC-0012 §4.5), self-gated on the ACTIONS_*_RETENTION_DAYS
   // trio; named for the pair's broader half.
   { arm: "cleanup_actions", spec: DEMO_SWEEP_CRON },
+  // upstream tasks_actions.go:46 (@every 6h) — the abandoned-jobs producer
+  // (SPEC-0012 §4.5's parity-review sweeps, the SIXTH sanctioned block),
+  // rides the hourly entry (the ratified cadence divergence — the sweeps
+  // module header).
+  { arm: "cancel_abandoned_jobs", spec: DEMO_SWEEP_CRON },
+  // NO upstream registered task — upstream folds the ephemeral-runner sweep
+  // into cleanup_actions's body (cleanup.go:34-39); ours decouples it as an
+  // always-on UNGATED producer (SPEC-0012 §4.5, parity-review item 3c), so
+  // it takes upstream's function name (the update_push_mirrors convention).
+  { arm: "cleanup_ephemeral_runners", spec: DEMO_SWEEP_CRON },
 ];
 
 /** The entry's arms (the census filter — the hourly entry is matched EXACTLY
@@ -222,8 +248,8 @@ export interface CronStateRow {
 }
 
 /**
- * The full tick state, keyed by arm name — ONE point scan of a ≤7-row table.
- * Arms without a row (nothing recorded yet — a fresh deployment, or the
+ * The full tick state, keyed by arm name — ONE point scan of a ≤10-row
+ * table. Arms without a row (nothing recorded yet — a fresh deployment, or the
  * golden harness) are simply absent: the monitor renders the never-fired
  * arms, exactly upstream's unset-Prev posture.
  */

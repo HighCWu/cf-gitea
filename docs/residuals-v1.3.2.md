@@ -93,6 +93,30 @@ The window's verification record (`635a573` — 98 suites, 2,551 results,
 all green, pinned at `29ecd1d`) rides alongside; its coverage gaps are
 board rows now.
 
+**The cron-census drift — found and closed (2026-10-31, the admin wave's
+open item 2).** The scheduled dispatcher's sanctioned-arm extensions grew
+past the arm census without joining it: services/cron-state.ts's
+CRON_ARMS carried the original 7 arms while handleScheduledCron
+(services/demo-sweep.ts) had grown to 10 producer calls — the parity-review
+sweep blocks (SPEC-0012 §4.5's FIFTH/SIXTH sanctioned extensions) landed
+producers whose census rows never followed. The drift's actual harm: the
+scheduled handler's tick recorder keys armsForEntry off the census, so the
+three stragglers' `cron_state` tick rows were silently SKIPPED (their arms
+were invisible in the admin cron list, the monitor page, and the tick
+store alike). Absorbed per the census's own join rule ("a scheduled arm
+added to handleScheduledCron joins THIS table in the same change"):
+`stop_endless_tasks` (upstream tasks_actions.go:38, step entry),
+`cancel_abandoned_jobs` (upstream tasks_actions.go:46, hourly entry) and
+`cleanup_ephemeral_runners` (no upstream registered task — upstream folds
+it into cleanup_actions's body, cleanup.go:34-39; ours decouples it as the
+always-on ungated producer, parity-review item 3c — hourly entry, the
+update_push_mirrors naming precedent). Runnability unchanged: all three
+are actions-family arms (producers in services/actions/sweeps.ts, sibling
+ownership), so the CRON_RUN_BODIES runnable maps stay at the same five
+arms and the new rows render listed-but-unrunnable (404 like unknown),
+matching stop_zombie_tasks/cleanup_actions's adjudicated posture. No
+board row flips — this closes a flag, not a listed residual.
+
 ---
 
 ## P1 — feature completion
@@ -793,12 +817,29 @@ board rows now.
    re-exports it in `apps/worker/src/ui/pages/user-settings-packages.tsx`).
    Size: **S** (conditional on the store growing the option).
 
-4. **SPEC-0011's queued engine residual: D3 + the unpinned rows.** The
-   state-transition ledger found one genuine unrecorded gap — the
-   failed-publish lease-pointer destroy (D3), "now queued for fix" — and
-   §7.2 rows 10-11 hold structurally/partially, unpinned by dedicated
-   checks (`specs/README.md` SPEC-0011 row; the ledger itself:
-   `docs/design/m3-state-transitions.md`). Size: **M** (fix + two checks).
+4. **SPEC-0011's queued engine residual: D3 + the unpinned rows — RESOLVED
+   before dispatch (`6545edd` the D3 fix + `849885e` the rows 10-11 pins,
+   2026-10-28); verified and closed 2026-10-31.** The row was written
+   against the ledger's ORIGINAL state; the D3 engine-fix unit and the
+   rows-10/11 pin unit had already landed by the time P3-4 dispatched, and
+   the ledger was amended in place (its D3 entry reads FIXED, §5 reads
+   PINNED for both rows). The dispatching unit's premise was stale; per
+   the brief's stale clause it verified instead of re-fixing: the
+   `published` flag gates the lease release exactly as recorded
+   (`compaction.ts:216,242,277`), NOTICE.md rows 142-144 carry the
+   deviations, and the pins exist — check-compaction §5.3 graceful
+   lease_lost + graceful mid-write failure (`e2e/check-compaction.mjs:674`,
+   `:723`, mutation-tested per NOTICE.md:143) and check-fault-matrix §7.2
+   rows 10/11 (`e2e/check-fault-matrix.mjs:823`, `:917`). The row's
+   still-open remainder (ledger §6 item 3, the three M3.5 scripts missing
+   from `e2e/README.md`'s list) also landed — `f9a63ec` added the
+   check-fault-matrix / check-correctness-tier / check-capability-matrix
+   section. Gates own-eyes 2026-10-31: the FULL 30-script engine e2e
+   family PASS=30 FAIL=0 (incl. check-compaction 10/10, check-fault-matrix
+   6/6, and the receive-path scripts check-correctness-tier 7/7,
+   check-receive-caps 12/12, check-push-origin 6/6), engine `tsc
+   -p tsconfig.build.json` clean + dist-types regenerated, root `pnpm
+   typecheck` exit 0. Nothing remains of this row.
 
 5. **Doc-debt sweep (stale rows found while consolidating — see the
    report's flags):** (a) `specs/README.md`'s issue-content-history row

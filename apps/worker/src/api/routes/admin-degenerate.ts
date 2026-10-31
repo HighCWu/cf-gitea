@@ -54,7 +54,7 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
  *               ExecTimes counts manual runs too, tasks.go:95-97).
  *
  *             The registry SPLIT the two surfaces keep (disclosed): the
- *             census (7 arms) is the SCHEDULER's lens while the API's run
+ *             census (10 arms) is the SCHEDULER's lens while the API's run
  *             gate is the runnable subset whose producer bodies are landed
  *             here — upstream's registry is its runnable set, but upstream
  *             is one process where we are two invocation kinds (fetch vs
@@ -170,10 +170,13 @@ type CronRunBody = (env: Env) => Promise<number>;
  * landed here (services/cron-state.ts's census holds the per-arm upstream
  * cites; the bodies are the scheduled dispatcher's exact producer calls,
  * "run = enqueue" — "crons enqueue, consumers do the work"). A census arm
- * absent from this map (the actions-family arms, whose producer modules are
- * an in-flight sibling's ownership) answers the run arm's 404 exactly like
- * an unknown task — the monitor's adjudicated arm — and extending run
- * capability extends the monitor's RUNNABLE_CRON_ARMS in the same landing.
+ * absent from this map (the FIVE actions-family arms — stop_zombie_tasks,
+ * cleanup_actions, stop_endless_tasks, cancel_abandoned_jobs and
+ * cleanup_ephemeral_runners, whose producer modules live in
+ * services/actions/**, an in-flight sibling's ownership) answers the run
+ * arm's 404 exactly like an unknown task — the monitor's adjudicated arm —
+ * and extending run capability extends the monitor's RUNNABLE_CRON_ARMS in
+ * the same landing.
  */
 const CRON_RUN_BODIES: Readonly<Record<string, CronRunBody>> = {
   update_mirrors: (env) => enqueueDueMirrorSyncs(env, {}),
@@ -414,7 +417,7 @@ export function registerAdminDegenerateRoutes(app: OpenAPIHono<ApiEnv>, requireA
   // GET /admin/cron — the full arm census, upstream-paginated (cron.go:
   // ListCronTasks — count before the slice, X-Total-Count over the full
   // registry) with the recorded tick state merged (the monitor's loader
-  // shape; one point scan of a ≤7-row table).
+  // shape; one point scan of a ≤10-row table).
   app.openapi(adminCronListRoute(requireAuth), async (c) => {
     const options = parseListOptions(new URL(c.req.url));
     const start = (options.page - 1) * options.limit;

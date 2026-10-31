@@ -59,10 +59,10 @@
  *   cron     the FULL landed arm census — `CRON_ARMS` (services/
  *            cron-state.ts, the usability F3 listing): one row per scheduled
  *            arm of the Worker's `scheduled` handler, mirroring
- *            handleScheduledCron's dispatch exactly (three arms on every
- *            10-minute step entry, four producer arms on the hourly entry;
+ *            handleScheduledCron's dispatch exactly (four arms on every
+ *            10-minute step entry, six producer arms on the hourly entry;
  *            the census block comment holds the per-arm upstream twin cites
- *            and the two cf-gitea-extension names). The per-arm tick state —
+ *            and the three cf-gitea-extension names). The per-arm tick state —
  *            Previous Time / Executions / Result, upstream's TaskTableRow
  *            Prev/ExecTimes/Status triple — comes from the `cron_state`
  *            table (migration 0044), which the scheduled handler upserts per
@@ -78,7 +78,7 @@
  *            admin-degenerate.ts's CRON_RUN_BODIES (five runnable arms:
  *            update_mirrors, update_push_mirrors, demo_sweep,
  *            delete_old_audit_events, cleanup_packages; "run = enqueue"):
- *            the button renders only there and the two still-bodyless
+ *            the button renders only there and the five still-bodyless
  *            actions-family census arms render an empty first cell (never a
  *            dead control); a manual run records its tick too (upstream
  *            ExecTimes counts run STARTS — tasks.go:95-97 — and RunWithUser
@@ -141,7 +141,7 @@
  *   upstream renders one on every row because every registered task is
  *   runnable in its in-process scheduler; rendering ours for arms with no
  *   landed run body would POST into the task.unknown flash — the
- *   dead-control rule. The two actions-family census arms render an empty
+ *   dead-control rule. The five actions-family census arms render an empty
  *   first cell.
  * - The Result cell renders upstream's THREE states from the recorded tick
  *   state: `—` while the arm never recorded (Status ""), the octicon-check
@@ -262,14 +262,17 @@ export const adminMonitorLocale = {
   operationRun: "Run", // "admin.dashboard.operation_run" (the run button title)
   // The cron task name render (cron.tmpl:24 — `admin.dashboard.{Name}`).
   // Upstream's locale strings verbatim (options/locale/locale_en-US.json);
-  // the two cf-gitea-extension arms (no upstream key exists) are marked.
+  // the three cf-gitea-extension arms (no upstream key exists) are marked.
   taskUpdateMirrors: "Update Mirrors", // "admin.dashboard.update_mirrors"
   taskUpdatePushMirrors: "Update Push Mirrors", // cf-gitea extension (update_mirrors's push twin)
   taskStopZombieTasks: "Stop actions zombie tasks", // "admin.dashboard.stop_zombie_tasks"
+  taskStopEndlessTasks: "Stop actions endless tasks", // "admin.dashboard.stop_endless_tasks"
   taskDemoSweep: "Demo Sweep", // cf-gitea extension (SPEC-0014 — the producer's own log tag)
   taskDeleteOldAuditEvents: "Delete audit events older than the retention period", // "admin.dashboard.delete_old_audit_events"
   taskCleanupPackages: "Clean up expired packages", // "admin.dashboard.cleanup_packages"
   taskCleanupActions: "Clean up expired actions' resources", // "admin.dashboard.cleanup_actions"
+  taskCancelAbandonedJobs: "Cancel actions abandoned jobs", // "admin.dashboard.cancel_abandoned_jobs"
+  taskCleanupEphemeralRunners: "Clean up old ephemeral runners", // cf-gitea extension (no upstream key — upstream's own wrap text, cleanup.go:37)
   // The queue table headers (queue.tmpl:10-15, reduced to the sourced three).
   queueName: "Name", // "admin.monitor.queue.name"
   queueType: "Type", // "admin.monitor.queue.type"
@@ -573,12 +576,13 @@ function nextFireForSpec(spec: string, from: Date): Date | null {
  * consumers do the work"); the injected `now` rides the options object every
  * producer accepts. The run button renders ONLY for these arms (the set below
  * derives from this map, so the render gate and the apply dispatch can never
- * drift); the two actions-family census arms (stop_zombie_tasks,
- * cleanup_actions) stay absent — their producer modules are an in-flight
- * sibling's ownership, and a listed-but-unrunnable arm's op answers the
- * task.unknown flash exactly like an unknown one — never a dead control.
- * Extending run capability = extending this map (and the API registry's
- * CRON_RUN_BODIES) in one change.
+ * drift); the five actions-family census arms (stop_zombie_tasks,
+ * cleanup_actions, stop_endless_tasks, cancel_abandoned_jobs,
+ * cleanup_ephemeral_runners) stay absent — their producer modules live in
+ * services/actions/** (an in-flight sibling's ownership), and a
+ * listed-but-unrunnable arm's op answers the task.unknown flash exactly like
+ * an unknown one — never a dead control. Extending run capability = extending
+ * this map (and the API registry's CRON_RUN_BODIES) in one change.
  */
 type CronRunBody = (env: Env, options: { now?: Date }) => Promise<number>;
 
@@ -626,7 +630,7 @@ export function loadAdminMonitorCron(now: Date): { entries: AdminMonitorCronEntr
  * after a failed one REPLACES the error posture: status follows the LAST
  * recorded tick, exactly upstream's single Status field). An arm without a
  * row keeps the never-fired posture (a fresh deployment, the golden
- * harness). One point scan of a ≤7-row table.
+ * harness). One point scan of a ≤10-row table.
  */
 export async function loadAdminMonitorCronRunState(
   db: D1Database,
@@ -669,6 +673,8 @@ function taskDisplayName(name: string): string {
       return adminMonitorLocale.taskUpdatePushMirrors;
     case "stop_zombie_tasks":
       return adminMonitorLocale.taskStopZombieTasks;
+    case "stop_endless_tasks":
+      return adminMonitorLocale.taskStopEndlessTasks;
     case "demo_sweep":
       return adminMonitorLocale.taskDemoSweep;
     case "delete_old_audit_events":
@@ -677,6 +683,10 @@ function taskDisplayName(name: string): string {
       return adminMonitorLocale.taskCleanupPackages;
     case "cleanup_actions":
       return adminMonitorLocale.taskCleanupActions;
+    case "cancel_abandoned_jobs":
+      return adminMonitorLocale.taskCancelAbandonedJobs;
+    case "cleanup_ephemeral_runners":
+      return adminMonitorLocale.taskCleanupEphemeralRunners;
     default:
       return name;
   }

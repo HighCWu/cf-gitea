@@ -1,7 +1,7 @@
 /**
  * The cron tick state's tests (usability F3): the arm census (the exact
- * handleScheduledCron dispatch mirror — three step arms on every non-hourly
- * entry, four producer arms on the hourly entry), the two tick upserts over
+ * handleScheduledCron dispatch mirror — four step arms on every non-hourly
+ * entry, six producer arms on the hourly entry), the two tick upserts over
  * real D1 (success moves last_success + increments runs + CLEARS the error;
  * failure stamps the error pair and preserves the history; both clip; both
  * no-op on an empty arm set), and the monitor's read seam. The store module
@@ -44,31 +44,41 @@ const stepArms = armsForEntry("*/10 * * * *");
 const hourlyArms = armsForEntry(DEMO_SWEEP_CRON);
 
 describe("the arm census (CRON_ARMS — the handleScheduledCron dispatch mirror)", () => {
-  it("lists exactly the seven landed arms with the two wrangler specs", () => {
+  it("lists exactly the ten landed arms with the two wrangler specs", () => {
     expect(CRON_ARMS.map((arm) => arm.arm)).toEqual([
       "update_mirrors",
       "update_push_mirrors",
       "stop_zombie_tasks",
+      "stop_endless_tasks",
       "demo_sweep",
       "delete_old_audit_events",
       "cleanup_packages",
       "cleanup_actions",
+      "cancel_abandoned_jobs",
+      "cleanup_ephemeral_runners",
     ]);
     for (const arm of CRON_ARMS) {
       expect([DEMO_SWEEP_CRON, "*/10 * * * *"]).toContain(arm.spec);
     }
   });
 
-  it("the step entry carries the three unconditional arms", () => {
-    expect(stepArms.map((arm) => arm.arm)).toEqual(["update_mirrors", "update_push_mirrors", "stop_zombie_tasks"]);
+  it("the step entry carries the four unconditional arms", () => {
+    expect(stepArms.map((arm) => arm.arm)).toEqual([
+      "update_mirrors",
+      "update_push_mirrors",
+      "stop_zombie_tasks",
+      "stop_endless_tasks",
+    ]);
   });
 
-  it("the hourly entry carries the four producer arms", () => {
+  it("the hourly entry carries the six producer arms", () => {
     expect(hourlyArms.map((arm) => arm.arm)).toEqual([
       "demo_sweep",
       "delete_old_audit_events",
       "cleanup_packages",
       "cleanup_actions",
+      "cancel_abandoned_jobs",
+      "cleanup_ephemeral_runners",
     ]);
   });
 
@@ -83,7 +93,7 @@ describe("recordArmsSuccess (the completed-tick upsert)", () => {
   it("inserts a fresh row (runs 1, last_success set) and increments on the next tick", async () => {
     await recordArmsSuccess(env.DB, hourlyArms, { now: NOW });
     let rows = await drizzle(env.DB).select().from(cronState).all();
-    expect(rows).toHaveLength(4);
+    expect(rows).toHaveLength(6);
     expect(rows.every((row) => row.runs === 1 && row.lastError === null && row.lastErrorUnix === null)).toBe(true);
 
     await recordArmsSuccess(env.DB, hourlyArms, { now: LATER });

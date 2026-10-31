@@ -209,24 +209,30 @@ describe("adminCronList (GET /admin/cron)", () => {
   it("renders the full arm census under upstream's Cron shape (zero state when nothing recorded)", async () => {
     const res = await adminSend("/admin/cron", authed());
     expect(res.status).toBe(200);
-    // The census: the step entry's three arms, then the hourly entry's four
+    // The census: the step entry's four arms, then the hourly entry's six
     // (services/cron-state.ts CRON_ARMS order — the monitor's render order).
-    expect(res.headers.get("X-Total-Count")).toBe("7");
+    expect(res.headers.get("X-Total-Count")).toBe("10");
     const list: Record<string, unknown>[] = await res.json();
-    expect(list).toHaveLength(7);
+    expect(list).toHaveLength(10);
     expect(list.map((entry) => entry.name)).toEqual([
       "update_mirrors",
       "update_push_mirrors",
       "stop_zombie_tasks",
+      "stop_endless_tasks",
       "demo_sweep",
       "delete_old_audit_events",
       "cleanup_packages",
       "cleanup_actions",
+      "cancel_abandoned_jobs",
+      "cleanup_ephemeral_runners",
     ]);
     expect(list.map((entry) => entry.schedule)).toEqual([
       "*/10 * * * *",
       "*/10 * * * *",
       "*/10 * * * *",
+      "*/10 * * * *",
+      "0 * * * *",
+      "0 * * * *",
       "0 * * * *",
       "0 * * * *",
       "0 * * * *",
@@ -275,9 +281,15 @@ describe("adminCronList (GET /admin/cron)", () => {
   it("paginates like upstream (page beyond the set → empty, total kept)", async () => {
     const page2 = await adminSend("/admin/cron?page=2&limit=5", authed());
     expect(page2.status).toBe(200);
-    expect(page2.headers.get("X-Total-Count")).toBe("7");
+    expect(page2.headers.get("X-Total-Count")).toBe("10");
     const page2List: Record<string, unknown>[] = await page2.json();
-    expect(page2List.map((entry) => entry.name)).toEqual(["cleanup_packages", "cleanup_actions"]);
+    expect(page2List.map((entry) => entry.name)).toEqual([
+      "delete_old_audit_events",
+      "cleanup_packages",
+      "cleanup_actions",
+      "cancel_abandoned_jobs",
+      "cleanup_ephemeral_runners",
+    ]);
 
     const page1 = await adminSend("/admin/cron?page=1&limit=1", authed());
     expect(page1.status).toBe(200);
@@ -302,12 +314,21 @@ describe("adminCronRun (POST /admin/cron/{task})", () => {
   });
 
   it("404s a listed-but-unrunnable census arm exactly like an unknown task, recording nothing", async () => {
-    // stop_zombie_tasks IS in the list's census (its producer module is an
-    // in-flight sibling's ownership) — the run gate answers the same 404.
-    const res = await adminSend("/admin/cron/stop_zombie_tasks", authed({ method: "POST" }));
-    expect(res.status).toBe(404);
-    const body: Record<string, unknown> = await res.json();
-    expect(body.message).toBe("not found");
+    // Every actions-family census arm IS in the list's census (its producer
+    // module — services/actions/** — is an in-flight sibling's ownership) —
+    // the run gate answers the same 404 for all five.
+    for (const task of [
+      "stop_zombie_tasks",
+      "cleanup_actions",
+      "stop_endless_tasks",
+      "cancel_abandoned_jobs",
+      "cleanup_ephemeral_runners",
+    ]) {
+      const res = await adminSend(`/admin/cron/${task}`, authed({ method: "POST" }));
+      expect(res.status, task).toBe(404);
+      const body: Record<string, unknown> = await res.json();
+      expect(body.message, task).toBe("not found");
+    }
     const rows = await drizzle(env.DB).select().from(cronState).all();
     expect(rows).toEqual([]);
   });
