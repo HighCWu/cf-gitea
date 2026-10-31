@@ -18,13 +18,13 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
                                                       # D1-only: --base-url/--token-file optional
 ```
 
-- Batteries (16): `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
+- Batteries (17): `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
   `ui-login`, `window2-mounts`, `window3-mounts`, `fixwave-parity`,
   `branch-protection`, `demo`, `wiki-git`, `packages-registry`,
-  `packages-distro`, `packages-protocols`, `cleanup-audit`, `all` (runs the 16
-  in that order, audit last). `all --dry-run` plans **190 probes** across them
-  (the counts in the table below were read off that dry-run at this writing;
-  `registry` scales with `--trials`).
+  `packages-distro`, `packages-protocols`, `packages-minor`, `cleanup-audit`,
+  `all` (runs the 17 in that order, audit last). `all --dry-run` plans
+  **199 probes** across them (the counts in the table below were read off
+  that dry-run at this writing; `registry` scales with `--trials`).
 - **The `cleanup-audit` battery is D1-only** (wrangler d1 execute, no HTTP): it
   takes neither `--base-url` nor `--token-file` — a missing token only errors
   when a selected battery actually makes HTTP calls (REDEPLOY15 friction: the
@@ -71,7 +71,7 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
 
 ## Batteries and their canonical expectations
 
-The registry at this writing — 16 batteries, **190 probes** (`all
+The registry at this writing — 17 batteries, **199 probes** (`all
 --dry-run`; `registry`'s count scales with `--trials`, here at its
 default 3):
 
@@ -92,8 +92,9 @@ default 3):
 | `packages-registry` | 11 | all SIX protocols end-to-end (generic/pypi/npm/helm/maven/nuget) + the D1 row sweep + repo delete | HTTP + **wrangler auth** (the row sweep rides `--d1-scope`) |
 | `packages-distro` | 5 | the M7 distro tail: rpm (hand-built fixture → .repo configs + repomd.xml + primary.xml.gz + repository.key → delete → repodata gone) + arch (.PKGINFO package → packages.db tar + symlink-dance aliases + .sig → delete → index 404 empty) + the D1 husk sweep + repo delete | HTTP + **wrangler auth** (the husk row sweep rides `--d1-scope`) |
 | `packages-protocols` | 9 | the SPEC-0016 §7 long tail: go (module zip → list/@latest/.info/.mod/.zip + sumdb 404 + missing-module 404s, + real `go mod download` when the toolchain is on the host) + cargo (.crate container → the {"ok"} shapes + config.json + sparse index + yank/unyank + download, + real `cargo fetch` through the in-script h2c-stripping proxy on plain-HTTP) + swift (login pair → multipart PUT → enumerate + Link → metadata + Digest zip → manifest 200/303 → identifiers) + rubygems (.gem → compact index → specs marshal → byte-parity download → gemspec.rz → yank) + the D1 husk sweep + repo delete | HTTP + **wrangler auth** (the husk row sweep rides `--d1-scope`); the two REAL-CLIENT arms degrade to a documented `[warn]` when `go`/`cargo` is off the probe host |
+| `packages-minor` | 9 | the SPEC-0016 §7 minor six: chef (cookbook tar.gz → universe + search + cookbook/version metadata with the 1_0_1 knife quirk → download → protocol version delete) + composer (raw zip PUT ?version= → packages.json/list.json/p2 with the %2F dist url + sha1 → download → management delete) + conan (v2 recipe revision → revisions/latest + the pinned revision-files list {"conanfile.py":null} → pinned download → pinned v2 delete) + cran (DESCRIPTION tar.gz → PACKAGES(.gz) block with the EMPTY MD5sum → download → management delete) + pub (request-upload → multipart → finalize → the normalized enumerate → download → management delete) + vagrant (box PUT → HEAD probe → the provider array + sha512 → download → management delete) + the D1 husk sweep + repo delete | HTTP + **wrangler auth** (the husk row sweep rides `--d1-scope`) |
 | `cleanup-audit` | 10 | post-run D1 count shapes (independent counts) | **D1-only** — wrangler auth, `--d1-scope remote\|local` (default remote); takes NEITHER `--base-url` NOR `--token-file` |
-| **`all`** | **190** | every battery in registry order, audit last | union of the above |
+| **`all`** | **199** | every battery in registry order, audit last | union of the above |
 
 Expectations are ported from `docs/design/p0-evidence.md` — the REDEPLOY13
 block (2026-10-26, ~lines 1507-1697) for the shallow trio, generate, ui-login,
@@ -632,6 +633,75 @@ prints all of them verbatim.
   the fullName the create returned (logged on one
   `[tail] proto-leftover-sweep` line; failures feed `left_behind`, never
   fatal; a green run no-ops silently).
+- **packages-minor** — the SPEC-0016 §7 minor six protocol families in ONE
+  owner-scoped sweep (the 28a40b5 wave; one probe repo vehicle + the run PAT;
+  every fixture GENERATED INLINE — the landed suites' hand-built builders, no
+  registry tooling on the probe host). INDEPENDENT (the protocols posture —
+  one red family never hides the others; every arm self-contains its family):
+  **pminor-chef-roundtrip** — POST `/chef/api/v1/cookbooks` the multipart
+  `tarball` part (a gzip'd tar whose `{cookbook}/metadata.json` member
+  carries EXACTLY one "/") → 201 `{}`; `/universe` carries the row
+  (`location_type` "opscode", the location_path/download_url pair, the
+  dependencies map); `/search?q=` the start/total/items item; the cookbook
+  metadata (`category` "" + `deprecated` false + the versions url array); the
+  version metadata read through the **1_0_1 knife quirk** (the version
+  segment's "_" reads as "."); the download byte parity; the PROTOCOL version
+  delete → 200 and the `{"error_messages":[""]}` 404 after.
+  **pminor-composer-roundtrip** — PUT `/composer?version=1.0.3` the raw zip
+  (the composer.json carries NO version — the query-param fallback) → 201
+  EMPTY; `packages.json` answers the exact three-template service index off
+  the request origin; `list.json` carries the name; the p2 metadata document
+  (`minified` "composer/2.0", the entry's `type` "library" default, the dist
+  url with the **%2F-encoded name path** and the stored **sha1 shasum**, the
+  empty source triple — no linked repo); the dist download rides the %2F path
+  byte parity; the management delete → 204 and the p2
+  `{"errors":[{status,message}]}` 404 after. **pminor-conan-roundtrip** —
+  PUT `/conan/v2/conans/{name}/{version}/{user}/{channel}/revisions/rev1/
+  files/conanfile.py` (the six-field conanfile) → 201; the v2 revisions list
+  (the json.Encoder newline, the created-DESC aggregate), the latest probe;
+  the pinned revision-files list answering
+  `{"files":{"conanfile.py":null}}` (the WebCrypto md5 reduction); the
+  pinned-revision
+  download byte parity; the v2 PINNED revision DELETE → 200 and the
+  revisions 404 `{"message":""}` after. **pminor-cran-roundtrip** — PUT
+  `/cran/src` the tar.gz (`{pkg}/DESCRIPTION` shallow member with
+  continuation lines) → 201; `PACKAGES` carries the exact field block
+  (Package/Version/License/Depends/Imports joined from the continuations/
+  NeedsCompilation ALWAYS/`MD5sum: ` rendering the **EMPTY value**); the
+  `PACKAGES.gz` twin decompresses to the same block
+  (application/x-gzip); the `{Package}_{Version}.tar.gz` download byte
+  parity (the Archive/{package}/{filename} path shares the handler); the
+  management delete → 204 and the EMPTY-body plain-text 404 after.
+  **pminor-pub-roundtrip** — the repository-spec-v2 publish dance: GET
+  `versions/new` → `{"url": …, "fields":{}}`; POST the multipart `file` part
+  (a tar.gz whose pubspec.yaml carries the **"v"-prefixed** version) → 204
+  EMPTY + the Location finalize header; GET finalize →
+  `{"success":{"message":""}}`; the enumerate answers the **NORMALIZED**
+  "1.2.3" everywhere (v.String()) with the pubspec pass-through carrying the
+  RAW "v1.2.3" and the archive_url; the archive download byte parity; the
+  management delete → 204 and the `{"error":{code,message}}` 404 after.
+  **pminor-vagrant-roundtrip** — PUT `/{box}/1.0.0/probe.box` (a gzip'd tar
+  whose info.json carries the description) → 201; the HEAD box probe → 200;
+  the enumerate carries the **provider array** (`name` "probe" — the file
+  property, original case minus .box — the url, `checksum` == the stored
+  **sha512**, `checksum_type` "sha512") and the newest version's
+  description; the download byte parity; the management delete → 204 and the
+  `{"errors":[""]}` 404 after. Cleanup is self-cleaning at the version layer
+  PLUS one D1 husk sweep arm (`pminor-cleanup-rows-d1`, the
+  packages-protocols precedent — wrangler auth, `--d1-scope`): chef's
+  protocol version delete and conan's pinned-revision delete ARE their
+  protocol deletes, the other four ride the management API (fold version +
+  files upstream-parity), so the empty package HUSKS sweep via D1 with the
+  zero-rows assert; the distro-internal rows + owner keypairs stay standing
+  and unreferenced blob content rides the >24 h cleanup queue as documented
+  residue. The probe repo DELETEs 204 (`pminor-cleanup-repo-204`). **Failure
+  cleanup (the consistency posture):** a finally-style tail best-effort
+  management-deletes exactly what the arms uploaded and have not already
+  deleted (the per-family gone flags), then sweeps the package rows (D1,
+  unless the in-chain sweep already ran), then deletes the probe repo under
+  the fullName the create returned (logged on one
+  `[tail] pmin-leftover-sweep` line; failures feed `left_behind`, never
+  fatal; a green run no-ops silently).
 - **cleanup-audit** — one wrangler d1 execute (`--d1-scope remote|local`,
   default remote) runs the whole count shape; **D1-only, so it runs without
   `--base-url`/`--token-file`**; the checks are INDEPENDENT (one red count
@@ -708,6 +778,14 @@ prints all of them verbatim.
     nothing to sweep there), then its package rows (D1 — the version
     deletes leave the empty package husks), then its probe repo;
     `[tail] proto-leftover-sweep`.
+  - `packages-minor` — its uploaded chef cookbook version, composer
+    package version, conan recipe version, cran source version, pub
+    package version, and vagrant box version (all best-effort management
+    deletes, gone-flagged — chef's protocol delete and conan's pinned v2
+    delete count as their own deletes, and a forced-red arm never uploaded
+    anything, so nothing to sweep there), then its package rows (D1 — the
+    version deletes leave the empty package husks), then its probe repo;
+    `[tail] pmin-leftover-sweep`.
   One `[tail]` line logs every action; failures feed `left_behind`, never
   fatal; a green run no-ops silently (the battery's own cleanup arms already
   emptied everything, and the gone flags skip the rest). The audit battery
@@ -803,6 +881,15 @@ prints all of them verbatim.
     never fails the battery — force a fixture-creating arm like
     `proto-swift-roundtrip` instead to see the forced-red shape on such a
     host).
+  - `packages-minor --force-red pminor-chef-roundtrip` — the same
+    INDEPENDENT posture: the forced arm reds UNRUN while the other steps
+    still run green (the create, the composer/conan/cran/pub/vagrant arms —
+    each self-deleting — the husk row sweep — which answers "already clean"
+    for the never-uploaded chef fixture among the registered names — and the
+    repo cleanup); the `[tail] pmin-leftover-sweep` line legitimately stays
+    silent (nothing the run created survived; a mid-arm red after a real PUT
+    is what the tail's gone-flagged management deletes + row sweep cover,
+    and that shape is not deterministically forceable).
   The rehearsal convention: each forced-red run is followed by a
   `cleanup-audit` run, and the audit going green is the sweep's proof.
 - The mirror battery can also be forced honestly through its real budget

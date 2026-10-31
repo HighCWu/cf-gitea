@@ -278,6 +278,61 @@
  *                  hides the others; every arm self-contains its family). A
  *                  red run sweeps the uploaded versions' rows + the repo (the
  *                  failureTail).
+ *   packages-minor The SIX MINOR protocol families' round-trips in ONE
+ *                  owner-scoped sweep (the chef/composer/conan/cran/pub/
+ *                  vagrant rows of SPEC-0016 §7, landed at 28a40b5; one probe
+ *                  repo vehicle + the run PAT; every fixture GENERATED INLINE
+ *                  — the landed suites' hand-built builders): the chef arm
+ *                  POSTs a hand-built cookbook tar.gz (the multipart tarball
+ *                  part over the ONE-slash metadata.json member) → 201 {},
+ *                  the universe row (location_type "opscode" + the download
+ *                  url + the dependencies map), the search item, the cookbook
+ *                  + version metadata (the "_"→"." knife quirk), the download
+ *                  byte parity, then the PROTOCOL version delete → the read
+ *                  404; the composer arm PUTs a raw zip with ?version= (the
+ *                  composer.json carries no version — the query-param
+ *                  fallback) → 201, the packages.json service-index
+ *                  templates, the list.json name, the p2 metadata document
+ *                  (minified composer/2.0, the dist url with the %2F-encoded
+ *                  name and the stored sha1 shasum, the empty source triple),
+ *                  the dist download byte parity, then the management delete
+ *                  → the p2 404; the conan arm PUTs the v2 recipe revision's
+ *                  conanfile.py (the six-key lattice's minimal recipe keys)
+ *                  → 201, the v2 revisions list + latest probe (the created-
+ *                  DESC aggregate), the pinned revision-files list
+ *                  ({"conanfile.py": null} — the WebCrypto md5 reduction), the
+ *                  pinned-revision download byte parity, then the v2 pinned
+ *                  DELETE → the revisions 404; the cran arm PUTs a tar.gz
+ *                  DESCRIPTION (the {pkg}/DESCRIPTION shallow member) to
+ *                  /src → 201, the PACKAGES index block (the field order,
+ *                  NeedsCompilation ALWAYS, MD5sum rendering EMPTY — the
+ *                  WebCrypto reduction), the PACKAGES.gz twin
+ *                  (application/x-gzip), the {Package}_{Version}.tar.gz
+ *                  download byte parity, then the management delete → the
+ *                  EMPTY-body 404; the pub arm walks the publish dance —
+ *                  GET versions/new (the {url, fields:{}} request-upload),
+ *                  POST the multipart file part (a tar.gz whose pubspec.yaml
+ *                  carries "v1.2.3") → 204 + the Location finalize header,
+ *                  GET finalize → {"success":{"message":""}}, the enumerate
+ *                  (the NORMALIZED "1.2.3" everywhere — v.String() — the
+ *                  pubspec pass-through, the archive_url), the download byte
+ *                  parity, then the management delete → the {"error":{code,
+ *                  message}} 404; the vagrant arm PUTs a hand-built .box
+ *                  (a gzip'd tar whose info.json carries the description) →
+ *                  201, the HEAD box probe, the enumerate (the provider
+ *                  ARRAY — name "probe", the url, checksum == the stored
+ *                  sha512, checksum_type "sha512"), the download byte parity,
+ *                  then the management delete → the {"errors":[""]} 404.
+ *                  Cleanup: composer/cran/pub/vagrant carry NO protocol
+ *                  delete (chef's and conan's protocol deletes ARE their
+ *                  arms' deletes), so those version deletes ride the
+ *                  management API and fold version + files upstream-parity —
+ *                  the empty package HUSKS sweep via D1 (the
+ *                  packages-protocols precedent, wrangler auth, --d1-scope)
+ *                  with the zero-rows assert. INDEPENDENT (the distro
+ *                  posture — one red family never hides the others; every arm
+ *                  self-contains its family). A red run sweeps the uploaded
+ *                  versions' rows + the repo (the failureTail).
  *   cleanup-audit  The post-run D1 count shapes (wrangler d1 execute; see the
  *                  audit SQL below for the exact tables).
  *   all            Every battery in the order above (audit last).
@@ -382,7 +437,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerDir = path.join(repoRoot, "apps", "worker");
 const DEFAULT_USER = "p0probe";
-const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "packages-protocols", "cleanup-audit", "all"];
+const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "packages-protocols", "packages-minor", "cleanup-audit", "all"];
 /** Batteries that make NO HTTP calls (they read D1 via wrangler only):
  *  --base-url and --token-file are OPTIONAL for these (REDEPLOY15 friction
  *  (a): the D1-only audit still demanded a PAT, forcing a scratch-mint +
@@ -5837,6 +5892,626 @@ const packagesProtocolsSteps = (ctx) => {
   ];
 };
 
+// ---------- battery: packages-minor (the chef/composer/conan/cran/pub/vagrant six) ----------
+
+/**
+ * The six MINOR protocol families' round-trips (SPEC-0016 §7's chef/composer/
+ * conan/cran/pub/vagrant rows — the registry's FOURTH family group after
+ * packages-registry's six registry protocols, packages-distro's rpm/arch and
+ * packages-protocols' go/cargo/swift/rubygems): SIX families over ONE
+ * owner-scoped fixture set — a public probe repo as the owner vehicle + the
+ * run PAT (write:package via `all`). Every fixture is GENERATED INLINE (the
+ * landed suites' hand-built builders — no registry tooling on the probe
+ * host), and every family arm self-contains its round-trip:
+ *
+ *   - chef     the cookbook tar.gz upload (the multipart `tarball` part over
+ *              a gzip'd tar whose metadata.json member carries EXACTLY one
+ *              "/" — chef.go's one-slash pick) → 201 {}, the universe row
+ *              ({cookbook: {version: {location_type "opscode", location_path,
+ *              download_url, dependencies}}}), the search item (the q
+ *              filter), the cookbook metadata (SemVer-sorted versions, the
+ *              category ""/deprecated false constants), the version metadata
+ *              read through the "_"→"." knife quirk (1_0_1 answers 1.0.1),
+ *              the tarball download byte parity, then the PROTOCOL version
+ *              delete (DELETE …/cookbooks/{name}/versions/{version} → 200)
+ *              and the version-metadata 404 after.
+ *   - composer the RAW-body zip PUT with ?version= (the composer.json carries
+ *              NO version — the query-param fallback is the assert) → 201,
+ *              the packages.json service index (the three %…% templates off
+ *              the request origin), list.json carrying the name, the p2
+ *              metadata document (minified "composer/2.0", the entry's
+ *              type "library" default + time ISO + dist {type zip, url with
+ *              the %2F-ENCODED name path, shasum == the stored sha1} + the
+ *              empty source triple — no linked repo), the dist download byte
+ *              parity through the %2F path, then the management delete → the
+ *              p2 404 {"errors":[{status,message}]}.
+ *   - conan    the v2 recipe upload: PUT
+ *              …/conans/{name}/{version}/{user}/{channel}/revisions/{rev}/
+ *              files/conanfile.py (the six-field conanfile the parser's
+ *              regexes read) → 201, the v2 revisions list
+ *              ({"revisions":[{revision,time}]}, Go's json.Encoder newline),
+ *              the v2 latest probe, the V1 SNAPSHOT over the same property
+ *              lattice ({"conanfile.py": ""} — the WebCrypto md5 reduction),
+ *              the pinned-revision download byte parity, then the v2 PINNED
+ *              revision DELETE → 200 and the revisions list 404s
+ *              ({"message":""}).
+ *   - cran     the source PUT (/cran/src — a tar.gz whose {pkg}/DESCRIPTION
+ *              shallow member feeds the continuation-line reader) → 201, the
+ *              PACKAGES index block (Package/Version/License/Depends/
+ *              Imports/NeedsCompilation ALWAYS/MD5sum — the MD5sum renders
+ *              the EMPTY value, the documented reduction), the PACKAGES.gz
+ *              twin (application/x-gzip, decompresses to the same block),
+ *              the {Package}_{Version}.tar.gz download byte parity, then the
+ *              management delete → the EMPTY-body plain-text 404.
+ *   - pub      the repository-spec-v2 publish dance: GET versions/new (the
+ *              {url, fields:{}} request-upload), POST the multipart `file`
+ *              part (a tar.gz whose pubspec.yaml version carries the
+ *              "v"-prefixed form) → 204 EMPTY + the Location finalize
+ *              header, GET finalize → {"success":{"message":""}}, the
+ *              enumerate ({"name","latest","versions"} — the NORMALIZED
+ *              "1.2.3" everywhere (v.String()), the pubspec pass-through,
+ *              the archive_url, the pub content type), the archive download
+ *              byte parity, then the management delete → the
+ *              {"error":{code,message}} 404.
+ *   - vagrant  the box PUT (/{name}/{version}/{provider}.box over a gzip'd
+ *              tar whose info.json carries the description) → 201, the HEAD
+ *              box probe (200), the enumerate (the provider ARRAY — name
+ *              "probe" (the property, original case minus .box), the url,
+ *              checksum == the stored sha512, checksum_type "sha512", the
+ *              newest version's description), the download byte parity
+ *              (the lowercased provider file name), then the management
+ *              delete → the {"errors":[""]} 404.
+ *
+ * Deletes + the husk sweep (the packages-protocols precedent): chef's
+ * version delete and conan's pinned-revision delete ARE their protocol
+ * deletes; composer/cran/pub/vagrant expose NO protocol delete, so those
+ * version deletes ride the management API (DELETE /api/v1/packages/{owner}/
+ * {type}/{name}/{version} → 204) and fold version + files upstream-parity —
+ * the empty package HUSKS sweep via D1 with the zero-rows assert. The
+ * distro-internal rows (_rpm/_arch/_debian/_alpine + the owner keypairs) are
+ * STANDING per-owner infrastructure the sweep never touches; unreferenced
+ * blob content rides the >24 h cleanup queue as documented residue. Package
+ * names are unique per run. INDEPENDENT (the distro posture): every arm
+ * self-contains its family — a red never hides the others. A red run sweeps
+ * the uploaded versions' rows + the repo (the failureTail).
+ */
+
+/** The chef cookbook tar.gz (the chef.test.ts makeCookbook shape — the
+ *  metadata.json member carries EXACTLY one "/" in its path). */
+const buildChefCookbook = (name, metadataJson) =>
+  gzipSync(tarBytes([[`${name}/metadata.json`, Buffer.from(metadataJson, "utf8")]]));
+
+/** The composer archive (the composer.test.ts composerArchive shape — the
+ *  composer.json carries the name; the version rides the ?version= query). */
+const buildComposerArchive = (name) =>
+  zipStoredBytes([
+    ["composer.json", Buffer.from(JSON.stringify({
+      name,
+      description: "deploy-probes composer round-trip probe",
+      license: "MIT",
+    }), "utf8")],
+    ["README.md", Buffer.from("# Readme\n", "utf8")],
+  ]);
+
+/** The conanfile.py text (the six fields the conanfile_parser regexes read —
+ *  the quoted-value forms `field = "value"` the patterns capture). */
+const buildConanfileText = (name, version) => [
+  "from conans import ConanFile",
+  "",
+  "class ProbeConan(ConanFile):",
+  `    name = "${name}"`,
+  `    version = "${version}"`,
+  '    author = "deploy-probes"',
+  '    homepage = "https://gitea.io/"',
+  '    url = "https://gitea.io/gitea/gitea"',
+  '    license = "MIT"',
+  '    description = "deploy-probes conan round-trip probe"',
+  '    topics = ("conan", "probe")',
+  "",
+  "    def build(self):",
+  "        pass",
+  "",
+].join("\n");
+
+/** The R DESCRIPTION document (the cran.test.ts fixture shape — the
+ *  continuation lines join the previous field with a space). */
+const buildCranDescription = (name) => [
+  `Package: ${name}`,
+  "Version: 1.0.3",
+  "Title: The deploy-probes Package",
+  "Author: deploy-probes (maintainer)",
+  "Maintainer: deploy-probes",
+  "Description: deploy-probes cran round-trip probe",
+  "    continued",
+  "License: MIT",
+  "Depends: methods,",
+  "    utils",
+  "Imports: abc,",
+  " 123",
+  "NeedsCompilation: yes",
+  "",
+].join("\n");
+
+const packagesMinorContext = () => ({
+  user: opts.user, repo: `pmin-${hexId()}`, tmp: null,
+  repoCreated: false, repoFullName: null, repoGone: false,
+  chef: null, chefGone: false,
+  composer: null, composerGone: false,
+  conan: null, conanGone: false,
+  cran: null, cranGone: false,
+  pub: null, pubGone: false,
+  vagrant: null, vagrantGone: false,
+  packageNames: [], rowsSwept: false,
+});
+
+const packagesMinorFailureCleanup = async (ctx) => {
+  const acts = [];
+  const versionDeletes = [
+    ["chef", ctx.chef, ctx.chefGone],
+    ["composer", ctx.composer, ctx.composerGone],
+    ["conan", ctx.conan, ctx.conanGone],
+    ["cran", ctx.cran, ctx.cranGone],
+    ["pub", ctx.pub, ctx.pubGone],
+    ["vagrant", ctx.vagrant, ctx.vagrantGone],
+  ];
+  for (const [type, state, gone] of versionDeletes) {
+    if (state === null || gone === true) continue;
+    try {
+      const del = await pkgMgmtDeleteVersion(ctx.user, type, state.name, state.version);
+      if (del.status === 204) acts.push(`${type} ${state.name}@${state.version} deleted`);
+      else if (del.status === 404) acts.push(`${type} ${state.name}@${state.version} already gone (the row sweep got there first)`);
+      else {
+        leftBehind.push(`${type} ${state.name}@${state.version} (DELETE returned ${del.status})`);
+        acts.push(`${type} ${state.name}@${state.version} LEFT BEHIND — DELETE returned ${del.status}`);
+      }
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      leftBehind.push(`${type} ${state.name}@${state.version} (failure-cleanup tail: ${why})`);
+      acts.push(`${type} delete FAILED — ${why}`);
+    }
+  }
+  if (ctx.rowsSwept !== true && ctx.packageNames.length > 0) {
+    try {
+      acts.push(...(await packagesDeleteProbeRows(ctx)));
+    } catch (err) {
+      leftBehind.push(`package rows ${ctx.packageNames.join(", ")} (failure-cleanup tail: ${err instanceof Error ? err.message : String(err)})`);
+      acts.push(`package-row sweep FAILED — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (ctx.repoCreated === true && ctx.repoGone !== true) {
+    const [owner, repo] = String(ctx.repoFullName ?? `${ctx.user}/${ctx.repo}`).split("/");
+    try {
+      const out = await deleteRepo(owner, repo);
+      acts.push(typeof out === "string" ? out : out.detail);
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      leftBehind.push(`repo ${owner}/${repo} (failure-cleanup tail: DELETE threw: ${why})`);
+      acts.push(`repo ${owner}/${repo} LEFT BEHIND — DELETE threw: ${why}`);
+    }
+  }
+  if (acts.length) log(`  [tail] pmin-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
+};
+
+const packagesMinorSteps = (ctx) => {
+  const origin = opts.baseUrl; // every URL assert renders off the request origin
+  const isoShape = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+  // --- chef ---
+  const chefName = `pmin-chef-${hexId()}`;
+  const chefVersion = "1.0.1";
+  const chefMetaJson = JSON.stringify({
+    name: chefName,
+    version: chefVersion,
+    description: "deploy-probes chef round-trip probe",
+    long_description: "Long",
+    maintainer: "deploy-probes",
+    license: "MIT",
+    source_url: "https://gitea.io/gitea/gitea",
+    dependencies: { apt: ">= 1.0" },
+  });
+  const chefTarball = buildChefCookbook(chefName, chefMetaJson);
+  const chefForm = swiftUploadMultipart([
+    { name: "tarball", filename: `${chefVersion}.tar.gz`, body: chefTarball },
+  ]);
+  // --- composer ---
+  const composerVendor = "pmin";
+  const composerProject = `composer-${hexId()}`;
+  const composerName = `${composerVendor}/${composerProject}`;
+  const composerVersion = "1.0.3";
+  const composerZip = buildComposerArchive(composerName);
+  // --- conan ---
+  const conanRef = { name: `pmin-conan-${hexId()}`, version: "1.2.0", user: "probeu", channel: "probec", revision: "rev1" };
+  const conanfileText = buildConanfileText(conanRef.name, conanRef.version);
+  // --- cran ---
+  const cranName = `pmincran${hexId()}`;
+  const cranVersion = "1.0.3";
+  const cranTarball = gzipSync(tarBytes([
+    [`${cranName}/DESCRIPTION`, Buffer.from(buildCranDescription(cranName), "utf8")],
+  ]));
+  // --- pub ---
+  const pubName = `pminpub${hexId()}`;
+  const pubVersionRaw = "v1.2.3"; // the pubspec carries the v-prefixed form…
+  const pubVersionStored = "1.2.3"; // …every read answers the NORMALIZED form
+  const pubspecText = [
+    `name: ${pubName}`,
+    `version: ${pubVersionRaw}`,
+    "description: deploy-probes pub round-trip probe",
+    "homepage: https://gitea.io",
+    "repository: https://gitea.io/gitea/gitea",
+    "environment:",
+    "  sdk: '>=3.0.0 <4.0.0'",
+    "dependencies:",
+    "  http: ^1.2.0",
+    "",
+  ].join("\n");
+  const pubArchive = gzipSync(tarBytes([
+    ["pubspec.yaml", Buffer.from(pubspecText, "utf8")],
+    ["readme.md", Buffer.from("# Readme\n", "utf8")],
+  ]));
+  const pubForm = swiftUploadMultipart([
+    { name: "file", filename: "probe.tar.gz", body: pubArchive },
+  ]);
+  // --- vagrant ---
+  const vagrantName = `pmin-box-${hexId()}`;
+  const vagrantVersion = "1.0.0";
+  const vagrantProvider = "probe.box";
+  const vagrantBox = gzipSync(tarBytes([
+    ["info.json", Buffer.from(JSON.stringify({
+      description: "deploy-probes vagrant box probe",
+      author: "deploy-probes",
+    }), "utf8")],
+  ]));
+  // All probe names registered at step-list construction (the protocols posture).
+  ctx.packageNames = [chefName, composerName, conanRef.name, cranName, pubName, vagrantName];
+  return [
+    {
+      id: "pminor-create-repo-201",
+      expect: `POST /api/v1/user/repos {"name":"${ctx.repo}","auto_init":true} → 201 (the owner fixture vehicle — all six families are OWNER-scoped rows, the repo only proves coexistence)`,
+      run: async () => {
+        const res = await api("/user/repos", { method: "POST", body: { name: ctx.repo, private: false, auto_init: true } });
+        expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+        ctx.repoCreated = true; // the failure-cleanup tail deletes it if a later arm reds
+        ctx.repoFullName = String(res.json?.full_name ?? `${ctx.user}/${ctx.repo}`);
+        return `created ${res.json?.full_name}`;
+      },
+    },
+    {
+      id: "pminor-chef-roundtrip",
+      expect: `chef: POST /chef/api/v1/cookbooks the multipart tarball (a gzip'd tar whose ${chefName}/metadata.json member carries EXACTLY one "/") → 201 {}; GET /universe → the ${chefName} row {location_type "opscode", location_path, download_url, dependencies {apt:>= 1.0}}; GET /search?q=&items=10 (knife's wire) → the start/total/items item; GET /cookbooks/${chefName} → the metadata (category "", deprecated false, the versions url array); GET /cookbooks/${chefName}/versions/1_0_1 → the "_"→"." knife quirk answers ${chefVersion} (+ tarball_file_size/license/dependencies); GET …/versions/${chefVersion}/download → byte parity; DELETE the version (the PROTOCOL delete) → 200 and the version metadata 404 {"error_messages":[""]} after`,
+      run: async () => {
+        const chefBase = `${origin}/api/packages/${ctx.user}/chef/api/v1`;
+        const put = await pkgFetch(`/${ctx.user}/chef/api/v1/cookbooks`, {
+          method: "POST",
+          headers: { "content-type": chefForm.contentType },
+          body: chefForm.body,
+        });
+        expect(put.status === 201 && put.text === "{}", `upload ${put.status} ${put.text.slice(0, 120)} (expected 201 {})`);
+        ctx.chef = { name: chefName, version: chefVersion };
+        const universe = await pkgFetch(`/${ctx.user}/chef/api/v1/universe`);
+        expect(universe.status === 200, `universe status ${universe.status} (expected 200)`);
+        expect(String(universe.headers.get("content-type") ?? "") === "application/json",
+          `universe content-type ${JSON.stringify(universe.headers.get("content-type"))} (expected application/json)`);
+        const universeJson = JSON.parse(universe.text);
+        const row = universeJson[chefName];
+        expect(row !== undefined, `universe carries no ${chefName} row (keys: ${Object.keys(universeJson).slice(0, 8).join(", ") || "none"})`);
+        const versionInfo = row?.[chefVersion];
+        expect(versionInfo?.location_type === "opscode", `universe location_type ${JSON.stringify(versionInfo?.location_type)} (expected opscode)`);
+        expect(versionInfo?.location_path === chefBase, `universe location_path drift: ${JSON.stringify(versionInfo?.location_path)}`);
+        expect(versionInfo?.download_url === `${chefBase}/cookbooks/${chefName}/versions/${chefVersion}/download`,
+          `universe download_url drift: ${JSON.stringify(versionInfo?.download_url)}`);
+        expect(JSON.stringify(versionInfo?.dependencies) === JSON.stringify({ apt: ">= 1.0" }),
+          `universe dependencies ${JSON.stringify(versionInfo?.dependencies)} (expected the apt map)`);
+        const search = await pkgFetch(`/${ctx.user}/chef/api/v1/search?q=${encodeURIComponent(chefName)}&items=10`);
+        expect(search.status === 200, `search status ${search.status} (expected 200)`);
+        const searchJson = JSON.parse(search.text);
+        expect(searchJson.start === 0 && searchJson.total >= 1, `search start/total ${searchJson.start}/${searchJson.total} (expected 0/>=1)`);
+        const item = (searchJson.items ?? []).find((entry) => entry.cookbook_name === chefName);
+        expect(item !== undefined, `search items carry no ${chefName}`);
+        expect(item?.cookbook_maintainer === "deploy-probes", `search maintainer ${JSON.stringify(item?.cookbook_maintainer)}`);
+        expect(item?.cookbook_description === "deploy-probes chef round-trip probe",
+          `search description ${JSON.stringify(item?.cookbook_description)}`);
+        expect(item?.cookbook === `${chefBase}/cookbooks/${chefName}`, `search cookbook url drift: ${JSON.stringify(item?.cookbook)}`);
+        const cookbookMeta = await pkgFetch(`/${ctx.user}/chef/api/v1/cookbooks/${chefName}`);
+        expect(cookbookMeta.status === 200, `cookbook metadata status ${cookbookMeta.status} (expected 200)`);
+        const cookbookJson = JSON.parse(cookbookMeta.text);
+        expect(cookbookJson.name === chefName && cookbookJson.maintainer === "deploy-probes",
+          `cookbook metadata name/maintainer ${JSON.stringify(cookbookJson.name)}/${JSON.stringify(cookbookJson.maintainer)}`);
+        expect(cookbookJson.category === "" && cookbookJson.deprecated === false,
+          `cookbook category/deprecated ${JSON.stringify(cookbookJson.category)}/${JSON.stringify(cookbookJson.deprecated)} (expected ""/false)`);
+        expect(cookbookJson.latest_version === `${chefBase}/cookbooks/${chefName}/versions/${chefVersion}`,
+          `cookbook latest_version drift: ${JSON.stringify(cookbookJson.latest_version)}`);
+        expect(Array.isArray(cookbookJson.versions) && cookbookJson.versions.includes(cookbookJson.latest_version),
+          `cookbook versions array missing the latest url`);
+        expect(isoShape.test(cookbookJson.created_at ?? "") && cookbookJson.created_at === cookbookJson.updated_at,
+          `cookbook created_at/updated_at ${JSON.stringify(cookbookJson.created_at)}/${JSON.stringify(cookbookJson.updated_at)} (expected the equal RFC3339 Z pair)`);
+        const versionMeta = await pkgFetch(`/${ctx.user}/chef/api/v1/cookbooks/${chefName}/versions/1_0_1`);
+        expect(versionMeta.status === 200, `version metadata (1_0_1) status ${versionMeta.status} (expected 200 — the knife quirk)`);
+        const versionJson = JSON.parse(versionMeta.text);
+        expect(versionJson.version === chefVersion, `version metadata version ${JSON.stringify(versionJson.version)} (expected ${chefVersion})`);
+        expect(typeof versionJson.tarball_file_size === "number" && versionJson.tarball_file_size > 0,
+          `version tarball_file_size ${JSON.stringify(versionJson.tarball_file_size)} (expected the blob size)`);
+        expect(versionJson.license === "MIT", `version license ${JSON.stringify(versionJson.license)}`);
+        expect(JSON.stringify(versionJson.dependencies) === JSON.stringify({ apt: ">= 1.0" }),
+          `version dependencies ${JSON.stringify(versionJson.dependencies)}`);
+        expect(versionJson.cookbook === `${chefBase}/cookbooks/${chefName}` &&
+          versionJson.file === `${chefBase}/cookbooks/${chefName}/versions/${chefVersion}/download`,
+          `version cookbook/file urls drift: ${JSON.stringify(versionJson.cookbook)}/${JSON.stringify(versionJson.file)}`);
+        const download = await pkgFetch(`/${ctx.user}/chef/api/v1/cookbooks/${chefName}/versions/${chefVersion}/download`);
+        expect(download.status === 200, `download status ${download.status} (expected 200)`);
+        expect(String(download.headers.get("content-type") ?? "").includes("application/octet-stream"),
+          `download content-type ${JSON.stringify(download.headers.get("content-type"))} (expected octet-stream)`);
+        expect(download.bytes.equals(chefTarball), `download bytes != the uploaded tarball (${download.bytes.length} vs ${chefTarball.length})`);
+        const del = await pkgFetch(`/${ctx.user}/chef/api/v1/cookbooks/${chefName}/versions/${chefVersion}`, { method: "DELETE" });
+        expect(del.status === 200, `protocol version delete status ${del.status} (expected 200)`);
+        ctx.chefGone = true;
+        const gone = await pkgFetch(`/${ctx.user}/chef/api/v1/cookbooks/${chefName}/versions/${chefVersion}`);
+        expect(gone.status === 404 && gone.text === '{"error_messages":[""]}',
+          `post-delete version metadata ${gone.status} ${gone.text.slice(0, 80)} (expected 404 {"error_messages":[""]})`);
+        return `upload 201 {} → universe row → search item → cookbook + version metadata (1_0_1 quirk) → download parity → protocol delete 200 → 404`;
+      },
+    },
+    {
+      id: "pminor-composer-roundtrip",
+      expect: `composer: PUT /composer?version=${composerVersion} the raw zip (the composer.json carries NO version — the query-param fallback) → 201 EMPTY; GET /packages.json → the exact {search, metadata_url, list} templates off the origin; GET /list.json → packageNames carries ${composerName}; GET /p2/${composerVendor}/${composerProject}.json → {minified "composer/2.0", the entry with type "library", time ISO, dist {type zip, url with the %2F-encoded name, shasum == the stored sha1}, the empty source triple}; GET the dist url → byte parity; DELETE /api/v1/packages/.../composer/${composerName}/${composerVersion} → 204 and the p2 404 {"errors":[…]} after`,
+      run: async () => {
+        const registryBase = `${origin}/api/packages/${ctx.user}/composer`;
+        const put = await pkgFetch(`/${ctx.user}/composer?version=${composerVersion}`, {
+          method: "PUT",
+          headers: { "content-type": "application/octet-stream" },
+          body: composerZip,
+        });
+        expect(put.status === 201 && put.bytes.length === 0, `upload ${put.status} ${put.text.slice(0, 120)} (expected the 201 EMPTY)`);
+        ctx.composer = { name: composerName, version: composerVersion };
+        const index = await pkgFetch(`/${ctx.user}/composer/packages.json`);
+        expect(index.status === 200, `packages.json status ${index.status} (expected 200)`);
+        expect(index.text === JSON.stringify({
+          search: `${registryBase}/search.json?q=%query%&type=%type%`,
+          metadata_url: `${registryBase}/p2/%package%.json`,
+          list: `${registryBase}/list.json`,
+        }), `packages.json drift: ${index.text.slice(0, 200)}`);
+        const list = await pkgFetch(`/${ctx.user}/composer/list.json`);
+        expect(list.status === 200, `list.json status ${list.status} (expected 200)`);
+        const listJson = JSON.parse(list.text);
+        expect(Array.isArray(listJson.packageNames) && listJson.packageNames.includes(composerName),
+          `list.json packageNames missing ${composerName} (holds: ${(listJson.packageNames ?? []).slice(0, 8).join(", ") || "none"})`);
+        const meta = await pkgFetch(`/${ctx.user}/composer/p2/${composerVendor}/${composerProject}.json`);
+        expect(meta.status === 200, `p2 metadata status ${meta.status} (expected 200)`);
+        const metaJson = JSON.parse(meta.text);
+        expect(metaJson.minified === "composer/2.0", `p2 minified ${JSON.stringify(metaJson.minified)} (expected composer/2.0)`);
+        const entries = metaJson.packages?.[composerName];
+        expect(Array.isArray(entries) && entries.length >= 1, `p2 packages key missing ${composerName}`);
+        const entry = entries.find((e) => e.version === composerVersion);
+        expect(entry !== undefined, `p2 carries no ${composerVersion} entry`);
+        expect(entry?.name === composerName, `p2 entry name ${JSON.stringify(entry?.name)}`);
+        expect(entry?.type === "library", `p2 entry type ${JSON.stringify(entry?.type)} (expected the "library" default)`);
+        expect(isoShape.test(entry?.time ?? ""), `p2 entry time ${JSON.stringify(entry?.time)} (expected the RFC3339 Z shape)`);
+        const expectedFilename = `${composerVendor}-${composerProject}.${composerVersion}.zip`;
+        expect(entry?.dist?.type === "zip", `p2 dist type ${JSON.stringify(entry?.dist?.type)} (expected zip)`);
+        expect(entry?.dist?.url === `${registryBase}/files/${encodeURIComponent(composerName)}/${composerVersion}/${expectedFilename}`,
+          `p2 dist url drift: ${JSON.stringify(entry?.dist?.url)}`);
+        expect(entry?.dist?.shasum === shaHex("sha1", composerZip), `p2 dist shasum != the stored sha1`);
+        expect(JSON.stringify(entry?.source) === JSON.stringify({ url: "", type: "", reference: "" }),
+          `p2 source ${JSON.stringify(entry?.source)} (expected the empty triple — no linked repo)`);
+        // pkgFetch prefixes /api/packages — strip the dist url's own prefix.
+        const distUrl = new URL(entry.dist.url);
+        const download = await pkgFetch(distUrl.pathname.replace(/^\/api\/packages/, "") + distUrl.search);
+        expect(download.status === 200, `dist download status ${download.status} (expected 200 — the %2F path)`);
+        expect(download.bytes.equals(composerZip), `dist download bytes != the uploaded zip (${download.bytes.length} vs ${composerZip.length})`);
+        const del = await pkgMgmtDeleteVersion(ctx.user, "composer", composerName, composerVersion);
+        expect(del.status === 204, `management delete status ${del.status} (expected 204)`);
+        ctx.composerGone = true;
+        const gone = await pkgFetch(`/${ctx.user}/composer/p2/${composerVendor}/${composerProject}.json`);
+        expect(gone.status === 404 && gone.text === '{"errors":[{"status":404,"message":"package does not exist"}]}',
+          `post-delete p2 ${gone.status} ${gone.text.slice(0, 120)} (expected the 404 error wrap)`);
+        return `PUT ?version= 201 → packages.json exact → list.json → p2 doc (%2F dist url + sha1) → dist parity → delete 204 → p2 404`;
+      },
+    },
+    {
+      id: "pminor-conan-roundtrip",
+      expect: `conan: PUT /conan/v2/conans/${conanRef.name}/${conanRef.version}/${conanRef.user}/${conanRef.channel}/revisions/${conanRef.revision}/files/conanfile.py (the six-field conanfile) → 201 EMPTY; GET …/revisions → {"revisions":[{revision ${conanRef.revision}, time}]} (the json.Encoder newline); GET …/latest (the unpinned latest-revision probe) → {"revision","time"}; GET …/revisions/${conanRef.revision}/files → {"files":{"conanfile.py":null}} (the md5 reduction); GET the pinned revision file → byte parity; DELETE the PINNED revision (v2) → 200 and the revisions list 404 {"message":""} after`,
+      run: async () => {
+        const recipePath = `conans/${conanRef.name}/${conanRef.version}/${conanRef.user}/${conanRef.channel}`;
+        const put = await pkgFetch(`/${ctx.user}/conan/v2/${recipePath}/revisions/${conanRef.revision}/files/conanfile.py`, {
+          method: "PUT",
+          headers: { "content-type": "text/plain" },
+          body: Buffer.from(conanfileText, "utf8"),
+        });
+        expect(put.status === 201 && put.bytes.length === 0, `recipe upload ${put.status} ${put.text.slice(0, 120)} (expected the 201 EMPTY)`);
+        ctx.conan = { name: conanRef.name, version: conanRef.version };
+        const revisions = await pkgFetch(`/${ctx.user}/conan/v2/${recipePath}/revisions`);
+        expect(revisions.status === 200, `revisions status ${revisions.status} (expected 200)`);
+        expect(revisions.text.endsWith("\n"), `revisions body missing the json.Encoder newline`);
+        const revisionsJson = JSON.parse(revisions.text);
+        expect(Array.isArray(revisionsJson.revisions) && revisionsJson.revisions.length >= 1,
+          `revisions list empty (expected at least ${conanRef.revision})`);
+        const rev = revisionsJson.revisions.find((entry) => entry.revision === conanRef.revision);
+        expect(rev !== undefined, `revisions list missing ${conanRef.revision} (holds: ${revisionsJson.revisions.map((r) => r.revision).join(", ")})`);
+        expect(isoShape.test(rev?.time ?? ""), `revision time ${JSON.stringify(rev?.time)} (expected the RFC3339 Z shape)`);
+        const latest = await pkgFetch(`/${ctx.user}/conan/v2/${recipePath}/latest`);
+        expect(latest.status === 200, `latest status ${latest.status} (expected 200)`);
+        const latestJson = JSON.parse(latest.text);
+        expect(latestJson.revision === conanRef.revision && isoShape.test(latestJson.time ?? ""),
+          `latest ${JSON.stringify(latestJson)} (expected revision ${conanRef.revision} + the time shape)`);
+        const revFiles = await pkgFetch(`/${ctx.user}/conan/v2/${recipePath}/revisions/${conanRef.revision}/files`);
+        expect(revFiles.status === 200, `pinned revision-files status ${revFiles.status} (expected 200)`);
+        expect(revFiles.text === '{"files":{"conanfile.py":null}}\n',
+          `pinned revision-files body ${JSON.stringify(revFiles.text)} (expected the md5-reduction null digest)`);
+        const download = await pkgFetch(`/${ctx.user}/conan/v2/${recipePath}/revisions/${conanRef.revision}/files/conanfile.py`);
+        expect(download.status === 200, `pinned download status ${download.status} (expected 200)`);
+        expect(download.bytes.equals(Buffer.from(conanfileText, "utf8")),
+          `pinned download bytes != the uploaded conanfile (${download.bytes.length} vs ${conanfileText.length})`);
+        const del = await pkgFetch(`/${ctx.user}/conan/v2/${recipePath}/revisions/${conanRef.revision}`, { method: "DELETE" });
+        expect(del.status === 200, `pinned revision delete status ${del.status} (expected 200)`);
+        ctx.conanGone = true;
+        const gone = await pkgFetch(`/${ctx.user}/conan/v2/${recipePath}/revisions`);
+        expect(gone.status === 404 && gone.text === '{"message":""}\n',
+          `post-delete revisions ${gone.status} ${JSON.stringify(gone.text)} (expected 404 {"message":""})`);
+        return `v2 recipe PUT 201 → revisions list + latest → pinned revision-files {"conanfile.py":null} → pinned download parity → pinned delete 200 → revisions 404`;
+      },
+    },
+    {
+      id: "pminor-cran-roundtrip",
+      expect: `cran: PUT /cran/src the tar.gz (the ${cranName}/DESCRIPTION shallow member — continuation lines, NeedsCompilation yes) → 201 EMPTY; GET /cran/src/contrib/PACKAGES → 200 text/plain carrying the exact block (Package/Version/License/Depends "methods, utils"/Imports "abc, 123"/NeedsCompilation: yes/MD5sum EMPTY); GET PACKAGES.gz → application/x-gzip decompressing to the same block; GET /cran/src/contrib/${cranName}_${cranVersion}.tar.gz → byte parity; DELETE /api/v1/packages/.../cran/${cranName}/${cranVersion} → 204 and the download 404 (the EMPTY plain-text body) after`,
+      run: async () => {
+        const put = await pkgFetch(`/${ctx.user}/cran/src`, {
+          method: "PUT",
+          headers: { "content-type": "application/octet-stream" },
+          body: cranTarball,
+        });
+        expect(put.status === 201 && put.bytes.length === 0, `upload ${put.status} ${put.text.slice(0, 120)} (expected the 201 EMPTY)`);
+        ctx.cran = { name: cranName, version: cranVersion };
+        const expectedBlock = [
+          `Package: ${cranName}`,
+          `Version: ${cranVersion}`,
+          "License: MIT",
+          "Depends: methods, utils",
+          "Imports: abc, 123",
+          "NeedsCompilation: yes",
+          "MD5sum: ",
+        ].join("\n");
+        const packages = await pkgFetch(`/${ctx.user}/cran/src/contrib/PACKAGES`);
+        expect(packages.status === 200, `PACKAGES status ${packages.status} (expected 200)`);
+        expect(String(packages.headers.get("content-type") ?? "") === "text/plain;charset=utf-8",
+          `PACKAGES content-type ${JSON.stringify(packages.headers.get("content-type"))}`);
+        expect(packages.text.includes(expectedBlock), `PACKAGES missing the ${cranName} block (body: ${JSON.stringify(packages.text.slice(0, 240))})`);
+        const packagesGz = await pkgFetch(`/${ctx.user}/cran/src/contrib/PACKAGES.gz`);
+        expect(packagesGz.status === 200, `PACKAGES.gz status ${packagesGz.status} (expected 200)`);
+        expect(String(packagesGz.headers.get("content-type") ?? "") === "application/x-gzip",
+          `PACKAGES.gz content-type ${JSON.stringify(packagesGz.headers.get("content-type"))} (expected application/x-gzip)`);
+        expect(gunzipSync(packagesGz.bytes).toString("utf8").includes(expectedBlock),
+          `PACKAGES.gz decompressed body missing the ${cranName} block`);
+        const filename = `${cranName}_${cranVersion}.tar.gz`;
+        const download = await pkgFetch(`/${ctx.user}/cran/src/contrib/${filename}`);
+        expect(download.status === 200, `download status ${download.status} (expected 200)`);
+        expect(download.bytes.equals(cranTarball), `download bytes != the uploaded tarball (${download.bytes.length} vs ${cranTarball.length})`);
+        const archiveDownload = await pkgFetch(`/${ctx.user}/cran/src/contrib/Archive/${cranName}/${filename}`);
+        expect(archiveDownload.status === 200, `Archive download status ${archiveDownload.status} (expected 200 — the shared handler)`);
+        const del = await pkgMgmtDeleteVersion(ctx.user, "cran", cranName, cranVersion);
+        expect(del.status === 204, `management delete status ${del.status} (expected 204)`);
+        ctx.cranGone = true;
+        const gone = await pkgFetch(`/${ctx.user}/cran/src/contrib/${filename}`);
+        expect(gone.status === 404 && gone.bytes.length === 0,
+          `post-delete download ${gone.status} ${gone.bytes.length}B (expected the 404 with the EMPTY plain-text body)`);
+        return `PUT /src 201 → PACKAGES block (MD5sum EMPTY) → PACKAGES.gz twin → downloads parity → delete 204 → EMPTY 404`;
+      },
+    },
+    {
+      id: "pminor-pub-roundtrip",
+      expect: `pub: GET /pub/api/packages/versions/new → 200 {"url": …/versions/new/upload, "fields":{}} (application/vnd.pub.v2+json); POST …/versions/new/upload the multipart file part (a tar.gz whose pubspec.yaml carries version ${pubVersionRaw}) → 204 EMPTY + Location …/versions/new/finalize/${pubName}/${pubVersionStored}; GET the finalize URL → 200 {"success":{"message":""}}; GET /pub/api/packages/${pubName} → the enumerate with the NORMALIZED "${pubVersionStored}" (v.String()), the pubspec pass-through, the archive_url; GET the archive → byte parity; DELETE /api/v1/packages/.../pub/${pubName}/${pubVersionStored} → 204 and the enumerate 404 {"error":{code,message}} after`,
+      run: async () => {
+        const pubBase = `${origin}/api/packages/${ctx.user}/pub/api/packages`;
+        const request = await pkgFetch(`/${ctx.user}/pub/api/packages/versions/new`);
+        expect(request.status === 200, `request-upload status ${request.status} (expected 200)`);
+        expect(String(request.headers.get("content-type") ?? "") === "application/vnd.pub.v2+json",
+          `request-upload content-type ${JSON.stringify(request.headers.get("content-type"))} (expected application/vnd.pub.v2+json)`);
+        expect(request.text === JSON.stringify({ url: `${pubBase}/versions/new/upload`, fields: {} }),
+          `request-upload body drift: ${request.text.slice(0, 200)}`);
+        const put = await pkgFetch(`/${ctx.user}/pub/api/packages/versions/new/upload`, {
+          method: "POST",
+          headers: { "content-type": pubForm.contentType },
+          body: pubForm.body,
+        });
+        expect(put.status === 204 && put.bytes.length === 0, `upload ${put.status} ${put.text.slice(0, 120)} (expected the 204 EMPTY)`);
+        expect(put.headers.get("location") === `${pubBase}/versions/new/finalize/${pubName}/${pubVersionStored}`,
+          `upload Location ${JSON.stringify(put.headers.get("location"))} (expected the finalize header with the NORMALIZED version)`);
+        ctx.pub = { name: pubName, version: pubVersionStored };
+        const finalize = await pkgFetch(`/${ctx.user}/pub/api/packages/versions/new/finalize/${pubName}/${pubVersionStored}`);
+        expect(finalize.status === 200 && finalize.text === '{"success":{"message":""}}',
+          `finalize ${finalize.status} ${finalize.text.slice(0, 80)} (expected {"success":{"message":""}})`);
+        const enumerate = await pkgFetch(`/${ctx.user}/pub/api/packages/${pubName}`);
+        expect(enumerate.status === 200, `enumerate status ${enumerate.status} (expected 200)`);
+        expect(String(enumerate.headers.get("content-type") ?? "") === "application/vnd.pub.v2+json",
+          `enumerate content-type ${JSON.stringify(enumerate.headers.get("content-type"))}`);
+        const listJson = JSON.parse(enumerate.text);
+        expect(listJson.name === pubName, `enumerate name ${JSON.stringify(listJson.name)}`);
+        expect(Array.isArray(listJson.versions) && listJson.versions.length >= 1, `enumerate versions empty`);
+        const entry = listJson.versions.find((v) => v.version === pubVersionStored);
+        expect(entry !== undefined, `enumerate carries no ${pubVersionStored} (holds: ${(listJson.versions ?? []).map((v) => v.version).join(", ")}) — the v-prefixed pubspec version must land NORMALIZED`);
+        expect(listJson.latest?.version === pubVersionStored, `enumerate latest ${JSON.stringify(listJson.latest?.version)}`);
+        expect(entry?.archive_url === `${pubBase}/${pubName}/files/${pubVersionStored}.tar.gz`,
+          `archive_url drift: ${JSON.stringify(entry?.archive_url)}`);
+        expect(isoShape.test(entry?.published ?? ""), `published ${JSON.stringify(entry?.published)} (expected the RFC3339 Z shape)`);
+        expect(entry?.pubspec?.name === pubName && entry?.pubspec?.version === pubVersionRaw,
+          `pubspec pass-through ${JSON.stringify(entry?.pubspec)} (expected the RAW document — version ${pubVersionRaw})`);
+        const download = await pkgFetch(`/${ctx.user}/pub/api/packages/${pubName}/files/${pubVersionStored}`);
+        expect(download.status === 200, `download status ${download.status} (expected 200)`);
+        expect(download.bytes.equals(pubArchive), `download bytes != the uploaded archive (${download.bytes.length} vs ${pubArchive.length})`);
+        expect(String(download.headers.get("content-disposition") ?? "").includes(`${pubVersionStored}.tar.gz`),
+          `download disposition missing the ${pubVersionStored}.tar.gz filename`);
+        const del = await pkgMgmtDeleteVersion(ctx.user, "pub", pubName, pubVersionStored);
+        expect(del.status === 204, `management delete status ${del.status} (expected 204)`);
+        ctx.pubGone = true;
+        const gone = await pkgFetch(`/${ctx.user}/pub/api/packages/${pubName}`);
+        expect(gone.status === 404 && gone.text === '{"error":{"code":"Not Found","message":""}}',
+          `post-delete enumerate ${gone.status} ${gone.text.slice(0, 120)} (expected the {"error":{code,message}} 404)`);
+        return `request-upload → multipart 204 + finalize Location → finalize {"success"} → enumerate (normalized ${pubVersionStored} + pubspec pass-through) → archive parity → delete 204 → 404`;
+      },
+    },
+    {
+      id: "pminor-vagrant-roundtrip",
+      expect: `vagrant: PUT /vagrant/${vagrantName}/${vagrantVersion}/${vagrantProvider} (a gzip'd tar whose info.json carries the description) → 201 EMPTY; HEAD /vagrant/${vagrantName} → 200 (the box probe); GET /vagrant/${vagrantName} → the enumerate with the provider ARRAY (name "probe", url …/${vagrantVersion}/${vagrantProvider}, checksum == the stored sha512, checksum_type "sha512") and the newest version's description; GET the provider url → byte parity; DELETE /api/v1/packages/.../vagrant/${vagrantName}/${vagrantVersion} → 204 and the enumerate 404 {"errors":[""]} after`,
+      run: async () => {
+        const put = await pkgFetch(`/${ctx.user}/vagrant/${vagrantName}/${vagrantVersion}/${vagrantProvider}`, {
+          method: "PUT",
+          headers: { "content-type": "application/octet-stream" },
+          body: vagrantBox,
+        });
+        expect(put.status === 201 && put.bytes.length === 0, `upload ${put.status} ${put.text.slice(0, 120)} (expected the 201 EMPTY)`);
+        ctx.vagrant = { name: vagrantName, version: vagrantVersion };
+        const probe = await pkgFetch(`/${ctx.user}/vagrant/${vagrantName}`, { method: "HEAD" });
+        expect(probe.status === 200, `box probe (HEAD) status ${probe.status} (expected 200)`);
+        const enumerate = await pkgFetch(`/${ctx.user}/vagrant/${vagrantName}`);
+        expect(enumerate.status === 200, `enumerate status ${enumerate.status} (expected 200)`);
+        expect(String(enumerate.headers.get("content-type") ?? "") === "application/json",
+          `enumerate content-type ${JSON.stringify(enumerate.headers.get("content-type"))}`);
+        const enumJson = JSON.parse(enumerate.text);
+        expect(enumJson.name === vagrantName && enumJson.description === "deploy-probes vagrant box probe",
+          `enumerate name/description ${JSON.stringify(enumJson.name)}/${JSON.stringify(enumJson.description)}`);
+        expect(Array.isArray(enumJson.versions) && enumJson.versions.length >= 1, `enumerate versions empty`);
+        const versionEntry = enumJson.versions.find((v) => v.version === vagrantVersion);
+        expect(versionEntry !== undefined, `enumerate carries no ${vagrantVersion}`);
+        expect(versionEntry?.status === "active", `version status ${JSON.stringify(versionEntry?.status)} (expected active)`);
+        const provider = (versionEntry?.providers ?? []).find((p) => p.name === "probe");
+        expect(provider !== undefined, `provider array missing "probe" (holds: ${(versionEntry?.providers ?? []).map((p) => p.name).join(", ")})`);
+        expect(provider?.url === `${origin}/api/packages/${ctx.user}/vagrant/${vagrantName}/${vagrantVersion}/${vagrantProvider}`,
+          `provider url drift: ${JSON.stringify(provider?.url)}`);
+        expect(provider?.checksum === shaHex("sha512", vagrantBox), `provider checksum != the stored sha512`);
+        expect(provider?.checksum_type === "sha512", `provider checksum_type ${JSON.stringify(provider?.checksum_type)} (expected sha512)`);
+        const download = await pkgFetch(`/${ctx.user}/vagrant/${vagrantName}/${vagrantVersion}/${vagrantProvider}`);
+        expect(download.status === 200, `download status ${download.status} (expected 200)`);
+        expect(download.bytes.equals(vagrantBox), `download bytes != the uploaded box (${download.bytes.length} vs ${vagrantBox.length})`);
+        expect(String(download.headers.get("content-disposition") ?? "").includes(vagrantProvider),
+          `download disposition missing the ${vagrantProvider} filename`);
+        const del = await pkgMgmtDeleteVersion(ctx.user, "vagrant", vagrantName, vagrantVersion);
+        expect(del.status === 204, `management delete status ${del.status} (expected 204)`);
+        ctx.vagrantGone = true;
+        const gone = await pkgFetch(`/${ctx.user}/vagrant/${vagrantName}`);
+        expect(gone.status === 404 && gone.text === '{"errors":[""]}',
+          `post-delete enumerate ${gone.status} ${gone.text.slice(0, 80)} (expected 404 {"errors":[""]})`);
+        return `box PUT 201 → HEAD probe 200 → enumerate (provider array + sha512) → download parity → delete 204 → 404`;
+      },
+    },
+    {
+      id: "pminor-cleanup-rows-d1",
+      expect: `the husk row sweep (wrangler d1 --${opts.d1Scope}; needs wrangler auth): chef's protocol version delete and conan's pinned-revision delete folded their versions + files, the composer/cran/pub/vagrant management deletes folded theirs — every family LEFT an empty package husk, so the probe's package husks delete via D1 with the zero-rows assert; the distro-internal rows (_rpm/_arch/_debian/_alpine + the owner keypairs) are STANDING per-owner infrastructure the sweep never touches`,
+      run: async () => {
+        const acts = await packagesDeleteProbeRows(ctx);
+        ctx.rowsSwept = true; // the failure tail no-ops on a green sweep
+        return `${acts.join("; ")} — husks gone; internal rows stay`;
+      },
+    },
+    {
+      id: "pminor-cleanup-repo-204",
+      expect: `DELETE /api/v1/repos/${ctx.user}/${ctx.repo} → 204 (the owner vehicle leaves; the package rows were deleted in-arm and husk-swept — the repo delete never touches them)`,
+      run: async () => {
+        const res = await api(`/repos/${ctx.user}/${ctx.repo}`, { method: "DELETE" });
+        expect(res.status === 204, `status ${res.status} (expected 204)`);
+        ctx.repoGone = true;
+        return "204";
+      },
+    },
+  ];
+};
+
 // ---------- battery: cleanup-audit (the D1 count shapes) ----------
 
 const AUDIT_TABLES = [
@@ -5987,11 +6662,24 @@ const BATTERIES = {
   // REAL-CLIENT arms degrade to a documented [warn] when the toolchain is off
   // the probe host.
   "packages-protocols": { title: "packages protocol long tail (SPEC-0016 §7: go module zip → list/@latest/.info/.mod/.zip + sumdb 404 + missing-module 404s (+ real `go mod download`), cargo .crate container → {ok} shapes + config.json + sparse index + yank/unyank + download (+ real `cargo fetch`), swift login pair → multipart PUT → enumerate + Link → metadata + Digest zip → manifest 200/303 → identifiers, rubygems .gem → compact index → specs marshal → byte-parity download → gemspec.rz → yank, then the D1 husk row sweep + repo delete)", context: packagesProtocolsContext, steps: packagesProtocolsSteps, failureTail: packagesProtocolsFailureCleanup, independent: true },
+  // Independent (the protocols posture — the six minor families are all
+  // OWNER-scoped, so the arms do not chain; each self-contains its family):
+  // chef (cookbook tar.gz → universe/search/metadata → the "_" quirk →
+  // download → the PROTOCOL version delete), composer (raw zip PUT ?version=
+  // → packages.json/list.json/p2 (%2F dist + sha1) → download → management
+  // delete), conan (v2 recipe revision upload → revisions list + latest →
+  // the pinned revision-files list → pinned download → the PINNED v2 delete), cran
+  // (DESCRIPTION tar.gz → PACKAGES(.gz) block → download → management
+  // delete), pub (request-upload → multipart → finalize → the normalized
+  // enumerate → download → management delete), vagrant (box PUT → the
+  // provider array + sha512 → download → management delete), then the D1
+  // husk row sweep + repo delete.
+  "packages-minor": { title: "packages minor six (SPEC-0016 §7: chef cookbook tar.gz → universe + search + cookbook/version metadata (the 1_0_1 knife quirk) → download → protocol delete, composer raw zip PUT ?version= → packages.json/list.json/p2 (%2F dist url + sha1 shasum) → download → management delete, conan v2 recipe revision → revisions/latest + pinned revision-files {\"conanfile.py\":null} → pinned download → pinned delete, cran DESCRIPTION tar.gz → PACKAGES(.gz) block (MD5sum EMPTY) → download → management delete, pub request-upload → multipart → finalize → normalized enumerate → archive download → management delete, vagrant box PUT → HEAD probe → provider array (sha512) → download → management delete, then the D1 husk row sweep + repo delete)", context: packagesMinorContext, steps: packagesMinorSteps, failureTail: packagesMinorFailureCleanup, independent: true },
   // Independent counts — one red count never hides the rest of the shape.
   "cleanup-audit": { title: "post-run D1 count shapes", context: () => ({}), steps: auditSteps, independent: true },
 };
 
-const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "packages-protocols", "cleanup-audit"] : [opts.battery];
+const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "packages-protocols", "packages-minor", "cleanup-audit"] : [opts.battery];
 
 // ---------- dry-run ----------
 
