@@ -69,6 +69,7 @@ import {
   stopEndlessTasks,
 } from "../services/actions/sweeps";
 import { handlePackagesCleanup, isPackageCleanupMessage } from "../services/packages/cleanup";
+import { isMailOutboxMessage, runMailOutboxArm } from "../services/mail/outbox";
 import { DEMO_RETENTION_HOURS, isDemoSweepMessage } from "../services/demo-sweep";
 import { handleMirrorSync, isMirrorSyncMessage } from "../services/mirror/sync";
 import { handlePushMirrorSync, isPushMirrorSyncMessage } from "../services/mirror/push-sync";
@@ -205,6 +206,10 @@ export async function destroyRepoDO(env: Env, engineName: string): Promise<void>
  *   - actions zombie stop ({kind: "actions-zombie"}, SPEC-0012 §5.6): the
  *     probe-gated step-entry producer's stop request — StopZombieTasks over
  *     stale running/cancelling tasks.
+ *   - mail outbox ({kind: "mail-outbox", mailId}, specs/email-outbound.md
+ *     §3.2): the mailer service's send leg — shape the stored
+ *     email_outbox row, the provider call, the outcome record (the ack/
+ *     retry policy is runMailOutboxArm's).
  *
  * Per message: idempotent work, then ack; a throw retries THAT message (the
  * redelivery re-runs the idempotent steps). Storage errors never fail the
@@ -373,6 +378,15 @@ export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): P
         );
         message.retry();
       }
+      continue;
+    }
+    // Mail outbox (specs/email-outbound.md §3.2) — the mailer service's
+    // consumer arm: `{kind: "mail-outbox", mailId}` → services/mail/outbox
+    // runMailOutboxArm (shape the stored row, the provider call, the
+    // outcome record; ack/retry policy owned there). Same typed-arm
+    // placement as every family above.
+    if (isMailOutboxMessage(message.body)) {
+      await runMailOutboxArm(env, message.body, message);
       continue;
     }
     if (!isRepoPurgeMessage(message.body)) {

@@ -15,6 +15,7 @@ import {
 import { RepoNameCollisionError, RepoNameInvalidError } from "../../repos/service";
 import { OrgNameCollisionError, OrgError } from "../../services/orgs/errors";
 import { OrgService, usableUsernameError, type OrgRecord } from "../../services/orgs/orgs";
+import { enqueueRegisterNotifyMail } from "../../services/mail/register-notify";
 import { deleteUserCascade } from "../../services/user-accounts";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
@@ -77,9 +78,11 @@ import { toApiUser } from "../services/user";
  *      personal access tokens: both fields are ACCEPTED AND IGNORED, the
  *      password-arms (400 `PasswordIsRequired`/`PasswordComplexity`/
  *      `PasswordPwned`, `must_change_password`) are unreachable, and the
- *      response is still the contract's `User` shape. `send_notify`,
- *      `source_id` and `login_name` (external-auth/mail concepts) are equally
- *      accepted and ignored.
+ *      response is still the contract's `User` shape. `source_id` and
+ *      `login_name` (external-auth concepts) are equally accepted and
+ *      ignored; `send_notify` left the deviation when the mailer landed
+ *      (specs/email-outbound.md §2.5 — it fires the register-notify mail,
+ *      upstream admin/user.go:153-156).
  *   2. **`purge` distinguished through the real cascade** (adminDeleteUser):
  *      upstream purge disables the account, deletes every owned repository
  *      through the repo-deletion service (services/user/user.go:172-182 →
@@ -413,11 +416,14 @@ const adminSearchUsersRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
 
 /**
  * Mirror of the contract's `CreateUserOption` (required: username, email).
- * `password` / `must_change_password` / `send_notify` / `source_id` /
- * `login_name` are carried per contract and IGNORED — deviation 1 (PAT-only
- * auth; no password or mail store). Out-of-enum `visibility` dies in the
- * request validator (runtime-only 400 where upstream binding 422s — the
- * documented orgs.ts divergence class).
+ * `password` / `must_change_password` / `source_id` / `login_name` are
+ * carried per contract and IGNORED — deviation 1 (PAT-only auth; no
+ * password or mail store). `send_notify` LEFT deviation 1 when the mailer
+ * landed (specs/email-outbound.md §2.5): it fires the register-notify mail
+ * via services/mail/register-notify.ts, upstream admin/user.go:153-156
+ * parity. Out-of-enum `visibility` dies in the request validator
+ * (runtime-only 400 where upstream binding 422s — the documented orgs.ts
+ * divergence class).
  */
 const createUserOptionSchema = z.object({
   created_at: z.string().optional().openapi({
@@ -847,8 +853,11 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
   // (400 arms via APIErrorAuto — deviation-free messages from the org errors
   // module), email format (400), namespace collision (409), email-in-use
   // (409), redirect consumption, insert. Deviation 1: the password/
-  // must_change_password/send_notify/source_id/login_name fields die here as
-  // accepted-and-ignored — no 400 password arms exist to hit.
+  // must_change_password/source_id/login_name fields die here as
+  // accepted-and-ignored — no 400 password arms exist to hit. `send_notify`
+  // no longer rides deviation 1: it fires the register-notify mailer
+  // (specs/email-outbound.md §2.5, upstream admin/user.go:153-156) —
+  // caught-and-logged, never load-bearing for the 201.
   app.openapi(adminCreateUserRoute(requireAuth), async (c) => {
     const form = c.req.valid("json");
 
@@ -871,6 +880,25 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
     // DeleteUserRedirect (user.go:798): creating on a live redirect consumes it.
     await drizzle(c.env.DB).delete(userRedirects).where(eq(userRedirects.lowerName, lower));
     const row = await insertCreatedUser(c.env.DB, form, new Date());
+    // The register-notify mail arm (specs/email-outbound.md §2.5) — upstream
+    // `if form.SendNotify { mailer.SendRegisterNotifyMail(u) }`
+    // (routers/api/v1/admin/user.go:153-156; the web twin admin/users.go:262).
+    // The previously accepted-and-ignored `send_notify` field fires the
+    // mailer's first real surface. Fire-and-forget in EFFECT (upstream
+    // SendAsync, services/mailer/mailer.go:66-80): the helper's await covers
+    // only the cheap D1 insert, the queue send inside is best-effort, and
+    // EVERY failure class is caught-and-logged — a mailer outage must never
+    // fail the 201 (the services/issue-events.ts seam posture).
+    if (form.send_notify === true) {
+      try {
+        await enqueueRegisterNotifyMail(c.env, row);
+      } catch (error) {
+        console.error(
+          "[mail] register-notify enqueue failed:",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
     return c.json(toApiUser(viewerOf(c), row), 201);
   });
 

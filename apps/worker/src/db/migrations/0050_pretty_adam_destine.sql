@@ -1,0 +1,1 @@
+ALTER TABLE `repo_counters` ADD `run_index` integer DEFAULT 0 NOT NULL;

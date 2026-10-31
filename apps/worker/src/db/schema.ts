@@ -358,12 +358,23 @@ export const repoUnits = sqliteTable(
  * one D1 batch = one SQLite transaction, so concurrent creations get strictly
  * sequential indexes and a failed insert rolls the bump back (§4.1).
  * Counters are never reused; `syncMaxIssueIndex` is the repair path.
+ *
+ * `run_index` (SPEC-0012 §4.5) is the second counter: upstream's
+ * `action_run_index` named sequence (GetNextResourceIndex,
+ * models/db/index.go:115-168) feeding `action_runs.index`. The Actions
+ * trigger's `nextRunIndex` bumps it in its own atomic batch, with the same
+ * never-rewind repair discipline (bootstrap at the repo's current max —
+ * rows created before the column carry 0 — then a guarded max() raise) so a
+ * pre-column repo self-heals on first use. `UNIQUE(repo_id, index)` on
+ * action_runs stays as the backstop for the two max+1 writers that bypass
+ * the counter (invalid-workflow runs, repo-actions routes).
  */
 export const repoCounters = sqliteTable("repo_counters", {
   repoId: text("repo_id")
     .primaryKey()
     .references(() => repositories.id),
   issueIndex: integer("issue_index").notNull().default(0),
+  runIndex: integer("run_index").notNull().default(0),
 });
 
 /**
@@ -4224,3 +4235,59 @@ export const cronState = sqliteTable("cron_state", {
   /** Completed-tick count (success upserts only — see the block comment). */
   runs: integer("runs").notNull().default(0),
 });
+
+/**
+ * Outbound email outbox (specs/email-outbound.md §4, migration 0049). The
+ * durable message store of the mailer service: the trigger inserts the
+ * shaped-but-unsanitized message (services/mail/register-notify.ts) and the
+ * REPO_TASKS consumer arm (services/mail/outbox.ts) applies the send-time
+ * transforms (upstream `Message.ToMessage`,
+ * gitea/services/mailer/sender/message.go:44-89) and hands the result to the
+ * configured transport. The payload lives HERE; the queue message carries
+ * only `{kind: "mail-outbox", mailId}` — the SPEC-0005 §3.6 webhook-delivery
+ * design (retries read fresh state; the delivery log is complete regardless
+ * of queue state). Upstream queues mail too (services/mailer/mailer.go:19,48).
+ */
+export const emailOutbox = sqliteTable(
+  "email_outbox",
+  {
+    /** Row id — the only thing the queue message carries. */
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Upstream `Message.Info` (sender/message.go:24) — the log-purpose
+     *  one-liner ("UID: 7, register notify"). */
+    info: text("info").notNull(),
+    /** Upstream `FromAddress` (message.go:25). */
+    fromAddress: text("from_address").notNull(),
+    /** Upstream `FromDisplayName` (message.go:26); '' = bare address. */
+    fromDisplayName: text("from_display_name").notNull().default(""),
+    /** Upstream `To` — ONE recipient (message.go:27's leak prevention). */
+    toAddr: text("to_addr").notNull(),
+    /** Upstream `ReplyTo` (message.go:28); NULL = header omitted. */
+    replyTo: text("reply_to"),
+    /** Stored UNSANITIZED; sanitize + prefix happen at send (SPEC §4.2). */
+    subject: text("subject").notNull(),
+    /** Upstream `Body` — the HTML half; text/plain derives at send (§5.6). */
+    bodyHtml: text("body_html").notNull(),
+    /** JSON `Record<string, string>` — upstream `Message.Headers`
+     *  (map[string][]string) reduced to the single-value set the notify
+     *  family actually sets (SPEC §4.4). */
+    headers: text("headers"),
+    /** 'pending' → 'sending' (the consumer's CAS claim) → 'sent' | 'failed'. */
+    status: text("status", { enum: ["pending", "sending", "sent", "failed"] })
+      .notNull()
+      .default("pending"),
+    /** Send attempts so far (queue redeliveries that reached the transport). */
+    attempts: integer("attempts").notNull().default(0),
+    /** The last failure one-liner (provider status/body excerpt, capped 1 KiB
+     *  at emit); NULL = no failure recorded. */
+    lastError: text("last_error"),
+    /** Trigger-level idempotency (e.g. `register-notify:<userId>`); UNIQUE —
+     *  SQLite permits many NULLs, so un-deduped triggers coexist (SPEC §4.1). */
+    dedupeKey: text("dedupe_key"),
+    /** Row creation, unix seconds. */
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+    /** Send completion, unix seconds; set with status='sent'. */
+    sentAt: integer("sent_at", { mode: "timestamp" }),
+  },
+  (table) => [uniqueIndex("email_outbox_dedupe_key_uq").on(table.dedupeKey)],
+);

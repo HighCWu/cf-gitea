@@ -199,6 +199,35 @@ instead), plus the mirror pair `MIRROR_ALLOWED_HOST_LIST` and
 `MIRROR_CREDENTIAL_KEY` (SPEC-0009's outbound egress policy and credential
 envelope).
 
+### Outbound email (specs/email-outbound.md)
+
+Off by default (strict polarity — a deployment NEVER sends mail until
+armed). The single wired trigger is `POST /admin/users` with
+`send_notify: true` (upstream `routers/api/v1/admin/user.go:153-156`);
+sends ride the `repo-tasks` queue consumer as `{kind: "mail-outbox"}`.
+
+Arming on a deployment:
+
+```bash
+# 1. vars in wrangler.jsonc (then pnpm build + deploy — deploy ships dist's
+#    generated config):
+#    "MAIL_ENABLED": "true",
+#    "MAIL_PROVIDER": "resend",        # or "dummy" (render+log, no network)
+#    "MAIL_FROM": "Gitea <noreply@yourdomain>",   # required when enabled
+#    "MAIL_SUBJECT_PREFIX": "",        # optional; "[cf-gitea]" style
+# 2. the provider key (resend arm only):
+wrangler secret put MAIL_PROVIDER_API_KEY
+```
+
+Verification: create a user with `send_notify: true`, then
+`wrangler tail` — the consumer arm logs `[repo-tasks] mail-outbox`;
+the `email_outbox` table is the delivery log
+(`status`: `pending|sending|sent|failed`, `last_error` carries the
+provider's status/body excerpt capped at 1 KiB). Provider 4xx = terminal
+`failed`; 429/5xx/network = queue retry (max 5) then `repo-tasks-dlq`.
+`MAIL_ENABLED=true` with a missing/unparseable `MAIL_FROM` logs a warning
+and skips — it never fails the admin 201.
+
 ### Building from a fresh worktree
 
 A fresh `git worktree add` checks out neither `gitea/` (submodule dirs start

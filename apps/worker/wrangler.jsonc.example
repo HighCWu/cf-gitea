@@ -76,7 +76,22 @@
     "PACKAGES_LIMIT_TOTAL_OWNER_COUNT": "-1",
     "PACKAGES_LIMIT_TOTAL_OWNER_SIZE": "-1",
     "PACKAGES_ENABLED": "true",
-    "PACKAGE_CLEANUP_OLDER_THAN": "24"
+    "PACKAGE_CLEANUP_OLDER_THAN": "24",
+    // Outbound email (specs/email-outbound.md §6): strict-polarity, OFF by
+    // default — a self-hosted deployment NEVER sends mail until armed, the
+    // same fail-closed class as DEMO_MODE. Arming = MAIL_ENABLED "true" +
+    // MAIL_FROM + a provider: "dummy" (the default — upstream's dummy
+    // protocol, services/mailer/sender/dummy.go: render+log+succeed) or
+    // "resend" (the HTTP relay arm — also
+    // `wrangler secret put MAIL_PROVIDER_API_KEY`). The first wired trigger
+    // is POST /admin/users with send_notify=true (upstream
+    // routers/api/v1/admin/user.go:153-156); MAIL_SUBJECT_PREFIX /
+    // MAIL_API_BASE are optional.
+    "MAIL_ENABLED": "false",
+    "MAIL_PROVIDER": "dummy",
+    "MAIL_FROM": "",
+    "MAIL_SUBJECT_PREFIX": "",
+    "MAIL_API_BASE": ""
   },
   "observability": {
     "enabled": true,
@@ -208,8 +223,11 @@
   // SPEC-0009 §4.1/§4.2 runtime config (SSRF allow-list + credential AES
   // key) — until they are declared here, wrangler silently ignores them in
   // .dev.vars (only declared names load; probed on wrangler 4.152).
+  // MAIL_PROVIDER_API_KEY is specs/email-outbound.md §6: consumed ONLY when
+  // MAIL_PROVIDER=resend; mail stays disabled by default, so most
+  // deployments provision the name here and never set a value.
   "secrets": {
-    "required": ["GIT_TOKEN", "MIRROR_ALLOWED_HOST_LIST", "MIRROR_CREDENTIAL_KEY"]
+    "required": ["GIT_TOKEN", "MIRROR_ALLOWED_HOST_LIST", "MIRROR_CREDENTIAL_KEY", "MAIL_PROVIDER_API_KEY"]
   },
   "migrations": [
     {
