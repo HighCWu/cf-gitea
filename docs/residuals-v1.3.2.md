@@ -500,6 +500,24 @@ board row flips — this closes a flag, not a listed residual.
     P1-1's M3 + the store wave; listed so the M3 SPEC-attachment does
     not miss them).
 
+14. **The OAuth2 provider — the v1.4 queue opener; SPEC written
+    (2026-10-31, `specs/oauth2-provider.md`, draft pending ratification).**
+    The provider surface upstream carries whole (`routers/web/web.go:617–631`:
+    authorize/grant/access_token/userinfo/keys/introspect + the
+    `.well-known/openid-configuration` arm) with the application CRUD already
+    landed on our side (migration 0026, the 5-op `/user/applications/oauth2`
+    family, the reduced settings pages). The SPEC records the flow design —
+    `oauth2_grant`/`oauth2_authorization_code` tables (migration 0052 sketch),
+    the per-instance signing key as a `system_keystore` row beside the Actions
+    OIDC key (WebCrypto JWS, RS256 default, no dependencies), the consent page
+    over SPEC-0010's session, the Bearer-JWT auth method feeding the landed
+    `apiScopeGate` unchanged, the builtin-application seed, and the
+    `OAUTH2_ENABLED` gate — including the one landed-constant change, the
+    git-HTTP Basic-realm flip to `realm="Gitea"` when the provider is enabled
+    (`githttp.go:146–159`; the current constant is the OAuth2-disabled arm
+    SPEC-0002 §2.6 chose deliberately). Six-wave decomposition in the SPEC's
+    §6; dispatches after ratification. Size: **L** (six waves, SPEC-attached).
+
 ## P2 — parity polish
 
 1. **The user actions settings group's remaining sub-tabs — LANDED
