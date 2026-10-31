@@ -2576,8 +2576,14 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
   app.get("/:username/composer/packages.json", (c) => composerServiceIndex(c));
   app.get("/:username/composer/search.json", (c) => composerSearch(c));
   app.get("/:username/composer/list.json", (c) => composerList(c));
-  app.get("/:username/composer/p2/:vendor/:project~dev.json", (c) => composerMetadata(c));
-  app.get("/:username/composer/p2/:vendor/:project.json", (c) => composerMetadata(c));
+  // The p2 metadata pair (~dev twin shares the handler) rides ONE whole-
+  // segment capture: Hono folds a param-with-literal-tail (`:project~dev.json`)
+  // into the param LABEL (the SmartRouter captures under "project~dev.json"),
+  // so the two-literal-route shape 404s every project — the packages-minor
+  // probes battery's find (upstream chi separates the dot via its [^/^.]+
+  // class). The handler dispatches the suffix; a non-.json segment answers
+  // the 404 shape.
+  app.get("/:username/composer/p2/:vendor/:filename", (c) => composerMetadata(c));
   app.get("/:username/composer/files/:package/:version/:filename", (c) => composerDownload(c));
   app.on("HEAD", "/:username/composer/files/:package/:version/:filename", (c) => composerDownload(c));
   app.put("/:username/composer", (c) => composerUpload(c));
@@ -4991,8 +4997,14 @@ async function chefEnumerate(c: Context<{ Bindings: Env }>): Promise<Response> {
       owner,
       c.req.query("q") ?? "",
       c.req.query("order") ?? "",
+      // NewAbsoluteListOptions (chef.go:70-73 + list_options.go): an absent
+      // or take<=0 `items` falls back to DefaultPagingNum(10) — upstream's
+      // own default, not an empty window (the probes battery's parity find).
       Number.parseInt(c.req.query("start") ?? "0", 10) || 0,
-      Number.parseInt(c.req.query("items") ?? "0", 10) || 0,
+      (() => {
+        const items = Number.parseInt(c.req.query("items") ?? "0", 10) || 0;
+        return items > 0 ? items : 10;
+      })(),
       baseURL,
     );
     return new Response(JSON.stringify(result), { status: 200, headers: { "content-type": "application/json" } });
@@ -5209,9 +5221,16 @@ async function composerMetadata(c: Context<{ Bindings: Env }>): Promise<Response
     const { owner, cred } = await protocolContext(c, "read");
     const origin = new URL(c.req.url).origin;
     const registryURL = `${origin}/api/packages/${owner.username}/composer`;
-    let project = c.req.param("project") ?? "";
-    if (project.endsWith("~dev")) {
-      project = project.slice(0, -"~dev".length);
+    let project = c.req.param("filename") ?? "";
+    if (project.endsWith("~dev.json")) {
+      project = project.slice(0, -"~dev.json".length);
+    } else if (project.endsWith(".json")) {
+      project = project.slice(0, -".json".length);
+    } else {
+      // The whole-segment capture admits non-.json shapes (upstream's chi
+      // class [^/^.]+ never matches them — the route itself 404s); answer
+      // the family's own not-found body.
+      return c.json({ errors: [{ status: 404, message: "package does not exist" }] }, 404);
     }
     const metadata = await getComposerPackageMetadata(
       c.env.DB,
