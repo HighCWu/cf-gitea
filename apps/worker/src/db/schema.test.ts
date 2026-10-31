@@ -287,13 +287,17 @@ describe("batch-7 stores parity (superseded REPO_*_DDL_STATEMENTS)", () => {
     ).rejects.toThrow();
   });
 
-  it("repo_watchers: composite PK, user index, first-created_at upsert", async () => {
+  it("repo_watchers: composite PK, user index, first-created_at upsert, watch-mode columns", async () => {
     const db = drizzle(env.DB);
     const columns = await tableColumns("repo_watchers");
     expect(columns.map((c) => [c.name, c.type, c.notnull, c.pk])).toEqual([
       ["repo_id", "TEXT", 1, 1],
       ["user_id", "INTEGER", 1, 2],
       ["created_at", "INTEGER", 0, 0],
+      ["mode", "INTEGER", 1, 0],
+      ["include_pull_requests", "INTEGER", 1, 0],
+      ["include_issues", "INTEGER", 1, 0],
+      ["include_releases", "INTEGER", 1, 0],
     ]);
     expect(await indexNames("repo_watchers")).toContain("idx_repo_watchers_user");
 
@@ -303,6 +307,15 @@ describe("batch-7 stores parity (superseded REPO_*_DDL_STATEMENTS)", () => {
     expect(
       await env.DB.prepare("SELECT created_at FROM repo_watchers WHERE repo_id = 'w1'").first<{ created_at: number }>(),
     ).toEqual({ created_at: 1 });
+
+    // The mode columns default to upstream's Watch row defaults (watch.go:
+    // 43-49 — mode Normal=1, every include flag true).
+    await db.insert(repoWatchers).values({ repoId: "w2", userId: 8, createdAt: new Date(1000) });
+    expect(
+      await env.DB.prepare(
+        "SELECT mode, include_pull_requests, include_issues, include_releases FROM repo_watchers WHERE repo_id = 'w2'",
+      ).first<{ mode: number; include_pull_requests: number; include_issues: number; include_releases: number }>(),
+    ).toEqual({ mode: 1, include_pull_requests: 1, include_issues: 1, include_releases: 1 });
   });
 
   it("repo_collaborators: composite PK, 'write' default, upsert arbitration", async () => {

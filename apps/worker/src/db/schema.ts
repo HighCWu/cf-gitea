@@ -1354,11 +1354,31 @@ export const repoTopics = sqliteTable(
 );
 
 /**
- * Repo-level watch edges (upstream `repo_watcher`, models/repo/watch.go —
- * deliberately NOT `issue_watch`, which is `issue_subscriptions` here).
- * `(repo_id, user_id)` PK; `ON CONFLICT DO NOTHING` keeps the FIRST
- * `created_at` on repeat watches. `ignored` is always false at this tier
- * (user-notification setting) and has no column.
+ * Repo-level watch edges (upstream `watch` table, models/repo/watch.go:38-50
+ * — the xorm model is named `Watch`, the historical D1 table kept Gitea's
+ * pre-rename `repo_watcher` name; deliberately NOT `issue_watch`, which is
+ * `issue_subscriptions` here). `(repo_id, user_id)` PK; `ON CONFLICT DO
+ * NOTHING` keeps the FIRST `created_at` on repeat watches.
+ *
+ * The watch MODES (watch.go:17-27) ride the four mode columns, all mirroring
+ * upstream's xorm tags verbatim:
+ *   - `mode`: `WatchMode` — None=0 ("watch nothing unless mentioned"),
+ *     Normal=1 (proactively watching), Dont=2 (ignore the repo), Auto=3
+ *     (from AutoWatchOnChanges), Custom=4 (the picked events only). Column
+ *     default 1 = upstream's `SMALLINT NOT NULL DEFAULT 1`; mode None is
+ *     NEVER persisted (watchRepoByMode deletes the row on the None
+ *     transition, watch.go:149-151) — an absent row IS None via the
+ *     GetWatch dummy (watch.go:62-67).
+ *   - the three include flags (`include_pull_requests`/`include_issues`/
+ *     `include_releases`, all `NOT NULL DEFAULT true`): the custom watch's
+ *     per-event picks (watch.go:47-49). Starting to watch resets them to
+ *     true so a custom selection survives plain watch/unwatch cycles
+ *     (watch.go:136-138); the mail resolution gates per event type on them
+ *     (getRepoWatchersIDs, watch.go:266-292).
+ * `ignored` on the API render is upstream-hardcoded false (routers/api/v1/
+ * user/watch.go IsWatching/Watch) and has no column; upstream's
+ * `updated` timestamp (watch.go:45) is unread by every surface we carry and
+ * has no column either.
  */
 export const repoWatchers = sqliteTable(
   "repo_watchers",
@@ -1366,6 +1386,10 @@ export const repoWatchers = sqliteTable(
     repoId: text("repo_id").notNull(),
     userId: integer("user_id").notNull(),
     createdAt: integer("created_at", { mode: "timestamp" }),
+    mode: integer("mode").notNull().default(1).$type<0 | 1 | 2 | 3 | 4>(),
+    includePullRequests: integer("include_pull_requests", { mode: "boolean" }).notNull().default(true),
+    includeIssues: integer("include_issues", { mode: "boolean" }).notNull().default(true),
+    includeReleases: integer("include_releases", { mode: "boolean" }).notNull().default(true),
   },
   (t) => [
     primaryKey({ columns: [t.repoId, t.userId] }),
@@ -1886,6 +1910,16 @@ export const sessions = sqliteTable(
      *  routers/web/auth/auth.go:127). DEFAULT false: pre-0035 rows were
      *  minted session-scope. */
     remember: integer("remember", { mode: "boolean" }).notNull().default(false),
+    /** OAuth2 authorize-dance state (SPEC-0010 §3 extension, the OAuth2
+     *  SPEC §2.2): JSON {client_id, redirect_uri, state, scope, nonce,
+     *  code_challenge, code_challenge_method} stashed between
+     *  GET /login/oauth/authorize and POST /login/oauth/grant; read-and-
+     *  cleared by /grant; NULL otherwise. Upstream stashes the same state in
+     *  its server-side session (oauth2_provider.go:271-295, 378-395) and
+     *  re-checks it at POST /grant (:411-415) — binding consent to the live
+     *  session is the security property (a captured consent page is useless
+     *  after logout/session rotation). */
+    oauthState: text("oauth_state"),
   },
   (t) => [
     index("sessions_user_idx").on(t.userId),
@@ -3017,6 +3051,88 @@ export const oauth2Applications = sqliteTable(
     // Upstream's `UID xorm:"INDEX"` — every list filters by uid
     // (models/auth/oauth2_list.go ToConds).
     index("oauth2_application_uid_idx").on(t.uid),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// The OAuth2 provider flow (SPEC specs/oauth2-provider.md §3 — W1 substrate):
+// the two flow tables behind /login/oauth/authorize|access_token. Migration
+// 0052 (the SPEC's own number — the tables are inert until the flow waves
+// read them). The applications table above is the landed 0026 half.
+// ---------------------------------------------------------------------------
+
+/**
+ * Upstream OAuth2Grant (gitea/models/auth/oauth2.go:504-514) — the
+ * permission of one user for one application. UNIQUE(user, application):
+ * one grant per pair, re-consent updates scope in place.
+ *
+ * Grant scope is DENORMALIZED STATE, the access token carries none of it
+ * (SPEC §2.4/§3): the JWT is only a pointer ({gnt, tt, exp}), all authority
+ * (user, scope, revocation) resolves from this row at request time — grant
+ * deletion / scope UPDATE kills outstanding tokens on the next request
+ * without touching any JWT.
+ */
+export const oauth2Grants = sqliteTable(
+  "oauth2_grant",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    userId: integer("user_id").notNull(),
+    applicationId: integer("application_id")
+      .notNull()
+      .references(() => oauth2Applications.id, { onDelete: "cascade" }),
+    /**
+     * Refresh-rotation counter; NOT NULL DEFAULT 1 (oauth2.go:509). Only
+     * moved under InvalidateRefreshTokens via the compare-and-increment
+     * UPDATE (WHERE counter = old) — a zero-rows answer is the stale-token
+     * signal (oauth2.go:545-559). Default OFF upstream: refresh tokens are
+     * reusable until expiry and the counter rides inert.
+     */
+    counter: integer("counter").notNull().default(1),
+    /** The mixed scope string (SPEC §2.5) — general + normalized access
+     *  scopes, space-joined. Upstream `Scope xorm:"TEXT"` (oauth2.go:510). */
+    scope: text("scope").notNull().default(""),
+    /** OIDC nonce replayed into the id_token (oauth2.go:511). */
+    nonce: text("nonce").notNull().default(""),
+    createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+    updatedAt: integer("updated_unix", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    // upstream xorm INDEX unique(user_application) (oauth2.go:506-508)
+    uniqueIndex("oauth2_grant_user_application_uq").on(t.userId, t.applicationId),
+  ],
+);
+
+/**
+ * Upstream OAuth2AuthorizationCode (oauth2.go:403-412) — one-time,
+ * 10-minute TTL (oauth2AuthorizationCodeValidity, oauth2.go:31, RFC 6749
+ * §4.1.2). Consumption IS the DELETE: the row's rowcount is the replay
+ * guard (Invalidate, oauth2.go:443-452 — zero affected rows ⇒ already
+ * used), a single D1 statement satisfying the transactional-consumption
+ * rule with no KV and no flag.
+ */
+export const oauth2AuthorizationCodes = sqliteTable(
+  "oauth2_authorization_code",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    grantId: integer("grant_id")
+      .notNull()
+      .references(() => oauth2Grants.id, { onDelete: "cascade" }),
+    /** `gta_` + 32 crypto-random bytes lowercased base32 unpadded
+     *  (GenerateNewAuthorizationCode, oauth2.go:522-542); UNIQUE-indexed for
+     *  the token endpoint's lookup (upstream `xorm:"INDEX unique"`). */
+    code: text("code").notNull(),
+    /** PKCE: "" = no PKCE on this code (oauth2.go:406-407; requiresCode-
+     *  Verifier is "method != '' || challenge != ''"). */
+    codeChallenge: text("code_challenge").notNull().default(""),
+    codeChallengeMethod: text("code_challenge_method").notNull().default(""),
+    redirectUri: text("redirect_uri").notNull().default(""),
+    /** The 10-minute window boundary; expired is `valid_until <= now`
+     *  (IsExpired, oauth2.go:415-419 — zero dies too, upstream defends). */
+    validUntil: integer("valid_until", { mode: "timestamp" }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("oauth2_authorization_code_code_uq").on(t.code),
+    index("oauth2_authorization_code_valid_until_idx").on(t.validUntil),
   ],
 );
 
@@ -4358,4 +4474,76 @@ export const emailOutbox = sqliteTable(
     sentAt: integer("sent_at", { mode: "timestamp" }),
   },
   (table) => [uniqueIndex("email_outbox_dedupe_key_uq").on(table.dedupeKey)],
+);
+
+/**
+ * Inbound email dedupe + log (specs/email-inbound.md §5, migration 0054).
+ * Email Routing hands the Worker's `email()` handler each message
+ * AT-LEAST-ONCE (MTA retries / platform redelivery), so the pipeline
+ * INSERTs the row BEFORE any decision and the UNIQUE `dedupe_key` IS the
+ * duplicate arbiter (the outbox `dedupe_key` pattern above); the outcome
+ * columns then record what the message did. Upstream analogue: the IMAP
+ * seen/deleted flag state + `handledSet` + log lines
+ * (gitea/services/mailer/incoming/incoming.go:145-256), made durable and
+ * queryable — upstream's mailbox-flag dedupe cannot port because there is
+ * no mailbox. Rows are written only when `MAIL_INBOUND_ENABLED=true`
+ * (the disabled gate writes NOTHING — the gate-off tripwire posture of
+ * email-outbound §7.5). Retention is the SPEC §1.3 follow-up.
+ */
+export const emailInbound = sqliteTable(
+  "email_inbound",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Message-ID when present, else sha256 over the stable envelope tuple
+     *  (from ‖ to ‖ subject ‖ date ‖ rawSize — RFC 5322 makes Message-ID a
+     *  SHOULD; duplicates must collapse either way, SPEC §3.4). UNIQUE —
+     *  the at-least-once arbiter; the FIRST row owns the outcome. */
+    dedupeKey: text("dedupe_key").notNull(),
+    /** Raw Message-ID header, clipped 998 (the RFC line bound). */
+    messageId: text("message_id").notNull().default(""),
+    /** Envelope pair (`ForwardableEmailMessage.from` / `.to`). */
+    fromAddress: text("from_address").notNull(),
+    toAddr: text("to_addr").notNull(),
+    /** Raw Subject header (RFC 2047 NOT decoded — SPEC §3.3), clipped 998. */
+    subject: text("subject").notNull().default(""),
+    /** Cloudflare's PREPENDED Authentication-Results (identifier
+     *  `mx.cloudflare.net` — sender-supplied ones are untrusted, SPEC
+     *  §4.2), clipped 1024; NULL when the identifier does not match. */
+    authResults: text("auth_results"),
+    /** Decode verdict: 'none' | 'invalid' | 'expired' | 'valid'. */
+    tokenStatus: text("token_status", { enum: ["none", "invalid", "expired", "valid"] })
+      .notNull()
+      .default("none"),
+    /** Pipeline verdict (SPEC §6's step outcomes). */
+    outcome: text("outcome", {
+      enum: [
+        "pending",
+        "dropped-misconfigured",
+        "rejected-oversize",
+        "dropped-duplicate",
+        "dropped-auto-reply",
+        "dropped-no-token",
+        "dropped-invalid-token",
+        "dropped-expired-token",
+        "dropped-permission",
+        "dropped-empty",
+        "dropped-missing-ref",
+        "comment-created",
+        "error",
+      ],
+    })
+      .notNull()
+      .default("pending"),
+    /** The token's doer + resolved reference, when decoded that far. */
+    userId: integer("user_id"),
+    refType: text("ref_type", { enum: ["issue", "comment"] }),
+    refId: integer("ref_id"),
+    /** The created comment, on `comment-created`. */
+    commentId: integer("comment_id"),
+    /** clip(errorText, 1024) on `error` (the outbox lastError discipline). */
+    error: text("error"),
+    receivedAt: integer("received_at", { mode: "timestamp" }).notNull(),
+    processedAt: integer("processed_at", { mode: "timestamp" }),
+  },
+  (table) => [uniqueIndex("email_inbound_dedupe_key_uq").on(table.dedupeKey)],
 );

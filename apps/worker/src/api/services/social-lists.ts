@@ -1,8 +1,9 @@
-import { and, asc, eq, or, sql } from "drizzle-orm";
+import { and, asc, eq, ne, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { repositories, repoWatchers, stars, users } from "../../db/schema";
 import type { RepositoryWithOwner, UserRow } from "./repository";
+import { WatchMode } from "./repo-watchers";
 
 /**
  * Tier-2 social listings behind the T2 listing routes (SPEC-0004 appendix A
@@ -54,25 +55,28 @@ export async function listRepoStargazers(
   return { items: items.map((row) => row.user), total: totalRow?.total ?? 0 };
 }
 
-/** Subscribers (models/repo/watch.go GetWatchers) — the repo's watchers,
- *  `users.id` order. */
+/** Subscribers (routers/api/v1/repo/subscriber.go → GetRepoWatchers,
+ *  models/repo/watch.go:295-308) — the repo's watchers, `users.id` order.
+ *  Mode-aware: `watch.mode <> Dont` (:298) — a persisted ignore row (the
+ *  Auto-unwatch landing, watch.go:164-165) is not a subscriber. */
 export async function listRepoSubscribers(
   d1: D1Database,
   repoId: string,
   options: SocialListOptions,
 ): Promise<{ items: UserRow[]; total: number }> {
   const db = drizzle(d1);
+  const watcherFilter = and(eq(repoWatchers.repoId, repoId), ne(repoWatchers.mode, WatchMode.Dont));
   const totalRow = await db
     .select({ total: sql<number>`count(*)` })
     .from(repoWatchers)
     .innerJoin(users, eq(users.id, repoWatchers.userId))
-    .where(eq(repoWatchers.repoId, repoId))
+    .where(watcherFilter)
     .get();
   const items = await db
     .select({ user: users })
     .from(repoWatchers)
     .innerJoin(users, eq(users.id, repoWatchers.userId))
-    .where(eq(repoWatchers.repoId, repoId))
+    .where(watcherFilter)
     .orderBy(asc(users.id))
     .limit(options.pageSize)
     .offset((options.page - 1) * options.pageSize);
@@ -80,12 +84,13 @@ export async function listRepoSubscribers(
 }
 
 /**
- * GetWatchedRepos (models/repo/user_repo.go) — the repositories one user
- * watches, newest-repo order not modeled: the same numeric-id ordering the
+ * GetWatchedRepos (models/repo/user_repo.go:81-113) — the repositories one
+ * user watches, newest-repo order not modeled: the same numeric-id ordering the
  * starred list uses (`CAST(id AS INTEGER)` — the text-id convention). The
  * visibility predicate mirrors services/stars.ts listStarredRepositories:
  * public rows plus rows owned by the REQUESTING doer; the admin arm drops
- * the filter entirely.
+ * the filter entirely. Mode-aware: ToConds' `watch.mode <> WatchModeDont`
+ * (user_repo.go:100-101) — an ignored repo leaves the watched list.
  */
 export async function listWatchedRepositories(
   d1: D1Database,
@@ -93,10 +98,12 @@ export async function listWatchedRepositories(
   options: { doerLoginLower: string; isAdmin: boolean } & SocialListOptions,
 ): Promise<{ items: RepositoryWithOwner[]; total: number }> {
   const db = drizzle(d1);
+  const modeFilter = ne(repoWatchers.mode, WatchMode.Dont);
   const where = options.isAdmin
-    ? eq(repoWatchers.userId, userId)
+    ? and(eq(repoWatchers.userId, userId), modeFilter)
     : and(
         eq(repoWatchers.userId, userId),
+        modeFilter,
         or(eq(repositories.visibility, "public"), eq(repositories.ownerNamespace, options.doerLoginLower)),
       );
   const totalRow = await db

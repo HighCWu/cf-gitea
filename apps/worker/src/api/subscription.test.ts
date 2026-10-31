@@ -217,3 +217,105 @@ describe("repositories.num_watches maintenance (migration 0030)", () => {
     expect(rendered.stars_count).toBe(0); // untouched by the watch arm
   });
 });
+
+/**
+ * The watch MODE transitions (migration 0053 — models/repo/watch.go:114-178
+ * through services/repo-watchers.ts): the WatchRepoAuto arms behind the API
+ * routes — PUT keeps a Custom selection and lifts Dont back to Normal
+ * (includes reset), DELETE lands an Auto watch on the persisted Dont mode
+ * and deletes everything else; GET answers IsWatchModeWatching(mode).
+ */
+describe("watch MODE transitions (migration 0053, models/repo/watch.go:114-178)", () => {
+  /** Seed user 1's watch row on repo 7101 in an arbitrary mode. */
+  const seedWatch = (values: Partial<typeof repoWatchers.$inferInsert>) =>
+    drizzle(env.DB)
+      .insert(repoWatchers)
+      .values({ repoId: "7101", userId: 1, createdAt: new Date(), ...values })
+      .onConflictDoNothing()
+      .run();
+
+  async function watchRow(): Promise<{ mode: number; pr: number; issues: number; releases: number } | undefined> {
+    // D1's first() answers null on no-row; the absent watch is the undefined
+    // the arms compare against (the dummy-mirror posture).
+    return (
+      (await env.DB
+        .prepare(
+          "SELECT mode, include_pull_requests AS pr, include_issues AS issues, include_releases AS releases FROM repo_watchers WHERE repo_id = '7101' AND user_id = 1",
+        )
+        .first<{ mode: number; pr: number; issues: number; releases: number }>()) ?? undefined
+    );
+  }
+
+  async function numWatches(repoId: string): Promise<number> {
+    const row = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get();
+    if (row === undefined) throw new Error("repo seed failed");
+    return row.numWatches;
+  }
+
+  it("PUT from nothing lands mode Normal with every include true (watchRepoByMode's insert arm, watch.go:141-144)", async () => {
+    expect((await makeApp()("/repos/someone-else/watched/subscription", { method: "PUT", headers: authHeaders })).status).toBe(200);
+    expect(await watchRow()).toEqual({ mode: 1, pr: 1, issues: 1, releases: 1 });
+    expect(await numWatches("7101")).toBe(1);
+  });
+
+  it("PUT keeps a Custom selection (watch.go:173-175) — the row's mode and picked flags don't move, the counter neither", async () => {
+    await seedWatch({ mode: 4, includePullRequests: false, includeIssues: true, includeReleases: true });
+    await drizzle(env.DB).update(repositories).set({ numWatches: 1 }).where(eq(repositories.id, "7101"));
+    const res = await makeApp()("/repos/someone-else/watched/subscription", { method: "PUT", headers: authHeaders });
+    expect(res.status).toBe(200);
+    const body = await res.json<Record<string, unknown>>();
+    expect(body.subscribed).toBe(true); // upstream renders WatchInfo unconditionally
+    expect(await watchRow()).toEqual({ mode: 4, pr: 0, issues: 1, releases: 1 });
+    expect(await numWatches("7101")).toBe(1); // still watching — delta 0
+    expect(await countRepoWatchers(env.DB, "7101")).toBe(1);
+  });
+
+  it("PUT lifts a persisted Dont back to Normal and resets the includes (watch.go:136-138's start-to-watch reset)", async () => {
+    await seedWatch({ mode: 2, includePullRequests: false, includeIssues: true, includeReleases: false });
+    expect((await makeApp()("/repos/someone-else/watched/subscription", { method: "PUT", headers: authHeaders })).status).toBe(200);
+    expect(await watchRow()).toEqual({ mode: 1, pr: 1, issues: 1, releases: 1 });
+    expect(await numWatches("7101")).toBe(1); // Dont → Normal flips watching-ness: +1
+  });
+
+  it("PUT over an Auto watch transitions to Normal with the includes SURVIVING (delta-0 update, no reset)", async () => {
+    await seedWatch({ mode: 3, includePullRequests: false, includeIssues: true, includeReleases: true });
+    await drizzle(env.DB).update(repositories).set({ numWatches: 1 }).where(eq(repositories.id, "7101"));
+    expect((await makeApp()("/repos/someone-else/watched/subscription", { method: "PUT", headers: authHeaders })).status).toBe(200);
+    expect(await watchRow()).toEqual({ mode: 1, pr: 0, issues: 1, releases: 1 }); // custom selection survives
+    expect(await numWatches("7101")).toBe(1); // Auto → Normal stays watching — delta 0
+  });
+
+  it("DELETE lands an Auto watch on the persisted Dont mode (watch.go:164-165): row stays, counter decrements, GET 404s", async () => {
+    await seedWatch({ mode: 3 });
+    await drizzle(env.DB).update(repositories).set({ numWatches: 1 }).where(eq(repositories.id, "7101"));
+    expect((await makeApp()("/repos/someone-else/watched/subscription", { method: "DELETE", headers: authHeaders })).status).toBe(204);
+    expect(await watchRow()).toEqual({ mode: 2, pr: 1, issues: 1, releases: 1 }); // the deliberate-off state persists
+    expect(await numWatches("7101")).toBe(0);
+    expect(await countRepoWatchers(env.DB, "7101")).toBe(0); // the drift probe counts WATCHING rows only
+    expect((await makeApp()("/repos/someone-else/watched/subscription", { headers: authHeaders })).status).toBe(404);
+    // A repeat DELETE over the Dont row lands None (watch.go:167 → :149-151's
+    // needSetWatchMode==false delete arm — upstream deletes here too, delta 0).
+    expect((await makeApp()("/repos/someone-else/watched/subscription", { method: "DELETE", headers: authHeaders })).status).toBe(204);
+    expect(await watchRow()).toBeUndefined(); // the helper folds D1's null to the absent-row undefined
+    expect(await numWatches("7101")).toBe(0);
+  });
+
+  it("DELETE deletes a Normal watch outright (watch.go:167 → watchRepoByMode's :149-151 delete arm)", async () => {
+    await makeApp()("/repos/someone-else/watched/subscription", { method: "PUT", headers: authHeaders });
+    expect((await makeApp()("/repos/someone-else/watched/subscription", { method: "DELETE", headers: authHeaders })).status).toBe(204);
+    expect(await watchRow()).toBeUndefined(); // the helper folds D1's null to the absent-row undefined
+    expect(await numWatches("7101")).toBe(0);
+  });
+
+  it("GET counts a Custom watch as watching (IsWatchModeWatching, watch.go:104-106)", async () => {
+    await seedWatch({ mode: 4, includePullRequests: false });
+    const res = await makeApp()("/repos/someone-else/watched/subscription", { headers: authHeaders });
+    expect(res.status).toBe(200);
+    expect((await res.json<Record<string, unknown>>()).subscribed).toBe(true);
+  });
+
+  it("GET 404s a persisted Dont row (IsWatchingRepo's mode-aware arm, watch.go:109-112)", async () => {
+    await seedWatch({ mode: 2 });
+    expect((await makeApp()("/repos/someone-else/watched/subscription", { headers: authHeaders })).status).toBe(404);
+  });
+});

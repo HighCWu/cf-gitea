@@ -15,8 +15,8 @@ import { isWatchingRepo, unwatchRepo, watchRepo } from "../services/repo-watcher
 /**
  * Tier-1 repo-subscription routes (SPEC-0004 §2.4 row `GET/PUT/DELETE
  * /repos/{owner}/{repo}/subscription`; upstream routers/api/v1/user/watch.go
- * IsWatching/Watch/Unwatch on the `repo_watchers` raw-D1 store —
- * services/repo-watchers.ts documents the schema gap).
+ * IsWatching/Watch/Unwatch on the `repo_watchers` store — the watch MODES
+ * ride the store's mode + include_* columns, services/repo-watchers.ts).
  *
  * Auth: upstream wraps the whole group in `reqToken()` (api.go:1403–1407) —
  * every operation requires a token (anonymous → the 401 runtime-only body,
@@ -24,13 +24,23 @@ import { isWatchingRepo, unwatchRepo, watchRepo } from "../services/repo-watcher
  * 404. PUT's declared 403 is LIVE —
  * upstream's ErrBlockedUser arm (models/repo/watch.go:170-171, unwrapped by
  * Watch at watch.go:174) is wired in the handler below (the
- * blocks-enforcement sweep). Semantics: GET 404s when the caller is not
- * watching (upstream APIErrorNotFound), PUT is an idempotent subscribe
- * returning the WatchInfo with `subscribed: true` and the REPOSITORY's
- * created timestamp (upstream `ctx.Repo.Repository.CreatedUnix`), DELETE is
- * the idempotent 204 unwatch. `ignored` stays false (the ignore mode is a
- * tier-2 notification setting) and `reason` renders null like upstream's
- * nil.
+ * blocks-enforcement sweep). Mode semantics (the WatchRepoAuto arms,
+ * watch.go:159-178, via services/repo-watchers.ts): PUT is the idempotent
+ * subscribe that KEEPS a Custom selection (watch.go:173-175 — the response
+ * still renders `subscribed: true`, like upstream's unconditional
+ * WatchInfo) and resets the include flags when starting to watch; DELETE
+ * lands an Auto watch on the persisted Dont mode (watch.go:164-165, the
+ * row stays, the counter decrements) and everything else on None (row
+ * deleted). GET 404s unless `IsWatchModeWatching(mode)` (IsWatchingRepo,
+ * watch.go:109-112 — a persisted Dont row answers 404). The WatchInfo
+ * render stays upstream-literal: `subscribed: true` with the REPOSITORY's
+ * created timestamp (upstream `ctx.Repo.Repository.CreatedUnix`),
+ * `ignored: false` (hardcoded false in upstream's IsWatching/Watch
+ * handlers too — the field is not read from the mode there) and `reason`
+ * null like upstream's nil. The Custom/ignore SETTERS are web-form arms
+ * (POST /action/watch|participate|ignore and /action/watch/options,
+ * routers/web/repo/watch.go) — the store primitive
+ * (`watchRepoWithOptions`) is landed; the routes ride the UI window.
  */
 
 const notFoundResponse = {
