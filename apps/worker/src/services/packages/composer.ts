@@ -8,8 +8,10 @@
  * - Upload (composer.go:151-223): the RAW body is the archive (NOT
  *   multipart); DetectPackageExtName picks zip ("PK") / tar.gz (gzip
  *   magic) / tar.bz2 ("BZh") and readPackageFile extracts composer.json
- *   (≤ 10 MiB, the path.Clean + AsciiEqualFold name walk); the version
- *   comes from composer.json OR the `?version=` query param
+ *   (≤ 10 MiB, the path.Clean + AsciiEqualFold name walk) — the bz2 arm
+ *   decodes through the vendored bzip2 port (./bz2.ts, the Go
+ *   compress/bzip2 semantics; the platform has no bzip2 surface); the
+ *   version comes from composer.json OR the `?version=` query param
  *   (composer.go:172-176 — an ABSENT one is ErrInvalidVersion → 400);
  *   the name grammar (metadata.go:111 — the vendor/project lowercase
  *   pattern) and the go-version NewSemver gate apply; the type defaults
@@ -39,13 +41,14 @@
  * - Download (composer.go:121-146): the version → file-by-name walk with
  *   the lead GET bump; the 404 arms ride helper.PackageErrorStatus.
  *
- * Divergences (documented per AGENTS.md): .tar.bz2 uploads answer the
- * invalid-archive 400 (Workers' DecompressionStream has no bzip2 — a
- * reduction of upstream's three-format dispatch); the zip CRC is not
- * verified (the blob sha256 gates the bytes); the repo-source arm
- * resolves visibility/owner/admin, not the per-unit permission lattice
- * (the landed org/repo model's posture); JSON.stringify rendering (no Go
- * Marshal HTML escaping).
+ * Divergences (documented per AGENTS.md): the zip CRC is not verified
+ * (the blob sha256 gates the bytes); the repo-source arm resolves
+ * visibility/owner/admin, not the per-unit permission lattice (the
+ * landed org/repo model's posture); JSON.stringify rendering (no Go
+ * Marshal HTML escaping). (.tar.bz2 uploads used to be REJECTED as the
+ * documented no-bzip2-on-Workers reduction — lifted by the ./bz2.ts
+ * decoder port; randomized blocks stay rejected, exactly like Go's
+ * compress/bzip2 upstream imports.)
  */
 
 import { and, asc, eq, inArray } from "drizzle-orm";
@@ -82,6 +85,7 @@ import {
 } from "./blobs";
 import { isValidAbsoluteHttpUrl, writeVersionMetadata } from "./protocol-common";
 import { readTarMembers } from "./distro-common";
+import { bzip2Decompress } from "./bz2";
 import { parseSwiftVersionStrict, swiftVersionString } from "./swift";
 
 // ---------------------------------------------------------------------------
@@ -157,7 +161,7 @@ export class ComposerArchiveError extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// The container walks — zip / tar.gz (bz2 detected and REJECTED)
+// The container walks — zip / tar.gz / tar.bz2
 // ---------------------------------------------------------------------------
 
 export const COMPOSER_EXT_ZIP = ".zip";
@@ -283,6 +287,23 @@ async function composerTarGzMembers(bytes: Uint8Array): Promise<{ name: string; 
   }
 }
 
+/** metadata.go:146-149's pkgExtTarBz2 arm: bzip2.NewReader + the tar walk.
+ *  The decoder is the vendored Go-compress/bzip2 port (./bz2.ts); every
+ *  malformed or CRC-failing stream is the invalid-archive arm. */
+function composerTarBz2Members(bytes: Uint8Array): { name: string; data: Uint8Array }[] {
+  let inflated: Uint8Array;
+  try {
+    inflated = bzip2Decompress(bytes);
+  } catch {
+    throw new ComposerArchiveError();
+  }
+  try {
+    return readTarMembers(inflated).map((member) => ({ name: member.name, data: member.data }));
+  } catch {
+    throw new ComposerArchiveError();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // ParsePackage (metadata.go:160-216)
 // ---------------------------------------------------------------------------
@@ -350,12 +371,12 @@ function composerMetadataFromJson(raw: Record<string, unknown>, readme: string):
  */
 export async function parseComposerPackage(bytes: Uint8Array, versionParam = ""): Promise<ComposerPackageInfo> {
   const ext = detectComposerExtName(bytes);
-  if (ext === COMPOSER_EXT_TAR_BZ2) {
-    // The documented reduction: no bzip2 decoder on Workers.
-    throw new ComposerArchiveError();
-  }
   const members =
-    ext === COMPOSER_EXT_ZIP ? await composerZipMembers(bytes) : await composerTarGzMembers(bytes);
+    ext === COMPOSER_EXT_ZIP
+      ? await composerZipMembers(bytes)
+      : ext === COMPOSER_EXT_TAR_BZ2
+        ? composerTarBz2Members(bytes)
+        : await composerTarGzMembers(bytes);
 
   const composerJsonBytes = composerFindCaseInsensitive(members, "composer.json");
   if (composerJsonBytes === null) {

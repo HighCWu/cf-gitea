@@ -4,8 +4,10 @@
  * composer}.go + modules/packages/composer/metadata.go at the pin,
  * through the SERVICE face:
  *
- *  - detectComposerExtName's magic dispatch (zip / tar.gz / bz2-detect +
- *    reject), ParseComposerPackage's composer.json extraction (the
+ *  - detectComposerExtName's magic dispatch (zip / tar.gz / bz2), the
+ *    .tar.bz2 arm through the ./bz2.ts decoder port (real system-bzip2
+ *    fixtures — the upload round-trip stores the ORIGINAL archive bytes),
+ *    ParseComposerPackage's composer.json extraction (the
  *    case-insensitive member find), the name/version/type/readme arms,
  *    the ?version= fallback and the BOTH-missing 400, the stored file
  *    name `vendor-project[.version]ext`, the license string|array forms,
@@ -227,6 +229,20 @@ function composerArchive(version?: string, name = "gitea/composer-package"): Uin
   ]);
 }
 
+/** The .tar.bz2 fixture: a REAL system-bzip2 archive (bzip2 1.0.8,
+ *  `bzip2 -9 -c` at authoring time) of the repo's own ustar builder output
+ *  for {composer.json, README.md} of gitea/bzip2-package 1.0.0 — the same
+ *  bytes bz2.test.ts byte-verifies against buildTar. */
+const COMPOSER_TAR_BZ2_BASE64 =
+  "QlpoOTFBWSZTWW7LCeoAAMrfws7QWAf/0yaiXIp///96AACBAAgIMAE4S2GoI0hk9Rk0PU0aNANDI0aAGgNNBpCnkgyAAMmQDIABpkDAgSmlCGp6nk2qZPIRk0NGhkNABoyGjTyz0n5tcQTWBhrtVDBpHJgrvUkxKWhCTA4OJCZVaKmNiaqCzxp3h1yswM7AYwN07ZuCMyXqotWPVpl0Yq1xQf5sDplaeMICSSXIrKbbXfTVo4y5uRUQ6I5M+/iwZbtwmBpCA4Md/hEMURyW3prFmyLKZhC2krzQWREyQgfjNlU7kLtlQaQw/LplKYFAgG9QNMDXx91BkYRUmxkgOvQokaVmDzAq6THhHpIU5MwimSe5udcrEnbKCD0w1kk62ltpddn7vXWnnX7HvUkSQYEyLBftbE0JCQKZGOJAr9Rw0DFbUSlwYj2VlyYCbQYvoDaSTPSC1gVAcHFVuBL1C9AhsIbaQ+O+CSIsIIP4u5IpwoSDdlhPUA==";
+
+function composerTarBz2Fixture(): Uint8Array {
+  const text = atob(COMPOSER_TAR_BZ2_BASE64);
+  const bytes = new Uint8Array(text.length);
+  for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
+  return bytes;
+}
+
 const OWNER = "composerowner";
 const DOER = "composerdoer";
 let ownerRow: { id: number; username: string };
@@ -260,14 +276,32 @@ async function uploadPackage(bytes: Uint8Array, overrides: Record<string, unknow
 // ---------------------------------------------------------------------------
 
 describe("detectComposerExtName + parseComposerPackage (metadata.go)", () => {
-  it("the magic dispatch: PK → zip, gzip → tar.gz, BZh → DETECTED but rejected", () => {
+  it("the magic dispatch: PK → zip, gzip → tar.gz, BZh → tar.bz2", () => {
     expect(detectComposerExtName(makeZip([]))).toBe(COMPOSER_EXT_ZIP);
     expect(detectComposerExtName(new Uint8Array([0x1f, 0x8b, 0, 0]))).toBe(COMPOSER_EXT_TAR_GZ);
     expect(detectComposerExtName(encoder.encode("BZh9"))).toBe(COMPOSER_EXT_TAR_BZ2);
     expect(() => detectComposerExtName(encoder.encode("plain"))).toThrow(ComposerArchiveError);
-    // The bz2 rejection is the documented reduction (no bzip2 on Workers).
-    const info = { name: "x/y", version: "1.0.0" };
-    void info;
+  });
+
+  it("the .tar.bz2 arm: the real-bzip2 fixture parses to the full PackageInfo", async () => {
+    const parsed = await parseComposerPackage(composerTarBz2Fixture(), "1.0.0");
+    expect(parsed.name).toBe("gitea/bzip2-package");
+    expect(parsed.version).toBe("1.0.0");
+    expect(parsed.type).toBe("composer-plugin");
+    expect(parsed.filename).toBe("gitea-bzip2-package.1.0.0.tar.bz2");
+    expect(parsed.metadata.description).toBe("Package Description");
+    expect(parsed.metadata.license).toEqual(["MIT"]);
+    expect(parsed.metadata.authors).toEqual([{ name: "Gitea Authors" }]);
+    expect(parsed.metadata.require).toEqual({ php: ">=8.1" });
+    expect(parsed.metadata.readme).toContain("A bzip2-packed composer fixture.");
+  });
+
+  it("a corrupt .tar.bz2 stream is the invalid-archive arm", async () => {
+    const good = composerTarBz2Fixture();
+    const bad = good.slice();
+    bad[11] = (bad[11] ?? 0) ^ 0x01; // a bit in the block CRC
+    await expect(parseComposerPackage(bad)).rejects.toBeInstanceOf(ComposerArchiveError);
+    await expect(parseComposerPackage(good.subarray(0, 20))).rejects.toBeInstanceOf(ComposerArchiveError);
   });
 
   it("the composer.json extraction: the fields, the filename, the readme fold", async () => {
@@ -355,6 +389,39 @@ describe("uploadComposerPackage (composer.go:151-223)", () => {
     expect(files[0]?.name).toBe("gitea-composer-package.1.0.3.zip");
     expect(files[0]?.isLead).toBe(true);
     void result;
+  });
+
+  it("the .tar.bz2 round-trip: the D1 rows, the .tar.bz2 file name, the ORIGINAL bytes download", async () => {
+    const fixture = composerTarBz2Fixture();
+    const result = (await uploadPackage(fixture)) as Awaited<ReturnType<typeof uploadComposerPackage>>;
+    expect(result.pkg.name).toBe("gitea/bzip2-package");
+    expect(result.version.version).toBe("1.0.0");
+    expect(result.file.name).toBe("gitea-bzip2-package.1.0.0.tar.bz2");
+
+    const props = await db()
+      .select()
+      .from(packageProperties)
+      .where(eq(packageProperties.refId, result.version.id))
+      .all();
+    expect(props).toHaveLength(1);
+    expect(props[0]?.name).toBe("composer.type");
+    expect(props[0]?.value).toBe("composer-plugin");
+
+    // The download serves the ARCHIVE bytes (the stored file is the
+    // original .tar.bz2, not an extraction).
+    const download = await openComposerFileForDownload(
+      env.DB,
+      env.REPO_PACKS,
+      owner(),
+      "gitea/bzip2-package",
+      "1.0.0",
+      "gitea-bzip2-package.1.0.0.tar.bz2",
+      "HEAD",
+    );
+    expect(download).not.toBeNull();
+    const served = new Uint8Array(await new Response(download?.stream).arrayBuffer());
+    expect(served.byteLength).toBe(fixture.byteLength);
+    expect(Array.from(served)).toEqual(Array.from(fixture));
   });
 
   it("a re-publish of the SAME version is the always-409", async () => {
