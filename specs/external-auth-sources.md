@@ -1024,6 +1024,66 @@ the shared index.
   (OIDC-over-google-discovery), the provider registry table module,
   tests. Gates: per-provider suites; the registry answers
   deferred-keys with the recorded status.
+
+  **As-built (2026-10-31):** landed as
+  `services/auth-sources/github-client.ts` +
+  `services/auth-sources/gplus-client.ts` (flat beside the family's
+  `oidc-client.ts`, not the §9 sketch's `providers/` subdir — the landed
+  family shape wins; the GOOGLE file takes the legacy `gplus-` name so the
+  factory dispatch reads `provider === "gplus"` → its module directly).
+  The registry table module was already pulled forward by W1 (the
+  data-only lattice); W3 consumes it — github's URL resolution reads
+  `getProviderDescriptor("github").customUrlSettings` so the goth
+  v1.82.0 values stay single-sourced (a re-parse per use; the table is
+  static data). Suites: `github-client.test.ts` (16 — the authorize
+  parameter set with NO scope param when the source carries none (x/oauth2
+  sets the key only when non-empty — the contrast to the OIDC arm's
+  `openid` default), the four-URL GHE override arm, the userFromReader
+  mapping, the scope-gated email arm (scope `user` and `user:email`,
+  TrimSpace equality; the FIRST primary&&verified entry in list order;
+  `ErrNoVerifiedGitHubPrimaryEmail` fails the login as upstream's FetchUser
+  does), the error arms) + `gplus-client.test.ts` (10 — the
+  `access_type=offline` option (goth google.go:29-34), the
+  `["email"]`-default-concatenated-ahead scope list
+  (providers_simple.go:32-37 — append, never replace), the
+  v0.27.0-Endpoint token URL (not the dead `!go1.9` legacy host), the
+  userinfo query-param token carry (google.go:103, no Bearer header — the
+  pinned wire shape), the NickName=Name mapping (:127), the error arms)
+  — 26/26. Factory: `resolveOAuth2Client` grew the `github`/`gplus` arms
+  (additive union + two branches + the two stale W2 comment lines; the
+  W2 factory test's not-implemented assertions updated in the same
+  disclosed hunk). Gates with own eyes: the eight auth-sources-family
+  files 140/140 (W1's 42 + W2's 72 + these 26), the six-file W2
+  regression run quoted 114/114 in ONE invocation, tsc 0, scoped eslint
+  clean, `check:api` PASS. Deviations/clarifications recorded: (a)
+  **github's external id is the NUMERIC user id** — goth v1.82.0
+  `userFromReader` sets `UserID = strconv.Itoa(u.ID)` (github.go:178) and
+  `NickName = login` (:174); the dispatch brief's "login as external id"
+  paraphrase is NOT the pin, and upstream-parity ruled (the login handle
+  surfaces as the nickname, which `suggestedUsername`/W5 can prefer). A
+  profile without a numeric id fails `external-id-missing` where goth
+  would coerce Go's zero value to `"0"` — the honest failure, recorded;
+  (b) the exchange body is the SPEC §5.3.3 client_secret_post shape for
+  BOTH arms: Google's pinned endpoint style IS `AuthStyleInParams`
+  (x/oauth2 v0.27.0 google.go:29) — exact parity; github's x/oauth2
+  autodetect would try Basic first (github/session.go:28 →
+  `config.Exchange`), and GitHub's endpoint accepts the in-params form
+  with identical observable outcome — the uniform body is the recorded
+  adaptation; (c) goth's github bio/location mappings have NO slot in the
+  landed bounded `ExternalIdentityProfile` (identity.ts carries neither
+  field — the OIDC claim set's shape) — the §4.3 columns exist but the
+  profile slice drops the values; widening it is a W2-tail type change,
+  recorded open for the orchestrator; (d) the ROUTE still answers
+  `provider_unavailable` for github/gplus pending the registration-window
+  dispatch hunks (web/oauth2-login.ts is W2-landed and was outside this
+  unit's ownership — the ready hunks: start leg dispatch
+  `buildGithubAuthorizeUrl(client.cfg, redirectUri, state)` /
+  `buildGplusAuthorizeUrl(...)` (no discovery fetch, no nonce), callback
+  leg `exchangeGithubCode`/`exchangeGplusCode` + the two new error
+  classes in the catch; the `web/oauth2-login.test.ts` "github answers
+  provider_unavailable" arm stays truthful until then); (e) OQ-3
+  resolved to the named simple client (the dispatch's ratified posture) —
+  no google-over-OIDC-discovery arm exists.
 - **W4 — admin CRUD + login UI** (depends W1; parallel to W2/W3). Owns:
   `ui/pages/admin-auths.tsx` (list/new/edit/delete + goldens), the
   `/-/admin/auths` route family over the store, the login-page
@@ -1033,6 +1093,102 @@ the shared index.
   item + the `index.ts`/`ui/index.ts` mounts hand off to the
   orchestrator window (SPEC-0018 §7 rule). Gates: admin suites +
   goldens + the login-page byte-stability test.
+
+  **As-built (2026-10-31, dispatched wave four):** the PAGE MODULE, the
+  NAV hunks, and the LOGIN/SIGNUP arms landed; the `ui/index.ts` route
+  family (parse claims + handlers + registrations + the three
+  route-driven goldens) remains the orchestrator's window — the module
+  header of `admin-auths.tsx` carries the exact hunk list (the four
+  AdminRoute families, the digits-only `{authid}` claims, the
+  guard-first handler ladders, the registration lines; the
+  mount-window-wave126 precedent covers the deferred route arms).
+
+  Landed: `ui/pages/admin-auths.tsx` (the list / new / edit renders +
+  the load/parse/validate/apply seams over the W1 store + cfg codec),
+  the suites (`admin-auths.matrix.test.tsx` 29 +
+  `login-external-auth.test.tsx` 7 = 36/36), the nav
+  (`AdminFamilyNavActive` + the Identity & Access FIRST item — the
+  dispatch delegated the shared nav unions to this unit; the
+  SPEC-0018 §3.3 omission note at `admin-users.tsx` retires), the
+  login page's `oauth2Sources` option (`login.tsx`'s
+  `ExternalAuthMethods` divider+navigator; the icon-or-fallback arm —
+  goth's Fomantic `<i>` icons need an icon font the static shell
+  lacks, so github/gplus/openidConnect embed the submodule's exact svg
+  bytes per the ADMIN_EMBEDDED_ICONS precedent, unknown providers fall
+  to the allowlisted octicon-globe), and the signup block
+  (first-run.tsx, INSIDE the form per signup_inner.tmpl:50-56), wired
+  at `ui/session.ts` GET /login + `ui/first-run.ts` GET /user/sign_up
+  (one `listActiveOAuth2Sources` read each; the committed login golden
+  byte-stable — its fixture carries no sources).
+
+  The §8 gates with own eyes: W1's store/cfg/registry 42/42
+  unregressed; session+first-run 77/77; the admin family suites
+  156/156 (five suites' `not.toContain("/-/admin/auths")` omission
+  pins flipped — admin-users/orgs/badges/emails/hooks carried the
+  stale side of the SPEC-0018 verdict, the 6b63bf6 straggler class
+  taken along); the goldens battery 94/94 and a11y 88/88 ON THIS
+  WAVE'S DIFF (the 13 admin goldens re-baselined with reviewed
+  diffs — exactly ONE insertion per file, the nav anchor, zero other
+  bytes); bare `tsc --noEmit` zero; scoped eslint clean on all 14
+  touched files.
+
+  As-built deviations/clarifications (each recorded so it is not
+  silently re-decided):
+  (a) **The buttons render on DATA alone** (the dispatch's disclosed
+  choice): no constant gate exists — upstream renders the social block
+  whenever an active source exists, and a gate constant would be an
+  invention. Until W2's routes mount in the dispatcher's window, a
+  button click is the honest 404 (a transient dev-window state).
+  (b) **Write-only client secret**: the edit input renders
+  `type="password" value=""` and an empty post keeps the stored
+  secret; upstream's OAuth2 arm displays the secret inline
+  (edit.tmpl:397-400) — §6.1/§7.7's masking posture wins, upstream's
+  own LDAP bind-password field is the type=password precedent.
+  (c) **Slug-validated name** `[A-Za-z0-9._-]+` at ≤30 (§6.3's
+  URL-token rule) over upstream's bare `Required;MaxSize(30)` — with
+  upstream's require/max_size/alpha_dash_dot message shapes.
+  (d) **The provider-scoped fields pre-drop**: the cfg builder includes
+  a foreign provider's fields NOWHERE (a claim posted for github is
+  dropped, not stored-inert) — upstream's parseOAuth2Config copies
+  every posted field onto the struct and stores it inert; the codec's
+  structural-absence rule (§4.2) keeps the observable create outcome
+  matching (success) while the stored cfg stays strict. The only codec
+  rejection reachable through the form is discovery-required.
+  (e) **The live discovery probe is the W2 handoff**: the write arms
+  run the codec's validate-before-persist (§6.2) plus the upstream
+  form-layer scheme gate (auths.go:272-278's url.Parse + http/https →
+  the invalid_openIdConnectAutoDiscoveryURL message verbatim); the
+  deeper probe (fetch+parse of the discovery document at save —
+  upstream's ErrOpenIDConnectInitialize outcome) folds into the arms
+  when W2's client seam is importable (the dispatch forbids importing
+  W2's flying files).
+  (f) **is_sync_enabled / TwoFactorPolicy render nowhere** (§6.3) and a
+  created source stores `is_sync_enabled=false` — upstream's new form
+  defaults the checkbox CHECKED (auths.go:85) so upstream creates
+  OAuth2 sources with IsSyncEnabled=true; the column is inert until
+  the sync engine (§1's deferred set), so the false default is the
+  recorded posture.
+  (g) **The list adds Provider + Users columns** (§6.1's row) over
+  upstream's seven — nine live columns, the no-results colspan
+  follows; a dead cfg renders the honest "(invalid)" provider marker
+  and renders no login button (a dead source cannot complete a chain).
+  (h) **The delete refusal re-renders the edit page at 200** with the
+  `still_in_used` message (upstream flashes + JSONRedirects to the
+  edit page — the plain-form POST reduction; the notices re-render
+  idiom keeps the message alive no-JS). The success arms 303 exactly
+  where upstream's Redirect lands (the list on create/delete, the
+  edit page on update).
+  (i) **The three route-driven auths goldens defer with the mount**
+  (§8's §5.2 process needs the mounted routes); the nav-shift
+  re-baseline (13 files) landed here.
+  (j) **The tips block reduces to the three executable providers** —
+  advising a Bitbucket/GitLab/… OAuth app on an instance where that
+  provider cannot complete a login would be the SPEC-0018 §3.3
+  posture-line class; the callback-URL tip computes the
+  common.ts:267 string server-side whenever the name is known (the
+  JS-fill reduction; the fresh new-form GET renders the element empty,
+  upstream's pre-JS bytes). OQ-5 stays as proposed (parity: the item
+  lights unconditionally).
 - **W5 — linking UI + settings** (depends W2; size **M**). Owns:
   `ui/pages/link-account.tsx` (`GET /user/link_account` +
   the two POST arms over §5.5), the account-links section on
@@ -1081,7 +1237,9 @@ W5-exclusive once dispatched.
    generic OIDC discovery path (Google exposes one). Proposal: named
    client per upstream (the scopes/default behavior then matches the
    pin exactly, including the auto-reg `profile` scope addition when
-   that arm lands).
+   that arm lands). **RESOLVED (2026-10-31, W3 dispatch): named simple
+   client** — `gplus-client.ts` implements the goth v1.82.0 google
+   provider's fixed endpoints verbatim (§9 W3 as-built).
 4. **PKCE on the client flow** — send `S256` on OIDC sources
    unconditionally (hardening; some IdPs reject unknown params) or
    defer (upstream's goth providers mostly send none)?

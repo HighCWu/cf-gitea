@@ -90,6 +90,16 @@ import {
   resolveOAuth2Client,
   type FetchImpl as OidcFetchImpl,
 } from "../services/auth-sources/oidc-client";
+import {
+  GithubClientError,
+  buildGithubAuthorizeUrl,
+  exchangeGithubCode,
+} from "../services/auth-sources/github-client";
+import {
+  GplusClientError,
+  buildGplusAuthorizeUrl,
+  exchangeGplusCode,
+} from "../services/auth-sources/gplus-client";
 import { getActiveOAuth2SourceByName } from "../services/auth-sources/store";
 import { lookupValidSession, mintSession, safeRedirectTarget, sessionCookieValue, sessionSetCookie } from "../ui/session";
 
@@ -245,8 +255,31 @@ export function createOAuth2LoginRouter(deps: RouterDeps = {}): Hono<{ Bindings:
     if (source === null) return notFound();
 
     const client = resolveOAuth2Client(source.cfg);
+    // The github/gplus simple arms (W3): no discovery document, no nonce —
+    // the authorize URL builds straight from the registry's endpoint set.
+    if (client.kind === "github" || client.kind === "gplus") {
+      const expectedState = crypto.randomUUID();
+      const state: OAuth2LoginState = {
+        sourceId: source.id,
+        provider: client.cfg.provider,
+        expectedState,
+        // The simple arms carry NO nonce (github/google authorize carries no
+        // nonce — goth sends none for them); undefined keeps the OIDC-only
+        // field honest.
+        nonce: undefined,
+        returnTo: parkReturnTo(c.req.raw),
+        continue: readContinuation(c.req.url),
+      };
+      const redirectUri = callbackRedirectUri(c.req.url, source.name);
+      const authorizeUrl =
+        client.kind === "github"
+          ? buildGithubAuthorizeUrl(client.cfg, redirectUri, expectedState)
+          : buildGplusAuthorizeUrl(client.cfg, redirectUri, expectedState);
+      const parked = await parkDanceState(c, state);
+      return seeOther(authorizeUrl, parked.cookieDirective === undefined ? [] : [parked.cookieDirective]);
+    }
     if (client.kind !== "oidc") {
-      // W2 carries the OIDC arm; the github/gplus clients are W3's (§9).
+      // The still-deferred registry keys answer the W2 posture.
       return loginErrorRedirect("provider_unavailable");
     }
 
@@ -318,6 +351,56 @@ export function createOAuth2LoginRouter(deps: RouterDeps = {}): Hono<{ Bindings:
     // The provider client (a source re-configured mid-dance dies here like
     // any dead row).
     const client = resolveOAuth2Client(source.cfg);
+    // The github/gplus simple arms' exchange (§5.3.3 form-post + the profile
+    // fetch with the identity mapping) — their typed errors take the
+    // errCallback default arm like every OIDC verify failure; the resolved
+    // identity falls through to the shared ladder below.
+    if (client.kind === "github" || client.kind === "gplus") {
+      const simpleCode = url.searchParams.get("code");
+      if (simpleCode === null || simpleCode === "") return loginErrorRedirect("internal", spentCookies);
+      let simpleIdentity;
+      try {
+        const exchanged =
+          client.kind === "github"
+            ? await exchangeGithubCode({
+                fetchImpl,
+                cfg: client.cfg,
+                redirectUri: callbackRedirectUri(c.req.url, source.name),
+                code: simpleCode,
+              })
+            : await exchangeGplusCode({
+                fetchImpl,
+                cfg: client.cfg,
+                redirectUri: callbackRedirectUri(c.req.url, source.name),
+                code: simpleCode,
+              });
+        simpleIdentity = exchanged.identity;
+      } catch (error) {
+        if (error instanceof GithubClientError || error instanceof GplusClientError) {
+          return loginErrorRedirect("internal", spentCookies);
+        }
+        throw error;
+      }
+      const resolution = await resolveByExternalLogin(c.env.DB, source, simpleIdentity);
+      if (resolution.outcome === "linked") {
+        if (resolution.user.status !== "active") return loginErrorRedirect("prohibited", spentCookies);
+        const cookieValue = await mintSession(c.env.DB, resolution.user.id);
+        return seeOther(returnTo, [sessionSetCookie(cookieValue, false), ...spentCookies]);
+      }
+      const sessionCookie = sessionCookieValue(c.req.raw);
+      const doer = sessionCookie !== null ? await lookupValidSession(c.env.DB, sessionCookie) : null;
+      if (doer !== null) {
+        await linkIdentityToUser(c.env.DB, source, doer.id, simpleIdentity);
+        const destination = state.continue !== undefined ? returnTo : "/user/settings/security";
+        return seeOther(destination, spentCookies);
+      }
+      const params = new URLSearchParams({
+        oauth2_source: source.name,
+        oauth2_username_hint: suggestedUsername(simpleIdentity),
+      });
+      if (state.returnTo !== undefined && returnTo !== "/") params.set("redirect_to", state.returnTo);
+      return seeOther(`/user/link_account?${params.toString()}`, spentCookies);
+    }
     if (client.kind !== "oidc") return loginErrorRedirect("provider_unavailable", spentCookies);
 
     // Exchange + id_token verify (§5.3.3/§5.4). Every verify failure is

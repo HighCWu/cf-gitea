@@ -49,10 +49,10 @@
  *     given_name/family_name, preferred_username|nickname, picture — the
  *     standard-claim set goth maps onto its User struct.
  *
- * The github/google client modules (SPEC §9 W3) hang off the same
- * `resolveOAuth2Client` seam shape; W2 implements the OIDC arm only and
- * the shared resolver answers the recorded not-implemented status for the
- * rest of the lattice.
+ * The github/gplus client modules (SPEC §9 W3, landed:
+ * `github-client.ts`/`gplus-client.ts`) hang off the same
+ * `resolveOAuth2Client` seam — the union below carries their kinds; the
+ * rest of the lattice answers the recorded not-implemented status.
  */
 
 import { assertApiTimeBounds, importVerifyKey, verifyJws, type JwsAlgorithm, type JwsHeader } from "../oauth2/jws";
@@ -485,12 +485,18 @@ function base64UrlDecodeJson(value: string): Uint8Array {
 // The client seam (SPEC §5.1) — W2's executable slice
 // ---------------------------------------------------------------------------
 
-/** The resolved client for a source row: the OIDC arm. The github/gplus
- *  client modules (SPEC §9 W3) extend this union; W2 answers the recorded
- *  not-implemented status for them (the flow's failure arm — the same
+/** The resolved client for a source row. W3 added the `github` and `gplus`
+ *  arms — the client modules (`github-client.ts`/`gplus-client.ts`) hang
+ *  off this union; the route layer dispatches per kind (the simple arms are
+ *  discovery-less: fixed endpoints from the registry/goth wire values vs
+ *  the OIDC arm's well-known join). Unknown-but-valid provider keys
+ *  (recorded-deferred lattice entries, SPEC §2.3) still answer the
+ *  not-implemented status (the flow's failure arm — the same
  *  flash-and-login-redirect ladder, upstream errCallback default). */
 export type OAuth2Client =
   | { kind: "oidc"; cfg: OAuth2SourceConfig }
+  | { kind: "github"; cfg: OAuth2SourceConfig }
+  | { kind: "gplus"; cfg: OAuth2SourceConfig }
   | { kind: "not-implemented"; provider: string; cfg: OAuth2SourceConfig };
 
 /** Parse the row's cfg and resolve the client. An unparsable row is a dead
@@ -498,5 +504,7 @@ export type OAuth2Client =
 export function resolveOAuth2Client(cfgJson: string): OAuth2Client {
   const cfg = parseOAuth2SourceConfig(cfgJson);
   if (cfg.provider === "openidConnect") return { kind: "oidc", cfg };
+  if (cfg.provider === "github") return { kind: "github", cfg };
+  if (cfg.provider === "gplus") return { kind: "gplus", cfg };
   return { kind: "not-implemented", provider: cfg.provider, cfg };
 }

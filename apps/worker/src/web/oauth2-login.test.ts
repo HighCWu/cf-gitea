@@ -274,12 +274,19 @@ describe("the start leg (GET /user/oauth2/{source})", () => {
     expect(parked?.expectedState).toBe(start.stateParam);
   });
 
-  it("a github source answers provider_unavailable in W2 (the client module is W3's)", async () => {
+  it("a github source rides the W3 simple arm — the authorize redirect, no discovery, no nonce", async () => {
     const cfg = serializeOAuth2SourceConfig({ v: 1, provider: "github", clientId: "g", clientSecret: "s" });
     await createLoginSource(env.DB, { type: LoginSourceType.OAuth2, name: "GH", isActive: true, cfg });
     const response = await req("https://app.example.com/user/oauth2/GH");
     expect(response.status).toBe(303);
-    expect(response.headers.get("location")).toBe("/login?oauth2_error=provider_unavailable");
+    const location = response.headers.get("location") ?? "";
+    // The registry's endpoint set straight (no discovery fetch); the dance
+    // state parks with NO nonce; the source-NAME-bound redirect_uri.
+    expect(location.startsWith("https://github.com/login/oauth/authorize?")).toBe(true);
+    expect(location).toContain("client_id=g");
+    expect(location).toContain(`redirect_uri=${encodeURIComponent("https://app.example.com/user/oauth2/GH/callback")}`);
+    expect(location).not.toContain("nonce");
+    expect(location).not.toContain("scope"); // no default scopes (user:email is auto-reg-deferred)
   });
 
   it("a discovery failure answers the failure arm (§7.5)", async () => {

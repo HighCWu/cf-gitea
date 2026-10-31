@@ -512,13 +512,13 @@ describe("id_token verify matrix (SPEC §8 Flow — good arms first)", () => {
   });
 });
 
-describe("resolveOAuth2Client (the §5.1 seam's W2 slice)", () => {
-  it("openidConnect resolves the oidc arm; github/gplus answer not-implemented in W2", () => {
+describe("resolveOAuth2Client (the §5.1 seam — W3 carries the three executable arms)", () => {
+  it("openidConnect resolves the oidc arm; github and gplus resolve their W3 client arms", () => {
     expect(resolveOAuth2Client(oidcCfg())).toMatchObject({ kind: "oidc" });
     const github = serializeOAuth2SourceConfig({ v: 1, provider: "github", clientId: "g", clientSecret: "s" });
-    expect(resolveOAuth2Client(github)).toMatchObject({ kind: "not-implemented", provider: "github" });
+    expect(resolveOAuth2Client(github)).toMatchObject({ kind: "github" });
     const gplus = serializeOAuth2SourceConfig({ v: 1, provider: "gplus", clientId: "g", clientSecret: "s" });
-    expect(resolveOAuth2Client(gplus)).toMatchObject({ kind: "not-implemented", provider: "gplus" });
+    expect(resolveOAuth2Client(gplus)).toMatchObject({ kind: "gplus" });
   });
 
   it("an unparsable cfg is a dead source (the codec's contract)", () => {
