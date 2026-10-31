@@ -1093,9 +1093,9 @@ runs the regexp):
   reads that work without a mailer (the gate's original "no write to gate
   it" justification dissolved with this landing). The NewIssueUsers seed
   (issue_user.go:28-55 — repo-assignee + poster rows at issue create,
-  is_read tracking) stays STAGED (§13.4): the mission scope was the
-  mention carrier, and the seed's assignee enumeration rides surfaces
-  that are not landed whole.
+  is_read tracking) LANDED since (2026-10-31, §13.4): the enumeration
+  surfaces are whole now (teams/units/collaborators) and the seats ride
+  the create batch.
 - The two reads our tree carries are wired:
   - the derived mailbox's mention arm (routes/notifications.ts
     `recipientExpr`): `exists (issue_user … uid, is_mentioned=1)` —
@@ -1149,7 +1149,7 @@ runs the regexp):
   mail-gated. Comment EDIT does not re-mention (upstream UpdateComment
   re-runs neither).
 
-### 13.3 Tests (parser.test.ts 53, resolve.test.ts 19, carrier.test.ts 16, notify.test.ts +6, issue-extras-subscription.test.ts +7)
+### 13.3 Tests (parser.test.ts 53, resolve.test.ts 19, carrier.test.ts 25 — 16 carrier + 9 the §13.4 seed, notify.test.ts +6, issue-extras-subscription.test.ts +7)
 
 - Parser: the pin's 37 pattern rows + the span fixture 1:1; the strip arms
   are cite-marked derived (fence/indented/code-span/link/linkify/email/
@@ -1160,7 +1160,7 @@ runs the regexp):
   the mentioned-unwatcher exception, the mentioned-doer exclusion, and two
   end-to-end arms through `addComment` (the onmention row lands first; a
   code-span mention does not resolve).
-- The carrier (carrier.test.ts 16): the upsert round trip (is_mentioned=1,
+- The carrier (carrier.test.ts 25): the upsert round trip (is_mentioned=1,
   is_read=0), the empty fast-path, single-row dedupe (same-call repeat +
   cross-call re-mention), the is_read-preserving re-mention
   (issue_user.go:77), the GetIssueMentionIDs filter (a non-mention carrier
@@ -1168,33 +1168,102 @@ runs the regexp):
   with NO mail env (issue/comment/PR create + the no-mention zero + the
   sticky flag), and the mailbox mention arm end-to-end through
   `registerNotificationsRoutes` (the mentioned user's thread appears; the
-  bystander's stays empty; deleting the carrier rows empties it).
+  bystander's stays empty; deleting the carrier rows empties it). The
+  seed arms (§13.4): owner+poster seats with zero flags, the seated-poster
+  dedupe, the write-gate on collaborator modes, the non-active
+  collaborator filter, the org-team arm (units-gated member seated, the
+  code-unit team gated OUT, the org owner unseated), the PR-create seats,
+  the standalone write shape, the seat arithmetic, and the seed never
+  feeding GetIssueMentionIDs.
 - The subscription fallback (issue-extras-subscription.test.ts +7): the
   poster seat with zero comments, the poster skipping the active filter
   (the append sits outside the query), the 0/21/22 comment-type set, the
   system-comment exclusion, the prohibited-commenter exclusion, and the
   fallback answering true over a Dont repo watch.
 
-### 13.4 Staged after the carrier (the §13.2 residue)
+### 13.4 The §13.2 residue — the seed lands, the mark-read adjudicated (2026-10-31)
 
-- `NewIssueUsers` seed (issue_user.go:28-55 + GetRepoAssignees,
-  models/repo/user_repo.go:117-150): the is_read-tracking rows (repo
-  assignees via access mode>=write + the org-team arm + poster/owner
-  seats) at issue create. Rides the read-tracking surface — worthless
-  until the mark-read write below lands.
+- `NewIssueUsers` seed — **LANDED** (issue_user.go:28-55 +
+  GetRepoAssignees, models/repo/user_repo.go:117-152). The enumeration is
+  `services/mentions/repo-assignees.ts` (`getRepoAssignees`): the
+  write/admin collaborator arm (the landed `repo_collaborators`
+  interpretation of upstream's `access` rows), the ORG-team arm
+  (`GetTeamUserIDsWithAccessToAnyRepoUnit`, team_repo.go:85-96 — teams
+  joined to THIS repo through the materialized `team_repo_access` rows,
+  gated `authorize >= read OR the issues/pulls unitsMap override >= read`
+  via the landed `teamUnitEnabled` collapse, expanded through
+  `team_members`), active users only (the tree's `status='active'`
+  is_active+!prohibit_login collapse), username order, then the NON-org
+  owner seat appended raw (:151-153 — org owners bring no seat). The seat
+  arithmetic is the carrier's `newIssueUserSeedRows` (poster joins only
+  when no assignee holds the seat, :35-53; our nullable posterId simply
+  brings no seat). The write rides the CREATE BATCH — per-seat INSERTs
+  with the in-transaction issue-id subquery, the labels-loop pattern —
+  keeping upstream's atomicity (NewIssueWithIndex issues the call in-tx,
+  issue_update.go:437; models/issues/pull.go:477 does for PRs, so BOTH
+  createIssue and createPullRequest seed). Zero-value rows
+  (`is_read`/`is_mentioned` false) — the seed feeds NO existing read (the
+  mention reads all filter `is_mentioned=1`); its purpose is the
+  read-tracking precondition: `UpdateIssueUserByRead` is UPDATE-only, so
+  without these seats a later mark-read write would no-op for exactly the
+  users upstream seats at create.
 - `UpdateIssueUserByRead` (issue_user.go:58-61 via SetIssueReadBy,
   models/activities/notification.go:338; callers routers/web/repo/
   issue_view.go:389, routers/web/repo/pull.go:153, routers/api/v1/repo/
-  pull.go:911): the issue-view mark-read write. Collides by design with
-  the derived mailbox's notification_states arithmetic — needs its own
-  decision note when the web issue-view port reaches it.
-- The mention reads over search: the issue indexer's GetIssueMentionIDs
-  (modules/indexer/issues/util.go:53 — no indexer in this tree),
-  `IssueSearch`'s MentionID join (issue_search.go:396-398 — the
-  `mentioned`/`mentioned_by` filters of `/repos/issues/search` and the
-  repo-scoped list, currently stubbed to the empty set in
-  api/routes/issues.ts), and UserMentionedRepoCond (repo_list.go:259-267).
-  The store exists now; the wiring belongs to the search surface's owner.
+  pull.go:911): the issue-view mark-read write — **STAYS STAGED**, with
+  the decision note this line promised. THE ADJUDICATION (at pin
+  fc493688): upstream stamps TWO halves in one call, and both fire at the
+  same seams — the signed user VIEWING the issue/PR page (the "mailbox UI
+  reads the issue" moment) and the API merge. Half 1 is the issue_user
+  flag itself (update-only). Half 2 is `setIssueNotificationStatusReadIfUnread`
+  (notification.go:346-362) — the notification-status twin. Our derived
+  mailbox HAS read-tracking (`notification_states.readAtUnix`), but its
+  only writers are the notifications mark endpoints (PUT /notifications,
+  PATCH /threads/{id}) — exactly upstream's OWN API counterpart, which
+  likewise never touches issue_user (upstream's notify handlers call
+  SetNotificationStatus only). The VIEW seam performs no write in this
+  tree: the issue/pull detail page families render read-only, and the
+  merge route has not ported pull.go:911's arm. Upstream's only is_read
+  CONSUMER is `LoadIsRead` (issue_list.go:488-508, the web issue list) —
+  feeding a field the pin's templates never render (grep over
+  templates/ finds no `.IsRead` read): dead data at fc493688, and our
+  tree carries no consumer either. So the arm lands when the view seam
+  lands, and the decision recorded here is: (a) the page families
+  (ui/index.ts issue-detail/pull-detail) gain the view-time write for the
+  signed viewer — ui/index.ts is not a mentions-unit file; (b) the view
+  ALSO stamps `notification_states.readAtUnix = now` — upstream stamps
+  both halves in one call, and the derived unread arithmetic (unread iff
+  lastActivity > readAtUnix; later activity re-marks unread with no
+  write-path hook) is semantically compatible with upstream's
+  unread-on-activity re-mark; (c) the merge route (pulls.ts) ports the
+  pull.go:911 arm beside it. The seeded seats above are the
+  precondition; STAGING GAP, exactly: no landed surface performs the
+  issue-view mark, and the write's only consumer is unported dead data at
+  the pin — not invented.
+- The search-surface residue — **CLOSED for `assigned`** (2026-10-31):
+  the mention filters landed with the search wave (§13.2); the GLOBAL
+  `assigned` doer-flag now rides the same shape (issue.go:226-228 —
+  `searchOpt.AssigneeID = the doer id` inside the IsSigned block): the
+  api/routes/issues.ts search handler sets `assigneeId` through the
+  existing applyAssigneeCondition filter (issue_search.go:379-381 over
+  the `issue_assignees` store), and the web aux feed's `assigned_by` is
+  real the same way (issue_list.go:289-291 — the aux handler reads only
+  the `_by` filters, never the booleans). Still the empty-set stubs:
+  `review_requested`/`reviewed` (no review store). Still staged:
+  the issue indexer's GetIssueMentionIDs (modules/indexer/issues/util.go:53
+  — no indexer in this tree), and UserMentionedRepoCond
+  (repo_list.go:259-267 — its only caller is the web dashboard's
+  accessible-repo condition, a surface this backend does not carry).
+- DIVERGENCE LEDGER (for the collaborators owner): the seed enumerates
+  through the FULL `GetRepoAssignees` port (repo-assignees.ts), while the
+  `/repos/{owner}/{repo}/assignees` route keeps its REDUCED
+  `listRepoAssignees` (api/services/repo-collaborators.ts —
+  collaborators + owner, no org-team arm); upstream serves both from ONE
+  function, so the route under-lists org teams. That route's port also
+  appends the owner row without the non-organization condition
+  (:151) — an org owner's own user row can appear as an "assignee".
+  Unifying both reads on repo-assignees.ts is that surface owner's call;
+  recorded here so the split is deliberate, not accidental.
 
 ---
 
@@ -1333,9 +1402,11 @@ runs the regexp):
 
 ### 14.6 The review-family extraction as-built (api/services/pull-reviews.ts)
 
-The extraction this SPEC staged is LANDED (the prerequisite the review
-mail family rides; the receivers themselves stay the NEXT wave — this
-wave emits NO mail):
+The extraction this SPEC staged is LANDED, and the review mail family
+this section named now rides it WHOLE — the three receivers + the
+team-request fold are LIVE (the arm flips below; the core write
+behavior is untouched — the route suite's 31 assertions and the
+service suite's original 16 still pass unchanged):
 
 - `submitReview` + `addReviewRequest` / `removeReviewRequest` moved
   VERBATIM out of `api/routes/pull-reviews.ts` (1977 → 1641 lines) into
@@ -1352,26 +1423,64 @@ wave emits NO mail):
   `api/services/pull-reviews.test.ts` (16 arms) pins the cores directly —
   the SubmitReview state machine, the request pair's skip/403/official
   semantics, and the seam posture below.
-- SEAM MARKERS (the next wave's firing points, upstream-shaped): BOTH
-  `PullRequestReview` (notify.go:98-111) and `PullRequestCodeComment`
-  (:113-117, the `MailMentionsComment` mention resolution over the
-  attached code comments' bodies — the parser half landed §13) fire from
-  ONE upstream body — `SubmitReview` (services/pull/review.go:316 and
-  :323-331) — so both `SEAM` comments sit in the service's `submitReview`
-  after the writes commit. `PullRequestReviewRequest` (notify.go:129-136,
+- THE ARMS (the former SEAM markers, now as-built at the same firing
+  points): BOTH `PullRequestReview` (notify.go:98-111) and
+  `PullRequestCodeComment` (:113-117, the `MailMentionsComment`
+  mention resolution) fire from ONE upstream body — `SubmitReview`
+  (services/pull/review.go:316 and :323-331) — so the service's
+  `submitReview` emits both from its tail (`emitReviewMail`): the type-22
+  comment's `FindAndUpdateIssueMentions` (parse + visibility resolve +
+  the §13 carrier persist, the IssuesService posture — upstream runs it
+  with no mailer) then `notifyPullRequestReview`, then per attached code
+  comment (the converted pending review keeps its id, so the type-21
+  rows stay attached) a FRESH mentions resolution +
+  `notifyPullRequestCodeComment`. Compose pins: the verdict action lines
+  by review type (actionToTemplate's CommentTypeReview branch,
+  mail_issue_common.go:248-257 — approve/reject/review over
+  default.tmpl; MailParticipantsComment empties only the push type, so
+  the kept body renders beneath the line), the `/comment/<id>`
+  Message-ID over the plain thread reference, `IsMention` per recipient
+  (the mention batch's membership), the WIP repo-watcher gate APPLIED
+  (ActionType(0) != ActionCreatePullRequest), dedupe
+  `pull-review:<commentId>:<recipientId>` /
+  `pull-code-comment:<commentId>:<recipientId>`; the code-comment arm is
+  the MENTIONS-ONLY batch (mail_comment.go:56-60 — visited is the poster
+  alone, so a non-mentioned watcher gets nothing and an
+  explicitly-unwatched mention still does; fromMention=true admits
+  onmention). `PullRequestReviewRequest` (notify.go:129-136,
   `SendIssueAssignedMail` over `{ActionType: 0, Content: "Requested to
   review <htmlurl>.", Comment: <the request comment>}`) fires from the
-  request model arm (services/issue/review_request.go:38 — `comment !=
-  nil`): the service's `addReviewRequest` and `removeReviewRequest` carry
-  the SEAM comments (the removal receiver self-gates off `!isRequest`,
-  notify.go:132). The route's TEAM-add block carries its own seam note —
-  upstream's team arm notifies through `teamReviewRequestNotify`
-  (review_request.go:233) while TEAM-request removal is silent (:44-47) —
-  so its mail fold rides the route, not the service cores.
-- Posture: absent env the arms are off (every construction site's
-  fail-closed default); an ARMED constructor performs byte-identical
-  writes and lands ZERO `email_outbox` rows (the service suite pins both —
-  this wave's tripwire against premature emission).
+  request model arm's firing point (services/issue/review_request.go:38
+  — `comment != nil`, BOTH directions call it and the receiver
+  self-gates the removal off `!isRequest`, notify.go:130-131):
+  `notifyPullRequestReviewRequest` — the IssueChangeAssignee twin (sole
+  recipient = the reviewer; not-to-self, not-disabled, IsMailable),
+  name "default" (the compose's comment-type switch has NO
+  ReviewRequest case, :258-268) → default.tmpl, NO action line, the
+  rendered `ct` IS the body, info "issue assigned", and the type-27
+  comment carries NO `HasMailReplySupport` (comment.go:196-201) → the
+  reply payload is nil: no Reply-To/List-Post, a bare thread
+  References, while the issue-bound unsubscribe token still rides.
+  Dedupe `pull-review-request:<commentId>:<recipientId>`.
+- THE TEAM-REQUEST FOLD (the route block, upstream
+  `TeamReviewRequest` → `teamReviewRequestNotify`,
+  services/issue/review_request.go:199/:233-252): after a team REQUEST
+  row + its type-27 comment land, the route expands the team's members
+  (`GetTeamMembers`, team_user.go:40-56 — ORDER BY full_name, name),
+  SKIPS the poster member (:241-243), and fires
+  `notifyPullRequestReviewRequest` per survivor over the SAME comment
+  (upstream's per-member `comment.AssigneeID` mutation is inert for the
+  compose — the mail keys on the comment id). TEAM-request REMOVAL
+  stays SILENT (:44-47 — `!isAdd` returns before the notifier).
+  Best-effort, never fails the request.
+- Posture: absent env the notify half is off (every construction
+  site's fail-closed default — the bare tripwire) while the mentions
+  resolve + carrier persist stay UNCONDITIONAL (§13); an ARMED
+  constructor performs byte-identical writes AND emits (the service
+  suite pins the armed emits, the bare silence, and the
+  removal self-gate; the notify.test.ts receiver describes pin each
+  compose + filter matrix; the templates.test.ts byte pins cover the
+  verdict lines + the `x_mentioned_you` line).
 
 ---
 

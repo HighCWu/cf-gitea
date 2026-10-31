@@ -3042,6 +3042,59 @@ describe("GET /repos/issues/search (issueSearchIssues)", () => {
     expect(emptySet.headers.get("X-Total-Count")).toBe("0");
   });
 
+  it("wires the assigned doer-flag — assigned (doer) over issue_assignees, assigned_by (other), the empty set", async () => {
+    const owner = await seedUser("Alice");
+    const neighbor = await seedUser("Bob");
+    const publicRepo = await seedRepo(owner.usernameLower, "assigned-public");
+    const privateRepo = await seedRepo(owner.usernameLower, "assigned-private", { private: true });
+    const stubAssigned = await seedIssue(publicRepo, "stub assigned here", { posterId: owner.id });
+    const bobPublic = await seedIssue(publicRepo, "bob assigned here", { posterId: owner.id });
+    const bobPrivate = await seedIssue(privateRepo, "bob assigned privately", { posterId: owner.id });
+    await seedIssue(publicRepo, "no assignees", { posterId: owner.id });
+    const stubId = STUB_USER.id;
+    if (stubId === undefined) throw new Error("stub identity carries no id");
+    // The assignee edges (applyAssigneeCondition's numeric arm scans
+    // issue_assignees — issue_search.go:379-381): the stub doer on the
+    // public thread, bob on one public and one PRIVATE thread.
+    await db().insert(issueAssignees).values([
+      { issueId: stubAssigned.id, assigneeId: stubId },
+      { issueId: bobPublic.id, assigneeId: neighbor.id },
+      { issueId: bobPrivate.id, assigneeId: neighbor.id },
+    ]);
+
+    // assigned-to-me: the signed doer-flag (repo/issue.go:226-228, gated
+    // on IsSigned) rides the same condition as assigned_by.
+    const me = await router()("/repos/issues/search?assigned=true", { headers: { Authorization: `token ${TOKEN}` } });
+    expect(me.status).toBe(200);
+    expect(me.headers.get("X-Total-Count")).toBe("1");
+    expect((await me.json<{ title: string }[]>())[0]?.title).toBe("stub assigned here");
+
+    // Anonymous callers keep NO assignee filter (upstream ignores the flag
+    // when unsigned) — the full visible set answers.
+    const anonFlag = await router()("/repos/issues/search?assigned=true");
+    expect(anonFlag.headers.get("X-Total-Count")).toBe("3");
+
+    // assigned-by-other with visibility: the condition ANDs the visible-repo
+    // set, so the stub viewer sees only the PUBLIC assignment — the private
+    // thread's edge never leaks the repo.
+    const bobAsOthers = await router()("/repos/issues/search?assigned_by=BOB");
+    expect(bobAsOthers.status).toBe(200);
+    expect(bobAsOthers.headers.get("X-Total-Count")).toBe("1");
+    expect((await bobAsOthers.json<{ title: string }[]>())[0]?.title).toBe("bob assigned here");
+
+    // The two doer-flags COMPOSE (created ∧ assigned): the stub created
+    // nothing here, so the pair answers empty — a real AND, never one arm.
+    const disjoint = await router()("/repos/issues/search?created=true&assigned=true", {
+      headers: { Authorization: `token ${TOKEN}` },
+    });
+    expect(disjoint.headers.get("X-Total-Count")).toBe("0");
+
+    // The empty-set arm: a resolved user with no assignee edges.
+    const emptySet = await router()("/repos/issues/search?assigned_by=alice");
+    expect(emptySet.status).toBe(200);
+    expect(emptySet.headers.get("X-Total-Count")).toBe("0");
+  });
+
   it("400s unknown owners and owner-less team filters; 422s bad time formats", async () => {
     await seedUser("Alice");
 

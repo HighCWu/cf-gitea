@@ -27,6 +27,7 @@ import {
   comments,
   issueLabels,
   issues,
+  issueUsers,
   labels,
   milestones,
   pullRequests,
@@ -57,7 +58,8 @@ import {
   notifyPullRequestCreated,
   type MailNotifyEnv,
 } from "../services/mail/notify";
-import { updateIssueMentions } from "../services/mentions/carrier";
+import { newIssueUserSeedRows, updateIssueMentions } from "../services/mentions/carrier";
+import { getRepoAssignees } from "../services/mentions/repo-assignees";
 import { findIssueMentions } from "../services/mentions/service";
 
 export type IssueRow = typeof issues.$inferSelect;
@@ -414,6 +416,12 @@ export class IssuesService {
     if (labelIds.length > 0) {
       await this.validateLabels(labelIds, input.repoId, input.ownerOrgId ?? null);
     }
+    // The NewIssueUsers enumeration reads the pre-create assignee state —
+    // the same pre-tx read upstream's in-tx call performs (nothing in the
+    // create writes the collaborator/team tables), so resolving it here and
+    // riding the seat INSERTs through the batch keeps upstream's atomicity
+    // (models/issues/issue_update.go:437 — a seed failure fails the create).
+    const seedRows = await this.issueUserSeedRows(input);
 
     const indexSub = this.issueIndexSubquery(input.repoId);
     const statements: BatchStatements = [
@@ -473,7 +481,32 @@ export class IssuesService {
           .where(and(eq(labels.id, labelId), sql`(SELECT changes()) > 0`)),
       );
     }
+    for (const seat of seedRows) {
+      // NewIssueUsers (models/issues/issue_user.go:28-55): the assignee +
+      // poster seats, zero-value rows (`is_read`/`is_mentioned` default
+      // false). Upstream runs it after the labels inside the create tx; the
+      // issue id resolves in-transaction like the label links above (one
+      // statement per seat — a multi-row VALUES list cannot carry the
+      // in-transaction issue-id subquery).
+      statements.push(
+        this.db.insert(issueUsers).values({ userId: seat.userId, issueId: this.issueIdSubquery(input.repoId, indexSub) }),
+      );
+    }
     return { statements, resultIndex };
+  }
+
+  /**
+   * The seed seats for the issue being created (NewIssueUsers' enumeration,
+   * issue_user.go:28-55 via GetRepoAssignees): the repo's assignees plus the
+   * poster when unseated. An orphaned repo row (no owner pair) seeds nothing
+   * — upstream's opts.Repo is always loaded, so this is a cannot-here arm
+   * mirroring the notify helpers' silent-skip posture.
+   */
+  private async issueUserSeedRows(input: CreateIssueInput): Promise<Array<{ userId: number }>> {
+    const pair = await findRepositoryById(this.d1, input.repoId);
+    if (pair === null) return [];
+    const assignees = await getRepoAssignees(this.d1, { id: pair.repo.id, ownerId: pair.repo.ownerId });
+    return newIssueUserSeedRows(assignees, input.posterId);
   }
 
   private issueIndexSubquery(repoId: string): SQL {

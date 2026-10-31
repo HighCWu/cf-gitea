@@ -1936,13 +1936,18 @@ export function registerIssueRoutes(
       if (formBool(url.searchParams, "created")) {
         posterId = requester.id;
       }
-      // assigned/review_requested/reviewed: the corresponding surfaces do
-      // not exist yet (the assignee flag's route wiring is its own wave's
-      // item; no review store) — the filters match the empty set.
-      for (const flag of ["assigned", "review_requested", "reviewed"]) {
+      // review_requested/reviewed: no review store exists yet — the filters
+      // match the empty set. `assigned` is REAL now (issue.go:226-228):
+      // searchOpt.AssigneeID = the doer id — the applyAssigneeCondition
+      // numeric arm (issue_search.go:379-381) over the issue_assignees
+      // store, the same filter `assigned_by` threads.
+      for (const flag of ["review_requested", "reviewed"]) {
         if (formBool(url.searchParams, flag)) {
           posterId = -1;
         }
+      }
+      if (formBool(url.searchParams, "assigned")) {
+        assigneeId = requester.id;
       }
       // The `mentioned` doer-flag (issue.go:223-225, gated on IsSigned —
       // anonymous callers keep it unfiltered): the doer's

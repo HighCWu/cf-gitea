@@ -95,9 +95,10 @@
  * milestoneIdsByRepoEntries, userIdForFilter, listRepoIssues,
  * toApiIssue. mentioned_by rides the landed issue_user carrier (the
  * IssueListFilters.mentionedId filter — applyMentionedCondition,
- * issue_search.go:396-398); assigned_by has no landed rows yet (its route
- * wiring is the assignee wave's item), so an EXISTING user in assigned_by
- * conjoins to the empty set; project filters likewise: exactly [-1] is a
+ * issue_search.go:396-398); assigned_by rides the issue_assignees store
+ * the same way (applyAssigneeCondition's numeric arm, issue_search.go:
+ * 379-381 — the IssueListFilters.assigneeId filter, wired with the global
+ * search's `assigned` doer-flag); project filters: exactly [-1] is a
  * no-op (every thread is projectless) and any concrete id list matches
  * nothing.
  *
@@ -273,9 +274,11 @@ export async function loadIssuesSearchAux(
   // login → ctx.NotFound. mentioned_by rides the landed issue_user carrier
   // (issue_list.go:292-294's `mentionedByID > 0 → MentionID` — the API
   // seam's mentionedId filter, applyMentionedCondition downstream);
-  // assigned_by still matches the empty set (no assignee rows exist).
+  // assigned_by rides the issue_assignees store the same way
+  // (issue_list.go:289-291's `assignedByID > 0 → AssigneeID` — the
+  // assigneeId filter, applyAssigneeCondition downstream).
   let posterId: number | null | undefined;
-  let assigneeVoid = false;
+  let assigneeId: number | null | undefined;
   let mentionedId: number | null | undefined;
   for (const [name, role] of [
     [query.createdByName, "poster"],
@@ -286,7 +289,7 @@ export async function loadIssuesSearchAux(
     const id = await userIdForFilter(env.DB, name);
     if (id === null) return { kind: "notFound", login: name };
     if (role === "poster") posterId = id;
-    else if (role === "assignee") assigneeVoid = true; // no assignee rows exist → empty conjunct
+    else if (role === "assignee") assigneeId = id;
     else mentionedId = id;
   }
 
@@ -295,7 +298,7 @@ export async function loadIssuesSearchAux(
   // a concrete id list matches nothing.
   const projectVoid = query.projectIds.length > 0 && !(query.projectIds.length === 1 && query.projectIds[0] === -1);
 
-  if (projectVoid || assigneeVoid) return { kind: "feed", issues: [], total: 0 };
+  if (projectVoid) return { kind: "feed", issues: [], total: 0 };
 
   const filters: IssueListFilters = {
     isClosed: query.isClosed,
@@ -306,6 +309,7 @@ export async function loadIssuesSearchAux(
     since: query.since,
     before: query.before,
     posterId,
+    assigneeId,
     mentionedId,
     ...clampedPaging(url),
   };

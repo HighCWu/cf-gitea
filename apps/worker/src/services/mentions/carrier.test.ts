@@ -19,18 +19,18 @@
 import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { issueUsers, issues, pullRequests, repoCounters, repositories, users } from "../../db/schema";
+import { issueUsers, issues, pullRequests, repoCollaborators, repoCounters, repositories, teamMembers, teamRepoAccess, teams, users } from "../../db/schema";
 import { createTokenAuthMiddleware, type AuthResolver } from "../../api/auth";
 import { giteaErrorHandler } from "../../api/errors";
 import type { ApiEnv } from "../../api/env";
 import type { User } from "../../api/models/user";
 import { registerNotificationsRoutes } from "../../api/routes/notifications";
 import { IssuesService } from "../../issues/service";
-import { getIssueMentionIds, updateIssueMentions } from "./carrier";
+import { getIssueMentionIds, newIssueUserSeedRows, seedIssueUsers, updateIssueMentions } from "./carrier";
 
 const AUTHOR_ID = 10;
 const ALICE_ID = 20;
@@ -58,6 +58,10 @@ beforeEach(async () => {
     "pull_requests",
     "issues",
     "repo_counters",
+    "repo_collaborators",
+    "team_members",
+    "team_repo_access",
+    "teams",
     "repositories",
     "users",
   ]) {
@@ -154,6 +158,130 @@ describe("getIssueMentionIds — the GetIssueMentionIDs read (issue_user.go:89-9
     if (alice === undefined) throw new Error("fixture missing");
     await updateIssueMentions(env.DB, 507, [alice]);
     expect(await getIssueMentionIds(env.DB, 999)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The NewIssueUsers seed (issue_user.go:28-55) — the zero-value seats at
+// issue/PR create, enumerated through GetRepoAssignees (user_repo.go:117-152).
+// ---------------------------------------------------------------------------
+
+const carrierRows = async (issueId: number) =>
+  drizzle(env.DB).select().from(issueUsers).where(eq(issueUsers.issueId, issueId)).orderBy(asc(issueUsers.id)).all();
+
+describe("the NewIssueUsers seed — assignee + poster seats at create (issue_user.go:28-55)", () => {
+  it("issue create seats the repo owner and the poster with zero-value flags", async () => {
+    const service = new IssuesService(env.DB);
+    const issue = await service.createIssue({ repoId: REPO_ID, title: "seeded", posterId: AUTHOR_ID, now: T0 });
+    // No collaborators exist, so GetRepoAssignees' enumeration is the
+    // non-org owner seat (user_repo.go:151-153); the poster joins it
+    // (isPosterAssignee false).
+    const rows = await carrierRows(issue.id);
+    expect(rows.map((row) => row.userId).sort()).toEqual([AUTHOR_ID, OWNER_ID].sort());
+    for (const row of rows) {
+      expect(row.isRead).toBe(false); // the mark-read write stays staged
+      expect(row.isMentioned).toBe(false); // a seed row is never a mention
+    }
+  });
+
+  it("the poster seated among the assignees is not duplicated (isPosterAssignee, issue_user.go:36-53)", async () => {
+    await drizzle(env.DB).insert(repoCollaborators).values({ repoId: REPO_ID, userId: AUTHOR_ID, mode: "write" });
+    const service = new IssuesService(env.DB);
+    const issue = await service.createIssue({ repoId: REPO_ID, title: "seated", posterId: AUTHOR_ID, now: T0 });
+    const rows = await carrierRows(issue.id);
+    expect(rows.map((row) => row.userId).sort()).toEqual([AUTHOR_ID, OWNER_ID].sort()); // one AUTHOR row only
+  });
+
+  it("write-or-above collaborators all get seats; a collaborator with no seat stays out (user_repo.go:126-133)", async () => {
+    await drizzle(env.DB).insert(repoCollaborators).values([
+      { repoId: REPO_ID, userId: ALICE_ID, mode: "write" },
+      { repoId: REPO_ID, userId: BYSTANDER_ID, mode: "read" }, // below the write gate
+    ]);
+    const service = new IssuesService(env.DB);
+    const issue = await service.createIssue({ repoId: REPO_ID, title: "collab", posterId: AUTHOR_ID, now: T0 });
+    const rows = await carrierRows(issue.id);
+    expect(rows.map((row) => row.userId).sort()).toEqual([ALICE_ID, AUTHOR_ID, OWNER_ID].sort());
+  });
+
+  it("a non-active collaborator brings no seat (GetRepoAssignees' is_active arm, user_repo.go:146-149 — the tree's active collapse)", async () => {
+    await drizzle(env.DB).insert(users).values({ id: 40, username: "ghost", usernameLower: "ghost", status: "prohibited", createdAt: T0 });
+    await drizzle(env.DB).insert(repoCollaborators).values({ repoId: REPO_ID, userId: 40, mode: "write" });
+    const service = new IssuesService(env.DB);
+    const issue = await service.createIssue({ repoId: REPO_ID, title: "inactive", posterId: AUTHOR_ID, now: T0 });
+    const rows = await carrierRows(issue.id);
+    expect(rows.map((row) => row.userId).sort()).toEqual([AUTHOR_ID, OWNER_ID].sort()); // ghost filtered
+  });
+
+  it("the org-team arm seeds members of a team granted on the assignable units (team_repo.go:85-96)", async () => {
+    // An org-owned repo with a team joined to it, gated on the units.
+    await drizzle(env.DB).insert(users).values({ id: 50, username: "acme", usernameLower: "acme", type: "org", status: "active", createdAt: T0 });
+    const ORG_REPO = "9501";
+    await drizzle(env.DB).insert(repositories).values({
+      id: ORG_REPO,
+      storageKey: `r_${ORG_REPO}`,
+      ownerNamespace: "acme",
+      ownerId: 50,
+      slug: "orgrepo",
+      visibility: "public",
+      refsVersion: 1,
+      backend: "self-hosted",
+      createdAt: T0,
+    });
+    await drizzle(env.DB).insert(teams).values([
+      { id: 60, orgId: 50, lowerName: "devs", name: "devs", authorize: "none", unitsMap: JSON.stringify({ "repo.issues": "read" }) },
+      { id: 61, orgId: 50, lowerName: "ops", name: "ops", authorize: "none", unitsMap: JSON.stringify({ "repo.code": "read" }) }, // no issues/pulls unit
+    ]);
+    await drizzle(env.DB).insert(teamRepoAccess).values([
+      { orgId: 50, teamId: 60, repoId: ORG_REPO },
+      { orgId: 50, teamId: 61, repoId: ORG_REPO },
+    ]);
+    await drizzle(env.DB).insert(teamMembers).values([
+      { orgId: 50, teamId: 60, userId: ALICE_ID },
+      { orgId: 50, teamId: 61, userId: BYSTANDER_ID }, // gated out: the code unit is not assignable
+    ]);
+    const service = new IssuesService(env.DB);
+    const issue = await service.createIssue({ repoId: ORG_REPO, title: "org seed", posterId: AUTHOR_ID, now: T0 });
+    const rows = await carrierRows(issue.id);
+    // The team arm seats alice; the org owner is NOT a seat (the
+    // non-organization condition, user_repo.go:151); the poster joins.
+    expect(rows.map((row) => row.userId).sort()).toEqual([ALICE_ID, AUTHOR_ID].sort());
+  });
+
+  it("PR create seeds the same seats (models/issues/pull.go:477 → NewIssueWithIndex)", async () => {
+    const service = new IssuesService(env.DB);
+    const { issue } = await service.createPullRequest({
+      repoId: REPO_ID,
+      headRepoId: REPO_ID,
+      baseBranch: "main",
+      headBranch: "topic",
+      title: "seeded pull",
+      posterId: AUTHOR_ID,
+      now: T0,
+    });
+    const rows = await carrierRows(issue.id);
+    expect(rows.map((row) => row.userId).sort()).toEqual([AUTHOR_ID, OWNER_ID].sort());
+  });
+
+  it("the standalone write shape lands the same zero-value rows", async () => {
+    const alice = await userRow(ALICE_ID);
+    if (alice === undefined) throw new Error("fixture missing");
+    await seedIssueUsers(env.DB, 510, [alice], BYSTANDER_ID);
+    const rows = await carrierRows(510);
+    expect(rows.map((row) => row.userId).sort()).toEqual([ALICE_ID, BYSTANDER_ID].sort());
+    expect(rows.every((row) => !row.isRead && !row.isMentioned)).toBe(true);
+  });
+
+  it("the seat arithmetic: poster deduped among assignees, a null poster brings no seat", () => {
+    expect(newIssueUserSeedRows([{ id: 2 }, { id: 3 }], 2)).toEqual([{ userId: 2 }, { userId: 3 }]);
+    expect(newIssueUserSeedRows([{ id: 2 }], 9)).toEqual([{ userId: 2 }, { userId: 9 }]);
+    expect(newIssueUserSeedRows([{ id: 2 }], null)).toEqual([{ userId: 2 }]);
+    expect(newIssueUserSeedRows([], null)).toEqual([]);
+  });
+
+  it("the seed never feeds the mention reads — zero-value is_mentioned stays out of GetIssueMentionIDs", async () => {
+    const service = new IssuesService(env.DB);
+    const issue = await service.createIssue({ repoId: REPO_ID, title: "plain", posterId: AUTHOR_ID, now: T0 });
+    expect(await getIssueMentionIds(env.DB, issue.id)).toEqual([]); // the owner/poster seats are not mentions
   });
 });
 

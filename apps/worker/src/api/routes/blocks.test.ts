@@ -530,6 +530,37 @@ describe("user blocks", () => {
     expect(rows.find((row) => row.id === bob.id)).toMatchObject({ numStars: 0 }); // his edge on alice's repo removed
     expect(rows.find((row) => row.id === carol.id)).toMatchObject({ numStars: 1 }); // untouched by the cascade
   });
+
+  it("the star decrement is CORRELATED per repo across a multi-repo scope — third-party stars on unstarred repos survive (block.go:172-175 → star.go:59, the 2546bb5 watch correlation)", async () => {
+    // The scope-wide-count flaw the watch tail fixed (2546bb5): a flat
+    // owner-scope total subtracted from EVERY owner repo would dock the
+    // party's whole star total from repos the party never starred. Two
+    // alice repos, bob starred BOTH, carol starred only the first — the
+    // second repo's carol star must survive with its counter intact.
+    const { alice, bob, carol } = await seedWorld();
+    const starredRepo = await seedRepo(alice);
+    const unstarredByBob = await seedRepo(alice);
+    await db().insert(stars).values([
+      { userId: bob.id, repoId: starredRepo.repoId, createdAt: new Date() },
+      { userId: bob.id, repoId: unstarredByBob.repoId, createdAt: new Date() },
+      { userId: carol.id, repoId: starredRepo.repoId, createdAt: new Date() },
+      { userId: carol.id, repoId: unstarredByBob.repoId, createdAt: new Date() },
+    ]);
+    await db().update(repositories).set({ numStars: 2 }).where(inArray(repositories.id, [starredRepo.repoId, unstarredByBob.repoId]));
+
+    const res = await put("/api/v1/user/blocks/bob", alice.id);
+    expect(res.status).toBe(204);
+    const repoRows = await db().select().from(repositories).all();
+    // Each repo loses exactly ITS OWN bob edge (StarRepo(false) per repo,
+    // block.go:172-175): carol's stars survive on both. The retired
+    // scope-wide subquery (bob's total = 2 subtracted from every row)
+    // would have floored starredRepo to 0 — docking carol's live star —
+    // and unstarredByBob likewise.
+    expect(repoRows.find((row) => row.id === starredRepo.repoId)).toMatchObject({ numStars: 1 }); // carol's remains
+    expect(repoRows.find((row) => row.id === unstarredByBob.repoId)).toMatchObject({ numStars: 1 }); // carol's remains
+    // The per-USER tally still moves by the full removed edge count.
+    expect((await db().select().from(users).all()).find((row) => row.id === bob.id)).toMatchObject({ numStars: 0 });
+  });
 });
 
 // ---------------------------------------------------------------------------

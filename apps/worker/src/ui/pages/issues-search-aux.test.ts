@@ -9,8 +9,8 @@
  * Feed A asserts the web /issues/search grammar from the pin's handler
  * (issue_list.go:196-308): the state/type tri-states, the fixed
  * created-desc order, the milestone name-then-id resolution, the
- * username→404 filter arms, the assignee/project void postures, the
- * RFC3339 422 (before-first), the X-Total-Count header set and the
+ * username→404 filter arms, the assignee/mention/project filter postures,
+ * the RFC3339 422 (before-first), the X-Total-Count header set and the
  * full-Issue envelope. Feed B asserts GetSuggestion's two passes
  * (suggestion.go:16-73): the latest-5 arm, the title-only keyword pass,
  * the isPull-blind exact-index prepend, the zero-marshalled envelope and
@@ -26,7 +26,7 @@ import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
 import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
-import { issueUsers, pullRequests } from "../../db/schema";
+import { issueAssignees, issueUsers, pullRequests } from "../../db/schema";
 import {
   clampedPaging,
   issuesSearchResponse,
@@ -101,6 +101,11 @@ beforeEach(async () => {
     "issue_labels",
     "issue_subscriptions",
     "issue_user",
+    "issue_assignees",
+    "repo_collaborators",
+    "team_members",
+    "team_repo_access",
+    "teams",
     "milestones",
     "pull_requests",
     "comments",
@@ -294,21 +299,32 @@ describe("loadIssuesSearchAux — the web /issues/search grammar", () => {
     expect(unknown).toEqual({ kind: "notFound", login: "ghost" });
   });
 
-  it("mentioned_by rides the issue_user carrier rows; assigned_by still matches the empty set; unknown logins 404", async () => {
+  it("mentioned_by rides the issue_user carrier rows; assigned_by rides the issue_assignees store; unknown logins 404", async () => {
     const s = await seed();
     // The carrier row (UpdateIssueUsersByMentions' shape): origin mentioned
-    // on thread #1 (uid = the MENTIONED user).
+    // on thread #1 (uid = the MENTIONED user). The NewIssueUsers seed
+    // already seated origin there (owner + poster) — the mention rides the
+    // single-column upsert, the upstream re-mention arm (issue_user.go:77).
     const issueOne = s.indexes.get(1);
     if (issueOne === undefined) throw new Error("fixture thread #1 missing");
-    await drizzle(env.DB).insert(issueUsers).values({ userId: s.origin.id, issueId: issueOne.id, isMentioned: true });
+    await drizzle(env.DB)
+      .insert(issueUsers)
+      .values({ userId: s.origin.id, issueId: issueOne.id, isMentioned: true })
+      .onConflictDoUpdate({ target: [issueUsers.userId, issueUsers.issueId], set: { isMentioned: true } });
+    // The assignee edge (applyAssigneeCondition's numeric arm scans
+    // issue_assignees): origin assigned thread #1, other unassigned.
+    await drizzle(env.DB).insert(issueAssignees).values({ issueId: issueOne.id, assigneeId: s.origin.id });
 
     const mentioned = await search(`?mentioned_by=${s.origin.username}&state=all`);
     if (mentioned.kind !== "feed") throw new Error("mention arm");
     expect(mentioned.issues.map((issue) => issue.number)).toEqual([1]);
 
-    // assigned_by: no assignee rows exist — the empty conjunction stays.
+    // assigned_by: exactly the threads carrying the user's edge.
     const assigned = await search(`?assigned_by=${s.origin.username}&state=all`);
-    expect(assigned).toEqual({ kind: "feed", issues: [], total: 0 });
+    if (assigned.kind !== "feed") throw new Error("assignee arm");
+    expect(assigned.issues.map((issue) => issue.number)).toEqual([1]);
+    const unassigned = await search(`?assigned_by=${s.other.username}&state=all`);
+    expect(unassigned).toEqual({ kind: "feed", issues: [], total: 0 });
 
     const unknown = await search("?mentioned_by=ghost");
     expect(unknown).toEqual({ kind: "notFound", login: "ghost" });

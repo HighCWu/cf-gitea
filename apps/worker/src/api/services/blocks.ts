@@ -474,9 +474,14 @@ function cleanupBlockRelations(
       .innerJoin(repositories, eq(issues.repoId, repositories.id))
       .where(eq(repositories.ownerId, ownerId));
   /** One counter UPDATE for a (party, repo-owner) scope: subtracts the
-   *  edges the FOLLOWING delete in the batch removes. The subquery's
-   *  `repositories AS owned` alias keeps the inner scan distinct from the
-   *  UPDATE target. */
+   *  edges the FOLLOWING delete in the batch removes. CORRELATED per repo —
+   *  the count rides the UPDATE target's own `repositories.id` (the
+   *  dropWatchesFor correlation, the 2546bb5 fix): a scope-wide total
+   *  subtracted from every owner repo would dock third-party stars from
+   *  repos the party never starred (masked by single-repo fixtures).
+   *  Upstream decrements THROUGH StarRepo(false) per actually-starred repo
+   *  (block.go:172-175 → star.go:59), so each repo moves by exactly its own
+   *  removed edge count. */
   const dropStarsFor = (party: number, ownerId: number) =>
     db
       .update(repositories)
@@ -484,7 +489,7 @@ function cleanupBlockRelations(
         numStars: sql`MAX(num_stars - (
           SELECT COUNT(*) FROM stars
           WHERE user_id = ${party}
-            AND repo_id IN (SELECT owned.id FROM repositories AS owned WHERE owned.owner_id = ${ownerId})
+            AND repo_id = ${repositories.id}
         ), 0)`,
       })
       .where(inArray(repositories.id, reposOwnedBy(ownerId)));

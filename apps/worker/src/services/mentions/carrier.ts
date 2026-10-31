@@ -20,6 +20,16 @@
  * the issue/comment/PR create services, before the notify fires —
  * services/issue/comments.go:81, services/issue/issue.go:68,
  * services/pull/pull.go:184.
+ *
+ * The table's third write is the NewIssueUsers SEED (issue_user.go:28-55):
+ * at issue/PR create every repo assignee (GetRepoAssignees —
+ * services/mentions/repo-assignees.ts) and the poster (when not already
+ * among them) gets a zero-value row (`is_read`/`is_mentioned` default
+ * false). Upstream runs it INSIDE the create transaction (issue_update.go:
+ * 437) — the seed rides the create batch through newIssueUserSeedRows'
+ * seat arithmetic; the mark-read consumer of `is_read`
+ * (UpdateIssueUserByRead, issue_user.go:58-61) is UPDATE-only, so these
+ * seeded seats are what make a later read-tracking write land at all.
  */
 
 import { and, asc, eq } from "drizzle-orm";
@@ -64,4 +74,46 @@ export async function getIssueMentionIds(d1: D1Database, issueId: number): Promi
     .orderBy(asc(issueUsers.id))
     .all();
   return rows.map((row) => row.userId);
+}
+
+/**
+ * `NewIssueUsers`' seat arithmetic (issue_user.go:33-53): every assignee
+ * keeps a seat; "Poster can be anyone, append later if not one of
+ * assignees" (:35-36) — the poster joins only when no assignee already
+ * holds it (`isPosterAssignee`). A null poster (our nullable posterId;
+ * upstream's PosterID is NOT NULL) simply brings no seat. The rows carry
+ * the zero values — `is_read`/`is_mentioned` default false (issue_user.go:
+ * 38-47 sets only IssueID + UID) — the pure shape lets the issue-create
+ * service ride the rows through its creation batch (the upstream call is
+ * in-transaction, issue_update.go:437).
+ */
+export function newIssueUserSeedRows(
+  assignees: ReadonlyArray<Pick<UserRow, "id">>,
+  posterId: number | null | undefined,
+): Array<{ userId: number }> {
+  const ids = assignees.map((user) => user.id);
+  if (posterId !== null && posterId !== undefined && !ids.includes(posterId)) {
+    ids.push(posterId);
+  }
+  return ids.map((userId) => ({ userId }));
+}
+
+/**
+ * `NewIssueUsers` (issue_user.go:28-55) as a STANDALONE write — the
+ * enumerated assignees plus the poster seat in one bulk insert of
+ * zero-value rows. The issue-create service does NOT go through this
+ * (the seed rides its creation batch, see newIssueUserSeedRows); this
+ * shape exists for direct callers/tests that already hold an issue id.
+ */
+export async function seedIssueUsers(
+  d1: D1Database,
+  issueId: number,
+  assignees: ReadonlyArray<Pick<UserRow, "id">>,
+  posterId: number | null | undefined,
+): Promise<void> {
+  const rows = newIssueUserSeedRows(assignees, posterId);
+  if (rows.length === 0) return;
+  await drizzle(d1)
+    .insert(issueUsers)
+    .values(rows.map((row) => ({ ...row, issueId })));
 }
