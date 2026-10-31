@@ -72,19 +72,38 @@ upstream's shape impossible and multiple equally faithful adaptations exist
   - `PullRequestReviewRequest` (:129-136) — STAGED with the review family
     (the same route-handler write site); its mail half is the landed
     `notifyIssueAssigneeChanged` shape with a review-request `ct`;
-  - `MergePullRequest` (:138-146) + `AutoMergePullRequest` (:148-156) —
-    the merge write's emit site (`api/services/pull-engine.ts`) had a
-    sibling wave in flight at this slice; fold when the file settles;
+  - `MergePullRequest` (:138-146) — LANDED (§14): the winning-merge mail
+    over the shared funnel, emitted from `api/services/pull-engine.ts`'s
+    `mergePullRequest` D1 landing (upstream's `markAsMergedPostProcess`
+    shape);
+  - `AutoMergePullRequest` (:148-156) — STAGED, adjudicated UNREACHABLE:
+    its upstream emit position is `markAsMergedPostProcess`'s
+    `wasAutoMerged=true` branch (merge.go:404), and `wasAutoMerged` is
+    only derivable from a `GetScheduledMergeByPullID` row (merge.go:
+    825-831) — this backend NEVER schedules one (no scheduled-merge store
+    exists; POST …/merge refuses `merge_when_checks_succeed` with the
+    declared 409, api/routes/pulls.ts:1544-1547). The arm's ONLY
+    differences from the landed merge arm are the ActionAutoMergePullRequest
+    constant (the SAME "merge" template name, mail_issue_common.go:
+    235-236), the same `/merge/` Message-ID extra (:296-297) and
+    `ForceDoerNotification` (mail_issue.go:191 — the merger receives
+    their own merge mail, bypassing the :94-97 doer exclusion). When a
+    scheduled-merge store lands, the emit flips on `wasAutoMerged` and
+    `resolveIssueMailRecipients` gains the force-doer flag;
   - the `/assignees` trio's `AddAssignees`/`RemoveAssignees` notify arms
-    (upstream assignee.go:242/:281) — the same landed
-    `notifyIssueAssigneeChanged` receiver; their call sites live in
-    `api/routes/issue-tables-t2.ts` handlers that construct no service,
-    so the fold is that file owner's;
+    (upstream assignee.go:242/:281) — LANDED (§14.5): the trio's
+    issue-tables-t2 handlers fan the landed `notifyIssueAssigneeChanged`
+    receiver beside their webhook emitter, per actually-changed assignee,
+    with the toggle's type-9 comment read back by its own key set;
   - mentions — LANDED (SPEC §13): `services/mentions/` (the parser + the
     visibility resolution) with the `mentions` parameter threaded through
     the hub arms and the comment/issue/PR-create emit sites; the
-    `onmention` preference reaches its upstream source. The remaining
-    follow-up is the `issue_user.is_mentioned` carrier HANDOFF (§13.2);
+    `onmention` preference reaches its upstream source. The
+    `issue_user.is_mentioned` carrier LANDED too (§13.2 — migration 0057,
+    the emit-position persistence + the two read arms); what remains is
+    the issue-view mark-read write (`UpdateIssueUserByRead`) and the
+    issue-indexer/repo-search mention reads, both STAGED with the
+    surfaces they ride (§13.4);
   - `MailMentionsComment` (code-comment mentions, mail_comment.go:42-62) —
     the parser half is now landed; the arm itself still rides the review
     service extraction (the STAGED family above).
@@ -975,8 +994,9 @@ mail is NOT the participants funnel:
   through `onAssignee(user, removed, comment)` (upstream's `comment`
   argument, assignee.go:155/:161); `writeAssigneeComment` returns the
   inserted row. The /assignees trio's `addIssueAssignees`/
-  `removeIssueAssignees` callers are untouched (their notify arms are
-  §1.3's staged fold).
+  `removeIssueAssignees` callers were untouched at this slice — their
+  notify arms LANDED with slice seven (§14.5), reading the toggle's
+  type-9 comment back by its own key set (the cores stay untouched).
 
 ### 12.3 The emit site + the folds
 
@@ -1055,12 +1075,51 @@ runs the regexp):
   mail arm's CheckRepoUnitUser fold re-gates every survivor downstream) and
   upstream's `IsUserBlockedBy` filter (issue_update.go:559-565 — no block
   table).
-- NO database write: upstream's `FindAndUpdateIssueMentions` persists
-  `issue_user.is_mentioned` (issue_update.go:567 → issue_user.go:64-86);
-  the `issue_user` table has no landed carrier and `issue_subscriptions`
-  here IS upstream's `issue_watch` — a mention never touches it at the pin.
-  HANDOFF for the next schema wave: an `issue_mentions (issue_id, user_id)`
-  carrier + the resolver's insert arm; the mail path needs no carrier.
+- The carrier LANDED (the §13.2 HANDOFF of the first mentions wave,
+  closed 2026-10-31): `issue_user` (migration 0057) ports upstream's
+  table EXACTLY — `ID pk autoincr, UID INDEX unique(uid_to_issue), IssueID
+  INDEX unique(uid_to_issue), IsRead, IsMentioned` (models/issues/
+  issue_user.go:15-21); `UID` maps to `user_id` per the tree convention.
+  The write is `services/mentions/carrier.ts` — `updateIssueMentions`
+  (`UpdateIssueMentions` issue_update.go:515-527 + `UpdateIssueUsersByMentions`
+  issue_user.go:64-86: the single-column `is_mentioned` upsert over the
+  `(user_id, issue_id)` arbiter, is_read untouched — the pin has NO
+  un-mention anywhere, so an edit dropping a `@name` leaves the flag
+  sticky) and `getIssueMentionIds` (`GetIssueMentionIDs`
+  issue_user.go:89-96). Threading: `issues/service.ts`'s
+  `resolveMailMentions` is now the FULL `FindAndUpdateIssueMentions`
+  (resolve then persist), and the three emit positions run it BEFORE the
+  mail-env gate — upstream has no mail-env notion, and the carrier feeds
+  reads that work without a mailer (the gate's original "no write to gate
+  it" justification dissolved with this landing). The NewIssueUsers seed
+  (issue_user.go:28-55 — repo-assignee + poster rows at issue create,
+  is_read tracking) stays STAGED (§13.4): the mission scope was the
+  mention carrier, and the seed's assignee enumeration rides surfaces
+  that are not landed whole.
+- The two reads our tree carries are wired:
+  - the derived mailbox's mention arm (routes/notifications.ts
+    `recipientExpr`): `exists (issue_user … uid, is_mentioned=1)` —
+    upstream mails the resolved mentions as their OWN batch, first of the
+    recipient sources (mail_issue.go:99-105), and the mailbox answers the
+    same question at read time;
+  - the subscription fallback's final arm (api/services/issue-extras.ts
+    `checkIssueSubscription`): upstream's CheckIssueWatch participants
+    fallback (issue_watch.go:88 → IsUserParticipantsOfIssue,
+    issue.go:631-636 → GetParticipantIDsByIssue, issue.go:647-668 — poster
+    unconditionally + DISTINCT posters of comment types 0/21/22 over
+    active non-prohibited users). NOTE the pin consults NO mention arm
+    here — `is_mentioned` never subscribes anyone through CheckIssueWatch
+    at fc493688; the carrier's rows were not wired into this read and
+    must not be (upstream behavior IS the default decision).
+- The issue_user READS at the pin our tree does NOT carry — STAGED with
+  their surfaces (§13.4): `UpdateIssueUserByRead` (issue_user.go:58-61 via
+  SetIssueReadBy, notification.go:338 — the issue-view mark-read), the
+  issue indexer's `GetIssueMentionIDs` (modules/indexer/issues/util.go:53
+  — no indexer), the search filter joins (issue_search.go:396-398 powering
+  `/repos/issues/search`'s `mentioned`/`mentioned_by` and
+  repo_list.go:259-267's UserMentionedRepoCond — the routes exist and
+  still stub the filters as the empty set; wiring them is the search
+  surface owner's precise hunk now that the store exists).
 - `services/mentions/service.ts` — the `findIssueMentions` entry
   (parse → resolve), the FindAndUpdateIssueMentions shape minus the two
   schema-absent arms.
@@ -1076,13 +1135,17 @@ runs the regexp):
   the status/title arms take none (upstream passes nil — services/issue/
   status.go:43/:56, issue.go:127).
 - The emit sites (`issues/service.ts`): `resolveMailMentions` runs parse +
-  resolve inside the notify helpers (upstream runs FindAndUpdateIssueMentions
-  in the same services before the notify — comments.go:81, issue.go:68,
-  pull.go:184), best-effort, only when the mail env is armed (no write to
-  gate it). Comment EDIT does not re-mention (upstream UpdateComment
+  resolve + the carrier persist inside the notify helpers (upstream runs
+  FindAndUpdateIssueMentions in the same services before the notify —
+  comments.go:81, issue.go:68, pull.go:184), best-effort. The first wave
+  gated this on the mail env ("no write to gate it"); the carrier landing
+  removed the gate — the resolve+persist now runs UNCONDITIONALLY at the
+  three emit positions (upstream has no mail-env notion, and the carrier
+  feeds reads that work with no mailer), only the notify half stays
+  mail-gated. Comment EDIT does not re-mention (upstream UpdateComment
   re-runs neither).
 
-### 13.3 Tests (parser.test.ts 53, resolve.test.ts 19, notify.test.ts +6)
+### 13.3 Tests (parser.test.ts 53, resolve.test.ts 19, carrier.test.ts 16, notify.test.ts +6, issue-extras-subscription.test.ts +7)
 
 - Parser: the pin's 37 pattern rows + the span fixture 1:1; the strip arms
   are cite-marked derived (fence/indented/code-span/link/linkify/email/
@@ -1093,6 +1156,209 @@ runs the regexp):
   the mentioned-unwatcher exception, the mentioned-doer exclusion, and two
   end-to-end arms through `addComment` (the onmention row lands first; a
   code-span mention does not resolve).
+- The carrier (carrier.test.ts 16): the upsert round trip (is_mentioned=1,
+  is_read=0), the empty fast-path, single-row dedupe (same-call repeat +
+  cross-call re-mention), the is_read-preserving re-mention
+  (issue_user.go:77), the GetIssueMentionIDs filter (a non-mention carrier
+  row excluded), the three ungated emit positions over `new IssuesService`
+  with NO mail env (issue/comment/PR create + the no-mention zero + the
+  sticky flag), and the mailbox mention arm end-to-end through
+  `registerNotificationsRoutes` (the mentioned user's thread appears; the
+  bystander's stays empty; deleting the carrier rows empties it).
+- The subscription fallback (issue-extras-subscription.test.ts +7): the
+  poster seat with zero comments, the poster skipping the active filter
+  (the append sits outside the query), the 0/21/22 comment-type set, the
+  system-comment exclusion, the prohibited-commenter exclusion, and the
+  fallback answering true over a Dont repo watch.
+
+### 13.4 Staged after the carrier (the §13.2 residue)
+
+- `NewIssueUsers` seed (issue_user.go:28-55 + GetRepoAssignees,
+  models/repo/user_repo.go:117-150): the is_read-tracking rows (repo
+  assignees via access mode>=write + the org-team arm + poster/owner
+  seats) at issue create. Rides the read-tracking surface — worthless
+  until the mark-read write below lands.
+- `UpdateIssueUserByRead` (issue_user.go:58-61 via SetIssueReadBy,
+  models/activities/notification.go:338; callers routers/web/repo/
+  issue_view.go:389, routers/web/repo/pull.go:153, routers/api/v1/repo/
+  pull.go:911): the issue-view mark-read write. Collides by design with
+  the derived mailbox's notification_states arithmetic — needs its own
+  decision note when the web issue-view port reaches it.
+- The mention reads over search: the issue indexer's GetIssueMentionIDs
+  (modules/indexer/issues/util.go:53 — no indexer in this tree),
+  `IssueSearch`'s MentionID join (issue_search.go:396-398 — the
+  `mentioned`/`mentioned_by` filters of `/repos/issues/search` and the
+  repo-scoped list, currently stubbed to the empty set in
+  api/routes/issues.ts), and UserMentionedRepoCond (repo_list.go:259-267).
+  The store exists now; the wiring belongs to the search surface's owner.
+
+---
+
+## 14. SLICE SEVEN AS-BUILT — the MergePullRequest arm (the winning-merge mail) + the /assignees trio folds
+
+### 14.1 The pin's chain map (verified at fc493688)
+
+- Upstream emit position: `markAsMergedPostProcess`
+  (services/pull/merge.go:385-412) — runs AFTER the merge tx, with the PR
+  RELOADED (`GetPullRequestByID` :388) and the issue closed. The winner
+  gate is the tx's CAS: `cnt != 1 → ErrIssueAlreadyChanged` (:848-852) —
+  a LOSER never notifies. The branch (:404-406):
+  `wasAutoMerged ? AutoMergePullRequest : MergePullRequest`, and
+  `wasAutoMerged` (:825-831) is ONLY true when a scheduled auto-merge row
+  existed and its `MergedCommitID` matched — the adjudication that stages
+  our `AutoMergePullRequest` (§1.3).
+- The receiver (`MergePullRequest`, mailer/notify.go:138-146):
+  `LoadIssue` then `MailParticipants(ctx, pr.Issue, doer,
+  ActionMergePullRequest, nil)` — mentions nil, doer = the merger.
+- MailParticipants (mail_issue.go:173-202): ActionMergePullRequest IS in
+  the :180-185 empty-content list (:184) — the content is EMPTIED; `Comment`
+  stays nil; `forceDoerNotification` is false for the plain merge arm.
+- Template resolution: actionToTemplate (mail_issue_common.go:235-236)
+  names it "merge" — ActionAutoMergePullRequest shares the name — and the
+  fallback chain (`mail/repo/pull/merge` → `mail/repo/issue/merge` →
+  `mail/repo/pull/default` → `mail/repo/issue/default`) lands on
+  issue/default.tmpl: only `assigned` + `default` exist under
+  `templates/mail/repo/issue/`, and no `mail/repo/pull/` at all.
+- The render: default.tmpl's merge branch interpolates
+  `mail.issue.action.merge` (locale_en-US.json:476) =
+  `<b>%[1]s</b> merged #%[2]d into %[3]s.` — %[1]s
+  `.Doer.DisplayNameWithFullName`, %[2]s `.Issue.Index`, %[3]s
+  `.Issue.PullRequest.BaseBranch`. The content is emptied, so the merge
+  line IS the body (the close/reopen byte shape; the "new"-only second
+  line never fires for a non-"new" name).
+- Message-ID: generateMessageIDForIssue's switch has the dedicated case
+  (mail_issue_common.go:296-297) — `/merge/<unixMilli>`, shared by
+  ActionMergePullRequest AND ActionAutoMergePullRequest; In-Reply-To/
+  References stay the plain thread id (ActionType(0), :165).
+- Subject: "Re: " + fallback (the :88-91 rule — any non-"new" name); the
+  batch info stays "issue comments".
+- Recipients: the full participants resolution, `pullCreate` NOT set — the
+  WIP gate (:67-76) drops the repo watchers for a WIP-titled pull (our
+  merge route refuses WIP anyway, pulls.ts:1548-1550 — the same
+  unreachable-but-faithful posture as the flag itself).
+
+### 14.2 The arm as-built (services/mail/notify.ts + templates.ts)
+
+- `notifyMergePullRequest(env, {issue, doer, baseBranch})` — a thin
+  wrapper over the shared `notifyIssueArm` compose: `actionName: "merge"`,
+  `content: ""` (MailParticipants :184), doer = the merger, dedupe prefix
+  `pull-merge`, and the new `baseBranch` input feeding the merge line's
+  %[3]s (the arm's ONE piece of PR-row state the issue row doesn't
+  carry). `MailNotifyEvent` gains `"MergePullRequest"`.
+- `notifyIssueArm` gains the merge branch: the always-rendered action line
+  via the new `issueActionMergeLine(doerDisplay, index, baseBranch)`
+  (templates.ts — the locale string verbatim; the branch name is a
+  plain-string locale arg so it escapes like the display name, the
+  TrHTML precedent), the `/merge` Message-ID extra
+  (`issueActionMessageId`'s action union widens with `"merge"`), and the
+  log name "merge mail". The dedupe key
+  `pull-merge:<issueId>:merge:<unixMilli>:<recipientId>` rides the long
+  (ms-bearing) family — the issue-status discipline.
+- No render change: `renderIssueActionMail`'s "action line + empty body"
+  shape IS the merge render (the doc comment's shape table gains "merge"
+  in the emptied-content list).
+
+### 14.3 The emit site (api/services/pull-engine.ts)
+
+- `mergePullRequest`'s D1 landing mirrors upstream's two halves exactly:
+  the issue close runs through a BARE `IssuesService(c.env.DB)` (no mail
+  env) — upstream's merge close is the MODEL-level `SetIssueAsClosed`
+  (merge.go:838), from which NO mail fires; the merge's ONLY mail is
+  `MergePullRequest`, never `IssueChangeStatus`'s close — and the PR-row
+  update gains `.returning()` so the landing WINNER is observable.
+- After a winning landing (the returned rows non-empty — the
+  `has_merged=0` CAS, merge.go:848-852's `cnt != 1` analogue),
+  `notifyMailMergePullRequest` (the module's best-effort wrapper, the
+  landed service-level arms' posture: load the merger row, fire
+  `notifyMergePullRequest`, log — never throw, the merge stays committed)
+  hands over the POST-close issue row (upstream fires with the reloaded
+  closed issue), `pr.baseBranch`, and the flow clock `opts.now`.
+- The merge route caller (pulls.ts:1601) passes the request Context —
+  the emit reads `c.env`; the shipped `MAIL_ENABLED=false` posture keeps
+  the arm OFF everywhere (pinned by the tripwire test).
+
+### 14.4 Tests (+6 over the 174 baseline — notify.test.ts 71, templates.test.ts 26)
+
+- The receiver byte pins: the Re: subject, the `/merge/<ms>` Message-ID
+  over the plain thread reference, the merge line with the base branch,
+  the emptied content (the issue description never renders), "issue
+  comments" info, the `pull-merge` dedupe keys, the reason header "pull".
+- The merge line's escaping (a `rel<"1">&x` branch renders escaped — the
+  TrHTML plain-string-arg rule) and the templates.test.ts verbatim pin
+  (+ its escaped twin).
+- The WIP-titled pull's merge drops the repo watchers (`pullCreate` NOT
+  set) while the poster still receives.
+- The real-flow emit (engine-backed, `manually-merged` over a seeded
+  cell): an armed merge lands exactly the winner's rows — and NO
+  `issue-status:*` row for the closed issue (the bare-close
+  anti-double-fire pin); the shipped mail-off posture merges with ZERO
+  outbox rows. Each emit test seeds its OWN repo/cell name (the DO
+  namespace survives across tests in a file — a shared name collides on
+  `refs/heads/main`).
+
+### 14.5 The /assignees trio's folds as-built (api/routes/issue-tables-t2.ts)
+
+- The HANDOFF taken: the POST (issueAddAssignees) and DELETE
+  (issueRemoveAssignees) handlers now fan the landed
+  `notifyIssueAssigneeChanged` receiver beside their webhook emitter —
+  per ACTUALLY-changed assignee (the write cores' return lists), in the
+  same post-write notify position upstream's AddAssignees
+  (assignee.go:242) / RemoveAssignees (:281) hold. Upstream dispatches
+  the removal event too and the MAIL receiver self-gates it off
+  (notify.go:121's `!removed`) — mirrored: the DELETE handler calls and
+  the receiver answers `no-recipients`.
+- The write cores (`addIssueAssignees`/`removeIssueAssignees`,
+  api/services/issues.ts) return only the changed users — the trio
+  shape's deliberate deviation from `ToggleIssueAssignee`'s
+  `(removed, comment)` pair — so the mail arm's `comment` argument is
+  read back by the type-9 row's own key set: `(issue, type 9, assignee,
+  removed flag, poster = doer)`, latest id — the just-inserted row under
+  any same-key replay. A null read-back skips the arm (the anchor and
+  the `/comment/<id>` Message-ID need the row; composing without it would
+  not be upstream's compose, mail_issue.go:214-222 builds the message
+  FROM the comment). The cores themselves are UNTOUCHED (the PATCH arm's
+  `changeAssignees` seam stays the service-level path).
+- Best-effort, never throws (the write stays committed); per-assignee
+  try/catch with the landed log shape. The armed mount is exercised
+  through the route tests (the env-merge shape of
+  register-notify.test.ts): POST lands one `issue-assigned` row per
+  added assignee (the type-9 anchor/Message-ID, "issue assigned" info,
+  the comment dedupe), a no-op re-add lands nothing new, the unarmed
+  shipped posture is the fold's fail-closed control, and the DELETE's
+  zero rows pin the receiver's removal self-gate.
+
+### 14.6 The review-family extraction sketch (the STAGED family's precise shape)
+
+The staged receivers (`PullRequestReview` notify.go:98-111,
+`PullRequestCodeComment` :113-117, `PullRequestReviewRequest` :129-136)
+all fire — upstream — from `services/pull/review.go` AFTER the review
+writes commit. Our tree has no such service layer: the review writes live
+inline in `api/routes/pull-reviews.ts` (1977 lines), whose D1 writes
+(~48 drizzle call sites) are route-handler writes — against the method.
+The extraction that un-blocks the family:
+
+- Extract `submitReview` (pull-reviews.ts:852-1032 — the review-submission
+  core: the review row upsert, the pending-review folding, the official-
+  reviewer gate inputs, the review-comment rows) into an
+  `api/services/pull-reviews.ts` service whose handlers take the notify
+  env alongside the write inputs, exactly the `IssuesService(d1, mailEnv)`
+  precedent (§8.3).
+- With it, the two request-writer cores `addReviewRequest` (:1033-) /
+  `removeReviewRequest` (:1098-) move the same way — the
+  `PullRequestReviewRequest` arm's emit site (its mail half is
+  `notifyIssueAssigneeChanged`'s shape with the review-request `ct`,
+  notify.go:131-136 — `SendIssueAssignedMail` over `{ActionType: 0,
+  Content: "Requested to review <htmlurl>.", Comment: <the request
+  comment>}` to the reviewer).
+- `PullRequestReview` (:98-111) composes over the review's type-22/23/24/25
+  comment thread (the APPROVED/REJECT/default→"approve"|"reject"|"review"
+  template names via actionToTemplate's commentType switch) — the compose
+  is the comment arm's shape with the REVIEW comment, so the extraction
+  feeds the existing hub core unchanged.
+- `PullRequestCodeComment` (:113-117) additionally needs the mention
+  resolution over the code-comment body (`MailMentionsComment`,
+  mail_comment.go:42-62) — the parser half is landed (§13); the arm rides
+  the same extraction.
 
 ---
 
@@ -1229,6 +1495,21 @@ Slice five adds (same files, same posture):
     plain rename silent) and armed `changeAssignees` (each add lands,
     the webhook emitter rides the same receiver, removals and no-ops
     mail nothing).
+
+Slice seven adds (same files, same posture; §14):
+
+14. **The merge arm** (`templates.test.ts` + `notify.test.ts`):
+    `issueActionMergeLine` verbatim + the escaped branch twin; the
+    receiver's byte pins — the `/merge/<ms>` Message-ID over the plain
+    reference, the merge line with the base branch, the emptied content,
+    the `pull-merge` dedupe, the WIP watcher drop; the REAL-flow emit —
+    an armed `mergePullRequest` lands exactly the winner's rows with NO
+    `issue-status` twin (the bare close never mails), the shipped mail-off
+    posture merges with ZERO rows; and the trio folds (`issue-tables-t2.test.ts`)
+    — POST lands one `issue-assigned` row per added assignee with the
+    type-9 anchor/Message-ID/dedupe, the no-op re-add and the unarmed
+    posture land nothing, the DELETE's zero rows pin the receiver's
+    removal self-gate.
 
 Gate: the new suites green own-eyes (`pnpm test <files>`); bare
 `tsc --noEmit` zero errors; scoped eslint clean; `pnpm db:generate`

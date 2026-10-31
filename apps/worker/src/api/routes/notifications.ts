@@ -427,6 +427,14 @@ function lastAnyActivityExpr(): SQL {
  * source, including mentions", services/mailer/mail_issue.go:88-93), so a
  * persisted Dont watch (the Auto-unwatch landing, watch.go:164-165) does
  * not qualify a notification recipient on its own.
+ *
+ * The mention arm reads the issue_user carrier (migration 0057): upstream's
+ * mail fan-out mails the resolved mentions as their OWN batch, first of all
+ * recipient sources ("========== Mentions ==========", services/mailer/
+ * mail_issue.go:99-105 — fed by FindAndUpdateIssueMentions' resolved users,
+ * which our carrier persists at the same emit positions), and the derived
+ * mailbox answers the same question at read time: is there an
+ * `is_mentioned` row for this (user, issue).
  */
 function recipientExpr(userId: number): SQL {
   return sql`(
@@ -435,6 +443,10 @@ function recipientExpr(userId: number): SQL {
     or ${issues.posterId} = ${userId}
     or ${issueSubscriptions.userId} is not null
     or exists (select 1 from comments pc where pc.issue_id = ${issues.id} and pc.poster_id = ${userId})
+    or exists (
+      select 1 from issue_user mu
+      where mu.issue_id = ${issues.id} and mu.user_id = ${userId} and mu.is_mentioned = 1
+    )
   )`;
 }
 

@@ -138,7 +138,7 @@ export function findRepoComment(d1: D1Database, repoId: string, commentId: numbe
 // Issue subscriptions (models/issues/issue_watch.go)
 // ---------------------------------------------------------------------------
 
-/** GetIssueWatch + the repo-watch fallback of CheckIssueWatch
+/** GetIssueWatch + the repo-watch + participants fallbacks of CheckIssueWatch
  *  (models/issues/issue_watch.go:73-89): an explicit `issue_watch` row wins
  *  verbatim; the absence falls to the repo-watch read — `GetWatch`
  *  (models/repo/watch.go:57-69, the dummy mirror: an absent row IS mode
@@ -147,13 +147,20 @@ export function findRepoComment(d1: D1Database, repoId: string, commentId: numbe
  *  issue's unit picks (`util.Iif(issue.IsPull, w.IncludePullRequests,
  *  w.IncludeIssues)`, issue_watch.go:85). A persisted Dont row (the
  *  ignore/mute state) therefore does NOT subscribe, and a Custom row
- *  subscribes only to its picked event types. Upstream's final
- *  participants fallback (issue_watch.go:88) is not modeled here — no
- *  participant store at this tier (the module-level divergence class). */
+ *  subscribes only to its picked event types. The final arm is upstream's
+ *  participants fallback (issue_watch.go:88 → IsUserParticipantsOfIssue,
+ *  models/issues/issue.go:631-636 → GetParticipantIDsByIssue, issue.go:647-
+ *  668): the issue poster plus the DISTINCT posters of the issue's comment
+ *  types 0/21/22 (Comment/Code/Review) over active, non-login-prohibited
+ *  users — the poster is appended WITHOUT the active filter (the poster
+ *  always counts, issue.go:664-666). NOTE the pin reads NO mention arm
+ *  here: `is_mentioned` (the issue_user carrier) is never consulted by
+ *  CheckIssueWatch at fc493688 — a mentioned user does not subscribe to
+ *  the thread through this read. */
 export async function checkIssueSubscription(
   d1: D1Database,
   userId: number,
-  issue: Pick<IssueRow, "id" | "repoId" | "isPull">,
+  issue: Pick<IssueRow, "id" | "repoId" | "isPull" | "posterId">,
 ): Promise<boolean> {
   const row = await drizzle(d1)
     .select({ isWatching: issueSubscriptions.isWatching })
@@ -165,7 +172,30 @@ export async function checkIssueSubscription(
     return row.isWatching;
   }
   const watch = await getWatch(d1, issue.repoId, userId);
-  return isWatchModeWatching(watch.mode) && (issue.isPull === true ? watch.watchPullRequests : watch.watchIssues);
+  if (isWatchModeWatching(watch.mode) && (issue.isPull === true ? watch.watchPullRequests : watch.watchIssues)) {
+    return true;
+  }
+  // The participants fallback: poster seat first (the unconditional append),
+  // then the commented-participant probe (the INNER JOIN's active filter
+  // collapses upstream's `is_active AND NOT prohibit_login` per the schema's
+  // single `status` enum).
+  if (issue.posterId !== null && issue.posterId === userId) {
+    return true;
+  }
+  const participant = await drizzle(d1)
+    .select({ posterId: comments.posterId })
+    .from(comments)
+    .innerJoin(users, eq(users.id, comments.posterId))
+    .where(
+      and(
+        eq(comments.issueId, issue.id),
+        inArray(comments.type, [CommentType.Comment, CommentType.Code, CommentType.Review]),
+        eq(users.status, "active"),
+      ),
+    )
+    .limit(1)
+    .get();
+  return participant !== undefined;
 }
 
 /** The explicit issue subscribers (is_watching rows) rendered as users,

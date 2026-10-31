@@ -968,6 +968,53 @@ export const issueSubscriptions = sqliteTable(
 );
 
 /**
+ * The issue-user relation (upstream `issue_user`, models/issues/
+ * issue_user.go:15-21 at pin fc493688 — `ID pk autoincr, UID INDEX
+ * unique(uid_to_issue), IssueID INDEX unique(uid_to_issue), IsRead,
+ * IsMentioned`): the per-(user, issue) carrier row. Upstream writes it two
+ * ways — the mention arm flips `is_mentioned` ONLY, never touching
+ * `is_read` (UpdateIssueUsersByMentions, issue_user.go:64-86, the Get→
+ * update-cols("is_mentioned")/insert upsert; the pin has NO un-mention —
+ * grep over models/|services/|routers/ finds zero `is_mentioned=false`
+ * writes, so a later edit dropping a `@name` leaves the flag sticky), and
+ * the read arm sets `is_read` on issue view (UpdateIssueUserByRead,
+ * issue_user.go:58-61, via SetIssueReadBy, models/activities/
+ * notification.go:338) — that write is STAGED here (our tree derives
+ * read-state from notification_states; the column lands with the
+ * exact-column port, the read arm is a follow-up). `UID` maps to
+ * `user_id` per the tree convention (cf. issue_watch → issue_subscriptions);
+ * a mention NEVER touches `issue_subscriptions` (upstream's issue_watch) —
+ * separate stores at the pin.
+ */
+export const issueUsers = sqliteTable(
+  "issue_user",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Upstream `UID` (user.id). */
+    userId: integer("user_id").notNull(),
+    issueId: integer("issue_id").notNull(),
+    /** Upstream `IsRead` — written only by the (staged) mark-read arm. */
+    isRead: integer("is_read", { mode: "boolean" }).notNull().default(false),
+    /** Upstream `IsMentioned` — the carrier this table exists for. */
+    isMentioned: integer("is_mentioned", { mode: "boolean" }).notNull().default(false),
+  },
+  (t) => [
+    // Upstream's `unique(uid_to_issue)` composite (issue_user.go:17-18) —
+    // the same arbitration point the landed join tables use (the upsert's
+    // ON CONFLICT target).
+    uniqueIndex("issue_user_uid_issue_uq").on(t.userId, t.issueId),
+    // Upstream's scalar `INDEX` on IssueID (issue_user.go:18) — the
+    // mentioned-set reads filter by issue_id alone (GetIssueMentionIDs,
+    // issue_user.go:89-96; issue_search.go:396-398; the notifications
+    // recipient arm). Upstream's scalar INDEX on UID has no single-uid
+    // query at this tier — the composite's uid lead serves the only
+    // (uid, issue) probe — so it is not carried (the index-audit drop
+    // discipline, migration 0037's precedent).
+    index("issue_user_issue_idx").on(t.issueId),
+  ],
+);
+
+/**
  * Commit statuses (SPEC-0005 §3.2). Sort orders and the combined-status
  * worst-of aggregation follow SPEC-0004 §2.4; this table only stores rows.
  */

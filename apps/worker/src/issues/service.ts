@@ -57,6 +57,7 @@ import {
   notifyPullRequestCreated,
   type MailNotifyEnv,
 } from "../services/mail/notify";
+import { updateIssueMentions } from "../services/mentions/carrier";
 import { findIssueMentions } from "../services/mentions/service";
 
 export type IssueRow = typeof issues.$inferSelect;
@@ -746,28 +747,37 @@ export class IssuesService {
     return rows[0];
   }
 
-  /** The mentions half of FindAndUpdateIssueMentions (upstream runs the
-   *  whole function in the issue service BEFORE the notify fires —
-   *  services/issue/comments.go:81, issue.go:68, pull.go:184 — and hands
-   *  the resolved users to the receiver). Our shape: parse + visibility
-   *  resolution only (services/mentions — the issue_user persistence arm
-   *  is the recorded HANDOFF), best-effort: a resolution failure degrades
-   *  the mail fan-out, never the write. */
+  /** The FULL FindAndUpdateIssueMentions (upstream runs the whole function
+   *  in the issue service BEFORE the notify fires — services/issue/
+   *  comments.go:81, issue.go:68, pull.go:184 — and hands the resolved
+   *  users to the receiver): parse + visibility resolution
+   *  (services/mentions) then the issue_user carrier upsert
+   *  (updateIssueMentions — upstream's persistence arm, issue_update.go:567
+   *  → issue_user.go:64-86). Best-effort: a resolution or carrier failure
+   *  degrades the notify fan-out, never the write. */
   private async resolveMailMentions(issue: IssueRow, doer: UserRow, content: string): Promise<UserRow[]> {
     const pair = await findRepositoryById(this.d1, issue.repoId);
     if (pair === null) return [];
-    return findIssueMentions(this.d1, { repo: pair.repo, issue, doer, content });
+    const mentions = await findIssueMentions(this.d1, { repo: pair.repo, issue, doer, content });
+    if (mentions.length > 0) {
+      await updateIssueMentions(this.d1, issue.id, mentions);
+    }
+    return mentions;
   }
 
   /** The CreateIssueComment receiver arm — best-effort, never throws (the
-   *  errors log; the write above stays committed). */
+   *  errors log; the write above stays committed). The mentions arm runs
+   *  UNCONDITIONALLY (upstream's CreateIssueComment runs
+   *  FindAndUpdateIssueMentions with no mail-env notion, services/issue/
+   *  comments.go:81): the carrier rows feed the notifications mailbox's
+   *  mention arm and the mentioned filters with no mailer configured.
+   *  Only the notify half stays mail-gated. */
   private async notifyCommentCreated(
     issue: IssueRow,
     comment: CommentRow,
     input: AddCommentInput,
     now: Date,
   ): Promise<void> {
-    if (this.mailEnv === undefined) return;
     if ((input.type ?? CommentType.Comment) !== CommentType.Comment) return;
     if (input.posterId === null || input.posterId === undefined) return;
     try {
@@ -777,6 +787,7 @@ export class IssuesService {
         return;
       }
       const mentions = await this.resolveMailMentions(issue, doer, comment.content ?? "");
+      if (this.mailEnv === undefined) return;
       const outcome = await notifyIssueComment(this.mailEnv, { issue, comment, doer, mentions }, { now });
       if (outcome.outcome === "enqueued" && outcome.enqueue.some((e) => e.outcome === "pending-unqueued")) {
         console.warn(
@@ -796,10 +807,13 @@ export class IssuesService {
    * with doer = issue.Poster). Only issues ride it — pull creation is the
    * separate NewPullRequest receiver (notify.go:88-93,
    * `notifyMailNewPullRequest` below), and upstream's NewIssue arm is the
-   * issue arm. Best-effort, never throws (the write above stays committed).
+   * issue arm. The mentions arm runs UNCONDITIONALLY (upstream's CreateIssue
+   * runs FindAndUpdateIssueMentions with no mail-env notion,
+   * services/issue/issue.go:68 — see notifyCommentCreated); only the notify
+   * half stays mail-gated. Best-effort, never throws (the write above stays
+   * committed).
    */
   private async notifyMailNewIssue(issue: IssueRow, now: Date): Promise<void> {
-    if (this.mailEnv === undefined) return;
     if (issue.isPull) return;
     if (issue.posterId === null) return;
     try {
@@ -810,6 +824,7 @@ export class IssuesService {
       }
       // Upstream services/issue/issue.go:68 — the issue body's mentions.
       const mentions = await this.resolveMailMentions(issue, doer, issue.content ?? "");
+      if (this.mailEnv === undefined) return;
       const outcome = await notifyIssueCreated(this.mailEnv, { issue, doer, mentions }, { now });
       if (outcome.outcome === "enqueued" && outcome.enqueue.some((e) => e.outcome === "pending-unqueued")) {
         console.warn(`[issues] new-issue notify: some rows stayed pending-unqueued (issue ${issue.id})`);
@@ -828,11 +843,13 @@ export class IssuesService {
    * the PR-create service exactly like upstream's model-layer notify; the
    * compose is the thread-root "new" arm with IsPull = true and the
    * repo-watcher WIP gate lifted (mail_issue.go:67-76's create-arm
-   * exception). Best-effort, never throws (the write above stays
-   * committed).
+   * exception). The mentions arm runs UNCONDITIONALLY (upstream's
+   * CreatePullRequest runs FindAndUpdateIssueMentions with no mail-env
+   * notion, services/pull/pull.go:184 — see notifyCommentCreated); only
+   * the notify half stays mail-gated. Best-effort, never throws (the
+   * write above stays committed).
    */
   private async notifyMailNewPullRequest(issue: IssueRow, now: Date): Promise<void> {
-    if (this.mailEnv === undefined) return;
     if (issue.posterId === null) return;
     try {
       const doer = (await this.db.select().from(users).where(eq(users.id, issue.posterId)).get()) ?? null;
@@ -842,6 +859,7 @@ export class IssuesService {
       }
       // Upstream services/pull/pull.go:184 — the PR body's mentions.
       const mentions = await this.resolveMailMentions(issue, doer, issue.content ?? "");
+      if (this.mailEnv === undefined) return;
       const outcome = await notifyPullRequestCreated(this.mailEnv, { issue, doer, mentions }, { now });
       if (outcome.outcome === "enqueued" && outcome.enqueue.some((e) => e.outcome === "pending-unqueued")) {
         console.warn(`[issues] new-pull notify: some rows stayed pending-unqueued (issue ${issue.id})`);

@@ -35,17 +35,15 @@
  *      folding that arm keeps both gates consistent with the landed
  *      posture (the mail side re-gates; nothing can leak through).
  *
- * NO database writes: upstream's `FindAndUpdateIssueMentions` persists
+ * NO database writes IN THIS MODULE: the resolver stays the pure
+ * parse-to-users half. Upstream's `FindAndUpdateIssueMentions` persists
  * `issue_user.is_mentioned` (issue_update.go:567 → UpdateIssueUsersByMentions,
- * issue_user.go:64-86) — the `issue_user` table has NO landed carrier (our
- * per-issue store is `issue_subscriptions` = upstream's `issue_watch`, a
- * DIFFERENT relation; writing subscription rows for mentions would diverge
- * from the pin, where a mention never touches `issue_watch`). The write is
- * the HANDOFF (a future `issue_mentions` carrier rides a migration this
- * unit is forbidden to make — src/db/** is out of ownership). The mail
- * consumers need no carrier: mentions ride the resolver's return value into
- * `resolveIssueMailRecipients`' `mentions` parameter (specs/email-outbound.md
- * §13).
+ * issue_user.go:64-86) — the carrier landed beside it (migration 0057's
+ * `issue_user` table, services/mentions/carrier.ts): the callers run
+ * resolve then persist, upstream's function shape. Our per-issue store is
+ * `issue_subscriptions` = upstream's `issue_watch`, a DIFFERENT relation —
+ * a mention never touches it at the pin, and the carrier rows are
+ * `issue_user` rows, not subscription rows.
  *
  * The upstream `IsUserBlockedBy` filter (issue_update.go:559-565) is folded
  * onto the same reduction ledger: our schema carries no user-block table.

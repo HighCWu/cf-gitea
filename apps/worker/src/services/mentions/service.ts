@@ -9,10 +9,12 @@
  * parameter — the shape slice two threaded as the reduction
  * (specs/email-outbound.md §8.2, lifted in §13).
  *
- * Deviations from the upstream function, both recorded in resolve.ts's
- * header: the `UpdateIssueMentions` persistence arm (the `issue_user`
- * carrier) and the `IsUserBlockedBy` filter (no block table) are
- * schema-absent — HANDOFF, not invented.
+ * Deviation from the upstream function, recorded in resolve.ts's header:
+ * the `IsUserBlockedBy` filter (no block table). The `UpdateIssueMentions`
+ * persistence arm (the `issue_user` carrier) LANDED (migration 0057,
+ * `carrier.ts`): the callers run resolve + persist — this entry stays the
+ * pure resolve half so the mail consumers can keep threading the resolved
+ * users straight through.
  */
 
 import type { RepositoryRow, UserRow } from "../../api/services/repository";

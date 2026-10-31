@@ -13,7 +13,10 @@
  * (`util.Iif(issue.IsPull, w.IncludePullRequests, w.IncludeIssues)`,
  * issue_watch.go:85). The pre-mode port probed ROW EXISTENCE, so a
  * persisted Dont row — the ignore/mute state the subscription routes land
- * (Auto-unwatch, watch.go:164-165) — wrongly answered "subscribed".
+ * (Auto-unwatch, watch.go:164-165) — wrongly answered "subscribed". The
+ * final participants fallback (:88) rides the second describe; the carrier
+ * wave (issue_user, migration 0057) ported it and the pin reads NO mention
+ * arm there — is_mentioned never subscribes through CheckIssueWatch.
  */
 
 import { env } from "cloudflare:workers";
@@ -22,7 +25,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { issueSubscriptions, issues, repositories, repoWatchers } from "../../db/schema";
+import { comments, issueSubscriptions, issues, repositories, repoWatchers, users } from "../../db/schema";
 import { checkIssueSubscription } from "./issue-extras";
 import { WatchMode } from "./repo-watchers";
 
@@ -35,7 +38,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  for (const table of ["issue_subscriptions", "repo_watchers", "issues", "repositories", "users"]) {
+  for (const table of ["issue_subscriptions", "repo_watchers", "comments", "issues", "repositories", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
 });
@@ -66,7 +69,7 @@ async function seedIssueFixture(): Promise<{ issueId: number; pullId: number }> 
 }
 
 const check = async (issueId: number, isPull: boolean): Promise<boolean> =>
-  checkIssueSubscription(env.DB, USER_ID, { id: issueId, repoId: REPO, isPull });
+  checkIssueSubscription(env.DB, USER_ID, { id: issueId, repoId: REPO, isPull, posterId: 1 });
 
 describe("checkIssueSubscription — the mode-aware repo-watch fallback (issue_watch.go:73-89)", () => {
   it("an explicit issue_subscriptions row wins verbatim — even against a Dont repo watch (:78-80)", async () => {
@@ -162,5 +165,93 @@ describe("checkIssueSubscription — the mode-aware repo-watch fallback (issue_w
     });
     expect(await check(issueId, false)).toBe(false);
     expect(await check(pullId, true)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The participants fallback (issue_watch.go:88 → IsUserParticipantsOfIssue,
+// issue.go:631-636 → GetParticipantIDsByIssue, issue.go:647-668) — the arm
+// the carrier wave ported. NOTE the pin consults NO mention arm here: the
+// issue_user is_mentioned rows never subscribe anyone through this read.
+// ---------------------------------------------------------------------------
+
+describe("checkIssueSubscription — the participants fallback (issue_watch.go:88, issue.go:647-668)", () => {
+  /** One active user row (the commenters below need the INNER JOIN to
+   *  resolve); `status` overrides for the prohibit arms. */
+  async function seedUser(id: number, status: "active" | "prohibited" = "active"): Promise<void> {
+    await drizzle(env.DB).insert(users).values({
+      id,
+      username: `user${id}`,
+      usernameLower: `user${id}`,
+      email: `user${id}@example.com`,
+      status,
+      createdAt: T0,
+    });
+  }
+
+  async function seedComment(issueId: number, posterId: number, type: number): Promise<void> {
+    await drizzle(env.DB)
+      .insert(comments)
+      .values({ type, posterId, issueId, content: "", createdAt: T0, updatedAt: T0 });
+  }
+
+  it("the poster is a participant with zero comments — the unconditional append (issue.go:664-666)", async () => {
+    const { issueId } = await seedIssueFixture();
+    expect(await checkIssueSubscription(env.DB, 1, { id: issueId, repoId: REPO, isPull: false, posterId: 1 })).toBe(
+      true,
+    );
+  });
+
+  it("the poster seat skips the active filter (the append sits OUTSIDE the query's active arm)", async () => {
+    const { issueId } = await seedIssueFixture();
+    await seedUser(1, "prohibited");
+    expect(await checkIssueSubscription(env.DB, 1, { id: issueId, repoId: REPO, isPull: false, posterId: 1 })).toBe(
+      true,
+    );
+  });
+
+  it("a plain-comment poster participates (:650 the CommentTypeComment arm)", async () => {
+    const { issueId } = await seedIssueFixture();
+    await seedUser(USER_ID);
+    await seedComment(issueId, USER_ID, 0); // CommentType.Comment
+    expect(await check(issueId, false)).toBe(true);
+  });
+
+  it("code-comment (21) and review (22) posters participate too (:650 the in(?,?,?) set)", async () => {
+    const { issueId } = await seedIssueFixture();
+    await seedUser(21);
+    await seedComment(issueId, 21, 21); // CommentType.Code
+    expect(await checkIssueSubscription(env.DB, 21, { id: issueId, repoId: REPO, isPull: false, posterId: 1 })).toBe(
+      true,
+    );
+    await seedUser(22);
+    await seedComment(issueId, 22, 22); // CommentType.Review
+    expect(await checkIssueSubscription(env.DB, 22, { id: issueId, repoId: REPO, isPull: false, posterId: 1 })).toBe(
+      true,
+    );
+  });
+
+  it("system-comment posters do NOT participate — a close (type 2) is not a participant comment", async () => {
+    const { issueId } = await seedIssueFixture();
+    await seedUser(USER_ID);
+    await seedComment(issueId, USER_ID, 2); // CommentType.Close — outside the in(?,?,?) set
+    expect(await check(issueId, false)).toBe(false);
+  });
+
+  it("a login-prohibited commenter does NOT participate (issue.go:653 the prohibit_login arm)", async () => {
+    const { issueId } = await seedIssueFixture();
+    await seedUser(USER_ID, "prohibited");
+    await seedComment(issueId, USER_ID, 0);
+    expect(await check(issueId, false)).toBe(false);
+  });
+
+  it("a commented participant answers true over a Dont repo watch — the fallback runs after the watch read (:84-88)", async () => {
+    const { issueId } = await seedIssueFixture();
+    await seedUser(USER_ID);
+    await seedComment(issueId, USER_ID, 0);
+    await drizzle(env.DB)
+      .insert(repoWatchers)
+      .values({ repoId: REPO, userId: USER_ID, mode: WatchMode.Dont, createdAt: T0 });
+    expect(await check(issueId, false)).toBe(true);
   });
 });
