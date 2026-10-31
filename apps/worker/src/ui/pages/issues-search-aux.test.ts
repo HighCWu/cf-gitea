@@ -26,7 +26,7 @@ import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
 import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
-import { pullRequests } from "../../db/schema";
+import { issueUsers, pullRequests } from "../../db/schema";
 import {
   clampedPaging,
   issuesSearchResponse,
@@ -100,6 +100,7 @@ beforeEach(async () => {
   for (const table of [
     "issue_labels",
     "issue_subscriptions",
+    "issue_user",
     "milestones",
     "pull_requests",
     "comments",
@@ -293,20 +294,34 @@ describe("loadIssuesSearchAux — the web /issues/search grammar", () => {
     expect(unknown).toEqual({ kind: "notFound", login: "ghost" });
   });
 
-  it("assigned_by / mentioned_by: existing logins conjoin to the empty set (no assignee data), unknown logins 404", async () => {
+  it("mentioned_by rides the issue_user carrier rows; assigned_by still matches the empty set; unknown logins 404", async () => {
     const s = await seed();
-    const assigned = await search(`?assigned_by=${s.origin.username}&state=all`);
-    expect(assigned).toEqual({ kind: "feed", issues: [], total: 0 });
+    // The carrier row (UpdateIssueUsersByMentions' shape): origin mentioned
+    // on thread #1 (uid = the MENTIONED user).
+    const issueOne = s.indexes.get(1);
+    if (issueOne === undefined) throw new Error("fixture thread #1 missing");
+    await drizzle(env.DB).insert(issueUsers).values({ userId: s.origin.id, issueId: issueOne.id, isMentioned: true });
 
     const mentioned = await search(`?mentioned_by=${s.origin.username}&state=all`);
-    expect(mentioned).toEqual({ kind: "feed", issues: [], total: 0 });
+    if (mentioned.kind !== "feed") throw new Error("mention arm");
+    expect(mentioned.issues.map((issue) => issue.number)).toEqual([1]);
+
+    // assigned_by: no assignee rows exist — the empty conjunction stays.
+    const assigned = await search(`?assigned_by=${s.origin.username}&state=all`);
+    expect(assigned).toEqual({ kind: "feed", issues: [], total: 0 });
 
     const unknown = await search("?mentioned_by=ghost");
     expect(unknown).toEqual({ kind: "notFound", login: "ghost" });
 
-    // created_by ∧ assigned_by stays the empty conjunction (never just the poster arm).
-    const both = await search(`?created_by=${s.origin.username}&assigned_by=${s.origin.username}&state=all`);
-    expect(both).toEqual({ kind: "feed", issues: [], total: 0 });
+    // created_by ∧ mentioned_by is a real AND (never just one arm): other's
+    // poster arm ∩ origin's mention arm = ∅.
+    const disjoint = await search(`?created_by=${s.other.username}&mentioned_by=${s.origin.username}&state=all`);
+    expect(disjoint).toEqual({ kind: "feed", issues: [], total: 0 });
+
+    // …and the intersecting pair returns exactly the shared thread.
+    const overlap = await search(`?created_by=${s.origin.username}&mentioned_by=${s.origin.username}&state=all`);
+    if (overlap.kind !== "feed") throw new Error("overlap arm");
+    expect(overlap.issues.map((issue) => issue.number)).toEqual([1]);
   });
 
   it("project: [-1] is the NoProjectOnly no-op, concrete ids match the empty set, a poisoned list filters nothing", async () => {

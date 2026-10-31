@@ -93,12 +93,13 @@
  * The search feed renders through the landed API machinery (the [ok]
  * issueSearchIssues block): parseStateFilter/parseTypeFilter/parseQueryTime,
  * milestoneIdsByRepoEntries, userIdForFilter, listRepoIssues,
- * toApiIssue. The assignee/mention filters have no landed data model (the
- * landed list route's posture verbatim: "no assignee/mention tracking
- * exists yet, so the filters match the empty set") — an EXISTING user in
- * assigned_by/mentioned_by therefore conjoins to the empty set; project
- * filters likewise: exactly [-1] is a no-op (every thread is projectless)
- * and any concrete id list matches nothing.
+ * toApiIssue. mentioned_by rides the landed issue_user carrier (the
+ * IssueListFilters.mentionedId filter — applyMentionedCondition,
+ * issue_search.go:396-398); assigned_by has no landed rows yet (its route
+ * wiring is the assignee wave's item), so an EXISTING user in assigned_by
+ * conjoins to the empty set; project filters likewise: exactly [-1] is a
+ * no-op (every thread is projectless) and any concrete id list matches
+ * nothing.
  *
  * This module holds the loaders + the JSON Response builders only; the
  * handlers live in src/ui/index.ts beside their sibling dispatchers (the
@@ -269,9 +270,13 @@ export async function loadIssuesSearchAux(
   const milestoneIds = await milestoneIdsByRepoEntries(env.DB, repo.id, query.milestoneEntries);
 
   // User filters (getUserIDForFilter, issue_list.go:232-246): unknown
-  // login → ctx.NotFound.
+  // login → ctx.NotFound. mentioned_by rides the landed issue_user carrier
+  // (issue_list.go:292-294's `mentionedByID > 0 → MentionID` — the API
+  // seam's mentionedId filter, applyMentionedCondition downstream);
+  // assigned_by still matches the empty set (no assignee rows exist).
   let posterId: number | null | undefined;
   let assigneeVoid = false;
+  let mentionedId: number | null | undefined;
   for (const [name, role] of [
     [query.createdByName, "poster"],
     [query.assignedByName, "assignee"],
@@ -281,7 +286,8 @@ export async function loadIssuesSearchAux(
     const id = await userIdForFilter(env.DB, name);
     if (id === null) return { kind: "notFound", login: name };
     if (role === "poster") posterId = id;
-    else assigneeVoid = true; // no assignee/mention rows exist → empty conjunct
+    else if (role === "assignee") assigneeVoid = true; // no assignee rows exist → empty conjunct
+    else mentionedId = id;
   }
 
   // Project filter (issue_list.go:267-274): [-1] alone is NoProjectOnly —
@@ -300,6 +306,7 @@ export async function loadIssuesSearchAux(
     since: query.since,
     before: query.before,
     posterId,
+    mentionedId,
     ...clampedPaging(url),
   };
   const page = await listRepoIssues(env.DB, repo.id, filters);

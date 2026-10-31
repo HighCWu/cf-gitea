@@ -28,6 +28,7 @@ import {
   issueDependencies,
   issuePins,
   issueStopwatches,
+  issueUsers,
   issues,
   labels,
   milestones,
@@ -82,6 +83,7 @@ beforeEach(async () => {
     "pull_requests",
     "comments",
     "issue_labels",
+    "issue_user",
     "issues",
     "milestones",
     "labels",
@@ -670,15 +672,16 @@ describe("GET /repos/{owner}/{repo}/issues (issueListIssues)", () => {
     expect(await unknownCase.json()).toEqual({ message: "user does not exist [uid: 0, name: Ghost]", url: ERROR_URL });
   });
 
-  it("resolves assigned_by/mentioned_by — unknown users 404, known users match the empty set", async () => {
+  it("resolves assigned_by/mentioned_by — unknown users 404; users without rows match the empty set", async () => {
     const owner = await seedUser("Alice");
     const neighbor = await seedUser("Bob");
     const repoId = await seedRepo(owner.usernameLower, "visible");
     await seedIssue(repoId, "by alice", { posterId: owner.id });
 
-    // No assignee/mention tracking exists, so a RESOLVED user matches the
-    // empty set — but the resolution itself still runs upstream's
-    // getUserIDForFilter (repo/issue.go:402-406) before any filtering.
+    // No assignee/mention ROWS exist in this seed, so a RESOLVED user
+    // matches the empty set — but the resolution itself still runs
+    // upstream's getUserIDForFilter (repo/issue.go:402-406) before any
+    // filtering (the wired filters are pinned just below).
     const known = await router()("/repos/alice/visible/issues?assigned_by=BOB&mentioned_by=Bob");
     expect(known.status).toBe(200);
     expect(await known.json<unknown[]>()).toEqual([]);
@@ -727,6 +730,41 @@ describe("GET /repos/{owner}/{repo}/issues (issueListIssues)", () => {
     const aliceList = await router()("/repos/alice/visible/issues?assigned_by=alice");
     expect(aliceList.status).toBe(200);
     expect(await aliceList.json<unknown[]>()).toEqual([]);
+  });
+
+  it("mentioned_by filters over the issue_user carrier rows — the wired applyMentionedCondition arm", async () => {
+    const owner = await seedUser("Alice");
+    const neighbor = await seedUser("Bob");
+    const third = await seedUser("Carol");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const mentioned = await seedIssue(repoId, "bob was mentioned", { posterId: owner.id });
+    const both = await seedIssue(repoId, "bob and carol", { posterId: owner.id });
+    await seedIssue(repoId, "unmentioned", { posterId: owner.id });
+    // The carrier's row shape (UpdateIssueUsersByMentions): the (user_id,
+    // issue_id) pair, is_mentioned flipped. uid = the MENTIONED user.
+    await db().insert(issueUsers).values([
+      { userId: neighbor.id, issueId: mentioned.id, isMentioned: true },
+      { userId: neighbor.id, issueId: both.id, isMentioned: true },
+      { userId: third.id, issueId: both.id, isMentioned: true },
+    ]);
+
+    const bobList = await router()("/repos/alice/visible/issues?mentioned_by=BOB");
+    expect(bobList.status).toBe(200);
+    const bobRows = await bobList.json<{ title: string }[]>();
+    // SortByCreatedDesc (created_unix DESC, id DESC): the second seed is
+    // the newer row on a tied stamp.
+    expect(bobRows.map((row) => row.title)).toEqual(["bob and carol", "bob was mentioned"]);
+
+    const carolList = await router()("/repos/alice/visible/issues?mentioned_by=carol");
+    expect(carolList.status).toBe(200);
+    const carolRows = await carolList.json<{ title: string }[]>();
+    expect(carolRows.map((row) => row.title)).toEqual(["bob and carol"]);
+
+    // A resolved user with no mention rows matches empty; the unknown-login
+    // 404 arm is pinned above.
+    const emptyList = await router()("/repos/alice/visible/issues?mentioned_by=alice");
+    expect(emptyList.status).toBe(200);
+    expect(await emptyList.json<unknown[]>()).toEqual([]);
   });
 
   it("404s an invisible repository", async () => {
@@ -2946,6 +2984,62 @@ describe("GET /repos/issues/search (issueSearchIssues)", () => {
     // The stub resolver identity (cf-gitea-stub) owns nothing.
     const signed = await router()("/repos/issues/search?q=findme", { headers: { Authorization: `token ${TOKEN}` } });
     expect(signed.headers.get("X-Total-Count")).toBe("1");
+  });
+
+  it("wires the mention filters — mentioned (doer), mentioned_by (other) with visibility, the empty set", async () => {
+    const owner = await seedUser("Alice");
+    const neighbor = await seedUser("Bob");
+    const publicRepo = await seedRepo(owner.usernameLower, "mention-public");
+    const privateRepo = await seedRepo(owner.usernameLower, "mention-private", { private: true });
+    const stubMentioned = await seedIssue(publicRepo, "stub mentioned here", { posterId: owner.id });
+    const bobPublic = await seedIssue(publicRepo, "bob mentioned here", { posterId: owner.id });
+    const bobPrivate = await seedIssue(privateRepo, "bob mentioned privately", { posterId: owner.id });
+    await seedIssue(publicRepo, "no mentions", { posterId: owner.id });
+    const stubId = STUB_USER.id;
+    if (stubId === undefined) throw new Error("stub identity carries no id");
+    // The carrier rows (uid = the MENTIONED user): the stub doer on the
+    // public thread, bob on one public and one PRIVATE thread.
+    await db().insert(issueUsers).values([
+      { userId: stubId, issueId: stubMentioned.id, isMentioned: true },
+      { userId: neighbor.id, issueId: bobPublic.id, isMentioned: true },
+      { userId: neighbor.id, issueId: bobPrivate.id, isMentioned: true },
+    ]);
+
+    // mentioned-by-me: the signed doer-flag (repo/issue.go:223-225, gated
+    // on IsSigned) rides the carrier rows — applyMentionedCondition.
+    const me = await router()("/repos/issues/search?mentioned=true", { headers: { Authorization: `token ${TOKEN}` } });
+    expect(me.status).toBe(200);
+    expect(me.headers.get("X-Total-Count")).toBe("1");
+    expect((await me.json<{ title: string }[]>())[0]?.title).toBe("stub mentioned here");
+
+    // Anonymous callers keep NO mention filter (upstream ignores the flag
+    // when unsigned) — the full visible set answers.
+    const anonFlag = await router()("/repos/issues/search?mentioned=true");
+    expect(anonFlag.headers.get("X-Total-Count")).toBe("3");
+
+    // mentioned-by-other with visibility: bob's mention condition ANDs the
+    // visible-repo set, so the anonymous/stub viewer sees only the PUBLIC
+    // mention — the private thread's mention row never leaks the repo.
+    const bobAsOthers = await router()("/repos/issues/search?mentioned_by=BOB");
+    expect(bobAsOthers.status).toBe(200);
+    expect(bobAsOthers.headers.get("X-Total-Count")).toBe("1");
+    expect((await bobAsOthers.json<{ title: string }[]>())[0]?.title).toBe("bob mentioned here");
+
+    // The admin viewer reads every repo, so the same filter surfaces the
+    // private mention too (the condition is repo-set-relative, never a
+    // hard public-only gate — that posture is UserMentionedRepoCond's, a
+    // web-dashboard arm this backend does not carry).
+    const adminApp = createApiRouter({ auth: { resolveToken: () => Promise.resolve({ ...STUB_USER, is_admin: true }) } });
+    const bobAsAdmin = await adminApp.fetch(
+      new Request("https://example.com/repos/issues/search?mentioned_by=bob", { headers: authHeaders }),
+      env,
+    );
+    expect(bobAsAdmin.headers.get("X-Total-Count")).toBe("2");
+
+    // The empty-set arm: a resolved user with no mention rows.
+    const emptySet = await router()("/repos/issues/search?mentioned_by=alice");
+    expect(emptySet.status).toBe(200);
+    expect(emptySet.headers.get("X-Total-Count")).toBe("0");
   });
 
   it("400s unknown owners and owner-less team filters; 422s bad time formats", async () => {

@@ -12,6 +12,7 @@ import {
   issuePins,
   issueStopwatches,
   issueSubscriptions,
+  issueUsers,
   issues,
   labels,
   milestones,
@@ -837,6 +838,14 @@ export interface IssueListFilters {
    *  subquery). Applies to pulls too — upstream's condition is
    *  unit-agnostic, and the PATCH assignees arm stores both. */
   assigneeId?: number | null;
+  /** Mentioned-id filter — upstream `applyMentionedCondition`
+   *  (models/issues/issue_search.go:395-399): the INNER JOIN issue_user ON
+   *  issue.id WHERE is_mentioned = true AND uid = ?; applied only when the
+   *  id is > 0 upstream (:245-247). Here it rides the landed issue_user
+   *  carrier (the `mentioned_by` username filters and the global search's
+   *  `mentioned` doer-flag resolve to it). The uid is the MENTIONED user —
+   *  who was @-referenced — never the mention author. */
+  mentionedId?: number | null;
   page: number;
   limit: number;
 }
@@ -994,6 +1003,24 @@ function issueFilterConditions(d1: D1Database, repoIds: string[], filters: Issue
   }
   if (filters.milestoneIds.length > 0) {
     conditions.push(inArray(issues.milestoneId, filters.milestoneIds));
+  }
+  if (filters.mentionedId !== undefined && filters.mentionedId !== null) {
+    // applyMentionedCondition (issue_search.go:396-398) as the id-IN
+    // subquery — the assignee arm's adaptation (the same INNER JOIN row
+    // set, composed through the AND chain). Only is_mentioned rows match:
+    // the carrier flips that single column, so a future read-state-only
+    // row (the staged mark-read arm) never enters the mention set — and
+    // upstream's index-side MentionedUserID reads the same rows
+    // (GetIssueMentionIDs, issue_user.go:89-96).
+    conditions.push(
+      inArray(
+        issues.id,
+        drizzle(d1)
+          .select({ issueId: issueUsers.issueId })
+          .from(issueUsers)
+          .where(and(eq(issueUsers.isMentioned, true), eq(issueUsers.userId, filters.mentionedId))),
+      ),
+    );
   }
   return and(...conditions) as SQL;
 }

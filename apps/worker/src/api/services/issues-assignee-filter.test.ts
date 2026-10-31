@@ -15,11 +15,10 @@
  * route wiring is the orchestrator follow-on — routes/issues.ts is another
  * unit's in-flight file).
  *
- * `mentioned_by` has NO service arm on purpose: no mention store exists (no
- * `issue_user` table is ever written), so the route's resolved-user
- * match-nothing arm answers the same empty set upstream's indexer would over
- * zero mention rows. It grows a store-side filter when mention tracking
- * lands.
+ * `mentioned_by` has its own suite now — the issue_user carrier landed
+ * (1622f90) and the search filters wire it: issues-mention-filter.test.ts
+ * pins the same seam shape for applyMentionedCondition (issue_search.go:
+ * 395-399).
  */
 
 import { env } from "cloudflare:workers";

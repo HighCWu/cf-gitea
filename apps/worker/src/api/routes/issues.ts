@@ -89,6 +89,7 @@ import {
   canViewRepositoryWithTeams,
   findRepositoriesByIds,
   findRepositoryByPath,
+  formBool,
   repositoryPermissions,
   viewerOf,
   type RepositoryWithOwner,
@@ -1050,14 +1051,21 @@ const searchIssuesRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
         type: z.string().optional().openapi({ description: "filter by type (issues / pulls) if set" }),
         since: rfc3339Query("Only show items updated after the given time. This is a timestamp in RFC 3339 format"),
         before: rfc3339Query("Only show items updated before the given time. This is a timestamp in RFC 3339 format"),
-        assigned: z.boolean().optional().openapi({ description: "Filter (issues / pulls) assigned to the authenticated user" }),
-        created: z.boolean().optional().openapi({ description: "Filter (issues / pulls) created by the authenticated user" }),
-        mentioned: z.boolean().optional().openapi({ description: "Filter (issues / pulls) mentioning the authenticated user" }),
+        // The five doer-flags parse through upstream's FormBool — Go form
+        // coercion never 400s, so the schema stays a LENIENT string with
+        // the contract's `boolean` type overridden onto the generated
+        // document (the repo-search formBoolParam precedent,
+        // routes/repo.ts:111-115). A strict z.boolean() here rejected
+        // `?mentioned=true` with a ZodError 400 the moment the flag grew a
+        // real filter (the pre-wiring stubs never exercised it).
+        assigned: z.string().optional().openapi({ type: "boolean", description: "Filter (issues / pulls) assigned to the authenticated user" }),
+        created: z.string().optional().openapi({ type: "boolean", description: "Filter (issues / pulls) created by the authenticated user" }),
+        mentioned: z.string().optional().openapi({ type: "boolean", description: "Filter (issues / pulls) mentioning the authenticated user" }),
         review_requested: z
-          .boolean()
+          .string()
           .optional()
-          .openapi({ description: "Filter pulls where the authenticated user's review was requested" }),
-        reviewed: z.boolean().optional().openapi({ description: "Filter pulls reviewed by the authenticated user" }),
+          .openapi({ type: "boolean", description: "Filter pulls where the authenticated user's review was requested" }),
+        reviewed: z.string().optional().openapi({ type: "boolean", description: "Filter pulls reviewed by the authenticated user" }),
         owner: z.string().optional().openapi({ description: "filter by owner" }),
         team: z.string().optional().openapi({ description: "filter by team (requires owner organization)" }),
         created_by: z.string().optional().openapi({ description: "Only show items which were created by the given user" }),
@@ -1098,11 +1106,12 @@ export function registerIssueRoutes(
     let posterId: number | null | undefined;
     // assigned_by rides the issue_assignees subquery (issue_search.go:373-
     // 383's numeric arm — the service-half seam, services/issues.ts).
-    // mentioned_by: no mention store exists yet, so a RESOLVED user matches
-    // the empty set (upstream's indexer MentionedUserID finds nothing over
-    // zero rows) — only the unknown-login 404 is observable today.
+    // mentioned_by rides the landed issue_user carrier the same way
+    // (applyMentionedCondition, issue_search.go:395-399 — :449-451 sets
+    // MentionID when the resolved id is > 0): the service's mentionedId
+    // filter over is_mentioned rows.
     let assigneeId: number | null | undefined;
-    let mentionedMatchesEmpty = false;
+    let mentionedId: number | null | undefined;
     for (const filter of ["created_by", "assigned_by", "mentioned_by"] as const) {
       const name = (url.searchParams.get(filter) ?? "").trim();
       if (name === "") continue;
@@ -1115,11 +1124,8 @@ export function registerIssueRoutes(
       } else if (filter === "assigned_by") {
         assigneeId = id;
       } else {
-        mentionedMatchesEmpty = true;
+        mentionedId = id;
       }
-    }
-    if (mentionedMatchesEmpty) {
-      posterId = -1;
     }
 
     const { items, total } = await listRepoIssues(c.env.DB, found.repo.id, {
@@ -1135,6 +1141,7 @@ export function registerIssueRoutes(
       before,
       posterId,
       assigneeId,
+      mentionedId,
       page: listOptions.page,
       limit: listOptions.limit,
     });
@@ -1904,7 +1911,8 @@ export function registerIssueRoutes(
     }
     // The global search's assigned_by rides the same issue_assignees
     // subquery (issue_search.go:373-383's numeric arm — the shared
-    // IssueListFilters seam); mentioned_by still matches empty (no store).
+    // IssueListFilters seam); mentioned_by rides the landed issue_user
+    // carrier (applyMentionedCondition, issue_search.go:395-399).
     const assignedBy = (url.searchParams.get("assigned_by") ?? "").trim();
     let assigneeId: number | null | undefined;
     if (assignedBy !== "") {
@@ -1913,25 +1921,34 @@ export function registerIssueRoutes(
         throw userNotExistError(assignedBy);
       }
     }
+    let mentionedId: number | null | undefined;
     const mentionedBy = (url.searchParams.get("mentioned_by") ?? "").trim();
     if (mentionedBy !== "") {
-      const id = await userIdForFilter(c.env.DB, mentionedBy);
-      if (id === null) {
+      mentionedId = await userIdForFilter(c.env.DB, mentionedBy);
+      if (mentionedId === null) {
         throw userNotExistError(mentionedBy);
       }
-      posterId = -1; // resolved user over zero mention rows — the empty set
     }
     const requester = c.get("authUser");
     if (requester !== undefined) {
-      if (url.searchParams.get("created") === "true") {
+      // ctx.FormBool(value-rule) parsing — 1/t/T/true/TRUE/True/on/on/On
+      // are true, everything else (and garbage) false, never an error.
+      if (formBool(url.searchParams, "created")) {
         posterId = requester.id;
       }
-      // assigned/mentioned/review_requested/reviewed: the corresponding
-      // tables do not exist yet — the filters match the empty set.
-      for (const flag of ["assigned", "mentioned", "review_requested", "reviewed"]) {
-        if (url.searchParams.get(flag) === "true") {
+      // assigned/review_requested/reviewed: the corresponding surfaces do
+      // not exist yet (the assignee flag's route wiring is its own wave's
+      // item; no review store) — the filters match the empty set.
+      for (const flag of ["assigned", "review_requested", "reviewed"]) {
+        if (formBool(url.searchParams, flag)) {
           posterId = -1;
         }
+      }
+      // The `mentioned` doer-flag (issue.go:223-225, gated on IsSigned —
+      // anonymous callers keep it unfiltered): the doer's
+      // applyMentionedCondition arm, real rows now.
+      if (formBool(url.searchParams, "mentioned")) {
+        mentionedId = requester.id;
       }
     }
 
@@ -1945,6 +1962,7 @@ export function registerIssueRoutes(
       before,
       posterId,
       assigneeId,
+      mentionedId,
       page: listOptions.page,
       limit: listOptions.limit,
     });
