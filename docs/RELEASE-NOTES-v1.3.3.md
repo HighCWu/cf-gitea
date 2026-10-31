@@ -9,7 +9,11 @@ battery's runs leave two standing repos/four tokens, the adjusted audit
 clean 10/10).
 
 The wave's shape, in one paragraph: **the gap-fill convergence** — the
-package registry completed to the pin's FULL 21-protocol surface, the M3
+package registry completed to the pin's FULL 21-protocol surface
+[CORRECTED 2026-11-01: the true pin census is 22 CommonRoutes groups + the
+OCI container API = 23 protocol surfaces (SPEC-0016 §2.1); at this tag the
+tree held 20 groups + container; terraform landed 2026-11-01, conda
+staged], the M3
 Actions tier finished to its last staged row (the matrix model), the four
 "unfillable" classifications were re-adjudicated and three of them built
 (email in and out, watch modes, mentions), and the two big v1.4 headliners
@@ -18,6 +22,11 @@ substrates landed. Seven 1308 quota-death waves were absorbed; salvage and
 revert discipline held throughout.
 
 ## 1. The package registry: 11 → 21 protocols (parity with the pin)
+
+> [CORRECTED 2026-11-01: "parity with the pin" was wrong — the true pin
+> census is 22 CommonRoutes groups + the OCI container API = 23 protocol
+> surfaces (SPEC-0016 §2.1); at this tag the tree held 20 groups +
+> container; terraform landed 2026-11-01, conda staged.]
 
 - **The protocol wave `5721dcc`** — go (a REAL `go mod download` round-trip
   incl. pseudo-versions and client-side go.sum dirhash parity), cargo (the
@@ -31,7 +40,10 @@ revert discipline held throughout.
   held through `packages-protocols.ts`.
 - **The six-minor wave `28a40b5`** — chef, composer, conan (the ~30-arm v1+v2
   revisions protocol), cran, pub, vagrant: the registry carries **21
-  protocols = the pin's full set**. Upstream's own `cran.rvserion` key typo
+  protocols = the pin's full set**. [CORRECTED 2026-11-01: not the pin's
+  full set — the pin is 22 CommonRoutes groups + container = 23 surfaces
+  (SPEC-0016 §2.1); this tag held 20 groups + container; terraform landed
+  2026-11-01, conda staged.] Upstream's own `cran.rvserion` key typo
   preserved verbatim.
 - **The cleanup rebuild rider `df868d2`** (all four distro families post-loop,
   `cleanup.go:122-147`) + the cargo per-package rider + the sweep twin's

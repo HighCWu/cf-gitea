@@ -34,6 +34,9 @@ import {
   repoTopics,
   repoTransfer,
   repositories,
+  teamMembers,
+  teamRepoAccess,
+  teams,
   users,
 } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
@@ -430,7 +433,7 @@ describe("GET /repos/.../assignees/{assignee} (repo-extras-t2)", () => {
     await seedCollaborator(readerId, "read");
 
     expect((await send(`${REPO_PATH}/assignees/neighbor`, authed())).status).toBe(204);
-    expect((await send(`${REPO_PATH}/assignees/${OWNER}`, authed())).status).toBe(204); // owner is always assignable
+    expect((await send(`${REPO_PATH}/assignees/${OWNER}`, authed())).status).toBe(204); // the user-owner seat
     expect((await send(`${REPO_PATH}/assignees/reader`, authed())).status).toBe(404); // read mode is not assignable
     const ghost = await send(`${REPO_PATH}/assignees/ghost`, authed());
     expect(ghost.status).toBe(404);
@@ -439,6 +442,67 @@ describe("GET /repos/.../assignees/{assignee} (repo-extras-t2)", () => {
     // ErrUserNotExist, the same `[uid: 0, name: X]` render.
     expect(ghostBody.message).toBe("user does not exist [uid: 0, name: ghost]");
     expect((await send(`${REPO_PATH}/assignees/neighbor`)).status).toBe(401); // reqToken
+  });
+
+  // Pinned for the 92ed5bf unification's implicit shifts on THIS check
+  // route (it rides the same listRepoAssignees delegate onto the full
+  // GetRepoAssignees port): an org owner's own row LEFT the assignee set
+  // (upstream appends the owner seat only under the `!repo.Owner.
+  // IsOrganization()` condition, user_repo.go:151 — the pre-unification
+  // reduced read appended the owner row raw, so an org owner checked 204),
+  // and the ORG-team arm ARRIVED (user_repo.go:134-141 →
+  // GetTeamUserIDsWithAccessToAnyRepoUnit): a member of a team joined to
+  // the repo through team_repo_access qualifies when the team's authorize
+  // reads at read-or-above OR its unitsMap grants read on the issues/pulls
+  // units — the code unit is NOT part of that gate, so a member gated out
+  // of it now checks 204.
+  it("post-92ed5bf: an org owner 404s; a team member gated out of the code unit but granted the issues unit 204s", async () => {
+    const orgId = (
+      await drizzle(env.DB)
+        .insert(users)
+        .values({ username: "acmeorg", usernameLower: "acmeorg", type: "org", status: "active", createdAt: NOW })
+        .returning({ id: users.id })
+        .all()
+    )[0]!.id;
+    const teamieId = (
+      await drizzle(env.DB)
+        .insert(users)
+        .values({ username: "teamie", usernameLower: "teamie", status: "active", createdAt: NOW })
+        .returning({ id: users.id })
+        .all()
+    )[0]!.id;
+    const orgRepoId = "t2-orgrepo"; // the beforeEach t2-% namespace
+    await drizzle(env.DB).insert(repositories).values({
+      id: orgRepoId,
+      storageKey: `r_${orgRepoId}`,
+      ownerNamespace: "acmeorg",
+      ownerId: orgId,
+      slug: orgRepoId,
+      visibility: "public",
+      refsVersion: 0,
+      createdAt: NOW,
+    });
+    // authorize "none" + an issues-unit override only: the team carries no
+    // code unit (the unitsMap gate, resolve.ts's teamUnitEnabled collapse).
+    const teamId = (
+      await drizzle(env.DB)
+        .insert(teams)
+        .values({
+          orgId,
+          lowerName: "devs",
+          name: "devs",
+          authorize: "none",
+          unitsMap: JSON.stringify({ "repo.issues": "read" }),
+        })
+        .returning({ id: teams.id })
+        .all()
+    )[0]!.id;
+    await drizzle(env.DB).insert(teamRepoAccess).values({ orgId, teamId, repoId: orgRepoId });
+    await drizzle(env.DB).insert(teamMembers).values({ orgId, teamId, userId: teamieId });
+
+    const orgPath = `/repos/acmeorg/${orgRepoId}/assignees`;
+    expect((await send(`${orgPath}/acmeorg`, authed())).status).toBe(404); // no org-owner seat
+    expect((await send(`${orgPath}/teamie`, authed())).status).toBe(204); // the org-team arm
   });
 });
 

@@ -85,7 +85,11 @@ fixed (the watch-tails fix's twin).
 P3-5's three stale claims closed with verified hashes; ALL SEVEN
 DISCLOSED-HASH placeholders filled; the demo-sweep header + index.ts
 hourly comments rewritten from the real artifacts; the board's
-protocol-count rows reconciled to 21/21.
+protocol-count rows reconciled to 21/21. [CORRECTED 2026-11-01: 21/21 was
+the wrong target — the true pin census is 22 CommonRoutes groups + the OCI
+container API = 23 protocol surfaces (SPEC-0016 §2.1); at v1.3.3 the tree
+held 20 groups + container; terraform landed 2026-11-01, conda staged —
+the board rows reconcile to 23 at the post-terraform tree.]
 
 ## 6. The freeze gate and process
 

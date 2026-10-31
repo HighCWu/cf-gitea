@@ -22,8 +22,8 @@
  *      "repo.pulls" per structs/org_team.go:34), tested per unit key;
  *   3. active users only (:146-149 — upstream `is_active = true`; our
  *      `users.status = 'active'` is the tree's is_active + !prohibit_login
- *      collapse), `GetOrderByName` order (the landed username-ASC
- *      precedent, listRepoAssignees);
+ *      collapse), `GetOrderByName` order (username ASC — the route
+ *      delegate rides this same order since 92ed5bf);
  *   4. the OWNER seat (:151-153): a NON-organization owner is appended
  *      unconditionally (never active-filtered, never sorted in — upstream
  *      appends `repo.Owner` raw) unless already enumerated; an org owner
@@ -31,11 +31,13 @@
  *
  * CONSUMER: the NewIssueUsers seed (services/mentions/carrier.ts
  * newIssueUserSeedRows — issue_user.go:28-55) enumerates THIS list at
- * issue/PR create. Upstream serves the /repos/{owner}/{repo}/assignees
- * route from the SAME function; our route keeps its reduced
- * listRepoAssignees (collaborators + owner, no team arm) — the two read
- * this module's shape and the route's unification is the collaborators
- * owner's call (recorded in specs/email-outbound.md §13.4).
+ * issue/PR create. UNIFIED (92ed5bf): upstream serves BOTH assignee
+ * surfaces — the /repos/{owner}/{repo}/assignees list and the
+ * /assignees/{assignee} eligibility check — from this ONE function
+ * (user_repo.go:117-152), and the route's `listRepoAssignees`
+ * (api/services/repo-collaborators.ts) is now a one-line delegate onto
+ * `getRepoAssignees`; the old reduced collaborators+owner under-list is
+ * gone (specs/email-outbound.md §13.4, the resolved ledger row).
  */
 
 import { and, eq, inArray } from "drizzle-orm";
