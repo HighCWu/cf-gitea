@@ -8,7 +8,10 @@
  * The brief's red→green spine, per arm:
  *   - store avatar (uploadAvatar) → serve by owner id (/avatars/u_<id>);
  *   - serve by email hash (/avatar/<HashEmail>) → the frozen-settings
- *     default-link redirect (private, max-age=300; 303);
+ *     default-link redirect (private, max-age=300; 303), now resolved
+ *     through the email_hash table (migration 0055) — the registry
+ *     lifecycle (saveEmailHash write half, getEmailForHash read half,
+ *     miss → "" → default) has its own describe below;
  *   - unknown-hash fallback → the deterministic 96px identicon arm verbatim
  *     (image/png, generic ETag public cache, 304 on If-None-Match);
  *   - plus the /user/avatar/{username}/{size} chain (custom-avatar link,
@@ -18,11 +21,12 @@
 
 import { applyD1Migrations, env } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { users } from "../db/schema";
+import { emailHash, users } from "../db/schema";
 import { renderIdenticonPng, IDENTICON_DARK_COLORS } from "../services/avatar-identicon";
-import { hashAvatar, hashEmail, uploadAvatar } from "../services/avatars";
+import { getEmailForHash, hashAvatar, hashEmail, saveEmailHash, uploadAvatar } from "../services/avatars";
 import { avatarServingRouter, cleanAvatarPath } from "./avatar-serving";
 
 beforeAll(async () => {
@@ -34,6 +38,7 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   await env.DB.prepare("DELETE FROM users").run();
+  await env.DB.prepare("DELETE FROM email_hash").run();
   // The avatars/ prefix of the shared bucket — the whole serving key space.
   let cursor: string | undefined;
   do {
@@ -335,6 +340,98 @@ describe("GET /avatar/{hash} (AvatarByEmailHash port)", () => {
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe("/assets/img/avatar_default.png");
     expect((await res.arrayBuffer()).byteLength).toBe(0);
+  });
+
+  it("resolves a saved hash through the table (the hit arm converges on the same frozen-settings redirect)", async () => {
+    // The route resolution is now LIVE against email_hash (migration 0055):
+    // the row saved by the write half resolves through GetEmailForHash, and
+    // at the frozen settings the final link converges on the default for ANY
+    // resolved email (generateEmailAvatarFinalLink arm 3) — the redirect
+    // shape is identical to the miss arm, per upstream at its own defaults.
+    const hash = await saveEmailHash(env.DB, "Hit@Example.COM");
+    const res = await serve(`/avatar/${hash}`);
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/assets/img/avatar_default.png");
+    expect(res.headers.get("cache-control")).toBe("private, max-age=300");
+    expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(await res.text()).toBe(`<a href="/assets/img/avatar_default.png">See Other</a>.\n\n`);
+  });
+
+  it("resolves an uppercased hash param through the ToLower normalization (avatar.go:59)", async () => {
+    const hash = await saveEmailHash(env.DB, "upper@example.com");
+    const res = await serve(`/avatar/${hash.toUpperCase()}`);
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/assets/img/avatar_default.png");
+  });
+
+  it("500s when the hash lookup fails (the ctx.ServerError arm, avatar.go:41-44)", async () => {
+    // GetEmailForHash propagates a D1 failure and the route answers the
+    // module header's plain-text 500. The table is renamed out for the probe
+    // and restored in the finally — the migration chain stays untouched.
+    await env.DB.prepare("ALTER TABLE email_hash RENAME TO email_hash_500_probe").run();
+    try {
+      const res = await serve(`/avatar/${"a".repeat(64)}`);
+      expect(res.status).toBe(500);
+      expect(await res.text()).toBe("server error\n");
+      expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+      expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    } finally {
+      await env.DB.prepare("ALTER TABLE email_hash_500_probe RENAME TO email_hash").run();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The email_hash registry (models/avatars/avatar.go lifecycle) — the write
+// half (saveEmailHash, avatar.go:72-86) and the read half (getEmailForHash,
+// avatar.go:58-69) behind the /avatar/{hash} resolver
+// ---------------------------------------------------------------------------
+
+describe("the email_hash registry (models/avatars/avatar.go lifecycle)", () => {
+  it("round-trips: saveEmailHash lowers/trims and getEmailForHash resolves the hash back", async () => {
+    const hash = await saveEmailHash(env.DB, "  User@Example.COM ");
+    expect(hash).toBe(await hashEmail("user@example.com")); // HashEmail over the lower+trimmed form
+    expect(hash).toMatch(/^[0-9a-f]{64}$/); // EncodeSha256 hex
+    await expect(getEmailForHash(env.DB, hash)).resolves.toBe("user@example.com");
+  });
+
+  it("writes the full row on first save (email lower+trim, hash, hash_type sha256)", async () => {
+    const hash = await saveEmailHash(env.DB, "Writer@Example.COM");
+    const rows = await db().select().from(emailHash).all();
+    expect(rows).toEqual([{ hash, email: "writer@example.com", hashType: "sha256" }]);
+  });
+
+  it("is idempotent per email and first-writer-wins per hash (the Exist-check skip, avatar.go:78-82)", async () => {
+    const hash = await saveEmailHash(env.DB, "first@example.com");
+    expect(await saveEmailHash(env.DB, "FIRST@example.com ")).toBe(hash);
+    expect(await db().select().from(emailHash).all()).toHaveLength(1);
+    // A pre-existing hash row is NOT rewritten by a later save — upstream
+    // checks Exist by hash alone and skips the insert.
+    await db().update(emailHash).set({ email: "tampered@example.com" }).where(eq(emailHash.hash, hash));
+    expect(await saveEmailHash(env.DB, "first@example.com")).toBe(hash);
+    expect((await db().select().from(emailHash).all())[0]?.email).toBe("tampered@example.com");
+  });
+
+  it("keeps the email_hashtype composite-unique shape — same email under two algorithms coexists", async () => {
+    const hash = await saveEmailHash(env.DB, "algo@example.com");
+    await db().insert(emailHash).values({ hash: "b".repeat(64), email: "algo@example.com", hashType: "blake2s" });
+    expect(await db().select().from(emailHash).all()).toHaveLength(2);
+    // The hash is the PK: a second row carrying it violates the key.
+    await expect(
+      db().insert(emailHash).values({ hash, email: "other@example.com", hashType: "blake2s" }),
+    ).rejects.toThrow();
+  });
+
+  it("answers a miss with '' — NOT an error (the !has arm, avatar.go:64-66)", async () => {
+    await expect(getEmailForHash(env.DB, "f".repeat(64))).resolves.toBe("");
+    // The param normalization (ToLower + TrimSpace, line 59) rides the miss too.
+    await expect(getEmailForHash(env.DB, `  ${"F".repeat(64)} `)).resolves.toBe("");
+  });
+
+  it("resolves through the param normalization: uppercased/spaced hash forms still find the row", async () => {
+    const hash = await saveEmailHash(env.DB, "case@example.com");
+    await expect(getEmailForHash(env.DB, hash.toUpperCase())).resolves.toBe("case@example.com");
+    await expect(getEmailForHash(env.DB, `  ${hash}  `)).resolves.toBe("case@example.com");
   });
 });
 

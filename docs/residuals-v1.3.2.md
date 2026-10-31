@@ -1049,9 +1049,26 @@ board row flips — this closes a flag, not a listed residual.
    original-position failure-frame mapping; the upstream chunked-frames
    fix remains desirable — ADR-0006's revisit trigger stays armed against
    cloudflare/workers-sdk#16349), git-over-HTTPS-only (ADR-0001), the
-   absent `email_hash` table, and no `/assets` fallback target. Recorded,
-   not re-sized; each is a future SPEC's call. Size: **S–L** depending on
-   which reopens.
+   absent `email_hash` table — **that arm RESOLVED in flight (2026-10-31,
+   uncommitted at write time)**: migration 0055 adds the table
+   (models/avatars/avatar.go:32-37's shape — `hash` PK, the
+   `(email, hash_type)` composite unique); services/avatars.ts lands both
+   lifecycle halves (saveEmailHash avatar.go:72-86 with the
+   insert-discard swallow, getEmailForHash avatar.go:58-69 — a Worker has
+   no process cache, so the D1 read IS the GetEmailForHash lookup); and
+   the `/avatar/{hash}` route (src/web/avatar-serving.ts) flips from the
+   hard-coded empty to the resolved arm, with the
+   `ctx.ServerError` plain-text 500 for lookup failures. At the frozen
+   picture settings the observable redirect is unchanged (hit and miss
+   converge on the default avatar — upstream is identical at its own
+   defaults), and the write path's production callers are upstream's
+   federated fast-link surfaces (avatar.go:122-130) — frozen off here, so
+   rows populate when those surfaces land (the ui avatar-by-email template
+   helper, the contributors graph). The v1.1/v1.2 release-note lines
+   carrying the old "resolves empty by design" wording are historical
+   records, left as written. Still carried: no `/assets` fallback target.
+   Recorded, not re-sized; each is a future SPEC's call. Size: **S–L**
+   depending on which reopens.
 
 7. **The serializer counts tail + the language side-store — the
    `last_login` half is IN FLIGHT via the store/schema wave; the

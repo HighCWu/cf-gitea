@@ -4547,3 +4547,37 @@ export const emailInbound = sqliteTable(
   },
   (table) => [uniqueIndex("email_inbound_dedupe_key_uq").on(table.dedupeKey)],
 );
+
+/**
+ * The email→hash registry that lets the public `/avatar/{hash}` route resolve
+ * a hash back to an email (migration 0055). Upstream `EmailHash`
+ * (models/avatars/avatar.go:32-37) — "keeps the email out of the rendered
+ * page": avatar links address emails by `HashEmail` (the gravatar-style hex
+ * sha256 over the lowercased, space-trimmed email, avatar.go:49-51) so pages
+ * never carry the address itself; the table is the only reversible half.
+ *
+ * Write path (avatar.go:72-86 saveEmailHash): link generation for an email
+ * (the `federated && !final` fast-link arm, avatar.go:122-130) inserts the
+ * pair behind an exist-check ("keeps a duplicate key error out of a
+ * transaction the caller may hold"), first writer wins on `hash`. Read path
+ * (avatar.go:58-69 GetEmailForHash): the route (routers/web/user/avatar.go:
+ * 38-47) looks the hash up; a miss answers "" and the route redirects to the
+ * default avatar. The port lives in services/avatars.ts (saveEmailHash /
+ * getEmailForHash).
+ *
+ * Column mapping (upstream xorm tags → here):
+ *   - `hash` — `pk varchar(64)`: the lowercase hex sha256 (64 chars), the
+ *     primary key (point lookups only).
+ *   - `email` / `hash_type` — the `UNIQUE(email_hashtype)` pair: the same
+ *     email under two hash algorithms may coexist ("so a later algorithm
+ *     change can tell old rows apart", avatar.go:30); `hash_type` is always
+ *     `sha256` today (avatar.go:80 writes the constant).
+ */
+export const emailHash = sqliteTable("email_hash", {
+  /** The HashEmail digest — lowercase hex sha256, the lookup key. */
+  hash: text("hash").primaryKey(),
+  /** The lowercased, space-trimmed email the hash was generated for. */
+  email: text("email").notNull(),
+  /** The digest algorithm (`sha256`, avatar.go:30 — never mutated today). */
+  hashType: text("hash_type").notNull(),
+}, (table) => [uniqueIndex("email_hash_email_hash_type_uq").on(table.email, table.hashType)]);

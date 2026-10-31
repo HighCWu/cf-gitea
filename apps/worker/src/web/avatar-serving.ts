@@ -249,14 +249,22 @@ avatarServingRouter.on(["GET", "HEAD"], "/avatars/*", async (c) => {
 
 // ---------------------------------------------------------------------------
 // GET /avatar/{hash} — the AvatarByEmailHash port (web.go:775,
-// routers/web/user/avatar.go:38-47): hash → email (services/avatars.ts
-// getEmailForHash — the email_hash table note lives there), size from the
-// form (FormInt, base_form.go:50 — error → 0), then the final-link
-// cacheable redirect.
+// routers/web/user/avatar.go:38-47): hash → email through the email_hash
+// table (services/avatars.ts getEmailForHash — the table landed, migration
+// 0055; a miss resolves "" per the upstream !has arm), size from the form
+// (FormInt, base_form.go:50 — error → 0), then the final-link cacheable
+// redirect. The D1-failure arm is upstream's ctx.ServerError
+// ("invalid avatar hash: "+hash, avatar.go:41-44) → the module header's
+// plain-text 500.
 // ---------------------------------------------------------------------------
 
 avatarServingRouter.on(["GET", "HEAD"], "/avatar/:hash", async (c) => {
-  const email = getEmailForHash(c.req.param("hash"));
+  let email: string;
+  try {
+    email = await getEmailForHash(c.env.DB, c.req.param("hash"));
+  } catch {
+    return textError(500, "server error"); // ctx.ServerError("invalid avatar hash: "+hash, err)
+  }
   const size = atoiPort(c.req.query("size") ?? "");
   const location = await generateEmailAvatarFinalLink(email, size);
   return cacheableRedirect(location, c.req.method === "HEAD");

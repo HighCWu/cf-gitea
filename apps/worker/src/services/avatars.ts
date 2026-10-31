@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { users } from "../db/schema";
+import { emailHash, users } from "../db/schema";
 import { renderIdenticonPng } from "./avatar-identicon";
 
 /**
@@ -393,6 +393,9 @@ export async function avatarExists(bucket: R2Bucket, target: AvatarTarget): Prom
 // models/user/avatar.go + routers/web/user/avatar.go over the frozen
 // picture settings. All functions here are storage/D1-parametric like the
 // write half above; the HTTP seam lives in src/web/avatar-serving.ts.
+// The email_hash registry (migration 0055, schema.ts) landed with this
+// module: saveEmailHash is the write half, getEmailForHash the read half —
+// both per the models/avatars/avatar.go lifecycle documented below.
 // ---------------------------------------------------------------------------
 
 /**
@@ -492,10 +495,11 @@ function generateSourceAvatarURL(source: URL, emailHash: string, size: number): 
  *
  * The email HASH table note: upstream reaches arm 3/4 with the email
  * resolved from the hash via the `email_hash` table (GetEmailForHash,
- * below) — cf-gitea's schema has no such table (owned by schema.ts +
- * migrations, outside this wave), so the resolved email is always "" and
- * arm 1 fires; at the frozen settings arms 3 and 4 converge on the same
- * default link for ANY email, so the observable behavior is identical.
+ * below) — the table landed (migration 0055, schema.ts) and the route
+ * resolves through it now; a miss still answers "" (the upstream !has arm)
+ * and fires arm 1. At the frozen settings arms 3 and 4 converge on the same
+ * default link for ANY resolved email, so the observable redirect is
+ * identical for hit and miss alike.
  */
 export async function generateEmailAvatarFinalLink(email: string, size: number): Promise<string> {
   const trimmed = email.trim();
@@ -508,25 +512,77 @@ export async function generateEmailAvatarFinalLink(email: string, size: number):
   return generateSourceAvatarURL(new URL(GRAVATAR_SOURCE), await hashEmail(trimmed), size);
 }
 
+/** emailHashType (models/avatars/avatar.go:30) — "so a later algorithm
+ * change can tell old rows apart"; the only value written today. */
+export const EMAIL_HASH_TYPE = "sha256";
+
 /**
- * GetEmailForHash (models/avatars/avatar.go:58-69): normalize the hash the
+ * GetEmailForHash (models/avatars/avatar.go:58-69) — the `/avatar/{hash}`
+ * route's resolver (routers/web/user/avatar.go:40): normalize the hash the
  * same way upstream does (ToLower + TrimSpace, line 59), then reverse it
- * through the `email_hash` table (line 60-68). cf-gitea's schema has no
- * email_hash table (see generateEmailAvatarFinalLink) — the lookup hits the
- * "not has" arm (line 64-66) and returns "", the only reachable state until
- * that table lands in a migration owned by the schema wave. The
- * normalization is kept verbatim so the function is drop-in compatible when
- * the table exists.
+ * through the `email_hash` table (line 60-68). Upstream wraps the lookup in
+ * `cache.GetString(emailHashCacheKey(hash), ...)` — a process-lifetime
+ * memoization; a Worker isolate has no cross-request cache to serve, and the
+ * memoization is a perf layer, not semantics, so the D1 read IS the lookup.
+ * A miss is NOT an error: the !has arm (line 64-66) returns "" and the route
+ * redirects to the default avatar. A D1 failure propagates — the route's
+ * `ctx.ServerError("invalid avatar hash: "+hash, err)` arm (avatar.go:41-44).
  */
-export function getEmailForHash(hash: string): string {
+export async function getEmailForHash(d1: D1Database, hash: string): Promise<string> {
   const normalized = hash.toLowerCase().trim(); // line 59, verbatim
-  if (normalized !== "") {
-    // The email_hash read (line 60-68) plugs in HERE — cf-gitea has no
-    // email_hash table until a schema-wave migration adds one, so every
-    // lookup lands on the !has arm (line 64-66) and resolves empty.
-    return "";
+  const rows = await drizzle(d1)
+    .select({ email: emailHash.email })
+    .from(emailHash)
+    .where(eq(emailHash.hash, normalized))
+    .limit(1);
+  return rows[0]?.email ?? ""; // the !has arm (line 64-66)
+}
+
+/**
+ * saveEmailHash (models/avatars/avatar.go:72-86) — the write half of the
+ * registry, upstream's only email_hash writer. Called from link generation
+ * for an email — the `federated && !final` fast-link arm of
+ * generateEmailAvatarLink (line 122-130, GenerateEmailAvatarFastLink's
+ * callers: models/user/avatar.go:78, modules/templates/util_avatar.go:72,
+ * services/repository/contributors_graph.go:237) — so every rendered
+ * `/avatar/<hash>` link has its resolution row ready before any browser
+ * dereferences it. Lifecycle, per the pin:
+ *
+ *   1. lower + trim the email (line 73) and HashEmail it (line 74);
+ *   2. upstream keys the whole body under
+ *      `cache.GetString(SafeCacheKey("AvatarStored", hash), ...)` — on a
+ *      cache miss: the Exist check ("keeps a duplicate key error out of a
+ *      transaction the caller may hold", line 77-78), then the Insert
+ *      (line 80) — first writer wins on `hash`;
+ *   3. `cache.Remove(emailHashCacheKey(hash))` after the insert (line 81) —
+ *      "a lookup may have cached it as unknown"; with no read-side process
+ *      cache (see getEmailForHash) the next lookup re-reads D1 and sees the
+ *      row, so the eviction is structurally unnecessary here;
+ *   4. the whole getter's error is discarded at the call site (`_, _ =`,
+ *      line 76): "an error must leave the hash unmarked" (line 83) — a
+ *      failed insert never breaks link generation, the hash is returned
+ *      regardless, and the next call retries (no cache key was set). The
+ *      try/catch below IS that discard.
+ */
+export async function saveEmailHash(d1: D1Database, email: string): Promise<string> {
+  const lowerEmail = email.toLowerCase().trim(); // line 73
+  const hash = await hashEmail(lowerEmail); // line 74 — HashEmail over the same normal form
+  try {
+    const existing = await drizzle(d1)
+      .select({ hash: emailHash.hash })
+      .from(emailHash)
+      .where(eq(emailHash.hash, hash))
+      .limit(1);
+    if (existing.length === 0) {
+      // line 80 — a plain insert: the (hash) PK and the (email, hash_type)
+      // UNIQUE both arbitrate the check-then-insert race, and the violated
+      // insert is swallowed like upstream's (the winner's row stands).
+      await drizzle(d1).insert(emailHash).values({ hash, email: lowerEmail, hashType: EMAIL_HASH_TYPE });
+    }
+  } catch {
+    // line 76's `_, _ =` — the discard; the hash is still returned.
   }
-  return "";
+  return hash;
 }
 
 /** The AvatarLinkWithSize user slice (the columns the chain reads). */
