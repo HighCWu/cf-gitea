@@ -911,6 +911,26 @@ the shared index.
   in-use count + the button-list read), `services/auth-sources/cfg.ts`
   (the versioned codec), tests. Gates: store/codec suites green, tsc 0,
   eslint clean, migration output = the one new file.
+
+  **As-built (2026-10-31, migration 0056):** all of the above landed, plus
+  the provider-registry skeleton (`services/auth-sources/registry.ts`) —
+  the §2.3 lattice as data (17 entries, three executable), pulled forward
+  from W3's "registry table module" by dispatch; W3 adds the client
+  modules against it, it is data-only. Suites:
+  `cfg.test.ts` (16) + `store.test.ts` (20, includes the 0056
+  structure arms + the migration-apply) + `registry.test.ts` (6) — 42/42.
+  Deviations/clarifications recorded: (a) the §4.2 sketch omits
+  `externalIdClaim` but §5.4/§6.3 carry it — the codec has it,
+  OIDC-only, optional; (b) upstream also indexes
+  `created_unix`/`updated_unix` (xorm INDEX, source.go:123-124) — NOT
+  carried (every reader orders by `name`; the §4.1 sketch's deliberate
+  drop, now explicit); (c) github's four custom-URL default VALUES are
+  goth v1.82.0's (gitea/go.mod:60), verified from the goth source
+  (providers/github/github.go package vars) — the strings are not in the
+  gitea tree (goth is an external module); (d) `GetSourceByID`'s id-0
+  Plain synthesis is not ported (no v1 consumer — the module header
+  records it); (e) the store's is_sync_enabled forcing ports the CODE of
+  source.go:225-228 (LDAP+OAuth2 sync-capable), not its comment.
 - **W2 — the OIDC client flow** (depends W1; size **L**). Owns:
   `services/auth-sources/oidc-client.ts` (discovery fetch/parse,
   authorize URL, code exchange, id_token verify over the landed

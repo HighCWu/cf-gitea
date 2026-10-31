@@ -1920,6 +1920,17 @@ export const sessions = sqliteTable(
      *  session is the security property (a captured consent page is useless
      *  after logout/session rotation). */
     oauthState: text("oauth_state"),
+    /** External-auth dance state (specs/external-auth-sources.md §4.4):
+     *  JSON {sourceId, provider, expectedState, nonce?, externalId, email,
+     *   name, nickName, avatarUrl, returnTo} — parked at the
+     *  /user/oauth2/{source} redirect, read-and-cleared at the callback;
+     *  NULL otherwise. Same pattern as `oauth_state` above (the provider
+     *  SPEC §2.2), the CLIENT side of the dance: the state lives in the D1
+     *  session row, not a cookie — no MaxTokenLength cookie-size trap
+     *  (upstream parks the goth user in the cookie session store,
+     *  modules/setting/oauth2.go:110). Bounded at write (SPEC §7.6, 8 KiB
+     *  hard cap; identity fields never truncate). */
+    oauth2LoginState: text("oauth2_login_state"),
   },
   (t) => [
     index("sessions_user_idx").on(t.userId),
@@ -4581,3 +4592,119 @@ export const emailHash = sqliteTable("email_hash", {
   /** The digest algorithm (`sha256`, avatar.go:30 — never mutated today). */
   hashType: text("hash_type").notNull(),
 }, (table) => [uniqueIndex("email_hash_email_hash_type_uq").on(table.email, table.hashType)]);
+
+// ---------------------------------------------------------------------------
+// SPEC: external-auth-sources §4 — the login_source model (migration 0056):
+// one external login chain per row (upstream "an external way for
+// authorizing users", models/auth/source.go:109), plus the external identity
+// join (models/user/external_login_user.go:50). v1 persists ONLY type 6
+// (OAuth2); the int type lattice stays so future types never migrate.
+// ---------------------------------------------------------------------------
+
+/**
+ * Upstream `login_source` (models/auth/source.go:109-126) — one external
+ * login chain. `type` keeps upstream's int lattice (NoType 0 … SSPI 7,
+ * source.go:28-37, append-only for wire compatibility) so future types
+ * never migrate; only OAuth2 (6) persists in v1 (SPEC §3.5's adjudication:
+ * LDAP/SMTP deferred, PAM/SSPI platform-impossible, Plain is not a source).
+ *
+ * Column mapping (xorm tags → here): `name` UNIQUE carries the URL token
+ * duty — the login buttons and the IdP-registered callback both encode it
+ * (SPEC §5.2); `is_active`/`is_sync_enabled` are `INDEX NOT NULL DEFAULT
+ * false` upstream; `two_factor_policy` `NOT NULL DEFAULT ''` (an inert slot
+ * until 2FA lands — TwoFactorShouldSkip reads "skip", source.go:212-214);
+ * `cfg` is the TEXT JSON typed config record (services/auth-sources/cfg.ts
+ * for type 6). Upstream also indexes `created_unix`/`updated_unix` (xorm
+ * INDEX created/updated, :123-124) — NOT carried: every reader here orders
+ * by `name` (FindSourcesOptions.ToOrders, :274) and no query filters on
+ * time; the SPEC §4.1 sketch drops them deliberately (D1 index writes are
+ * not free and the upstream indexes serve no landed read).
+ */
+export const loginSources = sqliteTable("login_source", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  /** 6 only in v1 (auth.OAuth2); the lattice stays int for re-pin stability. */
+  type: integer("type").notNull(),
+  /** UNIQUE — the login-button/callback URL token (SPEC §5.2); renaming a
+   *  source invalidates the IdP-side redirect registration (upstream lives
+   *  with the same coupling). */
+  name: text("name").notNull(),
+  /** Inactive sources never render a button nor resolve a sign-in
+   *  (GetActiveOAuth2SourceByAuthName, models/auth/oauth2.go:664-677). */
+  isActive: integer("is_active", { mode: "boolean" }).notNull().default(false),
+  /** Inert in v1 (no sync engine); upstream forces it false at CreateSource
+   *  for every type except LDAP and OAuth2 (source.go:225-228). */
+  isSyncEnabled: integer("is_sync_enabled", { mode: "boolean" }).notNull().default(false),
+  /** Inert slot — no 2FA landed (source.go:116; "skip" semantics at
+   *  :212-214). */
+  twoFactorPolicy: text("two_factor_policy").notNull().default(""),
+  /** The typed config record, JSON — the cfg codec (services/auth-sources/
+   *  cfg.ts) owns the versioned shape for type 6 (SPEC §4.2). */
+  cfg: text("cfg").notNull(),
+  createdAt: integer("created_unix", { mode: "timestamp" }).notNull(),
+  updatedAt: integer("updated_unix", { mode: "timestamp" }).notNull(),
+}, (t) => [
+  uniqueIndex("login_source_name_uq").on(t.name),
+  index("login_source_is_active_idx").on(t.isActive),
+]);
+
+/**
+ * Upstream `external_login_user` (models/user/external_login_user.go:50-70)
+ * — the external-identity join: one row per (source, foreign subject).
+ * Composite PK exactly upstream (:51 `ExternalID` pk, :53 `LoginSourceID`
+ * pk); `user_id` and `provider` carry upstream's INDEX tags (:52, :57 —
+ * `provider` is VARCHAR(25) upstream; SQLite text doesn't enforce length
+ * and the value is the goth registry key).
+ *
+ * Divergences, all SPEC §4.3-recorded: `raw_data` (upstream stores the full
+ * goth payload, :53 TEXT JSON) is DROPPED — v1 persists the bounded profile
+ * fields only (§7.6); the provider-token columns are carried for re-pin
+ * parity but v1 WRITES THEM EMPTY (§7.8 — nothing consumes them until the
+ * sync engine lands; unused secrets are not stored); NO
+ * `users.login_type/login_source/login_name` columns — the OAuth2-only v1
+ * resolves through this join (upstream itself falls through to it,
+ * routers/web/auth/oauth.go:504-521), and the password-source columns are a
+ * recorded future addition. The two ON DELETE CASCADEs are the
+ * substrate-honest safety net for direct-delete paths (upstream declares no
+ * FKs; its admin delete arm refuses in-use sources first — ErrSourceInUse,
+ * source.go:389-402 — and user deletion sweeps links via
+ * RemoveAllAccountLinks, external_login_user.go:119-124; the store keeps
+ * both observable behaviors).
+ */
+export const externalLoginUsers = sqliteTable("external_login_user", {
+  /** The foreign subject id, as the IdP asserts it (OIDC `sub`/configured
+   *  claim, GitHub numeric id). Composite PK half 1. */
+  externalId: text("external_id").notNull(),
+  /** The login_source row the identity arrived through; cascade-deleted
+   *  with it (the direct-delete safety net; the admin arm still refuses
+   *  in-use sources first — SPEC §6.1). */
+  loginSourceId: integer("login_source_id").notNull()
+    .references(() => loginSources.id, { onDelete: "cascade" }),
+  /** The linked local account; cascade-deleted with the user row (the
+   *  RemoveAllAccountLinks sweep's substrate form). */
+  userId: integer("user_id").notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  /** The goth provider key (`openidConnect`/`github`/`gplus`) — survives
+   *  source renames; the provider-keyed lookup reads it
+   *  (GetUserIDByExternalUserID, external_login_user.go:131-141). */
+  provider: text("provider").notNull(),
+  // Bounded profile snapshot (SPEC §7.6) — never the raw goth payload.
+  email: text("email"),
+  name: text("name"),
+  nickName: text("nick_name"),
+  avatarUrl: text("avatar_url"),
+  location: text("location"),
+  description: text("description"),
+  firstName: text("first_name"),
+  lastName: text("last_name"),
+  // Token fields: columns carried for re-pin parity, v1 writes EMPTY
+  // (SPEC §7.8) — the sync arm's landing is a code change, not a migration.
+  accessToken: text("access_token"),
+  accessTokenSecret: text("access_token_secret"),
+  refreshToken: text("refresh_token"),
+  /** The provider token's expiry; NULL while tokens are unwritten. */
+  expiresAt: integer("expires_at", { mode: "timestamp" }),
+}, (t) => [
+  primaryKey({ columns: [t.externalId, t.loginSourceId] }),
+  index("external_login_user_user_id_idx").on(t.userId),
+  index("external_login_user_provider_idx").on(t.provider),
+]);
