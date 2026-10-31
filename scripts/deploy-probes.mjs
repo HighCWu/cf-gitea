@@ -333,6 +333,37 @@
  *                  posture — one red family never hides the others; every arm
  *                  self-contains its family). A red run sweeps the uploaded
  *                  versions' rows + the repo (the failureTail).
+ *   auth-oauth2    The OAuth2 provider's W6 battery + the external-auth §8
+ *                  tail over one scripted THIRD-PARTY client: the app
+ *                  registration via the user API (the client secret renders
+ *                  exactly once), the login session, the authorize dance's
+ *                  consent path with in-script PKCE S256 (the consent page's
+ *                  hidden fields parsed and POSTed granted=true), the token
+ *                  exchange with FORM credentials, dance 2 on the
+ *                  AUTO-CONSENT arm exchanged with the Basic header, the
+ *                  dotted dispatch (GET /api/v1/user with the Bearer JWT),
+ *                  userinfo (+ the PAT-401 negative), the OFFLINE JWKS
+ *                  verify (WebCrypto in-script over BOTH the access token
+ *                  and the id_token; the claims pin iss/aud/sub/nonce/
+ *                  email_verified), the refresh grant, introspection
+ *                  (active shape + {"active":false} junk + the 401
+ *                  challenge), the REVOKE-KILLS-TOKEN arm (the oauth2_grant
+ *                  row deleted via wrangler d1 — the counter==1
+ *                  no-rotation pin first; W5's revoke POST is not landed),
+ *                  the app DELETE + the D1 husk sweep. The posture
+ *                  families: the realm check (a private repo's anonymous
+ *                  info/refs 401 carries `Basic realm="Gitea"` EXACTLY —
+ *                  the §2.11 provider-default-on flip), the discovery shape
+ *                  (13 alphabetical members, issuer/endpoints off ONE base,
+ *                  issuer == fetch origin on a deployed target), the
+ *                  builtin-seed read (the five uid=0 applications), and the
+ *                  external-auth source family (an ACTIVE type-6 OIDC
+ *                  login_source row seeded via D1 — the login page renders
+ *                  its button, an unknown source 404s; the flow legs stay in
+ *                  the landed suites' stub-IdP coverage). INDEPENDENT (the
+ *                  fixwave/distro posture — every family its own verdict).
+ *                  A red run sweeps the grant rows (D1), the app, the realm
+ *                  repo, and the source row (the failureTail).
  *   cleanup-audit  The post-run D1 count shapes (wrangler d1 execute; see the
  *                  audit SQL below for the exact tables).
  *   all            Every battery in the order above (audit last).
@@ -418,7 +449,7 @@
  * This file deliberately does NOT touch docs/design/p0-evidence.md (it is
  * REDEPLOY14's in-flight document); the conventions note lives here.
  */
-/* global fetch, AbortSignal, URLSearchParams, URL -- Web globals provided by Node >= 22 (no node: module exports them) */
+/* global crypto, fetch, AbortSignal, URLSearchParams, URL -- Web globals provided by Node >= 22 (no node: module exports them) */
 import { execFile } from "node:child_process";
 import console from "node:console";
 import { createHash, randomUUID } from "node:crypto";
@@ -437,7 +468,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerDir = path.join(repoRoot, "apps", "worker");
 const DEFAULT_USER = "p0probe";
-const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "packages-protocols", "packages-minor", "cleanup-audit", "all"];
+const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "packages-protocols", "packages-minor", "auth-oauth2", "cleanup-audit", "all"];
 /** Batteries that make NO HTTP calls (they read D1 via wrangler only):
  *  --base-url and --token-file are OPTIONAL for these (REDEPLOY15 friction
  *  (a): the D1-only audit still demanded a PAT, forcing a scratch-mint +
@@ -533,6 +564,7 @@ const usage = () =>
   "  packages-registry: (no extra options — the row-cleanup arm reuses --d1-scope and needs wrangler auth, the fixwave precedent)\n" +
   "  packages-distro: (no extra options — the husk row-cleanup arm reuses --d1-scope and needs wrangler auth, the packages-registry precedent; the internal _rpm/_arch rows + keypair are standing owner infrastructure)\n" +
   "  packages-protocols: (no extra options — the go/cargo REAL-CLIENT arms degrade to a [warn] when the toolchain is off the probe host; the cargo client rides an in-script header-stripping proxy on plain-HTTP targets; the husk row-cleanup arm reuses --d1-scope and needs wrangler auth)\n" +
+  "  auth-oauth2:   (no extra options — needs wrangler auth for the D1 arms: the builtin-seed read, the revoke row delete, the husk sweep, and the external-auth source seed/cleanup; --d1-scope picks the database, keep it in step with --base-url — the discovery arm's issuer==origin assert keys off it)\n" +
   "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (2 — the standing bootstrap set)\n" +
   "  any battery:   --force-red <check-id>    (self-test: force that check red UNRUN — exercises the failure-tail sweep; an unmatched id warns)";
 
@@ -6512,6 +6544,697 @@ const packagesMinorSteps = (ctx) => {
   ];
 };
 
+// ---------- battery: auth-oauth2 (the OAuth2 provider + external-auth W6 battery) ----------
+
+/**
+ * specs/oauth2-provider.md §5's live battery arm (the W6 wave) plus the
+ * external-auth-sources.md §8 tail, over the two landed auth surfaces — a
+ * scripted THIRD-PARTY client drives the provider end-to-end the way
+ * packages-protocols drives the package protocols: real protocol bytes, no
+ * in-repo test seams.
+ *
+ * The provider family (arms 1-12): the client registration via
+ * POST /api/v1/user/applications/oauth2 (confidential, one loopback
+ * redirect_uri — the client secret renders EXACTLY ONCE there), the login
+ * session (the ui-login methodology — the consent dance rides a SESSION, a
+ * PAT header never reads a UI page), the authorize dance's CONSENT path
+ * (PKCE S256 generated in-script; the consent page's hidden form fields are
+ * PARSED and POSTed granted=true), the token exchange with FORM credentials,
+ * then dance 2 riding the AUTO-CONSENT arm (confidential client + existing
+ * grant + unchanged scope → 303, NO consent page) exchanged with the
+ * RFC 6749 §2.3.1 Basic header. From the mint: the dotted dispatch
+ * (GET /api/v1/user with the Bearer JWT through the landed apiScopeGate),
+ * userinfo (plus the PAT-is-not-an-OAuth2-token 401 negative), the OFFLINE
+ * JWKS verify (GET /login/oauth/keys; the access token AND the id_token
+ * verify with WebCrypto in-script; the id_token claims pin iss/aud/sub/
+ * nonce/email_verified), the refresh grant (plus the refreshed credential
+ * authenticating userinfo), introspection (active shape + {"active":false}
+ * junk + the 401 Basic challenge), and THE REVOKE-KILLS-TOKEN arm — the
+ * revocation rides the UI when W5's settings revoke POST answers (the spec
+ * §5 arm's own wording) and falls back to the documented D1 store delete
+ * (upstream RevokeOAuth2Grant's own state change) when it does not: the
+ * grant row reads back with counter 1 (the no-default-rotation posture the
+ * refresh arm exercised), dies through whichever channel, and the
+ * OUTSTANDING access token 401s on the API and introspects inactive — the
+ * token is a POINTER to the grant row. Cleanup: the application DELETE 204
+ * (the FKs cascade) and the D1 husk sweep with the zero-rows assert.
+ *
+ * The posture families: the REALM check (one private auto_init probe repo;
+ * an anonymous info/refs 401 carries `Basic realm="Gitea"` EXACTLY — the
+ * §2.11 flip, the provider-default-on posture that feeds GCM's builtin-app
+ * flow), the DISCOVERY SHAPE (the 13 members alphabetical, the Go map
+ * marshal; issuer/endpoints off ONE base; on a deployed target
+ * (`--d1-scope remote`, the toolkit's base-url signal) that base MUST equal
+ * the fetch origin — locally the wrangler.jsonc APP_URL pin is the
+ * documented warn), the BUILTIN SEED (the five uid=0 applications migration
+ * 0052 seeded — the rows that make the realm flip meaningful), and the
+ * EXTERNAL-AUTH SOURCE family (specs/external-auth-sources.md §8's cheap
+ * posture: an ACTIVE type-6 OIDC login_source row seeded via D1 — there is
+ * no IdP on a deployment, so the flow legs stay in the landed suites'
+ * stub-IdP coverage — whose button renders on the anonymous /login, while
+ * an unknown source name 404s; the row then deletes clean).
+ *
+ * INDEPENDENT (the fixwave/distro posture): every family reports its own
+ * verdict — a red family never hides the others; dance-dependent arms guard
+ * with pointed "fixture missing" fails (the fixwave shape). Needs wrangler
+ * auth for the D1 arms (the builtin-seed read, the revoke row delete, the
+ * husk sweep, the source seed/cleanup; --d1-scope picks the database — keep
+ * it in step with --base-url). A green run leaves NOTHING behind (the app,
+ * its grant/codes, the realm repo, and the source row all sweep in-chain —
+ * cleanup-audit needs no new expectations); a red run sweeps exactly what
+ * survived (the failureTail: the grant rows D1-first, the app, the realm
+ * repo, the source row).
+ */
+
+const oauth2Context = () => ({
+  user: opts.user,
+  appName: `probe-oauth2-${hexId()}`,
+  redirectUri: "http://127.0.0.1/probe/oauth/callback",
+  scope: "openid profile email read:user",
+  state1: `st-${hexId(10)}`, state2: `st-${hexId(10)}`,
+  nonce1: `no-${hexId(10)}`, nonce2: `no-${hexId(10)}`,
+  // The registration (the create arm marks created; the cleanup arm the gone).
+  appId: null, clientId: null, clientSecret: null, appCreated: false, appGone: false,
+  // The session + the dance.
+  sessionCookie: null, danceLog: [], code1: null,
+  // The mints + the resolved doer.
+  tokens: null, tokensBasic: null, refreshed: null, userId: null,
+  // The discovery doc's issuer (the jwks arm's iss pin rides it).
+  discIssuer: null,
+  // The revoke arm's D1 reads.
+  grantRowId: null, rowsSwept: false,
+  // The realm family's private repo (created AND deleted inside its arm).
+  realmRepo: `auth-${hexId()}`, realmRepoCreated: false, realmRepoFullName: null, realmRepoGone: false,
+  // The external-auth family's source row (the ext cleanup arms mark deleted).
+  sourceName: `probe-oidc-${hexId(8)}`, sourceSeeded: false, sourceDeleted: false,
+  tmp: null,
+});
+
+/** Unverified JWS payload reader — the SIGNATURE reads are the JWKS arm's
+ *  WebCrypto verifies; these shapes feed the refresh/revoke arms (the iat
+ *  ordering + the same-second mint note). */
+const claimsOfJwt = (jwt) => JSON.parse(Buffer.from(jwt.split(".")[1], "base64url").toString("utf8"));
+
+/** alg → WebCrypto hash for the offline verify (the RS/ES families; the oct
+ *  family never reaches it — no public material is published). */
+const OAUTH2_ALG_HASH = { RS256: "SHA-256", RS384: "SHA-384", RS512: "SHA-512", ES256: "SHA-256", ES384: "SHA-384", ES512: "SHA-512" };
+
+/** Verify one compact JWS against a published JWK with WebCrypto (the
+ *  spec §5 battery arm's "offline" half). RSA → RSASSA-PKCS1-v1_5, EC →
+ *  ECDSA over the JWK's curve; `null` = the key family publishes no
+ *  verifiable public material (oct). */
+const verifyJwkOffline = async (jwk, token) => {
+  const [h, p, s] = token.split(".");
+  const signed = Buffer.from(`${h}.${p}`, "ascii");
+  const sig = Buffer.from(s, "base64url");
+  const hash = OAUTH2_ALG_HASH[jwk.alg];
+  if (jwk.kty === "RSA") {
+    const key = await crypto.subtle.importKey("jwk", { kty: "RSA", n: jwk.n, e: jwk.e, alg: jwk.alg }, { name: "RSASSA-PKCS1-v1_5", hash }, false, ["verify"]);
+    return await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, sig, signed);
+  }
+  if (jwk.kty === "EC") {
+    const key = await crypto.subtle.importKey("jwk", { kty: "EC", crv: jwk.crv, x: jwk.x, y: jwk.y }, { name: "ECDSA", namedCurve: jwk.crv }, false, ["verify"]);
+    return await crypto.subtle.verify({ name: "ECDSA", hash }, key, sig, signed);
+  }
+  return null;
+};
+
+/** The consent page's hidden-input reader — the scripted client parses the
+ *  form it was shown (the fields echo the request upstream stashed on the
+ *  session row). The golden's exact shape: `<input type="hidden" name="x"
+ *  value="y"/>`. */
+const hiddenValue = (html, name) => {
+  const m = html.match(new RegExp(`name="${name}" value="([^"]*)"`));
+  return m === null ? null : m[1];
+};
+
+/** A urlencoded POST to the WEB surface (not /api/v1): optional session
+ *  cookie, same-origin Origin header (§2.8's sameOriginGuard PASS arm),
+ *  RFC 6749 §2.3.1 Basic client auth. */
+const postForm = async (urlPath, params, { cookie, basic, origin } = {}) => {
+  const headers = { "content-type": "application/x-www-form-urlencoded" };
+  if (cookie) headers.cookie = cookie;
+  if (origin) headers.origin = origin;
+  if (basic) headers.authorization = `Basic ${Buffer.from(`${basic.user}:${basic.pass}`).toString("base64")}`;
+  const res = await fetchT(`${opts.baseUrl}${urlPath}`, { method: "POST", headers, body: new URLSearchParams(params).toString() });
+  const text = await res.text();
+  return { status: res.status, text, location: res.headers.get("location"), headers: res.headers };
+};
+
+/** One fresh PKCE S256 pair (RFC 7636 §4.1: verifier = 32 random bytes
+ *  base64url, challenge = BASE64URL(SHA256(ASCII(verifier)))). */
+const pkcePair = () => {
+  const verifier = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
+  return { verifier, challenge: createHash("sha256").update(verifier, "ascii").digest("base64url") };
+};
+
+/** The authorize-request query (the AuthorizationForm field names). */
+const authorizeQuery = (ctx, state, nonce, pair) => new URLSearchParams({
+  response_type: "code", client_id: ctx.clientId, redirect_uri: ctx.redirectUri,
+  state, scope: ctx.scope, nonce,
+  code_challenge_method: "S256", code_challenge: pair.challenge,
+});
+
+const oauth2Steps = (ctx) => [
+  {
+    id: "oauth2-app-create-201",
+    expect: `THE CLIENT REGISTRATION: POST /api/v1/user/applications/oauth2 {"name":"${ctx.appName}","redirect_uris":["${ctx.redirectUri}"],"confidential_client":true} → 201 with the client_id and the client secret rendered EXACTLY ONCE (the app.go contract; the secret is scrubbed from all output)`,
+    run: async () => {
+      const res = await api("/user/applications/oauth2", {
+        method: "POST",
+        body: { name: ctx.appName, redirect_uris: [ctx.redirectUri], confidential_client: true },
+      });
+      expect(res.status === 201, `status ${res.status} (expected 201): ${res.text.slice(0, 160)}`);
+      const body = res.json;
+      expect(typeof body.client_id === "string" && body.client_id.length > 0, "no client_id in the create body");
+      expect(typeof body.client_secret === "string" && body.client_secret.length > 0, "the client secret did NOT render in the create body (the exactly-once contract)");
+      expect(body.confidential_client === true && Array.isArray(body.redirect_uris) && body.redirect_uris[0] === ctx.redirectUri,
+        `echo shape confidential_client=${body.confidential_client} redirect_uris=${JSON.stringify(body.redirect_uris)}`);
+      const id = Number(body.id);
+      expect(Number.isInteger(id) && id > 0, `application id ${body.id} is not a positive integer`);
+      ctx.appId = id;
+      ctx.clientId = body.client_id;
+      ctx.clientSecret = body.client_secret;
+      ctx.appCreated = true; // the failure tail deletes it if a later arm reds
+      secrets.push(body.client_secret);
+      return `registered client ${body.client_id.slice(0, 8)}… (app id ${id}; secret shown once)`;
+    },
+  },
+  {
+    id: "oauth2-login-cookie",
+    expect: `POST /login (form-urlencoded user_name + password=<PAT>) → 303 + gitea_session cookie — the ui-login methodology (a PAT header never reads a UI page; the consent dance rides the SESSION row's oauth_state seam; the value is scrubbed from all output)`,
+    run: async () => {
+      const form = new URLSearchParams({ user_name: ctx.user, password: TOKEN });
+      const res = await fetchT(`${opts.baseUrl}/login`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: form.toString(),
+      });
+      await res.text();
+      expect(res.status === 303, `status ${res.status} (expected 303 See Other)`);
+      const setCookie = res.headers.getSetCookie().find((c) => c.startsWith("gitea_session="));
+      expect(setCookie !== undefined, `no gitea_session cookie in Set-Cookie (got ${res.headers.getSetCookie().length} cookies)`);
+      ctx.sessionCookie = setCookie.split(";")[0];
+      secrets.push(ctx.sessionCookie.split("=")[1] ?? "");
+      return "303 + gitea_session cookie";
+    },
+  },
+  {
+    id: "oauth2-builtins-seeded",
+    expect: `the five seeded BUILTIN applications (§2.9 — migration 0052's INSERT OR IGNORE, uid=0, confidential_client=0, the empty stored secret) present in D1 (wrangler d1 --${opts.d1Scope}; needs wrangler auth): git-credential-oauth / Git Credential Manager / tea / Gitea App / gitea-vscode — the rows that make the realm flip meaningful (GCM's builtin-app flow)`,
+    run: async () => {
+      const parsed = await d1Exec(`SELECT name FROM oauth2_application WHERE uid = 0`);
+      const names = new Set((parsed.at(-1)?.results ?? []).map((r) => r.name));
+      const want = ["git-credential-oauth", "Git Credential Manager", "tea", "Gitea App", "gitea-vscode"];
+      const missing = want.filter((n) => !names.has(n));
+      expect(missing.length === 0, `builtin applications missing from D1: ${missing.join(", ")} (found: ${[...names].join(", ") || "none"})`);
+      return `all five present (${want.length} uid=0 rows)`;
+    },
+  },
+  {
+    id: "oauth2-wellknown-shape",
+    expect: `THE DISCOVERY SHAPE (reads the mount state AT RUN TIME — the window2/window3 convention): GET /.well-known/openid-configuration → 200 application/json;charset=utf-8; the 13 top-level members ALPHABETICAL (the Go map marshal), issuer + every endpoint absolute off ONE base (the AppURL source — on a deployed target (--d1-scope remote) that base MUST equal the fetch origin, openid-connect-discovery §4; locally the wrangler.jsonc APP_URL pin is the documented warn), response_types ["code"], grant_types ["authorization_code","refresh_token"], code_challenge_methods ["plain","S256"], scopes the four general scopes, subject ["public"], exactly ONE advertised alg, the claims list carrying groups/email_verified; a 404 is the documented [warn] degradation — the W4 module's MOUNT HANDOFF (web/oauth2-wellknown.ts exports oauth2WellKnownRouter) not yet executed in the shared index, or the OAUTH2_ENABLED gate answering its self-404 (the two are told apart by body)`,
+    run: async () => {
+      const res = await fetchT(`${opts.baseUrl}/.well-known/openid-configuration`);
+      const text = await res.text();
+      if (res.status === 404) {
+        if (text === "404 page not found\n") {
+          return { status: "warn", detail: `the discovery route self-gates to 404 (oauth2_wellknown.go:17-20's exact body) — OAUTH2_ENABLED is OFF on this deployment; the provider-default-on posture is a deployment choice, the shape asserts when it is on` };
+        }
+        return { status: "warn", detail: `the discovery route answers 404 (${text.slice(0, 40).replace(/\s+/g, " ")}…) — the W4 module's MOUNT HANDOFF is not executed on this deployment (web/oauth2-wellknown.ts exports oauth2WellKnownRouter; the shared index registers the federation pair only); the shape asserts hard once mounted` };
+      }
+      expect(res.status === 200, `status ${res.status} (expected 200): ${text.slice(0, 120)}`);
+      expect(String(res.headers.get("content-type") ?? "") === "application/json;charset=utf-8",
+        `content-type ${JSON.stringify(res.headers.get("content-type"))} (expected application/json;charset=utf-8)`);
+      const doc = JSON.parse(text);
+      const keys = Object.keys(doc);
+      const wantKeys = ["authorization_endpoint", "claims_supported", "code_challenge_methods_supported", "grant_types_supported",
+        "id_token_signing_alg_values_supported", "introspection_endpoint", "issuer", "jwks_uri", "response_types_supported",
+        "scopes_supported", "subject_types_supported", "token_endpoint", "userinfo_endpoint"];
+      expect(JSON.stringify(keys) === JSON.stringify(wantKeys), `member set/order ${JSON.stringify(keys)} (expected the 13 alphabetical members)`);
+      ctx.discIssuer = String(doc.issuer ?? "");
+      expect(ctx.discIssuer !== "", "the discovery doc carries no issuer");
+      const base = ctx.discIssuer;
+      for (const [key, suffix] of [
+        ["authorization_endpoint", "/login/oauth/authorize"],
+        ["token_endpoint", "/login/oauth/access_token"],
+        ["jwks_uri", "/login/oauth/keys"],
+        ["userinfo_endpoint", "/login/oauth/userinfo"],
+        ["introspection_endpoint", "/login/oauth/introspect"],
+      ]) {
+        expect(doc[key] === `${base}${suffix}`, `${key} ${JSON.stringify(doc[key])} != issuer + ${suffix} (the endpoints ride the SAME AppURL source)`);
+      }
+      expect(JSON.stringify(doc.response_types_supported) === '["code"]', `response_types ${JSON.stringify(doc.response_types_supported)}`);
+      expect(JSON.stringify(doc.grant_types_supported) === '["authorization_code","refresh_token"]', `grant_types ${JSON.stringify(doc.grant_types_supported)}`);
+      expect(JSON.stringify(doc.code_challenge_methods_supported) === '["plain","S256"]', `code_challenge_methods ${JSON.stringify(doc.code_challenge_methods_supported)}`);
+      expect(JSON.stringify(doc.scopes_supported) === '["openid","profile","email","groups"]', `scopes_supported ${JSON.stringify(doc.scopes_supported)}`);
+      expect(JSON.stringify(doc.subject_types_supported) === '["public"]', `subject_types ${JSON.stringify(doc.subject_types_supported)}`);
+      expect(Array.isArray(doc.id_token_signing_alg_values_supported) && doc.id_token_signing_alg_values_supported.length === 1
+        && /^(RS|ES)[0-9]{3}$|^EdDSA$/.test(String(doc.id_token_signing_alg_values_supported[0])),
+      `id_token_signing_alg_values_supported ${JSON.stringify(doc.id_token_signing_alg_values_supported)} (expected EXACTLY the configured alg)`);
+      expect(Array.isArray(doc.claims_supported) && doc.claims_supported.includes("groups") && doc.claims_supported.includes("email_verified"),
+        `claims_supported missing groups/email_verified: ${JSON.stringify(doc.claims_supported)}`);
+      if (base === opts.baseUrl) {
+        return `13 members alphabetical; issuer == the fetch origin ${base} (the deployed posture); alg [${doc.id_token_signing_alg_values_supported[0]}]`;
+      }
+      if (opts.d1Scope === "remote") {
+        throw new Error(`issuer ${base} != the fetch origin ${opts.baseUrl} (openid-connect-discovery §4 — a deployed target MUST publish the origin it is fetched from; check the deployment's APP_URL/OAUTH2_JWT_CLAIM_ISSUER)`);
+      }
+      return { status: "warn", detail: `issuer/endpoints ride ${base} while the probe dials ${opts.baseUrl} — the local dev posture (wrangler.jsonc's APP_URL pin); the deployed target must answer issuer == fetch origin` };
+    },
+  },
+  {
+    id: "oauth2-realm-git-http",
+    expect: `THE REALM CHECK (§2.11): one private auto_init probe repo ${ctx.realmRepo} → an anonymous GET .../info/refs?service=git-upload-pack → 401 whose www-authenticate is EXACTLY 'Basic realm="Gitea"' (the provider-default-on realm flip — GCM then drives its builtin OAuth2 application, git-credential-manager#1442), then DELETE 204`,
+    run: async () => {
+      const res = await api("/user/repos", { method: "POST", body: { name: ctx.realmRepo, private: true, auto_init: true } });
+      if (res.status === 201) ctx.realmRepoCreated = true; // mark on the observable write
+      ctx.realmRepoFullName = String(res.json?.full_name ?? `${ctx.user}/${ctx.realmRepo}`);
+      expect(res.status === 201, `repo create status ${res.status} (expected 201): ${res.text.slice(0, 120)}`);
+      const refs = await fetchT(`${opts.baseUrl}/${ctx.user}/${ctx.realmRepo}/info/refs?service=git-upload-pack`);
+      await refs.text();
+      expect(refs.status === 401, `anonymous info/refs status ${refs.status} (expected 401 — the repo is private)`);
+      const wwwAuth = String(refs.headers.get("www-authenticate") ?? "");
+      expect(wwwAuth === 'Basic realm="Gitea"', `www-authenticate ${JSON.stringify(wwwAuth)} (expected EXACTLY 'Basic realm="Gitea"' — the OAUTH2_ENABLED-default-on flip)`);
+      const del = await api(`/repos/${ctx.user}/${ctx.realmRepo}`, { method: "DELETE" });
+      expect(del.status === 204, `repo delete status ${del.status} (expected 204)`);
+      ctx.realmRepoGone = true;
+      return `401 challenge 'Basic realm="Gitea"' on the private repo; repo deleted`;
+    },
+  },
+  {
+    id: "oauth2-dance-consent",
+    expect: `THE AUTHORIZE DANCE (consent path): a fresh PKCE S256 pair generated in-script; GET /login/oauth/authorize (response_type=code, client_id, redirect_uri, state, scope "${ctx.scope}", nonce, S256 challenge) WITH the session cookie → 200 CONSENT PAGE (a first-time confidential app has no grant yet) carrying action="/login/oauth/grant" + id="authorize-app" + the hidden fields echoing the request; the fields are PARSED off the page and POSTed to /login/oauth/grant granted=true (same-origin Origin header) → 303 to the registered redirect_uri with code + the echoed state`,
+    run: async () => {
+      expect(ctx.clientId !== null, "no client registration (fixture missing — the create arm failed)");
+      expect(ctx.sessionCookie !== null, "no login session (fixture missing — the login arm failed)");
+      const pair = pkcePair();
+      ctx.verifier = pair.verifier;
+      const authz = await fetchT(`${opts.baseUrl}/login/oauth/authorize?${authorizeQuery(ctx, ctx.state1, ctx.nonce1, pair)}`,
+        { headers: { cookie: ctx.sessionCookie } });
+      const html = await authz.text();
+      expect(authz.status === 200, `authorize status ${authz.status} (expected the 200 consent page): ${html.slice(0, 120)}`);
+      expect(html.includes('action="/login/oauth/grant"'), "the consent page carries no grant form");
+      expect(html.includes('id="authorize-app"'), "the consent page carries no granted=true submit (id=authorize-app)");
+      const form = {
+        client_id: hiddenValue(html, "client_id"),
+        state: hiddenValue(html, "state"),
+        scope: hiddenValue(html, "scope"),
+        nonce: hiddenValue(html, "nonce"),
+        redirect_uri: hiddenValue(html, "redirect_uri"),
+        granted: "true",
+      };
+      expect(form.client_id === ctx.clientId, `the consent form's client_id ${JSON.stringify(form.client_id)} != the registered one`);
+      expect(form.state === ctx.state1, "the consent form's state does not echo the request");
+      expect(form.redirect_uri === ctx.redirectUri, "the consent form's redirect_uri does not echo the request");
+      expect(form.scope === ctx.scope, `the consent form's scope ${JSON.stringify(form.scope)} != the normalized request scope`);
+      const grant = await postForm("/login/oauth/grant", form, { cookie: ctx.sessionCookie, origin: opts.baseUrl });
+      expect(grant.status === 303, `grant POST status ${grant.status} (expected 303): ${grant.text.slice(0, 120)}`);
+      expect(grant.location !== null, "the grant POST carries no Location");
+      const loc = new URL(grant.location);
+      const code = loc.searchParams.get("code");
+      expect(typeof code === "string" && code.length > 0, `the redirect carries no code: ${grant.location}`);
+      expect(loc.searchParams.get("state") === ctx.state1, `the redirect state ${JSON.stringify(loc.searchParams.get("state"))} != the request state`);
+      secrets.push(code);
+      ctx.code1 = code;
+      ctx.danceLog.push(
+        "authorize GET (PKCE S256 + state + nonce) → 200 consent page (hidden client_id/state/scope/nonce/redirect_uri parsed)",
+        "grant POST granted=true → 303 → redirect_uri?code=…&state=<echo>",
+      );
+      return `authorize → 200 consent; grant → 303 with code + echoed state (${loc.host}${loc.pathname})`;
+    },
+  },
+  {
+    id: "oauth2-exchange-form",
+    expect: `POST /login/oauth/access_token (grant_type=authorization_code, FORM client credentials, redirect_uri, the code, the S256 verifier) → 200 {access_token (a 3-segment compact JWS), token_type:"bearer", expires_in:3600, refresh_token, id_token (the scope carries openid), scope:"${ctx.scope}"}`,
+    run: async () => {
+      expect(ctx.code1 !== null, "no authorization code from the dance arm (fixture missing)");
+      const res = await postForm("/login/oauth/access_token", {
+        grant_type: "authorization_code", client_id: ctx.clientId, client_secret: ctx.clientSecret,
+        redirect_uri: ctx.redirectUri, code: ctx.code1, code_verifier: ctx.verifier,
+      });
+      expect(res.status === 200, `token status ${res.status} (expected 200): ${res.text.slice(0, 160)}`);
+      const body = JSON.parse(res.text);
+      expect(body.token_type === "bearer", `token_type ${JSON.stringify(body.token_type)} (expected "bearer")`);
+      expect(body.expires_in === 3600, `expires_in ${body.expires_in} (expected 3600)`);
+      expect(body.scope === ctx.scope, `scope ${JSON.stringify(body.scope)} (expected the normalized "${ctx.scope}")`);
+      expect(typeof body.access_token === "string" && body.access_token.split(".").length === 3, "access_token is not a 3-segment compact JWS");
+      expect(typeof body.refresh_token === "string" && body.refresh_token.length > 0, "no refresh_token in the mint");
+      expect(typeof body.id_token === "string" && body.id_token.length > 0, "no id_token in the mint (the scope carries openid)");
+      secrets.push(body.access_token, body.refresh_token, body.id_token);
+      ctx.tokens = body;
+      ctx.danceLog.push("access_token POST (form client auth) → 200 trio (bearer, expires_in 3600, scope, id_token)");
+      return `200 trio minted (access ${body.access_token.length} chars; expires_in 3600; scope + id_token present)`;
+    },
+  },
+  {
+    id: "oauth2-dance-auto-consent-basic",
+    expect: `dance 2 rides the AUTO-CONSENT arm (confidential client + existing grant + unchanged scope → NO consent page): GET /login/oauth/authorize (same scope, FRESH state/nonce/S256 pair) → 303 with a fresh code; then the exchange with the RFC 6749 §2.3.1 Basic header (NO body credentials) → 200 fresh pair (iat >= the original mint — same-second mints are claim-identical by design, the detail says which)`,
+    run: async () => {
+      expect(ctx.tokens !== null, "no mint from the exchange arm (fixture missing)");
+      const pair = pkcePair();
+      const authz = await fetchT(`${opts.baseUrl}/login/oauth/authorize?${authorizeQuery(ctx, ctx.state2, ctx.nonce2, pair)}`,
+        { headers: { cookie: ctx.sessionCookie } });
+      await authz.text();
+      expect(authz.status === 303, `authorize status ${authz.status} (expected 303 auto-consent — the unchanged re-authorize skips the consent page): ${(authz.headers.get("location") ?? "").slice(0, 80)}`);
+      const loc = new URL(authz.headers.get("location"));
+      const code2 = loc.searchParams.get("code");
+      expect(typeof code2 === "string" && code2.length > 0, `the auto-consent redirect carries no code: ${authz.headers.get("location")}`);
+      expect(loc.searchParams.get("state") === ctx.state2, `the auto-consent state ${JSON.stringify(loc.searchParams.get("state"))} != the request state`);
+      secrets.push(code2);
+      const res = await postForm("/login/oauth/access_token", {
+        grant_type: "authorization_code", redirect_uri: ctx.redirectUri, code: code2, code_verifier: pair.verifier,
+      }, { basic: { user: ctx.clientId, pass: ctx.clientSecret } });
+      expect(res.status === 200, `Basic exchange status ${res.status} (expected 200): ${res.text.slice(0, 160)}`);
+      const body = JSON.parse(res.text);
+      for (const key of ["access_token", "refresh_token", "id_token"]) {
+        expect(typeof body[key] === "string" && body[key].length > 0, `the Basic mint is missing ${key}`);
+      }
+      expect(body.scope === ctx.scope && body.token_type === "bearer" && body.expires_in === 3600,
+        `Basic mint shape token_type=${body.token_type} expires_in=${body.expires_in} scope=${JSON.stringify(body.scope)}`);
+      const oldIat = claimsOfJwt(ctx.tokens.access_token).iat;
+      const newIat = claimsOfJwt(body.access_token).iat;
+      expect(newIat >= oldIat, `the Basic mint iat ${newIat} is OLDER than the original ${oldIat}`);
+      secrets.push(body.access_token, body.refresh_token, body.id_token);
+      ctx.tokensBasic = body;
+      ctx.danceLog.push("authorize GET (unchanged scope) → 303 auto-consent (no consent page)", "access_token POST (Basic client auth) → 200 fresh pair");
+      return `303 auto-consent (fresh code); Basic exchange → 200 (iat ${oldIat} → ${newIat}${body.access_token === ctx.tokens.access_token ? ", claim-identical same-second mint" : ""})`;
+    },
+  },
+  {
+    id: "oauth2-api-bearer-dispatch",
+    expect: `THE DOTTED DISPATCH: GET /api/v1/user with Authorization: Bearer <the dotted access JWT> → 200 whose login is the PAT user (a dotted credential resolves through the OAuth2 auth method into the landed apiScopeGate — the grant scope "${ctx.scope}" covers read:user)`,
+    run: async () => {
+      expect(ctx.tokens !== null, "no mint from the exchange arm (fixture missing)");
+      const res = await fetchT(`${opts.baseUrl}/api/v1/user`, { headers: { authorization: `Bearer ${ctx.tokens.access_token}` } });
+      const text = await res.text();
+      let json = null;
+      try { json = JSON.parse(text); } catch { /* non-JSON — the status assert reports it */ }
+      expect(res.status === 200, `status ${res.status} (expected 200): ${text.slice(0, 120)}`);
+      expect(json?.login === ctx.user, `login ${JSON.stringify(json?.login)} != ${ctx.user}`);
+      ctx.userId = json.id;
+      ctx.danceLog.push("GET /api/v1/user (Bearer) → 200 as the grant's user (the dotted dispatch)");
+      return `200 as ${json.login} (id ${json.id}) — the grant scope rode the apiScopeGate`;
+    },
+  },
+  {
+    id: "oauth2-userinfo",
+    expect: `GET /login/oauth/userinfo with the Bearer → 200 {sub,name,preferred_username,email,picture,groups} in Go struct member order (sub == the API user id; groups null for an org-less user or an array); the SAME call with the run PAT → 401 (a PAT is NOT an OAuth2 credential — the AuthedMethod check)`,
+    run: async () => {
+      expect(ctx.tokens !== null, "no mint from the exchange arm (fixture missing)");
+      expect(Number.isInteger(ctx.userId), "no user id from the dispatch arm (fixture missing)");
+      const res = await fetchT(`${opts.baseUrl}/login/oauth/userinfo`, { headers: { authorization: `Bearer ${ctx.tokens.access_token}` } });
+      const text = await res.text();
+      expect(res.status === 200, `status ${res.status} (expected 200): ${text.slice(0, 120)}`);
+      const body = JSON.parse(text);
+      expect(JSON.stringify(Object.keys(body)) === JSON.stringify(["sub", "name", "preferred_username", "email", "picture", "groups"]),
+        `member order ${JSON.stringify(Object.keys(body))} (expected the Go struct order)`);
+      expect(body.sub === String(ctx.userId), `sub ${JSON.stringify(body.sub)} != String(${ctx.userId})`);
+      expect(body.preferred_username === ctx.user, `preferred_username ${JSON.stringify(body.preferred_username)} != ${ctx.user}`);
+      expect(String(body.picture ?? "").endsWith(`/avatars/${ctx.user.toLowerCase()}`), `picture ${JSON.stringify(body.picture)} missing the avatars tail`);
+      expect(body.groups === null || Array.isArray(body.groups), `groups ${JSON.stringify(body.groups)} (expected null for an org-less user or an array)`);
+      const pat = await fetchT(`${opts.baseUrl}/login/oauth/userinfo`, { headers: { authorization: `token ${TOKEN}` } });
+      await pat.text();
+      expect(pat.status === 401, `the PAT userinfo status ${pat.status} (expected 401 — a PAT is not an OAuth2 token)`);
+      ctx.danceLog.push("GET /login/oauth/userinfo (Bearer) → 200 OIDC shape; (PAT) → 401");
+      return `200 OIDC shape (sub=${body.sub}, groups ${body.groups === null ? "null" : `array[${body.groups.length}]`}); PAT → 401`;
+    },
+  },
+  {
+    id: "oauth2-jwks-offline-verify",
+    expect: `THE OFFLINE JWKS VERIFY: GET /login/oauth/keys → ONE JWK whose members emit ALPHABETICALLY (the Go map marshal); BOTH the access token and the id_token verify IN-SCRIPT with WebCrypto against the published key (RSASSA-PKCS1-v1_5 / ECDSA per the alg — an HS deployment degrades to the documented warn: the JWKS deliberately publishes no secret material); the id_token header's alg/kid match the JWK and its claims pin iss == the discovery issuer (skipped, noted, when the discovery doc is the documented 404 degradation), aud == [client_id], sub, the echoed dance nonce, email_verified on the active account`,
+    run: async () => {
+      expect(ctx.tokens !== null, "no mint from the exchange arm (fixture missing)");
+      expect(Number.isInteger(ctx.userId), "no user id from the dispatch arm (fixture missing)");
+      const res = await fetchT(`${opts.baseUrl}/login/oauth/keys`);
+      const text = await res.text();
+      expect(res.status === 200, `keys status ${res.status} (expected 200)`);
+      expect(String(res.headers.get("content-type") ?? "").includes("application/json"), `content-type ${JSON.stringify(res.headers.get("content-type"))} (expected application/json)`);
+      const jwks = JSON.parse(text);
+      expect(Array.isArray(jwks.keys) && jwks.keys.length === 1, `keys length ${jwks.keys?.length} (expected exactly 1)`);
+      const jwk = jwks.keys[0];
+      const members = Object.keys(jwk);
+      expect(JSON.stringify(members) === JSON.stringify([...members].sort()), `JWK members ${JSON.stringify(members)} are not alphabetical (the Go map marshal)`);
+      if (jwk.kty === "oct") {
+        return { status: "warn", detail: `HS deployment (kty oct, alg ${jwk.alg}) — the JWKS deliberately publishes no secret material (upstream's broken-for-third-party-OIDC oct posture, §2.10), so the offline verify is structurally unavailable; the claim shapes were pinned by the landed suites` };
+      }
+      const accessOk = await verifyJwkOffline(jwk, ctx.tokens.access_token);
+      expect(accessOk === true, "the ACCESS token signature does NOT verify against the published JWKS key");
+      const idOk = await verifyJwkOffline(jwk, ctx.tokens.id_token);
+      expect(idOk === true, "the id_token signature does NOT verify against the published JWKS key");
+      const header = JSON.parse(Buffer.from(ctx.tokens.id_token.split(".")[0], "base64url").toString("utf8"));
+      expect(header.alg === jwk.alg, `id_token header alg ${header.alg} != the JWK alg ${jwk.alg}`);
+      if (jwk.kid !== undefined) expect(header.kid === jwk.kid, `id_token header kid ${JSON.stringify(header.kid)} != the JWK kid`);
+      const claims = claimsOfJwt(ctx.tokens.id_token);
+      let issNote = "";
+      if (ctx.discIssuer !== null) {
+        expect(claims.iss === ctx.discIssuer, `iss ${JSON.stringify(claims.iss)} != the discovery issuer ${ctx.discIssuer}`);
+      } else {
+        issNote = "; iss pin skipped (the discovery doc is the documented 404 degradation)";
+      }
+      expect(Array.isArray(claims.aud) && claims.aud.length === 1 && claims.aud[0] === ctx.clientId, `aud ${JSON.stringify(claims.aud)} (expected [client_id])`);
+      expect(claims.sub === String(ctx.userId), `sub ${JSON.stringify(claims.sub)} != String(${ctx.userId})`);
+      expect(claims.nonce === ctx.nonce1, `nonce ${JSON.stringify(claims.nonce)} != the dance nonce`);
+      expect(claims.email_verified === true, `email_verified ${claims.email_verified} (expected true on the active account)`);
+      expect(claims.preferred_username === ctx.user, `preferred_username ${JSON.stringify(claims.preferred_username)} != ${ctx.user}`);
+      ctx.danceLog.push("GET /login/oauth/keys → 1 JWK; WebCrypto verify access + id_token TRUE; id_token claims pinned");
+      return `${jwk.kty}/${jwk.alg} verify: access + id_token TRUE; aud/sub/nonce/email_verified pinned${issNote}`;
+    },
+  },
+  {
+    id: "oauth2-refresh-grant",
+    expect: `grant_type=refresh_token (FORM credentials) → 200 fresh pair: the mint's iat >= the original (same-second mints are claim-identical by design — the detail says which), token_type bearer, expires_in 3600, scope unchanged, and the REFRESHED access token authenticates userinfo; the D1 counter read in the revoke arm pins the no-rotation half (OAUTH2_INVALIDATE_REFRESH_TOKENS default off)`,
+    run: async () => {
+      expect(ctx.tokens !== null, "no mint from the exchange arm (fixture missing)");
+      const res = await postForm("/login/oauth/access_token", {
+        grant_type: "refresh_token", client_id: ctx.clientId, client_secret: ctx.clientSecret,
+        refresh_token: ctx.tokens.refresh_token,
+      });
+      expect(res.status === 200, `refresh status ${res.status} (expected 200): ${res.text.slice(0, 160)}`);
+      const body = JSON.parse(res.text);
+      for (const key of ["access_token", "refresh_token"]) {
+        expect(typeof body[key] === "string" && body[key].length > 0, `the refresh mint is missing ${key}`);
+      }
+      expect(body.token_type === "bearer" && body.expires_in === 3600 && body.scope === ctx.scope,
+        `refresh mint shape token_type=${body.token_type} expires_in=${body.expires_in} scope=${JSON.stringify(body.scope)}`);
+      const oldIat = claimsOfJwt(ctx.tokens.access_token).iat;
+      const newIat = claimsOfJwt(body.access_token).iat;
+      expect(newIat >= oldIat, `the refresh mint iat ${newIat} is OLDER than the original ${oldIat}`);
+      secrets.push(body.access_token, body.refresh_token);
+      if (typeof body.id_token === "string" && body.id_token.length > 0) secrets.push(body.id_token);
+      ctx.refreshed = body;
+      const ui = await fetchT(`${opts.baseUrl}/login/oauth/userinfo`, { headers: { authorization: `Bearer ${body.access_token}` } });
+      await ui.text();
+      expect(ui.status === 200, `the refreshed access token userinfo status ${ui.status} (expected 200)`);
+      ctx.danceLog.push("refresh_token POST → 200 fresh pair; the refreshed access authenticates userinfo");
+      return `200 fresh pair (iat ${oldIat} → ${newIat}); the refreshed access authenticates userinfo`;
+    },
+  },
+  {
+    id: "oauth2-introspect",
+    expect: `POST /login/oauth/introspect (client_secret_basic ONLY): the live access token → 200 ACTIVE shape (members EXACTLY [active,scope,username,iss,sub,aud] in Go struct order — exp deliberately absent), scope == the grant scope, sub == String(uid), aud == [client_id]; a junk token → 200 {"active":false}; NO Basic → 401 + 'Basic realm="Gitea OAuth2"'`,
+    run: async () => {
+      expect(ctx.tokens !== null, "no mint from the exchange arm (fixture missing)");
+      expect(Number.isInteger(ctx.userId), "no user id from the dispatch arm (fixture missing)");
+      const active = await postForm("/login/oauth/introspect", { token: ctx.tokens.access_token }, { basic: { user: ctx.clientId, pass: ctx.clientSecret } });
+      expect(active.status === 200, `introspect status ${active.status} (expected 200): ${active.text.slice(0, 120)}`);
+      const body = JSON.parse(active.text);
+      expect(JSON.stringify(Object.keys(body)) === JSON.stringify(["active", "scope", "username", "iss", "sub", "aud"]),
+        `members ${JSON.stringify(Object.keys(body))} (expected the Go struct order, exp deliberately absent)`);
+      expect(body.active === true && body.scope === ctx.scope && body.username === ctx.user,
+        `active shape active=${body.active} scope=${JSON.stringify(body.scope)} username=${JSON.stringify(body.username)}`);
+      expect(body.sub === String(ctx.userId) && JSON.stringify(body.aud) === JSON.stringify([ctx.clientId]),
+        `sub/aud ${JSON.stringify(body.sub)}/${JSON.stringify(body.aud)} (expected String(uid)/[client_id])`);
+      const junk = await postForm("/login/oauth/introspect", { token: `junk-${hexId(12)}` }, { basic: { user: ctx.clientId, pass: ctx.clientSecret } });
+      expect(junk.status === 200 && junk.text === '{"active":false}', `junk introspect ${junk.status} ${JSON.stringify(junk.text.slice(0, 60))} (expected 200 {"active":false})`);
+      const anon = await postForm("/login/oauth/introspect", { token: ctx.tokens.access_token });
+      expect(anon.status === 401, `unauthenticated introspect status ${anon.status} (expected 401)`);
+      expect(String(anon.headers.get("www-authenticate") ?? "") === 'Basic realm="Gitea OAuth2"',
+        `challenge ${JSON.stringify(anon.headers.get("www-authenticate"))} (expected 'Basic realm="Gitea OAuth2"')`);
+      ctx.danceLog.push("introspect POST (Basic) → active shape; junk → {\"active\":false}; unauthenticated → 401");
+      return `active shape + {"active":false} junk + 401 'Basic realm="Gitea OAuth2"'`;
+    },
+  },
+  {
+    id: "oauth2-revoke-kills-token",
+    expect: `THE REVOKE-KILLS-TOKEN arm: the grant row reads back via wrangler d1 (--${opts.d1Scope}; needs wrangler auth) with counter == 1 (two refresh mints must NOT have moved it — the no-default-rotation posture), then the REVOKE rides the UI when it is live (the spec §5 arm's own wording: W5's POST /user/settings/applications/oauth2/{id}/revoke/{grantId} with the session cookie → 303) and falls back to the documented D1 store delete (upstream RevokeOAuth2Grant's state change — the row delete) when the route answers anything else; either way the OUTSTANDING access token dies IMMEDIATELY (the token is a pointer to the grant row): /api/v1/user with the ORIGINAL Bearer → 401, introspect → {"active":false}`,
+    run: async () => {
+      expect(ctx.appId !== null, "no application id from the create arm (fixture missing)");
+      expect(Number.isInteger(ctx.userId), "no user id from the dispatch arm (fixture missing)");
+      expect(ctx.tokens !== null, "no mint from the exchange arm (fixture missing)");
+      const found = await d1Exec(`SELECT id, counter FROM oauth2_grant WHERE user_id = ${ctx.userId} AND application_id = ${ctx.appId}`);
+      const row = found.at(-1)?.results?.[0];
+      expect(row !== undefined, "no oauth2_grant row for (user, application) — the consent never landed a grant");
+      ctx.grantRowId = row.id;
+      expect(Number(row.counter) === 1, `grant counter ${row.counter} (expected 1 — the refresh mints must not move it while OAUTH2_INVALIDATE_REFRESH_TOKENS is off)`);
+      // The revoke channel (mount-at-run-time): the W5 settings POST when it
+      // answers, the store delete otherwise — the claim is the TOKEN DEATH.
+      const uiRevoke = await postForm(`/user/settings/applications/oauth2/${ctx.appId}/revoke/${row.id}`, {},
+        { cookie: ctx.sessionCookie, origin: opts.baseUrl });
+      let channel;
+      if (uiRevoke.status === 303) {
+        channel = `the W5 settings revoke POST (303, grant ${row.id})`;
+      } else {
+        await d1Exec(`DELETE FROM oauth2_grant WHERE id = ${row.id}`);
+        channel = `the D1 store delete (the W5 revoke POST answered ${uiRevoke.status} — not mounted on this deployment; this IS upstream RevokeOAuth2Grant's state change)`;
+      }
+      const api2 = await fetchT(`${opts.baseUrl}/api/v1/user`, { headers: { authorization: `Bearer ${ctx.tokens.access_token}` } });
+      await api2.text();
+      expect(api2.status === 401, `post-revoke API status ${api2.status} (expected 401 — grant deletion kills outstanding access tokens immediately)`);
+      const dead = await postForm("/login/oauth/introspect", { token: ctx.tokens.access_token }, { basic: { user: ctx.clientId, pass: ctx.clientSecret } });
+      expect(dead.status === 200 && dead.text === '{"active":false}', `post-revoke introspect ${dead.status} ${JSON.stringify(dead.text.slice(0, 60))} (expected {"active":false})`);
+      ctx.danceLog.push(`revoke (${channel}) → the outstanding access token 401s on the API and introspects inactive`);
+      return `grant ${row.id} revoked via ${channel} (counter was 1); the outstanding access token 401s on the API and introspects inactive`;
+    },
+  },
+  {
+    id: "oauth2-cleanup-app-204",
+    expect: `DELETE /api/v1/user/applications/oauth2/{id} → 204 (the FKs cascade any surviving grants/codes — the probe's own grant is already revoked)`,
+    run: async () => {
+      expect(ctx.appId !== null, "no application id from the create arm (fixture missing)");
+      const res = await api(`/user/applications/oauth2/${ctx.appId}`, { method: "DELETE" });
+      expect(res.status === 204, `status ${res.status} (expected 204)`);
+      ctx.appGone = true;
+      return "204";
+    },
+  },
+  {
+    id: "oauth2-cleanup-rows-d1",
+    expect: `the D1 husk sweep (wrangler d1 --${opts.d1Scope}; needs wrangler auth): zero oauth2_application rows for the probe client_id, zero oauth2_grant rows for the application id, zero oauth2_authorization_code rows for the grant id — the provider family leaves NOTHING (cleanup-audit needs no new expectations)`,
+    run: async () => {
+      expect(ctx.appId !== null, "no application id from the create arm (fixture missing)");
+      const parsed = await d1Exec(`SELECT (SELECT COUNT(*) FROM oauth2_application WHERE client_id = '${ctx.clientId}') AS apps, ` +
+        `(SELECT COUNT(*) FROM oauth2_grant WHERE application_id = ${ctx.appId}) AS grants, ` +
+        `(SELECT COUNT(*) FROM oauth2_authorization_code WHERE ${ctx.grantRowId !== null ? `grant_id = ${ctx.grantRowId}` : "grant_id IN (SELECT id FROM oauth2_grant WHERE application_id = " + ctx.appId + ")"}) AS codes`);
+      const row = parsed.at(-1)?.results?.[0];
+      expect(row !== undefined, "no counts row from the d1 query");
+      expect(Number(row.apps) === 0 && Number(row.grants) === 0 && Number(row.codes) === 0,
+        `husk rows remain: apps=${row.apps} grants=${row.grants} codes=${row.codes} (expected all 0)`);
+      ctx.rowsSwept = true;
+      return `apps=${row.apps} grants=${row.grants} codes=${row.codes} — zero`;
+    },
+  },
+  {
+    id: "ext-source-seed-d1",
+    expect: `the external-auth source fixture (specs/external-auth-sources.md §8 tail): INSERT one ACTIVE type-6 OIDC login_source row via wrangler d1 (--${opts.d1Scope}; needs wrangler auth) named ${ctx.sourceName} with a codec-valid cfg (provider openidConnect, a .invalid discovery URL — no IdP exists on a deployment, so the flow legs stay in the landed suites' stub-IdP coverage), then SELECT it back by name`,
+    run: async () => {
+      const cfg = JSON.stringify({
+        v: 1, provider: "openidConnect", clientId: `probe-client-${hexId(6)}`, clientSecret: "probe-secret",
+        discoveryUrl: `https://oidc-${hexId(8)}.invalid/.well-known/openid-configuration`,
+      });
+      await d1Exec(`INSERT INTO login_source (type, name, is_active, is_sync_enabled, two_factor_policy, cfg, created_unix, updated_unix) ` +
+        `VALUES (6, '${ctx.sourceName}', 1, 0, '', '${cfg}', unixepoch(), unixepoch())`);
+      const parsed = await d1Exec(`SELECT id, type, is_active FROM login_source WHERE name = '${ctx.sourceName}'`);
+      const row = parsed.at(-1)?.results?.[0];
+      expect(row !== undefined, `the seeded source row was not found by name ${ctx.sourceName}`);
+      ctx.sourceSeeded = true;
+      expect(Number(row.type) === 6 && Number(row.is_active) === 1, `row shape type=${row.type} is_active=${row.is_active} (expected 6/1)`);
+      return `login_source row ${row.id} seeded (type 6, active, OIDC cfg)`;
+    },
+  },
+  {
+    id: "ext-login-buttons-render",
+    expect: `anonymous GET /login → 200 carrying the external-login-navigator block with THIS source's button (the href /user/oauth2/${ctx.sourceName} — the login seam's listActiveOAuth2Sources read renders the W4 buttons on data alone)`,
+    run: async () => {
+      expect(ctx.sourceSeeded === true, "no seeded source row (fixture missing)");
+      const res = await fetchT(`${opts.baseUrl}/login`);
+      const html = await res.text();
+      expect(res.status === 200, `status ${res.status} (expected 200)`);
+      expect(html.includes('id="external-login-navigator"'), "the login page renders no external-login-navigator block (the source is not enumerating)");
+      expect(html.includes(`href="/user/oauth2/${ctx.sourceName}"`), `the login page carries no button for ${ctx.sourceName}`);
+      return `the ${ctx.sourceName} button renders on the anonymous login page`;
+    },
+  },
+  {
+    id: "ext-unknown-source-404",
+    expect: `GET /user/oauth2/no-such-source-<hex> → 404 (the resolve-arm contract at BOTH layers; the FULL flow legs — discovery, id_token verify, the identity ladder — are unit-tested against the stub IdP in web/oauth2-login.test.ts and stay out of probe scope). The BODY reads the mount state AT RUN TIME (the window2 convention): the W2 router's own honest-404 line 'Not Found' (the recorded §5.2 divergence from upstream's ServerError) asserts hard; the dispatcher's lowercase 'not found' unclaimed-path answer is the documented [warn] — /user/oauth2/* is not yet carved out of the repo-scoped dispatcher branch, so the flow legs are unreachable live`,
+    run: async () => {
+      const res = await fetchT(`${opts.baseUrl}/user/oauth2/no-such-source-${hexId(8)}`);
+      const text = await res.text();
+      expect(res.status === 404, `status ${res.status} (expected 404)`);
+      if (text.startsWith("Not Found")) {
+        return "404 with the W2 router's honest-404 line ('Not Found')";
+      }
+      if (text.startsWith("not found")) {
+        return { status: "warn", detail: `404 but the DISPATCHER's unclaimed-path carve answered ('${text.slice(0, 20).replace(/\n/, "")}') — /user/oauth2/* is not carved out of the repo-scoped dispatcher branch (handlesUiRoute does not claim it), so the W2 flow legs are unreachable live on this deployment; the router's own 404 line asserts once the carve lands` };
+      }
+      throw new Error(`404 with an unexpected body ${JSON.stringify(text.slice(0, 40))} (expected the plain Not Found line)`);
+    },
+  },
+  {
+    id: "ext-source-cleanup-d1",
+    expect: `the source row deletes clean (wrangler d1 --${opts.d1Scope}): DELETE by name → a re-SELECT answers zero rows (any external_login_user rows would cascade; this probe links none)`,
+    run: async () => {
+      expect(ctx.sourceSeeded === true, "no seeded source row (fixture missing)");
+      await d1Exec(`DELETE FROM login_source WHERE name = '${ctx.sourceName}'`);
+      const parsed = await d1Exec(`SELECT COUNT(*) AS n FROM login_source WHERE name = '${ctx.sourceName}'`);
+      const n = parsed.at(-1)?.results?.[0]?.n;
+      expect(Number(n) === 0, `${n} rows remain for ${ctx.sourceName} (expected 0)`);
+      ctx.sourceDeleted = true;
+      return "deleted; zero rows remain";
+    },
+  },
+];
+
+/**
+ * The red-runs-self-sweep posture (the consistency posture — the packages
+ * tails' shape): a failed run best-effort sweeps exactly what survived —
+ * the external-auth source row (D1), the probe's grant rows (D1, the app
+ * delete cascades codes+grants; this covers a red before that delete), the
+ * application (API DELETE), and the realm repo. One [tail] line, failures
+ * feed left_behind, never fatal; a green run no-ops silently (the in-chain
+ * cleanup arms already emptied everything and the gone flags skip the rest).
+ */
+const oauth2FailureCleanup = async (ctx) => {
+  const acts = [];
+  if (ctx.sourceSeeded === true && ctx.sourceDeleted !== true) {
+    try {
+      await d1Exec(`DELETE FROM login_source WHERE name = '${ctx.sourceName}'`);
+      acts.push(`login_source ${ctx.sourceName} deleted (D1)`);
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      leftBehind.push(`login_source ${ctx.sourceName} (failure tail: d1 delete threw: ${why})`);
+      acts.push(`login_source ${ctx.sourceName} LEFT BEHIND — ${why}`);
+    }
+  }
+  if (ctx.appId !== null && ctx.rowsSwept !== true) {
+    try {
+      await d1Exec(`DELETE FROM oauth2_grant WHERE application_id = ${ctx.appId}`);
+      acts.push(`oauth2_grant rows for application ${ctx.appId} deleted (D1; codes cascade)`);
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      leftBehind.push(`oauth2_grant rows for application ${ctx.appId} (failure tail: d1 delete threw: ${why})`);
+      acts.push(`oauth2_grant rows for application ${ctx.appId} LEFT BEHIND — ${why}`);
+    }
+  }
+  if (ctx.appCreated === true && ctx.appGone !== true) {
+    try {
+      const res = await api(`/user/applications/oauth2/${ctx.appId}`, { method: "DELETE" });
+      if (res.status === 204) acts.push(`application ${ctx.appId} deleted`);
+      else {
+        leftBehind.push(`application ${ctx.appId} (DELETE returned ${res.status})`);
+        acts.push(`application ${ctx.appId} LEFT BEHIND — DELETE returned ${res.status}`);
+      }
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      leftBehind.push(`application ${ctx.appId} (failure tail: DELETE threw: ${why})`);
+      acts.push(`application ${ctx.appId} LEFT BEHIND — ${why}`);
+    }
+  }
+  if (ctx.realmRepoCreated === true && ctx.realmRepoGone !== true) {
+    const [owner, repo] = String(ctx.realmRepoFullName ?? `${ctx.user}/${ctx.realmRepo}`).split("/");
+    try {
+      const out = await deleteRepo(owner, repo);
+      acts.push(typeof out === "string" ? out : out.detail);
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      leftBehind.push(`repo ${owner}/${repo} (failure tail: DELETE threw: ${why})`);
+      acts.push(`repo ${owner}/${repo} LEFT BEHIND — ${why}`);
+    }
+  }
+  if (acts.length) log(`  [tail] oauth-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
+};
+
 // ---------- battery: cleanup-audit (the D1 count shapes) ----------
 
 const AUDIT_TABLES = [
@@ -6675,11 +7398,22 @@ const BATTERIES = {
   // provider array + sha512 → download → management delete), then the D1
   // husk row sweep + repo delete.
   "packages-minor": { title: "packages minor six (SPEC-0016 §7: chef cookbook tar.gz → universe + search + cookbook/version metadata (the 1_0_1 knife quirk) → download → protocol delete, composer raw zip PUT ?version= → packages.json/list.json/p2 (%2F dist url + sha1 shasum) → download → management delete, conan v2 recipe revision → revisions/latest + pinned revision-files {\"conanfile.py\":null} → pinned download → pinned delete, cran DESCRIPTION tar.gz → PACKAGES(.gz) block (MD5sum EMPTY) → download → management delete, pub request-upload → multipart → finalize → normalized enumerate → archive download → management delete, vagrant box PUT → HEAD probe → provider array (sha512) → download → management delete, then the D1 husk row sweep + repo delete)", context: packagesMinorContext, steps: packagesMinorSteps, failureTail: packagesMinorFailureCleanup, independent: true },
+  // Independent (the fixwave/distro posture — one red family never hides the
+  // others): the scripted third-party client (registration → session → the
+  // consent dance with in-script PKCE S256 → the form + Basic exchanges →
+  // the dotted dispatch → userinfo → the offline JWKS verify → refresh →
+  // introspect → the revoke-kills-token row delete), the realm check, the
+  // discovery shape, the builtin-seed read, and the external-auth source
+  // family (the D1-seeded OIDC row's login-page button + the unknown-source
+  // 404 — the flow legs stay in the landed suites' stub-IdP coverage). Needs
+  // wrangler auth for the D1 arms (--d1-scope picks the database — the
+  // discovery arm's issuer==origin assert keys off it).
+  "auth-oauth2": { title: "auth oauth2 (oauth2-provider §5 + external-auth §8: the scripted third-party client end-to-end — registration (secret exactly-once), login session, consent dance w/ PKCE S256, form + Basic exchanges, dotted dispatch, userinfo (+PAT-401), offline JWKS verify (WebCrypto, claims pinned), refresh, introspect (active+junk+401), revoke-kills-token (the grant row D1 delete), app delete + the D1 husk sweep — + the realm check, the discovery shape, the builtin seed, the external-auth source family)", context: oauth2Context, steps: oauth2Steps, failureTail: oauth2FailureCleanup, independent: true },
   // Independent counts — one red count never hides the rest of the shape.
   "cleanup-audit": { title: "post-run D1 count shapes", context: () => ({}), steps: auditSteps, independent: true },
 };
 
-const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "packages-protocols", "packages-minor", "cleanup-audit"] : [opts.battery];
+const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "packages-protocols", "packages-minor", "auth-oauth2", "cleanup-audit"] : [opts.battery];
 
 // ---------- dry-run ----------
 

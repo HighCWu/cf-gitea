@@ -33,6 +33,7 @@ import { avatarServingRouter } from "./web/avatar-serving";
 import { attachmentsServingRouter } from "./web/attachments-serving";
 import { oauth2Router } from "./web/oauth2-token";
 import { wellKnownRouter } from "./api/routes/federation";
+import { oauth2WellKnownRouter } from "./web/oauth2-wellknown";
 import { securityHeaders, withSecurityHeaders } from "./web/security-headers";
 import { webhookDlqHandler } from "./webhooks/dlq";
 import { webhookQueueHandler } from "./webhooks/consumer";
@@ -288,6 +289,11 @@ app.route("/", attachmentsServingRouter);
 // mount, the same plain-Hono seam shape): nodeinfo + webfinger, the
 // FEDERATION_ENABLED gate answers 404 when off (the web pair's disabled arm).
 app.route("/", wellKnownRouter);
+// The OIDC discovery doc (SPEC oauth2-provider.md W4): /.well-known/
+// openid-configuration — the W6 battery's find: the W4 wave exported the
+// router but its mount handoff never executed.
+app.route("/", oauth2WellKnownRouter);
+
 // The OAuth2 provider's stateless JSON arms (SPEC specs/oauth2-provider.md
 // §2.3/§2.6, W2's route-home decision in web/oauth2-token.ts's header):
 // POST /login/oauth/access_token, POST /login/oauth/introspect,

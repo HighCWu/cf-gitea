@@ -18,12 +18,13 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
                                                       # D1-only: --base-url/--token-file optional
 ```
 
-- Batteries (17): `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
+- Batteries (18): `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
   `ui-login`, `window2-mounts`, `window3-mounts`, `fixwave-parity`,
   `branch-protection`, `demo`, `wiki-git`, `packages-registry`,
-  `packages-distro`, `packages-protocols`, `packages-minor`, `cleanup-audit`,
-  `all` (runs the 17 in that order, audit last). `all --dry-run` plans
-  **199 probes** across them (the counts in the table below were read off
+  `packages-distro`, `packages-protocols`, `packages-minor`, `auth-oauth2`,
+  `cleanup-audit`,
+  `all` (runs the 18 in that order, audit last). `all --dry-run` plans
+  **219 probes** across them (the counts in the table below were read off
   that dry-run at this writing; `registry` scales with `--trials`).
 - **The `cleanup-audit` battery is D1-only** (wrangler d1 execute, no HTTP): it
   takes neither `--base-url` nor `--token-file` — a missing token only errors
@@ -71,7 +72,7 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
 
 ## Batteries and their canonical expectations
 
-The registry at this writing — 17 batteries, **199 probes** (`all
+The registry at this writing — 18 batteries, **219 probes** (`all
 --dry-run`; `registry`'s count scales with `--trials`, here at its
 default 3):
 
@@ -93,8 +94,9 @@ default 3):
 | `packages-distro` | 5 | the M7 distro tail: rpm (hand-built fixture → .repo configs + repomd.xml + primary.xml.gz + repository.key → delete → repodata gone) + arch (.PKGINFO package → packages.db tar + symlink-dance aliases + .sig → delete → index 404 empty) + the D1 husk sweep + repo delete | HTTP + **wrangler auth** (the husk row sweep rides `--d1-scope`) |
 | `packages-protocols` | 9 | the SPEC-0016 §7 long tail: go (module zip → list/@latest/.info/.mod/.zip + sumdb 404 + missing-module 404s, + real `go mod download` when the toolchain is on the host) + cargo (.crate container → the {"ok"} shapes + config.json + sparse index + yank/unyank + download, + real `cargo fetch` through the in-script h2c-stripping proxy on plain-HTTP) + swift (login pair → multipart PUT → enumerate + Link → metadata + Digest zip → manifest 200/303 → identifiers) + rubygems (.gem → compact index → specs marshal → byte-parity download → gemspec.rz → yank) + the D1 husk sweep + repo delete | HTTP + **wrangler auth** (the husk row sweep rides `--d1-scope`); the two REAL-CLIENT arms degrade to a documented `[warn]` when `go`/`cargo` is off the probe host |
 | `packages-minor` | 9 | the SPEC-0016 §7 minor six: chef (cookbook tar.gz → universe + search + cookbook/version metadata with the 1_0_1 knife quirk → download → protocol version delete) + composer (raw zip PUT ?version= → packages.json/list.json/p2 with the %2F dist url + sha1 → download → management delete) + conan (v2 recipe revision → revisions/latest + the pinned revision-files list {"conanfile.py":null} → pinned download → pinned v2 delete) + cran (DESCRIPTION tar.gz → PACKAGES(.gz) block with the EMPTY MD5sum → download → management delete) + pub (request-upload → multipart → finalize → the normalized enumerate → download → management delete) + vagrant (box PUT → HEAD probe → the provider array + sha512 → download → management delete) + the D1 husk sweep + repo delete | HTTP + **wrangler auth** (the husk row sweep rides `--d1-scope`) |
+| `auth-oauth2` | 20 | the OAuth2 provider W6 battery + the external-auth tail: the scripted third-party client (registration with the exactly-once secret → login session → the consent dance with in-script PKCE S256 → form + Basic exchanges → the dotted dispatch → userinfo (+PAT-401) → the offline JWKS verify (WebCrypto, id_token claims pinned) → refresh → introspect (active/junk/401) → the revoke-kills-token row delete → app delete + the D1 husk sweep) + the realm check + the discovery shape + the builtin seed + the external-auth source family | HTTP (login cookie + Bearer JWTs) + **wrangler auth** (the builtin-seed read, the revoke row delete, the husk sweep, and the source seed/cleanup ride `--d1-scope`; the discovery arm's issuer==origin assert keys off it) |
 | `cleanup-audit` | 10 | post-run D1 count shapes (independent counts) | **D1-only** — wrangler auth, `--d1-scope remote\|local` (default remote); takes NEITHER `--base-url` NOR `--token-file` |
-| **`all`** | **199** | every battery in registry order, audit last | union of the above |
+| **`all`** | **219** | every battery in registry order, audit last | union of the above |
 
 Expectations are ported from `docs/design/p0-evidence.md` — the REDEPLOY13
 block (2026-10-26, ~lines 1507-1697) for the shallow trio, generate, ui-login,
@@ -702,6 +704,76 @@ prints all of them verbatim.
   the fullName the create returned (logged on one
   `[tail] pmin-leftover-sweep` line; failures feed `left_behind`, never
   fatal; a green run no-ops silently).
+- **auth-oauth2** — the OAuth2 provider's W6 battery (specs/oauth2-provider.md
+  §5's live battery arm) plus the external-auth tail
+  (specs/external-auth-sources.md §8), over one scripted THIRD-PARTY client —
+  the packages-protocols pattern (real protocol bytes, no in-repo test
+  seams). INDEPENDENT (the fixwave/distro posture — every family its own
+  verdict; dance-dependent arms guard with pointed "fixture missing" fails).
+  **The provider family:** the client registration
+  (`POST /api/v1/user/applications/oauth2` — confidential, one loopback
+  redirect_uri; the client secret renders EXACTLY ONCE in that body and is
+  scrubbed from all output) → the login session (`POST /login` →
+  `gitea_session`; the consent dance rides the session row's oauth_state
+  seam — a PAT header never reads a UI page) → **the authorize dance's
+  consent path** (a fresh PKCE S256 pair generated in-script; GET
+  `/login/oauth/authorize` → the 200 consent page — a first-time
+  confidential app has no grant yet; the page's hidden `client_id/state/
+  scope/nonce/redirect_uri` fields are PARSED off the form and POSTed to
+  `/login/oauth/grant` with `granted=true` → 303 to the registered
+  redirect_uri with code + the echoed state) → **the exchange with FORM
+  credentials** (200: a 3-segment access JWS, `token_type` "bearer",
+  `expires_in` 3600, refresh_token, id_token, the normalized scope) →
+  **dance 2 on the AUTO-CONSENT arm** (confidential client + existing grant
+  + unchanged scope → 303 with a fresh code, NO consent page) **exchanged
+  with the RFC 6749 §2.3.1 Basic header** → **the dotted dispatch**
+  (GET `/api/v1/user` with `Authorization: Bearer <JWT>` → 200 as the grant
+  user through the landed apiScopeGate) → **userinfo** (the Go struct member
+  order `{sub,name,preferred_username,email,picture,groups}`; the SAME call
+  with the run PAT → 401, a PAT is not an OAuth2 credential) → **the offline
+  JWKS verify** (GET `/login/oauth/keys` → one JWK with ALPHABETICAL
+  members; BOTH the access token and the id_token verify with WebCrypto
+  in-script — RSASSA-PKCS1-v1_5 or ECDSA per the published alg, an HS
+  deployment degrades to the documented warn since the JWKS deliberately
+  publishes no secret material; the id_token header alg/kid match the JWK
+  and its claims pin iss == the discovery issuer, aud == [client_id], sub,
+  the echoed nonce, email_verified) → **refresh** (a fresh pair whose iat >=
+  the original — same-second mints are claim-identical by design; the
+  refreshed access authenticates userinfo; the no-default-rotation half is
+  pinned by the revoke arm's counter==1 read) → **introspect** (the active
+  shape with members EXACTLY `[active,scope,username,iss,sub,aud]` and NO
+  exp; junk → `{"active":false}`; no Basic → 401 +
+  `Basic realm="Gitea OAuth2"`) → **the revoke-kills-token arm** (W5's
+  settings revoke POST is not landed, so the revocation rides the STORE: the
+  `oauth2_grant` row reads back via wrangler d1 with counter == 1, DELETEs,
+  and the OUTSTANDING access token 401s on `/api/v1/user` and introspects
+  inactive — the token is a POINTER to the grant row) → the application
+  DELETE 204 (the FKs cascade) → **the D1 husk sweep** (zero
+  application/grant/code rows). **The posture families:** the realm check
+  (a private auto_init probe repo's anonymous `info/refs` → 401 whose
+  www-authenticate is EXACTLY `Basic realm="Gitea"` — the §2.11
+  provider-default-on flip that feeds GCM's builtin-app flow; the repo
+  deletes in-arm), the discovery shape (the 13 members alphabetical; issuer
+  + every endpoint off ONE base; on a deployed target — `--d1-scope remote`
+  — that base MUST equal the fetch origin, openid-connect-discovery §4;
+  locally the wrangler.jsonc APP_URL pin is the documented `[warn]`), the
+  builtin seed (the five uid=0 applications migration 0052 seeded:
+  git-credential-oauth / Git Credential Manager / tea / Gitea App /
+  gitea-vscode), and the external-auth source family (an ACTIVE type-6 OIDC
+  `login_source` row seeded via D1 with a codec-valid cfg pointing at a
+  `.invalid` discovery URL — no IdP exists on a deployment, so the flow legs
+  stay in the landed suites' stub-IdP coverage: the anonymous `/login`
+  renders the source's button via the `external-login-navigator` block, an
+  unknown source name 404s, and the row deletes clean). **Auth: wrangler**
+  for the D1 arms (the builtin-seed read, the revoke row delete, the husk
+  sweep, the source seed/cleanup — `--d1-scope`, keep it in step with
+  `--base-url`). A green run leaves NOTHING (cleanup-audit needs no new
+  expectations). **Failure cleanup (the consistency posture):** a finally-
+  style tail sweeps the source row (D1), the probe's grant rows (D1, unless
+  the in-chain sweep ran — the app delete cascades codes+grants), the
+  application, and the realm repo (logged on one
+  `[tail] oauth-leftover-sweep` line; failures feed `left_behind`, never
+  fatal; a green run no-ops silently).
 - **cleanup-audit** — one wrangler d1 execute (`--d1-scope remote|local`,
   default remote) runs the whole count shape; **D1-only, so it runs without
   `--base-url`/`--token-file`**; the checks are INDEPENDENT (one red count
@@ -786,6 +858,11 @@ prints all of them verbatim.
     anything, so nothing to sweep there), then its package rows (D1 — the
     version deletes leave the empty package husks), then its probe repo;
     `[tail] pmin-leftover-sweep`.
+  - `auth-oauth2` — its external-auth source row (D1), then its probe
+    grant rows (D1 — the app delete cascades codes+grants, so this covers a
+    red before that delete; skipped when the in-chain husk sweep already
+    ran), then its application, then its realm repo;
+    `[tail] oauth-leftover-sweep`.
   One `[tail]` line logs every action; failures feed `left_behind`, never
   fatal; a green run no-ops silently (the battery's own cleanup arms already
   emptied everything, and the gone flags skip the rest). The audit battery
@@ -890,6 +967,16 @@ prints all of them verbatim.
     silent (nothing the run created survived; a mid-arm red after a real PUT
     is what the tail's gone-flagged management deletes + row sweep cover,
     and that shape is not deterministically forceable).
+  - `auth-oauth2 --force-red ext-source-cleanup-d1` — the forced arm reds
+    UNRUN while the other steps still run green (the whole provider dance,
+    the app delete, the husk sweep, and the source seed/render/404 arms);
+    the seeded source row is the one thing left, and the
+    `[tail] oauth-leftover-sweep` line must list exactly its D1 delete.
+    Forcing an arm before the first creation (e.g. `oauth2-app-create-201`)
+    leaves nothing to sweep — the tail stays silent. (The atomic arms — the
+    realm check, the dance — create-and-clean inside one check, so a forced
+    red on them never leaves residue either; the app/grant residue class
+    fires on a mid-arm red.)
   The rehearsal convention: each forced-red run is followed by a
   `cleanup-audit` run, and the audit going green is the sweep's proof.
 - The mirror battery can also be forced honestly through its real budget
