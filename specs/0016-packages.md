@@ -131,7 +131,7 @@ wire-format module):
 | container (`api.go:509-547`) | ≈2,000 ln (routers 1,459: container 796 + blob 195 + manifest 416 + errors 52; plus services 314 + the wire module 204) | OCI: token → blob POST/PATCH/PUT chunked uploads, manifests | yes — JWT flow + upload state + digests | M5 |
 | debian / alpine / rpm / arch | each 300-600 ln | repo metadata index BUILDERS (`Packages`/`Release`/`APKINDEX`/`repodata`/`.repo` files) regenerated on upload/delete (`gitea/services/packages/cleanup/cleanup.go:115-145` rebuild arms) | yes — index files | M6 |
 | cargo (`api.go:156-172`) | ~600 ln + index.go | sparse index: `config.json` + `1|2|3/{name}` version lists derived on read (upstream's HTTP face builds them from the DB per request, cargo.go:66-87 → index.go:139-183); the **git repo** (`_cargo-index`, index.go:29) is only the traditional git-protocol mirror and stays the separate SPEC-attached milestone | yes — D1-derived; the git mirror deferred | **M7 LANDED** (see the cargo as-built) |
-| conan / composer / chef / conda / cran / go / pub / rubygems / swift / terraform / vagrant | each 150-700 ln | per-client wire contracts | protocol-only | long tail, demand-driven — RESOLVED per family at the 2026-11-01 adjudication: terraform **LANDED** (the as-built at the tail), conda **STAGED** (the three Workers codec walls, same as-built) |
+| conan / composer / chef / conda / cran / go / pub / rubygems / swift / terraform / vagrant | each 150-700 ln | per-client wire contracts | protocol-only | long tail, demand-driven — RESOLVED per family at the 2026-11-01 adjudication: terraform **LANDED** (the as-built at the tail), conda **LANDED** (2026-11-01 — the three walls RESOLVED: the bz2 decoder adopted, the `.conda`/zstd + repodata-encoder reductions recorded; the as-built at the tail supersedes this row's earlier STAGED state) |
 
 Verdict: the MODEL is the one shared prerequisite; the protocols are a
 staged family. Only **generic** is "plain UI/API CRUD"-sized — every other
@@ -650,7 +650,10 @@ idiom applies only where the vendored engine grows).
   terraform/vagrant): no committed milestone — each is a client wire contract
   over the SAME model; dispatch on demand, sizes S-M. (The 2026-11-01
   adjudication disposition: terraform LANDED — the as-built at the tail;
-  conda STAGED on the Workers codec walls, same as-built.)
+  [corrected 2026-11-01, the conda unit] conda LANDED too — the three walls
+  RESOLVED (the bz2 decoder adopted; the `.conda`/zstd and repodata-encoder
+  reductions recorded), the as-built at the tail; the census claim this
+  closes: TWENTY-THREE of TWENTY-THREE.)
 
 Entry criteria: ratified SPEC (this document → accepted), then M1 as a
 worker unit; M2+ per the census's wave discipline. Each ecosystem milestone
@@ -2161,3 +2164,137 @@ the package-filename split), the RepoData JSON family
 channel-prefixed names, the subdir composite key — an S-M unit once the
 codecs are decided. NOT counted toward the registry's parity claim until
 then: **the registry carries TWENTY-TWO of TWENTY-THREE**.
+
+## As-built — the long-tail `conda` family: the three walls RESOLVED (2026-11-01 — the staged row's decoder adopted, the zstd + encoder walls recorded as honest reductions; the census claim this section closes: **TWENTY-THREE of TWENTY-THREE**)
+
+The STAGED section above named three Workers codec walls; this unit
+adjudicated each with the BUILD-or-record discipline (upstream parity is
+the default decision; a Workers-impossible wall gets an honestly
+documented reduction):
+
+1. **`.tar.bz2` upload parse — ADOPTED.** `services/packages/conda.ts`
+   imports the landed `bzip2Decompress` (./bz2.ts — the Go
+   compress/bzip2 port; the decoder is generic, its composer naming is
+   doc-only) over distro-common's `readTarMembers`, and walks
+   `info/index.json` (REQUIRED — its absence is ErrInvalidStructure) +
+   `info/about.json` (optional, zero-filled) exactly as
+   metadata.go:132-217 does: the ≤ 32 MiB limited reads, the
+   conda-build name/version grammar verbatim (lowercase, the
+   `=@#$%^&*:;\"'\|<>?/ ` set + `!` in names / `-` in versions), the
+   about-URL validation (abs+host — an `ftp://` dev_url KEEPS, a
+   relative home clears), and the decode-error class split (a type-
+   mismatched/arrailed/dependent-bad index is the plain-error 500 arm
+   exactly like Go's json.Decode failure; a JSON-`null` index is the
+   decode no-op — upstream nil-panics at `i.Name`, our port answers the
+   invalid-name 400, the documented divergence on a crash arm).
+2. **`.conda` upload parse — RECORDED REDUCTION (wall 2).** Verified
+   against the pin first: the pin DOES accept `.conda`
+   (conda.go:37-39, the conda.go:215-216 dispatch → ParsePackageConda,
+   metadata.go:101-130) — zip + a ZSTD decoder for the inner
+   `info-*.tar.zst`. The platform has no zstd surface (the bz2 as-
+   built's probe record: the DecompressionStream union and
+   worker-configuration.d.ts both lack it) and Go's stdlib has neither
+   (upstream rides klauspost/compress); a full zstd decoder port is out
+   of a family unit's scope. THE REDUCTION: every `.conda` upload
+   answers the family's invalid-structure sentinel
+   (`CondaInvalidStructureError` → the 400 arm, conda.go:218-220's
+   ErrInvalidArgument shape) BEFORE any spool — upstream's 201-valid /
+   400-no-info-member / 500-corrupt-zip triple collapses to one 400
+   because no `.conda` can ever parse here. REOPEN TRIGGER: a zstd
+   decoder unit.
+3. **`repodata.json.bz2` serving — RECORDED REDUCTION (wall 3).** The
+   pin DOES serve the `.bz2` variants (conda.go:44's switch +
+   conda.go:170-183's bzip2 writer over github.com/dsnet/compress — a
+   format Go's stdlib cannot WRITE, so there is NO Go-stdlib reference
+   to port). Adjudication: a from-spec encoder (RLE1 + the BWT block
+   sort at up to 900k blocks + MTF/RLE2 + the multi-table
+   length-limited Huffman construction + selector optimization) is
+   >~700 lines and correctness-risky beyond one family unit. THE
+   REDUCTION: plain `repodata.json` / `current_repodata.json` serve
+   FULLY (the RepoData render, below); the `.bz2` names stay OUT of the
+   repodata switch and fall to the pin's own unknown-filename absence
+   shape in that path (Go http.NotFound — conda.go:52's arm; the
+   `404 page not found` page). Conda clients fall back to plain
+   repodata.json on the miss. REOPEN TRIGGER: a dedicated
+   bzip2-encoder unit.
+
+The built surface (api.go:263-267, the conan→conda→cran adjacency; one
+decoded-remainder walk carries the chi PathGroup's `<channel:*>`
+optional-wildcard grammar — `(.*?/)?` per router_path.go:168-179, so a
+nested channel `a/b` spans segments and an empty/short path rides the
+chi NotFound page):
+
+- `GET /<architecture>/<filename>` (+HEAD) and the channel-prefixed
+  twin — ListOrGetPackages (conda.go:41-53): the repodata switch
+  (the two `.json` names only — wall 3), then the package-filename
+  split, then http.NotFound;
+- the repodata render (conda.go:55-187): SearchFiles(channel, subdir)
+  over the `conda.channel` PACKAGE property (exact match — the
+  EMPTY-channel row is written at package creation and the default
+  enumeration needs it) + the `conda.subdir` FILE property; the RepoData
+  body carries `info:{subdir}` / `packages` / `packages.conda` /
+  `removed` in the struct order, the Go map-key sort (bytewise), the
+  13-field PackageInfo order with `md5` rendering EMPTY (no WebCrypto
+  MD5 — the landed blob-row note) and `depends` nil→[], and the
+  json.Encoder trailing newline; zero files → the 404-nil JSON;
+- the package download (conda.go:296-322): the search must answer
+  EXACTLY one row (zero OR multiple is the 404 — conda.go:308's
+  `len != 1`); the D-6 serve walk with the sniffed content type
+  (application/x-bzip2 — the only container the store can hold behind
+  wall 2), the HEAD ride, the lead-file GET-only counter bump
+  (packages.go:668);
+- `PUT /<channel>/<filename>` (+ the empty-channel arm) — the raw-body
+  upload (conda.go:189-294): the filename gate 400-nil, the `.conda`
+  wall 400 (wall 2), the spool → parse → size-quota →
+  CreatePackageOrAddFileToExisting chain: the package named
+  `channel/name` (the bare name when channel-empty, conda.go:232-237)
+  with `conda.name`/`conda.channel` at package CREATION only, the
+  VersionMetadata JSON at version CREATION only (a second file never
+  rewrites it), the stored file `{name}-{version}-{build}{.tar.bz2}`
+  (Go's Sprintf verbatim — an empty build leaves the trailing dash)
+  under the SUBDIR composite key with `conda.subdir`/`conda.metadata`,
+  and ANY duplicate row the ErrDuplicatePackageFile 409; the apiError
+  family body is `{"reason": http.StatusText, "message"}` over
+  application/json;charset=utf-8 (conda.go:26-35) with the 500s
+  stripped to the prod posture's constant.
+
+Documented divergences: the two recorded walls above; the stored-
+metadata JSON renders follow the Go struct tag orders with the
+omitempty sweep (`is_conda` has none — always present); the JSON
+decode gates reduce Go's int64-literal strictness to safe-integer
+checks (the terraform serial posture); upstream's `len(pfs) > 1`
+download ambiguity and the same-key repodata overwrite arm are ported
+literally (the survivor's version is undefined in both); the globallock
+wrapping CreatePackageOrAddFileToExisting rides the landed
+constraint-arbitrated posture (the model.ts header note, every family
+the same).
+
+Tests (own eyes): services `conda.test.ts` **28/28** + route arms
+`packages-conda.test.ts` **9/9** — both quoted over the pair:
+`Tests 37 passed (37)`; the real system-bzip2 fixtures (bzip2 1.0.8 -9,
+embedded base64 — the composer bz2 authoring posture), the
+name/version/URL/decode-error parse arms, the metadata JSON renders,
+the upload chain with the property/creation-only semantics, the
+duplicate 409, the `.conda` wall 400, the exact RepoData render, the
+exactly-one download gate, the channel/nested-channel walk, the `.bz2`
+reduction page, the auth/quota/PACKAGES_ENABLED gates. Neighbors
+unregressed: blobs + model + serve-content + composer routes + conda
+routes `Tests 84 passed (84)`; cran service + terraform routes +
+composer service `Tests 40 passed (40)`. `pnpm -C apps/worker
+typecheck` tree-zero; scoped eslint clean on the four touched files;
+`pnpm check:api` PASS (the conda arms are /api/packages protocol
+routes — outside the v1 contract surface).
+
+- **Open issues (conda):** (1) ~~the vendored bz2 decoder diverges from
+  Go on a zero-run-dominated tiny stream~~ RETRACTED at the same unit's
+  close: the suspect bytes were this unit's own corrupted base64 paste
+  (a stale embed), and a controlled cross-check settled it — Go's
+  compress/bzip2 (go1.25.1) rejects those exact bytes with the SAME
+  "Huffman length out of range" bz2.ts produced, and accepts every
+  fixture bz2.ts accepts (the two decoders AGREE on all tested streams;
+  no bz2-owner unit needed). (2) The two reopen triggers above (a zstd
+  decoder unit for `.conda` uploads; a bzip2-encoder unit for the
+  `.bz2` repodata variants). With conda landed the census closes:
+  **TWENTY-THREE of TWENTY-THREE** protocol surfaces (the 22
+  CommonRoutes groups + container) — the parity claim the 2056
+  section's TWENTY-TWO row staged for.

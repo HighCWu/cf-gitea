@@ -450,6 +450,16 @@ import {
   searchConanRecipes,
   uploadConanFile,
 } from "../../services/packages/conan";
+import {
+  CONDA_REPODATA_JSON_NAMES,
+  CondaInvalidNameError,
+  CondaInvalidStructureError,
+  CondaInvalidVersionError,
+  buildCondaRepodata,
+  isCondaPackageFileName,
+  openCondaFileForDownload,
+  uploadCondaPackageFile,
+} from "../../services/packages/conda";
 
 const WWW_AUTHENTICATE = 'Basic realm="Gitea Package API"';
 
@@ -2541,6 +2551,23 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
   app.get("/:username/vagrant/:name/:version/:provider", (c) => vagrantDownload(c));
   app.on("HEAD", "/:username/vagrant/:name/:version/:provider", (c) => vagrantDownload(c));
   app.put("/:username/vagrant/:name/:version/:provider", (c) => vagrantUpload(c));
+
+  // ------------------------------ CONDA (api.go:263-267) ------------------------------
+  // The conda family: the conan→conda→cran adjacency's PathGroup — chi's
+  // `<channel:*>` is the OPTIONAL non-greedy wildcard (`(.*?/)?`), so GET
+  // splits `/…/<architecture>/<filename>` (channel = everything before the
+  // last two segments, "" included) and PUT `/…/<filename>` (channel before
+  // the last); a path with an EMPTY segment (or fewer than two) matches no
+  // pattern and rides the chi NotFound page. One decoded-remainder walk
+  // carries both methods (the conan posture); the group's read wrap rides
+  // every arm, the PUT adds the write gate. HEAD rides the GET walks (the
+  // pypi/helm precedent — upstream registers GET only). The `.bz2` repodata
+  // names stay OUT of the switch (the wall-3 reduction — they fall to the
+  // unknown-filename NotFound page; the wall-2 `.conda` uploads answer the
+  // invalid-structure 400).
+
+  app.on(["GET", "HEAD"], "/:username/conda/*", (c) => condaDispatch(c));
+  app.put("/:username/conda/*", (c) => condaDispatch(c));
 
   // ------------------------------ CRAN (api.go:300-318) ------------------------------
   // The R family: the src/contrib + bin/{platform}/contrib/{rversion}
@@ -4882,6 +4909,239 @@ async function terraformUnlock(c: Context<{ Bindings: Env }>): Promise<Response>
     console.error("[packages-terraform] unlock failed", error);
     return terraformPlainText(500, "internal server error");
   }
+}
+
+// ---------------------------------------------------------------------------
+// CONDA — conda.go:26-35 (the JSON apiError {reason, message} pair over
+// ctx.JSON's application/json;charset=utf-8) + the api.go:263-267 PathGroup
+// arms, one decoded-remainder walk (the conan posture).
+// ---------------------------------------------------------------------------
+
+/** http.StatusText over the statuses the family answers. */
+function condaStatusText(status: 400 | 401 | 403 | 404 | 409 | 413 | 500): string {
+  switch (status) {
+    case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 403: return "Forbidden";
+    case 404: return "Not Found";
+    case 409: return "Conflict";
+    case 413: return "Request Entity Too Large";
+    case 500: return "Internal Server Error";
+  }
+}
+
+/** apiError (conda.go:26-35): `{"reason": http.StatusText(status),
+ *  "message": ProcessErrorForUser(obj)}` — the 500s strip to the prod
+ *  posture's constant (the landed families' 500 arm). */
+function condaApiError(status: 400 | 401 | 403 | 404 | 409 | 413 | 500, message: string): Response {
+  return new Response(
+    JSON.stringify({ reason: condaStatusText(status), message }),
+    { status, headers: { "content-type": "application/json;charset=utf-8" } },
+  );
+}
+
+/** Go http.NotFound — the chi NotFound page the PathGroup falls to for an
+ *  unmatched shape (unknown filenames, `.bz2` repodata names — the wall-3
+ *  reduction — and empty/short paths). */
+function condaNotFoundPage(): Response {
+  return goNotFoundPage();
+}
+
+type CondaGetTarget = { arm: "get"; channel: string; architecture: string; filename: string };
+type CondaPutTarget = { arm: "put"; channel: string; filename: string };
+
+/**
+ * The chi pattern walk (router_path.go:147-193): `<channel:*>` compiles to
+ * the OPTIONAL non-greedy `(.*?/)?` (with the pathSepEnd trailing-slash
+ * trim), `<architecture>`/`<filename>` to `[^/]+` — so an EMPTY segment or
+ * a short path matches no pattern (the chi NotFound), GET spans at least
+ * two segments (channel = everything before the last two), PUT at least
+ * one (channel before the last).
+ */
+function parseCondaPath(parts: string[], method: string): CondaGetTarget | CondaPutTarget | null {
+  if (parts.length === 0 || parts.some((part) => part === "")) return null;
+  if (method === "PUT") {
+    return { arm: "put", channel: parts.slice(0, -1).join("/"), filename: parts[parts.length - 1] ?? "" };
+  }
+  if (parts.length < 2) return null;
+  return {
+    arm: "get",
+    channel: parts.slice(0, -2).join("/"),
+    architecture: parts[parts.length - 2] ?? "",
+    filename: parts[parts.length - 1] ?? "",
+  };
+}
+
+async function condaDispatch(c: Context<{ Bindings: Env }>): Promise<Response> {
+  try {
+    // The PathGroup's read wrap rides EVERY arm (api.go:268) — upstream's
+    // group middlewares run before the matcher dispatch; the PUT adds the
+    // write gate (conda.go:265).
+    if (c.req.method === "PUT") {
+      const { owner, cred } = await protocolContext(c, "write");
+      const doer = cred.doer;
+      if (doer === null) {
+        return condaApiError(401, "user should have specific permission or be a site admin");
+      }
+      const target = condaPathOf(c, "put");
+      if (target === null || target.arm !== "put") return condaNotFoundPage();
+      return await condaUpload(c, owner, doer, target.channel, target.filename);
+    }
+    const { owner } = await protocolContext(c, "read");
+    const target = condaPathOf(c, "get");
+    if (target === null || target.arm !== "get") return condaNotFoundPage();
+    return await condaListOrGetPackages(c, owner, target.channel, target.architecture, target.filename);
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    throw error;
+  }
+}
+
+/** The decoded-remainder walk (the conan posture: RESERVED escapes survive
+ *  in c.req.path; the walk decodes per segment, a malformed escape 404s). */
+function condaPathOf(c: Context<{ Bindings: Env }>, arm: "get" | "put"): CondaGetTarget | CondaPutTarget | null {
+  const rawPath = c.req.path;
+  const segments = rawPath.split("/");
+  // ["", "api", "packages", {username}, "conda", …]
+  const prefix = `/api/packages/${segments[3] ?? ""}/conda`;
+  if (!rawPath.startsWith(`${prefix}/`)) return null;
+  const parts: string[] = [];
+  for (const part of rawPath.slice(prefix.length + 1).split("/")) {
+    try {
+      parts.push(decodeURIComponent(part));
+    } catch {
+      return null;
+    }
+  }
+  return parseCondaPath(parts, arm === "put" ? "PUT" : "GET");
+}
+
+/** ListOrGetPackages (conda.go:41-53): the repodata switch (the `.bz2`
+ *  twins stay out — wall 3), then the package-filename split, then Go's
+ *  http.NotFound. */
+async function condaListOrGetPackages(
+  c: Context<{ Bindings: Env }>,
+  owner: UserRow,
+  channel: string,
+  architecture: string,
+  filename: string,
+): Promise<Response> {
+  if (CONDA_REPODATA_JSON_NAMES.includes(filename)) {
+    return condaEnumerate(c, owner, channel, architecture);
+  }
+  if (isCondaPackageFileName(filename)) {
+    return condaDownload(c, owner, channel, architecture, filename);
+  }
+  return condaNotFoundPage();
+}
+
+/** EnumeratePackages (conda.go:55-187): the RepoData JSON render; the
+ *  zero-files arm is the 404-nil (conda.go:102-105); the content type is
+ *  the `.json` branch's application/json (the bzip2 branch is unreachable
+ *  behind wall 3). */
+async function condaEnumerate(c: Context<{ Bindings: Env }>, owner: UserRow, channel: string, architecture: string): Promise<Response> {
+  try {
+    const body = await buildCondaRepodata(c.env.DB, owner, channel, architecture);
+    if (body === null) return condaApiError(404, "");
+    return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    console.error("[packages-conda] repodata render failed", error);
+    return condaApiError(500, "internal server error");
+  }
+}
+
+/** DownloadPackageFile (conda.go:296-322): the EXACTLY-one search → the
+ *  D-6 serve walk. helper.ServePackageFile → ctx.ServeContent sniffs the
+ *  stored bytes: the BZh magic answers application/x-bzip2 (the only
+ *  container the store can hold — wall 2 keeps the .conda zip sniff
+ *  unreachable). */
+async function condaDownload(
+  c: Context<{ Bindings: Env }>,
+  owner: UserRow,
+  channel: string,
+  architecture: string,
+  filename: string,
+): Promise<Response> {
+  try {
+    const download = await openCondaFileForDownload(
+      c.env.DB,
+      c.env.REPO_PACKS,
+      owner,
+      channel,
+      architecture,
+      filename,
+      c.req.method === "HEAD" ? "HEAD" : "GET",
+    );
+    if (download === null) return condaApiError(404, "");
+    return fileResponse(
+      c,
+      { stream: download.stream, size: download.size, filename: download.file.name, created: download.file.createdUnix },
+      filename.endsWith(".conda") ? "application/zip" : "application/x-bzip2",
+    );
+  } catch (error) {
+    if (error instanceof HTTPException) return error.getResponse();
+    console.error("[packages-conda] download failed", error);
+    return condaApiError(500, "internal server error");
+  }
+}
+
+/** UploadPackageFile (conda.go:189-294): the filename gate rides HERE
+ *  (after the auth gates — the handler's own 400-nil arm), then the
+ *  spool/parse/store chain. */
+async function condaUpload(
+  c: Context<{ Bindings: Env }>,
+  owner: UserRow,
+  doer: AuthUser,
+  channel: string,
+  filename: string,
+): Promise<Response> {
+  if (!isCondaPackageFileName(filename)) {
+    return condaApiError(400, "");
+  }
+  try {
+    await uploadCondaPackageFile({
+      d1: c.env.DB,
+      bucket: c.env.REPO_PACKS,
+      owner,
+      doer,
+      channel,
+      filename,
+      content: bodyStream(c.req.raw),
+      declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
+      quota: packagesQuotaFromEnv(c.env),
+    });
+    return new Response(null, { status: 201 });
+  } catch (error) {
+    return condaUploadError(error);
+  }
+}
+
+function condaUploadError(error: unknown): Response {
+  if (error instanceof HTTPException) return error.getResponse();
+  // The ErrInvalidArgument sentinels → the 400 arm (conda.go:218-220);
+  // wall 2's `.conda` reduction rides CondaInvalidStructureError.
+  if (
+    error instanceof CondaInvalidStructureError ||
+    error instanceof CondaInvalidNameError ||
+    error instanceof CondaInvalidVersionError
+  ) {
+    return condaApiError(400, error.message);
+  }
+  if (error instanceof DuplicatePackageFileError) return condaApiError(409, "package file already exists");
+  if (error instanceof QuotaTotalCountError || error instanceof QuotaTypeSizeError || error instanceof QuotaTotalSizeError) {
+    return condaApiError(403, quotaMessage(error));
+  }
+  // The store-cap classes (the documented divergences — upstream's
+  // unbounded spool has neither arm).
+  if (error instanceof PackageSizeMismatchError) {
+    return condaApiError(500, "internal server error");
+  }
+  if (error instanceof PackageBlobTooLargeError) {
+    return condaApiError(413, "package file is too large");
+  }
+  console.error("[packages-conda] upload failed", error);
+  return condaApiError(500, "internal server error");
 }
 
 // ---------------------------------------------------------------------------
