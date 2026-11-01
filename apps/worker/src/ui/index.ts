@@ -1791,6 +1791,13 @@ import {
   renderReleasesFeedRss,
 } from "./pages/releases-feed-xml";
 import { loadTagsFeedData, TAGS_FEED_CONTENT_TYPES, renderTagsFeedAtom, renderTagsFeedRss } from "./pages/tags-feed-xml";
+// The per-branch commit feeds (web.go:1746-1747).
+import {
+  BRANCH_FEED_CONTENT_TYPES,
+  loadBranchFeedData,
+  renderBranchFeedAtom,
+  renderBranchFeedRss,
+} from "./pages/branch-feed-xml";
 // Window-2e B2: the repo-scoped aux/fragment modules.
 import {
   issuesSearchResponse,
@@ -2276,6 +2283,18 @@ export interface TagsFeedRoute {
   family: "tags-feed-rss" | "tags-feed-atom";
   owner: string;
   repo: string;
+}
+
+/** The per-BRANCH commit feeds (pages/branch-feed-xml.ts — upstream
+ *  web.go:1746-1747's wildcard branch-name feed tails at the /rss/branch
+ *  and /atom/branch paths): the slash-carrying branch name claims every
+ *  remainder segment (junk names stay claimed — the loader's null IS the
+ *  RepoRefByType middleware's 404). */
+export interface BranchFeedRoute {
+  family: "branch-feed-rss" | "branch-feed-atom";
+  owner: string;
+  repo: string;
+  branch: string;
 }
 
 /** The wave-41 rendered blob views (pages/render-files.ts): upstream
@@ -3721,6 +3740,7 @@ export type ParsedUiRoute =
   | ReleaseDownloadRoute
   | ReleasesFeedRoute
   | TagsFeedRoute
+  | BranchFeedRoute
   | RenderFileRoute
   | LastCommitRoute
   | BlobExcerptRoute
@@ -5838,6 +5858,20 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       return { family: head === "tags.rss" ? "tags-feed-rss" : "tags-feed-atom", owner, repo };
     }
     return null;
+  }
+  // The per-branch commit feeds (web.go:1746-1747 — /rss|atom/branch/{name},
+  // the name spans every remainder segment; exact-literal heads, chi-case-
+  // sensitive; junk names stay claimed — the loader's null is the
+  // RepoRefByType middleware's 404).
+  if ((head === "rss" || head === "atom") && rest.length >= 2 && rest[0] === "branch") {
+    let branch: string;
+    try {
+      branch = rest.slice(1).map((segment) => decodeURIComponent(segment)).join("/");
+    } catch {
+      return null;
+    }
+    if (branch === "") return null;
+    return { family: head === "rss" ? "branch-feed-rss" : "branch-feed-atom", owner, repo, branch };
   }
   if (head === "tags") {
     if (rest.length === 0) return { family: "tags", owner, repo };
@@ -13918,6 +13952,29 @@ async function tagsFeedRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
   );
 }
 
+/** GET /{owner}/{repo}/rss|atom/branch/{name} (web.go:1746-1747 — the
+ *  per-branch commit feed; the tagsFeedRoute shape minus MustBeNotEmpty:
+ *  the group has NO such gate, an empty repo 404s through the same loader
+ *  arm). */
+async function branchFeedRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { route, ctx, respond, repo, url } = resolved;
+  if (route.family !== "branch-feed-rss" && route.family !== "branch-feed-atom") {
+    return respond(await c.notFound()); // registration/parser drift guard
+  }
+  const data = await loadBranchFeedData(c.env, c.env.DB, repo, route.branch, url.origin, routeNow());
+  if (data === null) return respond(c.html(renderNotFound(ctx), 404)); // unknown branch (RepoRefByType)
+  const body = route.family === "branch-feed-rss" ? renderBranchFeedRss(data) : renderBranchFeedAtom(data);
+  return respond(
+    new Response(body, {
+      headers: {
+        "content-type": route.family === "branch-feed-rss" ? BRANCH_FEED_CONTENT_TYPES.rss : BRANCH_FEED_CONTENT_TYPES.atom,
+      },
+    }),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // The wave-41 rendered blob views (pages/render-files.ts — the survey's
 // row 3: upstream web.go:1715-1719's /render group over repo.RenderFile)
@@ -16948,6 +17005,9 @@ uiRouter.get("/:owner{^[\\w-]+\\.(rss|atom)$}", (c) => userFeedRoute(c));
 // `releases.rss`/`tags.rss` second segment.
 uiRouter.get("/:owner/:repo/:segment{^releases\\.(rss|atom)$}", (c) => releasesFeedRoute(c));
 uiRouter.get("/:owner/:repo/:segment{^tags\\.(rss|atom)$}", (c) => tagsFeedRoute(c));
+// The per-branch commit feeds (web.go:1746-1747 — the wildcard branch name).
+uiRouter.get("/:owner/:repo/rss/branch/*", (c) => branchFeedRoute(c));
+uiRouter.get("/:owner/:repo/atom/branch/*", (c) => branchFeedRoute(c));
 // Window-2e B2: the repo-scoped aux/fragment routes.
 uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/info", (c) => issueInfoFragmentRoute(c));
 uiRouter.get("/:owner/:repo/:kind{issues|pulls}/:index{\\d+}/attachments", (c) => issueAttachmentsFragmentRoute(c));

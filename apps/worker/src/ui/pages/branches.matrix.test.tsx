@@ -844,20 +844,19 @@ describe("w100 feed/archive absence (w129 batch-14: the documented never-pinned 
     // Provenance: wave-polish-matrix-14 (census gap a3, branches.tsx's
     // Reductions block). The render is exercised signed-in (the owner sees
     // the full writer chrome) so the absence cannot be a gate artifact.
-    // Census gap #10(b) landed the feed MODULE (pages/branch-feed-xml.ts —
-    // both envelopes over the log read) but NOT its route seam: ui/index.ts
-    // is the orchestrator's fold window, and until that mount lands the
-    // anchor would target a 404 (the dead-link rule). The absence holds
-    // until the module doc's route-seam HANDOFF executes — that fold flips
-    // this pin deliberately to the rendered-button arms (list.tmpl:44-45/
-    // :173-174's EnableFeed anchor: octicon-rss + the rss_feed tooltip +
-    // the /rss/branch/ href with PathEscapeSegments).
+    // Census gap #10(b) LANDED THROUGH (the module + the route-seam fold):
+    // the per-branch EnableFeed anchor renders (list.tmpl:44-45/:173-174 —
+    // octicon-rss + the rss_feed tooltip + the /rss/branch/ href with
+    // PathEscapeSegments); the ARCHIVE arms stay the header's reduction.
     const res = await get(`/${OWNER}/w100br/branches`, OWNER);
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).not.toContain("octicon-rss"); // the feed button's glyph
-    expect(html).not.toContain("rss/branch/"); // its href shape
-    expect(html).not.toContain("rss_feed"); // its tooltip literal
+    expect(html).toContain("octicon-rss"); // the feed button's glyph
+    expect(html).toContain("rss/branch/"); // its href shape
+    expect(html).toContain("RSS Feed"); // its tooltip (the rss_feed locale's value)
+    expect(html).not.toContain("archive-link"); // the ZIP/TAR.GZ anchor class
+    expect(html).not.toContain("/archive/"); // the archive href shape
+    expect(html).not.toContain("octicon-file-zip"); // the archive glyph
     expect(html).not.toContain("archive-link"); // the ZIP/TAR.GZ anchor class
     expect(html).not.toContain("/archive/"); // the archive href shape
     expect(html).not.toContain("octicon-file-zip"); // the archive glyph

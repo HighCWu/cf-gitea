@@ -310,6 +310,7 @@ export const branchesLocale = {
   branch_name: "Branch Name", // "repo.branch.name" (the create form's input label)
   rename_branch: (name: string): string => `Rename Branch "${name}"`, // "repo.branch.rename" (the rename button's tooltip)
   rename_to: (name: string): string => `Rename "${name}" to:`, // "repo.branch.rename_branch_to" (the rename input's label)
+  rss_feed: "RSS Feed", // "rss_feed" (the per-branch feed anchor's tooltip, list.tmpl:44-45)
   included: "Included", // "repo.branch.included"
   included_desc: "This branch is part of the default branch", // "repo.branch.included_desc" (the Included label's tooltip)
   compare_changes: "New Pull Request", // "repo.pulls.compare_changes" (the compare button, CanPull viewers)
@@ -842,6 +843,25 @@ function BranchCreateForm(props: { repoLink: string; from: string }) {
  *  `from`), posting upstream's POST `/branches/rename` (web.go:1486 +
  *  RenameBranchForm). The POST arm mounted with the window-2e folds
  *  (635ce2e — w129 batch-14 sweep: was "NOT mounted", the HANDOFF). */
+/** list.tmpl:44-45's EnableFeed anchor: `{RepoLink}/rss/branch/{name}` with
+ *  PathEscapeSegments (each segment encodeURIComponent'd, the slashes kept)
+ *  — ungated (upstream renders it beside the writer pair for every viewer;
+ *  the route seam landed with pages/branch-feed-xml.ts). */
+function BranchRssButton(props: { repoLink: string; name: string }) {
+  const escaped = props.name.split("/").map(encodeURIComponent).join("/");
+  return (
+    <a
+      role="button"
+      class="btn interact-bg tw-p-2"
+      href={`${props.repoLink}/rss/branch/${escaped}`}
+      aria-label={branchesLocale.rss_feed}
+      data-tooltip-content={branchesLocale.rss_feed}
+    >
+      <Icon name="octicon-rss" />
+    </a>
+  );
+}
+
 function BranchRenameForm(props: { repoLink: string; name: string }) {
   return (
     <form
@@ -1063,6 +1083,9 @@ export function BranchesPage(props: { ctx: UiContext; data: BranchesData; canAdm
                           <BranchRenameForm repoLink={repoLink} name={data.defaultBranch} />
                         </>
                       ) : null}
+                      {/* list.tmpl:44-45's EnableFeed anchor — ungated (the
+                          landed /rss/branch/* route seam). */}
+                      <BranchRssButton repoLink={repoLink} name={data.defaultBranch} />
                     </div>
                   </td>
                 </tr>
@@ -1122,10 +1145,11 @@ export function BranchesPage(props: { ctx: UiContext; data: BranchesData; canAdm
                   <td class="three wide">
                     <div class="tw-flex tw-flex-wrap tw-justify-end">
                       {/* list.tmpl:163-200's per-row order: create, rename,
-                          then delete (the RSS/download arms stay unrendered —
-                          the header's reductions). */}
+                          then the RSS anchor (the download arm stays
+                          unrendered — the header's reduction). */}
                       {writerControls ? <BranchCreateForm repoLink={repoLink} from={row.name} /> : null}
                       {writerControls ? <BranchRenameForm repoLink={repoLink} name={row.name} /> : null}
+                      <BranchRssButton repoLink={repoLink} name={row.name} />
                       {/* Delete folds the archived refusal into the render
                           gate — upstream gates all three controls identically
                           (list.tmpl:199's IsWriter + CanContentChange); the
