@@ -8,7 +8,10 @@ import { z } from "zod";
 
 import {
   orgMembers,
+  packageVersions,
+  packages,
   repositories,
+  twoFactor,
   userRedirects,
   users,
 } from "../../db/schema";
@@ -95,9 +98,13 @@ import { toApiUser } from "../services/user";
  *      rides; D1 cascade + tombstone inline, R2-prefix purge/destroy
  *      enqueued to REPO_TASKS) and removes memberships (a last-owner org
  *      DELETED through OrgService, upstream's DeleteOrganization(org, true)
- *      shape); purge=false keeps the table-free guards — owned repos and org
+ *      shape) and sweeps every owned package through the
+ *      deletePackageAndReferences cascade (upstream's RemoveAllPackages,
+ *      user.go:249-253 → services/packages/packages.go:720-750); purge=false
+ *      keeps the table-free guards — owned repos and org
  *      memberships still 422 exactly like upstream's non-purge path
- *      (user.go:238-251). The cascade + the census live in the service
+ *      (user.go:238-251), packages ownership included (the third in-tx
+ *      guard, user.go:250-255). The cascade + the census live in the service
  *      (`deleteUserCascade`, services/user-accounts.ts); the earlier
  *      accepted-and-undistinguished posture (noted 2026-10-28) predates the
  *      engine-backed cascade — a purge that silently dropped rows would have
@@ -110,10 +117,12 @@ import { toApiUser } from "../services/user";
  *      storage variant in `users.type` (enum 'user'|'org') — that arm answers
  *      upstream's CheckConvertUserType 400 `user type can not be converted`
  *      (services/user/update.go:299–307) as the closest declared error.
- *   4. **No restricted / 2FA / external-login columns**: `restricted` and
- *      `is_2fa_enabled` filters evaluate against the constant
- *      false-everything state (true filters match nothing);
- *      `source_id`/`login_name` filters likewise (every user is local).
+ *   4. **No restricted / external-login columns**: the `restricted` filter
+ *      evaluates against the constant false-everything state (true filters
+ *      match nothing); `source_id`/`login_name` filters likewise (every user
+ *      is local). `is_2fa_enabled` LEFT this deviation when the `two_factor`
+ *      store landed (migration 0059) — the filter is the real EXISTS over it
+ *      by uid, both polarities live (search.go:142–162's LEFT JOIN in twin).
  *   5. **No `updated` column**: the adminSearchUsers `updated` sort orders by
  *      `created_at` (upstream orders by `updated_unix`, user/search.go:21–36).
  *   6. **`active`/`prohibit_login` conflation**: upstream keeps two columns;
@@ -325,14 +334,25 @@ async function searchAdminUsers(
   if (isAdminRaw !== null && isAdminRaw !== "") {
     conditions.push(eq(users.isAdmin, formBoolValue(isAdminRaw)));
   }
-  // restricted / 2FA: constant false-everything state (deviation 4).
+  // restricted: constant false-everything state (deviation 4 — no
+  // users.restricted column exists).
   const isRestrictedRaw = url.searchParams.get("is_restricted");
   if (isRestrictedRaw !== null && isRestrictedRaw !== "" && formBoolValue(isRestrictedRaw)) {
     conditions.push(sql`0 = 1`);
   }
   const isTwoFaRaw = url.searchParams.get("is_2fa_enabled");
-  if (isTwoFaRaw !== null && isTwoFaRaw !== "" && formBoolValue(isTwoFaRaw)) {
-    conditions.push(sql`0 = 1`);
+  if (isTwoFaRaw !== null && isTwoFaRaw !== "") {
+    // Upstream LEFT OUTER JOINs two_factor and keeps `two_factor.uid IS NOT
+    // NULL` / `IS NULL` (search.go:142-162, engaged only when the option was
+    // provided — our presence gate). The EXISTS twin over our `two_factor`
+    // store (migration 0059) is equivalent: the uid UNIQUE makes the join
+    // 1:0..1, so a NULL join row ⇔ no enrollment row.
+    const enrolled = formBoolValue(isTwoFaRaw);
+    conditions.push(
+      enrolled
+        ? sql`EXISTS (SELECT 1 FROM ${twoFactor} WHERE ${twoFactor.userId} = ${users.id})`
+        : sql`NOT EXISTS (SELECT 1 FROM ${twoFactor} WHERE ${twoFactor.userId} = ${users.id})`,
+    );
   }
 
   const sort = resolveAdminUserSort(url);
@@ -987,13 +1007,14 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
   // DELETE /admin/users/{username} — the DeleteUser ladder
   // (admin/user.go:292-316): the org/self guards, the last-admin guard
   // (services/user/user.go:147-149), then — WITHOUT purge — the repo/
-  // membership count guards upstream checks inside its final transaction
-  // (user.go:234-248, the route's 422 mapping at admin/user.go:303-311).
-  // The cascade itself (purge's owned-repo + membership arms, the
-  // branch-protection scrub, the census batch and the row delete) is the
-  // deleteUserCascade service (services/user-accounts.ts) — the port of
-  // upstream's DeleteUser/deleteUser pair. Deviation 2: purge is now
-  // distinguished through the real repo cascade.
+  // membership/packages count guards upstream checks inside its final
+  // transaction (user.go:234-255, the route's 422 mapping at
+  // admin/user.go:303-311). The cascade itself (purge's owned-repo +
+  // membership + packages arms, the branch-protection scrub, the census
+  // batch and the row delete) is the deleteUserCascade service
+  // (services/user-accounts.ts) — the port of upstream's
+  // DeleteUser/deleteUser pair. Deviation 2: purge is now distinguished
+  // through the real repo cascade.
   app.openapi(adminDeleteUserRoute(requireAuth), async (c) => {
     const { username } = c.req.valid("param");
     const target = await resolveTargetRow(c, username);
@@ -1031,6 +1052,22 @@ export function registerAdminT2Routes(app: OpenAPIHono<ApiEnv>, requireAuth: Mid
         .get();
       if ((membershipCount?.total ?? 0) > 0) {
         throw new ApiError(422, `user still has membership of organizations [uid: ${target.id}]`);
+      }
+      // The third in-tx guard (user.go:250-255): `HasOwnerPackages` (an
+      // INNER JOIN over package_versions with is_internal=false —
+      // models/packages/package.go:342-351) → `ErrUserOwnPackages` ("user
+      // still has ownership of packages [uid: N]", package.go:338-340),
+      // mapped 422 beside the repos/orgs pair (admin/user.go:303-311). The
+      // purge path clears the packages first (the cascade's sweep), matching
+      // upstream running RemoveAllPackages before this transaction.
+      const packageCount = await db
+        .select({ total: sql<number>`count(*)` })
+        .from(packageVersions)
+        .innerJoin(packages, eq(packages.id, packageVersions.packageId))
+        .where(and(eq(packages.ownerId, target.id), eq(packageVersions.isInternal, false)))
+        .get();
+      if ((packageCount?.total ?? 0) > 0) {
+        throw new ApiError(422, `user still has ownership of packages [uid: ${target.id}]`);
       }
     }
 

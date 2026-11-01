@@ -7,7 +7,19 @@ import type { BatchItem } from "drizzle-orm/batch";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 import { z } from "zod";
 
-import { orgMembers, repositories, teamMembers, teamRepoAccess, teams, users, type TeamAccessMode } from "../../db/schema";
+import {
+  issueAssignees,
+  issueStopwatches,
+  issueSubscriptions,
+  issues,
+  orgMembers,
+  repositories,
+  teamMembers,
+  teamRepoAccess,
+  teams,
+  users,
+  type TeamAccessMode,
+} from "../../db/schema";
 import { LastOrgOwnerError } from "../../services/orgs/errors";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import { scrubTeamFromOrgRules } from "../../services/branch-protection";
@@ -21,8 +33,12 @@ import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
 import { orgDoerOf, orgVisibleToDoer, toApiOrganization } from "../services/org-repos";
 import { requireOrgMembership, requireOrgOwnership, resolveOrgForRequest, type OrgProfileDoer } from "../services/orgs";
 import { isRepositoryAdmin, requireRepoAdmin, requireVisibleRepo } from "../services/repo-access";
+import { unwatchRepo, watchRepo } from "../services/repo-watchers";
 import {
+  doerRepoAccessMode,
+  findRepositoryById,
   findUserByName,
+  formBoolValue,
   toApiRepository,
   viewerOf,
   type RepositoryWithOwner,
@@ -93,6 +109,10 @@ import { toApiUser } from "../services/user";
  *                               team.go:469–471) is LIVE — the user-blocks
  *                               model landed; the arm is wired at the
  *                               handler (the blocks-enforcement sweep)
+ *   - teamSearch:               500 {"ok":false,"error":"SearchTeam internal
+ *                               failure"} — SearchTeam's DB-error body
+ *                               (team.go:810–818), a custom shape NOT the
+ *                               blanked APIErrorInternal one
  *
  * Enforced-in-this-module repo-access slice (the teams half of
  * GetDoerRepoPermission, models/perm/access/repo_permission.go): the
@@ -106,10 +126,13 @@ import { toApiUser } from "../services/user";
  * Documented deviations (also in src/db/schema.ts): `authorize` is a TEXT
  * enum (upstream INTEGER `authorize`); unit overrides collapse onto
  * `teams.units_map` JSON (upstream `team_unit` table — no unit ACL exists to
- * enforce); `includes_all_repositories` fan-out is UNION-on-read (upstream
- * materializes `team_repo` rows at create/edit — org repos created later are
- * not materialized because the org-repo create path is not this module's
- * file); no `users.num_teams` counter (users table is frozen — nothing in
+ * enforce); `includes_all_repositories` coverage is UNION-on-read for
+ * flag-true teams (repos created after the create/edit fan-out are not
+ * materialized — the org-repo create path is not this module's file — while
+ * upstream re-materializes on every org-repo create; the create/edit
+ * fan-outs themselves DO materialize rows, see createTeam/editTeam, so the
+ * flag-OFF aftermath matches upstream's no-strip PATCH parity); no
+ * `users.num_teams` counter (users table is frozen — nothing in
  * the API surface reads it); site-admin bypasses ride the landed guard
  * modules.
  */
@@ -451,8 +474,9 @@ export class TeamsService {
    * maps every UpdateTeam error through APIErrorInternal (team.go:311–314).
    * Permission/units changes ride `assignTeamPermission` (the hasPermFields
    * branch, team.go:296–304); the owner-team guards are dead code here
-   * (bridge — no team is the owners team). The includes-all flag needs no
-   * fan-out: coverage is unioned on read (module header).
+   * (bridge — no team is the owners team). The includes-all flag IS applied
+   * (org/team.go:293–297) with UpdateTeam's fan-out (services/org/
+   * team.go:167–174 — see the inline comment for the union reconciliation).
    */
   async editTeam(team: TeamRecord, form: EditTeamOption): Promise<TeamRecord> {
     const patch: Partial<typeof teams.$inferInsert> = {};
@@ -478,9 +502,80 @@ export class TeamsService {
       patch.authorize = parsed.authorize;
       patch.unitsMap = parsed.unitsMapJson;
     }
+
+    // THE INCLUDES-ALL TOGGLE (org/team.go:293-297: the field's presence
+    // flips the flag — the `!team.IsOwnerTeam()` guard is dead code under the
+    // bridge — and UpdateTeam fans out). THE RECONCILIATION with our
+    // documented read-side deviation (module header: coverage is UNIONed on
+    // read, the org-repo create path materializes nothing): for a flag-true
+    // team the materialized rows are semantically INERT while the flag stays
+    // on (the union already covers everything) — they exist for the flag-OFF
+    // aftermath, because upstream's PATCH path has NO strip arm:
+    // UpdateTeam's includeAllChanged arm is ADD-only (services/org/
+    // team.go:167-174, `if includeAllChanged && t.IncludesAllRepositories`),
+    // and RemoveAllRepositoriesFromTeam fires only from DeleteTeam
+    // (team.go:213 — itself a no-op for includes-all teams, repo_team.go:104)
+    // and the web-only removeall action (web/org/teams.go:299). So the
+    // faithful port is: store the flag; when the request sets it TRUE,
+    // materialize rows for every CURRENT org repo not already rowed
+    // (AddAllRepositoriesToTeam, repo_team.go:72-98 — HasTeamRepo is the raw
+    // table probe, team_repo.go:25-30, so the flag never gates the skip);
+    // when FALSE, flip the column and leave the rows — the previously rowed
+    // repos KEEP their grant (upstream parity), and only the never-rowed
+    // repos (created after the last ON) lose coverage. That is exactly the
+    // observable upstream shape; the module header's "fan-out is
+    // UNION-on-read" deviation narrows to the create/edit-time materialization
+    // parity (createTeam has fanned out since the SPEC-0007 §3.5 landing).
+    const covered = new Set(
+      (
+        await this.db
+          .select({ repoId: teamRepoAccess.repoId })
+          .from(teamRepoAccess)
+          .where(eq(teamRepoAccess.teamId, team.id))
+          .all()
+      ).map((row) => row.repoId),
+    );
+    const fanOutRepoIds =
+      form.includes_all_repositories === true
+        ? (
+            await this.db
+              .select({ id: repositories.id })
+              .from(repositories)
+              .where(eq(repositories.ownerId, team.orgId))
+              .all()
+          )
+            .map((row) => row.id)
+            .filter((repoId) => !covered.has(repoId))
+        : [];
+    if (form.includes_all_repositories !== undefined) {
+      patch.includesAllRepositories = form.includes_all_repositories;
+    }
+
     if (Object.keys(patch).length > 0) {
       try {
-        await this.db.update(teams).set(patch).where(eq(teams.id, team.id));
+        await this.db.batch([
+          this.db
+            .update(teams)
+            .set(
+              // IncrTeamRepoNum per added row (repo_team.go:44-47) — the
+              // maintained counter the members total header convention rides.
+              fanOutRepoIds.length > 0 ? { ...patch, numRepos: sql`num_repos + ${fanOutRepoIds.length}` } : patch,
+            )
+            .where(eq(teams.id, team.id)),
+          ...(fanOutRepoIds.length > 0
+            ? [
+                // onConflictDoNothing: a concurrent addTeamRepo winning the
+                // race must not fail the whole edit as the rename-collision
+                // 500 (the counter bump then over-counts by the skipped
+                // rows — the same theoretical drift addTeamRepo's
+                // concurrent-add comment accepts).
+                this.db
+                  .insert(teamRepoAccess)
+                  .values(fanOutRepoIds.map((repoId) => ({ orgId: team.orgId, teamId: team.id, repoId })))
+                  .onConflictDoNothing({ target: [teamRepoAccess.teamId, teamRepoAccess.repoId] }),
+              ]
+            : []),
+        ]);
       } catch (error) {
         if (isUniqueViolation(error)) {
           // Upstream: ErrTeamAlreadyExist inside UpdateTeam → APIErrorInternal
@@ -592,10 +687,10 @@ export class TeamsService {
    * `AddTeamMember` (services/org/team.go:247–310): already a member →
    * silent no-op; else ensure the ORG membership first (`AddOrgUser` — the
    * "user will have membership to given organization automatically"), then
-   * the team row + counter in one batch. The blocked-user 403
-   * (team.go:248–250, 469–471) is wired at the route handler above (the
-   * blocks-enforcement sweep) — the service keeps its test-fixture
-   * signature.
+   * the team row + counter in one batch, then the auto-watch rider
+   * (team.go:289-307). The blocked-user 403 (team.go:248–250, 469–471) is
+   * wired at the route handler above (the blocks-enforcement sweep) — the
+   * service keeps its test-fixture signature.
    */
   async addTeamMember(team: TeamRecord, userId: number): Promise<void> {
     if (await this.isTeamMember(team.id, userId)) return;
@@ -612,21 +707,61 @@ export class TeamsService {
       if (isUniqueViolation(error)) return; // concurrent add — upstream's in-tx re-check
       throw error;
     }
+    // The auto-watch rider (team.go:289-307): the team's covered repos are
+    // watched for the new member when AUTO_WATCH_NEW_REPOS is on — default
+    // TRUE at the pin (setting/service.go:215 `MustBool(true)`); cf-gitea
+    // models no config var, so the default-true posture rides
+    // unconditionally. Upstream fires it in a goroutine (log-only,
+    // best-effort); ours runs inline — the same statements, determinism over
+    // the goroutine's performance shape. `watchRepo` IS the
+    // WatchRepoAuto(doWatch=true) port: a Custom selection is kept, an
+    // existing watch is the same-mode no-op. The covered set is our union
+    // (see `coveredRepoIds`), a superset of upstream's rowed set only where
+    // our read-side union grants real coverage.
+    const now = new Date();
+    for (const repoId of await this.coveredRepoIds(team)) {
+      await watchRepo(this.d1, repoId, userId, now);
+    }
+  }
+
+  /**
+   * The team's covered repository ids — the read-side union: includes-all →
+   * every org repo, else the explicit `team_repo_access` rows. Upstream's
+   * `GetTeamRepositories(SearchTeamRepoOptions{TeamID})` (the side-effect
+   * loops' source, team.go:292-293/323-325) returns the MATERIALIZED rows
+   * only; our union can add never-rowed repos for a flag-true team (created
+   * after the last fan-out — the module-header deviation) — those ARE real
+   * coverage on our read side, so the membership side effects ride them too.
+   */
+  private async coveredRepoIds(team: TeamRecord): Promise<string[]> {
+    if (team.includesAllRepositories) {
+      return (
+        await this.db.select({ id: repositories.id }).from(repositories).where(eq(repositories.ownerId, team.orgId)).all()
+      ).map((row) => row.id);
+    }
+    return (
+      await this.db.select({ repoId: teamRepoAccess.repoId }).from(teamRepoAccess).where(eq(teamRepoAccess.teamId, team.id)).all()
+    ).map((row) => row.repoId);
   }
 
   /**
    * `RemoveTeamMember` (services/org/team.go:312–364): non-member no-op;
    * delete + guarded counter decrement in one batch; then the
    * `removeInvalidOrgUser` scan — a member of no remaining team loses the org
-   * membership (the guarded delete + counter pair in the same batch). The
-   * §4.3 last-owner 500 fires from the pre-check BEFORE anything is deleted
-   * (upstream's tx rollback shape — see `removalLeavesOrgOwnerless`).
+   * membership (the guarded delete + counter pair in the same batch) — and
+   * the per-repo reconsider rider (team.go:346-361). The §4.3 last-owner 500
+   * fires from the pre-check BEFORE anything is deleted (upstream's tx
+   * rollback shape — see `removalLeavesOrgOwnerless`).
    */
   async removeTeamMember(team: TeamRecord, userId: number): Promise<void> {
     if (!(await this.isTeamMember(team.id, userId))) return;
     if (await this.removalLeavesOrgOwnerless(team.orgId, userId, team.id)) {
       throw new LastOrgOwnerError(userId);
     }
+    // The reconsider loop's source set, read BEFORE the delete (upstream
+    // reads GetTeamRepositories first too, team.go:323-326 — team coverage
+    // is independent of this one membership).
+    const coveredIds = await this.coveredRepoIds(team);
     await this.db.batch([
       this.db
         .delete(teamMembers)
@@ -662,6 +797,40 @@ export class TeamsService {
           ),
         ),
     ]);
+    // The reconsider rider (team.go:346-361, one pass per covered repo):
+    // RecalculateUserAccess has nothing to rewrite here (upstream's access
+    // table does not exist in our model — permissions are computed on read),
+    // then ReconsiderWatches (collaboration.go:145-160) un-watches each repo
+    // the ex-member can no longer access — upstream's
+    // `HasAnyUnitAccessOrPublicAccess` ≈ a public repo OR a surviving
+    // `doerRepoAccessMode` grant (owner bridge + teams + collaborators) —
+    // and drops their stopwatches + issue subscriptions in it
+    // (RemoveStopwatchesByRepoID / RemoveIssueWatchersByRepoID); then
+    // ReconsiderRepoIssuesAssignee (collaboration.go:132-143) un-assigns
+    // them where `CanBeAssigned` fails. The units collapse loses
+    // unit-granularity: upstream keeps watches for an any-unit reader but
+    // still drops their assignees when the PR unit specifically is not
+    // granted (CanBeAssigned = write-any-unit OR read-PR-unit) — our
+    // blanket mode reads every granted unit, so a granted read keeps both
+    // watches AND assignees; only a fully mode-'none' non-public repo drops
+    // them. Upstream swallows per-repo ErrNotExist (the util.ErrNotExist
+    // arm) — a vanished repo mid-loop skips quietly here too.
+    const now = new Date();
+    for (const repoId of coveredIds) {
+      const found = await findRepositoryById(this.d1, repoId);
+      if (found === null) continue;
+      const mode = await doerRepoAccessMode(this.d1, { id: found.repo.id, ownerId: found.repo.ownerId }, userId);
+      if (found.repo.visibility === "public" || mode !== "none") continue;
+      await unwatchRepo(this.d1, found.repo.id, userId, now);
+      const repoIssueIds = this.db.select({ id: issues.id }).from(issues).where(eq(issues.repoId, found.repo.id));
+      await this.db.delete(issueStopwatches).where(and(eq(issueStopwatches.userId, userId), inArray(issueStopwatches.issueId, repoIssueIds)));
+      await this.db
+        .delete(issueSubscriptions)
+        .where(and(eq(issueSubscriptions.userId, userId), inArray(issueSubscriptions.issueId, repoIssueIds)));
+      // mode === 'none' here ⇒ CanBeAssigned false (any grant would have
+      // cleared the arm above) — the un-assign sweep.
+      await this.db.delete(issueAssignees).where(and(eq(issueAssignees.assigneeId, userId), inArray(issueAssignees.issueId, repoIssueIds)));
+    }
   }
 
   /**
@@ -1570,19 +1739,42 @@ export function registerOrgTeamsRoutes(
       includeVisibilities = visibleTeamVisibilities(await isOrgMember(service.orgService, org, doer), true);
     }
     const list = parseListOptions(new URL(c.req.url));
-    const { items, total } = await service.listTeams({
-      orgId: org.id,
-      userId,
-      includeVisibilities,
-      keyword: query.q ?? "",
-      // ctx.FormString("include_desc") == "" || ctx.FormBool (team.go:801):
-      // ABSENT means true; "false" means false.
-      includeDesc: query.include_desc === undefined || query.include_desc !== "false",
-      page: list.page,
-      pageSize: list.limit,
-    });
-    setPaginationHeaders(c, total, list);
-    return c.json({ ok: true, data: items.map((team) => toApiTeam(team, { viewer: viewerOf(c) })) }, 200);
+    const includeDescRaw = query.include_desc ?? "";
+    // ctx.FormString("include_desc") == "" || ctx.FormBool("include_desc")
+    // (team.go:801-804): ABSENT or EMPTY means true; a PRESENT value goes
+    // through the FormBool value rule (base_form.go:61-66 — strconv.ParseBool
+    // plus the case-insensitive "on"): "0"/"f"/"F"/"false"/"FALSE"/"False"
+    // and every unparseable token (ParseBool's error → false) mean FALSE,
+    // "1"/"t"/"T"/"true"/"TRUE"/"True"/"on"/"ON"/"On" mean true. The shared
+    // `formBoolValue` helper carries exactly that value rule.
+    let found: { items: TeamRecord[]; total: number };
+    try {
+      found = await service.listTeams({
+        orgId: org.id,
+        userId,
+        includeVisibilities,
+        keyword: query.q ?? "",
+        includeDesc: includeDescRaw === "" || formBoolValue(includeDescRaw),
+        page: list.page,
+        pageSize: list.limit,
+      });
+    } catch (error) {
+      // SearchTeam's DB-error body (team.go:810-818): a log line + the
+      // custom {"ok":false,"error":"SearchTeam internal failure"} 500 —
+      // NOT the APIErrorInternal shape the handler's other failures take.
+      // Runtime-only (the route declares {200,404}); the prepared-response
+      // HTTPException is the 307-seam carrier (giteaErrorHandler passes it
+      // through untouched).
+      console.error(`SearchTeam failed: ${error instanceof Error ? error.message : String(error)}`);
+      throw new HTTPException(500, {
+        res: new Response(JSON.stringify({ ok: false, error: "SearchTeam internal failure" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json; charset=UTF-8" },
+        }),
+      });
+    }
+    setPaginationHeaders(c, found.total, list);
+    return c.json({ ok: true, data: found.items.map((team) => toApiTeam(team, { viewer: viewerOf(c) })) }, 200);
   });
 
   app.openapi(orgGetTeamRoute(requireAuth), async (c) => {
@@ -1815,11 +2007,13 @@ export function registerOrgTeamsRoutes(
     const service = new TeamsService(c.env.DB);
     const org = await mustOrg(service, found);
     await requireRepoTeamAdmin(c, service, org, doer, found); // upstream reqAdmin (api.go:1306)
-    const record = await service.getTeamByName(org.id, c.req.valid("param").team);
-    if (record === null) throw teamNotExistError(org.id, c.req.valid("param").team);
+    // changeRepoTeam's ladder (repo/teams.go:191-199): the manage gate
+    // (canChangeOrgRepoTeam → the 403) fires BEFORE getTeamByParam's 404.
     if (!(await canDoerManageOrgRepoTeam(c, service, org, doer, found))) {
       throw new ApiError(403, "No permission to change organization repository's team");
     }
+    const record = await service.getTeamByName(org.id, c.req.valid("param").team);
+    if (record === null) throw teamNotExistError(org.id, c.req.valid("param").team);
     if (await service.hasTeamRepo(record, found.repo.id)) {
       throw new ApiError(422, `team '${record.name}' is already added to repo`);
     }
@@ -1834,15 +2028,17 @@ export function registerOrgTeamsRoutes(
     const service = new TeamsService(c.env.DB);
     const org = await mustOrg(service, found);
     await requireRepoTeamAdmin(c, service, org, doer, found);
-    const record = await service.getTeamByName(org.id, c.req.valid("param").team);
-    if (record === null) throw teamNotExistError(org.id, c.req.valid("param").team);
+    // changeRepoTeam's ladder (repo/teams.go:191-199): the manage gate
+    // BEFORE the team 404.
     if (!(await canDoerManageOrgRepoTeam(c, service, org, doer, found))) {
       throw new ApiError(403, "No permission to change organization repository's team");
     }
+    const record = await service.getTeamByName(org.id, c.req.valid("param").team);
+    if (record === null) throw teamNotExistError(org.id, c.req.valid("param").team);
     if (!(await service.hasTeamRepo(record, found.repo.id))) {
       throw new ApiError(422, `team '${record.name}' was not added to repo`);
     }
-    await service.removeTeamRepo(record, found.repo.id);
+    await service.removeTeamRepo(record, found.repo.id); // silent no-op when uncovered
     return c.body(null, 204);
   });
 }

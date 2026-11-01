@@ -2,6 +2,7 @@ import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { orgMembers, users } from "../../db/schema";
+import { invalidEmailMessage } from "../../services/user-accounts";
 import { LastOrgOwnerError, OrgError } from "../../services/orgs/errors";
 import {
   OrgService,
@@ -347,11 +348,14 @@ export async function listVisibleOrgs(
  *
  * Documented divergences (the contract declares only {200, 404}, so the
  * upstream 422 binding failures are not reproducible as declared statuses):
- * field length caps (`MaxSize(50..255)`) and `ValidUrl` are not enforced, and
- * `UpdateOrgEmailAddress`'s `ValidateEmail` 422 (services/org/org.go:197–210)
- * is skipped — a malformed email is stored as given. An out-of-enum
- * `visibility` dies in the request validator instead (runtime-only 400, same
- * class as the documented /markdown 400).
+ * field length caps (`MaxSize(50..255)`) and `ValidUrl` are not enforced. The
+ * `UpdateOrgEmailAddress` validation is LIVE (runtime-only 422, services/org/
+ * org.go:197-209 mapped at routers/api/v1/org/org.go:388-394): a PRESENT
+ * non-empty email must parse (user_model.ValidateEmail's format half — the
+ * landed `invalidEmailMessage` port; upstream's EMAIL_DOMAIN allowlist half
+ * has no config counterpart and its default admits every domain), an empty
+ * string clears. An out-of-enum `visibility` dies in the request validator
+ * instead (runtime-only 400, same class as the documented /markdown 400).
  */
 export async function editOrgProfile(d1: D1Database, org: OrgRecord, form: EditOrgOption): Promise<OrgRecord> {
   const patch: Partial<typeof users.$inferInsert> = {};
@@ -359,7 +363,16 @@ export async function editOrgProfile(d1: D1Database, org: OrgRecord, form: EditO
   if (form.description !== undefined) patch.description = form.description;
   if (form.website !== undefined) patch.website = form.website;
   if (form.location !== undefined) patch.location = form.location;
-  if (form.email !== undefined) patch.email = form.email;
+  if (form.email !== undefined) {
+    // UpdateOrgEmailAddress (services/org/org.go:197-209): nil = no change;
+    // `*email != ""` validates (ValidateEmail → ErrEmailInvalid "email
+    // address is invalid: …" → the handler's 422), "" clears the column.
+    if (form.email !== "") {
+      const invalid = invalidEmailMessage(form.email);
+      if (invalid !== null) throw new ApiError(422, invalid);
+    }
+    patch.email = form.email;
+  }
   if (form.visibility !== undefined) patch.visibility = form.visibility;
   if (form.repo_admin_change_team_access !== undefined) {
     patch.repoAdminChangeTeamAccess = form.repo_admin_change_team_access;

@@ -352,6 +352,38 @@ describe("PATCH /orgs/{org} (orgEdit)", () => {
     });
     expect(edited.status).toBe(200);
   });
+
+  it("422s a malformed email with upstream's ValidateEmail body, keeps an empty string clearing the column (UpdateOrgEmailAddress)", async () => {
+    const seed = await seedOrg();
+    const send = router();
+    // UpdateOrgEmailAddress (services/org/org.go:197-209): a PRESENT
+    // non-empty email validates — ErrEmailInvalid "email address is
+    // invalid: <email>", mapped 422 (org.go:388-394).
+    const invalid = await send("/orgs/acme", {
+      method: "PATCH",
+      headers: authHeaders(seed.owner.id),
+      body: JSON.stringify({ email: "not-an-email" }),
+    });
+    expect(invalid.status).toBe(422);
+    expect(await invalid.json()).toEqual({ message: "email address is invalid: not-an-email", url: ERROR_URL });
+    // The failed edit changed nothing.
+    const untouched = await new OrgService(env.DB).getOrgByUsername("acme");
+    expect(untouched?.email ?? "").toBe("");
+    // An empty string clears (upstream stores org.Email = "").
+    const clearing = await send("/orgs/acme", {
+      method: "PATCH",
+      headers: authHeaders(seed.owner.id),
+      body: JSON.stringify({ email: "crew@acme.example" }),
+    });
+    expect(clearing.status).toBe(200);
+    const clear = await send("/orgs/acme", {
+      method: "PATCH",
+      headers: authHeaders(seed.owner.id),
+      body: JSON.stringify({ email: "" }),
+    });
+    expect(clear.status).toBe(200);
+    expect((await clear.json<Record<string, unknown>>()).email).toBe("");
+  });
 });
 
 // ---------------------------------------------------------------------------

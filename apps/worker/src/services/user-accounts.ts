@@ -77,6 +77,7 @@ import {
   notificationStates,
   oauth2Applications,
   orgMembers,
+  packages,
   reactions,
   repoCollaborators,
   repoWatchers,
@@ -91,6 +92,7 @@ import { tombstoneRepoDO } from "../repos/purge";
 import { OrgService } from "./orgs/orgs";
 import { LastOrgOwnerError } from "./orgs/errors";
 import { scrubUserFromAllRules } from "./branch-protection";
+import { deletePackageAndReferences } from "./packages/model";
 import { usableUsernameError } from "./orgs/orgs";
 
 // ---------------------------------------------------------------------------
@@ -441,12 +443,17 @@ async function deleteOwnerRepositories(env: DeleteUserEnv, ownerId: number): Pro
  *      org.go:58-70, whose purge arm deletes the ORG's repos first) —
  *      mirrored with the same cascade + `OrgService.deleteOrg` (the
  *      SPEC-0007 cascade, which refuses an org that still owns repos).
- *   3. Branch-protection whitelist scrub (delete.go:137-160, the
+ *   3. PURGE — packages (user.go:249-253 → RemoveAllPackages): every owned
+ *      package through the shared `deletePackageAndReferences` cascade
+ *      (versions + files + properties + the package row); blob rows and R2
+ *      content keys ride the sole-deleter package-cleanup sweep (the
+ *      rows-then-sweep split upstream itself has — see the inline comment).
+ *   4. Branch-protection whitelist scrub (delete.go:137-160, the
  *      "***** START: Branch Protections *****" block): the deleted id is
  *      stripped from every allowlist column of every SURVIVING rule —
  *      pre-batch, so a failed scrub aborts the delete (the landed route
  *      arm's ordering; ids are JSON-serialized, hence the full-rule pages).
- *   4. THE CENSUS BATCH — one D1 transaction (delete.go:31-206's
+ *   5. THE CENSUS BATCH — one D1 transaction (delete.go:31-206's
  *      `deleteUser` shape), statement order FK-safe:
  *        a. counter decrements FIRST, while the edge rows they read still
  *           exist: each repo the user stars/watches loses exactly one
@@ -487,8 +494,8 @@ export async function deleteUserCascade(
 ): Promise<void> {
   const d1 = env.DB;
   if (options.purge === true) {
-    // Upstream runs the two purge arms OUTSIDE the final transaction, each
-    // with its own internal transactions (user.go:172-186) — mirrored.
+    // Upstream runs the purge arms OUTSIDE the final transaction, each with
+    // its own internal transactions (user.go:172-186, 249-253) — mirrored.
     await deleteOwnerRepositories(env, userId);
     const orgService = new OrgService(d1);
     const memberships = await drizzle(d1)
@@ -507,6 +514,28 @@ export async function deleteUserCascade(
         await deleteOwnerRepositories(env, orgId);
         await orgService.deleteOrg(orgId);
       }
+    }
+
+    // Delete Packages (user.go:249-253 → services/packages/packages.go:720-750
+    // `RemoveAllPackages`): every package the user owns loses its versions,
+    // files and properties through the SAME cascade the protocol deletes and
+    // the cleanup rules ride (`deletePackageAndReferences` — the RemovePackage
+    // shape, model.ts:621-633; rows only). Blob ROWS and R2 content keys are
+    // deliberately NOT touched here — the hourly package-cleanup sweep is the
+    // SOLE content-key deleter (ratification 4: a `packages/blobs/…` key is
+    // deletable only when zero file rows reference its blob id; cleanup.ts
+    // arm (b) deletes the unreferenced-blob rows + R2 keys past the window).
+    // That is exactly upstream's split too: RemoveAllPackages deletes rows
+    // only and its CleanupTask's DeleteUnreferencedBlobs owns the content
+    // store — the purge is best-effort on blobs the same way the normal
+    // package delete is.
+    const ownerPackageIds = await drizzle(d1)
+      .select({ id: packages.id })
+      .from(packages)
+      .where(eq(packages.ownerId, userId))
+      .all();
+    for (const { id } of ownerPackageIds) {
+      await deletePackageAndReferences(d1, id);
     }
   }
 

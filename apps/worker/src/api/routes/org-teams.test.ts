@@ -22,11 +22,11 @@
 
 import { OpenAPIHono } from "@hono/zod-openapi";
 import { env } from "cloudflare:workers";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { repositories, teamMembers, teamRepoAccess, teams, userBlocking, users,
+import { issueAssignees, issueStopwatches, issueSubscriptions, issues, repoCollaborators, repoWatchers, repositories, teamMembers, teamRepoAccess, teams, userBlocking, users,
   protectedBranches,
 } from "../../db/schema";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, type AuthResolver } from "../auth";
@@ -42,8 +42,20 @@ beforeAll(applyOrgsDdl);
 
 beforeEach(async () => {
   // The team tables first (no dependents), then the org sweep (repositories,
-  // users-without-the-reserved-'assets'-row, org_members, redirects).
-  for (const table of ["protected_branches", "team_repo_access", "team_members", "teams"]) {
+  // users-without-the-reserved-'assets'-row, org_members, redirects). The
+  // membership-side-effect stores (watches, the issue-adjacent families the
+  // reconsider rider sweeps) go before the repositories rows too.
+  for (const table of [
+    "protected_branches",
+    "team_repo_access",
+    "team_members",
+    "teams",
+    "repo_watchers",
+    "stopwatch",
+    "issue_subscriptions",
+    "issue_assignees",
+    "issues",
+  ]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   await resetOrgTables();
@@ -379,6 +391,25 @@ describe("GET /orgs/{org}/teams/search (teamSearch)", () => {
     expect(await nameOnly.json<{ data: Array<unknown> }>().then((b) => b.data)).toEqual([]);
     expect(byName.headers.get("x-total-count")).toBe("1");
 
+    // The FULL FormBool value rule (base_form.go:61-66 — strconv.ParseBool +
+    // the case-insensitive "on"): "0" and every unparseable token mean FALSE
+    // (team.go:801-804's FormBool, NOT a !== "false" string compare), "on"
+    // means TRUE.
+    const zero = await send(`/orgs/${s.org.username}/teams/search?q=hidden&include_desc=0`, {
+      headers: authHeaders(s.owner.id),
+    });
+    expect(await zero.json<{ data: Array<unknown> }>().then((b) => b.data)).toEqual([]);
+    const bogus = await send(`/orgs/${s.org.username}/teams/search?q=hidden&include_desc=yes`, {
+      headers: authHeaders(s.owner.id),
+    });
+    expect(await bogus.json<{ data: Array<unknown> }>().then((b) => b.data)).toEqual([]);
+    const goOn = await send(`/orgs/${s.org.username}/teams/search?q=hidden&include_desc=on`, {
+      headers: authHeaders(s.owner.id),
+    });
+    expect((await goOn.json<{ data: Array<{ name: string }> }>().then((b) => b.data)).map((t) => t.name)).toEqual([
+      "vault-team",
+    ]);
+
     // The keyword arms must not cap (the 943e1e9 org-members class — D1's
     // 50-byte LIKE pattern limit): a 200-char needle answers the clean
     // empty result, not a D1_ERROR 500.
@@ -387,6 +418,25 @@ describe("GET /orgs/{org}/teams/search (teamSearch)", () => {
     });
     expect(longQ.status).toBe(200);
     expect(await longQ.json<{ data: Array<unknown> }>().then((b) => b.data)).toEqual([]);
+  });
+
+  it("answers SearchTeam's DB failure with the custom {ok:false,error} 500 body (team.go:810-818)", async () => {
+    const s = await seedActors();
+    const send = router();
+    const spy = vi.spyOn(TeamsService.prototype, "listTeams").mockRejectedValueOnce(new Error("disk I/O error"));
+    try {
+      const res = await send(`/orgs/${s.org.username}/teams/search?q=docs`, { headers: authHeaders(s.owner.id) });
+      expect(res.status).toBe(500);
+      // NOT the blanked {message,url} family — the exact custom body.
+      expect(await res.json<Record<string, unknown>>()).toEqual({ ok: false, error: "SearchTeam internal failure" });
+    } finally {
+      spy.mockRestore();
+    }
+    // The spy restored: the very next search answers 200 again (the mock was
+    // one-shot).
+    expect((await send(`/orgs/${s.org.username}/teams/search?q=docs`, { headers: authHeaders(s.owner.id) })).status).toBe(
+      200,
+    );
   });
 });
 
@@ -442,6 +492,64 @@ describe("PATCH /teams/{id} (orgEditTeam)", () => {
     expect(body).toMatchObject({ name: "Writers", description: "d".repeat(255), visibility: "limited", permission: "read" });
     const row = await db().select().from(teams).where(eq(teams.id, docsId)).get();
     expect(row).toMatchObject({ lowerName: "writers" });
+  });
+
+  it("applies includes_all_repositories: ON fans out rows to the CURRENT org repos, OFF keeps them (the add-only PATCH parity, team.go:167-174)", async () => {
+    const s = await seedActors();
+    const send = router();
+    const service = new TeamsService(env.DB);
+    const fresh = await service.createTeam(s.org, { name: "all-team", permission: "read" });
+
+    // OFF→ON: the fan-out materializes a row per current org repo and bumps
+    // the counter (AddAllRepositoriesToTeam, repo_team.go:72-98; IncrTeamRepoNum).
+    const on = await send(`/teams/${fresh.id}`, {
+      method: "PATCH",
+      headers: authHeaders(s.owner.id),
+      body: JSON.stringify({ includes_all_repositories: true }),
+    });
+    expect(on.status).toBe(200);
+    expect((await on.json<Record<string, unknown>>()).includes_all_repositories).toBe(true);
+    const rowed = await db().select().from(teamRepoAccess).where(eq(teamRepoAccess.teamId, fresh.id)).all();
+    expect(rowed.map((row) => row.repoId).sort()).toEqual(["t_public_repo", "t_vault"]);
+    expect((await db().select().from(teams).where(eq(teams.id, fresh.id)).get())?.numRepos).toBe(2);
+
+    // A repo created AFTER the ON carries no row — covered only by the flag
+    // union (the read-side union the module header documents).
+    await seedRepo(s.org.id, s.org.usernameLower, "later-repo", "public");
+    expect(
+      (await send(`/teams/${fresh.id}/repos/${s.org.username}/later-repo`, { headers: authHeaders(s.owner.id) })).status,
+    ).toBe(200);
+
+    // ON→OFF: upstream's PATCH path has NO strip arm — UpdateTeam's
+    // includeAllChanged branch is add-only (services/org/team.go:167-174),
+    // and RemoveAllRepositoriesFromTeam fires only from DeleteTeam
+    // (team.go:213) and the web-only removeall action (web/org/teams.go:299).
+    // The flag flips, the materialized rows KEEP granting (upstream parity),
+    // and only the never-rowed repo loses coverage.
+    const off = await send(`/teams/${fresh.id}`, {
+      method: "PATCH",
+      headers: authHeaders(s.owner.id),
+      body: JSON.stringify({ includes_all_repositories: false }),
+    });
+    expect(off.status).toBe(200);
+    expect((await off.json<Record<string, unknown>>()).includes_all_repositories).toBe(false);
+    expect(await db().select().from(teamRepoAccess).where(eq(teamRepoAccess.teamId, fresh.id)).all()).toHaveLength(2);
+    expect(
+      (await send(`/teams/${fresh.id}/repos/${s.org.username}/later-repo`, { headers: authHeaders(s.owner.id) })).status,
+    ).toBe(404);
+    expect(
+      (await send(`/teams/${fresh.id}/repos/${s.org.username}/public-repo`, { headers: authHeaders(s.owner.id) })).status,
+    ).toBe(200);
+
+    // Re-ON fans out to the never-rowed repo (HasTeamRepo's raw-table skip,
+    // team_repo.go:25-30, misses only the genuinely unrowed) + the counter.
+    await send(`/teams/${fresh.id}`, {
+      method: "PATCH",
+      headers: authHeaders(s.owner.id),
+      body: JSON.stringify({ includes_all_repositories: true }),
+    });
+    expect(await db().select().from(teamRepoAccess).where(eq(teamRepoAccess.teamId, fresh.id)).all()).toHaveLength(3);
+    expect((await db().select().from(teams).where(eq(teams.id, fresh.id)).get())?.numRepos).toBe(3);
   });
 
   it("renames collide into the internal-error 500 (UpdateTeam → APIErrorInternal seam)", async () => {
@@ -636,6 +744,88 @@ describe("PUT/DELETE /teams/{id}/members/{username} (orgAddTeamMember/orgRemoveT
     // Untyped guard error → the default-branch `internal server error`
     // fallback (ef2c049).
     expect((await res.json<Record<string, unknown>>()).message).toBe("internal server error");
+  });
+
+  it("auto-watches the team's covered repos for the new member (team.go:289-307 — AUTO_WATCH_NEW_REPOS default true)", async () => {
+    const s = await seedActors();
+    const send = router();
+    const service = new TeamsService(env.DB);
+    const docs = await mustTeam(service, await teamIdByName("docs"));
+    await service.addTeamRepo(docs, "t_public_repo");
+    await service.addTeamRepo(docs, "t_vault");
+
+    const res = await send(`/teams/${docs.id}/members/${s.outsider.username}`, {
+      method: "PUT",
+      headers: authHeaders(s.owner.id),
+    });
+    expect(res.status).toBe(204);
+    // Both covered repos watched for the newcomer through watchRepo (the
+    // WatchRepoAuto(true) port): Normal rows, and the num_watches counter
+    // moved with the edges.
+    const watches = await db().select().from(repoWatchers).where(eq(repoWatchers.userId, s.outsider.id)).all();
+    expect(watches.map((row) => row.repoId).sort()).toEqual(["t_public_repo", "t_vault"]);
+    expect(watches.every((row) => row.mode === 1)).toBe(true);
+    const repoRow = await db()
+      .select({ numWatches: repositories.numWatches })
+      .from(repositories)
+      .where(eq(repositories.id, "t_public_repo"))
+      .get();
+    expect(repoRow?.numWatches).toBe(1);
+    // The already-member PUT is the early-return no-op — the rider never
+    // re-runs (team.go:247-250 precedes :289-307).
+    await send(`/teams/${docs.id}/members/${s.outsider.username}`, { method: "PUT", headers: authHeaders(s.owner.id) });
+    expect(await db().select().from(repoWatchers).where(eq(repoWatchers.userId, s.outsider.id)).all()).toHaveLength(2);
+  });
+
+  it("reconsiders watches and drops now-inaccessible issue rows on member removal (team.go:346-361)", async () => {
+    const s = await seedActors();
+    const send = router();
+    const service = new TeamsService(env.DB);
+    const docs = await mustTeam(service, await teamIdByName("docs"));
+    await service.addTeamRepo(docs, "t_public_repo");
+    await service.addTeamRepo(docs, "t_vault");
+    await service.addTeamMember(docs, s.member.id);
+    // The add's auto-watch covered both repos for `member`...
+    expect(await db().select().from(repoWatchers).where(eq(repoWatchers.userId, s.member.id)).all()).toHaveLength(2);
+    // ...plus issue-adjacent rows in the PRIVATE repo — the reconsider
+    // sweep's input (assignee + subscription + stopwatch on one issue).
+    const issue = (
+      await db().insert(issues).values({ repoId: "t_vault", index: 1, title: "held" }).returning({ id: issues.id }).all()
+    )[0]!;
+    await db().insert(issueAssignees).values({ issueId: issue.id, assigneeId: s.member.id });
+    await db().insert(issueSubscriptions).values({ userId: s.member.id, issueId: issue.id, isWatching: true });
+    await db().insert(issueStopwatches).values({ issueId: issue.id, userId: s.member.id, createdAt: NOW });
+
+    const res = await send(`/teams/${docs.id}/members/${s.member.username}`, {
+      method: "DELETE",
+      headers: authHeaders(s.owner.id),
+    });
+    expect(res.status).toBe(204);
+    // The private repo: the ex-member holds NO surviving grant
+    // (doerRepoAccessMode 'none' — docs was their only team, no collaborator
+    // row) → unwatched (row deleted) and the issue-adjacent rows dropped
+    // (ReconsiderWatches collaboration.go:145-160 +
+    // ReconsiderRepoIssuesAssignee :132-143 — mode 'none' ⇒ CanBeAssigned
+    // false).
+    expect(
+      await db()
+        .select()
+        .from(repoWatchers)
+        .where(and(eq(repoWatchers.userId, s.member.id), eq(repoWatchers.repoId, "t_vault")))
+        .all(),
+    ).toEqual([]);
+    expect(await db().select().from(issueAssignees).where(eq(issueAssignees.assigneeId, s.member.id)).all()).toEqual([]);
+    expect(await db().select().from(issueSubscriptions).where(eq(issueSubscriptions.userId, s.member.id)).all()).toEqual([]);
+    expect(await db().select().from(issueStopwatches).where(eq(issueStopwatches.userId, s.member.id)).all()).toEqual([]);
+    // The public repo: HasAnyUnitAccessOrPublicAccess's public arm keeps the
+    // watch (collaboration.go:147-149).
+    expect(
+      await db()
+        .select()
+        .from(repoWatchers)
+        .where(and(eq(repoWatchers.userId, s.member.id), eq(repoWatchers.repoId, "t_public_repo")))
+        .all(),
+    ).toHaveLength(1);
   });
 });
 
@@ -861,6 +1051,34 @@ describe("GET/PUT/DELETE /repos/{owner}/{repo}/teams (repoListTeams/repoCheckTea
     expect((await notAdded.json<Record<string, unknown>>()).message).toBe("team 'vault-team' was not added to repo");
     expect((await del("docs")).status).toBe(204);
     expect(await db().select().from(teamRepoAccess).where(eq(teamRepoAccess.repoId, "t_public_repo")).all()).toEqual([]);
+  });
+
+  it("runs the manage gate (403) BEFORE the team 404 — changeRepoTeam's ladder (repo/teams.go:191-199)", async () => {
+    const s = await seedActors();
+    const send = router();
+    // A collaborator-admin passes reqAdmin but fails canDoerManageOrgRepoTeam
+    // while the org keeps repo_admin_change_team_access off — the manage
+    // gate's reachable non-owner case.
+    await db().insert(repoCollaborators).values({ repoId: "t_public_repo", userId: s.teammate.id, mode: "admin", createdAt: NOW });
+    const gated = await send(`/repos/${s.org.username}/public-repo/teams/ghost-team`, {
+      method: "PUT",
+      headers: authHeaders(s.teammate.id),
+    });
+    expect(gated.status).toBe(403);
+    expect((await gated.json<Record<string, unknown>>()).message).toBe(
+      "No permission to change organization repository's team",
+    );
+    // The org flag lifts the gate — the SAME unknown-team request now passes
+    // it and reaches getTeamByParam's 404.
+    await db().update(users).set({ repoAdminChangeTeamAccess: true }).where(eq(users.id, s.org.id));
+    const through = await send(`/repos/${s.org.username}/public-repo/teams/ghost-team`, {
+      method: "PUT",
+      headers: authHeaders(s.teammate.id),
+    });
+    expect(through.status).toBe(404);
+    expect((await through.json<Record<string, unknown>>()).message).toBe(
+      `team does not exist [org_id ${s.org.id}, team_id 0, name: ghost-team]`,
+    );
   });
 });
 

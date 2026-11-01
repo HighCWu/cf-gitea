@@ -30,10 +30,16 @@ import {
   notificationStates,
   oauth2Applications,
   orgMembers,
+  packageBlobs,
+  packageFiles,
+  packageProperties,
+  packageVersions,
+  packages,
   personalAccessTokens,
   protectedBranches,
   repositories,
   repoCounters,
+  twoFactor,
   userBadges,
   userRedirects,
   users,
@@ -136,6 +142,14 @@ beforeEach(async () => {
     "repo_settings",
     "repo_transfer",
     "repo_redirects",
+    "package_properties",
+    "package_files",
+    "package_versions",
+    "packages",
+    "package_blobs",
+    "package_blob_uploads",
+    "package_cleanup_rules",
+    "two_factor",
     "repositories",
     "users",
   ]) {
@@ -174,6 +188,40 @@ async function seedRepo(ownerId: number, ownerNamespace: string, slug: string, i
     refsVersion: 1,
     backend: "self-hosted",
     createdAt: NOW,
+  });
+}
+
+/** One owned package with a published version, a lead file and a
+ *  content-addressed blob row (the SPEC-0016 row shapes; the cascade and
+ *  the guards count rows — the protocol layer is not involved). */
+async function seedPackage(ownerId: number, name: string): Promise<void> {
+  const pkg = (
+    await drizzle(env.DB)
+      .insert(packages)
+      .values({ ownerId, type: "generic", name, lowerName: name.toLowerCase() })
+      .returning({ id: packages.id })
+      .all()
+  )[0]!;
+  const blob = (
+    await drizzle(env.DB)
+      .insert(packageBlobs)
+      .values({ size: 7, hashSha256: `deadbeef${name.toLowerCase()}`, createdUnix: NOW })
+      .returning({ id: packageBlobs.id })
+      .all()
+  )[0]!;
+  const version = (
+    await drizzle(env.DB)
+      .insert(packageVersions)
+      .values({ packageId: pkg.id, version: "1.0.0", lowerVersion: "1.0.0", createdUnix: NOW })
+      .returning({ id: packageVersions.id })
+      .all()
+  )[0]!;
+  await drizzle(env.DB).insert(packageFiles).values({
+    versionId: version.id,
+    blobId: blob.id,
+    name: "file.bin",
+    lowerName: "file.bin",
+    createdUnix: NOW,
   });
 }
 
@@ -428,8 +476,9 @@ describe("GET /admin/users (adminSearchUsers)", () => {
   });
 
   it("evaluates the unmodeled-column filters against the constant state (deviation 4)", async () => {
-    // Every cf-gitea user is local, un-restricted and 2FA-less: the false
-    // filters match everyone, the true filters match nothing.
+    // Every cf-gitea user is local and un-restricted: the false filters match
+    // everyone, the true filters match nothing. (The 2FA filter left this
+    // deviation when the two_factor store landed — its own describe below.)
     const locals = await adminSend("/admin/users?source_id=0", authed());
     expect(locals.headers.get("X-Total-Count")).toBe("6");
     const foreign = await adminSend("/admin/users?source_id=7", authed());
@@ -438,12 +487,29 @@ describe("GET /admin/users (adminSearchUsers)", () => {
     expect(unrestricted.headers.get("X-Total-Count")).toBe("6");
     const restricted = await adminSend("/admin/users?is_restricted=true", authed());
     expect(restricted.headers.get("X-Total-Count")).toBe("0");
-    const noTwofa = await adminSend("/admin/users?is_2fa_enabled=false", authed());
-    expect(noTwofa.headers.get("X-Total-Count")).toBe("6");
-    const twofa = await adminSend("/admin/users?is_2fa_enabled=true", authed());
-    expect(twofa.headers.get("X-Total-Count")).toBe("0");
     const external = await adminSend("/admin/users?login_name=ext-id", authed());
     expect(external.headers.get("X-Total-Count")).toBe("0");
+  });
+
+  it("reads the is_2fa_enabled filter against the two_factor store — BOTH polarities (search.go:142-162)", async () => {
+    // One enrolled user (the LEFT JOIN's non-NULL uid row; our store keeps
+    // one row per uid, UNIQUE(two_factor_uid_uq)) — everyone else is the
+    // NULL-join side.
+    await drizzle(env.DB).insert(twoFactor).values({
+      userId: neighborId,
+      secret: "JBSWY3DPEHPK3PXP",
+      scratchSalt: "salt",
+      scratchHash: "hash",
+      createdUnix: Math.floor(NOW.getTime() / 1000),
+      updatedUnix: Math.floor(NOW.getTime() / 1000),
+    });
+    const enrolled = await adminSend("/admin/users?is_2fa_enabled=true", authed());
+    expect(((await enrolled.json<Array<Record<string, unknown>>>())).map((entry) => entry.login)).toEqual(["neighbor"]);
+    const plain = await adminSend("/admin/users?is_2fa_enabled=false", authed());
+    expect(plain.headers.get("X-Total-Count")).toBe("5");
+    expect(
+      (await plain.json<Array<Record<string, unknown>>>()).every((entry) => entry.login !== "neighbor"),
+    ).toBe(true);
   });
 
   it("paginates with silent clamping", async () => {
@@ -815,6 +881,16 @@ describe("DELETE /admin/users/{username} (adminDeleteUser)", () => {
     expect(((await member.json<Record<string, unknown>>())).message).toBe(
       `user still has membership of organizations [uid: ${neighborId}]`,
     );
+
+    // The third in-tx guard (user.go:250-255 → HasOwnerPackages, the INNER
+    // JOIN over non-internal versions): verbatim ErrUserOwnPackages body.
+    await env.DB.prepare("DELETE FROM org_members").run();
+    await seedPackage(neighborId, "held-pkg");
+    const ownsPackages = await adminSend("/admin/users/neighbor", authed({ method: "DELETE" }));
+    expect(ownsPackages.status).toBe(422);
+    expect(((await ownsPackages.json<Record<string, unknown>>())).message).toBe(
+      `user still has ownership of packages [uid: ${neighborId}]`,
+    );
   });
 
   it("purge=true cascades BOTH owned repos through the real deleteRepository pipeline (204)", async () => {
@@ -864,6 +940,32 @@ describe("DELETE /admin/users/{username} (adminDeleteUser)", () => {
     expect(await orgs.getOrgById(ownedOrg.id)).toBeNull();
     // Both the owned org's repo and every other repo row are gone.
     expect(await drizzle(env.DB).select().from(repositories).all()).toHaveLength(0);
+  });
+
+  it("purge=true sweeps the owned packages — versions, files, properties and package rows gone; blob content rides the sole-deleter sweep (the RemoveAllPackages arm)", async () => {
+    await seedPackage(neighborId, "doomed");
+    // Sanity: the purge ran over a REAL store (one package, one version, one
+    // file, one blob row).
+    expect(await drizzle(env.DB).select().from(packages).all()).toHaveLength(1);
+    expect(await drizzle(env.DB).select().from(packageVersions).all()).toHaveLength(1);
+
+    const res = await adminSend("/admin/users/neighbor?purge=true", authed({ method: "DELETE" }));
+    expect(res.status).toBe(204);
+    expect(await drizzle(env.DB).select().from(users).where(eq(users.id, neighborId))).toHaveLength(0);
+    // The rows-then-sweep shape (services/packages/packages.go:720-750
+    // deletes rows only; the content store is CleanupTask's): package,
+    // version, file and property rows are GONE.
+    expect(await drizzle(env.DB).select().from(packages).all()).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(packageVersions).all()).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(packageFiles).all()).toHaveLength(0);
+    expect(await drizzle(env.DB).select().from(packageProperties).all()).toHaveLength(0);
+    // The blob ROW survives with zero file references — the hourly
+    // package-cleanup sweep (the SOLE content-key deleter, ratification 4)
+    // deletes the row + its `packages/blobs/…` R2 key past the window. That
+    // is upstream's own split: RemoveAllPackages never touches the content
+    // store, CleanupTask's DeleteUnreferencedBlobs owns it.
+    const blobRows = await drizzle(env.DB).select().from(packageBlobs).all();
+    expect(blobRows).toHaveLength(1);
   });
 
   it("sweeps the full census without purge: star/watch counters drop with the edges, the FK-less stores clear (204)", async () => {
