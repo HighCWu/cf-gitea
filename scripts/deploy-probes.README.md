@@ -70,14 +70,15 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
   Worker carries as secrets), never from a file or a flag, and are absent-
   gated to `[warn]` skips (never fake-green).
 - After the run the operator DELETEs the per-run PAT (by id/prefix) and re-checks
-  the token count with `cleanup-audit` — the default expectation is the
-  standing bootstrap SET (10 since the v1.5 freeze: admin bootstrap + six
-  p0probe retry-mint rows + p0probe2 + p0probe3 + p0probe4; the earlier
-  2-encoding — itself the 2026-10-28 two-user repair — predated the mint
-  churn, whose root cause is now FIXED — bootstrap-admin's mint carries the
-  API layer's duplicate-per-user guard (8e5c4ea), so re-runs skip instead of
-  adding rows; the six stale retry rows sweep at convergence; pass
-  `--expect-tokens <n>` when the standing set differs, e.g.
+  the token count with `cleanup-audit` — the default expectation is **1, the
+  per-run probe token itself; 0 between runs** (the v1.5.1 re-baseline,
+  2026-11-02: the posture is mint+sweep each cycle — bootstrap-admin's mint
+  carries the duplicate-per-user guard (8e5c4ea), so a run adds at most one
+  'bootstrap' row no matter how often it re-runs and the operator's
+  after-run DELETE takes it back; the standing bootstrap set of 10 that the
+  v1.5 freeze enumerated — admin bootstrap + six p0probe retry-mint rows +
+  p0probe2 + p0probe3 + p0probe4 — swept at convergence; pass
+  `--expect-tokens <n>` when the posture differs, e.g.
   local scratch users).
 
 ## Batteries and their canonical expectations
@@ -314,7 +315,9 @@ prints all of them verbatim.
   cookie POST `/{index}/times/{id}/delete` → 303 onto the canonical issue
   path → the API list empty after), the `_cherrypick` form (cookie GET
   `/_cherrypick/{sha}/{branch}` → 200 with the
-  `repository file editor edit` pageClass + the underscore form action; the
+  `page-content repository file editor edit` pageClass (the FULL rendered
+  class attribute, pinned at repo-editor-cherrypick.smoke.test.tsx:148) +
+  the underscore form action; the
   bare `/cherrypick/` spelling → 404, engine-owned since the rename), and
   the package settings pair (a PAT-uploaded generic package → cookie GET
   `/{owner}/-/packages/settings/generic/{name}` → 200 — the F1 registration
@@ -880,7 +883,10 @@ prints all of them verbatim.
   with the RFC 6749 §2.3.1 Basic header** → **the dotted dispatch**
   (GET `/api/v1/user` with `Authorization: Bearer <JWT>` → 200 as the grant
   user through the landed apiScopeGate) → **userinfo** (the Go struct member
-  order `{sub,name,preferred_username,email,picture,groups}`; the SAME call
+  order `{sub,name,preferred_username,email,picture,groups}`; `picture`
+  pins the resolvable shape — `<base>/avatars/u_<id>` or
+  `<base>/avatars/<64-hex HashAvatar>` off the avatar-serving key families,
+  7362128's composition, never the old `/avatars/{username}` tail); the SAME call
   with the run PAT → 401, a PAT is not an OAuth2 credential) → **the offline
   JWKS verify** (GET `/login/oauth/keys` → one JWK with ALPHABETICAL
   members; BOTH the access token and the id_token verify with WebCrypto
@@ -990,23 +996,24 @@ prints all of them verbatim.
   `--base-url`/`--token-file`**; the checks are INDEPENDENT (one red count
   never hides the rest): probe-user repositories == 1 (the standing
   `p0-shallow`, `--expect-owner-repos`), `status='creating'` == 0, `action`
-  == 1 (the standing fixture's OWN create-repo event, minted 2026-11-01
-  when the fresh p0probe4 fixture self-seeded on first contact after the
-  feed emitters landed — which is why the earlier audits held whole-table
-  0; the 389da18 delete sweep cascades action rows away WITH their repo, so
-  ephemeral battery repos still leave 0 and the never-deleted fixture's row
-  is the one survivor; delete + re-seed the fixture and the sweep plus the
-  fresh seed reproduce exactly 1), `stars` == 0,
+  == 2 — the two standing p0-shallow fixtures' create-repo events (the
+  0219256 calibration + one more since: an earlier run's own standing
+  fixture, likewise never deleted, joined the probe user's — the v1.5.1
+  live run observed exactly the pair; the drift mechanism is that each p0
+  battery session can leave a standing p0-shallow whose action row outlives
+  it; the 389da18 delete sweep cascades action rows away WITH their repo,
+  so ephemeral battery repos still leave 0 and NO hand-sweep is needed),
+  `stars` == 0,
   `push_mirrors` == 0, `protected_branches` == 0, `repo_redirects` == 0,
-  `user_blocking` == 0, `personal_access_tokens` == 10 by default — the
-  standing bootstrap set after the v1.5 mint churn (enumerated 2026-11-01:
-  admin bootstrap + SIX p0probe retry-mint rows + p0probe2 + p0probe3 +
-  p0probe4; the 2-encoding, itself the 2026-10-28 two-user repair of the
-  historical whole-table=1 that false-fired from 2026-10-29, predated the
-  churn, whose root cause is now FIXED — bootstrap-admin's mint carries the
-  API layer's duplicate-per-user guard (8e5c4ea), so re-runs skip instead of
-  adding rows; the six stale retry rows sweep at convergence;
-  `--expect-tokens <n>` overrides when the standing set changes again).
+  `user_blocking` == 0, `personal_access_tokens` == 1 by default — the
+  per-run probe token; 0 between runs (the v1.5.1 re-baseline, 2026-11-02:
+  mint+sweep each cycle — bootstrap-admin's mint carries the
+  duplicate-per-user guard (8e5c4ea), so each run mints at most one
+  'bootstrap' row and the operator's after-run DELETE takes it back; the
+  standing bootstrap set of 10 the v1.5 freeze enumerated — admin bootstrap
+  + six p0probe retry-mint rows + p0probe2/3/4 — swept at convergence;
+  `--expect-tokens <n>` overrides when the posture differs, e.g. local
+  scratch users).
 
 ## Leftovers and hygiene
 

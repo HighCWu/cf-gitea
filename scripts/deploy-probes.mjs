@@ -541,14 +541,14 @@
  *     pre-3265258 canonical 3 was button + h4 + submit; +the
  *     small-menu-items nav) where the anonymous render shows none.
  *   - cleanup audit: repositories of the probe user == 1 (p0-shallow,
- *     intentionally live), status='creating' == 0, "action" == 1 (the
- *     standing fixture's own create-repo event — the 389da18 delete sweep
- *     cascades action rows away WITH their repo, so every ephemeral battery
- *     repo still leaves 0 and only the never-deleted fixture's row
- *     survives), stars == 0, push_mirrors == 0, protected_branches == 0,
+ *     intentionally live), status='creating' == 0, "action" == 2 (the two
+ *     standing p0-shallow fixtures' create-repo events — the 389da18 delete
+ *     sweep cascades action rows away WITH their repo, so every ephemeral
+ *     battery repo still leaves 0), stars == 0, push_mirrors == 0,
+ *     protected_branches == 0,
  *     repo_redirects == 0, user_blocking == 0, personal_access_tokens ==
- *     10 (the standing bootstrap set after the v1.5 mint churn — enumerated
- *     in the audit step's expectation).
+ *     1 (the per-run probe token — mint+sweep each cycle, 0 between runs;
+ *     enumerated in the audit step's expectation).
  *
  * This file deliberately does NOT touch docs/design/p0-evidence.md (it is
  * REDEPLOY14's in-flight document); the conventions note lives here.
@@ -618,9 +618,10 @@ const parseArgs = (argv) => {
     // carries the literal a fourth time (navbar button + templates_info +
     // h4 form header + create-form submit button).
     trials: 3, fixtureRepo: "p0-shallow", fixtureOid: null, newLabelCount: 4,
-    // expectTokens 10: the standing bootstrap set after the v1.5 mint churn
-    // (enumerated in the audit step's expectation, 2026-11-01).
-    strictGeneratedClone: false, d1Scope: "remote", expectOwnerRepos: 1, expectTokens: 10,
+    // expectTokens 1: the per-run probe token — mint+sweep each cycle (the
+    // v1.5.1 re-baseline, 2026-11-02; enumerated in the audit step's
+    // expectation). 0 between runs.
+    strictGeneratedClone: false, d1Scope: "remote", expectOwnerRepos: 1, expectTokens: 1,
     mirrorSettleMs: 30_000, forceRed: null,
     monitorConsumer: null, profileDurationMs: 1_000,
   };
@@ -702,7 +703,7 @@ const usage = () =>
   "  packages-terraform: (no extra options — pure HTTP + the run PAT; the whole-state DELETE is its own row cascade, so unlike the other packages batteries there is NO D1 arm and no wrangler auth)\n" +
   "  auth-oauth2:   (no extra options — needs wrangler auth for the D1 arms: the builtin-seed read, the revoke row delete, the husk sweep, and the external-auth source seed/cleanup; --d1-scope picks the database, keep it in step with --base-url — the discovery arm's issuer==origin assert keys off it)\n" +
   "  monitor-platform: --monitor-consumer <key> (the MONITOR_QUEUE_CONSUMERS entry to drive; default the FIRST — serial-locked: one consumer per run, never two)  --profile-duration-ms <1000-5000> (default 1000; the profile POST answers synchronously, so this is the arm's wall time). The arms read CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_QUEUES_TOKEN / CLOUDFLARE_PROFILE_TOKEN / MONITOR_QUEUE_CONSUMERS / MONITOR_WORKER_NAME from the probe's OWN env (the same names the Worker carries as secrets); absent = the arm [warn]-skips (never fake-green). HTTP goes to api.cloudflare.com, NOT the deployment.\n" +
-  "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (10 — the standing bootstrap set after the v1.5 mint churn)\n" +
+  "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (1 — the per-run probe token; 0 between runs)\n" +
   "  any battery:   --force-red <check-id>    (self-test: force that check red UNRUN — exercises the failure-tail sweep; an unmatched id warns)";
 
 // ---------- plumbing ----------
@@ -2802,7 +2803,7 @@ const window3Steps = (ctx) => [
   },
   {
     id: "w3-cherrypick-form-200",
-    expect: `the cherrypick editor form (the 6a91a5c F5 rename — upstream's OWN underscore spelling, web.go:1468's {editor_action:_cherrypick}): cookie GET ${"{owner}/{repo}"}/_cherrypick/{sha}/{branch} → 200 text/html with class="repository file editor edit" + the form action carrying /_cherrypick/{sha}/{branch}; the BARE /cherrypick/{sha}/{branch} → 404 (engine-owned now — the underscore is the only editor_action)`,
+    expect: `the cherrypick editor form (the 6a91a5c F5 rename — upstream's OWN underscore spelling, web.go:1468's {editor_action:_cherrypick}): cookie GET ${"{owner}/{repo}"}/_cherrypick/{sha}/{branch} → 200 text/html with class="page-content repository file editor edit" (the FULL rendered string — the pageClass rides the page-content div, pinned at repo-editor-cherrypick.smoke.test.tsx:148) + the form action carrying /_cherrypick/{sha}/{branch}; the BARE /cherrypick/{sha}/{branch} → 404 (engine-owned now — the underscore is the only editor_action)`,
     run: async () => {
       expect(typeof ctx.cookie === "string", "no login cookie from the prior arms (fixture missing)");
       const branches = await api(`/repos/${ctx.user}/${ctx.repo}/branches`);
@@ -2815,7 +2816,10 @@ const window3Steps = (ctx) => [
       const get = await fetchT(`${opts.baseUrl}/${ctx.user}/${ctx.repo}/_cherrypick/${sha}/${branch}`, { headers: { cookie: ctx.cookie } });
       const body = await get.text();
       expect(get.status === 200, `_cherrypick GET status ${get.status} (expected 200 — the form render): ${body.slice(0, 120)}`);
-      expect(body.includes(`class="repository file editor edit"`), "the cherrypick pageClass discriminator is missing");
+      // The pageClass rides the page-content div (file-editor.tsx:623's
+      // BaseLayout prop) — needle is the FULL rendered class attribute,
+      // byte-exact with repo-editor-cherrypick.smoke.test.tsx:148.
+      expect(body.includes(`class="page-content repository file editor edit"`), "the cherrypick pageClass discriminator is missing");
       expect(body.includes(`action="/${ctx.user}/${ctx.repo}/_cherrypick/${sha}/${branch}"`),
         `the form action does not carry the underscore spelling (the 6a91a5c rename)`);
       const bare = await fetchT(`${opts.baseUrl}/${ctx.user}/${ctx.repo}/cherrypick/${sha}/${branch}`, { headers: { cookie: ctx.cookie } });
@@ -8040,7 +8044,15 @@ const oauth2Steps = (ctx) => [
         `member order ${JSON.stringify(Object.keys(body))} (expected the Go struct order)`);
       expect(body.sub === String(ctx.userId), `sub ${JSON.stringify(body.sub)} != String(${ctx.userId})`);
       expect(body.preferred_username === ctx.user, `preferred_username ${JSON.stringify(body.preferred_username)} != ${ctx.user}`);
-      expect(String(body.picture ?? "").endsWith(`/avatars/${ctx.user.toLowerCase()}`), `picture ${JSON.stringify(body.picture)} missing the avatars tail`);
+      // U45 (7362128) resolved the picture claims to the RESOLVABLE storage
+      // keys — the old /avatars/{usernameLower} tail 404'd (the keys are
+      // avatar-serving.ts's families: stored → avatars/u_<id>, fallback → the
+      // generated avatars/<64-hex sha256 HashAvatar> identicon) — composed
+      // absolute off the base URL (MakeAbsoluteURL's join, no double slash).
+      let picOrigin = null, picPath = null;
+      try { const u = new URL(String(body.picture ?? "")); picOrigin = u.origin; picPath = u.pathname; } catch { /* the shape assert reports it */ }
+      expect(picOrigin === new URL(opts.baseUrl).origin && picPath !== null && /^\/avatars\/(u_\d+|[0-9a-f]{64})$/.test(picPath),
+        `picture ${JSON.stringify(body.picture)} is not the resolvable avatar shape (<base>/avatars/u_<id> or <base>/avatars/<64-hex HashAvatar>, 7362128)`);
       expect(body.groups === null || Array.isArray(body.groups), `groups ${JSON.stringify(body.groups)} (expected null for an org-less user or an array)`);
       const pat = await fetchT(`${opts.baseUrl}/login/oauth/userinfo`, { headers: { authorization: `token ${TOKEN}` } });
       await pat.text();
@@ -8883,16 +8895,18 @@ const monitorPlatformSteps = (ctx) => {
 
 const AUDIT_TABLES = [
   { key: "creating_rows", sql: `(SELECT COUNT(*) FROM "repositories" WHERE "status" = 'creating')`, want: 0, label: `repositories WHERE status='creating' (whole table)` },
-  // action = 1, NOT 0: the standing fixture's OWN create-repo event (op_type 1,
-  // p0probe4/p0-shallow, minted 2026-11-01 when the fresh probe user's fixture
-  // self-seeded on first contact — after the feed emitters landed, which is why
-  // the earlier audits held whole-table 0). The 389da18 delete sweep cascades
-  // action rows away WITH their repo, so every ephemeral battery repo still
-  // leaves 0 and the never-deleted fixture's row is the one survivor. The
-  // count is self-healing: delete + re-seed the fixture and the old row is
-  // swept while the new seed mints exactly one, so 1 stays the standing truth;
-  // any OTHER survivor (a leaked repo left alive) still fails this check.
-  { key: "action_rows", sql: `(SELECT COUNT(*) FROM "action")`, want: 1, label: `"action" (whole table — exactly the standing fixture's create-repo event; the 389da18 delete sweep cascades every deleted repo's rows away, so NO hand-sweep)` },
+  // action = 2, NOT 1 (the v1.5.1 re-baseline, 2026-11-02): the TWO standing
+  // p0-shallow fixtures' create-repo events (op_type 1). The 0219256
+  // calibration stood at 1 when only the probe user's fixture lived (minted
+  // 2026-11-01 when it self-seeded on first contact, after the feed emitters
+  // landed — which is why the earlier audits held whole-table 0); an earlier
+  // run's own standing p0-shallow, likewise never deleted, joined since, and
+  // the v1.5.1 live run observed exactly the pair. The drift mechanism: each
+  // p0 battery session can leave a standing p0-shallow whose action row
+  // outlives it. The 389da18 delete sweep still cascades action rows away
+  // WITH their repo, so every EPHEMERAL battery repo leaves 0 — NO hand-sweep;
+  // a THIRD survivor (another leaked standing repo) still fails this check.
+  { key: "action_rows", sql: `(SELECT COUNT(*) FROM "action")`, want: 2, label: `"action" (whole table — the two standing p0-shallow fixtures' create-repo events, the 0219256 calibration + one more since; the 389da18 delete sweep cascades every deleted repo's rows away, so NO hand-sweep)` },
   { key: "stars", sql: `(SELECT COUNT(*) FROM "stars")`, want: 0, label: `stars` },
   { key: "push_mirrors", sql: `(SELECT COUNT(*) FROM "push_mirrors")`, want: 0, label: `push_mirrors` },
   { key: "protected_branches", sql: `(SELECT COUNT(*) FROM "protected_branches")`, want: 0, label: `protected_branches` },
@@ -8965,11 +8979,11 @@ const auditSteps = (ctx) => [
   })),
   {
     id: "audit-personal-access-tokens",
-    expect: `personal_access_tokens = 10, the standing bootstrap set after the v1.5 mint churn (enumerated 2026-11-01: the admin bootstrap + SIX p0probe bootstrap rows — each orchestrator mint retry across the p0probe/p0probe2/3/4 session inserted a row, ids 122/130/131/134/137/138 — + p0probe2 + p0probe3 + p0probe4; the 2-encoding, itself the 2026-10-28 two-user repair of the historical whole-table=1 that false-fired from 2026-10-29, predated the churn, whose root cause is now FIXED — bootstrap-admin's mint carries the API layer's duplicate-per-user guard (8e5c4ea), so re-runs skip instead of adding rows; the six stale retry rows sweep at convergence; per-run PATs are DELETEd by the operator — --expect-tokens <n> overrides when the standing set changes again)`,
+    expect: `personal_access_tokens = 1, the per-run probe token; 0 between runs (the v1.5.1 re-baseline, 2026-11-02 — mint+sweep each cycle: the operator mints the run PAT through bootstrap-admin and DELETEs it after the run, and the mint carries the duplicate-per-user guard (8e5c4ea), so a run can never re-drift the way the v1.5 retry churn did; the standing bootstrap set of 10 enumerated at the v1.5 freeze — admin bootstrap + six p0probe retry rows + p0probe2/3/4 — swept at convergence in v1.5.1; --expect-tokens <n> overrides when the posture differs, e.g. local scratch users)`,
     run: () => {
       const n = ctx.counts.personal_access_tokens;
       expect(n === opts.expectTokens, `${n} tokens (expected ${opts.expectTokens})`);
-      return `${n} (the standing bootstrap set: one per standing user)`;
+      return `${n} (the per-run probe token)`;
     },
   },
 ];
