@@ -364,6 +364,74 @@
  *                  fixwave/distro posture — every family its own verdict).
  *                  A red run sweeps the grant rows (D1), the app, the realm
  *                  repo, and the source row (the failureTail).
+ *   monitor-platform The SPEC-0021 platform arms' REAL-API closed loops
+ *                  (§7 — the verification half the 1308 quota death left
+ *                  unwritten; the implementation-status flip 集成待验证 →
+ *                  已实现 rides this battery passing against a live
+ *                  deployment, SPEC-0021 §6). DIRECT-API CLASS, DOCUMENTED
+ *                  HONESTLY: the admin UI's POST /-/admin/monitor/queue/
+ *                  {qid}/set and GET /-/admin/monitor/profile routes are the
+ *                  PENDING ui/index.ts fold (admin-monitor.tsx's "route
+ *                  HANDOFF" block ships them claim-ready), so no admin
+ *                  endpoint exists for either arm yet — the battery drives
+ *                  the OFFICIAL Cloudflare APIs the deployed adapters ride
+ *                  (api.cloudflare.com; services/monitor/{platform,queue-
+ *                  concurrency,profile}.ts's exact URLs/bodies/envelopes) and
+ *                  the admin-side route surface stays ADMIN-MANUAL until the
+ *                  fold lands. It is the ONLY battery whose HTTP leaves the
+ *                  deployment entirely (the probe host needs outbound
+ *                  api.cloudflare.com reachability).
+ *                  TOKEN-GATED from the probe's OWN environment — the SAME
+ *                  names the Worker carries as secrets: CLOUDFLARE_ACCOUNT_ID,
+ *                  CLOUDFLARE_QUEUES_TOKEN, MONITOR_QUEUE_CONSUMERS (the
+ *                  server-side allowlist JSON, same shape), MONITOR_WORKER_NAME,
+ *                  CLOUDFLARE_PROFILE_TOKEN; absent/malformed = the arm's
+ *                  checks answer [warn] "skipped: unconfigured …" — never a
+ *                  pass, never a network call. Both tokens ride the run's
+ *                  scrub table (never echoed).
+ *                  ARM 1 — THE /SET CLOSED LOOP, serial-locked: ONE consumer
+ *                  per run (the allowlist's first entry, or --monitor-consumer;
+ *                  never two): read (GET the consumer's FULL config — the
+ *                  saved snapshot) → modify (PUT settings.max_concurrency to
+ *                  a SAFE value — current−1, or current+1 at the 1-floor;
+ *                  auto (null) → the allowlist's declared value, else 1 —
+ *                  preserving batch_size / max_retries / max_wait_time_ms /
+ *                  retry_delay / dead_letter_queue / script_name / type
+ *                  VERBATIM: PUT replaces the consumer wholesale, dropping a
+ *                  field DROPS the setting) → verify (GET-verify the
+ *                  effective value, 3 reads 500 ms apart — the PUT's own echo
+ *                  is NOT trusted) → finally-RESTORE (the saved config
+ *                  verbatim — RUNS EVEN WHEN the modify/verify steps red: a
+ *                  failed PUT may still have landed) → re-verify. RESTORE
+ *                  FAILURE IS A BLOCKING RED (never [warn]).
+ *                  ARM 2 — THE PPROF CONTENT PROBE: POST the profile (cpu,
+ *                  --profile-duration-ms default 1000, capped 5000 — the
+ *                  platform answers synchronously, so this is the arm's wall
+ *                  time) and validate CONTENT: non-empty → the 10 MiB cap
+ *                  (content-length gated; the streamed read aborts past it) →
+ *                  gunzip (64 MiB decompression-bomb guard) → a minimal
+ *                  protobuf walk (field tags only, NO parser linked: wire
+ *                  types {0,1,2,5}, ≤ 1M fields; string_table present with
+ *                  the empty entry 0; the sample_type ValueType resolves
+ *                  non-empty strings; time_nanos + duration_nanos positive) →
+ *                  sane. ONE 429 retry with backoff (Retry-After honored,
+ *                  capped 5 s), then the report. NO secrets and NO binary
+ *                  bytes in the logs — byte counts + parse verdicts only.
+ *                  The frozen taxonomy (SPEC-0021 §5), ONE classifier for
+ *                  every arm: 401/403 → FAIL with the explicit "token
+ *                  mis-scoped" message (never "platform unsupported"); 400 →
+ *                  fail (the ONE documented exception: a no-live-instance
+ *                  message on the profile POST is the environment-condition
+ *                  [warn] — never claimed green, the platform's message rides
+ *                  the detail); read-back mismatch → fail; unconfigured →
+ *                  [warn] skipped; 429 → bounded retries then report.
+ *                  INDEPENDENT (the arms report their own verdicts; the /set
+ *                  steps gate on the loop's own state instead of chain() so a
+ *                  red modify/verify can NEVER chain-skip the restore). A red
+ *                  run sweeps NOTHING — the battery creates no deployment
+ *                  state (the loop's finally-restore IS the cleanup and its
+ *                  failure is the blocking red; profiling is side-effect-
+ *                  free), so there is no failureTail.
  *   cleanup-audit  The post-run D1 count shapes (wrangler d1 execute; see the
  *                  audit SQL below for the exact tables).
  *   all            Every battery in the order above (audit last).
@@ -449,7 +517,7 @@
  * This file deliberately does NOT touch docs/design/p0-evidence.md (it is
  * REDEPLOY14's in-flight document); the conventions note lives here.
  */
-/* global crypto, fetch, AbortSignal, URLSearchParams, URL -- Web globals provided by Node >= 22 (no node: module exports them) */
+/* global crypto, fetch, AbortSignal, TextDecoder, URLSearchParams, URL -- Web globals provided by Node >= 22 (no node: module exports them) */
 import { execFile } from "node:child_process";
 import console from "node:console";
 import { createHash, randomUUID } from "node:crypto";
@@ -468,7 +536,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workerDir = path.join(repoRoot, "apps", "worker");
 const DEFAULT_USER = "p0probe";
-const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "packages-protocols", "packages-minor", "packages-terraform", "auth-oauth2", "cleanup-audit", "all"];
+const BATTERY_NAMES = ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "packages-protocols", "packages-minor", "packages-terraform", "auth-oauth2", "monitor-platform", "cleanup-audit", "all"];
 /** Batteries that make NO HTTP calls (they read D1 via wrangler only):
  *  --base-url and --token-file are OPTIONAL for these (REDEPLOY15 friction
  *  (a): the D1-only audit still demanded a PAT, forcing a scratch-mint +
@@ -478,6 +546,23 @@ const D1_ONLY_BATTERIES = new Set(["cleanup-audit"]);
 
 /** Canonical fixture tip on the standing production repo (p0probe/p0-shallow). */
 const CANONICAL_FIXTURE_OID = "502abd2d5561536873088528a9f57f02cd1633e1";
+
+/** The monitor-platform battery's frozen constants — the probe's mirrors of
+ *  services/monitor/{platform,queue-concurrency,profile}.ts (kept as literals
+ *  here; the zero-dep script cannot import the TS). Defined BEFORE the CLI
+ *  section because parseArgs validates --profile-duration-ms against them. */
+const MONITOR_MAX_CONCURRENCY_MIN = 1;
+const MONITOR_MAX_CONCURRENCY_MAX = 250;
+const MONITOR_VERIFY_ATTEMPTS = 3;
+const MONITOR_VERIFY_DELAY_MS = 500;
+const MONITOR_429_RETRIES_ENVELOPE = 2; // the adapter's RATE_LIMIT_RETRIES
+const MONITOR_429_RETRIES_PROFILE = 1; // the frozen battery's ONE retry
+const MONITOR_429_BACKOFF_CAP_MS = 5_000;
+const MONITOR_PROFILE_DEFAULT_WORKER = "cf-gitea"; // DEFAULT_MONITOR_WORKER_NAME
+const MONITOR_PROFILE_DURATION_MIN_MS = 1_000; // the platform's documented minimum
+const MONITOR_PROFILE_DURATION_MAX_MS = 5_000; // the probe's frozen cap (the platform accepts up to 50 s)
+const MONITOR_PROFILE_CAP_BYTES = 10 * 1024 * 1024; // the frozen 10 MiB body cap
+const MONITOR_GUNZIP_CAP_BYTES = 64 * 1024 * 1024; // the decompression-bomb guard
 
 // ---------- CLI ----------
 
@@ -495,6 +580,7 @@ const parseArgs = (argv) => {
     trials: 3, fixtureRepo: "p0-shallow", fixtureOid: null, newLabelCount: 3,
     strictGeneratedClone: false, d1Scope: "remote", expectOwnerRepos: 1, expectTokens: 2,
     mirrorSettleMs: 30_000, forceRed: null,
+    monitorConsumer: null, profileDurationMs: 1_000,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -515,6 +601,8 @@ const parseArgs = (argv) => {
     else if (a === "--expect-owner-repos") opts.expectOwnerRepos = Number(argv[++i]);
     else if (a === "--expect-tokens") opts.expectTokens = Number(argv[++i]);
     else if (a === "--force-red") opts.forceRed = argv[++i];
+    else if (a === "--monitor-consumer") opts.monitorConsumer = argv[++i];
+    else if (a === "--profile-duration-ms") opts.profileDurationMs = Number(argv[++i]);
     else if (opts.battery === null && !a.startsWith("--")) {
       if (!BATTERY_NAMES.includes(a)) throw new Error(`unknown battery: ${a} (known: ${BATTERY_NAMES.join(", ")})`);
       opts.battery = a;
@@ -537,6 +625,10 @@ const parseArgs = (argv) => {
   if (opts.d1Scope !== "remote" && opts.d1Scope !== "local") throw new Error("--d1-scope must be remote or local");
   if (!Number.isFinite(opts.mirrorSettleMs) || opts.mirrorSettleMs <= 0) throw new Error("--mirror-settle-ms must be a positive number of milliseconds");
   if (opts.forceRed !== null && (typeof opts.forceRed !== "string" || opts.forceRed.length === 0)) throw new Error("--force-red needs the exact check id to force red (e.g. gen-generated-contents)");
+  if (opts.monitorConsumer !== null && !/^[a-zA-Z0-9_.-]{1,64}$/.test(opts.monitorConsumer)) throw new Error("--monitor-consumer must be 1-64 chars of [a-zA-Z0-9_.-] (a MONITOR_QUEUE_CONSUMERS key)");
+  if (!Number.isInteger(opts.profileDurationMs) || opts.profileDurationMs < MONITOR_PROFILE_DURATION_MIN_MS || opts.profileDurationMs > MONITOR_PROFILE_DURATION_MAX_MS) {
+    throw new Error(`--profile-duration-ms must be an integer ${MONITOR_PROFILE_DURATION_MIN_MS}-${MONITOR_PROFILE_DURATION_MAX_MS} (the platform's documented minimum; the probe's frozen cap)`);
+  }
   opts.baseUrl = opts.baseUrl ? opts.baseUrl.replace(/\/+$/, "") : null;
   return opts;
 };
@@ -567,6 +659,7 @@ const usage = () =>
   "  packages-minor: (no extra options — pure HTTP + the run PAT, every fixture generated inline; the husk row sweep reuses --d1-scope and needs wrangler auth, the packages-registry precedent)\n" +
   "  packages-terraform: (no extra options — pure HTTP + the run PAT; the whole-state DELETE is its own row cascade, so unlike the other packages batteries there is NO D1 arm and no wrangler auth)\n" +
   "  auth-oauth2:   (no extra options — needs wrangler auth for the D1 arms: the builtin-seed read, the revoke row delete, the husk sweep, and the external-auth source seed/cleanup; --d1-scope picks the database, keep it in step with --base-url — the discovery arm's issuer==origin assert keys off it)\n" +
+  "  monitor-platform: --monitor-consumer <key> (the MONITOR_QUEUE_CONSUMERS entry to drive; default the FIRST — serial-locked: one consumer per run, never two)  --profile-duration-ms <1000-5000> (default 1000; the profile POST answers synchronously, so this is the arm's wall time). The arms read CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_QUEUES_TOKEN / CLOUDFLARE_PROFILE_TOKEN / MONITOR_QUEUE_CONSUMERS / MONITOR_WORKER_NAME from the probe's OWN env (the same names the Worker carries as secrets); absent = the arm [warn]-skips (never fake-green). HTTP goes to api.cloudflare.com, NOT the deployment.\n" +
   "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (2 — the standing bootstrap set)\n" +
   "  any battery:   --force-red <check-id>    (self-test: force that check red UNRUN — exercises the failure-tail sweep; an unmatched id warns)";
 
@@ -7639,6 +7732,561 @@ const oauth2FailureCleanup = async (ctx) => {
   if (acts.length) log(`  [tail] oauth-leftover-sweep (best-effort failure cleanup) — ${scrub(acts.join("; "))}`);
 };
 
+// ---------- battery: monitor-platform (the SPEC-0021 platform arms) ----------
+
+/**
+ * The SPEC-0021 §7 verification half — the REAL-API closed loops the monitor
+ * platform's module tests cannot prove (those pin request literals via
+ * mocked fetch): the /set queue-concurrency loop and the pprof content probe,
+ * driven against the OFFICIAL Cloudflare APIs the deployed adapters ride
+ * (apps/worker/src/services/monitor/{platform,queue-concurrency,profile}.ts —
+ * these helpers mirror those modules' exact URLs, bodies, envelope shapes,
+ * preservation rule, verify posture, and 429 bounds; the script cannot import
+ * the TS, so the mirrors live here and the literals above pin the constants).
+ *
+ * See the header block's monitor-platform paragraph for the direct-API-class
+ * rationale, the env gating, and the frozen taxonomy.
+ */
+
+/** The probe's mirror of parseMonitorQueueAllowlist (services/monitor/
+ *  platform.ts — the same no-partial-trust validation). */
+const parseMonitorAllowlist = (raw) => {
+  if (raw === undefined || raw.trim() === "") {
+    return { targets: new Map(), error: null };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    return { targets: new Map(), error: `MONITOR_QUEUE_CONSUMERS is not valid JSON: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { targets: new Map(), error: "MONITOR_QUEUE_CONSUMERS must be a JSON object keyed by queue name" };
+  }
+  const targets = new Map();
+  for (const [key, value] of Object.entries(parsed)) {
+    if (!/^[a-zA-Z0-9_.-]{1,64}$/.test(key)) {
+      return { targets: new Map(), error: "MONITOR_QUEUE_CONSUMERS carries a key that is not a queue-name shape" };
+    }
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      return { targets: new Map(), error: `MONITOR_QUEUE_CONSUMERS[${key}] must be an object` };
+    }
+    const entry = value;
+    if (typeof entry.queue_id !== "string" || entry.queue_id === "") {
+      return { targets: new Map(), error: `MONITOR_QUEUE_CONSUMERS[${key}].queue_id must be a non-empty string` };
+    }
+    if (typeof entry.consumer_id !== "string" || entry.consumer_id === "") {
+      return { targets: new Map(), error: `MONITOR_QUEUE_CONSUMERS[${key}].consumer_id must be a non-empty string` };
+    }
+    let declared = null;
+    if (entry.declared_max_concurrency !== undefined && entry.declared_max_concurrency !== null) {
+      if (typeof entry.declared_max_concurrency !== "number" || !Number.isInteger(entry.declared_max_concurrency) || entry.declared_max_concurrency < 0) {
+        return { targets: new Map(), error: `MONITOR_QUEUE_CONSUMERS[${key}].declared_max_concurrency must be a non-negative integer or null` };
+      }
+      declared = entry.declared_max_concurrency;
+    }
+    targets.set(key, { key, queueId: entry.queue_id, consumerId: entry.consumer_id, declaredMaxConcurrency: declared });
+  }
+  return { targets, error: null };
+};
+
+const monitorPlatformContext = () => {
+  const env = process.env;
+  const accountId = env.CLOUDFLARE_ACCOUNT_ID?.trim() || null;
+  const queuesToken = env.CLOUDFLARE_QUEUES_TOKEN?.trim() || null;
+  const profileToken = env.CLOUDFLARE_PROFILE_TOKEN?.trim() || null;
+  const workerName = env.MONITOR_WORKER_NAME?.trim() || MONITOR_PROFILE_DEFAULT_WORKER;
+  // The platform tokens ride the same scrub table as the PAT (never echoed).
+  if (queuesToken !== null) secrets.push(queuesToken);
+  if (profileToken !== null) secrets.push(profileToken);
+  const allow = parseMonitorAllowlist(env.MONITOR_QUEUE_CONSUMERS);
+  const qsetMissing = [];
+  if (accountId === null) qsetMissing.push("CLOUDFLARE_ACCOUNT_ID");
+  if (queuesToken === null) qsetMissing.push("CLOUDFLARE_QUEUES_TOKEN");
+  if (allow.error !== null) {
+    qsetMissing.push(allow.error);
+  } else if (allow.targets.size === 0) {
+    qsetMissing.push("MONITOR_QUEUE_CONSUMERS (no allowlist entries)");
+  }
+  let qsetTarget = null;
+  if (allow.error === null && allow.targets.size > 0) {
+    if (opts.monitorConsumer !== null) {
+      qsetTarget = allow.targets.get(opts.monitorConsumer) ?? null;
+      if (qsetTarget === null) {
+        qsetMissing.push(`--monitor-consumer ${opts.monitorConsumer} is not in MONITOR_QUEUE_CONSUMERS (keys: ${[...allow.targets.keys()].join(", ")})`);
+      }
+    } else {
+      qsetTarget = [...allow.targets.values()][0]; // the serial lock: the FIRST entry, one consumer per run
+    }
+  }
+  const profileMissing = [];
+  if (accountId === null) profileMissing.push("CLOUDFLARE_ACCOUNT_ID");
+  if (profileToken === null) profileMissing.push("CLOUDFLARE_PROFILE_TOKEN");
+  return {
+    tmp: null,
+    durationMs: opts.profileDurationMs,
+    qsetGate: { configured: qsetMissing.length === 0, reason: qsetMissing.join("; "), accountId, token: queuesToken, target: qsetTarget },
+    profileGate: { configured: profileMissing.length === 0, reason: profileMissing.join("; "), accountId, token: profileToken, workerName },
+    saved: null, loopOpened: false, modifyTarget: null, restorePutOk: false,
+  };
+};
+
+// -- the Cloudflare API call core (platform.ts's mirrors) --
+
+/** Retry-After (seconds per the spec) → ms, capped (retryAfterMs's mirror). */
+const monitorRetryAfterMs = (headers) => {
+  const raw = headers.get("retry-after");
+  if (raw === null) return null;
+  const seconds = Number.parseFloat(raw);
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  return Math.min(seconds * 1000, MONITOR_429_BACKOFF_CAP_MS);
+};
+
+/** One JSON-envelope Cloudflare API call with the bounded 429 posture
+ *  (honor Retry-After capped; at most `maxRetries` retries, then the 429 is
+ *  returned for the caller's report). A network throw comes back as
+ *  { networkError } — the platform-unavailable arm, never an application
+ *  crash (doFetchRequest's mirror). */
+const monitorCfCall = async ({ method, url, token, body, maxRetries }) => {
+  let attempts = 0;
+  for (;;) {
+    attempts++;
+    let res;
+    try {
+      res = await fetchT(url, {
+        method,
+        headers: {
+          authorization: `Bearer ${token}`,
+          ...(body !== undefined ? { "content-type": "application/json" } : {}),
+        },
+        body,
+      });
+    } catch (err) {
+      return { networkError: err instanceof Error ? err.message : String(err), attempts };
+    }
+    if (res.status === 429 && attempts <= maxRetries) {
+      await sleep(monitorRetryAfterMs(res.headers) ?? 1_000);
+      continue;
+    }
+    const rateLimited = res.status === 429;
+    const text = rateLimited ? "" : await res.text();
+    let json = null;
+    if (!rateLimited) {
+      try { json = JSON.parse(text); } catch { /* non-JSON — the caller classifies on status */ }
+    }
+    return { status: res.status, ok: res.ok, rateLimited, json, text, attempts };
+  }
+};
+
+/** The profile POST with ONE 429 retry (the frozen battery's bound): backoff
+ *  honors Retry-After (capped), a fixed 2 s when the header is absent.
+ *  Returns the raw Response on the non-retry arms (the ok arm streams the
+ *  gzipped pprof — the body is read once, capped, by the caller). */
+const monitorProfileCall = async (gate, durationMs) => {
+  let attempts = 0;
+  for (;;) {
+    attempts++;
+    let res;
+    try {
+      res = await fetchT(monitorProfileUrl(gate), {
+        method: "POST",
+        headers: { authorization: `Bearer ${gate.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ duration_ms: durationMs, profile_type: "cpu" }),
+      });
+    } catch (err) {
+      return { networkError: err instanceof Error ? err.message : String(err), attempts };
+    }
+    if (res.status === 429 && attempts <= MONITOR_429_RETRIES_PROFILE) {
+      await sleep(monitorRetryAfterMs(res.headers) ?? 2_000);
+      continue;
+    }
+    return { status: res.status, ok: res.ok, rateLimited: res.status === 429, res, attempts };
+  }
+};
+
+/** The envelope's error entries (envelopeErrors's mirror). */
+const monitorEnvelopeErrors = (r) => {
+  const arr = r.json?.errors;
+  if (Array.isArray(arr)) {
+    return arr.map((e) => {
+      const entry = e ?? {};
+      return { code: typeof entry.code === "number" ? entry.code : null, message: typeof entry.message === "string" ? entry.message : "" };
+    });
+  }
+  return [{ code: null, message: (r.text ?? "").slice(0, 200) }];
+};
+
+const monitorErrText = (r) =>
+  monitorEnvelopeErrors(r).map((e) => (e.code !== null ? `${e.code}: ${e.message}` : e.message)).filter(Boolean).join("; ").slice(0, 200);
+
+/** THE FROZEN TAXONOMY'S classifier-thrower — ONE mapping for every arm
+ *  (classifyNonOk's mirror): 401/403 names the mis-scoped token (NEVER
+ *  "platform unsupported"); 400/405/415 the rejected request shape; 404 the
+ *  unresolving id; a 429 that survived its retries is reported; everything
+ *  else is platform-unavailable. Always throws — the caller's check records
+ *  the FAIL. */
+const monitorThrowCfFailure = (where, r) => {
+  if (r.networkError !== undefined) {
+    throw new Error(`${where}: the platform is unreachable — ${r.networkError}`);
+  }
+  if (r.rateLimited) {
+    throw new Error(`${where}: rate limited after ${r.attempts} attempts (Retry-After honored, capped at ${MONITOR_429_BACKOFF_CAP_MS} ms) — reported per the taxonomy, never a silent green`);
+  }
+  const errText = monitorErrText(r);
+  if (r.status === 401 || r.status === 403) {
+    throw new Error(`${where}: token mis-scoped — the platform answered ${r.status} (${errText || "no error detail"}); this FAILS the battery and is NEVER reported as "platform unsupported"`);
+  }
+  if (r.status === 400 || r.status === 405 || r.status === 415) {
+    throw new Error(`${where}: the platform rejected the request (${r.status}): ${errText}`);
+  }
+  if (r.status === 404) {
+    throw new Error(`${where}: 404 — the configured queue/consumer/worker id does not resolve: ${errText}`);
+  }
+  throw new Error(`${where}: the platform answered ${r.status}: ${errText}`);
+};
+
+// -- the consumer shapes (queue-concurrency.ts's mirrors) --
+
+/** The consumer settings slice the PUT builder consumes (the
+ *  QueueConsumerSettings fields the preservation rule needs). */
+const monitorParseConsumer = (result) => {
+  if (result === null || typeof result !== "object") {
+    throw new Error("the consumer result is not an object");
+  }
+  const settings = result.settings ?? null;
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  const str = (v) => (typeof v === "string" ? v : null);
+  return {
+    scriptName: str(result.script_name),
+    type: str(result.type),
+    deadLetterQueue: str(result.dead_letter_queue),
+    batchSize: settings === null ? null : num(settings.batch_size),
+    maxConcurrency: settings === null ? null : num(settings.max_concurrency),
+    maxRetries: settings === null ? null : num(settings.max_retries),
+    maxWaitTimeMs: settings === null ? null : num(settings.max_wait_time_ms),
+    retryDelay: settings === null ? null : num(settings.retry_delay),
+  };
+};
+
+/** The PUT body builder — buildConsumerPutBody's preservation rule made
+ *  structural: every field the GET returned rides verbatim; ONLY
+ *  settings.max_concurrency changes (null = the platform-max auto arm). */
+const monitorConsumerPutBody = (saved, maxConcurrency) => {
+  const body = { type: saved.type ?? "worker" };
+  if (saved.scriptName !== null) body.script_name = saved.scriptName;
+  if (saved.deadLetterQueue !== null) body.dead_letter_queue = saved.deadLetterQueue;
+  const settings = {};
+  if (saved.batchSize !== null) settings.batch_size = saved.batchSize;
+  settings.max_concurrency = maxConcurrency; // THE change
+  if (saved.maxRetries !== null) settings.max_retries = saved.maxRetries;
+  if (saved.maxWaitTimeMs !== null) settings.max_wait_time_ms = saved.maxWaitTimeMs;
+  if (saved.retryDelay !== null) settings.retry_delay = saved.retryDelay;
+  body.settings = settings;
+  return JSON.stringify(body);
+};
+
+const monitorConsumerUrl = (gate) =>
+  `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(gate.accountId)}/queues/${encodeURIComponent(gate.target.queueId)}/consumers/${encodeURIComponent(gate.target.consumerId)}`;
+
+const monitorProfileUrl = (gate) =>
+  `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(gate.accountId)}/workers/workers/${encodeURIComponent(gate.workerName)}/versions/latest/profile`;
+
+const monitorFmtMax = (v) => (v === null ? "auto" : String(v));
+
+/** The SAFE modify target (the frozen loop's rule): a REAL change inside the
+ *  validated range — current−1 (or current+1 at the 1-floor); auto (null) →
+ *  the allowlist's declared value, else 1. The restore always puts back the
+ *  SAVED value, so even the auto→number excursion is reverted verbatim. */
+const monitorSafeTarget = (current, declared) => {
+  if (current !== null) return current > MONITOR_MAX_CONCURRENCY_MIN ? current - 1 : current + 1;
+  if (declared !== null && declared >= MONITOR_MAX_CONCURRENCY_MIN && declared <= MONITOR_MAX_CONCURRENCY_MAX) return declared;
+  return MONITOR_MAX_CONCURRENCY_MIN;
+};
+
+/** The bounded verify read (the setQueueConsumerMaxConcurrency verify step's
+ *  mirror): up to 3 GETs 500 ms apart absorbing the read-after-write window;
+ *  a read that keeps answering a different value throws THE read-back-
+ *  mismatch FAIL; a read that keeps ERRORING throws the read failure. */
+const monitorVerifyLoop = async (gate, expected) => {
+  let got = null;
+  let last = null;
+  for (let attempt = 1; attempt <= MONITOR_VERIFY_ATTEMPTS; attempt++) {
+    last = await monitorCfCall({ method: "GET", url: monitorConsumerUrl(gate), token: gate.token, maxRetries: MONITOR_429_RETRIES_ENVELOPE });
+    if (last.ok) {
+      let parsed;
+      try {
+        parsed = monitorParseConsumer(last.json?.result);
+      } catch (err) {
+        throw new Error(`the verify read answered 200 with an unexpected consumer shape — ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+      }
+      got = parsed.maxConcurrency;
+      if (got === expected) return { got, attempts: attempt };
+    }
+    if (attempt < MONITOR_VERIFY_ATTEMPTS) await sleep(MONITOR_VERIFY_DELAY_MS);
+  }
+  if (!last.ok) monitorThrowCfFailure("the verify read", last);
+  throw new Error(`read-back mismatch: expected max_concurrency ${monitorFmtMax(expected)}, the platform kept answering ${monitorFmtMax(got)} after ${MONITOR_VERIFY_ATTEMPTS} verify reads (${MONITOR_VERIFY_DELAY_MS} ms apart)`);
+};
+
+/** The capped body read (the streaming posture — an unbounded body never
+ *  buffers): the stream is cancelled the moment it passes the cap. */
+const monitorReadBodyCapped = async (res, cap) => {
+  if (!res.body) {
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength > cap) throw new Error(`profile body exceeds the probe's ${cap} byte cap`);
+    return new Uint8Array(buf);
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > cap) {
+      await reader.cancel().catch(() => {});
+      throw new Error(`profile body exceeds the probe's 10 MiB cap (> ${cap} bytes) — the read was aborted`);
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
+  return out;
+};
+
+// -- the minimal pprof protobuf walk (NO parser linked — a bounded
+//    structural check over the wire format; the profile-level pins live in
+//    monitorAnalyzePprof) --
+
+const MONITOR_PROTO_MAX_FIELDS = 1_000_000;
+const MONITOR_PROTO_MAX_VALUE_TYPE_FIELDS = 8;
+
+/** One protobuf varint (≤ 10 bytes) → { value: bigint, next }. */
+const monitorReadVarint = (buf, off) => {
+  let value = 0n;
+  for (let i = 0; i < 10; i++) {
+    if (off >= buf.length) throw new Error("truncated varint");
+    const b = buf[off];
+    off += 1;
+    value |= BigInt(b & 0x7f) << BigInt(7 * i);
+    if ((b & 0x80) === 0) return { value, next: off };
+  }
+  throw new Error("a varint ran past 10 bytes");
+};
+
+/** Walk one protobuf message a bounded number of fields deep: collect
+ *  fieldNumber → [{wire, varint?, start?, len?}] in encounter order. A bad
+ *  field number, an unknown wire type, or truncation throws — the parse
+ *  verdict the battery reports. */
+const monitorWalkProto = (buf, maxFields) => {
+  const fields = new Map();
+  let off = 0;
+  let count = 0;
+  while (off < buf.length) {
+    if (++count > maxFields) throw new Error(`more than ${maxFields} fields — not a bounded profile message`);
+    const key = monitorReadVarint(buf, off);
+    off = key.next;
+    const field = Number(key.value >> 3n);
+    const wire = Number(key.value & 7n);
+    if (field === 0) throw new Error("field number 0 is invalid");
+    let entry;
+    if (wire === 0) {
+      const v = monitorReadVarint(buf, off);
+      off = v.next;
+      entry = { wire, varint: v.value };
+    } else if (wire === 1) {
+      if (off + 8 > buf.length) throw new Error("truncated 64-bit field");
+      entry = { wire, start: off, len: 8 };
+      off += 8;
+    } else if (wire === 2) {
+      const l = monitorReadVarint(buf, off);
+      off = l.next;
+      const len = Number(l.value);
+      if (off + len > buf.length) throw new Error("truncated length-delimited field");
+      entry = { wire, start: off, len };
+      off += len;
+    } else if (wire === 5) {
+      if (off + 4 > buf.length) throw new Error("truncated 32-bit field");
+      entry = { wire, start: off, len: 4 };
+      off += 4;
+    } else {
+      throw new Error(`invalid wire type ${wire}`);
+    }
+    const list = fields.get(field);
+    if (list !== undefined) list.push(entry);
+    else fields.set(field, [entry]);
+  }
+  return { fields, count };
+};
+
+/** The profile-level structural pins (perftools.profiles.Profile — exactly
+ *  the fields the frozen battery names): string_table present with the empty
+ *  entry 0 (the pprof convention), the first sample_type's ValueType
+ *  resolving non-empty in-bounds strings, time_nanos + duration_nanos
+ *  present and positive, period positive when present. The strings are
+ *  decoded on demand only — the table is never materialized, and nothing
+ *  binary ever reaches the log (the caller prints counts + these verdicts). */
+const monitorAnalyzePprof = (buf) => {
+  const { fields, count } = monitorWalkProto(buf, MONITOR_PROTO_MAX_FIELDS);
+  const decoder = new TextDecoder("utf8", { fatal: false });
+  const st = fields.get(6);
+  if (st === undefined || st.length === 0) throw new Error("string_table (field 6) is absent — not a pprof Profile message");
+  const stAt = (i) => {
+    const e = st[i];
+    if (e === undefined || e.wire !== 2) throw new Error(`string_table[${i}] is not a length-delimited entry`);
+    return decoder.decode(buf.subarray(e.start, e.start + e.len));
+  };
+  if (stAt(0) !== "") throw new Error(`string_table[0] is ${JSON.stringify(stAt(0))} (the pprof convention: entry 0 is the empty string)`);
+  const sampleTypes = fields.get(1);
+  if (sampleTypes === undefined || sampleTypes.length === 0) throw new Error("sample_type (field 1) is absent — not a pprof Profile message");
+  const resolveValueType = (entry) => {
+    if (entry.wire !== 2) throw new Error("a ValueType is not length-delimited");
+    const { fields: vf } = monitorWalkProto(buf.subarray(entry.start, entry.start + entry.len), MONITOR_PROTO_MAX_VALUE_TYPE_FIELDS);
+    const t = vf.get(1)?.[0];
+    const u = vf.get(2)?.[0];
+    if (t?.varint === undefined || u?.varint === undefined) throw new Error("a ValueType lacks type/unit string indices");
+    const typeIdx = Number(t.varint);
+    const unitIdx = Number(u.varint);
+    if (typeIdx >= st.length || unitIdx >= st.length) throw new Error(`a ValueType's string indices are out of table bounds (${typeIdx}, ${unitIdx} vs ${st.length} entries)`);
+    const typeName = stAt(typeIdx);
+    const unitName = stAt(unitIdx);
+    if (typeName === "" || unitName === "") throw new Error(`a ValueType resolves an empty string (${JSON.stringify(typeName)}/${JSON.stringify(unitName)})`);
+    return `${typeName}/${unitName}`;
+  };
+  const sampleType = resolveValueType(sampleTypes[0]);
+  const positiveVarint = (field, name) => {
+    const e = fields.get(field)?.[0];
+    if (e === undefined || e.wire !== 0) throw new Error(`${name} (field ${field}) is ${e === undefined ? "absent" : "not a varint"} — not a sane profile`);
+    if (e.varint <= 0n) throw new Error(`${name} (field ${field}) is ${e.varint} (expected positive)`);
+    return e.varint;
+  };
+  const durationNanos = positiveVarint(10, "duration_nanos");
+  positiveVarint(9, "time_nanos");
+  let periodType = null;
+  const pt = fields.get(11)?.[0];
+  if (pt !== undefined && pt.wire === 2) periodType = resolveValueType(pt);
+  const period = fields.get(12)?.[0];
+  if (period !== undefined && period.wire === 0 && period.varint <= 0n) throw new Error(`period (field 12) is ${period.varint} (expected positive when present)`);
+  return { fieldCount: count, stringCount: st.length, sampleType, periodType, durationMs: Number(durationNanos / 1_000_000n) };
+};
+
+// -- the steps --
+
+const monitorPlatformSteps = (ctx) => {
+  const gate = ctx.qsetGate;
+  const targetLabel = gate.target !== null
+    ? `${gate.target.key} (queue ${gate.target.queueId}, consumer ${gate.target.consumerId})`
+    : "the allowlisted consumer";
+  return [
+    {
+      id: "mon-qset-consumer-read",
+      expect: `ARM 1 — THE /SET CLOSED LOOP, serial-locked to ONE consumer (${targetLabel}; the battery never targets two): GET …/queues/{q}/consumers/{c} → 200 envelope; the FULL config is SAVED as the loop's snapshot (the restore rides it verbatim). 401/403 → FAIL "token mis-scoped" (never "platform unsupported"); 400/404/network → fail; unconfigured env → [warn] skip`,
+      run: async () => {
+        if (!gate.configured) return { status: "warn", detail: `skipped: unconfigured — ${gate.reason}` };
+        const r = await monitorCfCall({ method: "GET", url: monitorConsumerUrl(gate), token: gate.token, maxRetries: MONITOR_429_RETRIES_ENVELOPE });
+        if (!r.ok) monitorThrowCfFailure("reading the consumer", r);
+        let saved;
+        try {
+          saved = monitorParseConsumer(r.json?.result);
+        } catch (err) {
+          throw new Error(`the consumer read answered a non-envelope/unknown shape — ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+        }
+        ctx.saved = saved;
+        ctx.loopOpened = true;
+        ctx.modifyTarget = monitorSafeTarget(saved.maxConcurrency, gate.target.declaredMaxConcurrency);
+        return `saved config (consumer ${gate.target.consumerId.slice(0, 8)}…): max_concurrency ${monitorFmtMax(saved.maxConcurrency)}, batch_size ${monitorFmtMax(saved.batchSize)}, max_retries ${monitorFmtMax(saved.maxRetries)} — modify target ${monitorFmtMax(ctx.modifyTarget)}`;
+      },
+    },
+    {
+      id: "mon-qset-modify-put",
+      expect: `PUT the consumer — settings.max_concurrency → the SAFE target (current−1, or current+1 at the 1-floor; auto → the declared value, else 1), batch_size/max_retries/max_wait_time_ms/retry_delay/dead_letter_queue/script_name/type PRESERVED VERBATIM (PUT replaces the consumer wholesale — dropping a field DROPS the setting). A failure here does NOT skip the restore steps (a failed PUT may still have landed)`,
+      run: async () => {
+        if (!gate.configured) return { status: "warn", detail: "skipped: unconfigured" };
+        if (!ctx.loopOpened) return { status: "skip", detail: "prior step failed — the loop never opened (nothing was modified)" };
+        const r = await monitorCfCall({ method: "PUT", url: monitorConsumerUrl(gate), token: gate.token, body: monitorConsumerPutBody(ctx.saved, ctx.modifyTarget), maxRetries: MONITOR_429_RETRIES_ENVELOPE });
+        if (!r.ok) monitorThrowCfFailure(`writing the consumer (max_concurrency ${monitorFmtMax(ctx.saved.maxConcurrency)} → ${monitorFmtMax(ctx.modifyTarget)})`, r);
+        return `PUT accepted — max_concurrency ${monitorFmtMax(ctx.saved.maxConcurrency)} → ${monitorFmtMax(ctx.modifyTarget)} (the untouched fields rode the saved config verbatim)`;
+      },
+    },
+    {
+      id: "mon-qset-verify-effective",
+      expect: `GET-verify the effective value (${MONITOR_VERIFY_ATTEMPTS} reads, ${MONITOR_VERIFY_DELAY_MS} ms apart — the PUT's own echo is NOT trusted): it must equal the modify target; a persistent mismatch is THE read-back-mismatch FAIL (never a claimed success)`,
+      run: async () => {
+        if (!gate.configured) return { status: "warn", detail: "skipped: unconfigured" };
+        if (!ctx.loopOpened) return { status: "skip", detail: "prior step failed — the loop never opened (nothing was modified)" };
+        const { got, attempts } = await monitorVerifyLoop(gate, ctx.modifyTarget);
+        return `effective max_concurrency = ${monitorFmtMax(got)} (verified on read ${attempts}/${MONITOR_VERIFY_ATTEMPTS})`;
+      },
+    },
+    {
+      id: "mon-qset-restore-put",
+      expect: `FINALLY-RESTORE the saved config (PUT settings.max_concurrency back to the SAVED value — RUNS EVEN WHEN the modify/verify steps red): RESTORE FAILURE IS A BLOCKING RED, never [warn] — the probe never leaves a consumer modified while claiming anything`,
+      run: async () => {
+        if (!gate.configured) return { status: "warn", detail: "skipped: unconfigured" };
+        if (!ctx.loopOpened) return { status: "skip", detail: "prior step failed — the loop never opened (nothing was modified; nothing to restore)" };
+        const r = await monitorCfCall({ method: "PUT", url: monitorConsumerUrl(gate), token: gate.token, body: monitorConsumerPutBody(ctx.saved, ctx.saved.maxConcurrency), maxRetries: MONITOR_429_RETRIES_ENVELOPE });
+        if (!r.ok) {
+          throw new Error(`RESTORE FAILED (BLOCKING): the platform refused the restore PUT (${r.status}: ${monitorErrText(r)}) — the consumer may still carry the probe's modified max_concurrency ${monitorFmtMax(ctx.modifyTarget)}; restore it by hand (the admin Monitor UI's pool settings or the Queues API) before relying on this queue`);
+        }
+        ctx.restorePutOk = true;
+        return `restored max_concurrency = ${monitorFmtMax(ctx.saved.maxConcurrency)} (the saved config verbatim)`;
+      },
+    },
+    {
+      id: "mon-qset-verify-restore",
+      expect: `GET-re-verify the restore (the same bounded reads): the effective value must equal the SAVED value again — the closed loop is clean; a mismatch here is a BLOCKING RED (read-back mismatch never passes)`,
+      run: async () => {
+        if (!gate.configured) return { status: "warn", detail: "skipped: unconfigured" };
+        if (!ctx.loopOpened) return { status: "skip", detail: "prior step failed — the loop never opened (nothing was modified; nothing to verify)" };
+        const { got, attempts } = await monitorVerifyLoop(gate, ctx.saved.maxConcurrency);
+        const note = ctx.restorePutOk ? "" : " (the restore PUT answered an error — but the effective value IS the saved config again; the restore step's red stands)";
+        return `restore re-verified: effective max_concurrency = ${monitorFmtMax(got)} (read ${attempts}/${MONITOR_VERIFY_ATTEMPTS})${note}`;
+      },
+    },
+    {
+      id: "mon-pprof-content",
+      expect: `ARM 2 — THE PPROF CONTENT PROBE: POST …/workers/workers/{w}/versions/latest/profile {"duration_ms":${ctx.durationMs} ≤ 5000,"profile_type":"cpu"} → 200 with a GZIPPED PPROF FILE → validate CONTENT: non-empty → the 10 MiB cap (content-length gated; the streamed read aborts past it) → gunzip (64 MiB bomb guard) → the pprof protobuf parses (a minimal field-tag walk, NO parser linked) → string_table[0] empty, sample_type resolves non-empty strings, time_nanos/duration_nanos positive. ONE 429 retry with backoff, then report. NO secrets, NO binary bytes in the logs (byte counts + verdicts only). 401/403 → FAIL "token mis-scoped"; 400 → FAIL (a no-live-instance message is the documented environment-condition [warn], never claimed green); unconfigured env → [warn] skip`,
+      run: async () => {
+        const pGate = ctx.profileGate;
+        if (!pGate.configured) return { status: "warn", detail: `skipped: unconfigured — ${pGate.reason}` };
+        const r = await monitorProfileCall(pGate, ctx.durationMs);
+        if (!r.ok) {
+          // The ONE documented environment-condition carve-out: a 400-family
+          // body naming no live instance is the honest [warn] (SPEC-0021 §5's
+          // "No-active-profile-instance → environment-condition, never
+          // fake-green") — the platform's message rides the detail verbatim.
+          if ((r.status === 400 || r.status === 405 || r.status === 415) &&
+              /no\s+(live|active|running)|not\s+(currently\s+)?running|no\s+active\s+instance|instance\s+not\s+found|no\s+workers?\s+(are\s+)?running/i.test(monitorErrText(r))) {
+            return { status: "warn", detail: `environment condition, NEVER claimed green: the platform reports no live profile instance (${r.status}: ${monitorErrText(r)}) — send traffic to ${pGate.workerName} and re-run` };
+          }
+          monitorThrowCfFailure("the profile trigger", r);
+        }
+        const declared = Number.parseInt(r.res.headers.get("content-length") ?? "", 10);
+        if (Number.isFinite(declared) && declared > MONITOR_PROFILE_CAP_BYTES) {
+          throw new Error(`profile exceeds the probe's 10 MiB cap (${declared} bytes declared)`);
+        }
+        const bytes = await monitorReadBodyCapped(r.res, MONITOR_PROFILE_CAP_BYTES);
+        if (bytes.length === 0) throw new Error("the platform answered 200 with an EMPTY body (a profile is never empty)");
+        if (!(bytes[0] === 0x1f && bytes[1] === 0x8b)) {
+          throw new Error(`the response is not a gzip stream (first bytes ${bytes[0]}, ${bytes.length === 1 ? "<end>" : bytes[1]})`);
+        }
+        let inflated;
+        try {
+          inflated = gunzipSync(bytes, { maxOutputLength: MONITOR_GUNZIP_CAP_BYTES });
+        } catch (err) {
+          throw new Error(`gunzip failed on the ${bytes.length} byte body — ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+        }
+        const walk = monitorAnalyzePprof(inflated);
+        return `${bytes.length} B gzip → ${inflated.length} B pprof; protobuf parses (${walk.fieldCount} fields, all wire types valid); string_table ${walk.stringCount} entries (entry 0 empty); sample_type ${walk.sampleType}; time_nanos/duration_nanos positive (window ≈ ${walk.durationMs} ms)${walk.periodType !== null ? `; period_type ${walk.periodType}` : ""}`;
+      },
+    },
+  ];
+};
+
 // ---------- battery: cleanup-audit (the D1 count shapes) ----------
 
 const AUDIT_TABLES = [
@@ -7820,11 +8468,21 @@ const BATTERIES = {
   // wrangler auth for the D1 arms (--d1-scope picks the database — the
   // discovery arm's issuer==origin assert keys off it).
   "auth-oauth2": { title: "auth oauth2 (oauth2-provider §5 + external-auth §8: the scripted third-party client end-to-end — registration (secret exactly-once), login session, consent dance w/ PKCE S256, form + Basic exchanges, dotted dispatch, userinfo (+PAT-401), offline JWKS verify (WebCrypto, claims pinned), refresh, introspect (active+junk+401), revoke-kills-token (the grant row D1 delete), app delete + the D1 husk sweep — + the realm check, the discovery shape, the builtin seed, the external-auth source family)", context: oauth2Context, steps: oauth2Steps, failureTail: oauth2FailureCleanup, independent: true },
+  // Independent (the two arms report their own verdicts; the /set family's
+  // restore steps gate on the loop's own state instead of chain() so a red
+  // modify/verify can NEVER chain-skip the restore). Direct-API class: the
+  // admin UI's /set + /profile routes are the pending ui/index.ts fold, so
+  // the arms drive the OFFICIAL Cloudflare APIs from the probe's env —
+  // token-gated, absent = [warn]-skip, never fake-green (see the battery
+  // section + the header block). No failureTail: the battery creates no
+  // deployment state — the /set loop's finally-restore IS the cleanup, and
+  // its failure is the blocking red; profiling is side-effect-free.
+  "monitor-platform": { title: "monitor platform arms (SPEC-0021 §7: the /set closed loop — GET-save → SAFE modify → GET-verify → finally-RESTORE → re-verify, serial-locked to one MONITOR_QUEUE_CONSUMERS entry, restore failure a BLOCKING red — and the pprof content probe — cpu ≤ 5 s, 10 MiB cap, gunzip → minimal protobuf walk → sane fields, ONE 429 retry; direct-API class over api.cloudflare.com, token-gated from the probe's env)", context: monitorPlatformContext, steps: monitorPlatformSteps, independent: true },
   // Independent counts — one red count never hides the rest of the shape.
   "cleanup-audit": { title: "post-run D1 count shapes", context: () => ({}), steps: auditSteps, independent: true },
 };
 
-const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "packages-protocols", "packages-minor", "packages-terraform", "auth-oauth2", "cleanup-audit"] : [opts.battery];
+const batteryList = opts.battery === "all" ? ["p0", "registry", "generate-e2e", "forkpr-e2e", "mirror", "ui-login", "window2-mounts", "window3-mounts", "fixwave-parity", "branch-protection", "demo", "wiki-git", "packages-registry", "packages-distro", "packages-protocols", "packages-minor", "packages-terraform", "auth-oauth2", "monitor-platform", "cleanup-audit"] : [opts.battery];
 
 // ---------- dry-run ----------
 

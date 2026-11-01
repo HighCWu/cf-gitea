@@ -18,13 +18,13 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
                                                       # D1-only: --base-url/--token-file optional
 ```
 
-- Batteries (19): `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
+- Batteries (20): `p0`, `registry`, `generate-e2e`, `forkpr-e2e`, `mirror`,
   `ui-login`, `window2-mounts`, `window3-mounts`, `fixwave-parity`,
   `branch-protection`, `demo`, `wiki-git`, `packages-registry`,
   `packages-distro`, `packages-protocols`, `packages-minor`,
-  `packages-terraform`, `auth-oauth2`, `cleanup-audit`,
-  `all` (runs the 19 in that order, audit last). `all --dry-run` plans
-  **232 probes** across them (the counts in the table below were read off
+  `packages-terraform`, `auth-oauth2`, `monitor-platform`, `cleanup-audit`,
+  `all` (runs the 20 in that order, audit last). `all --dry-run` plans
+  **238 probes** across them (the counts in the table below were read off
   that dry-run at this writing; `registry` scales with `--trials`).
 - **The `cleanup-audit` battery is D1-only** (wrangler d1 execute, no HTTP): it
   takes neither `--base-url` nor `--token-file` — a missing token only errors
@@ -47,7 +47,7 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
   row sweep reuse `--d1-scope`); mint the
   PAT with `node scripts/bootstrap-admin.mjs <user>` on local D1, and pass the
   matching `--user`. A local self-test (the seven batteries committed at the
-  time — `window2-mounts` landed after; the toolkit now carries 16) was run green
+  time — `window2-mounts` landed after; the toolkit now carries 20) was run green
   from this tree; see "Local self-test fixtures" below.
 - `--json` puts only the final JSON summary on stdout (progress to stderr),
   same contract as deploy-smoke.
@@ -62,7 +62,11 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
   request) and the mint shape `cfg_<8hex>_<32base32>`.
 - The token is **never echoed**: every progress line, detail, and the JSON
   summary are scrubbed against it — and against the `gitea_session` value the
-  ui-login battery captures.
+  ui-login battery captures. The monitor-platform battery's platform tokens
+  (`CLOUDFLARE_QUEUES_TOKEN`, `CLOUDFLARE_PROFILE_TOKEN`) ride the SAME scrub
+  table — they are read from the probe's own environment (the same names the
+  Worker carries as secrets), never from a file or a flag, and are absent-
+  gated to `[warn]` skips (never fake-green).
 - After the run the operator DELETEs the per-run PAT (by id/prefix) and re-checks
   the token count with `cleanup-audit` — the default expectation is the
   standing bootstrap SET, one token per standing user (admin + p0probe = 2
@@ -72,7 +76,7 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
 
 ## Batteries and their canonical expectations
 
-The registry at this writing — 19 batteries, **232 probes** (`all
+The registry at this writing — 20 batteries, **238 probes** (`all
 --dry-run`; `registry`'s count scales with `--trials`, here at its
 default 3):
 
@@ -96,8 +100,9 @@ default 3):
 | `packages-minor` | 9 | the SPEC-0016 §7 minor six: chef (cookbook tar.gz → universe + search + cookbook/version metadata with the 1_0_1 knife quirk → download → protocol version delete) + composer (raw zip PUT ?version= → packages.json/list.json/p2 with the %2F dist url + sha1 → download → management delete) + conan (v2 recipe revision → revisions/latest + the pinned revision-files list {"conanfile.py":null} → pinned download → pinned v2 delete) + cran (DESCRIPTION tar.gz → PACKAGES(.gz) block with the EMPTY MD5sum → download → management delete) + pub (request-upload → multipart → finalize → the normalized enumerate → download → management delete) + vagrant (box PUT → HEAD probe → the provider array + sha512 → download → management delete) + the D1 husk sweep + repo delete | HTTP + **wrangler auth** (the husk row sweep rides `--d1-scope`) |
 | `packages-terraform` | 13 | the SPEC-0016 §7 terraform state backend: anonymous write 401s + the anonymous read-through to the EMPTY 404, state upload → GET byte-parity round-trip (serial/lineage re-parsed off the wire, HEAD parity), duplicate-serial 409, latest-serial DELETE 403 + non-latest 204, lock set/locked 423 with the Go field-order JSON (the 423 body IS the lock read — no GET lock route in the pin), the PRE-BODY `?ID=` upload gate (mismatch 423 over a parse-hostile body, match 201, lock survives), whole-DELETE locked 423 plain, unlock mismatch 423 plain / right ID 200 + the freed re-lock proof, the lock's package allocation + protocol-husk cascade, the unknown-name DELETE 404 contrast, whole-state delete t+0 + repo delete | HTTP (no D1 arms — the whole-state DELETE is its own row cascade) |
 | `auth-oauth2` | 20 | the OAuth2 provider W6 battery + the external-auth tail: the scripted third-party client (registration with the exactly-once secret → login session → the consent dance with in-script PKCE S256 → form + Basic exchanges → the dotted dispatch → userinfo (+PAT-401) → the offline JWKS verify (WebCrypto, id_token claims pinned) → refresh → introspect (active/junk/401) → the revoke-kills-token row delete → app delete + the D1 husk sweep) + the realm check + the discovery shape + the builtin seed + the external-auth source family | HTTP (login cookie + Bearer JWTs) + **wrangler auth** (the builtin-seed read, the revoke row delete, the husk sweep, and the source seed/cleanup ride `--d1-scope`; the discovery arm's issuer==origin assert keys off it) |
+| `monitor-platform` | 6 | SPEC-0021 §7's REAL-API closed loops: the `/set` closed loop (GET-save → SAFE modify → GET-verify → finally-RESTORE → re-verify; restore failure a BLOCKING red; serial-locked to ONE `MONITOR_QUEUE_CONSUMERS` entry) + the pprof content probe (cpu ≤ 5 s, 10 MiB cap → gunzip → minimal protobuf walk → sane fields, ONE 429 retry) | HTTP to **api.cloudflare.com** (NOT the deployment — the admin `/set` + `/profile` UI routes are the pending ui/index.ts fold, so the direct-API class stands in, documented admin-manual) + the arm tokens from the probe's OWN env (`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_QUEUES_TOKEN`, `CLOUDFLARE_PROFILE_TOKEN`, `MONITOR_QUEUE_CONSUMERS`, `MONITOR_WORKER_NAME` — the same names the Worker carries as secrets; absent = the arm `[warn]`-skips, never fake-green) |
 | `cleanup-audit` | 10 | post-run D1 count shapes (independent counts) | **D1-only** — wrangler auth, `--d1-scope remote\|local` (default remote); takes NEITHER `--base-url` NOR `--token-file` |
-| **`all`** | **232** | every battery in registry order, audit last | union of the above |
+| **`all`** | **238** | every battery in registry order, audit last | union of the above |
 
 Expectations are ported from `docs/design/p0-evidence.md` — the REDEPLOY13
 block (2026-10-26, ~lines 1507-1697) for the shallow trio, generate, ui-login,
@@ -826,6 +831,66 @@ prints all of them verbatim.
   application, and the realm repo (logged on one
   `[tail] oauth-leftover-sweep` line; failures feed `left_behind`, never
   fatal; a green run no-ops silently).
+- **monitor-platform** — SPEC-0021 §7's REAL-API closed loops (the
+  verification half the 1308 quota death left unwritten; the SPEC's
+  implementation-status flip 集成待验证 → 已实现 rides this battery passing
+  against a live deployment — SPEC-0021 §6). **Direct-API class, documented
+  honestly:** the admin UI's `POST /-/admin/monitor/queue/{qid}/set` and
+  `GET /-/admin/monitor/profile` routes are the PENDING `ui/index.ts` fold
+  (admin-monitor.tsx's "route HANDOFF" block ships them claim-ready), so no
+  admin endpoint exists for either arm yet — the battery drives the OFFICIAL
+  Cloudflare APIs the deployed adapters ride
+  (`apps/worker/src/services/monitor/{platform,queue-concurrency,profile}.ts`'s
+  exact URLs, bodies, envelope shapes, preservation rule, verify posture,
+  and 429 bounds, mirrored as literals) and the admin-side route surface
+  stays **admin-manual** until the fold lands. It is the only battery whose
+  HTTP leaves the deployment entirely (the probe host needs outbound
+  api.cloudflare.com reachability). **Token gating (never fake-green):** each
+  arm reads the SAME env names the Worker carries as secrets, from the
+  probe's OWN environment — `CLOUDFLARE_ACCOUNT_ID`,
+  `CLOUDFLARE_QUEUES_TOKEN`, `MONITOR_QUEUE_CONSUMERS` (the server-side
+  allowlist JSON, same shape), `MONITOR_WORKER_NAME` (default `cf-gitea`),
+  `CLOUDFLARE_PROFILE_TOKEN`; an absent/malformed name degrades that arm's
+  checks to `[warn] "skipped: unconfigured …"` — never a pass, never a
+  network call (proven: a token-absent run makes exactly ONE HTTP request,
+  the PAT preflight). Both platform tokens ride the run's scrub table.
+  **Arm 1 — the `/set` closed loop, serial-locked:** ONE consumer per run
+  (the allowlist's first entry, or `--monitor-consumer <key>`; the battery
+  never targets two): read (GET the consumer's FULL config — the saved
+  snapshot) → modify (PUT `settings.max_concurrency` to a SAFE value —
+  current−1, or current+1 at the 1-floor; auto (`null`) → the allowlist's
+  declared value, else 1 — preserving `batch_size` / `max_retries` /
+  `max_wait_time_ms` / `retry_delay` / `dead_letter_queue` / `script_name` /
+  `type` VERBATIM: PUT replaces the consumer wholesale, dropping a field
+  DROPS the setting) → verify (GET-verify the effective value, 3 reads
+  500 ms apart — the PUT's own echo is NOT trusted) → finally-RESTORE (the
+  saved config verbatim — RUNS EVEN WHEN the modify/verify steps red: a
+  failed PUT may still have landed, so the restore + its re-verify are
+  unconditional once the loop opened; the /set steps gate on the loop's own
+  state instead of `chain()` so a red modify/verify can NEVER chain-skip the
+  restore) → re-verify. **RESTORE FAILURE IS A BLOCKING RED** (never
+  `[warn]`). **Arm 2 — the pprof content probe:** POST the profile
+  (`profile_type: "cpu"`, `--profile-duration-ms` default 1000, capped 5000
+  — the platform answers synchronously, so this is the arm's wall time) and
+  validate CONTENT: non-empty → the 10 MiB cap (content-length gated; the
+  streamed read aborts past it) → gunzip (64 MiB decompression-bomb guard) →
+  a minimal protobuf walk (field tags only, NO parser linked: wire types
+  {0,1,2,5}, ≤ 1M fields; `string_table` present with the empty entry 0 —
+  the pprof convention; the `sample_type` ValueType resolves non-empty
+  in-bounds strings; `time_nanos` + `duration_nanos` present and positive;
+  `period` positive when present) → sane. ONE 429 retry with backoff
+  (Retry-After honored, capped 5 s), then the report. NO secrets and NO
+  binary bytes in the logs — byte counts + parse verdicts only. **The frozen
+  taxonomy (SPEC-0021 §5), ONE classifier for every arm:** 401/403 → FAIL
+  with the explicit "token mis-scoped" message (never "platform
+  unsupported"); 400 → FAIL (the ONE documented exception: a
+  no-live-instance message on the profile POST is the environment-condition
+  `[warn]` — never claimed green, the platform's message rides the detail
+  verbatim); read-back mismatch → FAIL; unconfigured → `[warn]` skipped;
+  429 → bounded retries then report. INDEPENDENT (the arms report their own
+  verdicts). **No failureTail:** the battery creates no deployment state —
+  the loop's finally-restore IS the cleanup and its failure is the blocking
+  red; profiling is side-effect-free.
 - **cleanup-audit** — one wrangler d1 execute (`--d1-scope remote|local`,
   default remote) runs the whole count shape; **D1-only, so it runs without
   `--base-url`/`--token-file`**; the checks are INDEPENDENT (one red count
