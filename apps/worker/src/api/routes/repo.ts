@@ -12,6 +12,7 @@ import {
   RepoNameCollisionError,
   RepoNameInvalidError,
   RepoService,
+  TransferInProgressError,
 } from "../../repos/service";
 import { tombstoneRepoDO } from "../../repos/purge";
 import { carryRepoCell } from "../../repos/carry";
@@ -38,8 +39,7 @@ import {
   type RepoSettingsPatch,
 } from "../services/repo-settings";
 import { deleteRepoTopics } from "../services/repo-topics";
-import { clearRepoWatches, deleteRepoWatchers } from "../services/repo-watchers";
-import { clearRepoStars } from "../services/stars";
+import { deleteRepoWatchers } from "../services/repo-watchers";
 import { emitRepoEvent, repositoryEventIdentity, repositoryEventPayload } from "../../services/repo-events";
 import { syncRepoLicensesForDefaultBranch } from "../../services/repo-licenses";
 import { engineCell, engineReads } from "../services/engine";
@@ -72,9 +72,11 @@ import {
  *
  * repoEdit applies the meaningful EditRepoOption subset (the model file
  * documents the accepted-and-ignored remainder): rename via the landed
- * repos service, visibility flip (with upstream's private-flip star/watch
- * zeroing — services/stars.ts clearRepoStars + services/repo-watchers.ts
- * clearRepoWatches), default branch (D1 + best-effort engine
+ * repos service, visibility flip (the fork↔base coupling — a fork's
+ * `private` is forced to its base's value, repo.go:673-679 — with the full
+ * setRepoVisibility port in the service: the private-flip star/watch
+ * zeroing, repository.go:172-181, and the fork-tree cascade,
+ * repository.go:184-200), default branch (D1 + best-effort engine
  * setHead), archived flip (with the mirror refusal — updateRepoArchivedState
  * repo.go:985-992), the template flag (D1-only — upstream
  * updateBasicProperties repo.go:699-701), and the stored settings subset;
@@ -93,14 +95,19 @@ import {
  * (transfer.go:132-133) only on its DIRECT-transfer arms — doer-is-admin /
  * self-transfer / org-can-create-repo (services/repository/transfer.go:458-477,
  * `transferOwnership` runs inline) — which this instance never exercises: it
- * always files pending, so the pending 201 is the only success code emitted.
+ * always files pending, so the pending 201 is the only success code emitted;
+ * a re-request while a transfer is pending 409s (transfer.go:113-115 —
+ * IsErrRepoTransferInProgress → StatusConflict, repos/service.ts
+ * TransferInProgressError).
  */
 
 /**
  * `ClearRepoStars` (models/repo/star.go:94-104) and `ClearRepoWatches`
  * (models/repo/watch.go:327-333) — the private-flip zeroing — live beside
  * their edge writers as services/stars.ts clearRepoStars and services/
- * repo-watchers.ts clearRepoWatches; the `if private` arm below calls them.
+ * repo-watchers.ts clearRepoWatches; the visibility service's
+ * applyVisibility calls them per flipped repo (the route's PATCH arm above
+ * delegates the whole setRepoVisibility flow, fork cascade included).
  */
 
 const notFoundResponse = {
@@ -357,6 +364,14 @@ const transferRepoRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
         content: { "application/json": { schema: apiErrorSchema } },
       },
       404: notFoundResponse,
+      // The duplicate-request 409 (transfer.go:113-115): a re-request while
+      // a transfer is pending maps IsErrRepoTransferInProgress to
+      // StatusConflict. Runtime-only against the vendored contract (the
+      // RUNTIME_ONLY_RESPONSES entry carries the cite).
+      409: {
+        description: "conflict",
+        content: { "application/json": { schema: apiErrorSchema } },
+      },
       422: {
         description: "validationError",
         content: { "application/json": { schema: apiErrorSchema } },
@@ -478,6 +493,18 @@ export function registerRepoRoutes(
       await requireRepoAdmin(c, found);
       // Upstream registers NO mustNotBeArchived on this PATCH (api.go:1245).
       const form = c.req.valid("json");
+      // Bind-time MaxSize validation (modules/structs/repo.go:177-181 —
+      // Description MaxSize(2048), Website MaxSize(1024)); upstream renders
+      // the first binding error as `[Field]: MaxSize` through
+      // fmt.Sprintf("%s: %s", errs[0].FieldNames, errs[0].Error())
+      // (routers/api/v1/api.go:842 over modules/web/binding/binding.go
+      // :39/:156-159), so the Go struct field name is the message key.
+      if (form.description !== undefined && form.description.length > 2048) {
+        throw new ApiError(422, "[Description]: MaxSize");
+      }
+      if (form.website !== undefined && form.website.length > 1024) {
+        throw new ApiError(422, "[Website]: MaxSize");
+      }
       // The engine deps ride the PATCH (REDEPLOY8's flagged tail — the delete
       // arm below threads the same registry): bare construction silently skips
       // rename's cell carry + syncRegistryMove, setVisibility's
@@ -525,18 +552,35 @@ export function registerRepoRoutes(
         }
       }
 
-      // Private flip (forks cannot exist yet — no base-repo sync needed).
-      // The →private arm also runs upstream's zeroing (setRepoVisibility,
-      // services/repository/repository.go:172-181): stars/watchers of a
-      // private repo are not public facts, so the counters zero and the
-      // edges delete. The flip guard keeps an already-private PATCH (or a
-      // →public flip) from clearing anything.
-      if (form.private !== undefined && form.private !== (found.repo.visibility === "private")) {
-        await service.setVisibility(found.repo.id, form.private);
-        if (form.private) {
-          await clearRepoStars(c.env.DB, found.repo.id);
-          await clearRepoWatches(c.env.DB, found.repo.id);
+      // Private flip — the fork↔base coupling first (updateBasicProperties,
+      // repo.go:673-679): a fork's visibility is FORCED to its base's — a
+      // requested `private` on a fork is replaced by the base's value before
+      // the change detection, so an out-of-step request is a silent no-op
+      // re-rendering the base's posture (a fork may neither out-privacy nor
+      // under-privacy its base). The flip itself (the guard skips an
+      // already-at-value PATCH, upstream's visibilityChanged) runs the full
+      // setRepoVisibility port (repos/service.ts): the →private zeroing
+      // (stars/watches, services/repository/repository.go:172-181) and the
+      // fork-tree cascade (repository.go:184-200: →private always; →public
+      // only when the owner is not a private org) now live there, per
+      // flipped repo.
+      let requestedPrivate = form.private;
+      if (requestedPrivate !== undefined && found.repo.forkParent !== null) {
+        const base = await drizzle(c.env.DB)
+          .select({ visibility: repositories.visibility })
+          .from(repositories)
+          .where(eq(repositories.id, found.repo.forkParent))
+          .get();
+        // A dangling fork_parent is unreachable (the delete cascade resets
+        // the children — repos/service.ts deleteRepository); upstream would
+        // 500 on the GetBaseRepo error arm (repo.go:675-678), we degrade to
+        // the repo's own value.
+        if (base !== undefined) {
+          requestedPrivate = base.visibility === "private";
         }
+      }
+      if (requestedPrivate !== undefined && requestedPrivate !== (found.repo.visibility === "private")) {
+        await service.setVisibility(found.repo.id, requestedPrivate);
       }
 
       // Default branch: D1 value + the engine setHead best-effort (the
@@ -830,6 +874,11 @@ export function registerRepoRoutes(
         if (error instanceof OwnerNotAssignableError) {
           // Self-transfer and inactive targets: the declared 422 family.
           throw new ApiError(422, error.message);
+        }
+        if (error instanceof TransferInProgressError) {
+          // The pending-duplicate 409 (transfer.go:113-115, upstream's
+          // err.Error() verbatim — the pending row is left untouched).
+          throw new ApiError(409, error.message);
         }
         throw error;
       }

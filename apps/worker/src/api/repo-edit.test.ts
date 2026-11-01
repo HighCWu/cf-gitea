@@ -175,6 +175,44 @@ describe("PATCH /repos/{owner}/{repo} (repoEdit) — stored settings subset", ()
     expect(await get.json<Record<string, unknown>>()).toMatchObject({ description: "hello", website: "https://example.io" });
   });
 
+  it("422s an over-length description and website with the upstream binding message (MaxSize, structs/repo.go:177-181)", async () => {
+    // The bind renders the first binding error as `[Field]: MaxSize`
+    // (api.go:842 over modules/web/binding/binding.go:39/:156-159 — the Go
+    // struct field name, the validation classification as the message).
+    const longDescription = await makeApp()(repoPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ description: "x".repeat(2049) }),
+    });
+    expect(longDescription.status).toBe(422);
+    expect(await longDescription.json()).toEqual({ message: "[Description]: MaxSize", url: ERROR_URL });
+
+    const longWebsite = await makeApp()(repoPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ website: "https://example.io/" + "y".repeat(1024) }),
+    });
+    expect(longWebsite.status).toBe(422);
+    expect(await longWebsite.json()).toEqual({ message: "[Website]: MaxSize", url: ERROR_URL });
+
+    // Nothing persisted by the refused PATCHes.
+    const after = await makeApp()(repoPath);
+    expect(await after.json<Record<string, unknown>>()).toMatchObject({ description: "", website: "" });
+  });
+
+  it("accepts the MaxSize boundary lengths (2048/1024)", async () => {
+    const res = await makeApp()(repoPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ description: "x".repeat(2048), website: "y".repeat(1024) }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json<Record<string, unknown>>()).toMatchObject({
+      description: "x".repeat(2048),
+      website: "y".repeat(1024),
+    });
+  });
+
   it("upsert-merges: a second PATCH touching only description keeps the stored flags", async () => {
     await makeApp()(repoPath, {
       method: "PATCH",
@@ -674,6 +712,132 @@ describe("PATCH /repos/{owner}/{repo} — the private-flip zeroing (ClearRepoSta
   });
 });
 
+describe("PATCH /repos/{owner}/{repo} — the fork↔base visibility coupling (repo.go:673-679 + repository.go:184-200)", () => {
+  /** A fork row hanging off an existing repo id (the single nullable
+   *  fork_parent column; the delete cascade keeps it loop-free). */
+  const seedFork = async (
+    id: string,
+    slug: string,
+    owner: { namespace: string; id: number },
+    forkParent: string,
+    visibility: "public" | "private" = "public",
+  ) => {
+    await drizzle(env.DB).insert(repositories).values({
+      id,
+      storageKey: `r_${id}`,
+      ownerNamespace: owner.namespace,
+      ownerId: owner.id,
+      slug,
+      visibility,
+      forkParent,
+      refsVersion: 0,
+      backend: "self-hosted",
+      createdAt: new Date("2026-02-03T04:05:06Z"),
+    });
+  };
+
+  /** An org-shaped users row with a settable visibility ceiling. */
+  const seedOrg = async (name: string, visibility: "public" | "limited" | "private") => {
+    const rows = await drizzle(env.DB)
+      .insert(users)
+      .values({ username: name, usernameLower: name, type: "org", visibility, status: "active", createdAt: new Date() })
+      .returning({ id: users.id })
+      .all();
+    return rows[0]!.id;
+  };
+
+  const patch = (path: string, token: string, body: Record<string, unknown>) =>
+    makeApp()(path, { method: "PATCH", headers: { Authorization: `token ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+  const visibilityOf = async (id: string) =>
+    (await drizzle(env.DB).select({ v: repositories.visibility }).from(repositories).where(eq(repositories.id, id)).get())?.v;
+
+  it("a fork's private request is FORCED to the base's value — an out-of-step request is a silent no-op (repo.go:673-679)", async () => {
+    // Base public + fork public; the fork asks to go private.
+    await seedFork("8401", "edit-me", { namespace: "other", id: otherUserId }, "7401");
+    const res = await patch("/repos/other/edit-me", TOKEN_OTHER, { private: true });
+    expect(res.status).toBe(200);
+    // The response renders the FORCED value (upstream mutates opts.Private
+    // before the flip), and neither row moved.
+    expect(await res.json<Record<string, unknown>>()).toMatchObject({ private: false });
+    expect(await visibilityOf("7401")).toBe("public");
+    expect(await visibilityOf("8401")).toBe("public");
+  });
+
+  it("a fork of a PRIVATE base cannot under-privacy itself either (the forced value is the base's)", async () => {
+    await drizzle(env.DB).update(repositories).set({ visibility: "private" }).where(eq(repositories.id, "7401"));
+    await seedFork("8401", "edit-me", { namespace: "other", id: otherUserId }, "7401", "private");
+    const res = await patch("/repos/other/edit-me", TOKEN_OTHER, { private: false });
+    expect(res.status).toBe(200);
+    expect(await res.json<Record<string, unknown>>()).toMatchObject({ private: true });
+    expect(await visibilityOf("8401")).toBe("private");
+  });
+
+  it("a BASE flip cascades the whole fork tree (repository.go:184-200 — GetRepositoriesByForkID recursion)", async () => {
+    await seedFork("8401", "edit-me", { namespace: "other", id: otherUserId }, "7401");
+    await seedFork("8402", "edit-me", { namespace: "collab-admin", id: collabAdminUserId }, "8401");
+    const res = await patch(repoPath, TOKEN, { private: true });
+    expect(res.status).toBe(200);
+    expect(await visibilityOf("7401")).toBe("private");
+    expect(await visibilityOf("8401")).toBe("private");
+    expect(await visibilityOf("8402")).toBe("private");
+  });
+
+  it("a base →public cascades too when no private org sits in the owner chain (the !private arm)", async () => {
+    // Seed the tree already private (a prior →private cascade).
+    await drizzle(env.DB).update(repositories).set({ visibility: "private" }).where(eq(repositories.id, "7401"));
+    await seedFork("8401", "edit-me", { namespace: "other", id: otherUserId }, "7401", "private");
+    await seedFork("8402", "edit-me", { namespace: "collab-admin", id: collabAdminUserId }, "8401", "private");
+    const res = await patch(repoPath, TOKEN, { private: false });
+    expect(res.status).toBe(200);
+    expect(await visibilityOf("7401")).toBe("public");
+    expect(await visibilityOf("8401")).toBe("public");
+    expect(await visibilityOf("8402")).toBe("public");
+  });
+
+  it("a base owned by a PRIVATE org does NOT →public-cascade: the fork stays private (repository.go:185-186)", async () => {
+    const orgId = await seedOrg("sec-org", "private");
+    await drizzle(env.DB).insert(repositories).values({
+      id: "7500",
+      storageKey: "r_7500",
+      ownerNamespace: "sec-org",
+      ownerId: orgId,
+      slug: "vault",
+      visibility: "private",
+      refsVersion: 0,
+      backend: "self-hosted",
+      createdAt: new Date("2026-02-03T04:05:06Z"),
+    });
+    await seedFork("8401", "vault", { namespace: "other", id: otherUserId }, "7500", "private");
+    // The org's own gate (visibility private) stops the →public walk one
+    // level up: the base flips, the fork does not follow.
+    const res = await patch("/repos/sec-org/vault", TOKEN_ADMIN, { private: false });
+    expect(res.status).toBe(200);
+    expect(await visibilityOf("7500")).toBe("public");
+    expect(await visibilityOf("8401")).toBe("private");
+  });
+
+  it("a LIMITED owner does not stop the →public walk (upstream checks != VisibleTypePrivate)", async () => {
+    const orgId = await seedOrg("open-org", "limited");
+    await drizzle(env.DB).insert(repositories).values({
+      id: "7501",
+      storageKey: "r_7501",
+      ownerNamespace: "open-org",
+      ownerId: orgId,
+      slug: "shared",
+      visibility: "private",
+      refsVersion: 0,
+      backend: "self-hosted",
+      createdAt: new Date("2026-02-03T04:05:06Z"),
+    });
+    await seedFork("8401", "shared", { namespace: "other", id: otherUserId }, "7501", "private");
+    const res = await patch("/repos/open-org/shared", TOKEN_ADMIN, { private: false });
+    expect(res.status).toBe(200);
+    expect(await visibilityOf("7501")).toBe("public");
+    expect(await visibilityOf("8401")).toBe("public");
+  });
+});
+
 describe("DELETE /repos/{owner}/{repo} (repoDelete)", () => {
   it("runs the lifecycle pipeline and clears this batch's raw stores", async () => {
     // Seed every raw store + a settings row, then delete.
@@ -779,10 +943,22 @@ describe("POST /repos/{owner}/{repo}/transfer (repoTransfer)", () => {
     expect(await deliveries()).toEqual([]);
   });
 
-  it("re-files (upsert) a repeat request", async () => {
-    await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "other" }) });
-    expect((await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "other" }) })).status).toBe(201);
-    expect(await drizzle(env.DB).select().from(repoTransfer).all()).toHaveLength(1);
+  it("409s a re-request while a transfer is pending, leaving the ORIGINAL row (transfer.go:113-115 — IsErrRepoTransferInProgress → StatusConflict; no upsert)", async () => {
+    const first = await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "other" }) });
+    expect(first.status).toBe(201);
+    // A DIFFERENT target on the re-request proves the refused write does not
+    // replace the pending row (the old upsert would have re-pointed it).
+    const second = await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "collab-admin" }) });
+    expect(second.status).toBe(409);
+    // Upstream ErrRepoTransferInProgress.Error() verbatim
+    // (models/repo/transfer.go:55-57).
+    expect(await second.json()).toEqual({
+      message: "repository is already being transferred [uname: cf-gitea-stub, name: edit-me]",
+      url: ERROR_URL,
+    });
+    const pending = await drizzle(env.DB).select().from(repoTransfer).all();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.newOwnerId).toBe(otherUserId);
   });
 
   it("answers 201 for a SITE-ADMIN doer too (upstream's direct arm would run transferOwnership inline and answer 202 — transfer.go:132-133; the direct machinery is unlanded here, every accepted request files pending)", async () => {

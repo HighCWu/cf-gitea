@@ -119,6 +119,14 @@ const RUNTIME_ONLY_RESPONSES = {
       // pending, so 201 is the success code we ship; the frozen contract
       // carries only the never-emitted-here 202.
       201: "upstream repoTransfer answers StatusCreated on the pending arm (transfer.go:126-130); its swagger documents only the direct-transfer 202 (transfer.go:48-58 vs :132-133)",
+      // The duplicate-request conflict: upstream maps
+      // IsErrRepoTransferInProgress to StatusConflict when a transfer is
+      // re-requested while one is pending (transfer.go:113-115, raised by
+      // TestRepositoryReadyForTransfer for a RepositoryPendingTransfer
+      // status, models/repo/transfer.go:213-222 via
+      // services/repository/transfer.go:445-446); its swagger documents only
+      // {202,403,404,422}.
+      409: "upstream repoTransfer maps IsErrRepoTransferInProgress to StatusConflict on a pending-duplicate re-request (transfer.go:113-115); its swagger documents only {202,403,404,422}",
     },
   },
   "/user/followers": {

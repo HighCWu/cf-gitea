@@ -83,15 +83,20 @@ import {
   repoTransfer,
   repoUnits,
   repoWatchers,
+  orgMembers,
   pullRequests,
   protectedBranches,
   repositories,
   stars,
   teamRepoAccess,
+  teams,
   users,
   webhookDeliveries,
   webhooks,
 } from "../db/schema";
+import { CommentType } from "../issues/comment-types";
+import { clearRepoStars } from "../api/services/stars";
+import { clearRepoWatches, unwatchRepo, watchRepo } from "../api/services/repo-watchers";
 import type { RepoPurgeMessage } from "./purge";
 
 /** Statement type accepted by drizzle's D1 `batch` (one SQLite transaction). */
@@ -182,6 +187,25 @@ export class TransferNotExistError extends Error {
   constructor(public readonly repoId: string) {
     super(`no pending transfer for repository: ${repoId}`);
     this.name = "TransferNotExistError";
+  }
+}
+
+/**
+ * A transfer is re-requested while one is already pending (upstream
+ * `ErrRepoTransferInProgress`, models/repo/transfer.go:42-57 —
+ * TestRepositoryReadyForTransfer raises it for a RepositoryPendingTransfer
+ * status, models/repo/transfer.go:213-222, via StartRepositoryTransfer's
+ * readiness gate, services/repository/transfer.go:445-446; the API maps it
+ * to 409 Conflict, routers/api/v1/repo/transfer.go:113-115). Message is the
+ * upstream Error() text verbatim.
+ */
+export class TransferInProgressError extends Error {
+  constructor(
+    public readonly ownerNamespace: string,
+    public readonly repoName: string,
+  ) {
+    super(`repository is already being transferred [uname: ${ownerNamespace}, name: ${repoName}]`);
+    this.name = "TransferInProgressError";
   }
 }
 
@@ -517,8 +541,16 @@ export class RepoService {
     return row;
   }
 
-  /** §2.5.4: file a pending transfer. One live row per repo (UNIQUE repo_id);
-   *  a re-request replaces the pending one. The repo stays usable (§2.5.4). */
+  /**
+   * §2.5.4: file a pending transfer. One live row per repo (UNIQUE repo_id);
+   * a re-request while one is pending REFUSES — upstream 409s the duplicate
+   * (TestRepositoryReadyForTransfer raises ErrRepoTransferInProgress for a
+   * RepositoryPendingTransfer status, models/repo/transfer.go:213-222, via
+   * StartRepositoryTransfer's readiness gate,
+   * services/repository/transfer.go:445-446). The unique-violation arm is
+   * the concurrent duplicate (upstream serializes on the repo working lock,
+   * transfer.go:438-448; ours arbitrates on the constraint) — same 409. The
+   * repo stays usable (§2.5.4). */
   async requestTransfer(repoId: string, doerId: number, newOwnerId: number): Promise<void> {
     const repo = await this.get(repoId);
     if (repo === null) throw new RepoNotExistError(repoId);
@@ -528,13 +560,20 @@ export class RepoService {
     const target = await this.db.select().from(users).where(eq(users.id, newOwnerId)).get();
     if (target === undefined) throw new OwnerNotAssignableError("target owner does not exist");
     if (target.status !== "active") throw new OwnerNotAssignableError("target owner is not active");
-    await this.db
-      .insert(repoTransfer)
-      .values({ repoId, doerId, newOwnerId, createdAt: new Date() })
-      .onConflictDoUpdate({
-        target: repoTransfer.repoId,
-        set: { doerId, newOwnerId, createdAt: new Date() },
-      });
+    const pending = await this.db
+      .select({ id: repoTransfer.id })
+      .from(repoTransfer)
+      .where(eq(repoTransfer.repoId, repoId))
+      .get();
+    if (pending !== undefined) throw new TransferInProgressError(repo.ownerNamespace, repo.slug);
+    try {
+      await this.db.insert(repoTransfer).values({ repoId, doerId, newOwnerId, createdAt: new Date() });
+    } catch (error) {
+      // The §4.1-adjacent race: two requests for the same repo decided by
+      // UNIQUE(repo_id) where upstream's lock serializes — the loser 409s.
+      if (isUniqueViolation(error)) throw new TransferInProgressError(repo.ownerNamespace, repo.slug);
+      throw error;
+    }
   }
 
   /** §2.5.4 reject/cancel: delete the pending row (no-op when absent). */
@@ -547,10 +586,40 @@ export class RepoService {
    * owner_namespace), delete the redirect shadowing the new location, insert
    * the redirect UNDER THE OLD OWNER (`NewRedirect(oldOwner.ID, repo.ID,
    * repo.Name, repo.Name)`, services/repository/transfer.go:320-354), drop
-   * the pending row. Storage untouched (`storage_key` immutable); the
-   * visibility re-check is implicit — every request re-reads the owner from
-   * D1 (§2.5.4), so a transfer to a private owner hides the repo from
-   * anonymous readers immediately.
+   * the pending row — plus the transferOwnership cascade arms that have a
+   * landed seam here (upstream services/repository/transfer.go:110-355):
+   *
+   *   - redundant-collaborator cleanup (:183-210): the drop set is the NEW
+   *     owner's own row plus every collaborator who is a member of the new
+   *     owner's org (they hold the same access through the org); everyone
+   *     else survives. Upstream's ghost arm has no counterpart here (our
+   *     collaborators are never ghost rows).
+   *   - the old-org arms (oldOwner.IsOrganization, :226-233 + :280-306): the
+   *     old org's team↔repo grants die with the move (RemoveOrgRepo,
+   *     models/organization/org.go:559-583) and each affected team's
+   *     num_repos drops with them (org.go:586-588); the old org's watch
+   *     drops; the org-label EDGES detach from this repo's issues (the
+   *     `DELETE FROM issue_label` + label-comment sweep, transfer.go:267-306
+   *     — the label definitions stay with the old org, so the edges are
+   *     recoverable if the repo ever transfers back; their counters and the
+   *     issues' num_comments are left to drift exactly like upstream's raw
+   *     deletes).
+   *
+   *   - documented equivalents (no seam): upstream's `user.num_repos ± 1`
+   *     owner counters (:246-250) have no column here — our users table
+   *     carries no repo tally and every owner count derives from the rows;
+   *     the new-org includes-all team materialization (:261-269) is subsumed
+   *     by the dynamic coverage union (schema.ts teamRepoAccess note); the
+   *     access-table recalculation (:271-275) needs no access table (the ACL
+   *     matrix re-reads D1 per request).
+   *
+   * Storage untouched (`storage_key` immutable); the visibility re-check is
+   * implicit — every request re-reads the owner from D1 (§2.5.4), so a
+   * transfer to a private owner hides the repo from anonymous readers
+   * immediately. The watch-transfer arms (transfer.go:277-286 — the filing
+   * doer auto-watches, the old org unwatched) run as the guarded
+   * watchRepo/unwatchRepo batches right after the main batch, upstream's
+   * in-tx order preserved (doer watch first).
    */
   async acceptTransfer(repoId: string, doer: { id: number; isAdmin: boolean }): Promise<RepoRow> {
     const repo = await this.get(repoId);
@@ -569,6 +638,29 @@ export class RepoService {
       throw new OwnerNotAssignableError("target owner does not exist or is not active");
     }
     if (repo.ownerId === null) throw new OwnerNotAssignableError("repository has no recorded owner");
+    const oldOwner = await this.db
+      .select({ id: users.id, type: users.type })
+      .from(users)
+      .where(eq(users.id, repo.ownerId))
+      .get();
+    const oldOwnerIsOrg = oldOwner?.type === "org";
+
+    // Upstream's label sweep narrows to labels that do not belong to the
+    // repo's new home (transfer.go:267-306): a REPO label of another repo
+    // (`label.org_id = 0 AND issue.repo_id != label.repo_id`) or an ORG
+    // label of an org that is not the new owner (`label.repo_id = 0 AND
+    // label.org_id != ?newOwner`). Our column shape: repo labels have
+    // `repo_id` set, org labels `repo_id` NULL (the issues.ts:198 read
+    // convention), so the two arms translate directly; COALESCE mirrors
+    // upstream's `= 0` / `= 0` zero-discriminators over a nullable column.
+    const foreignLabelIds = () =>
+      this.db
+        .select({ id: labels.id })
+        .from(labels)
+        .where(
+          sql`(${labels.repoId} IS NOT NULL AND ${labels.repoId} != ${repoId}) OR (${labels.repoId} IS NULL AND COALESCE(${labels.orgId}, 0) != ${pending.newOwnerId})`,
+        );
+    const repoIssueIds = () => this.db.select({ id: issues.id }).from(issues).where(eq(issues.repoId, repoId));
 
     const oldEngine = engineName(repo.ownerNamespace, repo.slug);
     const newEngine = engineName(target.usernameLower, repo.slug);
@@ -591,34 +683,155 @@ export class RepoService {
         redirectRepoId: repo.id,
         createdAt: new Date(),
       }),
+      // Redundant collaborators (:183-210): the new owner's own row and
+      // every new-org member's row drop (org access subsumes them); the
+      // upstream ghost arm has no seam here (no ghost collaborator rows).
+      this.db
+        .delete(repoCollaborators)
+        .where(
+          and(
+            eq(repoCollaborators.repoId, repoId),
+            sql`(${repoCollaborators.userId} = ${pending.newOwnerId} OR ${repoCollaborators.userId} IN (SELECT ${orgMembers.userId} FROM ${orgMembers} WHERE ${orgMembers.orgId} = ${pending.newOwnerId}))`,
+          ),
+        ),
       this.db.delete(repoTransfer).where(eq(repoTransfer.repoId, repoId)),
+      // The old-org arms (:226-233 + :280-306). First RemoveOrgRepo with its
+      // counter arm (transfer.go:227-229 → org.go:559-583, org.go:586-588):
+      // update-before-delete, so the decrement's subquery sees the rows its
+      // charge is computed from; MAX(…,0) is the landed drift-insurance
+      // floor (same posture as deleteRepository). Then the label-edge sweep
+      // (:267-306): edges detach, the type-Label event comments referencing
+      // them go with — the label definitions stay with the old org (upstream
+      // deletes neither them nor the drifted counters).
+      ...(oldOwnerIsOrg
+        ? [
+            this.db
+              .update(teams)
+              .set({ numRepos: sql`MAX(num_repos - 1, 0)` })
+              .where(
+                inArray(
+                  teams.id,
+                  this.db
+                    .select({ teamId: teamRepoAccess.teamId })
+                    .from(teamRepoAccess)
+                    .where(and(eq(teamRepoAccess.orgId, repo.ownerId), eq(teamRepoAccess.repoId, repoId))),
+                ),
+              ),
+            this.db
+              .delete(teamRepoAccess)
+              .where(and(eq(teamRepoAccess.orgId, repo.ownerId), eq(teamRepoAccess.repoId, repoId))),
+            this.db.delete(issueLabels).where(
+              and(
+                inArray(issueLabels.issueId, repoIssueIds()),
+                inArray(issueLabels.labelId, foreignLabelIds()),
+              ),
+            ),
+            this.db.delete(comments).where(
+              and(
+                eq(comments.type, CommentType.Label),
+                inArray(comments.issueId, repoIssueIds()),
+                inArray(comments.labelId, foreignLabelIds()),
+              ),
+            ),
+          ]
+        : []),
     ]);
+    // Watch transfer (:277-286): the ORIGINAL doer (repoTransfer.Doer, the
+    // user who filed the request) auto-watches; the old org's watch drops.
+    // WatchRepoAuto semantics ride the landed watchRepo/unwatchRepo ports
+    // (watch.go:159-178: a Custom watch is kept, an Auto old-org watch lands
+    // on Dont, everything else on None) — separate guarded batches, upstream
+    // order preserved.
+    await watchRepo(this.d1, repoId, pending.doerId, new Date());
+    if (oldOwnerIsOrg && repo.ownerId !== null) {
+      await unwatchRepo(this.d1, repoId, repo.ownerId, new Date());
+    }
     await this.moveEngineCell(oldEngine, newEngine, repo);
     const row = await this.get(repoId);
     if (row === null) throw new RepoNotExistError(repoId);
     return row;
   }
 
-  /** §2.5.6 visibility flip: D1 update + registry mirror. The ACL matrix
-   *  re-reads both rows per request, so no cache invalidation is required;
-   *  the worst-case stale window is the refs edge-cache TTL (§2.5.6). */
+  /**
+   * §2.5.6 visibility flip — the full setRepoVisibility port
+   * (services/repository/repository.go:145-205), fork coupling included.
+   * Per flipped repo: the row update, the →private zeroing (stars + watches
+   * of a private repo are not public facts, repository.go:172-181 —
+   * ClearRepoStars/ClearRepoWatches), the best-effort registry priv mirror,
+   * then the FORK-TREE cascade (repository.go:184-200):
+   *
+   *   shouldUpdateForks := private
+   *   if !private && repo.Owner.Visibility != VisibleTypePrivate {
+   *     shouldUpdateForks = true
+   *   }
+   *
+   * →private always descends; →public descends only when the flipping
+   * repo's owner is not a private org — evaluated PER LEVEL via the
+   * recursive applyVisibility walk (GetRepositoriesByForkID →
+   * setRepoVisibility per child), so a private-org-owned fork flips itself
+   * while its own subtree stops there. The fork column is the single
+   * nullable fork_parent (migration 0009; no is_fork — the delete cascade
+   * resets orphaned children, so the walk cannot loop).
+   *
+   * The ACL matrix re-reads both rows per request, so no cache invalidation
+   * is required; the worst-case stale window is the refs edge-cache TTL
+   * (§2.5.6). The forced-value arm of the coupling (a fork PATCH cannot
+   * choose its own visibility) is the ROUTE's — repo.go:673-679 forces
+   * `private` to the base's value before the change detection.
+   */
   async setVisibility(repoId: string, isPrivate: boolean): Promise<RepoRow> {
     const repo = await this.get(repoId);
     if (repo === null) throw new RepoNotExistError(repoId);
+    await this.applyVisibility(repo, isPrivate);
+    const row = await this.get(repoId);
+    if (row === null) throw new RepoNotExistError(repoId);
+    return row;
+  }
+
+  /** One setRepoVisibility level (repository.go:145-205): the flip, the
+   *  →private zeroing, the registry mirror, the fork walk. */
+  private async applyVisibility(repo: RepoRow, isPrivate: boolean): Promise<void> {
     await this.db
       .update(repositories)
       .set({ visibility: isPrivate ? "private" : "public", updatedAt: new Date() })
-      .where(eq(repositories.id, repoId));
+      .where(eq(repositories.id, repo.id));
+    if (isPrivate) {
+      // repository.go:172-181 — every flipped repo zeroes its own edges.
+      await clearRepoStars(this.d1, repo.id);
+      await clearRepoWatches(this.d1, repo.id);
+    }
     try {
       if (this.deps.registry) {
         await this.deps.registry.setConfig(engineName(repo.ownerNamespace, repo.slug), { priv: isPrivate });
       }
     } catch (error) {
-      console.error(`[repos] registry sync failed for ${repoId}: ${errorMessage(error)}`);
+      console.error(`[repos] registry sync failed for ${repo.id}: ${errorMessage(error)}`);
     }
-    const row = await this.get(repoId);
-    if (row === null) throw new RepoNotExistError(repoId);
-    return row;
+    // repository.go:184-200 — the cascade gate, then GetRepositoriesByForkID
+    // and a recursive setRepoVisibility per child.
+    if (isPrivate || (await this.ownerVisibility(repo.ownerId)) !== "private") {
+      const forks = await this.db
+        .select()
+        .from(repositories)
+        .where(eq(repositories.forkParent, repo.id))
+        .all();
+      for (const fork of forks) {
+        await this.applyVisibility(fork, isPrivate);
+      }
+    }
+  }
+
+  /** The owner row's visibility for the →public cascade gate (repo.Owner.
+   *  Visibility, repository.go:186) — 'public' for a missing owner row (the
+   *  git gate's orphaned-owner LEFT JOIN convention, redirectOwnerId). */
+  private async ownerVisibility(ownerId: number | null): Promise<"public" | "limited" | "private"> {
+    if (ownerId === null) return "public";
+    const row = await this.db
+      .select({ visibility: users.visibility })
+      .from(users)
+      .where(eq(users.id, ownerId))
+      .get();
+    return row?.visibility ?? "public";
   }
 
   /**

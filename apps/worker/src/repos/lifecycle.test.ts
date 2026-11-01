@@ -29,10 +29,13 @@ import {
 import { carryRepoCell } from "./carry";
 import { purgeRepoMessage, tombstoneRepoDO } from "./purge";
 import { settleCreatingRepo } from "../git-http/gate";
-import { protectedBranches, repoCounters, repoRedirects, repoSettings, repositories, repoTransfer, repoUnits, stars, users } from "../db/schema";
+import { comments, issueLabels, issues, labels, protectedBranches, repoCollaborators, repoCounters, repoRedirects, repoSettings, repoTransfer, repoUnits, repoWatchers, repositories, stars, teamRepoAccess, teams, users } from "../db/schema";
 import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
 import { createWikiPage, readWikiPage } from "../services/wiki";
 import { starRepo } from "../api/services/stars";
+import { watchRepo } from "../api/services/repo-watchers";
+import { addOrUpdateCollaborator } from "../api/services/repo-collaborators";
+import { CommentType } from "../issues/comment-types";
 import { ZERO_OID, buildPack, buildReceivePackBody, pktLine } from "./testing/git-pack";
 
 // wave-129 full-run contention budget: this file's heaviest closure measured
@@ -222,6 +225,26 @@ describe("transfer (SPEC-0003 §2.5.4)", () => {
     await svc.cancelTransfer(repo.id);
     expect(await drizzle(env.DB).select().from(repoTransfer).all()).toHaveLength(0);
   });
+
+  it("refuses a re-request while a transfer is pending and keeps the ORIGINAL row (transfer.go:445-446 — the 409 class)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const carol = await seedVerifiedUser({ username: "Carol" });
+    const svc = service();
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "dup");
+
+    await svc.requestTransfer(repo.id, alice.id, bob.id);
+    // The upstream ErrRepoTransferInProgress message verbatim
+    // (models/repo/transfer.go:55-57); the re-request points at a DIFFERENT
+    // target so a silent upsert would re-point the row (the old behavior).
+    await expect(svc.requestTransfer(repo.id, alice.id, carol.id)).rejects.toThrow(
+      "repository is already being transferred [uname: alice, name: dup]",
+    );
+    const pending = await drizzle(env.DB).select().from(repoTransfer).all();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.newOwnerId).toBe(bob.id);
+    expect(pending[0]?.doerId).toBe(alice.id);
+  });
 });
 
 describe("visibility model (SPEC-0003 §2.5.6) and ACL rows 4/5/10", () => {
@@ -289,6 +312,235 @@ describe("visibility model (SPEC-0003 §2.5.6) and ACL rows 4/5/10", () => {
       "This repo is archived. You can view files and clone it, but cannot push or open issues/pull-requests.",
     );
     expect((await SELF.fetch(refs)).status).toBe(200); // clone still works
+  });
+});
+
+describe("visibility fork cascade (setRepoVisibility, services/repository/repository.go:145-205)", () => {
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM repo_watchers").run();
+  });
+
+  const forkOf = async (childId: string, parentId: string) => {
+    await drizzle(env.DB).update(repositories).set({ forkParent: parentId }).where(eq(repositories.id, childId));
+  };
+  const states = async () =>
+    (await drizzle(env.DB)
+      .select({
+        id: repositories.id,
+        visibility: repositories.visibility,
+        numStars: repositories.numStars,
+        numWatches: repositories.numWatches,
+      })
+      .from(repositories)
+      .all()).sort((a, b) => a.id.localeCompare(b.id));
+
+  it("→private cascades the whole fork tree, zeroing each flipped repo's stars and watches (repository.go:172-200)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const carol = await seedVerifiedUser({ username: "Carol" });
+    const svc = service();
+    const base = await createRepo({ id: alice.id, usernameLower: "alice" }, "trunk");
+    const fork = await createRepo({ id: bob.id, usernameLower: "bob" }, "branch");
+    await forkOf(fork.id, base.id);
+    const grand = await createRepo({ id: carol.id, usernameLower: "carol" }, "twig");
+    await forkOf(grand.id, fork.id);
+
+    // Edges on every level: the walk zeroes each flipped repo's own
+    // (ClearRepoStars/ClearRepoWatches run inside applyVisibility, upstream's
+    // in-function placement, repository.go:172-181 — not a base-only sweep).
+    await starRepo(env.DB, bob.id, base.id, new Date());
+    await starRepo(env.DB, carol.id, fork.id, new Date());
+    await watchRepo(env.DB, grand.id, alice.id, new Date());
+
+    await svc.setVisibility(base.id, true);
+
+    const rows = await states();
+    expect(rows.find((r) => r.id === base.id)).toMatchObject({ visibility: "private", numStars: 0 });
+    expect(rows.find((r) => r.id === fork.id)).toMatchObject({ visibility: "private", numStars: 0 });
+    expect(rows.find((r) => r.id === grand.id)).toMatchObject({ visibility: "private", numWatches: 0 });
+    expect(await drizzle(env.DB).select().from(stars).all()).toEqual([]);
+    expect(await drizzle(env.DB).select().from(repoWatchers).all()).toEqual([]);
+  });
+
+  it("→public cascades per level and STOPS under a private-org owner; LIMITED does not stop it (repository.go:185-186)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const orgs = await env.DB.prepare(
+      "INSERT INTO users (username, username_lower, email, is_admin, status, visibility, type, num_members, created_at) VALUES ('acme', 'acme', NULL, 0, 'active', 'private', 'org', 0, ?) RETURNING id",
+    )
+      .bind(Math.floor(Date.now() / 1000))
+      .first<{ id: number }>();
+    const orgId = orgs!.id;
+    const svc = service();
+
+    // Arm 1 — plain owners: the →public walk descends the tree.
+    const pub = await createRepo({ id: alice.id, usernameLower: "alice" }, "open", true);
+    const pubFork = await createRepo({ id: bob.id, usernameLower: "bob" }, "open-fork", true);
+    await forkOf(pubFork.id, pub.id);
+    await svc.setVisibility(pub.id, false);
+    expect((await states()).find((r) => r.id === pub.id)).toMatchObject({ visibility: "public" });
+    expect((await states()).find((r) => r.id === pubFork.id)).toMatchObject({ visibility: "public" });
+
+    // Arm 2 — a private-org owner: the walk flips the org repo but stops
+    // before its forks (shouldUpdateForks stays false when the owner's
+    // visibility IS private).
+    const vault = await createRepo({ id: orgId, usernameLower: "acme" }, "vault", true);
+    const vaultFork = await createRepo({ id: bob.id, usernameLower: "bob" }, "vault-branch", true);
+    await forkOf(vaultFork.id, vault.id);
+    await svc.setVisibility(vault.id, false);
+    expect((await states()).find((r) => r.id === vault.id)).toMatchObject({ visibility: "public" });
+    expect((await states()).find((r) => r.id === vaultFork.id)).toMatchObject({ visibility: "private" });
+
+    // Arm 3 — LIMITED does not stop the walk (the check is
+    // `!= VisibleTypePrivate`, repository.go:185-186): flip the org's
+    // ceiling, re-privated the pair, and the →public walk now descends.
+    await drizzle(env.DB).update(users).set({ visibility: "limited" }).where(eq(users.id, orgId));
+    await svc.setVisibility(vault.id, true);
+    await svc.setVisibility(vault.id, false);
+    expect((await states()).find((r) => r.id === vault.id)).toMatchObject({ visibility: "public" });
+    expect((await states()).find((r) => r.id === vaultFork.id)).toMatchObject({ visibility: "public" });
+  });
+});
+
+describe("transfer accept cascade (transferOwnership, services/repository/transfer.go:183-306)", () => {
+  beforeEach(async () => {
+    for (const table of [
+      "repo_watchers",
+      "repo_collaborators",
+      "comments",
+      "issue_labels",
+      "labels",
+      "issues",
+      "team_repo_access",
+      "teams",
+      "org_members",
+    ]) {
+      await env.DB.prepare(`DELETE FROM ${table}`).run();
+    }
+  });
+
+  const seedOrgRow = async (name: string) => {
+    const orgs = await env.DB.prepare(
+      "INSERT INTO users (username, username_lower, email, is_admin, status, visibility, type, num_members, created_at) VALUES (?, ?, NULL, 0, 'active', 'public', 'org', 0, ?) RETURNING id",
+    )
+      .bind(name, name.toLowerCase(), Math.floor(Date.now() / 1000))
+      .first<{ id: number }>();
+    return orgs!.id;
+  };
+
+  it("old-org arms: team grants + num_repos die, the org watch drops, the doer auto-watches, and the org-label edges detach (transfer.go:226-306)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" }); // org member, files the transfer
+    const bob = await seedVerifiedUser({ username: "Bob" }); // the target owner
+    const carol = await seedVerifiedUser({ username: "Carol" }); // outside collaborator — kept
+    const orgId = await seedOrgRow("acme");
+    await env.DB.prepare("INSERT INTO org_members (org_id, user_id, is_public, role, created_at) VALUES (?, ?, 0, 'owner', ?)")
+      .bind(orgId, alice.id, Math.floor(Date.now() / 1000))
+      .run();
+
+    const svc = service();
+    const repo = await createRepo({ id: orgId, usernameLower: "acme" }, "donated");
+
+    // (a) the org's team grant + its num_repos tally (RemoveOrgRepo,
+    // org.go:559-583 + the Decr at :586-588; tally seeded at 3).
+    const team = await env.DB.prepare("INSERT INTO teams (org_id, lower_name, name, authorize, num_repos) VALUES (?, 'readers', 'readers', 'read', 3) RETURNING id")
+      .bind(orgId)
+      .first<{ id: number }>();
+    await env.DB.prepare("INSERT INTO team_repo_access (org_id, team_id, repo_id) VALUES (?, ?, ?)")
+      .bind(orgId, team!.id, repo.id)
+      .run();
+
+    // (b) collaborators: bob (the NEW owner — dropped) + carol (a plain
+    // collaborator of neither the new owner nor his org — kept).
+    await addOrUpdateCollaborator(env.DB, repo.id, bob.id, "write", new Date());
+    await addOrUpdateCollaborator(env.DB, repo.id, carol.id, "read", new Date());
+
+    // (c) the old org watches the repo (WatchRepoAuto(oldOwner, false)
+    // drops it); alice — the filing doer — has no row yet.
+    await watchRepo(env.DB, repo.id, orgId, new Date());
+
+    // (d) labels: acme's ORG label and a FOREIGN repo label both detach
+    // (transfer.go:267-283), their type-Label comments with them
+    // (:285-306); the repo's OWN label stays.
+    const issue = await drizzle(env.DB)
+      .insert(issues)
+      .values({ repoId: repo.id, index: 1, title: "one", posterId: alice.id })
+      .returning({ id: issues.id })
+      .all();
+    const issueId = issue[0]!.id;
+    const orgLabel = await drizzle(env.DB)
+      .insert(labels)
+      .values({ repoId: null, orgId, name: "org-label", color: "#00aabb" })
+      .returning({ id: labels.id })
+      .all();
+    const ownLabel = await drizzle(env.DB)
+      .insert(labels)
+      .values({ repoId: repo.id, orgId: 0, name: "repo-label", color: "#00aabb" })
+      .returning({ id: labels.id })
+      .all();
+    const foreignLabel = await drizzle(env.DB)
+      .insert(labels)
+      .values({ repoId: "r-elsewhere", orgId: 0, name: "elsewhere-label", color: "#00aabb" })
+      .returning({ id: labels.id })
+      .all();
+    for (const labelId of [orgLabel[0]!.id, ownLabel[0]!.id, foreignLabel[0]!.id]) {
+      await drizzle(env.DB).insert(issueLabels).values({ issueId, labelId });
+      await drizzle(env.DB).insert(comments).values({
+        type: CommentType.Label,
+        posterId: alice.id,
+        issueId,
+        labelId,
+        content: "",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+    }
+
+    await svc.requestTransfer(repo.id, alice.id, bob.id);
+    await svc.acceptTransfer(repo.id, { id: bob.id, isAdmin: false });
+
+    // (a) the grants died with the move; the affected team's tally dropped.
+    expect(await drizzle(env.DB).select().from(teamRepoAccess).all()).toEqual([]);
+    expect((await drizzle(env.DB).select({ n: teams.numRepos }).from(teams).where(eq(teams.id, team!.id)).get())?.n).toBe(2);
+
+    // (b) the drop set: the new owner's row is gone, the outside
+    // collaborator's row stays.
+    const collabs = await drizzle(env.DB).select({ userId: repoCollaborators.userId }).from(repoCollaborators).all();
+    expect(collabs).toEqual([{ userId: carol.id }]);
+
+    // (c) the watch transfer: the old org's row is gone, the FILING doer's
+    // row landed (WatchRepoAuto(doer, repo, true) → mode Normal).
+    expect(await drizzle(env.DB).select().from(repoWatchers).all()).toEqual([
+      expect.objectContaining({ repoId: repo.id, userId: alice.id, mode: 1 }),
+    ]);
+
+    // (d) only the repo's own label edge + comment survive.
+    expect((await drizzle(env.DB).select().from(issueLabels).all()).map((r) => r.labelId)).toEqual([ownLabel[0]!.id]);
+    const leftComments = await drizzle(env.DB).select({ labelId: comments.labelId }).from(comments).all();
+    expect(leftComments).toEqual([{ labelId: ownLabel[0]!.id }]);
+    // The moved row's ownership + the redirect are the pre-existing arms.
+    expect((await svc.get(repo.id))?.ownerNamespace).toBe("bob");
+  });
+
+  it("accepting INTO an org drops the new-org member collaborators but not outsiders (the IsOrganizationMember arm, transfer.go:196-210)", async () => {
+    const bob = await seedVerifiedUser({ username: "Bob" }); // repo owner → transfers to the org
+    const alice = await seedVerifiedUser({ username: "Alice" }); // org member — dropped
+    const carol = await seedVerifiedUser({ username: "Carol" }); // outsider — kept
+    const orgId = await seedOrgRow("acme");
+    await env.DB.prepare("INSERT INTO org_members (org_id, user_id, is_public, role, created_at) VALUES (?, ?, 0, 'member', ?)")
+      .bind(orgId, alice.id, Math.floor(Date.now() / 1000))
+      .run();
+
+    const svc = service();
+    const repo = await createRepo({ id: bob.id, usernameLower: "bob" }, "ingested");
+    await addOrUpdateCollaborator(env.DB, repo.id, alice.id, "write", new Date());
+    await addOrUpdateCollaborator(env.DB, repo.id, carol.id, "read", new Date());
+
+    await svc.requestTransfer(repo.id, bob.id, orgId);
+    await svc.acceptTransfer(repo.id, { id: bob.id, isAdmin: false });
+
+    const collabs = await drizzle(env.DB).select({ userId: repoCollaborators.userId }).from(repoCollaborators).all();
+    expect(collabs).toEqual([{ userId: carol.id }]);
+    expect((await svc.get(repo.id))?.ownerNamespace).toBe("acme");
   });
 });
 
