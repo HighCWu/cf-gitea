@@ -42,9 +42,12 @@
  * code_view.show_file_tree into FileTreeSidebar here too (the delete/upload
  * tails are repo-editor-tails.tsx's twins; cherrypick/patch run the switch
  * but their templates render no view_file_tree). The route dispatch feeds it
- * through loadFileTreeVisibility like render.tsx's src case; until that arm
- * lands, the prop rides absent and the bytes keep the default-true posture
- * (view_home.go:363-370).
+ * through loadFileTreeVisibility like render.tsx's src case (ui/index.ts:
+ * the GET hoists one compute feeding the plain and fork-overlay renders of
+ * both the edit and delete families, and each POST failure re-render
+ * computes its own — the 303 success stays read-free), so route bytes carry
+ * the stored state; a prop-absent direct render keeps the default-true
+ * posture (view_home.go:363-370).
  *
  * ## Write path (§3.2 — the landed contents write service, never a self-fetch)
  *

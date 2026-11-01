@@ -32,10 +32,10 @@
  * `showFileTree` prop (file-view.tsx's FileTreeSidebar conditional —
  * view_file_tree.tmpl:1, default true, the GetUserSetting default) through
  * renderBlamePage; the route dispatch feeds it through
- * loadFileTreeVisibility exactly like render.tsx's src case (the blame
- * reader-semantics pins ride the shared function). Until the dispatch arm
- * lands, the prop rides absent and the rendered bytes keep the
- * default-true posture (view_home.go:363-370).
+ * loadFileTreeVisibility exactly like render.tsx's src case (ui/index.ts's
+ * blame case; the blame reader-semantics pins ride the shared function), so
+ * the rendered bytes carry the stored state; a prop-absent direct render
+ * keeps the default-true posture (view_home.go:363-370).
  *
  * ## Data (§3.2 — the landed engine reads, never a self-fetch)
  *

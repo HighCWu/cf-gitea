@@ -51,9 +51,12 @@
  * tails; cherrypick/patch run the switch but render no view_file_tree)
  * sidebars ride the same upstream switch — their pages now thread the same
  * optional prop through their own render seams (blame.tsx, file-editor.tsx,
- * repo-editor-tails.tsx, default true); the stored read-back feeds at their
- * dispatch seams, and until that router arm lands those pages keep the
- * default-true bytes.
+ * repo-editor-tails.tsx, default true) and the route dispatch feeds it from
+ * the same read-back at every sidebar render site (ui/index.ts — twelve
+ * sites: the blame case, the editor GET + POST-failure renders, the upload
+ * arms; cherrypick/patch render no view_file_tree and take no field), so
+ * route bytes carry the stored state; a prop-absent direct render keeps the
+ * default-true posture.
  */
 
 import type { CommitJson, TreeEntryJson } from "@cf-gitea/git-engine";
