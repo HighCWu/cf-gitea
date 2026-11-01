@@ -1,15 +1,21 @@
 # cf-gitea v1.5 — Release Notes (the census-and-completion wave)
 
-**Range**: `0d172ac..1268884` — **71** commits, landed 2026-11-01 through
-2026-11-01 — a single-day window. Deployed as **`<DEPLOY ID — FILLED AT
-FREEZE>`**; migrations: **0058 `sessions.impersonator_user_id`** (the
-impersonation chain, `9c929dc`), **0059 — the four completion-substrate
-tables** (deleted_branches, review_state, pull_auto_merges, two_factor — one
-migration by design so the feature units dispatched schema-free in
-parallel), and **0060 `webauthn_credentials`** (the WebAuthn grant,
-`b8ff967`); probe battery **238 probes / 20 batteries** (the
-monitor-platform battery landed in-window; its live closed loop rides the
-deploy probe per SPEC-0021's two-stage rule).
+**Range**: `0d172ac..0219256` — **77 commits**, landed 2026-11-01 — a
+single-day window. Deployed as **`5e47f009`** — FIRST-TRY GREEN (the drizzle
+single-chunk pin carried through the 9.1 MB bundle; all three migrations
+applied remote BEFORE the deploy); migrations: **0058
+`sessions.impersonator_user_id`** (the impersonation chain, `9c929dc`),
+**0059 — the four completion-substrate tables** (deleted_branches,
+review_state, pull_auto_merges, two_factor — one migration by design so the
+feature units dispatched schema-free in parallel), and **0060
+`webauthn_credentials`** (the WebAuthn grant, `b8ff967`); probe battery
+**226/226 green after the audit adjustments at `0219256`** (6 `[warn]`
+skips: the monitor-platform battery's token-unconfigured class + the
+go/cargo toolchain-off class; the three first-run fails were all
+expectation drift, adjudicated — the census-#7 label count, the
+self-seeding fixture's action row, the enumerated standing-token set; the
+monitor-platform live closed loop rides the deploy probe per SPEC-0021's
+two-stage rule).
 
 The wave's shape: **the upstream-parity CENSUS ran and its findings drove the
 work, and the completion directive closed the window whole** — the `/api/v1`
