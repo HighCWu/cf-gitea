@@ -58,12 +58,25 @@
  *   write-arm section below); the ISLAND itself stays unrendered — (a) the
  *   island payload rides upstream's pageData, which our shell emits as null
  *   (the issue-detail reduction's cite, verbatim); (b) the merge-style
- *   allowlist/default (`PullRequestsConfig`) has no D1 home — `repo_units`
- *   carries 'code' only, so the form carries the config DEFAULTS
- *   (repo_unit.go's DefaultPullRequestsConfig: merge/rebase/rebase-merge/
- *   squash/fast-forward-only allowed, manually-merged not, default style
- *   merge) instead of a per-repo allowlist; (c) the style dropdown is the
- *   pull-reviews select reduction (the Vue menu is JS-only).
+ *   allowlist/default rides the PR-unit config's D1 home (the repo_units
+ *   config store — pullRequestsConfigFromJson; the early config-defaults
+ *   reduction predates that home and is retired); (c) the style dropdown is
+ *   the pull-reviews select reduction (the Vue menu is JS-only). The
+ *   message PREFILLS ride the SELECTED style (the no-JS render shows one
+ *   style's fields; the Vue swaps per selection): the title is S2's
+ *   composeMergeMessage re-issue, the BODY (landed with this module's
+ *   squash-prefill arm) is upstream's composition —
+ *   `CommitMessageMerge(GetSquashMergeCommitMessages(pr),
+ *   GetDefaultMergeMessage(squash).body)` for squash (pull_merge_form.go:
+ *   145), the bare Reviewed-on block for merge/rebase-merge (:122/:137).
+ *   Three disclosed degradations ride the body: the commit walk needs the
+ *   optional `reads` seam (absent → the Reviewed-on-only body — upstream's
+ *   own GetDefaultMergeMessage error arm), the >50-commit ranges take the
+ *   engine's oldest-first page where upstream's rev-list keeps the newest
+ *   50 (bullet SET drift only, never order/format), and the
+ *   `.gitea/default_merge_message/*.md` template resolution upstream runs
+ *   first is unmodeled (the SPEC-0005 write-path note — the template-less
+ *   default is the only path).
  * - THE UPDATE-BRANCH ARM (`ShowUpdatePullInfo`, update_branch_by_merge.tmpl)
  *   renders since the write arms landed (below); it stays gated to same-repo
  *   heads (the engine's fork refusal) and the `PullRequestsConfig` style
@@ -213,10 +226,11 @@
 
 import { renderToString } from "hono/jsx/dom/server";
 import { Context } from "hono";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
-import type { RefsResult } from "@cf-gitea/git-engine";
+import type { CommitJson, RefsResult } from "@cf-gitea/git-engine";
 
+import { branchRef, pullHeadRef, type EngineReads } from "../../api/services/engine";
 import { latestCommitStatuses, combinedStateOf } from "../../api/services/commit-status";
 import type { CommitStatusState } from "../../api/models/commit-status";
 import { hasWorkInProgressPrefix, issueNoDependenciesLeft } from "../../api/services/issues";
@@ -264,7 +278,7 @@ import {
   removeScheduledAutoMerge,
   scheduleAutoMergeRow,
 } from "../../services/pull-automerge";
-import { PRFlow, PRStatus, pullRequests, users, type CommitStatusRow } from "../../db/schema";
+import { PRFlow, PRStatus, pullRequests, pullReviews, ReviewType, users, type CommitStatusRow } from "../../db/schema";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { ICON_PATHS } from "../icons";
 import { timeSinceParts } from "../page-data";
@@ -550,8 +564,17 @@ mergeForm: {
   /** The title field's prefill — the SELECTED style's composed default
    *  (GetDefaultMergeMessage's per-style shape, re-issued for the render:
    *  mergeTitleFieldText on the merge/rebase-merge/squash entries,
-   *  pull_merge_form.go:128/146/152). */
+   *  pull_merge_form.go:121/136/144). */
   defaultTitle: string;
+  /** The message field's prefill — the SELECTED style's
+   *  mergeMessageFieldText (pull_merge_form.go:122/137/145): the squash
+   *  entry's `git.CommitMessageMerge(GetSquashMergeCommitMessages(pr),
+   *  defaultSquashMergeBody)` composition (the config-switched commit
+   *  bullet list / PR body / blank, plus the co-author trailers, merged
+   *  with the Reviewed-on block), the bare Reviewed-on block for
+   *  merge/rebase-merge, "" for the hidden-fields styles and the broken
+   *  rows. Swaps with the title on the default-style switch. */
+  defaultBody: string;
   /** The unresolved-dependency readiness gate — the write ladder's
    *  issueNoDependenciesLeft arm (check.go:219-223): true disables the
    *  submit, the pr_close_blocked message riding the box's blocker item. */
@@ -628,7 +651,14 @@ export function shellEscape(toEscape: string): string {
  *  `listTips` is the optional engine ref-read seam the branch-deletable tip
  *  checks ride (issue_view.go:632-648's HeadBranchCommitID/IsBranchExist
  *  reads): absent → the RENDER assumes the checks true (the POST seams
- *  re-check against the engine and refuse — the disclosed degradation). */
+ *  re-check against the engine and refuse — the disclosed degradation).
+ *  `reads` is the optional engine read bundle the squash body prefill's
+ *  commit walk rides (GetSquashMergeCommitMessages' base..head log,
+ *  services/pull/pull.go:723-775 — the same `engineReads(env, pair)`
+ *  composition pull-commits.tsx builds): absent → the commit-list half of
+ *  the squash body degrades to empty and the body carries only the
+ *  Reviewed-on trailers, upstream's own GetDefaultMergeMessage error arm
+ *  (the props stay "" on the err, pull_merge_form.go:71-83). */
 export interface PullMergeBoxInput {
   repo: RepoRow;
   issue: IssueRow;
@@ -636,6 +666,7 @@ export interface PullMergeBoxInput {
   viewer: Viewer;
   origin: string;
   listTips?: (pair: { ownerNamespace: string; slug: string }) => Promise<RefsResult | null>;
+  reads?: EngineReads;
 }
 
 /** Tolerant conflictedFiles decode (the engine check's JSON array). */
@@ -854,6 +885,258 @@ function defaultMergeTitleOf(issue: IssueRow, pr: PullRequestRow, headRepo: { ow
   }
   const from = headRepo === null ? `<deleted>:${pr.headBranch}` : `${headRepo.ownerNamespace}/${headRepo.slug}:${pr.headBranch}`;
   return `Merge pull request '${issue.title}' (#${pr.index}) from ${from} into ${pr.baseBranch}`;
+}
+
+// ---------------------------------------------------------------------------
+// The merge message BODY prefill — the write-side ports the render re-issues
+// (prepareMergeBoxFormProps:67-84 + the GetDefaultMergeMessage /
+// GetSquashMergeCommitMessages / CommitMessageMerge family). Every helper
+// here is a verbatim string-level port; the upstream vector tables
+// (modules/git/commit_message_test.go TestCommitMessageTrailer /
+// TestCommitMessageMerge) pin the two trailer primitives in this module's
+// own suite.
+// ---------------------------------------------------------------------------
+
+/** `git.CommitMessageSplitTrailer` (modules/git/commit_message.go:82-94) —
+ *  the interpret-trailers split (content + separator + trailer block). The
+ *  regexp is upstream's verbatim (the copied-from-legacy shape, its own
+ *  comment disclaims git-exactness); Go RE2's leftmost-lazy semantics agree
+ *  with JS's preference order on this pattern — the vector table pins it.
+ *  NormalizeStringEOL rides first (the Go helper's \r\n / \r fold). */
+const COMMIT_MESSAGE_TRAILER_SPLIT =
+  /^(?<content>.*?)(?<sep>^|^\n|^-{3,}\n+|\n+-{3,}\n+|\n{2,})(?<trailer>(?:[A-Za-z0-9][-\w]*:[^\n]*(\n\s+[^\n]*)*\n?)*\n*)$/s;
+
+/** The triple as `[content, sep, trailer]` — content + sep + trailer
+ *  reconstruct the original message (the Go contract). */
+export function commitMessageSplitTrailer(message: string): [content: string, sep: string, trailer: string] {
+  const s = message.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+  const groups = COMMIT_MESSAGE_TRAILER_SPLIT.exec(s)?.groups;
+  const content = groups?.content;
+  const sep = groups?.sep;
+  const trailer = groups?.trailer;
+  if (content === undefined || sep === undefined || trailer === undefined) return [s, "", ""];
+  return [content, sep, trailer];
+}
+
+/** `git.CommitMessageMerge` (modules/git/commit_message.go:99-127) — the two
+ *  messages joined at their trailers: contents body-joined, then one
+ *  separator and both trailer blocks (the squash prefill composes the
+ *  commit list with the Reviewed-on block through exactly this). */
+export function commitMessageMerge(m1: string, m2: string): string {
+  const [c1Raw, s1, t1Raw] = commitMessageSplitTrailer(m1);
+  const [c2Raw, s2, t2Raw] = commitMessageSplitTrailer(m2);
+  const c1 = c1Raw.trim();
+  const t1 = t1Raw.trim();
+  const c2 = c2Raw.trim();
+  const t2 = t2Raw.trim();
+  let out = "";
+  if (c1 !== "" && c2 !== "") {
+    out = `${c1}\n\n${c2}`;
+  } else if (c1 !== "") {
+    out = c1;
+  } else if (c2 !== "") {
+    out = c2;
+  }
+  if (t1 !== "" || t2 !== "") {
+    let sep = t1 === "" ? s2 : s1;
+    if (sep === "") sep = "\n\n";
+    if (c1 !== "" || c2 !== "") out += sep;
+    if (t1 !== "") out += t1;
+    if (t1 !== "" && t2 !== "") out += "\n";
+    if (t2 !== "") out += t2;
+  }
+  return out;
+}
+
+/** The settings defaults the prefill family reads (no D1 home — the global
+ *  defaults ride, the module's AutodetectManualMerge posture):
+ *  Repository.PullRequest.DefaultMergeMessageCommitsLimit and
+ *  DefaultMergeMessageSize (modules/setting/repository.go:205-206). */
+export const MERGE_MESSAGE_COMMITS_LIMIT = 50;
+export const MERGE_MESSAGE_MAX_SIZE = 5 * 1024;
+/** `DefaultMergeMessageMaxApprovers` (:207) — GetApprovers' reviewer cap. */
+const MERGE_MESSAGE_MAX_APPROVERS = 10;
+
+/** UTF-8 byte length (upstream caps bytes; the TextEncoder is the exact
+ *  counter — workerd Web-standard, no Node Buffer). */
+function utf8ByteLength(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+/** `formatSquashMergeCommitMessages` (services/pull/pull.go:850-880) — the
+ *  GitHub-style `* {message}` bullet list, OLDEST commit first (the engine's
+ *  listCommitsRange order — upstream's rev-list answer is newest-first and
+ *  slices.Backward re-reverses it), blank messages skipped, the byte cap
+ *  breaking the walk and truncating the result at a UTF-8 rune boundary
+ *  with a literal "..." tail, then the trailing "\n\n". */
+function formatSquashMergeCommitMessages(commits: CommitJson[]): string {
+  let sb = "";
+  for (const commit of commits) {
+    const msg = commit.message.trim();
+    if (msg === "") continue;
+    sb += `* ${msg}\n\n`;
+    if (utf8ByteLength(sb) >= MERGE_MESSAGE_MAX_SIZE) break;
+  }
+  let buf = sb.trim();
+  if (utf8ByteLength(buf) > MERGE_MESSAGE_MAX_SIZE) {
+    // the byte-accurate cut: truncate the UTF-8 bytes, then back off any
+    // split multi-byte rune exactly like DecodeLastRune's RuneError arm.
+    const bytes = new TextEncoder().encode(buf).slice(0, MERGE_MESSAGE_MAX_SIZE);
+    let cut = bytes.length;
+    while (cut > 0 && (bytes[cut - 1]! & 0xc0) === 0x80) cut -= 1; // continuation bytes
+    if (cut > 0 && (bytes[cut - 1]! & 0x80) !== 0) cut -= 1; // the leading byte of a split rune
+    buf = new TextDecoder().decode(bytes.slice(0, cut));
+    buf += "...";
+  }
+  return `${buf}\n\n`;
+}
+
+/** `collectSquashMergeCommitCoAuthors` (services/pull/pull.go:790-815) over
+ *  the walked commits — the DefaultMergeMessageAllAuthors=false default
+ *  scans exactly the limited list (no remaining-author batches): unique
+ *  author signature strings, the poster's own signature excluded, and the
+ *  account-email twin excluded (GetUserByEmail — the same account under a
+ *  private/second address must not co-author itself). */
+async function collectSquashMergeCommitCoAuthors(
+  d1: D1Database,
+  commits: CommitJson[],
+  poster: typeof users.$inferSelect | null,
+): Promise<string[]> {
+  const posterSig = poster === null ? null : gitSigString(poster);
+  const uniqueAuthors = new Set<string>();
+  const authors: string[] = [];
+  for (const commit of commits) {
+    const authorString = `${commit.author.name} <${commit.author.email}>`;
+    const first = !uniqueAuthors.has(authorString);
+    uniqueAuthors.add(authorString);
+    if (!first) continue;
+    if (posterSig !== null && authorString === posterSig) continue;
+    if (poster !== null && commit.author.email !== null && commit.author.email !== "") {
+      const row = (await drizzle(d1).select().from(users).where(eq(users.email, commit.author.email)).get()) ?? null;
+      if (row !== null && row.id === poster.id) continue;
+    }
+    authors.push(authorString);
+  }
+  return authors;
+}
+
+/** `buildSquashMergeCommitMessages` (services/pull/pull.go:777-800) — the
+ *  merge message plus the Co-authored-by trailer block, joined through the
+ *  trailer-split seam (`---------` separator rule included). */
+function buildSquashMergeCommitMessages(mergeMessage: string, coAuthors: string[]): string {
+  if (coAuthors.length === 0) return mergeMessage;
+  const [rawContent, rawSep, msgTrailer] = commitMessageSplitTrailer(mergeMessage);
+  let msgContent = rawContent;
+  let msgSep = rawSep;
+  if ((msgSep === "" || msgSep === "\n\n") && msgTrailer === "") {
+    msgContent = msgContent.replace(/\s+$/, ""); // TrimRightFunc(unicode.IsSpace)
+    msgSep = msgContent === "" ? "" : "\n\n---------\n\n";
+  }
+  let out = msgContent + msgSep;
+  const trailer = msgTrailer.trim();
+  if (trailer !== "") out += `${trailer}\n`;
+  for (const author of coAuthors) out += `Co-authored-by: ${author}\n`;
+  return out;
+}
+
+/** `User.NewGitSig().String()` — `{GitName()} <{GetEmail()}>`; GitName is
+ *  the display name with the username fallback (gitSafeName's charset fold
+ *  is a no-op for the landed D1 names) and GetEmail's keep-private
+ *  placeholder arm has no landed reader — the row's email verbatim
+ *  (mergePerson's own posture), "" when null. */
+function gitSigString(user: { displayName: string | null; username: string; email: string | null }): string {
+  const name = user.displayName !== null && user.displayName !== "" ? user.displayName : user.username;
+  return `${name} <${user.email ?? ""}>`;
+}
+
+/** `pr.GetApprovers` (models/issues/pull.go:351-384) — the "Reviewed-by: "
+ *  lines for the PR's official approvers: FindLatestReviews' per-reviewer
+ *  latest APPROVE review (official-only, the DefaultMergeMessageOfficial
+ *  ApproversOnly default; NOT dismissed-filtered — toCond touches dismissed
+ *  only when set), oldest review first, the `reviewersWritten > maxReview
+ *  ers` PRE-write break kept bug-for-bug (10 writes 11 upstream). */
+async function reviewedByLines(d1: D1Database, issueId: number): Promise<string> {
+  const rows = await drizzle(d1)
+    .select({ id: pullReviews.id, reviewerId: pullReviews.reviewerId })
+    .from(pullReviews)
+    .where(and(eq(pullReviews.issueId, issueId), eq(pullReviews.type, ReviewType.Approve), eq(pullReviews.official, true)))
+    .orderBy(pullReviews.id)
+    .all();
+  const latestPerReviewer = new Map<number, number>();
+  for (const row of rows) latestPerReviewer.set(row.reviewerId, row.id); // max id = the latest review
+  const reviewerIds = [...latestPerReviewer.keys()];
+  if (reviewerIds.length === 0) return "";
+  const reviewers = await drizzle(d1)
+    .select({ id: users.id, displayName: users.displayName, username: users.username, email: users.email })
+    .from(users)
+    .all();
+  const byId = new Map(reviewers.map((reviewer) => [reviewer.id, reviewer]));
+  let out = "";
+  let reviewersWritten = 0;
+  for (const reviewerId of reviewerIds) {
+    if (reviewersWritten > MERGE_MESSAGE_MAX_APPROVERS) break; // the pre-write cap quirk
+    const reviewer = byId.get(reviewerId);
+    if (reviewer === undefined) continue; // LoadReviewer's vanished-row arm
+    out += `Reviewed-by: ${gitSigString(reviewer)}\n`;
+    reviewersWritten += 1;
+  }
+  return out;
+}
+
+/** `GetDefaultMergeMessage`'s template-less body (services/pull/merge.go:
+ *  163-165) — `Reviewed-on: {absolute issue link}\n` + the Reviewed-by
+ *  lines. The `.gitea/default_merge_message/*.md` template resolution that
+ *  precedes it upstream stays unmodeled (the SPEC-0005 write-path note —
+ *  the template-less default is the only path). */
+function defaultMergeBodyOf(absoluteIssueLink: string, reviewedBy: string): string {
+  return `Reviewed-on: ${absoluteIssueLink}\n${reviewedBy}`;
+}
+
+/** `GetSquashMergeCommitMessages` (services/pull/pull.go:723-775) over the
+ *  optional `reads` seam — the mergeBase..head walk (the row's cached
+ *  merge base first, the engine RPC the fallback: pullRequestDiff's own
+ *  order, pull-commits.tsx's composition), then the
+ *  DefaultSquashMergeMessage switch (COMMIT_MESSAGES bullet list | PR_BODY
+ *  text | BLANK — models/repo/git.go:46-48) and the co-author trailers.
+ *  Every unresolvable read degrades to "" exactly like upstream's err arm
+ *  (the props stay "", pull_merge_form.go:77-83). THE >50-COMMIT
+ *  DEGRADATION: upstream's rev-list walk keeps the 50 NEWEST commits, the
+ *  engine's paged read answers the range's OLDEST first page — the bullet
+ *  SET differs past 50 commits, the order and format never. */
+async function squashMergeCommitMessages(
+  d1: D1Database,
+  input: PullMergeBoxInput,
+  defaultSquashMergeMessage: string,
+): Promise<string> {
+  const { issue, pr, reads } = input;
+  if (reads === undefined) return "";
+  const baseTip = await reads.readCommit(branchRef(pr.baseBranch));
+  const headCommit = await reads.readCommit(pullHeadRef(pr.index));
+  if (baseTip === null || headCommit === null) return "";
+  const mergeBase =
+    pr.mergeBase ??
+    (await (async () => {
+      const merged = await reads.mergeBase(baseTip.oid, headCommit.oid);
+      return merged !== null && merged.tag === "ok" ? merged.base : null;
+    })());
+  if (mergeBase === null) return ""; // unrelated histories: the empty range rule
+  const range = await reads.listCommitsRange(mergeBase, headCommit.oid, MERGE_MESSAGE_COMMITS_LIMIT, 0);
+  const commits = range?.commits ?? [];
+  let mergeMessage: string;
+  switch (defaultSquashMergeMessage) {
+    case "COMMIT_MESSAGES":
+      mergeMessage = formatSquashMergeCommitMessages(commits);
+      break;
+    case "PR_BODY":
+      mergeMessage = issue.content?.trim() ?? "";
+      break;
+    default:
+      mergeMessage = ""; // "BLANK"
+  }
+  const poster =
+    issue.posterId === null ? null : ((await drizzle(d1).select().from(users).where(eq(users.id, issue.posterId)).get()) ?? null);
+  const coAuthors = await collectSquashMergeCommitCoAuthors(d1, commits, poster);
+  return buildSquashMergeCommitMessages(mergeMessage, coAuthors);
 }
 
 /** The scheduled auto-merge's render shape (GetScheduledMergeByPullID's doer
@@ -1309,6 +1592,27 @@ export async function loadPullMergeBoxData(d1: D1Database, input: PullMergeBoxIn
     }
   }
 
+  // --- the merge message body prefill (prepareMergeBoxFormProps:67-84) ------
+  // Upstream computes the defaults under `!prInfo.IsPullRequestBroken` (the
+  // deleted-fork gate — merge.go's broken rows prefill NOTHING, titles
+  // included); the body half carries that gate (headRepo !== null) while the
+  // landed title keeps its pre-S2 shape (disclosed above the field). The
+  // SELECTED style's GetDefaultMergeMessage body: merge/rebase-merge carry
+  // the bare Reviewed-on trailer block, squash the
+  // CommitMessageMerge(GetSquashMergeCommitMessages, body) composition
+  // (pull_merge_form.go:122/137/145) — exactly the write path's own default
+  // (web pull.go:1126-1129 posts the field back verbatim), so an unedited
+  // no-JS submit stores upstream's message byte-for-byte. The hidden-fields
+  // styles (rebase/fast-forward-only/manually-merged) carry none.
+  let defaultBody = "";
+  if (headRepo !== null && (defaultStyle === "merge" || defaultStyle === "rebase-merge" || defaultStyle === "squash")) {
+    const reviewedBody = defaultMergeBodyOf(`${origin}${issueLink}`, await reviewedByLines(d1, issue.id));
+    defaultBody =
+      defaultStyle === "squash"
+        ? commitMessageMerge(await squashMergeCommitMessages(d1, input, prConfig.DefaultSquashMergeMessage), reviewedBody)
+        : reviewedBody;
+  }
+
   return {
     issueLink,
     reloadingInterval: isChecking ? 5000 : 0,
@@ -1331,6 +1635,13 @@ export async function loadPullMergeBoxData(d1: D1Database, input: PullMergeBoxIn
           // merge sentence, squash the `{title} (#{index})` shape, rebase ""
           // (the hidden-fields styles never show it).
           defaultTitle: defaultMergeTitleOf(issue, pr, headRepo === null ? null : headRepo.repo, defaultStyle),
+          // The SELECTED style's message BODY prefill (the mergeStyle
+          // detail's mergeMessageFieldText, pull_merge_form.go:122/137/145 —
+          // the CommitMessageMerge composition for squash, the bare
+          // Reviewed-on block for merge/rebase-merge, "" for the
+          // hidden-fields styles and the broken rows). The style-switch
+          // swaps it alongside the title (defaultStyle drives both).
+          defaultBody,
           isPullBranchDeletable: openBranchDeletable,
           headTarget,
           mergeWhenChecksSucceed: !canMergeNow, // the Vue autoMergeWhenSucceed reduction
@@ -1561,7 +1872,12 @@ export function PullMergeBoxFragment(props: { data: PullMergeBoxData }) {
                         <input type="text" name="merge_title_field" value={data.mergeForm.defaultTitle} />
                       </div>
                       <div class="field">
-                        <textarea name="merge_message_field" rows={5} placeholder={pullMergeWriteLocale.commit_message_desc} />
+                        {/* The prefill body rides as the textarea's content
+                            (the variables-form precedent) — the SELECTED
+                            style's mergeMessageFieldText. */}
+                        <textarea name="merge_message_field" rows={5} placeholder={pullMergeWriteLocale.commit_message_desc}>
+                          {data.mergeForm.defaultBody}
+                        </textarea>
                       </div>
                     </>
                   )}

@@ -46,6 +46,8 @@ import {
   cancelAutoMergeFromWeb,
   changeTargetBranchFromWeb,
   cleanupPullRequestFromWeb,
+  commitMessageMerge,
+  commitMessageSplitTrailer,
   loadPullMergeBoxData,
   mergePullRequestFromWeb,
   parseMergePullRequestWebForm,
@@ -530,6 +532,10 @@ describe("pullMergeBoxFragmentHtml DOM contract", () => {
       `name="merge_title_field" value="Merge pull request &#39;feat: mergeable&#39; (#${await indexPr("mergeable")}) from feature into main"`,
     );
     expect(html).toContain('<textarea name="merge_message_field" rows="5" placeholder="Add an optional extended description…">');
+    // The SELECTED style's body prefill — the merge entry's bare Reviewed-on
+    // block (no approvals on this fixture; the walk never runs for the merge
+    // style).
+    expect(html).toContain(`>Reviewed-on: ${ORIGIN}/alice/mergetest/pulls/${await indexPr("mergeable")}\n</textarea>`);
     // The style select (the dropdown's no-JS stand-in) + the submit text.
     expect(html).toContain('<select name="do">');
     expect(html).toContain('<option value="merge" selected="">');
@@ -1531,6 +1537,250 @@ describe("the web write arms", () => {
       "This pull request cannot be merged because all repository merge options are disabled.",
       "Enable merge options in the repository settings or merge the pull request manually.",
     ]);
+  });
+});
+
+// --- the squash message-body prefill (the CommitMessageMerge composition) -------
+// Upstream's squash body prefill = git.CommitMessageMerge(GetSquashMerge
+// CommitMessages(pr), GetDefaultMergeMessage(squash).body) (pull_merge_form
+// .go:145), and merge/rebase-merge carry the bare Reviewed-on body (:122/
+// :137). The walk rides the REAL engine cells (the listTips precedent's
+// optional `reads` seam): a dedicated repo carries root R on main and three
+// chained commits on squash-branch (c1 with a body — the bullet format pins
+// the multi-line message), the pull ref at the tip, all authored by "seed"
+// (no D1 user row) so the co-author arm appends it against the bob poster.
+
+describe("the squash message-body prefill (CommitMessageMerge composition)", () => {
+  let sqRepoId = "";
+  let sqIssueId = 0;
+  let sqPrIndex = 0;
+  const sqPair = { ownerNamespace: "alice", slug: "sqrepo" };
+  const reviewedOnLine = (index: number): string => `Reviewed-on: ${ORIGIN}/alice/sqrepo/pulls/${index}`;
+
+  beforeAll(async () => {
+    const repo = await new RepoService(env.DB).create({
+      owner: { id: alice.id, usernameLower: "alice" },
+      name: "sqrepo",
+      isPrivate: false,
+      status: "ready",
+    });
+    sqRepoId = repo.id;
+    // A fourth user WITH an email — the Reviewed-by signature pins read it.
+    await d1().insert(users).values({
+      id: 104,
+      username: "dave",
+      usernameLower: "dave",
+      displayName: "Dave Mail",
+      email: "dave@sqrepo.invalid",
+      createdAt: new Date(T0 * 1000),
+    });
+    const root = await landCommit(sqPair, branchRef("main"), { parents: [], message: "root", fileName: "README.md", content: "# sqrepo\n" });
+    const c1 = await landCommit(sqPair, branchRef("squash-branch"), {
+      parents: [root],
+      message: "c1 subject\n\nand the body",
+      fileName: "one.txt",
+      content: "one\n",
+    });
+    const c2 = await landCommit(sqPair, branchRef("squash-branch"), {
+      parents: [c1],
+      message: "c2 plain",
+      fileName: "two.txt",
+      content: "two\n",
+      replaceOid: c1,
+    });
+    const tip = await landCommit(sqPair, branchRef("squash-branch"), {
+      parents: [c2],
+      message: "c3 tail",
+      fileName: "three.txt",
+      content: "three\n",
+      replaceOid: c2,
+    });
+    await env.REPO.getByName("alice/sqrepo").setHead("main");
+    const { issue, pullRequest } = await new IssuesService(env.DB).createPullRequest({
+      repoId: sqRepoId,
+      title: "feat: squash me",
+      posterId: bob.id,
+      headRepoId: sqRepoId,
+      baseBranch: "main",
+      headBranch: "squash-branch",
+      content: "The PR body text.",
+      now: new Date((T0 + 300) * 1000),
+    });
+    sqIssueId = issue.id;
+    sqPrIndex = pullRequest.index;
+    await d1().update(pullRequests).set({ status: PRStatus.Mergeable, headSha: tip }).where(eq(pullRequests.id, pullRequest.id));
+    const landed = await env.REPO.getByName("alice/sqrepo").commitApiChange({
+      ref: pullHeadRef(pullRequest.index),
+      expectedOldOid: ZERO_OID,
+      newOid: tip,
+    });
+    if (landed.tag !== "committed") throw new Error(`sqrepo pull ref failed: ${landed.tag}`);
+  });
+
+  /** Set the PR-unit config the arm under test needs, then load with the
+   *  reads seam (engineReads' exact caller shape). */
+  async function loadSq(
+    config: Record<string, unknown>,
+    options: { reads?: boolean } = {},
+  ): Promise<PullMergeBoxData | null> {
+    await d1().delete(repoUnits).where(eq(repoUnits.repoId, sqRepoId));
+    await d1().insert(repoUnits).values({ repoId: sqRepoId, type: "pull_requests", config: JSON.stringify(config) });
+    const found = (await findPullRequestByIndex(env.DB, sqRepoId, sqPrIndex))!;
+    return loadPullMergeBoxData(env.DB, {
+      repo: await repoRow(sqRepoId),
+      issue: found.issue,
+      pr: found.pullRequest,
+      viewer: alice,
+      origin: ORIGIN,
+      listTips: (pair) => engineReads(env, pair).listRefs(),
+      ...(options.reads === false ? {} : { reads: engineReads(env, sqPair) }),
+    });
+  }
+
+  it("ports the upstream trailer primitives byte-for-byte (commit_message_test.go)", () => {
+    // TestCommitMessageTrailer's full vector table.
+    const splits: [string, string, string, string][] = [
+      ["", "", "", ""],
+      ["a", "a", "", ""],
+      ["a\n\nk", "a\n\nk", "", ""],
+      ["a\n\nk:v", "a", "\n\n", "k:v"],
+      ["a\n\nk:v\n  next-line", "a", "\n\n", "k:v\n  next-line"],
+      ["a\n\nk:v\n  next-line\nother: v", "a", "\n\n", "k:v\n  next-line\nother: v"],
+      ["a\n\nk:v\n\n", "a", "\n\n", "k:v\n\n"],
+      ["a\n--\nk:v", "a\n--\nk:v", "", ""],
+      ["a\n---\nk:v", "a", "\n---\n", "k:v"],
+      ["a\n\n---\n\nk:v", "a", "\n\n---\n\n", "k:v"],
+      ["k: v", "", "", "k: v"],
+      ["\nk:v", "", "\n", "k:v"],
+      ["\n\nk:v", "", "\n\n", "k:v"],
+      ["---\nk:v", "", "---\n", "k:v"],
+      ["\n---\nk:v", "", "\n---\n", "k:v"],
+      ["a:b\n---\nk:v", "a:b", "\n---\n", "k:v"],
+    ];
+    for (const [msg, body, sep, trailer] of splits) {
+      expect(commitMessageSplitTrailer(msg)).toEqual([body, sep, trailer]);
+    }
+    // TestCommitMessageMerge's full vector table.
+    const merges: [string, string, string][] = [
+      ["", "", ""],
+      ["msg1", "", "msg1"],
+      ["", "msg2", "msg2"],
+      ["msg1", "msg2", "msg1\n\nmsg2"],
+      ["k1: a", "", "k1: a"],
+      ["", "k2: b", "k2: b"],
+      ["k1: a", "k2: b", "k1: a\nk2: b"],
+      ["msg1", "k2: b", "msg1\n\nk2: b"],
+      ["k1: a", "msg2", "msg2\n\nk1: a"],
+      ["msg1\n\nk1: a", "msg2", "msg1\n\nmsg2\n\nk1: a"],
+      ["msg1\n----\nk1: a", "msg2", "msg1\n\nmsg2\n----\nk1: a"],
+      ["msg1\n\n----\n\nk1: a", "msg2", "msg1\n\nmsg2\n\n----\n\nk1: a"],
+      ["msg1", "msg2\n----\nk2: b", "msg1\n\nmsg2\n----\nk2: b"],
+      ["msg1", "msg2\n\nk2: b", "msg1\n\nmsg2\n\nk2: b"],
+      ["msg1\n\nk1: a", "msg2\n\nk2: b", "msg1\n\nmsg2\n\nk1: a\nk2: b"],
+    ];
+    for (const [m1, m2, out] of merges) {
+      expect(commitMessageMerge(m1, m2)).toBe(out);
+    }
+  });
+
+  it("prefills the COMMIT_MESSAGES body: the commit bullets + the co-author + Reviewed-on trailers", async () => {
+    const data = await loadSq({ DefaultMergeStyle: "squash", DefaultSquashMergeMessage: "COMMIT_MESSAGES" });
+    expect(data!.mergeForm!.defaultStyle).toBe("squash");
+    expect(data!.mergeForm!.defaultTitle).toBe(`feat: squash me (#${sqPrIndex})`);
+    // formatSquashMergeCommitMessages' oldest-first bullets (c1's body rides
+    // inside its bullet), buildSquashMergeCommitMessages' `---------`
+    // separator + the seed author as co-author (nobody's account), and
+    // CommitMessageMerge appending the Reviewed-on trailer block.
+    expect(data!.mergeForm!.defaultBody).toBe(
+      "* c1 subject\n\nand the body\n\n* c2 plain\n\n* c3 tail\n\n" +
+        "---------\n\nCo-authored-by: seed <seed@mergetest.invalid>\n" +
+        reviewedOnLine(sqPrIndex),
+    );
+  });
+
+  it("prefills the PR_BODY body (the DefaultSquashMergeMessage default) with the co-author + Reviewed-on trailers", async () => {
+    const data = await loadSq({ DefaultMergeStyle: "squash" });
+    expect(data!.mergeForm!.defaultBody).toBe(
+      "The PR body text.\n\n---------\n\nCo-authored-by: seed <seed@mergetest.invalid>\n" + reviewedOnLine(sqPrIndex),
+    );
+  });
+
+  it("prefills the BLANK body: only the trailers survive", async () => {
+    const data = await loadSq({ DefaultMergeStyle: "squash", DefaultSquashMergeMessage: "BLANK" });
+    expect(data!.mergeForm!.defaultBody).toBe(
+      "Co-authored-by: seed <seed@mergetest.invalid>\n" + reviewedOnLine(sqPrIndex),
+    );
+  });
+
+  it("prefills the merge style's Reviewed-on body with the Reviewed-by approver lines", async () => {
+    // Approvals: cara (official, null email — the "<>" sig arm), dave
+    // (official, the real email), bob (NON-official — excluded), and a LATER
+    // cara comment (the per-reviewer max-id is taken over the APPROVE+official
+    // cond — a later non-approve does not displace the line).
+    await d1().insert(pullReviews).values([
+      { type: ReviewType.Approve, reviewerId: cara.id, issueId: sqIssueId, official: true, createdAt: new Date(T0 * 1000), updatedAt: new Date(T0 * 1000) },
+      { type: ReviewType.Approve, reviewerId: 104, issueId: sqIssueId, official: true, createdAt: new Date((T0 + 1) * 1000), updatedAt: new Date((T0 + 1) * 1000) },
+      { type: ReviewType.Approve, reviewerId: bob.id, issueId: sqIssueId, official: false, createdAt: new Date((T0 + 2) * 1000), updatedAt: new Date((T0 + 2) * 1000) },
+      { type: ReviewType.Comment, reviewerId: cara.id, issueId: sqIssueId, official: true, createdAt: new Date((T0 + 3) * 1000), updatedAt: new Date((T0 + 3) * 1000) },
+    ]);
+    const data = await loadSq({ DefaultMergeStyle: "merge" });
+    expect(data!.mergeForm!.defaultStyle).toBe("merge");
+    expect(data!.mergeForm!.defaultTitle).toBe(`Merge pull request 'feat: squash me' (#${sqPrIndex}) from squash-branch into main`);
+    expect(data!.mergeForm!.defaultBody).toBe(
+      `${reviewedOnLine(sqPrIndex)}\nReviewed-by: Cara Null <>\nReviewed-by: Dave Mail <dave@sqrepo.invalid>\n`,
+    );
+  });
+
+  it("swaps the body alongside the title on the default-style switch", async () => {
+    const squash = await loadSq({ DefaultMergeStyle: "squash", DefaultSquashMergeMessage: "COMMIT_MESSAGES" });
+    expect(squash!.mergeForm!.defaultBody).toContain("* c1 subject");
+    const merged = await loadSq({ DefaultMergeStyle: "merge", DefaultSquashMergeMessage: "COMMIT_MESSAGES" });
+    expect(merged!.mergeForm!.defaultTitle).toContain("Merge pull request");
+    expect(merged!.mergeForm!.defaultBody).toBe(
+      `${reviewedOnLine(sqPrIndex)}\nReviewed-by: Cara Null <>\nReviewed-by: Dave Mail <dave@sqrepo.invalid>\n`,
+    );
+    // rebase keeps the hidden-fields shape: no body at all.
+    const rebased = await loadSq({ DefaultMergeStyle: "rebase" });
+    expect(rebased!.mergeForm!.defaultBody).toBe("");
+  });
+
+  it("degrades the body to the Reviewed-on line when the reads seam is absent", async () => {
+    const data = await loadSq({ DefaultMergeStyle: "squash", DefaultSquashMergeMessage: "COMMIT_MESSAGES" }, { reads: false });
+    // upstream's own err arm: GetSquashMergeCommitMessages failing leaves the
+    // props "" and the composition collapses to the reviewed body — the
+    // commit list AND its co-author trailers drop, the Reviewed-on block
+    // (with this fixture's approvals — seeded by the merge-style test above)
+    // stays. CommitMessageMerge TRIMS its trailer inputs, so the squash
+    // body's trailing newline (the GetDefaultMergeMessage shape) is gone —
+    // exactly what the write path stores for an unedited squash submit.
+    expect(data!.mergeForm!.defaultBody).toBe(
+      `${reviewedOnLine(sqPrIndex)}\nReviewed-by: Cara Null <>\nReviewed-by: Dave Mail <dave@sqrepo.invalid>`,
+    );
+  });
+
+  it("renders the prefilled body as the textarea's content", async () => {
+    await d1().delete(repoUnits).where(eq(repoUnits.repoId, sqRepoId));
+    await d1().insert(repoUnits).values({
+      repoId: sqRepoId,
+      type: "pull_requests",
+      config: JSON.stringify({ DefaultMergeStyle: "squash", DefaultSquashMergeMessage: "COMMIT_MESSAGES" }),
+    });
+    const found = (await findPullRequestByIndex(env.DB, sqRepoId, sqPrIndex))!;
+    const data = await loadPullMergeBoxData(env.DB, {
+      repo: await repoRow(sqRepoId),
+      issue: found.issue,
+      pr: found.pullRequest,
+      viewer: alice,
+      origin: ORIGIN,
+      listTips: (pair) => engineReads(env, pair).listRefs(),
+      reads: engineReads(env, sqPair),
+    });
+    const html = pullMergeBoxFragmentHtml(data);
+    // The body renders as the textarea's content, HTML-escaped like any text
+    // node (the signature angle brackets).
+    const escaped = data!.mergeForm!.defaultBody.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+    expect(html).toContain(`>${escaped}</textarea>`);
+    expect(html).toContain(`name="merge_message_field" rows="5" placeholder="Add an optional extended description…">* c1 subject`);
   });
 });
 
