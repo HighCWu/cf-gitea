@@ -86,6 +86,15 @@
  *     the archive ENDPOINT itself is landed (wave-ui-parity-6's
  *     `/archive/{ref}.{format}`; the old "no archive endpoint exists"
  *     premise was stale, corrected in the module header + here).
+ *   - the deleted-branch rows + restore chain (census gap #10(a) gone REAL
+ *     through migration 0059's `deleted_branches` substrate): over a
+ *     dedicated `w100del` fixture the REAL delete POST's PRE-CAS row is
+ *     verified in D1 and the list renders the deleted row (the plain-text
+ *     name, the Deleted-by line, the writer-gated restore form —
+ *     list.tmpl:93-99/:195-204) plus the restore flashes' display params;
+ *     the `/branches/restore` POST tail stays engine-owned DOCUMENTED
+ *     (the branches header's HANDOFF — the orchestrator's fold flips it
+ *     and rewrites that arm to the claimed shape);
  *   - the webui-parity ORDER arms over a dedicated `w100sort` fixture: the
  *     upstream default `commit_time DESC, name ASC` (models/git/
  *     branch_list.go:89-99 — no sort control exists at the pin, the brief's
@@ -104,11 +113,13 @@ import { ZERO_OID } from "../../api/services/engine";
 import { saveRepoSettings } from "../../api/services/repo-settings";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
-import { issues, pullRequests, repositories, users } from "../../db/schema";
+import { deletedBranches, issues, pullRequests, repositories, users } from "../../db/schema";
 import { settleCreatingRepo } from "../../git-http/gate";
 import { IssuesService } from "../../issues/service";
 import { RepoService } from "../../repos/service";
 import { parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
+import { renderPage } from "../shell";
+import { BranchesFlash } from "./branches";
 import type { UiManifest } from "../manifest";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { buildHistoryPack, buildReceivePackBody, type SeedCommit } from "../testing/seed-repo";
@@ -351,6 +362,21 @@ async function ensureFixtures(): Promise<void> {
   // read-pinned repos above.
   await ensureRepo(
     "w100wr",
+    [
+      { name: "main", tipIndex: MAIN_TIP },
+      { name: "side", tipIndex: AHEAD_TIP },
+    ],
+    tips,
+    pack,
+    { defaultBranch: "main" },
+  );
+
+  // The deleted-rows repo (the restore chain, migration 0059): main + side,
+  // unarchived — the deleted-rows arms delete `side` through the REAL
+  // delete POST (the substrate's writer), so it too stands alone from the
+  // read-pinned repos above.
+  await ensureRepo(
+    "w100del",
     [
       { name: "main", tipIndex: MAIN_TIP },
       { name: "side", tipIndex: AHEAD_TIP },
@@ -863,57 +889,102 @@ describe("w100 feed/archive absence (w129 batch-14: the documented never-pinned 
   });
 });
 
-// --- the deleted-branch rows + restore POST absence (census gap #10(a)) -----
-// pages/branches.tsx's ADJUDICATION: upstream flags deletes on its `branch`
-// TABLE (is_deleted rows keep the sha — models/git/branch.go:254-269) and
-// restores from the recorded sha (RestoreBranchPost, branch.go:108-135,
-// web.go:1485 POST /branches/restore with branch_id); this backend keeps
-// NO substrate (no branch rows in D1, no reflog in the engine, the delete
-// flow's webhook carries the name but never the sha) — a deleted branch is
-// unrecoverable by construction, so the deleted-row render and the restore
-// POST are a recorded REDUCTION, not an unmounted surface. These arms pin
-// the render half of that adjudication; the POST tail (`/branches/restore`)
-// is DOCUMENTED unclaimed — parseUiRoute answers null and the engine 404s
-// the POST, never pinned so the reopen (the module header's trigger list)
-// flips them deliberately.
+// --- the deleted-branch rows + restore (census gap #10(a): the substrate
+// landed, the chain went REAL) -------------------------------------------
+// Migration 0059 landed the `deleted_branches` table and the recorded
+// 3-step reopen trigger fired (pages/branches.tsx's header): the delete
+// POST writes the row PRE-CAS (applyBranchDelete's step 4.5), the list
+// renders the flagged rows (list.tmpl:93-99's plain-text name + the
+// Deleted-by line) with the writer's restore control (list.tmpl:195-204,
+// non-protected rows only), and the restore POST's MODULE is landed
+// (pages/branch-restore.ts). The arms below pin the render half over a
+// dedicated `w100del` fixture driven through the REAL delete POST (the
+// substrate's writer — the w100br read pins above stand untouched); the
+// POST tail (`/branches/restore`) stays engine-owned DOCUMENTED until the
+// orchestrator's fold flips it (the branches header's HANDOFF carries the
+// registration recipe; the fold rewrites the last arm to the claimed
+// shape — the window-2e rename precedent).
 
-describe("w100 deleted-branch rows + restore absence (census gap #10(a): the adjudication pin)", () => {
-  it("no deleted-row render and no restore control — on the default or any listed branch", async () => {
-    // The signed-in owner sees the full writer chrome (the batch-14
-    // convention) so the absence cannot be a gate artifact. Upstream's
-    // deleted rows would render list.tmpl:93-99's plain-text name + the
-    // `Deleted by` info line, and its writers get list.tmpl:195-204's
-    // restore-branch-button (octicon-reply, blue); none of that exists here.
-    const res = await get(`/${OWNER}/w100br/branches`, OWNER);
-    expect(res.status).toBe(200);
-    const html = await res.text();
-    expect(html).not.toContain("restore-branch-button"); // the restore control's class
-    expect(html).not.toContain("octicon-reply"); // its glyph
-    expect(html).not.toContain("Restore Branch"); // its tooltip literal (repo.branch.restore)
-    expect(html).not.toContain("/branches/restore"); // its action URL shape
-    expect(html).not.toContain("branch_id="); // its form field
-    expect(html).not.toContain("Deleted by"); // the deleted-row info line (repo.branch.deleted_by)
-    // And every listed row stays a LIVE row: a tree link per branch name
-    // (deleted rows render plain text upstream — no tree link).
-    for (const name of ["stale", "ahead", "flat", "moved"]) {
-      expect(html).toContain(`href="/${OWNER}/w100br/src/branch/${name}"`);
-    }
+describe("w100 deleted-branch rows + restore (the substrate chain, migration 0059)", () => {
+  it("the delete POST writes the row PRE-CAS and the list renders the deleted row + its restore control (writer, non-protected)", async () => {
+    const tips = (await buildHistoryPack(W100_COMMITS)).tips;
+    const res = await fetchUi(
+      `/${OWNER}/w100del/branches/delete`,
+      formPost(`/${OWNER}/w100del/branches/delete`, { name: "side" }, await cookieFor(OWNER)),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/${OWNER}/w100del/branches?deleted=side`);
+    // The engine half: the ref is gone.
+    const names = (await env.REPO.getByName(`${OWNER}/w100del`).listRefs()).refs.map((ref) => ref.name);
+    expect(names).not.toContain("refs/heads/side");
+    // The substrate half: the PRE-CAS row holds the recorded sha (the
+    // restore source — applyBranchDelete's step 4.5, the schema doc's
+    // contract).
+    const repoRow = (
+      await drizzle(env.DB).select().from(repositories).where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, "w100del"))).get()
+    )!;
+    const row = (
+      await drizzle(env.DB).select().from(deletedBranches).where(and(eq(deletedBranches.repoId, repoRow.id), eq(deletedBranches.name, "side"))).get()
+    )!;
+    expect(row.commitId).toBe(tips[AHEAD_TIP]);
+    // The render half (list.tmpl:93-99/:195-204): the plain-text name (NO
+    // tree link — the ref is gone), the Deleted-by info line, the restore
+    // control with its exact form shape; the live default row keeps its
+    // tree link.
+    const list = await get(`/${OWNER}/w100del/branches`, OWNER);
+    expect(list.status).toBe(200);
+    const html = await list.text();
+    expect(html).toContain(`action="/${OWNER}/w100del/branches/restore"`);
+    expect(html).toContain('name="branch_id"');
+    expect(html).toContain(`value="${row.id}"`); // the recorded id rides the form
+    expect(html).toContain("restore-branch-button");
+    expect(html).toContain("octicon-reply"); // its glyph
+    expect(html).toContain("Restore Branch &quot;side&quot;"); // its tooltip (repo.branch.restore)
+    expect(html).toContain("Deleted by"); // the info line (repo.branch.deleted_by)
+    expect(html).not.toContain(`href="/${OWNER}/w100del/src/branch/side"`);
+    expect(html).toContain(`href="/${OWNER}/w100del/src/branch/main"`);
   });
 
-  it("the restore POST tail is engine-owned: unclaimed by the parser, 404-shelled on POST (documented, not pinned — the reopen flips it)", async () => {
-    // Documented (never pinned as a claim): parseUiRoute(/branches/restore)
-    // → null — the mount wave flips it deliberately, per the file's own
-    // claim-pin convention. The POST's 404 IS pinned (the write-seam half,
-    // the archived delete's precedent) so the reopen cannot silently drop
-    // the refusal either.
-    expect(parseUiRoute(`/${OWNER}/w100br/branches/restore`)).toBeNull();
+  it("hides the restore control from non-writers while the deleted row itself renders for them", async () => {
+    // The row is public like the list (the reader sees the Deleted-by
+    // line); the control is writer-gated (list.tmpl's `$.IsWriter
+    // $.Repository.CanContentChange` + `{{if not .IsProtected}}`).
+    const html = await (await get(`/${OWNER}/w100del/branches`, STRANGER)).text();
+    expect(html).toContain("Deleted by");
+    expect(html).not.toContain("restore-branch-button");
+    expect(html).not.toContain("/branches/restore");
+  });
+
+  it("the restore flashes render from the flash params — the GET handler wires ?restored=/?restore_error= at the fold", () => {
+    // The route-level params (`?restored=` / `?restore_error=&name=`) reach
+    // BranchesFlash only once the orchestrator's fold wires the GET
+    // handler's two extra reads (the branches header's HANDOFF item c —
+    // the props are optional, the current call site compiles unchanged).
+    // Until then the arms are pinned at the module level, over the same
+    // component the fold's wiring will feed.
+    const html = (restored: string | null, restoreError: string | null, name = ""): string =>
+      renderPage(<BranchesFlash deleted={null} errorKind={null} errorName={name} restored={restored} restoreError={restoreError} />);
+    expect(html("side", null)).toContain("Branch &quot;side&quot; has been restored."); // restore_success
+    expect(html(null, "already_exists", "side")).toContain("A branch named &quot;side&quot; already exists."); // already_exists
+    expect(html(null, "failed", "side")).toContain("Failed to restore branch &quot;side&quot;."); // restore_failed (the protected refusal folds here)
+    expect(html(null, null)).not.toContain("ui info message"); // no flash, no params
+  });
+
+  it("the restore POST tail is engine-owned: unclaimed by the parser, 404-shelled on POST (documented — the orchestrator's fold flips it)", async () => {
+    // Documented (never claimed): parseUiRoute(/branches/restore) → null —
+    // the fold flips it deliberately (the branches header's HANDOFF). The
+    // POST's 404 IS pinned so the fold cannot silently drop the claim flip
+    // either; the fold rewrites THIS arm to the claimed shape (the
+    // window-2e rename precedent).
+    expect(parseUiRoute(`/${OWNER}/w100del/branches/restore`)).toBeNull();
     const res = await fetchUi(
-      `/${OWNER}/w100br/branches/restore`,
-      formPost(`/${OWNER}/w100br/branches/restore`, { branch_id: "1", name: "moved" }, await cookieFor(OWNER)),
+      `/${OWNER}/w100del/branches/restore`,
+      formPost(`/${OWNER}/w100del/branches/restore`, { branch_id: "1", name: "side" }, await cookieFor(OWNER)),
     );
     expect(res.status).toBe(404);
-    // The refs stand untouched (nothing was restored).
-    const names = (await env.REPO.getByName(`${OWNER}/w100br`).listRefs()).refs.map((ref) => ref.name);
-    expect(names).toContain("refs/heads/moved");
+    // The substrate stands untouched (nothing was restored — the ref side
+    // stays gone from arm 1's delete).
+    const names = (await env.REPO.getByName(`${OWNER}/w100del`).listRefs()).refs.map((ref) => ref.name);
+    expect(names).not.toContain("refs/heads/side");
   });
 });

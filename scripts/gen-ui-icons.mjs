@@ -128,6 +128,10 @@ const ALLOWLIST = [
   'octicon-plus',
   'octicon-project-symlink',
   'octicon-pulse',
+  // The branches deleted-row restore mark (list.tmpl:195-204's
+  // restore-branch-button `{{svg "octicon-reply"}}` — the restore arm of the
+  // deleted_branches substrate, migration 0059).
+  'octicon-reply',
   'octicon-repo',
   'octicon-shield-lock',
   'octicon-terminal', // SPEC-0016 M2 — the generic install block's label (content/generic.tmpl)

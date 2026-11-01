@@ -56,9 +56,9 @@
  *     canDelete := !IsDeleted && DefaultBranch != name && pullRequestTargetBranch != name
  *     if isProtected && canDelete { canDelete = canDelete && rule.CanUserDelete(...) }
  *
- * reduced to the landed model: no deleted-branch rows exist (the
- * deleted-branches ADJUDICATION section below — the restore column cannot
- * render), and GetPullRequestTargetBranch folds to the default branch for a
+ * reduced to the landed model: live rows only (`!IsDeleted` — the loader's
+ * deleted arm renders its own rows, the deleted-branches section below),
+ * and GetPullRequestTargetBranch folds to the default branch for a
  * same-repo target, so the first two arms are one `name != defaultBranch`
  * check. `rule.CanUserDelete` is the LANDED port (`canUserDelete`,
  * services/branch-protection.ts — write access + the rule's deletion arm +
@@ -89,7 +89,7 @@
  * `protected_deletion_failed` / `deletion_failed`.
  *
  * ## The deleted-branch rows + the restore POST — census gap #10(a):
- *    ADJUDICATED a recorded REDUCTION (no substrate exists)
+ *    the recorded REDUCTION's 3-step reopen trigger, gone REAL
  *
  * Upstream's deleted-branch substrate is NOT a separate table: the `branch`
  * table keeps EVERY branch ever seen and a web/API delete only FLAGS the
@@ -116,38 +116,67 @@
  * (empty OldCommitID → the sha as NewCommitID) and flashes
  * `repo.branch.restore_success`.
  *
- * This backend carries NO such substrate: the engine keeps refs ONLY (no
- * branch rows, no reflog — the public RPC surface has no ref history),
- * D1 has no branch table at all (the loader derives the universe from
- * listRefs), and the landed delete flow (`applyBranchDelete`, this file)
- * CAS-deletes the ref and emits the DeleteRef webhook — whose payload
- * carries the NAME, never the sha; no audit event registers branch
- * deletes (services/audit.ts). Nothing anywhere retains the
- * `{name → sha}` pair a restore needs, and the ref itself is gone — a
- * deleted branch is unrecoverable BY CONSTRUCTION, so the deleted-row
- * render and the restore POST are an honest REDUCTION (there is no row to
- * render and no sha to restore from), not an unmounted surface. The
- * absence is pinned (branches.matrix.test.tsx's restore-absence arm).
+ * This backend kept NO such substrate — a deleted branch was unrecoverable
+ * BY CONSTRUCTION (the reduction the branches.tsx header adjudicated and
+ * 70d4220 pinned). Migration 0059 landed the substrate table
+ * (`deleted_branches` — upstream's column subset, unique (repo_id, name),
+ * the schema doc's contract: the delete arm writes the row PRE-CAS so the
+ * sha survives the ref deletion; a re-delete of the same name overwrites),
+ * and the recorded 3-step reopen trigger is now REAL, in the trigger's own
+ * order:
  *
- * Reopen trigger (the parity row this leaves open, in dependency order):
- * (1) a `deleted_branches` D1 table — upstream's column subset `id,
- *     repo_id, name, commit_id, deleted_by_id, deleted_unix` — written by
- *     `applyBranchDelete`'s landing arm before the CAS delete (a generated
- *     migration; SPEC-first per AGENTS.md — OUTSIDE this unit's file
- *     ownership);
- * (2) a `loadDeletedBranches` arm in loadBranchesData + the list.tmpl:93-99
- *     deleted-row render (plain-text name, deleted_by info line, the
- *     is_deleted-last sort) + the restore form (list.tmpl:195-204's
- *     control, the no-JS direct-POST reduction like the delete button);
- * (3) the restore POST seam replaying PushManaged as
+ * (1) DONE — `applyBranchDelete` writes the row PRE-CAS (below, step 4.5):
+ *     the tip sha comes off the same listRefs snapshot the CAS base reads,
+ *     the actor + unix-second stamp ride along, the upsert overwrites on
+ *     re-delete;
+ * (2) DONE — the loader's `loadDeletedBranches` arm + the list.tmpl:93-99
+ *     deleted-row render (plain-text name — no tree link, the Deleted-by
+ *     info line, the PR cell reusing the live row's arms with the nil-
+ *     divergence posture, the ungated RSS anchor) + list.tmpl:195-204's
+ *     restore form (the no-JS direct-POST reduction like the delete
+ *     button; writer + non-protected);
+ * (3) the restore POST — the MODULE is landed (pages/branch-restore.ts:
+ *     `applyBranchRestore` replaying PushManaged as
  *     `commitApiChange({ref: "refs/heads/{name}", expectedOldOid:
- *     ZERO_OID, newOid: sha})` + the DeleteRef-style webhook for the
- *     create event, with the already_exists / restore_failed /
- *     restore_success flash arms (the delete arm's `?deleted=` /
- *     `?delete_error=` display-param convention).
- * Until (1) lands, this page keeps upstream's live-row shape exactly and
- * quietly never renders a deleted row — the honest posture the census
- * asked this unit to adjudicate.
+ *     ZERO_OID, newOid: sha})` + the create-event webhook (the API
+ *     create's payload shape) with the already_exists / restore_failed /
+ *     restore_success flash arms carried by this page's BranchesFlash from
+ *     the delete arm's display-param convention (`?restored=` /
+ *     `?restore_error=&name=`).
+ *
+ * **ROUTE-SEAM HANDOFF (the orchestrator's fold window — ui/index.ts is
+ * NOT this unit's file):** the POST tail needs three index.ts hunks, all
+ * replaying landed shapes:
+ *   a. parseUiRoute's `head === "branches"` block lifts the `/restore`
+ *      literal out of the unclaimed set: `if (rest.length === 1 &&
+ *      rest[0] === "restore") return { family: "branch-restore", owner,
+ *      repo };` (add `"branch-restore"` to the BranchesRoute family union —
+ *      upstream web.go:1485, inside the 1484-1489 group);
+ *   b. register the POST handler beside branchDeleteSubmit with the group's
+ *      middlewares posture (sameOriginGuard → resolveUiRequest → anonymous
+ *      loginRedirect → archived/empty 404 shells → form read → doer row →
+ *      findRepositoryById → applyBranchRestore); outcomes: `missing` → the
+ *      404 shell, `restored` → 303 `?restored={name}`, `already-exists` →
+ *      303 `?restore_error=already_exists&name={name}`,
+ *      `refused-protected`/`failed` → 303
+ *      `?restore_error=failed&name={name}` (upstream's protected-name push
+ *      refusal lands in the restore_failed arm — no dedicated flash key);
+ *   c. the branches GET handler passes the two new display params into
+ *      renderBranchesPage's flash: `restored:
+ *      url.searchParams.get("restored"), restoreError:
+ *      url.searchParams.get("restore_error")` (the props are OPTIONAL —
+ *      the current call site compiles unchanged, the two-stage convention).
+ * Until the fold, `/branches/restore` stays engine-owned (the matrix's
+ * documented arm holds) and the restore flashes render only from direct
+ * GET params — the render half is fully live.
+ *
+ * The loader's deleted arm filters rows whose name carries a LIVE ref
+ * again: upstream's push pipeline un-flags the branch row on every push
+ * (the sync upserts is_deleted=false), so ANY path that revives the name —
+ * our restore POST, a plain git push of the same name — makes the flagged
+ * row stop rendering; the engine-universe check answers all of them at
+ * once. The row itself survives (invisible; a re-delete overwrites it —
+ * the schema's upsert contract).
  *
  * ## The writer block — create + rename (two-stage; POST arms mounted)
  *
@@ -155,8 +184,10 @@
  * $.Repository.CanContentChange (not .IsDeleted)` (list.tmpl:34,56,163,185):
  * reduced here to the loader's write grant (principalAccessOfRow's write —
  * IsWriter's CanWrite(TypeCode)) plus `!repo.isArchived` (CanContentChange;
- * no mirror column is landed) — deleted rows cannot exist (the
- * deleted-branches ADJUDICATION section above). Each modal button is
+ * no mirror column is landed). Live rows get the create/rename pair;
+ * deleted rows get the restore control instead (the same gate plus the
+ * non-protected arm — list.tmpl:195's `{{if not .IsProtected}}`). Each
+ * modal button is
  * reduced to an inline no-JS
  * form carrying upstream's EXACT route and fields, so the mount wave can
  * serve them verbatim:
@@ -265,14 +296,14 @@
  */
 
 import type { CommitJson } from "@cf-gitea/git-engine";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, desc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { branchRef, engineCell, engineReads, refTipMap, type EngineDivergenceResult } from "../../api/services/engine";
 import { pullHeadRefName } from "../../api/services/pulls";
 import { loadRepoSettings } from "../../api/services/repo-settings";
 import { apiUserFromRow, toApiRepository, type RepositoryWithOwner, type UserRow } from "../../api/services/repository";
-import { issues, PRFlow, pullRequests } from "../../db/schema";
+import { deletedBranches, issues, PRFlow, pullRequests, users } from "../../db/schema";
 import { emitWebhookDeliveries } from "../../issues/webhooks";
 import {
   canUserDelete,
@@ -328,6 +359,11 @@ export const branchesLocale = {
   default_deletion_failed: (name: string): string =>
     `Branch "${name}" is the default or pull request target branch. It cannot be deleted.`, // "repo.branch.default_deletion_failed"
   protected_deletion_failed: (name: string): string => `Branch "${name}" is protected. It cannot be deleted.`, // "repo.branch.protected_deletion_failed"
+  deleted_by: (user: string): string => `Deleted by ${user}`, // "repo.branch.deleted_by" (the deleted-row info line's leading text; the template appends the TimeSince node)
+  restore_branch_aria: (name: string): string => `Restore Branch "${name}"`, // "repo.branch.restore" (the restore button's tooltip)
+  restore_success: (name: string): string => `Branch "${name}" has been restored.`, // "repo.branch.restore_success"
+  restore_failed: (name: string): string => `Failed to restore branch "${name}".`, // "repo.branch.restore_failed"
+  already_exists: (name: string): string => `A branch named "${name}" already exists.`, // "repo.branch.already_exists"
 } as const;
 
 /** Upstream `setting.Git.BranchesRangeSize` (modules/setting/git.go:45). */
@@ -400,6 +436,29 @@ export interface BranchRowView {
   latestPr: BranchLatestPr | null;
 }
 
+/** One rendered DELETED-branch row (list.tmpl:93-99/:195-204's shape over
+ *  migration 0059's deleted_branches substrate): the recorded id (the
+ *  restore form's `branch_id`), the plain-text name, the recorded sha
+ *  (never rendered — the restore POST's source), the actor + deletion
+ *  stamp (the info line), the first-match protection answer (the restore
+ *  control's non-protected gate) and the PR-column row (the same
+ *  GetLatestPullRequestByHeadInfo scan the live rows share — a deleted
+ *  name can still carry one; MergeMovedOn reads the STORED sha, upstream
+ *  loadOneBranch's `headCommit := dbBranch.CommitID`). */
+export interface BranchDeletedRowView {
+  id: number;
+  name: string;
+  commitId: string;
+  /** The actor's username (the users join; "unknown" if the row vanished —
+   *  the template renders DeletedBy.Name unconditionally). */
+  deletedByName: string;
+  deletedUnix: number;
+  /** First-match rule governs the NAME (viewer-independent) — hides the
+   *  restore control (list.tmpl's `{{if not .IsProtected}}`). */
+  isProtected: boolean;
+  latestPr: BranchLatestPr | null;
+}
+
 /** The page's render inputs, loaded by loadBranchesData. */
 export interface BranchesData {
   keyword: string;
@@ -422,14 +481,19 @@ export interface BranchesData {
   /** `repoSettings.hasPullRequests` (the DEFAULT_REPO_SETTINGS default when
    *  no row exists) — upstream AllowsPulls minus the mirror arm. */
   allowsPulls: boolean;
-  /** The list table's rows (the default branch excluded — upstream
-   *  ExcludeBranchNames), keyword-filtered, one page. */
+  /** The list table's live rows (the default branch excluded — upstream
+   *  ExcludeBranchNames), keyword-filtered, one page (the deleted rows
+   *  below sort after them — upstream's `is_deleted ASC` primary key). */
   rows: BranchRowView[];
+  /** The list table's deleted rows (list.tmpl's IsDeleted arm), keyword-
+   *  filtered, the page slice's tail, names carrying a live ref again
+   *  excluded (upstream's push-sync un-flag; the module header). */
+  deletedRows: BranchDeletedRowView[];
 }
 
 /** The page doer's protection-context identity (anonymous → the all-false
  *  access — principalAccessOfRow's null arm). */
-function protectionDoer(viewer: Viewer): { id: number; username: string; isAdmin: boolean } | null {
+export function protectionDoer(viewer: Viewer): { id: number; username: string; isAdmin: boolean } | null {
   return viewer.kind === "user" ? { id: viewer.id, username: viewer.username, isAdmin: viewer.isAdmin } : null;
 }
 
@@ -505,8 +569,10 @@ export async function loadBranchesData(
 
   // The protection context (the API LIST's loadBranchProtectionContext
   // composition): rules once, the doer's access pair once — plus the
-  // AllowsPulls read and the latest-PR walk, also once per request.
-  const [rules, access, settings, prRows] = await Promise.all([
+  // AllowsPulls read, the latest-PR walk and the deleted-branch read (the
+  // migration-0059 substrate — one ordered scan with its actor join), also
+  // once per request.
+  const [rules, access, settings, prRows, deletedRaw] = await Promise.all([
     listRepoRules(db, repo.id),
     principalAccessOfRow(db, repo, protectionDoer(options.viewer)),
     loadRepoSettings(db, repo.id),
@@ -516,6 +582,19 @@ export async function loadBranchesData(
       .innerJoin(issues, eq(issues.id, pullRequests.issueId))
       .where(and(eq(pullRequests.headRepoId, repo.id), eq(pullRequests.flow, PRFlow.Github)))
       .orderBy(asc(pullRequests.id)),
+    // loadDeletedBranches' port over the substrate: the repo's flagged rows
+    // with their actor's username. Upstream orders the combined list
+    // `is_deleted ASC, commit_time DESC, name ASC` (branch_list.go:96 — the
+    // flagged rows sort last); our table carries no commit_time (upstream's
+    // flagged row keeps its branch's commit_time — the one column the
+    // subset drops), so the deletion stamp orders them among themselves:
+    // `deleted_unix DESC, name ASC` — the documented divergence.
+    drizzle(db)
+      .select({ row: deletedBranches, deletedByName: users.username })
+      .from(deletedBranches)
+      .leftJoin(users, eq(users.id, deletedBranches.deletedById))
+      .where(eq(deletedBranches.repoId, repo.id))
+      .orderBy(desc(deletedBranches.deletedUnix), asc(deletedBranches.name)),
   ]);
 
   // GetLatestPullRequestByHeadInfo's reduction: the scan is id-ordered, so
@@ -540,10 +619,36 @@ export async function loadBranchesData(
   const defaultCommit = defaultBranch !== null ? await reads.readCommit(defaultBranch) : null;
 
   // The keyword filter (case-insensitive substring — the search combo's
-  // honest stand-in for upstream's SQL LIKE) over the non-default universe.
+  // honest stand-in for upstream's SQL LIKE) over the non-default universe
+  // AND the deleted rows (upstream's LIKE runs over the flagged rows too).
   const needle = options.keyword.trim().toLowerCase();
   const others = branchNames.filter((name) => name !== defaultBranch);
   const filtered = needle === "" ? others : others.filter((name) => name.toLowerCase().includes(needle));
+  // The deleted rows whose name carries a LIVE ref again stop rendering —
+  // upstream's push-sync un-flag arm (the module header): our restore POST
+  // and a plain git push of the same name both revive the ref, and the
+  // engine snapshot already holds every live name.
+  const deletedRows: BranchDeletedRowView[] = deletedRaw
+    .filter((entry) => !tips.has(branchRef(entry.row.name)))
+    .filter((entry) => needle === "" || entry.row.name.toLowerCase().includes(needle))
+    .map((entry) => {
+      const rule = firstMatchRule(rules, entry.row.name);
+      const pr = latestPrByBranch.get(entry.row.name) ?? null;
+      // MergeMovedOn reads the STORED sha for a deleted name (upstream's
+      // `headCommit := dbBranch.CommitID` — the ref is gone, the row's
+      // CommitID is the only head): the pull head must exist and differ
+      // from the recorded sha.
+      const pullHeadTip = pr !== null && pr.hasMerged ? tips.get(pullHeadRefName(pr.index))?.target : undefined;
+      return {
+        id: entry.row.id,
+        name: entry.row.name,
+        commitId: entry.row.commitId,
+        deletedByName: entry.deletedByName ?? "unknown",
+        deletedUnix: entry.row.deletedUnix,
+        isProtected: rule !== null,
+        latestPr: pr === null ? null : { ...pr, mergeMovedOn: pr.hasMerged && pullHeadTip !== undefined && pullHeadTip !== entry.row.commitId },
+      };
+    });
 
   // The tip-commit read over the WHOLE filtered universe — the sort key's
   // data (upstream orders its branch TABLE by the stored commit_time; the
@@ -565,20 +670,33 @@ export async function loadBranchesData(
       (a.name < b.name ? -1 : a.name > b.name ? 1 : 0),
   );
 
-  // Pagination (§4.11 clamps) over the ordered list; the per-row protection
-  // predicates + divergence walks still run for the rendered slice only.
+  // Pagination (§4.11 clamps) over the ordered list with the deleted rows
+  // appended (upstream's `is_deleted ASC` primary sort key — branch_list.go:
+  // 96, flagged rows sort last, so they land on the last pages); the
+  // per-row protection predicates + divergence walks still run for the
+  // rendered slice only.
   const page = Math.max(options.page, 1);
   const start = (page - 1) * BRANCHES_PAGE_SIZE;
-  const pageEntries = ordered.slice(start, start + BRANCHES_PAGE_SIZE);
-  const more = ordered.length > start + BRANCHES_PAGE_SIZE;
+  type PageEntry = { kind: "live"; name: string; commit: CommitJson | null } | { kind: "deleted"; row: BranchDeletedRowView };
+  const pageEntries: PageEntry[] = [
+    ...ordered.map((entry) => ({ kind: "live" as const, name: entry.name, commit: entry.commit })),
+    ...deletedRows.map((row) => ({ kind: "deleted" as const, row })),
+  ];
+  const sliced = pageEntries.slice(start, start + BRANCHES_PAGE_SIZE);
+  const more = pageEntries.length > start + BRANCHES_PAGE_SIZE;
 
   const rows = await Promise.all(
-    pageEntries.map(async (entry): Promise<BranchRowView> => {
-      const extras = await rowExtras(db, rules, access, entry.name, false);
-      const divergence = await readDivergence(reads, defaultBranch, entry.name);
-      return { name: entry.name, commit: entry.commit, divergence, latestPr: latestPrByBranch.get(entry.name) ?? null, ...extras };
-    }),
+    sliced
+      .filter((entry): entry is Extract<PageEntry, { kind: "live" }> => entry.kind === "live")
+      .map(async (entry): Promise<BranchRowView> => {
+        const extras = await rowExtras(db, rules, access, entry.name, false);
+        const divergence = await readDivergence(reads, defaultBranch, entry.name);
+        return { name: entry.name, commit: entry.commit, divergence, latestPr: latestPrByBranch.get(entry.name) ?? null, ...extras };
+      }),
   );
+  const pageDeletedRows = sliced
+    .filter((entry): entry is Extract<PageEntry, { kind: "deleted" }> => entry.kind === "deleted")
+    .map((entry) => entry.row);
 
   return {
     keyword: options.keyword,
@@ -591,6 +709,7 @@ export async function loadBranchesData(
     canWrite: access.write,
     allowsPulls: settings.hasPullRequests,
     rows,
+    deletedRows: pageDeletedRows,
   };
 }
 
@@ -641,6 +760,9 @@ export interface BranchDeleteInput {
  * 3. the M2 deletion predicate (`canUserDelete`) — the API arm predates
  *    SPEC-0013; the UI never offers a protection-defeating path;
  * 4. the ref-tip lookup (missing → `missing`, the arm's declared 404);
+ * 4.5 the deleted_branches row, PRE-CAS (migration 0059 — the schema doc's
+ *     contract: the sha survives the ref deletion; the upsert overwrites on
+ *     re-delete);
  * 5. the `deleteApiRef` CAS (moved → `failed`; already-gone → the arm's
  *    idempotent-204 arm, answered as `deleted` without an event, exactly
  *    like the route);
@@ -676,6 +798,22 @@ export async function applyBranchDelete(
   if (tip === undefined) {
     return { outcome: "missing", name };
   }
+  // 4.5 The deleted-branch row, PRE-CAS (migration 0059's substrate — the
+  //     schema doc's contract): the restore source survives the ref
+  //     deletion because the row lands BEFORE deleteApiRef — a crash or
+  //     refusal after this point can lose a delete, never the sha. The
+  //     upsert overwrites on re-delete (unique (repo_id, name)); a CAS
+  //     failure leaves the row holding the pre-attempt tip — the branch
+  //     still lives, so a restore of that row is refused already-exists and
+  //     the next delete overwrites it.
+  const deletedUnix = Math.floor(Date.now() / 1000);
+  await drizzle(env.DB)
+    .insert(deletedBranches)
+    .values({ repoId: repo.id, name, commitId: tip.target, deletedById: input.doer.id, deletedUnix })
+    .onConflictDoUpdate({
+      target: [deletedBranches.repoId, deletedBranches.name],
+      set: { commitId: tip.target, deletedById: input.doer.id, deletedUnix },
+    });
   // 5. The CAS delete (a WRITE RPC — a transport failure propagates, the
   //    honest 500: retryable-unknown state).
   const result = await engineCell(env, input.pair.repo).deleteApiRef({ ref: branchRef(name), expectedOid: tip.target });
@@ -688,19 +826,28 @@ export async function applyBranchDelete(
   if (result.tag === "deleted") {
     // 6. The DeleteRef webhook (the route's payload verbatim; failures are
     //    logged, never propagated — a webhook miss cannot fail the write).
-    await replayBranchDeleteWebhook(env, input, name);
+    await replayBranchRefWebhook(env, input, "delete", name, undefined);
   }
   // `already-absent` (currentOid null) lands here: the arm answers 204
   // without an event; the flash reads deleted.
   return { outcome: "deleted", name };
 }
 
-/** routes/branches.ts emitRefWebhook's port for the `delete` event: the
- *  upstream DeletePayload (notifier.go:858→:870 — pusher_type "user", ref
- *  the SHORT name), the delivery rows INLINE, only the Queue producer
- *  hanging off waitUntil when the binding is wired (the route's structural
- *  probe). */
-async function replayBranchDeleteWebhook(env: Env, input: BranchDeleteInput, branchName: string): Promise<void> {
+/** routes/branches.ts emitRefWebhook's port for the branch family's `create`
+ *  and `delete` ref events: the upstream DeletePayload (notifier.go:858→:870
+ *  — pusher_type "user", ref the SHORT name) and the upstream CreatePayload
+ *  (notifier.go:821→:830 — `sha` = the restored/created tip, ref the SHORT
+ *  name, NO pusher_type — the API POST arm's exact shape), the delivery rows
+ *  INLINE, only the Queue producer hanging off waitUntil when the binding is
+ *  wired (the route's structural probe). The restore POST
+ *  (pages/branch-restore.ts) replays the create arm. */
+export async function replayBranchRefWebhook(
+  env: Env,
+  input: BranchDeleteInput,
+  eventType: "create" | "delete",
+  branchName: string,
+  sha: string | undefined,
+): Promise<void> {
   const queueCandidate: unknown = (env as { WEBHOOK_DELIVERY?: unknown }).WEBHOOK_DELIVERY;
   const queue =
     typeof queueCandidate === "object" &&
@@ -709,21 +856,19 @@ async function replayBranchDeleteWebhook(env: Env, input: BranchDeleteInput, bra
       ? { sendBatch: (queueCandidate as { sendBatch: (messages: { body: WebhookDeliveryMessage }[]) => Promise<unknown> }).sendBatch.bind(queueCandidate) }
       : null;
   const viewer = { origin: input.origin, requester: apiUserFromRow(input.doer, { origin: input.origin, requester: null }) };
+  const payload =
+    eventType === "create"
+      ? { sha, ref: branchName, ref_type: "branch", repository: toApiRepository(viewer, input.pair), sender: apiUserFromRow(input.doer, viewer) }
+      : { ref: branchName, ref_type: "branch", pusher_type: "user", repository: toApiRepository(viewer, input.pair), sender: apiUserFromRow(input.doer, viewer) };
   try {
     await emitWebhookDeliveries(
       env.DB,
       {
         repoId: input.pair.repo.id,
         ownerId: input.pair.repo.ownerId,
-        eventType: "delete",
+        eventType,
         refName: branchRef(branchName),
-        payload: {
-          ref: branchName,
-          ref_type: "branch",
-          pusher_type: "user",
-          repository: toApiRepository(viewer, input.pair),
-          sender: apiUserFromRow(input.doer, viewer),
-        },
+        payload,
       },
       {
         enqueue:
@@ -731,7 +876,7 @@ async function replayBranchDeleteWebhook(env: Env, input: BranchDeleteInput, bra
             ? (deliveryIds) => {
                 input.waitUntil!(
                   queue.sendBatch(deliveryIds.map((deliveryId) => ({ body: { deliveryId } }))).then(undefined, (error: unknown) => {
-                    console.error(`[branches] delivery enqueue failed (delete): ${error instanceof Error ? error.message : String(error)}`);
+                    console.error(`[branches] delivery enqueue failed (${eventType}): ${error instanceof Error ? error.message : String(error)}`);
                   }),
                 );
               }
@@ -739,7 +884,7 @@ async function replayBranchDeleteWebhook(env: Env, input: BranchDeleteInput, bra
       },
     );
   } catch (error) {
-    console.error(`[branches] webhook fan-out failed (delete): ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`[branches] webhook fan-out failed (${eventType}): ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -885,20 +1030,23 @@ function BranchRenameForm(props: { repoLink: string; name: string }) {
 }
 
 /** The PR column's cell (list.tmpl's third cell — the header's PR-column
- *  section cites the four arms). Renders nothing when the arms render
- *  nothing upstream (e.g. merged + movedOn + ahead 0). */
-function BranchPrCell(props: { repoLink: string; row: BranchRowView; defaultBranch: string; allowsPulls: boolean; canPull: boolean }) {
-  const { row } = props;
+ *  section cites the four arms). Takes the cell's two inputs as primitives
+ *  so the deleted rows can share it (upstream renders the same cell over
+ *  flagged rows: IsIncluded folds away — their divergence is skipped, the
+ *  -1 error default — and the compare arm is gated `not .DBBranch.IsDeleted`).
+ *  Renders nothing when the arms render nothing upstream (e.g. merged +
+ *  movedOn + ahead 0). */
+function BranchPrCell(props: { repoLink: string; branchName: string; ahead: number; pr: BranchLatestPr | null; defaultBranch: string; allowsPulls: boolean; canPull: boolean }) {
+  const { pr } = props;
   // The degraded divergence reads as upstream's -1 error default: never
   // "included", never a compare button.
-  const ahead = row.divergence?.ahead ?? -1;
+  const ahead = props.ahead;
   const compare =
     props.allowsPulls && ahead > 0 ? (
-      <a class="ui compact basic button tw-m-0 tw-max-w-full" href={`${compareLink(props.repoLink, props.defaultBranch, row.name)}?expand=1`}>
+      <a class="ui compact basic button tw-m-0 tw-max-w-full" href={`${compareLink(props.repoLink, props.defaultBranch, props.branchName)}?expand=1`}>
         <span class="gt-ellipsis">{props.canPull ? branchesLocale.compare_changes : branchesLocale.compare_branch}</span>
       </a>
     ) : null;
-  const pr = row.latestPr;
   if (pr === null) {
     if (ahead === 0) {
       return (
@@ -956,6 +1104,48 @@ function BranchDeleteForm(props: { repoLink: string; name: string }) {
   );
 }
 
+/** The deleted row's info line (list.tmpl:97's
+ *  `{{ctx.Locale.Tr "repo.branch.deleted_by" .DBBranch.DeletedBy.Name}}
+ *  {{DateUtils.TimeSince .DBBranch.DeletedUnix}}`): the locale text node,
+ *  a space, then the relative-time element — the deletion stamp, not a
+ *  commit read (the ref is gone; upstream's flagged row keeps
+ *  DeletedUnix, our substrate's own column). */
+function BranchDeletedInfo(props: { deletedByName: string; deletedUnix: number }) {
+  return (
+    <p class="info">
+      {branchesLocale.deleted_by(props.deletedByName)} <TimeSince unixSeconds={props.deletedUnix} tz="+0000" />
+    </p>
+  );
+}
+
+/** list.tmpl:195-204's restore control (the JS link-action button reduced
+ *  to the no-JS direct-POST form like the delete button — the wave-15
+ *  rules-list precedent): hidden `branch_id` (RestoreBranchPost's form
+ *  field) posting upstream's exact route POST `/branches/restore`
+ *  (web.go:1485); the glyph is the template's octicon-reply in its
+ *  tw-text-blue span, the tooltip its repo.branch.restore text. Rendered
+ *  for writers on NON-protected deleted rows only (the module header's
+ *  gate); the POST seam itself is the orchestrator's fold (the module
+ *  header's HANDOFF). */
+function BranchRestoreForm(props: { repoLink: string; branchId: number; name: string }) {
+  return (
+    <form method="post" action={`${props.repoLink}/branches/restore`} class="tw-inline-block">
+      <input type="hidden" name="branch_id" value={props.branchId} />
+      <button
+        type="submit"
+        class="btn interact-bg tw-p-2 restore-branch-button"
+        aria-label={branchesLocale.restore_branch_aria(props.name)}
+        title={branchesLocale.restore_branch_aria(props.name)}
+        data-tooltip-content={branchesLocale.restore_branch_aria(props.name)}
+      >
+        <span class="tw-text-blue">
+          <Icon name="octicon-reply" />
+        </span>
+      </button>
+    </form>
+  );
+}
+
 /** The Older/Newer pager preserving `?q=` (the explore/commits DOM shape,
  *  driven by the `more` flag). */
 export function BranchesPagination(props: { basePath: string; keyword: string; page: number; more: boolean }) {
@@ -985,8 +1175,25 @@ export function BranchesPagination(props: { basePath: string; keyword: string; p
 }
 
 /** The flash block (the display-only-param reduction — `?deleted=` /
- *  `?delete_error=&name=` carry upstream DeleteBranchPost's texts). */
-function BranchesFlash(props: { deleted: string | null; errorKind: string | null; errorName: string }) {
+ *  `?delete_error=&name=` carry upstream DeleteBranchPost's texts; the
+ *  restore arms ride `?restored=` / `?restore_error=already_exists|failed
+ *  &name=` — RestoreBranchPost's texts, the same convention). The restore
+ *  params are OPTIONAL so the current index.ts call site compiles
+ *  unchanged; the orchestrator's fold wires the two reads (the module
+ *  header's HANDOFF). */
+export interface BranchesFlashParams {
+  deleted: string | null;
+  errorKind: string | null;
+  errorName: string;
+  /** `?restored={name}` — the restore_success flash. */
+  restored?: string | null;
+  /** `?restore_error=already_exists|failed&name={name}` — the two restore
+   *  failure arms (the protected-name refusal folds into `failed`, the
+   *  module's mapping). */
+  restoreError?: string | null;
+}
+
+export function BranchesFlash(props: BranchesFlashParams) {
   if (props.deleted !== null) {
     return <div class="ui info message">{branchesLocale.deletion_success(props.deleted)}</div>;
   }
@@ -999,13 +1206,22 @@ function BranchesFlash(props: { deleted: string | null; errorKind: string | null
   if (props.errorKind === "failed") {
     return <div class="ui negative message">{branchesLocale.deletion_failed(props.errorName)}</div>;
   }
+  if (props.restored != null && props.restored !== "") {
+    return <div class="ui info message">{branchesLocale.restore_success(props.restored)}</div>;
+  }
+  if (props.restoreError === "already_exists") {
+    return <div class="ui negative message">{branchesLocale.already_exists(props.errorName)}</div>;
+  }
+  if (props.restoreError === "failed") {
+    return <div class="ui negative message">{branchesLocale.restore_failed(props.errorName)}</div>;
+  }
   return null;
 }
 
 /** The full-document render (the render.tsx pattern). `canAdmin` gates the
  *  Switch Default Branch link (the settings page's own gate — the module
  *  header's divergence note). */
-export function renderBranchesPage(options: { ctx: UiContext; data: BranchesData; canAdmin: boolean; flash: { deleted: string | null; errorKind: string | null; errorName: string } }): string {
+export function renderBranchesPage(options: { ctx: UiContext; data: BranchesData; canAdmin: boolean; flash: BranchesFlashParams }): string {
   return renderPage(
     <BranchesPage ctx={options.ctx} data={options.data} canAdmin={options.canAdmin} flash={options.flash} />,
   );
@@ -1013,7 +1229,7 @@ export function renderBranchesPage(options: { ctx: UiContext; data: BranchesData
 
 /** The branches page (§2.4.1 discriminator: list.tmpl's literal
  *  `ui repository branches`). */
-export function BranchesPage(props: { ctx: UiContext; data: BranchesData; canAdmin: boolean; flash: { deleted: string | null; errorKind: string | null; errorName: string } }) {
+export function BranchesPage(props: { ctx: UiContext; data: BranchesData; canAdmin: boolean; flash: BranchesFlashParams }) {
   const { ctx, data } = props;
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("BranchesPage requires ctx.repo");
@@ -1136,7 +1352,9 @@ export function BranchesPage(props: { ctx: UiContext; data: BranchesData; canAdm
                   <td class="three wide tw-text-right">
                     <BranchPrCell
                       repoLink={repoLink}
-                      row={row}
+                      branchName={row.name}
+                      ahead={row.divergence?.ahead ?? -1}
+                      pr={row.latestPr}
                       defaultBranch={data.defaultBranch ?? repo.defaultBranch}
                       allowsPulls={data.allowsPulls}
                       canPull={data.canWrite}
@@ -1157,6 +1375,48 @@ export function BranchesPage(props: { ctx: UiContext; data: BranchesData; canAdm
                           button there was a dead control (the branches
                           matrix's RED). */}
                       {row.canDelete && !repo.isArchived ? <BranchDeleteForm repoLink={repoLink} name={row.name} /> : null}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+              {/* list.tmpl:93-99's IsDeleted arm, rendered in the SAME table
+                  (upstream's `is_deleted ASC` order puts them after the live
+                  rows — the loader composes the page universe that way): the
+                  plain-text name (the ref is gone — no tree link; the
+                  per-name copy button stays the header's clipboard
+                  reduction), the Deleted-by info line in place of the commit
+                  line, an empty divergence cell (upstream skips the walk —
+                  the -1 default), the PR cell over its shared scan (a
+                  deleted name can carry one), then the actions cell: the
+                  ungated RSS anchor (list.tmpl:172-174 carries no
+                  IsDeleted condition — the feed itself 404s the gone ref,
+                  upstream-identical) and the restore control (writer +
+                  non-protected; the POST seam is the module header's
+                  HANDOFF). */}
+              {data.deletedRows.map((row) => (
+                <tr>
+                  <td class="eight wide">
+                    <div class="flex-text-block">
+                      <span class="gt-ellipsis branch-name">{row.name}</span>
+                    </div>
+                    <BranchDeletedInfo deletedByName={row.deletedByName} deletedUnix={row.deletedUnix} />
+                  </td>
+                  <td class="two wide" />
+                  <td class="three wide tw-text-right">
+                    <BranchPrCell
+                      repoLink={repoLink}
+                      branchName={row.name}
+                      ahead={-1}
+                      pr={row.latestPr}
+                      defaultBranch={data.defaultBranch ?? repo.defaultBranch}
+                      allowsPulls={data.allowsPulls}
+                      canPull={data.canWrite}
+                    />
+                  </td>
+                  <td class="three wide">
+                    <div class="tw-flex tw-flex-wrap tw-justify-end">
+                      <BranchRssButton repoLink={repoLink} name={row.name} />
+                      {writerControls && !row.isProtected ? <BranchRestoreForm repoLink={repoLink} branchId={row.id} name={row.name} /> : null}
                     </div>
                   </td>
                 </tr>
