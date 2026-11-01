@@ -363,16 +363,20 @@ function DeleteBreadcrumb(props: { repoSlug: string; branchHref: string; treePat
 /** The full-document DELETE confirm render. `data`/`form` are the FAMILY
  *  types (loadFileEditorData("delete") / EditorFormValues / readEditorForm) —
  *  the dispatcher swapped in this render (MOUNTED at 1d834d6, the mount
- *  record). `fork` is the fork-to-edit overlay (pages/repo-editor-fork.tsx). */
+ *  record). `fork` is the fork-to-edit overlay (pages/repo-editor-fork.tsx).
+ *  `showFileTree` is the sidebar's initial visibility (delete.tmpl:7 renders
+ *  view_file_tree under editor.go:44's switch — absent = the default-true
+ *  posture, the dispatch seam feeds the stored read-back). */
 export function renderEditorDeletePage(options: {
   ctx: UiContext;
   data: FileEditorData;
   form: EditorFormValues;
   error: string | null;
   fork?: EditorForkOverlay | null;
+  showFileTree?: boolean;
 }): string {
   return renderPage(
-    <EditorDeleteConfirmPage ctx={options.ctx} data={options.data} form={options.form} error={options.error} fork={options.fork ?? null} />,
+    <EditorDeleteConfirmPage ctx={options.ctx} data={options.data} form={options.form} error={options.error} fork={options.fork ?? null} showFileTree={options.showFileTree} />,
   );
 }
 
@@ -384,8 +388,10 @@ export function renderEditorDeletePage(options: {
  *  WillSubmitToFork arm — the overlay's TargetFormAction + the fork's
  *  branch select + the common_top banner (the caller folds the fork's
  *  default branch into `form.branch`); breadcrumb/sidebar/cancel stay
- *  BASE-anchored (upstream renders them against ctx.Repo too). */
-export function EditorDeleteConfirmPage(props: { ctx: UiContext; data: FileEditorData; form: EditorFormValues; error: string | null; fork?: EditorForkOverlay | null }) {
+ *  BASE-anchored (upstream renders them against ctx.Repo too).
+ *  `showFileTree` threads the editor.go:44 sidebar switch into the shared
+ *  FileTreeSidebar (default true — view_home.go:363-370). */
+export function EditorDeleteConfirmPage(props: { ctx: UiContext; data: FileEditorData; form: EditorFormValues; error: string | null; fork?: EditorForkOverlay | null; showFileTree?: boolean }) {
   const { ctx, data, form } = props;
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("EditorDeleteConfirmPage requires ctx.repo");
@@ -409,6 +415,7 @@ export function EditorDeleteConfirmPage(props: { ctx: UiContext; data: FileEdito
             dirPath={data.dirPath}
             siblings={data.siblings}
             activeName={data.treePath.split("/").pop() ?? ""}
+            showFileTree={props.showFileTree}
           />
           <div class="repo-view-content">
             <form class="ui form form-fetch-action" method="post" action={action}>
@@ -516,16 +523,20 @@ function UploadDropzone(props: { repoLink: string }) {
 /** The full-document UPLOAD confirm render (the staging family LANDED —
  *  MOUNTED at 1d834d6, the mount record; the POST writes through
  *  `commitUploadFromForm`). `fork` is the fork-to-edit overlay
- *  (pages/repo-editor-fork.tsx). */
+ *  (pages/repo-editor-fork.tsx). `showFileTree` is the sidebar's initial
+ *  visibility (upload.tmpl:7 renders view_file_tree under editor.go:44's
+ *  switch — absent = the default-true posture, the dispatch seam feeds the
+ *  stored read-back). */
 export function renderEditorUploadPage(options: {
   ctx: UiContext;
   data: EditorUploadData;
   form: EditorUploadFormValues;
   error: string | null;
   fork?: EditorForkOverlay | null;
+  showFileTree?: boolean;
 }): string {
   return renderPage(
-    <EditorUploadConfirmPage ctx={options.ctx} data={options.data} form={options.form} error={options.error} fork={options.fork ?? null} />,
+    <EditorUploadConfirmPage ctx={options.ctx} data={options.data} form={options.form} error={options.error} fork={options.fork ?? null} showFileTree={options.showFileTree} />,
   );
 }
 
@@ -537,8 +548,9 @@ export function renderEditorUploadPage(options: {
  *  the overlay's TargetFormAction + the fork's branch select + the
  *  common_top banner; the dropzone stays BASE-anchored exactly like
  *  upstream (repo/upload.tmpl's `{{.RepoLink}}` arm — ctx.Repo stays base;
- *  the module header). */
-export function EditorUploadConfirmPage(props: { ctx: UiContext; data: EditorUploadData; form: EditorUploadFormValues; error: string | null; fork?: EditorForkOverlay | null }) {
+ *  the module header). `showFileTree` threads the editor.go:44 sidebar
+ *  switch into the shared FileTreeSidebar (default true). */
+export function EditorUploadConfirmPage(props: { ctx: UiContext; data: EditorUploadData; form: EditorUploadFormValues; error: string | null; fork?: EditorForkOverlay | null; showFileTree?: boolean }) {
   const { ctx, data, form } = props;
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("EditorUploadConfirmPage requires ctx.repo");
@@ -563,6 +575,7 @@ export function EditorUploadConfirmPage(props: { ctx: UiContext; data: EditorUpl
             dirPath={data.treePath}
             siblings={data.siblings}
             activeName=""
+            showFileTree={props.showFileTree}
           />
           <div class="repo-view-content">
             <form class="ui form form-fetch-action repo-file-upload" method="post" action={action}>

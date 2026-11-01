@@ -22,6 +22,21 @@
  * shape), the `lines-num` cell (L{n} span, data-line-number) and the
  * `lines-code` cell (code-inner).
  *
+ * ## The sidebar's initial visibility (blame.go:65)
+ *
+ * The blame page renders through view.tmpl (tplRepoView), whose view_file_tree
+ * inclusion (view.tmpl:20) is armed by prepareHomeTreeSideBarSwitch
+ * (blame.go:65 — the same view_home.go:360-371 read-back the file view
+ * threads): the sidebar container's `tw-hidden` rides the stored
+ * code_view.show_file_tree here too. The page threads the optional
+ * `showFileTree` prop (file-view.tsx's FileTreeSidebar conditional —
+ * view_file_tree.tmpl:1, default true, the GetUserSetting default) through
+ * renderBlamePage; the route dispatch feeds it through
+ * loadFileTreeVisibility exactly like render.tsx's src case (the blame
+ * reader-semantics pins ride the shared function). Until the dispatch arm
+ * lands, the prop rides absent and the rendered bytes keep the
+ * default-true posture (view_home.go:363-370).
+ *
  * ## Data (§3.2 — the landed engine reads, never a self-fetch)
  *
  * `engine.blame(ref, treePath)` (ui/engine.ts) for the runs + commit
@@ -297,14 +312,18 @@ function absoluteLineNumber(result: BlameResult, partIdx: number, lineIdx: numbe
   return result.firstLine + n;
 }
 
-/** The full-document render (the render.tsx pattern). */
-export function renderBlamePage(options: { ctx: UiContext; data: BlamePageData }): string {
-  return renderPage(<BlamePage ctx={options.ctx} data={options.data} />);
+/** The full-document render (the render.tsx pattern). `showFileTree` is the
+ *  sidebar's initial visibility (view_file_tree.tmpl:1's conditional — the
+ *  blame.go:65 switch; absent = the default-true posture, the dispatch seam
+ *  feeds the stored read-back — the module header). */
+export function renderBlamePage(options: { ctx: UiContext; data: BlamePageData; showFileTree?: boolean }): string {
+  return renderPage(<BlamePage ctx={options.ctx} data={options.data} showFileTree={options.showFileTree} />);
 }
 
 /** The blame page (§2.4.1 discriminator: view.tmpl:2's `repository file list
- *  blame`). */
-export function BlamePage(props: { ctx: UiContext; data: BlamePageData }) {
+ *  blame`). `showFileTree` threads the blame.go:65 sidebar switch into the
+ *  shared FileTreeSidebar (default true — view_home.go:363-370). */
+export function BlamePage(props: { ctx: UiContext; data: BlamePageData; showFileTree?: boolean }) {
   const { ctx, data } = props;
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("BlamePage requires ctx.repo");
@@ -332,6 +351,7 @@ export function BlamePage(props: { ctx: UiContext; data: BlamePageData }) {
             dirPath={data.treePath.includes("/") ? data.treePath.split("/").slice(0, -1).join("/") : ""}
             siblings={data.siblings}
             activeName={data.treePath.split("/").pop() ?? ""}
+            showFileTree={props.showFileTree}
           />
           <div class="repo-view-content">
             <BlameFileView repoLink={repoLink} data={data} />

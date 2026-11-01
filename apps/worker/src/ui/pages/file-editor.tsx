@@ -35,7 +35,16 @@
  * then commit_form.tmpl: `h3` "Commit Changes", the `commit_summary` input
  * (maxlength 100, placeholder = the upstream default message), the
  * `commit_message` textarea (rows 5), the target-branch select, the submit
- * + cancel pair.
+ * + cancel pair. The sidebar's INITIAL visibility rides the same upstream
+ * switch as the file view: prepareEditorPage runs prepareHomeTreeSideBarSwitch
+ * (editor.go:44 — the same view_home.go:360-371 read-back) before every
+ * editor template, so the optional `showFileTree` prop threads the stored
+ * code_view.show_file_tree into FileTreeSidebar here too (the delete/upload
+ * tails are repo-editor-tails.tsx's twins; cherrypick/patch run the switch
+ * but their templates render no view_file_tree). The route dispatch feeds it
+ * through loadFileTreeVisibility like render.tsx's src case; until that arm
+ * lands, the prop rides absent and the bytes keep the default-true posture
+ * (view_home.go:363-370).
  *
  * ## Write path (§3.2 — the landed contents write service, never a self-fetch)
  *
@@ -560,15 +569,18 @@ function EditorCommitForm(props: { action: string; branches: readonly string[]; 
  *  carries the structure (branches, sidebar, refusals); `fork` is the
  *  fork-to-edit overlay (pages/repo-editor-fork.tsx — WillSubmitToFork:
  *  the action onto the fork's editor route + the fork's branch select +
- *  common_top's banner; absent = byte-identical). */
+ *  common_top's banner; absent = byte-identical). `showFileTree` is the
+ *  sidebar's initial visibility (editor.go:44's switch — absent = the
+ *  default-true posture, the dispatch seam feeds the stored read-back). */
 export function renderFileEditorPage(options: {
   ctx: UiContext;
   data: FileEditorData;
   form: EditorFormValues;
   error: string | null;
   fork?: EditorForkOverlay | null;
+  showFileTree?: boolean;
 }): string {
-  return renderPage(<FileEditorPage ctx={options.ctx} data={options.data} form={options.form} error={options.error} fork={options.fork ?? null} />);
+  return renderPage(<FileEditorPage ctx={options.ctx} data={options.data} form={options.form} error={options.error} fork={options.fork ?? null} showFileTree={options.showFileTree} />);
 }
 
 /** The editor page (§2.4.1 discriminator: edit.tmpl:4's
@@ -580,8 +592,10 @@ export function renderFileEditorPage(options: {
  *  default branch into `form.branch`), and common_top's banner renders as
  *  the form's first child (all five upstream editor templates include it).
  *  The breadcrumb/sidebar/cancel stay BASE-anchored — upstream renders
- *  them against ctx.Repo (the base) too. */
-export function FileEditorPage(props: { ctx: UiContext; data: FileEditorData; form: EditorFormValues; error: string | null; fork?: EditorForkOverlay | null }) {
+ *  them against ctx.Repo (the base) too. `showFileTree` threads the
+ *  editor.go:44 sidebar switch into the shared FileTreeSidebar (default
+ *  true — view_home.go:363-370). */
+export function FileEditorPage(props: { ctx: UiContext; data: FileEditorData; form: EditorFormValues; error: string | null; fork?: EditorForkOverlay | null; showFileTree?: boolean }) {
   const { ctx, data, form } = props;
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("FileEditorPage requires ctx.repo");
@@ -613,6 +627,7 @@ export function FileEditorPage(props: { ctx: UiContext; data: FileEditorData; fo
             dirPath={data.dirPath}
             siblings={data.siblings}
             activeName={data.treePath.split("/").pop() ?? ""}
+            showFileTree={props.showFileTree}
           />
           <div class="repo-view-content">
             <form class="ui edit form" method="post" action={action}>

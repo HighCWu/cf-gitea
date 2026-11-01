@@ -46,10 +46,14 @@
  * "false" hides it — view_home.go:360-371 verbatim). The pair renders only
  * on BLOB views (the only views whose sidebar exists — a toggle with no
  * container would be a dead control), so the read-back runs on blob views
- * only; a tree view costs zero KV reads. The blame (blame.go:65) and edit
- * (editor.go:44) sidebars ride the same upstream switch — their pages'
- * threading is a disclosed follow-up (outside this module's wave
- * ownership); their FileTreeSidebar calls stay at the default-true posture.
+ * only; a tree view costs zero KV reads. The blame (blame.go:65) and editor
+ * (editor.go:44 — edit/new/delete through edit.tmpl:7 plus the delete/upload
+ * tails; cherrypick/patch run the switch but render no view_file_tree)
+ * sidebars ride the same upstream switch — their pages now thread the same
+ * optional prop through their own render seams (blame.tsx, file-editor.tsx,
+ * repo-editor-tails.tsx, default true); the stored read-back feeds at their
+ * dispatch seams, and until that router arm lands those pages keep the
+ * default-true bytes.
  */
 
 import type { CommitJson, TreeEntryJson } from "@cf-gitea/git-engine";

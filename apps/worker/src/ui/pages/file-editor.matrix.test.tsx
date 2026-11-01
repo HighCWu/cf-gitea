@@ -48,14 +48,18 @@
 import { env } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
 import { and, eq } from "drizzle-orm";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { repositories, users } from "../../db/schema";
+import { repositories, userSettingsKv, users } from "../../db/schema";
+import { engineClient } from "../engine";
 import { handlesUiRoute, parseUiRoute, uiRouter } from "../index";
+import { editorFormFromData, loadFileEditorData, renderFileEditorPage } from "./file-editor";
+import { loadFileTreeVisibility } from "./file-view";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
+import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import { ensureSeededRepo, type SeedCommit } from "../testing/seed-repo";
-import { T0, uiEnv } from "../__tests__/harness";
+import { manifest, T0, uiEnv } from "../__tests__/harness";
 
 async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
   return uiRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
@@ -631,5 +635,82 @@ describe("the commit-form validation arms (the edit-mode ghost branch, the defau
     // serializer terminates with \n).
     const log = await env.REPO.getByName("alice/feditor").listLog("main", { path: "notes/editor.txt", ofs: 0, n: 1 });
     expect(log?.commits[0]?.message.replace(/\n$/, "")).toBe("Update 'notes/editor.txt'\n\nmatrix body-only note");
+  });
+});
+
+// --- the editor sidebar's showFileTree arm (editor.go:44 — the page-module seam) --
+
+/**
+ * editor.go:44's prepareEditorPage runs prepareHomeTreeSideBarSwitch before
+ * every editor page, so edit.tmpl:7's view_file_tree rides the SAME stored
+ * code_view.show_file_tree as the file view (render.test.tsx pins the
+ * reader's semantics and the src feed). The ROUTE dispatch does not feed the
+ * prop yet (the router's editor cases are a separate wave), so this sidebar
+ * arm pins the page-module seam: the real reader (file-view.tsx's
+ * loadFileTreeVisibility over REAL D1) computes the value and
+ * renderFileEditorPage threads it into the shared FileTreeSidebar
+ * (view_file_tree.tmpl:1's conditional); the prop ABSENT keeps the current
+ * dispatch bytes (the default-true interim posture).
+ */
+describe("the editor sidebar's showFileTree arm (editor.go:44 — the page-module seam)", () => {
+  const TREEVIS_KEY = "code_view.show_file_tree";
+
+  let aliceId: number;
+
+  beforeAll(async () => {
+    await ensureFeditorFixtures();
+    const alice = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "alice")).get();
+    if (alice === undefined) throw new Error("feditor owner row missing");
+    aliceId = alice.id;
+  });
+
+  beforeEach(async () => {
+    await drizzle(env.DB)
+      .delete(userSettingsKv)
+      .where(and(eq(userSettingsKv.userId, aliceId), eq(userSettingsKv.settingKey, TREEVIS_KEY)));
+  });
+
+  async function storePref(value: string): Promise<void> {
+    await drizzle(env.DB)
+      .insert(userSettingsKv)
+      .values({ userId: aliceId, settingKey: TREEVIS_KEY, settingValue: value })
+      .onConflictDoUpdate({ target: [userSettingsKv.userId, userSettingsKv.settingKey], set: { settingValue: value } });
+  }
+
+  /** The edit-mode bench render through the module's render entry (the
+   *  feditor fixture's engine cell + repo row). */
+  async function editBenchHtml(showFileTree?: boolean): Promise<string> {
+    const row = (
+      await drizzle(env.DB)
+        .select()
+        .from(repositories)
+        .where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "feditor")))
+        .get()
+    )!;
+    const data = await loadFileEditorData(engineClient(env, "alice/feditor"), row, "edit", "main/notes/editor.txt", null);
+    if ("notFound" in data) throw new Error("expected edit data for the bench render");
+    const ctx: UiContext = {
+      viewer: { kind: "user", id: aliceId, username: "alice", isAdmin: false },
+      origin: "https://test.local",
+      assets: shellAssetsFromManifest(manifest),
+      repo: row,
+    };
+    return renderFileEditorPage({ ctx, data, form: editorFormFromData(data), error: null, showFileTree });
+  }
+
+  it("a stored-false viewer's editor view renders the sidebar hidden (the reader feeds the prop)", async () => {
+    await storePref("false");
+    const visibility = await loadFileTreeVisibility(env.DB, { kind: "user", id: aliceId, username: "alice", isAdmin: false });
+    expect(visibility).toBe(false);
+    const html = await editBenchHtml(visibility);
+    expect(html).toContain('<div class="repo-view-file-tree-container tw-hidden">');
+    expect(html).not.toContain('<div class="repo-view-file-tree-container">');
+  });
+
+  it("the prop ABSENT keeps today's dispatch bytes (the default-true interim posture)", async () => {
+    const html = await editBenchHtml();
+    expect(html).toContain('<div class="repo-view-file-tree-container">');
+    expect(html).not.toContain('<div class="repo-view-file-tree-container tw-hidden">');
+    expect(html).toContain('data-toggle-action="hide"');
   });
 });

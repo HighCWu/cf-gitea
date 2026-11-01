@@ -30,17 +30,21 @@
 import { env, SELF } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
 import { and, eq } from "drizzle-orm";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
 import { settleCreatingRepo } from "../../git-http/gate";
-import { repositories, users } from "../../db/schema";
+import { repositories, userSettingsKv, users } from "../../db/schema";
 import { RepoService } from "../../repos/service";
+import { engineClient } from "../engine";
 import { handlesUiRoute, parseUiRoute, uiRouter } from "../index";
+import { loadBlameData, renderBlamePage } from "../pages/blame";
+import { loadFileTreeVisibility } from "../pages/file-view";
+import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import { runA11y } from "./a11y";
 import { buildHistoryPack, buildReceivePackBody, type SeedCommit } from "../testing/seed-repo";
-import { T0, uiEnv } from "./harness";
+import { manifest, T0, uiEnv } from "./harness";
 
 async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
   return uiRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
@@ -317,5 +321,107 @@ describe("wave-54 a11y smoke", () => {
     expect(res.status).toBe(200);
     const violations = runA11y(await res.text());
     expect(violations, JSON.stringify(violations)).toEqual([]);
+  });
+});
+
+// --- the blame sidebar's showFileTree thread (blame.go:65's switch) --------------
+
+/**
+ * blame.go:65's prepareHomeTreeSideBarSwitch arms view.tmpl:20's
+ * view_file_tree for the blame view — the SAME stored
+ * code_view.show_file_tree the file view's src case reads back
+ * (render.test.tsx pins the reader's semantics and the src feed). The ROUTE
+ * dispatch does not feed the prop yet (the router's blame case is a separate
+ * wave), so these pins ride the page-module seam: the real reader
+ * (file-view.tsx's loadFileTreeVisibility, over REAL D1 — anonymous answers
+ * true with zero reads) computes the value and renderBlamePage threads it
+ * into the shared FileTreeSidebar (view_file_tree.tmpl:1's conditional).
+ * Default arms: the prop ABSENT (the current dispatch bytes) and the
+ * stored-true/anonymous renders keep the container plain; a stored-false
+ * viewer's blame view renders the container `tw-hidden` (the hide button's
+ * markup still renders inside — upstream's template posture).
+ */
+describe("the blame sidebar's showFileTree thread (blame.go:65 — the page-module seam)", () => {
+  const TREEVIS_KEY = "code_view.show_file_tree";
+
+  let aliceId: number;
+
+  beforeAll(async () => {
+    await tips(); // the wave54blame fixture (repo row + owner)
+    const alice = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "alice")).get();
+    if (alice === undefined) throw new Error("wave54blame owner row missing");
+    aliceId = alice.id;
+  });
+
+  beforeEach(async () => {
+    await drizzle(env.DB)
+      .delete(userSettingsKv)
+      .where(and(eq(userSettingsKv.userId, aliceId), eq(userSettingsKv.settingKey, TREEVIS_KEY)));
+  });
+
+  async function storePref(value: string): Promise<void> {
+    await drizzle(env.DB)
+      .insert(userSettingsKv)
+      .values({ userId: aliceId, settingKey: TREEVIS_KEY, settingValue: value })
+      .onConflictDoUpdate({ target: [userSettingsKv.userId, userSettingsKv.settingKey], set: { settingValue: value } });
+  }
+
+  /** The bench render inputs (the page module's seams — no route): the
+   *  blame loader over the real seeded cell + a bench ctx carrying the
+   *  fixture repo row. */
+  async function blameBench(): Promise<{ html: (showFileTree?: boolean) => string }> {
+    const row = (
+      await drizzle(env.DB)
+        .select()
+        .from(repositories)
+        .where(and(eq(repositories.ownerNamespace, "alice"), eq(repositories.slug, "wave54blame")))
+        .get()
+    )!;
+    const data = await loadBlameData(engineClient(env, "alice/wave54blame"), row, "branch/main/story.txt");
+    if ("notFound" in data) throw new Error("expected blame data for the bench render");
+    const ctx: UiContext = {
+      viewer: { kind: "user", id: aliceId, username: "alice", isAdmin: false },
+      origin: "https://test.local",
+      assets: shellAssetsFromManifest(manifest),
+      repo: row,
+    };
+    return { html: (showFileTree?: boolean) => renderBlamePage({ ctx, data, showFileTree }) };
+  }
+
+  it("a stored-false viewer's blame view renders the sidebar hidden (the reader feeds the prop)", async () => {
+    await storePref("false");
+    const visibility = await loadFileTreeVisibility(env.DB, { kind: "user", id: aliceId, username: "alice", isAdmin: false });
+    expect(visibility).toBe(false);
+    const { html } = await blameBench();
+    expect(html(visibility)).toContain('<div class="repo-view-file-tree-container tw-hidden">');
+    expect(html(visibility)).not.toContain('<div class="repo-view-file-tree-container">');
+    // The hide button's MARKUP still renders inside the hidden container —
+    // upstream's template does the same (the class hides it).
+    expect(html(visibility)).toContain('data-toggle-action="hide"');
+  });
+
+  it("stored-true keeps the tree shown (the reader answers true, the container renders plain)", async () => {
+    await storePref("true");
+    const visibility = await loadFileTreeVisibility(env.DB, { kind: "user", id: aliceId, username: "alice", isAdmin: false });
+    expect(visibility).toBe(true);
+    const { html } = await blameBench();
+    expect(html(visibility)).toContain('<div class="repo-view-file-tree-container">');
+    expect(html(visibility)).not.toContain('<div class="repo-view-file-tree-container tw-hidden">');
+  });
+
+  it("anonymous answers true WITHOUT consulting the store (a stored-false row ignored) and renders the default", async () => {
+    await storePref("false");
+    const visibility = await loadFileTreeVisibility(env.DB, { kind: "anonymous" });
+    expect(visibility).toBe(true);
+    const { html } = await blameBench();
+    expect(html(visibility)).toContain('<div class="repo-view-file-tree-container">');
+    expect(html(visibility)).not.toContain('<div class="repo-view-file-tree-container tw-hidden">');
+  });
+
+  it("the prop ABSENT keeps today's dispatch bytes (the default-true interim posture)", async () => {
+    const { html } = await blameBench();
+    expect(html()).toContain('<div class="repo-view-file-tree-container">');
+    expect(html()).not.toContain('<div class="repo-view-file-tree-container tw-hidden">');
+    expect(html()).toContain('data-toggle-action="hide"');
   });
 });

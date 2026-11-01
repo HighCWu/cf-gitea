@@ -13,15 +13,16 @@
 import { env } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
 import { and, eq } from "drizzle-orm";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { repositories, users } from "../../db/schema";
+import { repositories, userSettingsKv, users } from "../../db/schema";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import { uiRouter } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { engineClient } from "../engine";
+import { loadFileTreeVisibility } from "./file-view";
 import { uiEnv } from "../__tests__/harness";
 import { ensureSeededRepo, type SeedCommit } from "../testing/seed-repo";
 import {
@@ -371,5 +372,80 @@ describe("renderEditorUploadPage (upload.tmpl's faithful DOM, documented-unrende
     expect(html).toContain('<input type="hidden" id="tree_path" name="tree_path" value="notes"/>');
     expect(html).toContain('placeholder="Upload files to &quot;notes&quot;"');
     expect(html).toContain('href="/alice/editortails/src/branch/main/notes"');
+  });
+});
+
+// --- the tails' sidebar showFileTree arm (editor.go:44 — the page-module seam) ----
+
+/**
+ * Both tails render view_file_tree (delete.tmpl:7, upload.tmpl:7) under
+ * prepareEditorPage's prepareHomeTreeSideBarSwitch (editor.go:44 — the SAME
+ * stored code_view.show_file_tree the file view reads back; render.test.tsx
+ * pins the reader's semantics and the src feed). The ROUTE dispatch does not
+ * feed the prop yet (the router's editor cases are a separate wave), so this
+ * sidebar arm pins the page-module seam: the real reader (file-view.tsx's
+ * loadFileTreeVisibility over REAL D1) computes the value and the two render
+ * entries thread it into the shared FileTreeSidebar (view_file_tree.tmpl:1's
+ * conditional); the prop ABSENT keeps the current dispatch bytes (the
+ * default-true interim posture).
+ */
+describe("the tails' sidebar showFileTree arm (editor.go:44 — the page-module seam)", () => {
+  const TREEVIS_KEY = "code_view.show_file_tree";
+
+  let ownerId: number;
+
+  beforeAll(async () => {
+    const { ctx } = await ensureFixtures();
+    if (ctx.viewer.kind !== "user") throw new Error("expected the user-viewer fixture");
+    ownerId = ctx.viewer.id;
+  });
+
+  beforeEach(async () => {
+    await drizzle(env.DB)
+      .delete(userSettingsKv)
+      .where(and(eq(userSettingsKv.userId, ownerId), eq(userSettingsKv.settingKey, TREEVIS_KEY)));
+  });
+
+  async function storePref(value: string): Promise<void> {
+    await drizzle(env.DB)
+      .insert(userSettingsKv)
+      .values({ userId: ownerId, settingKey: TREEVIS_KEY, settingValue: value })
+      .onConflictDoUpdate({ target: [userSettingsKv.userId, userSettingsKv.settingKey], set: { settingValue: value } });
+  }
+
+  async function deleteBenchHtml(showFileTree?: boolean): Promise<string> {
+    const { ctx, repoRow } = await ensureFixtures();
+    const data = await loadFileEditorData(tailsEngine(), repoRow, "delete", "main/notes/editor.txt", null);
+    if ("notFound" in data) throw new Error("expected delete data for the bench render");
+    return renderEditorDeletePage({ ctx, data, form: editorFormFromData(data), error: null, showFileTree });
+  }
+
+  async function uploadBenchHtml(showFileTree?: boolean): Promise<string> {
+    const { ctx, repoRow } = await ensureFixtures();
+    const data = await loadEditorUploadData(tailsEngine(), repoRow, "main");
+    if ("notFound" in data) throw new Error("expected upload data for the bench render");
+    return renderEditorUploadPage({ ctx, data, form: uploadFormFromData(data), error: null, showFileTree });
+  }
+
+  it("a stored-false viewer's delete + upload confirms render the sidebar hidden (the reader feeds the prop)", async () => {
+    await storePref("false");
+    const visibility = await loadFileTreeVisibility(env.DB, { kind: "user", id: ownerId, username: "alice", isAdmin: false });
+    expect(visibility).toBe(false);
+    const deleteHtml = await deleteBenchHtml(visibility);
+    expect(deleteHtml).toContain('<div class="repo-view-file-tree-container tw-hidden">');
+    expect(deleteHtml).not.toContain('<div class="repo-view-file-tree-container">');
+    const uploadHtml = await uploadBenchHtml(visibility);
+    expect(uploadHtml).toContain('<div class="repo-view-file-tree-container tw-hidden">');
+    expect(uploadHtml).not.toContain('<div class="repo-view-file-tree-container">');
+  });
+
+  it("the prop ABSENT keeps today's dispatch bytes on both confirms (the default-true interim posture)", async () => {
+    const deleteHtml = await deleteBenchHtml();
+    expect(deleteHtml).toContain('<div class="repo-view-file-tree-container">');
+    expect(deleteHtml).not.toContain('<div class="repo-view-file-tree-container tw-hidden">');
+    const uploadHtml = await uploadBenchHtml();
+    expect(uploadHtml).toContain('<div class="repo-view-file-tree-container">');
+    expect(uploadHtml).not.toContain('<div class="repo-view-file-tree-container tw-hidden">');
+    expect(uploadHtml).toContain('data-toggle-action="hide"');
   });
 });
