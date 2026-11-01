@@ -72,6 +72,40 @@
  * (webfinger.go:116), gate-open only — the discovery tier is the gate's
  * payload, disabled = absent.
  *
+ * TIER B (SPEC §6.2, W-B2/W-B3/W-B4 as-built 2026-11-01 — the user's
+ * completion directive un-parked OQ-1's data plane within this SPEC's
+ * staged posture): the activitypub wildcard 501 RETIRES into the pre-stub
+ * (`1592576fa5^`) registration shape — the ONLY endpoints upstream's
+ * deleted tree ever carried:
+ *
+ *   GET  /api/v1/activitypub/user-id/{id}         → the Person actor
+ *          (person.go:20-79; services/federation/activitypub.ts builds it,
+ *          the RSA-3072 keypair lazily generated in user_settings_kv).
+ *   POST /api/v1/activitypub/user-id/{id}/inbox   → ReqHTTPSignature
+ *          (reqsignature.go, ported in services/federation/httpsig.ts) →
+ *          PersonInbox: a verified Follow answers 200 with an inline
+ *          Accept activity (the user's completion directive — NO follower
+ *          store: no sanctioned table exists and no migration is granted,
+ *          so the acceptance is NOT persisted; see SPEC §6.2 as-built);
+ *          every other verified activity keeps upstream's 204 black hole
+ *          (PersonInbox's entire body, person.go:81-96).
+ *
+ * chi-exact dispatch per armed path (the Group-folds-middleware mechanics
+ * from the Tier A header): chiUnknownMethodGuard (the pre-tree bare 405) →
+ * federationApiGate (disabled = the whole group unregistered → the router's
+ * native 404 for every known method) → the method guard (a known method the
+ * endpoint doesn't register → chi's methodNotAllowedHandler: empty body +
+ * Allow, NO further middleware — the gate never runs for an unresolved
+ * method) → the inline activitypub scope gate (api.go:1009's
+ * tokenRequiresScopes, folded into the endpoint) → the handler. Every
+ * UNREGISTERED /activitypub/* sub-path (incl. the deprecated pre-stub
+ * `/user/{username}` form — upstream's own "remove in 1.20" note at
+ * api.go:941-945, a removal completed at birth here) falls to the router's
+ * native not-found, upstream's unregistered-path posture (init.go's
+ * GlobalNotFound; the house-native 404 equivalence Tier A recorded).
+ * `/api/v1/nodeinfo` stays the W-B1 501 stub (that wave was not in this
+ * dispatch's scope).
+ *
  * INTEGRATION (orchestrator-owned — src/index.ts + api/router.ts, untouched
  * here; the HANDOFF lines live in specs/federation.md §6.1): the dispatcher's
  * repo-scoped branch (segments.length >= 2) currently hands /.well-known/*
@@ -98,6 +132,17 @@ import {
 } from "../../ui/session";
 import type { UserVisibilityDoer } from "../services/user";
 import { federationAppUrl, resolveWebfinger } from "../../services/federation/webfinger";
+import {
+  findActorUserById,
+  parseActorIdParam,
+  resolvePersonDocument,
+} from "../../services/federation/activitypub";
+import {
+  ACTIVITY_STREAMS_CONTENT_TYPE,
+  FEDERATION_MAX_BODY_BYTES,
+  readBodyBounded,
+  verifyHttpSignature,
+} from "../../services/federation/httpsig";
 
 /**
  * The env slice the family reads. `FEDERATION_ENABLED` rides wrangler `vars`
@@ -108,8 +153,8 @@ import { federationAppUrl, resolveWebfinger } from "../../services/federation/we
  * WebhookPushEnv posture, services/webhooks-push.ts:172).
  */
 export type FederationEnv = Omit<Env, "FEDERATION_ENABLED" | "APP_URL"> & {
-  /** `"true"` mounts the discovery pair + the 501 stubs; absent or any
-   *  other value keeps the surface fail-closed at upstream's disabled
+  /** `"true"` mounts the discovery pair + the activitypub arms; absent or
+   *  any other value keeps the surface fail-closed at upstream's disabled
    *  bytes (web 404 `Not Found\n`, API router-native 404). */
   FEDERATION_ENABLED?: string;
   /** Upstream `setting.AppURL` — unset falls back to the request origin. */
@@ -391,28 +436,182 @@ const federationApiGate: MiddlewareHandler<ApiEnv> = async (c, next) => {
   await next();
 };
 
+// ---------------------------------------------------------------------------
+// The activitypub arms — Tier B (SPEC §6.2 as-built)
+// ---------------------------------------------------------------------------
+
 /**
- * Register the gated stubs on the /api/v1 router (the orchestrator's
+ * chi's per-endpoint method arm: the endpoint registers ONE method, so a
+ * known method other than it resolves no endpoint and chi's DEFAULT
+ * methodNotAllowedHandler answers (empty body, `Allow` per registered
+ * method) BEFORE any endpoint middleware — group middleware (the scope
+ * gate) folds into ENDPOINT registrations, never into the 405.
+ */
+function chiMethodGuard(allowed: string[]): MiddlewareHandler<ApiEnv> {
+  return async (c, next) => {
+    if (c.req.method !== allowed[0]) {
+      return chiMethodNotAllowed(c.req.method, allowed);
+    }
+    await next();
+  };
+}
+
+/** The API arms read the appOrigin chain through the widened slice (the
+ *  generated Env's var literals stay assignable to the optional string). */
+function federationEnvOf(c: Context<ApiEnv>): FederationEnv {
+  return c.env;
+}
+
+/** The actor IRI for a user row — `{AppURL}api/v1/activitypub/user-id/{id}`. */
+function actorIriOf(appUrl: string, userId: number): string {
+  return `${appUrl}api/v1/activitypub/user-id/${userId}`;
+}
+
+/**
+ * The Person actor (person.go:20-79 at `1592576fa5^`): UserIDAssignmentAPI
+ * first — garbage id → 0, unknown id → ApiError 404 with ErrUserNotExist's
+ * exact text — then the document (keypair lazily generated on first serve)
+ * at the ActivityStreams content type. `checkTokenPublicOnly()` (the
+ * pre-stub group's second middleware) is a no-op for this surface: it
+ * blanks ContextUser EMAIL serializations for public-only tokens, and the
+ * Person document carries none — nothing to port.
+ */
+async function personHandler(c: Context<ApiEnv>): Promise<Response> {
+  const id = parseActorIdParam(c.req.param("id"));
+  const appUrl = federationAppUrl(federationEnvOf(c).APP_URL, new URL(c.req.url).origin);
+  const resolved = await resolvePersonDocument(c.env.DB, id, { appUrl });
+  if (resolved === undefined) {
+    throw new ApiError(404, `user does not exist [uid: ${id}, name: ]`);
+  }
+  return c.body(JSON.stringify(resolved.person), 200, { "content-type": ACTIVITY_STREAMS_CONTENT_TYPE });
+}
+
+/** The Follow activity's actor IRI — the string form, or an embedded
+ *  object's `id` (both legal ActivityStreams). */
+function activityActorIri(activity: Record<string, unknown>): string | null {
+  const actor = activity["actor"];
+  if (typeof actor === "string") return actor;
+  if (typeof actor === "object" && actor !== null) {
+    const id = (actor as Record<string, unknown>)["id"];
+    if (typeof id === "string") return id;
+  }
+  return null;
+}
+
+/**
+ * The inbox (person.go:81-96's PersonInbox behind reqsignature.go's
+ * middleware, in upstream's middleware order — UserIDAssignmentAPI runs
+ * BEFORE the signature, so an unknown target 404s without any verification
+ * work):
+ *   1. the size-capped body read (SPEC §3.1 — the black hole never read
+ *      the body; ours must, and the read is the streamed-bounded posture);
+ *   2. verifyHttpSignature — error arm → thrown (house 500, upstream
+ *      APIErrorInternal), rejected arm → the exact 403 body (:91-93);
+ *   3. the Follow → Accept ladder (the user's completion directive; the
+ *      Accept rides the RESPONSE — no follower store is sanctioned and no
+ *      delivery lane exists, so nothing is persisted and nothing is sent
+ *      outbound; SPEC §6.2 as-built records the remaining tier) — every
+ *      other activity keeps the upstream 204 black hole. Malformed JSON →
+ *      400 (an arm the black hole never needed; it never looked).
+ */
+async function inboxHandler(c: Context<ApiEnv>, opts: { fetchImpl?: typeof fetch }): Promise<Response> {
+  const id = parseActorIdParam(c.req.param("id"));
+  const target = await findActorUserById(c.env.DB, id);
+  if (target === undefined) {
+    throw new ApiError(404, `user does not exist [uid: ${id}, name: ]`);
+  }
+  const user = resolveInboxTarget(target);
+
+  const spool = await readBodyBounded(c.req.raw, FEDERATION_MAX_BODY_BYTES);
+  if (!spool.ok) {
+    throw new ApiError(413, "request body exceeds the federation maximum size");
+  }
+
+  const url = new URL(c.req.url);
+  const outcome = await verifyHttpSignature(
+    { method: "POST", pathWithQuery: `${url.pathname}${url.search}`, header: (name) => c.req.header(name) },
+    spool.body,
+    { fetchImpl: opts.fetchImpl },
+  );
+  if (outcome.kind === "error") {
+    throw new Error(`activitypub signature verification: ${outcome.reason}`);
+  }
+  if (outcome.kind === "rejected") {
+    throw new ApiError(403, "request signature verification failed");
+  }
+
+  const appUrl = federationAppUrl(federationEnvOf(c).APP_URL, new URL(c.req.url).origin);
+  const actorIri = actorIriOf(appUrl, user.id);
+
+  let activity: unknown;
+  try {
+    activity = JSON.parse(new TextDecoder().decode(spool.body));
+  } catch {
+    throw new ApiError(400, "Bad Request");
+  }
+  if (typeof activity === "object" && activity !== null && (activity as Record<string, unknown>).type === "Follow") {
+    const follow = activity as Record<string, unknown>;
+    const follower = activityActorIri(follow);
+    const accept: Record<string, unknown> = {
+      "@context": "https://www.w3.org/ns/activitystreams",
+      id: `${actorIri}#accepts/${crypto.randomUUID()}`,
+      type: "Accept",
+      actor: actorIri,
+      ...(follower === null ? {} : { to: follower }),
+      object: follow,
+    };
+    return c.body(JSON.stringify(accept), 200, { "content-type": ACTIVITY_STREAMS_CONTENT_TYPE });
+  }
+  // Upstream PersonInbox: `ctx.Status(http.StatusNoContent)` — the black hole.
+  return c.body(null, 204);
+}
+
+/** Inbox-side target lookup — the same GetUserByID arm as the actor,
+ *  without the keypair work (upstream's middleware order: the assignment
+ *  middleware runs first; the signature middleware never fires for an
+ *  unknown target). */
+function resolveInboxTarget(user: { id: number }): { id: number } {
+  return { id: user.id };
+}
+
+/**
+ * Register the gated family on the /api/v1 router (the orchestrator's
  * createApiRouter calls this beside the other families — HANDOFF §6.1).
  * chi-exact method arms:
- *   GET /api/v1/nodeinfo       api.go:1008 — no scope gate (upstream's
- *                              registration carries none). Disabled, the
- *                              path is UNREGISTERED: every known method →
- *                              the mux's native not-found. Enabled, the
- *                              GET-only endpoint 501s and every other
- *                              known method tree-405s with `Allow: GET`
- *                              (routeHTTP's methodNotAllowed arm; no HEAD
- *                              fallback in chi).
- *   ANY /api/v1/activitypub/*  api.go:1009 — Gitea's Any → chi Handle →
- *                              mALL: setEndpoint registers EVERY methodMap
- *                              method, so all known methods ride the
- *                              activitypub scope gate to the `Not
- *                              implemented\n` 501 (upstream's OPTIONS and
- *                              HEAD hit the stub exactly like GET).
- * Both arms: unknown methods bare-405 pre-tree (the guard above) —
+ *   GET /api/v1/nodeinfo                    api.go:1008 — the W-B1 501 stub,
+ *                                           no scope gate (upstream's
+ *                                           registration carries none).
+ *                                           Disabled, the path is
+ *                                           UNREGISTERED: every known
+ *                                           method → the mux's native
+ *                                           not-found. Enabled, the
+ *                                           GET-only endpoint 501s and
+ *                                           every other known method
+ *                                           tree-405s with `Allow: GET`.
+ *   GET /api/v1/activitypub/user-id/{id}    api.go:946-949 at `1592576fa5^`
+ *                                           (UserIDAssignmentAPI +
+ *                                           checkTokenPublicOnly + the
+ *                                           group scope gate) → the Person
+ *                                           actor; other known methods
+ *                                           tree-405 `Allow: GET`.
+ *   POST /api/v1/activitypub/user-id/{id}/inbox
+ *                                           api.go:948 (UserIDAssignmentAPI
+ *                                           + checkTokenPublicOnly +
+ *                                           ReqHTTPSignature + the group
+ *                                           scope gate) → the inbox ladder;
+ *                                           other known methods tree-405
+ *                                           `Allow: POST`.
+ * Every other /activitypub/* path (incl. the deprecated `/user/{username}`
+ * group, api.go:941-945's "remove in 1.20" form) stays UNREGISTERED — the
+ * router's native 404, exactly upstream's unregistered-path posture.
+ * Both armed paths: unknown methods bare-405 pre-tree (the guard above) —
  * gate-independent, exactly mux.go's early arm.
+ *
+ * `opts.fetchImpl` is the test seam for the verifier's outbound
+ * actor-document fetch (SPEC §7's env-boundary stubbing; production omits
+ * it and the global fetch runs).
  */
-export function registerFederationApiRoutes(app: OpenAPIHono<ApiEnv>): void {
+export function registerFederationApiRoutes(app: OpenAPIHono<ApiEnv>, opts: { fetchImpl?: typeof fetch } = {}): void {
   app.all("/nodeinfo", chiUnknownMethodGuard, (c) => {
     if (!federationEnabled(c.env)) {
       return routerNativeNotFound(c);
@@ -423,10 +622,19 @@ export function registerFederationApiRoutes(app: OpenAPIHono<ApiEnv>): void {
     return federationNotImplemented();
   });
   app.all(
-    "/activitypub/*",
+    "/activitypub/user-id/:id",
     chiUnknownMethodGuard,
     federationApiGate,
+    chiMethodGuard(["GET"]),
     activitypubScopeGate,
-    () => federationNotImplemented(),
+    (c) => personHandler(c),
+  );
+  app.all(
+    "/activitypub/user-id/:id/inbox",
+    chiUnknownMethodGuard,
+    federationApiGate,
+    chiMethodGuard(["POST"]),
+    activitypubScopeGate,
+    (c) => inboxHandler(c, opts),
   );
 }

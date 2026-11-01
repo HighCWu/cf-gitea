@@ -1,9 +1,11 @@
 /**
- * Federation Tier A suite (specs/federation.md §6.1 / §7 — W-A1): the
- * discovery pair + the gated 501 stubs on real D1, both routers driven
- * standalone (the HANDOFF mounts in src/index.ts + api/router.ts are the
- * orchestrator's; the sub-apps are mounted verbatim, so these pins carry
- * over unchanged).
+ * Federation suite (specs/federation.md §6.1 / §6.2 / §7): Tier A — the
+ * discovery pair on real D1 — plus Tier B as-built (W-B2/W-B3/W-B4, the
+ * 2026-11-01 completion directive): the Person actor, the signature-
+ * verified inbox with the Follow→Accept ladder, the keypair store, and the
+ * chi-exact method tree. Both routers driven standalone (the HANDOFF mounts
+ * in src/index.ts + api/router.ts are the orchestrator's; the sub-apps are
+ * mounted verbatim, so these pins carry over unchanged).
  *
  * Arms pinned, each with its upstream cite:
  *   - the FEDERATION_ENABLED gate: strict "true" polarity; disabled web
@@ -22,23 +24,29 @@
  *     unknown-user 404, and the JRD byte-shape (webfinger.go:87-121:
  *     subject/aliases/links in Go struct order, the in-handler
  *     `Access-Control-Allow-Origin: *` stamp at :116);
- *   - the stubs (api.go:1007-1010 + person.go:12-14): enabled, EVERY arm
- *     (GET /nodeinfo; ANY depth/method under /activitypub/*) answers Go
- *     http.Error's `Not implemented\n` at 501; the activitypub token scope
- *     gate rides the route group — anonymous passes to the stub (upstream's
- *     GetDoerTokenScope early return, api.go:281-283), a scopeless-token
- *     403 carries the exact api.go:300 body, the method-derived level
- *     (read passes GET, write required POST/PUT/PATCH/DELETE);
- *   - the method arms (the 7538a40 adjudication): chi's tree/mux mechanics
- *     — the web pair tree-405s every known non-GET with `Allow: GET`
- *     gate-INDEPENDENTLY (web.go:534-535 registers unconditionally; the
- *     per-endpoint gate never runs for an unresolved method; mux.go:532-540
- *     's default handler), /api/v1/nodeinfo 405s the same way only when
- *     enabled (api.go:1007's registration conditional leaves it
- *     unregistered when disabled), /activitypub/* is Gitea's Any → mALL —
- *     EVERY chi methodMap method (incl. QUERY, tree.go) rides the scope
- *     gate to the 501 — and an unknown method bare-405s pre-tree (mux.go
- *     routeHTTP's early arm, gate- and registration-independent).
+ *   - the API arms: /api/v1/nodeinfo keeps the W-B1 501 stub
+ *     (person.go:12-14's Go http.Error line; that wave was not in this
+ *     dispatch's scope); the activitypub family is the PRE-STUB
+ *     registration shape (`1592576fa5^`, SPEC §6.2) —
+ *     GET /activitypub/user-id/{id} → the Person actor (person.go:20-79),
+ *     POST /activitypub/user-id/{id}/inbox → ReqHTTPSignature + PersonInbox
+ *     (reqsignature.go; the Follow→Accept ladder is the user directive's
+ *     arm, everything else the 204 black hole), every other /activitypub/*
+ *     path UNREGISTERED → the router's native 404 (incl. the deprecated
+ *     /user/{username} form, api.go's own "remove in 1.20" note). The
+ *     inline activitypub scope gate: anonymous passes (api.go:281-283), a
+ *     foreign-category token 403s with api.go:300's body;
+ *   - the method arms (the 7538a40 adjudication, chi-exact): armed paths
+ *     405 with `Allow:` for every known non-registered method BEFORE any
+ *     middleware (chi's methodNotAllowedHandler — the scope gate never runs
+ *     for an unresolved method), disabled paths 404 natively for every
+ *     known method (unregistered at api.go:1007), an unknown method
+ *     bare-405s pre-tree (mux.go routeHTTP's early arm);
+ *   - Tier B units (SPEC §7): the RSA-3072 keypair lazily generated into
+ *     user_settings_kv (stable across serves — the debian.ts race posture),
+ *     the verifier's error/rejected arms mapped onto house 500 / the exact
+ *     403 body, the remote actor fetched through the injected fetchImpl
+ *     seam (fixed vectors live in httpsig.test.ts).
  */
 
 import { OpenAPIHono } from "@hono/zod-openapi";
@@ -63,6 +71,15 @@ import {
   parseResource,
   resolveWebfinger,
 } from "../../services/federation/webfinger";
+import { getOrCreateActorPublicKey } from "../../services/federation/activitypub";
+import {
+  ACTIVITY_STREAMS_CONTENT_TYPE,
+  buildSigningString,
+  computeSha256Digest,
+  pemEncode,
+  renderSignatureHeader,
+  signSigningString,
+} from "../../services/federation/httpsig";
 
 const ORIGIN = "https://fed.example";
 const HOST = "fed.example";
@@ -99,11 +116,13 @@ const wellKnown = async (path: string, federation?: string, appUrl?: string): Pr
  *  through Object.assign — the generated Env does not carry
  *  FEDERATION_ENABLED until the operator's config gains it, and the assign
  *  builds the widened slice without a cast (the vitest env itself already
- *  carries non-config bindings the same way). */
+ *  carries non-config bindings the same way). `fetchImpl` and `appUrl` are
+ *  the Tier B seams: the verifier's outbound actor fetch (SPEC §7's
+ *  env-boundary stubbing) and the AppURL chain override. */
 async function api(
   path: string,
   init?: RequestInit,
-  opts?: { federation?: string; auth?: AuthInfo },
+  opts?: { federation?: string; auth?: AuthInfo; fetchImpl?: typeof fetch; appUrl?: string },
 ): Promise<Response> {
   const app = new OpenAPIHono<ApiEnv>();
   app.onError(giteaErrorHandler);
@@ -114,8 +133,8 @@ async function api(
       await next();
     });
   }
-  registerFederationApiRoutes(app);
-  const envSlice = Object.assign({}, env, { FEDERATION_ENABLED: opts?.federation });
+  registerFederationApiRoutes(app, { fetchImpl: opts?.fetchImpl });
+  const envSlice = Object.assign({}, env, { FEDERATION_ENABLED: opts?.federation, APP_URL: opts?.appUrl });
   // The standalone app registers router-relative paths (no /api/v1 mount) —
   // the prefix strips off, the blocks.test.ts pattern.
   return await app.fetch(new Request(`${ORIGIN}${path}`, init), envSlice);
@@ -128,6 +147,7 @@ async function api(
 interface SeedOptions {
   username: string;
   email?: string | null;
+  fullName?: string | null;
   visibility?: "public" | "limited" | "private";
   type?: "user" | "org";
   hideEmail?: boolean;
@@ -143,6 +163,7 @@ async function seedUser(options: SeedOptions): Promise<{ id: number; username: s
       username: options.username,
       usernameLower: options.username.toLowerCase(),
       email: options.email ?? null,
+      ...(options.fullName === undefined ? {} : { fullName: options.fullName }),
       visibility: options.visibility ?? "public",
       type: options.type ?? "user",
       createdAt: new Date(),
@@ -201,6 +222,100 @@ const scopeForbidden = (required: string, tokenScope: string): Record<string, st
   message: `token does not have at least one of required scope(s), required=[${required}], token scope=${tokenScope}`,
   url: `${ORIGIN}/api/swagger`,
 });
+
+// ---------------------------------------------------------------------------
+// Tier B fixtures — the remote actor (SPEC §7's fetch-stubbed actors)
+// ---------------------------------------------------------------------------
+
+let remotePair: CryptoKeyPair;
+let foreignPair: CryptoKeyPair;
+let remotePem: string;
+const REMOTE_KEY_ID = "https://remote.example/actors/bob#main-key";
+const REMOTE_ACTOR_IRI = "https://remote.example/actors/bob";
+
+async function generateRsa3072Pair(): Promise<CryptoKeyPair> {
+  const pair = await crypto.subtle.generateKey(
+    { name: "RSASSA-PKCS1-v1_5", modulusLength: 3072, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+    true,
+    ["sign", "verify"],
+  );
+  if (!("privateKey" in pair) || !("publicKey" in pair)) throw new Error("key generation did not yield a pair");
+  return pair;
+}
+
+/** The fixture remote actor document the verifier's fetch returns. */
+function remoteActorDoc(keyId: string, publicKeyPem: string): string {
+  const owner = keyId.split("#")[0] ?? keyId;
+  return JSON.stringify({
+    "@context": ["https://www.w3.org/ns/activitystreams", "https://w3id.org/security/v1"],
+    id: owner,
+    type: "Person",
+    publicKey: { id: keyId, owner, publicKeyPem },
+  });
+}
+
+beforeAll(async () => {
+  remotePair = await generateRsa3072Pair();
+  foreignPair = await generateRsa3072Pair();
+  const spki = await crypto.subtle.exportKey("spki", remotePair.publicKey);
+  if (!(spki instanceof ArrayBuffer)) throw new Error("unexpected key export form");
+  remotePem = pemEncode("PUBLIC KEY", new Uint8Array(spki));
+});
+
+/**
+ * A signed inbox POST (the deleted client.go's signing posture —
+ * `(request-target) date digest`, rsa-sha256, the remote actor's #main-key
+ * keyId) dispatched through the api() helper with the fetch stub serving
+ * the fixture actor document. `digest` computes over the actual body unless
+ * overridden; `date` defaults to fresh-now (the 60 s TTL is real here).
+ */
+async function signedInbox(
+  path: string,
+  body: string,
+  opts: {
+    auth?: AuthInfo;
+    keyPair?: CryptoKeyPair;
+    keyId?: string;
+    date?: string;
+    omitDateHeader?: boolean;
+    digest?: string | null;
+    algorithm?: string;
+    signature?: string;
+    docBody?: string;
+    docStatus?: number;
+    fetchError?: boolean;
+    fetchImpl?: typeof fetch;
+  } = {},
+): Promise<Response> {
+  const url = new URL(`${ORIGIN}${path}`);
+  const pathWithQuery = `${url.pathname}${url.search}`;
+  const headers: Record<string, string> = { "content-type": ACTIVITY_STREAMS_CONTENT_TYPE };
+  if (opts.omitDateHeader !== true) headers["date"] = opts.date ?? new Date().toUTCString();
+  const bodyBytes = new TextEncoder().encode(body);
+  if (opts.digest !== null) {
+    headers["digest"] = opts.digest ?? (await computeSha256Digest(bodyBytes));
+  }
+  const signingString = buildSigningString(
+    { method: "POST", pathWithQuery, header: (name) => headers[name.toLowerCase()] },
+    ["(request-target)", "date", "digest"],
+  );
+  if (signingString === null) throw new Error("fixture signing string failed");
+  const signature =
+    opts.signature ?? (await signSigningString(signingString, (opts.keyPair ?? remotePair).privateKey));
+  headers["signature"] = renderSignatureHeader({
+    keyId: opts.keyId ?? REMOTE_KEY_ID,
+    algorithm: opts.algorithm ?? "rsa-sha256",
+    headers: ["(request-target)", "date", "digest"],
+    signature,
+  });
+  const keyId = opts.keyId ?? REMOTE_KEY_ID;
+  const doc = opts.docBody ?? remoteActorDoc(keyId, remotePem);
+  const fetchImpl: typeof fetch = opts.fetchImpl ??
+    (opts.fetchError
+      ? () => Promise.reject(new Error("network down"))
+      : () => Promise.resolve(new Response(doc, { status: opts.docStatus ?? 200 })));
+  return api(path, { method: "POST", body, headers }, { federation: "true", auth: opts.auth, fetchImpl });
+}
 
 // ---------------------------------------------------------------------------
 // The gate
@@ -503,8 +618,8 @@ describe("the /api/v1 stubs — registration gate", () => {
   });
 });
 
-describe("the /api/v1 stubs — enabled: NotImplemented everywhere (person.go:12-14)", () => {
-  it("GET /nodeinfo: Go http.Error's exact `Not implemented` line at 501", async () => {
+describe("the /api/v1 arms — the gate and the scope ladder", () => {
+  it("GET /nodeinfo keeps the W-B1 stub: Go http.Error's exact `Not implemented` line at 501", async () => {
     const response = await api("/nodeinfo", {}, { federation: "true" });
     expect(response.status).toBe(501);
     expect(await response.text()).toBe("Not implemented\n");
@@ -512,16 +627,16 @@ describe("the /api/v1 stubs — enabled: NotImplemented everywhere (person.go:12
     expect(response.headers.get("x-content-type-options")).toBe("nosniff");
   });
 
-  it("ANY /activitypub/*: anonymous passes the scope gate to the 501 (api.go:281-283)", async () => {
-    for (const attempt of [
-      { path: "/activitypub/user-id/1", init: {} },
-      { path: "/activitypub/user-id/1", init: { method: "POST" } },
-      { path: "/activitypub/user-id/1/inbox", init: { method: "POST" } },
-      { path: "/activitypub/anything/deeper/still", init: { method: "DELETE" } },
+  it("unregistered /activitypub/* sub-paths answer the router's native 404 (the pre-stub registration shape)", async () => {
+    for (const path of [
+      "/activitypub/anything/deeper/still",
+      "/activitypub/user/1", // the deprecated /user/{username} form — never carried (upstream's "remove in 1.20")
+      "/activitypub/user-id/",
+      "/activitypub",
     ]) {
-      const response = await api(attempt.path, attempt.init, { federation: "true" });
-      expect(response.status, attempt.path).toBe(501);
-      expect(await response.text(), attempt.path).toBe("Not implemented\n");
+      const response = await api(path, {}, { federation: "true" });
+      expect(response.status, path).toBe(404);
+      expect(await response.text(), path).toBe("404 Not Found");
     }
   });
 
@@ -545,20 +660,30 @@ describe("the /api/v1 stubs — enabled: NotImplemented everywhere (person.go:12
     expect(await scopeless.json()).toEqual(scopeForbidden("read:activitypub", "no-token-scope"));
   });
 
-  it("the method-derived level: read passes GET, write required for POST (api.go:285-289)", async () => {
-    const readGet = await api("/activitypub/user-id/1", {}, { federation: "true", auth: authWithScope("read:activitypub") });
-    expect(readGet.status).toBe(501);
+  it("the method-derived level: read passes GET at the actor, write required for the inbox POST (api.go:285-289)", async () => {
+    const alice = await seedUser({ username: "alice" });
 
-    const readPost = await api("/activitypub/user-id/1", { method: "POST" }, { federation: "true", auth: authWithScope("read:activitypub") });
+    // A read-category token reaches the GET handler (404 = the assignment
+    // middleware answered; unknown id 1, seeded user sits elsewhere).
+    const readGet = await api("/activitypub/user-id/1", {}, { federation: "true", auth: authWithScope("read:activitypub") });
+    expect(readGet.status).toBe(404);
+    expect((await readGet.json<{ message: string }>()).message).toContain("user does not exist");
+
+    // The same token misses the inbox POST's write level...
+    const readPost = await signedInbox(`/activitypub/user-id/${alice.id}/inbox`, '{"type":"Follow"}', {
+      auth: authWithScope("read:activitypub"),
+    });
     expect(readPost.status).toBe(403);
     expect(await readPost.json()).toEqual(scopeForbidden("write:activitypub", "read:activitypub"));
 
-    const writePost = await api("/activitypub/user-id/1", { method: "POST" }, { federation: "true", auth: authWithScope("write:activitypub") });
-    expect(writePost.status).toBe(501);
+    // ...a write-category token passes it (404 here = the unknown-user arm
+    // of a path targeting a nonexistent inbox — the gate is behind us).
+    const writePostUnknown = await api("/activitypub/user-id/1/inbox", { method: "POST", body: "{}" }, { federation: "true", auth: authWithScope("write:activitypub") });
+    expect(writePostUnknown.status).toBe(404);
 
     // `all` carries every category at both levels.
-    const allToken = await api("/activitypub/user-id/1", { method: "PUT" }, { federation: "true", auth: authWithScope("all") });
-    expect(allToken.status).toBe(501);
+    const allGet = await api(`/activitypub/user-id/${alice.id}`, {}, { federation: "true", auth: authWithScope("all") });
+    expect(allGet.status).toBe(200);
   });
 });
 
@@ -648,22 +773,328 @@ describe("the method arms — chi's 405 tree, no HEAD fallback", () => {
     expect(await options.text()).toBe("404 Not Found");
   });
 
-  it("API /activitypub/* is mALL: HEAD and OPTIONS ride the scope gate to the 501 (api.go:1009)", async () => {
-    const anonymous = await api("/activitypub/user-id/1", { method: "OPTIONS" }, { federation: "true" });
-    expect(anonymous.status).toBe(501);
-    expect(await anonymous.text()).toBe("Not implemented\n");
+  it("API activitypub arms: every known non-registered method tree-405s with Allow, BEFORE the scope gate", async () => {
+    await seedUser({ username: "alice" });
+    for (const method of ["HEAD", "OPTIONS", "POST", "PUT", "DELETE"]) {
+      const actor = await api("/activitypub/user-id/1", { method }, { federation: "true" });
+      expect(actor.status, `actor ${method}`).toBe(405);
+      expect(actor.headers.get("allow"), `actor ${method}`).toBe("GET");
+      expect(await actor.text(), `actor ${method}`).toBe("");
+    }
+    for (const method of ["GET", "HEAD", "OPTIONS", "PUT", "DELETE"]) {
+      const inbox = await api("/activitypub/user-id/1/inbox", { method }, { federation: "true" });
+      expect(inbox.status, `inbox ${method}`).toBe(405);
+      expect(inbox.headers.get("allow"), `inbox ${method}`).toBe("POST");
+      expect(await inbox.text(), `inbox ${method}`).toBe("");
+    }
 
-    // The method-derived level: HEAD/OPTIONS are non-write → the read level
-    // passes a read-only token to the stub and denies a foreign-category one
-    // (the same body the GET arm 403s with).
-    const headRead = await api("/activitypub/user-id/1", { method: "HEAD" }, { federation: "true", auth: authWithScope("read:activitypub") });
-    expect(headRead.status).toBe(501);
+    // chi-exact: the 405 is the mux's default handler — NO endpoint
+    // middleware runs, so even a foreign-category token 405s (not 403s).
+    const gateless = await api("/activitypub/user-id/1", { method: "PUT" }, { federation: "true", auth: authWithScope("read:repository") });
+    expect(gateless.status).toBe(405);
+    expect(gateless.headers.get("allow")).toBe("GET");
+  });
 
-    // The denial status rides HEAD too — its JSON body is stripped at the
-    // auto-HEAD wrapper (net/http suppresses HEAD bodies upstream); the
-    // exact body is the GET arm's pin above.
-    const headDenied = await api("/activitypub/user-id/1", { method: "HEAD" }, { federation: "true", auth: authWithScope("read:repository") });
-    expect(headDenied.status).toBe(403);
-    expect(await headDenied.text()).toBe("");
+  it("API activitypub arms disabled: unregistered — every known method answers the native 404", async () => {
+    for (const method of ["GET", "HEAD", "OPTIONS", "POST"]) {
+      const response = await api("/activitypub/user-id/1", { method }, { federation: undefined });
+      expect(response.status, `actor ${method}`).toBe(404);
+    }
+    const inboxOptions = await api("/activitypub/user-id/1/inbox", { method: "OPTIONS" }, { federation: "false" });
+    expect(inboxOptions.status).toBe(404);
+    expect(await inboxOptions.text()).toBe("404 Not Found");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TIER B — the Person actor (SPEC §6.2 W-B2 as-built; person.go:20-79 at
+// `1592576fa5^`): the deleted integration test's pins re-armed
+// (TestActivityPubPerson.ExistingPerson / MissingPerson)
+// ---------------------------------------------------------------------------
+
+describe("GET /activitypub/user-id/{id} — the Person actor", () => {
+  it("serves the Person document at the ActivityStreams content type (the deleted test's pins)", async () => {
+    const alice = await seedUser({ username: "alice", email: "alice@example.com" });
+    const actorIri = `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}`;
+
+    const response = await api(`/activitypub/user-id/${alice.id}`, {}, { federation: "true" });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe(ACTIVITY_STREAMS_CONTENT_TYPE);
+
+    const body = await response.text();
+    expect(body).toContain("@context"); // the deleted test's first assertion
+    const person = JSON.parse(body) as Record<string, unknown>;
+    expect(person["@context"]).toEqual([
+      "https://www.w3.org/ns/activitystreams",
+      "https://w3id.org/security/v1",
+    ]);
+    expect(person.id).toBe(actorIri); // numeric-ID IRI — the username is NOT in the path
+    expect(person.type).toBe("Person");
+    expect(person.preferredUsername).toBe("alice");
+    expect(person.url).toBe(`${ORIGIN}/alice`);
+    expect(person.inbox).toBe(`${actorIri}/inbox`); // the deleted test's Regexp pins
+    expect(person.outbox).toBe(`${actorIri}/outbox`);
+    expect(person.name).toBe("");
+
+    const publicKey = person.publicKey as Record<string, unknown>;
+    expect(publicKey.id).toBe(`${actorIri}#main-key`);
+    expect(publicKey.owner).toBe(actorIri);
+    const publicKeyPem = publicKey.publicKeyPem as string;
+    expect(publicKeyPem.startsWith("-----BEGIN PUBLIC KEY-----")).toBe(true);
+
+    expect(person.icon).toEqual({ type: "Image", mediaType: "image/png", url: `${ORIGIN}/avatars/alice` });
+  });
+
+  it("Name = FullName; icon rides the canonical house avatar projection", async () => {
+    const bob = await seedUser({ username: "bob", fullName: "Bob van Example" });
+    const response = await api(`/activitypub/user-id/${bob.id}`, {}, { federation: "true" });
+    const person = await response.json<Record<string, unknown>>();
+    expect(person.name).toBe("Bob van Example");
+  });
+
+  it("an org row serves a Person document too — GetUserByID is type-blind (UserIDAssignmentAPI)", async () => {
+    const acme = await seedUser({ username: "acme", type: "org" });
+    const response = await api(`/activitypub/user-id/${acme.id}`, {}, { federation: "true" });
+    expect(response.status).toBe(200);
+    const person = await response.json<Record<string, unknown>>();
+    expect(person.type).toBe("Person");
+    expect(person.preferredUsername).toBe("acme");
+  });
+
+  it("a missing user 404s with ErrUserNotExist's exact message (the deleted test's MissingPerson)", async () => {
+    const response = await api("/activitypub/user-id/999999999", {}, { federation: "true" });
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({
+      message: "user does not exist [uid: 999999999, name: ]",
+      url: `${ORIGIN}/api/swagger`,
+    });
+  });
+
+  it("a garbage id collapses to 0 (Go PathParamInt64 ignores the ParseInt error)", async () => {
+    const response = await api("/activitypub/user-id/abc", {}, { federation: "true" });
+    expect(response.status).toBe(404);
+    expect((await response.json<{ message: string }>()).message).toBe("user does not exist [uid: 0, name: ]");
+  });
+
+  it("the AppURL chain drives the IRIs (the APP_URL var)", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const response = await api(`/activitypub/user-id/${alice.id}`, {}, { federation: "true", appUrl: "https://custom.example" });
+    expect(response.status).toBe(200);
+    const person = await response.json<Record<string, unknown>>();
+    expect(person.id).toBe(`https://custom.example/api/v1/activitypub/user-id/${alice.id}`);
+    expect(person.inbox).toBe(`https://custom.example/api/v1/activitypub/user-id/${alice.id}/inbox`);
+  });
+});
+
+describe("the actor keypair — lazy RSA-3072 in user_settings_kv (user_settings.go)", () => {
+  it("the served publicKeyPem is STABLE across serves (the debian.ts race posture)", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const first = await api(`/activitypub/user-id/${alice.id}`, {}, { federation: "true" });
+    const second = await api(`/activitypub/user-id/${alice.id}`, {}, { federation: "true" });
+    const pemOf = async (response: Response): Promise<string> => {
+      const person = await response.json<{ publicKey: { publicKeyPem: string } }>();
+      return person.publicKey.publicKeyPem;
+    };
+    const pemFirst = await pemOf(first);
+    expect(await pemOf(second)).toBe(pemFirst);
+
+    // The stored pair lives under OUR setting keys — both rows present.
+    const rows = await env.DB.prepare("SELECT setting_key FROM user_settings_kv WHERE user_id = ?").bind(alice.id).all<{ setting_key: string }>();
+    const keys = rows.results.map((row) => row.setting_key).sort();
+    expect(keys).toEqual(["activitypub.priv_pem", "activitypub.pub_pem"]);
+  });
+
+  it("getOrCreateActorPublicKey round-trips; deleting the rows regenerates", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const first = await getOrCreateActorPublicKey(env.DB, alice.id);
+    expect(first.startsWith("-----BEGIN PUBLIC KEY-----")).toBe(true);
+    expect(await getOrCreateActorPublicKey(env.DB, alice.id)).toBe(first);
+
+    await env.DB.prepare("DELETE FROM user_settings_kv WHERE user_id = ?").bind(alice.id).run();
+    const regenerated = await getOrCreateActorPublicKey(env.DB, alice.id);
+    expect(regenerated.startsWith("-----BEGIN PUBLIC KEY-----")).toBe(true);
+    expect(regenerated).not.toBe(first);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TIER B — the inbox (person.go:81-96 behind reqsignature.go at
+// `1592576fa5^`): the deleted test's MissingPersonInbox posture re-armed
+// (unsigned → the 500 error arm; verified → the 204 black hole), with the
+// completion directive's Follow→Accept ladder on top (NO persistence — no
+// sanctioned follower store exists; SPEC §6.2 as-built)
+// ---------------------------------------------------------------------------
+
+describe("POST /activitypub/user-id/{id}/inbox — the signature gate", () => {
+  it("an unsigned POST is the upstream ERROR arm: house 500 (APIErrorInternal), the deleted test's pin", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const response = await api(`/activitypub/user-id/${alice.id}/inbox`, { method: "POST", body: "{}" }, { federation: "true" });
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ message: "internal server error", url: `${ORIGIN}/api/swagger` });
+  });
+
+  it("a garbage signature VALUE inside a well-formed param list is the rejected arm", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const response = await signedInbox(`/activitypub/user-id/${alice.id}/inbox`, "{}", { signature: "!!!!" });
+    // The header parses; every pre-crypto arm passes; base64Decode("!!!!")
+    // throws at the v.Verify stage → rejected (upstream's Verify-error →
+    // authenticated=false → 403 mapping).
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ message: "request signature verification failed", url: `${ORIGIN}/api/swagger` });
+  });
+
+  it("a param-list that parses to nothing is the error arm", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const response = await api(`/activitypub/user-id/${alice.id}/inbox`, {
+      method: "POST",
+      body: "{}",
+      headers: { signature: "not-a-param-list" },
+    }, { federation: "true" });
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ message: "internal server error", url: `${ORIGIN}/api/swagger` });
+  });
+
+  it("a tampered body (digest mismatch) is the REJECTED arm: the exact 403 body", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const response = await signedInbox(`/activitypub/user-id/${alice.id}/inbox`, '{"type":"Follow","x":1}', {
+      digest: await computeSha256Digest(new TextEncoder().encode('{"type":"Follow"}')),
+    });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ message: "request signature verification failed", url: `${ORIGIN}/api/swagger` });
+  });
+
+  it("a stale Date past the deleted client's 60 s expiry → 403", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const response = await signedInbox(`/activitypub/user-id/${alice.id}/inbox`, "{}", {
+      date: "Mon, 02 Jan 2006 15:04:05 GMT",
+    });
+    expect(response.status).toBe(403);
+    expect((await response.json<{ message: string }>()).message).toBe("request signature verification failed");
+  });
+
+  it("a foreign signer against the doc's key → 403", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const response = await signedInbox(`/activitypub/user-id/${alice.id}/inbox`, "{}", { keyPair: foreignPair });
+    expect(response.status).toBe(403);
+  });
+
+  it("a keyId whose document carries a different publicKey.id → the 500 error arm", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const response = await signedInbox(`/activitypub/user-id/${alice.id}/inbox`, "{}", {
+      docBody: remoteActorDoc("https://remote.example/actors/alice#main-key", remotePem),
+    });
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ message: "internal server error", url: `${ORIGIN}/api/swagger` });
+  });
+
+  it("an unknown keyId fails closed — fetch miss and network error are both the 500 arm", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const miss = await signedInbox(`/activitypub/user-id/${alice.id}/inbox`, "{}", { docStatus: 404 });
+    expect(miss.status).toBe(500);
+
+    const down = await signedInbox(`/activitypub/user-id/${alice.id}/inbox`, "{}", { fetchError: true });
+    expect(down.status).toBe(500);
+  });
+
+  it("an unsupported algorithm parameter → 403", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const response = await signedInbox(`/activitypub/user-id/${alice.id}/inbox`, "{}", { algorithm: "hs2019" });
+    expect(response.status).toBe(403);
+  });
+
+  it("the assignment middleware runs BEFORE the signature: an unknown target 404s unsigned", async () => {
+    const response = await api("/activitypub/user-id/999999999/inbox", { method: "POST", body: "{}" }, { federation: "true" });
+    expect(response.status).toBe(404);
+    expect((await response.json<{ message: string }>()).message).toBe("user does not exist [uid: 999999999, name: ]");
+  });
+
+  it("an over-MaxSize body is the 413 size arm (the bounded read, SPEC §3.1)", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const big = `{"x":"${"y".repeat(4 * 1024 * 1024)}"}`;
+    const response = await api(`/activitypub/user-id/${alice.id}/inbox`, { method: "POST", body: big }, { federation: "true" });
+    expect(response.status).toBe(413);
+  });
+});
+
+describe("POST /activitypub/user-id/{id}/inbox — the Follow→Accept ladder and the black hole", () => {
+  it("a verified Follow answers 200 with the inline Accept — actor, to, and the verbatim object echo", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const actorIri = `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}`;
+    const follow = {
+      "@context": "https://www.w3.org/ns/activitystreams",
+      id: "https://remote.example/activities/1",
+      type: "Follow",
+      actor: REMOTE_ACTOR_IRI,
+      object: actorIri,
+    };
+
+    const response = await signedInbox(`/activitypub/user-id/${alice.id}/inbox`, JSON.stringify(follow));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe(ACTIVITY_STREAMS_CONTENT_TYPE);
+
+    const accept = await response.json<Record<string, unknown>>();
+    expect(accept["@context"]).toBe("https://www.w3.org/ns/activitystreams");
+    expect(accept.type).toBe("Accept");
+    expect(accept.actor).toBe(actorIri);
+    expect(accept.to).toBe(REMOTE_ACTOR_IRI);
+    expect(accept.object).toEqual(follow); // the received Follow, verbatim
+    expect((accept.id as string).startsWith(`${actorIri}#accepts/`)).toBe(true);
+  });
+
+  it("a Follow with an embedded actor object reads `to` from its id; no actor → no `to`", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const path = `/activitypub/user-id/${alice.id}/inbox`;
+
+    const embedded = await signedInbox(path, JSON.stringify({
+      type: "Follow",
+      actor: { type: "Person", id: "https://remote.example/actors/carol" },
+      object: `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}`,
+    }));
+    expect(embedded.status).toBe(200);
+    expect((await embedded.json<Record<string, unknown>>()).to).toBe("https://remote.example/actors/carol");
+
+    const actorless = await signedInbox(path, JSON.stringify({ type: "Follow" }));
+    expect(actorless.status).toBe(200);
+    const accept = await actorless.json<Record<string, unknown>>();
+    expect(accept.to).toBeUndefined();
+    expect(accept.type).toBe("Accept");
+  });
+
+  it("every other verified activity keeps the upstream 204 black hole (PersonInbox verbatim)", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const path = `/activitypub/user-id/${alice.id}/inbox`;
+
+    for (const activity of [
+      { type: "Create", object: { type: "Note", content: "hi" } },
+      { type: "Undo", object: { type: "Follow", actor: REMOTE_ACTOR_IRI, object: REMOTE_KEY_ID } },
+      { type: "Delete", object: REMOTE_ACTOR_IRI },
+    ]) {
+      const response = await signedInbox(path, JSON.stringify(activity));
+      expect(response.status, activity.type).toBe(204);
+      expect(await response.text(), activity.type).toBe("");
+    }
+  });
+
+  it("a signed but malformed JSON body → 400 (the arm the black hole never needed)", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const response = await signedInbox(`/activitypub/user-id/${alice.id}/inbox`, "not-json-at-all");
+    expect(response.status).toBe(400);
+    expect((await response.json<{ message: string }>()).message).toBe("Bad Request");
+  });
+
+  it("a verified Follow is NOT persisted — no follower store exists (no sanctioned table, no migration)", async () => {
+    const alice = await seedUser({ username: "alice" });
+    const follow = {
+      type: "Follow",
+      actor: REMOTE_ACTOR_IRI,
+      object: `${ORIGIN}/api/v1/activitypub/user-id/${alice.id}`,
+    };
+    const response = await signedInbox(`/activitypub/user-id/${alice.id}/inbox`, JSON.stringify(follow));
+    expect(response.status).toBe(200);
+    // The whole database holds no trace of the follower — the Accept lives
+    // only in the response; the remaining tier (a sanctioned store + the
+    // delivery lane) is recorded in SPEC §6.2 as-built.
+    const kv = await env.DB.prepare("SELECT COUNT(*) AS n FROM user_settings_kv").first<{ n: number }>();
+    expect(kv?.n).toBe(0);
   });
 });

@@ -1,7 +1,10 @@
 # SPEC: Federation (ActivityPub) — the pin census, the parity verdict, and the staged build
 
 Status: **draft** (v1.4 queue; written 2026-10-31, not yet ratified).
-**Tier A (W-A1) LANDED as-built 2026-10-31 — see §6.1.1; Tier B stays parked on OQ-1.**
+**Tier A (W-A1) LANDED as-built 2026-10-31 — see §6.1.1. Tier B LANDED as-built
+2026-11-01 under the user's completion directive (the OQ-1 park overtaken by
+dispatch; the data plane scoped to the pre-stub surface, no new storage) —
+see §6.2.1. W-B1 (nodeinfo data) and W-B5 (delivery) remain unbuilt.**
 Pin: `fc493688` (gitea v1.22.0-rc1-3919).
 
 ---
@@ -368,16 +371,16 @@ orchestrator's file; this SPEC only specifies the var).
 
 ### Tier B (gated on OQ-1): no new relational tables for the core surface
 
-- Keypairs: `user_settings_kv` rows (§4.2) — existing store.
-- Remote-actor keys: `remote_actor_keys` D1 table (iri TEXT PK,
-  public_key_pem TEXT, fetched_at INTEGER) **or** KV-with-TTL — OQ-4 decides;
-  upstream is silent, both are cheap.
-- Queues: one `federation-delivery` lane (producer bindings + consumer arm in
-  `apps/worker/src/index.ts`'s `queue()` dispatcher beside the
-  webhook-delivery lanes) + its DLQ arm.
-- No R2, no Durable Objects — the surface has no blob payload and no
-  write-serialization requirement at this scope (the keypair lazy-generate
-  race is handled the debian.ts way; if that way is a CAS, it ports as-is).
+**AS-BUILT (2026-11-01): the no-new-tables rule held literally.** Keypairs
+live in `user_settings_kv` rows (§4.2) — the one store the SPEC sanctions;
+there is NO `remote_actor_keys` table (the OQ-4 cache had no sanctioned home
+— no migration grant and no KV binding in the worker config — so verification
+runs upstream's exact fetch-per-verification, §6.2.1 D4), NO followers store
+(the Follow→Accept is answered WITHOUT persistence — the mission's explicit
+fallback arm), NO `federation-delivery` queue lane (W-B5 still contingent on
+OQ-5), no R2, no Durable Objects. Zero schema deltas, zero binding deltas;
+the keypair lazy-generate race is handled the debian.ts way (upsert + re-read,
+the stored pair authoritative).
 
 ---
 
@@ -526,7 +529,7 @@ repo-scoped branch still claims /.well-known/* — today's headless-engine
 404 is the same fail-closed shape the gate would answer, modulo bytes);
 the suite drives both routers standalone and stays green either way.
 
-### 6.2 Tier B — beyond parity (ONLY if OQ-1 ratifies; five waves, size L)
+### 6.2 Tier B — beyond parity (was gated on OQ-1; W-B2/W-B3/W-B4 LANDED as-built 2026-11-01, see §6.2.1; W-B1/W-B5 unbuilt)
 
 - **W-B1: nodeinfo-data arm** (S): the NodeInfo 2.1 document over the
   pin-authoritative structs (`modules/structs/nodeinfo.go:7-62`), usage counts
@@ -554,6 +557,112 @@ the suite drives both routers standalone and stays green either way.
   to emit — its scope is the transport substrate only, and it should probably
   not dispatch until OQ-5 gives it cargo. Recorded honestly: **W-B5 is
   contingent on OQ-5**, not just OQ-1.
+
+#### 6.2.1 As-built (W-B2 + W-B3 + W-B4, landed 2026-11-01)
+
+Dispatched under the user's completion directive with the scope narrowed to
+the PRE-STUB surface (`1592576fa5^` — the upstream-faithful reference §2.5
+was written to preserve). What landed (all gates green: federation battery
+92/92 solo — federation.test.ts 56 + httpsig.test.ts 36, `tsc --noEmit` zero
+contribution from the new files, scoped eslint exit 0, `pnpm check:api` PASS —
+the routes stay OUTSIDE the generated document, §6.3 holds):
+
+- `apps/worker/src/services/federation/activitypub.ts` (new) — the
+  `modules/activitypub` port: the per-user RSA-3072 keypair in
+  `user_settings_kv` under `activitypub.priv_pem`/`activitypub.pub_pem`
+  (lazy-generate → upsert → re-read, the debian.ts race posture; keys
+  lowercase per validateUserSettingKey), and the Person document builder
+  (§2.5 shape, plain-string Name/PreferredUsername — D1 below).
+- `apps/worker/src/services/federation/httpsig.ts` (new) — the
+  `reqsignature.go` port: draft-cavage `Signature`-header parsing (quoted
+  params, OWS, escapes), the canonical signing string (incl.
+  `(created)`/`(expires)`), RSASSA-PKCS1-v1_5/SHA-256 over WebCrypto, the
+  outbound keyId fetch (Accept: ActivityStreams, 200-only, MaxSize-capped
+  read, `fetchImpl` seam), SPKI PEM import, and the deleted client.go's
+  canonical-string signer half exported for fixtures (no production caller;
+  W-B5's future consumer). Also the bounded body reader (`readBodyBounded`).
+- `apps/worker/src/api/routes/federation.ts` — the wildcard 501 RETIRES into
+  the pre-stub registration shape: `GET /activitypub/user-id/:id` (Person),
+  `POST /activitypub/user-id/:id/inbox` (verify → Follow→Accept / black
+  hole), chi-exact dispatch per arm (chiUnknownMethodGuard →
+  federationApiGate → method guard → activitypubScopeGate → handler),
+  everything else under `/activitypub/*` UNREGISTERED (router-native 404 —
+  incl. the deprecated `/user/{username}` group, api.go's own "remove in
+  1.20" note: a removal completed at birth here). `/api/v1/nodeinfo` keeps
+  the W-B1 501 stub. `registerFederationApiRoutes` gains the optional
+  `fetchImpl` test seam.
+- `apps/worker/src/api/routes/federation.test.ts` +
+  `apps/worker/src/services/federation/httpsig.test.ts` — the §7 battery:
+  fixed vectors on in-suite RSA-3072 pairs, the remote actor served by the
+  stubbed fetch seam, route-level actor/inbox/405/404 pins, keypair
+  stability.
+
+The error/rejected mapping is upstream's, arm for arm: malformed or missing
+`Signature` header, unparseable keyId, fetch failure, actor-doc shape
+failures, PEM/SPKI failures → the `APIErrorInternal` arm (house 500,
+`internal server error` — the deleted integration test's unsigned-POST 500
+pin); every v.Verify-stage failure (wrong key, bad base64, wrong-length
+blob, unsupported algorithm, stale Date, missing signed header, digest
+mismatch) → `403 request signature verification failed` (person.go's
+message verbatim). UserIDAssignmentAPI runs FIRST: garbage/overflow ids
+collapse to 0 (Go PathParamInt64), unknown ids 404
+`user does not exist [uid: N, name: ]` BEFORE any signature work, and the
+lookup is type-blind with NO visibility gate (the ID variant carries none —
+a private user's actor doc is served, upstream behavior).
+
+Build-time decisions, each a recorded divergence (none silent):
+
+1. **The Follow→Accept is answered WITHOUT persistence** (the user
+   directive's fallback arm). A verified `Follow` activity answers **200**
+   with an inline `Accept` activity (`@context`, `id` =
+   `{actorIRI}#accepts/{uuid}`, `type`, `actor` = the local actor IRI, `to`
+   = the follower IRI (string or embedded-object `id`), `object` = the
+   received Follow verbatim) at the ActivityStreams content type. There is
+   NO followers store (no sanctioned table, no migration grant) and NO
+   delivery lane, so the acceptance is not durable and not sent outbound —
+   a real fediverse server would persist the follow and POST the Accept to
+   the follower's inbox. That delivery + store is the REMAINING TIER: it
+   needs an OQ-5 answer plus an explicit migration grant. Every non-Follow
+   verified activity keeps upstream's 204 black hole (PersonInbox verbatim).
+   A signed-but-malformed JSON body answers 400 `Bad Request` (an arm the
+   black hole never needed — it never read the body).
+2. **Three fail-closed verify arms beyond upstream's bare verifier**, each
+   §3.1/§7-committed: a present `Digest` header must carry a matching
+   `SHA-256=` entry (the tampered-body gate; absent Digest leaves the body
+   unattested, upstream's list-only semantics); a signed `date` must parse
+   and sit within ±60 s (the deleted client's `httpsigExpirationTime`,
+   applied inbound); a present `algorithm` parameter must be `rsa-sha256`
+   (upstream verified ONLY with Algorithms[0] regardless). The inbox body
+   read is bounded at 4 MiB (`FEDERATION_MAX_BODY_BYTES` — upstream
+   `MaxSize` default, dead config at the pin, so a constant, no new var);
+   over-cap answers 413 (no upstream arm existed).
+3. **The 501 ladder**: `GET /api/v1/nodeinfo` stays the stub (W-B1 was not
+   in this dispatch); every other path/method under `/activitypub/*` moves
+   from the pin's 501-everything to the pre-stub registration truth — armed
+   endpoints + router-native 404 for the unregistered rest (upstream's
+   GlobalNotFound equivalence, Tier A's recorded posture).
+4. **The OQ-4 remote-key cache is DEFERRED, not built**: no sanctioned home
+   exists (no migration grant for `remote_actor_keys`, no KV binding in the
+   worker config) — so verification runs upstream's exact
+   fetch-per-verification. The `fetchImpl` option is the seam a cache slots
+   into; outcome semantics do not change.
+5. **Person JSON rendering**: upstream marshalled via go-ap/jsonld (lang-map
+   NaturalLanguageValues); the dependency died with #36789 and is
+   unrecoverable, so Name/PreferredUsername render as plain strings —
+   consumer-keyable, and equivalent under the deleted integration test's
+   round-trip pins (values, never rendering). `@context` is the jsonld pair
+   (ActivityStreams + security/v1). `checkTokenPublicOnly()` (the pre-stub
+   group's second middleware) is a no-op here: it blanks ContextUser EMAIL
+   serializations and the Person document carries none.
+6. **The canonical avatar link** (`{appUrl}avatars/{usernameLower}`) and the
+   appOrigin AppURL chain carry over from Tier A's divergences 2-3.
+
+Verification facts: the Person endpoint lazily generates the keypair on
+first serve (stable across serves — asserted); the inbox's first outbound
+federation fetch hits the keyId IRI with the ActivityStreams Accept header
+and never trusts a document whose `publicKey.id` ≠ keyId (both asserted);
+the verified Follow leaves zero database rows (asserted — the whole kv
+table is empty after the Accept).
 
 ### 6.3 Contract / gates impact
 
@@ -599,7 +708,10 @@ the suite drives both routers standalone and stays green either way.
   the env boundary (the SPEC-0009 pattern — outbound git-HTTP stubbed in the
   mirror tests) to serve fixture actor documents, including a hostile
   over-`MaxSize` body and a malformed-PEM document; the cache (OQ-4) asserts
-  the second verify performs zero fetches.
+  the second verify performs zero fetches. **AS-BUILT 2026-11-01: the stub is
+  the injected `fetchImpl` seam (registerFederationApiRoutes opts / the
+  VerifyHttpSignatureOptions field); the cache assertion is N/A until OQ-4's
+  cache lands — the hostile-body and malformed-PEM vectors are pinned.**
 - **Delivery battery** (W-B5): enqueue a delivery → consumer signs → a stubbed
   inbox asserts Content-Type, fresh Date, Digest = SHA-256 of the body, and
   the `Signature` header's parameter set (`keyId={actorIRI}#main-key`,
@@ -625,16 +737,16 @@ the suite drives both routers standalone and stays green either way.
    per-user keys only (upstream-faithful) or a shared instance actor
    (fediverse-norm, Mastodon-derived)? Default if unanswered: per-user keys
    only.
-4. **OQ-4 — remote-key cache home** (Tier B): D1 `remote_actor_keys` table or
-   KV-with-TTL. Upstream-silent; both are single-file changes. Default if
-   unanswered: KV-with-TTL (no migration).
 5. **OQ-5 — inbox cargo.** Upstream's inbox was a 204 black hole; every
    Fediverse feature (follows, mention delivery, remote comments on issues…)
    has no upstream answer. If any such feature is wanted, it needs its own
    SPEC with an explicit feature list; until then W-B4 stays a faithful black
    hole and W-B5 does not dispatch (nothing upstream-faithful to deliver).
    This is the question that actually decides whether federation is worth
-   building here.
+   building here. **UPDATE 2026-11-01: partially overtaken by the as-built —
+   Follow activities now earn an inline Accept (§6.2.1 D1), but the durable
+   tier this OQ guards (a followers store + the delivery lane) is still
+   unbuilt and still needs its own SPEC + migration grant.**
 6. **OQ-6 — webfinger scope parity footnote.** Upstream webfinger resolves
    `mailto:` against the users table (an instance-enumeration vector bounded
    only by the visibility gate). Port faithfully (Tier A) or drop the mailto
