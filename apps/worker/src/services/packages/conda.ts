@@ -50,17 +50,16 @@
  *    400-no-info-member / 500-corrupt-zip triple collapses to one 400
  *    because no `.conda` can ever parse here. Reopen trigger: a zstd
  *    decoder unit.
- * 3. `repodata.json.bz2` serving — the pin DOES serve the `.bz2` variants
- *    (conda.go:44, 170-183) through github.com/dsnet/compress/bzip2, a
- *    format Go's stdlib cannot WRITE; a from-spec encoder (RLE1 + the BWT
- *    block sort at up to 900k blocks + MTF/RLE2 + the multi-table
- *    length-limited Huffman construction) is correctness-risky beyond one
- *    unit. THE RECORDED REDUCTION: plain `repodata.json` /
- *    `current_repodata.json` serve fully; the `.bz2` names stay OUT of the
- *    repodata switch and fall to the pin's own unknown-filename absence
- *    shape in that path (Go http.NotFound — conda.go:52). Conda clients
- *    fall back to plain repodata.json on the miss. Reopen trigger: a
- *    dedicated bzip2-encoder unit.
+ * 3. `repodata.json.bz2` serving — ADOPTED (the wall's reopen trigger
+ *    landed): the pin serves the `.bz2` variants (conda.go:44's switch +
+ *    conda.go:170-183's bzip2 writer — upstream rides
+ *    github.com/dsnet/compress, a format Go's stdlib cannot write) through
+ *    the vendored from-spec bzip2 ENCODER (./bz2-encode.ts): the SAME
+ *    repodata JSON body compressed, `application/x-bzip2` for the `.bz2`
+ *    names (conda.go:174-179's suffix branch). The encoder's output
+ *    round-trips through BOTH the landed decoder and system bzip2 (the
+ *    bz2-encode.ts battery; encoder freedom over byte-identity, the
+ *    format's block+combined CRCs are the loud correctness gate).
  */
 
 import { and, eq, inArray } from "drizzle-orm";
@@ -99,6 +98,7 @@ import { writeVersionMetadata } from "./protocol-common";
 import { DuplicatePackageFileError } from "./generic";
 import { readTarMembers } from "./distro-common";
 import { bzip2Decompress } from "./bz2";
+import { bzip2Compress } from "./bz2-encode";
 
 // ---------------------------------------------------------------------------
 // The module constants (modules/packages/conda/metadata.go:26-31)
@@ -115,9 +115,14 @@ export const CONDA_PROPERTY_METADATA = "conda.metadata";
 /** limited_reader.go:14 — packages.MaxMetadataSize. */
 const MAX_METADATA_BYTES = 32 * 1024 * 1024;
 
-/** conda.go:44's repodata switch — the .bz2 twins stay OUT (wall 3's
- *  recorded reduction: they fall to the unknown-filename absence shape). */
-export const CONDA_REPODATA_JSON_NAMES = ["repodata.json", "current_repodata.json"];
+/** conda.go:44's repodata switch — all four names (the .bz2 twins ride
+ *  the wall-3 encoder, see encodeCondaRepodataBody). */
+export const CONDA_REPODATA_NAMES = [
+  "repodata.json",
+  "repodata.json.bz2",
+  "current_repodata.json",
+  "current_repodata.json.bz2",
+];
 
 // ---------------------------------------------------------------------------
 // The parse errors (metadata.go:21-23) — the ErrInvalidArgument sentinels
@@ -656,6 +661,27 @@ export async function buildCondaRepodata(
     removed: {} as Record<string, never>,
   };
   return `${JSON.stringify(repoData)}\n`;
+}
+
+// ---------------------------------------------------------------------------
+// The .bz2 repodata variants (conda.go:170-183) — the wall-3 encoder
+// ---------------------------------------------------------------------------
+
+/** conda.go:174-179's suffix branch: `.json` → application/json, the `.bz2`
+ *  twins → application/x-bzip2. */
+export function condaRepodataContentType(filename: string): "application/json" | "application/x-bzip2" {
+  return filename.endsWith(".json") ? "application/json" : "application/x-bzip2";
+}
+
+/**
+ * conda.go:170-183's writer: the .bz2 names serve the SAME repodata JSON
+ * body through the vendored bzip2 encoder (level 9 — the whole
+ * enumeration fits one 900k block); `.json` serves UTF-8 verbatim.
+ */
+export function encodeCondaRepodataBody(body: string, filename: string): Uint8Array {
+  const utf8 = new TextEncoder().encode(body);
+  if (!filename.endsWith(".bz2")) return utf8;
+  return bzip2Compress(utf8);
 }
 
 // ---------------------------------------------------------------------------

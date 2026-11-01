@@ -43,6 +43,7 @@ import {
   CONDA_PROPERTY_METADATA,
   CONDA_PROPERTY_NAME,
   CONDA_PROPERTY_SUBDIR,
+  CONDA_REPODATA_NAMES,
   CondaArchiveError,
   CondaInvalidNameError,
   CondaInvalidStructureError,
@@ -52,6 +53,8 @@ import {
   buildCondaRepodata,
   condaCheckName,
   condaCheckVersion,
+  condaRepodataContentType,
+  encodeCondaRepodataBody,
   isCondaPackageFileName,
   loadCondaFileMetadata,
   openCondaFileForDownload,
@@ -60,6 +63,7 @@ import {
   uploadCondaPackageFile,
   type UploadCondaPackageInput,
 } from "./conda";
+import { bzip2Decompress } from "./bz2";
 import { base64ToBytes, bytesToHex } from "./distro-common";
 
 beforeAll(async () => {
@@ -558,6 +562,42 @@ describe("buildCondaRepodata (conda.go:55-187)", () => {
     const owner = { id: ownerRow.id, type: "user", visibility: "public" } as const;
     expect((await searchCondaFiles(env.DB, owner.id, "", "linux-64", "NUMPY-1.26.0-PY3H_0.TAR.BZ2")).length).toBe(1);
     expect((await searchCondaFiles(env.DB, owner.id, "", "linux-64", "missing.tar.bz2")).length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The repodata .bz2 variants (conda.go:44 + :170-183) — the wall-3 encoder
+// ---------------------------------------------------------------------------
+
+describe("the repodata .bz2 variants (conda.go:170-183)", () => {
+  it("the name switch carries exactly the pin's four repodata names", () => {
+    expect(CONDA_REPODATA_NAMES).toEqual([
+      "repodata.json",
+      "repodata.json.bz2",
+      "current_repodata.json",
+      "current_repodata.json.bz2",
+    ]);
+  });
+
+  it("the content type follows conda.go:174-179's suffix branch", () => {
+    expect(condaRepodataContentType("repodata.json")).toBe("application/json");
+    expect(condaRepodataContentType("current_repodata.json")).toBe("application/json");
+    expect(condaRepodataContentType("repodata.json.bz2")).toBe("application/x-bzip2");
+    expect(condaRepodataContentType("current_repodata.json.bz2")).toBe("application/x-bzip2");
+  });
+
+  it("the .bz2 body is the SAME repodata JSON through the encoder; .json is verbatim UTF-8", async () => {
+    await upload(ownerRow, ownerRow.id, { content: streamOf(fixtureBytes(F1_FULL)), filename: "a.tar.bz2" });
+    const owner = { id: ownerRow.id, type: "user", visibility: "public" } as const;
+    const body = (await buildCondaRepodata(env.DB, owner, "", "linux-64")) as string;
+
+    const plain = encodeCondaRepodataBody(body, "repodata.json");
+    expect(new TextDecoder().decode(plain)).toBe(body);
+
+    const compressed = encodeCondaRepodataBody(body, "repodata.json.bz2");
+    expect(Array.from(compressed)).not.toEqual(Array.from(plain)); // actually compressed
+    const roundTrip = bzip2Decompress(compressed);
+    expect(new TextDecoder().decode(roundTrip)).toBe(body);
   });
 });
 

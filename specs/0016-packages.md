@@ -131,7 +131,7 @@ wire-format module):
 | container (`api.go:509-547`) | ≈2,000 ln (routers 1,459: container 796 + blob 195 + manifest 416 + errors 52; plus services 314 + the wire module 204) | OCI: token → blob POST/PATCH/PUT chunked uploads, manifests | yes — JWT flow + upload state + digests | M5 |
 | debian / alpine / rpm / arch | each 300-600 ln | repo metadata index BUILDERS (`Packages`/`Release`/`APKINDEX`/`repodata`/`.repo` files) regenerated on upload/delete (`gitea/services/packages/cleanup/cleanup.go:115-145` rebuild arms) | yes — index files | M6 |
 | cargo (`api.go:156-172`) | ~600 ln + index.go | sparse index: `config.json` + `1|2|3/{name}` version lists derived on read (upstream's HTTP face builds them from the DB per request, cargo.go:66-87 → index.go:139-183); the **git repo** (`_cargo-index`, index.go:29) is only the traditional git-protocol mirror and stays the separate SPEC-attached milestone | yes — D1-derived; the git mirror deferred | **M7 LANDED** (see the cargo as-built) |
-| conan / composer / chef / conda / cran / go / pub / rubygems / swift / terraform / vagrant | each 150-700 ln | per-client wire contracts | protocol-only | long tail, demand-driven — RESOLVED per family at the 2026-11-01 adjudication: terraform **LANDED** (the as-built at the tail), conda **LANDED** (2026-11-01 — the three walls RESOLVED: the bz2 decoder adopted, the `.conda`/zstd + repodata-encoder reductions recorded; the as-built at the tail supersedes this row's earlier STAGED state) |
+| conan / composer / chef / conda / cran / go / pub / rubygems / swift / terraform / vagrant | each 150-700 ln | per-client wire contracts | protocol-only | long tail, demand-driven — RESOLVED per family at the 2026-11-01 adjudication: terraform **LANDED** (the as-built at the tail), conda **LANDED** (2026-11-01 — the three walls RESOLVED: the bz2 decoder adopted, the `.conda`/zstd reduction recorded, the repodata-encoder reduction reopened and ADOPTED the same day; the as-built at the tail supersedes this row's earlier STAGED state) |
 
 Verdict: the MODEL is the one shared prerequisite; the protocols are a
 staged family. Only **generic** is "plain UI/API CRUD"-sized — every other
@@ -651,8 +651,9 @@ idiom applies only where the vendored engine grows).
   over the SAME model; dispatch on demand, sizes S-M. (The 2026-11-01
   adjudication disposition: terraform LANDED — the as-built at the tail;
   [corrected 2026-11-01, the conda unit] conda LANDED too — the three walls
-  RESOLVED (the bz2 decoder adopted; the `.conda`/zstd and repodata-encoder
-  reductions recorded), the as-built at the tail; the census claim this
+  RESOLVED (the bz2 decoder adopted; the `.conda`/zstd reduction recorded;
+  the repodata-encoder reduction reopened and adopted — the bz2-encode
+  unit), the as-built at the tail; the census claim this
   closes: TWENTY-THREE of TWENTY-THREE.)
 
 Entry criteria: ratified SPEC (this document → accepted), then M1 as a
@@ -2165,7 +2166,7 @@ channel-prefixed names, the subdir composite key — an S-M unit once the
 codecs are decided. NOT counted toward the registry's parity claim until
 then: **the registry carries TWENTY-TWO of TWENTY-THREE**.
 
-## As-built — the long-tail `conda` family: the three walls RESOLVED (2026-11-01 — the staged row's decoder adopted, the zstd + encoder walls recorded as honest reductions; the census claim this section closes: **TWENTY-THREE of TWENTY-THREE**)
+## As-built — the long-tail `conda` family: the three walls RESOLVED (2026-11-01 — the staged row's decoder adopted; the wall-2 zstd reduction recorded, the wall-3 encoder reduction REOPENED AND ADOPTED the same day; the census claim this section closes: **TWENTY-THREE of TWENTY-THREE**)
 
 The STAGED section above named three Workers codec walls; this unit
 adjudicated each with the BUILD-or-record discipline (upstream parity is
@@ -2202,21 +2203,32 @@ documented reduction):
    400-no-info-member / 500-corrupt-zip triple collapses to one 400
    because no `.conda` can ever parse here. REOPEN TRIGGER: a zstd
    decoder unit.
-3. **`repodata.json.bz2` serving — RECORDED REDUCTION (wall 3).** The
-   pin DOES serve the `.bz2` variants (conda.go:44's switch +
+3. **`repodata.json.bz2` serving — ADOPTED (2026-11-01, the wall's
+   recorded reopen trigger landed: the dedicated bzip2-encoder unit).**
+   The pin DOES serve the `.bz2` variants (conda.go:44's switch +
    conda.go:170-183's bzip2 writer over github.com/dsnet/compress — a
-   format Go's stdlib cannot WRITE, so there is NO Go-stdlib reference
-   to port). Adjudication: a from-spec encoder (RLE1 + the BWT block
-   sort at up to 900k blocks + MTF/RLE2 + the multi-table
-   length-limited Huffman construction + selector optimization) is
-   >~700 lines and correctness-risky beyond one family unit. THE
-   REDUCTION: plain `repodata.json` / `current_repodata.json` serve
-   FULLY (the RepoData render, below); the `.bz2` names stay OUT of the
-   repodata switch and fall to the pin's own unknown-filename absence
-   shape in that path (Go http.NotFound — conda.go:52's arm; the
-   `404 page not found` page). Conda clients fall back to plain
-   repodata.json on the miss. REOPEN TRIGGER: a dedicated
-   bzip2-encoder unit.
+   format Go's stdlib cannot WRITE, so there was NO Go-stdlib reference
+   to port). The from-spec encoder landed as `services/packages/
+   bz2-encode.ts`: RLE1 (the 4+count pairs, pair-capped at 255, block
+   cuts BETWEEN pairs) → the BWT over the RLE bytes (rotation order via
+   a prefix-doubling suffix array of the DOUBLED block — O(n log n)
+   time, O(n) space; the doubled text is what makes the sort match the
+   inverse's cyclic semantics where a plain sentinel sort silently
+   breaks the T-chain) → MTF with RUNA/RUNB bijective-base-2 runs →
+   libbz2's nMTF-grouped 2-6 Huffman tables (length-capped at 20 by
+   frequency halving, canonical hbAssignCodes assignment) → the
+   selector MTF + unary list. Encoder freedom over byte-identity with
+   bzip2(1); correctness is self-checking (every block CRC + the
+   combined stream CRC) and was proven BOTH ways: the committed battery
+   round-trips every arm through the landed decoder AND the authoring
+   harness ran every arm (plus a 200-case mixed-shape fuzz, levels
+   1-9) through system `bzip2 -d` byte-for-byte (bzip2 1.0.8; the
+   empty and aaaaa outputs are byte-identical to the tool's). The
+   conda wiring: `CONDA_REPODATA_NAMES` carries all FOUR switch names
+   (conda.go:44), and the `.bz2` requests serve the SAME repodata JSON
+   body through `bzip2Compress` with `application/x-bzip2`
+   (conda.go:170-183's suffix branch; level 9 — an enumeration fits
+   one 900k block). Wall 2's zstd reduction below STAYS RECORDED.
 
 The built surface (api.go:263-267, the conan→conda→cran adjacency; one
 decoded-remainder walk carries the chi PathGroup's `<channel:*>`
@@ -2226,8 +2238,8 @@ chi NotFound page):
 
 - `GET /<architecture>/<filename>` (+HEAD) and the channel-prefixed
   twin — ListOrGetPackages (conda.go:41-53): the repodata switch
-  (the two `.json` names only — wall 3), then the package-filename
-  split, then http.NotFound;
+  (all FOUR names, conda.go:44 — the `.bz2` twins ride the wall-3
+  encoder), then the package-filename split, then http.NotFound;
 - the repodata render (conda.go:55-187): SearchFiles(channel, subdir)
   over the `conda.channel` PACKAGE property (exact match — the
   EMPTY-channel row is written at package creation and the default
@@ -2236,7 +2248,10 @@ chi NotFound page):
   `removed` in the struct order, the Go map-key sort (bytewise), the
   13-field PackageInfo order with `md5` rendering EMPTY (no WebCrypto
   MD5 — the landed blob-row note) and `depends` nil→[], and the
-  json.Encoder trailing newline; zero files → the 404-nil JSON;
+  json.Encoder trailing newline; zero files → the 404-nil JSON; the
+  `.bz2` names answer with the SAME body through `bzip2Compress` and
+  `application/x-bzip2` (conda.go:170-183's suffix branch), the
+  `.json` names verbatim with `application/json`;
 - the package download (conda.go:296-322): the search must answer
   EXACTLY one row (zero OR multiple is the 404 — conda.go:308's
   `len != 1`); the D-6 serve walk with the sniffed content type
@@ -2258,7 +2273,8 @@ chi NotFound page):
   application/json;charset=utf-8 (conda.go:26-35) with the 500s
   stripped to the prod posture's constant.
 
-Documented divergences: the two recorded walls above; the stored-
+Documented divergences: the recorded wall-2 zstd reduction above (the
+wall-3 encoder reduction was reopened and adopted — see wall 3); the stored-
 metadata JSON renders follow the Go struct tag orders with the
 omitempty sweep (`is_conda` has none — always present); the JSON
 decode gates reduce Go's int64-literal strictness to safe-integer

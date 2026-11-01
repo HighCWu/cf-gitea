@@ -6,9 +6,11 @@
  * sub-app at /api/packages):
  *
  *  - the arms: PUT (201, the raw-body upload), repodata.json /
- *    current_repodata.json (200 application/json), the package download
- *    (200, the D-6 disposition, the sniffed application/x-bzip2, the HEAD
- *    ride, the GET-only bump);
+ *    current_repodata.json (200 application/json), the .bz2 repodata
+ *    twins (200 application/x-bzip2 — the SAME body through the wall-3
+ *    encoder, bz2-encode.ts, byte-decodable back to the plain render),
+ *    the package download (200, the D-6 disposition, the sniffed
+ *    application/x-bzip2, the HEAD ride, the GET-only bump);
  *  - the apiError family body: `{"reason": http.StatusText, "message"}`
  *    over application/json;charset=utf-8 — the 404-nil enumeration miss,
  *    the 400-nil foreign-filename upload, the `.conda` invalid-structure
@@ -16,8 +18,6 @@
  *    invalid-name 400, the duplicate 409;
  *  - the chi walk: the channel-prefixed and NESTED-channel paths (the
  *    `(.*?/)?` optional wildcard), the empty/short paths' NotFound page;
- *  - the wall-3 reduction: repodata.json.bz2 answers the unknown-filename
- *    NotFound page (plain repodata.json serves fully);
  *  - the gates: anonymous write → 401 + the Basic challenge, anonymous read
  *    of a public owner → 200, a private owner's stranger 401, the size
  *    quota 403 with the admin bypass, PACKAGES_ENABLED=false → 404.
@@ -35,6 +35,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { packageVersions, users } from "../../db/schema";
 import { createEcosystemProtocolRouter } from "./packages-protocols";
 import { mintFor } from "../../auth/testing/seeds";
+import { bzip2Decompress } from "../../services/packages/bz2";
 import { base64ToBytes } from "../../services/packages/distro-common";
 
 beforeAll(async () => {
@@ -313,21 +314,36 @@ describe("conda route error arms", () => {
     expect(await db().select().from(packageVersions).all()).toHaveLength(1);
   });
 
-  it("the GET walk: unknown filenames and short paths ride the chi NotFound page; the .bz2 repodata twins answer it (wall 3)", async () => {
+  it("the .bz2 repodata twins answer the SAME body compressed (wall 3 adopted, conda.go:170-183); unknown filenames and short paths still ride the chi NotFound page", async () => {
     const owner = await seedUser("alice");
     const writer = await token(owner, "write:package");
     const call = protocol();
     const auth = authHeaders(writer);
     await put(call, "alice", "/pkg.tar.bz2", fixtureBytes(F1_FULL), auth);
 
-    // The .bz2 repodata twins stay OUT of the switch — the pin's
-    // unknown-filename absence shape (Go http.NotFound).
-    for (const name of ["repodata.json.bz2", "current_repodata.json.bz2"]) {
-      const bz2 = await call(`/api/packages/alice/conda/linux-64/${name}`, { headers: auth });
-      expect(bz2.status).toBe(404);
-      expect(bz2.headers.get("content-type")).toBe("text/plain; charset=utf-8");
-      expect(await bz2.text()).toBe("404 page not found\n");
+    // The .bz2 twins: 200 application/x-bzip2, decoding back to the exact
+    // plain repodata render (the wall-3 encoder over the same body).
+    for (const [jsonName, bz2Name] of [
+      ["repodata.json", "repodata.json.bz2"],
+      ["current_repodata.json", "current_repodata.json.bz2"],
+    ] as const) {
+      const plain = await call(`/api/packages/alice/conda/linux-64/${jsonName}`, { headers: auth });
+      expect(plain.status).toBe(200);
+      expect(plain.headers.get("content-type")).toBe("application/json");
+      const compressed = await call(`/api/packages/alice/conda/linux-64/${bz2Name}`, { headers: auth });
+      expect(compressed.status).toBe(200);
+      expect(compressed.headers.get("content-type")).toBe("application/x-bzip2");
+      const body = await compressed.arrayBuffer();
+      expect(body.byteLength).toBeGreaterThan(0);
+      const decoded = bzip2Decompress(new Uint8Array(body));
+      expect(new TextDecoder().decode(decoded)).toBe(await plain.text());
     }
+
+    // The empty-channel enumeration misses → the .bz2 twin 404-nil JSON
+    // (the same apiError shape as the plain name).
+    const miss = await call("/api/packages/alice/conda/noarch/repodata.json.bz2", { headers: auth });
+    expect(miss.status).toBe(404);
+    expect(miss.headers.get("content-type")).toBe("application/json;charset=utf-8");
 
     // A foreign filename in the download path — the same page.
     const stranger = await call("/api/packages/alice/conda/linux-64/something.txt", { headers: auth });

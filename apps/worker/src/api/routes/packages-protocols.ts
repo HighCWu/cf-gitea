@@ -451,11 +451,13 @@ import {
   uploadConanFile,
 } from "../../services/packages/conan";
 import {
-  CONDA_REPODATA_JSON_NAMES,
+  CONDA_REPODATA_NAMES,
   CondaInvalidNameError,
   CondaInvalidStructureError,
   CondaInvalidVersionError,
   buildCondaRepodata,
+  condaRepodataContentType,
+  encodeCondaRepodataBody,
   isCondaPackageFileName,
   openCondaFileForDownload,
   uploadCondaPackageFile,
@@ -5026,8 +5028,8 @@ async function condaListOrGetPackages(
   architecture: string,
   filename: string,
 ): Promise<Response> {
-  if (CONDA_REPODATA_JSON_NAMES.includes(filename)) {
-    return condaEnumerate(c, owner, channel, architecture);
+  if (CONDA_REPODATA_NAMES.includes(filename)) {
+    return condaEnumerate(c, owner, channel, architecture, filename);
   }
   if (isCondaPackageFileName(filename)) {
     return condaDownload(c, owner, channel, architecture, filename);
@@ -5035,14 +5037,26 @@ async function condaListOrGetPackages(
   return condaNotFoundPage();
 }
 
-/** EnumeratePackages (conda.go:55-187): the RepoData JSON render; the
- *  zero-files arm is the 404-nil (conda.go:102-105); the content type is
- *  the `.json` branch's application/json (the bzip2 branch is unreachable
- *  behind wall 3). */
-async function condaEnumerate(c: Context<{ Bindings: Env }>, owner: UserRow, channel: string, architecture: string): Promise<Response> {
+/** EnumeratePackages (conda.go:55-187): the RepoData render — the `.json`
+ *  names answer the plain document, the `.bz2` names the WALL-3-LIFTED
+ *  encoder arm (encodeCondaRepodataBody, application/x-bzip2); the
+ *  zero-files arm is the 404-nil (conda.go:102-105). */
+async function condaEnumerate(
+  c: Context<{ Bindings: Env }>,
+  owner: UserRow,
+  channel: string,
+  architecture: string,
+  filename: string,
+): Promise<Response> {
   try {
     const body = await buildCondaRepodata(c.env.DB, owner, channel, architecture);
     if (body === null) return condaApiError(404, "");
+    if (filename.endsWith(".bz2")) {
+      return new Response(encodeCondaRepodataBody(body, filename), {
+        status: 200,
+        headers: { "content-type": condaRepodataContentType(filename) },
+      });
+    }
     return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
   } catch (error) {
     if (error instanceof HTTPException) return error.getResponse();
