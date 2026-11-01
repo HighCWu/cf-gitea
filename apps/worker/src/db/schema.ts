@@ -316,7 +316,7 @@ export const repoTransfer = sqliteTable(
       .default(sql`(unixepoch())`),
     // -------------------------------------------------------------------------
     // The org-team attach list (migration 0061) — upstream `RepoTransfer.
-    // TeamIDs []int64` (models/repo/transfer.go:57-58, xorm JSON TEXT).
+    // TeamIDs []int64` (models/repo/transfer.go:72, xorm JSON TEXT).
     // Kept LAST per the ALTER ADD COLUMN append convention (see the
     // repositories table note). JSON id-list per the house convention
     // (protected_tags.allowlist_team_ids): `[]` when the target is a user —
