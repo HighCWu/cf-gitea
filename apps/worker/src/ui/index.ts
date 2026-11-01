@@ -1153,8 +1153,14 @@ import {
   IMPERSONATE_UNKNOWN_USER_ERROR,
   adminUserImpersonate,
 } from "./pages/admin-users-impersonate";
-import { adminUserAvatarDelete, adminUserAvatarUpload } from "./pages/admin-users-avatar";
+import { adminUserAvatarDelete, adminUserAvatarUpload, adminUserLink } from "./pages/admin-users-avatar";
 import { ADMIN_USERS_LIST_LINK, loadAdminUserDetail, renderAdminUserDetailPage } from "./pages/admin-user-detail";
+import {
+  loadAdminUserEdit,
+  parseAdminUserEditForm,
+  renderAdminUserEditPage,
+  submitAdminUserEdit,
+} from "./pages/admin-user-edit";
 import { loadOrgWorktimeData, renderOrgWorktimePage, resolveOrgWorktimePage } from "./pages/org-worktime";
 import {
   applyUserSettingsSecretForm,
@@ -3496,6 +3502,7 @@ export interface AdminRoute {
     | "admin-monitor-queue-manage"
     | "admin-monitor-queue-remove-all"
     | "admin-user-detail"
+    | "admin-user-edit"
     | "admin-users-impersonate"
     | "admin-user-avatar"
     | "admin-user-avatar-delete";
@@ -4262,6 +4269,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     // LIST at the handler per prepareUserInfo).
     if (tail.length === 2 && tail[0] === "users" && /^\d+$/.test(tail[1] as string)) {
       return { family: "admin-user-detail", adminUserId: Number.parseInt(tail[1] as string, 10) };
+    if (tail.length === 3 && tail[0] === "users" && tail[2] === "edit" && /^\d+$/.test(tail[1] as string)) {
+      return { family: "admin-user-edit", adminUserId: Number.parseInt(tail[1] as string, 10) };
+    }
     }
     if (tail.length === 3 && tail[0] === "users" && tail[2] === "impersonate" && /^\d+$/.test(tail[1] as string)) {
       return { family: "admin-users-impersonate", adminUserId: Number.parseInt(tail[1] as string, 10) };
@@ -12079,6 +12089,49 @@ async function adminUserDetailPage(c: Context<{ Bindings: Env }>, userId: number
   return p.respond(c.html(renderAdminUserDetailPage(p.ctx, { ...data, oauth2Enabled: oauth2FeatureEnabled(c.env) }), 200));
 }
 
+/** GET /-/admin/users/{userid}/edit (EditUser — the be89414 module's
+ *  mount; the null load is the LIST redirect like the detail page). */
+async function adminUserEditPage(c: Context<{ Bindings: Env }>, userId: number): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminUserEdit(c.env.DB, userId);
+  if (data === null) return p.respond(new Response(null, { status: 303, headers: { location: ADMIN_USERS_LIST_LINK } }));
+  return p.respond(
+    c.html(renderAdminUserEditPage(p.ctx, { ...data, error: null, errorField: null, oauth2Enabled: oauth2FeatureEnabled(c.env) }), 200),
+  );
+}
+
+/** POST the same shape (EditUserPost): unknown-target 303 LIST,
+ *  server-error 500 plain, invalid re-renders the FRESH row at 200 with
+ *  the error slot (the partial persist shows), updated 303 the detail. */
+async function adminUserEditSubmit(c: Context<{ Bindings: Env }>, userId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = parseAdminUserEditForm(await readUrlEncodedForm(c.req.raw));
+  // The prologue guarantees a signed admin; the narrow keeps it cast-free.
+  const doerId = p.ctx.viewer.kind === "user" ? p.ctx.viewer.id : 0;
+  const outcome = await submitAdminUserEdit(c.env.DB, userId, doerId, form);
+  if (outcome.outcome === "unknown-target") {
+    return p.respond(new Response(null, { status: 303, headers: { location: ADMIN_USERS_LIST_LINK } }));
+  }
+  if (outcome.outcome === "server-error") {
+    return p.respond(new Response("Internal Server Error", { status: 500 }));
+  }
+  if (outcome.outcome === "invalid") {
+    const fresh = await loadAdminUserEdit(c.env.DB, userId);
+    if (fresh === null) return p.respond(new Response(null, { status: 303, headers: { location: ADMIN_USERS_LIST_LINK } }));
+    return p.respond(
+      c.html(
+        renderAdminUserEditPage(p.ctx, { ...fresh, error: outcome.message, errorField: outcome.field, oauth2Enabled: oauth2FeatureEnabled(c.env) }),
+        200,
+      ),
+    );
+  }
+  return p.respond(new Response(null, { status: 303, headers: { location: adminUserLink(userId) } }));
+}
+
 /** POST /-/admin/users/{userid}/impersonate (the 9c929dc chain's mount):
  *  the four-outcome ladder — impersonated 303s to /user/settings,
  *  unknown-user 400s with upstream's JSON body, already-impersonating 500s
@@ -17134,6 +17187,9 @@ uiRouter.get("/-/admin/monitor/stacktrace", (c) => adminMonitorPage(c, "trace"))
 uiRouter.get("/-/admin/users", (c) => adminUsersPage(c));
 // The user detail page + the impersonate/avatar writes (web.go:817-821).
 uiRouter.get("/-/admin/users/:userid{\\d+}", (c) => adminUserDetailPage(c, Number.parseInt(c.req.param("userid"), 10)));
+// The edit combo (web.go:~819 — GET+POST on one shape).
+uiRouter.get("/-/admin/users/:userid{\\d+}/edit", (c) => adminUserEditPage(c, Number.parseInt(c.req.param("userid"), 10)));
+uiRouter.post("/-/admin/users/:userid{\\d+}/edit", (c) => adminUserEditSubmit(c, Number.parseInt(c.req.param("userid"), 10)));
 uiRouter.post("/-/admin/users/:userid{\\d+}/impersonate", (c) => adminUsersImpersonateSubmit(c, Number.parseInt(c.req.param("userid"), 10)));
 uiRouter.post("/-/admin/users/:userid{\\d+}/avatar", (c) => adminUserAvatarSubmit(c, Number.parseInt(c.req.param("userid"), 10)));
 uiRouter.post("/-/admin/users/:userid{\\d+}/avatar/delete", (c) => adminUserAvatarDeleteSubmit(c, Number.parseInt(c.req.param("userid"), 10)));
