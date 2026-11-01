@@ -1605,11 +1605,25 @@ export function registerPullRoutes(
         throw new ApiError(405, "Please try again later");
       }
 
+      // The STATE arm precedes the deps gate below — upstream's
+      // CheckPullMergeable order (check.go:171-173 < :219-223): a conflicted
+      // (or otherwise non-mergeable) PR answers ErrNotMergeableState's 405
+      // "Please try again later" (pull.go:938-939) even with open
+      // dependencies, NOT the deps text. Empty keeps upstream's carve-out
+      // (`!pr.IsEmpty()`, check.go:171-173): it passes here and either
+      // schedules through the MWCS arm below (its inner gate admits it) or
+      // falls to the direct path's trailing gate, which rejects it.
+      if (!manualMark && checked.status !== PRStatus.Mergeable && checked.status !== PRStatus.Empty) {
+        throw new ApiError(405, "Please try again later");
+      }
+
       // The open-dependency gate — CheckPullMergeable's FINAL arm
       // (check.go:219-223), never bypassed by force_merge (the deps check
       // sits outside the protection-failure escape) and NEVER skipped for the
       // Auto type (only the branch-protection failure is, check.go:184-186) —
-      // so it runs BEFORE the schedule arm below, exactly like the upstream
+      // so it runs AFTER the state arm above (check.go:171-173 < :219-223 —
+      // a conflicted PR's merge attempt answers the state 405, not this text)
+      // and BEFORE the schedule arm below, exactly like the upstream
       // handlers' single CheckPullMergeable call that precedes
       // ScheduleAutoMerge (api pull.go:929/994; web pull.go:1056/1135). The
       // manually-merged mark never reaches it (check.go:162-165 — the route's

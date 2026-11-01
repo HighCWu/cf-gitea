@@ -72,7 +72,10 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
   standing bootstrap SET (10 since the v1.5 freeze: admin bootstrap + six
   p0probe retry-mint rows + p0probe2 + p0probe3 + p0probe4; the earlier
   2-encoding — itself the 2026-10-28 two-user repair — predated the mint
-  churn; pass `--expect-tokens <n>` when the standing set differs, e.g.
+  churn, whose root cause is now FIXED — bootstrap-admin's mint carries the
+  API layer's duplicate-per-user guard (8e5c4ea), so re-runs skip instead of
+  adding rows; the six stale retry rows sweep at convergence; pass
+  `--expect-tokens <n>` when the standing set differs, e.g.
   local scratch users).
 
 ## Batteries and their canonical expectations
@@ -947,8 +950,10 @@ prints all of them verbatim.
   admin bootstrap + SIX p0probe retry-mint rows + p0probe2 + p0probe3 +
   p0probe4; the 2-encoding, itself the 2026-10-28 two-user repair of the
   historical whole-table=1 that false-fired from 2026-10-29, predated the
-  churn; `--expect-tokens <n>` overrides when the standing set changes
-  again).
+  churn, whose root cause is now FIXED — bootstrap-admin's mint carries the
+  API layer's duplicate-per-user guard (8e5c4ea), so re-runs skip instead of
+  adding rows; the six stale retry rows sweep at convergence;
+  `--expect-tokens <n>` overrides when the standing set changes again).
 
 ## Leftovers and hygiene
 

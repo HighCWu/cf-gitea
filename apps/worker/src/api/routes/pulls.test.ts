@@ -24,7 +24,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
-import { comments, issueAssignees, issueDependencies, issues, pullAutoMerges, pullRequests, repoUnits, userBlocking, users, repositories } from "../../db/schema";
+import { comments, issueAssignees, issueDependencies, issues, PRStatus, pullAutoMerges, pullRequests, repoUnits, userBlocking, users, repositories } from "../../db/schema";
 import { IssuesService } from "../../issues/service";
 import { CommentType } from "../../issues/comment-types";
 import { carryRepoCell } from "../../repos/carry";
@@ -996,6 +996,71 @@ describe("POST /pulls/{index}/merge: the schedule / manual / dependency arms", (
     if (landed.tag !== "committed") throw new Error(`seed main landing failed: ${landed.tag}`);
     return commit.oid;
   }
+
+  /** DIVERGED branches with a REAL content conflict — both sides rewrite
+   *  README.md after the shared root with different bytes (feature = root +
+   *  one commit, main = root + one commit), so the engine's merge plan
+   *  conflicts and the lazy check resolves the row to PRStatus.Conflict
+   *  (the check.go:171-173 shape seedMainAhead cannot produce: it only
+   *  advances main, which yields Ancestor). */
+  async function seedDivergedConflict(ownerLower: string, slug: string, rootTip: string): Promise<void> {
+    const cell = env.REPO.getByName(`${ownerLower}/${slug}`);
+    const person = { name: "seed", email: "seed@pulls.invalid", time: 1761000003, tz: "+0000" };
+    const land = async (ref: string, body: string, message: string): Promise<void> => {
+      const readme = new TextEncoder().encode(body);
+      const readmeOid = await gitObjectOid("blob", readme);
+      const tree = serializeTree([{ mode: "100644", name: "README.md", oid: readmeOid }]);
+      const commit = serializeCommit({ tree: tree.oid, parents: [rootTip], author: person, committer: person, message });
+      const put = await cell.putApiObjects([
+        { oid: readmeOid, type: "blob", data: readme },
+        { oid: tree.oid, type: "tree", data: tree.data },
+        { oid: commit.oid, type: "commit", data: commit.data },
+      ]);
+      if (put.tag !== "ok") throw new Error(`seed ${ref} putApiObjects failed: ${put.tag}`);
+      const landed = await cell.commitApiChange({ ref, expectedOldOid: rootTip, newOid: commit.oid });
+      if (landed.tag !== "committed") throw new Error(`seed ${ref} landing failed: ${landed.tag}`);
+    };
+    await land(branchRef("feature"), `# ${slug} (feature side)\n`, "feature conflict\n");
+    await land(branchRef("main"), `# ${slug} (main side)\n`, "main conflict\n");
+  }
+
+  it("answers a CONFLICTED PR with open dependencies 405 'Please try again later' — the state arm precedes the deps gate (check.go:171-173 < :219-223), NOT the deps text", async () => {
+    const slug = "conflictdeps";
+    const repoId = await seedRepo(1, "cf-gitea-stub", slug);
+    const rootTip = await seedEngineBranches("cf-gitea-stub", slug, ["feature"]);
+    await seedDivergedConflict("cf-gitea-stub", slug, rootTip);
+    const create = await router()(`/repos/cf-gitea-stub/${slug}/pulls`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "conflicted and blocked", head: "feature", base: "main" }),
+    });
+    expect(create.status).toBe(201);
+    const row = await db().select().from(issues).all();
+    expect(row).toHaveLength(1);
+    const issueId = Number(row[0]!.id);
+    // An OPEN blocker edge (models/issues/dependency.go:190-199) — the deps
+    // gate's trigger, which must answer SECOND here.
+    const blocker = await service().createIssue({
+      repoId,
+      title: "blocker",
+      posterId: 1,
+      content: null,
+      labelIds: [],
+      milestoneId: null,
+    });
+    await db().insert(issueDependencies).values({ userId: 1, issueId, dependencyId: Number(blocker.id), createdAt: new Date() });
+    expect(await db().select().from(issueDependencies).all()).toHaveLength(1);
+    const res = await router()(`/repos/cf-gitea-stub/${slug}/pulls/${row[0]!.index}/merge`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ do: "merge" }),
+    });
+    expect(res.status).toBe(405);
+    expect(await res.json()).toEqual({ message: "Please try again later", url: ERROR_URL });
+    // The pin's premise really held: the lazy check resolved CONFLICT (the
+    // state arm's trigger) and the merge never happened.
+    expect((await db().select().from(pullRequests).all())[0]).toMatchObject({ status: PRStatus.Conflict, hasMerged: false });
+  });
 
   it("answers an ANCESTOR PR's merge attempt 405 'Please try again later' — the ErrNotMergeableState arm (check.go:171-173 via issues/pull.go:446-448 → pull.go:938-939), NOT ErrHasMerged's body (pull.go:934-935)", async () => {
     const slug = "ancestormerge";

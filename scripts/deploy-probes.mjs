@@ -8599,7 +8599,7 @@ const auditSteps = (ctx) => [
   })),
   {
     id: "audit-personal-access-tokens",
-    expect: `personal_access_tokens = 10, the standing bootstrap set after the v1.5 mint churn (enumerated 2026-11-01: the admin bootstrap + SIX p0probe bootstrap rows — each orchestrator mint retry across the p0probe/p0probe2/3/4 session inserted a row, ids 122/130/131/134/137/138 — + p0probe2 + p0probe3 + p0probe4; the 2-encoding, itself the 2026-10-28 two-user repair of the historical whole-table=1 that false-fired from 2026-10-29, predated the churn; per-run PATs are DELETEd by the operator — --expect-tokens <n> overrides when the standing set changes again)`,
+    expect: `personal_access_tokens = 10, the standing bootstrap set after the v1.5 mint churn (enumerated 2026-11-01: the admin bootstrap + SIX p0probe bootstrap rows — each orchestrator mint retry across the p0probe/p0probe2/3/4 session inserted a row, ids 122/130/131/134/137/138 — + p0probe2 + p0probe3 + p0probe4; the 2-encoding, itself the 2026-10-28 two-user repair of the historical whole-table=1 that false-fired from 2026-10-29, predated the churn, whose root cause is now FIXED — bootstrap-admin's mint carries the API layer's duplicate-per-user guard (8e5c4ea), so re-runs skip instead of adding rows; the six stale retry rows sweep at convergence; per-run PATs are DELETEd by the operator — --expect-tokens <n> overrides when the standing set changes again)`,
     run: () => {
       const n = ctx.counts.personal_access_tokens;
       expect(n === opts.expectTokens, `${n} tokens (expected ${opts.expectTokens})`);
