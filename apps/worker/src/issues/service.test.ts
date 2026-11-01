@@ -366,6 +366,65 @@ describe("milestones (§3.2 basics)", () => {
       /milestone does not exist/,
     );
   });
+
+  // M3 (⑩-review P3): upstream UpdateMilestone → UpdateMilestoneCounters
+  // (models/issues/milestone.go:153-205) recounts num_issues/num_closed_issues
+  // from the issue rows on EVERY patch, so maintained-delta drift heals. Both
+  // tests drift the counters by direct D1 update (inflation and zeroing —
+  // opposite directions) and heal them through ordinary PATCHes.
+  it("a field PATCH recounts drifted counters from the issue rows (UpdateMilestoneCounters)", async () => {
+    const repoId = await seedRepo();
+    const svc = service();
+    const ms = await svc.createMilestone({ repoId, name: "m1" });
+    await svc.createIssue({ repoId, title: "open", milestoneId: ms.id });
+    const done = await svc.createIssue({ repoId, title: "done", milestoneId: ms.id });
+    await svc.closeIssue(done.id);
+    // Sanity: the maintained deltas before any drift.
+    const truth = await svc.getMilestone(ms.id);
+    expect(truth?.numIssues).toBe(2);
+    expect(truth?.numClosedIssues).toBe(1);
+    expect(truth?.completeness).toBe(50);
+
+    // A different repo's milestone holds its own issue — the recount filters
+    // by milestone_id alone, so the foreign row must not leak into ours.
+    const otherRepo = await seedRepo();
+    const other = await service().createMilestone({ repoId: otherRepo, name: "other" });
+    await svc.createIssue({ repoId: otherRepo, title: "foreign", milestoneId: other.id });
+
+    // Drift the row directly (bypasses the maintained deltas).
+    await env.DB.prepare("UPDATE milestones SET num_issues = 99, num_closed_issues = 99 WHERE id = ?")
+      .bind(ms.id)
+      .run();
+
+    // A no-op-ish field edit — no state change — still recounts.
+    const healed = await svc.updateMilestone(ms.id, { content: "release notes" });
+    expect(healed.numIssues).toBe(2);
+    expect(healed.numClosedIssues).toBe(1);
+    expect(healed.completeness).toBe(50);
+    // The foreign milestone keeps its own recount.
+    const otherRow = await svc.getMilestone(other.id);
+    expect(otherRow?.numIssues).toBe(1);
+  });
+
+  it("the state-flip arm heals drifted counters too", async () => {
+    const repoId = await seedRepo();
+    const svc = service();
+    const ms = await svc.createMilestone({ repoId, name: "m2" });
+    await svc.createIssue({ repoId, title: "a", milestoneId: ms.id });
+    const closedIssue = await svc.createIssue({ repoId, title: "b", milestoneId: ms.id });
+    await svc.closeIssue(closedIssue.id);
+    // Zero the counters (drift in the under-reporting direction).
+    await env.DB.prepare("UPDATE milestones SET num_issues = 0, num_closed_issues = 0 WHERE id = ?")
+      .bind(ms.id)
+      .run();
+
+    const flipped = await svc.updateMilestone(ms.id, { state: "closed" });
+    expect(flipped.isClosed).toBe(true);
+    expect(flipped.closedDateAt).not.toBeNull();
+    expect(flipped.numIssues).toBe(2);
+    expect(flipped.numClosedIssues).toBe(1);
+    expect(flipped.completeness).toBe(50);
+  });
 });
 
 describe("labels (§3.2 counters)", () => {

@@ -377,6 +377,39 @@ describe("GET /attachments/{uuid} — resolution matrix", () => {
     expect((await res.arrayBuffer()).byteLength).toBe(0);
   });
 
+  // The route's second mounted method (web.go:912 `Methods("GET, OPTIONS", …,
+  // optionsCorsHandler())`): with CORS disabled — the default — the handler's
+  // deny arm (web.go:79-82) answers every OPTIONS with bare 405 so a preflight
+  // cannot re-run the download handler (and double-count it).
+  it("answers a bare OPTIONS with the 405 deny twin; the download handler never ran; GET still serves", async () => {
+    const owner = await seedUser("attach-owner");
+    await seedRepo(PUBLIC_REPO_ID, PUBLIC_STORAGE_KEY, owner, "public");
+    const issue = await seedIssue(PUBLIC_REPO_ID, owner.id);
+    const payload = pngPayload();
+    const row = await seedIssueAttachment({
+      repoId: PUBLIC_REPO_ID,
+      storageKey: PUBLIC_STORAGE_KEY,
+      issueId: issue.id,
+      name: "shot.png",
+      content: payload,
+    });
+    const path = `/attachments/${row.uuid}`;
+
+    const options = await serve(path, { method: "OPTIONS" });
+    expect(options.status).toBe(405);
+    // the house 405 shape — empty body + the route's declared methods
+    expect(options.headers.get("allow")).toBe("GET, OPTIONS");
+    expect((await options.arrayBuffer()).byteLength).toBe(0);
+    // the deny arm's point: the OPTIONS request did NOT re-run the download
+    expect((await issueAttachmentRow(row.uuid)).downloadCount).toBe(0);
+
+    const get = await serve(path);
+    expect(get.status).toBe(200);
+    expect(new Uint8Array(await get.arrayBuffer())).toEqual(payload);
+    // bumped exactly once — by the GET, not the OPTIONS
+    expect((await issueAttachmentRow(row.uuid)).downloadCount).toBe(1);
+  });
+
   it("serves a private repo attachment to the owner (private reader) and hides it from strangers and anonymous", async () => {
     const owner = await seedUser("attach-owner");
     const stranger = await seedUser("attach-stranger");

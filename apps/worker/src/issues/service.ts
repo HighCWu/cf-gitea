@@ -1135,8 +1135,24 @@ export class IssuesService {
     return rows[0];
   }
 
-  /** Patch name/content/deadline and/or the lifecycle state; recomputes
-   *  completeness (upstream `BeforeUpdate` formula). */
+  /**
+   * Patch name/content/deadline and/or the lifecycle state — upstream
+   * `UpdateMilestone` (models/issues/milestone.go:163-181) runs
+   * `UpdateMilestoneCounters` (:192-205) on EVERY patch, so the counters
+   * are RECOUNTED from the issue rows rather than trusted: a drifted
+   * num_issues/num_closed_issues heals on the next edit, whatever the
+   * patched field. The recount's correlated subselects filter by
+   * `milestone_id = ?` alone — closed adds `is_closed = true` (:194-199);
+   * the repo conjunction is implied by milestone identity (ids are globally
+   * unique PKs), exactly like upstream. Completeness then recomputes from
+   * the RECOUNTED values in a follow-up statement (:201-204 — SQLite SET
+   * expressions see the pre-update row, so the split is load-bearing), and
+   * both statements ride one batch (upstream's WithTx). The state-flip arm
+   * (`oldIsClosed != m.IsClosed`) additionally fires
+   * `updateRepoMilestoneNum` (:165, :298-300) upstream — not ported: our
+   * repositories table carries no num_closed_milestones column (pre-existing
+   * §3.2 divergence, out of scope).
+   */
   async updateMilestone(id: number, patch: UpdateMilestonePatch): Promise<MilestoneRow> {
     const existing = await this.getMilestone(id);
     if (existing === null) throw new MilestoneNotExistError({ id });
@@ -1152,16 +1168,24 @@ export class IssuesService {
       set.isClosed = closing;
       set.closedDateAt = closing ? now : null;
     }
-    // Completeness recomputes on every patch (upstream `BeforeUpdate` formula).
-    const rows = await this.db
-      .update(milestones)
-      .set({
-        ...set,
-        completeness: sql`CASE WHEN num_issues > 0 THEN num_closed_issues * 100 / num_issues WHEN is_closed = 1 THEN 100 ELSE 0 END`,
-      })
-      .where(eq(milestones.id, id))
-      .returning()
-      .all();
+    const results = await this.db.batch([
+      this.db
+        .update(milestones)
+        .set({
+          ...set,
+          numIssues: sql`(SELECT count(*) FROM issues WHERE milestone_id = ${id})`,
+          numClosedIssues: sql`(SELECT count(*) FROM issues WHERE milestone_id = ${id} AND is_closed = 1)`,
+        })
+        .where(eq(milestones.id, id)),
+      this.db
+        .update(milestones)
+        .set({
+          completeness: sql`CASE WHEN num_issues > 0 THEN num_closed_issues * 100 / num_issues WHEN is_closed = 1 THEN 100 ELSE 0 END`,
+        })
+        .where(eq(milestones.id, id))
+        .returning(),
+    ] as const);
+    const rows = batchRows<MilestoneRow>(results[1], "milestone recount update");
     const row = rows[0];
     if (row === undefined) throw new MilestoneNotExistError({ id });
     return row;

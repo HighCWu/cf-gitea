@@ -166,10 +166,14 @@ import { clearSessionSetCookie, sessionCookieValue, sessionSetCookie, verifySess
  *
  * Divergences (beyond the inline notes): Range/If-Range (ServeUserContentByReader's
  * minimal single-range arm, serve.go:166-229) is not ported — bodies stream
- * whole from R2, the avatar-serving precedent; and the OPTIONS method of
- * upstream's `Methods("GET, OPTIONS", optionsCorsHandler())` is not carried
- * (CORS is disabled by default so optionsCorsHandler degenerates to re-running
- * the download — a preflight would double-count downloads).
+ * whole from R2, the avatar-serving precedent; and the CORS arm of
+ * optionsCorsHandler (the cors.Handler branch, web.go:67-73) is not carried
+ * (CORS is disabled by default). The deny arm IS carried: with CORS disabled
+ * upstream's optionsCorsHandler answers every OPTIONS on the route with bare
+ * 405 (web.go:79-82 — "it should explicitly deny OPTIONS requests if CORS
+ * handler is not executed, to avoid the next GET/POST handler being
+ * incorrectly called by the OPTIONS request"), so a bare OPTIONS on
+ * /attachments/{uuid} 405s instead of falling through to 404.
  *
  * AUTH — two credentials BESIDE each other, in the route's upstream group
  * order (SPEC-0010 §2.9: an attachments BROWSER route is a web surface, so
@@ -1220,3 +1224,16 @@ attachmentsServingRouter.on(["GET", "HEAD"], "/attachments/:uuid", async (c) => 
   const body = rest === null ? streamOf(prefix) : prependPrefix(prefix, rest);
   return respond(new Response(body, { status: 200, headers }));
 });
+
+// ---------------------------------------------------------------------------
+// OPTIONS /attachments/{uuid} — the optionsCorsHandler deny twin (web.go:912
+// mounts `Methods("GET, OPTIONS", optionsCorsHandler(), …)`; with CORS
+// disabled — the default — web.go:79-82 explicitly denies every OPTIONS with
+// bare 405 "to avoid the next GET/POST handler being incorrectly called by
+// the OPTIONS request", i.e. a preflight must not re-run the download and
+// double-count it). The house 405 shape (index.ts's methodNotAllowed twin,
+// replicated module-locally like issue-write-tails.ts): empty body + Allow.
+// ---------------------------------------------------------------------------
+attachmentsServingRouter.on(["OPTIONS"], "/attachments/:uuid", () =>
+  new Response(null, { status: 405, headers: { allow: "GET, OPTIONS" } }),
+);
