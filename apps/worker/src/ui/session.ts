@@ -4,7 +4,12 @@
  *
  *   GET  /login   — the form (renders anonymous; a valid session redirects)
  *   POST /login   — verify PAT → mint the sessions row → Set-Cookie
- *   POST /logout  — delete the row (id + digest match), clear the cookie
+ *   POST /logout  — delete the row (id + digest match), clear the cookie;
+ *                   the admin-impersonation EXIT arm (upstream SignOut's
+ *                   ExitImpersonatedUser fold, auth.go:469-478 — a session
+ *                   carrying the `impersonator_user_id` backup is restored,
+ *                   the cookie stays, the redirect lands on /-/admin; NO
+ *                   unimpersonate route exists at the pin)
  *
  * Both routes are TOP-LEVEL (§2.1): the dispatcher needs no route-table
  * change — they are not repo-scoped (segments.length < 2), fall through to
@@ -41,7 +46,7 @@
  */
 
 import { Hono, type Context } from "hono";
-import { and, eq, lt } from "drizzle-orm";
+import { and, eq, isNotNull, isNull, lt, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { D1FailureLimiter } from "../auth/failure-limiter";
@@ -251,6 +256,16 @@ export type SessionVerification =
        *  rotation re-sets the cookie with this persistence (upstream
        *  re-sets the remember cookie, auth.go:127). */
       remember: boolean;
+      /** Admin impersonation (the sanctioned 2a00e28 follow-up): the
+       *  ADMIN's users.id behind this impersonated session
+       * (`sessions.impersonator_user_id`), or `null` when the session is
+       * not impersonating anyone. The shell's banner channel
+       * (templates/base/head_impersonate_banner.tmpl — the banner renders
+       * for every authenticated request whose session carries the backup);
+       * the authority decision NEVER reads it — the doer is the target,
+       * verbatim upstream (KeyUID flipped, context.go's IsDoerSession-
+       * Impersonated is display-only). */
+      impersonatorUserId: number | null;
       /** Background work: the throttled `last_seen_at` touch when due (§3). */
       background: Promise<unknown>[];
     };
@@ -369,6 +384,7 @@ export async function verifySession(
     user: { id: row.user.id, username: row.user.username, isAdmin: row.user.isAdmin },
     setCookie,
     remember: row.session.remember,
+    impersonatorUserId: row.session.impersonatorUserId,
     background,
   };
 }
@@ -460,6 +476,93 @@ export async function mintSession(
   return `${id}:${secret}`;
 }
 
+// ---------------------------------------------------------------------------
+// Admin impersonation (the sanctioned 2a00e28 follow-up — upstream
+// services/auth/impersonate.go:14-77 over the D1 session store)
+// ---------------------------------------------------------------------------
+
+/** The flip's outcomes (§2.4 posture): `impersonating` — the row now reads
+ *  user_id = target ∧ impersonator_user_id = admin; `already-impersonating`
+ *  — upstream's refusal (impersonate.go:16-18, KeyImpersonatorData already
+ *  set); `no-session` — the row vanished between the caller's verify and
+ *  the flip (expired / reuse-detection-deleted mid-request). */
+export type ImpersonateOutcome = "impersonating" | "already-impersonating" | "no-session";
+
+/**
+ * The in-place flip (upstream `ImpersonateUser`, impersonate.go:14-44):
+ * the admin's id is backed up into `impersonator_user_id` and `user_id`
+ * moves to the target — ONE guarded UPDATE
+ * (`… WHERE id = ? AND impersonator_user_id IS NULL`), so the
+ * already-impersonating refusal is race-free (a second flip can never
+ * overwrite the first admin's backup; upstream's get-then-set on the
+ * in-memory store has the same guarantee by construction). Identity-only:
+ * the row's clocks (`rotated_at`, `expires_at`, `last_seen_at`) and the
+ * secret are untouched — the SAME cookie keeps authenticating, now as the
+ * target (upstream flips KeyUID inside the live session; no re-issue).
+ *
+ * Upstream additionally backs up `KeyUserHasTwoFactorAuth` and sets it true
+ * for the impersonated stretch (impersonate.go:22-24, 37 — the target's
+ * 2FA is never re-prompted); our §2.2 sessions carry no 2FA key, so the
+ * backup is the single id. The bot-target guard (users.go:569-571,
+ * IsTypeBot → JSONError) is a DOCUMENTED DEAD ARM: our users.type is the
+ * SPEC-0002 two-value enum with no bot value, so no row can trip it.
+ */
+export async function impersonateSessionUser(
+  d1: D1Database,
+  sessionId: string,
+  adminUserId: number,
+  targetUserId: number,
+): Promise<ImpersonateOutcome> {
+  const db = drizzle(d1);
+  const flip = await db
+    .update(sessions)
+    .set({ userId: targetUserId, impersonatorUserId: adminUserId })
+    .where(and(eq(sessions.id, sessionId), isNull(sessions.impersonatorUserId)))
+    .run();
+  if ((flip.meta.changes ?? 0) > 0) return "impersonating";
+  // The guard rejected the write: the row is gone, or it is already
+  // impersonating (the refusal). One read disambiguates.
+  const row = await db
+    .select({ impersonatorUserId: sessions.impersonatorUserId })
+    .from(sessions)
+    .where(eq(sessions.id, sessionId))
+    .get();
+  if (row === undefined) return "no-session";
+  return "already-impersonating";
+}
+
+/**
+ * The exit arm (upstream `ExitImpersonatedUser`, impersonate.go:46-63,
+ * folded into SignOut — routers/web/auth/auth.go:469-478; there is NO
+ * dedicated unimpersonate route at the pin): the backup is restored —
+ * `user_id = impersonator_user_id`, the column cleared — in ONE statement
+ * keyed (id, digest) like `deleteSessionBySecret`, additionally guarded on
+ * the column being set. `false` = not impersonating (or the (id, digest)
+ * presentation didn't match, or the row is gone): the caller falls through
+ * to the ordinary logout, which is exactly upstream's shape (SignOut's
+ * `exitedImpersonated == false` arm destroys the session). The session
+ * CONTINUES after an exit — the same id:secret cookie authenticates as the
+ * admin, so the exit response must NOT clear the cookie (upstream keeps
+ * the same session store entry; only the keys flip back).
+ */
+export async function exitImpersonationBySecret(d1: D1Database, value: string): Promise<boolean> {
+  const parsed = parseCookieValue(value);
+  if (parsed === null) return false;
+  const digest = await sha256Hex(parsed.secret);
+  const result = await drizzle(d1)
+    .update(sessions)
+    .set({ userId: sql`${sessions.impersonatorUserId}`, impersonatorUserId: null })
+    .where(
+      and(
+        eq(sessions.id, parsed.id),
+        eq(sessions.sha256Digest, digest),
+        isNotNull(sessions.impersonatorUserId),
+      ),
+    )
+    .run();
+  return (result.meta.changes ?? 0) > 0;
+}
+
 /**
  * The §2.4 authority decision for LOGOUT — read-only, no side effects. A
  * forged logout must not become a lockout lever: reuse-detection deletion
@@ -468,14 +571,18 @@ export async function mintSession(
  * lookup decides "valid session" (current digest matches, active individual
  * doer) without deleting, rotating, or touching `last_seen_at`; a stale
  * in-grace previous cookie is anonymous exactly like §2.4 ("must not
- * authenticate"). Returns the doer slice, or `null` for every
- * not-authenticated outcome.
+ * authenticate"). Returns the doer slice extended with the ROW's id and the
+ * impersonation backup (`sessionId` — the flip's and the exit arm's key;
+ * `impersonatorUserId` — logout's branch condition, `null` on every
+ * non-impersonating session), or `null` for every not-authenticated
+ * outcome. The extension is additive: the shape stays assignable to
+ * `SessionUser` for the OAuth2 login consumers.
  */
 export async function lookupValidSession(
   d1: D1Database,
   value: string,
   options?: { now?: Date },
-): Promise<SessionUser | null> {
+): Promise<(SessionUser & { sessionId: string; impersonatorUserId: number | null }) | null> {
   const now = options?.now ?? new Date();
   const parsed = parseCookieValue(value);
   if (parsed === null) return null;
@@ -490,7 +597,13 @@ export async function lookupValidSession(
   const digest = await sha256Hex(parsed.secret);
   if (!(await timingSafeDigestEqual(row.session.sha256Digest, digest))) return null;
   if (row.user.status !== "active" || row.user.type !== "user") return null;
-  return { id: row.user.id, username: row.user.username, isAdmin: row.user.isAdmin };
+  return {
+    id: row.user.id,
+    username: row.user.username,
+    isAdmin: row.user.isAdmin,
+    sessionId: row.session.id,
+    impersonatorUserId: row.session.impersonatorUserId,
+  };
 }
 
 /**
@@ -831,7 +944,18 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
  *  delete the row by id AND matching digest; on anything else leave rows
  *  alone (reuse detection owns mismatch deletion). Either way the cookie is
  *  cleared (Max-Age=0, same flags) and the response redirects to `/` —
- *  idempotent: logging out without a session is a clean redirect. */
+ *  idempotent: logging out without a session is a clean redirect.
+ *
+ *  The impersonation EXIT arm rides this route (upstream SignOut folds
+ *  ExitImpersonatedUser in — routers/web/auth/auth.go:469-478; NO
+ *  unimpersonate route exists at the pin): a session carrying the
+ *  `impersonator_user_id` backup is RESTORED instead of deleted
+ *  (`exitImpersonationBySecret` — user_id back to the admin, the column
+ *  cleared) and the response redirects to `/-/admin` WITHOUT touching the
+ *  cookie — the same session continues as the admin. A lost exit race (the
+ *  backup cleared between the lookup and the guarded write) falls through
+ *  to the ordinary delete exactly like upstream's `exitedImpersonated ==
+ *  false` arm (auth.go:476-478) — the session then destroys. */
 async function logout(c: RouteContext): Promise<Response> {
   // §2.8 layer 2 — logout is a non-GET UI route.
   const guard = sameOriginGuard(c.req.raw);
@@ -843,7 +967,13 @@ async function logout(c: RouteContext): Promise<Response> {
     // must not delete rows); the (id, digest) delete covers only a valid
     // presentation.
     const valid = await lookupValidSession(c.env.DB, value);
-    if (valid !== null) await deleteSessionBySecret(c.env.DB, value);
+    if (valid !== null) {
+      if (valid.impersonatorUserId !== null) {
+        const exited = await exitImpersonationBySecret(c.env.DB, value);
+        if (exited) return seeOther("/-/admin"); // the session continues — no Set-Cookie
+      }
+      await deleteSessionBySecret(c.env.DB, value);
+    }
   }
   return seeOther("/", clearSessionSetCookie());
 }

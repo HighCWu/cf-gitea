@@ -950,6 +950,63 @@ function DemoBanner() {
 }
 
 // ---------------------------------------------------------------------------
+// The impersonation banner (templates/base/head_impersonate_banner.tmpl —
+// the admin impersonation arm's display half)
+// ---------------------------------------------------------------------------
+
+/** Chrome text for the impersonation banner — the component-local pattern
+ *  (the tabLocale/createLocale precedent above; locale.ts is shared and not
+ *  this wave's file). Upstream keys at the pin:
+ *  admin.users.impersonating_notice = "You are impersonating
+ *  <strong>%s</strong>. Actions you take are performed as this user." and
+ *  admin.users.impersonate_stop = "Stop impersonating" — split around the
+ *  <strong> interpolation the template's `%s` carries. */
+const impersonationBannerLocale = {
+  notice_prefix: "You are impersonating ",
+  notice_suffix: ". Actions you take are performed as this user.",
+  stop: "Stop impersonating",
+} as const;
+
+/**
+ * The impersonation banner (templates/base/head_impersonate_banner.tmpl,
+ * rendered by head_navbar.tmpl:148 right after the nav — the same slot this
+ * branch rides below). Upstream arms it on `ctx.ImpersonatedUser`
+ * (context_template.go:70-76 — the doer of a session whose
+ * KeyImpersonatorData is set); ours arms on the viewer's
+ * `impersonatorUserId` session backup. The markup is the template's verbatim
+ * class set (`ui warning message site-banner-container` >
+ * `flex-text-block site-banner-content` > octicon-alert + the
+ * `tw-flex-1` notice + the stop control); the ONE adaptation is the stop
+ * control: upstream's `<a href="/user/logout">` is a GET anchor — our
+ * /logout is POST-only (§2.7's link-preview/prefetch footgun reduction) —
+ * so the control is the navbar's POST form+button carrying the anchor's
+ * exact `ui compact tiny button hover-opaque` classes. Gate off (anonymous,
+ * plain sessions — every default render) the branch emits NOTHING:
+ * byte-identical pages (the goldens pin it). The exit itself is POST
+ * /logout's restore arm (session.ts — auth.go:469-478's SignOut fold,
+ * redirecting /-/admin).
+ */
+function ImpersonationBanner(props: { username: string }) {
+  return (
+    <div class="ui warning message site-banner-container">
+      <div class="flex-text-block site-banner-content">
+        <Icon name="octicon-alert" />
+        <span class="tw-flex-1">
+          {impersonationBannerLocale.notice_prefix}
+          <strong>{props.username}</strong>
+          {impersonationBannerLocale.notice_suffix}
+        </span>
+        <form method="post" action="/logout">
+          <button type="submit" class="ui compact tiny button hover-opaque">
+            {impersonationBannerLocale.stop}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // BaseLayout
 // ---------------------------------------------------------------------------
 
@@ -1022,6 +1079,15 @@ export function BaseLayout(props: {
         <div class="full height">
           <noscript>{locale.enable_javascript}</noscript>
           <Navbar viewer={ctx.viewer} activeNav={props.activeNav} notificationCount={ctx.notificationCount} />
+          {/* The impersonation banner (head_navbar.tmpl:148's slot — right
+              after the nav, ahead of the demo banner, the template pair's
+              relative order): armed ONLY on a session carrying the
+              impersonator backup (viewer.impersonatorUserId) — the exit is
+              POST /logout's restore arm. Gate off it emits NOTHING:
+              byte-identical pages (the goldens pin it). */}
+          {ctx.viewer.kind === "user" && ctx.viewer.impersonatorUserId != null ? (
+            <ImpersonationBanner username={ctx.viewer.username} />
+          ) : null}
           {/* SPEC-0014 §4.4 (M2): the demo banner rides the ctx flag — armed
               ONLY when the assembler set `demoMode` from the §2 gate. Gate
               off (absent/false — every default deployment) this branch emits

@@ -1978,6 +1978,43 @@ export const sessions = sqliteTable(
      *  modules/setting/oauth2.go:110). Bounded at write (SPEC §7.6, 8 KiB
      *  hard cap; identity fields never truncate). */
     oauth2LoginState: text("oauth2_login_state"),
+    /** Admin impersonation (SPEC-0010 §3 extension — the sanctioned
+     *  2a00e28 follow-up): the ADMIN's users.id behind an impersonated
+     *  session, NULL on every non-impersonating session (minted rows and
+     *  pre-0058 rows alike — no backfill). The port of upstream's
+     *  in-session `impersonatorData` backup (services/auth/impersonate.go:
+     *  14-44 — the admin's KeyUID stashed under session.KeyImpersonatorData
+     *  before KeyUID flips to the target): our session row carries identity
+     *  ONLY through `user_id`, and the two TEXT OAuth payload columns are
+     *  narrow read-and-CLEARED dance state that any OAuth round-trip would
+     *  wipe mid-impersonation — so the backup gets its own column.
+     *
+     *  - POST /-/admin/users/{userid}/impersonate flips the row IN PLACE:
+     *    user_id = target ∧ impersonator_user_id = admin (the flip refuses
+     *    when the column is already set — upstream's "already impersonating
+     *    a user" guard, impersonate.go:16-18).
+     *  - The EXIT folds into POST /logout (upstream SignOut,
+     *    routers/web/auth/auth.go:469-478): impersonator_user_id set means
+     *    the delete becomes a RESTORE (user_id = impersonator, the column
+     *    cleared) and the redirect lands on /-/admin. There is NO dedicated
+     *    unimpersonate route at the pin.
+     *  - Every verify (session.ts verifySession) reads the column through
+     *    the existing sessions ⋈ users join and exposes it as
+     *    SessionVerification.impersonatorUserId — the shell's banner
+     *    channel (templates/base/head_impersonate_banner.tmpl).
+     *  - The bot guard is a documented DEAD arm: upstream refuses
+     *    IsTypeBot() targets (users.go:569-571), but our users.type has no
+     *    bot value (SPEC-0002's two-value enum), so the branch is
+     *    unreachable here — recorded, not ported.
+     *
+     *  FK posture mirrors `user_id`: ON DELETE CASCADE — deleting the
+     *  impersonator admin kills the impersonated session outright (a ghost
+     *  restorer id must not survive its account). Nullable: D1/SQLite ALTER
+     *  TABLE ADD COLUMN carries no default and no backfill burden
+     *  (migration 0058). */
+    impersonatorUserId: integer("impersonator_user_id").references(() => users.id, {
+      onDelete: "cascade",
+    }),
   },
   (t) => [
     index("sessions_user_idx").on(t.userId),

@@ -23,6 +23,14 @@ export type Viewer =
       readonly id: number;
       readonly username: string;
       readonly isAdmin: boolean;
+      /** Admin impersonation (the sanctioned 2a00e28 follow-up): the
+       *  session's `impersonator_user_id` backup — the ADMIN behind this
+       *  impersonated session — or `null`/absent when not impersonating.
+       *  Display-only (the shell's impersonation banner,
+       *  templates/base/head_impersonate_banner.tmpl); authority is the
+       *  target's, verbatim upstream. Optional: unarmed viewer literals
+       *  stay byte-identical. */
+      readonly impersonatorUserId?: number | null;
     };
 
 /** The viewer plus the session cookie directive the RESPONSE must carry
@@ -73,7 +81,17 @@ export async function resolveViewer(
   }
   const { id, username, isAdmin } = verification.user;
   return {
-    viewer: { kind: "user", id, username, isAdmin },
+    // The impersonation backup rides ONLY when set (absent == not
+    // impersonating): unarmed viewers stay the exact pre-impersonation
+    // shape, so exact-shape consumers (goldens, toEqual assertions) never
+    // see the new key (the first-run suite's viewer pins).
+    viewer: {
+      kind: "user",
+      id,
+      username,
+      isAdmin,
+      ...(verification.impersonatorUserId !== null ? { impersonatorUserId: verification.impersonatorUserId } : {}),
+    },
     // ALWAYS a full directive (§2.7): the rotation arm's raw id:secret is
     // wrapped here so consumers attach setCookie as-is (the double-wrap the
     // dashboard matrix caught — resolveUiSession re-wrapped the clear arm's

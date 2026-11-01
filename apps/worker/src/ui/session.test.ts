@@ -17,6 +17,11 @@
  *   is alive, the 30-days-of-use survival, and the idle deaths.
  * - Logout: valid / cookieless / forged presentations (§2.7: forged logout
  *   leaves rows untouched — reuse detection owns mismatch deletion).
+ * - Admin impersonation (the sanctioned 2a00e28 follow-up): the flip over
+ *   the session store + the already-impersonating refusal
+ *   (services/auth/impersonate.go at the pin), the logout EXIT arm
+ *   (auth.go:469-478's SignOut fold — restore, cookie stays, /-/admin),
+ *   and the shell banner exposure through the real pipeline.
  * - Boundary (§2.9): a session cookie authorizes nothing on /api/v1 or
  *   git-HTTP.
  * - The login page golden (deterministic render, committed bytes) + the §5.5
@@ -47,6 +52,8 @@ import {
   SESSION_COOKIE_NAME,
   clearSessionSetCookie,
   deleteSessionBySecret,
+  exitImpersonationBySecret,
+  impersonateSessionUser,
   lookupValidSession,
   mintSession,
   rotateSession,
@@ -668,6 +675,160 @@ describe("POST /logout (§2.7)", () => {
     // The forged arm still leaves the row untouched (asserted above in the
     // forged arm's own test) — the clear directive is response-side only.
     expect(await drizzle(env.DB).select().from(sessions).all()).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------------
+// Admin impersonation (the sanctioned 2a00e28 follow-up) — the flip over the
+// session store, the logout EXIT arm (upstream SignOut's
+// ExitImpersonatedUser fold, auth.go:469-478 — NO unimpersonate route at
+// the pin), and the shell banner exposure
+// (templates/base/head_impersonate_banner.tmpl) through the real pipeline.
+// ---------------------------------------------------------------------------------
+
+describe("admin impersonation — flip, logout exit arm, banner exposure", () => {
+  /** Root (site admin) + Alice (the plain target), with Root's live session
+   *  minted at T. */
+  async function seedImpersonation(): Promise<{ adminId: number; targetId: number; cookieValue: string; sessionId: string }> {
+    const admin = await seedUser({ username: "Root", isAdmin: true });
+    const target = await seedUser({ username: "Alice" });
+    // REAL-clock mints: the block's route-level halves (POST /logout, the
+    // page renders) run through the live pipeline, whose verifies read the
+    // wall clock — the T-epoch fixtures above are for the time-travel
+    // service arms only.
+    const cookieValue = await mintSession(env.DB, admin.id);
+    return {
+      adminId: admin.id,
+      targetId: target.id,
+      cookieValue,
+      sessionId: cookieValue.split(":")[0] ?? "",
+    };
+  }
+
+  it("verifySession exposes impersonatorUserId — null on a plain mint, the admin backup on a flipped session", async () => {
+    const { adminId, targetId, cookieValue, sessionId } = await seedImpersonation();
+
+    const plain = await verifySession(env.DB, cookieValue);
+    expect(plain.outcome).toBe("authenticated");
+    if (plain.outcome === "authenticated") {
+      expect(plain.user.id).toBe(adminId);
+      expect(plain.impersonatorUserId).toBeNull();
+    }
+
+    expect(await impersonateSessionUser(env.DB, sessionId, adminId, targetId)).toBe("impersonating");
+    const flipped = await verifySession(env.DB, cookieValue);
+    expect(flipped.outcome).toBe("authenticated");
+    if (flipped.outcome === "authenticated") {
+      // The doer is the TARGET (authority verbatim upstream — KeyUID
+      // flipped), the backup rides alongside for the banner.
+      expect(flipped.user.id).toBe(targetId);
+      expect(flipped.user.isAdmin).toBe(false);
+      expect(flipped.impersonatorUserId).toBe(adminId);
+    }
+  });
+
+  it("a second flip refuses ('already impersonating a user', impersonate.go:16-18) and never overwrites the first backup", async () => {
+    const { adminId, targetId, sessionId } = await seedImpersonation();
+    expect(await impersonateSessionUser(env.DB, sessionId, adminId, targetId)).toBe("impersonating");
+
+    const secondAdmin = (
+      await drizzle(env.DB)
+        .insert(users)
+        .values([{ username: "Theta", usernameLower: "theta", isAdmin: true, status: "active", createdAt: new Date(T) }])
+        .returning({ id: users.id })
+        .all()
+    )[0]!.id;
+    expect(await impersonateSessionUser(env.DB, sessionId, secondAdmin, targetId)).toBe("already-impersonating");
+    const row = await drizzle(env.DB).select().from(sessions).where(eq(sessions.id, sessionId)).get();
+    expect(row?.userId).toBe(targetId);
+    expect(row?.impersonatorUserId).toBe(adminId); // the FIRST admin's backup survives
+  });
+
+  it("POST /logout on an impersonating session RESTORES the admin: 303 /-/admin, the cookie STAYS, the session continues", async () => {
+    const { adminId, targetId, cookieValue, sessionId } = await seedImpersonation();
+    expect(await impersonateSessionUser(env.DB, sessionId, adminId, targetId)).toBe("impersonating");
+
+    const res = await request("/logout", {
+      method: "POST",
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${cookieValue}` },
+    });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/-/admin"); // auth.go:474's redirect target
+    expect(cookieHeader(res)).toBe(""); // the session CONTINUES — no Set-Cookie of any kind
+
+    const row = await drizzle(env.DB).select().from(sessions).where(eq(sessions.id, sessionId)).get();
+    expect(row?.userId).toBe(adminId); // restored from the backup
+    expect(row?.impersonatorUserId).toBeNull(); // the backup cleared
+
+    // The SAME cookie authenticates as the admin again (upstream keeps the
+    // session store entry; only the keys flip back).
+    const next = await verifySession(env.DB, cookieValue);
+    expect(next.outcome).toBe("authenticated");
+    if (next.outcome === "authenticated") {
+      expect(next.user.id).toBe(adminId);
+      expect(next.impersonatorUserId).toBeNull();
+    }
+  });
+
+  it("the exit's guarded write refuses a forged presentation (the deleteSessionBySecret guard posture)", async () => {
+    const { adminId, targetId, sessionId } = await seedImpersonation();
+    expect(await impersonateSessionUser(env.DB, sessionId, adminId, targetId)).toBe("impersonating");
+
+    expect(await exitImpersonationBySecret(env.DB, `${sessionId}:${"f".repeat(64)}`)).toBe(false);
+    const row = await drizzle(env.DB).select().from(sessions).where(eq(sessions.id, sessionId)).get();
+    expect(row?.userId).toBe(targetId); // untouched
+    expect(row?.impersonatorUserId).toBe(adminId);
+  });
+
+  it("POST /logout on a PLAIN session still deletes + clears (the exit arm never hijacks the ordinary logout)", async () => {
+    const { adminId, cookieValue } = await seedImpersonation();
+    const res = await request("/logout", {
+      method: "POST",
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${cookieValue}` },
+    });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/");
+    expect(cookieHeader(res)).toBe(clearSessionSetCookie());
+    expect(await drizzle(env.DB).select().from(sessions).all()).toHaveLength(0);
+    expect(adminId).toBeGreaterThan(0);
+  });
+
+  it("the shell renders the impersonation banner for a flipped session only (head_impersonate_banner.tmpl's shape)", async () => {
+    const { adminId, targetId, cookieValue, sessionId } = await seedImpersonation();
+    await seedRepo(
+      { id: targetId, username: "Alice", usernameLower: "alice" },
+      "public",
+      "public",
+    );
+
+    // Plain session: no banner node anywhere (the goldens' byte-stability
+    // arm — every default render stays identical).
+    const plain = await request("/alice/public", {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, targetId)}` },
+    });
+    expect(plain.status).toBe(200);
+    expect(await plain.text()).not.toContain("site-banner-container");
+
+    // Flipped session: the banner renders in upstream's class set, the
+    // TARGET's name interpolated (ctx.ImpersonatedUser → Doer), and the
+    // stop control POSTs /logout (our §2.7 POST-only adaptation of the
+    // template's GET anchor).
+    expect(await impersonateSessionUser(env.DB, sessionId, adminId, targetId)).toBe("impersonating");
+    const impersonated = await request("/alice/public", {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${cookieValue}` },
+    });
+    expect(impersonated.status).toBe(200);
+    const html = await impersonated.text();
+    expect(html).toContain("ui warning message site-banner-container");
+    expect(html).toContain("You are impersonating");
+    expect(html).toContain("<strong>Alice</strong>");
+    expect(html).toContain("Actions you take are performed as this user.");
+    expect(html).toContain("Stop impersonating");
+    expect(html).toContain('method="post" action="/logout"');
+    // The doer chrome follows the TARGET (the navbar shows alice), while
+    // the admin backup stays display-only.
+    expect(html).toContain('id="navbar-username"');
+    expect(html).not.toContain('href="/login"');
   });
 });
 
