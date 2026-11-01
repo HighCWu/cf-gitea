@@ -22,6 +22,7 @@ import { repositories, users, webhookDeliveries, webhooks } from "../../db/schem
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { RepositoryWithOwner } from "../../api/services/repository";
+import { shortSha } from "../page-data";
 import { ensureSeededRepo, type SeedCommit } from "../testing/seed-repo";
 import {
   createWikiPageFromForm,
@@ -40,7 +41,9 @@ import {
   renderWikiStartPage,
   renderWikiViewPage,
   wikiLocale,
+  wikiTipOf,
 } from "./repo-wiki";
+import { loadWikiCommitDiffPatch, parseWikiCommitDownloadTail, parseWikiCommitViewTail } from "./wiki-commit-diff";
 
 // --- fixtures -----------------------------------------------------------------
 
@@ -152,7 +155,8 @@ describe("smoke: the view family (view.tmpl, content + sidebar + dropdown)", () 
     expect(sidebar.title).toBe("_Sidebar");
 
     const data = await loadWikiViewData(env, pair, "", ORIGIN);
-    if (data.outcome !== "view") throw new Error(`expected view, got ${data.outcome}`);
+    // The page-name arm (the commit-diff twin carries kind "commit-diff").
+    if (data.outcome !== "view" || data.kind === "commit-diff") throw new Error(`expected page view, got ${data.outcome}`);
     expect(data.title).toBe("Home");
     expect(data.pageUrl).toBe("Home");
     // The shared markdown pipeline in wiki mode: the heading carries the
@@ -371,5 +375,125 @@ describe("smoke: the webhook emissions family (the UI writer's path)", () => {
     expect(payloads[1]?.comment).toBe("ui msg");
     expect(payloads[2]?.page).toBe("Hook-Page-Renamed");
     expect(payloads[2]?.comment).toBe(""); // the Go-zero field (delete takes no comment upstream)
+  });
+});
+
+// --- 7. the COMMIT-DIFF family (web.go:1619-1620 — the PageIsWiki commit
+//        page + the .diff/.patch downloads, both over the SIBLING wiki cell
+//        through pages/wiki-commit-diff.tsx; the view rides the view loader,
+//        the downloads' raw serving arm is index.ts work — the interim
+//        folds are pinned in test 2)
+
+describe("smoke: the commit-diff family (web.go:1619-1620 over the wiki cell)", () => {
+  it("serves the revision-diff view through the view loader and renders the PageIsWiki commit page", async () => {
+    const { ctx, pair } = await ensureFixtures();
+    // A SLASHED + SPACED title: the codec stores the flat QueryEscaped git
+    // entry (`Docs%2FDiff-Guide.md`) — the raw downloads' blob read-back
+    // exercises the wikiEnginePath encode below.
+    const created = await createWikiPageFromForm(
+      env,
+      pair,
+      DOER,
+      parseWikiPageForm(new URLSearchParams({ title: "Docs/Diff Guide", content: "# diff guide\n\nkept line\n", message: "create the diff guide" })),
+      ORIGIN,
+    );
+    expect(created.title).toBe("Docs/Diff Guide"); // the DISPLAY title (toWikiPageMetaData)
+    expect(created.sub_url).toBe("Docs%2FDiff-Guide"); // the coded WebPath — the flat stored entry's escape
+    const tip = await wikiTipOf(env, pair);
+    if (tip === undefined) throw new Error("wiki tip missing");
+    const sha = tip.target;
+
+    // The view arm: the commit tail parses OUT of the page-name path
+    // (upstream chi specificity — web.go:1619's pattern beats `/*`).
+    const data = await loadWikiViewData(env, pair, `commit/${sha}`, ORIGIN);
+    if (data.outcome !== "view" || data.kind !== "commit-diff") throw new Error(`expected commit-diff view, got ${data.outcome}`);
+    expect(data.view.commit.oid).toBe(sha);
+    expect(data.view.commit.subject).toBe("create the diff guide");
+    expect(data.title).toBe(`create the diff guide · ${shortSha(sha)}`);
+    expect(data.view.files.map((file) => file.file.path)).toEqual(["Docs%2FDiff-Guide.md"]); // the flat stored entry
+
+    const html = renderWikiViewPage({ ctx, data, canWrite: true });
+    // The commit-page discriminator (commit_page.tmpl:5) + the WIKI active
+    // tab (the group's PageIsWiki data).
+    expect(html).toContain('<div role="main" aria-label="create the diff guide · ' + shortSha(sha) + '" class="page-content repository diff">');
+    expect(html).toContain('<a class="active item" href="/alice/wikismoke/wiki" data-shortcut-keys="g w">');
+    // The sha labels ride the WIKI commit base (commit_page.tmpl:2's Iif).
+    expect(html).toContain(`href="${REPO_LINK}/wiki/commit/${sha}"`);
+    // The header-button block is PageIsWiki-gated OFF (commit_page.tmpl:12).
+    expect(html).not.toContain("Browse Source");
+    // The identity sentence (committer is author — the DOER wrote it).
+    expect(html).toContain("committed");
+    // The diff box for the wiki page entry (box.tmpl's DOM, one file).
+    expect(html).toContain('data-new-filename="Docs%2FDiff-Guide.md"');
+    expect(html).toContain('data-line-type="add"');
+    expect(html).toContain("<code class=\"code-inner\"># diff guide</code>");
+  });
+
+  it("renders the raw downloads as git-apply-valid bytes over the wiki cell", async () => {
+    const { pair } = await ensureFixtures();
+    const tip = await wikiTipOf(env, pair);
+    if (tip === undefined) throw new Error("wiki tip missing");
+    const sha = tip.target;
+
+    // `.diff` — the plain unified diff (GetRawDiff's RawDiffNormal arm over
+    // the wiki repo): the stored flat entry name in the headers, the
+    // new-file shape, a count-consistent hunk (the renderer's git-apply
+    // validity — the byte-exact markers contract is the renderer suite's).
+    const diffBody = await loadWikiCommitDiffPatch(env, pair, sha, "diff");
+    if (diffBody === null) throw new Error("expected the .diff body over the wiki commit");
+    const diff = diffBody;
+    expect(diff.startsWith("diff --git a/Docs%2FDiff-Guide.md b/Docs%2FDiff-Guide.md\n")).toBe(true);
+    expect(diff).toContain("new file mode 100644");
+    expect(diff).toContain("--- /dev/null");
+    expect(diff).toContain("+++ b/Docs%2FDiff-Guide.md");
+    expect(diff).toMatch(/^@@ -0,0 \+1,3 @@$/m);
+    expect(diff).toContain("+# diff guide");
+    expect(diff).toContain("+kept line"); // the byte-exact trailing-newline contract is the renderer suite's
+
+    // `.patch` — the git-am mail WITHOUT the signature tail (the commit
+    // arm's --no-signature parity, diff.go:73).
+    const patchBody = await loadWikiCommitDiffPatch(env, pair, sha, "patch");
+    if (patchBody === null) throw new Error("expected the .patch body over the wiki commit");
+    const patch = patchBody;
+    expect(patch.startsWith(`From ${sha} Mon Sep 17 00:00:00 2001\n`)).toBe(true);
+    expect(patch).toContain("From: alice <alice@noreply.test.local>");
+    expect(patch).toContain("Subject: [PATCH] create the diff guide");
+    expect(patch).toContain("\n---\n");
+    expect(patch).toContain("diff --git a/Docs%2FDiff-Guide.md");
+    expect(patch.includes("\n-- \n")).toBe(false); // no `-- \n<version>` tail
+  });
+
+  it("folds the grammar misses upstream's way (unknown sha, pattern misses, the dotted interim)", async () => {
+    const { pair } = await ensureFixtures();
+    const tip = await wikiTipOf(env, pair);
+    if (tip === undefined) throw new Error("wiki tip missing");
+    const sha = tip.target;
+
+    // Grammar unit pins: the two patterns and their misses.
+    expect(parseWikiCommitViewTail(`commit/${sha}`)).toEqual({ sha });
+    expect(parseWikiCommitDownloadTail(`commit/${sha}.patch`)).toEqual({ sha, ext: "patch" });
+    expect(parseWikiCommitViewTail(`commit/${sha}/extra`)).toBeNull(); // one-segment pattern
+    expect(parseWikiCommitDownloadTail("commit/zzz.diff")).toBeNull(); // non-hex sha
+
+    // A well-shaped UNKNOWN sha: the download loader nulls (the serving
+    // arm's §4.5 shell — the diffpatch family's convention); the view arm
+    // interim-folds to the family's missing outcome (upstream Diff 404s —
+    // the loader cannot answer a 404 through the fixed outcome set, the
+    // module doc carries the disclosure).
+    const ghost = "a".repeat(40);
+    expect(await loadWikiCommitDiffPatch(env, pair, ghost, "diff")).toBeNull();
+    expect(await loadWikiCommitDiffPatch(env, pair, ghost, "patch")).toBeNull();
+    expect(await loadWikiViewData(env, pair, `commit/${ghost}`, ORIGIN)).toEqual({ outcome: "missing" });
+
+    // Uppercase hex is a PATTERN miss (web.go's lowercase-only class) — the
+    // tail stays a page name, upstream's combo fold.
+    expect(await loadWikiViewData(env, pair, `commit/${sha.toUpperCase()}`, ORIGIN)).toEqual({ outcome: "missing" });
+    // Plain grammar misses keep the page-name path (a page literally named
+    // "commit/zzz" would be shadowed only for the HEX shapes).
+    expect(await loadWikiViewData(env, pair, "commit/zzz", ORIGIN)).toEqual({ outcome: "missing" });
+    // The dotted download tail is NOT the view arm — the page-name fold
+    // answers until the raw serving arm lands in index.ts (the module
+    // doc's dispatch posture; upstream serves the bytes at web.go:1620).
+    expect(await loadWikiViewData(env, pair, `commit/${sha}.diff`, ORIGIN)).toEqual({ outcome: "missing" });
   });
 });

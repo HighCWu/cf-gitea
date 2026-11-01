@@ -116,6 +116,7 @@ import { wikiBranch, wikiCell } from "../../services/wiki";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";import type { UiManifest } from "../manifest";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { createWikiPageFromForm, parseWikiPageForm, wikiTipOf } from "./repo-wiki";
+import { loadWikiCommitDiffPatch } from "./wiki-commit-diff";
 
 // --- fixtures -------------------------------------------------------------------
 
@@ -730,5 +731,141 @@ describe("the ?page= revision pager at CommitsRangeSize (50)", () => {
     const junkHtml = await junk.text();
     expect(junkHtml.split('class="commit-summary"').length - 1).toBe(50); // parsePageNumber folds to page 1
     expect(junkHtml).toContain("Older</span>");
+  });
+});
+
+// --- the commit-diff arm (web.go:1619-1620 — the revision-diff view + the
+//     raw downloads' tail grammars, pages/wiki-commit-diff.tsx) --------------
+//
+// APPENDED LAST ON PURPOSE: the merge fixture below MOVES the w107wik ref
+// (append-only — every earlier pin on Home's history stays valid; nothing
+// after this describe reads the w107wik tip). The download tails' raw
+// SERVING is index.ts work pending at report time (a raw-text Response
+// cannot pass the page handler), so the dotted tail's route-level fold is
+// pinned here as the interim page-name 303 — upstream-exact for every
+// non-hex shape, an interim divergence for hex+suffix tails only.
+
+describe("the wiki commit-diff arm (web.go:1619 — the PageIsWiki commit page)", () => {
+  it("admits the commit tail through the wiki family catch-all and serves the diff view", async () => {
+    // The claim: the tail rides family "wiki" with the decoded rawTail (the
+    // parse-level admission — the commit grammars parse inside the loader).
+    expect(parseUiRoute(`/w107gal/w107wik/wiki/commit/${"a".repeat(40)}`)).toMatchObject({
+      family: "wiki",
+      owner: "w107gal",
+      repo: "w107wik",
+      rawTail: `commit/${"a".repeat(40)}`,
+    });
+    expect(handlesUiRoute(`/w107gal/w107wik/wiki/commit/${"a".repeat(40)}`)).toBe(true);
+
+    // A dedicated probe page — this describe owns its commit (the earlier
+    // describes' writes leave the tip wherever their round-trips ended).
+    const pair = await pairFor("w107wik");
+    await createWikiPageFromForm(
+      env,
+      pair,
+      DOER,
+      parseWikiPageForm(new URLSearchParams({ title: "Diff Arm Probe", content: "# diff arm\n", message: "diff arm subject probe" })),
+      ORIGIN,
+    );
+    const tip = await wikiTipOf(env, pair);
+    if (tip === undefined) throw new Error("w107wik tip missing");
+    const sha = tip.target;
+
+    const res = await get(`/w107gal/w107wik/wiki/commit/${sha}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The commit-page discriminator (commit_page.tmpl:5) — NOT a wiki view.
+    expect(html).toContain('class="page-content repository diff"');
+    expect(html).toContain("diff arm subject probe"); // the probe commit's subject
+    // The sha labels ride the WIKI commit base (commit_page.tmpl:2's Iif)
+    // and the header buttons are PageIsWiki-gated OFF (:12).
+    expect(html).toContain(`href="${REPO_LINK}/wiki/commit/${sha}"`);
+    expect(html).not.toContain("Browse Source");
+    // The diff box for the seeded page entry (the codec's dash form —
+    // spaces become dashes in the WebPath, so the stored name is plain).
+    expect(html).toContain('data-new-filename="Diff-Arm-Probe.md"');
+  });
+
+  it("folds the well-shaped unknown sha and the dotted download tail to the page-name 303 (the interim arms)", async () => {
+    const pair = await pairFor("w107wik");
+    const tip = await wikiTipOf(env, pair);
+    if (tip === undefined) throw new Error("w107wik tip missing");
+    // Unknown-but-well-shaped: upstream Diff 404-shells (commit.go's
+    // IsErrNotExist → ctx.NotFound); the fixed handler outcome set cannot
+    // answer a 404 — the family's missing fold answers until the serving
+    // arm's not-found mapping lands (disclosed to the orchestrator).
+    const ghost = await get(`/w107gal/w107wik/wiki/commit/${"a".repeat(40)}`);
+    expect(ghost.status).toBe(303);
+    expect(ghost.headers.get("location")).toBe(PAGES_ACTION);
+    // The dotted download tail is NOT the view arm: upstream serves the raw
+    // bytes (web.go:1620); the raw Response cannot pass the page handler —
+    // the loader + grammar ship in pages/wiki-commit-diff.tsx, the serving
+    // arm is index.ts work (the interim fold is upstream-exact for every
+    // non-hex shape).
+    const dotted = await get(`/w107gal/w107wik/wiki/commit/${tip.target}.diff`);
+    expect(dotted.status).toBe(303);
+    expect(dotted.headers.get("location")).toBe(PAGES_ACTION);
+  });
+
+  it("renders a MERGE commit's .patch as the non-merge side-commit series over the wiki cell", async () => {
+    // The merge world: one side commit + a merge ON TOP of the current tip
+    // (the matrix's seedWikiHistory posture — raw cell pushes; append-only).
+    const pair = await pairFor("w107wik");
+    const cell = wikiCell(env, pair);
+    const ref = branchRef(wikiBranch(pair));
+    const tip = await wikiTipOf(env, pair);
+    if (tip === undefined) throw new Error("w107wik tip missing");
+    const baseTip = tip.target;
+    const encoder = new TextEncoder();
+    const sideBlob = await buildBlobObject(encoder.encode("# wiki side\n"));
+    const homeBlob = await buildBlobObject(encoder.encode("# Home base\n")); // the fixture Home content
+    const sideTree = serializeTree([{ name: "Side.md", mode: "100644", oid: sideBlob.oid }]);
+    const person: Person = { name: DOER.name, email: DOER.email, time: T0 + 9_000, tz: "+0000" };
+    const side = serializeCommit({
+      tree: sideTree.oid,
+      parents: [baseTip],
+      author: person,
+      committer: person,
+      message: "side: wiki merge fixture",
+    });
+    const mergeTree = serializeTree([
+      { name: "Home.md", mode: "100644", oid: homeBlob.oid },
+      { name: "Side.md", mode: "100644", oid: sideBlob.oid },
+    ]);
+    const merge = serializeCommit({
+      tree: mergeTree.oid,
+      parents: [baseTip, side.oid],
+      author: person,
+      committer: person,
+      message: "merge the wiki side",
+    });
+    const stored = await cell.putApiObjects([
+      sideBlob,
+      { oid: sideTree.oid, type: sideTree.type, data: sideTree.data },
+      { oid: side.oid, type: side.type, data: side.data },
+      homeBlob,
+      { oid: mergeTree.oid, type: mergeTree.type, data: mergeTree.data },
+      { oid: merge.oid, type: merge.type, data: merge.data },
+    ]);
+    if (stored.tag !== "ok") throw new Error(`merge seed objects refused: ${stored.tag}`);
+    const landed = await cell.commitApiChange({ ref, expectedOldOid: baseTip, newOid: merge.oid });
+    if (landed.tag !== "committed") throw commitApiChangeError(landed);
+
+    // .patch over the merge: the non-merge side series (format-patch skips
+    // merges — diff.go:87-99) — ONE bare-[PATCH] mail for the side commit,
+    // never a merge mail, no signature tail (the commit arm's shape).
+    const patch = await loadWikiCommitDiffPatch(env, pair, merge.oid, "patch");
+    if (patch === null) throw new Error("expected the merge .patch body");
+    expect(patch.startsWith(`From ${side.oid} Mon Sep 17 00:00:00 2001\n`)).toBe(true);
+    expect(patch).toContain("Subject: [PATCH] side: wiki merge fixture");
+    expect(patch).not.toContain(`From ${merge.oid} `);
+    expect(patch).not.toContain("merge the wiki side");
+    expect(patch).not.toContain("\n-- \n");
+    // .diff over the merge: the first-parent tree delta (RawDiffNormal) —
+    // the side's file, not a whole-tree re-diff.
+    const diff = await loadWikiCommitDiffPatch(env, pair, merge.oid, "diff");
+    if (diff === null) throw new Error("expected the merge .diff body");
+    expect(diff).toContain("diff --git a/Side.md b/Side.md");
+    expect(diff).toContain("+");
   });
 });

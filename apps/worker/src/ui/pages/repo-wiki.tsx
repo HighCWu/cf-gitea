@@ -21,6 +21,11 @@
  *   m.Get("/blob_excerpt/{sha}", …)                        web.go:1618 (the
  *                                                   landed wiki-blob-excerpt twin)
  *   m.Get("/commit/{sha…}") / ".{patch,diff}"              web.go:1619-1620
+ *                                                   (LANDED — the wiki-commit-diff
+ *                                                   twin, pages/wiki-commit-diff.tsx;
+ *                                                   the view rides THIS module's
+ *                                                   loader, the downloads' raw
+ *                                                   serving arm is index.ts work)
  *   m.Get("/raw/*", repo.WikiRaw)                          web.go:1621
  *
  * The SUB-PAGES ARE NOT ROUTES. They are case-arms on the `action` form
@@ -53,6 +58,15 @@
  *                                action value lands in WikiPost's default arm)
  *   POST P/wiki/{PageURL}?action=_delete    delete
  *   GET  P/wiki/raw/*                       raw blob (WikiRaw)
+ *   GET  P/wiki/commit/{sha}                the revision-diff view (repo.Diff's
+ *                                PageIsWiki arm — the PageIsWiki commit page;
+ *                                chi specificity puts the pattern BEFORE the
+ *                                `/*` combo, so a matching tail is NEVER a
+ *                                page name)
+ *   GET  P/wiki/commit/{sha}.{diff|patch}   the raw downloads (repo.RawDiff's
+ *                                wiki arm over the sibling cell — loader +
+ *                                grammar landed in pages/wiki-commit-diff.tsx,
+ *                                the raw serving arm pending in index.ts)
  *
  * A page NAME of "_pages"/"_new"/"_edit"/"raw" is refused at write time
  * (reservedWikiNames, wiki_path.go:42) — precisely so these action values
@@ -233,9 +247,11 @@ import {
 } from "../../services/wiki";
 import { CommitList } from "../components/commit-list";
 import { TimeSince } from "../components/file-list";
-import { parsePageNumber, pathEscapeSegments } from "../page-data";
+import { parsePageNumber, pathEscapeSegments, shortSha } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
+import { loadWikiCommitDiffData, parseWikiCommitViewTail, renderWikiCommitDiffPage } from "./wiki-commit-diff";
+import type { CommitViewData } from "./commit-view";
 
 /** Page chrome text (component-local; upstream locale keys cited). */
 export const wikiLocale = {
@@ -513,23 +529,67 @@ function wikiNameFromTail(rawTail: string): string {
   return raw === "" ? wikiLocale.home : raw;
 }
 
+/** The view.tmpl page data — the classic page view (the wildcard tail's
+ *  page-name path). `kind` stays absent; the commit-diff twin below carries
+ *  the discriminant (the handler's fixed outcome set cannot grow — the
+ *  sixth wiki surface rides the "view" outcome under its own kind). */
+export type WikiPageViewData = {
+  outcome: "view";
+  kind?: undefined;
+  title: string;
+  pageUrl: string;
+  page: WikiPageJson;
+  contentHtml: string;
+  sidebarHtml: string;
+  footerHtml: string;
+  pages: WikiPageMeta[];
+};
+
+/** The commit-diff view data (web.go:1619's arm — the PageIsWiki commit
+ *  page over the sibling wiki cell, pages/wiki-commit-diff.tsx). */
+export type WikiCommitViewData = {
+  outcome: "view";
+  kind: "commit-diff";
+  /** The document title (the commit page's `subject · shortSha`). */
+  title: string;
+  /** The loaded commit + diff (the commit view loader's shape). */
+  view: CommitViewData;
+};
+
 export type WikiViewData =
   | { outcome: "start" } // no wiki branch — tplWikiStart (wiki.go:471-475)
   | { outcome: "missing" } // page absent — 303 ?action=_pages (wiki.go:237-239)
-  | {
-      outcome: "view";
-      title: string;
-      pageUrl: string;
-      page: WikiPageJson;
-      contentHtml: string;
-      sidebarHtml: string;
-      footerHtml: string;
-      pages: WikiPageMeta[];
-    };
+  | WikiPageViewData
+  | WikiCommitViewData;
 
 /** The GET view arm (repo.Wiki default): `rawTail` is the wildcard tail
- *  VERBATIM (the codec re-encodes it); "" → "Home". */
+ *  VERBATIM (the codec re-encodes it); "" → "Home". The `commit/{sha}`
+ *  shape parses as web.go:1619's revision-diff arm FIRST — chi's route
+ *  specificity puts the commit pattern before the `/*` combo, so a matching
+ *  tail is never a page name (a wiki page literally named
+ *  "commit/{7..64hex}" is shadowed, upstream included); a NON-matching tail
+ *  keeps the page-name path (the pattern-miss fold). */
 export async function loadWikiViewData(env: Env, pair: RepositoryWithOwner, rawTail: string, origin: string): Promise<WikiViewData> {
+  // The revision-diff VIEW arm (pages/wiki-commit-diff.tsx's grammar — the
+  // route-pattern port, lowercase hex like web.go:1619 itself).
+  const commitTail = parseWikiCommitViewTail(rawTail);
+  if (commitTail !== null) {
+    const view = await loadWikiCommitDiffData(env, env.DB, pair, commitTail.sha);
+    if (view === null) {
+      // Well-shaped but unresolvable (unknown oid / short prefix): upstream
+      // Diff 404-shells (commit.go's IsErrNotExist → ctx.NotFound) — the
+      // fixed handler outcome set cannot answer a 404, so the family's
+      // missing fold answers until the serving arm's not-found mapping
+      // lands in index.ts (disclosed to the orchestrator).
+      return { outcome: "missing" };
+    }
+    return {
+      outcome: "view",
+      kind: "commit-diff",
+      title: `${view.commit.subject} · ${shortSha(view.commit.oid)}`,
+      view,
+    };
+  }
   const wikiName = wikiNameFromTail(rawTail);
   const tip = await wikiTipOf(env, pair);
   if (tip === undefined) return { outcome: "start" }; // HasWiki (wiki.go:471)
@@ -664,14 +724,19 @@ export function WikiStartPage(props: { ctx: UiContext; canWrite: boolean }) {
   );
 }
 
-/** The full-document VIEW render (tplWikiView — wiki.go:500). */
-export function renderWikiViewPage(options: { ctx: UiContext; data: Extract<WikiViewData, { outcome: "view" }>; canWrite: boolean }): string {
+/** The full-document VIEW render — the "view" outcome's dispatch: the
+ *  commit-diff twin (web.go:1619's PageIsWiki commit page over the sibling
+ *  cell) or the classic view.tmpl page. The handler funnels EVERY
+ *  non-start/missing outcome here (the fixed index.ts narrowing cannot grow
+ *  an outcome), so the two kinds ride inside the outcome under `kind`. */
+export function renderWikiViewPage(options: { ctx: UiContext; data: WikiPageViewData | WikiCommitViewData; canWrite: boolean }): string {
+  if (options.data.kind === "commit-diff") return renderWikiCommitDiffPage({ ctx: options.ctx, data: options.data.view });
   return renderPage(<WikiViewPage ctx={options.ctx} data={options.data} canWrite={options.canWrite} />);
 }
 
 /** view.tmpl (discriminator: `repository wiki` — shared with the form page).
- *  `data` is the "view" outcome of loadWikiViewData. */
-export function WikiViewPage(props: { ctx: UiContext; data: Extract<WikiViewData, { outcome: "view" }>; canWrite: boolean }) {
+ *  `data` is the page-name arm of loadWikiViewData's "view" outcome. */
+export function WikiViewPage(props: { ctx: UiContext; data: WikiPageViewData; canWrite: boolean }) {
   const { ctx, data } = props;
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("WikiViewPage requires ctx.repo");
