@@ -266,6 +266,38 @@ describe("zstdDecompress — malformed streams rejected", () => {
     copy[10] = (copy[10] ?? 0) ^ 0xff;
     expect(() => zstdDecompress(copy)).toThrow(/checksum/);
   });
+
+  // --- the resolved-window gate (MAX_WINDOW_SIZE = (1<<27)+1) --------------
+  // Hand-built frames over the literal content "abc": magic ‖ FHD(0x00) ‖
+  // Window_Descriptor ‖ one last RAW block header ‖ content.
+  it("a windowLog-27 frame with the mantissa pushed to 7 (~240 MiB window) is rejected", () => {
+    // windowLog 27 → exponent 17 (0x88 after <<3); mantissa 7 → wlByte 0x8F.
+    // windowSize = 2^27 + 7·2^24 = 251658240 > (1<<27)+1 — the v1.5.7
+    // ZSTD_decompressStream gate (`windowSize > maxWindowSize`) rejects it
+    // even though the exponent passes the windowLog check.
+    const frame = new Uint8Array([0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x8f, 0x19, 0x00, 0x00, 0x61, 0x62, 0x63]);
+    expect(() => zstdDecompress(frame)).toThrow(/too much memory/);
+  });
+
+  it("the same frame at mantissa 0 (window exactly 2^27) decodes — the boundary holds", () => {
+    // wlByte 0x88: windowLog 27, mantissa 0 → windowSize = 2^27, one under
+    // the (1<<27)+1 default max.
+    const frame = new Uint8Array([0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x88, 0x19, 0x00, 0x00, 0x61, 0x62, 0x63]);
+    expect(new TextDecoder().decode(zstdDecompress(frame))).toBe("abc");
+  });
+
+  it("a singleSegment frame whose FCS-sized window exceeds the default max is rejected", () => {
+    // FHD 0xE0 = singleSegment + 8-byte FCS; FCS = 2^27 + 2 — passes the
+    // 1 GiB OUTPUT_CAP but its window (the FCS in a singleSegment frame)
+    // is past (1<<27)+1, so the gate fires before any block is walked.
+    const fcs = 2 ** 27 + 2;
+    const frame = new Uint8Array([
+      0x28, 0xb5, 0x2f, 0xfd, 0xe0,
+      fcs & 0xff, (fcs >>> 8) & 0xff, (fcs >>> 16) & 0xff, (fcs >>> 24) & 0xff,
+      0, 0, 0, 0,
+    ]);
+    expect(() => zstdDecompress(frame)).toThrow(/too much memory/);
+  });
 });
 
 // --- the XXH-64 implementation -----------------------------------------------

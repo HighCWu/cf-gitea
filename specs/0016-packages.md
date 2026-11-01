@@ -2291,9 +2291,12 @@ documented reduction):
    `info/about.json` (optional, zero-filled) exactly as
    metadata.go:132-217 does: the ≤ 32 MiB limited reads, the
    conda-build name/version grammar verbatim (lowercase, the
-   `=@#$%^&*:;\"'\|<>?/ ` set + `!` in names / `-` in versions), the
-   about-URL validation (abs+host — an `ftp://` dev_url KEEPS, a
-   relative home clears), and the decode-error class split (a type-
+   `=@#$%^&*:;"'|<>?/ ` set + `!` in names / `-` in versions), the
+   about-URL validation (validation.IsValidURL, helpers.go:42-51 —
+   http/https with a host ONLY: a relative home clears AND an `ftp://`
+   dev_url clears; the earlier "any absolute scheme with a host" reading
+   that kept the ftp URL predates the v1.5.7 helper check and is
+   history), and the decode-error class split (a type-
    mismatched/arrailed/dependent-bad index is the plain-error 500 arm
    exactly like Go's json.Decode failure; a JSON-`null` index is the
    decode no-op — upstream nil-panics at `i.Name`, our port answers the
@@ -2336,10 +2339,13 @@ documented reduction):
    and legacy frames are REJECTED (documented, like bz2's
    randomized-block stance); skippable frames pass through;
    concatenated frames decode in sequence with per-frame entropy and
-   repeat-offset resets. Resource posture: windowLog ≤ 27 (the
-   reference streaming decoder's ZSTD_WINDOWLOG_LIMIT_DEFAULT), output
-   capped at 1 GiB, tables bounded by the format's own accuracy/depth
-   limits. CORRECTNESS: the authoring harness ran every committed
+   repeat-offset resets. Resource posture: the window gate on the
+   RESOLVED window size — ZSTD_MAXWINDOWSIZE_DEFAULT ((1<<27)+1, the
+   reference streaming decoder's default maxWindowSize; the descriptor's
+   mantissa can inflate a windowLog-27 frame to ≈240 MiB and the
+   singleSegment arm derives the window from the FCS, so the windowLog
+   exponent check alone does not bound it) — and output capped at
+   1 GiB, tables bounded by the format's own accuracy/depth limits. CORRECTNESS: the authoring harness ran every committed
    fixture (levels 1/3/9/19/--ultra -22 across empty/one-byte/tiny/
    lorem/random/RLE/cycle/overlap/mix shapes, multi-block, concatenated,
    skippable, no-checksum, --long=27) through BOTH the decoder and

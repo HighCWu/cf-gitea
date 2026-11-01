@@ -484,7 +484,7 @@ import {
   type MonitorPlatformStatus,
 } from "../../services/monitor/platform";
 import { readQueueConsumer, type QueueConsumerSettings } from "../../services/monitor/queue-concurrency";
-import { parseMonitorProfileParams, profileFilename, requestWorkerProfile } from "../../services/monitor/profile";
+import { parseMonitorProfileParams, profileFilename, requestWorkerProfile, type ProfileOutcome } from "../../services/monitor/profile";
 import {
   commitStatuses,
   comments,
@@ -2134,8 +2134,22 @@ export async function applyAdminMonitorProfileDownload(
   if (profile.kind !== "ok") {
     // The reason goes to the console (observability) — the flash-less GET
     // download has no error page upstream either; the redirect lands on the
-    // trace page whose sections state the posture.
-    console.error(`[monitor] profile trigger degraded: ${profile.kind}`);
+    // trace page whose sections state the posture. The classification rides
+    // SPEC-0021 §5's binding taxonomy (platform.ts's frozen failure table —
+    // the same nouns the deploy-probe battery reads), not the free-form
+    // "degraded" the earlier draft logged: unconfigured is the skip/warn
+    // arm, auth is a FAIL (never "platform unsupported"), a rate-limit is
+    // the bounded-retry-then-report tail, platform-unavailable is the
+    // environment-condition class, and an invalid body is the
+    // read-back-mismatch fail.
+    const taxonomy: Record<Exclude<ProfileOutcome["kind"], "ok">, string> = {
+      unconfigured: "skip/warn",
+      auth: "fail (auth — never platform unsupported)",
+      "rate-limited": "report (bounded retries exhausted)",
+      "platform-unavailable": "environment-condition",
+      "invalid-response": "fail (read-back mismatch)",
+    };
+    console.error(`[monitor] profile trigger: ${taxonomy[profile.kind]} [kind: ${profile.kind}]`);
     return { kind: "redirect" };
   }
   return { kind: "download", bytes: profile.bytes, filename: profileFilename(parsed.type, now) };

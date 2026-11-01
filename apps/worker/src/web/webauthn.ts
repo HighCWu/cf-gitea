@@ -360,12 +360,21 @@ async function assertionPost(c: RouteContext): Promise<Response> {
     const verified = await verifyAssertion(
       parsed,
       { credentialId: credential.credentialId, coseKey: credential.coseKey, signCount: credential.signCount },
-      { challenge: challengeState.ch, rp },
+      // The 2FA arm begins with VerificationPreferred (webauthn.go:189) —
+      // go-webauthn maps that to shouldVerifyUser=false, so the UV flag is
+      // reported but never required here.
+      { challenge: challengeState.ch, rp, requireUserVerification: false },
     );
     if (verified.cloneDetected) {
       // The CloneWarning arm (webauthn.go:133-137/245-249 — cloned
-      // credential ⇒ 403). The CAS records the replay durably.
-      await applyAssertionSignCount(c.env.DB, credential.id, credential.signCount, verified.signCount, true);
+      // credential ⇒ 403). The CAS holds the counter at its stored
+      // HIGH-WATER mark and persists only clone_warning: upstream never
+      // lowers the stored sign count (UpdateSignCount runs on the success
+      // path alone), and writing the replayed (≤ stored) count here would
+      // UN-block a later replay of the earlier higher-count response — the
+      // monotonic ladder would read it as fresh. Holding the mark keeps the
+      // durable-rejection posture (the module header) without the hole.
+      await applyAssertionSignCount(c.env.DB, credential.id, credential.signCount, credential.signCount, true);
       return jsonError(403, "cloned credential", clearChallenge);
     }
     const outcome = await applyAssertionSignCount(c.env.DB, credential.id, credential.signCount, verified.signCount, false);
@@ -433,10 +442,17 @@ async function passkeyLogin(c: RouteContext): Promise<Response> {
     const verified = await verifyAssertion(
       parsed,
       { credentialId: credential.credentialId, coseKey: credential.coseKey, signCount: credential.signCount },
-      { challenge: challengeState.ch, rp, expectedUserHandle: parsed.userHandle },
+      // The passkey is the SOLE factor — the ceremony demands UV (upstream
+      // BeginDiscoverableLogin's WithUserVerification(VerificationRequired),
+      // webauthn.go:59; go-webauthn enforces it inside AuthenticatorData.
+      // Verify and the handler 403s the failure, webauthn.go:114-119).
+      { challenge: challengeState.ch, rp, expectedUserHandle: parsed.userHandle, requireUserVerification: true },
     );
     if (verified.cloneDetected) {
-      await applyAssertionSignCount(c.env.DB, credential.id, credential.signCount, verified.signCount, true);
+      // High-water hold — the 2FA arm's clone comment above (upstream never
+      // lowers the stored counter; writing the replayed count would
+      // un-block a later replay of the higher-count response).
+      await applyAssertionSignCount(c.env.DB, credential.id, credential.signCount, credential.signCount, true);
       return jsonError(403, "cloned credential", clearChallenge);
     }
     const outcome = await applyAssertionSignCount(c.env.DB, credential.id, credential.signCount, verified.signCount, false);

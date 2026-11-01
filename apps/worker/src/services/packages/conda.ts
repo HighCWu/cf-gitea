@@ -14,7 +14,8 @@
  *   (metadata.go:220-243, the conda-build grammar: lowercase, no
  *   `=@#$%^&*:;\"'\|<>?/ ` plus `!` in names / `-` in versions) are the
  *   ErrInvalidName/ErrInvalidVersion sentinels; about.json's home/dev_url/
- *   doc_url clear when not absolute URLs with a host (validation.IsValidURL).
+ *   doc_url clear when not absolute http/https URLs with a host
+ *   (validation.IsValidURL, helpers.go:42-51).
  *   The stored FILE is `{name}-{version}-{build}{.tar.bz2|.conda}` under the
  *   SUBDIR composite key (conda.go:269-271), IsLead true, carrying
  *   `conda.subdir` + `conda.metadata` (the FileMetadata JSON); the PACKAGE
@@ -252,16 +253,22 @@ export function buildCondaVersionMetadataJson(md: CondaVersionMetadata): string 
 }
 
 /**
- * validation.IsValidURL: url.Parse + IsAbs + Host != "" — ANY absolute
- * scheme with a host qualifies (ftp:// included; the composer family's
- * http/https gate is composer-specific). JS `new URL` throws on relative
- * strings and always yields an absolute form — the throw IS the IsAbs
- * failure.
+ * validation.IsValidURL (modules/validation/helpers.go:42-51): the URI must
+ * parse strictly, carry an http/https scheme (ANY other scheme — ftp://
+ * included — is invalid; the earlier "any absolute scheme" reading
+ * conflated the composer family's own gate with this one), and hold a
+ * valid port (WHATWG throws on an invalid port for these special schemes,
+ * the portOnly/validPort arm). Go's url.ParseRequestURI errors on control
+ * bytes — the tab/CR/LF the WHATWG parser would silently STRIP and thereby
+ * admit — so they are rejected before parsing.
  */
-function isValidCondaUrl(value: string): boolean {
+export function isValidCondaUrl(value: string): boolean {
   if (value === "") return false;
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(value)) return false;
   try {
-    return new URL(value).host !== "";
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:") && url.host !== "";
   } catch {
     return false;
   }
@@ -915,7 +922,15 @@ export async function openCondaFileForDownload(
   const object = await bucket.get(packageBlobContentKey(descriptor.blob.hashSha256));
   if (object === null) return null;
   if (method === "GET") {
-    await incrementDownloadCounter(d1, match.version.id);
+    // The counter is the download's OBSERVABILITY, not its gate (services/
+    // packages/packages.go:666-670 — upstream logs the increment failure
+    // and returns the opened file regardless; a failed write must not turn
+    // a servable blob into a 500).
+    try {
+      await incrementDownloadCounter(d1, match.version.id);
+    } catch (error) {
+      console.error(`[packages:conda] Error incrementing download counter (version ${match.version.id}): ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   return { file: descriptor.file, blob: descriptor.blob, stream: object.body, size: object.size };
 }

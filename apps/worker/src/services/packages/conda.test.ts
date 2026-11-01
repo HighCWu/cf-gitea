@@ -10,10 +10,11 @@
  *    covering index+about, the about-less minimal, the name/version gates
  *    (the conda-build grammar), the missing-index structure sentinel, the
  *    corrupt-stream archive class, the URL validation (a relative home
- *    clears, an ftp:// absolute KEEPS — validation.IsValidURL's IsAbs+Host
- *    shape), and the decode-error class (a string build_number, an array
- *    document, a non-string depends element) vs the JSON-null no-op corner
- *    (null index decodes to the zero struct → the name gate);
+ *    clears, an ftp:// absolute clears — validation.IsValidURL's
+ *    http/https-only gate, helpers.go:42-51), and the decode-error class
+ *    (a string build_number, an array document, a non-string depends
+ *    element) vs the JSON-null no-op corner (null index decodes to the
+ *    zero struct → the name gate);
  *  - the `.conda` parse (wall 2 ADOPTED): REAL conda containers authored
  *    with python's tarfile + zstandard(3) + zipfile at write time —
  *    stored- and deflate-member zips over `info-*.tar.zst`, the
@@ -62,6 +63,7 @@ import {
   condaRepodataContentType,
   encodeCondaRepodataBody,
   isCondaPackageFileName,
+  isValidCondaUrl,
   loadCondaFileMetadata,
   openCondaFileForDownload,
   parseCondaPackageConda,
@@ -260,12 +262,12 @@ describe("parseCondaPackageTarBz2 (metadata.go:93-217)", () => {
     expect(parsed.fileMetadata.dependencies).toEqual([]);
   });
 
-  it("the name gate: 'NumPy' is ErrInvalidName; the about-URL validation clears a relative home but KEEPS an ftp:// absolute", () => {
+  it("the name gate: 'NumPy' is ErrInvalidName; the about-URL validation clears BOTH the relative home and the ftp:// dev_url (helpers.go:42-51's http/https gate)", () => {
     expect(() => parseCondaPackageTarBz2(fixtureBytes(F3_BAD_NAME))).toThrow(CondaInvalidNameError);
     const parsed = parseCondaPackageTarBz2(fixtureBytes(F7_BAD_URLS));
     expect(parsed.name).toBe("curl");
     expect(parsed.versionMetadata.project_url).toBe("");
-    expect(parsed.versionMetadata.repository_url).toBe("ftp://x");
+    expect(parsed.versionMetadata.repository_url).toBe("");
     expect(parsed.versionMetadata.documentation_url).toBe("");
   });
 
@@ -289,6 +291,39 @@ describe("parseCondaPackageTarBz2 (metadata.go:93-217)", () => {
 
   it("a JSON-null index decodes to the zero struct — the NAME gate answers (upstream's decode no-op nil-panics; the 400 gate is our sane arm)", () => {
     expect(() => parseCondaPackageTarBz2(fixtureBytes(F10_NULL))).toThrow(CondaInvalidNameError);
+  });
+});
+
+describe("isValidCondaUrl (validation.IsValidURL, helpers.go:42-51)", () => {
+  it("http/https with a host pass; every other scheme, relative forms and empty values fail", () => {
+    for (const good of ["https://numpy.org/", "http://example.com:8080/a?b=c#d", "https://host"]) {
+      expect(isValidCondaUrl(good)).toBe(true);
+    }
+    for (const bad of [
+      "",
+      "ftp://x",
+      "file:///etc/passwd",
+      "javascript:alert(1)",
+      "gopher://old.example",
+      "numpy.org",
+      "//host/path",
+      "/absolute/path",
+      "http://", // no host
+    ]) {
+      expect(isValidCondaUrl(bad)).toBe(false);
+    }
+  });
+
+  it("control bytes fail before parsing (Go's ParseRequestURI rejects what WHATWG would strip)", () => {
+    expect(isValidCondaUrl("http:\t//evil.example")).toBe(false);
+    expect(isValidCondaUrl("http://evil.example\r/x")).toBe(false);
+    expect(isValidCondaUrl("http://evil.example\n")).toBe(false);
+    expect(isValidCondaUrl("\u0000https://numpy.org/")).toBe(false);
+  });
+
+  it("an invalid port fails (the validPort(portOnly(u.Host)) arm — WHATWG throws on it)", () => {
+    expect(isValidCondaUrl("http://host:99999/")).toBe(false);
+    expect(isValidCondaUrl("http://host:0x20/")).toBe(false);
   });
 });
 
@@ -770,6 +805,37 @@ describe("openCondaFileForDownload (conda.go:296-322)", () => {
       (await buildCondaRepodata(env.DB, owner, "", "linux-64")) as string,
     );
     expect(Object.keys(body.packages)).toEqual(["numpy-1.26.0-py3h_0.tar.bz2"]);
+  });
+
+  it("a failed counter write does NOT break the serving arm (packages.go:666-670 — upstream logs and returns the file)", async () => {
+    const bytes = fixtureBytes(F1_FULL);
+    const result = (await upload(ownerRow, ownerRow.id, { content: streamOf(bytes), filename: "b.tar.bz2" })) as Awaited<
+      ReturnType<typeof uploadCondaPackageFile>
+    >;
+    const owner = { id: ownerRow.id, type: "user", visibility: "public" } as const;
+
+    // A D1 that throws ONLY on the counter's UPDATE — the search/descriptor
+    // reads go through untouched.
+    const failing = new Proxy(env.DB, {
+      get(target: D1Database, prop: string | symbol, receiver: unknown): unknown {
+        if (prop !== "prepare") return Reflect.get(target, prop, receiver);
+        return (sql: string): D1PreparedStatement => {
+          // The counter's UPDATE carries download_count, but so does the
+          // search's SELECT column list — gate on the statement kind.
+          if (/^update/i.test(sql) && sql.includes("download_count")) throw new Error("counter write failed");
+          return target.prepare(sql);
+        };
+      },
+    });
+
+    const download = await openCondaFileForDownload(failing, env.REPO_PACKS, owner, "", "linux-64", "numpy-1.26.0-py3h_0.tar.bz2", "GET");
+    expect(download).not.toBeNull();
+    expect(
+      new Uint8Array(await new Response((download as { stream: ReadableStream }).stream).arrayBuffer()),
+    ).toEqual(bytes);
+    expect(
+      (await db().select().from(packageVersions).where(eq(packageVersions.id, result.version.id)).get())?.downloadCount,
+    ).toBe(0);
   });
 });
 

@@ -17,10 +17,17 @@ import { drizzle } from "drizzle-orm/d1";
 import type { Context } from "hono";
 import type { MergeabilityStatus, MergeStyle, Person, RebaseOutcome } from "@cf-gitea/git-engine";
 
-import { PRFlow, PRStatus, comments, issues, pullRequests, users } from "../../db/schema";
+import { PRFlow, PRStatus, comments, issues, pullAutoMerges, pullRequests, users } from "../../db/schema";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { CommentType } from "../../issues/comment-types";
 import { IssuesService } from "../../issues/service";
+// Cycle disclosure: ./issues imports pullRequestDiffShortStatForEnv from THIS
+// module; both directions use the import inside function bodies only (live
+// bindings — no module-init-time reads), so the ESM cycle is safe under Vite
+// and workerd. The alternative — duplicating the IssueNoDependenciesLeft
+// probe here — would fork the shared port the route's gate and the merge
+// box's blocker item already share.
+import { issueNoDependenciesLeft } from "./issues";
 import type { ApiEnv } from "../env";
 import { ApiError } from "../errors";
 import { notifyMergePullRequest } from "../../services/mail/notify";
@@ -401,8 +408,11 @@ function mergePerson(c: Context<ApiEnv>, now: Date): Person {
 
 /**
  * Merge execution (§3.4). Preconditions are the route's (mergeable state,
- * not WIP, not merged, not archived); this function lands the engine
- * choreography and then the D1 row + the merge_pull issue close.
+ * not WIP, not merged, not archived) EXCEPT the open-dependency gate, which
+ * lives HERE so every caller inherits it (the API route pre-checks the same
+ * port; the web merge box and the auto-merge consumer reach the core
+ * directly); this function lands the engine choreography and then the D1
+ * row + the merge_pull issue close.
  *
  * Styles:
  *   - merge / squash / fast-forward-only → one executeMerge;
@@ -419,6 +429,25 @@ export async function mergePullRequest(
   pr: PullRequestRow,
   opts: MergePullOptions,
 ): Promise<{ commitOid: string | null }> {
+  // The open-dependency gate — CheckPullMergeable's FINAL arm (services/pull/
+  // check.go:218-223): IssueNoDependenciesLeft (models/issues/dependency.go:
+  // 190-199 — only `issue_id = this` edges joined to an OPEN dependency_id
+  // block; being the blocker never does) must answer true before any merge
+  // work starts. Upstream's Manually check type returns BEFORE the gate
+  // (check.go:160-165), so the manually-merged mark skips it here too. Error
+  // mapping: the error class is check.go:48's ErrDependenciesLeft ("is
+  // blocked by an open dependency"); upstream's merge API has NO arm for it —
+  // it falls to APIErrorInternal → a 500 for a user-input condition
+  // (routers/api/v1/repo/pull.go:928-946), the web merge box answers the
+  // pr_close_blocked flash (pull.go:1088-1089), and upstream's issue-close
+  // API maps the same condition to 412 Precondition Failed (issue.go:645-648,
+  // :983-986). We answer 405 with the locale text verbatim — the route's
+  // errorForUser-faithful divergence (routes/pulls.ts, the same class as the
+  // sibling not-mergeable conditions), so the two layers agree verbatim.
+  if (opts.style !== "manually-merged" && !(await issueNoDependenciesLeft(c.env.DB, issue.id))) {
+    throw new ApiError(405, "You need to close all issues that are blocking this pull request before you can merge it.");
+  }
+
   const cell = engineCell(c.env, pair.repo);
   const reads = engineReads(c.env, pair.repo);
   const baseRef = branchRef(pr.baseBranch);
@@ -595,6 +624,23 @@ export async function mergePullRequest(
   // closed issue. Best-effort, never throws: the merge has already landed,
   // exactly like upstream logs notify errors past the merge (:865-867).
   if (merged.length > 0) {
+    // The scheduled auto merge's cleanup (services/pull/merge.go:827-837):
+    // upstream's Merge reads GetScheduledMergeByPullID (computing wasAutoMerged
+    // from it) and DeleteScheduledAutoMerge's the row inside the success
+    // transaction — a direct merge raced or superseded a schedule, and the
+    // landing clears it. The emission half of wasAutoMerged is the landing's
+    // webhook arms above; the delete is composed directly over the table (the
+    // service's deleteScheduledAutoMerge — automerge.go:98-100 — is the same
+    // statement, but pull-automerge.ts imports THIS module, so reaching back
+    // would invert the layer direction with a cycle). Idempotent with the
+    // consumer's own delete (a scheduled landing deletes twice, once per
+    // side). Best-effort like the arms beside it: the merge has already
+    // landed, and the consumer's merged-PR arm tolerates a surviving row.
+    try {
+      await drizzle(c.env.DB).delete(pullAutoMerges).where(eq(pullAutoMerges.issueId, issue.id));
+    } catch (error) {
+      console.error(`[pull-engine] auto-merge schedule cleanup failed (issue ${issue.id}): ${error instanceof Error ? error.message : String(error)}`);
+    }
     // The §13.4 merge arm (specs/email-outbound.md): upstream's Merge
     // handler stamps the PR's issue read for the merging doer BEFORE the
     // mergeability checks (routers/api/v1/repo/pull.go:909-914 —

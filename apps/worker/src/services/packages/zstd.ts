@@ -32,9 +32,14 @@
  *    32-bit-halves arithmetic, no dependency — the checksum is the loud
  *    correctness gate on real fixtures, the role the bzip2 CRCs play for
  *    ./bz2.ts);
- *  - windowLog above 27 fails the frame ("frame requires too much
- *    memory" — the reference streaming decoder's default
- *    ZSTD_WINDOWLOG_LIMIT_DEFAULT posture) and the decoded output is
+ *  - the window gate is the reference streaming decoder's default
+ *    ZSTD_WINDOWLOG_LIMIT_DEFAULT posture, on the RESOLVED window size
+ *    (ZSTD_MAXWINDOWSIZE_DEFAULT = (1<<27)+1): a windowLog above 27 fails
+ *    at the descriptor parse, and the full window — descriptor exponent +
+ *    mantissa fraction, or the singleSegment FCS — fails the
+ *    `windowSize > maxWindowSize` gate ("frame requires too much memory";
+ *    the exponent check alone would admit a windowLog-27 frame with a
+ *    ≈240 MiB mantissa-inflated window). The decoded output is additionally
  *    capped at 1 GiB (an upload blob is ≤ 512 MiB and the conda parse
  *    consumes ≤ 32 MiB of the inner tar, so anything past the cap is
  *    hostile);
@@ -1171,6 +1176,19 @@ function decodeAndExecuteSequences(
 // ---------------------------------------------------------------------------
 
 const WINDOWLOG_LIMIT = 27; // ZSTD_WINDOWLOG_LIMIT_DEFAULT — the memory gate
+/**
+ * ZSTD_MAXWINDOWSIZE_DEFAULT (`((U32)1 << ZSTD_WINDOWLOG_LIMIT_DEFAULT) + 1`,
+ * zstd_decompress.c) — the streaming decoder's default maxWindowSize. The
+ * gate binds the frame's RESOLVED window size, not its exponent: the
+ * Window_Descriptor's three mantissa bits add `(windowBase >> 3) * (wlByte
+ * & 7)`, so windowLog 27 can declare up to 2^27 + 7·2^24 ≈ 240 MiB of
+ * window while passing a windowLog-only check, and the singleSegment arm
+ * derives the window from the Frame_Content_Size outright. v1.5.7:
+ * `RETURN_ERROR_IF(zds->fParams.windowSize > zds->maxWindowSize,
+ * frameParameter_windowTooLarge)` (ZSTD_decompressStream) — "frame requires
+ * too much memory".
+ */
+const MAX_WINDOW_SIZE = (1 << WINDOWLOG_LIMIT) + 1;
 const OUTPUT_CAP = 1 << 30; // 1 GiB — the hostile-stream gate
 const ZSTD_BLOCK_MAX = 128 * 1024;
 const ZSTD_MAGIC = 0xfd2fb528;
@@ -1238,6 +1256,14 @@ function decodeFrame(bytes: Uint8Array, start: number): { content: Uint8Array; l
   }
   if (frameContentSize >= 0 && frameContentSize > OUTPUT_CAP) {
     throw new ZstdError("declared frame content size beyond the output cap");
+  }
+  // The resolved window size against the default max (MAX_WINDOW_SIZE's
+  // cite): the windowLog check above bounds only the descriptor's exponent,
+  // so this is the arm that actually refuses the mantissa-inflated window
+  // (windowLog 27 + mantissa 7 ≈ 240 MiB) and the singleSegment frames
+  // whose FCS-sized window exceeds the streaming default.
+  if (windowSize > MAX_WINDOW_SIZE) {
+    throw new ZstdError("frame requires too much memory (window size beyond the 128 MiB default)");
   }
 
   const blockSizeMax = Math.min(windowSize, ZSTD_BLOCK_MAX);

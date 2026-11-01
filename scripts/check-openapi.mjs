@@ -94,6 +94,19 @@ const RUNTIME_ONLY_RESPONSES = {
       422: "non-full-length sha input rejected at runtime (upstream resolves refs via the engine and 500s on unknown — neither reproducible without engine ref resolution); declared set stays {201,400,404}",
     },
   },
+  "/repos/{owner}/{repo}/pulls/{index}/merge": {
+    post: {
+      // The auto-merge SCHEDULE success (merge_when_checks_succeed: true):
+      // upstream's Merge handler answers the scheduling with a bare
+      // ctx.Status(http.StatusCreated) and an EMPTY body
+      // (routers/api/v1/repo/pull.go:1004-1006) — the pinned swagger block
+      // documents only {200,403,404,405,409,423} for repoMergePullRequest,
+      // so the declared 201 is the runtime-only arm (routes/pulls.ts's
+      // schedule arm; the 201-empty contract is pinned by
+      // pull-engine.test.ts's schedule test).
+      201: "upstream's schedule arm answers a bare StatusCreated (pull.go:1004-1006); its swagger documents {200,403,404,405,409,423} only",
+    },
+  },
   "/repos/{owner}/{repo}/transfer": {
     post: {
       // The PENDING arm: upstream's own handler answers 201 Created when the
@@ -232,6 +245,32 @@ const RUNTIME_ONLY_RESPONSES = {
   "/admin/users/{username}/repos": {
     post: {
       500: "same initRepository rollback arm as /user/repos (create.go:236-241,448-456 via repo.go:254-259 — the admin handler calls repo.CreateUserRepo, admin/repo.go:48); contract documents {201,400,403,404,409,422}",
+    },
+  },
+  "/packages/{owner}/{type}/{name}": {
+    delete: {
+      // The terraform specialization's OnBeforeRemovePackageAll guard
+      // (services/packages/terraform/spec.go:50-62) refuses a LOCKED state,
+      // wrapped as util.ErrUnprocessableContent — the util error family's
+      // errorForUser status 422 (modules/util/error.go:25-31) with
+      // "terraform state is locked and cannot be deleted" as the message —
+      // while the vendored swagger documents only {204,404}. The runtime
+      // arm rides the ApiError family UNDECLARED (routes/packages.ts
+      // assertPackageDeleteAllowed; pinned 422-for-422 by packages.test.ts),
+      // so the declared set stays the contract's; this entry documents the
+      // wild arm and holds the exception on file for any declaration
+      // widening (the packages.test.ts pins are the arm's guard).
+      422: "terraform locked-delete refusal (spec.go:50-62 wraps util.ErrUnprocessableContent → the errorForUser 422); contract documents {204,404}",
+    },
+  },
+  "/packages/{owner}/{type}/{name}/{version}": {
+    delete: {
+      // Same guard family for the version delete (spec.go:64-80): the locked
+      // refusal FIRST (:66-74), then the latest-version refusal — "the
+      // latest version of a Terraform state cannot be deleted" — both the
+      // errorForUser 422 against a contract set of {204,404} (the same
+      // undeclared-runtime-arm posture as the package delete above).
+      422: "terraform guards on the version delete (spec.go:64-80 — the locked refusal, then the latest-version refusal, both util.ErrUnprocessableContent → 422); contract documents {204,404}",
     },
   },
 };

@@ -561,4 +561,120 @@ describe("the login family", () => {
     });
     expect(res2.status).toBe(400);
   });
+
+  it("the passkey arm enforces UV (the sole-factor rule): uv-less 403, uv-bearing 200; the 2FA arm stays preferred", async () => {
+    const user = await seedUser();
+    const cred = await enrollCredential(user.id);
+
+    // The passkey ceremony demands UV (VerificationRequired, webauthn.go:59)
+    // — an UP-only assertion answers the go-webauthn ErrVerification 403
+    // (webauthn.go:114-119) and mints nothing.
+    const options1 = await req("/user/webauthn/passkey/assertion", { headers: { origin: ORIGIN } });
+    const cookie1 = (options1.headers.get("set-cookie") ?? "").split(";")[0]!;
+    const state1 = await verifyCeremonyState(env.DB, decodeURIComponent(cookie1.split("=").slice(1).join("=")), "passkey");
+    const uvLess = await assertionBody(cred.credentialId, {
+      challenge: state1!.ch,
+      userHandle: webAuthnIdForUser(user.id),
+      flags: FLAG_UP,
+    });
+    const res1 = await req("/user/webauthn/passkey/login", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ORIGIN, cookie: cookie1 },
+      body: JSON.stringify(uvLess),
+    });
+    expect(res1.status).toBe(403);
+    expect(await res1.text()).toContain("user-verification required but flag not set");
+    const sessions1 = await env.DB.prepare("SELECT count(*) AS n FROM sessions").all<{ n: number }>();
+    expect(sessions1.results[0]?.n).toBe(0);
+
+    // UP|UV passes the same ceremony.
+    const options2 = await req("/user/webauthn/passkey/assertion", { headers: { origin: ORIGIN } });
+    const cookie2 = (options2.headers.get("set-cookie") ?? "").split(";")[0]!;
+    const state2 = await verifyCeremonyState(env.DB, decodeURIComponent(cookie2.split("=").slice(1).join("=")), "passkey");
+    const uvBody = await assertionBody(cred.credentialId, {
+      challenge: state2!.ch,
+      userHandle: webAuthnIdForUser(user.id),
+      flags: FLAG_UP | FLAG_UV,
+    });
+    const res2 = await req("/user/webauthn/passkey/login", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ORIGIN, cookie: cookie2 },
+      body: JSON.stringify(uvBody),
+    });
+    expect(res2.status).toBe(200);
+    const sessions2 = await env.DB.prepare("SELECT count(*) AS n FROM sessions").all<{ n: number }>();
+    expect(sessions2.results[0]?.n).toBe(1);
+
+    // The 2FA arm begins with VerificationPreferred (webauthn.go:189 —
+    // go-webauthn's shouldVerifyUser=false): the SAME uv-less assertion
+    // shape is ACCEPTED there, the flag merely reported.
+    const pending = await signCeremonyState(env.DB, { k: "pending", uid: user.id, ch: "", rem: false, to: "/" });
+    const options3 = await req("/user/webauthn/assertion", { headers: { cookie: `gitea_webauthn=${encodeURIComponent(pending)}` } });
+    const cookie3 = (options3.headers.get("set-cookie") ?? "").split(";")[0]!;
+    const state3 = await verifyCeremonyState(env.DB, decodeURIComponent(cookie3.split("=").slice(1).join("=")), "assert");
+    // signCount 2: the passkey success above already moved the counter to 1,
+    // and the monotonic ladder sits BEHIND the UV gate — reusing 1 would
+    // trip the clone arm instead of exercising the UV posture.
+    const uvLess2fa = await assertionBody(cred.credentialId, { challenge: state3!.ch, flags: FLAG_UP, signCount: 2 });
+    const res3 = await req("/user/webauthn/assertion", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ORIGIN, cookie: `gitea_webauthn=${encodeURIComponent(pending)}; ${cookie3}` },
+      body: JSON.stringify(uvLess2fa),
+    });
+    expect(res3.status).toBe(200);
+  });
+
+  it("the clone arm holds the counter high-water: a lowered probe cannot un-block the original count", async () => {
+    const user = await seedUser();
+    const cred = await enrollCredential(user.id, { signCount: 10 });
+
+    // A genuine count advance is accepted and stored (10 → 11).
+    const pending1 = await signCeremonyState(env.DB, { k: "pending", uid: user.id, ch: "", rem: false });
+    const options1 = await req("/user/webauthn/assertion", { headers: { cookie: `gitea_webauthn=${encodeURIComponent(pending1)}` } });
+    const cookie1 = (options1.headers.get("set-cookie") ?? "").split(";")[0]!;
+    const state1 = await verifyCeremonyState(env.DB, decodeURIComponent(cookie1.split("=").slice(1).join("=")), "assert");
+    const body11 = await assertionBody(cred.credentialId, { challenge: state1!.ch, signCount: 11 });
+    const ok = await req("/user/webauthn/assertion", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ORIGIN, cookie: `gitea_webauthn=${encodeURIComponent(pending1)}; ${cookie1}` },
+      body: JSON.stringify(body11),
+    });
+    expect(ok.status).toBe(200);
+
+    // The cloned key probes with a LOWER count (fresh challenge — the
+    // monotonic ladder is the only remaining defense): 403, and the row
+    // KEEPS the high-water 11 with the warning set. (The regressed write
+    // stored the replayed 5 here.)
+    const pending2 = await signCeremonyState(env.DB, { k: "pending", uid: user.id, ch: "", rem: false });
+    const options2 = await req("/user/webauthn/assertion", { headers: { cookie: `gitea_webauthn=${encodeURIComponent(pending2)}` } });
+    const cookie2 = (options2.headers.get("set-cookie") ?? "").split(";")[0]!;
+    const state2 = await verifyCeremonyState(env.DB, decodeURIComponent(cookie2.split("=").slice(1).join("=")), "assert");
+    const body5 = await assertionBody(cred.credentialId, { challenge: state2!.ch, signCount: 5 });
+    const probe = await req("/user/webauthn/assertion", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ORIGIN, cookie: `gitea_webauthn=${encodeURIComponent(pending2)}; ${cookie2}` },
+      body: JSON.stringify(body5),
+    });
+    expect(probe.status).toBe(403);
+    const afterProbe = await env.DB.prepare("SELECT sign_count, clone_warning FROM webauthn_credentials WHERE id = ?").bind(cred.id).all<{ sign_count: number; clone_warning: number }>();
+    expect(afterProbe.results[0]?.sign_count).toBe(11);
+    expect(afterProbe.results[0]?.clone_warning).toBe(1);
+
+    // The original count strikes again on a fresh challenge: 11 ≤ 11 is
+    // STILL the clone arm — no session. (With the regressed backward write
+    // the stored 5 would have read 11 as fresh and minted one — the bypass.)
+    const pending3 = await signCeremonyState(env.DB, { k: "pending", uid: user.id, ch: "", rem: false });
+    const options3 = await req("/user/webauthn/assertion", { headers: { cookie: `gitea_webauthn=${encodeURIComponent(pending3)}` } });
+    const cookie3 = (options3.headers.get("set-cookie") ?? "").split(";")[0]!;
+    const state3 = await verifyCeremonyState(env.DB, decodeURIComponent(cookie3.split("=").slice(1).join("=")), "assert");
+    const body11again = await assertionBody(cred.credentialId, { challenge: state3!.ch, signCount: 11 });
+    const replay = await req("/user/webauthn/assertion", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ORIGIN, cookie: `gitea_webauthn=${encodeURIComponent(pending3)}; ${cookie3}` },
+      body: JSON.stringify(body11again),
+    });
+    expect(replay.status).toBe(403);
+    const sessions = await env.DB.prepare("SELECT count(*) AS n FROM sessions").all<{ n: number }>();
+    expect(sessions.results[0]?.n).toBe(1);
+  });
 });

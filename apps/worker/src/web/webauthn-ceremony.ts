@@ -58,8 +58,12 @@
  * webauthn.go:34, and real authenticators answer none/self under it) →
  * attested credential data (aaguid, credential id, COSE key).
  * Assertion (ValidateLogin): parse → rawId↔id match → credential lookup (the
- * caller's store read) → clientData → rpIdHash → UP (upstream 400s without
- * it, webauthn.go:121-124/234-235) → signature over authData‖SHA256(
+ * caller's store read) → clientData → rpIdHash → UP (go-webauthn always
+ * requires it in login — login.go's `shouldVerifyUserPresence := true` — and
+ * the handlers 403 the ErrVerification, webauthn.go:114-119/226-231) → UV
+ * when the ceremony demanded it (the passkey arm's VerificationRequired,
+ * webauthn.go:59; the 2FA arm's VerificationPreferred, webauthn.go:189,
+ * never enforces) → signature over authData‖SHA256(
  * clientDataJSON) → the sign-count ladder (≤ stored ⇒ clone detected ⇒ the
  * caller 403s, webauthn.go:133-137/245-249).
  *
@@ -747,15 +751,28 @@ export interface VerifiedAssertion {
 /**
  * The assertion verification for a LOADED credential (the caller resolves
  * rawId → row first; the login arm through the session-bound user, the
- * passkey arm through the userHandle). The sign-count ladder (module
- * header) runs AFTER the signature check — a replay of a COUNTER credential
- * fails the monotonic comparison and flags the clone; the CAS in the store
- * makes that durable.
+ * passkey arm through the userHandle). `expected.requireUserVerification`
+ * arms the UV gate: the passkey flow is the SOLE factor, so its ceremony
+ * demands UV (upstream BeginDiscoverableLogin's WithUserVerification(
+ * VerificationRequired), webauthn.go:59 — enforced inside go-webauthn's
+ * AuthenticatorData.Verify, "user verification required but flag not set");
+ * the 2FA flow begins with VerificationPreferred (webauthn.go:189), which
+ * go-webauthn maps to `shouldVerifyUser = false` — the UV flag is reported,
+ * never required. The UP gate is ALWAYS on (go-webauthn login.go hardcodes
+ * `shouldVerifyUserPresence := true`; a missing UP is the same
+ * ErrVerification class → the handlers answer 403 for both arms,
+ * webauthn.go:114-119/226-231 — hence the "forbidden" arm here, not the
+ * 400 the earlier draft carried; the handler's own post-validate
+ * `!cred.Flags.UserPresent` 400, webauthn.go:120-123, sits DOWNSTREAM of a
+ * validation that already rejected the flag's absence and is unreachable
+ * for this ladder). The sign-count ladder (module header) runs AFTER the
+ * signature check — a replay of a COUNTER credential fails the monotonic
+ * comparison and flags the clone; the CAS in the store makes that durable.
  */
 export async function verifyAssertion(
   parsed: ParsedAssertionResponse,
   stored: StoredCredential,
-  expected: { challenge: string; rp: RelyingParty; expectedUserHandle?: Uint8Array },
+  expected: { challenge: string; rp: RelyingParty; expectedUserHandle?: Uint8Array; requireUserVerification?: boolean },
 ): Promise<VerifiedAssertion> {
   if (!bytesEqual(parsed.rawId, stored.credentialId)) {
     throw new WebAuthnError("forbidden", "assertion rawId does not match the credential");
@@ -769,7 +786,10 @@ export async function verifyAssertion(
   if (!bytesEqual(authData.rpIdHash, expectedRpIdHash)) {
     throw new WebAuthnError("forbidden", "authenticator data RP ID hash mismatch");
   }
-  if (!authData.flags.up) throw new WebAuthnError("bad-request", "user-presence flag not set");
+  if (!authData.flags.up) throw new WebAuthnError("forbidden", "user-presence required but flag not set");
+  if (expected.requireUserVerification === true && !authData.flags.uv) {
+    throw new WebAuthnError("forbidden", "user-verification required but flag not set");
+  }
 
   const clientHash = await sha256(parsed.clientDataJSON);
   const signed = new Uint8Array(authData.raw.length + clientHash.length);

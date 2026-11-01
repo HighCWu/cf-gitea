@@ -473,6 +473,7 @@ async function assertionInputs(
     flags?: number;
     userHandle?: Uint8Array | null;
     expectedUserHandle?: Uint8Array;
+    requireUserVerification?: boolean;
     badSignature?: boolean;
   } = {},
 ) {
@@ -502,6 +503,7 @@ async function assertionInputs(
       challenge: options.expectedChallengeB64 ?? FIXED_CHALLENGE_B64,
       rp: RP,
       ...(options.expectedUserHandle !== undefined ? { expectedUserHandle: options.expectedUserHandle } : {}),
+      ...(options.requireUserVerification !== undefined ? { requireUserVerification: options.requireUserVerification } : {}),
     },
   };
 }
@@ -548,9 +550,13 @@ describe("webauthn-ceremony: the assertion ladder", () => {
     await expect(verifyAssertion(wrongRp.parsed, wrongRp.stored, wrongRp.expected)).rejects.toThrow(/RP ID hash mismatch/);
 
     const noUp = await assertionInputs({ flags: FLAG_UV });
-    await expect(verifyAssertion(noUp.parsed, noUp.stored, noUp.expected)).rejects.toBeInstanceOf(WebAuthnError);
+    await expect(verifyAssertion(noUp.parsed, noUp.stored, noUp.expected)).rejects.toThrow(/user-presence required but flag not set/);
     const caught = await verifyAssertion(noUp.parsed, noUp.stored, noUp.expected).catch((error: unknown) => error);
-    expect((caught as WebAuthnError).arm).toBe("bad-request");
+    // UP is always required in LOGIN (go-webauthn login.go's
+    // shouldVerifyUserPresence := true) and both handlers answer the
+    // ErrVerification with 403 (webauthn.go:114-119/226-231) — the
+    // forbidden arm, not the 400 of the unreachable post-validate arm.
+    expect((caught as WebAuthnError).arm).toBe("forbidden");
 
     const badSig = await assertionInputs({ badSignature: true });
     await expect(verifyAssertion(badSig.parsed, badSig.stored, badSig.expected)).rejects.toThrow(/signature invalid/);
@@ -562,6 +568,31 @@ describe("webauthn-ceremony: the assertion ladder", () => {
     await expect(verifyAssertion(wrongHandle.parsed, wrongHandle.stored, wrongHandle.expected)).rejects.toThrow(
       /userHandle mismatch/,
     );
+  });
+
+  it("the UV gate: required rejects an uv-less assertion 403-class; preferred (the 2FA arm) accepts it", async () => {
+    // The passkey arm's ceremony (VerificationRequired, webauthn.go:59):
+    // an assertion carrying UP alone fails the UV requirement.
+    const uvLess = await assertionInputs({ flags: FLAG_UP, requireUserVerification: true });
+    await expect(verifyAssertion(uvLess.parsed, uvLess.stored, uvLess.expected)).rejects.toThrow(
+      /user-verification required but flag not set/,
+    );
+    const caught = await verifyAssertion(uvLess.parsed, uvLess.stored, uvLess.expected).catch((error: unknown) => error);
+    expect((caught as WebAuthnError).arm).toBe("forbidden");
+
+    // The same wire assertion with UV set passes the required ceremony.
+    const withUv = await assertionInputs({ flags: FLAG_UP | FLAG_UV, requireUserVerification: true });
+    const verified = await verifyAssertion(withUv.parsed, withUv.stored, withUv.expected);
+    expect(verified.userVerified).toBe(true);
+
+    // The 2FA arm (VerificationPreferred, webauthn.go:189 — go-webauthn's
+    // shouldVerifyUser=false): the uv-less assertion is ACCEPTED, the flag
+    // merely reported.
+    const preferred = await assertionInputs({ flags: FLAG_UP, requireUserVerification: false });
+    const accepted = await verifyAssertion(preferred.parsed, preferred.stored, preferred.expected);
+    expect(accepted.userPresent).toBe(true);
+    expect(accepted.userVerified).toBe(false);
+    expect(accepted.cloneDetected).toBe(false);
   });
 
   it("rejects a credential mismatch and junk authenticator data", async () => {

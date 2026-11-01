@@ -31,11 +31,11 @@ import { ensureSeededRepo, buildHistoryPack, buildReceivePackBody, type SeedComm
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor } from "../auth/testing/seeds";
-import { users, protectedBranches, repositories, comments, issueUsers, notificationStates, PRStatus, pullRequests } from "../db/schema";
+import { users, protectedBranches, repositories, comments, issueDependencies, issueUsers, issues, notificationStates, PRStatus, pullAutoMerges, pullRequests } from "../db/schema";
 import { CommentType } from "../issues/comment-types";
 import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "./auth";
-import { giteaErrorHandler } from "./errors";
+import { ApiError, giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
 import { registerBranchRoutes } from "./routes/branches";
 import { registerCommitRoutes } from "./routes/commits";
@@ -314,7 +314,7 @@ describe("merge gating — conflict, WIP, schedule", () => {
     expect((await jsonBody(merge)).message).toBe("Please try again later");
   });
 
-  it("WIP titles answer 405; the auto-merge schedule answers the declared 409", async () => {
+  it("WIP titles answer 405 — including the auto-merge schedule (the Auto check type keeps the WIP gate, check.go:166-170)", async () => {
     await seedBranchWithCommit("wip", "wip.txt", "wip\n");
     const created = await send(`${REPO}/pulls`, jsonInit("POST", { title: "WIP: pending work", head: "wip", base: "main" }));
     expect(created.status).toBe(201);
@@ -330,11 +330,211 @@ describe("merge gating — conflict, WIP, schedule", () => {
     const merge = await send(`${REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge" }));
     expect(merge.status).toBe(405);
     expect((await jsonBody(merge)).message).toBe("Work in progress PRs cannot be merged");
-    expect((await send(`${REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge", merge_when_checks_succeed: true }))).status).toBe(409);
+    // The schedule arm runs BEHIND the WIP gate (api pull.go:928's
+    // CheckPullMergeable precedes pull.go:994's ScheduleAutoMerge — the
+    // Auto check type skips the branch-protection failure, not WIP):
+    const scheduled = await send(`${REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge", merge_when_checks_succeed: true }));
+    expect(scheduled.status).toBe(405);
+    expect((await jsonBody(scheduled)).message).toBe("Work in progress PRs cannot be merged");
+  });
+
+  it("the auto-merge schedule: 201 empty, the re-schedule 409, and the direct merge consumes the row", async () => {
+    // Its OWN seeded repo (apisuite/pulls-amsched — the clock block's
+    // rationale): the consuming arm MERGES, and a merge on the SHARED repo's
+    // main grows the closure the fork arms' pr-create base-fetch walk
+    // carries (observed: the walk tipped over WALK_MAX_RPC → seedForkHeadPr
+    // 500s when this test ran on `pulls`).
+    const AMS_SLUG = "pulls-amsched";
+    const AMS_REPO = `/repos/${OWNER}/${AMS_SLUG}`;
+    await ensureSeededRepo({ owner: OWNER, slug: AMS_SLUG, commits: SEED_COMMITS });
+    const made = await send(`${AMS_REPO}/branches`, jsonInit("POST", { new_branch_name: "amsched" }));
+    expect(made.status).toBe(201);
+    const written = await send(`${AMS_REPO}/contents/amsched.txt`, jsonInit("POST", { content: btoa("amsched\n"), branch: "amsched", message: "amsched: amsched.txt" }));
+    expect(written.status).toBe(201);
+    const created = await send(`${AMS_REPO}/pulls`, jsonInit("POST", { title: "Schedule me", head: "amsched", base: "main" }));
+    expect(created.status).toBe(201);
+    const index = (await jsonBody(created)).number as number;
+    const repoRow = await drizzle(env.DB)
+      .select()
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, AMS_SLUG)))
+      .get();
+    if (repoRow === undefined) throw new Error("amsched arm: repo row missing");
+    const joined = await findPullRequestByIndex(env.DB, repoRow.id, index);
+    if (joined === null) throw new Error("amsched arm: pr row missing");
+    const issueId = joined.issue.id;
+    const scheduledRowsOf = () => drizzle(env.DB).select().from(pullAutoMerges).where(eq(pullAutoMerges.issueId, issueId)).all();
+
+    // First schedule → the bare 201 Created, EMPTY body (pull.go:1004-1006's
+    // ctx.Status(http.StatusCreated)).
+    const first = await send(`${AMS_REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge", merge_when_checks_succeed: true }));
+    expect(first.status).toBe(201);
+    expect(await first.text()).toBe("");
+    // The row + the type-34 system comment landed (CreateAutoMergeComment,
+    // comment.go:1257; CommentTypePRScheduledToAutoMerge = 34).
+    const scheduledRows = await scheduledRowsOf();
+    expect(scheduledRows).toHaveLength(1);
+    expect(scheduledRows[0]!.mergeStyle).toBe("merge");
+    const scheduledComments = await drizzle(env.DB).select().from(comments).where(eq(comments.issueId, issueId)).all();
+    expect(scheduledComments.some((row) => row.type === CommentType.PRScheduledToAutoMerge)).toBe(true);
+
+    // Re-schedule → 409 with ErrAlreadyScheduledToAutoMerge's text
+    // (models/pull/automerge.go:43-45; api pull.go:997-1000) — NO
+    // delete-first, the standing row survives.
+    const second = await send(`${AMS_REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge", merge_when_checks_succeed: true }));
+    expect(second.status).toBe(409);
+    expect((await jsonBody(second)).message).toMatch(/^pull request is already scheduled to auto merge when checks succeed \[pull_id: \d+\]$/);
+    expect(await scheduledRowsOf()).toHaveLength(1);
+
+    // The direct merge does not conflict with the standing schedule — and
+    // upstream's Merge success tail deletes the row (merge.go:827-837):
+    expect((await send(`${AMS_REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge", merge_title_field: "Scheduled then merged" }))).status).toBe(200);
+    expect(await scheduledRowsOf()).toHaveLength(0);
+    expect((await jsonBody(await get(`${AMS_REPO}/pulls/${index}`))).merged).toBe(true);
   });
 
   it("merge-upstream answers 404 while forks cannot exist", async () => {
     expect((await send(`${REPO}/merge-upstream`, jsonInit("POST", { branch: "main" }))).status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The open-dependency merge gate — CheckPullMergeable's FINAL arm (services/
+// pull/check.go:218-223): IssueNoDependenciesLeft must answer true, with the
+// Manually check type returning BEFORE the gate (check.go:160-165). The gate
+// lives in the CORE (mergePullRequest) so the API route, the web merge box
+// and the auto-merge consumer all inherit it. Error mapping: upstream's merge
+// API has NO ErrDependenciesLeft arm — it falls to APIErrorInternal → 500
+// (routers/api/v1/repo/pull.go:928-946); the web box answers the
+// pr_close_blocked flash (pull.go:1088-1089) and the issue-close API maps the
+// same condition to 412 (issue.go:645-648). We answer 405 + the locale text
+// verbatim (the route's errorForUser-faithful divergence).
+//
+// Its OWN seeded repo (apisuite/pulls-deps, the clock block's rationale):
+// the unblocked arms MERGE, and merges grow main's closure — the fork arms'
+// base-fetch walk budget.
+// ---------------------------------------------------------------------------
+
+describe("the open-dependency merge gate (check.go:218-223)", () => {
+  const DEPS_SLUG = "pulls-deps";
+  const DEPS_REPO = `/repos/${OWNER}/${DEPS_SLUG}`;
+
+  beforeAll(async () => {
+    await ensureSeededRepo({ owner: OWNER, slug: DEPS_SLUG, commits: SEED_COMMITS });
+  });
+
+  async function depsRepoRow() {
+    const repoRow = await drizzle(env.DB)
+      .select()
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, DEPS_SLUG)))
+      .get();
+    if (repoRow === undefined) throw new Error("deps arm: repo row missing");
+    const ownerRow = await drizzle(env.DB).select().from(users).where(eq(users.id, OWNER_ID)).get();
+    if (ownerRow === undefined) throw new Error("deps arm: owner row missing");
+    return { repoRow, ownerRow };
+  }
+
+  const seedDepsBranch = async (branch: string, path: string, content: string): Promise<void> => {
+    const made = await send(`${DEPS_REPO}/branches`, jsonInit("POST", { new_branch_name: branch }));
+    expect(made.status).toBe(201);
+    const written = await send(`${DEPS_REPO}/contents/${path}`, jsonInit("POST", { content: btoa(content), branch, message: `${branch}: ${path}` }));
+    expect(written.status).toBe(201);
+  };
+
+  /** One open blocker issue + the (issueId → blocker) edge — the "blocked by"
+   *  direction (models/issues/dependency.go:190-199 reads issue_id = the PR's
+   *  issue). The high index keeps clear of the API's per-repo numbering. */
+  async function seedBlocker(repoId: string, issueId: number): Promise<number> {
+    const blocker = await drizzle(env.DB)
+      .insert(issues)
+      .values({ repoId, index: 4000 + issueId, posterId: OWNER_ID, title: `blocker for issue ${issueId}`, isPull: false, createdAt: new Date(T0 * 1000) })
+      .returning({ id: issues.id })
+      .then((rows) => rows[0]);
+    if (blocker === undefined) throw new Error("deps arm: blocker insert missing");
+    await drizzle(env.DB).insert(issueDependencies).values({ userId: OWNER_ID, issueId, dependencyId: blocker.id, createdAt: new Date(T0 * 1000) });
+    return blocker.id;
+  }
+
+  const closeBlocker = (id: number) =>
+    drizzle(env.DB).update(issues).set({ isClosed: true, closedAt: new Date(T0 * 1000 + 5) }).where(eq(issues.id, id));
+
+  it("the route refuses a blocked merge 405 with the pr_close_blocked text; closing the blocker unblocks", async () => {
+    await seedDepsBranch("dep-route", "dep-route.txt", "dep route\n");
+    const created = await send(`${DEPS_REPO}/pulls`, jsonInit("POST", { title: "Blocked by a dependency", head: "dep-route", base: "main" }));
+    expect(created.status).toBe(201);
+    const index = (await jsonBody(created)).number as number;
+    const { repoRow } = await depsRepoRow();
+    const found = await findPullRequestByIndex(env.DB, repoRow.id, index);
+    if (found === null) throw new Error("deps arm: pr row missing");
+    const blockerId = await seedBlocker(repoRow.id, found.issue.id);
+
+    const refused = await send(`${DEPS_REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge" }));
+    expect(refused.status).toBe(405);
+    expect((await jsonBody(refused)).message).toBe("You need to close all issues that are blocking this pull request before you can merge it.");
+    expect((await jsonBody(await get(`${DEPS_REPO}/pulls/${index}`))).merged).toBe(false);
+
+    await closeBlocker(blockerId);
+    expect((await send(`${DEPS_REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge" }))).status).toBe(200);
+    expect((await jsonBody(await get(`${DEPS_REPO}/pulls/${index}`))).merged).toBe(true);
+  });
+
+  it("the CORE gate refuses a direct mergePullRequest; the Manually type skips it (check.go:160-165)", async () => {
+    // a real authenticated Context (the clock block's capture pattern)
+    let captured: Context<ApiEnv> | null = null;
+    const a = new OpenAPIHono<ApiEnv>();
+    a.onError(giteaErrorHandler);
+    a.get("/deps-capture", createTokenAuthMiddleware(resolver), (c) => {
+      captured = c;
+      return c.json({});
+    });
+    const res = await a.fetch(new Request(`${ORIGIN}/deps-capture`, { headers: { Authorization: `token ${TOKEN}` } }), env);
+    expect(res.status).toBe(200);
+    if (captured === null) throw new Error("deps arm: context missing");
+
+    await seedDepsBranch("dep-core", "dep-core.txt", "dep core\n");
+    const created = await send(`${DEPS_REPO}/pulls`, jsonInit("POST", { title: "Core-gated merge", head: "dep-core", base: "main" }));
+    expect(created.status).toBe(201);
+    const index = (await jsonBody(created)).number as number;
+    const { repoRow, ownerRow } = await depsRepoRow();
+    const found = await findPullRequestByIndex(env.DB, repoRow.id, index);
+    if (found === null) throw new Error("deps arm: pr row missing");
+    // run the lazy check first: the core gate sits BEHIND upstream's
+    // mergeable arm, so a refusal here must not conflate the two gates.
+    expect((await jsonBody(await get(`${DEPS_REPO}/pulls/${index}`))).mergeable).toBe(true);
+    const pair = { repo: repoRow, owner: ownerRow };
+    await seedBlocker(repoRow.id, found.issue.id);
+
+    const refused = await mergePullRequest(captured, pair, found.issue, found.pullRequest, {
+      style: "merge",
+      message: "",
+      deleteBranchAfterMerge: false,
+      doerId: OWNER_ID,
+      now: new Date(),
+    }).then(
+      (): ApiError | null => null,
+      (error: unknown): unknown => error,
+    );
+    expect(refused).toBeInstanceOf(ApiError);
+    expect((refused as ApiError).status).toBe(405);
+    expect((refused as ApiError).message).toBe("You need to close all issues that are blocking this pull request before you can merge it.");
+
+    // The Manually check type returns BEFORE the deps gate upstream — the
+    // mark lands on a verified ancestor despite the standing blocker, and
+    // the base refs stay untouched (MergedManually marks, never merges).
+    const mainTip = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: DEPS_SLUG }).listRefs()).get("refs/heads/main")?.target as string;
+    const { commitOid } = await mergePullRequest(captured, pair, found.issue, found.pullRequest, {
+      style: "manually-merged",
+      message: "",
+      deleteBranchAfterMerge: false,
+      mergeCommitId: mainTip,
+      doerId: OWNER_ID,
+      now: new Date(),
+    });
+    expect(commitOid).toBe(mainTip);
+    const after = await findPullRequestByIndex(env.DB, repoRow.id, index);
+    expect(after?.pullRequest.hasMerged).toBe(true);
+    expect(after?.issue.isClosed).toBe(true);
   });
 });
 
@@ -392,22 +592,31 @@ describe("POST …/merge — the styles over the engine's landing primitives", (
     expect(main?.subject).toBe("Squashed change (#5)");
   });
 
-  it("manually-merged marks the row against a verified ancestor", async () => {
+  it("the forged manually-merged mark refuses at the style gate (AllowManualMerge defaults FALSE)", async () => {
     await seedBranchWithCommit("mm", "mm.txt", "mm\n");
     const created = await send(`${REPO}/pulls`, jsonInit("POST", { title: "Merged by hand", head: "mm", base: "main" }));
     const index = (await jsonBody(created)).number as number;
     const tips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
     const mainTip = tips.get("refs/heads/main")?.target as string;
 
-    // a commit that is NOT an ancestor of base (the unmerged clash tip) → 405
+    // AllowManualMerge defaults FALSE upstream (repo_unit.go:139-155's
+    // DefaultPullRequestsConfig never sets it) and this repo's unit does not
+    // enable it — MergedManually's IsMergeStyleAllowed gate (merge.go:755-759)
+    // refuses the style BEFORE any commit verification, so even a verified
+    // ancestor commit id answers the ErrInvalidMergeStyle 400 (the
+    // APIErrorAuto unwrap to ErrInvalidArgument, merge.go:231-233) with the
+    // bracketed repo/strategy render.
+    // The repo id is the stored STRING id (UUID-shaped), rendered verbatim.
+    const refusal = /^merge strategy is not allowed or is invalid \[repo_id: [^\]]+, strategy: manually-merged\]$/;
     const clashTip = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs()).get("refs/heads/clash")?.target as string;
     const bad = await send(`${REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "manually-merged", merge_commit_id: clashTip }));
-    expect(bad.status).toBe(405);
+    expect(bad.status).toBe(400);
+    expect((await jsonBody(bad)).message).toMatch(refusal);
 
-    expect((await send(`${REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "manually-merged", merge_commit_id: mainTip }))).status).toBe(200);
-    const pr = await jsonBody(await get(`${REPO}/pulls/${index}`));
-    expect(pr.merged).toBe(true);
-    expect(pr.merge_commit_sha).toBe(mainTip);
+    const good = await send(`${REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "manually-merged", merge_commit_id: mainTip }));
+    expect(good.status).toBe(400);
+    expect((await jsonBody(good)).message).toMatch(refusal);
+    expect((await jsonBody(await get(`${REPO}/pulls/${index}`))).merged).toBe(false);
   });
 });
 
