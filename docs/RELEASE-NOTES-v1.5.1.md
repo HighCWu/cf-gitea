@@ -1,8 +1,8 @@
 # cf-gitea v1.5.1 — Release Notes (the dead-route-and-salvage wave)
 
 **Range**: RANGE=<pending> (`1c8279b..FINAL_HEAD`) — **COMMIT_COUNT=<pending>**
-commits, landed 2026-11-01 — a single-day window (twelve at this draft; the
-pending-fill items in §10 may still join). Deployed as **`DEPLOY_ID=<pending>`**
+commits, landed 2026-11-01 — a single-day window (twenty-three at this draft; the
+pending-fill items in §14 may still join). Deployed as **`DEPLOY_ID=<pending>`**
 — FINAL_HEAD=<pending>. Probe battery **PROBE_COUNTS=<pending>** — the landed
 battery alignment (`d3f8211`) plans **244** probes (238 → 244, six new); live
 counts ride the convergence chain.
@@ -12,7 +12,13 @@ was absorbed without losing a line** — the standing-PAT churn v1.5's audit
 observed (`0219256`) got its root-cause fix (`8e5c4ea`), the reviewer's
 dead-route list got five dispatcher arms re-derived from `web.go` (`6a91a5c`),
 and the merge family's error ladders were re-derived against the pin one arm at
-a time (`b5b1994`, `01c7dfb`, `80a1ab7`, `de5efaf`). Every fix was re-derived
+a time (`b5b1994`, `01c7dfb`, `80a1ab7`, `de5efaf`, `40d0a6c`). The wave's
+second movement closed the standing reviews: the ⑩ authorization review gated
+nine write arms (`c3ac813`), the ⑨ admin/org review landed nine API findings,
+the settings danger zone, and the org-membership web arms (`7b4ccfc`,
+`6b7b517`, `9b45d68`), and the repo, label and
+notification surfaces were re-derived against their pins (`02f0f1b`,
+`e6b980e`, `c273341`, `14ba724`, `9d72592`, `8b46159`). Every fix was re-derived
 from the upstream pin BEFORE editing; every unit's suites were re-verified solo
 by the orchestrator before commit.
 
@@ -140,6 +146,17 @@ its assertion form).
   Ancestor arm answers the 405 with the !manualMark guard convention, placed
   BEFORE the deps gate (upstream order); pinned with a real-flow seedMainAhead
   setup (main advanced past the feature tip → create 201 → merge 405 verbatim).
+- **The state arm hoisted** (`40d0a6c`, S15): routes/pulls.ts gains the hoisted
+  STATE arm immediately after the Ancestor arm and BEFORE the deps gate
+  (upstream CheckPullMergeable order, check.go:171-173 < :219-223) —
+  !manualMark && status not Mergeable/Empty → 405 `Please try again later`, so
+  a conflicted PR answers the state text even with open dependencies. The
+  `!== Empty` carve-out is load-bearing: the MWCS schedule path schedules Empty
+  rows (the direct path's trailing gate rejects them) — zero behavior change
+  beyond precedence. Pinned with a real-conflict seed (both sides rewrite
+  README.md off the shared root) asserting the deps edge exists and the check
+  resolved Conflict; MUTATION-PROVEN (the hoisted arm disabled → exactly the
+  pin answers the deps text).
 - **The auto-merge row cleanup** (`01c7dfb`): the direct-merge success tail
   deletes a standing scheduled row (merge.go:827-837's DeleteScheduledAutoMerge),
   composed over the table — a reverse import would invert the layer —
@@ -183,6 +200,27 @@ its assertion form).
   webauthn.go:59's VerificationRequired; 2FA false per webauthn.go:189's
   VerificationPreferred — violation 403 (go-webauthn v0.18.2 ErrVerification).
   Client-requested UV is no longer trusted.
+- **THE ⑩ AUTHORIZATION CLASS** (`c3ac813`): nine write arms answered
+  non-writers with success or a leaking 404 — now gated. Milestone CRUD and
+  repo-label CRUD ride the shared reqRepoWriter gate (canWriteRepository) in
+  the landed projects-repo shape, placed after repo resolution and BEFORE id
+  resolution — upstream's middleware chain order means a non-writer
+  PATCH/DELETE on a missing row answers 403, not 404/204 (the middleware's
+  verbatim `user should have a permission to write to a repo`, api.go:392-396;
+  the 403s are runtime-only, declared responses unchanged). The issue-label
+  add/replace arms answer 403 `write permission is required` verbatim
+  (issue_label.go:311, shared by Add/Replace), clear answers the bare 403
+  (issue_label.go:292) — issue-404 precedes the gate. The silent-skip class
+  healed: a non-writer poster's issue PATCH applies the title but leaves
+  milestone and deadline untouched (upstream wraps the deadline parse
+  entirely, issue.go:760, and gates the milestone arm at the condition, :789)
+  — counters unmoved, no Milestone comment, no webhook; the type-7 comment
+  arms these label writes ride (`e6b980e`, §9) compose on all three API
+  label routes. One gate deliberately NOT added: upstream's
+  mustEnableIssuesOrPulls closes only the /issues subtree — the /labels and
+  /milestones groups are siblings outside it and upstream SERVES
+  label/milestone APIs on tracker-disabled repos, so wrapping ours would
+  diverge (L4, skipped with pin evidence — §14).
 - **The AEAD ticket** (`0bd7798`): the restart-dead sibling's AES-256-GCM
   ticket conversion verified COMPLETE hunk-by-hunk (wire-version byte 0x01,
   12B IV, 16B tag, HKDF-SHA256 key derivation, cached CryptoKey, retired-HMAC
@@ -285,6 +323,10 @@ archived body, clone advert 200.
 - **check-openapi registrations** (`01c7dfb`): the terraform management-delete
   422s + the merge route's 201 (the MWCS schedule success, pull.go:1004-1006)
   registered in RUNTIME_ONLY_RESPONSES; check:api PASS.
+- **the transfer 409 declarations** (`02f0f1b`): the declared 409 on the
+  transfer-request route fails the contract checker without its
+  RUNTIME_ONLY_RESPONSES companion (+8 — the same mechanical necessity
+  S4/S10 hit); entry with cite; check:api PASS.
 - **bootstrap-admin mint guard** (`8e5c4ea`) — the root-cause fix for v1.5's
   observed standing-PAT churn (2 → 10): the direct-SQL INSERT (name='bootstrap')
   ran unconditionally, so every probe-retry invocation added a row — the D1
@@ -315,7 +357,251 @@ archived body, clone advert 200.
   `atomic push failed` comment re-cited to the constant (NOTICE row 184
   already covers the flip; comment-only, dist-types regenerated clean).
 
-## 8. The probe battery alignment (S8, `d3f8211`)
+## 8. The repo surface — fork visibility, the transfer ladder, the settings danger zone (`02f0f1b`, `6b7b517`, `8b46159`)
+
+**Fork-visibility coupling** (`02f0f1b`, P2): setVisibility became the full
+setRepoVisibility port (services/repository/repository.go:145-205) — a flip
+recurses per fork level (row flip → per-repo star/watch zeroing (:172-181) →
+best-effort registry priv mirror → the cascade gate
+`isPrivate || owner != private` evaluated PER LEVEL, so a private-org fork
+flips itself while its subtree stops and a LIMITED-org fork's subtree passes,
+:184-200 → children via the fork_parent recursion, migration 0009's column
+read directly). The route gained upstream's forcing arm (repo.go:673-679): a
+fork's private request is replaced by the base repo's value BEFORE change
+detection — an out-of-step base renders a silent no-op re-render; a dangling
+forkParent degrades to the fork's own value. Pinned: forced no-op both
+directions, 3-level cascade, private-org stop, limited pass, per-level
+zeroing.
+
+**The transfer ladder's parity arms** (`02f0f1b`): edit-binding MaxSize checks
+after req.valid — description >2048 / website >1024 → 422 `[Field]: MaxSize`
+verbatim (api.go:842 over binding.go:39; boundary accepted, nothing
+persisted). requestTransfer pre-reads a standing row and answers 409
+TransferInProgressError (transfer.go:55-57 verbatim, :113-115) — the
+UNIQUE(repo_id) concurrent loser maps to the same error and the original row
+is preserved (a re-request with a DIFFERENT target pinned). On accept, the
+per-seam verdicts: num_repos is documented-equivalent (users carries no such
+column — counts derive from rows) but the seam that exists is ported
+(RemoveOrgRepo's team_repo_access delete + per-team numRepos decrement with a
+MAX(,0) floor inside the accept batch, org.go:559-588); the
+redundant-collaborator drop is ported (the new owner's row + new-org members;
+the ghost arm has no upstream seam); the watch transfer is ported (doer +1
+Custom-kept, old-org Auto→Dont/else→None, upstream order); old-org label edges
+are ported (physical issue_labels rows + the type-7 comment deletes per
+transfer.go:267-306, with the foreign-repo + foreign-org conjuncts —
+definitions and drifted counters left alone exactly like upstream's raw
+deletes). Full-cascade pins: org→user accept (team tally 3→2, doer watch
+lands, org watch drops, org+foreign label edges/comments detach while own
+survive, the new-owner collaborator dropped, the outsider kept) and the
+user→org accept arm. The declared 409's checker fold is in §7.
+
+**The repo-settings danger zone** (`6b7b517` — ⑨'s R2): the four
+dangerous-operation forms, ported from options.tmpl:804-870 +
+setting.go:194-206/:865-1063. TRANSFER START carries dangerous_operation_form's
+exact shape (hidden action=transfer, typed full-name confirmation,
+new_owner_name) and the full gate order — confirm-name exact
+(enterred_invalid_repo_name) → case-folded owner lookup
+(enterred_invalid_owner_name) → the blocked-user probe (the API transfer
+route's own composition, admin/self skipped) → destination-collision pre-check
+(new_owner_has_same_repo, self-arm excluded) → requestTransfer with
+OwnerNotAssignableError texts surfaced verbatim. A PENDING-TRANSFER BANNER
+renders transfer_started %s over the recipient's DisplayName and swaps the
+start form for the abort form while a transfer is in flight (a thin inline
+read over repo_transfer+users). CANCEL answers transfer_abort_invalid verbatim
+on a miss before cancelTransfer; DELETE rides the confirm-name gate into the
+full D1 cascade. Action routing lives in the page module (applyRepoBasics
+dispatches into applyRepoDangerAction — upstream posts every arm to the same
+/settings URL), so ui/index.ts stayed untouched; archive/unarchive/visibility
+were already carried by the merged basics form, not duplicated. Three arms are
+blocked on the index.ts follow-up bundle (§14): delete's owner-dashboard
+redirect override (the write is upstream-exact and pinned; the landing page is
+ours), the doer threading (settingsSubmit passes no viewer — exact for
+user-owned repos), and the admin-repos delete button's route registration (the
+seam is landed, the button renders nothing until then). The fourth form,
+delete-wiki, landed at `8b46159` (below) with its env threading fail-closed.
+
+**The whole-wiki delete arm + the N4 sweep** (`8b46159`, U8): the danger
+zone's fifth form — the wiki row between transfer and delete, has_wiki-gated
+exactly like upstream's unit-read gate (options.tmpl:873-885), the
+dangerous_operation_form shape with a typed FULL repo_name +
+confirm_wiki_delete (name-mismatch → enterred_invalid_repo_name; applied →
+303 /settings, upstream's JSONRedirect). The storage model was read before
+shaping: wiki pages are *.md blobs in the sibling engine cell (the D1 flag is
+repo_settings.has_wiki), so deleteWiki first flips has_wiki=false via
+saveRepoSettings (upstream removes the TypeWiki unit, setting.go:594), then
+runs a best-effort bounded page-walk (BFS over the cell tree, 5000-entry /
+depth-16 caps) feeding ONE applyWikiChanges delete set — a single
+tree-emptying 'Delete wiki' commit; storage failures are logged, not thrown
+(upstream's flash is unconditional). DOCUMENTED DIVERGENCE: upstream's
+git.DeleteRepository removes the whole wiki repo including history; ours
+empties the tip tree — pages/raw/revisions go not-found, blobs are reclaimed
+at repo-delete's cell destroy, and history is retained so a re-enabled wiki
+starts empty. NO webhook fires (upstream fires none — only an audit record,
+and our audit enum has no wiki arm yet: follow-up dispatched). WIRE GAP,
+fail-closed: settingsSubmit passes only the DB handle, so the delete-wiki arm
+REFUSES BEFORE ANY WRITE until the one-line env threading lands in ui/index.ts
+(§14's bundle). N4, the repo-delete notification sweep: deleteRepository's
+issue-scoped batch now sweeps notification_states — our derived model keys on
+(user_id, issue_id) with no repo_id column, so the arm joins through the
+repo's issue ids exactly like the comments/subscriptions siblings (upstream's
+Notification{RepoID} census arm, services/repository/delete.go:170; the
+adaptation disclosed in the comment). Pinned: doomed threads' read+unread rows
+gone per-issue, a survivor repo's row intact.
+
+## 9. Issues and labels — scoped/exclusive semantics, the self-healing recount (`e6b980e`, `14ba724`, `9d72592`)
+
+**Scoped/exclusive labels** (`e6b980e`, SPEC-0023 first — §13): THE ORDERING
+RULE, read off the pin (conventional wisdom corrected): exclusive_order is
+DISPLAY-ONLY (CompareLabelForDisplay/SortLabelsForDisplay, label.go:196-230 —
+scope-less first, scope groups by name, exclusive_order asc with ≤0 last, name
+tie-break); the attach/replace tie-break is POSITIONAL —
+RemoveDuplicateExclusiveLabels keeps a scoped label only if no LATER request
+entry shares its scope ("labels at the end of the array getting preference",
+issue_label.go:356-373), the multi-attach loop's last same-scope id wins —
+pinned with a descending-order test an order-based tie-break would have
+failed. Scope resolution is purely name-based: the last-/ cuts, either half
+empty = no scope, and repo and org labels in the same scope exclude each other
+(label.go:184-191); creation-time attach stays dedupe-free (upstream NewIssue
+calls newIssueLabel directly — documented out of scope). THE ARMS: setLabel
+dedupes same-scope removals BEFORE attach (the already-attached short-circuit
+first); replaceLabels positionally filters the requested set then diffs (adds
+before removes); the type-7 comment seam is COMPOSED — removal ('' content)
+and add ('1' content) comments now write on these arms exactly as upstream's
+module-private removeIssueLabel statement shape does, which also equips the
+API's add/replace/clear arms (§4's authorization block rides the same seam).
+The sidebar picker sorts by sortLabelsForDisplay with scope dividers and
+per-item data-scope; upstream has NO alt-click semantics, and our no-JS form
+collapses to the same resolution server-side via the positional filter.
+
+**The self-healing milestone recount** (`14ba724`, M3): updateMilestone now
+runs upstream's two-exec recount in one batch (milestone.go:183-205) — (1) the
+fields plus numIssues/numClosedIssues via correlated subselects filtering
+milestone_id ALONE (milestone IDs are globally unique PKs; the pin has no repo
+conjunction), (2) completeness from the RECOUNTED values in a second statement
+— the split is load-bearing: SQLite SET expressions read the pre-update row,
+so the old single-statement formula read possibly-drifted values. Direct-D1
+drift pins both directions (a 99-heals-to-2/1/50 row on a no-op-ish PATCH;
+0-heals on the state flip with closed_date_unix still stamped);
+MUTATION-PROVEN (recount stripped → exactly the 2 fail). Upstream's state-flip
+updateRepoMilestoneNum stays out — repositories carries no
+num_closed_milestones column (M4, §14).
+
+**The attachments OPTIONS 405 twin** (`14ba724`): the attachments serving
+router gains the OPTIONS 405 beside the GET (web.go:912's
+Methods("GET, OPTIONS") + optionsCorsHandler's deny arm — with CORS disabled
+the handler bare-405s every OPTIONS, so a preflight cannot double-count a
+download). Pinned: download_count 0 through OPTIONS, 1 on GET; empty body +
+Allow: GET, OPTIONS in the house methodNotAllowed shape. The stale "OPTIONS is
+not carried" divergence note is rewritten to the deny-arm-carried truth;
+MUTATION-PROVEN (route disabled → exactly the 1 fails). The observed residual
+— POST /attachments/{uuid} still falls to Hono 404 where chi's method-mismatch
+arm 405s — joins the index.ts follow-up bundle (§14).
+
+**The type-7 test accommodation and the regression sweep** (`9d72592`, U10):
+the one test whose seed rides setLabel now expects the comment PAIR in order —
+the seed's ADD marker (`{type:7, content:'1'}`) before the arm's removal
+marker (`{type:7, content:''}`), and the num_comments pin moved 1 → 2 (both
+seam paths bump the counter — a latent drift the old run never reached, now
+pinned). The sweep: all 15 files that seed through setLabel/replaceLabels or
+assert timelines/counter snapshots ran SOLO green — zero genuine bugs, the
+only red was the briefed accommodation.
+
+## 10. The notification mailbox — mute-over-union and the retired reductions (`c273341`)
+
+- **N1 (P2) repo-mute outranks EVERY recipient source**: the recipient
+  expression wraps the whole arm union with a top-level not-exists over
+  repo_watchers(mode=2) (notification_list.go:135-141's
+  remove-ignorers-from-toNotify; the watchers arm keeps its own guard) — an
+  ignorer who commented, was mentioned, or is the poster loses the thread on
+  all three arms (pinned; the mail layer's twin rule confirmed by citation).
+- **N2 (P3) the reduction RETIRED, both arms implemented**: issue_assignees
+  exists (schema :1818-1827) and pull_reviews carries upstream's
+  ReviewType.Request rows exactly (schema :2367-2420), so the recipient
+  expression gains the assignee exists-arm and the requested-reviewer arm
+  (rr.type=4 AND reviewer_id = the user — team-request rows never qualify a
+  user, negative-tested).
+- **N3 (P3) the WIP gate**: conjuncts ONLY the repo-watch arm
+  (notification_list.go:100) with not(isPull AND title LIKE any WIP prefix)
+  from a literal-synced mirror of the mail layer's WIP_PREFIXES (SQLite LIKE's
+  ASCII case-insensitivity equals the helper's rule). Pinned: a WIP:/Draft:
+  title is dropped for the pure watcher, a comment-participant is still
+  reached, a rename off WIP re-qualifies.
+- **N6 (P3) documented equivalence**: users.type is the collapsed
+  ['user','org'] enum — bot rows cannot exist, upstream's IsTypeBot skip is
+  vacuous here.
+- **N5 (P3) REFUTED at the pin** (recorded in §14): the transition-pinned
+  CommentID is real (notification.go:176-196) but the REST serializer never
+  renders it — our fillLastCommentIds already matches upstream's rule.
+
+## 11. Admin and org — the API findings and the membership web arms (`7b4ccfc`, `9b45d68`)
+
+- **A2 (P2) the dead is_2fa_enabled filter revived**: real EXISTS/NOT-EXISTS
+  over the two_factor store (migration 0059; the in-twin of upstream's 1:0..1
+  LEFT OUTER JOIN, models/user/search.go:141), both polarities, engaged only
+  when the param is present.
+- **A1a (P2) the third in-tx guard**: a non-purge user DELETE now counts
+  package_versions-joined packages (HasOwnerPackages, package.go:342-351) →
+  422 verbatim `user still has ownership of packages [uid: N]` beside the
+  sibling 422s (admin/user.go:303-311; all three guards re-verified in
+  upstream's final tx).
+- **A1b (P2) the purge cascade's packages arm**: via the shared
+  deletePackageAndReferences seam in upstream order (packages.go:720-750) —
+  blob rows and R2 keys deliberately untouched: the hourly cleanup sweep stays
+  the SOLE content-key deleter, the exact split upstream's
+  RemoveAllPackages+CleanupTask implements (pinned rows-gone /
+  blob-survives-with-zero-refs).
+- **O2 (P2) the include-all claim corrected**: the reviewer's "PATCH strips
+  rows on flip" premise was stale — UpdateTeam's includeAllChanged is ADD-only
+  at this pin (team.go:167-174; RemoveAllRepositoriesFromTeam fires only from
+  DeleteTeam/web-removeall). Ported faithfully: the flag stored, TRUE fans out
+  team_repo_access rows for never-rowed org repos with per-row numRepos bumps;
+  the union-vs-rows interaction documented (rows inert while ON, live for the
+  OFF aftermath where rowed repos keep access — upstream parity).
+- **O5 (P3)**: a present non-empty org email validates → 422
+  `email address is invalid: …`; '' clears.
+- **O6 (P3)**: both repo-team handlers reordered to teams.go:191-199 — the
+  manage-gate 403 precedes the team 404.
+- **O7 (P3)**: include_desc rides the ParseBool+'on' rule (base_form.go:61-66)
+  — the old `!== 'false'` compare treated 'yes' as true.
+- **O9 (P3)**: teamSearch failure → 500
+  `{'ok':false,'error':'SearchTeam internal failure'}` verbatim
+  (team.go:810-818).
+- **O8 (P3) both member riders**: add-member auto-watch (default-true posture
+  documented, upstream's goroutine inlined); remove-member reconsider
+  (public-or-surviving-grant keeps watches; else unwatch + stopwatches + issue
+  subscriptions; assignees ride the same arm).
+
+**The ⑨ P1 — the org/team membership WEB arms** (`9b45d68`, U1): the two
+families upstream posts membership actions through are claimed and registered
+in ui/index.ts with GET→405 twins — POST `/:owner/teams/:team/action/:action`
+and its `/action/repo/:action` sibling (web.go:997-998, TeamsAction
+teams.go:113-247 + TeamsRepoAction :271-314) and POST
+`/org/:owner/members/action/:action` (web.go:989, MembersAction
+members.go:82-136); `{action}` is upstream's wildcard param (unknown tokens
+fall through to the default redirect, teams.go:241-247), and the team segment
+carries both carriers. THE BRIEF'S ACTION NAMES CORRECTED AGAINST THE PIN:
+add_member/remove_member do not exist upstream — the as-built set is
+add|remove|join|leave|remove_invite (+ repo add|remove|addall|removeall). The
+ladders compose the existing TeamsService/OrgService seams with zero
+duplicated logic: the RequireMember+RequireTeamMember prologue (owners/admins
+pass, members need team membership, outsiders a 404 shell, anonymous 303);
+join owner-only; leave with checkIsOrgMemberAndRedirect's three-way (:249-262);
+remove/add owner-only with the blocked-user and org-target refusal redirects;
+remove_invite reduces both arms (no invite store at this pin); the repo
+family's owner-gate-before-switch (:272-275) with addall/removeall composing
+the single-repo arms over direct enumeration (upstream repo_team.go:72-126 has
+no landed service arm — documented); the members family uid-first
+(members.go:84-89), private/public self-or-owner, leave-removes-doer → 303 '/'
+— upstream's JSON answers reduce to 303s per the house no-session-flash
+convention. The buttons carry the verbatim template gates as plain-POST
+reductions (members.tmpl:50-71's visibility toggle + Leave/Remove by role —
+anonymous renders none; the team detail's sidebar.tmpl:14-23 Leave/Join,
+members.tmpl:11-17 owner add + :36-42 Remove, repositories.tmpl:13-28
+add/add-all/remove-all with the per-repo remove suppressed under
+includesAllRepositories). One disclosed pin flip in pages-wave12.test.ts (the
+null-action pin → the as-built claim, the wave-49 precedent pattern).
+
+## 12. The probe battery alignment (S8, `d3f8211`)
 
 - **The sweep**: every changed surface of the fix wave grepped against all
   pins — only fw-sudo-non-admin-403 touched one (strengthened to the BARE
@@ -331,7 +617,9 @@ archived body, clone advert 200.
   header — a token-level seam writing no rows) — all 10 expectations stand; the
   personal_access_tokens=10 pin describes the deployed standing set and stays
   (the future churn root-cause is `8e5c4ea`'s guard; `--expect-tokens`
-  overrides at re-baseline).
+  overrides at re-baseline). The annotation is now IN the battery: the README
+  prose and the audit expect-string state the root cause is FIXED
+  (`40d0a6c`), keeping the standing-10 claim verbatim.
 - **The six new probes** (238 → 244 planned; window3 26→31, branch-protection
   18→19): bp-automerge-roundtrip (the MWCS ladder over a protected PR — 201
   empty, standing-row 409 verbatim, DELETE 204, re-DELETE bare 404; race-free
@@ -353,8 +641,11 @@ archived body, clone advert 200.
   probes own-eyes; the battery cannot run live pre-deploy — verification rides
   the convergence chain.
 
-## 9. SPEC ledger
+## 13. SPEC ledger
 
+- **specs/0023-scoped-labels.md NEW** (`e6b980e`, 224 lines): scoped/exclusive
+  label semantics — the display-vs-positional ordering split, name-based scope
+  resolution, and the type-7 comment seam (§9).
 - **SPEC-0022-two-factor-webauthn.md NEW** (`0bd7798`, 297 lines): the surface,
   the cookie/TTL/clearing table, the AEAD format, 13 pinned divergences
   including as-built secret-at-rest = encrypted-in-flight; §6's dual-clear
@@ -376,26 +667,58 @@ archived body, clone advert 200.
   annotated; stale-pin-sweep.md's cherrypick row re-counted (0 → 4 intentional
   bare-literal pins, each enumerated) — historical files untouched.
 
-## 10. Deferred and pending (as of this draft)
+## 14. Deferred and pending (as of this draft)
 
-**Pending-fill markers for the convergence**: ⑥=<pending>, ⑨=<pending>. If
-either lands before the tag, write it here with its hash.
+**Pending-fill markers for the convergence**: ⑥=<pending> (the route-table
+systematic diff; its named follow-ups ride the index.ts bundle below) and
+⑪=<pending> (the actions/explore/avatars review). If any lands before the
+tag, write it here with its hash.
+**The in-flight units all landed**: ⑨ in three parts (the API findings
+`7b4ccfc`, §11; the settings danger zone `6b7b517`, §8; the P1 org/team
+membership web arms `9b45d68`, §11), U10's type-7 accommodation (`9d72592`,
+§9), and U8's whole-wiki delete arm + the N4 sweep (`8b46159`, §8) — only the
+migration-gated O3/O4 remain (deferred below).
 
 - **S10 LANDED** (`452984c`): all five named residuals closed — the webauthn
   dual-clear (§4), the limiter verdict (§4), acl's decideDeployKey archived
   ordering (§5), the packages.ts 422 declarations (§7), and the engine comment
-  (§7); SPEC-0022 §6 rewritten as-built (§9).
+  (§7); SPEC-0022 §6 rewritten as-built (§13).
 - **S13 LANDED** (`de5efaf`): the cancel-pin flip, the ancestor-PR API 405 arm
-  (§3), and the 201-declaration note (§9) — all three arms in.
-- **S13's known residue** (dispatched to the next unit): a CONFLICT-status PR
-  with open dependencies still hits our deps gate before the state arm —
-  upstream's state arm (check.go:171) precedes deps (:219), answering
-  `Please try again later` where ours answers the deps text.
-- **⑥ the route-table systematic diff** (PENDING) and **⑨ the
-  orgs/settings/admin review** (PENDING).
+  (§3), and the 201-declaration note (§13) — all three arms in.
+- **S15 LANDED** (`40d0a6c`): S13's ordering residue closed — the state arm
+  hoisted before the deps gate (§3), MUTATION-PROVEN; S12's deferred README
+  annotation landed with it (the battery's PAT expect-string and the README
+  state the churn root-cause is FIXED — §12).
+- **Resolved without code, kept as records**:
+  - **L4 skipped-with-pin-evidence** (`c3ac813`): upstream's
+    mustEnableIssuesOrPulls closes only the /issues subtree — the /labels and
+    /milestones groups are siblings outside it and carry no unit check in
+    repo/label.go + repo/milestone.go: upstream SERVES label/milestone APIs on
+    tracker-disabled repos, so wrapping ours would diverge (the
+    Upstream-Parity Decision Rule); evidence recorded in both module headers.
+  - **N5 refuted at the pin** (`c273341`): the transition-pinned CommentID is
+    real (notification.go:176-196) but the REST serializer never renders it —
+    GetLastComment is the newest CommentType.Comment (issue.go:470-483); our
+    fillLastCommentIds already matches.
+  - **N2 retired** (`c273341`): both recipient arms implemented (§10).
+- **M4 the num_closed_milestones column** (migration-gated): upstream's
+  state-flip updateRepoMilestoneNum needs a repositories column we do not
+  carry (`14ba724`, §9).
+- **O3/O4 the transfer team_ids + org-accept arms** (0061 migration-gated):
+  the ⑨ findings' remaining deferred arms.
+- **The index.ts follow-up bundle**: ⑥'s update_preferences / bare-spelling
+  aliases / org-heatmap twins, U4's three blocked arms (the delete redirect
+  override, the doer threading, the admin-repos delete registration — §8),
+  the POST-attachments 405 residual (`14ba724`, §9), delete-wiki's env
+  threading (the arm landed fail-closed at `8b46159` — §8), and the audit-enum
+  wiki arm (`8b46159`'s dispatched follow-up).
+- **The wiki-family quirk** (ledgered at `8b46159`): a slashed page title
+  lands as blob `guide%2Fintro.md` but the engine's readBlob decodes per
+  segment, so the read model can never serve it — createWikiPage 500s
+  'vanished after create' AFTER landing.
 - **The standing-PAT re-baseline**: the six stale retry rows swept and the
   count re-baselined at convergence via `--expect-tokens` (`8e5c4ea` /
-  `d3f8211`).
+  `d3f8211`; the root-cause annotation landed at `40d0a6c`).
 - **The squash-message-body prefill reduction**: needs a commit-list seam —
   the documented SPEC-0005 reduction (`b5b1994`).
 - **The bare `_cherrypick` divergence** stays as recorded: the bare spelling is
@@ -407,5 +730,6 @@ standing pattern for a restart — hunk-by-hunk attribution FIRST (1171 lines
 carried whole; S5's complete-as-found AEAD conversion kept rather than
 rewritten), the transient tsc baseline attributed hunk-by-hunk to its owner
 before any commit cites "tree-zero", and every known-red dispatched IMMEDIATELY
-(S1 → S7 → S9; S2's known-red healed at `de5efaf`). The orchestrator's solo
-re-verify discipline held on all twelve landings.
+(S1 → S7 → S9; S2's known-red healed at `de5efaf`; S13's residue at
+`40d0a6c`). The orchestrator's solo re-verify discipline held on all
+twenty-three landings.
