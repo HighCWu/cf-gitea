@@ -483,9 +483,17 @@ Build-time decisions, each a recorded adaptation (none silent):
    with the attachments-serving seam's exact consumption (§2.4 background
    settle, the clear/rotation Set-Cookie directive on the response).
    Anonymous stays the default viewer (zero D1 reads without a cookie).
-7. **OPTIONS on /.well-known/* falls to the router 404** — upstream's
-   `optionsCorsHandler` is a no-op without `[cors]` config
-   (web.go:542), which cf-gitea does not surface; identical observable.
+7. **Method arms on /.well-known/* — SUPERSEDED by the aa8c072 adjudication**
+   (this item's original reading — "OPTIONS falls to the router 404,
+   identical observable" — was WRONG): chi v5.4.0 has NO HEAD→GET fallback,
+   a known method resolving no endpoint answers the DEFAULT
+   methodNotAllowedHandler (empty body, `Allow` per method), and an unknown
+   method bare-405s PRE-TREE; Gitea's `optionsCorsHandler` (a no-op without
+   `[cors]` config, web.go:542) never runs for unresolved methods because
+   Group folds middleware into endpoint registrations. The pair answers
+   405+Allow gate-INDEPENDENTLY for every known non-GET (see
+   src/api/routes/federation.ts's rewritten header for the full
+   citations); the well-known.ts module carries the same posture.
 
 **HANDOFF — the two mounts (orchestrator-owned files, unchanged by this
 wave):**
