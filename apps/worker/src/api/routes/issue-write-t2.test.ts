@@ -238,11 +238,15 @@ describe("DELETE /repos/{owner}/{repo}/issues/{index}/labels/{id} (issueRemoveLa
       .from(comments)
       .where(and(eq(comments.issueId, issueA.id), eq(comments.type, 7)))
       .all();
+    // The seedAttachedLabel ride (IssuesService.setLabel) legitimately writes
+    // the type-7 ADD comment first (content "1", poster unset — the service
+    // seed passes no actor); the arm's own removal comment follows it.
     expect(removalComments).toEqual([
+      { type: 7, content: "1", labelId: label.id, posterId: null }, // the seed's add marker
       { type: 7, content: "", labelId: label.id, posterId: 1 }, // content "" = the removed marker
     ]);
     const issueRow = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueA.id)).limit(1).then((rows) => rows[0]);
-    expect(issueRow?.numComments).toBe(1); // the label comment folded in
+    expect(issueRow?.numComments).toBe(2); // both label comments folded in — the seed's ADD + the removal
   });
 
   it("is the silent 204 when the label exists but is not attached (no comment, no counter drift)", async () => {
