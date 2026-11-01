@@ -15,6 +15,7 @@ import { canWriteRepo } from "./pages/file-editor";
 import { CommitsPage, loadCommitsData } from "./pages/commits";
 import { FileViewPage, loadFileViewData } from "./pages/file-view";
 import { HomePage, loadHomeData } from "./pages/home";
+import { RepoMigratingPage, loadRepoMigratingData } from "./pages/repo-migrating";
 import { NotFoundPage } from "./pages/not-found";
 import type { UiRoute } from "./index";
 import type { UiContext } from "./ui-context";
@@ -51,6 +52,14 @@ export async function renderUiPage(options: {
 
   switch (route.family) {
     case "home": {
+      // checkHomeCodeViewable's IsBeingCreated arm (view.go:178-202 — the
+      // migrating-home census row): a repo mid-migration renders the
+      // migrating page INSTEAD of the code tree, before any git access —
+      // the gate's early return, ported (pages/repo-migrating.tsx).
+      if (repo.status === "migrating") {
+        const data = await loadRepoMigratingData(env, repo, ctx.viewer);
+        return { status: 200, html: renderPage(<RepoMigratingPage ctx={ctx} data={data} />) };
+      }
       const data = await loadHomeData(engine, repo, url.origin);
       // The empty-repo arm's CanWriteCode fold gets the true D1 grant
       // (collaborator/team arms — the same predicate the file view rides at
