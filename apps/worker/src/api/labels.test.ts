@@ -13,6 +13,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { issueLabels, labels, repositories, users } from "../db/schema";
+import { STUB_USER, type AuthResolver } from "./auth";
 import { createApiRouter } from "./router";
 import { contractModelProperties } from "../compat/contract/frozen-contract";
 
@@ -33,7 +34,8 @@ const db = () => drizzle(env.DB);
 
 const LABEL_FIELDS = Object.keys(contractModelProperties("Label")).sort();
 
-const TOKEN = "stub-token";
+const TOKEN = "stub-token"; // resolves to the seeded repo owner (login alice)
+const TOKEN_NEIGHBOR = "neighbor-token"; // resolves to a non-writer stranger
 const authHeaders = { Authorization: `token ${TOKEN}`, "Content-Type": "application/json" };
 const ERROR_URL = "https://example.com/api/swagger";
 
@@ -99,8 +101,27 @@ async function seedLabel(repoId: string, input: SeedLabelInput): Promise<number>
   return row.id;
 }
 
+/**
+ * The resolver seam: TOKEN maps to the seeded owner (login alice — every repo
+ * in this file is alice-owned) so the happy-path writes ride the writer gate
+ * as its writer; TOKEN_NEIGHBOR maps to an unaffiliated stranger and pins the
+ * reqRepoWriter 403s. STUB_USER carries the contract User field set; only
+ * id/login/username are re-pointed.
+ */
+const resolver: AuthResolver = {
+  resolveToken: (token) => {
+    if (token === TOKEN) {
+      return Promise.resolve({ ...STUB_USER, login: "alice", username: "Alice" });
+    }
+    if (token === TOKEN_NEIGHBOR) {
+      return Promise.resolve({ ...STUB_USER, id: 424242, login: "neighbor", username: "neighbor" });
+    }
+    return Promise.resolve(null);
+  },
+};
+
 const router = () => {
-  const app = createApiRouter();
+  const app = createApiRouter({ auth: resolver });
   return async (path: string, init?: RequestInit): Promise<Response> =>
     app.fetch(new Request(`https://example.com${path}`, init), env);
 };
@@ -213,6 +234,27 @@ describe("POST /repos/{owner}/{repo}/labels (issueCreateLabel)", () => {
     });
     expect(missing.status).toBe(404);
     expect(await missing.json()).toEqual({ message: "not found", url: ERROR_URL });
+  });
+
+  it("403s a non-writer with the upstream reqRepoWriter message (runtime-only status)", async () => {
+    // reqRepoWriter(TypeIssues, TypePullRequests) (api.go:1675-1681 via
+    // :393-400): any authenticated non-writer is rejected before the handler;
+    // the vendored contract declares no 403 on the repo-label ops (upstream's
+    // own swagger gap), so the status is runtime-only.
+    await seedUser("Alice");
+    await seedRepo("alice", "visible");
+
+    const res = await router()("/repos/alice/visible/labels", {
+      method: "POST",
+      headers: { Authorization: `token ${TOKEN_NEIGHBOR}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "bug", color: "#00aabb" }),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({
+      message: "user should have a permission to write to a repo",
+      url: ERROR_URL,
+    });
+    expect(await db().select().from(labels).all()).toHaveLength(0);
   });
 });
 
@@ -470,6 +512,35 @@ describe("PATCH /repos/{owner}/{repo}/labels/{id} (issueEditLabel)", () => {
     expect(anon.status).toBe(401);
     expect(await anon.json()).toEqual({ message: "token is required", url: ERROR_URL });
   });
+
+  it("403s a non-writer BEFORE the id resolution (missing and garbage ids stay a 403)", async () => {
+    // Upstream chains reqRepoWriter ahead of the handler, so the gate runs
+    // before EditLabel's strict-numeric lookup — a non-writer's PATCH on a
+    // missing (or non-numeric) id answers the 403, never the label 404.
+    await seedUser("Alice");
+    const repoId = await seedRepo("alice", "visible");
+    const labelId = await seedLabel(repoId, { name: "bug" });
+    const neighborHeaders = { Authorization: `token ${TOKEN_NEIGHBOR}`, "Content-Type": "application/json" };
+
+    const existing = await router()(`/repos/alice/visible/labels/${labelId}`, {
+      method: "PATCH",
+      headers: neighborHeaders,
+      body: JSON.stringify({ name: "hijack" }),
+    });
+    expect(existing.status).toBe(403);
+    expect(await existing.json()).toEqual({
+      message: "user should have a permission to write to a repo",
+      url: ERROR_URL,
+    });
+
+    const missing = await router()("/repos/alice/visible/labels/99", {
+      method: "PATCH",
+      headers: neighborHeaders,
+      body: JSON.stringify({ name: "new" }),
+    });
+    expect(missing.status).toBe(403);
+    expect((await db().select().from(labels).all())[0]?.name).toBe("bug");
+  });
 });
 
 describe("DELETE /repos/{owner}/{repo}/labels/{id} (issueDeleteLabel)", () => {
@@ -507,5 +578,23 @@ describe("DELETE /repos/{owner}/{repo}/labels/{id} (issueDeleteLabel)", () => {
     const missing = await router()("/repos/alice/ghost/labels/1", { method: "DELETE", headers: authHeaders });
     expect(missing.status).toBe(404);
     expect(await missing.json()).toEqual({ message: "not found", url: ERROR_URL });
+  });
+
+  it("403s a non-writer BEFORE the delete (a missing label stays a 403, not the silent 204)", async () => {
+    // Upstream chains reqRepoWriter ahead of the handler, so the gate runs
+    // before deleteLabel's zero-rows-204 — a non-writer's DELETE on a missing
+    // label answers the 403, never the 204.
+    await seedUser("Alice");
+    await seedRepo("alice", "visible");
+
+    const res = await router()("/repos/alice/visible/labels/99", {
+      method: "DELETE",
+      headers: { Authorization: `token ${TOKEN_NEIGHBOR}` },
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({
+      message: "user should have a permission to write to a repo",
+      url: ERROR_URL,
+    });
   });
 });

@@ -158,7 +158,7 @@ import { and, asc, desc, eq, inArray, ne, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { renderMarkdownToHtml } from "../../api/services/markdown";
-import { listRepoLabels } from "../../api/services/labels";
+import { labelExclusiveScope, listRepoLabels, sortLabelsForDisplay } from "../../api/services/labels";
 import {
   findIssueByRepoAndIndex,
   hasWorkInProgressPrefix,
@@ -1944,6 +1944,27 @@ function IssueSidebar(props: {
   const listBase = `${props.repoLink}/${issue.isPull ? "pulls" : "issues"}`;
   const canonicalPath = `${props.repoLink}/${issue.isPull ? "pulls" : "issues"}/${issue.index}`;
   const selectedIds = new Set(labels.map((label) => label.id));
+  // The scope-grouped picker list (SPEC-0023 §4.5): upstream sorts each
+  // sidebar label list with SortLabelsForDisplay
+  // (routers/web/repo/issue_page_meta.go:605-613) and renders a divider at
+  // every scope boundary (sidebar/label_list.tmpl:23-39). Order matters
+  // beyond display: our no-JS checkbox form can submit two same-scope
+  // exclusives and the server-side tri-state (replaceLabels' positional
+  // filter) resolves the winner by LAST position — i.e. the later item in
+  // this list, exactly the post-click state upstream's combolist JS leaves
+  // for the clicked label.
+  const labelOptions = props.labelOptions === null ? null : sortLabelsForDisplay(props.labelOptions);
+  const pickerRows: ({ kind: "divider"; scope: string } | { kind: "label"; label: LabelRow })[] = [];
+  if (labelOptions !== null) {
+    labelOptions.forEach((label, index) => {
+      const scope = labelExclusiveScope(label);
+      const previousScope = index > 0 ? labelExclusiveScope(labelOptions[index - 1]!) : null;
+      if (index > 0 && scope !== previousScope) {
+        pickerRows.push({ kind: "divider", scope });
+      }
+      pickerRows.push({ kind: "label", label });
+    });
+  }
   const nowMs = Date.now();
   return (
     <div class="issue-content-right ui segment">
@@ -1970,26 +1991,33 @@ function IssueSidebar(props: {
         <div class="fixed-text muted">
           <strong>{issueDetailLocale.labels}</strong>
         </div>
-        {props.labelOptions !== null ? (
+        {labelOptions !== null ? (
           <form class="ui form" action={`${props.repoLink}/issues/labels`} method="post">
             <input type="hidden" name="issue_ids" value={String(issue.id)} />
-            {props.labelOptions.length === 0 ? (
+            {labelOptions.length === 0 ? (
               <span class="item empty-list">{issueDetailLocale.no_labels}</span>
             ) : (
               <div class="ui list labels-list">
-                {props.labelOptions.map((label) => {
-                  const id = `issue-label-${label.id}`;
-                  return (
-                    <div class="item">
+                {pickerRows.map((row) =>
+                  row.kind === "divider" ? (
+                    <div class="divider" data-scope={row.scope} />
+                  ) : (
+                    <div class="item" data-scope={labelExclusiveScope(row.label)}>
                       <div class="ui checkbox">
-                        <input id={id} name="label_ids" type="checkbox" value={String(label.id)} checked={selectedIds.has(label.id)} />
-                        <label for={id}>
-                          <LabelBadge label={label} />
+                        <input
+                          id={`issue-label-${row.label.id}`}
+                          name="label_ids"
+                          type="checkbox"
+                          value={String(row.label.id)}
+                          checked={selectedIds.has(row.label.id)}
+                        />
+                        <label for={`issue-label-${row.label.id}`}>
+                          <LabelBadge label={row.label} />
                         </label>
                       </div>
                     </div>
-                  );
-                })}
+                  ),
+                )}
               </div>
             )}
             <div class="field">

@@ -62,6 +62,71 @@ export function toApiLabel(row: LabelRow, repoApiUrl: string): Label {
   };
 }
 
+/**
+ * `Label.ExclusiveScope` (models/issues/label.go:184-191, SPEC-0023 §2.1) —
+ * the name cut at the LAST `/`, exclusive-only, either half empty → no scope
+ * (`scope/` and `/name` are scope-less; `a/b/c` scopes `a/b`). The rule is
+ * purely name-based: a repo label and an org label in the same scope exclude
+ * each other.
+ */
+export function labelExclusiveScope(label: Pick<LabelRow, "name" | "exclusive">): string {
+  if (!label.exclusive) {
+    return "";
+  }
+  const cut = label.name.lastIndexOf("/");
+  if (cut <= 0 || cut === label.name.length - 1) {
+    return "";
+  }
+  return label.name.slice(0, cut);
+}
+
+/**
+ * `RemoveDuplicateExclusiveLabels` (models/issues/issue_label.go:356-373,
+ * SPEC-0023 §2.3) — the replace-arm requested-set filter: a scoped label is
+ * kept only when NO LATER entry of the list shares its scope ("labels at the
+ * end of the array getting preference"). Positional by design —
+ * `exclusive_order` never breaks attach/replace ties, it orders display only
+ * (compareLabelForDisplay).
+ */
+export function removeDuplicateExclusiveLabels<T>(list: T[], scopeOf: (entry: T) => string): T[] {
+  return list.filter((entry, index) => {
+    const scope = scopeOf(entry);
+    if (scope === "") {
+      return true;
+    }
+    return !list.slice(index + 1).some((later) => scopeOf(later) === scope);
+  });
+}
+
+/**
+ * `CompareLabelForDisplay` (models/issues/label.go:196-224, SPEC-0023 §2.3's
+ * ordering rule): scope-less labels first, then scope groups by scope name;
+ * within a scope `exclusive_order` ascending with order <= 0 treated as
+ * last, falling back to name.
+ */
+export function compareLabelForDisplay(a: LabelRow, b: LabelRow): number {
+  const scopeA = labelExclusiveScope(a);
+  const scopeB = labelExclusiveScope(b);
+  if (scopeA !== scopeB) {
+    if (scopeA === "") return -1;
+    if (scopeB === "") return 1;
+    return scopeA < scopeB ? -1 : scopeA > scopeB ? 1 : 0;
+  }
+  let orderA = a.exclusiveOrder ?? 0;
+  let orderB = b.exclusiveOrder ?? 0;
+  if (orderA <= 0) orderA = Number.MAX_SAFE_INTEGER;
+  if (orderB <= 0) orderB = Number.MAX_SAFE_INTEGER;
+  if (orderA !== orderB) {
+    return orderA - orderB;
+  }
+  return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+}
+
+/** `SortLabelsForDisplay` (models/issues/label.go:226-230) — stable sort. */
+export function sortLabelsForDisplay(labelsList: LabelRow[]): LabelRow[] {
+  return [...labelsList].sort(compareLabelForDisplay);
+}
+
 export type LabelSortType = "reversealphabetically" | "leastissues" | "mostissues" | "";
 
 /**

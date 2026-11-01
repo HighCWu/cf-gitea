@@ -107,7 +107,7 @@
 
 import { env } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
-import { and, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
@@ -120,6 +120,7 @@ import {
   issueSubscriptions,
   issueUsers,
   issues,
+  labels,
   milestones,
   notificationStates,
   projectIssues,
@@ -143,15 +144,23 @@ async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
 }
 
 /** A form POST with the browser's same-origin header (the §2.8 guard's
- *  happy path — the router fixture origin). */
-function formPost(fields: Record<string, string>): RequestInit {
+ *  happy path — the router fixture origin). Array values ride as REPEATED
+ *  keys (URLSearchParams.append) — the checkbox-group shape the
+ *  `label_ids` parser reads back with getAll. */
+function formPost(fields: Record<string, string | string[]>): RequestInit {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(fields)) {
+    for (const entry of Array.isArray(value) ? value : [value]) {
+      params.append(key, entry);
+    }
+  }
   return {
     method: "POST",
     headers: {
       "content-type": "application/x-www-form-urlencoded",
       origin: "https://test.local",
     },
-    body: new URLSearchParams(fields).toString(),
+    body: params.toString(),
   };
 }
 
@@ -1645,5 +1654,138 @@ describe("the view seam's mark-read (issue_view.go:386-391 + pull.go:150-155, §
       .where(and(eq(notificationStates.issueId, issueId), eq(notificationStates.userId, fixture.ownerId)))
       .get();
     expect(state?.readAtUnix ?? 0).toBeGreaterThan(0);
+  });
+});
+
+// --- the sidebar label picker's scope semantics (SPEC-0023) ---------------------------
+
+const PICKER_SCOPE = "mxscope";
+
+describe("the sidebar label picker's scope semantics (SPEC-0023)", () => {
+  /** Converging scoped-label seeds on the lab repo (the w129 milestone
+   *  pattern: exists-by-name before insert); exclusive_order is pinned
+   *  directly on the rows (createRepoLabel doesn't take it). */
+  async function ensurePickerLabels(repoId: string): Promise<{ alpha: number; beta: number; gamma: number }> {
+    const db = drizzle(env.DB);
+    const seeds = [
+      { key: "alpha", name: `${PICKER_SCOPE}/alpha`, order: 1 },
+      { key: "beta", name: `${PICKER_SCOPE}/beta`, order: 2 },
+      { key: "gamma", name: `${PICKER_SCOPE}/gamma`, order: 0 },
+    ] as const;
+    const out: Record<string, number> = {};
+    for (const seed of seeds) {
+      const existing = await db
+        .select({ id: labels.id })
+        .from(labels)
+        .where(and(eq(labels.repoId, repoId), eq(labels.name, seed.name)))
+        .get();
+      out[seed.key] =
+        existing?.id ??
+        (
+          await createRepoLabel(env.DB, repoId, {
+            name: seed.name,
+            exclusive: true,
+            color: "#00b109",
+            description: "",
+            isArchived: false,
+            now: new Date(),
+          })
+        ).id;
+      await db.update(labels).set({ exclusive: true, exclusiveOrder: seed.order }).where(eq(labels.id, out[seed.key]!));
+    }
+    return { alpha: out.alpha!, beta: out.beta!, gamma: out.gamma! };
+  }
+
+  async function pickerLabelIds(issueId: number): Promise<number[]> {
+    const rows = await drizzle(env.DB)
+      .select({ labelId: issueLabels.labelId })
+      .from(issueLabels)
+      .where(eq(issueLabels.issueId, issueId))
+      .orderBy(asc(issueLabels.labelId))
+      .all();
+    return rows.map((row) => row.labelId);
+  }
+
+  it("the picker renders the scope-grouped list: scope-less first, exclusive_order asc with the 0-order label last, dividers + per-item data-scope", async () => {
+    const fixture = await ensureIssueDetailFixtures();
+    const sharedRow = await drizzle(env.DB)
+      .select({ repoId: issues.repoId })
+      .from(issues)
+      .where(eq(issues.id, fixture.openPrIssueId))
+      .get();
+    if (sharedRow === undefined) throw new Error("picker render seed: shared row missing");
+    const { alpha, beta, gamma } = await ensurePickerLabels(sharedRow.repoId);
+    // A throwaway issue — the render must not disturb the shared fixture's
+    // seeded sidebar state (the established sidebar-write posture).
+    const throwaway = await new IssuesService(env.DB).createIssue({
+      repoId: sharedRow.repoId,
+      title: "mx: scope picker render",
+      now: new Date(),
+    });
+
+    const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/issues/${throwaway.index}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // Per-item data-scope (upstream label_list_item.tmpl:4 — the attribute
+    // the combolist JS keys its exclusive click rule on).
+    expect(html).toContain(`class="item" data-scope="${PICKER_SCOPE}"`);
+    // The group divider at the scope boundary (upstream label_list.tmpl:27).
+    expect(html).toMatch(new RegExp(`<div class="divider" data-scope="${PICKER_SCOPE}"\\s*/?>`));
+    // Ordering (issue_page_meta.go:605-613's SortLabelsForDisplay): the
+    // scope-less fixture label first, then the scope group with
+    // exclusive_order ascending and the 0-order label last.
+    const bugPos = html.indexOf(`id="issue-label-${fixture.labelId}"`);
+    const alphaPos = html.indexOf(`id="issue-label-${alpha}"`);
+    const betaPos = html.indexOf(`id="issue-label-${beta}"`);
+    const gammaPos = html.indexOf(`id="issue-label-${gamma}"`);
+    expect(Math.min(bugPos, alphaPos, betaPos, gammaPos)).toBe(bugPos);
+    expect(alphaPos).toBeLessThan(betaPos);
+    expect(betaPos).toBeLessThan(gammaPos);
+  });
+
+  it("submitting two same-scope ids keeps only the LAST DOM position — the server-side tri-state — and scope-less labels ride alongside", async () => {
+    const fixture = await ensureIssueDetailFixtures();
+    const sharedRow = await drizzle(env.DB)
+      .select({ repoId: issues.repoId })
+      .from(issues)
+      .where(eq(issues.id, fixture.openPrIssueId))
+      .get();
+    if (sharedRow === undefined) throw new Error("picker submit seed: shared row missing");
+    const { alpha, beta } = await ensurePickerLabels(sharedRow.repoId);
+    const throwaway = await new IssuesService(env.DB).createIssue({
+      repoId: sharedRow.repoId,
+      title: "mx: scope picker submit",
+      now: new Date(),
+    });
+
+    // [alpha, beta] — the later DOM position wins (upstream's post-click
+    // state: the clicked label replaces its same-scope occupant).
+    const first = await fetchUi(
+      `/${OWNER_NAME}/${REPO_SLUG}/issues/labels`,
+      withCookie(formPost({ issue_ids: String(throwaway.id), label_ids: [String(alpha), String(beta)] }), fixture.ownerCookie),
+    );
+    expect(first.status).toBe(303);
+    expect(await pickerLabelIds(throwaway.id)).toEqual([beta]);
+
+    // Re-click the selected label's neighbor: [beta, alpha] → alpha replaces.
+    const second = await fetchUi(
+      `/${OWNER_NAME}/${REPO_SLUG}/issues/labels`,
+      withCookie(formPost({ issue_ids: String(throwaway.id), label_ids: [String(beta), String(alpha)] }), fixture.ownerCookie),
+    );
+    expect(second.status).toBe(303);
+    expect(await pickerLabelIds(throwaway.id)).toEqual([alpha]);
+
+    // Scope-less labels are never displaced by the rule.
+    const third = await fetchUi(
+      `/${OWNER_NAME}/${REPO_SLUG}/issues/labels`,
+      withCookie(
+        formPost({ issue_ids: String(throwaway.id), label_ids: [String(fixture.labelId), String(alpha), String(beta)] }),
+        fixture.ownerCookie,
+      ),
+    );
+    expect(third.status).toBe(303);
+    expect(await pickerLabelIds(throwaway.id)).toEqual([fixture.labelId, beta]);
   });
 });

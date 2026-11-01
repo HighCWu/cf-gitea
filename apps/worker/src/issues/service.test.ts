@@ -8,9 +8,11 @@
  */
 
 import { env } from "cloudflare:workers";
-import { eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+
+import { labelExclusiveScope } from "../api/services/labels";
 
 import {
   comments,
@@ -397,6 +399,206 @@ describe("labels (§3.2 counters)", () => {
     const foreign = await seedLabel(repoA, "foreign");
     const issue = await service().createIssue({ repoId: repoB, title: "x" });
     await expect(service().setLabel(issue.id, foreign)).rejects.toThrow(/label does not exist/);
+  });
+});
+
+describe("scoped/exclusive labels (SPEC-0023)", () => {
+  /** seedLabel with the exclusive columns (the plain seeder keeps its shape). */
+  async function seedScopedLabel(repoId: string, name: string, exclusive = true, exclusiveOrder = 0): Promise<number> {
+    const rows = await db()
+      .insert(labels)
+      .values({ repoId, name, exclusive, exclusiveOrder })
+      .returning({ id: labels.id })
+      .all();
+    const row = rows[0];
+    if (row === undefined) throw new Error("label seed failed");
+    return row.id;
+  }
+
+  /** The issue's attached label ids, ascending (stable assertion order). */
+  async function attachedIds(issueId: number): Promise<number[]> {
+    const rows = await db()
+      .select({ labelId: issueLabels.labelId })
+      .from(issueLabels)
+      .where(eq(issueLabels.issueId, issueId))
+      .orderBy(asc(issueLabels.labelId))
+      .all();
+    return rows.map((row) => row.labelId);
+  }
+
+  /** The type-7 trail in write order — `{ labelId, content }` per row
+   *  (content "1" = added, "" = removed, upstream newIssueLabel/deleteIssueLabel). */
+  async function labelCommentTrail(issueId: number): Promise<{ labelId: number; content: string }[]> {
+    const rows = await db()
+      .select({ labelId: comments.labelId, content: comments.content })
+      .from(comments)
+      .where(and(eq(comments.issueId, issueId), eq(comments.type, CommentType.Label)))
+      .orderBy(asc(comments.id))
+      .all();
+    return rows.map((row) => ({ labelId: row.labelId ?? -1, content: row.content ?? "" }));
+  }
+
+  async function labelRow(labelId: number) {
+    const row = await db().select().from(labels).where(eq(labels.id, labelId)).get();
+    if (row === undefined) throw new Error("label row vanished");
+    return row;
+  }
+
+  async function issueRow(issueId: number) {
+    const row = await db().select().from(issues).where(eq(issues.id, issueId)).get();
+    if (row === undefined) throw new Error("issue row vanished");
+    return row;
+  }
+
+  it("ExclusiveScope port: the last-slash cut, either half empty → none, exclusive-only", () => {
+    // models/issues/label.go:184-191 — strings.CutLast on "/".
+    expect(labelExclusiveScope({ name: "priority/high", exclusive: true })).toBe("priority");
+    expect(labelExclusiveScope({ name: "a/b/c", exclusive: true })).toBe("a/b");
+    expect(labelExclusiveScope({ name: "scope/", exclusive: true })).toBe("");
+    expect(labelExclusiveScope({ name: "/name", exclusive: true })).toBe("");
+    expect(labelExclusiveScope({ name: "noslash", exclusive: true })).toBe("");
+    expect(labelExclusiveScope({ name: "priority/high", exclusive: false })).toBe("");
+  });
+
+  it("attaching two same-scope exclusives keeps only the second; the trail is add/remove/add with counters net right", async () => {
+    const repoId = await seedRepo();
+    const svc = service();
+    const high = await seedScopedLabel(repoId, "priority/high");
+    const low = await seedScopedLabel(repoId, "priority/low");
+    const issue = await svc.createIssue({ repoId, title: "scoped" });
+
+    expect(await svc.setLabel(issue.id, high)).toBe(true);
+    expect(await svc.setLabel(issue.id, low)).toBe(true);
+
+    expect(await attachedIds(issue.id)).toEqual([low]);
+    expect((await labelRow(high)).numIssues).toBe(0);
+    expect((await labelRow(low)).numIssues).toBe(1);
+    // Upstream newIssueLabel order: the displaced occupant's removal (content
+    // "") lands BEFORE the new label's add (content "1") — issue_label.go:85-111.
+    expect(await labelCommentTrail(issue.id)).toEqual([
+      { labelId: high, content: "1" },
+      { labelId: high, content: "" },
+      { labelId: low, content: "1" },
+    ]);
+    expect((await issueRow(issue.id)).numComments).toBe(3);
+  });
+
+  it("non-exclusive labels are untouched by the scope dedupe", async () => {
+    const repoId = await seedRepo();
+    const svc = service();
+    const bug = await seedLabel(repoId, "bug");
+    const high = await seedScopedLabel(repoId, "priority/high");
+    const issue = await svc.createIssue({ repoId, title: "mixed" });
+
+    expect(await svc.setLabel(issue.id, bug)).toBe(true);
+    expect(await svc.setLabel(issue.id, high)).toBe(true);
+
+    expect(await attachedIds(issue.id)).toEqual([bug, high]);
+    expect(await labelCommentTrail(issue.id)).toEqual([
+      { labelId: bug, content: "1" },
+      { labelId: high, content: "1" },
+    ]);
+    expect((await labelRow(bug)).numIssues).toBe(1);
+    expect((await labelRow(high)).numIssues).toBe(1);
+  });
+
+  it("re-attaching the current occupant short-circuits before the scope dedupe (HasIssueLabel)", async () => {
+    const repoId = await seedRepo();
+    const svc = service();
+    const high = await seedScopedLabel(repoId, "priority/high");
+    const issue = await svc.createIssue({ repoId, title: "idempotent" });
+
+    expect(await svc.setLabel(issue.id, high)).toBe(true);
+    expect(await svc.setLabel(issue.id, high)).toBe(false);
+
+    expect(await attachedIds(issue.id)).toEqual([high]);
+    // No removal of itself: exactly the one add comment.
+    expect(await labelCommentTrail(issue.id)).toEqual([{ labelId: high, content: "1" }]);
+    expect((await issueRow(issue.id)).numComments).toBe(1);
+  });
+
+  it("replace filters the REQUESTED set one-per-scope with the positional winner (later request entries win)", async () => {
+    const repoId = await seedRepo();
+    const svc = service();
+    const bug = await seedLabel(repoId, "bug");
+    const high = await seedScopedLabel(repoId, "priority/high");
+    const low = await seedScopedLabel(repoId, "priority/low");
+    const issue = await svc.createIssue({ repoId, title: "replace" });
+
+    // RemoveDuplicateExclusiveLabels (issue_label.go:356-373): [low, high]
+    // keeps high — the later entry — and the result reports POST-filter ids.
+    expect(await svc.replaceLabels(issue.id, [low, high])).toEqual({ added: [high], removed: [] });
+    expect(await attachedIds(issue.id)).toEqual([high]);
+    expect(await labelCommentTrail(issue.id)).toEqual([{ labelId: high, content: "1" }]);
+
+    expect(await svc.replaceLabels(issue.id, [high, low])).toEqual({ added: [low], removed: [high] });
+    expect(await attachedIds(issue.id)).toEqual([low]);
+
+    // The dropped duplicate never shows in `added`: [high, low, bug] filters
+    // to [low, bug]; the current occupant is already `low`, so only bug joins
+    // (ascending, upstream's ID sort) and nothing leaves.
+    expect(await svc.replaceLabels(issue.id, [high, low, bug])).toEqual({ added: [bug], removed: [] });
+    expect(await attachedIds(issue.id)).toEqual([bug, low]);
+  });
+
+  it("a scope-less requested set clears scope labels as plain diff removals (replace order: adds first, then removes)", async () => {
+    const repoId = await seedRepo();
+    const svc = service();
+    const high = await seedScopedLabel(repoId, "priority/high");
+    const issue = await svc.createIssue({ repoId, title: "clear-scope" });
+    expect(await svc.setLabel(issue.id, high)).toBe(true);
+
+    expect(await svc.replaceLabels(issue.id, [])).toEqual({ added: [], removed: [high] });
+    expect(await attachedIds(issue.id)).toEqual([]);
+    expect((await labelRow(high)).numIssues).toBe(0);
+    expect(await labelCommentTrail(issue.id)).toEqual([
+      { labelId: high, content: "1" },
+      { labelId: high, content: "" },
+    ]);
+  });
+
+  it("replace with [new, current] keeps the current occupant — a no-op with no new comments", async () => {
+    const repoId = await seedRepo();
+    const svc = service();
+    const high = await seedScopedLabel(repoId, "priority/high");
+    const low = await seedScopedLabel(repoId, "priority/low");
+    const issue = await svc.createIssue({ repoId, title: "keep-current" });
+    expect(await svc.setLabel(issue.id, high)).toBe(true);
+
+    expect(await svc.replaceLabels(issue.id, [low, high])).toEqual({ added: [], removed: [] });
+    expect(await attachedIds(issue.id)).toEqual([high]);
+    expect(await labelCommentTrail(issue.id)).toEqual([{ labelId: high, content: "1" }]);
+  });
+
+  it("exclusive_order never breaks the tie — the positional rule does (display-only per the pin)", async () => {
+    const repoId = await seedRepo();
+    const svc = service();
+    // Descending orders: an ascending exclusive_order tie-break would keep
+    // `low` (order 1) over `high` (order 5); the pin keeps the LATER entry.
+    const low = await seedScopedLabel(repoId, "priority/low", true, 1);
+    const high = await seedScopedLabel(repoId, "priority/high", true, 5);
+    const issue = await svc.createIssue({ repoId, title: "order-inert" });
+
+    expect(await svc.replaceLabels(issue.id, [low, high])).toEqual({ added: [high], removed: [] });
+    expect(await attachedIds(issue.id)).toEqual([high]);
+  });
+
+  it("dedupe removals fold the closed-state counters through the MAX guard", async () => {
+    const repoId = await seedRepo();
+    const svc = service();
+    const high = await seedScopedLabel(repoId, "priority/high");
+    const low = await seedScopedLabel(repoId, "priority/low");
+    const issue = await svc.createIssue({ repoId, title: "closed-scoped" });
+    expect(await svc.setLabel(issue.id, high)).toBe(true);
+    await svc.closeIssue(issue.id);
+    expect((await labelRow(high)).numClosedIssues).toBe(1);
+
+    expect(await svc.setLabel(issue.id, low)).toBe(true);
+    expect(await attachedIds(issue.id)).toEqual([low]);
+    expect((await labelRow(high)).numIssues).toBe(0);
+    expect((await labelRow(high)).numClosedIssues).toBe(0);
+    expect((await labelRow(low)).numIssues).toBe(1);
+    expect((await labelRow(low)).numClosedIssues).toBe(1);
   });
 });
 

@@ -48,6 +48,7 @@ import {
   RepositoryNotExistError,
 } from "./errors";
 import { changeIssueTitle, replaceIssueAssignees } from "../api/services/issues";
+import { labelExclusiveScope, removeDuplicateExclusiveLabels } from "../api/services/labels";
 import { findRepositoryById, type RepositoryWithOwner, type UserRow } from "../api/services/repository";
 import {
   notifyIssueAssigneeChanged,
@@ -193,6 +194,10 @@ export interface AddCommentInput {
 
 export interface LabelOperationOptions {
   ownerOrgId?: number | null;
+  /** The type-7 label comments' doer (upstream passes the actor through);
+   *  null (callers not wired yet) mirrors the comments table's nullable
+   *  poster_id. */
+  actorId?: number | null;
   now?: Date;
 }
 
@@ -935,7 +940,14 @@ export class IssuesService {
   // Labels (§3.2 counters)
   // ---------------------------------------------------------------------------
 
-  /** Attach one label; true when newly attached (idempotent re-add = false). */
+  /**
+   * Attach one label; true when newly attached (idempotent re-add = false).
+   * Upstream `NewIssueLabel` order (models/issues/issue_label.go:85-111,
+   * SPEC-0023 §4.3): the already-attached short-circuit first, then the
+   * same-scope exclusive dedupe (`RemoveDuplicateExclusiveIssueLabels`,
+   * :63-83 — removals precede the add), then the attach — every transition
+   * through the type-7 seam (§4.3's attachIssueLabelRow/detachIssueLabelRow).
+   */
   async setLabel(issueId: number, labelId: number, options: LabelOperationOptions = {}): Promise<boolean> {
     const issue = await this.getIssueById(issueId);
     if (issue === null) throw new IssueNotExistError({ id: issueId });
@@ -944,78 +956,155 @@ export class IssuesService {
       throw new NoSuchLabelError(labelId, issue.repoId);
     }
     const now = options.now ?? new Date();
-    const closedBump = issue.isClosed
-      ? { numClosedIssues: sql`num_closed_issues + 1` }
-      : {};
-    const results = await this.db.batch([
-      this.db.insert(issueLabels).values({ issueId, labelId }).onConflictDoNothing().returning({ labelId: issueLabels.labelId }),
-      this.db
-        .update(labels)
-        .set({ numIssues: sql`num_issues + 1`, ...closedBump })
-        .where(and(eq(labels.id, labelId), sql`(SELECT changes()) > 0`)),
-      this.db.update(issues).set({ updatedAt: now }).where(eq(issues.id, issueId)),
-    ] as const);
-    return batchRows<{ labelId: number }>(results[0], "issue_labels insert").length > 0;
+    const actorId = options.actorId ?? null;
+    const currentIds = (
+      await this.db.select({ labelId: issueLabels.labelId }).from(issueLabels).where(eq(issueLabels.issueId, issueId)).all()
+    ).map((row) => row.labelId);
+    if (currentIds.includes(labelId)) {
+      // Upstream `HasIssueLabel` short-circuit: no dedupe, no comments.
+      return false;
+    }
+    await this.db.update(issues).set({ updatedAt: now }).where(eq(issues.id, issueId));
+    // `RemoveDuplicateExclusiveIssueLabels` — same-scope occupants leave
+    // (commented + counted) BEFORE the new label attaches.
+    const scope = labelExclusiveScope(label);
+    if (scope !== "") {
+      const occupantIds = currentIds.filter((id) => id !== labelId);
+      const occupantRows =
+        occupantIds.length > 0 ? await this.db.select().from(labels).where(inArray(labels.id, occupantIds)).all() : [];
+      for (const occupant of occupantRows) {
+        if (labelExclusiveScope(occupant) === scope) {
+          await this.detachIssueLabelRow(issue, occupant, actorId, now);
+        }
+      }
+    }
+    return this.attachIssueLabelRow(issue, label, actorId, now);
   }
 
   /**
-   * Replace the full label set (upstream `ReplaceIssueLabels`): diff-based —
+   * Replace the full label set (upstream `ReplaceIssueLabels`): the REQUESTED
+   * set is filtered to one label per exclusive scope first
+   * (`RemoveDuplicateExclusiveLabels`, models/issues/issue_label.go:356-373 —
+   * positional, later request entries win; SPEC-0023 §4.4), then diffed —
    * detached labels leave, new labels join — with closed-state-aware counter
-   * maintenance, all in one batch.
+   * maintenance and the type-7 comment trail in upstream's replace order
+   * (additions first, then removals; :396-414).
    */
   async replaceLabels(issueId: number, labelIds: number[], options: LabelOperationOptions = {}): Promise<ReplaceLabelsResult> {
     const issue = await this.getIssueById(issueId);
     if (issue === null) throw new IssueNotExistError({ id: issueId });
-    const requested = [...new Set(labelIds)];
-    if (requested.length > 0) {
-      await this.validateLabels(requested, issue.repoId, options.ownerOrgId ?? null);
+    const requestedIds = [...new Set(labelIds)];
+    if (requestedIds.length > 0) {
+      await this.validateLabels(requestedIds, issue.repoId, options.ownerOrgId ?? null);
     }
+    const requestedRows =
+      requestedIds.length > 0 ? await this.db.select().from(labels).where(inArray(labels.id, requestedIds)).all() : [];
+    const requestedById = new Map(requestedRows.map((row) => [row.id, row]));
+    const requested = removeDuplicateExclusiveLabels(requestedIds, (id) => {
+      const row = requestedById.get(id);
+      return row === undefined ? "" : labelExclusiveScope(row);
+    });
     const current = (
       await this.db.select({ labelId: issueLabels.labelId }).from(issueLabels).where(eq(issueLabels.issueId, issueId)).all()
     ).map((row) => row.labelId);
-    const toAdd = requested.filter((id) => !current.includes(id));
-    const toRemove = current.filter((id) => !requested.includes(id));
+    const toAdd = requested.filter((id) => !current.includes(id)).sort((a, b) => a - b);
+    const toRemove = current.filter((id) => !requested.includes(id)).sort((a, b) => a - b);
     const now = options.now ?? new Date();
-
-    const counterDecrement = issue.isClosed
-      ? { numIssues: sql`num_issues - 1`, numClosedIssues: sql`num_closed_issues - 1` }
-      : { numIssues: sql`num_issues - 1` };
-    const counterIncrement = issue.isClosed
-      ? { numIssues: sql`num_issues + 1`, numClosedIssues: sql`num_closed_issues + 1` }
-      : { numIssues: sql`num_issues + 1` };
+    const actorId = options.actorId ?? null;
 
     // The issues touch is unconditional and must not sit between gated
-    // statements — keep it first; the label pairs below are self-gating.
-    const statements: BatchStatements = [
-      this.db.update(issues).set({ updatedAt: now }).where(eq(issues.id, issueId)),
-    ];
-    for (const labelId of toRemove) {
-      statements.push(
-        this.db
-          .delete(issueLabels)
-          .where(and(eq(issueLabels.issueId, issueId), eq(issueLabels.labelId, labelId))),
-      );
-      statements.push(
-        this.db
-          .update(labels)
-          .set(counterDecrement)
-          .where(and(eq(labels.id, labelId), sql`(SELECT changes()) > 0`)),
-      );
-    }
+    // statements — keep it first and last.
+    await this.db.update(issues).set({ updatedAt: now }).where(eq(issues.id, issueId));
     for (const labelId of toAdd) {
-      statements.push(
-        this.db.insert(issueLabels).values({ issueId, labelId }).onConflictDoNothing(),
-      );
-      statements.push(
-        this.db
-          .update(labels)
-          .set(counterIncrement)
-          .where(and(eq(labels.id, labelId), sql`(SELECT changes()) > 0`)),
-      );
+      const row = requestedById.get(labelId);
+      if (row === undefined) continue; // validateLabels just passed — unreachable
+      await this.attachIssueLabelRow(issue, row, actorId, now);
     }
-    statements.push(this.db.update(issues).set({ updatedAt: now }).where(eq(issues.id, issueId)));
-    await this.db.batch(statements);
+    if (toRemove.length > 0) {
+      const removeRows = await this.db.select().from(labels).where(inArray(labels.id, toRemove)).all();
+      const removeById = new Map(removeRows.map((row) => [row.id, row]));
+      for (const labelId of toRemove) {
+        const row = removeById.get(labelId);
+        if (row === undefined) continue;
+        await this.detachIssueLabelRow(issue, row, actorId, now);
+      }
+    }
+    await this.db.update(issues).set({ updatedAt: now }).where(eq(issues.id, issueId));
     return { added: toAdd, removed: toRemove };
+  }
+
+  /**
+   * The type-7 removal seam (SPEC-0023 §4.3): upstream `deleteIssueLabel`
+   * (models/issues/issue_label.go:158-184) — the link delete RETURNING is the
+   * guard (0 rows = not attached, everything stays skipped), else the label
+   * (7) removal comment (content "", the removed marker vs the add path's
+   * "1"), the closed-state-aware label counter fold (updateLabelCols) and the
+   * issue's num_comments bump, in one batch. Composed with the same statement
+   * shape as the landed removeIssueLabel arm (routes/issue-write-t2.ts:430-462)
+   * — that module is U5-owned, so the seam is replicated here, not imported.
+   */
+  private async detachIssueLabelRow(issue: IssueRow, label: LabelRow, actorId: number | null, now: Date): Promise<boolean> {
+    const removed = await this.db
+      .delete(issueLabels)
+      .where(and(eq(issueLabels.issueId, issue.id), eq(issueLabels.labelId, label.id)))
+      .returning({ labelId: issueLabels.labelId });
+    if (removed.length === 0) {
+      return false;
+    }
+    await this.db.batch([
+      this.db.insert(comments).values({
+        type: CommentType.Label,
+        posterId: actorId,
+        issueId: issue.id,
+        labelId: label.id,
+        content: "",
+        createdAt: now,
+        updatedAt: now,
+      }),
+      this.db
+        .update(labels)
+        .set(
+          issue.isClosed
+            ? { numIssues: sql`MAX(num_issues - 1, 0)`, numClosedIssues: sql`MAX(num_closed_issues - 1, 0)` }
+            : { numIssues: sql`MAX(num_issues - 1, 0)` },
+        )
+        .where(eq(labels.id, label.id)),
+      this.db.update(issues).set({ numComments: sql`num_comments + 1` }).where(eq(issues.id, issue.id)),
+    ] as const);
+    return true;
+  }
+
+  /** The type-7 add seam — upstream `newIssueLabel`
+   * (models/issues/issue_label.go:33-62): link insert guarded by the
+   * conflict-noop returning, then the label (7) ADD comment (content "1"),
+   * the counter increment and the num_comments bump. */
+  private async attachIssueLabelRow(issue: IssueRow, label: LabelRow, actorId: number | null, now: Date): Promise<boolean> {
+    const inserted = await this.db
+      .insert(issueLabels)
+      .values({ issueId: issue.id, labelId: label.id })
+      .onConflictDoNothing()
+      .returning({ labelId: issueLabels.labelId });
+    if (inserted.length === 0) {
+      return false;
+    }
+    const closedBump = issue.isClosed ? { numClosedIssues: sql`num_closed_issues + 1` } : {};
+    await this.db.batch([
+      this.db.insert(comments).values({
+        type: CommentType.Label,
+        posterId: actorId,
+        issueId: issue.id,
+        labelId: label.id,
+        content: "1",
+        createdAt: now,
+        updatedAt: now,
+      }),
+      this.db
+        .update(labels)
+        .set({ numIssues: sql`num_issues + 1`, ...closedBump })
+        .where(eq(labels.id, label.id)),
+      this.db.update(issues).set({ numComments: sql`num_comments + 1` }).where(eq(issues.id, issue.id)),
+    ] as const);
+    return true;
   }
 
   // ---------------------------------------------------------------------------
