@@ -248,10 +248,10 @@ describe("DELETE /repos/{owner}/{repo}/pulls/{index}/merge (repoCancelScheduledA
     expect((await jsonBody(res)).message).toBe("not found");
   });
 
-  it("answers the ErrPullRequestNotExist 404 for a missing index", async () => {
+  it("answers the BARE APIErrorNotFound 404 for a missing index (pull.go:1279-1282 — unlike the pulls GET routes, the cancel handler does not render the not-exist message)", async () => {
     const res = await fetchRoute(`${REPO_PATH}/pulls/999/merge`, authed("DELETE", {}));
     expect(res.status).toBe(404);
-    expect((await jsonBody(res)).message).toContain("pull request does not exist");
+    expect((await jsonBody(res)).message).toBe("not found");
   });
 
   it("401s anonymous callers", async () => {

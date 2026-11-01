@@ -972,6 +972,56 @@ describe("POST /pulls/{index}/merge: the schedule / manual / dependency arms", (
     expect(await db().select().from(pullAutoMerges).all()).toHaveLength(0);
   });
 
+  /** MAIN advanced past the given tip by one commit — the ancestor shape: a
+   *  head pointing at `parentTip` is then fully contained in base. */
+  async function seedMainAhead(ownerLower: string, slug: string, parentTip: string): Promise<string> {
+    const cell = env.REPO.getByName(`${ownerLower}/${slug}`);
+    const readme = new TextEncoder().encode(`# ${slug}\n`);
+    const readmeOid = await gitObjectOid("blob", readme);
+    const extra = new TextEncoder().encode("main work\n");
+    const extraOid = await gitObjectOid("blob", extra);
+    const tree = serializeTree([
+      { mode: "100644", name: "README.md", oid: readmeOid },
+      { mode: "100644", name: "main.txt", oid: extraOid },
+    ]);
+    const person = { name: "seed", email: "seed@pulls.invalid", time: 1761000002, tz: "+0000" };
+    const commit = serializeCommit({ tree: tree.oid, parents: [parentTip], author: person, committer: person, message: "main ahead\n" });
+    const put = await cell.putApiObjects([
+      { oid: extraOid, type: "blob", data: extra },
+      { oid: tree.oid, type: "tree", data: tree.data },
+      { oid: commit.oid, type: "commit", data: commit.data },
+    ]);
+    if (put.tag !== "ok") throw new Error(`seed main putApiObjects failed: ${put.tag}`);
+    const landed = await cell.commitApiChange({ ref: branchRef("main"), expectedOldOid: parentTip, newOid: commit.oid });
+    if (landed.tag !== "committed") throw new Error(`seed main landing failed: ${landed.tag}`);
+    return commit.oid;
+  }
+
+  it("answers an ANCESTOR PR's merge attempt 405 'Please try again later' — the ErrNotMergeableState arm (check.go:171-173 via issues/pull.go:446-448 → pull.go:938-939), NOT ErrHasMerged's body (pull.go:934-935)", async () => {
+    const slug = "ancestormerge";
+    // feature sits at the root tip; MAIN advances one commit past it, so the
+    // head commit is fully contained in base — PullRequestStatusAncestor
+    // (issues/pull.go:106) once the lazy check resolves the row.
+    await seedRepo(1, "cf-gitea-stub", slug);
+    const rootTip = await seedEngineBranches("cf-gitea-stub", slug, ["feature"]);
+    await seedMainAhead("cf-gitea-stub", slug, rootTip);
+    const create = await router()(`/repos/cf-gitea-stub/${slug}/pulls`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "already contained", head: "feature", base: "main" }),
+    });
+    expect(create.status).toBe(201);
+    const row = await db().select().from(issues).all();
+    expect(row).toHaveLength(1);
+    const res = await router()(`/repos/cf-gitea-stub/${slug}/pulls/${row[0]!.index}/merge`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ do: "merge" }),
+    });
+    expect(res.status).toBe(405);
+    expect(await res.json()).toEqual({ message: "Please try again later", url: ERROR_URL });
+  });
+
   it("answers the default-false AllowManualMerge with APIErrorAuto's 400 (merge.go:755-759 via pull.go:953-960) and never validates the commit", async () => {
     const slug = "manualoff";
     const { index } = await seedMergeablePr(slug);

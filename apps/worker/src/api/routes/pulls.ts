@@ -1589,8 +1589,20 @@ export function registerPullRoutes(
       // entirely (the mark needs no mergeable state — it exists to close out
       // conflicted work), so its arms run on the raw row.
       const checked = manualMark ? pullRequest : await ensurePullRequestChecked(c, found, pullRequest);
-      if (!manualMark && (checked.hasMerged || checked.status === PRStatus.Ancestor)) {
+      if (!manualMark && checked.hasMerged) {
         throw new ApiError(405, "The PR is already merged");
+      }
+      // An ANCESTOR PR (head already contained in base) is upstream the
+      // PullRequestStatusAncestor STATUS (issues/pull.go:106), not HasMerged:
+      // IsStatusMergeable is false for it (issues/pull.go:446-448), so
+      // CheckPullMergeable raises ErrNotMergeableState at the
+      // `!IsStatusMergeable() && !IsEmpty()` arm (check.go:171-173) and the
+      // API route answers it 405 "Please try again later" (api pull.go:938-
+      // 939). The arm sits BEFORE the deps gate (check.go:171 < :219), so the
+      // ancestor answer wins over the deps text; the MWCS schedule arm below
+      // carries the same condition for its own gate.
+      if (!manualMark && checked.status === PRStatus.Ancestor) {
+        throw new ApiError(405, "Please try again later");
       }
 
       // The open-dependency gate — CheckPullMergeable's FINAL arm
