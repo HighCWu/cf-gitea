@@ -1098,6 +1098,16 @@ import {
   renderUserSettingsBlockedPage,
 } from "./pages/user-settings-blocked";
 import type { BlockDoer } from "../api/services/blocks";
+import type { Viewer as ApiViewer } from "../api/services/repository";
+// The two web JSON twins (web.go:766-767 — census gap #19).
+import {
+  loadUserSearchCandidatesAux,
+  loadUserStopwatchesAux,
+  parseUserSearchCandidatesQuery,
+  parseUserStopwatchesQuery,
+  userSearchCandidatesResponse,
+  userStopwatchesAuxResponse,
+} from "./pages/user-json-aux";
 import {
   applyUserSettingsSecretForm,
   deleteUserSettingsSecret,
@@ -3418,6 +3428,14 @@ export interface AdminRoute {
  *  reqSignIn /user/settings/* groups, web.go:646-746). Same literal posture
  *  as the bare claim below: "user" is reserved and the /user group
  *  registers ahead of the dynamic pairs. */
+/** The two web JSON twins (pages/user-json-aux.ts — upstream web.go:766-767):
+ *  the header badge's stopwatches aggregate (reqSignIn) and the mention
+ *  typeahead's candidate search (optExploreSignIn). No owner — the /user/*
+ *  site-level namespace. */
+export interface UserJsonAuxRoute {
+  family: "user-stopwatches-aux" | "user-search-candidates-aux";
+}
+
 export interface UserSettingsTabRoute {
   family:
     | "user-settings-appearance"
@@ -3702,6 +3720,7 @@ export type ParsedUiRoute =
   | NotificationsRoute
   | UserSettingsRoute
   | UserSettingsTabRoute
+  | UserJsonAuxRoute
   | AdminRoute
   | SitemapRoute
   | SearchAuxRoute
@@ -3842,6 +3861,16 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // extends the claim down the tab tails — each shape maps to a committed
   // two-stage module's handoff recipe; every OTHER tail stays unclaimed →
   // the engine's 404 (no landed surface).
+  // The two web JSON twins (web.go:766-767 — pages/user-json-aux.ts): the
+  // stopwatches aggregate (reqSignIn) and the search-candidates list
+  // (optExploreSignIn — anonymous served). The literals ride BEFORE the
+  // settings chain (upstream's /user group order).
+  if (raw.length === 3 && raw[1] === "user" && raw[2] === "stopwatches") {
+    return { family: "user-stopwatches-aux" };
+  }
+  if (raw.length === 3 && raw[1] === "user" && raw[2] === "search_candidates") {
+    return { family: "user-search-candidates-aux" };
+  }
   if (raw[1] === "user" && raw[2] === "settings") {
     const tail = raw.slice(3);
     const numericId = (value: string | undefined): number | null =>
@@ -8173,6 +8202,71 @@ async function sitemapRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
     return respond(sitemapXmlResponse(await loadUsersSitemap(c.env.DB, url.origin, route.idx)));
   }
   return respond(await c.notFound()); // drift guard
+}
+
+/** GET /user/stopwatches (web.go:766 — reqSignIn; the repoSearchAuxRoute
+ *  bridge verbatim: the API-layer Viewer through toApiUser over the D1
+ *  row). */
+async function userStopwatchesAuxRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  if (resolved.route.family !== "user-stopwatches-aux") return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
+  const userRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
+  if (userRow === undefined) return respond(c.html(renderNotFound(ctx), 404)); // the session doer vanished
+  const apiViewer = {
+    origin: url.origin,
+    requester: toApiUser({
+      id: userRow.id,
+      username: userRow.username,
+      usernameLower: userRow.usernameLower,
+      email: userRow.email,
+      displayName: userRow.displayName,
+      location: userRow.location,
+      website: userRow.website,
+      description: userRow.description,
+      isAdmin: userRow.isAdmin,
+      status: userRow.status,
+      createdAt: userRow.createdAt,
+    }),
+  };
+  const result = await loadUserStopwatchesAux(c.env, userRow.id, apiViewer, parseUserStopwatchesQuery(url));
+  return respond(userStopwatchesAuxResponse(result.total, result.data));
+}
+
+/** GET /user/search_candidates (web.go:767 — optExploreSignIn: anonymous
+ *  served with a null requester; the same bridge for the signed arm). */
+async function userSearchCandidatesRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  if (resolved.route.family !== "user-search-candidates-aux") return respond(await c.notFound()); // drift guard
+  let apiViewer: ApiViewer;
+  if (viewer.kind === "anonymous") {
+    apiViewer = { origin: url.origin, requester: null };
+  } else {
+    const userRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
+    if (userRow === undefined) return respond(c.html(renderNotFound(ctx), 404)); // the session doer vanished
+    apiViewer = {
+      origin: url.origin,
+      requester: toApiUser({
+        id: userRow.id,
+        username: userRow.username,
+        usernameLower: userRow.usernameLower,
+        email: userRow.email,
+        displayName: userRow.displayName,
+        location: userRow.location,
+        website: userRow.website,
+        description: userRow.description,
+        isAdmin: userRow.isAdmin,
+        status: userRow.status,
+        createdAt: userRow.createdAt,
+      }),
+    };
+  }
+  const result = await loadUserSearchCandidatesAux(c.env, apiViewer, parseUserSearchCandidatesQuery(url));
+  return respond(userSearchCandidatesResponse(result));
 }
 
 async function repoSearchAuxRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
@@ -16384,6 +16478,9 @@ uiRouter.get("/user/settings/security", (c) => userSettingsSecurityPage(c));
 // The blocked-users pair (web.go:750-752 — BOTH methods are upstream
 // routes; no chi-405 twin).
 uiRouter.get("/user/settings/blocked_users", (c) => userSettingsBlockedUsersPage(c));
+// The two web JSON twins (web.go:766-767 — GET-only; POST answers the plain 404).
+uiRouter.get("/user/stopwatches", (c) => userStopwatchesAuxRoute(c));
+uiRouter.get("/user/search_candidates", (c) => userSearchCandidatesRoute(c));
 uiRouter.post("/user/settings/blocked_users", (c) => userSettingsBlockedUsersSubmit(c));
 // The account-link unlink POST (SPEC external-auth-sources.md W5's handoff;
 // upstream security.go:50-70 + RemoveAccountLink external_login_user.go:
