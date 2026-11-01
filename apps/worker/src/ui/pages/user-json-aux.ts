@@ -14,7 +14,8 @@
  * Not pages — the aux-JSON family convention (the branches-list-aux /
  * search-aux siblings): this module holds the two parse helpers, the two
  * feed loaders, and the JSON Response builders ONLY; the route claims and
- * the session prologue are index-owned (HANDOFF at the bottom).
+ * the session prologue are index-owned (LANDED at 65fbda5 — the record at
+ * the bottom).
  *
  * ---------------------------------------------------------------------------
  * Feed 1 — GET /user/stopwatches (reqSignIn, web.go:766)
@@ -146,7 +147,8 @@
  * - the empty match is the clean `{"data":[]}`.
  *
  * ---------------------------------------------------------------------------
- * HANDOFF — the index.ts fold recipe (this module is UNMOUNTED)
+ * MOUNT RECORD — the index.ts fold, EXECUTED at 65fbda5 (this module is
+ * mounted; the recipe below is the landed claims' record)
  * ---------------------------------------------------------------------------
  *
  * 1. parseUiRoute literals, in the `/user` literal neighborhood directly

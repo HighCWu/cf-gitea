@@ -606,8 +606,9 @@ export function PullFilesPage(props: { ctx: UiContext; data: PullFilesData }) {
 // ---------------------------------------------------------------------------
 // The VIEWED-FILES write arm (web.go:1371 → pull_review.go:295-341) — the
 // timeline unit's STOP, real since migration 0059's `review_state` landed.
-// The route registration is the ORCHESTRATOR's fold (ui/index.ts) — the
-// mount recipe rides this module's report; the seam follows the
+// The route registration LANDED at 79a94f9 (ui/index.ts: the POST pair +
+// the chi-405 GET twins under both families, parsed beside time_estimate);
+// the seam follows the
 // pull-merge-box write-arm shape: the mounted route resolves
 // session/repo/rows, this function owns the handler ladder.
 // ---------------------------------------------------------------------------

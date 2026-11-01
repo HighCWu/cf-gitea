@@ -132,7 +132,10 @@
  *   deletes directories recursively (editor.go:405-427, delete_directory
  *   message + DeleteRecursively) — directory deletes stay git/API-only.
  * - The upload form's action carries the bare literal `upload` (the family's
- *   naming); no route claims it until the staging family lands (handoff).
+ *   naming) over the branch/treePath tail — the family is CLAIMED since
+ *   1d834d6's mount (the upload-staging substrate landed before it, at
+ *   dc9ff97; the shared fileEditorGate gates the pair), the old
+ *   pending-handoff note retired.
  */
 
 import { type EngineClient } from "../engine";

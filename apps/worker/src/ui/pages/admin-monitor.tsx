@@ -136,8 +136,9 @@
  *   store (the survey row's config/notices/auths/emails siblings are equally
  *   out of this module's scope).
  * - The cron run button POSTs the PAGE URL (`/-/admin/monitor/cron`), not
- *   upstream's dashboard target (`AppSubUrl + "/-/admin"`, cron.tmpl:7): the
- *   dashboard route is not landed and is a different family's mount. The POST
+ *   upstream's dashboard target (`AppSubUrl + "/-/admin"`, cron.tmpl:7) — the
+ *   dashboard route landed since (the 2f7afe9 mount window) and this page-URL
+ *   POST stands as the landed reduction. The POST
  *   answers upstream's DashboardPost posture reduced to the monitor arm: the
  *   flash message ("Started Task: %s" / "Unknown task: %s",
  *   admin.dashboard.task.*) re-renders the page (the no-JS hooks-page
@@ -408,8 +409,8 @@
  * docs/compat/ui-parity-survey.md:386 (the `/-/admin/*` family row —
  * the monitor subset becomes PARTIAL).
  *
- * ## Queue-manage HANDOFF (census gap 17 — the claims are the ORCHESTRATOR's
- * fold; this module ships everything the fold wires, claim-ready)
+ * ## Queue-manage (LANDED — census gap 17's claims are the index.ts mount
+ * record, folded at 0cf8fd1)
  *
  * parseUiRoute's admin block, inside `tail[0] === "monitor"` AFTER the four
  * 2-segment arms (the literal `/queue` shadows the `{qid}` parse like
@@ -1357,8 +1358,8 @@ export function renderAdminMonitorQueuePage(options: { ctx: UiContext; data: Adm
 // ---------------------------------------------------------------------------
 // Queue manage (GET /-/admin/monitor/queue/{qid} + POST {qid}/remove-all-items
 // — queue_manage.tmpl reduced; the /set arm has no landed substrate — the
-// module header's adjudications. CLAIM-READY: the parse/registration recipe
-// is the header's HANDOFF section — ui/index.ts is the orchestrator's fold.)
+// module header's adjudications. LANDED at 0cf8fd1: the parse/registration
+// claims live in index.ts (the header's section is the mount record).)
 // ---------------------------------------------------------------------------
 
 /** The manage page's render inputs: the registry row (the qid resolved) plus

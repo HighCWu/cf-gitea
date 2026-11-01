@@ -1,9 +1,8 @@
 /**
  * The USER settings BLOCKED USERS tab — the org twin's user-scope twin
- * (census gap #14; UNMOUNTED at writing — the wiring HANDOFF is the mount
- * recipe at the bottom of this header, the b91dd1c pattern: index.ts +
- * index.test.ts are the orchestrator's fold window, the module + its tests
- * land first and stay green unmounted).
+ * (census gap #14; MOUNTED at 20f7290's five-fold — the wiring HANDOFF is
+ * retired, the mount recipe at the bottom of this header is the executed
+ * index.ts record, the b91dd1c pattern's landing).
  *
  * ## Upstream surface (at the pin fc493688)
  *
@@ -100,8 +99,8 @@
  * value — upstream's binding-failure funnel) parses to the invalid outcome
  * carrying the honest-absence note; neither is ever emitted by this DOM.
  *
- * ## Mount recipe (UNMOUNTED — the wiring HANDOFF, executed by the
- * orchestrator's index.ts fold; the org twin's retired handoff's exact
+ * ## Mount record (MOUNTED at 20f7290 — the wiring HANDOFF retired, the
+ * recipe below executed in index.ts; the org twin's retired handoff's exact
  * shape, userSettingsTabPrologue division):
  *
  *   1. `UserSettingsTabRoute` union: add

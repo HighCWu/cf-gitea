@@ -43,12 +43,18 @@
  *     (stricter than upstream: a forged return_uri cannot bounce across
  *     repos or leak fork existence).
  *
- * ## Wiring (HANDOFF — `ui/index.ts` is the orchestrator's fold window)
+ * ## Wiring (LANDED — the ui/index.ts mount record, f9907f9)
  *
  * The routes live in `index.ts` (this module is pure seams — the repo-fork
  * precedent): the `/_fork/{branch}` claim shape, the POST registration, the
- * gate's non-writer split, and the handlers' overlay fold are the report's
- * recipe. The `/_fork` literal keeps upstream's underscore — it is NOT one
+ * gate's non-writer split, and the handlers' overlay fold are LANDED there
+ * (f9907f9) — the `EditorForkRoute` union arm, the parse claim at the
+ * `head === "_fork"` literal, `editorForkSubmit` over
+ * `uiRouter.post("/:owner/:repo/_fork/*", …)`, the fileEditorGate forkArm
+ * overload pulling the four overlay-mounted GET families into the fork
+ * flow, and the banner/action/branch overlay folded into
+ * fileEditorPage/fileUploadPage. The `/_fork` literal keeps upstream's
+ * underscore — it is NOT one
  * of the bare-named editor_action combos (the family brief pins those bare;
  * `/_fork` is upstream's own spelling). POST-only registration: a GET
  * `/_fork/...` misses to the parent app's plain 404 (upstream chi answers

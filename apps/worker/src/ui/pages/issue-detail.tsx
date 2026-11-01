@@ -71,8 +71,10 @@
  * - PR branch names render as `<code>` without links and without the commit
  *   count ("wants to merge X commits from … into …"): both need engine reads
  *   (branch existence, the PR commit range) deferred with the mergeability
- *   wave. The merge-event sha renders as plain short text — the
- *   `/commit/{sha}` page stays engine-owned (open question 1).
+ *   wave. The merge-event sha LINKS the landed commit view (the TimelineEvent
+ *   arm's `.ui.sha` href `{repoLink}/commit/{sha}` — the page landed at
+ *   b447a7d, the link at 7e72149; the old plain-text/open-question-1
+ *   reduction is retired).
  * - Milestone links upstream's `/{repo}/milestone/{id}` (sidebar/
  *   milestone_list.tmpl:49). w129 batch-14 flip: it rendered plain text while
  *   the page was absent (the §2.4.1 dead-link rule won then) — the milestone
@@ -83,8 +85,8 @@
  *   the label form landed at wave 5 and the milestone/project/assignee
  *   selects + the header buttons (watch, deadline, pin, lock) land as the
  *   no-JS reductions posting to pages/issue-sidebar-writes.ts's routes (the
- *   routes themselves mount at the orchestrator's fold — that module's
- *   header carries the exact recipe; the sidebar renders regardless, since
+ *   routes themselves are index.ts's mount record — folded at 7187797; the
+ *   sidebar renders regardless, since
  *   the controls' posture is writer/admin-gated by resolveIssueDetailAccess).
  * - Avatar images are not rendered (no avatar route exists; an `<img>` to a
  *   missing route is a dead link) — the timeline items keep the upstream

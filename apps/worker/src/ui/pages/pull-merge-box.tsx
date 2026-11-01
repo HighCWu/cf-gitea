@@ -26,11 +26,12 @@
  *   the loader answers null and the route-stage handler 404-shells;
  * - `ShowMergeBox = !pull.HasMerged || data.IsPullBranchDeletable` (the
  *   template's own gate): upstream keeps the merged box ONLY to offer the
- *   delete-branch button (`POST /{index}/cleanup`, not landed — the §2.5
- *   write-action rule); with that button dead, the merged box has no
- *   remaining purpose ("there is nothing to do", issue_view.go:971-974), so
- *   the loader answers null for merged PRs — the box renders for open and
- *   closed-unmerged rows exactly like upstream's non-deletable case;
+ *   delete-branch button (`POST /{index}/cleanup` — LANDED at 20f7290's
+ *   write-tails fold, the cleanup arm below); the pre-fold reduction (the
+ *   button dead ⇒ the loader answered null for EVERY merged PR) is retired —
+ *   the merged arm now computes the deletable pair ("there is nothing to
+ *   do", issue_view.go:971-974, is the null arm only for the
+ *   non-deletable merged row) and the box renders for merged rows too;
  * - `PullMergeBoxReloading`/`ReloadingInterval`: `pull.IsChecking()` → the
  *   parent view's reload marker + the fragment's 5000 ms polling interval
  *   (issue_view.go:486 + 953-956); ours keys on the D1 row alone
@@ -185,7 +186,8 @@
  * shell (upstream's prepareIssueViewLoad miss / `ctx.NotFound`);
  * 3. `findPullRequestByIndex` → null ⇒ the same 404 shell (an issue row
  * without its PR extension is the broken-data class, never a box);
- * 4. `loadPullMergeBoxData` → null (merged — upstream renders the
+ * 4. `loadPullMergeBoxData` → null (a merged AND non-deletable row since
+ * 20f7290's cleanup arm — upstream renders the
  * ShowMergeBox=false arm) ⇒ `pullMergeBoxFragmentResponse("")` — an EMPTY
  * 200, exactly the template's `{{if $data.ShowMergeBox}}` miss, which is
  * also what the bundle's reload loop wants as its stop signal;

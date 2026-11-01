@@ -22,19 +22,20 @@
  *   - POST /{owner}/{repo}/comments/{id}/delete                      repo.DeleteComment            (web.go:1413)
  *   - POST /{owner}/{repo}/comments/{id}/reactions/{action}          repo.ChangeCommentReaction    (web.go:1414)
  *
- * NOT BUILT (adjudicated STOP — no substrate): POST
+ * NOT BUILT HERE — the viewed-files family later LANDED, but through the
+ * pull-files seam, not this module (79a94f9): POST
  * `/{owner}/{repo}/{issues|pulls}/{index}/viewed-files` (web.go:1371,
- * repo.UpdateViewedFiles). Upstream persists per-file viewed state in the
- * `review_state` table (pull_model.ViewedState); this backend has NO such
- * table (the pull-files page already documents its checkbox as a JS island
- * — pages/pull-files.tsx header), and a route that answers 200 without
- * writing would be a false write. The three-step flip recipe, for the
- * session-table owner at that wave: (1) the `review_state` D1 migration
- * (user_id, pull_id, commit_sha, path, state — upstream
- * models/pull/review_state.go:20-33), (2) the JSON handler port
- * (pull_review.go:302-341: `{files: {path: bool}, headCommitSHA}` body;
- * an empty headCommitSHA fills the PR's head commit; a malformed body
- * answers 400), (3) the pull-files checkbox render posting it.
+ * repo.UpdateViewedFiles) mounts over migration 0059's `review_state`
+ * table (the substrate the earlier STOP adjudication found missing — the
+ * old "no substrate, a 200 would be a false write" STOP is superseded
+ * history). The parse claim rides index.ts's length-2 {index} block beside
+ * time_estimate; the `viewedFilesPost` handler wraps pull-files.tsx's
+ * `updateViewedFilesFromWeb` in the box-write-context shape (ok→200 empty,
+ * bad-request→400, the non-pull redirect→303; the JSON port
+ * pull_review.go:302-341: `{files: {path: bool}, headCommitSHA}` body, an
+ * empty headCommitSHA filling the PR's head commit, a malformed body
+ * answering 400); the registrations carry the chi-405 GET twins under BOTH
+ * families (index.ts). This module's sixteen families are untouched by it.
  *
  * This is part one's handoff pattern (pages/issue-sidebar-writes.ts): the
  * index.ts router is the ORCHESTRATOR's fold window, so the POST handlers
@@ -163,7 +164,8 @@
  *        }
  *      }
  *
- *    (`viewed-files` stays engine-owned — the STOP adjudication above.)
+ *    (`viewed-files` is NOT this module's claim — LANDED at 79a94f9 in this
+ *    same block over the pull-files seam, the landed record above.)
  * 4. Register beside the landed write families — the static repo-scope
  *    literals (`/issues/delete`, `/issues/projects/column`) BEFORE the
  *    dynamic `/issues/:index` GET line (the wave-9 RegExpRouter rule), the
@@ -235,8 +237,9 @@
  *      uiRouter.post("/:owner/:repo/comments/:id/reactions/:action", (c) => commentReactionSubmit(c));
  *      uiRouter.get("/:owner/:repo/comments/:id/reactions/:action", () => methodNotAllowed("POST"));
  *
- *    (`/issues/:index/viewed-files` is NOT registered — the STOP
- *    adjudication above; the tail stays engine-owned.)
+ *    (`/{issues|pulls}/:index/viewed-files` IS registered — since 79a94f9:
+ *    the POST pair + the chi-405 GET twins under both families live in
+ *    index.ts, over the pull-files module's seam, the landed record above.)
  *
  * ## Pin lines that flip at THIS fold (test-side; edited at the fold, not
  *    here — this unit's tests drive the module's recipe router directly)

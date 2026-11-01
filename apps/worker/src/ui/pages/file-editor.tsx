@@ -78,9 +78,15 @@
  * site admin, the case-folded owner, a write/admin collaborator, or a
  * write/admin/owner-mode org-team grant — the same arms the contents PUT
  * enforces, so a team-granted member sees the editor entry the write seam
- * admits; non-writers 404-shell like the settings pages. Archived repos
+ * admits. Non-writers SPLIT by arm (f9907f9's gate forkArm overload): every
+ * POST — and the cherrypick/patch GETs, whose pages carry no fork overlay —
+ * 404-shells like the settings pages, while the four overlay-mounted GET
+ * families (new/edit/delete/upload) walk the fork-to-edit flow instead (a
+ * signed-in non-writer gets the fork prompt or the reader-fork overlay,
+ * pages/repo-editor-fork.tsx). Archived repos
  * 404-shell both verbs (upstream `RepoMustNotBeArchived` wraps the editor
- * group and answers NotFound, services/context/repo.go:136-141). The file
+ * group and answers NotFound, services/context/repo.go:136-141 — the
+ * archived arm precedes the fork split). The file
  * view renders the Edit/Delete entry links (and the tree chrome the New
  * File link) only under the same predicate.
  *
