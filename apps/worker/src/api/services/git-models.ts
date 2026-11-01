@@ -591,47 +591,300 @@ export function toContentsEntry(
 // Unified diff / patch rendering from the engine's structured DiffResult
 // (the engine renders text only on its private UI paths; the structured hunks
 // are the public surface — the renderer below reproduces git's unified format
-// from them; the "\ No newline at end of file" marker is not reproduced, a
-// documented approximation).
+// from them). The contract is VERBATIM git bytes — upstream GetPatch is
+// documented "able to be used with `git apply`" (modules/git/repo_compare.go:
+// 73-77) and the diff/patch downloads round-trip through it — so the byte
+// shapes are pinned against real-git output (git 2.43, reproduced in a scratch
+// repo at authoring time; the tests carry the recorded literals):
+//
+//   - a mode-only change (same blob oid, mode moved) prints `old mode` /
+//     `new mode` and NOTHING else — no index line (the blob pair is equal),
+//     no ---/+++, no hunks; `git apply --check --index` accepts exactly this
+//     shape and honors the mode move;
+//   - the index line's mode column prints only when both sides exist with the
+//     SAME mode — new/deleted files carry it on the new/deleted-file-mode line
+//     (`index 0000000..422c2b7`, no column), mode changes under old/new mode;
+//   - a created/deleted EMPTY blob prints the header + index and STOPS (no
+//     ---/+++ with zero hunks to follow);
+//   - hunk headers omit a `,1` single-line count (`@@ -1 +1,2 @@`);
+//   - "\ No newline at end of file" follows the emitted line that is the
+//     file's last line when that side's blob lacks the trailing newline.
+//
+// The last two facts live in the blobs, not in the structured hunks (the
+// engine's line diff is terminator-blind), so they need blob access:
+// `renderUnifiedDiffAsync` takes a DiffBlobSource and emits the markers and
+// synthesizes the del/add hunk a trailing-newline-only change requires (real
+// git prints a full hunk there; a headers-only section is REFUSED by
+// `git apply` — exit 128). The sync `renderUnifiedDiff` covers everything
+// content-free; a trailing-newline-only section falls through to the
+// ---/+++-without-hunks shape git apply rejects — LOUD (the apply refuses the
+// whole patch) rather than silently dropping the change — and byte-correct
+// callers use the async arm.
 // ---------------------------------------------------------------------------
 
 function shortOid(oid: string): string {
   return oid.slice(0, 7);
 }
 
-/** git-style mode column for the index line. */
-function indexMode(file: DiffFileJson): string {
-  const mode = file.new?.mode ?? file.old?.mode;
-  return mode === undefined ? "" : ` ${mode}`;
+/**
+ * git's index-line mode column: ` <mode>` only when BOTH tree sides exist and
+ * carry the SAME mode — new/deleted files carry the mode on the
+ * new/deleted-file-mode line (`index 0000000..422c2b7`, no column) and mode
+ * changes under old/new mode (`index d95f3ad..637f034`, bare).
+ */
+function indexModeSuffix(file: DiffFileJson): string {
+  if (file.old === null || file.new === null || file.old.mode !== file.new.mode) return "";
+  return ` ${file.new.mode}`;
 }
+
+/** git omits a `,1` single-line hunk-header count (`@@ -1 +1,2 @@`). */
+function hunkCount(count: number): string {
+  return count === 1 ? "" : `,${count}`;
+}
+
+/** The no-newline marker git appends after an unterminated final line. */
+export const NO_NEWLINE_MARKER = "\\ No newline at end of file";
 
 export function renderUnifiedDiff(files: DiffFileJson[]): string {
   const out: string[] = [];
   for (const file of files) {
-    const oldPath = file.old === null ? "/dev/null" : `a/${file.path}`;
-    const newPath = file.new === null ? "/dev/null" : `b/${file.path}`;
-    // git always names both sides after the (new) path here — /dev/null only
-    // appears on the ---/+++ lines
-    out.push(`diff --git a/${file.path} b/${file.path}`);
-    if (file.old === null && file.new !== null) out.push(`new file mode ${file.new.mode}`);
-    if (file.new === null && file.old !== null) out.push(`deleted file mode ${file.old.mode}`);
-    if (file.old !== null || file.new !== null) {
-      out.push(`index ${shortOid(file.old?.oid ?? "0000000")}..${shortOid(file.new?.oid ?? "0000000")}${indexMode(file)}`);
-    }
-    if (file.kind !== "text") {
-      out.push(`Binary files ${oldPath} and ${newPath} differ`);
-      continue;
-    }
-    out.push(`--- ${oldPath}`);
-    out.push(`+++ ${newPath}`);
+    if (pushFileHeaders(out, file)) continue;
+    out.push(`--- ${file.old === null ? "/dev/null" : `a/${file.path}`}`);
+    out.push(`+++ ${file.new === null ? "/dev/null" : `b/${file.path}`}`);
     for (const hunk of file.hunks) {
-      out.push(`@@ -${hunk.aStart},${hunk.aLen} +${hunk.bStart},${hunk.bLen} @@`);
+      out.push(`@@ -${hunk.aStart}${hunkCount(hunk.aLen)} +${hunk.bStart}${hunkCount(hunk.bLen)} @@`);
       for (const op of hunk.ops) {
         out.push(`${op.tag === "eq" ? " " : op.tag === "del" ? "-" : "+"}${op.line}`);
       }
     }
   }
   return out.join("\n");
+}
+
+/**
+ * The header part of one file's section (diff --git through index/binary).
+ * Returns TRUE when the section is COMPLETE at the headers — a mode-only
+ * change (the mode lines are the whole section), a binary/toolarge file
+ * (the differ line), or a created/deleted EMPTY blob (header + index, no
+ * ---/+++ with zero hunks behind them — git-apply garbage).
+ */
+function pushFileHeaders(out: string[], file: DiffFileJson): boolean {
+  // git always names both sides after the (new) path here — /dev/null only
+  // appears on the ---/+++ lines
+  out.push(`diff --git a/${file.path} b/${file.path}`);
+  if (file.old === null && file.new !== null) out.push(`new file mode ${file.new.mode}`);
+  if (file.new === null && file.old !== null) out.push(`deleted file mode ${file.old.mode}`);
+  if (file.old !== null && file.new !== null && file.old.mode !== file.new.mode) {
+    out.push(`old mode ${file.old.mode}`);
+    out.push(`new mode ${file.new.mode}`);
+  }
+  // the index line rides a blob-level content change (differing blob oids); a
+  // pure mode change keeps the same blob pair and prints NO index line
+  if (file.old === null || file.new === null || file.old.oid !== file.new.oid) {
+    out.push(`index ${shortOid(file.old?.oid ?? "0000000")}..${shortOid(file.new?.oid ?? "0000000")}${indexModeSuffix(file)}`);
+  }
+  if (file.kind !== "text") {
+    out.push(`Binary files ${file.old === null ? "/dev/null" : `a/${file.path}`} and ${file.new === null ? "/dev/null" : `b/${file.path}`} differ`);
+    return true;
+  }
+  if (file.hunks.length === 0) {
+    if (file.old !== null && file.new !== null && file.old.oid === file.new.oid) {
+      // mode-only section: the old/new mode lines above are the whole section
+      // (git prints no ---/+++/hunks; `git apply --check --index` passes)
+      return true;
+    }
+    if (file.old === null || file.new === null) {
+      // a created/deleted EMPTY blob: header + index and stop
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Blob access for the async renderer: the diff envelope's two tips plus a
+ * text reader over the tree blobs. `blobText(null, …)` answers null (a root
+ * diff has no old side); a missing/unreadable blob also answers null and the
+ * renderer degrades per-file (no markers — the engine hunks still render).
+ */
+export interface DiffBlobSource {
+  oldTip: string | null;
+  newTip: string;
+  blobText(tip: string | null, path: string): Promise<string | null>;
+}
+
+/** The DiffBlobSource over an EngineReads client (readBlob decodes to text). */
+export function diffBlobSource(
+  reads: Pick<EngineReads, "readBlob">,
+  oldTip: string | null,
+  newTip: string,
+): DiffBlobSource {
+  return {
+    oldTip,
+    newTip,
+    blobText: async (tip, path) => {
+      if (tip === null) return null;
+      const blob = await reads.readBlob(tip, path);
+      return blob === null ? null : new TextDecoder().decode(blob.data);
+    },
+  };
+}
+
+/** Trailing-newline facts of one blob text ("" = zero lines, never a marker). */
+function textFacts(text: string): { lines: string[]; count: number; hasNL: boolean } {
+  if (text === "") return { lines: [], count: 0, hasNL: false };
+  const body = text.endsWith("\n") ? text.slice(0, -1) : text;
+  const lines = body.split("\n");
+  return { lines, count: lines.length, hasNL: text.endsWith("\n") };
+}
+
+/**
+ * The byte-exact arm: everything `renderUnifiedDiff` pins, plus the two
+ * blob-derived facts git's output carries and the structured hunks do not —
+ *
+ *   - the "\ No newline at end of file" marker after the emitted line that is
+ *     the file's last line when that side's blob lacks the trailing newline;
+ *   - the synthesized hunk a trailing-newline-only change requires (the engine
+ *     sees zero line changes there; git prints a full `@@` hunk with the last
+ *     line as del/add and the marker on the side lacking the newline — without
+ *     it the section is headers-only and `git apply` refuses the whole patch).
+ *
+ * When the last hunk ENDS on the old file's final line as an eq op (the
+ * engine, comparing lines terminator-blind, kept a newline-state move of the
+ * final line as one eq), that op is rewritten to git's del/add pair with the
+ * marker — the line counts are identical under the rewrite, so the hunk header
+ * stays. The documented residual: git re-trims context around that terminal
+ * change, so when the eq sits in trailing context AFTER an earlier change in
+ * the same hunk, git's `@@` positions differ from ours (apply semantics are
+ * still exact — the pre-image matches and the post-image is the new bytes).
+ * A failed blob read degrades that file to the sync shape (no markers).
+ */
+export async function renderUnifiedDiffAsync(files: DiffFileJson[], src: DiffBlobSource): Promise<string> {
+  const out: string[] = [];
+  for (const file of files) {
+    if (file.kind !== "text" || pushFileHeaders(out, file)) {
+      continue;
+    }
+    // Blob reads are only paid where a marker or a synthesis can exist: the
+    // new side whenever the section has hunks (or must synthesize one), the
+    // old side only when the last hunk's old range reaches the old file's
+    // final line (derived from the new count via the add/del ledger — the
+    // hunks cover every non-eq op and context outside them counts equally).
+    const needsNew = file.new !== null && (file.hunks.length > 0 || file.old !== null);
+    const newFacts = needsNew ? textFacts((await src.blobText(src.newTip, file.path)) ?? "") : null;
+    const validNew = newFacts !== null && newFacts.count > 0;
+    if (file.hunks.length === 0 && file.old !== null && file.new !== null && file.old.oid !== file.new.oid) {
+      pushNewlineOnlyTrailer(out, file, validNew ? newFacts : null);
+      continue;
+    }
+    if (file.hunks.length === 0 || !validNew || newFacts === null) {
+      // degrade: the sync shape — for a hunk-less both-sides section that is
+      // the LOUD posture (---/+++ with no hunks; git apply refuses the whole
+      // patch rather than mis-applying); a hunked section renders plainly
+      // (no markers) on a failed read.
+      out.push(`--- ${file.old === null ? "/dev/null" : `a/${file.path}`}`);
+      out.push(`+++ ${file.new === null ? "/dev/null" : `b/${file.path}`}`);
+      for (const hunk of file.hunks) {
+        out.push(`@@ -${hunk.aStart}${hunkCount(hunk.aLen)} +${hunk.bStart}${hunkCount(hunk.bLen)} @@`);
+        for (const op of hunk.ops) {
+          out.push(`${op.tag === "eq" ? " " : op.tag === "del" ? "-" : "+"}${op.line}`);
+        }
+      }
+      continue;
+    }
+    out.push(`--- ${file.old === null ? "/dev/null" : `a/${file.path}`}`);
+    out.push(`+++ ${file.new === null ? "/dev/null" : `b/${file.path}`}`);
+
+    const hunks = file.hunks;
+    const lastHunk = hunks[hunks.length - 1] as (typeof hunks)[number];
+    const totalNew = newFacts.count;
+    const totalOld = totalNew - file.add + file.del;
+    const oldFacts =
+      file.old !== null && src.oldTip !== null && totalOld > 0 && lastHunk.aStart + lastHunk.aLen - 1 === totalOld
+        ? textFacts((await src.blobText(src.oldTip, file.path)) ?? "")
+        : null;
+    const validOld = oldFacts !== null && oldFacts.count === totalOld;
+
+    // the terminal-eq rewrite (see doc): the op at the OLD file's final line
+    // (a-position totalOld) in the last hunk is an eq and the old side lacks
+    // the newline — the engine, comparing lines terminator-blind, kept a
+    // newline-state move of that final line as one eq. Git's shape is the
+    // del/add pair; the counts are identical under the rewrite, so the hunk
+    // header stays. The generic walk below then places the markers.
+    let lastOps = lastHunk.ops;
+    if (validOld && oldFacts !== null && !oldFacts.hasNL) {
+      let aPos = lastHunk.aStart;
+      for (let i = 0; i < lastOps.length; i++) {
+        const op = lastOps[i] as (typeof lastOps)[number];
+        if (aPos === totalOld) {
+          if (op.tag === "eq") {
+            lastOps = [...lastOps.slice(0, i), { tag: "del" as const, line: op.line }, { tag: "add" as const, line: op.line }, ...lastOps.slice(i + 1)];
+          }
+          break;
+        }
+        if (op.tag !== "add") aPos += 1;
+      }
+    }
+
+    for (let h = 0; h < hunks.length; h++) {
+      const hunk = hunks[h] as (typeof hunks)[number];
+      // The walk positions reset PER HUNK from that hunk's own start: the
+      // marker fires only at the file's final line (aIdx === totalOld /
+      // bIdx === totalNew), and hunks with a gap between clusters would
+      // otherwise drag the running counters behind — the final hunk's ops
+      // would sit at wrong positions and the old-side marker would be
+      // silently dropped (an inapplicable pre-image for git apply).
+      let aIdx = hunk.aStart;
+      let bIdx = hunk.bStart;
+      out.push(`@@ -${hunk.aStart}${hunkCount(hunk.aLen)} +${hunk.bStart}${hunkCount(hunk.bLen)} @@`);
+      const hunkOps = h === hunks.length - 1 ? lastOps : hunk.ops;
+      for (const op of hunkOps) {
+        out.push(`${op.tag === "eq" ? " " : op.tag === "del" ? "-" : "+"}${op.line}`);
+        if (op.tag !== "add") {
+          if (aIdx === totalOld && validOld && oldFacts !== null && !oldFacts.hasNL) out.push(NO_NEWLINE_MARKER);
+          aIdx += 1;
+        }
+        if (op.tag !== "del") {
+          if (bIdx === totalNew && !newFacts.hasNL) out.push(NO_NEWLINE_MARKER);
+          bIdx += 1;
+        }
+      }
+    }
+  }
+  return out.join("\n");
+}
+
+/**
+ * The trailing-newline-only section's trailer (both sides exist, same lines,
+ * differing final-newline state — the engine's zero-hunk shape; the headers
+ * are already pushed). Git prints a full hunk: up to three context lines,
+ * then the last line as del/add with the marker on the side lacking the
+ * newline (both shapes verified against the binary). A null/empty blob read
+ * degrades to the sync shape (---/+++ with no hunks — the loud,
+ * git-apply-rejected posture).
+ */
+function pushNewlineOnlyTrailer(
+  out: string[],
+  file: DiffFileJson,
+  newFacts: { lines: string[]; count: number; hasNL: boolean } | null,
+): void {
+  out.push(`--- a/${file.path}`);
+  out.push(`+++ b/${file.path}`);
+  if (newFacts === null || newFacts.count === 0) return;
+  const { lines, count, hasNL } = newFacts;
+  const last = lines[count - 1] as string;
+  const context = Math.min(3, count - 1);
+  const start = count - context;
+  const len = context + 1;
+  out.push(`@@ -${start}${hunkCount(len)} +${start}${hunkCount(len)} @@`);
+  for (let i = start - 1; i < count - 1; i++) out.push(` ${lines[i] as string}`);
+  out.push(`-${last}`);
+  // exactly one side lacks the trailing newline (both lacking = equal bytes =
+  // no diff): the new text having it means the OLD side lacks it — git puts
+  // the marker on the newline-lacking side's emitted line
+  if (hasNL) out.push(NO_NEWLINE_MARKER);
+  out.push(`+${last}`);
+  if (!hasNL) out.push(NO_NEWLINE_MARKER);
 }
 
 /** RFC2822 date line for patch headers (format-patch shape). */
@@ -646,6 +899,18 @@ function rfc2822(person: Person): string {
   );
 }
 
+/** renderPatch options: the signature tail plus the series numbering. */
+export interface RenderPatchOptions {
+  /** `-- \n{version}` tail; null = `--no-signature` (the commit download). */
+  signature?: string | null;
+  /**
+   * The mail's place in a format-patch SERIES — `Subject: [PATCH i/N]` (git
+   * numbers only when the series has more than one mail; a single mail stays
+   * bare `[PATCH]`, verified against the binary).
+   */
+  patchNumber?: { index: number; count: number };
+}
+
 /**
  * `git format-patch`-style rendering for the `.{diffType}` download family.
  * The trailing `-- \n{version}` signature is git's format-patch default (what
@@ -653,16 +918,18 @@ function rfc2822(person: Person): string {
  * download passes `signature: null` for GetRawDiff's `--no-signature` flag
  * (modules/git/diff.go:73, the web.go:1760 arm).
  */
-export function renderPatch(commit: CommitJson, files: DiffFileJson[], options?: { signature?: string | null }): string {
+export function renderPatch(commit: CommitJson, files: DiffFileJson[], options?: RenderPatchOptions): string {
   const signature = options?.signature === undefined ? "2.47.0" : options.signature;
   const body = commit.message.split("\n");
   const subject = body[0] ?? "";
   const rest = body.slice(1).join("\n").replace(/^\n+/, "");
+  const number = options?.patchNumber;
+  const subjectTag = number === undefined ? "[PATCH]" : `[PATCH ${number.index}/${number.count}]`;
   const out = [
     `From ${commit.oid} Mon Sep 17 00:00:00 2001`,
     `From: ${commit.author.name} <${commit.author.email}>`,
     `Date: ${rfc2822(commit.author)}`,
-    `Subject: [PATCH] ${subject}`,
+    `Subject: ${subjectTag} ${subject}`,
     "",
   ];
   if (rest !== "") out.push(rest, "");
@@ -671,21 +938,75 @@ export function renderPatch(commit: CommitJson, files: DiffFileJson[], options?:
   return out.join("\n");
 }
 
-/** pulls/{index}/files entries from the PR range diff (ChangedFileList). */
+/**
+ * The byte-exact twin: renderPatch over `renderUnifiedDiffAsync` (see that
+ * function's doc for the blob-derived facts — the no-newline markers and the
+ * synthesized trailing-newline-only hunk).
+ */
+export async function renderPatchAsync(
+  commit: CommitJson,
+  files: DiffFileJson[],
+  src: DiffBlobSource,
+  options?: RenderPatchOptions,
+): Promise<string> {
+  const signature = options?.signature === undefined ? "2.47.0" : options.signature;
+  const body = commit.message.split("\n");
+  const subject = body[0] ?? "";
+  const rest = body.slice(1).join("\n").replace(/^\n+/, "");
+  const number = options?.patchNumber;
+  const subjectTag = number === undefined ? "[PATCH]" : `[PATCH ${number.index}/${number.count}]`;
+  const out = [
+    `From ${commit.oid} Mon Sep 17 00:00:00 2001`,
+    `From: ${commit.author.name} <${commit.author.email}>`,
+    `Date: ${rfc2822(commit.author)}`,
+    `Subject: ${subjectTag} ${subject}`,
+    "",
+  ];
+  if (rest !== "") out.push(rest, "");
+  out.push("---", await renderUnifiedDiffAsync(files, src));
+  if (signature !== null) out.push("-- ", signature, "");
+  return out.join("\n");
+}
+
+/**
+ * pulls/{index}/files entries from the PR range diff (ChangedFileList) —
+ * convert.ToChangedFile (services/convert/convert.go:1083-1104). The status
+ * vocabulary is upstream's RUNTIME set — "added|deleted|changed|copied|
+ * renamed|unchanged" (the swagger doc text says "modified", the code never
+ * emits it): deletion is "deleted" (never "removed" — that word belongs to
+ * the Commit.files arm, git_commit.go:198-205), an edited file is the
+ * default "changed" (never "modified"), and a 0-add/0-del entry (mode-only
+ * change) is "unchanged". "copied"/"renamed" are UNREACHABLE here: our
+ * engine diff seam carries no rename detection (DiffFileJson is one path per
+ * entry — the packages/git-engine NOTICE-recorded adaptation), so a rename
+ * surfaces as a delete+add pair; the arms stay documented, not emitted.
+ * previous_filename stays ABSENT (upstream's `omitempty` string — only the
+ * renamed arm would ever set it), unlike the old explicit null.
+ * URLs are upstream's shapes (convert.go:1105-1108): html_url
+ * /src/commit/{sha}/{path} (no #fragment), raw_url /raw/commit/{sha}/{path}
+ * — the path escaped per segment (PathEscapeSegments,
+ * modules/util/url.go:12-19; encodeURIComponent per segment is the repo's
+ * documented PathEscape stand-in, labels-t2.ts:47).
+ */
 export function toChangedFiles(files: DiffFileJson[], pair: RepositoryWithOwner, origin: string, ref: string): ChangedFile[] {
   const owner = encodeURIComponent(pair.repo.ownerNamespace);
   const slug = encodeURIComponent(pair.repo.slug);
-  return files.map((f) => ({
-    filename: f.path,
-    previous_filename: null,
-    status: f.old === null ? "added" : f.new === null ? "removed" : "modified",
-    additions: f.add,
-    deletions: f.del,
-    changes: f.add + f.del,
-    html_url: `${origin}/${owner}/${slug}/commit/${ref}#${f.path}`,
-    raw_url: `${origin}/${owner}/${slug}/raw/${ref}/${f.path}`,
-    contents_url: `${origin}/api/v1/repos/${owner}/${slug}/contents/${f.path}?ref=${ref}`,
-  }));
+  return files.map((f) => {
+    const escaped = f.path
+      .split("/")
+      .map(encodeURIComponent)
+      .join("/");
+    return {
+      filename: f.path,
+      status: f.old === null ? "added" : f.new === null ? "deleted" : f.add === 0 && f.del === 0 ? "unchanged" : "changed",
+      additions: f.add,
+      deletions: f.del,
+      changes: f.add + f.del,
+      html_url: `${origin}/${owner}/${slug}/src/commit/${ref}/${escaped}`,
+      raw_url: `${origin}/${owner}/${slug}/raw/commit/${ref}/${escaped}`,
+      contents_url: `${origin}/api/v1/repos/${owner}/${slug}/contents/${escaped}?ref=${ref}`,
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +1024,14 @@ export interface FileChange {
   sha?: string;
   /** rename source (update with from_path) */
   fromPath?: string;
+  /**
+   * The target tree mode for create/update (git's file modes: 100644,
+   * 100755, 120000). Absent = the contents-family defaults (create 100644,
+   * update preserves the entry's current mode). The diffpatch apply sets it
+   * from the patch's mode lines — upstream `git apply --index` honors mode
+   * changes (verified: a mode-only patch moves the staged entry's mode).
+   */
+  mode?: string;
 }
 
 export interface BuiltChange {
@@ -809,7 +1138,7 @@ export async function buildFileChangeCommit(
       }
       const blob = await buildBlobObject(change.content ?? new Uint8Array());
       objects.push(blob);
-      state.entries.set(name, { mode: "100644", oid: blob.oid });
+      state.entries.set(name, { mode: change.mode ?? "100644", oid: blob.oid });
       dirty.add(dir);
       outcomes.push({ ok: true });
       existing.push(false);
@@ -818,7 +1147,7 @@ export async function buildFileChangeCommit(
         // PUT without sha = create (upstream UpdateFile willCreate branch)
         const blob = await buildBlobObject(change.content ?? new Uint8Array());
         objects.push(blob);
-        state.entries.set(name, { mode: "100644", oid: blob.oid });
+        state.entries.set(name, { mode: change.mode ?? "100644", oid: blob.oid });
         dirty.add(dir);
         outcomes.push({ ok: true });
         existing.push(false);
@@ -831,7 +1160,7 @@ export async function buildFileChangeCommit(
       }
       const blob = await buildBlobObject(change.content ?? new Uint8Array());
       objects.push(blob);
-      state.entries.set(name, { mode: current.mode, oid: blob.oid });
+      state.entries.set(name, { mode: change.mode ?? current.mode, oid: blob.oid });
       dirty.add(dir);
       outcomes.push({ ok: true });
       existing.push(true);

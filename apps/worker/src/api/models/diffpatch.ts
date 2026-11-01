@@ -34,7 +34,9 @@ export const applyDiffPatchFileOptionsSchema = z.object({
   force_push: z.boolean().nullable().optional(),
   message: z.string().optional().openapi({ description: "commit message (defaults to apply-patch, like upstream)" }),
   new_branch: z.string().optional().openapi({ description: "commit onto a new branch created from `branch`" }),
-  signoff: z.boolean().optional(),
+  signoff: z.boolean().optional().openapi({
+    description: "signoff (optional): append the `Signed-off-by: <committer>` trailer to the commit message (upstream CommitTree's SignOff block, services/repository/files/temp_repo.go:312-317 — the identity is the commit's committer)",
+  }),
 });
 
 export type ApplyDiffPatchFileOptions = z.infer<typeof applyDiffPatchFileOptionsSchema>;

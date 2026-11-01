@@ -16,23 +16,31 @@
  *     diff.go:41-49) — `git diff --find-renames <parent> <commit>`, or
  *     `git show <commit>` for a root commit; here engineReads.readDiff(oid)
  *     (id2 defaults to the first parent, null-parent = empty-tree diff) over
- *     renderUnifiedDiff.
+ *     renderUnifiedDiffAsync (the blob-sourced arm — the no-newline markers
+ *     and the trailing-newline-only hunk synthesis of the verbatim-bytes
+ *     contract, services/git-models.ts).
  *   - commit `.patch`: GetRawDiff's RawDiffPatch arm (diff.go:50-63) —
  *     `git format-patch --no-signature --stdout`: the git-am MAIL header
  *     (From <oid> / From: / Date: / Subject: [PATCH]) around the unified
  *     diff, WITHOUT the trailing `-- \n<version>` signature; here
- *     renderPatch(commit, files, { signature: null }).
+ *     renderPatchAsync(commit, files, src, { signature: null }). Over a
+ *     MERGE commit the arm renders the non-merge side-commit SERIES
+ *     (format-patch skips merges — diff.go:87-99 — and a merge-only range
+ *     prints ZERO bytes; see renderPatchSeries).
  *   - pull `.diff`: DownloadDiffOrPatch's GetDiff (services/pull/patch.go:
  *     26-45 → modules/git/repo_compare.go:57-62) — `git diff -p
  *     <mergeBase>...refs/pull/N/head`; here pullRequestDiff's three-dot
  *     range (the landed API `.diff` route's own composition,
- *     api/routes/pulls.ts handlePullDiff) over renderUnifiedDiff.
+ *     api/routes/pulls.ts handlePullDiff) over renderUnifiedDiffAsync.
  *   - pull `.patch`: GetPatch (repo_compare.go:74-77) — `git format-patch
  *     --binary --stdout` over the same range: the mail header WITH the
- *     signature tail; here renderPatch(headCommit, files) — the landed API
- *     `.patch` arm verbatim (a RANGE renders as the head commit's single
- *     mail block, the landed API family's approximation of upstream's
- *     per-commit mail series; git-am applies the aggregated diff the same).
+ *     signature tail; here renderPatchAsync(headCommit, range.files, src) —
+ *     the landed API `.patch` arm verbatim (a RANGE with a NON-merge head
+ *     renders as the head commit's single mail block, the landed API
+ *     family's approximation of upstream's per-commit mail series; git-am
+ *     applies the aggregated diff the same). A MERGE-TIPPED head renders
+ *     the non-merge series instead (format-patch skips merges; the merge
+ *     itself is never a mail), empty output when the series is empty.
  *
  * Content-type: upstream sets none — Go's net/http sniffs the text and
  * answers `text/plain; charset=utf-8`; emitted explicitly here. Cache
@@ -74,9 +82,10 @@ import { Context, type Context as ContextType } from "hono";
 
 import { ApiError } from "../../api/errors";
 import type { ApiEnv } from "../../api/env";
-import { engineReads } from "../../api/services/engine";
+import type { CommitJson } from "@cf-gitea/git-engine";
+import { engineReads, type EngineReads } from "../../api/services/engine";
 import { findIssueByRepoAndIndex } from "../../api/services/issues";
-import { renderPatch, renderUnifiedDiff } from "../../api/services/git-models";
+import { diffBlobSource, renderPatchAsync, renderUnifiedDiffAsync, type RenderPatchOptions } from "../../api/services/git-models";
 import { pullRequestDiff } from "../../api/services/pull-engine";
 import { findPullRequestByIndex } from "../../api/services/pulls";
 import { findRepositoryById } from "../../api/services/repository";
@@ -90,10 +99,76 @@ export type DiffPatchExt = "diff" | "patch";
 const COMMIT_SHA = /^[0-9a-f]{7,64}$/i;
 
 /**
+ * The format-patch SERIES walker: the non-merge commits of `base..head`
+ * (git's format-patch NEVER renders a merge as a mail — verified against the
+ * binary: a merge-only range prints ZERO bytes), oldest-first (the series
+ * applies bottom-up; the engine's range walk is parents-before-children), one
+ * mail per commit, each diffed against its own first parent. Mail subjects
+ * number only when the series has more than one mail (`[PATCH]` vs
+ * `[PATCH i/N]`, the binary's shape). Between-mail seam (recorded real-git
+ * bytes): git's full stream is each mail plus its own trailing newline,
+ * joined by one more — an unsigned mail's last diff line gains `\n` and one
+ * blank line before the next `From` (`+line\n\nFrom …`), a signed mail's
+ * version line gains `\n` and two blank lines (`2.43.0\n\n\nFrom …`); the
+ * last mail's tail is the stream's tail. The walk is capped at
+ * MERGE_SERIES_COMMIT_CAP — a page walk until `more` flips false or the cap
+ * trips (documented: a merge series past the cap truncates, flagged nowhere
+ * in git's output either).
+ */
+const MERGE_SERIES_COMMIT_CAP = 2000;
+const MERGE_SERIES_PAGE = 500;
+
+async function renderPatchSeries(
+  reads: EngineReads,
+  base: string,
+  head: string,
+  options: RenderPatchOptions,
+): Promise<string> {
+  const commits: CommitJson[] = [];
+  for (let page = 0; commits.length < MERGE_SERIES_COMMIT_CAP; page++) {
+    const walked = await reads.listCommitsRange(base, head, MERGE_SERIES_PAGE, page);
+    if (walked === null) break;
+    for (const commit of walked.commits) {
+      if (commit.parents.length <= 1) commits.push(commit);
+    }
+    if (!walked.more) break;
+  }
+  const numbered = commits.length > 1;
+  const mails: string[] = [];
+  for (let i = 0; i < commits.length; i++) {
+    const commit = commits[i] as CommitJson;
+    const parent = commit.parents.length === 1 ? commit.parents[0] : undefined;
+    const diff = await reads.readDiff(commit.oid, parent);
+    const files = diff?.files ?? [];
+    const src = diffBlobSource(reads, diff?.old ?? null, diff?.new ?? commit.oid);
+    mails.push(
+      await renderPatchAsync(commit, files, src, {
+        ...options,
+        ...(numbered ? { patchNumber: { index: i + 1, count: commits.length } } : {}),
+      }),
+    );
+  }
+  // git's exact seam for BOTH signature states: each mail carries its own
+  // trailing newline (the rendered mails end bare for `signature: null`,
+  // with `2.43.0\n` otherwise), the join adds the blank seam line, and the
+  // last mail's tail is the stream's tail — recorded against `git
+  // format-patch --stdout` over 3-mail signed and unsigned series.
+  return mails.map((mail) => `${mail}\n`).join("\n");
+}
+
+/**
  * The commit download's body: the plain unified diff (`.diff`) or the
  * git-am mail shape without the signature tail (`.patch`). `null` = the 404
  * family: a non-hex/wrong-shape segment, an empty repo, or a commit the
  * engine cannot resolve (short prefixes — the full-oid divergence).
+ *
+ * `.patch` over a MERGE commit: upstream's RawDiffPatch arm runs
+ * `format-patch --no-signature --stdout <merge>...<parent0>` (diff.go:87-99)
+ * and format-patch skips merges — the answer is the non-merge side-commit
+ * series (`<parent0>` is an ancestor, so the symmetric difference is
+ * parent0..<merge>), EMPTY OUTPUT (zero bytes) when the series is empty. The
+ * pre-2026 renderer instead mailed the merge itself with the first-parent
+ * tree diff — the D11 fix lands upstream's shape.
  */
 export async function loadCommitDiffPatch(
   env: Env,
@@ -105,9 +180,17 @@ export async function loadCommitDiffPatch(
   const reads = engineReads(env, repo);
   const commit = await reads.readCommit(sha);
   if (commit === null) return null;
+  if (ext === "patch" && commit.parents.length > 1) {
+    return renderPatchSeries(reads, commit.parents[0] as string, commit.oid, { signature: null });
+  }
   const diff = await reads.readDiff(commit.oid);
   const files = diff?.files ?? [];
-  return ext === "patch" ? renderPatch(commit, files, { signature: null }) : renderUnifiedDiff(files);
+  if (ext === "patch") {
+    const src = diffBlobSource(reads, diff?.old ?? null, diff?.new ?? commit.oid);
+    return renderPatchAsync(commit, files, src, { signature: null });
+  }
+  const src = diffBlobSource(reads, diff?.old ?? null, diff?.new ?? commit.oid);
+  return renderUnifiedDiffAsync(files, src);
 }
 
 /**
@@ -115,6 +198,13 @@ export async function loadCommitDiffPatch(
  * family: a missing/non-pull row, an unresolvable base/head range (the
  * service's ApiError — the landed API sibling's mapping), or a head commit
  * the engine cannot read back for the mail header.
+ *
+ * `.patch` with a MERGE-tipped head: GetPatch's `format-patch --binary
+ * --stdout <mergeBase>...<head>` skips the merge like every other — the
+ * non-merge series with the signature tail; a null merge base (unresolvable
+ * range) keeps the 404 shell (upstream's GetPatch errors there). A
+ * non-merge head keeps the landed single-block rendering (the documented
+ * range approximation of upstream's per-commit mail series).
  */
 export async function loadPullDiffPatch(
   c: ContextType<{ Bindings: Env }>,
@@ -136,11 +226,20 @@ export async function loadPullDiffPatch(
     // service never reads) — the request/env pair re-wrapped, no casts (the
     // pull-files page's construction).
     const apiContext = new Context<ApiEnv>(c.req.raw, { env: c.env });
+    const reads = engineReads(c.env, pair.repo);
     const range = await pullRequestDiff(apiContext, pair, prRow.pullRequest);
-    if (ext === "diff") return renderUnifiedDiff(range.files);
-    const headCommit = await engineReads(c.env, pair.repo).readCommit(range.head);
+    const headCommit = await reads.readCommit(range.head);
     if (headCommit === null) return null;
-    return renderPatch(headCommit, range.files);
+    if (ext === "patch" && headCommit.parents.length > 1) {
+      // a merge-tipped head: the non-merge series (signature tail kept);
+      // without a merge base the range is unresolvable — the 404 shell
+      if (range.mergeBase === null) return null;
+      return renderPatchSeries(reads, range.mergeBase, range.head, {});
+    }
+    if (ext === "diff") {
+      return renderUnifiedDiffAsync(range.files, diffBlobSource(reads, range.mergeBase, range.head));
+    }
+    return renderPatchAsync(headCommit, range.files, diffBlobSource(reads, range.mergeBase, range.head));
   } catch (error) {
     if (!(error instanceof ApiError)) throw error;
     // The service's 404 (unresolvable base/head) → the 404 shell.

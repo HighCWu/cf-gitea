@@ -21,9 +21,20 @@
  *     trailing CR (--whitespace=fix);
  *   - the `index <old>..<new>` line is parsed but NOT used for the -3
  *     three-way fallback (the base blob is whatever sits at the path);
- *   - binary patches ("GIT binary patch" / "Binary files … differ") and mode
- *     changes are refused with the apply-failure 422 (upstream would apply
- *     binaries with --binary);
+ *   - binary patches ("GIT binary patch" / "Binary files … differ") are
+ *     refused with the apply-failure 422 (upstream would apply binaries with
+ *     --binary);
+ *   - MODE CHANGES APPLY: `new file mode`, and `old mode`/`new mode` pairs,
+ *     land through the commit builder's FileChange.mode — upstream
+ *     `git apply --index` honors them (verified against the binary: a
+ *     mode-only patch moves the entry's mode, `git apply --check --index`
+ *     accepts exactly that headers-only section). Two divergences, both
+ *     fail-closed where git is lenient (verified against the binary):
+ *     a mismatched `old mode` pre-image only WARNS in git ("type is …,
+ *     should be …", exit 0 even with --index) — refused here with the
+ *     apply-failure 422 "does not match index"; a lone unpaired mode line
+ *     or a mode no tree entry carries ("old mode banana") is git's
+ *     corrupt-patch/invalid-mode error — mirrored as 422s;
  *   - an unapplicable patch is the 422 "patch does not apply" family —
  *     upstream's git-apply failure actually surfaces as a 500
  *     (handleChangeRepoFilesError has no apply-failure mapping); 422 is the
@@ -43,6 +54,25 @@ export interface PatchFile {
   hunks: PatchHunk[];
   noOldNewline: boolean;
   noNewNewline: boolean;
+  /**
+   * The mode the file lands with: the new-mode half of an explicit
+   * `old mode`/`new mode` pair, or the `new file mode` line of a creation.
+   * Applied through FileChange.mode — upstream `git apply --index` honors
+   * mode changes (git blob modes only).
+   */
+  targetMode?: string;
+  /** The old-mode half of an explicit mode pair, validated against the base
+   *  tree entry (git apply --index's "does not match index" gate). */
+  sourceMode?: string;
+}
+
+/** The git blob modes a patch may set — trees and gitlinks never patch. */
+const PATCH_MODES = new Set(["100644", "100755", "120000"]);
+
+/** Parse a mode line's operand, refusing anything a tree entry cannot carry. */
+function parsePatchMode(value: string): string | null {
+  const mode = value.trim();
+  return PATCH_MODES.has(mode) ? mode : null;
 }
 
 export interface PatchHunk {
@@ -87,22 +117,35 @@ function emptySection(): PatchFile {
 
 /**
  * Parse a unified diff into file sections. Accepts the git-style form
- * (`diff --git …`, new/deleted file mode lines, ---/+++ headers) and the
- * plain form (---/+++ only). Throws the apply-failure 422 for binary
- * sections (upstream --binary would apply them).
+ * (`diff --git …`, new/deleted file mode lines, old/new mode pairs,
+ * ---/+++ headers) and the plain form (---/+++ only). Throws the
+ * apply-failure 422 for binary sections (upstream --binary would apply them)
+ * and for modes no tree entry can carry (upstream git apply refuses a
+ * malformed mode the same way).
  */
 export function parseUnifiedPatch(content: string): PatchFile[] {
   const lines = splitLines(content).lines;
   const files: PatchFile[] = [];
   let current: PatchFile | null = null;
   let activeHunk: PatchHunk | null = null;
+  // `current` was opened by a `diff --git` line (the git-style form): its
+  // ---/+++/hunks belong to the SAME section, and a bare `---` (the plain
+  // form) must not flush it — the flush would drop the mode lines parsed
+  // ahead of the ---/+++ pair
+  let fromDiffGit = false;
 
   const flush = (): void => {
-    // a pure-rename section carries rename headers and NO hunks — keep it
-    if (current !== null && (current.hunks.length > 0 || current.oldPath !== null || current.newPath !== null)) {
+    // keep a section that carries anything applicable: hunks, paths (pure
+    // rename / mode-only sections have NO ---/+++ to name them — the paths
+    // come from the `diff --git a/x b/y` line), or mode lines
+    if (
+      current !== null &&
+      (current.hunks.length > 0 || current.oldPath !== null || current.newPath !== null || current.sourceMode !== undefined || current.targetMode !== undefined)
+    ) {
       files.push(current);
     }
     current = null;
+    fromDiffGit = false;
     activeHunk = null;
   };
 
@@ -111,14 +154,53 @@ export function parseUnifiedPatch(content: string): PatchFile[] {
     if (line.startsWith("diff --git ")) {
       flush();
       current = emptySection();
+      fromDiffGit = true;
+      // the paths ride this line too — a mode-only section has NO ---/+++
+      // pair to name them (git prints none there). Unquoted `a/<old> b/<new>`
+      // only (our renderer never quotes; a content section's ---/+++ pair
+      // overrides these anyway).
+      const body = line.slice("diff --git ".length);
+      const sep = body.lastIndexOf(" b/");
+      if (body.startsWith("a/") && sep > 2) {
+        current.oldPath = body.slice(2, sep);
+        current.newPath = body.slice(sep + 3);
+      }
       continue;
     }
     if (line.startsWith("new file mode")) {
-      if (current !== null) current.oldPath = null;
+      if (current !== null) {
+        current.oldPath = null;
+        const mode = parsePatchMode(line.slice("new file mode".length));
+        if (mode === null) throw applyFailure(`invalid new file mode: ${line}`);
+        current.targetMode = mode;
+      }
       continue;
     }
     if (line.startsWith("deleted file mode")) {
-      if (current !== null) current.newPath = null;
+      if (current !== null) {
+        current.newPath = null;
+        // the deleted file's mode is parsed only to refuse malformed modes —
+        // the entry is gone after the apply either way
+        if (parsePatchMode(line.slice("deleted file mode".length)) === null) {
+          throw applyFailure(`invalid deleted file mode: ${line}`);
+        }
+      }
+      continue;
+    }
+    if (line.startsWith("old mode ")) {
+      if (current !== null) {
+        const mode = parsePatchMode(line.slice("old mode ".length));
+        if (mode === null) throw applyFailure(`invalid old mode: ${line}`);
+        current.sourceMode = mode;
+      }
+      continue;
+    }
+    if (line.startsWith("new mode ")) {
+      if (current !== null) {
+        const mode = parsePatchMode(line.slice("new mode ".length));
+        if (mode === null) throw applyFailure(`invalid new mode: ${line}`);
+        current.targetMode = mode;
+      }
       continue;
     }
     if (line.startsWith("rename from ")) {
@@ -133,10 +215,12 @@ export function parseUnifiedPatch(content: string): PatchFile[] {
       throw applyFailure("binary patches are not supported");
     }
     if (line.startsWith("--- ")) {
-      flush();
-      const section: PatchFile = current ?? emptySection();
-      section.oldPath = stripPathPrefix(line.slice(4));
-      current = section;
+      if (current !== null && !fromDiffGit) flush();
+      if (current === null) {
+        current = emptySection();
+        fromDiffGit = false;
+      }
+      current.oldPath = stripPathPrefix(line.slice(4));
       continue;
     }
     if (line.startsWith("+++ ")) {
@@ -278,16 +362,30 @@ export async function patchToFileChanges(reads: EngineReads, refTarget: string, 
     if (oldPath === null && newPath === null) {
       throw applyFailure("section without a target path");
     }
-    const baseText =
+    // a mode pair needs both halves (git apply refuses a lone mode line)
+    if ((file.sourceMode === undefined) !== (file.targetMode === undefined) && file.oldPath !== null && file.newPath !== null) {
+      throw applyFailure("mode change lines must pair old and new");
+    }
+    const baseBlob =
       oldPath === null
-        ? ""
+        ? null
         : await (async () => {
             const blob = await reads.readBlob(refTarget, oldPath);
             if (blob === null) throw applyFailure(`${oldPath} does not exist in the base tree`);
-            return new TextDecoder().decode(blob.data);
+            return blob;
           })();
+    // the pre-image mode gate: git apply only WARNS on a mismatched `old
+    // mode` ("type is …, should be …", exit 0 even with --index — verified
+    // against the binary); refused here instead — a patch claiming a
+    // pre-image mode the base tree does not carry was not generated against
+    // this tree, and silently moving the mode off that claim would mis-apply
+    if (file.sourceMode !== undefined && baseBlob !== null && baseBlob.mode !== file.sourceMode) {
+      throw applyFailure(`${oldPath}: does not match index (mode) [given: ${file.sourceMode}, expected: ${baseBlob.mode}]`);
+    }
+    const baseText = baseBlob === null ? "" : new TextDecoder().decode(baseBlob.data);
 
-    // a hunk-less section (pure rename) carries the base content through
+    // a hunk-less section (pure rename, mode-only move) carries the base
+    // content through
     const patchedText = file.hunks.length === 0 ? baseText : applyHunks(baseText, file);
     if (newPath === null) {
       // deletion: the patched content must be empty (git apply --index)
@@ -300,14 +398,29 @@ export async function patchToFileChanges(reads: EngineReads, refTarget: string, 
     }
     if (isRename) {
       changes.push({ operation: "delete", path: oldPath });
-      changes.push({ operation: "create", path: newPath, content: new TextEncoder().encode(patchedText) });
+      changes.push({
+        operation: "create",
+        path: newPath,
+        content: new TextEncoder().encode(patchedText),
+        ...(file.targetMode === undefined ? {} : { mode: file.targetMode }),
+      });
       continue;
     }
     if (oldPath === null) {
-      changes.push({ operation: "create", path: newPath, content: new TextEncoder().encode(patchedText) });
+      changes.push({
+        operation: "create",
+        path: newPath,
+        content: new TextEncoder().encode(patchedText),
+        mode: file.targetMode ?? "100644",
+      });
       continue;
     }
-    changes.push({ operation: "update", path: newPath, content: new TextEncoder().encode(patchedText) });
+    changes.push({
+      operation: "update",
+      path: newPath,
+      content: new TextEncoder().encode(patchedText),
+      ...(file.targetMode === undefined ? {} : { mode: file.targetMode }),
+    });
   }
   return changes;
 }

@@ -17,6 +17,18 @@
  *     (util.IfZero(apiOpts.Message, "apply-patch"));
  *   - author/committer: the body identities, falling back to the doer
  *     (the contract's own note on ApplyDiffPatchFileOptions);
+ *   - `signoff: true` appends the `Signed-off-by: <committer>` trailer —
+ *     upstream CommitTree (services/repository/files/temp_repo.go:312-317)
+ *     writes "\n" + "Signed-off-by: " + committerSig.String() after the
+ *     TrimSpace'd message, the identity being the COMMITTER signature
+ *     (makeGitUserSignature: committer identity, author-identity fallback
+ *     per field, doer fallback) — exactly the person toPerson
+ *     (form.committer ?? form.author, …) resolves here;
+ *   - mode changes in the patch APPLY (new-file modes, old/new mode pairs —
+ *     upstream `git apply --index` honors them; a mismatched `old mode`
+ *     pre-image, which git only warns on, is refused 422 "does not match
+ *     index" — the fail-closed divergence documented in services/diffpatch);
+ *     binary sections are refused with the apply-failure 422;
  *   - archived repositories refuse with the declared 423 (MustNotBeArchived);
  *   - the response is the FileResponse {commit, verification} — `content`
  *     marshals null upstream (no single file to render).
@@ -30,8 +42,8 @@
  *     apply-failure mapping). 422 is the declared-on-siblings validation
  *     code; 422/400 runtime emissions stay in the undeclared runtime-only
  *     class the orchestrator's tables own.
- *   - binary patches / mode changes are refused (422) — upstream applies
- *     binaries via --binary.
+ *   - binary patches are refused (422) — upstream applies binaries via
+ *     --binary.
  *
  * Auth: requireAuth (the write-family stand-in for upstream's
  * reqRepoWriter + doer identity; hooks-routes convention).
@@ -127,10 +139,14 @@ export function registerDiffPatchRoutes(
       const identity = doerIdentity(c);
       // upstream TrimSpaces the message at commit time (gitPatchCommitPush)
       const message = (form.message === undefined || form.message === "" ? "apply-patch" : form.message).trim();
+      // signoff: the trailer rides the COMMITTER identity (temp_repo.go
+      // makeGitUserSignature + the SignOff block — see the module doc)
+      const committer = toPerson(form.committer ?? form.author, identity.name, identity.email, form.dates?.committer);
+      const finalMessage = form.signoff === true ? `${message}\nSigned-off-by: ${committer.name} <${committer.email}>` : message;
       const result = await applyFileChanges(c, pair, { branch: form.branch, new_branch: form.new_branch }, changes, {
-        message,
+        message: finalMessage,
         author: toPerson(form.author, identity.name, identity.email, form.dates?.author),
-        committer: toPerson(form.committer ?? form.author, identity.name, identity.email, form.dates?.committer),
+        committer,
       });
 
       const commit = await reads.readCommit(result.refTarget);

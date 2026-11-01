@@ -214,6 +214,103 @@ describe("POST /repos/{owner}/{repo}/diffpatch (repoApplyDiffPatch)", () => {
     expect((await jsonBody(empty)).message).toContain("no file sections");
   });
 
+  it("applies mode changes: a new-file mode lands executable, an old/new pair moves the entry's mode", async () => {
+    // upstream `git apply --index` honors mode lines (verified against the
+    // binary: a mode-only patch moves the staged entry's mode); D10 lands the
+    // same through FileChange.mode
+    const patch = [
+      "diff --git a/script.sh b/script.sh",
+      "new file mode 100755",
+      "index 0000000..3333333",
+      "--- /dev/null",
+      "+++ b/script.sh",
+      "@@ -0,0 +1 @@",
+      "+#!/bin/sh",
+      "diff --git a/README.md b/README.md",
+      "old mode 100644",
+      "new mode 100755",
+      "index 1111111..1111111",
+      "--- a/README.md",
+      "+++ b/README.md",
+      "@@ -1,3 +1,3 @@",
+      " alpha",
+      " BETA",
+      " gamma",
+      "",
+    ].join("\n");
+    const res = await fetchRoute(`${REPO_PATH}/diffpatch`, authed("POST", { content: patch }));
+    expect(res.status).toBe(200);
+    const reads = engineReads(env, { ownerNamespace: OWNER.toLowerCase(), slug: SLUG });
+    const script = await reads.readBlob(undefined, "script.sh");
+    expect(script?.mode).toBe("100755");
+    const readme = await reads.readBlob(undefined, "README.md");
+    // the mode-only section: content carried through unchanged, mode moved
+    expect(readme === null ? "" : new TextDecoder().decode(readme.data)).toBe("alpha\nBETA\ngamma\n");
+    expect(readme?.mode).toBe("100755");
+  });
+
+  it("422s a mode pair whose old mode does not match the base tree (git apply's does-not-match-index)", async () => {
+    // script.sh sits at 100755 (the mode-apply test landed it there); a patch
+    // claiming 100644 as its pre-image mode is the does-not-match-index 422
+    const patch = [
+      "diff --git a/script.sh b/script.sh",
+      "old mode 100644",
+      "new mode 100644",
+      "index 3333333..3333333",
+      "--- a/script.sh",
+      "+++ b/script.sh",
+      "@@ -1 +1 @@",
+      " #!/bin/sh",
+      "",
+    ].join("\n");
+    const res = await fetchRoute(`${REPO_PATH}/diffpatch`, authed("POST", { content: patch }));
+    expect(res.status).toBe(422);
+    expect((await jsonBody(res)).message).toContain("does not match index");
+  });
+
+  it("422s malformed mode lines (git apply refuses modes no tree entry carries)", async () => {
+    const patch = [
+      "diff --git a/README.md b/README.md",
+      "old mode banana",
+      "new mode 100755",
+      "index 1111111..1111111",
+      "--- a/README.md",
+      "+++ b/README.md",
+      "@@ -1,3 +1,3 @@",
+      " alpha",
+      " BETA",
+      " gamma",
+      "",
+    ].join("\n");
+    const res = await fetchRoute(`${REPO_PATH}/diffpatch`, authed("POST", { content: patch }));
+    expect(res.status).toBe(422);
+    expect((await jsonBody(res)).message).toContain("invalid old mode");
+  });
+
+  it("appends the Signed-off-by trailer from the COMMITTER identity when signoff=true (D9)", async () => {
+    const patch = "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-alpha\n+ALPHA\n";
+    const res = await fetchRoute(
+      `${REPO_PATH}/diffpatch`,
+      authed("POST", { content: patch, message: "signed change", signoff: true, committer: { name: "Cmmtr", email: "cmmtr@x.test" } }),
+    );
+    expect(res.status).toBe(200);
+    const commit = (await jsonBody(res)).commit as { message: string };
+    // upstream CommitTree: message + "\n" + "Signed-off-by: " + committerSig
+    expect(commit.message).toBe("signed change\nSigned-off-by: Cmmtr <cmmtr@x.test>");
+  });
+
+  it("signoff falls back through the author identity to the doer (makeGitUserSignature order)", async () => {
+    const patch = "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-ALPHA\n+alpha\n";
+    const res = await fetchRoute(
+      `${REPO_PATH}/diffpatch`,
+      authed("POST", { content: patch, signoff: true, author: { name: "Authr", email: "authr@x.test" } }),
+    );
+    expect(res.status).toBe(200);
+    const commit = (await jsonBody(res)).commit as { message: string };
+    // committer = form.committer ?? form.author — the author identity here
+    expect(commit.message).toBe("apply-patch\nSigned-off-by: Authr <authr@x.test>");
+  });
+
   it("404s an unknown base branch with the ErrBranchNotExist message", async () => {
     const patch = "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-alpha\n+ALPHA\n";
     const res = await fetchRoute(`${REPO_PATH}/diffpatch`, authed("POST", { content: patch, branch: "ghost" }));

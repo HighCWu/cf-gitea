@@ -38,6 +38,8 @@ import { handlesUiRoute, parseUiRoute, uiRouter } from "../index";
 import { SELF } from "cloudflare:test";
 import { buildHistoryPack, buildReceivePackBody, type SeedCommit } from "../testing/seed-repo";
 import { T0, uiEnv } from "./harness";
+import { serializeCommit } from "@cf-gitea/git-engine";
+import { engineReads } from "../../api/services/engine";
 
 async function fetchUi(path: string): Promise<Response> {
   return uiRouter.fetch(new Request(`https://test.local${path}`), uiEnv);
@@ -252,6 +254,68 @@ describe("wave-29 parser family (parseUiRoute / handlesUiRoute)", () => {
 
 // --- the commit downloads -------------------------------------------------------
 
+/** The D11 fixture: a MERGE commit over the seeded history (parents [c1, c2],
+ *  tree = c2's), landed through the engine's public write RPCs (the
+ *  push-stale pattern — putApiObjects + a fresh-ref commitApiChange). Fixed
+ *  times → a deterministic oid, so the idempotent seed can read it back. */
+const MERGE_TIME = T0 + 600;
+const MERGE_MESSAGE = "Merge branch 'feature' into main\n";
+const ZERO_OID = "0".repeat(40);
+
+describe("GET /{owner}/{repo}/commit/{sha}.{diff|patch} — the merge arms (D11)", () => {
+  async function seedMerge(): Promise<{ mergeOid: string; c1: string; c2: string }> {
+    const [, c1, c2] = (await tips()) as [string, string, string];
+    const reads = engineReads(env, { ownerNamespace: "alice", slug: "wave29dp" });
+    const head = await reads.readCommit(c2);
+    if (head === null) throw new Error("wave29 c2 unreadable");
+    const person = { name: "Test User", email: "test@example.com", time: MERGE_TIME, tz: "+0000" };
+    const merge = serializeCommit({
+      tree: head.tree,
+      parents: [c1, c2],
+      author: person,
+      committer: person,
+      message: MERGE_MESSAGE,
+    });
+    const existing = await reads.readCommit(merge.oid);
+    if (existing === null) {
+      const cell = env.REPO.getByName("alice/wave29dp");
+      const put = await cell.putApiObjects([{ oid: merge.oid, type: "commit", data: merge.data }]);
+      if (put.tag !== "ok") throw new Error(`merge putApiObjects failed: ${put.tag}`);
+      const landed = await cell.commitApiChange({ ref: "refs/heads/merge-topic", expectedOldOid: ZERO_OID, newOid: merge.oid });
+      if (landed.tag !== "committed") throw new Error(`merge ref landing failed: ${landed.tag}`);
+    }
+    return { mergeOid: merge.oid, c1, c2 };
+  }
+
+  it("renders a MERGE commit's .patch as the non-merge side-commit series (format-patch skips merges)", async () => {
+    const { mergeOid, c2 } = await seedMerge();
+    const res = await fetchUi(`/alice/wave29dp/commit/${mergeOid}.patch`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    // upstream RawDiffPatch for a merge: format-patch <merge>...<parent0>
+    // walks parent0..<merge> and mails every NON-MERGE commit — the merge
+    // itself is NEVER a mail (verified against the binary; a merge-only range
+    // prints zero bytes). Here the side series is {c2} — one bare-[PATCH]
+    // mail (single-mail series stay unnumbered), no merge mail.
+    expect(body.startsWith(`From ${c2} Mon Sep 17 00:00:00 2001\n`)).toBe(true);
+    expect(body).toContain("Subject: [PATCH] wave29: pr head");
+    expect(body).not.toContain(`From ${mergeOid} `);
+    expect(body).not.toContain("Merge branch 'feature'");
+    // --no-signature: the commit download strips the signature tail
+    expect(body).not.toContain("\n-- \n");
+  });
+
+  it("keeps a merge commit's .diff on the first-parent tree diff (RawDiffNormal)", async () => {
+    const { mergeOid } = await seedMerge();
+    const res = await fetchUi(`/alice/wave29dp/commit/${mergeOid}.diff`);
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    // diff <parent0> <merge> — the second-parent side's tree delta
+    expect(body).toContain("diff --git a/docs/notes.md b/docs/notes.md");
+    expect(body).not.toContain("docs/notes.md b/docs/notes.md\ndiff --git a/src/app.ts");
+  });
+});
+
 describe("GET /{owner}/{repo}/commit/{sha}.{diff|patch}", () => {
   it("serves the plain unified diff with the upstream content type and cache header", async () => {
     const [, c1] = (await tips()) as [string, string];
@@ -264,11 +328,16 @@ describe("GET /{owner}/{repo}/commit/{sha}.{diff|patch}", () => {
     expect(body).toContain("diff --git a/README.md b/README.md");
     expect(body).toContain("--- a/README.md");
     expect(body).toContain("+++ b/README.md");
-    expect(body).toContain("@@ -1,1 +1,1 @@");
+    // git omits the `,1` single-line hunk count (the D3 byte fix — recorded
+    // real-git output: a one-line file edit prints `@@ -1 +1 @@`)
+    expect(body).toContain("@@ -1 +1 @@");
     expect(body).toContain("-wave29 root readme");
     expect(body).toContain("+wave29 readme v2");
-    // The created file carries git's new-file form.
+    // The created file carries git's new-file form — and the index line has
+    // NO mode column there (the mode lives on the new-file-mode line, D3).
     expect(body).toContain("new file mode 100644");
+    const newIndex = body.indexOf("new file mode 100644");
+    expect(body.slice(newIndex, newIndex + 60)).toMatch(/^new file mode 100644\nindex 0000000\.\.[0-9a-f]{7}\n/);
     expect(body).toContain("+console.log(\"wave29\");");
   });
 
