@@ -80,35 +80,60 @@
  *
  * Upstream's route group is web.go:662-677 (the `/user/settings/security`
  * subtree inside the reqSignIn `/user/settings` group). Only the GET mounts
- * (plus the W5 unlink POST above, HANDOFF):
+ * (plus the W5 unlink POST above and the 2FA four below, HANDOFF):
  *
  *   GET /user/settings/security → resolveUiSession (signed-in gate, the
  *            user-settings.tsx pattern) → loadUserSettingsSecurityPageData →
  *            renderUserSettingsSecurityPage; a session doer without a D1 row
  *            404-shells (the silent-auth-failure convention).
  *
- * Every other POST arm of the upstream group stays UNMOUNTED — each write
- * targets a store or op that does not exist (the per-section notes below):
- * `two_factor/regenerate_scratch` + `two_factor/disable`
- * (security/2fa.go:34-98), `two_factor/enroll` GET+POST (web.go:667-668,
- * twofa_enroll.tmpl), the webauthn `request_register`/`register`/`rename`/
- * `delete` quartet (web.go:669-673, security/webauthn.go), and the openid
- * POST/`delete`/`toggle_visibility` trio (web.go:674-676,
- * security/openid.go).
+ * ## The TOTP arms (LIVE — migration 0059's `two_factor` table + the
+ * src/auth/two-factor.ts seam; this unit flipped the derived posture off)
+ *
+ * `totpEnrolled` is now the REAL read (`hasTwoFactorByUid` — upstream's
+ * `auth_model.HasTwoFactorByUID`, security.go:73-78), and BOTH template
+ * arms render (twofa.tmpl at the pin):
+ *
+ *   - ENROLLED: `settings.twofa_is_enrolled` (the <strong> emphasis
+ *     rendered as markup — the no-raw-HTML rule keeps it as elements), the
+ *     regenerate form (POST …/regenerate_scratch), and the disable form
+ *     (POST …/disable). THE DISABLE DIVERGENCE (the mission's mandate):
+ *     upstream's disable form is a bare confirm dialog; ours carries a
+ *     REQUIRED passcode input — a hijacked session must not strip 2FA with
+ *     one click. The seam (applyTwofaDisable) verifies the code — TOTP in
+ *     the ±1 window or the scratch token — WITHOUT consuming/burning it;
+ *     recorded in src/auth/two-factor.ts's header. Upstream's
+ *     `enctype="multipart/form-data"` on the regenerate form is DROPPED —
+ *     the recipe handlers read urlencoded bodies (readUrlEncodedForm).
+ *   - NOT ENROLLED: the description, the recovery tip, the not-enrolled
+ *     line, and the Enroll BUTTON (twofa.tmpl:20-22) — now a LIVE link:
+ *     the enroll page exists (ui/pages/twofa.tsx, the no-QR divergence
+ *     documented there).
+ *
+ * The regenerate/disable POSTs and the enroll GET+POST are the HANDOFF —
+ * the full handler recipe lives in ui/pages/twofa.tsx's module header
+ * (userSettingsTabPrologue is index.ts-private, the unlink pattern). The
+ * once-shown scratch token travels in the security page's `notice` slot:
+ * after enroll/regenerate the handler re-renders THIS page with the
+ * positive notice carrying the token (the flash rides no wire in the
+ * no-JS shell; the W4 posture with the once-only carrier).
+ *
+ * Still UNMOUNTED — each write targets a store or op that does not exist:
+ * the openid POST/`delete`/`toggle_visibility` trio (web.go:674-676,
+ * security/openid.go). (The webauthn quartet is MOUNTED by the WebAuthn
+ * unit's own router — src/web/webauthn.ts, web.go:669-673 — not here: its
+ * dispatcher carve hands the tails to Hono beside that router's login
+ * family.)
  *
  * ## Data (§3.2 — what the landed auth exposes)
  *
- *   - 2FA (TOTP): no `two_factor` table — SPEC-0002 §1 puts 2FA/WebAuthn
- *     explicitly out of scope, and the schema carries no such store.
- *     `TOTPEnrolled` is therefore the DERIVED posture — no store = not
- *     enrolled (upstream's `auth_model.HasTwoFactorByUID`, security.go:73-78,
- *     answers false for every doer) — so the template's `{{else}}` arm's TEXT
- *     renders (twofa.tmpl:16-22): `settings.twofa_desc`, the recovery tip
- *     `settings.twofa_recovery_tip`, and `settings.twofa_not_enrolled`. The
- *     arm's Enroll BUTTON (twofa.tmpl:20-22) is UNRENDERED — a dead link: no
- *     enroll page exists (the dead-link rule). The ENROLLED arm never
- *     renders for the same absence.
- *   - WebAuthn: no store/ops → the section UNRENDERED.
+ *   - 2FA (TOTP): LIVE — the `two_factor` store (migration 0059) through
+ *     src/auth/two-factor.ts; both twofa.tmpl arms render (above).
+ *   - WebAuthn: LIVE (the WebAuthn unit) — the `webauthn_credentials`
+ *     store (migration 0060) through src/web/webauthn-store.ts; the
+ *     webauthn.tmpl section renders below (list + the register entry +
+ *     the rename modal + the delete form; the JS ceremony is the vendored
+ *     bundle's initUserAuthWebAuthnRegister against src/web/webauthn.ts).
  *   - Account links: LIVE (the W5 header section above).
  *   - OpenID: no `user_openid` store/ops → the section UNRENDERED.
  *
@@ -134,10 +159,13 @@
 
 import { UserSettingsNavbar } from "../components/settings-nav";
 import { BaseLayout, Icon, renderPage } from "../shell";
+import { hasTwoFactorByUid } from "../../auth/two-factor";
 import { oauth2LoginSourceButtons, ProviderIcon } from "./login";
+import { formatKeyDate } from "./user-settings-keys";
 import { getProviderDescriptor } from "../../services/auth-sources/registry";
 import { parseOAuth2SourceConfig } from "../../services/auth-sources/cfg";
 import { findExternalLogins, getLoginSource, listActiveOAuth2Sources, removeExternalLogin } from "../../services/auth-sources/store";
+import { listCredentialsByUser } from "../../web/webauthn-store";
 import type { UiContext } from "../ui-context";
 
 // ---------------------------------------------------------------------------
@@ -168,6 +196,43 @@ export const userSettingsSecurityLocale = {
    *  interpolates Go's ErrExternalLoginUserNotExist text into
    *  "RemoveAccountLink: …"; ours is the fixed non-committal copy). */
   unlink_missing: "The linked account was not found — it may already have been removed.",
+
+  // --- the TOTP arms (twofa.tmpl; the 2FA unit) -------------------------------
+  passcode: "Passcode", // "passcode" (the disable form's label — the mission's code requirement)
+  twofa_is_enrolled_prefix: "Your account is currently ", // "settings.twofa_is_enrolled" (split at the template's <strong>)
+  twofa_is_enrolled_strong: "enrolled", // "settings.twofa_is_enrolled" (the emphasized word)
+  twofa_is_enrolled_suffix: " in two-factor authentication.", // "settings.twofa_is_enrolled"
+  twofa_enroll_button: "Enroll in Two-Factor Authentication", // "settings.twofa_enroll" (the not-enrolled arm's button)
+  regenerate_scratch_token_desc:
+    "If you misplaced your recovery key or have already used it to sign in, you can reset it here.", // "settings.regenerate_scratch_token_desc"
+  twofa_scratch_token_regenerate: "Regenerate Single-Use Recovery Key", // "settings.twofa_scratch_token_regenerate"
+  twofa_disable_note: "You can disable two-factor authentication if needed.", // "settings.twofa_disable_note"
+  twofa_disable: "Disable Two-Factor Authentication", // "settings.twofa_disable"
+  twofa_disable_desc: "Disabling two-factor authentication will make your account less secure. Continue?", // "settings.twofa_disable_desc"
+
+  // --- the WebAuthn section (webauthn.tmpl + webauthn_error.tmpl; the
+  //     WebAuthn unit) ----------------------------------------------------------
+  webauthn: "Two-Factor Authentication (Security Keys)", // "settings.webauthn"
+  webauthn_desc_prefix: "Security keys are hardware devices containing cryptographic keys. They can be used for two-factor authentication. Security keys must support the", // "settings.webauthn_desc" (split at the template's link)
+  webauthn_desc_link: "WebAuthn Authenticator", // "settings.webauthn_desc" (the link text)
+  webauthn_key_loss_warning: "If you lose your security keys, you will lose access to your account.", // "settings.webauthn_key_loss_warning"
+  webauthn_alternative_tip: "You may want to configure an additional authentication method.", // "settings.webauthn_alternative_tip"
+  webauthn_nickname: "Nickname", // "settings.webauthn_nickname"
+  webauthn_register_key: "Add Security Key", // "settings.webauthn_register_key"
+  added_on: "Added on", // "settings.added_on %s" — the date renders beside it (the deploy-keys idiom)
+  rename: "Rename", // "rename"
+  webauthn_delete_key: "Remove Security Key", // "settings.webauthn_delete_key" (the dialog header)
+  webauthn_delete_key_desc: "If you remove a security key, you can no longer sign in with it. Continue?", // "settings.webauthn_delete_key_desc"
+  webauthn_error: "Could not read your security key.", // "webauthn_error" (the error box header)
+  webauthn_unsupported_browser: "Your browser does not currently support WebAuthn.", // "webauthn_unsupported_browser"
+  webauthn_error_unknown: "An unknown error occurred. Please retry.", // "webauthn_error_unknown"
+  webauthn_error_insecure:
+    'WebAuthn only supports secure connections. For testing over HTTP, you can use the origin "localhost".', // "webauthn_error_insecure"
+  webauthn_error_unable_to_process: "The server could not process your request.", // "webauthn_error_unable_to_process"
+  webauthn_error_duplicated:
+    "The security key is not permitted for this request. Please make sure that the key is not already registered.", // "webauthn_error_duplicated"
+  webauthn_error_empty: "You must set a name for this key.", // "webauthn_error_empty"
+  webauthn_error_timeout: "Timeout reached before your key could be read. Please reload this page and retry.", // "webauthn_error_timeout"
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -207,11 +272,23 @@ export interface AccountLinkButton {
   provider: string;
 }
 
-/** The security tab's render inputs: the derived 2FA posture (`false` is
- *  the only producible value today — no `two_factor` store) + the W5
- *  account-links projections (both empty on every instance without linked
- *  identities/active sources — the section renders nothing, upstream's own
- *  guard, and the page bytes stay the wave-56 shape). */
+/** One enrolled security key (webauthn.tmpl:10-29's item inputs — the
+ *  WebAuthn unit; the display slice of webauthn-store's row). */
+export interface WebAuthnCredentialView {
+  /** The row id — the Rename/Delete forms' wire value (the template's
+   *  data-modal-id / data-url id, ctx.FormInt64). */
+  id: number;
+  /** The nickname (webauthn.tmpl:16's item-title). */
+  name: string;
+  /** Upstream `CreatedUnix` (webauthn.tmpl:18's Added-on date). */
+  createdUnix: Date;
+}
+
+/** The security tab's render inputs: the LIVE 2FA posture (the real
+ *  `two_factor` read — the 2FA unit) + the W5 account-links projections
+ *  (empty on every instance without linked identities/active sources — the
+ *  section renders nothing, upstream's own guard) + the WebAuthn
+ *  credentials (the WebAuthn unit; empty until a key enrolls). */
 export interface UserSettingsSecurityPageData {
   totpEnrolled: boolean;
   /** The doer's links joined to their sources, `login_source_id` DESC
@@ -223,6 +300,10 @@ export interface UserSettingsSecurityPageData {
    *  (the dead-source rule — a source that cannot complete a chain renders
    *  no entry point). */
   linkButtons: AccountLinkButton[];
+  /** The enrolled security keys (upstream loadSecurityData's
+   *  GetWebAuthnCredentialsByUID, security.go:80-86 — pk order, the store's
+   *  default). */
+  webauthnCredentials: WebAuthnCredentialView[];
 }
 
 /** The provider display name — the registry as the single source (the
@@ -238,8 +319,9 @@ function providerDisplayName(provider: string, sourceName: string): string {
 
 /**
  * The page load — upstream's `HasTwoFactorByUID` arm (security.go:73-78)
- * answered from the store landscape (no two_factor table ⇒ false) plus the
- * W5 account-links projections (the module header).
+ * over the LIVE `two_factor` store (the 2FA unit; the derived false
+ * posture is retired) plus the W5 account-links projections (the module
+ * header).
  */
 export async function loadUserSettingsSecurityPageData(d1: D1Database, userId: number): Promise<UserSettingsSecurityPageData> {
   // The links joined to their sources (security.go:87-117): the store read
@@ -278,7 +360,21 @@ export async function loadUserSettingsSecurityPageData(d1: D1Database, userId: n
     displayName: providerDisplayName(button.provider, button.name),
   }));
 
-  return { totpEnrolled: false, accountLinks: joined, linkButtons };
+  // The LIVE TOTP posture (security.go:73-78's HasTwoFactorByUID — the
+  // existence read over migration 0059's table).
+  // The WebAuthn credentials (security.go:80-86's
+  // GetWebAuthnCredentialsByUID — the WebAuthn unit; pk order upstream).
+  const webauthnCredentials: WebAuthnCredentialView[] = (await listCredentialsByUser(d1, userId)).map((cred) => ({
+    id: cred.id,
+    name: cred.name,
+    createdUnix: cred.createdUnix,
+  }));
+  return {
+    totpEnrolled: await hasTwoFactorByUid(d1, userId),
+    accountLinks: joined,
+    linkButtons,
+    webauthnCredentials,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -344,25 +440,87 @@ export function UserSettingsSecurityPage(props: {
             {props.notice !== undefined ? (
               <div class={`ui ${props.notice.kind} message`}>{props.notice.message}</div>
             ) : null}
-            {/* security.tmpl:5-7's twofa include, not-enrolled arm
-                (twofa.tmpl:16-22 — the enrolled arm's regenerate/disable
-                forms and the Enroll button stay unrendered: no two_factor
-                store or ops, the module header). */}
+            {/* security.tmpl:5-7's twofa include — BOTH arms render (the
+                module header's TOTP section). */}
             <h4 class="ui top attached header">{userSettingsSecurityLocale.twofa}</h4>
             <div class="ui attached segment">
               <p>{userSettingsSecurityLocale.twofa_desc}</p>
-              {data.totpEnrolled ? null : (
+              {data.totpEnrolled ? (
+                <>
+                  {/* twofa.tmpl:6's enrolled line — the template's
+                      <strong> rendered as elements (the no-raw-HTML rule). */}
+                  <p>
+                    {userSettingsSecurityLocale.twofa_is_enrolled_prefix}
+                    <strong>{userSettingsSecurityLocale.twofa_is_enrolled_strong}</strong>
+                    {userSettingsSecurityLocale.twofa_is_enrolled_suffix}
+                  </p>
+                  {/* twofa.tmpl:7-10's regenerate form. Upstream's
+                      enctype="multipart/form-data" is DROPPED — the recipe
+                      handler reads urlencoded bodies (the module header). */}
+                  <form class="ui form" action="/user/settings/security/two_factor/regenerate_scratch" method="post">
+                    <p>{userSettingsSecurityLocale.regenerate_scratch_token_desc}</p>
+                    <button type="submit" class="ui primary button">
+                      {userSettingsSecurityLocale.twofa_scratch_token_regenerate}
+                    </button>
+                  </form>
+                  {/* twofa.tmpl:11-14's disable form — THE MISSION'S
+                      DIVERGENCE: the required passcode field (upstream is a
+                      bare confirm dialog; a hijacked session must not strip
+                      2FA with one click — the seam verifies without
+                      consuming, src/auth/two-factor.ts's header). */}
+                  <form class="ui form form-fetch-action" action="/user/settings/security/two_factor/disable" method="post">
+                    <p>{userSettingsSecurityLocale.twofa_disable_note}</p>
+                    <div class="field">
+                      <label for="disable-passcode">{userSettingsSecurityLocale.passcode}</label>
+                      <input id="disable-passcode" name="passcode" type="text" autocomplete="one-time-code" inputmode="numeric" required />
+                    </div>
+                    <button type="submit" class="ui red button" data-modal-confirm="#disable-twofa">
+                      {userSettingsSecurityLocale.twofa_disable}
+                    </button>
+                  </form>
+                </>
+              ) : (
                 <>
                   {/* The recovery tip is upstream's own encouragement line
                       (twofa.tmpl:18's comment). */}
                   <p>{userSettingsSecurityLocale.twofa_recovery_tip}</p>
                   <p>{userSettingsSecurityLocale.twofa_not_enrolled}</p>
+                  {/* twofa.tmpl:19-21's Enroll button — LIVE (the enroll
+                      page exists, ui/pages/twofa.tsx). */}
+                  <div class="inline field">
+                    <a class="ui primary button" href="/user/settings/security/two_factor/enroll">
+                      {userSettingsSecurityLocale.twofa_enroll_button}
+                    </a>
+                  </div>
                 </>
               )}
             </div>
-            {/* security.tmpl:6's webauthn include: UNRENDERED (no store/ops,
-                the module header). security.tmpl:9-12's openid include:
-                UNRENDERED. */}
+            {/* twofa.tmpl:23-33's disable confirm dialog — UNCONDITIONAL in
+                the template (it sits outside the {{if}}), rendered in both
+                arms byte-faithfully; in the not-enrolled arm it has no
+                trigger button, exactly upstream's inert markup. The
+                account-links dialog's no-JS posture applies verbatim. */}
+            <dialog class="modal-dialog" id="disable-twofa">
+              <div class="header">
+                <Icon name="octicon-trash" /> {userSettingsSecurityLocale.twofa_disable}
+              </div>
+              <div class="content">
+                <p>{userSettingsSecurityLocale.twofa_disable_desc}</p>
+              </div>
+              <div class="actions">
+                <button type="button" class="ui cancel button">
+                  {userSettingsSecurityLocale.modal_no}
+                </button>
+                <button type="submit" class="ui primary ok button">
+                  {userSettingsSecurityLocale.modal_yes}
+                </button>
+              </div>
+            </dialog>
+            {/* security.tmpl:6's webauthn include — LIVE (the WebAuthn unit;
+                migration 0060's store + the webauthn.ts endpoints). */}
+            <WebAuthnSection data={data} />
+            {/* security.tmpl:9-12's openid include: UNRENDERED (no
+                user_openid store/ops — the module header). */}
             {data.accountLinks.length > 0 || data.linkButtons.length > 0 ? (
               <AccountLinksSection data={data} />
             ) : null}
@@ -452,6 +610,153 @@ function AccountLinksSection(props: { data: UserSettingsSecurityPageData }) {
           </div>
           <div class="content">
             <p>{userSettingsSecurityLocale.remove_account_link_desc}</p>
+          </div>
+          <div class="actions">
+            <button type="button" class="ui cancel button">
+              {userSettingsSecurityLocale.modal_no}
+            </button>
+            <button type="submit" class="ui primary ok button">
+              {userSettingsSecurityLocale.modal_yes}
+            </button>
+          </div>
+        </dialog>
+      </div>
+    </>
+  );
+}
+
+/** The WebAuthn section (webauthn.tmpl + webauthn_error.tmpl at the pin —
+ *  the WebAuthn unit). The registration ceremony is JS-only upstream (the
+ *  `#register-webauthn` button is type="button"); the VENDORED bundle's
+ *  initUserAuthWebAuthnRegister is its driver — it reads `#nickname`,
+ *  `#register-webauthn` and the `#webauthn-error` box below and POSTs the
+ *  webauthn.ts endpoints, so the markup here is a WIRE CONTRACT (ids, the
+ *  wrapping `div.field`, the data-webauthn-error-msg spans). Rename is
+ *  upstream's JS-only modal (show-modal + form-fetch), rendered verbatim;
+ *  Delete reduces to the house plain-form POST (the account-links Remove
+ *  idiom — upstream's link-action is JS-driven) with the dialog hook
+ *  preserved. */
+function WebAuthnSection(props: { data: UserSettingsSecurityPageData }) {
+  const { data } = props;
+  return (
+    <>
+      <h4 class="ui top attached header">{userSettingsSecurityLocale.webauthn}</h4>
+      <div class="ui attached segment">
+        {/* webauthn.tmpl:3's desc — the template's link rendered as an
+            anchor (the no-raw-HTML rule). */}
+        <p>
+          {userSettingsSecurityLocale.webauthn_desc_prefix}{" "}
+          <a rel="noreferrer" target="_blank" href="https://w3c.github.io/webauthn/#webauthn-authenticator">
+            {userSettingsSecurityLocale.webauthn_desc_link}
+          </a>
+          .
+        </p>
+        <p>
+          {userSettingsSecurityLocale.webauthn_key_loss_warning} {userSettingsSecurityLocale.webauthn_alternative_tip}
+        </p>
+        {/* webauthn_error.tmpl — the bundle's webAuthnError() fills this
+            box (the prompt page's twin markup). */}
+        <div id="webauthn-error" class="ui negative message tw-hidden">
+          <div class="header">{userSettingsSecurityLocale.webauthn_error}</div>
+          <div id="webauthn-error-msg" class="tw-pt-2"></div>
+          <div class="tw-hidden">
+            <div data-webauthn-error-msg="browser">{userSettingsSecurityLocale.webauthn_unsupported_browser}</div>
+            <div data-webauthn-error-msg="unknown">{userSettingsSecurityLocale.webauthn_error_unknown}</div>
+            <div data-webauthn-error-msg="insecure">{userSettingsSecurityLocale.webauthn_error_insecure}</div>
+            <div data-webauthn-error-msg="unable-to-process">{userSettingsSecurityLocale.webauthn_error_unable_to_process}</div>
+            <div data-webauthn-error-msg="duplicated">{userSettingsSecurityLocale.webauthn_error_duplicated}</div>
+            <div data-webauthn-error-msg="empty">{userSettingsSecurityLocale.webauthn_error_empty}</div>
+            <div data-webauthn-error-msg="timeout">{userSettingsSecurityLocale.webauthn_error_timeout}</div>
+          </div>
+        </div>
+        <div class="flex-divided-list items-with-main">
+          {data.webauthnCredentials.map((cred) => (
+            <div class="item">
+              <div class="item-leading">
+                {/* octicon-key is outside the generated allowlist — the
+                    settings-keys shield-lock substitute (the house rule). */}
+                <Icon name="octicon-shield-lock" size={32} />
+              </div>
+              <div class="item-main">
+                <div class="item-title">{cred.name}</div>
+                <div class="item-body">
+                  <i>
+                    {userSettingsSecurityLocale.added_on} {formatKeyDate(cred.createdUnix)}
+                  </i>
+                </div>
+              </div>
+              <div class="item-trailing">
+                {/* webauthn.tmpl:21-24's rename trigger — the bundle's
+                    show-modal machinery opens the dialog and copies the
+                    data-modal-id/name onto the form inputs. */}
+                <button
+                  type="button"
+                  class="ui tiny button show-modal"
+                  data-modal="#rename-webauthn-nickname"
+                  data-modal-id={String(cred.id)}
+                  data-modal-name={cred.name}
+                >
+                  {userSettingsSecurityLocale.rename}
+                </button>
+                {/* The plain-form delete POST (the no-JS reduction — the
+                    module header); the dialog hook preserved. */}
+                <form action="/user/settings/security/webauthn/delete" method="post">
+                  <input type="hidden" name="id" value={String(cred.id)} />
+                  <button type="submit" class="ui red tiny button" data-modal-confirm="#delete-registration">
+                    {userSettingsSecurityLocale.remove}
+                  </button>
+                </form>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div class="ui attached segment">
+        <div class="ui form">
+          {/* webauthn.tmpl:35-40's register form — the `div.field` wrap and
+              both ids are the bundle's selectors (webAuthnRegisterRequest
+              reads `#nickname`, its `.closest('div.field')`, and
+              `#register-webauthn`). */}
+          <div class="required field">
+            <label for="nickname">{userSettingsSecurityLocale.webauthn_nickname}</label>
+            <input id="nickname" name="nickname" type="text" required />
+          </div>
+          <button type="button" id="register-webauthn" class="ui primary button">
+            <Icon name="octicon-shield-lock" /> {userSettingsSecurityLocale.webauthn_register_key}
+          </button>
+        </div>
+        {/* webauthn.tmpl:43-56's rename dialog — the form-fetch POST the
+            bundle intercepts (upstream-exact JSON arms on the endpoint). */}
+        <dialog class="modal-dialog" id="rename-webauthn-nickname">
+          <div class="header">
+            <Icon name="octicon-pencil" />
+            {userSettingsSecurityLocale.rename}
+          </div>
+          <form class="content ui form form-fetch-action" action="/user/settings/security/webauthn/rename" method="post">
+            <input type="hidden" name="id" />
+            <div class="required field">
+              <label>{userSettingsSecurityLocale.webauthn_nickname}</label>
+              <input name="name" type="text" maxlength={255} required />
+            </div>
+            <div class="actions">
+              <button type="button" class="ui cancel button">
+                {userSettingsSecurityLocale.modal_no}
+              </button>
+              <button type="submit" class="ui primary ok button">
+                {userSettingsSecurityLocale.modal_yes}
+              </button>
+            </div>
+          </form>
+        </dialog>
+        {/* webauthn.tmpl:58-66's delete confirm dialog — inert no-JS
+            (the working control is the per-row form above), the
+            account-links dialog posture. */}
+        <dialog class="modal-dialog" id="delete-registration">
+          <div class="header">
+            <Icon name="octicon-trash" /> {userSettingsSecurityLocale.webauthn_delete_key}
+          </div>
+          <div class="content">
+            <p>{userSettingsSecurityLocale.webauthn_delete_key_desc}</p>
           </div>
           <div class="actions">
             <button type="button" class="ui cancel button">

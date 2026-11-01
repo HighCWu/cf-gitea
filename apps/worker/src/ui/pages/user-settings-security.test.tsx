@@ -22,6 +22,7 @@ import { renderToString } from "hono/jsx/dom/server";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { runA11y } from "../__tests__/a11y";
+import { cborEncode } from "../../web/webauthn-fixtures";
 import { serializeOAuth2SourceConfig } from "../../services/auth-sources/cfg";
 import {
   createLoginSource,
@@ -69,6 +70,8 @@ beforeEach(async () => {
   await env.DB.prepare("DELETE FROM users").run();
   await env.DB.prepare("DELETE FROM external_login_user").run();
   await env.DB.prepare("DELETE FROM login_source").run();
+  await env.DB.prepare("DELETE FROM two_factor").run(); // the 2FA arms' clean slate (the enrolled describes re-seed)
+  await env.DB.prepare("DELETE FROM webauthn_credentials").run(); // the webauthn arms' clean slate (the enrolled describe re-seeds)
   await env.DB.prepare(
     "INSERT INTO users (id, username, username_lower, display_name, created_at) VALUES (1, 'alice', 'alice', 'Alice Doe', unixepoch())",
   ).run();
@@ -100,13 +103,26 @@ async function seedSource(name: string, options: { isActive?: boolean; provider?
   return row;
 }
 
-// --- the loader (the derived posture) -----------------------------------------
+// --- the loader (the LIVE TOTP posture) ---------------------------------------
 
-describe("loadUserSettingsSecurityPageData (the derived TOTP posture)", () => {
-  it("answers not-enrolled with EMPTY link projections for every doer — no two_factor store exists (SPEC-0002 §1); a clean instance renders no section", async () => {
+describe("loadUserSettingsSecurityPageData (the live TOTP posture + the W5 projections)", () => {
+  it("answers not-enrolled with EMPTY link projections for a clean instance — the real two_factor read (HasTwoFactorByUID)", async () => {
     const clean = await loadUserSettingsSecurityPageData(env.DB, 1);
-    expect(clean).toEqual({ totpEnrolled: false, accountLinks: [], linkButtons: [] });
-    expect(await loadUserSettingsSecurityPageData(env.DB, 999)).toEqual({ totpEnrolled: false, accountLinks: [], linkButtons: [] });
+    expect(clean).toEqual({ totpEnrolled: false, accountLinks: [], linkButtons: [], webauthnCredentials: [] });
+    expect(await loadUserSettingsSecurityPageData(env.DB, 999)).toEqual({
+      totpEnrolled: false,
+      accountLinks: [],
+      linkButtons: [],
+      webauthnCredentials: [],
+    });
+  });
+
+  it("answers enrolled when the doer's two_factor row exists (the 2FA unit's flip)", async () => {
+    await env.DB.prepare(
+      "INSERT INTO two_factor (user_id, secret, scratch_salt, scratch_hash, last_used_passcode_period, created_unix, updated_unix) VALUES (1, 'JBSWY3DPEHPK3PXP', 'salt', 'hash', 0, unixepoch(), unixepoch())",
+    ).run();
+    const data = await loadUserSettingsSecurityPageData(env.DB, 1);
+    expect(data.totpEnrolled).toBe(true);
   });
 
   it("projects the doer's links joined to their sources, login_source_id DESC (security.go's OrderBy)", async () => {
@@ -160,27 +176,42 @@ describe("the security page DOM (security.tmpl + twofa.tmpl at the pin)", () => 
     expect(html).toContain("user-setting-content"); // security.tmpl:3's wrapper
   });
 
-  it("renders the not-enrolled posture arm's three paragraphs (twofa.tmpl:16-22)", async () => {
+  it("renders the not-enrolled arm's paragraphs plus the LIVE Enroll button (twofa.tmpl:16-22)", async () => {
     const html = await pageHtml();
     expect(html).toContain("ui top attached header"); // twofa.tmpl:1
     expect(html).toContain(userSettingsSecurityLocale.twofa);
     expect(html).toContain(userSettingsSecurityLocale.twofa_desc.replaceAll('"', "&quot;")); // the escaped render
     expect(html).toContain(userSettingsSecurityLocale.twofa_recovery_tip);
     expect(html).toContain(userSettingsSecurityLocale.twofa_not_enrolled);
+    // the enroll arm is LIVE now (the dead-link rule retired with the
+    // enroll page): the button anchors the enroll route
+    expect(html).toContain('href="/user/settings/security/two_factor/enroll"');
+    expect(html).toContain(userSettingsSecurityLocale.twofa_enroll_button);
   });
 
-  it("renders no dead controls — no enroll link, no settings forms, no modals", async () => {
+  it("STALE-PIN FLIP (the 2FA unit): the not-enrolled arm carries the enroll link and the inert dialog — the enrolled arm's FORMS stay absent", async () => {
+    // The wave-56 pin ("no two_factor anywhere") is retired: the store
+    // exists, the enroll page exists, and upstream's #disable-twofa dialog
+    // renders UNCONDITIONALLY (twofa.tmpl sits it outside the {{if}}) —
+    // inert no-JS exactly like the accountlinks dialog's markup.
     const html = await pageHtml();
-    expect(html).not.toContain("two_factor"); // the enroll/regenerate/disable arms
-    expect(html).not.toContain('action="/user/settings/security'); // no upstream form arm targets the group
-    expect(html).not.toContain("show-modal"); // the #disable-twofa dialog pair
-    expect(html).not.toContain("<dialog");
+    expect(html).toContain('href="/user/settings/security/two_factor/enroll"'); // the LIVE enroll arm
+    expect(html).not.toContain('action="/user/settings/security/two_factor/regenerate_scratch"'); // the enrolled arm's forms
+    expect(html).not.toContain('action="/user/settings/security/two_factor/disable"');
+    expect(html).toContain('id="disable-twofa"'); // upstream's unconditional dialog (inert, no trigger here)
+    expect(html).toContain(userSettingsSecurityLocale.twofa_disable_desc);
   });
 
-  it("renders none of the store-less sections (webauthn/accountlinks/openid) — the W5 guard's EMPTY arm", async () => {
+  it("the not-enrolled render (with the new dialog bytes) passes the a11y smoke", async () => {
+    const data = await loadUserSettingsSecurityPageData(env.DB, 1);
+    const html = renderUserSettingsSecurityPage(ctx, data);
+    expect(runA11y(html)).toEqual([]);
+  });
+
+  it("renders the webauthn section LIVE and none of the store-less sections (accountlinks/openid) — the W5 guard's EMPTY arm (the webauthn pin flipped: the WebAuthn unit's section is live)", async () => {
     const html = await pageHtml();
-    expect(html).not.toContain("webauthn");
-    expect(html).not.toContain("WebAuthn");
+    expect(html).toContain(userSettingsSecurityLocale.webauthn); // webauthn.tmpl's header — LIVE
+    expect(html).toContain('id="register-webauthn"'); // the vendored bundle's activation button
     expect(html).not.toContain("Linked Accounts"); // accountlinks.tmpl's header — the guard's both-operands-empty arm
     expect(html).not.toContain("OpenID");
   });
@@ -207,6 +238,62 @@ describe("the security page DOM (security.tmpl + twofa.tmpl at the pin)", () => 
     const secretsActive = renderToString(<UserSettingsNavbar active="secrets" />);
     expect(secretsActive).toContain('class="active item" href="/user/settings/actions/secrets"');
     expect(secretsActive).toContain("open"); // navbar.tmpl:40's open arm
+  });
+});
+
+// --- the ENROLLED arm (twofa.tmpl's {{if .TOTPEnrolled}} — the 2FA unit) -------
+
+describe("the enrolled arm (twofa.tmpl:6-14 + the disable dialog)", () => {
+  /** A live enrollment for doer 1 (the row shape is the seam's business —
+   *  here only the existence matters). */
+  async function seedEnrolled(): Promise<void> {
+    await env.DB.prepare("DELETE FROM two_factor").run();
+    await env.DB.prepare(
+      "INSERT INTO two_factor (user_id, secret, scratch_salt, scratch_hash, last_used_passcode_period, created_unix, updated_unix) VALUES (1, 'JBSWY3DPEHPK3PXP', 'salt', 'hash', 0, unixepoch(), unixepoch())",
+    ).run();
+  }
+
+  it("renders the enrolled line's <strong> emphasis (twofa.tmpl:6, the no-raw-HTML split)", async () => {
+    await seedEnrolled();
+    const html = await pageHtml();
+    expect(html).toContain(
+      `${userSettingsSecurityLocale.twofa_is_enrolled_prefix}<strong>${userSettingsSecurityLocale.twofa_is_enrolled_strong}</strong>${userSettingsSecurityLocale.twofa_is_enrolled_suffix}`,
+    );
+    expect(html).not.toContain(userSettingsSecurityLocale.twofa_not_enrolled); // the other arm's text
+  });
+
+  it("renders the regenerate form (twofa.tmpl:7-10, the multipart enctype dropped) and the disable form with the REQUIRED passcode", async () => {
+    await seedEnrolled();
+    const html = await pageHtml();
+    expect(html).toContain(
+      '<form class="ui form" action="/user/settings/security/two_factor/regenerate_scratch" method="post">',
+    );
+    expect(html).toContain(userSettingsSecurityLocale.regenerate_scratch_token_desc);
+    expect(html).toContain(userSettingsSecurityLocale.twofa_scratch_token_regenerate);
+    // THE MISSION'S DIVERGENCE: the disable form demands a code (upstream
+    // is a bare dialog) — the one-time-code autocomplete, required.
+    expect(html).toContain('<form class="ui form form-fetch-action" action="/user/settings/security/two_factor/disable" method="post">');
+    expect(html).toContain(userSettingsSecurityLocale.twofa_disable_note);
+    expect(html).toContain('id="disable-passcode" name="passcode"');
+    expect(html).toContain('autocomplete="one-time-code"');
+    expect(html).toContain('data-modal-confirm="#disable-twofa"');
+    expect(html).toContain(userSettingsSecurityLocale.twofa_disable);
+  });
+
+  it("the disable dialog bytes render (upstream's unconditional markup)", async () => {
+    await seedEnrolled();
+    const html = await pageHtml();
+    expect(html).toContain('<dialog class="modal-dialog" id="disable-twofa">');
+    expect(html).toContain(userSettingsSecurityLocale.twofa_disable_desc);
+    expect(html).toContain(userSettingsSecurityLocale.modal_no);
+    expect(html).toContain(userSettingsSecurityLocale.modal_yes);
+  });
+
+  it("the enrolled render passes the a11y smoke", async () => {
+    await seedEnrolled();
+    const data = await loadUserSettingsSecurityPageData(env.DB, 1);
+    const html = renderUserSettingsSecurityPage(ctx, data);
+    expect(runA11y(html)).toEqual([]);
   });
 });
 
@@ -244,7 +331,7 @@ describe("the W5 account-links section (accountlinks.tmpl)", () => {
     expect(html).toContain(userSettingsSecurityLocale.manage_account_links);
     expect(html).toContain('href="/user/oauth2/gh-hub"');
     expect(html).toContain("GitHub");
-    expect(html).not.toContain('name="id"'); // no rows — no Remove forms
+    expect(html).not.toContain('action="/user/settings/security/account_link"'); // no link rows — no Remove forms
     expect(html).toContain(userSettingsSecurityLocale.manage_account_links_desc); // the desc item renders
   });
 
@@ -265,7 +352,7 @@ describe("the W5 account-links section (accountlinks.tmpl)", () => {
   });
 
   it("the notice option renders the unlink POST's re-render slot (the negative kind)", () => {
-    const html = renderUserSettingsSecurityPage(ctx, { totpEnrolled: false, accountLinks: [], linkButtons: [] }, {
+    const html = renderUserSettingsSecurityPage(ctx, { totpEnrolled: false, accountLinks: [], linkButtons: [], webauthnCredentials: [] }, {
       notice: { kind: "negative", message: userSettingsSecurityLocale.unlink_missing },
     });
     expect(html).toContain('class="ui negative message"');
@@ -329,29 +416,83 @@ describe("the security page DOM (security.tmpl + twofa.tmpl at the pin)", () => 
     expect(html).toContain("user-setting-content"); // security.tmpl:3's wrapper
   });
 
-  it("renders the not-enrolled posture arm's three paragraphs (twofa.tmpl:16-22)", async () => {
+  it("renders the not-enrolled arm's paragraphs plus the LIVE Enroll button (twofa.tmpl:16-22)", async () => {
     const html = await pageHtml();
     expect(html).toContain("ui top attached header"); // twofa.tmpl:1
     expect(html).toContain(userSettingsSecurityLocale.twofa);
     expect(html).toContain(userSettingsSecurityLocale.twofa_desc.replaceAll('"', "&quot;")); // the escaped render
     expect(html).toContain(userSettingsSecurityLocale.twofa_recovery_tip);
     expect(html).toContain(userSettingsSecurityLocale.twofa_not_enrolled);
+    // the enroll arm is LIVE now (the dead-link rule retired with the
+    // enroll page): the button anchors the enroll route
+    expect(html).toContain('href="/user/settings/security/two_factor/enroll"');
+    expect(html).toContain(userSettingsSecurityLocale.twofa_enroll_button);
   });
 
-  it("renders no dead controls — no enroll link, no settings forms, no modals", async () => {
+  it("STALE-PIN FLIP (the 2FA unit): the not-enrolled arm carries the enroll link and the inert dialog — the enrolled arm's FORMS stay absent", async () => {
+    // The wave-56 pin ("no two_factor anywhere") is retired: the store
+    // exists, the enroll page exists, and upstream's #disable-twofa dialog
+    // renders UNCONDITIONALLY (twofa.tmpl sits it outside the {{if}}) —
+    // inert no-JS exactly like the accountlinks dialog's markup.
     const html = await pageHtml();
-    expect(html).not.toContain("two_factor"); // the enroll/regenerate/disable arms
-    expect(html).not.toContain('action="/user/settings/security'); // no upstream form arm targets the group
-    expect(html).not.toContain("show-modal"); // the #disable-twofa dialog pair
-    expect(html).not.toContain("<dialog");
+    expect(html).toContain('href="/user/settings/security/two_factor/enroll"'); // the LIVE enroll arm
+    expect(html).not.toContain('action="/user/settings/security/two_factor/regenerate_scratch"'); // the enrolled arm's forms
+    expect(html).not.toContain('action="/user/settings/security/two_factor/disable"');
+    expect(html).toContain('id="disable-twofa"'); // upstream's unconditional dialog (inert, no trigger here)
+    expect(html).toContain(userSettingsSecurityLocale.twofa_disable_desc);
   });
 
-  it("renders none of the store-less sections (webauthn/accountlinks/openid)", async () => {
+  it("the not-enrolled render (with the new dialog bytes) passes the a11y smoke", async () => {
+    const data = await loadUserSettingsSecurityPageData(env.DB, 1);
+    const html = renderUserSettingsSecurityPage(ctx, data);
+    expect(runA11y(html)).toEqual([]);
+  });
+
+  it("renders the webauthn section LIVE and none of the store-less sections (accountlinks/openid) (the webauthn pin flipped: the WebAuthn unit's section is live)", async () => {
     const html = await pageHtml();
-    expect(html).not.toContain("webauthn");
-    expect(html).not.toContain("WebAuthn");
+    expect(html).toContain(userSettingsSecurityLocale.webauthn); // webauthn.tmpl's header — LIVE
     expect(html).not.toContain("Linked Accounts"); // accountlinks.tmpl's header — its guard renders nothing
     expect(html).not.toContain("OpenID");
+  });
+
+  it("the webauthn section renders the register entry with an EMPTY key list (the enrolled arm stays absent)", async () => {
+    const html = await pageHtml();
+    expect(html).toContain('id="register-webauthn"'); // the bundle's activation button
+    expect(html).toContain('id="nickname"'); // webAuthnRegisterRequest's input
+    expect(html).toContain('id="webauthn-error"'); // the error box the bundle fills
+    expect(html).toContain('data-webauthn-error-msg="duplicated"'); // the error ladder's typed spans
+    expect(html).not.toContain('action="/user/settings/security/webauthn/delete"'); // no keys — no delete forms
+  });
+
+  it("the enrolled render lists the keys with the delete forms and the rename dialog (webauthn.tmpl's rows)", async () => {
+    // The store parses the COSE key on read — the fixture carries a
+    // well-formed EC2 map (parse-only; the coordinates are dummies).
+    const coseKey = cborEncode(
+      new Map<number, number | Uint8Array>([
+        [1, 2],
+        [3, -7],
+        [-1, 1],
+        [-2, new Uint8Array(32).fill(1)],
+        [-3, new Uint8Array(32).fill(2)],
+      ]),
+    );
+    const sec = Math.floor(Date.now() / 1000);
+    await env.DB
+      .prepare(
+        "INSERT INTO webauthn_credentials (user_id, name, lower_name, credential_id, public_key, attestation_type, aaguid, sign_count, clone_warning, created_unix, updated_unix) VALUES (1, 'Work Key', 'work key', x'C0FFEE', ?, 'none', NULL, 4, 0, ?, ?)",
+      )
+      .bind(coseKey, sec, sec)
+      .run();
+    const data = await loadUserSettingsSecurityPageData(env.DB, 1);
+    expect(data.webauthnCredentials).toHaveLength(1);
+    expect(data.webauthnCredentials[0]?.name).toBe("Work Key");
+    const html = await pageHtml();
+    expect(html).toContain("Work Key"); // the item-title
+    expect(html).toContain("Added on"); // settings.added_on
+    expect(html).toContain('action="/user/settings/security/webauthn/delete"'); // the plain-form remove
+    expect(html).toContain('data-modal="#rename-webauthn-nickname"'); // the show-modal trigger
+    expect(html).toContain('id="rename-webauthn-nickname"'); // the dialog
+    expect(html).toContain('id="delete-registration"'); // the delete confirm dialog
   });
 
   it("the full-document render path matches the component path", async () => {

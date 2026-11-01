@@ -11,7 +11,25 @@
  *                   the cookie stays, the redirect lands on /-/admin; NO
  *                   unimpersonate route exists at the pin)
  *
- * Both routes are TOP-LEVEL (§2.1): the dispatcher needs no route-table
+ * plus THE 2FA GATE (the TOTP unit — upstream routers/web/auth/2fa.go over
+ * web.go:600-604's group; the pages live in ./pages/twofa):
+ *
+ *   GET  /user/two_factor         — the passcode page (a valid pending-2FA
+ *                                    ticket required; upstream's "in a 2FA
+ *                                    session" precondition)
+ *   POST /user/two_factor         — verify + CONSUME the passcode → mint
+ *   GET  /user/two_factor/scratch — the scratch-code page
+ *   POST /user/two_factor/scratch — verify + BURN the scratch code → mint
+ *                                    → 303 /user/settings/security
+ *
+ * The gate inserts between password-accept and session-mint (auth.go:330-349):
+ * an enrolled doer's POST /login does NOT mint — the pending principal
+ * travels in the signed `gitea_twofa` ticket cookie (upstream parks
+ * `twofaUid`/`twofaRemember` in its server-side session; the sessions
+ * schema carries no arbitrary keys, so the ticket — HMAC'd by the shared
+ * instance secret — plays that role; see src/auth/two-factor.ts's header).
+ *
+ * All routes are TOP-LEVEL (§2.1): the dispatcher needs no route-table
  * change — they are not repo-scoped (segments.length < 2), fall through to
  * `app.fetch`, and this router claims them. Registration (orchestrator-owned
  * `src/index.ts`, next to the uiRouter mount):
@@ -37,6 +55,28 @@
  * role verbatim (§2.3) — and our web login lives at `/login` (upstream:
  * `/user/login`, §2.1).
  *
+ * ## The gate's recorded divergences (the 2FA unit)
+ *
+ *   - The gate POSTs carry NO failure limiter — upstream's TwoFactorPost
+ *     has none either (the signed ticket, unforgeable without the instance
+ *     secret, is the gate; the credential proof already happened at
+ *     POST /login). Failures re-render at 200, the house posture.
+ *   - Upstream's handleSignIn sets `KeyUserHasTwoFactorAuth` in the minted
+ *     session (auth.go:401-407); our sessions carry no arbitrary keys and
+ *     its only reader (`DoerNeedTwoFactorAuth`, context.go:208-212) guards
+ *     the ENFORCED-2FA posture (`setting.TwoFactorAuthEnforced`) which has
+ *     no var here — the key is omitted, nothing reads it.
+ *   - The not-in-a-2FA-session arms answer the 500 shell (upstream's
+ *     `ctx.ServerError("UserSignIn", errors.New("not in 2FA session"))`,
+ *     2fa.go:36-39/50-54/103-106/118-121 — the ServerError twin is
+ *     renderServerErrorShellResponse). A FULLY-signed-in visitor GETs the
+ *     gate pages → 303 "/" (performAutoLogin's already-authenticated arm,
+ *     auth.go:208-227 → redirectAfterAuth's default target).
+ *   - The scratch success lands on /user/settings/security with the
+ *     `twofa_scratch_used` info flash upstream (2fa.go:154-160); the flash
+ *     rides no wire in our no-JS shell (the W4 posture) — the redirect
+ *     itself is the destination.
+ *
  * ## §2.9 boundary
  *
  * Sessions never authorize `/api/v1` or git-HTTP: `resolveAuth`
@@ -58,14 +98,32 @@ import {
 } from "../auth/middleware";
 import { ScopeSet } from "../auth/scopes";
 import { TokenService } from "../auth/token-service";
+import {
+  clearTwofaSetCookie,
+  getTwoFactorByUid,
+  hasTwoFactorByUid,
+  mintPendingTicket,
+  regenerateScratchToken,
+  twofaCookieValue,
+  twofaSetCookie,
+  validateAndConsumeTotp,
+  verifyPendingTicket,
+  verifyScratchToken,
+  type PendingTwofaTicket,
+} from "../auth/two-factor";
 import { demoModeEnabled } from "../services/demo-sweep";
 import { allowSignup, initWindowOpen } from "../services/user-accounts";
 import { listActiveOAuth2Sources } from "../services/auth-sources/store";
+import { signCeremonyState, webAuthnPendingSetCookie } from "../web/webauthn-ceremony";
+import { hasCredentialsForUser } from "../web/webauthn-store";
 import { sessions, users } from "../db/schema";
+import { readUrlEncodedForm } from "./forms";
 import { assetsBinding, assetsNotBuilt } from "./index";
 import { locale } from "./locale";
 import { AssetBuildError, loadManifest } from "./manifest";
+import { renderServerErrorShellResponse } from "./not-found-response";
 import { oauth2LoginSourceButtons, renderLoginPage } from "./pages/login";
+import { renderTwofaGatePage, renderTwofaScratchPage, twofaLocale } from "./pages/twofa";
 import { shellAssetsFromManifest, type UiContext } from "./ui-context";
 
 // ---------------------------------------------------------------------------
@@ -198,12 +256,18 @@ export function clearSessionSetCookie(): string {
  *  wins). `null` when the header or the cookie is absent/empty — a request
  *  without the cookie is anonymous with ZERO D1 session reads (§2.4). */
 export function sessionCookieValue(req: Request): string | null {
+  return cookieValue(req, SESSION_COOKIE_NAME);
+}
+
+/** The named-cookie read behind both readers (first match wins, empty is
+ *  absent). */
+function cookieValue(req: Request, name: string): string | null {
   const header = req.headers.get("cookie");
   if (header === null) return null;
   for (const pair of header.split(";")) {
     const at = pair.indexOf("=");
     if (at < 0) continue;
-    if (pair.slice(0, at).trim() === SESSION_COOKIE_NAME) {
+    if (pair.slice(0, at).trim() === name) {
       const value = pair.slice(at + 1).trim();
       return value === "" ? null : value;
     }
@@ -707,6 +771,14 @@ function seeOther(location: string, setCookie?: string): Response {
   return new Response(null, { status: 303, headers });
 }
 
+/** The 303 with MULTIPLE Set-Cookie directives — the gate's mint arms (the
+ *  fresh `gitea_session` AND the pending-ticket clear ride one response). */
+function seeOtherCookies(location: string, setCookies: string[]): Response {
+  const headers = new Headers({ location });
+  for (const cookie of setCookies) headers.append("set-cookie", cookie);
+  return new Response(null, { status: 303, headers });
+}
+
 /** 429 + Retry-After in the gate's plain-text shape (`respond.ts
  *  rateLimited`) — SPEC-0010 §2.2 pins the machine-readable status for the
  *  web surface (the gate's git-HTTP shape answers 403; here an active block
@@ -927,6 +999,53 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
     );
   }
 
+  // Step 4.5a (THE WEBAUTHN 2FA GATE — the disclosed hunk, the WebAuthn
+  // unit): a user with enrolled security keys does not get the session yet.
+  // Upstream handleTwoFactorRequired (routers/web/auth/auth.go:349-368)
+  // parks `twofaUid`/`twofaRemember` in the server-side session and 303s
+  // /user/webauthn; the carrier here is the signed `gitea_webauthn`
+  // PENDING cookie (web/webauthn-ceremony.ts's module header — the D1
+  // session row requires a signed-in user and this is the pre-auth step),
+  // carrying uid + the form's remember + the validated redirect target.
+  // The prompt page's vendored-bundle JS drives the assertion against
+  // src/web/webauthn.ts, which mints on success. The composition is
+  // upstream's own order (handleTwoFactorRequired: hasWebAuthn → /user/
+  // webauthn, ELSE /user/two_factor): the TOTP gate (step 4.5b below)
+  // answers only the users this check passes through.
+  if (await hasCredentialsForUser(c.env.DB, verified.user.id)) {
+    const pending = await signCeremonyState(c.env.DB, {
+      k: "pending",
+      uid: verified.user.id,
+      ch: "",
+      rem: form.remember,
+      to: safeRedirectTarget(form.redirectTo),
+    });
+    return seeOther("/user/webauthn", webAuthnPendingSetCookie(pending));
+  }
+
+  // Step 4.5 — THE 2FA GATE (upstream auth.go:330-349): an enrolled doer is
+  // NOT signed in yet. The pending principal, the form's remember decision
+  // and the validated redirect target travel in the signed ticket cookie
+  // (upstream: the pre-auth session's twofaUid/twofaRemember + the
+  // redirect_to cookie — one carrier here), and the flow continues at
+  // GET /user/two_factor. The limiter reset + the GC sweep still run (the
+  // credential proof SUCCEEDED — this is not a failure arm).
+  if (await hasTwoFactorByUid(c.env.DB, verified.user.id)) {
+    const ticket = await mintPendingTicket(
+      c.env.DB,
+      {
+        kind: "gate",
+        userId: verified.user.id,
+        remember: form.remember,
+        redirectTo: safeRedirectTarget(form.redirectTo),
+      },
+      now,
+    );
+    sink(limiterResetFailOpen(limiter, ip));
+    sink(sweepExpiredSessions(c.env.DB, now));
+    return seeOther("/user/two_factor", twofaSetCookie(ticket));
+  }
+
   // Step 5: mint row + cookie in one response; limiter reset + expired-row
   // sweep in waitUntil (§2.2 step 5). The form's `remember` rides the row:
   // rotations re-read it (§2.3 — upstream re-sets the remember cookie on
@@ -979,6 +1098,125 @@ async function logout(c: RouteContext): Promise<Response> {
 }
 
 // ---------------------------------------------------------------------------
+// The 2FA gate routes (upstream routers/web/auth/2fa.go over web.go:600-604)
+// — the pages render in the anonymous shell; every arm's authority is the
+// signed `gitea_twofa` ticket (the not-in-a-2FA-session arms are the 500
+// shell, upstream's ServerError).
+// ---------------------------------------------------------------------------
+
+/** The GET arms' shared ladder: a fully-signed-in visitor is already past
+ *  the gate (performAutoLogin's arm — 303 "/"); otherwise a valid GATE
+ *  ticket renders the page, anything else is upstream's ServerError. */
+async function gatePageResponse(
+  c: RouteContext,
+  render: (options: { ctx: UiContext; error: string | null }) => string,
+): Promise<Response> {
+  const sessionValue = sessionCookieValue(c.req.raw);
+  if (sessionValue !== null) {
+    const valid = await lookupValidSession(c.env.DB, sessionValue);
+    if (valid !== null) return seeOther("/");
+  }
+  const ticketValue = twofaCookieValue(c.req.raw);
+  const ticket = ticketValue === null ? null : await verifyPendingTicket(c.env.DB, ticketValue, "gate");
+  if (ticket === null) return renderServerErrorShellResponse(c.env, c.req.raw);
+  const assembled = await pageContext(c, { kind: "anonymous" });
+  if ("response" in assembled) return assembled.response;
+  return c.html(render({ ctx: assembled.ctx, error: null }), 200);
+}
+
+/** GET /user/two_factor (upstream TwoFactor, 2fa.go:28-42). */
+async function twofaPage(c: RouteContext): Promise<Response> {
+  return gatePageResponse(c, renderTwofaGatePage);
+}
+
+/** GET /user/two_factor/scratch (upstream TwoFactorScratch, 2fa.go:95-109). */
+async function twofaScratchPage(c: RouteContext): Promise<Response> {
+  return gatePageResponse(c, renderTwofaScratchPage);
+}
+
+/** The POST arms' shared prologue: same-origin (a non-GET UI write), then
+ *  the ticket. Upstream ServerErrors a missing/invalid 2FA session. */
+async function gateTicket(
+  c: RouteContext,
+): Promise<{ ticket: Extract<PendingTwofaTicket, { kind: "gate" }> } | { response: Response }> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return { response: guard };
+  const ticketValue = twofaCookieValue(c.req.raw);
+  const ticket = ticketValue === null ? null : await verifyPendingTicket(c.env.DB, ticketValue, "gate");
+  if (ticket === null || ticket.kind !== "gate") {
+    return { response: await renderServerErrorShellResponse(c.env, c.req.raw) };
+  }
+  return { ticket };
+}
+
+/** The gate failure re-render (200 + the inline message, the login posture;
+ *  NO limiter — upstream's TwoFactorPost has none, the ticket is the gate,
+ *  the module header's divergence note). */
+async function renderGateFailure(c: RouteContext, error: string): Promise<Response> {
+  const assembled = await pageContext(c, { kind: "anonymous" });
+  if ("response" in assembled) return assembled.response;
+  return c.html(renderTwofaGatePage({ ctx: assembled.ctx, error }), 200);
+}
+
+async function renderScratchFailure(c: RouteContext, error: string): Promise<Response> {
+  const assembled = await pageContext(c, { kind: "anonymous" });
+  if ("response" in assembled) return assembled.response;
+  return c.html(renderTwofaScratchPage({ ctx: assembled.ctx, error }), 200);
+}
+
+/** POST /user/two_factor (upstream TwoFactorPost, 2fa.go:45-92): verify AND
+ *  consume the passcode (the replay guard), then mint — upstream's
+ *  handleSignIn (KeyUserHasTwoFactorAuth omitted, the module header) — and
+ *  land on the ticket's validated redirect (consumeAuthRedirectLink's
+ *  carried target). The ticket dies with the mint (upstream's session
+ *  regeneration wipes twofaUid). */
+async function twofaSubmit(c: RouteContext): Promise<Response> {
+  const g = await gateTicket(c);
+  if ("response" in g) return g.response;
+  const row = await getTwoFactorByUid(c.env.DB, g.ticket.userId);
+  if (row === null) return renderServerErrorShellResponse(c.env, c.req.raw); // upstream: GetTwoFactorByUID error → ServerError
+
+  const form = await readUrlEncodedForm(c.req.raw);
+  const passcode = form.get("passcode") ?? "";
+  const now = new Date();
+  if (await validateAndConsumeTotp(c.env.DB, row, passcode, { now })) {
+    // Upstream records audit UserAuthenticationFailTwoFactor on the FAILURE
+    // arm (2fa.go:87-89) — unregistered in the audit registry, not emitted
+    // (the account-link unload precedent).
+    const cookieValue = await mintSession(c.env.DB, g.ticket.userId, { now, remember: g.ticket.remember });
+    return seeOtherCookies(safeRedirectTarget(g.ticket.redirectTo), [
+      sessionSetCookie(cookieValue, g.ticket.remember),
+      clearTwofaSetCookie(),
+    ]);
+  }
+  return renderGateFailure(c, twofaLocale.passcode_incorrect);
+}
+
+/** POST /user/two_factor/scratch (upstream TwoFactorScratchPost,
+ *  2fa.go:112-164): verify the scratch code, BURN it (regenerate), mint,
+ *  and land on /user/settings/security (upstream's redirect — the flash
+ *  dropped per the module header). */
+async function twofaScratchSubmit(c: RouteContext): Promise<Response> {
+  const g = await gateTicket(c);
+  if ("response" in g) return g.response;
+  const row = await getTwoFactorByUid(c.env.DB, g.ticket.userId);
+  if (row === null) return renderServerErrorShellResponse(c.env, c.req.raw);
+
+  const form = await readUrlEncodedForm(c.req.raw);
+  const token = form.get("token") ?? "";
+  if (await verifyScratchToken(row, token)) {
+    const now = new Date();
+    await regenerateScratchToken(c.env.DB, row, { now }); // the single-use burn
+    const cookieValue = await mintSession(c.env.DB, g.ticket.userId, { now, remember: g.ticket.remember });
+    return seeOtherCookies("/user/settings/security", [
+      sessionSetCookie(cookieValue, g.ticket.remember),
+      clearTwofaSetCookie(),
+    ]);
+  }
+  return renderScratchFailure(c, twofaLocale.scratch_token_incorrect);
+}
+
+// ---------------------------------------------------------------------------
 // The router (§2.1) — mounted by the dispatcher next to the uiRouter:
 //   app.route("/", sessionRouter);
 // ---------------------------------------------------------------------------
@@ -988,3 +1226,8 @@ export const sessionRouter = new Hono<{ Bindings: Env }>();
 sessionRouter.get("/login", (c) => loginPage(c));
 sessionRouter.post("/login", (c) => loginSubmit(c));
 sessionRouter.post("/logout", (c) => logout(c));
+// The 2FA gate (web.go:600-604's group — statics, no uiRouter overlap).
+sessionRouter.get("/user/two_factor", (c) => twofaPage(c));
+sessionRouter.post("/user/two_factor", (c) => twofaSubmit(c));
+sessionRouter.get("/user/two_factor/scratch", (c) => twofaScratchPage(c));
+sessionRouter.post("/user/two_factor/scratch", (c) => twofaScratchSubmit(c));

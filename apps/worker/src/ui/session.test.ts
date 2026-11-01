@@ -43,6 +43,16 @@ import { Hono } from "hono";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { fnv1a32 } from "../auth/failure-limiter";
 import { sha256Hex } from "../auth/digest";
+import {
+  TWOFA_COOKIE_NAME,
+  applyTwofaEnrollment,
+  clearTwofaSetCookie,
+  generateTotpSecret,
+  getTwoFactorByUid,
+  mintPendingTicket,
+  verifyScratchToken,
+} from "../auth/two-factor";
+import { totpCode } from "../auth/totp";
 import { TokenService } from "../auth/token-service";
 import { authFailures, repositories, sessions, users } from "../db/schema";
 import { uiRouter, type UiAssetsFetcher } from "./index";
@@ -194,7 +204,10 @@ const failureCount = async (ip: string): Promise<number> =>
 beforeAll(applyAuthD1Migrations);
 
 beforeEach(async () => {
-  for (const table of ["sessions", "personal_access_tokens", "auth_failures", "repositories", "users"]) {
+  // `two_factor` rides the 2FA gate's ladder (the gate describe below);
+  // `system_keystore` is NOT wiped — the ticket HMAC key persists per-file
+  // (the module cache holds it anyway; self-consistent per test).
+  for (const table of ["sessions", "personal_access_tokens", "auth_failures", "repositories", "users", "two_factor"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
 });
@@ -1341,5 +1354,222 @@ describe("login page golden (deterministic render)", () => {
     const first = await request("/login");
     const second = await request("/login");
     expect(await second.text()).toBe(await first.text());
+  });
+});
+
+// ---------------------------------------------------------------------------------
+// THE 2FA GATE (the TOTP unit) — the login ladder over migration 0059's table:
+// no-2FA unchanged / gated → twofa page → passcode ok mints / scratch ok mints
+// / the replay guard. Upstream pin: routers/web/auth/2fa.go over web.go:600-604.
+// ---------------------------------------------------------------------------------
+
+/** Split a multi-directive Set-Cookie header into per-cookie maps (our
+ *  directives carry no Expires dates, so `, ` splits cleanly). */
+function setCookieMaps(response: Response): Map<string, Map<string, string>> {
+  const header = response.headers.get("set-cookie") ?? "";
+  const out = new Map<string, Map<string, string>>();
+  for (const directive of header.split(/, (?=[A-Za-z0-9_-]+=)/)) {
+    if (directive === "") continue;
+    const parts = directive.split(";").map((part) => part.trim());
+    const at = parts[0]?.indexOf("=") ?? -1;
+    if (at < 0) continue;
+    const name = parts[0]?.slice(0, at) ?? "";
+    const map = new Map<string, string>();
+    map.set(parts[0]?.slice(at + 1) ?? "", "");
+    for (const part of parts.slice(1)) {
+      const eq = part.indexOf("=");
+      if (eq < 0) map.set(part, "");
+      else map.set(part.slice(0, eq), part.slice(eq + 1));
+    }
+    out.set(name, map);
+  }
+  return out;
+}
+
+describe("the 2FA gate — the login ladder (2fa.go over web.go:600-604)", () => {
+  /** A login-able PAT for `user` + a live TOTP enrollment through the REAL
+   *  enrollment seam (the secret never touches a test constant). */
+  async function seedEnrolled(user: SeedUser, name = "web"): Promise<{ pat: string; secret: string; scratchToken: string }> {
+    const pat = await seedToken(user, name);
+    const secret = generateTotpSecret();
+    const ticket = await mintPendingTicket(env.DB, { kind: "enroll", secret });
+    const outcome = await applyTwofaEnrollment(env.DB, user.id, await totpCode(secret, Date.now() / 1000), ticket);
+    if (outcome.outcome !== "enrolled") throw new Error(`enroll fixture failed: ${outcome.outcome}`);
+    return { pat, secret, scratchToken: outcome.scratchToken };
+  }
+
+  /** Drive the gate to the twofa page: login POST → the 303 + ticket cookie. */
+  async function gateTicket(user: SeedUser, pat: string, extra: Record<string, string> = {}): Promise<string> {
+    const res = await request("/login", form({ password: pat, ...extra }));
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/user/two_factor");
+    const value = setCookieMaps(res).get(TWOFA_COOKIE_NAME);
+    expect(value).toBeDefined();
+    const ticket = [...(value?.keys() ?? [])][0] ?? "";
+    expect(ticket).toContain(".");
+    return ticket;
+  }
+
+  it("a NOT-enrolled user's login is byte-unchanged: direct mint, no twofa cookie", async () => {
+    const alice = await seedUser();
+    const pat = await seedToken(alice, "web");
+    const res = await request("/login", form({ password: pat }));
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/");
+    const cookies = setCookieMaps(res);
+    expect(cookies.has(SESSION_COOKIE_NAME)).toBe(true);
+    expect(cookies.has(TWOFA_COOKIE_NAME)).toBe(false);
+  });
+
+  it("an enrolled user's login does NOT mint — 303 /user/two_factor with the signed ticket (auth.go:330-349)", async () => {
+    const alice = await seedUser();
+    const { pat } = await seedEnrolled(alice);
+    const res = await request("/login", form({ password: pat, redirect_to: "/alice/repo" }));
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/user/two_factor");
+    const cookies = setCookieMaps(res);
+    expect(cookies.has(TWOFA_COOKIE_NAME)).toBe(true);
+    expect(cookies.has(SESSION_COOKIE_NAME)).toBe(false); // no session minted yet
+    expect((await drizzle(env.DB).select().from(sessions).all()).length).toBe(0);
+    // the credential proof SUCCEEDED: the limiter reset still ran (the gate
+    // login itself, same IP bucket, clears the counter)
+    const ip = "10.5.5.5";
+    for (let i = 0; i < 3; i++) await request("/login", form({ password: "nope" }, { "x-forwarded-for": ip }));
+    expect(await failureCount(ip)).toBe(3);
+    await request("/login", form({ password: pat }, { "x-forwarded-for": ip }));
+    expect(await failureCount(ip)).toBe(0);
+  });
+
+  it("GET /user/two_factor: the ticket renders the passcode form; no ticket is the 500 shell; a live session 303s /", async () => {
+    const alice = await seedUser();
+    const { pat } = await seedEnrolled(alice);
+    const ticket = await gateTicket(alice, pat);
+
+    const page = await request("/user/two_factor", { headers: { cookie: `${TWOFA_COOKIE_NAME}=${ticket}` } });
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).toContain('action="/user/two_factor"');
+    expect(html).toContain('autocomplete="one-time-code"');
+    expect(html).toContain('href="/user/two_factor/scratch"');
+
+    const naked = await request("/user/two_factor");
+    expect(naked.status).toBe(500); // upstream's ServerError "not in 2FA session"
+
+    // the fully-signed-in visitor (performAutoLogin's arm)
+    const sessionValue = await mintSession(env.DB, alice.id);
+    const signedIn = await request("/user/two_factor", { headers: { cookie: `${SESSION_COOKIE_NAME}=${sessionValue}` } });
+    expect(signedIn.status).toBe(303);
+    expect(signedIn.headers.get("location")).toBe("/");
+  });
+
+  it("the passcode ladder: wrong code re-renders at 200; the right code mints + clears the ticket + lands on the carried redirect", async () => {
+    const alice = await seedUser();
+    const { pat, secret } = await seedEnrolled(alice);
+    const ticket = await gateTicket(alice, pat, { redirect_to: "/alice/repo" });
+    const cookieHeader = `${TWOFA_COOKIE_NAME}=${ticket}`;
+
+    const wrong = await request("/user/two_factor", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: cookieHeader, origin: "https://test.local" },
+      body: new URLSearchParams({ passcode: "000000" }).toString(),
+    });
+    expect(wrong.status).toBe(200);
+    expect(await wrong.text()).toContain("Your passcode is incorrect");
+
+    const right = await request("/user/two_factor", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: cookieHeader, origin: "https://test.local" },
+      body: new URLSearchParams({ passcode: await totpCode(secret, Date.now() / 1000) }).toString(),
+    });
+    expect(right.status).toBe(303);
+    expect(right.headers.get("location")).toBe("/alice/repo"); // the login form's target, carried through the gate
+    const cookies = setCookieMaps(right);
+    const sessionCookie = cookies.get(SESSION_COOKIE_NAME);
+    expect(sessionCookie).toBeDefined();
+    expect(cookies.get(TWOFA_COOKIE_NAME)?.get("Max-Age")).toBe("0"); // the ticket cleared
+    // the minted session authenticates (the row + the digest agree)
+    const raw = [...(sessionCookie?.keys() ?? [])][0] ?? "";
+    const verification = await verifySession(env.DB, raw);
+    expect(verification.outcome).toBe("authenticated");
+    if (verification.outcome === "authenticated") expect(verification.user.id).toBe(alice.id);
+    // the passcode was CONSUMED
+    const row = await getTwoFactorByUid(env.DB, alice.id);
+    expect(row?.lastUsedPasscodePeriod).toBeGreaterThan(0);
+  });
+
+  it("the replay guard: a consumed passcode cannot mint a second session", async () => {
+    const alice = await seedUser();
+    const { pat, secret } = await seedEnrolled(alice);
+    const code = await totpCode(secret, Date.now() / 1000);
+
+    const ticket1 = await gateTicket(alice, pat);
+    const first = await request("/user/two_factor", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: `${TWOFA_COOKIE_NAME}=${ticket1}`, origin: "https://test.local" },
+      body: new URLSearchParams({ passcode: code }).toString(),
+    });
+    expect(first.status).toBe(303);
+
+    // a SECOND gate with the SAME code — the conditional UPDATE matches zero rows
+    const ticket2 = await gateTicket(alice, pat);
+    const second = await request("/user/two_factor", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: `${TWOFA_COOKIE_NAME}=${ticket2}`, origin: "https://test.local" },
+      body: new URLSearchParams({ passcode: code }).toString(),
+    });
+    expect(second.status).toBe(200); // rejected — the re-render, not a mint
+    expect(await second.text()).toContain("Your passcode is incorrect");
+    expect((await drizzle(env.DB).select().from(sessions).all()).length).toBe(1); // only the first mint
+  });
+
+  it("the scratch ladder: wrong token re-renders; the right token burns, mints, and lands on the security page", async () => {
+    const alice = await seedUser();
+    const { pat, scratchToken } = await seedEnrolled(alice, "remembered");
+    const ticket = await gateTicket(alice, pat, { remember: "on" });
+    const cookieHeader = `${TWOFA_COOKIE_NAME}=${ticket}`;
+
+    const wrong = await request("/user/two_factor/scratch", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: cookieHeader, origin: "https://test.local" },
+      body: new URLSearchParams({ token: "AAAAAAAAAA" }).toString(),
+    });
+    expect(wrong.status).toBe(200);
+    expect(await wrong.text()).toContain("Your scratch code is incorrect");
+
+    const right = await request("/user/two_factor/scratch", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: cookieHeader, origin: "https://test.local" },
+      body: new URLSearchParams({ token: scratchToken }).toString(),
+    });
+    expect(right.status).toBe(303);
+    expect(right.headers.get("location")).toBe("/user/settings/security"); // upstream's scratch destination
+    const cookies = setCookieMaps(right);
+    expect(cookies.get(SESSION_COOKIE_NAME)?.get("Max-Age")).toBe(String(REMEMBER_MAX_AGE_SECONDS)); // remember rode the gate
+    expect(cookies.get(TWOFA_COOKIE_NAME)?.get("Max-Age")).toBe("0");
+    // the burn: the enrollment's token no longer verifies (regenerated at mint)
+    const row = await getTwoFactorByUid(env.DB, alice.id);
+    expect(row).not.toBeNull();
+    expect(await verifyScratchToken(row as NonNullable<typeof row>, scratchToken)).toBe(false);
+  });
+
+  it("the gate POSTs guard the origin (the §2.8 layer-2 rule)", async () => {
+    const alice = await seedUser();
+    const { pat } = await seedEnrolled(alice);
+    const ticket = await gateTicket(alice, pat);
+    const res = await request("/user/two_factor", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: `${TWOFA_COOKIE_NAME}=${ticket}`, origin: "https://evil.example" },
+      body: new URLSearchParams({ passcode: "123456" }).toString(),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it("the ticket never authenticates anything by itself: a forged/tampered value is the 500 shell", async () => {
+    const alice = await seedUser();
+    await seedEnrolled(alice);
+    const res = await request("/user/two_factor", { headers: { cookie: `${TWOFA_COOKIE_NAME}=forged.berries` } });
+    expect(res.status).toBe(500);
+    // the clear directive's shape (a constant, pinned once here)
+    expect(clearTwofaSetCookie()).toBe(`${TWOFA_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`);
   });
 });

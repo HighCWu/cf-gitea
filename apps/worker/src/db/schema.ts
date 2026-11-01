@@ -4900,3 +4900,91 @@ export const twoFactor = sqliteTable(
   },
   (t) => [uniqueIndex("two_factor_uid_uq").on(t.userId)],
 );
+
+// ---------------------------------------------------------------------------
+// WebAuthn (upstream models/auth/webauthn.go — the security-key enrollment
+// substrate, migration 0060): the per-user public-key credentials the
+// registration ceremony stores and the login assertion + the settings
+// management list read.
+// ---------------------------------------------------------------------------
+
+/**
+ * WebAuthn credentials (upstream `webauthn_credential` — models/auth/
+ * webauthn.go:45-58, migration 0060). One row per enrolled security key /
+ * passkey: the COSE public key is the verification material every assertion
+ * checks against; `sign_count` is the clone-detection counter (the CAS on it
+ * is also the replay guard). Upstream's table name is SINGULAR (the
+ * `TableName()` override, webauthn.go:64-67); the plural here is the house
+ * convention (repositories/issues/sessions), recorded divergence.
+ *
+ * Column mapping (upstream xorm tags → here):
+ *   - `ID pk autoincr` → `id`.
+ *   - `Name` / `LowerName unique(s)` + `UserID INDEX unique(s)` → the
+ *     (user_id, lower_name) UNIQUE composite — upstream's names are unique
+ *     per user regardless of letter case (BeforeInsert/BeforeUpdate fold,
+ *     webauthn.go:76-88; GetWebAuthnCredentialByName's lookup key,
+ *     webauthn.go:142-150).
+ *   - `CredentialID VARBINARY(1024) INDEX` → `credential_id` BLOB with a
+ *     UNIQUE index (the orchestrator grant's shape; upstream keeps a plain
+ *     non-unique index — credential ids are globally unique by the WebAuthn
+ *     spec, and the unique index serves both the ByCredID login lookup
+ *     (webauthn.go:169-177) and duplicate-enrollment rejection).
+ *   - `PublicKey []byte` → `public_key` BLOB — the COSE key bytes.
+ *   - `AttestationType string` → `attestation_type` ("none" | "self" at
+ *     this backend — Gitea never verifies real attestation,
+ *     modules/auth/webauthn/webauthn.go:34).
+ *   - `AAGUID []byte` → `aaguid` BLOB (16 bytes; NULL for "none"-style
+ *     responses without attested data — not producible through the verify
+ *     ladder, kept nullable for row honesty).
+ *   - `SignCount uint32 BIGINT` → `sign_count` (upstream stores in a BIGINT
+ *     column; SQLite INTEGER covers uint32 natively).
+ *   - `CloneWarning bool` → `clone_warning` — set by the sign-count CAS
+ *     loser/replay path (upstream keeps it on the loaded struct only;
+ *     UpdateSignCount writes sign_count alone, webauthn.go:70-73 — recorded
+ *     divergence: the column is MAINTAINED here because the CAS is the
+ *     durable replay guard, and a persisted warning is observable parity
+ *     with the settings surface upstream never renders it through).
+ *   - `transports` — the mission's addition upstream does not store (the
+ *     browser's response.transports hint, useful for future allowCredentials
+ *     transports); JSON array, NULL when the client sent none.
+ *   - `CreatedUnix` / `UpdatedUnix` (INDEX created/updated) → `created_unix`
+ *     / `updated_unix` — the indexes NOT carried: no landed read filters or
+ *     orders by time (the settings list orders by pk upstream, Find's
+ *     default), the same index-audit drop discipline as login_source.
+ */
+export const webauthnCredentials = sqliteTable(
+  "webauthn_credentials",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Upstream `UserID` — the owning user. */
+    userId: integer("user_id").notNull(),
+    /** Upstream `Name` — the display nickname. */
+    name: text("name").notNull(),
+    /** Upstream `LowerName` — the case-folded uniqueness + lookup key. */
+    lowerName: text("lower_name").notNull(),
+    /** The credential id bytes (upstream `CredentialID`). Globally unique.
+     *  Bare blob() (the actions tables' posture — dispatch.ts asBytes): D1
+     *  returns bytes, the store coerces to Uint8Array. */
+    credentialId: blob("credential_id").notNull(),
+    /** The COSE public key bytes (upstream `PublicKey`). */
+    publicKey: blob("public_key").notNull(),
+    /** Upstream `AttestationType` — "none" | "self" at this backend. */
+    attestationType: text("attestation_type").notNull(),
+    /** Upstream `AAGUID` — the authenticator's 16-byte model id. */
+    aaguid: blob("aaguid"),
+    /** Upstream `SignCount` — the authenticator's monotonic counter. */
+    signCount: integer("sign_count").notNull().default(0),
+    /** The browser's `response.transports` hint, JSON array; NULL unset. */
+    transports: text("transports"),
+    /** Upstream `CloneWarning` — the sign-count CAS's durable flag. */
+    cloneWarning: integer("clone_warning", { mode: "boolean" }).notNull().default(false),
+    /** Upstream `CreatedUnix` (seconds). */
+    createdUnix: integer("created_unix").notNull(),
+    /** Upstream `UpdatedUnix` (seconds) — touched on rename/sign-count. */
+    updatedUnix: integer("updated_unix").notNull(),
+  },
+  (t) => [
+    uniqueIndex("webauthn_credentials_user_lower_name_uq").on(t.userId, t.lowerName),
+    uniqueIndex("webauthn_credentials_credential_id_uq").on(t.credentialId),
+  ],
+);
