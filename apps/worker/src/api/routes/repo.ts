@@ -849,7 +849,7 @@ export function registerRepoRoutes(
           throw new ApiError(404, "The new owner does not exist or cannot be found");
         }
       }
-      // The team ladder (transfer.go:76-98), verbatim — a `team_ids` list
+      // The team ladder (routers/api/v1/repo/transfer.go:79-101), verbatim — a `team_ids` list
       // (PRESENT per the Go `*opts.TeamIDs != nil` pointer semantics: an
       // empty array is present too, a bare `null` is schema-rejected before
       // this point) rides an ORG-bound transfer only. Arm order upstream:

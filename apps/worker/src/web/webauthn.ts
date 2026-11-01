@@ -472,9 +472,23 @@ async function passkeyLogin(c: RouteContext): Promise<Response> {
     }
     const outcome = await applyAssertionSignCount(c.env.DB, credential.id, credential.signCount, verified.signCount, false);
     if (outcome === "counter-moved") return jsonError(403, "cloned credential", clearChallenge);
-    // Upstream: `remember := false // TODO: implement remember me`.
+    // Upstream: `remember := false // TODO: implement remember me`. The
+    // passkey success is ALSO the completed sign-in (the handleSignInFull
+    // twin — upstream's session regenerates whole, auth.go:390-397, so a
+    // dual-park's parked twofaUid dies with it): the 2FA prompt's stale
+    // pending/assert carriers and the `gitea_twofa` gate ticket (session.ts's
+    // step 4.5a) clear beside the mint — the completed sign-in leaves no
+    // pre-auth carrier standing (the 2FA arm's template above; SPEC-0022
+    // §6's contract).
     const cookieValue = await mintSession(c.env.DB, uid, { remember: false });
-    return jsonOk({ redirect: "/" }, webAuthnClearCookie("passkey"), sessionSetCookie(cookieValue, false));
+    return jsonOk(
+      { redirect: "/" },
+      webAuthnClearCookie("passkey"),
+      webAuthnClearCookie("assert"),
+      webAuthnClearCookie("pending"),
+      clearTwofaSetCookie(),
+      sessionSetCookie(cookieValue, false),
+    );
   } catch (error) {
     if (error instanceof WebAuthnError) {
       return error.arm === "bad-request" ? jsonError(400, error.message, clearChallenge) : jsonError(403, error.message, clearChallenge);

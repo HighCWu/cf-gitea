@@ -321,10 +321,10 @@ export const repoTransfer = sqliteTable(
     // repositories table note). JSON id-list per the house convention
     // (protected_tags.allowlist_team_ids): `[]` when the target is a user —
     // upstream files `nil` there (teams can only ride an ORG-bound transfer,
-    // routers/api/v1/repo/transfer.go:77-80 422s the user-target arm before
+    // routers/api/v1/repo/transfer.go:80-84 422s the user-target arm before
     // anything is stored). Filing validates every id (team exists → 422
     // `team %d not found`, team.org_id matches the recipient org → 403
-    // `team %d belongs not to org %d`, transfer.go:82-96); the rows attach
+    // `team %d belongs not to org %d`, transfer.go:87-97); the rows attach
     // at ACCEPT (services/repository/transfer.go:346-352 →
     // addRepositoryToTeam per team) — vanished teams drop silently there
     // (LoadAttributes re-fetches by id, transfer.go:111-121).

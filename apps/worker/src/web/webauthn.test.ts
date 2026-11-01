@@ -18,7 +18,12 @@ import { TWOFA_COOKIE_NAME } from "../auth/two-factor";
 import { TokenService } from "../auth/token-service";
 import { users, webauthnCredentials } from "../db/schema";
 import { mintSession, SESSION_COOKIE_NAME, sessionRouter } from "../ui/session";
-import { signCeremonyState, verifyCeremonyState } from "./webauthn-ceremony";
+import {
+  signCeremonyState,
+  verifyCeremonyState,
+  WEBAUTHN_CHALLENGE_COOKIE_NAME,
+  WEBAUTHN_COOKIE_NAME,
+} from "./webauthn-ceremony";
 import { base64UrlEncode, sha256, webAuthnIdForUser } from "./webauthn-cose";
 import {
   buildAssertionResponse,
@@ -571,6 +576,49 @@ describe("the login family", () => {
       body: JSON.stringify(badHandle),
     });
     expect(res2.status).toBe(400);
+  });
+
+  it("the passkey success clears the dual-park carriers too (the completed sign-in leaves no pre-auth carrier)", async () => {
+    const user = await seedUser();
+    const cred = await enrollCredential(user.id);
+    const optionsRes = await req("/user/webauthn/passkey/assertion", { headers: { origin: ORIGIN } });
+    expect(optionsRes.status).toBe(200);
+    const assertCookie = (optionsRes.headers.get("set-cookie") ?? "").split(";")[0]!;
+    const state = await verifyCeremonyState(env.DB, decodeURIComponent(assertCookie.split("=").slice(1).join("=")), "passkey");
+
+    // A DUAL-ENROLLED user parked by the password arm arrives with BOTH
+    // carriers standing (the `gitea_twofa` gate ticket from session.ts's
+    // step 4.5a plus the webauthn prompt's pending/assert pair) — and then
+    // completes the DISCOVERABLE passkey login instead of the prompt.
+    const pending = await signCeremonyState(env.DB, { k: "pending", uid: user.id, ch: "", rem: false, to: "/dashboard" });
+    const staleAssert = await signCeremonyState(env.DB, { k: "assert", uid: user.id, ch: "" });
+    const body = await assertionBody(cred.credentialId, { challenge: state!.ch, userHandle: webAuthnIdForUser(user.id) });
+    const res = await req("/user/webauthn/passkey/login", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: ORIGIN,
+        // The LIVE passkey carrier rides FIRST — webAuthnCookieValue reads
+        // the first `gitea_webauthn_challenge` pair, so the stale assert
+        // carrier after it must not shadow the challenge.
+        cookie: `${assertCookie}; ${WEBAUTHN_COOKIE_NAME}=${encodeURIComponent(pending)}; ${WEBAUTHN_CHALLENGE_COOKIE_NAME}=${encodeURIComponent(staleAssert)}; ${TWOFA_COOKIE_NAME}=stale-gate-ticket`,
+      },
+      body: JSON.stringify(body),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json<{ redirect: string }>()).redirect).toBe("/");
+    // The mint lands AND every pre-auth carrier clears beside it (SPEC-0022
+    // §6's contract — upstream's handleSignInFull regenerates the session
+    // whole, so the parked twofaUid dies with it):
+    const sessions = await env.DB.prepare("SELECT count(*) AS n FROM sessions").all<{ n: number }>();
+    expect(sessions.results[0]?.n).toBe(1);
+    const cleared = res.headers.getSetCookie ? res.headers.getSetCookie() : [res.headers.get("set-cookie") ?? ""];
+    // The three webauthn clears (passkey + stale assert on the challenge
+    // name, stale pending on the identity name) + the parked `gitea_twofa`
+    // gate ticket:
+    expect(cleared.filter((value) => value.startsWith(`${WEBAUTHN_CHALLENGE_COOKIE_NAME}=; Path=/; Max-Age=0`)).length).toBe(2);
+    expect(cleared.some((value) => value.startsWith(`${WEBAUTHN_COOKIE_NAME}=; Path=/; Max-Age=0`))).toBe(true);
+    expect(cleared.some((value) => value.startsWith(`${TWOFA_COOKIE_NAME}=; Path=/; Max-Age=0`))).toBe(true);
   });
 
   it("the passkey arm enforces UV (the sole-factor rule): uv-less 403, uv-bearing 200; the 2FA arm stays preferred", async () => {
