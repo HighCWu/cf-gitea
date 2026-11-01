@@ -1,7 +1,8 @@
 /**
  * The editor tails' DEFERRED route-level matrix (window-2e C2b 1d834d6 — the
- * mounted tails: GET+POST /{owner}/{repo}/upload/*, /patch/*, /cherrypick/*
- * and the delete-confirm swap; driven over the mounted uiRouter on the
+ * mounted tails: GET+POST /{owner}/{repo}/upload/*, /patch/*, /_cherrypick/*,
+ * the staging POST pair /{owner}/{repo}/upload-{file,remove} and the
+ * delete-confirm swap; driven over the mounted uiRouter on the
  * notifications 28b71b9 matrix's minted-session pattern, the collaboration
  * f8c84fc matrix the freshest reference). The MODULE suites own the DOM
  * contracts and the commit arms at bench level (pages/repo-editor-tails
@@ -11,7 +12,8 @@
  *   - the claim pins: the three new tails parse their tail shapes, the
  *     cherrypick suffix is sha-gated (upstream web.go:1469's
  *     `{sha:([a-f0-9]{7,64})}` + required `/*` tail) and bare/underscored
- *     literals fall through to the engine;
+ *     literals fall through to the engine; the staging pair claims its bare
+ *     repo-scope literals (web.go:1473-1474) and nothing deeper;
  *   - the gates across all three mounted tails (the shared fileEditorGate):
  *     anonymous 303s carrying each requested path, anonymous same-origin
  *     POSTs 303ing with nothing written, the non-writer 404ing GET+POST
@@ -298,7 +300,9 @@ describe("claim pins (the sha-gated cherrypick suffix, the bare literals)", () =
       refSuffix: "main",
     });
     const sha = "abcdef0123456789abcdef0123456789abcdef01";
-    expect(parseUiRoute(`/octo/hello/cherrypick/${sha}/main/x`)).toEqual({
+    // The underscore literal IS upstream's spelling (web.go:1468's
+    // {editor_action:_cherrypick}; the commit page's emitted URL carries it).
+    expect(parseUiRoute(`/octo/hello/_cherrypick/${sha}/main/x`)).toEqual({
       family: "editor-cherrypick",
       owner: "octo",
       repo: "hello",
@@ -307,23 +311,26 @@ describe("claim pins (the sha-gated cherrypick suffix, the bare literals)", () =
     // The dispatcher's reach (§2.2) covers all three.
     expect(handlesUiRoute("/octo/hello/upload/main")).toBe(true);
     expect(handlesUiRoute("/octo/hello/patch/main")).toBe(true);
-    expect(handlesUiRoute("/octo/hello/cherrypick/abcdef0/main")).toBe(true); // the 7-hex minimum
+    expect(handlesUiRoute("/octo/hello/_cherrypick/abcdef0/main")).toBe(true); // the 7-hex minimum
   });
 
-  it("a malformed cherrypick suffix and the bare/underscored literals fall through to the engine", () => {
+  it("a malformed cherrypick suffix and the bare literals fall through to the engine", () => {
     // Upstream's `({sha:([a-f0-9]{7,64})})` gate + the required `/*` tail.
-    expect(parseUiRoute("/octo/hello/cherrypick/zzzzzz/main")).toBeNull(); // non-hex
-    expect(parseUiRoute("/octo/hello/cherrypick/abcdef/main")).toBeNull(); // 6 < 7 hex
-    expect(parseUiRoute(`/octo/hello/cherrypick/${GHOST_SHA}`)).toBeNull(); // no branch tail
+    expect(parseUiRoute("/octo/hello/_cherrypick/zzzzzz/main")).toBeNull(); // non-hex
+    expect(parseUiRoute("/octo/hello/_cherrypick/abcdef/main")).toBeNull(); // 6 < 7 hex
+    expect(parseUiRoute(`/octo/hello/_cherrypick/${GHOST_SHA}`)).toBeNull(); // no branch tail
     // Bare literals fall through (upstream chi requires the `/*` tail too).
     expect(parseUiRoute("/octo/hello/upload")).toBeNull();
     expect(parseUiRoute("/octo/hello/patch")).toBeNull();
-    expect(parseUiRoute("/octo/hello/cherrypick")).toBeNull();
-    // Upstream's underscored literals stay unclaimed (the family's brief pins
-    // the bare names — the file-editor matrix's twin arm).
+    expect(parseUiRoute("/octo/hello/_cherrypick")).toBeNull();
+    // The bare `cherrypick` head is NOT an editor_action — upstream's route
+    // is `_cherrypick` (web.go:1468), so every bare-literal shape stays
+    // engine-owned (the deep review's F5 flip).
+    expect(parseUiRoute(`/octo/hello/cherrypick/${GHOST_SHA}/main`)).toBeNull();
+    // The OTHER underscored editor literals stay unclaimed (the family's
+    // brief pins the bare names — the file-editor matrix's twin arm).
     expect(parseUiRoute("/octo/hello/_upload/main")).toBeNull();
     expect(parseUiRoute("/octo/hello/_diffpatch/main")).toBeNull();
-    expect(parseUiRoute(`/octo/hello/_cherrypick/${GHOST_SHA}/main`)).toBeNull();
   });
 });
 
@@ -340,10 +347,10 @@ describe("gates across the mounted tails (anon / non-writer / archived)", () => 
     expect(patch.status).toBe(303);
     expect(patch.headers.get("location")).toBe("/login?redirect_to=%2Falice%2Fedittailspick%2Fpatch%2Fmain");
 
-    const pick = await fetchUi(`/alice/edittailspick/cherrypick/${sha2}/main`);
+    const pick = await fetchUi(`/alice/edittailspick/_cherrypick/${sha2}/main`);
     expect(pick.status).toBe(303);
     expect(pick.headers.get("location")).toBe(
-      `/login?redirect_to=%2Falice%2Fedittailspick%2Fcherrypick%2F${sha2}%2Fmain`,
+      `/login?redirect_to=%2Falice%2Fedittailspick%2F_cherrypick%2F${sha2}%2Fmain`,
     );
   });
 
@@ -364,7 +371,7 @@ describe("gates across the mounted tails (anon / non-writer / archived)", () => 
     expect(patch.headers.get("location")).toContain("/login?");
 
     const pick = await fetchUi(
-      `/alice/edittailspick/cherrypick/${sha2}/main`,
+      `/alice/edittailspick/_cherrypick/${sha2}/main`,
       formPost({ revert: "false", branch: "main" }),
     );
     expect(pick.status).toBe(303);
@@ -389,10 +396,10 @@ describe("gates across the mounted tails (anon / non-writer / archived)", () => 
     expect(uploadHtml).toContain('action="/alice/edittails/_fork/main"');
     expect(uploadHtml).toContain('<input type="hidden" name="return_uri" value="/alice/edittails/upload/main"/>');
     expect((await fetchUi("/alice/edittailspick/patch/main", sam)).status).toBe(404);
-    expect((await fetchUi(`/alice/edittailspick/cherrypick/${sha2}/main`, sam)).status).toBe(404);
+    expect((await fetchUi(`/alice/edittailspick/_cherrypick/${sha2}/main`, sam)).status).toBe(404);
 
     const post = await fetchUi(
-      `/alice/edittailspick/cherrypick/${sha2}/main`,
+      `/alice/edittailspick/_cherrypick/${sha2}/main`,
       withCookie(formPost({ revert: "false", branch: "main" }), samCookie),
     );
     expect(post.status).toBe(404);
@@ -409,7 +416,7 @@ describe("gates across the mounted tails (anon / non-writer / archived)", () => 
         .status,
     ).toBe(404);
     expect((await fetchUi("/alice/edittails-archived/patch/main", authed)).status).toBe(404);
-    expect((await fetchUi(`/alice/edittails-archived/cherrypick/${GHOST_SHA}/main`, authed)).status).toBe(404);
+    expect((await fetchUi(`/alice/edittails-archived/_cherrypick/${GHOST_SHA}/main`, authed)).status).toBe(404);
   });
 });
 
@@ -444,7 +451,7 @@ describe("cross-origin POSTs 403 ahead of everything (the guard runs first)", ()
     const { ownerCookie, sha2 } = await ensureFixtures();
     const engine = pickEngine();
     const tipBefore = await branchTip(engine, "main");
-    const pick = await fetchUi(`/alice/edittailspick/cherrypick/${sha2}/main`, {
+    const pick = await fetchUi(`/alice/edittailspick/_cherrypick/${sha2}/main`, {
       method: "POST",
       headers: {
         "content-type": "application/x-www-form-urlencoded",
@@ -688,12 +695,72 @@ describe("upload POST round-trips through the staging family", () => {
   });
 });
 
+// --- the staging pair (web.go:1473-1474's POST upload-file/upload-remove) -----------
+
+describe("the staging pair (the dropzone's POST endpoints through the mount)", () => {
+  it("the bare repo-scope literals parse; deeper tails stay engine-owned", () => {
+    expect(parseUiRoute("/octo/hello/upload-file")).toEqual({
+      family: "editor-upload-file",
+      owner: "octo",
+      repo: "hello",
+    });
+    expect(parseUiRoute("/octo/hello/upload-remove")).toEqual({
+      family: "editor-upload-remove",
+      owner: "octo",
+      repo: "hello",
+    });
+    // The dispatcher's reach (§2.2): without the claims the consult hands
+    // the POSTs to the engine (the dead-route rule — the pair 404'd at the
+    // engine before the claims landed).
+    expect(handlesUiRoute("/octo/hello/upload-file")).toBe(true);
+    expect(handlesUiRoute("/octo/hello/upload-remove")).toBe(true);
+    // EXACT length-1 tails — deeper shapes stay engine-owned.
+    expect(parseUiRoute("/octo/hello/upload-file/extra")).toBeNull();
+    expect(parseUiRoute("/octo/hello/upload-remove/extra")).toBeNull();
+  });
+
+  it("POST upload-file stages (200 + uuid), the upload-remove twin 204s it away, non-writer and anonymous 404", async () => {
+    const { ownerCookie, samCookie } = await ensureFixtures();
+
+    // The writer: the multipart body stages into REPO_PACKS and answers the
+    // dropzone's JSON ({uuid}) — the request REACHED the handler through the
+    // parse claim (web.go:1473's UploadFileToServer seam; the emitter is the
+    // upload page's data-upload-url).
+    const form = new FormData();
+    form.set("file", new File(["matrix staged bytes\n"], "matrix-drop.txt", { type: "text/plain" }));
+    const staged = await fetchUi("/alice/edittails/upload-file", withCookie({ method: "POST", body: form }, ownerCookie));
+    expect(staged.status).toBe(200);
+    const { uuid } = await staged.json<{ uuid: string }>();
+    expect(uuid).not.toBe("");
+    expect(await env.REPO_PACKS.head(repoUploadKey(uuid))).not.toBeNull();
+
+    // The remove twin (web.go:1474): the uuid-carrying same-origin form
+    // answers the missing-tolerant 204 — the staged blob is gone.
+    const removed = await fetchUi("/alice/edittails/upload-remove", withCookie(formPost({ file: uuid }), ownerCookie));
+    expect(removed.status).toBe(204);
+    expect(await env.REPO_PACKS.head(repoUploadKey(uuid))).toBeNull();
+
+    // The non-writer (edittailsam holds no grant) and anonymous: the
+    // handlers' writer predicate 404-shells (MustBeAbleToUpload +
+    // reqRepoCodeWriter ride the HANDLERS — the upload table has no repo
+    // column upstream).
+    const samForm = new FormData();
+    samForm.set("file", new File(["x"], "sam.txt", { type: "text/plain" }));
+    expect(
+      (await fetchUi("/alice/edittails/upload-file", withCookie({ method: "POST", body: samForm }, samCookie))).status,
+    ).toBe(404);
+    const anonForm = new FormData();
+    anonForm.set("file", new File(["y"], "anon.txt", { type: "text/plain" }));
+    expect((await fetchUi("/alice/edittails/upload-file", { method: "POST", body: anonForm })).status).toBe(404);
+  });
+});
+
 // --- the cherry-pick GET+POST ------------------------------------------------------
 
 describe("cherry-pick GET (the forward prefill and the ?cherry-pick-type=revert arm)", () => {
   it("the forward page prefills Cut's subject/body split over the commit and targets the URL branch", async () => {
     const { ownerCookie, sha2 } = await ensureFixtures();
-    const res = await fetchUi(`/alice/edittailspick/cherrypick/${sha2}/side`, {
+    const res = await fetchUi(`/alice/edittailspick/_cherrypick/${sha2}/side`, {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${ownerCookie}` },
     });
     expect(res.status).toBe(200);
@@ -718,7 +785,7 @@ describe("cherry-pick GET (the forward prefill and the ?cherry-pick-type=revert 
 
   it("?cherry-pick-type=revert flips the hidden flag and the revert prefill (editor_cherry_pick.go:31)", async () => {
     const { ownerCookie, sha2 } = await ensureFixtures();
-    const res = await fetchUi(`/alice/edittailspick/cherrypick/${sha2}/main?cherry-pick-type=revert`, {
+    const res = await fetchUi(`/alice/edittailspick/_cherrypick/${sha2}/main?cherry-pick-type=revert`, {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${ownerCookie}` },
     });
     expect(res.status).toBe(200);
@@ -731,7 +798,7 @@ describe("cherry-pick GET (the forward prefill and the ?cherry-pick-type=revert 
 
   it("a well-shaped but unreachable sha 404s (the loader's readCommit arm)", async () => {
     const { ownerCookie } = await ensureFixtures();
-    const res = await fetchUi(`/alice/edittailspick/cherrypick/${GHOST_SHA}/main`, {
+    const res = await fetchUi(`/alice/edittailspick/_cherrypick/${GHOST_SHA}/main`, {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${ownerCookie}` },
     });
     expect(res.status).toBe(404);
@@ -743,7 +810,7 @@ describe("cherry-pick POST (the forward arm, the refusal re-render, the revert a
     const { ownerCookie, sha2 } = await ensureFixtures();
     const engine = pickEngine();
     const res = await fetchUi(
-      `/alice/edittailspick/cherrypick/${sha2}/side`,
+      `/alice/edittailspick/_cherrypick/${sha2}/side`,
       withCookie(
         formPost({
           revert: "false",
@@ -766,7 +833,7 @@ describe("cherry-pick POST (the forward arm, the refusal re-render, the revert a
     const engine = pickEngine();
     const tipBefore = await branchTip(engine, "main");
     const res = await fetchUi(
-      `/alice/edittailspick/cherrypick/${sha2}/main`,
+      `/alice/edittailspick/_cherrypick/${sha2}/main`,
       withCookie(
         formPost({
           revert: "false",
@@ -799,7 +866,7 @@ describe("cherry-pick POST (the forward arm, the refusal re-render, the revert a
     }
 
     const res = await fetchUi(
-      `/alice/edittailspick/cherrypick/${sha2}/main`,
+      `/alice/edittailspick/_cherrypick/${sha2}/main`,
       withCookie(
         formPost({
           revert: "true",
@@ -977,7 +1044,7 @@ describe("the carried-form edges (the patch ghost twin, the header-default fallb
     const { ownerCookie, sha2 } = await ensureFixtures();
     const engine = pickEngine();
     const res = await fetchUi(
-      `/alice/edittailspick/cherrypick/${sha2}/main`,
+      `/alice/edittailspick/_cherrypick/${sha2}/main`,
       withCookie(
         formPost({
           revert: "false",
@@ -1001,7 +1068,7 @@ describe("the carried-form edges (the patch ghost twin, the header-default fallb
     // again (converging every run onto the pre-existing posture).
     expect(await blobOid(engine, "main", "feature.txt")).not.toBeNull();
     const res = await fetchUi(
-      `/alice/edittailspick/cherrypick/${sha2}/main`,
+      `/alice/edittailspick/_cherrypick/${sha2}/main`,
       withCookie(
         formPost({
           revert: "true",

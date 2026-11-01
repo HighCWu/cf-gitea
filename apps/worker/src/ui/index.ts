@@ -1116,6 +1116,7 @@ import {
 import {
   applyTwofaDisable,
   applyTwofaEnrollment,
+  clearTwofaSetCookie,
   generateTotpSecret,
   getTwoFactorByUid,
   hasTwoFactorByUid,
@@ -3139,6 +3140,23 @@ export interface EditorForkRoute {
   refSuffix: string;
 }
 
+/** The editor upload staging endpoints (services/upload-staging.ts —
+ *  upstream web.go:1472-1474's POST pair beside the editor Combos group:
+ *  `m.Post("/upload-file", repo.UploadFileToServer)` +
+ *  `m.Post("/upload-remove", repo.RemoveUploadFileFromServer)` under
+ *  `MustBeAbleToUpload, reqRepoCodeWriter` — the writer predicate rides the
+ *  HANDLER here (the upload table has no repo column upstream), the parse
+ *  claims the bare repo-scope literals so the dispatcher's handlesUiRoute
+ *  consult admits the POSTs into the sub-app (the dead-route rule). The
+ *  claims are EXACT length-1 tails: deeper shapes stay engine-owned.
+ *  POST-only registered: a GET misses into the parent app's plain 404
+ *  (upstream chi answers 405 — the recorded house divergence). */
+export interface EditorUploadStagingRoute {
+  family: "editor-upload-file" | "editor-upload-remove";
+  owner: string;
+  repo: string;
+}
+
 /** The blame page family (pages/blame.tsx): upstream's blame group —
  *  web.go:1729-1733's `m.Group("/blame", ...)` with `/branch/*`, `/tag/*`
  *  and `/commit/*` tails → repo.RefBlame (routers/web/repo/blame.go; the
@@ -3917,6 +3935,7 @@ export type ParsedUiRoute =
   | WikiRoute
   | FileEditorRoute
   | EditorForkRoute
+  | EditorUploadStagingRoute
   | BlameRoute
   | RepoSearchRoute
   | RepoActivityRoute
@@ -5009,6 +5028,28 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     // `?type=` query (the landed parseTypeFacet), so a 5-segment shape stays
     // unclaimed → the engine's 404.
     if (raw.length === 5) return null;
+    // The settings pair claims FIRST — upstream mounts the write-gated
+    // GET+POST at /settings/{type}/{name} (web.go:1121-1127), a SIBLING of
+    // the /{type}/{name} depth group, so `settings` occupies the TYPE
+    // segment position (raw[4]), never the tail. chi's static-first routing
+    // answers the literal before the dynamic depth group could shadow the
+    // pair (hono answers the first registration — the mounted settings
+    // patterns lead the depth group below, this claim leads the generic
+    // decode), so the version-view claim never sees the settings-first
+    // shape (an exclusion-by-reorder: `settings` never parses as a type).
+    // Any other settings-prefixed shape rides the generic depth claims like
+    // upstream's {type} param would.
+    if (raw.length === 7 && raw[4] === "settings") {
+      let settingsType: string;
+      let settingsName: string;
+      try {
+        settingsType = decodeURIComponent(raw[5] as string);
+        settingsName = decodeURIComponent(raw[6] as string);
+      } catch {
+        return null;
+      }
+      return { family: "owner-package-settings", owner, type: settingsType, name: settingsName };
+    }
     let type: string;
     let name: string;
     try {
@@ -5020,9 +5061,6 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (raw.length === 6) return { family: "owner-package-redirect", owner, type, name };
     if (raw.length === 7) {
       if (raw[6] === "versions") return { family: "owner-package-versions", owner, type, name };
-      // The settings literal claims FIRST (static-before-dynamic, the
-      // versions-tail precedent — web.go:1121-1127's write-gated pair).
-      if (raw[6] === "settings") return { family: "owner-package-settings", owner, type, name };
       let version: string;
       try {
         version = decodeURIComponent(raw[6] as string);
@@ -5489,6 +5527,13 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (rest.length === 2 && rest[0] === "attachments" && rest[1] === "remove") {
       return { family: "issue-attachments-remove", owner, repo };
     }
+    // The unpin DELETE tail (web.go:1404 — `m.Delete("/unpin/{index}")` on
+    // the group root: VERB-FIRST, /{family}/unpin/{index} — the index rides
+    // the tail's THIRD segment (rest[1]), not the first; the index-FIRST
+    // shape this block once claimed is upstream's 404).
+    if (rest.length === 2 && rest[0] === "unpin" && /^-?\d+$/.test(rest[1] as string)) {
+      return { family: "issue-unpin", owner, repo, urlKind: head, index: Number.parseInt(rest[1] as string, 10) };
+    }
     if (rest.length === 2 && /^-?\d+$/.test(rest[0] as string)) {
       const index = Number.parseInt(rest[0] as string, 10);
       if (rest[1] === "comments") return { family: "issue-comment", owner, repo, urlKind: head, index };
@@ -5543,11 +5588,6 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (rest[1] === "content-history" && rest[2] === "soft-delete") {
         return { family: "issue-content-history-soft-delete", owner, repo, urlKind: head, index };
       }
-      // The unpin DELETE tail (web.go:1404 — the index rides the THIRD
-      // segment here, not the first).
-      if (rest[1] === "unpin" && /^-?\d+$/.test(rest[2] as string)) {
-        return { family: "issue-unpin", owner, repo, urlKind: head, index: Number.parseInt(rest[2] as string, 10) };
-      }
       // The timeline length-3 writes (web.go:1379-1383 + :1392-1393):
       // dependency/{add,delete}, times/add, the reactions pair (the action
       // literal react|unreact rides the THIRD segment).
@@ -5559,10 +5599,6 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       }
       if (rest[1] === "reactions" && (rest[2] === "react" || rest[2] === "unreact")) {
         return { family: "issue-reaction", owner, repo, urlKind: head, index, action: rest[2] };
-      }
-      // The per-time delete (web.go:1376 — {timeid} on the THIRD segment).
-      if (rest[1] === "times" && /^\d+$/.test(rest[2] as string)) {
-        return { family: "time-delete", owner, repo, urlKind: head, index, timeId: Number.parseInt(rest[2] as string, 10) };
       }
       // The byte-serving alias: upstream mounts the uuid arm at
       // /{index}/attachments/{uuid} (web.go:1337) driving the same seam as
@@ -5581,6 +5617,26 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (head === "pulls" && rest[1] === "commits" && parsePullFilesSingleCommit(rest[2] as string) !== null) {
         return { family: "pull-commit-files", owner, repo, index, segment: rest[2] };
       }
+    }
+    // The per-time delete (web.go:1379 — `m.Post("/{timeid}/delete")` inside
+    // the /times group: /{index}/times/{timeid}/delete, FOUR segments — the
+    // timeid on the THIRD, the literal delete on the FOURTH; the bare
+    // /{index}/times/{timeid} tail this block once claimed is upstream's 404).
+    if (
+      rest.length === 4 &&
+      /^-?\d+$/.test(rest[0] as string) &&
+      rest[1] === "times" &&
+      /^\d+$/.test(rest[2] as string) &&
+      rest[3] === "delete"
+    ) {
+      return {
+        family: "time-delete",
+        owner,
+        repo,
+        urlKind: head,
+        index: Number.parseInt(rest[0] as string, 10),
+        timeId: Number.parseInt(rest[2] as string, 10),
+      };
     }
     // The stopwatch trio (web.go:1382 — {index}/times/stopwatch/{action}).
     if (
@@ -6453,8 +6509,13 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   }
   // Window-2e C2b: the cherrypick/patch pages (web.go:1465-1470 — the sha
   // rides the cherrypick ROUTE between the literal and the branch tail;
-  // bare patch/{branch} is the patch family). Bare literals fall through.
-  if (head === "patch" || head === "cherrypick") {
+  // bare patch/{branch} is the patch family). The cherrypick literal is
+  // upstream's OWN underscore spelling — web.go:1468's
+  // `{editor_action:_cherrypick}` (the commit page's emitted URL carries it,
+  // commit_page.tmpl:65) — so the family claims `_cherrypick`; the bare
+  // `cherrypick` head is NOT an editor_action and stays engine-owned.
+  // Bare literals fall through.
+  if (head === "patch" || head === "_cherrypick") {
     if (rest.length === 0) return null;
     let suffix: string;
     try {
@@ -6471,6 +6532,15 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     suffix = rest.map((segment) => decodeURIComponent(segment)).join("/");
   } catch {
     return null;
+  }
+  // The upload staging endpoints (web.go:1472-1474 — the editor group's
+  // POST pair under MustBeAbleToUpload + reqRepoCodeWriter; both gates ride
+  // the handlers). The bare repo-scope literals claim exactly the length-1
+  // tail: MUST claim or the dispatcher's handlesUiRoute consult hands the
+  // POSTs to the engine before Hono ever routes them (the dead-route rule —
+  // the issue-new matrix's second RED).
+  if ((head === "upload-file" || head === "upload-remove") && rest.length === 0) {
+    return { family: head === "upload-file" ? "editor-upload-file" : "editor-upload-remove", owner, repo };
   }
   // Census gap #13's write route (pages/repo-editor-fork.tsx — web.go:1450's
   // `m.Post("/_fork/*", repo.ForkToEditPost)`): the underscore literal is
@@ -10106,10 +10176,13 @@ async function twofaEnrollSubmit(c: Context<{ Bindings: Env }>): Promise<Respons
   );
   if (outcome.outcome === "enrolled") {
     const data = await loadUserSettingsSecurityPageData(c.env.DB, p.viewer.id);
+    // The enroll ticket dies with the enrollment (the twofaSubmit twin's
+    // clearTwofaSetCookie arm) — the sealed payload still CARRIES the TOTP
+    // secret, so the activated state must not leave it browser-live.
     return p.respond(c.html(renderUserSettingsSecurityPage(p.ctx, data, {
       notice: { kind: "positive",
         message: twofaLocale.enrolled_success.replace("%s", outcome.scratchToken) },
-    })), 200);
+    }), 200, { "set-cookie": clearTwofaSetCookie() }));
   }
   if (outcome.outcome === "already-enrolled") {
     return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/security" } }));
@@ -18463,6 +18536,10 @@ uiRouter.post("/:owner/:repo/branches/restore", (c) => branchRestoreSubmit(c));
 uiRouter.post("/:owner/:repo/branches/_new/*", (c) => branchCreateSubmit(c));
 uiRouter.post("/:owner/:repo/branches/rename", (c) => branchRenameSubmit(c));
 uiRouter.get("/:owner/:repo/pulls/new/*", (c) => pullsNewRedirect(c));
+// The upload staging pair (web.go:1472-1474 — MustBeAbleToUpload +
+// reqRepoCodeWriter ride the handlers; the parse claims the bare literals
+// so the dispatcher's handlesUiRoute consult admits the POSTs — the F2
+// dead-route fix).
 uiRouter.post("/:owner/:repo/upload-file", (c) => uploadFileEndpoint(c));
 uiRouter.post("/:owner/:repo/upload-remove", (c) => uploadRemoveEndpoint(c));
 uiRouter.get("/:owner/:repo/branches/delete", () => methodNotAllowed("POST"));
@@ -18508,8 +18585,11 @@ uiRouter.get("/:owner/:repo/upload/*", (c) => fileUploadPage(c));
 uiRouter.post("/:owner/:repo/upload/*", (c) => fileUploadSubmit(c));
 uiRouter.get("/:owner/:repo/patch/*", (c) => editorPatchPage(c, false));
 uiRouter.post("/:owner/:repo/patch/*", (c) => editorPatchPage(c, true));
-uiRouter.get("/:owner/:repo/cherrypick/*", (c) => editorCherryPickPage(c, false));
-uiRouter.post("/:owner/:repo/cherrypick/*", (c) => editorCherryPickPage(c, true));
+// The underscore literal is upstream's OWN spelling (web.go:1468's
+// `{editor_action:_cherrypick}` — the commit page's emitted URL carries it,
+// commit_page.tmpl:65); the bare `cherrypick` head stays engine-owned.
+uiRouter.get("/:owner/:repo/_cherrypick/*", (c) => editorCherryPickPage(c, false));
+uiRouter.post("/:owner/:repo/_cherrypick/*", (c) => editorCherryPickPage(c, true));
 // Census gap #13's write route (pages/repo-editor-fork.tsx — upstream
 // web.go:1450's `m.Post("/_fork/*", repo.ForkToEditPost)`): the underscore
 // literal is upstream's OWN spelling inside the editor Combos group — NOT
@@ -18861,12 +18941,19 @@ uiRouter.get("/:owner/:repo/lastcommit/*", (c) => lastCommitFragment(c));
 uiRouter.get("/:owner/-/packages", (c) => ownerPackagesPage(c));
 uiRouter.get("/:owner/-/packages/:type/:name", (c) => ownerPackageLatestRedirect(c));
 uiRouter.get("/:owner/-/packages/:type/:name/versions", (c) => ownerPackageVersionsPage(c));
-uiRouter.get("/:owner/-/packages/:type/:name/:version", (c) => ownerPackageVersionViewPage(c));
-// The packages UI write arms (census gap #5 — the settings pair registers
-// BEFORE the dynamic :version patterns; the version-delete shares the view
-// shape, method-disambiguated; the terraform pair is one deeper).
+// The packages UI write arms (census gap #5): the settings pair MUST lead
+// the dynamic :version patterns — hono answers the FIRST matching
+// registration for these equal-depth shapes, so a trailing settings
+// registration let the :version GET absorb
+// /settings/{type}/{name} as {type:"settings"} (the F1 dead-route finding:
+// the settings page 404-shelled through the version view's missing-package
+// arm). Upstream mounts the pair at /settings/{type}/{name} — web.go
+// 1121-1127 — a static segment hono's ranking does NOT promote on its own.
 uiRouter.get("/:owner/-/packages/settings/:type/:name", (c) => ownerPackageSettingsPage(c));
 uiRouter.post("/:owner/-/packages/settings/:type/:name", (c) => ownerPackageSettingsSubmit(c));
+uiRouter.get("/:owner/-/packages/:type/:name/:version", (c) => ownerPackageVersionViewPage(c));
+// The version-delete shares the view shape, method-disambiguated; the
+// terraform pair is one deeper.
 uiRouter.post("/:owner/-/packages/:type/:name/:version", (c) => ownerPackageVersionDelete(c));
 uiRouter.post("/:owner/-/packages/:type/:name/:version/terraform/lock", (c) => ownerPackageTerraformLockToggle(c));
 uiRouter.post("/:owner/-/packages/:type/:name/:version/terraform/unlock", (c) => ownerPackageTerraformLockToggle(c));

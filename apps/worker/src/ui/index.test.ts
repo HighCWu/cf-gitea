@@ -20,9 +20,9 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../auth/testing/seeds";
-import { applyTwofaEnrollment, generateTotpSecret, mintPendingTicket } from "../auth/two-factor";
+import { applyTwofaEnrollment, clearTwofaSetCookie, generateTotpSecret, mintPendingTicket } from "../auth/two-factor";
 import { totpCode } from "../auth/totp";
-import { externalLoginUsers, loginSources, repositories, repoSettings, twoFactor, users } from "../db/schema";
+import { comments, externalLoginUsers, issuePins, issues, loginSources, repositories, repoSettings, trackedTimes, twoFactor, users } from "../db/schema";
 import { serializeOAuth2SourceConfig } from "../services/auth-sources/cfg";
 import { createLoginSource, ensureExternalLogin, LoginSourceType } from "../services/auth-sources/store";
 import { getOrInsertBlob, packageBlobContentKey } from "../services/packages/blobs";
@@ -167,6 +167,13 @@ beforeEach(async () => {
     "repo_counters",
     "repo_redirects",
     "repositories",
+    // The dead-route-fix route fixtures (children first): the unpin/time
+    // ladders' issue rows, the pins, the comments the unpin writes, the
+    // tracked-time rows the delete soft-deletes.
+    "comments",
+    "issue_pins",
+    "tracked_time",
+    "issues",
     // The W4 external-auth fixtures (the link rows first) + the sessions the
     // signed-in fetches mint.
     "external_login_user",
@@ -226,6 +233,15 @@ describe("handlesUiRoute", () => {
                             // gates the handler — the route-level rows below)
     "/user/settings/security/account_link", // the W5 unlink POST (the dispatcher
                                             // admission the 1b17b08 referral re-arms)
+    // the five dead-route fixes' dispatcher admissions (2026-11-01)
+    "/octo/-/packages/settings/generic/proj", // F1 — settings FIRST
+    "/octo/hello/upload-file", // F2 — the staging pair
+    "/octo/hello/upload-remove",
+    "/octo/hello/issues/unpin/7", // F3 — verb-first
+    "/octo/hello/pulls/unpin/7",
+    "/octo/hello/issues/5/times/9/delete", // F4 — four segments
+    "/octo/hello/pulls/5/times/9/delete",
+    "/octo/hello/_cherrypick/abcdef0/main", // F5 — the underscore literal
   ])("claims UI family: %s", (pathname) => {
     expect(handlesUiRoute(pathname)).toBe(true);
   });
@@ -262,6 +278,12 @@ describe("handlesUiRoute", () => {
     "/octo/-/packages/generic/proj/1.0.0/files/x", // numeric {fileid} only
     "/octo/-/packages/generic/proj/1.0.0/extra", // deeper tails stay engine-owned
     "/octo/hello/packages/extra", // the repo tab claims the bare literal only
+    // the five dead-route fixes' flipped shapes (2026-11-01): the shapes the
+    // parse once claimed wrongly stay engine-owned
+    "/octo/-/packages/settings/generic/proj/extra", // F1 — no deeper settings tails
+    "/octo/hello/issues/7/unpin/3", // F3 — the index-first phantom
+    "/octo/hello/issues/5/times/9", // F4 — the length-3 phantom (no /delete)
+    "/octo/hello/cherrypick/abcdef0/main", // F5 — the bare literal is not an editor_action
     // NOTE: /octo/hello/settings/keys and /explore/repos/sitemap-1.xml left
     // this table — window-2d (b54f709) and window-2e-A (84996c6) claimed
     // them; the claim pins live in the parse table below (the wiki
@@ -532,6 +554,56 @@ describe("parseUiRoute", () => {
     // The repo-scoped twin stays unclaimed — the repo settings actions
     // family has no scoped-workflows tail (the engine's 404).
     ["/alice/demo/settings/actions/scoped-workflows", null],
+    // --- the five dead-route findings' parse pins (the deep review's F1-F5,
+    // fixed 2026-11-01) ---
+    // F1: the settings pair is SETTINGS-FIRST — upstream mounts it at
+    // /settings/{type}/{name} (web.go:1121-1127), a SIBLING of the depth
+    // group, so `settings` occupies the TYPE segment position; the tail
+    // shape this table once pinned (settings LAST) falls to the version
+    // view like upstream's {version} param would.
+    ["/octo/-/packages/settings/generic/proj", { family: "owner-package-settings", owner: "octo", type: "generic", name: "proj" }],
+    ["/octo/-/packages/settings/gener%69c/proj", { family: "owner-package-settings", owner: "octo", type: "generic", name: "proj" }],
+    [
+      "/octo/-/packages/generic/proj/settings",
+      { family: "owner-package-version-view", owner: "octo", type: "generic", name: "proj", version: "settings" },
+    ],
+    ["/octo/-/packages/settings/generic/proj/extra", null], // deeper settings tails stay engine-owned
+    // F2: the upload staging pair (web.go:1472-1474) — the bare repo-scope
+    // literals, exactly the length-1 tail.
+    ["/octo/hello/upload-file", { family: "editor-upload-file", owner: "octo", repo: "hello" }],
+    ["/octo/hello/upload-remove", { family: "editor-upload-remove", owner: "octo", repo: "hello" }],
+    ["/octo/hello/upload-file/extra", null], // deeper tails stay engine-owned
+    // F3: the unpin DELETE tail is VERB-FIRST (web.go:1404's
+    // m.Delete("/unpin/{index}") on the group root) — the index rides
+    // rest[1]; the index-FIRST shape is upstream's 404.
+    ["/octo/hello/issues/unpin/7", { family: "issue-unpin", owner: "octo", repo: "hello", urlKind: "issues", index: 7 }],
+    ["/octo/hello/pulls/unpin/7", { family: "issue-unpin", owner: "octo", repo: "hello", urlKind: "pulls", index: 7 }],
+    ["/octo/hello/issues/7/unpin/3", null], // the index-first phantom stays unclaimed
+    ["/octo/hello/issues/unpin", null], // the bare verb stays unclaimed
+    // F4: the per-time delete rides FOUR segments (web.go:1379's
+    // m.Post("/{timeid}/delete") inside the /times group); the bare
+    // /{index}/times/{timeid} tail is upstream's 404.
+    [
+      "/octo/hello/issues/5/times/9/delete",
+      { family: "time-delete", owner: "octo", repo: "hello", urlKind: "issues", index: 5, timeId: 9 },
+    ],
+    [
+      "/octo/hello/pulls/5/times/9/delete",
+      { family: "time-delete", owner: "octo", repo: "hello", urlKind: "pulls", index: 5, timeId: 9 },
+    ],
+    ["/octo/hello/issues/5/times/9", null], // the length-3 phantom stays unclaimed
+    ["/octo/hello/issues/5/times/x/delete", null], // junk timeid
+    // F5: the cherrypick literal is upstream's OWN underscore spelling
+    // (web.go:1468's {editor_action:_cherrypick}; the commit page's emitted
+    // URL carries it) — the bare `cherrypick` head is NOT an editor_action.
+    [
+      "/octo/hello/_cherrypick/abcdef0123/main/x",
+      { family: "editor-cherrypick", owner: "octo", repo: "hello", refSuffix: "abcdef0123/main/x" },
+    ],
+    ["/octo/hello/cherrypick/abcdef0123/main", null], // the bare literal stays engine-owned
+    ["/octo/hello/_cherrypick/zzzzzz/main", null], // non-hex sha
+    ["/octo/hello/_cherrypick/abcdef/main", null], // 6 < 7 hex
+    ["/octo/hello/_cherrypick/abcdef0123", null], // no branch tail
   ];
 
   it.each(table)("parses %s", (pathname, expected) => {
@@ -1146,6 +1218,10 @@ describe("the TOTP settings four (the twofa.tsx HANDOFF fold)", () => {
     const enrolledHtml = await enroll.text();
     expect(enrolledHtml).toContain("successfully enrolled");
     expect(enrolledHtml).toContain("Store your single-use recovery key (");
+    // The enrolled arm clears the enroll stash (the twofaSubmit twin's
+    // clearTwofaSetCookie arm) — the sealed ticket still CARRIES the TOTP
+    // secret, so the activated state must not leave it browser-live.
+    expect(enroll.headers.get("set-cookie") ?? "").toContain(clearTwofaSetCookie());
     const row = await drizzle(env.DB).select().from(twoFactor).all();
     expect(row).toHaveLength(1);
     expect(row[0]!.userId).toBe(user.id);
@@ -1373,5 +1449,176 @@ describe("GET /-/admin/users/{id}/edit (the placement fix's route pin)", () => {
     const miss = await fetchAuthed("/-/admin/users/999999/edit", cookie);
     expect(miss.status).toBe(303);
     expect(miss.headers.get("location")).toBe("/-/admin/users");
+  });
+});
+
+// --- the five dead-route fixes' route pins (the deep review's F1-F5, fixed
+// --- 2026-11-01): each family's registration + parse claim verified END TO
+// --- END over seeded rows — the request must reach the HANDLER, not just
+// --- parse -------------------------------------------------------------------
+
+describe("the five dead-route fixes' route pins", () => {
+  /** The verb/header-carrying fetch (the fetchAuthed shape + method/body). */
+  async function fetchAs(
+    path: string,
+    cookie: string | null,
+    options: { method?: string; body?: BodyInit; headers?: Record<string, string> } = {},
+  ): Promise<Response> {
+    return uiRouter.fetch(
+      new Request(`https://test.local${path}`, {
+        method: options.method ?? "GET",
+        headers: {
+          ...(cookie === null ? {} : { cookie: `${SESSION_COOKIE_NAME}=${cookie}` }),
+          ...options.headers,
+        },
+        body: options.body,
+      }),
+      uiEnv,
+    );
+  }
+
+  /** A same-origin urlencoded POST body (the write ladders' convention). */
+  const urlEncoded = (body: Record<string, string>): { method: string; headers: Record<string, string>; body: string } => ({
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://test.local" },
+    body: new URLSearchParams(body).toString(),
+  });
+
+  /** The F1/F2 fixture: Alice + a package version + a linked-target repo. */
+  async function seedOwnerFixture(): Promise<{ aliceId: number; cookie: string }> {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    await seedPackageVersion(alice.id, "proj", "1.0.0", new Date(1_700_000_000 * 1000));
+    await seedRepo("alice", "hello");
+    return { aliceId: alice.id, cookie: await mintSession(env.DB, alice.id) };
+  }
+
+  it("F1: GET /{owner}/-/packages/settings/{type}/{name} renders the settings page (settings FIRST — the :version GET no longer absorbs it)", async () => {
+    const { cookie } = await seedOwnerFixture();
+
+    // The owner writer: the write-gated page renders (the breadcrumb's
+    // settings title; the link form's action carries the settings-FIRST url).
+    const page = await fetchAs("/alice/-/packages/settings/generic/proj", cookie);
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).toContain("<title>proj - cf-gitea</title>");
+    // The rendered forms carry the DISPLAY owner name (the rows fold case at
+    // resolution, every owner-scoped family's convention).
+    expect(html).toContain('action="/Alice/-/packages/settings/generic/proj"');
+
+    // Anonymous: the write gate 404-shells (upstream reqPackageAccess(write)).
+    const anon = await fetchAs("/alice/-/packages/settings/generic/proj", null);
+    expect(anon.status).toBe(404);
+  });
+
+  it("F1: POST the settings link action 303s onto the settings-first url (the version-delete POST shape stays method-disambiguated)", async () => {
+    const { cookie } = await seedOwnerFixture();
+
+    const link = await fetchAs("/alice/-/packages/settings/generic/proj", cookie, urlEncoded({ action: "link", repo_name: "hello" }));
+    expect(link.status).toBe(303);
+    expect(link.headers.get("location")).toBe("/Alice/-/packages/settings/generic/proj");
+
+    // Anonymous POST: the login round-trip (the submit's doer check precedes
+    // the write gate, the landed handler ladder).
+    const anon = await fetchAs("/alice/-/packages/settings/generic/proj", null, urlEncoded({ action: "link", repo_name: "hello" }));
+    expect(anon.status).toBe(303);
+    expect(anon.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent("/alice/-/packages/settings/generic/proj")}`,
+    );
+  });
+
+  it("F2: POST /{owner}/{repo}/upload-file stages a file for a writer (200 + uuid) and 404-shells anonymous; upload-remove answers 204", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    await seedRepo("alice", "hello");
+    const cookie = await mintSession(env.DB, alice.id);
+
+    // The writer: the multipart body stages into REPO_PACKS and answers the
+    // dropzone's JSON ({uuid}) — the request REACHED the handler through the
+    // parse claim (before the fix the dispatcher handed it to the engine).
+    const form = new FormData();
+    form.set("file", new File(["staged bytes"], "drop.txt", { type: "text/plain" }));
+    const staged = await fetchAs("/alice/hello/upload-file", cookie, { method: "POST", body: form });
+    expect(staged.status).toBe(200);
+    const { uuid } = await staged.json<{ uuid: string }>();
+    expect(uuid).not.toBe("");
+
+    // The remove twin: the uuid-carrying form answers upstream's
+    // missing-tolerant 204 (same-origin; the guard fronts this endpoint).
+    const removed = await fetchAs("/alice/hello/upload-remove", cookie, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://test.local" },
+      body: new URLSearchParams({ file: uuid }).toString(),
+    });
+    expect(removed.status).toBe(204);
+
+    // Anonymous: the handler's writer predicate 404-shells (upstream's
+    // MustBeAbleToUpload + reqRepoCodeWriter pair; the POST reach itself is
+    // the fix's proof).
+    const anonForm = new FormData();
+    anonForm.set("file", new File(["x"], "x.txt", { type: "text/plain" }));
+    const anon = await fetchAs("/alice/hello/upload-file", null, { method: "POST", body: anonForm });
+    expect(anon.status).toBe(404);
+  });
+
+  it("F3: DELETE /{owner}/{repo}/issues/unpin/{index} unpins the seeded pin (204, the unpin comment lands); the GET twin answers chi's 405", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    await seedRepo("alice", "hello");
+    const repo = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(eq(repositories.slug, "hello")).get();
+    if (repo === undefined) throw new Error("seed repo missing");
+    await drizzle(env.DB).insert(issues).values({ repoId: repo.id, index: 1, title: "pinned", posterId: alice.id, createdAt: new Date(1_700_000_000 * 1000) });
+    const issue = await drizzle(env.DB).select({ id: issues.id }).from(issues).where(eq(issues.repoId, repo.id)).get();
+    if (issue === undefined) throw new Error("seed issue missing");
+    await drizzle(env.DB).insert(issuePins).values({ issueId: issue.id, repoId: repo.id, pinOrder: 1 });
+    const cookie = await mintSession(env.DB, alice.id);
+
+    // The admin (owner) DELETE: 204, the pin row gone, the unpin system
+    // comment written — through the VERB-FIRST route (web.go:1404).
+    const unpin = await fetchAs("/alice/hello/issues/unpin/1", cookie, {
+      method: "DELETE",
+      headers: { origin: "https://test.local" },
+    });
+    expect(unpin.status).toBe(204);
+    const pin = await drizzle(env.DB).select({ id: issuePins.issueId }).from(issuePins).where(eq(issuePins.issueId, issue.id)).get();
+    expect(pin).toBeUndefined();
+    const unpinComment = await drizzle(env.DB).select({ id: comments.id }).from(comments).where(eq(comments.issueId, issue.id)).get();
+    expect(unpinComment).toBeDefined();
+
+    // The GET twin answers chi's 405 with Allow: DELETE.
+    const twin = await fetchAs("/alice/hello/issues/unpin/1", null);
+    expect(twin.status).toBe(405);
+    expect(twin.headers.get("allow")).toBe("DELETE");
+
+    // Anonymous DELETE: the admin gate's login 303.
+    const anon = await fetchAs("/alice/hello/issues/unpin/1", null, {
+      method: "DELETE",
+      headers: { origin: "https://test.local" },
+    });
+    expect(anon.status).toBe(303);
+    expect(anon.headers.get("location")).toBe(`/login?redirect_to=${encodeURIComponent("/alice/hello/issues/unpin/1")}`);
+  });
+
+  it("F4: POST /{owner}/{repo}/issues/{index}/times/{timeid}/delete soft-deletes the entry (303 onto the canonical issue); a missing timeid 404s", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    await seedRepo("alice", "hello");
+    const repo = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(eq(repositories.slug, "hello")).get();
+    if (repo === undefined) throw new Error("seed repo missing");
+    await drizzle(env.DB).insert(issues).values({ repoId: repo.id, index: 1, title: "timed", posterId: alice.id, createdAt: new Date(1_700_000_000 * 1000) });
+    const issue = await drizzle(env.DB).select({ id: issues.id }).from(issues).where(eq(issues.repoId, repo.id)).get();
+    if (issue === undefined) throw new Error("seed issue missing");
+    await drizzle(env.DB).insert(trackedTimes).values({ issueId: issue.id, userId: alice.id, seconds: 3600, createdAt: new Date(1_700_000_000 * 1000) });
+    const entry = await drizzle(env.DB).select({ id: trackedTimes.id }).from(trackedTimes).where(eq(trackedTimes.issueId, issue.id)).get();
+    if (entry === undefined) throw new Error("seed time entry missing");
+    const cookie = await mintSession(env.DB, alice.id);
+
+    // The owner POST through the FOUR-segment route (web.go:1379): the
+    // canonical 303, the row soft-deleted.
+    const del = await fetchAs(`/alice/hello/issues/1/times/${entry.id}/delete`, cookie, urlEncoded({}));
+    expect(del.status).toBe(303);
+    expect(del.headers.get("location")).toBe("/alice/hello/issues/1");
+    const deleted = await drizzle(env.DB).select({ deleted: trackedTimes.deleted }).from(trackedTimes).where(eq(trackedTimes.id, entry.id)).get();
+    expect(deleted?.deleted).toBe(true);
+
+    // A missing timeid: the handler's 404 shell (the row lookup misses).
+    const miss = await fetchAs("/alice/hello/issues/1/times/9999/delete", cookie, urlEncoded({}));
+    expect(miss.status).toBe(404);
   });
 });
