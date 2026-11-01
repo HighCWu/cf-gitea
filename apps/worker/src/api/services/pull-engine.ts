@@ -46,6 +46,13 @@ import {
 import type { EngineMergeBaseResult, EngineReads } from "./engine";
 import { engineRepoName } from "./engine";
 import { findRepositoryById, type RepositoryWithOwner } from "./repository";
+import { loadRepoSettings } from "./repo-settings";
+// The squash default-body builders (the compose arm's GetSquashMergeCommitMessages
+// + Reviewed-on half) — the api→page seam; pull-merge-box imports THIS module's
+// merge entry points back, so the edge is a lazy cycle (function-body bindings
+// only, resolved at call time — the same shape upload-staging→repo-editor-tails
+// established, with the back-edge noted in both doc comments).
+import { commitMessageMerge, defaultMergeBodyOf, reviewedByLines, squashMergeCommitMessages } from "../../ui/pages/pull-merge-box";
 import { canWriteRepository } from "./repo-access";
 
 /** `PullRequestStatus` mapping (§2.4; unrelated has no upstream row → Empty). */
@@ -344,7 +351,7 @@ export interface MergePullOptions {
 
 /**
  * The API merge message (findings F2 — the empty merge commit). Port of the
- * API handler's composition (gitea/routers/api/v1/repo/pull.go:966-986) over
+ * API handler's composition (gitea/routers/api/v1/repo/pull.go:963-986) over
  * GetDefaultMergeMessage (services/pull/merge.go:112-148): a trimmed
  * `merge_title_field` wins; empty/absent falls to the style's default —
  *   rebase                          → "" (the fast-forward rebase amends nothing)
@@ -353,18 +360,35 @@ export interface MergePullOptions {
  *     same-repo head:               `Merge pull request '{title}' (#{index}) from {head} into {base}`
  *     deleted head repo:            `Merge pull request '{title}' (#{index}) from <deleted>:{head} into {base}`
  *     fork head:                    `Merge pull request '{title}' (#{index}) from {owner}/{name}:{head} into {base}`
- * A non-empty trimmed `merge_message_field` appends as `\n\n{field}`. The
+ * THE SQUASH DEFAULT BODY (upstream's useDefaultSquashBody arm, pull.go:966-
+ * 983): `mergeMessageField === undefined` — the form key ABSENT from the
+ * request, exactly upstream's `!HasMergeMessageField &&
+ * !Req.Form.Has("merge_message_field")` (forms/repo_form.go:455-457: a
+ * present-even-empty JSON value sets HasMergeMessageField and SKIPS the arm;
+ * a present-empty field stores the title only) — and style `squash` composes
+ * `CommitMessageMerge(GetSquashMergeCommitMessages(pr), defaultBody)` where
+ * defaultBody is GetDefaultMergeMessage's `Reviewed-on`/`Reviewed-by` block
+ * (merge.go:163-165). The composition reuses the merge box's exported
+ * builders (ui/pages/pull-merge-box.tsx — the api→page seam, the
+ * upload-staging→repo-editor-tails precedent; the back-edge is lazy
+ * call-time bindings). A non-empty trimmed `merge_message_field` appends as
+ * `\n\n{field}`. The web merge-box path passes a plain string (its form
+ * always carries the field, upstream web pull.go:1116-1129 has NO default-
+ * body arm) — the arm is API-only, exactly upstream. The
  * `.gitea/default_merge_message/*.md` template resolution upstream runs
  * first (merge.go:116-122) is NOT modeled — the template-less default is the
- * only path (documented SPEC-0005 divergence). manually-merged callers skip
- * composition entirely (upstream returns at pull.go:945-951 before it).
+ * only path (documented SPEC-0005 divergence). Read failures degrade to the
+ * empty-strings shape (the box loader's disclosed err-arm posture) instead
+ * of upstream's APIErrorInternal 500 — a prefilled-body read never fails the
+ * merge. manually-merged callers skip composition entirely (upstream
+ * returns at pull.go:945-951 before it).
  */
 export async function composeMergeMessage(
   c: Context<ApiEnv>,
   pair: RepositoryWithOwner,
   issue: IssueRow,
   pr: PullRequestRow,
-  input: { style: MergePullOptions["style"]; mergeTitleField: string; mergeMessageField: string },
+  input: { style: MergePullOptions["style"]; mergeTitleField: string; mergeMessageField: string | undefined },
 ): Promise<string> {
   let defaultTitle: string;
   if (input.style === "rebase") {
@@ -381,7 +405,20 @@ export async function composeMergeMessage(
   }
   const title = input.mergeTitleField.trim();
   let message = title === "" ? defaultTitle : title;
-  const body = input.mergeMessageField.trim();
+  let field = input.mergeMessageField;
+  if (field === undefined && input.style === "squash") {
+    // useDefaultSquashBody (pull.go:966-983): the absent field composes the
+    // squash default — the commit-message walk + the Reviewed-on block
+    // joined through git.CommitMessageMerge, then trimmed and appended with
+    // the title below.
+    const origin = new URL(c.req.url).origin;
+    const issueLink = `/${pair.repo.ownerNamespace}/${pair.repo.slug}/pulls/${pr.index}`;
+    const reviewedBody = defaultMergeBodyOf(`${origin}${issueLink}`, await reviewedByLines(c.env.DB, issue.id));
+    const prUnit = (await loadRepoSettings(c.env.DB, pair.repo.id)).prUnit;
+    const squashMessages = await squashMergeCommitMessages(c.env.DB, { issue, pr, reads: engineReads(c.env, pair.repo) }, prUnit.DefaultSquashMergeMessage);
+    field = commitMessageMerge(squashMessages, reviewedBody);
+  }
+  const body = (field ?? "").trim();
   if (body !== "") {
     message += `\n\n${body}`;
   }

@@ -1689,7 +1689,7 @@ export function registerPullRoutes(
         const message = await composeMergeMessage(c, found, issue, checked, {
           style: form.do,
           mergeTitleField: form.merge_title_field ?? "",
-          mergeMessageField: form.merge_message_field ?? "",
+          mergeMessageField: form.merge_message_field,
         });
         const now = new Date();
         const scheduled = await insertScheduledAutoMergeRow(c.env.DB, {
@@ -1753,7 +1753,7 @@ export function registerPullRoutes(
         : await composeMergeMessage(c, found, issue, checked, {
             style: form.do,
             mergeTitleField: form.merge_title_field ?? "",
-            mergeMessageField: form.merge_message_field ?? "",
+            mergeMessageField: form.merge_message_field,
           });
       const { commitOid } = await mergePullRequestEngine(c, found, issue, checked, {
         style: form.do,

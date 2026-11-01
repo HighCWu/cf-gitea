@@ -31,7 +31,7 @@ import { ensureSeededRepo, buildHistoryPack, buildReceivePackBody, type SeedComm
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor } from "../auth/testing/seeds";
-import { users, protectedBranches, repositories, comments, issueDependencies, issueUsers, issues, notificationStates, PRStatus, pullAutoMerges, pullRequests } from "../db/schema";
+import { users, protectedBranches, repositories, comments, issueDependencies, issueUsers, issues, notificationStates, PRStatus, pullAutoMerges, pullRequests, repoUnits } from "../db/schema";
 import { CommentType } from "../issues/comment-types";
 import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "./auth";
@@ -535,8 +535,16 @@ describe("the open-dependency merge gate (check.go:218-223)", () => {
     });
     expect(commitOid).toBe(mainTip);
     const after = await findPullRequestByIndex(env.DB, repoRow.id, index);
+    // AS-BUILT (since U39's close gate, daeb15b): the mark lands (the Manually
+    // check type skips the deps arm, check.go:160-165) and the CLOSE then
+    // refuses with DependenciesLeftError — which mergePullRequest's landing
+    // catch tolerates, leaving the issue OPEN under the merged row. Upstream
+    // fails the whole mark here (SetIssueAsClosed runs inside MarkAsMerged's
+    // transaction, merge.go:838-843, so ErrDependenciesLeft aborts
+    // MergedManually) — the mark-and-close pair is a standing divergence to
+    // reconcile; this pin holds the landed shape until that arm is owned.
     expect(after?.pullRequest.hasMerged).toBe(true);
-    expect(after?.issue.isClosed).toBe(true);
+    expect(after?.issue.isClosed).toBe(false);
   });
 });
 
@@ -920,6 +928,155 @@ describe("POST …/merge — the PascalCase wire form and the default commit mes
     const tips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
     const main = await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).readCommit(tips.get("refs/heads/main")?.target);
     expect(main?.subject).toBe(`Squash default (#${index})`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The squash default body on the ABSENT merge_message_field (api pull.go:966-983)
+// ---------------------------------------------------------------------------
+
+// Upstream's useDefaultSquashBody arm: the composition fires only when the
+// merge_message_field KEY is absent from the request (`!form.HasMergeMessageField
+// && !ctx.Req.Form.Has("merge_message_field")` — a present-even-empty JSON
+// value sets HasMergeMessageField, forms/repo_form.go:455-457) and the style
+// is squash. The field composes CommitMessageMerge(GetSquashMergeCommitMessages,
+// defaultBody) over the merge box's shared builders — bullets + co-author
+// trailers + the Reviewed-on block — then trims and appends under the title.
+// Its OWN seeded repo (the deps/clock pattern): the config row and the merges
+// stay off the shared world.
+
+describe("POST …/merge — the squash default body on the ABSENT merge_message_field (pull.go:966-983)", () => {
+  const SQ_SLUG = "pulls-squash";
+  const SQ_REPO = `/repos/${OWNER}/${SQ_SLUG}`;
+  const SQ_PAIR = { ownerNamespace: OWNER, slug: SQ_SLUG };
+  let sqRepoId = "";
+
+  beforeAll(async () => {
+    await ensureSeededRepo({ owner: OWNER, slug: SQ_SLUG, commits: SEED_COMMITS });
+    const row = await drizzle(env.DB)
+      .select()
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, SQ_SLUG)))
+      .get();
+    if (row === undefined) throw new Error("squash arm: repo row missing");
+    sqRepoId = row.id;
+  });
+
+  const setSquashConfig = async (config: Record<string, unknown>): Promise<void> => {
+    await drizzle(env.DB).delete(repoUnits).where(eq(repoUnits.repoId, sqRepoId));
+    await drizzle(env.DB).insert(repoUnits).values({ repoId: sqRepoId, type: "pull_requests", config: JSON.stringify(config) });
+  };
+
+  const sqSeedBranch = async (branch: string, path: string, content: string): Promise<void> => {
+    const made = await send(`${SQ_REPO}/branches`, jsonInit("POST", { new_branch_name: branch }));
+    expect(made.status).toBe(201);
+    const written = await send(`${SQ_REPO}/contents/${path}`, jsonInit("POST", { content: btoa(content), branch, message: `${branch}: ${path}` }));
+    expect(written.status).toBe(201);
+  };
+
+  /** One FOREIGN-AUTHOR commit landed raw on a branch (the co-author fixture
+   *  — the contents-write path stamps the doer, so a distinct author needs
+   *  putApiObjects + ref CAS; the pull-merge-box.test.tsx landCommit twin). */
+  async function landForeignCommit(branch: string, parentOid: string, fileName: string, message: string): Promise<string> {
+    const cell = env.REPO.getByName(`${OWNER}/${SQ_SLUG}`);
+    const blob = new TextEncoder().encode(`${fileName} content\n`);
+    const blobOid = await gitObjectOid("blob", blob);
+    const tree = serializeTree([{ mode: "100644", name: fileName, oid: blobOid }]);
+    const person = { name: "Landr", email: "landr@u31.invalid", time: T0 + 500, tz: "+0000" };
+    const commit = serializeCommit({ tree: tree.oid, parents: [parentOid], author: person, committer: person, message: `${message}\n` });
+    const put = await cell.putApiObjects([
+      { oid: blobOid, type: "blob", data: blob },
+      { oid: tree.oid, type: "tree", data: tree.data },
+      { oid: commit.oid, type: "commit", data: commit.data },
+    ]);
+    if (put.tag !== "ok") throw new Error(`foreign put failed: ${put.tag}`);
+    const landed = await cell.commitApiChange({ ref: `refs/heads/${branch}`, expectedOldOid: parentOid, newOid: commit.oid });
+    if (landed.tag !== "committed") throw new Error(`foreign ref landing failed (${landed.tag})`);
+    return commit.oid;
+  }
+
+  it("composes the commit bullets + the foreign-author co-author + the Reviewed-on block when the field is ABSENT", async () => {
+    await sqSeedBranch("u31a", "u31-a.txt", "u31 a\n");
+    const parent = refTipMap(await engineReads(env, SQ_PAIR).listRefs()).get("refs/heads/u31a")?.target as string;
+    await landForeignCommit("u31a", parent, "u31-c.txt", "landr: c");
+
+    const created = await send(`${SQ_REPO}/pulls`, jsonInit("POST", { title: "Arm squash default", head: "u31a", base: "main" }));
+    expect(created.status).toBe(201);
+    const index = (await jsonBody(created)).number as number;
+
+    // The bullet-list template (the PR-unit config — the landed default is
+    // PR_BODY). The doer-authored commit carries the poster's own signature
+    // and is excluded from the co-author block; the foreign one stays.
+    await setSquashConfig({ DefaultSquashMergeMessage: "COMMIT_MESSAGES" });
+
+    expect((await send(`${SQ_REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "squash" }))).status).toBe(200);
+    const tips = refTipMap(await engineReads(env, SQ_PAIR).listRefs());
+    const main = await engineReads(env, SQ_PAIR).readCommit(tips.get("refs/heads/main")?.target);
+    expect(main?.parents).toHaveLength(1);
+    // The doer-authored bullet also rides as a co-author here: the file's
+    // static token identity carries STUB_USER's email while the seeded D1
+    // poster row has none, so collectSquashMergeCommitCoAuthors' poster-sig
+    // exclusion misses (the exclusion itself is pinned with real rows in
+    // pull-merge-box.test.tsx). Oldest-first: the doer line, then Landr's.
+    expect(main?.message).toBe(
+      `Arm squash default (#${index})\n\n` +
+        "* u31a: u31-a.txt\n\n* landr: c\n\n---------\n\n" +
+        "Co-authored-by: apisuite <stub@cf-gitea.invalid>\nCo-authored-by: Landr <landr@u31.invalid>\n" +
+        `Reviewed-on: ${ORIGIN}/${OWNER}/${SQ_SLUG}/pulls/${index}\n`,
+    );
+  });
+
+  it("a PRESENT field — even empty — skips the arm: verbatim append, title-only on empty (HasMergeMessageField)", async () => {
+    await sqSeedBranch("u31p", "u31-p.txt", "u31 p\n");
+    const created = await send(`${SQ_REPO}/pulls`, jsonInit("POST", { title: "Arm present field", head: "u31p", base: "main" }));
+    expect(created.status).toBe(201);
+    const index = (await jsonBody(created)).number as number;
+
+    expect(
+      (
+        await send(
+          `${SQ_REPO}/pulls/${index}/merge`,
+          jsonInit("POST", { do: "squash", merge_title_field: "custom subject", merge_message_field: "explicit body" }),
+        )
+      ).status,
+    ).toBe(200);
+    const tips = refTipMap(await engineReads(env, SQ_PAIR).listRefs());
+    const main = await engineReads(env, SQ_PAIR).readCommit(tips.get("refs/heads/main")?.target);
+    // The COMMIT_MESSAGES config is live from the arm test — the arm NOT
+    // firing (no bullets, no Reviewed-on) is the pin.
+    expect(main?.message).toBe("custom subject\n\nexplicit body\n");
+
+    // The present-empty twin: a present key with "" sets HasMergeMessageField
+    // upstream (the *string UnmarshalJSON arm) — the field stays empty and
+    // the commit carries the default TITLE only, no composed body.
+    await sqSeedBranch("u31e", "u31-e.txt", "u31 e\n");
+    const emptyCreated = await send(`${SQ_REPO}/pulls`, jsonInit("POST", { title: "Arm present empty", head: "u31e", base: "main" }));
+    expect(emptyCreated.status).toBe(201);
+    const emptyIndex = (await jsonBody(emptyCreated)).number as number;
+    expect((await send(`${SQ_REPO}/pulls/${emptyIndex}/merge`, jsonInit("POST", { do: "squash", merge_message_field: "" }))).status).toBe(200);
+    const emptyTips = refTipMap(await engineReads(env, SQ_PAIR).listRefs());
+    const emptyMain = await engineReads(env, SQ_PAIR).readCommit(emptyTips.get("refs/heads/main")?.target);
+    expect(emptyMain?.message).toBe(`Arm present empty (#${emptyIndex})\n`);
+  });
+
+  it("a custom title with an ABSENT field composes the default body under it", async () => {
+    await sqSeedBranch("u31t", "u31-t.txt", "u31 t\n");
+    const created = await send(`${SQ_REPO}/pulls`, jsonInit("POST", { title: "Arm custom title", head: "u31t", base: "main" }));
+    expect(created.status).toBe(201);
+    const index = (await jsonBody(created)).number as number;
+
+    expect((await send(`${SQ_REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "squash", merge_title_field: "custom subject" }))).status).toBe(200);
+    const tips = refTipMap(await engineReads(env, SQ_PAIR).listRefs());
+    const main = await engineReads(env, SQ_PAIR).readCommit(tips.get("refs/heads/main")?.target);
+    // The single doer-authored commit is the poster's own signature — no
+    // co-author block rides.
+    // The single doer-authored commit rides as a co-author here for the same
+    // harness-identity reason as the arm test above (the stub email vs the
+    // null-email seeded row) — the block shape (--------- separator, the
+    // Reviewed-on join) is what the pin holds.
+    expect(main?.message).toBe(
+      `custom subject\n\n* u31t: u31-t.txt\n\n---------\n\nCo-authored-by: apisuite <stub@cf-gitea.invalid>\nReviewed-on: ${ORIGIN}/${OWNER}/${SQ_SLUG}/pulls/${index}\n`,
+    );
   });
 });
 

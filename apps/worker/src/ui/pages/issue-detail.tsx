@@ -179,6 +179,7 @@ import {
 } from "../../api/services/repository";
 import { collaboratorModeOf } from "../../api/services/repo-collaborators";
 import { findPullRequestByIndex } from "../../api/services/pulls";
+import type { EngineReads } from "../../api/services/engine";
 import { getRepoAssignees } from "../../services/mentions/repo-assignees";
 import {
   issueDependencies,
@@ -646,6 +647,14 @@ function formatDueDate(date: Date): string {
  * issue_view.go:347-352 — the redirect target's own view then marks once).
  * Error posture is upstream's: a failed mark fails the view
  * (issue_view.go:390-392, ctx.ServerError("ReadBy", err)).
+ *
+ * `reads` is the optional engine read bundle the merge box's squash body
+ * prefill rides (pull-merge-box.tsx's optional-seam shape, the listTips
+ * precedent): this loader has no `env` in scope (D1 only), so the ROUTE
+ * callers that serve PR pages thread `engineReads(env, repo)` through —
+ * absent → the box degrades to the Reviewed-on-only body, upstream's own
+ * GetDefaultMergeMessage err arm (the same disclosed degradation the
+ * fragment route's seam documents).
  */
 export async function loadIssueDetailData(
   d1: D1Database,
@@ -654,6 +663,7 @@ export async function loadIssueDetailData(
   index: number,
   origin: string,
   viewer: Viewer,
+  reads?: EngineReads,
 ): Promise<IssueDetailData | null> {
   const issue = await findIssueByRepoAndIndex(d1, repo.id, index);
   if (issue === null) return null;
@@ -674,7 +684,7 @@ export async function loadIssueDetailData(
   // refusal either).
   const mergeBox =
     issue.isPull && pr !== null && !repo.isArchived
-      ? await loadPullMergeBoxData(d1, { repo, issue, pr, viewer, origin })
+      ? await loadPullMergeBoxData(d1, { repo, issue, pr, viewer, origin, ...(reads === undefined ? {} : { reads }) })
       : null;
 
   const [labels, timelineRows, milestoneRow, assigneeRows, projectRows] = await Promise.all([

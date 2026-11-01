@@ -9360,6 +9360,9 @@ async function pullMergeBoxRoute(c: Context<{ Bindings: Env }>): Promise<Respons
     // The merged box gates on real branch existence (absent = the assumed-
     // deletable degradation; the cleanup POST re-checks).
     listTips: (pair) => engineReads(c.env, pair).listRefs(),
+    // The squash body prefill's commit walk (U31's optional reads seam —
+    // absent renders the disclosed Reviewed-on-only degradation).
+    reads: engineReads(c.env, repo),
   });
   // null → the EMPTY fragment (upstream's ShowMergeBox=false arm — the
   // bundle's reload stop signal).
@@ -9402,7 +9405,7 @@ async function pullMergeBoxWriteRoute(
     return respond(new Response(null, { status: 303, headers: { location: outcome.location } }));
   }
   if (outcome.outcome === "not-found") return respond(c.html(renderNotFound(ctx), 404));
-  const data = await loadIssueDetailData(c.env.DB, repo, found.issue.isPull ? "pulls" : "issues", route.index, url.origin, viewer);
+  const data = await loadIssueDetailData(c.env.DB, repo, found.issue.isPull ? "pulls" : "issues", route.index, url.origin, viewer, engineReads(c.env, repo));
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   const access = await resolveIssueDetailAccess(c.env, repo, viewer, data.issue);
   return respond(c.html(renderIssueDetailPage(ctx, data, access, undefined, { content: errorContent, error: outcome.message }), 200));
@@ -14900,7 +14903,7 @@ async function issueCommentSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
     return respond(new Response(null, { status: 303, headers: { location: canonicalPath } }));
   }
   // Re-render with the message and the kept draft (the new-issue convention).
-  const data = await loadIssueDetailData(c.env.DB, repo, route.urlKind, route.index, url.origin, viewer);
+  const data = await loadIssueDetailData(c.env.DB, repo, route.urlKind, route.index, url.origin, viewer, engineReads(c.env, repo));
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   return respond(c.html(renderIssueDetailPage(ctx, data, access, { content: form.content, error: result.message }), 200));
 }
@@ -14934,7 +14937,7 @@ async function issueLabelsSubmit(c: Context<{ Bindings: Env }>): Promise<Respons
   if (result.outcome === "applied") {
     return respond(new Response(null, { status: 303, headers: { location: canonicalPath } }));
   }
-  const data = await loadIssueDetailData(c.env.DB, repo, issue.isPull ? "pulls" : "issues", issue.index, url.origin, viewer);
+  const data = await loadIssueDetailData(c.env.DB, repo, issue.isPull ? "pulls" : "issues", issue.index, url.origin, viewer, engineReads(c.env, repo));
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
   const access = await resolveIssueDetailAccess(c.env, repo, viewer, issue);
   return respond(c.html(renderIssueDetailPage(ctx, data, access, { content: "", error: result.message }), 200));
@@ -14992,7 +14995,7 @@ async function pullReviewSubmit(c: Context<{ Bindings: Env }>): Promise<Response
   } catch (error) {
     const message = pullReviewErrorMessage(error);
     if (message === null) throw error;
-    const data = await loadIssueDetailData(c.env.DB, repo, "pulls", route.index, url.origin, viewer);
+    const data = await loadIssueDetailData(c.env.DB, repo, "pulls", route.index, url.origin, viewer, engineReads(c.env, repo));
     if (data === null) return respond(c.html(renderNotFound(ctx), 404));
     const access = await resolveIssueDetailAccess(c.env, repo, viewer, data.issue);
     return respond(c.html(renderIssueDetailPage(ctx, data, access, undefined, { content: form.content, error: message }), 200));
@@ -15049,7 +15052,7 @@ async function pullReviewRequestSubmit(c: Context<{ Bindings: Env }>): Promise<R
   } catch (error) {
     const message = pullReviewErrorMessage(error);
     if (message === null) throw error;
-    const data = await loadIssueDetailData(c.env.DB, repo, "pulls", issue.index, url.origin, viewer);
+    const data = await loadIssueDetailData(c.env.DB, repo, "pulls", issue.index, url.origin, viewer, engineReads(c.env, repo));
     if (data === null) return respond(c.html(renderNotFound(ctx), 404));
     const access = await resolveIssueDetailAccess(c.env, repo, viewer, data.issue);
     return respond(c.html(renderIssueDetailPage(ctx, data, access, undefined, undefined, message), 200));
@@ -16573,7 +16576,7 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   // an unknown index 404-shells with the repo context (§4.5).
   if (route.family === "issue-detail") {
     const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
-    const data = await loadIssueDetailData(c.env.DB, repo, route.urlKind, route.index, url.origin, viewer);
+    const data = await loadIssueDetailData(c.env.DB, repo, route.urlKind, route.index, url.origin, viewer, engineReads(c.env, repo));
     if (data === null) return respond(c.html(renderNotFound(ctx), 404));
     const redirect = crossFamilyRedirect(route.urlKind, repoLink, data.issue.index, data.issue.isPull);
     if (redirect !== null) return respond(new Response(null, { status: 303, headers: { location: redirect } }));

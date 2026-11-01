@@ -248,18 +248,31 @@ Citations: `gitea/models/issues/pull.go`, `services/pull/pull.go`, `check.go`,
   pointer-typed, so a present lowercase value, even `""`, wins); the remaining
   fields are lowercase-only. The emitted OpenAPI document declares only the
   lowercase names.
-- **Merge commit message (as-built, 2026-10-30)**: a trimmed `merge_title_field`
+- **Merge commit message (as-built, 2026-11-02)**: a trimmed `merge_title_field`
   wins; empty/absent falls to the style's template-less default
   (`GetDefaultMergeMessage`, `services/pull/merge.go:112–148`) — rebase → `""`,
   squash → `{title} (#{index})`, otherwise
   `Merge pull request '{title}' (#{index}) from {head} into {base}` with the fork
   form `from {owner}/{name}:{head}` and `<deleted>:{head}` for a deleted head repo
   (`routers/api/v1/repo/pull.go:966–986`); a non-empty trimmed
-  `merge_message_field` appends as `\n\n{field}`. Documented divergences: the
-  `.gitea/default_merge_message/*.md` template resolution and the squash default
-  body (aggregated commit messages + `Reviewed-on`/`Reviewed-by` trailers,
-  `services/pull/pull.go:724–`) are not modeled — squash lands the default title
-  only. manually-merged composes no message (upstream returns before it).
+  `merge_message_field` appends as `\n\n{field}`. THE SQUASH DEFAULT BODY
+  (upstream's `useDefaultSquashBody`, `pull.go:966–983` — resolved 2026-11-02,
+  both paths): when the `merge_message_field` KEY IS ABSENT from the request
+  (`!HasMergeMessageField && !Req.Form.Has` — a present-even-empty value
+  suppresses the arm, `services/forms/repo_form.go:455–457`) and the style is
+  squash, the route composes `CommitMessageMerge(GetSquashMergeCommitMessages,
+  defaultBody)` — the aggregated commit bullets + co-author trailers + the
+  `Reviewed-on`/`Reviewed-by` block — through the merge box's shared builders
+  (ui/pages/pull-merge-box.tsx exports; the api→page seam). The web merge-box
+  path always carries the field (prefilled verbatim, upstream web
+  `pull.go:1116–1129` has no default-body arm) — the arm is API-only, exactly
+  upstream. The UI prefill (SPEC-0008's merge box, the U31 seam) composes the
+  identical bytes, so the divergence is closed on BOTH paths. Remaining
+  divergences: the `.gitea/default_merge_message/*.md` template resolution
+  (`merge.go:116–122`) stays unmodeled — the template-less default is the only
+  path; read failures degrade to the empty-strings shape (the box loader's
+  disclosed err-arm posture) instead of upstream's `APIErrorInternal` 500.
+  manually-merged composes no message (upstream returns before it).
 - **Work-in-progress**: titles prefixed `WIP:`, `[WIP]`, `Draft`, etc. block merge
   (`models/issues/pull.go HasWorkInProgressPrefix`).
 

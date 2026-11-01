@@ -1054,8 +1054,13 @@ function gitSigString(user: { displayName: string | null; username: string; emai
  *  latest APPROVE review (official-only, the DefaultMergeMessageOfficial
  *  ApproversOnly default; NOT dismissed-filtered — toCond touches dismissed
  *  only when set), oldest review first, the `reviewersWritten > maxReview
- *  ers` PRE-write break kept bug-for-bug (10 writes 11 upstream). */
-async function reviewedByLines(d1: D1Database, issueId: number): Promise<string> {
+ *  ers` PRE-write break kept bug-for-bug (10 writes 11 upstream).
+ *
+ *  Shared seam: exported for the API merge's compose arm
+ *  (api/services/pull-engine.ts — upstream's GetDefaultMergeMessage body
+ *  half), the same api→page import precedent as squashMergeCommitMessages
+ *  above. */
+export async function reviewedByLines(d1: D1Database, issueId: number): Promise<string> {
   const rows = await drizzle(d1)
     .select({ id: pullReviews.id, reviewerId: pullReviews.reviewerId })
     .from(pullReviews)
@@ -1087,8 +1092,10 @@ async function reviewedByLines(d1: D1Database, issueId: number): Promise<string>
  *  163-165) — `Reviewed-on: {absolute issue link}\n` + the Reviewed-by
  *  lines. The `.gitea/default_merge_message/*.md` template resolution that
  *  precedes it upstream stays unmodeled (the SPEC-0005 write-path note —
- *  the template-less default is the only path). */
-function defaultMergeBodyOf(absoluteIssueLink: string, reviewedBy: string): string {
+ *  the template-less default is the only path). Shared seam: exported for
+ *  the API merge's compose arm (api/services/pull-engine.ts), the same
+ *  api→page import precedent as the other exported builders. */
+export function defaultMergeBodyOf(absoluteIssueLink: string, reviewedBy: string): string {
   return `Reviewed-on: ${absoluteIssueLink}\n${reviewedBy}`;
 }
 
@@ -1102,13 +1109,21 @@ function defaultMergeBodyOf(absoluteIssueLink: string, reviewedBy: string): stri
  *  (the props stay "", pull_merge_form.go:77-83). THE >50-COMMIT
  *  DEGRADATION: upstream's rev-list walk keeps the 50 NEWEST commits, the
  *  engine's paged read answers the range's OLDEST first page — the bullet
- *  SET differs past 50 commits, the order and format never. */
-async function squashMergeCommitMessages(
+ *  SET differs past 50 commits, the order and format never.
+ *
+ *  Shared seam: the API merge's compose arm (api/services/pull-engine.ts —
+ *  upstream's routers/api/v1/repo/pull.go:969-983 GetSquashMergeCommitMessages
+ *  call) consumes this exact builder, mirroring the established api→page
+ *  import precedent (services/upload-staging.ts → pages/repo-editor-tails);
+ *  the back-edge is lazy (call-time bindings only — pull-merge-box imports
+ *  composeMergeMessage from the same module it exports to). The input is the
+ *  minimal slice (issue/pr/reads) the walk reads, not the full box input. */
+export async function squashMergeCommitMessages(
   d1: D1Database,
-  input: PullMergeBoxInput,
+  seam: { issue: IssueRow; pr: PullRequestRow; reads?: EngineReads },
   defaultSquashMergeMessage: string,
 ): Promise<string> {
-  const { issue, pr, reads } = input;
+  const { issue, pr, reads } = seam;
   if (reads === undefined) return "";
   const baseTip = await reads.readCommit(branchRef(pr.baseBranch));
   const headCommit = await reads.readCommit(pullHeadRef(pr.index));

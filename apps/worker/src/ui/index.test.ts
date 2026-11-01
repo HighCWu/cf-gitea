@@ -22,8 +22,12 @@ import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../auth/testing/seeds";
 import { applyTwofaEnrollment, clearTwofaSetCookie, generateTotpSecret, mintPendingTicket } from "../auth/two-factor";
 import { totpCode } from "../auth/totp";
-import { comments, externalLoginUsers, issuePins, issues, loginSources, orgMembers, repositories, repoSettings, repoTransfer, teamMembers, trackedTimes, twoFactor, userSettingsKv, users } from "../db/schema";
+import { comments, externalLoginUsers, issuePins, issues, loginSources, orgMembers, PRStatus, pullRequests, repositories, repoSettings, repoTransfer, repoUnits, teamMembers, trackedTimes, twoFactor, userSettingsKv, users } from "../db/schema";
 import type { RepositoryWithOwner } from "../api/services/repository";
+import { branchRef, pullHeadRef, ZERO_OID } from "../api/services/engine";
+import { RepoService } from "../repos/service";
+import { IssuesService } from "../issues/service";
+import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 import { createWikiPageFromForm, parseWikiPageForm, wikiTipOf } from "./pages/repo-wiki";
 import { TeamsService } from "../api/routes/org-teams";
 import { OrgService } from "../services/orgs/orgs";
@@ -1133,6 +1137,124 @@ describe("uiRouter", () => {
     const twin = await fetchAuthed("/-/admin/auths/1/delete", cookie);
     expect(twin.status).toBe(405);
     expect(twin.headers.get("allow")).toBe("POST");
+  });
+});
+
+// --- the merge box fragment's reads-fed squash prefill (U31's handoff) -------
+// --- the route's `reads: engineReads(c.env, repo)` input through the mount ---
+
+describe("GET /:owner/:repo/pulls/:index/merge_box — the reads-fed squash prefill through the mount", () => {
+  /** Worker-side object hash + one commit landed on a ref (the
+   *  pull-merge-box.test.tsx landCommit twin — workerd crypto.subtle). */
+  async function fragObjectOid(type: string, data: Uint8Array): Promise<string> {
+    const header = new TextEncoder().encode(`${type} ${data.byteLength}\0`);
+    const bytes = new Uint8Array(header.byteLength + data.byteLength);
+    bytes.set(header, 0);
+    bytes.set(data, header.byteLength);
+    const digest = await crypto.subtle.digest("SHA-1", bytes);
+    return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  it("a stored-PR render carries the commit bullets in the textarea, not the Reviewed-on-only degradation", async () => {
+    const alice = await seedVerifiedUser({ username: "U31Boxer" });
+    const repo = await new RepoService(env.DB).create({
+      owner: { id: alice.id, usernameLower: "u31boxer" },
+      name: "fragbox",
+      isPrivate: false,
+      status: "ready",
+    });
+    const cell = env.REPO.getByName("u31boxer/fragbox");
+    const land = async (
+      ref: string,
+      parents: string[],
+      message: string,
+      fileName: string,
+      content: string,
+      replaceOid?: string,
+    ): Promise<string> => {
+      const blob = new TextEncoder().encode(content);
+      const blobOid = await fragObjectOid("blob", blob);
+      const tree = serializeTree([{ mode: "100644", name: fileName, oid: blobOid }]);
+      const person = { name: "seed", email: "seed@mergetest.invalid", time: 1_700_000_000, tz: "+0000" };
+      const commit = serializeCommit({ tree: tree.oid, parents, author: person, committer: person, message: `${message}\n` });
+      const put = await cell.putApiObjects([
+        { oid: blobOid, type: "blob", data: blob },
+        { oid: tree.oid, type: "tree", data: tree.data },
+        { oid: commit.oid, type: "commit", data: commit.data },
+      ]);
+      if (put.tag !== "ok") throw new Error(`frag put failed: ${put.tag}`);
+      const landed = await cell.commitApiChange({ ref, expectedOldOid: replaceOid ?? ZERO_OID, newOid: commit.oid });
+      if (landed.tag !== "committed") throw new Error(`frag ref landing failed: ${ref} (${landed.tag})`);
+      return commit.oid;
+    };
+
+    const rootOid = await land(branchRef("main"), [], "root", "README.md", "# fragbox\n");
+    await cell.setHead("main");
+    const c1 = await land(branchRef("fragbranch"), [rootOid], "frag: one\n\nwith a body", "FRAG_ONE.md", "one\n");
+    const c2 = await land(branchRef("fragbranch"), [c1], "frag: two", "FRAG_TWO.md", "two\n", c1);
+
+    const { pullRequest } = await new IssuesService(env.DB).createPullRequest({
+      repoId: repo.id,
+      title: "feat: frag squash",
+      posterId: alice.id,
+      headRepoId: repo.id,
+      baseBranch: "main",
+      headBranch: "fragbranch",
+      content: "the frag body",
+      now: new Date(1_761_000_000_000),
+    });
+    const index = pullRequest.index;
+    await drizzle(env.DB).update(pullRequests).set({ status: PRStatus.Mergeable, headSha: c2 }).where(eq(pullRequests.id, pullRequest.id));
+    const landed = await cell.commitApiChange({ ref: pullHeadRef(index), expectedOldOid: ZERO_OID, newOid: c2 });
+    if (landed.tag !== "committed") throw new Error(`frag pull ref landing failed (${landed.tag})`);
+    // The squash-default style + the COMMIT_MESSAGES template — the composed
+    // default the write path stores for an unedited submit.
+    await drizzle(env.DB).delete(repoUnits).where(eq(repoUnits.repoId, repo.id));
+    await drizzle(env.DB).insert(repoUnits).values({
+      repoId: repo.id,
+      type: "pull_requests",
+      config: JSON.stringify({ DefaultMergeStyle: "squash", DefaultSquashMergeMessage: "COMMIT_MESSAGES" }),
+    });
+    void rootOid;
+
+    const cookie = await mintSession(env.DB, alice.id);
+    const res = await uiRouter.fetch(
+      new Request(`https://test.local/u31boxer/fragbox/pulls/${index}/merge_box`, {
+        headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}` },
+      }),
+      uiEnv,
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type") ?? "").toContain("text/html");
+    const html = await res.text();
+
+    // The composed body rides as the textarea's content (HTML-escaped like
+    // any text node — the signature angle brackets): the walk's two bullets
+    // oldest-first, the co-author block (the commit author "seed" is nobody's
+    // account — the poster row carries no email), and the Reviewed-on line
+    // joined through CommitMessageMerge. The Reviewed-on-ONLY shape is the
+    // ABSENT-reads degradation — its absence here is the wiring pin.
+    const body =
+      "* frag: one\n\nwith a body\n\n* frag: two\n\n---------\n\n" +
+      "Co-authored-by: seed <seed@mergetest.invalid>\n" +
+      `Reviewed-on: https://test.local/u31boxer/fragbox/pulls/${index}`;
+    const escaped = body.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+    expect(html).toContain(`>${escaped}</textarea>`);
+    // The composed default swaps the title too (the style-switch pair).
+    expect(html).toContain(`name="merge_title_field" value="feat: frag squash (#${index})"`);
+
+    // Wire two's surface: the FULL PAGE render — loadIssueDetailData's
+    // threaded optional reads (the route callers feed engineReads) — embeds
+    // the same composed body inline.
+    const page = await uiRouter.fetch(
+      new Request(`https://test.local/u31boxer/fragbox/pulls/${index}`, {
+        headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}` },
+      }),
+      uiEnv,
+    );
+    expect(page.status).toBe(200);
+    const pageHtml = await page.text();
+    expect(pageHtml).toContain(`>${escaped}</textarea>`);
   });
 });
 
