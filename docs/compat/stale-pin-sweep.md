@@ -140,7 +140,7 @@ literals; counts are pins evaluated against the live parser:
 | `settings/wiki` (+ `/wikis` misspelling) | 3 | valid |
 | `upload` (file-upload family) | 0 | clean |
 | `patch/` (editor-patch) | 0 | clean |
-| `cherrypick/` | 0 | clean |
+| `cherrypick/` | 4 (re-run 2026-11-01, post-F5 rename `6a91a5c`) | valid — all intentional: the bare `cherrypick` head is NOT an editor_action (upstream's own spelling is `_cherrypick`, web.go:1468) so bare stays engine-owned, pinned as fall-through/null at index.test.ts:286 (`handlesUiRoute` false) + :603 and editor-tails.matrix.test.tsx:329 (both parse null) and repo-editor-cherrypick.smoke.test.tsx:223 (the bare fetch 404s through the mount); the one stale pin this rename created — the matrix's forward-prefill form-action at editor-tails.matrix.test.tsx:770, which pinned the broken bare emitter — flipped to `_cherrypick` (`2deece6` follow-up) |
 | `repo/migrate` | — | **1 stale positive-form pin** (finding 4); `repo-migrate.test.ts` claim pins themselves pass solo |
 | `repo/search` (search aux) | 0 | clean |
 | `issues/search`, `issues/suggestions` (aux feeds) | 0 | clean |

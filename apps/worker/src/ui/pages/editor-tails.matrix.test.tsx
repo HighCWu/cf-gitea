@@ -767,7 +767,7 @@ describe("cherry-pick GET (the forward prefill and the ?cherry-pick-type=revert 
     const html = await res.text();
 
     expect(html).toContain('<div role="main" aria-label="add feature file" class="page-content repository file editor edit">');
-    expect(html).toContain(`<form class="ui edit form form-fetch-action" method="post" action="/alice/edittailspick/cherrypick/${sha2}/side">`);
+    expect(html).toContain(`<form class="ui edit form form-fetch-action" method="post" action="/alice/edittailspick/_cherrypick/${sha2}/side">`);
     expect(html).toContain('<input type="hidden" name="revert" value="false"/>');
     // The breadcrumb: "Cherry-pick {short sha} onto:" over the commit link and
     // the URL branch (cherry_pick.tmpl:12-22).
