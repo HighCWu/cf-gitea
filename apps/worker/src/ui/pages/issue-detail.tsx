@@ -152,7 +152,7 @@
  * degrades to the plain no-content variant (markdown never breaks the page).
  */
 
-import { and, eq, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, ne, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { renderMarkdownToHtml } from "../../api/services/markdown";
@@ -164,13 +164,32 @@ import {
   listIssueAssignees,
   listIssueTimeline,
 } from "../../api/services/issues";
-import { checkIssueSubscription } from "../../api/services/issue-extras";
-import { listProjects, repoProjectScope, type ProjectRow } from "../../api/services/projects";
-import type { UserRow } from "../../api/services/repository";
+import { ALLOWED_REACTIONS, checkIssueSubscription, listTargetReactions, type ReactionRow } from "../../api/services/issue-extras";
+import { findIssueByIdGlobally, listProjects, repoProjectScope, type ProjectRow } from "../../api/services/projects";
+import {
+  canViewRepositoryWithTeams,
+  findRepositoriesByIds,
+  findRepositoryById,
+  type RepositoryRow,
+  type RepositoryWithOwner,
+  type UserRow,
+  type Viewer as ApiViewer,
+} from "../../api/services/repository";
 import { collaboratorModeOf } from "../../api/services/repo-collaborators";
 import { findPullRequestByIndex } from "../../api/services/pulls";
 import { getRepoAssignees } from "../../services/mentions/repo-assignees";
-import { issuePins, issues as issuesTable, milestones, projectIssues, projects, users } from "../../db/schema";
+import {
+  issueDependencies,
+  issuePins,
+  issueStopwatches,
+  issues as issuesTable,
+  milestones,
+  projectIssues,
+  projects,
+  reactions as reactionsTable,
+  trackedTimes,
+  users,
+} from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import { IssuesService } from "../../issues/service";
 import { IssueAlreadyChangedError, IssueError } from "../../issues/errors";
@@ -258,6 +277,36 @@ export const issueDetailLocale = {
   lock_reason: "Reason for locking", // "repo.issues.lock.reason"
   lock_confirm: "Lock", // "repo.issues.lock_confirm"
   unlock_confirm: "Unlock", // "repo.issues.unlock_confirm"
+  // Census gap #1 part two (the timeline writes — the upstream locale
+  // strings verbatim; the POST routes live in pages/
+  // issue-timeline-writes.ts, the mount recipe is that module's header).
+  no_ref: "No Branch/Tag Specified", // "repo.issues.no_ref"
+  dependencies: "Dependencies", // "repo.issues.dependency.title"
+  no_dependencies: "No dependencies set.", // "repo.issues.dependency.issue_no_dependencies" (the PR twin's string is identical)
+  blocks_short: "Blocks", // "repo.issues.dependency.blocks_short"
+  blocked_by_short: "Depends on", // "repo.issues.dependency.blocked_by_short"
+  add_dependency: "Add dependency…", // "repo.issues.dependency.add"
+  dependency_remove: "Remove", // "repo.issues.dependency.remove"
+  dependency_hidden_1: "You do not have permission to read 1 dependency", // "repo.issues.dependency.no_permission_1"
+  dependency_hidden_n: (n: number): string => `You do not have permission to read ${n} dependencies`, // "repo.issues.dependency.no_permission_n"
+  dependency_hidden_can_remove: "You do not have permission to read this dependency but can remove this dependency", // "repo.issues.dependency.no_permission.can_remove"
+  tracker: "Time Tracker", // "repo.issues.tracker"
+  timer_start: "Start timer", // "repo.issues.timetracker_timer_start"
+  timer_stop: "Stop timer", // "repo.issues.timetracker_timer_stop"
+  timer_discard: "Discard timer", // "repo.issues.timetracker_timer_discard"
+  timer_add: "Add Time", // "repo.issues.timetracker_timer_manually_add"
+  add_time_manually: "Manually Add Time", // "repo.issues.add_time_manually"
+  add_time_hours: "Hours", // "repo.issues.add_time_hours"
+  add_time_minutes: "Minutes", // "repo.issues.add_time_minutes"
+  time_estimate_set: "Set estimated time", // "repo.issues.time_estimate_set"
+  time_estimate_display: "Estimate: ", // "repo.issues.time_estimate_display" prefix (the value renders after)
+  tracking_already_started_prefix: "You have already started time tracking on ", // "repo.issues.tracking_already_started" head (the <a> renders mid-string)
+  tracking_already_started_tail: "!", // the sentence tail
+  total_time_spent: "Total Time Spent: ", // "repo.issues.time_spent_from_all_authors" prefix
+  reactions: "Reactions", // "repo.reactions"
+  edit_comment: "Edit", // "repo.issues.context.edit"
+  delete_comment: "Delete", // "repo.issues.context.delete"
+  delete_issue: "Delete", // "repo.issues.delete" (the issue_management trash button)
 } as const;
 
 /** `setting.Repository.Issue.MaxPinned` default (modules/setting/repository.go:223
@@ -270,9 +319,205 @@ export const ISSUE_DETAIL_MAX_PINNED = 3;
  *  `setting.Repository.Issue.LockReasons` (modules/setting/repository.go:222). */
 export const ISSUE_LOCK_REASONS: readonly string[] = ["Too heated", "Off-topic", "Spam", "Resolved"];
 
+/** The reaction short-code → emoji rendering (upstream ReactionToEmoji,
+ *  templates/helper.go:115 → modules/emoji's gemoji data — the instance
+ *  default set's exact eight, public/assets/emoji.json). */
+export const REACTION_EMOJI: Readonly<Record<string, string>> = {
+  "+1": "👍",
+  "-1": "👎",
+  laugh: "😆",
+  hooray: "🎉",
+  confused: "😕",
+  heart: "❤️",
+  rocket: "🚀",
+  eyes: "👀",
+};
+
+/** One grouped reaction surface: the type, its count, and the reacting
+ *  user ids (the render's has-reacted toggle reads the viewer against
+ *  them — shared/reactions.tmpl's `$value.HasUser`). */
+export interface ReactionGroup {
+  type: string;
+  count: number;
+  userIds: number[];
+}
+
+/** GroupByType (models/issues/reaction.go) over the id-ordered rows — the
+ *  first-appearance order the template renders in. */
+export function groupReactions(rows: ReactionRow[]): ReactionGroup[] {
+  const groups: ReactionGroup[] = [];
+  const byType = new Map<string, ReactionGroup>();
+  for (const row of rows) {
+    let group = byType.get(row.type);
+    if (group === undefined) {
+      group = { type: row.type, count: 0, userIds: [] };
+      byType.set(row.type, group);
+      groups.push(group);
+    }
+    group.count += 1;
+    group.userIds.push(row.userId);
+  }
+  return groups;
+}
+
+/** One dependency-list entry: the OTHER issue with its repo row and the
+ *  viewer's read verdict (issue_dependencies.tmpl's
+ *  BlockedBy/BlockingDependencies vs NotPermitted split). */
+export interface DependencyEntry {
+  issue: IssueRow;
+  repo: RepositoryRow;
+  permitted: boolean;
+}
+
+export interface IssueDependenciesData {
+  /** The issues `issue` BLOCKS (the edge (other, issue) side). */
+  blocking: DependencyEntry[];
+  /** The issues `issue` DEPENDS ON (the edge (issue, other) side). */
+  blockedBy: DependencyEntry[];
+  blockingHidden: number;
+  blockedByHidden: number;
+}
+
 /** Timeline cap (upstream renders the full timeline unpaginated; the cap
  *  bounds the render for pathological threads without changing the order). */
 export const TIMELINE_LIMIT = 500;
+
+// ---------------------------------------------------------------------------
+// Census gap #1 part two reads (the timeline-write family's display inputs)
+// ---------------------------------------------------------------------------
+
+/** The doer's running stopwatch (HasUserStopwatch — models/issues/
+ * stopwatch.go:31-42's per-user read; at most one row exists, so the
+ * single-row probe is exact). The WRITE seams in pages/
+ * issue-timeline-writes.ts import these reads (the render→write import
+ * direction keeps the pair acyclic). */
+export async function stopwatchOfUser(d1: D1Database, userId: number): Promise<{ id: number; issueId: number; createdAt: Date } | null> {
+  const row = await drizzle(d1)
+    .select({ id: issueStopwatches.id, issueId: issueStopwatches.issueId, createdAt: issueStopwatches.createdAt })
+    .from(issueStopwatches)
+    .where(eq(issueStopwatches.userId, userId))
+    .limit(1)
+    .then((rows) => rows[0]);
+  return row ?? null;
+}
+
+/** The doer's stopwatch ON ONE ISSUE (getStopwatch, stopwatch.go:31-37). */
+export async function stopwatchOfIssue(d1: D1Database, userId: number, issueId: number): Promise<{ id: number; createdAt: Date } | null> {
+  const row = await drizzle(d1)
+    .select({ id: issueStopwatches.id, createdAt: issueStopwatches.createdAt })
+    .from(issueStopwatches)
+    .where(and(eq(issueStopwatches.userId, userId), eq(issueStopwatches.issueId, issueId)))
+    .limit(1)
+    .then((rows) => rows[0]);
+  return row ?? null;
+}
+
+/** The service-side identity of the session viewer (the packages module's
+ *  conversion — the api Viewer's requester slice the repo-visibility
+ *  predicates read; the file-private twin re-ported here). */
+function detailApiUser(viewer: Viewer): ApiViewer["requester"] {
+  return viewer.kind === "user" ? { id: viewer.id, login: viewer.username, is_admin: viewer.isAdmin } : null;
+}
+
+/** TotalTimesForEachUser (models/issues/tracked_time.go over the live
+ *  rows — issue_view.go:614's WorkingUsers), username order. */
+async function workingUsersOf(d1: D1Database, issueId: number): Promise<Array<{ user: UserRow; seconds: number }>> {
+  const rows = await drizzle(d1)
+    .select({ userId: trackedTimes.userId, seconds: trackedTimes.seconds })
+    .from(trackedTimes)
+    .where(and(eq(trackedTimes.issueId, issueId), eq(trackedTimes.deleted, false)))
+    .all();
+  if (rows.length === 0) return [];
+  const sums = new Map<number, number>();
+  for (const row of rows) {
+    sums.set(row.userId, (sums.get(row.userId) ?? 0) + row.seconds);
+  }
+  const userRows = await drizzle(d1).select().from(users).where(inArray(users.id, [...sums.keys()])).orderBy(users.username).all();
+  return userRows.map((user) => ({ user, seconds: sums.get(user.id) ?? 0 }));
+}
+
+/** SecToHours (the stopwatch/tracked-time chrome format — "1 hour 2
+ *  minutes"; the landed issue-tables-t2 port's exact shape). The WRITE
+ *  seams in pages/issue-timeline-writes.ts import this (the render→write
+ *  import direction). */
+export function secToHours(totalSeconds: number): string {
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor(totalSeconds / 60) % 60;
+  const unit = (value: number, name: string): string =>
+    value === 1 ? `1 ${name} ` : value > 1 ? `${value} ${name}s ` : "";
+  let out = `${unit(hours, "hour")}${unit(minutes, "minute")}`;
+  if (out === "" && totalSeconds > 0) {
+    out = unit(totalSeconds, "second");
+  }
+  return out.replace(/ $/, "");
+}
+
+/** TimeEstimateString (modules/util/time_str.go:82-92): the compact
+ *  "1h2m" chain, largest unit first — the estimate input's prefilled
+ *  value and the sidebar's display line. */
+export function timeEstimateString(amount: number): string {
+  let rest = amount;
+  let out = "";
+  for (const [unit, num] of [
+    ["h", 3600],
+    ["m", 60],
+    ["s", 1],
+  ] as const) {
+    if (rest >= num) {
+      out += `${Math.floor(rest / num)}${unit}`;
+      rest %= num;
+    }
+  }
+  return out;
+}
+
+/** The dependency block's edge read (BlockedByDependencies /
+ *  BlockingDependencies, issue.go:670-708): the edges touching this issue,
+ *  the OTHER issues + their repo rows joined in, and the per-entry read
+ *  verdict (same-repo always; foreign through the viewer-visibility
+ *  predicate — the upstream GetDoerRepoPermission.CanReadIssuesOrPulls
+ *  stand-in; the batched-verdict shape of the API port's
+ *  prepareBlockerBatch). */
+async function dependenciesOf(d1: D1Database, issue: IssueRow, origin: string, viewer: Viewer): Promise<IssueDependenciesData> {
+  const edges = await drizzle(d1)
+    .select({ issueId: issueDependencies.issueId, dependencyId: issueDependencies.dependencyId })
+    .from(issueDependencies)
+    .where(or(eq(issueDependencies.issueId, issue.id), eq(issueDependencies.dependencyId, issue.id)))
+    .all();
+  // blockedBy: the edges (issue, other) — this issue depends on them;
+  // blocking: the edges (other, issue) — they depend on this one.
+  const blockedByIds = edges.filter((edge) => edge.issueId === issue.id).map((edge) => edge.dependencyId);
+  const blockingIds = edges.filter((edge) => edge.dependencyId === issue.id).map((edge) => edge.issueId);
+  const otherIds = [...new Set([...blockedByIds, ...blockingIds])];
+  const otherIssues = otherIds.length === 0 ? [] : await drizzle(d1).select().from(issuesTable).where(inArray(issuesTable.id, otherIds)).all();
+  const repoIds = [...new Set(otherIssues.map((row) => row.repoId))];
+  const pairs = repoIds.length === 0 ? new Map<string, RepositoryWithOwner>() : await findRepositoriesByIds(d1, repoIds);
+  const byId = new Map(otherIssues.map((row) => [row.id, row]));
+  const apiViewer: ApiViewer = { origin, requester: detailApiUser(viewer) };
+  const canView = new Map<string, boolean>();
+  for (const repoId of repoIds) {
+    if (repoId === issue.repoId) continue;
+    const pair = pairs.get(repoId);
+    if (pair !== undefined) {
+      canView.set(repoId, await canViewRepositoryWithTeams(d1, apiViewer, pair.repo));
+    }
+  }
+  const build = (ids: number[]): DependencyEntry[] =>
+    ids.flatMap((id) => {
+      const other = byId.get(id);
+      const pair = other === undefined ? undefined : pairs.get(other.repoId);
+      if (other === undefined || pair === undefined) return [];
+      return [{ issue: other, repo: pair.repo, permitted: other.repoId === issue.repoId || canView.get(other.repoId) === true }];
+    });
+  const blockedBy = build(blockedByIds);
+  const blocking = build(blockingIds);
+  return {
+    blockedBy,
+    blocking,
+    blockedByHidden: blockedBy.filter((value) => !value.permitted).length,
+    blockingHidden: blocking.filter((value) => !value.permitted).length,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Data loading (§3.2 direct service calls)
@@ -311,6 +556,31 @@ export interface IssueDetailData {
   /** Wave-11: the visible review rows (PRs only — the sidebar Reviewers
    *  section; the pending-privacy filter applied per the viewer). */
   reviews: PullReviewEntry[];
+  /** Census gap #1 part two: the issue-surface reaction groups (commentId
+   *  0 — view_content.tmpl:58-61's bar) and the timeline comment bars'
+   *  groups keyed by comment row id (comments.tmpl:73-77). */
+  issueReactions: ReactionGroup[];
+  commentReactions: Map<number, ReactionGroup[]>;
+  /** Census gap #1 part two: the signed viewer's running stopwatch
+   *  (HasUserStopwatch — at most one row per user); `null` = anonymous.
+   *  The sidebar timetracker block's running/other arms read it. */
+  viewerStopwatch: { issueId: number; createdAt: Date } | null;
+  /** Census gap #1 part two: the OtherStopwatchURL arm (stopwatch_
+   *  timetracker.tmpl's warning link) — the canonical page of the OTHER
+   *  issue the viewer's stopwatch runs on, `null` when it runs here (or
+   *  nowhere, or its row/repo vanished). */
+  otherStopwatchUrl: string | null;
+  /** Census gap #1 part two: TotalTimesForEachUser over the live rows
+   *  (issue_view.go:614 — the WorkingUsers list), username order. */
+  workingUsers: Array<{ user: UserRow; seconds: number }>;
+  /** Census gap #1 part two: the dependency block's two edge lists with
+   *  the per-entry read verdict (issue_dependencies.tmpl). */
+  dependencies: IssueDependenciesData;
+  /** Census gap #1 part two: the dependency add-form's candidates — the
+   *  same-repo issues excluding this one (upstream's search dropdown is a
+   *  JS fetch; AllowCrossRepositoryDependencies defaults false), newest
+   *  first, capped; `null` = not a writer (the form never renders). */
+  dependencyCandidates: IssueRow[] | null;
 }
 
 /**
@@ -463,6 +733,51 @@ export async function loadIssueDetailData(
     // comment: omitted rather than approximated).
   }
 
+  // Census gap #1 part two: the reaction bars (the issue surface + every
+  // rendered comment's bar — one batched query over the rendered comment
+  // ids, the landed listTargetReactions filter shape), the viewer's
+  // running stopwatch, the WorkingUsers totals, and the dependency edges.
+  const commentIds = timeline.filter((entry) => entry.kind === "comment").map((entry) => entry.comment.id);
+  const [issueReactionRows, commentReactionRows, viewerStopwatch, workingUsers, dependencies] = await Promise.all([
+    listTargetReactions(d1, issue.id, 0),
+    commentIds.length === 0
+      ? Promise.resolve([] as Array<{ id: number; userId: number; type: string; commentId: number }>)
+      : drizzle(d1)
+          .select({ id: reactionsTable.id, userId: reactionsTable.userId, type: reactionsTable.type, commentId: reactionsTable.commentId })
+          .from(reactionsTable)
+          .where(and(eq(reactionsTable.issueId, issue.id), inArray(reactionsTable.commentId, commentIds), eq(reactionsTable.releaseId, 0)))
+          .orderBy(asc(reactionsTable.id))
+          .all(),
+    viewer.kind === "user" ? stopwatchOfUser(d1, viewer.id) : Promise.resolve(null),
+    workingUsersOf(d1, issue.id),
+    dependenciesOf(d1, issue, origin, viewer),
+  ]);
+  const commentReactions = new Map<number, ReactionGroup[]>();
+  for (const row of commentReactionRows) {
+    const groups = commentReactions.get(row.commentId) ?? [];
+    const group = groups.find((candidate) => candidate.type === row.type);
+    if (group === undefined) {
+      groups.push({ type: row.type, count: 1, userIds: [row.userId] });
+    } else {
+      group.count += 1;
+      group.userIds.push(row.userId);
+    }
+    commentReactions.set(row.commentId, groups);
+  }
+
+  // The OtherStopwatchURL arm — the OTHER issue the viewer's stopwatch
+  // runs on (stopwatch_timetracker.tmpl's warning link). A missing row or
+  // repo degrades to no link (the message renders without it only in the
+  // logged-in block; a vanished row keeps the arm silent).
+  let otherStopwatchUrl: string | null = null;
+  if (viewerStopwatch !== null && viewerStopwatch.issueId !== issue.id) {
+    const otherIssue = await findIssueByIdGlobally(d1, viewerStopwatch.issueId);
+    const otherRepo = otherIssue === null ? null : await findRepositoryById(d1, otherIssue.repoId);
+    if (otherIssue !== null && otherRepo !== null) {
+      otherStopwatchUrl = `/${otherRepo.repo.ownerNamespace}/${otherRepo.repo.slug}/${otherIssue.isPull ? "pulls" : "issues"}/${otherIssue.index}`;
+    }
+  }
+
   return {
     urlKind,
     issue,
@@ -477,6 +792,13 @@ export async function loadIssueDetailData(
     mergerName: pr !== null && pr.hasMerged ? nameOf(pr.mergerId ?? null) : null,
     bodyHtml: renderIssueMarkdown({ text: issue.content ?? "", repo, origin }),
     timeline,
+    issueReactions: groupReactions(issueReactionRows),
+    commentReactions,
+    viewerStopwatch,
+    otherStopwatchUrl,
+    workingUsers,
+    dependencies,
+    dependencyCandidates: null, // the writer-gated list fills in resolveIssueDetailAccess
   };
 }
 
@@ -552,6 +874,16 @@ export interface IssueDetailAccess {
   /** Census gap #1: the assignee select's candidates — GetRepoAssignees
    *  (retrieveAssigneesData's enumeration); `null` = not a writer. */
   assigneeOptions: UserRow[] | null;
+  /** Census gap #1 part two: the default-settings CanUseTimetracker
+   *  (services/context/repo.go:270 — the timetracker has no settings
+   *  module landed, so enabled + AllowOnlyContributorsToTrackTime=false
+   *  hold and ANY signed-in viewer passes; the gate is the session +
+   *  the live repo). Gates the sidebar timetracker block's write forms. */
+  canUseTimetracker: boolean;
+  /** Census gap #1 part two: the dependency add-form's candidates (same
+   *  repo, excluding this issue, newest first — the module header's
+   *  cross-repo-default note); `null` = not a writer. */
+  dependencyCandidates: IssueRow[] | null;
 }
 
 /** Resolve both grants in one place (the settings gate's order: anonymous
@@ -581,6 +913,8 @@ export async function resolveIssueDetailAccess(
       milestoneOptions: null,
       projectOptions: null,
       assigneeOptions: null,
+      canUseTimetracker: false,
+      dependencyCandidates: null,
     };
   }
   const d1 = env.DB;
@@ -654,6 +988,18 @@ export async function resolveIssueDetailAccess(
       assigneeOptions.push(current);
     }
   }
+  // Census gap #1 part two: the dependency candidates (same repo, this
+  // issue excluded, newest first — the add-form select's options; upstream
+  // cross-repo dependencies default off, the module header).
+  const dependencyCandidates = canModifyIssueOrPull
+    ? await drizzle(d1)
+        .select()
+        .from(issuesTable)
+        .where(and(eq(issuesTable.repoId, repo.id), ne(issuesTable.id, issue.id)))
+        .orderBy(desc(issuesTable.updatedAt))
+        .limit(ISSUE_DETAIL_PICKER_LIMIT)
+        .all()
+    : null;
   return {
     canChangeState,
     labelOptions: labelOptionsValue,
@@ -675,6 +1021,8 @@ export async function resolveIssueDetailAccess(
     milestoneOptions: canModifyIssueOrPull ? { open: openMilestones, closed: closedMilestones } : null,
     projectOptions: canModifyIssueOrPull ? { open: [...openProjects, ...ownerProjects], closed: closedProjects } : null,
     assigneeOptions: canModifyIssueOrPull ? assigneeOptions : null,
+    canUseTimetracker: !repo.isArchived,
+    dependencyCandidates,
   };
 }
 
@@ -1037,9 +1385,101 @@ function CommentBody(props: { bodyHtml: string }) {
   );
 }
 
+/** The shared/reactions.tmpl bar reduced to no-JS forms (census gap #1
+ *  part two): the grouped labels (each a toggle form when the viewer can
+ *  react — POST `{actionUrl}/{unreact|react}` with the hidden `content`),
+ *  a disabled label otherwise, and the picker reduced to a disclosure
+ *  block of react forms (the tippy island replaced; the smiley octicon is
+ *  outside the generated allowlist — the picker summary degrades to the
+ *  emoji character). Upstream renders the bar when there are reactions OR
+ *  the viewer can react (`{{if or .Reactions $canReact}}`); anonymous
+ *  visitors see bare labels. */
+export function ReactionBar(props: {
+  actionUrl: string;
+  groups: ReactionGroup[];
+  viewer: Viewer;
+  canReact: boolean;
+}) {
+  if (props.groups.length === 0 && !props.canReact) return null;
+  const emojiOf = (type: string): string => REACTION_EMOJI[type] ?? `:${type}:`;
+  const viewerId = props.viewer.kind === "user" ? props.viewer.id : null;
+  return (
+    <div class="bottom-reactions" data-action-url={props.actionUrl} role="group" aria-label={issueDetailLocale.reactions}>
+      {props.canReact ? (
+        <details class="select-reaction">
+          <summary aria-label={issueDetailLocale.reactions} title={issueDetailLocale.reactions}>
+            <span aria-hidden="true">🙂</span>
+          </summary>
+          <div class="reaction-picker">
+            {[...ALLOWED_REACTIONS].map((value) => (
+              <form class="item emoji" method="post" action={`${props.actionUrl}/react`}>
+                <input type="hidden" name="content" value={value} />
+                <button type="submit" aria-label={value} title={value}>
+                  {emojiOf(value)}
+                </button>
+              </form>
+            ))}
+          </div>
+        </details>
+      ) : null}
+      {props.groups.map((group) => {
+        const reacted = viewerId !== null && group.userIds.includes(viewerId);
+        const label = `${group.type}: ${group.count}`;
+        return props.canReact ? (
+          <form class="ui label basic" method="post" action={`${props.actionUrl}/${reacted ? "unreact" : "react"}`}>
+            <input type="hidden" name="content" value={group.type} />
+            <button type="submit" class="reaction" aria-label={label} title={label} data-has-reacted={reacted ? "true" : "false"} data-reaction-content={group.type}>
+              <span class="reaction">{emojiOf(group.type)}</span> <span>{group.count}</span>
+            </button>
+          </form>
+        ) : (
+          <span class="ui label basic disabled" aria-label={label}>
+            <span class="reaction">{emojiOf(group.type)}</span> <span>{group.count}</span>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+/** The comment edit/delete arms (context_menu.tmpl reduced to no-JS
+ *  forms — census gap #1 part two): the edit form carries the STRICT
+ *  `content_version` CAS field (issue_comment.go:186-190's first arm) and
+ *  a prefilled textarea; the delete posts `/comments/{id}/delete` (the
+ *  upstream data-url, context_menu.tmpl:36). The confirm dialog reduces
+ *  away — the no-JS submit IS the confirmation (the merged-cleanup-form
+ *  precedent). The caller computes `canEdit` (poster-or-writer, the
+ *  locked-issue writer arm, non-archived — the context menu's own gate). */
+function CommentEditDeleteForms(props: { repoLink: string; comment: CommentRow }) {
+  return (
+    <div class="comment-edit-zone">
+      <details class="comment-edit-details">
+        <summary>{issueDetailLocale.edit_comment}</summary>
+        <form class="ui form" method="post" action={`${props.repoLink}/comments/${props.comment.id}`}>
+          <input type="hidden" name="content_version" value={String(props.comment.contentVersion)} />
+          <div class="field">
+            <textarea name="content" rows={5} aria-label={issueDetailLocale.edit_comment}>
+              {props.comment.content ?? ""}
+            </textarea>
+          </div>
+          <button type="submit" class="ui tiny primary button">
+            {issueDetailLocale.save}
+          </button>
+        </form>
+      </details>
+      <form class="comment-delete-form" method="post" action={`${props.repoLink}/comments/${props.comment.id}/delete`}>
+        <button type="submit" class="ui tiny button">{issueDetailLocale.delete_comment}</button>
+      </form>
+    </div>
+  );
+}
+
 /** The root issue comment (`#issue-{id}`, view_content.tmpl's first
- *  `.timeline-item.comment.issue-content-comment`). */
-function RootComment(props: { data: IssueDetailData }) {
+ *  `.timeline-item.comment.issue-content-comment`). Census gap #1 part
+ *  two: the reaction bar mounts under the body (view_content.tmpl:58-61,
+ *  ActionURL `{repoLink}/issues/{index}/reactions`). The root body's own
+ *  edit is the /content tail — NOT this unit's surface, no edit form. */
+function RootComment(props: { repoLink: string; data: IssueDetailData; viewer: Viewer; canReact: boolean }) {
   const { issue, posterName, bodyHtml } = props.data;
   const hash = `issue-${issue.id}`;
   return (
@@ -1052,13 +1492,29 @@ function RootComment(props: { data: IssueDetailData }) {
           createdAt={issue.createdAt}
         />
         <CommentBody bodyHtml={bodyHtml} />
+        <ReactionBar
+          actionUrl={`${props.repoLink}/issues/${issue.index}/reactions`}
+          groups={props.data.issueReactions}
+          viewer={props.viewer}
+          canReact={props.canReact}
+        />
       </div>
     </div>
   );
 }
 
-/** A timeline user comment (`comments.tmpl` type 0, `#issuecomment-{id}`). */
-function TimelineCommentCard(props: { entry: Extract<TimelineEntry, { kind: "comment" }> }) {
+/** A timeline user comment (`comments.tmpl` type 0, `#issuecomment-{id}`).
+ *  Census gap #1 part two: the reaction bar (comments.tmpl:73-77,
+ *  ActionURL `{repoLink}/comments/{id}/reactions`) and the edit/delete
+ *  forms ride the card for authorized viewers. */
+function TimelineCommentCard(props: {
+  repoLink: string;
+  entry: Extract<TimelineEntry, { kind: "comment" }>;
+  groups: ReactionGroup[];
+  viewer: Viewer;
+  canReact: boolean;
+  canEdit: boolean;
+}) {
   const { comment, posterName, bodyHtml } = props.entry;
   const hash = `issuecomment-${comment.id}`;
   return (
@@ -1066,6 +1522,13 @@ function TimelineCommentCard(props: { entry: Extract<TimelineEntry, { kind: "com
       <div class="content comment-container">
         <CommentHeader hash={hash} posterName={posterName} createdAt={comment.createdAt} />
         <CommentBody bodyHtml={bodyHtml} />
+        {props.canEdit ? <CommentEditDeleteForms repoLink={props.repoLink} comment={comment} /> : null}
+        <ReactionBar
+          actionUrl={`${props.repoLink}/comments/${comment.id}/reactions`}
+          groups={props.groups}
+          viewer={props.viewer}
+          canReact={props.canReact}
+        />
       </div>
     </div>
   );
@@ -1143,29 +1606,317 @@ function TimelineEvent(props: { data: IssueDetailData; entry: Extract<TimelineEn
   );
 }
 
-/** The sidebar (`view_content/sidebar.tmpl`): PRs lead with the wave-11
- *  Reviewers section (sidebar.tmpl:5-9 mounts reviewer_list first for
- *  is_pull rows), then the labels list (badges linking into the live list
- *  filters) and the milestone (upstream's `/milestone/{id}` link — w129
- *  batch-14: the detail page landed at ca4eb58, so the name anchors it like
- *  milestone_list.tmpl:49). Wave 5: an admin viewer gets the no-JS label
- *  edit form above the badge list. Census gap #1: the sidebar combo writes
- *  + header buttons — the milestone select, the project select, the
- *  assignee select (the no-JS checkbox/select reductions of
- *  sidebar/{milestone_list,project_list,assignee_list}.tmpl's JS dropdowns,
- *  posting the upstream `issue_ids` + `id` field shapes to the routes
- *  pages/issue-sidebar-writes.ts serves), the Notifications subscribe
- *  toggle (sidebar/watch_notification.tmpl's button — the eye pair stands
- *  in for the ungenerated mute/unmute octicons), the Due Date section
- *  (sidebar/due_date.tmpl — the remove affordance reduces to the empty
- *  submit: upstream's `required` input is dropped so a no-JS clear exists)
- *  and the issue_management pin/lock forms (sidebar/issue_management.tmpl —
- *  the lock dialog reduces to the inline reason form; the delete button is
- *  the later parts' surface). Everyone sees the display lists; Participants
- *  (participant_list), the stopwatch/timetracker, the dependencies, the
- *  reference link and the wip/allow-maintainer-edit switches stay
- *  unrendered (the later parts' surface — the §2.4.1 rule keeps them off
- *  rather than approximated). */
+/** The branch-selector field (templates/repo/issue/branch_selector_field.tmpl
+ *  reduced — census gap #1 part two): the current ref display line for
+ *  every reader (RefEndName / the No-Branch/Tag-Specified arm), and for a
+ *  ref-capable viewer (`$canChangeRef := or .IsIssuePoster
+ *  .HasIssuesOrPullsWritePermission`) a text-input form posting the
+ *  upstream `ref` field to `{repoLink}/issues/{index}/ref` (the JS
+ *  branch/tag picker island replaced — the picker's list browse is an
+ *  engine read the detail page doesn't need). ISSUES ONLY — upstream's own
+ *  gate wraps the whole template (`and (not .Issue.IsPull)`). */
+function IssueRefBlock(props: { repoLink: string; data: IssueDetailData; access: IssueDetailAccess; viewer: Viewer }) {
+  const { issue } = props.data;
+  if (issue.isPull) return null;
+  const canChangeRef =
+    props.viewer.kind === "user" && (issue.posterId === props.viewer.id || props.access.canModifyIssueOrPull);
+  return (
+    <>
+      <div class="divider" />
+      <div class="branch-selector-dropdown">
+        <div class="ui button branch-dropdown-button">
+          <span class="text-branch-name gt-ellipsis">{issue.ref !== null && issue.ref !== "" ? issue.ref : issueDetailLocale.no_ref}</span>
+        </div>
+        {canChangeRef ? (
+          <form class="ui form tw-mt-1" method="post" action={`${props.repoLink}/issues/${issue.index}/ref`}>
+            <div class="field flex-text-block">
+              <input name="ref" value={issue.ref ?? ""} placeholder="Filter branch or tag..." aria-label="Branch/Tag" />
+              <button type="submit" class="ui tiny primary button">
+                {issueDetailLocale.save}
+              </button>
+            </div>
+          </form>
+        ) : null}
+      </div>
+    </>
+  );
+}
+
+/** The stopwatch timetracker block (templates/repo/issue/sidebar/
+ *  stopwatch_timetracker.tmpl reduced — census gap #1 part two): the
+ *  Start/Stop + Discard/Add-Time button pair through the no-JS forms
+ *  (the link-action islands replaced), the already-tracking warning with
+ *  the other issue's live link, the estimate line + the inline estimate
+ *  form (the pencil modal reduced), and the WorkingUsers totals list —
+ *  which renders for EVERY reader, outside the CanUseTimetracker gate
+ *  (the template's own structure). */
+function TimetrackerBlock(props: { repoLink: string; data: IssueDetailData; access: IssueDetailAccess; viewer: Viewer }) {
+  const { issue, viewerStopwatch, otherStopwatchUrl, workingUsers } = props.data;
+  const canonicalPath = `${props.repoLink}/${issue.isPull ? "pulls" : "issues"}/${issue.index}`;
+  const running = viewerStopwatch !== null && viewerStopwatch.issueId === issue.id;
+  const canUse = props.viewer.kind === "user" && props.access.canUseTimetracker;
+  const totalSeconds = workingUsers.reduce((sum, entry) => sum + entry.seconds, 0);
+  return (
+    <>
+      {canUse ? (
+        <>
+          <div class="divider" />
+          <div>
+            <div class="flex-text-block">
+              <strong class="tw-flex-1">{issueDetailLocale.tracker}</strong>
+            </div>
+            <div class="ui buttons tw-mt-2 tw-w-full">
+              {running ? (
+                <>
+                  <form class="tw-flex-1" method="post" action={`${canonicalPath}/times/stopwatch/stop`}>
+                    <button type="submit" class="ui button tw-flex-1">
+                      <Icon name="octicon-stopwatch" size={14} /> {issueDetailLocale.timer_stop}
+                    </button>
+                  </form>
+                  <form method="post" action={`${canonicalPath}/times/stopwatch/cancel`}>
+                    <button type="submit" class="ui icon button" aria-label={issueDetailLocale.timer_discard} title={issueDetailLocale.timer_discard}>
+                      <Icon name="octicon-trash" size={14} />
+                    </button>
+                  </form>
+                </>
+              ) : (
+                <>
+                  <form class="tw-flex-1" method="post" action={`${canonicalPath}/times/stopwatch/start`}>
+                    <button type="submit" class="ui button tw-flex-1">
+                      <Icon name="octicon-stopwatch" size={14} /> {issueDetailLocale.timer_start}
+                    </button>
+                  </form>
+                  <details class="issue-add-time">
+                    <summary class="ui icon button" aria-label={issueDetailLocale.timer_add} title={issueDetailLocale.add_time_manually}>
+                      <Icon name="octicon-plus" size={14} />
+                    </summary>
+                    <form class="ui form" method="post" action={`${canonicalPath}/times/add`}>
+                      <div class="field flex-text-block">
+                        <input type="number" name="hours" min="0" max="1000" placeholder={issueDetailLocale.add_time_hours} aria-label={issueDetailLocale.add_time_hours} />
+                        <span aria-hidden="true">:</span>
+                        <input
+                          type="number"
+                          name="minutes"
+                          min="0"
+                          max="1000"
+                          placeholder={issueDetailLocale.add_time_minutes}
+                          aria-label={issueDetailLocale.add_time_minutes}
+                        />
+                      </div>
+                      <button type="submit" class="ui tiny primary button">{issueDetailLocale.timer_add}</button>
+                    </form>
+                  </details>
+                </>
+              )}
+            </div>
+            {viewerStopwatch !== null && !running ? (
+              <div class="ui warning message">
+                {issueDetailLocale.tracking_already_started_prefix}
+                {otherStopwatchUrl !== null ? <a href={otherStopwatchUrl}>another issue</a> : "another issue"}
+                {issueDetailLocale.tracking_already_started_tail}
+              </div>
+            ) : null}
+            {issue.timeEstimate > 0 ? (
+              <div class="tw-my-2">
+                {issueDetailLocale.time_estimate_display}
+                {timeEstimateString(issue.timeEstimate)}
+              </div>
+            ) : null}
+            <form class="ui form tw-mt-1" method="post" action={`${canonicalPath}/time_estimate`}>
+              <div class="field flex-text-block">
+                <input
+                  name="time_estimate"
+                  placeholder="1h 2m"
+                  value={timeEstimateString(issue.timeEstimate)}
+                  aria-label={issueDetailLocale.time_estimate_set}
+                />
+                <button type="submit" class="ui tiny primary button" aria-label={issueDetailLocale.time_estimate_set} title={issueDetailLocale.time_estimate_set}>
+                  <Icon name="octicon-pencil" size={14} />
+                </button>
+              </div>
+            </form>
+          </div>
+        </>
+      ) : null}
+      {workingUsers.length > 0 ? (
+        <div class="tw-mt-2">
+          {issueDetailLocale.total_time_spent}
+          {secToHours(totalSeconds)}
+          <div class="ui list flex-items-block">
+            {workingUsers.map((entry) => (
+              <div class="item">
+                <a class="muted" href={userLink(entry.user.username)}>
+                  {entry.user.username}
+                </a>
+                <div class="text">{secToHours(entry.seconds)}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+/** The dependencies block (templates/repo/issue/sidebar/
+ *  issue_dependencies.tmpl reduced — census gap #1 part two): the empty
+ *  arm carries the section title (upstream renders the title ONLY there),
+ *  the Blocks/Depends-on lists with per-row remove forms (the confirm
+ *  modal reduced to the direct submit), the NotPermitted count lines and
+ *  the writer's redacted-but-removable rows (the lock octicon is outside
+ *  the allowlist — the tooltip carries the can-remove note), and the add
+ *  form's search dropdown reduced to a native select of the same-repo
+ *  candidates posting `newDependency` (the issue ROW id — GetIssueByID's
+ *  lookup). */
+function DependenciesBlock(props: { repoLink: string; data: IssueDetailData; access: IssueDetailAccess }) {
+  const { issue, dependencies, dependencyCandidates } = props.data;
+  const canonicalPath = `${props.repoLink}/${issue.isPull ? "pulls" : "issues"}/${issue.index}`;
+  const canCreate = props.access.canModifyIssueOrPull;
+  const entryLink = (entry: DependencyEntry): string =>
+    `/${entry.repo.ownerNamespace}/${entry.repo.slug}/${entry.issue.isPull ? "pulls" : "issues"}/${entry.issue.index}`;
+  const removeForm = (entry: DependencyEntry, dependencyType: "blockedBy" | "blocking") => (
+    <form class="issue-remove-dependency-form" method="post" action={`${canonicalPath}/dependency/delete`}>
+      <input type="hidden" name="removeDependencyID" value={String(entry.issue.id)} />
+      <input type="hidden" name="dependencyType" value={dependencyType} />
+      <button type="submit" class="muted" aria-label={issueDetailLocale.dependency_remove} title={issueDetailLocale.dependency_remove}>
+        <Icon name="octicon-trash" size={16} />
+      </button>
+    </form>
+  );
+  const entryRow = (entry: DependencyEntry, dependencyType: "blockedBy" | "blocking") => (
+    <div class={`item ${entry.issue.isClosed ? "is-closed" : ""} flex-left-right`}>
+      <div class="item-left">
+        <a class="muted issue-dependency-title gt-ellipsis" href={entryLink(entry)}>
+          #{entry.issue.index} {entry.issue.title}
+        </a>
+        <div class="tw-text-xs gt-ellipsis">
+          {entry.repo.ownerNamespace}/{entry.repo.slug}
+        </div>
+      </div>
+      <div class="item-right">{canCreate ? removeForm(entry, dependencyType) : null}</div>
+    </div>
+  );
+  // The redacted-but-removable writer arm (issue_dependencies.tmpl's
+  // BlockedByDependenciesNotPermitted range): no link, no emoji render,
+  // the can-remove tooltip standing in for the ungenerated lock glyph.
+  const hiddenRow = (entry: DependencyEntry) => (
+    <div class={`item ${entry.issue.isClosed ? "is-closed" : ""} flex-left-right`}>
+      <div class="item-left">
+        <div class="gt-ellipsis">
+          <span title={issueDetailLocale.dependency_hidden_can_remove}>#</span>
+          <span class="gt-ellipsis issue-dependency-title">
+            #{entry.issue.index} {entry.issue.title}
+          </span>
+        </div>
+        <div class="tw-text-xs gt-ellipsis">
+          {entry.repo.ownerNamespace}/{entry.repo.slug}
+        </div>
+      </div>
+      <div class="item-right">{removeForm(entry, "blockedBy")}</div>
+    </div>
+  );
+  const countLine = (n: number) =>
+    n === 1 ? issueDetailLocale.dependency_hidden_1 : issueDetailLocale.dependency_hidden_n(n);
+  const isEmpty =
+    dependencies.blocking.length === 0 &&
+    dependencies.blockedBy.length === 0 &&
+    dependencies.blockingHidden === 0 &&
+    dependencies.blockedByHidden === 0;
+  return (
+    <>
+      <div class="divider" />
+      <div class="ui depending">
+        {isEmpty ? (
+          <>
+            <span class="text">
+              <strong>{issueDetailLocale.dependencies}</strong>
+            </span>
+            <br />
+            <p>{issueDetailLocale.no_dependencies}</p>
+          </>
+        ) : null}
+        {dependencies.blocking.length > 0 ? (
+          <>
+            <span class="text">
+              <strong>{issueDetailLocale.blocks_short}</strong>
+            </span>
+            <div class="flex-divided-list">
+              {dependencies.blocking.map((entry) => entryRow(entry, "blocking"))}
+            </div>
+          </>
+        ) : null}
+        {dependencies.blockingHidden > 0 ? (
+          <div class="item gt-ellipsis">
+            <span>{countLine(dependencies.blockingHidden)}</span>
+          </div>
+        ) : null}
+        {dependencies.blockedBy.length > 0 || (canCreate && dependencies.blockedByHidden > 0) ? (
+          <>
+            <span class="text">
+              <strong>{issueDetailLocale.blocked_by_short}</strong>
+            </span>
+            <div class="flex-divided-list">
+              {dependencies.blockedBy.filter((entry) => entry.permitted).map((entry) => entryRow(entry, "blockedBy"))}
+              {canCreate
+                ? dependencies.blockedBy
+                    .filter((entry) => !entry.permitted)
+                    .map((entry) => hiddenRow(entry))
+                : null}
+            </div>
+          </>
+        ) : null}
+        {!canCreate && dependencies.blockedByHidden > 0 ? (
+          <div class="item gt-ellipsis">
+            <span>{countLine(dependencies.blockedByHidden)}</span>
+          </div>
+        ) : null}
+        {canCreate ? (
+          <div class="tw-mt-2">
+            <form id="addDependencyForm" class="ui fluid action input" method="post" action={`${canonicalPath}/dependency/add`}>
+              <select name="newDependency" aria-label={issueDetailLocale.add_dependency}>
+                <option value="">{issueDetailLocale.add_dependency}</option>
+                {(dependencyCandidates ?? []).map((candidate) => (
+                  <option value={String(candidate.id)}>
+                    #{candidate.index} {candidate.title}
+                  </option>
+                ))}
+              </select>
+              <button type="submit" class="ui icon button" aria-label={issueDetailLocale.add_dependency}>
+                <Icon name="octicon-plus" size={16} />
+              </button>
+            </form>
+          </div>
+        ) : null}
+      </div>
+    </>
+  );
+}
+/** The sidebar (`view_content/sidebar.tmpl`): the branch-selector field
+ *  leads on issues (branch_selector_field — census gap #1 part two), PRs
+ *  follow with the wave-11 Reviewers section (sidebar.tmpl:5-9 mounts
+ *  reviewer_list first for is_pull rows), then the labels list (badges
+ *  linking into the live list filters) and the milestone (upstream's
+ *  `/milestone/{id}` link — w129 batch-14: the detail page landed at
+ *  ca4eb58, so the name anchors it like milestone_list.tmpl:49). Wave 5:
+ *  an admin viewer gets the no-JS label edit form above the badge list.
+ *  Census gap #1: the sidebar combo writes + header buttons — the
+ *  milestone select, the project select, the assignee select (the no-JS
+ *  checkbox/select reductions of sidebar/{milestone_list,project_list,
+ *  assignee_list}.tmpl's JS dropdowns, posting the upstream `issue_ids` +
+ *  `id` field shapes to the routes pages/issue-sidebar-writes.ts serves),
+ *  the Notifications subscribe toggle (sidebar/watch_notification.tmpl's
+ *  button — the eye pair stands in for the ungenerated mute/unmute
+ *  octicons) and the Due Date section (sidebar/due_date.tmpl — the remove
+ *  affordance reduces to the empty submit: upstream's `required` input is
+ *  dropped so a no-JS clear exists). Census gap #1 part two: the
+ *  timetracker block (stopwatch_timetracker.tmpl — the stopwatch trio +
+ *  manual add + estimate, pages/issue-timeline-writes.ts's routes), the
+ *  dependencies block (issue_dependencies.tmpl — the add/remove pair) and
+ *  the issue_management delete button ride the same module; the pin/lock
+ *  forms stay the part-one surface. Everyone sees the display lists;
+ *  Participants (participant_list), the reference link and the
+ *  wip/allow-maintainer-edit switches stay unrendered (the later parts'
+ *  surface — the §2.4.1 rule keeps them off rather than approximated). */
 function IssueSidebar(props: {
   repoLink: string;
   data: IssueDetailData;
@@ -1193,6 +1944,9 @@ function IssueSidebar(props: {
   const nowMs = Date.now();
   return (
     <div class="issue-content-right ui segment">
+      {/* branch_selector_field leads the sidebar on issues (sidebar.tmpl's
+          mount order — before the is_pull reviewer_list). */}
+      <IssueRefBlock repoLink={props.repoLink} data={props.data} access={access} viewer={props.viewer} />
       {issue.isPull ? (
         <>
           <ReviewersSidebar
@@ -1478,11 +2232,21 @@ function IssueSidebar(props: {
           </form>
         ) : null}
       </div>
-      {/* issue_management.tmpl — the pin toggle + the lock/unlock form for
-          repo admins on a live repo (the delete button is the later parts'
-          surface). The lock modal reduces to the inline reason form; the
-          key/lock octicons stand in as the single shield-lock glyph (the
-          allowlist degrade). */}
+      {/* stopwatch_timetracker.tmpl — the stopwatch trio + the manual add
+          + the estimate (census gap #1 part two; the WorkingUsers list is
+          the block's reader-visible half, upstream's own structure). */}
+      <TimetrackerBlock repoLink={props.repoLink} data={props.data} access={access} viewer={props.viewer} />
+      {/* issue_dependencies.tmpl — the dependency add/remove pair (census
+          gap #1 part two; the remove modal reduces to the per-row direct
+          submit). */}
+      <DependenciesBlock repoLink={props.repoLink} data={props.data} access={access} />
+      {/* issue_management.tmpl — the pin toggle + the lock/unlock form +
+          the delete button for repo admins on a live repo (census gap #1
+          part two lands the delete arm — the confirm dialog reduces to the
+          direct submit, the no-JS-submit-IS-the-confirmation posture). The
+          lock modal reduces to the inline reason form; the key/lock
+          octicons stand in as the single shield-lock glyph (the allowlist
+          degrade). */}
       {access.canManageIssue && access.pin !== null ? (
         <>
           <div class="divider" />
@@ -1505,6 +2269,11 @@ function IssueSidebar(props: {
             ) : null}
             <button type="submit" class={`ui ${issue.isLocked ? "" : "red"} button`}>
               {issue.isLocked ? issueDetailLocale.unlock_confirm : issueDetailLocale.lock_confirm}
+            </button>
+          </form>
+          <form class="tw-mt-1 single-button-form" method="post" action={`${canonicalPath}/delete`}>
+            <button type="submit" class="fluid ui button">
+              <Icon name="octicon-trash" size={16} /> {issueDetailLocale.delete_issue}
             </button>
           </form>
         </>
@@ -1674,6 +2443,8 @@ export function renderIssueDetailPage(
           milestoneOptions: null,
           projectOptions: null,
           assigneeOptions: null,
+          canUseTimetracker: false,
+          dependencyCandidates: null,
         }
       }
       form={form ?? { content: "", error: null }}
@@ -1708,6 +2479,17 @@ export function IssueDetailPage(props: {
   // (the header's auth posture; upstream's diff-page combobox reduced).
   const showReviewForm =
     data.issue.isPull && data.pr !== null && ctx.viewer.kind === "user" && !repo.isArchived;
+  // Census gap #1 part two: the reaction bars' grant (shared/reactions.tmpl
+  // `$canReact := and $allowedReactions ctx.RootData.IsSigned (not
+  // .Repository.IsArchived)`) and the comment edit/delete arms' grant
+  // (context_menu.tmpl's $canEditContent reduced: poster-or-writer, the
+  // locked-issue writer arm, the non-archived menu gate).
+  const canReact = ctx.viewer.kind === "user" && !repo.isArchived;
+  const canEditComments = (commentPosterId: number | null): boolean =>
+    ctx.viewer.kind === "user" &&
+    !repo.isArchived &&
+    (commentPosterId === ctx.viewer.id || props.access.canModifyIssueOrPull) &&
+    (!data.issue.isLocked || props.access.canModifyIssueOrPull);
   return (
     <BaseLayout
       ctx={ctx}
@@ -1723,10 +2505,17 @@ export function IssueDetailPage(props: {
         <div class="issue-content">
           <div class="issue-content-left">
             <div class="comment-list">
-              <RootComment data={data} />
+              <RootComment repoLink={repoLink} data={data} viewer={ctx.viewer} canReact={canReact} />
               {data.timeline.map((entry) =>
                 entry.kind === "comment" ? (
-                  <TimelineCommentCard entry={entry} />
+                  <TimelineCommentCard
+                    repoLink={repoLink}
+                    entry={entry}
+                    groups={data.commentReactions.get(entry.comment.id) ?? []}
+                    viewer={ctx.viewer}
+                    canReact={canReact}
+                    canEdit={canEditComments(entry.comment.posterId)}
+                  />
                 ) : (
                   <TimelineEvent data={data} entry={entry} repoLink={repoLink} />
                 ),

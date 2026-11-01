@@ -1121,6 +1121,111 @@ describe("the state machine through the detail route", () => {
   });
 });
 
+// --- census gap #1 PART TWO: the timeline writes' RENDER half (pages/
+// --- issue-detail.tsx's reaction bars + comment edit/delete forms + the
+// --- ref/timetracker/dependency sidebar blocks + the delete button — live
+// --- through the mounted uiRouter; the WRITE half is pages/
+// --- issue-timeline-writes.ts, unmounted until the fold, its ladders in
+// --- that module's own test file) ---------------------------------------
+
+describe("census gap #1 part two: the timeline write arms (render half)", () => {
+  it("the OWNER sees the sidebar blocks: the ref input, the timetracker block (start button + estimate input), the dependency add select, the delete button", async () => {
+    const fixture = await ensureIssueDetailFixtures();
+    const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The ref block (issues only): the display line + the writer form.
+    expect(html).toContain("No Branch/Tag Specified");
+    expect(html).toContain(`<form class="ui form tw-mt-1" method="post" action="/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}/ref">`);
+    expect(html).toContain('name="ref"');
+    // The timetracker block: Start timer + the stopwatch action, the
+    // manual-add hours/minutes inputs, the estimate input.
+    expect(html).toContain('<strong class="tw-flex-1">Time Tracker</strong>');
+    expect(html).toContain(`action="/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}/times/stopwatch/start"`);
+    expect(html).toContain('name="hours"');
+    expect(html).toContain('name="minutes"');
+    expect(html).toContain(`<form class="ui form tw-mt-1" method="post" action="/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}/time_estimate">`);
+    expect(html).toContain('name="time_estimate"');
+    // The dependencies block: the empty arm + the writer's add form (the
+    // select posts `newDependency` — the issue ROW id).
+    expect(html).toContain("<strong>Dependencies</strong>");
+    expect(html).toContain("No dependencies set.</p>");
+    expect(html).toContain('id="addDependencyForm"');
+    expect(html).toMatch(new RegExp(`<select name="newDependency" aria-label="Add dependency…">`));
+    // The delete button (issue_management tail).
+    expect(html).toContain(`<form class="tw-mt-1 single-button-form" method="post" action="/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}/delete">`);
+    // The reaction bar scaffold on the root body (the picker renders for
+    // the signed-in, non-archived viewer even with zero reactions).
+    expect(html).toMatch(new RegExp(`data-action-url="/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}/reactions"`));
+    expect(html).toContain('class="select-reaction"');
+    // No stopwatch is running — the Start arm renders, the Stop pair not.
+    expect(html).toContain("Start timer</button>");
+    expect(html).not.toContain(">Stop timer</button>");
+  });
+
+  it("ANONYMOUS sees the display halves only: the dependency empty arm + the ref line, NO timetracker block, NO reaction picker, NO ref/delete forms", async () => {
+    const fixture = await ensureIssueDetailFixtures();
+    const res = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/issues/${fixture.closedIssueIndex}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("<strong>Dependencies</strong>");
+    expect(html).toContain("No dependencies set.</p>");
+    expect(html).toContain("No Branch/Tag Specified");
+    expect(html).not.toContain('name="ref"');
+    expect(html).not.toContain('name="time_estimate"');
+    expect(html).not.toContain('name="newDependency"');
+    expect(html).not.toContain("Time Tracker");
+    expect(html).not.toContain('class="select-reaction"');
+    expect(html).not.toContain('class="bottom-reactions"'); // zero reactions + cannot react → no bar at all
+    expect(html).not.toContain("/delete\"");
+  });
+
+  it("a THROWAWAY issue's comment renders the edit/delete forms + the comment reaction bar for the owner; a stranger gets neither", async () => {
+    const fixture = await ensureIssueDetailFixtures();
+    const svc = new IssuesService(env.DB);
+    const shared = await drizzle(env.DB).select({ repoId: issues.repoId }).from(issues).where(eq(issues.id, fixture.openPrIssueId)).get();
+    if (shared === undefined) throw new Error("comment-arm seed: shared row missing");
+    const throwaway = await svc.createIssue({ repoId: shared.repoId, title: "mx: comment-arm target", posterId: fixture.ownerId, now: new Date() });
+    const created = await svc.addComment({ issueId: throwaway.id, posterId: fixture.ownerId, content: "mx: comment-arm body" });
+
+    const ownerRes = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/issues/${throwaway.index}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
+    });
+    expect(ownerRes.status).toBe(200);
+    const ownerHtml = await ownerRes.text();
+    expect(ownerHtml).toContain(`action="/${OWNER_NAME}/${REPO_SLUG}/comments/${created.id}"`);
+    expect(ownerHtml).toContain(`name="content_version"`);
+    expect(ownerHtml).toContain(`action="/${OWNER_NAME}/${REPO_SLUG}/comments/${created.id}/delete"`);
+    expect(ownerHtml).toContain(`data-action-url="/${OWNER_NAME}/${REPO_SLUG}/comments/${created.id}/reactions"`);
+
+    const bobRes = await fetchUi(`/${OWNER_NAME}/${REPO_SLUG}/issues/${throwaway.index}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.bobCookie}` },
+    });
+    expect(bobRes.status).toBe(200);
+    const bobHtml = await bobRes.text();
+    // Bob CAN react (any signed-in reader) but cannot edit/delete.
+    expect(bobHtml).toContain(`data-action-url="/${OWNER_NAME}/${REPO_SLUG}/comments/${created.id}/reactions"`);
+    expect(bobHtml).not.toContain(`action="/${OWNER_NAME}/${REPO_SLUG}/comments/${created.id}/delete"`);
+    expect(bobHtml).not.toContain(`name="content_version"`);
+  });
+
+  it("the viewed-files tail STAYS engine-owned (the module header's STOP adjudication — no substrate, the route is never registered)", async () => {
+    const fixture = await ensureIssueDetailFixtures();
+    const res = await fetchUi(
+      `/${OWNER_NAME}/${REPO_SLUG}/pulls/${fixture.wipPrIndex}/viewed-files`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: "https://test.local" },
+        body: JSON.stringify({ files: { "a.ts": true }, headCommitSHA: "" }),
+      },
+    );
+    expect(res.status).toBe(404);
+    expect(await res.text()).not.toContain("page-content");
+  });
+});
+
 // --- the claim pins ---------------------------------------------------------------------
 
 describe("claim pins (route-level answers the parse pins leave open)", () => {
