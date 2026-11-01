@@ -28,15 +28,14 @@
  * (lowercase `[a-f0-9]{7,64}` verbatim), and the page-name fallthrough for
  * a non-matching tail is upstream's chi specificity rule — the pattern miss
  * drops into `m.Combo("/*")` and wiki.Wiki treats the whole tail as a page
- * name. THE VIEW mounts through loadWikiViewData's commit arm today; the
- * DOWNLOADS ship here as loader + grammar only — a raw-text Response cannot
- * pass the page handler (every arm `c.html`-wraps the render), so the
- * serving arm is index.ts work pending at report time: one branch that
- * maps `parseWikiCommitDownloadTail` + `loadWikiCommitDiffPatch`'s null to
- * the §4.5 shell and everything else through `diffPatchTextResponse` (the
- * diffpatch family's exact convention). Until it lands, a dotted tail folds
- * to the page-name path — upstream-exact for every non-hex shape, an
- * interim 303 divergence for hex+suffix tails only.
+ * name. THE VIEW mounts through loadWikiViewData's commit arm; the
+ * DOWNLOADS serve through index.ts's wikiPage branch (upstream's
+ * specific-route-beats-Combo order): `parseWikiCommitDownloadTail`'s hit
+ * loads `loadWikiCommitDiffPatch`, its null (the shape is already gated by
+ * the parse — an unresolvable sha) answers the §4.5 shell (upstream
+ * RawDiff's IsErrNotExist → ctx.NotFound, commit.go:449-452), the body
+ * routes through `diffPatchTextResponse` (the diffpatch family's exact
+ * convention) — the interim hex+dotted 303 divergence is gone.
  *
  * ## Semantics
  *
@@ -57,9 +56,9 @@
  *   the diff envelope's paths — the wiki cell's STORED flat entry names
  *   (QueryEscaped by the codec: `Docs%2FDiff-Guide.md`). The engine decodes
  *   every path argument per segment, so the read-back needs the same
- *   encode services/wiki.ts's private `enginePath` applies ("%25" doubling)
- *   — mirrored here as `wikiEnginePath` (services/wiki.ts owns the
- *   original; collapsing the mirror means exporting it, reported).
+ *   encode services/wiki.ts's exported `enginePath` applies ("%25" doubling)
+ *   — imported directly (the private `wikiEnginePath` mirror collapsed once
+ *   the export landed).
  * - `.patch` over a MERGE commit: upstream's RawDiffPatch arm runs
  *   format-patch `<merge>...<parent0>` and format-patch skips merges — the
  *   non-merge side-commit series, EMPTY when the series is empty
@@ -79,7 +78,7 @@ import {
   type RenderPatchOptions,
 } from "../../api/services/git-models";
 import type { RepositoryWithOwner } from "../../api/services/repository";
-import { wikiReads } from "../../services/wiki";
+import { enginePath, wikiReads } from "../../services/wiki";
 import { commitViewLocale, type CommitViewData } from "./commit-view";
 import { messageBodyOf } from "./compare";
 import { userLink } from "../links";
@@ -123,22 +122,10 @@ export function parseWikiCommitDownloadTail(rawTail: string): { sha: string; ext
 }
 
 /**
- * services/wiki.ts's private `enginePath` encode, mirrored (module doc):
- * the codec-space stored name → the engine's wire path. Plain names carry
- * no "%" and pass through unchanged; coded names ("%2F") double the escape
- * so the engine's per-segment decode restores the stored bytes.
- */
-function wikiEnginePath(gitPath: string): string {
-  return gitPath
-    .split("/")
-    .map((segment) => segment.replaceAll("%", "%25"))
-    .join("/");
-}
-
-/**
  * The DiffBlobSource over the wiki cell's reads — diffBlobSource's shape
- * with the read-back encode above (the renderer's context-blob fetches must
- * address the STORED flat entry names).
+ * with services/wiki.ts's exported `enginePath` as the read-back encode
+ * (the renderer's context-blob fetches must address the STORED flat entry
+ * names).
  */
 function wikiDiffBlobSource(reads: EngineReads, oldTip: string | null, newTip: string): DiffBlobSource {
   return {
@@ -146,7 +133,7 @@ function wikiDiffBlobSource(reads: EngineReads, oldTip: string | null, newTip: s
     newTip,
     blobText: async (tip: string | null, path: string) => {
       if (tip === null) return null;
-      const blob = await reads.readBlob(tip, wikiEnginePath(path));
+      const blob = await reads.readBlob(tip, enginePath(path));
       return blob === null ? null : new TextDecoder().decode(blob.data);
     },
   };
@@ -308,9 +295,13 @@ export function WikiCommitDiffPage(props: { ctx: UiContext; data: CommitViewData
 /**
  * The series walker: the non-merge commits of `base..head` oldest-first,
  * one `--no-signature` mail per commit diffed against its own first parent
- * — diffpatch-files.ts's private renderPatchSeries mirrored over the wiki
- * blob source (module doc). The walk cap and the between-mail seam bytes
- * are that walker's verbatim (recorded against `git format-patch --stdout`).
+ * — the diffpatch family's renderPatchSeries mirrored over the wiki blob
+ * source (module doc). The walk cap and the between-mail seam bytes are
+ * that walker's verbatim (recorded against `git format-patch --stdout`).
+ * PENDING COLLAPSE: the family walker is being shared into
+ * api/services/git-models.ts by an in-flight sibling — once it lands as an
+ * export there, this mirror folds onto it (the wiki DiffBlobSource is the
+ * only local remainder).
  */
 const MERGE_SERIES_COMMIT_CAP = 2000;
 const MERGE_SERIES_PAGE = 500;

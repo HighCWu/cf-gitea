@@ -740,10 +740,12 @@ describe("the ?page= revision pager at CommitsRangeSize (50)", () => {
 // APPENDED LAST ON PURPOSE: the merge fixture below MOVES the w107wik ref
 // (append-only — every earlier pin on Home's history stays valid; nothing
 // after this describe reads the w107wik tip). The download tails' raw
-// SERVING is index.ts work pending at report time (a raw-text Response
-// cannot pass the page handler), so the dotted tail's route-level fold is
-// pinned here as the interim page-name 303 — upstream-exact for every
-// non-hex shape, an interim divergence for hex+suffix tails only.
+// SERVING rides index.ts's wikiPage branch (web.go:1620 — the parse-gated
+// grammar dispatches before the page folds): a hex+dotted tail now answers
+// the raw bytes, a well-shaped unknown sha on the DOWNLOAD arm 404-shells
+// (commit.go's IsErrNotExist → ctx.NotFound), and the VIEW arm keeps the
+// family's missing fold (the view loader's fixed outcome set cannot answer
+// a 404 — the view-side interim stays disclosed).
 
 describe("the wiki commit-diff arm (web.go:1619 — the PageIsWiki commit page)", () => {
   it("admits the commit tail through the wiki family catch-all and serves the diff view", async () => {
@@ -786,25 +788,30 @@ describe("the wiki commit-diff arm (web.go:1619 — the PageIsWiki commit page)"
     expect(html).toContain('data-new-filename="Diff-Arm-Probe.md"');
   });
 
-  it("folds the well-shaped unknown sha and the dotted download tail to the page-name 303 (the interim arms)", async () => {
+  it("keeps the unknown sha's VIEW on the family fold and serves the dotted tail's raw bytes (web.go:1620's arm)", async () => {
     const pair = await pairFor("w107wik");
     const tip = await wikiTipOf(env, pair);
     if (tip === undefined) throw new Error("w107wik tip missing");
-    // Unknown-but-well-shaped: upstream Diff 404-shells (commit.go's
-    // IsErrNotExist → ctx.NotFound); the fixed handler outcome set cannot
-    // answer a 404 — the family's missing fold answers until the serving
-    // arm's not-found mapping lands (disclosed to the orchestrator).
+    // Unknown-but-well-shaped VIEW: upstream Diff 404-shells (commit.go's
+    // IsErrNotExist → ctx.NotFound); the view loader's fixed outcome set
+    // cannot answer a 404 — the family's missing fold REMAINS the view
+    // arm's disclosed interim (the DOWNLOAD arm answers the 404 directly
+    // below — the serving branch is not outcome-set-bound).
     const ghost = await get(`/w107gal/w107wik/wiki/commit/${"a".repeat(40)}`);
     expect(ghost.status).toBe(303);
     expect(ghost.headers.get("location")).toBe(PAGES_ACTION);
-    // The dotted download tail is NOT the view arm: upstream serves the raw
-    // bytes (web.go:1620); the raw Response cannot pass the page handler —
-    // the loader + grammar ship in pages/wiki-commit-diff.tsx, the serving
-    // arm is index.ts work (the interim fold is upstream-exact for every
-    // non-hex shape).
+    // The dotted download tail serves the raw bytes (web.go:1620): the
+    // diffpatch family's plain-text shape — the interim 303 fold is gone.
     const dotted = await get(`/w107gal/w107wik/wiki/commit/${tip.target}.diff`);
-    expect(dotted.status).toBe(303);
-    expect(dotted.headers.get("location")).toBe(PAGES_ACTION);
+    expect(dotted.status).toBe(200);
+    expect(dotted.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    const body = await dotted.text();
+    expect(body.startsWith("diff --git a/Diff-Arm-Probe.md b/Diff-Arm-Probe.md\n")).toBe(true);
+    // The DOWNLOAD arm's unknown sha: upstream RawDiff's IsErrNotExist →
+    // ctx.NotFound — the §4.5 shell, never the family's 303 fold.
+    const ghostPatch = await get(`/w107gal/w107wik/wiki/commit/${"b".repeat(40)}.patch`);
+    expect(ghostPatch.status).toBe(404);
+    expect(await ghostPatch.text()).toContain("Page Not Found");
   });
 
   it("renders a MERGE commit's .patch as the non-merge side-commit series over the wiki cell", async () => {

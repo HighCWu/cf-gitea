@@ -1649,6 +1649,10 @@ import { loadPullFilesData, renderPullFilesPage, updateViewedFilesFromWeb } from
 // .diff/.patch routes; the loaders + Response builder live in the module,
 // the handlers here beside their sibling dispatchers).
 import { diffPatchTextResponse, loadCommitDiffPatch, loadPullDiffPatch } from "./pages/diffpatch-files";
+// The wiki commit-diff family (web.go:1619-1620's tails over the SIBLING
+// `owner/slug.wiki` cell — the downloads' grammar + loader live in the
+// module, the serving branch in wikiPage below).
+import { loadWikiCommitDiffPatch, parseWikiCommitDownloadTail } from "./pages/wiki-commit-diff";
 // Wave-32 archive download + commit aux JSON (the survey's rows 1 + 3 —
 // the streamed {ref}.{zip|tar.gz} tail and the load-branches-and-tags
 // ContainedLinks feed; loaders + Response builders in the modules, the
@@ -15408,6 +15412,19 @@ async function wikiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const { ctx, pair, rawTail, canWrite, respond } = p;
   const url = new URL(c.req.url);
   const action = url.searchParams.get("action");
+  // The raw downloads (web.go:1620 — repo.RawDiff's PageIsWiki arm over the
+  // SIBLING wiki cell): the specific commit route beats the page combo in
+  // upstream's mux, so the grammar hit dispatches BEFORE the page folds.
+  // The parse gates the shape, so the loader's null is exactly upstream's
+  // GetRawDiff IsErrNotExist → ctx.NotFound (commit.go:449-452) — the §4.5
+  // shell, not the family's missing 303; the body rides the diffpatch
+  // family's plain-text Response convention (the tree-redirect precedent).
+  const download = parseWikiCommitDownloadTail(rawTail);
+  if (download !== null) {
+    const body = await loadWikiCommitDiffPatch(c.env, pair, download.sha, download.ext);
+    if (body === null) return respond(c.html(renderNotFound(ctx), 404));
+    return respond(diffPatchTextResponse(body));
+  }
   if (action === "_pages") {
     const data = await loadWikiPagesData(c.env, pair);
     if (data.outcome === "no-wiki") return respond(c.html(renderWikiStartPage({ ctx, canWrite }), 200));

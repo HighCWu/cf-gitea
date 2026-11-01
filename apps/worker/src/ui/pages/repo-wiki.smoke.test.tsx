@@ -381,8 +381,8 @@ describe("smoke: the webhook emissions family (the UI writer's path)", () => {
 // --- 7. the COMMIT-DIFF family (web.go:1619-1620 — the PageIsWiki commit
 //        page + the .diff/.patch downloads, both over the SIBLING wiki cell
 //        through pages/wiki-commit-diff.tsx; the view rides the view loader,
-//        the downloads' raw serving arm is index.ts work — the interim
-//        folds are pinned in test 2)
+//        the downloads serve raw through index.ts's wikiPage serving branch
+//        — the route-level byte pins live in ui/index.test.ts)
 
 describe("smoke: the commit-diff family (web.go:1619-1620 over the wiki cell)", () => {
   it("serves the revision-diff view through the view loader and renders the PageIsWiki commit page", async () => {
@@ -463,7 +463,7 @@ describe("smoke: the commit-diff family (web.go:1619-1620 over the wiki cell)", 
     expect(patch.includes("\n-- \n")).toBe(false); // no `-- \n<version>` tail
   });
 
-  it("folds the grammar misses upstream's way (unknown sha, pattern misses, the dotted interim)", async () => {
+  it("folds the grammar misses upstream's way (unknown sha, pattern misses, the dotted tail's page-name fold)", async () => {
     const { pair } = await ensureFixtures();
     const tip = await wikiTipOf(env, pair);
     if (tip === undefined) throw new Error("wiki tip missing");
@@ -491,9 +491,11 @@ describe("smoke: the commit-diff family (web.go:1619-1620 over the wiki cell)", 
     // Plain grammar misses keep the page-name path (a page literally named
     // "commit/zzz" would be shadowed only for the HEX shapes).
     expect(await loadWikiViewData(env, pair, "commit/zzz", ORIGIN)).toEqual({ outcome: "missing" });
-    // The dotted download tail is NOT the view arm — the page-name fold
-    // answers until the raw serving arm lands in index.ts (the module
-    // doc's dispatch posture; upstream serves the bytes at web.go:1620).
+    // The dotted download tail is NOT the view arm — upstream serves the
+    // bytes at web.go:1620 through index.ts's serving branch, which
+    // dispatches BEFORE the view loader (ui/index.test.ts pins the raw
+    // bytes at the route). The VIEW loader's own page-name fold below stays
+    // the grammar's documented miss shape for a tail it never claims.
     expect(await loadWikiViewData(env, pair, `commit/${sha}.diff`, ORIGIN)).toEqual({ outcome: "missing" });
   });
 });

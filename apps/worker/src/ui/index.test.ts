@@ -23,6 +23,8 @@ import { seedVerifiedUser } from "../auth/testing/seeds";
 import { applyTwofaEnrollment, clearTwofaSetCookie, generateTotpSecret, mintPendingTicket } from "../auth/two-factor";
 import { totpCode } from "../auth/totp";
 import { comments, externalLoginUsers, issuePins, issues, loginSources, orgMembers, repositories, repoSettings, repoTransfer, teamMembers, trackedTimes, twoFactor, userSettingsKv, users } from "../db/schema";
+import type { RepositoryWithOwner } from "../api/services/repository";
+import { createWikiPageFromForm, parseWikiPageForm, wikiTipOf } from "./pages/repo-wiki";
 import { TeamsService } from "../api/routes/org-teams";
 import { OrgService } from "../services/orgs/orgs";
 import { serializeOAuth2SourceConfig } from "../services/auth-sources/cfg";
@@ -2358,5 +2360,119 @@ describe("POST /-/admin/repos/delete (web.go:851)", () => {
       body: new URLSearchParams({ id: "whatever" }).toString(),
     });
     expect(res.status).toBe(404);
+  });
+});
+
+// --- the wiki commit-diff downloads (web.go:1620 — the PageIsWiki RawDiff
+//     arm over the SIBLING `owner/slug.wiki` cell; grammar + loader in
+//     pages/wiki-commit-diff.tsx, the serving branch in wikiPage) ----------
+
+describe("GET /{owner}/{repo}/wiki/commit/{sha}.{diff|patch} (the raw serving arm)", () => {
+  // The CELL write lands once (DO storage outlives the D1 beforeEach sweep —
+  // the same persistence the smoke suite's memoized fixtures ride); the D1
+  // pair re-seeds per test because beforeEach wipes users/repositories.
+  let wikiCellSeed: { sha: string; entry: string } | null = null;
+
+  /** A wiki cell with one real commit: the page write seam (the same
+   *  service ops the form POSTs ride — the §4.4 gate blocks git-http
+   *  seeding of `*.wiki` cells), the fixture identity the route's own
+   *  prologue would derive for this user. */
+  async function seedWikiCommit(): Promise<{ sha: string; entry: string }> {
+    await seedVerifiedUser({ username: "wikidl-alice" });
+    await seedRepo("wikidl-alice", "wikidl");
+    const repoRow =
+      (await drizzle(env.DB)
+        .select()
+        .from(repositories)
+        .where(and(eq(repositories.ownerNamespace, "wikidl-alice"), eq(repositories.slug, "wikidl")))
+        .get()) ?? null;
+    if (repoRow === null) throw new Error("wikidl repo row missing");
+    const owner =
+      (await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "wikidl-alice")).get()) ?? null;
+    if (owner === null) throw new Error("wikidl owner row missing");
+    const pair: RepositoryWithOwner = { repo: repoRow, owner };
+    if (wikiCellSeed === null) {
+      const created = await createWikiPageFromForm(
+        env,
+        pair,
+        { name: "wikidl-alice", email: "wikidl-alice@noreply.test.local" },
+        parseWikiPageForm(new URLSearchParams({ title: "Serving Arm", content: "one\ntwo\n", message: "serving arm commit" })),
+        "https://test.local",
+      );
+      expect(created.sub_url).toBe("Serving-Arm");
+      const tip = await wikiTipOf(env, pair);
+      if (tip === undefined) throw new Error("wiki tip missing");
+      wikiCellSeed = { sha: tip.target, entry: "Serving-Arm.md" };
+    }
+    return wikiCellSeed;
+  }
+
+  it("serves the .diff raw bytes with the diffpatch family's response shape (git-apply-valid body)", async () => {
+    const { sha, entry } = await seedWikiCommit();
+    const res = await fetchUi(`/wikidl-alice/wikidl/wiki/commit/${sha}.diff`);
+    expect(res.status).toBe(200);
+    // The diffpatch convention: sniffed plain text + the zero-option prod
+    // Cache-Control (diffPatchTextResponse's header pair).
+    expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(res.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
+    const body = await res.text();
+    // The stored flat entry name in the headers, new-file shape, and a
+    // count-consistent hunk (the renderer's git-apply validity).
+    expect(body.startsWith(`diff --git a/${entry} b/${entry}\n`)).toBe(true);
+    expect(body).toContain("new file mode 100644");
+    expect(body).toContain("--- /dev/null");
+    expect(body).toContain(`+++ b/${entry}`);
+    expect(body).toMatch(/^@@ -0,0 \+1,2 @@$/m);
+    expect(body).toContain("+one");
+    expect(body).toContain("+two");
+  });
+
+  it("serves the .patch raw bytes (the git-am mail without the signature tail)", async () => {
+    const { sha, entry } = await seedWikiCommit();
+    const res = await fetchUi(`/wikidl-alice/wikidl/wiki/commit/${sha}.patch`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    const body = await res.text();
+    expect(body.startsWith(`From ${sha} Mon Sep 17 00:00:00 2001\n`)).toBe(true);
+    expect(body).toContain("From: wikidl-alice <wikidl-alice@noreply.test.local>");
+    expect(body).toContain("Subject: [PATCH] serving arm commit");
+    expect(body).toContain(`diff --git a/${entry}`);
+    expect(body.includes("\n-- \n")).toBe(false); // --no-signature parity (diff.go:73)
+  });
+
+  it("404-shells a well-shaped sha the wiki engine cannot resolve (commit.go's IsErrNotExist → ctx.NotFound arm)", async () => {
+    await seedWikiCommit();
+    const res = await fetchUi(`/wikidl-alice/wikidl/wiki/commit/${"c".repeat(40)}.diff`);
+    expect(res.status).toBe(404);
+    const html = await res.text();
+    expect(html).toContain("<title>Page Not Found - wikidl-alice/wikidl</title>");
+    expect(html).toContain('<div class="status-page-error">');
+  });
+
+  it("keeps the pattern misses on the page-name 303 fold (the regression pin)", async () => {
+    await seedWikiCommit();
+    for (const tail of [
+      "commit/zzz.diff", // non-hex sha
+      "commit/zzz.patch",
+      `commit/${"a".repeat(40)}.diffx`, // suffix beyond the grammar
+      `commit/${"A".repeat(40)}.diff`, // uppercase hex — the lowercase-only pattern class
+      `commit/${"a".repeat(6)}.diff`, // below the 7-hex floor
+    ]) {
+      const res = await fetchUi(`/wikidl-alice/wikidl/wiki/${tail}`);
+      expect(res.status, tail).toBe(303);
+      expect(res.headers.get("location"), tail).toBe("/wikidl-alice/wikidl/wiki/?action=_pages");
+    }
+  });
+
+  it("keeps the VIEW arm on the PageIsWiki commit page (the serving arm's re-pin)", async () => {
+    const { sha } = await seedWikiCommit();
+    const res = await fetchUi(`/wikidl-alice/wikidl/wiki/commit/${sha}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The commit-page discriminator (commit_page.tmpl:5) + the WIKI commit
+    // base for the sha labels (commit_page.tmpl:2's Iif).
+    expect(html).toContain('class="page-content repository diff"');
+    expect(html).toContain("serving arm commit");
+    expect(html).toContain(`href="/wikidl-alice/wikidl/wiki/commit/${sha}"`);
   });
 });

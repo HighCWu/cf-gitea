@@ -418,7 +418,7 @@ export function wikiBranch(pair: RepositoryWithOwner): string {
  * path filters — goes through this encode; the write paths never do (their
  * literal split IS the storage convention).
  */
-function enginePath(gitPath: string): string {
+export function enginePath(gitPath: string): string {
   return gitPath
     .split("/")
     .map((segment) => segment.replaceAll("%", "%25"))
