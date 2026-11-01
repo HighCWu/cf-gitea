@@ -755,6 +755,53 @@ beforeAll(async () => {
     forkMemberId: forkMemberRow.id,
     forkPushedOid: forkPack.oid,
   });
+
+  // ---------------------------------------------------------------------
+  // The compare fork-form seed (the 063db9b reconciliation — the compare
+  // route's head forms now ride the shared resolver): a fork of the
+  // compat-git repo owned by ANOTHER user, so the bare `owner:branch` head
+  // form resolves through the FORK EDGE (resolveHeadRepo →
+  // findHeadRepoByForkEdge → findForkByOwner: fork_parent + owner_id, the
+  // name-free GetUserFork reduction). The fork's main IS the seed commit —
+  // the same deterministic objects — so `main...compatmember:main` compares
+  // identical tips (the empty compare 200) and every ref walk rides shared
+  // objects. The explicit `owner/repo:branch` form needs no fork edge: the
+  // compat-fork-src source above serves it (any repo of the named owner,
+  // GetRepositoryByName, compare.go:181-189).
+  // ---------------------------------------------------------------------
+  const compareForkMember = await drizzle(env.DB)
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.usernameLower, "compatmember"))
+    .get();
+  if (compareForkMember === undefined) throw new Error("compatmember seed missing for the compare fork-form block");
+  await drizzle(env.DB).insert(repositories).values({
+    id: "9010",
+    storageKey: "r_9010",
+    ownerNamespace: "compatmember",
+    ownerId: compareForkMember.id,
+    slug: "compat-member-fork",
+    visibility: "public",
+    refsVersion: 1,
+    backend: "self-hosted",
+    forkParent: "9008",
+    isEmpty: false,
+    createdAt: SEED_NOW,
+  });
+  const memberForkCell = env.REPO.getByName("compatmember/compat-member-fork");
+  const memberForkStored = await memberForkCell.putApiObjects([
+    { oid: gitBlobOid, type: "blob", data: gitBlobData },
+    { oid: gitTree.oid, type: "tree", data: gitTree.data },
+    { oid: gitCommit.oid, type: "commit", data: gitCommit.data },
+  ]);
+  if (memberForkStored.tag !== "ok") {
+    throw new Error(`member-fork git-object seed putApiObjects failed: ${memberForkStored.tag}`);
+  }
+  const memberForkLand = await memberForkCell.commitApiChange({ ref: "refs/heads/main", expectedOldOid: ZERO_OID, newOid: gitCommit.oid });
+  if (memberForkLand.tag !== "committed") {
+    throw new Error(`member-fork ref landing failed (${memberForkLand.tag})`);
+  }
+  Object.assign(seeds, { memberForkOwner: "compatmember" });
 });
 
 // ---------------------------------------------------------------------------
@@ -1435,10 +1482,114 @@ const SCENARIOS: Readonly<Record<string, readonly CompatScenarioCase[]>> = {
       }),
     },
     {
-      name: "malformed basehead → declared 400",
-      status: 400,
+      // The 063db9b reconciliation: a separator-less tail is a HEAD form
+      // (ParseCompareRouterParam, routers/common/compare.go:78-86) — the
+      // base falls to the PR target branch (pull.go:1109's IfZero over
+      // GetPullRequestTargetBranch, pull_request_default.go:13-16; the
+      // repo's default_branch here), so `compat-topic` is the same
+      // one-commit range as main...compat-topic. The formerly-pinned
+      // declared 400 for this shape is retired.
+      name: "separator-less tail: head vs the default branch",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/compare/compat-topic`,
+      }),
+    },
+    {
+      // The head form still 404s an unresolvable ref (ResolveRefWithSuffix
+      // → not-exist → APIErrorAuto, pull.go:1110-1112).
+      name: "separator-less tail, unknown head ref → 404",
+      status: 404,
       request: (ctx) => ({
         path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/compare/nodots`,
+      }),
+    },
+    {
+      // The ^/~N revision suffix (ResolveRefWithSuffix, compare.go:110-132):
+      // compat-topic~1 walks the topic commit's parent = the seed commit —
+      // the same one-commit range again.
+      name: "ref suffix walk: compat-topic~1...compat-topic",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/compare/compat-topic~1...compat-topic`,
+      }),
+    },
+    {
+      // The seed commit is a ROOT commit — one generation past it misses
+      // (GetCommit(oriRef+suffix) → not-exist → 404, `ref %q does not
+      // exist`).
+      name: "ref suffix past the root → 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/compare/main~1...compat-topic`,
+      }),
+    },
+    {
+      // The ^{tree} form addresses a TREE, not ancestry — validRefSuffix
+      // (compare.go:136-137) rejects it with the invalid-argument 400
+      // (`unsupported ref suffix "^{tree}"`).
+      name: "unsupported suffix shape → 400",
+      status: 400,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/compare/main%5E%7Btree%7D...compat-topic`,
+      }),
+    },
+    {
+      // The explicit `owner/name:branch` head form (GetRepositoryByName,
+      // compare.go:181-189): the fork SOURCE is a real second repo of the
+      // same owner — the head ref resolves in ITS cell (the doer's read
+      // gate passes on the public row).
+      name: "head form owner/repo:branch — the explicit head repo",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/compare/main...${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.forkSource)}:main`,
+      }),
+    },
+    {
+      // The bare `owner:branch` fork form (compare.go:161-180 →
+      // FindHeadRepo) through the landed shared resolver (services/pulls.ts
+      // resolveHeadRepo): the seeded member fork (fork_parent = the
+      // compat-git repo, owner compatmember) resolves by EDGE, not name.
+      // Identical tips → the empty compare 200.
+      name: "head form owner:branch — the fork edge",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/compare/main...${String(ctx.seeds.memberForkOwner)}:main`,
+      }),
+    },
+    {
+      // The resolver's recorded flat-404 deviation (services/pulls.ts
+      // resolveHeadRepo header; pulls-head-repo.test.ts pins the same):
+      // a KNOWN head owner without a fork of the base — upstream answers
+      // 400 "the user %s does not have a fork of the base repository"
+      // (compare.go:178 → pull.go:1053-1055), ours keeps the anti-
+      // enumeration 404 (a16f60e). The ORG row owns no fork here.
+      name: "known head owner without a fork → the flat 404 (recorded deviation)",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/compare/main...${String(ctx.seeds.org)}:main`,
+      }),
+    },
+    {
+      // An unknown head owner → GetUserByName not-exist → 404 (pull.go:
+      // 1056-1058), upstream and ours alike.
+      name: "unknown head owner → 404",
+      status: 404,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/compare/main...compatghost:main`,
+      }),
+    },
+    {
+      // The chi wildcard's empty tail ("/compare/", never the bare
+      // "/compare" — no static leaf upstream): both IfZero arms fire —
+      // default branch against itself → the empty compare 200. The bare
+      // "/compare" native-404 shape is pinned in pull-engine.test.ts (the
+      // harness's empty-family rule accepts only empty or APIError-JSON
+      // bodies, not the runtime not-found text either mux answers).
+      name: "empty tail: default branch against itself",
+      status: 200,
+      request: (ctx) => ({
+        path: `/repos/${String(ctx.seeds.repoOwner)}/${String(ctx.seeds.gitRepoSlug)}/compare/`,
       }),
     },
   ],

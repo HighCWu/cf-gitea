@@ -28,7 +28,17 @@
  *     gate rides the route group — anonymous passes to the stub (upstream's
  *     GetDoerTokenScope early return, api.go:281-283), a scopeless-token
  *     403 carries the exact api.go:300 body, the method-derived level
- *     (read passes GET, write required POST/PUT/PATCH/DELETE).
+ *     (read passes GET, write required POST/PUT/PATCH/DELETE);
+ *   - the method arms (the 7538a40 adjudication): chi's tree/mux mechanics
+ *     — the web pair tree-405s every known non-GET with `Allow: GET`
+ *     gate-INDEPENDENTLY (web.go:534-535 registers unconditionally; the
+ *     per-endpoint gate never runs for an unresolved method; mux.go:532-540
+ *     's default handler), /api/v1/nodeinfo 405s the same way only when
+ *     enabled (api.go:1007's registration conditional leaves it
+ *     unregistered when disabled), /activitypub/* is Gitea's Any → mALL —
+ *     EVERY chi methodMap method (incl. QUERY, tree.go) rides the scope
+ *     gate to the 501 — and an unknown method bare-405s pre-tree (mux.go
+ *     routeHTTP's early arm, gate- and registration-independent).
  */
 
 import { OpenAPIHono } from "@hono/zod-openapi";
@@ -42,6 +52,7 @@ import { ScopeSet } from "../../auth/scopes";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
 import {
+  chiMethodNotAllowed,
   federationEnabled,
   registerFederationApiRoutes,
   wellKnownRouter,
@@ -548,5 +559,111 @@ describe("the /api/v1 stubs — enabled: NotImplemented everywhere (person.go:12
     // `all` carries every category at both levels.
     const allToken = await api("/activitypub/user-id/1", { method: "PUT" }, { federation: "true", auth: authWithScope("all") });
     expect(allToken.status).toBe(501);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The method arms — chi's tree/mux mechanics (the 7538a40 adjudication:
+// 405+Allow exactly where chi would, NO HEAD→GET fallback, the bare-405
+// pre-tree arm for unknown methods, each 405 gate-independence per its
+// registration shape). HEAD bodies read "" because Hono's auto-HEAD
+// wrapper strips bodies — the fetch spec does the same upstream.
+// ---------------------------------------------------------------------------
+
+describe("the method arms — chi's 405 tree, no HEAD fallback", () => {
+  const wellKnownVia = async (path: string, init: RequestInit, federation?: string): Promise<Response> =>
+    await wellKnownRouter.request(`${ORIGIN}${path}`, init, familyEnv(federation));
+
+  it("web pair: HEAD/OPTIONS/POST tree-405 + Allow: GET with an empty body, enabled", async () => {
+    for (const method of ["HEAD", "OPTIONS", "POST"]) {
+      const nodeinfo = await wellKnownVia("/.well-known/nodeinfo", { method }, "true");
+      expect(nodeinfo.status, `nodeinfo ${method}`).toBe(405);
+      expect(nodeinfo.headers.get("allow"), `nodeinfo ${method}`).toBe("GET");
+      expect(await nodeinfo.text(), `nodeinfo ${method}`).toBe("");
+
+      const webfinger = await wellKnownVia("/.well-known/webfinger", { method }, "true");
+      expect(webfinger.status, `webfinger ${method}`).toBe(405);
+      expect(webfinger.headers.get("allow"), `webfinger ${method}`).toBe("GET");
+      expect(await webfinger.text(), `webfinger ${method}`).toBe("");
+    }
+  });
+
+  it("web pair: the tree 405 is gate-INDEPENDENT (web.go:534-535 registers unconditionally)", async () => {
+    const head = await wellKnownVia("/.well-known/nodeinfo", { method: "HEAD" }, "false");
+    expect(head.status).toBe(405);
+    expect(head.headers.get("allow")).toBe("GET");
+
+    const options = await wellKnownVia("/.well-known/webfinger", { method: "OPTIONS" }, undefined);
+    expect(options.status).toBe(405);
+    expect(options.headers.get("allow")).toBe("GET");
+  });
+
+  it("web pair: the tree 405 is gate-INDEPENDENT (web.go:534-535 registers unconditionally)", async () => {
+    const head = await wellKnownVia("/.well-known/nodeinfo", { method: "HEAD" }, "false");
+    expect(head.status).toBe(405);
+    expect(head.headers.get("allow")).toBe("GET");
+
+    const options = await wellKnownVia("/.well-known/webfinger", { method: "OPTIONS" }, undefined);
+    expect(options.status).toBe(405);
+    expect(options.headers.get("allow")).toBe("GET");
+  });
+
+  it("an unknown method bare-405s with NO Allow — the byte shape (routeHTTP's pre-tree arm)", async () => {
+    // Workers' Request constructor rejects non-methodMap tokens (BREW and
+    // chi's QUERY placeholder both throw), so the wire dispatch is pinned
+    // over the constructible methods above and the bare-405 shape here —
+    // chiMethodNotAllowed skipping the Allow header for unknown methods.
+    const bare = chiMethodNotAllowed("BREW", ["GET"]);
+    expect(bare.status).toBe(405);
+    expect(bare.headers.get("allow")).toBeNull();
+    expect(await bare.text()).toBe("");
+
+    // QUERY IS in chi's methodMap (tree.go methodQuery) and carries the
+    // Allow line — though no request can carry the token past the runtime.
+    const allowed = chiMethodNotAllowed("QUERY", ["GET"]);
+    expect(allowed.status).toBe(405);
+    expect(allowed.headers.get("allow")).toBe("GET");
+  });
+
+  it("API /nodeinfo enabled: HEAD/OPTIONS/POST tree-405 + Allow: GET; GET stays the 501", async () => {
+    for (const method of ["HEAD", "OPTIONS", "POST"]) {
+      const response = await api("/nodeinfo", { method }, { federation: "true" });
+      expect(response.status, method).toBe(405);
+      expect(response.headers.get("allow"), method).toBe("GET");
+      expect(await response.text(), method).toBe("");
+    }
+    const get = await api("/nodeinfo", {}, { federation: "true" });
+    expect(get.status).toBe(501);
+    expect(await get.text()).toBe("Not implemented\n");
+  });
+
+  it("API /nodeinfo disabled: unregistered — known methods answer the native 404", async () => {
+    // HEAD strips the body at the auto-HEAD wrapper (the wire shape net/http
+    // produces too); OPTIONS keeps the native not-found body.
+    const head = await api("/nodeinfo", { method: "HEAD" }, { federation: undefined });
+    expect(head.status).toBe(404);
+
+    const options = await api("/nodeinfo", { method: "OPTIONS" }, { federation: "false" });
+    expect(options.status).toBe(404);
+    expect(await options.text()).toBe("404 Not Found");
+  });
+
+  it("API /activitypub/* is mALL: HEAD and OPTIONS ride the scope gate to the 501 (api.go:1009)", async () => {
+    const anonymous = await api("/activitypub/user-id/1", { method: "OPTIONS" }, { federation: "true" });
+    expect(anonymous.status).toBe(501);
+    expect(await anonymous.text()).toBe("Not implemented\n");
+
+    // The method-derived level: HEAD/OPTIONS are non-write → the read level
+    // passes a read-only token to the stub and denies a foreign-category one
+    // (the same body the GET arm 403s with).
+    const headRead = await api("/activitypub/user-id/1", { method: "HEAD" }, { federation: "true", auth: authWithScope("read:activitypub") });
+    expect(headRead.status).toBe(501);
+
+    // The denial status rides HEAD too — its JSON body is stripped at the
+    // auto-HEAD wrapper (net/http suppresses HEAD bodies upstream); the
+    // exact body is the GET arm's pin above.
+    const headDenied = await api("/activitypub/user-id/1", { method: "HEAD" }, { federation: "true", auth: authWithScope("read:repository") });
+    expect(headDenied.status).toBe(403);
+    expect(await headDenied.text()).toBe("");
   });
 });

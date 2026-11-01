@@ -7,9 +7,20 @@ import { drizzle } from "drizzle-orm/d1";
 import { issues, pullRequests } from "../../db/schema";
 import type { ApiEnv } from "../env";
 import { ApiError, apiErrorSchema } from "../errors";
-import { branchRef, engineReads, refTipMap, resolveListStartRef, resolveNamedRef, tagRef } from "../services/engine";
+import {
+  branchRef,
+  engineReads,
+  isFullObjectId,
+  refTipMap,
+  resolveListStartRef,
+  resolveNamedRef,
+  tagRef,
+  type EngineReads,
+  type RefTip,
+} from "../services/engine";
 import { renderPatch, renderUnifiedDiff, toApiCommit, userRowsByEmail } from "../services/git-models";
-import { toApiPullRequest } from "../services/pulls";
+import { resolveHeadRepo, toApiPullRequest } from "../services/pulls";
+import { canViewRepositoryWithTeams, findRepositoryById, type RepositoryWithOwner } from "../services/repository";
 import { compareSchema, commitListSchema, commitSchema } from "../models/git";
 import { pullRequestSchema } from "../models/pull";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
@@ -32,9 +43,14 @@ import { viewerOf } from "../services/repository";
  *     date over a bounded window (COMMIT_WALK_BOUND — the engine walk RPC
  *     carries no date filter; documented approximation);
  *   - `git/commits/{sha}` accepts a ref, not only a sha (the param contract);
- *   - `compare/{basehead}`: `base...head` (three-dot, merge-base) or
- *     `base..head` (two-dot); `output=diff|patch` answers raw text; a
- *     malformed basehead → the declared 400; the JSON commit list is served
+ *   - `compare/{basehead}`: the full ParseCompareRouterParam grammar
+ *     (routers/common/compare.go:63-105) — `base...head` (three-dot,
+ *     merge-base), `base..head` (two-dot), a separator-less head form
+ *     against the default branch (pull.go:1109's IfZero), the
+ *     `owner:branch` / `owner/name:branch` fork forms through the landed
+ *     shared resolver (services/pulls.ts resolveHeadRepo), and per-side
+ *     ^/~N revision suffixes (ResolveRefWithSuffix, compare.go:110-132);
+ *     `output=diff|patch` answers raw text; the JSON commit list is served
  *     NEWEST-first (upstream's git-log order, compare.go) — the engine walk
  *     is oldest-first and the render reverses it; a null merge base
  *     (unrelated histories) answers EARLY EMPTY like compare.go:91-93.
@@ -359,39 +375,65 @@ export function registerCommitRoutes(
   // so the doc stays doc-only (the git/commits dot-suffix idiom) and TWO
   // plain arms share the handler: the single-segment param route (wins the
   // shared prefix — the branch_protections probe) and a catch-all twin for
-  // the multi-segment tails (the contents raw/media pair). Split parity
-  // note: upstream's ParseCompareRouterParam answers a separator-less tail
-  // as head-vs-default-branch; this handler keeps the declared 400 (the
-  // compat suite pins it) — documented divergence, like the unmodeled
-  // `headOwner:headRef` fork forms.
+  // the multi-segment tails (the contents raw/media pair).
+  //
+  // The tail grammar is ParseCompareRouterParam (routers/common/compare.go:
+  // 63-105), ported below — the three 063db9b divergences RECONCILED here:
+  //   - a separator-less tail is a HEAD form (compare.go:78-86): the base
+  //     falls to the PR target branch (pull.go:1109's IfZero over
+  //     GetPullRequestTargetBranch — pull_request_default.go:13-16; no
+  //     PR-unit config table exists here, so repo.default_branch) and an
+  //     empty head side falls to the head repo's default branch
+  //     (pull.go:1114's IfZero);
+  //   - the head side carries the fork grammar (`owner:branch` bare form —
+  //     the fork edge; `owner/name:branch` explicit) through the LANDED
+  //     shared resolver (services/pulls.ts resolveHeadRepo — the PR twin's
+  //     FindHeadRepo port); the resolver's recorded deviations (the flat
+  //     anti-enumeration 404s) are the compare route's too;
+  //   - each side's ref carries an optional ^/~N revision suffix
+  //     (ResolveRefWithSuffix, compare.go:110-132): a valid suffix walks
+  //     the parsed commit's parents (upstream runs
+  //     GetCommit(oriRef+suffix) — git rev-parse ancestry), an unsupported
+  //     suffix shape is the 400 (`unsupported ref suffix %q`), an
+  //     unresolvable one the 404 (`ref %q does not exist`).
+  // Cross-repo heads resolve refs and read the head commit against the
+  // HEAD cell (upstream opens headGitRepo, pull.go:1078-1089); the
+  // merge-base/range pipeline stays on the base engine — head objects the
+  // base cell lacks (a fork with divergent history) collapse into the
+  // documented null merge-base EARLY EMPTY (compare.go:91-93), where
+  // upstream fetches the head tip (FetchRemoteTempCommit) — recorded
+  // limitation, not a status divergence.
   // -------------------------------------------------------------------------
   const handleCompare = async (c: Context<ApiEnv>, owner: string, repo: string, basehead: string): Promise<Response> => {
     const pair = await requireVisibleRepo(c, { owner, repo });
     const url = new URL(c.req.url);
-    const sep = basehead.includes("...") ? "..." : basehead.includes("..") ? ".." : null;
-    if (sep === null) {
-      throw new ApiError(400, "invalid basehead format: must be base...head or base..head");
-    }
-    const colon = basehead.indexOf(sep);
-    const baseParam = basehead.slice(0, colon);
-    const headParam = basehead.slice(colon + sep.length);
+    const req = parseCompareRouterParam(basehead);
+
+    // GetHeadOwnerAndRepo (compare.go:152-192) through the landed shared
+    // resolver: the plain form is a branch here, the bare `owner:branch`
+    // form searches the fork edge, `owner/name:branch` is the direct path
+    // lookup (compare.go:181-189).
+    const head = await resolveHeadRepo(c.env.DB, pair, req.headParam);
+    const headPair = head.headRepoId === pair.repo.id ? pair : await requireReadableHeadRepo(c, head.headRepoId);
 
     const reads = engineReads(c.env, pair.repo);
     const tips = refTipMap(await reads.listRefs());
-    // STRICT resolution (no default-branch fallback): an unknown side is
-    // the upstream 404, not a silent compare against the default branch.
-    const resolveSide = (param: string): string | null => {
-      const direct = tips.get(branchRef(param)) ?? tips.get(tagRef(param)) ?? tips.get(param);
-      if (direct !== undefined) return direct.target;
-      return /^[0-9a-f]{40}$/.test(param) ? param : null;
-    };
-    const baseTarget = resolveSide(baseParam);
-    const headTarget = resolveSide(headParam);
-    if (baseTarget === null || headTarget === null) {
-      throw new ApiError(404, "not found");
-    }
+    const headReads = headPair.repo.id === pair.repo.id ? reads : engineReads(c.env, headPair.repo);
+    const headTips = headPair.repo.id === pair.repo.id ? tips : refTipMap(await headReads.listRefs());
+
+    // The IfZero arms (pull.go:1109/1114): an empty side falls to the PR
+    // target branch — repo.default_branch here, no PR-unit config table —
+    // and to the resolved HEAD repo's default branch. The head's ref
+    // suffix splits AFTER the repo grammar (upstream parses the suffix
+    // after parseHead, compare.go:103-104).
+    const headRef = parseRefSuffix(head.headBranch);
+    const baseOriRef = req.baseOriRef === "" ? pair.repo.defaultBranch : req.baseOriRef;
+    const headOriRef = headRef.refName === "" ? headPair.repo.defaultBranch : headRef.refName;
+
+    const baseTarget = await resolveSideWithSuffix(reads, tips, baseOriRef, req.baseOriRefSuffix);
+    const headTarget = await resolveSideWithSuffix(headReads, headTips, headOriRef, headRef.refSuffix);
     const baseCommit = await reads.readCommit(baseTarget);
-    const headCommit = await reads.readCommit(headTarget);
+    const headCommit = await headReads.readCommit(headTarget);
     if (baseCommit === null || headCommit === null) {
       throw new ApiError(404, "not found");
     }
@@ -404,7 +446,7 @@ export function registerCommitRoutes(
     // reports base=null — the same EMPTY shape, our documented exhaustion
     // posture (SPEC-0001b §6).
     let rangeStart: string | null = baseCommit.oid;
-    if (sep === "...") {
+    if (req.separator === "...") {
       const base = await reads.mergeBase(baseCommit.oid, headCommit.oid);
       rangeStart = base !== null && base.tag === "ok" ? base.base : null;
     }
@@ -464,7 +506,7 @@ export function registerCommitRoutes(
       request: {
         params: z.object({
           ...ownerRepoParams,
-          basehead: z.string().min(1).openapi({ description: "the base and head, formatted as base...head (three-dot) or base..head (two-dot); refs may be branch names that contain slashes" }),
+          basehead: z.string().min(1).openapi({ description: "the base and head, formatted as base...head (three-dot) or base..head (two-dot); a separator-less value is the head against the default branch; the head may name a fork as owner or owner/repo; refs may be branch names that contain slashes and carry a ^/~N revision suffix" }),
         }),
         query: z.object({
           output: z.string().optional().openapi({ type: "string", enum: ["diff", "patch", ""], description: "output format; diff or patch answers raw text" }),
@@ -489,7 +531,13 @@ export function registerCommitRoutes(
     return handleCompare(c, owner, repo, basehead);
   });
 
-  app.get("/repos/:owner/:repo/compare/*", optionalAuth, (c) => {
+  app.get("/repos/:owner/:repo/compare/*", optionalAuth, async (c, next) => {
+    // chi's wildcard claims "/compare/…" INCLUDING the empty tail
+    // ("/compare/"), but the bare "/compare" has no static leaf in the
+    // upstream tree — it falls to the mux's native 404 there.
+    if (c.req.path.endsWith("/compare")) {
+      return next();
+    }
     const { owner, repo } = c.req.param();
     return handleCompare(c, owner, repo, tailAfter(c, `/${owner}/${repo}/compare/`));
   });
@@ -500,6 +548,146 @@ export function registerCommitRoutes(
 function tailAfter(c: Context<ApiEnv>, prefix: string): string {
   const index = c.req.path.indexOf(prefix);
   return decodeURIComponent(index < 0 ? "" : c.req.path.slice(index + prefix.length));
+}
+
+/** git.ParseRefSuffix (modules/git/ref.go:246-258): the EARLIEST of
+ *  "@{", "^", "~" splits the revision suffix off — so a combined suffix
+ *  like "main~2^" stays intact; no mark → no suffix. */
+function parseRefSuffix(ref: string): { refName: string; refSuffix: string } {
+  let suffixIdx = -1;
+  for (const mark of ["@{", "^", "~"]) {
+    const idx = ref.indexOf(mark);
+    if (idx !== -1 && (suffixIdx === -1 || idx < suffixIdx)) suffixIdx = idx;
+  }
+  return suffixIdx === -1
+    ? { refName: ref, refSuffix: "" }
+    : { refName: ref.slice(0, suffixIdx), refSuffix: ref.slice(suffixIdx) };
+}
+
+/** `validRefSuffix` (routers/common/compare.go:136-137): only ^/~ ancestry
+ *  navigation — the ^{...}, @{...} and :path forms address other objects
+ *  (trees, blobs) or reflog state that compare does not resolve, so they
+ *  are rejected (the 400 unsupported-suffix arm). */
+const VALID_REF_SUFFIX = /^(?:[~^][0-9]*)+$/;
+
+/** ParseCompareRouterParam (routers/common/compare.go:63-105): try "..."
+ *  (three-dot, merge-base), then ".." (two-dot, direct); a separator-less
+ *  tail is a HEAD form — the base stays empty and falls to the repo's
+ *  default branch at the IfZero arms (pull.go:1109), exactly the
+ *  `compare/{head}` route shapes 4/5/6. The base part carries its own ref
+ *  suffix (compare.go:101); the head part keeps the raw
+ *  `owner[:repo]:ref` grammar for resolveHeadRepo, whose branch then takes
+ *  the suffix split (upstream parses the suffix AFTER parseHead,
+ *  compare.go:103-104). */
+function parseCompareRouterParam(routerParam: string): {
+  baseOriRef: string;
+  baseOriRefSuffix: string;
+  separator: "..." | "..";
+  headParam: string;
+} {
+  if (routerParam === "") {
+    // The chi wildcard's empty tail (upstream `CompareRouterReq{}`): both
+    // sides fall to their default branches at the IfZero arms.
+    return { baseOriRef: "", baseOriRefSuffix: "", separator: "...", headParam: "" };
+  }
+  const triple = routerParam.indexOf("...");
+  if (triple !== -1) {
+    const base = parseRefSuffix(routerParam.slice(0, triple));
+    return {
+      baseOriRef: base.refName,
+      baseOriRefSuffix: base.refSuffix,
+      separator: "...",
+      headParam: routerParam.slice(triple + 3),
+    };
+  }
+  const double = routerParam.indexOf("..");
+  if (double !== -1) {
+    const base = parseRefSuffix(routerParam.slice(0, double));
+    return {
+      baseOriRef: base.refName,
+      baseOriRefSuffix: base.refSuffix,
+      separator: "..",
+      headParam: routerParam.slice(double + 2),
+    };
+  }
+  return { baseOriRef: "", baseOriRefSuffix: "", separator: "...", headParam: routerParam };
+}
+
+/**
+ * ResolveRefWithSuffix (routers/common/compare.go:110-132) over one repo's
+ * tips. Suffix-less, the landed guess ladder: branch → tag → raw ref →
+ * format-valid oid (UnstableGuessRefByShortName's reduction). With a valid
+ * ^/~N suffix, the ref resolves the same way and the suffix walks the
+ * commit ancestry (`~N` N first-parent generations, `^N` the N-th parent
+ * with 0 = the commit itself, bare marks = 1 — git rev-parse semantics;
+ * upstream runs GetCommit(oriRef+suffix) in one git step, ours steps the
+ * parsed commit's parents). An unsupported suffix shape throws the 400
+ * (`unsupported ref suffix %q`), an unresolvable ref the 404 (`ref %q does
+ * not exist`) — the two APIErrorAuto arms; the walk 404s at the first
+ * missing parent, so an oversized `~N` costs no more reads than the
+ * history is deep.
+ */
+async function resolveSideWithSuffix(
+  reads: EngineReads,
+  tips: Map<string, RefTip>,
+  oriRef: string,
+  refSuffix: string,
+): Promise<string> {
+  const guess = (): string | null => {
+    const direct = tips.get(branchRef(oriRef)) ?? tips.get(tagRef(oriRef)) ?? tips.get(oriRef);
+    if (direct !== undefined) return direct.target;
+    return isFullObjectId(oriRef) ? oriRef : null;
+  };
+  if (refSuffix === "") {
+    const resolved = guess();
+    if (resolved === null) {
+      throw new ApiError(404, `ref "${oriRef}" does not exist`);
+    }
+    return resolved;
+  }
+  if (!VALID_REF_SUFFIX.test(refSuffix)) {
+    throw new ApiError(400, `unsupported ref suffix "${refSuffix}"`);
+  }
+  let oid = guess();
+  if (oid === null) {
+    throw new ApiError(404, `ref "${oriRef}${refSuffix}" does not exist`);
+  }
+  for (const token of refSuffix.match(/[~^][0-9]*/g) ?? []) {
+    const count = token.slice(1) === "" ? 1 : Number.parseInt(token.slice(1), 10);
+    if (token[0] === "^") {
+      if (count === 0) continue; // `^0` IS the commit itself (git rev-parse)
+      const commit = await reads.readCommit(oid);
+      const parent = commit === null ? undefined : commit.parents[count - 1];
+      if (parent === undefined) {
+        throw new ApiError(404, `ref "${oriRef}${refSuffix}" does not exist`);
+      }
+      oid = parent;
+      continue;
+    }
+    for (let step = 0; step < count; step += 1) {
+      const commit = await reads.readCommit(oid);
+      const parent = commit === null ? undefined : commit.parents[0];
+      if (parent === undefined) {
+        throw new ApiError(404, `ref "${oriRef}${refSuffix}" does not exist`);
+      }
+      oid = parent;
+    }
+  }
+  return oid;
+}
+
+/** parseCompareInfo's head-repo READ gate (routers/api/v1/repo/pull.go:
+ * 1063-1074): `GetDoerRepoPermission(...).CanRead(unit.TypeCode)` — a head
+ * repo the viewer cannot read answers APIErrorNotFound, the same
+ * anti-enumeration 404 as an absent row (both collapse here). The landed
+ * team-aware visibility predicate is the CanRead port (the routes/pulls.ts
+ * local-copy shape). */
+async function requireReadableHeadRepo(c: Context<ApiEnv>, headRepoId: string): Promise<RepositoryWithOwner> {
+  const headPair = await findRepositoryById(c.env.DB, headRepoId);
+  if (headPair === null || !(await canViewRepositoryWithTeams(c.env.DB, viewerOf(c), headPair.repo))) {
+    throw new ApiError(404, "not found");
+  }
+  return headPair;
 }
 
 /** Compare renders at most this many commits (upstream's own page cap). */

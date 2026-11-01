@@ -38,12 +38,39 @@
  *     (routers/api/v1/activitypub/person.go:12-14 — the package's entire
  *     content at the pin; upstream retracted the data plane, PR #36789).
  *
- * The whole /.well-known group rides upstream's optionsCorsHandler
- * (web.go:542) — a no-op without [cors] config, which cf-gitea does not
- * surface; OPTIONS therefore falls through to the router's native 404 here
- * exactly as it does upstream. webfinger stamps its own
- * `Access-Control-Allow-Origin: *` in-handler (webfinger.go:116), gate-open
- * only — the discovery tier is the gate's payload, disabled = absent.
+ * The method arms are chi-exact (the 7538a40 adjudication; the well-known
+ * census's citations re-verified against chi v5.4.0 mux.go/tree.go and
+ * modules/web/router.go at this review — the earlier "OPTIONS falls through
+ * to the router's native 404" reading here is SUPERSEDED):
+ *   - Gitea's Group folds group middleware into each ENDPOINT registration
+ *     (modules/web/router.go Group → curMiddlewares →
+ *     wrapMiddlewareAndHandler → chiRouter.With(...).Method(...)), so
+ *     optionsCorsHandler (web.go:542) runs only when the GET endpoint
+ *     resolves. HEAD/OPTIONS resolve no endpoint and never reach it — the
+ *     mux's DEFAULT methodNotAllowedHandler answers first (routeHTTP's
+ *     methodNotAllowed arm): empty body, `Allow` added PER allowed method
+ *     (the endpoint iteration is a Go map range, so upstream's wire line
+ *     order is unspecified), and NO Allow for methods outside chi's
+ *     methodMap (the pre-tree early arm).
+ *   - chi registers NO HEAD→GET fallback (tree.go's endpoint map is
+ *     method-keyed; routeHTTP has none — HEAD is only its own methodMap
+ *     entry): a HEAD on a GET-only path is the same 405 + Allow: GET.
+ *   - The web pair registers UNCONDITIONALLY (web.go:534-535 — the gate is
+ *     per-endpoint middleware), so the tree 405s are gate-INDEPENDENT.
+ *   - The API arms differ: api.go:1007's registration CONDITIONAL leaves
+ *     the paths unregistered when disabled (known methods → the mux's
+ *     native not-found; only the pre-tree unknown-method 405 still fires),
+ *     while /activitypub/* is Gitea's Any → chi Handle → mALL (mux.go) —
+ *     setEndpoint registers EVERY methodMap method (tree.go's loop), so
+ *     all known methods ride the scope gate to the stub.
+ * Hono would auto-HEAD every GET route (dispatch-as-GET at the router
+ * match, body stripped — hono-base.js #dispatch), which upstream does not
+ * do, so every arm here rides `.all` and dispatches on `c.req.method`
+ * itself (the well-known module's pattern; the wrapper's
+ * `new Response(null, res)` keeps a deliberate 405's status + Allow).
+ * webfinger stamps its own `Access-Control-Allow-Origin: *` in-handler
+ * (webfinger.go:116), gate-open only — the discovery tier is the gate's
+ * payload, disabled = absent.
  *
  * INTEGRATION (orchestrator-owned — src/index.ts + api/router.ts, untouched
  * here; the HANDOFF lines live in specs/federation.md §6.1): the dispatcher's
@@ -126,6 +153,39 @@ function routerNativeNotFound(c: Context<ApiEnv>): Response {
   return c.text("404 Not Found", 404);
 }
 
+/** chi v5.4.0's methodMap (tree.go — incl. the RFC-10008 QUERY placeholder,
+ *  `methodQuery`): the methods whose 405 carries the `Allow` header. An
+ *  unknown method misses the map and bare-405s pre-tree (mux.go routeHTTP's
+ *  early arm — before any lookup, registration, or middleware). */
+const CHI_KNOWN_METHODS: ReadonlySet<string> = new Set([
+  "CONNECT",
+  "DELETE",
+  "GET",
+  "HEAD",
+  "OPTIONS",
+  "PATCH",
+  "POST",
+  "PUT",
+  "QUERY",
+  "TRACE",
+]);
+
+/** chi's default methodNotAllowedHandler (mux.go:532-540): empty body,
+ *  `Allow` ADDED PER method (`w.Header().Add` — one wire line per method;
+ *  the endpoint iteration is a Go map range, so upstream's line ORDER is
+ *  unspecified — ours is the deterministic declaration order passed here);
+ *  unknown methods 405 with NO Allow at all. Exported for the method-arm
+ *  pins — workers' Request constructor cannot carry a non-methodMap token
+ *  (BREW/QUERY both throw "Invalid HTTP method string"), so the bare-405
+ *  byte shape is pinned at the helper, the byte shape being the surface. */
+export function chiMethodNotAllowed(method: string, allow: string[]): Response {
+  const response = new Response(null, { status: 405 });
+  if (CHI_KNOWN_METHODS.has(method)) {
+    for (const value of allow) response.headers.append("allow", value);
+  }
+  return response;
+}
+
 // ---------------------------------------------------------------------------
 // The /.well-known pair — a plain Hono sub-app (non-contract web routes,
 // the avatar-serving seam shape; upstream mounts them on the web mux,
@@ -184,8 +244,18 @@ export const wellKnownRouter = new Hono<{ Bindings: FederationEnv }>();
  * `{appUrl}api/v1/nodeinfo`, rel = the nodeinfo 2.1 schema IRI. The
  * byte-shape is Go's compact struct marshal: `{"links":[{"href":…,"rel":…}]}`
  * (Href before Rel — the struct declares them in that order).
+ *
+ * The `.all` + method dispatch ports chi's tree arms: the endpoint resolves
+ * only for GET (web.go:534 registers GET alone), so every known non-GET
+ * method 405s with `Allow: GET` — gate-INDEPENDENTLY, the per-endpoint
+ * gate never running for an unresolved method — and an unknown method
+ * bare-405s (chiMethodNotAllowed's no-Allow arm).
  */
-wellKnownRouter.get("/.well-known/nodeinfo", (c) => {
+wellKnownRouter.all("/.well-known/nodeinfo", (c) => {
+  const method = c.req.method;
+  if (method !== "GET") {
+    return chiMethodNotAllowed(method, ["GET"]);
+  }
   if (!federationEnabled(c.env)) {
     // web.go:409-414 → ctx.HTTPError(404) → "Not Found\n" (base.go:105-111).
     return goHttpError(404, "Not Found");
@@ -203,8 +273,16 @@ wellKnownRouter.get("/.well-known/nodeinfo", (c) => {
  * arms are Go `http.Error` lines: 400 "Bad Request\n" (parse/scheme/host),
  * 404 "Not Found\n" (not-exist / suppressed / hidden). The JRD carries the
  * explicit `Access-Control-Allow-Origin: *` stamp (webfinger.go:116).
+ *
+ * Same chi tree dispatch as nodeinfo: the session viewer and the resolver
+ * never run for a non-GET — chi's 405 answers before any endpoint
+ * middleware (web.go:535 registers GET alone).
  */
-wellKnownRouter.get("/.well-known/webfinger", async (c) => {
+wellKnownRouter.all("/.well-known/webfinger", async (c) => {
+  const method = c.req.method;
+  if (method !== "GET") {
+    return chiMethodNotAllowed(method, ["GET"]);
+  }
   if (!federationEnabled(c.env)) {
     return goHttpError(404, "Not Found");
   }
@@ -287,6 +365,20 @@ export function federationNotImplemented(): Response {
 }
 
 /**
+ * routeHTTP's PRE-TREE arm (mux.go): a method outside chi's methodMap
+ * bare-405s before any lookup — path-, registration-, and gate-independent.
+ * Mounted as the first middleware on both API arms; the web pair inlines
+ * the same check in-handler (chiMethodNotAllowed's no-Allow arm). Known
+ * methods pass through to the chi tree semantics below.
+ */
+const chiUnknownMethodGuard: MiddlewareHandler<ApiEnv> = async (c, next) => {
+  if (!CHI_KNOWN_METHODS.has(c.req.method)) {
+    return chiMethodNotAllowed(c.req.method, []);
+  }
+  await next();
+};
+
+/**
  * The API arms' gate — the registration conditional (api.go:1007) rendered
  * as middleware: disabled answers the router's native not-found (the
  * unregistered-path posture, see the module header), enabled falls through
@@ -302,13 +394,39 @@ const federationApiGate: MiddlewareHandler<ApiEnv> = async (c, next) => {
 /**
  * Register the gated stubs on the /api/v1 router (the orchestrator's
  * createApiRouter calls this beside the other families — HANDOFF §6.1).
- * Both arms answer `Not implemented\n` at 501 when enabled:
- *   GET /api/v1/nodeinfo          api.go:1008 — no scope gate (upstream's
- *                                 registration carries none).
- *   ANY /api/v1/activitypub/*     api.go:1009 — the activitypub scope gate
- *                                 rides between the enable gate and the stub.
+ * chi-exact method arms:
+ *   GET /api/v1/nodeinfo       api.go:1008 — no scope gate (upstream's
+ *                              registration carries none). Disabled, the
+ *                              path is UNREGISTERED: every known method →
+ *                              the mux's native not-found. Enabled, the
+ *                              GET-only endpoint 501s and every other
+ *                              known method tree-405s with `Allow: GET`
+ *                              (routeHTTP's methodNotAllowed arm; no HEAD
+ *                              fallback in chi).
+ *   ANY /api/v1/activitypub/*  api.go:1009 — Gitea's Any → chi Handle →
+ *                              mALL: setEndpoint registers EVERY methodMap
+ *                              method, so all known methods ride the
+ *                              activitypub scope gate to the `Not
+ *                              implemented\n` 501 (upstream's OPTIONS and
+ *                              HEAD hit the stub exactly like GET).
+ * Both arms: unknown methods bare-405 pre-tree (the guard above) —
+ * gate-independent, exactly mux.go's early arm.
  */
 export function registerFederationApiRoutes(app: OpenAPIHono<ApiEnv>): void {
-  app.get("/nodeinfo", federationApiGate, () => federationNotImplemented());
-  app.all("/activitypub/*", federationApiGate, activitypubScopeGate, () => federationNotImplemented());
+  app.all("/nodeinfo", chiUnknownMethodGuard, (c) => {
+    if (!federationEnabled(c.env)) {
+      return routerNativeNotFound(c);
+    }
+    if (c.req.method !== "GET") {
+      return chiMethodNotAllowed(c.req.method, ["GET"]);
+    }
+    return federationNotImplemented();
+  });
+  app.all(
+    "/activitypub/*",
+    chiUnknownMethodGuard,
+    federationApiGate,
+    activitypubScopeGate,
+    () => federationNotImplemented(),
+  );
 }

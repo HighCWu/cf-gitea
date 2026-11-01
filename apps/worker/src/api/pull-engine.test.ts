@@ -806,8 +806,43 @@ describe("commits family (repoGetAllCommits / repoGetSingleCommit / dot-diff / c
     expect(diff.status).toBe(200);
     expect(await diff.text()).toContain("diff --git a/cmp.txt");
 
-    expect((await get(`${REPO}/compare/main`)).status).toBe(400);
+    // The separator-less tail is a HEAD form (the 063db9b reconciliation:
+    // ParseCompareRouterParam compare.go:78-86 — the base falls to the PR
+    // target branch, pull.go:1109's IfZero; repo.default_branch here). The
+    // formerly-pinned declared 400 is retired: `main` compares the default
+    // branch against itself (empty), `cmp` is the one-commit range.
+    const defaultSelf = await get(`${REPO}/compare/main`);
+    expect(defaultSelf.status).toBe(200);
+    expect((await jsonBody(defaultSelf)).total_commits).toBe(0);
+    const bareHead = await get(`${REPO}/compare/cmp`);
+    expect(bareHead.status).toBe(200);
+    expect((await jsonBody(bareHead)).total_commits).toBe(1);
+    // An unknown head ref still 404s (ResolveRefWithSuffix → not-exist →
+    // APIErrorAuto, pull.go:1110-1112).
     expect((await get(`${REPO}/compare/main...ghost`)).status).toBe(404);
+    // The bare "/compare" has no leaf in upstream's tree (chi's wildcard
+    // claims only "/compare/…" — the empty tail is its own arm above) —
+    // the mux's native not-found, not the compare handler.
+    expect((await get(`${REPO}/compare`)).status).toBe(404);
+  });
+
+  it("resolves ^/~N revision suffixes (ResolveRefWithSuffix, compare.go:110-132)", async () => {
+    // The suffix walks the parsed commit's parents (upstream runs
+    // GetCommit(oriRef+suffix) in one git step): main~1 is one generation
+    // back, ^0 IS the commit itself, and the walk past the root 404s
+    // (`ref %q does not exist`). The ^{tree} form addresses a TREE, not
+    // ancestry — validRefSuffix (compare.go:136-137) rejects it with the
+    // invalid-argument 400.
+    const parentRange = await get(`${REPO}/compare/main~1...main`);
+    expect(parentRange.status).toBe(200);
+    expect((await jsonBody(parentRange)).total_commits).toBe(1);
+
+    const selfZero = await get(`${REPO}/compare/main%5E0...main`);
+    expect(selfZero.status).toBe(200);
+    expect((await jsonBody(selfZero)).total_commits).toBe(0);
+
+    expect((await get(`${REPO}/compare/main~99...main`)).status).toBe(404);
+    expect((await get(`${REPO}/compare/main%5E%7Btree%7D...main`)).status).toBe(400);
   });
 
   it("routes SLASHED ref names in the basehead tail (upstream chi /compare/*)", async () => {
