@@ -33,6 +33,7 @@ import {
   detectContentType,
   encodeContentDisposition,
   goDetectContentType,
+  goPathBase,
   PRIVATE_STATIC_CACHE_CONTROL,
   SERVE_CACHE_CONTROL,
 } from "./attachments-serving";
@@ -321,6 +322,19 @@ describe("encodeContentDisposition (content_disposition.go + mime.FormatMediaTyp
   });
 });
 
+describe("goPathBase (Go path.Base port for the serve sites)", () => {
+  it("cuts the final element like Go path.Base (serve.go:92)", () => {
+    expect(goPathBase("shot.png")).toBe("shot.png");
+    expect(goPathBase("nested/dir/shot.png")).toBe("shot.png");
+    expect(goPathBase("/leading/shot.png")).toBe("shot.png");
+    expect(goPathBase("trailing/")).toBe("trailing");
+    expect(goPathBase("a/b/c/")).toBe("c");
+    expect(goPathBase("")).toBe(".");
+    expect(goPathBase("/")).toBe("/");
+    expect(goPathBase("//")).toBe("/");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // The route: resolution matrix, headers, 404 arms, dispositions
 // ---------------------------------------------------------------------------
@@ -358,6 +372,31 @@ describe("GET /attachments/{uuid} — resolution matrix", () => {
     expect(res.headers.get("content-length")).toBe(String(payload.byteLength));
     expect(new Uint8Array(await res.arrayBuffer())).toEqual(payload);
     expect((await issueAttachmentRow(row.uuid)).downloadCount).toBe(1);
+    // The increment is the ATOMIC SET download_count=download_count+1
+    // (models/repo/attachment.go:46-53) — a second GET bumps again, it does
+    // not rewrite the SELECTed row's value.
+    const second = await serve(`/attachments/${row.uuid}`);
+    expect(second.status).toBe(200);
+    expect((await issueAttachmentRow(row.uuid)).downloadCount).toBe(2);
+  });
+
+  it("basename's a slash-carrying stored name in Content-Disposition (httplib path.Base)", async () => {
+    const owner = await seedUser("attach-base-owner");
+    await seedRepo(PUBLIC_REPO_ID, PUBLIC_STORAGE_KEY, owner, "public");
+    const issue = await seedIssue(PUBLIC_REPO_ID, owner.id);
+    const row = await seedIssueAttachment({
+      repoId: PUBLIC_REPO_ID,
+      storageKey: PUBLIC_STORAGE_KEY,
+      issueId: issue.id,
+      name: "nested/dir/shot.png",
+      content: pngPayload(),
+    });
+
+    const res = await serve(`/attachments/${row.uuid}`);
+    expect(res.status).toBe(200);
+    // path.Base at serve (modules/httplib/serve.go:92) — the stored name's
+    // directory prefix never leaks into Content-Disposition.
+    expect(res.headers.get("content-disposition")).toBe("inline; filename=shot.png");
   });
 
   it("answers HEAD with the same headers and no body", async () => {

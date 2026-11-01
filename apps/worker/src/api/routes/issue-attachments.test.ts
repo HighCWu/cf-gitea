@@ -769,6 +769,38 @@ describe("the two-phase relay (PUT/GET …/issues/attachments/{id}/blob)", () =>
     expect(await drizzle(env.DB).select().from(issueAttachments).then((rows) => rows[0]?.downloadCount)).toBe(2);
   });
 
+  it("blob GET basename's a slash-carrying stored name in Content-Disposition (httplib path.Base)", async () => {
+    const issue = await seedIssue();
+    const init = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=relay.bin`, {
+      method: "POST",
+      headers: { ...auth },
+    });
+    const attachmentId = (await init.json<Record<string, unknown>>()).id as number;
+    const blobUrl = `${REPO_PATH}/issues/attachments/${attachmentId}/blob`;
+    const payload = new TextEncoder().encode("basenamed bytes");
+    expect(
+      (
+        await makeApp()(blobUrl, {
+          method: "PUT",
+          headers: { ...auth, "Content-Type": "application/octet-stream", "Content-Length": String(payload.byteLength) },
+          body: payload,
+        })
+      ).status,
+    ).toBe(200);
+    // The stored name carries a directory prefix — the serve site cuts it
+    // (modules/httplib/serve.go:92, path.Base(opts.Filename)); the raw name
+    // must never leak into Content-Disposition.
+    await drizzle(env.DB)
+      .update(issueAttachments)
+      .set({ name: "nested/dir/relay.bin" })
+      .where(eq(issueAttachments.id, attachmentId));
+    const got = await makeApp()(blobUrl);
+    expect(got.status).toBe(200);
+    expect(got.headers.get("Content-Disposition")).toBe(
+      `attachment; filename="relay.bin"; filename*=UTF-8''relay.bin`,
+    );
+  });
+
   it("relay GET 404s a pending row and a lying relay PUT is capped/validated", async () => {
     const issue = await seedIssue();
     const init = await makeApp()(`${REPO_PATH}/issues/${issue.index}/assets?name=pending.bin`, {

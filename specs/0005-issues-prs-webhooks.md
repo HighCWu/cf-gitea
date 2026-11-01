@@ -542,7 +542,13 @@ answers 201 + a `Location` upload URL into the worker-internal relay PUT
 bytes served back by the matching GET under the issue-read ACL (download-count
 increment parity with upstream's web ServeAttachment). Presigned PUTs remain a
 release-assets-only deferral; the issue family ships relay-only from day one because
-its payloads are small and the relay needs no S3 credentials.
+its payloads are small and the relay needs no S3 credentials. Upload allowed-types
+whitelist reduced: upstream verifies the stored name's extension against
+`ALLOWED_TYPES` and answers 422 on a miss (services/attachment/attachment.go:59,78
+in the pinned tree — `upload.Verify(buf, attach.Name, allowedTypes)` over
+`setting.Attachment.AllowedTypes`; pre-restructure cites
+issue_attachment.go:196-198), while this instance gates attachment types at no
+point (the release-assets posture), so the declared 422 arms are unreachable.
 
 ### 3.4 PR engine semantics (engine deltas)
 

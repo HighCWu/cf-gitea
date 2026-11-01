@@ -1,12 +1,15 @@
 import { createRoute } from "@hono/zod-openapi";
 import type { OpenAPIHono } from "@hono/zod-openapi";
 import type { Context, MiddlewareHandler } from "hono";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { z } from "zod";
 
 import { IssueNotExistError } from "../../issues/errors";
 import { issueAttachments, comments, issues } from "../../db/schema";
+// The serve-site basename cut — the single httplib port copy (web/
+// attachments-serving owns the encodeContentDisposition path.Base family).
+import { goPathBase } from "../../web/attachments-serving";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { attachmentSchema } from "../models/release";
@@ -104,7 +107,9 @@ import type { RepositoryWithOwner } from "../services/repository";
  *
  * Size cap: 512 MiB — the landed asset/LFS convention (SPEC-0005 §3.3 "ours
  * fixed at 512 MiB until a settings SPEC", the constant twin of
- * MAX_RELEASE_ASSET_BYTES; upstream's attachment default is 2048 MiB).
+ * MAX_RELEASE_ASSET_BYTES; upstream's issue-attachment default is 100 MiB,
+ * modules/setting/attachment.go:19 — the 2048 figure is the release-asset
+ * FileMaxSize default, modules/setting/repository.go:234).
  * Checked before streaming when Content-Length is known (413) and enforced
  * per chunk while streaming.
  *
@@ -1292,15 +1297,21 @@ export function registerIssueAttachmentRoutes(
     if (object === null) {
       throw attachmentNotExistError(row.id);
     }
+    // The atomic increment form — `SET download_count=download_count+1`
+    // (models/repo/attachment.go:46-53, the web ServeAttachment twin) — not
+    // a read-modify-write off the SELECTed row.
     await drizzle(c.env.DB)
       .update(issueAttachments)
-      .set({ downloadCount: row.downloadCount + 1 })
+      .set({ downloadCount: sql`${issueAttachments.downloadCount} + 1` })
       .where(eq(issueAttachments.id, row.id));
-    const fallback = row.name.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_");
+    // path.Base at serve (modules/httplib/serve.go:92, ServeSetHeaders) — a
+    // stored name carrying "/" serves its final element only.
+    const servedName = goPathBase(row.name);
+    const fallback = servedName.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_");
     return c.newResponse(object.body, 200, {
       "Content-Type": "application/octet-stream",
       "Content-Length": String(object.size),
-      "Content-Disposition": `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(row.name)}`,
+      "Content-Disposition": `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(servedName)}`,
       ETag: object.httpEtag,
     });
   });

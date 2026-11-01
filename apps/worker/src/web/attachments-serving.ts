@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { issueAttachments, issues, releaseAssets, releases, repositories, users } from "../db/schema";
@@ -100,9 +100,10 @@ import { clearSessionSetCookie, sessionCookieValue, sessionSetCookie, verifySess
  *      public-only bit (that is an API-tier enforcement — GetDoerRepoPermission
  *      reads the user's grants), so the git-HTTP gate's maskedByPublicOnly arm
  *      is deliberately absent here.
- *   8. IncreaseDownloadCount (models/repo/attachment.go:46-53) — +1 on the
- *      row, before the bytes are served (the landed blob GET twin,
- *      routes/issue-attachments.ts:1278-1281).
+ *   8. IncreaseDownloadCount (models/repo/attachment.go:46-53) — the ATOMIC
+ *      server-side `SET download_count=download_count+1` (never a
+ *      read-modify-write off the SELECTed row), before the bytes are served
+ *      (the landed blob GET twin, routes/issue-attachments.ts blob GET).
  *   9. ServeDirect (:218-226) — inapplicable like avatar-serving's (the R2
  *      binding serves bytes directly, no presigned URL).
  *  10. HandleGenericETagPrivateCache (httpcache.go:81-117): ETag
@@ -142,7 +143,9 @@ import { clearSessionSetCookie, sessionCookieValue, sessionSetCookie, verifySess
  *     modules/setting/ui.go:120-124), so with frozen defaults SVGs also serve
  *     inline. The mission's "inline images vs download others" split is NOT
  *     upstream behavior — upstream sandboxes inline content with the CSP
- *     instead. Encoding is encodeContentDisposition (httplib/
+ *     instead. Encoding is over `path.Base(opts.Filename)` (ServeSetHeaders,
+ *     modules/httplib/serve.go:92 — a stored "/"-carrying name serves its
+ *     final element only) via encodeContentDisposition (httplib/
  *     content_disposition.go:47-65) over Go mime.FormatMediaType
  *     (mime/mediatype.go): safe name (control/non-ASCII → '_', tab kept),
  *     token or quoted-string form, and the RFC 2231 `filename*=utf-8''…`
@@ -409,6 +412,21 @@ export function encodeContentDisposition(t: ContentDispositionType, filename: st
     return result;
   }
   return result + formatMediaTypeFilename(t, filename).slice(t.length);
+}
+
+/** Go path.Base (go/src/path/path.go) — the serve sites encode
+ *  `path.Base(opts.Filename)` (ServeSetHeaders, modules/httplib/serve.go:92),
+ *  so a stored name carrying "/" serves its final element only and never
+ *  leaks a directory prefix into Content-Disposition. Trailing slashes
+ *  strip; "" → "."; all-slashes → "/". */
+export function goPathBase(name: string): string {
+  if (name === "") return ".";
+  let end = name.length;
+  while (end > 0 && name[end - 1] === "/") end -= 1;
+  const stripped = name.slice(0, end);
+  const slash = stripped.lastIndexOf("/");
+  const base = slash === -1 ? stripped : stripped.slice(slash + 1);
+  return base === "" ? "/" : base;
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,16 +1152,20 @@ attachmentsServingRouter.on(["GET", "HEAD"], "/attachments/:uuid", async (c) => 
 
   // 8. IncreaseDownloadCount (:213-216) — before the bytes, upstream order.
   // Upstream's call sits AFTER the TypeInvalid if/else (:213), so the
-  // uploader's unlinked fetch bumps its row too.
+  // uploader's unlinked fetch bumps its row too. The increment is the
+  // ATOMIC server-side form — `SET download_count=download_count+1`
+  // (models/repo/attachment.go:46-53, the packages/model.ts:357 precedent) —
+  // never a read-modify-write off the SELECTed row: two overlapping GETs
+  // must both land.
   if (resolved.kind === "issue" || resolved.kind === "unlinked-issue") {
     await drizzle(c.env.DB)
       .update(issueAttachments)
-      .set({ downloadCount: resolved.row.downloadCount + 1 })
+      .set({ downloadCount: sql`${issueAttachments.downloadCount} + 1` })
       .where(eq(issueAttachments.id, resolved.row.id));
   } else {
     await drizzle(c.env.DB)
       .update(releaseAssets)
-      .set({ downloadCount: resolved.row.downloadCount + 1 })
+      .set({ downloadCount: sql`${releaseAssets.downloadCount} + 1` })
       .where(eq(releaseAssets.id, resolved.row.id));
   }
 
@@ -1194,7 +1216,9 @@ attachmentsServingRouter.on(["GET", "HEAD"], "/attachments/:uuid", async (c) => 
   // kept as the constant's complement).
   const dispositionType: ContentDispositionType =
     SVG_RENDER_ENABLED || !sniffed.isSvgImage() ? "inline" : "attachment";
-  const disposition = encodeContentDisposition(dispositionType, resolved.row.name);
+  // path.Base at serve (modules/httplib/serve.go:92) — a stored name carrying
+  // "/" serves its final element only.
+  const disposition = encodeContentDisposition(dispositionType, goPathBase(resolved.row.name));
 
   const headers: Record<string, string> = {
     // SetCacheControlInHeader (serve.go:96-99) overwrites the etag handler's

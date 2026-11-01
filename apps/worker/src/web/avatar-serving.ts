@@ -57,8 +57,11 @@ import {
  *     whole images; the body streams from R2.
  *   - The missing-object fallback: Content-Type image/png + the
  *     HandleGenericETagPublicCache arm (base.go:36-44) — ETag + Last-Modified
- *     + `public, max-age=21600`, 304 on If-None-Match, else a seeded 96px
- *     identicon for GET and bare headers for HEAD (RandomImageWithSize(96,
+ *     always; 304 on If-None-Match, else (only when If-None-Match is absent)
+ *     on a satisfied If-Modified-Since — both 304s carry NO Cache-Control
+ *     (SetCacheControlInHeader runs on the miss path only, httpcache.go:115);
+ *     the miss sets `public, max-age=21600`, then a seeded 96px identicon
+ *     for GET and bare headers for HEAD (RandomImageWithSize(96,
  *     path), base.go:41). Upstream's ETag is `"avatar-<exeModTime>"` (a
  *     per-build timestamp, base.go:28-29); a Worker has no executable
  *     mtime and the seeded PNG is deterministic per path, so a fixed ETag is
@@ -96,6 +99,10 @@ const FALLBACK_ETAG = '"avatar-cf-gitea-1"';
 const FALLBACK_LAST_MODIFIED = "Thu, 01 Jan 2026 00:00:00 GMT";
 /** base.go:41 — RandomImageWithSize(96, avatarPath). */
 const FALLBACK_IDENTICON_SIZE = 96;
+/** Strict IMF-fixdate (Go's http.TimeFormat layout) — other legal HTTP dates
+ *  fail upstream's `time.Parse(http.TimeFormat, …)` (httpcache.go:107) and
+ *  must fail here too. */
+const IMF_FIXDATE_RE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
 
 /** Go's http.Error: text/plain + nosniff + trailing newline. */
 function textError(status: 400 | 404 | 500, message: string): Response {
@@ -209,9 +216,12 @@ avatarServingRouter.on(["GET", "HEAD"], "/avatars/*", async (c) => {
   if (object === null) {
     // handleError's ErrNotExist arm (base.go:36-44): image/png + the generic
     // ETag public cache, then the seeded 96px identicon for GET.
+    // handleGenericETagTimeCache (httpcache.go:87-117) sets the ETag pair
+    // FIRST and both 304 arms return BEFORE SetCacheControlInHeader — a 304
+    // carries no Cache-Control; the miss path sets it (:115) right before
+    // the body arms below.
     const headers: Record<string, string> = {
       "Content-Type": "image/png",
-      "Cache-Control": PUBLIC_STATIC_CACHE_CONTROL,
       ETag: FALLBACK_ETAG,
       "Last-Modified": FALLBACK_LAST_MODIFIED,
     };
@@ -219,6 +229,23 @@ avatarServingRouter.on(["GET", "HEAD"], "/avatars/*", async (c) => {
     if (ifNoneMatch !== undefined && ifNoneMatchMatches(ifNoneMatch, FALLBACK_ETAG)) {
       return new Response(null, { status: 304, headers });
     }
+    // The If-Modified-Since arm — ignored whenever If-None-Match is present
+    // (httpcache.go:101-104, rfc9110 §13.1.3), strict IMF-fixdate parse,
+    // second precision over the exeModTime stand-in (`lastModified.Unix() <=
+    // t.Unix()`).
+    if (!ifNoneMatch) {
+      const ifModifiedSince = c.req.header("if-modified-since");
+      if (ifModifiedSince !== undefined && IMF_FIXDATE_RE.test(ifModifiedSince)) {
+        const since = Date.parse(ifModifiedSince);
+        if (
+          !Number.isNaN(since) &&
+          Date.parse(FALLBACK_LAST_MODIFIED) / 1000 <= since / 1000
+        ) {
+          return new Response(null, { status: 304, headers });
+        }
+      }
+    }
+    headers["Cache-Control"] = PUBLIC_STATIC_CACHE_CONTROL; // httpcache.go:115
     if (c.req.method === "HEAD") {
       return new Response(null, { status: 200, headers }); // "just return the headers"
     }

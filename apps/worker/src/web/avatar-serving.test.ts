@@ -207,14 +207,56 @@ describe("GET, HEAD /avatars/* (avatarStorageHandler port)", () => {
     const etag = '"avatar-cf-gitea-1"';
     const matched = await serve("/avatars/unknown-path", { headers: { "If-None-Match": etag } });
     expect(matched.status).toBe(304);
+    // The 304s return BEFORE SetCacheControlInHeader (httpcache.go:87-117) —
+    // bare except the ETag pair, no Cache-Control.
+    expect(matched.headers.get("etag")).toBe(etag);
+    expect(matched.headers.get("last-modified")).toBe("Thu, 01 Jan 2026 00:00:00 GMT");
+    expect(matched.headers.get("cache-control")).toBeNull();
     const weak = await serve("/avatars/unknown-path", { headers: { "If-None-Match": `W/${etag}` } });
     expect(weak.status).toBe(304);
+    expect(weak.headers.get("cache-control")).toBeNull();
     const wildcard = await serve("/avatars/unknown-path", { headers: { "If-None-Match": "*" } });
     expect(wildcard.status).toBe(304);
+    expect(wildcard.headers.get("cache-control")).toBeNull();
     const head = await serve("/avatars/unknown-path", { method: "HEAD" });
     expect(head.status).toBe(200);
     expect(head.headers.get("content-type")).toBe("image/png");
     expect((await head.arrayBuffer()).byteLength).toBe(0);
+  });
+
+  it("304s the fallback on a satisfied If-Modified-Since when If-None-Match is absent — bare 304", async () => {
+    // The IMS arm of handleGenericETagTimeCache (httpcache.go:102-112): gated
+    // on an ABSENT If-None-Match, strict IMF-fixdate parse, second precision
+    // over the exeModTime stand-in (FALLBACK_LAST_MODIFIED, 2026-01-01).
+    const ims = await serve("/avatars/unknown-path", {
+      headers: { "If-Modified-Since": "Thu, 01 Jan 2026 00:00:00 GMT" },
+    });
+    expect(ims.status).toBe(304);
+    expect(ims.headers.get("etag")).toBe('"avatar-cf-gitea-1"');
+    expect(ims.headers.get("last-modified")).toBe("Thu, 01 Jan 2026 00:00:00 GMT");
+    expect(ims.headers.get("cache-control")).toBeNull();
+    expect((await ims.arrayBuffer()).byteLength).toBe(0);
+
+    // A stale If-Modified-Since misses — the identicon serves and the MISS
+    // path carries Cache-Control (httpcache.go:115).
+    const stale = await serve("/avatars/unknown-path", {
+      headers: { "If-Modified-Since": "Mon, 01 Jan 1990 00:00:00 GMT" },
+    });
+    expect(stale.status).toBe(200);
+    expect(stale.headers.get("cache-control")).toBe("public, max-age=21600");
+    expect(pngHeader(await stale.arrayBuffer()).width).toBe(96);
+
+    // A PRESENT (non-matching) If-None-Match suppresses the IMS arm — the
+    // 200 serves despite the satisfied If-Modified-Since (rfc9110 §13.1.3,
+    // "MUST ignore If-Modified-Since when If-None-Match is present").
+    const suppressed = await serve("/avatars/unknown-path", {
+      headers: {
+        "If-None-Match": '"some-other-etag"',
+        "If-Modified-Since": "Thu, 01 Jan 2026 00:00:00 GMT",
+      },
+    });
+    expect(suppressed.status).toBe(200);
+    expect(pngHeader(await suppressed.arrayBuffer()).width).toBe(96);
   });
 
   it("404s the empty and fully-cleaned path arms", async () => {
