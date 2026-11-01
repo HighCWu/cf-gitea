@@ -105,14 +105,14 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { serializeCommit, serializeTree, type ApiObject, type Person } from "@cf-gitea/git-engine";
 
 import { branchRef, commitApiChangeError, ZERO_OID } from "../../api/services/engine";
-import { buildBlobObject } from "../../api/services/git-models";
+import { buildBlobObject, renderPatchSeries } from "../../api/services/git-models";
 import type { RepositoryWithOwner } from "../../api/services/repository";
 import { saveRepoSettings } from "../../api/services/repo-settings";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
 import { repositories, users } from "../../db/schema";
 import { RepoService } from "../../repos/service";
-import { wikiBranch, wikiCell } from "../../services/wiki";
+import { wikiBranch, wikiCell, wikiReads } from "../../services/wiki";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";import type { UiManifest } from "../manifest";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { createWikiPageFromForm, parseWikiPageForm, wikiTipOf } from "./repo-wiki";
@@ -863,16 +863,147 @@ describe("the wiki commit-diff arm (web.go:1619 — the PageIsWiki commit page)"
     // never a merge mail, no signature tail (the commit arm's shape).
     const patch = await loadWikiCommitDiffPatch(env, pair, merge.oid, "patch");
     if (patch === null) throw new Error("expected the merge .patch body");
-    expect(patch.startsWith(`From ${side.oid} Mon Sep 17 00:00:00 2001\n`)).toBe(true);
-    expect(patch).toContain("Subject: [PATCH] side: wiki merge fixture");
-    expect(patch).not.toContain(`From ${merge.oid} `);
+    // BYTE-EXACT over the fixed walker (the D11 join, V4 326904e): the
+    // fixture .patch is 646 bytes ending in exactly one newline past the
+    // last content line. The PRE-FIX mirror emitted 647 — one extra "\n" at
+    // the stream tail, the same defect the collapse verdict's scratch
+    // harness recorded as 464 vs 463 on its own (since-deleted) world.
+    // Every route-driven ancestor commit stamps wall-clock time
+    // (wikiPerson's now-less arm), so the run-computed side oid is the ONLY
+    // varying bytes in the mail — the fixed T0+9000 Date, the
+    // content-determined short blob oids and every header/hunk line are
+    // pinned verbatim (ASCII-only output, so .length is the byte count).
+    expect(patch).toBe(
+      `From ${side.oid} Mon Sep 17 00:00:00 2001
+From: w107gal <w107gal@noreply.test.local>
+Date: Wed, 15 Nov 2023 00:43:20 +0000
+Subject: [PATCH] side: wiki merge fixture
+
+---
+diff --git a/Diff-Arm-Probe.md b/Diff-Arm-Probe.md
+deleted file mode 100644
+index 09c32d5..0000000
+--- a/Diff-Arm-Probe.md
++++ /dev/null
+@@ -1 +0,0 @@
+-# diff arm
+diff --git a/Renamed-Page.md b/Renamed-Page.md
+deleted file mode 100644
+index 163e5df..0000000
+--- a/Renamed-Page.md
++++ /dev/null
+@@ -1 +0,0 @@
+-# RT v3
+diff --git a/Side.md b/Side.md
+new file mode 100644
+index 0000000..7e68207
+--- /dev/null
++++ b/Side.md
+@@ -0,0 +1 @@
++# wiki side
+`,
+    );
+    expect(patch.length).toBe(646);
+    // The stream tail: git's single trailing newline, no extra blank — and
+    // the explicit --no-signature posture pin.
+    expect(patch.endsWith("+# wiki side\n")).toBe(true);
+    expect(patch.endsWith("\n\n")).toBe(false);
+    expect(patch).not.toContain(`From ${merge.oid} `); // never the merge mail
     expect(patch).not.toContain("merge the wiki side");
-    expect(patch).not.toContain("\n-- \n");
+    expect(patch).not.toContain("\n-- \n"); // --no-signature parity (diff.go:73)
+    // PARITY PIN: the family walker (git-models' shared renderPatchSeries —
+    // the same fixed D11 join) produces IDENTICAL bytes over the same cell.
+    // The join half of the collapse verdict is resolved; only the blob
+    // read-back encode still keeps the mirror (wiki-commit-diff.tsx's
+    // verdict comment).
+    const shared = await renderPatchSeries(wikiReads(env, pair), baseTip, merge.oid, { signature: null });
+    expect(shared).toBe(patch);
     // .diff over the merge: the first-parent tree delta (RawDiffNormal) —
     // the side's file, not a whole-tree re-diff.
     const diff = await loadWikiCommitDiffPatch(env, pair, merge.oid, "diff");
     if (diff === null) throw new Error("expected the merge .diff body");
     expect(diff).toContain("diff --git a/Side.md b/Side.md");
     expect(diff).toContain("+");
+  });
+
+  it("seams a TWO-mail merge series with git's exact join bytes (one blank line between mails, one newline at the tail)", async () => {
+    // The 2-mail world: a side CHAIN (side1 on the current tip, side2 on
+    // side1) merged back — merge2's first-parent range merge..merge2 holds
+    // TWO non-merge commits, so the series numbers the mails and emits the
+    // between-mail seam (append-only; this describe is still last).
+    const pair = await pairFor("w107wik");
+    const cell = wikiCell(env, pair);
+    const ref = branchRef(wikiBranch(pair));
+    const tip = await wikiTipOf(env, pair);
+    if (tip === undefined) throw new Error("w107wik tip missing");
+    const baseTip = tip.target;
+    const encoder = new TextEncoder();
+    const homeBlob = await buildBlobObject(encoder.encode("# Home base\n"));
+    const side1Blob = await buildBlobObject(encoder.encode("# wiki side one\n"));
+    const side2Blob = await buildBlobObject(encoder.encode("# wiki side two\n"));
+    const side1Tree = serializeTree([{ name: "Side1.md", mode: "100644", oid: side1Blob.oid }]);
+    const side2Tree = serializeTree([{ name: "Side2.md", mode: "100644", oid: side2Blob.oid }]);
+    const person1: Person = { name: DOER.name, email: DOER.email, time: T0 + 9_100, tz: "+0000" };
+    const person2: Person = { name: DOER.name, email: DOER.email, time: T0 + 9_200, tz: "+0000" };
+    const side1 = serializeCommit({
+      tree: side1Tree.oid,
+      parents: [baseTip],
+      author: person1,
+      committer: person1,
+      message: "side one: wiki merge fixture",
+    });
+    const side2 = serializeCommit({
+      tree: side2Tree.oid,
+      parents: [side1.oid],
+      author: person2,
+      committer: person2,
+      message: "side two: wiki merge fixture",
+    });
+    const mergeTree = serializeTree([
+      { name: "Home.md", mode: "100644", oid: homeBlob.oid },
+      { name: "Side2.md", mode: "100644", oid: side2Blob.oid },
+    ]);
+    const merge2 = serializeCommit({
+      tree: mergeTree.oid,
+      parents: [baseTip, side2.oid],
+      author: person2,
+      committer: person2,
+      message: "merge the wiki side chain",
+    });
+    const stored = await cell.putApiObjects([
+      side1Blob,
+      { oid: side1Tree.oid, type: side1Tree.type, data: side1Tree.data },
+      { oid: side1.oid, type: side1.type, data: side1.data },
+      side2Blob,
+      { oid: side2Tree.oid, type: side2Tree.type, data: side2Tree.data },
+      { oid: side2.oid, type: side2.type, data: side2.data },
+      homeBlob,
+      { oid: mergeTree.oid, type: mergeTree.type, data: mergeTree.data },
+      { oid: merge2.oid, type: merge2.type, data: merge2.data },
+    ]);
+    if (stored.tag !== "ok") throw new Error(`merge seed objects refused: ${stored.tag}`);
+    const landed = await cell.commitApiChange({ ref, expectedOldOid: baseTip, newOid: merge2.oid });
+    if (landed.tag !== "committed") throw commitApiChangeError(landed);
+
+    const patch2 = await loadWikiCommitDiffPatch(env, pair, merge2.oid, "patch");
+    if (patch2 === null) throw new Error("expected the 2-mail merge .patch body");
+    // The numbered series ([PATCH i/N] arms on only when N > 1 — git's rule)
+    // over the FIXED join: 1098 bytes (pre-fix 1100 — the mirror's
+    // (mail+"\n")-joined-by-"\n" emitted an extra "\n" at the between-mail
+    // seam AND the tail).
+    expect(patch2.length).toBe(1098);
+    // THE SEAM — git's recorded shape (V4's D11, 326904e, xxd-recorded):
+    // mail1's own trailing newline plus the join's ONE blank line, then
+    // mail2's From header — never the pre-fix double-blank seam.
+    expect(patch2).toContain(`+# wiki side one\n\nFrom ${side2.oid} Mon Sep 17 00:00:00 2001\n`);
+    expect(patch2).not.toContain("\n\n\nFrom "); // the pre-fix seam shape
+    // The tail is mail2's own single newline; the numbering and the
+    // --no-signature posture.
+    expect(patch2.startsWith(`From ${side1.oid} Mon Sep 17 00:00:00 2001\n`)).toBe(true);
+    expect(patch2.endsWith("+# wiki side two\n")).toBe(true);
+    expect(patch2).toContain("Subject: [PATCH 1/2] side one: wiki merge fixture");
+    expect(patch2).toContain("Subject: [PATCH 2/2] side two: wiki merge fixture");
+    expect(patch2).not.toContain(`From ${merge2.oid} `); // never a merge mail
+    expect(patch2).not.toContain("\n-- \n"); // --no-signature parity (diff.go:73)
   });
 });

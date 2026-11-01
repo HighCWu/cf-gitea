@@ -64,9 +64,10 @@
  *   non-merge side-commit series, EMPTY when the series is empty
  *   (diff.go:87-99). `wikiPatchSeries` mirrors the family's series walker
  *   (api/services/git-models.ts `renderPatchSeries` — diffpatch-files.ts's
- *   private copy folded there at decf55d) over the wiki blob source, and
- *   STAYS a mirror: the collapse was byte-probed and REJECTED on two true
- *   differences (the walker's COLLAPSE VERDICT below).
+ *   private copy folded there at decf55d) over the wiki blob source, with
+ *   the walker's fixed D11 join (`mails.join("\n")` — byte-pinned in the
+ *   matrix). It STAYS a mirror for ONE remaining difference — the blob
+ *   read-back encode (the walker's COLLAPSE VERDICT below).
  */
 
 import type { CommitJson } from "@cf-gitea/git-engine";
@@ -301,40 +302,43 @@ export function WikiCommitDiffPage(props: { ctx: UiContext; data: CommitViewData
  * source (module doc). The walk cap and the between-mail seam bytes are
  * that walker's verbatim (recorded against `git format-patch --stdout`).
  *
- * COLLAPSE VERDICT (2026-11-02, as-built — the pending fold onto
- * api/services/git-models.ts's shared `renderPatchSeries` was byte-probed
- * over the U23 matrix merge fixture and REJECTED: the outputs differ, so
- * this mirror STAYS. Two true differences, both probed in a scratch
- * harness against the live wiki cell):
+ * COLLAPSE VERDICT (2026-11-02, UPDATED — the join fix landed; one true
+ * difference keeps the mirror off the shared `renderPatchSeries`. The
+ * original probe ran in a scratch harness against the live wiki cell and
+ * recorded TWO differences; the first is now RESOLVED in place):
  *
- *   1. THE JOIN SEAM. This mirror still joins `(mail + "\n")` with "\n" —
- *      the PRE-V4 shape this file was written against (U23 mirrored the
- *      family walker before V4's D11). V4's D11 (326904e) xxd-recorded
- *      exactly that shape as one newline OFF against `git format-patch
- *      --stdout` — "(mail+\n) joined by \n, both seams" — and fixed the
- *      family copy; the shared walker carries the fixed `mails.join("\n")`.
- *      Over the matrix merge fixture (one side-commit mail, unsigned) the
- *      mirror emits 464 bytes where the shared walker emits 463 — a single
- *      extra "\n" at the stream tail; a 2-mail probe diverges at the
- *      between-mail seam the same way. Folding onto the shared export
- *      would silently CHANGE the wiki `.patch` bytes — a latent byte-fix
- *      (the mirror predates V4's record), needing its own decision with
- *      re-pins, not a no-op fold.
- *   2. THE BLOB READ-BACK ENCODE. The wiki cell stores codec-space flat
- *      entry names (`Docs%2FDiff-Guide.md`), so this walker's
- *      `wikiDiffBlobSource` re-encodes every context-blob read through
- *      services/wiki.ts's `enginePath` ("%25" doubling, module doc); the
- *      shared walker builds a plain `diffBlobSource` with no encode, and a
- *      probe over a stored `Weird%2FName.md` entry (content without the
- *      trailing newline) lost the renderer's "\ No newline at end of file"
- *      marker there — the unencoded read decodes %2F into a nested miss,
- *      and the file degrades to the marker-less shape (636 vs 607 bytes).
- *      Any future shared-walker fold needs an encode hook (or a
- *      caller-supplied DiffBlobSource parameter) at git-models.ts first.
+ *   1. THE JOIN SEAM — RESOLVED. This mirror was written against the
+ *      PRE-V4 family walker and joined `(mail + "\n")` with "\n" — one
+ *      newline OFF against `git format-patch --stdout` at BOTH seams
+ *      (V4's D11, 326904e, xxd-recorded the git shape and fixed the family
+ *      copy to `mails.join("\n")`: each mail carries its own trailing
+ *      newline, the join adds only the inter-mail blank line, the last
+ *      mail's tail is the stream's tail — re-verified against a scratch
+ *      real-git repo: unsigned tail `+line\n`, unsigned seam
+ *      `+line\n\nFrom`, signed seam `2.43.0\n\n\nFrom`). The mirror now
+ *      carries that exact join, and the matrix pins the bytes over the
+ *      merge fixture: 646 bytes post-fix vs 647 pre-fix (the scratch
+ *      harness had recorded the same single-extra-newline defect as
+ *      464 vs 463 on its own, since-deleted world), the 2-mail series
+ *      pins the seam (`…one\n\nFrom`, never `\n\n\nFrom`), and a parity
+ *      pin asserts the shared walker's output equals the mirror's
+ *      byte-for-byte on the fixture.
+ *   2. THE BLOB READ-BACK ENCODE — the REMAINING blocker. The wiki cell
+ *      stores codec-space flat entry names (`Docs%2FDiff-Guide.md`), so
+ *      this walker's `wikiDiffBlobSource` re-encodes every context-blob
+ *      read through services/wiki.ts's `enginePath` ("%25" doubling,
+ *      module doc); the shared walker builds a plain `diffBlobSource` with
+ *      no encode, and a probe over a stored `Weird%2FName.md` entry
+ *      (content without the trailing newline) lost the renderer's
+ *      "\ No newline at end of file" marker there — the unencoded read
+ *      decodes %2F into a nested miss, and the file degrades to the
+ *      marker-less shape (636 vs 607 bytes). Any future shared-walker fold
+ *      needs an encode hook (or a caller-supplied DiffBlobSource
+ *      parameter) at git-models.ts first. Until then the mirror STAYS.
  *
- * The matrix's merge-series pins are structural (bare-[PATCH] side mail,
- * never the merge, no signature) and stay green over BOTH walkers — they
- * cannot arbitrate this collapse, which is why the probe ran on bytes.
+ * The matrix's merge-series pins are now BYTE-exact over the fixed walker
+ * (the fixture output with its tail, the 2-mail seam, the no-signature
+ * posture) — they arbitrate the join, not just the shape.
  */
 const MERGE_SERIES_COMMIT_CAP = 2000;
 const MERGE_SERIES_PAGE = 500;
@@ -364,7 +368,7 @@ async function wikiPatchSeries(reads: EngineReads, base: string, head: string, o
       }),
     );
   }
-  return mails.map((mail) => `${mail}\n`).join("\n");
+  return mails.join("\n");
 }
 
 /**
