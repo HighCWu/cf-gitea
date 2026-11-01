@@ -13,9 +13,10 @@
  *    application/x-bzip2, the HEAD ride, the GET-only bump);
  *  - the apiError family body: `{"reason": http.StatusText, "message"}`
  *    over application/json;charset=utf-8 — the 404-nil enumeration miss,
- *    the 400-nil foreign-filename upload, the `.conda` invalid-structure
- *    400 (wall 2), the corrupt-stream 500 (the prod-stripped message), the
- *    invalid-name 400, the duplicate 409;
+ *    the 400-nil foreign-filename upload, the corrupt-stream 500 (the
+ *    prod-stripped message), the corrupt `.conda` container 500 (wall 2
+ *    ADOPTED — the zip parse fires CondaArchiveError), the invalid-name
+ *    400, the duplicate 409;
  *  - the chi walk: the channel-prefixed and NESTED-channel paths (the
  *    `(.*?/)?` optional wildcard), the empty/short paths' NotFound page;
  *  - the gates: anonymous write → 401 + the Basic challenge, anonymous read
@@ -276,7 +277,7 @@ describe("conda routes (api.go:263-267)", () => {
 // ---------------------------------------------------------------------------
 
 describe("conda route error arms", () => {
-  it("the upload gates: foreign filename 400-nil, the .conda wall 400, corrupt stream 500, invalid name 400, duplicate 409", async () => {
+  it("the upload gates: foreign filename 400-nil, the corrupt .conda container 500, corrupt stream 500, invalid name 400, duplicate 409", async () => {
     const owner = await seedUser("alice");
     const writer = await token(owner, "write:package");
     const call = protocol();
@@ -287,10 +288,15 @@ describe("conda route error arms", () => {
     expect(foreign.status).toBe(400);
     expect(await foreign.text()).toBe('{"reason":"Bad Request","message":""}');
 
-    // Wall 2: the .conda upload answers the invalid-structure sentinel.
+    // Wall 2 ADOPTED: the `.conda` container is PARSED, so bzip2 bytes
+    // under a .conda name are a corrupt zip — the CondaArchiveError 500 arm
+    // (upstream ParsePackageConda's zip-failure path; the prod-stripped
+    // message). A missing info member would still be the 400 structure arm.
     const conda = await put(call, "alice", "/pkg.conda", fixtureBytes(F1_FULL), auth);
-    expect(conda.status).toBe(400);
-    expect(await conda.text()).toBe('{"reason":"Bad Request","message":"package structure is invalid"}');
+    expect(conda.status).toBe(500);
+    expect(await conda.text()).toBe(
+      '{"reason":"Internal Server Error","message":"internal server error"}',
+    );
 
     // A corrupt stream is the 500 arm (the prod-stripped message).
     const corrupt = await put(call, "alice", "/broken.tar.bz2", fixtureBytes(F6_CORRUPT), auth);

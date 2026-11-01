@@ -2577,8 +2577,8 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
   // every arm, the PUT adds the write gate. HEAD rides the GET walks (the
   // pypi/helm precedent — upstream registers GET only). The `.bz2` repodata
   // names RIDE the switch (wall 3 ADOPTED — encodeCondaRepodataBody serves
-  // the compressed twins); the wall-2 `.conda` uploads answer the
-  // invalid-structure 400.
+  // the compressed twins); wall 2 is ADOPTED too — the `.conda` uploads
+  // parse, and a corrupt container answers the CondaArchiveError 500.
 
   app.on(["GET", "HEAD"], "/:username/conda/*", (c) => condaDispatch(c));
   app.put("/:username/conda/*", (c) => condaDispatch(c));
@@ -5079,9 +5079,9 @@ async function condaEnumerate(
 
 /** DownloadPackageFile (conda.go:296-322): the EXACTLY-one search → the
  *  D-6 serve walk. helper.ServePackageFile → ctx.ServeContent sniffs the
- *  stored bytes: the BZh magic answers application/x-bzip2 (the only
- *  container the store can hold — wall 2 keeps the .conda zip sniff
- *  unreachable). */
+ *  stored bytes: the BZh magic answers application/x-bzip2, a stored
+ *  `.conda` answers application/zip (wall 2 ADOPTED — the container parses
+ *  on upload, before anything reaches the store). */
 async function condaDownload(
   c: Context<{ Bindings: Env }>,
   owner: UserRow,
@@ -5146,7 +5146,9 @@ async function condaUpload(
 function condaUploadError(error: unknown): Response {
   if (error instanceof HTTPException) return error.getResponse();
   // The ErrInvalidArgument sentinels → the 400 arm (conda.go:218-220);
-  // wall 2's `.conda` reduction rides CondaInvalidStructureError.
+  // wall 2 ADOPTED — a corrupt `.conda` container throws CondaArchiveError
+  // and falls through to the 500 (a missing info member still answers this
+  // 400 structure arm, upstream's ParsePackageConda shape).
   if (
     error instanceof CondaInvalidStructureError ||
     error instanceof CondaInvalidNameError ||
