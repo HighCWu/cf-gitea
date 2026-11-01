@@ -2564,9 +2564,9 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
   // carries both methods (the conan posture); the group's read wrap rides
   // every arm, the PUT adds the write gate. HEAD rides the GET walks (the
   // pypi/helm precedent — upstream registers GET only). The `.bz2` repodata
-  // names stay OUT of the switch (the wall-3 reduction — they fall to the
-  // unknown-filename NotFound page; the wall-2 `.conda` uploads answer the
-  // invalid-structure 400).
+  // names RIDE the switch (wall 3 ADOPTED — encodeCondaRepodataBody serves
+  // the compressed twins); the wall-2 `.conda` uploads answer the
+  // invalid-structure 400.
 
   app.on(["GET", "HEAD"], "/:username/conda/*", (c) => condaDispatch(c));
   app.put("/:username/conda/*", (c) => condaDispatch(c));
@@ -4943,8 +4943,8 @@ function condaApiError(status: 400 | 401 | 403 | 404 | 409 | 413 | 500, message:
 }
 
 /** Go http.NotFound — the chi NotFound page the PathGroup falls to for an
- *  unmatched shape (unknown filenames, `.bz2` repodata names — the wall-3
- *  reduction — and empty/short paths). */
+ *  unmatched shape (unknown filenames and empty/short paths; the `.bz2`
+ *  repodata names no longer land here — wall 3 ADOPTED). */
 function condaNotFoundPage(): Response {
   return goNotFoundPage();
 }
@@ -5018,9 +5018,9 @@ function condaPathOf(c: Context<{ Bindings: Env }>, arm: "get" | "put"): CondaGe
   return parseCondaPath(parts, arm === "put" ? "PUT" : "GET");
 }
 
-/** ListOrGetPackages (conda.go:41-53): the repodata switch (the `.bz2`
- *  twins stay out — wall 3), then the package-filename split, then Go's
- *  http.NotFound. */
+/** ListOrGetPackages (conda.go:41-53): the repodata switch (the four
+ *  names incl. the `.bz2` twins — wall 3 ADOPTED), then the
+ *  package-filename split, then Go's http.NotFound. */
 async function condaListOrGetPackages(
   c: Context<{ Bindings: Env }>,
   owner: UserRow,

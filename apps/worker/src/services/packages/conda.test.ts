@@ -5,7 +5,8 @@
  * (the terraform.test.ts precedent; the route arms ride packages-conda):
  *
  *  - the parse: the REAL system-bzip2 fixtures (bzip2 1.0.8 -9, embedded
- *    base64 — no in-test bzip2 writer exists, that is the wall-3 record)
+ *    base64 — authored with the upstream tool on purpose; the in-repo
+ *    encoder landed later as ./bz2-encode.ts, wall 3 ADOPTED)
  *    covering index+about, the about-less minimal, the name/version gates
  *    (the conda-build grammar), the missing-index structure sentinel, the
  *    corrupt-stream archive class, the URL validation (a relative home
@@ -118,7 +119,8 @@ async function seedUser(username: string): Promise<{ id: number; username: strin
 // ---------------------------------------------------------------------------
 // The fixtures — REAL conda packages authored with system tar + bzip2
 // 1.0.8 (-9) at write time, embedded base64 (the composer bz2 posture:
-// no in-test bzip2 writer exists — that is precisely wall 3's record).
+// upstream-tool output on purpose — the in-repo encoder arrived later,
+// ./bz2-encode.ts, and the parse keeps testing REAL tool bytes).
 // ---------------------------------------------------------------------------
 
 /** index.json + about.json, the full form (numpy 1.26.0, linux-64). */

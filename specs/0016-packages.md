@@ -2285,21 +2285,27 @@ wrapping CreatePackageOrAddFileToExisting rides the landed
 constraint-arbitrated posture (the model.ts header note, every family
 the same).
 
-Tests (own eyes): services `conda.test.ts` **28/28** + route arms
-`packages-conda.test.ts` **9/9** — both quoted over the pair:
-`Tests 37 passed (37)`; the real system-bzip2 fixtures (bzip2 1.0.8 -9,
-embedded base64 — the composer bz2 authoring posture), the
-name/version/URL/decode-error parse arms, the metadata JSON renders,
-the upload chain with the property/creation-only semantics, the
-duplicate 409, the `.conda` wall 400, the exact RepoData render, the
-exactly-one download gate, the channel/nested-channel walk, the `.bz2`
-reduction page, the auth/quota/PACKAGES_ENABLED gates. Neighbors
-unregressed: blobs + model + serve-content + composer routes + conda
-routes `Tests 84 passed (84)`; cran service + terraform routes +
-composer service `Tests 40 passed (40)`. `pnpm -C apps/worker
-typecheck` tree-zero; scoped eslint clean on the four touched files;
-`pnpm check:api` PASS (the conda arms are /api/packages protocol
-routes — outside the v1 contract surface).
+Tests (own eyes, the wall-3 bz2-encode unit's re-run): the encoder
+battery `bz2-encode.test.ts` **19/19** + the decoder battery
+`bz2.test.ts` **17/17** + services `conda.test.ts` **31/31** — quoted
+over the three files: `Tests 67 passed (67)`; route arms
+`packages-conda.test.ts` **9/9** (the former wall-3 404 arm now asserts
+the compressed twins: 200 application/x-bzip2, the payload decoding
+back to the exact plain render). The encoder goldens were cross-checked
+at authoring time with system `bzip2 -d` (bzip2 1.0.8): every committed
+arm reproduces its content byte-for-byte plus a 200-case mixed-shape
+fuzz (runs + random + cycles, levels 1-9) through BOTH decoders; the
+empty and aaaaa outputs are byte-identical to the tool's. The service
+fixtures remain the real system-bzip2 conda packages (bzip2 1.0.8 -9,
+embedded base64), the name/version/URL/decode-error parse arms, the
+metadata JSON renders, the upload chain with the property/creation-only
+semantics, the duplicate 409, the `.conda` wall 400, the exact RepoData
+render, the exactly-one download gate, the channel/nested-channel walk,
+the auth/quota/PACKAGES_ENABLED gates. Neighbors unregressed: blobs +
+model + serve-content `Tests 72 passed (72)` over the three files.
+`pnpm -C apps/worker typecheck` zero errors in the touched files (the
+tree's remaining errors ride sibling units' in-flight untracked files);
+scoped eslint exit 0 on the five touched files.
 
 - **Open issues (conda):** (1) ~~the vendored bz2 decoder diverges from
   Go on a zero-run-dominated tiny stream~~ RETRACTED at the same unit's
@@ -2308,9 +2314,10 @@ routes — outside the v1 contract surface).
   compress/bzip2 (go1.25.1) rejects those exact bytes with the SAME
   "Huffman length out of range" bz2.ts produced, and accepts every
   fixture bz2.ts accepts (the two decoders AGREE on all tested streams;
-  no bz2-owner unit needed). (2) The two reopen triggers above (a zstd
-  decoder unit for `.conda` uploads; a bzip2-encoder unit for the
-  `.bz2` repodata variants). With conda landed the census closes:
+  no bz2-owner unit needed). (2) ~~a bzip2-encoder unit for the `.bz2`
+  repodata variants~~ CLOSED at the bz2-encode unit (wall 3 ADOPTED,
+  above); the zstd decoder unit for `.conda` uploads stays the one open
+  reopen trigger (wall 2). With conda landed the census closes:
   **TWENTY-THREE of TWENTY-THREE** protocol surfaces (the 22
   CommonRoutes groups + container) — the parity claim the 2056
   section's TWENTY-TWO row staged for.
