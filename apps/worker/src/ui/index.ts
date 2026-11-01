@@ -3782,7 +3782,7 @@ export interface OrgTeamsRoute {
 
 /** The O1 org team-membership write families (upstream TeamsAction +
  *  TeamsRepoAction, routers/web/org/teams.go:113-247/271-314 at
- *  web.go:997-998's `m.Post("/teams/{team}/action/{action}")` +
+ *  web.go:999-1000's `m.Post("/teams/{team}/action/{action}")` +
  *  `m.Post("/teams/{team}/action/repo/{action}")`): the web arms for
  *  join/leave/add/remove on a team and the team's repo grant pair. The
  *  `{action}` segment is upstream's path-param WILDCARD — the handlers
@@ -3810,7 +3810,7 @@ export interface OrgTeamActionRoute {
 }
 
 /** The O1 org members write family (upstream MembersAction,
- *  routers/web/org/members.go:82-136 at web.go:989's
+ *  routers/web/org/members.go:82-136 at web.go:992's
  *  `m.Post("/members/action/{action}")`): the members page's visibility
  *  toggle (private/public), the owner's remove and the self leave. Same
  *  wildcard `{action}` claim as the teams family; the members page family's
@@ -4773,7 +4773,7 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     return { family: "org-members", owner: orgName };
   }
-  // The O1 members write family (web.go:989's
+  // The O1 members write family (web.go:992's
   // `m.Post("/members/action/{action}", org.MembersAction)`): the four
   // segments above extended with the literal `action` fourth segment and
   // the `{action}` tail a WILDCARD (upstream's path param — MembersAction's
@@ -4930,7 +4930,7 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // write (web.go:1011-1013 — the same positive-integer claim, keyed on the
   // id carrier only: a name carrier has no landed edit/delete read arms,
   // so five-segment name tails stay unclaimed → the engine's 404). The O1
-  // wave claims the `/action/*` membership writes (web.go:997-998 — the
+  // wave claims the `/action/*` membership writes (web.go:999-1000 — the
   // OrgTeamActionRoute interface's note); `/{id}/repositories` and every
   // other tail stays unclaimed → the engine's 404.
   // The org WORKTIME page (web.go:1015 — owner-only; the module's resolve
@@ -4958,7 +4958,7 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (raw[4] === "edit") return { family: "org-team-edit", owner, id: Number.parseInt(raw[3] as string, 10) };
       if (raw[4] === "delete") return { family: "org-team-delete", owner, id: Number.parseInt(raw[3] as string, 10) };
     }
-    // The O1 membership write families (web.go:997-998's POST pair): the
+    // The O1 membership write families (web.go:999-1000's POST pair): the
     // literal `action` fourth segment, the team segment in either carrier
     // form (the detail family's id/name shapes), and the `{action}` tail a
     // WILDCARD (upstream's path param — TeamsAction's switch answers an
@@ -13763,7 +13763,7 @@ async function orgTeamDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
 }
 
 // ---------------------------------------------------------------------------
-// The O1 org membership write families (web.go:989 + 997-998 — the members
+// The O1 org membership write families (web.go:992 + 999-1000 — the members
 // action POST, the team action POST and the team repo action POST;
 // routers/web/org/members.go:82-136 + teams.go:113-247/271-314). The web
 // arms compose the landed API-layer service half — TeamsService's
@@ -18510,7 +18510,7 @@ uiRouter.post("/:owner/teams/:id/edit", (c) => orgTeamEditSubmit(c));
 uiRouter.post("/:owner/teams/:id/delete", (c) => orgTeamDeleteSubmit(c));
 uiRouter.get("/:owner/teams/:id/delete", () => methodNotAllowed("POST"));
 // The O1 membership write families (parseUiRoute claims exactly these
-// shapes — upstream web.go:997-998's two POST segments inside the
+// shapes — upstream web.go:999-1000's two POST segments inside the
 // RequireMember+RequireTeamMember group; the gates run in the handlers,
 // resolveOrgTeamActionRequest's ladder). POST-only registrations beside
 // the wave-12/49 statics so they beat the dynamic /:owner/:repo block
@@ -19395,7 +19395,7 @@ uiRouter.get("/:owner{^(?!login$|logout$|healthz$)[\\w.-]+$}", (c) => ownerHomeP
 // future collision loudly).
 uiRouter.get("/org/:owner/members", (c) => orgMembersPage(c));
 // The O1 members write family (parseUiRoute claims the exact 6-segment
-// shape — upstream web.go:989's `m.Post("/members/action/{action}")`
+// shape — upstream web.go:992's `m.Post("/members/action/{action}")`
 // inside the RequireMember group; the wave-23 tail-spot rationale
 // verbatim: the literal org/members/action segments carry no earlier
 // pattern, and the GET twin answers chi's 405 — the edit/delete

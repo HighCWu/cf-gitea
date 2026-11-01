@@ -187,6 +187,12 @@ pnpm build          # REQUIRED before deploy: wrangler deploys dist/cf_gitea's
 pnpm deploy         # wrangler deploy from apps/worker
 ```
 
+Migration posture — `0061_aromatic_meggan` (repo_transfer.team_ids +
+repositories.num_closed_milestones) is applied LOCAL only (commit `7f2ecd3`);
+its remote apply is the convergence step BEFORE deploy (`pnpm
+db:migrate:remote`, then `wrangler d1 migrations list cf-gitea --remote`
+shows nothing pending — the deploy rides the migrated schema).
+
 Live (first deploy 2026-10-24): **https://cf-gitea.hecongw.workers.dev** —
 smoke-verified end to end: remote admin bootstrap, PAT-authenticated
 create-by-push, `ls-remote`, Basic-auth token API, `last_used_at` updates.

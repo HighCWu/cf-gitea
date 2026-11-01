@@ -44,8 +44,8 @@ Basic-realm flip.
   the pin (the token endpoint accepts only `authorization_code` and `refresh_token`,
   `routers/web/auth/oauth2_provider.go:553–563`); no invention.
 - OIDC `prompt=none`/session management/front-channel logout — absent from the pin.
-- WebAuthn interplay `webAuth.AllowOAuth2` (`web.go:630`) — cf-gitea has no WebAuthn
-  yet; the middleware slot is recorded so the re-pin picks it up.
+- WebAuthn interplay `webAuth.AllowOAuth2` (`web.go:630`) — WebAuthn landed
+  (SPEC-0022); the AllowOAuth2 interplay slot stays recorded for the re-pin.
 
 ## 2. Surface (upstream behavior is the default decision; every row carries its pin cite)
 

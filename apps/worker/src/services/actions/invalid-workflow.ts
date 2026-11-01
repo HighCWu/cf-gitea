@@ -8,15 +8,22 @@
 // at services/actions/notifier_helper.go:284-286 and surfaced in the run list
 // (routers/web/repo/actions/actions.go:559-569).
 //
-// The two post-insert arms of upstream's insertInvalidWorkflowRun are STAGED
-// seams, not omissions — their owning machinery does not exist in this tree
-// yet:
+// The two post-insert arms of upstream's insertInvalidWorkflowRun (:71-75) —
+// current posture (the old STAGED note's "owning machinery does not exist in
+// this tree yet" is overtaken by the landings): the commit-status machinery
+// has LANDED and is wired at its consumer sites — only the notifier arm
+// stays unported:
 //
 //   - createWorkflowCommitStatus (invalid_workflow.go:88-93 →
-//     services/actions/commit_status.go) — the commit-status service is the
-//     M3 P-tier landing; the trigger caller wires the status once it lands.
-//   - NotifyWorkflowRunStatusUpdate (:95-97) — the notifier census
-//     (services/actions/notifier.go:41-784) is likewise the P-tier landing.
+//     services/actions/commit_status.go) — LANDED (trigger.ts, the
+//     commit-status port) with its consumer sites wired: the completion
+//     emitter's status posts (86b5aee) and the claim path's RUNNING post
+//     (16ca6c9). This module's own invalid-run status call on the insert
+//     tail is still not made — the seam now exists for it.
+//   - NotifyWorkflowRunStatusUpdate (:95-97) — still unported: the notifier
+//     census (services/actions/notifier.go:41-784) has no port (no
+//     websocket fanout on Workers); the emitter pass's status refresh is the
+//     visible arm (update.ts's tail note).
 //
 // The run-index is upstream's GetNextResourceIndex(ctx, "action_run_index",
 // RepoID) (invalid_workflow.go:59-61); it rides the LANDED
@@ -161,9 +168,10 @@ export async function insertInvalidWorkflowRun(
     updated: now,
   });
 
-  // invalid_workflow.go:88-97 — the commit-status and notifier arms are the
-  // staged seams documented in the module header (their owning services are
-  // the P-tier landing; the trigger caller wires them).
+  // invalid_workflow.go:88-97 — the arms note in the module header: the
+  // commit-status seam has landed (createWorkflowCommitStatus, trigger.ts)
+  // though this tail's invalid-run status call is still not wired; the
+  // notifier arm stays unported.
 
   return { ...runRow, latestAttemptId: attemptRow.id };
 }

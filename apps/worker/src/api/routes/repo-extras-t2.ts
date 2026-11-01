@@ -87,7 +87,7 @@ import { contentsResponseSchema, type ContentsResponse } from "../models/content
  *     collaborators.go:304-330 over services/pull/reviewer.go:25-70):
  *     collaborators (mode >= read — every stored mode qualifies) plus the
  *     (non-org) owner, active users, name order — the upstream set with the
- *     org-team term dropped (orgs land with SPEC-0007).
+ *     org-team term dropped (the recorded reduction).
  *   - GET /repos/{owner}/{repo}/issue_config (repoGetIssueConfig) and
  *     /issue_config/validate (repoValidateIssueConfig, routers/api/v1/repo/
  *     repo.go:1204-1252 over services/issue/template.go
