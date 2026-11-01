@@ -682,12 +682,12 @@
  */
 
 import { Hono, type Context } from "hono";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { trimTrailingSlash } from "hono/trailing-slash";
 
 import { isReservedOwnerName } from "../repos/service";
-import { users } from "../db/schema";
+import { repositories, users } from "../db/schema";
 import type { RunRow } from "../services/actions/model";
 import { engineClient } from "./engine";
 import { readUrlEncodedForm } from "./forms";
@@ -1797,6 +1797,20 @@ import {
   renderEditorUploadPage,
   uploadFormFromData,
 } from "./pages/repo-editor-tails";
+// Census gap #13's fork-to-edit fold (pages/repo-editor-fork.tsx): the
+// routes live HERE (the module is pure seams — the repo-fork precedent);
+// the GET half rides fileEditorGate's fork arm, the POST half is the
+// /_fork write route below.
+import {
+  createForkToEdit,
+  editorForkReturnTarget,
+  editorForkTargetAction,
+  loadEditorForkOverlay,
+  parseEditorForkForm,
+  renderEditorForkPrompt,
+  resolveEditorForkBranch,
+  type EditorForkOverlay,
+} from "./pages/repo-editor-fork";
 import {
   cherryPickFormFromData,
   commitCherryPickFromForm,
@@ -3069,6 +3083,25 @@ export interface FileEditorRoute {
   refSuffix: string;
 }
 
+/** Census gap #13's write route (pages/repo-editor-fork.tsx): upstream
+ *  web.go:1450's `m.Post("/_fork/*", repo.ForkToEditPost)` — the editor
+ *  Combos group's fork arm, "read-only, fork to own repo, fine with 'code
+ *  reader'". The underscore literal is upstream's OWN spelling — NOT one of
+ *  the bare-named editor_action combos the family brief pins. POST-only
+ *  registered: a GET misses into the parent app's plain 404 (upstream chi
+ *  answers 405 — the recorded house divergence, the tags-delete posture).
+ *  The tail is the decoded branch rest (resolveEditorForkBranch's
+ *  branch-universe walk at handler time — upstream resolves it in the
+ *  group's RepoRefByType wrap); the bare `/_fork` stays unclaimed (chi's
+ *  `/*` requires the tail — the editor-literal convention). */
+export interface EditorForkRoute {
+  family: "editor-fork";
+  owner: string;
+  repo: string;
+  /** Decoded branch tail after the literal (never claimed empty). */
+  refSuffix: string;
+}
+
 /** The blame page family (pages/blame.tsx): upstream's blame group —
  *  web.go:1729-1733's `m.Group("/blame", ...)` with `/branch/*`, `/tag/*`
  *  and `/commit/*` tails → repo.RefBlame (routers/web/repo/blame.go; the
@@ -3830,6 +3863,7 @@ export type ParsedUiRoute =
   | GlobalInboxRoute
   | WikiRoute
   | FileEditorRoute
+  | EditorForkRoute
   | BlameRoute
   | RepoSearchRoute
   | RepoActivityRoute
@@ -6331,6 +6365,19 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     suffix = rest.map((segment) => decodeURIComponent(segment)).join("/");
   } catch {
     return null;
+  }
+  // Census gap #13's write route (pages/repo-editor-fork.tsx — web.go:1450's
+  // `m.Post("/_fork/*", repo.ForkToEditPost)`): the underscore literal is
+  // upstream's OWN spelling inside the editor Combos group — NOT one of the
+  // bare editor_action combos above. The tail claims every decoded rest
+  // (chi's `/*` shape; resolveEditorForkBranch's walk 404-shapes an
+  // unresolvable tail at handler time — the middleware arm). The bare
+  // `/_fork` stays unclaimed (the editor-literal convention); registration
+  // is POST-only — a GET misses into the parent app's plain 404 (upstream
+  // chi answers 405, the recorded house divergence).
+  if (head === "_fork") {
+    if (rest.length === 0) return null;
+    return { family: "editor-fork", owner, repo, refSuffix: suffix };
   }
   // The blame page family (web.go:1729-1733's /blame/{branch,tag,commit}/*):
   // the typed tails claim every rest INCLUDING a bare refType (chi's `/*`
@@ -12971,24 +13018,85 @@ const FILE_EDITOR_MODES = {
  * The editor prologue the GET and POST share (after the POST's §2.8 Origin
  * guard, and after each handler's own family drift check): the repo
  * resolution (invisible repos 404-shell before any redirect could leak
- * them), the anonymous login 303, then the write posture — the archived
- * refusal (upstream `RepoMustNotBeArchived` answers NotFound,
- * services/context/repo.go:136-141) and the write predicate (`canWriteRepo`,
- * the UI delegate onto the landed canWriteRepository, repo-access.ts via
- * ../repo-grants.ts — team grants included; non-writers
- * 404-shell like the settings pages — no fork-to-edit flow exists to offer
- * readers). Returns the ready Response, or null to proceed.
+ * them), the anonymous login 303, then the archived refusal (upstream
+ * `RepoMustNotBeArchived` answers NotFound, services/context/repo.go:136-141),
+ * then the write predicate split — upstream web.go:1449-1451's group rule
+ * ("GET" requests only need "code reader", "POST" requests need "code
+ * writer"; `canWriteRepo` is the UI delegate onto the landed
+ * canWriteRepository, repo-access.ts via ../repo-grants.ts — team grants
+ * included):
+ *
+ *   - `forkArm` false (every POST — upstream's `canWriteToBranch` middleware
+ *     answers NotFound — plus the patch/cherrypick GETs, whose page modules
+ *     carry no fork overlay): a non-writer 404-shells like the settings
+ *     pages.
+ *   - `forkArm` true (the four overlay-mounted GET families — new/edit/
+ *     delete/upload): the non-writer enters the FORK flow (census gap #13,
+ *     services/context/repo.go:191-197) — an unresolvable branch tail 404s
+ *     (the group's RepoRefByType arm), a viewer with NO fork of this source
+ *     gets `renderEditorForkPrompt` answered HERE (upstream ForkToEdit's
+ *     render; the fork check precedes the file read, editor.go:57-68), and
+ *     a viewer whose fork already EXISTS returns `{ readerFork }` — the
+ *     handler folds the WillSubmitToFork overlay into its render.
+ *
+ * Returns the ready Response, null to proceed as a writer, or the
+ * readerFork cell (forkArm GETs only).
  */
+type FileEditorGateOutcome =
+  | Response
+  | null
+  | { readerFork: { id: string; ownerNamespace: string; slug: string; defaultBranch: string } };
+
 async function fileEditorGate(
   c: Context<{ Bindings: Env }>,
   resolved: Extract<ResolvedUiRequest, { ok: true }>,
-): Promise<Response | null> {
+  forkArm: false,
+): Promise<Response | null>;
+async function fileEditorGate(
+  c: Context<{ Bindings: Env }>,
+  resolved: Extract<ResolvedUiRequest, { ok: true }>,
+  forkArm: true,
+): Promise<FileEditorGateOutcome>;
+async function fileEditorGate(
+  c: Context<{ Bindings: Env }>,
+  resolved: Extract<ResolvedUiRequest, { ok: true }>,
+  forkArm: boolean,
+): Promise<FileEditorGateOutcome> {
   const { url, ctx, viewer, repo, respond } = resolved;
   if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
-  if (repo.isArchived || !(await canWriteRepo(c.env, repo, viewer))) {
-    return respond(c.html(renderNotFound(ctx), 404));
+  if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404));
+  if (await canWriteRepo(c.env, repo, viewer)) return null;
+  if (!forkArm) return respond(c.html(renderNotFound(ctx), 404));
+  const route = resolved.route;
+  if (!("refSuffix" in route) || typeof route.refSuffix !== "string") {
+    return respond(c.html(renderNotFound(ctx), 404)); // caller drift (every caller guards its FileEditorRoute family first)
   }
-  return null;
+  const engine = engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`);
+  const branch = await resolveEditorForkBranch(engine, repo, route.refSuffix);
+  if (branch === null) return respond(c.html(renderNotFound(ctx), 404)); // the RepoRefByType arm
+  // The GetUserFork one-fork-per-owner probe (fork.go:75-82) —
+  // findForkByOwner's (forkParent, ownerId) pair plus the fork's
+  // `default_branch`, the overlay's select/action input (the API service's
+  // trio omits it; ONE read carries both).
+  const forkRow = await drizzle(c.env.DB)
+    .select({
+      id: repositories.id,
+      ownerNamespace: repositories.ownerNamespace,
+      slug: repositories.slug,
+      defaultBranch: repositories.defaultBranch,
+    })
+    .from(repositories)
+    .where(and(eq(repositories.forkParent, repo.id), eq(repositories.ownerId, viewer.id)))
+    .limit(1)
+    .get();
+  if (forkRow === undefined) {
+    // NeedFork (repo.go:191-197 — "no fork of this source yet"): the prompt
+    // the editor GET renders instead of the editor. The reload target is
+    // THIS editor URL — the POST 303s back onto it (the no-JS reload
+    // reduction, pages/repo-editor-fork.tsx's header).
+    return respond(c.html(renderEditorForkPrompt({ ctx, branch, returnUri: url.pathname + url.search, error: null }), 200));
+  }
+  return { readerFork: forkRow };
 }
 
 /** GET /{owner}/{repo}/{new|edit|delete}/{branch}[/{path}] (the form;
@@ -13005,12 +13113,33 @@ async function fileEditorPage(c: Context<{ Bindings: Env }>, family: FileEditorP
   const { url, ctx, repo, respond } = resolved;
   const route = resolved.route;
   if (route.family !== family) return respond(await c.notFound()); // registration/parser drift guard
-  const gate = await fileEditorGate(c, resolved);
-  if (gate !== null) return gate;
+  const gate = await fileEditorGate(c, resolved, true);
+  if (gate !== null && !("readerFork" in gate)) return gate;
+  const readerFork = gate !== null && "readerFork" in gate ? gate.readerFork : null;
   const mode = FILE_EDITOR_MODES[family];
   const engine = engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`);
   const data = await loadFileEditorData(engine, repo, mode, route.refSuffix, url.searchParams.get("filename"));
   if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
+  if (readerFork !== null) {
+    // The WillSubmitToFork GET (repo.go:203-258): the form action onto the
+    // FORK's own editor route, the fork's branches in the commit select,
+    // common_top's banner — and the fork's default branch folded into
+    // form.branch (the POST lands on the fork; pages/file-editor.tsx's
+    // contract). The content/sidebar stay the BASE's reads (upstream's
+    // ctx.Repo posture).
+    const overlay = await readerForkOverlay(c.env, readerFork, mode, data.treePath, data.branch, url.search);
+    if (overlay === null) return respond(c.html(renderNotFound(ctx), 404)); // listRefs' null posture (never today)
+    const form = { ...editorFormFromData(data), branch: overlay.defaultBranch };
+    // Window-2e C2b: the delete family renders its DEDICATED confirm page
+    // (repo-editor-tails' parity render — the pageClass discriminator,
+    // ALL-links breadcrumb, PageIsDelete placeholder; the one-template render
+    // stays the other two families').
+    const html =
+      family === "file-delete"
+        ? renderEditorDeletePage({ ctx, data, form, error: null, fork: overlay })
+        : renderFileEditorPage({ ctx, data, form, error: null, fork: overlay });
+    return respond(c.html(html, 200));
+  }
   // Window-2e C2b: the delete family renders its DEDICATED confirm page
   // (repo-editor-tails' parity render — the pageClass discriminator,
   // ALL-links breadcrumb, PageIsDelete placeholder; the one-template render
@@ -13042,7 +13171,9 @@ async function fileEditorSubmit(c: Context<{ Bindings: Env }>, family: FileEdito
   const { url, ctx, viewer, repo, respond } = resolved;
   const route = resolved.route;
   if (route.family !== family) return respond(await c.notFound()); // registration/parser drift guard
-  const gate = await fileEditorGate(c, resolved);
+  // POST: upstream's canWriteToBranch middleware 404s a non-writer (the
+  // gate's forkArm=false posture — the fork flow is GET-only).
+  const gate = await fileEditorGate(c, resolved, false);
   if (gate !== null) return gate;
   if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404)); // the gate above admitted only users
   const userRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
@@ -13087,13 +13218,23 @@ async function fileEditorSubmit(c: Context<{ Bindings: Env }>, family: FileEdito
 async function fileUploadPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
-  const { ctx, repo, respond } = resolved;
+  const { url, ctx, repo, respond } = resolved;
   if (resolved.route.family !== "file-upload") return respond(await c.notFound()); // drift guard
-  const gate = await fileEditorGate(c, resolved);
-  if (gate !== null) return gate;
+  const gate = await fileEditorGate(c, resolved, true);
+  if (gate !== null && !("readerFork" in gate)) return gate;
+  const readerFork = gate !== null && "readerFork" in gate ? gate.readerFork : null;
   const engine = engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`);
   const data = await loadEditorUploadData(engine, repo, resolved.route.refSuffix);
   if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
+  if (readerFork !== null) {
+    // The WillSubmitToFork GET: the commit rides the fork's editor route
+    // (the dropzone stays BASE-anchored — upstream's {{.RepoLink}} arm,
+    // pages/repo-editor-tails.tsx's header).
+    const overlay = await readerForkOverlay(c.env, readerFork, "upload", data.treePath, data.branch, url.search);
+    if (overlay === null) return respond(c.html(renderNotFound(ctx), 404)); // listRefs' null posture (never today)
+    const form = { ...uploadFormFromData(data), branch: overlay.defaultBranch };
+    return respond(c.html(renderEditorUploadPage({ ctx, data, form, error: null, fork: overlay }), 200));
+  }
   return respond(c.html(renderEditorUploadPage({ ctx, data, form: uploadFormFromData(data), error: null }), 200));
 }
 
@@ -13104,7 +13245,8 @@ async function fileUploadSubmit(c: Context<{ Bindings: Env }>): Promise<Response
   if (!resolved.ok) return resolved.response;
   const { ctx, viewer, repo, respond } = resolved;
   if (resolved.route.family !== "file-upload") return respond(await c.notFound()); // drift guard
-  const gate = await fileEditorGate(c, resolved);
+  // POST: the forkArm=false posture (the fork flow is GET-only).
+  const gate = await fileEditorGate(c, resolved, false);
   if (gate !== null) return gate;
   if (viewer.kind !== "user") return respond(c.html(renderNotFound(ctx), 404)); // the gate above admitted only users
   const userRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
@@ -13135,7 +13277,12 @@ async function editorCherryPickPage(c: Context<{ Bindings: Env }>, isPost: boole
   if (!resolved.ok) return resolved.response;
   const { url, ctx, viewer, repo, respond } = resolved;
   if (resolved.route.family !== "editor-cherrypick") return respond(await c.notFound()); // drift guard
-  const gate = await fileEditorGate(c, resolved);
+  // forkArm=false on BOTH verbs: upstream prompts the reader here too
+  // (prepareEditorPage runs on every editor GET), but this page module
+  // carries no fork overlay and its {sha}/{branch} tail grammar does not
+  // fit resolveEditorForkBranch's branch walk — the non-writer 404-shell
+  // stays the family strand (the route fold covers the mounted families).
+  const gate = await fileEditorGate(c, resolved, false);
   if (gate !== null) return gate;
   const engine = engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`);
   const data = await loadEditorCherryPickData(engine, repo, resolved.route.refSuffix, url.searchParams.get("cherry-pick-type"));
@@ -13170,7 +13317,9 @@ async function editorPatchPage(c: Context<{ Bindings: Env }>, isPost: boolean): 
   if (!resolved.ok) return resolved.response;
   const { ctx, viewer, repo, respond } = resolved;
   if (resolved.route.family !== "editor-patch") return respond(await c.notFound()); // drift guard
-  const gate = await fileEditorGate(c, resolved);
+  // forkArm=false on BOTH verbs — the cherrypick strand's twin (no fork
+  // overlay on this page module; the non-writer 404-shell stays).
+  const gate = await fileEditorGate(c, resolved, false);
   if (gate !== null) return gate;
   const engine = engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`);
   const data = await loadEditorPatchData(engine, repo, resolved.route.refSuffix);
@@ -13192,6 +13341,78 @@ async function editorPatchPage(c: Context<{ Bindings: Env }>, isPost: boolean): 
     );
   }
   return respond(c.html(renderEditorPatchPage({ ctx, data, form, error: result.message }), 200));
+}
+
+// ---------------------------------------------------------------------------
+// Census gap #13's write route (pages/repo-editor-fork.tsx — web.go:1450's
+// `m.Post("/_fork/*", repo.ForkToEditPost)`; the GET half rides
+// fileEditorGate's fork arm above)
+// ---------------------------------------------------------------------------
+
+/** The WillSubmitToFork overlay for the mounted editor GETs (the caller
+ *  holds the reader's fork cell from the gate): TargetFormAction onto the
+ *  FORK's own editor route (`editorForkTargetAction` — the fork's default
+ *  branch + the base's treePath + `from_base_branch` + the page's query
+ *  passthrough) + the fork cell's live branch select (`loadEditorForkOverlay`
+ *  — a still-settling fork renders `[defaultBranch]`, the module header's
+ *  strand posture). */
+async function readerForkOverlay(
+  env: Env,
+  fork: { ownerNamespace: string; slug: string; defaultBranch: string },
+  editorLiteral: string,
+  treePath: string,
+  baseBranch: string,
+  search: string,
+): Promise<EditorForkOverlay | null> {
+  const forkLink = `/${fork.ownerNamespace}/${fork.slug}`;
+  const action = editorForkTargetAction({
+    forkLink,
+    editorLiteral,
+    forkDefaultBranch: fork.defaultBranch,
+    treePath,
+    baseBranch,
+    query: search.startsWith("?") ? search.slice(1) : search,
+  });
+  return loadEditorForkOverlay(engineClient(env, forkLink.slice(1)), fork, action);
+}
+
+/**
+ * POST /{owner}/{repo}/_fork/{branch} (upstream ForkToEditPost,
+ * editor_fork.go:20-29): the §2.8 layer-2 Origin guard, the repo resolution,
+ * the anonymous login 303, the archived 404 — then the ladder WITHOUT the
+ * write predicate: upstream registers the route "read-only, fork to own
+ * repo, fine with 'code reader'" (web.go:1450), so a reader may fork. The
+ * branch resolves BEFORE the write (the group's RepoRefByType arm — an
+ * unresolvable tail 404s). `created` and `existing` (the double-POST race's
+ * arm — the module header) both 303 onto the validated `return_uri` (the
+ * no-JS reload reduction — the page the reloaded editor GET renders with the
+ * fork now present; a forged/cross-repo value falls back to the editor root,
+ * `editorForkReturnTarget`); a refused write re-renders the prompt at 200
+ * with the message (the prompt's error slot). Registration is POST-only: a
+ * GET misses into the parent app's plain 404 (upstream chi answers 405 —
+ * the recorded house divergence).
+ */
+async function editorForkSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "editor-fork") return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
+  if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404)); // RepoMustNotBeArchived's posture
+  const engine = engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`);
+  const branch = await resolveEditorForkBranch(engine, repo, resolved.route.refSuffix);
+  if (branch === null) return respond(c.html(renderNotFound(ctx), 404)); // the RepoRefByType arm
+  const form = parseEditorForkForm(await readUrlEncodedForm(c.req.raw));
+  const result = await createForkToEdit(c.env, c.env.DB, repo, viewer);
+  if (result.outcome === "invalid") {
+    return respond(
+      c.html(renderEditorForkPrompt({ ctx, branch, returnUri: form.returnUri, error: result.message }), 200),
+    );
+  }
+  const location = editorForkReturnTarget(form.returnUri, `/${repo.ownerNamespace}/${repo.slug}`, branch);
+  return respond(new Response(null, { status: 303, headers: { location } }));
 }
 
 /**
@@ -17929,6 +18150,15 @@ uiRouter.get("/:owner/:repo/patch/*", (c) => editorPatchPage(c, false));
 uiRouter.post("/:owner/:repo/patch/*", (c) => editorPatchPage(c, true));
 uiRouter.get("/:owner/:repo/cherrypick/*", (c) => editorCherryPickPage(c, false));
 uiRouter.post("/:owner/:repo/cherrypick/*", (c) => editorCherryPickPage(c, true));
+// Census gap #13's write route (pages/repo-editor-fork.tsx — upstream
+// web.go:1450's `m.Post("/_fork/*", repo.ForkToEditPost)`): the underscore
+// literal is upstream's OWN spelling inside the editor Combos group — NOT
+// one of the bare editor_action combos above. POST-only registration: a GET
+// misses into the parent app's plain 404 (upstream chi answers 405 — the
+// recorded house divergence, the tags-delete posture). The write itself
+// runs "read-only, fork to own repo, fine with 'code reader'" — no write
+// predicate gates it (editorForkSubmit's ladder).
+uiRouter.post("/:owner/:repo/_fork/*", (c) => editorForkSubmit(c));
 // Wave-6 single-segment family, wave-7-extended into the owner home (org
 // rows → the org home, user rows → the user profile — upstream's
 // OwnerProfile dispatch). The label regex is wave 6's VERBATIM (it already

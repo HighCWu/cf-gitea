@@ -296,16 +296,23 @@ describe("new file page GET (/new/{branch})", () => {
     expect(await res.text()).toContain('value="notes/hello.txt"');
   });
 
-  it("gates: anonymous 303 onto the login round-trip, unrelated viewer 404, site admin 200", async () => {
+  it("gates: anonymous 303 onto the login round-trip, unrelated viewer gets the fork prompt, site admin 200", async () => {
     const fixture = await ensureWave8Fixtures();
     const anon = await fetchUi("/alice/wave8/new/main");
     expect(anon.status).toBe(303);
     expect(anon.headers.get("location")).toBe("/login?redirect_to=%2Falice%2Fwave8%2Fnew%2Fmain");
 
+    // The gate's non-writer split (census gap #13's fold): a signed-in
+    // non-writer holding no fork of this source gets fork.tmpl's prompt —
+    // the /_fork action + this editor URL as the return_uri — where the
+    // pre-fold posture 404-shelled.
     const other = await fetchUi("/alice/wave8/new/main", {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.otherCookie}` },
     });
-    expect(other.status).toBe(404);
+    expect(other.status).toBe(200);
+    const otherHtml = await other.text();
+    expect(otherHtml).toContain('action="/alice/wave8/_fork/main"');
+    expect(otherHtml).toContain('<input type="hidden" name="return_uri" value="/alice/wave8/new/main"/>');
 
     const admin = await fetchUi("/alice/wave8/new/main", {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.adminCookie}` },

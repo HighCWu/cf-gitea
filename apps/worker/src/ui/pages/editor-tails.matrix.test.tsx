@@ -373,12 +373,21 @@ describe("gates across the mounted tails (anon / non-writer / archived)", () => 
     expect(await branchTip(engine, "main")).toBe(tipBefore); // no anonymous write
   });
 
-  it("a non-writer 404s GET and POST on every tail before any write (engine read-back)", async () => {
+  it("a non-writer: the upload GET renders the fork prompt, the patch/cherrypick GETs 404 (the strand), every POST 404s before any write", async () => {
     const { sha2, samCookie } = await ensureFixtures();
     const sam = { headers: { cookie: `${SESSION_COOKIE_NAME}=${samCookie}` } };
     const engine = pickEngine();
 
-    expect((await fetchUi("/alice/edittails/upload/main", sam)).status).toBe(404);
+    // The gate's non-writer split (census gap #13's fold): the overlay-
+    // mounted upload tail prompts the fork-less reader (fork.tmpl — the
+    // /_fork action + this upload URL as the return_uri); the patch/
+    // cherrypick page modules carry no fork overlay, so their 404-shell
+    // strand stays (ui/index.ts's forkArm=false gate calls).
+    const upload = await fetchUi("/alice/edittails/upload/main", sam);
+    expect(upload.status).toBe(200);
+    const uploadHtml = await upload.text();
+    expect(uploadHtml).toContain('action="/alice/edittails/_fork/main"');
+    expect(uploadHtml).toContain('<input type="hidden" name="return_uri" value="/alice/edittails/upload/main"/>');
     expect((await fetchUi("/alice/edittailspick/patch/main", sam)).status).toBe(404);
     expect((await fetchUi(`/alice/edittailspick/cherrypick/${sha2}/main`, sam)).status).toBe(404);
 

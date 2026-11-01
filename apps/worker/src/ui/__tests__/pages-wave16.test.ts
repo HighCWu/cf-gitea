@@ -246,12 +246,18 @@ describe("editor routes ride the team grant", () => {
     expect(await blobOid("wave16-note.txt")).not.toBeNull();
   });
 
-  it("the read-team member 404-shells the editor entry and its POST", async () => {
+  it("the read-team member GETs the fork prompt (the gate's non-writer split) and its POST 404s", async () => {
     const fixture = await ensureWave16Fixtures();
+    // Census gap #13's fold: a signed-in non-writer holding no fork of this
+    // source gets fork.tmpl's prompt instead of the pre-fold 404 shell — a
+    // read-team grant is still a non-writer (canWriteRepository's team arms).
     const page = await fetchUi("/wave16forge/rig/edit/main/README.md", {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.readCookie}` },
     });
-    expect(page.status).toBe(404);
+    expect(page.status).toBe(200);
+    const pageHtml = await page.text();
+    expect(pageHtml).toContain('action="/wave16forge/rig/_fork/main"');
+    expect(pageHtml).toContain('<input type="hidden" name="return_uri" value="/wave16forge/rig/edit/main/README.md"/>');
 
     const created = await fetchUi(
       "/wave16forge/rig/new/main",

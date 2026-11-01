@@ -243,16 +243,27 @@ describe("gates on the edit/delete arms (wave8 gated only /new)", () => {
     expect(del.headers.get("location")).toBe("/login?redirect_to=%2Falice%2Ffeditor%2Fdelete%2Fmain%2Fdocs%2Fguide.md");
   });
 
-  it("a non-writer 404s both GETs; the site admin renders both", async () => {
+  it("a non-writer GETs the fork prompt on both arms; the site admin renders both editors", async () => {
     const fixture = await ensureFeditorFixtures();
+    // The gate's non-writer split (census gap #13's fold): a signed-in
+    // non-writer with NO fork of this source gets fork.tmpl's prompt — the
+    // /_fork action carrying the resolved branch, this editor URL as the
+    // return_uri (the POST 303s back onto it). The POSTs still 404 (the
+    // forkArm=false posture — upstream's canWriteToBranch middleware).
     const samEdit = await fetchUi("/alice/feditor/edit/main/notes/editor.txt", {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.otherCookie}` },
     });
-    expect(samEdit.status).toBe(404);
+    expect(samEdit.status).toBe(200);
+    const samEditHtml = await samEdit.text();
+    expect(samEditHtml).toContain('action="/alice/feditor/_fork/main"');
+    expect(samEditHtml).toContain('<input type="hidden" name="return_uri" value="/alice/feditor/edit/main/notes/editor.txt"/>');
     const samDelete = await fetchUi("/alice/feditor/delete/main/docs/guide.md", {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.otherCookie}` },
     });
-    expect(samDelete.status).toBe(404);
+    expect(samDelete.status).toBe(200);
+    const samDeleteHtml = await samDelete.text();
+    expect(samDeleteHtml).toContain('action="/alice/feditor/_fork/main"');
+    expect(samDeleteHtml).toContain('<input type="hidden" name="return_uri" value="/alice/feditor/delete/main/docs/guide.md"/>');
 
     const adminEdit = await fetchUi("/alice/feditor/edit/main/notes/editor.txt", {
       headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.adminCookie}` },
