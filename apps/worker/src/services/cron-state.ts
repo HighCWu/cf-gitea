@@ -137,6 +137,9 @@ export const CRON_ARMS: readonly CronArm[] = [
   // retention, SPEC-0012 §4.5), self-gated on the ACTIONS_*_RETENTION_DAYS
   // trio; named for the pair's broader half.
   { arm: "cleanup_actions", spec: DEMO_SWEEP_CRON },
+  // The auto-merge due-scan producer (the 58f9890 fold; upstream's
+  // queue module is push-driven — our D1-claim scan needs the tick).
+  { arm: "auto_merge_due_scan", spec: DEMO_SWEEP_CRON },
   // upstream tasks_actions.go:46 (@every 6h) — the abandoned-jobs producer
   // (SPEC-0012 §4.5's parity-review sweeps, the SIXTH sanctioned block),
   // rides the hourly entry (the ratified cadence divergence — the sweeps

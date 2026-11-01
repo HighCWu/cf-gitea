@@ -1598,7 +1598,7 @@ import {
   renderNewIssuePage,
 } from "./pages/new-issue";
 import { issueNewChooseRedirect } from "./pages/issue-new-choose";
-import { loadPullFilesData, renderPullFilesPage } from "./pages/pull-files";
+import { loadPullFilesData, renderPullFilesPage, updateViewedFilesFromWeb } from "./pages/pull-files";
 // Wave-29 diffpatch downloads (the survey's row 4 — the four raw-text
 // .diff/.patch routes; the loaders + Response builder live in the module,
 // the handlers here beside their sibling dispatchers).
@@ -2212,6 +2212,7 @@ export interface IssueTimelineWriteRoute {
     | "stopwatch-stop"
     | "stopwatch-cancel"
     | "time-estimate"
+    | "viewed-files"
     | "issue-reaction"
     | "issue-delete"
     | "batch-delete"
@@ -5362,6 +5363,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       // ref, time_estimate, the single delete).
       if (rest[1] === "ref") return { family: "issue-ref", owner, repo, urlKind: head, index };
       if (rest[1] === "time_estimate") return { family: "time-estimate", owner, repo, urlKind: head, index };
+      // The viewed-files write (web.go:1371 — the review_state chain's
+      // route seam; POST-only under BOTH families).
+      if (rest[1] === "viewed-files") return { family: "viewed-files", owner, repo, urlKind: head, index };
       if (rest[1] === "delete") return { family: "issue-delete", owner, repo, urlKind: head, index };
       if (head === "pulls" && rest[1] === "files") return { family: "pull-files", owner, repo, index };
       if (head === "pulls" && rest[1] === "commits") return { family: "pull-commits", owner, repo, index };
@@ -6798,6 +6802,29 @@ async function settingsGate(
   if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   if (!(await canAdminRepo(c.env, repo, viewer))) return respond(c.html(renderNotFound(ctx), 404));
   return null;
+}
+
+/** POST /{owner}/{repo}/{issues|pulls}/{index}/viewed-files (web.go:1371 —
+ *  the review_state chain's route seam over the 58f9890 module; reqSignIn,
+ *  the box-write-context shape). */
+async function viewedFilesPost(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "viewed-files" || route.index === undefined) return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search)); // reqSignIn
+  if (repo.isArchived) return respond(c.html(renderNotFound(ctx), 404)); // RepoMustNotBeArchived
+  const issue = await findIssueByRepoAndIndex(c.env.DB, repo.id, route.index);
+  if (issue === null) return respond(c.html(renderNotFound(ctx), 404));
+  const prRow = issue.isPull ? await findPullRequestByIndex(c.env.DB, repo.id, route.index) : null;
+  const outcome = await updateViewedFilesFromWeb({ c, repo, issue, pr: prRow?.pullRequest ?? null, viewer });
+  if (outcome.outcome === "ok") return respond(new Response(null, { status: 200 }));
+  if (outcome.outcome === "bad-request") return respond(new Response("Bad Request", { status: 400 }));
+  if (outcome.outcome === "redirect") return respond(new Response(null, { status: 303, headers: { location: outcome.location } }));
+  return respond(c.html(renderNotFound(ctx), 404));
 }
 
 /** GET /{owner}/{repo}/-/migrate/status (web.go:1172-1174 — the repo-read
@@ -15172,7 +15199,8 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   // Wave-5 dispatch: the PR files diff view (render.tsx never sees this
   // family; non-pull rows 404-shell — pull-files.tsx header).
   if (route.family === "pull-files") {
-    const data = await loadPullFilesData(c, repo.id, route.index);
+    // The viewed-files read is viewer-scoped (the 58f9890 fold's pass).
+    const data = await loadPullFilesData(c, repo.id, route.index, viewer);
     if (data === null) return respond(c.html(renderNotFound(ctx), 404));
     return respond(c.html(renderPullFilesPage({ ctx, data }), 200));
   }
@@ -17469,7 +17497,8 @@ uiRouter.delete("/:owner/:repo/pulls/unpin/:index", (c) => issueUnpinSubmit(c));
 uiRouter.get("/:owner/:repo/pulls/unpin/:index", () => methodNotAllowed("DELETE"));
 // The issue/pull TIMELINE write arms (web.go:1369-1414 — pages/
 // issue-timeline-writes.ts; the statics ride BEFORE the dynamic :index
-// GET catches, the wave-9 rule; viewed-files is NOT registered — the
+// GET catches, the wave-9 rule; viewed-files registered BELOW (the
+// 58f9890 fold) — the
 // review_state STOP).
 uiRouter.post("/:owner/:repo/issues/delete", (c) => batchDeleteIssuesSubmit(c));
 uiRouter.get("/:owner/:repo/issues/delete", () => methodNotAllowed("POST"));
@@ -17523,6 +17552,12 @@ uiRouter.post("/:owner/:repo/issues/:index/delete", (c) => issueDeleteSubmit(c))
 uiRouter.get("/:owner/:repo/issues/:index/delete", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/:repo/pulls/:index/delete", (c) => issueDeleteSubmit(c));
 uiRouter.get("/:owner/:repo/pulls/:index/delete", () => methodNotAllowed("POST"));
+// The viewed-files write (web.go:1371 — the review_state chain; POST-only
+// under BOTH families).
+uiRouter.post("/:owner/:repo/issues/:index/viewed-files", (c) => viewedFilesPost(c));
+uiRouter.get("/:owner/:repo/issues/:index/viewed-files", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index/viewed-files", (c) => viewedFilesPost(c));
+uiRouter.get("/:owner/:repo/pulls/:index/viewed-files", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/:repo/comments/:id", (c) => commentUpdateSubmit(c));
 uiRouter.get("/:owner/:repo/comments/:id", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/:repo/comments/:id/delete", (c) => commentDeleteSubmit(c));

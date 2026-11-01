@@ -65,6 +65,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { repositories, users } from "../db/schema";
 import { enqueueDueAuditRetention } from "./audit";
+import { enqueueDueAutoMergeChecks } from "./pull-automerge";
 import { enqueueDueActionsRetention, enqueueDueZombieStops } from "./actions/retention";
 import {
   enqueueDueAbandonedJobCancels,
@@ -340,6 +341,18 @@ export async function handleScheduledCron(controller: ScheduledController, env: 
       );
     }
     // --- END actions-retention producer block ------------------------------
+    // --- BEGIN auto-merge producer block (the 58f9890 fold; upstream's
+    // --- queue module holds no cron of its own — the DUE scan needs a
+    // --- tick; rides the hourly entry, probe-shaped: one indexed SELECT
+    // --- LIMIT 50 + sendBatch, no CAS — the row IS the claim (the
+    // --- demo-sweep posture). Self-healing on failure (the catch logs;
+    // --- the next tick rescans).
+    try {
+      await enqueueDueAutoMergeChecks(env, {});
+    } catch (error) {
+      console.error("[auto-merge] producer probe failed (retrying next tick):", error);
+    }
+    // --- END auto-merge producer block -------------------------------------
     // --- BEGIN actions-abandoned + ephemeral producer block (SPEC-0012
     // --- §4.5, the parity review §5; the SIXTH sanctioned extension) -------
     // Upstream's cancel_abandoned_jobs (@every 6h) and the ephemeral half
