@@ -1148,10 +1148,13 @@ export class IssuesService {
    * the RECOUNTED values in a follow-up statement (:201-204 — SQLite SET
    * expressions see the pre-update row, so the split is load-bearing), and
    * both statements ride one batch (upstream's WithTx). The state-flip arm
-   * (`oldIsClosed != m.IsClosed`) additionally fires
-   * `updateRepoMilestoneNum` (:165, :298-300) upstream — not ported: our
-   * repositories table carries no num_closed_milestones column (pre-existing
-   * §3.2 divergence, out of scope).
+   * (`oldIsClosed != m.IsClosed`) additionally fires `updateRepoMilestoneNum`
+   * (:165, :298-305): the repo-level counter pair is RECOUNTED from the
+   * milestone rows — `num_milestones` (a steady-state no-op, kept for the
+   * self-healing shape) and `num_closed_milestones` (the tally that actually
+   * moves with the flip) — one UPDATE carrying two count(*) subselects, the
+   * third statement of this batch (D1 batches run sequentially inside the
+   * transaction, so it reads the already-flipped row).
    */
   async updateMilestone(id: number, patch: UpdateMilestonePatch): Promise<MilestoneRow> {
     const existing = await this.getMilestone(id);
@@ -1163,7 +1166,8 @@ export class IssuesService {
       deadlineAt: patch.deadlineAt !== undefined ? patch.deadlineAt : existing.deadlineAt,
       updatedAt: now,
     };
-    if (patch.state !== undefined && (patch.state === "closed") !== existing.isClosed) {
+    const flipped = patch.state !== undefined && (patch.state === "closed") !== existing.isClosed;
+    if (flipped) {
       const closing = patch.state === "closed";
       set.isClosed = closing;
       set.closedDateAt = closing ? now : null;
@@ -1184,6 +1188,19 @@ export class IssuesService {
         })
         .where(eq(milestones.id, id))
         .returning(),
+      // updateRepoMilestoneNum (:298-305), the flip-gated arm (:165) —
+      // upstream's exact Exec shape, subselect counts over the repo's rows.
+      ...(flipped
+        ? [
+            this.db
+              .update(repositories)
+              .set({
+                numMilestones: sql`(SELECT count(*) FROM milestones WHERE repo_id = ${existing.repoId})`,
+                numClosedMilestones: sql`(SELECT count(*) FROM milestones WHERE repo_id = ${existing.repoId} AND is_closed = 1)`,
+              })
+              .where(eq(repositories.id, existing.repoId)),
+          ]
+        : []),
     ] as const);
     const rows = batchRows<MilestoneRow>(results[1], "milestone recount update");
     const row = rows[0];
@@ -1193,8 +1210,19 @@ export class IssuesService {
 
   /**
    * Delete a milestone: its issues are unlinked (upstream behavior), the row
-   * is removed and the repo's `num_milestones` drops, in one batch. False
+   * is removed and the repo's counter pair is RECOUNTED, in one batch. False
    * when the milestone does not exist.
+   *
+   * The counters ride upstream's DeleteMilestoneByRepoID shape
+   * (models/issues/milestone.go:276-296): after the row is gone, BOTH
+   * repo-level tallies are recomputed from the surviving rows — the same
+   * `num_milestones`/`num_closed_milestones` count(*) subselects
+   * updateRepoMilestoneNum (:298-305) carries, spelled as one UPDATE so the
+   * sequential batch reads the post-delete state (a closed milestone's death
+   * drops num_closed_milestones with it, an open one leaves it alone). The
+   * earlier `MAX(num_milestones - 1, 0)` decrement was arithmetically equal
+   * in steady state but drifted un-healed; the recount is upstream's exact
+   * self-healing posture (mirroring updateMilestone's flip arm).
    */
   async deleteMilestone(id: number): Promise<boolean> {
     const existing = await this.getMilestone(id);
@@ -1207,7 +1235,10 @@ export class IssuesService {
       this.db.delete(milestones).where(eq(milestones.id, id)),
       this.db
         .update(repositories)
-        .set({ numMilestones: sql`MAX(num_milestones - 1, 0)` })
+        .set({
+          numMilestones: sql`(SELECT count(*) FROM milestones WHERE repo_id = ${existing.repoId})`,
+          numClosedMilestones: sql`(SELECT count(*) FROM milestones WHERE repo_id = ${existing.repoId} AND is_closed = 1)`,
+        })
         .where(eq(repositories.id, existing.repoId)),
     ] as const);
     return true;

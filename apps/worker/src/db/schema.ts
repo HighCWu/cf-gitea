@@ -210,6 +210,35 @@ export const repositories = sqliteTable(
      *  `wrangler d1 execute` — deliberately NOT automated (dev D1 is scratch,
      *  AGENTS.md; remote D1 has no production rows yet). */
     numForks: integer("num_forks").notNull().default(0),
+    // -------------------------------------------------------------------------
+    // Milestone close tally (migration 0061) — the SPEC-0005 §3.2 counter
+    // block's closed twin. Kept LAST like fork_parent/is_mirror/is_template/
+    // size_kb/num_stars/num_watches/num_forks above — ALTER TABLE ADD COLUMN
+    // physically appends, so the table_info order stays the migration order.
+    // -------------------------------------------------------------------------
+    /** Upstream `Repository.NumClosedMilestones` (models/repo/repo.go — the
+     *  `num_milestones` sibling). Upstream maintains BOTH tallies with the
+     *  same recount shape (`updateRepoMilestoneNum`, models/issues/
+     *  milestone.go:298-305: two count(*) subselects over `milestone`) at
+     *  every state change — the close/reopen flip (changeMilestoneStatus
+     *  :239-251 and the UpdateMilestone edit arm :163-181, both calling
+     *  updateRepoMilestoneNum on the `oldIsClosed != m.IsClosed` arm) and
+     *  the delete (DeleteMilestoneByRepoID :276-296, counts recomputed after
+     *  the row is gone); creation stays INCREMENTAL upstream (NewMilestone
+     *  :109-122, `num_milestones = num_milestones + 1`) and closed is
+     *  untouched there (a new milestone is open). Mirrored exactly by
+     *  issues/service.ts updateMilestone/deleteMilestone; createMilestone's
+     *  landed `num_milestones + 1` batch arm is already the upstream shape.
+     *  NOT NULL DEFAULT 0: the ALTER backfills pre-existing rows to 0 — the
+     *  one-time settle rides the next flip/delete recount (upstream's own
+     *  recount-on-edit posture); the idempotent operator sweep, if ever
+     *  needed, is `UPDATE repositories SET num_closed_milestones = (SELECT
+     *  count(*) FROM milestones m WHERE m.repo_id = repositories.id AND
+     *  m.is_closed = 1)` via `wrangler d1 execute` — deliberately NOT
+     *  automated (dev D1 is scratch, AGENTS.md; remote D1 has no production
+     *  rows yet). The only reader today is internal (the NumOpenMilestones
+     *  arithmetic); no wire change. */
+    numClosedMilestones: integer("num_closed_milestones").notNull().default(0),
   },
   (t) => [
     // SPEC-0003 §3.1: "UNIQUE(owner_id, lower_name) is the arbitration point
@@ -271,7 +300,7 @@ export const repoRedirects = sqliteTable(
 /**
  * Pending transfer (SPEC-0003 §2.5.4; upstream `repo_transfer`). One live
  * request per repo (`repo_id` UNIQUE); the repo stays fully usable while the
- * row exists. Teams column deferred to SPEC-0005.
+ * row exists.
  */
 export const repoTransfer = sqliteTable(
   "repo_transfer",
@@ -285,6 +314,22 @@ export const repoTransfer = sqliteTable(
     createdAt: integer("created_at", { mode: "timestamp" })
       .notNull()
       .default(sql`(unixepoch())`),
+    // -------------------------------------------------------------------------
+    // The org-team attach list (migration 0061) — upstream `RepoTransfer.
+    // TeamIDs []int64` (models/repo/transfer.go:57-58, xorm JSON TEXT).
+    // Kept LAST per the ALTER ADD COLUMN append convention (see the
+    // repositories table note). JSON id-list per the house convention
+    // (protected_tags.allowlist_team_ids): `[]` when the target is a user —
+    // upstream files `nil` there (teams can only ride an ORG-bound transfer,
+    // routers/api/v1/repo/transfer.go:77-80 422s the user-target arm before
+    // anything is stored). Filing validates every id (team exists → 422
+    // `team %d not found`, team.org_id matches the recipient org → 403
+    // `team %d belongs not to org %d`, transfer.go:82-96); the rows attach
+    // at ACCEPT (services/repository/transfer.go:346-352 →
+    // addRepositoryToTeam per team) — vanished teams drop silently there
+    // (LoadAttributes re-fetches by id, transfer.go:111-121).
+    // -------------------------------------------------------------------------
+    teamIds: text("team_ids").notNull().default("[]"),
   },
 );
 

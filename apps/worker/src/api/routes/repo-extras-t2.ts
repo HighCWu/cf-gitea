@@ -63,12 +63,12 @@ import { contentsResponseSchema, type ContentsResponse } from "../models/content
  * Operations (19; file-contents is a GET+POST pair):
  *   - POST /repos/{owner}/{repo}/transfer/accept (acceptRepoTransfer,
  *     routers/api/v1/repo/transfer.go:137-178): 202 + the moved Repository;
- *     the landed repos service runs the §2.5.4 transaction
- *     (repos/service.ts:498-543).
+ *     the landed repos service runs the §2.5.4 transaction.
  *   - POST /repos/{owner}/{repo}/transfer/reject (rejectRepoTransfer,
  *     transfer.go:181-220): 200 + the untouched Repository; the pending-row
  *     delete rides RepoService.cancelTransfer with the eligibility gate
- *     ported HERE (the service's cancelTransfer has none).
+ *     composed HERE from the service's CanUserAcceptOrRejectTransfer port
+ *     (the service's cancelTransfer itself has none).
  *   - GET /topics/search (topicSearch, routers/api/v1/repo/topic.go:264-312,
  *     registered anonymous at routers/api/v1/api.go:1870): keyword LIKE over
  *     the repo_topics store aggregated per topic name (upstream keeps a
@@ -141,13 +141,14 @@ import { contentsResponseSchema, type ContentsResponse } from "../models/content
  *     answers 201 and DELETE 204 exactly like upstream.
  *
  * Documented deviations (upstream behavior vs this instance):
- *   - transfer/accept admission: upstream admits ONLY the pending recipient
- *     (models/repo/transfer.go:143-159 CanUserAcceptOrRejectTransfer); the
- *     landed repos service also admits the current repo owner and site admins
- *     (repos/service.ts:505). The service is not edited by this batch — its
- *     broader grant stands.
- *   - transfer/reject admission: upstream-strict recipient-only (admins act
- *     via sudo) — asymmetric with accept by construction (see above).
+ *   - transfer/accept + reject admission: BOTH run the upstream
+ *     CanUserAcceptOrRejectTransfer predicate (models/repo/transfer.go:
+ *     142-160) — the user recipient alone, or any doer with CanCreateOrgRepo
+ *     on the recipient ORG (org owners + can-create teams; the pending row's
+ *     newOwnerId is the org's id, so the org arm is what admits a human).
+ *     The port lives on the repos service (canUserAcceptOrRejectTransfer,
+ *     repos/service.ts); no admin bypass exists upstream (sudo acts as the
+ *     recipient) and none here.
  *   - resolve/unresolve/replies: upstream registers mustNotBeArchived
  *     (api.go:1445-1447,1475 → runtime 423) but the frozen contract omits 423
  *     for these ops, so no archived gate is declared or enforced here.
@@ -1257,10 +1258,13 @@ export function registerRepoExtrasT2Routes(
         throw new ApiError(404, `no pending transfer for repository: ${found.repo.id}`);
       }
       const doer = doerOf(c);
-      // CanUserAcceptOrRejectTransfer (models/repo/transfer.go:143-159): a
-      // user recipient is the only eligible rejecter (org terms land with
-      // SPEC-0007); admins act through sudo upstream — mirrored here.
-      if (pending.newOwnerId !== doer.id) {
+      // CanUserAcceptOrRejectTransfer (models/repo/transfer.go:142-160),
+      // RejectRepositoryTransfer's gate (services/repository/transfer.go:
+      // 525-527): the USER recipient alone, or — recipient is an ORG — any
+      // doer with CanCreateOrgRepo on it. Upstream 403s with
+      // `util.ErrPermissionDenied`'s text; no admin bypass (sudo acts as the
+      // recipient), mirrored here.
+      if (!(await new RepoService(c.env.DB).canUserAcceptOrRejectTransfer(pending.newOwnerId, doer.id))) {
         throw new ApiError(403, "permission denied");
       }
       await new RepoService(c.env.DB).cancelTransfer(found.repo.id);

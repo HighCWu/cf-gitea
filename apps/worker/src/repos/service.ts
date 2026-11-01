@@ -61,6 +61,7 @@ import type { Registry } from "@cf-gitea/git-engine";
 
 import { IssuesService } from "../issues/service";
 import { AuditActions, auditEventInsert, type AuditOrigin } from "../services/audit";
+import { OrgService } from "../services/orgs/orgs";
 import {
   actions,
   comments,
@@ -551,8 +552,20 @@ export class RepoService {
    * services/repository/transfer.go:445-446). The unique-violation arm is
    * the concurrent duplicate (upstream serializes on the repo working lock,
    * transfer.go:438-448; ours arbitrates on the constraint) — same 409. The
-   * repo stays usable (§2.5.4). */
-  async requestTransfer(repoId: string, doerId: number, newOwnerId: number): Promise<void> {
+   * repo stays usable (§2.5.4).
+   *
+   * `teamIds` rides the org-team attach list (upstream `StartRepositoryTransfer
+   * ... teams []*organization.Team`, services/repository/transfer.go:437 — the
+   * route pre-validates every id, transfer.go:76-98, and the pending row
+   * stores the ids, `RepoTransfer.TeamIDs []int64` JSON TEXT; the ATTACH
+   * itself happens at acceptTransfer). Empty for user targets — the route's
+   * ladder 422s any team list on a non-org recipient before reaching here. */
+  async requestTransfer(
+    repoId: string,
+    doerId: number,
+    newOwnerId: number,
+    teamIds: number[] = [],
+  ): Promise<void> {
     const repo = await this.get(repoId);
     if (repo === null) throw new RepoNotExistError(repoId);
     if (repo.ownerId === newOwnerId) {
@@ -568,7 +581,9 @@ export class RepoService {
       .get();
     if (pending !== undefined) throw new TransferInProgressError(repo.ownerNamespace, repo.slug);
     try {
-      await this.db.insert(repoTransfer).values({ repoId, doerId, newOwnerId, createdAt: new Date() });
+      await this.db
+        .insert(repoTransfer)
+        .values({ repoId, doerId, newOwnerId, teamIds: JSON.stringify(teamIds), createdAt: new Date() });
     } catch (error) {
       // The §4.1-adjacent race: two requests for the same repo decided by
       // UNIQUE(repo_id) where upstream's lock serializes — the loser 409s.
@@ -580,6 +595,29 @@ export class RepoService {
   /** §2.5.4 reject/cancel: delete the pending row (no-op when absent). */
   async cancelTransfer(repoId: string): Promise<void> {
     await this.db.delete(repoTransfer).where(eq(repoTransfer.repoId, repoId));
+  }
+
+  /**
+   * `CanUserAcceptOrRejectTransfer` (models/repo/transfer.go:142-160) — the
+   * shared admission predicate for BOTH transfer verdicts (accept rides it
+   * via AcceptTransferOwnership transfer.go:67-69, reject via
+   * RejectRepositoryTransfer :525-527): "For user, it checks if it's
+   * himself; for organizations, it checks if the user is able to create
+   * repos". A missing recipient row refuses (upstream LoadAttributes fails
+   * the check, :147-150). The org arm composes the landed
+   * `OrgService.canCreateOrgRepo` seam (org_user.go:98-106's
+   * can_create_org_repo OR owner-team predicate — org OWNERS pass through
+   * the isOrgOwner bridge inside it).
+   */
+  async canUserAcceptOrRejectTransfer(recipientId: number, doerId: number): Promise<boolean> {
+    const recipient = await this.db
+      .select({ id: users.id, type: users.type })
+      .from(users)
+      .where(eq(users.id, recipientId))
+      .get();
+    if (recipient === undefined) return false;
+    if (recipient.type !== "org") return recipient.id === doerId;
+    return new OrgService(this.d1).canCreateOrgRepo(recipient.id, doerId);
   }
 
   /**
@@ -606,6 +644,12 @@ export class RepoService {
    *     issues' num_comments are left to drift exactly like upstream's raw
    *     deletes).
    *
+   *   - the filed team attach (:346-352): every org-team id stored on the
+   *     pending row (RepoTransfer.TeamIDs) gains its team_repo_access grant
+   *     + num_repos charge INSIDE the transaction, addRepositoryToTeam
+   *     (services/repository/repo_team.go:40-47) — the filing-side ladder
+   *     lives in the route (repo.ts, transfer.go:76-98).
+   *
    *   - documented equivalents (no seam): upstream's `user.num_repos ± 1`
    *     owner counters (:246-250) have no column here — our users table
    *     carries no repo tally and every owner count derives from the rows;
@@ -621,18 +665,26 @@ export class RepoService {
    * doer auto-watches, the old org unwatched) run as the guarded
    * watchRepo/unwatchRepo batches right after the main batch, upstream's
    * in-tx order preserved (doer watch first).
+   *
+   * Admission is upstream's CanUserAcceptOrRejectTransfer port
+   * (models/repo/transfer.go:142-160, via AcceptTransferOwnership
+   * services/repository/transfer.go:67-69): the USER recipient alone, or —
+   * when the recipient is an ORG (the pending row's newOwnerId is the org's
+   * row id, matching no human id) — any doer with CanCreateOrgRepo on it
+   * (org owners + can-create/owner teams, the landed canCreateOrgRepo seam).
+   * Upstream grants NO admin bypass here (admins act via sudo) and does not
+   * admit the transferring repo owner — the wider {repo owner, site admin}
+   * arms the earlier reduction carried are gone with the port. 403 message
+   * is upstream's `util.ErrPermissionDenied` text (the reject route's
+   * verbatim twin).
    */
   async acceptTransfer(repoId: string, doer: { id: number; isAdmin: boolean }): Promise<RepoRow> {
     const repo = await this.get(repoId);
     if (repo === null) throw new RepoNotExistError(repoId);
     const pending = await this.db.select().from(repoTransfer).where(eq(repoTransfer.repoId, repoId)).get();
     if (pending === undefined) throw new TransferNotExistError(repoId);
-    // The full collaborator model lands in SPEC-0005; today the accept grant
-    // is { repo owner, target owner, site admin }.
-    if (!doer.isAdmin && doer.id !== repo.ownerId && doer.id !== pending.newOwnerId) {
-      throw new NotAuthorizedError(
-        "only the repo owner, the target owner, or a site admin can accept a transfer",
-      );
+    if (!(await this.canUserAcceptOrRejectTransfer(pending.newOwnerId, doer.id))) {
+      throw new NotAuthorizedError("permission denied");
     }
     const target = await this.db.select().from(users).where(eq(users.id, pending.newOwnerId)).get();
     if (target === undefined || target.status !== "active") {
@@ -662,6 +714,29 @@ export class RepoService {
           sql`(${labels.repoId} IS NOT NULL AND ${labels.repoId} != ${repoId}) OR (${labels.repoId} IS NULL AND COALESCE(${labels.orgId}, 0) != ${pending.newOwnerId})`,
         );
     const repoIssueIds = () => this.db.select({ id: issues.id }).from(issues).where(eq(issues.repoId, repoId));
+
+    // The filed org-team attach list (RepoTransfer.TeamIDs, JSON TEXT) — the
+    // rows ATTACH here, at accept (transferOwnership's closing loop,
+    // services/repository/transfer.go:346-352). Upstream LoadAttributes
+    // re-fetches the teams by id at accept (models/repo/transfer.go:111-121),
+    // so a team deleted between filing and accept drops silently — mirrored
+    // by the org-scoped lookup below (filing validated team.org_id against
+    // the recipient org; orgs never re-point teams, so the conjunct only
+    // drops vanished rows). includes-all teams stay UNMATERIALIZED per the
+    // landed addTeamRepo reduction (routes/org-teams.ts — their coverage is
+    // the dynamic union; upstream's unconditional addRepositoryToTeam
+    // materialization is redundant here).
+    const filedTeamIds: number[] = JSON.parse(pending.teamIds) as number[];
+    const attachTeams =
+      filedTeamIds.length === 0
+        ? []
+        : (
+            await this.db
+              .select({ id: teams.id, includesAllRepositories: teams.includesAllRepositories })
+              .from(teams)
+              .where(and(inArray(teams.id, filedTeamIds), eq(teams.orgId, pending.newOwnerId)))
+              .all()
+          ).filter((team) => !team.includesAllRepositories);
 
     const oldEngine = engineName(repo.ownerNamespace, repo.slug);
     const newEngine = engineName(target.usernameLower, repo.slug);
@@ -696,6 +771,29 @@ export class RepoService {
           ),
         ),
       this.db.delete(repoTransfer).where(eq(repoTransfer.repoId, repoId)),
+      // The team attach (:346-352 → addRepositoryToTeam, services/repository/
+      // repo_team.go:40-47 = AddTeamRepo + IncrTeamRepoNum), one guarded pair
+      // per team. Update-before-insert so the NOT EXISTS guard reads the
+      // PRE-insert coverage (a team already holding the repo skips the bump,
+      // the idempotent re-attach arms no-op) — the batch-serialized stand-in
+      // for the landed addTeamRepo's hasTeamRepo pre-check + unique-violation
+      // catch (that seam lives in a route module; the grant rows and the
+      // num_repos charge are the same ones it writes).
+      ...attachTeams.flatMap((team) => [
+        this.db
+          .update(teams)
+          .set({ numRepos: sql`${teams.numRepos} + 1` })
+          .where(
+            and(
+              eq(teams.id, team.id),
+              sql`NOT EXISTS (SELECT 1 FROM ${teamRepoAccess} WHERE ${teamRepoAccess.teamId} = ${team.id} AND ${teamRepoAccess.repoId} = ${repoId})`,
+            ),
+          ),
+        this.db
+          .insert(teamRepoAccess)
+          .values({ orgId: pending.newOwnerId, teamId: team.id, repoId })
+          .onConflictDoNothing(),
+      ]),
       // The old-org arms (:226-233 + :280-306). First RemoveOrgRepo with its
       // counter arm (transfer.go:227-229 → org.go:559-583, org.go:586-588):
       // update-before-delete, so the decrement's subquery sees the rows its

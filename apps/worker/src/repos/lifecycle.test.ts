@@ -177,6 +177,15 @@ describe("rename + redirects (SPEC-0003 §2.5.3, ACL row 13)", () => {
 });
 
 describe("transfer (SPEC-0003 §2.5.4)", () => {
+  const seedOrgRow = async (name: string) => {
+    const orgs = await env.DB.prepare(
+      "INSERT INTO users (username, username_lower, email, is_admin, status, visibility, type, num_members, created_at) VALUES (?, ?, NULL, 0, 'active', 'public', 'org', 0, ?) RETURNING id",
+    )
+      .bind(name, name.toLowerCase(), Math.floor(Date.now() / 1000))
+      .first<{ id: number }>();
+    return orgs!.id;
+  };
+
   it("moves ownership, registers the redirect under the OLD owner, and drops anonymous access with the new owner's visibility", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
     const bob = await seedVerifiedUser({ username: "Bob" });
@@ -186,7 +195,9 @@ describe("transfer (SPEC-0003 §2.5.4)", () => {
     await svc.requestTransfer(repo.id, alice.id, bob.id);
     expect(await drizzle(env.DB).select().from(repoTransfer).all()).toHaveLength(1);
 
-    await svc.acceptTransfer(repo.id, { id: alice.id, isAdmin: false });
+    // The ported admission (transfer.go:142-160): the USER recipient alone —
+    // the filing owner is NOT upstream-eligible for the accept.
+    await svc.acceptTransfer(repo.id, { id: bob.id, isAdmin: false });
 
     const moved = (await svc.get(repo.id))!;
     expect(moved.ownerNamespace).toBe("bob");
@@ -219,9 +230,12 @@ describe("transfer (SPEC-0003 §2.5.4)", () => {
     await expect(svc.requestTransfer(repo.id, alice.id, alice.id)).rejects.toThrow("already owned");
     await expect(svc.requestTransfer(repo.id, alice.id, 424242)).rejects.toThrow("does not exist");
     await svc.requestTransfer(repo.id, alice.id, bob.id);
-    await expect(svc.acceptTransfer(repo.id, { id: carol.id, isAdmin: false })).rejects.toThrow(
-      "only the repo owner",
-    );
+    // The ported admission (transfer.go:142-160): neither a third party nor
+    // the filing owner may accept — upstream's util.ErrPermissionDenied text
+    // verbatim (no admin bypass either; admins act via sudo upstream).
+    await expect(svc.acceptTransfer(repo.id, { id: carol.id, isAdmin: false })).rejects.toThrow("permission denied");
+    await expect(svc.acceptTransfer(repo.id, { id: alice.id, isAdmin: false })).rejects.toThrow("permission denied");
+    await expect(svc.acceptTransfer(repo.id, { id: carol.id, isAdmin: true })).rejects.toThrow("permission denied");
     await svc.cancelTransfer(repo.id);
     expect(await drizzle(env.DB).select().from(repoTransfer).all()).toHaveLength(0);
   });
@@ -244,6 +258,99 @@ describe("transfer (SPEC-0003 §2.5.4)", () => {
     expect(pending).toHaveLength(1);
     expect(pending[0]?.newOwnerId).toBe(bob.id);
     expect(pending[0]?.doerId).toBe(alice.id);
+  });
+
+  it("files the org-team id list on the pending row (RepoTransfer.TeamIDs, JSON TEXT)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const orgId = await seedOrgRow("acme");
+    const svc = service();
+    const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "team-filed");
+
+    await svc.requestTransfer(repo.id, alice.id, orgId, [7, 9]);
+    const pending = await drizzle(env.DB).select().from(repoTransfer).all();
+    expect(pending).toHaveLength(1);
+    expect(JSON.parse(pending[0]!.teamIds)).toEqual([7, 9]);
+
+    // A user-target filing stores the empty list (the route 422s any team
+    // list before reaching here; the default keeps the column `[]`).
+    const repo2 = await createRepo({ id: alice.id, usernameLower: "alice" }, "solo-filed");
+    await svc.requestTransfer(repo2.id, alice.id, (await seedVerifiedUser({ username: "Bob" })).id);
+    const pending2 = await drizzle(env.DB)
+      .select()
+      .from(repoTransfer)
+      .where(eq(repoTransfer.repoId, repo2.id))
+      .get();
+    expect(JSON.parse(pending2!.teamIds)).toEqual([]);
+  });
+
+  it("accept attaches the filed teams — grant rows + num_repos charge (transfer.go:346-352 → addRepositoryToTeam); a vanished team drops, an includes-all team stays unmaterialized", async () => {
+    const bob = await seedVerifiedUser({ username: "Bob" }); // repo owner → transfers to the org
+    const orgId = await seedOrgRow("acme");
+    // The accepting org owner + a can-create team arm exist at the predicate
+    // test below; here the attach is the subject.
+    const owner = await seedVerifiedUser({ username: "Olive" });
+    await env.DB.prepare("INSERT INTO org_members (org_id, user_id, is_public, role, created_at) VALUES (?, ?, 0, 'owner', ?)")
+      .bind(orgId, owner.id, Math.floor(Date.now() / 1000))
+      .run();
+    const granted = await env.DB.prepare("INSERT INTO teams (org_id, lower_name, name, authorize, num_repos) VALUES (?, 'readers', 'readers', 'read', 1) RETURNING id")
+      .bind(orgId)
+      .first<{ id: number }>();
+    const covered = await env.DB.prepare("INSERT INTO teams (org_id, lower_name, name, authorize, num_repos, includes_all_repositories) VALUES (?, 'allhands', 'allhands', 'read', 0, 1) RETURNING id")
+      .bind(orgId)
+      .first<{ id: number }>();
+    const vanishedId = 424242; // not in teams — the LoadAttributes re-fetch drop
+
+    const svc = service();
+    const repo = await createRepo({ id: bob.id, usernameLower: "bob" }, "team-attached");
+    await svc.requestTransfer(repo.id, bob.id, orgId, [granted!.id, covered!.id, vanishedId]);
+    await svc.acceptTransfer(repo.id, { id: owner.id, isAdmin: false });
+
+    const grants = await drizzle(env.DB)
+      .select({ teamId: teamRepoAccess.teamId })
+      .from(teamRepoAccess)
+      .where(eq(teamRepoAccess.repoId, repo.id))
+      .all();
+    // The plain team materializes; the includes-all team's coverage is the
+    // dynamic union (the landed addTeamRepo reduction); the vanished id drops.
+    expect(grants.map((g) => g.teamId).sort()).toEqual([granted!.id]);
+    expect((await drizzle(env.DB).select({ numRepos: teams.numRepos }).from(teams).where(eq(teams.id, granted!.id)).get())?.numRepos).toBe(2);
+    expect((await drizzle(env.DB).select({ numRepos: teams.numRepos }).from(teams).where(eq(teams.id, covered!.id)).get())?.numRepos).toBe(0);
+    expect((await svc.get(repo.id))?.ownerNamespace).toBe("acme");
+  });
+
+  it("CanUserAcceptOrRejectTransfer (transfer.go:142-160): the org arm admits owners + can-create members, refuses plain members; the user arm admits the recipient alone", async () => {
+    const svc = service();
+    const orgId = await seedOrgRow("acme2");
+    const owner = await seedVerifiedUser({ username: "Owen" });
+    const creator = await seedVerifiedUser({ username: "Cara" });
+    const member = await seedVerifiedUser({ username: "Milo" });
+    const outsider = await seedVerifiedUser({ username: "Nadia" });
+    await env.DB.prepare("INSERT INTO org_members (org_id, user_id, is_public, role, created_at) VALUES (?, ?, 0, 'owner', ?)")
+      .bind(orgId, owner.id, Math.floor(Date.now() / 1000))
+      .run();
+    await env.DB.prepare("INSERT INTO org_members (org_id, user_id, is_public, role, created_at) VALUES (?, ?, 0, 'member', ?)")
+      .bind(orgId, member.id, Math.floor(Date.now() / 1000))
+      .run();
+    const teamId = (
+      await env.DB.prepare("INSERT INTO teams (org_id, lower_name, name, authorize, can_create_org_repo) VALUES (?, 'creators', 'creators', 'write', 1) RETURNING id")
+        .bind(orgId)
+        .first<{ id: number }>()
+    )!.id;
+    await env.DB.prepare("INSERT INTO team_members (org_id, team_id, user_id) VALUES (?, ?, ?)")
+      .bind(orgId, teamId, creator.id)
+      .run();
+
+    // Org recipient: owners pass the isOrgOwner bridge, can-create team
+    // members pass the team arm, plain members and outsiders refuse.
+    expect(await svc.canUserAcceptOrRejectTransfer(orgId, owner.id)).toBe(true);
+    expect(await svc.canUserAcceptOrRejectTransfer(orgId, creator.id)).toBe(true);
+    expect(await svc.canUserAcceptOrRejectTransfer(orgId, member.id)).toBe(false);
+    expect(await svc.canUserAcceptOrRejectTransfer(orgId, outsider.id)).toBe(false);
+    // User recipient: the recipient alone (owner/admin arms are gone).
+    expect(await svc.canUserAcceptOrRejectTransfer(owner.id, owner.id)).toBe(true);
+    expect(await svc.canUserAcceptOrRejectTransfer(owner.id, outsider.id)).toBe(false);
+    // A missing recipient row refuses (upstream LoadAttributes fails the check).
+    expect(await svc.canUserAcceptOrRejectTransfer(424242, outsider.id)).toBe(false);
   });
 });
 
@@ -523,10 +630,10 @@ describe("transfer accept cascade (transferOwnership, services/repository/transf
 
   it("accepting INTO an org drops the new-org member collaborators but not outsiders (the IsOrganizationMember arm, transfer.go:196-210)", async () => {
     const bob = await seedVerifiedUser({ username: "Bob" }); // repo owner → transfers to the org
-    const alice = await seedVerifiedUser({ username: "Alice" }); // org member — dropped
+    const alice = await seedVerifiedUser({ username: "Alice" }); // org OWNER (a member too) — dropped; accepts per CanUserAcceptOrRejectTransfer
     const carol = await seedVerifiedUser({ username: "Carol" }); // outsider — kept
     const orgId = await seedOrgRow("acme");
-    await env.DB.prepare("INSERT INTO org_members (org_id, user_id, is_public, role, created_at) VALUES (?, ?, 0, 'member', ?)")
+    await env.DB.prepare("INSERT INTO org_members (org_id, user_id, is_public, role, created_at) VALUES (?, ?, 0, 'owner', ?)")
       .bind(orgId, alice.id, Math.floor(Date.now() / 1000))
       .run();
 
@@ -536,7 +643,7 @@ describe("transfer accept cascade (transferOwnership, services/repository/transf
     await addOrUpdateCollaborator(env.DB, repo.id, carol.id, "read", new Date());
 
     await svc.requestTransfer(repo.id, bob.id, orgId);
-    await svc.acceptTransfer(repo.id, { id: bob.id, isAdmin: false });
+    await svc.acceptTransfer(repo.id, { id: alice.id, isAdmin: false });
 
     const collabs = await drizzle(env.DB).select({ userId: repoCollaborators.userId }).from(repoCollaborators).all();
     expect(collabs).toEqual([{ userId: carol.id }]);
@@ -1418,7 +1525,7 @@ const token = (await mintFor(alice.id, "w", "write:user,write:repository")).plai
 
     const svc = service();
     await svc.requestTransfer(repo.id, alice.id, bob.id);
-    await svc.acceptTransfer(repo.id, { id: alice.id, isAdmin: false });
+    await svc.acceptTransfer(repo.id, { id: bob.id, isAdmin: false });
 
     // The same stale-fresh-cell class as rename, one namespace over.
     const after = await env.REPO.getByName("bob/movable").listRefs();
@@ -1631,7 +1738,7 @@ describe("wiki sibling cell (specs/wiki.md §3 — the 0b619be follow-ups)", () 
     await seedWikiPage(repo, alice.id, "alice", "Home");
 
     await svc.requestTransfer(repo.id, alice.id, bob.id);
-    await svc.acceptTransfer(repo.id, { id: alice.id, isAdmin: false });
+    await svc.acceptTransfer(repo.id, { id: bob.id, isAdmin: false });
 
     // The same sibling move, one namespace over.
     const moved = (await svc.get(repo.id))!;

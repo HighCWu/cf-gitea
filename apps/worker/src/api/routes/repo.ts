@@ -6,7 +6,7 @@ import { z } from "zod";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { repositories } from "../../db/schema";
+import { repositories, teams } from "../../db/schema";
 import {
   OwnerNotAssignableError,
   RepoNameCollisionError,
@@ -830,11 +830,31 @@ export function registerRepoRoutes(
       if (target === null) {
         throw new ApiError(404, "The new owner does not exist or cannot be found");
       }
-      // Teams land with SPEC-0007 — every id misses, in upstream's message
-      // shape (transfer.go:96–99; the non-org check fires first upstream,
-      // but with zero teams both reduce to the same 422).
-      if (form.team_ids !== undefined && form.team_ids.length > 0) {
-        throw new ApiError(422, `team ${form.team_ids[0]} not found`);
+      // The team ladder (transfer.go:76-98), verbatim — a `team_ids` list
+      // (PRESENT per the Go `*opts.TeamIDs != nil` pointer semantics: an
+      // empty array is present too, a bare `null` is schema-rejected before
+      // this point) rides an ORG-bound transfer only. Arm order upstream:
+      // the non-org 422 fires before any per-id lookup; every id must then
+      // EXIST (422 `team %d not found`) and BELONG to the recipient org
+      // (403 `team %d belongs not to org %d` — %d carries the org's row id,
+      // the users.id our pending.newOwnerId stores). Valid ids ride the
+      // pending row (`RepoTransfer.TeamIDs`) and ATTACH at accept
+      // (repos/service.ts, services/repository/transfer.go:346-352).
+      const teamIds: number[] = [];
+      if (form.team_ids !== undefined) {
+        if (target.type !== "org") {
+          throw new ApiError(422, "Teams can only be added to organization-owned repositories");
+        }
+        for (const tID of form.team_ids) {
+          const team = await drizzle(c.env.DB).select({ orgId: teams.orgId }).from(teams).where(eq(teams.id, tID)).get();
+          if (team === undefined) {
+            throw new ApiError(422, `team ${tID} not found`);
+          }
+          if (team.orgId !== target.id) {
+            throw new ApiError(403, `team ${tID} belongs not to org ${target.id}`);
+          }
+          teamIds.push(tID);
+        }
       }
 
       // StartRepositoryTransfer's blocked arm (services/repository/transfer.go:
@@ -869,7 +889,7 @@ export function registerRepoRoutes(
       }
 
       try {
-        await new RepoService(c.env.DB).requestTransfer(found.repo.id, requester.id ?? 0, target.id);
+        await new RepoService(c.env.DB).requestTransfer(found.repo.id, requester.id ?? 0, target.id, teamIds);
       } catch (error) {
         if (error instanceof OwnerNotAssignableError) {
           // Self-transfer and inactive targets: the declared 422 family.

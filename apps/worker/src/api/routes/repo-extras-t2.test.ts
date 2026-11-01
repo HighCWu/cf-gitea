@@ -73,6 +73,9 @@ const T0 = 1_760_000_000;
 const TOKEN = "extras-owner-token"; // → the seeded owner
 const TOKEN_NEIGHBOR = "extras-neighbor-token"; // → non-writer neighbor
 const TOKEN_OUTSIDER = "extras-outsider-token"; // → uninvolved third party
+const TOKEN_ORG_OWNER = "extras-org-owner-token"; // → the acme-% org family's owner
+const TOKEN_ORG_MEMBER = "extras-org-member-token"; // → its plain member
+const TOKEN_ORG_CREATOR = "extras-org-creator-token"; // → its can-create team member
 const NOW = new Date("2026-02-03T04:05:06Z");
 
 const ENGINE_COMMITS: SeedCommit[] = [
@@ -123,6 +126,10 @@ let ownerId = 0;
 let neighborId = 0;
 let outsiderId = 0;
 let readerId = 0;
+let acmeId = 0;
+let orgOwnerId = 0;
+let plainMemberId = 0;
+let teamCreatorId = 0;
 let engineRepoId = "";
 let storageKey = "";
 let TIP1 = "";
@@ -163,6 +170,9 @@ function resolver(): AuthResolver {
       if (token === TOKEN) return Promise.resolve(identity(ownerId, OWNER));
       if (token === TOKEN_NEIGHBOR) return Promise.resolve(identity(neighborId, "neighbor"));
       if (token === TOKEN_OUTSIDER) return Promise.resolve(identity(outsiderId, "outsider"));
+      if (token === TOKEN_ORG_OWNER) return Promise.resolve(identity(orgOwnerId, "acme-owner"));
+      if (token === TOKEN_ORG_MEMBER) return Promise.resolve(identity(plainMemberId, "acme-member"));
+      if (token === TOKEN_ORG_CREATOR) return Promise.resolve(identity(teamCreatorId, "acme-creator"));
       return Promise.resolve(null);
     },
   };
@@ -284,9 +294,11 @@ async function seedCollaborator(userId: number, mode: "read" | "write" | "admin"
   await drizzle(env.DB).insert(repoCollaborators).values({ repoId: engineRepoId, userId, mode, createdAt: NOW });
 }
 
-/** One pending transfer row. */
-async function seedPendingTransfer(repoId: string, newOwnerId: number): Promise<void> {
-  await drizzle(env.DB).insert(repoTransfer).values({ repoId, doerId: ownerId, newOwnerId, createdAt: NOW });
+/** One pending transfer row; `teamIds` rides the migration-0061 JSON list. */
+async function seedPendingTransfer(repoId: string, newOwnerId: number, teamIds: number[] = []): Promise<void> {
+  await drizzle(env.DB)
+    .insert(repoTransfer)
+    .values({ repoId, doerId: ownerId, newOwnerId, teamIds: JSON.stringify(teamIds), createdAt: NOW });
 }
 
 /** The cell carries the tombstone flag: beginReceive is refused outright
@@ -1228,5 +1240,142 @@ describe("POST .../transfer/accept + /reject (repo-extras-t2)", () => {
     await seedRepoRow("noreject");
     const response = await send(`/repos/${OWNER}/t2-noreject/transfer/reject`, authed({ method: "POST" }, TOKEN_NEIGHBOR));
     expect(response.status).toBe(404);
+  });
+});
+
+// The ORG-bound transfer family (migration-0061): the pending row's
+// newOwnerId is the ORG's row id, so the CanUserAcceptOrRejectTransfer org
+// arm (models/repo/transfer.go:142-160) is what admits a human — owners +
+// can-create members via the landed canCreateOrgRepo seam — and the teams
+// filed on the pending row attach at ACCEPT (services/repository/
+// transfer.go:346-352). Both verdicts + the attach pinned here.
+describe("org-bound transfer admission (CanUserAcceptOrRejectTransfer) + the filed-team attach", () => {
+  let readersTeamId = 0;
+  let allhandsTeamId = 0;
+
+  /** The acme-% family: org, owner, plain member, can-create member, teams.
+   *  Re-seeded per test (users persist across tests; the LIKE-wipe keeps the
+   *  re-run collision-free — the FK cascades clear org_members/teams/
+   *  team_members/team_repo_access with the user rows). */
+  const seedOrgFamily = async () => {
+    await env.DB.prepare("DELETE FROM users WHERE username LIKE 'acme-%'").run();
+    await env.DB.prepare("DELETE FROM team_repo_access WHERE repo_id LIKE 't2-%'").run();
+    acmeId = (
+      await drizzle(env.DB)
+        .insert(users)
+        .values({ username: "acme-org", usernameLower: "acme-org", type: "org", status: "active", createdAt: NOW })
+        .returning({ id: users.id })
+        .all()
+    )[0]!.id;
+    orgOwnerId = (
+      await drizzle(env.DB)
+        .insert(users)
+        .values({ username: "acme-owner", usernameLower: "acme-owner", status: "active", createdAt: NOW })
+        .returning({ id: users.id })
+        .all()
+    )[0]!.id;
+    plainMemberId = (
+      await drizzle(env.DB)
+        .insert(users)
+        .values({ username: "acme-member", usernameLower: "acme-member", status: "active", createdAt: NOW })
+        .returning({ id: users.id })
+        .all()
+    )[0]!.id;
+    teamCreatorId = (
+      await drizzle(env.DB)
+        .insert(users)
+        .values({ username: "acme-creator", usernameLower: "acme-creator", status: "active", createdAt: NOW })
+        .returning({ id: users.id })
+        .all()
+    )[0]!.id;
+    for (const [userId, role] of [
+      [orgOwnerId, "owner"],
+      [plainMemberId, "member"],
+    ] as const) {
+      await env.DB.prepare("INSERT INTO org_members (org_id, user_id, is_public, role, created_at) VALUES (?, ?, 0, ?, ?)")
+        .bind(acmeId, userId, role, Math.floor(NOW.getTime() / 1000))
+        .run();
+    }
+    readersTeamId = (
+      await env.DB.prepare("INSERT INTO teams (org_id, lower_name, name, authorize) VALUES (?, 'readers', 'readers', 'read') RETURNING id")
+        .bind(acmeId)
+        .first<{ id: number }>()
+    )!.id;
+    allhandsTeamId = (
+      await env.DB.prepare("INSERT INTO teams (org_id, lower_name, name, authorize, includes_all_repositories) VALUES (?, 'allhands', 'allhands', 'read', 1) RETURNING id")
+        .bind(acmeId)
+        .first<{ id: number }>()
+    )!.id;
+    const creatorsTeamId = (
+      await env.DB.prepare("INSERT INTO teams (org_id, lower_name, name, authorize, can_create_org_repo) VALUES (?, 'creators', 'creators', 'write', 1) RETURNING id")
+        .bind(acmeId)
+        .first<{ id: number }>()
+    )!.id;
+    await env.DB.prepare("INSERT INTO team_members (org_id, team_id, user_id) VALUES (?, ?, ?)")
+      .bind(acmeId, creatorsTeamId, teamCreatorId)
+      .run();
+  };
+
+  it("an org OWNER (not the filer, not an admin) accepts: 202 + the move + the filed teams attach (addRepositoryToTeam, repo_team.go:40-47)", async () => {
+    await seedOrgFamily();
+    const repoId = await seedRepoRow("orgaccept");
+    await seedPendingTransfer(repoId, acmeId, [readersTeamId, allhandsTeamId, 424242]); // 424242 = vanished team
+    const accepted = await send(`/repos/${OWNER}/t2-orgaccept/transfer/accept`, authed({ method: "POST" }, TOKEN_ORG_OWNER));
+    expect(accepted.status).toBe(202);
+    const body = await accepted.json<{ owner: { login: string }; name: string }>();
+    expect(body.owner.login).toBe("acme-org"); // the moved Repository's owner is the ORG
+    expect(body.name).toBe("t2-orgaccept");
+    expect(await drizzle(env.DB).select().from(repoTransfer).all()).toHaveLength(0);
+
+    // The attach: the plain team materializes + its num_repos charges; the
+    // includes-all team stays UNMATERIALIZED (coverage is the dynamic union,
+    // the landed addTeamRepo reduction); the vanished id drops silently.
+    const grants = await drizzle(env.DB).select({ teamId: teamRepoAccess.teamId }).from(teamRepoAccess).all();
+    expect(grants.map((g) => g.teamId)).toEqual([readersTeamId]);
+    expect((await drizzle(env.DB).select({ numRepos: teams.numRepos }).from(teams).where(eq(teams.id, readersTeamId)).get())?.numRepos).toBe(1);
+    expect((await drizzle(env.DB).select({ numRepos: teams.numRepos }).from(teams).where(eq(teams.id, allhandsTeamId)).get())?.numRepos).toBe(0);
+  });
+
+  it("a plain org member is refused for BOTH verdicts: 403 with upstream's ErrPermissionDenied text", async () => {
+    await seedOrgFamily();
+    const repoId = await seedRepoRow("orgmember");
+    await seedPendingTransfer(repoId, acmeId, [readersTeamId]);
+    expect(
+      (await send(`/repos/${OWNER}/t2-orgmember/transfer/accept`, authed({ method: "POST" }, TOKEN_ORG_MEMBER))).status,
+    ).toBe(403);
+    expect(
+      (await send(`/repos/${OWNER}/t2-orgmember/transfer/reject`, authed({ method: "POST" }, TOKEN_ORG_MEMBER))).status,
+    ).toBe(403);
+    const refused403 = await send(`/repos/${OWNER}/t2-orgmember/transfer/accept`, authed({ method: "POST" }, TOKEN_ORG_MEMBER));
+    expect(await refused403.json<{ message: string }>()).toMatchObject({ message: "permission denied" });
+    // The pending row survived both refusals.
+    expect(await drizzle(env.DB).select().from(repoTransfer).all()).toHaveLength(1);
+  });
+
+  it("a can-create team member accepts (the CanCreateOrgRepo team arm — repo creation grants the verdict, not ownership)", async () => {
+    await seedOrgFamily();
+    const repoId = await seedRepoRow("orgcreator");
+    await seedPendingTransfer(repoId, acmeId);
+    const accepted = await send(`/repos/${OWNER}/t2-orgcreator/transfer/accept`, authed({ method: "POST" }, TOKEN_ORG_CREATOR));
+    expect(accepted.status).toBe(202);
+    expect(await accepted.json<{ owner: { login: string } }>()).toMatchObject({ owner: { login: "acme-org" } });
+    expect(await drizzle(env.DB).select().from(repoTransfer).all()).toHaveLength(0);
+  });
+
+  it("reject: the org owner 200s with the untouched Repository + the row gone; the filer stays ineligible", async () => {
+    await seedOrgFamily();
+    const repoId = await seedRepoRow("orgreject");
+    await seedPendingTransfer(repoId, acmeId);
+    // The repo OWNER (the filer here) is NOT upstream-eligible — the asymmetry
+    // note in the old user-recipient test generalizes to org recipients.
+    expect(
+      (await send(`/repos/${OWNER}/t2-orgreject/transfer/reject`, authed({ method: "POST" }, TOKEN))).status,
+    ).toBe(403);
+    const rejected = await send(`/repos/${OWNER}/t2-orgreject/transfer/reject`, authed({ method: "POST" }, TOKEN_ORG_OWNER));
+    expect(rejected.status).toBe(200);
+    const body = await rejected.json<{ owner: { login: string }; name: string }>();
+    expect(body.owner.login).toBe(OWNER); // untouched by the reject
+    expect(body.name).toBe("t2-orgreject");
+    expect(await drizzle(env.DB).select().from(repoTransfer).all()).toHaveLength(0);
   });
 });

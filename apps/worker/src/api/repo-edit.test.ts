@@ -921,6 +921,24 @@ describe("DELETE /repos/{owner}/{repo} (repoDelete)", () => {
 });
 
 describe("POST /repos/{owner}/{repo}/transfer (repoTransfer)", () => {
+  /** An org owner row (users.type='org'); users are wiped per-test above. */
+  const seedOrgRow = async (name: string): Promise<number> => {
+    const org = await drizzle(env.DB)
+      .insert(users)
+      .values({ username: name, usernameLower: name.toLowerCase(), type: "org", status: "active", createdAt: new Date() })
+      .returning({ id: users.id })
+      .all();
+    return org[0]!.id;
+  };
+
+  /** One team row in the org; returns its global id. */
+  const seedTeamRow = async (orgId: number, name: string): Promise<number> => {
+    const team = await env.DB.prepare("INSERT INTO teams (org_id, lower_name, name, authorize) VALUES (?, ?, ?, 'read') RETURNING id")
+      .bind(orgId, name.toLowerCase(), name)
+      .first<{ id: number }>();
+    return team!.id;
+  };
+
   it("files a pending transfer and answers 201 with the CURRENT Repository (the pin's pending arm, transfer.go:126-130)", async () => {
     const res = await makeApp()(`${repoPath}/transfer`, {
       method: "POST",
@@ -978,12 +996,54 @@ describe("POST /repos/{owner}/{repo}/transfer (repoTransfer)", () => {
     expect(await res.json()).toEqual({ message: "The new owner does not exist or cannot be found", url: ERROR_URL });
   });
 
-  it("422s a self-transfer and a team_ids payload", async () => {
+  it("422s a self-transfer", async () => {
     const self = await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "cf-gitea-stub" }) });
     expect(self.status).toBe(422);
-    const teams = await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "other", team_ids: [5] }) });
-    expect(teams.status).toBe(422);
-    expect((await teams.json<Record<string, unknown>>()).message).toBe("team 5 not found");
+  });
+
+  // The team ladder (transfer.go:76-98). Arm one: a PRESENT team_ids list on
+  // a USER target 422s verbatim BEFORE any team lookup — the Go pointer
+  // semantics (`*opts.TeamIDs != nil`) make an EMPTY array present too; only
+  // an omitted field (or schema-rejected `null`) skips the ladder.
+  it("422s team_ids against a user target verbatim (transfer.go:78-80) — empty array present too, no row filed", async () => {
+    for (const team_ids of [[5], []]) {
+      const res = await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "other", team_ids }) });
+      expect(res.status).toBe(422);
+      expect((await res.json<Record<string, unknown>>()).message).toBe(
+        "Teams can only be added to organization-owned repositories",
+      );
+    }
+    expect(await drizzle(env.DB).select().from(repoTransfer).all()).toHaveLength(0);
+  });
+
+  it("422s an unknown team id against an org target verbatim (transfer.go:84-88)", async () => {
+    const orgId = await seedOrgRow("acme");
+    const res = await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "acme", team_ids: [orgId] }) });
+    expect(res.status).toBe(422);
+    expect((await res.json<Record<string, unknown>>()).message).toBe(`team ${orgId} not found`);
+  });
+
+  it("403s a wrong-org team id verbatim (transfer.go:91-93) — the message carries the team id AND the recipient org's row id", async () => {
+    const acmeId = await seedOrgRow("acme");
+    const otherOrgId = await seedOrgRow("strays-org");
+    const strayTeamId = await seedTeamRow(otherOrgId, "strays");
+    const res = await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "acme", team_ids: [strayTeamId] }) });
+    expect(res.status).toBe(403);
+    expect((await res.json<Record<string, unknown>>()).message).toBe(`team ${strayTeamId} belongs not to org ${acmeId}`);
+    expect(await drizzle(env.DB).select().from(repoTransfer).all()).toHaveLength(0);
+  });
+
+  it("files valid team ids: 201 + the pending row carries the JSON list + the current-Repository shape (the pending arm)", async () => {
+    const acmeId = await seedOrgRow("acme");
+    const t1 = await seedTeamRow(acmeId, "readers");
+    const t2 = await seedTeamRow(acmeId, "writers");
+    const res = await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "acme", team_ids: [t1, t2] }) });
+    expect(res.status).toBe(201);
+    expect(await res.json<Record<string, unknown>>()).toMatchObject({ full_name: "cf-gitea-stub/edit-me" }); // not applied yet
+    const pending = await drizzle(env.DB).select().from(repoTransfer).all();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.newOwnerId).toBe(acmeId);
+    expect(JSON.parse(pending[0]!.teamIds)).toEqual([t1, t2]);
   });
 
   it("403s a caller without the danger-zone grant", async () => {

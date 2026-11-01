@@ -350,12 +350,59 @@ describe("milestones (§3.2 basics)", () => {
     const closed = await svc.updateMilestone(ms.id, { state: "closed" });
     expect(closed.isClosed).toBe(true);
     expect(closed.closedDateAt).not.toBeNull();
+    expect((await repoRow(repoId)).numClosedMilestones).toBe(1); // the flip recount
 
     expect(await svc.deleteMilestone(ms.id)).toBe(true);
     expect(await svc.getMilestone(ms.id)).toBeNull();
     const unlinked = await svc.getIssueById(issue.id);
     expect(unlinked?.milestoneId).toBeNull();
     expect((await repoRow(repoId)).numMilestones).toBe(0);
+    // A CLOSED milestone's death drops the closed tally with it
+    // (DeleteMilestoneByRepoID's post-delete recount).
+    expect((await repoRow(repoId)).numClosedMilestones).toBe(0);
+  });
+
+  it("num_closed_milestones rides upstream's maintenance points: flip recounts, delete recounts, create leaves it, drift heals (updateRepoMilestoneNum, milestone.go:165/:250/:283-305)", async () => {
+    const repoId = await seedRepo();
+    const svc = service();
+    const a = await svc.createMilestone({ repoId, name: "a" });
+    const b = await svc.createMilestone({ repoId, name: "b" });
+    // Creation is INCREMENTAL upstream (NewMilestone bumps num_milestones
+    // only, :109-122) — a fresh milestone is open, the closed tally stays 0.
+    expect((await repoRow(repoId)).numMilestones).toBe(2);
+    expect((await repoRow(repoId)).numClosedMilestones).toBe(0);
+
+    await svc.updateMilestone(a.id, { state: "closed" });
+    expect((await repoRow(repoId)).numClosedMilestones).toBe(1);
+    // A no-state edit (rename) fires no repo recount — the tally is untouched.
+    await svc.updateMilestone(b.id, { name: "b2" });
+    expect((await repoRow(repoId)).numClosedMilestones).toBe(1);
+
+    await svc.updateMilestone(a.id, { state: "open" }); // reopen drops it back
+    expect((await repoRow(repoId)).numClosedMilestones).toBe(0);
+
+    // The delete recount: a CLOSED milestone's death drops the tally, an
+    // open one leaves it alone.
+    await svc.updateMilestone(a.id, { state: "closed" });
+    await svc.deleteMilestone(b.id);
+    expect((await repoRow(repoId)).numClosedMilestones).toBe(1);
+    expect((await repoRow(repoId)).numMilestones).toBe(1);
+
+    // Repo-scoped: another repo's closed milestones never leak in.
+    const other = await seedRepo();
+    const foreign = await svc.createMilestone({ repoId: other, name: "foreign" });
+    await svc.updateMilestone(foreign.id, { state: "closed" });
+    expect((await repoRow(repoId)).numClosedMilestones).toBe(1);
+    expect((await repoRow(other)).numClosedMilestones).toBe(1);
+
+    // Drift heals on the next flip — the recount carries BOTH tallies
+    // (upstream's updateRepoMilestoneNum shape, not ±1 increments).
+    await env.DB.prepare("UPDATE repositories SET num_milestones = 99, num_closed_milestones = 99 WHERE id = ?")
+      .bind(repoId)
+      .run();
+    await svc.updateMilestone(a.id, { state: "open" });
+    expect((await repoRow(repoId)).numMilestones).toBe(1);
+    expect((await repoRow(repoId)).numClosedMilestones).toBe(0);
   });
 
   it("rejects a milestone from another repo at issue creation", async () => {
