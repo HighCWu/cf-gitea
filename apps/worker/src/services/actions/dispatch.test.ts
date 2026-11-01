@@ -4,7 +4,11 @@
  * layer), the fork-PR secret suppression, the payload-assembly release path,
  * needs resolution, and the insert seam's version bump — plus the
  * claim-window battery: a terminal stopTask finalizes the job's stranded
- * (crash-orphaned) tasks and carries the upstream StopTask piggybacks.
+ * (crash-orphaned) tasks and carries the upstream StopTask piggybacks. The
+ * claim's own commit-status post (task.go:113-115, the U14 ledgered
+ * residual) pins: the row exists at claim, before any report; the release
+ * paths never post ahead of it; the disconnect release posts first and the
+ * re-pick dedupes.
  */
 
 import { applyD1Migrations } from "cloudflare:test";
@@ -17,8 +21,10 @@ import {
   actionLogChunks,
   actionRunJobs,
   actionRunners,
+  actionRuns,
   actionTasks,
   actionTasksVersions,
+  commitStatuses,
   protectedBranches,
   repositories,
   repoUnits,
@@ -116,7 +122,7 @@ async function seed(options: { runsOn?: string[]; forkPullRequest?: boolean } = 
       event: "pull_request",
       eventPayload: JSON.stringify({
         number: 7,
-        pull_request: { base: { ref: "main", sha: "d".repeat(40) }, head: { ref: "feature" } },
+        pull_request: { base: { ref: "main", sha: "d".repeat(40) }, head: { ref: "feature", sha: "e".repeat(40) } },
       }),
       triggerEvent: "pull_request",
       ...(options.forkPullRequest === true ? {} : {}),
@@ -189,7 +195,7 @@ describe("the claim + payload path", () => {
     // base/head refs ride the event payload (context.go:43-58).
     expect(context.base_ref).toBe("main");
     expect(context.head_ref).toBe("feature");
-    expect(context.event).toEqual({ number: 7, pull_request: { base: { ref: "main", sha: "d".repeat(40) }, head: { ref: "feature" } } });
+    expect(context.event).toEqual({ number: 7, pull_request: { base: { ref: "main", sha: "d".repeat(40) }, head: { ref: "feature", sha: "e".repeat(40) } } });
     // workflow_payload served verbatim at M1a (the if:always() rewrite is M3).
     expect(new TextDecoder().decode(claimed.workflowPayload)).toContain("jobs:");
   });
@@ -330,6 +336,58 @@ describe("the claim + payload path", () => {
     // The waiting job bumps all three scopes.
     const rows = await db().select().from(actionTasksVersions);
     expect(rows).toHaveLength(3);
+  });
+});
+
+describe("the claim's own status post (task.go:113-115, the U14 residual)", () => {
+  it("a claimed task's commit status row exists before any report", async () => {
+    const seedInfo = await seed();
+    const { task } = await fetchTask(env, env.DB, seedInfo.runner, 0, "https://example.com/");
+    expect(task).toBeDefined(); // the claim happened; no UpdateTask ever ran
+
+    const run = (await db().select().from(actionRuns))[0];
+    const job = (await db().select().from(actionRunJobs).where(eq(actionRunJobs.jobId, "build")))[0];
+    const rows = await db().select().from(commitStatuses).where(eq(commitStatuses.repoId, "repo-disp"));
+    expect(rows).toHaveLength(1);
+    const row = rows[0];
+    // The RUNNING claim maps into the pending family at "In progress"
+    // (commit_status.go:363/:342-343) under the workflow context name; the
+    // commit id is the PR head sha out of the event payload (commit_status.go:118).
+    expect(row?.context).toBe("ci / build (pull_request)");
+    expect(row?.state).toBe("pending");
+    expect(row?.description).toBe("In progress");
+    expect(row?.sha).toBe("e".repeat(40));
+    expect(row?.targetUrl).toBe(`https://example.com/disp/repo/actions/runs/${run?.id}/jobs/${job?.id}`);
+    expect(row?.creatorId).toBe(-2); // the Actions system doer
+  });
+
+  it("an assembly failure releases the claim before any status posts (task.go:105-112 precedes :115)", async () => {
+    const seedInfo = await seed();
+    // Sabotage the run row so buildRunnerTask cannot assemble: the claim
+    // releases (the payload-assembly pin) and NO status row may exist — the
+    // post only rides a successful assembly.
+    await db().delete(actionRuns);
+    await expect(fetchTask(env, env.DB, seedInfo.runner, 0, "https://example.com/")).rejects.toThrow(/vanished/);
+    expect(await db().select().from(commitStatuses)).toHaveLength(0);
+  });
+
+  it("the disconnect release posts first — the re-pick's identical context dedupes to one row", async () => {
+    const seedInfo = await seed();
+    const controller = new AbortController();
+    controller.abort(); // the client hung up during the pick
+
+    const { task } = await fetchTask(env, env.DB, seedInfo.runner, 0, "https://example.com/", controller.signal);
+    expect(task).toBeUndefined();
+    // Upstream's ordering: the post (task.go:115) precedes the ctx.Err()
+    // release (:123-128), so the row exists even though the claim was undone.
+    expect(await db().select().from(commitStatuses)).toHaveLength(1);
+
+    // The re-pick claims the released job and posts the identical RUNNING
+    // context — the identical-state short-circuit (commit_status.go:303-309
+    // via createWorkflowCommitStatus) keeps exactly one row.
+    const second = await fetchTask(env, env.DB, seedInfo.runner, 0, "https://example.com/");
+    expect(second.task).toBeDefined();
+    expect(await db().select().from(commitStatuses)).toHaveLength(1);
   });
 });
 

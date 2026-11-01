@@ -372,8 +372,12 @@ export type EditRepoOption = z.infer<typeof editRepoOptionSchema>;
 /**
  * Mirror of the vendored contract's `TransferRepoOption`
  * (#/definitions/TransferRepoOption) — `new_owner` is the one required field.
- * `team_ids` is accepted per shape; teams land with SPEC-0007 (the route
- * answers the upstream `team %d not found` 422 while none exist).
+ * `team_ids` rides the landed team ladder (7f2ecd3, the SPEC-0007 team
+ * surface): the route validates per upstream transfer.go:79-101 — a list on
+ * a non-org target answers the `Teams can only be added to
+ * organization-owned repositories` 422, an unknown id the `team %d not
+ * found` 422, and a team from another org the `team %d belongs not to org
+ * %d` 403 — and the valid ids attach to the pending transfer at accept.
  */
 export const transferRepoOptionSchema = z.object({
   new_owner: z.string().openapi({ description: "The new owner's name" }),

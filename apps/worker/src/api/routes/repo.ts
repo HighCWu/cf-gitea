@@ -3,10 +3,10 @@ import type { OpenAPIHono } from "@hono/zod-openapi";
 import type { MiddlewareHandler } from "hono";
 import { z } from "zod";
 
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { repositories, teams } from "../../db/schema";
+import { orgMembers, repositories, teams } from "../../db/schema";
 import {
   OwnerNotAssignableError,
   RepoNameCollisionError,
@@ -830,6 +830,25 @@ export function registerRepoRoutes(
       if (target === null) {
         throw new ApiError(404, "The new owner does not exist or cannot be found");
       }
+      // The PRIVATE-org anti-enumeration arm (routers/api/v1/repo/transfer.go:
+      // 71-77): a transfer into an org the doer "shouldn't know about" answers
+      // the SAME missing-owner 404. Upstream's exact conjunction — org-typed
+      // target, doer NOT a site admin, org visibility == VisibleTypePrivate
+      // (a LIMITED org's existence is semi-public upstream and passes), doer
+      // NOT an org member (HasMemberWithUserID — any org_members row, role
+      // unexamined). It runs BEFORE the team ladder upstream (:71 vs :79), so
+      // an outsider cannot probe org existence through the team arms either.
+      const requester = c.get("authUser");
+      if (target.type === "org" && requester.is_admin !== true && target.visibility === "private") {
+        const membership = await drizzle(c.env.DB)
+          .select({ id: orgMembers.id })
+          .from(orgMembers)
+          .where(and(eq(orgMembers.orgId, target.id), eq(orgMembers.userId, requester.id ?? 0)))
+          .limit(1);
+        if (membership.length === 0) {
+          throw new ApiError(404, "The new owner does not exist or cannot be found");
+        }
+      }
       // The team ladder (transfer.go:76-98), verbatim — a `team_ids` list
       // (PRESENT per the Go `*opts.TeamIDs != nil` pointer semantics: an
       // empty array is present too, a bare `null` is schema-rejected before
@@ -870,7 +889,7 @@ export function registerRepoRoutes(
       // OwnerNotAssignableError 422 below (upstream's direct arm would
       // transfer back silently — the landed self-transfer 422 divergence
       // stands), so neither reaches the probe, exactly like upstream.
-      const requester = c.get("authUser");
+      // (`requester` was read above — the anti-enumeration arm shares it.)
       const doerIsAdmin = requester.is_admin === true;
       if (!doerIsAdmin && found.repo.ownerId !== target.id) {
         const doerBlockedByNewOwner = await isUserBlockedBy(

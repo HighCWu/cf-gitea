@@ -17,6 +17,12 @@
  *   - step rows: none inserted at claim (upstream parses them from the
  *     workflow payload via actionslib — the S/E tier's model rows);
  *     runner-REPORTED steps arrive through M1b's UpdateTask.
+ *
+ * The claim path's OWN commit-status post (task.go:113-115, the U14
+ * ledgered residual) LANDED: pickTask posts the claimed job's RUNNING
+ * status right after payload assembly — before the disconnect check and
+ * before any runner report — via the landed createWorkflowCommitStatus
+ * seam (./postClaimCommitStatus for the composition note).
  */
 
 import { and, eq } from "drizzle-orm";
@@ -52,7 +58,13 @@ import {
 } from "./model";
 import { taskAllowsOidcToken } from "./oidc";
 import { createAuthorizationToken, oidcIssuer, signActionsClaims } from "./secrets";
-import { runnerWorkflowPayload } from "./trigger";
+import {
+  commitStatusEventAndCommit,
+  createWorkflowCommitStatus,
+  runnerWorkflowPayload,
+  workflowDisplayName,
+  workflowStatusContextName,
+} from "./trigger";
 import type { Task, TaskNeed } from "./wire";
 
 /** The D1/database binding spelling shared by the service functions. */
@@ -207,7 +219,15 @@ async function pickTask(env: Env, d1: D1, runner: RunnerRow, appUrl: string, sig
   }
 
   try {
-    const task = await buildRunnerTask(env, d1, claimed, appUrl);
+    const assembled = await buildRunnerTask(env, d1, claimed, appUrl);
+    // The claim path's own status post (task.go:115): upstream calls
+    // CreateCommitStatusForRunJobs(ctx, job.Run, job) right here — after
+    // payload assembly, BEFORE the ctx.Err() disconnect check — so the
+    // claimed RUNNING job has its commit status the moment it is picked,
+    // not on the first report. The disconnect-release re-pick re-posts the
+    // identical pending context and createWorkflowCommitStatus's
+    // identical-state short-circuit absorbs the duplicate.
+    await postClaimCommitStatus(d1, assembled.ctx, appUrl);
     // The disconnect check (task.go:123-128): the job was claimed and its
     // payload assembled, but if the request died meanwhile the response can
     // no longer reach the runner — release the claim so another poll picks
@@ -219,7 +239,7 @@ async function pickTask(env: Env, d1: D1, runner: RunnerRow, appUrl: string, sig
       await releaseTaskForRunner(d1, claimed, claimed.job);
       return null;
     }
-    return task;
+    return assembled.task;
   } catch (err) {
     // The job was claimed but the payload failed: release the claim so the
     // job returns to the waiting queue (task.go:108-112, ReleaseTaskForRunner).
@@ -332,9 +352,12 @@ interface ClaimContext {
 /**
  * The full claim payload (buildRunnerTask): Task{id, workflow_payload,
  * context, secrets, vars, needs}. Assembly failures propagate so the caller
- * releases the claim.
+ * releases the claim. The DB rows re-read here (fresh post-CAS truth) ride
+ * back as the ClaimContext so the caller's status post sees the claimed
+ * job exactly upstream's PickTask sees `job` out of buildRunnerTask
+ * (task.go:105-116).
  */
-async function buildRunnerTask(env: Env, d1: D1, claimed: ClaimedTask, appUrl: string): Promise<Task> {
+async function buildRunnerTask(env: Env, d1: D1, claimed: ClaimedTask, appUrl: string): Promise<{ task: Task; ctx: ClaimContext }> {
   const db = drizzle(d1);
   const jobRows = await db.select().from(actionRunJobs).where(eq(actionRunJobs.id, claimed.jobId)).limit(1);
   const job = jobRows[0];
@@ -358,18 +381,68 @@ async function buildRunnerTask(env: Env, d1: D1, claimed: ClaimedTask, appUrl: s
   ]);
 
   return {
-    id: claimed.id,
-    // task.go:176-186 (runnerWorkflowPayload): the job `if:` forced to the
-    // literal `always()` — "as Gitea has decided it and a runner must not
-    // re-evaluate it" (SPEC-0012 §2.3 + the M3 P-tier row). The M1a stage
-    // served the stored bytes verbatim (the module header's resolved note).
-    workflowPayload: runnerWorkflowPayload(asBytes(job.workflowPayload)),
-    context,
-    secrets,
-    machine: "",
-    needs,
-    vars,
+    task: {
+      id: claimed.id,
+      // task.go:176-186 (runnerWorkflowPayload): the job `if:` forced to the
+      // literal `always()` — "as Gitea has decided it and a runner must not
+      // re-evaluate it" (SPEC-0012 §2.3 + the M3 P-tier row). The M1a stage
+      // served the stored bytes verbatim (the module header's resolved note).
+      workflowPayload: runnerWorkflowPayload(asBytes(job.workflowPayload)),
+      context,
+      secrets,
+      machine: "",
+      needs,
+      vars,
+    },
+    ctx,
   };
+}
+
+/**
+ * CreateCommitStatusForRunJobs at the claim site (task.go:115 via
+ * commit_status.go:31-72 → createCommitStatus): the claimed job's RUNNING
+ * status gets its commit status row the moment it is picked. The seam is
+ * composed from trigger.ts's exported pieces (commitStatusEventAndCommit +
+ * the createWorkflowCommitStatus writer) rather than its
+ * createCommitStatusForRunJobs wrapper because that wrapper's status tables
+ * (toCommitStatus / toCommitStatusDescription) predate RUNNING callers —
+ * "the v1 rows this module writes never hold them at status-creation time".
+ * The claim post is the first caller that holds one, so the RUNNING mapping
+ * lands here, exactly upstream: RUNNING rides the pending family
+ * (commit_status.go:363) and reads "In progress" (:342-343). The
+ * pendingFilter arm (commit_status.go:56-59) is nil at claim — it arms only
+ * for pending jobs — so onlyReplace is always false. Upstream's caller is
+ * log-only ("it won't return an error … it's not critical",
+ * commit_status.go:30): a failed post must never fail the pick, so this
+ * swallows and logs.
+ */
+async function postClaimCommitStatus(d1: D1, ctx: ClaimContext, appUrl: string): Promise<void> {
+  try {
+    // Cron runs never post (commit_status.go:33-35); an unsupported event or
+    // a payload missing its commit id posts nothing (:41-43).
+    if (ctx.run.scheduleId !== 0) return;
+    const { event, commitId } = commitStatusEventAndCommit(ctx.run, ctx.run.eventPayload);
+    if (event === "" || commitId === "") return;
+
+    const displayName = workflowDisplayName(ctx.run.workflowId, new TextDecoder().decode(asBytes(ctx.job.workflowPayload)));
+    const ctxName = workflowStatusContextName(displayName, ctx.job.name, event);
+    // The target URL rides this module's appUrl convention (routes'
+    // appUrlOf — origin plus trailing slash, upstream AppURL's own shape):
+    // run.Link() + "/jobs/{id}" (commit_status.go:150) with no extra slash.
+    const targetUrl = `${appUrl}${ctx.repo?.ownerNamespace ?? ""}/${ctx.repo?.slug ?? ""}/actions/runs/${ctx.run.id}/jobs/${ctx.job.id}`;
+    await createWorkflowCommitStatus(d1, {
+      repoId: ctx.run.repoId,
+      commitId,
+      ctxName,
+      workflowId: ctx.run.workflowId,
+      state: "pending", // toCommitStatus(StatusRunning) — commit_status.go:363
+      targetUrl,
+      description: "In progress", // toCommitStatusDescription(StatusRunning) — :342-343
+      onlyReplace: false,
+    });
+  } catch (err) {
+    console.error(`[actions-dispatch] claim status post failed for job ${ctx.job.id}: ${String(err)}`);
+  }
 }
 
 /** git.RefName ShortName/RefType (context.go:60-64). */

@@ -9,8 +9,9 @@
  * invalid name), the admin/danger-zone 403s, the §2.5.5 DELETE (D1 row +
  * this batch's raw stores gone), and the pending-arm 201 transfer
  * (transfer.go:126-130 — 201 with the current-state Repository + the pending
- * repo_transfer row; the anti-enumeration 404 unknown-owner message,
- * self-transfer 422, teams 422).
+ * repo_transfer row; the anti-enumeration 404 unknown-owner message and the
+ * private-org invisible-target arm (transfer.go:71-77), self-transfer 422,
+ * teams 422).
  */
 
 import { SELF } from "cloudflare:test";
@@ -20,7 +21,7 @@ import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { repoRedirects, repoTransfer, repoUnits, repoWatchers, repositories, stars, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
+import { orgMembers, repoRedirects, repoTransfer, repoUnits, repoWatchers, repositories, stars, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
 import {
   createOptionalTokenAuthMiddleware,
   createStubAuthResolver,
@@ -994,6 +995,67 @@ describe("POST /repos/{owner}/{repo}/transfer (repoTransfer)", () => {
     const res = await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "nobody" }) });
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ message: "The new owner does not exist or cannot be found", url: ERROR_URL });
+  });
+
+  // The PRIVATE-org anti-enumeration arm (routers/api/v1/repo/transfer.go:
+  // 71-77): a transfer into an org the doer "shouldn't know about" answers
+  // the SAME missing-owner 404. Upstream's exact conjunction — org-typed
+  // target, doer NOT a site admin, visibility == VisibleTypePrivate (LIMITED
+  // passes: a limited org's existence is semi-public upstream), and no
+  // org_members row (HasMemberWithUserID exempts ANY membership, role
+  // unexamined). It precedes the team ladder upstream (:71 vs :79), so an
+  // outsider cannot probe org existence through the team arms either.
+  it("404s a transfer into a PRIVATE org the doer is not a member of (transfer.go:71-77) — the missing-owner message, no row", async () => {
+    const acmeId = await seedOrgRow("acme");
+    await drizzle(env.DB).update(users).set({ visibility: "private" }).where(eq(users.id, acmeId));
+    const res = await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "acme" }) });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ message: "The new owner does not exist or cannot be found", url: ERROR_URL });
+    expect(await drizzle(env.DB).select().from(repoTransfer).all()).toHaveLength(0);
+  });
+
+  it("the private-org arm PRECEDES the team ladder — team_ids against an invisible org answers 404, not the team 422", async () => {
+    const acmeId = await seedOrgRow("acme");
+    await drizzle(env.DB).update(users).set({ visibility: "private" }).where(eq(users.id, acmeId));
+    const res = await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "acme", team_ids: [999999] }) });
+    expect(res.status).toBe(404);
+    expect(await drizzle(env.DB).select().from(repoTransfer).all()).toHaveLength(0);
+  });
+
+  it("a PRIVATE org proceeds for an org member (HasMemberWithUserID exempts — any role)", async () => {
+    const acmeId = await seedOrgRow("acme");
+    await drizzle(env.DB).update(users).set({ visibility: "private" }).where(eq(users.id, acmeId));
+    await drizzle(env.DB).insert(orgMembers).values({ orgId: acmeId, userId: 1, isPublic: false, role: "member", createdAt: new Date() }).all();
+    const res = await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "acme" }) });
+    expect(res.status).toBe(201);
+    expect((await drizzle(env.DB).select().from(repoTransfer).all())[0]?.newOwnerId).toBe(acmeId);
+  });
+
+  it("a PRIVATE org proceeds for a site-admin doer (upstream's !ctx.Doer.IsAdmin exemption — no membership needed)", async () => {
+    const acmeId = await seedOrgRow("acme");
+    await drizzle(env.DB).update(users).set({ visibility: "private" }).where(eq(users.id, acmeId));
+    const res = await makeApp()(`${repoPath}/transfer`, {
+      method: "POST",
+      headers: { Authorization: `token ${TOKEN_ADMIN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ new_owner: "acme" }),
+    });
+    expect(res.status).toBe(201);
+    expect((await drizzle(env.DB).select().from(repoTransfer).all())[0]?.newOwnerId).toBe(acmeId);
+  });
+
+  it("a LIMITED org passes the arm for a non-member doer (upstream's VisibleTypePrivate exactness)", async () => {
+    const acmeId = await seedOrgRow("acme");
+    await drizzle(env.DB).update(users).set({ visibility: "limited" }).where(eq(users.id, acmeId));
+    const res = await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "acme" }) });
+    expect(res.status).toBe(201);
+    expect((await drizzle(env.DB).select().from(repoTransfer).all())[0]?.newOwnerId).toBe(acmeId);
+  });
+
+  it("a PUBLIC org proceeds for any danger-zone-granted doer (the arm stays silent)", async () => {
+    const acmeId = await seedOrgRow("acme"); // users.visibility defaults 'public'
+    const res = await makeApp()(`${repoPath}/transfer`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ new_owner: "acme" }) });
+    expect(res.status).toBe(201);
+    expect((await drizzle(env.DB).select().from(repoTransfer).all())[0]?.newOwnerId).toBe(acmeId);
   });
 
   it("422s a self-transfer", async () => {
