@@ -8,11 +8,11 @@
  *     deeper/bare tails stay unclaimed (the `-` namespace's disjoint
  *     literals — the ae32b1a rule the census's Open Issues #8 cites);
  *   - the web PAIR shape: `[[unixTs, count]...]` + `totalContributions` —
- *     NOT the API's `[{timestamp, contributions}]` objects (heatmap.go:22-30
+ *     NOT the API's `[{timestamp, contributions}]` objects (heatmap.go:36-47
  *     vs routers/api/v1/user/user.go:138-161), with the 900-second bucket
  *     arithmetic pinned on a seeded pair (two rows in one bucket → one pair
  *     of count 2) and the out-of-window row excluded;
- *   - the `IsUserVisibleToViewer` gate (heatmap.go:38-44): a private
+ *   - the `IsUserVisibleToViewer` gate (heatmap.go:55-60): a private
  *     subject 404-shells anonymous and 200s for themself and a site admin;
  *     a public subject answers anonymous;
  *   - a renamed user 307s (the profile seam's redirect arm); an org name
@@ -194,7 +194,7 @@ describe("the web pair shape (writeHeatmapJSON's port)", () => {
 
 // --- the visibility gate ----------------------------------------------------------
 
-describe("the IsUserVisibleToViewer gate (heatmap.go:38-44)", () => {
+describe("the IsUserVisibleToViewer gate (heatmap.go:55-60)", () => {
   it("404-shells a private subject anonymous, and answers themself and a site admin", async () => {
     const anon = await fetchUi("/hm-private/-/heatmap");
     expect(anon.status).toBe(404);

@@ -32,8 +32,11 @@ import {
   pullReviews,
   releaseAssets,
   releases,
-  repositories,
+  repoCounters,
   repoMirrors,
+  repoSettings,
+  repoUnits,
+  repositories,
   teams,
   users,
 } from "../../db/schema";
@@ -583,6 +586,22 @@ async function seedGoldenCompare(): Promise<void> {
  * Idempotent: the org lookup gates the whole block (org creation arbitrates
  * the shared username namespace — re-running would collide, not converge).
  */
+/**
+ * §5.2 determinism pins for the acme repos whose ids RENDER on a committed
+ * golden: U1's team action forms carry `repo.id` in the per-repo remove
+ * form's `repoid` value (org-teams.tsx:810, upstream repositories.tmpl:45-49),
+ * and RepoService.create mints `crypto.randomUUID()` at insert
+ * (repos/service.ts:387) — without the pin the org-team-detail golden is red
+ * on every run by construction. Same family as the fixed-id fixture repo's
+ * `00000000-…-0001` (seed-repo.ts's ensureSeededFixedIdRepo, the
+ * webhookDeliveries fixed-uuid precedent). `rocket-skates` renders nowhere
+ * and stays service-minted.
+ */
+const FIXED_ORG_REPO_IDS: Record<string, string> = {
+  anvil: "00000000-0000-4000-8000-0000000000a1",
+  "bird-seed": "00000000-0000-4000-8000-0000000000a2",
+};
+
 async function seedGoldenOrg(): Promise<void> {
   const orgs = new OrgService(env.DB);
   if ((await orgs.getOrgByUsername("acme")) !== null) return;
@@ -614,12 +633,36 @@ async function seedGoldenOrg(): Promise<void> {
       isPrivate: repo.isPrivate,
       status: "ready",
     });
+    // The id pin (FIXED_ORG_REPO_IDS above): the precedent (ensureSeededFixedIdRepo)
+    // inserts directly, but anvil is engine-backed (seedGoldenTeamWriter pushes
+    // content), so the pin rides the service create and moves the id-keyed
+    // children with it. The SPEC's single FK (repo_counters.repo_id →
+    // repositories.id, schema.ts:420) cannot hold a mid-pin orphan and SQLite
+    // checks it immediately, so the counters row (born at issueIndex 0 — the
+    // value is unchanged) is re-created AFTER the parent flip; repo_settings /
+    // repo_units carry no FK and follow by UPDATE so the later
+    // saveRepoSettings/settings reads bind to the pinned id. audit_events'
+    // scope_id keeps the minted value (historical metadata; no committed
+    // golden renders acme repos' audit trail).
+    const pinnedId = FIXED_ORG_REPO_IDS[repo.slug];
+    const repoId = pinnedId ?? row.id;
+    if (pinnedId !== undefined) {
+      const db = drizzle(env.DB);
+      await db.delete(repoCounters).where(eq(repoCounters.repoId, row.id));
+      await db.update(repoSettings).set({ repoId: pinnedId }).where(eq(repoSettings.repoId, row.id));
+      await db.update(repoUnits).set({ repoId: pinnedId }).where(eq(repoUnits.repoId, row.id));
+      await db
+        .update(repositories)
+        .set({ id: pinnedId, storageKey: `r_${pinnedId}` })
+        .where(eq(repositories.id, row.id));
+      await db.insert(repoCounters).values({ repoId: pinnedId, issueIndex: 0 }).onConflictDoNothing();
+    }
     await drizzle(env.DB)
       .update(repositories)
       .set({ createdAt: new Date(T0 * 1000), updatedAt: new Date(repo.updated * 1000), isArchived: repo.isArchived })
-      .where(eq(repositories.id, row.id));
+      .where(eq(repositories.id, repoId));
     if (repo.description !== "") {
-      await saveRepoSettings(env.DB, row.id, { description: repo.description }, new Date(T0 * 1000));
+      await saveRepoSettings(env.DB, repoId, { description: repo.description }, new Date(T0 * 1000));
     }
   }
 

@@ -396,13 +396,10 @@ prints all of them verbatim.
   confirm name on `action=delete` → the 200 re-render with the verbatim
   form.enterred_invalid_repo_name text in the ui negative message (the API
   still reads the repo — nothing written); the REAL delete (the exact
-  name) → 303 the settings URL and the API read-back is 404 at t+0.
-  **PENDING on that last pin:** the COMMITTED handler redirects every
-  applied outcome to `/{owner}/{slug}/settings` — for a deleted repo that
-  URL is the 404 shell, upstream's own divergence (it targets the owner
-  dashboard, setting.go:978); the IN-FLIGHT ui/index.ts fold redirects a
-  user-owned delete to `/` — if it lands, flip `fw-danger-delete-303`'s
-  location assert at convergence (see "Convergence pending markers").
+  name) → 303 `/` (the LANDED owner-dashboard redirect override, 7d91ccd —
+  upstream targets the owner dashboard, setting.go:980: user owners `/`,
+  org owners `/org/{name}/dashboard`, user.go:326-332; this battery's
+  fixture repo is user-owned) and the API read-back is 404 at t+0.
   **Independent** (the
   cleanup-audit precedent): every family reports its own verdict — a red
   family never chain-skips the rest of the matrix (pre-RD23 every family
@@ -1251,15 +1248,14 @@ so the orchestrator can fast-adjudicate each flip at the convergence run:
   battery asserts diff CONTENT (the pulls/commits arms pin statuses, refs,
   and head/sha chains, never diff payloads). Expected no-op; listed so a
   surprise red on a pulls arm has a first suspect.
-- **PENDING the in-flight ui/index.ts fold** (the 6b7b517 blocked items:
-  the settings doer threading + the delete redirect override + the
-  admin-repos delete button + the delete-wiki env threading) —
-  `fw-danger-delete-303` pins the COMMITTED redirect
-  (`/{owner}/{slug}/settings`, the 404-shell divergence); if the fold
-  lands, a user-owned delete redirects to `/` and the location assert
-  flips. The danger family's other asserts (the banner, the cancel, the
-  refusal, the API 404) are fold-independent (the doer degrade is exact
-  for user-owned repos either way).
+- **RETIRED PENDING: the ui/index.ts fold landed (7d91ccd)** (the settings
+  doer threading + the delete redirect override + the admin-repos delete
+  button + the delete-wiki env threading) — `fw-danger-delete-303`'s pin
+  flipped to the LANDED owner-dashboard redirect: a user-owned delete 303s
+  to `/` (the battery's fixture repo is user-owned; org owners land on
+  `/org/{name}/dashboard`, user.go:326-332). The danger family's other
+  asserts (the banner, the cancel, the refusal, the API 404) were
+  fold-independent and are unchanged.
 - **Deliberately NOT probed (recorded decisions, not gaps):** U14's
   actions needs-chain emitter — the battery drives no workflow runs (the
   E2E lives in `routes.test.ts`, the mission's own skip rule); U9's

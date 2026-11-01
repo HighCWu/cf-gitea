@@ -117,12 +117,11 @@
  *   moved it to settings/branches.tmpl (`action=default_branch`, options
  *   sourced from `.Branches`, the git branch list); that page is the
  *   branch-protection module's file, outside this module.
- * - The invalid re-render carries the legacy trio (name/description/private)
- *   through the landed handler's rebuilt form binding; the wave-129 fields
- *   fall back to the STORED states on that path (the rebuild is the
- *   orchestrator-owned line in ui/index.ts — `data.form = form` is the
- *   one-line follow-up that makes the carry exact; until then absent
- *   optionals render stored, never a false state the user did not submit).
+ * - The invalid re-render carries the WHOLE parsed form through the
+ *   handler's rebuilt binding (`data.form = form`, the 88cbd17 hardening in
+ *   ui/index.ts) — the module's stored-fallback for the wave-129 optional
+ *   fields is dead code on this path: absent optionals render exactly what
+ *   was submitted, never a false state the user did not submit.
  * - The hooks list links every row onto its settings page (wave 14 —
  *   upstream base_list.tmpl's name + pencil anchors; before that page
  *   existed the rows rendered as text) and the per-hook LastStatus dot
@@ -160,27 +159,27 @@
  *     — upstream's own target for transfer/cancel
  *     (`repo.Link()+"/settings"`).
  *   - DELETE's upstream redirect is the owner dashboard
- *     (ctx.Repo.Owner.DashboardLink()) with deletion_success; the
- *     registered handler's applied arm can only target the settings URL,
- *     so a successful delete 303s onto the now-dead settings URL (the 404
- *     shell). The write itself is upstream-exact. ORCHESTRATOR FOLLOW-UP
- *     (ui/index.ts, one line): the applied outcome needs a redirect
- *     override (or an explicit deleted arm) to land the dashboard target.
- *   - The pending row's doer: upstream records ctx.Doer; the registered
- *     handler passes no viewer, so the ladders take an OPTIONAL `doer` and
- *     degrade to the repo's recorded owner (exact for user-owned repos;
- *     functionally invisible otherwise — acceptTransfer's grant never
- *     reads the doer column). ORCHESTRATOR FOLLOW-UP (ui/index.ts, one
- *     line): pass the viewer through settingsSubmit.
+ *     (ctx.Repo.Owner.DashboardLink()) with deletion_success; LANDED
+ *     (7d91ccd): settingsSubmit's applied delete arm overrides the redirect
+ *     onto the dashboard target — user owners `/`, org owners
+ *     `/org/{name}/dashboard` (user.go:326-332); the deletion_success
+ *     flash stays the no-session-flash reduction. The write itself is
+ *     upstream-exact.
+ *   - The pending row's doer: upstream records ctx.Doer; the ladders take
+ *     an OPTIONAL `doer` and degrade to the repo's recorded owner when a
+ *     caller omits it (exact for user-owned repos; functionally invisible
+ *     otherwise — acceptTransfer's grant never reads the doer column).
+ *     LANDED (7d91ccd): settingsSubmit threads the session viewer, so the
+ *     pending row records the doer like upstream.
  *   - delete-wiki LANDED (the whole-wiki arm): services/wiki.ts deleteWiki
  *     composes the per-page landing path into one bounded page-walk +
  *     tree-emptying commit and resets `repo_settings.has_wiki` (upstream
  *     wiki_service.DeleteWiki's two steps — UpdateRepositoryUnits then
  *     git.DeleteRepository). The ladder rides an OPTIONAL `env` tail for
- *     the wiki cell RPCs; settingsSubmit does not thread it yet, so the
- *     unthreaded arm refuses BEFORE any write (never a half-applied
- *     delete). ORCHESTRATOR FOLLOW-UP (ui/index.ts, the doer line's twin):
- *     `applyRepoBasics(c.env.DB, repo, form, viewer, c.env)`.
+ *     the wiki cell RPCs; settingsSubmit threads it (7d91ccd:
+ *     `applyRepoBasics(c.env.DB, repo, form, doer, c.env)` — the doer
+ *     thread's twin), so an unthreaded caller still refuses BEFORE any
+ *     write (never a half-applied delete).
  *     repos/service.ts still exposes no pending-transfer READ seam (the
  *     API arms inline the drizzle read, repo-extras-t2.ts:1253 — mirrored
  *     here as loadPendingRepoTransfer); that export need is reported,
@@ -391,7 +390,7 @@ export const settingsLocale = {
   wiki_delete_desc: "Deleting repository wiki data is permanent and cannot be undone.", // "repo.settings.wiki_delete_desc"
   wiki_delete_notices_1: "- This will permanently delete and disable the repository wiki for %s.", // "repo.settings.wiki_delete_notices_1" (%s = the full name)
   confirm_wiki_delete: "Delete Wiki Data", // "repo.settings.confirm_wiki_delete" (the modal's danger submit)
-  wiki_delete_unavailable: "Wiki deletion is unavailable because the repository storage is unreachable.", // cf-gitea addition — the unthreaded-engine-bindings refusal (nothing written; the one-line ui/index.ts follow-up)
+  wiki_delete_unavailable: "Wiki deletion is unavailable because the repository storage is unreachable.", // cf-gitea addition — the fail-closed no-bindings refusal (nothing written; settingsSubmit threads the bindings since 7d91ccd)
   unknown_action: "Unknown settings action.", // cf-gitea addition — upstream answers ctx.NotFound for an unrecognized action
 } as const;
 
@@ -589,31 +588,31 @@ export type RepoBasicsResult = { outcome: "applied"; slug: string } | { outcome:
  * The result reuses RepoBasicsResult so the registration's response shaping
  * compiles untouched: every applied outcome 303s onto
  * `/{owner}/{slug}/settings` — upstream's own redirect target for
- * transfer/cancel/delete-wiki (repo.Link() + "/settings"), and a DOCUMENTED
- * divergence for delete (upstream redirects onto the owner dashboard,
- * ctx.Repo.Owner.DashboardLink(), with a success flash — the registered
- * handler cannot express that target yet; see the module header's
- * follow-up). Invalid outcomes re-render the page with the exact upstream
- * texts (upstream's JSONError toast reduced to the inline negative
- * message — the basics arm's established reduction; there is no
- * session-flash plumbing).
+ * transfer/cancel/delete-wiki (repo.Link() + "/settings"); delete's
+ * upstream dashboard target LANDED as settingsSubmit's redirect override
+ * (upstream redirects onto the owner dashboard,
+ * ctx.Repo.Owner.DashboardLink(), with a success flash — user owners `/`,
+ * org owners `/org/{name}/dashboard`, user.go:326-332; the flash itself
+ * stays the no-session-flash reduction). Invalid outcomes re-render the
+ * page with the exact upstream texts (upstream's JSONError toast reduced to
+ * the inline negative message — the basics arm's established reduction;
+ * there is no session-flash plumbing).
  *
  * The `doer` thread: upstream records ctx.Doer on the pending row and runs
- * the blocked-user probe as the doer. The registered handler does not pass
- * the viewer yet (the one-line ui/index.ts follow-up reported to the
- * orchestrator), so the parameter is OPTIONAL and the ladders degrade to
- * the repo's recorded owner — EXACT for the user-owned repo (the owner
- * clicks), and the org-owned case records the org row (functionally
- * invisible: acceptTransfer's grant reads repo.ownerId + the pending
- * newOwnerId + the admin flag, never the doer column).
+ * the blocked-user probe as the doer. The parameter is OPTIONAL and the
+ * ladders degrade to the repo's recorded owner when a caller omits it —
+ * EXACT for the user-owned repo (the owner clicks), and the org-owned case
+ * records the org row (functionally invisible: acceptTransfer's grant
+ * reads repo.ownerId + the pending newOwnerId + the admin flag, never the
+ * doer column). settingsSubmit threads the session viewer (7d91ccd), so
+ * the registered path records the doer like upstream.
  *
  * The `env` tail (the delete-wiki arm's thread): the wiki cell RPCs need the
- * engine bindings (services/wiki.ts's whole-wiki sweep rides the REPO DO),
- * which the registered handler also does not pass yet — the doer follow-up's
- * twin, reported as the same one-liner (`applyRepoBasics(c.env.DB, repo,
- * form, doer, c.env)`). Absent bindings refuse the wiki arm BEFORE any write
- * (the confirmed delete either deletes or refuses, never half-applies); the
- * d1-only arms (transfer/cancel/delete) are unaffected.
+ * engine bindings (services/wiki.ts's whole-wiki sweep rides the REPO DO);
+ * settingsSubmit passes them since 7d91ccd (`applyRepoBasics(c.env.DB,
+ * repo, form, doer, c.env)`). Absent bindings still refuse the wiki arm
+ * BEFORE any write (the confirmed delete either deletes or refuses, never
+ * half-applies); the d1-only arms (transfer/cancel/delete) are unaffected.
  */
 export async function applyRepoDangerAction(
   d1: D1Database,
@@ -727,11 +726,11 @@ export async function applyRepoDangerAction(
       // (JSONRedirect(ctx.Repo.RepoLink + "/settings")).
       if (!nameConfirmed) return { outcome: "invalid", message: settingsLocale.enterred_invalid_repo_name };
       if (env === undefined) {
-        // The registered handler does not thread the engine bindings yet
-        // (the module's reported one-line ui/index.ts follow-up above).
-        // Refuse before any write — the D1-only half (the flag) must never
-        // land while the storage half cannot.
-        console.error("[settings] delete-wiki refused: engine bindings not threaded into applyRepoBasics (ui/index.ts follow-up)");
+        // Defensive: settingsSubmit threads the bindings (7d91ccd), so this
+        // arm fires only for a caller that omits the tail. Refuse before
+        // any write — the D1-only half (the flag) must never land while the
+        // storage half cannot.
+        console.error("[settings] delete-wiki refused: caller omitted the engine-bindings tail of applyRepoBasics");
         return { outcome: "invalid", message: settingsLocale.wiki_delete_unavailable };
       }
       const pair = await findRepositoryById(d1, repo.id);

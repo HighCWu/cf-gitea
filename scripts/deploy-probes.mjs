@@ -2984,10 +2984,10 @@ const window3FailureCleanup = async (ctx) => {
  *      form; the cancel POST → 303 and the banner is gone; a WRONG confirm
  *      name on action=delete → the 200 re-render with the verbatim
  *      enterred_invalid_repo_name text (nothing written); the REAL delete
- *      (exact name) → 303 the settings URL — the COMMITTED redirect target,
- *      now the 404 shell (upstream targets the owner dashboard; the
- *      in-flight ui/index.ts fold will move it to "/" — PENDING, flip the
- *      pin at convergence) — and the API read-back 404 at t+0.
+ *      (exact name) → 303 "/" — the LANDED owner-dashboard redirect override
+ *      (7d91ccd; upstream's DashboardLink, setting.go:980 + user.go:326-332:
+ *      user owners "/", org owners /org/{name}/dashboard — this battery's
+ *      fixture repo is user-owned) — and the API read-back 404 at t+0.
  *
  * `independent: true` on purpose (the cleanup-audit precedent): each family
  * reports its own verdict — a red family must not chain-skip the rest of the
@@ -3579,7 +3579,7 @@ const fixwaveSteps = (ctx) => [
   },
   {
     id: "fw-danger-delete-303",
-    expect: `THE REAL DELETE (6b7b517 U4 — the confirm-name gate passes, the full D1 cascade runs): the owner's session POST action=delete with the EXACT full name → 303 EXACTLY /${"{owner}/{repo}"}/settings (the COMMITTED redirect target — for a deleted repo that URL is now the 404 shell, the documented divergence; upstream targets the owner dashboard, setting.go:978 — PENDING: the in-flight ui/index.ts fold redirects a user-owned delete to "/", flip this pin at convergence); the API read-back → 404 at t+0 (the row is gone — the delete IS the cascade)`,
+    expect: `THE REAL DELETE (6b7b517 U4 — the confirm-name gate passes, the full D1 cascade runs): the owner's session POST action=delete with the EXACT full name → 303 EXACTLY "/" (the LANDED owner-dashboard redirect override, 7d91ccd: upstream handleSettingsPostDelete's JSONRedirect(ctx.Repo.Owner.DashboardLink()), setting.go:980 — user owners land on "/", org owners on /org/{name}/dashboard, user.go:326-332; this battery's fixture repo is user-owned); the API read-back → 404 at t+0 (the row is gone — the delete IS the cascade)`,
     run: async () => {
       expect(ctx.dzCreated === true && ctx.dzGone !== true && typeof ctx.webCookie === "string", "no danger-zone repo / owner session from the prior arms (fixture missing)");
       const settingsPath = `/${ctx.user}/${ctx.dzRepo}/settings`;
@@ -3591,11 +3591,11 @@ const fixwaveSteps = (ctx) => [
       await res.text();
       if (res.status === 303) ctx.dzGone = true; // mark on the observable write (before the location assert)
       expect(res.status === 303, `real delete POST status ${res.status} (expected 303): ${res.status === 200 ? "the typed-name gate refused — the confirm name must be the EXACT full name" : ""}`);
-      expect(res.headers.get("location") === settingsPath,
-        `delete location ${JSON.stringify(res.headers.get("location"))} (expected ${settingsPath} — the committed settings-URL redirect; the in-flight fold will move it to "/")`);
+      expect(res.headers.get("location") === "/",
+        `delete location ${JSON.stringify(res.headers.get("location"))} (expected "/" — the user-owner dashboard redirect; org owners land on /org/{name}/dashboard)`);
       const gone = await api(`/repos/${ctx.user}/${ctx.dzRepo}`);
       expect(gone.status === 404, `repo GET after the delete: ${gone.status} (expected 404 at t+0 — the row is gone)`);
-      return `303 → the settings URL (the committed 404-shell divergence); the repo is dead at t+0 (API 404)`;
+      return `303 → / (the user-owner dashboard redirect); the repo is dead at t+0 (API 404)`;
     },
   },
   {

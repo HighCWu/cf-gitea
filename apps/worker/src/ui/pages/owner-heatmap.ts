@@ -1,17 +1,17 @@
 /**
  * The owner HEATMAP web JSON route — `/{username}/-/heatmap` (pages wave;
  * upstream web.go:1107's `/{username}/-` group's `m.Get("/heatmap",
- * user.DashboardHeatmap)`, routers/web/user/heatmap.go:32-63): the JSON
+ * user.DashboardHeatmap)`, routers/web/user/heatmap.go:49-73): the JSON
  * endpoint the official bundle's profile widget fetches
  * (web_src/js/features/heatmap.ts `initHeatmap` → `#user-heatmap`'s
  * `data-heatmap-url` — the profile activity tab's contribution grid, this
  * wave's second piece renders the div that triggers it).
  *
- * ## The upstream handler, arm by arm (heatmap.go:32-63)
+ * ## The upstream handler, arm by arm (heatmap.go:49-73)
  *
- * - `EnableUserHeatmap` (heatmap.go:34-37, default ON,
+ * - `EnableUserHeatmap` (heatmap.go:51-54, default ON,
  *   modules/setting/service.go) — not a landed setting; the route serves.
- * - The viewer-visibility gate (heatmap.go:38-44): `ctx.Org.Organization ==
+ * - The viewer-visibility gate (heatmap.go:55-60): `ctx.Org.Organization ==
  *   nil && !IsUserVisibleToViewer(ctx.ContextUser, ctx.Doer)` → NotFound.
  *   The landed `resolveUserProfile` seam IS that ladder (user-profile.tsx's
  *   `IsUserVisibleToViewer` port: admin/self short-circuit, public,
@@ -22,7 +22,7 @@
  *   R06's prerequisite (the org-arm aggregation) and NOT this wave's brief:
  *   the user-gated resolver answers org names as a miss here, the recorded
  *   R06 boundary.
- * - `writeHeatmapJSON` (heatmap.go:22-30): `{"heatmapData":
+ * - `writeHeatmapJSON` (heatmap.go:36-47): `{"heatmapData":
  *   [[unixTs, count]...], "totalContributions": N}` — the PAIR shape, NOT
  *   the API's `[{timestamp, contributions}]` objects
  *   (routers/api/v1/user/user.go:138-161).
@@ -105,7 +105,7 @@ export async function loadOwnerHeatmapData(d1: D1Database, user: UserProfileRow)
   return { pairs, total };
 }
 
-/** The JSON body — writeHeatmapJSON (heatmap.go:22-30) verbatim. */
+/** The JSON body — writeHeatmapJSON (heatmap.go:36-47) verbatim. */
 export function ownerHeatmapJsonBody(load: { pairs: HeatmapPair[]; total: number }): string {
   return JSON.stringify({ heatmapData: load.pairs, totalContributions: load.total });
 }
