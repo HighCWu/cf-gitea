@@ -19,10 +19,11 @@
  *     (transfer_abort_invalid verbatim) and the happy delete of the pending
  *     row;
  *   - the delete ladder: the confirm-name refusal (nothing deleted) and the
- *     happy D1-cascade delete — 303 onto the settings URL (the DOCUMENTED
- *     divergence: upstream redirects onto the owner dashboard, a target the
- *     registered handler cannot express yet), the rows gone, a follow-up
- *     GET 404-shelling;
+ *     happy D1-cascade delete — 303 onto the OWNER DASHBOARD (upstream's
+ *     ctx.Repo.Owner.DashboardLink() redirect, user.go:326-332 — user owners
+ *     `/`, org owners /org/{name}/dashboard; the old settings-URL +
+ *     404-shell divergence closed by 7d91ccd), the rows gone, a follow-up
+ *     GET 404-shelling the deleted repo's settings;
  *   - the delete-wiki arm (options.tmpl:873-885 + #delete-wiki-modal): the
  *     wiki row renders only for wiki-enabled repos (has_wiki — the unit
  *     CanRead gate's landed reduction) with the dangerous_operation_form
@@ -341,12 +342,15 @@ describe("the delete POST ladder (action=delete)", () => {
     expect(await repoRowExists()).toBe(true);
   });
 
-  it("deletes the repository (the D1 cascade) and 303s onto the settings URL — the documented divergence: that URL now 404-shells", async () => {
+  it("deletes the repository (the D1 cascade) and 303s onto the owner dashboard (upstream's DashboardLink, user.go:326-332 — user owners `/`)", async () => {
     const res = await settingsPost({ action: "delete", repo_name: "alice/demo" });
     expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe("/alice/demo/settings"); // upstream targets the owner dashboard — the registered handler cannot express it yet
+    // Upstream redirects onto ctx.Repo.Owner.DashboardLink() with the
+    // deletion_success flash — for a user owner that is `/` (7d91ccd closed
+    // the old settings-URL divergence).
+    expect(res.headers.get("location")).toBe("/");
     expect(await repoRowExists()).toBe(false);
-    // The follow-up GET lands the 404 shell (the divergence's landing).
+    // The deleted repo's settings URL 404-shells (repo gone).
     const gone = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
     expect(gone.status).toBe(404);
     expect(await gone.text()).toContain("status-page-error");

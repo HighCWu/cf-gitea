@@ -14,6 +14,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
 import { issues, milestones, repoCounters, repositories, users } from "../db/schema";
+import { IssuesService } from "../issues/service";
 import { STUB_USER, type AuthResolver } from "./auth";
 import { createApiRouter } from "./router";
 import { contractModelProperties } from "../compat/contract/frozen-contract";
@@ -387,7 +388,20 @@ describe("PATCH /repos/{owner}/{repo}/milestones/{id} (issueEditMilestone)", () 
   it("patches title/description and transitions state both ways", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible");
-    const id = await seedMilestone(repoId, { name: "v1", numIssues: 2, numClosedIssues: 1 });
+    const id = await seedMilestone(repoId, { name: "v1" });
+    // REAL issue rows behind the milestone (2 tracked, 1 closed): the
+    // counters the pin reads are the maintained tallies. Upstream recounts the pair
+    // from the issue rows on EVERY patch (UpdateMilestoneCounters,
+    // models/issues/milestone.go:192-205, landed as U9's 14ba724) — a
+    // counter-only fixture (seeded tallies, no rows) would recount to 0/0,
+    // which is exactly upstream's answer for such a row. With real rows the
+    // recount reproduces the maintained 2/1 and the state flip leaves the
+    // tallies untouched — upstream's observable behavior for a real
+    // milestone.
+    const issueSvc = new IssuesService(env.DB);
+    const openA = await issueSvc.createIssue({ repoId, title: "on v1 a", milestoneId: id });
+    await issueSvc.createIssue({ repoId, title: "on v1 b", milestoneId: id });
+    await issueSvc.closeIssue(openA.id);
 
     const close = await router()(`/repos/alice/visible/milestones/${id}`, {
       method: "PATCH",
@@ -407,7 +421,8 @@ describe("PATCH /repos/{owner}/{repo}/milestones/{id} (issueEditMilestone)", () 
     expect(reopen.status).toBe(200);
     const reopened = await reopen.json<{ state: string; closed_at: string | null; open_issues: number; closed_issues: number }>();
     expect(reopened).toMatchObject({ state: "open", closed_at: null });
-    // counters untouched
+    // counters untouched — the every-patch recount (UpdateMilestoneCounters)
+    // reproduces the maintained tallies; a state flip moves no issue.
     expect(reopened).toMatchObject({ open_issues: 1, closed_issues: 1 });
   });
 

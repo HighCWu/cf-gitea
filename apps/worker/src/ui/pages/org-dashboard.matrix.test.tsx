@@ -7,9 +7,10 @@
  * the org-teams matrix's harness pattern), one fresh org world per test
  * behind per-test table wipes. The arms:
  *
- *   - the claim pins: the four/five-segment literal shapes, the junk
- *     neighbors (/org/{org}/other, deeper tails, the /-/heatmap tail — R03
- *     unclaimed), malformed percent-encoding, and handlesUiRoute;
+ *   - the claim pins: the four/five-segment literal shapes, the R03
+ *     heatmap twins' as-built admission (6/7-segment `-`/`heatmap` literals,
+ *     7d91ccd), the junk neighbors (/org/{org}/other, deeper tails —
+ *     engine-owned), malformed percent-encoding, and handlesUiRoute;
  *   - the MEMBER-ONLY gate (upstream web.go:982-985's OrgAssignment
  *     {RequireMember: true} posture the census's Open Issues #9 pins):
  *     anonymous 404-SHELLS (upstream NotFound — NO login redirect, the
@@ -234,7 +235,7 @@ async function expectNotFoundShell(res: Response): Promise<void> {
 // --- the claim pins (parseUiRoute / handlesUiRoute) ---------------------------
 
 describe("org-dashboard claim pins", () => {
-  it("claims the four/five-segment literal shapes and leaves the neighbors with the engine", () => {
+  it("claims the four/five-segment literal shapes + the heatmap twins and leaves the other neighbors with the engine", () => {
     expect(parseUiRoute("/org/dashorg/dashboard")).toEqual({ family: "org-dashboard", owner: "dashorg" });
     expect(parseUiRoute("/org/dashorg/dashboard/Alpha%20Crew")).toEqual({
       family: "org-dashboard",
@@ -249,12 +250,21 @@ describe("org-dashboard claim pins", () => {
     expect(handlesUiRoute("/org/dashorg/dashboard")).toBe(true);
     expect(handlesUiRoute("/org/dashorg/dashboard/squad")).toBe(true);
     // The junk neighbors stay engine-owned: a different literal third
-    // segment, deeper tails, and the /-/heatmap tail (R03 — unclaimed,
-    // the engine's 404 exactly like upstream's unregistered route).
+    // segment and deeper tails. The R03 heatmap twins LANDED (7d91ccd):
+    // the literal `-` + `heatmap` segments claim the 6-/7-segment shapes
+    // ahead of the {team} arm (web.go:984-985's static-first posture) —
+    // as-built admission set, no longer the engine's 404.
     expect(parseUiRoute("/org/dashorg/other")).toBeNull();
     expect(parseUiRoute("/org/dashorg/dashboard/squad/more")).toBeNull();
-    expect(parseUiRoute("/org/dashorg/dashboard/-/heatmap")).toBeNull();
-    expect(parseUiRoute("/org/dashorg/dashboard/-/heatmap/squad")).toBeNull();
+    expect(parseUiRoute("/org/dashorg/dashboard/-/heatmap")).toEqual({
+      family: "org-dashboard-heatmap",
+      owner: "dashorg",
+    });
+    expect(parseUiRoute("/org/dashorg/dashboard/-/heatmap/squad")).toEqual({
+      family: "org-dashboard-heatmap",
+      owner: "dashorg",
+      team: "squad",
+    });
     expect(parseUiRoute("/org/%zz/dashboard")).toBeNull();
     expect(parseUiRoute("/org/dashorg/dashboard/%zz")).toBeNull();
     // The bare /org/{org} shape stays the REPO-HOME family's (owner "org"

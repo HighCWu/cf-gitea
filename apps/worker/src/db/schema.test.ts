@@ -590,6 +590,9 @@ describe("repositories fork_parent parity (superseded FORKS_DDL_STATEMENTS)", ()
       ["num_stars", "INTEGER", 1, 0],
       ["num_watches", "INTEGER", 1, 0],
       ["num_forks", "INTEGER", 1, 0],
+      // 0061 (7f2ecd3): the closed-milestone counter — the ALTER sweep's
+      // newest append, LAST position (upstream repositories.num_closed_milestones).
+      ["num_closed_milestones", "INTEGER", 1, 0],
     ]);
     // The appended columns keep the ALTER ADD COLUMN constraints: is_mirror
     // is NOT NULL with the keyword-alias default (`false` = 0), original_url
@@ -601,8 +604,9 @@ describe("repositories fork_parent parity (superseded FORKS_DDL_STATEMENTS)", ()
     expect(byName.get("is_mirror")?.dflt_value).toBe("false");
     expect(byName.get("original_url")?.dflt_value).toBeNull();
     expect(byName.get("is_template")?.dflt_value).toBe("false");
-    // 0029-0031 tails: NOT NULL DEFAULT 0 (the drizzle integer default).
-    for (const name of ["size_kb", "num_stars", "num_watches", "num_forks"]) {
+    // 0029-0031 tails + 0061's counter: NOT NULL DEFAULT 0 (the drizzle
+    // integer default).
+    for (const name of ["size_kb", "num_stars", "num_watches", "num_forks", "num_closed_milestones"]) {
       expect(byName.get(name)?.dflt_value).toBe("0");
     }
     expect(await indexNames("repositories")).toContain("repositories_fork_parent_idx");

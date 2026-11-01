@@ -776,7 +776,9 @@ describe("mounted chain (SELF — src/index.ts's /api/v1 mounts): sudo trio", ()
     });
 
     expect(res.status).toBe(403);
-    expect(await res.json()).toEqual({ message: "Only administrators allowed to sudo.", url: ERROR_URL });
+    // Upstream's bare `{message}` 403 — api.go:135-138's literal ctx.JSON,
+    // no APIError `url` field (0bd7798).
+    expect(await res.json()).toEqual({ message: "Only administrators allowed to sudo." });
   });
 
   it("admin sudo onto an unknown target → 404 not found", async () => {
@@ -803,7 +805,9 @@ describe("mounted chain (SELF — src/index.ts's /api/v1 mounts): sudo trio", ()
       headers: { cookie: `${SESSION_COOKIE_NAME}=${cookieValue}` },
     });
     expect(sudoed.status).toBe(403); // anonymous doer — "Only administrators allowed to sudo."
-    expect(await sudoed.json()).toEqual({ message: "Only administrators allowed to sudo.", url: ERROR_URL });
+    // Upstream's bare `{message}` 403 — api.go:135-138's literal ctx.JSON,
+    // no APIError `url` field (0bd7798).
+    expect(await sudoed.json()).toEqual({ message: "Only administrators allowed to sudo." });
 
     // The no-sudo contrast: the same cookie-only request is plain anonymous
     // at the route gate (401), never the admin identity.
