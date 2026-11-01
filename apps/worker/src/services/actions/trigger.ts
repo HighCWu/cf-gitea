@@ -1860,7 +1860,7 @@ export function shouldEventCreateCommitStatus(event: string): boolean {
 // Commit statuses (services/actions/commit_status.go)
 // ---------------------------------------------------------------------------
 
-/** toCommitStatus (commit_status.go:357-370) → the landed table's states. */
+/** toCommitStatus (commit_status.go:357-368) → the landed table's states. */
 export function toCommitStatus(status: number): "pending" | "success" | "failure" | "warning" | "skipped" | "error" {
   switch (status) {
     case ACTION_STATUS_SUCCESS:
@@ -1871,8 +1871,11 @@ export function toCommitStatus(status: number): "pending" | "success" | "failure
     case ACTION_STATUS_WAITING:
     case ACTION_STATUS_BLOCKED:
     case ACTION_STATUS_PENDING:
-      // RUNNING/CANCELLING ride too (upstream's pending family) — the v1 rows
-      // this module writes never hold them at status-creation time.
+    case ACTION_STATUS_RUNNING:
+    case ACTION_STATUS_CANCELLING:
+      // upstream's pending family is one case line (:363) — the claim post
+      // (dispatch.ts) holds RUNNING jobs and the cancel emitter holds
+      // CANCELLING ones at post time.
       return "pending";
     case ACTION_STATUS_SKIPPED:
       return "skipped";
@@ -1881,7 +1884,7 @@ export function toCommitStatus(status: number): "pending" | "success" | "failure
   }
 }
 
-/** toCommitStatusDescription (commit_status.go:372-394) — the duration-bearing
+/** toCommitStatusDescription (commit_status.go:331-355) — the duration-bearing
  *  arms render the seconds shape of job.DurationString (0s when unstarted). */
 export function toCommitStatusDescription(job: { status: number; started: Date | null; stopped: Date | null }): string {
   const duration = () => {
@@ -1897,12 +1900,16 @@ export function toCommitStatusDescription(job: { status: number; started: Date |
       return `Canceled after ${duration()}`;
     case ACTION_STATUS_SKIPPED:
       return "Skipped";
-    case ACTION_STATUS_PENDING:
-      return "Waiting for needed jobs";
+    case ACTION_STATUS_RUNNING:
+      return "In progress";
+    case ACTION_STATUS_CANCELLING:
+      return "Canceling";
     case ACTION_STATUS_WAITING:
       return "Waiting to run";
     case ACTION_STATUS_BLOCKED:
       return "Blocked by required conditions";
+    case ACTION_STATUS_PENDING:
+      return "Waiting for needed jobs";
     default:
       return `Unknown status: ${job.status}`;
   }
@@ -2021,7 +2028,12 @@ export async function createCommitStatusForRunJobs(
     const displayName = workflowDisplayName(opts.run.workflowId, payloadText(job.workflowPayload));
     const ctxName = workflowStatusContextName(displayName, job.name, event);
     const description = toCommitStatusDescription(job);
-    const targetUrl = `${opts.appUrl}/${opts.repoOwnerNamespace}/${opts.repoSlug}/actions/runs/${opts.run.id}/jobs/${job.id}`;
+    // run.Link() + "/jobs/{id}" (commit_status.go:150) — single-slash joins
+    // over a no-trailing-slash base (upstream Link()'s own shape: AppSubURL +
+    // "/" + owner + ...): the appUrlOf callers (routes.ts:288-292, origin
+    // plus trailing slash) are stripped, the empty-base emitters (cancel,
+    // update) land root-relative.
+    const targetUrl = `${opts.appUrl.replace(/\/+$/, "")}/${opts.repoOwnerNamespace}/${opts.repoSlug}/actions/runs/${opts.run.id}/jobs/${job.id}`;
     const state = toCommitStatus(job.status);
     // onlyReplace (commit_status.go:174-177): a PENDING job whose context
     // matches no required glob posts nothing (optional pending jobs don't

@@ -62,6 +62,8 @@ import {
   commitStatusEventAndCommit,
   createWorkflowCommitStatus,
   runnerWorkflowPayload,
+  toCommitStatus,
+  toCommitStatusDescription,
   workflowDisplayName,
   workflowStatusContextName,
 } from "./trigger";
@@ -401,15 +403,10 @@ async function buildRunnerTask(env: Env, d1: D1, claimed: ClaimedTask, appUrl: s
 /**
  * CreateCommitStatusForRunJobs at the claim site (task.go:115 via
  * commit_status.go:31-72 → createCommitStatus): the claimed job's RUNNING
- * status gets its commit status row the moment it is picked. The seam is
- * composed from trigger.ts's exported pieces (commitStatusEventAndCommit +
- * the createWorkflowCommitStatus writer) rather than its
- * createCommitStatusForRunJobs wrapper because that wrapper's status tables
- * (toCommitStatus / toCommitStatusDescription) predate RUNNING callers —
- * "the v1 rows this module writes never hold them at status-creation time".
- * The claim post is the first caller that holds one, so the RUNNING mapping
- * lands here, exactly upstream: RUNNING rides the pending family
- * (commit_status.go:363) and reads "In progress" (:342-343). The
+ * status gets its commit status row the moment it is picked. The mapping
+ * rides trigger.ts's shared tables (toCommitStatus / toCommitStatusDescription
+ * — commit_status.go:357-368/:331-355), which carry the RUNNING arm exactly
+ * upstream: the pending family (:363) and "In progress" (:342-343). The
  * pendingFilter arm (commit_status.go:56-59) is nil at claim — it arms only
  * for pending jobs — so onlyReplace is always false. Upstream's caller is
  * log-only ("it won't return an error … it's not critical",
@@ -435,9 +432,9 @@ async function postClaimCommitStatus(d1: D1, ctx: ClaimContext, appUrl: string):
       commitId,
       ctxName,
       workflowId: ctx.run.workflowId,
-      state: "pending", // toCommitStatus(StatusRunning) — commit_status.go:363
+      state: toCommitStatus(ctx.job.status),
       targetUrl,
-      description: "In progress", // toCommitStatusDescription(StatusRunning) — :342-343
+      description: toCommitStatusDescription(ctx.job),
       onlyReplace: false,
     });
   } catch (err) {

@@ -36,6 +36,7 @@ import {
 } from "../../db/schema";
 import {
   ACTION_STATUS_BLOCKED,
+  ACTION_STATUS_CANCELLING,
   ACTION_STATUS_CANCELLED,
   ACTION_STATUS_FAILURE,
   ACTION_STATUS_PENDING,
@@ -53,6 +54,7 @@ import {
   commitStatusEventAndCommit,
   compilePatterns,
   containsExpression,
+  createCommitStatusForRunJobs,
   createSkippedCommitStatusForFilteredWorkflow,
   createWorkflowCommitStatus,
   detectWorkflowMatch,
@@ -576,13 +578,19 @@ jobs:
 // ---------------------------------------------------------------------------
 
 describe("commit status shapes", () => {
-  it("toCommitStatus maps the states (commit_status.go:357-370)", () => {
+  it("toCommitStatus maps the states (commit_status.go:357-368)", () => {
     expect(toCommitStatus(ACTION_STATUS_SUCCESS)).toBe("success");
     expect(toCommitStatus(ACTION_STATUS_FAILURE)).toBe("failure");
     expect(toCommitStatus(3 /* CANCELLED */)).toBe("failure");
     expect(toCommitStatus(ACTION_STATUS_WAITING)).toBe("pending");
     expect(toCommitStatus(ACTION_STATUS_PENDING)).toBe("pending");
+    // upstream's pending family is one case line (:363): RUNNING and
+    // CANCELLING ride it — the claim post holds RUNNING jobs, the cancel
+    // emitter holds CANCELLING ones at post time
+    expect(toCommitStatus(ACTION_STATUS_RUNNING)).toBe("pending");
+    expect(toCommitStatus(ACTION_STATUS_CANCELLING)).toBe("pending");
     expect(toCommitStatus(ACTION_STATUS_SKIPPED)).toBe("skipped");
+    expect(toCommitStatus(999)).toBe("error");
   });
 
   it("toCommitStatusDescription arms", () => {
@@ -590,6 +598,8 @@ describe("commit status shapes", () => {
     expect(toCommitStatusDescription({ status: ACTION_STATUS_SUCCESS, started: t0, stopped: new Date(t0.getTime() + 65_000) })).toBe("Successful in 65s");
     expect(toCommitStatusDescription({ status: ACTION_STATUS_FAILURE, started: t0, stopped: new Date(t0.getTime() + 5_000) })).toBe("Failing after 5s");
     expect(toCommitStatusDescription({ status: ACTION_STATUS_SKIPPED, started: null, stopped: null })).toBe("Skipped");
+    expect(toCommitStatusDescription({ status: ACTION_STATUS_RUNNING, started: null, stopped: null })).toBe("In progress"); // :342-343
+    expect(toCommitStatusDescription({ status: ACTION_STATUS_CANCELLING, started: null, stopped: null })).toBe("Canceling"); // :344-345
     expect(toCommitStatusDescription({ status: ACTION_STATUS_WAITING, started: null, stopped: null })).toBe("Waiting to run");
     expect(toCommitStatusDescription({ status: ACTION_STATUS_PENDING, started: null, stopped: null })).toBe("Waiting for needed jobs");
   });
@@ -670,7 +680,8 @@ function runInput(workflowId: string) {
     title: "fix: thing",
     repoOwnerNamespace: "alice",
     repoSlug: "demo",
-    appUrl: "https://actions.example.com",
+    // the routes' appUrlOf shape (origin plus trailing slash — AppURL's own)
+    appUrl: "https://actions.example.com/",
   };
 }
 
@@ -724,10 +735,56 @@ describe("insertTriggeredRun (InsertRun rows + index + statuses)", () => {
     expect(statuses[0]?.context).toBe("CI / build (push)");
     expect(statuses[0]?.state).toBe("pending");
     expect(statuses[0]?.creatorId).toBe(ACTIONS_USER_ID);
-    expect(statuses[0]?.targetUrl).toContain(`/actions/runs/${run.id}/jobs/`);
+    // run.Link() + "/jobs/{id}" (commit_status.go:150): single-slash join —
+    // the trailing-slash appUrlOf base is stripped, no //owner double slash
+    expect(statuses[0]?.targetUrl).toBe(`https://actions.example.com/alice/demo/actions/runs/${run.id}/jobs/${jobs[0]!.id}`);
 
     // the waiting job bumps the task version
     expect(await getTasksVersionByScope(env.DB, 0, REPO_ID)).toBe(1);
+  });
+
+  it("a CANCELLING job's status re-post rides the pending family at 'Canceling' (the cancel emitter's free mapping)", async () => {
+    await seedRepo();
+    // The cancel path's post shape (createCommitStatusesForJobsByRun over
+    // stopTask's graceful handshake, job_emitter.go:135-151): the claimed job
+    // still holds CANCELLING when its status re-posts; the empty-base emitter
+    // lands a root-relative target (run.Link()'s own shape minus subpath).
+    await createCommitStatusForRunJobs(
+      env.DB,
+      {
+        run: {
+          id: 1,
+          repoId: REPO_ID,
+          workflowId: ".github/workflows/ci.yml",
+          event: "push",
+          triggerEvent: "push",
+          commitSha: HEAD,
+          scheduleId: 0,
+        },
+        repoOwnerNamespace: "alice",
+        repoSlug: "demo",
+        eventPayloadJson: JSON.stringify({ head_commit: { id: HEAD } }),
+        appUrl: "",
+      },
+      [
+        {
+          id: 77,
+          jobId: "build",
+          name: "build",
+          status: ACTION_STATUS_CANCELLING,
+          started: new Date(1_700_000_000_000),
+          stopped: null,
+          workflowPayload: new TextEncoder().encode("name: CI\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: make\n"),
+          isMatrixDeferred: false,
+        },
+      ],
+    );
+
+    const rows = await db().select().from(commitStatuses).where(eq(commitStatuses.sha, HEAD));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.state).toBe("pending"); // toCommitStatus(CANCELLING) — commit_status.go:363
+    expect(rows[0]?.description).toBe("Canceling"); // toCommitStatusDescription(CANCELLING) — :344-345
+    expect(rows[0]?.targetUrl).toBe("/alice/demo/actions/runs/1/jobs/77");
   });
 
   it("the per-repo index rides the repo_counters.run_index CAS (GetNextResourceIndex's named-sequence shape)", async () => {
