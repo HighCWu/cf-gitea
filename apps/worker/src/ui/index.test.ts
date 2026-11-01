@@ -15,14 +15,14 @@
 
 import { env } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../auth/testing/seeds";
 import { applyTwofaEnrollment, clearTwofaSetCookie, generateTotpSecret, mintPendingTicket } from "../auth/two-factor";
 import { totpCode } from "../auth/totp";
-import { comments, externalLoginUsers, issuePins, issues, loginSources, orgMembers, repositories, repoSettings, teamMembers, trackedTimes, twoFactor, users } from "../db/schema";
+import { comments, externalLoginUsers, issuePins, issues, loginSources, orgMembers, repositories, repoSettings, repoTransfer, teamMembers, trackedTimes, twoFactor, userSettingsKv, users } from "../db/schema";
 import { TeamsService } from "../api/routes/org-teams";
 import { OrgService } from "../services/orgs/orgs";
 import { serializeOAuth2SourceConfig } from "../services/auth-sources/cfg";
@@ -168,6 +168,9 @@ beforeEach(async () => {
     "repo_units",
     "repo_counters",
     "repo_redirects",
+    // The danger-threading battery's pending transfer row (references
+    // repositories — goes before it, the children-first sweep convention).
+    "repo_transfer",
     "repositories",
     // The dead-route-fix route fixtures (children first): the unpin/time
     // ladders' issue rows, the pins, the comments the unpin writes, the
@@ -180,6 +183,8 @@ beforeEach(async () => {
     // signed-in fetches mint.
     "external_login_user",
     "login_source",
+    // The update_preferences battery's KV rows (references users).
+    "user_settings_kv",
     "sessions",
     "users",
   ]) {
@@ -606,6 +611,31 @@ describe("parseUiRoute", () => {
     ["/octo/hello/_cherrypick/zzzzzz/main", null], // non-hex sha
     ["/octo/hello/_cherrypick/abcdef/main", null], // 6 < 7 hex
     ["/octo/hello/_cherrypick/abcdef0123", null], // no branch tail
+    // --- the follow-up bundle's claim pins (2026-11-01) ---
+    // The preferences write (web.go:636) — the exact literal, POST-only at
+    // registration (the GET twin 405s).
+    ["/user/settings/update_preferences", { family: "user-settings-update-preferences", id: null }],
+    ["/user/settings/update_preferences/extra", null], // deeper tails stay engine-owned
+    // The admin repos delete write (web.go:851) — the admin-emails-delete
+    // shape beside the bare list literal.
+    ["/-/admin/repos/delete", { family: "admin-repos-delete" }],
+    ["/-/admin/repos/delete/extra", null], // deeper tails stay engine-owned
+    // The org dashboard's heatmap JSON twins (web.go:984-985) — the literal
+    // `-` + `heatmap` segments over the 6-/7-segment shapes; the team tail
+    // is any decodable segment; every other deeper shape stays engine-owned.
+    ["/org/acme/dashboard/-/heatmap", { family: "org-dashboard-heatmap", owner: "acme" }],
+    ["/org/acme/dashboard/-/heatmap/Devs", { family: "org-dashboard-heatmap", owner: "acme", team: "Devs" }],
+    ["/org/acme/dashboard/-/heatmap/devs/extra", null],
+    ["/org/acme/dashboard/-/heatsink", null], // the literal heatmap only
+    ["/org/acme/dashboard/-", { family: "org-dashboard", owner: "acme", team: "-" }], // the 5-segment team arm keeps its shape
+    // The editor family's underscore aliases (web.go:1453-1467's spellings)
+    // map onto the SAME families as the bare twins.
+    ["/octo/hello/_new/main", { family: "file-new", owner: "octo", repo: "hello", refSuffix: "main" }],
+    ["/octo/hello/_edit/main/x.txt", { family: "file-edit", owner: "octo", repo: "hello", refSuffix: "main/x.txt" }],
+    ["/octo/hello/_delete/main/x.txt", { family: "file-delete", owner: "octo", repo: "hello", refSuffix: "main/x.txt" }],
+    ["/octo/hello/_upload/main", { family: "file-upload", owner: "octo", repo: "hello", refSuffix: "main" }],
+    ["/octo/hello/_diffpatch/main", { family: "editor-patch", owner: "octo", repo: "hello", refSuffix: "main" }],
+    ["/octo/hello/_new", null], // the bare tail requirement holds for the aliases too
   ];
 
   it.each(table)("parses %s", (pathname, expected) => {
@@ -2009,5 +2039,324 @@ describe("O1 org membership write families (web.go:989 + 997-998)", () => {
       expect(twin.status).toBe(405);
       expect(twin.headers.get("allow")).toBe("POST");
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The follow-up bundle's route battery (2026-11-01): the update_preferences
+// KV write, the org heatmap twins, the editor underscore aliases, the
+// settings danger threading (doer + env) and the delete redirect override,
+// and the admin repos delete write.
+// ---------------------------------------------------------------------------
+
+describe("POST /user/settings/update_preferences (web.go:636)", () => {
+  async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
+    return uiRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
+  }
+
+  async function sessionHeader(userId: number): Promise<string> {
+    return `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, userId)}`;
+  }
+
+  async function storedFlag(userId: number): Promise<string | undefined> {
+    const row = await drizzle(env.DB)
+      .select({ settingValue: userSettingsKv.settingValue })
+      .from(userSettingsKv)
+      .where(and(eq(userSettingsKv.userId, userId), eq(userSettingsKv.settingKey, "code_view.show_file_tree")))
+      .get();
+    return row?.settingValue;
+  }
+
+  it("stores the flag for a signed-in user and answers JSONOK; the toggle flips the stored bytes", async () => {
+    const user = await seedVerifiedUser({ username: "pref-user" });
+    const cookie = await sessionHeader(user.id);
+    const post = (body: string): RequestInit => ({
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://test.local", cookie },
+      body,
+    });
+
+    const hide = await fetchUi("/user/settings/update_preferences", post(JSON.stringify({ codeViewShowFileTree: false })));
+    expect(hide.status).toBe(200);
+    expect(await hide.text()).toBe('{"ok":true}');
+    expect(await storedFlag(user.id)).toBe("false");
+
+    const show = await fetchUi("/user/settings/update_preferences", post(JSON.stringify({ codeViewShowFileTree: true })));
+    expect(show.status).toBe(200);
+    // the upsert arbitrated at the (user_id, setting_key) unique — one row, new bytes
+    const rows = await drizzle(env.DB).select().from(userSettingsKv).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.settingValue).toBe("true");
+    expect(rows[0]?.settingKey).toBe("code_view.show_file_tree");
+    expect(rows[0]?.userId).toBe(user.id);
+  });
+
+  it("a missing field stores Go's zero (false); unknown fields are ignored", async () => {
+    const user = await seedVerifiedUser({ username: "pref-user2" });
+    const cookie = await sessionHeader(user.id);
+    const res = await fetchUi("/user/settings/update_preferences", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://test.local", cookie },
+      body: JSON.stringify({ somethingElse: 1 }),
+    });
+    expect(res.status).toBe(200);
+    expect(await storedFlag(user.id)).toBe("false");
+  });
+
+  it("a malformed body and a wrong-typed field are the 400 json-decode arm", async () => {
+    const user = await seedVerifiedUser({ username: "pref-user3" });
+    const cookie = await sessionHeader(user.id);
+    const bad = await fetchUi("/user/settings/update_preferences", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://test.local", cookie },
+      body: "{not json",
+    });
+    expect(bad.status).toBe(400);
+    const wrongType = await fetchUi("/user/settings/update_preferences", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://test.local", cookie },
+      body: JSON.stringify({ codeViewShowFileTree: "yes" }),
+    });
+    expect(wrongType.status).toBe(400);
+    const rows = await drizzle(env.DB).select().from(userSettingsKv).all();
+    expect(rows).toHaveLength(0); // nothing written on either refusal
+  });
+
+  it("an anonymous POST 303s onto the login round-trip (reqSignIn) and a GET twin answers chi's 405", async () => {
+    const anon = await fetchUi("/user/settings/update_preferences", {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://test.local" },
+      body: "{}",
+    });
+    expect(anon.status).toBe(303);
+    expect(anon.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent("/user/settings/update_preferences")}`,
+    );
+    const twin = await fetchUi("/user/settings/update_preferences", { method: "GET" });
+    expect(twin.status).toBe(405);
+    expect(twin.headers.get("allow")).toBe("POST");
+  });
+});
+
+describe("GET /org/{org}/dashboard/-/heatmap[/{team}] (web.go:984-985)", () => {
+  const T0 = 1_700_000_000;
+
+  async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
+    return uiRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
+  }
+
+  async function sessionHeader(userId: number): Promise<string> {
+    return `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, userId)}`;
+  }
+
+  /** The org fixture: an owner, a team member (on Developers), a plain org
+   *  member (no team), and an outsider. */
+  async function seedFixture(): Promise<{ orgId: number; ownerId: number; teamMemberId: number; memberId: number; outsiderId: number; teamId: number }> {
+    const orgs = new OrgService(env.DB);
+    const owner = await seedVerifiedUser({ username: "hm-owner" });
+    const teamMember = await seedVerifiedUser({ username: "hm-teammember" });
+    const member = await seedVerifiedUser({ username: "hm-member" });
+    const outsider = await seedVerifiedUser({ username: "hm-outsider" });
+    const org = await orgs.createOrg({ name: "hm-org", ownerId: owner.id, visibility: "public", now: new Date(T0 * 1000) });
+    await orgs.addMember(org.id, member.id, { now: new Date(T0 * 1000) }); // the plain member: no team
+    await orgs.addMember(org.id, teamMember.id, { now: new Date(T0 * 1000) }); // RequireMember's row
+    const teams = new TeamsService(env.DB);
+    const team = await teams.createTeam(org, { name: "Developers", permission: "read" });
+    await teams.addTeamMember(team, teamMember.id);
+    return { orgId: org.id, ownerId: owner.id, teamMemberId: teamMember.id, memberId: member.id, outsiderId: outsider.id, teamId: team.id };
+  }
+
+  it("serves the pair-shape JSON to a member and 404-shells anonymous and non-members", async () => {
+    const fx = await seedFixture();
+
+    const anon = await fetchUi("/org/hm-org/dashboard/-/heatmap");
+    expect(anon.status).toBe(404); // RequireMember — NO login redirect
+
+    const outsider = await fetchUi("/org/hm-org/dashboard/-/heatmap", {
+      headers: { cookie: await sessionHeader(fx.outsiderId) },
+    });
+    expect(outsider.status).toBe(404);
+
+    const member = await fetchUi("/org/hm-org/dashboard/-/heatmap", {
+      headers: { cookie: await sessionHeader(fx.memberId) },
+    });
+    expect(member.status).toBe(200);
+    expect(member.headers.get("content-type")).toContain("application/json");
+    expect(await member.json()).toEqual({ heatmapData: [], totalContributions: 0 });
+  });
+
+  it("the {team} tail resolves case-folded behind RequireTeamMember; a miss shells", async () => {
+    const fx = await seedFixture();
+
+    // The plain member is not on Developers — RequireTeamMember's shell.
+    const offTeam = await fetchUi("/org/hm-org/dashboard/-/heatmap/developers", {
+      headers: { cookie: await sessionHeader(fx.memberId) },
+    });
+    expect(offTeam.status).toBe(404);
+
+    // The team member passes (the case-folded lower-name resolution).
+    const onTeam = await fetchUi("/org/hm-org/dashboard/-/heatmap/DEVELOPERS", {
+      headers: { cookie: await sessionHeader(fx.teamMemberId) },
+    });
+    expect(onTeam.status).toBe(200);
+    expect(await onTeam.json()).toEqual({ heatmapData: [], totalContributions: 0 });
+
+    // An unknown team name shells like the page family's resolution arm.
+    const ghost = await fetchUi("/org/hm-org/dashboard/-/heatmap/ghost", {
+      headers: { cookie: await sessionHeader(fx.ownerId) },
+    });
+    expect(ghost.status).toBe(404);
+  });
+});
+
+describe("the editor underscore aliases (web.go:1453-1467)", () => {
+  async function fetchUi(path: string): Promise<Response> {
+    return uiRouter.fetch(new Request(`https://test.local${path}`), uiEnv);
+  }
+
+  it("each underscore spelling reaches the editor's anonymous arm (the login 303), not the engine 404", async () => {
+    await seedVerifiedUser({ username: "alias-owner" });
+    await seedRepo("alias-owner", "aliased");
+    for (const path of [
+      "/alias-owner/aliased/_new/main",
+      "/alias-owner/aliased/_edit/main/x.txt",
+      "/alias-owner/aliased/_delete/main/x.txt",
+      "/alias-owner/aliased/_upload/main",
+      "/alias-owner/aliased/_diffpatch/main",
+    ]) {
+      const res = await fetchUi(path);
+      expect(res.status, path).toBe(303);
+      expect(res.headers.get("location"), path).toBe(
+        `/login?redirect_to=${encodeURIComponent(path)}`,
+      );
+    }
+  });
+});
+
+describe("settingsSubmit's danger threading (the doer + env tails) and the delete redirect override", () => {
+  async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
+    return uiRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
+  }
+
+  async function sessionHeader(userId: number): Promise<string> {
+    return `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, userId)}`;
+  }
+
+  const formPost = (path: string, body: Record<string, string>, cookie: string): RequestInit => ({
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://test.local", cookie },
+    body: new URLSearchParams(body).toString(),
+  });
+
+  it("the delete arm redirects onto the owner dashboard: / for a user owner, /org/{name}/dashboard for an org owner", async () => {
+    const admin = await seedVerifiedUser({ username: "del-admin", isAdmin: true });
+    const owner = await seedVerifiedUser({ username: "del-owner" }); // the org twin's creator
+    await seedRepo("del-owner", "goner");
+    const cookie = await sessionHeader(admin.id);
+
+    const res = await fetchUi(
+      "/del-owner/goner/settings",
+      formPost("/del-owner/goner/settings", { action: "delete", repo_name: "del-owner/goner" }, cookie),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/"); // user.DashboardLink() — AppSubURL + "/"
+    const rows = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).all();
+    expect(rows).toHaveLength(0);
+
+    // The org-owned twin: OrganisationLink() + "/dashboard".
+    const orgs = new OrgService(env.DB);
+    const org = await orgs.createOrg({ name: "del-org", ownerId: owner.id, visibility: "public", now: new Date() });
+    const orgRepoId = crypto.randomUUID();
+    await drizzle(env.DB).insert(repositories).values({
+      id: orgRepoId,
+      storageKey: `r_${orgRepoId}`,
+      ownerNamespace: "del-org",
+      ownerId: org.id,
+      slug: "orgrepo",
+      visibility: "public",
+    });
+    const orgRes = await fetchUi(
+      "/del-org/orgrepo/settings",
+      formPost("/del-org/orgrepo/settings", { action: "delete", repo_name: "del-org/orgrepo" }, cookie),
+    );
+    expect(orgRes.status).toBe(303);
+    expect(orgRes.headers.get("location")).toBe("/org/del-org/dashboard");
+    const after = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).all();
+    expect(after).toHaveLength(0);
+  });
+
+  it("the transfer arm records the SESSION user as the pending doer (the threaded viewer, not the repo owner)", async () => {
+    const admin = await seedVerifiedUser({ username: "xfer-admin", isAdmin: true });
+    await seedVerifiedUser({ username: "xfer-owner" });
+    const target = await seedVerifiedUser({ username: "xfer-target" });
+    await seedRepo("xfer-owner", "movable");
+    const cookie = await sessionHeader(admin.id);
+
+    const res = await fetchUi(
+      "/xfer-owner/movable/settings",
+      formPost("/xfer-owner/movable/settings", { action: "transfer", repo_name: "xfer-owner/movable", new_owner_name: "xfer-target" }, cookie),
+    );
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/xfer-owner/movable/settings");
+    const pending = await drizzle(env.DB).select().from(repoTransfer).all();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.doerId).toBe(admin.id); // the session viewer — the unthreaded call recorded the OWNER
+    expect(pending[0]?.newOwnerId).toBe(target.id);
+  });
+});
+
+describe("POST /-/admin/repos/delete (web.go:851)", () => {
+  async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
+    return uiRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
+  }
+
+  async function sessionHeader(userId: number): Promise<string> {
+    return `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, userId)}`;
+  }
+
+  it("deletes the row for a site admin and 303s back onto the list; unknown ids 303 silently; the GET twin 405s", async () => {
+    const admin = await seedVerifiedUser({ username: "adm-del-admin", isAdmin: true });
+    await seedVerifiedUser({ username: "adm-del-owner" });
+    await seedRepo("adm-del-owner", "adm-goner");
+    const seeded = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).all();
+    expect(seeded).toHaveLength(1);
+    const repoId = seeded[0]?.id as string;
+    const cookie = await sessionHeader(admin.id);
+
+    const twin = await fetchUi("/-/admin/repos/delete", { method: "GET" });
+    expect(twin.status).toBe(405);
+    expect(twin.headers.get("allow")).toBe("POST");
+
+    const ghost = await fetchUi("/-/admin/repos/delete", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://test.local", cookie },
+      body: new URLSearchParams({ id: "no-such-repo" }).toString(),
+    });
+    expect(ghost.status).toBe(303); // the stale-form arm — silent
+    expect(ghost.headers.get("location")).toBe("/-/admin/repos");
+
+    const res = await fetchUi("/-/admin/repos/delete", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://test.local", cookie },
+      body: new URLSearchParams({ id: repoId }).toString(),
+    });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/-/admin/repos");
+    const after = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).all();
+    expect(after).toHaveLength(0);
+  });
+
+  it("a non-admin POST 404-shells (the prologue's gate)", async () => {
+    const plain = await seedVerifiedUser({ username: "adm-del-plain" });
+    const res = await fetchUi("/-/admin/repos/delete", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        origin: "https://test.local",
+        cookie: await sessionHeader(plain.id),
+      },
+      body: new URLSearchParams({ id: "whatever" }).toString(),
+    });
+    expect(res.status).toBe(404);
   });
 });

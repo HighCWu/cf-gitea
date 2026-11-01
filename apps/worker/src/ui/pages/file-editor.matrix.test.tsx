@@ -222,10 +222,25 @@ describe("claim pin (the family's parse shapes wave8 does not carry)", () => {
     expect(handlesUiRoute("/octo/hello/delete/main/x.txt")).toBe(true);
   });
 
-  it("upstream's underscored literals stay unclaimed (the brief pins the bare names)", () => {
-    expect(parseUiRoute("/octo/hello/_edit/main/x.txt")).toBeNull();
-    expect(parseUiRoute("/octo/hello/_new/main")).toBeNull();
-    expect(parseUiRoute("/octo/hello/_delete/main/x.txt")).toBeNull();
+  it("upstream's underscored literals claim the SAME families (the dual-spelling landing — the bare-pin divergence retired)", () => {
+    expect(parseUiRoute("/octo/hello/_edit/main/x.txt")).toEqual({
+      family: "file-edit",
+      owner: "octo",
+      repo: "hello",
+      refSuffix: "main/x.txt",
+    });
+    expect(parseUiRoute("/octo/hello/_new/main")).toEqual({
+      family: "file-new",
+      owner: "octo",
+      repo: "hello",
+      refSuffix: "main",
+    });
+    expect(parseUiRoute("/octo/hello/_delete/main/x.txt")).toEqual({
+      family: "file-delete",
+      owner: "octo",
+      repo: "hello",
+      refSuffix: "main/x.txt",
+    });
   });
 });
 

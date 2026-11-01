@@ -492,7 +492,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     expect(ths.every((el) => el.attrs.scope === "col"), "every th carries scope=col (the closed gap)").toBe(true);
   });
 
-  it("admin-repos: the admin sidebar names every arm (Repositories active), the ten headers are named and scoped, and the fixture row pins the fixed id", () => {
+  it("admin-repos: the admin sidebar names every arm (Repositories active), the eleven headers are named and scoped, and the fixture row pins the fixed id", () => {
     const root = parseHtmlTree(adminReposGolden);
     const nav = descendants(root).find((el) => hasClass(el, "flex-container-nav"));
     expect(nav, "the admin sidebar nav").toBeDefined();
@@ -528,8 +528,8 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     const headings = descendants(root).filter((el) => /^h[1-6]$/.test(el.tag));
     expect(headings.map((el) => accessibleName(el))).toEqual(["Repository Management (Total: 1)"]);
 
-    // The repos table: ten header cells, every one named and scope-carrying
-    // (five via the text + aria-hidden-svg SortHeader anchors, five plain).
+    // The repos table: eleven header cells, every one named and scope-carrying
+    // (five via the text + aria-hidden-svg SortHeader anchors, six plain).
     const table = descendants(root).find((el) => el.tag === "table");
     expect(table, "the repos table").toBeDefined();
     const thead = (table ?? root).children.find((el) => el.tag === "thead");
@@ -546,6 +546,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "Size",
       "Updated",
       "Created",
+      "Op.", // the delete column (list.tmpl:43) — the registration landed, the button renders
     ]);
     expect(ths.every((el) => el.attrs.scope === "col"), "every th carries scope=col").toBe(true);
 
@@ -556,7 +557,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     const bodyRow = descendants(table ?? root).find((el) => el.tag === "tr" && descendants(el).some((c) => c.tag === "td"));
     expect(bodyRow, "the tbody row").toBeDefined();
     const tds = descendants(bodyRow ?? root).filter((el) => el.tag === "td");
-    expect(tds).toHaveLength(10);
+    expect(tds).toHaveLength(11);
     expect(accessibleName(tds[0] ?? ({} as never))).toBe("00000000-0000-4000-8000-000000000001");
     expect(
       tds[1] ? descendants(tds[1]).filter((el) => el.tag === "a").map((el) => [el.attrs.href, accessibleName(el)]) : [],

@@ -327,10 +327,21 @@ describe("claim pins (the sha-gated cherrypick suffix, the bare literals)", () =
     // is `_cherrypick` (web.go:1468), so every bare-literal shape stays
     // engine-owned (the deep review's F5 flip).
     expect(parseUiRoute(`/octo/hello/cherrypick/${GHOST_SHA}/main`)).toBeNull();
-    // The OTHER underscored editor literals stay unclaimed (the family's
-    // brief pins the bare names — the file-editor matrix's twin arm).
-    expect(parseUiRoute("/octo/hello/_upload/main")).toBeNull();
-    expect(parseUiRoute("/octo/hello/_diffpatch/main")).toBeNull();
+    // The OTHER underscored editor literals claim their families now (the
+    // dual-spelling landing — upstream's own spellings, web.go:1459/1466;
+    // the file-editor matrix's twin arm).
+    expect(parseUiRoute("/octo/hello/_upload/main")).toEqual({
+      family: "file-upload",
+      owner: "octo",
+      repo: "hello",
+      refSuffix: "main",
+    });
+    expect(parseUiRoute("/octo/hello/_diffpatch/main")).toEqual({
+      family: "editor-patch",
+      owner: "octo",
+      repo: "hello",
+      refSuffix: "main",
+    });
   });
 });
 

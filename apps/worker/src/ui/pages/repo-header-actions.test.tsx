@@ -316,6 +316,7 @@ function syntheticRepo(overrides: Partial<RepoRow> = {}): RepoRow {
     numStars: 0,
     numWatches: 0,
     numForks: 0,
+    numClosedMilestones: 0,
     ...overrides,
   };
 }

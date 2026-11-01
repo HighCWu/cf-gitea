@@ -58,16 +58,16 @@
  *             zero-filled or dash column would fabricate data (the
  *             explore.tsx "no D1 sources" omission rule); the header's
  *             lfssize sorter dies with it
- *   (Op)      OMITTED — the column holds ONLY the delete-modal button
- *             (list.tmpl:82-87, 99-109) targeting POST /-/admin/repos/delete
- *             (web.go:834) — the WRITE SEAM is landed below
- *             (deleteAdminRepoFromForm, upstream admin.DeleteRepo over the
- *             shared RepoService.deleteRepository) but the ROUTE
- *             REGISTRATION is blocked on ui/index.ts (outside this
- *             module's ownership; the mount recipe is in the ladder's doc),
- *             and a rendered button posting to an unregistered route would
- *             be a dead control (the dead-link rule §2.4.1) — render the
- *             button with, and only with, that registration
+ *   (Op)      LIVE — the column is the delete-modal button's no-JS
+ *             reduction (list.tmpl:82-87's red trash → the plain-form POST
+ *             to /-/admin/repos/delete, web.go:851, the admin-emails
+ *             delete arm's shape): the WRITE SEAM is deleteAdminRepoFromForm
+ *             below (upstream admin.DeleteRepo over the shared
+ *             RepoService.deleteRepository) and the ROUTE REGISTRATION is
+ *             landed in ui/index.ts (family "admin-repos-delete" — the
+ *             admin-emails-delete shape; sameOriginGuard + adminPagePrologue
+ *             → the delete → 303 onto the list). Only the LFS Size column
+ *             stays omitted (the header's LFS Size row).
  *
  * The header's "Unadopted Repositories" button (list.tmpl:6 →
  * /-/admin/repos/unadopted) targets an UNLANDED page → omitted.
@@ -131,7 +131,7 @@ import { searchRepositories, type RepositoryWithOwner, type Viewer as ApiViewer 
 import { RepoNotExistError, RepoService } from "../../repos/service";
 
 import { formatByteSize, parsePageNumber } from "../page-data";
-import { renderPage } from "../shell";
+import { Icon, renderPage } from "../shell";
 import {
   AdminEmbeddedSvg,
   AdminFamilyPagination,
@@ -186,6 +186,8 @@ export const adminReposLocale = {
   col_size: "Size", // "admin.repos.size" (list.tmpl:33)
   col_updated: "Updated", // "admin.auths.updated" (list.tmpl:40)
   col_created: "Created", // "admin.users.created" (list.tmpl:41)
+  col_op: "Op.", // "admin.notices.op" (list.tmpl:43 — the delete column)
+  op_delete_aria: "Delete This Repository", // "repo.settings.delete" (the modal's title the trash link opens — the icon-button additive aria)
   archived: "Archived", // "repo.desc.archived" (list.tmpl:53)
   private: "Private", // "repo.desc.private" (list.tmpl:56)
   internal: "Internal", // "repo.desc.internal" (list.tmpl:59)
@@ -311,7 +313,9 @@ export function adminRepoSortMapping(sort: AdminRepoSort): { sort: string; order
 
 // ---------------------------------------------------------------------------
 // The delete ladder (upstream admin.DeleteRepo, repos.go:43-57 — the review
-// R2 arm; the write seam is LANDED, the route registration is BLOCKED)
+// R2 arm; the write seam is LANDED and the route registration is LIVE —
+// ui/index.ts's family "admin-repos-delete", the mounted POST
+// /-/admin/repos/delete)
 // ---------------------------------------------------------------------------
 
 export type AdminRepoDeleteResult = { outcome: "deleted" } | { outcome: "missing" };
@@ -328,15 +332,13 @@ export type AdminRepoDeleteResult = { outcome: "deleted" } | { outcome: "missing
  * `/-/admin/repos/delete?id=N`); the flash + JSONRedirect("") reload ride
  * the future registration.
  *
- * ROUTE REGISTRATION BLOCKED (ui/index.ts, outside this module's
- * ownership): POST /-/admin/repos/delete needs the admin literal family's
- * parse arm (`tail.length === 2 && tail[0] === "repos" && tail[1] ===
- * "delete"` → family "admin-repos-delete", the admin-emails-delete shape)
- * plus its registered handler — adminPagePrologue → sameOriginGuard →
- * this function → 303 back onto the list. Until that lands, the row-level
- * delete button deliberately renders NOTHING: a form posting to an
- * unregistered route is a dead control (§2.4.1) — the module header's
- * (Op) note stands, with the write seam now ready beneath it.
+ * ROUTE REGISTRATION LANDED (ui/index.ts): POST /-/admin/repos/delete is
+ * the admin literal family's parse arm (`tail.length === 2 && tail[0] ===
+ * "repos" && tail[1] === "delete"` → family "admin-repos-delete", the
+ * admin-emails-delete shape) plus its registered handler — sameOriginGuard
+ * → adminPagePrologue → this function → 303 back onto the list. The
+ * row-level delete button renders with the registration live (the page
+ * component's Op column); the GET twin answers chi's 405.
  */
 export async function deleteAdminRepoFromForm(d1: D1Database, repoId: string): Promise<AdminRepoDeleteResult> {
   try {
@@ -428,7 +430,7 @@ export function renderAdminReposPage(ctx: UiContext, data: AdminReposData): stri
  *  repos.go:31). */
 export function AdminReposPage(props: { ctx: UiContext; data: AdminReposData }) {
   const { params } = props.data;
-  const colCount = 10; // the live columns (LFS Size + Op omitted — the module header)
+  const colCount = 11; // the live columns (LFS Size omitted — the module header; the Op column is the delete form)
   const sortHref = (sort: string): string => {
     const next = new URLSearchParams(props.data.query);
     if (sort === "recentupdate") {
@@ -587,6 +589,7 @@ export function AdminReposPage(props: { ctx: UiContext; data: AdminReposData }) 
               </th>
               <th scope="col">{adminReposLocale.col_updated}</th>
               <th scope="col">{adminReposLocale.col_created}</th>
+              <th scope="col">{adminReposLocale.col_op}</th>
             </tr>
           </thead>
           <tbody>
@@ -640,6 +643,18 @@ export function AdminReposPage(props: { ctx: UiContext; data: AdminReposData }) 
                   <td>{formatByteSize(repo.sizeKb * 1024)}</td>
                   <td>{repo.updatedAt !== null ? formatAdminDate(repo.updatedAt) : ""}</td>
                   <td>{formatAdminDate(repo.createdAt)}</td>
+                  {/* The Op column (list.tmpl:82-87): the red trash opening
+                      the delete modal upstream — the no-JS plain-form POST
+                      reduction (the admin-emails delete arm's shape), the
+                      registration now live behind it. */}
+                  <td>
+                    <form method="post" action="/-/admin/repos/delete" class="tw-inline">
+                      <input type="hidden" name="id" value={repo.id} />
+                      <button type="submit" class="tw-text-red link-action negative" aria-label={adminReposLocale.op_delete_aria}>
+                        <Icon name="octicon-trash" />
+                      </button>
+                    </form>
+                  </td>
                 </tr>
               ))
             )}

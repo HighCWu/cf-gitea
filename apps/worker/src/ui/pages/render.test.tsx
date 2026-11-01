@@ -77,6 +77,7 @@ const ctx: UiContext = {
     numStars: 0,
     numWatches: 0,
     numForks: 0,
+    numClosedMilestones: 0,
   } satisfies RepoRow,
 };
 

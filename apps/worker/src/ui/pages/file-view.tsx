@@ -27,6 +27,24 @@
  * whenever `fInfo.isLFSFile()` — meta row or not — so a pointer file's
  * Raw button, copy control, and view-raw media sources resolve LFS while
  * a regular file keeps /raw (SingleDownload has no LFS arm at the pin).
+ *
+ * The blob view's sidebar carries the upstream file-tree toggle PAIR
+ * (view_file_tree.tmpl:3-8's hide button inside the container +
+ * view_file_tree_toggle_button.tmpl's show button beside it — our port had
+ * omitted both): each carries the official bundle's contract verbatim
+ * (class `repo-view-file-tree-toggle`, `data-global-click=
+ * "onRepoViewFileTreeToggle"`, `data-toggle-action`, the diff locale
+ * tooltips — "repo.diff.hide_file_tree"/"show_file_tree") so the bundle's
+ * repo-view-file-tree.ts toggles the container client-side and POSTs
+ * `{codeViewShowFileTree}` to /user/settings/update_preferences for a
+ * signed-in user (the landed KV write, ui/index.ts). The rendered INITIAL
+ * state rides the optional `showFileTree` prop (default true —
+ * view_home.go:360-371's GetUserSetting default): the read-back from the
+ * user_settings_kv store is a REPORTED follow-up (render.tsx's one-line
+ * `showFileTree={…}` thread — render.tsx is outside this module's wave
+ * ownership), so every render currently uses the default-true posture and
+ * the pair renders only on BLOB views (the only views whose sidebar
+ * exists — a toggle with no container would be a dead control).
  */
 
 import type { CommitJson, TreeEntryJson } from "@cf-gitea/git-engine";
@@ -119,7 +137,10 @@ function probeIsLfsFile(blobData: Uint8Array): boolean {
 
 /** The current-dir sidebar (§2.1: one listTree call, no lazy tree v1).
  *  Exported for the file editor (pages wave 8) — editor/edit.tmpl renders the
- *  same view_file_tree beside its form. */
+ *  same view_file_tree beside its form. The button row leads with upstream's
+ *  hide-toggle (view_file_tree.tmpl:3-8 — the class/data contract verbatim:
+ *  the bundle's onRepoViewFileTreeToggle flips the container client-side and
+ *  POSTs the preference for a signed-in user; see the module header). */
 export function FileTreeSidebar(props: {
   repoLink: string;
   refType: RefType;
@@ -131,6 +152,15 @@ export function FileTreeSidebar(props: {
   return (
     <div class="repo-view-file-tree-container">
       <div class="flex-text-block repo-button-row">
+        <button
+          type="button"
+          class="repo-view-file-tree-toggle ui button"
+          data-global-click="onRepoViewFileTreeToggle"
+          data-toggle-action="hide"
+          data-tooltip-content="Hide file tree"
+        >
+          <Icon name="octicon-sidebar-expand" />
+        </button>
         <b>Files</b>
       </div>
       <div id="view-file-tree">
@@ -346,12 +376,19 @@ export async function loadFileViewData(
  * views (view_file.tmpl:72-84's CanContentChange block, at the editor's
  * literal route names). The golden renders are anonymous → canWrite false →
  * byte-identical to the pre-wave DOM.
+ *
+ * The toggle-pair's show button (view_file_tree_toggle_button.tmpl — the
+ * `repo-view-file-tree-toggle` emitter beside the container, blob views
+ * only) renders with the `tw-hidden` state the optional `showFileTree` prop
+ * carries (default true — the GetUserSetting default, view_home.go:363-370;
+ * the read-back thread is the reported render.tsx follow-up, module header).
  */
-export function FileViewPage(props: { ctx: UiContext; data: FileViewData; canWrite?: boolean }) {
+export function FileViewPage(props: { ctx: UiContext; data: FileViewData; canWrite?: boolean; showFileTree?: boolean }) {
   const { ctx, data } = props;
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("FileViewPage requires ctx.repo");
   if ("notFound" in data) throw new Error("FileViewPage received notFound — render.tsx answers the 404 shell");
+  const showFileTree = props.showFileTree ?? true;
 
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   const { refType, ref } = data.active;
@@ -367,6 +404,20 @@ export function FileViewPage(props: { ctx: UiContext; data: FileViewData; canWri
   const chrome = (
     <div class="repo-button-row">
       <div class="repo-button-row-left">
+        {data.kind === "blob" ? (
+          // view_content.tmpl:6-11's show-toggle (rendered only off the tree
+          // root upstream; here blob views only — the views whose sidebar
+          // exists). Hidden when the tree shows (the default-true posture).
+          <button
+            type="button"
+            class={`repo-view-file-tree-toggle ui button not-mobile${showFileTree ? " tw-hidden" : ""}`}
+            data-global-click="onRepoViewFileTreeToggle"
+            data-toggle-action="show"
+            data-tooltip-content="Show file tree"
+          >
+            <Icon name="octicon-sidebar-collapse" />
+          </button>
+        ) : null}
         <BranchSelector
           repoLink={repoLink}
           family="src"

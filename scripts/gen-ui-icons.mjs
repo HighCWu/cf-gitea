@@ -202,6 +202,12 @@ const ALLOWLIST = [
   'octicon-diff',
   'octicon-file-added',
   'octicon-upload',
+  // The file-view file-tree toggle wave (view_file_tree.tmpl:3-8 +
+  // view_file_tree_toggle_button.tmpl — the pair pages/file-view.tsx renders
+  // on blob views; the collapse glyph is the show-toggle's mark, the expand
+  // glyph the hide-toggle's). Both carry multi-path 16x16 bodies at the pin.
+  'octicon-sidebar-collapse',
+  'octicon-sidebar-expand',
 ];
 
 // What shell.tsx's Icon component hardcodes; a body needing anything else

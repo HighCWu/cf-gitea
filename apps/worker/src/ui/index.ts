@@ -687,7 +687,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { trimTrailingSlash } from "hono/trailing-slash";
 
 import { isReservedOwnerName } from "../repos/service";
-import { repositories, teamRepoAccess, users } from "../db/schema";
+import { repositories, teamRepoAccess, userSettingsKv, users } from "../db/schema";
 import type { RunRow } from "../services/actions/model";
 import { engineClient } from "./engine";
 import { readUrlEncodedForm } from "./forms";
@@ -1343,7 +1343,7 @@ import { monitorPlatformConfigFromEnv } from "../services/monitor/platform";
 import { AdminFamilyNav, loadAdminUsersData, renderAdminUsersPage } from "./pages/admin-users";
 import { OrgSettingsNavbar, UserSettingsNavbar } from "./components/settings-nav";
 import { loadAdminOrgsData, renderAdminOrgsPage } from "./pages/admin-orgs";
-import { loadAdminReposData, renderAdminReposPage } from "./pages/admin-repos";
+import { deleteAdminRepoFromForm, loadAdminReposData, renderAdminReposPage } from "./pages/admin-repos";
 // The tick-18 packages arm (pages/admin-packages.tsx — upstream
 // /-/admin/packages, web.go:852-858's /packages group GET).
 import { loadAdminPackagesData, renderAdminPackagesPage } from "./pages/admin-packages";
@@ -3112,9 +3112,12 @@ export interface WikiRawRoute {
 }
 
 /** The wave-8 file-editor family (pages/file-editor.tsx): upstream's
- *  `/{editor_action:_edit|_new|_delete}/*` Combos under
- *  `RepoRefByType(git.RefTypeBranch)` (web.go:1453-1461) at the wave brief's
- *  literal names (`new`/`edit`/`delete`). The tail is the decoded
+ *  `/{editor_action:_edit|_new|_delete|_upload|_diffpatch}/*` Combos under
+ *  `RepoRefByType(git.RefTypeBranch)` (web.go:1453-1467) claimed in BOTH
+ *  spellings — the underscore literals are upstream's own, the bare twins
+ *  (`new`/`edit`/`delete`/`upload`/`patch`) stay for our emitters (the
+ *  file-view page's hrefs; the bare-pin divergence retired with the alias
+ *  landing, pages/file-editor.tsx's note). The tail is the decoded
  *  branch+path rest; it resolves against the BRANCH universe only at page
  *  time (pages/file-editor.tsx's loadFileEditorData — the /src walk's
  *  branch arm, so a slash-bearing branch takes the shortest existing
@@ -3537,6 +3540,11 @@ export interface AdminRoute {
     | "admin-users"
     | "admin-orgs"
     | "admin-repos"
+    // POST /-/admin/repos/delete (web.go:851 — admin.DeleteRepo; the listing
+    // row's delete-modal target, admin/repo/list.tmpl:82-87 — the page's
+    // no-JS plain-form reduction posts it). POST-only: the GET twin answers
+    // chi's 405.
+    | "admin-repos-delete"
     | "admin-packages"
     | "admin-emails"
     | "admin-emails-activate"
@@ -3674,6 +3682,10 @@ export interface UserSettingsTabRoute {
     | "user-settings-appearance"
     | "user-settings-appearance-theme"
     | "user-settings-appearance-language"
+    // POST /user/settings/update_preferences (web.go:636 — user_setting.
+    // UpdatePreferences, settings.go:23-33; the file-view page's toggle
+    // button is its emitter). POST-only: the GET twin answers chi's 405.
+    | "user-settings-update-preferences"
     | "user-settings-security"
     | "user-settings-security-account-link" // POST /user/settings/security/account_link (security.go:50-70 — the W5 unlink; the GET twin 405s)
     | "user-settings-security-twofa-enroll" // GET+POST /user/settings/security/two_factor/enroll (security/2fa.go:164-286)
@@ -3908,8 +3920,8 @@ export interface OrgSettingsRoute {
  *  and the "org" owner name is create-time reserved besides). The {team}
  *  tail is any decodable segment: upstream resolves it case-folded against
  *  the visible teams' lower names and 404s the miss (org.go:213-232, the
- *  RequireTeamMember arm included). The heatmap tails
- *  (`/dashboard/-/heatmap[/{team}]` — R03) and every deeper shape stay
+ *  RequireTeamMember arm included). The heatmap tails claim beside this
+ *  family (OrgDashboardHeatmapRoute below); every other deeper shape stays
  *  unclaimed → the engine's 404. */
 export interface OrgDashboardRoute {
   family: "org-dashboard";
@@ -3917,6 +3929,28 @@ export interface OrgDashboardRoute {
   owner: string;
   /** The decoded team-name tail (the `/{team}` arm — resolved case-folded
    *  against the org's teams at load). */
+  team?: string;
+}
+
+/** The org dashboard's heatmap JSON twins (the owner-scope heatmap's org
+ *  arms — census R03's org row): upstream web.go:984-985's
+ *  `m.Get("/dashboard/-/heatmap", user.DashboardHeatmap)` +
+ *  `m.Get("/dashboard/-/heatmap/{team}", user.DashboardHeatmap)` inside the
+ *  `/{org}` group's `OrgAssignment{RequireMember: true, RequireTeamMember:
+ *  true}` (web.go:979-993) — the SAME handler the landed user-scope
+ *  `/{username}/-/heatmap` twin serves, here under the org dashboard's
+ *  member-only prologue (heatmap.go:56-61's user-visibility check doesn't
+ *  fire in the org context because the group's RequireMember already gates).
+ *  The `-` segment is the dashboard URL's all-teams placeholder; the
+ *  `{team}` tail resolves case-folded behind RequireTeamMember exactly like
+ *  the page family's. GET-only registrations (upstream registers GETs; a
+ *  POST misses into the parent app's plain 404). */
+export interface OrgDashboardHeatmapRoute {
+  family: "org-dashboard-heatmap";
+  /** Decoded org segment. */
+  owner: string;
+  /** The decoded team-name tail (the `/heatmap/{team}` arm — resolved
+   *  case-folded against the org's teams at load). */
   team?: string;
 }
 
@@ -4064,6 +4098,7 @@ export type ParsedUiRoute =
   | RawMediaRoute
   | OwnerHeatmapRoute
   | UserCodeSearchRoute
+  | OrgDashboardHeatmapRoute
   | OrgInboxRoute;
 
 
@@ -4187,6 +4222,12 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     const numericId = (value: string | undefined): number | null =>
       value !== undefined && /^\d+$/.test(value) ? Number.parseInt(value, 10) : null;
     if (tail.length === 0) return { family: "user-settings" };
+    // The preferences write (web.go:636 — the bare POST beside the group's
+    // GET/POST pair; settings.go:23-33's UpdatePreferences): POST-only, the
+    // GET twin answers chi's 405 (the account_link shape).
+    if (tail.length === 1 && tail[0] === "update_preferences") {
+      return { family: "user-settings-update-preferences", id: null };
+    }
     if (tail.length === 1 && tail[0] === "appearance") return { family: "user-settings-appearance", id: null };
     if (tail.length === 2 && tail[0] === "appearance" && tail[1] === "theme") {
       return { family: "user-settings-appearance-theme", id: null };
@@ -4501,6 +4542,11 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     if (tail.length === 1 && tail[0] === "orgs") return { family: "admin-orgs" };
     if (tail.length === 1 && tail[0] === "repos") return { family: "admin-repos" };
+    // The listing's delete-modal write (web.go:851 — admin.DeleteRepo over
+    // the shared delete seam; admin-repos.tsx's deleteAdminRepoFromForm, the
+    // admin-emails-delete shape): the exact two-segment tail beside the
+    // bare list literal. POST-only — the GET twin answers chi's 405.
+    if (tail.length === 2 && tail[0] === "repos" && tail[1] === "delete") return { family: "admin-repos-delete" };
     // The tick-18 packages arm (pages/admin-packages.tsx — web.go:852-858's
     // /packages group): the bare list GET only. The group's delete/cleanup
     // POSTs stay unclaimed — unlanded writes (the module's dead-link note),
@@ -4779,8 +4825,28 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // team lower names at load (org.go:213-218's EqualFold walk, the
   // RequireTeamMember arm at org.go:226-236 behind it; a miss 404-shells —
   // upstream answers its NotFound page for any team param, so the segment
-  // claim is upstream-shaped). The heatmap tails (`/dashboard/-/heatmap[…]`,
-  // R03) and every deeper shape stay unclaimed → the engine's 404.
+  // claim is upstream-shaped). The R03 heatmap tails claim FIRST (the
+  // literal `-` + `heatmap` segments over 6-/7-segment shapes, web.go:
+  // 984-985 — disjoint depths from the {team} arm, claimed ahead of it for
+  // the static-first posture); every other deeper shape stays unclaimed →
+  // the engine's 404.
+  if (raw.length >= 6 && raw.length <= 7 && raw[1] === "org" && raw[3] === "dashboard" && raw[4] === "-" && raw[5] === "heatmap") {
+    let orgName: string;
+    try {
+      orgName = decodeURIComponent(raw[2] as string);
+    } catch {
+      return null;
+    }
+    if (raw.length === 6) return { family: "org-dashboard-heatmap", owner: orgName };
+    let teamName: string;
+    try {
+      teamName = decodeURIComponent(raw[6] as string);
+    } catch {
+      return null;
+    }
+    if (teamName === "") return null;
+    return { family: "org-dashboard-heatmap", owner: orgName, team: teamName };
+  }
   if (raw.length >= 4 && raw.length <= 5 && raw[1] === "org" && raw[3] === "dashboard") {
     let orgName: string;
     try {
@@ -6605,10 +6671,22 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     return { family: "repo-archive", owner, repo, refExt };
   }
-  // Wave-8 file editor: the `new`/`edit`/`delete` literals claim the
-  // branch+path tail shape (FileEditorRoute). Bare literals fall through to
-  // the engine (upstream chi requires the `/*` tail as well).
-  if (head === "new" || head === "edit" || head === "delete" || head === "upload") {
+  // Wave-8 file editor: the editor_action literals claim the branch+path
+  // tail shape (FileEditorRoute) in BOTH spellings — upstream's underscore
+  // family (`{editor_action:_new|_edit|_delete|_upload}`, web.go:1453-1460)
+  // and the bare twins our own emitters carry (the retired bare-pin
+  // divergence, pages/file-editor.tsx's note). Bare literals fall through
+  // to the engine (upstream chi requires the `/*` tail as well).
+  if (
+    head === "new" ||
+    head === "_new" ||
+    head === "edit" ||
+    head === "_edit" ||
+    head === "delete" ||
+    head === "_delete" ||
+    head === "upload" ||
+    head === "_upload"
+  ) {
     if (rest.length === 0) return null;
     let suffix: string;
     try {
@@ -6617,7 +6695,14 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       return null;
     }
     return {
-      family: head === "new" ? "file-new" : head === "edit" ? "file-edit" : head === "delete" ? "file-delete" : "file-upload",
+      family:
+        head === "new" || head === "_new"
+          ? "file-new"
+          : head === "edit" || head === "_edit"
+            ? "file-edit"
+            : head === "delete" || head === "_delete"
+              ? "file-delete"
+              : "file-upload",
       owner,
       repo,
       refSuffix: suffix,
@@ -6625,13 +6710,15 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   }
   // Window-2e C2b: the cherrypick/patch pages (web.go:1465-1470 — the sha
   // rides the cherrypick ROUTE between the literal and the branch tail;
-  // bare patch/{branch} is the patch family). The cherrypick literal is
-  // upstream's OWN underscore spelling — web.go:1468's
-  // `{editor_action:_cherrypick}` (the commit page's emitted URL carries it,
-  // commit_page.tmpl:65) — so the family claims `_cherrypick`; the bare
-  // `cherrypick` head is NOT an editor_action and stays engine-owned.
-  // Bare literals fall through.
-  if (head === "patch" || head === "_cherrypick") {
+  // bare patch/{branch} is the patch family). BOTH spellings serve the
+  // patch family: upstream's `{editor_action:_diffpatch}` (web.go:1466) and
+  // the bare `patch` our emitters carry (the editor family's dual-spelling
+  // posture above). The cherrypick literal is upstream's OWN underscore
+  // spelling — web.go:1468's `{editor_action:_cherrypick}` (the commit
+  // page's emitted URL carries it, commit_page.tmpl:65) — so the family
+  // claims `_cherrypick`; the bare `cherrypick` head is NOT an
+  // editor_action and stays engine-owned. Bare literals fall through.
+  if (head === "patch" || head === "_diffpatch" || head === "_cherrypick") {
     if (rest.length === 0) return null;
     let suffix: string;
     try {
@@ -6639,7 +6726,7 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     } catch {
       return null;
     }
-    if (head === "patch") return { family: "editor-patch", owner, repo, refSuffix: suffix };
+    if (head === "patch" || head === "_diffpatch") return { family: "editor-patch", owner, repo, refSuffix: suffix };
     if (splitCherryPickSuffix(suffix) === null) return null;
     return { family: "editor-cherrypick", owner, repo, refSuffix: suffix };
   }
@@ -7227,7 +7314,16 @@ async function settingsPage(c: Context<{ Bindings: Env }>): Promise<Response> {
 
 /** POST /{owner}/{repo}/settings — the basics write through the landed
  *  services (RepoService.rename/setVisibility + saveRepoSettings); success
- *  303s back onto the CANONICAL settings URL (a rename moves the slug). */
+ *  303s back onto the CANONICAL settings URL (a rename moves the slug).
+ *  The danger arms thread the viewer + the engine bindings (settings.tsx's
+ *  applyRepoDangerAction optional tails — the recorded one-line follow-ups:
+ *  the doer records on pending transfers + probes the block graph as the
+ *  session user, delete-wiki's sweep needs REPO_PACKS), and the DELETE
+ *  arm's redirect overrides onto the owner dashboard (upstream
+ *  handleSettingsPostDelete's JSONRedirect(ctx.Repo.Owner.DashboardLink()),
+ *  setting.go:980 — user owners land on `/`, org owners on
+ *  `/org/{name}/dashboard`, user.go:326-332; the deletion_success flash has
+ *  no renderable analog — the no-session-flash reduction). */
 async function settingsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
   const guard = sameOriginGuard(c.req.raw);
   if (guard !== null) return guard;
@@ -7235,10 +7331,19 @@ async function settingsSubmit(c: Context<{ Bindings: Env }>): Promise<Response> 
   if (!resolved.ok) return resolved.response;
   const gate = await settingsGate(c, resolved);
   if (gate !== null) return gate;
-  const { ctx, repo, respond } = resolved;
+  const { ctx, repo, viewer, respond } = resolved;
   const form = parseRepoBasicsForm(await readUrlEncodedForm(c.req.raw));
-  const result = await applyRepoBasics(c.env.DB, repo, form);
+  // The gate guarantees a signed-in viewer past this point (settingsGate's
+  // anonymous arm redirected); the narrow slice is the ladders' parameter.
+  const doer = viewer.kind === "user" ? { id: viewer.id, isAdmin: viewer.isAdmin } : undefined;
+  const result = await applyRepoBasics(c.env.DB, repo, form, doer, c.env);
   if (result.outcome === "applied") {
+    if (form.action === "delete") {
+      const isOrg = await loadOwnerIsOrg(c.env.DB, repo);
+      return respond(
+        new Response(null, { status: 303, headers: { location: isOrg ? `/org/${repo.ownerNamespace}/dashboard` : "/" } }),
+      );
+    }
     return respond(new Response(null, { status: 303, headers: { location: `/${repo.ownerNamespace}/${result.slug}/settings` } }));
   }
   const data = await loadRepoBasics(c.env.DB, repo);
@@ -10246,6 +10351,59 @@ async function userSettingsAppearanceSubmit(
   return p.respond(c.html(renderUserSettingsAppearancePage(p.ctx, data, { form: arm, message: outcome.message })));
 }
 
+/**
+ * Upstream `SettingsKeyCodeViewShowFileTree` (models/user/setting_options.go:19)
+ * — the generic user-settings KV key (schema.ts's `user_settings_kv` store,
+ * the actions.config precedent): the file-view page's tree visibility flag.
+ * Read back by prepareHomeTreeSideBarSwitch (view_home.go:360-371, default
+ * "true"); written ONLY here (the UpdatePreferences POST).
+ */
+const SETTINGS_KEY_CODE_VIEW_SHOW_FILE_TREE = "code_view.show_file_tree";
+
+/**
+ * POST /user/settings/update_preferences (web.go:636 — user_setting.
+ * UpdatePreferences, routers/web/user/setting/settings.go:23-33): the
+ * official bundle's file-tree toggle emitter (web_src/js/features/
+ * repo-view-file-tree.ts:22-24 POSTs `{codeViewShowFileTree}` on every
+ * toggle). The JSON decode is Go-strict: a non-object body, or an object
+ * whose codeViewShowFileTree is not a boolean, is the 400 "json decode
+ * failed" arm (settings.go:27-30); a missing field is Go's zero `false`,
+ * unknown fields are ignored. The write is the user_settings_kv upsert
+ * (models/user/setting.go:186-208's SetUserSetting — the SQLite
+ * ON CONFLICT arbitration of the update-then-insert dance) storing
+ * strconv.FormatBool's bytes; the answer is ctx.JSONOK's `{"ok":true}`.
+ * reqSignIn (the group's wrap) rides the prologue; the POST carries the
+ * §2.8 origin guard (the house fetch-POST convention), the GET twin
+ * answers chi's 405.
+ */
+async function userSettingsUpdatePreferences(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  let decoded: unknown;
+  try {
+    decoded = await c.req.json();
+  } catch {
+    return p.respond(new Response("json decode failed\n", { status: 400 }));
+  }
+  let flag = false;
+  if (decoded !== null) {
+    if (typeof decoded !== "object" || Array.isArray(decoded)) {
+      return p.respond(new Response("json decode failed\n", { status: 400 }));
+    }
+    const value = (decoded as Record<string, unknown>).codeViewShowFileTree;
+    if (value !== undefined && typeof value !== "boolean") {
+      return p.respond(new Response("json decode failed\n", { status: 400 }));
+    }
+    flag = value === true;
+  }
+  const settingValue = flag ? "true" : "false"; // strconv.FormatBool
+  await drizzle(c.env.DB)
+    .insert(userSettingsKv)
+    .values({ userId: p.viewer.id, settingKey: SETTINGS_KEY_CODE_VIEW_SHOW_FILE_TREE, settingValue })
+    .onConflictDoUpdate({ target: [userSettingsKv.userId, userSettingsKv.settingKey], set: { settingValue } });
+  return p.respond(new Response('{"ok":true}', { headers: { "content-type": "application/json;charset=utf-8" } }));
+}
+
 async function userSettingsSecurityPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const p = await userSettingsTabPrologue(c, false);
   if (!p.ok) return p.response;
@@ -11401,6 +11559,55 @@ async function orgDashboardPage(c: Context<{ Bindings: Env }>): Promise<Response
   const data = await loadOrgDashboardData(c.env.DB, org.org, viewer, url.origin, url.searchParams, team);
   const viewerName = viewer.kind === "user" ? viewer.username : "";
   return respond(c.html(renderOrgDashboardPage(ctx, data, viewerName), 200));
+}
+
+/**
+ * GET /org/{org}/dashboard/-/heatmap[/{team}] (web.go:984-985 — the org
+ * arms of user.DashboardHeatmap, the landed user-scope /{username}/-/heatmap
+ * twin's family): the org-dashboard page's member-only prologue runs
+ * VERBATIM (the group's OrgAssignment{RequireMember, RequireTeamMember} —
+ * anonymous AND non-members 404-shell, the census's Open Issues #9 posture;
+ * the {team} tail adds the case-folded resolution behind RequireTeamMember),
+ * then the landed heatmap seam composes over the org's users row
+ * (heatmap.go:67-69's GetUserHeatmapDataByOrgTeam arm reduces to the same
+ * loader — the org IS the subject user row here; ownerHeatmapJsonBody's
+ * pair-shape wire contract is shared verbatim). Honest scope note: the
+ * landed aggregation counts the subject's CREATED issues+comments (the
+ * documented action-table deviation, pages/owner-heatmap.ts's header), so
+ * the org scope aggregates the org row's own contributions — upstream's
+ * org arm (actions by ALL users across the org's owned repositories,
+ * user_heatmap.go:59's OnlyPerformedBy=!org flip) has no landed analog;
+ * the {team} tail gates but does not re-scope the aggregation (upstream's
+ * RequestedTeam repo-set filter rides the same absent action table).
+ */
+async function orgDashboardHeatmapData(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "org-dashboard-heatmap") return respond(await c.notFound()); // drift guard
+  const doer = orgFamilyDoer(viewer);
+  const org = await resolveOrgDashboardOrg(c.env.DB, route.owner, doer, url.pathname, orgFamilyQuery(url));
+  if (org.kind === "redirect") {
+    return respond(new Response(null, { status: 307, headers: { location: org.location } }));
+  }
+  if (org.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  if (!(await isOrgDashboardMember(c.env.DB, org.org, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  if (route.team !== undefined) {
+    const team = await resolveDashboardTeam(c.env.DB, org.org, route.team);
+    if (team === null || !(await isOrgDashboardTeamMember(c.env.DB, org.org, team, viewer))) {
+      return respond(c.html(renderNotFound(ctx), 404));
+    }
+  }
+  // The aggregation's subject: the org's users row (orgs ARE users-table
+  // rows — the loadOwnerHeatmapData signature's UserProfileRow).
+  const orgUser = await drizzle(c.env.DB).select().from(users).where(eq(users.id, org.org.id)).get();
+  if (orgUser === undefined) return respond(c.html(renderNotFound(ctx), 404));
+  const load = await loadOwnerHeatmapData(c.env.DB, orgUser);
+  if (load === null) return respond(c.html(renderNotFound(ctx), 404)); // the gate's miss class
+  return respond(c.json(JSON.parse(ownerHeatmapJsonBody(load))));
 }
 
 // ---------------------------------------------------------------------------
@@ -12861,6 +13068,26 @@ async function adminReposPage(c: Context<{ Bindings: Env }>): Promise<Response> 
   if (!p.ok) return p.response;
   const data = await loadAdminReposData(c.env.DB, p.ctx.viewer, new URL(c.req.raw.url).searchParams, oauth2FeatureEnabled(c.env));
   return p.respond(c.html(renderAdminReposPage(p.ctx, data)));
+}
+
+/**
+ * POST /-/admin/repos/delete (web.go:851 — admin.DeleteRepo, repos.go:43-57,
+ * over the SHARED delete seam the repo-settings danger zone composes): the
+ * §2.8 guard + the site-admin prologue, then the row id into
+ * deleteAdminRepoFromForm — the "missing" outcome (an unknown or stale id,
+ * upstream's ServerError arm) 303s silently like the hooks/emails deletes
+ * (the stale-form posture), the applied arm reloads the listing. The
+ * success flash + JSONRedirect("") reload reduce to the bare 303 (the
+ * no-session-flash convention).
+ */
+async function adminReposDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const form = await readUrlEncodedForm(c.req.raw);
+  await deleteAdminRepoFromForm(c.env.DB, form.get("id") ?? "");
+  return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/repos" } }));
 }
 
 /** GET /-/admin/packages (pages/admin-packages.tsx — upstream web.go:852-858's
@@ -18106,6 +18333,10 @@ uiRouter.get("/notifications/purge", () => methodNotAllowed("POST"));
 // not needed here: /user/settings POST carries the literal GET above, and
 // the teams POSTs hang off the /new literal's own GET+POST pair.
 uiRouter.get("/user/settings", (c) => userSettingsPage(c));
+// The preferences write (web.go:636 — POST-only; the GET twin answers chi's
+// 405 — the account_link convention).
+uiRouter.get("/user/settings/update_preferences", () => methodNotAllowed("POST"));
+uiRouter.post("/user/settings/update_preferences", (c) => userSettingsUpdatePreferences(c));
 // Window-2a: the tab families (each parse family's method arms — the
 // modules' handoff recipes).
 uiRouter.get("/user/settings/appearance", (c) => userSettingsAppearancePage(c));
@@ -18445,6 +18676,10 @@ uiRouter.post("/-/admin/users/:userid{\\d+}/avatar", (c) => adminUserAvatarSubmi
 uiRouter.post("/-/admin/users/:userid{\\d+}/avatar/delete", (c) => adminUserAvatarDeleteSubmit(c, Number.parseInt(c.req.param("userid"), 10)));
 uiRouter.get("/-/admin/orgs", (c) => adminOrgsPage(c));
 uiRouter.get("/-/admin/repos", (c) => adminReposPage(c));
+// The listing's delete write (web.go:851 — POST-only; the GET twin answers
+// chi's 405 — the account_link convention).
+uiRouter.get("/-/admin/repos/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/-/admin/repos/delete", (c) => adminReposDeleteSubmit(c));
 // The tick-18 packages arm (parseUiRoute claims exactly the bare literal —
 // web.go:852-858's list GET; the group's delete/cleanup POSTs stay
 // unregistered, the engine's 404).
@@ -19098,18 +19333,33 @@ uiRouter.get("/:owner/:repo/releases/tag/*", (c) => releaseDetailPage(c));
 // POSTs run the §2.8 sameOriginGuard first — session.ts's convention; the
 // `*` tail is the branch+path rest the handlers resolve against the branch
 // universe). All three carry GET (the forms) + POST (the writes) — even the
-// delete, whose confirmation page is where a failed CAS re-renders.
+// delete, whose confirmation page is where a failed CAS re-renders. BOTH
+// spellings register per family: upstream's underscore literals (web.go:
+// 1453-1467 — other instances' URLs land here) and the bare twins our own
+// emitters emit (the file-view page's hrefs).
 uiRouter.get("/:owner/:repo/new/*", (c) => fileEditorPage(c, "file-new"));
 uiRouter.post("/:owner/:repo/new/*", (c) => fileEditorSubmit(c, "file-new"));
+uiRouter.get("/:owner/:repo/_new/*", (c) => fileEditorPage(c, "file-new"));
+uiRouter.post("/:owner/:repo/_new/*", (c) => fileEditorSubmit(c, "file-new"));
 uiRouter.get("/:owner/:repo/edit/*", (c) => fileEditorPage(c, "file-edit"));
 uiRouter.post("/:owner/:repo/edit/*", (c) => fileEditorSubmit(c, "file-edit"));
+uiRouter.get("/:owner/:repo/_edit/*", (c) => fileEditorPage(c, "file-edit"));
+uiRouter.post("/:owner/:repo/_edit/*", (c) => fileEditorSubmit(c, "file-edit"));
 uiRouter.get("/:owner/:repo/delete/*", (c) => fileEditorPage(c, "file-delete"));
 uiRouter.post("/:owner/:repo/delete/*", (c) => fileEditorSubmit(c, "file-delete"));
-// Window-2e C2b: the upload + cherrypick/patch tails.
+uiRouter.get("/:owner/:repo/_delete/*", (c) => fileEditorPage(c, "file-delete"));
+uiRouter.post("/:owner/:repo/_delete/*", (c) => fileEditorSubmit(c, "file-delete"));
+// Window-2e C2b: the upload + cherrypick/patch tails (the upload and patch
+// families carry the underscore aliases too — _upload web.go:1462,
+// _diffpatch web.go:1465).
 uiRouter.get("/:owner/:repo/upload/*", (c) => fileUploadPage(c));
 uiRouter.post("/:owner/:repo/upload/*", (c) => fileUploadSubmit(c));
+uiRouter.get("/:owner/:repo/_upload/*", (c) => fileUploadPage(c));
+uiRouter.post("/:owner/:repo/_upload/*", (c) => fileUploadSubmit(c));
 uiRouter.get("/:owner/:repo/patch/*", (c) => editorPatchPage(c, false));
 uiRouter.post("/:owner/:repo/patch/*", (c) => editorPatchPage(c, true));
+uiRouter.get("/:owner/:repo/_diffpatch/*", (c) => editorPatchPage(c, false));
+uiRouter.post("/:owner/:repo/_diffpatch/*", (c) => editorPatchPage(c, true));
 // The underscore literal is upstream's OWN spelling (web.go:1468's
 // `{editor_action:_cherrypick}` — the commit page's emitted URL carries it,
 // commit_page.tmpl:65); the bare `cherrypick` head stays engine-owned.
@@ -19169,6 +19419,10 @@ uiRouter.get("/:owner/-/code", (c) => userCodeSearchPage(c));
 // page 404-shells inside the handler).
 uiRouter.get("/org/:owner/dashboard", (c) => orgDashboardPage(c));
 uiRouter.get("/org/:owner/dashboard/:team", (c) => orgDashboardPage(c));
+// The R03 heatmap JSON twins (web.go:984-985 — GET-only; a POST misses into
+// the parent app's plain 404, the owner-scope heatmap's posture).
+uiRouter.get("/org/:owner/dashboard/-/heatmap", (c) => orgDashboardHeatmapData(c));
+uiRouter.get("/org/:owner/dashboard/-/heatmap/:team", (c) => orgDashboardHeatmapData(c));
 // Wave-24 repo social lists (parseUiRoute claims exactly these shapes —
 // upstream's web.go:1759/1766/1767 bare literals; GET-only read pages
 // through the uiPage dispatch, the branches/releases convention).

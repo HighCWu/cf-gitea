@@ -9,11 +9,16 @@
  *   GET+POST /{owner}/{repo}/edit/{branch}/{path}              edit a file
  *   GET+POST /{owner}/{repo}/delete/{branch}/{path}            delete a file
  *
- * (Upstream spells the literals with a leading underscore; the brief pins the
- * bare names. The tail after the literal resolves against the BRANCH universe
- * only — `resolveRefSuffix("branch", …)`, so a branch named `feature/foo`
- * walks the shortest existing prefix exactly like the /src family. The bare
- * literals stay unclaimed: upstream chi requires the `/*` tail too.)
+ * (BOTH spellings serve — the wave-8 bare-pin divergence retired: upstream's
+ * underscore literals (`_new|_edit|_delete|_upload|_diffpatch`, web.go:
+ * 1453-1467) AND the bare twins this page's brief pinned and our emitters
+ * still emit (file-view.tsx's hrefs) claim the same families, so other
+ * instances' underscore URLs land instead of 404ing. The tail after the
+ * literal resolves against the BRANCH universe only —
+ * `resolveRefSuffix("branch", …)`, so a branch named `feature/foo` walks
+ * the shortest existing prefix exactly like the /src family. A literal in
+ * either spelling WITHOUT the `/*` tail stays unclaimed: upstream chi
+ * requires the tail too.)
  *
  * ## DOM contract (templates/repo/editor/edit.tmpl + delete.tmpl +
  *  commit_form.tmpl + common_breadcrumb.tmpl + view_file_tree at the pin)

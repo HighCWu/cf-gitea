@@ -18,8 +18,9 @@
  *   - the RENDER's contract: the `admin` pageClass, the panel header +
  *     total, the row projection (the badges, the mirror/fork glyphs, the
  *     owner lock, the KiB→bytes Size cell), the no-results row, the filter
- *     radios' checked states, the pager hrefs — and the dead-link
- *     assertions (no Op/delete column, no Unadopted button, no fork=0 /
+ *     radios' checked states, the pager hrefs — the Op column's live delete
+ *     form (the registration landed in ui/index.ts), and the dead-link
+ *     assertions (no Unadopted button, no LFS Size column, no fork=0 /
  *     mirror=0 arms).
  */
 
@@ -289,11 +290,21 @@ describe("the admin repos DOM (templates/admin/repo/list.tmpl at the pin)", () =
     }
   });
 
-  it("renders NO dead controls — no Op/delete column, no Unadopted button, no LFS Size column", async () => {
+  it("renders the Op column's delete form per row (the registration is LIVE — list.tmpl:82-87's no-JS reduction)", async () => {
     await seedBaseFixtures();
     const html = render(await load(adminViewer, ""));
-    expect(html).not.toContain("/-/admin/repos/delete"); // the Op column's target (list.tmpl:84)
-    expect(html).not.toContain("octicon-trash");
+    // The header + one plain form per row: the hidden repo id + the red trash.
+    expect(html).toContain(`<th scope="col">${adminReposLocale.col_op}</th>`);
+    const forms = html.split('<form method="post" action="/-/admin/repos/delete" class="tw-inline">').length - 1;
+    expect(forms).toBe(9); // one per listed row
+    expect(html).toContain('<input type="hidden" name="id" value="9"/>'); // starry's row id
+    expect(html.split('aria-label="Delete This Repository"').length - 1).toBe(9);
+    expect(html).toContain("octicon-trash");
+  });
+
+  it("renders NO dead controls — no Unadopted button, no LFS Size column, no negated filter arms", async () => {
+    await seedBaseFixtures();
+    const html = render(await load(adminViewer, ""));
     expect(html).not.toContain('href="/-/admin/repos/unadopted"'); // list.tmpl:6
     expect(html).not.toContain("LFS Size"); // the omitted column (no source — the module header)
     expect(html).not.toContain('name="fork" value="0"'); // the negated fork arm is not rendered
@@ -312,7 +323,7 @@ describe("the admin repos DOM (templates/admin/repo/list.tmpl at the pin)", () =
     expect(html).toContain('name="sort" value="moststars"'); // the submit-button sort menu
   });
 
-  it("renders the no-results row (colspan 10) and the sortable header links", async () => {
+  it("renders the no-results row (colspan 11) and the sortable header links", async () => {
     await seedBaseFixtures();
     const empty = render(await load(adminViewer, "q=nobody"));
     expect(empty).toContain(adminReposLocale.no_results);
@@ -359,8 +370,9 @@ describe("the admin repos DOM (templates/admin/repo/list.tmpl at the pin)", () =
 });
 
 // --- the delete ladder (upstream admin.DeleteRepo — the write seam; the
-// --- route registration is blocked on ui/index.ts, so the ladder drives
-// --- directly over real D1) -----------------------------------------------
+// --- route registration is LIVE (ui/index.ts family "admin-repos-delete"),
+// --- and the route-level 303/405 battery rides index.test.ts — these stay
+// --- the direct-over-D1 seam drives) ---------------------------------------
 
 describe("deleteAdminRepoFromForm (admin.DeleteRepo's port)", () => {
   it("deletes the repository through the shared delete cascade (the row gone, the list no longer counts it)", async () => {
@@ -376,7 +388,7 @@ describe("deleteAdminRepoFromForm (admin.DeleteRepo's port)", () => {
     expect(after.items.map((item) => item.repo.slug)).not.toContain("starry");
   });
 
-  it("answers a missing id with the missing outcome (the future registration maps it — upstream ServerErrors the miss)", async () => {
+  it("answers a missing id with the missing outcome (the registration maps it to the silent stale-form 303 — upstream ServerErrors the miss)", async () => {
     await seedBaseFixtures();
     const outcome = await deleteAdminRepoFromForm(env.DB, "404");
     expect(outcome).toEqual({ outcome: "missing" });

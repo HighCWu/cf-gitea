@@ -449,6 +449,42 @@ describe("GET /attachments/{uuid} — resolution matrix", () => {
     expect((await issueAttachmentRow(row.uuid)).downloadCount).toBe(1);
   });
 
+  // The method-mismatch arm's POST-class residual (web.go:912 registers the
+  // path for `Methods("GET, OPTIONS")` only — chi 405s every other verb
+  // where Hono's unregistered-method fall-through answered 404): the bare
+  // POST (and its PUT/DELETE/PATCH siblings) is the 405 twin, the download
+  // handler never runs, GET still serves.
+  it("answers the uncovered mutator verbs with the 405 twin; the download handler never ran; GET still serves", async () => {
+    const owner = await seedUser("attach-owner");
+    await seedRepo(PUBLIC_REPO_ID, PUBLIC_STORAGE_KEY, owner, "public");
+    const issue = await seedIssue(PUBLIC_REPO_ID, owner.id);
+    const payload = pngPayload();
+    const row = await seedIssueAttachment({
+      repoId: PUBLIC_REPO_ID,
+      storageKey: PUBLIC_STORAGE_KEY,
+      issueId: issue.id,
+      name: "shot.png",
+      content: payload,
+    });
+    const path = `/attachments/${row.uuid}`;
+
+    for (const method of ["POST", "PUT", "DELETE", "PATCH"] as const) {
+      const res = await serve(path, { method });
+      expect(res.status, method).toBe(405);
+      // the house 405 shape — empty body + the route's declared methods
+      expect(res.headers.get("allow"), method).toBe("GET, OPTIONS");
+      expect((await res.arrayBuffer()).byteLength, method).toBe(0);
+    }
+    // none of the mismatches re-ran the download
+    expect((await issueAttachmentRow(row.uuid)).downloadCount).toBe(0);
+
+    const get = await serve(path);
+    expect(get.status).toBe(200);
+    expect(new Uint8Array(await get.arrayBuffer())).toEqual(payload);
+    // bumped exactly once — by the GET, not the mismatches
+    expect((await issueAttachmentRow(row.uuid)).downloadCount).toBe(1);
+  });
+
   it("serves a private repo attachment to the owner (private reader) and hides it from strangers and anonymous", async () => {
     const owner = await seedUser("attach-owner");
     const stranger = await seedUser("attach-stranger");

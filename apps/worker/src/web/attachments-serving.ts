@@ -1261,3 +1261,17 @@ attachmentsServingRouter.on(["GET", "HEAD"], "/attachments/:uuid", async (c) => 
 attachmentsServingRouter.on(["OPTIONS"], "/attachments/:uuid", () =>
   new Response(null, { status: 405, headers: { allow: "GET, OPTIONS" } }),
 );
+
+// ---------------------------------------------------------------------------
+// POST-class verbs on /attachments/{uuid} — chi's method-mismatch arm
+// (web.go:912 registers the path for `Methods("GET, OPTIONS")` ONLY, so any
+// other verb misses every method-specific handler and chi answers its
+// MethodNotAllowed — 405, never the 404 an unregistered path would take).
+// The uncovered mutators (POST/PUT/DELETE/PATCH — POST the observed
+// residual: a bare POST previously fell to Hono's 404) ride the same house
+// 405 shape as the OPTIONS twin above: empty body + the route's declared
+// methods, module-locally since the router is this module's.
+// ---------------------------------------------------------------------------
+attachmentsServingRouter.on(["POST", "PUT", "DELETE", "PATCH"], "/attachments/:uuid", () =>
+  new Response(null, { status: 405, headers: { allow: "GET, OPTIONS" } }),
+);
