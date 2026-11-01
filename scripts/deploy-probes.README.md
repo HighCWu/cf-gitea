@@ -24,8 +24,10 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
   `packages-distro`, `packages-protocols`, `packages-minor`,
   `packages-terraform`, `auth-oauth2`, `monitor-platform`, `cleanup-audit`,
   `all` (runs the 20 in that order, audit last). `all --dry-run` plans
-  **244 probes** across them (the counts in the table below were read off
-  that dry-run at this writing; `registry` scales with `--trials`).
+  **253 probes** across them (the counts in the table below were read off
+  that dry-run at this writing; `registry` scales with `--trials`; the
+  second alignment — 244 → 253 — rode the v1.5.1 U-wave sweep, nine new
+  `fixwave-parity` probes, see that battery's bullet).
 - **The `cleanup-audit` battery is D1-only** (wrangler d1 execute, no HTTP): it
   takes neither `--base-url` nor `--token-file` — a missing token only errors
   when a selected battery actually makes HTTP calls (REDEPLOY15 friction: the
@@ -80,7 +82,7 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
 
 ## Batteries and their canonical expectations
 
-The registry at this writing — 20 batteries, **244 probes** (`all
+The registry at this writing — 20 batteries, **253 probes** (`all
 --dry-run`; `registry`'s count scales with `--trials`, here at its
 default 3):
 
@@ -94,7 +96,7 @@ default 3):
 | `ui-login` | 5 | the login-cookie methodology: anonymous vs owner labels view | HTTP (login cookie) |
 | `window2-mounts` | 22 | user-settings tab family: anon 303s, pageClass 200s, the secret round-trip, keys negative, last-owner flash | HTTP (login cookie) |
 | `window3-mounts` | 31 | feed tails, wiki raw bytes, profile tabs, admin lists, settings account/notifications, milestone detail, content-history list + the 6a91a5c newly-armed routes (upload staging pair, unpin DELETE, tracked-time delete POST, _cherrypick form, package settings round-trip) | HTTP (login cookie) |
-| `fixwave-parity` | 22 | the RD23 parity matrix: PR head-sync, merged-PR 412, ghost-404, tag-only push-create, revoke mask, visibility ladder, sudo pair, session-rotation directive | HTTP + **ADMIN PAT** + **wrangler auth** (the rotation backdate + session-row sweep are D1 writes) |
+| `fixwave-parity` | 31 | the RD23 parity matrix: PR head-sync, merged-PR 412, ghost-404, tag-only push-create, revoke mask, visibility ladder, sudo pair, session-rotation directive — plus the v1.5.1 U-wave families: the `is_2fa_enabled` filter (both polarities), the label writer gate (non-writer POST `/labels` → the verbatim 403), the org/team membership WEB actions (anonymous 303, outsider 404-shell, owner add → the team slice, member leave → `/`), and the repo-settings danger zone (transfer start → banner → cancel, the wrong-name delete refusal, the REAL delete → the API 404 at t+0) | HTTP + **ADMIN PAT** + **wrangler auth** (the rotation backdate + the THREE session-row sweeps are D1 writes) |
 | `branch-protection` | 19 | SPEC-0013 flows: rule CRUD + priority swap, per-ref push rejection, approval gate 405→200, MWCS schedule+cancel round-trip, whitelist flag round-trip | HTTP + **ADMIN PAT** (the priority ids and slash-glob arm are pure API — no wrangler) |
 | `demo` | 4 | demo posture: committed-config machinery, `DEMO_MODE`-off default, open signup, the §4.4 banner ([warn] pre-M2) | HTTP against the demo instance; the TTL-mechanics arm is LOCAL-only (`--d1-scope local` + `DEMO_MODE=true` in `.dev.vars` against `pnpm dev`) |
 | `wiki-git` | 7 | the `.wiki.git` wire: REST page create → real clone carries the root commit → push → read-back → privacy tail → t+0 tombstone | HTTP |
@@ -106,7 +108,7 @@ default 3):
 | `auth-oauth2` | 20 | the OAuth2 provider W6 battery + the external-auth tail: the scripted third-party client (registration with the exactly-once secret → login session → the consent dance with in-script PKCE S256 → form + Basic exchanges → the dotted dispatch → userinfo (+PAT-401) → the offline JWKS verify (WebCrypto, id_token claims pinned) → refresh → introspect (active/junk/401) → the revoke-kills-token row delete → app delete + the D1 husk sweep) + the realm check + the discovery shape + the builtin seed + the external-auth source family | HTTP (login cookie + Bearer JWTs) + **wrangler auth** (the builtin-seed read, the revoke row delete, the husk sweep, and the source seed/cleanup ride `--d1-scope`; the discovery arm's issuer==origin assert keys off it) |
 | `monitor-platform` | 6 | SPEC-0021 §7's REAL-API closed loops: the `/set` closed loop (GET-save → SAFE modify → GET-verify → finally-RESTORE → re-verify; restore failure a BLOCKING red; serial-locked to ONE `MONITOR_QUEUE_CONSUMERS` entry) + the pprof content probe (cpu ≤ 5 s, 10 MiB cap → gunzip → minimal protobuf walk → sane fields, ONE 429 retry) | HTTP to **api.cloudflare.com** (NOT the deployment — the admin `/set` + `/profile` UI routes are the pending ui/index.ts fold, so the direct-API class stands in, documented admin-manual) + the arm tokens from the probe's OWN env (`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_QUEUES_TOKEN`, `CLOUDFLARE_PROFILE_TOKEN`, `MONITOR_QUEUE_CONSUMERS`, `MONITOR_WORKER_NAME` — the same names the Worker carries as secrets; absent = the arm `[warn]`-skips, never fake-green) |
 | `cleanup-audit` | 10 | post-run D1 count shapes (independent counts) | **D1-only** — wrangler auth, `--d1-scope remote\|local` (default remote); takes NEITHER `--base-url` NOR `--token-file` |
-| **`all`** | **244** | every battery in registry order, audit last | union of the above |
+| **`all`** | **253** | every battery in registry order, audit last | union of the above |
 
 Expectations are ported from `docs/design/p0-evidence.md` — the REDEPLOY13
 block (2026-10-26, ~lines 1507-1697) for the shallow trio, generate, ui-login,
@@ -353,18 +355,72 @@ prints all of them verbatim.
   cookie directive (the `rotated_at` backdated 25 h via wrangler d1 — the
   toolkit's first D1 WRITE path — then GET /login re-sets the FULL
   `gitea_session` directive, the adopted secret round-trips, and the stale
-  pre-rotation secret authenticates nothing). **Independent** (the
+  pre-rotation secret authenticates nothing). The v1.5.1 U-wave sweep added
+  four families riding the SAME fixtures (the second battery alignment,
+  after d3f8211's S-wave pass: every changed surface of
+  6b7b517/02f0f1b/7b4ccfc/e6b980e/c3ac813/c273341/14ba724/9b45d68/8b46159/
+  d973408/86b5aee was grepped against all 244 standing pins and NONE
+  drifted — the writer gates never fire (the battery's milestone/label
+  writes are the owner's), no battery pins the mailbox, attachments
+  OPTIONS, transfer API, fork-visibility, include_desc, org-email, or
+  team-includes_all surfaces, and the packages-carrying users are never
+  deleted — so the alignment is additive only, 244 → 253): **the
+  `is_2fa_enabled` filter** (7b4ccfc U2 A2 — `GET /admin/users` unfiltered
+  lists the run admin (the control), `?is_2fa_enabled=true` does NOT (the
+  engagement proof — an unfiltered run would answer them), and
+  `?is_2fa_enabled=false` lists them again — both polarities of the
+  two_factor EXISTS/NOT-EXISTS twin; read-only); **the label writer gate**
+  (c3ac813 U5 M1+L1(a) — the member's own PAT READS the public PR repo
+  (visibility proven at run time; a 404 there means the create default
+  flipped, not gate drift), then `POST /repos/…/labels` answers 403 with
+  the verbatim reqRepoWriter middleware text "user should have a permission
+  to write to a repo" and the label list stays empty); **the org/team
+  membership WEB actions** (9b45d68 U1 — anonymous
+  `POST /{org}/teams/{team}/action/add` → 303 the exact
+  `/login?redirect_to=` round-trip; the API-revoked member's own web
+  session (PAT-as-password login) posting the owner-only add → the 404
+  shell; the OWNER's web session add (the `uname` field) → 303 exactly
+  `/{org}/teams/{id}` with the API membership read-back 200 —
+  addTeamMember ensured the org membership first; the member's web session
+  `POST /org/{org}/members/action/leave` (the `uid` field, resolved first
+  per members.go:84-89) → 303 exactly `/` with the API team row 404 — the
+  org removal cascades it); **and the repo-settings DANGER ZONE** (6b7b517
+  U4, over the owner's second web session on a fresh public repo — the
+  `fwdz-` repo is the family's own fixture and the REAL delete is its
+  cleanup): anonymous `POST /settings action=transfer` → 303 the login
+  round-trip; the owner's transfer POST (the typed FULL `repo_name` +
+  `new_owner_name=<member>`) → 303 exactly `/{owner}/{repo}/settings`,
+  whose page then carries the pending-transfer banner (transfer_started
+  naming the recipient) + the hidden `action=cancel_transfer` abort form;
+  the cancel POST → 303 and a fresh GET shows the banner GONE; a WRONG
+  confirm name on `action=delete` → the 200 re-render with the verbatim
+  form.enterred_invalid_repo_name text in the ui negative message (the API
+  still reads the repo — nothing written); the REAL delete (the exact
+  name) → 303 the settings URL and the API read-back is 404 at t+0.
+  **PENDING on that last pin:** the COMMITTED handler redirects every
+  applied outcome to `/{owner}/{slug}/settings` — for a deleted repo that
+  URL is the 404 shell, upstream's own divergence (it targets the owner
+  dashboard, setting.go:978); the IN-FLIGHT ui/index.ts fold redirects a
+  user-owned delete to `/` — if it lands, flip `fw-danger-delete-303`'s
+  location assert at convergence (see "Convergence pending markers").
+  **Independent** (the
   cleanup-audit precedent): every family reports its own verdict — a red
   family never chain-skips the rest of the matrix (pre-RD23 every family
   legitimately reds; the post-deploy run is the verdict). Flags: no extra
   options, but it needs an **ADMIN PAT** (`--user` must be the site admin —
   `POST /admin/users` and the sudo pair) and **wrangler auth for the D1
   arms** (`--d1-scope` picks the database, remote by default — keep it in
-  step with `--base-url`). **Failure cleanup (the consistency posture):** a
+  step with `--base-url`). The web families mint THREE session rows total
+  (the rotation family's, the danger family's owner row, the org family's
+  member row) — all three sweep. **Failure cleanup (the consistency
+  posture):** a
   finally-style tail best-effort sweeps the repos (org repo, PR repo,
-  tag-only repo), then the org, the member user (its PAT rows cascade), and
-  the session row via D1 (logged on one `[tail] fw-leftover-sweep` line;
-  failures feed `left_behind`, never fatal; a green run no-ops silently).
+  tag-only repo, the danger-zone repo — a red between the transfer start
+  and the cancel rides the owner's web cookie through the cancel POST
+  first), then the org, the member user (its PAT rows cascade), and the
+  three web-session rows via D1 (logged on one `[tail] fw-leftover-sweep`
+  line; failures feed `left_behind`, never fatal; a green run no-ops
+  silently).
 - **branch-protection** — the SPEC-0013 protection flows over one scratch
   auto_init repo (the gate-assessment gap 2 closure: the M1–M4 surface is
   deployed, so every redeploy verifies the FLOWS, not just the table's
@@ -988,8 +1044,10 @@ prints all of them verbatim.
     settings probe's generic package (owner-scoped — the repo deletes never
     touch packages, so the management-API delete is the sweep);
     `[tail] w3-leftover-sweep`.
-  - `fixwave-parity` — its repos, then the org, the member user (its PAT
-    rows cascade), and the session row (the D1 delete);
+  - `fixwave-parity` — its repos (the danger-zone repo last among them,
+    AFTER the best-effort cancel of a pending transfer via the owner's web
+    cookie), then the org, the member user (its PAT rows cascade), and the
+    THREE web-session rows (the D1 deletes);
     `[tail] fw-leftover-sweep`.
   - `branch-protection` — its created rules (best-effort explicit deletes
     first, so a failed repo delete still lands the audit back at
@@ -1166,6 +1224,51 @@ prints all of them verbatim.
   flag: `--mirror-settle-ms 1` times the sync-settle poll out mid-battery
   (after the repo + mirror row exist) — the original 5fdbc15 self-test
   convention.
+
+## Convergence pending markers (the v1.5.1 in-flight U-units)
+
+The second alignment (244 → 253) swept the battery against the LANDED
+U-wave (through 86b5aee) and pinned the committed truth only — the units
+still in flight at this writing were NOT predicted. Their likely impacts,
+so the orchestrator can fast-adjudicate each flip at the convergence run:
+
+- **PENDING U13 (`_cherrypick` aliases + `update_preferences`)** — the
+  in-flight file-editor wave claims BOTH editor spellings (the bare twins
+  stay for the emitters), so `w3-cherrypick-form-200`'s second half (the
+  BARE `/cherrypick/{sha}/{branch}` → **404** assert, "engine-owned since
+  the rename") is the prime flip candidate: if the alias lands, the bare
+  head answers **200** and that half flips to the alias shape (the
+  underscore form's 200 + form-action asserts should survive unchanged).
+  The `update_preferences` route is battery-pin-free (no battery POSTs
+  `/user/settings/update_preferences`).
+- **PENDING U16 (the 409/403 transfer texts, the API transfer route)** —
+  battery-pin-free TODAY: no standing probe drives
+  `POST /repos/{owner}/{repo}/transfer` (the fixwave danger family rides
+  the WEB arms, which answer the committed re-render/303 shapes, not the
+  API 409/403). If U16 also touches the WEB invalid/banner texts, the new
+  `fw-danger-*` pins move with it — adjudicate at convergence.
+- **PENDING U18/U19 (the diff byte shapes)** — battery-pin-free: no
+  battery asserts diff CONTENT (the pulls/commits arms pin statuses, refs,
+  and head/sha chains, never diff payloads). Expected no-op; listed so a
+  surprise red on a pulls arm has a first suspect.
+- **PENDING the in-flight ui/index.ts fold** (the 6b7b517 blocked items:
+  the settings doer threading + the delete redirect override + the
+  admin-repos delete button + the delete-wiki env threading) —
+  `fw-danger-delete-303` pins the COMMITTED redirect
+  (`/{owner}/{slug}/settings`, the 404-shell divergence); if the fold
+  lands, a user-owned delete redirects to `/` and the location assert
+  flips. The danger family's other asserts (the banner, the cancel, the
+  refusal, the API 404) are fold-independent (the doer degrade is exact
+  for user-owned repos either way).
+- **Deliberately NOT probed (recorded decisions, not gaps):** U14's
+  actions needs-chain emitter — the battery drives no workflow runs (the
+  E2E lives in `routes.test.ts`, the mission's own skip rule); U9's
+  attachments OPTIONS-405 twin and download-count atomicity — the battery
+  creates no attachment fixtures; U8's whole-wiki delete arm — the battery
+  deletes wikis only via the whole-repo purge (wiki-git), and the
+  delete-wiki settings arm refuses before any write at the committed pin
+  (the env threading is the in-flight fold above); U7's mailbox mute
+  outranking — no battery probe lists notifications.
 
 ## Deliberately not ported (yet)
 

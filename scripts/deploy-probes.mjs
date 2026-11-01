@@ -105,12 +105,22 @@
  *                  admin-200 ladder, the sudo pair (admin impersonation +
  *                  non-admin 403), and the session rotation's full cookie
  *                  directive (the D1-write backdate arm — the toolkit's first
- *                  D1 WRITE path, d1Exec). `independent` on purpose: every
- *                  family reports its own verdict (a red family never
- *                  chain-skips the rest of the matrix — pre-RD23 all eight
- *                  families legitimately red; the post-deploy run is the
- *                  verdict). A red run sweeps its repos + org + member user +
- *                  session row (the failureTail).
+ *                  D1 WRITE path, d1Exec); the v1.5.1 U-wave additions ride
+ *                  the same fixtures: the is_2fa_enabled filter (both
+ *                  polarities, read-only), the label writer gate (non-writer
+ *                  POST /labels → the verbatim 403), the org/team membership
+ *                  WEB actions (anonymous 303 / outsider 404-shell / the
+ *                  owner's uname add 303 / the member's uid leave 303),
+ *                  and the repo-settings DANGER ZONE (transfer start →
+ *                  banner → cancel, the wrong-name delete refusal 200, the
+ *                  REAL delete 303 + API 404 at t+0). `independent` on
+ *                  purpose: every family reports its own verdict (a red
+ *                  family never chain-skips the rest of the matrix — pre-RD23
+ *                  all eight families legitimately red; the post-deploy run
+ *                  is the verdict). A red run sweeps its repos (the
+ *                  danger-zone repo's pending transfer cancelled first) +
+ *                  org + member user + all three web-session rows (the
+ *                  failureTail).
  *   branch-protection The SPEC-0013 protection flows over one scratch repo
  *                  (the gate-assessment gap 2 closure — the M1-M4 surface is
  *                  deployed; this verifies the FLOWS, not just the table):
@@ -2951,6 +2961,33 @@ const window3FailureCleanup = async (ctx) => {
  *      HttpOnly + Secure + SameSite=Lax — NOT the raw id:secret value that was
  *      the forced-logout bug), the adopted secret round-trips (303 → /), and
  *      the stale pre-rotation secret authenticates nothing (the 200 form).
+ *   7. The is_2fa_enabled filter (7b4ccfc U2 A2, read-only): the admin list
+ *      UNFILTERED carries the run admin (the control), ?is_2fa_enabled=true
+ *      drops them (the engagement proof), ?is_2fa_enabled=false lists them
+ *      again — both polarities of the EXISTS/NOT-EXISTS two_factor twin.
+ *   8. The label writer gate (c3ac813 U5 M1+L1(a)): the member's own PAT
+ *      READS the public PR repo but POST /repos/…/labels answers the
+ *      verbatim reqRepoWriter 403 ("user should have a permission to write
+ *      to a repo") and the label list stays empty.
+ *   9. The org/team membership WEB actions (9b45d68 U1): anonymous team
+ *      action POST → 303 /login?redirect_to=…, the API-revoked member's own
+ *      web session (PAT-as-password login) POSTs the owner-only add → the
+ *      404 shell, the OWNER's web session POST action=add (uname) → 303 the
+ *      team slice + the API membership read-back 200, and the member's web
+ *      session POST /org/{org}/members/action/leave (uid) → 303 "/" + the
+ *      API team row 404 (the org removal cascades it).
+ *  10. The repo-settings DANGER ZONE (6b7b517 U4) over the owner's second
+ *      web session: a fresh public repo; anonymous transfer POST → 303 the
+ *      login round-trip; the owner's transfer POST (typed FULL repo_name +
+ *      new_owner_name=<member>) → 303 the settings URL, whose page now
+ *      carries the pending-transfer banner + the hidden cancel_transfer
+ *      form; the cancel POST → 303 and the banner is gone; a WRONG confirm
+ *      name on action=delete → the 200 re-render with the verbatim
+ *      enterred_invalid_repo_name text (nothing written); the REAL delete
+ *      (exact name) → 303 the settings URL — the COMMITTED redirect target,
+ *      now the 404 shell (upstream targets the owner dashboard; the
+ *      in-flight ui/index.ts fold will move it to "/" — PENDING, flip the
+ *      pin at convergence) — and the API read-back 404 at t+0.
  *
  * `independent: true` on purpose (the cleanup-audit precedent): each family
  * reports its own verdict — a red family must not chain-skip the rest of the
@@ -2958,9 +2995,10 @@ const window3FailureCleanup = async (ctx) => {
  * predates the wave: ignored Sudo header, raw-value rotation cookie, no 412
  * guard, non-strict ghost walk, no refs/pull sync, the tag-only data-loss,
  * unwired org git grants, no visibility ladder); the POST-DEPLOY run is the
- * verdict. A red run sweeps everything it created (the failureTail: repos,
- * org, member user — its PAT rows cascade — and the session row via D1);
- * green runs clean through fw-cleanup.
+ * verdict. A red run sweeps everything it created (the failureTail: repos
+ * incl. the danger-zone repo — its pending transfer cancelled first — the
+ * org, the member user — its PAT rows cascade — and ALL THREE web-session
+ * rows via D1); green runs clean through fw-cleanup.
  *
  * Requires an ADMIN PAT (--user must be the site admin; POST /admin/users and
  * the sudo pair need it) and wrangler auth for the d1 arms (--d1-scope picks
@@ -2975,13 +3013,20 @@ const fixwaveContext = () => ({
   // Family 2: tag-only push-create.
   tagRepo: `fwt-${hexId()}`, tagName: `fwv1-${hexId()}`,
   // Families 4/5/3: the private user (the sudo impersonation target AND the
-  // org family's member — one create, two families).
-  member: `fwu-${hexId()}`, memberToken: null, memberTokenId: null,
+  // org family's member — one create, two families; the id is the
+  // members-action leave form's uid carrier).
+  member: `fwu-${hexId()}`, memberToken: null, memberTokenId: null, memberId: null,
+  memberCookie: null, memberSessionId: null,
   // Family 3: the org.
   org: `fworg-${hexId()}`, orgRepo: `fwor-${hexId()}`, teamId: null,
+  // The danger-zone family's throwaway repo (the transfer target is the
+  // member; the REAL delete in the family's last arm is its own cleanup).
+  dzRepo: `fwdz-${hexId()}`, dzFullName: null, dzCreated: false, dzGone: false,
+  dzTransferPending: false,
   // Family 6: the web session (the row id is public; the secret half is
-  // scrubbed at capture).
-  sessionId: null, cookie: null,
+  // scrubbed at capture). The danger family's separate session rides
+  // webCookie/webSessionId — both rows sweep at cleanup.
+  sessionId: null, cookie: null, webCookie: null, webSessionId: null,
   // Failure-tail bookkeeping (the sibling batteries' convention: mark on the
   // observable write, sweep what the flags say survived).
   prRepoCreated: false, prRepoFullName: null, prRepoGone: false,
@@ -3185,10 +3230,11 @@ const fixwaveSteps = (ctx) => [
         },
       });
       if (res.status === 201) ctx.memberCreated = true; // mark on the observable write
+      if (res.status === 201 && Number.isInteger(res.json?.id)) ctx.memberId = res.json.id; // the members-action leave form's uid carrier
       expect(res.status === 201, `status ${res.status} (expected 201 — an admin PAT is required): ${res.text.slice(0, 160)}`);
       expect(res.json?.login === ctx.member, `login ${res.json?.login} (expected ${ctx.member})`);
       expect(res.json?.visibility === "private", `visibility ${res.json?.visibility} (expected private)`);
-      return `user ${ctx.member} created (private)`;
+      return `user ${ctx.member} created (private, id ${ctx.memberId})`;
     },
   },
   {
@@ -3203,6 +3249,23 @@ const fixwaveSteps = (ctx) => [
       expect(admin.status === 200, `admin status ${admin.status} (expected 200 — the site admin reads every row)`);
       expect(admin.json?.visibility === "private", `admin-viewed visibility ${admin.json?.visibility} (expected private)`);
       return `anonymous 404 (masked), admin 200 (private) — the ladder holds`;
+    },
+  },
+  {
+    id: "fw-admin-2fa-filter",
+    expect: `THE is_2fa_enabled FILTER (7b4ccfc U2 A2 — the dead filter is real now: EXISTS/NOT-EXISTS over the two_factor store, upstream's search.go:142-162 join, engaged ONLY when the param is present): GET /admin/users UNFILTERED lists ${"{user}"} (the control), ?is_2fa_enabled=true does NOT (the engagement proof — an unfiltered run would answer them; the bootstrap admin carries no two_factor row), ?is_2fa_enabled=false lists them again (the false polarity's twin)`,
+    run: async () => {
+      const all = await api("/admin/users?limit=50");
+      expect(all.status === 200 && Array.isArray(all.json), `unfiltered list ${all.status}: ${all.text.slice(0, 120)}`);
+      expect(all.json.some((u) => u?.login === opts.user), `the unfiltered admin list does not carry ${opts.user} (the control arm)`);
+      const enrolled = await api("/admin/users?is_2fa_enabled=true&limit=50");
+      expect(enrolled.status === 200 && Array.isArray(enrolled.json), `the true-filtered list ${enrolled.status}: ${enrolled.text.slice(0, 120)}`);
+      expect(!enrolled.json.some((u) => u?.login === opts.user),
+        `${opts.user} answered the is_2fa_enabled=true filter — either the filter is still dead (7b4ccfc missing) or the standing admin enrolled 2FA (re-baseline this probe)`);
+      const unenrolled = await api("/admin/users?is_2fa_enabled=false&limit=50");
+      expect(unenrolled.status === 200 && Array.isArray(unenrolled.json), `the false-filtered list ${unenrolled.status}: ${unenrolled.text.slice(0, 120)}`);
+      expect(unenrolled.json.some((u) => u?.login === opts.user), `the false-filtered list dropped ${opts.user} (the NOT-EXISTS arm)`);
+      return `control lists, true-filter excludes, false-filter lists ${opts.user} — both polarities engaged`;
     },
   },
   {
@@ -3248,6 +3311,25 @@ const fixwaveSteps = (ctx) => [
       expect(res.json?.url === undefined,
         `the body carried url ${JSON.stringify(res.json?.url)} — the APIError wrapper shape (0bd7798 dropped it: the bare {message} ctx.JSON is upstream's, api.go:135-138)`);
       return `403 "Only administrators allowed to sudo." — the bare {message} body (no url)`;
+    },
+  },
+  {
+    id: "fw-label-non-writer-403",
+    expect: `THE LABEL WRITER GATE (c3ac813 U5 M1+L1(a) — reqRepoWriter rides the repo-label CRUD, placed after repo resolution BEFORE id resolution): the member's own PAT READS the public PR repo (GET → 200 — visibility proven at run time; a 404 here is a default-visibility flip, not gate drift) but POST /repos/${"{owner}/{repo}"}/labels {"name","color"} → 403 with the verbatim middleware message "user should have a permission to write to a repo" (api.go:393-400's rendering); the label list stays EMPTY (the refused write landed nothing)`,
+    run: async () => {
+      expect(ctx.memberToken !== null, "no member token from the prior arms (fixture missing)");
+      const vis = await api(`/repos/${ctx.user}/${ctx.prRepo}`, { asToken: ctx.memberToken });
+      expect(vis.status === 200, `member GET of the PR repo status ${vis.status} (expected 200 — the create default is public; a 404 means the visibility default flipped and this gate is unreachable)`);
+      const post = await api(`/repos/${ctx.user}/${ctx.prRepo}/labels`, {
+        asToken: ctx.memberToken, method: "POST", body: { name: `fw-label-${hexId()}`, color: "#00aabb" },
+      });
+      expect(post.status === 403, `non-writer label POST status ${post.status} (expected 403 — an unmounted gate would answer 201): ${post.text.slice(0, 160)}`);
+      expect(post.json?.message === "user should have a permission to write to a repo",
+        `message ${JSON.stringify(post.json?.message)} (expected the verbatim reqRepoWriter middleware text)`);
+      const list = await api(`/repos/${ctx.user}/${ctx.prRepo}/labels`);
+      expect(list.status === 200 && Array.isArray(list.json) && list.json.length === 0,
+        `the label list after the refusal: ${list.status} ${list.text.slice(0, 80)} (expected [] — nothing written)`);
+      return `member reads 200, label POST 403 verbatim, list [] — the writer gate holds`;
     },
   },
   {
@@ -3313,6 +3395,207 @@ const fixwaveSteps = (ctx) => [
       const owner = await api(`/repos/${ctx.org}/${ctx.orgRepo}`);
       expect(owner.status === 200, `owner control GET status ${owner.status} (expected 200 — only the member lost access)`);
       return `revoked: member advert 128 not-found + API 404 (masked); owner still 200`;
+    },
+  },
+  {
+    id: "fw-web-session-303",
+    expect: `the run user's web session for the danger family (the rotation family's row below stays independent): POST /login (form-urlencoded user_name + password=<PAT>) → 303 + gitea_session (the ui-login methodology; the value scrubbed from all output); the 10-char row id captured for the cleanup sweep`,
+    run: async () => {
+      const form = new URLSearchParams({ user_name: ctx.user, password: TOKEN });
+      const res = await fetchT(`${opts.baseUrl}/login`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: form.toString(),
+      });
+      await res.text();
+      expect(res.status === 303, `status ${res.status} (expected 303 See Other)`);
+      const setCookie = res.headers.getSetCookie().find((c) => c.startsWith("gitea_session="));
+      expect(setCookie !== undefined, `no gitea_session cookie in Set-Cookie (got ${res.headers.getSetCookie().length} cookies)`);
+      ctx.webCookie = setCookie.split(";")[0];
+      const value = ctx.webCookie.split("=")[1] ?? "";
+      ctx.webSessionId = value.split(":")[0];
+      secrets.push(value);
+      expect(ctx.webSessionId.length === 10, `session row id ${ctx.webSessionId} is not the 10-char public id shape`);
+      return `303 + gitea_session cookie (danger-family row ${ctx.webSessionId} minted)`;
+    },
+  },
+  {
+    id: "fw-org-web-gate-404",
+    expect: `THE ACTION GATES (9b45d68 U1 — POST /${"{org}"}/teams/${"{team}"}/action/${"{action}"} is LIVE): ANONYMOUS POST action=add → 303 EXACTLY /login?redirect_to=<encoded action path> (the RequireMember prologue's anonymous arm); the API-revoked team member's own WEB session (PAT-as-password login — the ui-login methodology) POST action=add → the 404 SHELL (a signed-in outsider 404-shells, org.go:106-120's gate — never a redirect, never a grant); their session row id captured for the cleanup sweep`,
+    run: async () => {
+      expect(ctx.memberToken !== null && Number.isInteger(ctx.teamId), "no member token / team from the prior arms (fixture missing)");
+      const actionPath = `/${ctx.org}/teams/${ctx.teamId}/action/add`;
+      const anon = await fetchT(`${opts.baseUrl}${actionPath}`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ uname: ctx.user }).toString(),
+      });
+      await anon.text();
+      expect(anon.status === 303, `anonymous team-action POST status ${anon.status} (expected 303 — the login round-trip)`);
+      expect(anon.headers.get("location") === `/login?redirect_to=${encodeURIComponent(actionPath)}`,
+        `anonymous location ${JSON.stringify(anon.headers.get("location"))} (expected /login?redirect_to=<encoded action path>)`);
+      const form = new URLSearchParams({ user_name: ctx.member, password: ctx.memberToken });
+      const login = await fetchT(`${opts.baseUrl}/login`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: form.toString(),
+      });
+      await login.text();
+      expect(login.status === 303, `member web login status ${login.status} (expected 303 — the PAT-as-password methodology)`);
+      const setCookie = login.headers.getSetCookie().find((c) => c.startsWith("gitea_session="));
+      expect(setCookie !== undefined, `no gitea_session cookie on the member login (${login.headers.getSetCookie().length} cookies)`);
+      ctx.memberCookie = setCookie.split(";")[0];
+      const value = ctx.memberCookie.split("=")[1] ?? "";
+      ctx.memberSessionId = value.split(":")[0];
+      secrets.push(value);
+      const shell = await fetchT(`${opts.baseUrl}${actionPath}`, {
+        method: "POST",
+        headers: { cookie: ctx.memberCookie, origin: opts.baseUrl, "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ uname: ctx.user }).toString(),
+      });
+      await shell.text();
+      expect(shell.status === 404, `outsider team-action POST status ${shell.status} (expected the 404 shell — the API-revoked member is an org outsider)`);
+      return `anonymous 303 /login?redirect_to=…; outsider POST → the 404 shell (member session row ${ctx.memberSessionId} minted)`;
+    },
+  },
+  {
+    id: "fw-org-web-owner-add-303",
+    expect: `THE OWNER ADD round-trip (9b45d68 U1 — teams.go:163-226's add arm LIVE, the uname field): the OWNER's web session POST /${"{org}"}/teams/${"{team}"}/action/add (uname=<member>) → 303 EXACTLY /${"{org}"}/teams/${"{id}"} (the id-carrier slice redirect); the API confirms the membership (GET /teams/${"{id}"}/members/<member> → 200 with the login) — addTeamMember ensured the ORG membership first, arming the members-action leave arm below`,
+    run: async () => {
+      expect(typeof ctx.webCookie === "string" && Number.isInteger(ctx.teamId) && ctx.memberCreated,
+        "no owner session / team / member from the prior arms (fixture missing)");
+      const actionPath = `/${ctx.org}/teams/${ctx.teamId}/action/add`;
+      const res = await fetchT(`${opts.baseUrl}${actionPath}`, {
+        method: "POST",
+        headers: { cookie: ctx.webCookie, origin: opts.baseUrl, "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ uname: ctx.member }).toString(),
+      });
+      await res.text();
+      expect(res.status === 303, `owner add POST status ${res.status} (expected 303): ${res.status === 404 ? "the owner gate 404-shelled — canManageOrgTeams did not see the org owner" : ""}`);
+      expect(res.headers.get("location") === `/${ctx.org}/teams/${ctx.teamId}`,
+        `location ${JSON.stringify(res.headers.get("location"))} (expected the team slice /${ctx.org}/teams/${ctx.teamId})`);
+      const member = await api(`/teams/${ctx.teamId}/members/${ctx.member}`);
+      expect(member.status === 200 && member.json?.login === ctx.member,
+        `membership GET after the web add: ${member.status} ${member.text.slice(0, 80)} (expected 200 with the member's login)`);
+      return `303 → the team slice; the API reads the member back (200 ${ctx.member})`;
+    },
+  },
+  {
+    id: "fw-org-web-member-leave-303",
+    expect: `THE MEMBER LEAVE round-trip (9b45d68 U1 — members.go:114-121's leave arm LIVE; the button posts uid=SignedUser.ID and the handler resolves the uid FIRST, members.go:84-89): the member's web session POST /org/${"{org}"}/members/action/leave (uid=<their id>) → 303 EXACTLY "/" (the JSONRedirect("/") arm); the API confirms the sweep (GET /teams/${"{id}"}/members/<member> → 404 — the org-membership removal cascades the team row)`,
+    run: async () => {
+      expect(typeof ctx.memberCookie === "string" && Number.isInteger(ctx.memberId) && Number.isInteger(ctx.teamId),
+        "no member session / id / team from the prior arms (fixture missing)");
+      const leavePath = `/org/${ctx.org}/members/action/leave`;
+      const res = await fetchT(`${opts.baseUrl}${leavePath}`, {
+        method: "POST",
+        headers: { cookie: ctx.memberCookie, origin: opts.baseUrl, "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ uid: String(ctx.memberId) }).toString(),
+      });
+      await res.text();
+      expect(res.status === 303, `member leave POST status ${res.status} (expected 303)`);
+      expect(res.headers.get("location") === "/", `location ${JSON.stringify(res.headers.get("location"))} (expected "/" — the leave arm's JSONRedirect target)`);
+      const gone = await api(`/teams/${ctx.teamId}/members/${ctx.member}`);
+      expect(gone.status === 404, `membership GET after the leave: ${gone.status} (expected 404 — the org removal cascades the team row)`);
+      return `303 "/" — the member left and the team row swept (API 404)`;
+    },
+  },
+  {
+    id: "fw-danger-transfer-roundtrip",
+    expect: `THE DANGER-ZONE TRANSFER round-trip (6b7b517 U4 — the transfer/cancel arms are LIVE; a fresh public repo): ANONYMOUS POST /settings action=transfer → 303 EXACTLY /login?redirect_to=<encoded settings path> (the settingsGate's anonymous arm); the owner's session POST action=transfer (the typed FULL repo_name + new_owner_name=<member>) → 303 EXACTLY /${"{owner}/{repo}"}/settings; the settings page now carries the pending-transfer banner (transfer_started's "has been marked for transfer and awaits confirmation from" + the recipient) AND the abort form's hidden action=cancel_transfer; POST action=cancel_transfer → 303 settings; the banner AND the abort form are GONE on a fresh GET (the pending row deleted)`,
+    run: async () => {
+      expect(typeof ctx.webCookie === "string" && ctx.memberCreated, "no owner session / member from the prior arms (fixture missing)");
+      const create = await api("/user/repos", { method: "POST", body: { name: ctx.dzRepo, private: false, auto_init: true } });
+      if (create.status === 201) {
+        ctx.dzCreated = true; // mark on the observable write
+        ctx.dzFullName = String(create.json?.full_name ?? `${ctx.user}/${ctx.dzRepo}`);
+      }
+      expect(create.status === 201, `danger-zone repo create status ${create.status} (expected 201): ${create.text.slice(0, 120)}`);
+      const settingsPath = `/${ctx.user}/${ctx.dzRepo}/settings`;
+      const anon = await fetchT(`${opts.baseUrl}${settingsPath}`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ action: "transfer", repo_name: ctx.dzFullName, new_owner_name: ctx.member }).toString(),
+      });
+      await anon.text();
+      expect(anon.status === 303, `anonymous transfer POST status ${anon.status} (expected 303 — the settingsGate's login round-trip)`);
+      expect(anon.headers.get("location") === `/login?redirect_to=${encodeURIComponent(settingsPath)}`,
+        `anonymous location ${JSON.stringify(anon.headers.get("location"))} (expected /login?redirect_to=<encoded settings path>)`);
+      const start = await fetchT(`${opts.baseUrl}${settingsPath}`, {
+        method: "POST",
+        headers: { cookie: ctx.webCookie, origin: opts.baseUrl, "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ action: "transfer", repo_name: ctx.dzFullName, new_owner_name: ctx.member }).toString(),
+      });
+      await start.text();
+      ctx.dzTransferPending = start.status === 303; // mark on the observable write (before the location assert)
+      expect(start.status === 303, `transfer start POST status ${start.status} (expected 303): ${start.status === 200 ? "an invalid re-render — the confirm/target arms refused" : ""}`);
+      expect(start.headers.get("location") === settingsPath,
+        `start location ${JSON.stringify(start.headers.get("location"))} (expected ${settingsPath})`);
+      const bannerPage = await fetchT(`${opts.baseUrl}${settingsPath}`, { headers: { cookie: ctx.webCookie } });
+      const bannerBody = await bannerPage.text();
+      expect(bannerPage.status === 200, `settings GET status ${bannerPage.status} (expected 200 with the pending banner)`);
+      expect(bannerBody.includes("has been marked for transfer and awaits confirmation from"),
+        "the pending-transfer banner is missing from the settings page");
+      expect(bannerBody.includes(ctx.member), `the banner does not name the recipient ${ctx.member} (transfer_started's %s)`);
+      expect(bannerBody.includes(`name="action" value="cancel_transfer"`), "the abort form's hidden action=cancel_transfer is missing");
+      const cancel = await fetchT(`${opts.baseUrl}${settingsPath}`, {
+        method: "POST",
+        headers: { cookie: ctx.webCookie, origin: opts.baseUrl, "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ action: "cancel_transfer" }).toString(),
+      });
+      await cancel.text();
+      ctx.dzTransferPending = false;
+      expect(cancel.status === 303, `cancel POST status ${cancel.status} (expected 303)`);
+      expect(cancel.headers.get("location") === settingsPath,
+        `cancel location ${JSON.stringify(cancel.headers.get("location"))} (expected ${settingsPath})`);
+      const after = await fetchT(`${opts.baseUrl}${settingsPath}`, { headers: { cookie: ctx.webCookie } });
+      const afterBody = await after.text();
+      expect(after.status === 200, `post-cancel settings GET status ${after.status} (expected 200)`);
+      expect(!afterBody.includes("has been marked for transfer and awaits confirmation from"),
+        "the pending-transfer banner still renders after the cancel (the pending row survived)");
+      return `anon 303 → start 303 → banner + abort form → cancel 303 → banner gone (transfer to ${ctx.member} filed and cancelled)`;
+    },
+  },
+  {
+    id: "fw-danger-delete-refusal-200",
+    expect: `THE DELETE REFUSAL (6b7b517 U4 — handleSettingsPostDelete's typed-name gate): the owner's session POST action=delete with a WRONG repo_name (<full name> + "-typo") → 200 RE-RENDER (never a 303) carrying the verbatim form.enterred_invalid_repo_name text "The repository name you entered is incorrect." in the ui negative message; the API still reads the repo → 200 (nothing written)`,
+    run: async () => {
+      expect(ctx.dzCreated === true && typeof ctx.webCookie === "string", "no danger-zone repo / owner session from the prior arms (fixture missing)");
+      const settingsPath = `/${ctx.user}/${ctx.dzRepo}/settings`;
+      const res = await fetchT(`${opts.baseUrl}${settingsPath}`, {
+        method: "POST",
+        headers: { cookie: ctx.webCookie, origin: opts.baseUrl, "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ action: "delete", repo_name: `${ctx.dzFullName}-typo` }).toString(),
+      });
+      const body = await res.text();
+      expect(res.status === 200, `wrong-name delete POST status ${res.status} (expected the 200 re-render): ${body.slice(0, 120)}`);
+      expect(body.includes("The repository name you entered is incorrect."),
+        "the re-render does not carry the verbatim enterred_invalid_repo_name text");
+      expect(body.includes(`class="ui negative message"`), "the refusal message is not in the ui negative banner");
+      const alive = await api(`/repos/${ctx.user}/${ctx.dzRepo}`);
+      expect(alive.status === 200, `repo GET after the refusal: ${alive.status} (expected 200 — the refusal wrote nothing)`);
+      return `200 re-render with the verbatim refusal; the repo survives (API 200)`;
+    },
+  },
+  {
+    id: "fw-danger-delete-303",
+    expect: `THE REAL DELETE (6b7b517 U4 — the confirm-name gate passes, the full D1 cascade runs): the owner's session POST action=delete with the EXACT full name → 303 EXACTLY /${"{owner}/{repo}"}/settings (the COMMITTED redirect target — for a deleted repo that URL is now the 404 shell, the documented divergence; upstream targets the owner dashboard, setting.go:978 — PENDING: the in-flight ui/index.ts fold redirects a user-owned delete to "/", flip this pin at convergence); the API read-back → 404 at t+0 (the row is gone — the delete IS the cascade)`,
+    run: async () => {
+      expect(ctx.dzCreated === true && ctx.dzGone !== true && typeof ctx.webCookie === "string", "no danger-zone repo / owner session from the prior arms (fixture missing)");
+      const settingsPath = `/${ctx.user}/${ctx.dzRepo}/settings`;
+      const res = await fetchT(`${opts.baseUrl}${settingsPath}`, {
+        method: "POST",
+        headers: { cookie: ctx.webCookie, origin: opts.baseUrl, "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ action: "delete", repo_name: ctx.dzFullName }).toString(),
+      });
+      await res.text();
+      if (res.status === 303) ctx.dzGone = true; // mark on the observable write (before the location assert)
+      expect(res.status === 303, `real delete POST status ${res.status} (expected 303): ${res.status === 200 ? "the typed-name gate refused — the confirm name must be the EXACT full name" : ""}`);
+      expect(res.headers.get("location") === settingsPath,
+        `delete location ${JSON.stringify(res.headers.get("location"))} (expected ${settingsPath} — the committed settings-URL redirect; the in-flight fold will move it to "/")`);
+      const gone = await api(`/repos/${ctx.user}/${ctx.dzRepo}`);
+      expect(gone.status === 404, `repo GET after the delete: ${gone.status} (expected 404 at t+0 — the row is gone)`);
+      return `303 → the settings URL (the committed 404-shell divergence); the repo is dead at t+0 (API 404)`;
     },
   },
   {
@@ -3382,7 +3665,7 @@ const fixwaveSteps = (ctx) => [
   },
   {
     id: "fw-cleanup",
-    expect: `everything DELETEd: org repo + PR repo + tag repo (204 each), the org (204), the member's token (204) + the member user (204), the session row (D1) — a failed cleanup is documented, not fatal (the failure-tail re-sweeps)`,
+    expect: `everything DELETEd: org repo + PR repo + tag repo + the danger-zone repo (204 each), the org (204), the member's token (204) + the member user (204), the THREE web-session rows (rotation + danger-family owner/member) (D1) — a failed cleanup is documented, not fatal (the failure-tail re-sweeps)`,
     run: async () => {
       const parts = [];
       const a = await deleteRepo(ctx.org, ctx.orgRepo);
@@ -3394,6 +3677,30 @@ const fixwaveSteps = (ctx) => [
       const c = await deleteRepo(ctx.user, ctx.tagRepo);
       if (typeof c === "string") ctx.tagRepoGone = true;
       parts.push(typeof c === "string" ? c : c.detail);
+      // The danger-zone repo: normally already dead (the family's real-delete
+      // arm IS its cleanup). A red mid-family leaves it alive — cancel a
+      // pending transfer first (the failure-tail's same shape), then delete.
+      if (ctx.dzTransferPending === true && ctx.dzGone !== true && typeof ctx.webCookie === "string") {
+        try {
+          const cancel = await fetchT(`${opts.baseUrl}/${ctx.user}/${ctx.dzRepo}/settings`, {
+            method: "POST",
+            headers: { cookie: ctx.webCookie, origin: opts.baseUrl, "content-type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({ action: "cancel_transfer" }).toString(),
+          });
+          await cancel.text();
+          if (cancel.status === 303) {
+            ctx.dzTransferPending = false;
+            parts.push(`pending transfer on ${ctx.dzRepo} cancelled (303)`);
+          } else parts.push(`pending-transfer cancel returned ${cancel.status} (continuing to the repo delete)`);
+        } catch (err) {
+          parts.push(`pending-transfer cancel threw: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      if (ctx.dzCreated === true && ctx.dzGone !== true) {
+        const d = await deleteRepo(ctx.user, ctx.dzRepo);
+        if (typeof d === "string") ctx.dzGone = true;
+        parts.push(typeof d === "string" ? d : d.detail);
+      }
       if (ctx.orgCreated) {
         const org = await api(`/orgs/${ctx.org}`, { method: "DELETE" });
         if (org.status === 204) { ctx.orgGone = true; parts.push(`org ${ctx.org} deleted`); }
@@ -3419,6 +3726,26 @@ const fixwaveSteps = (ctx) => [
           parts.push(`session row ${ctx.sessionId} deleted (D1)`);
         } catch (err) {
           parts.push(`session row ${ctx.sessionId} LEFT BEHIND — ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      // The org-web/danger families' two extra web sessions (the owner's and
+      // the member's — same D1 row shape, the same sweep).
+      if (ctx.webSessionId !== null) {
+        try {
+          await d1Exec(`DELETE FROM sessions WHERE id = '${ctx.webSessionId}'`);
+          ctx.webRowDeleted = true;
+          parts.push(`web session row ${ctx.webSessionId} deleted (D1)`);
+        } catch (err) {
+          parts.push(`web session row ${ctx.webSessionId} LEFT BEHIND — ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      if (ctx.memberSessionId !== null) {
+        try {
+          await d1Exec(`DELETE FROM sessions WHERE id = '${ctx.memberSessionId}'`);
+          ctx.memberRowDeleted = true;
+          parts.push(`member session row ${ctx.memberSessionId} deleted (D1)`);
+        } catch (err) {
+          parts.push(`member session row ${ctx.memberSessionId} LEFT BEHIND — ${err instanceof Error ? err.message : String(err)}`);
         }
       }
       await rm(ctx.tmp, { recursive: true, force: true });
@@ -3462,6 +3789,28 @@ const fixwaveFailureCleanup = async (ctx) => {
     if (ctx.tagRepoCreated === true && ctx.tagRepoGone !== true) {
       await tryDeleteRepo("tag-only repo", ctx.tagRepoFullName, `${ctx.user}/${ctx.tagRepo}`);
     }
+    // The danger-zone repo: a red between the transfer start and the cancel
+    // leaves a PENDING row — cancel it first (the owner's web cookie rides
+    // the same POST the round-trip used), then the repo delete.
+    if (ctx.dzTransferPending === true && ctx.dzGone !== true && typeof ctx.webCookie === "string") {
+      try {
+        const cancel = await fetchT(`${opts.baseUrl}/${ctx.user}/${ctx.dzRepo}/settings`, {
+          method: "POST",
+          headers: { cookie: ctx.webCookie, origin: opts.baseUrl, "content-type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ action: "cancel_transfer" }).toString(),
+        });
+        await cancel.text();
+        if (cancel.status === 303) {
+          ctx.dzTransferPending = false;
+          acts.push(`pending transfer on ${ctx.dzRepo} cancelled (303)`);
+        } else acts.push(`pending-transfer cancel returned ${cancel.status} (continuing to the repo delete)`);
+      } catch (err) {
+        acts.push(`pending-transfer cancel threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (ctx.dzCreated === true && ctx.dzGone !== true) {
+      await tryDeleteRepo("danger-zone repo", ctx.dzFullName, `${ctx.user}/${ctx.dzRepo}`);
+    }
     if (ctx.orgCreated === true && ctx.orgGone !== true) {
       try {
         const res = await api(`/orgs/${ctx.org}`, { method: "DELETE" });
@@ -3486,6 +3835,23 @@ const fixwaveFailureCleanup = async (ctx) => {
         acts.push(`session row ${ctx.sessionId} deleted (D1)`);
       } catch (err) {
         noteLeftBehind(`session row ${ctx.sessionId}`, `D1 delete threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    // The org-web/danger families' two extra web sessions (the same sweep).
+    if (ctx.webSessionId !== null && ctx.webRowDeleted !== true) {
+      try {
+        await d1Exec(`DELETE FROM sessions WHERE id = '${ctx.webSessionId}'`);
+        acts.push(`web session row ${ctx.webSessionId} deleted (D1)`);
+      } catch (err) {
+        noteLeftBehind(`web session row ${ctx.webSessionId}`, `D1 delete threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (ctx.memberSessionId !== null && ctx.memberRowDeleted !== true) {
+      try {
+        await d1Exec(`DELETE FROM sessions WHERE id = '${ctx.memberSessionId}'`);
+        acts.push(`member session row ${ctx.memberSessionId} deleted (D1)`);
+      } catch (err) {
+        noteLeftBehind(`member session row ${ctx.memberSessionId}`, `D1 delete threw: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
   } catch (err) {
@@ -8632,7 +8998,7 @@ const BATTERIES = {
   // the verdict). Needs an ADMIN PAT (POST /admin/users + the sudo pair) and
   // wrangler auth for the d1 arms (the rotation backdate + the session-row
   // sweep; --d1-scope picks the database).
-  "fixwave-parity": { title: "fix-wave parity (PR head-sync → merged-PR 412 → ghost-404, tag-only push-create, org revoke mask, private-user ladder, sudo pair, session-rotation directive)", context: fixwaveContext, steps: fixwaveSteps, failureTail: fixwaveFailureCleanup, independent: true },
+  "fixwave-parity": { title: "fix-wave parity (PR head-sync → merged-PR 412 → ghost-404, tag-only push-create, org revoke mask, private-user ladder, sudo pair, session-rotation directive, is_2fa filter, label writer gate, org membership web actions, danger-zone transfer + delete)", context: fixwaveContext, steps: fixwaveSteps, failureTail: fixwaveFailureCleanup, independent: true },
   // Chained (the shared-fixture shape — a red in the setup skips the arms
   // that need it, like registry/generate; NOT independent like fixwave).
   // Needs an ADMIN PAT (the member-user arm) and wrangler auth for the
