@@ -1,8 +1,9 @@
 # cf-gitea v1.5.1 — Release Notes (the dead-route-and-salvage wave)
 
 **Range**: RANGE=<pending> (`1c8279b..FINAL_HEAD`) — **COMMIT_COUNT=<pending>**
-commits, landed 2026-11-01 — a single-day window (thirty-two at this draft, the
-two notes commits excluded; the pending-fill items in §16 may still join). Deployed
+commits, landed across 2026-11-01/02 — a single overnight window (forty-four at
+this draft, the three notes commits excluded; the pending-fill items in §17 may
+still join). Deployed
 as **`DEPLOY_ID=<pending>`** — FINAL_HEAD=<pending>. Probe battery
 **PROBE_COUNTS=<pending>** — the first battery alignment (`d3f8211`) planned
 **244** probes (238 → 244, six new) and the second (`ebf21a2`) plans **253**
@@ -25,7 +26,20 @@ batches landed directly (`86b5aee`, `d973408`), and after the death the
 V-wave of salvages finished the dead U-units' carried work (`7f2ecd3`,
 `6f1008b`, `ebf21a2`, `8994488`, `326904e`), the index.ts bundle landed
 (`7d91ccd`), and U21 closed the attributed findings and U14's residual last
-(`16ca6c9`). Every fix was re-derived
+(`16ca6c9`). The wave's fourth movement closed the dispatched units and
+adversarially re-verified the release: the trigger status mappings completed
+with the fold-back (`035213e`), the paperwork and cite-drift batches landed
+(`0ee668d`, `820319f`), the wiki revision-diff view and its raw downloads
+landed as one split-then-served arc (`14cc03d`, `8fadf97`), the gitlink diff
+visibility reached the engine (`decf55d`), the file-tree KV read-back followed
+its upstream pin over the brief's default (`2512dbf`), the goldens trio
+regenerated deterministic on the fixed-id harness precedent (`abe1fa1`), and
+the eleven-check adversarial re-check confirmed the fix wave while finding one
+P3 (§16, `268b268`) — closed same-window with every parked carrier cleared
+(`fb3ee67`); the blame/editor sidebars took the file-tree feed
+page-module-side (`8c18bc5`); and the wikiPatchSeries collapse was adjudicated
+STOPPED on failed byte-identity, the mirror kept with a byte-fix dispatched
+(`275d151`). Every fix was re-derived
 from the upstream pin BEFORE editing; every unit's suites were re-verified solo
 by the orchestrator before commit.
 
@@ -249,7 +263,7 @@ its assertion form).
   mustEnableIssuesOrPulls closes only the /issues subtree — the /labels and
   /milestones groups are siblings outside it and upstream SERVES
   label/milestone APIs on tracker-disabled repos, so wrapping ours would
-  diverge (L4, skipped with pin evidence — §16).
+  diverge (L4, skipped with pin evidence — §17).
 - **The AEAD ticket** (`0bd7798`): the restart-dead sibling's AES-256-GCM
   ticket conversion verified COMPLETE hunk-by-hunk (wire-version byte 0x01,
   12B IV, 16B tag, HKDF-SHA256 key derivation, cached CryptoKey, retired-HMAC
@@ -473,7 +487,7 @@ full D1 cascade. Action routing lives in the page module (applyRepoBasics
 dispatches into applyRepoDangerAction — upstream posts every arm to the same
 /settings URL), so ui/index.ts stayed untouched; archive/unarchive/visibility
 were already carried by the merged basics form, not duplicated. Three arms are
-blocked on the index.ts follow-up bundle (§16): delete's owner-dashboard
+blocked on the index.ts follow-up bundle (§17): delete's owner-dashboard
 redirect override (the write is upstream-exact and pinned; the landing page is
 ours), the doer threading (settingsSubmit passes no viewer — exact for
 user-owned repos), and the admin-repos delete button's route registration (the
@@ -500,7 +514,7 @@ starts empty. NO webhook fires (upstream fires none — only an audit record,
 and our audit enum has no wiki arm yet: follow-up dispatched). WIRE GAP,
 fail-closed: settingsSubmit passes only the DB handle, so the delete-wiki arm
 REFUSES BEFORE ANY WRITE until the one-line env threading lands in ui/index.ts
-(§16's bundle). N4, the repo-delete notification sweep: deleteRepository's
+(§17's bundle). N4, the repo-delete notification sweep: deleteRepository's
 issue-scoped batch now sweeps notification_states — our derived model keys on
 (user_id, issue_id) with no repo_id column, so the arm joins through the
 repo's issue ids exactly like the comments/subscriptions siblings (upstream's
@@ -509,7 +523,7 @@ adaptation disclosed in the comment). Pinned: doomed threads' read+unread rows
 gone per-issue, a survivor repo's row intact.
 
 **The wiki follow-ups land** (V3, `6f1008b`, the U17 salvage): the
-slashed-title quirk (§16's ledgered 500-after-create) is FIXED at the read
+slashed-title quirk (§17's ledgered 500-after-create) is FIXED at the read
 side, and the shape is worth recording — writes land the codec's GitPath
 segments as tree entry names VERBATIM (buildFileChangeCommit splits on literal
 '/'), while every engine read decodes per segment (decodePath), so the flat
@@ -532,6 +546,57 @@ FindEvents/metaPairs — repaired in three places). CROSS-UNIT FOLD
 actionFilters, and the two audit-logs goldens (org-settings, repo-settings)
 land IN THIS COMMIT carrying exactly the two new options — the dependency
 V3's report named (V1's commit will exclude them).
+
+**The wiki revision-diff view and the raw downloads** (U23 `14cc03d` + U32
+`8fadf97` — ⑫'s D12, landed as a split-then-served arc): THE SPLIT VERDICT
+(U23): the VIEW mounts fully loader-side — loadWikiViewData gains the
+`commit/{sha}` arm under the SAME 'view' outcome (`WikiPageViewData |
+WikiCommitViewData`, the handler dispatches on kind — zero index.ts changes,
+proven type-clean by a tree-zero typecheck taken with the in-flight files
+included); the raw downloads' loader + grammar land first, with the serving arm
+dispatched (the handler funneled every outcome through c.html — a raw Response
+cannot pass). THE VIEW (wiki-commit-diff.tsx NEW): the PageIsWiki commit page
+per commit_page.tmpl — sha labels onto `{repoLink}/wiki/commit/{sha}` (:2),
+header buttons gated off (:12), activeTab=wiki, the 'repository diff' page
+class, reusing commitViewLocale + DiffFileBox/DiffStats/diffFileViews/
+usernamesByEmail over the wiki cell's readDiff. THE GRAMMAR: web.go:1619-1620
+verbatim — lowercase-only `[0-9a-f]{7,64}`, the parse IS the router gate
+(uppercase tails fold to page names like upstream's pattern miss — verified);
+the full-oid-only engine divergence is inherited (short prefixes parse,
+readCommit nulls). THE RAW COMPOSITION: via diffpatch-files' exported renderer
+seams (readDiff/renderUnifiedDiffAsync/renderPatchAsync/diffBlobSource, exactly
+loadCommitDiffPatch's composition) over wikiReads — TWO MIRRORS DISCLOSED at
+U23 with collapse opportunities once U25 landed: wikiEnginePath (load-bearing:
+the renderer's read-backs must address the codec's flat stored names, exercised
+by a slashed+spaced title) and wikiPatchSeries (the private merge-series
+walker; tested over a REAL wiki-cell merge — .patch mails the side commit
+[PATCH], never the merge, no signature). THE SERVING ARM (U32): wikiPage gains
+the branch immediately after the prologue destructure, BEFORE the ?action folds
+and the view load (upstream's specific-route-beats-Combo/* mux order) —
+parseWikiCommitDownloadTail hit → loadWikiCommitDiffPatch →
+diffPatchTextResponse; null → the handler's 404-shell convention (exactly
+upstream GetRawDiff's IsErrNotExist → NotFound, commit.go:449-452 — verified).
+U23's disclosed interims are GONE: hex+dotted tails serve RAW bytes instead of
+the page-name 303, and a well-shaped ghost sha answers 404, not the
+missing-303; the VIEW-side ghost fold STAYS an interim (repo-wiki.tsx's outcome
+set cannot carry a 404 — ledgered in §17). THE MIRROR COLLAPSE BEGUN:
+enginePath DONE (services/wiki.ts strictly the export keyword;
+wiki-commit-diff.tsx collapses onto the import, doc updated); wikiPatchSeries
+PENDING at U32's check time (git-models was U25's uncommitted state) — the
+collapse unit's VERDICT (U37, `275d151`): STOPPED, the mirror KEPT —
+byte-identity FAILED against both the shared renderer and git itself (the
+probe and the verdict in §17); a wiki byte-fix dispatched (§17). PINS:
+index.test.ts +116 (5 route-level
+— .diff raw bytes with the content-type+cache pair and a git-apply-valid
+`@@ -0,0 +1,2 @@` hunk, .patch mail From-sha with NO `--` tail, ghost-sha 404
+shell, pattern-miss 303 regression over non-hex/uppercase/short/suffix, VIEW
+re-pin; the cell write memoized — DO storage outlives the D1 wipe, the pair
+re-seeds); wiki.matrix dotted-tail 303 → 200 + ghost-download 404 (ghost VIEW
+stays 303 per the interim); smoke loader pins re-confirmed. Gates, orchestrator
+re-verified solo: U23 wiki smoke 9/9 + matrix 29/29 (38 combined, twice, one
+boot-flake re-run green); U32 index 333/333, smoke 9/9, matrix 29/29; typecheck
+zero in owned files at both landings (U32's 2-error attribution was U25's
+pre-fix state, healed at `decf55d`); scoped eslint clean.
 
 ## 9. Issues and labels — scoped/exclusive semantics, the self-healing recount (`e6b980e`, `14ba724`, `9d72592`)
 
@@ -589,7 +654,7 @@ Allow: GET, OPTIONS in the house methodNotAllowed shape. The stale "OPTIONS is
 not carried" divergence note is rewritten to the deny-arm-carried truth;
 MUTATION-PROVEN (route disabled → exactly the 1 fails). The observed residual
 — POST /attachments/{uuid} still falls to Hono 404 where chi's method-mismatch
-arm 405s — joins the index.ts follow-up bundle (§16).
+arm 405s — joins the index.ts follow-up bundle (§17).
 
 **The type-7 test accommodation and the regression sweep** (`9d72592`, U10):
 the one test whose seed rides setLabel now expects the comment PAIR in order —
@@ -623,7 +688,7 @@ only red was the briefed accommodation.
 - **N6 (P3) documented equivalence**: users.type is the collapsed
   ['user','org'] enum — bot rows cannot exist, upstream's IsTypeBot skip is
   vacuous here.
-- **N5 (P3) REFUTED at the pin** (recorded in §16): the transition-pinned
+- **N5 (P3) REFUTED at the pin** (recorded in §17): the transition-pinned
   CommentID is real (notification.go:176-196) but the REST serializer never
   renders it — our fillLastCommentIds already matches upstream's rule.
 
@@ -755,8 +820,8 @@ posts first and the re-pick's identical context dedupes. Pinned: claimed →
 row exists pre-report (context ci / build (pull_request), pending, In
 progress, head sha, targetUrl, creatorId −2); assembly-failure → zero rows;
 abort-release → re-claim dedupes to one. (U21 also landed V2's two
-transfer findings — §8.) ATTRIBUTED for trigger.ts's owner (dispatched,
-§16): toCommitStatus/toCommitStatusDescription omit RUNNING(6)/CANCELLING(8)
+transfer findings — §8.) ATTRIBUTED for trigger.ts's owner (CLOSED at U27,
+below): toCommitStatus/toCommitStatusDescription omit RUNNING(6)/CANCELLING(8)
 despite the comment claiming they ride (RUNNING falls to error/Unknown — the
 claim post is the first RUNNING caller, its mapping lives locally pending
 that fix; the cancel arms posting CANCELLING hit the same gap); and
@@ -765,6 +830,34 @@ origin+trailing-slash (completion-time URLs carry //owner — the dispatch
 site joins single-slash). Gates, orchestrator re-verified solo: dispatch
 18/18 (+3), repo-edit 62/62 (+6), actions routes E2E 24/24 downstream;
 typecheck tree-zero; check:api PASS; scoped eslint clean.
+
+**The trigger mappings complete — and the fold-back** (U27, `035213e`): U21's
+two attributed findings closed. FINDING 1: toCommitStatus/
+toCommitStatusDescription gain the missing RUNNING/CANCELLING arms from
+upstream's exact table (commit_status.go:363's one-case line
+Waiting/Blocked/Pending/Running/Cancelling → Pending — verified; :342-345
+Running → `In progress`, Cancelling → `Canceling` — verified); the stale
+"ride too — v1 rows never hold them" comment replaced with the real arms +
+callers (the claim post holds RUNNING, the cancel emitter CANCELLING); the
+description switch reordered to upstream's case order. THE FOLD-BACK:
+dispatch.ts's postClaimCommitStatus drops its local literals for the shared
+helpers (ClaimContext.job matches the {status,started,stopped} shape) —
+dispatch.test.ts UNTOUCHED, its pins stayed green through the fold, proving
+value-identity; a new DB-backed cancel-arm pin drives a CANCELLING job through
+createCommitStatusForRunJobs (job_emitter.go:135-151's shape) pinning
+pending/`Canceling`/root-relative target. FINDING 2: the targetUrl template
+normalizes the base (appUrl stripped of trailing slashes then single-slash
+joined — upstream's run.Link() shape, commit_status.go:150 — verified) fixing
+`//owner` under appUrlOf while PRESERVING the empty-base emitters'
+root-relative `/owner/...` shape — the first broken attempt (bare-relative)
+was caught by the unit's own new CANCELLING pin before landing; update.ts
+untouched (trigger-side fix suffices). Pins moved: runInput.appUrl → the
+appUrlOf shape; the insert test's toContain upgraded to an exact toBe pin; the
+empty-base CANCELLING pin; no other suite pins actions-generated targetUrls
+(checked pull-automerge/compat/statuses/api routes). Gates, orchestrator
+re-verified solo: trigger 150/150 (+2 net), dispatch 18/18; downstream E2E
+24/24 + repo-actions families 86/86 per report; typecheck tree-zero; scoped
+eslint clean.
 
 **The avatar/attachment P3 batch** (U15, `d973408`, five landed zero
 deferrals):
@@ -809,9 +902,10 @@ deferrals):
 
 The ⑫ diff/files review's D-findings landed across two salvage units: V4
 (the verbatim-git renderer family, the U18 salvage) and V5 (the
-files/compare family, the U19 salvage). The D-ledger state as of this draft:
-D1, D3, D9, D10, D11 landed with V4; D4–D8 landed with V5; **D2 and D12
-remain pending** (§16).
+files/compare family, the U19 salvage). The D-ledger as of this draft:
+D1, D3, D9, D10, D11 landed with V4; D4–D8 landed with V5; **D2 and D12 have
+since LANDED** (D2 at U25 `decf55d`, below; D12 across U23+U32, §8) — the
+whole D-ledger is in.
 
 **The verbatim-git renderer** (V4, `326904e`): the dead wave's
 renderUnifiedDiffAsync/DiffBlobSource design kept, the contract verbatim git
@@ -853,9 +947,9 @@ real-git re-verification and fixed in-landing:
   from the committer identity (temp_repo.go:312-317 verbatim — verified; no
   trailing newline; committer→author→doer fallback = the family's landed
   convention); schema description added; both polarities pinned.
-- OPEN NOTES dispatched next (§16): the non-merge single-mail .patch's
+- OPEN NOTES (both CLOSED at U25, below): the non-merge single-mail .patch's
   missing final trailing newline (one byte); routes/commits.ts's compare
-  .patch still renders merges with the old single-mail shape.
+  .patch still rendering merges with the old single-mail shape.
 - Gates, orchestrator re-verified solo: git-models-diffrender 19/19 (new),
   diffpatch 17/17, wave29 15/15; collateral green (compare.matrix 25,
   pull-engine 50 aligning with V5's re-pins, a11y 91); typecheck tree-zero;
@@ -901,6 +995,50 @@ real-git re-verification and fixed in-landing:
   only) — 158/158 untouched.
 - Gates, orchestrator re-verified solo: pull-engine 50/50, pulls 30/30,
   compat 158/158; tsc EXIT 0; scoped eslint clean; check:api PASS 554 ops.
+
+**The gitlink visibility and the shared series** (U25, `decf55d` — D2 plus
+V4's two open notes):
+
+- **D2 (P2)**: the ENGINE now emits gitlinks — flattenTree's isGitlinkMode
+  skip dropped (an omission, not a decision; the two object-queue walks at
+  repo.ts:1128/2433 KEEP theirs: a gitlink oid is never a local object);
+  computeDiff models a gitlink side as git's virtual one-line
+  `Subproject commit <sha>` file (the submodule sha NEVER dereferenced into
+  this store — a coincidental same-sha object cannot leak bytes); diffLines
+  produces git's exact hunk through the ordinary machinery; NOTICE row
+  recorded with the walk-site distinction. THE RENDERERS: zero new code — the
+  hunks carry upstream's parsed shapes verbatim (gitdiff.go:1102/:1131's
+  `+/-Subproject commit ` prefixes — the landing's :1101/:1130 cite drifted
+  one line) so renderUnifiedDiff emits git's exact bytes and toChangedFiles
+  maps added/changed/deleted per the 326904e vocabulary; REAL-GIT literals
+  recorded (add: `new file mode 160000` + index without column +
+  `@@ -0,0 +1 @@`; change: `@@ -1 +1 @@`; delete: `deleted file mode 160000`)
+  and APPLY-OK verified (`git apply --check --index` applies the Subproject
+  patch); end-to-end pin seeds a gitlink-only commit pinning dot-diff bytes +
+  stats {1,1,2} + files[0].status. UI: the never-firing Submodule label lights
+  (created/deleted pinned); HONEST PARITY PIN: a same-mode sha bump keeps
+  modeLabel null — upstream's TranslateDiffEntryMode (:617-626) emits only
+  from parsed mode lines and a bump's patch has none. DISCLOSED RESIDUAL
+  (v1.5.2 ledger, §17): git silently drops the gitlink delete when the path
+  becomes a directory; our flat map emits delete+add.
+- **NOTE (a) — V4's tail note closed**: the single-mail .patch tails fixed
+  from real-git xxd records (signed ends `-- \n2.43.0\n\n` one byte MORE than
+  had landed; unsigned ends `+line\n` — the landed string had no final
+  newline); the three coordinator-approved ripple flips landed (wave29:426,
+  compare-feeds:546/:619).
+- **NOTE (b) — V4's compare-shape note closed**: the SHARED renderPatchSeries
+  in git-models (non-merge mails over base..head, `[PATCH i/N]` only when
+  N>1, merge-only range zero bytes, 2000-commit page cap); commits.ts's
+  compare arm delegates; diffpatch-files.ts's private copy DELETED per the
+  grant — byte-identical for every series in both signature states.
+- **THE POST-LANDING FIX (coordinator-caught)**: the earlier eslint repair had
+  traded away typecheck (two TS2322s — readCommit's honest `CommitJson|null`
+  feeding serializeCommit); fixed with a runtime broken-fixture guard instead
+  of re-asserting, BOTH gates green together this time.
+- Gates, orchestrator re-verified solo: diffrender 27/27, pull-engine 52/52,
+  pull-files.matrix 39/39, wave29+compare-feeds 34/34, pulls 38/38 collateral;
+  typecheck tree-zero (re-run post-fix); check:api PASS; NOTICE + dist-types
+  regenerated.
 
 ## 14. The probe battery alignments (S8 `d3f8211`; V6 `ebf21a2`)
 
@@ -979,7 +1117,43 @@ of the two named flip candidates — the `fw-danger-delete-303` location pin
 convergence run; the README's other prime candidate (a `_cherrypick` alias)
 did NOT land — V1's aliases are the bare EDITOR spellings
 (`_new|_edit|_delete|_upload|_diffpatch`) only, so the bare-cherrypick 404
-half of fw-cherrypick-form-200 STANDS.
+half of fw-cherrypick-form-200 STANDS. Both candidates have since been
+ADJUDICATED (U26, below): the flip landed GREEN, the bare-cherrypick half
+stands BY DESIGN.
+
+**The goldens trio, the probe flip, and the adjudication** (U26, `abe1fa1` —
+V1's four handoffs all closed): THE TRIO: update-goldens.mjs delta EXACTLY
+three files (85 byte-identical); pull-review-signed-in + settings-team-admin
+deterministic-green; org-team-detail was RED BY CONSTRUCTION (U1's team action
+forms render repo.id in the remove form's repoid; the acme repos seed via
+crypto.randomUUID per run) — fixed at the granted scope: harness.ts
+seedGoldenOrg pins FIXED_ORG_REPO_IDS (anvil `…00a1`, bird-seed `…00a2`, the
+seed-repo.ts fixed-id precedent family) post-create with the id-keyed children
+moved (repo_counters re-created after the parent flip — the SPEC's single FK;
+repo_settings/repo_units updated; audit scope_id disclosed untouched; literals
+verified unique across src). THE FIXED-ID PRECEDENT: a golden harness may pin
+seeded ids to make fixtures deterministic — proven by the double-run
+uuid-variance check, goldens 97/97 on THREE consecutive solo runs. THE
+PULL-REVIEW DELTA ATTRIBUTED (accepted by the coordinator): NOT V1's predicted
+comment form — the merge-box Checking-state arm (fixture PR status=Checking,
+the form correctly absent, upstream-faithful) + label data-scope attrs (the
+scoping feature). THE FLIP: fw-danger-delete-303 to the landed shape
+(user-owned → 303 `/`, org → `/org/{name}/dashboard`, user.go:326-332/
+setting.go:980) with the PENDING retired in expect/assert/return + the family
+doc + both README rows — the flip candidate armed above is ADJUDICATED GREEN.
+SETTINGS as-built: the three named notes + the three sibling satisfied notes
+(six hunks; the console.error kept as a defensive log with the corrected
+message); still-true notes left alone. HEATMAP: V1's 'actual' numbers were
+THEMSELVES off — the file is 73 lines; all SEVEN drifted cites repaired
+(:49-73 handler, :51-54 enable, :55-60 visibility, :36-47 writeHeatmapJSON)
+across both files. THE COORDINATOR ADJUDICATION recorded: U26's w3-cherrypick
+observation was MISTAKEN — index.ts:6719 leaves bare cherrypick engine-owned
+BY DESIGN (only patch/_diffpatch are dual-spelled), the bare-404 half does NOT
+flip, and U24's audit reading is confirmed — the README's second prime
+candidate above is RESOLVED as a deliberate non-flip. Gates, orchestrator
+re-verified solo: goldens 97/97, heatmap 7/7, a11y 91/91 per report, dry-run
+253, node --check clean, scoped eslint clean; the one tree tsc error
+attributed to U25's in-flight diffrender test.
 
 ## 15. SPEC ledger and migrations
 
@@ -1025,8 +1199,99 @@ transfer.go — verified at :72) and
 NULL` (the M4 counter) — journal single-entry, the snapshot programmatically
 column-diffed against 0060 (only the two columns, nothing stray), LOCAL
 applied; the REMOTE application is the orchestrator's at convergence.
+- **The pre-convergence paperwork batch** (U28, `0ee668d`, six findings): (7)
+  ui/index.ts's 9 cite instances across 8 lines renumbered (web.go:997-998 →
+  :999-1000 ×5, :989 → :992 ×4; one compound cite needed a second pass for the
+  missing web.go: prefix; comment-only, every hunk verified hunk-by-hunk); (8)
+  specs/oauth2-provider.md:47-48 repointed — WebAuthn landed (SPEC-0022 +
+  migration 0060), the AllowOAuth2 interplay slot stays recorded for the
+  re-pin; (9) DELIBERATE DEVIATION from the audit's grep hint: the only
+  CHECK-ONLY-DO-NOT-APPLY hits are PRE-WRITTEN frozen run-day records
+  (rd25/tag-v1.3.1) — falsifying them with a 0061 line would corrupt
+  historical documents, so the posture line lands in the STANDING runbook's
+  Deployment section instead (0061 applied LOCAL by `7f2ecd3`; remote apply is
+  the convergence step BEFORE deploy); (13) invalid-workflow.ts's STAGED note
+  rewritten to the truth (createWorkflowCommitStatus exists at
+  trigger.ts:2101 — the audit's :2089 had drifted — wired at the completion
+  emitter `86b5aee` and the claim post `16ca6c9`;
+  NotifyWorkflowRunStatusUpdate remains unported; the module's own invalid-run
+  status call still NOT made, stated honestly); (14) repo-extras-t2.ts:90
+  '(orgs land with SPEC-0007)' → '(the recorded reduction)' — the reviewer
+  org-team arm's omission is real and now carries the right reason; (15+16)
+  three ui-parity-survey rows annotated with verified hashes in the
+  cherrypick-row style (:1210 the wiki delete-modal LANDED `8b46159`+
+  `6b7b517`; :1398 the danger zone; :1323 the five-segment POST tails
+  `9b45d68`). Gates, orchestrator re-verified: index 328/328 (comment-only
+  proof), invalid-workflow 12/12, repo-extras 35/35; typecheck's 2 tree errors
+  attributed to U23's in-flight wiki unit; scoped eslint clean.
+- **The cite-drift cleanup batch** (U30, `820319f`): 5 disclosed + 5
+  incidental cite repairs, every one re-verified against the pin fc493688 —
+  the web.go/teams.go/members.go region cites (:999-1000, :992, :113-254,
+  :246-253, :82-133), pull.go's X-Total-Count :1573 at both sites, :1541
+  (SkipTo, not :1542), the '297 lines' → 300 count, the nonexistent SPEC-0022
+  path fixed — and the transfer.go:57-58 cite located at db/schema.ts:319,
+  handed to the next unit (folded at `268b268`, §16). Comment-only proof:
+  pulls 30/30 + lifecycle 56/56; typecheck exit 0; scoped eslint clean.
 
-## 16. Deferred and pending (as of this draft)
+## 16. The fix-wave adversarial re-check — the release's last line of defense (U33, `268b268`)
+
+After the last feature landing, a read-only adversarial unit re-attacked the
+fix wave's critical surfaces before the release, confirming **ELEVEN CONFIRMED
+checks** and returning one P3. CONFIRMED: the clone-count high-water (both arms
+under the (stored,stored,true) matrix; the 7>5 rollback replay closed —
+upstream's success-only UpdateSignCount matched at webauthn.go:146-149,
+verified); the AEAD ticket wire (0x01|iv12|ct+tag16, the retired-HMAC format
+killed at the version gate); the dual-carrier park + the logout/exit ladder;
+the nine writer gates in chain position (message verbatim api.go:393-400; the
+L4 skip pin-correct — labels/milestones really are siblings outside :1674's
+subtree); the O3 ladder order (present-list semantics incl. the empty array;
+identical to routers/api/v1/repo/transfer.go:79-101, verified); the
+vanished-team drop + the idempotent re-attach; the O4 predicate verbatim (the
+admin grant gone, `permission denied` exact); M4's flip-gating (count(*)
+subselects = milestone.go:298-305, verified); THE NEEDS-CHAIN E2E HONESTY
+(FakeRunner speaks real application/proto over SELF.fetch against the mounted
+worker — it never imports server code; only the BLOCKED staging is by hand,
+disclosed; the mutation-kill is consistent — §12); and the renderer's
+mode-only + four no-newline shapes re-derived against scratch git 2.43.0
+(including the hand-proven two-hunk counter-drop — the D1 defect was real and
+the per-hunk reset fix correct, §13).
+
+**THE P3 FINDING (dispatched to U36, §17 — CLOSED below)**: passkeyLogin's success arm clears
+only its own pair — the dual-park carriers (the gitea_twofa gate ticket, 24h,
+plus the webauthn pending carrier) SURVIVE a completed discoverable login,
+violating the wave's own SPEC-0022 §6 dual-clear contract; parity/hygiene, not
+a bypass (both carriers still need their own proof); the one-line fix sits
+beside the 2FA arm's template. FINDINGS (P4, dispatched, §17): the
+transfer-ladder comment's transfer.go:76-98 → routers/api/v1/repo/transfer.go:79-101,
+plus schema.ts:324/:327's two cite swaps. U33's own still-open self-attribution
+(the private-org 404, models comment) was STALE — both had landed at `16ca6c9`.
+PART 1 of the same landing closed U30's handoff: schema.ts:319's TeamIDs cite
+transfer.go:57-58 → :72 (pin re-confirmed — :57-58 is
+ErrRepoTransferInProgress's tail). Process note: the confirmed-nothing arms are
+recorded here so the next audit does not re-derive them; the E2E honesty
+verdict is the standing answer to "is the FakeRunner real?"
+
+**THE P3 AND THE P4s CLOSE** (U36, `fb3ee67`): passkeyLogin's success arm now
+mirrors the 2FA assertion arm's full cookie list (the passkey+assert+pending
+webAuthnClearCookie triple, clearTwofaSetCookie, then the session mint —
+handleSignInFull's whole-session regenerate per auth.go:390-397; both upstream
+mint arms call it, webauthn.go:158/:270 — verified), so SPEC-0022 §6's 'no
+pre-auth carrier standing' contract holds on BOTH mint arms; the assert/
+passkey pair share the gitea_webauthn_challenge carrier name, so two identical
+challenge clears emit — harmless, both carrier-split arms wiped. Pinned: a
+dual-parked request (live passkey challenge first + stale assert carrier +
+signed stale pending + literal stale gitea_twofa) → 200, session count 1,
+exactly 2 challenge-name Max-Age=0 clears + the identity-name clear + the
+gitea_twofa clear. THE P4s (re-verified against fc493688): repo.ts:852's
+transfer.go:76-98 → routers/api/v1/repo/transfer.go:79-101 (models' 76-98 is
+the struct tail + LoadRecipient); schema.ts:324 :77-80 → :80-84 (the 422 sits
+at :82); :327 :82-96 → :87-97 (the for-loop at :87, the 403 at :95). OPEN
+NOTE (ledgered, §17): SPEC-0022 §6 names only the 2FA mint arm — the passkey
+arm now satisfies it too; the one-word both-arms touch rides the convergence
+notes fill. Gates, orchestrator re-verified solo: webauthn 15/15 (incl. the
+new case) + ceremony 29/29 = 44/44; typecheck tree-zero; scoped eslint clean.
+
+## 17. Deferred and pending (as of this draft)
 
 **Pending-fill markers for the convergence**: ⑥=LANDED (`7d91ccd` — the
 index.ts bundle's seven arms all in, ⑥'s named follow-ups included; the
@@ -1050,8 +1315,9 @@ decodes clean) persisting code_view.show_file_tree to user_settings_kv
 (setting_options.go:19) + the file-tree toggle pair rendered verbatim
 (view_file_tree.tmpl:3-7 hide + the toggle_button show, locale 2645-2646,
 repo-view-file-tree.ts:22-24's POST contract; both sidebar icons
-allowlisted + generated, 80 icons); the KV read-back feed needs render.tsx —
-REPORTED not done, documented in both headers. (2) the bare-spelling editor
+allowlisted + generated, 80 icons); the KV read-back feed needed render.tsx —
+REPORTED not done at V1's landing, documented in both headers — has since
+LANDED (U29, below). (2) the bare-spelling editor
 aliases `_new|_edit|_delete|_upload|_diffpatch` parse to the SAME families
 (web.go:1453-1465, the dead unit's two off-by-one cites repaired) with
 GET+POST registrations; file-editor.tsx's divergence note updated. (3) the
@@ -1073,32 +1339,114 @@ U15's hunks untouched). GOLDENS: V1's three byte-identical at HEAD
 (render-genuine); the two audit goldens rode V3's `6f1008b` as planned.
 A PRE-EXISTING TRIO RED (worktree-proven at clean HEAD: pull-review-signed-in
 / org-team-detail / settings-team-admin — stale vs landed-never-regenerated
-features, U1's family) — dispatched to the regen unit (below). HANDOFFS
-dispatched: the battery's fw-danger-delete-303 pin flip (this landing arms
-it — §14); settings.tsx's now-satisfied follow-up docs; owner-heatmap cite
-drifts. Gates, orchestrator re-verified solo: index 328/328 (the
+features, U1's family) — LANDED at U26 (`abe1fa1`, §14): the trio regenerated
+deterministic, org-team-detail's red root-caused to per-run uuid seeding and
+fixed with the harness fixed-id precedent. HANDOFFS dispatched: the battery's
+fw-danger-delete-303 pin flip (this landing arms it — §14); settings.tsx's
+now-satisfied follow-up docs; owner-heatmap cite drifts — ALL closed at U26
+(`abe1fa1`, §14). Gates, orchestrator re-verified solo: index 328/328 (the
 update_preferences battery, heatmap twins, aliases, danger threading +
 admin delete battery), file-editor.matrix 19/19, admin-repos.matrix 15/15,
 editor-tails 35 + attachments 47 + a11y 91 + shell/render/
 header-actions/migrating 92 per report; typecheck tree-zero; gen-icons 80
 exit 0; scoped eslint clean over 16 files.
 
-**Dispatched, not landed at this draft**:
-- **U21's attributed findings for trigger.ts's owner** (`16ca6c9`, §12):
-  the RUNNING(6)/CANCELLING(8) omission in
-  toCommitStatus/toCommitStatusDescription (the claim post is the first
-  RUNNING caller; the cancel arms posting CANCELLING hit the same gap), and
-  trigger.ts:2024's targetUrl double-slash under appUrlOf's
-  origin+trailing-slash.
-- **V1's handoffs** (`7d91ccd`): the battery pin flip (armed — §14),
-  settings.tsx's follow-up docs, the owner-heatmap cite drifts, and the
-  pre-existing golden trio's regeneration.
-- **V4's two open notes** (§13): the non-merge single-mail .patch's missing
-  final trailing newline (one byte); routes/commits.ts's compare .patch
-  still rendering merges with the old single-mail shape.
+**The KV read-back lands — with an upstream-winning default deviation** (U29,
+`2512dbf`): THE SEAM: render.tsx's uiPage src case computes showFileTree
+(blob-kind only; loadFileTreeVisibility beside the loader, the canWriteRepo
+precedent) threading into FileViewPage → FileTreeSidebar's `tw-hidden`
+(view_file_tree.tmpl:1's conditional, previously missing — every render was
+default-true). THE DEFAULTS — DEVIATION FROM THE BRIEF, UPSTREAM-WINNING: the
+brief said "no row → default false" but view_home.go:360-371 is unambiguous
+the other way (anonymous TRUE with zero reads; rowless → GetUserSetting 'true'
+→ shown; stored false → hidden; garbage bytes → the ParseBool error arm →
+false — verified at the pin) and both committed goldens corroborate — per the
+Upstream-Parity Decision Rule the landed semantics follow the pin (documented
+in both module headers). COST POSTURE: anonymous costs zero D1 reads (the
+resolveViewer posture), a signed-in viewer one indexed point read, tree-kind
+views nothing. Pins: 3 prop→DOM + 4 reader-semantics over real D1 (including
+the anonymous-zero-read and garbage-bytes arms) + 4 route-level through the
+mounted uiRouter (stored-true/false/rowless/anonymous-stored-false-ignored).
+OPEN NOTES: upstream's same switch feeds the BLAME (blame.go:65) and EDITOR
+(editor.go:44) sidebars — both call sites verified — LANDED page-module-side
+at U34 (below). Gates, orchestrator re-verified
+solo: render 39/39 (+11), goldens 97/97 byte-identical, a11y+pages+blame+editor
+collateral 171/171 + wave54 47/47 per report; typecheck exit 0; scoped eslint
+clean; ui/index.ts untouched (the KV key is a local const cross-citing, not an
+import).
 
-**The ⑫ D-ledger**: D1, D3, D9, D10, D11 landed with V4 (`326904e`) and
-D4–D8 landed with V5 (`8994488`) — §13; **D2 and D12 remain pending**.
+**The blame/editor feed — page-module-side** (U34, `8c18bc5`): U29's optional
+showFileTree prop pattern landed on EVERY sidebar consumer — blame.tsx
+(blame.go:65's prepareHomeTreeSideBarSwitch arming view.tmpl:20),
+file-editor.tsx's new/edit/delete (edit.tmpl:7, editor.go:44),
+repo-editor-tails.tsx's delete+upload confirms (delete.tmpl/upload.tmpl:7) —
+with the cherrypick/patch scope note verified upstream (they call
+prepareEditorPage but their templates render NO view_file_tree; our port
+matches); file-view.tsx's header follow-up note updated to landed. THE BLOCKED
+ARM (dispatched next, below): the ROUTER feed — per-case compute lines in
+ui/index.ts — until then the prop rides absent and production bytes stay
+default-true, PROVEN byte-identical (goldens 97/97). TESTS: 8 new pins over
+the REAL loadFileTreeVisibility + real D1 — wave54-blame +4 (stored-false
+hidden / stored-true shown / anonymous zero-read ignoring a stored-false row /
+prop-absent interim), file-editor.matrix +2, repo-editor-tails +2. Gates,
+orchestrator re-verified solo: blame 13/13, file-editor.matrix 21/21,
+repo-editor-tails 13/13; render 39/39 + collateral 80/80 + goldens 97/97
+byte-identical; typecheck tree-zero; scoped eslint clean over 7 files.
+
+**The collapse verdict — STOPPED, the mirror kept** (U37, `275d151`): the
+dispatched wikiPatchSeries fold ran as a byte-identity probe first (a scratch
+vitest harness driving BOTH walkers over a live wiki cell,
+created-run-deleted) and FAILED — U23's exact merge fixture diverges 464 vs
+463 bytes (one extra `\n` at the stream tail); a 2-mail series diverges at
+the between-mail seam (same root); the encode seam additionally diverges on a
+no-trailing-newline flat entry (636 vs 607 — the mirror's wikiDiffBlobSource
+re-encodes through enginePath's %25 doubling producing git's no-newline
+marker, the shared plain source degrades marker-less). ROOT CAUSE from
+history: U23 mirrored the family walker PRE-V4 — `326904e`'s D11
+xxd-recorded the (mail+\n)-joined-by-\n shape as the correct git bytes and
+fixed the FAMILY copy; the wiki mirror is byte-off against BOTH the shared
+renderer and git itself. The fold would be a real byte fix needing its own
+decision + re-pins, not a no-op — and the encode seam blocks any fold until
+git-models offers an encode hook or a caller-supplied DiffBlobSource. The
+COLLAPSE VERDICT comment records both differences with byte counts; the
+module doc re-points at the shared renderPatchSeries; no PENDING COLLAPSE
+markers remain anywhere. Zero code change, zero pin change (the matrix
+merge-series pins are structural — bare-[PATCH] side mail, never the merge,
+no signature — green over BOTH walkers; that is why the probe ran on bytes).
+Gates, orchestrator re-verified solo: wiki.matrix 29/29, smoke 9/9 +
+wiki-raw 4/4; typecheck tree-zero; scoped eslint clean. OPEN ITEM dispatched
+(below): the wiki byte-fix itself — flip the mirror's join to the
+git-recorded shape + byte pins.
+
+**Dispatched — all closed within this continuation**: U21's attributed
+trigger findings → U27 (`035213e`, §12); V1's four handoffs (the battery
+flip, the settings as-built notes, the heatmap cites, the golden trio) → U26
+(`abe1fa1`, §14); V4's two open notes → U25 (`decf55d`, §13); U30's schema
+cite handoff → U33 (`268b268`, §16); U23's dispatched serving arm → U32
+(`8fadf97`, §8); V1's reported-not-done KV read-back → U29 (`2512dbf`,
+above); U29's blame/editor open notes → U34 (`8c18bc5`, above); U33's P3 +
+P4s → U36 (`fb3ee67`, §16); the dispatched wikiPatchSeries collapse → U37's
+STOPPED verdict (`275d151`, above).
+
+**Dispatched, in flight at this draft** (the convergence tail):
+- **The router-side file-tree feed** (U34's dispatched next): per-case
+  compute lines in ui/index.ts so the blame/editor/tails views READ the
+  stored KV like the file view — the page-module feed (above) is byte-inert
+  until then.
+- **The wiki byte-fix** (U37's dispatched next): flip the wiki mirror's join
+  to the git-recorded (mail+\n) shape + byte pins — blocked on an encode hook
+  or a caller-supplied DiffBlobSource in git-models (the verdict above).
+- **U31 — the squash-message-body prefill** (the standing SPEC-0005
+  reduction, below).
+- **SPEC-0022 §6's both-arms wording** (U36's open note): the one-word touch
+  rides the convergence notes fill.
+- **The ⑬ review** — the next standing review, dispatched; its findings ride
+  the next draft.
+
+**The ⑫ D-ledger — COMPLETE**: D1, D3, D9, D10, D11 landed with V4
+(`326904e`) and D4–D8 landed with V5 (`8994488`) — §13; **D2 landed with U25**
+(`decf55d`, §13) and **D12 landed across U23+U32** (`14cc03d`, `8fadf97`,
+§8). No D-finding remains open.
 
 **Resolved this window** (promoted out of the last draft's list):
 - **M4** the num_closed_milestones column + the state-flip recount — landed
@@ -1148,12 +1496,24 @@ D4–D8 landed with V5 (`8994488`) — §13; **D2 and D12 remain pending**.
   count re-baselined at convergence via `--expect-tokens` (`8e5c4ea` /
   `d3f8211`; the root-cause annotation landed at `40d0a6c`).
 - **The squash-message-body prefill reduction**: needs a commit-list seam —
-  the documented SPEC-0005 reduction (`b5b1994`).
+  the documented SPEC-0005 reduction (`b5b1994`); U31 dispatched (in flight,
+  above).
 - **The bare `_cherrypick` divergence** stays as recorded, in narrowed form:
   the bare EDITOR spellings are now ALIASED to the same families
   (`7d91ccd`), but the bare `/cherrypick/{sha}` FORM action remains
-  engine-owned (`2deece6`'s mount-level 404 pin; the four intentional
-  bare-literal test pins enumerated at `16b30bb`).
+  engine-owned — now BY ADJUDICATED DESIGN (`abe1fa1`'s coordinator
+  adjudication: index.ts:6719 dual-spells only patch/_diffpatch, so U26's
+  observed flip candidate does not exist; `2deece6`'s mount-level 404 pin and
+  the four intentional bare-literal test pins enumerated at `16b30bb` stand;
+  the README marker resolved as a deliberate non-flip).
+- **The view-side ghost fold interim** (U23/U32, §8): repo-wiki.tsx's outcome
+  set cannot carry a 404, so a well-shaped unknown sha on the VIEW route still
+  folds to the 'missing' page where upstream answers its NotFound shell —
+  waits on an outcome-set widening; the DOWNLOAD route already answers 404
+  upstream-exact.
+- **The gitlink directory-residual** (U25, §13, the v1.5.2 ledger): git
+  silently drops the gitlink delete when the path becomes a directory; our
+  flat map emits delete+add.
 
 **Process records for the next wave**: the salvage protocol has now run
 TWICE — hunk-by-hunk attribution FIRST (1171 lines carried whole across the
@@ -1165,10 +1525,18 @@ attributed hunk-by-hunk to its owner before any commit cites "tree-zero",
 and every known-red and attributed finding dispatched IMMEDIATELY (S1 → S7 →
 S9; S2's known-red healed at `de5efaf`; S13's residue at `40d0a6c`; V2's two
 findings to U21, which landed them same-window; V4's two open notes;
-U21's own attributed findings re-dispatched to trigger.ts's owner). The
-second wave added two disciplines: the dead units' cross-unit dependencies
-were named in their reports and folded into the RIGHT landing (V3's audit
-goldens; V5's D6-rides-V4), and V4's real-git re-verification caught a FALSE
-verification claim in a dead unit's report (D10's honor note, §13 — the
-salvage verifies the dead sibling's CLAIMS, not just its hunks). The
-orchestrator's solo re-verify discipline held on all thirty-two landings.
+U21's own attributed findings re-dispatched to trigger.ts's owner, closed by
+U27). The second wave added two disciplines: the dead units' cross-unit
+dependencies were named in their reports and folded into the RIGHT landing
+(V3's audit goldens; V5's D6-rides-V4), and V4's real-git re-verification
+caught a FALSE verification claim in a dead unit's report (D10's honor note,
+§13 — the salvage verifies the dead sibling's CLAIMS, not just its hunks).
+This continuation added two more: the ADVERSARIAL RE-CHECK (U33 — after the
+last landing, re-derive the wave's critical claims independently instead of
+trusting the landing reports; it confirmed eleven and returned one real P3,
+§16), and the FIXED-ID harness precedent (U26 — deterministic seeded ids beat
+per-run uuid seeding wherever a fixture's ids reach the bytes under test).
+The same continuation showed the probe-first discipline working in reverse:
+U37's byte-identity probe FAILED and the wikiPatchSeries fold was STOPPED
+before any code moved (above). The orchestrator's solo re-verify discipline
+held on all forty-four landings.
