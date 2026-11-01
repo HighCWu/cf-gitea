@@ -1690,6 +1690,10 @@ import { loadCommitViewData, renderCommitViewPage } from "./pages/commit-view";
 // The census R08 blame page (web.go:1729-1733's /blame family) over the
 // engine's blame() read RPC.
 import { loadBlameData, renderBlamePage } from "./pages/blame";
+// The sidebar views' stored file-tree toggle read-back (view_home.go:360-371):
+// the blame/editor dispatch seams feed it where their page renders a tree
+// sidebar (the reader self-guards anonymous — zero KV reads).
+import { loadFileTreeVisibility } from "./pages/file-view";
 // The census R10 in-repo code search page (web.go:1768's /search literal)
 // over the engine's grep() read RPC (SPEC-0015 M1).
 import { loadRepoSearchData, renderRepoSearchPage } from "./pages/repo-search";
@@ -14244,7 +14248,7 @@ type FileEditorPageFamily = "file-new" | "file-edit" | "file-delete";
 async function fileEditorPage(c: Context<{ Bindings: Env }>, family: FileEditorPageFamily): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
-  const { url, ctx, repo, respond } = resolved;
+  const { url, ctx, viewer, repo, respond } = resolved;
   const route = resolved.route;
   if (route.family !== family) return respond(await c.notFound()); // registration/parser drift guard
   const gate = await fileEditorGate(c, resolved, true);
@@ -14254,6 +14258,11 @@ async function fileEditorPage(c: Context<{ Bindings: Env }>, family: FileEditorP
   const engine = engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`);
   const data = await loadFileEditorData(engine, repo, mode, route.refSuffix, url.searchParams.get("filename"));
   if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
+  // editor.go:44's sidebar switch: the stored code_view.show_file_tree read
+  // feeds every editor render's tree sidebar (the gate above admitted only
+  // signed-in viewers — the reader's anonymous zero-read arm never fires
+  // here). One compute shared by the fork-overlay and plain arms.
+  const showFileTree = await loadFileTreeVisibility(c.env.DB, viewer);
   if (readerFork !== null) {
     // The WillSubmitToFork GET (repo.go:203-258): the form action onto the
     // FORK's own editor route, the fork's branches in the commit select,
@@ -14267,11 +14276,12 @@ async function fileEditorPage(c: Context<{ Bindings: Env }>, family: FileEditorP
     // Window-2e C2b: the delete family renders its DEDICATED confirm page
     // (repo-editor-tails' parity render — the pageClass discriminator,
     // ALL-links breadcrumb, PageIsDelete placeholder; the one-template render
-    // stays the other two families').
+    // stays the other two families'). The sidebar is the BASE's read (upstream's
+    // ctx.Repo posture); the stored toggle state is the viewer's.
     const html =
       family === "file-delete"
-        ? renderEditorDeletePage({ ctx, data, form, error: null, fork: overlay })
-        : renderFileEditorPage({ ctx, data, form, error: null, fork: overlay });
+        ? renderEditorDeletePage({ ctx, data, form, error: null, fork: overlay, showFileTree })
+        : renderFileEditorPage({ ctx, data, form, error: null, fork: overlay, showFileTree });
     return respond(c.html(html, 200));
   }
   // Window-2e C2b: the delete family renders its DEDICATED confirm page
@@ -14279,9 +14289,9 @@ async function fileEditorPage(c: Context<{ Bindings: Env }>, family: FileEditorP
   // ALL-links breadcrumb, PageIsDelete placeholder; the one-template render
   // stays the other two families').
   if (family === "file-delete") {
-    return respond(c.html(renderEditorDeletePage({ ctx, data, form: editorFormFromData(data), error: null }), 200));
+    return respond(c.html(renderEditorDeletePage({ ctx, data, form: editorFormFromData(data), error: null, showFileTree }), 200));
   }
-  return respond(c.html(renderFileEditorPage({ ctx, data, form: editorFormFromData(data), error: null }), 200));
+  return respond(c.html(renderFileEditorPage({ ctx, data, form: editorFormFromData(data), error: null, showFileTree }), 200));
 }
 
 /**
@@ -14322,9 +14332,13 @@ async function fileEditorSubmit(c: Context<{ Bindings: Env }>, family: FileEdito
     // arm — editor.go:345-357 — reduced to the page's own message).
     const refusalRender = family === "file-delete" ? renderEditorDeletePage : null;
     if (refusalRender !== null) {
-      return respond(c.html(refusalRender({ ctx, data, form: editorFormFromData(data), error: null }), 200));
+      return respond(
+        c.html(refusalRender({ ctx, data, form: editorFormFromData(data), error: null, showFileTree: await loadFileTreeVisibility(c.env.DB, viewer) }), 200),
+      );
     }
-    return respond(c.html(renderFileEditorPage({ ctx, data, form: editorFormFromData(data), error: null }), 200));
+    return respond(
+      c.html(renderFileEditorPage({ ctx, data, form: editorFormFromData(data), error: null, showFileTree: await loadFileTreeVisibility(c.env.DB, viewer) }), 200),
+    );
   }
   const result = await commitFileFromForm(c.env, c.req.raw, repo, userRow, mode, values);
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
@@ -14339,9 +14353,9 @@ async function fileEditorSubmit(c: Context<{ Bindings: Env }>, family: FileEdito
     return respond(new Response(null, { status: 303, headers: { location } }));
   }
   if (family === "file-delete") {
-    return respond(c.html(renderEditorDeletePage({ ctx, data, form: values, error: result.message }), 200));
+    return respond(c.html(renderEditorDeletePage({ ctx, data, form: values, error: result.message, showFileTree: await loadFileTreeVisibility(c.env.DB, viewer) }), 200));
   }
-  return respond(c.html(renderFileEditorPage({ ctx, data, form: values, error: result.message }), 200));
+  return respond(c.html(renderFileEditorPage({ ctx, data, form: values, error: result.message, showFileTree: await loadFileTreeVisibility(c.env.DB, viewer) }), 200));
 }
 
 // ---------------------------------------------------------------------------
@@ -14352,7 +14366,7 @@ async function fileEditorSubmit(c: Context<{ Bindings: Env }>, family: FileEdito
 async function fileUploadPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const resolved = await resolveUiRequest(c);
   if (!resolved.ok) return resolved.response;
-  const { url, ctx, repo, respond } = resolved;
+  const { url, ctx, viewer, repo, respond } = resolved;
   if (resolved.route.family !== "file-upload") return respond(await c.notFound()); // drift guard
   const gate = await fileEditorGate(c, resolved, true);
   if (gate !== null && !("readerFork" in gate)) return gate;
@@ -14360,6 +14374,10 @@ async function fileUploadPage(c: Context<{ Bindings: Env }>): Promise<Response> 
   const engine = engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`);
   const data = await loadEditorUploadData(engine, repo, resolved.route.refSuffix);
   if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
+  // editor.go:44's sidebar switch on the upload page too (upload.tmpl:7's
+  // view_file_tree): the stored read feeds both arms (the gate above admitted
+  // only signed-in viewers).
+  const showFileTree = await loadFileTreeVisibility(c.env.DB, viewer);
   if (readerFork !== null) {
     // The WillSubmitToFork GET: the commit rides the fork's editor route
     // (the dropzone stays BASE-anchored — upstream's {{.RepoLink}} arm,
@@ -14367,9 +14385,9 @@ async function fileUploadPage(c: Context<{ Bindings: Env }>): Promise<Response> 
     const overlay = await readerForkOverlay(c.env, readerFork, "upload", data.treePath, data.branch, url.search);
     if (overlay === null) return respond(c.html(renderNotFound(ctx), 404)); // listRefs' null posture (never today)
     const form = { ...uploadFormFromData(data), branch: overlay.defaultBranch };
-    return respond(c.html(renderEditorUploadPage({ ctx, data, form, error: null, fork: overlay }), 200));
+    return respond(c.html(renderEditorUploadPage({ ctx, data, form, error: null, fork: overlay, showFileTree }), 200));
   }
-  return respond(c.html(renderEditorUploadPage({ ctx, data, form: uploadFormFromData(data), error: null }), 200));
+  return respond(c.html(renderEditorUploadPage({ ctx, data, form: uploadFormFromData(data), error: null, showFileTree }), 200));
 }
 
 async function fileUploadSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
@@ -14399,7 +14417,7 @@ async function fileUploadSubmit(c: Context<{ Bindings: Env }>): Promise<Response
     // no-JS reduction redirects back (nothing to re-render).
     return respond(new Response(null, { status: 303, headers: { location: `/${repo.ownerNamespace}/${repo.slug}/upload/${pathEscapeSegments(form.branch)}` } }));
   }
-  return respond(c.html(renderEditorUploadPage({ ctx, data, form, error: result.message }), 200));
+  return respond(c.html(renderEditorUploadPage({ ctx, data, form, error: result.message, showFileTree: await loadFileTreeVisibility(c.env.DB, viewer) }), 200));
 }
 
 async function editorCherryPickPage(c: Context<{ Bindings: Env }>, isPost: boolean): Promise<Response> {
@@ -16599,7 +16617,13 @@ async function uiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
       route.refSuffix,
     );
     if ("notFound" in data) return respond(c.html(renderNotFound(ctx), 404));
-    return respond(c.html(renderBlamePage({ ctx, data }), 200));
+    // blame.go:65's sidebar switch: the blame view always renders the tree
+    // sidebar, so the stored read feeds whenever a viewer exists — anonymous
+    // answers true with zero KV reads (the reader's own arm), byte-identical
+    // to the default-true posture.
+    return respond(
+      c.html(renderBlamePage({ ctx, data, showFileTree: await loadFileTreeVisibility(c.env.DB, viewer) }), 200),
+    );
   }
   // Wave-24 dispatch: the repo social lists (render.tsx never sees these
   // families; the loader's family switch picks the landed read — forks

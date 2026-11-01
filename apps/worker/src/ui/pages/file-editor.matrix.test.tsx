@@ -644,13 +644,14 @@ describe("the commit-form validation arms (the edit-mode ghost branch, the defau
  * editor.go:44's prepareEditorPage runs prepareHomeTreeSideBarSwitch before
  * every editor page, so edit.tmpl:7's view_file_tree rides the SAME stored
  * code_view.show_file_tree as the file view (render.test.tsx pins the
- * reader's semantics and the src feed). The ROUTE dispatch does not feed the
- * prop yet (the router's editor cases are a separate wave), so this sidebar
- * arm pins the page-module seam: the real reader (file-view.tsx's
+ * reader's semantics and the src feed). The ROUTE dispatch now feeds the
+ * same read too (ui/index.ts's editor cases), so the fed-route pin below
+ * drives the real route with a session cookie; beside it the page-module
+ * pins keep the module's own seams pinned: the real reader (file-view.tsx's
  * loadFileTreeVisibility over REAL D1) computes the value and
  * renderFileEditorPage threads it into the shared FileTreeSidebar
- * (view_file_tree.tmpl:1's conditional); the prop ABSENT keeps the current
- * dispatch bytes (the default-true interim posture).
+ * (view_file_tree.tmpl:1's conditional); the prop ABSENT renders the
+ * direct-render default-true bytes.
  */
 describe("the editor sidebar's showFileTree arm (editor.go:44 — the page-module seam)", () => {
   const TREEVIS_KEY = "code_view.show_file_tree";
@@ -707,10 +708,22 @@ describe("the editor sidebar's showFileTree arm (editor.go:44 — the page-modul
     expect(html).not.toContain('<div class="repo-view-file-tree-container">');
   });
 
-  it("the prop ABSENT keeps today's dispatch bytes (the default-true interim posture)", async () => {
+  it("the prop ABSENT renders the module's default-true bytes (the direct-render default; the dispatch feeds the stored read)", async () => {
     const html = await editBenchHtml();
     expect(html).toContain('<div class="repo-view-file-tree-container">');
     expect(html).not.toContain('<div class="repo-view-file-tree-container tw-hidden">');
     expect(html).toContain('data-toggle-action="hide"');
+  });
+
+  it("the ROUTE dispatch feeds the stored read: a stored-false owner's edit page hides the sidebar", async () => {
+    await storePref("false");
+    const fixture = await ensureFeditorFixtures();
+    const res = await fetchUi("/alice/feditor/edit/main/notes/editor.txt", {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.ownerCookie}` },
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<div class="repo-view-file-tree-container tw-hidden">');
+    expect(html).not.toContain('<div class="repo-view-file-tree-container">');
   });
 });

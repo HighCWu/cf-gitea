@@ -381,13 +381,14 @@ describe("renderEditorUploadPage (upload.tmpl's faithful DOM, documented-unrende
  * Both tails render view_file_tree (delete.tmpl:7, upload.tmpl:7) under
  * prepareEditorPage's prepareHomeTreeSideBarSwitch (editor.go:44 — the SAME
  * stored code_view.show_file_tree the file view reads back; render.test.tsx
- * pins the reader's semantics and the src feed). The ROUTE dispatch does not
- * feed the prop yet (the router's editor cases are a separate wave), so this
- * sidebar arm pins the page-module seam: the real reader (file-view.tsx's
- * loadFileTreeVisibility over REAL D1) computes the value and the two render
- * entries thread it into the shared FileTreeSidebar (view_file_tree.tmpl:1's
- * conditional); the prop ABSENT keeps the current dispatch bytes (the
- * default-true interim posture).
+ * pins the reader's semantics and the src feed). The ROUTE dispatch now
+ * feeds the same read too (ui/index.ts's editor/upload cases), so the
+ * fed-route pin below drives the real delete + upload routes with a session
+ * cookie; beside it the page-module pins keep the module's own seams
+ * pinned: the real reader (file-view.tsx's loadFileTreeVisibility over REAL
+ * D1) computes the value and the two render entries thread it into the
+ * shared FileTreeSidebar (view_file_tree.tmpl:1's conditional); the prop
+ * ABSENT renders the direct-render default-true bytes.
  */
 describe("the tails' sidebar showFileTree arm (editor.go:44 — the page-module seam)", () => {
   const TREEVIS_KEY = "code_view.show_file_tree";
@@ -439,7 +440,7 @@ describe("the tails' sidebar showFileTree arm (editor.go:44 — the page-module 
     expect(uploadHtml).not.toContain('<div class="repo-view-file-tree-container">');
   });
 
-  it("the prop ABSENT keeps today's dispatch bytes on both confirms (the default-true interim posture)", async () => {
+  it("the prop ABSENT renders the module's default-true bytes on both confirms (the direct-render default; the dispatch feeds the stored read)", async () => {
     const deleteHtml = await deleteBenchHtml();
     expect(deleteHtml).toContain('<div class="repo-view-file-tree-container">');
     expect(deleteHtml).not.toContain('<div class="repo-view-file-tree-container tw-hidden">');
@@ -447,5 +448,27 @@ describe("the tails' sidebar showFileTree arm (editor.go:44 — the page-module 
     expect(uploadHtml).toContain('<div class="repo-view-file-tree-container">');
     expect(uploadHtml).not.toContain('<div class="repo-view-file-tree-container tw-hidden">');
     expect(uploadHtml).toContain('data-toggle-action="hide"');
+  });
+
+  it("the ROUTE dispatch feeds the stored read: a stored-false owner's delete + upload confirms hide the sidebar", async () => {
+    await storePref("false");
+    const { ownerCookie } = await ensureFixtures();
+    const headers = { cookie: `${SESSION_COOKIE_NAME}=${ownerCookie}` };
+    const del = await uiRouter.fetch(
+      new Request("https://test.local/alice/editortails/delete/main/notes/editor.txt", { headers }),
+      uiEnv,
+    );
+    expect(del.status).toBe(200);
+    const delHtml = await del.text();
+    expect(delHtml).toContain('<div class="repo-view-file-tree-container tw-hidden">');
+    expect(delHtml).not.toContain('<div class="repo-view-file-tree-container">');
+    const up = await uiRouter.fetch(
+      new Request("https://test.local/alice/editortails/upload/main", { headers }),
+      uiEnv,
+    );
+    expect(up.status).toBe(200);
+    const upHtml = await up.text();
+    expect(upHtml).toContain('<div class="repo-view-file-tree-container tw-hidden">');
+    expect(upHtml).not.toContain('<div class="repo-view-file-tree-container">');
   });
 });

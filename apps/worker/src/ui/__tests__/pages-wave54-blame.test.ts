@@ -39,6 +39,7 @@ import { repositories, userSettingsKv, users } from "../../db/schema";
 import { RepoService } from "../../repos/service";
 import { engineClient } from "../engine";
 import { handlesUiRoute, parseUiRoute, uiRouter } from "../index";
+import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { loadBlameData, renderBlamePage } from "../pages/blame";
 import { loadFileTreeVisibility } from "../pages/file-view";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
@@ -331,15 +332,17 @@ describe("wave-54 a11y smoke", () => {
  * view_file_tree for the blame view — the SAME stored
  * code_view.show_file_tree the file view's src case reads back
  * (render.test.tsx pins the reader's semantics and the src feed). The ROUTE
- * dispatch does not feed the prop yet (the router's blame case is a separate
- * wave), so these pins ride the page-module seam: the real reader
- * (file-view.tsx's loadFileTreeVisibility, over REAL D1 — anonymous answers
- * true with zero reads) computes the value and renderBlamePage threads it
- * into the shared FileTreeSidebar (view_file_tree.tmpl:1's conditional).
- * Default arms: the prop ABSENT (the current dispatch bytes) and the
- * stored-true/anonymous renders keep the container plain; a stored-false
- * viewer's blame view renders the container `tw-hidden` (the hide button's
- * markup still renders inside — upstream's template posture).
+ * dispatch now feeds the same read too (ui/index.ts's blame case), so the
+ * fed-route pins below drive the real route with a session cookie; beside
+ * them the page-module pins keep the module's own seams pinned: the real
+ * reader (file-view.tsx's loadFileTreeVisibility, over REAL D1 — anonymous
+ * answers true with zero reads) computes the value and renderBlamePage
+ * threads it into the shared FileTreeSidebar (view_file_tree.tmpl:1's
+ * conditional). Default arms: the prop ABSENT (the direct render's
+ * default-true bytes) and the stored-true/anonymous renders keep the
+ * container plain; a stored-false viewer's blame view renders the container
+ * `tw-hidden` (the hide button's markup still renders inside — upstream's
+ * template posture).
  */
 describe("the blame sidebar's showFileTree thread (blame.go:65 — the page-module seam)", () => {
   const TREEVIS_KEY = "code_view.show_file_tree";
@@ -418,10 +421,31 @@ describe("the blame sidebar's showFileTree thread (blame.go:65 — the page-modu
     expect(html(visibility)).not.toContain('<div class="repo-view-file-tree-container tw-hidden">');
   });
 
-  it("the prop ABSENT keeps today's dispatch bytes (the default-true interim posture)", async () => {
+  it("the prop ABSENT renders the module's default-true bytes (the direct-render default; the dispatch feeds the stored read)", async () => {
     const { html } = await blameBench();
     expect(html()).toContain('<div class="repo-view-file-tree-container">');
     expect(html()).not.toContain('<div class="repo-view-file-tree-container tw-hidden">');
     expect(html()).toContain('data-toggle-action="hide"');
+  });
+
+  it("the ROUTE dispatch feeds the stored read: a stored-false viewer's blame view hides the sidebar", async () => {
+    await storePref("false");
+    const cookie = await mintSession(env.DB, aliceId);
+    const res = await fetchUi("/alice/wave54blame/blame/branch/main/story.txt", {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}` },
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<div class="repo-view-file-tree-container tw-hidden">');
+    expect(html).not.toContain('<div class="repo-view-file-tree-container">');
+  });
+
+  it("the ROUTE dispatch stays zero-read anonymous: a stored-false row is ignored, the default renders", async () => {
+    await storePref("false");
+    const res = await fetchUi("/alice/wave54blame/blame/branch/main/story.txt");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<div class="repo-view-file-tree-container">');
+    expect(html).not.toContain('<div class="repo-view-file-tree-container tw-hidden">');
   });
 });
