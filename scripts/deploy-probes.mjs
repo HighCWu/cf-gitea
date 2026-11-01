@@ -506,13 +506,22 @@
  *     d1, --d1-scope) -> DELETE 204 and the list back to [].
  *   - login: POST /login form-urlencoded user_name + password=<PAT> answers
  *     303 with a gitea_session cookie; the labels page then shows the
- *     writer's "New Label" form (3 occurrences canonically, +the
+ *     writer's "New Label" form (4 occurrences canonically on the EMPTY
+ *     list since 3265258 — the navbar button, the empty-list templates_info
+ *     sentence ("Create a label with 'New Label' or use a predefined label
+ *     set:", repo.issues.label_templates.info — renders only while the list
+ *     is empty), the h4 form header, and the create-form submit button; the
+ *     pre-3265258 canonical 3 was button + h4 + submit; +the
  *     small-menu-items nav) where the anonymous render shows none.
  *   - cleanup audit: repositories of the probe user == 1 (p0-shallow,
- *     intentionally live), status='creating' == 0, "action" == 0 (the
- *     389da18 delete sweep — no hand-sweep), stars == 0, push_mirrors == 0,
- *     protected_branches == 0, repo_redirects == 0, user_blocking == 0,
- *     personal_access_tokens == 1 (the standing bootstrap PAT).
+ *     intentionally live), status='creating' == 0, "action" == 1 (the
+ *     standing fixture's own create-repo event — the 389da18 delete sweep
+ *     cascades action rows away WITH their repo, so every ephemeral battery
+ *     repo still leaves 0 and only the never-deleted fixture's row
+ *     survives), stars == 0, push_mirrors == 0, protected_branches == 0,
+ *     repo_redirects == 0, user_blocking == 0, personal_access_tokens ==
+ *     10 (the standing bootstrap set after the v1.5 mint churn — enumerated
+ *     in the audit step's expectation).
  *
  * This file deliberately does NOT touch docs/design/p0-evidence.md (it is
  * REDEPLOY14's in-flight document); the conventions note lives here.
@@ -577,8 +586,14 @@ const parseArgs = (argv) => {
     // wait aborted), leaking residue into the cleanup audit. 20s was calibrated
     // when the flows were smaller; AbortSignal only bites when actually slow.
     timeoutMs: 60_000,
-    trials: 3, fixtureRepo: "p0-shallow", fixtureOid: null, newLabelCount: 3,
-    strictGeneratedClone: false, d1Scope: "remote", expectOwnerRepos: 1, expectTokens: 2,
+    // newLabelCount 4: on the EMPTY labels list the writer arm also renders
+    // 3265258's label_load_template block, whose templates_info sentence
+    // carries the literal a fourth time (navbar button + templates_info +
+    // h4 form header + create-form submit button).
+    trials: 3, fixtureRepo: "p0-shallow", fixtureOid: null, newLabelCount: 4,
+    // expectTokens 10: the standing bootstrap set after the v1.5 mint churn
+    // (enumerated in the audit step's expectation, 2026-11-01).
+    strictGeneratedClone: false, d1Scope: "remote", expectOwnerRepos: 1, expectTokens: 10,
     mirrorSettleMs: 30_000, forceRed: null,
     monitorConsumer: null, profileDurationMs: 1_000,
   };
@@ -646,7 +661,7 @@ const usage = () =>
   "  generate-e2e:  --strict-generated-clone   (promote the carried git-wire warn to a hard assert)\n" +
   "  forkpr-e2e:    (no extra options)\n" +
   "  mirror:        --mirror-settle-ms <ms>    (sync-settle budget, default 30000; the row-settle arm reuses --d1-scope)\n" +
-  "  ui-login:      --new-label-count <n>      (canonical 3 writer-form occurrences)\n" +
+  "  ui-login:      --new-label-count <n>      (canonical 4 writer-form occurrences on the empty list, incl. 3265258's templates_info arm)\n" +
   "  window2-mounts: (no extra options)\n" +
   "  window3-mounts: (no extra options)\n" +
   "  fixwave-parity: (no extra options — needs an ADMIN PAT + wrangler auth for the d1 arms; --d1-scope rides the rotation backdate)\n" +
@@ -660,7 +675,7 @@ const usage = () =>
   "  packages-terraform: (no extra options — pure HTTP + the run PAT; the whole-state DELETE is its own row cascade, so unlike the other packages batteries there is NO D1 arm and no wrangler auth)\n" +
   "  auth-oauth2:   (no extra options — needs wrangler auth for the D1 arms: the builtin-seed read, the revoke row delete, the husk sweep, and the external-auth source seed/cleanup; --d1-scope picks the database, keep it in step with --base-url — the discovery arm's issuer==origin assert keys off it)\n" +
   "  monitor-platform: --monitor-consumer <key> (the MONITOR_QUEUE_CONSUMERS entry to drive; default the FIRST — serial-locked: one consumer per run, never two)  --profile-duration-ms <1000-5000> (default 1000; the profile POST answers synchronously, so this is the arm's wall time). The arms read CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_QUEUES_TOKEN / CLOUDFLARE_PROFILE_TOKEN / MONITOR_QUEUE_CONSUMERS / MONITOR_WORKER_NAME from the probe's OWN env (the same names the Worker carries as secrets); absent = the arm [warn]-skips (never fake-green). HTTP goes to api.cloudflare.com, NOT the deployment.\n" +
-  "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (2 — the standing bootstrap set)\n" +
+  "  cleanup-audit: --d1-scope remote|local  --expect-owner-repos <n> (1)  --expect-tokens <n> (10 — the standing bootstrap set after the v1.5 mint churn)\n" +
   "  any battery:   --force-red <check-id>    (self-test: force that check red UNRUN — exercises the failure-tail sweep; an unmatched id warns)";
 
 // ---------- plumbing ----------
@@ -1802,7 +1817,7 @@ const uiSteps = (ctx) => [
   },
   {
     id: "ui-labels-cookie-owner",
-    expect: `labels page WITH the cookie → 200 with ${opts.newLabelCount} "New Label" occurrences (canonical 3) + small-menu-items — the writer-gate owner arm renders`,
+    expect: `labels page WITH the cookie → 200 with ${opts.newLabelCount} "New Label" occurrences (canonical 4 on the EMPTY list since 3265258: the navbar button, the empty-list templates_info sentence "Create a label with 'New Label' or use a predefined label set:", the h4 form header, the create-form submit button — the pre-3265258 canonical 3 lacked the templates_info arm) + small-menu-items — the writer-gate owner arm renders`,
     run: async () => {
       const res = await fetchT(`${opts.baseUrl}/${ctx.user}/${ctx.repo}/labels`, { headers: { cookie: ctx.cookie } });
       const body = await res.text();
@@ -8290,13 +8305,22 @@ const monitorPlatformSteps = (ctx) => {
 // ---------- battery: cleanup-audit (the D1 count shapes) ----------
 
 const AUDIT_TABLES = [
-  { key: "creating_rows", sql: `(SELECT COUNT(*) FROM "repositories" WHERE "status" = 'creating')`, want: () => 0, label: `repositories WHERE status='creating' (whole table)` },
-  { key: "action_rows", sql: `(SELECT COUNT(*) FROM "action")`, want: () => 0, label: `"action" (whole table — the 389da18 delete sweep means NO hand-sweep)` },
-  { key: "stars", sql: `(SELECT COUNT(*) FROM "stars")`, want: () => 0, label: `stars` },
-  { key: "push_mirrors", sql: `(SELECT COUNT(*) FROM "push_mirrors")`, want: () => 0, label: `push_mirrors` },
-  { key: "protected_branches", sql: `(SELECT COUNT(*) FROM "protected_branches")`, want: () => 0, label: `protected_branches` },
-  { key: "repo_redirects", sql: `(SELECT COUNT(*) FROM "repo_redirects")`, want: () => 0, label: `repo_redirects` },
-  { key: "user_blocking", sql: `(SELECT COUNT(*) FROM "user_blocking")`, want: () => 0, label: `user_blocking` },
+  { key: "creating_rows", sql: `(SELECT COUNT(*) FROM "repositories" WHERE "status" = 'creating')`, want: 0, label: `repositories WHERE status='creating' (whole table)` },
+  // action = 1, NOT 0: the standing fixture's OWN create-repo event (op_type 1,
+  // p0probe4/p0-shallow, minted 2026-11-01 when the fresh probe user's fixture
+  // self-seeded on first contact — after the feed emitters landed, which is why
+  // the earlier audits held whole-table 0). The 389da18 delete sweep cascades
+  // action rows away WITH their repo, so every ephemeral battery repo still
+  // leaves 0 and the never-deleted fixture's row is the one survivor. The
+  // count is self-healing: delete + re-seed the fixture and the old row is
+  // swept while the new seed mints exactly one, so 1 stays the standing truth;
+  // any OTHER survivor (a leaked repo left alive) still fails this check.
+  { key: "action_rows", sql: `(SELECT COUNT(*) FROM "action")`, want: 1, label: `"action" (whole table — exactly the standing fixture's create-repo event; the 389da18 delete sweep cascades every deleted repo's rows away, so NO hand-sweep)` },
+  { key: "stars", sql: `(SELECT COUNT(*) FROM "stars")`, want: 0, label: `stars` },
+  { key: "push_mirrors", sql: `(SELECT COUNT(*) FROM "push_mirrors")`, want: 0, label: `push_mirrors` },
+  { key: "protected_branches", sql: `(SELECT COUNT(*) FROM "protected_branches")`, want: 0, label: `protected_branches` },
+  { key: "repo_redirects", sql: `(SELECT COUNT(*) FROM "repo_redirects")`, want: 0, label: `repo_redirects` },
+  { key: "user_blocking", sql: `(SELECT COUNT(*) FROM "user_blocking")`, want: 0, label: `user_blocking` },
 ];
 
 /** One wrangler d1 execute (--json, --${opts.d1Scope}) → the parsed output
@@ -8355,16 +8379,16 @@ const auditSteps = (ctx) => [
   },
   ...AUDIT_TABLES.map((t) => ({
     id: `audit-${t.key.replaceAll("_", "-")}`,
-    expect: `${t.label} = 0`,
+    expect: `${t.label} = ${t.want}`,
     run: () => {
       const n = ctx.counts[t.key];
-      expect(n === 0, `${t.label} = ${n} (expected 0)`);
-      return `${t.label} = 0`;
+      expect(n === t.want, `${t.label} = ${n} (expected ${t.want})`);
+      return `${t.label} = ${t.want}`;
     },
   })),
   {
     id: "audit-personal-access-tokens",
-    expect: `personal_access_tokens = the standing bootstrap set, one per standing user (admin + p0probe = 2 since the probe user gained its own bootstrap 2026-10-28; per-run PATs DELETEd by the operator — the historical whole-table=1 encoding predates the second standing user and false-fired from 2026-10-29)`,
+    expect: `personal_access_tokens = 10, the standing bootstrap set after the v1.5 mint churn (enumerated 2026-11-01: the admin bootstrap + SIX p0probe bootstrap rows — each orchestrator mint retry across the p0probe/p0probe2/3/4 session inserted a row, ids 122/130/131/134/137/138 — + p0probe2 + p0probe3 + p0probe4; the 2-encoding, itself the 2026-10-28 two-user repair of the historical whole-table=1 that false-fired from 2026-10-29, predated the churn; per-run PATs are DELETEd by the operator — --expect-tokens <n> overrides when the standing set changes again)`,
     run: () => {
       const n = ctx.counts.personal_access_tokens;
       expect(n === opts.expectTokens, `${n} tokens (expected ${opts.expectTokens})`);

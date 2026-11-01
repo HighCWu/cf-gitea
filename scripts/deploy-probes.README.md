@@ -69,10 +69,11 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
   gated to `[warn]` skips (never fake-green).
 - After the run the operator DELETEs the per-run PAT (by id/prefix) and re-checks
   the token count with `cleanup-audit` — the default expectation is the
-  standing bootstrap SET, one token per standing user (admin + p0probe = 2
-  since the probe user gained its own bootstrap 2026-10-28; pass
-  `--expect-tokens <n>` when the standing set differs, e.g. local scratch
-  users).
+  standing bootstrap SET (10 since the v1.5 freeze: admin bootstrap + six
+  p0probe retry-mint rows + p0probe2 + p0probe3 + p0probe4; the earlier
+  2-encoding — itself the 2026-10-28 two-user repair — predated the mint
+  churn; pass `--expect-tokens <n>` when the standing set differs, e.g.
+  local scratch users).
 
 ## Batteries and their canonical expectations
 
@@ -234,8 +235,13 @@ prints all of them verbatim.
   OPEN ISSUE 3 closed): a PAT header never logs a session in. Anonymous labels
   page 200 with 0 "New Label" occurrences → `POST /login`
   (form-urlencoded `user_name` + `password=<PAT>`) → 303 + `gitea_session` →
-  labels page WITH the cookie 200 with the writer form (canonical 3
-  occurrences, `--new-label-count`) + `small-menu-items`. **Failure cleanup
+  labels page WITH the cookie 200 with the writer form (canonical 4
+  occurrences on the EMPTY list since 3265258 — the navbar button, the
+  empty-list `templates_info` sentence ("Create a label with 'New Label'
+  or use a predefined label set:", rendered only while the list is empty),
+  the h4 form header, the create-form submit button; the pre-3265258
+  canonical 3 lacked the templates_info arm, `--new-label-count`) +
+  `small-menu-items`. **Failure cleanup
   (the consistency posture):** the battery creates a fixture repo (any repo
   has a labels page), so a mid-battery red no longer leaves it behind
   `[skip]` lines — a finally-style tail (the mirror shape,
@@ -896,16 +902,21 @@ prints all of them verbatim.
   `--base-url`/`--token-file`**; the checks are INDEPENDENT (one red count
   never hides the rest): probe-user repositories == 1 (the standing
   `p0-shallow`, `--expect-owner-repos`), `status='creating'` == 0, `action`
-  == 0 (the 389da18 delete sweep — NO hand-sweep), `stars` == 0,
+  == 1 (the standing fixture's OWN create-repo event, minted 2026-11-01
+  when the fresh p0probe4 fixture self-seeded on first contact after the
+  feed emitters landed — which is why the earlier audits held whole-table
+  0; the 389da18 delete sweep cascades action rows away WITH their repo, so
+  ephemeral battery repos still leave 0 and the never-deleted fixture's row
+  is the one survivor; delete + re-seed the fixture and the sweep plus the
+  fresh seed reproduce exactly 1), `stars` == 0,
   `push_mirrors` == 0, `protected_branches` == 0, `repo_redirects` == 0,
-  `user_blocking` == 0, `personal_access_tokens` == the standing bootstrap
-  SET, one per standing user (admin + p0probe = 2 by default since the
-  probe user gained its own bootstrap 2026-10-28 — the historical
-  whole-table=1 encoding predated the second standing user and false-fired
-  from 2026-10-29; `--expect-tokens <n>` overrides). The one honest
-  exception to `action == 0`: a push
-  to the still-live fixture (the local seed flow) leaves its own action rows —
-  production probe runs only clone it, so the canonical whole-table 0 holds.
+  `user_blocking` == 0, `personal_access_tokens` == 10 by default — the
+  standing bootstrap set after the v1.5 mint churn (enumerated 2026-11-01:
+  admin bootstrap + SIX p0probe retry-mint rows + p0probe2 + p0probe3 +
+  p0probe4; the 2-encoding, itself the 2026-10-28 two-user repair of the
+  historical whole-table=1 that false-fired from 2026-10-29, predated the
+  churn; `--expect-tokens <n>` overrides when the standing set changes
+  again).
 
 ## Leftovers and hygiene
 
