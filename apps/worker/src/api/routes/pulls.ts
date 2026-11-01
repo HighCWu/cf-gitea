@@ -266,7 +266,7 @@ function formBoolDefault(url: URL, key: string): boolean {
  * per route and documents which: the commit walks pass the so-far window (the
  * engine's listLog reports no total — the approximation lives at those
  * routes), while /pulls/{index}/files passes the TRUE list length (the
- * handler holds the whole list — pull.go:1568-1569).
+ * handler holds the whole list — pull.go:1573).
  */
 function setCommitListHeaders(c: Context<ApiEnv>, opts: { page: number; limit: number }, countSoFar: number, hasMore: boolean): void {
   c.header("X-Total-Count", String(countSoFar));
@@ -1421,7 +1421,7 @@ export function registerPullRoutes(
   // — ChangedFileList over the range diff (the other X-* header family).
   //
   // Query surface per upstream (pull.go:1518-1545 + the swagger):
-  //   - `skip-to` (the upstream param NAME — pull.go:1542 reads
+  //   - `skip-to` (the upstream param NAME — pull.go:1541 reads
   //     FormString("skip-to")) starts the list AT the named file:
   //     `git diff --skip-to=` semantics (gitdiff.go:1331-1333) — files from
   //     that path onward, an unmatching name yielding the empty list. The
@@ -1438,7 +1438,7 @@ export function registerPullRoutes(
   //
   // X-Total-Count is the TRUE total — the handler holds the whole file list,
   // so the count is `files.length` (upstream SetTotalCountHeader over
-  // totalNumberOfFiles, pull.go:1568-1569); the old `(page-1)*limit+len`
+  // totalNumberOfFiles, pull.go:1573); the old `(page-1)*limit+len`
   // soFar inflated the header on page > 1. When the engine's diff window is
   // budget-truncated (MAX_DIFF_FILES — SPEC-0001b §3) the count is that
   // window, the same caveat the ChangedFileList itself carries.

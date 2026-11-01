@@ -668,11 +668,11 @@ only red was the briefed accommodation.
 **The ⑨ P1 — the org/team membership WEB arms** (`9b45d68`, U1): the two
 families upstream posts membership actions through are claimed and registered
 in ui/index.ts with GET→405 twins — POST `/:owner/teams/:team/action/:action`
-and its `/action/repo/:action` sibling (web.go:997-998, TeamsAction
-teams.go:113-247 + TeamsRepoAction :271-314) and POST
-`/org/:owner/members/action/:action` (web.go:989, MembersAction
-members.go:82-136); `{action}` is upstream's wildcard param (unknown tokens
-fall through to the default redirect, teams.go:241-247), and the team segment
+and its `/action/repo/:action` sibling (web.go:999-1000, TeamsAction
+teams.go:113-254 + TeamsRepoAction :271-314) and POST
+`/org/:owner/members/action/:action` (web.go:992, MembersAction
+members.go:82-133); `{action}` is upstream's wildcard param (unknown tokens
+fall through to the default redirect, teams.go:246-253), and the team segment
 carries both carriers. THE BRIEF'S ACTION NAMES CORRECTED AGAINST THE PIN:
 add_member/remove_member do not exist upstream — the as-built set is
 add|remove|join|leave|remove_invite (+ repo add|remove|addall|removeall). The
@@ -986,7 +986,7 @@ half of fw-cherrypick-form-200 STANDS.
 - **specs/0023-scoped-labels.md NEW** (`e6b980e`, 224 lines): scoped/exclusive
   label semantics — the display-vs-positional ordering split, name-based scope
   resolution, and the type-7 comment seam (§9).
-- **SPEC-0022-two-factor-webauthn.md NEW** (`0bd7798`, 297 lines): the surface,
+- **specs/0022-two-factor-webauthn.md NEW** (`0bd7798`, 300 lines): the surface,
   the cookie/TTL/clearing table, the AEAD format, 13 pinned divergences
   including as-built secret-at-rest = encrypted-in-flight; §6's dual-clear
   contract rewritten as-built at `452984c` (the webauthn mint arm landed).
