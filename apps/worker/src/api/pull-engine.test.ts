@@ -273,10 +273,12 @@ describe("PR diff, patch, commits, files", () => {
     const page2 = await get(`${REPO}/pulls/1/files?limit=1&page=2`);
     expect(page2.status).toBe(200);
     expect(page2.headers.get("X-Page")).toBe("2");
-    // The SO-FAR approximation rides the FULL file count, not the slice:
-    // soFar = (page - 1) * limit + files.length = 1 + 2 (routes/pulls.ts
-    // handler, the setCommitListHeaders module doc) — an upper bound.
-    expect(page2.headers.get("X-Total-Count")).toBe("3");
+    // X-Total-Count is the TRUE total — the handler holds the whole list, so
+    // the count is files.length on EVERY page (upstream
+    // SetTotalCountHeader(totalNumberOfFiles), pull.go:1568-1569). The old
+    // soFar formula ((page-1)*limit + files.length = 1 + 2 = 3 here)
+    // inflated the header on page > 1.
+    expect(page2.headers.get("X-Total-Count")).toBe("2");
     expect(page2.headers.get("X-HasMore")).toBe("false");
     const files: Array<Record<string, unknown>> = await page2.json();
     expect(files).toHaveLength(1);
@@ -1007,6 +1009,14 @@ describe("commits family (repoGetAllCommits / repoGetSingleCommit / dot-diff / c
     const compare: Record<string, unknown> = await res.json();
     expect(compare.total_commits).toBe(1);
     expect((compare.commits as Array<Record<string, unknown>>)[0]?.sha).not.toBe("");
+    // Stat is ALWAYS on — upstream's ToCommitOptions{Stat: true} (routers/
+    // api/v1/repo/compare.go:105-109; the query carries only verification/
+    // files): the compare commits carry the stats block with NO query param,
+    // and the old undeclared `?stat=` toggle is gone — inert either way.
+    expect((compare.commits as Array<Record<string, unknown>>)[0]?.stats).toEqual({ additions: 1, deletions: 0, total: 1 });
+    const statOff = await get(`${REPO}/compare/main...cmp?stat=false`);
+    expect(statOff.status).toBe(200);
+    expect(((await jsonBody(statOff)).commits as Array<Record<string, unknown>>)[0]?.stats).toEqual({ additions: 1, deletions: 0, total: 1 });
 
     const twoDot = await get(`${REPO}/compare/main..cmp`);
     expect(twoDot.status).toBe(200);
@@ -1097,6 +1107,48 @@ describe("commits family (repoGetAllCommits / repoGetSingleCommit / dot-diff / c
     // newest first: the range head ("second: two.txt") renders before "cmporder: one.txt"
     expect(((commits[0]?.commit as Record<string, unknown>).message as string).startsWith("second: two.txt")).toBe(true);
     expect(((commits[1]?.commit as Record<string, unknown>).message as string).startsWith("cmporder: one.txt")).toBe(true);
+  });
+
+  it("reports the TRUE total_commits past the bounded compare list (upstream's walk is unbounded, compare.go:101 — the bound is ours)", async () => {
+    // 251 chained commits rooted on main's tip (direct putApiObjects + ref
+    // CAS — the contents API would need 251 round-trips; every commit shares
+    // one tree so the per-commit stat readDiff is the empty diff): upstream
+    // returns the WHOLE range unpaged (`TotalCommits: len(compareInfo.
+    // Commits)`, compare.go:120-121 over ShowPrettyFormatLogToList — no
+    // limit), so the old `total_commits = walked.length` reported 250. The
+    // counting walk (countDivergence ahead — |base..head|, no commit
+    // materialization) keeps the count true while the rendered list stays
+    // at COMPARE_COMMIT_BOUND.
+    const cell = env.REPO.getByName(`${OWNER}/${SLUG}`);
+    const mainTip = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs()).get("refs/heads/main")?.target;
+    expect(mainTip).toBeDefined();
+    const person = { name: "seed", email: "seed@api.invalid", time: T0 + 120, tz: "+0000" };
+    const blob = new TextEncoder().encode("# storm\n");
+    const blobOid = await gitObjectOid("blob", blob);
+    const tree = serializeTree([{ mode: "100644", name: "STORM.md", oid: blobOid }]);
+    const objects: Array<{ oid: string; type: "blob" | "tree" | "commit"; data: Uint8Array }> = [
+      { oid: blobOid, type: "blob", data: blob },
+      { oid: tree.oid, type: "tree", data: tree.data },
+    ];
+    let parent = mainTip as string;
+    for (let i = 0; i < 251; i++) {
+      const commit = serializeCommit({ tree: tree.oid, parents: [parent], author: person, committer: person, message: `storm ${i}\n` });
+      parent = commit.oid;
+      objects.push({ oid: commit.oid, type: "commit", data: commit.data });
+    }
+    for (let start = 0; start < objects.length; start += 100) {
+      const put = await cell.putApiObjects(objects.slice(start, start + 100));
+      expect(put.tag).toBe("ok");
+    }
+    const landed = await cell.commitApiChange({ ref: "refs/heads/storm", expectedOldOid: ZERO_OID, newOid: parent });
+    expect(landed.tag).toBe("committed");
+
+    const res = await get(`${REPO}/compare/main...storm`);
+    expect(res.status).toBe(200);
+    const compare: Record<string, unknown> = await res.json();
+    // the TRUE range count (251), not the walked window (250)
+    expect(compare.total_commits).toBe(251);
+    expect(compare.commits as unknown[]).toHaveLength(250);
   });
 
   it("answers EARLY EMPTY on unrelated histories (three-dot null merge base, compare.go:91-93)", async () => {
@@ -1573,7 +1625,7 @@ describe("PR .diff/.patch tails — the empty-range, binary and truncation-cap a
     expect((patchText.match(/diff --git /g) ?? [])).toHaveLength(100);
   });
 
-  it("maps the /files range arms: empty range, binary added, file removed — previous_filename always null (no rename detection)", async () => {
+  it("maps the /files range arms: empty range, binary added, file removed — the upstream runtime status vocabulary (deleted, never removed), previous_filename omitted (no rename detection), the /src/commit + /raw/commit URL shapes", async () => {
     // Find the two PR indexes from the list (the shared suite's counter is
     // never hardcoded — the file's own convention).
     const pulls = (await (await get(`${REPO}/pulls?state=all&limit=50`)).json<Array<Record<string, unknown>>>()).filter(
@@ -1591,10 +1643,13 @@ describe("PR .diff/.patch tails — the empty-range, binary and truncation-cap a
     const binaryFiles: Array<Record<string, unknown>> = await binary.json();
     expect(binaryFiles[0]?.filename).toBe("logo.bin");
     expect(binaryFiles[0]?.status).toBe("added");
-    expect(binaryFiles[0]?.previous_filename).toBeNull();
+    // upstream's `omitempty` string (structs/pull.go:185) — absent unless a
+    // rename carried it (never: no rename detection in the engine seam).
+    expect(binaryFiles[0]).not.toHaveProperty("previous_filename");
 
     // The deletion arm: a branch that deletes a file (old side present, new
-    // side null → "removed").
+    // side null → "deleted" — convert.go:1087, never "removed"; that word
+    // belongs to the Commit.files arm, git_commit.go:198-205).
     const delBranch = await send(`${REPO}/branches`, jsonInit("POST", { new_branch_name: "taildelete" }));
     expect(delBranch.status).toBe(201);
     const readme = await get(`${REPO}/contents/README.md?ref=taildelete`);
@@ -1610,14 +1665,84 @@ describe("PR .diff/.patch tails — the empty-range, binary and truncation-cap a
     expect(removal.status).toBe(200);
     const removalFiles: Array<Record<string, unknown>> = await removal.json();
     expect(removalFiles[0]?.filename).toBe("README.md");
-    expect(removalFiles[0]?.status).toBe("removed");
-    expect(removalFiles[0]?.previous_filename).toBeNull();
+    expect(removalFiles[0]?.status).toBe("deleted");
+    expect(removalFiles[0]).not.toHaveProperty("previous_filename");
+    // The URL shapes are upstream's (convert.go:1105-1108): /src/commit/{sha}/
+    // {path} without a #fragment and /raw/commit/{sha}/{path} — not the
+    // legacy /commit/{sha}#{path} and /raw/{sha}/{path} forms.
+    const headSha = ((await jsonBody(await get(`${REPO}/pulls/${removalIndex}`))).head as Record<string, unknown>).sha as string;
+    // the WEB url family — upstream repo.HTMLURL() is {root}/{owner}/{repo},
+    // no /repos prefix (that is the API path's own)
+    expect(removalFiles[0]?.html_url).toBe(`${ORIGIN}/${OWNER}/${SLUG}/src/commit/${headSha}/README.md`);
+    expect(removalFiles[0]?.raw_url).toBe(`${ORIGIN}/${OWNER}/${SLUG}/raw/commit/${headSha}/README.md`);
 
     // The empty range lists zero files with the zero totals.
     const emptyFiles = await get(`${REPO}/pulls/${emptyIndex}/files`);
     expect(emptyFiles.status).toBe(200);
     expect(emptyFiles.headers.get("X-Total-Count")).toBe("0");
     expect(await emptyFiles.json<unknown[]>()).toEqual([]);
+  });
+
+  it("serves the /files X-Total-Count as the TRUE total on page > 1 and honors skip-to (pull.go:1542-1570)", async () => {
+    // Four entries on one branch — README.md MODIFIED (the "changed"
+    // default, convert.go:1086 — never "modified" as a status word) plus
+    // three adds. Page 2 with limit 1 must report the full count 4: the old
+    // soFar formula `(page-1)*limit + listLength` answered (2-1)*1 + 4 = 5
+    // here — the inflation this pin kills.
+    await seedBranchWithCommit("filespage", "p1.txt", "one\n");
+    await send(`${REPO}/contents/p2.txt`, jsonInit("POST", { content: btoa("two\n"), branch: "filespage", message: "second: p2.txt" }));
+    await send(`${REPO}/contents/p3.txt`, jsonInit("POST", { content: btoa("three\n"), branch: "filespage", message: "third: p3.txt" }));
+    const baseReadme = await get(`${REPO}/contents/README.md?ref=main`);
+    expect(baseReadme.status).toBe(200);
+    const baseReadmeSha = ((await jsonBody(baseReadme)).sha) as string;
+    const readmeEdit = await send(`${REPO}/contents/README.md`, jsonInit("PUT", { content: btoa("# changed\n"), sha: baseReadmeSha, branch: "filespage", message: "filespage: edit README" }));
+    expect(readmeEdit.status).toBe(200);
+    const pagePr = await send(`${REPO}/pulls`, jsonInit("POST", { title: "Files page tail", head: "filespage", base: "main" }));
+    expect(pagePr.status).toBe(201);
+    const pageIndex = (await jsonBody(pagePr)).number as number;
+
+    const page2 = await get(`${REPO}/pulls/${pageIndex}/files?limit=1&page=2`);
+    expect(page2.status).toBe(200);
+    expect(page2.headers.get("X-Total-Count")).toBe("4");
+    // the second sorted path of [README.md, p1.txt, p2.txt, p3.txt]
+    expect(((await page2.json<Array<Record<string, unknown>>>())[0]?.filename) ?? "").toBe("p1.txt");
+
+    // skip-to starts the list AT the named file (git diff --skip-to, the
+    // upstream param name), the total stays the FULL count, and an
+    // unmatching name yields the empty list (gitdiff.go:1331-1333 — output
+    // skips everything before the path; a path never reached emits nothing).
+    const skipped = await get(`${REPO}/pulls/${pageIndex}/files?skip-to=p2.txt`);
+    expect(skipped.status).toBe(200);
+    expect(skipped.headers.get("X-Total-Count")).toBe("4");
+    expect((await skipped.json<Array<Record<string, unknown>>>()).map((f) => f.filename)).toEqual(["p2.txt", "p3.txt"]);
+
+    const gone = await get(`${REPO}/pulls/${pageIndex}/files?skip-to=ghost.txt`);
+    expect(gone.status).toBe(200);
+    expect(gone.headers.get("X-Total-Count")).toBe("4");
+    expect(await gone.json<unknown[]>()).toEqual([]);
+
+    // The vocabulary: the edited file is "changed" (upstream's runtime
+    // default — convert.go never emits "modified"), the adds stay "added".
+    const all = await (await get(`${REPO}/pulls/${pageIndex}/files`)).json<Array<Record<string, unknown>>>();
+    const byPath = new Map(all.map((f) => [f.filename as string, f.status as string]));
+    expect(byPath.get("README.md")).toBe("changed");
+    expect(byPath.get("p1.txt")).toBe("added");
+    expect(byPath.get("p2.txt")).toBe("added");
+    expect(byPath.get("p3.txt")).toBe("added");
+
+    // whitespace is NO LONGER a declared query (the engine diff seam has no
+    // whitespace modes — the reduction documented at the route, pull.go:
+    // 1536's WhitespaceBehavior unportable): the param is inert — zod strips
+    // the undeclared key and the plain hunks come back unchanged — not a
+    // declare-and-ignore lie.
+    const inert = await get(`${REPO}/pulls/${pageIndex}/files?whitespace=ignore-all`);
+    expect(inert.status).toBe(200);
+    expect((await inert.json<Array<Record<string, unknown>>>()).map((f) => f.filename)).toEqual([
+      "README.md",
+      "p1.txt",
+      "p2.txt",
+      "p3.txt",
+    ]);
   });
 });
 

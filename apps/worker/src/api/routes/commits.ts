@@ -54,6 +54,11 @@ import { viewerOf } from "../services/repository";
  *     NEWEST-first (upstream's git-log order, compare.go) — the engine walk
  *     is oldest-first and the render reverses it; a null merge base
  *     (unrelated histories) answers EARLY EMPTY like compare.go:91-93.
+ *     Compare deviations, both disclosed at the handler: stat is hard-coded
+ *     TRUE (upstream's ToCommitOptions{Stat: true} — the query has no stat),
+ *     and the rendered list is bounded at COMPARE_COMMIT_BOUND (upstream's
+ *     log walk is unbounded and unpaged) while total_commits reports the
+ *     TRUE range count (countDivergence, not the bounded list length).
  *
  * X-Total-Count approximation: the engine's listLog carries no total, so the
  * header counts the walked window (COMMIT_WALK_BOUND) — documented divergence
@@ -403,6 +408,14 @@ export function registerCommitRoutes(
   // documented null merge-base EARLY EMPTY (compare.go:91-93), where
   // upstream fetches the head tip (FetchRemoteTempCommit) — recorded
   // limitation, not a status divergence.
+  //
+  // Commit-list posture: upstream walks the range UNBOUNDED (services/git/
+  // compare.go:101) and returns every commit unpaged with
+  // `TotalCommits: len(...)`. Ours renders at most COMPARE_COMMIT_BOUND
+  // entries (the bound is ours — upstream has no cap) while total_commits
+  // reports the TRUE range count from the counting walk (countDivergence
+  // ahead — no commit materialization), so consumers past the bound see an
+  // honest total with a truncated list.
   // -------------------------------------------------------------------------
   const handleCompare = async (c: Context<ApiEnv>, owner: string, repo: string, basehead: string): Promise<Response> => {
     const pair = await requireVisibleRepo(c, { owner, repo });
@@ -476,7 +489,10 @@ export function registerCommitRoutes(
     }
 
     const walked = (await reads.listCommitsRange(rangeStart, headCommit.oid, COMPARE_COMMIT_BOUND)) ?? { commits: [], more: false };
-    const statFlag = formBoolDefault(url, "stat");
+    // Stat is hard-coded TRUE (upstream's ToCommitOptions{Stat: true},
+    // routers/api/v1/repo/compare.go:105-109 — the query carries only
+    // verification/files); the old `?stat=` read was an undeclared
+    // upstream-absent toggle.
     const filesFlag = formBoolDefault(url, "files");
     const userRows = await userRowsByEmail(c.env.DB, walked.commits);
     // Upstream serves the compare commit list in git-log order (newest
@@ -486,10 +502,31 @@ export function registerCommitRoutes(
     const newestFirst = [...walked.commits].reverse();
     const rendered = await Promise.all(
       newestFirst.map((commit) =>
-        toApiCommit(c.env.DB, reads, viewerOf(c), pair, commit, undefined, { stat: statFlag, files: filesFlag, userRows }),
+        toApiCommit(c.env.DB, reads, viewerOf(c), pair, commit, undefined, { stat: true, files: filesFlag, userRows }),
       ),
     );
-    return c.json({ total_commits: walked.commits.length, commits: rendered }, 200);
+    // total_commits is the TRUE range count, matching upstream's
+    // `TotalCommits: len(compareInfo.Commits)` over the UNBOUNDED log walk
+    // (services/git/compare.go:101 — ShowPrettyFormatLogToList has no
+    // limit). When the bounded walk answered `more: false` the list IS the
+    // whole range — its length is exact without a second RPC. Past the
+    // bound (more: true), `ahead` of countDivergence(rangeStart, head)
+    // (|base..head|, one OidSet parent-closure walk, no commit
+    // materialization) supplies the true count while the LIST stays bounded
+    // at COMPARE_COMMIT_BOUND — upstream returns every commit with no
+    // pagination, so the bound is our resource-posture reduction and the
+    // count stays honest past it. A failed/missing count walk falls back to
+    // the walked length; an exhausted count (50k-visit budget) is a lower
+    // bound, the same exhaustion posture as the merge-base walk's EARLY
+    // EMPTY above.
+    let totalCommits = walked.commits.length;
+    if (walked.more) {
+      const counted = await reads.countDivergence(rangeStart, headCommit.oid);
+      if (counted !== null && counted.tag === "ok") {
+        totalCommits = counted.ahead;
+      }
+    }
+    return c.json({ total_commits: totalCommits, commits: rendered }, 200);
   };
 
   // Doc-only registration (the git/commits dot-suffix idiom — a zod-openapi
@@ -690,7 +727,15 @@ async function requireReadableHeadRepo(c: Context<ApiEnv>, headRepoId: string): 
   return headPair;
 }
 
-/** Compare renders at most this many commits (upstream's own page cap). */
+/**
+ * Compare renders at most this many commits. Upstream has NO cap —
+ * GetCompareInfo's ShowPrettyFormatLogToList walks the whole range
+ * (services/git/compare.go:101, `git log` without a limit) and the endpoint
+ * does not paginate — so this is OUR resource bound (the engine walk
+ * materializes CommitJson per commit), a documented reduction: the rendered
+ * list is the first bound commits while total_commits (countDivergence, the
+ * handler) stays the true range count.
+ */
 const COMPARE_COMMIT_BOUND = 250;
 
 

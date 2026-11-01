@@ -262,9 +262,11 @@ function formBoolDefault(url: URL, key: string): boolean {
 
 /**
  * The contract's X-* header family (CommitList / ChangedFileList are the only
- * two responses declaring it — SPEC-0004 §2.5). X-Total-Count carries the
- * commits/files SO FAR (the engine's range walk reports no total; the
- * approximation is documented in the routes).
+ * two responses declaring it — SPEC-0004 §2.5). The count is CALLER-SUPPLIED
+ * per route and documents which: the commit walks pass the so-far window (the
+ * engine's listLog reports no total — the approximation lives at those
+ * routes), while /pulls/{index}/files passes the TRUE list length (the
+ * handler holds the whole list — pull.go:1568-1569).
  */
 function setCommitListHeaders(c: Context<ApiEnv>, opts: { page: number; limit: number }, countSoFar: number, hasMore: boolean): void {
   c.header("X-Total-Count", String(countSoFar));
@@ -1417,6 +1419,29 @@ export function registerPullRoutes(
   // -------------------------------------------------------------------------
   // GET /repos/{owner}/{repo}/pulls/{index}/files (repoGetPullRequestFiles)
   // — ChangedFileList over the range diff (the other X-* header family).
+  //
+  // Query surface per upstream (pull.go:1518-1545 + the swagger):
+  //   - `skip-to` (the upstream param NAME — pull.go:1542 reads
+  //     FormString("skip-to")) starts the list AT the named file:
+  //     `git diff --skip-to=` semantics (gitdiff.go:1331-1333) — files from
+  //     that path onward, an unmatching name yielding the empty list. The
+  //     X-Total-Count stays the FULL file count (upstream computes it from a
+  //     separate shortstat walk WITHOUT SkipTo, pull.go:1553-1561), and the
+  //     page window slices the SKIPPED list (pull.go:1563-1570).
+  //   - `whitespace` is NOT declared: upstream passes it to the diff
+  //     generator (WhitespaceBehavior, pull.go:1536; the -w/-b/
+  //     --ignore-space-at-eol flag table, gitdiff.go:1704-1706), but our
+  //     engine diff seam (readDiff, SPEC-0001b §3) computes plain hunks only
+  //     — no whitespace modes exist to honor. The old declare-and-ignore was
+  //     a silent lie; the reduction is now honest (an engine-side gap, not a
+  //     route-side one).
+  //
+  // X-Total-Count is the TRUE total — the handler holds the whole file list,
+  // so the count is `files.length` (upstream SetTotalCountHeader over
+  // totalNumberOfFiles, pull.go:1568-1569); the old `(page-1)*limit+len`
+  // soFar inflated the header on page > 1. When the engine's diff window is
+  // budget-truncated (MAX_DIFF_FILES — SPEC-0001b §3) the count is that
+  // window, the same caveat the ChangedFileList itself carries.
   // -------------------------------------------------------------------------
   app.openapi(
     createRoute({
@@ -1429,8 +1454,7 @@ export function registerPullRoutes(
       request: {
         params: z.object(pullIndexParams),
         query: z.object({
-          skip_to: z.string().optional().openapi({ description: "skip to given file" }),
-          whitespace: z.string().optional().openapi({ type: "string", enum: ["ignore-all", "ignore-change", "ignore-eol", "show-all"], description: "whitespace behaviour" }),
+          "skip-to": z.string().optional().openapi({ description: "skip to given file" }),
           page: pageLimitQuery.page,
           limit: pageLimitQuery.limit,
         }),
@@ -1452,10 +1476,12 @@ export function registerPullRoutes(
         viewerOf(c).origin,
         range.head,
       );
-      const soFar = (listOptions.page - 1) * listOptions.limit + files.length;
-      setCommitListHeaders(c, listOptions, soFar, files.length > listOptions.page * listOptions.limit);
+      const skipTo = c.req.valid("query")["skip-to"] ?? "";
+      const from = skipTo === "" ? 0 : files.findIndex((f) => f.filename === skipTo);
+      const skipped = files.slice(from === -1 ? files.length : from);
+      setCommitListHeaders(c, listOptions, files.length, files.length > listOptions.page * listOptions.limit);
       const start = (listOptions.page - 1) * listOptions.limit;
-      return c.json(files.slice(start, start + listOptions.limit), 200);
+      return c.json(skipped.slice(start, start + listOptions.limit), 200);
     },
   );
 
