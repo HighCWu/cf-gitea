@@ -92,8 +92,17 @@
  *   highlighting, no editor options menu (options.tmpl), no find/palette.
  * - Preview is OFF in v1 (the brief): edit.tmpl's write/preview/diff tab menu
  *   reduces to the single write tab; no `/_preview/*` route exists.
- * - No fork-to-edit: upstream shows readers a fork-then-edit flow
- *   (NeedFork/ForkToEdit); readers here 404-shell at the write predicate.
+ * - Fork-to-edit LANDED (census gap #13): upstream's reader flow — the
+ *   editor GET for a signed-in non-writer renders `editor/fork` (NeedFork)
+ *   or the fork-targeting editor (WillSubmitToFork: TargetFormAction onto
+ *   the fork's own editor route, the fork's branches in the commit select,
+ *   common_top's blue banner), and `POST /{owner}/{repo}/_fork/{branch}`
+ *   creates the fork then reloads (ForkToEditPost). The seams live in
+ *   pages/repo-editor-fork.tsx (the prompt render, the overlay, the write);
+ *   THIS page accepts the optional `fork` overlay — set, the form action
+ *   and the commit select target the fork; absent, byte-identical render.
+ *   The route claim + gate split are the ui/index.ts fold (the family's
+ *   mount record).
  * - The commit_choice radios ("commit directly" / "commit to a new branch" +
  *   `new_branch_name`, commit_form.tmpl) reduce to ONE target-branch select
  *   of the EXISTING branches (the brief; the service's new_branch arm stays
@@ -130,6 +139,7 @@ import type { Viewer } from "../viewer";
 import { FileTreeSidebar } from "./file-view";
 import { resolveHeadBranch, type ResolvedRefs } from "./home";
 import { resolveRefSuffix } from "../index";
+import { EditorForkBanner, type EditorForkOverlay } from "./repo-editor-fork";
 
 /** Page chrome text (component-local, the milestonesLocale pattern — the
  *  strings cite upstream's locale keys). */
@@ -536,29 +546,43 @@ function EditorCommitForm(props: { action: string; branches: readonly string[]; 
 
 /** The full-document render (the render.tsx pattern). `form` carries the
  *  field values (the GET's prefills or the preserved submission); `data`
- *  carries the structure (branches, sidebar, refusals). */
+ *  carries the structure (branches, sidebar, refusals); `fork` is the
+ *  fork-to-edit overlay (pages/repo-editor-fork.tsx — WillSubmitToFork:
+ *  the action onto the fork's editor route + the fork's branch select +
+ *  common_top's banner; absent = byte-identical). */
 export function renderFileEditorPage(options: {
   ctx: UiContext;
   data: FileEditorData;
   form: EditorFormValues;
   error: string | null;
+  fork?: EditorForkOverlay | null;
 }): string {
-  return renderPage(<FileEditorPage ctx={options.ctx} data={options.data} form={options.form} error={options.error} />);
+  return renderPage(<FileEditorPage ctx={options.ctx} data={options.data} form={options.form} error={options.error} fork={options.fork ?? null} />);
 }
 
 /** The editor page (§2.4.1 discriminator: edit.tmpl:4's
  *  `repository file editor edit`; the delete variant's `editor delete`
- *  tail is dropped — one template serves all three modes). */
-export function FileEditorPage(props: { ctx: UiContext; data: FileEditorData; form: EditorFormValues; error: string | null }) {
+ *  tail is dropped — one template serves all three modes). `fork` set: the
+ *  WillSubmitToFork arm — the form action is the overlay's
+ *  TargetFormAction (the fork's editor route), the commit select lists the
+ *  FORK's branches (the POST lands there; the caller folds the fork's
+ *  default branch into `form.branch`), and common_top's banner renders as
+ *  the form's first child (all five upstream editor templates include it).
+ *  The breadcrumb/sidebar/cancel stay BASE-anchored — upstream renders
+ *  them against ctx.Repo (the base) too. */
+export function FileEditorPage(props: { ctx: UiContext; data: FileEditorData; form: EditorFormValues; error: string | null; fork?: EditorForkOverlay | null }) {
   const { ctx, data, form } = props;
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("FileEditorPage requires ctx.repo");
+  const fork = props.fork ?? null;
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   const branchHref = `${repoLink}/src/branch/${pathEscapeSegments(data.branch)}`;
   const action =
-    data.mode === "new"
-      ? `${repoLink}/new/${pathEscapeSegments(data.branch)}`
-      : `${repoLink}/${data.mode}/${pathEscapeSegments(data.branch)}/${pathEscapeSegments(data.treePath)}`;
+    fork !== null
+      ? fork.action
+      : data.mode === "new"
+        ? `${repoLink}/new/${pathEscapeSegments(data.branch)}`
+        : `${repoLink}/${data.mode}/${pathEscapeSegments(data.branch)}/${pathEscapeSegments(data.treePath)}`;
   const cancelHref =
     data.mode === "new" || data.treePath === ""
       ? branchHref
@@ -581,6 +605,7 @@ export function FileEditorPage(props: { ctx: UiContext; data: FileEditorData; fo
           />
           <div class="repo-view-content">
             <form class="ui edit form" method="post" action={action}>
+              {fork !== null ? <EditorForkBanner overlay={fork} /> : null}
               <div class="repo-editor-header">
                 <EditorBreadcrumb
                   repoSlug={repo.slug}
@@ -636,7 +661,7 @@ export function FileEditorPage(props: { ctx: UiContext; data: FileEditorData; fo
               )}
               <EditorCommitForm
                 action={action}
-                branches={data.refs.branches}
+                branches={fork !== null ? fork.branches : data.refs.branches}
                 form={form}
                 summaryPlaceholder={
                   data.mode === "new" ? fileEditorLocale.add_tmpl : defaultEditorMessage(data.mode, data.treePath)

@@ -108,9 +108,16 @@
  *   the blob-sha `blob_sha` field (delete only — the loader's entry oid; the
  *   upload loader carries no sha, matching upstream's upload flow whose CAS
  *   is the same last_commit id).
- * - The fork arms (common_top.tmpl's WillSubmitToFork message, the
- *   NeedFork/ForkToEdit redirect) are unrendered — no fork-to-edit flow (the
- *   wave-8 header).
+ * - Fork-to-edit LANDED (census gap #13): the tails ride the family's
+ *   fork arms — an optional `fork` overlay (pages/repo-editor-fork.tsx's
+ *   EditorForkOverlay) puts the action onto the fork's editor route, swaps
+ *   the commit select to the fork's branches, and renders common_top's
+ *   WillSubmitToFork banner (all five upstream editor templates include
+ *   common_top). Absent, byte-identical renders. The upload fork arm keeps
+ *   the dropzone BASE-anchored exactly like upstream (repo/upload.tmpl's
+ *   `data-upload-url="{{.RepoLink}}/upload-file"` — ctx.Repo stays base
+ *   under WillSubmitToFork; the reader cannot stage there, upstream's own
+ *   posture, not reduced further).
  * - The view_file_tree toggle button (delete.tmpl:12-13 says it must exist —
  *   for the JS toggle) is unrendered: the landed FileTreeSidebar dropped both
  *   toggle buttons (JS island, no UserSettingCodeViewShowFileTree pipeline)
@@ -142,6 +149,7 @@ import {
 } from "./file-editor";
 import { FileTreeSidebar } from "./file-view";
 import type { ResolvedRefs } from "./home";
+import { EditorForkBanner, type EditorForkOverlay } from "./repo-editor-fork";
 
 /** Page chrome text (component-local, the fileEditorLocale pattern — the
  *  strings cite upstream's locale keys). */
@@ -352,15 +360,16 @@ function DeleteBreadcrumb(props: { repoSlug: string; branchHref: string; treePat
 /** The full-document DELETE confirm render. `data`/`form` are the FAMILY
  *  types (loadFileEditorData("delete") / EditorFormValues / readEditorForm) —
  *  the dispatcher swapped in this render (MOUNTED at 1d834d6, the mount
- *  record). */
+ *  record). `fork` is the fork-to-edit overlay (pages/repo-editor-fork.tsx). */
 export function renderEditorDeletePage(options: {
   ctx: UiContext;
   data: FileEditorData;
   form: EditorFormValues;
   error: string | null;
+  fork?: EditorForkOverlay | null;
 }): string {
   return renderPage(
-    <EditorDeleteConfirmPage ctx={options.ctx} data={options.data} form={options.form} error={options.error} />,
+    <EditorDeleteConfirmPage ctx={options.ctx} data={options.data} form={options.form} error={options.error} fork={options.fork ?? null} />,
   );
 }
 
@@ -368,14 +377,22 @@ export function renderEditorDeletePage(options: {
  *  `repository file editor delete`). Form → the LANDED delete arm; the
  *  commit fields carry tree_path + blob_sha (the landed handler's CAS), the
  *  summary placeholder is the PageIsDelete arm. NO content arm — delete.tmpl
- *  renders the commit form directly (module header). */
-export function EditorDeleteConfirmPage(props: { ctx: UiContext; data: FileEditorData; form: EditorFormValues; error: string | null }) {
+ *  renders the commit form directly (module header). `fork` set: the
+ *  WillSubmitToFork arm — the overlay's TargetFormAction + the fork's
+ *  branch select + the common_top banner (the caller folds the fork's
+ *  default branch into `form.branch`); breadcrumb/sidebar/cancel stay
+ *  BASE-anchored (upstream renders them against ctx.Repo too). */
+export function EditorDeleteConfirmPage(props: { ctx: UiContext; data: FileEditorData; form: EditorFormValues; error: string | null; fork?: EditorForkOverlay | null }) {
   const { ctx, data, form } = props;
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("EditorDeleteConfirmPage requires ctx.repo");
+  const fork = props.fork ?? null;
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   const branchHref = `${repoLink}/src/branch/${pathEscapeSegments(data.branch)}`;
-  const action = `${repoLink}/delete/${pathEscapeSegments(data.branch)}/${pathEscapeSegments(data.treePath)}`;
+  const action =
+    fork !== null
+      ? fork.action
+      : `${repoLink}/delete/${pathEscapeSegments(data.branch)}/${pathEscapeSegments(data.treePath)}`;
   const cancelHref = `${branchHref}/${pathEscapeSegments(data.treePath)}`;
 
   return (
@@ -392,12 +409,13 @@ export function EditorDeleteConfirmPage(props: { ctx: UiContext; data: FileEdito
           />
           <div class="repo-view-content">
             <form class="ui form form-fetch-action" method="post" action={action}>
+              {fork !== null ? <EditorForkBanner overlay={fork} /> : null}
               <div class="repo-editor-header">
                 <DeleteBreadcrumb repoSlug={repo.slug} branchHref={branchHref} treePath={data.treePath} />
               </div>
               {props.error !== null ? <div class="ui negative message">{props.error}</div> : null}
               <TailCommitForm
-                branches={data.refs.branches}
+                branches={fork !== null ? fork.branches : data.refs.branches}
                 form={form}
                 summaryPlaceholder={defaultEditorMessage("delete", data.treePath)}
                 cancelHref={cancelHref}
@@ -494,15 +512,17 @@ function UploadDropzone(props: { repoLink: string }) {
 
 /** The full-document UPLOAD confirm render (the staging family LANDED —
  *  MOUNTED at 1d834d6, the mount record; the POST writes through
- *  `commitUploadFromForm`). */
+ *  `commitUploadFromForm`). `fork` is the fork-to-edit overlay
+ *  (pages/repo-editor-fork.tsx). */
 export function renderEditorUploadPage(options: {
   ctx: UiContext;
   data: EditorUploadData;
   form: EditorUploadFormValues;
   error: string | null;
+  fork?: EditorForkOverlay | null;
 }): string {
   return renderPage(
-    <EditorUploadConfirmPage ctx={options.ctx} data={options.data} form={options.form} error={options.error} />,
+    <EditorUploadConfirmPage ctx={options.ctx} data={options.data} form={options.form} error={options.error} fork={options.fork ?? null} />,
   );
 }
 
@@ -510,17 +530,24 @@ export function renderEditorUploadPage(options: {
  *  `repository file editor upload`). Form class
  *  `ui form form-fetch-action repo-file-upload` (upload.tmpl:9); the action
  *  is the family's bare-literal shape — UNCLAIMED until the write family
- *  lands (documented-unrendered). */
-export function EditorUploadConfirmPage(props: { ctx: UiContext; data: EditorUploadData; form: EditorUploadFormValues; error: string | null }) {
+ *  lands (documented-unrendered). `fork` set: the WillSubmitToFork arm —
+ *  the overlay's TargetFormAction + the fork's branch select + the
+ *  common_top banner; the dropzone stays BASE-anchored exactly like
+ *  upstream (repo/upload.tmpl's `{{.RepoLink}}` arm — ctx.Repo stays base;
+ *  the module header). */
+export function EditorUploadConfirmPage(props: { ctx: UiContext; data: EditorUploadData; form: EditorUploadFormValues; error: string | null; fork?: EditorForkOverlay | null }) {
   const { ctx, data, form } = props;
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("EditorUploadConfirmPage requires ctx.repo");
+  const fork = props.fork ?? null;
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   const branchHref = `${repoLink}/src/branch/${pathEscapeSegments(data.branch)}`;
   const action =
-    data.treePath === ""
-      ? `${repoLink}/upload/${pathEscapeSegments(data.branch)}`
-      : `${repoLink}/upload/${pathEscapeSegments(data.branch)}/${pathEscapeSegments(data.treePath)}`;
+    fork !== null
+      ? fork.action
+      : data.treePath === ""
+        ? `${repoLink}/upload/${pathEscapeSegments(data.branch)}`
+        : `${repoLink}/upload/${pathEscapeSegments(data.branch)}/${pathEscapeSegments(data.treePath)}`;
 
   return (
     <BaseLayout ctx={ctx} title={editorTailsLocale.upload_file} pageClass="repository file editor upload" activeTab="code">
@@ -536,6 +563,7 @@ export function EditorUploadConfirmPage(props: { ctx: UiContext; data: EditorUpl
           />
           <div class="repo-view-content">
             <form class="ui form form-fetch-action repo-file-upload" method="post" action={action}>
+              {fork !== null ? <EditorForkBanner overlay={fork} /> : null}
               <div class="repo-editor-header">
                 <UploadBreadcrumb repoSlug={repo.slug} branchHref={branchHref} treePath={data.treePath} />
               </div>
@@ -544,7 +572,7 @@ export function EditorUploadConfirmPage(props: { ctx: UiContext; data: EditorUpl
                 <UploadDropzone repoLink={repoLink} />
               </div>
               <TailCommitForm
-                branches={data.refs.branches}
+                branches={fork !== null ? fork.branches : data.refs.branches}
                 form={form}
                 summaryPlaceholder={uploadFilesToDirMessage(data.treePath)}
                 cancelHref={data.treePath === "" ? branchHref : `${branchHref}/${pathEscapeSegments(data.treePath)}`}
