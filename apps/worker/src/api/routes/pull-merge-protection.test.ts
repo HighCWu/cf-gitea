@@ -19,7 +19,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { protectedBranches, pullRequests, pullReviews, repoCollaborators, repositories, ReviewType, teamMembers, teams } from "../../db/schema";
+import { protectedBranches, pullRequests, pullReviews, repoCollaborators, repoUnits, repositories, ReviewType, teamMembers, teams } from "../../db/schema";
 import { IssuesService } from "../../issues/service";
 import { ZERO_OID, branchRef } from "../services/engine";
 import type { AuthResolver } from "../auth";
@@ -43,11 +43,14 @@ beforeEach(async () => {
     "comments",
     "issue_labels",
     "pull_requests",
+    "pull_auto_merges",
+    "issue_dependency",
     "issues",
     "milestones",
     "labels",
     "repo_collaborators",
     "repo_counters",
+    "repo_units",
     "repositories",
     "users",
   ]) {
@@ -367,10 +370,11 @@ describe("POST …/pulls/{index}/merge — the SPEC-0013 protection gate", () =>
     expect((await merge(scenario, {}, CARA_TOKEN)).status).toBe(200); // no approvals required → whitelist pass merges
   });
 
-  it("manually-merged skips the protection checks entirely (check.go:162–165)", async () => {
+  it("manually-merged skips the protection checks entirely (check.go:162–165) — with the PR unit's AllowManualMerge armed (merge.go:755-759's IsMergeStyleAllowed gate, default FALSE)", async () => {
     const scenario = await seedScenario();
     await seedRule(scenario.repoId, { requiredApprovals: 1, blockOnRejectedReviews: true });
     await seedReview(scenario, ReviewType.Reject, { official: true });
+    await db().insert(repoUnits).values({ repoId: scenario.repoId, type: "pull_requests", config: JSON.stringify({ AllowManualMerge: true }) });
     const res = await router()(
       `/api/v1/repos/${OWNER}/${scenario.slug}/pulls/${scenario.index}/merge`,
       authed(ALICE_TOKEN, { method: "POST", body: JSON.stringify({ do: "manually-merged", merge_commit_id: scenario.mainTip }) }),

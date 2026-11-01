@@ -85,7 +85,7 @@ import { changedFileListSchema, commitListSchema } from "../models/git";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { ActionType, recordAction, type ActionDraft } from "../services/activity-feeds";
 import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
-import { changeIssueBody, changeIssueDeadline, changeIssueMilestone, hasWorkInProgressPrefix, issueErrorToApiError } from "../services/issues";
+import { changeIssueBody, changeIssueDeadline, changeIssueMilestone, hasWorkInProgressPrefix, issueErrorToApiError, issueNoDependenciesLeft } from "../services/issues";
 import { assertPullsUnit } from "../services/issue-unit-gates";
 import { parseMilestoneDeadline } from "../services/milestones";
 import {
@@ -125,7 +125,9 @@ import {
 } from "../services/repository";
 import { toApiUser } from "../services/user";
 import { canWriteRepository } from "../services/repo-access";
+import { loadRepoSettings } from "../services/repo-settings";
 import { canBypassBranchProtection, checkPullBranchProtections, findRule, isUserMergeWhitelisted, parseRuleConfig, principalAccessOf } from "../../services/branch-protection";
+import { createScheduledAutoMergeComment, insertScheduledAutoMergeRow } from "../../services/pull-automerge";
 import { emitMilestoneEvent } from "./issues";
 import { requestedReviewersOf } from "./pull-reviews";
 
@@ -1486,8 +1488,10 @@ export function registerPullRoutes(
 
   // -------------------------------------------------------------------------
   // POST /repos/{owner}/{repo}/pulls/{index}/merge (repoMergePullRequest)
-  // — 200 empty on success; the 405 family is the not-mergeable semantics
-  // (SPEC-0004 §2.5), 409 the lost base-ref CAS.
+  // — 200 empty on success, 201 empty when the call scheduled the auto
+  // merge (merge_when_checks_succeed, pull.go:994-1007) with the 409 the
+  // already-scheduled conflict; the 405 family is the not-mergeable
+  // semantics (SPEC-0004 §2.5), 409 also the lost base-ref CAS.
   // -------------------------------------------------------------------------
   app.openapi(
     createRoute({
@@ -1503,6 +1507,7 @@ export function registerPullRoutes(
       },
       responses: {
         200: { description: "empty" },
+        201: { description: "empty" },
         403: forbiddenResponse,
         404: notFoundResponse,
         405: { description: "empty" },
@@ -1535,28 +1540,129 @@ export function registerPullRoutes(
         }
       }
 
-      // CheckPullMergeable (405 family): merged, WIP, not-mergeable. The
-      // auto-merge schedule gate runs first (upstream checks
-      // MergeWhenChecksSucceed before the mergeable state).
+      // CheckPullMergeable (405 family): merged, the manual-mark style gate,
+      // WIP, not-mergeable — the same order the Auto check type (the schedule
+      // arm below) runs at the pin, only the branch-protection failure
+      // skipped (check.go:184-186); the full General re-check runs at consume
+      // time (automerge.go:214-216).
       if (pullRequest.hasMerged) {
         throw new ApiError(405, "The PR is already merged");
       }
-      if (form.merge_when_checks_succeed === true) {
-        // the auto-merge schedule is not modeled (no scheduled-merge table)
-        throw new ApiError(409, "scheduled auto-merge is not supported");
+      // The manual mark, hoisted once: the Do value is its own check TYPE
+      // (pull.go:923-928 — Manually overrides the MWCS Auto choice), so the
+      // arms below skip or serve it by this flag, never by re-comparing the
+      // narrowed union.
+      const manualMark = form.do === "manually-merged";
+      // The manual mark's style gate — MergedManually's FIRST gate
+      // (merge.go:755-759): IsMergeStyleAllowed(ManuallyMerged) = the PR
+      // unit's AllowManualMerge, the zero value FALSE upstream's
+      // DefaultPullRequestsConfig never sets (repo_unit.go:139-155). The API
+      // answers the refusal through APIErrorAuto (pull.go:953-960):
+      // ErrInvalidMergeStyle unwraps to ErrInvalidArgument (merge.go:231-233)
+      // → 400 with the error's own text; our repo id is the stored string,
+      // rendered verbatim in the same bracket shape.
+      if (manualMark) {
+        const settings = await loadRepoSettings(c.env.DB, found.repo.id);
+        if (!settings.prUnit.AllowManualMerge) {
+          throw new ApiError(400, `merge strategy is not allowed or is invalid [repo_id: ${found.repo.id}, strategy: manually-merged]`);
+        }
+        // MergedManually's commit resolution (merge.go:761-771): GetCommit on
+        // a missing/empty ref → NewInvalidArgumentErrorf("commit not found in
+        // base repository") — the same errorForUser 400. The in-branch
+        // verification rides the engine's manual arm (api/services/
+        // pull-engine.ts), which the request now reaches with the style
+        // allowed.
+        if (form.merge_commit_id === undefined || form.merge_commit_id === "") {
+          throw new ApiError(400, "commit not found in base repository");
+        }
       }
-      if (hasWorkInProgressPrefix(issue.title)) {
+      // The Manually check type early-returns BEFORE the WIP arm
+      // (check.go:161-165 — merged/closed/permission only), so a WIP title
+      // never blocks the mark.
+      if (!manualMark && hasWorkInProgressPrefix(issue.title)) {
         throw new ApiError(405, "Work in progress PRs cannot be merged");
       }
 
       // The mergeable precondition runs the LAZY check on a `checking` row
       // (same self-healing pass as the GET): not-mergeable after the check →
-      // the upstream 405 "Please try again later".
-      const checked = await ensurePullRequestChecked(c, found, pullRequest);
-      if (checked.hasMerged || checked.status === PRStatus.Ancestor) {
+      // the upstream 405 "Please try again later". The Manually type skips it
+      // entirely (the mark needs no mergeable state — it exists to close out
+      // conflicted work), so its arms run on the raw row.
+      const checked = manualMark ? pullRequest : await ensurePullRequestChecked(c, found, pullRequest);
+      if (!manualMark && (checked.hasMerged || checked.status === PRStatus.Ancestor)) {
         throw new ApiError(405, "The PR is already merged");
       }
-      if (checked.status !== PRStatus.Mergeable) {
+
+      // The open-dependency gate — CheckPullMergeable's FINAL arm
+      // (check.go:219-223), never bypassed by force_merge (the deps check
+      // sits outside the protection-failure escape) and NEVER skipped for the
+      // Auto type (only the branch-protection failure is, check.go:184-186) —
+      // so it runs BEFORE the schedule arm below, exactly like the upstream
+      // handlers' single CheckPullMergeable call that precedes
+      // ScheduleAutoMerge (api pull.go:929/994; web pull.go:1056/1135). The
+      // manually-merged mark never reaches it (check.go:162-165 — the route's
+      // manual arm above already gated the style). The engine re-runs the
+      // same gate at its core (api/services/pull-engine.ts), so the direct
+      // merge path answers it twice-identically. Deliberate DIVERGENCE
+      // documented: upstream's API ladder has NO ErrDependenciesLeft arm (the
+      // error falls to APIErrorInternal → a 500 for a user-input condition,
+      // routers/api/v1/repo/pull.go:928-946 at the pin and on main); the 405
+      // with the locale text is our errorForUser-faithful choice — the same
+      // class as every sibling not-mergeable condition here and the
+      // Terraform-422 precedent (SPEC-0016) — carrying the web flash's exact
+      // string (repo.issues.dependency.pr_close_blocked, pull.go:1088-1090).
+      if (!manualMark && !(await issueNoDependenciesLeft(c.env.DB, issue.id))) {
+        throw new ApiError(405, "You need to close all issues that are blocking this pull request before you can merge it.");
+      }
+
+      // THE SCHEDULE ARM (api pull.go:994-1007): merge_when_checks_succeed
+      // schedules the auto merge — success → the bare 201 Created
+      // (ctx.Status, EMPTY body), a standing row → the 409 carrying
+      // ErrAlreadyScheduledToAutoMerge's text (models/pull/automerge.go:43-
+      // 45). NO delete-first: that reset is the WEB handler's shape (web
+      // pull.go:1136); the API keeps the row and conflicts (automerge.go:55-
+      // 61's exists-check → the model error). The Auto-type state gate is
+      // CheckPullMergeable's `!pr.IsStatusMergeable() && !pr.IsEmpty()`
+      // (check.go:171-173) — an Empty PR schedules too. The type-34 comment
+      // (CreateAutoMergeComment's scheduled half) and the first check
+      // enqueue (StartAutoMergeCheckByPullHead, automerge.go:100-103)
+      // complete the upstream service's transaction tail. The manual mark
+      // never reaches it: upstream returns at the mark (pull.go:951-960)
+      // before the schedule branch, so Manually overrides MWCS when both
+      // flags ride one body.
+      if (!manualMark && form.merge_when_checks_succeed === true) {
+        if (checked.status !== PRStatus.Mergeable && checked.status !== PRStatus.Empty) {
+          throw new ApiError(405, "Please try again later");
+        }
+        const message = await composeMergeMessage(c, found, issue, checked, {
+          style: form.do,
+          mergeTitleField: form.merge_title_field ?? "",
+          mergeMessageField: form.merge_message_field ?? "",
+        });
+        const now = new Date();
+        const scheduled = await insertScheduledAutoMergeRow(c.env.DB, {
+          issueId: issue.id,
+          doerId: requester.id ?? 0,
+          sha: checked.headSha ?? "",
+          style: form.do,
+          message,
+          deleteBranchAfterMerge: form.delete_branch_after_merge === true,
+        }, now);
+        if (scheduled === null) {
+          throw new ApiError(409, `pull request is already scheduled to auto merge when checks succeed [pull_id: ${String(issue.id)}]`);
+        }
+        await createScheduledAutoMergeComment(c.env.DB, issue.id, requester.id ?? 0, now);
+        if (c.env.REPO_TASKS !== undefined) {
+          try {
+            await c.env.REPO_TASKS.send({ kind: "auto-merge-check", issueId: issue.id });
+          } catch (error) {
+            console.error(`[pulls] auto-merge check enqueue failed (issue ${issue.id}): ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        return c.body(null, 201);
+      }
+
+      if (!manualMark && checked.status !== PRStatus.Mergeable) {
         throw new ApiError(405, "Please try again later");
       }
 
@@ -1566,7 +1672,7 @@ export function registerPullRoutes(
       // (check.go:162–165). A failure answers 405 with the upstream message
       // text VERBATIM; `force_merge` clears it only through
       // CanBypassBranchProtection (check.go:192–207).
-      if (rule !== null && form.do !== "manually-merged") {
+      if (rule !== null && !manualMark) {
         const failure = await checkPullBranchProtections(c.env.DB, rule, {
           issueId: issue.id,
           commitsBehind: checked.commitsBehind ?? 0,
@@ -1590,14 +1696,13 @@ export function registerPullRoutes(
       // merge_message_field appends (pull.go:966-986, merge.go:112-148 —
       // composeMergeMessage). manually-merged skips it: upstream returns at
       // pull.go:945-951 before composing and the mark touches no commit.
-      const message =
-        form.do === "manually-merged"
-          ? ""
-          : await composeMergeMessage(c, found, issue, checked, {
-              style: form.do,
-              mergeTitleField: form.merge_title_field ?? "",
-              mergeMessageField: form.merge_message_field ?? "",
-            });
+      const message = manualMark
+        ? ""
+        : await composeMergeMessage(c, found, issue, checked, {
+            style: form.do,
+            mergeTitleField: form.merge_title_field ?? "",
+            mergeMessageField: form.merge_message_field ?? "",
+          });
       const { commitOid } = await mergePullRequestEngine(c, found, issue, checked, {
         style: form.do,
         message,

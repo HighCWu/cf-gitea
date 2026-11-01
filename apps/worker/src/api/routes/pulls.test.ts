@@ -24,8 +24,9 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
-import { comments, issueAssignees, issues, pullRequests, userBlocking, users, repositories } from "../../db/schema";
+import { comments, issueAssignees, issueDependencies, issues, pullAutoMerges, pullRequests, repoUnits, userBlocking, users, repositories } from "../../db/schema";
 import { IssuesService } from "../../issues/service";
+import { CommentType } from "../../issues/comment-types";
 import { carryRepoCell } from "../../repos/carry";
 import { RepoService } from "../../repos/service";
 import { ZERO_OID, branchRef, engineReads, refTipMap } from "../services/engine";
@@ -54,11 +55,14 @@ beforeEach(async () => {
     "issue_subscriptions",
     "issue_pins",
     "pull_requests",
+    "pull_auto_merges",
     "comments",
     "issue_assignees",
+    "issue_dependency",
     "issues",
     "action",
     "repo_counters",
+    "repo_units",
     "user_blocking",
     "repositories",
     "users",
@@ -863,5 +867,148 @@ describe("POST /repos/{owner}/{repo}/pulls: the bare head grammar follows the fo
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ message: "not found", url: ERROR_URL });
     expect(await db().select().from(pullRequests).all()).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /repos/{owner}/{repo}/pulls/{index}/merge — the schedule, manual-mark
+// and dependency arms (the migration-0059 salvage). Upstream pins:
+//   - MWCS → ScheduleAutoMerge → the bare 201 (api pull.go:994-1007), a
+//     standing row → the 409 (IsErrAlreadyScheduledToAutoMerge,
+//     models/pull/automerge.go:43-45);
+//   - do=manually-merged → MergedManually, whose FIRST gate is the PR unit's
+//     AllowManualMerge (merge.go:755-759, default FALSE repo_unit.go:139-155)
+//     → APIErrorAuto 400 (ErrInvalidMergeStyle unwraps to ErrInvalidArgument,
+//     merge.go:231-233), the commit resolution 400s "commit not found in base
+//     repository" (merge.go:761-771);
+//   - the deps arm is CheckPullMergeable's FINAL check (check.go:219-223),
+//     never skipped for the Auto type (only the branch-protection failure is,
+//     check.go:184-186) — a deps-blocked PR refuses to schedule.
+// ---------------------------------------------------------------------------
+
+describe("POST /pulls/{index}/merge: the schedule / manual / dependency arms", () => {
+  /** One mergeable PR through the real create flow (real engine branches:
+   *  feature = main + one commit). */
+  async function seedMergeablePr(slug: string): Promise<{ repoId: string; mainTip: string; index: number; issueId: number }> {
+    const repoId = await seedRepo(1, "cf-gitea-stub", slug);
+    await seedEngineBranches("cf-gitea-stub", slug, []);
+    const tips = refTipMap(await engineReads(env, { ownerNamespace: "cf-gitea-stub", slug }).listRefs());
+    const mainTip = tips.get(branchRef("main"))?.target;
+    if (mainTip === undefined) throw new Error("seed main missing");
+    await seedFeatureAhead("cf-gitea-stub", slug, mainTip);
+    const create = await router()(`/repos/cf-gitea-stub/${slug}/pulls`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "merge me", head: "feature", base: "main" }),
+    });
+    expect(create.status).toBe(201);
+    const row = await db().select().from(issues).all();
+    expect(row).toHaveLength(1);
+    return { repoId, mainTip, index: row[0]!.index, issueId: Number(row[0]!.id) };
+  }
+
+  /** The PR unit row with AllowManualMerge armed (the setting the mark's
+   *  style gate reads; repo-settings.ts's Go-marshal config JSON). */
+  async function seedManualMergeAllowed(repoId: string): Promise<void> {
+    await db().insert(repoUnits).values({ repoId, type: "pull_requests", config: JSON.stringify({ AllowManualMerge: true }) });
+  }
+
+  it("schedules with merge_when_checks_succeed: bare 201, the row, the type-34 comment, the first check enqueue — and a second call 409s (pull.go:994-1007)", async () => {
+    const slug = "mwcs201";
+    const { index, issueId } = await seedMergeablePr(slug);
+    const first = await router()(`/repos/cf-gitea-stub/${slug}/pulls/${index}/merge`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ do: "merge", merge_when_checks_succeed: true }),
+    });
+    expect(first.status).toBe(201);
+    expect(await first.text()).toBe(""); // ctx.Status(201) — the EMPTY body
+    const rows = await db().select().from(pullAutoMerges).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ issueId, doerId: 1, mergeStyle: "merge", deleteBranchAfterMerge: false });
+    const commentRows = await db().select().from(comments).all();
+    expect(commentRows.some((row) => row.type === CommentType.PRScheduledToAutoMerge)).toBe(true);
+    // The PR is NOT merged by the schedule call.
+    expect((await db().select().from(pullRequests).all())[0]).toMatchObject({ hasMerged: false });
+    // A standing row conflicts: IsErrAlreadyScheduledToAutoMerge's 409, the
+    // row KEPT (no delete-first — that reset is the WEB handler's shape).
+    const second = await router()(`/repos/cf-gitea-stub/${slug}/pulls/${index}/merge`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ do: "merge", merge_when_checks_succeed: true }),
+    });
+    expect(second.status).toBe(409);
+    expect(await second.json()).toEqual({
+      message: `pull request is already scheduled to auto merge when checks succeed [pull_id: ${issueId}]`,
+      url: ERROR_URL,
+    });
+    expect(await db().select().from(pullAutoMerges).all()).toHaveLength(1);
+  });
+
+  it("refuses to schedule a deps-blocked PR: the final CheckPullMergeable arm precedes ScheduleAutoMerge (check.go:219-223) — 405 pr_close_blocked, no row", async () => {
+    const slug = "mwcsdeps";
+    const { repoId, index, issueId } = await seedMergeablePr(slug);
+    // An OPEN blocker issue in the same repo — IssueNoDependenciesLeft's
+    // blocked-by edge (models/issues/dependency.go:190-199).
+    const blocker = await service().createIssue({
+      repoId,
+      title: "blocker",
+      posterId: 1,
+      content: null,
+      labelIds: [],
+      milestoneId: null,
+    });
+    await db().insert(issueDependencies).values({ userId: 1, issueId, dependencyId: Number(blocker.id), createdAt: new Date() });
+    const res = await router()(`/repos/cf-gitea-stub/${slug}/pulls/${index}/merge`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ do: "merge", merge_when_checks_succeed: true }),
+    });
+    expect(res.status).toBe(405);
+    expect(await res.json()).toEqual({
+      message: "You need to close all issues that are blocking this pull request before you can merge it.",
+      url: ERROR_URL,
+    });
+    expect(await db().select().from(pullAutoMerges).all()).toHaveLength(0);
+  });
+
+  it("answers the default-false AllowManualMerge with APIErrorAuto's 400 (merge.go:755-759 via pull.go:953-960) and never validates the commit", async () => {
+    const slug = "manualoff";
+    const { index } = await seedMergeablePr(slug);
+    const res = await router()(`/repos/cf-gitea-stub/${slug}/pulls/${index}/merge`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ do: "manually-merged" }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json<{ message: string }>()).message).toContain("merge strategy is not allowed or is invalid");
+    expect((await db().select().from(pullRequests).all())[0]).toMatchObject({ hasMerged: false });
+  });
+
+  it("marks manually once the setting is armed: 200, the merged row, and MWCS on the same body is overridden by the mark (pull.go:923-928)", async () => {
+    const slug = "manualon";
+    const { repoId, index, mainTip } = await seedMergeablePr(slug);
+    await seedManualMergeAllowed(repoId);
+    const res = await router()(`/repos/cf-gitea-stub/${slug}/pulls/${index}/merge`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ do: "manually-merged", merge_commit_id: mainTip, merge_when_checks_succeed: true }),
+    });
+    expect(res.status).toBe(200); // the mark answers BEFORE the schedule branch
+    expect(await db().select().from(pullAutoMerges).all()).toHaveLength(0);
+    expect((await db().select().from(pullRequests).all())[0]).toMatchObject({ hasMerged: true, mergedCommitId: mainTip });
+  });
+
+  it("400s an armed mark whose merge_commit_id is absent (MergedManually's GetCommit on the empty ref, merge.go:761-771)", async () => {
+    const slug = "manualnoid";
+    const { repoId, index } = await seedMergeablePr(slug);
+    await seedManualMergeAllowed(repoId);
+    const res = await router()(`/repos/cf-gitea-stub/${slug}/pulls/${index}/merge`, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ do: "manually-merged" }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ message: "commit not found in base repository", url: ERROR_URL });
   });
 });

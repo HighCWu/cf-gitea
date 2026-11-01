@@ -24,12 +24,14 @@ import { findPullRequestByIndex } from "../../api/services/pulls";
 import { ZERO_OID, branchRef, engineReads, refTipMap, pullHeadRef } from "../../api/services/engine";
 import {
   comments,
+  issueDependencies,
   issues,
   PRFlow,
   PRStatus,
   protectedBranches,
   pullRequests,
   pullReviews,
+  repoUnits,
   repositories,
   ReviewType,
   users,
@@ -1003,6 +1005,10 @@ describe("the web write arms", () => {
     const okOid = await landCommit(pair, branchRef("okbranch"), { parents: [rootOid], message: "ok work", fileName: "ok.ts", content: "ok\n" });
     await landCommit(pair, branchRef("release"), { parents: [rootOid], message: "release cut", fileName: "VERSION", content: "1.0.0\n" });
     await env.REPO.getByName("alice/wrepo").setHead("main");
+    // The write repo's PR unit with AllowManualMerge armed — the mark's style
+    // gate (merge.go:755-759, default FALSE) reads it on every manual POST
+    // and the loader reads it for the styles array.
+    await d1().insert(repoUnits).values({ repoId: repo.id, type: "pull_requests", config: JSON.stringify({ AllowManualMerge: true }) });
 
     // The PR rows. ok/manual/behind get real pull refs below; the refusal
     // fixtures refuse before any engine read matters.
@@ -1349,6 +1355,182 @@ describe("the web write arms", () => {
     expect(await changeTargetBranchFromWeb(await writeCtx("fresh", cara), parseTargetBranchForm(new URLSearchParams({ target_branch: "release" })))).toEqual({
       outcome: "not-found",
     });
+  });
+
+  it("refuses the manual mark while AllowManualMerge is the default FALSE (MergedManually's IsMergeStyleAllowed gate, merge.go:755-759 → the pull.go:1101-1102 flash)", async () => {
+    // A dedicated repo WITHOUT the unit row — the defaults answer, and the
+    // default is FALSE (repo_unit.go:139-155 never sets the flag).
+    const repo = await new RepoService(env.DB).create({
+      owner: { id: alice.id, usernameLower: "alice" },
+      name: "manualoff",
+      isPrivate: false,
+      status: "ready",
+    });
+    const { issue, pullRequest } = await new IssuesService(env.DB).createPullRequest({
+      repoId: repo.id,
+      title: "misc: manualoff",
+      posterId: bob.id,
+      headRepoId: repo.id,
+      baseBranch: "main",
+      headBranch: "feature",
+      now: new Date((T0 + 220) * 1000),
+    });
+    const ctx: PullMergeBoxWriteContext = {
+      c: new Context(new Request(`${ORIGIN}/alice/manualoff/pulls/${pullRequest.index}`, { method: "POST" }), { env }),
+      repo: (await d1().select().from(repositories).where(eq(repositories.id, repo.id)).all())[0]!,
+      issue,
+      pr: pullRequest,
+      viewer: alice,
+    };
+    expect(await mergePullRequestFromWeb(ctx, mergeFormOf({ do: "manually-merged", merge_commit_id: rootOid }))).toEqual({
+      outcome: "error",
+      message: "You cannot use this merge option for this pull request.",
+    });
+    const after = (await findPullRequestByIndex(env.DB, repo.id, pullRequest.index))!;
+    expect(after.pullRequest.hasMerged).toBe(false);
+  });
+
+  it("refuses to schedule a deps-blocked PR (the final CheckPullMergeable arm precedes the schedule, web pull.go:1056→1135) and renders the blocker + the disabled submit", async () => {
+    await seedWritePr("amdeps", { title: "feat: amdeps", headBranch: "feature" }, { headSha: featureOid });
+    const index = await writeIndex("amdeps");
+    const found = (await findPullRequestByIndex(env.DB, writeRepoId, index))!;
+    const blocker = await new IssuesService(env.DB).createIssue({ repoId: writeRepoId, title: "deps blocker", posterId: bob.id, now: new Date((T0 + 221) * 1000) });
+    await d1()
+      .insert(issueDependencies)
+      .values({ userId: alice.id, issueId: found.issue.id, dependencyId: Number(blocker.id), createdAt: new Date((T0 + 222) * 1000) });
+    // The POST refuses before any row lands — the pr_close_blocked flash.
+    expect(await mergePullRequestFromWeb(await writeCtx("amdeps", alice), mergeFormOf({ merge_when_checks_succeed: "true" }))).toEqual({
+      outcome: "error",
+      message: "You need to close all issues that are blocking this pull request before you can merge it.",
+    });
+    expect(await getScheduledAutoMerge(env.DB, found.issue.id)).toBeNull();
+    // The render: the blocker item rides the first section and the submit
+    // is disabled (the readiness gate the write ladder enforces).
+    const data = await loadPullMergeBoxData(env.DB, {
+      repo: await writeRepoOf(),
+      issue: found.issue,
+      pr: found.pullRequest,
+      viewer: alice,
+      origin: ORIGIN,
+      listTips: (pair) => engineReads(env, pair).listRefs(),
+    });
+    expect(data!.mergeForm!.blockedByDependencies).toBe(true);
+    const html = pullMergeBoxFragmentHtml(data);
+    expect(html).toContain("You need to close all issues that are blocking this pull request before you can merge it.");
+    expect(html).toContain("disabled");
+  });
+
+  it("projects the stored styles allowlist, the default-style ladder and the per-style prefill (pull_merge_form.go:29-46/126-170)", async () => {
+    // wrepo's unit row arms only AllowManualMerge over the defaults — every
+    // default style stays allowed, so the full six-style array renders and
+    // the ladder answers the stored DefaultMergeStyle ("merge" by default).
+    await seedWritePr("styles", { title: "feat: styles", headBranch: "feature" }, { headSha: featureOid });
+    const found = (await findPullRequestByIndex(env.DB, writeRepoId, await writeIndex("styles")))!;
+    const data = await loadPullMergeBoxData(env.DB, {
+      repo: await writeRepoOf(),
+      issue: found.issue,
+      pr: found.pullRequest,
+      viewer: alice,
+      origin: ORIGIN,
+      listTips: (pair) => engineReads(env, pair).listRefs(),
+    });
+    expect(data!.mergeForm!.styles.map((style) => style.name)).toEqual([
+      "merge",
+      "rebase",
+      "rebase-merge",
+      "squash",
+      "fast-forward-only",
+      "manually-merged",
+    ]);
+    expect(data!.mergeForm!.defaultStyle).toBe("merge");
+    // The SELECTED style's prefill — the merge sentence (composeMergeMessage's
+    // default arm shape, re-issued for the render).
+    expect(data!.mergeForm!.defaultTitle).toBe(`Merge pull request 'feat: styles' (#${await writeIndex("styles")}) from feature into main`);
+
+    // A restricted allowlist + a non-default DefaultMergeStyle: the ladder
+    // preselects the stored style when allowed, and the prefill flips to the
+    // squash shape (GetDefaultMergeMessage's per-style switch).
+    const repo = await new RepoService(env.DB).create({
+      owner: { id: alice.id, usernameLower: "alice" },
+      name: "styles2",
+      isPrivate: false,
+      status: "ready",
+    });
+    await d1().insert(repoUnits).values({
+      repoId: repo.id,
+      type: "pull_requests",
+      config: JSON.stringify({ AllowMerge: false, AllowRebaseMerge: false, AllowFastForwardOnly: false, AllowManualMerge: false, DefaultMergeStyle: "squash" }),
+    });
+    const { pullRequest } = await new IssuesService(env.DB).createPullRequest({
+      repoId: repo.id,
+      title: "squash me",
+      posterId: bob.id,
+      headRepoId: repo.id,
+      baseBranch: "main",
+      headBranch: "feature",
+      now: new Date((T0 + 223) * 1000),
+    });
+    // Past the checking state (the styles array's IsStatusMergeable gate).
+    await d1().update(pullRequests).set({ status: PRStatus.Mergeable }).where(eq(pullRequests.id, pullRequest.id));
+    const fresh2 = (await findPullRequestByIndex(env.DB, repo.id, pullRequest.index))!;
+    const data2 = await loadPullMergeBoxData(env.DB, {
+      repo: (await d1().select().from(repositories).where(eq(repositories.id, repo.id)).all())[0]!,
+      issue: fresh2.issue,
+      pr: fresh2.pullRequest,
+      viewer: alice,
+      origin: ORIGIN,
+      listTips: (pair) => engineReads(env, pair).listRefs(),
+    });
+    expect(data2!.mergeForm!.styles.map((style) => style.name)).toEqual(["rebase", "squash"]);
+    expect(data2!.mergeForm!.defaultStyle).toBe("squash");
+    expect(data2!.mergeForm!.defaultTitle).toBe(`squash me (#${pullRequest.index})`);
+
+    // An EMPTY allowlist renders no form — the no_merge_desc/no_merge_helper
+    // blocker pair replaces it (pull_merge_form.go:171-180).
+    const repo3 = await new RepoService(env.DB).create({
+      owner: { id: alice.id, usernameLower: "alice" },
+      name: "styles3",
+      isPrivate: false,
+      status: "ready",
+    });
+    await d1().insert(repoUnits).values({
+      repoId: repo3.id,
+      type: "pull_requests",
+      config: JSON.stringify({
+        AllowMerge: false,
+        AllowRebase: false,
+        AllowRebaseMerge: false,
+        AllowSquash: false,
+        AllowFastForwardOnly: false,
+        AllowManualMerge: false,
+      }),
+    });
+    const issue3 = await new IssuesService(env.DB).createPullRequest({
+      repoId: repo3.id,
+      title: "no styles",
+      posterId: bob.id,
+      headRepoId: repo3.id,
+      baseBranch: "main",
+      headBranch: "feature",
+      now: new Date((T0 + 224) * 1000),
+    });
+    // Past the checking state so the spinner blocker does not ride the
+    // section under assertion.
+    await d1().update(pullRequests).set({ status: PRStatus.Mergeable }).where(eq(pullRequests.id, issue3.pullRequest.id));
+    const fresh3 = (await findPullRequestByIndex(env.DB, repo3.id, issue3.pullRequest.index))!;
+    const data3 = await loadPullMergeBoxData(env.DB, {
+      repo: (await d1().select().from(repositories).where(eq(repositories.id, repo3.id)).all())[0]!,
+      issue: fresh3.issue,
+      pr: fresh3.pullRequest,
+      viewer: alice,
+      origin: ORIGIN,
+      listTips: (pair) => engineReads(env, pair).listRefs(),
+    });
+    expect(data3!.mergeForm).toBeNull();
+    expect(sectionOf(data3!, 0).map((item) => item.info)).toEqual([
+      "This pull request cannot be merged because all repository merge options are disabled.",
+      "Enable merge options in the repository settings or merge the pull request manually.",
+    ]);
   });
 });
 

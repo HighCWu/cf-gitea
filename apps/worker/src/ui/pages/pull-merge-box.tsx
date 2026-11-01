@@ -219,7 +219,7 @@ import type { RefsResult } from "@cf-gitea/git-engine";
 
 import { latestCommitStatuses, combinedStateOf } from "../../api/services/commit-status";
 import type { CommitStatusState } from "../../api/models/commit-status";
-import { hasWorkInProgressPrefix } from "../../api/services/issues";
+import { hasWorkInProgressPrefix, issueNoDependenciesLeft } from "../../api/services/issues";
 import type { User } from "../../api/models/user";
 import type { ApiEnv } from "../../api/env";
 import { ApiError } from "../../api/errors";
@@ -235,6 +235,7 @@ import {
 } from "../../api/services/pull-engine";
 import { findPullRequestByIndex, toApiPullRequest } from "../../api/services/pulls";
 import { findRepositoryById, toApiRepository } from "../../api/services/repository";
+import { loadRepoSettings } from "../../api/services/repo-settings";
 import { ActionType, recordAction } from "../../api/services/activity-feeds";
 import { emitIssueEvent } from "../../services/issue-events";
 import {
@@ -328,6 +329,9 @@ export const pullMergeWriteLocale = {
   rebase_merge_commit_pull_request: "Rebase, then create merge commit", // "repo.pulls.rebase_merge_commit_pull_request"
   squash_merge_pull_request: "Create squash commit", // "repo.pulls.squash_merge_pull_request"
   fast_forward_only_merge_pull_request: "Fast-forward only", // "repo.pulls.fast_forward_only_merge_pull_request"
+  merge_manually: "Manually merged", // "repo.pulls.merge_manually"
+  no_merge_desc: "This pull request cannot be merged because all repository merge options are disabled.", // "repo.pulls.no_merge_desc"
+  no_merge_helper: "Enable merge options in the repository settings or merge the pull request manually.", // "repo.pulls.no_merge_helper"
   commit_message_desc: "Add an optional extended description…", // "repo.editor.commit_message_desc"
   merge_commit_id: "The merge commit ID", // "repo.pulls.merge_commit_id"
   branch_delete_button: "Delete Branch", // "repo.branch.delete_html" (the merged box's cleanup button)
@@ -345,6 +349,7 @@ export const pullMergeWriteLocale = {
   has_merged: "Failed: The pull request has been merged. You cannot merge again or change the target branch.", // "repo.pulls.has_merged"
   no_merge_wip: "This pull request cannot be merged because it is marked as being a work in progress.", // "repo.pulls.no_merge_wip"
   no_merge_not_ready: "This pull request is not ready to be merged. Check review status and status checks.", // "repo.pulls.no_merge_not_ready"
+  dependencies_left: "You need to close all issues that are blocking this pull request before you can merge it.", // "repo.issues.dependency.pr_close_blocked"
   update_not_allowed: "You are not allowed to update branch", // "repo.pulls.update_not_allowed" (ErrNoPermissionToMerge's arm)
   invalid_merge_option: "You cannot use this merge option for this pull request.", // "repo.pulls.invalid_merge_option"
   wrong_commit_id: "commit ID must be a commit ID on the target branch", // "repo.pulls.wrong_commit_id"
@@ -533,16 +538,24 @@ mergeForm: {
   /** The `force_merge` hidden input's v-model (the Vue computed:
    *  `canMergeNow && !allOverridableChecksOk`). */
   forceMerge: boolean;
-  /** The allowed styles (the PR-unit allowlist defaults: merge/rebase/
-   *  rebase-merge/squash always, fast-forward-only when the row is not
-   *  behind — pull_merge_form.go:147-163 over repo_unit.go's defaults;
-   *  manually-merged stays excluded, AllowManualMerge defaults false). */
+  /** The allowed styles (the PR-unit allowlist — pull_merge_form.go:126-170:
+   *  each Allow* flag gates its entry, fast-forward-only also needs
+   *  CommitsBehind == 0, and manually-merged rides canUseManualMerge =
+   *  !WIP && !IsChecking && AllowManualMerge). */
   styles: { name: string; text: string; hideMessageFields: boolean }[];
-  /** The preselected `do` (the DefaultMergeStyle default, "merge"). */
+  /** The preselected `do` — prepareMergeBoxFormProps's ladder: the stored
+   *  DefaultMergeStyle when its style is allowed, else the first allowed
+   *  (pull_merge_form.go:29-46). */
   defaultStyle: string;
-  /** The title field's prefill — the default style's composed default
-   *  (composeMergeMessage's default arm, re-issued for the render). */
+  /** The title field's prefill — the SELECTED style's composed default
+   *  (GetDefaultMergeMessage's per-style shape, re-issued for the render:
+   *  mergeTitleFieldText on the merge/rebase-merge/squash entries,
+   *  pull_merge_form.go:128/146/152). */
   defaultTitle: string;
+  /** The unresolved-dependency readiness gate — the write ladder's
+   *  issueNoDependenciesLeft arm (check.go:219-223): true disables the
+   *  submit, the pr_close_blocked message riding the box's blocker item. */
+  blockedByDependencies: boolean;
   /** The delete checkbox (the Vue `isPullBranchDeletable`). */
   isPullBranchDeletable: boolean;
   /** The checkbox label's branch target (the `textDeleteBranch` arg). */
@@ -1207,20 +1220,74 @@ export async function loadPullMergeBoxData(d1: D1Database, input: PullMergeBoxIn
   }
 
   // --- the write-arm data (the census gap #2 section) ----------------------
-  // The merge form's allowed styles (prepareMergeBoxFormProps over the PR-unit
-  // defaults — merge/rebase/rebase-merge/squash always, fast-forward-only
-  // when the head is not behind, pull_merge_form.go:147-163;
-  // manually-merged stays excluded, AllowManualMerge defaults false,
-  // repo_unit.go:127). The preselected style is the DefaultMergeStyle
-  // default ("merge", repo_unit.go:152-153).
+  // The merge form's allowed styles — prepareMergeBoxFormProps's mergeStyles
+  // array (pull_merge_form.go:126-170) over the STORED PR-unit allowlist
+  // (repo_settings.ts's PullRequestsConfig, upstream repo_unit.go:119-137's
+  // Go-marshal keys): each Allow* flag gates its entry, fast-forward-only
+  // additionally needs CommitsBehind == 0 (:161), and manually-merged rides
+  // canUseManualMerge = !WIP && !IsChecking && AllowManualMerge (:162-168).
+  // The PR-unit config has its D1 home now (the repo_units config store), so
+  // the old config-defaults reduction is retired.
+  const prConfig = (await loadRepoSettings(d1, repo.id)).prUnit;
   const ffAllowed = (pr.commitsBehind ?? 0) === 0;
+  // The five default styles render only for a status-mergeable or empty PR
+  // (pull_merge_form.go:126's `IsStatusMergeable() || IsEmpty()` array gate);
+  // manually-merged appends OUTSIDE it — the feature exists to close out
+  // non-mergeable (conflicted) work, pull_merge_form.go:158-163.
+  const stylesRenderable = isMergeable || isEmpty;
   const styleOptions: { name: string; text: string; hideMessageFields: boolean }[] = [
-    { name: "merge", text: pullMergeWriteLocale.merge_pull_request, hideMessageFields: false },
-    { name: "rebase", text: pullMergeWriteLocale.rebase_merge_pull_request, hideMessageFields: true },
-    { name: "rebase-merge", text: pullMergeWriteLocale.rebase_merge_commit_pull_request, hideMessageFields: false },
-    { name: "squash", text: pullMergeWriteLocale.squash_merge_pull_request, hideMessageFields: false },
-    ...(ffAllowed ? [{ name: "fast-forward-only", text: pullMergeWriteLocale.fast_forward_only_merge_pull_request, hideMessageFields: true }] : []),
+    ...(stylesRenderable && prConfig.AllowMerge ? [{ name: "merge", text: pullMergeWriteLocale.merge_pull_request, hideMessageFields: false }] : []),
+    ...(stylesRenderable && prConfig.AllowRebase ? [{ name: "rebase", text: pullMergeWriteLocale.rebase_merge_pull_request, hideMessageFields: true }] : []),
+    ...(stylesRenderable && prConfig.AllowRebaseMerge
+      ? [{ name: "rebase-merge", text: pullMergeWriteLocale.rebase_merge_commit_pull_request, hideMessageFields: false }]
+      : []),
+    ...(stylesRenderable && prConfig.AllowSquash ? [{ name: "squash", text: pullMergeWriteLocale.squash_merge_pull_request, hideMessageFields: false }] : []),
+    ...(stylesRenderable && prConfig.AllowFastForwardOnly && ffAllowed
+      ? [{ name: "fast-forward-only", text: pullMergeWriteLocale.fast_forward_only_merge_pull_request, hideMessageFields: true }]
+      : []),
+    // The manual mark's render arm (pull_merge_form.go:162-168): the settings
+    // gate AND the WIP/checking exclusions, hideMergeMessageTexts +
+    // hideAutoMerge like upstream.
+    ...(!isWorkInProgress && !isChecking && prConfig.AllowManualMerge
+      ? [{ name: "manually-merged", text: pullMergeWriteLocale.merge_manually, hideMessageFields: true }]
+      : []),
   ];
+  // The preselected style — prepareMergeBoxFormProps's ladder (pull_merge_form
+  // .go:29-46): the stored DefaultMergeStyle when allowed, else the first
+  // allowed entry (the fallback walks merge → rebase → rebase-merge → squash
+  // → fast-forward-only → manually-merged, which is styleOptions' own order).
+  const defaultStyle = styleOptions.some((style) => style.name === prConfig.DefaultMergeStyle)
+    ? prConfig.DefaultMergeStyle
+    : (styleOptions[0]?.name ?? "");
+  // An EMPTY allowlist renders no form: the no_merge_desc/no_merge_helper
+  // blocker pair replaces it — pull_merge_form.go:171-180's `else if
+  // (IsStatusMergeable || IsEmpty)` branch, so the pair explains a MERGEABLE
+  // PR whose every style is disabled (a non-mergeable row's state blockers
+  // already do; a non-writer sees only the access item, the builder's
+  // hasPermToMerge early return).
+  if (hasPermToMerge && styleOptions.length === 0 && stylesRenderable) {
+    commitBlockers.push({ icon: "octicon-x", info: pullMergeWriteLocale.no_merge_desc, listItems: [] });
+    commitBlockers.push({ icon: "octicon-info", info: pullMergeWriteLocale.no_merge_helper, listItems: [] });
+    infoSections[0] = commitBlockers;
+  }
+  // The unresolved-dependency readiness gate — the write ladder's
+  // issueNoDependenciesLeft arm (check.go:219-223, the merge POST's
+  // ErrDependenciesLeft → pr_close_blocked flash, web pull.go:1088-1090),
+  // surfaced as the commit-blocker item + the disabled submit below. Upstream's
+  // box itself renders no deps item (the deps list is the issue sidebar's,
+  // BlockedByDependencies over issue_dependencies.tmpl, issue_view.go:501-507);
+  // this gate is the box's readiness face for the same condition the POST
+  // refuses.
+  const blockedByDependencies = hasPermToMerge && !(await issueNoDependenciesLeft(d1, issue.id));
+  if (blockedByDependencies) {
+    commitBlockers.push({
+      icon: "octicon-x",
+      iconClass: "tw-text-red",
+      info: pullMergeWriteLocale.dependencies_left,
+      listItems: [],
+    });
+    infoSections[0] = commitBlockers;
+  }
   // The delete-branch checkbox + the merged-box twin's gate
   // (prepareMergeBoxDeleteBranch for the open arm: canDelete + the branch
   // exists — no tip check and no shared-head check until closed).
@@ -1251,17 +1318,23 @@ export async function loadPullMergeBoxData(d1: D1Database, input: PullMergeBoxIn
     infoSections,
     isWorkInProgress,
     commands,
-    mergeForm: hasPermToMerge
+    mergeForm: hasPermToMerge && styleOptions.length > 0
       ? {
           issueLink,
           headCommitId: pr.headSha ?? "",
           forceMerge: canMergeNow && hasOverridableBlockers, // the Vue forceMerge computed
           styles: styleOptions,
-          defaultStyle: "merge",
-          defaultTitle: defaultMergeTitleOf(issue, pr, headRepo === null ? null : headRepo.repo, "merge"),
+          defaultStyle,
+          // The SELECTED style's composed default (GetDefaultMergeMessage's
+          // per-style shape — the write ladder's composeMergeMessage default
+          // arm, re-issued for the render): merge/rebase-merge carry the
+          // merge sentence, squash the `{title} (#{index})` shape, rebase ""
+          // (the hidden-fields styles never show it).
+          defaultTitle: defaultMergeTitleOf(issue, pr, headRepo === null ? null : headRepo.repo, defaultStyle),
           isPullBranchDeletable: openBranchDeletable,
           headTarget,
           mergeWhenChecksSucceed: !canMergeNow, // the Vue autoMergeWhenSucceed reduction
+          blockedByDependencies,
           pendingAutoMerge: await pendingAutoMergeOf(d1, issue.id),
         }
       : null,
@@ -1507,7 +1580,7 @@ export function PullMergeBoxFragment(props: { data: PullMergeBoxData }) {
                     </select>
                   </div>
                   <div class="flex-text-block tw-gap-3">
-                    <button type="submit" class="ui primary button">
+                    <button type="submit" class="ui primary button" disabled={data.mergeForm.blockedByDependencies}>
                       {selectedMergeStyle(data.mergeForm).text}
                       {data.mergeForm.mergeWhenChecksSucceed ? ` ${pullMergeWriteLocale.auto_merge_button_when_succeed}` : null}
                     </button>
@@ -1790,16 +1863,24 @@ export async function mergePullRequestFromWeb(ctx: PullMergeBoxWriteContext, for
     return { outcome: "error", message: pullMergeWriteLocale.update_not_allowed };
   }
   // The manual short-circuit (check.go:162-165): manually-merged skips the
-  // WIP / mergeable-state / protection checks entirely — and the MWCS branch
-  // never reaches it (the manual mark returns before pull.go:1135 upstream).
+  // WIP / mergeable-state / protection checks entirely (the MWCS branch never
+  // reaches it — the manual mark returns before pull.go:1135 upstream) and
+  // lands in MergedManually, whose FIRST gate is the style-allowed check —
+  // gated below on the PR unit's AllowManualMerge.
   if (form.do !== "manually-merged") {
     if (hasWorkInProgressPrefix(ctx.issue.title)) {
       return { outcome: "error", message: pullMergeWriteLocale.no_merge_wip };
     }
     // The mergeable precondition runs the lazy check (the API route's pass).
     const checked = await ensurePullRequestChecked(api, pair, ctx.pr);
-    if (checked.hasMerged || checked.status === PRStatus.Ancestor) {
+    if (checked.hasMerged) {
       return { outcome: "error", message: pullMergeWriteLocale.has_merged };
+    }
+    // Ancestor is NOT IsStatusMergeable (models/issues/pull.go:446-448) —
+    // CheckPullMergeable answers it ErrNotMergeableState, whose flash is the
+    // not-ready text (pull.go:1082-1088), NOT ErrHasMerged's has_merged.
+    if (checked.status === PRStatus.Ancestor) {
+      return { outcome: "error", message: pullMergeWriteLocale.no_merge_not_ready };
     }
     // THE SCHEDULE ARM (pull.go:1135-1149): merge_when_checks_succeed
     // schedules instead of merging — the Auto check type's one relaxation is
@@ -1811,6 +1892,13 @@ export async function mergePullRequestFromWeb(ctx: PullMergeBoxWriteContext, for
     // transaction, services/automerge/automerge.go:84-99), flashes the
     // newly-scheduled text and redirects — the flash rides our bare 303 (the
     // reloaded box renders the pending message + the cancel button).
+    // The Auto CheckPullMergeable call at pull.go:1056 runs the FULL ladder
+    // before this branch — its FINAL deps arm (check.go:219-223) included —
+    // so a deps-blocked PR refuses to schedule with the pr_close_blocked
+    // flash (pull.go:1088-1090):
+    if (!(await issueNoDependenciesLeft(db, ctx.issue.id))) {
+      return { outcome: "error", message: pullMergeWriteLocale.dependencies_left };
+    }
     if (form.mergeWhenChecksSucceed) {
       if (checked.status !== PRStatus.Mergeable && checked.status !== PRStatus.Empty) {
         return { outcome: "error", message: pullMergeWriteLocale.no_merge_not_ready };
@@ -1875,6 +1963,24 @@ export async function mergePullRequestFromWeb(ctx: PullMergeBoxWriteContext, for
       mergeCommitId: form.mergeCommitId === "" ? undefined : form.mergeCommitId,
     });
   }
+  // The manual mark lands in MergedManually, whose FIRST gate is the
+  // style-allowed check (merge.go:755-759): IsMergeStyleAllowed
+  // (ManuallyMerged) = the PR unit's AllowManualMerge, the zero value FALSE
+  // upstream's DefaultPullRequestsConfig never sets (repo_unit.go:139-155).
+  // The web flash for the refusal is invalid_merge_option (pull.go:1101-1102's
+  // IsErrInvalidMergeStyle arm).
+  if (!(await loadRepoSettings(db, ctx.repo.id)).prUnit.AllowManualMerge) {
+    return { outcome: "error", message: pullMergeWriteLocale.invalid_merge_option };
+  }
+  // Style allowed: MergedManually proceeds to the commit verification —
+  // GetCommit(ref) then IsCommitInBranch (merge.go:761-775), both refusals
+  // util.ErrInvalidArgument upstream (pull.go:1103-1105's wrong_commit_id
+  // flash). The engine's manual arm answers the same class ("The merge
+  // commit ..." ApiErrors — mergeEngineErrorMessage maps the prefix), and
+  // MarkAsMerged lands the merged row without touching refs. The mark skips
+  // every ladder arm above (the Manually check type's early return,
+  // check.go:161-165) and never schedules (upstream returns at the mark,
+  // pull.go:1098-1107, before the MWCS branch).
   return runMergeLanding(ctx, {
     api,
     pair,
