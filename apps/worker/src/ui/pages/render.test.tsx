@@ -21,15 +21,34 @@
  * viewer like empty.tmpl: the Quick Guide pins render through the WRITER
  * viewer (owner fixture), and the anonymous + signed-in-reader arms pin the
  * single repo.empty_message segment the template gives every non-writer.
+ *
+ * The file-tree visibility read-back wave (2026-11-02) — the V1 follow-up:
+ * the toggle pair's INITIAL state now feeds the stored
+ * code_view.show_file_tree (ui/pages/file-view.tsx's loadFileTreeVisibility,
+ * threaded by ui/render.tsx's src case). Three describes: the
+ * FileViewPage prop → DOM contract over the stub harness, the reader's
+ * GetUserSetting port semantics over real D1 (absent/"true"/"false"/garbage
+ * + the anonymous zero-read arm), and the route-level feed through the
+ * mounted uiRouter over a REAL seeded repo (stored-true/stored-false/
+ * rowless/anonymous, the stored-false-ignored-for-anonymous posture).
  */
 
-import { describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { renderToString } from "hono/jsx/dom/server";
+import { env } from "cloudflare:test";
+import { and, eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
 
+import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
+import { userSettingsKv, users } from "../../db/schema";
+import { uiEnv } from "../__tests__/harness";
 import type { EngineClient } from "../engine";
 import { enrichTreeCommits, ENRICH_MAX } from "../page-data";
 import type { RefsResult, TreeEntryJson, CommitJson } from "@cf-gitea/git-engine";
-import { loadFileViewData, FileViewPage } from "./file-view";
+import { uiRouter } from "../index";
+import { mintSession, SESSION_COOKIE_NAME } from "../session";
+import { ensureSeededRepo, type SeedCommit } from "../testing/seed-repo";
+import { loadFileTreeVisibility, loadFileViewData, FileViewPage } from "./file-view";
 import { loadHomeData, HomePage, resolveHeadBranch } from "./home";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
@@ -695,5 +714,251 @@ describe("the tree-root button row (view_content.tmpl's Go-to-File / Add-File / 
     expect(writer).toContain('href="/octocat/hello/compare/main...main?expand=1"');
     expect(writer).toContain('data-tooltip-content="New Pull Request"');
     expect(writer).toContain("octicon-git-pull-request");
+  });
+});
+
+// --- the file-tree toggle pair's INITIAL state (the showFileTree prop) --------
+
+/**
+ * The FileViewPage prop → DOM contract (view_file_tree.tmpl:1's container
+ * conditional + view_file_tree_toggle_button.tmpl's show-button
+ * conditional): tree visible ⇒ the container renders plain and the SHOW
+ * button carries `tw-hidden` (its collapse icon hidden — the hide button
+ * inside the container is the live control); tree hidden ⇒ the container
+ * carries `tw-hidden` and the show button renders plain. The default
+ * (prop absent) is upstream's GetUserSetting default true — the anonymous
+ * golden's posture.
+ */
+describe("the file-tree toggle pair's initial state (view_file_tree.tmpl's UserSettingCodeViewShowFileTree)", () => {
+  /** A blob-view page over the stub engine's README.md (the markup arm). */
+  async function blobHtml(showFileTree: boolean | undefined): Promise<string> {
+    const engine = stubEngine();
+    const data = await loadFileViewData(engine, repo, ctx.origin, "branch/main/README.md");
+    if (!("kind" in data) || data.kind !== "blob") throw new Error("expected blob data");
+    return renderToString(<FileViewPage ctx={ctx} data={data} showFileTree={showFileTree} />);
+  }
+
+  const CONTAINER_SHOWN = '<div class="repo-view-file-tree-container">';
+  const CONTAINER_HIDDEN = '<div class="repo-view-file-tree-container tw-hidden">';
+  const SHOW_HIDDEN =
+    'class="repo-view-file-tree-toggle ui button not-mobile tw-hidden" data-global-click="onRepoViewFileTreeToggle" data-toggle-action="show"';
+  const SHOW_VISIBLE =
+    'class="repo-view-file-tree-toggle ui button not-mobile" data-global-click="onRepoViewFileTreeToggle" data-toggle-action="show"';
+  const HIDE_BUTTON =
+    'class="repo-view-file-tree-toggle ui button" data-global-click="onRepoViewFileTreeToggle" data-toggle-action="hide"';
+
+  it("renders the tree VISIBLE with the hide button's initial shape for showFileTree true (the stored-true posture)", async () => {
+    const html = await blobHtml(true);
+    expect(html).toContain(CONTAINER_SHOWN);
+    expect(html).not.toContain(CONTAINER_HIDDEN);
+    expect(html).toContain(HIDE_BUTTON);
+    expect(html).not.toContain('class="repo-view-file-tree-toggle ui button tw-hidden"');
+    expect(html).toContain(SHOW_HIDDEN);
+    expect(html).not.toContain(SHOW_VISIBLE);
+  });
+
+  it("renders the tree HIDDEN with the visible show button for showFileTree false (the stored-false posture)", async () => {
+    const html = await blobHtml(false);
+    expect(html).toContain(CONTAINER_HIDDEN);
+    expect(html).not.toContain(CONTAINER_SHOWN);
+    expect(html).toContain(SHOW_VISIBLE);
+    expect(html).not.toContain(SHOW_HIDDEN);
+    // The hide button's MARKUP still renders inside the hidden container —
+    // upstream's template does the same (the container's class hides it).
+    expect(html).toContain(HIDE_BUTTON);
+  });
+
+  it("renders the DEFAULT (prop absent) as the default-true posture — the GetUserSetting default, the anonymous golden's bytes", async () => {
+    const html = await blobHtml(undefined);
+    expect(html).toContain(CONTAINER_SHOWN);
+    expect(html).not.toContain(CONTAINER_HIDDEN);
+    expect(html).toContain(SHOW_HIDDEN);
+    expect(html).not.toContain(SHOW_VISIBLE);
+  });
+});
+
+// --- the KV read-back: loadFileTreeVisibility (the GetUserSetting port) --------
+
+/** The seed both D1-backed describes ride (the README.md blob view is the
+ *  feed's route target). */
+const TREEVIS_COMMITS: SeedCommit[] = [
+  {
+    message: "seed: readme for the tree-visibility read-back",
+    time: 1_700_000_000,
+    files: [{ path: "README.md", content: "# filetree\n" }],
+  },
+];
+
+/**
+ * The reader's semantics over REAL D1 (view_home.go:360-371 verbatim):
+ * anonymous answers true WITHOUT a store read; a signed-in viewer reads the
+ * one user_settings_kv row — an absent row (never toggled) defaults SHOWED
+ * (GetUserSetting's "true" default), a stored "true" shows, a stored
+ * "false" hides, and any other bytes hide (strconv.ParseBool's error arm
+ * lands false; our writer stores only FormatBool's exact bytes).
+ */
+describe("loadFileTreeVisibility (view_home.go prepareHomeTreeSideBarSwitch's read-back)", () => {
+  const TREEVIS_KEY = "code_view.show_file_tree";
+
+  let aliceId: number;
+  beforeAll(async () => {
+    await applyAuthD1Migrations();
+    // A dedicated slug (the harness convention — never another file's repo
+    // rows); the ENGINE push is irrelevant to the reader but the D1 owner
+    // row it provisions is the fixture.
+    await ensureSeededRepo({
+      owner: "alice",
+      slug: "filetree",
+      commits: TREEVIS_COMMITS,
+    });
+    const alice = await drizzle(env.DB)
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.usernameLower, "alice"))
+      .get();
+    if (alice === undefined) throw new Error("tree-visibility fixture owner missing");
+    aliceId = alice.id;
+  });
+
+  beforeEach(async () => {
+    await drizzle(env.DB)
+      .delete(userSettingsKv)
+      .where(and(eq(userSettingsKv.userId, aliceId), eq(userSettingsKv.settingKey, TREEVIS_KEY)));
+  });
+
+  async function store(value: string): Promise<void> {
+    await drizzle(env.DB)
+      .insert(userSettingsKv)
+      .values({ userId: aliceId, settingKey: TREEVIS_KEY, settingValue: value })
+      .onConflictDoUpdate({ target: [userSettingsKv.userId, userSettingsKv.settingKey], set: { settingValue: value } });
+  }
+
+  it("answers true for an anonymous viewer without consulting the store", async () => {
+    // A stored row for a DIFFERENT user exists — the anonymous arm never
+    // reads, so it cannot see it (upstream's `ctx.Doer == nil` → true).
+    await store("false");
+    expect(await loadFileTreeVisibility(env.DB, { kind: "anonymous" })).toBe(true);
+  });
+
+  it("answers true for a signed-in user with no row (GetUserSetting's 'true' default — never toggled)", async () => {
+    expect(await loadFileTreeVisibility(env.DB, { kind: "user", id: aliceId, username: "alice", isAdmin: false })).toBe(true);
+  });
+
+  it("carries the stored 'true' (tree shown) and 'false' (tree hidden) bytes", async () => {
+    await store("true");
+    expect(await loadFileTreeVisibility(env.DB, { kind: "user", id: aliceId, username: "alice", isAdmin: false })).toBe(true);
+    await store("false");
+    expect(await loadFileTreeVisibility(env.DB, { kind: "user", id: aliceId, username: "alice", isAdmin: false })).toBe(false);
+  });
+
+  it("hides on garbage bytes (strconv.ParseBool's error arm lands false; the writer only stores FormatBool's)", async () => {
+    await store("yes");
+    expect(await loadFileTreeVisibility(env.DB, { kind: "user", id: aliceId, username: "alice", isAdmin: false })).toBe(false);
+  });
+});
+
+// --- the route-level feed: the src case threads the stored visibility ----------
+
+/**
+ * The whole feed through the mounted uiRouter over a REAL seeded repo:
+ * parse → resolve → load → renderUiPage's src case → loadFileTreeVisibility
+ * → FileViewPage. The stored bytes shape the blob view's initial DOM; a
+ * tree-kind view (no sidebar) renders regardless and stays at the default
+ * posture; anonymous renders the default-true posture even when SOME user's
+ * stored row says false (the Doer-nil arm ignores the store).
+ */
+describe("the src feed's showFileTree thread (renderUiPage over the seeded repo)", () => {
+  const TREEVIS_KEY = "code_view.show_file_tree";
+
+  let aliceId: number;
+  let aliceCookie: string;
+
+  beforeAll(async () => {
+    await applyAuthD1Migrations();
+    await ensureSeededRepo({
+      owner: "alice",
+      slug: "filetree",
+      commits: TREEVIS_COMMITS,
+    });
+    const alice = await drizzle(env.DB)
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.usernameLower, "alice"))
+      .get();
+    if (alice === undefined) throw new Error("tree-visibility fixture owner missing");
+    aliceId = alice.id;
+    aliceCookie = await mintSession(env.DB, aliceId);
+  });
+
+  beforeEach(async () => {
+    await drizzle(env.DB)
+      .delete(userSettingsKv)
+      .where(and(eq(userSettingsKv.userId, aliceId), eq(userSettingsKv.settingKey, TREEVIS_KEY)));
+  });
+
+  async function store(value: string): Promise<void> {
+    await drizzle(env.DB)
+      .insert(userSettingsKv)
+      .values({ userId: aliceId, settingKey: TREEVIS_KEY, settingValue: value })
+      .onConflictDoUpdate({ target: [userSettingsKv.userId, userSettingsKv.settingKey], set: { settingValue: value } });
+  }
+
+  /** The real production path for the blob view (the mount, no execution
+   *  context — resolveViewer settles its background work inline). */
+  async function srcGet(cookie?: string): Promise<{ status: number; html: string }> {
+    const res = await uiRouter.fetch(
+      new Request("https://test.local/alice/filetree/src/branch/main/README.md", {
+        headers: {
+          origin: "https://test.local",
+          ...(cookie !== undefined ? { cookie: `${SESSION_COOKIE_NAME}=${cookie}` } : {}),
+        },
+      }),
+      uiEnv,
+    );
+    return { status: res.status, html: await res.text() };
+  }
+
+  it("a stored-true user's blob view renders 200 with the tree visible + the hide button's initial shape", async () => {
+    await store("true");
+    const { status, html } = await srcGet(aliceCookie);
+    expect(status).toBe(200);
+    expect(html).toContain('<div class="repo-view-file-tree-container">');
+    expect(html).not.toContain('<div class="repo-view-file-tree-container tw-hidden">');
+    expect(html).toContain(
+      'class="repo-view-file-tree-toggle ui button" data-global-click="onRepoViewFileTreeToggle" data-toggle-action="hide"',
+    );
+    expect(html).toContain(
+      'class="repo-view-file-tree-toggle ui button not-mobile tw-hidden" data-global-click="onRepoViewFileTreeToggle" data-toggle-action="show"',
+    );
+  });
+
+  it("a stored-false user's blob view renders the tree hidden + the show button", async () => {
+    await store("false");
+    const { status, html } = await srcGet(aliceCookie);
+    expect(status).toBe(200);
+    expect(html).toContain('<div class="repo-view-file-tree-container tw-hidden">');
+    expect(html).not.toContain('<div class="repo-view-file-tree-container">');
+    expect(html).toContain(
+      'class="repo-view-file-tree-toggle ui button not-mobile" data-global-click="onRepoViewFileTreeToggle" data-toggle-action="show"',
+    );
+  });
+
+  it("a signed-in user with NO row renders the default-true posture (never toggled = the 'true' default)", async () => {
+    const { status, html } = await srcGet(aliceCookie);
+    expect(status).toBe(200);
+    expect(html).toContain('<div class="repo-view-file-tree-container">');
+    expect(html).not.toContain('<div class="repo-view-file-tree-container tw-hidden">');
+    expect(html).toContain('data-toggle-action="show" data-tooltip-content="Show file tree"');
+  });
+
+  it("anonymous renders the default-true posture even when a stored row says false (the Doer-nil arm ignores the store)", async () => {
+    await store("false");
+    const { status, html } = await srcGet();
+    expect(status).toBe(200);
+    expect(html).toContain('<div class="repo-view-file-tree-container">');
+    expect(html).not.toContain('<div class="repo-view-file-tree-container tw-hidden">');
+    expect(html).toContain(
+      'class="repo-view-file-tree-toggle ui button not-mobile tw-hidden" data-global-click="onRepoViewFileTreeToggle" data-toggle-action="show"',
+    );
   });
 });

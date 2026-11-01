@@ -39,17 +39,25 @@
  * `{codeViewShowFileTree}` to /user/settings/update_preferences for a
  * signed-in user (the landed KV write, ui/index.ts). The rendered INITIAL
  * state rides the optional `showFileTree` prop (default true —
- * view_home.go:360-371's GetUserSetting default): the read-back from the
- * user_settings_kv store is a REPORTED follow-up (render.tsx's one-line
- * `showFileTree={…}` thread — render.tsx is outside this module's wave
- * ownership), so every render currently uses the default-true posture and
- * the pair renders only on BLOB views (the only views whose sidebar
- * exists — a toggle with no container would be a dead control).
+ * view_home.go:360-371's GetUserSetting default) fed by render.tsx's src
+ * case through `loadFileTreeVisibility` — the user_settings_kv READ-BACK
+ * of the toggle POST's stored bytes (the follow-up V1 reported; upstream's
+ * defaults stand: anonymous and never-toggled users see the tree, a stored
+ * "false" hides it — view_home.go:360-371 verbatim). The pair renders only
+ * on BLOB views (the only views whose sidebar exists — a toggle with no
+ * container would be a dead control), so the read-back runs on blob views
+ * only; a tree view costs zero KV reads. The blame (blame.go:65) and edit
+ * (editor.go:44) sidebars ride the same upstream switch — their pages'
+ * threading is a disclosed follow-up (outside this module's wave
+ * ownership); their FileTreeSidebar calls stay at the default-true posture.
  */
 
 import type { CommitJson, TreeEntryJson } from "@cf-gitea/git-engine";
 import { MAX_BLAME_BYTES, MAX_BLAME_LINES } from "@cf-gitea/git-engine";
+import { and, eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
 
+import { userSettingsKv } from "../../db/schema";
 import { BranchSelector } from "../components/branch-selector";
 import { FileContentView, type MediaKind } from "../components/file-content";
 import { RepoFilesTable } from "../components/file-list";
@@ -71,6 +79,7 @@ import {
 } from "../page-data";
 import { BaseLayout, Icon } from "../shell";
 import type { UiContext } from "../ui-context";
+import type { Viewer } from "../viewer";
 import { resolveHeadBranch, type ResolvedRefs } from "./home";
 
 /** The file/tree view render inputs, loaded by loadFileViewData. */
@@ -140,7 +149,11 @@ function probeIsLfsFile(blobData: Uint8Array): boolean {
  *  same view_file_tree beside its form. The button row leads with upstream's
  *  hide-toggle (view_file_tree.tmpl:3-8 — the class/data contract verbatim:
  *  the bundle's onRepoViewFileTreeToggle flips the container client-side and
- *  POSTs the preference for a signed-in user; see the module header). */
+ *  POSTs the preference for a signed-in user; see the module header). The
+ *  container's `tw-hidden` rides the `showFileTree` prop (view_file_tree.tmpl:1
+ *  — `{{if not .UserSettingCodeViewShowFileTree}}tw-hidden{{end}}`; default
+ *  true, so the blame/editor consumers that have not threaded the read-back
+ *  yet keep today's exact bytes). */
 export function FileTreeSidebar(props: {
   repoLink: string;
   refType: RefType;
@@ -148,9 +161,10 @@ export function FileTreeSidebar(props: {
   dirPath: string;
   siblings: readonly TreeEntryJson[];
   activeName: string;
+  showFileTree?: boolean;
 }) {
   return (
-    <div class="repo-view-file-tree-container">
+    <div class={`repo-view-file-tree-container${props.showFileTree === false ? " tw-hidden" : ""}`}>
       <div class="flex-text-block repo-button-row">
         <button
           type="button"
@@ -363,6 +377,37 @@ export async function loadFileViewData(
   };
 }
 
+/** The generic user-settings KV key upstream names
+ *  SettingsKeyCodeViewShowFileTree (models/user/setting_options.go:19) — the
+ *  same string ui/index.ts's update_preferences POST writes. Declared here
+ *  (not imported) because ui/index.ts is the router module this file must
+ *  not reach into; the two spellings cite each other. */
+const SETTINGS_KEY_CODE_VIEW_SHOW_FILE_TREE = "code_view.show_file_tree";
+
+/**
+ * view_home.go:360-371 `prepareHomeTreeSideBarSwitch`'s read-back over the
+ * user_settings_kv store the toggle POST writes (ui/index.ts's
+ * userSettingsUpdatePreferences): the blob sidebar's INITIAL visibility.
+ * Upstream verbatim: anonymous — `showFileTree := true` with NO store read
+ * (the template-data arm for `ctx.Doer == nil`); a signed-in user —
+ * GetUserSetting(key, "true")'s default, so an absent row (never toggled)
+ * keeps the tree SHOWN, and the stored bytes decide otherwise (`"true"`
+ * shows; anything else hides — strconv.ParseBool's error arm lands false,
+ * and our writer stores only FormatBool's exact bytes). Tree views consume
+ * nothing (no sidebar) — render.tsx calls this on blob views only.
+ */
+export async function loadFileTreeVisibility(d1: D1Database, viewer: Viewer): Promise<boolean> {
+  if (viewer.kind !== "user") return true;
+  const row = await drizzle(d1)
+    .select({ settingValue: userSettingsKv.settingValue })
+    .from(userSettingsKv)
+    .where(
+      and(eq(userSettingsKv.userId, viewer.id), eq(userSettingsKv.settingKey, SETTINGS_KEY_CODE_VIEW_SHOW_FILE_TREE)),
+    )
+    .get();
+  return row === undefined || row.settingValue === "true";
+}
+
 /**
  * The file/tree view page. §2.4.1 discriminators: the upstream view.tmpl
  * base `repository file list`, extended with `view file` on blob views
@@ -379,9 +424,10 @@ export async function loadFileViewData(
  *
  * The toggle-pair's show button (view_file_tree_toggle_button.tmpl — the
  * `repo-view-file-tree-toggle` emitter beside the container, blob views
- * only) renders with the `tw-hidden` state the optional `showFileTree` prop
- * carries (default true — the GetUserSetting default, view_home.go:363-370;
- * the read-back thread is the reported render.tsx follow-up, module header).
+ * only) renders with the `tw-hidden` state the `showFileTree` prop carries
+ * (default true — the GetUserSetting default, view_home.go:363-370;
+ * render.tsx's src case feeds the user_settings_kv read-back through
+ * loadFileTreeVisibility, module header).
  */
 export function FileViewPage(props: { ctx: UiContext; data: FileViewData; canWrite?: boolean; showFileTree?: boolean }) {
   const { ctx, data } = props;
@@ -468,6 +514,7 @@ export function FileViewPage(props: { ctx: UiContext; data: FileViewData; canWri
             dirPath={parentDirOf(data.treePath)}
             siblings={data.siblings}
             activeName={data.treePath.split("/").pop() ?? ""}
+            showFileTree={showFileTree}
           />
           <div class="repo-view-content">
             <FileContentView

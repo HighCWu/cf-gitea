@@ -13,7 +13,7 @@ import { engineClient } from "./engine";
 import { renderPage } from "./shell";
 import { canWriteRepo } from "./pages/file-editor";
 import { CommitsPage, loadCommitsData } from "./pages/commits";
-import { FileViewPage, loadFileViewData } from "./pages/file-view";
+import { FileViewPage, loadFileTreeVisibility, loadFileViewData } from "./pages/file-view";
 import { HomePage, loadHomeData } from "./pages/home";
 import { RepoMigratingPage, loadRepoMigratingData } from "./pages/repo-migrating";
 import { NotFoundPage } from "./pages/not-found";
@@ -86,7 +86,17 @@ export async function renderUiPage(options: {
       // anonymous resolves false with zero D1 reads, so the golden renders
       // stay byte-stable.
       const canWrite = repo.isArchived ? false : await canWriteRepo(env, repo, ctx.viewer);
-      return { status: 200, html: renderPage(<FileViewPage ctx={ctx} data={data} canWrite={canWrite} />) };
+      // The file-tree toggle pair's INITIAL state: the user_settings_kv
+      // read-back of the stored code_view.show_file_tree (view_home.go's
+      // prepareHomeTreeSideBarSwitch :360-371 — V1's reported follow-up,
+      // now landed). Blob views only (the only views whose sidebar exists);
+      // anonymous answers true with ZERO D1 reads (the resolveViewer cost
+      // posture), a signed-in viewer costs one indexed point read.
+      const showFileTree = data.kind === "blob" ? await loadFileTreeVisibility(env.DB, ctx.viewer) : true;
+      return {
+        status: 200,
+        html: renderPage(<FileViewPage ctx={ctx} data={data} canWrite={canWrite} showFileTree={showFileTree} />),
+      };
     }
   }
 }
