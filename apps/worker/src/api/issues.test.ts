@@ -451,6 +451,58 @@ describe("POST /repos/{owner}/{repo}/issues (issueCreateIssue)", () => {
     expect(deliveries[0]!.payloadContent).toContain('\n  "action": "opened"');
   });
 
+  it("412s closed=true when an OPEN dependency blocks the close — the create arm's issue-only text (issue.go:643-652)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const blocker = await seedIssue(repoId, "blocker"); // stays open
+    const hookId = await seedHook(repoId, ["issues"]);
+
+    // The API surface cannot attach a dependency at create time (no
+    // create-time field — upstream's arm is equally defensive), so the edge
+    // for the request's issue is pre-seeded: fresh per-test DB, the blocker
+    // is this test's first issue row, the POST's issue is the very next
+    // autoincrement id — the exact blocking shape the moment the row lands.
+    await db().insert(issueDependencies).values({
+      userId: 1,
+      issueId: blocker.id + 1,
+      dependencyId: blocker.id,
+      createdAt: new Date(),
+    });
+
+    const res = await router()("/repos/Alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "born blocked", closed: true }),
+    });
+    expect(res.status).toBe(412);
+    // DISTINCT from the PATCH family's "issue or pull request" message.
+    expect(await res.json()).toEqual({
+      message: "cannot close this issue because it still has open dependencies",
+      url: ERROR_URL,
+    });
+
+    // The issue was created, the close never ran: open, no close comment.
+    const created = (await db().select().from(issues).where(eq(issues.repoId, repoId)).all()).find(
+      (row) => row.index === 2,
+    );
+    expect(created?.isClosed).toBe(false);
+    expect(await db().select().from(comments).where(eq(comments.issueId, created!.id)).all()).toHaveLength(0);
+
+    // Only the opened webhook fired — no closed event for the failed close.
+    const actions = (await deliveriesFor(hookId)).map((d) => (JSON.parse(d.payloadContent) as { action: string }).action);
+    expect(actions).toEqual(["opened"]);
+
+    // A resolved blocker lets the closed=true create close normally.
+    await service().closeIssue(blocker.id);
+    const ok = await router()("/repos/Alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "born closable", closed: true }),
+    });
+    expect(ok.status).toBe(201);
+    expect((await ok.json<{ state: string }>()).state).toBe("closed");
+  });
+
   it("renders the opened payload issue block null/null (the ToAPIIssue emission witness — the create route drops assignees)", async () => {
     // Upstream's NewIssue (notifier.go:305) renders the opened payload issue
     // through the SHARED ToAPIIssue — for a fresh unassigned issue that is
@@ -1018,6 +1070,97 @@ describe("PATCH /repos/{owner}/{repo}/issues/{index} (issueEditIssue)", () => {
     });
   });
 
+  it("412s the close when an OPEN dependency blocks it — the PATCH-family text (issue.go:981-989), and closes once the blocker resolves", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const blocker = await seedIssue(repoId, "blocker");
+    const issue = await seedIssue(repoId, "blocked", { posterId: 1 });
+    await db().insert(issueDependencies).values({
+      userId: 1,
+      issueId: issue.id,
+      dependencyId: blocker.id,
+      createdAt: new Date(),
+    });
+
+    const res = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ state: "closed" }),
+    });
+    expect(res.status).toBe(412);
+    // DISTINCT from the create arm's issue-only message (:643-652).
+    expect(await res.json()).toEqual({
+      message: "cannot close this issue or pull request because it still has open dependencies",
+      url: ERROR_URL,
+    });
+
+    // The transition never ran: still open, no close comment, counter unmoved.
+    expect((await db().select().from(issues).where(eq(issues.id, issue.id)).get())?.isClosed).toBe(false);
+    expect(await db().select().from(comments).where(eq(comments.issueId, issue.id)).all()).toHaveLength(0);
+    expect((await db().select().from(repositories).where(eq(repositories.id, repoId)).get())?.numClosedIssues).toBe(0);
+
+    // A resolved blocker unblocks the close.
+    await service().closeIssue(blocker.id);
+    const ok = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ state: "closed" }),
+    });
+    expect(ok.status).toBe(201);
+    expect((await ok.json<{ state: string }>()).state).toBe("closed");
+  });
+
+  it("gates the PR close on open dependencies too — the shared SetIssueAsClosed seam (the pulls-PATCH twin maps the same text)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const blocker = await seedIssue(repoId, "blocker");
+    const pull = await service().createPullRequest({
+      repoId,
+      headRepoId: repoId,
+      baseBranch: "main",
+      headBranch: "topic",
+      title: "blocked pr",
+      posterId: 1,
+    });
+    await db().insert(issueDependencies).values({
+      userId: 1,
+      issueId: pull.issue.id,
+      dependencyId: blocker.id,
+      createdAt: new Date(),
+    });
+
+    const close = await router()(`/repos/alice/visible/issues/${pull.issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ state: "closed" }),
+    });
+    expect(close.status).toBe(412);
+    expect(await close.json()).toEqual({
+      message: "cannot close this issue or pull request because it still has open dependencies",
+      url: ERROR_URL,
+    });
+    expect((await db().select().from(issues).where(eq(issues.id, pull.issue.id)).get())?.isClosed).toBe(false);
+
+    // The REOPEN direction is never gated (issue_update.go:65) — an open PR
+    // PATCHed to "open" is a no-op 201 with no error.
+    const noop = await router()(`/repos/alice/visible/issues/${pull.issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ state: "open" }),
+    });
+    expect(noop.status).toBe(201);
+
+    // Resolving the blocker lets the PR close through the same seam.
+    await service().closeIssue(blocker.id);
+    const ok = await router()(`/repos/alice/visible/issues/${pull.issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ state: "closed" }),
+    });
+    expect(ok.status).toBe(201);
+    expect((await db().select().from(issues).where(eq(issues.id, pull.issue.id)).get())?.isClosed).toBe(true);
+  });
+
   it("keeps the unmerged-PR state arms working through the issues route", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible");
@@ -1180,6 +1323,59 @@ describe("PATCH /repos/{owner}/{repo}/issues/{index} (issueEditIssue)", () => {
       body: JSON.stringify({ title: "x" }),
     });
     expect(missing.status).toBe(404);
+  });
+
+  it("a write-collaborator edits a NON-POSTER issue and the assignee arm APPLIES (the async CanWriteIssuesOrPulls grant, issue.go:706/:772)", async () => {
+    // The stub identity is neither poster (bob) nor owner (alice): before the
+    // async-grant flip the sync matrix answered the bare 403 and the assignee
+    // arm silently skipped — only the write-mode collaborator row
+    // (GetDoerRepoPermission's collaborator arm, repo_permission.go:448-508)
+    // ranks it a writer now.
+    const owner = await seedUser("Alice");
+    const bob = await seedUser("Bob");
+    const neighbor = await seedUser("neighbor");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
+    await seedIssue(repoId, "bobs issue", { posterId: bob.id });
+    const hookId = await seedHook(repoId, ["issue_assign"]);
+
+    const edit = await router()("/repos/alice/visible/issues/1", {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "writer-collab rename" }),
+    });
+    expect(edit.status).toBe(201);
+    expect((await edit.json<{ title: string }>()).title).toBe("writer-collab rename");
+
+    // The assignee arm rides the SAME resolved canWrite as the
+    // deadline/milestone arms — it applies instead of silently skipping.
+    const assigned = await router()("/repos/alice/visible/issues/1", {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ assignees: [neighbor.usernameLower] }),
+    });
+    expect(assigned.status).toBe(201);
+    const edges = await db().select().from(issueAssignees).all();
+    expect(edges).toHaveLength(1);
+    expect(edges[0]?.assigneeId).toBe(neighbor.id);
+    expect((await deliveriesFor(hookId)).map((d) => d.eventType)).toEqual(["issue_assign"]);
+  });
+
+  it("a read-collaborator still 403s the non-poster edit (the grant ranks read only)", async () => {
+    const owner = await seedUser("Alice");
+    const bob = await seedUser("Bob");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    await db()
+      .insert(repoCollaborators)
+      .values({ repoId, userId: 1, mode: "read", createdAt: new Date(), updatedAt: new Date() });
+    await seedIssue(repoId, "bobs issue", { posterId: bob.id });
+
+    const res = await router()("/repos/alice/visible/issues/1", {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "hijack" }),
+    });
+    expect(res.status).toBe(403);
+    expect((await res.json<{ message: string }>()).message).toBe("");
   });
 
   it("423s archived repositories", async () => {
@@ -1713,6 +1909,42 @@ describe("PATCH /repos/{owner}/{repo}/issues/comments/{id} (issueEditComment)", 
     expect(stubEditsBobs.status).toBe(403);
   });
 
+  it("a write-collaborator edits ANOTHER USER's comment (poster-OR-writer, services/issue/issue.go:322-336 via CanSelfChangeOrAccessContent)", async () => {
+    const alice = await seedUser("Alice");
+    const bob = await seedUser("Bob");
+    const repoId = await seedRepo(alice.usernameLower, "visible", { stubWriter: true });
+    const bobIssue = await seedIssue(repoId, "bobs", { posterId: bob.id });
+    const bobComment = await service().addComment({ issueId: bobIssue.id, posterId: bob.id, content: "bob's" });
+
+    // Same identity shape as the 403 pin above, plus the write-mode
+    // collaborator row: the comment edit flips from the bare 403 to 200.
+    const res = await router()(`/repos/alice/visible/issues/comments/${bobComment.id}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "collab edit" }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ id: bobComment.id, body: "collab edit" });
+  });
+
+  it("a read-collaborator still 403s another user's comment edit (the grant ranks read only)", async () => {
+    const alice = await seedUser("Alice");
+    const bob = await seedUser("Bob");
+    const repoId = await seedRepo(alice.usernameLower, "visible");
+    await db()
+      .insert(repoCollaborators)
+      .values({ repoId, userId: 1, mode: "read", createdAt: new Date(), updatedAt: new Date() });
+    const bobIssue = await seedIssue(repoId, "bobs", { posterId: bob.id });
+    const bobComment = await service().addComment({ issueId: bobIssue.id, posterId: bob.id, content: "bob's" });
+
+    const res = await router()(`/repos/alice/visible/issues/comments/${bobComment.id}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "read-collab hijack" }),
+    });
+    expect(res.status).toBe(403);
+  });
+
   it("422s an empty and an absent body (EditIssueCommentOption's binding:\"Required\" fires in the bind middleware, structs/issue_comment.go:45)", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible");
@@ -1766,6 +1998,34 @@ describe("DELETE /repos/{owner}/{repo}/issues/comments/{id} (issueDeleteComment)
     const res = await router()(`/repos/alice/visible/issues/comments/${closeComment.id}`, { method: "DELETE", headers: authHeaders });
     expect(res.status).toBe(400);
     expect(await db().select().from(comments).all()).toHaveLength(1);
+  });
+
+  it("a write-collaborator deletes ANOTHER USER's comment; a read-collaborator still 403s (the canEditIssue poster-or-writer rule)", async () => {
+    const alice = await seedUser("Alice");
+    const bob = await seedUser("Bob");
+    const writerRepo = await seedRepo(alice.usernameLower, "writable", { stubWriter: true });
+    const bobIssue = await seedIssue(writerRepo, "bobs", { posterId: bob.id });
+    const bobComment = await service().addComment({ issueId: bobIssue.id, posterId: bob.id, content: "bob's" });
+
+    const deleted = await router()(`/repos/alice/writable/issues/comments/${bobComment.id}`, {
+      method: "DELETE",
+      headers: authHeaders,
+    });
+    expect(deleted.status).toBe(204);
+    expect(await db().select().from(comments).all()).toHaveLength(0);
+
+    const readerRepo = await seedRepo(alice.usernameLower, "readable");
+    await db()
+      .insert(repoCollaborators)
+      .values({ repoId: readerRepo, userId: 1, mode: "read", createdAt: new Date(), updatedAt: new Date() });
+    const bobIssue2 = await seedIssue(readerRepo, "bobs too", { posterId: bob.id });
+    const bobComment2 = await service().addComment({ issueId: bobIssue2.id, posterId: bob.id, content: "bob's again" });
+
+    const forbidden = await router()(`/repos/alice/readable/issues/comments/${bobComment2.id}`, {
+      method: "DELETE",
+      headers: authHeaders,
+    });
+    expect(forbidden.status).toBe(403);
   });
 
   it("404s unknown comments", async () => {

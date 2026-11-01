@@ -16,6 +16,7 @@ import { labelExclusiveScope } from "../api/services/labels";
 
 import {
   comments,
+  issueDependencies,
   issueLabels,
   issues,
   labels,
@@ -28,7 +29,7 @@ import {
 } from "../db/schema";
 import { CommentType } from "./comment-types";
 import { IssueAlreadyChangedError, ReleaseAlreadyExistError } from "./errors";
-import { ellipsisDisplayString, IssuesService, MAX_TITLE_DISPLAY_WIDTH } from "./service";
+import { DependenciesLeftError, ellipsisDisplayString, IssuesService, MAX_TITLE_DISPLAY_WIDTH } from "./service";
 import { applyIssuesD1Migrations } from "./testing/apply-d1-migrations";
 import { branchFilterAllows, emitWebhookDeliveries, webhookEventGroup, webhookHasEvent } from "./webhooks";
 
@@ -40,6 +41,7 @@ const RESET_TABLES = [
   "webhooks",
   "releases",
   "comments",
+  "issue_dependency",
   "issue_labels",
   "issues",
   "milestones",
@@ -225,6 +227,76 @@ describe("§4.2 close/reopen CAS", () => {
     const repo = await repoRow(repoId);
     expect(repo.numClosedPulls).toBe(1);
     expect(repo.numClosedIssues).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The SetIssueAsClosed dependency arm (models/issues/issue_update.go:62-72):
+// IssueNoDependenciesLeft checked on the CLOSE direction only, before the CAS
+// batch — a blocked close writes nothing.
+// ---------------------------------------------------------------------------
+
+describe("close gate: open dependencies (SetIssueAsClosed, issue_update.go:62-72)", () => {
+  it("closeIssue throws DependenciesLeftError (412) on an OPEN blocker and writes nothing", async () => {
+    const repoId = await seedRepo();
+    const svc = service();
+    const blocker = await svc.createIssue({ repoId, title: "blocker" });
+    const issue = await svc.createIssue({ repoId, title: "blocked" });
+    await db()
+      .insert(issueDependencies)
+      .values({ userId: 1, issueId: issue.id, dependencyId: blocker.id, createdAt: new Date() });
+
+    await expect(svc.closeIssue(issue.id)).rejects.toBeInstanceOf(DependenciesLeftError);
+    await expect(svc.closeIssue(issue.id)).rejects.toMatchObject({
+      status: 412,
+      message: "cannot close this issue or pull request because it still has open dependencies",
+    });
+
+    // The gate sits BEFORE the batch: no close comment, no counter drift.
+    expect((await svc.getIssueById(issue.id))?.isClosed).toBe(false);
+    expect(await db().select().from(comments).where(eq(comments.issueId, issue.id)).all()).toHaveLength(0);
+    expect((await repoRow(repoId)).numClosedIssues).toBe(0);
+  });
+
+  it("being the BLOCKER never gates: the reverse-direction edge lets the close through", async () => {
+    const repoId = await seedRepo();
+    const svc = service();
+    const dependent = await svc.createIssue({ repoId, title: "depends on me" });
+    const issue = await svc.createIssue({ repoId, title: "i block someone" });
+    await db()
+      .insert(issueDependencies)
+      .values({ userId: 1, issueId: dependent.id, dependencyId: issue.id, createdAt: new Date() });
+
+    await expect(svc.closeIssue(issue.id)).resolves.toMatchObject({ isClosed: true });
+  });
+
+  it("a RESOLVED blocker closes fine (IssueNoDependenciesLeft)", async () => {
+    const repoId = await seedRepo();
+    const svc = service();
+    const blocker = await svc.createIssue({ repoId, title: "blocker" });
+    const issue = await svc.createIssue({ repoId, title: "blocked" });
+    await db()
+      .insert(issueDependencies)
+      .values({ userId: 1, issueId: issue.id, dependencyId: blocker.id, createdAt: new Date() });
+
+    await svc.closeIssue(blocker.id);
+    await expect(svc.closeIssue(issue.id)).resolves.toMatchObject({ isClosed: true });
+    expect((await repoRow(repoId)).numClosedIssues).toBe(2);
+  });
+
+  it("REOPEN never checks dependencies (the close-only arm, issue_update.go:65)", async () => {
+    const repoId = await seedRepo();
+    const svc = service();
+    const blocker = await svc.createIssue({ repoId, title: "blocker" });
+    const issue = await svc.createIssue({ repoId, title: "closed then blocked" });
+    await svc.closeIssue(issue.id);
+    // The edge appears AFTER the close — exactly the stale-dependency shape
+    // upstream's close-only check exists to permit on reopen.
+    await db()
+      .insert(issueDependencies)
+      .values({ userId: 1, issueId: issue.id, dependencyId: blocker.id, createdAt: new Date() });
+
+    await expect(svc.reopenIssue(issue.id)).resolves.toMatchObject({ isClosed: false });
   });
 });
 

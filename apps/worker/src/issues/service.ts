@@ -41,13 +41,14 @@ import {
 import { CommentType, type CommentTypeValue } from "./comment-types";
 import {
   IssueAlreadyChangedError,
+  IssueError,
   IssueNotExistError,
   MilestoneNotExistError,
   NoSuchLabelError,
   ReleaseAlreadyExistError,
   RepositoryNotExistError,
 } from "./errors";
-import { changeIssueTitle, replaceIssueAssignees } from "../api/services/issues";
+import { changeIssueTitle, issueNoDependenciesLeft, replaceIssueAssignees } from "../api/services/issues";
 import { labelExclusiveScope, removeDuplicateExclusiveLabels } from "../api/services/labels";
 import { findRepositoryById, type RepositoryWithOwner, type UserRow } from "../api/services/repository";
 import {
@@ -238,6 +239,24 @@ export interface ReplaceLabelsResult {
 }
 
 export type MilestoneStateFilter = "open" | "closed" | "all";
+
+/**
+ * 412 — closing an issue/PR that still has an OPEN blocker, the shared
+ * `SetIssueAsClosed` dependency arm (models/issues/issue_update.go:62-72 →
+ * `ErrDependenciesLeft`, models/issues/dependency.go). The class message is
+ * the PATCH-family mapping verbatim ("issue or pull request",
+ * routers/api/v1/repo/issue.go:981-989) — every arm that funnels the error
+ * through `issueErrorToApiError` (the issues-PATCH and pulls-PATCH state
+ * arms) serves it as-is; the create-closed arm remaps to its issue-only
+ * text ("cannot close this issue because …", issue.go:643-652). Colocated
+ * with the transition that throws it, outside the ./errors family file.
+ */
+export class DependenciesLeftError extends IssueError {
+  constructor() {
+    super(412, "cannot close this issue or pull request because it still has open dependencies");
+    this.name = "DependenciesLeftError";
+  }
+}
 
 export class IssuesService {
   private readonly db: DrizzleD1Database;
@@ -546,7 +565,9 @@ export class IssuesService {
 
   /**
    * Close an issue (CAS `WHERE is_closed = 0`), write the close system
-   * comment and move repo/milestone/label counters — all in one batch. The
+   * comment and move repo/milestone/label counters — all in one batch. An
+   * OPEN dependency blocker fails the close first with
+   * `DependenciesLeftError` (412 — the SetIssueAsClosed gate below). The
    * CAS loser gets `IssueAlreadyChangedError` (§4.2 → 409) and its batch has
    * fully no-opped (no stray comment, no counter drift).
    */
@@ -562,6 +583,27 @@ export class IssuesService {
   private async transitionClosed(issueId: number, close: boolean, options: TransitionOptions): Promise<IssueRow> {
     const issue = await this.getIssueById(issueId);
     if (issue === null) throw new IssueNotExistError({ id: issueId });
+    // SetIssueAsClosed's dependency arm (models/issues/issue_update.go:62-72,
+    // via IssueNoDependenciesLeft dependency.go:191-203 — only `issue_id =
+    // this` edges onto an OPEN dependency_id block): close-only, so a reopen
+    // never trips on unsatisfied dependencies (the upstream comment at :65).
+    // The enabled collapse (IssuesConfig.EnableDependencies default true,
+    // models/repo/issue.go:52-57 — the landed no-settings convention) makes
+    // the check unconditional. It sits BEFORE the CAS batch like upstream's
+    // pre-update position, so a blocked close writes NOTHING (no system
+    // comment, no counter drift). Every close seam funnels through here:
+    // create-closed + PATCH state (routes/issues.ts), PATCH pulls state
+    // (routes/pulls.ts — mapped by its asApiError to the same 412 text,
+    // upstream's shared closeOrReopenIssue), the merge close
+    // (api/services/pull-engine.ts — its entry pre-gates the same helper, so
+    // real merges are unaffected; the manually-merged style, which upstream's
+    // CheckPullMergeable skips (check.go:160-165), now fails at the close
+    // exactly like upstream's own merge.go:841 SetIssueAsClosed call), the
+    // push-close (webhooks-push.ts — its bare catch mirrors upstream's
+    // tolerated IsErrDependenciesLeft, pull.go:642/:682).
+    if (close && !(await issueNoDependenciesLeft(this.d1, issueId))) {
+      throw new DependenciesLeftError();
+    }
     const now = options.now ?? new Date();
     const commentType = options.commentType ?? (close ? CommentType.Close : CommentType.Reopen);
     const labelIds = (

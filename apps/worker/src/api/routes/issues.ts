@@ -8,7 +8,7 @@ import { z } from "zod";
 import { issues, pullRequests } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
 import { IssueError, IssueNotExistError, MilestoneNotExistError } from "../../issues/errors";
-import { IssuesService, type IssueRow, type PullRequestRow } from "../../issues/service";
+import { DependenciesLeftError, IssuesService, type IssueRow, type PullRequestRow } from "../../issues/service";
 import type { HookEventType } from "../../issues/webhooks";
 import { emitIssueEvent, issueEventIdentity, issueEventPayload, type IssueEventIdentity } from "../../services/issue-events";
 import { canWriteRepository, isRepositoryAdmin } from "../services/repo-access";
@@ -90,7 +90,6 @@ import {
   findRepositoriesByIds,
   findRepositoryByPath,
   formBool,
-  repositoryPermissions,
   viewerOf,
   type RepositoryWithOwner,
   type UserRow,
@@ -156,8 +155,13 @@ import {
  * `reqRepoReader(unit.TypeIssues)` arm (api.go:1576) AFTER the archived 423,
  * upstream's order. The repo-level /labels and /milestones groups carry NO
  * unit gate upstream (api.go:1675-1688) — reads stay 200 on unit-less repos.
- * The 412 family stays DECLARED-but-unreachable for POST/PATCH issues (the
- * merged-PR arm is PATCH's only live 412).
+ * The 412 family is LIVE on POST/PATCH issues: the merged-PR precondition
+ * (PATCH only) and the close-with-open-dependencies gate — POST closed=true
+ * answers "cannot close this issue because it still has open dependencies"
+ * (issue.go:643-652), PATCH state "cannot close this issue or pull request
+ * because it still has open dependencies" (issue.go:981-989), both mapped
+ * from the shared transition's DependenciesLeftError (the SetIssueAsClosed
+ * dependency arm, models/issues/issue_update.go:62-72).
  *
  * Webhook triggers (SPEC-0005 §3.5): issues opened (POST) / edited (title,
  * body) / closed+reopened (PATCH state) and the comment family (POST
@@ -320,8 +324,11 @@ async function requireIssue(c: Context<ApiEnv>, found: RepositoryWithOwner, rawI
 }
 
 /** Poster-or-writer rule of EditIssue/EditIssueComment (CanWriteIssuesOrPulls
- *  reduced to the landed permission matrix: poster, repo owner, or admin). */
-function canEditIssue(c: Context<ApiEnv>, found: RepositoryWithOwner, posterId: number | null): boolean {
+ *  via the ASYNC collaborator/team-aware grant — canWriteRepository adds the
+ *  write/admin collaborator rows and the write-grade team arms to the owner/
+ *  site-admin matrix, services/issue/issue.go:322-336's poster-OR-AccessMode
+ *  composition): the poster, or any repo writer. */
+async function canEditIssue(c: Context<ApiEnv>, found: RepositoryWithOwner, posterId: number | null): Promise<boolean> {
   const requester = c.get("authUser");
   if (requester === undefined) {
     return false;
@@ -329,8 +336,7 @@ function canEditIssue(c: Context<ApiEnv>, found: RepositoryWithOwner, posterId: 
   if (posterId !== null && requester.id === posterId) {
     return true;
   }
-  const permissions = repositoryPermissions(viewerOf(c), found.repo);
-  return permissions.admin === true || permissions.push === true;
+  return canWriteRepository(c, found);
 }
 
 // ---------------------------------------------------------------------------
@@ -1217,30 +1223,46 @@ export function registerIssueRoutes(
           .returning();
         issue = updated[0] ?? issue;
       }
+      // The opened webhook fires BEFORE the close attempt — upstream's
+      // opened notification rides INSIDE issue_service.NewIssue
+      // (services/issue/issue.go), so the upstream NewIssue → CloseIssue
+      // notify order emits opened even when the close arm below aborts with
+      // the dependencies-left 412. This route drops form.assignee(s) (the
+      // file-header deviation), so a fresh issue's assignee set is ALWAYS
+      // empty and the wire render's null/null is exactly what upstream's
+      // ToAPIIssue (NewIssue:305) would emit for the same fresh issue — the
+      // identities coincide by construction. A future create-assignee wave
+      // must split the paths.
+      await emitIssueEvent(c, {
+        repoId: found.repo.id,
+        ownerId: event.ownerId,
+        eventType: "issues",
+        payload: issueEventPayload(
+          "opened",
+          await toApiIssue(c.env.DB, viewer, found, issue),
+          issue.index,
+          event.repository,
+          event.sender,
+        ),
+      });
       if (form.closed === true) {
         try {
           issue = await service.closeIssue(issue.id, { actorId: requester.id });
         } catch (error) {
+          // The create arm's DISTINCT DependenciesLeftError mapping
+          // (issue.go:643-652): the issue-only text, NOT the PATCH family's
+          // "issue or pull request" message (:981-989).
+          if (error instanceof DependenciesLeftError) {
+            throw new ApiError(412, "cannot close this issue because it still has open dependencies");
+          }
           asApiError(error);
           throw error;
         }
       }
 
-      // ONE render serves the 201 body AND the opened/closed payloads below:
-      // this route drops form.assignee(s) (the file-header deviation), so a
-      // fresh issue's assignee set is ALWAYS empty and the wire render's
-      // null/null is exactly what upstream's ToAPIIssue (NewIssue:305) would
-      // emit for the same fresh issue — the identities coincide by
-      // construction. A future create-assignee wave must split the paths.
+      // The closed emission and the 201 body render the POST-close row
+      // (state closed; on a failed close the handler has already thrown).
       const rendered = await toApiIssue(c.env.DB, viewer, found, issue);
-      // Webhooks: opened (always), then closed (form.closed) — the upstream
-      // NewIssue → CloseIssue notification order.
-      await emitIssueEvent(c, {
-        repoId: found.repo.id,
-        ownerId: event.ownerId,
-        eventType: "issues",
-        payload: issueEventPayload("opened", rendered, issue.index, event.repository, event.sender),
-      });
       if (form.closed === true) {
         await emitIssueEvent(c, {
           repoId: found.repo.id,
@@ -1322,7 +1344,7 @@ export function registerIssueRoutes(
     if (row === null) {
       throw commentNotExistError(commentId);
     }
-    if (!canEditIssue(c, found, row.comment.posterId)) {
+    if (!(await canEditIssue(c, found, row.comment.posterId))) {
       // Upstream answers a bare Status(403); the envelope carries an empty message.
       throw new ApiError(403, "");
     }
@@ -1377,7 +1399,7 @@ export function registerIssueRoutes(
     if (row === null) {
       throw commentNotExistError(commentId);
     }
-    if (!canEditIssue(c, found, row.comment.posterId)) {
+    if (!(await canEditIssue(c, found, row.comment.posterId))) {
       throw new ApiError(403, "");
     }
     if (!commentHasContentSupport(row.comment.type)) {
@@ -1414,7 +1436,7 @@ export function registerIssueRoutes(
     const { viewer, found, units } = await requireVisibleRepo(c, c.req.valid("param"));
     assertNotArchived(found);
     let issue = await requireIssue(c, found, c.req.valid("param").index, units);
-    if (!canEditIssue(c, found, issue.posterId)) {
+    if (!(await canEditIssue(c, found, issue.posterId))) {
       // Upstream answers a bare Status(403); the contract's forbidden family
       // is the {message, url} envelope — sent empty-messageed.
       throw new ApiError(403, "");
@@ -1553,7 +1575,10 @@ export function registerIssueRoutes(
     // form.assignee(s): upstream REPLACES the assignee set the GitHub way
     // (EditIssue → UpdateAssignees, issue.go:772-779 → services/issue/
     // assignee.go:94-166): writer-gated (`canWrite && (Assignees != nil ||
-    // Assignee != nil)`, :772), the requested names validated pre-write by
+    // Assignee != nil)`, :772) on the SAME resolved canWrite as the
+    // deadline/milestone arms — the async collaborator/team-aware grant, so
+    // a write-collaborator's assignee arm applies instead of silently
+    // skipping — the requested names validated pre-write by
     // the shared service (the blocked arm assignee.go:169-170 answers 403
     // "user is blocked"; CanBeAssigned the 400/403 family), then the
     // removals+adds ride the landed issue_assignees table with one type-9
@@ -1566,8 +1591,7 @@ export function registerIssueRoutes(
     // "Assignee does not exist: …" (pull.go:688), the same 422 the landed
     // /assignees routes reply (documented, the shared service's resolution).
     if (
-      (repositoryPermissions(viewerOf(c), found.repo).admin === true ||
-        repositoryPermissions(viewerOf(c), found.repo).push === true) &&
+      canWrite &&
       ((form.assignees !== undefined && form.assignees !== null) || (form.assignee !== undefined && form.assignee !== null))
     ) {
       // The IssuesService fold fans the IssueChangeAssignee mail receiver in
@@ -1606,7 +1630,11 @@ export function registerIssueRoutes(
     // State: the merged precondition first — upstream (repo/issue.go:810-817)
     // 412s ANY state arm on a merged PR (the guard runs before the requested
     // value is examined, so both "closed" and "open" attempts answer 412),
-    // then the CAS-guarded close/reopen transitions.
+    // then the CAS-guarded close/reopen transitions. A blocked close (an
+    // OPEN dependency) rides the transition's DependenciesLeftError through
+    // asApiError → 412 "cannot close this issue or pull request because it
+    // still has open dependencies" (issue.go:981-989 — closeOrReopenIssue's
+    // text, shared with the pulls-PATCH twin).
     const state = patchField(form.state);
     if (state !== undefined && issue.isPull) {
       const pullRequest = await findPullRequestRowByIssueId(c.env.DB, issue.id);
