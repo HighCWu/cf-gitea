@@ -20,6 +20,15 @@
  * hooks/pulls-merge convention); the anonymous 401 is the usual
  * runtime-only class.
  *
+ * THE 58f9890/79a94f9 FLIP: a scheduled row CAN now exist (the web box's
+ * MWCS arm + the cron consumer, migration 0059). The route is the FULL
+ * upstream ladder now: the not-scheduled 404 (the only arm the old stub
+ * could answer), then the cancel-permission check (the SCHEDULER cancels
+ * freely; anyone else needs IsUserAllowedToMerge — the landed two-gate
+ * shape: base write + the rule's merge whitelist, the 403 otherwise), then
+ * RemoveScheduledAutoMerge -> the real 204. The type-35 comment ride is the
+ * web module's; the API cancel is silent like upstream's.
+ *
  * NOTE for the router one-liner: this is the ONLY registration of the DELETE
  * method on /repos/{owner}/{repo}/pulls/{index}/merge — routes/pulls.ts owns
  * the GET/POST pair and must not duplicate it.
@@ -33,6 +42,9 @@ import { z } from "zod";
 import type { ApiEnv } from "../env";
 import { ApiError, apiErrorSchema } from "../errors";
 import { findPullRequestByIndex, pullRequestNotExistError } from "../services/pulls";
+import { getScheduledAutoMerge, removeScheduledAutoMerge } from "../../services/pull-automerge";
+import { findRepositoryById } from "../services/repository";
+import { findRule, isUserMergeWhitelisted, parseRuleConfig, principalAccessOf } from "../../services/branch-protection";
 import { assertPullsUnit } from "../services/issue-unit-gates";
 import { requireVisibleRepo } from "../services/repo-access";
 
@@ -68,9 +80,31 @@ async function cancelScheduledAutoMerge(c: Context<ApiEnv>, owner: string, repo:
   if (row === null) {
     throw pullRequestNotExistError(found.repo.id, index);
   }
-  // No scheduled auto-merge can exist on this backend — upstream's
-  // GetScheduledMergeByPullID exist=false → APIErrorNotFound.
-  throw new ApiError(404, "not found");
+  // GetScheduledMergeByPullID: exist=false → the bare 404 (the old stub's
+  // only reachable arm — still the common case).
+  const scheduled = await getScheduledAutoMerge(c.env.DB, row.issue.id);
+  if (scheduled === null) {
+    throw new ApiError(404, "not found");
+  }
+  // The cancel-permission split (pull.go's ctx.Doer.ID != autoMerge.DoerID):
+  // the SCHEDULER cancels freely; anyone else needs IsUserAllowedToMerge —
+  // the landed two-gate shape (base write + the rule's merge whitelist).
+  // requireAuth guarantees the user; the narrow keeps it cast-free.
+  const authUser = c.get("authUser");
+  if (authUser !== undefined && authUser.id !== scheduled.doerId) {
+    const pair = await findRepositoryById(c.env.DB, found.repo.id);
+    if (pair === null) {
+      throw new ApiError(404, "not found");
+    }
+    const access = await principalAccessOf(c.env.DB, pair.repo, authUser);
+    const rule = await findRule(c.env.DB, found.repo.id, row.pullRequest.baseBranch);
+    const allowed = access.write && (rule === null || (await isUserMergeWhitelisted(c.env.DB, parseRuleConfig(rule.rules), access)));
+    if (!allowed) {
+      throw new ApiError(403, "You are not allowed to remove this scheduled auto merge");
+    }
+  }
+  await removeScheduledAutoMerge(c.env.DB, row.issue, authUser?.id ?? 0, new Date());
+  return c.body(null, 204);
 }
 
 export function registerPullAutoMergeRoutes(
