@@ -175,6 +175,7 @@ describe("GET /.well-known/openid-configuration — the document shape", () => {
       material,
       issuer: oauth2Issuer({ ...env, ...overrides }, ORIGIN),
       appUrl: `${ORIGIN}/`,
+      bucket: env.REPO_PACKS,
       now: NOW(),
     });
     if (!result.ok) throw new Error("mint failed");

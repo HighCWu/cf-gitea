@@ -124,6 +124,7 @@ async function mintForGrant(grant: OAuth2GrantRow, applicationId: number, userId
     material,
     issuer: "https://example.com",
     appUrl: "https://example.com/",
+    bucket: env.REPO_PACKS,
     now: NOW(),
   });
   if (!result.ok) throw new Error("mint failed");
@@ -704,7 +705,11 @@ describe("GET/POST /login/oauth/userinfo (InfoOAuth)", () => {
     expect(body.sub).toBe(String(user.id));
     expect(body.name).toBe("Alice Example");
     expect(body.preferred_username).toBe(user.username);
-    expect(body.picture).toBe(`https://example.com/avatars/${user.username.toLowerCase()}`);
+    // user.AvatarLink parity (oauth2_provider.go:121): the no-custom-avatar
+    // seed lands on the generated-identicon storage key — RESOLVABLE under
+    // /avatars/*, unlike the earlier hand-spelled /avatars/{username} 404.
+    const { hashAvatar } = await import("../services/avatars");
+    expect(body.picture).toBe(`${ORIGIN}/avatars/${await hashAvatar(user.id, user.username)}`);
     expect(body.groups).toBeNull(); // the pin's nil-slice-as-null JSON
   });
 

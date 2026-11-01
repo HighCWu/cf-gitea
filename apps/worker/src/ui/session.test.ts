@@ -1806,6 +1806,45 @@ describe("the 2FA gate — the login ladder (2fa.go over web.go:600-604)", () =>
     expect(await verifyScratchToken(row as NonNullable<typeof row>, scratchToken)).toBe(false);
   });
 
+  it("the scratch arm resumes the link flow's parked re-dance ticket (upstream's completePendingLinks through this arm, 2fa.go:149); other parked targets keep the settings/security pin", async () => {
+    // The LINK park shape (the link-account router's 2FA gate): the gate
+    // ticket's redirectTo slot carries the re-dance URL. A scratch success —
+    // a valid second factor — must resume it or the link strands half-done.
+    const link = await seedUser({ username: "LinkScratch" });
+    const { scratchToken: linkToken } = await seedEnrolled(link, "link-scratch");
+    const dance = "/user/oauth2/OIDC?redirect_to=%2Fafter&oauth2_continue=signin-link";
+    const linkTicket = await mintPendingTicket(env.DB, { kind: "gate", userId: link.id, remember: false, redirectTo: dance });
+    const resumed = await request("/user/two_factor/scratch", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        cookie: `${TWOFA_COOKIE_NAME}=${linkTicket}`,
+        origin: "https://test.local",
+      },
+      body: new URLSearchParams({ token: linkToken }).toString(),
+    });
+    expect(resumed.status).toBe(303);
+    expect(resumed.headers.get("location")).toBe(dance);
+    expect((await drizzle(env.DB).select().from(sessions).all()).length).toBe(1); // minted
+
+    // A LOCAL login's parked target (a plain redirect_to — or the no-park
+    // "/") is NOT a re-dance continuation: upstream's pin holds.
+    const plain = await seedUser({ username: "PlainScratch" });
+    const { scratchToken: plainToken } = await seedEnrolled(plain, "plain-scratch");
+    const plainTicket = await mintPendingTicket(env.DB, { kind: "gate", userId: plain.id, remember: false, redirectTo: "/after" });
+    const pinned = await request("/user/two_factor/scratch", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        cookie: `${TWOFA_COOKIE_NAME}=${plainTicket}`,
+        origin: "https://test.local",
+      },
+      body: new URLSearchParams({ token: plainToken }).toString(),
+    });
+    expect(pinned.status).toBe(303);
+    expect(pinned.headers.get("location")).toBe("/user/settings/security");
+  });
+
   it("the gate POSTs guard the origin (the §2.8 layer-2 rule)", async () => {
     const alice = await seedUser();
     const { pat } = await seedEnrolled(alice);

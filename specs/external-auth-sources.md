@@ -113,7 +113,8 @@ Out of scope (each recorded so it is not silently re-decided):
   `needs2FA` gate, `oauth.go:351-358`) — 2FA landed as SPEC-0022 for the
   local login gate, but external sources carry no local TOTP secret, so
   the config column stays an inert slot (§4.1) until an external-2FA
-  policy re-pin.
+  policy re-pin. AS-BUILT (2026-11-02, the F1 fix — that deferral covered
+  only the provider-signin gate): the link-signin arm itself is now gated per oauth2LinkAccount's deliberate `HasTwoFactorOrWebAuthn` check (linkaccount.go:149-176, skip-local-2FA ignored for a link to a previous user) — the enrolled park carries the re-dance URL as the post-gate target and the gate-minted session's dance callback writes the link (the `completePendingLinks`, linkaccount.go:265-272 parity).
 - **`git credential` OAuth against foreign IdPs** — the provider SPEC's
   builtin applications serve git-credential flows against OUR provider;
   consuming an external IdP for git-HTTP credentials is a later arm,

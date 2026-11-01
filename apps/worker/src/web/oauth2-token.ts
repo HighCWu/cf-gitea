@@ -495,6 +495,7 @@ async function mintResponse(
     clientKey: input.clientKey,
     issuer: oauth2Issuer(c.env, new URL(c.req.url).origin),
     appUrl: appUrlOf(c),
+    bucket: c.env.REPO_PACKS,
     now: new Date(),
     invalidateRefreshTokens: input.rotate,
   });
@@ -681,6 +682,7 @@ async function infoOAuth(c: Context<{ Bindings: OAuth2TokenEnv }>): Promise<Resp
   const body = await buildUserInfoResponse(db, resolved.user, {
     appUrl: appUrlOf(c),
     onlyPublicGroups: scopeSet.publicOnly,
+    bucket: c.env.REPO_PACKS,
   });
   return c.json(body);
 }

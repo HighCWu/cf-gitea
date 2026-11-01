@@ -4,15 +4,22 @@
  * with the W2 fetch-stub IdP — the FULL ladders end-to-end
  * (dance → anonymous-miss link page → credential arm → the RE-DANCE → the
  * callback completes the link against the IdP-RE-ASSERTED identity), the
- * gate matrix (the init-window refusal BEFORE credential work on BOTH arms,
- * ALLOW_SIGNUP's 404 polarity, the untrusted-hint 404s), the credential
- * ladder's failure re-renders, and the DOM contract of the page render
- * (link_account.tmpl + signup_inner/signin_inner at the pin).
+ * 2FA gate on the signin arm (oauth2LinkAccount's deliberate
+ * HasTwoFactorOrWebAuthn park — enrolled users do NOT mint; the TOTP and
+ * WebAuthn gate completions resume the re-dance and the link completes
+ * post-assertion), the gate matrix (the init-window refusal BEFORE
+ * credential work on BOTH arms, ALLOW_SIGNUP's 404 polarity, the
+ * untrusted-hint 404s), the credential ladder's failure re-renders, and the
+ * DOM contract of the page render (link_account.tmpl +
+ * signup_inner/signin_inner at the pin).
  */
 
-import { env } from "cloudflare:test";
+import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
+import { Hono } from "hono";
 
+import { TWOFA_COOKIE_NAME, applyTwofaEnrollment, generateTotpSecret, mintPendingTicket, verifyPendingTicket } from "../../auth/two-factor";
+import { totpCode } from "../../auth/totp";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { TokenService } from "../../auth/token-service";
 import { runA11y } from "../__tests__/a11y";
@@ -20,6 +27,12 @@ import { OAUTH2_DANCE_COOKIE_NAME } from "../../services/auth-sources/identity";
 import { serializeOAuth2SourceConfig } from "../../services/auth-sources/cfg";
 import { createLoginSource, getActiveOAuth2SourceByName, LoginSourceType } from "../../services/auth-sources/store";
 import { createOAuth2LoginRouter } from "../../web/oauth2-login";
+import { buildAssertionResponse, buildAuthData, clientDataJson, FLAG_UP, FLAG_UV, makeEcFixture, signWith, type EcFixture } from "../../web/webauthn-fixtures";
+import { WEBAUTHN_COOKIE_NAME, verifyCeremonyState } from "../../web/webauthn-ceremony";
+import { createWebAuthnRouter } from "../../web/webauthn";
+import { createCredential } from "../../web/webauthn-store";
+import { sha256 } from "../../web/webauthn-cose";
+import { SESSION_COOKIE_NAME, sessionRouter } from "../session";
 import { createLinkAccountRouter } from "./link-account-router";
 import { linkAccountLocale, loadLinkAccountPageData } from "./link-account";
 
@@ -118,7 +131,9 @@ const CLOSED_ENV: GateTestEnv = { ...env, ALLOW_SIGNUP: "false" };
 
 beforeEach(async () => {
   await applyAuthD1Migrations();
-  for (const table of ["external_login_user", "login_source", "sessions", "users", "personal_access_tokens"]) {
+  // `two_factor` + `webauthn_credentials` ride the signin arm's 2FA gate
+  // (the describe below).
+  for (const table of ["external_login_user", "login_source", "sessions", "users", "personal_access_tokens", "two_factor", "webauthn_credentials"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   idp = await stubIdp();
@@ -600,5 +615,282 @@ describe("POST /user/link_account_signup (LinkAccountPostRegister's ladder)", ()
       SIGNUP_ENV,
     );
     expect(post.status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE SIGNIN ARM'S 2FA GATE — oauth2LinkAccount's deliberate
+// HasTwoFactorOrWebAuthn check (linkaccount.go:149-176, "We deliberately
+// ignore the skip local 2fa setting here because we are linking to a
+// previous user here"): an enrolled user's verified PAT does NOT mint a
+// session. The park is ui/session.ts's login-gate pattern (the WebAuthn
+// pending carrier / the `gitea_twofa` gate ticket / the dual-carrier park)
+// with the RE-DANCE URL parked as the post-gate target, so the gate's mint
+// arms (sessionRouter's POST /user/two_factor, the webauthn assertion)
+// resume at the dance start leg and the callback completes the link
+// post-assertion — our substrate's completePendingLinks
+// (linkaccount.go:265-272's parity).
+// ---------------------------------------------------------------------------
+
+/** The mint arms' app: the sessionRouter registration shape (the TOTP gate
+ *  half of the completion chain). */
+const gateApp = new Hono<{ Bindings: Env }>();
+gateApp.route("/", sessionRouter);
+const greq = async (path: string, init?: RequestInit): Promise<Response> => {
+  const context = createExecutionContext();
+  const response = await gateApp.fetch(new Request(`https://app.example.com${path}`, init), env, context);
+  await waitOnExecutionContext(context);
+  return response;
+};
+
+/** The webauthn router (the assertion legs). The RP derives from the
+ *  request URL — router.request synthesizes http://localhost, the origin
+ *  the fixtures sign for (webauthn.test.ts's posture). */
+const webRouter = createWebAuthnRouter();
+const wreq = async (path: string, init?: RequestInit): Promise<Response> => webRouter.request(path, init, env);
+
+/** Split a multi-directive Set-Cookie header (our directives carry no
+ *  Expires dates, so `, ` splits cleanly — session.test.ts's shape). */
+function setCookieDirectives(response: Response): string[] {
+  const header = response.headers.get("set-cookie") ?? "";
+  return header === "" ? [] : header.split(/, (?=[A-Za-z0-9_-]+=)/);
+}
+
+/** The FIRST directive's value for `name` (undefined when the cookie is
+ *  absent). */
+function cookieValueOf(response: Response, name: string): string | undefined {
+  for (const directive of setCookieDirectives(response)) {
+    const pair = directive.split(";")[0] ?? "";
+    const at = pair.indexOf("=");
+    if (at > 0 && pair.slice(0, at).trim() === name) return pair.slice(at + 1);
+  }
+  return undefined;
+}
+
+/** A live TOTP enrollment through the REAL enrollment seam (the session
+ *  suite's seedEnrolled shape — the secret never touches a constant). */
+async function enrollTotp(userId: number): Promise<string> {
+  const secret = generateTotpSecret();
+  const ticket = await mintPendingTicket(env.DB, { kind: "enroll", secret });
+  const outcome = await applyTwofaEnrollment(env.DB, userId, await totpCode(secret, Date.now() / 1000), ticket);
+  if (outcome.outcome !== "enrolled") throw new Error(`totp fixture failed: ${outcome.outcome}`);
+  return secret;
+}
+
+/** An enrolled WebAuthn credential row over a REAL EC fixture (the
+ *  assertion ladder verifies signatures — synthetic-key bytes). */
+async function enrollWebAuthn(userId: number, ec: EcFixture): Promise<Uint8Array> {
+  const credentialId = crypto.getRandomValues(new Uint8Array(16));
+  await createCredential(env.DB, userId, "link key", {
+    credentialId,
+    coseKey: ec.cose,
+    publicKeyRaw: ec.coseBytes,
+    attestationType: "none",
+    aaguid: new Uint8Array(16),
+    signCount: 0,
+    transports: null,
+    userPresent: true,
+    userVerified: true,
+  });
+  return credentialId;
+}
+
+/** The synthetic assertion body for the enrolled credential (webauthn.test.ts's
+ *  helper shape): UP|UV flags, a count-1 signature over authData‖clientHash. */
+async function assertionBody(ec: EcFixture, credentialId: Uint8Array, challenge: string): Promise<Record<string, unknown>> {
+  const authData = await buildAuthData({ rpId: "localhost", flags: FLAG_UP | FLAG_UV, signCount: 1 });
+  const clientData = clientDataJson("webauthn.get", challenge, "http://localhost");
+  const clientHash = await sha256(clientData);
+  const signed = new Uint8Array(authData.length + clientHash.length);
+  signed.set(authData, 0);
+  signed.set(clientHash, authData.length);
+  const signature = await signWith(ec, signed);
+  return buildAssertionResponse({ credentialId, authData, clientData, signature, userHandle: null });
+}
+
+/** The link-signin POST for the gate fixtures (the seeded user is `jane`). */
+async function signinPost(pat: string): Promise<Response> {
+  return req(
+    "https://app.example.com/user/link_account_signin",
+    formPost({ user_name: "jane", password: pat, oauth2_source: "OIDC", redirect_to: "/after" }),
+  );
+}
+
+const DANCE_TARGET = "/user/oauth2/OIDC?redirect_to=%2Fafter&oauth2_continue=signin-link";
+
+describe("the signin arm's 2FA gate (oauth2LinkAccount parity — the F1 fix)", () => {
+  it("a TOTP-enrolled user does NOT mint: the park arms the gate ticket carrying the re-dance URL, 303 /user/two_factor", async () => {
+    await seedOidcSource();
+    const userId = await seedUserRow({ name: "jane", email: "jane@example.com" });
+    const pat = await mintPat(userId);
+    await enrollTotp(userId);
+    const before = await sessionCount();
+
+    const post = await signinPost(pat);
+    expect(post.status).toBe(303);
+    expect(post.headers.get("location")).toBe("/user/two_factor");
+    // The bypass is closed: no session row, no session cookie.
+    expect(await sessionCount()).toBe(before);
+    expect(cookieValueOf(post, SESSION_COOKIE_NAME)).toBeUndefined();
+    // The gate ticket decodes with the parked principal AND the pending-link
+    // state (the re-dance URL is the post-gate target).
+    const ticket = await verifyPendingTicket(env.DB, cookieValueOf(post, TWOFA_COOKIE_NAME) ?? "", "gate");
+    expect(ticket).toEqual({ kind: "gate", userId, remember: false, redirectTo: DANCE_TARGET });
+  });
+
+  it("a DUAL enrollment parks BOTH carriers at the webauthn prompt (handleTwoFactorRequired's hasWebAuthn-first order)", async () => {
+    await seedOidcSource();
+    const userId = await seedUserRow({ name: "jane", email: "jane@example.com" });
+    const pat = await mintPat(userId);
+    await enrollTotp(userId);
+    await enrollWebAuthn(userId, await makeEcFixture());
+
+    const post = await signinPost(pat);
+    expect(post.status).toBe(303);
+    expect(post.headers.get("location")).toBe("/user/webauthn");
+    expect(await sessionCount()).toBe(0);
+    // The pending carrier: the pre-auth principal + the dance target.
+    const pending = await verifyCeremonyState(env.DB, cookieValueOf(post, WEBAUTHN_COOKIE_NAME) ?? "", "pending");
+    expect(pending).toMatchObject({ k: "pending", uid: userId, ch: "", rem: false, to: DANCE_TARGET });
+    // The gate ticket rides beside it (the TOTP fallback's authority).
+    const ticket = await verifyPendingTicket(env.DB, cookieValueOf(post, TWOFA_COOKIE_NAME) ?? "", "gate");
+    expect(ticket).toMatchObject({ kind: "gate", userId, remember: false, redirectTo: DANCE_TARGET });
+  });
+
+  it("a WebAuthn-only enrollment parks the pending carrier alone, 303 /user/webauthn, no ticket", async () => {
+    await seedOidcSource();
+    const userId = await seedUserRow({ name: "jane", email: "jane@example.com" });
+    const pat = await mintPat(userId);
+    await enrollWebAuthn(userId, await makeEcFixture());
+
+    const post = await signinPost(pat);
+    expect(post.status).toBe(303);
+    expect(post.headers.get("location")).toBe("/user/webauthn");
+    expect(await sessionCount()).toBe(0);
+    const pending = await verifyCeremonyState(env.DB, cookieValueOf(post, WEBAUTHN_COOKIE_NAME) ?? "", "pending");
+    expect(pending).toMatchObject({ k: "pending", uid: userId, to: DANCE_TARGET });
+    expect(cookieValueOf(post, TWOFA_COOKIE_NAME)).toBeUndefined();
+  });
+
+  it("COMPLETION via the TOTP gate: the passcode mints AND resumes the re-dance; the callback links the re-asserted identity onto returnTo", async () => {
+    const source = await seedOidcSource();
+    const userId = await seedUserRow({ name: "jane", email: "jane@example.com" });
+    const pat = await mintPat(userId);
+    const secret = await enrollTotp(userId);
+
+    const park = await signinPost(pat);
+    const gateCookie = `${TWOFA_COOKIE_NAME}=${cookieValueOf(park, TWOFA_COOKIE_NAME)}`;
+    const submit = await greq("/user/two_factor", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: gateCookie },
+      body: new URLSearchParams({ passcode: await totpCode(secret, Date.now() / 1000) }).toString(),
+    });
+    expect(submit.status).toBe(303);
+    // The mint arm resumed at the parked target — the dance start leg — and
+    // the fresh session cookie rides it.
+    expect(submit.headers.get("location")).toBe(DANCE_TARGET);
+    expect(await sessionCount()).toBe(1);
+    const sessionCookie = cookieValueOf(submit, SESSION_COOKIE_NAME);
+    expect(sessionCookie).toBeDefined();
+    // the gate carrier died with the mint (the Max-Age=0 clear directive)
+    expect(setCookieDirectives(submit).some((directive) => directive.startsWith(`${TWOFA_COOKIE_NAME}=; Path=/; Max-Age=0`))).toBe(true);
+
+    // The dance completes the link onto the GATE-MINTED session (the W2
+    // chain — our completePendingLinks).
+    const bearer = `${SESSION_COOKIE_NAME}=${sessionCookie}`;
+    const start = await freq(`https://app.example.com${submit.headers.get("location")}`, { headers: { cookie: bearer } });
+    expect(start.status).toBe(303);
+    const { results } = await env.DB.prepare("SELECT oauth2_login_state FROM sessions").all<{ oauth2_login_state: string | null }>();
+    const parked = JSON.parse(results[0]!.oauth2_login_state!) as { expectedState: string; nonce: string; continue: string };
+    expect(parked.continue).toBe("signin-link");
+    idp.tokenResponse = {
+      access_token: "at",
+      token_type: "Bearer",
+      id_token: await signIdToken(idp, { ...baseClaims(), nonce: parked.nonce }),
+    };
+    const done = await freq(
+      `https://app.example.com/user/oauth2/OIDC/callback?code=the-code&state=${encodeURIComponent(parked.expectedState)}`,
+      { headers: { cookie: bearer } },
+    );
+    expect(done.status).toBe(303);
+    expect(done.headers.get("location")).toBe("/after");
+    const { results: links } = await env.DB
+      .prepare("SELECT user_id FROM external_login_user WHERE external_id = ? AND login_source_id = ?")
+      .bind("sub-123", String(source.id))
+      .all<{ user_id: number }>();
+    expect(links[0]?.user_id).toBe(userId);
+  });
+
+  it("COMPLETION via the WebAuthn gate: the assertion mints AND answers the re-dance; the link completes", async () => {
+    const source = await seedOidcSource();
+    const userId = await seedUserRow({ name: "jane", email: "jane@example.com" });
+    const pat = await mintPat(userId);
+    const ec = await makeEcFixture();
+    const credentialId = await enrollWebAuthn(userId, ec);
+
+    const park = await signinPost(pat);
+    const pending = cookieValueOf(park, WEBAUTHN_COOKIE_NAME)!;
+    const optionsRes = await wreq("/user/webauthn/assertion", {
+      headers: { cookie: `${WEBAUTHN_COOKIE_NAME}=${encodeURIComponent(pending)}` },
+    });
+    expect(optionsRes.status).toBe(200);
+    const assertCookie = (optionsRes.headers.get("set-cookie") ?? "").split(";")[0]!;
+    const state = await verifyCeremonyState(env.DB, decodeURIComponent(assertCookie.split("=").slice(1).join("=")), "assert");
+    expect(state).not.toBeNull();
+    const verifyRes = await wreq("/user/webauthn/assertion", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: "http://localhost",
+        cookie: `${WEBAUTHN_COOKIE_NAME}=${encodeURIComponent(pending)}; ${assertCookie}`,
+      },
+      body: JSON.stringify(await assertionBody(ec, credentialId, state!.ch)),
+    });
+    expect(verifyRes.status).toBe(200);
+    // The mint arm answered the parked dance target.
+    expect((await verifyRes.json<{ redirect: string }>()).redirect).toBe(DANCE_TARGET);
+    expect(await sessionCount()).toBe(1);
+    const cleared = verifyRes.headers.getSetCookie ? verifyRes.headers.getSetCookie() : [verifyRes.headers.get("set-cookie") ?? ""];
+    const sessionDirective = cleared.find((value) => value.startsWith(`${SESSION_COOKIE_NAME}=`));
+    expect(sessionDirective).toBeDefined();
+    const sessionCookie = sessionDirective!.split(";")[0]!.split("=").slice(1).join("=");
+
+    // The dance completes the link onto the GATE-MINTED session.
+    const bearer = `${SESSION_COOKIE_NAME}=${sessionCookie}`;
+    const start = await freq(`https://app.example.com${DANCE_TARGET}`, { headers: { cookie: bearer } });
+    expect(start.status).toBe(303);
+    const { results } = await env.DB.prepare("SELECT oauth2_login_state FROM sessions").all<{ oauth2_login_state: string | null }>();
+    const parked = JSON.parse(results[0]!.oauth2_login_state!) as { expectedState: string; nonce: string; continue: string };
+    expect(parked.continue).toBe("signin-link");
+    idp.tokenResponse = {
+      access_token: "at",
+      token_type: "Bearer",
+      id_token: await signIdToken(idp, { ...baseClaims(), nonce: parked.nonce }),
+    };
+    const done = await freq(
+      `https://app.example.com/user/oauth2/OIDC/callback?code=the-code&state=${encodeURIComponent(parked.expectedState)}`,
+      { headers: { cookie: bearer } },
+    );
+    expect(done.status).toBe(303);
+    expect(done.headers.get("location")).toBe("/after");
+    const { results: links } = await env.DB
+      .prepare("SELECT user_id FROM external_login_user WHERE external_id = ? AND login_source_id = ?")
+      .bind("sub-123", String(source.id))
+      .all<{ user_id: number }>();
+    expect(links[0]?.user_id).toBe(userId);
+  });
+
+  it("a non-enrolled user links directly — the happy path is byte-unchanged (no gate step, direct mint + re-dance)", async () => {
+    await seedOidcSource();
+    const userId = await seedUserRow({ name: "jane", email: "jane@example.com" });
+    const pat = await mintPat(userId);
+
+    const post = await signinPost(pat);
+    expect(post.status).toBe(303);
+    expect(post.headers.get("location")).toBe(DANCE_TARGET);
+    expect(await sessionCount()).toBe(1);
+    expect(cookieValueOf(post, SESSION_COOKIE_NAME)).toBeDefined();
+    expect(cookieValueOf(post, TWOFA_COOKIE_NAME)).toBeUndefined();
+    expect(cookieValueOf(post, WEBAUTHN_COOKIE_NAME)).toBeUndefined();
   });
 });

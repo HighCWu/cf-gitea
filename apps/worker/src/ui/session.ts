@@ -20,7 +20,10 @@
  *   POST /user/two_factor         — verify + CONSUME the passcode → mint
  *   GET  /user/two_factor/scratch — the scratch-code page
  *   POST /user/two_factor/scratch — verify + BURN the scratch code → mint
- *                                    → 303 /user/settings/security
+ *                                    → 303 /user/settings/security (or,
+ *                                    for the link flow's parked re-dance
+ *                                    ticket, that dance URL — the scratch
+ *                                    arm's completePendingLinks parity)
  *
  * The gate inserts between password-accept and session-mint (auth.go:330-349):
  * an enrolled doer's POST /login does NOT mint — the pending principal
@@ -111,7 +114,11 @@
  *   - The scratch success lands on /user/settings/security with the
  *     `twofa_scratch_used` info flash upstream (2fa.go:154-160); the flash
  *     rides no wire in our no-JS shell (the W4 posture) — the redirect
- *     itself is the destination.
+ *     itself is the destination. ONE resume arm: upstream runs
+ *     completePendingLinks through this arm too (2fa.go:149), and the link
+ *     flow's parked target (the link-account router's re-dance URL in the
+ *     ticket's redirectTo slot) IS the completion — scratchRedirectTarget
+ *     resumes it, every other parked target keeps the pin.
  *
  * ## §2.9 boundary
  *
@@ -1402,7 +1409,13 @@ async function twofaSubmit(c: RouteContext): Promise<Response> {
 /** POST /user/two_factor/scratch (upstream TwoFactorScratchPost,
  *  2fa.go:112-164): verify the scratch code, BURN it (regenerate), mint,
  *  and land on /user/settings/security (upstream's redirect — the flash
- *  dropped per the module header). */
+ *  dropped per the module header) — UNLESS the parked target is the
+ *  link flow's re-dance continuation (scratchRedirectTarget below): the
+ *  scratch code is a valid second factor, and upstream runs
+ *  completePendingLinks through this very arm (2fa.go:149) before its
+ *  settings/security redirect — here the link completion IS the dance
+ *  resume, so stranding the scratch user on settings/security would leave
+ *  the link half-done. */
 async function twofaScratchSubmit(c: RouteContext): Promise<Response> {
   const g = await gateTicket(c);
   if ("response" in g) return g.response;
@@ -1416,7 +1429,7 @@ async function twofaScratchSubmit(c: RouteContext): Promise<Response> {
     await regenerateScratchToken(c.env.DB, row, { now }); // the single-use burn
     const cookieValue = await mintSession(c.env.DB, g.ticket.userId, { now, remember: g.ticket.remember });
     await retirePresentedSession(c.env.DB, c.req.raw, g.ticket.userId);
-    return seeOtherCookies("/user/settings/security", [
+    return seeOtherCookies(scratchRedirectTarget(g.ticket.redirectTo), [
       sessionSetCookie(cookieValue, g.ticket.remember),
       clearTwofaSetCookie(),
       webAuthnClearCookie("pending"),
@@ -1424,6 +1437,30 @@ async function twofaScratchSubmit(c: RouteContext): Promise<Response> {
     ]);
   }
   return renderScratchFailure(c, twofaLocale.scratch_token_incorrect);
+}
+
+/** The scratch arm's landing: upstream pins /user/settings/security
+ *  (2fa.go:159) and ignores the parked redirect — EXCEPT the link flow's
+ *  park, which stores the RE-DANCE URL in the gate ticket's redirectTo slot
+ *  (the link-account router's 2FA gate: `/user/oauth2/{source}?…&
+ *  oauth2_continue={signin-link|signup}`). The scratch success must resume
+ *  it (the module header on twofaScratchSubmit); every other parked target
+ *  — a local login's redirect_to, the no-park "/" — keeps the upstream pin.
+ *  The re-dance shape is read exactly like web/oauth2-login.ts's
+ *  readContinuation (declared locally — session.ts is that module's IMPORT,
+ *  the cycle must not close). */
+function scratchRedirectTarget(parked: string): string {
+  let url: URL;
+  try {
+    url = new URL(parked, "https://scratch-target.invalid");
+  } catch {
+    return "/user/settings/security";
+  }
+  const marker = url.searchParams.get("oauth2_continue");
+  if (url.pathname.startsWith("/user/oauth2/") && (marker === "signin-link" || marker === "signup")) {
+    return safeRedirectTarget(parked);
+  }
+  return "/user/settings/security";
 }
 
 // ---------------------------------------------------------------------------

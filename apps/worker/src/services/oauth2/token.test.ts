@@ -23,6 +23,7 @@ import { getOrCreateGrant, setGrantNonce, type OAuth2GrantRow } from "./grants";
 import { base64UrlDecode } from "./jws";
 import {
   buildIdTokenClaims,
+  buildUserInfoResponse,
   deriveCodeChallenge,
   getOAuthGroupsForUser,
   grantAdditionalScopes,
@@ -269,6 +270,7 @@ describe("mintTokenTrio through the real store (NewAccessTokenResponse, access_t
       material,
       issuer: "https://git.example.com",
       appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
       now: T0,
     });
     expect(result.ok).toBe(true);
@@ -311,6 +313,7 @@ describe("mintTokenTrio through the real store (NewAccessTokenResponse, access_t
       material,
       issuer: "https://git.example.com",
       appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
       now: T0,
     });
     if (!result.ok) throw new Error("mint failed");
@@ -326,6 +329,8 @@ describe("mintTokenTrio through the real store (NewAccessTokenResponse, access_t
 describe("buildIdTokenClaims (the OIDCToken member order + the omitempty semantics)", () => {
   it("iss/sub/aud/exp/iat lead; nonce rides; the profile family renders in struct order", async () => {
     const userId = await seedUser({ displayName: "A User", website: "https://u.example.com", language: "en-US" });
+    // The user carries a STORED avatar (the deterministic picture pin below).
+    await drizzle(env.DB).update(users).set({ useCustomAvatar: true }).where(eq(users.id, userId));
     const app = await seedApp();
     const grant = await seedGrant(userId, app.id, "openid profile");
     const applicationRow = (await drizzle(env.DB).select().from(oauth2Applications).where(eq(oauth2Applications.id, app.id)).get())!;
@@ -337,6 +342,7 @@ describe("buildIdTokenClaims (the OIDCToken member order + the omitempty semanti
       user: userRow,
       issuer: "https://git.example.com",
       appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
       exp: T0_SEC + 3600,
       nowSec: T0_SEC,
     });
@@ -359,12 +365,69 @@ describe("buildIdTokenClaims (the OIDCToken member order + the omitempty semanti
     expect(claims.name).toBe("A User");
     expect(claims.preferred_username).toBe(userRow.username);
     expect(claims.profile).toBe(`https://git.example.com/${userRow.username}`);
-    expect(claims.picture).toBe(`https://git.example.com/avatars/${userRow.usernameLower}`);
+    // AvatarLink parity (access_token.go:231): the user carries a STORED
+    // avatar, so the link is the u_<id> storage key — NOT the unresolvable
+    // /avatars/{username} the earlier hand-spell produced (see "the picture
+    // claim" suite below).
+    expect(claims.picture).toBe(`https://git.example.com/avatars/u_${userId}`);
     expect(claims.website).toBe("https://u.example.com");
     expect(claims.locale).toBe("en-US");
     // updated_at omits (no users.updated_unix column — the zero stamp
     // upstream omitempty drops too)
     expect(claims.updated_at).toBeUndefined();
+  });
+
+  it("the picture claim (user.AvatarLink parity): the stored u_<id> shape and the generated-identicon fallback — BOTH resolvable", async () => {
+    // The STORED avatar arm: useCustomAvatar ⇒ avatarLinkWithSize links the
+    // `avatars/u_<id>` storage key (models/user/avatar.go:60-61's u.Avatar
+    // slot — the cf-gitea key layout divergence documented there).
+    const storedId = await seedUser();
+    await drizzle(env.DB).update(users).set({ useCustomAvatar: true }).where(eq(users.id, storedId));
+    const storedRow = (await drizzle(env.DB).select().from(users).where(eq(users.id, storedId)).get())!;
+    const storedApp = await seedApp();
+    const stored = await buildIdTokenClaims({
+      db: env.DB,
+      grant: await seedGrant(storedId, storedApp.id, "openid profile"),
+      application: (await drizzle(env.DB).select().from(oauth2Applications).where(eq(oauth2Applications.id, storedApp.id)).get())!,
+      user: storedRow,
+      issuer: "https://git.example.com",
+      appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
+      exp: T0_SEC + 3600,
+      nowSec: T0_SEC,
+    });
+    expect(stored.claims.picture).toBe(`https://git.example.com/avatars/u_${storedId}`);
+
+    // The FALLBACK arm (the frozen DisableGravatar posture): the generated
+    // identicon file — `avatars/<HashAvatar(id, email)>` — and the upload
+    // ACTUALLY lands (the link dereferences under the /avatars/* handler).
+    const fallbackId = await seedUser();
+    const fallbackRow = (await drizzle(env.DB).select().from(users).where(eq(users.id, fallbackId)).get())!;
+    const { hashAvatar } = await import("../avatars");
+    const file = await hashAvatar(fallbackId, fallbackRow.email ?? "");
+    const fallbackApp = await seedApp();
+    const fallback = await buildIdTokenClaims({
+      db: env.DB,
+      grant: await seedGrant(fallbackId, fallbackApp.id, "openid profile"),
+      application: (await drizzle(env.DB).select().from(oauth2Applications).where(eq(oauth2Applications.id, fallbackApp.id)).get())!,
+      user: fallbackRow,
+      issuer: "https://git.example.com",
+      appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
+      exp: T0_SEC + 3600,
+      nowSec: T0_SEC,
+    });
+    expect(fallback.claims.picture).toBe(`https://git.example.com/avatars/${file}`);
+    expect(await env.REPO_PACKS.head(`avatars/${file}`)).not.toBeNull();
+
+    // The USERINFO picture composes the same chain (oauth2_provider.go:121's
+    // ctx.Doer.AvatarLink) in the same member slot.
+    const info = await buildUserInfoResponse(env.DB, fallbackRow, {
+      appUrl: "https://git.example.com/",
+      onlyPublicGroups: false,
+      bucket: env.REPO_PACKS,
+    });
+    expect(info.picture).toBe(`https://git.example.com/avatars/${file}`);
   });
 
   it("email_verified is a Go bool omitempty — present ONLY when true; empty email omits", async () => {
@@ -379,6 +442,7 @@ describe("buildIdTokenClaims (the OIDCToken member order + the omitempty semanti
       user: activeRow,
       issuer: "https://git.example.com",
       appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
       exp: T0_SEC + 3600,
       nowSec: T0_SEC,
     });
@@ -395,6 +459,7 @@ describe("buildIdTokenClaims (the OIDCToken member order + the omitempty semanti
       user: (await drizzle(env.DB).select().from(users).where(eq(users.id, activeId)).get())!,
       issuer: "https://git.example.com",
       appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
       exp: T0_SEC + 3600,
       nowSec: T0_SEC,
     });
@@ -415,6 +480,7 @@ describe("buildIdTokenClaims (the OIDCToken member order + the omitempty semanti
       user: (await drizzle(env.DB).select().from(users).where(eq(users.id, noEmailId)).get())!,
       issuer: "https://git.example.com",
       appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
       exp: T0_SEC + 3600,
       nowSec: T0_SEC,
     });
@@ -441,6 +507,7 @@ describe("buildIdTokenClaims (the OIDCToken member order + the omitempty semanti
       user: (await drizzle(env.DB).select().from(users).where(eq(users.id, userId)).get())!,
       issuer: "https://git.example.com",
       appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
       exp: T0_SEC + 3600,
       nowSec: T0_SEC,
     });
@@ -459,6 +526,7 @@ describe("buildIdTokenClaims (the OIDCToken member order + the omitempty semanti
       user: (await drizzle(env.DB).select().from(users).where(eq(users.id, userId)).get())!,
       issuer: "https://git.example.com",
       appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
       exp: T0_SEC + 3600,
       nowSec: T0_SEC,
     });
@@ -488,6 +556,7 @@ describe("buildIdTokenClaims (the OIDCToken member order + the omitempty semanti
       user: (await drizzle(env.DB).select().from(users).where(eq(users.id, userId)).get())!,
       issuer: "https://git.example.com",
       appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
       exp: T0_SEC + 3600,
       nowSec: T0_SEC,
     });
@@ -517,6 +586,7 @@ describe("the no-default-rotation trap (InvalidateRefreshTokens default FALSE)",
       material,
       issuer: "https://git.example.com",
       appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
       now: T0,
     });
     if (!first.ok) throw new Error("first mint failed");
@@ -532,6 +602,7 @@ describe("the no-default-rotation trap (InvalidateRefreshTokens default FALSE)",
           material,
           issuer: "https://git.example.com",
           appUrl: "https://git.example.com/",
+          bucket: env.REPO_PACKS,
           now: T0,
           invalidateRefreshTokens: true,
         }),
@@ -545,6 +616,7 @@ describe("the no-default-rotation trap (InvalidateRefreshTokens default FALSE)",
       material,
       issuer: "https://git.example.com",
       appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
       now: T0,
       invalidateRefreshTokens: rotate,
     });
@@ -597,6 +669,7 @@ describe("the no-default-rotation trap (InvalidateRefreshTokens default FALSE)",
       material,
       issuer: "https://git.example.com",
       appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
       now: T0,
       invalidateRefreshTokens: true,
     });
@@ -629,6 +702,7 @@ describe("the HS id_token client-key arm", () => {
       clientKey,
       issuer: "https://git.example.com",
       appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
       now: T0,
     });
     if (!result.ok) throw new Error("mint failed");
@@ -671,6 +745,7 @@ describe("resolveOAuth2AccessTokenCredential (the dispatch)", () => {
       material,
       issuer: "https://git.example.com",
       appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
       now: T0,
     });
     if (!result.ok) throw new Error("mint failed");

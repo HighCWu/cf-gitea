@@ -56,6 +56,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { normalizeScope as normalizeAccessTokenScope } from "../../auth/scopes";
 import { oauth2Applications, orgMembers, teamMembers, teams, userSettings, users } from "../../db/schema";
+import { avatarLinkWithSize } from "../avatars";
 import {
   getGrantByID,
   grantScopeContains,
@@ -367,6 +368,9 @@ export interface MintTokenTrioInput {
   /** URL base for the profile/picture claims (the AppURL shape, trailing
    *  slash). */
   appUrl: string;
+  /** The avatar object store — the picture claim's chain reads it (the
+   *  generated-identicon arm may store the file). */
+  bucket: R2Bucket;
   now: Date;
   /** The InvalidateRefreshTokens posture — upstream default FALSE (the
    *  no-default-rotation trap, module header). */
@@ -422,6 +426,7 @@ export async function mintTokenTrio(input: MintTokenTrioInput): Promise<AccessTo
       user,
       issuer,
       appUrl,
+      bucket: input.bucket,
       exp: accessExpiration,
       nowSec,
     });
@@ -475,6 +480,7 @@ export async function buildIdTokenClaims(input: {
   user: OAuth2UserRow;
   issuer: string;
   appUrl: string;
+  bucket: R2Bucket;
   exp: number;
   nowSec: number;
 }): Promise<{ claims: Record<string, unknown> }> {
@@ -495,7 +501,7 @@ export async function buildIdTokenClaims(input: {
     if (displayNameOf(user) !== "") claims.name = displayNameOf(user);
     claims.preferred_username = user.username;
     claims.profile = `${appUrl}${user.username}`;
-    claims.picture = `${appUrl}avatars/${user.usernameLower}`;
+    claims.picture = await avatarPictureLink(input.bucket, user, appUrl);
     if ((user.website ?? "") !== "") claims.website = user.website;
     const language = await languageOf(input.db, user.id);
     if (language !== "") claims.locale = language;
@@ -530,6 +536,29 @@ function includesPublicOnly(grantScope: string): boolean {
 function displayNameOf(user: OAuth2UserRow): string {
   const fullName = user.displayName ?? "";
   return fullName !== "" ? fullName : user.username;
+}
+
+/**
+ * The `picture` claim's link — upstream `user.AvatarLink(ctx)`
+ * (access_token.go:231 id_token / oauth2_provider.go:121 userinfo):
+ * MakeAbsoluteURL over `AvatarLinkWithSize(ctx, 0)` (models/user/avatar.go:
+ * 83-88). The hand-spelled `${appUrl}avatars/{username}` it replaced 404'd —
+ * the storage keys are `avatars/u_<id>` and `avatars/<HashAvatar>`
+ * (services/avatars.ts's layout), never a username. avatarLinkWithSize runs
+ * the same frozen DisableGravatar chain the /user/avatar/{username}/{size}
+ * handler serves (custom ⇒ `u_<id>`; otherwise the generated identicon file
+ * under the /avatars/* storage handler — the auto-generate may store the
+ * object, which upstream's link builder does too), size 0 per AvatarLink.
+ * The `OAuth2UserRow` carries the chain's five fields structurally (the
+ * AvatarChainUser projection).
+ */
+async function avatarPictureLink(bucket: R2Bucket, user: OAuth2UserRow, appUrl: string): Promise<string> {
+  // MakeAbsoluteURL's join, verbatim: hostURL + "/" + TrimPrefix(link, "/")
+  // (server_request.go:161-169) — appUrl's AppURL trailing slash plays the
+  // upstream "/" separator, so the relative avatar link never double-slashes.
+  const base = appUrl.endsWith("/") ? appUrl : `${appUrl}/`;
+  const link = await avatarLinkWithSize(bucket, user, 0);
+  return `${base}${link.startsWith("/") ? link.slice(1) : link}`;
 }
 
 /** The `Language` preference — the landed user_settings side row (the five
@@ -611,13 +640,13 @@ export async function getOAuthGroupsForUser(db: D1Database, userId: number, only
  * userInfoResponse (oauth2_provider.go:86-93) — member order sub, name,
  * preferred_username, email, picture, groups; groups is null when the user
  * is in no orgs (the pin's nil-slice-as-null JSON). The caller supplies the
- * resolved doer row and the public-only bit (IsPublicOnlyDoer — the
- * resolved scope's restriction).
+ * resolved doer row, the public-only bit (IsPublicOnlyDoer — the resolved
+ * scope's restriction) and the avatar bucket (the picture's chain).
  */
 export async function buildUserInfoResponse(
   db: D1Database,
   user: OAuth2UserRow,
-  options: { appUrl: string; onlyPublicGroups: boolean },
+  options: { appUrl: string; onlyPublicGroups: boolean; bucket: R2Bucket },
 ): Promise<Record<string, unknown>> {
   const groups = await getOAuthGroupsForUser(db, user.id, options.onlyPublicGroups);
   return {
@@ -625,7 +654,7 @@ export async function buildUserInfoResponse(
     name: displayNameOf(user),
     preferred_username: user.username,
     email: user.email ?? "",
-    picture: `${options.appUrl}avatars/${user.usernameLower}`,
+    picture: await avatarPictureLink(options.bucket, user, options.appUrl),
     groups,
   };
 }

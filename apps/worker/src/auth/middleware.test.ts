@@ -578,6 +578,7 @@ describe("the OAuth2 Bearer-dots dispatch (services/auth/oauth2.go:110-128)", ()
       material,
       issuer: "https://example.com",
       appUrl: "https://example.com/",
+      bucket: env.REPO_PACKS,
       now: T0,
     });
     if (!result.ok) throw new Error("oauth2 mint failed");
@@ -653,6 +654,7 @@ describe("the OAuth2 Bearer-dots dispatch (services/auth/oauth2.go:110-128)", ()
       material: await loadOAuth2SigningMaterial(env.DB),
       issuer: "https://example.com",
       appUrl: "https://example.com/",
+      bucket: env.REPO_PACKS,
       now: T0,
     });
     if (!result.ok) throw new Error("mint failed");

@@ -24,14 +24,29 @@
  *      shared registration ladder (signup);
  *   6. failure ⇒ the 200 re-render with the inline message (the §2.2
  *      posture; the failed arm's tab carries the error);
- *      success ⇒ `mintSession` (a FRESH row — the fixation posture) and
- *      the RE-DANCE: `303 /user/oauth2/{source}?redirect_to=…&
+ *      success on the SIGNIN arm ⇒ THE 2FA GATE (upstream gates this exact
+ *      arm — oauth2LinkAccount's HasTwoFactorOrWebAuthn check,
+ *      linkaccount.go:149-176, with its deliberate-ignore comment — so a
+ *      2FA-enrolled user does NOT mint here): the local login's park
+ *      (ui/session.ts steps 4.5a/4.5b) with the RE-DANCE URL parked as the
+ *      post-gate target (the gate ticket's redirectTo / the pending
+ *      carrier's `to`), so the gate's mint arms resume the flow at the
+ *      dance start leg and the link completes post-assertion (our
+ *      substrate's completePendingLinks — the W2 callback, not a parked
+ *      first-assertion blob);
+ *      success otherwise ⇒ `mintSession` (a FRESH row — the fixation
+ *      posture) and the RE-DANCE: `303 /user/oauth2/{source}?redirect_to=…&
  *      oauth2_continue=signin-link|signup`. The fresh session cookie rides
  *      the redirect; W2's start leg then parks the dance state on the NEW
  *      session's row (the row carrier), the IdP re-asserts the identity,
  *      and the callback completes the link against it — landing on the
  *      parked `returnTo`, never the generic signed-in arm's
  *      settings/security (the continuation marker discriminates).
+ *
+ * The SIGNUP arm gates 2FA nowhere: upstream's LinkAccountPostRegister
+ * handles a JUST-CREATED user (linkaccount.go:241-262 — handleSignIn with
+ * no HasTwoFactorOrWebAuthn arm), and a fresh account can carry no
+ * enrollment — the mint is direct.
  *
  * NO provider call happens on any arm here — the arms never see an
  * identity; they only prove a local credential (or create a local account)
@@ -50,8 +65,11 @@
 
 import { Hono, type Context } from "hono";
 
+import { hasTwoFactorByUid, mintPendingTicket, twofaSetCookie } from "../../auth/two-factor";
 import { readUrlEncodedForm } from "../forms";
 import { renderNotFound } from "../render";
+import { signCeremonyState, webAuthnPendingSetCookie } from "../../web/webauthn-ceremony";
+import { hasCredentialsForUser } from "../../web/webauthn-store";
 import { externalSignupBlockedByInitWindow } from "../../services/auth-sources/identity";
 import {
   applyLinkAccountSignIn,
@@ -121,6 +139,15 @@ function backgroundSink(c: RouteContext): (promise: Promise<unknown>) => void {
 function seeOther(location: string, setCookie?: string): Response {
   const headers: Record<string, string> = { location };
   if (setCookie !== undefined) headers["set-cookie"] = setCookie;
+  return new Response(null, { status: 303, headers });
+}
+
+/** The 303 with MULTIPLE Set-Cookie directives — the dual-carrier park (the
+ *  pending carrier AND the gate ticket ride one response; session.ts's
+ *  seeOtherCookies twin, kept local per the leaf-only module graph). */
+function seeOtherCookies(location: string, setCookies: string[]): Response {
+  const headers = new Headers({ location });
+  for (const cookie of setCookies) headers.append("set-cookie", cookie);
   return new Response(null, { status: 303, headers });
 }
 
@@ -258,9 +285,67 @@ async function linkAccountSignInSubmit(c: RouteContext): Promise<Response> {
     });
   }
 
-  // Verified: mint (a FRESH row — the fixation posture) and re-dance.
+  // -- THE 2FA GATE (upstream gates this exact arm) --------------------------
+  //
+  // oauth2LinkAccount checks HasTwoFactorOrWebAuthn BEFORE any link
+  // completion and parks via handleTwoFactorRequired — "We deliberately
+  // ignore the skip local 2fa setting here because we are linking to a
+  // previous user here" (linkaccount.go:149-176); the link completes
+  // post-assertion through completePendingLinks (:265-272). Without this
+  // check the verified-PAT arm below mints a FULL platform session with no
+  // second factor — the local login's own gate (ui/session.ts steps
+  // 4.5a/4.5b) applied verbatim: a WebAuthn enrollment parks the signed
+  // `gitea_webauthn` PENDING carrier (a D1 session row requires a signed-in
+  // user and this is the pre-auth step), a TOTP enrollment the `gitea_twofa`
+  // gate ticket, a dual enrollment BOTH carriers at the webauthn prompt
+  // (handleTwoFactorRequired's hasWebAuthn-first order). The link-signin
+  // form carries no remember checkbox (the page module's LinkAccountMode
+  // reduction), so `rem`/`remember` park FALSE.
+  //
+  // The pending-link state rides INSIDE the carriers: the re-dance URL
+  // itself is the parked redirect target — the same slots the local login
+  // parks the form target in (the ticket's redirectTo, the carrier's `to`).
+  // The gate's mint arms are UNCHANGED and resume the flow: ui/session.ts
+  // twofaSubmit redirects to safeRedirectTarget(ticket.redirectTo),
+  // web/webauthn.ts assertionPost to safeRedirectTarget(pending.to) — the
+  // mint lands on the dance start leg WITH the fresh session, W2's start
+  // leg parks the signin-link continuation on the new session's row, the
+  // IdP re-asserts the identity, and the callback completes the link onto
+  // it and lands on the parked returnTo. That dance callback IS our
+  // substrate's completePendingLinks: the external_login_user row is
+  // written against the IdP-RE-ASSERTED identity, never from a parked
+  // first-assertion blob (the W2 contract — the recorded reason the parked
+  // state is a dance URL, not an identity).
+  const danceTarget = reDanceRedirect(source.name, form.redirectTo, "signin-link");
+  if (await hasCredentialsForUser(c.env.DB, outcome.userId)) {
+    const pending = await signCeremonyState(c.env.DB, {
+      k: "pending",
+      uid: outcome.userId,
+      ch: "",
+      rem: false,
+      to: danceTarget,
+    });
+    if (await hasTwoFactorByUid(c.env.DB, outcome.userId)) {
+      const ticket = await mintPendingTicket(
+        c.env.DB,
+        { kind: "gate", userId: outcome.userId, remember: false, redirectTo: danceTarget },
+      );
+      return seeOtherCookies("/user/webauthn", [webAuthnPendingSetCookie(pending), twofaSetCookie(ticket)]);
+    }
+    return seeOther("/user/webauthn", webAuthnPendingSetCookie(pending));
+  }
+  if (await hasTwoFactorByUid(c.env.DB, outcome.userId)) {
+    const ticket = await mintPendingTicket(
+      c.env.DB,
+      { kind: "gate", userId: outcome.userId, remember: false, redirectTo: danceTarget },
+    );
+    return seeOther("/user/two_factor", twofaSetCookie(ticket));
+  }
+
+  // Verified, not enrolled: mint (a FRESH row — the fixation posture) and
+  // re-dance — the unchanged happy path.
   const cookieValue = await mintSession(c.env.DB, outcome.userId);
-  return seeOther(reDanceRedirect(source.name, form.redirectTo, "signin-link"), sessionSetCookie(cookieValue, false));
+  return seeOther(danceTarget, sessionSetCookie(cookieValue, false));
 }
 
 // -- POST /user/link_account_signup -------------------------------------------
