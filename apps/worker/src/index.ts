@@ -331,10 +331,27 @@ app.route("/", firstRunRouter);
 // POSTs ride their own router BEFORE uiRouter per the 9d77172 rule.
 import { linkAccountRouter } from "./ui/pages/link-account-router";
 app.route("/", linkAccountRouter);
-app.route("/", uiRouter);
 // SPEC-0010: /login + /logout are single-segment top level routes (§2.1) —
 // never repo-scoped, so the dispatcher and the engine never see them.
+// THE CONSOLIDATED FOLD (b8ff967's HANDOFF) moves this mount into the
+// pre-uiRouter block: the session router also carries the TOTP gate family
+// /user/two_factor[/scratch], and /user/two_factor is TWO segments — the
+// 9d77172 rule again (the route-level probe: GETs 404-in-shell through the
+// dynamic /:owner/:repo pair when mounted after uiRouter, while the POSTs
+// slipped through only because uiRouter is GET-only).
 app.route("/", sessionRouter);
+// The WEBAUTHN family (b8ff967's module header HANDOFF — the consolidated
+// fold's mount half): /user/webauthn's five pre-auth login arms
+// (web.go:658-664) + /user/settings/security/webauthn/*'s four settings
+// POSTs with their GET 405 twins (web.go:669-673). Reachable only through
+// the isUserAuthPath carve below; the signed-cookie ceremony carriers
+// (gitea_webauthn pending/assert/passkey) need no middleware here — the
+// handlers read them per-request. BEFORE uiRouter per the 9d77172 rule:
+// /user/webauthn is two segments, the dynamic /:owner/:repo pair would
+// otherwise take the GETs.
+import { webauthnRouter } from "./web/webauthn";
+app.route("/", webauthnRouter);
+app.route("/", uiRouter);
 // The OAuth2 authorize pair (SPEC oauth2-provider.md W3): /login/oauth/
 // authorize + /login/oauth/grant — session-bound UI routes in the session
 // family; the oauth2Enabled 403 wrap rides W4 (the commented slot at the
@@ -342,7 +359,8 @@ app.route("/", sessionRouter);
 app.route("/", oauth2AuthorizeRouter);
 // The EXTERNAL-AUTH login pair (SPEC external-auth-sources.md W2):
 // /user/oauth2/{source} + its /callback — the OIDC client flow's legs
-// (web.go:768-771's mounts).
+// (web.go:768-771's mounts) — 3+-segment shapes, so post-uiRouter mounting
+// is safe here.
 app.route("/", oauth2LoginRouter);
 
 export default {
@@ -415,7 +433,25 @@ export default {
       (segments[1] === "oauth2" ||
         segments[1] === "link_account" ||
         segments[1] === "link_account_signin" ||
-        segments[1] === "link_account_signup");
+        segments[1] === "link_account_signup" ||
+        // THE CONSOLIDATED AUTH FOLD (b8ff967's HANDOFF — the WebAuthn and
+        // TOTP gate units landed their routers but the routes were
+        // unreachable until this carve): the pre-auth WebAuthn gate family
+        // (/user/webauthn — web.go:658-664's five login arms on
+        // webauthnRouter), the settings quartet
+        // (/user/settings/security/webauthn/* — web.go:669-673's four POSTs
+        // + the GET 405 twins, same router), and the TOTP gate family
+        // (/user/two_factor[/scratch] — web.go:600-604's group on
+        // sessionRouter; probe-verified that parseUiRoute claims NONE of
+        // these paths, so without the arms the repo-scoped branch hands
+        // them to the headless engine before Hono ever sees the mounts).
+        // "user" and "settings" are reserved first/second segments upstream
+        // (models/user/user.go:642), so the arms never shadow an
+        // /owner/repo pair; unregistered tails take Hono's default 404 at
+        // the isLoginPath grain.
+        segments[1] === "webauthn" ||
+        (segments[1] === "settings" && segments[2] === "security" && segments[3] === "webauthn") ||
+        segments[1] === "two_factor");
     // THE ASSET-MISS FALLBACK TARGET (web.go:264 + modules/public/public.go —
     // the v1.2-carried "no /assets fallback target" residual closed): the
     // wrangler assets binding serves every HIT edge-side with

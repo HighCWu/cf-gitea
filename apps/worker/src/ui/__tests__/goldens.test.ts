@@ -1357,7 +1357,10 @@ const NEW_GOLDEN_CASES: GoldenCase[] = [
   //     Enabled arm, the keep-count / keep-pattern / remove-days bodies, and
   //     the row's Edit + Preview links keyed on the rule's autoincrement id
   //     (1 — the fresh file storage's first insert, the fixed seed order
-  //     precedent). No cargo section (the module's documented reduction) and
+  //     precedent). The CARGO section renders (the template's second include
+  //     — the landed user-settings-packages-cargo module; the pre-substrate
+  //     dead-control reduction expired at e4d7e49 and this golden was
+  //     re-baselined with it), and
   //     no timestamps — the created_unix pin in the fixture block is
   //     determinism insurance, not a rendered byte. History: this golden was
   //     EXCLUDED at first landing because the real-route drive answered 404 —

@@ -232,6 +232,21 @@ describe("the platform-arms route claims (the module header's HANDOFF shapes)", 
     expect(parseUiRoute("/-/admin/monitor/queue/repo-tasks/sets")).toBeNull();
     expect(handlesUiRoute("/-/admin/monitor/diagnosis/extra")).toBe(false);
   });
+
+  it("the remove-all write parses with the qid/literal pair at the registration's shape (the cd6ea38 segment-swap referral's pin)", () => {
+    // The registration and the rendered queue_manage.tmpl form both put the
+    // queue NAME at the THIRD segment and the literal at the FOURTH
+    // (/-/admin/monitor/queue/{qid}/remove-all-items — web.go:807's group
+    // order); the landed claim checked the pair swapped, so the form's exact
+    // POST fell to the engine's 404. This pin is the agreement proof.
+    expect(parseUiRoute("/-/admin/monitor/queue/repo-tasks/remove-all-items")).toEqual({
+      family: "admin-monitor-queue-remove-all",
+      qid: "repo-tasks",
+    });
+    expect(handlesUiRoute("/-/admin/monitor/queue/repo-tasks/remove-all-items")).toBe(true);
+    // The swapped shape (literal third, qid fourth) stays unclaimed.
+    expect(parseUiRoute("/-/admin/monitor/queue/remove-all-items/repo-tasks")).toBeNull();
+  });
 });
 
 // --- POST /-/admin/monitor/queue/{qid}/set -----------------------------------

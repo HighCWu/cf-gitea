@@ -20,7 +20,9 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../auth/testing/seeds";
-import { loginSources, repositories, repoSettings, users } from "../db/schema";
+import { applyTwofaEnrollment, generateTotpSecret, mintPendingTicket } from "../auth/two-factor";
+import { totpCode } from "../auth/totp";
+import { loginSources, repositories, repoSettings, twoFactor, users } from "../db/schema";
 import { getOrInsertBlob, packageBlobContentKey } from "../services/packages/blobs";
 import { getOrInsertPackage, getOrInsertVersion, tryInsertFile } from "../services/packages/model";
 import { resetManifestCache, type UiManifest } from "./manifest";
@@ -428,14 +430,17 @@ describe("parseUiRoute", () => {
     ["/acme/settings/packages/rules/add", { family: "org-settings-packages-rule-add", owner: "acme" }],
     ["/acme/settings/packages/rules/7", { family: "org-settings-packages-rule-edit", owner: "acme", id: 7 }],
     ["/acme/settings/packages/rules/7/preview", { family: "org-settings-packages-rule-preview", owner: "acme", id: 7 }],
-    ["/acme/settings/packages/cargo/initialize", null], // the cargo tails stay unregistered
+    ["/acme/settings/packages/cargo/initialize", { family: "org-settings-packages-cargo-initialize", owner: "acme" }],
+    ["/acme/settings/packages/cargo/rebuild", { family: "org-settings-packages-cargo-rebuild", owner: "acme" }],
+    ["/acme/settings/packages/cargo/other", null], // the group claims the two write tails only
     ["/acme/settings/packages/rules/junk", null], // non-numeric id
     // The USER-scope packages family (the same nesting-bug guard class).
     ["/user/settings/packages", { family: "user-settings-packages", id: null }],
     ["/user/settings/packages/rules/add", { family: "user-settings-packages-rule-add", id: null }],
     ["/user/settings/packages/rules/7", { family: "user-settings-packages-rule-edit", id: 7 }],
     ["/user/settings/packages/rules/7/preview", { family: "user-settings-packages-rule-preview", id: 7 }],
-    ["/user/settings/packages/cargo/initialize", null], // the cargo tail stays unregistered (the chef tail is claimed)
+    ["/user/settings/packages/cargo/initialize", { family: "user-settings-packages-cargo-initialize", id: null }], // the cargo tails ARE claimed (the e4d7e49 substrate; the chef tail is claimed too)
+    ["/user/settings/packages/cargo/rebuild", { family: "user-settings-packages-cargo-rebuild", id: null }],
     ["/user/settings/packages/rules/junk", null], // non-numeric id
     // The P2-1/P2-2 actions-general mounts (web.go:722/:724 user,
     // :1052/:1054 org — the bare group redirects + the General pages).
@@ -443,6 +448,16 @@ describe("parseUiRoute", () => {
     ["/acme/settings/actions/general", { family: "org-settings-actions-general", owner: "acme" }],
     ["/user/settings/actions", { family: "user-settings-actions-redirect", id: null }],
     ["/user/settings/actions/general", { family: "user-settings-actions-general", id: null }],
+    // The TOTP settings four (the twofa.tsx module header's HANDOFF recipe —
+    // the 228b16e fold, security/2fa.go's group): the enroll GET+POST share
+    // the one path family, the two write POSTs beside it; junk tails stay
+    // engine-owned.
+    ["/user/settings/security/two_factor/enroll", { family: "user-settings-security-twofa-enroll", id: null }],
+    ["/user/settings/security/two_factor/regenerate_scratch", { family: "user-settings-security-twofa-regenerate", id: null }],
+    ["/user/settings/security/two_factor/disable", { family: "user-settings-security-twofa-disable", id: null }],
+    ["/user/settings/security/two_factor/enroll/extra", null], // deeper tails stay engine-owned
+    ["/user/settings/security/two_factor/other", null], // unknown literal sibling
+    ["/user/settings/security/two_factor", null], // the bare group is unclaimed (upstream 404s it too)
     // The store wave's SCOPED-WORKFLOWS mounts (web.go:517-523's shared
     // four-route group at the three scopes — web.go:730 user, :1060 org,
     // :903 admin): the GET page literals + the three static write tails.
@@ -475,6 +490,35 @@ describe("parseUiRoute", () => {
     ["/-/admin/auths/7/extra", null], // deeper tails stay engine-owned
     ["/-/admin/auths/new/delete", null], // the delete tail claims digits only
     ["/-/admin/auths/extra", null], // unknown literal sibling
+    // The SPEC-0021 platform arms (the 6cc57d8 module's fold — the module
+    // header's HANDOFF): the {qid} group's /set write (the queue NAME qid
+    // rides the THIRD segment, upstream's chi group shape) and the two
+    // 2-segment literals.
+    ["/-/admin/monitor/queue/repo-tasks/set", { family: "admin-monitor-queue-set", qid: "repo-tasks" }],
+    ["/-/admin/monitor/diagnosis", { family: "admin-monitor-diagnosis" }],
+    ["/-/admin/monitor/profile", { family: "admin-monitor-profile" }],
+    ["/-/admin/monitor/queue/repo-tasks/set/extra", null], // deeper tails stay engine-owned
+    ["/-/admin/monitor/diagnosis/extra", null],
+    ["/-/admin/monitor/profilez", null], // junk literal sibling
+    // The remove-all write (web.go:807's group shape — the same {qid} third
+    // segment as /set; the landed claim had the pair SEGMENT-SWAPPED and the
+    // rendered form 404'd, the cd6ea38 referral fixed 2026-11-01).
+    ["/-/admin/monitor/queue/repo-tasks/remove-all-items", { family: "admin-monitor-queue-remove-all", qid: "repo-tasks" }],
+    ["/-/admin/monitor/queue/remove-all-items/repo-tasks", null], // the swapped shape stays unclaimed
+    ["/-/admin/monitor/queue/repo-tasks/remove-all-items/extra", null],
+    // The admin users family (web.go:817-821): the detail/edit/impersonate/
+    // avatar combos — the edit claim was brace-nested inside the detail arm
+    // until the cd6ea38 referral's placement fix (never reachable); these
+    // pins hold the sibling shapes apart.
+    ["/-/admin/users", { family: "admin-users" }],
+    ["/-/admin/users/7", { family: "admin-user-detail", adminUserId: 7 }],
+    ["/-/admin/users/7/edit", { family: "admin-user-edit", adminUserId: 7 }],
+    ["/-/admin/users/7/impersonate", { family: "admin-users-impersonate", adminUserId: 7 }],
+    ["/-/admin/users/7/avatar", { family: "admin-user-avatar", adminUserId: 7 }],
+    ["/-/admin/users/7/avatar/delete", { family: "admin-user-avatar-delete", adminUserId: 7 }],
+    ["/-/admin/users/x/edit", null], // junk id
+    ["/-/admin/users/7/edit/extra", null], // deeper tails stay engine-owned
+    ["/-/admin/users/edit", null], // the literal stays unclaimed (digits only)
     // The repo-scoped twin stays unclaimed — the repo settings actions
     // family has no scoped-workflows tail (the engine's 404).
     ["/alice/demo/settings/actions/scoped-workflows", null],
@@ -973,5 +1017,248 @@ describe("uiRouter", () => {
     const twin = await fetchAuthed("/-/admin/auths/1/delete", cookie);
     expect(twin.status).toBe(405);
     expect(twin.headers.get("allow")).toBe("POST");
+  });
+});
+
+// --- the TOTP settings four (the twofa.tsx module header's HANDOFF recipe —
+// --- the 228b16e fold; upstream security/2fa.go's group) ----------------------
+
+describe("the TOTP settings four (the twofa.tsx HANDOFF fold)", () => {
+  // The enroll page renders over the settings layout; the three POSTs ride
+  // the sameOriginGuard via the prologue's write mode. The pending-secret
+  // stash is the signed gitea_twofa "enroll" ticket (auth/two-factor.ts).
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM two_factor").run();
+  });
+
+  async function fetchAuthed(
+    path: string,
+    cookie: string,
+    options: { method?: string; body?: string; headers?: Record<string, string> } = {},
+  ): Promise<Response> {
+    return uiRouter.fetch(
+      new Request(`https://test.local${path}`, {
+        method: options.method ?? "GET",
+        headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}`, ...options.headers },
+        body: options.body,
+      }),
+      uiEnv,
+    );
+  }
+
+  /** The enroll page's shown secret (the or_enter_secret line's payload). */
+  function shownSecret(html: string): string {
+    const match = /Or enter the secret: ([A-Z2-7]+)/.exec(html);
+    expect(match).not.toBe(null);
+    return match![1]!;
+  }
+
+  it("gates the enroll page: anonymous 303, already-enrolled 303, fresh render carries the stash", async () => {
+    const user = await seedVerifiedUser({ username: "Tosha" });
+
+    // Anonymous: the settings prologue 303s onto the login round-trip.
+    const bounce = await fetchUi("/user/settings/security/two_factor/enroll");
+    expect(bounce.status).toBe(303);
+    expect(bounce.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent("/user/settings/security/two_factor/enroll")}`,
+    );
+
+    // The fresh enroll render: the otpauth URI + the secret line, and the
+    // signed enroll stash riding Set-Cookie.
+    const cookie = await mintSession(env.DB, user.id);
+    const fresh = await fetchAuthed("/user/settings/security/two_factor/enroll", cookie);
+    expect(fresh.status).toBe(200);
+    const html = await fresh.text();
+    expect(html).toContain('class="page-content user settings twofa"');
+    expect(html).toContain('action="/user/settings/security/two_factor/enroll"');
+    expect(html).toContain("otpauth://totp/");
+    const secret = shownSecret(html);
+    expect(secret.length).toBeGreaterThanOrEqual(16);
+    const stash = fresh.headers.get("set-cookie") ?? "";
+    expect(stash).toContain("gitea_twofa=");
+
+    // A carried stash re-renders the SAME secret with no fresh stash (the
+    // begin/reuse arm — the invalid-passcode 303's re-render substrate).
+    const stashValue = stash.split(";")[0]!.split("=").slice(1).join("=");
+    const reuse = await fetchAuthed("/user/settings/security/two_factor/enroll", cookie, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}; gitea_twofa=${stashValue}` },
+    });
+    expect(reuse.status).toBe(200);
+    expect(shownSecret(await reuse.text())).toBe(secret);
+    expect(reuse.headers.get("set-cookie")).toBeNull();
+
+    // The already-enrolled refusal: an enrolled doer 303s the canonical
+    // security page (upstream's `t != nil` pre-check arm).
+    const secret2 = generateTotpSecret();
+    const enrolled = await applyTwofaEnrollment(
+      env.DB,
+      user.id,
+      await totpCode(secret2, Math.floor(Date.now() / 1000)),
+      await mintPendingTicket(env.DB, { kind: "enroll", secret: secret2 }),
+    );
+    expect(enrolled.outcome).toBe("enrolled");
+    const refused = await fetchAuthed("/user/settings/security/two_factor/enroll", cookie);
+    expect(refused.status).toBe(303);
+    expect(refused.headers.get("location")).toBe("/user/settings/security");
+  });
+
+  it("enrolls end-to-end over the route: valid passcode activates, invalid 303s back to the same secret", async () => {
+    const user = await seedVerifiedUser({ username: "Tosha" });
+    const cookie = await mintSession(env.DB, user.id);
+
+    // Begin: capture the shown secret + stash.
+    const fresh = await fetchAuthed("/user/settings/security/two_factor/enroll", cookie);
+    const html = await fresh.text();
+    const secret = shownSecret(html);
+    const stash = (fresh.headers.get("set-cookie") ?? "").split(";")[0]!.split("=").slice(1).join("=");
+
+    // The invalid passcode: 303 back onto the GET (the plain-form reduction).
+    const formHeaders = { "content-type": "application/x-www-form-urlencoded", origin: "https://test.local" };
+    const invalid = await fetchAuthed("/user/settings/security/two_factor/enroll", cookie, {
+      method: "POST",
+      headers: { ...formHeaders, cookie: `${SESSION_COOKIE_NAME}=${cookie}; gitea_twofa=${stash}` },
+      body: "passcode=000000",
+    });
+    expect(invalid.status).toBe(303);
+    expect(invalid.headers.get("location")).toBe("/user/settings/security/two_factor/enroll");
+    expect(await drizzle(env.DB).select().from(twoFactor).all()).toHaveLength(0);
+
+    // The valid passcode: verify-once activates; the security page re-renders
+    // at 200 with the once-shown scratch token in the positive notice.
+    const now = Math.floor(Date.now() / 1000);
+    const code = await totpCode(secret, now);
+    const enroll = await fetchAuthed("/user/settings/security/two_factor/enroll", cookie, {
+      method: "POST",
+      headers: { ...formHeaders, cookie: `${SESSION_COOKIE_NAME}=${cookie}; gitea_twofa=${stash}` },
+      body: `passcode=${code}`,
+    });
+    expect(enroll.status).toBe(200);
+    const enrolledHtml = await enroll.text();
+    expect(enrolledHtml).toContain("successfully enrolled");
+    expect(enrolledHtml).toContain("Store your single-use recovery key (");
+    const row = await drizzle(env.DB).select().from(twoFactor).all();
+    expect(row).toHaveLength(1);
+    expect(row[0]!.userId).toBe(user.id);
+    expect(row[0]!.secret).toBe(secret);
+  });
+
+  it("regenerates the scratch token and disables over the routes, with the code requirement", async () => {
+    const user = await seedVerifiedUser({ username: "Tosha" });
+    const cookie = await mintSession(env.DB, user.id);
+    const formHeaders = { "content-type": "application/x-www-form-urlencoded", origin: "https://test.local" };
+
+    // Enroll directly through the seam (the route covered above), keeping
+    // the once-shown scratch token for the later disable arm.
+    const secret = generateTotpSecret();
+    const ticket = await mintPendingTicket(env.DB, { kind: "enroll", secret });
+    const enrolled = await applyTwofaEnrollment(env.DB, user.id, await totpCode(secret, Math.floor(Date.now() / 1000)), ticket);
+    expect(enrolled.outcome).toBe("enrolled");
+    const firstScratch = enrolled.outcome === "enrolled" ? enrolled.scratchToken : "";
+
+    // Regenerate: 200 re-render with the once-shown token; the not-enrolled
+    // miss arm 303s back (covered by the row's presence here).
+    const regen = await fetchAuthed("/user/settings/security/two_factor/regenerate_scratch", cookie, {
+      method: "POST",
+      headers: formHeaders,
+    });
+    expect(regen.status).toBe(200);
+    const regenHtml = await regen.text();
+    expect(regenHtml).toContain("Your single-use recovery key is now ");
+    expect(regenHtml).not.toContain(firstScratch);
+
+    // Disable with a WRONG code: the negative notice re-render, the row STAYS.
+    const wrong = await fetchAuthed("/user/settings/security/two_factor/disable", cookie, {
+      method: "POST",
+      headers: formHeaders,
+      body: "passcode=000000",
+    });
+    expect(wrong.status).toBe(200);
+    expect(await wrong.text()).toContain("The passcode is incorrect. Try again.");
+    expect(await drizzle(env.DB).select().from(twoFactor).all()).toHaveLength(1);
+
+    // Disable with a valid passcode: 303 the canonical URL, the row gone.
+    const code = await totpCode(secret, Math.floor(Date.now() / 1000));
+    const disable = await fetchAuthed("/user/settings/security/two_factor/disable", cookie, {
+      method: "POST",
+      headers: formHeaders,
+      body: `passcode=${code}`,
+    });
+    expect(disable.status).toBe(303);
+    expect(disable.headers.get("location")).toBe("/user/settings/security");
+    expect(await drizzle(env.DB).select().from(twoFactor).all()).toHaveLength(0);
+  });
+
+  it("arms the write guards: the cross-origin reject and the two GET 405 twins", async () => {
+    const user = await seedVerifiedUser({ username: "Tosha" });
+    const cookie = await mintSession(env.DB, user.id);
+
+    // The §2.8 sameOriginGuard rides the prologue's write mode.
+    const forged = await fetchAuthed("/user/settings/security/two_factor/regenerate_scratch", cookie, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://evil.example" },
+    });
+    expect(forged.status).toBe(403);
+
+    // The POST-only tails' GET twins answer chi's 405 (Allow: POST).
+    for (const path of [
+      "/user/settings/security/two_factor/regenerate_scratch",
+      "/user/settings/security/two_factor/disable",
+    ]) {
+      const twin = await fetchAuthed(path, cookie);
+      expect(twin.status, path).toBe(405);
+      expect(twin.headers.get("allow")).toBe("POST");
+      expect(await twin.text()).toBe("Method Not Allowed\n");
+    }
+  });
+});
+
+// --- the admin-user-edit route (the cd6ea38 referral's placement fix — the
+// --- claim was brace-nested inside the detail arm and never reachable) --------
+
+describe("GET /-/admin/users/{id}/edit (the placement fix's route pin)", () => {
+  async function fetchAuthed(
+    path: string,
+    cookie: string | null,
+  ): Promise<Response> {
+    return uiRouter.fetch(
+      new Request(`https://test.local${path}`, {
+        headers: cookie === null ? {} : { cookie: `${SESSION_COOKIE_NAME}=${cookie}` },
+      }),
+      uiEnv,
+    );
+  }
+
+  it("answers the be89414 gate ladder: anonymous 303, non-admin 404, admin 200", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+
+    // Anonymous: the admin prologue 303s onto the login round-trip.
+    const bounce = await fetchAuthed(`/-/admin/users/${alice.id}/edit`, null);
+    expect(bounce.status).toBe(303);
+    expect(bounce.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent(`/-/admin/users/${alice.id}/edit`)}`,
+    );
+
+    // The signed-in non-admin: the hidden admin surface 404-shells.
+    const peon = await seedVerifiedUser({ username: "Peon" });
+    const peonCookie = await mintSession(env.DB, peon.id);
+    const forbidden = await fetchAuthed(`/-/admin/users/${alice.id}/edit`, peonCookie);
+    expect(forbidden.status).toBe(404);
+    expect(await forbidden.text()).toContain("<title>Page Not Found - cf-gitea</title>");
+
+    // The admin: the edit page renders over the seeded row.
+    const admin = await seedVerifiedUser({ username: "Root", isAdmin: true });
+    const adminCookie = await mintSession(env.DB, admin.id);
+    const ok = await fetchAuthed(`/-/admin/users/${alice.id}/edit`, adminCookie);
+    expect(ok.status).toBe(200);
+    const html = await ok.text();
+    expect(html).toContain(`action="/-/admin/users/${alice.id}/edit" method="post"`);
+  });
+
+  it("an unknown id 303s the admin list (the handler's miss arm through the now-reachable route)", async () => {
+    const admin = await seedVerifiedUser({ username: "Root", isAdmin: true });
+    const cookie = await mintSession(env.DB, admin.id);
+    const miss = await fetchAuthed("/-/admin/users/999999/edit", cookie);
+    expect(miss.status).toBe(303);
+    expect(miss.headers.get("location")).toBe("/-/admin/users");
   });
 });

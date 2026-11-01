@@ -5,8 +5,23 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { applyAuthD1Migrations } from "./auth/testing/apply-d1-migrations";
 import { basicHeader, basicTokenHeader, mintFor, resetAuthTables, seedVerifiedUser } from "./auth/testing/seeds";
 import { fnv1a32 } from "./auth/failure-limiter";
-import { authFailures, repositories } from "./db/schema";
+import { mintPendingTicket } from "./auth/two-factor";
+import { authFailures, repositories, twoFactor, webauthnCredentials } from "./db/schema";
 import { asByteStream, gunzipCapped, withVerifiedStart } from "./git-http/gzip";
+import { signCeremonyState, verifyCeremonyState } from "./web/webauthn-ceremony";
+import { base64UrlEncode, sha256 } from "./web/webauthn-cose";
+import {
+  buildAssertionResponse,
+  buildAuthData,
+  clientDataJson,
+  FLAG_UP,
+  FLAG_UV,
+  FIXED_AAGUID,
+  makeEcFixture,
+  signWith,
+  type EcFixture,
+} from "./web/webauthn-fixtures";
+import { mintSession, SESSION_COOKIE_NAME } from "./ui/session";
 import { ensureSeededRepo } from "./ui/testing/seed-repo";
 
 // The git authorize hook verifies PATs against D1 (SPEC-0002), so the
@@ -1106,6 +1121,212 @@ describe("the /user auth-page family carve (upstream web.go:597-599 + 768-771)",
     const res = await SELF.fetch("https://example.com/user/link_account", { headers: { accept: "text/html" } });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("text/html; charset=UTF-8");
+  });
+});
+
+// --- the consolidated auth fold (b8ff967's HANDOFF: the webauthn +
+// --- two_factor carve + the webauthnRouter mount) ------------------------------
+
+describe("the consolidated auth fold (the webauthn + two_factor carve, upstream web.go:600-604/658-664/669-673)", () => {
+  // The probe record (the fold's own verification, 2026-11-01): parseUiRoute
+  // claims NONE of these paths (ui/index.ts has zero webauthn/two_factor
+  // arms), so before the carve every shape here fell into the repo-scoped
+  // branch — owner "user", repo "webauthn"/"two_factor", no D1 row — and the
+  // headless engine answered before Hono ever saw the mounts. The arms ride
+  // their own mounted routers: the TOTP gate family on sessionRouter
+  // (ui/session.ts's own registrations), the WebAuthn login family + the
+  // settings quartet on webauthnRouter (web/webauthn.ts).
+  let ec: EcFixture;
+
+  beforeAll(async () => {
+    ec = await makeEcFixture();
+  });
+
+  /** The webauthn/twofa tables the file-level beforeEach does not cover. */
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM webauthn_credentials").run();
+    await env.DB.prepare("DELETE FROM two_factor").run();
+    await env.DB.prepare("DELETE FROM sessions").run();
+  });
+
+  /** Insert an enrolled credential row (webauthn.test.ts's fixture shape). */
+  async function enrollCredential(userId: number): Promise<{ id: number; credentialId: Uint8Array }> {
+    const credentialId = new Uint8Array([0x01, 0x02, 0x03, 0x04]);
+    const sec = Math.floor(Date.now() / 1000);
+    const rows = await drizzle(env.DB)
+      .insert(webauthnCredentials)
+      .values({
+        userId,
+        name: "fold key",
+        lowerName: "fold key",
+        credentialId,
+        publicKey: ec.coseBytes,
+        attestationType: "none",
+        aaguid: FIXED_AAGUID,
+        signCount: 0,
+        transports: null,
+        cloneWarning: false,
+        createdUnix: sec,
+        updatedUnix: sec,
+      })
+      .returning()
+      .all();
+    return { id: rows[0]!.id, credentialId };
+  }
+
+  /** The synthetic signed assertion for an enrolled credential (the
+   *  fixtures sign for the SELF origin the dispatcher sees). */
+  async function assertionBody(credentialId: Uint8Array, challenge: string): Promise<Record<string, unknown>> {
+    const authData = await buildAuthData({ rpId: "example.com", flags: FLAG_UP | FLAG_UV, signCount: 1 });
+    const clientData = clientDataJson("webauthn.get", challenge, "https://example.com");
+    const clientHash = await sha256(clientData);
+    const signed = new Uint8Array(authData.length + clientHash.length);
+    signed.set(authData, 0);
+    signed.set(clientHash, authData.length);
+    const signature = await signWith(ec, signed);
+    return buildAssertionResponse({ credentialId, authData, clientData, signature, userHandle: null });
+  }
+
+  it("keeps unregistered family tails on Hono's default 404 (the isLoginPath grain)", async () => {
+    // The carve hands the WHOLE prefix to Hono; a shape no mount registers
+    // takes Hono's plain default — never the engine's lowercase `not found\n`
+    // and never the HTML 404 shell (the /user/oauth2 twin's pin).
+    for (const path of ["/user/webauthn/junk", "/user/settings/security/webauthn/junk", "/user/two_factor/junk"]) {
+      const res = await SELF.fetch(`https://example.com${path}`, { redirect: "manual" });
+      expect(res.status).toBe(404);
+      expect(res.headers.get("content-type")).toBe("text/plain; charset=UTF-8");
+      expect(await res.text()).toBe("404 Not Found");
+    }
+  });
+
+  it("hands the WebAuthn login family to the mounted router — the bare gate answers the router's 500, not the engine", async () => {
+    // No carrier: webAuthnPage's "not in WebAuthn session" arm — the exact
+    // plain-text ServerError posture the pre-carve engine could never answer
+    // (it had `not found\n`). Reachability with zero fixtures.
+    const res = await SELF.fetch("https://example.com/user/webauthn", { redirect: "manual" });
+    expect(res.status).toBe(500);
+    expect(res.headers.get("content-type")).toBe("text/plain;charset=utf-8");
+    expect(await res.text()).toBe("Internal Server Error\n");
+  });
+
+  it.skipIf(!UI_ASSETS_BUILT)("renders the WebAuthn gate page over a pending carrier", async () => {
+    const user = await seedVerifiedUser();
+    await enrollCredential(user.id);
+    const pending = await signCeremonyState(env.DB, { k: "pending", uid: user.id, ch: "", rem: false, to: "/" });
+    const res = await SELF.fetch("https://example.com/user/webauthn", {
+      headers: { cookie: `gitea_webauthn=${encodeURIComponent(pending)}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/html; charset=UTF-8");
+    // The prompt's wire contract (the bundle's activation marker).
+    expect(await res.text()).toContain("user signin webauthn-prompt");
+  });
+
+  it("hands the assertion ladder to the mounted router — challenge GET, fixture POST, session mint", async () => {
+    const user = await seedVerifiedUser();
+    const cred = await enrollCredential(user.id);
+    const pending = await signCeremonyState(env.DB, { k: "pending", uid: user.id, ch: "", rem: false, to: "/" });
+    const pendingCookie = `gitea_webauthn=${encodeURIComponent(pending)}`;
+
+    const optionsRes = await SELF.fetch("https://example.com/user/webauthn/assertion", {
+      headers: { cookie: pendingCookie },
+    });
+    expect(optionsRes.status).toBe(200);
+    const options = await optionsRes.json<{ publicKey: { rpId: string; allowCredentials: Array<{ id: string }> } }>();
+    expect(options.publicKey.rpId).toBe("example.com");
+    expect(options.publicKey.allowCredentials).toEqual([{ type: "public-key", id: base64UrlEncode(cred.credentialId) }]);
+    const assertCookie = (optionsRes.headers.get("set-cookie") ?? "").split(";")[0]!;
+
+    const state = await verifyCeremonyState(env.DB, decodeURIComponent(assertCookie.split("=").slice(1).join("=")), "assert");
+    expect(state?.k).toBe("assert");
+    const verifyRes = await SELF.fetch("https://example.com/user/webauthn/assertion", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: "https://example.com",
+        cookie: `${pendingCookie}; ${assertCookie}`,
+      },
+      body: JSON.stringify(await assertionBody(cred.credentialId, state!.ch)),
+    });
+    expect(verifyRes.status).toBe(200);
+    expect(await verifyRes.json<{ redirect: string }>()).toEqual({ redirect: "/" });
+    // The session row minted through the dispatcher round-trip.
+    const sessions = await env.DB.prepare("SELECT count(*) AS n FROM sessions").all<{ n: number }>();
+    expect(sessions.results[0]?.n).toBe(1);
+  });
+
+  it("hands the settings quartet to the mounted router — the GET 405 twins and a live rename arm", async () => {
+    // The 405 twins are registrations on the router itself — an exact
+    // reachability probe per path that never touches the shell.
+    for (const path of [
+      "/user/settings/security/webauthn/request_register",
+      "/user/settings/security/webauthn/register",
+      "/user/settings/security/webauthn/rename",
+      "/user/settings/security/webauthn/delete",
+    ]) {
+      const res = await SELF.fetch(`https://example.com${path}`, { redirect: "manual" });
+      expect(res.status).toBe(405);
+      expect(res.headers.get("allow")).toBe("POST");
+      expect(await res.text()).toBe("Method Not Allowed\n");
+    }
+
+    // One live POST arm: a signed-in rename of a nonexistent id reaches the
+    // handler and takes its upstream-exact JSON 404 (the engine's plain
+    // `not found\n` is unreachable).
+    const user = await seedVerifiedUser();
+    const session = await mintSession(env.DB, user.id, { remember: false });
+    const res = await SELF.fetch("https://example.com/user/settings/security/webauthn/rename", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        cookie: `${SESSION_COOKIE_NAME}=${session}`,
+      },
+      body: "id=99999&name=fold-probe",
+    });
+    expect(res.status).toBe(404);
+    expect(await res.json<{ errorMessage: string }>()).toEqual({ errorMessage: "WebAuthn credential does not exist" });
+  });
+
+  it.skipIf(!UI_ASSETS_BUILT)("hands the TOTP gate family to the session router — the passcode page over a gate ticket", async () => {
+    const user = await seedVerifiedUser();
+    const ticket = await mintPendingTicket(env.DB, { kind: "gate", userId: user.id, remember: false, redirectTo: "/" });
+    const res = await SELF.fetch("https://example.com/user/two_factor", {
+      headers: { cookie: `gitea_twofa=${ticket}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/html; charset=UTF-8");
+    const html = await res.text();
+    expect(html).toContain('action="/user/two_factor"');
+
+    // The scratch twin rides the same ticket.
+    const scratch = await SELF.fetch("https://example.com/user/two_factor/scratch", {
+      headers: { cookie: `gitea_twofa=${ticket}` },
+    });
+    expect(scratch.status).toBe(200);
+    expect(await scratch.text()).toContain('action="/user/two_factor/scratch"');
+  });
+
+  it.skipIf(!UI_ASSETS_BUILT)("hands the TOTP gate POST to the session router — a wrong passcode re-renders the gate", async () => {
+    const user = await seedVerifiedUser();
+    const sec = Math.floor(Date.now() / 1000);
+    await drizzle(env.DB).insert(twoFactor).values({
+      userId: user.id,
+      secret: "JBSWY3DPEHPK3PXP", // valid base32 (the RFC 4226 example alphabet)
+      scratchSalt: "fold-salt",
+      scratchHash: "fold-hash",
+      createdUnix: sec,
+      updatedUnix: sec,
+    });
+    const ticket = await mintPendingTicket(env.DB, { kind: "gate", userId: user.id, remember: false, redirectTo: "/" });
+    const res = await SELF.fetch("https://example.com/user/two_factor", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: `gitea_twofa=${ticket}` },
+      body: "passcode=000000",
+    });
+    // The failure re-render — 200 with the inline message (the login
+    // posture; the engine's plain 404 is unreachable).
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Your passcode is incorrect");
   });
 });
 

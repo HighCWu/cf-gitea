@@ -1109,6 +1109,25 @@ import {
   renderUserSettingsSecurityPage,
   userSettingsSecurityLocale,
 } from "./pages/user-settings-security";
+// The TOTP settings four (the twofa.tsx module header's HANDOFF recipe —
+// the folded handlers below are that recipe verbatim over the module's
+// exported seams; the enrollment scratch token rides the security page's
+// notice slot).
+import {
+  applyTwofaDisable,
+  applyTwofaEnrollment,
+  generateTotpSecret,
+  getTwoFactorByUid,
+  hasTwoFactorByUid,
+  mintPendingTicket,
+  otpauthUri,
+  regenerateScratchToken,
+  twofaCookieValue,
+  twofaIssuer,
+  twofaSetCookie,
+  verifyPendingTicket,
+} from "../auth/two-factor";
+import { renderTwofaEnrollPage, twofaLocale } from "./pages/twofa";
 // The user-scope blocked-users settings pair (web.go:750-752 — census
 // gap #14, the org twin's user-scope sibling).
 import {
@@ -3630,6 +3649,9 @@ export interface UserSettingsTabRoute {
     | "user-settings-appearance-theme"
     | "user-settings-appearance-language"
     | "user-settings-security"
+    | "user-settings-security-twofa-enroll" // GET+POST /user/settings/security/two_factor/enroll (security/2fa.go:164-286)
+    | "user-settings-security-twofa-regenerate" // POST /user/settings/security/two_factor/regenerate_scratch (security/2fa.go:31-66)
+    | "user-settings-security-twofa-disable" // POST /user/settings/security/two_factor/disable (security/2fa.go:69-104)
     | "user-settings-secrets"
     | "user-settings-secrets-delete"
     | "user-settings-actions-redirect" // GET /user/settings/actions (web.go:722 bare LocationRedirect)
@@ -4080,6 +4102,20 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       return { family: "user-settings-appearance-language", id: null };
     }
     if (tail.length === 1 && tail[0] === "security") return { family: "user-settings-security", id: null };
+    // The TOTP settings four (the twofa.tsx module header's HANDOFF recipe —
+    // folded 2026-11-01; upstream security/2fa.go's group nested inside the
+    // security settings): the enroll GET+POST share the one path family, the
+    // two write POSTs beside it. The literals bind under the reserved
+    // user/settings prefix; deeper junk tails stay unclaimed (the engine).
+    if (tail.length === 3 && tail[0] === "security" && tail[1] === "two_factor" && tail[2] === "enroll") {
+      return { family: "user-settings-security-twofa-enroll", id: null };
+    }
+    if (tail.length === 3 && tail[0] === "security" && tail[1] === "two_factor" && tail[2] === "regenerate_scratch") {
+      return { family: "user-settings-security-twofa-regenerate", id: null };
+    }
+    if (tail.length === 3 && tail[0] === "security" && tail[1] === "two_factor" && tail[2] === "disable") {
+      return { family: "user-settings-security-twofa-disable", id: null };
+    }
     // The blocked-users pair (web.go:750-752 — the navbar's order puts it
     // between Security and Applications).
     if (tail.length === 1 && tail[0] === "blocked_users") return { family: "user-settings-blocked-users", id: null };
@@ -4337,14 +4373,19 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     const tail = raw.slice(3);
     if (tail.length === 0) return { family: "admin-dashboard" };
     if (tail.length === 1 && tail[0] === "users") return { family: "admin-users" };
-    // The user detail page + the impersonate/avatar writes (web.go:817-821 —
-    // digits-only, junk stays engine-404; the detail page's miss 303s to the
-    // LIST at the handler per prepareUserInfo).
+    // The user detail page + the edit combo + the impersonate/avatar writes
+    // (web.go:817-821 — digits-only, junk stays engine-404; the detail
+    // page's miss 303s to the LIST at the handler per prepareUserInfo).
+    // THE PLACEMENT FIX (the cd6ea38 referral, 2026-11-01): the edit claim
+    // was brace-nested AFTER the detail arm's return — syntactically legal
+    // (tsc never flagged the dead nested if) and therefore NEVER reachable;
+    // the 07c969b fold's placement bug. Both claims stand alone as siblings,
+    // mutually exclusive by tail length.
     if (tail.length === 2 && tail[0] === "users" && /^\d+$/.test(tail[1] as string)) {
       return { family: "admin-user-detail", adminUserId: Number.parseInt(tail[1] as string, 10) };
+    }
     if (tail.length === 3 && tail[0] === "users" && tail[2] === "edit" && /^\d+$/.test(tail[1] as string)) {
       return { family: "admin-user-edit", adminUserId: Number.parseInt(tail[1] as string, 10) };
-    }
     }
     if (tail.length === 3 && tail[0] === "users" && tail[2] === "impersonate" && /^\d+$/.test(tail[1] as string)) {
       return { family: "admin-users-impersonate", adminUserId: Number.parseInt(tail[1] as string, 10) };
@@ -4551,8 +4592,8 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (tail.length === 3 && tail[0] === "monitor" && tail[1] === "queue") {
       return { family: "admin-monitor-queue-manage", qid: tail[2] as string };
     }
-    if (tail.length === 4 && tail[0] === "monitor" && tail[1] === "queue" && tail[2] === "remove-all-items") {
-      return { family: "admin-monitor-queue-remove-all", qid: tail[3] as string };
+    if (tail.length === 4 && tail[0] === "monitor" && tail[1] === "queue" && tail[3] === "remove-all-items") {
+      return { family: "admin-monitor-queue-remove-all", qid: tail[2] as string };
     }
     if (tail.length === 4 && tail[0] === "monitor" && tail[1] === "queue" && tail[3] === "set") {
       return { family: "admin-monitor-queue-set", qid: tail[2] as string };
@@ -10013,6 +10054,97 @@ async function userSettingsSecurityPage(c: Context<{ Bindings: Env }>): Promise<
   if (!p.ok) return p.response;
   const data = await loadUserSettingsSecurityPageData(c.env.DB, p.viewer.id);
   return p.respond(c.html(renderUserSettingsSecurityPage(p.ctx, data), 200));
+}
+
+// ---------------------------------------------------------------------------
+// The TOTP settings four (the twofa.tsx module header's HANDOFF recipe —
+// security/2fa.go's group; the enroll page renders over the settings layout,
+// the three POSTs re-render the security page with the notice-slot carrier).
+// ---------------------------------------------------------------------------
+
+const ENROLL_PATH = "/user/settings/security/two_factor";
+
+/** GET {ENROLL_PATH}/enroll (security/2fa.go:164-192): prologue → the
+ *  already-enrolled refusal → begin/reuse the pending secret → render. */
+async function twofaEnrollPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, false);
+  if (!p.ok) return p.response;
+  if (await hasTwoFactorByUid(c.env.DB, p.viewer.id)) {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/security" } }));
+  }
+  const incoming = twofaCookieValue(c.req.raw);
+  const ticket = incoming === null ? null : await verifyPendingTicket(c.env.DB, incoming, "enroll");
+  const secret = ticket?.kind === "enroll" ? ticket.secret : generateTotpSecret();
+  const issuer = twofaIssuer(c.env.APP_URL);
+  const data = { secret, uri: otpauthUri(secret, issuer, p.viewer.username) };
+  const setCookie = ticket?.kind === "enroll" ? undefined : twofaSetCookie(await mintPendingTicket(c.env.DB, { kind: "enroll", secret }));
+  const html = renderTwofaEnrollPage(p.ctx, data);
+  if (setCookie === undefined) return p.respond(c.html(html, 200));
+  return p.respond(c.html(html, 200, { "set-cookie": setCookie }));
+}
+
+/** POST {ENROLL_PATH}/enroll (security/2fa.go:195-286): verify-once
+ *  activates; the scratch token renders ONCE in the security page's
+ *  positive notice (the once-only carrier — the flash rides no wire). */
+async function twofaEnrollSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const params = await readUrlEncodedForm(c.req.raw);
+  const outcome = await applyTwofaEnrollment(
+    c.env.DB, p.viewer.id, params.get("passcode") ?? "", twofaCookieValue(c.req.raw),
+  );
+  if (outcome.outcome === "enrolled") {
+    const data = await loadUserSettingsSecurityPageData(c.env.DB, p.viewer.id);
+    return p.respond(c.html(renderUserSettingsSecurityPage(p.ctx, data, {
+      notice: { kind: "positive",
+        message: twofaLocale.enrolled_success.replace("%s", outcome.scratchToken) },
+    })), 200);
+  }
+  if (outcome.outcome === "already-enrolled") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/security" } }));
+  }
+  if (outcome.outcome === "no-pending-secret") {
+    return p.respond(new Response(null, { status: 303, headers: { location: ENROLL_PATH + "/enroll" } }));
+  }
+  // invalid-passcode: upstream re-renders the enroll page with the flash;
+  // the plain-form reduction 303s back to the GET, whose pending stash
+  // survives so the SAME secret re-renders (the seam's disclosed arm).
+  return p.respond(new Response(null, { status: 303, headers: { location: ENROLL_PATH + "/enroll" } }));
+}
+
+/** POST {ENROLL_PATH}/regenerate_scratch (security/2fa.go:31-66): the new
+ *  token renders ONCE (the notice carrier, the enroll arm's posture). */
+async function twofaRegenerateScratch(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const row = await getTwoFactorByUid(c.env.DB, p.viewer.id);
+  if (row === null) {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/security" } }));
+  }
+  const token = await regenerateScratchToken(c.env.DB, row);
+  const data = await loadUserSettingsSecurityPageData(c.env.DB, p.viewer.id);
+  return p.respond(c.html(renderUserSettingsSecurityPage(p.ctx, data, {
+    notice: { kind: "positive",
+      message: twofaLocale.scratch_regenerated.replace("%s", token) },
+  })), 200);
+}
+
+/** POST {ENROLL_PATH}/disable (security/2fa.go:69-104 + the mission's
+ *  code requirement): the passcode field is REQUIRED — an empty/invalid
+ *  code re-renders the security page with the negative notice. */
+async function twofaDisable(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const params = await readUrlEncodedForm(c.req.raw);
+  const outcome = await applyTwofaDisable(c.env.DB, p.viewer.id, params.get("passcode") ?? "");
+  if (outcome.outcome === "disabled") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/security" } }));
+  }
+  const data = await loadUserSettingsSecurityPageData(c.env.DB, p.viewer.id);
+  return p.respond(c.html(renderUserSettingsSecurityPage(p.ctx, data, {
+    notice: { kind: "negative",
+      message: outcome.outcome === "invalid-code" ? twofaLocale.passcode_invalid : userSettingsSecurityLocale.twofa_not_enrolled },
+  })), 200);
 }
 
 /** GET /user/settings/blocked_users (web.go:750-751 — the user-scope twin;
@@ -17414,6 +17546,18 @@ uiRouter.post("/user/settings/security/account_link", async (c) => {
     notice: { kind: "negative", message: userSettingsSecurityLocale.unlink_missing },
   })), 200);
 });
+
+// The TOTP settings four (the twofa.tsx module header's HANDOFF recipe —
+// the fold, 2026-11-01; the security page's Enroll anchor and the
+// regenerate/disable forms POST these exact paths). GET+POST share the
+// enroll path; the two write POSTs carry their GET 405 twins (chi's
+// methodNotAllowed posture — the account_link twin above).
+uiRouter.get(ENROLL_PATH + "/enroll", (c) => twofaEnrollPage(c));
+uiRouter.post(ENROLL_PATH + "/enroll", (c) => twofaEnrollSubmit(c));
+uiRouter.post(ENROLL_PATH + "/regenerate_scratch", (c) => twofaRegenerateScratch(c));
+uiRouter.post(ENROLL_PATH + "/disable", (c) => twofaDisable(c));
+uiRouter.get(ENROLL_PATH + "/regenerate_scratch", () => methodNotAllowed("POST"));
+uiRouter.get(ENROLL_PATH + "/disable", () => methodNotAllowed("POST"));
 uiRouter.get("/user/settings/actions/secrets", (c) => userSettingsSecretsPage(c));
 uiRouter.post("/user/settings/actions/secrets", (c) => userSettingsSecretsSubmit(c));
 uiRouter.post("/user/settings/actions/secrets/delete", (c) => userSettingsSecretsDelete(c));
