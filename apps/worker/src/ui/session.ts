@@ -24,10 +24,19 @@
  *
  * The gate inserts between password-accept and session-mint (auth.go:330-349):
  * an enrolled doer's POST /login does NOT mint — the pending principal
- * travels in the signed `gitea_twofa` ticket cookie (upstream parks
+ * travels in the ENCRYPTED `gitea_twofa` ticket cookie (upstream parks
  * `twofaUid`/`twofaRemember` in its server-side session; the sessions
- * schema carries no arbitrary keys, so the ticket — HMAC'd by the shared
- * instance secret — plays that role; see src/auth/two-factor.ts's header).
+ * schema carries no arbitrary keys, so the ticket — AES-256-GCM sealed
+ * under the shared instance secret — plays that role; see
+ * src/auth/two-factor.ts's header). A DUAL-enrolled user (WebAuthn keys +
+ * TOTP) is parked at the WEBAUTHN prompt (handleTwoFactorRequired's
+ * hasWebAuthn arm, auth.go:362-366) with BOTH carriers armed — upstream's
+ * `twofaUid` lives in the same server session, so its TOTP page renders
+ * from the webauthn prompt (webauthn.go:40-46 → 2fa.go:36); the
+ * `gitea_twofa` gate ticket minted alongside the pending carrier is that
+ * same-session sharing over cookies, and whichever flow completes first
+ * clears BOTH (the TOTP arms here; the webauthn mint arm is the webauthn
+ * unit's — web/webauthn.ts).
  *
  * All routes are TOP-LEVEL (§2.1): the dispatcher needs no route-table
  * change — they are not repo-scoped (segments.length < 2), fall through to
@@ -72,6 +81,33 @@
  *     renderServerErrorShellResponse). A FULLY-signed-in visitor GETs the
  *     gate pages → 303 "/" (performAutoLogin's already-authenticated arm,
  *     auth.go:208-227 → redirectAfterAuth's default target).
+ *   - LOGOUT retires the pre-auth carriers: upstream's HandleSignOut
+ *     destroys the WHOLE server session (auth.go:453-460), so a parked
+ *     `twofaUid`/webauthn state dies with it; here the carriers are
+ *     cookies, so logout appends their Max-Age=0 clears (gitea_twofa,
+ *     gitea_webauthn, gitea_webauthn_challenge) to the gitea_session clear.
+ *   - SIGN-IN retires the presented prior session row when it belongs to a
+ *     DIFFERENT user (upstream's Regenerate destroys the pre-sign-in
+ *     session so "an ID known before sign-in is never authenticated",
+ *     modules/session/store.go:113-128 + handleSignInFull's
+ *     regenerateSession, auth.go:400-407); a SAME-user prior row is kept
+ *     alive deliberately — the fixation vector (a planted session id
+ *     gaining authority over the signing-in principal) is a cross-user
+ *     concern, and a same-user row already authenticates as the exact
+ *     principal the new mint grants, so destroying it adds nothing the
+ *     row's own TTL, logout, and reuse detection don't already own.
+ *   - The IMPERSONATION EXIT is reachable regardless of the TARGET's
+ *     account status: upstream's session Verify checks only
+ *     `IsIndividual()` (services/auth/session.go:31-61 — no ProhibitLogin
+ *     read), and SignOut runs ExitImpersonatedUser against the raw session
+ *     before/regardless of the doer (auth.go:469-478) — so an admin who
+ *     impersonated a prohibited target can always step back out. Our
+ *     §2.4 verify keeps the doer-status check (SPEC-0010's authority
+ *     posture), so the exit arm keys on the (id, digest) presentation +
+ *     the `impersonator_user_id` stamp alone (migration 0058) — the same
+ *     authority a logout delete holds — and never consults the target's
+ *     status/type. The exit emits upstream's UserImpersonationExit audit
+ *     row (auth.go:476).
  *   - The scratch success lands on /user/settings/security with the
  *     `twofa_scratch_used` info flash upstream (2fa.go:154-160); the flash
  *     rides no wire in our no-JS shell (the W4 posture) — the redirect
@@ -87,6 +123,7 @@
 
 import { Hono, type Context } from "hono";
 import { and, eq, isNotNull, isNull, lt, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/sqlite-core";
 import { drizzle } from "drizzle-orm/d1";
 
 import { D1FailureLimiter } from "../auth/failure-limiter";
@@ -111,10 +148,15 @@ import {
   verifyScratchToken,
   type PendingTwofaTicket,
 } from "../auth/two-factor";
+import { AuditActions, emitAudit } from "../services/audit";
 import { demoModeEnabled } from "../services/demo-sweep";
 import { allowSignup, initWindowOpen } from "../services/user-accounts";
 import { listActiveOAuth2Sources } from "../services/auth-sources/store";
-import { signCeremonyState, webAuthnPendingSetCookie } from "../web/webauthn-ceremony";
+import {
+  signCeremonyState,
+  webAuthnClearCookie,
+  webAuthnPendingSetCookie,
+} from "../web/webauthn-ceremony";
 import { hasCredentialsForUser } from "../web/webauthn-store";
 import { sessions, users } from "../db/schema";
 import { readUrlEncodedForm } from "./forms";
@@ -627,6 +669,55 @@ export async function exitImpersonationBySecret(d1: D1Database, value: string): 
   return (result.meta.changes ?? 0) > 0;
 }
 
+/** The impersonation-exit snapshot the logout arm audits with: the live
+ *  impersonating row keyed EXACTLY like `exitImpersonationBySecret` —
+ *  (id, digest) presentation + the `impersonator_user_id` stamp — with the
+ *  TARGET's and the ADMIN's name slices joined for the audit row
+ *  (upstream's exit event names the admin as actor and the target as
+ *  scope, auth.go:476's RecordAs over impersonate.go's restored backup).
+ *  Deliberately NO doer-status/type read: this is the exit's reachability
+ *  seam (the module header's exit-reachability divergence — upstream's
+ *  Verify never consults ProhibitLogin, services/auth/session.go:31-61),
+ *  so a prohibited or org-typed target can still be stepped out of.
+ *  `null` = not impersonating / the presentation doesn't match / the row
+ *  is gone — the caller falls through to the ordinary arms. */
+export async function lookupImpersonationExitSession(
+  d1: D1Database,
+  value: string,
+): Promise<{
+  admin: { id: number; username: string };
+  target: { id: number; username: string; type: "user" | "org" };
+} | null> {
+  const parsed = parseCookieValue(value);
+  if (parsed === null) return null;
+  const digest = await sha256Hex(parsed.secret);
+  const adminUsers = alias(users, "admin_users");
+  const row = await drizzle(d1)
+    .select({
+      adminId: adminUsers.id,
+      adminUsername: adminUsers.username,
+      targetId: users.id,
+      targetUsername: users.username,
+      targetType: users.type,
+    })
+    .from(sessions)
+    .innerJoin(users, eq(users.id, sessions.userId))
+    .innerJoin(adminUsers, eq(adminUsers.id, sessions.impersonatorUserId))
+    .where(
+      and(
+        eq(sessions.id, parsed.id),
+        eq(sessions.sha256Digest, digest),
+        isNotNull(sessions.impersonatorUserId),
+      ),
+    )
+    .get();
+  if (row === undefined) return null;
+  return {
+    admin: { id: row.adminId, username: row.adminUsername },
+    target: { id: row.targetId, username: row.targetUsername, type: row.targetType },
+  };
+}
+
 /**
  * The §2.4 authority decision for LOGOUT — read-only, no side effects. A
  * forged logout must not become a lockout lever: reuse-detection deletion
@@ -692,6 +783,32 @@ export async function deleteSessionBySecret(d1: D1Database, value: string): Prom
  *  (routers/web/auth/auth.go:86,382). No cron exists (§3). */
 export async function sweepExpiredSessions(d1: D1Database, now?: Date): Promise<void> {
   await drizzle(d1).delete(sessions).where(lt(sessions.expiresAt, now ?? new Date())).run();
+}
+
+/**
+ * Sign-in's prior-row retirement (the module header's sign-in divergence):
+ * upstream REGENERATES the presented session at every successful sign-in —
+ * Regenerate destroys the stored row so "an ID known before sign-in is
+ * never authenticated" (modules/session/store.go:113-128; handleSignInFull
+ * calls it before minting, auth.go:400-407). The mint here is already a
+ * FRESH id:secret (the fixation shape is handled at mint), so the presented
+ * row is retired only when it belongs to a DIFFERENT user — verify-and-
+ * delete, §2.4-verified (a dead/forged presentation retires nothing; reuse
+ * detection owns mismatch deletion, §2.4 step 3). A SAME-user prior row is
+ * KEPT ALIVE on purpose: it already authenticates as exactly the principal
+ * the new mint grants, so destroying it adds nothing its own TTL, logout,
+ * and reuse detection don't own (the header records the choice once).
+ *
+ * Called at every login-flow mint (the POST /login arm and the two 2FA-gate
+ * mint arms — upstream's handleSignInFull runs on all three paths).
+ */
+async function retirePresentedSession(d1: D1Database, req: Request, newUserId: number): Promise<void> {
+  const presented = sessionCookieValue(req);
+  if (presented === null) return;
+  const prior = await lookupValidSession(d1, presented);
+  if (prior === null) return;
+  if (prior.id === newUserId) return; // same principal: the documented keep-alive
+  await deleteSessionBySecret(d1, presented);
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,6 +1129,16 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
   // upstream's own order (handleTwoFactorRequired: hasWebAuthn → /user/
   // webauthn, ELSE /user/two_factor): the TOTP gate (step 4.5b below)
   // answers only the users this check passes through.
+  //
+  // DUAL enrollment (the TOTP-fallback fix): upstream parks twofaUid in
+  // the SAME server session regardless of which prompt it redirects to
+  // (handleTwoFactorRequired sets the keys BEFORE the hasWebAuthn
+  // branch), so its webauthn page can render the TOTP fallback and GET
+  // /user/two_factor finds `twofaUid` (webauthn.go:40-46 → 2fa.go:36).
+  // Two cookies cannot share one jar slot, so the dual-enrolled park arms
+  // BOTH carriers here — the pending carrier AND the `gitea_twofa` gate
+  // ticket — and whichever flow completes first clears both (the TOTP
+  // arms below; the webauthn mint arm is web/webauthn.ts's).
   if (await hasCredentialsForUser(c.env.DB, verified.user.id)) {
     const pending = await signCeremonyState(c.env.DB, {
       k: "pending",
@@ -1020,6 +1147,19 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
       rem: form.remember,
       to: safeRedirectTarget(form.redirectTo),
     });
+    if (await hasTwoFactorByUid(c.env.DB, verified.user.id)) {
+      const ticket = await mintPendingTicket(
+        c.env.DB,
+        {
+          kind: "gate",
+          userId: verified.user.id,
+          remember: form.remember,
+          redirectTo: safeRedirectTarget(form.redirectTo),
+        },
+        now,
+      );
+      return seeOtherCookies("/user/webauthn", [webAuthnPendingSetCookie(pending), twofaSetCookie(ticket)]);
+    }
     return seeOther("/user/webauthn", webAuthnPendingSetCookie(pending));
   }
 
@@ -1049,8 +1189,12 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
   // Step 5: mint row + cookie in one response; limiter reset + expired-row
   // sweep in waitUntil (§2.2 step 5). The form's `remember` rides the row:
   // rotations re-read it (§2.3 — upstream re-sets the remember cookie on
-  // rotation, auth.go:127).
+  // rotation, auth.go:127). The presented prior session row retires after
+  // the mint lands (upstream's Regenerate — retirePresentedSession's
+  // header; mint-first so a failed retirement can never leave the presenter
+  // sessionless).
   const cookieValue = await mintSession(c.env.DB, verified.user.id, { now, remember: form.remember });
+  await retirePresentedSession(c.env.DB, c.req.raw, verified.user.id);
   sink(limiterResetFailOpen(limiter, ip));
   sink(sweepExpiredSessions(c.env.DB, now));
 
@@ -1062,8 +1206,12 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
  *  footgun; none is offered). Run §2.4 verification; on a VALID session
  *  delete the row by id AND matching digest; on anything else leave rows
  *  alone (reuse detection owns mismatch deletion). Either way the cookie is
- *  cleared (Max-Age=0, same flags) and the response redirects to `/` —
- *  idempotent: logging out without a session is a clean redirect.
+ *  cleared (Max-Age=0, same flags) — and with it the PRE-AUTH carriers
+ *  (gitea_twofa, gitea_webauthn, gitea_webauthn_challenge): upstream's
+ *  HandleSignOut destroys the whole server session (auth.go:453-460), so a
+ *  parked twofaUid dies with the logout; our cookie carriers die by their
+ *  own Max-Age=0 directives. The response redirects to `/` — idempotent:
+ *  logging out without a session is a clean redirect.
  *
  *  The impersonation EXIT arm rides this route (upstream SignOut folds
  *  ExitImpersonatedUser in — routers/web/auth/auth.go:469-478; NO
@@ -1074,7 +1222,13 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
  *  cookie — the same session continues as the admin. A lost exit race (the
  *  backup cleared between the lookup and the guarded write) falls through
  *  to the ordinary delete exactly like upstream's `exitedImpersonated ==
- *  false` arm (auth.go:476-478) — the session then destroys. */
+ *  false` arm (auth.go:476-478) — the session then destroys. The exit also
+ *  emits upstream's UserImpersonationExit audit row (auth.go:476 — actor
+ *  the ADMIN, scope the TARGET, RecordAs's shape). The exit attempt runs on
+ *  EVERY §2.4-invalid presentation too (the exit-reachability arm — see
+ *  lookupImpersonationExitSession: the target's account status must never
+ *  strand the admin inside the impersonation; upstream's SignOut runs the
+ *  exit against the raw session before/regardless of the doer). */
 async function logout(c: RouteContext): Promise<Response> {
   // §2.8 layer 2 — logout is a non-GET UI route.
   const guard = sameOriginGuard(c.req.raw);
@@ -1086,15 +1240,53 @@ async function logout(c: RouteContext): Promise<Response> {
     // must not delete rows); the (id, digest) delete covers only a valid
     // presentation.
     const valid = await lookupValidSession(c.env.DB, value);
-    if (valid !== null) {
-      if (valid.impersonatorUserId !== null) {
+    if (valid === null || valid.impersonatorUserId !== null) {
+      // The exit attempt (valid-impersonating AND the unreachable-status
+      // arms alike): keyed (id, digest) + the impersonator stamp — the same
+      // authority the delete below holds, so a forged presentation is a
+      // no-op, never a lever.
+      const exit = await lookupImpersonationExitSession(c.env.DB, value);
+      if (exit !== null) {
         const exited = await exitImpersonationBySecret(c.env.DB, value);
-        if (exited) return seeOther("/-/admin"); // the session continues — no Set-Cookie
+        if (exited) {
+          // Upstream's exit audit row (auth.go:476): actor = the admin
+          // (RecordAs's explicit doer), scope = the target (the request's
+          // doer at SignOut), impersonator dropped (the actor IS the admin
+          // — refs.go impersonatorRef's same-id fold). A failed insert
+          // must not fail the exit (upstream writeEvent logs, never throws).
+          const emitted = emitAudit(drizzle(c.env.DB), {
+            action: AuditActions.UserImpersonationExit,
+            actorId: exit.admin.id,
+            actorName: exit.admin.username,
+            actorCredential: null, // the write rode a session
+            scopeType: exit.target.type === "org" ? "organization" : "user",
+            scopeId: exit.target.id,
+            scopeName: exit.target.username,
+            origin: "ui",
+            ipAddress: clientIp(c.req.raw),
+            // the message column stores the RENDERED template (the seam's
+            // contract) — the upstream template's two tokens
+            vars: { actor: exit.admin.username, scope: exit.target.username },
+          }).catch((error: unknown) => {
+            console.log(
+              `[audit] impersonation-exit row failed (actor=${exit.admin.id} scope=${exit.target.id}): ${String(error)}`,
+            );
+          });
+          await emitted;
+          return seeOther("/-/admin"); // the session continues — no Set-Cookie
+        }
       }
+    }
+    if (valid !== null) {
       await deleteSessionBySecret(c.env.DB, value);
     }
   }
-  return seeOther("/", clearSessionSetCookie());
+  return seeOtherCookies("/", [
+    clearSessionSetCookie(),
+    clearTwofaSetCookie(),
+    webAuthnClearCookie("pending"),
+    webAuthnClearCookie("assert"),
+  ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1168,8 +1360,10 @@ async function renderScratchFailure(c: RouteContext, error: string): Promise<Res
  *  consume the passcode (the replay guard), then mint — upstream's
  *  handleSignIn (KeyUserHasTwoFactorAuth omitted, the module header) — and
  *  land on the ticket's validated redirect (consumeAuthRedirectLink's
- *  carried target). The ticket dies with the mint (upstream's session
- *  regeneration wipes twofaUid). */
+ *  carried target). The ticket dies with the mint — AND the webauthn
+ *  carriers with it (upstream's session regeneration wipes twofaUid AND
+ *  webauthnAssertion together; whichever flow completed first cleared the
+ *  whole pre-auth state — the dual-carrier note at the login gate). */
 async function twofaSubmit(c: RouteContext): Promise<Response> {
   const g = await gateTicket(c);
   if ("response" in g) return g.response;
@@ -1184,9 +1378,12 @@ async function twofaSubmit(c: RouteContext): Promise<Response> {
     // arm (2fa.go:87-89) — unregistered in the audit registry, not emitted
     // (the account-link unload precedent).
     const cookieValue = await mintSession(c.env.DB, g.ticket.userId, { now, remember: g.ticket.remember });
+    await retirePresentedSession(c.env.DB, c.req.raw, g.ticket.userId);
     return seeOtherCookies(safeRedirectTarget(g.ticket.redirectTo), [
       sessionSetCookie(cookieValue, g.ticket.remember),
       clearTwofaSetCookie(),
+      webAuthnClearCookie("pending"),
+      webAuthnClearCookie("assert"),
     ]);
   }
   return renderGateFailure(c, twofaLocale.passcode_incorrect);
@@ -1208,9 +1405,12 @@ async function twofaScratchSubmit(c: RouteContext): Promise<Response> {
     const now = new Date();
     await regenerateScratchToken(c.env.DB, row, { now }); // the single-use burn
     const cookieValue = await mintSession(c.env.DB, g.ticket.userId, { now, remember: g.ticket.remember });
+    await retirePresentedSession(c.env.DB, c.req.raw, g.ticket.userId);
     return seeOtherCookies("/user/settings/security", [
       sessionSetCookie(cookieValue, g.ticket.remember),
       clearTwofaSetCookie(),
+      webAuthnClearCookie("pending"),
+      webAuthnClearCookie("assert"),
     ]);
   }
   return renderScratchFailure(c, twofaLocale.scratch_token_incorrect);

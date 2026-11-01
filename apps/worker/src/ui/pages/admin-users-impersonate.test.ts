@@ -24,7 +24,11 @@
  *     reuse-deleted between the §2.4 verify and the write) answers
  *     session-gone, not an impersonation.
  *   - THE ORG-TARGET ARM: any users row passes (orgs ARE users rows,
- *     SPEC-0007 — upstream GetUserByID has no type gate).
+ *     SPEC-0007 — upstream GetUserByID has no type gate), and its audit
+ *     row scopes `organization` (ScopeFromUser, refs.go:44-50).
+ *   - THE START AUDIT ROW (users.go:580): emitted after the flip lands —
+ *     actor the admin, scope the target, upstream's rendered message;
+ *     the refusal and the unknown-user arms emit nothing.
  *   - THE BOT GUARD, DOCUMENTED DEAD (users.go:569-571): our users.type
  *     enum has no bot value — pinned by asserting an org-typed target (the
  *     closest non-user type that EXISTS) impersonates like any row.
@@ -39,7 +43,7 @@ import { eq } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { sessions, users } from "../../db/schema";
+import { auditEvents, sessions, users } from "../../db/schema";
 import { exitImpersonationBySecret, impersonateSessionUser, lookupValidSession, mintSession, verifySession } from "../session";
 import {
   IMPERSONATE_SUCCESS_REDIRECT,
@@ -53,8 +57,8 @@ import {
 const T0 = new Date(1_700_000_000 * 1000); // 2023-11-14T22:13:20Z (users.createdAt seed data only)
 
 /** Tables the fixtures touch (children first — the org-settings matrix's
- *  cleanup-list convention). */
-const FIXTURE_TABLES = ["sessions", "users"];
+ *  cleanup-list convention; audit_event rides the START-row asserts). */
+const FIXTURE_TABLES = ["audit_event", "sessions", "users"];
 
 beforeAll(async () => {
   await applyAuthD1Migrations();
@@ -124,6 +128,24 @@ describe("adminUserImpersonate (upstream admin.ImpersonateUser, users.go:563-581
     expect(after?.digest).toBe(before?.digest);
     expect(after?.expiresAt.getTime()).toBe(before?.expiresAt.getTime());
 
+    // The START audit row (users.go:580's Record): actor the admin, scope
+    // the target, upstream's rendered message.
+    const startRows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(startRows).toHaveLength(1);
+    expect(startRows[0]).toMatchObject({
+      action: "user:impersonation:start",
+      actorId: adminId,
+      actorName: "dave",
+      actorCredential: null,
+      impersonatorId: 0,
+      scopeType: "user",
+      scopeId: String(targetId),
+      scopeName: "alice",
+      origin: "ui",
+      message: "User dave started impersonating user alice.",
+      ipAddress: null,
+    });
+
     // The SAME cookie now authenticates AS THE TARGET with the admin
     // backup exposed (the shell banner's channel).
     const verification = await verifySession(env.DB, cookieValue);
@@ -157,6 +179,9 @@ describe("adminUserImpersonate (upstream admin.ImpersonateUser, users.go:563-581
     const outcome = await adminUserImpersonate(env.DB, { sessionId, adminUserId: secondAdmin }, targetId);
     expect(outcome).toEqual({ outcome: "already-impersonating" });
     expect(await rowIdentity(sessionId)).toEqual({ userId: targetId, impersonatorUserId: adminId });
+    // upstream Records ONLY on the success arm (users.go:575-580): the
+    // refusal emits no second audit row.
+    expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(1);
 
     // The service half pins the same refusal directly.
     expect(await impersonateSessionUser(env.DB, sessionId, secondAdmin, adminId)).toBe("already-impersonating");
@@ -171,8 +196,10 @@ describe("adminUserImpersonate (upstream admin.ImpersonateUser, users.go:563-581
 
     expect(outcome).toEqual({ outcome: "unknown-user" });
     expect(IMPERSONATE_UNKNOWN_USER_ERROR).toEqual({ errorMessage: "unable to get user", renderFormat: "text" });
-    // The miss wrote nothing: the session is untouched.
+    // The miss wrote nothing: the session is untouched, and no audit row
+    // precedes the flip (upstream Records only after ImpersonateUser).
     expect(await rowIdentity(sessionId)).toEqual({ userId: adminId, impersonatorUserId: null });
+    expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(0);
     expect(targetId).not.toBe(424242);
   });
 
@@ -200,6 +227,20 @@ describe("adminUserImpersonate (upstream admin.ImpersonateUser, users.go:563-581
 
     expect(outcome).toEqual({ outcome: "impersonated" });
     expect(await rowIdentity(sessionId)).toEqual({ userId: orgId, impersonatorUserId: adminId });
+    // The audit scope follows ScopeFromUser (refs.go:44-50): an org target
+    // scopes `organization`, name carried.
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "user:impersonation:start",
+      actorId: adminId,
+      actorName: "dave",
+      scopeType: "organization",
+      scopeId: String(orgId),
+      scopeName: "forge",
+      origin: "ui",
+      message: "User dave started impersonating user forge.",
+    });
   });
 });
 
@@ -247,10 +288,14 @@ describe("exitImpersonationBySecret (upstream ExitImpersonatedUser, impersonate.
 // --- the lookup the arm shares ----------------------------------------------
 
 describe("loadAdminImpersonateTarget (GetUserByID, users.go:565-568)", () => {
-  it("resolves an existing users row by id and nulls the miss", async () => {
+  it("resolves an existing users row by id (+ the audit's username/type slice) and nulls the miss", async () => {
     const { targetId } = await seedUsers();
 
-    expect(await loadAdminImpersonateTarget(env.DB, targetId)).toEqual({ id: targetId });
+    expect(await loadAdminImpersonateTarget(env.DB, targetId)).toEqual({
+      id: targetId,
+      username: "alice",
+      type: "user",
+    });
     expect(await loadAdminImpersonateTarget(env.DB, 987654)).toBeNull();
   });
 });

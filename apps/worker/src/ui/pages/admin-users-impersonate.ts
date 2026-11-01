@@ -41,6 +41,12 @@
  *     authenticating as the target.
  *   - session.ts `lookupValidSession` — the caller-side §2.4 decision that
  *     yields the admin's user id AND the live row id (the flip's key).
+ *   - services/audit.ts `emitAudit` + the `user:impersonation:start` action
+ *     (upstream action.go:65): the START row emits after the flip lands
+ *     (users.go:580's Record — actor the admin, scope the target); the
+ *     EXIT row (action.go:66, auth.go:476's RecordAs) lives at session.ts's
+ *     logout arm. A failed insert logs and never fails the flip (upstream
+ *     writeEvent's posture).
  *
  * ## Mount recipe (the index.ts fold — this module is PORT-FIRST, direct-
  * driven by the suite like the avatar pair)
@@ -102,6 +108,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { users } from "../../db/schema";
+import { AuditActions, emitAudit } from "../../services/audit";
 import { impersonateSessionUser } from "../session";
 
 /** The success redirect — upstream
@@ -129,9 +136,13 @@ export type AdminUserImpersonateOutcome =
 
 /** The target slice the arm needs (any users row passes upstream's
  *  GetUserByID — orgs included; only the bot type would refuse, and our
- *  enum has no bot value — the dead arm above). */
+ *  enum has no bot value — the dead arm above). `username` + `type` feed
+ *  the audit row's scope snapshot (upstream ScopeFromUser's shape: an org
+ *  target scopes as `organization`, refs.go:44-50). */
 export interface AdminImpersonateTarget {
   readonly id: number;
+  readonly username: string;
+  readonly type: "user" | "org";
 }
 
 /**
@@ -141,7 +152,7 @@ export interface AdminImpersonateTarget {
  */
 export async function loadAdminImpersonateTarget(d1: D1Database, userId: number): Promise<AdminImpersonateTarget | null> {
   const row = await drizzle(d1)
-    .select({ id: users.id })
+    .select({ id: users.id, username: users.username, type: users.type })
     .from(users)
     .where(eq(users.id, userId))
     .get();
@@ -175,7 +186,41 @@ export async function adminUserImpersonate(
   const flip = await impersonateSessionUser(d1, session.sessionId, session.adminUserId, target.id);
   switch (flip) {
     case "impersonating":
-      return { outcome: "impersonated" };
+      // The START audit row (upstream users.go:580's `audit.Record(ctx,
+      // audit_model.UserImpersonation, u)`): actor the ADMIN (the signed-in
+      // doer Record reads), scope the TARGET (ScopeFromUser's shape — an
+      // org target scopes `organization`), origin ui. A failed insert must
+      // not fail the flip (upstream writeEvent logs, never throws); the
+      // client IP is upstream's IPAddress stamp, but the request lives at
+      // the route layer this seam deliberately doesn't see — recorded null.
+      {
+        const adminName =
+          (
+            await drizzle(d1)
+              .select({ username: users.username })
+              .from(users)
+              .where(eq(users.id, session.adminUserId))
+              .get()
+          )?.username ?? "";
+        await emitAudit(drizzle(d1), {
+          action: AuditActions.UserImpersonation,
+          actorId: session.adminUserId,
+          actorName: adminName,
+          actorCredential: null, // the write rode a session
+          scopeType: target.type === "org" ? "organization" : "user",
+          scopeId: target.id,
+          scopeName: target.username,
+          origin: "ui",
+          // the message column stores the RENDERED template (the seam's
+          // contract) — the upstream template's two tokens
+          vars: { actor: adminName, scope: target.username },
+        }).catch((error: unknown) => {
+          console.log(
+            `[audit] impersonation-start row failed (actor=${session.adminUserId} scope=${target.id}): ${String(error)}`,
+          );
+        });
+        return { outcome: "impersonated" };
+      }
     case "already-impersonating":
       return { outcome: "already-impersonating" };
     case "no-session":

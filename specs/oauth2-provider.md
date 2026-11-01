@@ -83,8 +83,9 @@ Request forms (`services/forms/user_form.go:108–151`):
 Happy path, upstream semantics (`oauth2_provider.go:224–479`):
 
 1. **Pre-check** (`oauthDoerAuthorizePreCheck`, :211): two-factor-required doers get
-   the `access_denied` error redirect (cf-gitea has no 2FA yet — the slot is kept as a
-   no-op predicate so the re-pin finds it).
+   the `access_denied` error redirect (2FA landed as SPEC-0022, but the web gate
+   parks PAT logins only — this OAuth2-dance pre-check slot stays a no-op predicate
+   until the dance grows a password-backed identity, so the re-pin finds it).
 2. Load the application by `client_id`; unknown ⇒ `unauthorized_client`
    "Client ID not registered".
 3. **Redirect URI check** — `ContainsRedirectURI` (`models/auth/oauth2.go:164–205`):
@@ -630,7 +631,8 @@ Plus the builtin-application seed rows (§2.9) appended to the same migration wi
     sameOriginGuard is the house posture, a disclosed strengthening.)
 13. **Anonymous/2FA** — `reqSignIn` redirects anonymous browsers to the login page
     (the dance resumes via SPEC-0010's `redirect_to`); the 2FA pre-check slot is a
-    no-op predicate until 2FA exists.
+    no-op predicate — 2FA landed as SPEC-0022 (web login gate), and the dance's own
+    gate stays the re-pin slot it always was.
 14. **Multi-instanceWorkers** — the signing key is a D1 row: every isolate verifies
     and signs with the same material; no per-isolate key drift (the R2/file-based
     upstream dance exists precisely because Gitea can share a data dir across

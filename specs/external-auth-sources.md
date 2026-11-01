@@ -110,8 +110,10 @@ Out of scope (each recorded so it is not silently re-decided):
   unknown external identity lands on the link-account page (§5.5); the
   auto-register arm is a recorded follow-up, not silent absence.
 - **2FA interplay** (`TwoFactorPolicy`, `handleOAuth2SignIn`'s
-  `needs2FA` gate, `oauth.go:351-358`) — cf-gitea has no 2FA; the config
-  column is carried as an inert slot (§4.1) so the re-pin finds it.
+  `needs2FA` gate, `oauth.go:351-358`) — 2FA landed as SPEC-0022 for the
+  local login gate, but external sources carry no local TOTP secret, so
+  the config column stays an inert slot (§4.1) until an external-2FA
+  policy re-pin.
 - **`git credential` OAuth against foreign IdPs** — the provider SPEC's
   builtin applications serve git-credential flows against OUR provider;
   consuming an external IdP for git-HTTP credentials is a later arm,
@@ -451,7 +453,9 @@ export const loginSources = sqliteTable('login_source', {
   /** Inert in v1 (no sync engine); upstream forces it false for non-sync
    *  types at CreateSource (source.go:225-228). */
   isSyncEnabled: integer('is_sync_enabled', { mode: 'boolean' }).notNull().default(false),
-  /** Inert slot — no 2FA landed (source.go:116, TwoFactorShouldSkip :212-214). */
+  /** Inert slot — the landed 2FA (SPEC-0022) gates local logins only;
+   *  external sources carry no local TOTP secret (source.go:116,
+   *  TwoFactorShouldSkip :212-214). */
   twoFactorPolicy: text('two_factor_policy').notNull().default(''),
   /** The typed config record, JSON — §4.2's shape for type 6. */
   cfg: text('cfg').notNull(),

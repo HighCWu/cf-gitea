@@ -8,7 +8,11 @@
  * middlewares upstream chains after `apiAuth` (api.go §2.5 table).
  *
  * Error bodies are the upstream `APIError` JSON: `{"message", "url"}` where
- * `url` is the instance swagger URL (`AppURL + "api/swagger"`).
+ * `url` is the instance swagger URL (`AppURL + "api/swagger"`). The TWO
+ * documented exceptions are bare `{"message"}` 403s — upstream's
+ * `ctx.JSON(http.StatusForbidden, gin.H{"message": ...})` without the
+ * APIError wrapper (api.go:135-138 sudo-non-admin, api.go:889-893
+ * prohibited-account).
  */
 
 import type { Context, MiddlewareHandler } from "hono";
@@ -194,12 +198,13 @@ export function resolveAuth(options: ResolveAuthOptions = {}): MiddlewareHandler
 
     // Post-auth option checks — upstream `verifyAuthWithOptionsAPI`
     // (api.go:877–894); no activation/password cases exist yet, so only the
-    // prohibited-account gate applies.
+    // prohibited-account gate applies. The body is upstream's BARE
+    // `{message}` JSON (api.go:889–893's literal ctx.JSON — no APIError
+    // `url` field).
     if (verified.user.status === "prohibited") {
-      return apiErrorResponse(
-        c,
+      return c.json(
+        { message: "This account is prohibited from signing in, please contact your site administrator." },
         403,
-        "This account is prohibited from signing in, please contact your site administrator.",
       );
     }
 
@@ -427,7 +432,9 @@ export function sudo(): MiddlewareHandler<AuthEnv> {
     }
     const auth = c.get("auth");
     if (!auth?.user?.isAdmin) {
-      return apiErrorResponse(c, 403, "Only administrators allowed to sudo.");
+      // Upstream's BARE `{message}` JSON (api.go:135-138's literal
+      // ctx.JSON — no APIError `url` field).
+      return c.json({ message: "Only administrators allowed to sudo." }, 403);
     }
     const service = new TokenService(c.env.DB);
     const impersonated = await service.getUserByName(target);

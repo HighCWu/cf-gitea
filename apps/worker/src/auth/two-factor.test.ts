@@ -2,8 +2,10 @@
  * The two_factor seam's tests (real D1, migration 0059 applied): the
  * enrollment round-trip (the mission's gate), the consume/replay ladder
  * over the PERIOD guard, the scratch burn, the disable arm's code
- * requirement, the pending-ticket codec (kind separation, tamper, expiry),
- * and the otpauth URI's pquerna-exact bytes.
+ * requirement, the pending-ticket codec (the AES-256-GCM seal: kind
+ * separation, tamper, expiry, confidentiality — the TOTP secret never
+ * rides the cookie in the clear), and the otpauth URI's pquerna-exact
+ * bytes.
  */
 
 import { env } from "cloudflare:test";
@@ -208,18 +210,59 @@ describe("the pending-ticket codec", () => {
     expect(await verifyPendingTicket(env.DB, enroll, "gate", { now: NOW })).toBeNull();
     expect(await verifyPendingTicket(env.DB, enroll, "enroll", { now: NOW })).not.toBeNull();
 
+    // AEAD wire: ONE dotless base64url token — a flipped ciphertext byte
+    // breaks the GCM tag (the folded HMAC's role) and verifies null.
     const gate = await mintPendingTicket(env.DB, { kind: "gate", userId: 9, remember: false, redirectTo: "/" }, NOW);
-    const [body, mac] = gate.split(".");
-    const flipped = mac === undefined ? "A" : `${mac[0] === "A" ? "B" : "A"}${mac.slice(1)}`;
-    expect(await verifyPendingTicket(env.DB, `${body}.${flipped}`, "gate", { now: NOW })).toBeNull();
+    expect(gate).toMatch(/^[A-Za-z0-9_-]+$/);
+    const mid = Math.floor(gate.length / 2);
+    const flippedChar = gate[mid] === "A" ? "B" : "A";
+    const tampered = gate.slice(0, mid) + flippedChar + gate.slice(mid + 1);
+    expect(tampered).not.toBe(gate);
+    expect(await verifyPendingTicket(env.DB, tampered, "gate", { now: NOW })).toBeNull();
+    // a trailing truncation (tag bytes shorn) is null too
+    expect(await verifyPendingTicket(env.DB, gate.slice(0, gate.length - 8), "gate", { now: NOW })).toBeNull();
+
     expect(await verifyPendingTicket(env.DB, "garbage", "gate", { now: NOW })).toBeNull();
-    expect(await verifyPendingTicket(env.DB, `${body}`, "gate", { now: NOW })).toBeNull();
+    // the RETIRED HMAC format (`body.mac`, no version byte) fails the
+    // length/version gates outright — outstanding pre-AEAD cookies die at
+    // the format switch instead of verifying under any key
+    expect(await verifyPendingTicket(env.DB, `aGVsbG8.yWJj`, "gate", { now: NOW })).toBeNull();
 
     // a ticket minted under a DIFFERENT instance secret (the keystore row
     // rotated out-of-band) is null — the operator-rotation posture
     await env.DB.prepare("DELETE FROM system_keystore").run();
     resetTwofaSigningSecretCache(); // the isolate-restart half of the rotation
     expect(await verifyPendingTicket(env.DB, gate, "gate", { now: NOW })).toBeNull();
+  });
+
+  it("the ENROLL ticket does not leak the TOTP secret (AES-GCM confidentiality — the item the HMAC shape failed)", async () => {
+    const secret = generateTotpSecret();
+    const ticket = await mintPendingTicket(env.DB, { kind: "enroll", secret }, NOW);
+    // the base32 secret is not a readable substring of the sealed cookie
+    expect(ticket).not.toContain(secret);
+    // …nor do its raw ASCII bytes survive anywhere in the DECODED wire
+    // (version byte + IV + ciphertext + tag): a 64-byte needle cannot
+    // occur in a ~110-byte buffer by chance, so this arm is deterministic
+    const binary = atob(ticket.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (ticket.length % 4)) % 4));
+    const secretBytes = new TextEncoder().encode(secret);
+    let byteHit = false;
+    for (let i = 0; i + secretBytes.length <= binary.length; i++) {
+      let match = true;
+      for (let j = 0; j < secretBytes.length; j++) {
+        if (binary.charCodeAt(i + j) !== secretBytes[j]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) byteHit = true;
+    }
+    expect(byteHit).toBe(false);
+    // the round-trip still recovers the exact secret for the verify
+    const opened = await verifyPendingTicket(env.DB, ticket, "enroll", { now: NOW });
+    expect(opened).toEqual({ kind: "enroll", secret });
+    // two seals of the same payload differ (a fresh random IV per mint)
+    const again = await mintPendingTicket(env.DB, { kind: "enroll", secret }, NOW);
+    expect(again).not.toBe(ticket);
   });
 
   it("the cookie directives carry the §2.3 flag set", () => {

@@ -27,14 +27,21 @@
  *     server-side session (`twofaUid`/`twofaRemember`, auth.go:352-354)
  *     and the enrollment secret alongside (`twofaSecret`/`twofaUri`,
  *     security/2fa.go:145-152); our `sessions` rows carry no arbitrary
- *     keys, so BOTH travel in a signed ticket cookie instead —
- *     HMAC-SHA256 over a compact JSON payload keyed by the shared
- *     `general_token_signing_secret` system_keystore row (the landed
- *     instance secret that plays upstream's JWT_SECRET/SECRET_KEY role;
- *     operator-only rotation, the oauth2 keys.ts posture — outstanding
- *     tickets die with it, a user mid-flow just re-authenticates). Same
- *     trust shape as upstream's session cookie: possession of the
- *     unguessable signed value IS the authority to continue the flow.
+ *     keys, so BOTH travel in an ENCRYPTED ticket cookie instead —
+ *     AES-256-GCM over a compact JSON payload, keyed by an HKDF-SHA256
+ *     derivation of the shared `general_token_signing_secret`
+ *     system_keystore row (the landed instance secret that plays
+ *     upstream's JWT_SECRET/SECRET_KEY role; operator-only rotation, the
+ *     oauth2 keys.ts posture — outstanding tickets die with it, a user
+ *     mid-flow just re-authenticates). Confidentiality is the point of
+ *     the encryption: the ENROLL payload carries the TOTP shared secret,
+ *     which upstream never leaves the server (security/2fa.go:145-152) —
+ *     the earlier integrity-only HMAC shape leaked it to the cookie jar.
+ *     ONE integrity mechanism: AES-GCM's own authentication tag (the
+ *     previous HMAC is folded into it — tampering fails the AEAD
+ *     decrypt, same unforgeability, half the machinery). Same trust
+ *     shape as upstream's session cookie: possession of the unguessable
+ *     sealed value IS the authority to continue the flow.
  *   - WebAuthn: `HasTwoFactorOrWebAuthn` (twofactor.go:189-197) reduces to
  *     the TOTP half — no webauthn_credential store exists yet; the gate
  *     and the login flow's webauthn redirect arm are the next unit's.
@@ -195,11 +202,102 @@ function base64UrlDecode(value: string): Uint8Array | null {
   }
 }
 
-async function hmacSha256Hex(keyHex: string, message: string): Promise<Uint8Array> {
+function hexToBytes(keyHex: string): Uint8Array {
   const keyBytes = new Uint8Array(keyHex.length / 2);
   for (let i = 0; i < keyBytes.length; i++) keyBytes[i] = parseInt(keyHex.slice(i * 2, i * 2 + 2), 16);
-  const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  return new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message)));
+  return keyBytes;
+}
+
+// ---------------------------------------------------------------------------
+// The ticket AEAD — AES-256-GCM under an HKDF derivation of the instance
+// secret (the header's PENDING-STATE bullet: one mechanism, GCM's tag)
+// ---------------------------------------------------------------------------
+
+/** Wire-version byte: `0x01` prefixes every sealed ticket so a future
+ *  re-key/format is detectable at decode, and the retired HMAC format
+ *  (`body.mac`, no prefix byte) fails the length/version gates outright. */
+const TICKET_WIRE_VERSION = 0x01;
+
+/** GCM nonce length (WebCrypto's default recommendation) + tag length. */
+const TICKET_IV_BYTES = 12;
+const TICKET_TAG_BYTES = 16;
+
+/** HKDF salt/info — fixed, non-secret domain separators; the key material's
+ *  entire entropy is the instance secret. */
+const TICKET_HKDF_SALT = "cf-gitea:twofa-ticket";
+const TICKET_HKDF_INFO = "cf-gitea:twofa-pending-ticket-aead-v1";
+
+const aeadKeyCache = new Map<string, Promise<CryptoKey>>();
+
+/** The AES-256-GCM ticket key: HKDF-SHA256(salt, info) over the raw instance
+ *  secret bytes, 256 output bits — cached per isolate alongside the
+ *  secret itself (resetTwofaSigningSecretCache drops both). */
+async function loadTicketAeadKey(d1: D1Database): Promise<CryptoKey> {
+  const secretHex = await loadSigningSecret(d1);
+  const cached = aeadKeyCache.get(secretHex);
+  if (cached !== undefined) return cached;
+  const promise = (async (): Promise<CryptoKey> => {
+    const ikm = await crypto.subtle.importKey("raw", hexToBytes(secretHex), "HKDF", false, ["deriveBits"]);
+    const bits = await crypto.subtle.deriveBits(
+      {
+        name: "HKDF",
+        hash: "SHA-256",
+        salt: new TextEncoder().encode(TICKET_HKDF_SALT),
+        info: new TextEncoder().encode(TICKET_HKDF_INFO),
+      },
+      ikm,
+      256,
+    );
+    return crypto.subtle.importKey("raw", bits, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+  })();
+  aeadKeyCache.set(secretHex, promise);
+  return promise;
+}
+
+/** Seal the payload JSON: `0x01 || iv || AES-256-GCM(json)` (WebCrypto
+ *  appends the 128-bit tag to the ciphertext), base64url — ONE opaque
+ *  token. The GCM tag IS the integrity mechanism (the retired HMAC's role,
+ *  folded per the header). */
+async function sealTicket(d1: D1Database, payload: TicketPayload): Promise<string> {
+  const key = await loadTicketAeadKey(d1);
+  const iv = crypto.getRandomValues(new Uint8Array(TICKET_IV_BYTES));
+  const sealed = new Uint8Array(
+    await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv, tagLength: TICKET_TAG_BYTES * 8 },
+      key,
+      new TextEncoder().encode(JSON.stringify(payload)),
+    ),
+  );
+  const wire = new Uint8Array(1 + TICKET_IV_BYTES + sealed.length);
+  wire[0] = TICKET_WIRE_VERSION;
+  wire.set(iv, 1);
+  wire.set(sealed, 1 + TICKET_IV_BYTES);
+  return base64UrlEncode(wire);
+}
+
+/** Open a sealed ticket: version byte, length floor (prefix + iv + the GCM
+ *  tag alone), AEAD decrypt — every malformed/tampered presentation is
+ *  null, then the kind + TTL gates below. */
+async function openTicket(d1: D1Database, value: string): Promise<TicketPayload | null> {
+  const wire = base64UrlDecode(value);
+  if (
+    wire === null ||
+    wire.length < 1 + TICKET_IV_BYTES + TICKET_TAG_BYTES ||
+    wire[0] !== TICKET_WIRE_VERSION
+  ) {
+    return null;
+  }
+  const key = await loadTicketAeadKey(d1);
+  try {
+    const plain = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: wire.slice(1, 1 + TICKET_IV_BYTES), tagLength: TICKET_TAG_BYTES * 8 },
+      key,
+      wire.slice(1 + TICKET_IV_BYTES),
+    );
+    return JSON.parse(new TextDecoder().decode(plain)) as TicketPayload;
+  } catch {
+    return null;
+  }
 }
 
 /** The shared instance-secret row (the `[security] SECRET_KEY` role here) —
@@ -211,10 +309,11 @@ const GENERAL_TOKEN_SIGNING_SECRET_ROW = "general_token_signing_secret";
 
 const signingSecretCache = new Map<string, Promise<string>>();
 
-/** TEST-ONLY: drop the module-level signing-secret cache (the keys.ts
- *  resetSecretCaches precedent — simulates an isolate restart). */
+/** TEST-ONLY: drop the module-level signing-secret + AEAD-key caches (the
+ *  keys.ts resetSecretCaches precedent — simulates an isolate restart). */
 export function resetTwofaSigningSecretCache(): void {
   signingSecretCache.clear();
+  aeadKeyCache.clear();
 }
 
 async function loadSigningSecret(d1: D1Database): Promise<string> {
@@ -265,21 +364,21 @@ function parseSigningSecretRow(value: string): string {
 }
 
 /**
- * Mint the signed ticket cookie value: `base64url(payload).base64url(hmac)`.
- * The HMAC key is the shared instance secret; the payload is the compact
- * JSON of the ticket plus its issued-at.
+ * Mint the sealed ticket cookie value: one opaque token,
+ * `base64url(0x01 || iv || AES-256-GCM(json))` (see the AEAD block above —
+ * the payload is the compact JSON of the ticket plus its issued-at).
  */
 export async function mintPendingTicket(d1: D1Database, ticket: PendingTwofaTicket, now?: Date): Promise<string> {
   const payload: TicketPayload = { ...ticket, iat: (now ?? new Date()).getTime() };
-  const body = base64UrlEncode(new TextEncoder().encode(JSON.stringify(payload)));
-  return `${body}.${base64UrlEncode(await hmacSha256Hex(await loadSigningSecret(d1), body))}`;
+  return sealTicket(d1, payload);
 }
 
 /**
- * Verify a presented ticket of exactly `kind` — HMAC re-check in constant
- * time, then the TTL. Any malformed/mismatched/expired presentation is
- * null (the callers' not-in-a-2FA-session arm). A ticket of the OTHER kind
- * is null too — the two flows never cross-authenticate.
+ * Verify a presented ticket of exactly `kind` — AEAD open (the GCM tag
+ * authenticates; the retired format's dot never parses), then the TTL. Any
+ * malformed/tampered/expired presentation is null (the callers'
+ * not-in-a-2FA-session arm). A ticket of the OTHER kind is null too — the
+ * two flows never cross-authenticate.
  */
 export async function verifyPendingTicket(
   d1: D1Database,
@@ -287,23 +386,8 @@ export async function verifyPendingTicket(
   kind: PendingTwofaTicket["kind"],
   options?: { now?: Date },
 ): Promise<PendingTwofaTicket | null> {
-  const dot = value.lastIndexOf(".");
-  if (dot <= 0 || dot === value.length - 1) return null;
-  const body = value.slice(0, dot);
-  const mac = base64UrlDecode(value.slice(dot + 1));
-  if (mac === null) return null;
-  const expected = await hmacSha256Hex(await loadSigningSecret(d1), body);
-  if (mac.length !== expected.length || !crypto.subtle.timingSafeEqual(mac, expected)) {
-    return null;
-  }
-  const jsonBytes = base64UrlDecode(body);
-  if (jsonBytes === null) return null;
-  let payload: TicketPayload;
-  try {
-    payload = JSON.parse(new TextDecoder().decode(jsonBytes)) as TicketPayload;
-  } catch {
-    return null;
-  }
+  const payload = await openTicket(d1, value);
+  if (payload === null) return null;
   if (payload.kind !== kind) return null;
   if (payload.iat + PENDING_TICKET_TTL_MS <= (options?.now ?? new Date()).getTime()) return null;
   if (payload.kind === "gate") {

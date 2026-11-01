@@ -225,7 +225,7 @@ describe("403: admin routes and prohibited accounts", () => {
     expect(response.status).toBe(200);
   });
 
-  it("prohibited account → upstream prohibited message", async () => {
+  it("prohibited account → upstream prohibited message (the BARE {message} body — api.go:889-893 has no url field)", async () => {
     const seeded = await seedWithToken("BannedUser", "all", { status: "prohibited" });
     const response = await call("https://example.com/_repo", {
       headers: { Authorization: `token ${seeded.token}` },
@@ -233,19 +233,18 @@ describe("403: admin routes and prohibited accounts", () => {
     expect(response.status).toBe(403);
     expect(await response.json()).toEqual({
       message: "This account is prohibited from signing in, please contact your site administrator.",
-      url: SWAGGER_URL,
     });
   });
 });
 
 describe("sudo (SPEC-0002 §4.2)", () => {
-  it("non-admin using sudo → exact upstream 403", async () => {
+  it("non-admin using sudo → exact upstream 403 (the BARE {message} body — api.go:135-138 has no url field)", async () => {
     const seeded = await seedWithToken("SudoPeon", "all");
     const response = await call("https://example.com/_whoami?sudo=target", {
       headers: { Authorization: `token ${seeded.token}` },
     });
     expect(response.status).toBe(403);
-    expect(await response.json()).toEqual({ message: "Only administrators allowed to sudo.", url: SWAGGER_URL });
+    expect(await response.json()).toEqual({ message: "Only administrators allowed to sudo." });
   });
 
   it("admin sudo onto an unknown target → 404 not found", async () => {

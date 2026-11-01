@@ -54,7 +54,14 @@ import {
 } from "../auth/two-factor";
 import { totpCode } from "../auth/totp";
 import { TokenService } from "../auth/token-service";
-import { authFailures, repositories, sessions, users } from "../db/schema";
+import { auditEvents, authFailures, repositories, sessions, users } from "../db/schema";
+import {
+  WEBAUTHN_CHALLENGE_COOKIE_NAME,
+  WEBAUTHN_COOKIE_NAME,
+  encodeCoseKey,
+  webAuthnClearCookie,
+} from "../web/webauthn-ceremony";
+import { createCredential } from "../web/webauthn-store";
 import { uiRouter, type UiAssetsFetcher } from "./index";
 import type { UiManifest } from "./manifest";
 import {
@@ -144,6 +151,23 @@ function cookieParts(header: string): Map<string, string> {
 
 const cookieHeader = (response: Response): string => response.headers.get("set-cookie") ?? "";
 
+/** Split a multi-directive Set-Cookie header (our directives carry no
+ *  Expires dates, so `, ` splits cleanly). */
+function setCookieDirectives(response: Response): string[] {
+  const header = cookieHeader(response);
+  return header === "" ? [] : header.split(/, (?=[A-Za-z0-9_-]+=)/);
+}
+
+/** The logout response's clear set — the session cookie AND the pre-auth
+ *  carriers (upstream HandleSignOut destroys the WHOLE server session,
+ *  auth.go:453-460; the cookie carriers die by their own Max-Age=0s). */
+const LOGOUT_CLEAR_SET = [
+  clearSessionSetCookie(),
+  clearTwofaSetCookie(),
+  webAuthnClearCookie("pending"),
+  webAuthnClearCookie("assert"),
+];
+
 // --- fixtures ---------------------------------------------------------------------
 
 interface SeedUser {
@@ -204,10 +228,20 @@ const failureCount = async (ip: string): Promise<number> =>
 beforeAll(applyAuthD1Migrations);
 
 beforeEach(async () => {
-  // `two_factor` rides the 2FA gate's ladder (the gate describe below);
-  // `system_keystore` is NOT wiped — the ticket HMAC key persists per-file
-  // (the module cache holds it anyway; self-consistent per test).
-  for (const table of ["sessions", "personal_access_tokens", "auth_failures", "repositories", "users", "two_factor"]) {
+  // `two_factor` + `webauthn_credentials` ride the 2FA gate's ladders (the
+  // gate describe below); `system_keystore` is NOT wiped — the ticket AEAD
+  // key material persists per-file (the module cache holds it anyway;
+  // self-consistent per test).
+  for (const table of [
+    "sessions",
+    "personal_access_tokens",
+    "auth_failures",
+    "repositories",
+    "users",
+    "two_factor",
+    "webauthn_credentials",
+    "audit_event",
+  ]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
 });
@@ -316,6 +350,52 @@ describe("POST /login — the happy path (§2.2)", () => {
     const res = await request("/login", form({ password: pat }, { "x-forwarded-for": ip }));
     expect(res.status).toBe(303);
     expect(await failureCount(ip)).toBe(0); // limiter.reset ran via waitUntil
+  });
+
+  it("a CROSS-user re-login retires the presented prior session row (upstream Regenerate — store.go:113-128, auth.go:400-407)", async () => {
+    const alice = await seedUser({ username: "Alice" });
+    const bob = await seedUser({ username: "Bob" });
+    const staleCookie = await mintSession(env.DB, alice.id); // a live ALICE row presented at Bob's login
+    expect(await lookupValidSession(env.DB, staleCookie)).not.toBeNull();
+
+    const bobPat = await seedToken(bob, "web");
+    const res = await request("/login", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: `${SESSION_COOKIE_NAME}=${staleCookie}` },
+      body: new URLSearchParams({ password: bobPat }).toString(),
+    });
+    expect(res.status).toBe(303);
+    // Bob minted…
+    const rows = await drizzle(env.DB).select().from(sessions).all();
+    expect(rows).toHaveLength(1);
+    const sessionCookie = setCookieMaps(res).get(SESSION_COOKIE_NAME);
+    expect(sessionCookie).toBeDefined();
+    expect(rows[0]?.id).toBe([...(sessionCookie?.keys() ?? [])][0]?.split(":")[0]);
+    expect(rows[0]?.userId).toBe(bob.id);
+    // …and Alice's presented row died with the sign-in (an ID known before
+    // sign-in never stays authenticated across users).
+    expect(await lookupValidSession(env.DB, staleCookie)).toBeNull();
+  });
+
+  it("a SAME-user re-login KEEPS the prior row alive (the documented choice — it already authenticates the minted principal)", async () => {
+    const alice = await seedUser({ username: "Alice" });
+    const pat = await seedToken(alice, "web");
+    const priorCookie = await mintSession(env.DB, alice.id);
+
+    const res = await request("/login", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: `${SESSION_COOKIE_NAME}=${priorCookie}` },
+      body: new URLSearchParams({ password: pat }).toString(),
+    });
+    expect(res.status).toBe(303);
+    // both rows alive: the prior (same principal) AND the fresh mint
+    const rows = await drizzle(env.DB).select().from(sessions).all();
+    expect(rows).toHaveLength(2);
+    expect(await lookupValidSession(env.DB, priorCookie)).not.toBeNull();
+    const sessionCookie = setCookieMaps(res).get(SESSION_COOKIE_NAME);
+    expect(sessionCookie).toBeDefined();
+    // the RESPONSE cookie is a fresh row, not the presented one
+    expect([...(sessionCookie?.keys() ?? [])][0]?.split(":")[0]).not.toBe(priorCookie.split(":")[0]);
   });
 
   it("stamps users.last_login_at at the mint (P3-7 — upstream's SetLastLogin sign-in family, auth.go:427-430)", async () => {
@@ -615,7 +695,7 @@ describe("GET /login — the rotation round-trip", () => {
 });
 
 describe("POST /logout (§2.7)", () => {
-  it("deletes the row (id AND digest), clears the cookie, redirects — idempotent", async () => {
+  it("deletes the row (id AND digest), clears the cookie + the pre-auth carriers, redirects — idempotent", async () => {
     const alice = await seedUser();
     const cookieValue = await mintSession(env.DB, alice.id);
 
@@ -625,7 +705,7 @@ describe("POST /logout (§2.7)", () => {
     });
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe("/");
-    expect(cookieHeader(res)).toBe(clearSessionSetCookie());
+    expect(setCookieDirectives(res)).toEqual(LOGOUT_CLEAR_SET);
     expect(await drizzle(env.DB).select().from(sessions).all()).toHaveLength(0);
 
     // Logging out again (stale cookie, row gone) is still a clean redirect.
@@ -677,17 +757,38 @@ describe("POST /logout (§2.7)", () => {
 
     const cookieless = await request("/logout", { method: "POST" });
     expect(cookieless.status).toBe(303);
-    expect(cookieHeader(cookieless)).toBe(clearSessionSetCookie());
+    expect(setCookieDirectives(cookieless)).toEqual(LOGOUT_CLEAR_SET);
 
     const forged = await request("/logout", {
       method: "POST",
       headers: { cookie: `${SESSION_COOKIE_NAME}=${id}:${"f".repeat(64)}` },
     });
     expect(forged.status).toBe(303);
-    expect(cookieHeader(forged)).toBe(clearSessionSetCookie());
+    expect(setCookieDirectives(forged)).toEqual(LOGOUT_CLEAR_SET);
     // The forged arm still leaves the row untouched (asserted above in the
     // forged arm's own test) — the clear directive is response-side only.
     expect(await drizzle(env.DB).select().from(sessions).all()).toHaveLength(1);
+  });
+
+  it("clears the PRE-AUTH carriers too — the logout round-trip retires gitea_twofa and both webauthn carriers (auth.go:453-460)", async () => {
+    // A parked pre-auth state survives no logout: upstream's HandleSignOut
+    // destroys the whole server session, twofaUid included; here the
+    // carriers are cookies, so the response carries all four Max-Age=0
+    // directives (the LOGOUT_CLEAR_SET pinned above, exercised WITH the
+    // carriers actually present in the jar).
+    const res = await request("/logout", {
+      method: "POST",
+      headers: {
+        cookie: [
+          `${TWOFA_COOKIE_NAME}=sealed-ticket-value`,
+          `${WEBAUTHN_COOKIE_NAME}=pending-state-value`,
+          `${WEBAUTHN_CHALLENGE_COOKIE_NAME}=challenge-value`,
+        ].join("; "),
+      },
+    });
+    expect(res.status).toBe(303);
+    const directives = setCookieDirectives(res);
+    expect(directives).toEqual(LOGOUT_CLEAR_SET);
   });
 });
 
@@ -773,6 +874,24 @@ describe("admin impersonation — flip, logout exit arm, banner exposure", () =>
     expect(row?.userId).toBe(adminId); // restored from the backup
     expect(row?.impersonatorUserId).toBeNull(); // the backup cleared
 
+    // The EXIT audit row (auth.go:476's RecordAs — actor the ADMIN, scope
+    // the TARGET, impersonator dropped since the actor IS the admin).
+    const auditRows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(auditRows).toHaveLength(1);
+    const adminName = await drizzle(env.DB).select({ username: users.username }).from(users).where(eq(users.id, adminId)).get();
+    const targetName = await drizzle(env.DB).select({ username: users.username }).from(users).where(eq(users.id, targetId)).get();
+    expect(auditRows[0]).toMatchObject({
+      action: "user:impersonation:exit",
+      actorId: adminId,
+      actorName: adminName?.username,
+      impersonatorId: 0,
+      scopeType: "user",
+      scopeId: String(targetId),
+      scopeName: targetName?.username,
+      origin: "ui",
+      message: `User ${adminName?.username} stopped impersonating user ${targetName?.username}.`,
+    });
+
     // The SAME cookie authenticates as the admin again (upstream keeps the
     // session store entry; only the keys flip back).
     const next = await verifySession(env.DB, cookieValue);
@@ -781,6 +900,66 @@ describe("admin impersonation — flip, logout exit arm, banner exposure", () =>
       expect(next.user.id).toBe(adminId);
       expect(next.impersonatorUserId).toBeNull();
     }
+  });
+
+  it("the exit arm is reachable with a PROHIBITED target (the doer-status check never strands the admin — services/auth/session.go:31-61)", async () => {
+    // A prohibited target fails lookupValidSession on every request (the
+    // §2.4 authority posture), so the VALID-arm branch cannot run — the
+    // logout must still reach the (id, digest)-keyed exit instead of
+    // locking the admin inside a session every verify calls anonymous.
+    const admin = await seedUser({ username: "Root", isAdmin: true });
+    const prohibited = await seedUser({ username: "BannedTarget", status: "prohibited" });
+    const cookieValue = await mintSession(env.DB, admin.id);
+    const sessionId = cookieValue.split(":")[0] ?? "";
+    expect(await lookupValidSession(env.DB, cookieValue)).not.toBeNull();
+    expect(await impersonateSessionUser(env.DB, sessionId, admin.id, prohibited.id)).toBe("impersonating");
+    // sanity: the flipped session is now §2.4-anonymous (the prohibited doer)
+    expect(await lookupValidSession(env.DB, cookieValue)).toBeNull();
+
+    const res = await request("/logout", {
+      method: "POST",
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${cookieValue}` },
+    });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/-/admin");
+    expect(cookieHeader(res)).toBe(""); // the session continues — no Set-Cookie
+
+    const row = await drizzle(env.DB).select().from(sessions).where(eq(sessions.id, sessionId)).get();
+    expect(row?.userId).toBe(admin.id); // restored
+    expect(row?.impersonatorUserId).toBeNull();
+    // the admin's session works again
+    const next = await verifySession(env.DB, cookieValue);
+    expect(next.outcome).toBe("authenticated");
+    if (next.outcome === "authenticated") expect(next.user.id).toBe(admin.id);
+  });
+
+  it("an org-typed target's exit row scopes organization (ScopeFromUser's shape, refs.go:44-50)", async () => {
+    const admin = await seedUser({ username: "Root", isAdmin: true });
+    const orgId = (
+      await drizzle(env.DB)
+        .insert(users)
+        .values([{ username: "forge", usernameLower: "forge", type: "org", status: "active", createdAt: new Date() }])
+        .returning({ id: users.id })
+        .all()
+    )[0]!.id;
+    const cookieValue = await mintSession(env.DB, admin.id);
+    expect(await impersonateSessionUser(env.DB, cookieValue.split(":")[0] ?? "", admin.id, orgId)).toBe("impersonating");
+
+    const res = await request("/logout", {
+      method: "POST",
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${cookieValue}` },
+    });
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/-/admin");
+    const auditRows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(auditRows).toHaveLength(1);
+    expect(auditRows[0]).toMatchObject({
+      action: "user:impersonation:exit",
+      actorId: admin.id,
+      scopeType: "organization",
+      scopeId: String(orgId),
+      scopeName: "forge",
+    });
   });
 
   it("the exit's guarded write refuses a forged presentation (the deleteSessionBySecret guard posture)", async () => {
@@ -801,7 +980,7 @@ describe("admin impersonation — flip, logout exit arm, banner exposure", () =>
     });
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe("/");
-    expect(cookieHeader(res)).toBe(clearSessionSetCookie());
+    expect(setCookieDirectives(res)).toEqual(LOGOUT_CLEAR_SET);
     expect(await drizzle(env.DB).select().from(sessions).all()).toHaveLength(0);
     expect(adminId).toBeGreaterThan(0);
   });
@@ -1398,6 +1577,25 @@ describe("the 2FA gate — the login ladder (2fa.go over web.go:600-604)", () =>
     return { pat, secret, scratchToken: outcome.scratchToken };
   }
 
+  /** An enrolled WebAuthn credential row (the DUAL-enrollment fixture — the
+   *  gate only reads row existence, but the store's row view parses the
+   *  COSE key, so the bytes are real: a canonical EC2 key re-encoded). */
+  async function seedWebAuthnCredential(user: SeedUser): Promise<void> {
+    const x = crypto.getRandomValues(new Uint8Array(32));
+    const y = crypto.getRandomValues(new Uint8Array(32));
+    await createCredential(env.DB, user.id, "security key", {
+      credentialId: crypto.getRandomValues(new Uint8Array(16)),
+      coseKey: { kty: "EC2", x, y },
+      publicKeyRaw: encodeCoseKey({ kty: "EC2", x, y }),
+      attestationType: "none",
+      aaguid: new Uint8Array(16),
+      signCount: 0,
+      transports: null,
+      userPresent: true,
+      userVerified: true,
+    });
+  }
+
   /** Drive the gate to the twofa page: login POST → the 303 + ticket cookie. */
   async function gateTicket(user: SeedUser, pat: string, extra: Record<string, string> = {}): Promise<string> {
     const res = await request("/login", form({ password: pat, ...extra }));
@@ -1406,7 +1604,8 @@ describe("the 2FA gate — the login ladder (2fa.go over web.go:600-604)", () =>
     const value = setCookieMaps(res).get(TWOFA_COOKIE_NAME);
     expect(value).toBeDefined();
     const ticket = [...(value?.keys() ?? [])][0] ?? "";
-    expect(ticket).toContain(".");
+    // the AEAD wire: ONE dotless base64url token (the sealed ticket)
+    expect(ticket).toMatch(/^[A-Za-z0-9_-]+$/);
     return ticket;
   }
 
@@ -1421,7 +1620,7 @@ describe("the 2FA gate — the login ladder (2fa.go over web.go:600-604)", () =>
     expect(cookies.has(TWOFA_COOKIE_NAME)).toBe(false);
   });
 
-  it("an enrolled user's login does NOT mint — 303 /user/two_factor with the signed ticket (auth.go:330-349)", async () => {
+  it("an enrolled user's login does NOT mint — 303 /user/two_factor with the sealed ticket (auth.go:330-349)", async () => {
     const alice = await seedUser();
     const { pat } = await seedEnrolled(alice);
     const res = await request("/login", form({ password: pat, redirect_to: "/alice/repo" }));
@@ -1438,6 +1637,52 @@ describe("the 2FA gate — the login ladder (2fa.go over web.go:600-604)", () =>
     expect(await failureCount(ip)).toBe(3);
     await request("/login", form({ password: pat }, { "x-forwarded-for": ip }));
     expect(await failureCount(ip)).toBe(0);
+  });
+
+  it("a DUAL-enrolled user parks at /user/webauthn with BOTH carriers armed — the TOTP fallback page renders 200 (webauthn.go:40-46 → 2fa.go:36)", async () => {
+    // Upstream parks twofaUid in the SAME server session regardless of the
+    // prompt it redirects to (handleTwoFactorRequired sets the keys before
+    // the hasWebAuthn branch), so its webauthn page renders the TOTP
+    // fallback and GET /user/two_factor finds the parked principal. Two
+    // cookies cannot share one jar slot: the dual park arms BOTH carriers.
+    const alice = await seedUser();
+    const { pat, secret } = await seedEnrolled(alice);
+    await seedWebAuthnCredential(alice);
+
+    const res = await request("/login", form({ password: pat, redirect_to: "/alice/repo" }));
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/user/webauthn"); // the webauthn prompt wins (hasWebAuthn first)
+    const cookies = setCookieMaps(res);
+    expect(cookies.has(WEBAUTHN_COOKIE_NAME)).toBe(true); // the pending carrier
+    expect(cookies.has(TWOFA_COOKIE_NAME)).toBe(true); // the TOTP gate ticket — the fallback's authority
+    expect(cookies.has(SESSION_COOKIE_NAME)).toBe(false);
+    expect((await drizzle(env.DB).select().from(sessions).all()).length).toBe(0);
+
+    // THE DEAD-500 FIX: from the webauthn prompt, the TOTP fallback link
+    // (web/webauthn-page.tsx arms /user/two_factor) now renders — the gate
+    // ticket verifies without any webauthn ceremony.
+    const gateTicket = [...(cookies.get(TWOFA_COOKIE_NAME)?.keys() ?? [])][0] ?? "";
+    const page = await request("/user/two_factor", { headers: { cookie: `${TWOFA_COOKIE_NAME}=${gateTicket}` } });
+    expect(page.status).toBe(200);
+    expect(await page.text()).toContain('action="/user/two_factor"');
+
+    // TOTP success mints AND clears BOTH carriers (whichever flow completes
+    // first clears both — the session.ts half of that contract).
+    const right = await request("/user/two_factor", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", cookie: `${TWOFA_COOKIE_NAME}=${gateTicket}`, origin: "https://test.local" },
+      body: new URLSearchParams({ passcode: await totpCode(secret, Date.now() / 1000) }).toString(),
+    });
+    expect(right.status).toBe(303);
+    expect(right.headers.get("location")).toBe("/alice/repo");
+    const cleared = setCookieMaps(right);
+    expect(cleared.get(TWOFA_COOKIE_NAME)?.get("Max-Age")).toBe("0");
+    expect(cleared.get(WEBAUTHN_COOKIE_NAME)?.get("Max-Age")).toBe("0");
+    expect(cleared.get(WEBAUTHN_CHALLENGE_COOKIE_NAME)?.get("Max-Age")).toBe("0");
+    const raw = [...(cleared.get(SESSION_COOKIE_NAME)?.keys() ?? [])][0] ?? "";
+    const verification = await verifySession(env.DB, raw);
+    expect(verification.outcome).toBe("authenticated");
+    if (verification.outcome === "authenticated") expect(verification.user.id).toBe(alice.id);
   });
 
   it("GET /user/two_factor: the ticket renders the passcode form; no ticket is the 500 shell; a live session 303s /", async () => {

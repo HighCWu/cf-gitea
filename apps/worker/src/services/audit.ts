@@ -145,6 +145,15 @@ export const AuditActions = {
     "user:oauth2application:grant",
     "Granted OAuth2 application {oauth2_application} access to user {scope}.",
   ),
+  // The impersonation pair (admin impersonation's audit rows — the
+  // sanctioned 2a00e28 follow-up): ids AND templates verbatim from
+  // upstream action.go:65-66. Note upstream's Go const is
+  // `UserImpersonation` while the id carries the `:start` suffix — both
+  // ported exactly. The start row emits at the impersonate write seam
+  // (users.go:580's Record), the exit row at SignOut's restore
+  // (auth.go:476's RecordAs — actor the ADMIN, scope the target).
+  UserImpersonation: defineAction("user:impersonation:start", "User {actor} started impersonating user {scope}."),
+  UserImpersonationExit: defineAction("user:impersonation:exit", "User {actor} stopped impersonating user {scope}."),
   // organization:* (action.go:114-134)
   OrganizationCreate: defineAction("organization:create", "Created organization {scope}."),
   OrganizationDelete: defineAction("organization:delete", "Deleted organization {scope}."),

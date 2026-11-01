@@ -86,7 +86,9 @@ and SPEC-0008 open question 4 are satisfied by this document.
 - The write actions themselves, star/watch counters, settings/admin pages — each is
   its own SPEC; this one only defines the principal they will run as and the CSRF
   contract they must follow.
-- OAuth2 provider, 2FA/WebAuthn, HTTP-signature — SPEC-0002 §2.8 territory.
+- OAuth2 provider, HTTP-signature — SPEC-0002 §2.8 territory. 2FA/WebAuthn landed —
+  SPEC-0022 (its login gate inserts between this SPEC's POST /login credential proof
+  and the session mint).
 - CSP (SPEC-0008 open question 6) — separate pass; §4.9 records the interplay.
 - Session management UI (list/revoke devices, logout-everywhere) — open question 5.
 
