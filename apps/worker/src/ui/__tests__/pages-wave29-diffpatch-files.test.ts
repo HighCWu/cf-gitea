@@ -423,7 +423,9 @@ describe("GET /{owner}/{repo}/pulls/{index}.{diff|patch}", () => {
     expect(body).toContain("Subject: [PATCH] wave29: pr head");
     expect(body).toContain("A body line for the patch header.");
     expect(body).toContain("diff --git a/docs/notes.md b/docs/notes.md");
-    expect(body.endsWith("-- \n2.47.0\n")).toBe(true);
+    // the mail tail is git's stream end: the version line plus the final
+    // newline (real git 2.43.0 `format-patch --stdout -1` ends `2.43.0\n\n`)
+    expect(body.endsWith("-- \n2.47.0\n\n")).toBe(true);
   });
 
   it("serves a CLOSED pull (GetPullRequestByIndex has no state filter)", async () => {

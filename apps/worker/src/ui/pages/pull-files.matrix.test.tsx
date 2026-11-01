@@ -1762,3 +1762,83 @@ describe("w111 DiffFileBox viewed-file-form label", () => {
     expect(without).not.toContain("viewed-file-form");
   });
 });
+
+// The D2 gitlink arm: the engine now emits submodule entries (mode 160000,
+// the virtual `Subproject commit <sha>` hunk — the NOTICE-recorded engine
+// adaptation), so diffFileViews' TranslateDiffEntryMode table can fire its
+// filemode_submodule label at all (never-firing before: the engine skipped
+// gitlink entries entirely).
+describe("D2 gitlink arm (the Submodule entry-mode label over the engine's virtual Subproject file)", () => {
+  const SUB_OLD = "26e4d4173c1cbc3a7fe13a4131eb33b888b8d11e";
+  const SUB_NEW = "c09b7ca63d24b4156a3d73d1c1ef0c37f64f769d";
+
+  it("a changed submodule renders the Subproject del/add rows; the label stays null (a sha bump parses no mode line — upstream's TranslateDiffEntryMode rule)", async () => {
+    const { DiffFileBox } = await import("./pull-files");
+    const view = (await diffFileViews([
+      {
+        path: "sub",
+        old: { oid: SUB_OLD, mode: "160000" },
+        new: { oid: SUB_NEW, mode: "160000" },
+        kind: "text",
+        add: 1,
+        del: 1,
+        hunks: [{
+          aStart: 1, aLen: 1, bStart: 1, bLen: 1,
+          ops: [
+            { tag: "del", line: `Subproject commit ${SUB_OLD}` },
+            { tag: "add", line: `Subproject commit ${SUB_NEW}` },
+          ],
+        }],
+      },
+    ]))[0]!;
+    // upstream gitdiff.go:617-626: the entry-mode label exists only when a
+    // mode line was parsed (new/deleted/old/new mode) — a submodule bump's
+    // patch carries `index abc..def 160000` and NO mode line, so the label
+    // is empty there; the created/deleted arms below are where it lights up.
+    expect(view.modeLabel).toBe(null);
+    // the section still renders the unified table body (the Subproject hunk;
+    // the box splits the +/- marker from the row content in the DOM)
+    expect(view.body).toBe("table");
+    const box = renderToString(<DiffFileBox view={view} />);
+    expect(box).toContain('<span class="tw-font-mono" data-type-marker="-"></span>');
+    expect(box).toContain(`<code class="code-inner">Subproject commit ${SUB_OLD}</code>`);
+    expect(box).toContain('<span class="tw-font-mono" data-type-marker="+"></span>');
+    expect(box).toContain(`<code class="code-inner">Subproject commit ${SUB_NEW}</code>`);
+  });
+
+  it("created and deleted submodules fire the Submodule label (TranslateDiffEntryMode's git.filemode.submodule)", async () => {
+    const { DiffFileBox } = await import("./pull-files");
+    const created = (await diffFileViews([
+      {
+        path: "sub",
+        old: null,
+        new: { oid: SUB_OLD, mode: "160000" },
+        kind: "text",
+        add: 1,
+        del: 0,
+        hunks: [{ aStart: 0, aLen: 0, bStart: 1, bLen: 1, ops: [{ tag: "add", line: `Subproject commit ${SUB_OLD}` }] }],
+      },
+    ]))[0]!;
+    expect(created.modeLabel).toBe("Submodule");
+    expect(created.body).toBe("table");
+    const createdBox = renderToString(<DiffFileBox view={created} />);
+    expect(createdBox).toContain('<span class="ui label">Submodule</span>');
+    expect(createdBox).toContain(`<code class="code-inner">Subproject commit ${SUB_OLD}</code>`);
+
+    const deleted = (await diffFileViews([
+      {
+        path: "sub",
+        old: { oid: SUB_NEW, mode: "160000" },
+        new: null,
+        kind: "text",
+        add: 0,
+        del: 1,
+        hunks: [{ aStart: 1, aLen: 1, bStart: 0, bLen: 0, ops: [{ tag: "del", line: `Subproject commit ${SUB_NEW}` }] }],
+      },
+    ]))[0]!;
+    expect(deleted.modeLabel).toBe("Submodule");
+    const deletedBox = renderToString(<DiffFileBox view={deleted} />);
+    expect(deletedBox).toContain('<span class="ui label">Submodule</span>');
+    expect(deletedBox).toContain(`<code class="code-inner">Subproject commit ${SUB_NEW}</code>`);
+  });
+});

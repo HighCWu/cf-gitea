@@ -33,11 +33,20 @@ import {
   NO_NEWLINE_MARKER,
   renderPatch,
   renderPatchAsync,
+  renderPatchSeries,
   renderUnifiedDiff,
   renderUnifiedDiffAsync,
+  toChangedFiles,
   type DiffBlobSource,
 } from "./git-models";
 import type { CommitJson } from "@cf-gitea/git-engine";
+import type { RepositoryWithOwner } from "./repository";
+
+/** The pair stub (the git-models-tags.test.ts idiom — URL composition only). */
+const PAIR = {
+  repo: { ownerNamespace: "owner", slug: "repo" },
+  owner: {},
+} as unknown as RepositoryWithOwner;
 
 /** A text DiffFileJson with the given oids/modes/hunks. */
 function textFile(overrides: Partial<DiffFileJson> & { path: string }): DiffFileJson {
@@ -572,5 +581,199 @@ describe("renderPatch — series numbering and the async twin", () => {
     const sync = renderPatch(commit, files, { signature: "2.43.0" });
     const asynced = await renderPatchAsync(commit, files, memSource({ "one.txt": "x\ny\n" }), { signature: "2.43.0" });
     expect(asynced).toBe(sync);
+  });
+
+  it("the signed single mail ends `-- \\n{version}\\n\\n`; the unsigned one ends on the diff's final line + newline", () => {
+    // real git 2.43.0 (scratch repo, `git format-patch --stdout -1` | xxd):
+    //   signed   …+3\n-- \n2.43.0\n\n   (xxd: `2d2d 200a 322e 3433 2e30 0a0a`)
+    //   unsigned …+3\n                  (the last diff line carries the
+    //   stream's final newline; the pre-fix renderer stopped one byte short
+    //   on both forms)
+    const commit = mailCommit("dddddddddddddddddddddddddddddddddddddddd", "tail\n");
+    const files = [
+      textFile({
+        path: "tail.txt",
+        add: 1,
+        hunks: [{ aStart: 0, aLen: 0, bStart: 1, bLen: 1, ops: [{ tag: "add", line: "x" }] }],
+      }),
+    ];
+    const signed = renderPatch(commit, files, { signature: "2.43.0" });
+    expect(signed.endsWith("+x\n-- \n2.43.0\n\n")).toBe(true);
+    const unsigned = renderPatch(commit, files, { signature: null });
+    expect(unsigned.endsWith("+x\n")).toBe(true);
+    expect(unsigned).not.toContain("\n-- \n");
+  });
+});
+
+// --- D2: gitlink (submodule) sections — the engine's virtual one-line file ----
+
+const SUB_OLD = "26e4d4173c1cbc3a7fe13a4131eb33b888b8d11e";
+const SUB_NEW = "c09b7ca63d24b4156a3d73d1c1ef0c37f64f769d";
+
+describe("gitlink (submodule) sections — the engine's virtual Subproject file (D2)", () => {
+  it("added submodule: `new file mode 160000`, index WITHOUT the mode column, `@@ -0,0 +1 @@` +Subproject", () => {
+    // real git (scratch super-repo, `git diff base add-sub`):
+    //   diff --git a/sub b/sub
+    //   new file mode 160000
+    //   index 0000000..26e4d41
+    //   --- /dev/null
+    //   +++ b/sub
+    //   @@ -0,0 +1 @@
+    //   +Subproject commit 26e4d4173c1cbc3a7fe13a4131eb33b888b8d11e
+    const file = textFile({
+      path: "sub",
+      old: null,
+      new: { oid: SUB_OLD, mode: "160000" },
+      add: 1,
+      hunks: [{ aStart: 0, aLen: 0, bStart: 1, bLen: 1, ops: [{ tag: "add", line: `Subproject commit ${SUB_OLD}` }] }],
+    });
+    expect(renderUnifiedDiff([file])).toBe(
+      [
+        "diff --git a/sub b/sub",
+        "new file mode 160000",
+        `index 0000000..${SUB_OLD.slice(0, 7)}`,
+        "--- /dev/null",
+        "+++ b/sub",
+        "@@ -0,0 +1 @@",
+        `+Subproject commit ${SUB_OLD}`,
+      ].join("\n"),
+    );
+  });
+
+  it("changed submodule: `index abc..def 160000` (both sides share the mode) and `@@ -1 +1 @@` del/add", async () => {
+    // real git (`git diff other bump-sub`):
+    //   diff --git a/sub b/sub
+    //   index 26e4d41..c09b7ca 160000
+    //   --- a/sub
+    //   +++ b/sub
+    //   @@ -1 +1 @@
+    //   -Subproject commit 26e4d41…
+    //   +Subproject commit c09b7ca…
+    const file = textFile({
+      path: "sub",
+      old: { oid: SUB_OLD, mode: "160000" },
+      new: { oid: SUB_NEW, mode: "160000" },
+      add: 1,
+      del: 1,
+      hunks: [{
+        aStart: 1, aLen: 1, bStart: 1, bLen: 1,
+        ops: [
+          { tag: "del", line: `Subproject commit ${SUB_OLD}` },
+          { tag: "add", line: `Subproject commit ${SUB_NEW}` },
+        ],
+      }],
+    });
+    expect(renderUnifiedDiff([file])).toBe(
+      [
+        "diff --git a/sub b/sub",
+        `index ${SUB_OLD.slice(0, 7)}..${SUB_NEW.slice(0, 7)} 160000`,
+        "--- a/sub",
+        "+++ b/sub",
+        "@@ -1 +1 @@",
+        `-Subproject commit ${SUB_OLD}`,
+        `+Subproject commit ${SUB_NEW}`,
+      ].join("\n"),
+    );
+    // the async arm renders the SAME bytes: a gitlink path's readBlob fails
+    // closed (the sha is not a blob of this store), so the marker pass
+    // degrades to the plain hunk — exactly git's output, which has no
+    // no-newline markers on Subproject lines
+    await expect(renderUnifiedDiffAsync([file], memSource({}))).resolves.toBe(renderUnifiedDiff([file]));
+  });
+
+  it("deleted submodule: `deleted file mode 160000`, `@@ -1 +0,0 @@` -Subproject", () => {
+    // real git (`git diff bump drop-sub`):
+    //   diff --git a/sub b/sub
+    //   deleted file mode 160000
+    //   index c09b7ca..0000000
+    //   --- a/sub
+    //   +++ /dev/null
+    //   @@ -1 +0,0 @@
+    //   -Subproject commit c09b7ca63d24b4156a3d73d1c1ef0c37f64f769d
+    const file = textFile({
+      path: "sub",
+      old: { oid: SUB_NEW, mode: "160000" },
+      new: null,
+      del: 1,
+      hunks: [{ aStart: 1, aLen: 1, bStart: 0, bLen: 0, ops: [{ tag: "del", line: `Subproject commit ${SUB_NEW}` }] }],
+    });
+    expect(renderUnifiedDiff([file])).toBe(
+      [
+        "diff --git a/sub b/sub",
+        "deleted file mode 160000",
+        `index ${SUB_NEW.slice(0, 7)}..0000000`,
+        "--- a/sub",
+        "+++ /dev/null",
+        "@@ -1 +0,0 @@",
+        `-Subproject commit ${SUB_NEW}`,
+      ].join("\n"),
+    );
+  });
+
+  it("toChangedFiles maps the gitlink entry per the ChangedFile vocabulary (add=added, change=changed, delete=deleted)", () => {
+    const add = textFile({ path: "sub", old: null, new: { oid: SUB_OLD, mode: "160000" }, add: 1, hunks: [{ aStart: 0, aLen: 0, bStart: 1, bLen: 1, ops: [{ tag: "add", line: "s" }] }] });
+    const change = textFile({ path: "sub", old: { oid: SUB_OLD, mode: "160000" }, new: { oid: SUB_NEW, mode: "160000" }, add: 1, del: 1, hunks: [{ aStart: 1, aLen: 1, bStart: 1, bLen: 1, ops: [{ tag: "del", line: "a" }, { tag: "add", line: "b" }] }] });
+    const del = textFile({ path: "sub", old: { oid: SUB_NEW, mode: "160000" }, new: null, del: 1, hunks: [{ aStart: 1, aLen: 1, bStart: 0, bLen: 0, ops: [{ tag: "del", line: "s" }] }] });
+    const mapped = toChangedFiles([add, change, del], PAIR, "http://localhost:3000", "abcdefabcdefabcdefabcdefabcdefabcdefabcd");
+    expect(mapped.map((f) => f.status)).toEqual(["added", "changed", "deleted"]);
+    expect(mapped.map((f) => [f.additions, f.deletions])).toEqual([[1, 0], [1, 1], [0, 1]]);
+  });
+});
+
+// --- the compare .patch arm's merge semantics (V4 open note b) ----------------
+
+/** A reads stub over a fixed walk page: readDiff diffs against the commit's
+ *  first parent; readBlob always fails (the gitlink degrade posture). */
+function seriesReads(commits: CommitJson[]): Parameters<typeof renderPatchSeries>[0] {
+  return {
+    listCommitsRange: (_base: string, _head: string, _limit: number, page?: number) =>
+      Promise.resolve(page ? { commits: [], more: false } : { commits, more: false }),
+    readDiff: (id?: string, id2?: string) =>
+      Promise.resolve({
+        old: id2 ?? null,
+        new: id ?? "",
+        files: [
+          textFile({
+            path: "f.txt",
+            add: 1,
+            hunks: [{ aStart: 0, aLen: 0, bStart: 1, bLen: 1, ops: [{ tag: "add", line: "x" }] }],
+          }),
+        ],
+        truncated: false,
+      }),
+    readBlob: () => Promise.resolve(null),
+  };
+}
+
+describe("renderPatchSeries — the format-patch series over a range (compare ?output=patch)", () => {
+  it("a range containing a merge mails only the non-merges, numbered [PATCH i/N], git's recorded seam", async () => {
+    // git 2.43.0 `format-patch --stdout` over a merge-containing range skips
+    // the merge entirely; the signed seam reads `2.43.0\n\n\nFrom` and the
+    // unsigned one `+x\n\nFrom` (both xxd-recorded).
+    const c1 = mailCommit("1111111111111111111111111111111111111111", "one\n");
+    const merge = mailCommit("2222222222222222222222222222222222222222", "Merge branch 'x'\n");
+    merge.parents = [c1.oid, "9999999999999999999999999999999999999999"];
+    const c3 = mailCommit("3333333333333333333333333333333333333333", "three\n");
+    const out = await renderPatchSeries(seriesReads([c1, merge, c3]), "b".repeat(40), c3.oid, { signature: "2.43.0" });
+    expect(out).toContain("Subject: [PATCH 1/2] one");
+    expect(out).toContain("Subject: [PATCH 2/2] three");
+    expect(out).not.toContain("Merge branch 'x'");
+    expect(out).not.toContain(`From ${merge.oid} `);
+    expect(out).toContain("+x\n-- \n2.43.0\n\n\nFrom 3333");
+    expect(out.endsWith("2.43.0\n\n")).toBe(true);
+  });
+
+  it("a merge-only range prints ZERO bytes (format-patch's shape)", async () => {
+    const merge = mailCommit("4444444444444444444444444444444444444444", "Merge branch 'y'\n");
+    merge.parents = ["8888888888888888888888888888888888888888", "7777777777777777777777777777777777777777"];
+    expect(await renderPatchSeries(seriesReads([merge]), "b".repeat(40), merge.oid)).toBe("");
+  });
+
+  it("a single-mail series stays bare [PATCH] and ends with its own tail", async () => {
+    const c1 = mailCommit("5555555555555555555555555555555555555555", "solo\n");
+    const out = await renderPatchSeries(seriesReads([c1]), "b".repeat(40), c1.oid, { signature: "2.43.0" });
+    expect(out).toContain("Subject: [PATCH] solo");
+    expect(out).not.toContain("[PATCH 1/1]");
+    expect(out.endsWith("2.43.0\n\n")).toBe(true);
   });
 });

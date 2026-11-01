@@ -82,10 +82,9 @@ import { Context, type Context as ContextType } from "hono";
 
 import { ApiError } from "../../api/errors";
 import type { ApiEnv } from "../../api/env";
-import type { CommitJson } from "@cf-gitea/git-engine";
-import { engineReads, type EngineReads } from "../../api/services/engine";
+import { engineReads } from "../../api/services/engine";
 import { findIssueByRepoAndIndex } from "../../api/services/issues";
-import { diffBlobSource, renderPatchAsync, renderUnifiedDiffAsync, type RenderPatchOptions } from "../../api/services/git-models";
+import { diffBlobSource, renderPatchAsync, renderPatchSeries, renderUnifiedDiffAsync } from "../../api/services/git-models";
 import { pullRequestDiff } from "../../api/services/pull-engine";
 import { findPullRequestByIndex } from "../../api/services/pulls";
 import { findRepositoryById } from "../../api/services/repository";
@@ -99,62 +98,17 @@ export type DiffPatchExt = "diff" | "patch";
 const COMMIT_SHA = /^[0-9a-f]{7,64}$/i;
 
 /**
- * The format-patch SERIES walker: the non-merge commits of `base..head`
- * (git's format-patch NEVER renders a merge as a mail — verified against the
- * binary: a merge-only range prints ZERO bytes), oldest-first (the series
- * applies bottom-up; the engine's range walk is parents-before-children), one
- * mail per commit, each diffed against its own first parent. Mail subjects
- * number only when the series has more than one mail (`[PATCH]` vs
- * `[PATCH i/N]`, the binary's shape). Between-mail seam (recorded real-git
- * bytes): git's full stream is each mail plus its own trailing newline,
- * joined by one more — an unsigned mail's last diff line gains `\n` and one
- * blank line before the next `From` (`+line\n\nFrom …`), a signed mail's
- * version line gains `\n` and two blank lines (`2.43.0\n\n\nFrom …`); the
- * last mail's tail is the stream's tail. The walk is capped at
- * MERGE_SERIES_COMMIT_CAP — a page walk until `more` flips false or the cap
- * trips (documented: a merge series past the cap truncates, flagged nowhere
- * in git's output either).
+ * The format-patch SERIES walker lives in the shared renderer (api/services/
+ * git-models.ts renderPatchSeries — the compare `?output=patch` arm's
+ * walker, imported below): the non-merge commits of `base..head`, oldest-
+ * first, one mail per commit diffed against its own first parent,
+ * `[PATCH i/N]` only for a multi-mail series, merge-only ranges EMPTY. The
+ * single-renderer fold (2026-11-02) keeps ONE copy of the byte-exact
+ * seam/tail shape: each mail carries its own trailing newline and the join
+ * adds the blank seam line (`mails.join("\n")`), recorded against `git
+ * format-patch --stdout` over 3-mail signed and unsigned series. The call
+ * sites keep their `(reads, base, head, options)` shape unchanged.
  */
-const MERGE_SERIES_COMMIT_CAP = 2000;
-const MERGE_SERIES_PAGE = 500;
-
-async function renderPatchSeries(
-  reads: EngineReads,
-  base: string,
-  head: string,
-  options: RenderPatchOptions,
-): Promise<string> {
-  const commits: CommitJson[] = [];
-  for (let page = 0; commits.length < MERGE_SERIES_COMMIT_CAP; page++) {
-    const walked = await reads.listCommitsRange(base, head, MERGE_SERIES_PAGE, page);
-    if (walked === null) break;
-    for (const commit of walked.commits) {
-      if (commit.parents.length <= 1) commits.push(commit);
-    }
-    if (!walked.more) break;
-  }
-  const numbered = commits.length > 1;
-  const mails: string[] = [];
-  for (let i = 0; i < commits.length; i++) {
-    const commit = commits[i] as CommitJson;
-    const parent = commit.parents.length === 1 ? commit.parents[0] : undefined;
-    const diff = await reads.readDiff(commit.oid, parent);
-    const files = diff?.files ?? [];
-    const src = diffBlobSource(reads, diff?.old ?? null, diff?.new ?? commit.oid);
-    mails.push(
-      await renderPatchAsync(commit, files, src, {
-        ...options,
-        ...(numbered ? { patchNumber: { index: i + 1, count: commits.length } } : {}),
-      }),
-    );
-  }
-  // git's exact seam for BOTH signature states: each mail carries its own
-  // trailing newline (the rendered mails end bare for `signature: null`,
-  // with `2.43.0\n` otherwise), the join adds the blank seam line, and the
-  // last mail's tail is the stream's tail — recorded against `git
-  // format-patch --stdout` over 3-mail signed and unsigned series.
-  return mails.map((mail) => `${mail}\n`).join("\n");
-}
 
 /**
  * The commit download's body: the plain unified diff (`.diff`) or the

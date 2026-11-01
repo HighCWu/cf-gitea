@@ -543,7 +543,9 @@ describe("loadCompareFeed .patch arms (compare.go:596, repo_compare.go:74-77)", 
     expect(body.startsWith(`From ${c3} Mon Sep 17 00:00:00 2001\n`)).toBe(true);
     expect(body).toContain("Subject: [PATCH] cmpfeeds: c3 notes");
     expect(body).toContain("+console.log");
-    expect(body.endsWith("-- \n2.47.0\n")).toBe(true);
+    // the mail tail is git's stream end: the version line plus the final
+    // newline (real git 2.43.0 `format-patch --stdout -1` ends `2.43.0\n\n`)
+    expect(body.endsWith("-- \n2.47.0\n\n")).toBe(true);
   });
 
   it("answers the zero-mail ranges with an EMPTY body (format-patch's shape)", async () => {
@@ -616,7 +618,8 @@ describe("loadCompareFeed fork-form arms (the cross-repo downloads)", () => {
     const body = feedBody(feed);
     expect(body.startsWith(`From ${forkTip()} Mon Sep 17 00:00:00 2001\n`)).toBe(true);
     expect(body).toContain("Subject: [PATCH] cmpfeeds: the fork diverges");
-    expect(body.endsWith("-- \n2.47.0\n")).toBe(true);
+    // git's stream tail (the version line plus the final newline)
+    expect(body.endsWith("-- \n2.47.0\n\n")).toBe(true);
   });
 
   it("folds the same-owner prefix back onto the base repo (GetHeadOwnerAndRepo's fold)", async () => {

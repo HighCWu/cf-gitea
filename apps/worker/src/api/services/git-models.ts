@@ -608,7 +608,15 @@ export function toContentsEntry(
 //     ---/+++ with zero hunks to follow);
 //   - hunk headers omit a `,1` single-line count (`@@ -1 +1,2 @@`);
 //   - "\ No newline at end of file" follows the emitted line that is the
-//     file's last line when that side's blob lacks the trailing newline.
+//     file's last line when that side's blob lacks the trailing newline;
+//   - a submodule (gitlink, mode 160000) section is git's virtual one-line
+//     file `Subproject commit <full sha>`: the engine's diff carries the
+//     del/add hunk for it (the NOTICE-recorded engine adaptation), so the
+//     ordinary headers+hunks below emit git's exact shape with no special
+//     case here — add `@@ -0,0 +1 @@`/`+Subproject commit …`, change
+//     `index abc..def 160000` + `@@ -1 +1 @@`, delete `@@ -1 +0,0 @@`
+//     (git 2.43.0 scratch-repo record; upstream parses these very lines
+//     into SubmoduleDiffInfo, gitdiff.go:813-858).
 //
 // The last two facts live in the blobs, not in the structured hunks (the
 // engine's line diff is terminator-blind), so they need blob access:
@@ -917,6 +925,13 @@ export interface RenderPatchOptions {
  * the PR download serves — services/pull/patch.go GetPatch); the commit
  * download passes `signature: null` for GetRawDiff's `--no-signature` flag
  * (modules/git/diff.go:73, the web.go:1760 arm).
+ *
+ * The mail ends with git's exact stream tail (git 2.43.0 `--stdout` record):
+ * exactly one newline past the last content line — after the version line
+ * when signed (`…\n-- \n2.43.0\n\n`), after the diff's final line when
+ * unsigned (`…\n+line\n`). The series seam (renderPatchSeries) relies on
+ * this tail: mails joined by one "\n" reproduce git's recorded inter-mail
+ * blank line for BOTH signature states.
  */
 export function renderPatch(commit: CommitJson, files: DiffFileJson[], options?: RenderPatchOptions): string {
   const signature = options?.signature === undefined ? "2.47.0" : options.signature;
@@ -934,7 +949,8 @@ export function renderPatch(commit: CommitJson, files: DiffFileJson[], options?:
   ];
   if (rest !== "") out.push(rest, "");
   out.push("---", renderUnifiedDiff(files));
-  if (signature !== null) out.push("-- ", signature, "");
+  if (signature !== null) out.push("-- ", signature, "", "");
+  else out.push("");
   return out.join("\n");
 }
 
@@ -964,8 +980,60 @@ export async function renderPatchAsync(
   ];
   if (rest !== "") out.push(rest, "");
   out.push("---", await renderUnifiedDiffAsync(files, src));
-  if (signature !== null) out.push("-- ", signature, "");
+  if (signature !== null) out.push("-- ", signature, "", "");
+  else out.push("");
   return out.join("\n");
+}
+
+/**
+ * The format-patch SERIES over a commit range — the compare `?output=patch`
+ * arm (upstream GetPatch, repo_compare.go:74-78, runs `format-patch --binary
+ * --stdout <base><sep><head>` over the head repo; compare.go:131): the
+ * NON-MERGE commits of `base..head`, oldest-first, one mail per commit
+ * diffed against its own first parent. format-patch NEVER renders a merge as
+ * a mail — a merge-only range prints ZERO bytes (git 2.43.0 record) — and
+ * mail subjects number only when the series has more than one mail
+ * (`[PATCH]` vs `[PATCH i/N]`). The join is git's recorded seam for both
+ * signature states: each mail ends with its own trailing newline
+ * (renderPatch's tail), the `join("\n")` adds the inter-mail blank line —
+ * a signed seam reads `2.43.0\n\n\nFrom`, an unsigned one `+line\n\nFrom` —
+ * and the last mail's tail is the stream's tail. The walk pages at
+ * PATCH_SERIES_PAGE up to PATCH_SERIES_COMMIT_CAP (a series past the cap
+ * truncates, flagged nowhere in git's output either).
+ */
+export const PATCH_SERIES_COMMIT_CAP = 2000;
+const PATCH_SERIES_PAGE = 500;
+
+export async function renderPatchSeries(
+  reads: Pick<EngineReads, "listCommitsRange" | "readDiff" | "readBlob">,
+  base: string,
+  head: string,
+  options?: RenderPatchOptions,
+): Promise<string> {
+  const commits: CommitJson[] = [];
+  for (let page = 0; commits.length < PATCH_SERIES_COMMIT_CAP; page++) {
+    const walked = (await reads.listCommitsRange(base, head, PATCH_SERIES_PAGE, page)) ?? { commits: [], more: false };
+    for (const commit of walked.commits) {
+      if (commit.parents.length <= 1) commits.push(commit);
+    }
+    if (!walked.more) break;
+  }
+  const numbered = commits.length > 1;
+  const mails: string[] = [];
+  for (let i = 0; i < commits.length; i++) {
+    const commit = commits[i] as CommitJson;
+    const parent = commit.parents.length === 1 ? commit.parents[0] : undefined;
+    const diff = await reads.readDiff(commit.oid, parent);
+    const files = diff?.files ?? [];
+    const src = diffBlobSource(reads, diff?.old ?? null, diff?.new ?? commit.oid);
+    mails.push(
+      await renderPatchAsync(commit, files, src, {
+        ...options,
+        ...(numbered ? { patchNumber: { index: i + 1, count: commits.length } } : {}),
+      }),
+    );
+  }
+  return mails.join("\n");
 }
 
 /**

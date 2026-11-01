@@ -18,7 +18,7 @@ import {
   type EngineReads,
   type RefTip,
 } from "../services/engine";
-import { renderPatch, renderUnifiedDiff, toApiCommit, userRowsByEmail } from "../services/git-models";
+import { renderPatch, renderPatchSeries, renderUnifiedDiff, toApiCommit, userRowsByEmail } from "../services/git-models";
 import { resolveHeadRepo, toApiPullRequest } from "../services/pulls";
 import { canViewRepositoryWithTeams, findRepositoryById, type RepositoryWithOwner } from "../services/repository";
 import { compareSchema, commitListSchema, commitSchema } from "../models/git";
@@ -482,8 +482,14 @@ export function registerCommitRoutes(
       const diff = await reads.readDiff(headCommit.oid, rangeStart);
       const files = diff?.files ?? [];
       if (output === "patch") {
-        const headJson = headCommit;
-        return c.text(renderPatch(headJson, files), 200);
+        // Upstream's compare download is the RANGE's format-patch (GetPatch,
+        // repo_compare.go:74-78 — `format-patch --binary --stdout
+        // <base><sep><head>`, run from compare.go:131): the non-merge mail
+        // series, never the head commit's single mail over the aggregated
+        // range diff — a range containing merges mails only the non-merges
+        // (the merge itself is never a mail), a merge-only range prints zero
+        // bytes, and numbering turns on only for a multi-mail series.
+        return c.text(await renderPatchSeries(reads, rangeStart, headCommit.oid), 200);
       }
       return c.text(renderUnifiedDiff(files), 200);
     }

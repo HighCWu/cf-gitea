@@ -984,9 +984,11 @@ describe("commits family (repoGetAllCommits / repoGetSingleCommit / dot-diff / c
     expect(patchText).toContain("Subject: [PATCH]");
     // The commit download strips the format-patch signature (upstream's
     // `--no-signature`, diff.go:99): the body ends on the diff's last line
-    // (TIP2 adds docs/base.txt) — byte-pin the tail; the default
-    // `-- \n2.47.0` mail tail is absent.
-    expect(patchText.endsWith("+base doc")).toBe(true);
+    // PLUS the stream's final newline (TIP2 adds docs/base.txt; real git
+    // 2.43.0 `format-patch --no-signature --stdout -1` ends `…+line\n` — the
+    // one byte the pre-fix renderer stopped short) — byte-pin the tail; the
+    // default `-- \n2.47.0` mail tail is absent.
+    expect(patchText.endsWith("+base doc\n")).toBe(true);
     expect(patchText).not.toContain("\n-- \n");
   });
 
@@ -1186,6 +1188,114 @@ describe("commits family (repoGetAllCommits / repoGetSingleCommit / dot-diff / c
     expect(twoDot.status).toBe(200);
     const twoDotBody = (await twoDot.json<Record<string, unknown>>());
     expect((twoDotBody.commits as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  it("carries a submodule (gitlink) change through the diff surfaces — the engine's virtual Subproject file (D2)", async () => {
+    // Two commits whose trees differ ONLY in a gitlink entry (mode 160000 —
+    // the submodule's commit sha; NO blob object exists for it here). Before
+    // the engine emitted gitlinks, a submodule-only commit diffed to ZERO
+    // files; now it flows through every surface with git's exact shape
+    // (real git 2.43.0 scratch-repo record).
+    const cell = env.REPO.getByName(`${OWNER}/${SLUG}`);
+    const person = { name: "seed", email: "seed@api.invalid", time: T0 + 75, tz: "+0000" };
+    const SUB1 = "26e4d4173c1cbc3a7fe13a4131eb33b888b8d11e";
+    const SUB2 = "c09b7ca63d24b4156a3d73d1c1ef0c37f64f769d";
+    const tree1 = serializeTree([{ mode: "160000", name: "sub", oid: SUB1 }]);
+    const tree2 = serializeTree([{ mode: "160000", name: "sub", oid: SUB2 }]);
+    const root = serializeCommit({ tree: tree1.oid, parents: [], author: person, committer: person, message: "sublink: add at c1\n" });
+    const child = serializeCommit({ tree: tree2.oid, parents: [root.oid], author: person, committer: person, message: "sublink: bump to c2\n" });
+    const put = await cell.putApiObjects([
+      { oid: tree1.oid, type: "tree", data: tree1.data },
+      { oid: tree2.oid, type: "tree", data: tree2.data },
+      { oid: root.oid, type: "commit", data: root.data },
+      { oid: child.oid, type: "commit", data: child.data },
+    ]);
+    expect(put.tag).toBe("ok");
+    const landed = await cell.commitApiChange({ ref: "refs/heads/sublink", expectedOldOid: ZERO_OID, newOid: child.oid });
+    expect(landed.tag).toBe("committed");
+
+    // the commit's own .diff: git's exact submodule section
+    const diff = await get(`${REPO}/git/commits/${child.oid}.diff`);
+    expect(diff.status).toBe(200);
+    expect(await diff.text()).toBe(
+      [
+        "diff --git a/sub b/sub",
+        `index ${SUB1.slice(0, 7)}..${SUB2.slice(0, 7)} 160000`,
+        "--- a/sub",
+        "+++ b/sub",
+        "@@ -1 +1 @@",
+        `-Subproject commit ${SUB1}`,
+        `+Subproject commit ${SUB2}`,
+      ].join("\n"),
+    );
+
+    // the commit JSON's stat/files arm: 1/1 and the modified entry
+    const single = await get(`${REPO}/git/commits/${child.oid}`);
+    expect(single.status).toBe(200);
+    const commitJson = await jsonBody(single);
+    expect(commitJson.stats).toEqual({ additions: 1, deletions: 1, total: 2 });
+    expect(commitJson.files).toEqual([{ filename: "sub", status: "modified" }]);
+
+    // the compare's raw diff over the exact pair (the branch is a disjoint
+    // root — the three-dot form answers EARLY EMPTY like isle above; the
+    // two-dot form reads the literal base..head range)
+    const compare = await get(`${REPO}/compare/${root.oid}..${child.oid}?output=diff`);
+    expect(compare.status).toBe(200);
+    expect(await compare.text()).toBe(
+      [
+        "diff --git a/sub b/sub",
+        `index ${SUB1.slice(0, 7)}..${SUB2.slice(0, 7)} 160000`,
+        "--- a/sub",
+        "+++ b/sub",
+        "@@ -1 +1 @@",
+        `-Subproject commit ${SUB1}`,
+        `+Subproject commit ${SUB2}`,
+      ].join("\n"),
+    );
+  });
+
+  it("renders compare ?output=patch as the non-merge mail series (GetPatch; a merge is never a mail)", async () => {
+    // topic commit + a merge whose parents are [main, topic]: the range
+    // main...merge walks {topic, merge}; format-patch mails ONLY the topic
+    // commit (the merge is skipped) — never the old head-commit single mail
+    // over the aggregated range diff.
+    const cell = env.REPO.getByName(`${OWNER}/${SLUG}`);
+    const mainTip = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs()).get("refs/heads/main")?.target;
+    expect(mainTip).toBeDefined();
+    const mainCommit = await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).readCommit(mainTip);
+    // the pin above holds the live branch tip — a null read here is a broken
+    // fixture, not an arm under test: fail loudly instead of asserting past
+    // the type (the engine read is `CommitJson | null` by contract)
+    if (mainCommit === null) {
+      throw new Error("compare-patch fixture broken: the pinned main tip commit is unreadable");
+    }
+    const mainTree = mainCommit.tree;
+    const person = { name: "seed", email: "seed@api.invalid", time: T0 + 105, tz: "+0000" };
+    const topic = serializeCommit({ tree: mainTree, parents: [mainTip as string], author: person, committer: person, message: "patchseries: the one mail\n" });
+    const merge = serializeCommit({ tree: mainTree, parents: [mainTip as string, topic.oid], author: person, committer: person, message: "Merge branch 'patchtopic'\n" });
+    const put = await cell.putApiObjects([
+      { oid: topic.oid, type: "commit", data: topic.data },
+      { oid: merge.oid, type: "commit", data: merge.data },
+    ]);
+    expect(put.tag).toBe("ok");
+    const landed = await cell.commitApiChange({ ref: "refs/heads/patchtopic", expectedOldOid: ZERO_OID, newOid: merge.oid });
+    expect(landed.tag).toBe("committed");
+
+    const patch = await get(`${REPO}/compare/main...patchtopic?output=patch`);
+    expect(patch.status).toBe(200);
+    const body = await patch.text();
+    expect(body.startsWith(`From ${topic.oid} Mon Sep 17 00:00:00 2001\n`)).toBe(true);
+    expect(body).toContain("Subject: [PATCH] patchseries: the one mail"); // single-mail series stays bare
+    expect(body).not.toContain(`From ${merge.oid} `);
+    expect(body).not.toContain("Merge branch 'patchtopic'");
+    // the stream tail: git's signed single-mail end (…\n-- \n2.47.0\n\n)
+    expect(body.endsWith("-- \n2.47.0\n\n")).toBe(true);
+
+    // a MERGE-ONLY range prints ZERO bytes: two-dot base = the merge's own
+    // first-parent-side topic tip walks {merge} alone — format-patch's shape
+    const mergeOnly = await get(`${REPO}/compare/${topic.oid}..${merge.oid}?output=patch`);
+    expect(mergeOnly.status).toBe(200);
+    expect(await mergeOnly.text()).toBe("");
   });
 });
 

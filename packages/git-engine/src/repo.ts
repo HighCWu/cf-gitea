@@ -2731,7 +2731,12 @@ export class RepoCell extends DurableObject<Env> {
     for (const e of parseTree(obj.data)) {
       const p = prefix ? `${prefix}/${e.name}` : e.name;
       if (isTreeMode(e.mode)) await this.flattenTree(e.oid, p, out, gate);
-      else if (!isGitlinkMode(e.mode)) out.set(p, { oid: e.oid, mode: e.mode });
+      // gitlink entries (mode 160000) participate in tree diffs with the
+      // submodule's commit sha as their "oid" — the entry the submodule-diff
+      // surfaces need (NOTICE-recorded adaptation; the vendored skip was an
+      // omission, not a decision). computeDiff never dereferences the sha
+      // into this store — it synthesizes the virtual one-line file.
+      else out.set(p, { oid: e.oid, mode: e.mode });
     }
   }
 
@@ -2752,8 +2757,25 @@ export class RepoCell extends DurableObject<Env> {
         truncated = true;
         break;
       }
-      const oldData = o ? (await this.store.get(o.oid, gate))?.data ?? new Uint8Array(0) : new Uint8Array(0);
-      const newData = n ? (await this.store.get(n.oid, gate))?.data ?? new Uint8Array(0) : new Uint8Array(0);
+      // A gitlink side (mode 160000) is modeled as git models it: the virtual
+      // one-line file `Subproject commit <sha>` — the submodule's commit sha
+      // is NEVER dereferenced into this store (it lives in the submodule's
+      // object database; a coincidental same-sha object here must not leak
+      // its bytes into the diff). diffLines over the virtual pair yields
+      // git's exact hunk (`@@ -1 +1 @@` with the del/add Subproject lines;
+      // add/delete produce the -0,0/+1 and -1/+0,0 shapes).
+      const oGitlink = o !== null && isGitlinkMode(o.mode);
+      const nGitlink = n !== null && isGitlinkMode(n.mode);
+      const oldData = o
+        ? oGitlink
+          ? new TextEncoder().encode(`Subproject commit ${o.oid}\n`)
+          : (await this.store.get(o.oid, gate))?.data ?? new Uint8Array(0)
+        : new Uint8Array(0);
+      const newData = n
+        ? nGitlink
+          ? new TextEncoder().encode(`Subproject commit ${n.oid}\n`)
+          : (await this.store.get(n.oid, gate))?.data ?? new Uint8Array(0)
+        : new Uint8Array(0);
       const fd: FileDiff = { path: p, o, n, kind: "text", ops: null, hunks: [], add: 0, del: 0 };
       if (isBinary(oldData) || isBinary(newData)) {
         fd.kind = "binary";
