@@ -22,7 +22,9 @@ import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../auth/testing/seeds";
 import { applyTwofaEnrollment, generateTotpSecret, mintPendingTicket } from "../auth/two-factor";
 import { totpCode } from "../auth/totp";
-import { loginSources, repositories, repoSettings, twoFactor, users } from "../db/schema";
+import { externalLoginUsers, loginSources, repositories, repoSettings, twoFactor, users } from "../db/schema";
+import { serializeOAuth2SourceConfig } from "../services/auth-sources/cfg";
+import { createLoginSource, ensureExternalLogin, LoginSourceType } from "../services/auth-sources/store";
 import { getOrInsertBlob, packageBlobContentKey } from "../services/packages/blobs";
 import { getOrInsertPackage, getOrInsertVersion, tryInsertFile } from "../services/packages/model";
 import { resetManifestCache, type UiManifest } from "./manifest";
@@ -222,6 +224,8 @@ describe("handlesUiRoute", () => {
     "/octo/-/code", // the code-search twin in the same `/-` namespace
     "/octo/hello/packages", // the R16 repo tab literal (the settings row
                             // gates the handler — the route-level rows below)
+    "/user/settings/security/account_link", // the W5 unlink POST (the dispatcher
+                                            // admission the 1b17b08 referral re-arms)
   ])("claims UI family: %s", (pathname) => {
     expect(handlesUiRoute(pathname)).toBe(true);
   });
@@ -458,6 +462,12 @@ describe("parseUiRoute", () => {
     ["/user/settings/security/two_factor/enroll/extra", null], // deeper tails stay engine-owned
     ["/user/settings/security/two_factor/other", null], // unknown literal sibling
     ["/user/settings/security/two_factor", null], // the bare group is unclaimed (upstream 404s it too)
+    // The W5 account-link unlink POST (security.go:50-70 — the settings
+    // security page's Remove form's action; the 1b17b08 dead-route fix):
+    // the POST-only family beside the bare security literal — the GET twin
+    // answers the chi 405.
+    ["/user/settings/security/account_link", { family: "user-settings-security-account-link", id: null }],
+    ["/user/settings/security/account_link/extra", null], // deeper tails stay engine-owned
     // The store wave's SCOPED-WORKFLOWS mounts (web.go:517-523's shared
     // four-route group at the three scopes — web.go:730 user, :1060 org,
     // :903 admin): the GET page literals + the three static write tails.
@@ -1209,6 +1219,109 @@ describe("the TOTP settings four (the twofa.tsx HANDOFF fold)", () => {
       expect(twin.headers.get("allow")).toBe("POST");
       expect(await twin.text()).toBe("Method Not Allowed\n");
     }
+  });
+});
+
+// --- the account-link unlink POST (the W5 handoff route — the 1b17b08
+// --- referral's parse-reachability fix: the settings security page's Remove
+// --- form 404'd through the dispatcher until the parse claim landed) ---------
+
+describe("POST /user/settings/security/account_link (the W5 unlink route)", () => {
+  async function fetchAuthed(
+    path: string,
+    cookie: string | null,
+    options: { method?: string; body?: string; headers?: Record<string, string> } = {},
+  ): Promise<Response> {
+    return uiRouter.fetch(
+      new Request(`https://test.local${path}`, {
+        method: options.method ?? "GET",
+        headers: {
+          ...(cookie === null ? {} : { cookie: `${SESSION_COOKIE_NAME}=${cookie}` }),
+          ...options.headers,
+        },
+        body: options.body,
+      }),
+      uiEnv,
+    );
+  }
+
+  /** One linked identity over the landed store seams (the security page
+   *  matrix's fixture shape): an active OAuth2 source + the doer's
+   *  external_login_user row. Answers the source id — the Remove form's
+   *  hidden `id` field carries it (the unlink keys on the pair). */
+  async function seedLink(userId: number): Promise<number> {
+    const cfg = serializeOAuth2SourceConfig({
+      v: 1,
+      provider: "openidConnect",
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      discoveryUrl: "https://idp.example.com",
+    });
+    const source = await createLoginSource(env.DB, {
+      type: LoginSourceType.OAuth2,
+      name: "oidc-corp",
+      isActive: true,
+      cfg,
+    });
+    await ensureExternalLogin(env.DB, { externalId: "sub-1", loginSourceId: source.id, userId, provider: "openidConnect" });
+    return source.id;
+  }
+
+  it("gates the POST: anonymous 303s the login round-trip", async () => {
+    const bounce = await fetchAuthed("/user/settings/security/account_link", null, {
+      method: "POST",
+      body: "id=7",
+    });
+    expect(bounce.status).toBe(303);
+    expect(bounce.headers.get("location")).toBe(
+      `/login?redirect_to=${encodeURIComponent("/user/settings/security/account_link")}`,
+    );
+  });
+
+  it("unlinks over the live POST: the form id removes the pair and 303s back; the stale id re-renders the notice", async () => {
+    const user = await seedVerifiedUser({ username: "Lorna" });
+    const cookie = await mintSession(env.DB, user.id);
+    const sourceId = await seedLink(user.id);
+    const formHeaders = { "content-type": "application/x-www-form-urlencoded", origin: "https://test.local" };
+
+    // The Remove form's exact shape (the page render's hidden id): 303 onto
+    // the canonical security page, the external_login_user row gone.
+    const unlink = await fetchAuthed("/user/settings/security/account_link", cookie, {
+      method: "POST",
+      headers: formHeaders,
+      body: `id=${sourceId}`,
+    });
+    expect(unlink.status).toBe(303);
+    expect(unlink.headers.get("location")).toBe("/user/settings/security");
+    expect(await drizzle(env.DB).select().from(externalLoginUsers).all()).toHaveLength(0);
+
+    // The re-POST of the now-gone id (security.go:55-57's arm through the
+    // route): the 200 re-render carries the missing-link notice — no 500.
+    const stale = await fetchAuthed("/user/settings/security/account_link", cookie, {
+      method: "POST",
+      headers: formHeaders,
+      body: `id=${sourceId}`,
+    });
+    expect(stale.status).toBe(200);
+    expect(await stale.text()).toContain("was not found");
+  });
+
+  it("arms the write guards: the cross-origin 403 and the GET 405 twin", async () => {
+    const user = await seedVerifiedUser({ username: "Lorna" });
+    const cookie = await mintSession(env.DB, user.id);
+
+    // The §2.8 sameOriginGuard rides the prologue's write mode.
+    const forged = await fetchAuthed("/user/settings/security/account_link", cookie, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", origin: "https://evil.example" },
+    });
+    expect(forged.status).toBe(403);
+
+    // The POST-only family's GET twin answers chi's 405 (Allow: POST).
+    const twin = await fetchAuthed("/user/settings/security/account_link", cookie);
+    expect(twin.status).toBe(405);
+    expect(twin.headers.get("allow")).toBe("POST");
+    expect(await twin.text()).toBe("Method Not Allowed\n");
   });
 });
 

@@ -3649,6 +3649,7 @@ export interface UserSettingsTabRoute {
     | "user-settings-appearance-theme"
     | "user-settings-appearance-language"
     | "user-settings-security"
+    | "user-settings-security-account-link" // POST /user/settings/security/account_link (security.go:50-70 — the W5 unlink; the GET twin 405s)
     | "user-settings-security-twofa-enroll" // GET+POST /user/settings/security/two_factor/enroll (security/2fa.go:164-286)
     | "user-settings-security-twofa-regenerate" // POST /user/settings/security/two_factor/regenerate_scratch (security/2fa.go:31-66)
     | "user-settings-security-twofa-disable" // POST /user/settings/security/two_factor/disable (security/2fa.go:69-104)
@@ -4115,6 +4116,16 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     if (tail.length === 3 && tail[0] === "security" && tail[1] === "two_factor" && tail[2] === "disable") {
       return { family: "user-settings-security-twofa-disable", id: null };
+    }
+    // The account-link unlink POST (security.go:50-70 — the settings security
+    // page's Remove form's action, the b91dd1c W5 landing's registered
+    // uiRouter POST): claimed beside the bare security literal so the
+    // dispatcher admits it and the handler's own null-parse prologue passes —
+    // without it the registered route 404s through its own drift guard (the
+    // 1b17b08 referral's parse-reachability class). POST-only: the GET twin
+    // answers chi's 405.
+    if (tail.length === 2 && tail[0] === "security" && tail[1] === "account_link") {
+      return { family: "user-settings-security-account-link", id: null };
     }
     // The blocked-users pair (web.go:750-752 — the navbar's order puts it
     // between Security and Applications).
