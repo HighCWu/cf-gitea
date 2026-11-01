@@ -118,9 +118,15 @@
  * the octicon-check / octicon-x pair (tooltip = the last message) when the
  * task HAS run (cron.tmpl:29), and the hidden `from=monitor`. queue.tmpl: reduced to the columns with landed
  * sources (Name/Type/Number in Queue — Exemplar Type and the worker counts
- * have no cf-gitea source; the per-queue Review link and manage page are not
- * rendered: no landed set-workers/remove-arms — the dead-control rule) plus
- * the cf-gitea delivery-state breakdown segment. stacktrace.tmpl reduced to
+ * have no cf-gitea source) plus the per-queue Review link column and the
+ * cf-gitea delivery-state breakdown segment; the links target the LANDED
+ * manage page (the census gap-17 fold below). queue_manage.tmpl: the detail
+ * table carries the same reduced columns; the remove-all-items form renders
+ * ONLY on the one landed purge body (repo-tasks — the dead-control rule
+ * narrows upstream's per-countable render); the DLQ's row is the
+ * countable-less `-` arm (queue_manage.tmpl:29's own `{{if lt $sum 0}}`
+ * posture); the Pool Settings form is OMITTED — no worker-pool knob, the
+ * /set arm stays unclaimed. stacktrace.tmpl reduced to
  * the header + segment shape carrying the honest-absence note: no tabs, no
  * cancel `link-action`s, no diagnosis form (all dead without a source).
  *
@@ -157,6 +163,39 @@
  *   renders NONE of trace_tabs.tmpl: the perftrace tab is `!setting.IsProd`
  *   upstream (stacktrace.go:19) and has no source either; the diagnosis form
  *   POSTs an unlanded route. A rendered tab/form would be dead.
+ * - The queue manage page's qid is the QUEUE NAME (upstream's numeric qid is
+ *   the in-process registry id — no cf-gitea counterpart; the Cloudflare
+ *   queue name is the landed identity, wrangler.jsonc's queues.producer).
+ * - QueueSet's POST /{qid}/set stays UNCLAIMED: Cloudflare Queues expose no
+ *   worker-pool knob (no Get/SetWorkerMaxNumber substrate), so the Pool
+ *   Settings form renders nowhere and the route answers the engine's 404 —
+ *   the queue-list's originally recorded posture for this arm.
+ * - QueueRemoveAllItems lands for repo-tasks ONLY: its `queued|syncing` rows
+ *   ARE the pipeline's in-flight set (a message dead-lettered into
+ *   repo-tasks-dlq leaves its row stuck `queued` forever — repos/dlq.ts acks
+ *   without touching D1, and the stuck-syncing sweep reclaims `syncing`
+ *   only, mirror/sync.ts:846-853 — while the cron producer's due-SELECT
+ *   reads `idle` rows alone), so the purge resets them to `idle` and the
+ *   next tick re-enqueues the due ones: upstream's "remove all items to
+ *   make it work again" (queue.go:71-74), depth back to 0. webhook-delivery
+ *   gets NO purge arm: its queue items are the webhook_deliveries rows
+ *   THEMSELVES (upstream's arm removes queue items while PRESERVING the
+ *   hook_task log — ours cannot separate the two), and the pipeline
+ *   self-heals (the DLQ sweep marks stuck rows failed,
+ *   webhooks/consumer.ts:30-32). The DLQ answers the unknown-queue 404 too
+ *   (known but unmanageable — no landed counter, no substrate); its GET
+ *   detail still renders, the countable-less `-` arm with no form.
+ * - self_check (web.go:785-786) and system_status (web.go:782) stay
+ *   UNCLAIMED — the recorded postures stand: system_status's fragment has
+ *   its only consumer in the 5s-morph dl the dashboard module does not
+ *   render (pages/admin-dashboard.tsx card 3: "stays UNMOUNTED"); self_check
+ *   's three checks (setting.StartupProblems, the DB collation pair,
+ *   cache.Test) all have no cf-gitea source — no startup-problem store, D1/
+ *   SQLite has no server-collation mismatch class (upstream's fix hints
+ *   render only for MySQL/MSSQL, self_check.tmpl:21-25), no cache layer —
+ *   so the page would assert "no problem found" without any check having
+ *   run; the family navs already omit the item (the dead-link rule).
+ *   perftrace and diagnosis stay unclaimed for the trace_tabs reason above.
  *
  * ## Mount record (MOUNTED at e31c0cf — the routes are live)
  *
@@ -196,9 +235,64 @@
  * OrgSettingsBlockedNav precedent). Survey row touched on landing:
  * docs/compat/ui-parity-survey.md:386 (the `/-/admin/*` family row —
  * the monitor subset becomes PARTIAL).
+ *
+ * ## Queue-manage HANDOFF (census gap 17 — the claims are the ORCHESTRATOR's
+ * fold; this module ships everything the fold wires, claim-ready)
+ *
+ * parseUiRoute's admin block, inside `tail[0] === "monitor"` AFTER the four
+ * 2-segment arms (the literal `/queue` shadows the `{qid}` parse like
+ * upstream's static-before-dynamic rule):
+ *
+ *     if (tail.length === 3 && tail[0] === "monitor" && tail[1] === "queue") {
+ *       return { family: "admin-monitor-queue-manage", qid: tail[2] as string };
+ *     }
+ *     if (tail.length === 4 && tail[0] === "monitor" && tail[1] === "queue" && tail[2] === "remove-all-items") {
+ *       return { family: "admin-monitor-queue-remove-all", qid: tail[3] as string };
+ *     }
+ *
+ * (NO `/set` arm — the documented reduction above; the shape stays null →
+ * the engine's 404.) Registrations beside adminMonitorCronSubmit, with the
+ * module imports parseAdminMonitorQueueQid / loadAdminMonitorQueueDetail /
+ * applyAdminMonitorQueueRemoveAllItems / renderAdminMonitorQueueManagePage:
+ *
+ *     async function adminMonitorQueueManage(c: Context<{ Bindings: Env }>, qidRaw: string): Promise<Response> {
+ *       const p = await adminPagePrologue(c);
+ *       if (!p.ok) return p.response;
+ *       const qid = parseAdminMonitorQueueQid(qidRaw);
+ *       const data = qid === null ? null : await loadAdminMonitorQueueDetail(c.env.DB, qid);
+ *       if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404)); // upstream's nil-mq arm
+ *       return p.respond(c.html(renderAdminMonitorQueueManagePage({ ctx: p.ctx, data, flash: null })));
+ *     }
+ *
+ *     async function adminMonitorQueueRemoveAll(c: Context<{ Bindings: Env }>, qidRaw: string): Promise<Response> {
+ *       const guard = sameOriginGuard(c.req.raw);
+ *       if (guard !== null) return guard;
+ *       const p = await adminPagePrologue(c);
+ *       if (!p.ok) return p.response;
+ *       const qid = parseAdminMonitorQueueQid(qidRaw);
+ *       if (qid === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+ *       const result = await applyAdminMonitorQueueRemoveAllItems(c.env.DB, qid);
+ *       if (result.outcome === "unknown-queue") return p.respond(c.html(renderNotFound(p.ctx), 404));
+ *       const data = await loadAdminMonitorQueueDetail(c.env.DB, qid); // non-null in practice: the purge body proves registry membership
+ *       if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+ *       return p.respond(c.html(renderAdminMonitorQueueManagePage({ ctx: p.ctx, data, flash: { kind: "positive", text: result.message } })));
+ *     }
+ *
+ *     uiRouter.get("/-/admin/monitor/queue/:qid", (c) => adminMonitorQueueManage(c, c.req.param("qid")));
+ *     uiRouter.post("/-/admin/monitor/queue/:qid/remove-all-items", (c) => adminMonitorQueueRemoveAll(c, c.req.param("qid")));
+ *
+ * Pins that flip at the fold: index.test.ts's monitor-tail route pin (the
+ * `/queue/{qid}` shape starts parsing); NOTHING in this module's tests pins
+ * the new shape at the route level, so the fold breaks no test here. The
+ * manage page renders the shared AdminFamilyNav with active="queue" —
+ * upstream's QueueManage sets PageIsAdminMonitor (outside navbar.tmpl:107's
+ * open-OR), leaving every item inactive and the group closed; the shared
+ * nav's derived-open arm cannot express that posture without a new prop in
+ * admin-users.tsx (outside this unit's ownership) — the divergence is
+ * documented, not silent.
  */
 
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import type { Child } from "hono/jsx";
 
@@ -277,6 +371,15 @@ export const adminMonitorLocale = {
   queueName: "Name", // "admin.monitor.queue.name"
   queueType: "Type", // "admin.monitor.queue.type"
   queueNumberInQueue: "Number in Queue", // "admin.monitor.queue.numberinqueue"
+  // The queue manage page (queue_manage.tmpl; the census gap-17 fold).
+  queueManageTitle: "Queue: %s", // "admin.monitor.queue" (queue.go:33 — %s = the queue name)
+  queueReviewAdd: "Review / Add Workers", // "admin.monitor.queue.review_add" (queue.tmpl:28's link label)
+  queueRemoveAll: "Remove all", // "admin.monitor.queue.settings.remove_all_items" (queue_manage.tmpl:34's button)
+  queueRemoveAllDone: "All items in the queue have been removed.", // "admin.monitor.queue.settings.remove_all_items_done" (queue.go:87's flash)
+  // cf-gitea addition — the manage page's reduction note (the module header's
+  // adjudications: no set arm, webhook purge, DLQ purge).
+  queueManageReductions:
+    "Pool settings (worker counts) have no cf-gitea source: Cloudflare Queues grow and shrink without an in-process worker pool, so the settings form does not render. The webhook queue has no remove-all arm either: its queue items are the delivery log rows themselves, and upstream's purge preserves the log. The dead-letter queue has no landed counter (the - cell above) and no purge substrate.",
   // The run POST's flash texts (admin.go:188-190 DashboardPost — "%s" is the
   // task's locale name / the raw op).
   taskStarted: "Started Task: %s", // "admin.dashboard.task.started"
@@ -895,43 +998,63 @@ export interface AdminMonitorQueuesData {
  *                          here after the outcome write failed — the D1 log
  *                          cannot see it) → the `-` arm.
  */
-export async function loadAdminMonitorQueues(d1: D1Database): Promise<AdminMonitorQueuesData> {
-  const db = drizzle(d1);
+/** The landed depth scan shared by the list + detail loaders (ONE copy of
+ *  the derivations — the no-duplicate rule): two grouped counts over the
+ *  webhook delivery log and the pull-mirror producer's state machine. */
+async function queueDepthByState(db: ReturnType<typeof drizzle>): Promise<{
+  deliveryByState: Map<string, number>;
+  mirrorByState: Map<string, number>;
+}> {
   const [deliveryRows, mirrorRows] = await Promise.all([
     db.select({ state: webhookDeliveries.state, n: sql<number>`count(*)` }).from(webhookDeliveries).groupBy(webhookDeliveries.state).all(),
     db.select({ state: repoMirrors.syncState, n: sql<number>`count(*)` }).from(repoMirrors).groupBy(repoMirrors.syncState).all(),
   ]);
-  const deliveryByState = new Map(deliveryRows.map((row) => [row.state, row.n]));
-  const mirrorByState = new Map(mirrorRows.map((row) => [row.state, row.n]));
-  // The schema enum's five states, rendered in lifecycle order, zeros
-  // included (the log's full posture — the breakdown is the point).
-  const deliveryStates: Array<[string, number]> = [
-    ["pending", deliveryByState.get("pending") ?? 0],
-    ["delivering", deliveryByState.get("delivering") ?? 0],
-    ["delivered", deliveryByState.get("delivered") ?? 0],
-    ["skipped", deliveryByState.get("skipped") ?? 0],
-    ["failed", deliveryByState.get("failed") ?? 0],
-  ];
   return {
-    queues: [
-      {
-        name: "webhook-delivery",
-        type: "cloudflare-queue",
-        inQueue: (deliveryByState.get("pending") ?? 0) + (deliveryByState.get("delivering") ?? 0),
-      },
-      {
-        name: "repo-tasks",
-        type: "cloudflare-queue",
-        inQueue: (mirrorByState.get("queued") ?? 0) + (mirrorByState.get("syncing") ?? 0),
-      },
-      { name: "webhook-delivery-dlq", type: "cloudflare-queue", inQueue: null },
-    ],
-    deliveryStates,
+    deliveryByState: new Map(deliveryRows.map((row) => [row.state, row.n])),
+    mirrorByState: new Map(mirrorRows.map((row) => [row.state, row.n])),
   };
 }
 
-/** The queues page (queue.tmpl reduced to the sourced columns — the module
- *  header's reduction list) plus the cf-gitea delivery-state segment. */
+/** The landed queue registry rows from the depth scan (the list's three rows
+ *  AND the manage page's known names — one registry copy; the qid identity
+ *  is the queue name, the module header's divergence note). */
+function landedQueueRows(depth: {
+  deliveryByState: Map<string, number>;
+  mirrorByState: Map<string, number>;
+}): AdminMonitorQueueRow[] {
+  return [
+    {
+      name: "webhook-delivery",
+      type: "cloudflare-queue",
+      inQueue: (depth.deliveryByState.get("pending") ?? 0) + (depth.deliveryByState.get("delivering") ?? 0),
+    },
+    {
+      name: "repo-tasks",
+      type: "cloudflare-queue",
+      inQueue: (depth.mirrorByState.get("queued") ?? 0) + (depth.mirrorByState.get("syncing") ?? 0),
+    },
+    { name: "webhook-delivery-dlq", type: "cloudflare-queue", inQueue: null },
+  ];
+}
+
+export async function loadAdminMonitorQueues(d1: D1Database): Promise<AdminMonitorQueuesData> {
+  const db = drizzle(d1);
+  const depth = await queueDepthByState(db);
+  // The schema enum's five states, rendered in lifecycle order, zeros
+  // included (the log's full posture — the breakdown is the point).
+  const deliveryStates: Array<[string, number]> = [
+    ["pending", depth.deliveryByState.get("pending") ?? 0],
+    ["delivering", depth.deliveryByState.get("delivering") ?? 0],
+    ["delivered", depth.deliveryByState.get("delivered") ?? 0],
+    ["skipped", depth.deliveryByState.get("skipped") ?? 0],
+    ["failed", depth.deliveryByState.get("failed") ?? 0],
+  ];
+  return { queues: landedQueueRows(depth), deliveryStates };
+}
+
+/** The queues page (queue.tmpl reduced to the sourced columns plus the
+ *  Review link column — queue.tmpl:28, every row links its manage page; all
+ *  three detail pages render) plus the cf-gitea delivery-state segment. */
 export function AdminMonitorQueuePage(props: { ctx: UiContext; data: AdminMonitorQueuesData }) {
   return (
     <AdminMonitorShell ctx={props.ctx} title={adminMonitorLocale.queues} active="queue">
@@ -943,6 +1066,8 @@ export function AdminMonitorQueuePage(props: { ctx: UiContext; data: AdminMonito
               <th scope="col">{adminMonitorLocale.queueName}</th>
               <th scope="col">{adminMonitorLocale.queueType}</th>
               <th scope="col">{adminMonitorLocale.queueNumberInQueue}</th>
+              {/* queue.tmpl:16's unnamed link column. */}
+              <th scope="col"></th>
             </tr>
           </thead>
           <tbody>
@@ -951,6 +1076,13 @@ export function AdminMonitorQueuePage(props: { ctx: UiContext; data: AdminMonito
                 <td>{queue.name}</td>
                 <td>{queue.type}</td>
                 <td>{queue.inQueue === null ? "-" : queue.inQueue}</td>
+                <td>
+                  {/* queue.tmpl:28 — the Review link to the manage page
+                      (`$.Link` = /-/admin/monitor/queue, the qid appended). */}
+                  <a href={`/-/admin/monitor/queue/${queue.name}`} class="button">
+                    {adminMonitorLocale.queueReviewAdd}
+                  </a>
+                </td>
               </tr>
             ))}
           </tbody>
@@ -975,6 +1107,193 @@ export function AdminMonitorQueuePage(props: { ctx: UiContext; data: AdminMonito
 
 export function renderAdminMonitorQueuePage(options: { ctx: UiContext; data: AdminMonitorQueuesData }): string {
   return renderPage(<AdminMonitorQueuePage ctx={options.ctx} data={options.data} />);
+}
+
+// ---------------------------------------------------------------------------
+// Queue manage (GET /-/admin/monitor/queue/{qid} + POST {qid}/remove-all-items
+// — queue_manage.tmpl reduced; the /set arm has no landed substrate — the
+// module header's adjudications. CLAIM-READY: the parse/registration recipe
+// is the header's HANDOFF section — ui/index.ts is the orchestrator's fold.)
+// ---------------------------------------------------------------------------
+
+/** The manage page's render inputs: the registry row (the qid resolved) plus
+ *  whether the remove-all-items form renders. */
+export interface AdminMonitorQueueDetailData {
+  queue: AdminMonitorQueueRow;
+  /** A landed purge body exists for this queue (the dead-control rule
+   *  narrows upstream's per-countable form render to the purgeable rows). */
+  purgeable: boolean;
+}
+
+/**
+ * The landed purge bodies — QueueRemoveAllItems's registry arm (queue.go:71),
+ * one entry per queue whose in-flight set the D1 substrate can actually
+ * clear; the render gate AND the apply dispatch derive from this map so they
+ * can never drift (the CRON_RUN_BODIES posture). Exactly one landed body:
+ *
+ *   repo-tasks  reset `queued|syncing` → `idle` (the CAS shapes of
+ *               services/mirror/sync.ts): a message dead-lettered into
+ *               repo-tasks-dlq leaves its row stuck `queued` forever
+ *               (repos/dlq.ts acks without touching D1) and only an idle
+ *               row re-enters the cron producer's due-SELECT, so this reset
+ *               IS the pipeline's "make it work again" arm — the next tick
+ *               re-enqueues the due rows. `nextSyncAt` is untouched (the
+ *               failure arm's posture: a due row retries on the next cron).
+ *               The depth contract decides the WHERE: upstream counts base-
+ *               queue items only and its purge shows 0 while on-the-fly
+ *               items exist; our rendered depth counts queued+syncing, so
+ *               the purge clears both.
+ *
+ * webhook-delivery and webhook-delivery-dlq stay absent — the module
+ * header's adjudication (the delivery queue's items are the log rows;
+ * upstream's purge preserves the log; the DLQ has no landed substrate).
+ */
+type QueuePurgeBody = (d1: D1Database) => Promise<void>;
+
+const QUEUE_PURGE_BODIES: Readonly<Record<string, QueuePurgeBody>> = {
+  "repo-tasks": (d1) =>
+    drizzle(d1)
+      .update(repoMirrors)
+      .set({ syncState: "idle", updatedAt: new Date() })
+      .where(inArray(repoMirrors.syncState, ["queued", "syncing"]))
+      .run()
+      .then(() => undefined),
+};
+
+/**
+ * The manage page's qid path segment (the route passes the raw segment —
+ * the orchestrator's fold). Decode failure → null, the engine's 404 funnel
+ * (the org-members parse's posture).
+ */
+export function parseAdminMonitorQueueQid(raw: string): string | null {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * QueueManage over the landed registry (queue.go:26): the qid resolves
+ * against the SAME three rows the list renders (one registry copy —
+ * landedQueueRows); an unknown name answers null → the route's 404
+ * (upstream's nil GetManagedQueue arm, queue.go:29-32). The DLQ resolves
+ * too — its detail renders the countable-less `-` arm with no form
+ * (queue_manage.tmpl:29's own `{{if lt $sum 0}}` posture). Two point scans
+ * of the same two grouped counts.
+ */
+export async function loadAdminMonitorQueueDetail(
+  d1: D1Database,
+  qid: string,
+): Promise<AdminMonitorQueueDetailData | null> {
+  const db = drizzle(d1);
+  const depth = await queueDepthByState(db);
+  const queue = landedQueueRows(depth).find((row) => row.name === qid);
+  if (queue === undefined) {
+    return null;
+  }
+  return { queue, purgeable: QUEUE_PURGE_BODIES[qid] !== undefined };
+}
+
+export type AdminMonitorQueueRemoveAllResult =
+  | { outcome: "applied"; message: string }
+  | { outcome: "unknown-queue" };
+
+/**
+ * QueueRemoveAllItems (queue.go:71-89) over the landed purge bodies: the
+ * known-and-purgeable queue executes its body and answers the
+ * remove_all_items_done flash; a queue with no landed purge body — the
+ * webhook delivery queue, the DLQ, or any unknown name — answers
+ * unknown-queue, which the route renders as upstream's nil-mq 404
+ * (queue.go:77-80). The negative flash arm of the cron page has no
+ * counterpart here: there is no producible invalid FORM (the button renders
+ * only on purgeable rows), so every non-applied answer is a 404, never a
+ * banner.
+ */
+export async function applyAdminMonitorQueueRemoveAllItems(
+  d1: D1Database,
+  qid: string,
+): Promise<AdminMonitorQueueRemoveAllResult> {
+  const purge = QUEUE_PURGE_BODIES[qid];
+  if (purge === undefined) {
+    return { outcome: "unknown-queue" };
+  }
+  await purge(d1);
+  return { outcome: "applied", message: adminMonitorLocale.queueRemoveAllDone };
+}
+
+/** The manage page (queue_manage.tmpl reduced): the `Queue: %s` header
+ *  (queue.go:33) over the sourced-columns detail table; the depth cell
+ *  carries the remove-all-items form ONLY on a purgeable queue (upstream
+ *  renders it for every countable queue, queue_manage.tmpl:33-35 — the
+ *  dead-control rule narrows it), and the countable-less DLQ renders the
+ *  `-` arm with no form (queue_manage.tmpl:29-31's own conditional). The
+ *  Pool Settings section is OMITTED entirely (no worker-pool knob — the
+ *  /set arm unclaimed). The reduction note is the cf-gitea posture line
+ *  (the trace page's honest-absence convention); `flash` is the no-JS POST
+ *  answer banner (always positive here — the unknown-queue arm is a 404). */
+export function AdminMonitorQueueManagePage(props: {
+  ctx: UiContext;
+  data: AdminMonitorQueueDetailData;
+  flash: { kind: "positive"; text: string } | null;
+}) {
+  const queue = props.data.queue;
+  const title = adminMonitorLocale.queueManageTitle.replace("%s", queue.name);
+  const manageLink = `/-/admin/monitor/queue/${queue.name}`;
+  return (
+    <AdminMonitorShell ctx={props.ctx} title={title} active="queue">
+      <h4 class="ui top attached header">{title}</h4>
+      {props.flash !== null ? <div class="ui positive message">{props.flash.text}</div> : null}
+      <div class="ui attached table segment">
+        <table class="ui very basic table">
+          <thead>
+            <tr>
+              <th>{adminMonitorLocale.queueName}</th>
+              <th>{adminMonitorLocale.queueType}</th>
+              <th>{adminMonitorLocale.queueNumberInQueue}</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>{queue.name}</td>
+              <td>{queue.type}</td>
+              <td>
+                {queue.inQueue === null ? (
+                  // queue_manage.tmpl:29-31 — the countable-less render.
+                  "-"
+                ) : (
+                  <>
+                    {queue.inQueue}
+                    {props.data.purgeable ? (
+                      <form action={`${manageLink}/remove-all-items`} method="post" class="tw-inline-block tw-ml-4">
+                        <button type="submit" class="ui tiny basic red button">
+                          {adminMonitorLocale.queueRemoveAll}
+                        </button>
+                      </form>
+                    ) : null}
+                  </>
+                )}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      {/* The cf-gitea posture line (the module header's adjudications) —
+          queue_manage.tmpl's second section keeps its segment+p shape with
+          the dead Pool Settings header omitted. */}
+      <div class="ui attached segment">
+        <p>{adminMonitorLocale.queueManageReductions}</p>
+      </div>
+    </AdminMonitorShell>
+  );
+}
+
+export function renderAdminMonitorQueueManagePage(options: {
+  ctx: UiContext;
+  data: AdminMonitorQueueDetailData;
+  flash: { kind: "positive"; text: string } | null;
+}): string {
+  return renderPage(<AdminMonitorQueueManagePage ctx={options.ctx} data={options.data} flash={options.flash} />);
 }
 
 // ---------------------------------------------------------------------------

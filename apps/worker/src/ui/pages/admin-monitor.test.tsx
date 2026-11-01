@@ -5,15 +5,19 @@
  * migrations in beforeAll; the counts read the same tables the API families
  * write), the cron registry/parse/apply matrix (the run arms drive the landed
  * CRON_RUN_BODIES producers against recording queues — the sync.test.ts
- * stub), and the DOM contract of the four page renders —
- * hono/jsx renderToString, the module driven directly. The deferred-test
- * matrix also drives the real routes (the org-blocked matrix's minted-session
- * uiRouter pattern): the adminPagePrologue's anonymous-303 / non-admin-404-
- * shell posture on GET and POST, the admin's four 200s with each pageClass
- * discriminator, the cron run POST's no-JS re-render with the positive flash
- * (op=update_mirrors) and the unknown-op negative flash, the guard-first
- * cross-origin 403, and the route-claim pin (the bare monitor tail, junk
- * page names and deeper tails unclaimed → the engine's 404).
+ * stub), the queue-manage {qid} arms (the census gap-17 fold — module-level:
+ * the detail loader over the landed registry, the repo-tasks purge body, the
+ * qid parse, and the manage-page DOM; the ROUTE claims are the orchestrator's
+ * ui/index.ts fold — the module header's HANDOFF section — and nothing here
+ * pins the new shape at the route level), and the DOM contract of the five
+ * page renders — hono/jsx renderToString, the module driven directly. The
+ * deferred-test matrix also drives the real routes (the org-blocked matrix's
+ * minted-session uiRouter pattern): the adminPagePrologue's anonymous-303 /
+ * non-admin-404-shell posture on GET and POST, the admin's four 200s with
+ * each pageClass discriminator, the cron run POST's no-JS re-render with the
+ * positive flash (op=update_mirrors) and the unknown-op negative flash, the
+ * guard-first cross-origin 403, and the route-claim pin (the bare monitor
+ * tail, junk page names and deeper tails unclaimed → the engine's 404).
  */
 
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
@@ -57,18 +61,23 @@ import type { UiContext } from "../ui-context";
 import type { Viewer } from "../viewer";
 import {
   AdminMonitorCronPage,
+  AdminMonitorQueueManagePage,
   AdminMonitorQueuePage,
   AdminMonitorStatsPage,
   AdminMonitorTracePage,
   adminMonitorLocale,
   applyAdminMonitorCronForm,
+  applyAdminMonitorQueueRemoveAllItems,
   formatMonitorFullTime,
   loadAdminMonitorCron,
   loadAdminMonitorCronRunState,
+  loadAdminMonitorQueueDetail,
   loadAdminMonitorQueues,
   loadAdminMonitorStats,
   parseAdminMonitorCronForm,
+  parseAdminMonitorQueueQid,
   renderAdminMonitorCronPage,
+  renderAdminMonitorQueueManagePage,
 } from "./admin-monitor";
 import { AdminFamilyNav } from "./admin-users";
 import { armsForEntry, listCronState, recordArmsFailure, recordArmsSuccess } from "../../services/cron-state";
@@ -752,8 +761,14 @@ describe("the monitor family DOM (templates/admin/*.tmpl at the pin)", () => {
     for (const state of ["pending", "delivering", "delivered", "skipped", "failed"]) {
       expect(html).toContain(`<td width="200">${state}</td>`);
     }
-    // NO dead queue-management controls (the reduction — no manage page).
-    expect(html).not.toContain("Review / Add Workers");
+    // The Review links render on every row (queue.tmpl:28; the census gap-17
+    // fold — the manage page LANDED, so the no-link reduction flipped) — all
+    // three detail pages resolve, so no link is dead.
+    expect(html).toContain(`>${adminMonitorLocale.queueReviewAdd}</a>`);
+    expect(html).toContain('href="/-/admin/monitor/queue/webhook-delivery"');
+    expect(html).toContain('href="/-/admin/monitor/queue/repo-tasks"');
+    expect(html).toContain('href="/-/admin/monitor/queue/webhook-delivery-dlq"');
+    // The remove arm lives on the MANAGE page only — never a form here.
     expect(html).not.toContain("remove-all-items");
   });
 
@@ -888,6 +903,207 @@ describe("the monitor family DOM (templates/admin/*.tmpl at the pin)", () => {
     expect(html).toContain('href="/-/admin/monitor/stacktrace"');
     // The unported audit_logs page is a dead link — never rendered.
     expect(html).not.toContain("/-/admin/monitor/audit_logs");
+  });
+});
+
+// --- the queue manage arms (the census gap-17 fold — module-level; the ROUTE
+// claims are the orchestrator's ui/index.ts fold, the module header's HANDOFF:
+// nothing here pins the {qid} shape at the parse/registration level) --------
+
+describe("parseAdminMonitorQueueQid (the {qid} path segment)", () => {
+  it("a plain queue name round-trips", () => {
+    expect(parseAdminMonitorQueueQid("repo-tasks")).toBe("repo-tasks");
+    expect(parseAdminMonitorQueueQid("webhook-delivery")).toBe("webhook-delivery");
+  });
+
+  it("a percent-encoded segment decodes", () => {
+    expect(parseAdminMonitorQueueQid("repo%2Dtasks")).toBe("repo-tasks");
+  });
+
+  it("a bad escape answers null — never throws (the engine's 404 funnel)", () => {
+    expect(parseAdminMonitorQueueQid("%zz")).toBeNull();
+  });
+});
+
+describe("loadAdminMonitorQueueDetail (QueueManage over the landed registry)", () => {
+  it("the three registry names resolve; an unknown name answers null (the nil-mq arm)", async () => {
+    expect(await loadAdminMonitorQueueDetail(env.DB, "nope")).toBeNull();
+    const delivery = await loadAdminMonitorQueueDetail(env.DB, "webhook-delivery");
+    const tasks = await loadAdminMonitorQueueDetail(env.DB, "repo-tasks");
+    const dlq = await loadAdminMonitorQueueDetail(env.DB, "webhook-delivery-dlq");
+    // The empty-store depths (the list loader's 0/0/`-` triple) and the
+    // purge flags: only repo-tasks has a landed purge body.
+    expect(delivery).toEqual({
+      queue: { name: "webhook-delivery", type: "cloudflare-queue", inQueue: 0 },
+      purgeable: false,
+    });
+    expect(tasks).toEqual({
+      queue: { name: "repo-tasks", type: "cloudflare-queue", inQueue: 0 },
+      purgeable: true,
+    });
+    expect(dlq).toEqual({
+      queue: { name: "webhook-delivery-dlq", type: "cloudflare-queue", inQueue: null },
+      purgeable: false,
+    });
+  });
+
+  it("the depths are the SAME D1 derivations the list counts (one registry copy)", async () => {
+    const db = drizzle(env.DB);
+    const hookRows = await db
+      .insert(webhooks)
+      .values([{ repoId: "r1", url: "https://hook.test", events: "{}", isActive: true, createdAt: AT }])
+      .returning({ id: webhooks.id })
+      .all();
+    await db
+      .insert(webhookDeliveries)
+      .values([
+        { hookId: hookRows[0]!.id, repoId: "r1", uuid: "u1", eventType: "issues", eventGroup: "issues", payloadContent: "{}", state: "pending", createdAt: AT },
+        { hookId: hookRows[0]!.id, repoId: "r1", uuid: "u2", eventType: "issues", eventGroup: "issues", payloadContent: "{}", state: "delivering", createdAt: AT },
+        { hookId: hookRows[0]!.id, repoId: "r1", uuid: "u3", eventType: "issues", eventGroup: "issues", payloadContent: "{}", state: "delivered", createdAt: AT },
+      ])
+      .run();
+    await db
+      .insert(repoMirrors)
+      .values([
+        { repoId: "a", remoteAddress: "https://src.test/a.git", syncState: "queued", nextSyncAt: 1 },
+        { repoId: "b", remoteAddress: "https://src.test/b.git", syncState: "syncing", nextSyncAt: 1 },
+        { repoId: "c", remoteAddress: "https://src.test/c.git", syncState: "idle", nextSyncAt: 1 },
+      ])
+      .run();
+    const list = await loadAdminMonitorQueues(env.DB);
+    for (const row of list.queues) {
+      const detail = await loadAdminMonitorQueueDetail(env.DB, row.name);
+      expect(detail!.queue).toEqual(row);
+    }
+    expect((await loadAdminMonitorQueueDetail(env.DB, "repo-tasks"))!.queue.inQueue).toBe(2);
+    expect((await loadAdminMonitorQueueDetail(env.DB, "webhook-delivery"))!.queue.inQueue).toBe(2);
+  });
+});
+
+describe("applyAdminMonitorQueueRemoveAllItems (QueueRemoveAllItems over the landed pipelines)", () => {
+  it("repo-tasks resets the in-flight set to idle — the depth drains to 0, nextSyncAt preserved", async () => {
+    await drizzle(env.DB)
+      .insert(repoMirrors)
+      .values([
+        // A dead-lettered sync: stuck `queued` forever until this arm (the
+        // module header's corruption scenario — repos/dlq.ts acks without
+        // touching D1).
+        { repoId: "stuck", remoteAddress: "https://src.test/stuck.git", syncState: "queued", nextSyncAt: 111 },
+        // A consumer that died mid-sync.
+        { repoId: "died", remoteAddress: "https://src.test/died.git", syncState: "syncing", nextSyncAt: 222 },
+        // An idle row — never in the in-flight set, untouched by the purge.
+        { repoId: "calm", remoteAddress: "https://src.test/calm.git", syncState: "idle", nextSyncAt: 333 },
+      ])
+      .run();
+    const result = await applyAdminMonitorQueueRemoveAllItems(env.DB, "repo-tasks");
+    expect(result).toEqual({ outcome: "applied", message: adminMonitorLocale.queueRemoveAllDone });
+    const rows = await drizzle(env.DB).select().from(repoMirrors).all();
+    const byRepo = new Map(rows.map((row) => [row.repoId, row]));
+    expect(byRepo.get("stuck")!.syncState).toBe("idle"); // re-enters the cron due-SELECT
+    expect(byRepo.get("died")!.syncState).toBe("idle");
+    expect(byRepo.get("calm")!.syncState).toBe("idle"); // unchanged posture
+    // nextSyncAt untouched: the due rows re-enqueue on the next cron tick.
+    expect(byRepo.get("stuck")!.nextSyncAt).toBe(111);
+    expect(byRepo.get("calm")!.nextSyncAt).toBe(333);
+    // The rendered depth is 0 — the arm's contract (upstream's post-purge
+    // Number in Queue).
+    expect((await loadAdminMonitorQueueDetail(env.DB, "repo-tasks"))!.queue.inQueue).toBe(0);
+  });
+
+  it("webhook-delivery answers unknown-queue — the delivery log is never destroyed", async () => {
+    const db = drizzle(env.DB);
+    const hookRows = await db
+      .insert(webhooks)
+      .values([{ repoId: "r1", url: "https://hook.test", events: "{}", isActive: true, createdAt: AT }])
+      .returning({ id: webhooks.id })
+      .all();
+    await db
+      .insert(webhookDeliveries)
+      .values([
+        { hookId: hookRows[0]!.id, repoId: "r1", uuid: "u1", eventType: "issues", eventGroup: "issues", payloadContent: "{}", state: "pending", createdAt: AT },
+        { hookId: hookRows[0]!.id, repoId: "r1", uuid: "u2", eventType: "issues", eventGroup: "issues", payloadContent: "{}", state: "delivering", createdAt: AT },
+      ])
+      .run();
+    const result = await applyAdminMonitorQueueRemoveAllItems(env.DB, "webhook-delivery");
+    expect(result).toEqual({ outcome: "unknown-queue" });
+    // Every row exactly where it was — no purge body for the log-backed queue.
+    const rows = await db.select({ state: webhookDeliveries.state }).from(webhookDeliveries).all();
+    expect(rows.map((row) => row.state).sort()).toEqual(["delivering", "pending"]);
+  });
+
+  it("the DLQ and any unknown name answer unknown-queue (known but unmanageable)", async () => {
+    expect(await applyAdminMonitorQueueRemoveAllItems(env.DB, "webhook-delivery-dlq")).toEqual({
+      outcome: "unknown-queue",
+    });
+    expect(await applyAdminMonitorQueueRemoveAllItems(env.DB, "nope")).toEqual({ outcome: "unknown-queue" });
+  });
+});
+
+describe("the queue manage DOM (queue_manage.tmpl reduced)", () => {
+  it("repo-tasks: the Queue-name header, the sourced columns, the remove form, no Pool Settings", async () => {
+    const data = (await loadAdminMonitorQueueDetail(env.DB, "repo-tasks"))!;
+    const html = renderToString(
+      <AdminMonitorQueueManagePage ctx={ctx} data={data} flash={null} />,
+    );
+    expect(html).toContain('class="page-content admin monitor"'); // the §2.4.1 discriminator
+    expect(html).toContain(`>Queue: repo-tasks</h4>`); // "admin.monitor.queue" with the name
+    expect(html).toContain("<td>repo-tasks</td>");
+    expect(html).toContain("<td>cloudflare-queue</td>");
+    expect(html).toContain(`<th>${adminMonitorLocale.queueName}</th>`);
+    // The remove-all-items form (queue_manage.tmpl:33-35) — purgeable row only.
+    expect(html).toContain('action="/-/admin/monitor/queue/repo-tasks/remove-all-items"');
+    expect(html).toContain('method="post"');
+    expect(html).toContain('class="ui tiny basic red button"');
+    expect(html).toContain(`>${adminMonitorLocale.queueRemoveAll}</button>`);
+    // NO Pool Settings form anywhere (the /set arm unclaimed — no knob).
+    expect(html).not.toContain("max-number");
+    expect(html).not.toContain("/set");
+    // The cf-gitea reduction note segment (apostrophe-free substrings — the
+    // render escapes "upstream's" to &#39;).
+    expect(html).toContain("Pool settings (worker counts) have no cf-gitea source");
+    expect(html).toContain("its queue items are the delivery log rows themselves");
+    expect(html).toContain("and no purge substrate.");
+    // The nav: the queue item active, the group open (the handoff's
+    // documented divergence from upstream's inactive-items render).
+    expect(html).toContain('class="active item" href="/-/admin/monitor/queue"');
+  });
+
+  it("webhook-delivery: the count renders with NO remove form (no purge body)", async () => {
+    const data = (await loadAdminMonitorQueueDetail(env.DB, "webhook-delivery"))!;
+    const html = renderToString(<AdminMonitorQueueManagePage ctx={ctx} data={data} flash={null} />);
+    expect(html).toContain(">Queue: webhook-delivery</h4>");
+    expect(html).toContain("<td>0</td>");
+    expect(html).not.toContain("remove-all-items");
+    expect(html).not.toContain("ui tiny basic red button");
+  });
+
+  it("the DLQ renders the countable-less `-` arm with no form (queue_manage.tmpl:29's own conditional)", async () => {
+    const data = (await loadAdminMonitorQueueDetail(env.DB, "webhook-delivery-dlq"))!;
+    const html = renderToString(<AdminMonitorQueueManagePage ctx={ctx} data={data} flash={null} />);
+    expect(html).toContain(">Queue: webhook-delivery-dlq</h4>");
+    expect(html).toContain("<td>-</td>");
+    expect(html).not.toContain("remove-all-items");
+    expect(html).not.toContain("<td>0</td>");
+  });
+
+  it("the flash banner renders the remove_all_items_done text (the no-JS POST convention)", async () => {
+    const data = (await loadAdminMonitorQueueDetail(env.DB, "repo-tasks"))!;
+    const html = renderToString(
+      <AdminMonitorQueueManagePage
+        ctx={ctx}
+        data={data}
+        flash={{ kind: "positive", text: adminMonitorLocale.queueRemoveAllDone }}
+      />,
+    );
+    expect(html).toContain('class="ui positive message"');
+    expect(html).toContain("All items in the queue have been removed.");
+  });
+
+  it("the full-document render matches the component path", async () => {
+    const data = (await loadAdminMonitorQueueDetail(env.DB, "repo-tasks"))!;
+    expect(
+      renderAdminMonitorQueueManagePage({ ctx, data, flash: null }),
+    ).toContain('class="page-content admin monitor"');
   });
 });
 
