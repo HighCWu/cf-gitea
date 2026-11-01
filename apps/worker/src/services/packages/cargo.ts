@@ -14,7 +14,7 @@
  *   PUT    …/cargo/api/v1/crates/{package}/{version}/unyank      → UnyankPackage (the yank=false twin)
  *   GET    …/cargo/api/v1/crates/{package}/owners                → ListOwners (cargo.go:152-155)
  *
- * ## The index storage posture (the git-repo reduction)
+ * ## The index storage posture (the git-repo mirror — M7's deferred half, LANDED)
  *
  * Upstream maintains a REAL git repository `_cargo-index`
  * (index.go:24, InitializeIndexRepository) whose per-package NDJSON files and
@@ -25,13 +25,21 @@
  * index.go:139-183 — SearchVersions + the version descriptors), and
  * UpdatePackageIndexIfExists itself states the contract this port rides:
  * "cargo http index does not rely on the repo itself, so if the repo does not
- * exist, we just do nothing" (index.go:94-99). SPEC-0016 §1 carves the
- * git-backed `_cargo-index` repository out of v1 ("own SPEC-attached
- * milestone") — so our tree NEVER has the repo, updateCargoPackageIndex is
- * permanently the repo-absent arm (the upstream no-op), and the sparse index
- * is derived on read exactly as upstream's HTTP face does. Every write arm
- * (publish / yank / unyank / the cleanup rider) still calls it at upstream's
- * call-site shape, so the git-index milestone can hang content off one seam.
+ * exist, we just do nothing" (index.go:94-99). The mirror now EXISTS as the
+ * rowless engine cell `<owner>/_cargo-index` (services/packages/cargo-index.ts
+ * — the wiki sibling's hiding posture; upstream's repo is a visible row, ours
+ * is hidden by construction): `updateCargoPackageIndex` remains the one seam
+ * every write arm calls at upstream's call-site shape (publish / yank /
+ * unyank / the cleanup rider), and when the caller threads the
+ * `CargoIndexHook` the mirror's present arm rewrites that ONE package's file
+ * incrementally (the adjudication — upstream never rebuilds on writes; the
+ * full `RebuildIndex` is the explicit operator action). Two disclosed
+ * postures: the hooks are BEST-EFFORT (a failed mirror write logs and
+ * continues — upstream FAILS the publish and rolls the version back,
+ * cargo.go:247-254; the mirror heals on the next write of the package or a
+ * rebuild), and DORMANT until a mount passes the hook (the routes are
+ * recipe-owned; the mount lines live in SPEC-0016's cargo as-built) — the
+ * unborn-mirror arm IS the upstream repo-absent no-op.
  *
  * ## The .crate container (parser.go:57-71)
  *
@@ -77,7 +85,7 @@
 import { and, asc, eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { packageFiles, packageProperties, packageVersions, repositories } from "../../db/schema";
+import { packageFiles, packageProperties, packageVersions, packages, repositories } from "../../db/schema";
 import {
   QuotaTotalCountError,
   QuotaTotalSizeError,
@@ -104,6 +112,7 @@ import {
 import { getPackageProperties, isValidAbsoluteHttpUrl, writeVersionMetadata } from "./protocol-common";
 import { bytesToHex } from "./distro-common";
 import { parseGoSemver } from "./npm";
+import { updateCargoIndexMirror, type CargoIndexHook } from "./cargo-index";
 
 // ---------------------------------------------------------------------------
 // Metadata (modules/packages/cargo/parser.go:27-51 — the JSON-tag order is
@@ -142,8 +151,10 @@ export interface CargoMetadata {
 /** `PropertyYanked` (parser.go:19) — the version property holding the flag. */
 export const CARGO_YANKED_PROPERTY = "cargo.yanked";
 
-/** `IndexRepositoryName` (index.go:24) — the git-protocol mirror repo's name
- *  (never created in our tree — see the module-header reduction). */
+/** `IndexRepositoryName` (index.go:24) — the git-protocol mirror's name: the
+ *  rowless engine cell `<owner>/_cargo-index` (cargo-index.ts; a repositories
+ *  ROW at this name is user-owned and the mirror refuses it — the collision
+ *  guard). */
 export const CARGO_INDEX_REPOSITORY_NAME = "_cargo-index";
 
 /** `ConfigFileName` (index.go:25). */
@@ -566,6 +577,9 @@ export interface UploadCargoPackageInput {
   content: ReadableStream<Uint8Array>;
   declaredLength?: number;
   quota: PackagesQuotaConfig;
+  /** The `_cargo-index` mirror hook (cargo-index.ts) — optional; absent =
+   *  the mirror arm stays the upstream repo-absent no-op. */
+  cargoIndex?: CargoIndexHook;
   now?: Date;
 }
 
@@ -670,9 +684,16 @@ export async function uploadCargoPackage(input: UploadCargoPackageInput): Promis
       throw new Error("cargo package file insert raced a duplicate");
     }
 
-    // UpdatePackageIndexIfExists (cargo.go:210-220) — the git-index seam;
-    // the repo-absent no-op per index.go:94-99 (updateCargoPackageIndex).
-    await updateCargoPackageIndex(d1, input.owner.id, pkg.id);
+    // UpdatePackageIndexIfExists (cargo.go:210-220) — the git-mirror seam;
+    // the repo-absent no-op per index.go:94-99 when the hook is absent or
+    // the mirror is unborn (updateCargoPackageIndex). Upstream commits as
+    // ctx.Doer here — the hook's doerId pins that (index.go:301-303).
+    await updateCargoPackageIndex(
+      d1,
+      input.owner.id,
+      pkg.id,
+      input.cargoIndex === undefined ? undefined : { ...input.cargoIndex, doerId: input.doer.id },
+    );
 
     return { pkg, versionId: version.id, version: version.version };
   } finally {
@@ -722,44 +743,88 @@ async function storeCargoContent(d1: D1Database, bucket: R2Bucket, spooled: Spoo
 }
 
 /**
- * `UpdatePackageIndexIfExists` (index.go:92-112) — the git-index seam every
- * cargo write arm calls. Upstream looks up the owner's `_cargo-index`
- * repository and, when it does not exist, returns nil WITHOUT any other
- * effect ("cargo http index does not rely on the repo itself, so if the repo
- * does not exist, we just do nothing", index.go:94-99). Our tree never
- * creates that repository (SPEC-0016 §1: the git-backed index repo is its own
- * SPEC-attached milestone), so the function resolves the upstream contract's
- * repo-absent arm permanently: one repositories-row probe keyed
- * owner+`_cargo-index`, then the no-op. The row probe exists so the git-index
- * milestone can hang its rewrite arm on this exact seam, and so a deployment
- * that happens to carry a `_cargo-index` repo row keeps the write arms
- * observable (the present arm logs the reduction — no content is written).
+ * `UpdatePackageIndexIfExists` (index.go:92-112) — the git-mirror seam every
+ * cargo write arm calls (publish, yank/unyank, the cleanup rider). Upstream
+ * looks up the owner's `_cargo-index` repository and, when it does not exist,
+ * returns nil WITHOUT any other effect ("cargo http index does not rely on
+ * the repo itself, so if the repo does not exist, we just do nothing",
+ * index.go:94-99). Our mirror lives at cargo-index.ts as the ROWLESS engine
+ * cell `<owner>/_cargo-index` (the hiding posture; upstream's is a visible
+ * repositories row), so the resolution order here is:
+ *
+ *   1. a `repositories` row occupying the name means a USER owns the address
+ *      — the mirror arms refuse to touch a user-owned repo (upstream would
+ *      find that repo and commit the index INTO it, GetRepositoryByOwnerAndName
+ *      → alterRepositoryContent, index.go:210-226) — logged skip;
+ *   2. with the `CargoIndexHook` threaded, the mirror's present arm runs —
+ *      ONE package file rewritten incrementally from D1, the unborn cell
+ *      answering the upstream repo-absent no-op (no forced creation,
+ *      index.go:108-111). BEST-EFFORT: a failure logs and never fails the
+ *      protocol write (the disclosed divergence from upstream's
+ *      rollback-on-index-failure, cargo.go:247-254; the mirror heals on the
+ *      next write of the same package or a rebuild);
+ *   3. without the hook the arm stays the dormant no-op — the routes are
+ *      recipe-owned; the mount lines live in SPEC-0016's cargo as-built.
  */
-export async function updateCargoPackageIndex(d1: D1Database, ownerId: number, packageId: number): Promise<void> {
-  const repo = await drizzle(d1)
+export async function updateCargoPackageIndex(
+  d1: D1Database,
+  ownerId: number,
+  packageId: number,
+  cargoIndex?: CargoIndexHook,
+): Promise<void> {
+  const row = await drizzle(d1)
     .select({ id: repositories.id })
     .from(repositories)
     .where(and(eq(repositories.ownerId, ownerId), eq(repositories.slug, CARGO_INDEX_REPOSITORY_NAME)))
     .limit(1)
     .all();
-  if (repo.length === 0) {
-    // index.go:96-99 — the repo-absent arm: do nothing.
+  if (row.length > 0) {
+    // The address is user-owned (the collision guard) — the mirror never
+    // touches it; the sparse face keeps deriving on read either way.
+    console.log(
+      `[packages-cargo] package ${packageId}: a _cargo-index repositories row occupies the mirror address (user-owned); the rowless mirror skips (cargo-index.ts collision guard)`,
+    );
     return;
   }
-  // The repo row EXISTS (upstream would alterRepositoryContent here,
-  // index.go:110-112). Our v1 carries no files-service write path for the
-  // index repo (the git-index milestone's subject) — log-and-skip keeps the
-  // write arms live without fabricating content.
-  console.log(
-    `[packages-cargo] package ${packageId}: a _cargo-index repository row exists but the git-index mirror is not maintained (SPEC-0016 §1); the sparse index derives on read`,
-  );
+  if (cargoIndex === undefined) {
+    // The dormant arm — no hook threaded (upstream's repo-absent no-op).
+    return;
+  }
+  try {
+    const pkg = await drizzle(d1)
+      .select()
+      .from(packages)
+      .where(eq(packages.id, packageId))
+      .get();
+    if (pkg === undefined) {
+      // The package row died with its last version (the cleanup rider's
+      // emptied-package shape) — nothing to mirror for it; the mirror's file
+      // removal rides the package-level arms, not a phantom row.
+      console.log(`[packages-cargo] package ${packageId}: row absent, mirror update skipped`);
+      return;
+    }
+    const result = await updateCargoIndexMirror(cargoIndex.bindings, d1, ownerId, pkg, {
+      doerId: cargoIndex.doerId,
+    });
+    if (result.tag === "refused") {
+      console.error(`[packages-cargo] mirror update refused (${result.reason}) for package ${packageId}`);
+    } else if (result.tag === "committed" || result.tag === "removed") {
+      console.log(`[packages-cargo] mirror ${result.tag} for package ${pkg.name} at ${result.commitOid.slice(0, 12)}`);
+    }
+  } catch (error) {
+    // Best-effort (the webhook-fan posture) — the write arms never fail on
+    // the mirror; the next write of this package or a rebuild heals it.
+    console.error(`[packages-cargo] mirror update failed for package ${packageId}: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 /**
  * The yank/unyank walk (cargo.go:247-274): the version must exist (404),
  * the `cargo.yanked` version property must exist (the 500 sentinel — a
  * pre-yank-era version row), then the property flips and the index seam
- * runs. Returns nothing; the caller answers `{"ok": true}`.
+ * runs. `cargoIndex` threads the `_cargo-index` mirror hook (optional;
+ * absent = the dormant no-op). Returns nothing; the caller answers
+ * `{"ok": true}`.
  */
 export async function setCargoPackageYanked(
   d1: D1Database,
@@ -767,6 +832,7 @@ export async function setCargoPackageYanked(
   name: string,
   version: string,
   yank: boolean,
+  cargoIndex?: CargoIndexHook,
 ): Promise<void> {
   const pv = await getVersionByNameAndVersion(d1, ownerId, "cargo", name, version);
   if (pv === null) {
@@ -783,8 +849,9 @@ export async function setCargoPackageYanked(
     .set({ value: yank ? "true" : "false" })
     .where(eq(packageProperties.id, prop.id))
     .run();
-  // UpdatePackageIndexIfExists (cargo.go:262-267) — the git-index seam.
-  await updateCargoPackageIndex(d1, ownerId, pv.packageId);
+  // UpdatePackageIndexIfExists (cargo.go:262-267) — the git-mirror seam,
+  // committed as ctx.Doer upstream (the hook carries doerId).
+  await updateCargoPackageIndex(d1, ownerId, pv.packageId, cargoIndex);
 }
 
 /**

@@ -83,7 +83,8 @@ Out of scope (each named so it is not silently re-decided):
 - **Cargo's git-backed index repo** (`_cargo-index`,
   `gitea/services/packages/cargo/index.go:29` — a real repository whose
   files commit through the files service) — the heaviest single ecosystem;
-  own SPEC-attached milestone.
+  own SPEC-attached milestone. *(Landed 2026-11-01 as the rowless engine
+  cell — see the mirror as-built below; the carve-out is closed.)*
 - **Repository signing keys** (alpine/debian/rpm `GetRepositoryKey` arms, the
   chef keypair, `DefaultRPMSignEnabled`,
   `gitea/modules/setting/packages.go:42`) — no signing key exists in our
@@ -130,7 +131,7 @@ wire-format module):
 | nuget (`api.go:348-378`) | 698 ln | V2 OData + V3 JSON service index, registration, symbols | yes — the largest single-ecosystem wire | M4 |
 | container (`api.go:509-547`) | ≈2,000 ln (routers 1,459: container 796 + blob 195 + manifest 416 + errors 52; plus services 314 + the wire module 204) | OCI: token → blob POST/PATCH/PUT chunked uploads, manifests | yes — JWT flow + upload state + digests | M5 |
 | debian / alpine / rpm / arch | each 300-600 ln | repo metadata index BUILDERS (`Packages`/`Release`/`APKINDEX`/`repodata`/`.repo` files) regenerated on upload/delete (`gitea/services/packages/cleanup/cleanup.go:115-145` rebuild arms) | yes — index files | M6 |
-| cargo (`api.go:156-172`) | ~600 ln + index.go | sparse index: `config.json` + `1|2|3/{name}` version lists derived on read (upstream's HTTP face builds them from the DB per request, cargo.go:66-87 → index.go:139-183); the **git repo** (`_cargo-index`, index.go:29) is only the traditional git-protocol mirror and stays the separate SPEC-attached milestone | yes — D1-derived; the git mirror deferred | **M7 LANDED** (see the cargo as-built) |
+| cargo (`api.go:156-172`) | ~600 ln + index.go | sparse index: `config.json` + `1|2|3/{name}` version lists derived on read (upstream's HTTP face builds them from the DB per request, cargo.go:66-87 → index.go:139-183); the **git repo** (`_cargo-index`, index.go:29) is the traditional git-protocol mirror — **LANDED** as the rowless engine cell (the 2026-11-01 as-built below; the git-URL face itself stays a gate-family gap) | yes — D1-derived; the git mirror maintained | **M7 LANDED incl. the mirror** (see both cargo as-builts) |
 | conan / composer / chef / conda / cran / go / pub / rubygems / swift / terraform / vagrant | each 150-700 ln | per-client wire contracts | protocol-only | long tail, demand-driven — RESOLVED per family at the 2026-11-01 adjudication: terraform **LANDED** (the as-built at the tail), conda **LANDED** (2026-11-01 — the three walls RESOLVED: the bz2 decoder adopted, the `.conda`/zstd reduction recorded, the repodata-encoder reduction reopened and ADOPTED the same day; the as-built at the tail supersedes this row's earlier STAGED state) |
 
 Verdict: the MODEL is the one shared prerequisite; the protocols are a
@@ -1489,6 +1490,115 @@ bare-token acceptance would be a cross-family divergence beyond the pin —
 recorded as an open question for the orchestrator, NOT landed. Battery
 teardown: the battery user row deleted, the PAT swept, the 0600 token file
 shredded.
+
+## As-built — M7's deferred half: the `_cargo-index` git mirror (2026-11-01 — index.go ported as the rowless engine cell; the §1 carve-out and the §2.1 census "deferred" tail flip with this section)
+
+Upstream `gitea/services/packages/cargo/index.go` (the whole file: config.json
+root, the 1|2|3/{name} per-package NDJSON files, delete-side removals, the
+initial-branch setup) at the pin, ported as
+`src/services/packages/cargo-index.ts` with the hook seam extended in
+`cargo.ts` (`updateCargoPackageIndex`'s 4th arg + the `cargoIndex` field on
+the publish input and the yank/unyank walk).
+
+**The three adjudications the mission demanded, recorded:**
+
+1. **Incremental per package, never a per-write rebuild.** Upstream's write
+   arms (publish cargo.go:247, yank/unyank cargo.go:298, the cleanup rider
+   cleanup.go:115) all funnel into `UpdatePackageIndexIfExists`, which
+   rewrites exactly ONE package file — `addOrUpdatePackageIndex` over that
+   package's full version list (index.go:198-208) — and the whole-tree
+   `RebuildIndex` (index.go:63-106) is a separate explicit operator action,
+   never a write-arm behavior. Ours keeps that shape: each write recomputes
+   the ONE package's NDJSON from D1 (`buildCargoPackageIndex`, the same
+   builder the sparse face serves) and rewrites its file; the RebuildIndex
+   port (`rebuildCargoIndexMirror`) exists for the operator button. One
+   deliberate write-arm divergence: upstream LEAVES a package's index file
+   behind when its last version disappears (BuildPackageIndex's zero-version
+   nil → addOrUpdatePackageIndex no-ops, index.go:154-156/203-205 — the stale
+   line-file survives until a manual Rebuild); OURS REMOVES it — the mirror's
+   source of truth is D1 (the sparse face 404s an emptied package), so
+   matching the sparse face (and upstream's own RebuildIndex output) is the
+   more faithful of the two observable behaviors.
+2. **The hiding posture — rowless cell, hidden by construction.** Upstream
+   creates the index as a REAL repositories row (`CreateRepositoryDirectly`,
+   index.go:210-226) and does NOT hide it from listings (no models/repo filter
+   at the pin — the repo shows on the owner's profile). Our substrate's
+   pattern for infrastructure repositories is the wiki sibling: a bare engine
+   cell with NO D1 row and NO registry entry, invisible to every listing, the
+   site index, and the git gate's registry-existence oracle. The mirror is
+   that: the cell `<owner>/_cargo-index` (wikiCellName's combined-name
+   convention). Divergences bought: upstream's index repo is user-visible and
+   cloneable at `{origin}/{owner}/_cargo-index.git` — ours is hidden and the
+   git-URL face 404s until a wiki-style gate family teaches the gate the
+   marker (gate.ts is not this module's surface; the CONTENT is maintained so
+   that face is one seam away — and the sparse `+sparse+` face cargo clients
+   actually use never reads the repo). Owner renames strand the cell at the
+   old namespace (upstream renames it automatically): the next write after a
+   re-initialize re-seeds at the new name, untouched packages reappear on
+   their next write or a rebuild.
+3. **Best-effort landings (the webhook-fan posture, disclosed).** Upstream
+   FAILS the publish when the index write fails and ROLLS THE VERSION BACK
+   (cargo.go:247-254). Ours logs and continues — a failed mirror write heals
+   on the next write of the same package or a rebuild. Commit identity:
+   upstream's `CommitTreeUserOptions{DoerUser: doer}` — publish/yank commit
+   as ctx.Doer, the cleanup arm as owner,owner (cleanup.go:115); ours
+   resolves the hook's `doerId` row (publish/yank) or the owner row, with the
+   house noreply fallback `<username>@noreply.<origin hostname>` for a null
+   email (upload-staging's convention; the hostname comes from the bindings'
+   origin because the cleanup consumer runs off-request).
+
+**Shape:** `ensureCargoIndexMirror` (InitializeIndexRepository: get-or-create —
+the config root commit over the unborn cell, the engine seats HEAD on the
+first branch — and a config re-stamp on a born one; upstream commits on every
+click, ours skips when the bytes are already current, the one micro-divergence),
+`updateCargoIndexMirror` (the present arm: unborn → the upstream repo-absent
+no-op verbatim, index.go:108-111 "We do not want to force the creation of the
+repo here"; else one file rewritten/removed via the mirror's own level-chain
+tree builder + `putApiObjects`/`commitApiChange` CAS with ONE conflict retry —
+the shared contents builder is NOT reused because its level map never
+registers fresh intermediate directories, dropping 2+-level creates), and
+`rebuildCargoIndexMirror` (RebuildIndex: one whole-tree replacement commit,
+config.json preserved from the live cell, emptied packages vanish). The tree
+lands at 100644 blobs under the canonical shard dirs; the branch is `main`
+(upstream's repo.DefaultBranch = the DEFAULT_BRANCH setting; our repo rows'
+birth value). The engine's 8 MiB `putApiObjects` budget bounds a rebuild — a
+registry past it answers `too_large` on the explicit action instead of
+failing.
+
+**The collision guard:** a `repositories` ROW at `owner/_cargo-index` means a
+USER owns the address (our design never creates one; `isUsableRepoName`
+allows it). Upstream would find that repo and commit the index INTO it; ours
+refuses — every mirror arm (ensure/update/rebuild and the `updateCargoPackageIndex`
+seam) probes the row first and logged-skips. This repurposes the old seam
+probe (which used to log "the mirror is not maintained") into the guard; the
+cleanup.test expectations (row present → resolves; absent → resolves) hold
+unchanged.
+
+**Wiring (dormant until mounted — the routes are recipe-owned):**
+`updateCargoPackageIndex(d1, ownerId, packageId, cargoIndex?)` is the one
+seam; `cargoIndexBindings(env, requestOrigin?)` builds the hook bindings
+(`APP_URL` → request origin → localhost). Mount lines for the recipe wave:
+the publish arm passes `cargoIndex: { bindings: cargoIndexBindings(c.env),
+doerId: doer.id }` (the service already pins doerId from its own `doer` when
+the field is present); the yank/unyank arms the same; cleanup.ts's rider
+(:451) threads the struct as the 4th arg; the settings buttons call
+`ensureCargoIndexMirror` / `rebuildCargoIndexMirror`. Until then every arm
+stays the upstream no-op — the mirror only ever exists where ensure ran.
+
+**Suites (own eyes):** cargo-index.test 16/16 solo (real-cell: the config
+root commit with the exact `json.Encoder`-newline bytes, the idempotent
+"current" + visibility-flip "updated" arms, the unborn no-op with NO cell
+created, upload → tree with the exact NDJSON line and cksum == payload
+sha256, the 1.0.10-before-1.0.2 string-sort rewrite, yank/unyank flag flips
+in the file, delete → removed with the emptied `do/om` dir-chain collapse and
+surviving siblings, the never-mirrored zero-version "unchanged", the
+collision-guard freeze, the rebuild's stale-file purge + get-or-create,
+the doer/owner identity + noreply fallback); cargo.test 17/17 (unchanged —
+the hook is optional); cleanup.test 25/25 (the rider's repo-absent and
+row-present arms both resolve through the extended seam). `tsc --noEmit`
+carries zero cargo-family errors (the tree's remaining errors are the
+webauthn/two-factor wave's in-flight files); scoped eslint on the three
+touched files exits 0.
 
 ## As-built — the long-tail `swift` family: the Swift package registry protocol (2026-10-31 — the census's Swift registry lands; the registry carries FOURTEEN protocols)
 
