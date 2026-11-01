@@ -10,6 +10,7 @@ import type { ApiEnv } from "../env";
 import type { Release } from "../models/release";
 import type { User } from "../models/user";
 import { engineReads, refTipMap, tagRef } from "./engine";
+import { listReleaseAssets, toApiAttachment } from "./release-assets";
 import { apiUserFromRow, type RepositoryWithOwner, type Viewer } from "./repository";
 import { resolveTagTarget, writeTagRef, type TagCreator } from "./tags";
 
@@ -63,7 +64,10 @@ import { resolveTagTarget, writeTagRef, type TagCreator } from "./tags";
  *    `{repo APIURL}/releases/{id}`, HTMLURL `{repo HTMLURL}/releases/tag/
  *    {tag}`, TarURL/ZipURL `{repo HTMLURL}/archive/{tag}.tar.gz|zip`,
  *    UploadURL `{repo APIURL}/releases/{id}/assets`; `published_at` null for
- *    drafts; assets empty until the R2 asset wave.
+ *    drafts; assets render the release's attachment rows (upstream
+ *    LoadAttributes → GetReleaseAttachments — the R2 asset wave has landed:
+ *    upload/list/edit/delete + serving all work; see toApiRelease's doc
+ *    comment for the two pinned divergences).
  */
 
 /** The release-write gate's data dependency set (canAccessReleaseDraft). */
@@ -729,14 +733,35 @@ function releaseUrls(pair: RepositoryWithOwner, origin: string, row: ReleaseRow)
 
 /**
  * `convert.ToAPIRelease` — the publisher row is fetched per render (upstream
- * `release.LoadAttributes` + `ToAuthor`); assets are the empty Attachment
- * list until the R2 asset wave (SPEC-0004 open question 3).
+ * `release.LoadAttributes` + `ToAuthor`) and the release's attachment rows
+ * ride along: LoadAttributes ends in GetReleaseAttachments (models/repo/
+ * release.go:111-127, :389-449), rendered here through the attachment-list
+ * route's own converter (`toApiAttachment`) over the route's own read
+ * (`listReleaseAssets`) — every caller of this converter (list, latest,
+ * by-tag, by-id, the `release` webhook payload, the UI form writes' webhook
+ * leg) gets the assets for free. A deleted release's asset rows go with the
+ * row (deleteRelease's batch), so a render can never orphan; the read
+ * touches D1 rows only — no R2 interaction.
+ *
+ * Two pinned divergences from upstream's GetReleaseAttachments/
+ * ToAPIAttachments:
+ *  - order: ours is asset-id ASC (listReleaseAssets — primary-key order,
+ *    the attachment-list route's read); upstream orders
+ *    `Asc("release_id", "name")` (release.go:417).
+ *  - `browser_download_url` keeps the uuid shape (`/attachments/{uuid}`);
+ *    upstream prefers `/releases/download/{tag}/{name}` when a release's
+ *    asset names are unique (GetReleaseAttachments' CustomDownloadURL,
+ *    release.go:443, consumed by Attachment.DownloadURL) — the release
+ *    review's R13 finding; the flip rides the v1.5.2 wave together with
+ *    the order pin.
  */
 export async function toApiRelease(d1: D1Database, viewer: Viewer, pair: RepositoryWithOwner, row: ReleaseRow): Promise<Release> {
-  const publisherRow =
+  const [publisherRow, assetRows] = await Promise.all([
     row.publisherId > 0
-      ? await drizzle(d1).select().from(users).where(eq(users.id, row.publisherId)).get()
-      : undefined;
+      ? drizzle(d1).select().from(users).where(eq(users.id, row.publisherId)).get()
+      : Promise.resolve(undefined),
+    listReleaseAssets(d1, row.id),
+  ]);
   const author: User | null = publisherRow === undefined ? null : apiUserFromRow(publisherRow, viewer);
   const urls = releaseUrls(pair, viewer.origin, row);
   return {
@@ -755,6 +780,6 @@ export async function toApiRelease(d1: D1Database, viewer: Viewer, pair: Reposit
     created_at: isoOrZero(row.createdAt),
     published_at: row.isDraft ? null : row.publishedUnix === 0 ? null : new Date(row.publishedUnix * 1000).toISOString(),
     author,
-    assets: [],
+    assets: assetRows.map((assetRow) => toApiAttachment(viewer.origin, assetRow)),
   };
 }

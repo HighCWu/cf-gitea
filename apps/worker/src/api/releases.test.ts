@@ -47,6 +47,15 @@
  * tag) answer the upstream UNMAPPED 500 (ctx.APIErrorInternal, release.go:
  * 379-382) with row and refs untouched. The webhook action mapping follows
  * the same fork: tagCreated → "published", otherwise "updated".
+ *
+ * The assets-render wave (this change) — toApiRelease now loads the
+ * release's attachment rows (upstream ToAPIRelease renders Attachments over
+ * LoadAttributes → GetReleaseAttachments, models/repo/release.go:111-127,
+ * :389-449): list/latest/by-tag/by-id AND the `release` webhook payload
+ * carry them, in OUR renderer's asset-id order (the attachment-list route's
+ * own read; upstream orders by name, release.go:417), with the uuid
+ * browser_download_url (upstream's unique-name /releases/download/{tag}/
+ * {name} — the release review's R13 finding — rides the v1.5.2 wave).
  */
 
 import { env } from "cloudflare:workers";
@@ -961,6 +970,97 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
 });
 
 // ---------------------------------------------------------------------------
+// Release assets in the release payloads (upstream ToAPIRelease renders
+// Attachments over LoadAttributes → GetReleaseAttachments, models/repo/
+// release.go:111-127,389-449): every read that renders the converter —
+// list, latest, by-tag, by-id — carries the release's attachment rows.
+// Pinned in OUR renderer's order (asset-id ascending — the attachment-list
+// route's own read via listReleaseAssets); upstream orders by name
+// (release.go:417). browser_download_url keeps the uuid shape (upstream's
+// unique-name /releases/download/{tag}/{name} — the release review's R13
+// finding — rides the v1.5.2 wave).
+// ---------------------------------------------------------------------------
+
+/** Two assets on one release, seeded so id order and name order DISAGREE
+ *  (the first row carries the later name): the render pins id order (ours),
+ *  not upstream's name order. */
+async function seedAssets(releaseId: number): Promise<void> {
+  await drizzle(env.DB).insert(releaseAssets).values([
+    {
+      uuid: "asset-u-late-name",
+      repoId: "7301",
+      releaseId,
+      name: "zeta.zip",
+      size: 30,
+      r2Key: "repos/r_7301/release-assets/asset-u-late-name",
+      createdAt: new Date(),
+    },
+    {
+      uuid: "asset-u-early-name",
+      repoId: "7301",
+      releaseId,
+      name: "alpha.zip",
+      size: 20,
+      r2Key: "repos/r_7301/release-assets/asset-u-early-name",
+      createdAt: new Date(),
+    },
+  ]);
+}
+
+describe("release assets render in the release payloads (ToAPIRelease attachments)", () => {
+  let assetReleaseId = 0;
+
+  beforeEach(async () => {
+    await seedRelease({ tag: "plain-v1", minutesOffset: 0 });
+    // The asset release is the NEWER published release, so it is also the
+    // latest-release read's answer.
+    assetReleaseId = await seedRelease({ tag: "asset-v1", minutesOffset: 1 });
+    await seedAssets(assetReleaseId);
+  });
+
+  it("GET by id renders both assets (id order — ours; upstream orders by name)", async () => {
+    const res = await makeApp()(`${REPO_PATH}/releases/${assetReleaseId}`);
+    expect(res.status).toBe(200);
+    const body = await res.json<{
+      assets: Array<{ id: number; name: string; uuid: string; size: number; download_count: number; browser_download_url: string }>;
+    }>();
+    expect(body.assets.map((a) => a.name)).toEqual(["zeta.zip", "alpha.zip"]); // id order, NOT upstream's name order
+    expect(body.assets.map((a) => a.uuid)).toEqual(["asset-u-late-name", "asset-u-early-name"]);
+    expect(body.assets[0]).toMatchObject({
+      size: 30,
+      download_count: 0,
+      browser_download_url: "https://example.com/attachments/asset-u-late-name", // the uuid shape (R13 pending)
+    });
+  });
+
+  it("GET by tag renders both assets", async () => {
+    const res = await makeApp()(`${REPO_PATH}/releases/tags/asset-v1`);
+    expect(res.status).toBe(200);
+    expect((await res.json<{ assets: Array<{ name: string }> }>()).assets.map((a) => a.name)).toEqual([
+      "zeta.zip",
+      "alpha.zip",
+    ]);
+  });
+
+  it("the list carries the assets per release and [] for the asset-less release", async () => {
+    const res = await makeApp()(`${REPO_PATH}/releases`);
+    expect(res.status).toBe(200);
+    const body = await res.json<Array<{ tag_name: string; assets: Array<{ name: string }> }>>();
+    const assetsByTag = Object.fromEntries(body.map((r) => [r.tag_name, r.assets.map((a) => a.name)]));
+    expect(assetsByTag["asset-v1"]).toEqual(["zeta.zip", "alpha.zip"]);
+    expect(assetsByTag["plain-v1"]).toEqual([]);
+  });
+
+  it("latest renders the assets too (the newest non-draft non-prerelease release)", async () => {
+    const res = await makeApp()(`${REPO_PATH}/releases/latest`);
+    expect(res.status).toBe(200);
+    const body = await res.json<{ tag_name: string; assets: Array<{ name: string }> }>();
+    expect(body.tag_name).toBe("asset-v1");
+    expect(body.assets.map((a) => a.name)).toEqual(["zeta.zip", "alpha.zip"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // `release` webhook emissions (upstream sendReleaseHook:879 — NewRelease:889
 // "published" / UpdateRelease:893 "updated" / DeleteRelease:897 "deleted",
 // all gated on `!rel.IsDraft`, services/release/release.go:198,358,435).
@@ -993,6 +1093,31 @@ describe("release webhook emissions (repoCreateRelease/repoEditRelease/repoDelet
     expect(payload.repository).toMatchObject({ full_name: "cf-gitea-stub/rel" });
     expect(payload.sender).toMatchObject({ login: "cf-gitea-stub" });
     expect(delivery.payloadContent).toContain('\n  "action": "published"'); // 2-space §2.7 serialization
+  });
+
+  it("the webhook payload's release carries the attachment rows (rendered through the same converter)", async () => {
+    const hookId = await seedHook("7301", ["release"]);
+    // ride-tag: the PATCH rides the pre-existing ref (tagCreated=false →
+    // "updated"), so no ref cleanup is needed for idempotency.
+    const releaseId = await seedRelease({ tag: "ride-tag", minutesOffset: 0 });
+    await seedAssets(releaseId);
+
+    const res = await makeApp()(`${REPO_PATH}/releases/${releaseId}`, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ name: "Assets ride" }),
+    });
+    expect(res.status).toBe(200);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as {
+      action: string;
+      release: { assets: Array<{ name: string; browser_download_url: string }> };
+    };
+    expect(payload.action).toBe("updated");
+    expect(payload.release.assets.map((a) => a.name)).toEqual(["zeta.zip", "alpha.zip"]);
+    expect(payload.release.assets[0]?.browser_download_url).toBe("https://example.com/attachments/asset-u-late-name");
   });
 
   it("emits `updated` on a riding edit and `published` on a tag-creating edit (upstream isTagCreated fork, release.go:361-367)", async () => {
