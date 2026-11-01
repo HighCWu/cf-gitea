@@ -39,17 +39,22 @@
  *    adopted; every malformed or CRC-failing stream is the plain-error
  *    class (upstream's bzip2/tar/json errors are not ErrInvalidArgument —
  *    conda.go:218-224 sends them to the 500 arm).
- * 2. `.conda` parse — ParsePackageConda (metadata.go:101-130) needs zip +
- *    a ZSTD decoder for the inner `info-*.tar.zst`; the platform has NO
- *    zstd surface (the SPEC's probe record: DecompressionStream's format
- *    union and worker-configuration.d.ts both lack it) and Go's stdlib has
- *    neither (upstream rides klauspost/compress). THE HONEST REDUCTION:
- *    every `.conda` upload answers the family's invalid-structure sentinel
- *    (ErrInvalidArgument → the 400 arm) — the shape a valid-zip-without-
- *    info-member already gets upstream; upstream's 201-valid /
- *    400-no-info-member / 500-corrupt-zip triple collapses to one 400
- *    because no `.conda` can ever parse here. Reopen trigger: a zstd
- *    decoder unit.
+ * 2. `.conda` parse — ADOPTED (2026-11-01, the wall's recorded reopen
+ *    trigger landed: the dedicated zstd-decoder unit). ParsePackageConda
+ *    (metadata.go:101-130) rides the family-local EOCD + central-directory
+ *    zip walk (the tar-scan idiom of the landed cran/nuget readers: stored
+ *    + deflate members, CRC32-gated at data EOF, zip64 out of scope under
+ *    the upload cap) over `info-*.tar.zst` and the vendored zstd DECODER
+ *    (./zstd.ts — the format-doc port with facebook/zstd's C decoder as
+ *    the algorithm reference, XXH-64 checksums verified, dictionaries/
+ *    legacy frames rejected, skippable frames passed through, concatenated
+ *    frames decoded in sequence) into the SAME parsePackageTar walk the
+ *    `.tar.bz2` arm runs; the arm sets FileMetadata.IsCondaPackage = true
+ *    (metadata.go:122-124), which flips the stored extension to `.conda`
+ *    (conda.go:239-242) and the repodata split to `packages.conda`. A zip
+ *    with no `info-*.tar.zst` member is the invalid-structure sentinel
+ *    (metadata.go:129); zip/zstd/tar/json failures stay the plain-error
+ *    500 class (conda.go:218-224).
  * 3. `repodata.json.bz2` serving — ADOPTED (the wall's reopen trigger
  *    landed): the pin serves the `.bz2` variants (conda.go:44's switch +
  *    conda.go:170-183's bzip2 writer — upstream rides
@@ -96,9 +101,10 @@ import {
 } from "./blobs";
 import { writeVersionMetadata } from "./protocol-common";
 import { DuplicatePackageFileError } from "./generic";
-import { readTarMembers } from "./distro-common";
+import { readTarMembers, crc32 } from "./distro-common";
 import { bzip2Decompress } from "./bz2";
 import { bzip2Compress } from "./bz2-encode";
+import { zstdDecompress } from "./zstd";
 
 // ---------------------------------------------------------------------------
 // The module constants (modules/packages/conda/metadata.go:26-31)
@@ -341,27 +347,18 @@ export function isCondaPackageFileName(filename: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// The parse (metadata.go:93-217) — the tar walk over the decoded bz2
+// The parse (metadata.go:93-217) — the tar walk shared by both container
+// arms (the containers differ; parsePackageTar is one function upstream)
 // ---------------------------------------------------------------------------
 
 /**
- * ParsePackageBZ2 (metadata.go:94-98): bzip2 decode (the vendored port —
- * Bzip2Error is the plain-error class like Go's reader) + the tar walk.
+ * parsePackageTar (metadata.go:132-217) over the decoded tar: walks the
+ * regular-file members for `info/index.json` (REQUIRED — its absence is
+ * ErrInvalidStructure) and `info/about.json` (optional, zero-filled),
+ * each through the ≤ 32 MiB metadata bound (limited_reader.go:14), the
+ * name/version gates on index decode, and the about-URL validation.
  */
-export function parseCondaPackageTarBz2(bytes: Uint8Array): CondaPackage {
-  let inflated: Uint8Array;
-  try {
-    inflated = bzip2Decompress(bytes);
-  } catch {
-    throw new CondaArchiveError();
-  }
-  let members: ReturnType<typeof readTarMembers>;
-  try {
-    members = readTarMembers(inflated);
-  } catch {
-    throw new CondaArchiveError();
-  }
-
+function parseCondaTarMembers(members: ReturnType<typeof readTarMembers>): CondaPackage {
   let index: CondaRecord | null = null;
   let about: CondaRecord | null = null;
   for (const member of members) {
@@ -408,6 +405,204 @@ export function parseCondaPackageTarBz2(bytes: Uint8Array): CondaPackage {
       timestamp: condaInt(index, "timestamp"),
     },
   };
+}
+
+/**
+ * ParsePackageBZ2 (metadata.go:94-98): bzip2 decode (the vendored port —
+ * Bzip2Error is the plain-error class like Go's reader) + the tar walk.
+ */
+export function parseCondaPackageTarBz2(bytes: Uint8Array): CondaPackage {
+  let inflated: Uint8Array;
+  try {
+    inflated = bzip2Decompress(bytes);
+  } catch {
+    throw new CondaArchiveError();
+  }
+  let members: ReturnType<typeof readTarMembers>;
+  try {
+    members = readTarMembers(inflated);
+  } catch {
+    throw new CondaArchiveError();
+  }
+  return parseCondaTarMembers(members);
+}
+
+// ---------------------------------------------------------------------------
+// The `.conda` container (metadata.go:101-130) — the outer zip + the inner
+// zstd'd tar. The zip walk is the family-local tar-scan idiom (the landed
+// cran/nuget readers): an EOCD + central-directory scan, stored (method 0)
+// and deflate (method 8, DecompressionStream("deflate-raw")) members,
+// CRC32-gated at data EOF (Go's archive/zip readDataEOF → checkSum), zip64
+// out of scope under the upload cap. Dictionaries and legacy frames are
+// rejected by the decoder itself; every zip/zstd/tar failure is the
+// plain-error class (→ the 500 arm), a missing `info-*.tar.zst` member the
+// invalid-structure sentinel (metadata.go:129 → the 400 arm).
+// ---------------------------------------------------------------------------
+
+const ZIP_EOCD_SIGNATURE = 0x06054b50;
+const ZIP_CD_SIGNATURE = 0x02014b50;
+const ZIP_LOCAL_SIGNATURE = 0x04034b50;
+
+function zipU16(bytes: Uint8Array, offset: number): number {
+  return (bytes[offset] as number) | ((bytes[offset + 1] as number) << 8);
+}
+
+function zipU32(bytes: Uint8Array, offset: number): number {
+  return (
+    (bytes[offset] as number) |
+    ((bytes[offset + 1] as number) << 8) |
+    ((bytes[offset + 2] as number) << 16) |
+    ((bytes[offset + 3] as number) << 24)
+  ) >>> 0;
+}
+
+interface CondaZipMember {
+  name: string;
+  method: number;
+  crc32: number;
+  compressedSize: number;
+  uncompressedSize: number;
+  localHeaderOffset: number;
+}
+
+/** The central-directory scan (zip.NewReader's readDirectory). */
+function readCondaZipMembers(bytes: Uint8Array): CondaZipMember[] {
+  if (bytes.byteLength < 22) throw new Error("zip: not a valid zip file");
+  // The EOCD lives in the last 22 + 65535 bytes (max comment length).
+  const window = Math.min(bytes.byteLength, 22 + 65535);
+  let eocdAt = -1;
+  for (let i = bytes.byteLength - 22; i >= bytes.byteLength - window; i--) {
+    if (zipU32(bytes, i) === ZIP_EOCD_SIGNATURE) {
+      eocdAt = i;
+      break;
+    }
+  }
+  if (eocdAt < 0) throw new Error("zip: not a valid zip file");
+  const entryCount = zipU16(bytes, eocdAt + 10);
+  const cdSize = zipU32(bytes, eocdAt + 12);
+  const cdOffset = zipU32(bytes, eocdAt + 16);
+  if (cdOffset + cdSize > bytes.byteLength) throw new Error("zip: not a valid zip file");
+  const members: CondaZipMember[] = [];
+  let cursor = cdOffset;
+  for (let i = 0; i < entryCount; i++) {
+    if (cursor + 46 > bytes.byteLength || zipU32(bytes, cursor) !== ZIP_CD_SIGNATURE) {
+      throw new Error("zip: not a valid zip file");
+    }
+    const flags = zipU16(bytes, cursor + 8);
+    const nameLength = zipU16(bytes, cursor + 28);
+    const nameBytes = bytes.subarray(cursor + 46, cursor + 46 + nameLength);
+    let name: string;
+    if ((flags & 0x800) !== 0) {
+      name = new TextDecoder().decode(nameBytes);
+    } else {
+      name = "";
+      for (const byte of nameBytes) name += String.fromCharCode(byte);
+    }
+    members.push({
+      name,
+      method: zipU16(bytes, cursor + 10),
+      crc32: zipU32(bytes, cursor + 16),
+      compressedSize: zipU32(bytes, cursor + 20),
+      uncompressedSize: zipU32(bytes, cursor + 24),
+      localHeaderOffset: zipU32(bytes, cursor + 42),
+    });
+    cursor += 46 + nameLength + zipU16(bytes, cursor + 30) + zipU16(bytes, cursor + 32);
+  }
+  return members;
+}
+
+/** One member's data, CRC-verified at data EOF (readDataEOF → checkSum). */
+async function readCondaZipMember(bytes: Uint8Array, member: CondaZipMember): Promise<Uint8Array> {
+  if (
+    member.localHeaderOffset + 30 > bytes.byteLength ||
+    zipU32(bytes, member.localHeaderOffset) !== ZIP_LOCAL_SIGNATURE
+  ) {
+    throw new Error("zip: invalid local header");
+  }
+  const nameLength = zipU16(bytes, member.localHeaderOffset + 26);
+  const extraLength = zipU16(bytes, member.localHeaderOffset + 28);
+  const dataStart = member.localHeaderOffset + 30 + nameLength + extraLength;
+  const compressed = bytes.subarray(dataStart, dataStart + member.compressedSize);
+  const checkSum = (data: Uint8Array): Uint8Array => {
+    if (crc32(data) !== member.crc32) throw new Error("zip: checksum error");
+    return data;
+  };
+  if (member.method === 0) {
+    return checkSum(compressed.slice());
+  }
+  if (member.method === 8) {
+    const inflated = new Response(compressed.slice()).body!.pipeThrough(
+      new DecompressionStream("deflate-raw"),
+    );
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    const reader = inflated.getReader();
+    for (;;) {
+      const read = await reader.read();
+      if (read.done) break;
+      total += read.value.byteLength;
+      // The zip-bomb gate: the claimed uncompressed size bounds the output.
+      if (total > member.uncompressedSize) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The stream may already be errored.
+        }
+        throw new Error("zip: decompressed size exceeds the entry's recorded size");
+      }
+      chunks.push(read.value);
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return checkSum(out);
+  }
+  throw new Error(`zip: unsupported compression method ${member.method}`);
+}
+
+/**
+ * ParsePackageConda (metadata.go:101-130): the outer zip's `info-*.tar.zst`
+ * member, zstd-decoded (the vendored port) into the shared tar walk, with
+ * FileMetadata.IsCondaPackage = true (metadata.go:122-124 — the flag that
+ * stores the file as `.conda` and renders it under `packages.conda`).
+ */
+export async function parseCondaPackageConda(bytes: Uint8Array): Promise<CondaPackage> {
+  let members: CondaZipMember[];
+  try {
+    members = readCondaZipMembers(bytes);
+  } catch {
+    throw new CondaArchiveError();
+  }
+  // metadata.go:107-108 — the FIRST `info-`/`.tar.zst` member wins.
+  const infoMember = members.find(
+    (member) => member.name.startsWith("info-") && member.name.endsWith(".tar.zst"),
+  );
+  if (infoMember === undefined) throw new CondaInvalidStructureError();
+
+  let memberData: Uint8Array;
+  try {
+    memberData = await readCondaZipMember(bytes, infoMember);
+  } catch {
+    throw new CondaArchiveError();
+  }
+  let inflated: Uint8Array;
+  try {
+    inflated = zstdDecompress(memberData);
+  } catch {
+    throw new CondaArchiveError();
+  }
+  let tarMembers: ReturnType<typeof readTarMembers>;
+  try {
+    tarMembers = readTarMembers(inflated);
+  } catch {
+    throw new CondaArchiveError();
+  }
+  const parsed = parseCondaTarMembers(tarMembers);
+  parsed.fileMetadata.is_conda = true;
+  return parsed;
 }
 
 // ---------------------------------------------------------------------------
@@ -787,22 +982,17 @@ async function writeCondaFileProperties(
 
 /**
  * UploadPackageFile's store walk (conda.go:189-294): the filename gate,
- * the `.conda` wall arm (wall 2's reduction — the invalid-structure
- * sentinel BEFORE any spool), the spool → parse → size-quota → create
- * chain. CreatePackageOrAddFileToExisting: the package properties ride
- * package creation, the version metadata rides version creation, and ANY
- * duplicate (version, file, composite-key) row is the
- * ErrDuplicatePackageFile 409 (no OverwriteExisting).
+ * the spool → parse (the container dispatch by suffix, conda.go:213-217)
+ * → size-quota → create chain. CreatePackageOrAddFileToExisting: the
+ * package properties ride package creation, the version metadata rides
+ * version creation, and ANY duplicate (version, file, composite-key) row
+ * is the ErrDuplicatePackageFile 409 (no OverwriteExisting).
  */
 export async function uploadCondaPackageFile(input: UploadCondaPackageInput): Promise<UploadCondaPackageResult> {
   const now = input.now ?? new Date();
   if (!isCondaPackageFileName(input.filename)) {
     // Unreachable through the route (it gates first, conda.go:191-194) —
     // kept so the service alone still refuses foreign names.
-    throw new CondaInvalidStructureError();
-  }
-  if (input.filename.endsWith(".conda")) {
-    // Wall 2 — the zstd reduction (see the module header).
     throw new CondaInvalidStructureError();
   }
   if (!input.doer.isAdmin && input.quota.limitTotalOwnerCount > UNLIMITED_QUOTA) {
@@ -827,7 +1017,10 @@ export async function uploadCondaPackageFile(input: UploadCondaPackageInput): Pr
     }
     const bytes = new Uint8Array(await spoolObject.arrayBuffer());
 
-    const parsed = parseCondaPackageTarBz2(bytes);
+    // conda.go:213-217 — the container dispatch by filename suffix.
+    const parsed = input.filename.endsWith(".conda")
+      ? await parseCondaPackageConda(bytes)
+      : parseCondaPackageTarBz2(bytes);
 
     await checkSizeQuotaExceeded(input.d1, input.doer.isAdmin, input.owner.id, CONDA_PACKAGE_TYPE, bytes.byteLength, input.quota);
 

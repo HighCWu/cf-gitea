@@ -14,6 +14,12 @@
  *    shape), and the decode-error class (a string build_number, an array
  *    document, a non-string depends element) vs the JSON-null no-op corner
  *    (null index decodes to the zero struct → the name gate);
+ *  - the `.conda` parse (wall 2 ADOPTED): REAL conda containers authored
+ *    with python's tarfile + zstandard(3) + zipfile at write time —
+ *    stored- and deflate-member zips over `info-*.tar.zst`, the
+ *    is_conda=true flip, the no-info-member structure sentinel, the
+ *    corrupt-zip / broken-inner-zstd archive classes, and the name gate
+ *    through the container;
  *  - the metadata JSON renders: the FileMetadata/VersionMetadata tag order
  *    with the omitempty sweep (is_conda always present);
  *  - the upload: rows under the channel-prefixed package name, the
@@ -21,8 +27,7 @@
  *    composite key, the conda.name/channel/subdir/metadata properties (the
  *    EMPTY-channel row included), the version metadata written at VERSION
  *    creation only (a second file does NOT rewrite it), the duplicate
- *    stored name 409, the `.conda` wall arm (the invalid-structure 400
- *    class), blob dedupe + the R2 content-key byte parity;
+ *    stored name 409, blob dedupe + the R2 content-key byte parity;
  *  - the repodata: the exact RepoData render (struct order, the Go map-key
  *    sort, the trailing newline), the empty-404 null, the channel/subdir
  *    filters, the is_conda split, the md5 "" render (no WebCrypto MD5);
@@ -59,6 +64,7 @@ import {
   isCondaPackageFileName,
   loadCondaFileMetadata,
   openCondaFileForDownload,
+  parseCondaPackageConda,
   parseCondaPackageTarBz2,
   searchCondaFiles,
   uploadCondaPackageFile,
@@ -151,6 +157,26 @@ const F11_BAD_DEPENDS = "QlpoOTFBWSZTWbtZUfIAAK17g8KQACBQBf+QIAp/f9/aQAAABAAIMAC
 /** numpy 1.26.0 again — build py3h_1, license_family PATENT (the
  *  second-file arm: same package + version, a NEW stored file). */
 const F12_SECOND_BUILD = "QlpoOTFBWSZTWTEwJvQAAT7/gsyRACBQB//3PgFsCv/33+pAAAAIMAGbSttQalGmnpDRpk00xGjIMTIwTJphGmAymSYpmmppkyhkaNADIGhobUDIEkiammUxp6jQmCMmagNAaNGEBpx1LYUXokIKdwkmlABYLtMor5NfVD5YKuK4mAgIBuCAKdhQ1bQ6FOJvBq0bb4Oz0I9E2Ky/Cuv4+W/U4XNAfzJ6YYczm9nA6mpRZbGF2+d/n4d1p+Rt/3LiMk3XFPfF0HGPOVCtJZ+Ft4ltMPTUghBJyc4WJV3TX5G6ZgMB7ROcbQZ6B3YImY+OrzgX3ZgrBRmMWmSAXVJOCEkpdsxNc8Zq6ncKtlu3kKpMtPrHdIUb/LdIZrJtqpXyZYl5JLXyk695v0AB6PsTWgyE0IgkQ/jEVprOCk0+kDFmEQz3sFsLUVyDRA2MkIv07gZPYWYRaIrB33/VwDHWKPekeU/uAtg0mCMWdhgz2ZD0VpMrAxgpkZSFONVCO9lxhjxWH5cUqeu4wmIaLCrqVrErAlud7q2lXcIsn4kCCsjQCbXahPbV5XGr3TTQ9kYSxxVMhbs6FxTWrhCE2qJezORnKpeRID/F3JFOFCQMTAm9AA==";
+
+// --- the `.conda` container fixtures (wall 2 ADOPTED) — REAL conda
+// containers: python tarfile + zstandard(3) + zipfile at authoring time,
+// embedded base64 (the stored-member and deflate-member zip shapes; the
+// inner tar carries info/index.json + info/about.json exactly as the
+// `.tar.bz2` fixtures do). numpy 1.26.0, build py3h_2 (build_number 2).
+const F_CONDA_NUMPY = "UEsDBBQAAAAAAOt8YV1a79KcwQEAAMEBAAATAAAAaW5mby05ZjJjMWQudGFyLnpzdCi1L/1gACe9DQAmmU0iME31g4pyU1JCfQS6Y3Ueq+VByXrtwRK6tml7K6SBg4EWFEQARwBCAND0hvEwBCYmV1szxsIUn/ErlFiMrIrK64udBWXzRdF91Gb/Nh9N02il6UajWQIa5WCYpru7aRjd3YfPh2AT8HlMZuQxM7KNogoNCBUVZYueBf82KmHBLBQaEN6hi9Ri5GEBMIVbs1YYQ4AMMKbAgH1OtqLLgZ31zyGFbzGysLMqhOT1Z3kmpqKPijf2UjkduxhF6zC65zojhlKLcI0y1axD2Z7fiOFk+SNXDPIuWBqre/iWVuydUDsquqGws6hs9qGMdlHjg+5PXI+UrAErcfO5+RI5HYPuZKNE1ftIwJdIdbIkcZ5aO83prYMQ0OTnjZF/dTpYGXnJY7XPyEse/6GblXLVaj2oTcr7TPIYMiCAApFjxMADEAA8GMMv1UhbgIWmmpT7HkhMAGFYhs5gL98kg+Ho/QgyAP8tx+2iUW1B+7hcpsr0Gp70AyTYsKMY2VWZIcwqeGhjcFaMQILh2s8UrRqQ9VenZi8tJO8PL3s+dktxCbrFW+twi7KBrDnA48ONLMVxDJcRE1gCUEsDBBQAAAAAAOt8YV17J4PqWgAAAFoAAAASAAAAcGtnLTlmMmMxZC50YXIuenN0KLUv/WAAJ4UCAHQDbGliL2xpYmRlbW8uc28AMDAwMDY0NDAwMDE3NTAAMTQ1MjQ3NzA0MTA1MzYAIDB1c3RhcgAwMAgA3CbHAwAyICEgZrihLAVwrFyGTKAOUEsBAhQDFAAAAAAA63xhXVrv0pzBAQAAwQEAABMAAAAAAAAAAAAAAIABAAAAAGluZm8tOWYyYzFkLnRhci56c3RQSwECFAMUAAAAAADrfGFdeyeD6loAAABaAAAAEgAAAAAAAAAAAAAAgAHyAQAAcGtnLTlmMmMxZC50YXIuenN0UEsFBgAAAAACAAIAgQAAAHwCAAAAAA==";
+// the deflate-member zip twin (method 8 members through DecompressionStream).
+const F_CONDA_NUMPY_DEFLATED = "UEsDBBQAAAAIAOt8YV1a79KcxgEAAMEBAAATAAAAaW5mby1hYmMxMjMudGFyLnpzdAHBAT7+KLUv/WAAJ70NACaZTSIwTfWDinJTUkJ9BLpjdR6r5UHJeu3BErq2aXsrpIGDgRYURABHAEIA0PSG8TAEJiZXWzPGwhSf8SuUWIysisrri50FZfNF0X3UZv82H03TaKXpRqNZAhrlYJimu7tpGN3dh8+HYBPweUxm5DEzso2iCg0IFRVli54F/zYqYcEsFBoQ3qGL1GLkYQEwhVuzVhhDgAwwpsCAfU62osuBnfXPIYVvMbKwsyqE5PVneSamoo+KN/ZSOR27GEXrMLrnOiOGUotwjTLVrEPZnt+I4WT5I1cM8i5YGqt7+JZW7J1QOyq6obCzqGz2oYx2UeOD7k9cj5SsAStx87n5Ejkdg+5ko0TV+0jAl0h1siRxnlo7zemtgxDQ5OeNkX91OlgZecljtc/ISx7/oZuVctVqPahNyvtM8hgyIIACkWPEwAMQADwYwy/VSFuAhaaalPseSEwAYViGzmAv3ySD4ej9CDIA/y3H7aJRbUH7uFymyvQanvQDJNiwoxjZVZkhzCp4aGNwVoxAguHazxStGpD1V6dmLy0k7w8vez52S3EJusVb63CLsoGsOcDjw40sxXEMlxETWAJQSwMEFAAAAAgA63xhXXsng+pXAAAAWgAAABIAAABwa2ctYWJjMTIzLnRhci56c3TT2Kr/N4FBvZWJoYQ5JzNJH4hTUnPz9YrzGQyAwMzEBEgampsaMBiamBqZmJsbmBgamBqbMSgYlBaXJBYBVXEw3FE7zsxgpKCokLZjoQ5rwZqYNp8FfABQSwECFAMUAAAACADrfGFdWu/SnMYBAADBAQAAEwAAAAAAAAAAAAAAgAEAAAAAaW5mby1hYmMxMjMudGFyLnpzdFBLAQIUAxQAAAAIAOt8YV17J4PqVwAAAFoAAAASAAAAAAAAAAAAAACAAfcBAABwa2ctYWJjMTIzLnRhci56c3RQSwUGAAAAAAIAAgCBAAAAfgIAAAAA";
+// a zip with NO `info-*.tar.zst` member — the invalid-structure sentinel.
+const F_CONDA_NOINFO = "UEsDBBQAAAAAAOt8YV17J4PqWgAAAFoAAAAQAAAAcGtnLW9ubHkudGFyLnpzdCi1L/1gACeFAgB0A2xpYi9saWJkZW1vLnNvADAwMDA2NDQwMDAxNzUwADE0NTI0NzcwNDEwNTM2ACAwdXN0YXIAMDAIANwmxwMAMiAhIGa4oSwFcKxchkygDlBLAQIUAxQAAAAAAOt8YV17J4PqWgAAAFoAAAAQAAAAAAAAAAAAAACAAQAAAABwa2ctb25seS50YXIuenN0UEsFBgAAAAABAAEAPgAAAIgAAAAAAA==";
+// a truncated zip — the corrupt-archive class.
+const F_CONDA_CORRUPT = "UEsDBBQAAAAAAOt8YV1a79KcwQEAAMEBAAATAAAAaW5mby05ZjJjMWQudGFyLnpzdCi1L/1gACe9DQAmmU0iME31g4pyU1JCfQS6Y3Ueq+VByXrtwRK6tml7K6SBg4EWFEQARwBCAND0hvEwBCYmV1szxsIUn/ErlFiMrIrK64udBWXzRdF91Gb/Nh9N02il6UajWQIa5WCYpru7aRjd3YfPh2AT8HlMZuQxM7KNogoNCBUVZYueBf82KmHBLBQaEN6hi9Ri5GEBMIVbs1YYQ4AMMKbAgH1OtqLLgZ31zyGFbzGysLMqhOT1Z3kmpqKPijf2UjkduxhF6zC65zojhlKLcI0y1axD2Z7fiOFk+SNXDPIuWBqre/iWVuydUDsquqGws6hs9qGMdlHjg+5PXI+UrAErcfO5+RI5HYPuZKNE1ftIwJdIdbIkcZ5aO83prYMQ0OTnjZF/dTpYGXnJY7XPyEse/6GblXLVaj2oTcr7TPIYMiCAApFjxMADEAA8GMMv1UhbgIW";
+// a valid zip whose `info-*.tar.zst` member holds garbage — the zip CRC
+// is clean, the inner zstd stream is not (the broken-inner-zstd class).
+const F_CONDA_BADZST = "UEsDBBQAAAAAAPd8YV2eKdZ/gAAAAIAAAAARAAAAaW5mby1iYWQxLnRhci56c3SZESIzmREiM5kRIjOZESIzmREiM5kRIjOZESIzmREiM5kRIjOZESIzmREiM5kRIjOZESIzmREiM5kRIjOZESIzmREiM5kRIjOZESIzmREiM5kRIjOZESIzmREiM5kRIjOZESIzmREiM5kRIjOZESIzmREiM5kRIjOZESIzmREiM5kRIjOZESIzmREiM1BLAQIUAxQAAAAAAPd8YV2eKdZ/gAAAAIAAAAARAAAAAAAAAAAAAACAAQAAAABpbmZvLWJhZDEudGFyLnpzdFBLBQYAAAAAAQABAD8AAACvAAAAAAA=";
+// the name gate through the container: index.json name "NumPy".
+const F_CONDA_BADNAME = "UEsDBBQAAAAAAPd8YV3TU02ufAAAAHwAAAAUAAAAaW5mby1iYWRuYW1lLnRhci56c3QotS/9YAAnlQMAosUTGXBJdTAVqqFoTA6mYrh6l7WkbdoQhKpqsAwNdUGnmHUMvpVQcuiC0OJAiUBXU6sMO59CwGiSf7K5U/oJ3CS6bftHtp3r4KEoVmEZwBmWBQsA+gR4oDVYxL1pDTdHWQAyzAEeZrihLAVwrFxGTGAJUEsBAhQDFAAAAAAA93xhXdNTTa58AAAAfAAAABQAAAAAAAAAAAAAAIABAAAAAGluZm8tYmFkbmFtZS50YXIuenN0UEsFBgAAAAABAAEAQgAAAK4AAAAAAA==";
+// numpy 1.26.0 build py3h_1 — the second-build arm through the container.
+const F_CONDA_NUMPY2 = "UEsDBBQAAAAAAOt8YV3tQUGhwgEAAMIBAAATAAAAaW5mby1hYWExMTEudGFyLnpzdCi1L/1gACfFDQAm2U0jIG31YyrlZqWE+gh0x2pjIBqA+Y1X1ym06qb3BEklQQCBsAFEAEcAQgDQ9IbxMAQek6utGWPBFp/xK4xYnKyKyuuLnQVl8yXRjdRm/zYjTdPopelGo1kENAvCME13d9MwursRn//AHvB5VGbkMTOyjaIJDI6KirJFz4J/G4WgYBQJDI536CK1OHFYAGzh1qwXxhAkA4wpMGCfk63oamBn/XNI4VucLNhZFULy+rM8E1PRR8Ub9lI5HbsYReswuuc6I4ZSg3CNMtWsQ9me34jhZPkjVwvyKlgaq3v4Fr3YO6GGTHRjYWdR2exDGa2ixgfdf1yPlKwBS3HzufkUOR2D7mSjRNX7RMCnSHUyRXGeWjvN6a2DD9Dk542Tf3U6WDl5yWO1z8lLHv+hm5Vy1Wo9qE3K+0zyGDIggAKRY8TAAxAAPBjDL9VIW4CFppqU+x5ITABhWIbOYC/fJIPh6P0IMgD/LcftolFtQfu4XKbK9Bqe9AMk2LCjGNlVmSHMKnhoY3BWjECC4drPFK0akPVXp2YvLSTvDy97PnZLcQm6xVvrcIuygaw5wOPDjSzFcQyXERNYAlBLAQIUAxQAAAAAAOt8YV3tQUGhwgEAAMIBAAATAAAAAAAAAAAAAACAAQAAAABpbmZvLWFhYTExMS50YXIuenN0UEsFBgAAAAABAAEAQQAAAPMBAAAAAA==";
 
 const fixtureBytes = (base64: string): Uint8Array => base64ToBytes(base64);
 
@@ -418,16 +444,92 @@ describe("uploadCondaPackageFile (conda.go:189-294)", () => {
     expect(blobs).toHaveLength(1); // one content blob behind both
   });
 
-  it("the `.conda` wall arm: the invalid-structure sentinel BEFORE any store", async () => {
-    await expect(
-      upload(ownerRow, ownerRow.id, {
-        content: streamOf(new TextEncoder().encode("PK\u0003\u0004 whatever")),
-        filename: "numpy.conda",
-      }),
-    ).rejects.toThrow(CondaInvalidStructureError);
-    expect(await db().select().from(packages).all()).toHaveLength(0);
+  it("the `.conda` arm: the full store walk with is_conda=true and the `.conda` stored name", async () => {
+    const bytes = fixtureBytes(F_CONDA_NUMPY);
+    const result = (await upload(ownerRow, ownerRow.id, {
+      content: streamOf(bytes),
+      filename: "numpy.conda",
+    })) as Awaited<ReturnType<typeof uploadCondaPackageFile>>;
+
+    expect(result.pkg.name).toBe("numpy"); // no channel → the bare name
+    expect(result.version.version).toBe("1.26.0");
+    expect(result.file.name).toBe("numpy-1.26.0-py3h_2.conda"); // is_conda → `.conda`
+    expect(result.file.compositeKey).toBe("linux-64");
+    expect(result.file.isLead).toBe(true);
+    expect(result.parsed.fileMetadata.is_conda).toBe(true);
+    expect(result.parsed.fileMetadata.build).toBe("py3h_2");
+    expect(result.parsed.fileMetadata.build_number).toBe(2);
+    expect(result.parsed.versionMetadata.summary).toBe("Array processing for numbers, strings, records, and objects.");
+    expect(result.parsed.versionMetadata.repository_url).toBe("https://github.com/numpy/numpy");
+
+    // The FILE properties carry is_conda=true in the stored metadata JSON.
+    const props = await db().select().from(packageProperties).all();
+    const metadata = props.find((p) => p.refType === PropertyType.File && p.refId === result.file.id && p.name === CONDA_PROPERTY_METADATA)?.value;
+    expect(metadata).toContain('"is_conda":true');
+
+    // The R2 content key carries the exact upload bytes; the spool is gone.
+    const object = await env.REPO_PACKS.get(`packages/blobs/${spooledKey(result.blob.hashSha256)}`);
+    expect(new Uint8Array(await (object as R2ObjectBody).arrayBuffer())).toEqual(bytes);
     const spool = await env.REPO_PACKS.list({ prefix: "packages/tmp/" });
     expect(spool.objects).toHaveLength(0);
+  });
+
+  it("the `.conda` arm: the repodata split rides is_conda (packages.conda)", async () => {
+    await upload(ownerRow, ownerRow.id, { content: streamOf(fixtureBytes(F_CONDA_NUMPY)), filename: "a.conda" });
+    const owner = { id: ownerRow.id, type: "user", visibility: "public" } as const;
+    const body = parseJson<{ packages: Record<string, unknown>; "packages.conda": Record<string, { build: string }> }>(
+      (await buildCondaRepodata(env.DB, owner, "", "linux-64")) as string,
+    );
+    expect(body.packages).toEqual({});
+    expect(Object.keys(body["packages.conda"])).toEqual(["numpy-1.26.0-py3h_2.conda"]);
+    expect(body["packages.conda"]["numpy-1.26.0-py3h_2.conda"]?.build).toBe("py3h_2");
+  });
+
+  it("the `.conda` arm: a duplicate stored name is the 409 class; the version metadata is NOT rewritten", async () => {
+    const first = (await upload(ownerRow, ownerRow.id, {
+      content: streamOf(fixtureBytes(F_CONDA_NUMPY)),
+      filename: "a.conda",
+    })) as Awaited<ReturnType<typeof uploadCondaPackageFile>>;
+    const second = (await upload(ownerRow, ownerRow.id, {
+      content: streamOf(fixtureBytes(F_CONDA_NUMPY2)),
+      filename: "b.conda",
+    })) as Awaited<ReturnType<typeof uploadCondaPackageFile>>;
+    expect(second.version.id).toBe(first.version.id);
+    expect(second.file.name).toBe("numpy-1.26.0-py3h_1.conda");
+    // The bz2 twin of the SAME version still collides on the stored name.
+    await expect(
+      upload(ownerRow, ownerRow.id, { content: streamOf(fixtureBytes(F_CONDA_NUMPY)), filename: "c.conda" }),
+    ).rejects.toThrow(DuplicatePackageFileError);
+  });
+
+  it("the `.conda` arm: the deflate-member zip twin parses identically", async () => {
+    const parsed = await parseCondaPackageConda(fixtureBytes(F_CONDA_NUMPY_DEFLATED));
+    expect(parsed.name).toBe("numpy");
+    expect(parsed.version).toBe("1.26.0");
+    expect(parsed.fileMetadata.is_conda).toBe(true);
+    expect(parsed.fileMetadata.build_number).toBe(2);
+    expect(parsed.versionMetadata.description).toBe("NumPy is the fundamental package for scientific computing.");
+  });
+
+  it("the `.conda` arm: a zip with no info-*.tar.zst member is the invalid-structure sentinel", async () => {
+    await expect(parseCondaPackageConda(fixtureBytes(F_CONDA_NOINFO))).rejects.toThrow(CondaInvalidStructureError);
+    await expect(
+      upload(ownerRow, ownerRow.id, { content: streamOf(fixtureBytes(F_CONDA_NOINFO)), filename: "x.conda" }),
+    ).rejects.toThrow(CondaInvalidStructureError);
+    expect(await db().select().from(packages).all()).toHaveLength(0);
+  });
+
+  it("the `.conda` arm: a corrupt zip and a broken inner zstd stream are the 500 class", async () => {
+    await expect(parseCondaPackageConda(fixtureBytes(F_CONDA_CORRUPT))).rejects.toThrow(CondaArchiveError);
+    await expect(parseCondaPackageConda(fixtureBytes(F_CONDA_BADZST))).rejects.toThrow(CondaArchiveError);
+    await expect(
+      upload(ownerRow, ownerRow.id, { content: streamOf(fixtureBytes(F_CONDA_CORRUPT)), filename: "x.conda" }),
+    ).rejects.toThrow(CondaArchiveError);
+    expect(await db().select().from(packages).all()).toHaveLength(0);
+  });
+
+  it("the `.conda` arm: the name gate rides the container (ErrInvalidName)", async () => {
+    await expect(parseCondaPackageConda(fixtureBytes(F_CONDA_BADNAME))).rejects.toThrow(CondaInvalidNameError);
   });
 
   it("a corrupt archive is the 500 class and stores nothing", async () => {

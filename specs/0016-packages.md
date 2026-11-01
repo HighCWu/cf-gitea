@@ -2276,7 +2276,7 @@ channel-prefixed names, the subdir composite key — an S-M unit once the
 codecs are decided. NOT counted toward the registry's parity claim until
 then: **the registry carries TWENTY-TWO of TWENTY-THREE**.
 
-## As-built — the long-tail `conda` family: the three walls RESOLVED (2026-11-01 — the staged row's decoder adopted; the wall-2 zstd reduction recorded, the wall-3 encoder reduction REOPENED AND ADOPTED the same day; the census claim this section closes: **TWENTY-THREE of TWENTY-THREE**)
+## As-built — the long-tail `conda` family: the three walls RESOLVED (2026-11-01 — the staged row's decoder adopted; the wall-3 encoder reduction REOPENED AND ADOPTED the same day; the wall-2 zstd reduction REVERSED AND ADOPTED at the zstd-decoder unit the same day; the census claim this section closes: **TWENTY-THREE of TWENTY-THREE**)
 
 The STAGED section above named three Workers codec walls; this unit
 adjudicated each with the BUILD-or-record discipline (upstream parity is
@@ -2298,21 +2298,53 @@ documented reduction):
    exactly like Go's json.Decode failure; a JSON-`null` index is the
    decode no-op — upstream nil-panics at `i.Name`, our port answers the
    invalid-name 400, the documented divergence on a crash arm).
-2. **`.conda` upload parse — RECORDED REDUCTION (wall 2).** Verified
-   against the pin first: the pin DOES accept `.conda`
-   (conda.go:37-39, the conda.go:215-216 dispatch → ParsePackageConda,
-   metadata.go:101-130) — zip + a ZSTD decoder for the inner
-   `info-*.tar.zst`. The platform has no zstd surface (the bz2 as-
-   built's probe record: the DecompressionStream union and
-   worker-configuration.d.ts both lack it) and Go's stdlib has neither
-   (upstream rides klauspost/compress); a full zstd decoder port is out
-   of a family unit's scope. THE REDUCTION: every `.conda` upload
-   answers the family's invalid-structure sentinel
-   (`CondaInvalidStructureError` → the 400 arm, conda.go:218-220's
-   ErrInvalidArgument shape) BEFORE any spool — upstream's 201-valid /
-   400-no-info-member / 500-corrupt-zip triple collapses to one 400
-   because no `.conda` can ever parse here. REOPEN TRIGGER: a zstd
-   decoder unit.
+2. **`.conda` upload parse — ADOPTED (2026-11-01, the wall's recorded
+   reopen trigger landed: the dedicated zstd-decoder unit; the earlier
+   "every `.conda` upload answers the invalid-structure 400" reduction is
+   REVERSED — the reduction was the honest answer while no decoder
+   existed, and it is history now, do not restore it).** ParsePackageConda
+   (metadata.go:101-130) rides the family-local EOCD +
+   central-directory zip walk in conda.ts (the landed cran/nuget
+   tar-scan idiom: stored + deflate members — deflate through
+   DecompressionStream("deflate-raw") — CRC32-gated at data EOF, Go's
+   archive/zip readDataEOF → checkSum; zip64 out of scope under the
+   upload cap) over the FIRST `info-`-prefixed, `.tar.zst`-suffixed
+   member, into the vendored zstd decoder `services/packages/zstd.ts`
+   and the SAME parsePackageTar walk the `.tar.bz2` arm runs; the arm
+   sets `FileMetadata.IsCondaPackage = true` (metadata.go:122-124),
+   which stores the file as `{name}-{version}-{build}.conda`
+   (conda.go:239-242) and renders it under `packages.conda`. THE ZSTD
+   DECODER (the algorithm record): a decode-only, whole-buffer port of
+   the Zstandard Compression Format spec (the v0.4.3 doc shipped in
+   zstd 1.5.7 — the release conda's own tooling emits), written against
+   facebook/zstd v1.5.7's C decoder as the algorithm reference for every
+   bit-level walk — frames/magic (FHD, window descriptor, FCS fields),
+   Raw/RLE/Compressed blocks, the literals section (Raw/RLE/Huffman
+   Compressed+Treeless over the weight-derived X1 table — direct 4-bit
+   or two-state FSE-compressed weights, the implied last weight, 1 or 4
+   interleaved backward bit-streams behind a 6-byte jump table), the
+   FSE tables (literals-length/match/offset: the readNCount description
+   parse, the step-spread decode-table build, predefined/RLE/FSE/repeat
+   modes), the sequence execution in the reference's exact bit order
+   (offset extra bits, match-length bits, literals-length bits, then
+   the LL → ML → OF state updates; the repeat-offset rotation rules
+   incl. the literals-length-zero shift and the `repeat1 - 1` arm), the
+   OVERLAP-COPY trap (byte-by-byte forward match copies — a chunked
+   `set()` corrupts offset < length matches), and XXH-64 frame
+   checksums (implemented in-module, 32-bit-halves arithmetic, no
+   dependency — the loud correctness gate on real frames). Dictionaries
+   and legacy frames are REJECTED (documented, like bz2's
+   randomized-block stance); skippable frames pass through;
+   concatenated frames decode in sequence with per-frame entropy and
+   repeat-offset resets. Resource posture: windowLog ≤ 27 (the
+   reference streaming decoder's ZSTD_WINDOWLOG_LIMIT_DEFAULT), output
+   capped at 1 GiB, tables bounded by the format's own accuracy/depth
+   limits. CORRECTNESS: the authoring harness ran every committed
+   fixture (levels 1/3/9/19/--ultra -22 across empty/one-byte/tiny/
+   lorem/random/RLE/cycle/overlap/mix shapes, multi-block, concatenated,
+   skippable, no-checksum, --long=27) through BOTH the decoder and
+   system zstd 1.5.7 byte-for-byte, plus all rejection arms and the
+   XXH-64 one-shot vectors.
 3. **`repodata.json.bz2` serving — ADOPTED (2026-11-01, the wall's
    recorded reopen trigger landed: the dedicated bzip2-encoder unit).**
    The pin DOES serve the `.bz2` variants (conda.go:44's switch +
@@ -2364,27 +2396,31 @@ chi NotFound page):
   `.json` names verbatim with `application/json`;
 - the package download (conda.go:296-322): the search must answer
   EXACTLY one row (zero OR multiple is the 404 — conda.go:308's
-  `len != 1`); the D-6 serve walk with the sniffed content type
-  (application/x-bzip2 — the only container the store can hold behind
-  wall 2), the HEAD ride, the lead-file GET-only counter bump
-  (packages.go:668);
+  `len != 1`); the D-6 serve walk with the sniffed content type (the
+  store now holds `.tar.bz2` AND `.conda` containers — wall 2 ADOPTED),
+  the HEAD ride, the lead-file GET-only counter bump (packages.go:668);
 - `PUT /<channel>/<filename>` (+ the empty-channel arm) — the raw-body
-  upload (conda.go:189-294): the filename gate 400-nil, the `.conda`
-  wall 400 (wall 2), the spool → parse → size-quota →
+  upload (conda.go:189-294): the filename gate 400-nil, the
+  container dispatch by suffix (conda.go:213-217 — `.tar.bz2` through
+  the bzip2 decoder, `.conda` through the zip + zstd walk, wall 2
+  ADOPTED), the spool → parse → size-quota →
   CreatePackageOrAddFileToExisting chain: the package named
   `channel/name` (the bare name when channel-empty, conda.go:232-237)
   with `conda.name`/`conda.channel` at package CREATION only, the
   VersionMetadata JSON at version CREATION only (a second file never
-  rewrites it), the stored file `{name}-{version}-{build}{.tar.bz2}`
-  (Go's Sprintf verbatim — an empty build leaves the trailing dash)
-  under the SUBDIR composite key with `conda.subdir`/`conda.metadata`,
-  and ANY duplicate row the ErrDuplicatePackageFile 409; the apiError
-  family body is `{"reason": http.StatusText, "message"}` over
+  rewrites it), the stored file
+  `{name}-{version}-{build}{.tar.bz2|.conda}` (Go's Sprintf verbatim —
+  an empty build leaves the trailing dash; the extension rides
+  IsCondaPackage, conda.go:239-242) under the SUBDIR composite key with
+  `conda.subdir`/`conda.metadata`, and ANY duplicate row the
+  ErrDuplicatePackageFile 409; the apiError family body is
+  `{"reason": http.StatusText, "message"}` over
   application/json;charset=utf-8 (conda.go:26-35) with the 500s
   stripped to the prod posture's constant.
 
-Documented divergences: the recorded wall-2 zstd reduction above (the
-wall-3 encoder reduction was reopened and adopted — see wall 3); the stored-
+Documented divergences: the wall-2 zstd reduction was REVERSED at the
+zstd-decoder unit (`.conda` uploads parse — see wall 2 above); the
+wall-3 encoder reduction was reopened and adopted (see wall 3); the stored-
 metadata JSON renders follow the Go struct tag orders with the
 omitempty sweep (`is_conda` has none — always present); the JSON
 decode gates reduce Go's int64-literal strictness to safe-integer
@@ -2417,6 +2453,31 @@ model + serve-content `Tests 72 passed (72)` over the three files.
 tree's remaining errors ride sibling units' in-flight untracked files);
 scoped eslint exit 0 on the five touched files.
 
+UPDATE (the wall-2 zstd-decoder unit, same day): the zstd battery
+`zstd.test.ts` **25/25** + services `conda.test.ts` **37/37** — quoted
+over the pair: `Tests 62 passed (62)`. The zstd fixtures are REAL
+system-zstd frames (zstd 1.5.7, embedded base64) — levels 1-19 across
+empty/one-byte/tiny/lorem/random/RLE/cycle/overlap/mix shapes, multi-
+block and the 128 KB block cap, 4-stream literals behind the jump
+table, FSE-coded sequence tables, concatenated frames, skippable-frame
+pass-through, the no-checksum arm, the --long=27 window cap, and the
+rejection arms (dictionary, windowLog above 27, legacy/bad magic,
+truncation, a flipped content byte failing the checksum); the content
+side regenerates in-test from the same deterministic generators, the
+frame checksums are the loud gate, and the authoring harness cross-
+checked every arm byte-for-byte against the tool plus the XXH-64
+one-shot vectors. The `.conda` service fixtures are REAL conda
+containers (python tarfile + zstandard(3) + zipfile): the full store
+walk with `is_conda=true` and the `.conda` stored name, the repodata
+`packages.conda` split, the duplicate 409, the deflate-member twin,
+the no-info-member structure sentinel, the corrupt-zip /
+broken-inner-zstd archive classes, and the name gate through the
+container. The route arms `packages-conda.test.ts` (a sibling file,
+NOT this unit's) still carry the retired `.conda` wall-400 assertion —
+the route unit must update that one arm (a valid `.conda` upload now
+answers 201; a corrupt container the 500 class), everything else in
+that suite is untouched by this unit.
+
 - **Open issues (conda):** (1) ~~the vendored bz2 decoder diverges from
   Go on a zero-run-dominated tiny stream~~ RETRACTED at the same unit's
   close: the suspect bytes were this unit's own corrupted base64 paste
@@ -2426,8 +2487,10 @@ scoped eslint exit 0 on the five touched files.
   fixture bz2.ts accepts (the two decoders AGREE on all tested streams;
   no bz2-owner unit needed). (2) ~~a bzip2-encoder unit for the `.bz2`
   repodata variants~~ CLOSED at the bz2-encode unit (wall 3 ADOPTED,
-  above); the zstd decoder unit for `.conda` uploads stays the one open
-  reopen trigger (wall 2). With conda landed the census closes:
+  above); (3) ~~the zstd decoder unit for `.conda` uploads (the wall-2
+  reopen trigger)~~ CLOSED at the zstd-decoder unit (wall 2 ADOPTED,
+  above — the recorded reduction REVERSED). With conda landed the
+  census closes:
   **TWENTY-THREE of TWENTY-THREE** protocol surfaces (the 22
   CommonRoutes groups + container) — the parity claim the 2056
   section's TWENTY-TWO row staged for.
