@@ -98,6 +98,7 @@ import {
 } from "./alpine";
 import { buildAllRpmRepositoryFiles } from "./rpm";
 import { updateCargoPackageIndex } from "./cargo";
+import { cargoIndexBindings } from "./cargo-index";
 
 /** The REPO_TASKS message kind the producer enqueues. */
 export interface PackageCleanupMessage {
@@ -114,7 +115,7 @@ export function isPackageCleanupMessage(value: unknown): value is PackageCleanup
 
 /** The env slice the pair touches (the AuditRetentionEnv posture — bindings
  *  optional so tests can drive unset/unbound structurally). */
-export type PackagesCleanupEnv = Partial<Pick<Env, "DB" | "REPO_TASKS" | "REPO_PACKS">> & {
+export type PackagesCleanupEnv = Partial<Pick<Env, "DB" | "REPO_TASKS" | "REPO_PACKS" | "REPO" | "APP_URL">> & {
   /** The orphan window in HOURS (upstream OLDER_THAN=24h); invalid → default. */
   PACKAGE_CLEANUP_OLDER_THAN?: string;
 };
@@ -445,10 +446,18 @@ async function executeCleanupOneRule(
     // package loop, distinct from the distro families' post-loop rebuild:
     // each package that lost a version refreshes its index entry
     // (cargo.UpdatePackageIndexIfExists; a throw fails the message → the
-    // queue redelivers). Our seam is upstream's repo-absent arm
-    // (index.go:94-99) — see cargo.ts's posture note.
+    // queue redelivers). The SPEC-0016 M7 hook rides where the REPO
+    // namespace is bound (the consumer's full Env; unbound in partial test
+    // envs = the upstream repo-absent no-op, index.go:94-99) — the cleanup
+    // arm omits doerId, the owner authors the mirror commits. See cargo.ts's
+    // posture note.
     if (versionDeleted && rule.type === "cargo") {
-      await updateCargoPackageIndex(env.DB, rule.ownerId, pkg.id);
+      await updateCargoPackageIndex(
+        env.DB,
+        rule.ownerId,
+        pkg.id,
+        env.REPO === undefined ? undefined : { bindings: cargoIndexBindings({ REPO: env.REPO, APP_URL: env.APP_URL }) },
+      );
     }
   }
 

@@ -279,6 +279,7 @@ import type { UiContext } from "../ui-context";
 import { OrgSettingsNavbar } from "../components/settings-nav";
 import { formatByteSize } from "../page-data";
 import { userLink } from "../links";
+import { CargoIndexSection } from "./user-settings-packages-cargo";
 import {
   PACKAGE_TYPES,
   absoluteShort,
@@ -870,8 +871,10 @@ export function renderOrgSettingsPackagesPage(ctx: UiContext, data: OrgPackagesS
   return renderPage(<OrgPackagesSettingsPage ctx={ctx} data={data} />);
 }
 
-/** The list page (packages.tmpl → cleanup_rules/list.tmpl). The cargo
- *  section is NOT rendered — no substrate, the module header's reduction. */
+/** The list page (packages.tmpl → cleanup_rules/list.tmpl). The CARGO
+ *  section renders after the rules segment (the template's second include —
+ *  the landed ./user-settings-packages-cargo module; the pre-substrate
+ *  dead-control reduction expired at e4d7e49). */
 export function OrgPackagesSettingsPage(props: { ctx: UiContext; data: OrgPackagesSettingsPageData }) {
   const { ctx, data } = props;
   const base = `/${data.org.username}/settings/packages`;
@@ -948,8 +951,11 @@ export function OrgPackagesSettingsPage(props: { ctx: UiContext; data: OrgPackag
                 )}
               </div>
             </div>
-            {/* package/shared/cargo.tmpl: NOT RENDERED — no cargo substrate
-                (the module header's documented dead-control reduction). */}
+            {/* package/shared/cargo.tmpl (the template's second include) —
+                the landed ./user-settings-packages-cargo module; the POSTs
+                ride the e4d7e49 mirror seams (that module header's
+                adjudication history). */}
+            <CargoIndexSection base={base} />
           </div>
         </div>
       </div>

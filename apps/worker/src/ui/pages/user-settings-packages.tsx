@@ -219,6 +219,7 @@ import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 import { formatByteSize } from "../page-data";
 import { userLink } from "../links";
+import { CargoIndexSection } from "./user-settings-packages-cargo";
 import {
   PACKAGE_TYPES,
   absoluteShort,
@@ -476,9 +477,11 @@ export function renderUserSettingsPackagesPage(ctx: UiContext, data: UserPackage
 }
 
 /** The list page (user/settings/packages.tmpl → cleanup_rules/list.tmpl).
- *  The cargo section is NOT rendered (the documented dead-control
- *  omission); the CHEF keypair section renders — the landed
- *  ./user-settings-packages-chef module (packages.tmpl:9-24). */
+ *  The CARGO section renders below (packages.tmpl's second include — the
+ *  landed ./user-settings-packages-cargo module; the pre-substrate
+ *  dead-control omission expired at e4d7e49) and the CHEF keypair section
+ *  renders after it — the landed ./user-settings-packages-chef module
+ *  (packages.tmpl:9-24). */
 export function UserSettingsPackagesPage(props: { ctx: UiContext; data: UserPackagesSettingsPageData }) {
   const { ctx, data } = props;
   const base = "/user/settings/packages";
@@ -555,10 +558,14 @@ export function UserSettingsPackagesPage(props: { ctx: UiContext; data: UserPack
                 )}
               </div>
             </div>
-            {/* The chef keypair section (packages.tmpl:9-24) — the landed
-                ./user-settings-packages-chef module; the POST streams the
-                private key ONCE. package/shared/cargo.tmpl: NOT RENDERED —
-                no cargo substrate (the module header's omission). */}
+            {/* The CARGO index section (packages.tmpl's second include,
+                package/shared/cargo.tmpl) — the landed
+                ./user-settings-packages-cargo module; the POSTs ride the
+                e4d7e49 mirror seams (the module header's adjudication
+                history). Then the chef keypair section (packages.tmpl:9-24)
+                — the landed ./user-settings-packages-chef module; its POST
+                streams the private key ONCE. */}
+            <CargoIndexSection base={base} />
             <ChefKeypairSection base={base} />
           </div>
         </div>

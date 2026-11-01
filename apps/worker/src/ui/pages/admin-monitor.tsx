@@ -1659,7 +1659,7 @@ function QueuePoolSettings(props: { queueName: string; platform: AdminMonitorQue
 export function AdminMonitorQueueManagePage(props: {
   ctx: UiContext;
   data: AdminMonitorQueueDetailData;
-  flash: { kind: "positive"; text: string } | null;
+  flash: { kind: "positive" | "negative"; text: string } | null;
 }) {
   const queue = props.data.queue;
   const title = adminMonitorLocale.queueManageTitle.replace("%s", queue.name);
@@ -1717,7 +1717,7 @@ export function AdminMonitorQueueManagePage(props: {
 export function renderAdminMonitorQueueManagePage(options: {
   ctx: UiContext;
   data: AdminMonitorQueueDetailData;
-  flash: { kind: "positive"; text: string } | null;
+  flash: { kind: "positive" | "negative"; text: string } | null;
 }): string {
   return renderPage(<AdminMonitorQueueManagePage ctx={options.ctx} data={options.data} flash={options.flash} />);
 }

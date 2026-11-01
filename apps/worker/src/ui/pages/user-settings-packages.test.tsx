@@ -10,13 +10,13 @@
  * user-visibility badge arms public/limited/private, Ghost), and the three
  * pages' DOM contracts (list + add/edit + preview — the DISTINCT
  * `user packages admin` preview pageClass, the scaffold nav's active
- * Packages item, the cargo AND chef absences, the error-class re-render
- * arms, the banner text).
+ * Packages item, the cargo AND chef fold-backs rendering (the landed
+ * substrates), the error-class re-render arms, the banner text).
  *
  * The route-level matrix (anonymous 303 / cross-origin 403 / the parse
- * claims / the cargo+chef tails' engine 404s) lands WITH THE MOUNT —
- * index.ts is a shared file this unit does not edit (the module header's
- * HANDOFF item 4).
+ * claims / the cargo+chef POST arms' live routing) landed WITH THE MOUNT —
+ * the cargo tails ride the e4d7e49 mirror substrate (the chef tail's
+ * fold-back precedent).
  */
 
 import { env } from "cloudflare:workers";
@@ -353,7 +353,7 @@ describe("loadUserCleanupRulePreview (SetRulePreviewContext over ctx.Doer)", () 
 // --- the renders -----------------------------------------------------------------
 
 describe("the list page render (user/settings/packages.tmpl → cleanup_rules/list.tmpl)", () => {
-  it("renders the pageClass, the header + add link over the FIXED user base, the rule rows and the trailing links; no cargo AND no chef section", async () => {
+  it("renders the pageClass, the header + add link over the FIXED user base, the rule rows and the trailing links; the cargo AND chef sections (the fold-backs)", async () => {
     const alice = await seedUserRow("alice");
     const ruleId = await seedRule({ ownerId: alice.id, type: "generic", enabled: true, keepCount: 5, keepPattern: "keep-.*", removeDays: 30, removePattern: "rc-.*" });
     const data = await loadUserPackagesSettingsPageData(env.DB, alice);
@@ -370,11 +370,15 @@ describe("the list page render (user/settings/packages.tmpl → cleanup_rules/li
     expect(html).toContain(`<i>${userSettingsPackagesLocale.remove_pattern}:</i> rc-.*`);
     expect(html).toContain(`href="/user/settings/packages/rules/${ruleId}">Edit`);
     expect(html).toContain(`href="/user/settings/packages/rules/${ruleId}/preview"`);
-    // The cargo section stays UNRENDERED (the documented dead-control
-    // omission); the CHEF keypair section RENDERS (the landed
-    // ./user-settings-packages-chef module — the fold-back with the
-    // keypair POST's routing).
-    expect(html.toLowerCase()).not.toContain("cargo");
+    // The CARGO section RENDERS (the landed ./user-settings-packages-cargo
+    // module — packages.tmpl's second include; the pre-substrate dead-control
+    // omission expired at e4d7e49) BETWEEN the rules segment and the chef
+    // section, in the template's order; the CHEF keypair section RENDERS
+    // after it (the landed ./user-settings-packages-chef module).
+    expect(html).toContain("Cargo Registry Index"); // the cargo section's header (packages.owner.settings.cargo.title)
+    expect(html).toContain(`action="/user/settings/packages/cargo/initialize"`); // the initialize form
+    expect(html).toContain(`action="/user/settings/packages/cargo/rebuild"`); // the rebuild form
+    expect(html.indexOf("Cargo Registry Index")).toBeLessThan(html.indexOf("Chef Registry")); // the template order
     expect(html).toContain("chef/regenerate_keypair"); // the keypair form's action
     expect(html).toContain("Chef Registry"); // the chef section's header (locale key packages.owner.settings.chef.title)
     // The scaffold nav's Packages item is the active one (the mount swaps

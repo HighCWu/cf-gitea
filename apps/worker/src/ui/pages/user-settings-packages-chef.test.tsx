@@ -325,8 +325,13 @@ describe("the parse-tree claim (user-settings-packages-chef-regenerate)", () => 
     expect(parseUiRoute("/user/settings/packages/chef")).toBeNull();
     expect(parseUiRoute("/user/settings/packages/chef/regenerate_keypair/extra")).toBeNull();
     expect(parseUiRoute("/user/settings/packages/chef/junk")).toBeNull();
-    // The neighbors' claims stand (the static-first ordering intact).
+    // The neighbors' claims stand (the static-first ordering intact). The
+    // cargo tail IS claimed now (the e4d7e49 substrate's fold — the mirror
+    // arms ride pages/user-settings-packages-cargo.tsx).
     expect(parseUiRoute("/user/settings/packages")).toEqual({ family: "user-settings-packages", id: null });
-    expect(parseUiRoute("/user/settings/packages/cargo/initialize")).toBeNull(); // cargo stays unregistered
+    expect(parseUiRoute("/user/settings/packages/cargo/initialize")).toEqual({
+      family: "user-settings-packages-cargo-initialize",
+      id: null,
+    });
   });
 });

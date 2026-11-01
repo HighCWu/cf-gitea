@@ -12,7 +12,7 @@
  * match_full_name, remove-days, the internal rows pinned out) plus the
  * descriptor cells (size, creator, Ghost), and the three pages' DOM
  * contracts (list + add/edit + preview — the pageClass, the nav
- * scaffolding's active Packages item, the cargo absence, the error-class
+ * scaffolding's active Packages item, the cargo section's fold-back render, the error-class
  * re-render arms, the banner text).
  *
  * The route-level matrix (anonymous 303 / non-owner 404 shells /
@@ -587,7 +587,7 @@ describe("loadOrgCleanupRulePreview (SetRulePreviewContext — shared/packages.g
 // --- the renders -----------------------------------------------------------------
 
 describe("the list page render (packages.tmpl → cleanup_rules/list.tmpl)", () => {
-  it("renders the pageClass, the header + add link, the rule rows and the trailing links; no cargo section", async () => {
+  it("renders the pageClass, the header + add link, the rule rows and the trailing links; the cargo section renders (the fold-back)", async () => {
     const ruleId = await seedRule({ ownerId: org.id, type: "generic", enabled: true, keepCount: 5, keepPattern: "keep-.*", removeDays: 30, removePattern: "rc-.*" });
     const data = await loadOrgPackagesSettingsPageData(env.DB, org);
     const html = renderOrgSettingsPackagesPage(ctx, data);
@@ -603,8 +603,12 @@ describe("the list page render (packages.tmpl → cleanup_rules/list.tmpl)", () 
     expect(html).toContain(`<i>${orgSettingsPackagesLocale.remove_pattern}:</i> rc-.*`);
     expect(html).toContain(`href="/coalition/settings/packages/rules/${ruleId}">Edit`);
     expect(html).toContain(`href="/coalition/settings/packages/rules/${ruleId}/preview"`);
-    // The cargo section is NOT rendered (the documented dead-control reduction).
-    expect(html.toLowerCase()).not.toContain("cargo");
+    // The CARGO section renders (the template's second include — the landed
+    // ./user-settings-packages-cargo module; the pre-substrate dead-control
+    // reduction expired at e4d7e49) over the org frame's base.
+    expect(html).toContain("Cargo Registry Index"); // packages.owner.settings.cargo.title
+    expect(html).toContain(`action="/coalition/settings/packages/cargo/initialize"`);
+    expect(html).toContain(`action="/coalition/settings/packages/cargo/rebuild"`);
     // The nav scaffolding's Packages item is the active one; the shared
     // family's hrefs ride verbatim (incl. the labels wave-14 divergence).
     expect(html).toContain(`class="active item" href="/coalition/settings/packages"`);

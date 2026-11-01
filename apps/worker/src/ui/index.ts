@@ -1215,6 +1215,11 @@ import {
 // 718's POST over the landed chef-auth service; the section's fold-back
 // recipe rides that module's header).
 import { chefKeypairDownloadResponse, regenerateChefKeypair } from "./pages/user-settings-packages-chef";
+// The cargo index web arms (pages/user-settings-packages-cargo.tsx records
+// the section + the surface): web.go:714-717's user POSTs and web.go:
+// 1081-1085's org POSTs over the LANDED mirror seams (services/packages/
+// cargo-index.ts — the e4d7e49 substrate the section's buttons drive).
+import { cargoIndexBindings, ensureCargoIndexMirror, rebuildCargoIndexMirror } from "../services/packages/cargo-index";
 import type { UserProfileRow } from "./pages/user-profile";
 import {
   createUserHookFromForm,
@@ -1282,17 +1287,30 @@ import {
   renderAdminDashboardPage,
 } from "./pages/admin-dashboard";
 import {
+  adminMonitorLocale,
   applyAdminMonitorCronForm,
+  applyAdminMonitorProfileDownload,
   loadAdminMonitorCronRunState,
+  loadAdminMonitorDiagnosis,
   loadAdminMonitorQueues,
   loadAdminMonitorStats,
   parseAdminMonitorCronForm,
   renderAdminMonitorCronPage,
+  renderAdminMonitorDiagnosisPage,
   renderAdminMonitorQueuePage,
   renderAdminMonitorStatsPage,
   renderAdminMonitorTracePage,
 } from "./pages/admin-monitor";
 import type { AdminMonitorPage } from "./pages/admin-monitor";
+// The SPEC-0021 platform arms' route seams (the 6cc57d8 module's fold — the
+// admin-monitor header's Platform-arms HANDOFF): the queue-set closed loop
+// and the platform config read (the profile trigger rides the module's own
+// applyAdminMonitorProfileDownload body above).
+import {
+  applyAdminMonitorQueueSet,
+  parseMonitorQueueSetForm,
+} from "../services/monitor/queue-concurrency";
+import { monitorPlatformConfigFromEnv } from "../services/monitor/platform";
 // The admin listing pages (the family prologue is shared adminPagePrologue).
 import { AdminFamilyNav, loadAdminUsersData, renderAdminUsersPage } from "./pages/admin-users";
 import { OrgSettingsNavbar, UserSettingsNavbar } from "./components/settings-nav";
@@ -3537,6 +3555,14 @@ export interface AdminRoute {
     // write, and the avatar pair (the 2a00e28 seams).
     | "admin-monitor-queue-manage"
     | "admin-monitor-queue-remove-all"
+    // The SPEC-0021 platform arms (the 6cc57d8 module's fold — the module
+    // header's Platform-arms HANDOFF): the queue-set write (web.go:807's
+    // POST inside the /queue/{qid} group — the same NAME qid), the composite
+    // diagnosis report (web.go:811), and the pprof trigger's GET-download
+    // arm (web.go:801's PerfTrace over the platform Profiling API).
+    | "admin-monitor-queue-set"
+    | "admin-monitor-diagnosis"
+    | "admin-monitor-profile"
     | "admin-user-detail"
     | "admin-user-edit"
     | "admin-users-impersonate"
@@ -3625,6 +3651,8 @@ export interface UserSettingsTabRoute {
     | "user-settings-packages-rule-add"
     | "user-settings-packages-rule-edit"
     | "user-settings-packages-rule-preview"
+    | "user-settings-packages-cargo-initialize" // POST /user/settings/packages/cargo/initialize (web.go:715)
+    | "user-settings-packages-cargo-rebuild" // POST /user/settings/packages/cargo/rebuild (web.go:716)
     | "user-settings-packages-chef-regenerate" // POST /user/settings/packages/chef/regenerate_keypair (web.go:718)
     | "user-settings-blocked-users" // GET+POST /user/settings/blocked_users (web.go:750-752)
     | "user-settings-variables"
@@ -3758,6 +3786,8 @@ export interface OrgSettingsRoute {
     | "org-settings-packages-rule-add" // GET+POST /{org}/settings/packages/rules/add
     | "org-settings-packages-rule-edit" // GET+POST /{org}/settings/packages/rules/{id}
     | "org-settings-packages-rule-preview" // GET /{org}/settings/packages/rules/{id}/preview
+    | "org-settings-packages-cargo-initialize" // POST /{org}/settings/packages/cargo/initialize (web.go:1082)
+    | "org-settings-packages-cargo-rebuild" // POST /{org}/settings/packages/cargo/rebuild (web.go:1083)
     | "org-team-edit" // GET+POST /{org}/teams/{id}/edit
     | "org-team-delete" // POST /{org}/teams/{id}/delete
   ;
@@ -4083,9 +4113,8 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     // The USER-scope packages family (pages/user-settings-packages.tsx —
     // web.go:701-719's cleanup-rules group at user scope; rules/add literal
-    // before the {id} combos; the cargo tail stays unregistered — no cargo
-    // substrate — while the chef tail below IS claimed over the landed
-    // chef-auth service).
+    // before the {id} combos; the cargo tails below ARE claimed over the
+    // landed mirror substrate, like the chef tail beneath them).
     if (tail.length === 1 && tail[0] === "packages") {
       return { family: "user-settings-packages", id: null };
     }
@@ -4099,6 +4128,13 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (tail.length === 4 && tail[0] === "packages" && tail[1] === "rules" && tail[3] === "preview") {
       const id = numericId(tail[2]);
       return id === null ? null : { family: "user-settings-packages-rule-preview", id };
+    }
+    // The cargo index arms (web.go:714-717 — InitializeCargoIndex /
+    // RebuildCargoIndex over pages/user-settings-packages-cargo.tsx's
+    // landed mirror seams; POST-only upstream, the GET twins answer the
+    // 405; the junk/deeper tails stay unclaimed → the engine's 404).
+    if (tail.length === 3 && tail[0] === "packages" && tail[1] === "cargo" && (tail[2] === "initialize" || tail[2] === "rebuild")) {
+      return { family: `user-settings-packages-cargo-${tail[2]}`, id: null };
     }
     // The chef keypair arm (web.go:718 — RegenerateChefKeyPair over
     // pages/user-settings-packages-chef.tsx; POST-only upstream, the GET
@@ -4505,12 +4541,27 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (tail[1] === "stacktrace") return { family: "admin-monitor", page: "trace" };
     }
     // The monitor queue-manage pair (web.go:805-811 — the queue NAME qid;
-    // the /set arm is the recorded reduction, never claimed).
+    // the static-before-dynamic rule puts the literals ahead of the {qid}
+    // parse like upstream's chi group order) + the SPEC-0021 platform arms
+    // (the 6cc57d8 module's fold): the /set write beside the remove-all
+    // 4-segment claim (web.go:807 — the literal rides the FOURTH segment,
+    // the {qid} group's tail, qid = the third), then the two 2-segment
+    // literals diagnosis/profile (web.go:811 + the PerfTrace arm's
+    // download shape) after the landed page literals above.
     if (tail.length === 3 && tail[0] === "monitor" && tail[1] === "queue") {
       return { family: "admin-monitor-queue-manage", qid: tail[2] as string };
     }
     if (tail.length === 4 && tail[0] === "monitor" && tail[1] === "queue" && tail[2] === "remove-all-items") {
       return { family: "admin-monitor-queue-remove-all", qid: tail[3] as string };
+    }
+    if (tail.length === 4 && tail[0] === "monitor" && tail[1] === "queue" && tail[3] === "set") {
+      return { family: "admin-monitor-queue-set", qid: tail[2] as string };
+    }
+    if (tail.length === 2 && tail[0] === "monitor" && tail[1] === "diagnosis") {
+      return { family: "admin-monitor-diagnosis" };
+    }
+    if (tail.length === 2 && tail[0] === "monitor" && tail[1] === "profile") {
+      return { family: "admin-monitor-profile" };
     }
     return null;
   }
@@ -4812,8 +4863,8 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     // The org settings PACKAGES family (pages/org-settings-packages.tsx —
     // web.go:1069-1085's cleanup-rules group; the rules/add literal claims
-    // AHEAD of the {id} combo, chi static-first). The cargo tails stay
-    // unregistered — no substrate.
+    // AHEAD of the {id} combo, chi static-first). The cargo tails below ARE
+    // claimed over the landed mirror substrate (web.go:1081-1085).
     if (raw.length === 4 && raw[3] === "packages") {
       return { family: "org-settings-packages", owner };
     }
@@ -4825,6 +4876,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     if (raw.length === 7 && raw[3] === "packages" && raw[4] === "rules" && raw[6] === "preview" && /^-?\d+$/.test(raw[5] as string)) {
       return { family: "org-settings-packages-rule-preview", owner, id: Number.parseInt(raw[5] as string, 10) };
+    }
+    if (raw.length === 6 && raw[3] === "packages" && raw[4] === "cargo" && (raw[5] === "initialize" || raw[5] === "rebuild")) {
+      return { family: `org-settings-packages-cargo-${raw[5]}`, owner };
     }
     if (raw.length === 5 && raw[3] === "avatar" && raw[4] === "delete") {
       return { family: "org-settings-avatar-delete", owner };
@@ -10259,6 +10313,33 @@ async function userPackagesChefRegenerateKeypair(c: Context<{ Bindings: Env }>):
   return p.respond(chefKeypairDownloadResponse(user.username, privatePem));
 }
 
+/** POST /user/settings/packages/cargo/{initialize,rebuild} (web.go:714-717 →
+ *  setting/packages.go:85-100 → shared InitializeCargoIndex/RebuildCargoIndex,
+ *  over pages/user-settings-packages-cargo.tsx's landed mirror seams): the
+ *  §2.8 guard + the tab prologue (the family convention), then the mirror
+ *  arm — upstream commits as owner=doer (ctx.Doer is the settings owner), so
+ *  doerId stays OMITTED, the seams' owner-authors default. A failure is
+ *  upstream's Flash.Error + redirect arm (:239-243) — logged, never a 500;
+ *  success and failure both redirect onto the settings page (upstream's
+ *  ctx.Redirect; the flash rides no queue — the landed no-flash-queue
+ *  reduction). */
+async function userPackagesCargoIndexArm(c: Context<{ Bindings: Env }>, arm: "initialize" | "rebuild"): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const user = await readProfileRowForPackages(c, p.viewer.id);
+  if (user === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  try {
+    if (arm === "initialize") {
+      await ensureCargoIndexMirror(cargoIndexBindings(c.env), c.env.DB, user.id);
+    } else {
+      await rebuildCargoIndexMirror(cargoIndexBindings(c.env), c.env.DB, user.id);
+    }
+  } catch (error) {
+    console.error(`[packages-cargo-index] user settings ${arm} failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/packages" } }));
+}
+
 // --- the account tab (pages/user-settings-account.tsx — upstream EmailPost /
 // DeleteEmail / DeleteAccount; navbar.tmpl:7-11) ----------------------------
 
@@ -11591,6 +11672,34 @@ async function orgPackagesRulePreviewPage(c: Context<{ Bindings: Env }>, ruleId:
   return respond(c.html(renderOrgCleanupRulePreviewPage(ctx, data), 200));
 }
 
+/** POST /{org}/settings/packages/cargo/{initialize,rebuild} (web.go:1081-1085
+ *  → org/setting_packages.go:109-124 → shared InitializeCargoIndex/
+ *  RebuildCargoIndex): the guard-first + owner prologue + drift guard (the
+ *  org packages family's convention), then the SAME mirror arms as the user
+ *  twin — upstream passes ctx.ContextUser as BOTH owner and doer here, so
+ *  doerId stays OMITTED (the owner authors) exactly like upstream. A failure
+ *  is upstream's Flash.Error + redirect arm — logged, never a 500; both
+ *  answers 303 onto the org's settings packages page (upstream's
+ *  fmt.Sprintf redirect, setting_packages.go:114/:123). */
+async function orgPackagesCargoIndexArm(c: Context<{ Bindings: Env }>, arm: "initialize" | "rebuild"): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamsRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { org, respond } = resolved;
+  if (resolved.route.family !== `org-settings-packages-cargo-${arm}`) return respond(await c.notFound()); // drift guard
+  try {
+    if (arm === "initialize") {
+      await ensureCargoIndexMirror(cargoIndexBindings(c.env), c.env.DB, org.id);
+    } else {
+      await rebuildCargoIndexMirror(cargoIndexBindings(c.env), c.env.DB, org.id);
+    }
+  } catch (error) {
+    console.error(`[packages-cargo-index] org settings ${arm} failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return respond(new Response(null, { status: 303, headers: { location: `/${org.username}/settings/packages` } }));
+}
+
 /** POST /{org}/settings/actions/runners/reset_registration_token
  * (ResetRunnerRegistrationToken, runners.go:275-290): NewRunnerToken at the
  * org scope, then the plain 303 back onto the list URL (upstream's
@@ -12189,6 +12298,82 @@ async function adminMonitorCronSubmit(c: Context<{ Bindings: Env }>): Promise<Re
   const data = await loadAdminMonitorCronRunState(c.env.DB, routeNow());
   const flash = { kind: result.outcome === "applied" ? "positive" as const : "negative" as const, text: result.message };
   return p.respond(c.html(renderAdminMonitorCronPage({ ctx: p.ctx, data, flash })));
+}
+
+/** POST /-/admin/monitor/queue/{qid}/set — the SPEC-0021 platform arms'
+ *  queue-set write (web.go:807's QueueSet inside the /queue/{qid} group;
+ *  the 6cc57d8 module's fold). The guard rides FIRST (the remove-all
+ *  posture), then: a junk qid is the 404 funnel, an invalid form
+ *  re-renders the FRESH manage page with upstream's
+ *  maxnumberworkers.error flash (admin.monitor.queue.settings.
+ *  maxnumberworkers.error), and every applied/unapplied outcome carries the
+ *  service's own flash onto the re-rendered page — the honest skip arm
+ *  (unconfigured token/allowlist) renders the manage page's platform panel
+ *  in the unconfigured posture, never a fabricated success. */
+async function adminMonitorQueueSetSubmit(c: Context<{ Bindings: Env }>, qidRaw: string): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const qid = parseAdminMonitorQueueQid(qidRaw);
+  if (qid === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  const max = parseMonitorQueueSetForm(await readUrlEncodedForm(c.req.raw));
+  if (max === null) {
+    // Upstream's maxnumberworkers.error flash, re-rendered fresh.
+    const data = await loadAdminMonitorQueueDetail(c.env.DB, qid, {
+      platform: monitorPlatformConfigFromEnv(c.env),
+    });
+    if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+    return p.respond(c.html(renderAdminMonitorQueueManagePage({ ctx: p.ctx, data, flash: { kind: "negative", text: adminMonitorLocale.poolSettingsError } })));
+  }
+  const viewer = p.ctx.viewer;
+  const result = await applyAdminMonitorQueueSet(c.env, c.env.DB, qid, max, {
+    actorId: viewer.kind === "user" ? viewer.id : 0,
+    actorName: viewer.kind === "user" ? viewer.username : "",
+    now: routeNow(),
+  });
+  const data = await loadAdminMonitorQueueDetail(c.env.DB, qid, {
+    platform: monitorPlatformConfigFromEnv(c.env),
+  });
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderAdminMonitorQueueManagePage({ ctx: p.ctx, data, flash: result.flash })));
+}
+
+/** GET /-/admin/monitor/diagnosis — the composite report (web.go:811's
+ *  MonitorDiagnosis; the module's documented divergence: the per-item
+ *  status table IS the report, rendered — never a ZIP download). Every
+ *  unreadable item reports unavailable + reason (the freeze's
+ *  unavailable ≠ 0 posture); an unconfigured platform renders the
+ *  unconfigured dimensions honestly. */
+async function adminMonitorDiagnosisPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminMonitorDiagnosis(c.env, c.env.DB, { now: routeNow() });
+  return p.respond(c.html(renderAdminMonitorDiagnosisPage({ ctx: p.ctx, data })));
+}
+
+/** GET /-/admin/monitor/profile — the pprof trigger's download arm
+ *  (web.go:801's PerfTrace POST over the platform Profiling API, adapted to
+ *  the no-JS GET form the trace page's form targets). The module-side
+ *  applyAdminMonitorProfileDownload owns the platform body ("so the fold's
+ *  handler stays thin"): a bad/unconfigured/degraded trigger 303s back onto
+ *  the trace page — the arm's only surface (upstream's GET-download posture
+ *  has no error page; the 303 keeps the no-JS form usable); the ok arm
+ *  streams the VERIFIED gzipped pprof bytes as the attachment. */
+async function adminMonitorProfileDownload(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const download = await applyAdminMonitorProfileDownload(c.env, new URL(c.req.raw.url).searchParams, { now: routeNow() });
+  if (download.kind === "redirect") {
+    return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/monitor/stacktrace" } }));
+  }
+  return p.respond(new Response(download.bytes, {
+    status: 200,
+    headers: {
+      "content-type": "application/octet-stream",
+      "content-disposition": `attachment; filename="${download.filename}"`,
+    },
+  }));
 }
 
 // --- the admin listing pages (pages/admin-users.tsx / admin-orgs.tsx /
@@ -17254,6 +17439,12 @@ uiRouter.get("/user/settings/packages/rules/:id{(\\d+)}", (c) => userPackagesRul
 uiRouter.post("/user/settings/packages/rules/:id{(\\d+)}", (c) => userPackagesRuleEditSubmit(c, Number(c.req.param("id"))));
 uiRouter.get("/user/settings/packages/rules/:id{(\\d+)}/preview", (c) => userPackagesRulePreviewPage(c, Number(c.req.param("id"))));
 uiRouter.post("/user/settings/packages/rules/:id{(\\d+)}/preview", () => methodNotAllowed("GET"));
+// The cargo index arms (web.go:714-717 — POST-only upstream; the GET twins
+// answer the 405, the chef-family convention).
+uiRouter.post("/user/settings/packages/cargo/initialize", (c) => userPackagesCargoIndexArm(c, "initialize"));
+uiRouter.post("/user/settings/packages/cargo/rebuild", (c) => userPackagesCargoIndexArm(c, "rebuild"));
+uiRouter.get("/user/settings/packages/cargo/initialize", () => methodNotAllowed("POST"));
+uiRouter.get("/user/settings/packages/cargo/rebuild", () => methodNotAllowed("POST"));
 // The chef keypair arm (web.go:718 — POST-only upstream; the GET twin
 // answers chi's 405).
 uiRouter.post("/user/settings/packages/chef/regenerate_keypair", (c) => userPackagesChefRegenerateKeypair(c));
@@ -17415,6 +17606,13 @@ uiRouter.get("/:owner/settings/packages/rules/:id{(\\d+)}", (c) => orgPackagesRu
 uiRouter.post("/:owner/settings/packages/rules/:id{(\\d+)}", (c) => orgPackagesRuleEditSubmit(c, Number(c.req.param("id"))));
 uiRouter.get("/:owner/settings/packages/rules/:id{(\\d+)}/preview", (c) => orgPackagesRulePreviewPage(c, Number(c.req.param("id"))));
 uiRouter.post("/:owner/settings/packages/rules/:id{(\\d+)}/preview", () => methodNotAllowed("GET"));
+// The org cargo index arms (web.go:1081-1085 — POST-only upstream; the GET
+// twins answer the 405). Registered INSIDE the org settings packages group
+// (the same posture the user twin's arms ride).
+uiRouter.post("/:owner/settings/packages/cargo/initialize", (c) => orgPackagesCargoIndexArm(c, "initialize"));
+uiRouter.post("/:owner/settings/packages/cargo/rebuild", (c) => orgPackagesCargoIndexArm(c, "rebuild"));
+uiRouter.get("/:owner/settings/packages/cargo/initialize", () => methodNotAllowed("POST"));
+uiRouter.get("/:owner/settings/packages/cargo/rebuild", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/settings/actions/runners", () => methodNotAllowed("GET"));
 uiRouter.get("/:owner/settings/actions/runners/reset_registration_token", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/settings/actions/runners/reset_registration_token", (c) => orgActionsRunnersTokenReset(c));
@@ -17470,9 +17668,16 @@ uiRouter.get("/-/admin/monitor/stats", (c) => adminMonitorPage(c, "stats"));
 uiRouter.get("/-/admin/monitor/cron", (c) => adminMonitorPage(c, "cron"));
 uiRouter.post("/-/admin/monitor/cron", (c) => adminMonitorCronSubmit(c));
 uiRouter.get("/-/admin/monitor/queue", (c) => adminMonitorPage(c, "queue"));
-// The queue-manage pair (web.go:805-811 — the queue-NAME qid).
+// The queue-manage pair (web.go:805-811 — the queue-NAME qid) + the
+// SPEC-0021 platform arms (the 6cc57d8 module's fold): the /set write
+// inside the {qid} group (web.go:807), the composite diagnosis GET
+// (web.go:811), and the pprof trigger's download GET (web.go:801's
+// PerfTrace adapted to the no-JS form; the trace page is its only surface).
 uiRouter.get("/-/admin/monitor/queue/:qid", (c) => adminMonitorQueueManagePage(c, c.req.param("qid")));
 uiRouter.post("/-/admin/monitor/queue/:qid/remove-all-items", (c) => adminMonitorQueueRemoveAllSubmit(c, c.req.param("qid")));
+uiRouter.post("/-/admin/monitor/queue/:qid/set", (c) => adminMonitorQueueSetSubmit(c, c.req.param("qid")));
+uiRouter.get("/-/admin/monitor/diagnosis", (c) => adminMonitorDiagnosisPage(c));
+uiRouter.get("/-/admin/monitor/profile", (c) => adminMonitorProfileDownload(c));
 uiRouter.get("/-/admin/monitor/stacktrace", (c) => adminMonitorPage(c, "trace"));
 // The admin listing pages (top-level static literals — nothing dynamic
 // shadows them; the parse claims carry the same literals).

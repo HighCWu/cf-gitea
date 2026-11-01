@@ -293,6 +293,11 @@ import {
   setCargoPackageYanked,
   uploadCargoPackage,
 } from "../../services/packages/cargo";
+// The SPEC-0016 M7 git-mirror hook's bindings builder — the publish and
+// yank/unyank arms thread `cargoIndex: { bindings: cargoIndexBindings(c.env),
+// doerId: doer.id }` (the mount recipe the cargo-index module header
+// records; upstream commits the index as ctx.Doer).
+import { cargoIndexBindings } from "../../services/packages/cargo-index";
 
 import {
   MAX_SWIFT_UPLOAD_BYTES,
@@ -2182,6 +2187,10 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         content: bodyStream(c.req.raw),
         declaredLength: contentLength(c.req.raw) ?? undefined, // chunked streams (D-2)
         quota: packagesQuotaFromEnv(c.env),
+        // UpdatePackageIndexIfExists (cargo.go:210-220) — the `_cargo-index`
+        // mirror hook, committed as ctx.Doer (index.go:301-303); the repo-
+        // absent no-op stays INSIDE the seam.
+        cargoIndex: { bindings: cargoIndexBindings(c.env), doerId: doer.id },
       });
       return new Response(JSON.stringify({ ok: true }), {
         status: 200,
@@ -2224,6 +2233,9 @@ export function createEcosystemProtocolRouter(): Hono<{ Bindings: Env }> {
         c.req.param("package") ?? "",
         c.req.param("version") ?? "",
         yank,
+        // UpdatePackageIndexIfExists (cargo.go:262-267) — the mirror hook,
+        // the same ctx.Doer posture as the publish arm.
+        { bindings: cargoIndexBindings(c.env), doerId: doer.id },
       );
       return new Response(JSON.stringify({ ok: true }), {
         status: 200,
