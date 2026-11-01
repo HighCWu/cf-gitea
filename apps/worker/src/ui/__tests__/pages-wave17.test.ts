@@ -330,7 +330,8 @@ describe("wave-17 parser families (parseUiRoute / handlesUiRoute)", () => {
       repo: "hello",
       from: "main",
     });
-    expect(parseUiRoute("/octo/hello/branches/restore")).toBeNull();
+    // The restore write LANDED (branch-restore.ts + the fold) — claimed.
+    expect(parseUiRoute("/octo/hello/branches/restore")).toEqual({ family: "branch-restore", owner: "octo", repo: "hello" });
     expect(parseUiRoute("/octo/hello/branches/delete/more")).toBeNull();
   });
 });

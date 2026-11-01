@@ -970,21 +970,25 @@ describe("w100 deleted-branch rows + restore (the substrate chain, migration 005
     expect(html(null, null)).not.toContain("ui info message"); // no flash, no params
   });
 
-  it("the restore POST tail is engine-owned: unclaimed by the parser, 404-shelled on POST (documented — the orchestrator's fold flips it)", async () => {
-    // Documented (never claimed): parseUiRoute(/branches/restore) → null —
-    // the fold flips it deliberately (the branches header's HANDOFF). The
-    // POST's 404 IS pinned so the fold cannot silently drop the claim flip
-    // either; the fold rewrites THIS arm to the claimed shape (the
-    // window-2e rename precedent).
-    expect(parseUiRoute(`/${OWNER}/w100del/branches/restore`)).toBeNull();
+  it("the restore POST is LIVE through the fold: the claimed parse + the REAL route round-trip restores the ref at the stored sha", async () => {
+    // The fold flipped this arm (the window-2e rename precedent): the
+    // parse claims, the POST replays the stored sha through the engine,
+    // and the 303 carries the restore_success flash param.
+    expect(parseUiRoute(`/${OWNER}/w100del/branches/restore`)).toEqual({ family: "branch-restore", owner: OWNER, repo: "w100del" });
+    const repoRow = (
+      await drizzle(env.DB).select().from(repositories).where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, "w100del"))).get()
+    )!;
+    const row = (
+      await drizzle(env.DB).select().from(deletedBranches).where(and(eq(deletedBranches.repoId, repoRow.id), eq(deletedBranches.name, "side"))).get()
+    )!;
     const res = await fetchUi(
       `/${OWNER}/w100del/branches/restore`,
-      formPost(`/${OWNER}/w100del/branches/restore`, { branch_id: "1", name: "side" }, await cookieFor(OWNER)),
+      formPost(`/${OWNER}/w100del/branches/restore`, { branch_id: String(row.id) }, await cookieFor(OWNER)),
     );
-    expect(res.status).toBe(404);
-    // The substrate stands untouched (nothing was restored — the ref side
-    // stays gone from arm 1's delete).
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe(`/${OWNER}/w100del/branches?restored=side`);
+    // The engine half: the ref is BACK (at the stored sha — arm 1's tip).
     const names = (await env.REPO.getByName(`${OWNER}/w100del`).listRefs()).refs.map((ref) => ref.name);
-    expect(names).not.toContain("refs/heads/side");
+    expect(names).toContain("refs/heads/side");
   });
 });

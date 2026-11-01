@@ -1675,6 +1675,8 @@ import {
   parseBranchDeleteForm,
   renderBranchesPage,
 } from "./pages/branches";
+// The branch restore replay (web.go:1485 — the deleted_branches chain).
+import { applyBranchRestore, parseBranchRestoreForm } from "./pages/branch-restore";
 import {
   createReleaseFromForm,
   deleteReleaseFromForm,
@@ -2288,7 +2290,7 @@ export interface PullCommitsRoute {
  *  `/_new/*`, `/restore`) stays engine-owned — upstream's
  *  unregistered-route 404. */
 export interface BranchesRoute {
-  family: "branches" | "branch-delete" | "branch-create" | "branch-rename";
+  family: "branches" | "branch-delete" | "branch-restore" | "branch-create" | "branch-rename";
   owner: string;
   repo: string;
   /** The create form's source branch (the _new/{from} tail, decoded). */
@@ -5876,6 +5878,9 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   if (head === "branches") {
     if (rest.length === 0) return { family: "branches", owner, repo };
     if (rest.length === 1 && rest[0] === "delete") return { family: "branch-delete", owner, repo };
+    // The restore write (web.go:1485 — POST-only; the deleted_branches
+    // chain's route seam, branch-restore.ts's handoff).
+    if (rest.length === 1 && rest[0] === "restore") return { family: "branch-restore", owner, repo };
     if (rest.length === 1 && rest[0] === "list") return { family: "branches-list-aux", owner, repo };
     // Window-2e folds: the writer forms' POST targets (the wave-63 module's
     // handoff — upstream web.go:1477-1481/1486).
@@ -9561,6 +9566,8 @@ async function branchesPage(c: Context<{ Bindings: Env }>): Promise<Response> {
           deleted: url.searchParams.get("deleted"),
           errorKind: url.searchParams.get("delete_error"),
           errorName: url.searchParams.get("name") ?? "",
+          restored: url.searchParams.get("restored"),
+          restoreError: url.searchParams.get("restore_error"),
         },
       }),
       200,
@@ -9608,6 +9615,42 @@ async function branchDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Respon
     result.outcome === "deleted"
       ? `${listPath}?deleted=${encodeURIComponent(result.name)}`
       : `${listPath}?delete_error=${result.outcome === "refused-default" ? "default" : result.outcome === "refused-protected" ? "protected" : "failed"}&name=${encodeURIComponent(result.name)}`;
+  return respond(new Response(null, { status: 303, headers: { location } }));
+}
+
+/** POST /{owner}/{repo}/branches/restore (web.go:1485 — RestoreBranchPost
+ *  over branch-restore.ts's replay: the branchDeleteSubmit twin with the
+ *  restore outcome ladder; upstream folds the protected refusal into
+ *  restore_failed — no dedicated key). */
+async function branchRestoreSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "branch-restore") return respond(await c.notFound()); // registration/parser drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
+  if (repo.isArchived || repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404));
+  const branchId = parseBranchRestoreForm(await readUrlEncodedForm(c.req.raw));
+  if (branchId === null) return respond(c.html(renderNotFound(ctx), 404));
+  const doerRow = await drizzle(c.env.DB).select().from(users).where(eq(users.id, viewer.id)).get();
+  if (doerRow === undefined) return respond(c.html(renderNotFound(ctx), 404)); // the session doer vanished
+  const pair = await findRepositoryById(c.env.DB, repo.id);
+  if (pair === null) return respond(c.html(renderNotFound(ctx), 404));
+  let waitUntil: ((promise: Promise<unknown>) => void) | undefined;
+  try {
+    waitUntil = c.executionCtx.waitUntil.bind(c.executionCtx);
+  } catch {
+    waitUntil = undefined; // in-process test callers have no execution context
+  }
+  const result = await applyBranchRestore(c.env, repo, viewer, branchId, { pair, doer: doerRow, origin: url.origin, waitUntil });
+  const listPath = `/${repo.ownerNamespace}/${repo.slug}/branches`;
+  if (result.outcome === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  const location =
+    result.outcome === "restored"
+      ? `${listPath}?restored=${encodeURIComponent(result.name)}`
+      : `${listPath}?restore_error=${result.outcome === "already-exists" ? "already_exists" : "failed"}&name=${encodeURIComponent(result.name)}`;
   return respond(new Response(null, { status: 303, headers: { location } }));
 }
 
@@ -17798,6 +17841,8 @@ uiRouter.get("/:owner/:repo/settings/branches/:id/delete", () => methodNotAllowe
 // test/delete convention).
 uiRouter.get("/:owner/:repo/branches", (c) => branchesPage(c));
 uiRouter.post("/:owner/:repo/branches/delete", (c) => branchDeleteSubmit(c));
+// The restore write (web.go:1485 — POST-only; GET /branches/restore 404s).
+uiRouter.post("/:owner/:repo/branches/restore", (c) => branchRestoreSubmit(c));
 // Window-2e folds: the branch writer arms, the pulls/new redirect, the upload endpoints.
 uiRouter.post("/:owner/:repo/branches/_new/*", (c) => branchCreateSubmit(c));
 uiRouter.post("/:owner/:repo/branches/rename", (c) => branchRenameSubmit(c));
