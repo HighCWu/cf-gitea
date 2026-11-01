@@ -1,13 +1,12 @@
 # cf-gitea v1.5.1 — Release Notes (the dead-route-and-salvage wave)
 
-**Range**: RANGE=<pending> (`1c8279b..FINAL_HEAD`) — **COMMIT_COUNT=<pending>**
-commits, landed across 2026-11-01/02 — a single overnight window (forty-four at
-this draft, the three notes commits excluded; the pending-fill items in §17 may
-still join). Deployed
-as **`DEPLOY_ID=<pending>`** — FINAL_HEAD=<pending>. Probe battery
-**PROBE_COUNTS=<pending>** — the first battery alignment (`d3f8211`) planned
+**Range**: RANGE=`1c8279b..c9e4d7c` — **COMMIT_COUNT=60**
+commits (the four notes commits excluded from the narrative count), landed across 2026-11-01/02 —
+a single overnight window. Deployed
+as **`DEPLOY_ID=3edf133f`** (version `3edf133f-ac3a-46f1-9a66-4eee096fefc2`) — FINAL_HEAD=`c9e4d7c`. Probe battery
+**PROB_COUNTS=245 pass / 0 fail / 6 warn (253 planned)** — the first battery alignment (`d3f8211`) planned
 **244** probes (238 → 244, six new) and the second (`ebf21a2`) plans **253**
-(nine more); live counts ride the convergence chain.
+(nine more); the first live run answered 239/4/6, all four adjudicated at `c9e4d7c` (a byte-wrong pageClass needle, a U45-stale picture expectation, and two instance-state re-baselines — the PAT posture now mint+sweep-per-cycle with `8e5c4ea`'s guard, and the action-row count grew to two standing p0-shallow fixtures); the second run answered **245/0/6** — first-try green for the re-baselined truth. The six warns are the documented token-unconfigured + toolchain-off classes. The full-suite composite gate passed on its third run after the same adjudication pattern: 463/463 files, zero assertions, one known-class vitest/workerd teardown (`87621de` precedent) on an all-passing file. Migration **0061** applied remote BEFORE deploy (exactly two statements: `repo_transfer.team_ids` + `repositories.num_closed_milestones`).
 
 The wave's shape: **v1.5's own findings drove the work, and a mid-wave restart
 was absorbed without losing a line** — the standing-PAT churn v1.5's audit
