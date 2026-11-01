@@ -22,16 +22,31 @@ import {
   toApiMilestone,
 } from "../services/milestones";
 import { IssuesService } from "../../issues/service";
-import { canViewRepositoryWithTeams, findRepositoryByPath, viewerOf } from "../services/repository";
+import { canWriteRepository } from "../services/repo-access";
+import {
+  canViewRepositoryWithTeams,
+  findRepositoryByPath,
+  viewerOf,
+  type RepositoryWithOwner,
+} from "../services/repository";
 
 /**
  * Tier-1 `issue`-tagged repo-milestone routes (SPEC-0004 §2.4 rows:
  * issueGetMilestonesList / issueCreateMilestone / issueGetMilestone /
  * issueEditMilestone / issueDeleteMilestone). Reads are anonymous-capable;
  * writes require a token upstream (`reqToken` + `reqRepoWriter(TypeIssues,
- * TypePullRequests)` — SPEC-0002 `write:issue`). The path id resolves by id
- * (strconv.ParseInt base 0) with a case-sensitive NAME fallback — including
- * on PATCH and DELETE. Mutations wrap the landed IssuesService.
+ * TypePullRequests)` — SPEC-0002 `write:issue`) and the writer half is
+ * enforced here (`requireRepoWriter`, the upstream reqRepoWriter 403). The
+ * path id resolves by id (strconv.ParseInt base 0) with a case-sensitive NAME
+ * fallback — including on PATCH and DELETE. Mutations wrap the landed
+ * IssuesService. The 403 is runtime-only: the vendored contract declares
+ * {201,404}/{200,404}/{204,404} on the milestone ops (upstream's own swagger
+ * gap), so no 403 response is declared. NO issues-unit gate: upstream's
+ * /milestones group sits OUTSIDE the mustEnableIssuesOrPulls wrapper
+ * (api.go:1674 closes only the /issues subtree; the milestone group
+ * :1682-1688 is a sibling and repo/milestone.go carries no unit check) — a
+ * tracker-disabled repo still serves these, so we mirror that instead of the
+ * issues routes' assertIssuesOrPullsUnit.
  */
 
 const notFoundResponse = {
@@ -176,6 +191,19 @@ async function requireVisibleRepo(c: Context<ApiEnv>, path: { owner: string; rep
 }
 
 /**
+ * `reqRepoWriter(unit.TypeIssues, unit.TypePullRequests)` (routers/api/v1/
+ * api.go:1682-1688 via :393-400) — the milestone write ladder's 403, the
+ * upstream message verbatim. Runs at the middleware's chain position (after
+ * the repo assignment, before the handler's id resolution), so a non-writer's
+ * PATCH/DELETE on a missing milestone answers 403, not the 404.
+ */
+async function requireRepoWriter(c: Context<ApiEnv>, found: RepositoryWithOwner): Promise<void> {
+  if (!(await canWriteRepository(c, found))) {
+    throw new ApiError(403, "user should have a permission to write to a repo");
+  }
+}
+
+/**
  * `ParseIssueFilterStateIsClosed` — unknown state values mean open
  * (upstream: "unknown state, undefined behavior").
  */
@@ -227,6 +255,7 @@ export function registerMilestoneRoutes(
 
   app.openapi(createMilestoneRoute(requireAuth), async (c) => {
     const { found } = await requireVisibleRepo(c, c.req.valid("param"));
+    await requireRepoWriter(c, found);
     const body = c.req.valid("json");
     const service = new IssuesService(c.env.DB);
     const row = await createRepoMilestone(service, found.repo.id, {
@@ -251,6 +280,7 @@ export function registerMilestoneRoutes(
 
   app.openapi(editMilestoneRoute(requireAuth), async (c) => {
     const { found } = await requireVisibleRepo(c, c.req.valid("param"));
+    await requireRepoWriter(c, found);
     const { id } = c.req.valid("param");
     const service = new IssuesService(c.env.DB);
     const row = await findRepoMilestoneByIdOrName(service, c.env.DB, found.repo.id, id);
@@ -271,6 +301,7 @@ export function registerMilestoneRoutes(
 
   app.openapi(deleteMilestoneRoute(requireAuth), async (c) => {
     const { found } = await requireVisibleRepo(c, c.req.valid("param"));
+    await requireRepoWriter(c, found);
     const { id } = c.req.valid("param");
     const service = new IssuesService(c.env.DB);
     const row = await findRepoMilestoneByIdOrName(service, c.env.DB, found.repo.id, id);

@@ -135,7 +135,11 @@ async function seedUser(username: string): Promise<{ id: number; usernameLower: 
   return { id: user.id, usernameLower: user.usernameLower };
 }
 
-async function seedRepo(ownerNamespace: string, slug: string, options: { archived?: boolean; private?: boolean } = {}): Promise<string> {
+async function seedRepo(
+  ownerNamespace: string,
+  slug: string,
+  options: { archived?: boolean; private?: boolean; stubWriter?: boolean } = {},
+): Promise<string> {
   const id = String(repoSeq++);
   await db().insert(repositories).values({
     id,
@@ -148,6 +152,16 @@ async function seedRepo(ownerNamespace: string, slug: string, options: { archive
     backend: "self-hosted",
     createdAt: new Date("2026-02-03T04:05:06Z"),
   });
+  if (options.stubWriter === true) {
+    // The stub token identity (id 1) as a write-mode collaborator — the
+    // GetDoerRepoPermission collaborator arm (repo_permission.go:448-508) that
+    // ranks a direct access row write for reqRepoWriter /
+    // CanWriteIssuesOrPulls, without touching owner/org semantics (the
+    // :1449 locked-comment pin rides the same idiom).
+    await db()
+      .insert(repoCollaborators)
+      .values({ repoId: id, userId: 1, mode: "write", createdAt: new Date(), updatedAt: new Date() });
+  }
   await service().ensureRepoCounters(id);
   return id;
 }
@@ -339,8 +353,9 @@ async function seedTrioPr(
   ownerLower: string,
   slug: string,
   title: string,
+  options: { stubWriter?: boolean } = {},
 ): Promise<{ repoId: string; issueIndex: number; pullIndex: number }> {
-  const repoId = await seedRepo(ownerLower, slug);
+  const repoId = await seedRepo(ownerLower, slug, options);
   const tip = await seedEngineBranches(ownerLower, slug, ["topic"]);
   const child = await landChildCommit(ownerLower, slug, "topic", tip, [
     { name: "README.md", content: `# ${slug} v2\n` },
@@ -1034,7 +1049,7 @@ describe("PATCH /repos/{owner}/{repo}/issues/{index} (issueEditIssue)", () => {
 
   it("moves the milestone with counter maintenance and a milestone comment", async () => {
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     const milestoneId = await seedMilestone(repoId, "v1");
     const otherMilestone = await seedMilestone(repoId, "v2");
     const issue = await seedIssue(repoId, "moving", { posterId: 1, milestoneId });
@@ -1064,7 +1079,7 @@ describe("PATCH /repos/{owner}/{repo}/issues/{index} (issueEditIssue)", () => {
 
   it("sets and unsets the due date", async () => {
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     await seedIssue(repoId, "deadline", { posterId: 1 });
 
     const set = await router()("/repos/alice/visible/issues/1", {
@@ -1082,6 +1097,50 @@ describe("PATCH /repos/{owner}/{repo}/issues/{index} (issueEditIssue)", () => {
     });
     expect(unset.status).toBe(201);
     expect((await unset.json<{ due_date: string | null }>()).due_date).toBeNull();
+  });
+
+  it("silently skips the deadline/milestone arms for a non-writer poster (issue.go:760/:789)", async () => {
+    // Upstream computes canWrite once and guards ONLY the writer arms with it:
+    // a non-writer POSTER still edits the issue (201, title applied) while the
+    // deadline/milestone arms skip entirely — no milestone change, no counter
+    // moves, no system comment, no webhook. The stub identity (posterId 1)
+    // holds no write grant on alice's repo.
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const milestoneId = await seedMilestone(repoId, "v1");
+    const other = await seedMilestone(repoId, "v2");
+    const issue = await seedIssue(repoId, "poster-edits", { posterId: 1, milestoneId });
+    const hookId = await seedHook(repoId, ["issue_milestone"]);
+
+    const patch = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "renamed by poster", milestone: other, due_date: "2031-03-04" }),
+    });
+    expect(patch.status).toBe(201);
+    const body = await patch.json<{ title: string; milestone: { id: number } | null; due_date: string | null }>();
+    expect(body.title).toBe("renamed by poster");
+    expect(body.milestone?.id).toBe(milestoneId); // unchanged
+    expect(body.due_date).toBeNull(); // unchanged
+
+    const ms = await db().select().from(milestones).all();
+    expect(ms.find((m) => m.id === milestoneId)?.numIssues).toBe(1);
+    expect(ms.find((m) => m.id === other)?.numIssues).toBe(0);
+    // The title edit's own ChangeTitle (10) comment is the ONLY row — no
+    // Milestone (8) system comment, no deadline comment either.
+    const types = (await db().select().from(comments).where(eq(comments.issueId, issue.id)).all()).map((r) => r.type);
+    expect(types).toEqual([CommentType.ChangeTitle]);
+    expect(await deliveriesFor(hookId)).toHaveLength(0);
+
+    // The skip swallows the arm's validation too: an unknown milestone id is
+    // NOT the 404 a writer would get — the same 201, milestone untouched.
+    const unknown = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ milestone: 42 }),
+    });
+    expect(unknown.status).toBe(201);
+    expect((await unknown.json<{ milestone: { id: number } | null }>()).milestone?.id).toBe(milestoneId);
   });
 
   it("403s non-poster non-owner editors and 404s missing issues", async () => {
@@ -1742,7 +1801,7 @@ describe("issue label routes (issueGetLabels / issueAddLabel / issueReplaceLabel
 
   it("POST adds (idempotent, by id AND by name) and answers 200 — never 201", async () => {
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     const a = await seedLabel(repoId, "alpha");
     const b = await seedLabel(repoId, "beta");
     await seedIssue(repoId, "target", { labelIds: [a] });
@@ -1766,7 +1825,7 @@ describe("issue label routes (issueGetLabels / issueAddLabel / issueReplaceLabel
 
   it("rejects mixed id/name arrays with the runtime 400 and unknown labels with 404", async () => {
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     await seedLabel(repoId, "alpha");
     await seedIssue(repoId, "target");
 
@@ -1795,7 +1854,7 @@ describe("issue label routes (issueGetLabels / issueAddLabel / issueReplaceLabel
 
   it("PUT replaces the whole set (200) and DELETE clears it (204)", async () => {
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     const a = await seedLabel(repoId, "alpha");
     const b = await seedLabel(repoId, "beta");
     await seedIssue(repoId, "replace me", { labelIds: [a, b] });
@@ -1818,9 +1877,11 @@ describe("issue label routes (issueGetLabels / issueAddLabel / issueReplaceLabel
 
   it("keeps label open-counters in step and 423s archived repos on mutations", async () => {
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     const labelId = await seedLabel(repoId, "bug");
     await seedIssue(repoId, "countered");
+    // The frozen repo stays grant-less: the 423 (mustNotBeArchived) sits ahead
+    // of the writer gate in upstream's chain, so even a non-writer gets the 423.
     await seedRepo(owner.usernameLower, "frozen", { archived: true });
 
     await router()("/repos/alice/visible/issues/1/labels", {
@@ -1848,7 +1909,7 @@ describe("issue label routes (issueGetLabels / issueAddLabel / issueReplaceLabel
     // (services/convert/issue.go:269-280). The admin list does NOT union
     // (repo/label.go:52,58) — the pinned asymmetry.
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     await env.DB.prepare("UPDATE users SET type = 'org' WHERE id = ?").bind(owner.id).run();
     const repoLabel = await seedLabel(repoId, "repo-side");
     const orgLabel = await db()
@@ -1886,7 +1947,7 @@ describe("issue label routes (issueGetLabels / issueAddLabel / issueReplaceLabel
 
   it("falls org-only names through to the owner org and keeps repo names repo-wins (pin 7448b49aac)", async () => {
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     await env.DB.prepare("UPDATE users SET type = 'org' WHERE id = ?").bind(owner.id).run();
     const shared = await seedLabel(repoId, "shared"); // the repo AND the org carry the name
     await db()
@@ -1924,7 +1985,7 @@ describe("issue label routes (issueGetLabels / issueAddLabel / issueReplaceLabel
 
   it("PUT replaces with a mixed repo+org id set and still rejects foreign-repo ids on the org-owned repo", async () => {
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     await env.DB.prepare("UPDATE users SET type = 'org' WHERE id = ?").bind(owner.id).run();
     const repoLabel = await seedLabel(repoId, "repo-side");
     const orgLabel = await db()
@@ -1963,7 +2024,7 @@ describe("issue label routes (issueGetLabels / issueAddLabel / issueReplaceLabel
 
   it("rejects org label ids on user-owned repos as today (owner is not an org)", async () => {
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     const orgLabel = await db()
       .insert(labels)
       .values({ repoId: null, orgId: owner.id, name: "org-wide", color: "#778899", description: "" })
@@ -1983,6 +2044,55 @@ describe("issue label routes (issueGetLabels / issueAddLabel / issueReplaceLabel
       url: ERROR_URL,
     });
   });
+
+  it("403s the write arms for a non-writer (add/replace 'write permission is required', clear bare)", async () => {
+    // The CanWriteIssuesOrPulls gates of prepareForReplaceOrAdd (issue_label.go:311
+    // — add and replace share it, message verbatim) and ClearIssueLabels
+    // (:292 — bare Status(403), empty body, the landed single-label detach's
+    // shape). The stub identity holds no grant on alice's repo.
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const labelId = await seedLabel(repoId, "bug");
+    await seedIssue(repoId, "gated");
+
+    const add = await router()("/repos/alice/visible/issues/1/labels", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: [labelId] }),
+    });
+    expect(add.status).toBe(403);
+    expect(await add.json()).toEqual({ message: "write permission is required", url: ERROR_URL });
+
+    const replace = await router()("/repos/alice/visible/issues/1/labels", {
+      method: "PUT",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: [labelId] }),
+    });
+    expect(replace.status).toBe(403);
+    expect(await replace.json()).toEqual({ message: "write permission is required", url: ERROR_URL });
+
+    const clear = await router()("/repos/alice/visible/issues/1/labels", { method: "DELETE", headers: authHeaders });
+    expect(clear.status).toBe(403);
+    expect(await clear.json()).toEqual({ message: "", url: ERROR_URL });
+
+    // Nothing attached, no counters moved.
+    expect((await db().select().from(labels).where(eq(labels.id, labelId)).all())[0]?.numIssues).toBe(0);
+  });
+
+  it("404s a missing issue ahead of the writer gate on the label arms", async () => {
+    // getRepoIssueByIndexForDoer runs BEFORE CanWriteIssuesOrPulls upstream
+    // (issue_label.go:166-172's order), so a missing issue stays the 404 even
+    // for a non-writer.
+    const owner = await seedUser("Alice");
+    await seedRepo(owner.usernameLower, "visible");
+
+    const missing = await router()("/repos/alice/visible/issues/9/labels", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ labels: [] }),
+    });
+    expect(missing.status).toBe(404);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1995,7 +2105,7 @@ describe("issue label routes (issueGetLabels / issueAddLabel / issueReplaceLabel
 describe("issue label webhook emissions (issueAddLabel / issueReplaceLabels / issueClearLabels)", () => {
   it("emits label_updated on POST and PUT and label_cleared on DELETE, with the IssuePayload field set", async () => {
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     const a = await seedLabel(repoId, "alpha");
     const b = await seedLabel(repoId, "beta");
     await seedIssue(repoId, "labeled");
@@ -2050,7 +2160,7 @@ describe("issue label webhook emissions (issueAddLabel / issueReplaceLabels / is
     const owner = await seedUser("Alice");
     const neighbor = await seedUser("neighbor");
     const recluse = await seedUser("recluse");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     const issue = await seedIssue(repoId, "labeled-set");
     await db().insert(issueAssignees).values([
       { issueId: issue.id, assigneeId: neighbor.id },
@@ -2099,7 +2209,7 @@ describe("issue label webhook emissions (issueAddLabel / issueReplaceLabels / is
 
   it("stays silent for hooks not subscribed to issue_label", async () => {
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     const labelId = await seedLabel(repoId, "bug");
     await seedIssue(repoId, "quiet");
     const hookId = await seedHook(repoId, ["issues"]); // sibling event, not issue_label
@@ -2116,7 +2226,7 @@ describe("issue label webhook emissions (issueAddLabel / issueReplaceLabels / is
 
   it("routes PR label writes to pull_request_label with the PullRequestPayload field set", async () => {
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     const labelId = await seedLabel(repoId, "approved");
     const pull = await service().createPullRequest({
       repoId,
@@ -2162,7 +2272,7 @@ describe("issue label webhook emissions (issueAddLabel / issueReplaceLabels / is
     const owner = await seedUser("Alice");
     const neighbor = await seedUser("neighbor");
     const recluse = await seedUser("recluse");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     const labelId = await seedLabel(repoId, "approved");
     const pull = await service().createPullRequest({
       repoId,
@@ -2199,7 +2309,7 @@ describe("issue label webhook emissions (issueAddLabel / issueReplaceLabels / is
 
   it("renders the PR's EMPTY assignee set as [] not null (pull.go:87 SliceNilAsEmpty — the PR-converter nuance the issue arm lacks)", async () => {
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     const labelId = await seedLabel(repoId, "approved");
     const pull = await service().createPullRequest({
       repoId,
@@ -2233,7 +2343,7 @@ describe("issue label webhook emissions (issueAddLabel / issueReplaceLabels / is
   it("carries the diff-stat trio on the pull_request_label payload over the real range diff (the GetDiffShortStat block is not gated on isPayload — convert/pull.go:31-34 + :230-254)", async () => {
     // The namespace's owner ROW must exist — findRepositoryByPath inner-joins it.
     const owner = await seedUser("Alice");
-    const { repoId, issueIndex } = await seedTrioPr(owner.usernameLower, "trio-label", "PR label trio");
+    const { repoId, issueIndex } = await seedTrioPr(owner.usernameLower, "trio-label", "PR label trio", { stubWriter: true });
     const labelId = await seedLabel(repoId, "approved");
     const hookId = await seedHook(repoId, ["pull_request_label"]);
 
@@ -2440,7 +2550,7 @@ describe("comment edit/delete webhook emissions (issueEditComment / issueDeleteC
 describe("issue milestone webhook emissions (issueEditIssue PATCH milestone arm)", () => {
   it("emits milestoned on the set and demilestoned on the clear, with the IssuePayload field set", async () => {
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     const milestoneId = await seedMilestone(repoId, "v1");
     await seedIssue(repoId, "milestoned", { posterId: 1 });
     const hookId = await seedHook(repoId, ["issue_milestone"]);
@@ -2481,7 +2591,7 @@ describe("issue milestone webhook emissions (issueEditIssue PATCH milestone arm)
 
   it("stays silent on an unchanged milestone PATCH, for push-only hooks, and for sibling subscriptions", async () => {
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     const milestoneId = await seedMilestone(repoId, "v1");
     await seedIssue(repoId, "quiet", { posterId: 1, milestoneId });
     const hookId = await seedHook(repoId, ["issue_milestone"]);
@@ -2503,7 +2613,7 @@ describe("issue milestone webhook emissions (issueEditIssue PATCH milestone arm)
 
   it("routes PR milestone writes to pull_request_milestone with the PullRequestPayload field set", async () => {
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     const milestoneId = await seedMilestone(repoId, "v1");
     const pull = await service().createPullRequest({
       repoId,
@@ -2550,7 +2660,7 @@ describe("issue milestone webhook emissions (issueEditIssue PATCH milestone arm)
     const owner = await seedUser("Alice");
     const neighbor = await seedUser("neighbor");
     const recluse = await seedUser("recluse");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     const milestoneId = await seedMilestone(repoId, "v1");
     const issue = await seedIssue(repoId, "milestoned-set", { posterId: 1 });
     await db().insert(issueAssignees).values([
@@ -2592,7 +2702,7 @@ describe("issue milestone webhook emissions (issueEditIssue PATCH milestone arm)
   it("carries the diff-stat trio on the pull_request_milestone payload over the real range diff (the GetDiffShortStat block is not gated on isPayload — convert/pull.go:31-34 + :230-254)", async () => {
     // The namespace's owner ROW must exist — findRepositoryByPath inner-joins it.
     const owner = await seedUser("Alice");
-    const { repoId, issueIndex } = await seedTrioPr(owner.usernameLower, "trio-mile", "PR milestone trio");
+    const { repoId, issueIndex } = await seedTrioPr(owner.usernameLower, "trio-mile", "PR milestone trio", { stubWriter: true });
     const milestoneId = await seedMilestone(repoId, "v1");
     const hookId = await seedHook(repoId, ["pull_request_milestone"]);
 

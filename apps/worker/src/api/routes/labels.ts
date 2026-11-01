@@ -24,17 +24,27 @@ import {
   canViewRepositoryWithTeams,
   findRepositoryByPath,
   viewerOf,
+  type RepositoryWithOwner,
 } from "../services/repository";
+import { canWriteRepository } from "../services/repo-access";
 
 /**
  * Tier-1 `issue`-tagged repo-label routes (SPEC-0004 §2.4 rows:
  * issueListLabels / issueCreateLabel / issueGetLabel / issueEditLabel /
  * issueDeleteLabel). Reads are anonymous-capable; the writes require a token
  * upstream (`reqToken` + `reqRepoWriter(TypeIssues, TypePullRequests)` —
- * SPEC-0002 `write:issue`). No 423 archived gate here (upstream gates only
- * the issue-level label operations). Label ids are repo-scoped; the id path
- * param falls back to a name lookup on GET (upstream repo.GetLabel), while
- * PATCH/DELETE are strictly numeric.
+ * SPEC-0002 `write:issue`) and the writer half is enforced here
+ * (`requireRepoWriter`, the upstream reqRepoWriter 403). No 423 archived gate
+ * here (upstream gates only the issue-level label operations). Label ids are
+ * repo-scoped; the id path param falls back to a name lookup on GET (upstream
+ * repo.GetLabel), while PATCH/DELETE are strictly numeric. The 403 is
+ * runtime-only: the vendored contract declares {201,404,422}/{200,404,422}/
+ * {204,404} on the repo-label ops (upstream's own swagger gap), so no 403
+ * response is declared. NO issues-unit gate: upstream's /labels group sits
+ * OUTSIDE the mustEnableIssuesOrPulls wrapper (api.go:1674 closes only the
+ * /issues subtree; the label group :1675-1681 is a sibling and repo/label.go
+ * carries no unit check) — a tracker-disabled repo still serves these, so we
+ * mirror that instead of the issues routes' assertIssuesOrPullsUnit.
  */
 
 const notFoundResponse = {
@@ -176,6 +186,20 @@ async function requireVisibleRepo(c: Context<ApiEnv>, path: { owner: string; rep
   return { viewer, found };
 }
 
+/**
+ * `reqRepoWriter(unit.TypeIssues, unit.TypePullRequests)` (routers/api/v1/
+ * api.go:1675-1681 via :393-400) — the repo-label write ladder's 403, the
+ * upstream message verbatim. Runs at the middleware's chain position (after
+ * the repo assignment, before the handler's id resolution), so a non-writer's
+ * PATCH/DELETE on a missing or garbage id answers 403, not the label 404 /
+ * the missing-label 204.
+ */
+async function requireRepoWriter(c: Context<ApiEnv>, found: RepositoryWithOwner): Promise<void> {
+  if (!(await canWriteRepository(c, found))) {
+    throw new ApiError(403, "user should have a permission to write to a repo");
+  }
+}
+
 /** Body bind hook: upstream's Go bind answers malformed bodies with the
  * declared 422 (`bind()` → `Name: Required`-shaped message; ours stays the
  * route-family's generic text). */
@@ -224,6 +248,7 @@ export function registerLabelRoutes(
     createLabelRoute(requireAuth),
     async (c) => {
       const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireRepoWriter(c, found);
       const body = c.req.valid("json");
       const color = normalizeLabelColor(body.color);
       const row = await createRepoLabel(c.env.DB, found.repo.id, {
@@ -256,6 +281,7 @@ export function registerLabelRoutes(
     editLabelRoute(requireAuth),
     async (c) => {
       const { viewer, found } = await requireVisibleRepo(c, c.req.valid("param"));
+      await requireRepoWriter(c, found);
       const { id } = c.req.valid("param");
       const numericId = pathParamInt64(id);
       const row = await findRepoLabelById(c.env.DB, found.repo.id, numericId);
@@ -283,6 +309,7 @@ export function registerLabelRoutes(
 
   app.openapi(deleteLabelRoute(requireAuth), async (c) => {
     const { found } = await requireVisibleRepo(c, c.req.valid("param"));
+    await requireRepoWriter(c, found);
     const { id } = c.req.valid("param");
     const row = await findRepoLabelById(c.env.DB, found.repo.id, pathParamInt64(id));
     // Upstream deleteLabel succeeds with zero deleted rows — a missing label

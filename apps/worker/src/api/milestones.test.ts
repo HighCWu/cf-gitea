@@ -14,6 +14,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
 import { issues, milestones, repoCounters, repositories, users } from "../db/schema";
+import { STUB_USER, type AuthResolver } from "./auth";
 import { createApiRouter } from "./router";
 import { contractModelProperties } from "../compat/contract/frozen-contract";
 
@@ -34,7 +35,8 @@ const db = () => drizzle(env.DB);
 
 const MILESTONE_FIELDS = Object.keys(contractModelProperties("Milestone")).sort();
 
-const TOKEN = "stub-token";
+const TOKEN = "stub-token"; // resolves to the seeded repo owner (login alice)
+const TOKEN_NEIGHBOR = "neighbor-token"; // resolves to a non-writer stranger
 const authHeaders = { Authorization: `token ${TOKEN}`, "Content-Type": "application/json" };
 const ERROR_URL = "https://example.com/api/swagger";
 
@@ -102,8 +104,27 @@ async function seedMilestone(repoId: string, input: SeedMilestoneInput): Promise
   return row.id;
 }
 
+/**
+ * The resolver seam: TOKEN maps to the seeded owner (login alice — every repo
+ * in this file is alice-owned) so the happy-path writes ride the writer gate
+ * as its writer; TOKEN_NEIGHBOR maps to an unaffiliated stranger and pins the
+ * reqRepoWriter 403s. STUB_USER carries the contract User field set; only
+ * id/login/username are re-pointed.
+ */
+const resolver: AuthResolver = {
+  resolveToken: (token) => {
+    if (token === TOKEN) {
+      return Promise.resolve({ ...STUB_USER, login: "alice", username: "Alice" });
+    }
+    if (token === TOKEN_NEIGHBOR) {
+      return Promise.resolve({ ...STUB_USER, id: 424242, login: "neighbor", username: "neighbor" });
+    }
+    return Promise.resolve(null);
+  },
+};
+
 const router = () => {
-  const app = createApiRouter();
+  const app = createApiRouter({ auth: resolver });
   return async (path: string, init?: RequestInit): Promise<Response> =>
     app.fetch(new Request(`https://example.com${path}`, init), env);
 };
@@ -214,6 +235,28 @@ describe("POST /repos/{owner}/{repo}/milestones (issueCreateMilestone)", () => {
     });
     expect(missing.status).toBe(404);
     expect(await missing.json()).toEqual({ message: "not found", url: ERROR_URL });
+  });
+
+  it("403s a non-writer with the upstream reqRepoWriter message (runtime-only status)", async () => {
+    // reqRepoWriter(TypeIssues, TypePullRequests) (api.go:1682-1688 via
+    // :393-400): any authenticated non-writer — here the neighbor token on an
+    // alice-owned repo — is rejected before the handler; the vendored
+    // contract declares no 403 on the milestone ops (upstream's own swagger
+    // gap), so the status is runtime-only.
+    await seedUser("Alice");
+    await seedRepo("alice", "visible");
+
+    const res = await router()("/repos/alice/visible/milestones", {
+      method: "POST",
+      headers: { Authorization: `token ${TOKEN_NEIGHBOR}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "m" }),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({
+      message: "user should have a permission to write to a repo",
+      url: ERROR_URL,
+    });
+    expect(await db().select().from(milestones).all()).toHaveLength(0);
   });
 });
 
@@ -442,6 +485,34 @@ describe("PATCH /repos/{owner}/{repo}/milestones/{id} (issueEditMilestone)", () 
     expect(anon.status).toBe(401);
     expect(await anon.json()).toEqual({ message: "token is required", url: ERROR_URL });
   });
+
+  it("403s a non-writer BEFORE the id resolution (missing milestone stays a 403)", async () => {
+    // Upstream chains reqRepoWriter ahead of the handler, so the gate runs
+    // before getMilestoneByIDOrName — a non-writer's PATCH on a missing
+    // milestone answers the 403, never the plain 404.
+    await seedUser("Alice");
+    const repoId = await seedRepo("alice", "visible");
+    const id = await seedMilestone(repoId, { name: "v1" });
+    const neighborHeaders = { Authorization: `token ${TOKEN_NEIGHBOR}`, "Content-Type": "application/json" };
+
+    const existing = await router()(`/repos/alice/visible/milestones/${id}`, {
+      method: "PATCH",
+      headers: neighborHeaders,
+      body: JSON.stringify({ title: "hijack" }),
+    });
+    expect(existing.status).toBe(403);
+    expect(await existing.json()).toEqual({
+      message: "user should have a permission to write to a repo",
+      url: ERROR_URL,
+    });
+
+    const missing = await router()("/repos/alice/visible/milestones/999995", {
+      method: "PATCH",
+      headers: neighborHeaders,
+      body: JSON.stringify({ title: "x" }),
+    });
+    expect(missing.status).toBe(403);
+  });
 });
 
 describe("DELETE /repos/{owner}/{repo}/milestones/{id} (issueDeleteMilestone)", () => {
@@ -467,5 +538,20 @@ describe("DELETE /repos/{owner}/{repo}/milestones/{id} (issueDeleteMilestone)", 
     const res = await router()("/repos/alice/visible/milestones/999996", { method: "DELETE", headers: authHeaders });
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ message: "not found", url: ERROR_URL });
+  });
+
+  it("403s a non-writer BEFORE the id resolution (missing milestone stays a 403, not the silent 204)", async () => {
+    await seedUser("Alice");
+    await seedRepo("alice", "visible");
+
+    const res = await router()("/repos/alice/visible/milestones/999994", {
+      method: "DELETE",
+      headers: { Authorization: `token ${TOKEN_NEIGHBOR}` },
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({
+      message: "user should have a permission to write to a repo",
+      url: ERROR_URL,
+    });
   });
 });

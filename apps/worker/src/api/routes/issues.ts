@@ -1419,6 +1419,12 @@ export function registerIssueRoutes(
       // is the {message, url} envelope — sent empty-messageed.
       throw new ApiError(403, "");
     }
+    // Upstream resolves canWrite once (issue.go:706 CanWriteIssuesOrPulls) and
+    // gates ONLY the writer arms on it: a non-writer POSTER still edits the
+    // issue, but the deadline/milestone arms below silently skip (issue.go:760
+    // `canWrite && !editIssueDeadline(...)`, :789 `canWrite && form.Milestone
+    // != nil && …`) — no counter moves, no system comments, no webhooks.
+    const canWrite = await canWriteRepository(c, found);
     const form = c.req.valid("json");
     const service = new IssuesService(c.env.DB, c.env);
     const requester = c.get("authUser");
@@ -1524,17 +1530,22 @@ export function registerIssueRoutes(
       issue = { ...issue, ref };
     }
 
-    // Deadline: unset_due_date removes; due_date sets (writer-gated upstream).
-    if (patchField(form.unset_due_date) === true && issue.deadlineAt !== null) {
-      await changeIssueDeadline(c.env.DB, issue, null, issue.deadlineAt, actorId, now);
-      issue = { ...issue, deadlineAt: null };
-    } else {
-      const dueDate = patchField(form.due_date);
-      if (dueDate !== undefined && dueDate !== "") {
-        const parsed = parseMilestoneDeadline(dueDate);
-        if (parsed === null || parsed.getTime() !== issue.deadlineAt?.getTime()) {
-          await changeIssueDeadline(c.env.DB, issue, parsed, issue.deadlineAt, actorId, now);
-          issue = { ...issue, deadlineAt: parsed };
+    // Deadline: unset_due_date removes; due_date sets. WRITER-gated upstream
+    // (issue.go:760) — the arm (including the due_date format validation) is
+    // skipped entirely for a non-writer, so their bad formats stay unparsed
+    // and the request answers 201 with the deadline untouched.
+    if (canWrite) {
+      if (patchField(form.unset_due_date) === true && issue.deadlineAt !== null) {
+        await changeIssueDeadline(c.env.DB, issue, null, issue.deadlineAt, actorId, now);
+        issue = { ...issue, deadlineAt: null };
+      } else {
+        const dueDate = patchField(form.due_date);
+        if (dueDate !== undefined && dueDate !== "") {
+          const parsed = parseMilestoneDeadline(dueDate);
+          if (parsed === null || parsed.getTime() !== issue.deadlineAt?.getTime()) {
+            await changeIssueDeadline(c.env.DB, issue, parsed, issue.deadlineAt, actorId, now);
+            issue = { ...issue, deadlineAt: parsed };
+          }
         }
       }
     }
@@ -1570,9 +1581,12 @@ export function registerIssueRoutes(
       );
     }
 
-    // Milestone: only on actual change (upstream guards with !=).
+    // Milestone: only on actual change (upstream guards with !=). WRITER-gated
+    // upstream (issue.go:789) — the whole arm (the unknown-milestone 404
+    // validation included) skips for a non-writer, so their PATCH succeeds
+    // with the milestone untouched.
     const milestone = patchField(form.milestone);
-    if (milestone !== undefined && milestone !== issue.milestoneId) {
+    if (canWrite && milestone !== undefined && milestone !== issue.milestoneId) {
       const newMilestoneId = milestone === 0 ? null : milestone;
       if (newMilestoneId !== null) {
         const row = await service.getMilestone(newMilestoneId);
@@ -1758,6 +1772,11 @@ export function registerIssueRoutes(
       const { viewer, found, units } = await requireVisibleRepo(c, c.req.valid("param"));
       assertNotArchived(found);
       const issue = await requireIssue(c, found, c.req.valid("param").index, units);
+      if (!(await canWriteRepository(c, found))) {
+        // prepareForReplaceOrAdd's CanWriteIssuesOrPulls 403 (issue_label.go:311
+        // — AddIssueLabels rides it), the upstream message verbatim.
+        throw new ApiError(403, "write permission is required");
+      }
       const form = c.req.valid("json");
       const labelIds = await resolveLabelOptionIds(c.env.DB, found, form.labels);
       const service = new IssuesService(c.env.DB);
@@ -1793,6 +1812,11 @@ export function registerIssueRoutes(
       const { viewer, found, units } = await requireVisibleRepo(c, c.req.valid("param"));
       assertNotArchived(found);
       const issue = await requireIssue(c, found, c.req.valid("param").index, units);
+      if (!(await canWriteRepository(c, found))) {
+        // prepareForReplaceOrAdd's CanWriteIssuesOrPulls 403 (issue_label.go:311
+        // — ReplaceIssueLabels rides it), the upstream message verbatim.
+        throw new ApiError(403, "write permission is required");
+      }
       const form = c.req.valid("json");
       const labelIds = await resolveLabelOptionIds(c.env.DB, found, form.labels);
       const service = new IssuesService(c.env.DB);
@@ -1823,6 +1847,11 @@ export function registerIssueRoutes(
     const { found, units } = await requireVisibleRepo(c, c.req.valid("param"));
     assertNotArchived(found);
     const issue = await requireIssue(c, found, c.req.valid("param").index, units);
+    if (!(await canWriteRepository(c, found))) {
+      // ClearIssueLabels: bare Status(403), empty body (issue_label.go:292) —
+      // the same bare-403 shape the landed single-label detach gate answers.
+      throw new ApiError(403, "");
+    }
     const service = new IssuesService(c.env.DB);
     try {
       await service.replaceLabels(issue.id, [], { ownerOrgId: null });
