@@ -33,6 +33,8 @@ import type { ApiEnv } from "../env";
 import { registerPackagesRoutes, createPackagesProtocolRouter } from "./packages";
 import type { User } from "../models/user";
 import { packageBlobContentKey } from "../../services/packages/blobs";
+import { getOrInsertPackage, getOrInsertVersion } from "../../services/packages/model";
+import { removeTerraformLock, setTerraformLock } from "../../services/packages/terraform";
 import { mintFor } from "../../auth/testing/seeds";
 
 beforeAll(async () => {
@@ -940,6 +942,127 @@ describe("the 9 management ops + admin list", () => {
     const filteredRows = await filtered.json<Record<string, unknown>[]>();
     expect(filteredRows).toHaveLength(1);
     expect(filteredRows[0]?.name).toBe("other-pkg");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The terraform specialization's delete guards (spec.go:50-80 through the
+// RemovePackage/RemovePackageVersion spec hooks) — the 422s the v1 deletes
+// answer on a LOCKED state / the LATEST version; the API twins of the web
+// settings arms (package-settings.test.tsx's delete seams).
+// ---------------------------------------------------------------------------
+
+describe("the terraform delete guards (deletePackage + deletePackageVersion)", () => {
+  /** One terraform package with two versions (older + latest) — the web
+   *  fixture's shape (seedPackageVersion with type: "terraform"); the lock
+   *  rides the landed terraform service (the package property). */
+  async function terraformFixture(): Promise<{
+    ownerWrite: string;
+    lock: () => Promise<void>;
+    unlock: () => Promise<void>;
+  }> {
+    const owner = await seedUser("tflord");
+    const ownerWrite = await token(owner, "write:package");
+    const { row: pkg } = await getOrInsertPackage(env.DB, {
+      ownerId: owner.id,
+      type: "terraform",
+      name: "state",
+      now: NOW,
+    });
+    await getOrInsertVersion(env.DB, {
+      packageId: pkg.id,
+      creatorId: owner.id,
+      version: "1",
+      now: NOW,
+    });
+    await getOrInsertVersion(env.DB, {
+      packageId: pkg.id,
+      creatorId: owner.id,
+      version: "2",
+      now: new Date(NOW.getTime() + 1000),
+    });
+    const lock = (): Promise<void> =>
+      setTerraformLock(env.DB, pkg.id, {
+        ID: "lock-1",
+        Operation: "Manual UI Lock",
+        Info: "",
+        Who: "tflord",
+        Version: "1.9.0",
+        Created: "2026-10-29T12:00:00Z",
+        Path: "",
+      });
+    const unlock = (): Promise<void> => removeTerraformLock(env.DB, pkg.id);
+    return { ownerWrite, lock, unlock };
+  }
+
+  it("deletePackage: a LOCKED state refuses with the …delete.locked 422; unlocked deletes", async () => {
+    const { ownerWrite, lock, unlock } = await terraformFixture();
+    await lock();
+    const locked = await router()("/api/v1/packages/tflord/terraform/state", {
+      method: "DELETE",
+      headers: authHeaders(ownerWrite),
+    });
+    expect(locked.status).toBe(422);
+    expect(await locked.json()).toEqual({
+      message: "terraform state is locked and cannot be deleted",
+      url: ERROR_URL,
+    });
+    expect(await db().select().from(packages).all()).toHaveLength(1); // no partial state
+
+    await unlock();
+    const ok = await router()("/api/v1/packages/tflord/terraform/state", {
+      method: "DELETE",
+      headers: authHeaders(ownerWrite),
+    });
+    expect(ok.status).toBe(204);
+    await ok.text();
+    expect(await db().select().from(packages).all()).toHaveLength(0);
+  });
+
+  it("deletePackageVersion: LOCKED first, then the LATEST refusal; the older version deletes", async () => {
+    const { ownerWrite, lock, unlock } = await terraformFixture();
+    await lock();
+    // The locked refusal precedes the latest check — even the OLDER version
+    // is refused (spec.go:66-74 precedes :76-79).
+    const locked = await router()("/api/v1/packages/tflord/terraform/state/1", {
+      method: "DELETE",
+      headers: authHeaders(ownerWrite),
+    });
+    expect(locked.status).toBe(422);
+    expect(await locked.json()).toEqual({
+      message: "terraform state is locked and cannot be deleted",
+      url: ERROR_URL,
+    });
+
+    await unlock();
+    // The LATEST version refuses even unlocked (…delete.latest).
+    const latestRefusal = await router()("/api/v1/packages/tflord/terraform/state/2", {
+      method: "DELETE",
+      headers: authHeaders(ownerWrite),
+    });
+    expect(latestRefusal.status).toBe(422);
+    expect(await latestRefusal.json()).toEqual({
+      message: "the latest version of a Terraform state cannot be deleted",
+      url: ERROR_URL,
+    });
+
+    // The older version deletes…
+    const olderOk = await router()("/api/v1/packages/tflord/terraform/state/1", {
+      method: "DELETE",
+      headers: authHeaders(ownerWrite),
+    });
+    expect(olderOk.status).toBe(204);
+    await olderOk.text();
+    // …and the survivor is now the only (hence latest) version — still refused.
+    const stillLatest = await router()("/api/v1/packages/tflord/terraform/state/2", {
+      method: "DELETE",
+      headers: authHeaders(ownerWrite),
+    });
+    expect(stillLatest.status).toBe(422);
+    expect(await stillLatest.json()).toEqual({
+      message: "the latest version of a Terraform state cannot be deleted",
+      url: ERROR_URL,
+    });
   });
 });
 

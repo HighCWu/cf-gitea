@@ -307,12 +307,9 @@
  *   MaxPinned default 3 per type), pinned unpins; both redirect canonical.
  *   The write is the upstream port (the pin row at max+1 + the pin(36)
  *   comment / the delete + the unpin(37) comment, num_comments folded) —
- *   the landed API port's helpers are file-private in
- *   api/routes/issue-write-t2.ts, so this module re-ports those three
- *   statements verbatim (insertIssuePin/deleteIssuePin/moveIssuePin over
- *   the SAME upstream lines) — the one write-logic duplication in this
- *   unit, disclosed for the orchestrator's seam-extraction call (the
- *   natural home is api/services/issue-extras.ts beside lockIssue).
+ *   the statements live in api/services/issue-extras.ts (the shared seam
+ *   beside lockIssue; c1391ce's duplication note resolved) and both this
+ *   module and api/routes/issue-write-t2.ts call them.
  * - IssueUnpin (issue_pin.go:56-77): repo-scoped index lookup (a miss is
  *   the 404 shell — upstream ServerError), the unpinned no-op is the
  *   silent success, answer 204.
@@ -337,12 +334,17 @@
  */
 
 import { Context, Hono } from "hono";
-import { and, eq, gt, gte, inArray, lt, sql } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import type { ApiEnv } from "../../api/env";
 import {
+  deleteIssuePin,
+  insertIssuePin,
   lockIssue,
+  moveIssuePin,
+  pinOfIssue,
+  pinStats,
   setIssueSubscription,
   unlockIssue,
 } from "../../api/services/issue-extras";
@@ -366,8 +368,7 @@ import { findRepositoryById, type RepositoryWithOwner, type UserRow } from "../.
 import { loadRepoSettings } from "../../api/services/repo-settings";
 import { getWatch } from "../../api/services/repo-watchers";
 import { isStarring } from "../../api/services/stars";
-import { comments, issuePins, issues, projectIssues, projects, users } from "../../db/schema";
-import { CommentType } from "../../issues/comment-types";
+import { projectIssues, projects, users } from "../../db/schema";
 import type { IssueRow } from "../../issues/service";
 import { IssuesService } from "../../issues/service";
 import { demoModeEnabled } from "../../services/demo-sweep";
@@ -523,111 +524,12 @@ export function parseMovePinBody(body: unknown): MovePinBody {
 }
 
 // ---------------------------------------------------------------------------
-// The pin write port (issue_pin.go:61-173 — the landed API port's
-// file-private helpers re-ported; the module header carries the duplication
-// note and the seam-extraction recommendation)
+// The pin write seam rides services/issue-extras.ts — insertIssuePin /
+// deleteIssuePin / moveIssuePin (+ the pinOfIssue/pinStats reads) moved there
+// verbatim (the c1391ce seam extraction), so this module imports the SAME
+// statements the API routes call; the module header's duplication note is
+// history.
 // ---------------------------------------------------------------------------
-
-/** GetIssuePin (issue_pin.go:37) — the pin row, null when unpinned. */
-export async function pinOfIssue(d1: D1Database, issueId: number): Promise<{ pinOrder: number } | null> {
-  const row = await drizzle(d1)
-    .select({ pinOrder: issuePins.pinOrder })
-    .from(issuePins)
-    .where(eq(issuePins.issueId, issueId))
-    .limit(1)
-    .then((rows) => rows[0]);
-  return row ?? null;
-}
-
-/** getPinnedIssuesNum/MaxPinOrder (issue_pin.go:119-131) over one type half
- *  (the is_pull split rides the issues join — the landed API port's
- *  pinStats shape). */
-export async function pinStats(d1: D1Database, repoId: string, isPull: boolean): Promise<{ count: number; maxOrder: number }> {
-  const rows = await drizzle(d1)
-    .select({ pinOrder: issuePins.pinOrder })
-    .from(issuePins)
-    .innerJoin(issues, eq(issues.id, issuePins.issueId))
-    .where(and(eq(issuePins.repoId, repoId), eq(issues.isPull, isPull)))
-    .all();
-  return { count: rows.length, maxOrder: rows.reduce((max, row) => Math.max(max, row.pinOrder), 0) };
-}
-
-/** PinIssue's write half (issue_pin.go:61-97): the pin row at max + 1 plus
- *  the pin (36) comment, one batch (the caller ran the cap check). */
-export async function insertIssuePin(d1: D1Database, issue: IssueRow, actorId: number, now: Date): Promise<void> {
-  const { maxOrder } = await pinStats(d1, issue.repoId, issue.isPull);
-  await drizzle(d1).batch([
-    drizzle(d1)
-      .insert(issuePins)
-      .values({ issueId: issue.id, repoId: issue.repoId, pinOrder: maxOrder + 1 })
-      .onConflictDoNothing(),
-    drizzle(d1).insert(comments).values({
-      type: CommentType.Pin,
-      posterId: actorId,
-      issueId: issue.id,
-      content: "",
-      createdAt: now,
-      updatedAt: now,
-    }),
-    drizzle(d1).update(issues).set({ numComments: sql`num_comments + 1` }).where(eq(issues.id, issue.id)),
-  ] as const);
-}
-
-/** UnpinIssue's write half (issue_pin.go:99-114): the row delete is the
- *  guard — 0 rows = the silent no-op (upstream returns before the
- *  comment); otherwise the unpin (37) comment. True when removed. */
-export async function deleteIssuePin(d1: D1Database, issue: IssueRow, actorId: number, now: Date): Promise<boolean> {
-  const removed = await drizzle(d1)
-    .delete(issuePins)
-    .where(eq(issuePins.issueId, issue.id))
-    .returning({ issueId: issuePins.issueId });
-  if (removed.length === 0) {
-    return false;
-  }
-  await drizzle(d1).batch([
-    drizzle(d1).insert(comments).values({
-      type: CommentType.Unpin,
-      posterId: actorId,
-      issueId: issue.id,
-      content: "",
-      createdAt: now,
-      updatedAt: now,
-    }),
-    drizzle(d1).update(issues).set({ numComments: sql`num_comments + 1` }).where(eq(issues.id, issue.id)),
-  ] as const);
-  return true;
-}
-
-/** MovePin (issue_pin.go:134-163): the neighbours between the old and new
- *  slot shift by one, then the pin takes the slot — one batch, the ranges
- *  exclude the pin's own order (the landed API port's exact statements;
- *  the is_pull split rides the issues subquery — our issue_pins has no
- *  is_pull column). */
-export async function moveIssuePin(d1: D1Database, issue: IssueRow, currentOrder: number, newPosition: number): Promise<void> {
-  if (currentOrder === newPosition) {
-    return;
-  }
-  const db = drizzle(d1);
-  const sameType = inArray(
-    issuePins.issueId,
-    db.select({ id: issues.id }).from(issues).where(eq(issues.isPull, issue.isPull)),
-  );
-  await db.batch([
-    db
-      .update(issuePins)
-      .set({ pinOrder: currentOrder > newPosition ? sql`pin_order + 1` : sql`pin_order - 1` })
-      .where(
-        and(
-          eq(issuePins.repoId, issue.repoId),
-          sameType,
-          currentOrder > newPosition
-            ? and(gte(issuePins.pinOrder, newPosition), lt(issuePins.pinOrder, currentOrder))
-            : and(gt(issuePins.pinOrder, currentOrder), gte(issuePins.pinOrder, newPosition)),
-        ),
-      ),
-    db.update(issuePins).set({ pinOrder: newPosition }).where(eq(issuePins.issueId, issue.id)),
-  ] as const);
-}
 
 // ---------------------------------------------------------------------------
 // The write seams (one per upstream handler; D1-only, the landed services)

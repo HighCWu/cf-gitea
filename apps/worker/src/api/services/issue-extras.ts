@@ -1,5 +1,5 @@
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/d1";
+import { and, asc, eq, gt, gte, inArray, lt, sql } from "drizzle-orm";
+import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 
 import { comments, issuePins, issueSubscriptions, issues, reactions, users } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
@@ -257,6 +257,131 @@ export async function listPinnedIssues(
     .orderBy(asc(issuePins.pinOrder))
     .all()
     .then((rows) => rows.map((row) => row.issue));
+}
+
+/**
+ * The pin WRITE family (models/issues/issue_pin.go) — the shared seam both
+ * consumers ride. Ported verbatim from the API port's file-private originals
+ * (routes/issue-write-t2.ts), which the UI sidebar module (ui/pages/
+ * issue-sidebar-writes.ts) had re-ported statement-for-statement; the
+ * extraction retires that duplication (commit c1391ce's flag). Zero behavior
+ * change: the same statements, the same batches, over the same tables.
+ */
+
+/** `setting.Repository.Issue.MaxPinned` default (modules/setting/repository.go:223). */
+export const MAX_PINNED_PER_TYPE = 3;
+
+/** One pin row (GetIssuePin, issue_pin.go:37) — null when unpinned. */
+export async function pinOfIssue(d1: D1Database, issueId: number): Promise<{ pinOrder: number } | null> {
+  const row = await drizzle(d1)
+    .select({ pinOrder: issuePins.pinOrder })
+    .from(issuePins)
+    .where(eq(issuePins.issueId, issueId))
+    .limit(1)
+    .then((rows) => rows[0]);
+  return row ?? null;
+}
+
+/** Count + max(pin_order) over one repo's issue/pull half
+ *  (getPinnedIssuesNum / getPinnedIssuesMaxPinOrder, issue_pin.go:119-131). */
+export async function pinStats(d1: D1Database, repoId: string, isPull: boolean): Promise<{ count: number; maxOrder: number }> {
+  const rows = await drizzle(d1)
+    .select({ pinOrder: issuePins.pinOrder })
+    .from(issuePins)
+    .innerJoin(issues, eq(issues.id, issuePins.issueId))
+    .where(and(eq(issuePins.repoId, repoId), eq(issues.isPull, isPull)))
+    .all();
+  return { count: rows.length, maxOrder: rows.reduce((max, row) => Math.max(max, row.pinOrder), 0) };
+}
+
+/** The `is_pull` half-condition of the upstream pin updates — our issue_pins
+ *  has no is_pull column, so the split rides an issues join (listPinnedIssues
+ *  above does the same join). */
+function sameTypeIssues(db: DrizzleD1Database, isPull: boolean) {
+  return inArray(issuePins.issueId, db.select({ id: issues.id }).from(issues).where(eq(issues.isPull, isPull)));
+}
+
+/** PinIssue (issue_pin.go:61): the pin row at max + 1 plus the pin (36)
+ *  comment, one batch. The caller ran the cap and duplicate checks. */
+export async function insertIssuePin(d1: D1Database, issue: IssueRow, actorId: number, now: Date): Promise<void> {
+  const { maxOrder } = await pinStats(d1, issue.repoId, issue.isPull);
+  await drizzle(d1).batch([
+    drizzle(d1)
+      .insert(issuePins)
+      .values({ issueId: issue.id, repoId: issue.repoId, pinOrder: maxOrder + 1 })
+      .onConflictDoNothing(),
+    drizzle(d1).insert(comments).values({
+      type: CommentType.Pin,
+      posterId: actorId,
+      issueId: issue.id,
+      content: "",
+      createdAt: now,
+      updatedAt: now,
+    }),
+    drizzle(d1)
+      .update(issues)
+      .set({ numComments: sql`num_comments + 1` })
+      .where(eq(issues.id, issue.id)),
+  ] as const);
+}
+
+/** UnpinIssue (issue_pin.go:99): the row delete is the guard — 0 rows = a
+ *  silent no-op (upstream returns before the comment); otherwise the unpin
+ *  (37) comment. True when something was unpinned. */
+export async function deleteIssuePin(d1: D1Database, issue: IssueRow, actorId: number, now: Date): Promise<boolean> {
+  const removed = await drizzle(d1)
+    .delete(issuePins)
+    .where(eq(issuePins.issueId, issue.id))
+    .returning({ issueId: issuePins.issueId });
+  if (removed.length === 0) {
+    return false;
+  }
+  await drizzle(d1).batch([
+    drizzle(d1).insert(comments).values({
+      type: CommentType.Unpin,
+      posterId: actorId,
+      issueId: issue.id,
+      content: "",
+      createdAt: now,
+      updatedAt: now,
+    }),
+    drizzle(d1)
+      .update(issues)
+      .set({ numComments: sql`num_comments + 1` })
+      .where(eq(issues.id, issue.id)),
+  ] as const);
+  return true;
+}
+
+/**
+ * MovePin (issue_pin.go:134) port: the neighbours between the old and new
+ * slot shift by one, then the pin takes the new slot — one batch, the ranges
+ * exclude the pin's own current order so the statements never self-interfere.
+ * newPosition >= 1 and an existing pin are the caller's checks.
+ */
+export async function moveIssuePin(d1: D1Database, issue: IssueRow, currentOrder: number, newPosition: number): Promise<void> {
+  if (currentOrder === newPosition) {
+    return;
+  }
+  const db = drizzle(d1);
+  await db.batch([
+    db
+      .update(issuePins)
+      .set({ pinOrder: currentOrder > newPosition ? sql`pin_order + 1` : sql`pin_order - 1` })
+      .where(
+        and(
+          eq(issuePins.repoId, issue.repoId),
+          sameTypeIssues(db, issue.isPull),
+          currentOrder > newPosition
+            ? and(gte(issuePins.pinOrder, newPosition), lt(issuePins.pinOrder, currentOrder))
+            : and(gt(issuePins.pinOrder, currentOrder), gte(issuePins.pinOrder, newPosition)),
+        ),
+      ),
+    db
+      .update(issuePins)
+      .set({ pinOrder: newPosition })
+      .where(eq(issuePins.issueId, issue.id)),
+  ] as const);
 }
 
 // ---------------------------------------------------------------------------

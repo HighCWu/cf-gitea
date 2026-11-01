@@ -33,6 +33,8 @@ import { toApiUser } from "../services/user";
 import {
   type PackageAccessMode,
   type PackageDescriptor,
+  type PackageRow,
+  type PackageVersionRow,
   QuotaTotalCountError,
   QuotaTotalSizeError,
   QuotaTypeSizeError,
@@ -62,6 +64,11 @@ import {
 } from "../../services/packages/generic";
 import { PackageSizeMismatchError } from "../../services/packages/blobs";
 import { servePackageFileResponse } from "../../services/packages/serve-content";
+import {
+  getTerraformLock,
+  isTerraformLockLocked,
+  TERRAFORM_PACKAGE_TYPE,
+} from "../../services/packages/terraform";
 
 /**
  * The package registry API surface (SPEC-0016 §3) — two mounted families in
@@ -430,6 +437,71 @@ async function canDoerManagePackage(
 }
 
 // ---------------------------------------------------------------------------
+// The terraform specialization's delete guards — the OnBeforeRemove arms the
+// v1 deletes run upstream (services/packages/terraform/spec.go:50-80 through
+// packages_service.RemovePackage/RemovePackageVersion's spec hooks), the same
+// guards the WEB settings page landed (ui/pages/package-settings.tsx's
+// terraformDeleteGuardAll / terraformDeleteGuardVersion).
+// ---------------------------------------------------------------------------
+
+/**
+ * OnBeforeRemovePackageAll (spec.go:50-62): a LOCKED terraform state refuses
+ * the whole-package delete. Non-terraform packages run no guard — the spec
+ * registry registers terraform's specialization for `TypeTerraformState`
+ * only, so the hook is a no-op everywhere else (the web port's
+ * `pkg.type !== "terraform"` fold).
+ *
+ * Upstream wraps both refusals as `util.ErrUnprocessableContent` errors —
+ * the errorForUser status 422 — with the wrapped Go texts as the message
+ * (the strings its `APIErrorAuto` error family renders); the messages below
+ * are those exact texts. The 422 is NOT a declared response: upstream's own
+ * swagger documents only {204,404} for the deletes while its runtime can
+ * answer the undeclared error status — the declared set stays the vendored
+ * contract's (check:api discipline), the runtime arm rides the ApiError
+ * family like every landed undeclared 422 (hooks.ts, labels.ts, …).
+ */
+async function assertPackageDeleteAllowed(d1: D1Database, pkg: PackageRow): Promise<void> {
+  if (pkg.type !== TERRAFORM_PACKAGE_TYPE) return;
+  const lock = await getTerraformLock(d1, pkg.id);
+  if (isTerraformLockLocked(lock)) {
+    // "packages.terraform.delete.locked" (locale_en-US.json:3703).
+    throw new ApiError(422, "terraform state is locked and cannot be deleted");
+  }
+}
+
+/**
+ * OnBeforeRemovePackageVersion (spec.go:64-80): LOCKED first, then the
+ * LATEST-version refusal — upstream `IsLatest` (state.go:29-44) reads
+ * SearchLatestVersions (PackageID + IsInternal=false) and compares the
+ * first row's id; the landed searchLatestVersions' max-id-per-package GROUP
+ * BY arm is that read verbatim (the web port reduces it to the same
+ * max-id query).
+ */
+async function assertPackageVersionDeleteAllowed(
+  d1: D1Database,
+  pkg: PackageRow,
+  version: PackageVersionRow,
+): Promise<void> {
+  if (pkg.type !== TERRAFORM_PACKAGE_TYPE) return;
+  const lock = await getTerraformLock(d1, pkg.id);
+  if (isTerraformLockLocked(lock)) {
+    // "packages.terraform.delete.locked" — the shared refusal first
+    // (spec.go:66-74 precedes :76-79).
+    throw new ApiError(422, "terraform state is locked and cannot be deleted");
+  }
+  const { rows } = await searchLatestVersions(d1, {
+    packageId: pkg.id,
+    excludeInternal: true,
+    limit: 1,
+    page: 1,
+  });
+  if (rows[0]?.version.id === version.id) {
+    // "packages.terraform.delete.latest" (locale_en-US.json:3704).
+    throw new ApiError(422, "the latest version of a Terraform state cannot be deleted");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // A — the nine management ops + admin list (§3.1)
 // ---------------------------------------------------------------------------
 
@@ -577,6 +649,9 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
       if (pkg === null) {
         throw new ApiError(404, "not found");
       }
+      // RemovePackage's spec hook (packages.go:681): the terraform
+      // specialization's locked-state refusal rides here.
+      await assertPackageDeleteAllowed(c.env.DB, pkg);
       await deletePackageAndReferences(c.env.DB, pkg.id);
       return c.body(null, 204);
     },
@@ -622,6 +697,13 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
       if (versionRow === null) {
         throw new ApiError(404, "not found");
       }
+      const pkg = await getPackageByName(c.env.DB, owner.id, params.type, params.name);
+      if (pkg === null) {
+        throw new ApiError(404, "not found");
+      }
+      // RemovePackageVersion's spec hook (packages.go:519): the terraform
+      // specialization's locked-then-latest refusals ride here.
+      await assertPackageVersionDeleteAllowed(c.env.DB, pkg, versionRow);
       await deletePackageVersionAndReferences(c.env.DB, versionRow.id);
       return c.body(null, 204);
     },
