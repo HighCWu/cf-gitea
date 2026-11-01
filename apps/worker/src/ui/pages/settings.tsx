@@ -140,6 +140,56 @@
  *   target URL, POST content type, secret and the active flag are the form's
  *   fields — the same field names the upstream gitea.tmpl posts.
  *
+ * ## The danger zone (the review R2 arms — options.tmpl:804-870 at the pin)
+ *
+ * The Basics page renders upstream's Danger Zone section: the pending
+ * transfer (banner body `transfer_started %s` + the abort POST when one is
+ * filed, else `transfer_desc` + the start disclosure), and the delete row
+ * with the typed-full-name confirmation. Upstream's action-routed POST
+ * handling (setting.go:194-206's switch: transfer/cancel_transfer/delete/
+ * delete-wiki/archive/unarchive/…) is ported INSIDE this module: the
+ * registered POST /settings handler delegates its whole write to
+ * `parseRepoBasicsForm` + `applyRepoBasics`, so the `action` discriminator
+ * dispatches there (applyRepoDangerAction) — the ui/index.ts registration
+ * is untouched. The ladders compose the landed service seams:
+ * RepoService.requestTransfer / cancelTransfer / deleteRepository (the same
+ * seams the API transfer/delete arms call), with upstream's per-case gates
+ * enumerated in applyRepoDangerAction's doc. Divergences, disclosed:
+ *   - The success flash has no plumbing (the mirror page's reduction):
+ *     every applied outcome is the bare 303 onto `/{owner}/{repo}/settings`
+ *     — upstream's own target for transfer/cancel
+ *     (`repo.Link()+"/settings"`).
+ *   - DELETE's upstream redirect is the owner dashboard
+ *     (ctx.Repo.Owner.DashboardLink()) with deletion_success; the
+ *     registered handler's applied arm can only target the settings URL,
+ *     so a successful delete 303s onto the now-dead settings URL (the 404
+ *     shell). The write itself is upstream-exact. ORCHESTRATOR FOLLOW-UP
+ *     (ui/index.ts, one line): the applied outcome needs a redirect
+ *     override (or an explicit deleted arm) to land the dashboard target.
+ *   - The pending row's doer: upstream records ctx.Doer; the registered
+ *     handler passes no viewer, so the ladders take an OPTIONAL `doer` and
+ *     degrade to the repo's recorded owner (exact for user-owned repos;
+ *     functionally invisible otherwise — acceptTransfer's grant never
+ *     reads the doer column). ORCHESTRATOR FOLLOW-UP (ui/index.ts, one
+ *     line): pass the viewer through settingsSubmit.
+ *   - delete-wiki has NO landed whole-wiki delete arm (services/wiki.ts is
+ *     per-page only — the wave-54 split's honest-absence note at
+ *     /settings/wiki) and repos/service.ts exposes no pending-transfer
+ *     READ seam (the API arms inline the drizzle read,
+ *     repo-extras-t2.ts:1253 — mirrored here as loadPendingRepoTransfer);
+ *     both export needs are reported, neither foreign file is edited.
+ *   - The transfer arm is pending-only, exactly like the landed API
+ *     transfer route: upstream's direct-transfer arms (doer-admin/self,
+ *     org-can-create) reduce to the pending row; the self-transfer refusal
+ *     keeps the API arm's landed 422 divergence (the service's
+ *     OwnerNotAssignableError text, surfaced verbatim).
+ *   - The visibility and archive flips stay merged into the basics form
+ *     above (the wave-4 posture — upstream's danger-zone modals for them
+ *     are the documented merge); convert/convert-fork have no landed
+ *     seams and render nothing (the dead-control rule). The modals reduce
+ *     to `<details>` disclosures wrapping the same forms — the
+ *     org-settings danger zone's established reduction.
+ *
  * ## The mirror panel (wave 10 — options.tmpl's Mirror Settings section)
  *
  * The brief's dedicated `/settings/mirror` sub-page (upstream at this pin
@@ -217,10 +267,11 @@
  * DELETE arm's 404, the settings pages' existence-hiding posture).
  */
 
-import { inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { ApiError } from "../../api/errors";
+import { isUserBlockedBy } from "../../api/services/blocks";
 import {
   buildTestPushPayload,
   createRepoHook,
@@ -242,10 +293,10 @@ import {
   setRepoTemplate,
   type RepoSettings,
 } from "../../api/services/repo-settings";
-import { RepoNameCollisionError, RepoNameInvalidError, RepoService } from "../../repos/service";
+import { OwnerNotAssignableError, RepoNameCollisionError, RepoNameInvalidError, RepoService } from "../../repos/service";
 import { timeSinceParts } from "../page-data";
 import { TimeSince } from "../components/file-list";
-import { HookStatus, webhookDeliveries } from "../../db/schema";
+import { HookStatus, repoTransfer, repositories, users, webhookDeliveries } from "../../db/schema";
 import type { IconName } from "../icons";
 import { sessionRepoGrant } from "../repo-grants";
 import type { RepoRow, UiContext } from "../ui-context";
@@ -306,6 +357,24 @@ export const settingsLocale = {
   packages_desc: "Enable Repository Packages Registry", // "repo.settings.packages_desc"
   archive_toggle: "Archive Repo", // "repo.settings.archive.button" (the merged danger-zone flip)
   archive_mirror_error: "You cannot archive a mirrored repo.", // "repo.settings.archive.error_ismirror"
+  // The danger zone (options.tmpl:804-870 at the pin — the wave-r2 arms).
+  danger_zone: "Danger Zone", // "repo.settings.danger_zone"
+  transfer: "Transfer Ownership", // "repo.settings.transfer" (the row title + the start-disclosure action)
+  transfer_desc: "Transfer this repository to a user or to an organization for which you have administrator rights.", // "repo.settings.transfer_desc"
+  transfer_owner: "New Owner", // "repo.settings.transfer_owner"
+  transfer_perform: "Perform Transfer", // "repo.settings.transfer_perform" (the modal's danger submit)
+  transfer_started: 'This repository has been marked for transfer and awaits confirmation from "%s"', // "repo.settings.transfer_started" (the pending banner body, %s = recipient DisplayName)
+  transfer_abort: "Cancel transfer", // "repo.settings.transfer_abort" (the pending arm's abort button)
+  transfer_abort_invalid: "You cannot cancel a non existent repository transfer.", // "repo.settings.transfer_abort_invalid"
+  new_owner_has_same_repo: "The new owner already has a repository with same name. Please choose another name.", // "repo.settings.new_owner_has_same_repo"
+  transfer_blocked_user: "Cannot transfer repository because you are blocked by the new owner.", // "repo.settings.transfer.blocked_user"
+  enterred_invalid_repo_name: "The repository name you entered is incorrect.", // "form.enterred_invalid_repo_name"
+  enterred_invalid_owner_name: "The new owner name is not valid.", // "form.enterred_invalid_owner_name"
+  enter_repo_name_to_confirm: "Enter the repository name as confirmation:", // "repo.settings.enter_repo_name_to_confirm" (dangerous_operation_form.tmpl:8)
+  delete: "Delete This Repository", // "repo.settings.delete"
+  delete_desc: "Deleting a repository is permanent and cannot be undone.", // "repo.settings.delete_desc"
+  confirm_delete: "Delete Repository", // "repo.settings.confirm_delete" (the modal's danger submit)
+  unknown_action: "Unknown settings action.", // cf-gitea addition — upstream answers ctx.NotFound for an unrecognized action
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -355,11 +424,19 @@ export interface RepoBasicsUnits {
  *  stays type-valid: absent means render the STORED state, never a lie
  *  about the submission. parseRepoBasicsForm always fills them from a real
  *  POST body, and applyRepoBasics receives the full parse output either way
- *  — the optionals affect only the invalid re-render's binding. */
+ *  — the optionals affect only the invalid re-render's binding.
+ *
+ *  The wave-r2 danger-zone fields ride the same shape: `action` is the
+ *  urlencoded discriminator ("" = our merged basics save — the wave-129
+ *  posture; "update" = upstream's basic-form literal, accepted onto the
+ *  same basics ladder) and `newOwnerName` carries `new_owner_name`
+ *  (dangerous_operation_form.tmpl:17) for the transfer arm. */
 export interface RepoBasicsForm {
+  action: string;
   name: string;
   description: string;
   isPrivate: boolean;
+  newOwnerName: string;
   website?: string;
   isTemplate?: boolean;
   isArchived?: boolean;
@@ -367,18 +444,45 @@ export interface RepoBasicsForm {
 }
 
 /** The basics form's render inputs: the STORED description/website/units
- *  (loadRepoSettings) plus the re-rendered submission. `hasActions` is the
- *  STORED has_actions read — the SettingsNav Actions block's navbar.tmpl:47
- *  conditional — deliberately OUTSIDE the form (the options POST can neither
- *  carry nor clobber the flag; the general page's toggle is the sole UI
- *  writer), so it is read fresh off loadRepoSettings on every render
- *  including the invalid re-render. */
+ *  (loadRepoSettings), the re-rendered submission, and the pending-transfer
+ *  read (`pendingTransfer`, null = none) that arms the danger zone's banner
+ *  + abort button (options.tmpl:846-877's `{{if .RepoTransfer}}`). */
 export interface RepoBasicsData {
   description: string;
   website: string;
   units: RepoBasicsUnits;
   hasActions: boolean;
+  pendingTransfer: PendingRepoTransfer | null;
   form: RepoBasicsForm;
+}
+
+/** The pending transfer's render projection: the recipient's display name
+ *  (upstream `.RepoTransfer.Recipient.DisplayName()` — FullName, else the
+ *  username) for `transfer_started`'s %s. */
+export interface PendingRepoTransfer {
+  recipient: string;
+}
+
+/**
+ * The pending-transfer read for the settings page — upstream
+ * GetPendingRepositoryTransfer (models/repo/transfer.go) reduced to the
+ * row's existence + the recipient display name. THIN INLINE COMPOSITION:
+ * repos/service.ts exposes the pending row only through its write methods
+ * (requestTransfer/cancelTransfer/acceptTransfer re-read it internally);
+ * there is no exported read seam (the API transfer arms inline the same
+ * drizzle read, repo-extras-t2.ts:1253) — reported to the orchestrator as
+ * the repos/service.ts export follow-up, this read is the page module's
+ * own file-local composition over the landed table.
+ */
+export async function loadPendingRepoTransfer(d1: D1Database, repoId: string): Promise<PendingRepoTransfer | null> {
+  const row = await drizzle(d1)
+    .select({ displayName: users.displayName, username: users.username })
+    .from(repoTransfer)
+    .innerJoin(users, eq(users.id, repoTransfer.newOwnerId))
+    .where(eq(repoTransfer.repoId, repoId))
+    .get();
+  if (row === undefined) return null;
+  return { recipient: row.displayName !== null && row.displayName !== "" ? row.displayName : row.username };
 }
 
 export async function loadRepoBasics(d1: D1Database, repo: RepoRow): Promise<RepoBasicsData> {
@@ -395,10 +499,13 @@ export async function loadRepoBasics(d1: D1Database, repo: RepoRow): Promise<Rep
     website: settings.website,
     units,
     hasActions: settings.hasActions,
+    pendingTransfer: await loadPendingRepoTransfer(d1, repo.id),
     form: {
+      action: "",
       name: repo.slug,
       description: settings.description,
       isPrivate: repo.visibility === "private",
+      newOwnerName: "",
       website: settings.website,
       isTemplate: repo.isTemplate,
       isArchived: repo.isArchived,
@@ -416,12 +523,19 @@ export async function loadRepoBasics(d1: D1Database, repo: RepoRow): Promise<Rep
  *  checkbox field name is cf-gitea's). No `enable_actions` arm: the field is
  *  actions_general.tmpl's alone and the form dropped it (the module header's
  *  retirement note). Checkbox semantics are the HTML ones the `private`
- *  field pinned: any present value counts, an absent field is false. */
+ *  field pinned: any present value counts, an absent field is false.
+ *
+ *  The wave-r2 discriminator fields: `action` ("" when absent — our merged
+ *  basics save; a danger value dispatches applyRepoBasics onto the
+ *  danger-zone ladders) and `new_owner_name` (the transfer modal's owner
+ *  input, trimmed like `repo_name`; absent = ""). */
 export function parseRepoBasicsForm(params: URLSearchParams): RepoBasicsForm {
   return {
+    action: params.get("action") ?? "",
     name: (params.get("repo_name") ?? "").trim(),
     description: params.get("description") ?? "",
     isPrivate: (params.get("private") ?? "") !== "",
+    newOwnerName: (params.get("new_owner_name") ?? "").trim(),
     website: params.get("website") ?? "",
     isTemplate: (params.get("template") ?? "") !== "",
     isArchived: (params.get("archived") ?? "") !== "",
@@ -438,6 +552,150 @@ export function parseRepoBasicsForm(params: URLSearchParams): RepoBasicsForm {
 export type RepoBasicsResult = { outcome: "applied"; slug: string } | { outcome: "invalid"; message: string };
 
 /**
+ * The danger-zone action ladders (options.tmpl's POST arms — upstream
+ * setting.go's switch cases transfer / cancel_transfer / delete at :865+,
+ * dispatched through this module's action discriminator because the
+ * registered POST /settings handler delegates its whole write here; the
+ * registration in ui/index.ts is untouched).
+ *
+ * The gate: upstream runs canManageRepoDangerZone INSIDE each case
+ * (setting.go:793/826 — CanDoerManageRepoDangerZone: the owner or an
+ * org-team admin); this deployment's posture is strictly the route's
+ * settingsGate (canAdminRepo = isRepositoryAdmin) evaluated BEFORE the
+ * write — same class of grant, so the ladders below never re-check it.
+ *
+ * The result reuses RepoBasicsResult so the registration's response shaping
+ * compiles untouched: every applied outcome 303s onto
+ * `/{owner}/{slug}/settings` — upstream's own redirect target for
+ * transfer/cancel/delete-wiki (repo.Link() + "/settings"), and a DOCUMENTED
+ * divergence for delete (upstream redirects onto the owner dashboard,
+ * ctx.Repo.Owner.DashboardLink(), with a success flash — the registered
+ * handler cannot express that target yet; see the module header's
+ * follow-up). Invalid outcomes re-render the page with the exact upstream
+ * texts (upstream's JSONError toast reduced to the inline negative
+ * message — the basics arm's established reduction; there is no
+ * session-flash plumbing).
+ *
+ * The `doer` thread: upstream records ctx.Doer on the pending row and runs
+ * the blocked-user probe as the doer. The registered handler does not pass
+ * the viewer yet (the one-line ui/index.ts follow-up reported to the
+ * orchestrator), so the parameter is OPTIONAL and the ladders degrade to
+ * the repo's recorded owner — EXACT for the user-owned repo (the owner
+ * clicks), and the org-owned case records the org row (functionally
+ * invisible: acceptTransfer's grant reads repo.ownerId + the pending
+ * newOwnerId + the admin flag, never the doer column).
+ */
+export async function applyRepoDangerAction(
+  d1: D1Database,
+  repo: RepoRow,
+  form: RepoBasicsForm,
+  doer?: { id: number; isAdmin: boolean },
+): Promise<RepoBasicsResult> {
+  // The typed confirmation is the FULL name (dangerous_operation_form.tmpl
+  // renders $repoFullName and handleSettingsPost* compares
+  // `repo.FullName() != form.RepoName` exactly; ours compares the same
+  // bytes over the lowercase-canonical registry row).
+  const repoFullName = `${repo.ownerNamespace}/${repo.slug}`;
+  const nameConfirmed = form.name === repoFullName;
+  switch (form.action) {
+    case "transfer": {
+      if (!nameConfirmed) return { outcome: "invalid", message: settingsLocale.enterred_invalid_repo_name };
+      if (form.newOwnerName === "") return { outcome: "invalid", message: settingsLocale.enterred_invalid_owner_name };
+      // GetUserByName's lower_name lookup (transfer.go:884).
+      const target = await drizzle(d1)
+        .select()
+        .from(users)
+        .where(eq(users.usernameLower, form.newOwnerName.toLowerCase()))
+        .get();
+      if (target === undefined) return { outcome: "invalid", message: settingsLocale.enterred_invalid_owner_name };
+      // StartRepositoryTransfer's blocked arm (transfer.go:464-466) over the
+      // API transfer route's exact composition (routes/repo.ts — the doer
+      // blocked by the NEW owner, or the new owner blocked by the CURRENT
+      // owner; skipped for a site-admin doer and for the self arm, which
+      // the landed service refuses below instead of upstream's silent
+      // direct transfer).
+      const effectiveDoer = doer ?? { id: repo.ownerId ?? 0, isAdmin: false };
+      if (!effectiveDoer.isAdmin && repo.ownerId !== target.id) {
+        const doerBlockedByNewOwner = await isUserBlockedBy(
+          d1,
+          { id: effectiveDoer.id, isAdmin: effectiveDoer.isAdmin },
+          target.id,
+        );
+        const newOwnerBlockedByCurrent = await isUserBlockedBy(
+          d1,
+          { id: target.id, isAdmin: target.isAdmin },
+          repo.ownerId ?? -1,
+        );
+        if (doerBlockedByNewOwner || newOwnerBlockedByCurrent) {
+          return { outcome: "invalid", message: settingsLocale.transfer_blocked_user };
+        }
+      }
+      // The web ladder's IsErrRepoAlreadyExist arm
+      // (handleSettingsPostTransfer's new_owner_has_same_repo mapping): the
+      // pending row must not file against an occupied destination. The
+      // landed service files without a destination pre-check (the collision
+      // would surface only at accept), so this thin read ports the
+      // upstream arm in the page module — the repos/service.ts export
+      // follow-up is reported. The SELF arm skips it (the repo occupies its
+      // own destination; the landed service refusal below is the API arm's
+      // 422 divergence, not a collision).
+      if (target.id !== repo.ownerId) {
+        const occupied = await drizzle(d1)
+          .select({ id: repositories.id })
+          .from(repositories)
+          .where(and(eq(repositories.ownerNamespace, target.usernameLower), eq(repositories.slug, repo.slug)))
+          .get();
+        if (occupied !== undefined) return { outcome: "invalid", message: settingsLocale.new_owner_has_same_repo };
+      }
+      try {
+        // The pending arm (transfer.go:489-503): every transfer files a
+        // pending row in this deployment — upstream's direct arms (the
+        // doer-admin/self short-circuit, the org-can-create arm) reduce to
+        // the pending row exactly like the landed API transfer route.
+        await new RepoService(d1).requestTransfer(repo.id, effectiveDoer.id, target.id);
+      } catch (error) {
+        if (error instanceof OwnerNotAssignableError) {
+          return { outcome: "invalid", message: error.message }; // the API arm's 422 texts (self/inactive target)
+        }
+        throw error;
+      }
+      return { outcome: "applied", slug: repo.slug };
+    }
+    case "cancel_transfer": {
+      // handleSettingsPostCancelTransfer: a pending row must exist
+      // (GetPendingRepositoryTransfer) — upstream flashes
+      // transfer_abort_invalid and redirects; the flash-less reduction
+      // re-renders with the same text. The cancel itself is the landed
+      // service seam (the pending-row delete; upstream's CancelRepository
+      // Transfer status reset has no landed status column).
+      const pending = await drizzle(d1)
+        .select({ id: repoTransfer.id })
+        .from(repoTransfer)
+        .where(eq(repoTransfer.repoId, repo.id))
+        .get();
+      if (pending === undefined) return { outcome: "invalid", message: settingsLocale.transfer_abort_invalid };
+      await new RepoService(d1).cancelTransfer(repo.id);
+      return { outcome: "applied", slug: repo.slug };
+    }
+    case "delete": {
+      // handleSettingsPostDelete: the typed-name gate, then the landed
+      // delete seam (the D1 cascade + tombstone + purge message —
+      // repo_service.DeleteRepository's port). Applied redirects onto the
+      // settings URL (now a 404 shell — the documented divergence; upstream
+      // targets the owner dashboard).
+      if (!nameConfirmed) return { outcome: "invalid", message: settingsLocale.enterred_invalid_repo_name };
+      await new RepoService(d1).deleteRepository(repo.id);
+      return { outcome: "applied", slug: repo.slug };
+    }
+    default:
+      // Upstream's switch default answers ctx.NotFound; the result union
+      // cannot express a 404, so the closest reduction is the inline
+      // refusal (nothing written — cf-gitea text, disclosed).
+      return { outcome: "invalid", message: settingsLocale.unknown_action };
+  }
+}
+
+/**
  * The basics write — the PATCH route's steps for the form's fields. Rename
  * only on a case-insensitive change (the route's guard), visibility only on
  * a change, description through the settings upsert (always — the empty
@@ -450,8 +708,24 @@ export type RepoBasicsResult = { outcome: "applied"; slug: string } | { outcome:
  * upstream mirror refusal re-renders the same way — evaluated BEFORE any
  * write so an invalid outcome leaves the whole POST inert (the invalid-arm
  * rule).
+ *
+ * The wave-r2 dispatch: a POST carrying a danger `action` (transfer /
+ * cancel_transfer / delete — options.tmpl's hidden discriminator) routes to
+ * applyRepoDangerAction BEFORE the basics ladder, so a danger form's fields
+ * (the typed FULL name, an absent description) never run the basics write.
+ * "" (our merged form) and "update" (upstream's basic-form literal) both
+ * fall through to the basics ladder. The optional `doer` tail is the
+ * danger ladders' only need for the viewer — see applyRepoDangerAction.
  */
-export async function applyRepoBasics(d1: D1Database, repo: RepoRow, form: RepoBasicsForm): Promise<RepoBasicsResult> {
+export async function applyRepoBasics(
+  d1: D1Database,
+  repo: RepoRow,
+  form: RepoBasicsForm,
+  doer?: { id: number; isAdmin: boolean },
+): Promise<RepoBasicsResult> {
+  if (form.action !== "" && form.action !== "update") {
+    return applyRepoDangerAction(d1, repo, form, doer);
+  }
   if (form.name === "") {
     return { outcome: "invalid", message: "Repository name cannot be empty." }; // cf-gitea addition (HTML5 required backs this)
   }
@@ -731,6 +1005,10 @@ export function RepoSettingsPage(props: { ctx: UiContext; data: RepoBasicsData; 
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("RepoSettingsPage requires ctx.repo");
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+  // The typed confirmation's target bytes (dangerous_operation_form.tmpl's
+  // $repoFullName — the lowercase-canonical registry row verbatim; the
+  // danger ladders compare the same bytes).
+  const repoFullName = `${repo.ownerNamespace}/${repo.slug}`;
   // The wave-129 fields: the carried submission when present, the STORED
   // state otherwise (the handler's invalid-path rebuild omits them — the
   // RepoBasicsForm note; the template/archived stored states come off the
@@ -739,6 +1017,7 @@ export function RepoSettingsPage(props: { ctx: UiContext; data: RepoBasicsData; 
   const units = data.form.units ?? data.units;
   const isTemplate = data.form.isTemplate ?? repo.isTemplate;
   const isArchived = data.form.isArchived ?? repo.isArchived;
+  const pendingTransfer = data.pendingTransfer ?? null;
   return (
     <BaseLayout ctx={ctx} title={settingsLocale.settings} pageClass="repository settings options">
       <div class="ui container flex-container">
@@ -839,6 +1118,98 @@ export function RepoSettingsPage(props: { ctx: UiContext; data: RepoBasicsData; 
                 </button>
               </div>
             </form>
+          </div>
+          {/* options.tmpl:804-870's Danger Zone (the CanManagerDangerZone
+              block — this route's settingsGate IS that posture, so the
+              section renders unconditionally here). The visibility and
+              archive flips stay in the merged basics form above (the wave-4
+              posture, kept); the wiki item stays on its wave-54 tab
+              (repo-settings-wiki.tsx — no landed whole-wiki delete arm, its
+              honest-absence note is the rendered state). Upstream's
+              show-modal buttons + <dialog> modals reduce to the org-settings
+              danger zone's <details> disclosures wrapping the same forms. */}
+          <h4 class="ui top attached error header">{settingsLocale.danger_zone}</h4>
+          <div class="ui attached error danger segment">
+            <div class="flex-divided-list items-with-main">
+              {/* The transfer row (options.tmpl:846-877): the pending
+                  transfer swaps the body for the banner text and the start
+                  disclosure for the abort form. */}
+              <div class="item tw-items-center">
+                <div class="item-main">
+                  <div class="item-title">{settingsLocale.transfer}</div>
+                  <div class="item-body">
+                    {pendingTransfer === null
+                      ? settingsLocale.transfer_desc
+                      : settingsLocale.transfer_started.replace("%s", pendingTransfer.recipient)}
+                  </div>
+                </div>
+                <div class="item-trailing">
+                  {pendingTransfer === null ? (
+                    <details class="ui basic red button tw-p-0">
+                      <summary class="tw-p-2">{settingsLocale.transfer}</summary>
+                      <div class="ui attached segment tw-text-left">
+                        {/* dangerous_operation_form.tmpl's transfer shape:
+                            hidden action + typed full name + new_owner_name. */}
+                        <form class="ui form" action={`${repoLink}/settings`} method="post">
+                          <input type="hidden" name="action" value="transfer" />
+                          <div class="field">
+                            <label>
+                              {settingsLocale.enter_repo_name_to_confirm} <span class="tw-text-red">{repoFullName}</span>
+                            </label>
+                          </div>
+                          <div class="required field">
+                            <label for="confirm_repo_name">{settingsLocale.repo_name}</label>
+                            <input id="confirm_repo_name" name="repo_name" required />
+                          </div>
+                          <div class="required field">
+                            <label for="new_owner_name">{settingsLocale.transfer_owner}</label>
+                            <input id="new_owner_name" name="new_owner_name" required />
+                          </div>
+                          <button type="submit" class="ui red button">
+                            {settingsLocale.transfer_perform}
+                          </button>
+                        </form>
+                      </div>
+                    </details>
+                  ) : (
+                    <form method="post" action={`${repoLink}/settings`}>
+                      <input type="hidden" name="action" value="cancel_transfer" />
+                      <button type="submit" class="ui red button">{settingsLocale.transfer_abort}</button>
+                    </form>
+                  )}
+                </div>
+              </div>
+              {/* The delete row (options.tmpl:878-887 + #delete-repo-modal):
+                  the typed-name confirmation, no new-owner field. */}
+              <div class="item tw-items-center">
+                <div class="item-main">
+                  <div class="item-title">{settingsLocale.delete}</div>
+                  <div class="item-body">{settingsLocale.delete_desc}</div>
+                </div>
+                <div class="item-trailing">
+                  <details class="ui basic red button tw-p-0">
+                    <summary class="tw-p-2">{settingsLocale.delete}</summary>
+                    <div class="ui attached segment tw-text-left">
+                      <form class="ui form" action={`${repoLink}/settings`} method="post">
+                        <input type="hidden" name="action" value="delete" />
+                        <div class="field">
+                          <label>
+                            {settingsLocale.enter_repo_name_to_confirm} <span class="tw-text-red">{repoFullName}</span>
+                          </label>
+                        </div>
+                        <div class="required field">
+                          <label for="delete_repo_name">{settingsLocale.repo_name}</label>
+                          <input id="delete_repo_name" name="repo_name" required />
+                        </div>
+                        <button type="submit" class="ui red button">
+                          {settingsLocale.confirm_delete}
+                        </button>
+                      </form>
+                    </div>
+                  </details>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </div>

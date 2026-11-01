@@ -28,6 +28,9 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { renderToString } from "hono/jsx/dom/server";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
+import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
+import { repositories } from "../../db/schema";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
@@ -36,6 +39,7 @@ import {
   AdminReposPage,
   adminReposLocale,
   adminRepoSortMapping,
+  deleteAdminRepoFromForm,
   loadAdminReposData,
 } from "./admin-repos";
 
@@ -351,5 +355,32 @@ describe("the admin repos DOM (templates/admin/repo/list.tmpl at the pin)", () =
     expect(html).toContain('href="/-/admin/actions/variables"');
     expect(html).toContain('href="/-/admin/actions/job_queue"');
     expect(html).not.toContain("/-/admin/actions/scoped_workflows");
+  });
+});
+
+// --- the delete ladder (upstream admin.DeleteRepo — the write seam; the
+// --- route registration is blocked on ui/index.ts, so the ladder drives
+// --- directly over real D1) -----------------------------------------------
+
+describe("deleteAdminRepoFromForm (admin.DeleteRepo's port)", () => {
+  it("deletes the repository through the shared delete cascade (the row gone, the list no longer counts it)", async () => {
+    await seedBaseFixtures();
+    const before = await load(adminViewer, "");
+    expect(before.total).toBe(9);
+    const outcome = await deleteAdminRepoFromForm(env.DB, "9");
+    expect(outcome).toEqual({ outcome: "deleted" });
+    const row = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(eq(repositories.id, "9")).get();
+    expect(row).toBeUndefined();
+    const after = await load(adminViewer, "");
+    expect(after.total).toBe(8);
+    expect(after.items.map((item) => item.repo.slug)).not.toContain("starry");
+  });
+
+  it("answers a missing id with the missing outcome (the future registration maps it — upstream ServerErrors the miss)", async () => {
+    await seedBaseFixtures();
+    const outcome = await deleteAdminRepoFromForm(env.DB, "404");
+    expect(outcome).toEqual({ outcome: "missing" });
+    const after = await load(adminViewer, "");
+    expect(after.total).toBe(9); // nothing deleted
   });
 });

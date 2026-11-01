@@ -60,9 +60,14 @@
  *             lfssize sorter dies with it
  *   (Op)      OMITTED — the column holds ONLY the delete-modal button
  *             (list.tmpl:82-87, 99-109) targeting POST /-/admin/repos/delete
- *             (web.go:834) — an UNLANDED write; per-row ACTION writes are out
- *             of this wave's scope and a rendered button would be dead (the
- *             dead-link rule §2.4.1, the users page's details/edit omission)
+ *             (web.go:834) — the WRITE SEAM is landed below
+ *             (deleteAdminRepoFromForm, upstream admin.DeleteRepo over the
+ *             shared RepoService.deleteRepository) but the ROUTE
+ *             REGISTRATION is blocked on ui/index.ts (outside this
+ *             module's ownership; the mount recipe is in the ladder's doc),
+ *             and a rendered button posting to an unregistered route would
+ *             be a dead control (the dead-link rule §2.4.1) — render the
+ *             button with, and only with, that registration
  *
  * The header's "Unadopted Repositories" button (list.tmpl:6 →
  * /-/admin/repos/unadopted) targets an UNLANDED page → omitted.
@@ -123,6 +128,7 @@
  */
 
 import { searchRepositories, type RepositoryWithOwner, type Viewer as ApiViewer } from "../../api/services/repository";
+import { RepoNotExistError, RepoService } from "../../repos/service";
 
 import { formatByteSize, parsePageNumber } from "../page-data";
 import { renderPage } from "../shell";
@@ -301,6 +307,45 @@ export function adminRepoSortMapping(sort: AdminRepoSort): { sort: string; order
     case "reverselfssize":
       return { sort: "lfs_size", order: "desc" };
   }
+}
+
+// ---------------------------------------------------------------------------
+// The delete ladder (upstream admin.DeleteRepo, repos.go:43-57 — the review
+// R2 arm; the write seam is LANDED, the route registration is BLOCKED)
+// ---------------------------------------------------------------------------
+
+export type AdminRepoDeleteResult = { outcome: "deleted" } | { outcome: "missing" };
+
+/**
+ * The admin repo delete — upstream admin.DeleteRepo's ladder (repos.go:
+ * 43-57) over the SAME landed delete seam the repo-settings danger zone
+ * composes (RepoService.deleteRepository): the row must exist
+ * (GetRepositoryByID — upstream answers a miss with ServerError; this
+ * reduction returns "missing" so the future registration can map it per
+ * the house convention), then the delete (the D1 cascade + tombstone +
+ * purge message). NO confirm-name gate — upstream's admin arm takes only
+ * the `id` form field (list.tmpl's modal posts
+ * `/-/admin/repos/delete?id=N`); the flash + JSONRedirect("") reload ride
+ * the future registration.
+ *
+ * ROUTE REGISTRATION BLOCKED (ui/index.ts, outside this module's
+ * ownership): POST /-/admin/repos/delete needs the admin literal family's
+ * parse arm (`tail.length === 2 && tail[0] === "repos" && tail[1] ===
+ * "delete"` → family "admin-repos-delete", the admin-emails-delete shape)
+ * plus its registered handler — adminPagePrologue → sameOriginGuard →
+ * this function → 303 back onto the list. Until that lands, the row-level
+ * delete button deliberately renders NOTHING: a form posting to an
+ * unregistered route is a dead control (§2.4.1) — the module header's
+ * (Op) note stands, with the write seam now ready beneath it.
+ */
+export async function deleteAdminRepoFromForm(d1: D1Database, repoId: string): Promise<AdminRepoDeleteResult> {
+  try {
+    await new RepoService(d1).deleteRepository(repoId);
+  } catch (error) {
+    if (error instanceof RepoNotExistError) return { outcome: "missing" };
+    throw error;
+  }
+  return { outcome: "deleted" };
 }
 
 // ---------------------------------------------------------------------------
