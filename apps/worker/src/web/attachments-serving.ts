@@ -50,17 +50,29 @@ import { clearSessionSetCookie, sessionCookieValue, sessionSetCookie, verifySess
  *      collide.
  *   2. GetAttachmentLinkedTypeAndRepoID (services/repository/repository.go:
  *      207-229): issue → unit TypeIssues/TypePullRequests (issue.IsPull) +
- *      issue.RepoID; release → TypeReleases + rel.RepoID; else TypeInvalid.
- *      A dangling issue/release row is a ServerError → 500 upstream.
+ *      issue.RepoID; release → TypeReleases + rel.RepoID; else TypeInvalid
+ *      with NO error when BOTH links are zero (:227-228 — upstream never
+ *      queries the issue/release tables for the unlinked shape). A dangling
+ *      NONZERO link (target row gone) is the ServerError → 500 arm.
+ *      cf-gitea's split halves carry NOT NULL links where 0 is the unlinked
+ *      marker: issue_attachments.issue_id = 0 / release_assets.release_id = 0
+ *      is the just-uploaded-but-unattached row (the dropzone's staged
+ *      preview, linked when the comment/release form commits).
  *   3. Repo-mismatch arm (:154-157) only fires when ctx.Repo.Repository is
  *      resolved — this site-level route has none (web.go:912 sits outside
  *      RepoAssignment), so the arm is dead here (it guards the
  *      /{username}/{reponame}/attachments/{uuid} compatibility twin,
  *      web.go:1529-1532, not landed — see OPEN ISSUES).
  *   4. TypeInvalid arm (:159-163): an unlinked attachment serves to its
- *      uploader only, everyone else 404. Structurally unreachable in
- *      cf-gitea: both halves carry NOT NULL links (issue_attachments.issue_id,
- *      release_assets.release_id) — kept as a documented dead arm.
+ *      UPLOADER ONLY — `!(ctx.IsSigned && attach.UploaderID == ctx.Doer.ID)`
+ *      → 404 for everyone else, anonymous included, site admins included
+ *      (no admin arm). The whole linked walk (:164-210: repo resolution,
+ *      permission, draft, scope) is upstream's else-branch and is SKIPPED on
+ *      this arm — the uploader's request flows straight to the download bump
+ *      (:213, after the if/else, so the unlinked fetch bumps too). A zero
+ *      UploaderID matches nobody (models/repo/attachment.go:32 `DEFAULT 0`,
+ *      "zero before this column added"); cf-gitea's nullable uploader_id
+ *      behaves the same.
  *   5. GetRepositoryByID + GetDoerRepoPermission (:164-182) — the site route
  *      resolves the repo itself (ctx.Repo.Repository is nil). A missing repo
  *      row is the GetRepositoryByID ServerError → 500 arm; permission fails
@@ -742,17 +754,24 @@ type IssueAttachmentRow = typeof issueAttachments.$inferSelect;
 type ReleaseAssetRow = typeof releaseAssets.$inferSelect;
 
 /** Which half of the split attachment table the uuid resolved to, plus the
- *  upstream linked unit type (attachment.go:25-34 attachmentReadScope). */
+ *  upstream linked unit type (attachment.go:25-34 attachmentReadScope). The
+ *  `unlinked-*` kinds are the TypeInvalid arm's shape — a zero link
+ *  (issue_id 0 / release_id 0, the staged-but-unattached upload); the row's
+ *  nullable uploader_id decides who may serve it. */
 type ResolvedAttachment =
   | { kind: "issue"; row: IssueAttachmentRow; issue: typeof issues.$inferSelect; unitType: "issues" | "pulls" }
-  | { kind: "release"; row: ReleaseAssetRow; release: typeof releases.$inferSelect };
+  | { kind: "release"; row: ReleaseAssetRow; release: typeof releases.$inferSelect }
+  | { kind: "unlinked-issue"; row: IssueAttachmentRow }
+  | { kind: "unlinked-release"; row: ReleaseAssetRow };
 
 export type { ResolvedAttachment };
 
 /** The uuid → (attachment, linked type, repoID) walk: GetAttachmentByUUID +
  *  GetAttachmentLinkedTypeAndRepoID (repository.go:207-229) over the split
- *  halves. Missing issue/release rows (dangling links) return null → the
- *  ServerError 500 arm. */
+ *  halves. A zero link is the TypeInvalid return (:227-228 — upstream never
+ *  touches the issue/release tables for it) → the `unlinked-*` kinds; a
+ *  NONZERO link whose target row is gone is the ServerError 500 arm
+ *  ("dangling"). */
 export async function resolveAttachmentByUuid(
   d1: D1Database,
   uuid: string,
@@ -760,12 +779,14 @@ export async function resolveAttachmentByUuid(
   const db = drizzle(d1);
   const attach = (await db.select().from(issueAttachments).where(eq(issueAttachments.uuid, uuid)).limit(1))[0];
   if (attach !== undefined) {
+    if (attach.issueId === 0) return { kind: "unlinked-issue", row: attach };
     const issue = (await db.select().from(issues).where(eq(issues.id, attach.issueId)).limit(1))[0];
     if (issue === undefined) return "dangling";
     return { kind: "issue", row: attach, issue, unitType: issue.isPull ? "pulls" : "issues" };
   }
   const asset = (await db.select().from(releaseAssets).where(eq(releaseAssets.uuid, uuid)).limit(1))[0];
   if (asset !== undefined) {
+    if (asset.releaseId === 0) return { kind: "unlinked-release", row: asset };
     const release = (await db.select().from(releases).where(eq(releases.id, asset.releaseId)).limit(1))[0];
     if (release === undefined) return "dangling";
     return { kind: "release", row: asset, release };
@@ -1016,27 +1037,6 @@ attachmentsServingRouter.on(["GET", "HEAD"], "/attachments/:uuid", async (c) => 
   if (resolved === "dangling") {
     return SERVER_ERROR(); // GetAttachmentLinkedTypeAndRepoID ServerError (:146-150)
   }
-  const repoId = resolved.kind === "issue" ? resolved.issue.repoId : resolved.row.repoId;
-  const unitType = resolved.kind === "issue" ? resolved.unitType : "releases";
-
-  // 3. The repo-mismatch arm (:154-157) is dead on this site-level route —
-  // ctx.Repo.Repository is nil (web.go:912 sits outside RepoAssignment).
-  // 4. The TypeInvalid uploader-only arm (:159-163) is structurally
-  // unreachable: both cf-gitea halves carry NOT NULL links.
-
-  // 5. GetRepositoryByID + GetDoerRepoPermission (:164-182), over the landed
-  // readGrant predicate (SPEC-0003 §2.4 / SPEC-0010 §2.6).
-  const repo = (await drizzle(c.env.DB).select().from(repositories).where(eq(repositories.id, repoId)).limit(1))[0];
-  if (repo === undefined) {
-    return SERVER_ERROR(); // GetRepositoryByID ServerError (:170-173)
-  }
-  const ownerRow = (
-    await drizzle(c.env.DB)
-      .select({ id: users.id, status: users.status, visibility: users.visibility })
-      .from(users)
-      .where(eq(users.usernameLower, repo.ownerNamespace))
-      .limit(1)
-  )[0];
   // `c.executionCtx` is unavailable under direct router.request() test
   // invocations — the resolver then settles session background work inline
   // (the ui/index.ts dispatch pattern).
@@ -1046,6 +1046,9 @@ attachmentsServingRouter.on(["GET", "HEAD"], "/attachments/:uuid", async (c) => 
   } catch {
     waitUntil = undefined;
   }
+  // The webAuth walk resolves BEFORE the serving arms — upstream's auth group
+  // runs as middleware, so ctx.Doer/ctx.IsSigned already exist when the
+  // TypeInvalid arm reads them (:160).
   const credential = await resolveOptionalCredential(request, c.env, { waitUntil });
   const doer = credential.doer;
   // The session arm's cookie directive (rotation / clear) rides EVERY
@@ -1055,47 +1058,80 @@ attachmentsServingRouter.on(["GET", "HEAD"], "/attachments/:uuid", async (c) => 
     if (credential.setCookie !== null) response.headers.append("Set-Cookie", credential.setCookie);
     return response;
   };
-  const teamMode =
-    doer === null ? "none" : await doerRepoAccessMode(c.env.DB, { id: repo.id, ownerId: repo.ownerId }, doer.id);
-  const canRead = readGrant({
-    repoVisibility: repo.visibility,
-    owner: ownerRow === undefined ? null : { id: ownerRow.id, status: ownerRow.status },
-    ownerVisibility: ownerRow?.visibility ?? "private",
-    doer,
-    teamMode,
-  });
-  if (!canRead) {
-    return respond(NOT_FOUND()); // perm.CanRead fail (:184-187)
-  }
 
-  // 6. The draft-release arm (:193-203) — release_id is NOT NULL on
-  // release_assets, so the upstream `attach.ReleaseID != 0` guard always
-  // holds on this half.
-  if (resolved.kind === "release" && resolved.release.isDraft) {
-    const canWrite =
-      doer !== null &&
-      (await canWriteReleases(
-        c.env.DB,
-        repo,
-        ownerRow === undefined ? null : ownerRow,
-        doer,
-        teamMode,
-      ));
-    if (!canWrite) {
+  // 3. The repo-mismatch arm (:154-157) is dead on this site-level route —
+  // ctx.Repo.Repository is nil (web.go:912 sits outside RepoAssignment).
+  // 4. The TypeInvalid arm (:159-163) — an unlinked row (issue_id 0 /
+  // release_id 0: the dropzone's staged-but-unattached preview) serves ONLY
+  // to its uploader; every other doer, anonymous included, 404s. The whole
+  // linked walk (:164-210) is upstream's else-branch and is skipped on this
+  // arm — the repo row is never even read. A NULL uploader_id matches
+  // nobody (upstream's zero UploaderID, models/repo/attachment.go:32).
+  if (resolved.kind === "unlinked-issue" || resolved.kind === "unlinked-release") {
+    if (doer === null || doer.id !== resolved.row.uploaderId) {
       return respond(NOT_FOUND());
+    }
+  } else {
+    const repoId = resolved.kind === "issue" ? resolved.issue.repoId : resolved.row.repoId;
+    const unitType = resolved.kind === "issue" ? resolved.unitType : "releases";
+
+    // 5. GetRepositoryByID + GetDoerRepoPermission (:164-182), over the landed
+    // readGrant predicate (SPEC-0003 §2.4 / SPEC-0010 §2.6).
+    const repo = (await drizzle(c.env.DB).select().from(repositories).where(eq(repositories.id, repoId)).limit(1))[0];
+    if (repo === undefined) {
+      return SERVER_ERROR(); // GetRepositoryByID ServerError (:170-173)
+    }
+    const ownerRow = (
+      await drizzle(c.env.DB)
+        .select({ id: users.id, status: users.status, visibility: users.visibility })
+        .from(users)
+        .where(eq(users.usernameLower, repo.ownerNamespace))
+        .limit(1)
+    )[0];
+    const teamMode =
+      doer === null ? "none" : await doerRepoAccessMode(c.env.DB, { id: repo.id, ownerId: repo.ownerId }, doer.id);
+    const canRead = readGrant({
+      repoVisibility: repo.visibility,
+      owner: ownerRow === undefined ? null : { id: ownerRow.id, status: ownerRow.status },
+      ownerVisibility: ownerRow?.visibility ?? "private",
+      doer,
+      teamMode,
+    });
+    if (!canRead) {
+      return respond(NOT_FOUND()); // perm.CanRead fail (:184-187)
+    }
+
+    // 6. The draft-release arm (:193-203) — release_id is NOT NULL on
+    // release_assets, so the upstream `attach.ReleaseID != 0` guard always
+    // holds on this half.
+    if (resolved.kind === "release" && resolved.release.isDraft) {
+      const canWrite =
+        doer !== null &&
+        (await canWriteReleases(
+          c.env.DB,
+          repo,
+          ownerRow === undefined ? null : ownerRow,
+          doer,
+          teamMode,
+        ));
+      if (!canWrite) {
+        return respond(NOT_FOUND());
+      }
+    }
+
+    // 7. CheckTokenScopes + attachmentReadScope (:205-210) — AFTER the 404
+    // arms, matching upstream's order; only token doers are checked (a
+    // session doer resolves with scope null — CheckTokenScopes no-ops for a
+    // doer without an API-token scope, permission.go:19-22).
+    if (doer !== null && credential.scope !== null && !credential.scope.has(attachmentReadScope(unitType))) {
+      return respond(FORBIDDEN());
     }
   }
 
-  // 7. CheckTokenScopes + attachmentReadScope (:205-210) — AFTER the 404
-  // arms, matching upstream's order; only token doers are checked (a
-  // session doer resolves with scope null — CheckTokenScopes no-ops for a
-  // doer without an API-token scope, permission.go:19-22).
-  if (doer !== null && credential.scope !== null && !credential.scope.has(attachmentReadScope(unitType))) {
-    return respond(FORBIDDEN());
-  }
-
   // 8. IncreaseDownloadCount (:213-216) — before the bytes, upstream order.
-  if (resolved.kind === "issue") {
+  // Upstream's call sits AFTER the TypeInvalid if/else (:213), so the
+  // uploader's unlinked fetch bumps its row too.
+  if (resolved.kind === "issue" || resolved.kind === "unlinked-issue") {
     await drizzle(c.env.DB)
       .update(issueAttachments)
       .set({ downloadCount: resolved.row.downloadCount + 1 })

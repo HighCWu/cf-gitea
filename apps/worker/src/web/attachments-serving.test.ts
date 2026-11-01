@@ -2,7 +2,9 @@
  * The site-level attachment-serving seam (src/web/attachments-serving.ts) on
  * real D1 + R2 — upstream routers/web/repo/attachment.go ServeAttachment at
  * the pin. Pins: the split-table uuid resolution (issue half → issue/PR unit,
- * release half → releases unit), the readGrant visibility matrix (public anon
+ * release half → releases unit), the unlinked TypeInvalid arm (issue_id 0 /
+ * release_id 0 — uploader-only, 404 for everyone else, linked walk skipped),
+ * the readGrant visibility matrix (public anon
  * / private reader / stranger-404, anti-enumeration), the scope check AFTER
  * the 404 arms (read:issue / read:repository → 403), the draft-release arm,
  * the download_count bump, the generic ETag private-cache 304s (ETag +
@@ -168,9 +170,12 @@ interface SeedAttachmentOptions {
   content: Uint8Array;
   now?: Date;
   commentId?: number;
+  /** The uploader's user id (0 mirrors a pre-column row matching nobody). */
+  uploaderId?: number;
 }
 
-/** A stored issue attachment (the landed upload flow — realistic R2 keys). */
+/** A stored issue attachment (the landed upload flow — realistic R2 keys).
+ *  `issueId: 0` lands the unlinked staged shape (the dropzone preview row). */
 async function seedIssueAttachment(options: SeedAttachmentOptions) {
   return uploadIssueAttachment({
     bucket: env.REPO_PACKS,
@@ -178,7 +183,7 @@ async function seedIssueAttachment(options: SeedAttachmentOptions) {
     storageKey: options.storageKey,
     issueId: options.issueId,
     commentId: options.commentId ?? 0,
-    uploaderId: 1,
+    uploaderId: options.uploaderId ?? 1,
     name: options.name,
     content: streamOf(options.content),
     multipart: false,
@@ -229,6 +234,26 @@ async function issueAttachmentRow(uuid: string) {
   const row = (await db().select().from(issueAttachments).where(eq(issueAttachments.uuid, uuid)).limit(1))[0];
   if (row === undefined) throw new Error("attachment row missing");
   return row;
+}
+
+/** A stored release-attachment half with NO release link (release_id 0 —
+ *  the unlinked staged shape on the release side). Direct row + R2 put, like
+ *  seedReleaseAsset, but no `releases` row exists. */
+async function seedUnlinkedReleaseAsset(uploaderId: number | null, content: Uint8Array): Promise<string> {
+  const uuid = crypto.randomUUID();
+  const key = `repos/r_${PUBLIC_REPO_ID}/release-assets/${uuid}/stage.bin`;
+  await env.REPO_PACKS.put(key, content);
+  await db().insert(releaseAssets).values({
+    uuid,
+    repoId: PUBLIC_REPO_ID,
+    releaseId: 0,
+    uploaderId,
+    name: "stage.bin",
+    size: content.byteLength,
+    r2Key: key,
+    createdAt: new Date("2026-03-02T03:04:05Z"),
+  });
+  return uuid;
 }
 
 // ---------------------------------------------------------------------------
@@ -756,6 +781,134 @@ describe("GET /attachments/{uuid} — dangling-link 500 arm", () => {
     await db().delete(issues).where(eq(issues.id, issue.id));
     const res = await serve(`/attachments/${row.uuid}`);
     expect(res.status).toBe(500);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The TypeInvalid arm (attachment.go:159-163): an unlinked row — issue_id 0 /
+// release_id 0, the dropzone's staged-but-unattached preview — serves ONLY to
+// its uploader (ctx.IsSigned && UploaderID == ctx.Doer.ID). Everyone else
+// 404s, anonymous included, site admins included (no admin arm). The linked
+// walk (:164-210: repo resolution, readGrant, draft, scope) is upstream's
+// else-branch and is skipped on this arm — the tests below seed NO repo row,
+// so a 200 pins the skip (the linked walk would 500 on the missing repo).
+// ---------------------------------------------------------------------------
+
+describe("GET /attachments/{uuid} — the unlinked arm (TypeInvalid, uploader-only)", () => {
+  it("serves an unlinked issue-half row to its uploader over the session cookie, with no repo row at all", async () => {
+    const uploader = await seedUser("attach-uploader");
+    const payload = pngPayload();
+    // issueId 0 and NO repositories row: the linked walk would 500 on the
+    // missing repo — the 200 pins the TypeInvalid arm's skip.
+    const row = await seedIssueAttachment({
+      repoId: PUBLIC_REPO_ID,
+      storageKey: PUBLIC_STORAGE_KEY,
+      issueId: 0,
+      name: "preview.png",
+      content: payload,
+      uploaderId: uploader.id,
+    });
+    const cookie = await mintSession(env.DB, uploader.id);
+    const res = await serve(`/attachments/${row.uuid}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/png");
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(payload);
+    // the bump rides the unlinked fetch too (upstream :213, after the if/else)
+    expect((await issueAttachmentRow(row.uuid)).downloadCount).toBe(1);
+  });
+
+  it("404s an unlinked issue-half row for anonymous and never bumps the count", async () => {
+    const uploader = await seedUser("attach-uploader");
+    const row = await seedIssueAttachment({
+      repoId: PUBLIC_REPO_ID,
+      storageKey: PUBLIC_STORAGE_KEY,
+      issueId: 0,
+      name: "preview.png",
+      content: pngPayload(),
+      uploaderId: uploader.id,
+    });
+    const res = await serve(`/attachments/${row.uuid}`);
+    expect(res.status).toBe(404);
+    expect(await res.text()).toBe("Not Found\n");
+    expect((await issueAttachmentRow(row.uuid)).downloadCount).toBe(0);
+  });
+
+  it("404s an unlinked issue-half row for a signed non-uploader — all-scope stranger AND site admin (no admin arm)", async () => {
+    const uploader = await seedUser("attach-uploader");
+    const stranger = await seedUser("attach-stranger");
+    const admin = await seedUser("attach-admin", true);
+    const row = await seedIssueAttachment({
+      repoId: PUBLIC_REPO_ID,
+      storageKey: PUBLIC_STORAGE_KEY,
+      issueId: 0,
+      name: "preview.png",
+      content: pngPayload(),
+      uploaderId: uploader.id,
+    });
+    const strangerRes = await serve(`/attachments/${row.uuid}`, {
+      headers: { authorization: `token ${(await mintFor(stranger.id, "stranger-all", "all")).plaintext}` },
+    });
+    expect(strangerRes.status).toBe(404);
+    const adminRes = await serve(`/attachments/${row.uuid}`, {
+      headers: { authorization: `token ${(await mintFor(admin.id, "admin-all", "all")).plaintext}` },
+    });
+    expect(adminRes.status).toBe(404);
+    expect((await issueAttachmentRow(row.uuid)).downloadCount).toBe(0);
+  });
+
+  it("serves the uploader over the token arm too — NO scope required (CheckTokenScopes lives in the linked else-branch)", async () => {
+    const uploader = await seedUser("attach-uploader");
+    const row = await seedIssueAttachment({
+      repoId: PUBLIC_REPO_ID,
+      storageKey: PUBLIC_STORAGE_KEY,
+      issueId: 0,
+      name: "preview.png",
+      content: pngPayload(),
+      uploaderId: uploader.id,
+    });
+    // read:user carries neither read:issue nor read:repository — a scope
+    // check on this arm would 403; upstream runs it only in the else.
+    const token = (await mintFor(uploader.id, "uploader-scopeless", "read:user")).plaintext;
+    const res = await serve(`/attachments/${row.uuid}`, {
+      headers: { authorization: `token ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect((await issueAttachmentRow(row.uuid)).downloadCount).toBe(1);
+  });
+
+  it("serves an unlinked release-half row to its uploader and hides it from a signed non-uploader", async () => {
+    const uploader = await seedUser("attach-uploader");
+    const stranger = await seedUser("attach-stranger");
+    const payload = new TextEncoder().encode("staged asset bytes");
+    const uuid = await seedUnlinkedReleaseAsset(uploader.id, payload);
+
+    const strangerRes = await serve(`/attachments/${uuid}`, {
+      headers: { authorization: `token ${(await mintFor(stranger.id, "rel-stranger", "all")).plaintext}` },
+    });
+    expect(strangerRes.status).toBe(404);
+
+    const cookie = await mintSession(env.DB, uploader.id);
+    const res = await serve(`/attachments/${uuid}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${cookie}` },
+    });
+    expect(res.status).toBe(200);
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(payload);
+    const assets = await db().select().from(releaseAssets).all();
+    expect(assets[0]?.downloadCount).toBe(1);
+  });
+
+  it("404s an unlinked release-half row whose uploader_id is NULL for a signed all-scope user (zero-UploaderID matches nobody)", async () => {
+    await seedUser("attach-uploader");
+    const signed = await seedUser("attach-stranger");
+    const uuid = await seedUnlinkedReleaseAsset(null, new TextEncoder().encode("orphan stage"));
+    const res = await serve(`/attachments/${uuid}`, {
+      headers: { authorization: `token ${(await mintFor(signed.id, "null-up", "all")).plaintext}` },
+    });
+    expect(res.status).toBe(404);
+    const assets = await db().select().from(releaseAssets).all();
+    expect(assets[0]?.downloadCount).toBe(0);
   });
 });
 
