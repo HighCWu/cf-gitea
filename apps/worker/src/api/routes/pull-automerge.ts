@@ -8,8 +8,10 @@
  * GetScheduledMergeByPullID → exist=false → APIErrorNotFound. The route
  * mirrors exactly that, in upstream's order:
  *   1. invisible/missing repository → the anti-enumeration 404;
- *   2. missing PR index → the ErrPullRequestNotExist 404
- *      (`pull request does not exist [id: 0, …]`, the pulls-route message);
+ *   2. missing PR index → the bare APIErrorNotFound 404 ("not found",
+ *      services/context/api.go:137-142 — upstream's cancel handler answers
+ *      IsErrPullRequestNotExist with the SAME bare 404 as the scheduled-none
+ *      arm, pull.go:1279-1282, NOT the pulls-route message);
  *   3. otherwise (PR exists, nothing scheduled) → the bare 404 "not found".
  *
  * The declared {204, 403, 423} branches are therefore never emitted: 204
@@ -41,7 +43,7 @@ import { z } from "zod";
 
 import type { ApiEnv } from "../env";
 import { ApiError, apiErrorSchema } from "../errors";
-import { findPullRequestByIndex, pullRequestNotExistError } from "../services/pulls";
+import { findPullRequestByIndex } from "../services/pulls";
 import { getScheduledAutoMerge, removeScheduledAutoMerge } from "../../services/pull-automerge";
 import { findRepositoryById } from "../services/repository";
 import { findRule, isUserMergeWhitelisted, parseRuleConfig, principalAccessOf } from "../../services/branch-protection";
@@ -78,10 +80,14 @@ async function cancelScheduledAutoMerge(c: Context<ApiEnv>, owner: string, repo:
   const index = pathId(rawIndex);
   const row = await findPullRequestByIndex(c.env.DB, found.repo.id, index);
   if (row === null) {
-    throw pullRequestNotExistError(found.repo.id, index);
+    // IsErrPullRequestNotExist → APIErrorNotFound (pull.go:1279-1282): the
+    // BARE 404 "not found" — unlike the pulls GET routes, this handler does
+    // not render the ErrPullRequestNotExist message.
+    throw new ApiError(404, "not found");
   }
-  // GetScheduledMergeByPullID: exist=false → the bare 404 (the old stub's
-  // only reachable arm — still the common case).
+  // GetScheduledMergeByPullID: exist=false → APIErrorNotFound too
+  // (pull.go:1289-1292) — the same bare 404 (the old stub's only reachable
+  // arm — still the common case).
   const scheduled = await getScheduledAutoMerge(c.env.DB, row.issue.id);
   if (scheduled === null) {
     throw new ApiError(404, "not found");
@@ -100,7 +106,9 @@ async function cancelScheduledAutoMerge(c: Context<ApiEnv>, owner: string, repo:
     const rule = await findRule(c.env.DB, found.repo.id, row.pullRequest.baseBranch);
     const allowed = access.write && (rule === null || (await isUserMergeWhitelisted(c.env.DB, parseRuleConfig(rule.rules), access)));
     if (!allowed) {
-      throw new ApiError(403, "You are not allowed to remove this scheduled auto merge");
+      // pull.go:1303-1304's verbatim text (the web handler's HTTPError text
+      // is the identical string, routers/web/repo/pull.go:1274).
+      throw new ApiError(403, "user has no permission to cancel the scheduled auto merge");
     }
   }
   await removeScheduledAutoMerge(c.env.DB, row.issue, authUser?.id ?? 0, new Date());

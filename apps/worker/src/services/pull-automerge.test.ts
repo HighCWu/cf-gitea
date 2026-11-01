@@ -13,6 +13,9 @@
  *     PR merged (the landed mergePullRequest with the row's
  *     style/message), the issue closed with the merge_pull comment;
  *   - closed/merged rows delete; a missing row is the not-scheduled arm;
+ *   - an Empty PR schedules but never merges (the quick check is
+ *     Mergeable-only) and an open dependency skips with the row kept until
+ *     the blocker closes (check.go:219-222's consumer arm);
  *   - the producer enqueues one message per scheduled row (and zero for an
  *     empty table) through a recording queue spy (the demo-sweep shape).
  */
@@ -27,7 +30,7 @@ import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { createCommitStatus } from "../api/services/commit-status";
 import { findPullRequestByIndex } from "../api/services/pulls";
 import { ZERO_OID, branchRef, pullHeadRef } from "../api/services/engine";
-import { comments, PRStatus, protectedBranches, pullAutoMerges, pullRequests, users } from "../db/schema";
+import { comments, issueDependencies, PRStatus, protectedBranches, pullAutoMerges, pullRequests, users } from "../db/schema";
 import { IssuesService } from "../issues/service";
 import { CommentType } from "../issues/comment-types";
 import { emptyRuleConfig, serializeRuleConfig } from "./branch-protection";
@@ -84,6 +87,28 @@ async function landCommit(
   if (put.tag !== "ok") throw new Error(`seed putApiObjects failed: ${put.tag}`);
   const landed = await cell.commitApiChange({ ref, expectedOldOid: ZERO_OID, newOid: commit.oid });
   if (landed.tag !== "committed") throw new Error(`seed ref landing failed: ${ref} (${landed.tag})`);
+  return commit.oid;
+}
+
+/** One CHILD commit on `branch` (parent = parentOid) with a single file — a
+ *  tip DISTINCT from the shared headOid so a test's merge attempt is the
+ *  first one of that content (the shared head gets squash-merged by the
+ *  green-pr test, which would refuse a second merge of the same tree). */
+async function landChildCommitOnBranch(branch: string, parentOid: string, fileName: string, content: string): Promise<string> {
+  const cell = env.REPO.getByName("alice/amrepo");
+  const blob = new TextEncoder().encode(content);
+  const blobOid = await gitObjectOid("blob", blob);
+  const tree = serializeTree([{ mode: "100644", name: fileName, oid: blobOid }]);
+  const person = { name: "seed", email: "seed@amrepo.invalid", time: T0 + 200, tz: "+0000" };
+  const commit = serializeCommit({ tree: tree.oid, parents: [parentOid], author: person, committer: person, message: `${fileName}\n` });
+  const put = await cell.putApiObjects([
+    { oid: blobOid, type: "blob", data: blob },
+    { oid: tree.oid, type: "tree", data: tree.data },
+    { oid: commit.oid, type: "commit", data: commit.data },
+  ]);
+  if (put.tag !== "ok") throw new Error(`child putApiObjects failed: ${put.tag}`);
+  const landed = await cell.commitApiChange({ ref: branchRef(branch), expectedOldOid: parentOid, newOid: commit.oid });
+  if (landed.tag !== "committed") throw new Error(`child ref landing failed: ${branch} (${landed.tag})`);
   return commit.oid;
 }
 
@@ -219,6 +244,114 @@ describe("handleAutoMergeCheck (the consume-time ladder)", () => {
     await d1().update(pullRequests).set({ headBranch: "ghost-branch" }).where(eq(pullRequests.id, found.pullRequest.id));
     expect(await handleAutoMergeCheck(env, found.issue.id)).toBe("skipped-head-branch-missing");
     expect(await getScheduledAutoMerge(env.DB, found.issue.id)).not.toBeNull();
+  });
+
+  it("an Empty PR schedules but never auto-merges (the quick check is Mergeable-only, automerge.go:143-145)", async () => {
+    const index = await seedScheduledPr("emptypr", "merge");
+    const found = (await findPullRequestByIndex(env.DB, repoId, index))!;
+    // EVERYTHING else green: the required check passes — an Empty row must
+    // still never merge (models/issues/pull.go:446-448: IsStatusMergeable has
+    // no Empty arm; the schedule accepted it via check.go:170-172).
+    await createCommitStatus(env.DB, {
+      repoId,
+      sha: headOid,
+      state: "success",
+      targetUrl: "",
+      description: "build ok",
+      context: "ci/build",
+      creatorId: alice.id,
+    });
+    await d1().update(pullRequests).set({ status: PRStatus.Empty }).where(eq(pullRequests.id, found.pullRequest.id));
+    expect(await handleAutoMergeCheck(env, found.issue.id)).toBe("skipped-not-mergeable");
+    expect(await getScheduledAutoMerge(env.DB, found.issue.id)).not.toBeNull();
+    expect(found.pullRequest.hasMerged).toBe(false);
+  });
+
+  it("an open dependency skips the merge with the row kept (check.go:219-222); closing the blocker releases it", async () => {
+    const index = await seedScheduledPr("blockedpr", "merge");
+    const found = (await findPullRequestByIndex(env.DB, repoId, index))!;
+    // A tip DISTINCT from the shared headOid (already squash-merged by the
+    // green-pr test) so this test's merge arms are first-of-their-content.
+    const tip = await landChildCommitOnBranch("blockedpr-branch", headOid, "blocked.ts", "// blocked work\n");
+    await d1().update(pullRequests).set({ headSha: tip }).where(eq(pullRequests.id, found.pullRequest.id));
+    await env.REPO.getByName("alice/amrepo").commitApiChange({ ref: pullHeadRef(found.pullRequest.index), expectedOldOid: headOid, newOid: tip });
+    await createCommitStatus(env.DB, {
+      repoId,
+      sha: tip,
+      state: "success",
+      targetUrl: "",
+      description: "build ok",
+      context: "ci/build",
+      creatorId: alice.id,
+    });
+    const blocker = await new IssuesService(env.DB).createIssue({
+      repoId,
+      title: "blocker",
+      content: null,
+      posterId: alice.id,
+      labelIds: [],
+      milestoneId: null,
+    });
+    // The "blocked by" edge (issue_id = the scheduled PR's issue).
+    await d1().insert(issueDependencies).values({ userId: alice.id, issueId: found.issue.id, dependencyId: blocker.id, createdAt: new Date((T0 + 130) * 1000) });
+    expect(await handleAutoMergeCheck(env, found.issue.id)).toBe("skipped-dependencies");
+    expect(await getScheduledAutoMerge(env.DB, found.issue.id)).not.toBeNull();
+    expect(found.pullRequest.hasMerged).toBe(false);
+
+    // The REVERSE edge never blocks: the PR BLOCKING another open issue is
+    // the dependency_id side, and IssueNoDependenciesLeft reads only
+    // issue_id = self — the release below merges WITH this edge standing.
+    const downstream = await new IssuesService(env.DB).createIssue({
+      repoId,
+      title: "downstream",
+      content: null,
+      posterId: alice.id,
+      labelIds: [],
+      milestoneId: null,
+    });
+    await d1().insert(issueDependencies).values({ userId: alice.id, issueId: downstream.id, dependencyId: found.issue.id, createdAt: new Date((T0 + 131) * 1000) });
+
+    // Closing the blocker releases the wait — the next tick merges.
+    await new IssuesService(env.DB).closeIssue(blocker.id, { actorId: alice.id, now: new Date((T0 + 140) * 1000) });
+    expect(await handleAutoMergeCheck(env, found.issue.id)).toBe("merged");
+    expect(await getScheduledAutoMerge(env.DB, found.issue.id)).toBeNull();
+  });
+
+  it("a post-schedule push re-gates at the FRESH head sha — the stale sha's green never merges the new head", async () => {
+    const index = await seedScheduledPr("racepr", "merge");
+    const found = (await findPullRequestByIndex(env.DB, repoId, index))!;
+    // Green ci/build ONLY at the schedule-time sha (headOid) — the exact
+    // state a just-landed push makes stale.
+    await createCommitStatus(env.DB, {
+      repoId,
+      sha: headOid,
+      state: "success",
+      targetUrl: "",
+      description: "build ok",
+      context: "ci/build",
+      creatorId: alice.id,
+    });
+    // The push lands AFTER the schedule: the refs move and the row re-arms
+    // to `checking` (the push flow's re-arm posture — the Checking CAS in the
+    // merge engine's push path).
+    const racedOid = await landChildCommitOnBranch("racepr-branch", headOid, "race.ts", "// raced work\n");
+    await env.REPO.getByName("alice/amrepo").commitApiChange({ ref: pullHeadRef(index), expectedOldOid: headOid, newOid: racedOid });
+    await d1().update(pullRequests).set({ status: PRStatus.Checking }).where(eq(pullRequests.id, found.pullRequest.id));
+
+    // Tick 1 on the checking row: the stored quick check waits (a checking
+    // row is not IsStatusMergeable, automerge.go:143-145) — the OLD sha's
+    // green must not merge the NEW head out from under the settle.
+    expect(await handleAutoMergeCheck(env, found.issue.id)).toBe("skipped-not-mergeable");
+    expect(await getScheduledAutoMerge(env.DB, found.issue.id)).not.toBeNull();
+
+    // The settle (any GET's lazy check CAS): the row lands Mergeable at the
+    // NEW sha — then tick 2 gates the statuses at the CHECKED row's fresh
+    // sha (the B2 seam; upstream's own live read sits inside the gate,
+    // commit_status.go:126-135). No green ci/build at racedOid → the
+    // schedule waits; the PR is never merged under the old sha's green.
+    await d1().update(pullRequests).set({ status: PRStatus.Mergeable, headSha: racedOid }).where(eq(pullRequests.id, found.pullRequest.id));
+    expect(await handleAutoMergeCheck(env, found.issue.id)).toBe("skipped-status-checks");
+    expect((await findPullRequestByIndex(env.DB, repoId, index))!.pullRequest.hasMerged).toBe(false);
   });
 
   it("drops a schedule whose PR row vanished", async () => {

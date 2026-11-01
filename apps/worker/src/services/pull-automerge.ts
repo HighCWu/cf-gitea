@@ -9,13 +9,14 @@
  *              (pull.go:1135-1149): the landed merge ladder's schedule arm —
  *              pages/pull-merge-box.tsx mergePullRequestFromWeb — deletes any
  *              existing row, inserts this one (models' ScheduleAutoMerge,
- *              automerge.go:58-77) and creates the type-34 system comment
+ *              models/pull/automerge.go:54-75) and creates the type-34 system comment
  *              (CreateAutoMergeComment, comment.go:1257) — then the FIRST
  *              check is enqueued (StartAutoMergeCheckByPullHead).
  *   CHECK      upstream runs a unique queue whose item pins
  *              `pr:{pullID}:{headCommitID}` and whose handler
- *              (handlePullRequestAutoMerge, automerge.go:131-259) re-checks
- *              everything at consume time. Ours: `{kind: "auto-merge-check",
+ *              (handlePullRequestAutoMerge, services/automerge/automerge.go:
+ *              132-251) re-checks everything at consume time. Ours:
+ *              `{kind: "auto-merge-check",
  *              issueId}` messages on the standing REPO_TASKS queue — the cron
  *              producer (enqueueDueAutoMergeChecks) re-probes every scheduled
  *              row each tick, so a red PR that turns green merges on the
@@ -25,22 +26,26 @@
  *   CANCEL     web POST /pulls/{index}/cancel_auto_merge (pull.go:1251-1290):
  *              the landed cancel arm — pages/pull-merge-box.tsx
  *              cancelAutoMergeFromWeb — deletes the row and creates the
- *              type-35 comment (RemoveScheduledAutoMerge, automerge.go:110).
+ *              type-35 comment (RemoveScheduledAutoMerge, services/automerge/
+ *              automerge.go:91-100).
  *
  * ## The consume-time ladder (handlePullRequestAutoMerge's order)
  *
  *   not scheduled → skip; closed/merged → DELETE the row and skip; the
- *   stored quick check (not mergeable / WIP) → skip; head branch missing →
- *   skip; required commit statuses not green (IsPullCommitStatusPass,
- *   commit_status.go:73 — the rule's required-context merge, ported below)
- *   → skip (THE schedule waits); the doer's merge permission gone → skip;
+ *   stored quick check (not MERGEABLE — IsStatusMergeable has no Empty arm,
+ *   models/issues/pull.go:446-448 / WIP) → skip; head branch missing →
+ *   skip; the doer's merge permission gone → skip;
  *   the fresh mergeability check (ensurePullRequestChecked — the General
  *   re-check CheckPullMergeable runs at merge time) not mergeable → skip;
- *   branch protections failed → skip; otherwise MERGE with the row's
- *   style/message/delete-branch, DELETE the row, re-issue the merge
- *   webhook + feed action (the landed merge route's emit arms), and run the
- *   flagged delete-branch after merge (ShouldDeleteBranchAfterMerge's
- *   best-effort tail).
+ *   required commit statuses not green at the CHECKED row's fresh sha
+ *   (IsPullCommitStatusPass, commit_status.go:73 — the rule's required-
+ *   context merge, ported below) → skip (THE schedule waits);
+ *   branch protections failed → skip; an open dependency remains
+ *   (CheckPullMergeable's final arm, check.go:219-222) → skip; otherwise
+ *   MERGE with the row's style/message/delete-branch, DELETE the row,
+ *   re-issue the merge webhook + feed action (the landed merge route's emit
+ *   arms), and run the flagged delete-branch after merge
+ *   (ShouldDeleteBranchAfterMerge's best-effort tail).
  *
  * A skip LEAVES the row scheduled (upstream's errSkipAutoMerge) — the next
  * tick re-probes. Only the closed/merged arm and the successful merge
@@ -49,11 +54,13 @@
  * ## Divergences (each cited at the seam)
  *
  * - The head-sha gate: upstream's queue item pins the sha it was enqueued
- *   for and skips when the ref moved; the cron re-probe has no stale item —
- *   it re-reads the LIVE head every tick (upstream itself re-gets the
- *   latest sha "to handle the case where the check of a previous push did
- *   not succeed", automerge.go:186-189). The row's `sha` stays the
- *   schedule-time record.
+ *   for and skips when the ref moved (services/automerge/automerge.go:165-178);
+ *   the cron re-probe has no stale item — it re-reads the LIVE head every
+ *   tick (upstream itself re-gets the latest sha "to handle the case where
+ *   the check of a previous push did not succeed", automerge.go:180-182 —
+ *   the read itself sits inside IsPullCommitStatusPass, commit_status.go:
+ *   126-135) and the status gate reads that fresh sha, never the row's
+ *   stored one. The row's `sha` stays the schedule-time record.
  * - `MergedCommitID` (upstream's post-merge stamp) has no landed column —
  *   the merge's own `pull_requests.merged_commit_id` is the record.
  * - `EffectiveRequiredContexts` (the owner/admin mandated scoped checks,
@@ -72,7 +79,7 @@ import { Context } from "hono";
 import type { ApiEnv } from "../api/env";
 import { ApiError } from "../api/errors";
 import { ActionType, recordAction } from "../api/services/activity-feeds";
-import { hasWorkInProgressPrefix } from "../api/services/issues";
+import { hasWorkInProgressPrefix, issueNoDependenciesLeft } from "../api/services/issues";
 import { combinedStateOf, latestCommitStatuses } from "../api/services/commit-status";
 import type { CommitStatusState } from "../api/models/commit-status";
 import {
@@ -231,24 +238,17 @@ export async function getScheduledAutoMerge(d1: D1Database, issueId: number): Pr
   return (await drizzle(d1).select().from(pullAutoMerges).where(eq(pullAutoMerges.issueId, issueId)).get()) ?? null;
 }
 
-/** The schedule write (models' ScheduleAutoMerge + the web handler's
- *  delete-first, pull.go:1136): any existing row goes, then the insert. The
- *  type-34 comment rides the caller (the web ladder runs it inside its own
- *  outcome — same model split upstream: the model inserts, the service
- *  comments). */
-export async function scheduleAutoMergeRow(
-  d1: D1Database,
-  input: {
-    issueId: number;
-    doerId: number;
-    sha: string;
-    style: string;
-    message: string;
-    deleteBranchAfterMerge: boolean;
-  },
-  now: Date,
-): Promise<PullAutoMergeRow> {
-  await drizzle(d1).delete(pullAutoMerges).where(eq(pullAutoMerges.issueId, input.issueId));
+interface ScheduleAutoMergeInput {
+  issueId: number;
+  doerId: number;
+  sha: string;
+  style: string;
+  message: string;
+  deleteBranchAfterMerge: boolean;
+}
+
+/** The bare insert (models' ScheduleAutoMerge's tail, models/pull/automerge.go:67-74). */
+async function insertAutoMergeRow(d1: D1Database, input: ScheduleAutoMergeInput, now: Date): Promise<PullAutoMergeRow> {
   const rows = await drizzle(d1)
     .insert(pullAutoMerges)
     .values({
@@ -264,7 +264,37 @@ export async function scheduleAutoMergeRow(
   return rows[0]!;
 }
 
-/** `DeleteScheduledAutoMerge` (automerge.go:98-100) — true when a row went. */
+/** The schedule write (models' ScheduleAutoMerge + the web handler's
+ *  delete-first, pull.go:1136): any existing row goes, then the insert. The
+ *  type-34 comment rides the caller (the web ladder runs it inside its own
+ *  outcome — same model split upstream: the model inserts, the service
+ *  comments). */
+export async function scheduleAutoMergeRow(
+  d1: D1Database,
+  input: ScheduleAutoMergeInput,
+  now: Date,
+): Promise<PullAutoMergeRow> {
+  await drizzle(d1).delete(pullAutoMerges).where(eq(pullAutoMerges.issueId, input.issueId));
+  return insertAutoMergeRow(d1, input, now);
+}
+
+/** The model's ScheduleAutoMerge WITHOUT the web handler's delete-first —
+ *  the API arm's shape (api pull.go:994-1000): a standing row is KEPT and
+ *  reported (upstream answers IsErrAlreadyScheduledToAutoMerge → 409; the
+ *  model raises it from the GetScheduledMergeByPullID exists-check,
+ *  models/pull/automerge.go:54-62). Returns null when a row was already
+ *  standing (the caller answers the conflict); the type-34 comment rides the
+ *  caller. */
+export async function insertScheduledAutoMergeRow(
+  d1: D1Database,
+  input: ScheduleAutoMergeInput,
+  now: Date,
+): Promise<PullAutoMergeRow | null> {
+  if ((await getScheduledAutoMerge(d1, input.issueId)) !== null) return null;
+  return insertAutoMergeRow(d1, input, now);
+}
+
+/** `DeleteScheduledAutoMerge` (models/pull/automerge.go:90-91) — true when a row went. */
 export async function deleteScheduledAutoMerge(d1: D1Database, issueId: number): Promise<boolean> {
   const rows = await drizzle(d1).delete(pullAutoMerges).where(eq(pullAutoMerges.issueId, issueId)).returning({ id: pullAutoMerges.id });
   return rows.length > 0;
@@ -380,6 +410,7 @@ export type AutoMergeCheckOutcome =
   | "skipped-doer-missing"
   | "skipped-no-merge-permission"
   | "skipped-protections"
+  | "skipped-dependencies"
   | "merge-failed"
   | "merged";
 
@@ -435,21 +466,27 @@ export async function handleAutoMergeCheck(env: Env, issueId: number, options: {
     return "deleted-closed-or-merged";
   }
   if (issue.isClosed || pr.hasMerged) {
-    // closed or merged → delete the record and skip (automerge.go:136-143).
+    // closed or merged → delete the record and skip (automerge.go:136-141).
     await deleteScheduledAutoMerge(d1, issueId);
     return "deleted-closed-or-merged";
   }
 
-  // The quick check on the STORED row (automerge.go:146-148): not mergeable
-  // or WIP → skip (the schedule waits; the next tick re-probes).
-  if (pr.status !== PRStatus.Mergeable && pr.status !== PRStatus.Empty) return "skipped-not-mergeable";
+  // The quick check on the STORED row (services/automerge/automerge.go:143-
+  // 145): not mergeable or WIP → skip (the schedule waits; the next tick
+  // re-probes). MERGEABLE ONLY — `pr.IsStatusMergeable()` is
+  // `Status == PullRequestStatusMergeable` with NO Empty arm
+  // (models/issues/pull.go:446-448): an Empty PR schedules (the Auto-type
+  // gate is `!IsStatusMergeable() && !IsEmpty()`, check.go:170-172) but the
+  // consumer skips it every tick, row kept — an empty diff never merges out
+  // of a schedule.
+  if (pr.status !== PRStatus.Mergeable) return "skipped-not-mergeable";
   if (hasWorkInProgressPrefix(issue.title)) return "skipped-wip";
 
   const pair = await findRepositoryById(d1, issue.repoId);
   if (pair === null) return "skipped-not-mergeable"; // the vanished base repo — nothing to merge into
   const headRepo = await findRepositoryById(d1, pr.headRepoId);
 
-  // The head-branch existence check (automerge.go:169-188): Github flow →
+  // The head-branch existence check (automerge.go:183-196): Github flow →
   // the branch exists in the HEAD repo; AGit → the PR ref exists on base.
   // A failed (null) ref read is the missing arm — nothing to merge.
   if (pr.flow === PRFlow.Github) {
@@ -466,42 +503,63 @@ export async function handleAutoMergeCheck(env: Env, issueId: number, options: {
   const rule = await findRule(d1, pair.repo.id, pr.baseBranch);
   const config = rule === null ? null : parseRuleConfig(rule.rules);
 
-  // IsPullCommitStatusPass — the schedule's whole point: wait here until
-  // the required checks go green (automerge.go:191-196).
-  if (!(await isPullCommitStatusPass(d1, pair.repo.id, pr.headSha, config))) return "skipped-status-checks";
-
-  // The scheduled doer (GetPossibleUserByID, automerge.go:199-203): a
+  // The scheduled doer (GetPossibleUserByID, automerge.go:211-214): a
   // vanished doer cannot merge (upstream errors — logged, row stays).
   const doerRows = await drizzle(d1).select().from(users).where(eq(users.id, scheduled.doerId)).all();
   const doerRow = doerRows[0];
   if (doerRow === undefined) return "skipped-doer-missing";
   const doer: User = { id: doerRow.id, login: doerRow.username, is_admin: doerRow.isAdmin, email: doerRow.email ?? undefined };
 
-  // CheckPullMergeable's permission half at merge time (automerge.go:206-216
-  // → check.go:158-165): the doer's base write + the merge whitelist.
+  // CheckPullMergeable's permission half at merge time (automerge.go:221-223
+  // → check.go:155-160): the doer's base write + the merge whitelist.
   const access = await principalAccessOf(d1, pair.repo, doer);
   if (!(access.write && (config === null || (await isUserMergeWhitelisted(d1, config, access))))) {
     return "skipped-no-merge-permission";
   }
 
-  // The fresh mergeability (CheckPullMergeTypeGeneral's mergeable-state +
-  // IsChecking arms — the landed lazy check settles both).
+  // The fresh mergeability FIRST (CheckPullMergeTypeGeneral's mergeable-state
+  // + IsChecking arms — the landed lazy check settles both). Upstream re-gets
+  // the latest head sha before its status gate "to handle the case where the
+  // check of a previous push did not succeed or was not finished yet"
+  // (automerge.go:180-182; the live read sits INSIDE IsPullCommitStatusPass,
+  // commit_status.go:126-135): the row's stored sha can lag a just-landed
+  // push, and gating the statuses on it would merge the NEW head under the
+  // OLD sha's green statuses — so the gate below reads the CHECKED row's sha.
   const api = consumerApiContext(env, doer);
   const checked = await ensurePullRequestChecked(api, pair, pr);
   if (checked.hasMerged) {
     await deleteScheduledAutoMerge(d1, issueId);
     return "deleted-closed-or-merged";
   }
-  if (checked.status !== PRStatus.Mergeable && checked.status !== PRStatus.Empty) return "skipped-not-mergeable";
+  // Empty stays out of the fresh gate too: the quick check fixed the class
+  // (Mergeable-only, automerge.go:146) — a PR that BECAME empty after
+  // scheduling (the base absorbed the change) skips with the row kept, the
+  // same wait-for-a-real-diff posture, never an empty commit out of a
+  // schedule.
+  if (checked.status !== PRStatus.Mergeable) return "skipped-not-mergeable";
+
+  // IsPullCommitStatusPass — the schedule's whole point: wait here until
+  // the required checks go green at the FRESH head sha (automerge.go:200-206).
+  if (!(await isPullCommitStatusPass(d1, pair.repo.id, checked.headSha, config))) return "skipped-status-checks";
 
   // The branch protections at merge time (CheckPullMergeable General does
-  // NOT skip them — approvals etc. must hold when green, automerge.go:217).
+  // NOT skip them — approvals etc. must hold when green; the arm lives in
+  // check.go:178-215, reached through the consumer's whole-ladder call,
+  // automerge.go:221-223).
   if (rule !== null) {
     const failure = await checkPullBranchProtections(d1, rule, { issueId, commitsBehind: checked.commitsBehind ?? 0 });
     if (failure !== null) return "skipped-protections";
   }
 
-  // Merge with the row's style/message/delete-branch (automerge.go:226-236).
+  // The open-dependency gate — CheckPullMergeable's FINAL arm (check.go:219-
+  // 222, after the protections + signing arms), reached through the consumer's
+  // whole-ladder call (automerge.go:221-223): an open blocker answers
+  // errSkipAutoMerge ("pull request is not mergeable") and the scheduled row
+  // STAYS — the blocker may still close while the checks hold green; the next
+  // tick re-probes.
+  if (!(await issueNoDependenciesLeft(d1, issueId))) return "skipped-dependencies";
+
+  // Merge with the row's style/message/delete-branch (automerge.go:227-236).
   // A stored style outside the enum is corrupt data — skip (nothing to
   // merge with).
   const style = mergeStyleOf(scheduled.mergeStyle);
@@ -516,7 +574,7 @@ export async function handleAutoMergeCheck(env: Env, issueId: number, options: {
     });
   } catch (error) {
     if (!(error instanceof ApiError)) throw error;
-    // The FIXME upstream carries (automerge.go:233-235): the failure is
+    // The FIXME upstream carries (automerge.go:232-235): the failure is
     // logged, the row STAYS scheduled (a transient conflict may clear).
     console.error(`[auto-merge] merge failed for issue ${issueId}: ${error.message}`);
     return "merge-failed";

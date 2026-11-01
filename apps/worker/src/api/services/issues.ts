@@ -1,8 +1,9 @@
-import { and, asc, eq, gte, inArray, lt, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, like, lt, or, sql, type SQL } from "drizzle-orm";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 import type { Context } from "hono";
 
 import {
+  actions,
   comments,
   issueAssignees,
   issueAttachments,
@@ -33,6 +34,7 @@ import type { ApiEnv } from "../env";
 import type { Comment, Issue, TimelineComment } from "../models/issue";
 import type { User } from "../models/user";
 import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "./blocks";
+import { ActionType } from "./activity-feeds";
 import { findCollaborator } from "./repo-collaborators";
 import { pullRequestDiffShortStatForEnv } from "./pull-engine";
 import { toApiPullRequest } from "./pulls";
@@ -2017,7 +2019,9 @@ async function emitIssueDeletedEvent(d1: D1Database, event: IssueDeletedEvent, e
 }
 
 /**
- * The §4.12 delete cascade in ONE D1 batch: comments (own rows + xref rows
+ * The §4.12 delete cascade in ONE D1 batch: the feed sweep (upstream
+ * DeleteIssueActions — the issue's comment-anchored action rows plus its
+ * `index|%` create row), comments (own rows + xref rows
  * pointing here + dependency rows), issue_labels, the tier-2 children
  * (content history, assignees, dependencies in BOTH directions, notification
  * states, stopwatches, tracked times, attachments), reactions,
@@ -2072,7 +2076,39 @@ export async function deleteIssueCascade(d1: D1Database, bucket: R2Bucket, issue
     if (key !== null) await bucket.delete(key);
   }
 
+  // The FEED SWEEP (upstream DeleteIssueActions, services/issue/issue.go:219 →
+  // models/activities/action.go:558-586) runs before the DeleteBeans batch
+  // upstream and joins it here: (1) the action rows pointing at the issue's
+  // comments (upstream pages the comment ids at DefaultMaxInSize for a
+  // MariaDB planner bug — one issue's comments fit a single IN here); (2) the
+  // issue's own create row (ActionCreateIssue/ActionCreatePullRequest with
+  // content `index|%` — "IssueIndex|content...", the pattern parameter-bound
+  // like upstream's `content LIKE ?`; the `|` separator keeps issue #N's
+  // prefix from matching #N1/N10's rows). Without arm 2 a deleted issue's
+  // create-action survives as a ghost feed entry.
+  const commentIds = (
+    await drizzle(d1).select({ id: comments.id }).from(comments).where(eq(comments.issueId, issue.id)).all()
+  ).map((row) => row.id);
+  const commentActionSweep = drizzle(d1).delete(actions).where(inArray(actions.commentId, commentIds));
+  const createActionSweep = drizzle(d1)
+    .delete(actions)
+    .where(
+      and(
+        eq(actions.repoId, issue.repoId),
+        inArray(actions.opType, [ActionType.CreateIssue, ActionType.CreatePullRequest]),
+        like(actions.content, `${issue.index}|%`),
+      ),
+    );
+  // Upstream's arm order (comment rows first, create rows second) as a TUPLE:
+  // the batch argument is `[BatchStatement, ...BatchStatement[]]`, and
+  // spreading a plain array at position 0 erases the tuple's required first
+  // element — the arm (b) statement is always present, so the ternary keeps
+  // every branch a one-plus tuple.
+  const actionStatements: [BatchStatement, ...BatchStatement[]] =
+    commentIds.length > 0 ? [commentActionSweep, createActionSweep] : [createActionSweep];
+
   const statements: [BatchStatement, ...BatchStatement[]] = [
+    ...actionStatements,
     drizzle(d1).delete(comments).where(eq(comments.issueId, issue.id)),
     drizzle(d1).delete(comments).where(eq(comments.refIssueId, issue.id)),
     drizzle(d1).delete(comments).where(eq(comments.dependentIssueId, issue.id)),
@@ -2165,6 +2201,26 @@ export async function findIssueByRepoAndIndex(d1: D1Database, repoId: string, in
     .limit(1)
     .then((rows) => rows[0]);
   return row ?? null;
+}
+
+/**
+ * `IssueNoDependenciesLeft` (models/issues/dependency.go:191-203) — true when
+ * NO open blocker remains: the only edges that matter are `issue_id = this`
+ * joined to a still-open `dependency_id` (the "blocked by" direction; an edge
+ * where this issue is the BLOCKER never prevents closing). The merge ladders'
+ * final gate (services/pull/check.go:219-222 — after the protections and
+ * signing arms, so a manually-merged mark never reaches it) and the merge
+ * box's blocker item share this one port.
+ */
+export async function issueNoDependenciesLeft(d1: D1Database, issueId: number): Promise<boolean> {
+  const blocker = await drizzle(d1)
+    .select({ id: issueDependencies.id })
+    .from(issueDependencies)
+    .innerJoin(issues, eq(issues.id, issueDependencies.dependencyId))
+    .where(and(eq(issueDependencies.issueId, issueId), eq(issues.isClosed, false)))
+    .limit(1)
+    .get();
+  return blocker === undefined;
 }
 
 /** The data layer's typed errors → ApiError with the pinned status/message. */

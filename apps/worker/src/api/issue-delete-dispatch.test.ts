@@ -26,8 +26,9 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
 
-import { actions, comments, issueAssignees, labels, repoCounters, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
+import { actions, comments, issueAssignees, labels, reactions, repoCounters, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
 import { IssuesService } from "../issues/service";
+import { ActionType } from "./services/activity-feeds";
 import { ZERO_OID, branchRef, engineReads, refTipMap } from "./services/engine";
 import { STUB_USER } from "./auth";
 import { createApiRouter } from "./router";
@@ -446,5 +447,73 @@ describe("DELETE /repos/{owner}/{repo}/issues/{index} webhook emissions (upstrea
     expect(next.index).toBe(2);
     const counters = await db().select().from(repoCounters).all();
     expect(counters[0]?.issueIndex).toBe(2);
+  });
+
+  it("the feed sweep (DeleteIssueActions, action.go:558-586): the issue's comment-anchored action rows, its reactions, and its `index|%` create row go with the delete, foreign rows survive", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "sweep");
+    const doomed = await seedIssue(repoId, "doomed with a feed trail", { posterId: owner.id });
+    const comment = await service().addComment({ issueId: doomed.id, posterId: 1, content: "vanishes" });
+    const neighbor = await seedIssue(repoId, "neighbor survives", { posterId: owner.id });
+    const otherRepoId = await seedRepo(owner.usernameLower, "sweep-other");
+    const otherIssue = await seedIssue(otherRepoId, "same index, another repo", { posterId: owner.id });
+    const now = new Date("2026-03-04T00:00:00Z");
+    const feedRow = (over: Partial<typeof actions.$inferInsert>): typeof actions.$inferInsert => ({
+      userId: 1,
+      opType: ActionType.CommentIssue,
+      actUserId: 1,
+      repoId,
+      createdAt: now,
+      ...over,
+    });
+    // The doomed issue's trail: the comment-anchored row and the create row
+    // (`index|title` — the CreateIssue content shape recordAction writes).
+    await db().insert(actions).values([
+      feedRow({ commentId: comment.id }),
+      feedRow({ opType: ActionType.CreateIssue, content: `${doomed.index}|doomed with a feed trail` }),
+    ]);
+    // The survivors: a sibling issue's create row (a different `index|`), a
+    // create row whose index has the doomed index as a DIGIT PREFIX (doomed
+    // is #1, this is #10 — the `|` separator keeps `1|%` from matching
+    // `10|...`), a comment-anchored row of a comment that is NOT the doomed
+    // issue's (commentId 0), a non-create op_type with the SAME `index|`
+    // prefix (only CreateIssue/CreatePullRequest carry the content arm
+    // upstream), and another repo's own `1|` create row (the repo_id
+    // conjunct scopes the content arm to the doomed repo).
+    await db().insert(actions).values([
+      feedRow({ opType: ActionType.CreateIssue, content: `${neighbor.index}|neighbor survives` }),
+      feedRow({ opType: ActionType.CreateIssue, content: "10|the #10 sibling" }),
+      feedRow({ commentId: 0 }),
+      feedRow({ opType: ActionType.CloseIssue, content: `${doomed.index}|not a create row` }),
+      feedRow({ repoId: otherRepoId, opType: ActionType.CreateIssue, content: `${otherIssue.index}|the other repo's own` }),
+    ]);
+    // Reactions ride the same cascade (the landed issue_id sweep): the doomed
+    // issue carries an issue-level and a comment-anchored reaction, the
+    // neighbor a surviving one.
+    await db().insert(reactions).values([
+      { userId: 1, issueId: doomed.id, commentId: 0, type: "+1", createdAt: now },
+      { userId: 1, issueId: doomed.id, commentId: comment.id, type: "heart", createdAt: now },
+      { userId: 1, issueId: neighbor.id, commentId: 0, type: "+1", createdAt: now },
+    ]);
+    expect(await db().select().from(actions).all()).toHaveLength(7);
+    expect(await db().select().from(reactions).all()).toHaveLength(3);
+
+    const res = await router()(`/repos/alice/sweep/issues/${doomed.index}`, { method: "DELETE", headers: authHeaders });
+    expect(res.status).toBe(204);
+
+    const survivors = await db().select().from(actions).all();
+    expect(survivors).toHaveLength(5);
+    expect(survivors.map((row) => `${row.opType}:${row.content}:${row.commentId}`).sort()).toEqual([
+      "10::0", // the comment-anchored row of nobody's comment
+      `12:${doomed.index}|not a create row:0`, // CloseIssue with the same index| prefix — the content arm never touches it
+      "6:10|the #10 sibling:0", // #10's create row — `1|` does NOT digit-prefix-match `10|`
+      `6:${otherIssue.index}|the other repo's own:0`, // the other repo's `1|` row — the repo_id conjunct
+      `6:${neighbor.index}|neighbor survives:0`,
+    ]);
+    // The doomed issue's reactions (issue-level + comment-anchored) died
+    // with it; the neighbor's survives.
+    const leftoverReactions = await db().select().from(reactions).all();
+    expect(leftoverReactions).toHaveLength(1);
+    expect(leftoverReactions[0]!.issueId).toBe(neighbor.id);
   });
 });
