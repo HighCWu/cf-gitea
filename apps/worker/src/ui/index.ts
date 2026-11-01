@@ -882,6 +882,26 @@ import {
   issueUnlockSubmit,
   issueWatchSubmit,
 } from "./pages/issue-sidebar-writes";
+// The issue/pull TIMELINE write cluster (web.go:1369-1414 — census gap #1
+// part two's sixteen self-contained handlers).
+import {
+  batchDeleteIssuesSubmit,
+  commentDeleteSubmit,
+  commentReactionSubmit,
+  commentUpdateSubmit,
+  dependencyAddSubmit,
+  dependencyRemoveSubmit,
+  issueDeleteSubmit,
+  issueReactionSubmit,
+  issueRefSubmit,
+  projectColumnMoveSubmit,
+  stopwatchCancelSubmit,
+  stopwatchStartSubmit,
+  stopwatchStopSubmit,
+  timeAddSubmit,
+  timeDeleteSubmit,
+  timeEstimateSubmit,
+} from "./pages/issue-timeline-writes";
 import { loadOrgHomeData, renderOrgHomePage, resolveOrgHome } from "./pages/org-home";
 // The census R06 org dashboard (web.go:982-985's /org/{org}/dashboard
 // family) — the member-only page over the landed org-feed reads.
@@ -2167,6 +2187,44 @@ export interface IssueCommentRoute {
  *  families): the repo-scope combo POSTs (milestone/projects/assignee/
  *  move_pin), the {index} writes (deadline/watch/lock/unlock/pin), and the
  *  DELETE unpin tail. */
+
+/** The issue/pull TIMELINE write families (pages/issue-timeline-writes.ts —
+ *  upstream web.go:1369-1414 + 1400/1403): ref, dependencies, times +
+ *  stopwatch + estimate, the reaction pair, delete/batch-delete, the
+ *  project-column move, and the comment update/delete/reaction trio (the
+ *  trio carries the comment ROW id, repo-scoped). */
+export interface IssueTimelineWriteRoute {
+  family:
+    | "issue-ref"
+    | "dependency-add"
+    | "dependency-remove"
+    | "time-add"
+    | "time-delete"
+    | "stopwatch-start"
+    | "stopwatch-stop"
+    | "stopwatch-cancel"
+    | "time-estimate"
+    | "issue-reaction"
+    | "issue-delete"
+    | "batch-delete"
+    | "project-column-move"
+    | "comment-update"
+    | "comment-delete"
+    | "comment-reaction";
+  owner: string;
+  repo: string;
+  /** The {type} families; ABSENT on the repo-scoped comment trio. */
+  urlKind?: "issues" | "pulls";
+  /** The {index} families only. */
+  index?: number;
+  /** The per-time delete family. */
+  timeId?: number;
+  /** The reaction families' react|unreact literal. */
+  action?: string;
+  /** The comment trio's ROW id. */
+  commentId?: number;
+}
+
 export interface IssueSidebarWriteRoute {
   family:
     | "issue-milestone"
@@ -3748,6 +3806,7 @@ export type ParsedUiRoute =
   | SettingsRoute
   | IssueCommentRoute
   | IssueSidebarWriteRoute
+  | IssueTimelineWriteRoute
   | IssueLabelsRoute
   | PullFilesRoute
   | PullCommitsRoute
@@ -5048,6 +5107,17 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   if (head === "comments" && rest.length === 2 && rest[1] === "attachments") {
     return { family: "comment-attachments", owner, repo, segment: rest[0] };
   }
+  // The comment write trio (web.go:1411-1414 — the ROW id, repo-scoped:
+  // update, delete, reactions/{react|unreact}).
+  if (head === "comments" && rest.length === 1 && /^\d+$/.test(rest[0] as string)) {
+    return { family: "comment-update", owner, repo, commentId: Number.parseInt(rest[0] as string, 10) };
+  }
+  if (head === "comments" && rest.length === 2 && /^\d+$/.test(rest[0] as string) && rest[1] === "delete") {
+    return { family: "comment-delete", owner, repo, commentId: Number.parseInt(rest[0] as string, 10) };
+  }
+  if (head === "comments" && rest.length === 3 && /^\d+$/.test(rest[0] as string) && rest[1] === "reactions" && (rest[2] === "react" || rest[2] === "unreact")) {
+    return { family: "comment-reaction", owner, repo, commentId: Number.parseInt(rest[0] as string, 10), action: rest[2] };
+  }
   // Window-2e B2: the activity-author JSON feed (web.go:1683-1687 — the
   // optional period tail; unknown/bare segments hit the WEEKLY default).
   if (head === "activity_author_data") {
@@ -5236,6 +5306,8 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (rest[0] === "projects") return { family: "issue-projects", owner, repo, urlKind: head };
       if (rest[0] === "assignee") return { family: "issue-assignee", owner, repo, urlKind: head };
       if (rest[0] === "move_pin") return { family: "issue-move-pin", owner, repo, urlKind: head };
+      // The batch-delete literal (web.go:1409 — the ids ride the form).
+      if (rest[0] === "delete") return { family: "batch-delete", owner, repo, urlKind: head };
       // Wave-11: the review-request + dismiss POSTs (web.go:1435-1436 —
       // repo-scoped, the issue/review ids ride the form fields).
       if (head === "issues" && rest[0] === "request_review") return { family: "issue-request-review", owner, repo };
@@ -5256,6 +5328,11 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     // — web.go:1376 — and /files on the pulls group only — web.go:1670).
     // The attachment-remove write (web.go:1395 — REPO-LEVEL, both families,
     // the uuid rides the form's `file` field; POST-only).
+    // The project-column move (web.go:1399's /projects/column — a
+    // NON-numeric length-2 shape, claimed before the numeric block).
+    if (rest.length === 2 && rest[0] === "projects" && rest[1] === "column") {
+      return { family: "project-column-move", owner, repo, urlKind: head };
+    }
     if (rest.length === 2 && rest[0] === "attachments" && rest[1] === "remove") {
       return { family: "issue-attachments-remove", owner, repo };
     }
@@ -5269,6 +5346,11 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (rest[1] === "lock") return { family: "issue-lock", owner, repo, urlKind: head, index };
       if (rest[1] === "unlock") return { family: "issue-unlock", owner, repo, urlKind: head, index };
       if (rest[1] === "pin") return { family: "issue-pin", owner, repo, urlKind: head, index };
+      // The timeline {index} writes (web.go:1371-1381 + 1383-1389 + 1408:
+      // ref, time_estimate, the single delete).
+      if (rest[1] === "ref") return { family: "issue-ref", owner, repo, urlKind: head, index };
+      if (rest[1] === "time_estimate") return { family: "time-estimate", owner, repo, urlKind: head, index };
+      if (rest[1] === "delete") return { family: "issue-delete", owner, repo, urlKind: head, index };
       if (head === "pulls" && rest[1] === "files") return { family: "pull-files", owner, repo, index };
       if (head === "pulls" && rest[1] === "commits") return { family: "pull-commits", owner, repo, index };
       // Window-2e B2: the info/attachments fragments (web.go:1321-1334,
@@ -5310,6 +5392,22 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (rest[1] === "unpin" && /^-?\d+$/.test(rest[2] as string)) {
         return { family: "issue-unpin", owner, repo, urlKind: head, index: Number.parseInt(rest[2] as string, 10) };
       }
+      // The timeline length-3 writes (web.go:1379-1383 + :1392-1393):
+      // dependency/{add,delete}, times/add, the reactions pair (the action
+      // literal react|unreact rides the THIRD segment).
+      if (rest[1] === "dependency" && (rest[2] === "add" || rest[2] === "delete")) {
+        return { family: rest[2] === "add" ? "dependency-add" : "dependency-remove", owner, repo, urlKind: head, index };
+      }
+      if (rest[1] === "times" && rest[2] === "add") {
+        return { family: "time-add", owner, repo, urlKind: head, index };
+      }
+      if (rest[1] === "reactions" && (rest[2] === "react" || rest[2] === "unreact")) {
+        return { family: "issue-reaction", owner, repo, urlKind: head, index, action: rest[2] };
+      }
+      // The per-time delete (web.go:1376 — {timeid} on the THIRD segment).
+      if (rest[1] === "times" && /^\d+$/.test(rest[2] as string)) {
+        return { family: "time-delete", owner, repo, urlKind: head, index, timeId: Number.parseInt(rest[2] as string, 10) };
+      }
       // The byte-serving alias: upstream mounts the uuid arm at
       // /{index}/attachments/{uuid} (web.go:1337) driving the same seam as
       // the site-level /attachments/{uuid} — a 302 onto it (the module's
@@ -5327,6 +5425,18 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (head === "pulls" && rest[1] === "commits" && parsePullFilesSingleCommit(rest[2] as string) !== null) {
         return { family: "pull-commit-files", owner, repo, index, segment: rest[2] };
       }
+    }
+    // The stopwatch trio (web.go:1382 — {index}/times/stopwatch/{action}).
+    if (
+      rest.length === 4 &&
+      /^-?\d+$/.test(rest[0] as string) &&
+      rest[1] === "times" &&
+      rest[2] === "stopwatch" &&
+      (rest[3] === "start" || rest[3] === "stop" || rest[3] === "cancel")
+    ) {
+      const index = Number.parseInt(rest[0] as string, 10);
+      const family = rest[3] === "start" ? "stopwatch-start" : rest[3] === "stop" ? "stopwatch-stop" : "stopwatch-cancel";
+      return { family, owner, repo, urlKind: head, index };
     }
     // Wave-11 + the conversation fold: the /pulls/{index}/files/reviews
     // group's three tails (web.go:1673-1675 — the /submit verdict POST, the
@@ -17258,6 +17368,68 @@ uiRouter.delete("/:owner/:repo/issues/unpin/:index", (c) => issueUnpinSubmit(c))
 uiRouter.get("/:owner/:repo/issues/unpin/:index", () => methodNotAllowed("DELETE"));
 uiRouter.delete("/:owner/:repo/pulls/unpin/:index", (c) => issueUnpinSubmit(c));
 uiRouter.get("/:owner/:repo/pulls/unpin/:index", () => methodNotAllowed("DELETE"));
+// The issue/pull TIMELINE write arms (web.go:1369-1414 — pages/
+// issue-timeline-writes.ts; the statics ride BEFORE the dynamic :index
+// GET catches, the wave-9 rule; viewed-files is NOT registered — the
+// review_state STOP).
+uiRouter.post("/:owner/:repo/issues/delete", (c) => batchDeleteIssuesSubmit(c));
+uiRouter.get("/:owner/:repo/issues/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/delete", (c) => batchDeleteIssuesSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/projects/column", (c) => projectColumnMoveSubmit(c));
+uiRouter.get("/:owner/:repo/issues/projects/column", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/projects/column", (c) => projectColumnMoveSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/projects/column", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/:index/ref", (c) => issueRefSubmit(c));
+uiRouter.get("/:owner/:repo/issues/:index/ref", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index/ref", (c) => issueRefSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/:index/ref", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/:index/dependency/add", (c) => dependencyAddSubmit(c));
+uiRouter.get("/:owner/:repo/issues/:index/dependency/add", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index/dependency/add", (c) => dependencyAddSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/:index/dependency/add", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/:index/dependency/delete", (c) => dependencyRemoveSubmit(c));
+uiRouter.get("/:owner/:repo/issues/:index/dependency/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index/dependency/delete", (c) => dependencyRemoveSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/:index/dependency/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/:index/times/add", (c) => timeAddSubmit(c));
+uiRouter.get("/:owner/:repo/issues/:index/times/add", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index/times/add", (c) => timeAddSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/:index/times/add", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/:index/times/:timeid/delete", (c) => timeDeleteSubmit(c));
+uiRouter.get("/:owner/:repo/issues/:index/times/:timeid/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index/times/:timeid/delete", (c) => timeDeleteSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/:index/times/:timeid/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/:index/times/stopwatch/start", (c) => stopwatchStartSubmit(c));
+uiRouter.get("/:owner/:repo/issues/:index/times/stopwatch/start", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index/times/stopwatch/start", (c) => stopwatchStartSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/:index/times/stopwatch/start", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/:index/times/stopwatch/stop", (c) => stopwatchStopSubmit(c));
+uiRouter.get("/:owner/:repo/issues/:index/times/stopwatch/stop", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index/times/stopwatch/stop", (c) => stopwatchStopSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/:index/times/stopwatch/stop", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/:index/times/stopwatch/cancel", (c) => stopwatchCancelSubmit(c));
+uiRouter.get("/:owner/:repo/issues/:index/times/stopwatch/cancel", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index/times/stopwatch/cancel", (c) => stopwatchCancelSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/:index/times/stopwatch/cancel", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/:index/time_estimate", (c) => timeEstimateSubmit(c));
+uiRouter.get("/:owner/:repo/issues/:index/time_estimate", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index/time_estimate", (c) => timeEstimateSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/:index/time_estimate", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/:index/reactions/:action", (c) => issueReactionSubmit(c));
+uiRouter.get("/:owner/:repo/issues/:index/reactions/:action", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index/reactions/:action", (c) => issueReactionSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/:index/reactions/:action", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/issues/:index/delete", (c) => issueDeleteSubmit(c));
+uiRouter.get("/:owner/:repo/issues/:index/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/pulls/:index/delete", (c) => issueDeleteSubmit(c));
+uiRouter.get("/:owner/:repo/pulls/:index/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/comments/:id", (c) => commentUpdateSubmit(c));
+uiRouter.get("/:owner/:repo/comments/:id", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/comments/:id/delete", (c) => commentDeleteSubmit(c));
+uiRouter.get("/:owner/:repo/comments/:id/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/comments/:id/reactions/:action", (c) => commentReactionSubmit(c));
+uiRouter.get("/:owner/:repo/comments/:id/reactions/:action", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/pulls/:index/comments", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/pulls/:index/files", (c) => uiPage(c));
 // The PR commits tab (parseUiRoute claims exactly this shape — GET only,

@@ -693,15 +693,17 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     const thead = queueTable.children.find((el) => el.tag === "thead");
     expect(thead, "the queues table has a thead").toBeDefined();
     const ths = descendants(thead ?? root).filter((el) => el.tag === "th");
-    expect(ths.map((el) => accessibleName(el))).toEqual(["Name", "Type", "Number in Queue"]);
+    // The d0fc34f landing added queue.tmpl:28's Review/Add-Workers link
+    // COLUMN (the unlabeled action header rides last).
+    expect(ths.map((el) => accessibleName(el))).toEqual(["Name", "Type", "Number in Queue", ""]);
     expect(ths.every((el) => el.attrs.scope === "col"), "every th carries scope=col").toBe(true);
     const queueRows = descendants(queueTable).filter((el) => el.tag === "tr" && el.children.some((c) => c.tag === "td"));
     expect(
       queueRows.map((row) => row.children.map((cell) => accessibleName(cell))),
     ).toEqual([
-      ["webhook-delivery", "cloudflare-queue", "1"],
-      ["repo-tasks", "cloudflare-queue", "0"],
-      ["webhook-delivery-dlq", "cloudflare-queue", "-"],
+      ["webhook-delivery", "cloudflare-queue", "1", "Review / Add Workers"],
+      ["repo-tasks", "cloudflare-queue", "0", "Review / Add Workers"],
+      ["webhook-delivery-dlq", "cloudflare-queue", "-", "Review / Add Workers"],
     ]);
 
     // The cf-gitea delivery-states segment: the definition shape the refined
