@@ -35,6 +35,7 @@ import { oauth2Router } from "./web/oauth2-token";
 import { wellKnownRouter } from "./api/routes/federation";
 import { oauth2WellKnownRouter } from "./web/oauth2-wellknown";
 import { webWellKnownRouter } from "./web/well-known";
+import { webMiscRouter } from "./web/misc";
 import { securityHeaders, withSecurityHeaders } from "./web/security-headers";
 import { webhookDlqHandler } from "./webhooks/dlq";
 import { webhookQueueHandler } from "./webhooks/consumer";
@@ -299,6 +300,10 @@ app.route("/", oauth2WellKnownRouter);
 // above keeps winning by Hono's static-beats-wildcard specificity — the
 // module's mount-parity test proves it).
 app.route("/", webWellKnownRouter);
+// The misc trio + markup (census rec #3 — /-/web-theme|web-banner|markup;
+// NO /-/* wildcard mounted: it would shadow the landed /-/admin family,
+// unregistered tails keep the global not-found surface).
+app.route("/", webMiscRouter);
 
 // The OAuth2 provider's stateless JSON arms (SPEC specs/oauth2-provider.md
 // §2.3/§2.6, W2's route-home decision in web/oauth2-token.ts's header):
@@ -453,7 +458,13 @@ export default {
       !isAttachmentServing &&
       !isWellKnown &&
       !isLoginPath &&
-      !isUserAuthPath;
+      !isUserAuthPath &&
+      // The /-/ dash-prefix family carve (web.go:544-547's misc trio at
+      // /-/web-theme|web-banner|markup — the isWellKnown twin): without it
+      // /-/* falls to the repo-scoped branch and the engine 404s (owner
+      // "-", repo "markup", no D1 row). The landed /-/admin family rides
+      // uiRouter's parse instead (its claims fire before this gate).
+      segments[0] !== "-";
     if (isRepoScoped) {
       // All methods for the UI's write families (new/edit/delete file,
       // new-issue, comments, settings, milestones — waves 4-8 are POSTs on
