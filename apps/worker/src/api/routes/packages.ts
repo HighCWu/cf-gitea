@@ -454,11 +454,12 @@ async function canDoerManagePackage(
  * Upstream wraps both refusals as `util.ErrUnprocessableContent` errors —
  * the errorForUser status 422 — with the wrapped Go texts as the message
  * (the strings its `APIErrorAuto` error family renders); the messages below
- * are those exact texts. The 422 is NOT a declared response: upstream's own
- * swagger documents only {204,404} for the deletes while its runtime can
- * answer the undeclared error status — the declared set stays the vendored
- * contract's (check:api discipline), the runtime arm rides the ApiError
- * family like every landed undeclared 422 (hooks.ts, labels.ts, …).
+ * are those exact texts. The 422 IS declared on both delete routes (the
+ * runtime-faithful superset — terraformDeleteRefusal above): upstream's own
+ * swagger documents only {204,404} while its runtime answers the 422, so
+ * the extra code rides check-openapi.mjs's RUNTIME_ONLY_RESPONSES as the
+ * documented exception (the /user/avatar posture, SPEC-0004 §2.5) — the
+ * generated spec now documents the arm the runtime actually sends.
  */
 async function assertPackageDeleteAllowed(d1: D1Database, pkg: PackageRow): Promise<void> {
   if (pkg.type !== TERRAFORM_PACKAGE_TYPE) return;
@@ -538,6 +539,17 @@ const notFoundResponse = {
 } as const;
 const forbiddenResponse = {
   description: "forbidden",
+  content: { "application/json": { schema: apiErrorSchema } },
+} as const;
+// The terraform delete guards' refusal shape (assertPackageDeleteAllowed /
+// assertPackageVersionDeleteAllowed below): upstream wraps both refusals as
+// util.ErrUnprocessableContent → the errorForUser 422
+// (services/packages/terraform/spec.go:50-80 via modules/util/error.go:25-31)
+// while its vendored swagger documents only {204,404} — the declared 422 is
+// the runtime-faithful superset, carried as a documented runtime-only
+// exception in scripts/check-openapi.mjs (the /user/avatar posture).
+const terraformDeleteRefusal = {
+  description: "unprocessableContent",
   content: { "application/json": { schema: apiErrorSchema } },
 } as const;
 const packageListResponse = {
@@ -640,7 +652,10 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
       summary: "Delete a package",
       operationId: "deletePackage",
       request: { params: typeParam },
-      responses: { 204: { description: "empty" }, 404: notFoundResponse },
+      // The 422 carries the terraform locked-state refusal (spec.go:50-62
+      // wraps util.ErrUnprocessableContent) — the runtime-faithful superset,
+      // exception-documented in check-openapi.mjs's RUNTIME_ONLY_RESPONSES.
+      responses: { 204: { description: "empty" }, 404: notFoundResponse, 422: terraformDeleteRefusal },
     }),
     async (c) => {
       const { owner } = await requirePackageContext(c, "write", { requireToken: true, groupScopeGate: true });
@@ -688,7 +703,9 @@ export function registerPackagesRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: Mi
       summary: "Delete a package version",
       operationId: "deletePackageVersion",
       request: { params: versionParam },
-      responses: { 204: { description: "empty" }, 404: notFoundResponse },
+      // The 422 carries the terraform guards (spec.go:64-80 — locked first,
+      // then the latest-version refusal), as above.
+      responses: { 204: { description: "empty" }, 404: notFoundResponse, 422: terraformDeleteRefusal },
     }),
     async (c) => {
       const { owner } = await requirePackageContext(c, "write", { requireToken: true, groupScopeGate: true });

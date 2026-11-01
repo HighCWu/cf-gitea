@@ -221,7 +221,8 @@ export interface FinalizeReceiveInput {
   /** The client's `atomic` capability (gitprotocol-pack; observed on git
    * 2.43.0 `git push --atomic`): if ANY ref update fails, NONE apply — the
    * failed command keeps its own ng message, the commands that would have
-   * applied report "atomic push failed". Absent/undefined = per-ref
+   * applied report ATOMIC_PUSH_FAILED ("atomic transaction failed" —
+   * protocol.ts; git 2.43 receive-pack.c:1896's ng text). Absent/undefined = per-ref
    * semantics (receive-pack's non-atomic default: rejected commands never
    * block their siblings). The all-or-nothing verdict is decided inside the
    * ONE commit transaction (commitPush's verdict pass), so a failed atomic

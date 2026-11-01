@@ -418,10 +418,21 @@ function decide(
  * code+wiki units of the key's OWN repository at the key's `mode`. The
  * matrix arms, in the landed order:
  *
- * - owner unavailable (githttp.go:117-119, every caller) → 403;
+ * - owner unavailable (githttp.go:104-107, every caller) → 403;
  * - an engine-shape admin surface, or a repo other than the key's → 404
  *   "Repository not found" — the zero-perm 404 (:197-200: the key "belongs
- *   to another repository, so it grants nothing here"), existence masked;
+ *   to another repository, so it grants nothing here"), existence masked.
+ *   The admin mask stays AHEAD of the archived refusal deliberately:
+ *   upstream's repo DELETE carries no archived arm (api/v1/repo/repo.go
+ *   Delete gates on permission alone — archived repos stay deletable) and
+ *   the admin shape never reaches httpBase;
+ * - THE PRE-GRANT ARCHIVED REFUSAL (row 10, githttp.go:124-128): httpBase
+ *   answers `repoExist && repo.IsArchived && !isPull` → plain 403 BEFORE
+ *   any permission consult — GetDoerRepoPermission (the key's ONLY
+ *   permission source, repo_permission.go:387-409) evaluates at :185-193 —
+ *   so a foreign or read-mode key pushing into an archived repo takes this
+ *   403, never the zero-perm 404. Writes only: clones keep working (the
+ *   `!isPull` gate);
  * - READ: publicly visible (upstream's canAnonymousPull arm admits ANY
  *   signed-in doer's pull on a public repo with a public owner,
  *   :132-135 — the key user included) OR the key's own repo (mode 1 and 2
@@ -430,9 +441,8 @@ function decide(
  *   key permission model has no such arm — a limited owner's public repo
  *   stays beyond a foreign key.
  * - WRITE: the key's own repo at mode >= 2 — mode 1 → 404 (row 8's
- *   write-capability masking, :197-199) — then the archived refusal (row
- *   10). The gate's mirror-readonly 403 still runs after the matrix
- *   (SPEC-0009 row 21).
+ *   write-capability masking, :197-199). The gate's mirror-readonly 403
+ *   still runs after the matrix (SPEC-0009 row 21).
  *
  * No scope arm (deploy keys carry no token scope — upstream GetAccessScope
  * returns "" for the key user, so CheckRepoScopedToken skips) and no
@@ -449,6 +459,15 @@ function decideDeployKey(
   if (owner !== null && owner.status === "prohibited") return ownerUnavailable();
   if (engineAdmin || owner === null) return repositoryNotFound();
 
+  // The PRE-GRANT archived refusal (row 10, githttp.go:124-128): httpBase
+  // answers `repoExist && repo.IsArchived && !isPull` → plain 403 BEFORE
+  // any permission is consulted — GetDoerRepoPermission (the key's ONLY
+  // permission source, repo_permission.go:387-409) evaluates at :185-193 —
+  // so a foreign or read-mode key pushing into an archived repo takes this
+  // 403, never the zero-perm 404 of the write mask below. Writes only:
+  // clones keep working (the `!isPull` gate).
+  if (op === "write" && repo.isArchived) return repositoryArchived();
+
   if (op === "read") {
     // Any signed-in doer's pull on a public repo with a public owner is
     // served (:132-135) — a foreign key included; the key's own repo at
@@ -461,9 +480,8 @@ function decideDeployKey(
   }
 
   // Write: the key's own repo at write mode — a foreign repo or a read-only
-  // key takes the row-8 404 (write capability hidden), an own-repo write
-  // takes the row-10 archived refusal first.
+  // key takes the row-8 404 (write capability hidden); the archived refusal
+  // ran PRE-grant above (upstream :124-128, ahead of the key permission).
   if (key.repoId !== repo.id || key.mode < 2) return repositoryNotFound();
-  if (repo.isArchived) return repositoryArchived();
   return true;
 }

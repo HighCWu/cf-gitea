@@ -1716,6 +1716,31 @@ describe("deploy tokens authenticate git-HTTP (upstream's DeployToken method, we
     expect(open.status).toBe(200);
   });
 
+  it("a push into an ARCHIVED repo takes the PRE-grant archived 403 — a read-mode key's receive too, not the zero-perm 404 (githttp.go:124-128 orders it before the key permission)", async () => {
+    const { token, repoId } = await seedRepoWithToken("dtfrozen", true);
+    await drizzle(env.DB).update(repositories).set({ isArchived: true }).where(eq(repositories.id, repoId));
+
+    // Upstream httpBase answers the archived push 403 BEFORE
+    // GetDoerRepoPermission (the key's ONLY permission source, :185-193) —
+    // so even the read-mode key (which the write mask would 404) gets the
+    // archived body here. The masking order is the S6 residual's fix.
+    const probe = await SELF.fetch(
+      "https://example.com/alice/dtfrozen.git/info/refs?service=git-receive-pack",
+      { headers: { authorization: basicHeader("git", token) } },
+    );
+    expect(probe.status).toBe(403);
+    expect(await probe.text()).toBe(
+      "This repo is archived. You can view files and clone it, but cannot push or open issues/pull-requests.",
+    );
+
+    // The `!isPull` gate: the same key's clone advert still serves.
+    const clone = await SELF.fetch(
+      "https://example.com/alice/dtfrozen.git/info/refs?service=git-upload-pack",
+      { headers: { authorization: basicHeader("git", token) } },
+    );
+    expect(clone.status).toBe(200);
+  });
+
   it("an unknown gdt_ value falls through every method into the 401 challenge", async () => {
     await seedRepoWithToken("dtmissing", true);
     const miss = await SELF.fetch(

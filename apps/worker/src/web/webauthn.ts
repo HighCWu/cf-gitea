@@ -35,7 +35,10 @@
  *    outcome (upstream's defer Session.Delete) while the pending carrier
  *    SURVIVES failures — the prompt page's JS re-requests a fresh challenge
  *    exactly like upstream. Success: mintSession (the handleSignInFull
- *    twin — last-login rides the mint) + {"redirect"}.
+ *    twin — last-login rides the mint) + {"redirect"}, and ALL pre-auth
+ *    carriers clear (both webauthn cookies AND the dual-park `gitea_twofa`
+ *    gate ticket — upstream's completed sign-in regenerates the session
+ *    whole, auth.go:390-397, so the parked twofaUid dies with it).
  *  - GET/POST /user/webauthn/passkey/* (WebAuthnPasskeyAssertion/Login):
  *    upstream gates on setting.Service.EnablePasskeyAuth (default TRUE,
  *    service.go:181 — carried: no setting exists, the default stands).
@@ -68,6 +71,7 @@ import { Hono, type Context } from "hono";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
+import { clearTwofaSetCookie } from "../auth/two-factor";
 import { twoFactor, users } from "../db/schema";
 import { readUrlEncodedForm } from "../ui/forms";
 import { locale } from "../ui/locale";
@@ -385,11 +389,22 @@ async function assertionPost(c: RouteContext): Promise<Response> {
     }
     // Success: mint (the handleSignInFull twin — remember rides the pending
     // carrier, upstream's twofaRemember) and answer the redirect
-    // (consumeAuthRedirectLink's validated target, "/" fallback).
+    // (consumeAuthRedirectLink's validated target, "/" fallback). The mint
+    // is the completed sign-in, so the session was regenerated WHOLE
+    // upstream (auth.go:390-397's ClearSessionKeysForSignIn + regenerate —
+    // the parked twofaUid dies with it): the dual-park's `gitea_twofa`
+    // gate ticket (session.ts's step 4.5a) clears here too — the completed
+    // sign-in leaves no pre-auth carrier standing (SPEC-0022 §6's contract).
     const remember = pending.rem ?? false;
     const cookieValue = await mintSession(c.env.DB, pending.uid, { remember });
     const target = safeRedirectTarget(pending.to ?? "/");
-    return jsonOk({ redirect: target }, webAuthnClearCookie("assert"), webAuthnClearCookie("pending"), sessionSetCookie(cookieValue, remember));
+    return jsonOk(
+      { redirect: target },
+      webAuthnClearCookie("assert"),
+      webAuthnClearCookie("pending"),
+      clearTwofaSetCookie(),
+      sessionSetCookie(cookieValue, remember),
+    );
   } catch (error) {
     if (error instanceof WebAuthnError) {
       return error.arm === "bad-request" ? jsonError(400, error.message, clearChallenge) : jsonError(403, error.message, clearChallenge);

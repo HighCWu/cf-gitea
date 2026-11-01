@@ -287,10 +287,13 @@ the deliberate differences:
 
 ## 6. Landed-state notes
 
-- The WebAuthn-side half of the dual-clear contract (the mint arm in
-  `web/webauthn.ts` clearing `gitea_twofa` alongside its own carriers) is
-  the WebAuthn unit's follow-up — session.ts's TOTP arms already clear all
-  pre-auth carriers, and logout clears all four.
+- The dual-clear contract is AS-BUILT on both sides: session.ts's TOTP
+  arms clear all pre-auth carriers, logout clears all four, and the
+  webauthn mint arm (`web/webauthn.ts`) clears `gitea_twofa` alongside its
+  own cookie pair on the successful assertion — upstream's completed
+  sign-in regenerates the session whole (auth.go:390-397's
+  ClearSessionKeysForSignIn + regenerate), so the parked twofaUid dies
+  with it; the Max-Age=0 directive is the cookie-carrier equivalent.
 - `X-Gitea-OTP` (SPEC-0002 §2.2/§4.6) stays accepted-and-ignored: the API
   chain authenticates PATs, which are already single-proof credentials;
   upstream's OTP check guards Basic-with-password, which does not exist

@@ -1657,6 +1657,15 @@ describe("the 2FA gate — the login ladder (2fa.go over web.go:600-604)", () =>
     expect(cookies.has(TWOFA_COOKIE_NAME)).toBe(true); // the TOTP gate ticket — the fallback's authority
     expect(cookies.has(SESSION_COOKIE_NAME)).toBe(false);
     expect((await drizzle(env.DB).select().from(sessions).all()).length).toBe(0);
+    // The park arm resets the limiter too — the password proof SUCCEEDED
+    // here exactly as in the TOTP-only gate (upstream has no login-failure
+    // limiter to inherit a park-vs-complete split from, so the house rule
+    // "verified password ⇒ reset" covers every park alike).
+    const ip = "10.6.6.6";
+    for (let i = 0; i < 3; i++) await request("/login", form({ password: "nope" }, { "x-forwarded-for": ip }));
+    expect(await failureCount(ip)).toBe(3);
+    await request("/login", form({ password: pat }, { "x-forwarded-for": ip }));
+    expect(await failureCount(ip)).toBe(0);
 
     // THE DEAD-500 FIX: from the webauthn prompt, the TOTP fallback link
     // (web/webauthn-page.tsx arms /user/two_factor) now renders — the gate

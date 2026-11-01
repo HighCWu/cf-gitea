@@ -254,13 +254,15 @@ const RUNTIME_ONLY_RESPONSES = {
       // wrapped as util.ErrUnprocessableContent — the util error family's
       // errorForUser status 422 (modules/util/error.go:25-31) with
       // "terraform state is locked and cannot be deleted" as the message —
-      // while the vendored swagger documents only {204,404}. The runtime
-      // arm rides the ApiError family UNDECLARED (routes/packages.ts
-      // assertPackageDeleteAllowed; pinned 422-for-422 by packages.test.ts),
-      // so the declared set stays the contract's; this entry documents the
-      // wild arm and holds the exception on file for any declaration
-      // widening (the packages.test.ts pins are the arm's guard).
-      422: "terraform locked-delete refusal (spec.go:50-62 wraps util.ErrUnprocessableContent → the errorForUser 422); contract documents {204,404}",
+      // while the vendored swagger documents only {204,404}. The route now
+      // DECLARES the 422 (routes/packages.ts terraformDeleteRefusal; pinned
+      // 422-for-422 by packages.test.ts), so this entry is the REQUIRED
+      // documented exception for the widened declaration — removing it
+      // hard-fails the declared ⊆ contract rule (verified: exit 1,
+      // "declares response 422; contract has {204, 404} and no documented
+      // exception covers it"). Same posture as /user/avatar's declared
+      // extras.
+      422: "terraform locked-delete refusal (spec.go:50-62 wraps util.ErrUnprocessableContent → the errorForUser 422); contract documents {204,404} — the route declares the runtime-faithful 422, this entry is its exception",
     },
   },
   "/packages/{owner}/{type}/{name}/{version}": {
@@ -268,9 +270,10 @@ const RUNTIME_ONLY_RESPONSES = {
       // Same guard family for the version delete (spec.go:64-80): the locked
       // refusal FIRST (:66-74), then the latest-version refusal — "the
       // latest version of a Terraform state cannot be deleted" — both the
-      // errorForUser 422 against a contract set of {204,404} (the same
-      // undeclared-runtime-arm posture as the package delete above).
-      422: "terraform guards on the version delete (spec.go:64-80 — the locked refusal, then the latest-version refusal, both util.ErrUnprocessableContent → 422); contract documents {204,404}",
+      // errorForUser 422 against a contract set of {204,404}. The route
+      // declares the 422 (terraformDeleteRefusal), so this entry is the
+      // required exception, as for the package delete above.
+      422: "terraform guards on the version delete (spec.go:64-80 — the locked refusal, then the latest-version refusal, both util.ErrUnprocessableContent → 422); contract documents {204,404} — the route declares the runtime-faithful 422, this entry is its exception",
     },
   },
 };

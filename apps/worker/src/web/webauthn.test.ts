@@ -14,6 +14,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
+import { TWOFA_COOKIE_NAME } from "../auth/two-factor";
 import { TokenService } from "../auth/token-service";
 import { users, webauthnCredentials } from "../db/schema";
 import { mintSession, SESSION_COOKIE_NAME, sessionRouter } from "../ui/session";
@@ -456,20 +457,30 @@ describe("the login family", () => {
     const state = await verifyCeremonyState(env.DB, decodeURIComponent(raw), "assert");
     expect(state?.ac).toEqual([base64UrlEncode(cred.credentialId)]);
     const body = await assertionBody(cred.credentialId, { challenge: state!.ch });
+    // A STALE `gitea_twofa` gate ticket rides along (the dual-enrollment park
+    // arms BOTH carriers in session.ts's step 4.5a; the user then completes
+    // via the webauthn prompt instead of the TOTP fallback).
     const verifyRes = await req("/user/webauthn/assertion", {
       method: "POST",
-      headers: { "content-type": "application/json", origin: ORIGIN, cookie: `${cookieHeader}; ${assertCookie}` },
+      headers: {
+        "content-type": "application/json",
+        origin: ORIGIN,
+        cookie: `${cookieHeader}; ${assertCookie}; ${TWOFA_COOKIE_NAME}=stale-gate-ticket`,
+      },
       body: JSON.stringify(body),
     });
     expect(verifyRes.status).toBe(200);
     expect((await verifyRes.json<{ redirect: string }>()).redirect).toBe("/dashboard");
-    // The mint + the counter bump + BOTH carriers cleared:
+    // The mint + the counter bump + ALL carriers cleared (the dual-clear
+    // contract — the completed sign-in regenerates the session whole
+    // upstream, so the parked twofaUid dies with it; SPEC-0022 §6):
     const sessions = await env.DB.prepare("SELECT count(*) AS n FROM sessions").all<{ n: number }>();
     expect(sessions.results[0]?.n).toBe(1);
     const counter = await env.DB.prepare("SELECT sign_count FROM webauthn_credentials WHERE id = ?").bind(cred.id).all<{ sign_count: number }>();
     expect(counter.results[0]?.sign_count).toBe(1);
     const cleared = verifyRes.headers.getSetCookie ? verifyRes.headers.getSetCookie() : [verifyRes.headers.get("set-cookie") ?? ""];
     expect(cleared.some((value) => value.startsWith("gitea_webauthn=; Path=/; Max-Age=0"))).toBe(true);
+    expect(cleared.some((value) => value.startsWith(`${TWOFA_COOKIE_NAME}=; Path=/; Max-Age=0`))).toBe(true);
 
     // THE REPLAY: a fresh challenge + the SAME response bytes — the counter
     // did not advance, the durable single-use arm 403s.

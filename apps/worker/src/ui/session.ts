@@ -1147,6 +1147,16 @@ async function loginSubmit(c: RouteContext): Promise<Response> {
       rem: form.remember,
       to: safeRedirectTarget(form.redirectTo),
     });
+    // The limiter reset + the GC sweep ride the PARK too — the same rule the
+    // TOTP-only gate below states: the password proof SUCCEEDED, so this is
+    // not a failure arm. Upstream offers no park-vs-complete distinction to
+    // inherit: it has no login-failure limiter at all (nothing in
+    // routers/web/auth or services/auth tracks failures — its park,
+    // handleTwoFactorRequired auth.go:349-368, only regenerates the session
+    // and redirects), so the house limiter's semantics are ours, and they
+    // reset on every verified-password arm alike.
+    sink(limiterResetFailOpen(limiter, ip));
+    sink(sweepExpiredSessions(c.env.DB, now));
     if (await hasTwoFactorByUid(c.env.DB, verified.user.id)) {
       const ticket = await mintPendingTicket(
         c.env.DB,
