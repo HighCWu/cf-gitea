@@ -29,7 +29,15 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { pullRequests, repositories, users } from "../../db/schema";
+import {
+  issueAssignees,
+  issueUsers,
+  pullRequests,
+  pullReviews,
+  repositories,
+  ReviewType,
+  users,
+} from "../../db/schema";
 import { createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -44,6 +52,7 @@ const TOKEN_NEIGHBOR = "neighbor-token";
 const TOKEN_CAROL = "carol-token";
 const TOKEN_ADMIN = "admin-token";
 const TOKEN_WATCHER = "watcher-token";
+const TOKEN_MUTER = "muter-token";
 
 const T1 = new Date("2026-03-01T00:00:00Z"); // issue creations (by neighbor)
 const T2 = new Date("2026-03-05T00:00:00Z"); // owner's comment on A
@@ -104,7 +113,9 @@ function resolver(): AuthResolver {
               ? "root-admin"
               : token === TOKEN_WATCHER
                 ? "watcher"
-                : null;
+                : token === TOKEN_MUTER
+                  ? "muter"
+                  : null;
       if (login === null) {
         return null;
       }
@@ -150,6 +161,9 @@ beforeEach(async () => {
     "issue_pins",
     "comments",
     "issue_labels",
+    "issue_assignees",
+    "issue_user",
+    "pull_reviews",
     "pull_requests",
     "issues",
     "repo_topics",
@@ -388,6 +402,198 @@ describe("GET /notifications (notifyGetList)", () => {
     expect(closed?.subject.state).toBe("closed");
     expect(merged?.subject.state).toBe("merged");
     expect(merged?.subject.type).toBe("Pull");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Recipient arms + whole-union gates (notification_list.go's toNotify passes)
+// ---------------------------------------------------------------------------
+
+describe("recipient arms and gates", () => {
+  /** Fresh non-watching user (the muter's mailbox is the test subject). */
+  async function insertMuter(): Promise<number> {
+    const rows = await drizzle(env.DB)
+      .insert(users)
+      .values({ username: "muter", usernameLower: "muter", status: "active", createdAt: SEED })
+      .returning({ id: users.id })
+      .all();
+    return rows[0]!.id;
+  }
+
+  it("an ignorer loses EVERY arm — comment participant, mentioned, and poster alike (mute outranks all sources)", async () => {
+    const service = new IssuesService(env.DB);
+    const muterId = await insertMuter();
+
+    // Comment-participant arm: neighbor-authored issue the muter commented on.
+    const commented = await service.createIssue({ repoId: REPO_ID, title: "i commented", posterId: neighborId, now: T1 });
+    await service.addComment({ issueId: commented.id, posterId: muterId, content: "me too", now: T2 });
+
+    // Mention arm: the is_mentioned carrier row, no comment of the muter's own.
+    const mentioned = await service.createIssue({ repoId: REPO_ID, title: "i am mentioned", posterId: neighborId, now: T1 });
+    await drizzle(env.DB).insert(issueUsers).values({ userId: muterId, issueId: mentioned.id, isMentioned: true });
+
+    // Poster arm: the muter authors; the owner's reply is the foreign activity.
+    const authored = await service.createIssue({ repoId: REPO_ID, title: "i authored", posterId: muterId, now: T1 });
+    await service.addComment({ issueId: authored.id, posterId: 1, content: "owner reply", now: T2 });
+
+    // Each arm alone puts its issue in the muter's mailbox (the seed watch
+    // row belongs to the neighbor — the muter has no watch yet).
+    const listed = await send("/notifications", authed(undefined, TOKEN_MUTER));
+    const ids = (await listed.json<Thread[]>()).map((thread) => thread.id);
+    expect(ids).toEqual(expect.arrayContaining([commented.id, mentioned.id, authored.id]));
+
+    // Muting removes all three: upstream deletes the ignorers from the WHOLE
+    // toNotify set after every source joined ("muting the repository
+    // outranks every other source, including mentions",
+    // notification_list.go:135-141) — the same rule the mail fan-out applies
+    // (services/mail/notify.ts, ignorers join `visited` ahead of every
+    // batch); this mailbox conjunct is its twin, so the two layers agree.
+    await watchRepoByMode(env.DB, REPO_ID, muterId, WatchMode.Dont, SEED);
+    const muted = (await (await send("/notifications", authed(undefined, TOKEN_MUTER))).json<Thread[]>()).map(
+      (thread) => thread.id,
+    );
+    expect(muted).toEqual(expect.not.arrayContaining([commented.id, mentioned.id, authored.id]));
+    const forbidden = await send(`/notifications/threads/${commented.id}`, authed({ method: "PATCH" }, TOKEN_MUTER));
+    expect(forbidden.status).toBe(403);
+  });
+
+  it("assignees and requested reviewers are recipients (notification_list.go:112-121 — the assignee arm is real)", async () => {
+    const service = new IssuesService(env.DB);
+    const carolRow = await env.DB.prepare("SELECT id FROM users WHERE username_lower = 'carol'").first<{ id: number }>();
+    const carolId = carolRow!.id;
+
+    // Assignee arm: carol assigned on issue B (neighbor-authored T1 — this
+    // is the only arm she can claim it through).
+    await drizzle(env.DB).insert(issueAssignees).values({ issueId: issueB.id, assigneeId: carolId });
+    const listed = (await (await send("/notifications", authed(undefined, TOKEN_CAROL))).json<Thread[]>()).map(
+      (thread) => thread.id,
+    );
+    expect(listed).toContain(issueB.id);
+
+    // Requested-reviewer arm: a pull_reviews Request row with a USER reviewer
+    // (upstream GetPullRequestRequestedReviewerIDs, models/issues/pull.go:1020-1028).
+    const { pullIssueId } = await seedPullAndSecondRepo();
+    await drizzle(env.DB).insert(pullReviews).values({
+      type: ReviewType.Request,
+      reviewerId: carolId,
+      issueId: pullIssueId,
+    });
+    const withReviewer = (await (await send("/notifications", authed(undefined, TOKEN_CAROL))).json<Thread[]>()).map(
+      (thread) => thread.id,
+    );
+    expect(withReviewer).toContain(pullIssueId);
+
+    // A TEAM-request row (reviewer_id = 0) never qualifies a user —
+    // upstream's `reviewer_id > 0` term.
+    const teamOnly = await service.createPullRequest({
+      repoId: REPO_ID,
+      headRepoId: REPO_ID,
+      baseBranch: "main",
+      headBranch: "team-review",
+      title: "team requested",
+      posterId: neighborId,
+      now: T2,
+    });
+    await drizzle(env.DB).insert(pullReviews).values({
+      type: ReviewType.Request,
+      reviewerId: 0,
+      reviewerTeamId: 7,
+      issueId: teamOnly.issue.id,
+    });
+    const afterTeamRow = (await (await send("/notifications", authed(undefined, TOKEN_CAROL))).json<Thread[]>()).map(
+      (thread) => thread.id,
+    );
+    expect(afterTeamRow).not.toContain(teamOnly.issue.id);
+  });
+
+  it("drops only the repo-watch arm while a PR title carries a WIP prefix (notification_list.go:100)", async () => {
+    const service = new IssuesService(env.DB);
+    const neighborList = async (): Promise<number[]> =>
+      (await (await send("/notifications", authed(undefined, TOKEN_NEIGHBOR))).json<Thread[]>()).map(
+        (thread) => thread.id,
+      );
+
+    // Owner-authored WIP PR: the neighbor's ONLY claim is the seed repo-watch
+    // row, and the WIP gate drops exactly that arm — no thread for them.
+    const wip = await service.createPullRequest({
+      repoId: REPO_ID,
+      headRepoId: REPO_ID,
+      baseBranch: "main",
+      headBranch: "wip-topic",
+      title: "WIP: half-done",
+      posterId: 1,
+      now: T2,
+    });
+    expect(await neighborList()).not.toContain(wip.issue.id);
+
+    // Arm-scoped: the same WIP PR still reaches a user through another arm
+    // (the neighbor commenting makes them a participant — upstream guards
+    // only the GetRepoWatchersIDs add).
+    await service.addComment({ issueId: wip.issue.id, posterId: neighborId, content: "watcher comment", now: T3 });
+    expect(await neighborList()).toContain(wip.issue.id);
+
+    // The second prefix of the shared set and the rename timing: a "Draft:"
+    // PR drops too, and renaming off WIP re-qualifies the watcher for the
+    // (past) activity — the gate reads the CURRENT title (derived-model
+    // timing caveat, deviation 1/4).
+    const draft = await service.createPullRequest({
+      repoId: REPO_ID,
+      headRepoId: REPO_ID,
+      baseBranch: "main",
+      headBranch: "draft-topic",
+      title: "Draft: notes",
+      posterId: 1,
+      now: T2,
+    });
+    expect(await neighborList()).not.toContain(draft.issue.id);
+    await service.changeTitle(draft.issue, "ready for review", 1, T3);
+    expect(await neighborList()).toContain(draft.issue.id);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// latest_comment_url — the GetLastComment serializer rule (newest wins)
+// ---------------------------------------------------------------------------
+
+describe("latest_comment_url (GetLastComment, services/convert/notification.go)", () => {
+  it("renders the newest comment across a read→re-mark transition — NOT a transition-pinned CommentID", async () => {
+    const service = new IssuesService(env.DB);
+    const urlOfA = async (): Promise<string> => {
+      const threads = (await (await send("/notifications", authed())).json<Thread[]>());
+      return String(threads.find((thread) => thread.id === issueA.id)!.subject.latest_comment_url);
+    };
+
+    // Baseline: A's newest foreign comment (T3, the neighbor's reply).
+    const t3Url = await urlOfA();
+    expect(t3Url).toMatch(/\/issues\/comments\/\d+$/);
+
+    // Read it; a foreign comment re-marks the thread (upstream's
+    // updateIssueNotification read→unread transition — its STORED CommentID
+    // pins here). The serializer keeps rendering the newest comment, which
+    // at this instant IS the re-marking one.
+    await send(`/notifications/threads/${issueA.id}`, authed({ method: "PATCH" }));
+    const reMark = await service.addComment({
+      issueId: issueA.id,
+      posterId: neighborId,
+      content: "re-mark",
+      now: new Date(Date.now() + 60_000),
+    });
+    const reMarkUrl = await urlOfA();
+    expect(reMarkUrl.endsWith(`/issues/comments/${reMark.id}`)).toBe(true);
+
+    // The discriminator: one MORE foreign comment with no read in between.
+    // Upstream's stored CommentID stays at the re-marking comment (it only
+    // rewrites on the read→unread transition), but the API field renders
+    // GetLastComment — the NEWEST one wins.
+    const newer = await service.addComment({
+      issueId: issueA.id,
+      posterId: neighborId,
+      content: "newest",
+      now: new Date(Date.now() + 120_000),
+    });
+    const newestUrl = await urlOfA();
+    expect(newestUrl.endsWith(`/issues/comments/${newer.id}`)).toBe(true);
+    expect(newestUrl).not.toBe(reMarkUrl);
   });
 });
 

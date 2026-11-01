@@ -15,6 +15,7 @@ import {
   pullRequests,
   repositories,
   repoWatchers,
+  ReviewType,
   users,
 } from "../../db/schema";
 import { ApiError, apiErrorSchema } from "../errors";
@@ -67,7 +68,8 @@ import { apiRepositoryUrl, toApiRepository, viewerOf, type Viewer } from "../ser
  *    reads those rows. Our thread set is DERIVED from real issue/comment
  *    activity at read time: an issue is a thread for user U iff U is a
  *    recipient (repo owner, repo watcher, issue poster, explicit issue
- *    subscriber, or comment participant) AND at least one activity event on
+ *    subscriber, comment participant, mentioned user, assignee, or
+ *    requested reviewer — deviation 4) AND at least one activity event on
  *    the issue was authored by someone else (upstream excludes the activity
  *    author from the recipients too — notification_list.go:135
  *    `delete(toNotify, notificationAuthorID)`). Activity events are the
@@ -88,14 +90,25 @@ import { apiRepositoryUrl, toApiRepository, viewerOf, type Viewer } from "../ser
  *    (exact upstream message), site admin bypasses the recipient check (and
  *    falls back to the global latest activity when they authored every
  *    event); a recipient with no foreign activity has no mailbox entry → 404.
- * 4. Recipient set reduced to our tables: owner ∪ repo_watchers (mode-aware:
- *    a Dont/ignore row does NOT qualify — the migration-0053 mode columns
- *    closed the "untyped rows" gap; the per-type include matching upstream
- *    applies, GetRepoWatchersIDs' include_<type> arm, watch.go:266-292,
- *    is still not ported here) ∪ issue poster ∪ explicit issue subscribers
- *    ∪ comment participants. Upstream additionally notifies assignees and
- *    requested reviewers (no assignee table at this tier) and excludes
- *    access-revoked users (no revocation model).
+ * 4. Recipient set = upstream's toNotify union (notification_list.go:93-133):
+ *    owner ∪ repo_watchers (mode-aware: a Dont/ignore row does NOT qualify —
+ *    the migration-0053 mode columns closed the "untyped rows" gap; the
+ *    per-type include matching upstream applies, GetRepoWatchersIDs'
+ *    include_<type> arm, watch.go:266-292, is still not ported here; and
+ *    WIP-PR titles drop the arm at read time — notification_list.go:100,
+ *    evaluated against the CURRENT title, so a rename re-qualifies or
+ *    retires the watcher's view of past activity) ∪ issue poster ∪ explicit
+ *    issue subscribers ∪ comment participants ∪ mentioned (issue_user
+ *    is_mentioned) ∪ assignees ∪ requested reviewers (pull_reviews
+ *    type=Request). Two whole-union gates mirror upstream's post-assembly
+ *    passes: the mute rule (ignorers removed AFTER every source — "muting
+ *    the repository outranks every other source, including mentions",
+ *    notification_list.go:135-141; the mail fan-out's twin at
+ *    services/mail/notify.ts) and the bot skip (upstream skips
+ *    IsTypeBot users at materialization, :158-160 — vacuous here: our
+ *    users.type enum is "user"/"org" only, no bot rows can exist).
+ *    Access-revoked users remain excluded upstream-only (no revocation
+ *    model).
  * 5. Subject types are Issue/Pull only. `subject-type=commit/repository`
  *    filters are accepted (upstream maps them to valid sources) but match
  *    nothing here — no commit/repository notification source exists.
@@ -417,35 +430,97 @@ function lastAnyActivityExpr(): SQL {
 }
 
 /**
+ * `HasWorkInProgressPrefix` (models/issues/pull.go:652-658) as a SQL
+ * fragment — the same prefix set as the mail layer's `hasWorkInProgressPrefix`
+ * (api/services/issues.ts `WIP_PREFIXES`, the upstream
+ * setting.Repository.PullRequest.WorkInProgressPrefixes default plus the
+ * mail layer's carried extensions; kept in literal sync — that constant is
+ * not exported and this module owns no shared file). SQLite LIKE is ASCII
+ * case-insensitive, the helper's own matching rule; no prefix contains a
+ * LIKE metacharacter ("[" is literal in SQLite).
+ */
+const RECIPIENT_WIP_PREFIXES: readonly string[] = ["WIP:", "[WIP]", "WIP]", "Draft"];
+
+/** The WIP-title match over the issues row in scope (reads issues.title). */
+function wipTitleExpr(): SQL {
+  return sql`(${sql.join(
+    RECIPIENT_WIP_PREFIXES.map((prefix) => sql`${issues.title} like ${`${prefix}%`}`),
+    sql` or `,
+  )})`;
+}
+
+/**
  * The recipient predicate (module doc deviation 4); needs the repositories
  * join plus the repo_watchers / issue_subscriptions left joins in scope.
- * The watch arm is MODE-aware: a row qualifies only outside the ignore
- * state (`mode <> Dont` — upstream's watcher-recipients never enumerate
- * Dont rows: GetRepoWatchersIDs' `watch.mode<>? WatchModeDont`,
- * models/repo/watch.go:281, and the mailer additionally sweeps the ignorers
- * into the visited set FIRST — "muting the repository outranks every other
- * source, including mentions", services/mailer/mail_issue.go:88-93), so a
- * persisted Dont watch (the Auto-unwatch landing, watch.go:164-165) does
- * not qualify a notification recipient on its own.
+ * The arms mirror upstream's toNotify assembly
+ * (createOrUpdateIssueNotifications, notification_list.go:93-133): repo
+ * watchers (GetRepoWatchersIDs), the poster/participants (ours split into
+ * poster / explicit subscribers / comment participants), the is_mentioned
+ * carrier (issue_user, migration 0057 — upstream's mail fan-out mails the
+ * resolved mentions as their OWN batch first of all sources,
+ * "========== Mentions ==========", services/mailer/mail_issue.go:99-105,
+ * fed by FindAndUpdateIssueMentions' resolved users, which our carrier
+ * persists at the same emit positions), assignees (GetAssigneeIDsByIssue)
+ * and requested reviewers (GetPullRequestRequestedReviewerIDs — pull-reviews
+ * `type = Request` rows with a user reviewer, the same shape our
+ * pull_reviews table mirrors; the isPull guard mirrors upstream's
+ * `if issue.IsPull` around the reviewer query).
  *
- * The mention arm reads the issue_user carrier (migration 0057): upstream's
- * mail fan-out mails the resolved mentions as their OWN batch, first of all
- * recipient sources ("========== Mentions ==========", services/mailer/
- * mail_issue.go:99-105 — fed by FindAndUpdateIssueMentions' resolved users,
- * which our carrier persists at the same emit positions), and the derived
- * mailbox answers the same question at read time: is there an
- * `is_mentioned` row for this (user, issue).
+ * TWO gates apply to the WHOLE union, not to a single arm, mirroring
+ * upstream's post-assembly passes:
+ * - The mute rule: repo ignorers (watch mode=Dont, GetRepoIgnorersIDs,
+ *   watch.go:244-251) are removed from toNotify AFTER every source joined —
+ *   "muting the repository outranks every other source, including mentions"
+ *   (notification_list.go:135-141). The mail fan-out applies the same rule
+ *   (services/mail/notify.ts: the ignorer set joins `visited` ahead of
+ *   every batch) — this conjunct is the mailbox twin, so an ignorer who
+ *   commented / was mentioned / is the poster loses the thread too. The
+ *   watchers arm itself still carries the mode<>Dont guard (a Dont row
+ *   never qualifies on its own, GetRepoWatchersIDs' `watch.mode<>?`,
+ *   watch.go:281; the Auto-unwatch landing, watch.go:164-165).
+ * - The WIP-PR rule: while a pull's title carries a WIP prefix, the
+ *   repo-watchers arm does NOT qualify — upstream guards ONLY that arm at
+ *   notify time (`if !(issue.IsPull && HasWorkInProgressPrefix(issue.Title))`
+ *   around the GetRepoWatchersIDs add, notification_list.go:100); every
+ *   other arm still receives. Gate evaluated against the CURRENT title —
+ *   a rename re-qualifies/retires the watcher's view of past activity
+ *   (derived-model timing, deviation 1).
+ *
+ * Bot recipients: upstream skips user.IsTypeBot() users when materializing
+ * (notification_list.go:158-160). Our users.type enum carries only
+ * "user"/"org" — the collapsed user-type model has no bot rows, so the skip
+ * is vacuously true here and no filter arm exists (documented equivalence).
  */
 function recipientExpr(userId: number): SQL {
   return sql`(
-    (${repoWatchers.userId} is not null and ${repoWatchers.mode} <> ${WatchMode.Dont})
-    or ${repositories.ownerId} = ${userId}
-    or ${issues.posterId} = ${userId}
-    or ${issueSubscriptions.userId} is not null
-    or exists (select 1 from comments pc where pc.issue_id = ${issues.id} and pc.poster_id = ${userId})
-    or exists (
-      select 1 from issue_user mu
-      where mu.issue_id = ${issues.id} and mu.user_id = ${userId} and mu.is_mentioned = 1
+    (
+      (
+        (${repoWatchers.userId} is not null and ${repoWatchers.mode} <> ${WatchMode.Dont})
+        and not (${issues.isPull} = 1 and ${wipTitleExpr()})
+      )
+      or ${repositories.ownerId} = ${userId}
+      or ${issues.posterId} = ${userId}
+      or ${issueSubscriptions.userId} is not null
+      or exists (select 1 from comments pc where pc.issue_id = ${issues.id} and pc.poster_id = ${userId})
+      or exists (
+        select 1 from issue_user mu
+        where mu.issue_id = ${issues.id} and mu.user_id = ${userId} and mu.is_mentioned = 1
+      )
+      or exists (
+        select 1 from issue_assignees aa
+        where aa.issue_id = ${issues.id} and aa.assignee_id = ${userId}
+      )
+      or (
+        ${issues.isPull} = 1
+        and exists (
+          select 1 from pull_reviews rr
+          where rr.issue_id = ${issues.id} and rr.type = ${ReviewType.Request} and rr.reviewer_id = ${userId}
+        )
+      )
+    )
+    and not exists (
+      select 1 from repo_watchers ig
+      where ig.repo_id = ${issues.repoId} and ig.user_id = ${userId} and ig.mode = ${WatchMode.Dont}
     )
   )`;
 }
@@ -595,7 +670,21 @@ async function fetchThreads(d1: D1Database, query: ThreadQuery): Promise<{ items
   return { items, total };
 }
 
-/** GetLastComment (models/issues/issue.go:470-483): latest CommentTypeComment. */
+/**
+ * GetLastComment (models/issues/issue.go:470-483): latest CommentTypeComment.
+ *
+ * Review-finding verdict (the "transition-pinned CommentID" claim): at this
+ * pin the REST serializer does NOT render notification.CommentID —
+ * services/convert/notification.go (both Source arms) calls
+ * `n.Issue.GetLastComment(ctx)` for latest_comment_url/_html_url, which is
+ * exactly this newest-CommentType.Comment-at-read-time query.
+ * updateIssueNotification (models/activities/notification.go:176-196) pins
+ * CommentID only on the read→unread transition, but that column feeds the
+ * web-UI/mail surfaces, not this API — so newest-wins here IS upstream
+ * parity, and the sequence test pins it across a re-mark transition.
+ * (Tie-break: upstream orders by created_unix DESC with no id tiebreak;
+ * max(id) is the deterministic stand-in for the same "latest" set.)
+ */
 async function fillLastCommentIds(d1: D1Database, items: DerivedThread[]): Promise<void> {
   const ids = items.map((item) => item.issue.id);
   if (ids.length === 0) {
