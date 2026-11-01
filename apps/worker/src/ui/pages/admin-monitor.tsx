@@ -159,17 +159,9 @@
  * - The delivery-state breakdown segment is a cf-gitea addition (marked in
  *   the locale block) — upstream's queue table has no per-state view, but the
  *   landed log carries the states and the depth number alone hides them.
- * - The trace page renders the note instead of goroutine/process counts and
- *   renders NONE of trace_tabs.tmpl: the perftrace tab is `!setting.IsProd`
- *   upstream (stacktrace.go:19) and has no source either; the diagnosis form
- *   POSTs an unlanded route. A rendered tab/form would be dead.
  * - The queue manage page's qid is the QUEUE NAME (upstream's numeric qid is
  *   the in-process registry id — no cf-gitea counterpart; the Cloudflare
  *   queue name is the landed identity, wrangler.jsonc's queues.producer).
- * - QueueSet's POST /{qid}/set stays UNCLAIMED: Cloudflare Queues expose no
- *   worker-pool knob (no Get/SetWorkerMaxNumber substrate), so the Pool
- *   Settings form renders nowhere and the route answers the engine's 404 —
- *   the queue-list's originally recorded posture for this arm.
  * - QueueRemoveAllItems lands for repo-tasks ONLY: its `queued|syncing` rows
  *   ARE the pipeline's in-flight set (a message dead-lettered into
  *   repo-tasks-dlq leaves its row stuck `queued` forever — repos/dlq.ts acks
@@ -195,7 +187,187 @@
  *   render only for MySQL/MSSQL, self_check.tmpl:21-25), no cache layer —
  *   so the page would assert "no problem found" without any check having
  *   run; the family navs already omit the item (the dead-link rule).
- *   perftrace and diagnosis stay unclaimed for the trace_tabs reason above.
+ *
+ * ## Platform arms (the 2026-11-01 MONITOR PLATFORM FREEZE — design frozen
+ * by the user; Cloudflare-native adapters over the OFFICIAL APIs)
+ *
+ * The original reductions above REWRITTEN by the freeze — /set, perftrace/
+ * pprof and diagnosis are Cloudflare-NATIVE ADAPTERS now, replacing the
+ * recorded local-substrate claims:
+ *
+ *   /set      Cloudflare Queues DO carry the worker-pool knob: the consumer's
+ *             max_concurrency (PUT /accounts/{a}/queues/{q}/consumers/{c},
+ *             services/monitor/queue-concurrency.ts — the read → modify →
+ *             write → GET-verify closed loop, preserving every untouched
+ *             setting; null = the platform's auto arm). The Pool Settings
+ *             form renders on the manage page when the SERVER-SIDE
+ *             allowlist (the MONITOR_QUEUE_CONSUMERS var) carries the
+ *             queue's entry; the UI shows the RUNTIME value (the verified
+ *             GET) and the DECLARED value (the allowlist's
+ *             declared_max_concurrency, mirroring wrangler.jsonc)
+ *             SEPARATELY with a drift warning — the next `wrangler deploy`
+ *             re-applies the declared config, so a runtime change is never
+ *             silently permanent. Audit rows ride emitAudit (operator,
+ *             before, after, API result, timestamp). Conflict-safety on
+ *             concurrent edits is a DOCUMENTED FOLLOW-UP (SPEC-0021 §8),
+ *             not built — the platform exposes no compare-and-swap; the
+ *             verify step catches a lost update on the next read and the
+ *             audit trail shows both writes.
+ *   pprof     Workers Profiling API (POST …/workers/{worker}/versions/{v}/
+ *             profile → a gzipped pprof; services/monitor/profile.ts): the
+ *             trace page's Profiling form triggers cpu|heap captures bounded
+ *             to the platform's 1..50 s and streams the .pprof.gz back as
+ *             the download. Content validation splits per the freeze: the
+ *             worker checks size + gzip magic; the deploy-probe battery
+ *             (scripts/deploy-probes.mjs monitor-platform) owns the DEEP
+ *             parse (gunzip → pprof protobuf → type/sampling sane).
+ *   perftrace SEPARATE from profiling (request tracing ≠ CPU/heap
+ *             capture): Workers Traces expose NO query API (dashboards,
+ *             wrangler tail, OTel/Logpush export only — verified live
+ *             2026-11-01), so the trace page's perftrace section states the
+ *             enabled posture honestly (observability.traces is committed
+ *             true) and links out — never a fabricated query arm.
+ *   diagnosis GET /-/admin/monitor/diagnosis renders the COMPOSITE report:
+ *             per-item SOURCE + collection time + availability status.
+ *             Cloudflare queue truth (the consumer API reads), the D1
+ *             mirror-row business state (CLEARLY labeled not-the-queue-
+ *             truth), recent errors (Workers Logs have no query API either —
+ *             the landed error surface is the cron_state error record),
+ *             the deployment version (the Deployments API's serving
+ *             deployment), the profiling arm's availability. unavailable ≠
+ *             0: every unreadable item reports unavailable + reason, never
+ *             a fabricated zero. Upstream's report is a ZIP download; ours
+ *             renders the page (the per-item status table IS the report —
+ *             the documented divergence).
+ *   goroutine The stacktrace arm's honest-absence note STANDS (the runtime
+ *             exposes no goroutine introspection) — the goroutine dump
+ *             remains the SOLE final reduction.
+ *
+ * ## The two status dimensions (SPEC-0021 §6 — never conflated)
+ *
+ *   implementation-status: 集成待验证 ("integrated, awaiting live
+ *     verification") for these arms until the monitor-platform probe
+ *     battery passes against a live deployment, then 已实现
+ *     ("implemented").
+ *   environment-status: per deployment, per arm — available (可用) /
+ *     unconfigured (未配置) / insufficient-permissions (权限不足 — the
+ *     platform answered 401/403, NEVER "platform unsupported") /
+ *     platform-unavailable (平台暂不可用). The Monitor UI surfaces this
+ *     dimension to the admin verbatim (the manage page's platform panel,
+ *     the diagnosis report's status column); the failure taxonomy behind
+ *     it lives in services/monitor/platform.ts.
+ *
+ * ### Platform-arms route HANDOFF (the orchestrator's ui/index.ts fold;
+ * this module ships everything the fold wires, claim-ready — the queue-
+ * manage HANDOFF pattern above)
+ *
+ * Imports beside the existing admin-monitor imports:
+ *   parseMonitorProfileParams, profileFilename, requestWorkerProfile,
+ *   PROFILE_DURATION_MS_MIN/MAX (services/monitor/profile),
+ *   applyAdminMonitorQueueSet, parseAdminMonitorQueueSetForm,
+ *   monitorPlatformConfigFromEnv (services/monitor/{queue-concurrency,
+ *   platform}).
+ *
+ *   parseUiRoute's admin block, inside the `monitor` tail AFTER the landed
+ *   shapes (the static-before-dynamic rule; the 4-segment /set claim goes
+ *   beside the 4-segment remove-all-items claim):
+ *
+ *       if (tail.length === 4 && tail[0] === "monitor" && tail[1] === "queue" && tail[2] === "set") {
+ *         return { family: "admin-monitor-queue-set", qid: tail[3] as string };
+ *       }
+ *       if (tail.length === 2 && tail[0] === "monitor" && tail[1] === "diagnosis") {
+ *         return { family: "admin-monitor-diagnosis" };
+ *       }
+ *       if (tail.length === 2 && tail[0] === "monitor" && tail[1] === "profile") {
+ *         return { family: "admin-monitor-profile" };
+ *       }
+ *
+ *   (plus the three family literals in the manifest/type-table union and
+ *   the handlesUiRoute arm — the same three-place claim the queue-manage
+ *   fold made).
+ *
+ *   Registrations beside adminMonitorQueueRemoveAllSubmit:
+ *
+ *     async function adminMonitorQueueSetSubmit(c: Context<{ Bindings: Env }>, qidRaw: string): Promise<Response> {
+ *       const guard = sameOriginGuard(c.req.raw);
+ *       if (guard !== null) return guard;
+ *       const p = await adminPagePrologue(c);
+ *       if (!p.ok) return p.response;
+ *       const qid = parseAdminMonitorQueueQid(qidRaw);
+ *       if (qid === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+ *       const max = parseAdminMonitorQueueSetForm(await readUrlEncodedForm(c.req.raw));
+ *       if (max === null) {
+ *         // Upstream's maxnumberworkers.error flash, re-rendered fresh.
+ *         const data = await loadAdminMonitorQueueDetail(c.env.DB, qid, {
+ *           platform: monitorPlatformConfigFromEnv(c.env),
+ *         });
+ *         if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+ *         return p.respond(c.html(renderAdminMonitorQueueManagePage({ ctx: p.ctx, data, flash: { kind: "negative", text: adminMonitorLocale.poolSettingsError } })));
+ *       }
+ *       const viewer = p.ctx.viewer;
+ *       const result = await applyAdminMonitorQueueSet(c.env, c.env.DB, qid, max, {
+ *         actorId: viewer.kind === "user" ? viewer.id : 0,
+ *         actorName: viewer.kind === "user" ? viewer.username : "",
+ *         now: routeNow(),
+ *       });
+ *       const data = await loadAdminMonitorQueueDetail(c.env.DB, qid, {
+ *         platform: monitorPlatformConfigFromEnv(c.env),
+ *       });
+ *       if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+ *       return p.respond(c.html(renderAdminMonitorQueueManagePage({ ctx: p.ctx, data, flash: result.flash })));
+ *     }
+ *
+ *     async function adminMonitorDiagnosisPage(c: Context<{ Bindings: Env }>): Promise<Response> {
+ *       const p = await adminPagePrologue(c);
+ *       if (!p.ok) return p.response;
+ *       const data = await loadAdminMonitorDiagnosis(c.env, c.env.DB, { now: routeNow() });
+ *       return p.respond(c.html(renderAdminMonitorDiagnosisPage({ ctx: p.ctx, data })));
+ *     }
+ *
+ *     async function adminMonitorProfileDownload(c: Context<{ Bindings: Env }>): Promise<Response> {
+ *       const p = await adminPagePrologue(c);
+ *       if (!p.ok) return p.response;
+ *       const params = parseMonitorProfileParams(new URL(c.req.raw.url).searchParams);
+ *       const config = monitorPlatformConfigFromEnv(c.env);
+ *       if (params === null || config.accountId === undefined || config.profileToken === undefined) {
+ *         // The trace page is the arm's only surface — a bad/unconfigured
+ *         // trigger lands back there (upstream's GET-download posture has
+ *         // no error page; the 303 keeps the no-JS form usable).
+ *         return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/monitor/stacktrace" } }));
+ *       }
+ *       // The serving version when the deployments read answers; the
+ *       // documented "latest" fallback otherwise.
+ *       let versionId: string | undefined;
+ *       const deployment = await readLatestDeployment({ accountId: config.accountId, apiToken: config.profileToken, workerName: config.workerName });
+ *       if (deployment.kind === "ok" && deployment.result !== null && deployment.result.versions[0]?.versionId) {
+ *         versionId = deployment.result.versions[0].versionId;
+ *       }
+ *       const profile = await requestWorkerProfile({
+ *         accountId: config.accountId, apiToken: config.profileToken, workerName: config.workerName,
+ *         versionId, type: params.type, durationMs: params.durationMs,
+ *       });
+ *       if (profile.kind !== "ok") {
+ *         console.error("[monitor] profile trigger failed", profile.kind);
+ *         return p.respond(new Response(null, { status: 303, headers: { location: "/-/admin/monitor/stacktrace" } }));
+ *       }
+ *       return p.respond(new Response(profile.bytes, {
+ *         status: 200,
+ *         headers: {
+ *           "content-type": "application/octet-stream",
+ *           "content-disposition": `attachment; filename="${profileFilename(params.type, routeNow())}"`,
+ *         },
+ *       }));
+ *     }
+ *
+ *     uiRouter.post("/-/admin/monitor/queue/:qid/set", (c) => adminMonitorQueueSetSubmit(c, c.req.param("qid")));
+ *     uiRouter.get("/-/admin/monitor/diagnosis", (c) => adminMonitorDiagnosisPage(c));
+ *     uiRouter.get("/-/admin/monitor/profile", (c) => adminMonitorProfileDownload(c));
+ *
+ *   (readLatestDeployment joins the imports from services/monitor/platform.)
+ *   Pins that flip at the fold: index.test.ts's monitor-tail route pin (the
+ *   three new shapes start parsing); nothing in this module's tests pins
+ *   the new shapes at the route level (module-level only — the queue-manage
+ *   fold's precedent).
  *
  * ## Mount record (MOUNTED at e31c0cf — the routes are live)
  *
@@ -303,6 +475,16 @@ import { enqueueDuePushMirrorSyncs } from "../../services/mirror/push-sync";
 import { enqueueDuePackagesCleanup } from "../../services/packages/cleanup";
 import { CRON_ARMS, listCronState, recordArmsSuccess, type CronStateRow } from "../../services/cron-state";
 import {
+  classifyPlatformStatus,
+  monitorPlatformConfigFromEnv,
+  readLatestDeployment,
+  type FetchImpl,
+  type MonitorPlatformConfig,
+  type MonitorPlatformStatus,
+} from "../../services/monitor/platform";
+import { readQueueConsumer, type QueueConsumerSettings } from "../../services/monitor/queue-concurrency";
+import { parseMonitorProfileParams, profileFilename, requestWorkerProfile } from "../../services/monitor/profile";
+import {
   commitStatuses,
   comments,
   follows,
@@ -362,6 +544,7 @@ export const adminMonitorLocale = {
   taskStopZombieTasks: "Stop actions zombie tasks", // "admin.dashboard.stop_zombie_tasks"
   taskStopEndlessTasks: "Stop actions endless tasks", // "admin.dashboard.stop_endless_tasks"
   taskDemoSweep: "Demo Sweep", // cf-gitea extension (SPEC-0014 — the producer's own log tag)
+  taskAutoMergeDueScan: "Auto-merge due scan", // cf-gitea extension (the pull-automerge fold's census arm)
   taskDeleteOldAuditEvents: "Delete audit events older than the retention period", // "admin.dashboard.delete_old_audit_events"
   taskCleanupPackages: "Clean up expired packages", // "admin.dashboard.cleanup_packages"
   taskCleanupActions: "Clean up expired actions' resources", // "admin.dashboard.cleanup_actions"
@@ -371,25 +554,85 @@ export const adminMonitorLocale = {
   queueName: "Name", // "admin.monitor.queue.name"
   queueType: "Type", // "admin.monitor.queue.type"
   queueNumberInQueue: "Number in Queue", // "admin.monitor.queue.numberinqueue"
-  // The queue manage page (queue_manage.tmpl; the census gap-17 fold).
+  // The queue manage page (queue_manage.tmpl; the census gap-17 fold + the
+  // platform arms' Pool Settings — queue_manage.tmpl:19-38's second section,
+  // now claimable: the Cloudflare Queues consumer's max_concurrency IS the
+  // worker-pool knob, services/monitor/queue-concurrency.ts).
   queueManageTitle: "Queue: %s", // "admin.monitor.queue" (queue.go:33 — %s = the queue name)
   queueReviewAdd: "Review / Add Workers", // "admin.monitor.queue.review_add" (queue.tmpl:28's link label)
   queueRemoveAll: "Remove all", // "admin.monitor.queue.settings.remove_all_items" (queue_manage.tmpl:34's button)
   queueRemoveAllDone: "All items in the queue have been removed.", // "admin.monitor.queue.settings.remove_all_items_done" (queue.go:87's flash)
-  // cf-gitea addition — the manage page's reduction note (the module header's
-  // adjudications: no set arm, webhook purge, DLQ purge).
+  // The Pool Settings section (queue_manage.tmpl:19-38, upstream locale
+  // verbatim — admin.monitor.queue.settings.*).
+  poolSettingsTitle: "Pool Settings", // "admin.monitor.queue.settings.title"
+  poolSettingsDesc: "Pools dynamically grow in response to their worker queue blocking.", // "admin.monitor.queue.settings.desc"
+  poolSettingsMaxNumber: "Max number of workers", // "admin.monitor.queue.settings.maxnumberworkers"
+  poolSettingsSubmit: "Update Settings", // "admin.monitor.queue.settings.submit"
+  settingsChanged: "Settings Updated", // "admin.monitor.queue.settings.changed" (the applied flash)
+  poolSettingsError: "Max number of workers must be a number", // "admin.monitor.queue.settings.maxnumberworkers.error" (the failed binding's flash)
+  // cf-gitea additions — the platform arms' UI (no upstream keys; the
+  // two-status-dimension scheme, SPEC-0021 §6).
+  runtimeValue: "Runtime (Cloudflare API, verified)",
+  declaredValue: "Declared (wrangler.jsonc)",
+  driftWarning:
+    "A redeploy re-applies the declared wrangler.jsonc settings — the runtime value above is a drift that the next deploy overwrites, not a permanent change.",
+  autoLabel: "auto", // the platform's null=auto arm (max_concurrency null = the platform maximum)
+  envAvailable: "Available", // 可用
+  envUnconfigured: "Not configured", // 未配置
+  envInsufficientPermissions: "Insufficient permissions", // 权限不足 (401/403 — NEVER "platform unsupported")
+  envPlatformUnavailable: "Platform temporarily unavailable", // 平台暂不可用
+  platformNotWired: "The queue platform arm is not wired on this route yet.",
+  // cf-gitea addition — the manage page's posture note (the REWRITTEN
+  // reduction: the set arm is an adapter now; the purge adjudications keep).
   queueManageReductions:
-    "Pool settings (worker counts) have no cf-gitea source: Cloudflare Queues grow and shrink without an in-process worker pool, so the settings form does not render. The webhook queue has no remove-all arm either: its queue items are the delivery log rows themselves, and upstream's purge preserves the log. The dead-letter queue has no landed counter (the - cell above) and no purge substrate.",
+    "Worker-pool settings ride the Cloudflare Queues consumer API (max_concurrency) when this queue has a server-side allowlist entry; the form shows the platform-verified runtime value and the wrangler-declared value separately. The webhook queue has no remove-all arm: its queue items are the delivery log rows themselves, and upstream's purge preserves the log. The dead-letter queue has no landed counter (the - cell above) and no purge substrate.",
   // The run POST's flash texts (admin.go:188-190 DashboardPost — "%s" is the
   // task's locale name / the raw op).
   taskStarted: "Started Task: %s", // "admin.dashboard.task.started"
   taskUnknown: "Unknown task: %s", // "admin.dashboard.task.unknown"
-  // cf-gitea additions — the honest-absence answers (the module header):
-  // the trace page's source-less render and the queue section's landed
-  // delivery-state breakdown title.
+  // cf-gitea additions — the trace page's sections (the REWRITTEN
+  // trace_tabs posture: the stacktrace honest-absence note STANDS — the
+  // goroutine dump is the sole final reduction — while perftrace/pprof and
+  // diagnosis are platform adapters now, SPEC-0021 §4-§5).
   traceUnavailable:
-    "Trace data is not available: the Workers runtime exposes no goroutine or process introspection, so the upstream stacktrace list (runtime.NumGoroutine + the process manager) has no cf-gitea source.",
+    "Goroutine and process introspection is not available: the Workers runtime exposes neither, so the upstream stacktrace list (runtime.NumGoroutine + the process manager) has no cf-gitea source. This is the one remaining hard reduction of the monitor family.",
   deliveryStates: "Webhook delivery states",
+  // The perftrace section (request tracing — SEPARATE from profiling):
+  // Workers Traces have no query API (verified live 2026-11-01), so the
+  // section states the enabled posture and links out.
+  perfTraceTitle: "Request traces (perftrace)",
+  perfTracePosture:
+    "Workers Traces are enabled on this deployment (observability.traces). The platform exposes no on-demand trace query API, so this page cannot list traces; open the Cloudflare dashboard (Workers & Pages -> your Worker -> Observability -> Traces) or stream with `wrangler tail`.",
+  perfTraceDocs: "Traces docs",
+  // The profiling section (the pprof adapter).
+  profileTitle: "Profiling",
+  profileConfiguredNote:
+    "Triggers a capture through the Workers Profiling API and downloads the gzipped pprof (cpu or heap, 1-50 s). The file is the raw pprof output of the platform.",
+  profileUnconfigured:
+    "Profiling is not configured on this deployment (no CLOUDFLARE_PROFILE_TOKEN / CLOUDFLARE_ACCOUNT_ID) — the Workers Profiling API is available but not wired.",
+  profileTypeLabel: "Profile type",
+  profileSecondsLabel: "Seconds",
+  profileDownload: "Download profile (.pprof.gz)",
+  // The diagnosis section + report (upstream's download_diagnosis_report
+  // label; the report renders as a PAGE — the documented divergence).
+  diagnosisReport: "Download diagnosis report", // "admin.monitor.download_diagnosis_report"
+  diagnosisTitle: "Diagnosis Report",
+  diagnosisColHeader: "Item",
+  diagnosisSourceHeader: "Source",
+  diagnosisCollectedHeader: "Collected (UTC)",
+  diagnosisStatusHeader: "Status",
+  diagnosisDetailHeader: "Detail",
+  diagnosisUnavailable: "unavailable",
+  diagnosisAvailable: "available",
+  diagnosisQueueTruthSource: "Cloudflare Queues API (consumer read) — the queue truth",
+  diagnosisD1MirrorSource: "D1 business mirror — NOT the queue truth",
+  diagnosisD1MirrorNote:
+    "These counts come from the D1 delivery-log and mirror-state rows. They reflect the business state of the pipelines, not the Cloudflare queue depths.",
+  diagnosisCronErrorsSource: "cron_state table (the landed error surface)",
+  diagnosisCronErrorsNone: "no recorded cron arm errors",
+  diagnosisDeploymentSource: "Workers Deployments API (the serving deployment)",
+  diagnosisProfilingSource: "Workers Profiling API (availability)",
+  diagnosisProfilingArmed: "armed — trigger a capture from the Trace page",
 } as const;
 
 /** The monitor submenu's live items (the shared AdminFamilyNav's monitor
@@ -780,6 +1023,8 @@ function taskDisplayName(name: string): string {
       return adminMonitorLocale.taskStopEndlessTasks;
     case "demo_sweep":
       return adminMonitorLocale.taskDemoSweep;
+    case "auto_merge_due_scan":
+      return adminMonitorLocale.taskAutoMergeDueScan;
     case "delete_old_audit_events":
       return adminMonitorLocale.taskDeleteOldAuditEvents;
     case "cleanup_packages":
@@ -1123,6 +1368,28 @@ export interface AdminMonitorQueueDetailData {
   /** A landed purge body exists for this queue (the dead-control rule
    *  narrows upstream's per-countable form render to the purgeable rows). */
   purgeable: boolean;
+  /** The platform arm's state (the /set adapter, SPEC-0021 §3) — the
+   *  environment-status dimension + the verified runtime config + the
+   *  declared value. Present on every load; the UNCONFIGURED posture is
+   *  itself the honest state. */
+  platform: AdminMonitorQueuePlatformState;
+}
+
+/** One queue's platform-arm state (the /set arm's environment-status
+ *  display). `runtime` is the platform-verified consumer config (available
+ *  only); `declaredMaxConcurrency` mirrors the allowlist var's
+ *  declared_max_concurrency (wrangler.jsonc's queues.consumers entry). */
+export interface AdminMonitorQueuePlatformState {
+  status: MonitorPlatformStatus;
+  /** The reason when not available (rendered verbatim). */
+  detail: string | null;
+  /** Whether THIS queue has a server-side allowlist entry (the /set form
+   *  renders only then — an unlisted queue is unaddressable by design). */
+  targetPresent: boolean;
+  declaredMaxConcurrency: number | null;
+  runtime: QueueConsumerSettings | null;
+  /** The collection time of the runtime read (the display's "verified at"). */
+  collectedAt: Date | null;
 }
 
 /**
@@ -1181,10 +1448,24 @@ export function parseAdminMonitorQueueQid(raw: string): string | null {
  * too — its detail renders the countable-less `-` arm with no form
  * (queue_manage.tmpl:29's own `{{if lt $sum 0}}` posture). Two point scans
  * of the same two grouped counts.
+ *
+ * The `options.platform` slice (the /set arm, SPEC-0021 §3): when present,
+ * the loader ALSO reads the queue's consumer through the Cloudflare API —
+ * the runtime value the Pool Settings panel displays next to the declared
+ * one. A platform READ FAILURE never fails the page: the D1 registry row
+ * still renders and the panel carries the environment-status dimension
+ * instead (available / unconfigured / insufficient-permissions /
+ * platform-unavailable — the freeze's honest-degraded arms). Absent options
+ * (pre-fold routes) render the not-wired posture.
  */
 export async function loadAdminMonitorQueueDetail(
   d1: D1Database,
   qid: string,
+  options: {
+    platform?: MonitorPlatformConfig;
+    fetchImpl?: FetchImpl;
+    now?: Date;
+  } = {},
 ): Promise<AdminMonitorQueueDetailData | null> {
   const db = drizzle(d1);
   const depth = await queueDepthByState(db);
@@ -1192,7 +1473,62 @@ export async function loadAdminMonitorQueueDetail(
   if (queue === undefined) {
     return null;
   }
-  return { queue, purgeable: QUEUE_PURGE_BODIES[qid] !== undefined };
+  const platform = await loadQueuePlatformState(qid, options);
+  return { queue, purgeable: QUEUE_PURGE_BODIES[qid] !== undefined, platform };
+}
+
+/** One queue's /set-arm state read (the manage page's platform panel AND
+ *  the diagnosis report's queue-truth items share the shape derivation —
+ *  the panel adds the runtime config, the report the collection stamp).
+ *  Every failure kind degrades to its environment-status dimension; the
+ *  page NEVER fails on a platform read. */
+export async function loadQueuePlatformState(
+  qid: string,
+  options: { platform?: MonitorPlatformConfig; fetchImpl?: FetchImpl; now?: Date } = {},
+): Promise<AdminMonitorQueuePlatformState> {
+  const config = options.platform;
+  if (config === undefined) {
+    return { status: "unconfigured", detail: adminMonitorLocale.platformNotWired, targetPresent: false, declaredMaxConcurrency: null, runtime: null, collectedAt: null };
+  }
+  if (config.queueAllowlistError !== null) {
+    return { status: "unconfigured", detail: config.queueAllowlistError, targetPresent: false, declaredMaxConcurrency: null, runtime: null, collectedAt: null };
+  }
+  const target = config.queueTargets.get(qid);
+  if (target === undefined) {
+    return {
+      status: "unconfigured",
+      detail: "this queue has no entry in the server-side consumer allowlist (MONITOR_QUEUE_CONSUMERS) — it is not addressable through the platform API by design",
+      targetPresent: false,
+      declaredMaxConcurrency: null,
+      runtime: null,
+      collectedAt: null,
+    };
+  }
+  if (config.accountId === undefined || config.accountId === "" || config.queuesToken === undefined || config.queuesToken === "") {
+    return {
+      status: "unconfigured",
+      detail: "the queue platform arm needs CLOUDFLARE_ACCOUNT_ID and the CLOUDFLARE_QUEUES_TOKEN secret",
+      targetPresent: true,
+      declaredMaxConcurrency: target.declaredMaxConcurrency,
+      runtime: null,
+      collectedAt: null,
+    };
+  }
+  const read = await readQueueConsumer({
+    accountId: config.accountId,
+    apiToken: config.queuesToken,
+    target,
+    fetchImpl: options.fetchImpl,
+  });
+  const classified = classifyPlatformStatus(read);
+  return {
+    status: classified.status,
+    detail: classified.detail,
+    targetPresent: true,
+    declaredMaxConcurrency: target.declaredMaxConcurrency,
+    runtime: read.kind === "ok" ? read.settings : null,
+    collectedAt: read.kind === "ok" ? (options.now ?? new Date()) : null,
+  };
 }
 
 export type AdminMonitorQueueRemoveAllResult =
@@ -1222,16 +1558,103 @@ export async function applyAdminMonitorQueueRemoveAllItems(
   return { outcome: "applied", message: adminMonitorLocale.queueRemoveAllDone };
 }
 
-/** The manage page (queue_manage.tmpl reduced): the `Queue: %s` header
- *  (queue.go:33) over the sourced-columns detail table; the depth cell
- *  carries the remove-all-items form ONLY on a purgeable queue (upstream
- *  renders it for every countable queue, queue_manage.tmpl:33-35 — the
- *  dead-control rule narrows it), and the countable-less DLQ renders the
- *  `-` arm with no form (queue_manage.tmpl:29-31's own conditional). The
- *  Pool Settings section is OMITTED entirely (no worker-pool knob — the
- *  /set arm unclaimed). The reduction note is the cf-gitea posture line
- *  (the trace page's honest-absence convention); `flash` is the no-JS POST
- *  answer banner (always positive here — the unknown-queue arm is a 404). */
+/** The environment-status label (the frozen four-value dimension, SPEC-0021
+ *  §6 — the UI surfaces it verbatim). */
+export function monitorEnvStatusLabel(status: MonitorPlatformStatus): string {
+  switch (status) {
+    case "available":
+      return adminMonitorLocale.envAvailable;
+    case "unconfigured":
+      return adminMonitorLocale.envUnconfigured;
+    case "insufficient-permissions":
+      return adminMonitorLocale.envInsufficientPermissions;
+    case "platform-unavailable":
+      return adminMonitorLocale.envPlatformUnavailable;
+  }
+}
+
+/** The max_concurrency render (null = the platform's auto arm). */
+function maxConcurrencyText(value: number | null): string {
+  return value === null ? adminMonitorLocale.autoLabel : String(value);
+}
+
+/** The Pool Settings panel's platform-state segment (the environment-status
+ *  posture line — the honest-degraded arm for every non-available state). */
+function QueuePlatformStatusLine(props: { platform: AdminMonitorQueuePlatformState }) {
+  return (
+    <p>
+      <strong>{monitorEnvStatusLabel(props.platform.status)}</strong>
+      {props.platform.detail !== null ? <> — {props.platform.detail}</> : null}
+    </p>
+  );
+}
+
+/** The Pool Settings section (queue_manage.tmpl:19-38 — the /set arm, now
+ *  the Cloudflare-native adapter). The form renders ONLY when the platform
+ *  read is available for an allowlisted queue (the dead-control rule: a
+ *  form over an unreadable/unaddressable consumer would POST into the
+ *  environment-status error — never a dead control); every other state
+ *  renders the status line instead. The runtime row (the platform-verified
+ *  GET) and the declared row (wrangler.jsonc's mirror) render SEPARATELY
+ *  with the drift warning — the freeze's binding display contract. */
+function QueuePoolSettings(props: { queueName: string; platform: AdminMonitorQueuePlatformState }) {
+  const platform = props.platform;
+  return (
+    <>
+      <h4 class="ui top attached header">{adminMonitorLocale.poolSettingsTitle}</h4>
+      <div class="ui attached segment">
+        <p>{adminMonitorLocale.poolSettingsDesc}</p>
+        {platform.status === "available" && platform.targetPresent && platform.runtime !== null ? (
+          <>
+            <table class="ui very basic table">
+              <tbody>
+                <tr>
+                  <td width="280">{adminMonitorLocale.runtimeValue}</td>
+                  <td>
+                    <strong>{maxConcurrencyText(platform.runtime.maxConcurrency)}</strong>
+                    {platform.collectedAt !== null ? (
+                      <span class="tw-ml-2">({formatMonitorFullTime(platform.collectedAt)} UTC)</span>
+                    ) : null}
+                  </td>
+                </tr>
+                <tr>
+                  <td>{adminMonitorLocale.declaredValue}</td>
+                  <td>{platform.declaredMaxConcurrency === null ? "-" : maxConcurrencyText(platform.declaredMaxConcurrency)}</td>
+                </tr>
+              </tbody>
+            </table>
+            <p>{adminMonitorLocale.driftWarning}</p>
+            <form method="post" action={`/-/admin/monitor/queue/${props.queueName}/set`}>
+              <div class="ui form">
+                <div class="inline field">
+                  <label for="max-number">{adminMonitorLocale.poolSettingsMaxNumber}</label>
+                  <input name="max-number" type="text" placeholder={`Currently ${maxConcurrencyText(platform.runtime.maxConcurrency)}`} />
+                </div>
+                <button type="submit" class="ui submit button">
+                  {adminMonitorLocale.poolSettingsSubmit}
+                </button>
+              </div>
+            </form>
+          </>
+        ) : (
+          <QueuePlatformStatusLine platform={platform} />
+        )}
+      </div>
+    </>
+  );
+}
+
+/** The manage page (queue_manage.tmpl reduced + the platform arms): the
+ *  `Queue: %s` header (queue.go:33) over the sourced-columns detail table;
+ *  the depth cell carries the remove-all-items form ONLY on a purgeable
+ *  queue (upstream renders it for every countable queue, queue_manage.tmpl:
+ *  33-35 — the dead-control rule narrows it), and the countable-less DLQ
+ *  renders the `-` arm with no form (queue_manage.tmpl:29-31's own
+ *  conditional). The Pool Settings section rides the platform state (the
+ *  /set adapter — the form only on an available allowlisted read). The
+ *  posture note carries the purge adjudications; `flash` is the no-JS POST
+ *  answer banner (positive on an applied set/remove; negative on the failed
+ *  binding or a degraded platform arm). */
 export function AdminMonitorQueueManagePage(props: {
   ctx: UiContext;
   data: AdminMonitorQueueDetailData;
@@ -1243,7 +1666,7 @@ export function AdminMonitorQueueManagePage(props: {
   return (
     <AdminMonitorShell ctx={props.ctx} title={title} active="queue">
       <h4 class="ui top attached header">{title}</h4>
-      {props.flash !== null ? <div class="ui positive message">{props.flash.text}</div> : null}
+      {props.flash !== null ? <div class={`ui ${props.flash.kind} message`}>{props.flash.text}</div> : null}
       <div class="ui attached table segment">
         <table class="ui very basic table">
           <thead>
@@ -1278,9 +1701,11 @@ export function AdminMonitorQueueManagePage(props: {
           </tbody>
         </table>
       </div>
-      {/* The cf-gitea posture line (the module header's adjudications) —
-          queue_manage.tmpl's second section keeps its segment+p shape with
-          the dead Pool Settings header omitted. */}
+      {/* The Pool Settings section (queue_manage.tmpl:19-38's own header +
+          segment shape — the /set adapter's surface). */}
+      <QueuePoolSettings queueName={queue.name} platform={props.data.platform} />
+      {/* The cf-gitea posture line (the purge adjudications — the set arm
+          lives in the section above now). */}
       <div class="ui attached segment">
         <p>{adminMonitorLocale.queueManageReductions}</p>
       </div>
@@ -1297,29 +1722,420 @@ export function renderAdminMonitorQueueManagePage(options: {
 }
 
 // ---------------------------------------------------------------------------
-// Trace (GET /-/admin/monitor/stacktrace — stacktrace.tmpl's honest absence)
+// Trace (GET /-/admin/monitor/stacktrace — stacktrace.tmpl + trace_tabs.tmpl
+// through the platform adapters: the stacktrace honest-absence note STANDS;
+// perftrace = the enabled-posture section; profiling = the pprof adapter's
+// form; diagnosis = the composite report's link)
 // ---------------------------------------------------------------------------
 
+/** The trace page's render inputs: the platform config decides which
+ *  sections render controls vs posture lines (the dead-control rule — a
+ *  form over an unconfigured token would POST into the redirect). Absent
+ *  (pre-fold routes) renders every platform section in the unconfigured
+ *  posture. */
+export interface AdminMonitorTracePlatform {
+  /** The profiling arm's trigger renders only when true (the profile token
+   *  + account id present). */
+  profileConfigured: boolean;
+}
+
 /**
- * The trace page (stacktrace.tmpl reduced): upstream renders "%d Goroutines,
- * %d Processes" over the process manager's stack list; the Workers runtime
- * exposes neither, so the page renders the header + segment shape carrying
- * the honest-absence note. NONE of trace_tabs.tmpl renders (the perftrace
- * tab is dev-only upstream AND source-less; the diagnosis form POSTs an
- * unlanded route; the process cancel `link-action`s have no source) — the
- * dead-control rule.
+ * The trace page. Upstream trace_tabs.tmpl carries three tabs (perftrace —
+ * dev-only, the process/stacktrace pair) + the diagnosis form; ours carries
+ * four SECTIONS (no tabs — one is the honest absence):
+ *
+ *   stacktrace  the honest-absence note STANDS (no goroutine/process
+ *               introspection — the monitor's sole final reduction).
+ *   perftrace   request tracing: the enabled posture (observability.traces
+ *               is committed true) + the dashboard/tail pointers — the
+ *               platform exposes NO on-demand query API (verified live
+ *               2026-11-01), so the section states it honestly and links
+ *               out instead of a fabricated query arm.
+ *   profiling   the pprof adapter's form (cpu|heap, seconds bounded by the
+ *               platform's 1..50) GETing /-/admin/monitor/profile with
+ *               target="_blank" (upstream's GET-download posture) — only
+ *               when the profile token is configured; the unconfigured
+ *               line otherwise.
+ *   diagnosis   upstream's "Download diagnosis report" control (GET,
+ *               target="_blank") over the composite report page — ours
+ *               renders the report as a page (the documented divergence).
  */
-export function AdminMonitorTracePage(props: { ctx: UiContext }) {
+export function AdminMonitorTracePage(props: { ctx: UiContext; platform?: AdminMonitorTracePlatform }) {
+  const profileConfigured = props.platform?.profileConfigured === true;
   return (
     <AdminMonitorShell ctx={props.ctx} title={adminMonitorLocale.monitoring} active="trace">
       <h4 class="ui top attached header">{adminMonitorLocale.trace}</h4>
       <div class="ui attached segment">
         <p>{adminMonitorLocale.traceUnavailable}</p>
       </div>
+      {/* The perftrace section (request tracing — the enabled posture). */}
+      <h4 class="ui top attached header">{adminMonitorLocale.perfTraceTitle}</h4>
+      <div class="ui attached segment">
+        <p>{adminMonitorLocale.perfTracePosture}</p>
+        <p>
+          <a href="https://developers.cloudflare.com/workers/observability/traces/" target="_blank" rel="noopener noreferrer">
+            {adminMonitorLocale.perfTraceDocs}
+          </a>
+        </p>
+      </div>
+      {/* The profiling section (the pprof adapter). */}
+      <h4 class="ui top attached header">{adminMonitorLocale.profileTitle}</h4>
+      <div class="ui attached segment">
+        {profileConfigured ? (
+          <>
+            <p>{adminMonitorLocale.profileConfiguredNote}</p>
+            <form method="get" action="/-/admin/monitor/profile" target="_blank">
+              <div class="ui form">
+                <div class="inline field">
+                  <label for="profile-type">{adminMonitorLocale.profileTypeLabel}</label>
+                  <select name="type" id="profile-type">
+                    <option value="cpu">cpu</option>
+                    <option value="heap">heap</option>
+                  </select>
+                </div>
+                <div class="inline field">
+                  <label for="profile-seconds">{adminMonitorLocale.profileSecondsLabel}</label>
+                  <input name="seconds" id="profile-seconds" size={3} maxlength={3} value="10" />
+                </div>
+                <button type="submit" class="ui primary small button">
+                  {adminMonitorLocale.profileDownload}
+                </button>
+              </div>
+            </form>
+          </>
+        ) : (
+          <p>{adminMonitorLocale.profileUnconfigured}</p>
+        )}
+      </div>
+      {/* The diagnosis section (the composite report's entrance). */}
+      <h4 class="ui top attached header">{adminMonitorLocale.diagnosisTitle}</h4>
+      <div class="ui attached segment">
+        <form method="get" action="/-/admin/monitor/diagnosis" target="_blank">
+          <button type="submit" class="ui primary small button">
+            {adminMonitorLocale.diagnosisReport}
+          </button>
+        </form>
+      </div>
     </AdminMonitorShell>
   );
 }
 
-export function renderAdminMonitorTracePage(options: { ctx: UiContext }): string {
-  return renderPage(<AdminMonitorTracePage ctx={options.ctx} />);
+export function renderAdminMonitorTracePage(options: { ctx: UiContext; platform?: AdminMonitorTracePlatform }): string {
+  return renderPage(<AdminMonitorTracePage ctx={options.ctx} platform={options.platform} />);
+}
+
+// ---------------------------------------------------------------------------
+// Diagnosis (GET /-/admin/monitor/diagnosis — the COMPOSITE report; upstream
+// MonitorDiagnosis streams a ZIP, ours renders the per-item status page —
+// the documented divergence: the status table IS the report)
+// ---------------------------------------------------------------------------
+
+/** One report item — SOURCE + collection time + availability status (the
+ *  freeze's binding triple). `unavailable ≠ 0`: an unreadable item carries
+ *  status "unavailable" + the reason, NEVER a fabricated zero detail. */
+export interface AdminMonitorDiagnosisItem {
+  key: string;
+  label: string;
+  /** Where the value came from (the source column, verbatim). */
+  source: string;
+  collectedAt: Date;
+  status: "available" | "unavailable";
+  /** The environment-status dimension for platform items (null for the
+   *  local D1 items — they have no platform posture). */
+  statusDimension: MonitorPlatformStatus | null;
+  /** The value summary (available only). */
+  detail: string | null;
+  /** The reason (unavailable only). */
+  unavailableReason: string | null;
+}
+
+export interface AdminMonitorDiagnosisData {
+  collectedAt: Date;
+  items: AdminMonitorDiagnosisItem[];
+}
+
+/** The diagnosis loader's options — the platform reads ride the same seams
+ *  as the manage page (fetchImpl for tests; now for the collection stamps). */
+export interface AdminMonitorDiagnosisOptions {
+  now?: Date;
+  fetchImpl?: FetchImpl;
+}
+
+/**
+ * The composite report loader (SPEC-0021 §5). Per-item SOURCE + collection
+ * time + availability:
+ *
+ *   queue-consumer:<name>  the Cloudflare Queues API read per allowlisted
+ *                          entry — the QUEUE TRUTH (max_concurrency et al).
+ *                          Unconfigured platform → ONE unavailable item
+ *                          (never a per-queue row of zeros).
+ *   d1-mirror:<name>       the landed D1 depth derivation per landed queue —
+ *                          CLEARLY labeled the business mirror, NOT the
+ *                          queue truth (the module header's adjudication);
+ *                          always available (the D1 read is local).
+ *   recent-errors          the cron_state error record (Workers Logs have
+ *                          no query API — the landed error surface is the
+ *                          honest substitute); a read store with zero
+ *                          errors is a REAL zero, not a fabricated one.
+ *   deployment-version     the Deployments API's serving deployment (the
+ *                          profile token's Workers Scripts Read covers it).
+ *   profiling              the Profiling arm's availability only — the
+ *                          report never triggers a capture (that's the
+ *                          trace page's bounded form).
+ */
+export async function loadAdminMonitorDiagnosis(
+  env: Env,
+  d1: D1Database,
+  options: AdminMonitorDiagnosisOptions = {},
+): Promise<AdminMonitorDiagnosisData> {
+  const now = options.now ?? new Date();
+  const config = monitorPlatformConfigFromEnv(env);
+  const items: AdminMonitorDiagnosisItem[] = [];
+
+  // --- the queue truth (the platform reads) -------------------------------
+  const queueTargets = [...config.queueTargets.values()];
+  const platformReady = config.queueAllowlistError === null && config.accountId !== undefined && config.accountId !== "" && config.queuesToken !== undefined && config.queuesToken !== "";
+  if (queueTargets.length === 0 || !platformReady) {
+    items.push({
+      key: "queue-consumers",
+      label: "Queue consumers (Cloudflare queue truth)",
+      source: adminMonitorLocale.diagnosisQueueTruthSource,
+      collectedAt: now,
+      status: "unavailable",
+      statusDimension: "unconfigured",
+      detail: null,
+      unavailableReason:
+        config.queueAllowlistError ??
+        (queueTargets.length === 0
+          ? "no queue consumer entries in the server-side allowlist (MONITOR_QUEUE_CONSUMERS)"
+          : "the queue platform arm needs CLOUDFLARE_ACCOUNT_ID and the CLOUDFLARE_QUEUES_TOKEN secret"),
+    });
+  } else {
+    for (const target of queueTargets) {
+      const read = await readQueueConsumer({
+        accountId: config.accountId!,
+        apiToken: config.queuesToken,
+        target,
+        fetchImpl: options.fetchImpl,
+      });
+      const classified = classifyPlatformStatus(read);
+      items.push({
+        key: `queue-consumer:${target.key}`,
+        label: `Queue consumer ${target.key} (Cloudflare queue truth)`,
+        source: adminMonitorLocale.diagnosisQueueTruthSource,
+        collectedAt: now,
+        status: read.kind === "ok" ? "available" : "unavailable",
+        statusDimension: classified.status,
+        detail:
+          read.kind === "ok"
+            ? `max_concurrency ${maxConcurrencyText(read.settings.maxConcurrency)}, batch_size ${read.settings.batchSize ?? "-"}, max_retries ${read.settings.maxRetries ?? "-"}, DLQ ${read.settings.deadLetterQueue || "-"}`
+            : null,
+        unavailableReason: read.kind === "ok" ? null : (classified.detail ?? read.kind),
+      });
+    }
+  }
+
+  // --- the D1 business mirror (NOT the queue truth — labeled) -------------
+  const depth = await queueDepthByState(drizzle(d1));
+  const depthItems: Array<{ name: string; inQueue: number | null }> = [
+    {
+      name: "webhook-delivery",
+      inQueue: (depth.deliveryByState.get("pending") ?? 0) + (depth.deliveryByState.get("delivering") ?? 0),
+    },
+    {
+      name: "repo-tasks",
+      inQueue: (depth.mirrorByState.get("queued") ?? 0) + (depth.mirrorByState.get("syncing") ?? 0),
+    },
+    { name: "webhook-delivery-dlq", inQueue: null },
+  ];
+  for (const row of depthItems) {
+    items.push({
+      key: `d1-mirror:${row.name}`,
+      label: `${row.name} in-flight (D1 business mirror)`,
+      source: adminMonitorLocale.diagnosisD1MirrorSource,
+      collectedAt: now,
+      status: "available",
+      statusDimension: null,
+      detail: row.inQueue === null ? "no landed counter (the DLQ's rows are unreachable from D1)" : `${row.inQueue} in-flight rows (business state)`,
+      unavailableReason: null,
+    });
+  }
+
+  // --- recent errors (the landed error surface) ---------------------------
+  const state = await listCronState(d1);
+  const errorEntries = [...state.values()].filter((row) => row.lastError !== null && row.lastError !== "");
+  items.push({
+    key: "recent-errors",
+    label: "Recent errors (cron arms)",
+    source: adminMonitorLocale.diagnosisCronErrorsSource,
+    collectedAt: now,
+    status: "available",
+    statusDimension: null,
+    detail:
+      errorEntries.length === 0
+        ? adminMonitorLocale.diagnosisCronErrorsNone
+        : errorEntries.map((row) => `${row.arm}: ${row.lastError}`).join("; ").slice(0, 400),
+    unavailableReason: null,
+  });
+
+  // --- the deployment version (the serving deployment) --------------------
+  const deployment = await readLatestDeployment({
+    accountId: config.accountId,
+    apiToken: config.profileToken,
+    workerName: config.workerName,
+    fetchImpl: options.fetchImpl,
+  });
+  const deploymentClassified = classifyPlatformStatus(deployment);
+  items.push({
+    key: "deployment-version",
+    label: "Deployment version (serving)",
+    source: adminMonitorLocale.diagnosisDeploymentSource,
+    collectedAt: now,
+    status: deployment.kind === "ok" && deployment.result !== null ? "available" : "unavailable",
+    statusDimension: deploymentClassified.status,
+    detail:
+      deployment.kind === "ok" && deployment.result !== null
+        ? `deployment ${deployment.result.id.slice(0, 8)}…, version ${deployment.result.versions[0]?.versionId.slice(0, 8) ?? "?"}… at ${deployment.result.versions[0]?.percentage ?? "?"}%, created ${deployment.result.createdOn ?? "?"}${deployment.result.source !== null ? `, source ${deployment.result.source}` : ""}`
+        : null,
+    unavailableReason:
+      deployment.kind === "ok" && deployment.result === null ? "the Deployments API answered with no deployments" : deployment.kind === "ok" ? null : (deploymentClassified.detail ?? deployment.kind),
+  });
+
+  // --- the profiling arm's availability (never a capture here) ------------
+  const profilingConfigured = config.accountId !== undefined && config.accountId !== "" && config.profileToken !== undefined && config.profileToken !== "";
+  items.push({
+    key: "profiling",
+    label: "Profiling (pprof)",
+    source: adminMonitorLocale.diagnosisProfilingSource,
+    collectedAt: now,
+    status: profilingConfigured ? "available" : "unavailable",
+    statusDimension: profilingConfigured ? "available" : "unconfigured",
+    detail: profilingConfigured ? adminMonitorLocale.diagnosisProfilingArmed : null,
+    unavailableReason: profilingConfigured ? null : "no CLOUDFLARE_PROFILE_TOKEN / CLOUDFLARE_ACCOUNT_ID — the Workers Profiling API is not wired",
+  });
+
+  return { collectedAt: now, items };
+}
+
+/** The diagnosis page (the per-item status table IS the report — upstream's
+ *  ZIP divergence is documented in the module header). */
+export function AdminMonitorDiagnosisPage(props: { ctx: UiContext; data: AdminMonitorDiagnosisData }) {
+  return (
+    <AdminMonitorShell ctx={props.ctx} title={adminMonitorLocale.diagnosisTitle} active="trace">
+      <h4 class="ui top attached header">{adminMonitorLocale.diagnosisTitle}</h4>
+      <div class="ui attached table segment">
+        <table class="ui very basic table unstackable">
+          <thead>
+            <tr>
+              <th>{adminMonitorLocale.diagnosisColHeader}</th>
+              <th>{adminMonitorLocale.diagnosisSourceHeader}</th>
+              <th>{adminMonitorLocale.diagnosisCollectedHeader}</th>
+              <th>{adminMonitorLocale.diagnosisStatusHeader}</th>
+              <th>{adminMonitorLocale.diagnosisDetailHeader}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {props.data.items.map((item) => (
+              <tr>
+                <td>{item.label}</td>
+                <td>{item.source}</td>
+                <td>{formatMonitorFullTime(item.collectedAt)}</td>
+                <td>
+                  {item.status === "available" ? (
+                    <>
+                      {adminMonitorLocale.diagnosisAvailable}
+                      {item.statusDimension !== null && item.statusDimension !== "available" ? (
+                        <span class="tw-ml-2">({monitorEnvStatusLabel(item.statusDimension)})</span>
+                      ) : null}
+                    </>
+                  ) : (
+                    <>
+                      <strong>{adminMonitorLocale.diagnosisUnavailable}</strong>
+                      {item.statusDimension !== null ? (
+                        <span class="tw-ml-2">({monitorEnvStatusLabel(item.statusDimension)})</span>
+                      ) : null}
+                    </>
+                  )}
+                </td>
+                <td>{item.status === "available" ? item.detail : item.unavailableReason}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div class="ui attached segment">
+        <p>{adminMonitorLocale.diagnosisD1MirrorNote}</p>
+      </div>
+    </AdminMonitorShell>
+  );
+}
+
+export function renderAdminMonitorDiagnosisPage(options: { ctx: UiContext; data: AdminMonitorDiagnosisData }): string {
+  return renderPage(<AdminMonitorDiagnosisPage ctx={options.ctx} data={options.data} />);
+}
+
+// ---------------------------------------------------------------------------
+// The profile download (GET /-/admin/monitor/profile — the pprof adapter's
+// route body, module-side so the fold's handler stays thin)
+// ---------------------------------------------------------------------------
+
+/** The route-shaped answer for the profile trigger: the redirect arm lands
+ *  back on the trace page (a bad binding, an unconfigured token, or any
+ *  degraded platform outcome — the console carries the reason, the admin
+ *  sees the posture there); the download arm carries the VERIFIED gzipped
+ *  pprof bytes + the attachment filename. */
+export type AdminMonitorProfileDownload =
+  | { kind: "redirect" }
+  | { kind: "download"; bytes: Uint8Array; filename: string };
+
+/**
+ * The profile trigger (upstream's GET-download posture — MonitorDiagnosis is
+ * a GET): parse the params (type cpu|heap, seconds → duration_ms within the
+ * platform's 1..50 s), resolve the serving version from the deployments
+ * read when it answers (the documented "latest" fallback otherwise), POST
+ * the profile, and verify the bytes (size cap + gzip magic — profile.ts's
+ * validation split). The binary is NEVER logged — outcomes are kinds and
+ * byte counts only.
+ */
+export async function applyAdminMonitorProfileDownload(
+  env: Env,
+  params: URLSearchParams,
+  options: { now?: Date; fetchImpl?: FetchImpl } = {},
+): Promise<AdminMonitorProfileDownload> {
+  const now = options.now ?? new Date();
+  const parsed = parseMonitorProfileParams(params);
+  const config = monitorPlatformConfigFromEnv(env);
+  if (parsed === null || config.accountId === undefined || config.accountId === "" || config.profileToken === undefined || config.profileToken === "") {
+    return { kind: "redirect" };
+  }
+  // The serving version when the deployments read answers; "latest" (the
+  // documented fallback — most recently CREATED, not necessarily deployed)
+  // otherwise.
+  let versionId: string | undefined;
+  const deployment = await readLatestDeployment({
+    accountId: config.accountId,
+    apiToken: config.profileToken,
+    workerName: config.workerName,
+    fetchImpl: options.fetchImpl,
+  });
+  if (deployment.kind === "ok" && deployment.result !== null && deployment.result.versions[0]?.versionId) {
+    versionId = deployment.result.versions[0].versionId;
+  }
+  const profile = await requestWorkerProfile({
+    accountId: config.accountId,
+    apiToken: config.profileToken,
+    workerName: config.workerName,
+    versionId,
+    type: parsed.type,
+    durationMs: parsed.durationMs,
+    fetchImpl: options.fetchImpl,
+  });
+  if (profile.kind !== "ok") {
+    // The reason goes to the console (observability) — the flash-less GET
+    // download has no error page upstream either; the redirect lands on the
+    // trace page whose sections state the posture.
+    console.error(`[monitor] profile trigger degraded: ${profile.kind}`);
+    return { kind: "redirect" };
+  }
+  return { kind: "download", bytes: profile.bytes, filename: profileFilename(parsed.type, now) };
 }

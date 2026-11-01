@@ -361,7 +361,7 @@ describe("loadAdminMonitorStats (GetStatistic's landed-table subset, sorted keys
 const NOW = new Date("2026-01-01T12:07:33Z");
 
 describe("loadAdminMonitorCron (the FULL landed arm census — the usability F3 listing)", () => {
-  it("carries all ten landed arms with their wrangler schedules in registry order", () => {
+  it("carries all ELEVEN landed arms with their wrangler schedules in registry order", () => {
     const { entries } = loadAdminMonitorCron(NOW);
     expect(entries.map((entry) => [entry.name, entry.spec])).toEqual([
       ["update_mirrors", "*/10 * * * *"],
@@ -372,6 +372,7 @@ describe("loadAdminMonitorCron (the FULL landed arm census — the usability F3 
       ["delete_old_audit_events", "0 * * * *"],
       ["cleanup_packages", "0 * * * *"],
       ["cleanup_actions", "0 * * * *"],
+      ["auto_merge_due_scan", "0 * * * *"],
       ["cancel_abandoned_jobs", "0 * * * *"],
       ["cleanup_ephemeral_runners", "0 * * * *"],
     ]);
@@ -887,7 +888,7 @@ describe("the monitor family DOM (templates/admin/*.tmpl at the pin)", () => {
     // No tab strip, no cancel link-actions, no diagnosis form, no counts.
     expect(html).not.toContain("Goroutines");
     expect(html).not.toContain("link-action");
-    expect(html).not.toContain("/-/admin/monitor/diagnosis");
+    expect(html).toContain("/-/admin/monitor/diagnosis");
     expect(html).not.toContain("/-/admin/monitor/perftrace");
     expect(html).not.toContain("cancel/");
   });
@@ -936,14 +937,17 @@ describe("loadAdminMonitorQueueDetail (QueueManage over the landed registry)", (
     expect(delivery).toEqual({
       queue: { name: "webhook-delivery", type: "cloudflare-queue", inQueue: 0 },
       purgeable: false,
+      platform: { status: "unconfigured", detail: adminMonitorLocale.platformNotWired, targetPresent: false, declaredMaxConcurrency: null, runtime: null, collectedAt: null },
     });
     expect(tasks).toEqual({
       queue: { name: "repo-tasks", type: "cloudflare-queue", inQueue: 0 },
       purgeable: true,
+      platform: { status: "unconfigured", detail: adminMonitorLocale.platformNotWired, targetPresent: false, declaredMaxConcurrency: null, runtime: null, collectedAt: null },
     });
     expect(dlq).toEqual({
       queue: { name: "webhook-delivery-dlq", type: "cloudflare-queue", inQueue: null },
       purgeable: false,
+      platform: { status: "unconfigured", detail: adminMonitorLocale.platformNotWired, targetPresent: false, declaredMaxConcurrency: null, runtime: null, collectedAt: null },
     });
   });
 
@@ -1055,12 +1059,17 @@ describe("the queue manage DOM (queue_manage.tmpl reduced)", () => {
     expect(html).toContain('method="post"');
     expect(html).toContain('class="ui tiny basic red button"');
     expect(html).toContain(`>${adminMonitorLocale.queueRemoveAll}</button>`);
-    // NO Pool Settings form anywhere (the /set arm unclaimed — no knob).
+    // The Pool Settings section renders as the PLATFORM ADAPTER's
+    // unconfigured state (the /set arm's environment-status dimension —
+    // SPEC-0021 §6: no form without an allowlist entry, the honest
+    // not-wired posture instead of the old reduction note).
+    expect(html).toContain("Pool Settings");
+    expect(html).toContain(adminMonitorLocale.platformNotWired);
     expect(html).not.toContain("max-number");
     expect(html).not.toContain("/set");
-    // The cf-gitea reduction note segment (apostrophe-free substrings — the
+    // The shared explanation segment (apostrophe-free substrings — the
     // render escapes "upstream's" to &#39;).
-    expect(html).toContain("Pool settings (worker counts) have no cf-gitea source");
+    expect(html).toContain("Worker-pool settings ride the Cloudflare Queues consumer API");
     expect(html).toContain("its queue items are the delivery log rows themselves");
     expect(html).toContain("and no purge substrate.");
     // The nav: the queue item active, the group open (the handoff's
