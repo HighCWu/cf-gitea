@@ -72,7 +72,17 @@
  *                  user-settings account/notifications tabs (read-only — the
  *                  POST arms are NOT probed), the milestone list→detail
  *                  round-trip, and the issue content-history list tail (the
- *                  {"results":null} pre-edit empty arm). Like
+ *                  {"results":null} pre-edit empty arm). The 6a91a5c wave's
+ *                  five newly-armed routes ride HARD asserts (committed =
+ *                  live; no mount-timing warn): the editor upload staging
+ *                  pair (upload-file 200 {"uuid"} → upload-remove 204 →
+ *                  anonymous 404), the verb-first unpin DELETE (204 +
+ *                  anonymous 303), the four-segment tracked-time delete
+ *                  (API-seeded → 303 → gone), the _cherrypick form (200 at
+ *                  the underscore spelling, bare /cherrypick/ 404), and the
+ *                  package settings pair (200 after the F1 registration
+ *                  reorder, the anonymous 404, the settings-form delete as
+ *                  self-cleanup). Like
  *                  window2-mounts, every surface reads the mount state AT RUN
  *                  TIME: a 404 (or, for the profile tabs, a 200 that is
  *                  still the inert repositories view) is the documented
@@ -83,7 +93,8 @@
  *                  both DELETEd on green (the issue/milestone/wiki-page rows
  *                  cascade with the repo), so cleanup-audit needs no new
  *                  residue expectations; a red run sweeps both (the
- *                  failureTail).
+ *                  failureTail) plus the settings probe's generic package
+ *                  (owner-scoped — the management-API delete).
  *   fixwave-parity The RD23 fix wave's LIVE parity matrix — one probe family
  *                  per landed behavior (each self-cleans; see the battery
  *                  section below for the per-family shapes): the PR head-sync
@@ -114,7 +125,13 @@
  *                  the merge approval gate (PR into the protected branch →
  *                  405 "Does not have enough approvals" → an ADMIN-minted
  *                  write collaborator's official APPROVED review → merge 200,
- *                  main advanced), and the whitelist/enforce-admins flag set
+ *                  main advanced), the MWCS schedule+cancel round-trip over
+ *                  that same protected PR (the 201 schedule / 409
+ *                  already-scheduled / 204 cancel / bare-404 re-cancel
+ *                  ladder — the RACE-FREE target: the unmet
+ *                  required_approvals keeps the consume-time re-check
+ *                  skipping, and a skip leaves the row scheduled), and the
+ *                  whitelist/enforce-admins flag set
  *                  round-tripping the serializer (glob name → branch_name "",
  *                  the M4 sanitizer keeps the owner, the enable_push=false
  *                  cascade). CHAINED (shared fixtures). Needs an ADMIN PAT
@@ -2241,11 +2258,19 @@ const window2FailureCleanup = async (ctx) => {
  *
  * Fixtures: ONE public auto_init probe repo (the feeds' non-empty gate, the
  * wiki page, the issue, the milestone) + ONE empty public repo (the feeds'
- * MustBeNotEmpty 404 arm). A green run deletes both repos — the
- * issue/milestone/wiki-page rows cascade with the repo delete (services
- * deleteRepository's batch) and the wiki cell follows the repo's engine
- * cleanup — so the battery leaves NO D1 residue and cleanup-audit needs no
- * new expectations. A red run sweeps both repos (the failureTail).
+ * MustBeNotEmpty 404 arm). The 6a91a5c wave's five newly-armed routes ride
+ * at the END of the chain with HARD asserts (committed = live): the editor
+ * upload staging pair, the verb-first unpin DELETE, the four-segment
+ * tracked-time delete POST (an API-seeded entry, self-cleaning), the
+ * _cherrypick form (the underscore spelling; the bare head 404s through the
+ * engine), and the package settings pair (a PAT-uploaded generic package;
+ * the settings-form delete IS the cleanup — packages are owner-scoped, so
+ * the tail sweeps the package by name if a red strikes first). A green run
+ * deletes both repos — the issue/milestone/wiki-page rows cascade with the
+ * repo delete (services deleteRepository's batch) and the wiki cell follows
+ * the repo's engine cleanup — so the battery leaves NO D1 residue and
+ * cleanup-audit needs no new expectations. A red run sweeps both repos plus
+ * the probe package (the failureTail).
  */
 
 /** The wiki page content pushed through the LANDED web writer
@@ -2260,6 +2285,9 @@ const window3Context = () => ({
   repo: `w3-${hexId()}`, emptyRepo: `w3e-${hexId()}`,
   issueNumber: null, milestoneId: null, milestoneTitle: `w3m-${hexId()}`,
   wikiEtag: null,
+  // the w3-package-settings-roundtrip fixture (owner-scoped — the repo
+  // deletes NEVER touch packages, so the tail sweeps it by name)
+  probePackage: null, probePackageGone: false,
   repoCreated: false, repoFullName: null, repoGone: false,
   emptyCreated: false, emptyFullName: null, emptyGone: false,
 });
@@ -2683,6 +2711,147 @@ const window3Steps = (ctx) => [
     },
   },
   {
+    id: "w3-upload-staging-roundtrip",
+    expect: `the editor upload staging pair (web.go:1472-1474's POST tails, armed at 6a91a5c F2): cookie POST ${"{owner}/{repo}"}/upload-file (multipart "file", a tiny .txt) → 200 {"uuid"}; cookie POST /upload-remove (file=<uuid>) → 204 (missing-tolerant upstream shape); ANONYMOUS POST /upload-file → 404 (reqRepoCodeWriter rides the handler — the 404 shell)`,
+    run: async () => {
+      expect(typeof ctx.cookie === "string", "no login cookie from the prior arms (fixture missing)");
+      const boundary = `w3form${hexId(12)}`;
+      const uploadBody = (name) => Buffer.concat([
+        Buffer.from(`--${boundary}\r\ncontent-disposition: form-data; name="file"; filename="${name}"\r\ncontent-type: text/plain\r\n\r\n`, "utf8"),
+        Buffer.from(`window3 upload staging probe ${hexId()}\n`, "utf8"),
+        Buffer.from(`\r\n--${boundary}--\r\n`, "utf8"),
+      ]);
+      const put = await fetchT(`${opts.baseUrl}/${ctx.user}/${ctx.repo}/upload-file`, {
+        method: "POST",
+        headers: { cookie: ctx.cookie, origin: opts.baseUrl, "content-type": `multipart/form-data; boundary=${boundary}` },
+        body: uploadBody(`w3-${hexId()}.txt`),
+      });
+      const putText = await put.text();
+      expect(put.status === 200, `upload-file status ${put.status} (expected 200 with {"uuid"}): ${putText.slice(0, 120)}`);
+      let uuid = null;
+      try { uuid = JSON.parse(putText)?.uuid ?? null; } catch { /* the assert reports the raw body */ }
+      expect(typeof uuid === "string" && uuid.length > 0, `no uuid in the body: ${putText.slice(0, 120)}`);
+      const remove = await fetchT(`${opts.baseUrl}/${ctx.user}/${ctx.repo}/upload-remove`, {
+        method: "POST",
+        headers: { cookie: ctx.cookie, origin: opts.baseUrl, "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ file: uuid }).toString(),
+      });
+      await remove.text();
+      expect(remove.status === 204, `upload-remove status ${remove.status} (expected 204): ${remove.status === 403 ? "the sameOriginGuard rejected a same-origin POST" : ""}`);
+      const anon = await fetchT(`${opts.baseUrl}/${ctx.user}/${ctx.repo}/upload-file`, {
+        method: "POST",
+        headers: { "content-type": `multipart/form-data; boundary=${boundary}` },
+        body: uploadBody(`w3-${hexId()}.txt`),
+      });
+      await anon.text();
+      expect(anon.status === 404, `anonymous upload-file status ${anon.status} (expected 404 — the writer predicate's shell)`);
+      return `200 {"uuid"} → 204 remove → anonymous 404 (the staging pair round-trips; the staged row is deleted)`;
+    },
+  },
+  {
+    id: "w3-issue-unpin-204",
+    expect: `the unpin DELETE (web.go:1404's verb-first /{family}/unpin/{index} group root, armed at 6a91a5c F3 — the index-FIRST shape is upstream's 404): cookie+Origin DELETE ${"{owner}/{repo}"}/issues/unpin/${"{index}"} → 204 (idempotent — unpinning a never-pinned issue still 204s); ANONYMOUS DELETE → 303 onto the exact /login?redirect_to=<encoded path> round-trip`,
+    run: async () => {
+      expect(Number.isInteger(ctx.issueNumber), "no issue fixture from the prior arms (fixture missing)");
+      const unpinPath = `/${ctx.user}/${ctx.repo}/issues/unpin/${ctx.issueNumber}`;
+      const del = await fetchT(`${opts.baseUrl}${unpinPath}`, {
+        method: "DELETE", headers: { cookie: ctx.cookie, origin: opts.baseUrl },
+      });
+      await del.text();
+      expect(del.status === 204, `unpin status ${del.status} (expected 204): ${del.status === 403 ? "the sameOriginGuard rejected a same-origin DELETE" : ""}`);
+      const anon = await fetchT(`${opts.baseUrl}${unpinPath}`, { method: "DELETE" });
+      await anon.text();
+      expect(anon.status === 303, `anonymous unpin status ${anon.status} (expected 303 — the login redirect)`);
+      expect(anon.headers.get("location") === `/login?redirect_to=${encodeURIComponent(unpinPath)}`,
+        `location ${JSON.stringify(anon.headers.get("location"))} (expected /login?redirect_to=${encodeURIComponent(unpinPath)})`);
+      return `204 unpin (idempotent) → anonymous 303 /login?redirect_to=…`;
+    },
+  },
+  {
+    id: "w3-time-delete-roundtrip",
+    expect: `the tracked-time delete POST (web.go:1379's four-segment /{index}/times/{timeid}/delete, armed at 6a91a5c F4 — the truncating length-3 tail is upstream's 404): API POST …/issues/${"{index}"}/times {"time":900} → 200 with the entry id; cookie+Origin POST …/times/${"{id}"}/delete → 303 onto the canonical issue path; the API list is EMPTY after (the entry gone — the round-trip self-cleans)`,
+    run: async () => {
+      expect(Number.isInteger(ctx.issueNumber), "no issue fixture from the prior arms (fixture missing)");
+      const timesPath = `/repos/${ctx.user}/${ctx.repo}/issues/${ctx.issueNumber}/times`;
+      const add = await api(timesPath, { method: "POST", body: { time: 900 } });
+      expect(add.status === 200, `time add status ${add.status} (expected 200): ${add.text.slice(0, 120)}`);
+      expect(Number.isInteger(add.json?.id), `no tracked-time id in the add body: ${add.text.slice(0, 120)}`);
+      const timeId = add.json.id;
+      const del = await fetchT(`${opts.baseUrl}/${ctx.user}/${ctx.repo}/issues/${ctx.issueNumber}/times/${timeId}/delete`, {
+        method: "POST", headers: { cookie: ctx.cookie, origin: opts.baseUrl },
+      });
+      await del.text();
+      expect(del.status === 303, `time-delete status ${del.status} (expected 303): ${del.status === 403 ? "the sameOriginGuard rejected a same-origin POST" : ""}`);
+      expect(del.headers.get("location") === `/${ctx.user}/${ctx.repo}/issues/${ctx.issueNumber}`,
+        `location ${JSON.stringify(del.headers.get("location"))} (expected the canonical issue path)`);
+      const after = await api(timesPath);
+      expect(after.status === 200 && Array.isArray(after.json) && after.json.length === 0,
+        `the times list after delete: ${after.status} ${after.text.slice(0, 120)} (expected [])`);
+      return `200 add → 303 delete → the entry gone (the four-segment spelling deletes; the bare /{index}/times/{id} tail stays upstream's 404)`;
+    },
+  },
+  {
+    id: "w3-cherrypick-form-200",
+    expect: `the cherrypick editor form (the 6a91a5c F5 rename — upstream's OWN underscore spelling, web.go:1468's {editor_action:_cherrypick}): cookie GET ${"{owner}/{repo}"}/_cherrypick/{sha}/{branch} → 200 text/html with class="repository file editor edit" + the form action carrying /_cherrypick/{sha}/{branch}; the BARE /cherrypick/{sha}/{branch} → 404 (engine-owned now — the underscore is the only editor_action)`,
+    run: async () => {
+      expect(typeof ctx.cookie === "string", "no login cookie from the prior arms (fixture missing)");
+      const branches = await api(`/repos/${ctx.user}/${ctx.repo}/branches`);
+      expect(branches.status === 200 && Array.isArray(branches.json) && branches.json.length > 0,
+        `branches list ${branches.status}: ${branches.text.slice(0, 120)}`);
+      const row = branches.json.find((b) => b?.name === "main") ?? branches.json[0];
+      const sha = row?.commit?.id;
+      expect(typeof sha === "string" && /^[a-f0-9]{7,64}$/.test(sha), `no commit sha on the branch list: ${branches.text.slice(0, 160)}`);
+      const branch = String(row?.name ?? "main");
+      const get = await fetchT(`${opts.baseUrl}/${ctx.user}/${ctx.repo}/_cherrypick/${sha}/${branch}`, { headers: { cookie: ctx.cookie } });
+      const body = await get.text();
+      expect(get.status === 200, `_cherrypick GET status ${get.status} (expected 200 — the form render): ${body.slice(0, 120)}`);
+      expect(body.includes(`class="repository file editor edit"`), "the cherrypick pageClass discriminator is missing");
+      expect(body.includes(`action="/${ctx.user}/${ctx.repo}/_cherrypick/${sha}/${branch}"`),
+        `the form action does not carry the underscore spelling (the 6a91a5c rename)`);
+      const bare = await fetchT(`${opts.baseUrl}/${ctx.user}/${ctx.repo}/cherrypick/${sha}/${branch}`, { headers: { cookie: ctx.cookie } });
+      await bare.text();
+      expect(bare.status === 404, `bare cherrypick status ${bare.status} (expected 404 — the bare head is engine-owned since the rename)`);
+      return `200 form at /_cherrypick/{sha}/${branch} (pageClass + the underscore form action); bare /cherrypick/ 404`;
+    },
+  },
+  {
+    id: "w3-package-settings-roundtrip",
+    expect: `the package settings pair (web.go:1121-1127's write-gated GET+POST at /settings/{type}/{name}, armed at 6a91a5c F1 — the registration reorder that stopped :version absorbing the settings shape): PAT PUT /api/packages/${"{u}"}/generic/{name}/1.0.0/probe.txt → 201; cookie GET ${"{u}"}/-/packages/settings/generic/{name} → 200 with the settings form (pre-6a91a5c this 404-shelled through the version view); ANONYMOUS GET → 404 (the write gate's shell, never a login redirect); cookie POST action=delete&package_name={name} → 303 onto /{u}/-/packages (the settings-form delete IS the cleanup); the re-GET → 404 (the package is gone)`,
+    run: async () => {
+      expect(typeof ctx.cookie === "string", "no login cookie from the prior arms (fixture missing)");
+      const pkg = `w3pkg-${hexId()}`;
+      const put = await fetchT(`${opts.baseUrl}/api/packages/${ctx.user}/generic/${pkg}/1.0.0/probe.txt`, {
+        method: "PUT", headers: { authorization: `token ${TOKEN}` },
+        body: Buffer.from(`window3 package-settings probe ${pkg}\n`, "utf8"),
+      });
+      const putText = await put.text();
+      expect(put.status === 201, `generic PUT status ${put.status} (expected 201): ${putText.slice(0, 120)}`);
+      ctx.probePackage = pkg; // the failure tail sweeps it if a later arm reds
+      const settingsPath = `/${ctx.user}/-/packages/settings/generic/${pkg}`;
+      const page = await fetchT(`${opts.baseUrl}${settingsPath}`, { headers: { cookie: ctx.cookie } });
+      const pageBody = await page.text();
+      expect(page.status === 200, `settings GET status ${page.status} (expected 200 — the settings pair must lead the :version patterns): ${pageBody.slice(0, 120)}`);
+      expect(pageBody.includes(`name="repo_name"`), "the settings form's repo_name field is missing");
+      const anon = await fetchT(`${opts.baseUrl}${settingsPath}`);
+      await anon.text();
+      expect(anon.status === 404, `anonymous settings GET status ${anon.status} (expected 404 — the write gate's 404 shell)`);
+      const del = await fetchT(`${opts.baseUrl}${settingsPath}`, {
+        method: "POST",
+        headers: { cookie: ctx.cookie, origin: opts.baseUrl, "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ action: "delete", package_name: pkg, repo_name: "" }).toString(),
+      });
+      await del.text();
+      expect(del.status === 303, `settings delete status ${del.status} (expected 303): ${del.status === 403 ? "the sameOriginGuard rejected a same-origin POST" : ""}`);
+      expect(del.headers.get("location") === `/${ctx.user}/-/packages`,
+        `location ${JSON.stringify(del.headers.get("location"))} (expected /${ctx.user}/-/packages)`);
+      const gone = await fetchT(`${opts.baseUrl}${settingsPath}`, { headers: { cookie: ctx.cookie } });
+      await gone.text();
+      expect(gone.status === 404, `settings GET after delete ${gone.status} (expected 404 — the package is gone)`);
+      ctx.probePackageGone = true;
+      return `201 PUT → 200 settings page → anonymous 404 → 303 form-delete → 404 after (the round-trip self-cleans at the package layer)`;
+    },
+  },
+  {
     id: "w3-cleanup-204",
     expect: `both probe repos DELETEd → 204 (the issue/milestone/wiki-page rows cascade with the repo delete; a failed cleanup is documented, not fatal; the failure-cleanup tail re-sweeps)`,
     run: async () => {
@@ -2725,6 +2894,17 @@ const window3FailureCleanup = async (ctx) => {
         acts.push(typeof out === "string" ? out : out.detail);
       } catch (err) {
         noteLeftBehind(`${t.what} ${owner}/${repo}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    // the settings probe's generic package (owner-scoped residue — the repo
+    // deletes never touch it; the management API delete is the sweep)
+    if (typeof ctx.probePackage === "string" && ctx.probePackageGone !== true) {
+      try {
+        const res = await api(`/packages/${opts.user}/generic/${ctx.probePackage}`, { method: "DELETE" });
+        if (res.status === 204) acts.push(`package ${ctx.probePackage} deleted (204)`);
+        else noteLeftBehind(`package ${ctx.probePackage}`, `DELETE returned ${res.status}`);
+      } catch (err) {
+        noteLeftBehind(`package ${ctx.probePackage}`, `DELETE threw: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
   } catch (err) {
@@ -3058,14 +3238,16 @@ const fixwaveSteps = (ctx) => [
   },
   {
     id: "fw-sudo-non-admin-403",
-    expect: `THE REFUSAL ARM: GET /user with the MEMBER's own PAT + Sudo → 403 "Only administrators allowed to sudo." (the exact upstream text)`,
+    expect: `THE REFUSAL ARM: GET /user with the MEMBER's own PAT + Sudo → 403 "Only administrators allowed to sudo." (the exact upstream text) carrying the BARE {message} body — NO url field (0bd7798: upstream's literal ctx.JSON, api.go:135-138, not the APIError wrapper)`,
     run: async () => {
       expect(ctx.memberToken !== null, "no member token from the prior arm (fixture missing)");
       const res = await api("/user", { asToken: ctx.memberToken, headers: { sudo: ctx.user } });
       expect(res.status === 403, `status ${res.status} (expected 403 — a non-admin never sudoes; an unmounted sudo() would answer 200)`);
       expect(res.json?.message === "Only administrators allowed to sudo.",
         `message ${JSON.stringify(res.json?.message)} (expected the exact upstream refusal)`);
-      return `403 "Only administrators allowed to sudo."`;
+      expect(res.json?.url === undefined,
+        `the body carried url ${JSON.stringify(res.json?.url)} — the APIError wrapper shape (0bd7798 dropped it: the bare {message} ctx.JSON is upstream's, api.go:135-138)`);
+      return `403 "Only administrators allowed to sudo." — the bare {message} body (no url)`;
     },
   },
   {
@@ -3623,6 +3805,35 @@ const branchProtectionSteps = (ctx) => [
       expect(res.json?.message === "Does not have enough approvals",
         `message ${JSON.stringify(res.json?.message)} (expected the verbatim upstream text)`);
       return `405 verbatim: ${res.json?.message}`;
+    },
+  },
+  {
+    id: "bp-automerge-roundtrip",
+    expect: `THE MWCS ROUND-TRIP over the protected PR (the schedule ladder the old stub never had): POST …/pulls/${"{N}"}/merge {"do":"merge","merge_when_checks_succeed":true} → 201 EMPTY (the schedule — the stub answered 409 "scheduled auto-merge is not supported" ALWAYS); the IMMEDIATE re-POST → 409 "pull request is already scheduled to auto merge when checks succeed…" (ErrAlreadyScheduledToAutoMerge — the API has NO delete-first); DELETE …/pulls/${"{N}"}/merge → 204 (the scheduler cancels freely); the re-DELETE → 404 "not found" (the BARE not-scheduled arm, not the pulls-route message)`,
+    run: async () => {
+      expect(Number.isInteger(ctx.prNumber), "no open PR from the prior arms (fixture missing)");
+      // The protected PR is the RACE-FREE schedule target: required_approvals
+      // 1 is unmet, so the consume-time General re-check answers the branch
+      // protections "Does not have enough approvals" → SKIP — and a skip
+      // LEAVES the row scheduled (never a merge under us, never a delete).
+      const schedule = await api(`/repos/${ctx.user}/${ctx.repo}/pulls/${ctx.prNumber}/merge`, {
+        method: "POST", body: { do: "merge", merge_when_checks_succeed: true },
+      });
+      expect(schedule.status === 201, `schedule status ${schedule.status} (expected 201 — the old 409-stub answer is gone): ${schedule.text.slice(0, 160)}`);
+      expect(schedule.text === "", `schedule body ${JSON.stringify(schedule.text.slice(0, 80))} (expected EMPTY — the bare Created)`);
+      const again = await api(`/repos/${ctx.user}/${ctx.repo}/pulls/${ctx.prNumber}/merge`, {
+        method: "POST", body: { do: "merge", merge_when_checks_succeed: true },
+      });
+      expect(again.status === 409, `re-schedule status ${again.status} (expected 409 — a standing row conflicts, the API keeps the row): ${again.text.slice(0, 160)}`);
+      expect(typeof again.json?.message === "string" && again.json.message.startsWith("pull request is already scheduled to auto merge when checks succeed"),
+        `message ${JSON.stringify(again.json?.message)} (expected ErrAlreadyScheduledToAutoMerge's text + the [pull_id: N] tail)`);
+      const cancel = await api(`/repos/${ctx.user}/${ctx.repo}/pulls/${ctx.prNumber}/merge`, { method: "DELETE" });
+      expect(cancel.status === 204, `cancel status ${cancel.status} (expected 204 — the scheduler cancels freely): ${cancel.text.slice(0, 160)}`);
+      const recancel = await api(`/repos/${ctx.user}/${ctx.repo}/pulls/${ctx.prNumber}/merge`, { method: "DELETE" });
+      expect(recancel.status === 404, `re-cancel status ${recancel.status} (expected 404 — nothing scheduled): ${recancel.text.slice(0, 160)}`);
+      expect(recancel.json?.message === "not found",
+        `message ${JSON.stringify(recancel.json?.message)} (expected the BARE "not found" — the cancel handler's own 404, different from the pulls GET routes' message)`);
+      return `201 schedule → 409 already-scheduled → 204 cancel → 404 bare not-found (the PR stays open for the approval arms; the consumer's protection skip keeps the row ours)`;
     },
   },
   {
@@ -8414,7 +8625,7 @@ const BATTERIES = {
   // tabs, admin lists, settings account/notifications) 404-degrade to warns
   // until the mount window deploys; anything mounted asserts hard. The wiki
   // page write + issue/milestone seeds ride LANDED routes (chain-hard).
-  "window3-mounts": { title: "window-3 mounts (feed tails, wiki raw, profile tabs, admin lists, settings account/notifications, milestone detail, content-history list)", context: window3Context, steps: window3Steps, failureTail: window3FailureCleanup },
+  "window3-mounts": { title: "window-3 mounts (feed tails, wiki raw, profile tabs, admin lists, settings account/notifications, milestone detail, content-history list, + the 6a91a5c newly-armed routes: upload staging, unpin, time-delete, _cherrypick, package settings)", context: window3Context, steps: window3Steps, failureTail: window3FailureCleanup },
   // Independent steps (the cleanup-audit precedent): each fix-wave family
   // reports its own verdict — a red family never chain-skips the rest of the
   // matrix (pre-RD23 every family legitimately reds; the post-deploy run is
@@ -8426,7 +8637,7 @@ const BATTERIES = {
   // that need it, like registry/generate; NOT independent like fixwave).
   // Needs an ADMIN PAT (the member-user arm) and wrangler auth for the
   // priority arm's rule-id lookup (--d1-scope picks the database).
-  "branch-protection": { title: "branch-protection flows (SPEC-0013: rule CRUD + priority, push-time per-ref rejection, merge approval gate 405→200, whitelist flag round-trip)", context: branchProtectionContext, steps: branchProtectionSteps, failureTail: branchProtectionFailureCleanup },
+  "branch-protection": { title: "branch-protection flows (SPEC-0013: rule CRUD + priority, push-time per-ref rejection, merge approval gate 405→200, MWCS schedule+cancel round-trip, whitelist flag round-trip)", context: branchProtectionContext, steps: branchProtectionSteps, failureTail: branchProtectionFailureCleanup },
   // Independent (the fixwave/cleanup-audit posture shape): every demo arm
   // reports its own verdict. The banner arm reads its surface AT RUN TIME —
   // a miss while the M2 wave is still in flight is the documented [warn]

@@ -24,7 +24,7 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
   `packages-distro`, `packages-protocols`, `packages-minor`,
   `packages-terraform`, `auth-oauth2`, `monitor-platform`, `cleanup-audit`,
   `all` (runs the 20 in that order, audit last). `all --dry-run` plans
-  **238 probes** across them (the counts in the table below were read off
+  **244 probes** across them (the counts in the table below were read off
   that dry-run at this writing; `registry` scales with `--trials`).
 - **The `cleanup-audit` battery is D1-only** (wrangler d1 execute, no HTTP): it
   takes neither `--base-url` nor `--token-file` — a missing token only errors
@@ -77,7 +77,7 @@ node scripts/deploy-probes.mjs cleanup-audit --d1-scope local --user dpprobe --e
 
 ## Batteries and their canonical expectations
 
-The registry at this writing — 20 batteries, **238 probes** (`all
+The registry at this writing — 20 batteries, **244 probes** (`all
 --dry-run`; `registry`'s count scales with `--trials`, here at its
 default 3):
 
@@ -90,9 +90,9 @@ default 3):
 | `mirror` | 8 | push-mirror registration-time SSRF egress gate + the `.invalid` sync-settle lifecycle | HTTP + **wrangler auth** (the row re-read rides `--d1-scope`) |
 | `ui-login` | 5 | the login-cookie methodology: anonymous vs owner labels view | HTTP (login cookie) |
 | `window2-mounts` | 22 | user-settings tab family: anon 303s, pageClass 200s, the secret round-trip, keys negative, last-owner flash | HTTP (login cookie) |
-| `window3-mounts` | 26 | feed tails, wiki raw bytes, profile tabs, admin lists, settings account/notifications, milestone detail, content-history list | HTTP (login cookie) |
+| `window3-mounts` | 31 | feed tails, wiki raw bytes, profile tabs, admin lists, settings account/notifications, milestone detail, content-history list + the 6a91a5c newly-armed routes (upload staging pair, unpin DELETE, tracked-time delete POST, _cherrypick form, package settings round-trip) | HTTP (login cookie) |
 | `fixwave-parity` | 22 | the RD23 parity matrix: PR head-sync, merged-PR 412, ghost-404, tag-only push-create, revoke mask, visibility ladder, sudo pair, session-rotation directive | HTTP + **ADMIN PAT** + **wrangler auth** (the rotation backdate + session-row sweep are D1 writes) |
-| `branch-protection` | 18 | SPEC-0013 flows: rule CRUD + priority swap, per-ref push rejection, approval gate 405→200, whitelist flag round-trip | HTTP + **ADMIN PAT** (the priority ids and slash-glob arm are pure API — no wrangler) |
+| `branch-protection` | 19 | SPEC-0013 flows: rule CRUD + priority swap, per-ref push rejection, approval gate 405→200, MWCS schedule+cancel round-trip, whitelist flag round-trip | HTTP + **ADMIN PAT** (the priority ids and slash-glob arm are pure API — no wrangler) |
 | `demo` | 4 | demo posture: committed-config machinery, `DEMO_MODE`-off default, open signup, the §4.4 banner ([warn] pre-M2) | HTTP against the demo instance; the TTL-mechanics arm is LOCAL-only (`--d1-scope local` + `DEMO_MODE=true` in `.dev.vars` against `pnpm dev`) |
 | `wiki-git` | 7 | the `.wiki.git` wire: REST page create → real clone carries the root commit → push → read-back → privacy tail → t+0 tombstone | HTTP |
 | `packages-registry` | 11 | all SIX protocols end-to-end (generic/pypi/npm/helm/maven/nuget) + the D1 row sweep + repo delete | HTTP + **wrangler auth** (the row sweep rides `--d1-scope`) |
@@ -103,7 +103,7 @@ default 3):
 | `auth-oauth2` | 20 | the OAuth2 provider W6 battery + the external-auth tail: the scripted third-party client (registration with the exactly-once secret → login session → the consent dance with in-script PKCE S256 → form + Basic exchanges → the dotted dispatch → userinfo (+PAT-401) → the offline JWKS verify (WebCrypto, id_token claims pinned) → refresh → introspect (active/junk/401) → the revoke-kills-token row delete → app delete + the D1 husk sweep) + the realm check + the discovery shape + the builtin seed + the external-auth source family | HTTP (login cookie + Bearer JWTs) + **wrangler auth** (the builtin-seed read, the revoke row delete, the husk sweep, and the source seed/cleanup ride `--d1-scope`; the discovery arm's issuer==origin assert keys off it) |
 | `monitor-platform` | 6 | SPEC-0021 §7's REAL-API closed loops: the `/set` closed loop (GET-save → SAFE modify → GET-verify → finally-RESTORE → re-verify; restore failure a BLOCKING red; serial-locked to ONE `MONITOR_QUEUE_CONSUMERS` entry) + the pprof content probe (cpu ≤ 5 s, 10 MiB cap → gunzip → minimal protobuf walk → sane fields, ONE 429 retry) | HTTP to **api.cloudflare.com** (NOT the deployment — the admin `/set` + `/profile` UI routes are the pending ui/index.ts fold, so the direct-API class stands in, documented admin-manual) + the arm tokens from the probe's OWN env (`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_QUEUES_TOKEN`, `CLOUDFLARE_PROFILE_TOKEN`, `MONITOR_QUEUE_CONSUMERS`, `MONITOR_WORKER_NAME` — the same names the Worker carries as secrets; absent = the arm `[warn]`-skips, never fake-green) |
 | `cleanup-audit` | 10 | post-run D1 count shapes (independent counts) | **D1-only** — wrangler auth, `--d1-scope remote\|local` (default remote); takes NEITHER `--base-url` NOR `--token-file` |
-| **`all`** | **238** | every battery in registry order, audit last | union of the above |
+| **`all`** | **244** | every battery in registry order, audit last | union of the above |
 
 Expectations are ported from `docs/design/p0-evidence.md` — the REDEPLOY13
 block (2026-10-26, ~lines 1507-1697) for the shallow trio, generate, ui-login,
@@ -297,7 +297,26 @@ prints all of them verbatim.
   the pageClass + probe rows, the anonymous login-303 arm), the user-settings
   account/notifications tabs (read-only — the POST arms are NOT probed), the
   milestone list→detail round-trip, and the issue content-history list tail
-  (the `{"results":null}` pre-edit empty arm). Login-cookie methodology first
+  (the `{"results":null}` pre-edit empty arm). The 6a91a5c wave's five
+  newly-armed routes ride HARD asserts (committed = live; no mount-timing
+  warn): the editor upload staging pair (cookie POST `upload-file` with a
+  tiny multipart file → 200 `{"uuid"}` → cookie POST `upload-remove` → 204
+  — the missing-tolerant upstream shape — and the ANONYMOUS upload-file →
+  404, `reqRepoCodeWriter` riding the handler), the verb-first unpin DELETE
+  (`/{owner}/{repo}/issues/unpin/{index}` → 204 idempotent, then the
+  anonymous 303 onto the exact `/login?redirect_to=` round-trip), the
+  four-segment tracked-time delete POST (an API-seeded 900-second entry →
+  cookie POST `/{index}/times/{id}/delete` → 303 onto the canonical issue
+  path → the API list empty after), the `_cherrypick` form (cookie GET
+  `/_cherrypick/{sha}/{branch}` → 200 with the
+  `repository file editor edit` pageClass + the underscore form action; the
+  bare `/cherrypick/` spelling → 404, engine-owned since the rename), and
+  the package settings pair (a PAT-uploaded generic package → cookie GET
+  `/{owner}/-/packages/settings/generic/{name}` → 200 — the F1 registration
+  reorder; anonymous → the write gate's 404, never a login redirect — then
+  the cookie POST `action=delete&package_name=…` → 303 onto
+  `/{owner}/-/packages` IS the cleanup, and the re-GET 404s). Login-cookie
+  methodology first
   (`POST /login` → `gitea_session`; a PAT header never reads a UI page); the
   wiki write arm sends a same-origin `Origin` header so it exercises §2.8's
   sameOriginGuard PASS arm. Like window2-mounts, every surface reads the
@@ -309,7 +328,9 @@ prints all of them verbatim.
   repo (the feeds' 404 arm) — both DELETEd on green (the issue/milestone/
   wiki-page rows cascade with the repo), so cleanup-audit needs no new
   residue expectations. **Failure cleanup (the consistency posture):** a
-  finally-style tail best-effort deletes both repos (logged on one
+  finally-style tail best-effort deletes both repos AND the settings probe's
+  generic package (owner-scoped — the repo deletes never touch packages; the
+  management-API delete is the sweep) (logged on one
   `[tail] w3-leftover-sweep` line; failures feed `left_behind`, never fatal;
   a green run no-ops silently). No extra options.
 - **fixwave-parity** — the RD23 fix wave's LIVE parity matrix, one probe
@@ -369,7 +390,18 @@ prints all of them verbatim.
   the sibling LANDS, and ls-remote pins main at the pre-push tip. **(c) the
   merge approval gate** — a PR into the protected branch (`required_approvals:
   1`) merges → **405** with the verbatim ErrNotReadyToMerge text "Does not
-  have enough approvals"; an ADMIN-minted second user (the fixwave member
+  have enough approvals"; **the MWCS schedule+cancel round-trip over that
+  same PR** (the RACE-FREE target: the unmet `required_approvals` keeps the
+  consume-time General re-check answering the protection skip, and a skip
+  LEAVES the row scheduled — never a merge under us, never a delete):
+  `POST …/pulls/{N}/merge {"do":"merge","merge_when_checks_succeed":true}` →
+  **201 EMPTY** (the old stub answered 409 "scheduled auto-merge is not
+  supported" ALWAYS) → the immediate re-POST → **409** "pull request is
+  already scheduled to auto merge when checks succeed [pull_id: N]"
+  (ErrAlreadyScheduledToAutoMerge — the API has NO delete-first) →
+  `DELETE …/pulls/{N}/merge` → **204** (the scheduler cancels freely) → the
+  re-DELETE → **404 "not found"** (the BARE not-scheduled arm, not the
+  pulls GET routes' message); then an ADMIN-minted second user (the fixwave member
   methodology: `POST /admin/users` → token mint over HTTP BASIC →
   `PUT …/collaborators {"permission":"write"}` → 204) submits an APPROVED
   review that lands `official:true` (write access is official without the
@@ -947,7 +979,9 @@ prints all of them verbatim.
     user's standing fixture — the next run 409s onto it).
   - `window2-mounts` — its secret by name (the user API DELETE), then its
     org; `[tail] w2-leftover-sweep`.
-  - `window3-mounts` — its two probe repos (content + empty);
+  - `window3-mounts` — its two probe repos (content + empty) and the
+    settings probe's generic package (owner-scoped — the repo deletes never
+    touch packages, so the management-API delete is the sweep);
     `[tail] w3-leftover-sweep`.
   - `fixwave-parity` — its repos, then the org, the member user (its PAT
     rows cascade), and the session row (the D1 delete);
