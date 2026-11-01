@@ -180,6 +180,13 @@ export const AuditActions = {
   RepositoryDelete: defineAction("repository:delete", "Deleted repository {scope}."),
   RepositoryName: defineAction("repository:name:update", "Changed repository name from {previous_name} to {scope}."),
   RepositoryVisibility: defineAction("repository:visibility:update", "Changed visibility of repository {scope} to {visibility}."),
+  // Upstream action.go:151 (its position is after the transfer block, before
+  // the collaborator block — the transfer rows are not registered here yet).
+  // The settings page's `delete-wiki` danger action's audit row; emitted at
+  // the wiki service's deleteWiki seam (upstream wiki.go:378
+  // `audit.Record(ctx, audit_model.RepositoryWikiDelete, repo)` — the
+  // sweep's final statement, reached even when the storage sweep failed).
+  RepositoryWikiDelete: defineAction("repository:wiki:delete", "Deleted wiki of repository {scope}."),
 } as const;
 
 // ---------------------------------------------------------------------------

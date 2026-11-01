@@ -32,6 +32,30 @@
  * routers/api/v1/repo/wiki.go ListWikiPages) — the codec keeps the original
  * segment instead, a name shape no wiki write can ever produce.
  *
+ * Engine-path seam (the slashed-title read asymmetry, U8's find): the write
+ * path stores the codec's GitPath segments as tree entry names VERBATIM
+ * (buildFileChangeCommit splits on literal "/" only — api/services/
+ * git-models.ts), while EVERY engine path read decodes per segment
+ * (decodePath — split "/", then decodeURIComponent each segment,
+ * packages/git-engine src/repo.ts). A slashed title ("guide/intro") thus
+ * stores the FLAT blob `guide%2Fintro.md` — upstream's exact legacy shape
+ * (wiki_path.go's own comment: "the old wiki code's behavior is always
+ * using %2F … so there are a lot of legacy `%2F` files in user wikis";
+ * upstream's git layer matches entry names literally, so it round-trips) —
+ * but a read that handed the codec name straight to the engine decoded it
+ * to `guide/intro.md` and never matched, so createWikiPage 500'd "wiki page
+ * vanished after create" AFTER the write landed (non-ASCII and
+ * punctuation-escaped titles were the same class). The fix at this seam is
+ * ONE shared encode, `enginePath` below: the codec's GitPath is already
+ * QueryEscaped (every "%" a valid escape, "/" escaped, spaces literal), so
+ * doubling its only meta-character ("%" → "%25") makes the engine's decode
+ * restore the codec's exact bytes — every read becomes an ENTRY-NAME-
+ * EQUALITY lookup of the flat stored name, and the log path filters match
+ * the same way. The write side keeps the codec names verbatim (the
+ * literal-split landing is what produces upstream's flat shape); the list
+ * arm stays symmetric for free (the tree listing shows the flat names and
+ * gitPathToWebPath decodes them back to the slashed display titles).
+ *
  * Writes (specs/wiki.md §2): upstream `updateWikiPage` (wiki.go) semantics —
  * create requires absence (400 `ErrWikiAlreadyExist`), edit is a
  * remove-old-if-any + write-new (a missing page UPSERTS; a rename onto an
@@ -100,6 +124,7 @@ import { apiUserFromRow, toApiRepository, type RepositoryWithOwner, type Viewer 
 import { saveRepoSettings } from "../api/services/repo-settings";
 import { users } from "../db/schema";
 import { emitWebhookDeliveries } from "../issues/webhooks";
+import { AuditActions, emitAudit } from "./audit";
 import { appOrigin } from "./webhooks-push";
 
 // ---------------------------------------------------------------------------
@@ -377,6 +402,29 @@ export function wikiBranch(pair: RepositoryWithOwner): string {
   return pair.repo.defaultBranch;
 }
 
+/**
+ * THE one shared encode at the engine boundary: a codec-space wiki GitPath →
+ * the engine's wire path. The engine decodes every path argument per segment
+ * (decodePath: split "/", then decodeURIComponent each segment —
+ * packages/git-engine src/repo.ts), while the write landing stored the codec
+ * names verbatim (buildFileChangeCommit splits on literal "/" only). The
+ * codec's GitPath is already QueryEscaped — every "%" a VALID escape, "/"
+ * escaped to %2F, spaces literal (WebPathToGitPath's %20/+ restore) — so the
+ * only meta-character left is "%" itself: doubling it ("%25") makes the
+ * engine's decode restore the codec's exact bytes, and the lookup becomes an
+ * entry-name-equality match against the stored (flat) name. Plain and nested
+ * pushed names carry no "%" and pass through unchanged (the identity). Every
+ * engine read of a wiki path in this file — blob probes, tree descent, log
+ * path filters — goes through this encode; the write paths never do (their
+ * literal split IS the storage convention).
+ */
+function enginePath(gitPath: string): string {
+  return gitPath
+    .split("/")
+    .map((segment) => segment.replaceAll("%", "%25"))
+    .join("/");
+}
+
 interface WikiTip {
   reads: EngineReads;
   tip: RefTip | undefined;
@@ -402,10 +450,10 @@ async function prepareWikiGitPath(
   if (tip === undefined) return { exists: false, foundPath: gitPath, gitPath };
   const unescaped = `${wikiName}.md`;
   if (unescaped !== gitPath) {
-    const direct = await reads.readBlob(tip, unescaped);
+    const direct = await reads.readBlob(tip, enginePath(unescaped));
     if (direct !== null) return { exists: true, foundPath: unescaped, gitPath };
   }
-  const coded = await reads.readBlob(tip, gitPath);
+  const coded = await reads.readBlob(tip, enginePath(gitPath));
   return { exists: coded !== null, foundPath: gitPath, gitPath };
 }
 
@@ -420,24 +468,28 @@ async function pageBlob(
   wikiName: string,
 ): Promise<{ data: Uint8Array; matchedPath: string } | null> {
   const gitPath = webPathToGitPath(wikiName);
-  const coded = await reads.readBlob(tip, gitPath);
+  const coded = await reads.readBlob(tip, enginePath(gitPath));
   if (coded !== null) return { data: coded.data, matchedPath: gitPath };
   const unescaped = pathUnescape(gitPath);
   if (unescaped !== null && unescaped !== gitPath) {
-    const alt = await reads.readBlob(tip, unescaped);
+    const alt = await reads.readBlob(tip, enginePath(unescaped));
     if (alt !== null) return { data: alt.data, matchedPath: unescaped };
   }
   return null;
 }
 
-/** `git.FileCommitsCount` — total commits touching the path (paged log walk). */
+/**
+ * `git.FileCommitsCount` — total commits touching the path (paged log walk).
+ * The filter path rides the same encode: the engine decodes it back to the
+ * stored entry name before walking the trees (matchesFilter → pathOid).
+ */
 async function countCommitsForPath(reads: EngineReads, tip: string, gitPath: string): Promise<number> {
   let count = 0;
   let ofs = 0;
   // the engine's path-filtered walk scans at most 2000 commits
   // (PATH_LOG_SCAN, packages/git-engine src/repo.ts) — cap the count there.
   while (ofs <= 2000) {
-    const page = await reads.listLog(tip, { path: gitPath, ofs, n: 100 });
+    const page = await reads.listLog(tip, { path: enginePath(gitPath), ofs, n: 100 });
     if (page === null || page.commits.length === 0) break;
     count += page.commits.length;
     if (!page.more) break;
@@ -498,7 +550,9 @@ export async function listWikiPages(
     if (index < skip || index >= maxNum || entry.type !== "blob") continue;
     const wikiName = gitPathToWebPath(entry.name);
     if (wikiName === null) continue;
-    const lastCommit = await lastCommitForPath(reads, tip.target, entry.name);
+    // entry.name is the RAW stored (flat) name — the log lookup encodes it
+    // for the engine's decoded filter so the last-commit row resolves.
+    const lastCommit = await lastCommitForPath(reads, tip.target, enginePath(entry.name));
     pages.push(toWikiPageMetaData(wikiName, lastCommit, pair, origin));
   }
   return { pages, totalEntries: entries.length };
@@ -523,7 +577,7 @@ export async function readWikiPage(
     sideContent(reads, tip.target, "_Sidebar"),
     sideContent(reads, tip.target, "_Footer"),
     countCommitsForPath(reads, tip.target, found.matchedPath),
-    lastCommitForPath(reads, tip.target, found.matchedPath),
+    lastCommitForPath(reads, tip.target, enginePath(found.matchedPath)),
   ]);
   return {
     ...toWikiPageMetaData(wikiName, lastCommit, pair, origin),
@@ -551,7 +605,7 @@ export async function listWikiPageRevisions(
   if (found === null) return null;
   const count = await countCommitsForPath(reads, tip.target, found.matchedPath);
   const log = await reads.listLog(tip.target, {
-    path: found.matchedPath,
+    path: enginePath(found.matchedPath),
     ofs: (page - 1) * WIKI_REVISIONS_PAGE_SIZE,
     n: WIKI_REVISIONS_PAGE_SIZE + 1,
   });
@@ -594,11 +648,12 @@ export async function readWikiRawBlob(
   for (const target of [gitPath, trimmed]) {
     // findEntryForFile (wiki.go:81-96): the target, then Go
     // url.QueryUnescape(target) ("the shortest alternative"); the engine's
-    // null read is the not-exist class.
+    // null read is the not-exist class. Each codec-space candidate rides
+    // the shared encode at the engine boundary.
     const unescaped = queryUnescape(target);
     const candidates = unescaped !== null && unescaped !== target ? [target, unescaped] : [target];
     for (const candidate of candidates) {
-      const blob = await reads.readBlob(tip.target, candidate);
+      const blob = await reads.readBlob(tip.target, enginePath(candidate));
       if (blob !== null) return { oid: blob.oid, data: blob.data };
     }
   }
@@ -1011,7 +1066,13 @@ async function collectWikiBlobPaths(reads: EngineReads, ref: string): Promise<st
   while (frontier.length > 0 && paths.length < WIKI_DELETE_MAX_ENTRIES) {
     const next: { path: string; depth: number }[] = [];
     const trees = await Promise.all(
-      frontier.map(async (dir) => ({ dir, tree: await reads.listTree(ref, dir.path === "" ? undefined : dir.path) })),
+      frontier.map(async (dir) => ({
+        dir,
+        // the walk composes RAW entry names; the read of each directory
+        // encodes them for the engine's decoded lookup (the identity for
+        // plain pushed names).
+        tree: await reads.listTree(ref, dir.path === "" ? undefined : enginePath(dir.path)),
+      })),
     );
     for (const { dir, tree } of trees) {
       if (tree === null) continue;
@@ -1034,7 +1095,7 @@ async function collectWikiBlobPaths(reads: EngineReads, ref: string): Promise<st
  * `wiki_service.DeleteWiki` (services/wiki/wiki.go:365-381) — the settings
  * page's `delete-wiki` danger action (handleSettingsPostDeleteWiki,
  * routers/web/repo/setting/setting.go:983-1001), composed for any caller.
- * Two steps, upstream's order:
+ * Three steps, upstream's order:
  *
  *   1. The unit disable (:367 `UpdateRepositoryUnits(ctx, repo, nil,
  *      []unit.Type{unit.TypeWiki})`). Our landed unit-flag reduction stores
@@ -1061,12 +1122,26 @@ async function collectWikiBlobPaths(reads: EngineReads, ref: string): Promise<st
  *      keeps the wiki branch's history (a re-enabled wiki starts empty
  *      rather than nonexistent), which is also why no cell tombstone/destroy
  *      runs here: the cell still serves the surviving history.
+ *   3. The audit row (:378 `audit.Record(ctx,
+ *      audit_model.RepositoryWikiDelete, repo)`) — the whole-wiki delete's
+ *      ONLY side-channel (upstream fires no webhook here; the WikiPayload
+ *      triple rides the PER-PAGE routes only). Upstream's Record is the
+ *      FINAL statement, reached even when the storage sweep failed (that
+ *      failure was absorbed into CreateNotice + a log line above), so the
+ *      emit sits outside the sweep's try/catch and carries its own
+ *      catch-and-log (upstream writeEvent's InsertEvent arm,
+ *      services/audit/event.go:138-141 — a failed row logs, never fails the
+ *      request). Actor: upstream Record's doer-from-context — the caller's
+ *      WikiDoer resolved to its user row (the settings arm passes
+ *      doer-row-else-owner, so the row exists; the 0 fallback marks an
+ *      unattributable doer). Scope: the repo — repository scope, no org arm
+ *      for user repos. Origin: the designed caller is the settings danger
+ *      action (an upstream UI route) — ui, the admin-users-impersonate
+ *      seam's service-level posture (the request's real origin never
+ *      reaches this seam).
  *
- * No webhook: upstream's DeleteWiki fires none (the WikiPayload triple rides
- * the PER-PAGE routes only; the service's only side-channel is
- * `audit.Record(RepositoryWikiDelete)` — the audit enum here has no wiki arm
- * yet, reported as the follow-up). Returns having applied the flag reset
- * even when the storage sweep logged a failure — upstream's exact posture.
+ * Returns having applied the flag reset even when the storage sweep logged
+ * a failure — upstream's exact posture.
  */
 export async function deleteWiki(
   env: ApiEnv["Bindings"],
@@ -1097,6 +1172,34 @@ export async function deleteWiki(
   } catch (error) {
     console.error(
       `[wiki] delete-wiki storage sweep failed (wiki disabled; pages may remain until a retry or the repo delete) [repo: ${pair.repo.ownerNamespace}/${pair.repo.slug}]: ${errorMessage(error)}`,
+    );
+  }
+  // Step 3 — the audit row (upstream wiki.go:378), OUTSIDE the sweep's
+  // try/catch: recorded even when the sweep failed (the catch above is
+  // upstream's CreateNotice arm). Catch-and-log: upstream writeEvent's
+  // InsertEvent arm logs and never fails the request (event.go:138-141).
+  try {
+    const actorRow =
+      (await drizzle(d1)
+        .select()
+        .from(users)
+        .where(eq(users.usernameLower, doer.name.toLowerCase()))
+        .get()) ?? null;
+    const fullName = `${pair.repo.ownerNamespace}/${pair.repo.slug}`;
+    await emitAudit(drizzle(d1), {
+      action: AuditActions.RepositoryWikiDelete,
+      actorId: actorRow?.id ?? 0,
+      actorName: actorRow?.username ?? doer.name,
+      actorCredential: null, // the write rides the session (the settings form)
+      scopeType: "repository",
+      scopeId: pair.repo.id,
+      scopeName: fullName,
+      origin: "ui",
+      vars: { scope: fullName },
+    });
+  } catch (error) {
+    console.error(
+      `[audit] wiki-delete row failed (scope: ${pair.repo.ownerNamespace}/${pair.repo.slug}): ${errorMessage(error)}`,
     );
   }
 }

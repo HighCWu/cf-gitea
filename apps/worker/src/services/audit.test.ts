@@ -198,6 +198,15 @@ describe("audit action registry (SPEC-0015 §4.2)", () => {
     // sorted
     expect([...filters].sort()).toEqual(filters);
   });
+
+  it("the whole-wiki delete arm (upstream action.go:151) is registered with the verbatim id and template", () => {
+    expect(messageTemplate("repository:wiki:delete")).toBe("Deleted wiki of repository {scope}.");
+    expect(renderMessage(AuditActions.RepositoryWikiDelete, { scope: "alice/alpha" })).toBe(
+      "Deleted wiki of repository alice/alpha.",
+    );
+    // the 3-segment id derives its family prefix filter
+    expect(actionFilters()).toContain("repository:wiki");
+  });
 });
 
 // ---------------------------------------------------------------------------
