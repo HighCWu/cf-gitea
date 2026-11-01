@@ -696,7 +696,7 @@ import { renderServerErrorShellResponse } from "./not-found-response";
 import { parsePageNumber, pathEscapeSegments } from "./page-data";
 import { resolveRepositoryForViewer } from "./repo-view";
 import { renderNotFound, renderUiPage } from "./render";
-import { sameOriginGuard } from "./session";
+import { clearSessionSetCookie, lookupValidSession, sameOriginGuard, sessionCookieValue } from "./session";
 import { blobRedirectResponse, fetchActionRedirectResponse, isFetchActionRequest, treeRedirectResponse } from "./pages/repo-home";
 import {
   loadReleaseDownload,
@@ -1119,6 +1119,23 @@ import {
   resolveMigrationRecord,
   retryMigration,
 } from "./pages/repo-migrate-status";
+// The five-recipe fold batch's modules (census #17/#18/#20 tails + the
+// 2a00e28 avatar seams + the eb8df05 pages).
+import {
+  applyAdminMonitorQueueRemoveAllItems,
+  loadAdminMonitorQueueDetail,
+  parseAdminMonitorQueueQid,
+  renderAdminMonitorQueueManagePage,
+} from "./pages/admin-monitor";
+import {
+  IMPERSONATE_REFUSED_BODY,
+  IMPERSONATE_SUCCESS_REDIRECT,
+  IMPERSONATE_UNKNOWN_USER_ERROR,
+  adminUserImpersonate,
+} from "./pages/admin-users-impersonate";
+import { adminUserAvatarDelete, adminUserAvatarUpload } from "./pages/admin-users-avatar";
+import { ADMIN_USERS_LIST_LINK, loadAdminUserDetail, renderAdminUserDetailPage } from "./pages/admin-user-detail";
+import { loadOrgWorktimeData, renderOrgWorktimePage, resolveOrgWorktimePage } from "./pages/org-worktime";
 import {
   applyUserSettingsSecretForm,
   deleteUserSettingsSecret,
@@ -3414,7 +3431,16 @@ export interface AdminRoute {
     | "admin-actions-scoped-workflows" // GET /-/admin/actions/scoped-workflows (web.go:903)
     | "admin-actions-scoped-workflows-add" // POST .../scoped-workflows/add
     | "admin-actions-scoped-workflows-required" // POST .../scoped-workflows/required
-    | "admin-actions-scoped-workflows-remove"; // POST .../scoped-workflows/remove
+    | "admin-actions-scoped-workflows-remove" // POST .../scoped-workflows/remove
+    // The census #17/#18/#20 tails: the monitor queue-manage pair (the
+    // Cloudflare queue NAME as qid), the user detail page, the impersonate
+    // write, and the avatar pair (the 2a00e28 seams).
+    | "admin-monitor-queue-manage"
+    | "admin-monitor-queue-remove-all"
+    | "admin-user-detail"
+    | "admin-users-impersonate"
+    | "admin-user-avatar"
+    | "admin-user-avatar-delete";
   /** The monitor page (stats/cron/queue/stacktrace → the module's
    *  AdminMonitorPage union); absent on the dashboard family and the three
    *  listing families. */
@@ -3428,6 +3454,12 @@ export interface AdminRoute {
   /** The positive-integer {authid} (the auths edit/delete families —
    *  web.go:876-879's param; the same digits-only PathParamInt64 posture). */
   authId?: number;
+  /** The parsed {userid} path param (the detail/impersonate/avatar
+   *  families — the digits-only PathParamInt64 parity, junk stays
+   *  engine-404). */
+  adminUserId?: number;
+  /** The monitor queue-manage pair's qid (the Cloudflare queue NAME). */
+  qid?: string;
   /** The positive-integer {id} for the admin actions families — the
    *  runners edit/update/delete combos and the variables edit/delete
    *  combos (digits-only claims, the same PathParamInt64 posture). */
@@ -3454,6 +3486,15 @@ export interface RepoMigrateStatusRoute {
   family: "repo-migrate-status" | "repo-migrate-retry" | "repo-migrate-cancel";
   owner: string;
   repo: string;
+}
+
+/** The org WORKTIME page (pages/org-worktime.tsx — upstream web.go:1015's
+ *  owner-only tracked-times aggregate; served at /{org}/worktime per the
+ *  landed require-owner family convention, upstream's /org/... path
+ *  recorded in the module header). */
+export interface OrgWorktimeRoute {
+  family: "org-worktime";
+  owner: string;
 }
 
 export interface UserSettingsTabRoute {
@@ -3742,6 +3783,7 @@ export type ParsedUiRoute =
   | UserSettingsTabRoute
   | UserJsonAuxRoute
   | RepoMigrateStatusRoute
+  | OrgWorktimeRoute
   | AdminRoute
   | SitemapRoute
   | SearchAuxRoute
@@ -4156,6 +4198,21 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     const tail = raw.slice(3);
     if (tail.length === 0) return { family: "admin-dashboard" };
     if (tail.length === 1 && tail[0] === "users") return { family: "admin-users" };
+    // The user detail page + the impersonate/avatar writes (web.go:817-821 —
+    // digits-only, junk stays engine-404; the detail page's miss 303s to the
+    // LIST at the handler per prepareUserInfo).
+    if (tail.length === 2 && tail[0] === "users" && /^\d+$/.test(tail[1] as string)) {
+      return { family: "admin-user-detail", adminUserId: Number.parseInt(tail[1] as string, 10) };
+    }
+    if (tail.length === 3 && tail[0] === "users" && tail[2] === "impersonate" && /^\d+$/.test(tail[1] as string)) {
+      return { family: "admin-users-impersonate", adminUserId: Number.parseInt(tail[1] as string, 10) };
+    }
+    if (tail.length === 3 && tail[0] === "users" && tail[2] === "avatar" && /^\d+$/.test(tail[1] as string)) {
+      return { family: "admin-user-avatar", adminUserId: Number.parseInt(tail[1] as string, 10) };
+    }
+    if (tail.length === 4 && tail[0] === "users" && tail[2] === "avatar" && tail[3] === "delete" && /^\d+$/.test(tail[1] as string)) {
+      return { family: "admin-user-avatar-delete", adminUserId: Number.parseInt(tail[1] as string, 10) };
+    }
     if (tail.length === 1 && tail[0] === "orgs") return { family: "admin-orgs" };
     if (tail.length === 1 && tail[0] === "repos") return { family: "admin-repos" };
     // The tick-18 packages arm (pages/admin-packages.tsx — web.go:852-858's
@@ -4341,6 +4398,14 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
       if (tail[1] === "queue") return { family: "admin-monitor", page: "queue" };
       if (tail[1] === "stacktrace") return { family: "admin-monitor", page: "trace" };
     }
+    // The monitor queue-manage pair (web.go:805-811 — the queue NAME qid;
+    // the /set arm is the recorded reduction, never claimed).
+    if (tail.length === 3 && tail[0] === "monitor" && tail[1] === "queue") {
+      return { family: "admin-monitor-queue-manage", qid: tail[2] as string };
+    }
+    if (tail.length === 4 && tail[0] === "monitor" && tail[1] === "queue" && tail[2] === "remove-all-items") {
+      return { family: "admin-monitor-queue-remove-all", qid: tail[3] as string };
+    }
     return null;
   }
 
@@ -4483,6 +4548,13 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // so five-segment name tails stay unclaimed → the engine's 404). Every
   // other tail (`/{id}/repositories`, the `/action/*` writes) stays
   // unclaimed → the engine's 404.
+  // The org WORKTIME page (web.go:1015 — owner-only; the module's resolve
+  // ladder owns the gates; the bare 3-segment shape only, deeper tails
+  // stay engine-owned).
+  if (repo === "worktime") {
+    if (raw.length === 3) return { family: "org-worktime", owner };
+    return null;
+  }
   if (repo === "teams") {
     if (raw.length === 3) return { family: "org-teams", owner };
     if (raw.length === 4) {
@@ -11803,6 +11875,52 @@ async function adminDashboardSubmit(c: Context<{ Bindings: Env }>): Promise<Resp
   return p.respond(c.html(renderAdminDashboardPage({ ctx: p.ctx, data, flash })));
 }
 
+/** GET /-/admin/monitor/queue/{qid} (the d0fc34f module's mount — the
+ *  queue-NAME qid; an unknown name is upstream's nil-mq 404). */
+async function adminMonitorQueueManagePage(c: Context<{ Bindings: Env }>, qid: string): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const qidParsed = parseAdminMonitorQueueQid(qid);
+  const data = qidParsed === null ? null : await loadAdminMonitorQueueDetail(c.env.DB, qidParsed);
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderAdminMonitorQueueManagePage({ ctx: p.ctx, data, flash: null })));
+}
+
+/** POST /-/admin/monitor/queue/{qid}/remove-all-items — every non-applied
+ *  answer is upstream's 404 (no producible invalid form), never a banner. */
+async function adminMonitorQueueRemoveAllSubmit(c: Context<{ Bindings: Env }>, qid: string): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const qidParsed = parseAdminMonitorQueueQid(qid);
+  const result = qidParsed === null ? { outcome: "unknown-queue" as const } : await applyAdminMonitorQueueRemoveAllItems(c.env.DB, qidParsed);
+  if (result.outcome === "unknown-queue") return p.respond(c.html(renderNotFound(p.ctx), 404));
+  // The positive flash rides the re-rendered manage page (the no-JS
+  // convention).
+  const data = await loadAdminMonitorQueueDetail(c.env.DB, qidParsed as string);
+  if (data === null) return p.respond(c.html(renderNotFound(p.ctx), 404));
+  return p.respond(c.html(renderAdminMonitorQueueManagePage({ ctx: p.ctx, data, flash: { kind: "positive", text: result.message } })));
+}
+
+/** GET /{org}/worktime (the eb8df05 module's mount — the resolve ladder's
+ *  5-arm union maps redirect/signin/missing/forbidden/page). */
+async function orgWorktimePage(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, respond, route } = resolved;
+  if (route.family !== "org-worktime") return respond(await c.notFound()); // drift guard
+  const owner = route.owner;
+  const viewer = resolved.viewer;
+  const outcome = await resolveOrgWorktimePage(c.env.DB, owner, viewer, url.pathname, url.search.slice(1));
+  if (outcome.kind === "redirect") return respond(new Response(null, { status: 307, headers: { location: outcome.location } }));
+  if (outcome.kind === "signin") return respond(new Response(null, { status: 303, headers: { location: outcome.location } }));
+  if (outcome.kind === "missing" || outcome.kind === "forbidden") return respond(c.html(renderNotFound(ctx), 404));
+  const data = await loadOrgWorktimeData(c.env.DB, outcome.org, url.searchParams, routeNow());
+  if (data.outcome === "error") return respond(new Response("Internal Server Error", { status: 500 }));
+  return respond(c.html(renderOrgWorktimePage(ctx, data.data), 200));
+}
+
 async function adminMonitorPage(c: Context<{ Bindings: Env }>, page: AdminMonitorPage): Promise<Response> {
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
@@ -11841,6 +11959,73 @@ async function adminMonitorCronSubmit(c: Context<{ Bindings: Env }>): Promise<Re
 // each rides the shared adminPagePrologue) -----------------------------------
 
 /** GET /-/admin/users: the prologue → the paged users listing. */
+/** GET /-/admin/users/{userid} (ViewUser — pages/admin-user-detail.tsx): a
+ *  null load is prepareUserInfo's LIST-redirect arm, never a 404. */
+async function adminUserDetailPage(c: Context<{ Bindings: Env }>, userId: number): Promise<Response> {
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const data = await loadAdminUserDetail(c.env.DB, userId);
+  if (data === null) return p.respond(new Response(null, { status: 303, headers: { location: ADMIN_USERS_LIST_LINK } }));
+  return p.respond(c.html(renderAdminUserDetailPage(p.ctx, { ...data, oauth2Enabled: oauth2FeatureEnabled(c.env) }), 200));
+}
+
+/** POST /-/admin/users/{userid}/impersonate (the 9c929dc chain's mount):
+ *  the four-outcome ladder — impersonated 303s to /user/settings,
+ *  unknown-user 400s with upstream's JSON body, already-impersonating 500s
+ *  plain (never a silent redirect), session-gone bounces to login with the
+ *  clear-cookie. */
+async function adminUsersImpersonateSubmit(c: Context<{ Bindings: Env }>, userId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const path = new URL(c.req.url).pathname;
+  const bounce = new Response(null, {
+    status: 303,
+    headers: { location: `/login?redirect_to=${encodeURIComponent(path)}`, "set-cookie": clearSessionSetCookie() },
+  });
+  const cookie = sessionCookieValue(c.req.raw);
+  const session = cookie === null ? null : await lookupValidSession(c.env.DB, cookie);
+  if (session === null) return p.respond(bounce);
+  const outcome = await adminUserImpersonate(c.env.DB, { sessionId: session.sessionId, adminUserId: session.id }, userId);
+  if (outcome.outcome === "impersonated") {
+    return p.respond(new Response(null, { status: 303, headers: { location: IMPERSONATE_SUCCESS_REDIRECT } }));
+  }
+  if (outcome.outcome === "unknown-user") {
+    return p.respond(
+      new Response(JSON.stringify(IMPERSONATE_UNKNOWN_USER_ERROR), {
+        status: 400,
+        headers: { "content-type": "application/json;charset=utf-8" },
+      }),
+    );
+  }
+  if (outcome.outcome === "already-impersonating") {
+    return p.respond(new Response(IMPERSONATE_REFUSED_BODY, { status: 500, headers: { "content-type": "text/plain;charset=utf-8" } }));
+  }
+  // session-gone: the flip's guarded UPDATE matched no row.
+  return p.respond(bounce);
+}
+
+/** The admin avatar pair (web.go:820-821 — the 2a00e28 seams' mounts; the
+ *  modules' own redirects carry the unknown-target LIST arm). */
+async function adminUserAvatarSubmit(c: Context<{ Bindings: Env }>, userId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const outcome = await adminUserAvatarUpload(c.env.REPO_PACKS, c.env.DB, userId, c.req.raw);
+  return p.respond(new Response(null, { status: 303, headers: { location: outcome.redirect } }));
+}
+
+async function adminUserAvatarDeleteSubmit(c: Context<{ Bindings: Env }>, userId: number): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const p = await adminPagePrologue(c);
+  if (!p.ok) return p.response;
+  const outcome = await adminUserAvatarDelete(c.env.REPO_PACKS, c.env.DB, userId);
+  return p.respond(new Response(null, { status: 303, headers: { location: outcome.redirect } }));
+}
+
 async function adminUsersPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const p = await adminPagePrologue(c);
   if (!p.ok) return p.response;
@@ -16691,6 +16876,9 @@ uiRouter.post("/repo/create", (c) => repoCreateSubmit(c));
 uiRouter.get("/org/create", (c) => orgCreatePage(c));
 uiRouter.post("/org/create", (c) => orgCreateSubmit(c));
 uiRouter.get("/:owner/teams", (c) => orgTeamsPage(c));
+// The org worktime page (web.go:1015 — owner-only; registered beside the
+// wave-12 statics BEFORE any dynamic pair, the RegExpRouter rule).
+uiRouter.get("/:owner/worktime", (c) => orgWorktimePage(c));
 uiRouter.get("/:owner/teams/new", (c) => orgTeamNewPage(c));
 uiRouter.post("/:owner/teams/new", (c) => orgTeamNewSubmit(c));
 uiRouter.get("/:owner/teams/:id", (c) => orgTeamDetailPage(c));
@@ -16827,10 +17015,18 @@ uiRouter.get("/-/admin/monitor/stats", (c) => adminMonitorPage(c, "stats"));
 uiRouter.get("/-/admin/monitor/cron", (c) => adminMonitorPage(c, "cron"));
 uiRouter.post("/-/admin/monitor/cron", (c) => adminMonitorCronSubmit(c));
 uiRouter.get("/-/admin/monitor/queue", (c) => adminMonitorPage(c, "queue"));
+// The queue-manage pair (web.go:805-811 — the queue-NAME qid).
+uiRouter.get("/-/admin/monitor/queue/:qid", (c) => adminMonitorQueueManagePage(c, c.req.param("qid")));
+uiRouter.post("/-/admin/monitor/queue/:qid/remove-all-items", (c) => adminMonitorQueueRemoveAllSubmit(c, c.req.param("qid")));
 uiRouter.get("/-/admin/monitor/stacktrace", (c) => adminMonitorPage(c, "trace"));
 // The admin listing pages (top-level static literals — nothing dynamic
 // shadows them; the parse claims carry the same literals).
 uiRouter.get("/-/admin/users", (c) => adminUsersPage(c));
+// The user detail page + the impersonate/avatar writes (web.go:817-821).
+uiRouter.get("/-/admin/users/:userid{\\d+}", (c) => adminUserDetailPage(c, Number.parseInt(c.req.param("userid"), 10)));
+uiRouter.post("/-/admin/users/:userid{\\d+}/impersonate", (c) => adminUsersImpersonateSubmit(c, Number.parseInt(c.req.param("userid"), 10)));
+uiRouter.post("/-/admin/users/:userid{\\d+}/avatar", (c) => adminUserAvatarSubmit(c, Number.parseInt(c.req.param("userid"), 10)));
+uiRouter.post("/-/admin/users/:userid{\\d+}/avatar/delete", (c) => adminUserAvatarDeleteSubmit(c, Number.parseInt(c.req.param("userid"), 10)));
 uiRouter.get("/-/admin/orgs", (c) => adminOrgsPage(c));
 uiRouter.get("/-/admin/repos", (c) => adminReposPage(c));
 // The tick-18 packages arm (parseUiRoute claims exactly the bare literal —
