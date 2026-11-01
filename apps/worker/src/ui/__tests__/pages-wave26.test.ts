@@ -282,13 +282,26 @@ describe("wave-26 parser claims", () => {
       owner: "wave26-owner",
       repo: "tracked",
     });
-    // The sibling shapes stay unclaimed (the engine's 404): upstream's own
-    // unregistered tails — the plural /milestones/{id}, the {id}/{action}
-    // write, the /milestones/delete write, the singular /milestone bare and
-    // /milestone/{id}/edit forms, any /fork/* tail.
+    // The {id}/{open|close} status write and the /milestones/delete literal
+    // are claimed too (the write-tails fold, 20f7290 — both POST-only, the
+    // GET misses to the 405 twin).
+    expect(parseUiRoute("/wave26-owner/tracked/milestones/5/close")).toEqual({
+      family: "milestone-action",
+      owner: "wave26-owner",
+      repo: "tracked",
+      id: "5",
+      action: "close",
+    });
+    expect(parseUiRoute("/wave26-owner/tracked/milestones/delete")).toEqual({
+      family: "milestone-delete",
+      owner: "wave26-owner",
+      repo: "tracked",
+    });
+    // The remaining sibling shapes stay unclaimed (the engine's 404):
+    // upstream's own unregistered tails — the plural /milestones/{id}, the
+    // singular /milestone bare and /milestone/{id}/edit forms, any /fork/*
+    // tail.
     expect(parseUiRoute("/wave26-owner/tracked/milestones/5")).toBeNull();
-    expect(parseUiRoute("/wave26-owner/tracked/milestones/5/close")).toBeNull();
-    expect(parseUiRoute("/wave26-owner/tracked/milestones/delete")).toBeNull();
     expect(parseUiRoute("/wave26-owner/tracked/milestone")).toBeNull();
     expect(parseUiRoute("/wave26-owner/tracked/milestone/5/edit")).toBeNull();
     expect(parseUiRoute("/wave26-owner/tracked/milestone/5/extra")).toBeNull();
@@ -297,6 +310,8 @@ describe("wave-26 parser claims", () => {
     expect(handlesUiRoute("/wave26-owner/tracked/milestone/5")).toBe(true);
     expect(handlesUiRoute("/wave26-owner/tracked/milestones/5/edit")).toBe(true);
     expect(handlesUiRoute("/wave26-owner/tracked/fork")).toBe(true);
+    expect(handlesUiRoute("/wave26-owner/tracked/milestones/5/close")).toBe(true);
+    expect(handlesUiRoute("/wave26-owner/tracked/milestones/delete")).toBe(true);
     expect(handlesUiRoute("/wave26-owner/tracked/milestones/5")).toBe(false);
     // The landed forks LIST literal keeps its family.
     expect(parseUiRoute("/wave26-owner/tracked/forks")).toEqual({ family: "forks", owner: "wave26-owner", repo: "tracked" });

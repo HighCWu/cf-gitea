@@ -22,7 +22,7 @@ import { SELF, env } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
-import { PAGE_CONTENT_SECURITY_POLICY, withSecurityHeaders } from "./security-headers";
+import { PAGE_CACHE_CONTROL, PAGE_CONTENT_SECURITY_POLICY, withSecurityHeaders } from "./security-headers";
 import headersFile from "../../public/_headers?raw";
 
 beforeAll(async () => {
@@ -42,7 +42,7 @@ function expectUniversalPosture(headers: Headers): void {
   expect(headers.get("x-frame-options")).toBe("SAMEORIGIN");
 }
 
-describe("HTML page class (uiRouter, parent middleware stamp)", () => {
+describe("HTML page class (the parent security-headers stamp)", () => {
   it.skipIf(!UI_ASSETS_BUILT)("stamps the full page posture on /login", async () => {
     const response = await SELF.fetch("https://example.com/login", {
       headers: { accept: "text/html" },
@@ -51,9 +51,14 @@ describe("HTML page class (uiRouter, parent middleware stamp)", () => {
     expect(response.headers.get("content-type")).toBe("text/html; charset=UTF-8");
     expectUniversalPosture(response.headers);
     expect(response.headers.get("content-security-policy")).toBe(PAGE_CONTENT_SECURITY_POLICY);
-    // The smoke's verified page posture (findings-latency-health.md:98),
-    // untouched by this unit — the uiRouter middleware stamps it first and
-    // the security-headers pass must not have disturbed it.
+    // The smoke's verified page posture (findings-latency-health.md:98).
+    // REGRESSION PIN: 1b17b08's consolidated auth fold moved sessionRouter
+    // into the pre-uiRouter block (the 9d77172 rule), which silently dropped
+    // this header — /login's handler now registers BEFORE the uiRouter
+    // stamp middleware, so nothing set it. The page cache-control is the
+    // security-headers pass's HTML-class arm (web/security-headers.ts,
+    // upstream context.go:189's tree-wide zero-option form), so the posture
+    // holds regardless of mount order.
     expect(response.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
   });
 
@@ -130,6 +135,7 @@ describe("withSecurityHeaders (unit)", () => {
         "x-content-type-options": "nosniff",
         "x-frame-options": "SAMEORIGIN",
         "content-security-policy": PAGE_CONTENT_SECURITY_POLICY,
+        "cache-control": PAGE_CACHE_CONTROL,
       },
     });
     expect(withSecurityHeaders(res)).toBe(res);
@@ -161,6 +167,24 @@ describe("withSecurityHeaders (unit)", () => {
     expect(html.body).not.toBeNull();
     const json = withSecurityHeaders(new Response("{}", { headers: { "content-type": "application/json" } }));
     expect(json.headers.get("content-security-policy")).toBeNull();
+  });
+
+  it("stamps the zero-option page cache-control on HTML, set-if-absent (the 1b17b08 mount-move regression pin)", () => {
+    // The page cache-control rides the HTML class since the 1b17b08
+    // consolidated auth fold: sessionRouter/webauthnRouter moved INTO the
+    // pre-uiRouter block (the 9d77172 rule), so pre-uiRouter page surfaces
+    // no longer unwind through the uiRouter stamp middleware — the pass
+    // carries the posture instead (upstream context.go:189's tree-wide form).
+    const bare = withSecurityHeaders(new Response("<x/>", { headers: { "content-type": "text/html; charset=UTF-8" } }));
+    expect(bare.headers.get("cache-control")).toBe(PAGE_CACHE_CONTROL);
+    // A handler-set value keeps its own (the raw/wiki public caches class).
+    const set = withSecurityHeaders(
+      new Response("<x/>", { headers: { "content-type": "text/html", "cache-control": "public, max-age=21600" } }),
+    );
+    expect(set.headers.get("cache-control")).toBe("public, max-age=21600");
+    // Non-HTML classes stay untouched (the API/plain/git classes).
+    const plain = withSecurityHeaders(new Response("x", { headers: { "content-type": "text/plain; charset=utf-8" } }));
+    expect(plain.headers.get("cache-control")).toBeNull();
   });
 });
 

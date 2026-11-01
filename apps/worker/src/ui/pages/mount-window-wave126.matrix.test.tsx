@@ -421,7 +421,9 @@ describe("the admin listing pages' gates (the shared adminPagePrologue)", () => 
     expect(parseUiRoute("/-/admin/users")).toEqual({ family: "admin-users" });
     expect(parseUiRoute("/-/admin/orgs")).toEqual({ family: "admin-orgs" });
     expect(parseUiRoute("/-/admin/repos")).toEqual({ family: "admin-repos" });
-    expect(parseUiRoute("/-/admin/users/42")).toBeNull(); // static-before-dynamic: deeper tails unclaimed
+    // The digits-only detail tail is claimed since the five-recipe fold
+    // (0cf8fd1 — the admin user detail page).
+    expect(parseUiRoute("/-/admin/users/42")).toEqual({ family: "admin-user-detail", adminUserId: 42 });
     expect(handlesUiRoute("/-/admin/users")).toBe(true);
   });
 });

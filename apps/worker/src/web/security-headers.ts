@@ -68,6 +68,24 @@
  * onError hand-sets its own cache-control) call `withSecurityHeaders`
  * directly. Headers ride the EXISTING Response — the body stream is carried
  * by reference, never buffered (AGENTS.md Workers rules).
+ *
+ * THE PAGE CACHE-CONTROL ARM (the 1b17b08 mount-move regression, restored
+ * 2026-11-01): upstream stamps the zero-option prod form
+ * (`SetCacheControlInHeader` with `CacheControlOptions{}` — httpcache.go:29-31)
+ * TREE-WIDE from the web context's middleware (services/context/context.go:189)
+ * and the API context's twin (api.go:251); our adaptation carried it as the
+ * uiRouter-local middleware (src/ui/index.ts, the RD20 probe's fix), which
+ * covered every page registered after it — until 1b17b08's consolidated auth
+ * fold moved sessionRouter (and webauthnRouter) INTO the pre-uiRouter block
+ * per the 9d77172 rule, and /login stopped unwinding through the uiRouter
+ * stamp (its handler now registers before that middleware in the merged
+ * chain). A per-viewer HTML surface becoming heuristically cacheable is the
+ * exact production bug RD20 recorded, so the page class is completed here
+ * instead: `text/html` responses gain the zero-option form set-if-absent.
+ * The uiRouter middleware keeps running first for its own subtree (same
+ * value — idempotent under set-if-absent), non-HTML classes are untouched,
+ * and handlers that set their own (raw/wiki media caches, the error arms,
+ * the fragments) keep theirs.
  */
 
 import type { MiddlewareHandler } from "hono";
@@ -88,6 +106,14 @@ export const X_FRAME_OPTIONS = "SAMEORIGIN";
 
 /** Upstream's landed `XContentTypeOptions` default (security.go:28). */
 export const X_CONTENT_TYPE_OPTIONS = "nosniff";
+
+/**
+ * The page cache-control — upstream's zero-option prod form
+ * (`SetCacheControlInHeader` with `CacheControlOptions{}`, httpcache.go:29-31,
+ * applied tree-wide at context.go:189). Page-class only (`text/html`), the
+ * module header carries the 1b17b08 mount-move record.
+ */
+export const PAGE_CACHE_CONTROL = "max-age=0, private, must-revalidate";
 
 /**
  * Stamp the class matrix onto one response. Set-if-absent: a handler that
@@ -113,6 +139,9 @@ export function withSecurityHeaders(res: Response): Response {
   }
   if (isHtml && res.headers.get("content-security-policy") === null) {
     missing.push(["content-security-policy", PAGE_CONTENT_SECURITY_POLICY]);
+  }
+  if (isHtml && res.headers.get("cache-control") === null) {
+    missing.push(["cache-control", PAGE_CACHE_CONTROL]);
   }
   if (missing.length === 0) return res;
   const headers = new Headers(res.headers);
