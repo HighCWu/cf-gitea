@@ -1211,18 +1211,23 @@ describe("census gap #1 part two: the timeline write arms (render half)", () => 
     expect(bobHtml).not.toContain(`name="content_version"`);
   });
 
-  it("the viewed-files tail STAYS engine-owned (the module header's STOP adjudication — no substrate, the route is never registered)", async () => {
+  it("the viewed-files tail is LIVE (the review_state chain, migration 0059 + the 79a94f9 fold — the STOP adjudication superseded)", async () => {
     const fixture = await ensureIssueDetailFixtures();
     const res = await fetchUi(
       `/${OWNER_NAME}/${REPO_SLUG}/pulls/${fixture.wipPrIndex}/viewed-files`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json", origin: "https://test.local" },
-        body: JSON.stringify({ files: { "a.ts": true }, headCommitSHA: "" }),
-      },
+      withCookie(
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", origin: "https://test.local" },
+          body: JSON.stringify({ files: { "a.ts": true }, headCommitSHA: "" }),
+        },
+        fixture.ownerCookie,
+      ),
     );
-    expect(res.status).toBe(404);
-    expect(await res.text()).not.toContain("page-content");
+    // The bundle's JSON body lands; a non-pull would redirect — the WIP PR
+    // is a pull, so the mark writes and answers the bare 200.
+    expect(res.headers.get("location")).toBe(null); // no redirect on a pull
+    expect(res.status).toBe(200);
   });
 });
 

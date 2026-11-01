@@ -208,6 +208,7 @@ import {
 import { LabelBadge } from "./issues-list";
 import { canAdminRepo } from "./settings";
 import { BaseLayout, Icon, renderPage } from "../shell";
+import { CommentAttachmentsDropzone } from "./issue-attachments-write";
 import type { RepoRow, UiContext } from "../ui-context";
 import type { Viewer } from "../viewer";
 
@@ -2390,6 +2391,9 @@ function CommentFormBlock(props: {
                 {props.form.content}
               </textarea>
             </div>
+            {/* view_content.tmpl:155-159's placement: the dropzone between
+                the textarea and the footer fields (the 00f8e49 fold-back). */}
+            <CommentAttachmentsDropzone repoLink={props.repoLink} issueIndex={issue.index} />
             <div class="field footer">
               <div class="flex-text-block tw-justify-end">
                 {access.canChangeState && !(pr !== null && pr.hasMerged) ? (
