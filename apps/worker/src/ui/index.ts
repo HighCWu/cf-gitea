@@ -1108,6 +1108,17 @@ import {
   userSearchCandidatesResponse,
   userStopwatchesAuxResponse,
 } from "./pages/user-json-aux";
+// The migration status/retry/cancel arms (web.go:1172-1174 + :1281-1283 —
+// census gap #11, the a0f3f40 salvage).
+import {
+  cancelMigration,
+  deriveMigrationStatus,
+  migrateStatusNotFoundResponse,
+  migrateStatusPayload,
+  migrateStatusResponse,
+  resolveMigrationRecord,
+  retryMigration,
+} from "./pages/repo-migrate-status";
 import {
   applyUserSettingsSecretForm,
   deleteUserSettingsSecret,
@@ -3436,6 +3447,15 @@ export interface UserJsonAuxRoute {
   family: "user-stopwatches-aux" | "user-search-candidates-aux";
 }
 
+/** The migration status/retry/cancel arms (pages/repo-migrate-status.ts —
+ *  upstream web.go:1172-1174 + :1281-1283): the /-/migrate/status poller
+ *  (repo-read grant) and the settings-path retry/cancel writes (admin). */
+export interface RepoMigrateStatusRoute {
+  family: "repo-migrate-status" | "repo-migrate-retry" | "repo-migrate-cancel";
+  owner: string;
+  repo: string;
+}
+
 export interface UserSettingsTabRoute {
   family:
     | "user-settings-appearance"
@@ -3721,6 +3741,7 @@ export type ParsedUiRoute =
   | UserSettingsRoute
   | UserSettingsTabRoute
   | UserJsonAuxRoute
+  | RepoMigrateStatusRoute
   | AdminRoute
   | SitemapRoute
   | SearchAuxRoute
@@ -5278,9 +5299,24 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   if (head === "pull" && rest.length === 2 && /^-?\d+$/.test(rest[0] as string) && rest[1] === "target_branch") {
     return { family: "pull-target-branch", owner, repo, index: Number.parseInt(rest[0] as string, 10) };
   }
+  // The migration status poller (web.go:1172-1174 — the /-/ pseudo-segment
+  // group; the repo-migrating page's 2s StatusChecker target; the repo-read
+  // grant rides resolveUiRequest).
+  if (head === "-" && rest.length === 2 && rest[0] === "migrate" && rest[1] === "status") {
+    return { family: "repo-migrate-status", owner, repo };
+  }
   if (head === "settings") {
     if (rest.length === 0) return { family: "settings", owner, repo };
     if (rest.length === 1 && rest[0] === "hooks") return { family: "settings-hooks", owner, repo };
+    // The migration retry/cancel writes (web.go:1281-1283 — POSTs REGISTER
+    // under the settings path; the BUTTONS render on the migrating repo
+    // home, a separate census row; the module ships the endpoints).
+    if (rest.length === 2 && rest[0] === "migrate" && rest[1] === "retry") {
+      return { family: "repo-migrate-retry", owner, repo };
+    }
+    if (rest.length === 2 && rest[0] === "migrate" && rest[1] === "cancel") {
+      return { family: "repo-migrate-cancel", owner, repo };
+    }
     // Window-2d: the four settings-tab modules. The githooks group claims
     // BEFORE the numeric hooks/{id} block could matter ("git" fails the
     // numeric guard — explicit claims keep both owners unambiguous).
@@ -6565,6 +6601,55 @@ async function settingsGate(
   if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
   if (!(await canAdminRepo(c.env, repo, viewer))) return respond(c.html(renderNotFound(ctx), 404));
   return null;
+}
+
+/** GET /{owner}/{repo}/-/migrate/status (web.go:1172-1174 — the repo-read
+ *  grant rides resolveUiRequest; the failed-message gate is upstream's
+ *  admin-substitution arm, migrate.go:291-292). */
+async function repoMigrateStatusRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { repo, viewer, respond } = resolved;
+  if (resolved.route.family !== "repo-migrate-status") return respond(await c.notFound()); // drift guard
+  const record = await resolveMigrationRecord(c.env.DB, repo.id);
+  if (record === null) return respond(migrateStatusNotFoundResponse());
+  const derived = deriveMigrationStatus(record);
+  const canSeeFailure = viewer.kind === "user" && (await canAdminRepo(c.env, repo, viewer));
+  return respond(migrateStatusResponse(migrateStatusPayload(derived, canSeeFailure)));
+}
+
+/** POST /{owner}/{repo}/settings/migrate/retry (web.go:1281-1283 — the
+ *  settings admin gate; "missing" answers upstream's ServerError 500,
+ *  both other outcomes ctx.JSONOK's {}). */
+async function repoMigrateRetryRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { repo, respond } = resolved;
+  if (resolved.route.family !== "repo-migrate-retry") return respond(await c.notFound()); // drift guard
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  const outcome = await retryMigration(c.env.DB, c.env, { id: repo.id, ownerNamespace: repo.ownerNamespace, slug: repo.slug }, routeNow());
+  if (outcome === "missing") {
+    return respond(new Response("task does not exist or you do not have access to this task\n", { status: 500 }));
+  }
+  return respond(new Response("{}", { headers: { "content-type": "application/json;charset=utf-8" } }));
+}
+
+/** POST /{owner}/{repo}/settings/migrate/cancel — EVERY arm redirects onto
+ *  the repo home (migrate.go:257/267, including the missing-record miss). */
+async function repoMigrateCancelRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { repo, respond } = resolved;
+  if (resolved.route.family !== "repo-migrate-cancel") return respond(await c.notFound()); // drift guard
+  const gate = await settingsGate(c, resolved);
+  if (gate !== null) return gate;
+  await cancelMigration(c.env.DB, { id: repo.id }, routeNow());
+  return respond(new Response(null, { status: 303, headers: { location: `/${repo.ownerNamespace}/${repo.slug}` } }));
 }
 
 /** GET /{owner}/{repo}/settings (pages/settings.tsx — the basics form). */
@@ -17003,6 +17088,11 @@ uiRouter.get("/:owner/:repo/pulls/:index/commits", (c) => uiPage(c));
 // Wave-4 write families (parseUiRoute claims exactly these shapes; the
 // POSTs run the §2.8 sameOriginGuard first — session.ts's convention).
 uiRouter.get("/:owner/:repo/settings", (c) => settingsPage(c));
+// The migration status/retry/cancel arms (web.go:1172-1174 + :1281-1283 —
+// the a0f3f40 salvage's mount).
+uiRouter.get("/:owner/:repo/-/migrate/status", (c) => repoMigrateStatusRoute(c));
+uiRouter.post("/:owner/:repo/settings/migrate/retry", (c) => repoMigrateRetryRoute(c));
+uiRouter.post("/:owner/:repo/settings/migrate/cancel", (c) => repoMigrateCancelRoute(c));
 // Window-2d: the four settings tabs.
 uiRouter.get("/:owner/:repo/settings/hooks/git", (c) => repoGitHooksPage(c));
 uiRouter.get("/:owner/:repo/settings/hooks/git/:name", (c) => repoGitHookEditPage(c));
