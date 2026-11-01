@@ -6,18 +6,24 @@
  * and models/actions/run_job.go:642-687 (AggregateJobStatus / the
  * attempt-run status mirror).
  *
- * THE STAGED SHAPE: the M3 job emitter (needs-graph re-resolution,
- * `if:` evaluation) and the commit-status family are NOT here — M1b ports
- * their LIFECYCLE side effects that the runner protocol must not skip:
- * the attempt+run aggregate recompute (refreshRunStatus, the M1b substitute
- * for the emitter's run-status leg), the tasks_version wake bumps (run_job.go
- * 504-527), and the ephemeral-runner removal (UpdateTask's IsDone arm).
+ * THE COMPLETION-PATH EMITTER (the M3 rewire): updateTask's tail carries the
+ * two arms upstream's handler runs after the state machine — the
+ * unconditional CreateCommitStatusForRunJobs (runner.go:263) and, for any
+ * non-unspecified report, EmitJobsIfReadyByRun (runner.go:270-276) through
+ * trigger.ts's checkJobsOfRun. The emitter call is the SPEC-0012 §4.5 inline
+ * posture (bounded needs-graph work runs inside the UpdateTask request, the
+ * same way the trigger insert tail runs its post-commit kick); without it a
+ * completed job A never releases its needs-dependent sibling B — the job
+ * stays un-pickable (the dispatch scan picks WAITING only) and the run hangs
+ * until the abandoned sweep. The notifier half of upstream's tail
+ * (NotifyWorkflowJobStatusUpdateWithTask / NotifyWorkflowRunStatusUpdateWithReload,
+ * runner.go:266-277) has no port — the statuses refresh inside the emitter
+ * pass is the visible arm (no websocket fanout on Workers).
  * StopTask's terminal arm carries the same hook family on its path (the
  * UpdateRunJob version bump, the UpdateTask ephemeral removal, and — for the
  * sweep callers that pass the storage env — the clear_tasks.go log transfer),
  * plus the stranded-claim finalizer for the claim window the transactional
  * upstream claim cannot have (see finalizeStrandedTasksOfJob).
- * M3 replaces the aggregate arm with EmitJobsIfReadyByRun.
  */
 
 import { and, eq, inArray, ne, sql } from "drizzle-orm";
@@ -33,7 +39,7 @@ import {
   actionTaskSteps,
   actionTasks,
 } from "../../db/schema";
-import type { RunJobRow, TaskRow } from "./model";
+import { getRepoById, type RunJobRow, type TaskRow } from "./model";
 import { decodeLogIndexes, encodeLogIndexes, nextChunkSeq, readLogs, renderLogAppend, sealLogsToStorage } from "./logs";
 import {
   ACTION_STATUS_CANCELLED,
@@ -50,6 +56,11 @@ import {
   statusToResult,
 } from "./model";
 import type { StepState, TaskState, UpdateLogRequest, UpdateTaskRequest } from "./wire";
+// The cycle with ./trigger is function-level lazy (this module only CALLS the
+// emitter inside updateTask's body; trigger's imports of this module are the
+// hoisted refreshRunStatus/stopTask declarations) — ESM resolves it at call
+// time, the exact shape the M3 rewire was staged for.
+import { checkJobsOfRun, createCommitStatusForRunJobs } from "./trigger";
 
 type D1 = D1Database;
 
@@ -552,9 +563,13 @@ export interface UpdateTaskOutcome {
  * The UpdateTask handler service: state machine → outputs (≤255-byte keys /
  * ≤1 MiB values, skipped not fatal) → sentOutputs (all stored keys) → the
  * lifecycle side effects (run aggregate, tasks_version wake, ephemeral
- * removal).
+ * removal) → the completion-path emitter (module header: the unconditional
+ * commit-status post, then EmitJobsIfReadyByRun for a non-unspecified
+ * report). `appUrl` spells the commit-status target URLs (the request
+ * origin, the routes handler's appUrlOf; the emitter pass itself runs with
+ * "" the way trigger.ts's callers do when no origin is at hand).
  */
-export async function updateTask(d1: D1, runnerId: number, req: UpdateTaskRequest): Promise<UpdateTaskOutcome> {
+export async function updateTask(d1: D1, runnerId: number, req: UpdateTaskRequest, appUrl = ""): Promise<UpdateTaskOutcome> {
   if (req.state === undefined) {
     throw new Error("state is required");
   }
@@ -588,15 +603,47 @@ export async function updateTask(d1: D1, runnerId: number, req: UpdateTaskReques
     throw new Error(`actions: job ${task.jobId} for task ${task.id} vanished`);
   }
 
-  // The lifecycle writes (M1b's emitter substitute — module header):
-  // the attempt/run aggregate, the tasks_version wake, ephemeral removal.
+  // The lifecycle writes: the attempt/run aggregate (the completing job's
+  // own flip lands here first — the emitter below re-reads DB truth), the
+  // tasks_version wake, ephemeral removal.
   await refreshRunStatus(d1, job.repoId, job.runId, job.runAttemptId);
   if (!preJobWasDone && isDoneStatus(task.status)) {
-    // Only bump when waiting work remains (run_job.go:513-527).
+    // Only bump when waiting work remains (run_job.go:513-527). The emitter
+    // below carries its own wake arm for the jobs IT flips (a needs-wake
+    // bumps again, exactly upstream's double UpdateRunJob hook).
     if (await hasWaitingJobsToPick(d1, job.repoId)) {
       await increaseTaskVersion(d1, job.ownerId, job.repoId);
     }
     await deleteEphemeralRunner(d1, task.runnerId);
+  }
+
+  // The completion-path emitter (runner.go:263-276, module header): the
+  // unconditional commit-status post for the completing job, then — for any
+  // non-unspecified report — the run's needs-graph pass. The pass is the arm
+  // that wakes needs-dependent siblings: checkJobsOfRun flips PENDING/BLOCKED
+  // jobs to WAITING (the `if:` gate, deferred matrices and the concurrency
+  // gates included), bumps the version when work became pickable, refreshes
+  // the attempt/run aggregate, and re-posts the run's statuses — inline, the
+  // SPEC-0012 §4.5 bounded-work posture (the trigger insert tail runs the
+  // same pass inline after its inserts).
+  const runRows = await db.select().from(actionRuns).where(eq(actionRuns.id, job.runId)).limit(1);
+  const run = runRows[0];
+  if (run !== undefined) {
+    const repo = await getRepoById(d1, job.repoId);
+    await createCommitStatusForRunJobs(
+      d1,
+      {
+        run,
+        repoOwnerNamespace: repo?.ownerNamespace ?? "",
+        repoSlug: repo?.slug ?? "",
+        eventPayloadJson: run.eventPayload,
+        appUrl,
+      },
+      [job],
+    );
+  }
+  if (req.state.result !== RUNNERV1_RESULT.UNSPECIFIED) {
+    await checkJobsOfRun(d1, job.runId);
   }
 
   return {

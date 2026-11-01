@@ -322,6 +322,42 @@ describe("updateTaskByState — the state machine", () => {
     expect(rows).toHaveLength(0);
   });
 
+  it("completing job A wakes its needs-dependent B (the completion-path emitter, runner.go:263-276)", async () => {
+    const seedInfo = await seed({
+      jobs: [{ jobId: "build" }, { jobId: "deploy", needs: ["build"] }],
+    });
+    // Post-insert posture: build dispatchable; the M1a seeding seam inserts
+    // every row WAITING flat, so deploy is staged to the needs-unmet state
+    // the producer's insert arm writes (PENDING — trigger.ts's insertRunJob
+    // status arm) before the chain runs.
+    const seeded = await db().select().from(actionRunJobs).where(eq(actionRunJobs.runId, seedInfo.runId));
+    expect(seeded.find((j) => j.jobId === "build")?.status).toBe(5); // waiting
+    expect(seeded.find((j) => j.jobId === "deploy")?.status).toBe(5); // the seam's flat WAITING
+    await db().update(actionRunJobs).set({ status: 9 }).where(eq(actionRunJobs.jobId, "deploy"));
+
+    const claim = await claimTask(seedInfo, "build");
+    await updateTask(env.DB, claim.runnerId, {
+      state: { id: claim.taskId, result: 1, startedAt: undefined, stoppedAt: undefined, steps: [], reportedSteps: [] },
+      outputs: {},
+    });
+
+    // THE PIN: the emitter ran on the completion path — no other writer can
+    // move deploy here. The update.ts:20 header promised this rewire; a run
+    // without it hangs until the abandoned sweep.
+    const deploy = (await db().select().from(actionRunJobs).where(eq(actionRunJobs.jobId, "deploy")))[0];
+    expect(deploy?.status).toBe(5); // waiting → claimable
+
+    // The chain finishes: claim + complete deploy, the run lands SUCCESS.
+    const claim2 = await claimTask(seedInfo, "deploy");
+    await updateTask(env.DB, claim2.runnerId, {
+      state: { id: claim2.taskId, result: 1, startedAt: undefined, stoppedAt: undefined, steps: [], reportedSteps: [] },
+      outputs: {},
+    });
+    const runRows = await db().select().from(actionRuns).where(eq(actionRuns.id, seedInfo.runId));
+    expect(runRows[0]?.status).toBe(1);
+    expect(runRows[0]?.stopped).not.toBeNull();
+  });
+
   it("finishing bumps the tasks_version only when waiting work remains", async () => {
     const seedInfo = await seed({ jobs: [{ jobId: "build" }, { jobId: "deploy" }] });
     const claim = await claimTask(seedInfo, "build");

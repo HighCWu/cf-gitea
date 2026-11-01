@@ -14,8 +14,6 @@
  *     throws and the claim releases (task.go's assembly-failure posture);
  *   - gitea_runtime_token / actions_id_token_request_*: omitted — they ride
  *     M1b's HS256 signer (§4.4's token-signing secret);
- *   - ref_protected: false — the SPEC-0013 protected-branch match service
- *     is wired at M3 with the commit-status family;
  *   - step rows: none inserted at claim (upstream parses them from the
  *     workflow payload via actionslib — the S/E tier's model rows);
  *     runner-REPORTED steps arrive through M1b's UpdateTask.
@@ -25,6 +23,7 @@ import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import {
+  actionRunAttempts,
   actionRunners,
   actionRuns,
   actionRunJobs,
@@ -33,6 +32,7 @@ import {
   actionVariables,
   secrets as actionSecrets,
 } from "../../db/schema";
+import { findRule } from "../branch-protection";
 import {
   generateSaltedToken,
   getRepoById,
@@ -108,19 +108,21 @@ function releasePickSlot(): void {
 /**
  * TryPickTask (task.go:41-53): bounded pick; throttled=true answers WITHOUT
  * touching the DB so the caller echoes the runner's stale tasks_version and
- * the runner retries on its next poll (runner.go:202-207).
+ * the runner retries on its next poll (runner.go:202-207). `signal` is the
+ * served request's AbortSignal — pickTask's disconnect check (task.go:123-128).
  */
 export async function tryPickTask(
   env: Env,
   d1: D1,
   runner: RunnerRow,
   appUrl = "",
+  signal?: AbortSignal | null,
 ): Promise<{ task: Task | null; throttled: boolean }> {
   if (!acquirePickSlot()) {
     return { task: null, throttled: true };
   }
   try {
-    const task = await pickTask(env, d1, runner, appUrl);
+    const task = await pickTask(env, d1, runner, appUrl, signal);
     return { task, throttled: false };
   } finally {
     releasePickSlot();
@@ -130,7 +132,8 @@ export async function tryPickTask(
 /**
  * FetchTask (runner.go:168-217) minus the wire codec: returns the response
  * message's contents. The runner's served tasksVersion is advisory — the
- * server always attempts a pick on mismatch.
+ * server always attempts a pick on mismatch. `signal` rides to pickTask's
+ * disconnect check (task.go:123-128).
  */
 export async function fetchTask(
   env: Env,
@@ -138,6 +141,7 @@ export async function fetchTask(
   runner: RunnerRow,
   runnerTasksVersion: number,
   appUrl = "",
+  signal?: AbortSignal | null,
 ): Promise<{ task: Task | undefined; tasksVersion: number }> {
   let latestVersion = await getTasksVersionByScope(d1, runner.ownerId, runner.repoId);
   if (latestVersion === 0) {
@@ -156,7 +160,7 @@ export async function fetchTask(
     if (freshRunner === undefined) {
       return { task: undefined, tasksVersion: latestVersion };
     }
-    const picked = await tryPickTask(env, d1, freshRunner, appUrl);
+    const picked = await tryPickTask(env, d1, freshRunner, appUrl, signal);
     if (picked.throttled) {
       // Keep the runner's STALE version so it retries on its next poll
       // instead of sleeping to the next bump (runner.go:202-207).
@@ -172,7 +176,7 @@ export async function fetchTask(
 // PickTask (services/actions/task.go:66-131)
 // ---------------------------------------------------------------------------
 
-async function pickTask(env: Env, d1: D1, runner: RunnerRow, appUrl: string): Promise<Task | null> {
+async function pickTask(env: Env, d1: D1, runner: RunnerRow, appUrl: string, signal?: AbortSignal | null): Promise<Task | null> {
   if (runner.isDisabled) {
     return null;
   }
@@ -203,7 +207,19 @@ async function pickTask(env: Env, d1: D1, runner: RunnerRow, appUrl: string): Pr
   }
 
   try {
-    return await buildRunnerTask(env, d1, claimed, appUrl);
+    const task = await buildRunnerTask(env, d1, claimed, appUrl);
+    // The disconnect check (task.go:123-128): the job was claimed and its
+    // payload assembled, but if the request died meanwhile the response can
+    // no longer reach the runner — release the claim so another poll picks
+    // the job up. Upstream reads ctx.Err(); the Workers analog is the served
+    // request's AbortSignal (workerd aborts it on client hangup). The
+    // answer-shape is null rather than a thrown error for the same reason:
+    // there is no runner left to deliver one to.
+    if (signal?.aborted) {
+      await releaseTaskForRunner(d1, claimed, claimed.job);
+      return null;
+    }
+    return task;
   } catch (err) {
     // The job was claimed but the payload failed: release the claim so the
     // job returns to the waiting queue (task.go:108-112, ReleaseTaskForRunner).
@@ -410,6 +426,43 @@ async function generateTaskContext(env: Env, d1: D1, appUrl: string, ctx: ClaimC
   const triggerUser =
     run.triggerUserId > 0 ? await getUserById(d1, run.triggerUserId) : null;
 
+  // ref_protected (context.go:63-68): the SAME resolution the insert-time
+  // buildGithubContext runs (trigger.ts:1190-1197) — branches through the
+  // landed branch-protection store (findRule ≈ IsBranchProtected,
+  // models/git/ref.go:16); tags and pull refs answer false exactly upstream
+  // (IsRefProtected's IsBranch/IsTag arms — the protected-tag store gap is
+  // trigger.ts's module-header disclosure), and a protection-check failure
+  // answers false (context.go:66-68's log-and-false arm).
+  let refProtected = false;
+  if (ref.startsWith("refs/heads/")) {
+    try {
+      refProtected = (await findRule(d1, run.repoId, shortName)) !== null;
+    } catch {
+      refProtected = false;
+    }
+  }
+
+  // triggering_actor (context.go:139-143): the ATTEMPT's trigger user — a
+  // re-run may initiate the attempt under a different user than the run's
+  // original actor (github.actor stays run.TriggerUser; upstream claims pass
+  // attempt=nil and fall back to the run's latest attempt — the job's own
+  // attempt row is that attempt here). A missing attempt or user leaves ""
+  // exactly upstream.
+  let triggeringActor = "";
+  if (job.runAttemptId > 0) {
+    const dbCtx = drizzle(d1);
+    const attemptRows = await dbCtx
+      .select({ triggerUserId: actionRunAttempts.triggerUserId })
+      .from(actionRunAttempts)
+      .where(eq(actionRunAttempts.id, job.runAttemptId))
+      .limit(1);
+    const attemptUserId = attemptRows[0]?.triggerUserId ?? 0;
+    if (attemptUserId > 0) {
+      const attemptUser = await getUserById(d1, attemptUserId);
+      triggeringActor = attemptUser?.username ?? "";
+    }
+  }
+
   const out: Record<string, unknown> = {
     // standard contexts (context.go:76-110)
     action: "",
@@ -429,8 +482,7 @@ async function generateTaskContext(env: Env, d1: D1, appUrl: string, ctx: ClaimC
     job: job.jobId,
     ref,
     ref_name: shortName,
-    // STAGED (module header): the SPEC-0013 protected-ref match lands at M3.
-    ref_protected: false,
+    ref_protected: refProtected,
     ref_type: refType,
     path: "",
     repository: fullName,
@@ -443,7 +495,7 @@ async function generateTaskContext(env: Env, d1: D1, appUrl: string, ctx: ClaimC
     secret_source: "Actions",
     server_url: appUrl,
     sha,
-    triggering_actor: "",
+    triggering_actor: triggeringActor,
     workflow: run.workflowId,
     workspace: "",
 

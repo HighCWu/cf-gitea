@@ -8,11 +8,13 @@
  *   POST /api/actions/runner.v1.RunnerService/Register   (no auth)
  *   POST /api/actions/runner.v1.RunnerService/{Method}   (runner auth)
  *
- * Protocol: connect unary. `application/proto` (the codec act_runner uses)
- * and `application/json` (protojson spelling) are both answered; any other
- * content-type answers 415 per the connect spec. The gRPC and gRPC-Web
- * protocol variants are not implemented (unary act_runner traffic is
- * connect; documented divergence, proto/WIRE-FREEZE.md).
+ * Protocol: connect unary over `application/proto` — the codec act_runner
+ * speaks, and the only one the ratified wire freeze covers
+ * (proto/WIRE-FREEZE.md). An `application/json` connect request answers
+ * connect `unimplemented`/501 (the freeze decision, spelled by
+ * decodeJsonRequest below), and any other content-type answers 415 per the
+ * connect spec. The gRPC and gRPC-Web protocol variants are not implemented
+ * (unary act_runner traffic is connect; documented divergence).
  *
  * The interceptor (interceptor.go:36-107): every RunnerService procedure
  * except Register requires `x-runner-uuid` + `x-runner-token`; the token is
@@ -392,7 +394,10 @@ export function createActionsRouter(): Hono<{ Bindings: Env; Variables: ActionsV
       encodeFetchTaskResponse,
       async (req: FetchTaskRequest, c) => {
         const runner = runnerOf(c);
-        const result = await fetchTask(c.env, c.env.DB, runner, req.tasksVersion, appUrlOf(c));
+        // The served request's AbortSignal is the Workers analog of upstream's
+        // request context (task.go:123-128): pickTask releases the claim when
+        // the client hung up while the payload was assembling.
+        const result = await fetchTask(c.env, c.env.DB, runner, req.tasksVersion, appUrlOf(c), c.req.raw.signal);
         return {
           task: result.task,
           tasksVersion: result.tasksVersion,
@@ -413,7 +418,7 @@ export function createActionsRouter(): Hono<{ Bindings: Env; Variables: ActionsV
       encodeUpdateTaskResponse,
       async (req: UpdateTaskRequest, c) => {
         const runner = runnerOf(c);
-        const outcome = await updateTask(c.env.DB, runner.id, req);
+        const outcome = await updateTask(c.env.DB, runner.id, req, appUrlOf(c));
         return {
           state: {
             id: outcome.stateId,

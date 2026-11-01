@@ -9,7 +9,10 @@
  *   semantics (first fetch bootstraps 0→1, no-task answers carry the latest
  *   version, unauthenticated/unknown-runner 401s) → the claim round-trip
  *   (a seeded waiting job is picked with the full Task payload, the job CAS
- *   flips, a second runner gets nothing).
+ *   flips, a second runner gets nothing) → the M1b ingestion loop → the
+ *   needs-chain E2E (completing job A over the live protocol wakes its
+ *   needs-dependent B through UpdateTask's completion-path emitter and the
+ *   run completes).
  */
 
 import { applyD1Migrations, SELF } from "cloudflare:test";
@@ -24,6 +27,7 @@ import {
   actionRuns,
   actionTasks,
   actionTasksVersions,
+  commitStatuses,
   repositories,
   repoUnits,
   users,
@@ -55,6 +59,7 @@ const CLEANUP_TABLES = [
   "action_artifacts",
   "action_run_job_summaries",
   "action_log_chunks",
+  "commit_statuses",
   "secrets",
   "action_variables",
   "repo_units",
@@ -769,5 +774,118 @@ describe("the M1b procedures (UpdateTask/UpdateLog)", () => {
     const runAfter = await db().select().from(actionRuns).where(eq(actionRuns.id, runId));
     expect(runAfter[0]?.status).toBe(1);
     expect(runAfter[0]?.stopped).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The completion-path emitter (A1 — runner.go:263-276 over the live protocol)
+// ---------------------------------------------------------------------------
+
+describe("the completion-path emitter (needs-chain E2E)", () => {
+  /** A two-job chain: build (no needs) → deploy (needs build). The payload
+   *  carries a head_commit so the commit-status family actually posts. */
+  const CHAIN_PAYLOAD = new TextEncoder().encode("name: ci\njobs:\n  build:\n    steps:\n      - run: echo hi\n");
+
+  async function seedNeedsChain(): Promise<{ runId: number }> {
+    const owner = await db()
+      .insert(users)
+      .values({
+        username: "owner-needs",
+        usernameLower: "owner-needs",
+        status: "active",
+        createdAt: new Date("2026-01-01T00:00:00Z"),
+      })
+      .returning({ id: users.id });
+    const ownerSeed = owner[0];
+    if (ownerSeed === undefined) throw new Error("owner seed failed");
+    const ownerId = ownerSeed.id;
+    await db().insert(repositories).values({
+      id: "repo-needs",
+      storageKey: "r_repo-needs",
+      ownerNamespace: "owner",
+      ownerId,
+      slug: "needs",
+      visibility: "public",
+    });
+    await db().insert(repoUnits).values({ repoId: "repo-needs", type: "actions" });
+    const { run } = await insertActionRun(
+      env.DB,
+      {
+        repoId: "repo-needs",
+        ownerId,
+        workflowId: ".gitea/workflows/ci.yml",
+        index: 1,
+        triggerUserId: ownerId,
+        ref: "refs/heads/main",
+        commitSha: "c".repeat(40),
+        event: "push",
+        eventPayload: JSON.stringify({ ref: "refs/heads/main", head_commit: { id: "d".repeat(40) } }),
+        triggerEvent: "push",
+        title: "ci",
+      },
+      [
+        { jobId: "build", needs: [], runsOn: ["ubuntu-latest"], workflowPayload: CHAIN_PAYLOAD },
+        { jobId: "deploy", needs: ["build"], runsOn: ["ubuntu-latest"], workflowPayload: CHAIN_PAYLOAD },
+      ],
+    );
+    return { runId: run.id };
+  }
+
+  it("completing job A over the wire wakes its needs-dependent B and the run completes", async () => {
+    const { runId } = await seedNeedsChain();
+
+    // Post-insert posture: build dispatchable (WAITING); deploy staged to
+    // the needs-BLOCKED posture (the emitter resolver's intermediate — the
+    // M1a seeding seam inserts every row WAITING flat, so the block is
+    // staged by hand; a live run holds B here whenever the run/job
+    // concurrency gate demotes it).
+    const seeded = await db().select().from(actionRunJobs).where(eq(actionRunJobs.runId, runId));
+    expect(seeded.find((j) => j.jobId === "build")?.status).toBe(5);
+    await db().update(actionRunJobs).set({ status: 7 }).where(eq(actionRunJobs.jobId, "deploy"));
+    expect(seeded.find((j) => j.jobId === "deploy")?.status).toBe(5);
+
+    await newRunnerTokenWithValue(env.DB, 0, "repo-needs", "reg-needs");
+    const runner = makeRunner();
+    await runner.register({ token: "reg-needs", name: "needs", labels: ["ubuntu-latest"] });
+
+    // Claim A only — the needs-unmet sibling is un-pickable.
+    const claimedA = await runner.poll();
+    const taskA = requireTask(claimedA);
+    expect(taskA.context?.["job"]).toBe("build");
+
+    // Complete A over the live protocol. THE A1 PIN: UpdateTask's tail runs
+    // the emitter (EmitJobsIfReadyByRun) — without it deploy never leaves
+    // its needs-unmet status and the run hangs until the abandoned sweep.
+    await runner.updateTask({ id: taskA.id, result: 1 }, {});
+    const deployAfter = (await db().select().from(actionRunJobs).where(eq(actionRunJobs.jobId, "deploy")))[0];
+    expect(deployAfter?.status).toBe(5); // needs-unmet → WAITING
+
+    // B is claimable now (the emitter's wake bump drives the next poll).
+    const claimedB = await runner.poll();
+    const taskB = requireTask(claimedB);
+    expect(taskB.context?.["job"]).toBe("deploy");
+
+    // Complete B: the run reaches completion.
+    await runner.updateTask({ id: taskB.id, result: 1 }, {});
+    const runRows = await db().select().from(actionRuns).where(eq(actionRuns.id, runId));
+    expect(runRows[0]?.status).toBe(1); // success
+    expect(runRows[0]?.stopped).not.toBeNull();
+
+    // The commit-status family rode the same path: each job's context ends
+    // at success (the unconditional post + the emitter's statuses refresh;
+    // identical-state reposts short-circuit).
+    const statuses = await db()
+      .select()
+      .from(commitStatuses)
+      .where(eq(commitStatuses.repoId, "repo-needs"))
+      .orderBy(commitStatuses.id);
+    const latestByContext = new Map<string, string>();
+    for (const s of statuses) latestByContext.set(s.context, s.state);
+    const buildCtx = [...latestByContext.keys()].find((c) => c.includes("build"));
+    const deployCtx = [...latestByContext.keys()].find((c) => c.includes("deploy"));
+    expect(buildCtx).toBeDefined();
+    expect(deployCtx).toBeDefined();
+    expect(latestByContext.get(buildCtx as string)).toBe("success");
+    expect(latestByContext.get(deployCtx as string)).toBe("success");
   });
 });

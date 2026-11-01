@@ -19,6 +19,7 @@ import {
   actionRunners,
   actionTasks,
   actionTasksVersions,
+  protectedBranches,
   repositories,
   repoUnits,
   secrets,
@@ -53,6 +54,8 @@ const CLEANUP_TABLES = [
   "action_artifacts",
   "action_run_job_summaries",
   "action_log_chunks",
+  "commit_statuses",
+  "protected_branches",
   "secrets",
   "action_variables",
   "repo_units",
@@ -327,6 +330,66 @@ describe("the claim + payload path", () => {
     // The waiting job bumps all three scopes.
     const rows = await db().select().from(actionTasksVersions);
     expect(rows).toHaveLength(3);
+  });
+});
+
+describe("the claim context's ref_protected + triggering_actor (A2, context.go:63-68/139-143)", () => {
+  it("a protected-branch run claims ref_protected:true with the attempt's trigger user", async () => {
+    const seedInfo = await seed();
+    const now = new Date();
+    await db().insert(protectedBranches).values({
+      repoId: seedInfo.repoId,
+      ruleName: "main",
+      rules: "{}",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const response = await fetchTask(env, env.DB, seedInfo.runner, 0, "");
+    const task = response.task;
+    expect(task).toBeDefined();
+    const context = (task as NonNullable<typeof task>).context ?? {};
+    // The claim-time resolution rides the landed branch-protection store
+    // (findRule ≈ IsBranchProtected) — the same call the insert-time
+    // buildGithubContext makes (trigger.ts:1190-1197).
+    expect(context.ref_protected).toBe(true);
+    // triggering_actor is the ATTEMPT's trigger user (context.go:139-143);
+    // actor stays the run's trigger user.
+    expect(context.triggering_actor).toBe("disp");
+    expect(context.actor).toBe("disp");
+  });
+
+  it("an unprotected branch claims ref_protected:false (the actor still rides)", async () => {
+    const seedInfo = await seed();
+    const response = await fetchTask(env, env.DB, seedInfo.runner, 0, "");
+    const task = response.task;
+    expect(task).toBeDefined();
+    const context = (task as NonNullable<typeof task>).context ?? {};
+    expect(context.ref_protected).toBe(false);
+    expect(context.triggering_actor).toBe("disp");
+  });
+});
+
+describe("the disconnect release (PickTask's ctx.Err() arm, task.go:123-128)", () => {
+  it("releases the claim when the request signal aborted during assembly", async () => {
+    const seedInfo = await seed();
+    const controller = new AbortController();
+    controller.abort(); // the client hung up before the response could land
+
+    const { task } = await fetchTask(env, env.DB, seedInfo.runner, 0, "", controller.signal);
+    expect(task).toBeUndefined();
+
+    // The claim is undone: the job returns to the waiting queue, no task row
+    // strands (an orphan RUNNING task would wedge an ephemeral runner's
+    // one-task-per-lifetime check forever).
+    const job = (await db().select().from(actionRunJobs).where(eq(actionRunJobs.jobId, "build")))[0];
+    expect(job?.taskId).toBe(0);
+    expect(job?.status).toBe(5);
+    expect(await db().select().from(actionTasks)).toHaveLength(0);
+
+    // A live poll afterwards claims the job again.
+    const second = await fetchTask(env, env.DB, seedInfo.runner, 0, "");
+    expect(second.task).toBeDefined();
   });
 });
 
