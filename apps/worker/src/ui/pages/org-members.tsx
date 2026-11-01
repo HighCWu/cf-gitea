@@ -53,10 +53,15 @@
  *   tier-2 identity has no keep-private flag.
  * - The per-row 2FA line (owner-only view) is unrendered — no two-factor
  *   model exists (members.tmpl:39-49).
- * - The `.item-trailing` actions are unrendered — the visibility toggle and
- *   the leave/remove buttons POST to `/members/action/*` (web.go:989), a
- *   write family outside this wave's inventory (dead controls forbidden,
- *   §2.4.1; the survey header keeps POST actions out of scope).
+ * - The `.item-trailing` actions (members.tmpl:50-71) render as REAL POST
+ *   forms against the landed `/members/action/*` write family (the O1
+ *   wave — upstream's link-action fetch buttons reduced to plain forms,
+ *   the orgTeamDeleteSubmit confirm-dialog reduction; the confirm
+ *   `<dialog>` is not reproduced and each POST runs the §2.8
+ *   sameOriginGuard server-side). The gates are the template's verbatim:
+ *   the visibility toggle shows for the viewer's own row or an org owner
+ *   (`or (eq $.SignedUser.ID .ID) $.IsOrganizationOwner`), Leave for the
+ *   viewer's own row, Remove for an owner on everyone else's.
  * - The avatar link is the placeholder glyph (the org-home avatar-slot rule;
  *   the name link carries the navigation, so the row loses nothing
  *   keyboard-reachable).
@@ -94,6 +99,10 @@ export const orgMembersLocale = {
   member_role: "Member Role:", // "org.members.member_role"
   owner: "Owner", // "org.members.owner"
   member: "Member", // "org.members.member"
+  make_hidden: "Make hidden", // "org.members.public_helper" — the toggle on a public row
+  make_visible: "Make visible", // "org.members.private_helper" — the toggle on a hidden row
+  leave: "Leave", // "org.members.leave"
+  remove: "Remove", // "org.members.remove"
 } as const;
 
 /** Upstream `setting.UI.MembersPagingNum` (modules/setting/ui.go:91). */
@@ -238,14 +247,31 @@ export async function resolveOrgMembersOrg(
 /**
  * One members.tmpl `.item` row (reductions in the module header): the
  * placeholder avatar glyph (not a link — the name link navigates), the name
- * link, the "Hidden" badge on non-public memberships, and — only when the
- * listing is not public-only — the member-role line with the owner's
- * shield-lock glyph inside the strong.
+ * link, the "Hidden" badge on non-public memberships, the member-role line
+ * with the owner's shield-lock glyph inside the strong (non-public-only
+ * listings), and members.tmpl:50-71's `.item-trailing` actions as real POST
+ * forms against `/org/{org}/members/action/{action}` (the O1 family): the
+ * visibility toggle for the viewer's own row or an org owner, Leave on the
+ * viewer's own row, Remove for an owner on the others'. Anonymous viewers
+ * get no actions (`$.SignedUser` is upstream's empty fake — the `eq` never
+ * matches and `IsOrganizationOwner` is false).
  */
-export function OrgMembersRowView(props: { row: OrgMembersRow; publicOnly: boolean }) {
-  const { row, publicOnly } = props;
+export function OrgMembersRowView(props: {
+  row: OrgMembersRow;
+  publicOnly: boolean;
+  /** The action-path prefix `/{org link}/members/action` — the handler
+   *  threads it so the row stays a pure function of data + gates. */
+  actionBase: string;
+  /** The signed-in viewer's id, or null (anonymous — no actions). */
+  viewerId: number | null;
+  /** The viewer's OrgAssignment IsOwner. */
+  isOrgOwner: boolean;
+}) {
+  const { row, publicOnly, actionBase, viewerId, isOrgOwner } = props;
   const username = row.user.username;
   const isOwner = row.membership.role === "owner";
+  const isSelf = viewerId !== null && viewerId === row.user.id;
+  const canToggle = isSelf || isOrgOwner;
   return (
     <div class="item">
       <div class="item-leading">
@@ -273,24 +299,70 @@ export function OrgMembersRowView(props: { row: OrgMembersRow; publicOnly: boole
           </div>
         ) : null}
       </div>
+      {canToggle || isSelf || isOrgOwner ? (
+        <div class="item-trailing">
+          {canToggle ? (
+            <form method="post" action={`${actionBase}/${row.membership.isPublic ? "private" : "public"}`}>
+              <input type="hidden" name="uid" value={row.user.id} />
+              <button type="submit" class="ui tiny button">
+                {row.membership.isPublic ? orgMembersLocale.make_hidden : orgMembersLocale.make_visible}
+              </button>
+            </form>
+          ) : null}
+          {isSelf ? (
+            <form method="post" action={`${actionBase}/leave`}>
+              <input type="hidden" name="uid" value={row.user.id} />
+              <button type="submit" class="ui red tiny button">
+                {orgMembersLocale.leave}
+              </button>
+            </form>
+          ) : isOrgOwner ? (
+            <form method="post" action={`${actionBase}/remove`}>
+              <input type="hidden" name="uid" value={row.user.id} />
+              <button type="submit" class="ui red tiny button">
+                {orgMembersLocale.remove}
+              </button>
+            </form>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }
 
 /** The full-document render (the render.tsx pattern — `index.ts` stays a
  *  pure-TS router module, so the JSX invocation lives beside the component;
- *  the `ownerPrompt` gate rides the options like the branches page's
- *  `canAdmin`, evaluated once per request in the handler). */
-export function renderOrgMembersPage(ctx: UiContext, data: OrgMembersData, options: { ownerPrompt: boolean }): string {
-  return renderPage(<OrgMembersPage ctx={ctx} data={data} ownerPrompt={options.ownerPrompt} />);
+ *  the gates ride the options like the branches page's `canAdmin`,
+ *  evaluated once per request in the handler). */
+export function renderOrgMembersPage(
+  ctx: UiContext,
+  data: OrgMembersData,
+  options: { ownerPrompt: boolean; viewerId: number | null; isOrgOwner: boolean },
+): string {
+  return renderPage(
+    <OrgMembersPage
+      ctx={ctx}
+      data={data}
+      ownerPrompt={options.ownerPrompt}
+      viewerId={options.viewerId}
+      isOrgOwner={options.isOrgOwner}
+    />,
+  );
 }
 
 /** The members page (§2.4.1 discriminator: members.tmpl:3's literal
  *  `organization members`). */
-export function OrgMembersPage(props: { ctx: UiContext; data: OrgMembersData; ownerPrompt: boolean }) {
+export function OrgMembersPage(props: {
+  ctx: UiContext;
+  data: OrgMembersData;
+  ownerPrompt: boolean;
+  viewerId: number | null;
+  isOrgOwner: boolean;
+}) {
   const { ctx, data } = props;
   const orgLink = `/${data.org.username}`;
   const basePath = `/org/${data.org.username}/members`;
+  const actionBase = `${basePath}/action`;
   // The pager preserves the `?q=` keyword (the org-teams pattern; upstream's
   // base/paginate keeps the query).
   const pageHref = (target: number): string => {
@@ -330,7 +402,15 @@ export function OrgMembersPage(props: { ctx: UiContext; data: OrgMembersData; ow
               <div class="item-main">{orgMembersLocale.no_results}</div>
             </div>
           ) : (
-            data.rows.map((row) => <OrgMembersRowView row={row} publicOnly={data.publicOnly} />)
+            data.rows.map((row) => (
+              <OrgMembersRowView
+                row={row}
+                publicOnly={data.publicOnly}
+                actionBase={actionBase}
+                viewerId={props.viewerId}
+                isOrgOwner={props.isOrgOwner}
+              />
+            ))
           )}
         </div>
         {data.page > 1 || data.more ? (

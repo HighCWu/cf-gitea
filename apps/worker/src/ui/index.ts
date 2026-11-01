@@ -687,7 +687,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { trimTrailingSlash } from "hono/trailing-slash";
 
 import { isReservedOwnerName } from "../repos/service";
-import { repositories, users } from "../db/schema";
+import { repositories, teamRepoAccess, users } from "../db/schema";
 import type { RunRow } from "../services/actions/model";
 import { engineClient } from "./engine";
 import { readUrlEncodedForm } from "./forms";
@@ -925,7 +925,13 @@ import {
   renderOrgTeamsPage,
   resolveOrgTeamsOrg,
 } from "./pages/org-teams";
-import type { TeamRecord } from "../api/routes/org-teams";
+// The O1 membership write arms compose the landed API-layer service half
+// (SPEC-0007 §3.5 — TeamsService's Add/RemoveTeamMember + repo grant pair)
+// and the org membership services (the visibility flip pair + the doer
+// membership read the members page already rides).
+import { TeamsService, type TeamRecord } from "../api/routes/org-teams";
+import { LastOrgOwnerError } from "../services/orgs/errors";
+import { isDoerOrgMember, setOrgMembershipPublic } from "../api/services/orgs";
 import {
   createOrgLabelFromForm,
   deleteOrgLabelFromForm,
@@ -1138,7 +1144,9 @@ import {
   renderUserSettingsBlockedPage,
 } from "./pages/user-settings-blocked";
 import type { BlockDoer } from "../api/services/blocks";
+import { isUserBlockedBy } from "../api/services/blocks";
 import type { Viewer as ApiViewer } from "../api/services/repository";
+import { findUserByName } from "../api/services/repository";
 // The two web JSON twins (web.go:766-767 — census gap #19).
 import {
   loadUserSearchCandidatesAux,
@@ -1757,7 +1765,7 @@ import { toApiUser } from "../api/auth";
 import { ApiError } from "../api/errors";
 import { IssuesService } from "../issues/service";
 import { deleteNoticesByIds, emptyNotices, parseNoticeIds } from "../services/notices";
-import type { OrgRecord } from "../services/orgs/orgs";
+import { OrgService, type OrgRecord } from "../services/orgs/orgs";
 // Window-2d: the four repo-settings tab modules.
 import {
   applyRepoGitHook,
@@ -3739,14 +3747,16 @@ export interface UserSettingsTabRoute {
  *  read them as a repository named "teams" — upstream shadows such a repo
  *  identically (web.go:993 registers ahead of :1292's
  *  `/{username}/{reponame}`). The deeper tails (`/{id}/repositories`,
- *  `/{id}/edit`, `/{id}/delete`, the `/action/*` writes) stay unclaimed →
- *  the engine's 404. The census R19 wave adds the NAME CARRIER on the
- *  detail family: a non-numeric `/{team}` segment claims the same detail
- *  arm resolved case-folded through the lower_name (upstream's EqualFold
- *  walk, services/context/org.go:213-218; a miss 404-shells, org.go:214-
- *  218 — upstream answers its 404 page for any team param, so the segment
- *  claim is upstream-shaped), while the five-segment edit/delete tails
- *  keep their positive-integer-only claims (the wave-49 shapes). */
+ *  `/{id}/edit`, `/{id}/delete`) plus the `/action/*` writes (the O1
+ *  membership families below) are the only tails this module claims;
+ *  every other tail stays unclaimed → the engine's 404. The census R19
+ *  wave adds the NAME CARRIER on the detail family: a non-numeric
+ *  `/{team}` segment claims the same detail arm resolved case-folded
+ *  through the lower_name (upstream's EqualFold walk,
+ *  services/context/org.go:213-218; a miss 404-shells, org.go:214-218 —
+ *  upstream answers its 404 page for any team param, so the segment claim
+ *  is upstream-shaped), while the five-segment edit/delete tails keep
+ *  their positive-integer-only claims (the wave-49 shapes). */
 export interface OrgTeamsRoute {
   family: "org-teams" | "org-team-new" | "org-team-detail";
   /** Decoded org segment. */
@@ -3756,6 +3766,53 @@ export interface OrgTeamsRoute {
   /** The team name (the detail family's R19 name carrier — decoded,
    *  resolved case-folded against lower_name at load). */
   name?: string;
+}
+
+/** The O1 org team-membership write families (upstream TeamsAction +
+ *  TeamsRepoAction, routers/web/org/teams.go:113-247/271-314 at
+ *  web.go:997-998's `m.Post("/teams/{team}/action/{action}")` +
+ *  `m.Post("/teams/{team}/action/repo/{action}")`): the web arms for
+ *  join/leave/add/remove on a team and the team's repo grant pair. The
+ *  `{action}` segment is upstream's path-param WILDCARD — the handlers
+ *  switch on it and an unknown token falls through to the default
+ *  redirect (teams.go:241-247), so the parse claims ANY non-empty token,
+ *  not a literal set. The team segment carries the detail family's two
+ *  forms (positive integer → id, otherwise the decoded R19 name carrier
+ *  resolved case-folded through lower_name). POST-only registrations (the
+ *  GET twins answer chi's 405 — the edit/delete convention); the member
+ *  ladder (web.go:993-1001's OrgAssignment{RequireMember,
+ *  RequireTeamMember}) runs in the handlers, the exact
+ *  org-member/team-member gates upstream's switch arms re-check
+ *  (IsOwner for join/add/remove, plain team membership for leave). */
+export interface OrgTeamActionRoute {
+  family: "org-team-action" | "org-team-repo-action";
+  /** Decoded org segment. */
+  owner: string;
+  /** The team id (the positive-integer carrier — the OrgTeamsRoute field
+   *  names, the parse spread's shapes). */
+  id?: number;
+  /** The team name (the decoded name carrier — case-folded at load). */
+  name?: string;
+  /** The action token (decoded; upstream's PathParam("action")). */
+  action: string;
+}
+
+/** The O1 org members write family (upstream MembersAction,
+ *  routers/web/org/members.go:82-136 at web.go:989's
+ *  `m.Post("/members/action/{action}")`): the members page's visibility
+ *  toggle (private/public), the owner's remove and the self leave. Same
+ *  wildcard `{action}` claim as the teams family; the members page family's
+ *  literal `org` + `members` segments extend with the literal `action`
+ *  (`/org/{org}/members/{other}` tails stay unclaimed → the engine's 404).
+ *  Upstream answers JSON (the template's link-action fetches); the no-JS
+ *  port POSTs real forms, so the arms reduce to 303s (the JSONRedirect
+ *  no-session-flash reduction, the team-delete convention). */
+export interface OrgMembersActionRoute {
+  family: "org-members-action";
+  /** Decoded org segment. */
+  owner: string;
+  /** The action token (decoded; upstream's PathParam("action")). */
+  action: string;
 }
 
 /** The wave-14 org labels management families (pages/org-labels.tsx): the
@@ -3963,6 +4020,8 @@ export type ParsedUiRoute =
   | SitemapRoute
   | SearchAuxRoute
   | OrgTeamsRoute
+  | OrgTeamActionRoute
+  | OrgMembersActionRoute
   | OrgLabelsRoute
   | OrgSettingsRoute
   | OrgDashboardRoute
@@ -4007,6 +4066,20 @@ export type ParsedUiRoute =
   | UserCodeSearchRoute
   | OrgInboxRoute;
 
+
+/** The `{team}` segment's two carrier forms, shared by the detail slice and
+ *  the O1 action families (the 4-segment detail arm's exact ladder):
+ *  a positive-integer segment parses to the id (int64 parity — "007" is 7),
+ *  anything else is the decoded name carrier (the R19 shape), an
+ *  undecodable segment parses nowhere (null → the engine's 404). */
+function parseTeamCarrier(segment: string): { id: number } | { name: string } | null {
+  if (/^\d+$/.test(segment)) return { id: Number.parseInt(segment, 10) };
+  try {
+    return { name: decodeURIComponent(segment) };
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Parse a repo-scoped pathname into a UI route, or `null` when the path is
@@ -4654,6 +4727,23 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     }
     return { family: "org-members", owner: orgName };
   }
+  // The O1 members write family (web.go:989's
+  // `m.Post("/members/action/{action}", org.MembersAction)`): the four
+  // segments above extended with the literal `action` fourth segment and
+  // the `{action}` tail a WILDCARD (upstream's path param — MembersAction's
+  // switch falls unknown tokens through to the JSON-OK arm, members.go:130,
+  // so the claim is shape-level). Any OTHER `members/{x}` tail stays
+  // unclaimed → the engine's 404; a junk-encoded token → null (the
+  // engine's 404).
+  if (raw.length === 6 && raw[1] === "org" && raw[3] === "members" && raw[4] === "action") {
+    let orgName: string;
+    try {
+      orgName = decodeURIComponent(raw[2] as string);
+      return { family: "org-members-action", owner: orgName, action: decodeURIComponent(raw[5] as string) };
+    } catch {
+      return null;
+    }
+  }
   // The ORG-scoped inbox families (pages/org-inbox.tsx — this wave's R07):
   // upstream web.go:986-991's exact 4-/5-segment shapes — the literal `org`
   // first segment (the /org group registers ahead of the dynamic pairs
@@ -4773,9 +4863,10 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // (pages/org-settings.tsx) adds the {id}/edit combo and the {id}/delete
   // write (web.go:1011-1013 — the same positive-integer claim, keyed on the
   // id carrier only: a name carrier has no landed edit/delete read arms,
-  // so five-segment name tails stay unclaimed → the engine's 404). Every
-  // other tail (`/{id}/repositories`, the `/action/*` writes) stays
-  // unclaimed → the engine's 404.
+  // so five-segment name tails stay unclaimed → the engine's 404). The O1
+  // wave claims the `/action/*` membership writes (web.go:997-998 — the
+  // OrgTeamActionRoute interface's note); `/{id}/repositories` and every
+  // other tail stays unclaimed → the engine's 404.
   // The org WORKTIME page (web.go:1015 — owner-only; the module's resolve
   // ladder owns the gates; the bare 3-segment shape only, deeper tails
   // stay engine-owned).
@@ -4800,6 +4891,31 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (raw.length === 5 && /^\d+$/.test(raw[3] as string)) {
       if (raw[4] === "edit") return { family: "org-team-edit", owner, id: Number.parseInt(raw[3] as string, 10) };
       if (raw[4] === "delete") return { family: "org-team-delete", owner, id: Number.parseInt(raw[3] as string, 10) };
+    }
+    // The O1 membership write families (web.go:997-998's POST pair): the
+    // literal `action` fourth segment, the team segment in either carrier
+    // form (the detail family's id/name shapes), and the `{action}` tail a
+    // WILDCARD (upstream's path param — TeamsAction's switch answers an
+    // unknown token with the default redirect, teams.go:241-247, so the
+    // claim is shape-level, not a literal set). A junk-encoded token or
+    // carrier decodes nowhere → null (the engine's 404).
+    if (raw.length === 6 && raw[4] === "action") {
+      const carrier = parseTeamCarrier(raw[3] as string);
+      if (carrier === null) return null;
+      try {
+        return { family: "org-team-action", owner, ...carrier, action: decodeURIComponent(raw[5] as string) };
+      } catch {
+        return null;
+      }
+    }
+    if (raw.length === 7 && raw[4] === "action" && raw[5] === "repo") {
+      const carrier = parseTeamCarrier(raw[3] as string);
+      if (carrier === null) return null;
+      try {
+        return { family: "org-team-repo-action", owner, ...carrier, action: decodeURIComponent(raw[6] as string) };
+      } catch {
+        return null;
+      }
     }
     return null;
   }
@@ -11189,7 +11305,23 @@ async function orgTeamDetailPage(c: Context<{ Bindings: Env }>): Promise<Respons
         ? await loadOrgTeamDetailDataByName(c.env.DB, resolved.org, route.name)
         : null;
   if (data === null) return respond(c.html(renderNotFound(ctx), 404));
-  return respond(c.html(renderOrgTeamDetailPage(ctx, data), 200));
+  // The write controls' gates (sidebar.tmpl:14-23 + members.tmpl /
+  // repositories.tmpl's IsOrganizationOwner conditionals), evaluated once
+  // per request: the owner posture rides the prologue's composition, the
+  // team membership is the viewer's row on THIS team.
+  const viewer = resolved.viewer;
+  const isTeamMember =
+    viewer.kind === "user" && (await new TeamsService(c.env.DB).isTeamMember(data.team.id, viewer.id));
+  return respond(
+    c.html(
+      renderOrgTeamDetailPage(ctx, data, {
+        viewerId: viewer.kind === "user" ? viewer.id : null,
+        isOrgOwner: await canManageOrgTeams(c.env.DB, resolved.org, viewer),
+        isTeamMember,
+      }),
+      200,
+    ),
+  );
 }
 
 /** GET /{org}/teams/new (pages/org-teams.tsx — the create form; the same
@@ -13401,6 +13533,376 @@ async function orgTeamDeleteSubmit(c: Context<{ Bindings: Env }>): Promise<Respo
   const location =
     result.outcome === "deleted" ? `/${org.username}/teams` : `/${org.username}/teams/${team.id}/edit`;
   return respond(new Response(null, { status: 303, headers: { location } }));
+}
+
+// ---------------------------------------------------------------------------
+// The O1 org membership write families (web.go:989 + 997-998 — the members
+// action POST, the team action POST and the team repo action POST;
+// routers/web/org/members.go:82-136 + teams.go:113-247/271-314). The web
+// arms compose the landed API-layer service half — TeamsService's
+// Add/RemoveTeamMember + repo grant pair, OrgService.removeMember (the
+// RemoveOrgUser port) and the membership visibility flip — no logic is
+// duplicated. Upstream answers the members family in JSON (the template's
+// link-action fetches) and the teams families with redirects; the no-JS
+// port POSTs real forms everywhere, so every success arm reduces to a 303
+// (the JSONRedirect no-session-flash reduction, orgTeamDeleteSubmit's
+// convention) and every flash arm loses only its message (the
+// no-flash-plumbing reduction, the last-owner precedent). Form integers
+// ride the landed `formInt64` (repo-settings-actions-general.tsx — Go's
+// FormInt64 junk→0 parity); the repo-grant `repoid` is the schema's string
+// id and passes through verbatim.
+// ---------------------------------------------------------------------------
+
+/**
+ * `checkIsOrgMemberAndRedirect` (teams.go:249-262): after a removal the
+ * doer who is no longer an org member — and not an admin — leaves the
+ * teams subtree entirely: a private org redirects to the site root (the
+ * AppSubURL reduction), a public/limited one to the org home; a still-
+ * member (or admin) takes the default teams target.
+ */
+async function orgRemovalRedirectTarget(
+  d1: D1Database,
+  org: OrgRecord,
+  viewer: Viewer,
+  defaultLocation: string,
+): Promise<string> {
+  if (viewer.kind !== "user") return defaultLocation;
+  if (viewer.isAdmin) return defaultLocation;
+  const membership = await new OrgService(d1).getMembership(org.id, viewer.id);
+  if (membership !== null) return defaultLocation;
+  return org.visibility === "private" ? "/" : `/${org.username}`;
+}
+
+/**
+ * The teams action families' prologue (the owner-gated
+ * `resolveOrgTeamsRequest`'s MEMBER-level twin — upstream's teams action
+ * group runs OrgAssignment{RequireMember, RequireTeamMember},
+ * web.go:993-1001, NOT require-owner; the IsOwner re-checks live inside
+ * TeamsAction's switch arms): the session half, the owner-segment drift
+ * guard, the org resolution (307/404-shell), the anonymous login 303 (the
+ * landed family posture), then the org-member gate (org.go:106-120's
+ * IsMember — owner or membership row; a signed-in outsider 404-shells),
+ * then the team resolution (id, or the R19 case-folded name carrier) and
+ * RequireTeamMember (org.go:216-231 — owner/admin or a membership row on
+ * THIS team; everything else 404-shells like upstream's NotFound).
+ */
+type ResolvedOrgTeamAction = Extract<ResolvedUiSession, { ok: true }> & {
+  org: OrgRecord;
+  team: TeamRecord;
+  isOwner: boolean;
+};
+
+async function resolveOrgTeamActionRequest(c: Context<{ Bindings: Env }>): Promise<ResolvedOrgTeamAction | { ok: false; response: Response }> {
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved;
+  const { url, ctx, viewer, respond } = resolved;
+  const route = resolved.route;
+  if (!("owner" in route) || !("action" in route)) return { ok: false, response: respond(await c.notFound()) }; // drift guard
+  const doer = orgFamilyDoer(viewer);
+  const query = url.search.startsWith("?") ? url.search.slice(1) : url.search;
+  const org = await resolveOrgTeamsOrg(c.env.DB, route.owner, doer, url.pathname, query);
+  if (org.kind === "redirect") {
+    return { ok: false, response: respond(new Response(null, { status: 307, headers: { location: org.location } })) };
+  }
+  if (org.kind === "missing") return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
+  if (viewer.kind === "anonymous") return { ok: false, response: respond(loginRedirect(url.pathname + url.search)) };
+  const isOwner = await canManageOrgTeams(c.env.DB, org.org, viewer);
+  // RequireMember (web.go:993-1001): owners and org members pass.
+  if (!isOwner && doer.id !== null && !(await isDoerOrgMember(new OrgService(c.env.DB), org.org, doer))) {
+    return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
+  }
+  const service = new TeamsService(c.env.DB);
+  const teamId = "id" in route && typeof route.id === "number" ? route.id : undefined;
+  const teamName = "name" in route && typeof route.name === "string" ? route.name : undefined;
+  const team =
+    teamId !== undefined
+      ? (await service.getTeamById(teamId)) ?? null
+      : teamName !== undefined
+        ? (await service.getTeamByName(org.org.id, teamName)) ?? null
+        : null;
+  if (team === null || team.orgId !== org.org.id) return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
+  // RequireTeamMember (org.go:216-231): privileged or on the team.
+  if (!isOwner && doer.id !== null && !(await service.isTeamMember(team.id, doer.id))) {
+    return { ok: false, response: respond(c.html(renderNotFound(ctx), 404)) };
+  }
+  return { ...resolved, org: org.org, team, isOwner };
+}
+
+/** The team detail slice URL (the id-carrier internal-link convention —
+ *  upstream redirects onto `/{org}/teams/{lowername}`; the slice's
+ *  route-shape note keys on the id). */
+function orgTeamSliceLocation(org: OrgRecord, team: TeamRecord): string {
+  return `/${org.username}/teams/${team.id}`;
+}
+
+/**
+ * POST /{org}/teams/{team}/action/{action} (upstream TeamsAction,
+ * routers/web/org/teams.go:113-247). The switch ladder, gate by gate:
+ *
+ *   - `join` — OWNER-only (`!ctx.Org.IsOwner` → 404, teams.go:117-121): an
+ *     org owner adds THEMSELVES to the team (a plain team member's join is
+ *     upstream's 404 too — join is not self-service). Already-member is
+ *     the landed addTeamMember's silent no-op (AddTeamMember's in-tx
+ *     re-check); a doer blocked by the org takes upstream's shared
+ *     ErrBlockedUser flash arm (teams.go:229-231) reduced to the
+ *     skip-and-redirect. Redirect: the teams LIST (the switch's empty
+ *     `page` default, teams.go:244-246).
+ *   - `leave` — any TEAM member (the RequireTeamMember prologue is the
+ *     only gate): RemoveTeamMember on the doer. The last-owner refusal
+ *     (ErrLastOrgOwner, teams.go:128-131) keeps the row and loses only
+ *     its flash; the redirect rides checkIsOrgMemberAndRedirect.
+ *   - `remove` — OWNER-only (teams.go:134-137): drops the `uid` member.
+ *     A zero/unknown uid redirects to the teams list (teams.go:139-143's
+ *     user==nil arm); the last-owner refusal as above; the redirect's
+ *     default target is the team page (teams.go:147).
+ *   - `add` — OWNER-only (teams.go:163-166): resolves `uname`
+ *     (lowercased — teams.go:168), an unknown user answers the
+ *     user_not_exist flash reduced to the team-page redirect
+ *     (teams.go:171-194 — at this pin there is no MailService, so the
+ *     email-invite branch upstream guards on `setting.MailService != nil`
+ *     is dead), an ORG row the cannot_add_org_to_team arm (196-202), a
+ *     blocked user the shared blocked arm, an already-member the
+ *     duplicate flash — the add itself rides the landed addTeamMember
+ *     (AddTeamMember ensures the ORG membership first). `page = "team"`:
+ *     the redirect target is the team page (223-226).
+ *   - `remove_invite` — OWNER-only (204-207): the invite store does not
+ *     exist at this pin (no MailService — invites are never created), so
+ *     both of upstream's arms (the iid==0 redirect, teams.go:209-213, and
+ *     the RemoveInviteByID write, 215-222) reduce to the team-page
+ *     redirect.
+ *   - anything else — upstream's switch falls through with `page` empty
+ *     (the wildcard param claim): the default teams-list redirect.
+ */
+async function orgTeamActionSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamActionRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, org, team, isOwner, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "org-team-action") return respond(await c.notFound()); // drift guard
+  const service = new TeamsService(c.env.DB);
+  const form = await readUrlEncodedForm(c.req.raw);
+  const teamsList = `/${org.username}/teams`;
+  const teamSlice = orgTeamSliceLocation(org, team);
+  switch (route.action) {
+    case "join":
+    {
+      if (!isOwner) return respond(c.html(renderNotFound(ctx), 404));
+      if (viewer.kind === "user") {
+        const blocked = await isUserBlockedBy(c.env.DB, { id: viewer.id, isAdmin: viewer.isAdmin }, team.orgId);
+        if (!blocked) await service.addTeamMember(team, viewer.id);
+      }
+      return respond(new Response(null, { status: 303, headers: { location: teamsList } }));
+    }
+    case "leave":
+    {
+      try {
+        if (viewer.kind === "user") await service.removeTeamMember(team, viewer.id);
+      } catch (error) {
+        if (!(error instanceof LastOrgOwnerError)) throw error; // the flash arm's message drops
+      }
+      const location = await orgRemovalRedirectTarget(c.env.DB, org, viewer, teamsList);
+      return respond(new Response(null, { status: 303, headers: { location } }));
+    }
+    case "remove":
+    {
+      if (!isOwner) return respond(c.html(renderNotFound(ctx), 404));
+      const uid = formInt64(form.get("uid"));
+      const target = uid === 0 ? null : ((await drizzle(c.env.DB).select().from(users).where(eq(users.id, uid)).get()) ?? null);
+      if (target === null) return respond(new Response(null, { status: 303, headers: { location: teamsList } }));
+      try {
+        await service.removeTeamMember(team, target.id);
+      } catch (error) {
+        if (!(error instanceof LastOrgOwnerError)) throw error;
+      }
+      const location = await orgRemovalRedirectTarget(c.env.DB, org, viewer, teamSlice);
+      return respond(new Response(null, { status: 303, headers: { location } }));
+    }
+    case "add":
+    {
+      if (!isOwner) return respond(c.html(renderNotFound(ctx), 404));
+      const uname = (form.get("uname") ?? "").trim().toLowerCase();
+      const target = uname === "" ? null : await findUserByName(c.env.DB, uname);
+      if (target === null || target.type === "org") {
+        // user_not_exist (no MailService — no invite branch) /
+        // cannot_add_org_to_team: the flash arms' redirect, messageless.
+        return respond(new Response(null, { status: 303, headers: { location: teamSlice } }));
+      }
+      const blocked = await isUserBlockedBy(c.env.DB, { id: target.id, isAdmin: target.isAdmin }, team.orgId);
+      if (!blocked) await service.addTeamMember(team, target.id); // already-member no-ops (the duplicate flash arm)
+      return respond(new Response(null, { status: 303, headers: { location: teamSlice } }));
+    }
+    case "remove_invite":
+    {
+      if (!isOwner) return respond(c.html(renderNotFound(ctx), 404));
+      // No invite store at this pin (no MailService — nothing to remove);
+      // both upstream arms reduce to the team-page redirect.
+      return respond(new Response(null, { status: 303, headers: { location: teamSlice } }));
+    }
+    default:
+      return respond(new Response(null, { status: 303, headers: { location: teamsList } }));
+  }
+}
+
+/**
+ * POST /{org}/teams/{team}/action/repo/{action} (upstream TeamsRepoAction,
+ * routers/web/org/teams.go:271-314): the owner-only repo grant pair.
+ * `!ctx.Org.IsOwner` 404s BEFORE the switch (teams.go:272-275); `add`
+ * resolves `repo_name` through path.Base within the TEAM's org (277-288 —
+ * an unknown repo answers the add_nonexistent_repo flash reduced to the
+ * redirect), `remove` drops the `repoid` grant (the landed removeTeamRepo's
+ * not-covered no-op is upstream's RemoveRepositoryFromTeam shape,
+ * repo_team.go:180-202), `addall`/`removeall` enumerate the org's/ team's
+ * repos over the same single-repo arms (AddAll/RemoveAllRepositoriesFromTeam,
+ * repo_team.go:72-100/102-126 — the covered/include-all skips ride the
+ * landed arms' no-ops). Upstream's addall/removeall answer JSONRedirect
+ * onto the repositories sub-page and the pair arms a plain Redirect there;
+ * this deployment merges that page into the team slice (the module
+ * header), so every arm lands on the slice.
+ */
+async function orgTeamRepoActionSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveOrgTeamActionRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, org, team, isOwner, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "org-team-repo-action") return respond(await c.notFound()); // drift guard
+  if (!isOwner) return respond(c.html(renderNotFound(ctx), 404)); // teams.go:272-275, before the switch
+  const service = new TeamsService(c.env.DB);
+  const form = await readUrlEncodedForm(c.req.raw);
+  const teamSlice = orgTeamSliceLocation(org, team);
+  switch (route.action) {
+    case "add":
+    {
+      // path.Base(ctx.FormString("repo_name")) — the search box may carry
+      // an org/repo pair; the base name resolves within the team's org.
+      const raw = form.get("repo_name") ?? "";
+      const name = raw.split("/").filter((part) => part !== "").pop() ?? "";
+      const found = name === "" ? null : await service.repoInOrg(org.id, name);
+      if (found === null) return respond(new Response(null, { status: 303, headers: { location: teamSlice } }));
+      await service.addTeamRepo(team, found.repo.id); // covered no-ops (TeamAddRepository's HasTeamRepo arm)
+      return respond(new Response(null, { status: 303, headers: { location: teamSlice } }));
+    }
+    case "remove":
+    {
+      const repoId = form.get("repoid") ?? "";
+      if (repoId !== "") await service.removeTeamRepo(team, repoId); // uncovered no-ops
+      return respond(new Response(null, { status: 303, headers: { location: teamSlice } }));
+    }
+    case "addall":
+    {
+      // AddAllRepositoriesToTeam's org enumeration (repo_team.go:79-95):
+      // every org repo through the single-repo arm; covered/include-all
+      // rows no-op inside addTeamRepo.
+      const orgRepos = await drizzle(c.env.DB)
+        .select({ id: repositories.id })
+        .from(repositories)
+        .where(eq(repositories.ownerId, org.id))
+        .all();
+      for (const repo of orgRepos) await service.addTeamRepo(team, repo.id);
+      return respond(new Response(null, { status: 303, headers: { location: teamSlice } }));
+    }
+    case "removeall":
+    {
+      // RemoveAllRepositoriesFromTeam (repo_team.go:102-126): an
+      // includes-all team no-ops; the rest drop every covered grant
+      // through the single-repo arm.
+      if (!team.includesAllRepositories) {
+        const covered = await drizzle(c.env.DB)
+          .select({ repoId: teamRepoAccess.repoId })
+          .from(teamRepoAccess)
+          .where(eq(teamRepoAccess.teamId, team.id))
+          .all();
+        for (const row of covered) await service.removeTeamRepo(team, row.repoId);
+      }
+      return respond(new Response(null, { status: 303, headers: { location: teamSlice } }));
+    }
+    default:
+      return respond(new Response(null, { status: 303, headers: { location: teamSlice } }));
+  }
+}
+
+/**
+ * POST /org/{org}/members/action/{action} (upstream MembersAction,
+ * routers/web/org/members.go:82-136). The uid resolves FIRST (82-90 — a
+ * zero/unknown uid is upstream's 404), then the switch:
+ *
+ *   - `private`/`public` — the doer themself or an org owner (98-100 /
+ *     105-107, else 404): ChangeOrgUserStatus through the landed
+ *     setOrgMembershipPublic (the API twin's exact arm). Upstream answers
+ *     JSONOK (the fetch-action's stay-on-page arm); the form port reloads
+ *     the members page.
+ *   - `remove` — OWNER-only (109-111, else 404): OrgService.removeMember
+ *     (the RemoveOrgUser port — the team sweep included). The last-owner
+ *     refusal keeps the row, messageless.
+ *   - `leave` — the doer's own membership (114-121): on success upstream
+ *     flashes organization_leave_success and JSONRedirects to the site
+ *     root — the 303 to "/" — and the last-owner refusal keeps the row.
+ *   - anything else — the switch falls through to JSONOK (130-132); the
+ *     form port reloads the members page.
+ */
+async function orgMembersActionSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, ctx, viewer, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "org-members-action") return respond(await c.notFound()); // drift guard
+  const doer = orgFamilyDoer(viewer);
+  const org = await resolveOrgMembersOrg(c.env.DB, route.owner, doer, url.pathname, orgFamilyQuery(url));
+  if (org.kind === "redirect") {
+    return respond(new Response(null, { status: 307, headers: { location: org.location } }));
+  }
+  if (org.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
+  const isOwner = await isOrgOwnerViewer(c.env.DB, org.org, viewer);
+  // The group's RequireMember (web.go:994-1001): owners and org members.
+  if (!isOwner && doer.id !== null && !(await isDoerOrgMember(new OrgService(c.env.DB), org.org, doer))) {
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  const form = await readUrlEncodedForm(c.req.raw);
+  const uid = formInt64(form.get("uid"));
+  const member = uid === 0 ? null : ((await drizzle(c.env.DB).select().from(users).where(eq(users.id, uid)).get()) ?? null);
+  if (member === null) return respond(c.html(renderNotFound(ctx), 404)); // members.go:84-89
+  const membersPage = `/org/${org.org.username}/members`;
+  const orgs = new OrgService(c.env.DB);
+  switch (route.action) {
+    case "private":
+    case "public":
+    {
+      if (doer.id !== member.id && !isOwner) return respond(c.html(renderNotFound(ctx), 404)); // members.go:98-100/105-107
+      await setOrgMembershipPublic(c.env.DB, org.org.id, member.id, route.action === "public");
+      return respond(new Response(null, { status: 303, headers: { location: membersPage } }));
+    }
+    case "remove":
+    {
+      if (!isOwner) return respond(c.html(renderNotFound(ctx), 404)); // members.go:109-111
+      try {
+        await orgs.removeMember(org.org.id, member.id);
+      } catch (error) {
+        if (!(error instanceof LastOrgOwnerError)) throw error; // the JSONError message drops
+      }
+      return respond(new Response(null, { status: 303, headers: { location: membersPage } }));
+    }
+    case "leave":
+    {
+      // members.go:114-116 — the DOER leaves (upstream removes ctx.Doer,
+      // ignoring the uid; the button posts uid=SignedUser.ID).
+      if (doer.id === null) return respond(c.html(renderNotFound(ctx), 404)); // unreachable past the anonymous gate
+      try {
+        await orgs.removeMember(org.org.id, doer.id);
+      } catch (error) {
+        if (!(error instanceof LastOrgOwnerError)) throw error;
+        return respond(new Response(null, { status: 303, headers: { location: membersPage } }));
+      }
+      return respond(new Response(null, { status: 303, headers: { location: "/" } })); // the JSONRedirect("/") arm
+    }
+    default:
+      return respond(new Response(null, { status: 303, headers: { location: membersPage } }));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -15933,9 +16435,18 @@ async function orgMembersPage(c: Context<{ Bindings: Env }>): Promise<Response> 
     return respond(new Response(null, { status: 307, headers: { location: org.location } }));
   }
   if (org.kind === "missing") return respond(c.html(renderNotFound(ctx), 404));
-  const ownerPrompt = await isOrgOwnerViewer(c.env.DB, org.org, viewer);
+  const isOrgOwner = await isOrgOwnerViewer(c.env.DB, org.org, viewer);
   const data = await loadOrgMembersData(c.env.DB, org.org, doer, url.searchParams);
-  return respond(c.html(renderOrgMembersPage(ctx, data, { ownerPrompt }), 200));
+  return respond(
+    c.html(
+      renderOrgMembersPage(ctx, data, {
+        ownerPrompt: isOrgOwner,
+        viewerId: viewer.kind === "user" ? viewer.id : null,
+        isOrgOwner,
+      }),
+      200,
+    ),
+  );
 }
 
 /**
@@ -17767,6 +18278,20 @@ uiRouter.get("/:owner/teams/:id/edit", (c) => orgTeamEditPage(c));
 uiRouter.post("/:owner/teams/:id/edit", (c) => orgTeamEditSubmit(c));
 uiRouter.post("/:owner/teams/:id/delete", (c) => orgTeamDeleteSubmit(c));
 uiRouter.get("/:owner/teams/:id/delete", () => methodNotAllowed("POST"));
+// The O1 membership write families (parseUiRoute claims exactly these
+// shapes — upstream web.go:997-998's two POST segments inside the
+// RequireMember+RequireTeamMember group; the gates run in the handlers,
+// resolveOrgTeamActionRequest's ladder). POST-only registrations beside
+// the wave-12/49 statics so they beat the dynamic /:owner/:repo block
+// (the wave-2e rule); the POST-only tails answer GET with chi's 405 —
+// the edit/delete convention — and the POSTs run the §2.8 sameOriginGuard
+// first. The `{action}` tail is upstream's wildcard param (the
+// OrgTeamActionRoute interface's note): unknown tokens 303 to the teams
+// default, exactly TeamsAction's fall-through.
+uiRouter.post("/:owner/teams/:team/action/:action", (c) => orgTeamActionSubmit(c));
+uiRouter.get("/:owner/teams/:team/action/:action", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/teams/:team/action/repo/:action", (c) => orgTeamRepoActionSubmit(c));
+uiRouter.get("/:owner/teams/:team/action/repo/:action", () => methodNotAllowed("POST"));
 // Wave-49 org settings family (parseUiRoute claims exactly these shapes —
 // upstream web.go:1017-1092's /settings subtree: the options combo (GET +
 // POST), the avatar write pair and the danger-zone rename/delete/visibility
@@ -18619,6 +19144,14 @@ uiRouter.get("/:owner{^(?!login$|logout$|healthz$)[\\w.-]+$}", (c) => ownerHomeP
 // sub-app's reach equal to the parser's, the drift guards absorbing any
 // future collision loudly).
 uiRouter.get("/org/:owner/members", (c) => orgMembersPage(c));
+// The O1 members write family (parseUiRoute claims the exact 6-segment
+// shape — upstream web.go:989's `m.Post("/members/action/{action}")`
+// inside the RequireMember group; the wave-23 tail-spot rationale
+// verbatim: the literal org/members/action segments carry no earlier
+// pattern, and the GET twin answers chi's 405 — the edit/delete
+// convention; the POST runs the §2.8 sameOriginGuard first).
+uiRouter.post("/org/:owner/members/action/:action", (c) => orgMembersActionSubmit(c));
+uiRouter.get("/org/:owner/members/action/:action", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/-/repositories", (c) => orgRepositoriesPage(c));
 // The owner heatmap JSON tail (parseUiRoute claims the exact 4-segment
 // shape — the `-` namespace's disjoint literal; GET-only, the JSON feed).

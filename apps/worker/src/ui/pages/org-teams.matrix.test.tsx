@@ -801,6 +801,87 @@ describe("the detail slice's sidebar arms (the permission shapes wave-12 never r
   });
 });
 
+// --- the detail slice's write controls (the O1 action families) -------------------
+
+describe("the detail slice's write controls (the O1 action families' rendered gates)", () => {
+  let world: TeamsWorld;
+
+  beforeEach(async () => {
+    world = await seedTeamsWorld();
+  });
+
+  it("renders the owner add form + per-member Remove on every member row and the Leave button for the owner's own membership", async () => {
+    // nadia owns the org AND sits on Alpha Crew — sidebar.tmpl:14-23's
+    // Leave rides the membership, members.tmpl:11-17's add form and
+    // :36-42's Remove ride IsOrganizationOwner.
+    const res = await getRoute(`/teamorgmx/teams/${world.alphaTeamId}`, world.ownerId);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const action = `/teamorgmx/teams/${world.alphaTeamId}/action`;
+    // The add form (the search input + the upstream label).
+    expect(html).toContain(`<form class="ui form ignore-dirty tw-flex tw-flex-wrap tw-gap-2" action="${action}/add" method="post">`);
+    expect(html).toContain('name="uname"');
+    expect(html).toContain(">Add team member</button>");
+    // One Remove form per member row (two members), each carrying the row's
+    // hidden uid (the repo rows' remove pair is the fourth test below).
+    expect((html.split(`action="${action}/remove"`).length - 1)).toBe(2);
+    // Leave (the membership) and NO Join (the owner is on the team).
+    expect(html).toContain(`<form method="post" action="${action}/leave">`);
+    expect(html).not.toContain(`action="${action}/join"`);
+    expect(html).toContain(">Leave</button>");
+    // No confirm dialogs survive the reduction.
+    expect(html).not.toContain("data-modal");
+  });
+
+  it("renders the Join form for an owner not on the team, and the repo controls only off the includes-all flag", async () => {
+    // Public Squad: nadia is an owner NOT on the team — sidebar.tmpl's
+    // Join arm; the repo section is a plain (non-includes-all) team.
+    const res = await getRoute(`/teamorgmx/teams/${world.publicTeamId}`, world.ownerId);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const action = `/teamorgmx/teams/${world.publicTeamId}/action`;
+    expect(html).toContain(`<form method="post" action="${action}/join">`);
+    expect(html).toContain('<input type="hidden" name="page" value="team"/>');
+    expect(html).toContain(">Join</button>");
+    expect(html).not.toContain(`action="${action}/leave"`);
+    // repositories.tmpl:13-28 — the add form + the Add All / Remove All
+    // pair (the memberless team renders the empty arm below them).
+    expect(html).toContain(`<form class="ui form ignore-dirty tw-flex-1 tw-flex" action="${action}/repo/add" method="post">`);
+    expect(html).toContain('name="repo_name"');
+    expect(html).toContain(`action="${action}/repo/addall"`);
+    expect(html).toContain(`action="${action}/repo/removeall"`);
+    expect(html).toContain(">Add All</button>");
+    expect(html).toContain(">Remove All</button>");
+    expect(html).toContain("No repositories could be accessed by this team.");
+  });
+
+  it("suppresses the repo controls on an includes-all team (the canAddRemove pair) but keeps the member controls", async () => {
+    const res = await getRoute(`/teamorgmx/teams/${world.limitedTeamId}`, world.ownerId);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const action = `/teamorgmx/teams/${world.limitedTeamId}/action`;
+    expect(html).toContain("<li>All repositories</li>");
+    expect(html).not.toContain(`action="${action}/repo/`);
+    // The member add/remove pair is owner-only, membership-independent.
+    expect(html).toContain(`action="${action}/add"`);
+    // The covered repos render (the union flag), link-shaped, no per-repo
+    // remove forms.
+    expect(html).toContain(">teamorgmx/open-repo</a>");
+    expect(html).not.toContain(`action="${action}/repo/remove"`);
+  });
+
+  it("renders the per-repo remove forms keyed on the repo id for the owner on a plain team", async () => {
+    const res = await getRoute(`/teamorgmx/teams/${world.alphaTeamId}`, world.ownerId);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const action = `/teamorgmx/teams/${world.alphaTeamId}/action`;
+    // repositories.tmpl:45-49 — the submit button itself names repoid.
+    expect((html.split(`action="${action}/repo/remove"`).length - 1)).toBe(2);
+    expect(html).toContain('name="repoid"');
+    expect((html.match(/>Remove<\/button>/g) ?? []).length).toBe(4); // 2 members + 2 repos
+  });
+});
+
 // --- the create form's parse edges (beyond wave-12's typed 422s) ------------------
 
 describe("the create form's parse edges", () => {

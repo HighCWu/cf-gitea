@@ -51,12 +51,16 @@
  *   precedent). Upstream shadows a repo named "teams" identically: the org
  *   teams group registers at web.go:993, ahead of :1292's
  *   `/{username}/{reponame}`.
- * - The deeper tails beyond the wave-49 claims (`/teams/{id}/repositories`,
- *   the `/action/*` writes) stay unclaimed → the engine's 404, exactly
- *   upstream's unregistered-route 404 for a slice that has not landed them.
- *   Wave 49 (pages/org-settings.tsx) claimed `/teams/{id}/edit` + `/delete` —
- *   the detail sidebar's Settings button below is their entry link; this
- *   module's own routes are unchanged.
+ * - The deeper tails beyond the wave-49 claims (`/teams/{id}/repositories`)
+ *   stay unclaimed → the engine's 404. Wave 49 (pages/org-settings.tsx)
+ *   claimed `/teams/{id}/edit` + `/delete` — the detail sidebar's Settings
+ *   button below is their entry link. The O1 wave claims the membership
+ *   writes (`/teams/{team}/action/{action}` +
+ *   `/teams/{team}/action/repo/{action}` — web.go:997-998, the
+ *   OrgTeamActionRoute families in ui/index.ts, whose handlers carry
+ *   upstream's member-level RequireMember/RequireTeamMember ladder and
+ *   TeamsAction/TeamsRepoAction's owner re-checks); this module renders
+ *   their controls and keys its forms on the id carrier.
  *
  * ## Documented v1 degradations (§6 method)
  *
@@ -74,10 +78,19 @@
  *   `<img>` to a missing route is a dead link, the org-home avatar-slot
  *   rule); a memberless team renders the empty strip without upstream's
  *   add_team_member link (its target form does not exist here).
- * - The detail page's member add/remove forms, the repo add/remove forms,
- *   the join/leave buttons and the owner Settings (edit) button are not
- *   rendered — those write routes are not in this wave's UI inventory, and
- *   dead controls are forbidden (§2.4.1).
+ * - The detail page's write controls render against the O1 action families
+ *   (the module header's route-shape section) as REAL POST forms —
+ *   upstream's link-action buttons and confirm dialogs reduced (the
+ *   orgTeamDeleteSubmit convention; §2.8 guards server-side). The gates
+ *   are the templates' verbatim conditionals evaluated for the viewer:
+ *   sidebar.tmpl:14-23's Leave (a team member) / Join (an owner not on
+ *   the team) in the sidebar header, members.tmpl:11-17's owner add form
+ *   and :36-42's owner remove buttons (the owners-team single-member
+ *   guard is dead code here — no owners team rows exist under the §3.3
+ *   bridge), repositories.tmpl:13-28's owner add/add-all/remove-all
+ *   controls and :45-49's per-repo remove (the `canAddRemove` pair —
+ *   owner AND not includes-all).
+ * - The owner Settings (edit) button rides the wave-49 entry link below.
  * - The permission section renders the upstream desc paragraphs for
  *   write/admin teams (the `<strong>` pair of
  *   org.teams.write/admin_permission_desc); a team carrying `units_map`
@@ -144,6 +157,15 @@ export const orgTeamsLocale = {
   team_name_helper: "Team names should be short and memorable.", // "org.team_name_helper"
   create_team: "Create Team", // "org.create_team"
   team_settings_button: "Settings", // "org.teams.settings" — the wave-49 entry-link hunk (sidebar.tmpl:90; octicon-gear not in the icon allowlist)
+  join: "Join", // "org.teams.join"
+  leave: "Leave", // "org.teams.leave"
+  add_team_member: "Add team member", // "org.teams.add_team_member"
+  add: "Add", // "add"
+  add_all: "Add All", // "add_all"
+  remove_all: "Remove All", // "remove_all"
+  remove: "Remove", // "org.members.remove"
+  search_user_placeholder: "Search users…", // "search.user_kind" — the add-member input (members.tmpl:14)
+  search_repo_placeholder: "Search repositories…", // "search.repo_kind" — the add-repo input (repositories.tmpl:17)
   search: "Search", // cf-gitea addition — the submit label; upstream renders an
   // icon-only button (octicon-search), which is not in the landed icon
   // allowlist (scripts/gen-ui-icons.mjs is outside this wave's ownership).
@@ -266,13 +288,14 @@ export async function loadOrgTeamsData(
 }
 
 /** The team detail render inputs: the team row, its member rows and its
- *  covered repository slugs (the landed team read arms —
- *  listTeamMemberRows/listTeamRepoPairs, one page each). */
+ *  covered repositories (the landed team read arms — listTeamMemberRows/
+ *  listTeamRepoPairs, one page each; the repo rows carry the id the
+ *  remove form posts as `repoid`). */
 export interface OrgTeamDetailData {
   org: OrgRecord;
   team: TeamRecord;
   members: Array<typeof users.$inferSelect>;
-  repoSlugs: string[];
+  repos: Array<{ id: string; slug: string }>;
 }
 
 /**
@@ -294,7 +317,7 @@ export async function loadOrgTeamDetailData(
     org,
     team,
     members: members.items,
-    repoSlugs: repos.items.map((pair) => pair.repo.slug),
+    repos: repos.items.map((pair) => ({ id: pair.repo.id, slug: pair.repo.slug })),
   };
 }
 
@@ -578,23 +601,48 @@ export function OrgTeamsPage(props: { ctx: UiContext; data: OrgTeamsData }) {
   );
 }
 
-/** The full-document render for the detail slice. */
-export function renderOrgTeamDetailPage(ctx: UiContext, data: OrgTeamDetailData): string {
-  return renderPage(<OrgTeamDetailPage ctx={ctx} data={data} />);
+/** The full-document render for the detail slice (the action controls ride
+ *  the options — the ownerPrompt pattern, evaluated once per request). */
+export function renderOrgTeamDetailPage(
+  ctx: UiContext,
+  data: OrgTeamDetailData,
+  options: { viewerId: number | null; isOrgOwner: boolean; isTeamMember: boolean },
+): string {
+  return renderPage(
+    <OrgTeamDetailPage
+      ctx={ctx}
+      data={data}
+      viewerId={options.viewerId}
+      isOrgOwner={options.isOrgOwner}
+      isTeamMember={options.isTeamMember}
+    />,
+  );
 }
 
 /**
  * The team detail slice (§2.4.1 discriminator: `organization teams` —
  * members.tmpl/repositories.tmpl:3): sidebar.tmpl's six-wide column (name +
- * visibility badge, description, access + permission segments) beside the
- * ten-wide members list + repo-access list (upstream's two pages merged —
- * the module header). The org-team-navbar switch and every add/remove/join/
- * leave control are documented degradations (no write routes this wave).
+ * visibility badge, description, access + permission segments, and
+ * sidebar.tmpl:14-23's Leave/Join pair) beside the ten-wide members list
+ * (members.tmpl's owner add form + remove buttons) + repo-access list
+ * (repositories.tmpl's owner add/add-all/remove-all controls + per-repo
+ * remove) — upstream's two pages merged (the module header), the write
+ * controls posted against the O1 action families.
  */
-export function OrgTeamDetailPage(props: { ctx: UiContext; data: OrgTeamDetailData }) {
-  const { ctx, data } = props;
+export function OrgTeamDetailPage(props: {
+  ctx: UiContext;
+  data: OrgTeamDetailData;
+  viewerId: number | null;
+  isOrgOwner: boolean;
+  isTeamMember: boolean;
+}) {
+  const { ctx, data, viewerId, isOrgOwner, isTeamMember } = props;
   const orgLink = `/${data.org.username}`;
   const team = data.team;
+  // repositories.tmpl:14's pair — owner AND not includes-all (an
+  // includes-all team's coverage is the union flag, not grant rows).
+  const canAddRemoveRepos = isOrgOwner && !team.includesAllRepositories;
+  const teamActions = `${orgLink}/teams/${team.id}/action`;
   return (
     <BaseLayout ctx={ctx} title={orgDisplayName(data.org)} pageClass="organization teams">
       <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
@@ -607,6 +655,25 @@ export function OrgTeamDetailPage(props: { ctx: UiContext; data: OrgTeamDetailDa
                 <strong>{team.name}</strong>
                 <TeamBadges team={team} />
               </div>
+              {/* sidebar.tmpl:14-23 — Leave for a team member, Join for an
+                  owner not on the team (the confirm dialogs reduced to
+                  direct POSTs — the orgTeamDeleteSubmit convention). */}
+              {isTeamMember ? (
+                <form method="post" action={`${teamActions}/leave`}>
+                  <input type="hidden" name="uid" value={viewerId ?? ""} />
+                  <button type="submit" class="ui red mini compact button">
+                    {orgTeamsLocale.leave}
+                  </button>
+                </form>
+              ) : isOrgOwner ? (
+                <form method="post" action={`${teamActions}/join`}>
+                  <input type="hidden" name="page" value="team" />
+                  <input type="hidden" name="uid" value={viewerId ?? ""} />
+                  <button type="submit" class="ui primary mini compact button">
+                    {orgTeamsLocale.join}
+                  </button>
+                </form>
+              ) : null}
             </h4>
             <div class="ui attached segment">
               {team.description !== "" ? (
@@ -641,6 +708,21 @@ export function OrgTeamDetailPage(props: { ctx: UiContext; data: OrgTeamDetailDa
           {/* members.tmpl + repositories.tmpl — the merged ten-wide column. */}
           <div class="ui ten wide column">
             <h4 class="ui top attached header">{orgTeamsLocale.members}</h4>
+            {/* members.tmpl:11-17 — the owner's add form (the search box's
+                autocomplete JS reduced to the plain input; the email-invite
+                arm is dead at this pin — no MailService). */}
+            {isOrgOwner ? (
+              <div class="ui top attached segment">
+                <form class="ui form ignore-dirty tw-flex tw-flex-wrap tw-gap-2" action={`${teamActions}/add`} method="post">
+                  <div class="ui input tw-mr-2">
+                    <input name="uname" placeholder={orgTeamsLocale.search_user_placeholder} autocomplete="off" required />
+                  </div>
+                  <button type="submit" class="ui primary button">
+                    {orgTeamsLocale.add_team_member}
+                  </button>
+                </form>
+              </div>
+            ) : null}
             <div class="ui attached segment">
               {data.members.length === 0 ? (
                 <span class="tw-text-text-light tw-italic">{orgTeamsLocale.members_none}</span>
@@ -656,27 +738,81 @@ export function OrgTeamDetailPage(props: { ctx: UiContext; data: OrgTeamDetailDa
                           <a href={`/${member.username}`}>{member.username}</a>
                         </div>
                       </div>
+                      {/* members.tmpl:36-42 — the owner's Remove (the
+                          owners-team single-member guard is dead code under
+                          the §3.3 bridge — no owners team rows exist). */}
+                      {isOrgOwner ? (
+                        <div class="item-trailing">
+                          <form method="post" action={`${teamActions}/remove`}>
+                            <input type="hidden" name="uid" value={member.id} />
+                            <button type="submit" class="ui red button">
+                              {orgTeamsLocale.remove}
+                            </button>
+                          </form>
+                        </div>
+                      ) : null}
                     </div>
                   ))}
                 </div>
               )}
             </div>
             <h4 class="ui top attached header">{orgTeamsLocale.repositories}</h4>
+            {/* repositories.tmpl:13-28 — the owner's add form and the
+                add-all/remove-all pair (the confirm attributes reduced to
+                direct POSTs). */}
+            {canAddRemoveRepos ? (
+              <div class="ui top attached segment flex-text-block tw-flex-wrap">
+                <form
+                  class="ui form ignore-dirty tw-flex-1 tw-flex"
+                  action={`${teamActions}/repo/add`}
+                  method="post"
+                >
+                  <div class="ui input">
+                    <input name="repo_name" placeholder={orgTeamsLocale.search_repo_placeholder} autocomplete="off" required />
+                  </div>
+                  <button type="submit" class="ui primary button tw-ml-2">
+                    {orgTeamsLocale.add}
+                  </button>
+                </form>
+                <div class="tw-inline-block">
+                  <form class="tw-inline" method="post" action={`${teamActions}/repo/addall`}>
+                    <button type="submit" class="ui primary button">
+                      {orgTeamsLocale.add_all}
+                    </button>
+                  </form>
+                  <form class="tw-inline" method="post" action={`${teamActions}/repo/removeall`}>
+                    <button type="submit" class="ui red button">
+                      {orgTeamsLocale.remove_all}
+                    </button>
+                  </form>
+                </div>
+              </div>
+            ) : null}
             <div class="ui attached segment">
-              {data.repoSlugs.length === 0 ? (
+              {data.repos.length === 0 ? (
                 <span class="tw-text-text-light tw-italic">{orgTeamsLocale.repos_none}</span>
               ) : (
                 <div class="flex-divided-list items-with-main">
-                  {data.repoSlugs.map((slug) => (
+                  {data.repos.map((repo) => (
                     <div class="item tw-items-center">
                       <div class="item-leading">
                         <Icon name="octicon-repo" size={24} />
                       </div>
                       <div class="item-main">
-                        <a class="item-title tw-text-primary" href={`${orgLink}/${slug}`}>
-                          {data.org.username}/{slug}
+                        <a class="item-title tw-text-primary" href={`${orgLink}/${repo.slug}`}>
+                          {data.org.username}/{repo.slug}
                         </a>
                       </div>
+                      {/* repositories.tmpl:45-49 — the per-repo remove. */}
+                      {canAddRemoveRepos ? (
+                        <div class="item-trailing">
+                          <form method="post" action={`${teamActions}/repo/remove`}>
+                            <button type="submit" class="ui red small button" name="repoid" value={repo.id}>
+                              {orgTeamsLocale.remove}
+                            </button>
+                          </form>
+                        </div>
+                      ) : null}
                     </div>
                   ))}
                 </div>

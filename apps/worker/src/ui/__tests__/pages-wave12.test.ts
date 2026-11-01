@@ -177,7 +177,15 @@ describe("wave-12 parser families (parseUiRoute / handlesUiRoute)", () => {
     // org-settings.tsx) — the assertion below is that wave's claim now.
     expect(parseUiRoute("/acme/teams/42/edit")).toEqual({ family: "org-team-edit", owner: "acme", id: 42 });
     expect(parseUiRoute("/acme/teams/42/delete")).toEqual({ family: "org-team-delete", owner: "acme", id: 42 });
-    expect(parseUiRoute("/acme/teams/42/action/join")).toBeNull();
+    // {id}/action/{action} flipped to the O1 membership-write family
+    // (ui/index.ts OrgTeamActionRoute — web.go:997-998's POST pair); the
+    // assertion below is that wave's claim now.
+    expect(parseUiRoute("/acme/teams/42/action/join")).toEqual({
+      family: "org-team-action",
+      owner: "acme",
+      id: 42,
+      action: "join",
+    });
     // The census R19 wave: a NON-NUMERIC segment is now the NAME carrier —
     // upstream's team page takes any {team} param and resolves it
     // case-folded against the lower names (org.go:213-218), 404-shelling

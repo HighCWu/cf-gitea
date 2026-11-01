@@ -22,7 +22,9 @@ import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../auth/testing/seeds";
 import { applyTwofaEnrollment, clearTwofaSetCookie, generateTotpSecret, mintPendingTicket } from "../auth/two-factor";
 import { totpCode } from "../auth/totp";
-import { comments, externalLoginUsers, issuePins, issues, loginSources, repositories, repoSettings, trackedTimes, twoFactor, users } from "../db/schema";
+import { comments, externalLoginUsers, issuePins, issues, loginSources, orgMembers, repositories, repoSettings, teamMembers, trackedTimes, twoFactor, users } from "../db/schema";
+import { TeamsService } from "../api/routes/org-teams";
+import { OrgService } from "../services/orgs/orgs";
 import { serializeOAuth2SourceConfig } from "../services/auth-sources/cfg";
 import { createLoginSource, ensureExternalLogin, LoginSourceType } from "../services/auth-sources/store";
 import { getOrInsertBlob, packageBlobContentKey } from "../services/packages/blobs";
@@ -1620,5 +1622,392 @@ describe("the five dead-route fixes' route pins", () => {
     // A missing timeid: the handler's 404 shell (the row lookup misses).
     const miss = await fetchAs("/alice/hello/issues/1/times/9999/delete", cookie, urlEncoded({}));
     expect(miss.status).toBe(404);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// The O1 org membership write families (web.go:989 + 997-998) — parse
+// claims, the member-level gate ladder, the permission matrices and the
+// no-flash 303 reductions, over the mounted uiRouter with minted sessions.
+// The file's beforeEach truncates the tables between tests, so every test
+// seeds its own org through the landed OrgService/TeamsService arms the
+// handlers compose (the F4 fixture pattern).
+// ---------------------------------------------------------------------------
+
+describe("O1 org membership write families (web.go:989 + 997-998)", () => {
+  const T0 = 1_700_000_000;
+
+  async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
+    return uiRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
+  }
+
+  async function sessionHeader(userId: number): Promise<string> {
+    return `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, userId)}`;
+  }
+
+  const formPost = (path: string, body: Record<string, string>, cookie?: string, origin = "https://test.local"): RequestInit => ({
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      origin,
+      ...(cookie === undefined ? {} : { cookie }),
+    },
+    body: new URLSearchParams(body).toString(),
+  });
+
+  /** The shared org fixture: owner, two Developers members, an outsider, a
+   *  site admin, the Developers team, and two org repos for the grant
+   *  arms. Answered per test (the truncate-and-reseed convention). */
+  async function seedOrgFixture(): Promise<{
+    ownerId: number;
+    memberId: number;
+    member2Id: number;
+    outsiderId: number;
+    orgId: number;
+    teamId: number;
+    repoIds: string[];
+  }> {
+    const orgs = new OrgService(env.DB);
+    const owner = await seedVerifiedUser({ username: "o1-owner" });
+    const member = await seedVerifiedUser({ username: "o1-member" });
+    const member2 = await seedVerifiedUser({ username: "o1-member2" });
+    const outsider = await seedVerifiedUser({ username: "o1-outsider" });
+    const org = await orgs.createOrg({ name: "o1-org", ownerId: owner.id, visibility: "public", now: new Date(T0 * 1000) });
+    const teams = new TeamsService(env.DB);
+    const team = await teams.createTeam(org, { name: "Developers", permission: "write" });
+    await teams.addTeamMember(team, member.id);
+    await teams.addTeamMember(team, member2.id);
+    const repoIds: string[] = [];
+    for (const slug of ["o1repo", "o1repo2"]) {
+      const id = crypto.randomUUID();
+      repoIds.push(id);
+      await drizzle(env.DB).insert(repositories).values({
+        id,
+        storageKey: `r_${id}`,
+        ownerNamespace: "o1-org",
+        ownerId: org.id,
+        slug,
+        visibility: "private",
+      });
+    }
+    return { ownerId: owner.id, memberId: member.id, member2Id: member2.id, outsiderId: outsider.id, orgId: org.id, teamId: team.id, repoIds };
+  }
+
+  /** The last-owner org: a solo owner on their own only team. */
+  async function seedSoloOrgFixture(): Promise<{ ownerId: number; orgId: number; teamId: number }> {
+    const orgs = new OrgService(env.DB);
+    const owner = await seedVerifiedUser({ username: "o1-solo" });
+    const org = await orgs.createOrg({ name: "o1-solo-org", ownerId: owner.id, visibility: "public", now: new Date(T0 * 1000) });
+    const team = await new TeamsService(env.DB).createTeam(org, { name: "Solo", permission: "read" });
+    await new TeamsService(env.DB).addTeamMember(team, owner.id);
+    return { ownerId: owner.id, orgId: org.id, teamId: team.id };
+  }
+
+  const teamAction = (action: string, teamId: number): string => `/o1-org/teams/${teamId}/action/${action}`;
+
+  it("claims the action shapes with both team carriers and the wildcard action", () => {
+    expect(parseUiRoute("/acme/teams/42/action/join")).toEqual({ family: "org-team-action", owner: "acme", id: 42, action: "join" });
+    expect(parseUiRoute("/acme/teams/007/action/join")).toEqual({ family: "org-team-action", owner: "acme", id: 7, action: "join" });
+    expect(parseUiRoute("/acme/teams/devs/action/leave")).toEqual({ family: "org-team-action", owner: "acme", name: "devs", action: "leave" });
+    expect(parseUiRoute("/acme/teams/42/action/repo/add")).toEqual({ family: "org-team-repo-action", owner: "acme", id: 42, action: "add" });
+    expect(parseUiRoute("/acme/teams/42/action/repo/remove-all")).toEqual({ family: "org-team-repo-action", owner: "acme", id: 42, action: "remove-all" });
+    expect(parseUiRoute("/org/acme/members/action/leave")).toEqual({ family: "org-members-action", owner: "acme", action: "leave" });
+    // The wave-12 flip: the previously-unclaimed tail is this battery's
+    // family (the pages-wave12.test.ts pin carries the same assertion).
+    expect(handlesUiRoute("/acme/teams/42/action/join")).toBe(true);
+    // The repo literal is CLAIMED at the 6-segment shape as the wildcard
+    // action "repo" (upstream's path param: TeamsAction's switch falls the
+    // unknown token through to the default redirect) — only the 7-segment
+    // literal pair is the repo family.
+    expect(parseUiRoute("/acme/teams/42/action/repo")).toEqual({ family: "org-team-action", owner: "acme", id: 42, action: "repo" });
+  });
+
+  it("leaves the malformed and adjacent tails with the engine", () => {
+    // Junk-encoded segments decode nowhere (the parser's per-segment rule).
+    expect(parseUiRoute("/acme/teams/%zz/action/join")).toBeNull();
+    expect(parseUiRoute("/acme/teams/42/action/%zz")).toBeNull();
+    expect(parseUiRoute("/acme/teams/42/action/repo/%zz")).toBeNull();
+    expect(parseUiRoute("/org/acme/members/action/%zz")).toBeNull();
+    // The literal `action` segment and the exact segment counts only.
+    expect(parseUiRoute("/acme/teams/42/action")).toBeNull();
+    expect(parseUiRoute("/acme/teams/42/actions/join")).toBeNull();
+    expect(parseUiRoute("/acme/teams/42/action/repo/add/extra")).toBeNull();
+    expect(parseUiRoute("/org/acme/members/action")).toBeNull();
+    expect(parseUiRoute("/org/acme/members/extra")).toBeNull();
+    expect(parseUiRoute("/org/acme/members/action/leave/extra")).toBeNull();
+  });
+
+  it("owner adds a member (the org membership rides AddTeamMember) and a member leaving their only team drops it", async () => {
+    const fx = await seedOrgFixture();
+    const teams = new TeamsService(env.DB);
+    const orgs = new OrgService(env.DB);
+    const ownerCookie = await sessionHeader(fx.ownerId);
+    const candidate = await seedVerifiedUser({ username: "o1-candidate" });
+
+    const added = await fetchUi(teamAction("add", fx.teamId), formPost(teamAction("add", fx.teamId), { uname: "O1-Candidate" }, ownerCookie));
+    expect(added.status).toBe(303);
+    expect(added.headers.get("location")).toBe(`/o1-org/teams/${fx.teamId}`);
+    expect(await teams.isTeamMember(fx.teamId, candidate.id)).toBe(true);
+    // AddTeamMember ensured the ORG membership ("user will have membership
+    // to given organization automatically").
+    expect(await orgs.getMembership(fx.orgId, candidate.id)).not.toBeNull();
+
+    // The member leaves: the row goes, and with no remaining team the org
+    // membership goes too — the public-org arm of
+    // checkIsOrgMemberAndRedirect lands on the org home.
+    const leave = await fetchUi(teamAction("leave", fx.teamId), formPost(teamAction("leave", fx.teamId), { uid: String(fx.member2Id) }, await sessionHeader(fx.member2Id)));
+    expect(leave.status).toBe(303);
+    expect(leave.headers.get("location")).toBe("/o1-org");
+    expect(await teams.isTeamMember(fx.teamId, fx.member2Id)).toBe(false);
+    expect(await orgs.getMembership(fx.orgId, fx.member2Id)).toBeNull();
+  });
+
+  it("gates the write ladder: outsider 404s, plain member cannot join/add/remove, off-team member 404s", async () => {
+    const fx = await seedOrgFixture();
+    const memberCookie = await sessionHeader(fx.memberId);
+    const outsiderCookie = await sessionHeader(fx.outsiderId);
+
+    // A signed-in NON-member is upstream's RequireMember NotFound.
+    const stranger = await fetchUi(teamAction("add", fx.teamId), formPost(teamAction("add", fx.teamId), { uname: "o1-outsider" }, outsiderCookie));
+    expect(stranger.status).toBe(404);
+    // A team member (non-owner) hits the IsOwner arms: join/add/remove 404.
+    for (const [action, body] of [
+      ["join", {}],
+      ["add", { uname: "o1-outsider" }],
+      ["remove", { uid: String(fx.member2Id) }],
+    ] as const) {
+      const res = await fetchUi(teamAction(action, fx.teamId), formPost(teamAction(action, fx.teamId), body, memberCookie));
+      expect(res.status).toBe(404);
+    }
+    // An org member NOT on this team 404s at RequireTeamMember.
+    const orgs = new OrgService(env.DB);
+    const other = await seedVerifiedUser({ username: "o1-other-team" });
+    await orgs.addMember(fx.orgId, other.id, { now: new Date(T0 * 1000) });
+    const offTeam = await fetchUi(teamAction("leave", fx.teamId), formPost(teamAction("leave", fx.teamId), {}, await sessionHeader(other.id)));
+    expect(offTeam.status).toBe(404);
+    // Non-member join: join is not open self-service upstream either.
+    const join = await fetchUi(teamAction("join", fx.teamId), formPost(teamAction("join", fx.teamId), {}, outsiderCookie));
+    expect(join.status).toBe(404);
+  });
+
+  it("owner joins and self-leaves; zero/unknown uid redirects to the teams list; unknown action falls through", async () => {
+    const fx = await seedOrgFixture();
+    const teams = new TeamsService(env.DB);
+    const ownerCookie = await sessionHeader(fx.ownerId);
+
+    // Join: the owner adds THEMSELVES to the team.
+    const join = await fetchUi(teamAction("join", fx.teamId), formPost(teamAction("join", fx.teamId), { page: "team", uid: String(fx.ownerId) }, ownerCookie));
+    expect(join.status).toBe(303);
+    expect(join.headers.get("location")).toBe("/o1-org/teams");
+    expect(await teams.isTeamMember(fx.teamId, fx.ownerId)).toBe(true);
+    // ...and their own leave attempt is the last-owner refusal (the sole
+    // role='owner' row, no remaining team): nothing is deleted and the
+    // redirect ladder keeps the default teams-list target.
+    const leave = await fetchUi(teamAction("leave", fx.teamId), formPost(teamAction("leave", fx.teamId), { uid: String(fx.ownerId) }, ownerCookie));
+    expect(leave.status).toBe(303);
+    expect(leave.headers.get("location")).toBe("/o1-org/teams");
+    expect(await teams.isTeamMember(fx.teamId, fx.ownerId)).toBe(true);
+
+    // Remove with a zero uid: upstream's user==nil arm → the teams list.
+    const zero = await fetchUi(teamAction("remove", fx.teamId), formPost(teamAction("remove", fx.teamId), { uid: "0" }, ownerCookie));
+    expect(zero.status).toBe(303);
+    expect(zero.headers.get("location")).toBe("/o1-org/teams");
+    // Remove with an unknown uid: the same arm.
+    const ghost = await fetchUi(teamAction("remove", fx.teamId), formPost(teamAction("remove", fx.teamId), { uid: "999999" }, ownerCookie));
+    expect(ghost.status).toBe(303);
+    expect(ghost.headers.get("location")).toBe("/o1-org/teams");
+    // The owner removing a member: the 303 lands on the team slice (the
+    // still-member ladder) and the row goes.
+    const removed = await fetchUi(teamAction("remove", fx.teamId), formPost(teamAction("remove", fx.teamId), { uid: String(fx.member2Id) }, ownerCookie));
+    expect(removed.status).toBe(303);
+    expect(removed.headers.get("location")).toBe(`/o1-org/teams/${fx.teamId}`);
+    expect(await teams.isTeamMember(fx.teamId, fx.member2Id)).toBe(false);
+    // An unknown action token: the wildcard's default redirect.
+    const unknown = await fetchUi(teamAction("promote", fx.teamId), formPost(teamAction("promote", fx.teamId), {}, ownerCookie));
+    expect(unknown.status).toBe(303);
+    expect(unknown.headers.get("location")).toBe("/o1-org/teams");
+    // An unknown REPO action token: the repo family's default.
+    const unknownRepo = await fetchUi(`${teamAction("repo", fx.teamId)}/swap`, formPost(`${teamAction("repo", fx.teamId)}/swap`, {}, ownerCookie));
+    expect(unknownRepo.status).toBe(303);
+    expect(unknownRepo.headers.get("location")).toBe(`/o1-org/teams/${fx.teamId}`);
+  });
+
+  it("the last-owner team leave refusal keeps the team row and lands on the teams list", async () => {
+    const fx = await seedSoloOrgFixture();
+    const teams = new TeamsService(env.DB);
+    const leave = await fetchUi(`/o1-solo-org/teams/${fx.teamId}/action/leave`, formPost(`/o1-solo-org/teams/${fx.teamId}/action/leave`, {}, await sessionHeader(fx.ownerId)));
+    expect(leave.status).toBe(303);
+    // Still a member (refused) → the default teams list.
+    expect(leave.headers.get("location")).toBe("/o1-solo-org/teams");
+    expect(await teams.isTeamMember(fx.teamId, fx.ownerId)).toBe(true);
+  });
+
+  it("add resolves unknown/org targets to the team redirect and never writes", async () => {
+    const fx = await seedOrgFixture();
+    const teams = new TeamsService(env.DB);
+    const ownerCookie = await sessionHeader(fx.ownerId);
+
+    const ghost = await fetchUi(teamAction("add", fx.teamId), formPost(teamAction("add", fx.teamId), { uname: "o1-nobody" }, ownerCookie));
+    expect(ghost.status).toBe(303);
+    expect(ghost.headers.get("location")).toBe(`/o1-org/teams/${fx.teamId}`);
+    // An ORG row is the cannot_add_org_to_team arm (users.type='org').
+    const orgRow = await fetchUi(teamAction("add", fx.teamId), formPost(teamAction("add", fx.teamId), { uname: "o1-org" }, ownerCookie));
+    expect(orgRow.status).toBe(303);
+    expect(await teams.isTeamMember(fx.teamId, fx.orgId)).toBe(false);
+  });
+
+  it("repo grants: add by name, the nonexistent arm, remove, addall, removeall", async () => {
+    const fx = await seedOrgFixture();
+    const teams = new TeamsService(env.DB);
+    const team = await teams.getTeamById(fx.teamId);
+    if (team === null) throw new Error("seed team missing");
+    const ownerCookie = await sessionHeader(fx.ownerId);
+    const repoAction = (action: string): string => `${teamAction("repo", fx.teamId)}/${action}`;
+
+    // A NON-member cannot touch the grants (the owner gate before the
+    // switch, teams.go:272-275).
+    const stranger = await fetchUi(repoAction("add"), formPost(repoAction("add"), { repo_name: "o1repo" }, await sessionHeader(fx.outsiderId)));
+    expect(stranger.status).toBe(404);
+
+    // Unknown repo: the nonexistent arm redirects without a grant.
+    const ghost = await fetchUi(repoAction("add"), formPost(repoAction("add"), { repo_name: "teamorg/nope" }, ownerCookie));
+    expect(ghost.status).toBe(303);
+    expect(ghost.headers.get("location")).toBe(`/o1-org/teams/${fx.teamId}`);
+
+    // Add by name (the search box's org/repo form base-strips).
+    const add = await fetchUi(repoAction("add"), formPost(repoAction("add"), { repo_name: "o1-org/o1repo" }, ownerCookie));
+    expect(add.status).toBe(303);
+    expect(await teams.hasTeamRepo(team, fx.repoIds[0]!)).toBe(true);
+
+    // Addall covers the rest of the org.
+    const addall = await fetchUi(repoAction("addall"), formPost(repoAction("addall"), {}, ownerCookie));
+    expect(addall.status).toBe(303);
+    for (const repoId of fx.repoIds) expect(await teams.hasTeamRepo(team, repoId)).toBe(true);
+
+    // Remove the pair grant, then removeall clears the rest.
+    const remove = await fetchUi(repoAction("remove"), formPost(repoAction("remove"), { repoid: fx.repoIds[0]! }, ownerCookie));
+    expect(remove.status).toBe(303);
+    expect(await teams.hasTeamRepo(team, fx.repoIds[0]!)).toBe(false);
+    const removeall = await fetchUi(repoAction("removeall"), formPost(repoAction("removeall"), {}, ownerCookie));
+    expect(removeall.status).toBe(303);
+    for (const repoId of fx.repoIds) expect(await teams.hasTeamRepo(team, repoId)).toBe(false);
+  });
+
+  it("members family: owner removes (the team sweep included), non-owner 404s, leave lands on the site root", async () => {
+    const fx = await seedOrgFixture();
+    const orgs = new OrgService(env.DB);
+    const teams = new TeamsService(env.DB);
+    // Fresh members — this test owns their whole lifecycle.
+    const sweptUser = await seedVerifiedUser({ username: "o1-swept" });
+    const leaver = await seedVerifiedUser({ username: "o1-leaver" });
+    await orgs.addMember(fx.orgId, sweptUser.id, { now: new Date((T0 + 100) * 1000) });
+    const team = await teams.getTeamById(fx.teamId);
+    if (team === null) throw new Error("seed team missing");
+    await teams.addTeamMember(team, sweptUser.id);
+    await orgs.addMember(fx.orgId, leaver.id, { now: new Date((T0 + 110) * 1000) });
+    const membersAction = (action: string): string => `/org/o1-org/members/action/${action}`;
+
+    // A non-owner member cannot remove another member.
+    const forbidden = await fetchUi(membersAction("remove"), formPost(membersAction("remove"), { uid: String(sweptUser.id) }, await sessionHeader(leaver.id)));
+    expect(forbidden.status).toBe(404);
+
+    // The owner removes: the org row goes AND the team sweep takes every
+    // team_members row of the org with it.
+    const removed = await fetchUi(membersAction("remove"), formPost(membersAction("remove"), { uid: String(sweptUser.id) }, await sessionHeader(fx.ownerId)));
+    expect(removed.status).toBe(303);
+    expect(removed.headers.get("location")).toBe("/org/o1-org/members");
+    expect(await orgs.getMembership(fx.orgId, sweptUser.id)).toBeNull();
+    const sweptRows = await drizzle(env.DB).select({ id: teamMembers.id }).from(teamMembers).where(eq(teamMembers.userId, sweptUser.id)).all();
+    expect(sweptRows).toHaveLength(0);
+
+    // Leave: the JSONRedirect("/") arm.
+    const leave = await fetchUi(membersAction("leave"), formPost(membersAction("leave"), { uid: String(leaver.id) }, await sessionHeader(leaver.id)));
+    expect(leave.status).toBe(303);
+    expect(leave.headers.get("location")).toBe("/");
+    expect(await orgs.getMembership(fx.orgId, leaver.id)).toBeNull();
+  });
+
+  it("members family: the last-owner leave refusal keeps the row and reloads the page; unknown action reloads; junk uid 404s; anonymous 303s", async () => {
+    const fx = await seedSoloOrgFixture();
+    const orgs = new OrgService(env.DB);
+    const action = (token: string): string => `/org/o1-solo-org/members/action/${token}`;
+
+    const refused = await fetchUi(action("leave"), formPost(action("leave"), { uid: String(fx.ownerId) }, await sessionHeader(fx.ownerId)));
+    expect(refused.status).toBe(303);
+    expect(refused.headers.get("location")).toBe("/org/o1-solo-org/members");
+    expect(await orgs.getMembership(fx.orgId, fx.ownerId)).not.toBeNull();
+
+    // Unknown action: upstream's switch fall-through answers JSONOK (the
+    // stay-on-page arm) — the form port reloads the members page.
+    const unknown = await fetchUi(action("promote"), formPost(action("promote"), { uid: String(fx.ownerId) }, await sessionHeader(fx.ownerId)));
+    expect(unknown.status).toBe(303);
+    expect(unknown.headers.get("location")).toBe("/org/o1-solo-org/members");
+
+    // A junk/zero uid: upstream's GetUserByID 404.
+    const junk = await fetchUi(action("remove"), formPost(action("remove"), { uid: "abc" }, await sessionHeader(fx.ownerId)));
+    expect(junk.status).toBe(404);
+
+    // Anonymous: the action families' login 303.
+    const anon = await fetchUi(action("leave"), formPost(action("leave"), { uid: String(fx.ownerId) }));
+    expect(anon.status).toBe(303);
+    expect(anon.headers.get("location")).toContain("/login?redirect_to=");
+  });
+
+  it("members family: the visibility flips ride self-or-owner (ChangeOrgUserStatus's guard)", async () => {
+    const fx = await seedOrgFixture();
+    const orgs = new OrgService(env.DB);
+    const selfUser = await seedVerifiedUser({ username: "o1-vis-self" });
+    const otherUser = await seedVerifiedUser({ username: "o1-vis-other" });
+    const looker = await seedVerifiedUser({ username: "o1-vis-looker" });
+    await orgs.addMember(fx.orgId, selfUser.id, { isPublic: false, now: new Date((T0 + 200) * 1000) });
+    await orgs.addMember(fx.orgId, otherUser.id, { isPublic: false, now: new Date((T0 + 210) * 1000) });
+    await orgs.addMember(fx.orgId, looker.id, { isPublic: false, now: new Date((T0 + 220) * 1000) });
+    const membersAction = (action: string): string => `/org/o1-org/members/action/${action}`;
+    const isPublic = async (userId: number): Promise<boolean | undefined> => {
+      const row = await drizzle(env.DB).select({ isPublic: orgMembers.isPublic }).from(orgMembers).where(eq(orgMembers.userId, userId)).get();
+      return row?.isPublic;
+    };
+
+    // The member flips their OWN row public, then back.
+    const selfPublic = await fetchUi(membersAction("public"), formPost(membersAction("public"), { uid: String(selfUser.id) }, await sessionHeader(selfUser.id)));
+    expect(selfPublic.status).toBe(303);
+    expect(await isPublic(selfUser.id)).toBe(true);
+    const selfPrivate = await fetchUi(membersAction("private"), formPost(membersAction("private"), { uid: String(selfUser.id) }, await sessionHeader(selfUser.id)));
+    expect(selfPrivate.status).toBe(303);
+    expect(await isPublic(selfUser.id)).toBe(false);
+
+    // A non-owner member cannot flip someone else's row.
+    const forbidden = await fetchUi(membersAction("public"), formPost(membersAction("public"), { uid: String(otherUser.id) }, await sessionHeader(looker.id)));
+    expect(forbidden.status).toBe(404);
+    expect(await isPublic(otherUser.id)).toBe(false);
+
+    // The owner flips anyone's.
+    const ownerFlip = await fetchUi(membersAction("public"), formPost(membersAction("public"), { uid: String(otherUser.id) }, await sessionHeader(fx.ownerId)));
+    expect(ownerFlip.status).toBe(303);
+    expect(await isPublic(otherUser.id)).toBe(true);
+  });
+
+  it("armors the families: cross-origin 403 and the GET twins' chi 405", async () => {
+    const fx = await seedOrgFixture();
+    const ownerCookie = await sessionHeader(fx.ownerId);
+    const evil = (path: string): RequestInit => formPost(path, {}, ownerCookie, "https://evil.example");
+    for (const path of [
+      teamAction("add", fx.teamId),
+      `${teamAction("repo", fx.teamId)}/add`,
+      "/org/o1-org/members/action/remove",
+    ]) {
+      const res = await fetchUi(path, evil(path));
+      expect(res.status).toBe(403);
+    }
+    for (const path of [
+      teamAction("join", fx.teamId),
+      `${teamAction("repo", fx.teamId)}/add`,
+      "/org/o1-org/members/action/leave",
+    ]) {
+      const twin = await fetchUi(path, { method: "GET", headers: { cookie: ownerCookie } });
+      expect(twin.status).toBe(405);
+      expect(twin.headers.get("allow")).toBe("POST");
+    }
   });
 });

@@ -42,11 +42,14 @@
  *   - the row shape under the owner's full view: the person glyph is a
  *     non-link placeholder (the org-home avatar-slot rule), the second-owner
  *     membership renders a SECOND shield-lock (the addMember role primitive),
- *     the Hidden badge markup, the userId-ASC row order, and the DEAD-CONTROL
- *     pin — upstream's /members/action/* visibility toggle and the Leave /
- *     Remove buttons (web.go:989, members.tmpl:51-71) render nowhere, so the
- *     page has no write surface (no cross-origin posture to test — the only
- *     form is the GET search box);
+ *     the Hidden badge markup, the userId-ASC row order, and the O1 row
+ *     actions — upstream's /members/action/* visibility toggle and the
+ *     Leave / Remove buttons (web.go:989, members.tmpl:50-71) render as
+ *     plain POST forms under the template's verbatim gates: the owner sees
+ *     a toggle on every row with Leave on the self row and Remove on the
+ *     others, a plain member only the self row's toggle + Leave, and the
+ *     anonymous viewer nothing at all (upstream's empty SignedUser fake —
+ *     the dialogs are reduced to direct POSTs, §2.8 guards server-side);
  *   - the rename-redirect arm: a renamed org 307s with path+query preserved
  *     (RedirectToUser's first-occurrence replace), a renamed PRIVATE org
  *     404-shells for anonymous (the coarse non-public gate) while a signed-in
@@ -517,17 +520,54 @@ describe("the row shape (avatar placeholder, second-owner shield, ordering, dead
     expect(at("d-pub")).toBeLessThan(at("d-priv"));
   });
 
-  it("the /members/action write family (visibility toggle, leave, remove) renders NOWHERE", async () => {
+  it("the /members/action row actions render as POST forms under the template's gates (the O1 family)", async () => {
     const html = await ownerViewHtml();
-    // Upstream members.tmpl:51-71 + web.go:989 — the unported write family.
-    // Dead controls are forbidden (§2.4.1), so nothing may hint at them.
-    expect(html).not.toContain("members/action");
-    expect(html).not.toContain(">Leave</button>");
-    expect(html).not.toContain(">Remove</button>");
+    // members.tmpl:50-71 at the O1 as-built: the visibility toggle for the
+    // self row or an owner (every row, this viewer is the owner), Leave on
+    // the self row, Remove on the others'. Upstream's link-action buttons
+    // and confirm dialogs reduce to plain POST forms (§2.8 guards
+    // server-side) — no data-modal attributes survive.
+    expect(html).toContain('<form method="post" action="/org/dorg/members/action/private">');
+    expect(html).toContain('<form method="post" action="/org/dorg/members/action/leave">');
+    expect(html).toContain('<form method="post" action="/org/dorg/members/action/remove">');
     expect(html).not.toContain("data-modal-confirm");
-    // Consequently the page carries NO write surface: the only form is the
-    // GET search box (cross-origin has nothing to protect here).
+    // The toggle's polarity follows the row: the two PRIVATE memberships
+    // (d-owner's own, d-priv) carry "Make visible", the two PUBLIC ones
+    // (d-second, d-pub) "Make hidden" — the same action URL, the hidden
+    // uid picks the row.
+    expect((html.match(/>Make visible<\/button>/g) ?? []).length).toBe(2);
+    expect((html.match(/>Make hidden<\/button>/g) ?? []).length).toBe(2);
+    // Leave is the self row only; Remove covers the other three.
+    expect((html.match(/>Leave<\/button>/g) ?? []).length).toBe(1);
+    expect((html.match(/>Remove<\/button>/g) ?? []).length).toBe(3);
+    // The GET search box is still the only non-action form.
     expect(html).toContain('<form class="ui form ignore-dirty tw-my-4" method="get"');
+  });
+
+  it("a plain member sees only their own row's actions (toggle + Leave, no Remove)", async () => {
+    await seedShapeOrg();
+    const pub = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "d-pub")).get();
+    const res = await fetchUi("/org/dorg/members", { headers: { cookie: await sessionHeader(pub!.id) } });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The self row: the public membership toggles via action/private with
+    // the "Make hidden" label, and the red Leave sits beside it.
+    expect(html).toContain('<form method="post" action="/org/dorg/members/action/private">');
+    expect(html).toContain('<form method="post" action="/org/dorg/members/action/leave">');
+    expect((html.match(/>Leave<\/button>/g) ?? []).length).toBe(1);
+    // No owner anywhere: no Remove forms, and exactly one row (the self
+    // row) carries a trailing action block.
+    expect(html).not.toContain('action="/org/dorg/members/action/remove');
+    expect((html.match(/item-trailing/g) ?? []).length).toBe(1);
+  });
+
+  it("the anonymous view renders no action forms (upstream's empty SignedUser fake)", async () => {
+    await seedShapeOrg();
+    const res = await fetchUi("/org/dorg/members");
+    expect(res.status).toBe(200);
+    const anon = await res.text();
+    expect(anon).not.toContain("members/action");
+    expect(anon).not.toContain("item-trailing");
   });
 });
 
