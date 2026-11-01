@@ -145,16 +145,21 @@
  * the upstream NotFound arms → the not-found outcome (the 404 shell).
  *
  * Per-write divergences (each cite inline at the seam):
- * - merge: the auto-merge schedule refuses with the API route's landed
- *   contract ("scheduled auto-merge is not supported" — no scheduled-merge
- *   table exists, routes/pull-automerge.ts); the webhook + feed action ride
- *   the route's own payload assembly re-issued over importable service
- *   pieces (emitIssueEvent + recordAction — pullRequestPayload's §2.7 shape
- *   with citations); `cancel_auto_merge` is the honest not-scheduled 404
- *   (no scheduled row can exist — the API DELETE route's mirror); the
- *   merge form renders upstream's field names (PullRequestMergeForm.vue +
+ * - merge: the auto-merge schedule is REAL (migration 0059's
+ *   `pull_auto_merges` — the MWCS arm schedules into
+ *   services/pull-automerge.ts, whose queue consumer merges when the
+ *   required checks go green; the box renders the pending message + the
+ *   cancel button); the webhook + feed action ride the route's own payload
+ *   assembly re-issued over importable service pieces (emitIssueEvent +
+ *   recordAction — pullRequestPayload's §2.7 shape with citations);
+ *   `cancel_auto_merge` deletes the scheduled row (the scheduler may cancel
+ *   their own schedule; a non-scheduler needs the merge right — the
+ *   not-scheduled 404 stays for a missing row); the merge form renders
+ *   upstream's field names (PullRequestMergeForm.vue +
  *   forms.MergePullRequestForm) reduced to the no-JS select (the
- *   pull-reviews combobox reduction precedent — the Vue island is JS-only).
+ *   pull-reviews combobox reduction precedent — the Vue island is JS-only);
+ *   the island's autoMergeWhenSucceed v-model reduces to the hidden field's
+ *   render-time value (true when the merge cannot happen now).
  * - update: same-repo heads only (the engine fork refusal — the fork cell's
  *   base branch is a fork-point snapshot); the PR-unit config gates default
  *   true (repo_unit.go's DefaultPullRequestsConfig — no D1 home).
@@ -248,9 +253,18 @@ import {
   type PrincipalAccess,
   type ProtectedBranchConfig,
 } from "../../services/branch-protection";
+import {
+  contextMatchesRequired,
+  createScheduledAutoMergeComment,
+  getScheduledAutoMerge,
+  mergeRequiredContextsCommitStatus,
+  removeScheduledAutoMerge,
+  scheduleAutoMergeRow,
+} from "../../services/pull-automerge";
 import { PRFlow, PRStatus, pullRequests, users, type CommitStatusRow } from "../../db/schema";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { ICON_PATHS } from "../icons";
+import { timeSinceParts } from "../page-data";
 import type { RepoRow } from "../ui-context";
 import type { Viewer } from "../viewer";
 
@@ -337,6 +351,15 @@ export const pullMergeWriteLocale = {
   unable_to_update: "Unable to update pull request", // UpdatePullRequest's fallback JSONError text
   branch_deletion_success: 'Branch "{branch}" has been deleted.', // "repo.branch.deletion_success"
   no_permission_for_action: "user not allowed to do this action", // pull.ErrUserHasNoPermissionForAction's text
+  // the auto-merge arms (pull_merge_form.go:91-94 + the pending tip)
+  auto_merge_button_when_succeed: "(When checks succeed)", // "repo.pulls.auto_merge_button_when_succeed"
+  auto_merge_cancel_schedule: "Cancel auto merge", // "repo.pulls.auto_merge_cancel_schedule"
+  // "repo.pulls.auto_merge_has_pending_schedule" = "%[1]s scheduled this pull
+  // request to auto merge when all checks succeed %[2]s." — the relative time
+  // renders between the fragments (the TimeSince seam).
+  auto_merge_has_pending_schedule_prefix: "scheduled this pull request to auto merge when all checks succeed",
+  auto_merge_has_pending_schedule_suffix: ".",
+  cancel_permission_denied: "user has no permission to cancel the scheduled auto merge", // pull.go:1278's HTTPError text
 } as const;
 
 /** The conflicted-files list cap (pull_merge_box.go:112-115): > 10 keeps 10
@@ -522,6 +545,15 @@ mergeForm: {
   isPullBranchDeletable: boolean;
   /** The checkbox label's branch target (the `textDeleteBranch` arg). */
   headTarget: string;
+  /** The hidden `merge_when_checks_succeed` value — the Vue
+   *  autoMergeWhenSucceed reduction: true when the merge cannot happen now
+   *  (`!canMergeNow` — the !canMergeNow arm offers ONLY the auto merge),
+   *  false for the plain merge. */
+  mergeWhenChecksSucceed: boolean;
+  /** The scheduled row (`hasPendingPullRequestMerge` + its tip: the doer
+   *  name + the created stamp the relative time renders between). `null` =
+   *  nothing scheduled (GetScheduledMergeByPullID's miss). */
+  pendingAutoMerge: { doerName: string; createdUnix: number } | null;
 } | null;
 /** The update-branch arm (`ShowUpdatePullInfo` + the update_branch_by_merge
  *  template's buttons, reduced to one no-JS form per style). `null` when the
@@ -565,112 +597,11 @@ export function shellEscape(toEscape: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// The status-check context glob (glob.Compile's default-separator compile —
-// the same walk branch-protection.ts ports for rule names, separators = []
-// so `*` crosses `/` like upstream's status_check_contexts)
+// The status-check context glob + the required-context combine live in
+// services/pull-automerge.ts (contextMatchesRequired /
+// mergeRequiredContextsCommitStatus) — one port, two consumers: the box
+// DISPLAYS the required-check state, the auto-merge consumer ENFORCES it.
 // ---------------------------------------------------------------------------
-
-const GLOB_SPECIAL = "*?[]{}\\,";
-
-function contextGlobRegExp(pattern: string): RegExp | null {
-  let out = "^";
-  for (let pos = 0; pos < pattern.length; pos++) {
-    const c = pattern[pos]!;
-    if (c === "*") {
-      if (pattern[pos + 1] === "*") {
-        pos += 1;
-        out += ".*";
-      } else {
-        out += ".*"; // no separators — `*` crosses `/`
-      }
-    } else if (c === "?") {
-      out += ".";
-    } else if (c === "[") {
-      let cls = "[";
-      pos += 1;
-      if (pattern[pos] === "!" || pattern[pos] === "^") {
-        cls += "^";
-        pos += 1;
-      }
-      let closed = false;
-      for (; pos < pattern.length; pos++) {
-        const cc = pattern[pos]!;
-        if (cc === "]") {
-          if (cls === "[" || cls === "[^") return null; // `[]`/`[^]` — the error path
-          cls += "]";
-          closed = true;
-          break;
-        }
-        cls += cc === "\\" ? `\\${pattern[++pos] ?? ""}` : cc;
-      }
-      if (!closed) return null; // unterminated class
-      out += cls;
-    } else if (c === "{") {
-      out += "(?:";
-      // the {a,b} alternation — a single nesting level is all upstream's
-      // status contexts ever carry; the walk matches branch-protection.ts's
-      let depth = 1;
-      let sub = "";
-      for (pos += 1; pos < pattern.length; pos++) {
-        const sc = pattern[pos]!;
-        if (sc === "{") {
-          depth += 1;
-          sub += sc;
-        } else if (sc === "}") {
-          depth -= 1;
-          if (depth === 0) break;
-          sub += sc;
-        } else {
-          sub += GLOB_SPECIAL.includes(sc) && sc !== "," ? `\\${sc}` : sc;
-        }
-      }
-      if (depth !== 0) return null; // unterminated `{...}`
-      out += sub.replaceAll(",", "|");
-      out += ")";
-    } else if (GLOB_SPECIAL.includes(c)) {
-      out += `\\${c}`;
-    } else {
-      out += c;
-    }
-  }
-  try {
-    return new RegExp(`${out}$`);
-  } catch {
-    return null; // the compile error path (createRequiredContextMatcher's fallback)
-  }
-}
-
-/** `createRequiredContextMatcher` (pull.go:584-594): the glob compile, or the
- *  exact-string fallback for invalid patterns. */
-function contextMatchesRequired(pattern: string, context: string): boolean {
-  const compiled = contextGlobRegExp(pattern);
-  return compiled === null ? pattern === context : compiled.test(context);
-}
-
-/** `MergeRequiredContextsCommitStatus` (services/pull/commit_status.go:26-68):
- *  no statuses → pending; no required contexts → the plain combine; otherwise
- *  the combine over the matched statuses, pending until EVERY context
- *  matched — unless the matched set already failed. */
-function mergeRequiredContextsCommitStatus(statuses: CommitStatusRow[], requiredContexts: string[]): CommitStatusState {
-  if (statuses.length === 0) return "pending";
-  if (requiredContexts.length === 0) return combinedStateOf(statuses);
-  const matched: CommitStatusRow[] = [];
-  let allMatched = true;
-  for (const pattern of requiredContexts) {
-    let contextMatched = false;
-    for (const status of statuses) {
-      if (contextMatchesRequired(pattern, status.context)) {
-        matched.push(status);
-        contextMatched = true;
-      }
-    }
-    allMatched = allMatched && contextMatched;
-  }
-  if (matched.length === 0) return "pending";
-  const returned = combinedStateOf(matched);
-  if (allMatched) return returned;
-  return returned === "failure" ? "failure" : "pending";
-}
 
 // ---------------------------------------------------------------------------
 // The loader — the prepareMergeBox projection over the landed merge state
@@ -908,6 +839,16 @@ function defaultMergeTitleOf(issue: IssueRow, pr: PullRequestRow, headRepo: { ow
   }
   const from = headRepo === null ? `<deleted>:${pr.headBranch}` : `${headRepo.ownerNamespace}/${headRepo.slug}:${pr.headBranch}`;
   return `Merge pull request '${issue.title}' (#${pr.index}) from ${from} into ${pr.baseBranch}`;
+}
+
+/** The scheduled auto-merge's render shape (GetScheduledMergeByPullID's doer
+ *  join, pull_merge_form.go:55-65 — hasPendingPullRequestMerge + the tip's
+ *  doer name and created stamp). */
+async function pendingAutoMergeOf(d1: D1Database, issueId: number): Promise<{ doerName: string; createdUnix: number } | null> {
+  const row = await getScheduledAutoMerge(d1, issueId);
+  if (row === null) return null;
+  const doer = (await drizzle(d1).select({ username: users.username }).from(users).where(eq(users.id, row.doerId)).get()) ?? null;
+  return { doerName: doer?.username ?? "", createdUnix: row.createdUnix };
 }
 
 /**
@@ -1318,6 +1259,8 @@ export async function loadPullMergeBoxData(d1: D1Database, input: PullMergeBoxIn
           defaultTitle: defaultMergeTitleOf(issue, pr, headRepo === null ? null : headRepo.repo, "merge"),
           isPullBranchDeletable: openBranchDeletable,
           headTarget,
+          mergeWhenChecksSucceed: !canMergeNow, // the Vue autoMergeWhenSucceed reduction
+          pendingAutoMerge: await pendingAutoMergeOf(d1, issue.id),
         }
       : null,
     updateBranch: updateOptions.length > 0 ? { options: updateOptions } : null,
@@ -1514,11 +1457,28 @@ export function PullMergeBoxFragment(props: { data: PullMergeBoxData }) {
               // force_merge hidden, merge_title_field + merge_message_field,
               // the manually-merged merge_commit_id, the `do` select (the
               // style dropdown's no-JS stand-in) and the
-              // delete_branch_after_merge checkbox).
+              // delete_branch_after_merge checkbox). The MWCS hidden carries
+              // the render's autoMergeWhenSucceed reduction; a scheduled row
+              // renders the Vue's info message above the form and the cancel
+              // form beside it (PullRequestMergeForm.vue:127 + 196-202).
               <div class="item">
+                {data.mergeForm.pendingAutoMerge !== null ? (
+                  <div class="ui info message">
+                    {data.mergeForm.pendingAutoMerge.doerName}{" "}
+                    {pullMergeWriteLocale.auto_merge_has_pending_schedule_prefix}{" "}
+                    <relative-time
+                      prefix=""
+                      tense="past"
+                      datetime={new Date(data.mergeForm.pendingAutoMerge.createdUnix * 1000).toISOString()}
+                    >
+                      {timeSinceParts(data.mergeForm.pendingAutoMerge.createdUnix, "+0000").text}
+                    </relative-time>
+                    {pullMergeWriteLocale.auto_merge_has_pending_schedule_suffix}
+                  </div>
+                ) : null}
                 <form class="ui form form-fetch-action" action={`${data.mergeForm.issueLink}/merge`} method="post">
                   <input type="hidden" name="head_commit_id" value={data.mergeForm.headCommitId} />
-                  <input type="hidden" name="merge_when_checks_succeed" value="false" />
+                  <input type="hidden" name="merge_when_checks_succeed" value={data.mergeForm.mergeWhenChecksSucceed ? "true" : "false"} />
                   <input type="hidden" name="force_merge" value={data.mergeForm.forceMerge ? "true" : "false"} />
                   {selectedMergeStyle(data.mergeForm).hideMessageFields ? null : (
                     <>
@@ -1547,6 +1507,7 @@ export function PullMergeBoxFragment(props: { data: PullMergeBoxData }) {
                   <div class="flex-text-block tw-gap-3">
                     <button type="submit" class="ui primary button">
                       {selectedMergeStyle(data.mergeForm).text}
+                      {data.mergeForm.mergeWhenChecksSucceed ? ` ${pullMergeWriteLocale.auto_merge_button_when_succeed}` : null}
                     </button>
                     {data.mergeForm.isPullBranchDeletable ? (
                       <div class="ui checkbox">
@@ -1558,6 +1519,15 @@ export function PullMergeBoxFragment(props: { data: PullMergeBoxData }) {
                     ) : null}
                   </div>
                 </form>
+                {data.mergeForm.pendingAutoMerge !== null ? (
+                  // The cancel button (PullRequestMergeForm.vue's
+                  // hasPendingPullRequestMerge form → baseLink+'/cancel_auto_merge').
+                  <form action={`${data.mergeForm.issueLink}/cancel_auto_merge`} method="post" class="tw-ml-4">
+                    <button type="submit" class="ui button">
+                      {pullMergeWriteLocale.auto_merge_cancel_schedule}
+                    </button>
+                  </form>
+                ) : null}
               </div>
             ) : null}
             {data.commands !== null ? (
@@ -1785,14 +1755,18 @@ async function writePrologue(
 /**
  * The web merge ladder: CheckPullMergeable's arm order (check.go:142-207 —
  * merged, closed, the permission pair, [manual short-circuit], WIP,
- * mergeable state) with the schedule refusal in the landed API route's slot,
- * the lazy-check precondition, the protection gate with the force_merge
- * bypass, composeMergeMessage, and the engine merge — the API merge route's
- * exact service seams with the web flash mapping. The success webhook + feed
- * action re-issue the route's private emit arms over importable pieces (the
- * payload assembly is pullRequestPayload's §2.7 wrapper shape; the PR render
- * the canonical converter; the fan-out emitIssueEvent; the feed row the
- * route's pullActionDraft merge discriminant — closed + merged=true →
+ * mergeable state) with the MWCS schedule arm in the landed refusal's slot
+ * (pull.go:1135-1149 — the Auto merge-check type skips the branch-protection
+ * failure, check.go:184-186, so the schedule rides past approvals/outdated/
+ * required-checks and merges when they clear; services/pull-automerge.ts's
+ * consumer is the other half), the lazy-check precondition, the protection
+ * gate with the force_merge bypass, composeMergeMessage, and the engine
+ * merge — the API merge route's exact service seams with the web flash
+ * mapping. The success webhook + feed action re-issue the route's private
+ * emit arms over importable pieces (the payload assembly is
+ * pullRequestPayload's §2.7 wrapper shape; the PR render the canonical
+ * converter; the fan-out emitIssueEvent; the feed row the route's
+ * pullActionDraft merge discriminant — closed + merged=true →
  * ActionType.MergePullRequest, content `index|title`).
  */
 export async function mergePullRequestFromWeb(ctx: PullMergeBoxWriteContext, form: MergePullRequestWebForm): Promise<PullMergeBoxWriteOutcome> {
@@ -1813,13 +1787,9 @@ export async function mergePullRequestFromWeb(ctx: PullMergeBoxWriteContext, for
     // ErrNoPermissionToMerge's flash (pull.go:1077).
     return { outcome: "error", message: pullMergeWriteLocale.update_not_allowed };
   }
-  // The schedule refusal (the API route's landed contract — no scheduled-
-  // merge table exists, routes/pull-automerge.ts).
-  if (form.mergeWhenChecksSucceed) {
-    return { outcome: "error", message: "scheduled auto-merge is not supported" };
-  }
   // The manual short-circuit (check.go:162-165): manually-merged skips the
-  // WIP / mergeable-state / protection checks entirely.
+  // WIP / mergeable-state / protection checks entirely — and the MWCS branch
+  // never reaches it (the manual mark returns before pull.go:1135 upstream).
   if (form.do !== "manually-merged") {
     if (hasWorkInProgressPrefix(ctx.issue.title)) {
       return { outcome: "error", message: pullMergeWriteLocale.no_merge_wip };
@@ -1828,6 +1798,47 @@ export async function mergePullRequestFromWeb(ctx: PullMergeBoxWriteContext, for
     const checked = await ensurePullRequestChecked(api, pair, ctx.pr);
     if (checked.hasMerged || checked.status === PRStatus.Ancestor) {
       return { outcome: "error", message: pullMergeWriteLocale.has_merged };
+    }
+    // THE SCHEDULE ARM (pull.go:1135-1149): merge_when_checks_succeed
+    // schedules instead of merging — the Auto check type's one relaxation is
+    // the branch-protection failure (check.go:184-186), so only the arms
+    // above (merged/closed/permission/WIP) plus the mergeable state gate it;
+    // an Empty PR schedules too (check.go:172's `&& !pr.IsEmpty()`). The
+    // upstream handler deletes any existing schedule first (the re-schedule
+    // reset), inserts the row + the type-34 comment (ScheduleAutoMerge's
+    // transaction, services/automerge/automerge.go:84-99), flashes the
+    // newly-scheduled text and redirects — the flash rides our bare 303 (the
+    // reloaded box renders the pending message + the cancel button).
+    if (form.mergeWhenChecksSucceed) {
+      if (checked.status !== PRStatus.Mergeable && checked.status !== PRStatus.Empty) {
+        return { outcome: "error", message: pullMergeWriteLocale.no_merge_not_ready };
+      }
+      const message = await composeMergeMessage(api, pair, ctx.issue, checked, {
+        style: form.do,
+        mergeTitleField: form.mergeTitleField,
+        mergeMessageField: form.mergeMessageField,
+      });
+      const now = new Date();
+      await scheduleAutoMergeRow(db, {
+        issueId: ctx.issue.id,
+        doerId: ctx.viewer.id,
+        sha: checked.headSha ?? "",
+        style: form.do,
+        message,
+        deleteBranchAfterMerge: form.deleteBranchAfterMerge,
+      }, now);
+      await createScheduledAutoMergeComment(db, ctx.issue.id, ctx.viewer.id, now);
+      // The FIRST check (StartAutoMergeCheckByPullHead, automerge.go:100-103)
+      // — best-effort on the standing queue; the cron producer re-probes
+      // every tick regardless, so an unbound queue only delays a green merge.
+      if (ctx.c.env.REPO_TASKS !== undefined) {
+        try {
+          await ctx.c.env.REPO_TASKS.send({ kind: "auto-merge-check", issueId: ctx.issue.id });
+        } catch (error) {
+          console.error(`[pull-merge-box] auto-merge check enqueue failed (issue ${ctx.issue.id}): ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      return { outcome: "redirect", location: issueLink };
     }
     if (checked.status !== PRStatus.Mergeable) {
       return { outcome: "error", message: pullMergeWriteLocale.no_merge_not_ready };
@@ -1952,16 +1963,31 @@ async function runMergeLanding(
 // --- POST /pulls/{index}/cancel_auto_merge (web.go:1666 → pull.go:1251-1290) --
 
 /**
- * The cancel arm: GetScheduledMergeByPullID's `!exist` → NotFound is the ONLY
- * reachable upstream behavior — this backend has no scheduled-merge table
- * (the API DELETE route's contract, routes/pull-automerge.ts; POST /merge
- * refuses the schedule). The doer-mismatch 403 and the success flash arms are
- * unreachable past that 404.
+ * The cancel arm, real since migration 0059's `pull_auto_merges` landed:
+ * GetScheduledMergeByPullID's `!exist` → NotFound; the scheduler-canceler
+ * mismatch runs IsUserAllowedToMerge (the doer may cancel their own
+ * schedule; a non-scheduler needs the merge right — pull.go:1270-1281, the
+ * 403 mapped to the error outcome with the handler's own text); then
+ * RemoveScheduledAutoMerge — the row delete + the type-35 comment — and the
+ * redirect (the canceled_schedule flash rides it).
  */
 export async function cancelAutoMergeFromWeb(ctx: PullMergeBoxWriteContext): Promise<PullMergeBoxWriteOutcome> {
   const prologue = await writePrologue(ctx);
   if (!prologue.ok) return prologue.outcome;
-  return { outcome: "not-found" };
+  const { pair, issueLink } = prologue;
+  const db = ctx.c.env.DB;
+  const scheduled = await getScheduledAutoMerge(db, ctx.issue.id);
+  if (scheduled === null) return { outcome: "not-found" }; // pull.go:1263-1265
+  if (ctx.viewer.id !== scheduled.doerId) {
+    const access = await principalAccessOf(db, pair.repo, await doerProjection(ctx));
+    const rule = await findRule(db, ctx.repo.id, ctx.pr.baseBranch);
+    const allowed = access.write && (rule === null || (await isUserMergeWhitelisted(db, parseRuleConfig(rule.rules), access)));
+    if (!allowed) {
+      return { outcome: "error", message: pullMergeWriteLocale.cancel_permission_denied }; // pull.go:1278's HTTPError text
+    }
+  }
+  await removeScheduledAutoMerge(db, ctx.issue, ctx.viewer.id, new Date());
+  return { outcome: "redirect", location: issueLink };
 }
 
 // --- POST /pulls/{index}/update (web.go:1667 → pull.go:968-1041) --------------

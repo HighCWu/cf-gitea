@@ -70,6 +70,7 @@ import {
 } from "../services/actions/sweeps";
 import { handlePackagesCleanup, isPackageCleanupMessage } from "../services/packages/cleanup";
 import { isMailOutboxMessage, runMailOutboxArm } from "../services/mail/outbox";
+import { handleAutoMergeCheck, isAutoMergeCheckMessage } from "../services/pull-automerge";
 import { DEMO_RETENTION_HOURS, isDemoSweepMessage } from "../services/demo-sweep";
 import { handleMirrorSync, isMirrorSyncMessage } from "../services/mirror/sync";
 import { handlePushMirrorSync, isPushMirrorSyncMessage } from "../services/mirror/push-sync";
@@ -210,6 +211,11 @@ export async function destroyRepoDO(env: Env, engineName: string): Promise<void>
  *     §3.2): the mailer service's send leg — shape the stored
  *     email_outbox row, the provider call, the outcome record (the ack/
  *     retry policy is runMailOutboxArm's).
+ *   - pull auto-merge checks ({kind: "auto-merge-check", issueId},
+ *     services/pull-automerge.ts): the MWCS schedule's consumer — one
+ *     upstream handlePullRequestAutoMerge ladder run per scheduled row
+ *     (a skip leaves the row for the next cron probe; merged/closed
+ *     deletes it).
  *
  * Per message: idempotent work, then ack; a throw retries THAT message (the
  * redelivery re-runs the idempotent steps). Storage errors never fail the
@@ -387,6 +393,22 @@ export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): P
     // placement as every family above.
     if (isMailOutboxMessage(message.body)) {
       await runMailOutboxArm(env, message.body, message);
+      continue;
+    }
+    // Pull auto-merge check (services/pull-automerge.ts — the MWCS schedule's
+    // consumer): one message = one scheduled row = one upstream
+    // handlePullRequestAutoMerge ladder run (skip leaves the row scheduled —
+    // the cron producer re-probes next tick; merged/closed deletes it). A
+    // throw retries THAT message (the mirror-sync posture; the ladder is
+    // idempotent — a merged PR takes the deleted-closed-or-merged arm).
+    if (isAutoMergeCheckMessage(message.body)) {
+      try {
+        await handleAutoMergeCheck(env, message.body.issueId);
+        message.ack();
+      } catch (error) {
+        console.error(`[repo-tasks] auto-merge-check ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
+        message.retry();
+      }
       continue;
     }
     if (!isRepoPurgeMessage(message.body)) {

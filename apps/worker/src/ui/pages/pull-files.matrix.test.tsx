@@ -48,10 +48,13 @@ import { createDurableGit, type DurableGitHandler } from "@cf-gitea/git-engine";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import { Context } from "hono";
+import { renderToString } from "hono/jsx/dom/server";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor, seedVerifiedUser } from "../../auth/testing/seeds";
-import { issues, PRStatus, protectedBranches, pullRequests, repositories, users } from "../../db/schema";
+import { issues, PRStatus, protectedBranches, pullRequests, repositories, reviewState, users } from "../../db/schema";
+import { findPullRequestByIndex } from "../../api/services/pulls";
 import { authorize } from "../../git-http/authorize";
 import { gitHttpGate, settleCreatingRepo } from "../../git-http/gate";
 import { emptyRuleConfig, serializeRuleConfig } from "../../services/branch-protection";
@@ -62,6 +65,9 @@ import { parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
 import type { UiManifest } from "../manifest";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { buildHistoryPack, buildReceivePackBody, type SeedCommit } from "../testing/seed-repo";
+import { shellAssetsFromManifest, type UiContext } from "../ui-context";
+import type { Viewer } from "../viewer";
+import { diffFileViews, loadPullFilesData, renderPullFilesPage, updateViewedFilesFromWeb, type PullFilesData } from "./pull-files";
 
 // wave-129 full-run contention budget: this file's beforeAll seeding (the
 // receive-flow w111* fixture family) measured a 4.68s hook share of the 30s
@@ -1533,5 +1539,226 @@ describe("the PR-head sync's route-level reflection (the second push moves the p
     // (prepareMergeBoxProtectionChecks' order, the outdated item first).
     expect(boxHtml).toContain("You are not authorized to merge this pull request.");
     expect(boxHtml).not.toContain("This pull request can be merged automatically.");
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// The VIEWED-FILES round-trip (migration 0059's review_state — pages/
+// pull-files.tsx's write seam + the loader's state read). Module-level by
+// necessity: the POST route's registration is the ORCHESTRATOR's fold (the
+// index.ts claim recipe rides the module report), so the seam is driven
+// directly over real D1 — the pull-merge-box write-arm posture. The page
+// render arms build the page from the LOADED data plus one fabricated diff
+// file (the render is pure; the engine-backed diff pages are the suites
+// above).
+// ---------------------------------------------------------------------------
+
+describe("w111 viewed-files round-trip (the review_state seam)", () => {
+  const viewerUser = { kind: "user" as const, id: 0, username: "w111viewer", isAdmin: false };
+  const HEAD = "b".repeat(40);
+  const STALE = "a".repeat(40);
+  let viewRepoId = "";
+  let viewIssueId = 0;
+  let viewPrId = 0;
+  let viewIndex = 0;
+  let viewRepoRow: UiContext["repo"];
+
+  async function loadRepoRow(): Promise<UiContext["repo"]> {
+    const rows = await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, viewRepoId)).all();
+    return rows[0];
+  }
+
+  beforeAll(async () => {
+    const user = await seedVerifiedUser({ username: "w111viewer" });
+    viewerUser.id = user.id;
+    const repo = await new RepoService(env.DB).create({
+      owner: { id: user.id, usernameLower: "w111viewer" },
+      name: "viewrepo",
+      isPrivate: false,
+      status: "ready",
+    });
+    viewRepoId = repo.id;
+    viewRepoRow = await loadRepoRow();
+    const service = new IssuesService(env.DB);
+    const created = await service.createPullRequest({
+      repoId: viewRepoId,
+      title: "feat: viewed",
+      posterId: user.id,
+      headRepoId: viewRepoId,
+      baseBranch: "main",
+      headBranch: "topic",
+      now: new Date(T0 * 1000),
+    });
+    viewIssueId = created.issue.id;
+    viewPrId = created.pullRequest.id;
+    viewIndex = created.pullRequest.index;
+    await drizzle(env.DB).update(pullRequests).set({ status: PRStatus.Mergeable, headSha: HEAD }).where(eq(pullRequests.id, viewPrId));
+  });
+
+  /** The write seam's context (the mounted route's resolved shape). */
+  function writeCtx(body: string, contentType: string) {
+    const request = new Request(`https://test.local/w111viewer/viewrepo/pulls/${viewIndex}/viewed-files`, {
+      method: "POST",
+      headers: { "content-type": contentType },
+      body,
+    });
+    return new Context<{ Bindings: Env }>(request, { env });
+  }
+
+  async function prRowOf() {
+    const found = await findPullRequestByIndex(env.DB, viewRepoId, viewIndex);
+    if (found === null) throw new Error("viewed fixture PR missing");
+    return found;
+  }
+
+  async function storedRows(userId: number): Promise<{ commitSha: string }[]> {
+    return drizzle(env.DB)
+      .select({ commitSha: reviewState.commitSha })
+      .from(reviewState)
+      .where(and(eq(reviewState.userId, userId), eq(reviewState.issueId, viewIssueId)))
+      .all();
+  }
+
+  it("stamps the whole-PR mark from the official bundle's JSON body and reads it back current", async () => {
+    const { issue, pullRequest } = await prRowOf();
+    const ctx = writeCtx(JSON.stringify({ files: { "a.ts": true }, headCommitSHA: HEAD }), "application/json");
+    const outcome = await updateViewedFilesFromWeb({ c: ctx, repo: viewRepoRow!, issue, pr: pullRequest, viewer: viewerUser });
+    expect(outcome).toEqual({ outcome: "ok" });
+    // The row: one (user, pull) row at the posted sha.
+    expect(await storedRows(viewerUser.id)).toEqual([{ commitSha: HEAD }]);
+    // The loader (viewer passed) reads it CURRENT; the viewerless call — the
+    // mounted GET until the fold passes the viewer — reads null.
+    const withViewer = await loadPullFilesData(new Context(new Request("https://test.local/x"), { env }), viewRepoId, viewIndex, viewerUser);
+    expect(withViewer!.viewed).toEqual({ commitSha: HEAD, current: true });
+    const noViewer = await loadPullFilesData(new Context(new Request("https://test.local/x"), { env }), viewRepoId, viewIndex);
+    expect(noViewer!.viewed).toBeNull();
+  });
+
+  it("re-marking overwrites the sha (the upsert); an empty-map body defaults to the head sha", async () => {
+    const { issue, pullRequest } = await prRowOf();
+    const ctx = writeCtx(JSON.stringify({ files: {} }), "application/json");
+    expect(await updateViewedFilesFromWeb({ c: ctx, repo: viewRepoRow!, issue, pr: pullRequest, viewer: viewerUser })).toEqual({ outcome: "ok" });
+    expect(await storedRows(viewerUser.id)).toEqual([{ commitSha: HEAD }]); // defaulted from pr.headSha
+  });
+
+  it("the all-false map clears the row; the urlencoded form marks and unmarks", async () => {
+    const { issue, pullRequest } = await prRowOf();
+    const unmark = writeCtx(JSON.stringify({ files: { "a.ts": false }, headCommitSHA: HEAD }), "application/json");
+    expect(await updateViewedFilesFromWeb({ c: unmark, repo: viewRepoRow!, issue, pr: pullRequest, viewer: viewerUser })).toEqual({ outcome: "ok" });
+    expect(await storedRows(viewerUser.id)).toHaveLength(0);
+    const form = writeCtx(`head_commit_sha=${HEAD}&viewed=true`, "application/x-www-form-urlencoded");
+    expect(await updateViewedFilesFromWeb({ c: form, repo: viewRepoRow!, issue, pr: pullRequest, viewer: viewerUser })).toEqual({ outcome: "ok" });
+    expect(await storedRows(viewerUser.id)).toEqual([{ commitSha: HEAD }]);
+    const formOff = writeCtx("viewed=false", "application/x-www-form-urlencoded");
+    expect(await updateViewedFilesFromWeb({ c: formOff, repo: viewRepoRow!, issue, pr: pullRequest, viewer: viewerUser })).toEqual({ outcome: "ok" });
+    expect(await storedRows(viewerUser.id)).toHaveLength(0);
+  });
+
+  it("maps the refusals: malformed JSON 400, non-pull redirect", async () => {
+    const { issue, pullRequest } = await prRowOf();
+    const bad = writeCtx("{not json", "application/json");
+    expect(await updateViewedFilesFromWeb({ c: bad, repo: viewRepoRow!, issue, pr: pullRequest, viewer: viewerUser })).toEqual({
+      outcome: "bad-request",
+    });
+    // The non-pull twin redirects onto the issues family (getPullInfo's arm).
+    const plain = await new IssuesService(env.DB).createIssue({ repoId: viewRepoId, title: "plain", posterId: viewerUser.id, now: new Date(T0 * 1000) });
+    const redirect = writeCtx("viewed=true", "application/x-www-form-urlencoded");
+    expect(await updateViewedFilesFromWeb({ c: redirect, repo: viewRepoRow!, issue: plain, pr: null, viewer: viewerUser })).toEqual({
+      outcome: "redirect",
+      location: `/w111viewer/viewrepo/issues/${plain.index}`,
+    });
+  });
+
+  it("renders the viewed summary, the mark form and the per-file checkboxes from the loaded data", async () => {
+    // A stale row (a push moved the head past the mark) → summary 0 / N and
+    // the mark form; per-file labels unchecked.
+    const staleHtml = await renderWithRow(STALE);
+    expect(staleHtml).toContain("0 / 1 files viewed");
+    expect(staleHtml).toContain('id="viewed-files-summary" value="0" max="1"');
+    expect(staleHtml).toContain(`<form action="/w111viewer/viewrepo/pulls/${viewIndex}/viewed-files" method="post">`);
+    // The mark form posts the PR's CURRENT head (upstream's AfterCommitID /
+    // data-headcommit), never the stale row's sha.
+    expect(staleHtml).toContain(`name="head_commit_sha" value="${HEAD}"`);
+    expect(staleHtml).toContain('name="viewed" value="true"');
+    expect(staleHtml).toContain('class="viewed-file-form unselectable"');
+    // A current row → the full count, NO mark form, checked labels.
+    const currentHtml = await renderWithRow(HEAD);
+    expect(currentHtml).toContain("1 / 1 files viewed");
+    expect(currentHtml).not.toContain(`action="/w111viewer/viewrepo/pulls/${viewIndex}/viewed-files"`);
+    expect(currentHtml).toContain("viewed-file-form unselectable viewed-file-checked-form");
+    expect(currentHtml).toContain(`data-headcommit="${HEAD}"`);
+    expect(currentHtml).toContain('type="checkbox" name="f2.txt" autocomplete="off" checked=""');
+    // Anonymous renders neither the summary nor the labels.
+    const anonData = await loadedData({ kind: "anonymous" }, null);
+    const anonHtml = renderPullFilesPage({ ctx: pageCtx({ kind: "anonymous" }), data: anonData });
+    expect(anonHtml).not.toContain("viewed-files-summary");
+    expect(anonHtml).not.toContain("viewed-file-form");
+  });
+
+  // --- the render helpers (the page render is pure over its data) --------------
+
+  function pageCtx(viewer: Viewer): UiContext {
+    return { viewer, origin: "https://test.local", assets: shellAssetsFromManifest(manifest), repo: viewRepoRow! };
+  }
+
+  /** The loader's data with the review_state row pinned to `rowSha` and one
+   *  fabricated text file (the engine-backed diff renders are the route
+   *  suites' job). */
+  async function loadedData(viewer: Viewer, rowSha: string | null): Promise<PullFilesData> {
+    await prRowOf();
+    const userId = viewer.kind === "user" ? viewer.id : -1;
+    await drizzle(env.DB).delete(reviewState).where(and(eq(reviewState.userId, userId), eq(reviewState.issueId, viewIssueId)));
+    if (rowSha !== null) {
+      await drizzle(env.DB).insert(reviewState).values({ userId, issueId: viewIssueId, commitSha: rowSha, updatedUnix: T0 });
+    }
+    const loaded = await loadPullFilesData(new Context(new Request("https://test.local/x"), { env }), viewRepoId, viewIndex, viewer);
+    if (loaded === null) throw new Error("fixture loader returned null");
+    const files = await diffFileViews([
+      {
+        path: "f2.txt",
+        old: { oid: "0".repeat(40), mode: "100644" },
+        new: { oid: "1".repeat(40), mode: "100644" },
+        kind: "text",
+        add: 1,
+        del: 0,
+        hunks: [],
+      },
+    ]);
+    return { ...loaded, files, totalAddition: 1, totalDeletion: 0 };
+  }
+
+  async function renderWithRow(rowSha: string): Promise<string> {
+    const data = await loadedData(viewerUser, rowSha);
+    return renderPullFilesPage({ ctx: pageCtx(viewerUser), data });
+  }
+});
+
+// The DiffFileBox viewed-label DOM (the fragment-level pin — the box is the
+// shared vocabulary with the compare view, which passes no viewedForm).
+describe("w111 DiffFileBox viewed-file-form label", () => {
+  const BOX_SHA = "b".repeat(40);
+  it("renders upstream's label attrs only when the viewedForm is present", async () => {
+    const { DiffFileBox } = await import("./pull-files");
+    const view = (await diffFileViews([
+      {
+        path: "g.txt",
+        old: { oid: "0".repeat(40), mode: "100644" },
+        new: { oid: "2".repeat(40), mode: "100644" },
+        kind: "text",
+        add: 2,
+        del: 0,
+        hunks: [],
+      },
+    ]))[0]!;
+    const withForm = renderToString(
+      <DiffFileBox view={view} viewedForm={{ link: "/o/r/pulls/1/viewed-files", headCommitSha: BOX_SHA, viewed: true }} />,
+    );
+    expect(withForm).toContain('data-link="/o/r/pulls/1/viewed-files"');
+    expect(withForm).toContain(`data-headcommit="${BOX_SHA}"`);
+    expect(withForm).toContain('class="viewed-file-form unselectable viewed-file-checked-form"');
+    expect(withForm).toContain('type="checkbox" name="g.txt" autocomplete="off" checked=""');
+    const without = renderToString(<DiffFileBox view={view} />);
+    expect(without).not.toContain("viewed-file-form");
   });
 });

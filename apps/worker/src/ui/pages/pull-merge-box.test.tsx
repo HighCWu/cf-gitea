@@ -37,6 +37,7 @@ import {
 import { IssuesService } from "../../issues/service";
 import { CommentType } from "../../issues/comment-types";
 import { emptyRuleConfig, serializeRuleConfig } from "../../services/branch-protection";
+import { getScheduledAutoMerge } from "../../services/pull-automerge";
 import { RepoService } from "../../repos/service";
 import type { RepoRow } from "../ui-context";
 import {
@@ -1064,7 +1065,7 @@ describe("the web write arms", () => {
     });
     expect(await mergePullRequestFromWeb(await writeCtx("conflicted", alice), mergeFormOf({ merge_when_checks_succeed: "true" }))).toEqual({
       outcome: "error",
-      message: "scheduled auto-merge is not supported",
+      message: "This pull request is not ready to be merged. Check review status and status checks.",
     });
   });
 
@@ -1093,6 +1094,139 @@ describe("the web write arms", () => {
 
   it("answers the not-scheduled 404 for cancel_auto_merge", async () => {
     expect(await cancelAutoMergeFromWeb(await writeCtx("fresh", alice))).toEqual({ outcome: "not-found" });
+  });
+
+  it("schedules the auto merge when checks must succeed: row, type-34 comment, redirect", async () => {
+    // A dedicated mergeable fixture (the earlier tests mutate their own).
+    await seedWritePr("amgreen", { title: "feat: amgreen", headBranch: "feature" }, { headSha: featureOid });
+    const index = await writeIndex("amgreen");
+    const before = (await d1().select().from(comments).all()).filter((row) => row.type === CommentType.PRScheduledToAutoMerge).length;
+    const result = await mergePullRequestFromWeb(await writeCtx("amgreen", alice), mergeFormOf({ do: "squash", merge_when_checks_succeed: "true" }));
+    expect(result).toEqual({ outcome: "redirect", location: `/alice/wrepo/pulls/${index}` });
+    const found = (await findPullRequestByIndex(env.DB, writeRepoId, index))!;
+    const scheduled = await getScheduledAutoMerge(env.DB, found.issue.id);
+    expect(scheduled).not.toBeNull();
+    expect(scheduled!.doerId).toBe(alice.id);
+    expect(scheduled!.mergeStyle).toBe("squash");
+    expect(scheduled!.sha).toBe(featureOid);
+    expect(scheduled!.mergeMessage).toContain("feat: amgreen");
+    // The PR itself is NOT merged by the schedule arm.
+    expect(found.pullRequest.hasMerged).toBe(false);
+    // The type-34 system comment (CreateAutoMergeComment's scheduled half).
+    const after = (await d1().select().from(comments).all()).filter((row) => row.type === CommentType.PRScheduledToAutoMerge).length;
+    expect(after).toBe(before + 1);
+  });
+
+  it("renders the pending schedule: the info message + the cancel form + the reduced MWCS hidden", async () => {
+    const index = await writeIndex("amgreen");
+    const found = (await findPullRequestByIndex(env.DB, writeRepoId, index))!;
+    const data = await loadPullMergeBoxData(env.DB, {
+      repo: await writeRepoOf(),
+      issue: found.issue,
+      pr: found.pullRequest,
+      viewer: alice,
+      origin: ORIGIN,
+      listTips: (pair) => engineReads(env, pair).listRefs(),
+    });
+    expect(data!.mergeForm!.pendingAutoMerge?.doerName).toBe("alice");
+    expect(typeof data!.mergeForm!.pendingAutoMerge?.createdUnix).toBe("number");
+    expect(data!.mergeForm!.mergeWhenChecksSucceed).toBe(false); // canMergeNow on the clean fixture
+    const html = pullMergeBoxFragmentHtml(data);
+    expect(html).toContain('class="ui info message"');
+    expect(html).toContain("scheduled this pull request to auto merge when all checks succeed");
+    expect(html).toContain(`<form action="/alice/wrepo/pulls/${index}/cancel_auto_merge" method="post" class="tw-ml-4">`);
+    expect(html).toContain("Cancel auto merge");
+  });
+
+  it("re-scheduling resets the single row (the handler's delete-first)", async () => {
+    const index = await writeIndex("amgreen");
+    await mergePullRequestFromWeb(await writeCtx("amgreen", alice), mergeFormOf({ do: "merge", merge_when_checks_succeed: "true" }));
+    const found = (await findPullRequestByIndex(env.DB, writeRepoId, index))!;
+    const scheduled = await getScheduledAutoMerge(env.DB, found.issue.id);
+    expect(scheduled!.mergeStyle).toBe("merge");
+    const commentsRows = await d1().select().from(comments).where(eq(comments.issueId, found.issue.id)).all();
+    expect(commentsRows.filter((row) => row.type === CommentType.PRScheduledToAutoMerge).length).toBe(2);
+  });
+
+  it("refuses the schedule for a WIP PR and a conflicted PR (no row lands)", async () => {
+    await seedWritePr("amwip", { title: "WIP: amwip", headBranch: "feature" }, { headSha: featureOid });
+    const wip = await mergePullRequestFromWeb(await writeCtx("amwip", alice), mergeFormOf({ merge_when_checks_succeed: "true" }));
+    expect(wip).toEqual({ outcome: "error", message: "This pull request cannot be merged because it is marked as being a work in progress." });
+    const conflict = await mergePullRequestFromWeb(await writeCtx("conflicted", alice), mergeFormOf({ merge_when_checks_succeed: "true" }));
+    expect(conflict).toEqual({
+      outcome: "error",
+      message: "This pull request is not ready to be merged. Check review status and status checks.",
+    });
+    for (const name of ["amwip", "conflicted"]) {
+      const found = (await findPullRequestByIndex(env.DB, writeRepoId, await writeIndex(name)))!;
+      expect(await getScheduledAutoMerge(env.DB, found.issue.id)).toBeNull();
+    }
+  });
+
+  it("renders the MWCS-hidden true + the button suffix when the merge cannot happen now", async () => {
+    // A rule whose blockers alice (the admin) canNOT bypass: the approvals
+    // blocker stands and canMergeNow flips false — the Vue arm where the
+    // only offered action is the auto merge.
+    const repo = await new RepoService(env.DB).create({
+      owner: { id: alice.id, usernameLower: "alice" },
+      name: "forcegated",
+      isPrivate: false,
+      status: "ready",
+    });
+    const forceRepoId = repo.id;
+    await d1().insert(protectedBranches).values({
+      repoId: forceRepoId,
+      ruleName: "main",
+      priority: 0,
+      rules: serializeRuleConfig({ ...emptyRuleConfig(), requiredApprovals: 1, blockAdminMergeOverride: true }),
+      createdAt: new Date(T0 * 1000),
+      updatedAt: new Date(T0 * 1000),
+    });
+    await seedWritePr("amblocked", { title: "feat: amblocked", headBranch: "feature" }, { headSha: featureOid });
+    // Move the row onto the force-gated repo (seedWritePr pins writeRepoId).
+    await d1()
+      .update(pullRequests)
+      .set({ headRepoId: forceRepoId, baseRepoId: forceRepoId })
+      .where(eq(pullRequests.id, writePrIds.amblocked!));
+    await d1()
+      .update(issues)
+      .set({ repoId: forceRepoId })
+      .where(eq(issues.id, writeIssueIds.amblocked!));
+    const found = (await findPullRequestByIndex(env.DB, forceRepoId, await writeIndex("amblocked")))!;
+    const data = await loadPullMergeBoxData(env.DB, {
+      repo: (await d1().select().from(repositories).where(eq(repositories.id, forceRepoId)).all())[0]!,
+      issue: found.issue,
+      pr: found.pullRequest,
+      viewer: alice,
+      origin: ORIGIN,
+      listTips: (pair) => engineReads(env, pair).listRefs(),
+    });
+    expect(data!.mergeForm!.mergeWhenChecksSucceed).toBe(true);
+    expect(data!.mergeForm!.forceMerge).toBe(false); // canMergeNow false — no force escape either
+    const html = pullMergeBoxFragmentHtml(data);
+    expect(html).toContain('name="merge_when_checks_succeed" value="true"');
+    expect(html).toContain("Create merge commit (When checks succeed)");
+  });
+
+  it("cancels the schedule: scheduler redirect + row gone + type-35; the permissionless 403 twin", async () => {
+    const index = await writeIndex("amgreen");
+    const found = (await findPullRequestByIndex(env.DB, writeRepoId, index))!;
+    // bob holds no write on alice's repo → the permission-denied error text.
+    expect(await cancelAutoMergeFromWeb(await writeCtx("amgreen", bob))).toEqual({
+      outcome: "error",
+      message: "user has no permission to cancel the scheduled auto merge",
+    });
+    expect(await getScheduledAutoMerge(env.DB, found.issue.id)).not.toBeNull();
+    // The scheduler cancels: redirect, row gone, the type-35 comment.
+    expect(await cancelAutoMergeFromWeb(await writeCtx("amgreen", alice))).toEqual({
+      outcome: "redirect",
+      location: `/alice/wrepo/pulls/${index}`,
+    });
+    expect(await getScheduledAutoMerge(env.DB, found.issue.id)).toBeNull();
+    const rows = await d1().select().from(comments).where(eq(comments.issueId, found.issue.id)).all();
+    expect(rows.some((row) => row.type === CommentType.PRUnscheduledToAutoMerge)).toBe(true);
+    // The second cancel finds no row → the upstream NotFound arm.
+    expect(await cancelAutoMergeFromWeb(await writeCtx("amgreen", alice))).toEqual({ outcome: "not-found" });
   });
 
   it("updates the head branch by merge: redirect, moved ref, checking row", async () => {
