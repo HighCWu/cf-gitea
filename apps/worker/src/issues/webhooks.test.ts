@@ -17,7 +17,7 @@ import { serializeCommit, serializeTree, type ApiObject, type DiffFileJson } fro
 import { env } from "cloudflare:workers";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
-import { commitFileLists, enrichCommitsWithFileLists, type CommitDiffRead } from "./webhooks";
+import { branchFilterAllows, commitFileLists, enrichCommitsWithFileLists, type CommitDiffRead } from "./webhooks";
 
 // wave-129 full-run contention budget: the beforeAll enrichment chain (five
 // commits landed through the RepoCell write RPCs) measured a 16.07s hook share
@@ -237,5 +237,62 @@ describe("enrichCommitsWithFileLists (real RepoCell)", () => {
     expect(result.enriched).toBe(false);
     expect(result.commits).toBe(payload);
     expect("added" in result.commits[0]!).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// branchFilterAllows — the checkBranchFilter glob (services/webhook/
+// webhook.go:110-130 over gitea/modules/glob). The pin compiles the pattern
+// with NO separators (bare glob.Compile), so `*`/`**` are both `.*` and `?`
+// is `.` — any run/character, `/` included — while classes and brace
+// alternation compile live and a malformed pattern DENIES the hook (the err
+// arm, webhook.go:119-122).
+// ---------------------------------------------------------------------------
+
+describe("branchFilterAllows — the gitea/modules/glob grammar (bare Compile, no separators)", () => {
+  it("compiles character classes, ranges and negation live", () => {
+    expect(branchFilterAllows("releases[0-9]", "refs/heads/releases1")).toBe(true);
+    expect(branchFilterAllows("releases[0-9]", "refs/heads/releasesx")).toBe(false);
+    expect(branchFilterAllows("rel[eas]ase", "refs/heads/release")).toBe(true);
+    expect(branchFilterAllows("rel[eas]ase", "refs/heads/releXase")).toBe(false);
+    expect(branchFilterAllows("[!a]bc", "refs/heads/xbc")).toBe(true);
+    expect(branchFilterAllows("[!a]bc", "refs/heads/abc")).toBe(false);
+  });
+
+  it("compiles {a,b} alternation — nestable, empty arm matches empty, a bare comma stays literal", () => {
+    expect(branchFilterAllows("{main,develop}", "refs/heads/main")).toBe(true);
+    expect(branchFilterAllows("{main,develop}", "refs/heads/develop")).toBe(true);
+    expect(branchFilterAllows("{main,develop}", "refs/heads/feature")).toBe(false);
+    expect(branchFilterAllows("release/{1,2}.{x,y}", "refs/heads/release/1.y")).toBe(true);
+    expect(branchFilterAllows("release/{1,2}.{x,y}", "refs/heads/release/1.z")).toBe(false);
+    expect(branchFilterAllows("{,rc}", "refs/heads/rc")).toBe(true);
+    expect(branchFilterAllows("a,b", "refs/heads/a,b")).toBe(true);
+    expect(branchFilterAllows("a,b", "refs/heads/ab")).toBe(false);
+  });
+
+  it("matches `*` and `?` across separators (bare Compile has none — no [^/] segment cap)", () => {
+    expect(branchFilterAllows("release*", "refs/heads/release/1.0")).toBe(true);
+    expect(branchFilterAllows("release*", "refs/heads/releasea")).toBe(true);
+    expect(branchFilterAllows("ma?n", "refs/heads/ma-n")).toBe(true);
+    expect(branchFilterAllows("feature/*", "refs/heads/feature/x/y")).toBe(true);
+    expect(branchFilterAllows("feature/*", "refs/heads/main")).toBe(false);
+  });
+
+  it("DENIES a malformed filter (the compile-failure arm, webhook.go:119-122)", () => {
+    // empty class — Go's regexp "missing closing ]"; JS would compile a
+    // never/every-matching class, so the compiler mirrors Go's error.
+    expect(branchFilterAllows("[]main", "refs/heads/main")).toBe(false);
+    expect(branchFilterAllows("[!]", "refs/heads/x")).toBe(false);
+    // unterminated constructs
+    expect(branchFilterAllows("[abc", "refs/heads/abc")).toBe(false);
+    expect(branchFilterAllows("releases{", "refs/heads/releases")).toBe(false);
+    expect(branchFilterAllows("{main,devel", "refs/heads/devel")).toBe(false);
+    expect(branchFilterAllows("main\\", "refs/heads/main")).toBe(false);
+    expect(branchFilterAllows("releases[0-", "refs/heads/releases")).toBe(false);
+    // a bare `]` outside a class — Go's regexp rejects it (JS would take it
+    // literally), so the compiler mirrors Go's error.
+    expect(branchFilterAllows("main]", "refs/heads/main]")).toBe(false);
+    // an invalid class range fails the regexp compile on both runtimes
+    expect(branchFilterAllows("rel[z-a]ase", "refs/heads/release")).toBe(false);
   });
 });

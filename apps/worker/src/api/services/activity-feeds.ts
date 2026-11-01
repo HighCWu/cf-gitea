@@ -41,7 +41,8 @@ import { prefetchCommentPosters, toApiComment } from "./issues";
  *   - payload: gitea/services/convert/activity.go:17-50 (ToActivity).
  *
  * Deviations are pinned in the SPEC (§3.1 TEXT repo_id / 3-of-5 indexes,
- * §3.2 no write-time watcher permission filter, §3.3 the wired action-type
+ * §3.2 the write-time watcher filter ports the notification-pref half only —
+ * no per-unit permissions, §3.3 the wired action-type
  * matrix, §3.4 visibility='private' plays keep_activity_private — the
  * routes/user-read-t2.ts heatmap precedent — and UTC date windows). The
  * visibility/repo-access filters run as SQL subqueries so the D1 bound
@@ -151,15 +152,65 @@ export interface ActionDraft {
 }
 
 /**
+ * The per-action notification-pref gate over a watcher row (feed.go:67-89):
+ * each watcher receives only the action families its flags subscribe to.
+ * `IsWatchingAll` (watch.go:81-84) — mode ≠ Custom AND all three include
+ * flags — gates the code family and the default (repository events have no
+ * watch option of their own); the release, issues and PR families each key
+ * off their single flag. Upstream's `permCode/permIssue/permPR` unit-
+ * permission conjuncts are the SPEC §3.2 deviation (cf-gitea has no
+ * per-unit permissions) — the notification prefs are the ported half.
+ */
+function watcherAllows(
+  watch: { mode: number; includePullRequests: boolean; includeIssues: boolean; includeReleases: boolean },
+  opType: number,
+): boolean {
+  const watchingAll =
+    watch.mode !== WatchMode.Custom && watch.includePullRequests && watch.includeIssues && watch.includeReleases;
+  switch (opType) {
+    case ActionType.CommitRepo:
+    case ActionType.PushTag:
+    case ActionType.DeleteTag:
+    case ActionType.DeleteBranch:
+      return watchingAll; // code family (feed.go:69-71)
+    case ActionType.PublishRelease:
+      return watch.includeReleases; // feed.go:72-73
+    case ActionType.CreateIssue:
+    case ActionType.CommentIssue:
+    case ActionType.CloseIssue:
+    case ActionType.ReopenIssue:
+      return watch.includeIssues; // feed.go:74-76
+    case ActionType.CreatePullRequest:
+    case ActionType.CommentPull:
+    case ActionType.MergePullRequest:
+    case ActionType.ClosePullRequest:
+    case ActionType.ReopenPullRequest:
+    case ActionType.AutoMergePullRequest:
+    case ActionType.ApprovePullRequest:
+    case ActionType.RejectPullRequest:
+    case ActionType.PullReviewDismissed:
+    case ActionType.PullRequestReadyForReview:
+      return watch.includePullRequests; // feed.go:77-81
+    default:
+      return watchingAll; // repository events (feed.go:82-84)
+  }
+}
+
+/**
  * Insert the receiver fan-out for one action (SPEC §3.2): the original row
  * (`user_id = act_user_id`), the org-owner row when the repo is org-owned
  * and the actor is not the org (feed.go:55-62), and one row per repo
  * watcher (feed.go:64-100 — the GetWatchers read, watch.go:228-241:
- * mode <> Dont + any include on + active user; see the query below).
- * Deviation (SPEC §3.2): upstream's write-time per-watcher
- * unit-permission/notification-pref filter is NOT ported — cf-gitea has no
- * per-unit permissions and `repo_watchers` carries no prefs; the read
- * path's per-caller filters bound visibility under our model.
+ * mode <> Dont + any include on + active user; see the query below), then
+ * the per-action notification-pref gate (`watcherAllows` above,
+ * feed.go:67-89).
+ * Deviation (SPEC §3.2, narrowed): upstream's write-time filter's
+ * unit-permission half (`permCode/permIssue/permPR`) is NOT ported —
+ * cf-gitea has no per-unit permissions; the notification-pref half
+ * (`watcher.IncludeIssues` / `IncludePullRequests` / `IncludeReleases` /
+ * `IsWatchingAll`) IS — the columns exist on `repo_watchers` (migration
+ * 0053). The read path's per-caller filters still bound visibility under
+ * our model.
  *
  * Throws on D1 errors — the emitter hooks own the catch-and-log posture,
  * exactly like the webhook fan-out.
@@ -200,7 +251,13 @@ export async function recordAction(db: D1Database, draft: ActionDraft): Promise<
   // (:238) has no column — the landed no-column divergence class, every
   // account is login-able).
   const watcherRows = await d1
-    .select({ userId: repoWatchers.userId })
+    .select({
+      userId: repoWatchers.userId,
+      mode: repoWatchers.mode,
+      includePullRequests: repoWatchers.includePullRequests,
+      includeIssues: repoWatchers.includeIssues,
+      includeReleases: repoWatchers.includeReleases,
+    })
     .from(repoWatchers)
     .innerJoin(users, eq(users.id, repoWatchers.userId))
     .where(
@@ -217,9 +274,9 @@ export async function recordAction(db: D1Database, draft: ActionDraft): Promise<
     )
     .all();
   for (const watcher of watcherRows) {
-    if (watcher.userId !== draft.actUserId && !receivers.includes(watcher.userId)) {
-      receivers.push(watcher.userId);
-    }
+    if (watcher.userId === draft.actUserId || receivers.includes(watcher.userId)) continue;
+    if (!watcherAllows(watcher, draft.opType)) continue;
+    receivers.push(watcher.userId);
   }
 
   await d1
@@ -579,10 +636,13 @@ export async function renderFeedItems(
       act_user: apiUserFromRow(actUser, viewer),
       repo_id: numericRepoId(row.repoId),
       repo: toApiRepository(viewer, pair),
-      // comment_id always serializes (Go zero-value 0; no omitempty upstream);
-      // the embedded comment OBJECT only for a live comment row.
-      comment_id: row.commentId,
-      ...(renderedComment === undefined ? {} : { comment: renderedComment.comment }),
+      // Both serialize the comment only when it resolves: upstream sets
+      // CommentID inside `if ac.Comment != nil` (activity.go:42-46), so a
+      // dangling comment_id renders the Go zero value 0 (no omitempty on
+      // the field, structs/activity.go:26) with no comment object.
+      ...(renderedComment === undefined
+        ? { comment_id: 0 }
+        : { comment_id: row.commentId, comment: renderedComment.comment }),
       ref_name: row.refName,
       is_private: row.isPrivate,
       content: row.content,

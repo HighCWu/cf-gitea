@@ -1781,3 +1781,139 @@ describe("deploy tokens authenticate git-HTTP (upstream's DeployToken method, we
     expect((await drizzle(env.DB).select().from(deployKeys).all())[0]!.repoId).toBe(repoId);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Upstream-parity arms (services-parity review items 3-5): the mirror-readonly
+// 403's verbatim PlainText body, the PRE-AUTH owner-inactive/archived 403s
+// (anonymous callers get the plain 403 body, never the 401 Basic challenge),
+// and the `?go-get=1` meta answering on every git route upstream's httpBase
+// reaches (githttp.go:63-66 — GET /info/refs AND the POST RPCs).
+// ---------------------------------------------------------------------------
+
+describe("upstream-parity arms: mirror 403 body, pre-auth 403s, go-get on every git route", () => {
+  /** One minimal public D1 repo row (the ACL-only arms never reach the engine). */
+  async function seedGateRepo(slug: string, extra: Partial<typeof repositories.$inferInsert> = {}) {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    await drizzle(env.DB)
+      .insert(repositories)
+      .values({
+        id: `g_${slug}`,
+        storageKey: `r_g_${slug}`,
+        ownerNamespace: "alice",
+        ownerId: alice.id,
+        slug,
+        visibility: "public",
+        ...extra,
+      });
+    return alice;
+  }
+
+  it("mirror-readonly 403 writes the body verbatim (no trailing newline) with upstream's PlainText headers", async () => {
+    const alice = await seedGateRepo("mirror", { isMirror: true });
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+
+    const advert = await SELF.fetch(
+      "https://example.com/alice/mirror.git/info/refs?service=git-receive-pack",
+      { headers: { authorization: basicTokenHeader(token) } },
+    );
+    expect(advert.status).toBe(403);
+    // ctx.PlainText (base.go plainTextInternal) writes the string VERBATIM —
+    // the review's finding: the old inline shape appended `\n`.
+    expect(await advert.text()).toBe("mirror repository is read-only");
+    expect(advert.headers.get("content-type")).toBe("text/plain;charset=utf-8");
+    expect(advert.headers.get("x-content-type-options")).toBe("nosniff");
+  });
+
+  it("owner-inactive answers the plain 403 PRE-auth — anonymous gets the body, not the 401 challenge (githttp.go:103-107)", async () => {
+    const alice = await seedGateRepo("frozenowner");
+    await drizzle(env.DB).update(users).set({ status: "prohibited" }).where(eq(users.id, alice.id));
+
+    const anonymous = await SELF.fetch(
+      "https://example.com/alice/frozenowner.git/info/refs?service=git-upload-pack",
+    );
+    expect(anonymous.status).toBe(403);
+    expect(anonymous.headers.get("www-authenticate")).toBeNull();
+    expect(await anonymous.text()).toBe(
+      "Repository cannot be accessed. You cannot push or open issues/pull-requests.",
+    );
+
+    // The owner themself (valid token, write scope): the same pre-auth 403 —
+    // upstream's block runs for every caller.
+    const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const owner = await SELF.fetch("https://example.com/alice/frozenowner.git/info/refs?service=git-upload-pack", {
+      headers: { authorization: basicTokenHeader(token) },
+    });
+    expect(owner.status).toBe(403);
+    expect(await owner.text()).toBe(
+      "Repository cannot be accessed. You cannot push or open issues/pull-requests.",
+    );
+  });
+
+  it("archived pushes answer the plain 403 PRE-auth — anonymous gets the body, not the 401 challenge; clones keep working (githttp.go:124-128)", async () => {
+    await seedGateRepo("frozen", { isArchived: true });
+
+    const anonymousPush = await SELF.fetch(
+      "https://example.com/alice/frozen.git/info/refs?service=git-receive-pack",
+    );
+    expect(anonymousPush.status).toBe(403);
+    expect(anonymousPush.headers.get("www-authenticate")).toBeNull();
+    expect(await anonymousPush.text()).toBe(
+      "This repo is archived. You can view files and clone it, but cannot push or open issues/pull-requests.",
+    );
+
+    // Reads are unaffected by the archived refusal (the `!isPull` gate) — the
+    // anonymous clone advert still serves once the engine knows the name.
+    await env.REGISTRY.getByName("registry").upsert("alice/frozen", Date.now());
+    const clone = await SELF.fetch("https://example.com/alice/frozen.git/info/refs?service=git-upload-pack");
+    expect(clone.status).toBe(200);
+  });
+
+  it("?go-get=1 answers the go-import meta on the RPC routes too (httpBase answers before auth/existence)", async () => {
+    const meta = '<meta name="go-import" content="example.com/nobody/nothing git https://example.com/nobody/nothing.git">';
+
+    // The upload-pack RPC (POST, the router-admitted method).
+    const uploadRpc = await SELF.fetch("https://example.com/nobody/nothing.git/git-upload-pack?go-get=1", {
+      method: "POST",
+      headers: { "content-type": UPLOAD_CT },
+      body: "0000",
+    });
+    expect(uploadRpc.status).toBe(200);
+    expect(await uploadRpc.text()).toBe(meta);
+
+    // The receive-pack RPC — the anonymous push-create advert probe would
+    // otherwise 401 BEFORE anything else; the meta outranks it like upstream.
+    const receiveRpc = await SELF.fetch("https://example.com/nobody/nothing.git/git-receive-pack?go-get=1", {
+      method: "POST",
+      headers: { "content-type": RECEIVE_CT },
+      body: "0000",
+    });
+    expect(receiveRpc.status).toBe(200);
+    expect(await receiveRpc.text()).toBe(meta);
+  });
+
+  it("go-get follows upstream's router method bindings: a method the router would not route gets no meta", async () => {
+    // GET /git-upload-pack is not a chi route upstream (POST,OPTIONS only) —
+    // no meta; the request falls through to the ordinary pipeline (here the
+    // D1-miss registry-oracle 404).
+    const getRpc = await SELF.fetch("https://example.com/nobody/nothing.git/git-upload-pack?go-get=1");
+    expect(getRpc.status).toBe(404);
+    expect(await getRpc.text()).not.toContain("go-import");
+
+    // POST /info/refs is likewise not a route (GET,OPTIONS only) — no meta;
+    // on a D1-resolved repo the service parse answers the bare 400 (§2.2,
+    // no ?service).
+    await seedGateRepo("postrefs");
+    const postRefs = await SELF.fetch("https://example.com/alice/postrefs.git/info/refs?go-get=1", {
+      method: "POST",
+      headers: { "content-type": UPLOAD_CT },
+      body: "0000",
+    });
+    expect(postRefs.status).toBe(400);
+    expect(await postRefs.text()).not.toContain("go-import");
+
+    // The synthetic HEAD file has no upstream httpBase arm at all — no meta.
+    const head = await SELF.fetch("https://example.com/nobody/nothing.git/HEAD?go-get=1");
+    expect(head.status).toBe(404);
+    expect(await head.text()).not.toContain("go-import");
+  });
+});

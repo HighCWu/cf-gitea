@@ -1572,13 +1572,20 @@ export function parsePushCommands(section: Uint8Array): { commands: PushCommand[
 
 /**
  * The client's `atomic` capability: if ANY ref update fails, NONE apply. The
- * commands that would have applied report this message (byte-observed on git
- * 2.43.0: a per-ref failure with --atomic keeps the failing command's own ng
- * message and renders the siblings `ng <ref> atomic push failed`), and the
- * refs are left untouched — git's ref-transaction abort
- * (builtin/receive-pack.c execute_commands_atomic).
+ * commands that would have applied report this message, and the refs are
+ * left untouched — git's ref-transaction abort (builtin/receive-pack.c
+ * execute_commands_atomic: a failing arm does `goto failure`, which renders
+ * every command without its own error the `reported_error` text). The string
+ * is the arm upstream-git renders when the ref TRANSACTION aborts on an
+ * atomic push — `reported_error = "atomic transaction failed"` in the
+ * `ref_transaction_commit` failure branch (git v2.43.0
+ * builtin/receive-pack.c:1896; binary-verified in the shipped git 2.43.0) —
+ * the shape this engine's single-transaction commit models. (Deviation from
+ * the vendored durable-git text "atomic push failed", recorded in
+ * NOTICE.md: real receive-pack never reports that literal as an ng message
+ * on modern git.)
  */
-export const ATOMIC_PUSH_FAILED = "atomic push failed";
+export const ATOMIC_PUSH_FAILED = "atomic transaction failed";
 
 /**
  * Parse the push-options section of a receive-pack request (gitprotocol-pack:

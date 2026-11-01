@@ -199,6 +199,92 @@ describe("activity feeds — write path through the emitters", () => {
     ]);
   });
 
+  it("gates watcher receivers by the per-action notification prefs (feed.go:67-89) — each family × each flag shape pinned", async () => {
+    // Five watchers on the repo beside the actor, one per flag shape:
+    //   issuesOnly    — Custom (4), include_issues only;
+    //   prsOnly       — Custom (4), include_pull_requests only;
+    //   releasesOnly  — Custom (4), include_releases only;
+    //   allFlags      — Normal (1), every flag at its true default — the
+    //                   IsWatchingAll state;
+    //   customAll     — Custom (4) with all three flags ON — every
+    //                   single-flag family passes but IsWatchingAll does NOT
+    //                   (the mode ≠ Custom conjunct, watch.go:82-84).
+    const seedWatcherUser = async (username: string): Promise<number> => {
+      await env.DB.prepare("INSERT INTO users (username, username_lower, created_at) VALUES (?, ?, 0)")
+        .bind(username, username)
+        .run();
+      return Number(
+        (await env.DB.prepare("SELECT id FROM users WHERE username_lower = ?").bind(username).first<{ id: number }>())
+          ?.id,
+      );
+    };
+    const issuesOnly = await seedWatcherUser("issues-only");
+    const prsOnly = await seedWatcherUser("prs-only");
+    const releasesOnly = await seedWatcherUser("releases-only");
+    const allFlags = await seedWatcherUser("all-flags");
+    const customAll = await seedWatcherUser("custom-all");
+    const seedWatcher = async (
+      userId: number,
+      mode: number,
+      includePullRequests: number,
+      includeIssues: number,
+      includeReleases: number,
+    ): Promise<void> => {
+      await env.DB.prepare(
+        "INSERT INTO repo_watchers (repo_id, user_id, mode, include_pull_requests, include_issues, include_releases) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+        .bind(REPO_ID, userId, mode, includePullRequests, includeIssues, includeReleases)
+        .run();
+    };
+    await seedWatcher(issuesOnly, 4, 0, 1, 0);
+    await seedWatcher(prsOnly, 4, 1, 0, 0);
+    await seedWatcher(releasesOnly, 4, 0, 0, 1);
+    await seedWatcher(allFlags, 1, 1, 1, 1);
+    await seedWatcher(customAll, 4, 1, 1, 1);
+
+    // One action per family (recordAction directly — full opType control;
+    // REPO_ID's owner is a plain user so no org row joins the fan-out).
+    for (const opType of [
+      ActionType.CreateIssue, // issues family
+      ActionType.CommentPull, // PR family
+      ActionType.PublishRelease, // release family
+      ActionType.CommitRepo, // code family
+      ActionType.CreateRepo, // default (repository events)
+    ]) {
+      await recordAction(env.DB, { actUserId: 1, repoId: REPO_ID, opType, isPrivate: false });
+    }
+
+    const received = (
+      await env.DB.prepare("SELECT op_type, user_id FROM action WHERE user_id <> 1 ORDER BY op_type, user_id").all<{
+        op_type: number;
+        user_id: number;
+      }>()
+    ).results;
+    expect(received).toEqual([
+      // CreateRepo (default): IsWatchingAll only.
+      { op_type: ActionType.CreateRepo, user_id: allFlags },
+      // CommitRepo (code family): IsWatchingAll — customAll's mode blocks it.
+      { op_type: ActionType.CommitRepo, user_id: allFlags },
+      // CreateIssue: the include_issues flag (single-flag families pass for
+      // customAll too — only the code/default families gate on the mode).
+      { op_type: ActionType.CreateIssue, user_id: issuesOnly },
+      { op_type: ActionType.CreateIssue, user_id: allFlags },
+      { op_type: ActionType.CreateIssue, user_id: customAll },
+      // CommentPull: the include_pull_requests flag.
+      { op_type: ActionType.CommentPull, user_id: prsOnly },
+      { op_type: ActionType.CommentPull, user_id: allFlags },
+      { op_type: ActionType.CommentPull, user_id: customAll },
+      // PublishRelease: the include_releases flag.
+      { op_type: ActionType.PublishRelease, user_id: releasesOnly },
+      { op_type: ActionType.PublishRelease, user_id: allFlags },
+      { op_type: ActionType.PublishRelease, user_id: customAll },
+    ]);
+    // The headline regression: an issues-only watcher gets NO PR/release rows.
+    expect(received.filter((row) => row.user_id === issuesOnly).map((row) => row.op_type)).toEqual([
+      ActionType.CreateIssue,
+    ]);
+  });
+
   it("runs the GetWatchers mode filter over the watcher receivers (watch.go:228-241) — Dont and no-include rows receive nothing, a picked-include Custom row does", async () => {
     // Four watchers on the repo beside the actor:
     //   neighborId    — Normal (1), the plain watcher — included;
@@ -685,8 +771,9 @@ describe("activity feeds query-shape witness (query-shape-audit A8)", () => {
         act_user: apiUserFromRow(actUser, viewer),
         repo_id: numericRepoId(row.repoId),
         repo: toApiRepository(viewer, pair),
-        comment_id: row.commentId,
-        ...(renderedComment === undefined ? {} : { comment: renderedComment.comment }),
+        ...(renderedComment === undefined
+          ? { comment_id: 0 }
+          : { comment_id: row.commentId, comment: renderedComment.comment }),
         ref_name: row.refName,
         is_private: row.isPrivate,
         content: row.content,
@@ -713,6 +800,11 @@ describe("activity feeds query-shape witness (query-shape-audit A8)", () => {
     expect(body).toEqual(perRow);
     expect(new Set(body.map((item) => item.act_user_id))).toEqual(new Set([1, neighborId]));
     expect(body.filter((item) => item.comment !== undefined)).toHaveLength(3);
-    expect(body.find((item) => item.comment_id === 999999)?.comment).toBeUndefined();
+    // The dangling comment arm: upstream sets CommentID inside
+    // `if ac.Comment != nil` (activity.go:42-46), so a dead comment renders
+    // comment_id 0 with no comment object — NOT the row's stale id.
+    const ghost = body.find((item) => item.content === "1|ghost");
+    expect(ghost?.comment_id).toBe(0);
+    expect(ghost?.comment).toBeUndefined();
   });
 });

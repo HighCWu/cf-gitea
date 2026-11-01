@@ -2,11 +2,13 @@
  * Git-HTTP ACL gate — SPEC-0003 §2.4 matrix over D1-resolved repositories.
  *
  * Pipeline stage order follows upstream `httpBase`
- * (gitea/routers/web/repo/githttp.go:62-261):
+ * (gitea/routers/web/repo/githttp.go:62-261): the two PRE-AUTH refusals
+ * first (owner-inactive :103-107, archived pushes :124-128 — plain 403 for
+ * every caller, anonymous included), then the auth ladder:
  *   credentials → failure limiter → deploy-token verify (upstream's
  *   DeployToken method, registered on the git routes before Basic,
  *   web.go:135-136) → token verify → scope check (row 7) →
- *   doer account status (row 11) → owner account status → repo grants
+ *   doer account status (row 11) → repo grants
  *   (rows 8/9) → push-create (rows 15-20, SPEC-0003 M3).
  *
  * Conventions (SPEC-0003 §2.4, SPEC-0002 §2.6): unauthenticated → 401 Basic
@@ -324,6 +326,18 @@ function decide(
   teamMode: TeamAccessMode,
   oauth2Enabled: boolean,
 ): Response | true {
+  // PRE-AUTH refusals — upstream httpBase runs both BEFORE the auth ladder,
+  // so they answer their plain 403 bodies to ANONYMOUS callers too (never
+  // the 401 Basic challenge):
+  //   - owner-inactive (githttp.go:103-107): every caller, reads included —
+  //     the repo owner's account is unavailable, full stop;
+  //   - archived pushes (githttp.go:124-128): `repoExist && IsArchived &&
+  //     !isPull` — writes only, clones keep working; grants are not
+  //     consulted, so the archived status of an existing repo path is not
+  //     masked (upstream's own ordering).
+  if (owner !== null && owner.status === "prohibited") return ownerUnavailable();
+  if (op === "write" && repo.isArchived) return repositoryArchived();
+
   // Visibility model (§2.5.6): repo `visibility` × owner `users.visibility`.
   // Row 1: public repo + active PUBLIC owner. Row 2's limited/private-owner
   // branches arrive with the M2 `users.visibility` column: a limited owner's
@@ -355,11 +369,9 @@ function decide(
   if (scope === null || !scope.has(required)) return scopeForbidden();
 
   // Row 11: disabled/prohibited doer (checked after the scope, like upstream).
+  // (The repo OWNER's inactive status was the PRE-AUTH refusal above —
+  // upstream's :103-107 block, ahead of the ladder.)
   if (doer.status === "prohibited") return accountDisabled();
-
-  // Upstream httpBase also refuses when the repo's OWNER is inactive
-  // (githttp.go:117-119) — applies to every caller, owner included.
-  if (owner !== null && owner.status === "prohibited") return ownerUnavailable();
 
   // Grant lines: { repo owner, site admin } plus the resolved grant (the
   // SPEC-0007 §3.5 org arms — the Owners-team bridge + covering teams — and,
@@ -388,9 +400,7 @@ function decide(
   if (!canRead || maskedByPublicOnly) return repositoryNotFound();
 
   if (op === "write") {
-    // Row 10: archived repos refuse pushes (upstream :124-128 message text);
-    // clones keep working — the check only gates the write path.
-    if (repo.isArchived) return repositoryArchived();
+    // Row 10's archived refusal ran PRE-AUTH above (upstream :124-128).
     // Row 8: visible but no write grant → 404 (write capability hidden).
     // Write ranks at write/admin/owner mode (access_mode.go:17–22 ranking)
     // on the resolved grant — an org team OR the SPEC-0005 collaborator row

@@ -184,8 +184,17 @@ export async function gitHttpGate(
   }
 
   // §2.1 item 1: `?go-get=1` short-circuits before auth and regardless of
-  // existence/access (go-get ignores .netrc, so the meta needs no auth).
-  if (route.kind === "info-refs" && url.searchParams.get("go-get") === "1") {
+  // existence/access (go-get ignores .netrc, so the meta needs no auth) —
+  // upstream's httpBase answers it at the TOP of every git service handler
+  // (githttp.go:63-66): GET /info/refs (GetInfoRefs, :464) AND the POST RPCs
+  // (serviceRPC calls httpBase, :371). The method gates below are upstream's
+  // router bindings (githttp.go:13-16: `GET,OPTIONS /info/refs`,
+  // `POST,OPTIONS /git-upload-pack|/git-receive-pack`) — the meta never
+  // answers on a method the router would not route. The synthetic HEAD file
+  // has no upstream httpBase arm, so it keeps its probe shape (no meta).
+  const goGetMethod: "GET" | "POST" | null =
+    route.kind === "info-refs" ? "GET" : route.kind === "head" ? null : "POST";
+  if (goGetMethod !== null && req.method === goGetMethod && url.searchParams.get("go-get") === "1") {
     return goGetMeta(url, route.owner, route.repo);
   }
 
@@ -278,10 +287,7 @@ export async function gitHttpGate(
   // read-only — any authenticated, authorized PUSH onto an is_mirror repo
   // answers 403 with upstream's exact text (reads unaffected).
   if (op === "write" && resolved.repo.isMirror) {
-    return new Response("mirror repository is read-only\n", {
-      status: 403,
-      headers: { "content-type": "text/plain; charset=utf-8" },
-    });
+    return mirrorReadOnly();
   }
 
   // Upstream parity (SPEC-0003 §2.4 — the blocked-pusher relation is NOT a
@@ -379,6 +385,18 @@ function wikiDisabledStop(
  *  so NO trailing newline (unlike the http.Error 401/403 cousins). */
 function repositoryWikiDisabled(): Response {
   return new Response("repository wiki is disabled", {
+    status: 403,
+    headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
+  });
+}
+
+/** SPEC-0009 §2.4 row 21 — `PlainText(403, "mirror repository is read-only")`
+ *  (githttp.go:202-205): ctx.PlainText (base.go plainTextInternal) writes the
+ *  body VERBATIM — no trailing newline — with its exact header pair. (The
+ *  old inline shape appended `\n` and dropped nosniff; both were the
+ *  http.Error shape upstream reserves for the 401/403 challenge cousins.) */
+function mirrorReadOnly(): Response {
+  return new Response("mirror repository is read-only", {
     status: 403,
     headers: { "content-type": "text/plain;charset=utf-8", "x-content-type-options": "nosniff" },
   });
@@ -538,10 +556,7 @@ async function handleWikiGitRoute(
   // SPEC-0009 §2.4 row 21 / upstream githttp.go:202-205 — `!isPull` covers
   // the wiki's receive-pack: a mirrored parent's wiki is read-only too.
   if (op === "write" && resolved.repo.isMirror) {
-    return new Response("mirror repository is read-only\n", {
-      status: 403,
-      headers: { "content-type": "text/plain; charset=utf-8" },
-    });
+    return mirrorReadOnly();
   }
 
   // Protocol reads need the wiki cell's registry row (module doc) — seeded

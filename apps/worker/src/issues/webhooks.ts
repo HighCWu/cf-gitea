@@ -100,35 +100,133 @@ export function webhookHasEvent(config: HookEventConfig, eventType: HookEventTyp
 }
 
 /**
- * Glob → RegExp with gobwas/glob semantics (upstream's matcher): `*` stays
- * within one path segment, `**` crosses separators, `?` is one non-separator
- * character. Character classes are not supported (no upstream branch filter
- * uses them).
+ * Port of `gitea.dev/modules/glob` (gitea/modules/glob/glob.go — the 2025
+ * regexp-based rewrite of gobwas/glob), exactly as `checkBranchFilter` calls
+ * it: `glob.Compile(branchFilter)` — NO separators, default flags (NOT
+ * CompileWorkflow: no leading-`!` negation, no star-star-slash
+ * right-separator special case, `?` stays a wildcard).
+ *
+ * With no separators the compiler's `nonSeparatorChars` is `.`, so `*` AND
+ * `**` both build `.*` (any run, `/` included) and `?` builds `.` (any
+ * single character) — the historic `[^/]*`/`[^/]` shape here was the
+ * WITH-separators semantics upstream's bare Compile does not use.
+ * Character classes (`[abc]`, ranges `[a-z]`, negation `[!abc]`) and `{a,b}`
+ * alternation (nestable; an empty alternative matches the empty string, the
+ * `{,a}` void arm; `,` outside braces is literal) compile live. The `\`
+ * escape passes the next rune through verbatim (Go-regexp semantics: `\d`
+ * stays a digit class, matching upstream's builder byte for byte).
+ *
+ * Malformed patterns return null → DENY (the caller mirrors upstream's
+ * `checkBranchFilter` err arm, webhook.go:119-122): unterminated class or
+ * escape errors in the compiler, a bare `]` outside a class errors (Go's
+ * regexp rejects it; JS would accept it literally), an unclosed `{` leaves
+ * an unbalanced `(` that fails the regexp compile, and an empty class
+ * (`[]`, `[!]`) errors like Go's "missing closing ]" — JS would compile it
+ * to a never/every-matching class instead. Returns null, never throws.
  */
-function compileGlob(pattern: string): RegExp {
-  let source = "";
-  for (let i = 0; i < pattern.length; i++) {
-    const ch = pattern[i]!;
-    if (ch === "*") {
-      if (pattern[i + 1] === "*") {
-        source += ".*";
-        i++;
-      } else {
-        source += "[^/]*";
-      }
-    } else if (ch === "?") {
-      source += "[^/]";
-    } else {
-      source += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function compileGlob(pattern: string): RegExp | null {
+  const chars = [...pattern]; // the []rune conversion upstream compiles over
+  let pos = 0;
+  const out: string[] = [];
+
+  const compileChars = (): string | null => {
+    out.push("[");
+    if (pos < chars.length && chars[pos] === "!") {
+      pos++;
+      out.push("^");
     }
+    let members = 0;
+    while (pos < chars.length) {
+      const c = chars[pos++]!;
+      if (c === "]") {
+        if (members === 0) return "missing closing ]"; // Go regexp: empty class
+        out.push("]");
+        return null;
+      }
+      if (c === "\\") {
+        if (pos >= chars.length) return "unterminated character class escape";
+        out.push("\\", chars[pos++]!);
+      } else {
+        out.push(c);
+      }
+      members++;
+    }
+    return "unterminated character class";
+  };
+
+  const compile = (subPattern: boolean): string | null => {
+    while (pos < chars.length) {
+      const c = chars[pos++]!;
+      if (subPattern && c === "}") {
+        out.push(")");
+        return null;
+      }
+      switch (c) {
+        case "*":
+          if (pos < chars.length && chars[pos] === "*") pos++; // `**` — no separators, no CompileWorkflow right-separator case
+          out.push(".*");
+          break;
+        case "?":
+          out.push(".");
+          break;
+        case "+":
+          out.push("\\+");
+          break;
+        case "[": {
+          const classError = compileChars();
+          if (classError !== null) return classError;
+          break;
+        }
+        case "{":
+          out.push("(");
+          {
+            const err = compile(true);
+            if (err !== null) return err;
+          }
+          break;
+        case ",":
+          out.push(subPattern ? "|" : ",");
+          break;
+        case "\\":
+          if (pos >= chars.length) return "no character to escape";
+          out.push("\\", chars[pos++]!);
+          break;
+        case "]":
+          // Go's regexp parser rejects a `]` outside a character class
+          // ("unexpected ]") — upstream denies such filters at the regexp
+          // compile; JS would accept it literally, so the check lives here.
+          return "unexpected ]";
+        case ".":
+        case "^":
+        case "$":
+        case "(":
+        case ")":
+        case "|":
+          out.push("\\", c);
+          break;
+        default:
+          out.push(c);
+      }
+    }
+    return null;
+  };
+
+  out.push("^");
+  const error = compile(false);
+  if (error !== null) return null;
+  out.push("$");
+  try {
+    return new RegExp(out.join(""));
+  } catch {
+    return null; // the assembled regexp is invalid (unclosed `{` → unbalanced `(`, bad class range, …)
   }
-  return new RegExp(`^${source}$`);
 }
 
 /**
  * Port of `checkBranchFilter` (services/webhook/webhook.go:110–130): empty/
  * `*`/`**` filters match everything; a payload without a ref is unaffected;
- * otherwise the filter matches the branch name or the full ref.
+ * otherwise the filter matches the branch name or the full ref — and a
+ * COMPILE FAILURE DENIES the hook (the err arm's `return false`).
  * `refName` may be a branch name or a full ref.
  */
 export function branchFilterAllows(branchFilter: string | undefined, refName: string | null | undefined): boolean {
@@ -139,6 +237,7 @@ export function branchFilterAllows(branchFilter: string | undefined, refName: st
   const fullRef = refName.startsWith("refs/") ? refName : `refs/heads/${refName}`;
   const branchName = fullRef.startsWith("refs/heads/") ? fullRef.slice("refs/heads/".length) : null;
   const glob = compileGlob(branchFilter);
+  if (glob === null) return false; // compile failure → deny (webhook.go:119-122)
   if (branchName !== null && glob.test(branchName)) return true;
   return glob.test(fullRef);
 }

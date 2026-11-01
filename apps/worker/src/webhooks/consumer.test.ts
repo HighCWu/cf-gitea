@@ -10,6 +10,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { webhookDeliveries, webhooks } from "../db/schema";
+import { createOwnerHook } from "../api/services/hooks";
 import { emitWebhookDeliveries } from "../issues/webhooks";
 import {
   WEBHOOK_RESPONSE_LIMIT_BYTES,
@@ -341,19 +342,51 @@ describe("§3.6 delivery — success path", () => {
     expect((await hookRow(hookId)).lastStatus).toBe(1); // HookStatus.Succeed
   });
 
-  it("resolves owner-level hooks to the user target type and system hooks to system", async () => {
-    const ownerHook = await seedHook({ repoId: null, ownerId: 42 });
+  it("resolves the target type from the OWNER ROW's type (deliver.go:113-124): organization for an org owner, user otherwise, default when the owner row is gone; system stays system", async () => {
+    // Clean slate for the owner rows this test seeds (the file's beforeEach
+    // clears only the webhook tables).
+    await env.DB.prepare("DELETE FROM users WHERE username_lower IN ('hook-user', 'hook-org')").run();
+    const seedOwner = async (username: string, type: "user" | "org"): Promise<number> => {
+      await env.DB.prepare("INSERT INTO users (username, username_lower, type, created_at) VALUES (?, ?, ?, 0)")
+        .bind(username, username, type)
+        .run();
+      return Number(
+        (await env.DB.prepare("SELECT id FROM users WHERE username_lower = ?").bind(username).first<{ id: number }>())
+          ?.id,
+      );
+    };
+    const humanId = await seedOwner("hook-user", "user");
+    const orgId = await seedOwner("hook-org", "org");
+
+    // The ORG hook rides the store/service layer (AddOwnerHook's port,
+    // createOwnerHook — an owner-scoped row the API cannot create for an org
+    // yet), so the owner-scoped create path is under test end to end. The
+    // user/default arms use the raw seeds the shapes need.
+    const orgHook = await createOwnerHook(env.DB, orgId, {
+      type: "gitea",
+      config: { url: "http://receiver.test/hook", content_type: "json", secret: "s3cr3t" },
+      active: true,
+      events: ["issues"],
+    });
+    const userHook = await seedHook({ repoId: null, ownerId: humanId });
+    const goneOwnerHook = await seedHook({ repoId: null, ownerId: 42 }); // no users row
     const systemHook = await seedHook({ repoId: null, ownerId: null, isSystemWebhook: true });
+
     const seen: string[] = [];
     const { fetchImpl } = receiverStub((call) => {
       seen.push(call.headers["X-Gitea-Hook-Installation-Target-Type"]!);
       return new Response(null, { status: 200 });
     });
-    const a = await seedDelivery(ownerHook);
-    const b = await seedDelivery(systemHook);
-    await processWebhookDelivery(env.DB, { deliveryId: a }, {}, { fetchImpl });
-    await processWebhookDelivery(env.DB, { deliveryId: b }, {}, { fetchImpl });
-    expect(seen).toEqual(["user", "system"]);
+    const deliveries = [
+      await seedDelivery(orgHook.id),
+      await seedDelivery(userHook),
+      await seedDelivery(goneOwnerHook),
+      await seedDelivery(systemHook),
+    ];
+    for (const deliveryId of deliveries) {
+      await processWebhookDelivery(env.DB, { deliveryId }, {}, { fetchImpl });
+    }
+    expect(seen).toEqual(["organization", "user", "default", "system"]);
   });
 });
 

@@ -158,12 +158,18 @@ inserts one row per RECEIVER:
    actor and the org owner) — this is what makes watched-repo activity show
    up in `/users/{username}/activities/feeds`.
 
-Deviation (documented): upstream filters each watcher row at WRITE time by
-per-watcher unit permissions and notification prefs (`permCode/permIssue/
-permPR`, `watcher.IncludeIssues` …). cf-gitea has no per-unit permission
-model and `repo_watchers` carries no notification prefs (schema note), so
-every watcher row is written unconditionally; per-caller read filters (§3.4)
-reproduce the visibility under our model.
+Deviation (documented, narrowed): upstream filters each watcher row at
+WRITE time by per-watcher unit permissions AND notification prefs
+(`permCode/permIssue/permPR` AND `watcher.IncludeIssues` /
+`IncludePullRequests` / `IncludeReleases` / `IsWatchingAll`,
+`feed.go:67-89`). cf-gitea has no per-unit permission model, so the
+`perm*` conjuncts are NOT ported; the notification-pref half IS — the
+`repo_watchers` include columns exist (migration 0053; an earlier schema
+note claiming they don't was stale) and `recordAction` gates each watcher
+row by its action family: code/repository events ⇔ `IsWatchingAll`
+(mode ≠ Custom, all three flags), issues ⇔ `include_issues`, PRs ⇔
+`include_pull_requests`, releases ⇔ `include_releases`. Per-caller read
+filters (§3.4) still bound visibility under our model.
 
 ### 3.3 Wired-vs-deferred action-type matrix
 
@@ -249,8 +255,9 @@ with the landed clamping (`parseListOptions`: page<1→1, limit<1→30, limit>50
   cascade) ⇒ the action row is skipped (upstream soft-keeps the repo row;
   skipping is the honest equivalent once the cascade ran). Acting user row
   gone ⇒ skip (cannot render `act_user`). Comment referenced by
-  `comment_id` gone ⇒ `comment`/`comment_id` stay unset (Go-zero 0/""),
-  mirroring upstream's `if ac.Comment != nil` gate (`activity.go:42-46`).
+  `comment_id` gone ⇒ the Go zero values render — `comment_id: 0` with no
+  `comment` object — mirroring upstream's `if ac.Comment != nil` gate
+  (`activity.go:42-46`, which sets CommentID only inside the gate).
 - **Fan-out failure**: action-row inserts never fail a mutation — caught,
   logged, dropped (the webhook fan-out posture). A lost insert means a feed
   gap, not an API error.

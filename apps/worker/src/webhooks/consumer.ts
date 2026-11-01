@@ -95,9 +95,9 @@
  */
 
 import { and, eq, sql } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/d1";
+import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 
-import { HookStatus, webhookDeliveries, webhooks } from "../db/schema";
+import { HookStatus, users, webhookDeliveries, webhooks } from "../db/schema";
 import { checkWebhookTarget, parseHostPolicy, type EgressMode } from "./ssrf";
 
 /** The only thing a producer puts on the queue (§3.6). */
@@ -216,19 +216,27 @@ export interface BuiltWebhookRequest {
 export class WebhookRequestError extends Error {}
 
 /**
- * `X-Gitea-Hook-Installation-Target-Type` (deliver.go:113–124). Upstream
- * resolves owner-level hooks to "organization"/"user" via the user row;
- * organizations land with SPEC-0007, so owners resolve to "user" and the
- * owner-row-gone fallback ("default") applies only to an ownerless row.
+ * `X-Gitea-Hook-Installation-Target-Type` (deliver.go:113–124): owner-level
+ * hooks resolve through the OWNER's user row — `IsOrganization()` renders
+ * "organization", anything else "user". Upstream's guard (`owner != nil &&
+ * err == nil`) leaves the "default" fallback for BOTH an ownerless row AND
+ * an owner row that no longer resolves, so the lookup here answers "default"
+ * on a miss too.
  */
-function resolveTargetType(hook: {
-  isSystemWebhook: boolean;
-  repoId: string | null;
-  ownerId: number | null;
-}): string {
+async function resolveTargetType(
+  db: DrizzleD1Database,
+  hook: {
+    isSystemWebhook: boolean;
+    repoId: string | null;
+    ownerId: number | null;
+  },
+): Promise<string> {
   if (hook.isSystemWebhook) return "system";
   if (hook.repoId !== null) return "repository";
-  if (hook.ownerId !== null) return "user"; // organization detection: SPEC-0007
+  if (hook.ownerId !== null) {
+    const owner = await db.select({ type: users.type }).from(users).where(eq(users.id, hook.ownerId)).get();
+    if (owner !== undefined) return owner.type === "org" ? "organization" : "user";
+  }
   return "default";
 }
 
@@ -407,7 +415,7 @@ export async function processWebhookDelivery(
 
   // §3.6 step 3 — sign the stored payload bytes with the hook secret.
   const signatures = await computeWebhookSignatures(hook.secret, delivery.payloadContent);
-  const targetType = resolveTargetType(hook);
+  const targetType = await resolveTargetType(db, hook);
 
   const recordFailure = async (
     response: HookResponseInfo,

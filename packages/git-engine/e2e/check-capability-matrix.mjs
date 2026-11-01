@@ -555,10 +555,11 @@ proof("report-status-v2", async () => {
 proof("atomic", async () => {
   // the ADVERTISED atomic: one failing command rejects the WHOLE section —
   // the failing command keeps its own message, the would-apply sibling gets
-  // ATOMIC_PUSH_FAILED, and NO ref moves (git's ref-transaction abort,
-  // execute_commands_atomic; byte-observed on git 2.43.0: `! [rejected] main
-  // -> main (fetch first)` + `! [rejected] atom3 -> atom3 (atomic push
-  // failed)`). Drives the REAL control plane finalize.
+  // ATOMIC_PUSH_FAILED (the constant carries git's transaction-abort arm's
+  // ng text `atomic transaction failed`, git v2.43.0
+  // builtin/receive-pack.c:1896 — the NOTICE.md deviation row has the
+  // rename), and NO ref moves (git's ref-transaction abort,
+  // execute_commands_atomic). Drives the REAL control plane finalize.
   const { host, rstore } = receiveHost();
   seedHistory(rstore);
   rstore.setRef("refs/heads/doomed", h.commit1); // the stale create: old=ZERO lies
