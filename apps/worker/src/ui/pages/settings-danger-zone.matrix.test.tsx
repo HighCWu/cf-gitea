@@ -23,6 +23,14 @@
  *     divergence: upstream redirects onto the owner dashboard, a target the
  *     registered handler cannot express yet), the rows gone, a follow-up
  *     GET 404-shelling;
+ *   - the delete-wiki arm (options.tmpl:873-885 + #delete-wiki-modal): the
+ *     wiki row renders only for wiki-enabled repos (has_wiki — the unit
+ *     CanRead gate's landed reduction) with the dangerous_operation_form
+ *     confirm shape, the confirm-name refusal writes nothing through the
+ *     real route, the unthreaded-engine-bindings refusal refuses BEFORE any
+ *     write at the seam, and the happy sweep (services/wiki.ts deleteWiki)
+ *     drives applyRepoBasics with the env tail — pages gone, has_wiki reset,
+ *     the applied outcome that 303s onto the settings URL;
  *   - the unknown-action refusal, the gate-first non-admin 404, and the
  *     guard-first cross-origin 403.
  *
@@ -38,12 +46,14 @@ import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { repoTransfer, repositories } from "../../db/schema";
+import { repoTransfer, repositories, users } from "../../db/schema";
+import { loadRepoSettings } from "../../api/services/repo-settings";
+import { createWikiPage, listWikiPages, readWikiPage, type WikiDoer } from "../../services/wiki";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import type { RepoRow } from "../ui-context";
 import type { UiManifest } from "../manifest";
-import { parseRepoBasicsForm } from "./settings";
+import { applyRepoBasics, parseRepoBasicsForm } from "./settings";
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -340,6 +350,99 @@ describe("the delete POST ladder (action=delete)", () => {
     const gone = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
     expect(gone.status).toBe(404);
     expect(await gone.text()).toContain("status-page-error");
+  });
+});
+
+// --- the delete-wiki arm (the whole-wiki delete — options.tmpl:873-885) -----------
+//
+// The render + refusal arms drive the REAL route (the dispatch reaches
+// applyRepoDangerAction through the registered POST handler). The happy arm
+// drives the exported applyRepoBasics directly WITH the engine bindings on
+// the optional `env` tail, because the registered settingsSubmit does not
+// thread c.env yet — the module's reported one-line ui/index.ts follow-up
+// (the doer thread's twin); until that lands, the unthreaded real-route POST
+// refuses BEFORE any write, which the second ladder test pins at the seam.
+
+describe("the delete-wiki render arm (the wiki danger row)", () => {
+  it("renders the wiki row with the typed-name confirm for a wiki-enabled repo, between transfer and delete", async () => {
+    const res = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The row (has_wiki defaults true — the wiki-unit CanRead gate's landed
+    // reduction) + the #delete-wiki-modal's notice line and confirm shape.
+    expect(html).toContain("Deleting repository wiki data is permanent and cannot be undone.");
+    expect(html).toContain("- This will permanently delete and disable the repository wiki for alice/demo.");
+    expect(html).toContain('<input type="hidden" name="action" value="delete-wiki"/>');
+    expect(html).toContain('<input id="delete_wiki_repo_name" name="repo_name" required=""/>');
+    expect(html).toContain("Delete Wiki Data");
+    // Upstream order: the wiki row sits between the transfer and delete rows.
+    const wikiAt = html.indexOf('value="delete-wiki"');
+    const deleteAt = html.indexOf('value="delete"');
+    expect(wikiAt).toBeGreaterThan(-1);
+    expect(deleteAt).toBeGreaterThan(wikiAt);
+  });
+
+  it("renders nothing for a wiki-disabled repo (has_wiki=0)", async () => {
+    await env.DB.prepare("INSERT INTO repo_settings (repo_id, has_wiki) VALUES ('repo-1', 0)").run();
+    const res = await fetchUi("/alice/demo/settings", { headers: { cookie: await ownerSessionHeader() } });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).not.toContain('value="delete-wiki"');
+    expect(html).not.toContain("Deleting repository wiki data is permanent");
+  });
+});
+
+describe("the delete-wiki POST ladder (action=delete-wiki)", () => {
+  const WIKI_DOER: WikiDoer = { name: "alice", email: "alice@noreply.test.local" };
+
+  it("refuses a wrong confirmation name through the real route with the exact text and writes nothing", async () => {
+    const res = await settingsPost({ action: "delete-wiki", repo_name: "demo" });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(
+      '<div class="ui negative message">The repository name you entered is incorrect.</div>',
+    );
+    expect((await loadRepoSettings(env.DB, repo.id)).hasWiki).toBe(true);
+  });
+
+  it("refuses BEFORE any write when the engine bindings are not threaded (the unthreaded registration)", async () => {
+    const result = await applyRepoBasics(
+      env.DB,
+      repo,
+      parseRepoBasicsForm(new URLSearchParams({ action: "delete-wiki", repo_name: "alice/demo" })),
+    );
+    expect(result).toEqual({
+      outcome: "invalid",
+      message: "Wiki deletion is unavailable because the repository storage is unreachable.",
+    });
+    expect((await loadRepoSettings(env.DB, repo.id)).hasWiki).toBe(true);
+  });
+
+  it("deletes the whole wiki through the threaded env: pages gone, flag reset, applied outcome", async () => {
+    const ownerRow = await drizzle(env.DB).select().from(users).where(eq(users.id, aliceId)).get();
+    if (ownerRow === undefined) throw new Error("alice row missing");
+    const pair = { repo, owner: ownerRow };
+    const encoder = new TextEncoder();
+    await createWikiPage(env, pair, WIKI_DOER, { title: "Home", content: encoder.encode("# Home\n"), message: "" }, ORIGIN);
+    await createWikiPage(env, pair, WIKI_DOER, { title: "Extras", content: encoder.encode("# E\n"), message: "" }, ORIGIN);
+    expect((await listWikiPages(env, pair, 1, 30, ORIGIN)).pages.length).toBe(2);
+    expect((await loadRepoSettings(env.DB, repo.id)).hasWiki).toBe(true);
+
+    const result = await applyRepoBasics(
+      env.DB,
+      repo,
+      parseRepoBasicsForm(new URLSearchParams({ action: "delete-wiki", repo_name: "alice/demo" })),
+      { id: aliceId, isAdmin: false },
+      env,
+    );
+    expect(result).toEqual({ outcome: "applied", slug: "demo" }); // the 303's source outcome
+    expect((await loadRepoSettings(env.DB, repo.id)).hasWiki).toBe(false);
+    const after = await listWikiPages(env, pair, 1, 30, ORIGIN);
+    expect(after.pages).toEqual([]);
+    expect(after.totalEntries).toBe(0);
+    expect(await readWikiPage(env, pair, "Home", ORIGIN)).toBeNull();
+    expect(await readWikiPage(env, pair, "Extras", ORIGIN)).toBeNull();
+    // The repository row itself is untouched (a wiki delete is not a delete).
+    expect(await repoRowExists()).toBe(true);
   });
 });
 

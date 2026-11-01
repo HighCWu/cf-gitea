@@ -582,6 +582,76 @@ describe("delete pipeline (SPEC-0003 §2.5.5, §4.2, §4.8)", () => {
     expect(revived.tag).toBe("ok");
   });
 
+  it("cascades notification_states rows with the repo's issues (delete.go:170's Notification{RepoID} arm, ⑩-review P3)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const svc = service();
+    const doomed = await createRepo({ id: alice.id, usernameLower: "alice" }, "notified");
+    const survivor = await createRepo({ id: alice.id, usernameLower: "alice" }, "watched-elsewhere");
+    // In-file hygiene: this file's beforeEach does not sweep the table.
+    await env.DB.prepare("DELETE FROM notification_states").run();
+
+    // Two issues in the doomed repo, one in the survivor.
+    await env.DB.prepare(
+      "INSERT INTO issues (repo_id, `index`, poster_id, title, created_unix) VALUES (?, 1, ?, 'T1', unixepoch())",
+    )
+      .bind(doomed.id, alice.id)
+      .run();
+    await env.DB.prepare(
+      "INSERT INTO issues (repo_id, `index`, poster_id, title, created_unix) VALUES (?, 2, ?, 'T2', unixepoch())",
+    )
+      .bind(doomed.id, alice.id)
+      .run();
+    await env.DB.prepare(
+      "INSERT INTO issues (repo_id, `index`, poster_id, title, created_unix) VALUES (?, 1, ?, 'S1', unixepoch())",
+    )
+      .bind(survivor.id, alice.id)
+      .run();
+    const doomedIds = (
+      await env.DB.prepare("SELECT id FROM issues WHERE repo_id = ? ORDER BY `index`").bind(doomed.id).all<{ id: number }>()
+    ).results.map((r) => r.id);
+    const survivorIds = (
+      await env.DB.prepare("SELECT id FROM issues WHERE repo_id = ? ORDER BY `index`").bind(survivor.id).all<{ id: number }>()
+    ).results.map((r) => r.id);
+    expect(doomedIds).toHaveLength(2);
+    expect(survivorIds).toHaveLength(1);
+
+    // Read-state rows: both alice's doomed threads (one read, one unread),
+    // bob's row on a doomed thread (the sweep takes every user's row for the
+    // issue), and alice's row on the survivor's thread.
+    for (const [userId, issueId, readAt] of [
+      [alice.id, doomedIds[0], 42],
+      [alice.id, doomedIds[1], 0],
+      [bob.id, doomedIds[1], 7],
+      [alice.id, survivorIds[0], 99],
+    ] as const) {
+      await env.DB.prepare(
+        "INSERT INTO notification_states (user_id, issue_id, read_at_unix, updated_at) VALUES (?, ?, ?, unixepoch())",
+      )
+        .bind(userId, issueId, readAt)
+        .run();
+    }
+
+    await svc.deleteRepository(doomed.id);
+
+    // Every doomed thread's rows are gone — both users', read and unread.
+    for (const issueId of doomedIds) {
+      expect(
+        (
+          await env.DB.prepare("SELECT COUNT(*) AS n FROM notification_states WHERE issue_id = ?")
+            .bind(issueId)
+            .first<{ n: number }>()
+        )?.n,
+      ).toBe(0);
+    }
+    // Another repo's rows survive untouched (value + existence).
+    const kept = await env.DB
+      .prepare("SELECT read_at_unix FROM notification_states WHERE issue_id = ?")
+      .bind(survivorIds[0])
+      .first<{ read_at_unix: number }>();
+    expect(kept?.read_at_unix).toBe(99);
+  });
+
   it("§4.2: a push holding a receive lease fails cleanly when the delete lands mid-flight", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
     const repo = await createRepo({ id: alice.id, usernameLower: "alice" }, "racy", false);

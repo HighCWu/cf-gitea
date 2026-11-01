@@ -97,6 +97,7 @@ import {
 import { buildBlobObject, buildFileChangeCommit, type FileChange } from "../api/services/git-models";
 import { lastCommitForPath } from "../api/services/contents";
 import { apiUserFromRow, toApiRepository, type RepositoryWithOwner, type Viewer } from "../api/services/repository";
+import { saveRepoSettings } from "../api/services/repo-settings";
 import { users } from "../db/schema";
 import { emitWebhookDeliveries } from "../issues/webhooks";
 import { appOrigin } from "./webhooks-push";
@@ -970,6 +971,134 @@ export async function deleteWikiPage(
   // `wiki` deleted — no `comment` argument upstream (notifier.go:560-562);
   // Go zero-marshals the field, so the payload carries `"comment": ""`.
   await emitWikiPageEvent(env, pair, doer, "deleted", wikiName, "", options?.origin ?? appOrigin(env));
+}
+
+// ---------------------------------------------------------------------------
+// The whole-wiki delete arm (the settings page's `delete-wiki` action —
+// upstream wiki_service.DeleteWiki, services/wiki/wiki.go:365-381)
+// ---------------------------------------------------------------------------
+
+/**
+ * The delete walk's budget: the cell tree is walked directory-by-directory
+ * (one `listTree` RPC per directory — the engine boundary has no recursive
+ * tree read, tree-list-aux.ts's documented cost posture), so the caps bound
+ * both the RPC count and the composed change set. A wiki that outgrows them
+ * deletes the walked prefix and logs — upstream's own whole-wiki delete is
+ * best-effort the same way (a failed git.DeleteRepository becomes a
+ * CreateNotice + a log line, and the op still succeeds).
+ */
+const WIKI_DELETE_MAX_ENTRIES = 5000;
+const WIKI_DELETE_MAX_DEPTH = 16;
+
+/**
+ * The composed delete commit's message. No upstream analog to copy: upstream
+ * `DeleteWiki` never commits — `git.DeleteRepository` removes the whole wiki
+ * repo (wiki.go:369-377). Ours lands one tree-emptying commit, so the branch
+ * tip keeps a tombstone commit; the deterministic service-side string mirrors
+ * the per-page arm's non-overridable `Delete page %q` template posture.
+ */
+const DELETE_WIKI_COMMIT_MESSAGE = "Delete wiki";
+
+/**
+ * Every blob path in the wiki tree, breadth-first (one listTree RPC per
+ * directory; subdirectories exist because a page title with a `/` codes to a
+ * nested git path — webPathToGitPath). Bounded by the two caps above; commit
+ * entries (gitlinks — no wiki writer produces one) are left in place.
+ */
+async function collectWikiBlobPaths(reads: EngineReads, ref: string): Promise<string[]> {
+  const paths: string[] = [];
+  let frontier: { path: string; depth: number }[] = [{ path: "", depth: 0 }];
+  while (frontier.length > 0 && paths.length < WIKI_DELETE_MAX_ENTRIES) {
+    const next: { path: string; depth: number }[] = [];
+    const trees = await Promise.all(
+      frontier.map(async (dir) => ({ dir, tree: await reads.listTree(ref, dir.path === "" ? undefined : dir.path) })),
+    );
+    for (const { dir, tree } of trees) {
+      if (tree === null) continue;
+      for (const entry of tree.entries) {
+        if (paths.length >= WIKI_DELETE_MAX_ENTRIES) return paths;
+        const child = dir.path === "" ? entry.name : `${dir.path}/${entry.name}`;
+        if (entry.type === "tree") {
+          if (dir.depth + 1 <= WIKI_DELETE_MAX_DEPTH) next.push({ path: child, depth: dir.depth + 1 });
+        } else if (entry.type === "blob") {
+          paths.push(child);
+        }
+      }
+    }
+    frontier = next;
+  }
+  return paths;
+}
+
+/**
+ * `wiki_service.DeleteWiki` (services/wiki/wiki.go:365-381) — the settings
+ * page's `delete-wiki` danger action (handleSettingsPostDeleteWiki,
+ * routers/web/repo/setting/setting.go:983-1001), composed for any caller.
+ * Two steps, upstream's order:
+ *
+ *   1. The unit disable (:367 `UpdateRepositoryUnits(ctx, repo, nil,
+ *      []unit.Type{unit.TypeWiki})`). Our landed unit-flag reduction stores
+ *      wiki enablement in `repo_settings.has_wiki` (repo_units has no wiki
+ *      type — the enum grew only code/packages/actions/pull_requests/
+ *      projects), so the reset is `has_wiki = false` through the settings
+ *      write seam. Every wiki route's hasWiki gate 404-shells from here on
+ *      — the "disable" half of upstream's locale notice ("permanently delete
+ *      AND disable the repository wiki").
+ *   2. The storage sweep (:369-377 `git.DeleteRepository(ctx,
+ *      repo.WikiStorageRepo())`), best-effort: upstream logs + CreateNotice
+ *      on failure and the op still succeeds (the flash is unconditional,
+ *      setting.go:997-1000). Our wiki is NOT a separate git repo — pages are
+ *      `*.md` blobs in the sibling engine cell's default branch (specs/wiki.md
+ *      §3; no wiki D1 rows, no wiki table) — so the sweep is the per-page
+ *      arm's own landing path (`applyWikiChanges`) composed: one bounded
+ *      page-walk over the cell tree (`collectWikiBlobPaths`) feeds ONE
+ *      FileChange delete set, landing a single tree-emptying commit. The
+ *      read model is empty afterwards (pages list → empty, page/raw/revision
+ *      reads → not-found); the deleted blobs stay in the cell's SQLite as
+ *      unreferenced objects until the repo-delete cascade destroys the cell
+ *      (repos/purge.ts's wiki cascade) — the DOCUMENTED divergence from
+ *      upstream's whole-repo file delete, which removes history too. Ours
+ *      keeps the wiki branch's history (a re-enabled wiki starts empty
+ *      rather than nonexistent), which is also why no cell tombstone/destroy
+ *      runs here: the cell still serves the surviving history.
+ *
+ * No webhook: upstream's DeleteWiki fires none (the WikiPayload triple rides
+ * the PER-PAGE routes only; the service's only side-channel is
+ * `audit.Record(RepositoryWikiDelete)` — the audit enum here has no wiki arm
+ * yet, reported as the follow-up). Returns having applied the flag reset
+ * even when the storage sweep logged a failure — upstream's exact posture.
+ */
+export async function deleteWiki(
+  env: ApiEnv["Bindings"],
+  d1: D1Database,
+  pair: RepositoryWithOwner,
+  doer: WikiDoer,
+  options?: WikiWriteOptions,
+): Promise<void> {
+  // Step 1 — the wiki unit disable (upstream runs it FIRST, :367).
+  await saveRepoSettings(d1, pair.repo.id, { hasWiki: false }, new Date());
+  // Step 2 — the storage sweep, best-effort (the CreateNotice analog is the
+  // log line; the flag reset above is not rolled back, upstream's either).
+  try {
+    const { reads, tip } = await wikiTip(env, pair);
+    if (tip !== undefined) {
+      const paths = await collectWikiBlobPaths(reads, tip.target);
+      if (paths.length > 0) {
+        await applyWikiChanges(
+          env,
+          pair,
+          paths.map((path) => ({ operation: "delete" as const, path })),
+          DELETE_WIKI_COMMIT_MESSAGE,
+          doer,
+          options,
+        );
+      }
+    }
+  } catch (error) {
+    console.error(
+      `[wiki] delete-wiki storage sweep failed (wiki disabled; pages may remain until a retry or the repo delete) [repo: ${pair.repo.ownerNamespace}/${pair.repo.slug}]: ${errorMessage(error)}`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------

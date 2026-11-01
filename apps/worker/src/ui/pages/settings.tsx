@@ -172,12 +172,19 @@
  *     functionally invisible otherwise — acceptTransfer's grant never
  *     reads the doer column). ORCHESTRATOR FOLLOW-UP (ui/index.ts, one
  *     line): pass the viewer through settingsSubmit.
- *   - delete-wiki has NO landed whole-wiki delete arm (services/wiki.ts is
- *     per-page only — the wave-54 split's honest-absence note at
- *     /settings/wiki) and repos/service.ts exposes no pending-transfer
- *     READ seam (the API arms inline the drizzle read,
- *     repo-extras-t2.ts:1253 — mirrored here as loadPendingRepoTransfer);
- *     both export needs are reported, neither foreign file is edited.
+ *   - delete-wiki LANDED (the whole-wiki arm): services/wiki.ts deleteWiki
+ *     composes the per-page landing path into one bounded page-walk +
+ *     tree-emptying commit and resets `repo_settings.has_wiki` (upstream
+ *     wiki_service.DeleteWiki's two steps — UpdateRepositoryUnits then
+ *     git.DeleteRepository). The ladder rides an OPTIONAL `env` tail for
+ *     the wiki cell RPCs; settingsSubmit does not thread it yet, so the
+ *     unthreaded arm refuses BEFORE any write (never a half-applied
+ *     delete). ORCHESTRATOR FOLLOW-UP (ui/index.ts, the doer line's twin):
+ *     `applyRepoBasics(c.env.DB, repo, form, viewer, c.env)`.
+ *     repos/service.ts still exposes no pending-transfer READ seam (the
+ *     API arms inline the drizzle read, repo-extras-t2.ts:1253 — mirrored
+ *     here as loadPendingRepoTransfer); that export need is reported,
+ *     the foreign file not edited.
  *   - The transfer arm is pending-only, exactly like the landed API
  *     transfer route: upstream's direct-transfer arms (doer-admin/self,
  *     org-can-create) reduce to the pending row; the self-transfer refusal
@@ -271,6 +278,7 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { ApiError } from "../../api/errors";
+import type { ApiEnv } from "../../api/env";
 import { isUserBlockedBy } from "../../api/services/blocks";
 import {
   buildTestPushPayload,
@@ -283,7 +291,7 @@ import {
   fireTestDelivery,
   type WebhookRow,
 } from "../../api/services/hooks";
-import { apiUserFromRow, toApiRepository, type RepositoryWithOwner, type UserRow } from "../../api/services/repository";
+import { apiUserFromRow, findRepositoryById, toApiRepository, type RepositoryWithOwner, type UserRow } from "../../api/services/repository";
 import { isRepositoryAdmin } from "../../api/services/repo-access";
 import { getMirrorStatus, type MirrorStatus } from "../../api/services/mirror";
 import {
@@ -294,6 +302,8 @@ import {
   type RepoSettings,
 } from "../../api/services/repo-settings";
 import { OwnerNotAssignableError, RepoNameCollisionError, RepoNameInvalidError, RepoService } from "../../repos/service";
+import { deleteWiki, type WikiDoer } from "../../services/wiki";
+import { appOrigin } from "../../services/webhooks-push";
 import { timeSinceParts } from "../page-data";
 import { TimeSince } from "../components/file-list";
 import { HookStatus, repoTransfer, repositories, users, webhookDeliveries } from "../../db/schema";
@@ -374,6 +384,14 @@ export const settingsLocale = {
   delete: "Delete This Repository", // "repo.settings.delete"
   delete_desc: "Deleting a repository is permanent and cannot be undone.", // "repo.settings.delete_desc"
   confirm_delete: "Delete Repository", // "repo.settings.confirm_delete" (the modal's danger submit)
+  // The wiki arm (options.tmpl:873-885's row + :1047-1064's #delete-wiki-modal
+  // at the pin — upstream renders the row under the wiki unit's CanRead and
+  // the modal under UnitEnabled; our single landed wiki flag gates both).
+  wiki_delete: "Delete Wiki Data", // "repo.settings.wiki_delete" (the row title + the disclosure button)
+  wiki_delete_desc: "Deleting repository wiki data is permanent and cannot be undone.", // "repo.settings.wiki_delete_desc"
+  wiki_delete_notices_1: "- This will permanently delete and disable the repository wiki for %s.", // "repo.settings.wiki_delete_notices_1" (%s = the full name)
+  confirm_wiki_delete: "Delete Wiki Data", // "repo.settings.confirm_wiki_delete" (the modal's danger submit)
+  wiki_delete_unavailable: "Wiki deletion is unavailable because the repository storage is unreachable.", // cf-gitea addition — the unthreaded-engine-bindings refusal (nothing written; the one-line ui/index.ts follow-up)
   unknown_action: "Unknown settings action.", // cf-gitea addition — upstream answers ctx.NotFound for an unrecognized action
 } as const;
 
@@ -446,12 +464,15 @@ export interface RepoBasicsForm {
 /** The basics form's render inputs: the STORED description/website/units
  *  (loadRepoSettings), the re-rendered submission, and the pending-transfer
  *  read (`pendingTransfer`, null = none) that arms the danger zone's banner
- *  + abort button (options.tmpl:846-877's `{{if .RepoTransfer}}`). */
+ *  + abort button (options.tmpl:846-877's `{{if .RepoTransfer}}`). `hasWiki`
+ *  gates the danger zone's wiki row (options.tmpl:873's wiki-unit CanRead —
+ *  our landed has_wiki flag is that gate's reduction). */
 export interface RepoBasicsData {
   description: string;
   website: string;
   units: RepoBasicsUnits;
   hasActions: boolean;
+  hasWiki: boolean;
   pendingTransfer: PendingRepoTransfer | null;
   form: RepoBasicsForm;
 }
@@ -499,6 +520,7 @@ export async function loadRepoBasics(d1: D1Database, repo: RepoRow): Promise<Rep
     website: settings.website,
     units,
     hasActions: settings.hasActions,
+    hasWiki: settings.hasWiki,
     pendingTransfer: await loadPendingRepoTransfer(d1, repo.id),
     form: {
       action: "",
@@ -584,12 +606,21 @@ export type RepoBasicsResult = { outcome: "applied"; slug: string } | { outcome:
  * clicks), and the org-owned case records the org row (functionally
  * invisible: acceptTransfer's grant reads repo.ownerId + the pending
  * newOwnerId + the admin flag, never the doer column).
+ *
+ * The `env` tail (the delete-wiki arm's thread): the wiki cell RPCs need the
+ * engine bindings (services/wiki.ts's whole-wiki sweep rides the REPO DO),
+ * which the registered handler also does not pass yet — the doer follow-up's
+ * twin, reported as the same one-liner (`applyRepoBasics(c.env.DB, repo,
+ * form, doer, c.env)`). Absent bindings refuse the wiki arm BEFORE any write
+ * (the confirmed delete either deletes or refuses, never half-applies); the
+ * d1-only arms (transfer/cancel/delete) are unaffected.
  */
 export async function applyRepoDangerAction(
   d1: D1Database,
   repo: RepoRow,
   form: RepoBasicsForm,
   doer?: { id: number; isAdmin: boolean },
+  env?: ApiEnv["Bindings"],
 ): Promise<RepoBasicsResult> {
   // The typed confirmation is the FULL name (dangerous_operation_form.tmpl
   // renders $repoFullName and handleSettingsPost* compares
@@ -687,6 +718,41 @@ export async function applyRepoDangerAction(
       await new RepoService(d1).deleteRepository(repo.id);
       return { outcome: "applied", slug: repo.slug };
     }
+    case "delete-wiki": {
+      // handleSettingsPostDeleteWiki (setting.go:983-1001): the typed-name
+      // gate (identical compare), then wiki_service.DeleteWiki — services/
+      // wiki.ts deleteWiki's composed arm (the has_wiki reset + the
+      // one-commit whole-tree page sweep). Applied 303s onto the settings
+      // URL, upstream's own redirect target for this action
+      // (JSONRedirect(ctx.Repo.RepoLink + "/settings")).
+      if (!nameConfirmed) return { outcome: "invalid", message: settingsLocale.enterred_invalid_repo_name };
+      if (env === undefined) {
+        // The registered handler does not thread the engine bindings yet
+        // (the module's reported one-line ui/index.ts follow-up above).
+        // Refuse before any write — the D1-only half (the flag) must never
+        // land while the storage half cannot.
+        console.error("[settings] delete-wiki refused: engine bindings not threaded into applyRepoBasics (ui/index.ts follow-up)");
+        return { outcome: "invalid", message: settingsLocale.wiki_delete_unavailable };
+      }
+      const pair = await findRepositoryById(d1, repo.id);
+      if (pair === null) return { outcome: "invalid", message: settingsLocale.enterred_invalid_repo_name };
+      // The commit identity, wikiPrologue's derivation (ui/index.ts): the
+      // doer row when threaded, else the repo's recorded owner; the stored
+      // email, else the @noreply.<host> fallback over the app origin.
+      const identityId = doer?.id ?? repo.ownerId;
+      const identity =
+        identityId === null || identityId === undefined
+          ? undefined
+          : await drizzle(d1).select().from(users).where(eq(users.id, identityId)).get();
+      if (identity === undefined) return { outcome: "invalid", message: settingsLocale.enterred_invalid_repo_name };
+      const email =
+        identity.email === null || identity.email === ""
+          ? `${identity.username}@noreply.${new URL(appOrigin(env)).hostname}`
+          : identity.email;
+      const wikiDoer: WikiDoer = { name: identity.username, email };
+      await deleteWiki(env, d1, pair, wikiDoer);
+      return { outcome: "applied", slug: repo.slug };
+    }
     default:
       // Upstream's switch default answers ctx.NotFound; the result union
       // cannot express a 404, so the closest reduction is the inline
@@ -710,21 +776,24 @@ export async function applyRepoDangerAction(
  * rule).
  *
  * The wave-r2 dispatch: a POST carrying a danger `action` (transfer /
- * cancel_transfer / delete — options.tmpl's hidden discriminator) routes to
- * applyRepoDangerAction BEFORE the basics ladder, so a danger form's fields
- * (the typed FULL name, an absent description) never run the basics write.
- * "" (our merged form) and "update" (upstream's basic-form literal) both
- * fall through to the basics ladder. The optional `doer` tail is the
- * danger ladders' only need for the viewer — see applyRepoDangerAction.
+ * cancel_transfer / delete / delete-wiki — options.tmpl's hidden
+ * discriminator) routes to applyRepoDangerAction BEFORE the basics ladder,
+ * so a danger form's fields (the typed FULL name, an absent description)
+ * never run the basics write. "" (our merged form) and "update" (upstream's
+ * basic-form literal) both fall through to the basics ladder. The optional
+ * `doer` tail is the danger ladders' need for the viewer, and the `env` tail
+ * is the delete-wiki ladder's need for the engine bindings — both see
+ * applyRepoDangerAction for the degradation contracts.
  */
 export async function applyRepoBasics(
   d1: D1Database,
   repo: RepoRow,
   form: RepoBasicsForm,
   doer?: { id: number; isAdmin: boolean },
+  env?: ApiEnv["Bindings"],
 ): Promise<RepoBasicsResult> {
   if (form.action !== "" && form.action !== "update") {
-    return applyRepoDangerAction(d1, repo, form, doer);
+    return applyRepoDangerAction(d1, repo, form, doer, env);
   }
   if (form.name === "") {
     return { outcome: "invalid", message: "Repository name cannot be empty." }; // cf-gitea addition (HTML5 required backs this)
@@ -1123,11 +1192,11 @@ export function RepoSettingsPage(props: { ctx: UiContext; data: RepoBasicsData; 
               block — this route's settingsGate IS that posture, so the
               section renders unconditionally here). The visibility and
               archive flips stay in the merged basics form above (the wave-4
-              posture, kept); the wiki item stays on its wave-54 tab
-              (repo-settings-wiki.tsx — no landed whole-wiki delete arm, its
-              honest-absence note is the rendered state). Upstream's
-              show-modal buttons + <dialog> modals reduce to the org-settings
-              danger zone's <details> disclosures wrapping the same forms. */}
+              posture, kept); the wiki item (options.tmpl:873-885, gated on
+              the wiki unit's CanRead — our landed has_wiki flag) rides the
+              delete-wiki ladder below. Upstream's show-modal buttons +
+              <dialog> modals reduce to the org-settings danger zone's
+              <details> disclosures wrapping the same forms. */}
           <h4 class="ui top attached error header">{settingsLocale.danger_zone}</h4>
           <div class="ui attached error danger segment">
             <div class="flex-divided-list items-with-main">
@@ -1179,6 +1248,46 @@ export function RepoSettingsPage(props: { ctx: UiContext; data: RepoBasicsData; 
                   )}
                 </div>
               </div>
+              {/* The wiki row (options.tmpl:873-885 + #delete-repo-modal's
+                  sibling #delete-wiki-modal at :1047-1064): rendered only
+                  when the wiki is enabled (the unit-CanRead gate's landed
+                  reduction), the dangerous_operation_form shape — hidden
+                  action=delete-wiki + the typed FULL name + the
+                  confirm_wiki_delete danger submit — with the modal's
+                  wiki_delete_notices_1 line as the disclosure's warning. */}
+              {data.hasWiki && (
+                <div class="item tw-items-center">
+                  <div class="item-main">
+                    <div class="item-title">{settingsLocale.wiki_delete}</div>
+                    <div class="item-body">{settingsLocale.wiki_delete_desc}</div>
+                  </div>
+                  <div class="item-trailing">
+                    <details class="ui basic red button tw-p-0">
+                      <summary class="tw-p-2">{settingsLocale.wiki_delete}</summary>
+                      <div class="ui attached segment tw-text-left">
+                        <div class="ui warning message">
+                          {settingsLocale.wiki_delete_notices_1.replace("%s", repoFullName)}
+                        </div>
+                        <form class="ui form" action={`${repoLink}/settings`} method="post">
+                          <input type="hidden" name="action" value="delete-wiki" />
+                          <div class="field">
+                            <label>
+                              {settingsLocale.enter_repo_name_to_confirm} <span class="tw-text-red">{repoFullName}</span>
+                            </label>
+                          </div>
+                          <div class="required field">
+                            <label for="delete_wiki_repo_name">{settingsLocale.repo_name}</label>
+                            <input id="delete_wiki_repo_name" name="repo_name" required />
+                          </div>
+                          <button type="submit" class="ui red button">
+                            {settingsLocale.confirm_wiki_delete}
+                          </button>
+                        </form>
+                      </div>
+                    </details>
+                  </div>
+                </div>
+              )}
               {/* The delete row (options.tmpl:878-887 + #delete-repo-modal):
                   the typed-name confirmation, no new-owner field. */}
               <div class="item tw-items-center">

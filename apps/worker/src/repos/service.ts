@@ -71,6 +71,7 @@ import {
   issues,
   labels,
   milestones,
+  notificationStates,
   reactions,
   releaseAssets,
   releases,
@@ -905,12 +906,21 @@ export class RepoService {
     );
 
     // Issue-scoped dependents join through the repo's issue ids (comments,
-    // labels, subscriptions, reactions); everything else keys on repo_id.
+    // labels, subscriptions, notifications, reactions); everything else keys
+    // on repo_id.
     const issueIds = () => this.db.select({ id: issues.id }).from(issues).where(eq(issues.repoId, repoId));
     await this.db.batch([
       this.db.delete(comments).where(inArray(comments.issueId, issueIds())),
       this.db.delete(issueLabels).where(inArray(issueLabels.issueId, issueIds())),
       this.db.delete(issueSubscriptions).where(inArray(issueSubscriptions.issueId, issueIds())),
+      // Notification read-state (⑩-review P3): upstream's census carries
+      // `&activities_model.Notification{RepoID: repoID}` directly
+      // (services/repository/delete.go:170). Our derived-thread store has no
+      // repo_id column — notification_states keys on (user_id, issue_id) and
+      // the threads derive from issues — so the arm joins through the repo's
+      // issue ids like the siblings above. Without it the leak is invisible
+      // (the threads 404 with their issues) but the rows are permanent.
+      this.db.delete(notificationStates).where(inArray(notificationStates.issueId, issueIds())),
       this.db.delete(reactions).where(inArray(reactions.issueId, issueIds())),
       this.db.delete(pullRequests).where(eq(pullRequests.baseRepoId, repoId)),
       this.db.delete(pullRequests).where(eq(pullRequests.headRepoId, repoId)),
