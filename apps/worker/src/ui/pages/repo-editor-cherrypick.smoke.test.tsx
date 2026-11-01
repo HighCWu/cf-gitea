@@ -5,8 +5,10 @@
  * arm → the file gone) and the patch page's create happy path (render →
  * patch commit lands). Real engine content via the receive-flow seed
  * (testing/seed-repo.ts), D1 from the generated migrations; the writes go
- * through the module's own commit arms (no route exists — the HANDOFF
- * NOTE's wiring wave owns the 303 mapping).
+ * through the module's own commit arms (the wiring's 303 mapping lives in
+ * ui/index.ts). One mount-level pin beside the happy paths: the F5 rename's
+ * emitter↔dispatcher contract — the `_cherrypick` literal renders through
+ * the real uiRouter and the bare `cherrypick` head stays engine-owned.
  */
 
 import { env } from "cloudflare:test";
@@ -19,6 +21,9 @@ import { repositories, users } from "../../db/schema";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import { engineClient } from "../engine";
+import { uiRouter } from "../index";
+import { uiEnv } from "../__tests__/harness";
+import { mintSession, SESSION_COOKIE_NAME } from "../session";
 import { ensureSeededRepo, type SeedCommit } from "../testing/seed-repo";
 import {
   cherrypickLocale,
@@ -141,7 +146,7 @@ describe("the cherry-pick page's revert happy path", () => {
     const html = renderEditorCherryPickPage({ ctx, data, form, error: null });
 
     expect(html).toContain('<div role="main" aria-label="add feature file" class="page-content repository file editor edit">');
-    expect(html).toContain(`<form class="ui edit form form-fetch-action" method="post" action="/alice/editorcherrypick/cherrypick/${sha2}/main">`);
+    expect(html).toContain(`<form class="ui edit form form-fetch-action" method="post" action="/alice/editorcherrypick/_cherrypick/${sha2}/main">`);
     expect(html).toContain('<input type="hidden" name="revert" value="true"/>');
     // The breadcrumb: "Revert {sha link} onto:" + the repo + branch sections
     // + the or-Cancel tail onto the commit URL (cherry_pick.tmpl:12-22).
@@ -181,7 +186,7 @@ describe("the cherry-pick page's revert happy path", () => {
     const values = parseCherryPickForm(params);
     const result = await commitCherryPickFromForm(
       env,
-      new Request(`https://test.local/alice/editorcherrypick/cherrypick/${sha2}/main`, { method: "POST" }),
+      new Request(`https://test.local/alice/editorcherrypick/_cherrypick/${sha2}/main`, { method: "POST" }),
       repoRow,
       userRow,
       sha2,
@@ -195,6 +200,30 @@ describe("the cherry-pick page's revert happy path", () => {
     // The default-message fallback never fired (the form carried the prefill).
     const landed = await engine.readCommit("main");
     expect(landed?.message.startsWith("revert ")).toBe(true);
+  });
+
+  it("the mount admits _cherrypick and the bare spelling stays engine-owned (the F5 rename's contract)", async () => {
+    const { userRow, sha2 } = await ensureFixtures();
+    const cookie = await mintSession(env.DB, userRow.id);
+    const init: RequestInit = {
+      headers: { origin: "https://test.local", cookie: `${SESSION_COOKIE_NAME}=${cookie}` },
+    };
+    // The underscore literal rides the real mount: the writer's GET renders
+    // the page whose form action POSTs the admitted path.
+    const ok = await uiRouter.fetch(
+      new Request(`https://test.local/alice/editorcherrypick/_cherrypick/${sha2}/main`, init),
+      uiEnv,
+    );
+    expect(ok.status).toBe(200);
+    expect(await ok.text()).toContain(`action="/alice/editorcherrypick/_cherrypick/${sha2}/main"`);
+    // The bare `cherrypick` head is NOT an editor_action — the sub-app's
+    // reach equals handlesUiRoute's, so the mount misses it (the engine owns
+    // the bare shape in the composed app).
+    const bare = await uiRouter.fetch(
+      new Request(`https://test.local/alice/editorcherrypick/cherrypick/${sha2}/main`, init),
+      uiEnv,
+    );
+    expect(bare.status).toBe(404);
   });
 });
 

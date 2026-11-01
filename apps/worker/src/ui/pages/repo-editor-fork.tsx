@@ -249,16 +249,19 @@ export interface EditorForkOverlay {
  * the editor literal + the fork's DEFAULT branch + the treePath + the
  * `from_base_branch` query, then the current page's query appended
  * (upstream appends `ctx.Req.URL.RawQuery` through the Iif's ?/& switch).
- * `editorLiteral` is the page's OWN URL literal (the family's bare names —
- * `new|edit|delete|upload|patch`; `cherrypick` carries the sha between the
- * literal and the branch, web.go:1469's `{sha}` segment — pass it as
- * `sha`). Pass `query` with its leading `?`/`&`-free form (the raw
+   * `editorLiteral` is the page's OWN URL literal (the family's bare names —
+   * `new|edit|delete|upload|patch`, with `patch` the documented bare
+   * divergence; `_cherrypick` carries the sha between the literal and the
+   * branch, web.go:1469's `{sha}` segment — pass it as `sha`; upstream
+   * passes the `_cherrypick` literal verbatim through this construction,
+   * repo.go:258-259, and the bare spelling is not an editor_action).
+   * Pass `query` with its leading `?`/`&`-free form (the raw
  * `url.search` substring WITHOUT the leading `?` — "" when none).
  */
 export function editorForkTargetAction(options: {
   forkLink: string;
   editorLiteral: string;
-  /** cherrypick only (web.go:1469 — the sha rides between the literal and
+  /** _cherrypick only (web.go:1469 — the sha rides between the literal and
    *  the branch tail); undefined elsewhere. */
   sha?: string;
   forkDefaultBranch: string;

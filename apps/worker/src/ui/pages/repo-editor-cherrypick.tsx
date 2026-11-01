@@ -10,7 +10,7 @@
  *             GET repo.NewDiffPatch / POST repo.NewDiffPatchPost,
  *             routers/web/repo/editor_apply_patch.go:16-52, binding
  *             EditRepoFileForm; template repo/editor/patch.tmpl)
- *   GET+POST /{owner}/{repo}/cherrypick/{sha}/{branch}      the Cherry-pick /
+ *   GET+POST /{owner}/{repo}/_cherrypick/{sha}/{branch}     the Cherry-pick /
  *             Revert page (upstream
  *             `/{editor_action:_cherrypick}/{sha:([a-f0-9]{7,64})}/*` —
  *             web.go:1468-1470, GET repo.CherryPick / POST
@@ -18,8 +18,11 @@
  *             17-83, binding CherryPickForm; template
  *             repo/editor/cherry_pick.tmpl)
  *
- * Upstream spells the literals with a leading underscore; the family's brief
- * pins the bare names (pages/file-editor.tsx header). Both tails sit under
+ * Upstream spells the editor literals with a leading underscore; the family's
+ * brief pins the bare name for `patch` (pages/file-editor.tsx header — the
+ * documented divergence), while the cherrypick tail follows upstream's
+ * `_cherrypick` verbatim (the F5 rename — the bare `cherrypick` head is NOT
+ * an editor_action and stays engine-owned). Both tails sit under
  * the same `RepoRefByType(git.RefTypeBranch)` group as the wave-8 family:
  * the tail after the literal (after the sha for cherrypick) is the
  * branch+path rest and resolves against the BRANCH universe only —
@@ -73,10 +76,10 @@
  * arms:
  *
  *  1. parseUiRoute — the wave-8 literal block claims `patch` and
- *     `cherrypick` (rest non-empty, decodeURIComponent per segment, joined
+ *     `_cherrypick` (rest non-empty, decodeURIComponent per segment, joined
  *     into the suffix):
  *       - `patch` → `{ family: "editor-patch", owner, repo, refSuffix }`.
- *       - `cherrypick` → `splitCherryPickSuffix(suffix)` (BELOW — sha gate
+ *       - `_cherrypick` → `splitCherryPickSuffix(suffix)` (BELOW — sha gate
  *         + branch rest, this module's export); `null` returns null (the
  *         shape falls to the engine, upstream's `({sha:([a-f0-9]{7,64})})`
  *         gate + required `/*` tail); else
@@ -85,7 +88,7 @@
  *         the literal and the branch tail), the rest is the refSuffix.
  *  2. Registration beside the wave-8 uiRouter block:
  *       uiRouter.get|post("/:owner/:repo/patch/*", …)
- *       uiRouter.get|post("/:owner/:repo/cherrypick/*", …)
+ *       uiRouter.get|post("/:owner/:repo/_cherrypick/*", …)
  *  3. Handlers mirror fileEditorPage/fileEditorSubmit (the
  *     fileEditorGate prologue: §2.8 Origin guard on POST → resolveUiRequest
  *     → anonymous login 303 → archived/write-predicate 404-shell), with
@@ -163,7 +166,7 @@ export const cherrypickLocale = {
 } as const;
 
 // ---------------------------------------------------------------------------
-// The URL grammar — `cherrypick/{sha}/{branch}[/{path}]`
+// The URL grammar — `_cherrypick/{sha}/{branch}[/{path}]`
 // ---------------------------------------------------------------------------
 
 /** The sha segment's shape gate — upstream web.go:1469's
@@ -635,7 +638,10 @@ export function EditorCherryPickPage(props: { ctx: UiContext; data: EditorCherry
   if (repo === undefined) throw new Error("EditorCherryPickPage requires ctx.repo");
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   const branchHref = `${repoLink}/src/branch/${pathEscapeSegments(data.branch)}`;
-  const action = `${repoLink}/cherrypick/${data.sha}/${pathEscapeSegments(data.branch)}`;
+  // The F5 rename (commit 6a91a5c): the dispatcher admits `_cherrypick`
+  // (upstream's editor_action — commit_page.tmpl:65 emits it); the bare
+  // spelling falls through to the engine.
+  const action = `${repoLink}/_cherrypick/${data.sha}/${pathEscapeSegments(data.branch)}`;
   return (
     <BaseLayout ctx={ctx} title={data.commit.subject} pageClass="repository file editor edit" activeTab="code">
       <div class="ui container">

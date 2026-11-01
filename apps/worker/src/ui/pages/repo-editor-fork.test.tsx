@@ -10,7 +10,7 @@
  * base's stays):
  *
  *   - the pure seams: editorForkTargetAction (TargetFormAction's shapes —
- *     root/nested/cherrypick/query passthrough), editorForkReturnTarget
+ *     root/nested/_cherrypick/query passthrough), editorForkReturnTarget
  *     (the no-JS reload validation — in-repo verbatim, cross-repo and
  *     protocol-relative refused), parseEditorForkForm, and
  *     uniqueEditorForkName's EXACT quirky sequence (upstream's
@@ -205,18 +205,18 @@ describe("editorForkTargetAction (TargetFormAction's port, services/context/repo
     ).toBe("/edforksam/edork/new/main?from_base_branch=feature%2Fx");
   });
 
-  it("cherrypick carries the sha between the literal and the branch (web.go:1469)", () => {
+  it("_cherrypick carries the sha between the literal and the branch (web.go:1469; upstream passes the underscore literal verbatim — repo.go:258-259)", () => {
     expect(
       editorForkTargetAction({
         forkLink: "/edforksam/edork",
-        editorLiteral: "cherrypick",
+        editorLiteral: "_cherrypick",
         sha: "abc1234",
         forkDefaultBranch: "main",
         treePath: "",
         baseBranch: "main",
         query: "",
       }),
-    ).toBe("/edforksam/edork/cherrypick/abc1234/main?from_base_branch=main");
+    ).toBe("/edforksam/edork/_cherrypick/abc1234/main?from_base_branch=main");
   });
 
   it("appends the current page's query after from_base_branch (upstream's RawQuery passthrough)", () => {
