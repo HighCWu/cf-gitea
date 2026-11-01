@@ -4792,3 +4792,111 @@ export const externalLoginUsers = sqliteTable("external_login_user", {
   index("external_login_user_user_id_idx").on(t.userId),
   index("external_login_user_provider_idx").on(t.provider),
 ]);
+
+/**
+ * Deleted branches (upstream models/git/branch.go:254-269's DeletedBranch —
+ * the RESTORE arm's substrate, migration 0059): the delete arm writes the
+ * row PRE-CAS (the sha survives the ref deletion), the branches list
+ * renders the deleted rows with their restore forms, and the restore POST
+ * replays commitApiChange from the stored sha. One row per (repo, name) —
+ * a re-delete of the same name overwrites (upstream's
+ * unique(repo_id, name) upsert).
+ */
+export const deletedBranches = sqliteTable(
+  "deleted_branches",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    repoId: text("repo_id").notNull(),
+    /** Upstream `Name` — the branch's exact name (slashes included). */
+    name: text("name").notNull(),
+    /** Upstream `Commit` — the tip sha AT DELETE TIME (the restore source). */
+    commitId: text("commit_id").notNull(),
+    /** Upstream `DeletedByID` — the actor (the list renders them). */
+    deletedById: integer("deleted_by_id").notNull(),
+    /** Upstream `DeletedUnix` (seconds). */
+    deletedUnix: integer("deleted_unix").notNull(),
+  },
+  (t) => [
+    uniqueIndex("deleted_branches_repo_name_uq").on(t.repoId, t.name),
+    index("deleted_branches_repo_idx").on(t.repoId),
+  ],
+);
+
+/**
+ * Review state (upstream models/issues/review_state.go — the VIEWED-FILES
+ * arm's substrate, migration 0059): the PR-files viewed tracking, one row
+ * per (user, pull), updated to the latest commit sha as the reviewer marks
+ * files viewed. The files page's diff highlighting consumes it.
+ */
+export const reviewState = sqliteTable(
+  "review_state",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    userId: integer("user_id").notNull(),
+    /** The PULL's issue id (upstream PullID). */
+    issueId: integer("issue_id").notNull(),
+    /** Upstream `CommitSHA` — the head sha the viewed marks were made at. */
+    commitSha: text("commit_sha").notNull(),
+    /** Upstream `UpdatedUnix` (seconds). */
+    updatedUnix: integer("updated_unix").notNull(),
+  },
+  (t) => [
+    uniqueIndex("review_state_user_issue_uq").on(t.userId, t.issueId),
+    index("review_state_issue_idx").on(t.issueId),
+  ],
+);
+
+/**
+ * Pull auto-merges (upstream models/pull_automerge.go — the
+ * cancel_auto_merge arm's substrate, migration 0059): the merge box's
+ * MERGE-WHEN-CHECKS-SUCCEED records; a queue consumer checks each and
+ * merges when green, the cancel arm deletes the row.
+ */
+export const pullAutoMerges = sqliteTable(
+  "pull_auto_merges",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** The PULL's issue id (upstream PullID). */
+    issueId: integer("issue_id").notNull(),
+    /** Upstream `DoerID` — who scheduled the auto-merge. */
+    doerId: integer("doer_id").notNull(),
+    /** Upstream `SHA` — the head sha the schedule was made at. */
+    sha: text("sha").notNull(),
+    /** Upstream `MergeStyle` (merge/rebase/rebase-merge/squash/fast-forward). */
+    mergeStyle: text("merge_style").notNull(),
+    /** Upstream `DeleteBranchAfterMerge`. */
+    deleteBranchAfterMerge: integer("delete_branch_after_merge", { mode: "boolean" }).notNull().default(false),
+    /** Upstream `MergeMessage` (nullable — the box's optional message). */
+    mergeMessage: text("merge_message"),
+    createdUnix: integer("created_unix").notNull(),
+  },
+  (t) => [
+    uniqueIndex("pull_auto_merges_issue_uq").on(t.issueId),
+    index("pull_auto_merges_created_idx").on(t.createdUnix),
+  ],
+);
+
+/**
+ * TOTP two-factor (upstream models/auth/twofactor.go — the 2FA enrollment
+ * substrate, migration 0059): the secret + the scratch-hash pair, one row
+ * per user; the login flow's 2FA gate and the scratch-code recovery read
+ * it. WebAuthn credentials land with their own unit (its own shape).
+ */
+export const twoFactor = sqliteTable(
+  "two_factor",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** Upstream `UID` — uniqueIndex (one enrollment per user). */
+    userId: integer("user_id").notNull(),
+    /** Upstream `Secret` — the TOTP shared secret (base32). */
+    secret: text("secret").notNull(),
+    /** Upstream `ScratchSalt` + `ScratchHash` — the recovery codes pair. */
+    scratchSalt: text("scratch_salt").notNull(),
+    scratchHash: text("scratch_hash").notNull(),
+    /** Upstream `LastUsedPasscodePeriod` — the TOTP replay guard. */
+    lastUsedPasscodePeriod: integer("last_used_passcode_period").notNull().default(0),
+    createdUnix: integer("created_unix").notNull(),
+    updatedUnix: integer("updated_unix").notNull(),
+  },
+  (t) => [uniqueIndex("two_factor_uid_uq").on(t.userId)],
+);
