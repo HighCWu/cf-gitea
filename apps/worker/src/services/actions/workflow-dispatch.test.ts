@@ -266,6 +266,16 @@ describe("dispatchWorkflow (workflow.go:64-199's repo-level arm, the ⑲A4 produ
     // run dispatches from this repo's own workflow dir.
     const zero = await dispatch(reads, { scopedWorkflowSourceRepoId: "0" });
     expect(zero.status).toBe("ok");
+    // A NEGATIVE spelling is repo-level too: upstream parses FormInt64 and
+    // arms the scoped branch only when the value is > 0 (workflow.go:79's
+    // `isScoped := scopedWorkflowSourceRepoID > 0`) — "-5" dispatches the
+    // repo's own workflow dir like the zero arm (the R1-F11 pin).
+    const negative = await dispatch(reads, { scopedWorkflowSourceRepoId: "-5" });
+    expect(negative.status).toBe("ok");
+    if (negative.status === "ok") {
+      expect(negative.run.isScopedRun).toBe(false);
+      expect(negative.run.workflowRepoId).toBe(REPO_ID); // workflow.go:136 — the repo itself
+    }
   });
 });
 

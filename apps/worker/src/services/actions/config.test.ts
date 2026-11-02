@@ -41,6 +41,7 @@ import {
   parseRepoActionsConfig,
   removeRepoActionsCollaborativeOwner,
   saveRepoActionsConfig,
+  scopedSourceRepoParam,
   serializeRepoActionsConfig,
   toggleRepoActionsWorkflow,
   type RepoActionsConfig,
@@ -387,6 +388,58 @@ describe("the effective-source reads (models/actions/scoped_workflow.go:84-159)"
     expect(await isScopedWorkflowOptedOut(env.DB, cfg, 1, SRC_ID, "ci.yml")).toBe(true); // flagged AND not required
     enableScopedWorkflow(cfg, SRC_ID, "ci.yml");
     expect(await isScopedWorkflowOptedOut(env.DB, cfg, 1, SRC_ID, "ci.yml")).toBe(false); // the unflagged early-out
+  });
+
+  it("scans BOTH effective rows: a required flag on either the owner row or the instance row refuses (R1-F2)", async () => {
+    const store = scopedWorkflowSourcesStore(env.DB);
+    const cfg = parseRepoActionsConfig(null);
+    disableScopedWorkflow(cfg, SRC_ID, "ci.yml");
+
+    // BOTH rows exist: instance WITHOUT the required flag + owner WITH it.
+    // GetEffectiveScopedWorkflowSources loads the pair (scoped_workflow.go:
+    // 71-79) and IsWorkflowRequiredInSources scans BOTH (:90-98) — the
+    // first-found read collapsed the pair and let the opt-out through.
+    await store.addSource(0, SRC_ID);
+    await store.setSourceConfigs(0, SRC_ID, {});
+    await store.addSource(1, SRC_ID);
+    await store.setSourceConfigs(1, SRC_ID, { "ci.yml": { required: true, patterns: ["*"] } });
+    expect(await isScopedWorkflowRequired(env.DB, 1, SRC_ID, "ci.yml")).toBe(true);
+    expect(await isScopedWorkflowOptedOut(env.DB, cfg, 1, SRC_ID, "ci.yml")).toBe(false); // the flag on the OWNER row refuses
+
+    // the mirror: required on the INSTANCE row only — equally refusing
+    await store.setSourceConfigs(1, SRC_ID, {});
+    await store.setSourceConfigs(0, SRC_ID, { "ci.yml": { required: true, patterns: ["*"] } });
+    expect(await isScopedWorkflowRequired(env.DB, 1, SRC_ID, "ci.yml")).toBe(true);
+    expect(await isScopedWorkflowOptedOut(env.DB, cfg, 1, SRC_ID, "ci.yml")).toBe(false);
+
+    // neither row required → the flagged opt-out is in effect again
+    await store.setSourceConfigs(0, SRC_ID, {});
+    expect(await isScopedWorkflowRequired(env.DB, 1, SRC_ID, "ci.yml")).toBe(false);
+    expect(await isScopedWorkflowOptedOut(env.DB, cfg, 1, SRC_ID, "ci.yml")).toBe(true);
+  });
+
+  it("a consumer at owner 0 (instance scope) reads the instance row alone", async () => {
+    const store = scopedWorkflowSourcesStore(env.DB);
+    await store.addSource(0, SRC_ID);
+    await store.setSourceConfigs(0, SRC_ID, { "ci.yml": { required: true, patterns: ["*"] } });
+    await store.addSource(1, SRC_ID);
+    await store.setSourceConfigs(1, SRC_ID, {});
+    expect(await isScopedWorkflowRequired(env.DB, 0, SRC_ID, "ci.yml")).toBe(true); // owners = [0] only (:74-77)
+    expect(await isScopedWorkflowRequired(env.DB, 1, SRC_ID, "ci.yml")).toBe(true); // both rows, the instance one required
+    await store.setSourceConfigs(0, SRC_ID, {});
+    expect(await isScopedWorkflowRequired(env.DB, 0, SRC_ID, "ci.yml")).toBe(false); // the owner-1 row is not the consumer's
+    expect(await isScopedWorkflowRequired(env.DB, 1, SRC_ID, "ci.yml")).toBe(false);
+  });
+});
+
+describe("scopedSourceRepoParam (FormInt64's zero semantics — the TEXT adaptation)", () => {
+  it("reduces \"\"/\"0\" and any NEGATIVE spelling to the repo-level arm; other values ride verbatim", () => {
+    expect(scopedSourceRepoParam("")).toBe(""); // absent
+    expect(scopedSourceRepoParam("0")).toBe(""); // FormInt64's zero
+    expect(scopedSourceRepoParam("-5")).toBe(""); // upstream isScoped := > 0 (workflow.go:79) — negative = repo-level
+    expect(scopedSourceRepoParam("-0")).toBe("");
+    expect(scopedSourceRepoParam("123")).toBe("123"); // a source-id candidate
+    expect(scopedSourceRepoParam("junk")).toBe("junk"); // the recorded TEXT divergence (policed downstream)
   });
 });
 

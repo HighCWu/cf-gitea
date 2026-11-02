@@ -21,6 +21,7 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { parseDocument } from "yaml";
 
+import { saveRepoSettings } from "../../api/services/repo-settings";
 import {
   actionRunJobSummaries,
   actionRuns,
@@ -34,6 +35,7 @@ import {
   repositories,
   users,
 } from "../../db/schema";
+import { toggleRepoActionsWorkflow } from "./config";
 import {
   ACTION_STATUS_BLOCKED,
   ACTION_STATUS_CANCELLING,
@@ -370,7 +372,9 @@ describe("listWorkflows (first-existing-dir + .yml/.yaml + the 1 MiB cap)", () =
           : Promise.resolve(null),
     };
     const files = await listWorkflows(listing, "refs/heads/main");
-    expect(files.map((f) => f.entryName)).toEqual([".gitea/workflows/a.yml"]);
+    // entry.Name() is the subtree ls-tree name — DIR-RELATIVE (tree.go:132-145;
+    // actions_trigger_test.go:495's WorkflowID "createdelete.yml" pin).
+    expect(files.map((f) => f.entryName)).toEqual(["a.yml"]);
   });
 
   it("falls through to .github/workflows when .gitea/workflows is absent", async () => {
@@ -381,7 +385,24 @@ describe("listWorkflows (first-existing-dir + .yml/.yaml + the 1 MiB cap)", () =
         path === ".github/workflows/b.yaml" ? Promise.resolve({ data: new Uint8Array(1) }) : Promise.resolve(null),
     };
     const files = await listWorkflows(listing, "refs/heads/main");
-    expect(files.map((f) => f.entryName)).toEqual([".github/workflows/b.yaml"]);
+    expect(files.map((f) => f.entryName)).toEqual(["b.yaml"]);
+  });
+
+  it("nested entries keep their below-the-dir path (`ls-tree -r` on the subtree)", async () => {
+    const listing: WorkflowTreeReads = {
+      listTree: (_ref, path) =>
+        path === ".gitea/workflows"
+          ? Promise.resolve({ entries: [{ name: "top.yml", type: "blob" }, { name: "sub", type: "tree" }] })
+          : path === ".gitea/workflows/sub"
+            ? Promise.resolve({ entries: [{ name: "nested.yml", type: "blob" }] })
+            : Promise.resolve(null),
+      readBlob: (_ref, path) =>
+        path === ".gitea/workflows/top.yml" || path === ".gitea/workflows/sub/nested.yml"
+          ? Promise.resolve({ data: new TextEncoder().encode("on: push\njobs: {}\n") })
+          : Promise.resolve(null),
+    };
+    const files = await listWorkflows(listing, "refs/heads/main");
+    expect(files.map((f) => f.entryName)).toEqual(["top.yml", "sub/nested.yml"]);
   });
 
   it("no workflow dir anywhere answers empty", async () => {
@@ -406,7 +427,7 @@ describe("listWorkflows (first-existing-dir + .yml/.yaml + the 1 MiB cap)", () =
       },
     };
     const files = await listWorkflows(listing, "refs/heads/main");
-    expect(files.map((f) => f.entryName)).toEqual([".github/workflows/ok.yml"]);
+    expect(files.map((f) => f.entryName)).toEqual(["ok.yml"]);
   });
 
   it("isWorkflowPath gates on the dirs + extensions", () => {
@@ -1982,7 +2003,9 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
 
     const runs = await db().select().from(actionRuns);
     expect(runs).toHaveLength(1);
-    expect(runs[0]?.workflowId).toBe(".gitea/workflows/ci.yml");
+    // run.WorkflowID = dwf.EntryName — the dir-relative name (notifier_helper.go:396;
+    // the upstream integration pin actions_trigger_test.go:495).
+    expect(runs[0]?.workflowId).toBe("ci.yml");
     expect(runs[0]?.event).toBe("push");
     expect(runs[0]?.triggerEvent).toBe("push");
     expect(runs[0]?.commitSha).toBe(tip);
@@ -2096,8 +2119,8 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
 
     const runs = await db().select().from(actionRuns).orderBy(actionRuns.id);
     expect(runs).toHaveLength(2);
-    const badRun = runs.find((r) => r.workflowId === ".gitea/workflows/bad.yml");
-    const goodRun = runs.find((r) => r.workflowId === ".gitea/workflows/good.yml");
+    const badRun = runs.find((r) => r.workflowId === "bad.yml");
+    const goodRun = runs.find((r) => r.workflowId === "good.yml");
     expect(badRun).toBeDefined();
     expect(goodRun).toBeDefined();
 
@@ -2109,12 +2132,13 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
     expect(badRun?.triggerEvent).toBe("push");
     expect(badRun?.index).toBeGreaterThan(0);
 
-    // the summary carries the parse error verbatim (invalid_workflow.go:81)
+    // the summary carries the parse error verbatim (invalid_workflow.go:81 —
+    // the %s is run.WorkflowID, the bare entry name after the F1 id-space fix)
     const summaries = await db().select().from(actionRunJobSummaries).where(eq(actionRunJobSummaries.runId, badRun?.id ?? 0));
     expect(summaries).toHaveLength(1);
     expect(summaries[0]?.contentType).toBe("text/markdown");
     expect(summaries[0]?.content).toBe(
-      "**Invalid workflow file: .gitea/workflows/bad.yml**\n\n```\njob bad: Unrecognized named-value: 'env'\n```\n",
+      "**Invalid workflow file: bad.yml**\n\n```\njob bad: Unrecognized named-value: 'env'\n```\n",
     );
     expect(summaries[0]?.contentSize).toBe(new TextEncoder().encode(summaries[0]?.content ?? "").length);
 
@@ -2190,8 +2214,9 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
     expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId, scheduledUnix: tickNoon })).toBe(2);
     let runs = await db().select().from(actionRuns).orderBy(actionRuns.id);
     expect(runs).toHaveLength(2);
-    expect(runs[0]?.workflowId).toBe(".gitea/workflows/hourly.yml");
-    expect(runs[1]?.workflowId).toBe(".gitea/workflows/noon.yml");
+    // schedule_tasks.go:130's WorkflowID rides dwf.EntryName — dir-relative.
+    expect(runs[0]?.workflowId).toBe("hourly.yml");
+    expect(runs[1]?.workflowId).toBe("noon.yml");
     for (const run of runs) {
       expect(run.triggerEvent).toBe("schedule");
       expect(run.event).toBe("push"); // upstream CreateScheduleTaskBySpec's Event: cron.Event
@@ -2210,12 +2235,12 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
     expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId, scheduledUnix: tick14 })).toBe(1);
     runs = await db().select().from(actionRuns).orderBy(actionRuns.id);
     expect(runs).toHaveLength(3);
-    expect(runs[2]?.workflowId).toBe(".gitea/workflows/hourly.yml");
+    expect(runs[2]?.workflowId).toBe("hourly.yml");
 
     // the noon workflow never fired at the 14:00 tick — the mission's
     // non-due arm, asserted on the rows
-    expect(runs.filter((r) => r.workflowId === ".gitea/workflows/noon.yml")).toHaveLength(1);
-    expect(runs.filter((r) => r.workflowId === ".gitea/workflows/hourly.yml")).toHaveLength(2);
+    expect(runs.filter((r) => r.workflowId === "noon.yml")).toHaveLength(1);
+    expect(runs.filter((r) => r.workflowId === "hourly.yml")).toHaveLength(2);
   });
 
   it("a redelivered tick message inserts nothing (the schedule_unix dedupe)", async () => {
@@ -2258,7 +2283,7 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
     expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId, scheduledUnix: tick })).toBe(1);
     const runs = await db().select().from(actionRuns);
     expect(runs).toHaveLength(1);
-    expect(runs[0]?.workflowId).toBe(".gitea/workflows/good.yml");
+    expect(runs[0]?.workflowId).toBe("good.yml");
     expect((JSON.parse(runs[0]?.eventPayload ?? "{}") as { schedule?: string }).schedule).toBe("@hourly");
   });
 
@@ -2286,6 +2311,61 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
     expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId: "repo-sched-arch", scheduledUnix: tick })).toBe(0);
     expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId: "repo-sched-empty", scheduledUnix: tick })).toBe(0);
     expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId: "repo-sched-missing", scheduledUnix: tick })).toBe(0);
+  });
+
+  // -- the R1-F1 id-space pins: the settings-page toggle writes the BARE
+  // entry name (the runs-page link id) and the disabled checks must compare
+  // that same space — the full-path split kept disabled workflows running. --
+
+  it("a settings-page disable suppresses the matching push run (the bare-name flag actually arms)", async () => {
+    const { owner, slug, repoId, userId } = await seedE2eRepo("disabled-push");
+    const token = (await mintFor(userId, "t-dis", "write:repository")).plaintext;
+    const wfV1 = "name: CI\non: push\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n";
+    const wfV2 = "name: CI\non: push\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: z\n";
+    const { tips, pack } = await buildChainPack(null, [
+      { message: "ci: add workflow", files: [{ path: ".gitea/workflows/ci.yml", content: wfV1 }] },
+      { message: "ci: tweak workflow", files: [{ path: ".gitea/workflows/ci.yml", content: wfV2 }] },
+    ]);
+    const first = await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[0]! }], pack, token);
+    expect(first.status).toBe(200);
+    expect(await db().select().from(actionRuns)).toHaveLength(1);
+
+    // the workflow-list toggle arm writes the BARE name (view.go:1324-1375's
+    // DisableWorkflow over cfg.DisabledWorkflows; the UI posts entry.Name())
+    await saveRepoSettings(env.DB, repoId, { hasActions: true }, new Date(0));
+    expect(
+      await toggleRepoActionsWorkflow(env.DB, repoId, userId, { workflowId: "ci.yml", isEnable: false, scopedWorkflowSourceRepoId: "" }),
+    ).toBe("saved");
+
+    // the second push inserts NOTHING — the disabled check now compares the
+    // run's bare workflowId space against the stored flag
+    // (notifier_helper.go:223's IsWorkflowDisabled(wf.EntryName)).
+    const second = await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[1]! }], pack, token);
+    expect(second.status).toBe(200);
+    const runs = await db().select().from(actionRuns);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.workflowId).toBe("ci.yml");
+  });
+
+  it("the same bare-name flag suppresses the schedule tick (the schedule twin)", async () => {
+    const { owner, slug, repoId, userId } = await seedE2eRepo("disabled-sched");
+    const token = (await mintFor(userId, "t-dis2", "write:repository")).plaintext;
+    const hourly = 'name: Hourly\non:\n  schedule:\n    - cron: "0 * * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
+    const { tips, pack } = await buildChainPack(null, [
+      { message: "ci: schedule workflow", files: [{ path: ".gitea/workflows/hourly.yml", content: hourly }] },
+    ]);
+    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[0]! }], pack, token);
+
+    await saveRepoSettings(env.DB, repoId, { hasActions: true }, new Date(0));
+    expect(
+      await toggleRepoActionsWorkflow(env.DB, repoId, userId, { workflowId: "hourly.yml", isEnable: false, scopedWorkflowSourceRepoId: "" }),
+    ).toBe("saved");
+
+    // schedule_tasks.go:122-125's disabled-workflow skip fires on the bare
+    // name — the tick inserts nothing.
+    const tick = Math.floor(Date.UTC(2026, 5, 1, 12, 0, 0) / 1000);
+    expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId, scheduledUnix: tick })).toBe(0);
+    expect(await db().select().from(actionRuns)).toHaveLength(0);
   });
 });
 

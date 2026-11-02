@@ -634,7 +634,10 @@ export function isWorkflowPath(path: string): boolean {
 }
 
 export interface WorkflowFile {
-  /** The tree path (upstream entry.Name() is the full path below the repo root). */
+  /** Upstream entry.Name() — the ls-tree path RELATIVE to the workflow dir
+   *  (the recursive listing runs `ls-tree -r` on the SUBTREE, tree.go:132-145,
+   *  so `ci.yml` — the dir-relative id space every consumer shares: the
+   *  disabled map, the runs' workflow_id, the scoped configs). */
   entryName: string;
   content: string;
 }
@@ -650,7 +653,13 @@ export interface WorkflowTreeReads {
  * that exists wins entirely (the loop breaks on the first SubTree success —
  * both dirs are never merged), then the recursive .yml/.yaml listing.
  * The recursive walk rides repeated listTree calls (upstream's
- * ListEntriesRecursiveFast).
+ * ListEntriesRecursiveFast). Emitted entryNames are DIR-RELATIVE
+ * (`ci.yml`, `sub/ci.yml`): upstream's recursive ls-tree runs against the
+ * SUBTREE's own id (tree.go:132-145 — its "name" field carries the path
+ * below that subtree), so entry.Name() never repeats the `.gitea/workflows/`
+ * prefix and every consumer (IsWorkflowDisabled(wf.EntryName),
+ * run.WorkflowID = dwf.EntryName) keys off that bare space — the
+ * actions_trigger_test.go:495 `WorkflowID: "createdelete.yml"` pin.
  */
 export async function listWorkflows(reads: WorkflowTreeReads, ref: string): Promise<WorkflowFile[]> {
   let base: string | null = null;
@@ -680,14 +689,17 @@ export async function listWorkflows(reads: WorkflowTreeReads, ref: string): Prom
   };
   await walk(base, 16);
   const out: WorkflowFile[] = [];
-  for (const entryName of files) {
-    const blob = await reads.readBlob(ref, entryName);
+  for (const path of files) {
+    const blob = await reads.readBlob(ref, path);
     if (blob === null) continue;
     // GetContentFromEntry's cap (workflows.go:110-121): ReadWithLimit errors
     // past 1 MiB — an oversized file is dropped, never truncated.
     if (blob.data.byteLength > WORKFLOW_FILE_MAX_BYTES) {
       continue;
     }
+    // entry.Name(): the path relative to the base dir (tree.go:142's
+    // ls-tree-on-the-subtree name space).
+    const entryName = path.slice(base.length + 1);
     out.push({ entryName, content: new TextDecoder().decode(blob.data) });
   }
   return out;

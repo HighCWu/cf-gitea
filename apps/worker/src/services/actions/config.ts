@@ -390,14 +390,16 @@ export async function applyRepoTokenPermissionsForm(d1: D1Database, repoId: stri
 
 /** The `scoped_workflow_source_repo_id` form param's TEXT adaptation
  *  (shared by the toggle and dispatch arms): upstream parses FormInt64 —
- *  absent/junk → 0 and a literal "0" both mean the repo-level arm — while
- *  our source ids are TEXT. "" and "0" reduce to the repo-level ""; every
- *  other nonempty value rides verbatim as a source-id candidate (a bogus
- *  one is policed downstream: the dispatch's effective-source gate answers
- *  not-found, the toggle writes a dead opt-out key exactly as upstream's
- *  deliberate nonexistent-source opt-out does). */
+ *  absent/junk → 0 and a literal "0" both mean the repo-level arm, and any
+ *  NEGATIVE parse is repo-level too (`isScoped := scopedWorkflowSourceRepoID
+ *  > 0`, workflow.go:79) — while our source ids are TEXT. "" and "0" and a
+ *  leading "-" reduce to the repo-level ""; every other nonempty value
+ *  rides verbatim as a source-id candidate (a bogus one is policed
+ *  downstream: the dispatch's effective-source gate answers not-found, the
+ *  toggle writes a dead opt-out key exactly as upstream's deliberate
+ *  nonexistent-source opt-out does). */
 export function scopedSourceRepoParam(raw: string): string {
-  return raw === "" || raw === "0" ? "" : raw;
+  return raw === "" || raw === "0" || raw.startsWith("-") ? "" : raw;
 }
 
 /** IsScopedWorkflowDisabled (:111-113) — the consumer's opt-out flag for
@@ -431,59 +433,61 @@ export function enableScopedWorkflow(cfg: RepoActionsConfig, sourceRepoId: strin
 
 // --- the effective-source reads (models/actions/scoped_workflow.go) -------
 
-/** GetEffectiveScopedWorkflowSources (:84-91) reduced to what the toggle and
- *  dispatch arms ask: the (owner, sourceRepo) registration rows effective for
- *  a repo owned by consumerOwnerId — the owner's own rows plus the
- *  instance-level (owner_id=0) rows. The landed sources store's
- *  (owner, repo) get composes the two rows (an indexed get each) — the
- *  upstream single EXISTS/Find over owner_id IN (0, ownerId) rides the same
- *  UNIQUE(owner_repo) index. */
-async function effectiveSourceFor(
-  d1: D1Database,
-  consumerOwnerId: number,
-  sourceRepoId: string,
-): Promise<ScopedWorkflowSourceRow | null> {
+/** GetEffectiveScopedWorkflowSources (:71-79) reduced to what the toggle and
+ *  dispatch arms ask: EVERY (owner, sourceRepo) registration row effective
+ *  for a repo owned by consumerOwnerId — the instance-level (owner_id=0)
+ *  row AND the owner's own row, BOTH when both exist (upstream's single
+ *  Find over owner_id IN (0, ownerId) returns the pair; the landed sources
+ *  store's (owner, repo) gets compose it — an indexed get each). The pair
+ *  matters for the required scan: an instance row without the required
+ *  flag plus an owner row with it REFUSES the opt-out upstream
+ *  (IsWorkflowRequiredInSources scans all rows, scoped_workflow.go:90-98) —
+ *  a first-found read collapses the pair and lets the disable through
+ *  (the R1-F2 finding). */
+async function effectiveSourcesFor(d1: D1Database, consumerOwnerId: number, sourceRepoId: string): Promise<ScopedWorkflowSourceRow[]> {
   const store = scopedWorkflowSourcesStore(d1);
-  const instance = await store.getSource(0, sourceRepoId);
-  if (instance !== null) return instance;
-  if (consumerOwnerId === 0) return null;
-  return store.getSource(consumerOwnerId, sourceRepoId);
+  const owners: number[] = [0];
+  if (consumerOwnerId !== 0) owners.push(consumerOwnerId); // scoped_workflow.go:74-77
+  const rows = await Promise.all(owners.map((ownerId) => store.getSource(ownerId, sourceRepoId)));
+  return rows.filter((row): row is ScopedWorkflowSourceRow => row !== null);
 }
 
-/** IsScopedWorkflowSourceEffective (:93-101) — is sourceRepoId a scoped
- *  source for a repo owned by consumerOwnerId. */
+/** IsScopedWorkflowSourceEffective (:81-88) — is sourceRepoId a scoped
+ *  source for a repo owned by consumerOwnerId (any effective row exists). */
 export async function isScopedWorkflowSourceEffective(d1: D1Database, consumerOwnerId: number, sourceRepoId: string): Promise<boolean> {
-  return (await effectiveSourceFor(d1, consumerOwnerId, sourceRepoId)) !== null;
+  return (await effectiveSourcesFor(d1, consumerOwnerId, sourceRepoId)).length > 0;
 }
 
-/** IsWorkflowRequiredInSources (:103-108) over the effective rows — the
- *  source registration marks this workflow required (a required workflow
- *  cannot be opted out and still gates merges). */
-function isWorkflowRequiredInSource(source: ScopedWorkflowSourceRow | null, workflowId: string): boolean {
-  return source?.workflowConfigs[workflowId]?.required === true;
+/** IsWorkflowRequiredInSources (:90-98) over the effective rows — ANY
+ *  effective registration marks this workflow required (a required workflow
+ *  cannot be opted out and still gates merges). Every row already filters
+ *  to sourceRepoId, so the per-row SourceRepoID check is the store's
+ *  key itself. */
+function isWorkflowRequiredInSources(sources: ScopedWorkflowSourceRow[], workflowId: string): boolean {
+  return sources.some((source) => source.workflowConfigs[workflowId]?.required === true);
 }
 
-/** IsScopedWorkflowRequired (:151-159) — required by any effective source. */
+/** IsScopedWorkflowRequired (:108-115) — required by any effective source. */
 export async function isScopedWorkflowRequired(d1: D1Database, consumerOwnerId: number, sourceRepoId: string, workflowId: string): Promise<boolean> {
-  return isWorkflowRequiredInSource(await effectiveSourceFor(d1, consumerOwnerId, sourceRepoId), workflowId);
+  return isWorkflowRequiredInSources(await effectiveSourcesFor(d1, consumerOwnerId, sourceRepoId), workflowId);
 }
 
-/** ScopedWorkflowOptedOut (:146-151) — the consumer's opt-out of
+/** ScopedWorkflowOptedOut (:129-132) — the consumer's opt-out of
  *  (sourceRepoId, workflowId) is in effect: flagged disabled AND not
- *  required by the effective registration. */
-function scopedWorkflowOptedOut(cfg: Pick<RepoActionsConfig, "disabledScopedWorkflows">, source: ScopedWorkflowSourceRow | null, sourceRepoId: string, workflowId: string): boolean {
-  return !isWorkflowRequiredInSource(source, workflowId) && isScopedWorkflowDisabled(cfg, sourceRepoId, workflowId);
+ *  required by ANY effective registration. */
+function scopedWorkflowOptedOut(cfg: Pick<RepoActionsConfig, "disabledScopedWorkflows">, sources: ScopedWorkflowSourceRow[], sourceRepoId: string, workflowId: string): boolean {
+  return !isWorkflowRequiredInSources(sources, workflowId) && isScopedWorkflowDisabled(cfg, sourceRepoId, workflowId);
 }
 
-/** IsScopedWorkflowOptedOut (:139-144) — the store read with upstream's
+/** IsScopedWorkflowOptedOut (:117-127) — the store read with upstream's
  *  cheap early-out: an unflagged consumer answers false without touching the
- *  sources table. This is the DISPATCH (:84-99 of services/actions/
- *  workflow.go) and RERUN (view.go:929-936) disabled check's scoped arm. */
+ *  sources table. This is the DISPATCH (workflow.go:84-99) and RERUN
+ *  (view.go:929-936) disabled check's scoped arm. */
 export async function isScopedWorkflowOptedOut(d1: D1Database, cfg: Pick<RepoActionsConfig, "disabledScopedWorkflows">, consumerOwnerId: number, sourceRepoId: string, workflowId: string): Promise<boolean> {
   if (!isScopedWorkflowDisabled(cfg, sourceRepoId, workflowId)) {
     return false;
   }
-  return scopedWorkflowOptedOut(cfg, await effectiveSourceFor(d1, consumerOwnerId, sourceRepoId), sourceRepoId, workflowId);
+  return scopedWorkflowOptedOut(cfg, await effectiveSourcesFor(d1, consumerOwnerId, sourceRepoId), sourceRepoId, workflowId);
 }
 
 // --- the workflow-list pages' toggle arm (view.go:1324-1375) --------------

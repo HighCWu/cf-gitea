@@ -317,7 +317,12 @@ export interface ScopedWorkflowSourceFile {
  * (`GetEventsFromContent`) with upstream's log-and-skip invalid arm
  * (:46-49 — an unparseable `on:` skips the entry, never fails the walk).
  * A read `null` (no dir / no blob through the null-on-failure client) skips
- * like upstream's miss arms.
+ * like upstream's miss arms. Emitted entryNames are DIR-RELATIVE — the
+ * settings page's configs map keys them bare (`workflow_ids` ← EntryName,
+ * scoped_workflows.go:330-341; the read side `configs[p.EntryName]`, :214)
+ * and upstream's own name space is the subtree ls-tree (tree.go:132-145),
+ * the F1 twin (the consumer's dispatch matches the same bare names,
+ * workflow.go:263-264).
  */
 export async function parseScopedWorkflowFiles(reads: ScopedWorkflowFileReads, ref: string): Promise<ScopedWorkflowSourceFile[]> {
   let base: string | null = null;
@@ -347,14 +352,17 @@ export async function parseScopedWorkflowFiles(reads: ScopedWorkflowFileReads, r
   };
   await walk(base, 16);
   const out: ScopedWorkflowSourceFile[] = [];
-  for (const entryName of paths) {
-    const blob = await reads.readBlob(ref, entryName);
+  for (const path of paths) {
+    const blob = await reads.readBlob(ref, path);
     if (blob === null) continue;
     // GetContentFromEntry's cap (the listWorkflows twin — an oversized file
     // is dropped, never truncated).
     if (blob.data.byteLength > WORKFLOW_FILE_MAX_BYTES) {
       continue;
     }
+    // entry.Name(): the path relative to the scoped base dir (tree.go:142's
+    // ls-tree-on-the-subtree name space — the F1 twin).
+    const entryName = path.slice(base.length + 1);
     const content = new TextDecoder().decode(blob.data);
     let events: WorkflowEvent[];
     try {

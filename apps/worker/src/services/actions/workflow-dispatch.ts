@@ -58,11 +58,13 @@
  * repo-level arm. Upstream's form value is FormInt64 over an int64 repo id
  * space; ours is the TEXT repositories.id space verbatim (the schema's own
  * TEXT adaptation, schema.ts:3931). The landed wire keeps upstream's zero
- * semantics through config.ts's scopedSourceRepoParam: "" (absent) and "0"
- * (the landed page's dispatch form always posts it) are the repo-level
- * arm; every other nonempty value rides verbatim as a source-id candidate
- * (a bogus one dies on the effective-source gate below — the recorded
- * divergence from upstream's junk→0 fallback).
+ * semantics through config.ts's scopedSourceRepoParam: "" (absent), "0"
+ * (the landed page's dispatch form always posts it) and any NEGATIVE
+ * spelling (`isScoped := scopedWorkflowSourceRepoID > 0`, workflow.go:79 —
+ * a negative parse is repo-level) are the repo-level arm; every other
+ * nonempty value rides verbatim as a source-id candidate (a bogus one dies
+ * on the effective-source gate below — the recorded divergence from
+ * upstream's junk→0 fallback).
  * The arm:
  *   1. the opt-out disabled check (workflow.go:84-99's isScoped branch —
  *     config.ts's isScopedWorkflowOptedOut, the flagged-disabled AND

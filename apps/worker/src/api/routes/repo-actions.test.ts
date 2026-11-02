@@ -756,6 +756,17 @@ describe("GET .../workflows/{workflow_id}/runs (ActionsListWorkflowRuns)", () =>
     expect((await get(`${SUITE}/actions/workflows/ci.yml/runs`)).status).toBe(401);
     expect((await get(`${EMPTY}/actions/workflows/x.yml/runs`, "bob-token")).status).toBe(403);
   });
+
+  it("a PATH-spelled workflow_id answers 404 — the exact-name id space has no spelling bridge (the R1-F1 arm)", async () => {
+    // Upstream: the store filter is an exact Eq over the raw param
+    // (run_list.go:101-103) and the fallback matches entry.Name() == workflowID
+    // exactly (convert.go:705) — a path-spelled request misses both, even for
+    // a workflow whose file plainly exists (producers store the dir-relative
+    // entry name, actions_trigger_test.go:495).
+    const res = await get(`${SUITE}/actions/workflows/${encodeURIComponent(".gitea/workflows/notify.yml")}/runs`, "alice-token");
+    expect(res.status).toBe(404);
+    expect((await res.json<{ message: string }>()).message).toBe('workflow ".gitea/workflows/notify.yml" not found');
+  });
 });
 
 // ---------------------------------------------------------------------------

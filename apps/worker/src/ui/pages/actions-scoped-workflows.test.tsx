@@ -25,9 +25,11 @@
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { saveRepoSettings } from "../../api/services/repo-settings";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
 import { orgMembers, users } from "../../db/schema";
+import { toggleRepoActionsWorkflow } from "../../services/actions/config";
 import { scopedWorkflowSourcesStore } from "../../services/actions/scoped-workflow-sources";
 import { uiRouter, type UiAssetsFetcher } from "../index";
 import type { UiManifest } from "../manifest";
@@ -240,8 +242,8 @@ describe("parseScopedWorkflowFiles (ListScopedWorkflows + ParseScopedWorkflows)"
       }),
       REF,
     );
-    expect(files.map((f) => f.entryName).sort()).toEqual([".gitea/scoped_workflows/deploy.yml", ".gitea/scoped_workflows/nested/a.yml"]);
-    const deploy = files.find((f) => f.entryName === ".gitea/scoped_workflows/deploy.yml")!;
+    expect(files.map((f) => f.entryName).sort()).toEqual(["deploy.yml", "nested/a.yml"]);
+    const deploy = files.find((f) => f.entryName === "deploy.yml")!;
     expect(deploy.displayName).toBe("Deploy"); // WorkflowDisplayName's name: arm
     expect(deploy.events.map((e) => e.name)).toEqual(["push", "workflow_dispatch"]);
   });
@@ -255,7 +257,7 @@ describe("parseScopedWorkflowFiles (ListScopedWorkflows + ParseScopedWorkflows)"
       }),
       REF,
     );
-    expect(files.map((f) => f.entryName)).toEqual([".gitea/scoped_workflows/ok.yml"]); // the 1 MiB drop arm
+    expect(files.map((f) => f.entryName)).toEqual(["ok.yml"]); // the 1 MiB drop arm
   });
 
   it("skips a workflow whose YAML does not parse — the log-and-skip arm, the walk survives", async () => {
@@ -266,7 +268,7 @@ describe("parseScopedWorkflowFiles (ListScopedWorkflows + ParseScopedWorkflows)"
       }),
       REF,
     );
-    expect(files.map((f) => f.entryName)).toEqual([".gitea/scoped_workflows/good.yml"]);
+    expect(files.map((f) => f.entryName)).toEqual(["good.yml"]);
   });
 });
 
@@ -299,11 +301,11 @@ jobs:
 
 describe("listSourceScopedWorkflowInfos (listSourceScopedWorkflowFiles over the pure merge)", () => {
   // The config keys are the ENTRY-NAME space the page itself renders and
-  // posts back — the walk's path-spelled names (the landed trigger.ts
-  // listWorkflows convention), so live rows merge and only true orphans
-  // remain.
+  // posts back — the walk's DIR-RELATIVE names (the subtree ls-tree space,
+  // tree.go:132-145; the page's own write keys, scoped_workflows.go:330-341),
+  // so live rows merge and only true orphans remain.
   const configs: Record<string, ScopedWorkflowSourceRow["workflowConfigs"][string]> = {
-    ".gitea/scoped_workflows/deploy.yml": { required: true, patterns: ["coalition/demo: Deploy / build (push)"] },
+    "deploy.yml": { required: true, patterns: ["coalition/demo: Deploy / build (push)"] },
     "gone.yml": { required: false, patterns: ["legacy"] },
     "required-gone.yml": { required: true, patterns: ["still-gates"] },
     "nullish.yml": null,
@@ -317,7 +319,7 @@ describe("listSourceScopedWorkflowInfos (listSourceScopedWorkflowFiles over the 
     );
     expect(infos).toEqual([
       {
-        entryName: ".gitea/scoped_workflows/deploy.yml",
+        entryName: "deploy.yml",
         displayName: "Deploy",
         required: true, // the stored config merged in (:214-217)
         patterns: "coalition/demo: Deploy / build (push)", // the newline-joined store
@@ -347,7 +349,7 @@ describe("loadScopedWorkflowsPageData (ScopedWorkflows, :98-149)", () => {
   it("assembles the views in id order, skipping a source whose repo row is gone", async () => {
     const store = memoryStore([
       { ownerId: ORG_ID, sourceRepoId: "repo-missing", workflowConfigs: {} },
-      { ownerId: ORG_ID, sourceRepoId: "repo-1", workflowConfigs: { ".gitea/scoped_workflows/deploy.yml": { required: false, patterns: [] } } },
+      { ownerId: ORG_ID, sourceRepoId: "repo-1", workflowConfigs: { "deploy.yml": { required: false, patterns: [] } } },
     ]);
     const data = await loadScopedWorkflowsPageData(store, env.DB, () => treeReads({ ".gitea/scoped_workflows/deploy.yml": DEPLOY_WF }), {
       kind: "org",
@@ -358,7 +360,7 @@ describe("loadScopedWorkflowsPageData (ScopedWorkflows, :98-149)", () => {
     expect(data.sources).toHaveLength(1); // repo-missing skipped (the :129-133 continue)
     const view = data.sources[0];
     expect(view?.repo.fullName).toBe("coalition/demo");
-    expect(view?.infos[0]?.entryName).toBe(".gitea/scoped_workflows/deploy.yml");
+    expect(view?.infos[0]?.entryName).toBe("deploy.yml"); // the dir-relative entry name
     expect(view?.infos[0]?.required).toBe(false); // the config merged by the entry name
     expect(data.redirectLink).toBe("/coalition/settings/actions/scoped-workflows");
   });
@@ -473,21 +475,23 @@ describe("applyScopedWorkflowRequired (ScopedWorkflowSetRequired, :282-349)", ()
       ".gitea/scoped_workflows/b.yml": "on: push\njobs: {}\n",
       // gone.yml is NOT on the default branch — the orphan
     });
+    // the posted ids are the page's OWN dir-relative entry names
+    // (scoped_workflows.go:330-341's workflow_ids ← EntryName)
     const outcome = await applyScopedWorkflowRequired(store, env.DB, () => reads, scope, {
       repoId: "repo-1",
-      workflowIds: [".gitea/scoped_workflows/a.yml", ".gitea/scoped_workflows/b.yml", "gone.yml"],
-      requiredWorkflowIds: [".gitea/scoped_workflows/a.yml"],
+      workflowIds: ["a.yml", "b.yml", "gone.yml"],
+      requiredWorkflowIds: ["a.yml"],
       patternsByWorkflowId: {
-        ".gitea/scoped_workflows/a.yml": "p1\n\np2",
-        ".gitea/scoped_workflows/b.yml": "history",
+        "a.yml": "p1\n\np2",
+        "b.yml": "history",
         "gone.yml": "dropped?",
       },
     });
     expect(outcome).toEqual({ outcome: "saved" });
     const savedRow = store.rows[0];
     expect(savedRow?.workflowConfigs).toEqual({
-      ".gitea/scoped_workflows/a.yml": { required: true, patterns: ["p1", "p2"] }, // parsePatternLines' trim
-      ".gitea/scoped_workflows/b.yml": { required: false, patterns: ["history"] }, // the live unchecked keep (:339)
+      "a.yml": { required: true, patterns: ["p1", "p2"] }, // parsePatternLines' trim
+      "b.yml": { required: false, patterns: ["history"] }, // the live unchecked keep (:339)
       // gone.yml — the unchecked orphan DROPS (the only escapes are clearing
       // it here or removing the source, :224-226's comment).
     });
@@ -782,18 +786,19 @@ describe("the drizzle source store through the page arms (the store wave's integ
     expect(fresh.sources[0]?.repo.id).toBe("repo-1");
     expect(fresh.sources[0]?.infos[0]?.required).toBe(false);
 
-    // SetRequired persists the configs through the real JSON column — and
+    // SetRequired persists the configs through the real JSON column — the
+    // posted ids are the DIR-RELATIVE entry names (the F3 key space) — and
     // the GET assembly merges them back into the rendered row.
     expect(
       await applyScopedWorkflowRequired(store, env.DB, () => reads, scope, {
         repoId: "repo-1",
-        workflowIds: [".gitea/scoped_workflows/deploy.yml"],
-        requiredWorkflowIds: [".gitea/scoped_workflows/deploy.yml"],
-        patternsByWorkflowId: { ".gitea/scoped_workflows/deploy.yml": "coalition/demo: Deploy / build (push)" },
+        workflowIds: ["deploy.yml"],
+        requiredWorkflowIds: ["deploy.yml"],
+        patternsByWorkflowId: { "deploy.yml": "coalition/demo: Deploy / build (push)" },
       }),
     ).toEqual({ outcome: "saved" });
     expect((await store.getSource(ORG_ID, "repo-1"))?.workflowConfigs).toEqual({
-      ".gitea/scoped_workflows/deploy.yml": { required: true, patterns: ["coalition/demo: Deploy / build (push)"] },
+      "deploy.yml": { required: true, patterns: ["coalition/demo: Deploy / build (push)"] },
     });
     const saved = await loadScopedWorkflowsPageData(store, env.DB, () => reads, scope);
     expect(saved.sources[0]?.infos[0]?.required).toBe(true);
@@ -816,6 +821,54 @@ describe("the drizzle source store through the page arms (the store wave's integ
     expect(data.ownerId).toBe(0);
     expect(data.redirectLink).toBe("/-/admin/actions/scoped-workflows");
     expect(data.sources[0]?.repo.fullName).toBe("coalition/demo");
+  });
+});
+
+// --- the R1-F3 end-to-end pin -----------------------------------------------------
+//
+// The settings page writes the merge-gate configs keyed by the DIR-RELATIVE
+// entry name (scoped_workflows.go:330-341) and the consumer's toggle reads
+// the SAME bare space (config.ts's isScopedWorkflowRequired over
+// workflow.go:86) — the full-path key split meant a required flag set here
+// NEVER armed the consumer's scoped_required_cannot_disable refusal.
+
+describe("the settings page's required flag arms the consumer's refusal (the F3 pin)", () => {
+  it("applyScopedWorkflowRequired stores bare keys; toggleRepoActionsWorkflow refuses the disable", async () => {
+    const store = scopedWorkflowSourcesStore(env.DB);
+    await store.addSource(ORG_ID, "repo-1"); // coalition registers its own demo repo
+
+    // the settings-page save: required ci.yml, keyed by the page's own
+    // entry name
+    const outcome = await applyScopedWorkflowRequired(
+      store,
+      env.DB,
+      () => treeReads({ ".gitea/scoped_workflows/ci.yml": "on: push\njobs: {}\n" }),
+      { kind: "org", ownerId: ORG_ID, orgLink: "/coalition" },
+      {
+        repoId: "repo-1",
+        workflowIds: ["ci.yml"],
+        requiredWorkflowIds: ["ci.yml"],
+        patternsByWorkflowId: { "ci.yml": "coalition/demo: CI / build (push)" },
+      },
+    );
+    expect(outcome).toEqual({ outcome: "saved" });
+    // the persisted keys are BARE (scoped_workflows.go:340's
+    // configs[workflowID] over the EntryName form ids)
+    expect((await store.getSource(ORG_ID, "repo-1"))?.workflowConfigs).toEqual({
+      "ci.yml": { required: true, patterns: ["coalition/demo: CI / build (push)"] },
+    });
+
+    // the consumer's disable of the scoped workflow REFUSES — the required
+    // lookup on the bare key now hits (view.go:1338-1344's
+    // IsScopedWorkflowRequired JSONError arm)
+    await saveRepoSettings(env.DB, "repo-1", { hasActions: true }, new Date(0));
+    expect(
+      await toggleRepoActionsWorkflow(env.DB, "repo-1", ORG_ID, {
+        workflowId: "ci.yml",
+        isEnable: false,
+        scopedWorkflowSourceRepoId: "repo-1",
+      }),
+    ).toBe("scoped-required");
   });
 });
 

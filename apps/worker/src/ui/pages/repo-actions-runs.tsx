@@ -744,8 +744,9 @@ export async function loadRepoActionsRunsData(input: RepoActionsRunsInput): Prom
         .filter((id) => id !== "" && !(id in workflowNames))
         .sort();
 
-  // The scoped param's zero-reduction (scopedSourceRepoParam): ""/"0" is the
-  // repo-level arm — exactly upstream's FormInt64 parsed 0 (actions.go:629).
+  // The scoped param's zero-reduction (scopedSourceRepoParam): ""/"0" and any
+  // leading "-" are the repo-level arm — upstream's FormInt64 parse with the
+  // isScoped := > 0 arm (actions.go:629, workflow.go:79).
   const scopedSourceId = scopedSourceRepoParam(query.scopedWorkflowSourceRepoId);
 
   let runRows: RunRow[];

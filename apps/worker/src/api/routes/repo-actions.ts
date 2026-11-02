@@ -1,7 +1,7 @@
 import { createRoute, z } from "@hono/zod-openapi";
 import type { OpenAPIHono } from "@hono/zod-openapi";
 import type { Context, MiddlewareHandler } from "hono";
-import { and, asc, count, desc, eq, inArray, like, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { parse as yamlParse, stringify as yamlStringify } from "yaml";
 
@@ -795,8 +795,10 @@ async function defaultBranchWorkflows(
 
 /**
  * GetActionWorkflow (convert.go:672-679) + getActionWorkflowFromCommit
- * (:712-724): the entry by name (entry.Name() == workflowID) with its
- * content read; `null` = the `workflow %q not found` arm.
+ * (:712-724): the entry by name (entry.Name() == workflowID — convert.go:705,
+ * the EXACT dir-relative name; a path-spelled id misses the same way
+ * upstream's does) with its content read; `null` = the
+ * `workflow %q not found` arm.
  */
 async function findWorkflowEntry(
   reads: ReturnType<typeof engineReads>,
@@ -804,10 +806,9 @@ async function findWorkflowEntry(
   workflowId: string,
 ): Promise<{ commitOid: string; authorWhen: Date; entry: WorkflowEntry; content: string } | null> {
   const at = await defaultBranchWorkflows(reads, pair);
-  const wanted = baseSegment(workflowId);
   if (at.entries === null) return null;
   for (const entry of at.entries) {
-    if (entry.name !== wanted) continue;
+    if (entry.name !== workflowId) continue;
     const blob = await reads.readBlob(at.commitOid, `${entry.dir}/${entry.name}`);
     if (blob === null) continue;
     return { commitOid: at.commitOid, authorWhen: at.authorWhen, entry, content: new TextDecoder().decode(blob.data) };
@@ -2328,12 +2329,14 @@ export function registerRepoActionsRoutes(
       const scopedRaw = url.searchParams.get("scoped_workflow_source_repo_id") ?? "0";
       const scopedId = /^\d+$/.test(scopedRaw) ? Number.parseInt(scopedRaw, 10) : 0;
 
-      // The store id match: upstream compares `workflow_id = ?` exactly; the
-      // landed producers wrote PATH-spelled ids (the repo-actions-workflow
-      // module's divergence note) — both spellings match, upstream's bare
-      // name stays the primary arm.
-      const storeId = baseSegment(workflowId);
-      const workflowMatch = or(eq(actionRuns.workflowId, storeId), like(actionRuns.workflowId, `%/${storeId}`));
+      // The store id match: upstream passes the RAW path param to
+      // FindRunOptions.WorkflowID and the ToConds arm is an exact Eq
+      // (run_list.go:101-103) — no spelling bridge exists upstream because
+      // producers store the dir-relative entry name (workflows.go:214/223's
+      // EntryName; actions_trigger_test.go:495's "createdelete.yml" pin).
+      // The trigger producer emits that same bare space (the R1-F1 fix), so
+      // the landed like()-over-path-spelled-rows bridge is retired.
+      const workflowMatch = eq(actionRuns.workflowId, workflowId);
 
       // The existence probe (action.go:1009-1032): existing runs prove the
       // workflow valid — historical files list without a git lookup; a
@@ -2555,9 +2558,9 @@ export function registerRepoActionsRoutes(
       }
       const url = new URL(c.req.url);
       // The scoped source param rides RAW — dispatchActionWorkflow normalizes
-      // through scopedSourceRepoParam (the TEXT source id verbatim; ""/"0" =
-      // the repo-level arm; the module header's THE SCOPED DISPATCH TWIN
-      // note).
+      // through scopedSourceRepoParam (the TEXT source id verbatim; ""/"0"
+      // and any leading "-" = the repo-level arm, workflow.go:79's
+      // isScoped := > 0; the module header's THE SCOPED DISPATCH TWIN note).
       const scopedRaw = url.searchParams.get("scoped_workflow_source_repo_id") ?? "";
 
       const viewer = viewerOf(c);
