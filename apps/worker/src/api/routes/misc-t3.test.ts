@@ -106,9 +106,18 @@ beforeEach(async () => {
 const ED25519_KEY =
   "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICQgLhusngED6SvOcMDWHg9wVjgOJ4QTN77gPol4OtTU ed25519-comment user@host";
 const ED25519_FINGERPRINT = "SHA256:nBIbxZfae58Hod5zlVgetQGtfn2OhEymkNryw9sEXR8";
+// The 3072-bit floor: MinimumKeySizes accepts rsa only at >= AsymKeyMinBitsRsa
+// (3071, consts/asymkey.go:7) — the pre-3072 default 2048-bit keys 422 at the
+// minimum-key-size gate (ssh_key_parse.go:180-204), so the fixture must clear it.
 const RSA_KEY =
-  "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC3sBogtkFTvHdp6XkAThDF9Xqbfri5C/mGWrH4vnwBhnWFULjS5Kcu9Sk1Rz0FsCvnsEG9Fnbkaq9g28Wv7QZZsWmkC+UfvSoMVIt3koKLYwweRv3do/TzL/2KT5BBGTSCUGeotpkP8znF3fK6xi7A7zf9cBzfL8P2tNnLR+XqgGfVuRFjVXd2wjjtpEhOHLK4BIncKpoI6TgIHwFayxH+DrNQDTjpCw7NWef5jsstb0ICBRQti5QNc+uYm1qQPDTsZ8ZlljnOxy/4Au6aPXpq2jUHQWfBFy+IrVeVEoGIacrBMK5aAjS/aHDIKDVql0km8r8BMFlfNDD/Lff5v59f";
-const RSA_FINGERPRINT = "SHA256:I5plbz5CJDzZiBSGXjZBVDpAS8c0FI3jzxrjbQSfaaU";
+  "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDCuwk92zuCZ5a66BpLWzhdB1DWkG/EBQ6LJou/4G9HD5xVMqR8suSHfXqIN4LyWK2uEGYkiHuThcbjKtic0ZcqnhNsyJtzIG3PBxHW9b731gTFjFcQOiCp57Zyh59XBUnqGsNQpDj1UHy0SHZJY4HejShPw9DHqH7mqDuaLNCDbvYB7+Y8HAEM5P057tQlu3u11pa02s856YZLxjs9nxQs41hscCo6Vi/AsIJN7qFA+UF6zhTTwtSSyZdBwawKWK7Y17vzDV1Hu8nV5eOY1bEPuOA8e0EykC0Jit7ktPuiY8PzMmTneSSkhmuXQbibuEuZFrAb8qxKyCUPVPHX2PzNUvGz+Bo1EdbITlVwE3lrq2lUU6y5yet5dW3sbwmfUAf7MsMvhKriOm2ifJE44/ALE58OqIUOzQgAy/gDkFQ8WwKRCBt27meQqPmhbU5MfmkkjWD2V39Mw3Mi/y4uu1OY3C3JbQ5/bvsI/01N7fFyuVme/1L4sEmfmbWdX7OypoE=";
+const RSA_FINGERPRINT = "SHA256:oK+IaishpnoElZFFjuzQUE2JPS8h+NEQPVIs6bY6imI";
+// Below the floor / off the allowlist (generated at authoring time): the
+// 1024-bit modulus misses the 3071 floor; dsa has no MinimumKeySizes entry.
+const RSA1024_KEY =
+  "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQDSJ0mzSbBXSJmq8hAHHJOEZ9qnOVO7lEBj2mzb2TVfDhZzUs+webtOaB650gH8R5wNSb4wq5RwITqXfnF6wZghhXgD2Hu1esODrlV+7AOY2kOGw99Bb2mlADeXO91PHyBHblL/l2CxeA+s/bdxL7ioEeYgObfqGMohTSXY4G08Yw==";
+const DSA_KEY =
+  "ssh-dss AAAAB3NzaC1kc3MAAACBANziQoXJkUWmwoVkU1w8otc+LG8Gyit5TKIs3bz8yHgTdDwe2rUC9r3Pkf/BKAAm+7EilJG3Ls5jPCxMQ2lLSsTLUaFEUtVhfe66tPZR/uzrXMYF3rT6ly5c/nmOn8jQDukiUceXe8dEHCFpuLqqVkZB2IhiElHGWkvLcjbArYY5AAAAFQDy2cIqRwRH/qXk9NLDjOayEWUcAwAAAIALZ3x/CJ4+FlpC98yi/WJIQrWKnAivn+bLGODZtxjlrWCGym8BWeUx326afjKVaVd9yWo6xQhbJwphc8feEjF+awNJaZcz3cCpB0/3lfTCylfbkHbs20jQ7U+W5lg2cj2R+rjlLl7AaV4Gw4SsSb2cSD71rvZotbZu5U8g1VDmpQAAAIAZT5Cniy6XyoGVH3Wx+O8Q64gRgF6uUUyFkCS+iiZpfaEooEAjTXsT6vDcJ9OS54oMLMS9wnVuMM1OqS7Uu35tCu9TpfzibwjCXFTPzBledfk7QH4XPwqa3LB08EcmEl+PYIUCqECvRb/QBFOtPIlWqrSxkM+/i3VFdeNNiLltXQ==";
 
 /** gpg --batch RSA key, identity <gpg-match@example.com>. */
 const GPG_MATCH = `-----BEGIN PGP PUBLIC KEY BLOCK-----
@@ -457,6 +466,29 @@ describe("POST /user/keys (misc-t3)", () => {
       expect(missing.status).toBe(422);
     }
     expect((await miscSend("/user/keys", authed({ method: "POST" }))).status).toBe(422);
+  });
+
+  it("enforces the minimum-key-size gate at upstream's defaults (ssh_key_parse.go:180-204)", async () => {
+    // MinimumKeySizeCheck defaults TRUE (setting/ssh.go:55): a 1024-bit rsa
+    // modulus misses the 3071 floor (consts/asymkey.go:7).
+    const small = await miscSend("/user/keys", authed(json({ title: "k", key: RSA1024_KEY }, { method: "POST" })));
+    expect(small.status).toBe(422);
+    expect((await small.json<Record<string, unknown>>()).message).toBe(
+      "Invalid key content: key length is not enough: got 1024, needs 3071",
+    );
+
+    // dsa parses but has no MinimumKeySizes entry — the allowlist miss.
+    const dsa = await miscSend("/user/keys", authed(json({ title: "k", key: DSA_KEY }, { method: "POST" })));
+    expect(dsa.status).toBe(422);
+    expect((await dsa.json<Record<string, unknown>>()).message).toBe(
+      "Invalid key content: key type is not allowed: dsa",
+    );
+
+    // The floor is inclusive at the listed sizes: 3072-bit rsa and ed25519
+    // still create (the happy-path POSTs above pin ed25519 at 201).
+    const floor = await miscSend("/user/keys", authed(json({ title: "floor", key: RSA_KEY }, { method: "POST" })));
+    expect(floor.status).toBe(201);
+    expect((await floor.json<Record<string, unknown>>()).fingerprint).toBe(RSA_FINGERPRINT);
   });
 });
 

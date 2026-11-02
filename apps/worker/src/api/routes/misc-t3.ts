@@ -85,9 +85,13 @@ import type { ParsedGpgEntity, ParsedSshKey } from "../../services/ssh-gpg-keys"
  *   unpadded-std-base64(sha256(blob)) (ssh_key_fingerprint.go:42-48). NOT
  *   implemented (each → 422 `Invalid key content: …`): the SSH2/RFC4716
  *   headered format and PEM PKIX conversion arms of parseKeyString
- *   (ssh_key_parse.go:87-130), and minimum-key-size checks
- *   (setting.SSH.MinimumKeySizeCheck is instance config; cf-gitea runs
- *   defaults-off upstream, ssh_key_parse.go:182). Upstream's exact Go error
+ *   (ssh_key_parse.go:87-130). The minimum-key-size gate IS implemented at
+ *   upstream's DEFAULTS: CheckPublicKeyString's tail (ssh_key_parse.go:
+ *   180-204) runs with MinimumKeySizeCheck true (setting/ssh.go:55) and the
+ *   MinimumKeySizes map (setting/ssh.go:56 ← consts/asymkey.go:7-8) —
+ *   rsa ≥3071 bits, the other listed types 256, unlisted types → "key type
+ *   is not allowed: <name>" — owned by the shared parser
+ *   (services/ssh-gpg-keys.ts checkSshKeyMinSize). Upstream's exact Go error
  *   strings after `Invalid key content: ` are runtime internals (the %v tail
  *   diverges); statuses and the prefix match.
  *

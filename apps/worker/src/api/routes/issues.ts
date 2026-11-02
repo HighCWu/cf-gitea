@@ -119,7 +119,10 @@ import {
  * extended by this batch):
  *   - POST issues:                  400 (invalid due_date format — upstream
  *                                   ApplyAPIDeadlineTimestamp "invalid date
- *                                   format: X"; undeclared in the contract)
+ *                                   format: X"; undeclared in the contract;
+ *                                   the parse rides the create arm's writer
+ *                                   gate, so only a WRITER's bad due_date can
+ *                                   reach it — issue.go:606-622)
  *   - PATCH issues/{index}:         409 (stale content_version CAS — upstream
  *                                   EditIssue → StatusConflict "the issue is
  *                                   already changed"), 400 (invalid due_date;
@@ -1178,12 +1181,23 @@ export function registerIssueRoutes(
       const requester = c.get("authUser");
       const event = issueEventContext(c, found);
 
+      // The create arm resolves the writer ladder BEFORE applying any
+      // writer-gated field (issue.go:606-622 CanWrite(unit.TypeIssues)):
+      // the deadline, milestone and assignees ride the writer branch only,
+      // while a NON-writer's labels are silently cleared and the issue STILL
+      // creates (201) — just without those fields. (Upstream also nils
+      // form.Projects in the same else-arm; this route has no projects
+      // surface yet, so there is nothing to clear for it.)
+      const canWrite = await canWriteRepository(c, found);
+
       // Writer-gated deadline (upstream gates on CanWrite(TypeIssues); the
       // token identity stands in for the ACL matrix). ApplyAPIDeadlineTimestamp
-      // port — 400 "invalid date format" on bad input (runtime-only status).
+      // port — 400 "invalid date format" on bad input (runtime-only status);
+      // the parse rides the gate, so a non-writer's due_date is dropped
+      // before it can fail (issue.go:608-610).
       let deadlineAt: Date | null = null;
       const rawDueDate = patchField(form.due_date);
-      if (rawDueDate !== undefined && rawDueDate !== "") {
+      if (canWrite && rawDueDate !== undefined && rawDueDate !== "") {
         deadlineAt = parseMilestoneDeadline(rawDueDate);
       }
 
@@ -1205,8 +1219,13 @@ export function registerIssueRoutes(
           title: form.title,
           content: form.body ?? null,
           posterId: requester.id,
-          milestoneId: form.milestone === undefined || form.milestone === 0 ? null : form.milestone,
-          labelIds: form.labels ?? [],
+          // issue.go:612/619-621: the milestone applies only behind
+          // CanWrite, and a non-writer's form.Labels is cleared to the
+          // empty list before NewIssue ever sees it (so unknown ids are
+          // never validated for a non-writer — no 404, just dropped).
+          milestoneId:
+            canWrite && form.milestone !== undefined && form.milestone !== 0 ? form.milestone : null,
+          labelIds: canWrite ? (form.labels ?? []) : [],
           ref: form.ref ?? "",
         });
       } catch (error) {

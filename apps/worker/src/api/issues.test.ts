@@ -408,9 +408,11 @@ describe("POST /repos/{owner}/{repo}/issues (issueCreateIssue)", () => {
     expect(body.id).toBeTypeOf("number");
   });
 
-  it("attaches labels and the milestone by id and stores the deadline", async () => {
+  it("attaches labels and the milestone by id and stores the deadline for a WRITER poster (issue.go:608-615)", async () => {
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    // The writer branch of the create arm's CanWrite(TypeIssues) ladder —
+    // the stub token rides the write-mode collaborator row.
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     const labelId = await seedLabel(repoId, "bug");
     const milestoneId = await seedMilestone(repoId, "v1");
 
@@ -425,6 +427,35 @@ describe("POST /repos/{owner}/{repo}/issues (issueCreateIssue)", () => {
     expect(body.milestone?.id).toBe(milestoneId);
     // ApplyAPIDeadlineTimestamp: end of that calendar day (UTC).
     expect(body.due_date).toBe("2030-01-02T23:59:59.000Z");
+  });
+
+  it("SILENTLY DROPS the writer-gated fields for a non-writer poster — 201 with no labels/milestone/deadline (issue.go:619-621)", async () => {
+    // No stubWriter: the poster is a plain reporter on the public repo —
+    // upstream's else-arm clears form.Labels (and Projects) and skips the
+    // milestone/deadline arms; the issue still creates, the fields just
+    // never apply. The unknown ids are never validated (no 404) and a
+    // malformed due_date never reaches ApplyAPIDeadlineTimestamp (no 400) —
+    // the whole ladder sits behind CanWrite.
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const labelId = await seedLabel(repoId, "bug");
+    const milestoneId = await seedMilestone(repoId, "v1");
+
+    const res = await router()("/repos/Alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        title: "created by a reader",
+        labels: [labelId, 7777],
+        milestone: milestoneId,
+        due_date: "not-a-date",
+      }),
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json<{ labels: Array<{ id: number }>; milestone: { id: number } | null; due_date: string | null }>();
+    expect(body.labels).toEqual([]);
+    expect(body.milestone).toBeNull();
+    expect(body.due_date).toBeNull();
   });
 
   it("creates closed when form.closed is set (open webhook, then closed)", async () => {
@@ -551,7 +582,9 @@ describe("POST /repos/{owner}/{repo}/issues (issueCreateIssue)", () => {
 
   it("422s a missing title (bind) and 404s unknown milestone/label ids", async () => {
     const owner = await seedUser("Alice");
-    const repoId = await seedRepo(owner.usernameLower, "visible");
+    // The 404 arms ride the WRITER path — a non-writer's milestone/label ids
+    // are dropped before NewIssue validates them (issue.go:619-621).
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
 
     const noTitle = await router()("/repos/Alice/visible/issues", {
       method: "POST",

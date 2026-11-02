@@ -13,6 +13,13 @@
  * structurally validated (the decoded blob must be a well-formed SSH wire
  * string sequence whose first field names the declared type), with the
  * upstream length caps (maxKeyBinaryBytes 4096 → 5461 base64 chars). The
+ * minimum-key-size gate IS ported at upstream's DEFAULTS:
+ * CheckPublicKeyString's tail (ssh_key_parse.go:180-204) runs with
+ * MinimumKeySizeCheck true (setting/ssh.go:55) and the MinimumKeySizes map
+ * (setting/ssh.go:56 ← consts/asymkey.go:7-8) — rsa ≥3071 bits (bitlen of
+ * the modulus), every other listed type at the 256-bit floor its lengths
+ * always meet, any unlisted type (dsa among them) → "key type is not
+ * allowed: <name>" (checkSshKeyMinSize below). The
  * fingerprint is upstream's `ssh.FingerprintSHA256` — "SHA256:" +
  * unpadded-std-base64(sha256(blob)) (ssh_key_fingerprint.go:42-48). NOT
  * ported: the SSH2/PEM arms (rejected up front) and Go's exact non-subset
@@ -106,6 +113,80 @@ async function sshFingerprint(blob: Uint8Array): Promise<string> {
  *  maxKeyContentBase64Bytes (4096 * 4 / 3). */
 const SSH_MAX_KEY_BASE64_BYTES = 5461;
 
+/** CheckPublicKeyString's minimum-key-size floor for rsa
+ *  (setting/ssh.go:56 MinimumKeySizes ← consts/asymkey.go:7
+ *  AsymKeyMinBitsRsa = 3071 — 3072-1 tolerating the leading zero). The map's
+ *  other floor, AsymKeyMinBitsEC = 256 (:8), never participates in a
+ *  comparison here: every non-rsa type SSHNativeParsePublicKey's switch
+ *  recognizes reports a length ≥ 256 (ed25519 and the sk pairs a flat 256,
+ *  the ecdsa curves 256/384/521), so their `length >= minLen` check can only
+ *  pass — only rsa can be undersized. */
+const SSH_MIN_BITS_RSA = 3071;
+
+/** Go big.Int.BitLen over an SSH wire mpint: leading zero bytes carry no
+ *  significance, and the all-zero (or absent) integer is bit length 0. */
+function mpintBitLen(mpint: Uint8Array): number {
+  let start = 0;
+  while (start < mpint.length && mpint[start] === 0) {
+    start += 1;
+  }
+  if (start === mpint.length) {
+    return 0;
+  }
+  return (mpint.length - start - 1) * 8 + (32 - Math.clz32(mpint[start]!));
+}
+
+/**
+ * CheckPublicKeyString's minimum-key-size / type-allowlist tail
+ * (models/asymkey/ssh_key_parse.go:180-204), which runs by DEFAULT
+ * (setting.SSH.MinimumKeySizeCheck: true, setting/ssh.go:55). The lookup
+ * keys on SSHNativeParsePublicKey's normalized names — its switch
+ * (ssh_key_parse.go:226-258) maps the wire type strings to (name, length):
+ * rsa → bitlen(N) with its 3071 floor, dsa → bitlen(P) but the
+ * MinimumKeySizes map never lists it, and the ecdsa curves, ed25519 and the
+ * sk pairs map to always-passing lengths (see SSH_MIN_BITS_RSA). A wire type
+ * OUTSIDE the switch — an unknown algorithm — never had a map entry either,
+ * so both misses surface as upstream's map-miss spelling
+ * "key type is not allowed: <name>"; an undersized rsa answers
+ * "key length is not enough: got N, needs 3071".
+ */
+function checkSshKeyMinSize(
+  wireType: string,
+  material: Uint8Array[],
+  invalid: (detail: string) => SshKeyParseError,
+): void {
+  switch (wireType) {
+    case "ssh-rsa": {
+      // The rsa wire body is (E, N); SSHNativeParsePublicKey reports
+      // bitlen(N) (ssh_key_parse.go:241-246).
+      if (material.length < 2) {
+        throw invalid("invalid ssh public key: malformed key blob");
+      }
+      const length = mpintBitLen(material[1]!);
+      if (length < SSH_MIN_BITS_RSA) {
+        throw invalid(`key length is not enough: got ${length}, needs ${SSH_MIN_BITS_RSA}`);
+      }
+      return;
+    }
+    case "ssh-dss":
+      // SSHNativeParsePublicKey computes bitlen(P) for dsa, but the
+      // MinimumKeySizes map has no entry — the map miss rejects any size
+      // (ssh_key_parse.go:203-204).
+      throw invalid("key type is not allowed: dsa");
+    case "ecdsa-sha2-nistp256":
+    case "ecdsa-sha2-nistp384":
+    case "ecdsa-sha2-nistp521":
+    case "ssh-ed25519":
+    case "sk-ecdsa-sha2-nistp256@openssh.com":
+    case "sk-ssh-ed25519@openssh.com":
+      // Mapped to lengths ≥ their 256 floor — the comparison always passes.
+      return;
+    default:
+      // Outside SSHNativeParsePublicKey's switch: no MinimumKeySizes entry.
+      throw invalid(`key type is not allowed: ${wireType}`);
+  }
+}
+
 /** Go strings.SplitN: the last part carries the unsplit remainder. */
 function goSplitN(content: string, separator: string, n: number): string[] {
   const parts = content.split(separator);
@@ -123,10 +204,11 @@ export interface ParsedSshKey {
 }
 
 /**
- * Structural OpenSSH public key validation + SHA-256 fingerprint. Throws the
- * detail-only SshKeyParseError on any violation (upstream
- * HandleCheckKeyStringError's "Invalid key content: …" family — the consumer
- * supplies the prefix/status; see the error contract above).
+ * Structural OpenSSH public key validation + SHA-256 fingerprint + the
+ * minimum-key-size gate. Throws the detail-only SshKeyParseError on any
+ * violation (upstream HandleCheckKeyStringError's "Invalid key content: …"
+ * family — the consumer supplies the prefix/status; see the error contract
+ * above).
  */
 export async function parseSshPublicKey(raw: string): Promise<ParsedSshKey> {
   let content = raw.trim();
@@ -179,17 +261,22 @@ export async function parseSshPublicKey(raw: string): Promise<ParsedSshKey> {
   // (a real key carries at least one material field).
   let offset = afterType;
   let fields = 0;
+  const material: Uint8Array[] = [];
   while (offset < blob.length) {
     const next = readString(offset);
     if (next === null) {
       throw invalid("invalid ssh public key: malformed key blob");
     }
+    material.push(blob.subarray(offset + 4, next[1]));
     offset = next[1];
     fields += 1;
   }
   if (fields === 0) {
     throw invalid("invalid ssh public key: empty key blob");
   }
+  // CheckPublicKeyString's minimum-key-size gate runs AFTER the structural
+  // parse (ssh_key_parse.go:180-204) — the add-time rejection order.
+  checkSshKeyMinSize(wireType, material, invalid);
   const stored = parts.length === 1 ? `${wireType} ${base64Key}` : [declaredType, base64Key, comment].filter((p) => p !== "").join(" ");
   return { content: stored.trim(), fingerprint: await sshFingerprint(blob) };
 }
