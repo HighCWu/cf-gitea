@@ -23,6 +23,7 @@ import {
 } from "../../auth/errors";
 import { scopeStringSlice } from "../../auth/scopes";
 import { loadSubkeys, toApiGpgKey } from "../services/account-keys";
+import { emitAccessTokenAudit } from "../../services/oauth2/audit-arms";
 import { canWriteRepository } from "../services/repo-access";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
@@ -1059,6 +1060,17 @@ export function registerAccountAggregatesRoutes(app: OpenAPIHono<ApiEnv>, requir
         // scope yet — the documented deferral (module header).
       })
       .catch(mintErrorToApiError);
+    // audit.Record(ctx, UserAccessTokenAdd) — ctx.ContextUser as owner, the
+    // doer as actor (app.go:156 over applications.go:133's template).
+    await emitAccessTokenAudit(c.env.DB, {
+      userId: target.id,
+      tokenName: minted.name,
+      tokenScope: minted.scopes,
+      verb: "add",
+      origin: "api",
+      actor: { id: doer.id ?? 0, username: doer.login ?? target.username },
+      actorCredential: `access-token:${String(minted.id)}`,
+    });
     return c.json(
       {
         id: minted.id,
@@ -1100,6 +1112,17 @@ export function registerAccountAggregatesRoutes(app: OpenAPIHono<ApiEnv>, requir
       // the NewNotExistErrorf text (models/auth).
       throw new ApiError(404, `access token does not exist [id: ${tokenId}]`);
     }
+    // audit.Record(ctx, UserAccessTokenRemove) — app.go:231 over
+    // applications.go:162's template (the arm loads the name if the id-form
+    // deleted it; the name-form carry is the tokenParam).
+    await emitAccessTokenAudit(c.env.DB, {
+      userId: target.id,
+      tokenName: goParseIntBase0(tokenParam) === 0 ? tokenParam : `#${String(tokenId)}`,
+      verb: "remove",
+      origin: "api",
+      actor: { id: doer.id ?? 0, username: doer.login ?? target.username },
+      actorCredential: `access-token:${tokenParam}`,
+    });
     return c.body(null, 204);
   });
 

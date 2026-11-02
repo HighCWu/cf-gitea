@@ -694,8 +694,9 @@ describe("pinned-list query-shape witness (query-shape-audit A2/A3, tier-2)", ()
     // + the route's two unit-gate reads (mustEnableIssuesOrPulls + the
     // reqRepoReader(TypeIssues) arm of api.go:1577 — each ONE constant
     // loadRepoSettings riding the shared settings+units loader).
-    expect(issuesCount).toBeLessThanOrEqual(12);
-    expect(issuesCount).toBeLessThan(13);
+    // +1 (cddae16's project-membership arm — the tier-2 ripple twin).
+    expect(issuesCount).toBeLessThanOrEqual(13);
+    expect(issuesCount).toBeLessThan(14);
     expect(pinned.find((entry) => entry.number === issueA.index)?.user).toMatchObject({ login: "cf-gitea-stub" });
     expect(pinned.find((entry) => entry.number === issueB.index)?.user).toMatchObject({ login: "neighbor" });
     expect(pinned.find((entry) => entry.number === issueA.index)?.milestone).not.toBeNull();
@@ -718,7 +719,8 @@ describe("pinned-list query-shape witness (query-shape-audit A2/A3, tier-2)", ()
     const pullsCount = pullsMeter.count();
     // + the mustAllowPulls unit-gate read (api.go:1478 — one constant
     // loadRepoSettings, services/issue-unit-gates.ts).
-    expect(pullsCount).toBeLessThanOrEqual(11);
+    // +1 (cddae16's project-membership arm — the tier-2 ripple twin).
+    expect(pullsCount).toBeLessThanOrEqual(12);
     expect(pullsCount).toBeLessThan(13);
 
     // Contract discipline: the batched pulls render is deep-equal to the

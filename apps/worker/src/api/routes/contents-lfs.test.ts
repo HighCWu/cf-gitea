@@ -130,11 +130,11 @@ describe("GET /repos/{owner}/{repo}/raw (GetRawFileOrLFS — the ⑳ L2 pins)", 
 describe("the file view's LFS render (the ⑳ L3 pin — view.go:104-123's swap)", () => {
   it("the loader swaps the pointer for the OBJECT content when lfsEnv is threaded", async () => {
     const { loadFileViewData } = await import("../../ui/pages/file-view");
-    const { engineReads } = await import("../services/engine");
+    const { engineClient } = await import("../../ui/engine");
     const row = await drizzle(env.DB).select().from(repositories).where(eq(repositories.slug, SLUG)).get();
     if (row === undefined) throw new Error("repo row missing");
     const repo = { ownerNamespace: OWNER, slug: SLUG, defaultBranch: "main", id: row.id, storageKey: row.storageKey };
-    const data = await loadFileViewData(engineReads(env, repo), repo, ORIGIN, "branch/main/asset.bin", env);
+    const data = await loadFileViewData(engineClient(env, `${OWNER}/${SLUG}`) as never, repo, ORIGIN, "branch/main/asset.bin", env);
     if (!("kind" in data) || data.kind !== "blob") throw new Error("expected blob view data");
     const rendered = JSON.stringify(data);
     expect(rendered).toContain("the actual stored LFS payload");
@@ -143,11 +143,11 @@ describe("the file view's LFS render (the ⑳ L3 pin — view.go:104-123's swap)
 
   it("the loader keeps the pointer text when the meta row is absent (view.go:104-110's badge arm)", async () => {
     const { loadFileViewData } = await import("../../ui/pages/file-view");
-    const { engineReads } = await import("../services/engine");
+    const { engineClient } = await import("../../ui/engine");
     const row = await drizzle(env.DB).select().from(repositories).where(eq(repositories.slug, SLUG)).get();
     if (row === undefined) throw new Error("repo row missing");
     const repo = { ownerNamespace: OWNER, slug: SLUG, defaultBranch: "main", id: row.id, storageKey: row.storageKey };
-    const data = await loadFileViewData(engineReads(env, repo), repo, ORIGIN, "branch/main/ghost.bin", env);
+    const data = await loadFileViewData(engineClient(env, `${OWNER}/${SLUG}`) as never, repo, ORIGIN, "branch/main/ghost.bin", env);
     if (!("kind" in data) || data.kind !== "blob") throw new Error("expected blob view data");
     const rendered = JSON.stringify(data);
     expect(rendered).toContain("git-lfs.github.com/spec");

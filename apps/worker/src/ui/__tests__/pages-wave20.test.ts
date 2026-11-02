@@ -359,7 +359,7 @@ describe("GET /{owner}/{repo}/releases (the list)", () => {
   it("renders the attachment row with the landed asset URL", async () => {
     const res = await fetchUi("/alice/wave20rel/releases");
     const html = await res.text();
-    expect(html).toContain('download="" href="https://test.local/attachments/w20-asset-0001-fixed"');
+    expect(html).toContain('download="" href="https://test.local/alice/wave20rel/releases/download/w20-v1/w20-v1.zip"');
     expect(html).toContain("<span class=\"gt-ellipsis\">w20-v1.zip</span>");
     expect(html).toContain("<span class=\"tw-pl-5\">1.5 kiB</span>");
     expect(html).toContain("svg octicon-package");
@@ -438,7 +438,7 @@ describe("GET /{owner}/{repo}/releases/tag/{tag}", () => {
     expect(html).toContain('href="/alice/wave20rel/releases/tag/w20-v1"');
     expect(html).toContain('href="/alice/wave20rel/src/tag/w20-v1"');
     expect(html).toContain("<strong>seed</strong>");
-    expect(html).toContain('download="" href="https://test.local/attachments/w20-asset-0001-fixed"');
+    expect(html).toContain('download="" href="https://test.local/alice/wave20rel/releases/download/w20-v1/w20-v1.zip"');
     // The single-entry page: exactly one release-entry.
     expect(html.split('class="release-entry"').length - 1).toBe(1);
   });
@@ -475,8 +475,10 @@ describe("GET /{owner}/{repo}/releases/tag/{tag}", () => {
       isTag: true,
       now: new Date((T0 + 130) * 1000),
     });
+    // R12 (e95ce33): the tag-only record RENDERS the single-tag page
+    // (PageIsSingleTag, release.go:303-339) — was the family's 404.
     const tagOnly = await fetchUi("/alice/wave20rel/releases/tag/w20-tagonly");
-    expect(tagOnly.status).toBe(404);
+    expect(tagOnly.status).toBe(200);
   });
 });
 

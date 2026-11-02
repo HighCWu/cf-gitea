@@ -278,11 +278,12 @@ describe("tags page /{owner}/{repo}/tags", () => {
     expect(html).toContain("2 Tags</h3>");
     // The release-backed tag links onto the release detail (upstream's
     // canReadReleases arm — the row exists) and carries the Detail link;
-    // the tag-only tag falls to upstream's OWN else-arm target (the landed
-    // release detail 404s tag-only rows — the module header).
+    // the tag-only tag links onto the SINGLE-TAG page since R12 (e95ce33 —
+    // /releases/tag/{tag} renders PageIsSingleTag for tag-only records,
+    // release.go:303-339; was the release family's 404, and the row's link
+    // rode the src/tag else-arm).
     expect(html).toContain('href="/wave25-owner/labeled/releases/tag/v1.0.0"');
-    expect(html).not.toContain('href="/wave25-owner/labeled/releases/tag/v2.0.0-rc"');
-    expect(html).toContain('href="/wave25-owner/labeled/src/tag/v2.0.0-rc"');
+    expect(html).toContain('href="/wave25-owner/labeled/releases/tag/v2.0.0-rc"');
     expect(html).toContain("Detail");
     // The commit links resolve to the seeded tips (short-sha line, full oid
     // in the href).

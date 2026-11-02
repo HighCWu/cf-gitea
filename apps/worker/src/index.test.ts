@@ -670,18 +670,19 @@ describe("gitHttpGate LFS interception (SPEC-0006 §2.1)", () => {
       body: JSON.stringify({ operation: "upload", objects: [] }),
     });
 
-  it("keeps the engine's 404 for info/lfs paths on D1-missing repos (no challenge)", async () => {
+  it("answers the LFS-JSON 404 for info/lfs batch on D1-missing repos (no challenge — the ⑳ L9 flip)", async () => {
     const response = await batch("demo", "absent");
 
     // The LFS branch resolves through the same D1 pipeline: no row, no
-    // redirect → the ORIGINAL request flows to the engine (its own plain 404),
-    // never an LFS challenge. The vendored e2e suite (32/35 allowlist) runs
-    // entirely against D1-missing repos, so this passthrough staying
-    // byte-identical is what keeps its numbers stable. The engine owns the
-    // 404's shape; we pin only that the LFS family did not answer.
+    // redirect → upstream's OWN missing-repo arm answers — the LFS-JSON 404
+    // with no challenge (server.go:462-468's renderLfsMsg; the engine
+    // passthrough was the transitional posture, retired with the L9 port in
+    // 8936a2d). The vendored e2e suite runs entirely against D1-missing
+    // repos THROUGH THE GIT ROUTES (parseLfsRoute never claims those), so
+    // its numbers are untouched by this arm.
     expect(response.status).toBe(404);
     expect(response.headers.get("www-authenticate")).toBeNull();
-    expect(response.headers.get("content-type")).not.toContain("vnd.git-lfs");
+    expect(response.headers.get("content-type")).toContain("vnd.git-lfs+json");
   });
 
   it("claims info/lfs for a D1-backed repo with the gitea-lfs realm (not the git-HTTP matrix)", async () => {

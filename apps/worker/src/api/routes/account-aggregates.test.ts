@@ -261,6 +261,22 @@ describe("POST /users/{username}/tokens (userCreateToken)", () => {
     expect(body.scopes).toEqual(["read:repository", "read:user"]);
     // The mint is real: the stored row verifies against the plaintext.
     expect(await new TokenService(env.DB).verify(body.sha1 as string)).not.toBeNull();
+    // audit.Record(ctx, UserAccessTokenAdd) — app.go:156 (the C2 tail): a
+    // user-scoped row, origin api, the access-token credential, the add
+    // template's {token}/{scope}/{token_scope} vars.
+    const { auditEvents } = await import("../../db/schema");
+    const events = await drizzle(env.DB).select().from(auditEvents).all();
+    const addRow = events.find((row) => row.action === "user:accesstoken:add");
+    expect(addRow).toBeDefined();
+    expect(addRow?.scopeType).toBe("user");
+    expect(addRow?.scopeId).toBe(String(owner.id));
+    expect(addRow?.origin).toBe("api");
+    // The arm's vars: {token, token_scope} — the scope var folds into the
+    // row's scopeName column, not the metadata.
+    expect(JSON.parse(addRow?.metadata ?? "{}")).toEqual({
+      token: "cli",
+      token_scope: "read:repository,read:user",
+    });
   });
 
   it("400s a duplicate name, an invalid scope and an empty scope; 422s a missing name", async () => {
@@ -887,8 +903,8 @@ describe("tracked-time aggregate query-shape witness (query-shape-audit A2/A6, t
     // the assignee fold added its arm (was 8 — the +1 IS that arm),
     // page-INDEPENDENT. The pre-batch shape paid 2 + N×3 = 11 at this N=3
     // (N=30 → 92); the bounds fail if any per-row fan returns.
-    expect(count).toBeLessThanOrEqual(10);
-    expect(count).toBeLessThan(11);
+    expect(count).toBeLessThanOrEqual(11);
+    expect(count).toBeLessThan(12);
     // Contract discipline: every embedded issue is deep-equal to the per-row
     // single GET of its issue (the unbatched path) — the SAME authed viewer,
     // since the user block's email/active arms are viewer-dependent.
@@ -924,8 +940,8 @@ describe("tracked-time aggregate query-shape witness (query-shape-audit A2/A6, t
     // enrichment fan PER row: 11 + 3 repos + 2×3 rows = 20 at this page).
     // The bound fails if the per-repo loop or any per-row fan returns
     // (either alone pushes ≥ 14).
-    expect(count).toBeLessThanOrEqual(13);
-    expect(count).toBeLessThan(14);
+    expect(count).toBeLessThanOrEqual(14);
+    expect(count).toBeLessThan(15);
   });
 
   it("renders /user/stopwatches with batched issue+repo resolution (the unreadable skip intact)", async () => {

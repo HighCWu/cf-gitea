@@ -1226,7 +1226,8 @@ describe("pulls list query-shape witness (query-shape-audit A3/B1/A9)", () => {
     // shape paid 1 + 2 + 5×(3 base reads + 1 B1 PR re-select + 1 milestone
     // + 1 merger + 1 fork head repo) = 26 at this N; 5 rows × 4 alone would
     // break the second bound.
-    expect(count).toBeLessThanOrEqual(14);
+    // +1 (cddae16's project-membership arm — the issues-family ripple twin).
+    expect(count).toBeLessThanOrEqual(15);
     expect(count).toBeLessThan(5 * 4);
     // The fork head renders (batched pair lookup worked) and the merged row
     // carries its merger (the batched mergers arm worked).
