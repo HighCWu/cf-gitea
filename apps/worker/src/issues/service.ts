@@ -1375,7 +1375,14 @@ export class IssuesService {
       .get();
     if (existing !== undefined) {
       if (!existing.isTag) throw new ReleaseAlreadyExistError(tagName);
-      // §2.3: first release edit converts the pure tag record.
+      // §2.3: first release edit converts the pure tag record. A DRAFT
+      // conversion re-stamps the creation time — upstream's createTag draft
+      // arm runs `rel.CreatedUnix = timeutil.TimeStampNow()` on EVERY draft
+      // write, the tag-record conversion included (services/release/
+      // release.go:165-168), so the converted draft rises to the top of the
+      // created-ordered lists instead of carrying the tag record's original
+      // push-era stamp. The published arm is dated by its tag commit
+      // upstream (:154) — no re-stamp here.
       const converted = await this.db
         .update(releases)
         .set({
@@ -1387,6 +1394,7 @@ export class IssuesService {
           isPrerelease: input.isPrerelease ?? false,
           isTag: false,
           publishedUnix: isDraft ? 0 : toUnix(now),
+          ...(isDraft ? { createdAt: now } : {}),
         })
         .where(eq(releases.id, existing.id))
         .returning()

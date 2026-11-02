@@ -1031,6 +1031,21 @@ export class RepoService {
       // (the threads 404 with their issues) but the rows are permanent.
       this.db.delete(notificationStates).where(inArray(notificationStates.issueId, issueIds())),
       this.db.delete(reactions).where(inArray(reactions.issueId, issueIds())),
+      // The issue-id arm of the project-board membership sweep (the M1
+      // leak): a repo's issues can sit on OWNER-level boards, and the
+      // repo-project arm below cannot reach those membership rows — its
+      // `IN (SELECT id FROM project WHERE repo_id = ?)` subselect is
+      // confined to repo-scoped projects. Upstream's census carries BOTH
+      // shapes: the per-issue `&project_model.ProjectIssue{IssueID:
+      // issue.ID}` inside deleteIssue's DeleteBeans
+      // (services/issue/issue.go:246, run for every repo issue by the
+      // delete issue loop) is the owner-board half; project.go:450-481's
+      // project-scoped deletes are the repo-project half. The arm rides in
+      // THIS group — ahead of the issues delete — because the batch's
+      // subqueries re-evaluate per statement: once the issue rows go, the
+      // issue-id subselect would match nothing (the placement rule every
+      // sibling above follows).
+      this.db.delete(projectIssues).where(inArray(projectIssues.issueId, issueIds())),
       this.db.delete(pullRequests).where(eq(pullRequests.baseRepoId, repoId)),
       this.db.delete(pullRequests).where(eq(pullRequests.headRepoId, repoId)),
       this.db.delete(issues).where(eq(issues.repoId, repoId)),

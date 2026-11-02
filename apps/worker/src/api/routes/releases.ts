@@ -144,12 +144,16 @@ const releaseBodyHook = ({ success }: { success: boolean }): undefined => {
   return undefined;
 };
 
-/** Upstream `ctx.FormOptionalBool`: absent/"" = null; `true`/`1` = true;
- *  `false`/`0` = false; anything else = false-with-log (we mirror the parse,
- *  keep it total). */
+/** Upstream `ctx.FormOptionalBool` (services/context/base_form.go:71-80):
+ *  absent/"" = null; otherwise `strconv.ParseBool`'s set — "1","t","T",
+ *  "TRUE","true","True" = true, "0","f","F","FALSE","false","False" and
+ *  anything else = false (ParseBool's error is discarded upstream) — plus
+ *  a case-insensitive "on" (strings.EqualFold). So `?draft=TRUE` filters
+ *  IN and `?draft=yes` filters OUT, exactly upstream. */
 function formOptionalBool(raw: string | undefined): boolean | null {
   if (raw === undefined || raw === "") return null;
-  return raw === "true" || raw === "1" || raw === "on";
+  const parseBoolTrue = raw === "1" || raw === "t" || raw === "T" || raw === "true" || raw === "TRUE" || raw === "True";
+  return parseBoolTrue || raw.toLowerCase() === "on";
 }
 
 /** Shared repo resolution + the releases-unit gate. */

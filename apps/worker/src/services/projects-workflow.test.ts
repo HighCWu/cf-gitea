@@ -462,6 +462,26 @@ describe("executeWorkflowActions", () => {
     ]);
   });
 
+  it("an add∩remove OVERLAP label ends REMOVED — removals win (upstream AddRemoveLabels runs NewIssueLabels then DeleteIssueLabel, services/issue/label.go:96-105)", async () => {
+    const p1 = await seedProject();
+    const colA = await seedColumn(p1.id, { title: "A", isDefault: true });
+    const lPresent = await seedLabel(REPO_ID, "overlap-attached");
+    const lAbsent = await seedLabel(REPO_ID, "overlap-missing");
+    await seedWorkflow(p1.id, "item_added_to_project", {}, {
+      add_label_ids: [lPresent.id, lAbsent.id],
+      remove_label_ids: [lPresent.id, lAbsent.id],
+    });
+    const issue = await seedIssue(1);
+    await attach(issue.id, lPresent.id);
+
+    await addIssueToColumn(env.DB, p1, await issueRow(issue.id), colA, ALICE_ID, NOW);
+
+    // Both overlap labels end absent: the attached one (add skipped —
+    // NewIssueLabels ignores already-attached labels — then removed) and the
+    // never-attached one (add attaches, then the remove pass deletes it).
+    expect(await attachedIds(issue.id)).toEqual([]);
+  });
+
   it("issue_state close closes the item with the close comment and counter", async () => {
     const p1 = await seedProject();
     const colA = await seedColumn(p1.id, { title: "A", isDefault: true });

@@ -1228,4 +1228,34 @@ describe("the release reactions bar (R16(f))", () => {
     expect(html).toContain("ui label basic disabled");
     expect(html).not.toContain("select-reaction"); // the canReact half does not
   });
+
+  it("the group labels render in Go MAP-KEY order — ALPHABETICAL by type, not the rows' read order (reactions.tmpl:14's range over GroupByType)", async () => {
+    const { repo } = await theFixture();
+    const owner = await ownerId();
+    const row = await seedRelease({ repoId: repo.id, publisherId: owner, tagName: "v1", title: "Ordered" });
+    // Seeded rocket FIRST (read order = created,id), eyes second — the old
+    // first-appearance render would emit rocket before eyes.
+    await createReleaseReaction(env.DB, { userId: owner, releaseId: row.id, type: "rocket" }, at(126));
+    await createReleaseReaction(env.DB, { userId: owner, releaseId: row.id, type: "eyes" }, at(127));
+
+    const res = await fetchUi("/relmx-owner/rel/releases");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const eyesAt = html.indexOf('aria-label="eyes: 1"');
+    const rocketAt = html.indexOf('aria-label="rocket: 1"');
+    expect(eyesAt).toBeGreaterThan(-1);
+    expect(rocketAt).toBeGreaterThan(-1);
+    expect(eyesAt).toBeLessThan(rocketAt);
+  });
+
+  it("the single-tag page lookup is CASE-SENSITIVE (SingleRelease's raw tag_name IN arm, release.go:296-308 + models/repo/release.go:282-284): /releases/tag/V1 over a v1 row 404s", async () => {
+    const { repo, ownerCookie } = await theFixture();
+    const owner = await ownerId();
+    await seedRelease({ repoId: repo.id, publisherId: owner, tagName: "v1", title: "Cased" });
+
+    const exact = await fetchUi("/relmx-owner/rel/releases/tag/v1", { headers: { cookie: ownerCookie } });
+    expect(exact.status).toBe(200);
+    const variant = await fetchUi("/relmx-owner/rel/releases/tag/V1", { headers: { cookie: ownerCookie } });
+    expect(variant.status).toBe(404);
+  });
 });

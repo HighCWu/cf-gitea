@@ -132,13 +132,15 @@
  * ## Behavior pins (the test matrix carries each)
  *
  * - The form parse: `content` Required — empty/garbage = the bind refusal,
- *   the plain-text 400 (the issue twin's carried reduction of upstream's
- *   fetch-action JSONErrorWithField 400).
- * - react: allowed-set check → the blocked-user probe (publisher + repo
- *   owner, `IsUserBlockedBy`'s admin short-circuit riding) → the guarded
- *   insert (a duplicate stays success). Both refusal arms answer
- *   STATUS-EXACT 403 as the plain text (upstream HTTPError(403) — the HTML
- *   error page is chrome, the compare.tsx honest-status posture).
+ *   the plain-text 400, answered BEFORE the release lookup (upstream's
+ *   GetFetchActionForm is the handler's first statement, release.go:708-713;
+ *   the issue twin's carried reduction of upstream's fetch-action
+ *   JSONErrorWithField 400).
+ * - react: the blocked-user probe FIRST (publisher + repo owner,
+ *   `IsUserBlockedBy`'s admin short-circuit riding) → the allowed-set check
+ *   (reaction.go:19-29's order) → the guarded insert (a duplicate stays
+ *   success). Both refusal arms answer STATUS-EXACT 403 as the plain text
+ *   (upstream HTTPError(403) — the HTML error page is chrome).
  * - unreact: the silent delete — a no-row unreact is still the 303.
  * - The 303 target: `/releases/tag/{pathEscapeSegments(tag)}`.
  * - NO reaction render is attached to the write answer (upstream's JSON
@@ -324,9 +326,10 @@ export type ReleaseReactionApplyResult =
  * ChangeReleaseReaction's write half (release.go:723-741 over
  * services/release/reaction.go:19-29): the content allow-list and the
  * blocked-user guard ride the REACT arm only (upstream's shape — react goes
- * through CreateReleaseReaction's CreateReaction allowed-set check + the
- * IsUserBlockedBy probe; unreact calls DeleteReleaseReaction directly, NO
- * checks — a foreign-content unreact is the silent no-op success there).
+ * through CreateReleaseReaction, which probes IsUserBlockedBy FIRST and
+ * only then reaches CreateReaction's allowed-set check, reaction.go:19-29;
+ * unreact calls DeleteReleaseReaction directly, NO checks — a
+ * foreign-content unreact is the silent no-op success there).
  * Both refusal arms answer upstream's `util.ErrPermissionDenied` → 403
  * (STATUS-EXACT — the release handler's divergence from the issue handler's
  * ServerError 500); the idempotent create is success either way (upstream
@@ -345,8 +348,12 @@ export async function applyReleaseReactionWrite(
   now: Date,
 ): Promise<ReleaseReactionApplyResult> {
   if (action === "react") {
-    if (!ALLOWED_RELEASE_REACTIONS_SET.has(content)) return { outcome: "forbidden-reaction" };
+    // Upstream's guard ORDER (reaction.go:19-29): the blocked-user probe
+    // (IsUserBlockedBy → ErrBlockedUser) FIRST, the allowed-set check
+    // (CreateReaction over UI.ReleaseReactionsLookup) second — a blocked
+    // user's foreign content answers the blocked 403, not the content one.
     if (await isUserBlockedBy(d1, doer, ...blockerIds)) return { outcome: "blocked-user" };
+    if (!ALLOWED_RELEASE_REACTIONS_SET.has(content)) return { outcome: "forbidden-reaction" };
     await createReleaseReaction(d1, { userId: doer.id, releaseId: target.releaseId, type: content }, now);
     return { outcome: "applied" };
   }
@@ -365,11 +372,14 @@ export async function applyReleaseReactionWrite(
  * POST /{owner}/{repo}/releases/{id}/reactions/{action} (upstream
  * repo.ChangeReleaseReaction, release.go:708-755): the §2.8 Origin guard,
  * the family's gate order (anonymous → login 303; archived/read → the 404
- * shell), then the repo-scoped release lookup by the GLOBAL id (a missing
- * or foreign id — or the tag/draft refusal — 404-shells: release.go:719-722
- * is status-exact NotFound; the lookup miss is the tree's
- * ServerError-on-miss reduction), then the action pair over the write seam,
- * success the canonical 303 onto the release's own page (Release.Link()).
+ * shell), then the form parse (upstream's opening GetFetchActionForm,
+ * release.go:708-711 — missing `content` is the bind-refusal 400 BEFORE the
+ * release lookup :713), then the repo-scoped release lookup by the GLOBAL id
+ * (a missing or foreign id — or the tag/draft refusal — 404-shells:
+ * release.go:719-722 is status-exact NotFound; the lookup miss is the
+ * tree's ServerError-on-miss reduction), then the action pair over the
+ * write seam, success the canonical 303 onto the release's own page
+ * (Release.Link()).
  */
 export async function releaseReactionSubmit(c: RouteContext): Promise<Response> {
   const guard = sameOriginGuard(c.req.raw);
@@ -380,6 +390,13 @@ export async function releaseReactionSubmit(c: RouteContext): Promise<Response> 
   if ("response" in gated) return gated.response;
   const { ctx, respond, repo, viewer } = gated;
 
+  // Upstream parses the fetch-action form FIRST — GetFetchActionForm is
+  // ChangeReleaseReaction's opening statement (routers/web/repo/release.go:
+  // 708-711), so a missing `content` answers the bind-refusal 400 before
+  // the release lookup is reached (:713).
+  const content = parseReleaseReactionForm(await readUrlEncodedForm(c.req.raw));
+  if (content === null) return respond(httpErrorText(400, releaseReactionLocale.content_required));
+
   const rawId = c.req.param("id") ?? "";
   if (!/^\d+$/.test(rawId)) return respond(c.html(renderNotFound(ctx), 404));
   const row = await findReleaseForRepoById(c.env.DB, repo.id, Number.parseInt(rawId, 10));
@@ -387,8 +404,6 @@ export async function releaseReactionSubmit(c: RouteContext): Promise<Response> 
 
   const action = c.req.param("action") ?? "";
   if (action !== "react" && action !== "unreact") return respond(c.html(renderNotFound(ctx), 404));
-  const content = parseReleaseReactionForm(await readUrlEncodedForm(c.req.raw));
-  if (content === null) return respond(httpErrorText(400, releaseReactionLocale.content_required));
 
   const result = await applyReleaseReactionWrite(
     c.env.DB,

@@ -232,6 +232,23 @@ export async function findReleaseByTag(d1: D1Database, repoId: string, tag: stri
   return rows[0] ?? null;
 }
 
+/** SingleRelease's web lookup — `FindReleasesOptions.TagNames:
+ *  []string{ctx.PathParam("*")}` (routers/web/repo/release.go:296-308)
+ *  lands in FindReleases' `builder.In("tag_name", ...)` arm
+ *  (models/repo/release.go:282-284) over the RAW column: CASE-SENSITIVE,
+ *  unlike the lowered GetRelease pair above. `/releases/tag/V1.0` over a
+ *  `v1.0` row is a 404 upstream; only this loader mirrors that — the API's
+ *  by-tag arms and the edit-form loader stay on GetRelease's
+ *  lower_tag_name (release.go:568-576). */
+export async function findReleaseByTagExact(d1: D1Database, repoId: string, tag: string): Promise<ReleaseRow | null> {
+  const rows = await drizzle(d1)
+    .select()
+    .from(releases)
+    .where(and(eq(releases.repoId, repoId), eq(releases.tagName, tag)))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
 /** `GetReleaseForRepoByID` — the GLOBAL id scoped through this repo. */
 export async function findReleaseForRepoById(d1: D1Database, repoId: string, id: number): Promise<ReleaseRow | null> {
   if (id <= 0) {

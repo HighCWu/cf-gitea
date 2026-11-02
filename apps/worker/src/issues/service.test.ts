@@ -423,6 +423,25 @@ describe("releases (§2.3, §4.11)", () => {
     const rows = await db().select().from(releases).where(eq(releases.repoId, repoId)).all();
     expect(rows).toHaveLength(1);
   });
+
+  it("a DRAFT conversion re-stamps the creation time (createTag's draft arm re-stamps CreatedUnix=now on EVERY draft write — release.go:165-168)", async () => {
+    const repoId = await seedRepo();
+    const svc = service();
+    // The tag record carries a push-era stamp; the conversion lands later.
+    await svc.createRelease({ repoId, publisherId: 1, tagName: "old-tag", isTag: true, title: "", now: new Date("2026-01-01T00:00:00Z") });
+    const conversionTime = new Date("2026-10-24T12:00:00Z");
+    const draft = await svc.createRelease({ repoId, publisherId: 1, tagName: "old-tag", isDraft: true, now: conversionTime });
+    expect(draft.isTag).toBe(false);
+    expect(draft.createdAt).toEqual(conversionTime);
+    expect(draft.publishedUnix).toBe(0);
+
+    // The PUBLISHED conversion keeps the row's original stamp (upstream
+    // dates a published release by its tag commit, release.go:154 — no
+    // re-stamp arm here).
+    await svc.createRelease({ repoId, publisherId: 1, tagName: "old-tag-2", isTag: true, title: "", now: new Date("2026-02-01T00:00:00Z") });
+    const published = await svc.createRelease({ repoId, publisherId: 1, tagName: "old-tag-2", title: "published now", now: conversionTime });
+    expect(published.createdAt).toEqual(new Date("2026-02-01T00:00:00Z"));
+  });
 });
 
 describe("milestones (§3.2 basics)", () => {

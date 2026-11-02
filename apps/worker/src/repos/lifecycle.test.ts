@@ -811,7 +811,11 @@ describe("delete pipeline (SPEC-0003 §2.5.5, §4.2, §4.8)", () => {
 
     // Membership rows: one riding the doomed repo's issue (the project_issue
     // join arm — upstream deletes it through the repo's projects), one under
-    // the OWNER-level board (which must survive with its project).
+    // the OWNER-level board. BOTH die with the repo: the owner-board row is
+    // swept by the ISSUE-id arm — upstream deleteIssue carries
+    // `&project_model.ProjectIssue{IssueID: issue.ID}` per issue
+    // (services/issue/issue.go:246) and the repo delete runs it for every
+    // issue — while the owner-level BOARD itself survives.
     await env.DB.prepare(
       "INSERT INTO issues (repo_id, `index`, poster_id, title, created_unix) VALUES (?, 1, ?, 'B1', unixepoch())",
     )
@@ -830,8 +834,11 @@ describe("delete pipeline (SPEC-0003 §2.5.5, §4.2, §4.8)", () => {
 
     // The doomed repo's boards are gone; the owner-level board (the
     // WHERE repo_id = ? arm cannot claim repo_id '' — upstream's 0) and the
-    // survivor repo's board survive with their columns, workflows — and the
-    // owner-level membership.
+    // survivor repo's board survive with their columns and workflows — but
+    // with NO memberships: the repo's issue died and every project_issue
+    // row riding it died with it (the issue-id sweep arm,
+    // services/issue/issue.go:246). The owner board is left empty, exactly
+    // like upstream's.
     const keptProjects = await drizzle(env.DB).select().from(projects).all();
     expect(keptProjects.map((p) => [p.title, p.repoId]).sort()).toEqual([
       ["Alice's own board", ""],
@@ -840,8 +847,7 @@ describe("delete pipeline (SPEC-0003 §2.5.5, §4.2, §4.8)", () => {
     expect(await drizzle(env.DB).select().from(projectColumns).all()).toHaveLength(2);
     expect(await drizzle(env.DB).select().from(projectWorkflows).all()).toHaveLength(2);
     const keptMemberships = await drizzle(env.DB).select().from(projectIssues).all();
-    expect(keptMemberships).toHaveLength(1);
-    expect(keptMemberships[0]?.projectId).toBe(doomedOwnerLevel);
+    expect(keptMemberships).toHaveLength(0);
   });
 
   it("§4.2: a push holding a receive lease fails cleanly when the delete lands mid-flight", async () => {

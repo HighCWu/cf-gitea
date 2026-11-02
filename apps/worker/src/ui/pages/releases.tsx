@@ -194,6 +194,7 @@ import {
   editRelease,
   findLatestRelease,
   findReleaseByTag,
+  findReleaseByTagExact,
   findReleaseForRepoById,
   listReleases,
   toApiRelease,
@@ -377,8 +378,9 @@ async function enrichEntries(
   // R16(f): one batched reactions read (upstream getReleaseInfos' single
   // FindReleaseReactions over the page's release ids, release.go:96) then
   // the rows-by-release map (that function's reactionsByRelease) and
-  // GroupByType per row — the first-appearance order the template renders
-  // in, over the created_unix,id read order.
+  // GroupByType per row — the render re-orders the groups by type at the
+  // bar (Go map-key order, reactions.tmpl:14; see ReleaseReactionBar), the
+  // rows themselves in the created_unix,id read order.
   const foundReactions = await listReleaseReactions(
     d1,
     rows.map((row) => row.id),
@@ -488,11 +490,15 @@ export async function loadReleasesData(
  * tag-only records (`IncludeTags: true`), drafts stay write-gated
  * (`IncludeDrafts: writeAccess`), a miss 404s, and a tag-only record renders
  * the SingleTag page (PageIsSingleTag — the same list template, the title
- * falling back to the tag name, release.go:331-334). Before the R2
- * conversion landed this row never existed in our tree, so the loader's old
- * `isTag → null` arm was the documented corollary; now a deleted release
- * leaves its record behind and the tag page must render it exactly like
- * upstream's.
+ * falling back to the tag name, release.go:331-334). The lookup is the
+ * CASE-SENSITIVE raw `tag_name IN (tag)` arm (release.go:296-308's
+ * TagNames → models/repo/release.go:282-284 — findReleaseByTagExact, NOT
+ * the lowered GetRelease pair; a `/releases/tag/V1.0` URL over a `v1.0`
+ * row 404s upstream and here too, while the edit form's GetRelease lookup
+ * stays lowered). Before the R2 conversion landed this row never existed in
+ * our tree, so the loader's old `isTag → null` arm was the documented
+ * corollary; now a deleted release leaves its record behind and the tag
+ * page must render it exactly like upstream's.
  */
 export async function loadReleaseDetailData(
   env: Env,
@@ -502,7 +508,7 @@ export async function loadReleaseDetailData(
   canWrite: boolean,
   origin: string,
 ): Promise<ReleaseEntry | null> {
-  const row = await findReleaseByTag(d1, repo.id, tag);
+  const row = await findReleaseByTagExact(d1, repo.id, tag);
   if (row === null) return null;
   if (row.isDraft && !canWrite) return null;
   const [latest, tags] = await Promise.all([findLatestRelease(d1, repo.id), tagTipsOf(env, repo)]);
@@ -947,6 +953,13 @@ export function ReleaseReactionBar(props: { actionUrl: string; groups: ReactionG
   if (props.groups.length === 0 && !props.canReact) return null;
   const emojiOf = (type: string): string => REACTION_EMOJI[type] ?? `:${type}:`;
   const viewerId = props.viewer.kind === "user" ? props.viewer.id : null;
+  // Upstream's group order is Go MAP-KEY order: reactions.tmpl:14 ranges
+  // `{{range $key, $value := .Reactions}}` over the GroupByType map (models/
+  // issues/reaction.go's map[string]ReactionList) and html/template walks
+  // maps in SORTED-KEY order — ALPHABETICAL by type, not the rows'
+  // first-appearance order the shared groupReactions preserves (the issue
+  // twin keeps insertion order; the release render re-orders here).
+  const groups = [...props.groups].sort((a, b) => (a.type < b.type ? -1 : a.type > b.type ? 1 : 0));
   return (
     <div class="bottom-reactions" data-action-url={props.actionUrl} role="group" aria-label={releasesLocale.reactions}>
       {props.canReact ? (
@@ -966,7 +979,7 @@ export function ReleaseReactionBar(props: { actionUrl: string; groups: ReactionG
           </div>
         </details>
       ) : null}
-      {props.groups.map((group) => {
+      {groups.map((group) => {
         const reacted = viewerId !== null && group.userIds.includes(viewerId);
         const label = `${group.type}: ${group.count}`;
         return props.canReact ? (

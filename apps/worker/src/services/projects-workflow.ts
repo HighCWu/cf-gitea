@@ -511,11 +511,16 @@ async function moveIssueByWorkflow(
 /**
  * `changeLabelsByWorkflow` (:189-197) over the landed human PUT write: ids
  * resolve against the label store with the missing silently dropped
- * (`GetLabelsByIDs`, models/issues/label.go:317-330), then the target set is
- * `current − remove + add` (adds positioned LAST so the exclusive-scope
- * dedupe — ReplaceIssueLabels' RemoveDuplicateExclusiveLabels positional rule —
- * lets an add evict its scope's occupant, the human PUT arm's behavior).
- * A target equal to the current set writes nothing.
+ * (`GetLabelsByIDs`, models/issues/label.go:317-330), then the target set
+ * mirrors upstream's ADD-THEN-REMOVE sequence (AddRemoveLabels —
+ * services/issue/label.go:96-105: `NewIssueLabels(ctx, issue, toAdd)`
+ * first — a no-op for already-attached labels — then a DeleteIssueLabel
+ * loop over toRemove), so a label in the add∩remove overlap ends REMOVED
+ * no matter its starting state. As a target list: `[current + add] −
+ * remove`, adds positioned after the current rows so the exclusive-scope
+ * dedupe — ReplaceIssueLabels' RemoveDuplicateExclusiveLabels positional
+ * rule — still lets a surviving add evict its scope's occupant (the human
+ * PUT arm's behavior). A target equal to the current set writes nothing.
  */
 async function changeLabelsByWorkflow(
   d1: D1Database,
@@ -551,21 +556,20 @@ async function changeLabelsByWorkflow(
     .from(issueLabels)
     .where(eq(issueLabels.issueId, issue.id));
   const current = currentRows.map((row) => row.labelId);
-  const target: number[] = [];
+  // `[current + add] − remove`: the add pass appends (deduped —
+  // NewIssueLabels skips already-attached labels), the remove pass then
+  // drops — the overlap therefore ends REMOVED (removals win), upstream's
+  // add-then-remove net (label.go:96-105).
+  const merged: number[] = [];
   const seen = new Set<number>();
-  for (const labelId of current) {
-    if (!removeSet.has(labelId) && !seen.has(labelId)) {
-      seen.add(labelId);
-      target.push(labelId);
-    }
-  }
-  for (const labelId of addIds) {
+  for (const labelId of [...current, ...addIds]) {
     if (!seen.has(labelId)) {
       seen.add(labelId);
-      target.push(labelId);
+      merged.push(labelId);
     }
   }
-  const unchanged = target.length === current.length && current.every((id) => seen.has(id));
+  const target = merged.filter((labelId) => !removeSet.has(labelId));
+  const unchanged = target.length === current.length && current.every((id, index) => target[index] === id);
   if (unchanged) {
     return;
   }

@@ -651,6 +651,18 @@ describe("GET /repos/{owner}/{repo}/releases (repoListReleases)", () => {
     expect((await draftsOnly.json<Array<{ tag_name: string }>>()).map((r) => r.tag_name)).toEqual(["v3-draft"]);
     const draftsAnon = await makeApp()(`${REPO_PATH}/releases?draft=true`);
     expect(await draftsAnon.json()).toEqual([]); // no write access → nothing
+    // formOptionalBool rides strconv.ParseBool's set + the case-insensitive
+    // "on" (services/context/base_form.go:71-80): the uppercase and
+    // t/T/1 spellings filter IN, non-parseable junk filters OUT (Some(false)
+    // — ?draft=yes hides drafts like an explicit false), absent = null.
+    const upper = await makeApp()(`${REPO_PATH}/releases?draft=TRUE`, { headers: { Authorization: `token ${TOKEN}` } });
+    expect((await upper.json<Array<{ tag_name: string }>>()).map((r) => r.tag_name)).toEqual(["v3-draft"]);
+    const bareT = await makeApp()(`${REPO_PATH}/releases?draft=T`, { headers: { Authorization: `token ${TOKEN}` } });
+    expect((await bareT.json<Array<{ tag_name: string }>>()).map((r) => r.tag_name)).toEqual(["v3-draft"]);
+    const onForm = await makeApp()(`${REPO_PATH}/releases?draft=ON`, { headers: { Authorization: `token ${TOKEN}` } });
+    expect((await onForm.json<Array<{ tag_name: string }>>()).map((r) => r.tag_name)).toEqual(["v3-draft"]);
+    const junk = await makeApp()(`${REPO_PATH}/releases?draft=yes`, { headers: { Authorization: `token ${TOKEN}` } });
+    expect((await junk.json<Array<{ tag_name: string }>>()).map((r) => r.tag_name)).toEqual(["v4-pre", "v2", "v1"]);
     const pre = await makeApp()(`${REPO_PATH}/releases?pre-release=true`);
     expect((await pre.json<Array<{ tag_name: string }>>()).map((r) => r.tag_name)).toEqual(["v4-pre"]);
     const filtered = await makeApp()(`${REPO_PATH}/releases?tag_filter=v*`);

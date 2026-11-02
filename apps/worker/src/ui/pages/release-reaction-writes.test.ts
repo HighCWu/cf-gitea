@@ -406,6 +406,24 @@ describe("the release reaction toggle (ChangeReleaseReaction)", () => {
     expect(await rowsOf(f.v1.id)).toEqual([]);
   });
 
+  it("the blocked probe precedes the allowed-set check (reaction.go:19-29's order): a blocked user's FOREIGN content answers the blocked 403", async () => {
+    const f = await ensureFixture();
+    await drizzle(env.DB).insert(userBlocking).values({ blockerId: f.ownerId, blockeeId: f.readId, note: "", createdAt: at(105) });
+    const res = await fetchReaction(`/relrx-owner/relrx/releases/${f.v1.id}/reactions/react`, formPost("/x", { content: "confused" }, f.readCookie));
+    expect(res.status).toBe(403);
+    const text = await res.text();
+    expect(text).toContain("user is blocked");
+    expect(text).not.toContain("is not an allowed reaction");
+    expect(await rowsOf(f.v1.id)).toEqual([]);
+  });
+
+  it("the form parse precedes the release lookup (release.go:708-713's GetFetchActionForm first): missing content on a NONEXISTENT id is the 400, not the 404", async () => {
+    const f = await ensureFixture();
+    const res = await fetchReaction(`/relrx-owner/relrx/releases/424242/reactions/react`, formPost("/x", { content: "" }, f.ownerCookie));
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain("content is required");
+  });
+
   it("the unreact deletes the row silently and 303s (DeleteReleaseReaction)", async () => {
     const f = await ensureFixture();
     await createReleaseReaction(env.DB, { userId: f.readId, releaseId: f.v1.id, type: "eyes" }, at(106));

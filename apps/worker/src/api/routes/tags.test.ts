@@ -29,14 +29,14 @@
 import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { Hono } from "hono";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
 import { ensureSeededRepo, type SeedCommit } from "../../ui/testing/seed-repo";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { users } from "../../db/schema";
+import { protectedTags, releases, repositories, users } from "../../db/schema";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -284,5 +284,82 @@ describe("annotated-tag message arms (residuals P3-11)", () => {
     // an UNKNOWN oid rides the same arm
     const unknown = await get(`${REPO_PATH}/git/tags/0123456789012345678901234567890123456789`);
     expect(unknown.status).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The delete arm's release coupling (v1.5.5 R2-L1 — services/release/
+// release.go:376-404): the protected check runs FIRST (before `git tag -d`,
+// :376-387), the `git tag -d` "not found" error is TOLERATED (:389-393) so a
+// missing ref with an existing row proceeds to the events + row delete, and
+// the push event's `before` is the ROW's sha1 — the PEELED commit
+// (:150-151's rel.Sha1), not the raw tag-object oid.
+// ---------------------------------------------------------------------------
+describe("the delete arm's release coupling (release.go:376-404)", () => {
+  const seedTagRow = async (repoId: string, tagName: string, sha1: string) => {
+    await drizzle(env.DB).insert(releases).values({
+      repoId,
+      publisherId: OWNER_ID,
+      tagName,
+      lowerTagName: tagName.toLowerCase(),
+      isTag: true,
+      sha1,
+      createdAt: new Date(T0 * 1000),
+    });
+  };
+
+  const repoIdOf = async (): Promise<string> => {
+    const row = await drizzle(env.DB)
+      .select({ id: repositories.id })
+      .from(repositories)
+      .where(and(eq(repositories.ownerNamespace, OWNER), eq(repositories.slug, SLUG)))
+      .get();
+    if (row === undefined) throw new Error("seed repo missing");
+    return row.id;
+  };
+
+  it("a missing ref with an existing tag ROW proceeds (git tag -d's tolerated not-found): 204, the row goes, the pair (no ref, no record) still 404s", async () => {
+    const repoId = await repoIdOf();
+    await seedTagRow(repoId, "ghost-relay", TIP1);
+    // sanity: the ref really is absent
+    expect((await get(`${REPO_PATH}/tags/ghost-relay`)).status).toBe(404);
+
+    const res = await send(`${REPO_PATH}/tags/ghost-relay`, authed({ method: "DELETE" }));
+    expect(res.status).toBe(204);
+    const kept = await drizzle(env.DB)
+      .select({ id: releases.id })
+      .from(releases)
+      .where(and(eq(releases.repoId, repoId), eq(releases.lowerTagName, "ghost-relay")))
+      .all();
+    expect(kept).toHaveLength(0);
+
+    // the rowless pair — no release record AND no ref — stays the 404
+    // (upstream's GetRelease miss, routers/api/v1/repo/tag.go:267-273)
+    const rowless = await send(`${REPO_PATH}/tags/never-existed`, authed({ method: "DELETE" }));
+    expect(rowless.status).toBe(404);
+  });
+
+  it("the protected check precedes the missing-ref arm: a protected GHOST tag with a row is the 422, not a silent 204 (release.go:376-387)", async () => {
+    const repoId = await repoIdOf();
+    await seedTagRow(repoId, "protected-ghost", TIP2);
+    await drizzle(env.DB).insert(protectedTags).values({
+      repoId,
+      namePattern: "protected-*",
+      allowlistUserIds: "[424242]",
+      allowlistTeamIds: "[]",
+      createdAt: new Date(T0 * 1000),
+      updatedAt: new Date(T0 * 1000),
+    });
+
+    const res = await send(`${REPO_PATH}/tags/protected-ghost`, authed({ method: "DELETE" }));
+    expect(res.status).toBe(422);
+    expect((await jsonBody(res)).message).toBe("user not allowed to delete protected tag");
+    // the row survives the refusal
+    const kept = await drizzle(env.DB)
+      .select({ id: releases.id })
+      .from(releases)
+      .where(and(eq(releases.repoId, repoId), eq(releases.lowerTagName, "protected-ghost")))
+      .all();
+    expect(kept).toHaveLength(1);
   });
 });

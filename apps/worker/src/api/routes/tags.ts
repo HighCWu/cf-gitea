@@ -253,23 +253,40 @@ async function deleteTagByName(c: Context<ApiEnv>, pair: RepositoryWithOwner, ta
     throw new ApiError(409, "a tag attached to a release cannot be deleted directly");
   }
   const tip = refTipMap(await engineReads(c.env, pair.repo).listRefs()).get(tagRef(tagName));
-  if (tip === undefined) {
+  // A missing ref with a release row is NOT a 404: upstream's `git tag -d`
+  // tolerates the "not found" error and the delTag flow PROCEEDS — events
+  // then row delete (release.go:389-393). Only the rowless pair (no record,
+  // no ref) 404s here (upstream's GetRelease miss, routers/api/v1/repo/
+  // tag.go:267-273).
+  if (tip === undefined && record === undefined) {
     throw new ApiError(404, "not found");
   }
-  // Protected-tag enforcement on the delete arm (upstream DeleteTag →
-  // release_service.DeleteReleaseByID's IsUserAllowedToControlTag check,
-  // services/release/release.go:376-390, answered 422 "user not allowed
-  // to delete protected tag", routers/api/v1/repo/tag.go:282-285 — the
-  // check runs after the existence arms, exactly here).
+  // Protected-tag enforcement runs FIRST — before the ref-delete decision —
+  // (upstream DeleteReleaseByID's delTag arm checks IsUserAllowedToControlTag
+  // BEFORE `git tag -d`, services/release/release.go:376-387, answered 422
+  // "user not allowed to delete protected tag", routers/api/v1/repo/tag.go:
+  // 281-285), so it guards the missing-ref arm exactly like the delete arm.
+  // The rowless pure-ref arm rides the same check (no upstream analog — that
+  // pair 404s there — carried from this port's posture, never loosened).
   const doer = c.get("authUser");
   if (!(await isTagControlAllowed(c.env.DB, await listProtectedTags(c.env.DB, pair.repo.id), tagName, doer?.id ?? 0))) {
     throw new ApiError(422, "user not allowed to delete protected tag");
   }
-  const result = await engineCell(c.env, pair.repo).deleteApiRef({ ref: tagRef(tagName), expectedOid: tip.target });
-  if (result.tag !== "deleted") {
-    const error = deleteApiRefError(result);
-    if (error !== null) throw error;
+  // The CAS delete rides only when the ref exists; the missing-ref arm
+  // skips straight to the events + row delete (upstream's tolerated
+  // `git tag -d` failure, release.go:389-393).
+  let deleted = false;
+  if (tip !== undefined) {
+    const result = await engineCell(c.env, pair.repo).deleteApiRef({ ref: tagRef(tagName), expectedOid: tip.target });
+    if (result.tag === "deleted") {
+      deleted = true;
+    } else {
+      const error = deleteApiRefError(result);
+      if (error !== null) throw error;
+    }
   }
+  // The missing-ref arm proceeds WITH its events when a record exists.
+  const missingRefArm = tip === undefined && record !== undefined;
   // The tag-only record goes WITH the ref (upstream's delTag=true branch:
   // `git tag -d` then `DeleteByID[Release]`, release.go:388-412; the ledger
   // R2 note "tags-API delete finds it"). Upstream's delTag arm deletes ONLY
@@ -277,22 +294,28 @@ async function deleteTagByName(c: Context<ApiEnv>, pair: RepositoryWithOwner, ta
   // shared tail code this bare tag-record delete rides too — a converted
   // record's assets were already swept at the release delete that converted
   // it, so the bare row delete is the complete cascade for the states our
-  // tree can reach).
+  // tree can reach). The missing-ref arm deletes the row too (upstream's
+  // DeleteByID runs after the tolerated tag -d, release.go:405-407).
   if (record !== undefined && record.isTag) {
     await drizzle(c.env.DB).delete(releases).where(eq(releases.id, record.id));
   }
   // Upstream's API tag delete fires the zero-commit `push` event too
-  // (services/release/release.go:396-403 — PushCommits with
-  // OldCommitID = the tag's sha and the empty NewCommitID, then
-  // DeleteRef :403): before = the pre-delete ref tip, after = the zero
-  // oid. Emission order push → delete matches upstream.
-  if (result.tag === "deleted") {
-    await emitRefWebhook(c, pair, "push", zeroCommitPushPayload(c, pair, tagRef(tagName), tip.target, ZERO_OID), tagRef(tagName));
+  // (release.go:395-403 — PushCommits with OldCommitID = rel.Sha1 — the
+  // PEELED commit id set at release.go:150-151, NOT the raw tag-object oid
+  // — and the empty NewCommitID, then DeleteRef :403). The event fires on
+  // the missing-ref arm as well (upstream's PushCommits/DeleteRef sit after
+  // the tolerated tag -d). before = the ROW's sha1, falling back to the ref
+  // tip when the row never carried one (empty/null), and the zero oid when
+  // neither exists; after = the zero oid. Emission order push → delete
+  // matches upstream.
+  const before = record?.sha1 != null && record.sha1 !== "" ? record.sha1 : (tip?.target ?? ZERO_OID);
+  if (deleted || missingRefArm) {
+    await emitRefWebhook(c, pair, "push", zeroCommitPushPayload(c, pair, tagRef(tagName), before, ZERO_OID), tagRef(tagName));
   }
   // Upstream DeleteRef (notifier.go:858→:870): pusher_type is always
   // "user" (api.PusherTypeUser). The idempotent already-absent arm
   // (deleteApiRefError's null) removed nothing — no event for it.
-  if (result.tag === "deleted") {
+  if (deleted || missingRefArm) {
     await emitRefWebhook(
       c,
       pair,
