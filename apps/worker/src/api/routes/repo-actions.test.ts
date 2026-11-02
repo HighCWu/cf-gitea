@@ -214,11 +214,19 @@ beforeAll(async () => {
     const left = await env.DB.prepare("SELECT count(*) AS n FROM action_runs").first<{ n: number }>();
     return left?.n ?? 0;
   };
-  await new Promise((resolve) => setTimeout(resolve, 400)); // let the in-flight waitUntil inserts land
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    if ((await wipeRunFamily()) === 0) break;
+  // The settle barrier (the v1.5.3 gate rounds' hardening): the tight
+  // 20-attempt loop raced a consumer insert that landed between its last
+  // wipe and the first describe (observed R2/R3 under full-suite load —
+  // total_count 1 in the zero-run test). The barrier now SPACES its
+  // attempts and demands TWO consecutive clean passes, so a late insert
+  // lands inside the window and dies with the next wipe.
+  let consecutiveClean = 0;
+  for (let attempt = 0; attempt < 20 && consecutiveClean < 2; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const left = await wipeRunFamily();
+    consecutiveClean = left === 0 ? consecutiveClean + 1 : 0;
   }
-  if ((await env.DB.prepare("SELECT count(*) AS n FROM action_runs").first<{ n: number }>())?.n !== 0) {
+  if (consecutiveClean < 2) {
     throw new Error("the seeds' trigger runs never settled — the run-family wipe did not converge");
   }
 });
