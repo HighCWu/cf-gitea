@@ -111,11 +111,11 @@
  *    respond(c.html(renderUserCodeSearchPage(ctx, data), 200)).
  * 5. Registration (beside the heatmap tail):
  *    `uiRouter.get("/:owner/-/code", (c) => userCodeSearchPage(c));`
- * 6. The deferred nav tab (both strips): ProfileTabs' optional-prop pattern —
- *    a `codeTab?: { active: boolean; href: string }` on user-profile.tsx's
- *    ProfileTabs + org-home.tsx's OrgMenu, armed active on this page, and
- *    inert (or armed per the census disposition) on the profile/org pages —
- *    the two files are outside this module's ownership.
+ * 6. The nav tab (both strips): armed by the wave I-b completion — this page
+ *    passes `codeTab={{ active: true, href }}` to ProfileTabs (user arm) and
+ *    OrgMenu (org arm), and the strips' optional-prop pattern lets the
+ *    profile/org pages arm it inert; absent keeps the prior DOM byte-stable
+ *    (the two strip files stay outside page-module ownership).
  */
 
 import type { GrepResult } from "@cf-gitea/git-engine";
@@ -123,9 +123,9 @@ import type { GrepResult } from "@cf-gitea/git-engine";
 import { and, eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { listFollowers, listFollowing } from "../../api/services/follows";
+import { isFollowing, listFollowers, listFollowing } from "../../api/services/follows";
 import type { OrgDoer } from "../../api/services/org-repos";
-import { repositories } from "../../db/schema";
+import { projects, repositories } from "../../db/schema";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import { engineClient } from "../engine";
 import { pathEscapeSegments } from "../page-data";
@@ -231,11 +231,26 @@ export async function resolveUserCodeSearchOwner(
 // ---------------------------------------------------------------------------
 
 /** The profile-grid chrome counts (the packages page's userProfileChrome
- *  idiom: the menu tab's repository count + the avatar card's pair). */
+ *  idiom: the menu tab's repository count + the avatar card's pair) plus the
+ *  wave I-b strip arms (the Projects-tab count on the USER arm, the follow
+ *  button on both arms, the USER arm's admin gear). */
 export interface CodeSearchChrome {
   repoCount: number;
   followers: number;
   following: number;
+  /** The USER arm's Projects-tab count (header.tmpl:17-20's
+   *  `{{if .ProjectCount}}` label — the OPEN projects total, loadHeaderCount
+   *  parity, shared/user/header.go:172-192; the ORG arm renders no Projects
+   *  tab on this page, the count stays its zero). */
+  openProjects: number;
+  /** The strip's follow-button input (org/header.tmpl:17 on the ORG arm,
+   *  profile_big_avatar.tmpl:123-136 on the USER arm): present only for a
+   *  signed-in viewer who is not the owner, IsFollowing(doer, owner) its
+   *  label (header.go:28's argument order). */
+  followButton: { following: boolean } | null;
+  /** profile_big_avatar.tmpl:18's admin gear gate (the viewer's admin
+   *  flag; the ORG arm renders no avatar card, the field is inert there). */
+  viewerIsAdmin: boolean;
 }
 
 /** The doer-visible repository count for the tab label (the packages page's
@@ -306,10 +321,26 @@ export async function loadUserCodeSearchData(
 
   // The chrome counts ride every arm (page furniture, not search data).
   // The org arm carries no avatar-card pair (OrgHeader renders none
-  // upstream) — the zeros are structural, never rendered.
-  const [repoCount, follows] = await Promise.all([
+  // upstream) — the follower/following zeros are structural, never
+  // rendered; the follow button DOES render on the org header
+  // (org/header.tmpl:17), so it computes on both arms.
+  const ownerId = owner.kind === "org" ? owner.org.id : owner.user.id;
+  const [repoCount, follows, openProjectsRow, viewerFollows] = await Promise.all([
     owner.kind === "org" ? orgRepoCount(d1, owner.org, doer) : ownerRepoCount(d1, owner.user.id, doer),
     owner.kind === "org" ? Promise.resolve({ followers: 0, following: 0 }) : followCountsOf(d1, owner.user.id, doer),
+    // The USER arm's Projects-tab count (header.tmpl:17-20 — the OPEN
+    // projects total, loadHeaderCount parity; the individual scope IS the
+    // projects.ownerId arm).
+    owner.kind === "user"
+      ? drizzle(d1)
+          .select({ total: sql<number>`count(*)` })
+          .from(projects)
+          .where(and(eq(projects.ownerId, owner.user.id), eq(projects.isClosed, false)))
+          .get()
+      : Promise.resolve(undefined),
+    // The strip's follow button on both arms (org/header.tmpl:17 /
+    // profile_big_avatar.tmpl:123-136 — IsFollowing(doer, owner)).
+    doer.id !== null && doer.id !== ownerId ? isFollowing(d1, doer.id, ownerId) : Promise.resolve(false),
   ]);
 
   // The bare arm stops HERE — no seed read, no engine call (user/code.go
@@ -318,7 +349,14 @@ export async function loadUserCodeSearchData(
 
   return {
     owner,
-    chrome: { repoCount, followers: follows.followers, following: follows.following },
+    chrome: {
+      repoCount,
+      followers: follows.followers,
+      following: follows.following,
+      openProjects: Number(openProjectsRow?.total ?? 0),
+      followButton: doer.id !== null && doer.id !== ownerId ? { following: viewerFollows } : null,
+      viewerIsAdmin: doer.isAdmin,
+    },
     keyword,
     selectedMode,
     displayMode,
@@ -540,14 +578,21 @@ export function UserCodeSearchPage(props: { ctx: UiContext; data: UserCodeSearch
   const action = `/${ownerName}/-/code`;
   if (data.owner.kind === "org") {
     // org arm: `page-content organization code` — org/header + the search
-    // block (user/code.tmpl:3-7).
+    // block (user/code.tmpl:3-7). The header's follow button is the C2 arm
+    // (org/header.tmpl:17); the menu's Code tab is the C1 arm
+    // (menu.tmpl:28-32 — ACTIVE here, IsCodePage true on this page).
     return (
       <BaseLayout ctx={ctx} title={userCodeSearchLocale.title} pageClass="organization code">
-        <OrgHeader org={data.owner.org} signedIn={ctx.viewer.kind === "user"} />
+        <OrgHeader
+          org={data.owner.org}
+          signedIn={ctx.viewer.kind === "user"}
+          followButton={data.chrome.followButton ?? undefined}
+        />
         <OrgMenu
           orgLink={`/${data.owner.org.username}`}
           repoCount={data.chrome.repoCount}
           packagesTab={ctx.packagesEnabled !== false ? { active: false, href: `/${data.owner.org.username}/-/packages` } : undefined}
+          codeTab={{ active: true, href: action }}
         />
         <div class="ui container">
           <FederatedSearchBlock action={action} data={data} />
@@ -557,8 +602,9 @@ export function UserCodeSearchPage(props: { ctx: UiContext; data: UserCodeSearch
   }
   // user arm: `page-content user profile` — the profile grid (avatar card +
   // overview header) + the search block (user/code.tmpl:9-21). The overview
-  // header renders WITHOUT the Code tab (the module header's deferred nav
-  // arm — the tab strip is outside this module's ownership).
+  // header carries the C1 Projects + Code tabs (header.tmpl:14-31 — Code
+  // ACTIVE here, `{{if .IsCodePage}}`), the avatar card the C2 follow button
+  // + the C3 admin gear (profile_big_avatar.tmpl:123-136/:18).
   return (
     <BaseLayout ctx={ctx} title={userCodeSearchLocale.title} pageClass="user profile">
       <div class="ui container">
@@ -568,6 +614,8 @@ export function UserCodeSearchPage(props: { ctx: UiContext; data: UserCodeSearch
               user={data.owner.user}
               followers={data.chrome.followers}
               following={data.chrome.following}
+              followButton={data.chrome.followButton ?? undefined}
+              viewerIsAdmin={data.chrome.viewerIsAdmin}
             />
           </div>
           <div class="ui twelve wide column tw-mb-4">
@@ -575,7 +623,9 @@ export function UserCodeSearchPage(props: { ctx: UiContext; data: UserCodeSearch
               username={data.owner.user.username}
               repoCount={data.chrome.repoCount}
               starsCount={data.owner.user.numStars}
+              projectsTab={{ active: false, count: data.chrome.openProjects, href: `/${data.owner.user.username}/-/projects` }}
               packagesTab={ctx.packagesEnabled !== false ? { active: false, href: `/${data.owner.user.username}/-/packages` } : undefined}
+              codeTab={{ active: true, href: action }}
             />
             <FederatedSearchBlock action={action} data={data} />
           </div>

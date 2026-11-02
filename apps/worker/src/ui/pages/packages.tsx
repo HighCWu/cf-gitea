@@ -160,10 +160,10 @@
 import { and, asc, desc, eq, inArray, like, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { listFollowers, listFollowing } from "../../api/services/follows";
+import { isFollowing, listFollowers, listFollowing } from "../../api/services/follows";
 import { loadRepoSettings } from "../../api/services/repo-settings";
 import { canViewRepositoryWithTeams, type RepositoryRow } from "../../api/services/repository";
-import { packageFiles, packageVersions, packages, repositories, users } from "../../db/schema";
+import { packageFiles, packageVersions, packages, projects, repositories, users } from "../../db/schema";
 import { getBlobById, packageBlobContentKey, type PackageBlobRow } from "../../services/packages/blobs";
 import { getTerraformLock, isTerraformLockLocked, type TerraformLockInfo } from "../../services/packages/terraform";
 import type { OrgRecord } from "../../services/orgs/orgs";
@@ -559,6 +559,28 @@ export async function hasNonInternalVersion(d1: D1Database, packageId: number): 
   return rows.length > 0;
 }
 
+/** The chrome the packages pages render beside the profile tabs / org menu
+ *  (the loaders' shared read) — exported for pages/package-settings.tsx, the
+ *  settings page's chrome. */
+export interface PackagesOwnerChrome {
+  repoCount: number;
+  followers: number;
+  following: number;
+  /** The USER arm's Projects-tab count (header.tmpl:17-20's
+   *  `{{if .ProjectCount}}` label — the OPEN projects total, loadHeaderCount
+   *  parity; the ORG arm renders no Projects tab, the count stays its
+   *  zero). */
+  openProjects: number;
+  /** The strip's follow-button input (org/header.tmpl:17 on the ORG arm,
+   *  profile_big_avatar.tmpl:123-136 on the USER arm): present only for a
+   *  signed-in viewer who is not the owner, IsFollowing(doer, owner) its
+   *  label (header.go:28's argument order). */
+  followButton: { following: boolean } | null;
+  /** profile_big_avatar.tmpl:18's admin gear gate (the viewer's admin
+   *  flag; the ORG arm renders no avatar card, the field is inert there). */
+  viewerIsAdmin: boolean;
+}
+
 /** The chrome counts the packages pages render beside the profile tabs /
  *  org menu (the loaders' shared read) — exported for pages/
  *  package-settings.tsx, the settings page's chrome. */
@@ -566,9 +588,23 @@ export async function ownerPackagesChrome(
   d1: D1Database,
   owner: PackagesOwner,
   doer: ProfileDoer,
-): Promise<{ repoCount: number; followers: number; following: number }> {
+): Promise<PackagesOwnerChrome> {
   if (owner.kind === "user") return userProfileChrome(d1, owner.user, doer);
-  return ownerRepoCount(d1, ownerIdOf(owner), doer).then((repoCount) => ({ repoCount, followers: 0, following: 0 }));
+  const [repoCount, viewerFollows] = await Promise.all([
+    ownerRepoCount(d1, ownerIdOf(owner), doer),
+    // org/header.tmpl:17's follow_unfollow include (IsFollowing(doer, org),
+    // the org-home loader's gate — a doer row of the org itself cannot
+    // exist, the id comparison is the defensive shape).
+    doer.id !== null && doer.id !== owner.org.id ? isFollowing(d1, doer.id, owner.org.id) : Promise.resolve(false),
+  ]);
+  return {
+    repoCount,
+    followers: 0,
+    following: 0,
+    openProjects: 0,
+    followButton: doer.id !== null && doer.id !== owner.org.id ? { following: viewerFollows } : null,
+    viewerIsAdmin: doer.isAdmin,
+  };
 }
 
 /** The type facet's accepted values (the select's value arm): "", "all"
@@ -612,16 +648,33 @@ async function followCountsOf(d1: D1Database, userId: number, doer: ProfileDoer)
 }
 
 /** The profile-grid chrome both user-arm pages carry (the avatar card's
- *  counts + the menu's RepoCount — the user-half chrome data). */
-interface UserProfileChrome {
-  repoCount: number;
-  followers: number;
-  following: number;
-}
+ *  counts + the menu's RepoCount — the user-half chrome data), the wave I-b
+ *  strip arms included. */
+type UserProfileChrome = PackagesOwnerChrome;
 
 async function userProfileChrome(d1: D1Database, user: UserProfileRow, doer: ProfileDoer): Promise<UserProfileChrome> {
-  const [repoCount, follows] = await Promise.all([ownerRepoCount(d1, user.id, doer), followCountsOf(d1, user.id, doer)]);
-  return { repoCount, followers: follows.followers, following: follows.following };
+  const [repoCount, follows, openProjectsRow, viewerFollows] = await Promise.all([
+    ownerRepoCount(d1, user.id, doer),
+    followCountsOf(d1, user.id, doer),
+    // The strip's Projects count (header.tmpl:17-20 — the OPEN individual
+    // projects: the projects.ownerId arm, loadHeaderCount parity).
+    drizzle(d1)
+      .select({ total: sql<number>`count(*)` })
+      .from(projects)
+      .where(and(eq(projects.ownerId, user.id), eq(projects.isClosed, false)))
+      .get(),
+    // The avatar card's follow button (profile_big_avatar.tmpl:123-136,
+    // IsFollowing(doer, target), header.go:28's argument order).
+    doer.id !== null && doer.id !== user.id ? isFollowing(d1, doer.id, user.id) : Promise.resolve(false),
+  ]);
+  return {
+    repoCount,
+    followers: follows.followers,
+    following: follows.following,
+    openProjects: Number(openProjectsRow?.total ?? 0),
+    followButton: doer.id !== null && doer.id !== user.id ? { following: viewerFollows } : null,
+    viewerIsAdmin: doer.isAdmin,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -683,6 +736,15 @@ export interface OwnerPackagesData {
   /** The user arm's avatar-card counts. */
   followers: number;
   following: number;
+  /** The USER arm's Projects-tab count (header.tmpl:17-20 — the OPEN
+   *  projects total, loadHeaderCount parity). */
+  openProjects: number;
+  /** The strip's follow button (the user arm's avatar card :123-136, the
+   *  org arm's header org/header.tmpl:17). */
+  followButton: { following: boolean } | null;
+  /** profile_big_avatar.tmpl:18's admin gear gate (the viewer's admin
+   *  flag; inert on the ORG arm). */
+  viewerIsAdmin: boolean;
 }
 
 /**
@@ -708,7 +770,7 @@ export async function loadOwnerPackagesData(
   const [{ rows, count }, hasPackages, chrome] = await Promise.all([
     listLatestRows(d1, { ownerId, type: typeFilter, query, page }),
     hasOwnerPackages(d1, ownerId),
-    owner.kind === "user" ? userProfileChrome(d1, owner.user, doer) : ownerRepoCount(d1, ownerId, doer).then((repoCount) => ({ repoCount, followers: 0, following: 0 })),
+    ownerPackagesChrome(d1, owner, doer),
   ]);
 
   const names = await creatorNamesOf(d1, rows.map((row) => row.version));
@@ -732,6 +794,9 @@ export async function loadOwnerPackagesData(
     repoCount: chrome.repoCount,
     followers: chrome.followers,
     following: chrome.following,
+    openProjects: chrome.openProjects,
+    followButton: chrome.followButton,
+    viewerIsAdmin: chrome.viewerIsAdmin,
   };
 }
 
@@ -839,6 +904,13 @@ export interface OwnerPackageVersionsData {
   repoCount: number;
   followers: number;
   following: number;
+  /** The USER arm's Projects-tab count (header.tmpl:17-20). */
+  openProjects: number;
+  /** The strip's follow button (the user arm's avatar card :123-136, the
+   *  org arm's header org/header.tmpl:17). */
+  followButton: { following: boolean } | null;
+  /** profile_big_avatar.tmpl:18's admin gear gate (inert on the ORG arm). */
+  viewerIsAdmin: boolean;
 }
 
 /**
@@ -894,10 +966,7 @@ export async function loadOwnerPackageVersionsData(
   const names = await creatorNamesOf(d1, versions);
 
   const doer: ProfileDoer = viewer.kind === "user" ? { id: viewer.id, isAdmin: viewer.isAdmin } : { id: null, isAdmin: false };
-  const chrome =
-    owner.kind === "user"
-      ? await userProfileChrome(d1, owner.user, doer)
-      : { repoCount: await ownerRepoCount(d1, ownerIdOf(owner), doer), followers: 0, following: 0 };
+  const chrome = await ownerPackagesChrome(d1, owner, doer);
 
   return {
     owner,
@@ -911,6 +980,9 @@ export async function loadOwnerPackageVersionsData(
     repoCount: chrome.repoCount,
     followers: chrome.followers,
     following: chrome.following,
+    openProjects: chrome.openProjects,
+    followButton: chrome.followButton,
+    viewerIsAdmin: chrome.viewerIsAdmin,
   };
 }
 
@@ -940,6 +1012,13 @@ export interface PackageVersionViewData {
   repoCount: number;
   followers: number;
   following: number;
+  /** The USER arm's Projects-tab count (header.tmpl:17-20). */
+  openProjects: number;
+  /** The strip's follow button (the user arm's avatar card :123-136, the
+   *  org arm's header org/header.tmpl:17). */
+  followButton: { following: boolean } | null;
+  /** profile_big_avatar.tmpl:18's admin gear gate (inert on the ORG arm). */
+  viewerIsAdmin: boolean;
   /** `CanWritePackages` (package.go:306) — the write-mode rank of the SAME
    *  ladder the route gate ran; arms the settings/delete sidebar block and
    *  the terraform lock forms. */
@@ -1005,10 +1084,7 @@ export async function loadOwnerPackageVersionViewData(
   }
 
   const doer: ProfileDoer = viewer.kind === "user" ? { id: viewer.id, isAdmin: viewer.isAdmin } : { id: null, isAdmin: false };
-  const chrome =
-    owner.kind === "user"
-      ? await userProfileChrome(d1, owner.user, doer)
-      : { repoCount: await ownerRepoCount(d1, ownerId, doer), followers: 0, following: 0 };
+  const chrome = await ownerPackagesChrome(d1, owner, doer);
 
   // The write-mode rank (package.go:306's CanWritePackages — the same
   // determinePackageAccessMode ladder the route gate ran, now at write).
@@ -1060,6 +1136,9 @@ export async function loadOwnerPackageVersionViewData(
     repoCount: chrome.repoCount,
     followers: chrome.followers,
     following: chrome.following,
+    openProjects: chrome.openProjects,
+    followButton: chrome.followButton,
+    viewerIsAdmin: chrome.viewerIsAdmin,
     canWritePackages,
     isLatestVersion,
     terraformLock,
@@ -1434,11 +1513,15 @@ function PackagesListBlock(props: {
 
 /** The profile-grid chrome both user-arm pages share (profile.tmpl's grid:
  *  the four-wide avatar column + the twelve-wide column carrying the
- *  overview header). */
+ *  overview header). The avatar card renders the wave I-b C2 follow button
+ *  + C3 admin gear beside the unconditional RSS anchor
+ *  (profile_big_avatar.tmpl:123-136/:18/:31-33); the overview header carries
+ *  the C1 Projects + Code tabs INACTIVE (header.tmpl:14-31 — the Packages
+ *  tab stays the active one here, `.IsPackagesPage`). */
 function UserProfileGrid(props: {
   ctx: UiContext;
   user: UserProfileRow;
-  chrome: { repoCount: number; followers: number; following: number };
+  chrome: UserProfileChrome;
   children: import("hono/jsx").Child;
 }) {
   const username = props.user.username;
@@ -1446,14 +1529,22 @@ function UserProfileGrid(props: {
     <div class="ui container">
       <div class="ui stackable grid">
         <div class="ui four wide column">
-          <ProfileAvatarCard user={props.user} followers={props.chrome.followers} following={props.chrome.following} />
+          <ProfileAvatarCard
+            user={props.user}
+            followers={props.chrome.followers}
+            following={props.chrome.following}
+            followButton={props.chrome.followButton ?? undefined}
+            viewerIsAdmin={props.chrome.viewerIsAdmin}
+          />
         </div>
         <div class="ui twelve wide column tw-mb-4">
           <ProfileTabs
             username={username}
             repoCount={props.chrome.repoCount}
             starsCount={props.user.numStars}
+            projectsTab={{ active: false, count: props.chrome.openProjects, href: `/${username}/-/projects` }}
             packagesTab={{ active: true, href: `/${username}/-/packages` }}
+            codeTab={{ active: false, href: `/${username}/-/code` }}
           />
           {props.children}
         </div>
@@ -1464,17 +1555,25 @@ function UserProfileGrid(props: {
 
 /** The org chrome both org-arm pages share (org/header + org/menu with the
  *  Packages tab ACTIVE) — exported for pages/package-settings.tsx, the
- *  settings page's org arm. */
+ *  settings page's org arm. The header's follow button is the C2 arm
+ *  (org/header.tmpl:17); the menu's Code tab is the C1 arm (menu.tmpl:28-32,
+ *  inactive here). */
 export function OrgPackagesChrome(props: {
   ctx: UiContext;
   org: OrgRecord;
   repoCount: number;
+  followButton?: { following: boolean };
   children: import("hono/jsx").Child;
 }) {
   return (
     <>
-      <OrgHeader org={props.org} signedIn={props.ctx.viewer.kind === "user"} />
-      <OrgMenu orgLink={`/${props.org.username}`} repoCount={props.repoCount} packagesTab={{ active: true, href: `/${props.org.username}/-/packages` }} />
+      <OrgHeader org={props.org} signedIn={props.ctx.viewer.kind === "user"} followButton={props.followButton} />
+      <OrgMenu
+        orgLink={`/${props.org.username}`}
+        repoCount={props.repoCount}
+        packagesTab={{ active: true, href: `/${props.org.username}/-/packages` }}
+        codeTab={{ active: false, href: `/${props.org.username}/-/code` }}
+      />
       {props.children}
     </>
   );
@@ -1510,7 +1609,7 @@ export function OwnerPackagesPage(props: { ctx: UiContext; data: OwnerPackagesDa
     return (
       <BaseLayout ctx={ctx} title={packagesLocale.title} pageClass="organization packages">
         <div class="ui container">
-          <OrgPackagesChrome ctx={ctx} org={data.owner.org} repoCount={data.repoCount}>
+          <OrgPackagesChrome ctx={ctx} org={data.owner.org} repoCount={data.repoCount} followButton={data.followButton ?? undefined}>
             {listBlock}
           </OrgPackagesChrome>
         </div>
@@ -1589,7 +1688,7 @@ export function OwnerPackageVersionsPage(props: { ctx: UiContext; data: OwnerPac
     return (
       <BaseLayout ctx={ctx} title={packagesLocale.title} pageClass="organization packages">
         <div class="ui container">
-          <OrgPackagesChrome ctx={ctx} org={data.owner.org} repoCount={data.repoCount}>
+          <OrgPackagesChrome ctx={ctx} org={data.owner.org} repoCount={data.repoCount} followButton={data.followButton ?? undefined}>
             <PackageVersionsBlock data={data} />
           </OrgPackagesChrome>
         </div>
@@ -1885,7 +1984,7 @@ export function OwnerPackageVersionViewPage(props: { ctx: UiContext; data: Packa
     return (
       <BaseLayout ctx={ctx} title={data.pkg.name} pageClass="organization packages">
         <div class="ui container">
-          <OrgPackagesChrome ctx={ctx} org={data.owner.org} repoCount={data.repoCount}>
+          <OrgPackagesChrome ctx={ctx} org={data.owner.org} repoCount={data.repoCount} followButton={data.followButton ?? undefined}>
             <PackageVersionViewBlock data={data} />
           </OrgPackagesChrome>
         </div>

@@ -108,7 +108,12 @@
  * - The linked-PR read is the comments-ref walk upstream does (batched
  *   queries here, LoadComments there).
  * - The user arm's chrome carries the SAME reductions as the LIST page's
- *   (the two live overview tabs, no avatar images).
+ *   (the live overview tabs — Repositories/Projects plus the wave I-b C1
+ *   Code tab, header.tmpl:26-31, inactive — no avatar images). The avatar
+ *   card renders the C2 follow button (profile_big_avatar.tmpl:123-136) and
+ *   the C3 admin gear (:18); the org arm's header carries the C2 follow
+ *   button (org/header.tmpl:17) and its menu the C1 Code tab
+ *   (menu.tmpl:28-32, inactive).
  * - Markdown renders through the SHARED service in its context-less mode
  *   (SPEC-0008 §3.4's sanitizer divergence, the LIST page's note).
  */
@@ -150,7 +155,7 @@ import {
 } from "../../api/services/projects";
 import { issueLabelRows } from "../../api/services/issues";
 import type { IssueRow } from "../../issues/service";
-import { listFollowers, listFollowing } from "../../api/services/follows";
+import { isFollowing, listFollowers, listFollowing } from "../../api/services/follows";
 import { renderMarkdownToHtml } from "../../api/services/markdown";
 import type { RepositoryWithOwner, Viewer as ApiViewer } from "../../api/services/repository";
 import type { LabelRow } from "../../db/schema";
@@ -328,12 +333,20 @@ export function projectLinkOf(owner: ResolvedOwner, project: ProjectRow): string
 // ---------------------------------------------------------------------------
 
 /** The shared chrome counts (repoCount/openTotal for the menu tab,
- *  followers/following for the user arm's avatar card). */
+ *  followers/following for the user arm's avatar card) plus the strip's
+ *  follow-button + admin-gear inputs (the wave I-b arms — org/header.tmpl:17
+ *  on the ORG arm, profile_big_avatar.tmpl:123-136/:18 on the USER arm). */
 export interface BoardChromeCounts {
   repoCount: number;
   openTotal: number;
   followers: number;
   following: number;
+  /** Present only for a signed-in viewer who is not the owner (the
+   *  org-home/user-profile loaders' shape, IsFollowing(doer, owner)). */
+  followButton: { following: boolean } | null;
+  /** The signed-in viewer's site-admin flag (the USER arm's gear gate; the
+   *  ORG arm renders no avatar card, the field is inert there). */
+  viewerIsAdmin: boolean;
 }
 
 /** loadHeaderCount's RepoCount arm + the owner's OPEN-projects total (the
@@ -371,11 +384,18 @@ export async function loadProjectChromeCounts(
     followers = followerPage.total;
     following = followingPage.total;
   }
+  // The strip's follow button (org/header.tmpl:17 on the ORG arm,
+  // profile_big_avatar.tmpl:123-136 on the USER arm — the same IsFollowing
+  // state, header.go:28's argument order).
+  const viewerFollows =
+    doer.id !== null && doer.id !== ownerId ? await isFollowing(d1, doer.id, ownerId) : false;
   return {
     repoCount: Number(repoCountRow?.total ?? 0),
     openTotal: openPage.total,
     followers,
     following,
+    followButton: doer.id !== null && doer.id !== ownerId ? { following: viewerFollows } : null,
+    viewerIsAdmin: doer.isAdmin,
   };
 }
 
@@ -669,11 +689,16 @@ function BoardChrome(props: {
   if (props.owner.kind === "org") {
     return (
       <BaseLayout ctx={ctx} title={props.title} pageClass={props.pageClass}>
-        <OrgHeader org={props.owner.org} signedIn={ctx.viewer.kind === "user"} />
+        <OrgHeader
+          org={props.owner.org}
+          signedIn={ctx.viewer.kind === "user"}
+          followButton={props.counts.followButton ?? undefined}
+        />
         <OrgMenu
           orgLink={`/${ownerName}`}
           repoCount={props.counts.repoCount}
           projectsTab={{ active: true, count: props.counts.openTotal, href: listPath }}
+          codeTab={{ active: false, href: `/${ownerName}/-/code` }}
         />
         {props.children}
       </BaseLayout>
@@ -688,6 +713,8 @@ function BoardChrome(props: {
               user={props.owner.user}
               followers={props.counts.followers}
               following={props.counts.following}
+              followButton={props.counts.followButton ?? undefined}
+              viewerIsAdmin={props.counts.viewerIsAdmin}
             />
           </div>
           <div class="ui twelve wide column tw-mb-4">
@@ -695,6 +722,7 @@ function BoardChrome(props: {
               orgLink={`/${ownerName}`}
               repoCount={props.counts.repoCount}
               projectsTab={{ active: true, count: props.counts.openTotal, href: listPath }}
+              codeTab={{ active: false, href: `/${ownerName}/-/code` }}
             />
             {props.children}
           </div>

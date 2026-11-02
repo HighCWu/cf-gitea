@@ -45,25 +45,26 @@
  * card-level button would need that unlanded POST arm, and upstream renders
  * none here anyway.
  *
- * ## Entry points and the tab strip (the brief's strip-update question,
- *    verified — the strips do NOT change)
+ * ## Entry points and the tab strip (the wave I-b completion recorded)
  *
  * The `?tab=followers`/`?tab=following` anchors live ONLY on the avatar
  * card — `shared/user/profile_big_avatar.tmpl:25` renders the
  * `NumFollowers`/`NumFollowing` counts as the two
  * `{{.ContextUser.HomeLink}}?tab=…` anchors (the person glyph prefixing the
  * followers one). `user/overview/header.tmpl` has NO followers/following
- * menu entries at this pin (:8-34's conditions cover
+ * menu entries at this pin (:8-46's conditions cover
  * overview/repositories/projects/packages/code/activity/stars/watching
  * only) — so on these tabs upstream renders the overview header with NO
- * active item (both `eq .TabName` conditions fail), and NEITHER landed
- * strip (user-profile.tsx's ProfileTabs, activity-feeds.tsx's OverviewTabs)
- * gains anchors: rendering follower anchors in the header would be a
- * divergence, not parity. The mounts make profile_big_avatar.tmpl:25's pair
- * live — the ProfileAvatarCard anchor diff shipped with the mount (the
- * mount record). This module renders its own module-local strip (the
- * activity module's kept-local pattern) with both tabs INACTIVE — exact
- * header.tmpl behavior for `TabName = followers/following`.
+ * active item (both `eq .TabName` conditions fail). The avatar card is the
+ * SAME template on every profile tab (prepareContextForProfileBigAvatar
+ * runs for each), so the wave I-b arms ride along: the C2 follow button
+ * (profile_big_avatar.tmpl:123-136, IsFollowing over the landed machinery)
+ * and the C3 admin gear (:18) render beside the unconditional RSS anchor
+ * (:31-33). The module-local strip renders the C1 tab set INACTIVE
+ * (Projects header.tmpl:14-21 with the ProjectCount label, Packages
+ * :22-26 armed on the packages flag, Code :27-31) — exact header.tmpl
+ * behavior for `TabName = followers/following`, the activity module's
+ * local-strip shape.
  *
  * ## Visibility (the landed predicates — never a local re-derivation)
  *
@@ -136,8 +137,8 @@
 import { and, eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { listFollowers, listFollowing } from "../../api/services/follows";
-import { repositories } from "../../db/schema";
+import { isFollowing, listFollowers, listFollowing } from "../../api/services/follows";
+import { projects, repositories } from "../../db/schema";
 import { parsePageNumber } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
@@ -180,8 +181,20 @@ export interface UserFollowTabsData {
   following: number;
   /** The overview header's Repositories count (the doer-visible WHERE). */
   repoCount: number;
+  /** The overview header's Projects count (header.tmpl:17-20's
+   *  `{{if .ProjectCount}}` label — the OPEN individual projects,
+   *  loadHeaderCount parity). */
+  openProjects: number;
   page: number;
   more: boolean;
+  /** The avatar card's follow-button input (profile_big_avatar.tmpl:123-136
+   *  — the same template renders on every profile tab; present only for a
+   *  signed-in viewer who is not the target, IsFollowing(doer, target) its
+   *  label). */
+  followButton: { following: boolean } | null;
+  /** profile_big_avatar.tmpl:18's admin gear gate (the viewer's admin
+   *  flag). */
+  viewerIsAdmin: boolean;
 }
 
 /**
@@ -217,11 +230,25 @@ export async function loadUserFollowTabsData(
   const repoWhere = seePrivate
     ? eq(repositories.ownerId, user.id)
     : and(eq(repositories.ownerId, user.id), eq(repositories.visibility, "public"));
-  const repoCountRow = await drizzle(d1)
-    .select({ total: sql<number>`count(*)` })
-    .from(repositories)
-    .where(repoWhere)
-    .get();
+  const [repoCountRow, openProjectsRow, viewerFollows] = await Promise.all([
+    drizzle(d1)
+      .select({ total: sql<number>`count(*)` })
+      .from(repositories)
+      .where(repoWhere)
+      .get(),
+    // The strip's Projects count (header.tmpl:17-20 — the OPEN individual
+    // projects: the projects.ownerId arm, loadHeaderCount parity).
+    drizzle(d1)
+      .select({ total: sql<number>`count(*)` })
+      .from(projects)
+      .where(and(eq(projects.ownerId, user.id), eq(projects.isClosed, false)))
+      .get(),
+    // The avatar card is the SAME template on every profile tab
+    // (prepareContextForProfileBigAvatar runs for each) — the follow
+    // button's gate + state ride along here (profile_big_avatar.tmpl:
+    // 123-136, IsFollowing(doer, target), header.go:28's argument order).
+    doer.id !== null && doer.id !== user.id ? isFollowing(d1, doer.id, user.id) : Promise.resolve(false),
+  ]);
 
   return {
     user,
@@ -230,8 +257,11 @@ export async function loadUserFollowTabsData(
     followers: followers.total,
     following: following.total,
     repoCount: Number(repoCountRow?.total ?? 0),
+    openProjects: Number(openProjectsRow?.total ?? 0),
     page,
     more: page * USER_PROFILE_PAGE_SIZE < active.total,
+    followButton: doer.id !== null && doer.id !== user.id ? { following: viewerFollows } : null,
+    viewerIsAdmin: doer.isAdmin,
   };
 }
 
@@ -336,17 +366,34 @@ export function FollowCardsList(props: {
  * :33) fail for followers/following, and the Stars/watching anchors
  * (header.tmpl:36-46) never mark active here either (upstream renders the
  * overview header with no active item for these pages — the collapsed-if
- * rule: both anchors render, neither is active). Module-local, the activity
- * module's kept-local pattern; labels reuse userProfileLocale (this module
- * imports it).
+ * rule: both anchors render, neither is active). The wave I-b completion
+ * adds the C1 Projects tab (header.tmpl:14-21 — `octicon-project-symlink`,
+ * the `{{if .ProjectCount}}` label), the Packages tab (header.tmpl:22-26,
+ * armed on the strict-polarity packages flag) and the Code tab
+ * (header.tmpl:27-31 — `octicon-code`, the "user.code" label), all INACTIVE
+ * — the activity module's local strip renders the same three. Module-local,
+ * the activity module's kept-local pattern; labels reuse userProfileLocale
+ * (this module imports it).
  */
-function OverviewTabs(props: { username: string; repoCount: number }) {
+function OverviewTabs(props: { username: string; repoCount: number; openProjects: number; packagesEnabled?: boolean }) {
   return (
     <overflow-menu class="ui secondary pointing tabular borderless menu">
       <div class="overflow-menu-items">
         <a class="item" href={`/${props.username}?tab=repositories`}>
           <Icon name="octicon-repo" /> {userProfileLocale.repositories}
           {props.repoCount > 0 ? <div class="ui small label">{props.repoCount}</div> : null}
+        </a>
+        <a class="item" href={`/${props.username}/-/projects`}>
+          <Icon name="octicon-project-symlink" /> {userProfileLocale.projects}
+          {props.openProjects > 0 ? <div class="ui small label">{props.openProjects}</div> : null}
+        </a>
+        {props.packagesEnabled !== false ? (
+          <a class="item" href={`/${props.username}/-/packages`}>
+            <Icon name="octicon-package" /> {userProfileLocale.packages}
+          </a>
+        ) : null}
+        <a class="item" href={`/${props.username}/-/code`}>
+          <Icon name="octicon-code" /> {userProfileLocale.code}
         </a>
         <a class="item" href={`/${props.username}?tab=activity`}>
           <Icon name="octicon-rss" /> {userProfileLocale.activity}
@@ -370,7 +417,10 @@ export function renderUserFollowTabsPage(ctx: UiContext, data: UserFollowTabsDat
 }
 
 /** The profile follow tabs (profile.tmpl's grid + the `tab ==
- *  "followers"/"following"` branch: §2.4.1 discriminator `user profile`). */
+ *  "followers"/"following"` branch: §2.4.1 discriminator `user profile`).
+ *  The avatar card is the SAME template on every profile tab — the wave I-b
+ *  arms ride along (the follow button profile_big_avatar.tmpl:123-136, the
+ *  admin gear :18, the RSS anchor :31-33 already unconditional). */
 export function UserFollowTabsPage(props: { ctx: UiContext; data: UserFollowTabsData }) {
   const { ctx, data } = props;
   return (
@@ -378,10 +428,21 @@ export function UserFollowTabsPage(props: { ctx: UiContext; data: UserFollowTabs
       <div class="ui container">
         <div class="ui stackable grid">
           <div class="ui four wide column">
-            <ProfileAvatarCard user={data.user} followers={data.followers} following={data.following} />
+            <ProfileAvatarCard
+              user={data.user}
+              followers={data.followers}
+              following={data.following}
+              followButton={data.followButton ?? undefined}
+              viewerIsAdmin={data.viewerIsAdmin}
+            />
           </div>
           <div class="ui twelve wide column tw-mb-4">
-            <OverviewTabs username={data.user.username} repoCount={data.repoCount} />
+            <OverviewTabs
+              username={data.user.username}
+              repoCount={data.repoCount}
+              openProjects={data.openProjects}
+              packagesEnabled={ctx.packagesEnabled}
+            />
             <FollowCardsList
               username={data.user.username}
               tab={data.tab}

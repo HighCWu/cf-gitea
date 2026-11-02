@@ -20,7 +20,7 @@ import { renderToString } from "hono/jsx/dom/server";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { followUser } from "../../api/services/follows";
-import { repositories, users } from "../../db/schema";
+import { projects, repositories, users } from "../../db/schema";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import {
@@ -156,7 +156,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  for (const table of ["follows", "repositories", "users"]) {
+  for (const table of ["projects", "follows", "repositories", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
 });
@@ -269,7 +269,6 @@ describe("loadUserFollowTabsData (the loader seam)", () => {
 });
 
 // --- the render (user_cards.tmpl's DOM) -----------------------------------------
-
 describe("FollowCard (user_cards.tmpl:10-25's row)", () => {
   it("the name link carries DisplayName (fullName → username fallback) and the meta arms chain", async () => {
     await seedBaseFixtures();
@@ -389,5 +388,134 @@ describe("UserFollowTabsPage (the full-document render)", () => {
     expect(adminHtml).toContain("<title>Gal Owner - ");
     expect(adminHtml).toContain('<a href="/uporg">Up Org</a>'); // the org card
     expect(adminHtml).toContain('<a href="/priv">Priv Follower</a>');
+  });
+});
+
+// --- the wave I-b arms (the avatar card's follow button + admin gear, the
+// --- C1 Projects/Packages/Code tabs) ----------------------------------------
+
+/** One OPEN + one CLOSED owner-level project for gal (the ProjectCount
+ *  parity read answers the OPEN one only). */
+async function seedGalProjects(): Promise<void> {
+  const gal = await userRow("gal");
+  await drizzle(env.DB).insert(projects).values([
+    {
+      title: "Gal Open Plan",
+      creatorId: gal.id,
+      ownerId: gal.id,
+      repoId: "",
+      type: 1,
+      isClosed: false,
+      createdAt: FIXED_DATE,
+      updatedAt: FIXED_DATE,
+    },
+    {
+      title: "Gal Closed Plan",
+      creatorId: gal.id,
+      ownerId: gal.id,
+      repoId: "",
+      type: 1,
+      isClosed: true,
+      createdAt: FIXED_DATE,
+      updatedAt: FIXED_DATE,
+    },
+  ]);
+}
+
+describe("the wave I-b loader arms (openProjects, followButton, viewerIsAdmin)", () => {
+  it("openProjects is the OPEN projects total (the closed row never counts)", async () => {
+    await seedBaseFixtures();
+    await seedGalProjects();
+    const data = await loadUserFollowTabsData(env.DB, await userRow("gal"), admin, new URLSearchParams());
+    expect(data.openProjects).toBe(1);
+    // Zero owners answer zero (the {{if .ProjectCount}} label drops).
+    const strangerData = await loadUserFollowTabsData(
+      env.DB,
+      await userRow("stranger"),
+      admin,
+      new URLSearchParams(),
+    );
+    expect(strangerData.openProjects).toBe(0);
+  });
+
+  it("followButton renders only for a signed-in viewer who is not the target, IsFollowing its label", async () => {
+    await seedBaseFixtures();
+    // Anonymous: no button (the {{if and .IsSigned ...}} gate).
+    expect((await loadUserFollowTabsData(env.DB, await userRow("gal"), anon, new URLSearchParams())).followButton).toBeNull();
+    // The target themself: no button.
+    const self = await loadUserFollowTabsData(
+      env.DB,
+      await userRow("gal"),
+      { id: (await userRow("gal")).id, isAdmin: false },
+      new URLSearchParams(),
+    );
+    expect(self.followButton).toBeNull();
+    // A signed-in outsider: the button with the IsFollowing state (gal does
+    // NOT follow stranger — false; gal DOES follow pal — true).
+    const stranger = await userRow("stranger");
+    const gal = await userRow("gal");
+    expect(
+      (await loadUserFollowTabsData(env.DB, stranger, { id: gal.id, isAdmin: false }, new URLSearchParams()))
+        .followButton,
+    ).toEqual({ following: false });
+    expect(
+      (await loadUserFollowTabsData(env.DB, await userRow("pal"), { id: gal.id, isAdmin: false }, new URLSearchParams()))
+        .followButton,
+    ).toEqual({ following: true });
+    // The admin flag rides verbatim (the gear's gate).
+    expect((await loadUserFollowTabsData(env.DB, gal, admin, new URLSearchParams())).viewerIsAdmin).toBe(true);
+    expect((await loadUserFollowTabsData(env.DB, gal, anon, new URLSearchParams())).viewerIsAdmin).toBe(false);
+  });
+});
+
+describe("the wave I-b render arms (profile_big_avatar.tmpl:18/:31-33/:123-136 + header.tmpl:14-31)", () => {
+  it("a signed-in non-target viewer gets the follow form (no-JS POST) and an admin gets the gear; the RSS anchor is unconditional", async () => {
+    await seedBaseFixtures();
+    const gal = await userRow("gal");
+    const data = await loadUserFollowTabsData(env.DB, gal, admin, new URLSearchParams());
+    const html = renderToString(<UserFollowTabsPage ctx={ctx} data={data} />);
+
+    // The follow button (profile_big_avatar.tmpl:123-136): not following →
+    // the primary arm + the follow action; the POST is the landed
+    // `POST /{username}?action=…` reduction.
+    expect(html).toContain('<form method="post" action="/gal?action=follow">');
+    expect(html).toContain('class="ui basic primary button tw-w-full"');
+    expect(html).toContain("Follow");
+    // The admin gear (profile_big_avatar.tmpl:18) — the tooltip + the landed
+    // admin user-detail href.
+    expect(html).toContain('data-tooltip-content="User Details"');
+    expect(html).toContain(`href="/-/admin/users/${gal.id}"`);
+    // The RSS anchor (:31-33) — EnableFeed pins TRUE, always rendered.
+    expect(html).toContain('href="/gal.rss"');
+  });
+
+  it("anonymous gets neither follow form nor gear (the card keeps the prior arms + the RSS anchor)", async () => {
+    await seedBaseFixtures();
+    const data = await loadUserFollowTabsData(env.DB, await userRow("gal"), anon, new URLSearchParams());
+    const html = renderToString(<UserFollowTabsPage ctx={ctx} data={data} />);
+    expect(html).not.toContain('method="post" action="/gal?action=');
+    expect(html).not.toContain('data-tooltip-content="User Details"');
+    expect(html).toContain('href="/gal.rss"');
+  });
+
+  it("the strip renders the C1 Projects/Packages/Code tabs INACTIVE with the ProjectCount label", async () => {
+    await seedBaseFixtures();
+    await seedGalProjects();
+    const data = await loadUserFollowTabsData(env.DB, await userRow("gal"), admin, new URLSearchParams());
+    const html = renderToString(<UserFollowTabsPage ctx={ctx} data={data} />);
+    // Projects (header.tmpl:14-21): inactive here, the OPEN count label.
+    expect(html).toContain('class="item" href="/gal/-/projects"');
+    expect(html).toContain("octicon-project-symlink");
+    expect(html).toContain('<div class="ui small label">1</div>'); // the open project (repoCount is 2 for admin — its own label)
+    // Packages (header.tmpl:22-26) + Code (header.tmpl:27-31): inactive.
+    expect(html).toContain('class="item" href="/gal/-/packages"');
+    expect(html).toContain("octicon-package");
+    expect(html).toContain('class="item" href="/gal/-/code"');
+    expect(html).toContain("octicon-code");
+    // NEITHER new tab (nor any tab) is active — TabName=followers matches
+    // nothing (header.tmpl's eq conditions).
+    expect(html).not.toContain('class="active item" href="/gal/-/projects"');
+    expect(html).not.toContain('class="active item" href="/gal/-/code"');
+    expect(html).not.toContain('class="active item" href="/gal?tab=repositories"');
   });
 });

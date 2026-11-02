@@ -109,24 +109,30 @@
  *   is the same repo-context-free render; ours escapes raw HTML
  *   (SPEC-0008 §3.4's documented sanitizer divergence).
  * - The user arm's overview menu (user/overview/header.tmpl) renders the
- *   two live tabs (Repositories + the active Projects) — Overview needs a
- *   profile-readme pipeline, Packages/Code/Activity/Stars their pages
- *   (dead links forbidden, §2.4.1); the Repositories tab anchors
- *   `/{username}` (the landed profile page, the user-profile menu
- *   convention — upstream's `?tab=repositories` is a no-op here). Tab
+ *   live tabs (Repositories + the active Projects + the C1 Code tab,
+ *   header.tmpl:26-31 — the wave I-b completion; Packages/Activity/Stars
+ *   stay unrendered, their pages dead links here §2.4.1); the Repositories
+ *   tab anchors `/{username}` (the landed profile page, the user-profile
+ *   menu convention — upstream's `?tab=repositories` is a no-op here). Tab
  *   count labels ride `loadHeaderCount`'s data (header.go:165-193):
  *   RepoCount = the doer-visible repository total (the profile loader's
- *   WHERE), ProjectCount = the OPEN projects total.
+ *   WHERE), ProjectCount = the OPEN projects total. The avatar card renders
+ *   the C2 follow button (profile_big_avatar.tmpl:123-136, IsFollowing over
+ *   the landed machinery) and the C3 admin gear (:18, the viewer-side admin
+ *   flag) beside the unconditional RSS anchor (:31-33 — EnableFeed pins
+ *   TRUE, modules/setting/other.go:21).
  * - The org arm's menu renders the Repositories + Projects tabs —
- *   OrgMenu's additive projectsTab extension (org-home.tsx, disclosed);
- *   Members/Teams/Settings stay OrgMenu's own reduction (not this row's
- *   diff).
+ *   OrgMenu's additive projectsTab extension (org-home.tsx, disclosed) —
+ *   plus the C1 Code tab (menu.tmpl:28-32, the wave I-b completion,
+ *   inactive); the org header carries the C2 follow button
+ *   (org/header.tmpl:17's follow_unfollow include). Members/Teams/Settings
+ *   stay OrgMenu's own reduction (not this row's diff).
  */
 
 import { and, eq, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { listFollowers, listFollowing } from "../../api/services/follows";
+import { isFollowing, listFollowers, listFollowing } from "../../api/services/follows";
 import { renderMarkdownToHtml } from "../../api/services/markdown";
 import {
   listProjects,
@@ -265,6 +271,17 @@ export interface OwnerProjectsData {
   /** The user arm's avatar-card counts (profile_big_avatar.tmpl). */
   followers: number;
   following: number;
+  /** The strip's follow-button input (org/header.tmpl:17's follow_unfollow
+   *  include on the ORG arm, profile_big_avatar.tmpl:123-136's button on the
+   *  USER arm — both `{{if .IsSigned}}` / `{{if and .IsSigned (ne
+   *  .SignedUserID .ContextUser.ID)}}`): present only for a signed-in viewer
+   *  who is not the owner (the org-home/user-profile loaders' shape,
+   *  IsFollowing(doer, owner) its label). */
+  followButton: { following: boolean } | null;
+  /** profile_big_avatar.tmpl:18's admin gear gate (`{{if .IsAdmin}}` — the
+   *  signed-in viewer's admin flag; the ORG arm renders no avatar card, the
+   *  field is inert there). */
+  viewerIsAdmin: boolean;
 }
 
 /**
@@ -383,6 +400,13 @@ export async function loadOwnerProjectsData(
     following = followingPage.total;
   }
 
+  // The strip's follow button (org/header.tmpl:17 on the ORG arm,
+  // profile_big_avatar.tmpl:123-136 on the USER arm — the same IsFollowing
+  // state, header.go:28's argument order; a signed-in viewer who is not the
+  // owner carries the button).
+  const viewerFollows =
+    doer.id !== null && doer.id !== ownerId ? await isFollowing(d1, doer.id, ownerId) : false;
+
   return {
     owner,
     items,
@@ -396,6 +420,8 @@ export async function loadOwnerProjectsData(
     repoCount: Number(repoCountRow?.total ?? 0),
     followers,
     following,
+    followButton: doer.id !== null && doer.id !== ownerId ? { following: viewerFollows } : null,
+    viewerIsAdmin: doer.isAdmin,
   };
 }
 
@@ -556,14 +582,18 @@ export function OwnerProjectsPage(props: { ctx: UiContext; data: OwnerProjectsDa
   if (data.owner.kind === "org") {
     // The ORG arm: org/header (the landed OrgHeader; org/header.tmpl:38's
     // trailing org/menu include is the OrgMenu strip) + the list inside the
-    // upstream container.
+    // upstream container. The follow button rides the loader's IsFollowing
+    // state (header.tmpl:17's include); the menu's Code tab is the C1 arm
+    // (menu.tmpl:28-32 — inactive here, IsCodePage false on the projects
+    // page).
     return (
       <BaseLayout ctx={ctx} title={ownerProjectsLocale.projects} pageClass="organization projects">
-        <OrgHeader org={data.owner.org} signedIn={ctx.viewer.kind === "user"} />
+        <OrgHeader org={data.owner.org} signedIn={ctx.viewer.kind === "user"} followButton={data.followButton ?? undefined} />
         <OrgMenu
           orgLink={`/${ownerName}`}
           repoCount={data.repoCount}
           projectsTab={{ active: true, count: data.openTotal, href: basePath }}
+          codeTab={{ active: false, href: `/${ownerName}/-/code` }}
         />
         <div class="ui container">
           <ProjectsListBlock basePath={basePath} data={data} />
@@ -574,18 +604,28 @@ export function OwnerProjectsPage(props: { ctx: UiContext; data: OwnerProjectsDa
   // The USER arm: the profile grid — four-wide avatar column + twelve-wide
   // column carrying the overview header menu + the list (profile.tmpl's
   // projects shape, shared/user/profile_big_avatar + user/overview/header).
+  // The avatar card's follow button + admin gear are the C2/C3 arms
+  // (profile_big_avatar.tmpl:123-136/:18); the menu's Code tab is the C1
+  // arm (header.tmpl:26-31 — inactive here).
   return (
     <BaseLayout ctx={ctx} title={ownerProjectsLocale.projects} pageClass="user profile">
       <div class="ui container">
         <div class="ui stackable grid">
           <div class="ui four wide column">
-            <ProfileAvatarCard user={data.owner.user} followers={data.followers} following={data.following} />
+            <ProfileAvatarCard
+              user={data.owner.user}
+              followers={data.followers}
+              following={data.following}
+              followButton={data.followButton ?? undefined}
+              viewerIsAdmin={data.viewerIsAdmin}
+            />
           </div>
           <div class="ui twelve wide column tw-mb-4">
             <OrgMenu
               orgLink={`/${ownerName}`}
               repoCount={data.repoCount}
               projectsTab={{ active: true, count: data.openTotal, href: basePath }}
+              codeTab={{ active: false, href: `/${ownerName}/-/code` }}
             />
             <ProjectsListBlock basePath={basePath} data={data} />
           </div>

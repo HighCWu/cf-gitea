@@ -51,7 +51,8 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../../auth/testing/seeds";
-import { repositories, users } from "../../db/schema";
+import { followUser } from "../../api/services/follows";
+import { projects, repositories, users } from "../../db/schema";
 import { RepoService } from "../../repos/service";
 import { OrgService } from "../../services/orgs/orgs";
 import { ensureSeededRepo, type SeedCommit } from "../testing/seed-repo";
@@ -205,6 +206,8 @@ beforeAll(async () => {
 beforeEach(async () => {
   // FK order (the repo-search.matrix wipe).
   for (const table of [
+    "projects",
+    "follows",
     "release_assets",
     "releases",
     "webhook_deliveries",
@@ -645,5 +648,124 @@ describe("user-code-search a11y smoke", () => {
       const violations = runA11y(page.html);
       expect(violations, JSON.stringify(violations)).toEqual([]);
     }
+  });
+});
+
+// --- the wave I-b strip arms (header.tmpl:14-31 + profile_big_avatar.tmpl) --------
+
+/** A signed-in non-target viewer row (the follow button's arm). */
+async function seedViewer(): Promise<UserProfileRow> {
+  await seedVerifiedUser({ username: "cs-viewer" });
+  const row = await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "cs-viewer")).get();
+  if (row === undefined) throw new Error("cs-viewer row missing");
+  return row;
+}
+
+/** One OPEN + one CLOSED owner-level project for cs-owner (the ProjectCount
+ *  parity read answers the OPEN one only). */
+async function seedOwnerProjects(owner: UserProfileRow): Promise<void> {
+  await drizzle(env.DB).insert(projects).values([
+    {
+      title: "Owner Open Plan",
+      creatorId: owner.id,
+      ownerId: owner.id,
+      repoId: "",
+      type: 1,
+      isClosed: false,
+      createdAt: OLD_TIME,
+      updatedAt: OLD_TIME,
+    },
+    {
+      title: "Owner Closed Plan",
+      creatorId: owner.id,
+      ownerId: owner.id,
+      repoId: "",
+      type: 1,
+      isClosed: true,
+      createdAt: OLD_TIME,
+      updatedAt: OLD_TIME,
+    },
+  ]);
+}
+
+describe("the wave I-b strip arms on the code page", () => {
+  it("the user arm: the Code tab ACTIVE, the Projects tab with its open count, the follow form + the admin gear on the card", async () => {
+    await seedContentFamily();
+    const owner = await seedOwner();
+    await seedOwnerProjects(owner);
+    const viewer = await seedViewer();
+    const doer: ProfileDoer = { id: viewer.id, isAdmin: false };
+
+    // Not following → the primary follow arm (profile_big_avatar.tmpl:126-127).
+    const page = await renderPage("cs-owner", doer, { kind: "user", id: viewer.id, username: "cs-viewer", isAdmin: false }, "");
+    expect(page.status).toBe(200);
+    expect(page.html).toContain('<form method="post" action="/cs-owner?action=follow">');
+    expect(page.html).toContain('class="ui basic primary button tw-w-full"');
+    // The Projects tab (header.tmpl:14-21) — inactive here, the OPEN count.
+    expect(page.html).toContain('class="item" href="/cs-owner/-/projects"');
+    expect(page.html).toContain("octicon-project-symlink");
+    expect(page.html).toContain('<div class="ui small label">1</div>');
+    // The Code tab (header.tmpl:27-31) — ACTIVE (IsCodePage on this page).
+    expect(page.html).toContain('class="active item" href="/cs-owner/-/code"');
+    expect(page.html).toContain("octicon-code");
+    // The RSS anchor renders unconditionally (EnableFeed pins TRUE); the
+    // gear never renders for a non-admin viewer.
+    expect(page.html).toContain('href="/cs-owner.rss"');
+    expect(page.html).not.toContain('data-tooltip-content="User Details"');
+    // The Packages tab renders under the strict-polarity flag (undefined ⇒ on).
+    expect(page.html).toContain('class="item" href="/cs-owner/-/packages"');
+
+    // Following → the unfollow arm drops the primary class
+    // (profile_big_avatar.tmpl:126's Iif).
+    await followUser(env.DB, viewer.id, owner.id);
+    const followed = await renderPage("cs-owner", doer, { kind: "user", id: viewer.id, username: "cs-viewer", isAdmin: false }, "");
+    expect(followed.html).toContain('<form method="post" action="/cs-owner?action=unfollow">');
+    expect(followed.html).toContain('class="ui basic  button tw-w-full"');
+
+    // An admin viewer gets the gear (profile_big_avatar.tmpl:18) onto the
+    // landed admin user-detail page.
+    await seedVerifiedUser({ username: "cs-admin", isAdmin: true });
+    const adminRow = await drizzle(env.DB).select().from(users).where(eq(users.usernameLower, "cs-admin")).get();
+    if (adminRow === undefined) throw new Error("cs-admin row missing");
+    const adminPage = await renderPage(
+      "cs-owner",
+      { id: adminRow.id, isAdmin: true },
+      { kind: "user", id: adminRow.id, username: "cs-admin", isAdmin: true },
+      "",
+    );
+    expect(adminPage.html).toContain('data-tooltip-content="User Details"');
+    expect(adminPage.html).toContain(`href="/-/admin/users/${owner.id}"`);
+  });
+
+  it("anonymous gets no follow form and the org arm carries the header follow button + the ACTIVE Code tab", async () => {
+    await seedContentFamily();
+    const owner = await seedOwner();
+
+    // Anonymous: no follow form, the card's other arms intact.
+    const anonPage = await renderPage("cs-owner", anonDoer, { kind: "anonymous" }, "");
+    expect(anonPage.html).not.toContain('method="post" action="/cs-owner?action=');
+    expect(anonPage.html).toContain('href="/cs-owner.rss"');
+    expect(anonPage.html).toContain('class="active item" href="/cs-owner/-/code"');
+
+    // The org arm: org/header's follow_unfollow include (org/header.tmpl:17)
+    // renders for the signed-in owner-viewer (an org self-follow cannot
+    // exist — following=false), the menu's Code tab ACTIVE (menu.tmpl:28-32).
+    const orgs = new OrgService(env.DB);
+    const org = await orgs.createOrg({ name: "cs-iborg", ownerId: owner.id });
+    await seedPaddingRepo({ id: org.id, usernameLower: "cs-iborg" }, "orgrepo");
+    const doer: ProfileDoer = { id: owner.id, isAdmin: false };
+    const orgPage = await renderPage(
+      "cs-iborg",
+      doer,
+      { kind: "user", id: owner.id, username: owner.username, isAdmin: false },
+      "",
+    );
+    expect(orgPage.status).toBe(200);
+    expect(orgPage.html).toContain('class="page-content organization code"');
+    expect(orgPage.html).toContain('<form method="post" action="/cs-iborg?action=follow">');
+    expect(orgPage.html).toContain('class="ui basic button"');
+    expect(orgPage.html).toContain('class="active item" href="/cs-iborg/-/code"');
+    // The org arm renders no avatar card (OrgHeader renders none upstream).
+    expect(orgPage.html).not.toContain('id="profile-avatar-card"');
   });
 });

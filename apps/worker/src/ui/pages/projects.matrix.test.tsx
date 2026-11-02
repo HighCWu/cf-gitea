@@ -689,3 +689,91 @@ async function repoIdOf(slug: string): Promise<string> {
   if (row === undefined) throw new Error(`repo ${slug} not seeded`);
   return row.id;
 }
+
+// --- the wave I-b strip arms (org/header.tmpl:17 + menu.tmpl:28-32 +
+// --- profile_big_avatar.tmpl:18/:31-33/:123-136 on the LIST + BOARD pages) --------
+
+describe("the wave I-b strip arms on the projects pages", () => {
+  it("the list page's USER arm: the Code tab inactive, the card's RSS anchor; anonymous gets no follow form or gear", async () => {
+    const res = await fetchUi(`/${OWNER_NAME}/-/projects`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The C1 Code tab (header.tmpl:26-31) — present, INACTIVE (the Projects
+    // tab is the active one here).
+    expect(html).toContain('class="item" href="/projmx-owner/-/code"');
+    expect(html).toContain("octicon-code");
+    expect(html).not.toContain('class="active item" href="/projmx-owner/-/code"');
+    // The avatar card's unconditional RSS anchor (profile_big_avatar.tmpl:
+    // 31-33 — EnableFeed pins TRUE).
+    expect(html).toContain('href="/projmx-owner.rss"');
+    // Anonymous: no follow form, no gear.
+    expect(html).not.toContain('method="post" action="/projmx-owner?action=');
+    expect(html).not.toContain('data-tooltip-content="User Details"');
+  });
+
+  it("the list page's USER arm for a signed-in non-owner: the follow form; for the site admin: the gear", async () => {
+    const fixture = await ensureProjectsFixtures();
+    const signed = await fetchUi(`/${OWNER_NAME}/-/projects`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.orgOwnerCookie}` },
+    });
+    expect(signed.status).toBe(200);
+    const signedHtml = await signed.text();
+    expect(signedHtml).toContain('<form method="post" action="/projmx-owner?action=follow">');
+    expect(signedHtml).toContain('class="ui basic primary button tw-w-full"');
+
+    const admin = await fetchUi(`/${OWNER_NAME}/-/projects`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.adminCookie}` },
+    });
+    expect(admin.status).toBe(200);
+    const adminHtml = await admin.text();
+    expect(adminHtml).toContain('data-tooltip-content="User Details"');
+    expect(adminHtml).toContain(`href="/-/admin/users/${fixture.ownerId}"`);
+    // The gear is the card's only admin arm — the anonymous gear never
+    // rendered, so this node is the diff (the board twin pins the same).
+    expect(adminHtml).toContain("<title>Projects - ");
+  });
+
+  it("the list page's ORG arm: the header follow button + the RSS anchor, the Code tab inactive on the menu", async () => {
+    const fixture = await ensureProjectsFixtures();
+    const res = await fetchUi(`/${ORG_NAME}/-/projects`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.orgOwnerCookie}` },
+    });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // org/header.tmpl:16-20's RSS anchor + :17's follow_unfollow include
+    // (the org owner does not follow the org — the follow arm).
+    expect(html).toContain('class="ui basic label button" href="/projmxorg.rss"');
+    expect(html).toContain('<form method="post" action="/projmxorg?action=follow">');
+    // menu.tmpl:28-32's Code item — present, INACTIVE (PageIsViewProjects).
+    expect(html).toContain('class="item" href="/projmxorg/-/code"');
+    expect(html).not.toContain('class="active item" href="/projmxorg/-/code"');
+  });
+
+  it("the BOARD page carries the same arms on both chrome arms", async () => {
+    const fixture = await ensureProjectsFixtures();
+    // The USER arm (the admin viewer: follow form + gear + inactive Code).
+    const userBoard = await fetchUi(`/${OWNER_NAME}/-/projects/${fixture.userBoardId}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.adminCookie}` },
+    });
+    expect(userBoard.status).toBe(200);
+    const userHtml = await userBoard.text();
+    expect(userHtml).toContain('<form method="post" action="/projmx-owner?action=follow">');
+    expect(userHtml).toContain(`href="/-/admin/users/${fixture.ownerId}"`);
+    expect(userHtml).toContain('href="/projmx-owner.rss"');
+    expect(userHtml).toContain('class="item" href="/projmx-owner/-/code"');
+    expect(userHtml).not.toContain('class="active item" href="/projmx-owner/-/code"');
+
+    // The ORG arm (the org owner: header follow button + inactive Code).
+    const orgBoard = await fetchUi(`/${ORG_NAME}/-/projects/${fixture.orgBoardId}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${fixture.orgOwnerCookie}` },
+    });
+    expect(orgBoard.status).toBe(200);
+    const orgHtml = await orgBoard.text();
+    expect(orgHtml).toContain('<form method="post" action="/projmxorg?action=follow">');
+    expect(orgHtml).toContain('href="/projmxorg.rss"');
+    expect(orgHtml).toContain('class="item" href="/projmxorg/-/code"');
+    expect(orgHtml).not.toContain('class="active item" href="/projmxorg/-/code"');
+    // The org arm renders no avatar card — no gear site.
+    expect(orgHtml).not.toContain('data-tooltip-content="User Details"');
+  });
+});

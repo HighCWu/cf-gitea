@@ -74,7 +74,7 @@ import {
   tryInsertFile,
 } from "../../services/packages/model";
 import { lockPackageTerraformState } from "./package-settings";
-import { follows, packageVersions, packages, repoSettings, repoUnits, users } from "../../db/schema";
+import { follows, packageVersions, packages, projects, repoSettings, repoUnits, users } from "../../db/schema";
 import { BaseLayout } from "../shell";
 import { shellAssetsFromManifest, type RepoRow, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
@@ -118,6 +118,7 @@ const assets = shellAssetsFromManifest(manifest);
 /** Tables the fixtures touch (children first — the model suite's sweep
  *  convention). */
 const FIXTURE_TABLES = [
+  "projects",
   "package_properties",
   "package_files",
   "package_blobs",
@@ -956,4 +957,122 @@ it("the type census carries upstream's 23-member TypeList with display names", (
   expect(packageTypeName("pypi")).toBe("PyPI");
   expect(packageTypeName("terraform")).toBe("Terraform State");
   expect(packageTypeName("mystery")).toBe("mystery"); // the open string set
+});
+
+// ---------------------------------------------------------------------------
+// The wave I-b strip arms (header.tmpl:14-31 / menu.tmpl:28-32 /
+// org/header.tmpl:17 / profile_big_avatar.tmpl:18/:31-33/:123-136)
+// ---------------------------------------------------------------------------
+
+/** One OPEN owner-level project for the Projects-tab count parity read. */
+async function seedOwnerProject(ownerId: number, title: string, isClosed = false) {
+  await db().insert(projects).values({
+    title,
+    creatorId: ownerId,
+    ownerId,
+    repoId: "",
+    type: 1,
+    isClosed,
+    createdAt: T0,
+    updatedAt: T0,
+  });
+}
+
+describe("the wave I-b strip arms on the packages pages", () => {
+  it("the owner list USER arm: the Projects + Code tabs join the strip (Packages stays active), the card grows the follow form + gear + RSS anchor", async () => {
+    const owner = await seedUser("ibowner");
+    await seedOwnerProject(owner.id, "Ib Open Plan");
+    await seedOwnerProject(owner.id, "Ib Closed Plan", true);
+    await seedPackageVersion(owner.id, "ib-tool", "1.0.0");
+
+    // A signed-in non-owner viewer: the follow form (not following → the
+    // primary arm), the Projects tab with the OPEN count, the inactive Code
+    // tab, the still-ACTIVE Packages tab.
+    const viewer: Viewer = { kind: "user", id: owner.id + 1, username: "ibviewer", isAdmin: false };
+    await seedUser("ibviewer");
+    const data = await loadOwnerPackagesData(env.DB, { kind: "user", user: await rowOf(owner.id) }, viewer, ORIGIN, new URLSearchParams());
+    const html = renderOwnerPackagesPage(pageCtx(viewer), data);
+    expect(html).toContain('<form method="post" action="/ibowner?action=follow">');
+    expect(html).toContain('class="ui basic primary button tw-w-full"');
+    expect(html).toContain('class="item" href="/ibowner/-/projects"');
+    expect(html).toContain("octicon-project-symlink");
+    expect(html).toContain('<div class="ui small label">1</div>'); // the OPEN project only
+    expect(html).toContain('class="item" href="/ibowner/-/code"');
+    expect(html).not.toContain('class="active item" href="/ibowner/-/code"');
+    expect(html).toContain('<a class="active item" href="/ibowner/-/packages">'); // the ACTIVE Packages tab
+    expect(html).toContain('href="/ibowner.rss"'); // the card's unconditional RSS anchor
+    expect(html).not.toContain('data-tooltip-content="User Details"'); // no gear for a non-admin
+
+    // The site-admin viewer: the gear onto the landed admin user-detail page.
+    const adminViewer: Viewer = { kind: "user", id: owner.id + 2, username: "ibadmin", isAdmin: true };
+    await seedUser("ibadmin", { isAdmin: true });
+    const adminData = await loadOwnerPackagesData(env.DB, { kind: "user", user: await rowOf(owner.id) }, adminViewer, ORIGIN, new URLSearchParams());
+    const adminHtml = renderOwnerPackagesPage(pageCtx(adminViewer), adminData);
+    expect(adminHtml).toContain('data-tooltip-content="User Details"');
+    expect(adminHtml).toContain(`href="/-/admin/users/${owner.id}"`);
+
+    // Anonymous: no follow form, no gear, the rest of the chrome intact.
+    const anonData = await loadOwnerPackagesData(env.DB, { kind: "user", user: await rowOf(owner.id) }, { kind: "anonymous" }, ORIGIN, new URLSearchParams());
+    const anonHtml = renderOwnerPackagesPage(pageCtx({ kind: "anonymous" }), anonData);
+    expect(anonHtml).not.toContain('method="post" action="/ibowner?action=');
+    expect(anonHtml).not.toContain('data-tooltip-content="User Details"');
+    expect(anonHtml).toContain('href="/ibowner.rss"');
+  });
+
+  it("the owner list ORG arm: the header follow button + RSS anchor, the Code tab inactive beside the ACTIVE Packages tab", async () => {
+    const owner = await seedUser("iborgowner");
+    const orgs = new OrgService(env.DB);
+    const org = await orgs.createOrg({ name: "iborg", ownerId: owner.id });
+    await seedPackageVersion(org.id, "ib-org-tool", "1.0.0");
+
+    // A signed-in viewer: org/header.tmpl:17's follow_unfollow include +
+    // :16-20's RSS anchor; menu.tmpl:28-32's Code item INACTIVE.
+    const viewer: Viewer = { kind: "user", id: owner.id, username: "iborgowner", isAdmin: false };
+    const data = await loadOwnerPackagesData(env.DB, { kind: "org", org }, viewer, ORIGIN, new URLSearchParams());
+    const html = renderOwnerPackagesPage(pageCtx(viewer), data);
+    expect(html).toContain('<form method="post" action="/iborg?action=follow">');
+    expect(html).toContain('class="ui basic button"');
+    expect(html).toContain('class="ui basic label button" href="/iborg.rss"');
+    expect(html).toContain('class="item" href="/iborg/-/code"');
+    expect(html).not.toContain('class="active item" href="/iborg/-/code"');
+    expect(html).toContain('<a class="active item" href="/iborg/-/packages">');
+    // The org arm renders no avatar card — no gear site.
+    expect(html).not.toContain('id="profile-avatar-card"');
+
+    // Anonymous: the follow button drops (org/header.tmpl:17's IsSigned gate).
+    const anonData = await loadOwnerPackagesData(env.DB, { kind: "org", org }, { kind: "anonymous" }, ORIGIN, new URLSearchParams());
+    const anonHtml = renderOwnerPackagesPage(pageCtx({ kind: "anonymous" }), anonData);
+    expect(anonHtml).not.toContain('method="post" action="/iborg?action=');
+    expect(anonHtml).toContain('class="ui basic label button" href="/iborg.rss"');
+  });
+
+  it("the version view threads the same chrome through its loaders (user + org arms)", async () => {
+    const owner = await seedUser("ibview");
+    const { pkg, ver } = await seedPackageVersion(owner.id, "ib-view-tool", "1.0.0");
+    await seedFile(ver.id, "ib.txt", "content");
+    await seedOwnerProject(owner.id, "Ib View Plan");
+
+    const viewer: Viewer = { kind: "user", id: owner.id + 1, username: "ibviewviewer", isAdmin: false };
+    await seedUser("ibviewviewer");
+    const data = await loadOwnerPackageVersionViewData(env.DB, { kind: "user", user: await rowOf(owner.id) }, viewer, ORIGIN, pkg.type, pkg.name, ver.version);
+    if (data === null) throw new Error("view data missing");
+    const html = renderOwnerPackageVersionViewPage(pageCtx(viewer), data);
+    expect(html).toContain('<form method="post" action="/ibview?action=follow">');
+    expect(html).toContain('class="item" href="/ibview/-/projects"');
+    expect(html).toContain('<div class="ui small label">1</div>');
+    expect(html).toContain('class="item" href="/ibview/-/code"');
+
+    // The org twin: the view page's OrgPackagesChrome carries the follow
+    // button + the inactive Code tab too.
+    const orgs = new OrgService(env.DB);
+    const org = await orgs.createOrg({ name: "ibvieworg", ownerId: owner.id });
+    const { pkg: orgPkg, ver: orgVer } = await seedPackageVersion(org.id, "ib-view-org-tool", "1.0.0");
+    await seedFile(orgVer.id, "ibo.txt", "content");
+    const orgData = await loadOwnerPackageVersionViewData(env.DB, { kind: "org", org }, viewer, ORIGIN, orgPkg.type, orgPkg.name, orgVer.version);
+    if (orgData === null) throw new Error("org view data missing");
+    const orgHtml = renderOwnerPackageVersionViewPage(pageCtx(viewer), orgData);
+    expect(orgHtml).toContain('<form method="post" action="/ibvieworg?action=follow">');
+    expect(orgHtml).toContain('class="item" href="/ibvieworg/-/code"');
+    expect(orgHtml).not.toContain('class="active item" href="/ibvieworg/-/code"');
+  });
 });

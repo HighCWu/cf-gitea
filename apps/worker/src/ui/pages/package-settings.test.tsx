@@ -46,7 +46,7 @@ import { RepoService } from "../../repos/service";
 import { OrgService } from "../../services/orgs/orgs";
 import { getOrInsertPackage, getOrInsertVersion, linkPackageToRepo } from "../../services/packages/model";
 import { getTerraformLock, isTerraformLockLocked } from "../../services/packages/terraform";
-import { packages, users } from "../../db/schema";
+import { packages, projects, users } from "../../db/schema";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
@@ -80,6 +80,7 @@ const assets = shellAssetsFromManifest(manifest);
 /** Tables the fixtures touch (children first — the model suite's sweep
  *  convention; package_properties carries the terraform lock). */
 const FIXTURE_TABLES = [
+  "projects",
   "package_properties",
   "package_files",
   "package_blobs",
@@ -368,5 +369,71 @@ describe("parsePackageSettingsForm — the three fields", () => {
       packageName: "doomed",
     });
     expect(parsePackageSettingsForm(new URLSearchParams())).toEqual({ action: "", repoName: "", packageName: "" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The wave I-b strip arms (header.tmpl:14-31 + org/header.tmpl:16-20/:17)
+// ---------------------------------------------------------------------------
+
+describe("the wave I-b strip arms on the settings page", () => {
+  it("the USER arm: the Projects + Code tabs join the overview header (Packages stays active); the avatar strip renders no follow/gear/rss (org_profile_avatar)", async () => {
+    const alice = await seedUser("ibsetter");
+    await db().insert(projects).values({
+      title: "Ib Settings Plan",
+      creatorId: alice.id,
+      ownerId: alice.id,
+      repoId: "",
+      type: 1,
+      isClosed: false,
+      createdAt: T0,
+      updatedAt: T0,
+    });
+    const { pkg } = await seedPackageVersion(alice.id, "ib-set", "1.0.0");
+    const owner: PackagesOwner = { kind: "user", user: await rowOf(alice.id) };
+    // A signed-in NON-owner viewer: the data's follow button is present but
+    // the settings page renders org_profile_avatar (no follow control).
+    const viewer: Viewer = { kind: "user", id: alice.id + 1, username: "ibsetviewer", isAdmin: false };
+    await seedUser("ibsetviewer");
+
+    const data = await loadPackageSettingsData(env.DB, owner, viewer, ORIGIN, pkg);
+    expect(data.openProjects).toBe(1);
+    expect(data.followButton).toEqual({ following: false });
+    const html = renderPackageSettingsPage(pageCtx(viewer), data);
+    // The overview header (user/overview/header.tmpl): the C1 Projects +
+    // Code tabs INACTIVE, the Packages tab stays ACTIVE.
+    expect(html).toContain('class="item" href="/ibsetter/-/projects"');
+    expect(html).toContain('<div class="ui small label">1</div>');
+    expect(html).toContain('class="item" href="/ibsetter/-/code"');
+    expect(html).not.toContain('class="active item" href="/ibsetter/-/code"');
+    expect(html).toContain('<a class="active item" href="/ibsetter/-/packages">'); // ACTIVE Packages
+    // org_profile_avatar.tmpl carries no follow control, no gear, no RSS —
+    // the shared profile_big_avatar arms never render on this page.
+    expect(html).not.toContain('method="post" action="/ibsetter?action=');
+    expect(html).not.toContain('data-tooltip-content="User Details"');
+    expect(html).not.toContain('href="/ibsetter.rss"');
+  });
+
+  it("the ORG arm: the header follow button rides the loader (anonymous drops it, the RSS anchor stays)", async () => {
+    const founder = await seedUser("iborgsetter");
+    const orgs = new OrgService(env.DB);
+    const org = await orgs.createOrg({ name: "ibsetorg", ownerId: founder.id, visibility: "public", now: T0 });
+    const { pkg } = await seedPackageVersion(org.id, "ib-org-set", "1.0.0");
+    const owner: PackagesOwner = { kind: "org", org };
+    const viewer: Viewer = { kind: "user", id: founder.id, username: "iborgsetter", isAdmin: false };
+
+    const data = await loadPackageSettingsData(env.DB, owner, viewer, ORIGIN, pkg);
+    expect(data.followButton).toEqual({ following: false });
+    const html = renderPackageSettingsPage(pageCtx(viewer), data);
+    expect(html).toContain('<form method="post" action="/ibsetorg?action=follow">');
+    expect(html).toContain('class="ui basic label button" href="/ibsetorg.rss"');
+
+    // Anonymous: the follow button drops (org/header.tmpl:17's IsSigned
+    // gate), the RSS anchor stays (EnableFeed pins TRUE).
+    const anonData = await loadPackageSettingsData(env.DB, owner, { kind: "anonymous" }, ORIGIN, pkg);
+    expect(anonData.followButton).toBeNull();
+    const anonHtml = renderPackageSettingsPage(pageCtx({ kind: "anonymous" }), anonData);
+    expect(anonHtml).not.toContain('method="post" action="/ibsetorg?action=');
+    expect(anonHtml).toContain('class="ui basic label button" href="/ibsetorg.rss"');
   });
 });

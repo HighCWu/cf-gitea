@@ -204,6 +204,14 @@ export interface PackageSettingsData {
   repoCount: number;
   followers: number;
   following: number;
+  /** The USER arm's Projects-tab count (header.tmpl:17-20 — the OPEN
+   *  projects total, loadHeaderCount parity). */
+  openProjects: number;
+  /** The ORG arm's header follow button (org/header.tmpl:17 — the same
+   *  template renders on every page of the family). The user arm renders
+   *  org_profile_avatar (no follow control upstream), so its value stays
+   *  unread there. */
+  followButton: { following: boolean } | null;
 }
 
 /**
@@ -253,6 +261,8 @@ export async function loadPackageSettingsData(
     repoCount: chrome.repoCount,
     followers: chrome.followers,
     following: chrome.following,
+    openProjects: chrome.openProjects,
+    followButton: chrome.followButton,
   };
 }
 
@@ -594,7 +604,10 @@ export function PackageSettingsPage(props: {
   if (data.owner.kind === "org") {
     return (
       <BaseLayout ctx={ctx} title={data.pkg.name} pageClass="package settings options organization">
-        <OrgHeader org={data.owner.org} signedIn={ctx.viewer.kind === "user"} />
+        {/* org/header.tmpl renders on EVERY page of the org packages family
+            — the follow button (header.tmpl:17's follow_unfollow include)
+            rides the loader's IsFollowing state. */}
+        <OrgHeader org={data.owner.org} signedIn={ctx.viewer.kind === "user"} followButton={data.followButton ?? undefined} />
         <div class="ui container">{body}</div>
       </BaseLayout>
     );
@@ -604,11 +617,16 @@ export function PackageSettingsPage(props: {
     <BaseLayout ctx={ctx} title={data.pkg.name} pageClass="package settings options">
       <SettingsAvatarStrip owner={data.owner} />
       <div class="ui container">
+        {/* The overview header (user/overview/header.tmpl): the Packages tab
+            ACTIVE (`.IsPackagesPage`), the wave I-b C1 Projects + Code tabs
+            INACTIVE (header.tmpl:14-31). */}
         <ProfileTabs
           username={user.username}
           repoCount={data.repoCount}
           starsCount={user.numStars}
+          projectsTab={{ active: false, count: data.openProjects, href: `/${user.username}/-/projects` }}
           packagesTab={{ active: true, href: `/${user.username}/-/packages` }}
+          codeTab={{ active: false, href: `/${user.username}/-/code` }}
         />
         {body}
       </div>
