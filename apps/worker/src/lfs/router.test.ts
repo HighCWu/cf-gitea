@@ -14,8 +14,11 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { verifyDeployToken } from "../auth/deploy-token-service";
 import { basicHeader, basicTokenHeader, mintFor, resetAuthTables, seedVerifiedUser } from "../auth/testing/seeds";
+import { doerRepoAccessMode } from "../api/services/repository";
+import { TeamsService } from "../api/routes/org-teams";
 import { resolveRepository } from "../git-http/acl";
-import { deployKeys, repositories, repoRedirects } from "../db/schema";
+import { deployKeys, repoCollaborators, repositories, repoRedirects } from "../db/schema";
+import { OrgService } from "../services/orgs/orgs";
 import {
   DEFAULT_LFS_LIMITS,
   LFS_ACCEPT_HEADER,
@@ -41,6 +44,11 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
+  // Grant tables first (repo_collaborators declares no FK and org tables
+  // mirror the gate.test.ts sweep order) — then the auth rows they point at.
+  for (const table of ["repo_collaborators", "team_repo_access", "team_members", "teams", "org_members"]) {
+    await env.DB.prepare(`DELETE FROM ${table}`).run();
+  }
   await resetAuthTables();
   await env.DB.prepare("DELETE FROM deploy_keys").run();
   await env.DB.prepare("DELETE FROM repositories").run();
@@ -64,7 +72,7 @@ async function seedRepo(
   ownerNamespace: string,
   slug: string,
   visibility: "public" | "private",
-  options: { isArchived?: boolean } = {},
+  options: { isArchived?: boolean; ownerId?: number } = {},
 ): Promise<SeededRepo> {
   const id = crypto.randomUUID();
   const storageKey = `r_${id}`;
@@ -77,6 +85,7 @@ async function seedRepo(
       slug,
       visibility,
       ...(options.isArchived === true ? { isArchived: true } : {}),
+      ...(options.ownerId !== undefined ? { ownerId: options.ownerId } : {}),
     })
     .run();
   return { id, storageKey, owner: ownerNamespace, slug };
@@ -537,6 +546,197 @@ describe("deploy-key tokens on the LFS family (F1: upstream mounts the routes WI
 
     const after = await verifyDeployToken(env.DB, token);
     expect(after?.updatedAt.getTime()).toBe(before?.updatedAt.getTime());
+  });
+});
+
+// --- collaborator + org-team grants (the git-HTTP grant fold) --------------------
+
+describe("collaborator and org-team grants on the LFS family (SPEC-0007 §3.5 + SPEC-0005)", () => {
+  /**
+   * `authorizeLfs` resolves the SAME repository-service grant the git-HTTP
+   * gate consumes (`doerRepoAccessMode` — the SPEC-0007 §3.5 org/team arms
+   * + the SPEC-0005 collaborator row; upstream LFS `authenticate` consults
+   * the full GetDoerRepoPermission fold, server.go:551-557). A collaborator
+   * or org-team member who can git push can git lfs push too; a read grant
+   * downloads but never uploads; an outsider on a private repo still 401s.
+   */
+
+  /** The SPEC-0005 collaborator row, seeded at the requested mode. */
+  async function seedCollaborator(repoId: string, userId: number, mode: "read" | "write"): Promise<void> {
+    await drizzle(env.DB).insert(repoCollaborators).values({ repoId, userId, mode }).run();
+  }
+
+  /** Owner-verifiable object (store+row), so read arms have something to serve. */
+  async function seedDownloadable(
+    repo: SeededRepo,
+    ordinal: number,
+  ): Promise<{ oid: string; bytes: Uint8Array }> {
+    const bytes = content(ordinal, 256);
+    const oid = await sha256Hex(bytes);
+    const store = new RelayLfsStore(env.REPO_PACKS);
+    await store.put(lfsKey(repo.storageKey, oid), bytes, {
+      size: bytes.byteLength,
+      expectedSha256Hex: oid,
+    });
+    await new LfsStateService(env.DB).insertVerified(lfsRepoIdOf(repo), oid, bytes.byteLength, new Date());
+    return { oid, bytes };
+  }
+
+  /** The full git-lfs write roundtrip with one credential. */
+  async function runWriteLadder(
+    repo: SeededRepo,
+    token: string,
+    ordinal: number,
+  ): Promise<void> {
+    const bytes = content(ordinal, 256);
+    const oid = await sha256Hex(bytes);
+    const auth = { authorization: basicTokenHeader(token) };
+
+    const batch = await lfsBatch(`${repoUrl(repo)}/info/lfs/objects/batch`, {
+      operation: "upload",
+      objects: [{ oid, size: bytes.byteLength }],
+    }, auth);
+    expect(batch.status).toBe(200);
+    const shaped = await batch.json<{ objects: { actions: Record<string, { href: string }> }[] }>();
+    const uploadHref = shaped.objects[0]?.actions.upload?.href;
+    const verifyHref = shaped.objects[0]?.actions.verify?.href;
+    expect(uploadHref).toBeDefined();
+    expect(verifyHref).toBeDefined();
+
+    const put = await SELF.fetch(uploadHref as string, {
+      method: "PUT",
+      headers: { ...auth, "content-length": String(bytes.byteLength) },
+      body: bytes,
+    });
+    expect(put.status).toBe(200);
+    expect(await put.json()).toEqual({ message: "OK" });
+
+    const verify = await SELF.fetch(verifyHref as string, {
+      method: "POST",
+      headers: { accept: LFS_MEDIA_TYPE, "content-type": LFS_MEDIA_TYPE, ...auth },
+      body: JSON.stringify({ oid, size: bytes.byteLength }),
+    });
+    expect(verify.status).toBe(200);
+    expect(await verify.json()).toEqual({ message: "OK" });
+    expect(await lastRowState(lfsRepoIdOf(repo), oid)).toBe("verified");
+  }
+
+  it("a write-collaborator runs the full write ladder: batch(upload) → PUT → verify", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const repo = await seedRepo("alice", "shared", "private");
+    await seedCollaborator(repo.id, bob.id, "write");
+    const bobWrite = (await mintFor(bob.id, "w", "write:repository")).plaintext;
+
+    // The fixture rows are exactly what the fold reads — one cross-check
+    // against the service layer (the full matrix lives in repository.test.ts).
+    expect(await doerRepoAccessMode(env.DB, { id: repo.id, ownerId: null }, bob.id)).toBe("write");
+    expect(await doerRepoAccessMode(env.DB, { id: repo.id, ownerId: alice.id }, bob.id)).toBe("write");
+
+    await runWriteLadder(repo, bobWrite, 51);
+  });
+
+  it("an org-team write member runs the same ladder on an org-owned private repo", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const orgs = new OrgService(env.DB);
+    const teams = new TeamsService(env.DB);
+    const org = await orgs.createOrg({ name: "acme", ownerId: alice.id });
+    // ownerId set — the team arm resolves through it (orgs.ts teamRepoAccessMode).
+    const repo = await seedRepo("acme", "vault", "private", { ownerId: org.id });
+    const writers = await teams.createTeam(org, { name: "writers", permission: "write" });
+    await teams.addTeamRepo(writers, repo.id);
+    await teams.addTeamMember(writers, bob.id);
+    const bobWrite = (await mintFor(bob.id, "w", "write:repository")).plaintext;
+
+    expect(await doerRepoAccessMode(env.DB, { id: repo.id, ownerId: org.id }, bob.id)).toBe("write");
+
+    await runWriteLadder(repo, bobWrite, 52);
+  });
+
+  it("a read-collaborator downloads but cannot upload (write-scope token: the GRANT is the blocker)", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const repo = await seedRepo("alice", "readonly", "private");
+    await seedCollaborator(repo.id, bob.id, "read");
+    // Write scope on purpose: a read-scope token would stop at the scope
+    // check (plain 403) before the grant rows — the 401 below is the
+    // grant-arm challenge, upstream's authenticate-false outcome.
+    const bobWrite = (await mintFor(bob.id, "w", "write:repository")).plaintext;
+    const { oid, bytes } = await seedDownloadable(repo, 53);
+    const auth = { authorization: basicTokenHeader(bobWrite) };
+
+    const download = await lfsBatch(`${repoUrl(repo)}/info/lfs/objects/batch`, {
+      operation: "download",
+      objects: [{ oid, size: bytes.byteLength }],
+    }, auth);
+    expect(download.status).toBe(200);
+    const shaped = await download.json<{
+      objects: { actions: { download?: { href: string } } }[];
+    }>();
+    expect(shaped.objects[0]?.actions.download?.href).toBe(
+      `${repoUrl(repo)}/info/lfs/objects/${oid}`,
+    );
+    const get = await SELF.fetch(shaped.objects[0]?.actions.download?.href as string, { headers: auth });
+    expect(get.status).toBe(200);
+    expect(new Uint8Array(await get.arrayBuffer())).toEqual(bytes);
+
+    const upload = await lfsBatch(`${repoUrl(repo)}/info/lfs/objects/batch`, {
+      operation: "upload",
+      objects: [{ oid, size: bytes.byteLength }],
+    }, auth);
+    expect(upload.status).toBe(401);
+    expect(upload.headers.get("www-authenticate")).toBe('Basic realm="gitea-lfs"');
+    expect(await upload.json()).toEqual({ message: "Unauthorized" });
+  });
+
+  it("an org-team read member downloads but cannot upload, like the read collaborator", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const orgs = new OrgService(env.DB);
+    const teams = new TeamsService(env.DB);
+    const org = await orgs.createOrg({ name: "acme", ownerId: alice.id });
+    const repo = await seedRepo("acme", "vault", "private", { ownerId: org.id });
+    const readers = await teams.createTeam(org, { name: "readers", permission: "read" });
+    await teams.addTeamRepo(readers, repo.id);
+    await teams.addTeamMember(readers, bob.id);
+    const bobWrite = (await mintFor(bob.id, "w", "write:repository")).plaintext;
+    const { oid, bytes } = await seedDownloadable(repo, 54);
+    const auth = { authorization: basicTokenHeader(bobWrite) };
+
+    const download = await lfsBatch(`${repoUrl(repo)}/info/lfs/objects/batch`, {
+      operation: "download",
+      objects: [{ oid, size: bytes.byteLength }],
+    }, auth);
+    expect(download.status).toBe(200);
+
+    const upload = await lfsBatch(`${repoUrl(repo)}/info/lfs/objects/batch`, {
+      operation: "upload",
+      objects: [{ oid, size: bytes.byteLength }],
+    }, auth);
+    expect(upload.status).toBe(401);
+    expect(upload.headers.get("www-authenticate")).toBe('Basic realm="gitea-lfs"');
+  });
+
+  it("an outsider on a private repo still 401s on both operations (no grant resolves)", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const repo = await seedRepo("alice", "closed", "private");
+    const bobWrite = (await mintFor(bob.id, "w", "write:repository")).plaintext;
+    const auth = { authorization: basicTokenHeader(bobWrite) };
+
+    const upload = await lfsBatch(`${repoUrl(repo)}/info/lfs/objects/batch`, {
+      operation: "upload",
+      objects: [],
+    }, auth);
+    expect(upload.status).toBe(401);
+    expect(upload.headers.get("www-authenticate")).toBe('Basic realm="gitea-lfs"');
+
+    const download = await lfsBatch(`${repoUrl(repo)}/info/lfs/objects/batch`, {
+      operation: "download",
+      objects: [],
+    }, auth);
+    expect(download.status).toBe(401);
   });
 });
 

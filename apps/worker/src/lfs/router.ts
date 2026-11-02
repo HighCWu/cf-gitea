@@ -96,7 +96,11 @@ import {
 } from "../auth/middleware";
 import { ScopeSet } from "../auth/scopes";
 import { TokenService, type VerifiedAuth } from "../auth/token-service";
-import { resolveRepository } from "../git-http/acl";
+// The gate consults the same repository-service grant fold as the git-HTTP
+// ACL (SPEC-0007 §3.5 teams + SPEC-0005 collaborator row): one resolution,
+// no drift.
+import { doerRepoAccessMode } from "../api/services/repository";
+import { readGrant, resolveRepository } from "../git-http/acl";
 import {
   accountDisabled,
   ownerUnavailable,
@@ -452,18 +456,31 @@ export async function authorizeLfs(input: {
   if (verified.user.status === "prohibited") return accountDisabled();
   if (owner !== null && owner.status === "prohibited") return ownerUnavailable();
 
-  // Grant model identical to the git-HTTP matrix (M1: owner + site admin;
-  // limited owners expose public repos to any authenticated principal),
-  // except the failure outcome: upstream's LFS routes challenge where
-  // git-HTTP 404s (§2.2) — the challenge is issued regardless, so existence
-  // is not disclosed either way.
+  // The doer's resolved grant over the repo — the SAME repository-service
+  // fold the git-HTTP gate consumes (acl.ts:262-267): SPEC-0007 §3.5
+  // org/team arms (the Owners-team bridge + covering teams) and the
+  // SPEC-0005 active collaborator row; 'none' when the doer holds no grant.
+  // Upstream parity: LFS `authenticate` consults the full
+  // GetDoerRepoPermission fold (server.go:551-557), not a reduced
+  // owner/admin ladder — a collaborator or org-team member who can git push
+  // can git lfs push too.
+  const teamMode = await doerRepoAccessMode(env.DB, { id: repo.id, ownerId: repo.ownerId }, verified.user.id);
+
+  // Grant lines = the shared readGrant predicate (the git-HTTP matrix's own
+  // grant lines — publiclyVisible, owner, site admin, the limited-owner
+  // branch — plus the resolved grant at any mode >= read; SPEC-0010 §2.6's
+  // one-copy discipline), except the failure outcome: upstream's LFS routes
+  // challenge where git-HTTP 404s (§2.2) — the challenge is issued
+  // regardless, so existence is not disclosed either way.
   const isOwner = owner !== null && verified.user.id === owner.id;
   const isSiteAdmin = verified.user.isAdmin;
-  const canRead =
-    publiclyVisible ||
-    isOwner ||
-    isSiteAdmin ||
-    (repo.visibility === "public" && ownerActive && input.ownerVisibility === "limited");
+  const canRead = readGrant({
+    repoVisibility: repo.visibility,
+    owner: owner === null ? null : { id: owner.id, status: owner.status },
+    ownerVisibility: input.ownerVisibility,
+    doer: { id: verified.user.id, isAdmin: verified.user.isAdmin },
+    teamMode,
+  });
   const maskedByPublicOnly = scope.publicOnly && !publiclyVisible;
   if (!canRead || maskedByPublicOnly) return lfsChallenge();
 
@@ -471,7 +488,11 @@ export async function authorizeLfs(input: {
     // §4.11: archived repos refuse LFS writes (platform-consistent with the
     // git-HTTP row 10; reads unaffected).
     if (repo.isArchived) return repositoryArchived();
-    if (!isOwner && !isSiteAdmin) return lfsChallenge();
+    // Write ranks at write/admin/owner mode on the resolved grant (the
+    // git-HTTP matrix's teamWrites rank, access_mode.go:17-22) — an org team
+    // OR the SPEC-0005 collaborator row — beside the owner + site-admin arms.
+    const teamWrites = teamMode === "write" || teamMode === "admin" || teamMode === "owner";
+    if (!isOwner && !isSiteAdmin && !teamWrites) return lfsChallenge();
   }
   return true;
 }

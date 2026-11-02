@@ -15,7 +15,8 @@ import { drizzle } from "drizzle-orm/d1";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { basicHeader, basicTokenHeader, mintFor, resetAuthTables, seedVerifiedUser } from "../auth/testing/seeds";
-import { deployKeys, repositories } from "../db/schema";
+import { TeamsService } from "../api/routes/org-teams";
+import { deployKeys, repoCollaborators, repositories } from "../db/schema";
 import { LFS_MEDIA_TYPE } from "../services/lfs/batch";
 import {
   goParseInt64,
@@ -23,6 +24,7 @@ import {
   pathJoinRel,
   rfc3339Seconds,
 } from "../services/lfs/locks";
+import { OrgService } from "../services/orgs/orgs";
 import { applyLfsObjectsDdl, resetLfsTables } from "../services/lfs/testing";
 import { LFS_DEPLOY_KEY_DOER_ID, parseLfsRoute } from "./router";
 
@@ -34,6 +36,11 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
+  // Grant tables first (repo_collaborators declares no FK and org tables
+  // mirror the gate.test.ts sweep order) — then the auth rows they point at.
+  for (const table of ["repo_collaborators", "team_repo_access", "team_members", "teams", "org_members"]) {
+    await env.DB.prepare(`DELETE FROM ${table}`).run();
+  }
   await resetAuthTables();
   await env.DB.prepare("DELETE FROM deploy_keys").run();
   await env.DB.prepare("DELETE FROM repositories").run();
@@ -53,7 +60,7 @@ async function seedRepo(
   ownerNamespace: string,
   slug: string,
   visibility: "public" | "private",
-  options: { isArchived?: boolean } = {},
+  options: { isArchived?: boolean; ownerId?: number } = {},
 ): Promise<SeededRepo> {
   const id = crypto.randomUUID();
   await drizzle(env.DB)
@@ -65,6 +72,7 @@ async function seedRepo(
       slug,
       visibility,
       ...(options.isArchived === true ? { isArchived: true } : {}),
+      ...(options.ownerId !== undefined ? { ownerId: options.ownerId } : {}),
     })
     .run();
   return { id, storageKey: `r_${id}`, owner: ownerNamespace, slug };
@@ -681,6 +689,145 @@ describe("locks auth posture (requireSigned + per-verb messages)", () => {
     });
     expect(mismatch.status).toBe(404); // catch-all: no media-type check
     expect(await mismatch.text()).toBe("404 page not found\n");
+  });
+});
+
+// --- collaborator + org-team grants (the family grant fold) -------------------------
+
+describe("collaborator and org-team grants on locks (SPEC-0007 §3.5 + SPEC-0005)", () => {
+  /**
+   * `authorizeLfsLocks` resolves the SAME repository-service grant the
+   * family pipeline does (`doerRepoAccessMode` — the SPEC-0007 §3.5
+   * org/team arms + the SPEC-0005 collaborator row; upstream locks
+   * `authenticate` consults GetDoerRepoPermission). Read grants pass the
+   * list verb; create/verify/unlock need write/admin/owner mode; an
+   * outsider still takes the route-message 401.
+   */
+
+  /** The SPEC-0005 collaborator row, seeded at the requested mode. */
+  async function seedCollaborator(repoId: string, userId: number, mode: "read" | "write"): Promise<void> {
+    await drizzle(env.DB).insert(repoCollaborators).values({ repoId, userId, mode }).run();
+  }
+
+  it("a write-collaborator creates, verifies and unlocks locks", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const repo = await seedRepo("alice", "shared", "private");
+    await seedCollaborator(repo.id, bob.id, "write");
+    const bobWrite = (await mintFor(bob.id, "w", "write:repository")).plaintext;
+
+    const made = await createLock(repo, bobWrite, "collab.bin");
+    expect(made.status).toBe(201);
+    const lock = made.body.lock as WireLock;
+    expect(lock.path).toBe("collab.bin");
+
+    const verify = await lockFetch(locksUrl(repo, "/verify"), {
+      method: "POST",
+      token: bobWrite,
+      body: {},
+    });
+    expect(verify.status).toBe(200);
+    const body = await verify.json<LockVerifyWire>();
+    expect(body.ours.map((l) => l.path)).toEqual(["collab.bin"]);
+    expect(body.theirs).toEqual([]);
+
+    const done = await lockFetch(locksUrl(repo, `/${lock.id}/unlock`), {
+      method: "POST",
+      token: bobWrite,
+      body: {},
+    });
+    expect(done.status).toBe(200);
+    expect(await done.json()).toEqual({ lock });
+  });
+
+  it("an org-team write member creates locks; a read-mode team member cannot create or verify", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const carol = await seedVerifiedUser({ username: "Carol" });
+    const orgs = new OrgService(env.DB);
+    const teams = new TeamsService(env.DB);
+    const org = await orgs.createOrg({ name: "acme", ownerId: alice.id });
+    const repo = await seedRepo("acme", "vault", "private", { ownerId: org.id });
+    const writers = await teams.createTeam(org, { name: "writers", permission: "write" });
+    await teams.addTeamRepo(writers, repo.id);
+    await teams.addTeamMember(writers, bob.id);
+    const readers = await teams.createTeam(org, { name: "readers", permission: "read" });
+    await teams.addTeamRepo(readers, repo.id);
+    await teams.addTeamMember(readers, carol.id);
+    const bobWrite = (await mintFor(bob.id, "w", "write:repository")).plaintext;
+    // Write scope on purpose for Carol: a read-scope token would stop at the
+    // scope check (403) — the 401s below are the grant-arm challenge.
+    const carolWrite = (await mintFor(carol.id, "w", "write:repository")).plaintext;
+
+    const made = await createLock(repo, bobWrite, "team.bin");
+    expect(made.status).toBe(201);
+
+    const carolList = await lockFetch(locksUrl(repo), { method: "GET", token: carolWrite });
+    expect(carolList.status).toBe(200);
+    expect(await carolList.json()).toEqual({ locks: [(made.body.lock as WireLock)] });
+
+    const carolCreate = await lockFetch(locksUrl(repo), {
+      method: "POST",
+      token: carolWrite,
+      body: { path: "nope.bin" },
+    });
+    expect(carolCreate.status).toBe(401);
+    expect(await carolCreate.json()).toEqual({ message: "You must have push access to create locks" });
+
+    const carolVerify = await lockFetch(locksUrl(repo, "/verify"), {
+      method: "POST",
+      token: carolWrite,
+      body: {},
+    });
+    expect(carolVerify.status).toBe(401);
+    expect(await carolVerify.json()).toEqual({ message: "You must have push access to verify locks" });
+  });
+
+  it("a read-collaborator lists but cannot create or verify (write routes)", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const repo = await seedRepo("alice", "readonly", "private");
+    await seedCollaborator(repo.id, bob.id, "read");
+    const bobWrite = (await mintFor(bob.id, "w", "write:repository")).plaintext;
+
+    const list = await lockFetch(locksUrl(repo), { method: "GET", token: bobWrite });
+    expect(list.status).toBe(200);
+    expect(await list.json()).toEqual({ locks: [] });
+
+    const create = await lockFetch(locksUrl(repo), {
+      method: "POST",
+      token: bobWrite,
+      body: { path: "nope.bin" },
+    });
+    expect(create.status).toBe(401);
+    expect(await create.json()).toEqual({ message: "You must have push access to create locks" });
+
+    const verify = await lockFetch(locksUrl(repo, "/verify"), {
+      method: "POST",
+      token: bobWrite,
+      body: {},
+    });
+    expect(verify.status).toBe(401);
+    expect(await verify.json()).toEqual({ message: "You must have push access to verify locks" });
+  });
+
+  it("an outsider on a private repo still 401s with the route messages (no grant resolves)", async () => {
+    await seedVerifiedUser({ username: "Alice" });
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const repo = await seedRepo("alice", "closed", "private");
+    const bobWrite = (await mintFor(bob.id, "w", "write:repository")).plaintext;
+
+    const list = await lockFetch(locksUrl(repo), { method: "GET", token: bobWrite });
+    expect(list.status).toBe(401);
+    expect(await list.json()).toEqual({ message: "You must have pull access to list locks" });
+
+    const create = await lockFetch(locksUrl(repo), {
+      method: "POST",
+      token: bobWrite,
+      body: { path: "nope.bin" },
+    });
+    expect(create.status).toBe(401);
+    expect(await create.json()).toEqual({ message: "You must have push access to create locks" });
   });
 });
 

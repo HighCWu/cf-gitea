@@ -69,6 +69,11 @@ import {
 } from "../auth/middleware";
 import { ScopeSet } from "../auth/scopes";
 import { TokenService, type VerifiedAuth } from "../auth/token-service";
+// The same repository-service grant fold the family pipeline consults
+// (router.ts authorizeLfs; acl.ts:262-267): SPEC-0007 §3.5 teams + SPEC-0005
+// collaborator row, one resolution, no drift.
+import { doerRepoAccessMode } from "../api/services/repository";
+import { readGrant } from "../git-http/acl";
 import {
   accountDisabled,
   ownerUnavailable,
@@ -264,22 +269,30 @@ export async function authorizeLfsLocks(input: {
   if (verified.user.status === "prohibited") return accountDisabled();
   if (owner !== null && owner.status === "prohibited") return ownerUnavailable();
 
-  // `authenticate` (requireSigned + access mode): the grant model is the
-  // family's; the failure body is the route message (upstream's
-  // authenticate-false arm).
+  // `authenticate` (requireSigned + access mode): the grant lines are the
+  // shared readGrant predicate over the SAME repository-service fold the
+  // family pipeline resolves (authorizeLfs — org/team arms + collaborator
+  // row, upstream GetDoerRepoPermission at server.go:551-557); the failure
+  // body is the route message (upstream's authenticate-false arm).
+  const teamMode = await doerRepoAccessMode(env.DB, { id: repo.id, ownerId: repo.ownerId }, verified.user.id);
   const isOwner = owner !== null && verified.user.id === owner.id;
   const isSiteAdmin = verified.user.isAdmin;
-  const canRead =
-    publiclyVisible ||
-    isOwner ||
-    isSiteAdmin ||
-    (repo.visibility === "public" && ownerActive && input.ownerVisibility === "limited");
+  const canRead = readGrant({
+    repoVisibility: repo.visibility,
+    owner: owner === null ? null : { id: owner.id, status: owner.status },
+    ownerVisibility: input.ownerVisibility,
+    doer: { id: verified.user.id, isAdmin: verified.user.isAdmin },
+    teamMode,
+  });
   const maskedByPublicOnly = scopeSet.publicOnly && !publiclyVisible;
   if (!canRead || maskedByPublicOnly) return lockChallenge(message);
 
   if (access === "write") {
     if (repo.isArchived) return repositoryArchived();
-    if (!isOwner && !isSiteAdmin) return lockChallenge(message);
+    // Write ranks at write/admin/owner mode on the resolved grant (the
+    // git-HTTP matrix's teamWrites rank, access_mode.go:17-22).
+    const teamWrites = teamMode === "write" || teamMode === "admin" || teamMode === "owner";
+    if (!isOwner && !isSiteAdmin && !teamWrites) return lockChallenge(message);
   }
   return { doerId: verified.user.id };
 }
