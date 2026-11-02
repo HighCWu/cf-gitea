@@ -674,6 +674,39 @@ function hex4(buf: Uint8Array, pos: number): number {
 }
 
 /**
+ * Read a gzipped receive body under the push cap measured on the COMPRESSED
+ * bytes. `req.arrayBuffer()` would buffer the whole body before the inflate
+ * cap applies, so the read walks the stream with a running byte count: the
+ * declared Content-Length is checked up front, and the moment the counted
+ * read passes the cap the reader is cancelled and the standard 413 error is
+ * thrown (an "exceeds maximum size" message maps to `tooLargeResponse` in
+ * the receive catch). Only the surviving bounded bytes reach gunzipLimited,
+ * which keeps the DECOMPRESSED side of the budget.
+ */
+async function readGzipBodyBounded(req: Request, maxBytes: number): Promise<Uint8Array> {
+  const declared = parseInt(req.headers.get("content-length") ?? "", 10);
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new Error(`request body exceeds maximum size (${declared} bytes declared)`);
+  }
+  const reader = req.body?.getReader() as ReadableStreamDefaultReader<Uint8Array> | undefined;
+  if (!reader) return new Uint8Array(0);
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value?.length) continue;
+    total += value.length;
+    if (total > maxBytes) {
+      reader.cancel().catch(() => {}); // stop the sender; never surfaces
+      throw new Error(`request body exceeds maximum size (${total} compressed bytes read)`);
+    }
+    parts.push(value);
+  }
+  return concat(parts);
+}
+
+/**
  * Read the pkt-line command section of a receive-pack request. Only this small
  * section is buffered; everything after the flush-pkt is the pack and stays a
  * stream. A gzipped body (small pushes only) is inflated once under the push
@@ -684,9 +717,13 @@ async function parsePushRequest(req: Request, maxBytes: number): Promise<ParsedP
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   let buf: Uint8Array;
   if (req.headers.get("content-encoding")?.includes("gzip")) {
-    // only small pushes arrive gzipped, and the inflate is budgeted: a
-    // zlib bomb can no more exceed the push cap than a plain body can
-    bufferedAll = gunzipLimited(new Uint8Array(await req.arrayBuffer()), maxBytes);
+    // only small pushes arrive gzipped, and the budget is two-layered: the
+    // COMPRESSED bytes are read through a counting wrapper (a declared or
+    // actual body over the cap 413s before the excess is ever buffered —
+    // never `arrayBuffer()`-first, which would hold the whole body), and
+    // gunzipLimited bounds the INFLATED bytes, so a zlib bomb can no more
+    // exceed the push cap than a plain body can.
+    bufferedAll = gunzipLimited(await readGzipBodyBounded(req, maxBytes), maxBytes);
     buf = bufferedAll;
   } else {
     reader = (req.body?.getReader() as ReadableStreamDefaultReader<Uint8Array>) ?? null;

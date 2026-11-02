@@ -141,7 +141,16 @@
     // HANDOFF) no mail carries a token, so an armed inbound drops
     // everything at the no-token gate — fail-closed end to end.
     "MAIL_INBOUND_ENABLED": "false",
-    "MAIL_INBOUND_REPLY_ADDRESS": ""
+    "MAIL_INBOUND_REPLY_ADDRESS": "",
+    // Git push size cap in MiB (the engine's receive quota — MAX_PUSH_MB,
+    // packages/git-engine src/env.ts; consumed in src/mod.ts receivePack).
+    // Unset/garbage falls back to the engine's own 512 MiB default
+    // (DEFAULT_MAX_PUSH_MB, src/mod.ts), so the value here only DOCUMENTS
+    // the shipped posture — tighten it to bound per-push memory. The cap
+    // applies to the compressed request body too: a gzipped push body
+    // (Content-Length-declared or counted off the stream) over the cap is
+    // rejected 413 BEFORE the bytes buffer or the inflate runs.
+    "MAX_PUSH_MB": "512"
   },
   "observability": {
     "enabled": true,

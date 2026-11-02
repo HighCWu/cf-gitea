@@ -15482,6 +15482,19 @@ async function wikiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   const data = await loadWikiViewData(c.env, pair, rawTail, url.origin);
   if (data.outcome === "start") return respond(c.html(renderWikiStartPage({ ctx, canWrite }), 200));
   if (data.outcome === "missing") {
+    // The raw-file round's 303 (wiki.go:240-242 — the isRaw class): the
+    // `.md`-trimmed entry exists, so the resolved WebPath interpolates
+    // VERBATIM into /wiki/raw/ (upstream builds the Location from the same
+    // wikiName — no re-encoding) and the request never reaches the _pages
+    // fold, which stays the plain noEntry answer (wiki.go:237-239).
+    if (data.rawRedirectTo !== undefined) {
+      return respond(
+        new Response(null, {
+          status: 303,
+          headers: { location: `${repoLinkOf(p.repo)}/wiki/raw/${data.rawRedirectTo}` },
+        }),
+      );
+    }
     return respond(new Response(null, { status: 303, headers: { location: wikiPagesAction(p.repo) } }));
   }
   return respond(c.html(renderWikiViewPage({ ctx, data, canWrite }), 200));

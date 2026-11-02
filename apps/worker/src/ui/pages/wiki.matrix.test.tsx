@@ -1017,8 +1017,8 @@ index 0000000..7e68207
 //     isRaw decision; APPENDED ABSOLUTE LAST: it moves the w107wik ref like
 //     the commit-diff world above, and nothing after it reads the tip)
 
-describe("the raw-file view round (the loader's isRaw decision — the disclosed interim)", () => {
-  it("serves the raw bytes and keeps the raw-name VIEW on the family fold until the serving arm's mapping lands", async () => {
+describe("the raw-file view round (the loader's isRaw decision + the serving arm's 303)", () => {
+  it("serves the raw bytes and 303s the raw-name VIEW onto the raw URL", async () => {
     const pair = await pairFor("w107wik");
     const cell = wikiCell(env, pair);
     const ref = branchRef(wikiBranch(pair));
@@ -1052,13 +1052,11 @@ describe("the raw-file view round (the loader's isRaw decision — the disclosed
     expect(await raw.text()).toBe("not-really-a-png\n");
     // The VIEW of the raw name (wiki.go:240-242's isRaw redirect): the
     // loader probes the trimmed round (wikiRawFileRound) and carries
-    // rawRedirectTo on the missing outcome, but the serving arm cannot
-    // express the redirect yet — the fixed missing-arm location answers
-    // with the family fold. DISCLOSED INTERIM (the commit-diff view's 404
-    // twin, repo-wiki.tsx's header): the one-arm index.ts mapping flips
-    // this 303 onto `${REPO_LINK}/wiki/raw/img.png`.
+    // rawRedirectTo on the missing outcome; the serving arm answers the
+    // 303 onto the raw URL — the resolved WebPath interpolated VERBATIM
+    // (wikiPage's rawRedirectTo arm, ahead of the _pages noEntry fold).
     const view = await get(`${REPO_LINK}/wiki/img.png`);
     expect(view.status).toBe(303);
-    expect(view.headers.get("location")).toBe(PAGES_ACTION);
+    expect(view.headers.get("location")).toBe(`${REPO_LINK}/wiki/raw/img.png`);
   });
 });
