@@ -398,8 +398,9 @@ async function authorize(c: RouteContext): Promise<Response> {
   const doer = signedIn.user;
 
   // oauthDoerAuthorizePreCheck (:211-222): two-factor-required doers get the
-  // access_denied redirect. SLOT — cf-gitea has no 2FA yet (SPEC §2.2 step
-  // 1); the predicate is a no-op so the re-pin finds the seam.
+  // access_denied redirect. As-built: 2FA landed (SPEC-0022) but this predicate
+  // guards the ENFORCED-2FA posture (`DoerNeedTwoFactorAuth` — no enforced-2FA
+  // var here, session.ts's recorded divergence), so it stays a no-op for the re-pin.
 
   const params = c.req.method === "GET" ? new URL(c.req.url).searchParams : await parseForm(c.req.raw);
   const form: AuthorizeForm = {

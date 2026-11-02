@@ -115,6 +115,14 @@
     // /.well-known/openid-configuration was fetched from). Only moves the
     // `issuer` member; the endpoint URLs always follow APP_URL.
     "OAUTH2_JWT_CLAIM_ISSUER": "",
+    // The refresh-token rotation posture ([oauth2] INVALIDATE_REFRESH_TOKENS,
+    // specs/oauth2-provider.md §4.16): strict-polarity — ONLY the exact string
+    // "true" enables (the DEMO_MODE class); "true" rotates the grant's
+    // outstanding refresh tokens on exchange (the CAS arm,
+    // services/oauth2/token.ts:399-410). Default "false" is upstream's
+    // (InvalidateRefreshTokens, modules/setting/oauth2.go:107) — refresh
+    // tokens stay reusable until expiry.
+    "OAUTH2_INVALIDATE_REFRESH_TOKENS": "false",
     // Outbound email (specs/email-outbound.md §6): strict-polarity, OFF by
     // default — a self-hosted deployment NEVER sends mail until armed, the
     // same fail-closed class as DEMO_MODE. Arming = MAIL_ENABLED "true" +

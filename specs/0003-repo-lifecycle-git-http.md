@@ -162,7 +162,7 @@ P = push `receive-pack`):
 | # | Caller | Repo | Op | Response | Upstream cite |
 |---|---|---|---|---|---|
 | 1 | anonymous | public repo, public owner | F | 200 advertisement | `:132-135` |
-| 2 | anonymous | private or missing repo, or limited/private owner | F | `401` + `WWW-Authenticate: Basic realm="Gitea (Basic Auth)"` (the pin's OAuth2-disabled arm, `:152-158` — see SPEC-0002 §2.6) | `:150-160` |
+| 2 | anonymous | private or missing repo, or limited/private owner | F | `401` + `WWW-Authenticate: Basic realm=…` per the pin's OAuth2 switch (`:152-158` — see SPEC-0002 §2.6): `realm="Gitea"` with the provider enabled, `realm="Gitea (Basic Auth)"` disabled (as-built 18b78a8: `basicChallenge(oauth2FeatureEnabled(env))` over `src/git-http/respond.ts:33-45`) | `:150-160` |
 | 3 | anonymous | any | P | `401` + challenge (push always needs identity) | `:149-160` |
 | 4 | anonymous unit-read granted | private repo | F | 200 | `:138-145`, test `:163-189` |
 | 5 | anonymous unit-read granted | private repo | P | `401` (unit read never grants write) | test `:184` |
