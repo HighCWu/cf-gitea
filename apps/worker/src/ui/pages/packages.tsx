@@ -581,10 +581,10 @@ export interface PackagesOwnerChrome {
   repoCount: number;
   followers: number;
   following: number;
-  /** The USER arm's Projects-tab count (header.tmpl:17-20's
-   *  `{{if .ProjectCount}}` label — the OPEN projects total, loadHeaderCount
-   *  parity; the ORG arm renders no Projects tab, the count stays its
-   *  zero). */
+  /** The Projects-tab count (header.tmpl:17-20's `{{if .ProjectCount}}`
+   *  label — the OPEN projects total, loadHeaderCount parity:
+   *  shared/user/header.go:172-192 computes ProjectCount for BOTH owner
+   *  kinds, so both arms render the tab — the org arm INACTIVE). */
   openProjects: number;
   /** The strip's follow-button input (org/header.tmpl:17 on the ORG arm,
    *  profile_big_avatar.tmpl:123-136 on the USER arm): present only for a
@@ -605,8 +605,17 @@ export async function ownerPackagesChrome(
   doer: ProfileDoer,
 ): Promise<PackagesOwnerChrome> {
   if (owner.kind === "user") return userProfileChrome(d1, owner.user, doer);
-  const [repoCount, viewerFollows] = await Promise.all([
+  const [repoCount, orgOpenProjects, viewerFollows] = await Promise.all([
     ownerRepoCount(d1, ownerIdOf(owner), doer),
+    // The org arm's Projects-tab count (header.tmpl:17-20 — the OPEN
+    // organization projects: the projects.ownerId arm over the org's id,
+    // loadHeaderCount parity — shared/user/header.go:178-192 computes
+    // ProjectCount for the organization type too).
+    drizzle(d1)
+      .select({ total: sql<number>`count(*)` })
+      .from(projects)
+      .where(and(eq(projects.ownerId, owner.org.id), eq(projects.isClosed, false)))
+      .get(),
     // org/header.tmpl:17's follow_unfollow include (IsFollowing(doer, org),
     // the org-home loader's gate — a doer row of the org itself cannot
     // exist, the id comparison is the defensive shape).
@@ -616,7 +625,7 @@ export async function ownerPackagesChrome(
     repoCount,
     followers: 0,
     following: 0,
-    openProjects: 0,
+    openProjects: Number(orgOpenProjects?.total ?? 0),
     followButton: doer.id !== null && doer.id !== owner.org.id ? { following: viewerFollows } : null,
     viewerIsAdmin: doer.isAdmin,
   };
@@ -1538,7 +1547,10 @@ function PackagesListBlock(props: {
  *  because `TabName` is unset here (header.tmpl:8's
  *  `eq .TabName "repositories"` — the packages routes never set TabName;
  *  profile.go:90 is the tree's only setter, fed by the `tab` form value,
- *  never "packages") — hence `repositoriesActive={false}`. */
+ *  never "packages") — hence `repositoriesActive={false}`. The Packages tab
+ *  rides the landed packagesEnabled gate (header.tmpl:22's
+ *  `{{if and .IsPackageEnabled ...}}` — the strict-polarity ctx flag the
+ *  user-code-search arm threads too). */
 function UserProfileGrid(props: {
   ctx: UiContext;
   user: UserProfileRow;
@@ -1565,7 +1577,9 @@ function UserProfileGrid(props: {
             starsCount={props.user.numStars}
             repositoriesActive={false}
             projectsTab={{ active: false, count: props.chrome.openProjects, href: `/${username}/-/projects` }}
-            packagesTab={{ active: true, href: `/${username}/-/packages` }}
+            packagesTab={
+              props.ctx.packagesEnabled !== false ? { active: true, href: `/${username}/-/packages` } : undefined
+            }
             codeTab={{ active: false, href: `/${username}/-/code` }}
           />
           {props.children}
@@ -1577,18 +1591,26 @@ function UserProfileGrid(props: {
 
 /** The org chrome the packages-family org pages share (org/header +
  *  org/menu with the Packages tab ACTIVE) — used by the owner list and
- *  version view renders below (package-settings.tsx's org arm renders
- *  org/header ALONE — upstream renders no menu there). The header's follow
- *  button is the C2 arm (org/header.tmpl:17); the menu's Code tab is the
- *  C1 arm (menu.tmpl:28-32, inactive here). Repositories renders INACTIVE
- *  (`repositoriesActive=false` — menu.tmpl:9's `PageIsViewRepositories` is
- *  never set on this family, whose only active state is the Packages item,
- *  :24's `IsPackagesPage`; the DR-5 landing closed the K2 drift the module
- *  header records). */
+ *  version view renders below, and exported for package-settings.tsx whose
+ *  org arm renders the same pair (upstream org/header.tmpl:38 ends with an
+ *  UNCONDITIONAL org/menu include and package/settings.tmpl:3-7 renders
+ *  org/header on the org arm — the menu renders on every org page of the
+ *  family). The header's follow button is the C2 arm (org/header.tmpl:17);
+ *  the menu carries the FULL tab set (menu.tmpl:15-22 Projects INACTIVE —
+ *  `PageIsViewProjects` false here — :23-27 Packages ACTIVE, :28-32 Code
+ *  inactive). Repositories renders INACTIVE (`repositoriesActive=false` —
+ *  menu.tmpl:9's `PageIsViewRepositories` is never set on this family,
+ *  whose only active state is the Packages item, :24's `IsPackagesPage`;
+ *  the DR-5 landing closed the K2 drift the module header records).
+ *  `openProjects` feeds the Projects tab's `{{if .ProjectCount}}` label
+ *  (loadHeaderCount parity). */
 export function OrgPackagesChrome(props: {
   ctx: UiContext;
   org: OrgRecord;
   repoCount: number;
+  /** The OPEN organization-projects total (the Projects tab's count label;
+   *  the org chrome loader's read). */
+  openProjects: number;
   followButton?: { following: boolean };
   children: import("hono/jsx").Child;
 }) {
@@ -1599,7 +1621,10 @@ export function OrgPackagesChrome(props: {
         orgLink={`/${props.org.username}`}
         repoCount={props.repoCount}
         repositoriesActive={false}
-        packagesTab={{ active: true, href: `/${props.org.username}/-/packages` }}
+        projectsTab={{ active: false, count: props.openProjects, href: `/${props.org.username}/-/projects` }}
+        packagesTab={
+          props.ctx.packagesEnabled !== false ? { active: true, href: `/${props.org.username}/-/packages` } : undefined
+        }
         codeTab={{ active: false, href: `/${props.org.username}/-/code` }}
       />
       {props.children}
@@ -1637,7 +1662,13 @@ export function OwnerPackagesPage(props: { ctx: UiContext; data: OwnerPackagesDa
     return (
       <BaseLayout ctx={ctx} title={packagesLocale.title} pageClass="organization packages">
         <div class="ui container">
-          <OrgPackagesChrome ctx={ctx} org={data.owner.org} repoCount={data.repoCount} followButton={data.followButton ?? undefined}>
+          <OrgPackagesChrome
+            ctx={ctx}
+            org={data.owner.org}
+            repoCount={data.repoCount}
+            openProjects={data.openProjects}
+            followButton={data.followButton ?? undefined}
+          >
             {listBlock}
           </OrgPackagesChrome>
         </div>
@@ -1716,7 +1747,13 @@ export function OwnerPackageVersionsPage(props: { ctx: UiContext; data: OwnerPac
     return (
       <BaseLayout ctx={ctx} title={packagesLocale.title} pageClass="organization packages">
         <div class="ui container">
-          <OrgPackagesChrome ctx={ctx} org={data.owner.org} repoCount={data.repoCount} followButton={data.followButton ?? undefined}>
+          <OrgPackagesChrome
+            ctx={ctx}
+            org={data.owner.org}
+            repoCount={data.repoCount}
+            openProjects={data.openProjects}
+            followButton={data.followButton ?? undefined}
+          >
             <PackageVersionsBlock data={data} />
           </OrgPackagesChrome>
         </div>
@@ -2012,7 +2049,13 @@ export function OwnerPackageVersionViewPage(props: { ctx: UiContext; data: Packa
     return (
       <BaseLayout ctx={ctx} title={data.pkg.name} pageClass="organization packages">
         <div class="ui container">
-          <OrgPackagesChrome ctx={ctx} org={data.owner.org} repoCount={data.repoCount} followButton={data.followButton ?? undefined}>
+          <OrgPackagesChrome
+            ctx={ctx}
+            org={data.owner.org}
+            repoCount={data.repoCount}
+            openProjects={data.openProjects}
+            followButton={data.followButton ?? undefined}
+          >
             <PackageVersionViewBlock data={data} />
           </OrgPackagesChrome>
         </div>

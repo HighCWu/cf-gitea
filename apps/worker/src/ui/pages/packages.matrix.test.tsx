@@ -1009,6 +1009,11 @@ describe("the wave I-b strip arms on the packages pages", () => {
     expect(html).not.toContain('class="active item" href="/ibowner?tab=repositories"');
     expect(html).toContain('href="/ibowner.rss"'); // the card's unconditional RSS anchor
     expect(html).not.toContain('data-tooltip-content="User Details"'); // no gear for a non-admin
+    // R6-8: the Packages tab rides the landed packagesEnabled gate — the
+    // strict "false" drops it (header.tmpl:22's `{{if and .IsPackageEnabled
+    // ...}}`; the user-code-search arm threads the same polarity).
+    const disarmed = renderOwnerPackagesPage(pageCtx(viewer, { packagesEnabled: false }), data);
+    expect(disarmed).not.toContain('href="/ibowner/-/packages"');
 
     // The site-admin viewer: the gear onto the landed admin user-detail page.
     const adminViewer: Viewer = { kind: "user", id: owner.id + 2, username: "ibadmin", isAdmin: true };
@@ -1051,8 +1056,20 @@ describe("the wave I-b strip arms on the packages pages", () => {
     // org arm, previously a recorded divergence.
     expect(html).toContain('class="item" href="/iborg"');
     expect(html).not.toContain('class="active item" href="/iborg"');
+    // The FULL org-kind menu set (the R6-5 uniformity): the Projects tab
+    // renders INACTIVE beside the ACTIVE Packages item (menu.tmpl:15-22's
+    // `{{if .CanReadProjects}}` — `PageIsViewProjects` false on the
+    // packages pages; loadHeaderCount computes ProjectCount for the org
+    // kind too, shared/user/header.go:178-192).
+    expect(html).toContain('class="item" href="/iborg/-/projects"');
+    expect(html).not.toContain('class="active item" href="/iborg/-/projects"');
     // The org arm renders no avatar card — no gear site.
     expect(html).not.toContain('id="profile-avatar-card"');
+    // R6-8: the Packages tab rides the landed packagesEnabled gate — the
+    // strict "false" drops it (menu.tmpl:23-27's `{{if and .IsPackageEnabled
+    // .CanReadPackages}}`).
+    const disarmed = renderOwnerPackagesPage(pageCtx(viewer, { packagesEnabled: false }), data);
+    expect(disarmed).not.toContain('href="/iborg/-/packages"');
 
     // Anonymous: the follow button drops (org/header.tmpl:17's IsSigned gate).
     const anonData = await loadOwnerPackagesData(env.DB, { kind: "org", org }, { kind: "anonymous" }, ORIGIN, new URLSearchParams());
@@ -1095,8 +1112,11 @@ describe("the wave I-b strip arms on the packages pages", () => {
     expect(orgHtml).toContain('class="item" href="/ibvieworg/-/code"');
     expect(orgHtml).not.toContain('class="active item" href="/ibvieworg/-/code"');
     // The twin's Repositories item is INACTIVE too (the same DR-5 posture —
-    // OrgPackagesChrome's `repositoriesActive={false}`, menu.tmpl:9).
+    // OrgPackagesChrome's `repositoriesActive={false}`, menu.tmpl:9), and
+    // its Projects tab rides the R6-5 uniformity — INACTIVE here.
     expect(orgHtml).toContain('class="item" href="/ibvieworg"');
     expect(orgHtml).not.toContain('class="active item" href="/ibvieworg"');
+    expect(orgHtml).toContain('class="item" href="/ibvieworg/-/projects"');
+    expect(orgHtml).not.toContain('class="active item" href="/ibvieworg/-/projects"');
   });
 });

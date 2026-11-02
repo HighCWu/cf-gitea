@@ -412,6 +412,11 @@ describe("the wave I-b strip arms on the settings page", () => {
     // `eq .TabName "repositories"`).
     expect(html).toContain('<a class="item" href="/ibsetter?tab=repositories">');
     expect(html).not.toContain('class="active item" href="/ibsetter?tab=repositories"');
+    // R6-8: the Packages tab rides the landed packagesEnabled gate — the
+    // strict "false" drops it (header.tmpl:22's `{{if and .IsPackageEnabled
+    // ...}}`).
+    const disarmed = renderPackageSettingsPage(pageCtx(viewer, { packagesEnabled: false }), data);
+    expect(disarmed).not.toContain('href="/ibsetter/-/packages"');
     // org_profile_avatar.tmpl carries no follow control, no gear, no RSS —
     // the shared profile_big_avatar arms never render on this page.
     expect(html).not.toContain('method="post" action="/ibsetter?action=');
@@ -432,6 +437,26 @@ describe("the wave I-b strip arms on the settings page", () => {
     const html = renderPackageSettingsPage(pageCtx(viewer), data);
     expect(html).toContain('<form method="post" action="/ibsetorg?action=follow">');
     expect(html).toContain('class="ui basic label button" href="/ibsetorg.rss"');
+    // R6-3: the org arm renders the FULL org menu (package/settings.tmpl:3-7
+    // renders org/header and org/header.tmpl:38 ends with an unconditional
+    // org/menu include — the org arm of this family was previously bare).
+    // The Packages tab stays ACTIVE (`.IsPackagesPage` — package.go:418);
+    // the Projects + Code tabs render INACTIVE (menu.tmpl:15-22/:28-32);
+    // Repositories renders INACTIVE (menu.tmpl:9's `PageIsViewRepositories`
+    // is never set on this family — :24's IsPackagesPage is its only active
+    // state, the DR-5 posture OrgPackagesChrome lands).
+    expect(html).toContain('<a class="active item" href="/ibsetorg/-/packages">');
+    expect(html).toContain('class="item" href="/ibsetorg/-/projects"');
+    expect(html).not.toContain('class="active item" href="/ibsetorg/-/projects"');
+    expect(html).toContain('class="item" href="/ibsetorg/-/code"');
+    expect(html).not.toContain('class="active item" href="/ibsetorg/-/code"');
+    expect(html).toContain('class="item" href="/ibsetorg"');
+    expect(html).not.toContain('class="active item" href="/ibsetorg"');
+    // R6-8: the Packages tab rides the landed packagesEnabled gate — the
+    // strict "false" drops it (menu.tmpl:23-27's `{{if and .IsPackageEnabled
+    // .CanReadPackages}}`).
+    const disarmed = renderPackageSettingsPage(pageCtx(viewer, { packagesEnabled: false }), data);
+    expect(disarmed).not.toContain('href="/ibsetorg/-/packages"');
 
     // Anonymous: the follow button drops (org/header.tmpl:17's IsSigned
     // gate), the RSS anchor stays (EnableFeed pins TRUE).

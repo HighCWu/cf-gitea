@@ -79,8 +79,10 @@
  * ## DOM (templates/package/settings.tmpl)
  *
  * `page-content package settings options` (+` organization` on the org
- * arm): org/header ALONE on the org arm (no org menu — upstream renders
- * none here), the org_profile_avatar strip + the overview tabs on the user
+ * arm): org/header + org/menu on the org arm (settings.tmpl:3-7 renders
+ * org/header, whose org/header.tmpl:38 ends with an unconditional org/menu
+ * include — the full menu renders on every org page of the family), the
+ * org_profile_avatar strip + the overview tabs on the user
  * arm, then the container: base/alert (the flash banner slot), the
  * breadcrumb (`{package anchor} {badge} / Settings`), and the three
  * sections — visibility (inherit note + the owner-settings link button),
@@ -136,7 +138,7 @@ import {
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
 import type { Viewer } from "../viewer";
-import { OrgHeader } from "./org-home";
+import { OrgHeader, OrgMenu } from "./org-home";
 import {
   ownerPackagesAccessMode,
   ownerPackagesChrome,
@@ -496,10 +498,11 @@ function SettingsAvatarStrip(props: { owner: PackagesOwner }) {
 /** The settings page (templates/package/settings.tmpl — `page-content
  *  package settings options` +` organization`). The flash banner renders
  *  in the base/alert slot (null on the plain GET). The org arm renders
- *  org/header ALONE (upstream registers no org menu on this page); the
- *  user arm renders the avatar strip + the overview tabs (the
- *  user/overview/header twin) — both inside the template's container
- *  order. */
+ *  org/header + org/menu (settings.tmpl:3-7 renders org/header, whose
+ *  org/header.tmpl:38 ends with an UNCONDITIONAL org/menu include — the
+ *  full menu renders on every org page of the family). The user arm
+ *  renders the avatar strip + the overview tabs (the user/overview/header
+ *  twin) — both inside the template's container order. */
 export function PackageSettingsPage(props: {
   ctx: UiContext;
   data: PackageSettingsData;
@@ -606,8 +609,24 @@ export function PackageSettingsPage(props: {
       <BaseLayout ctx={ctx} title={data.pkg.name} pageClass="package settings options organization">
         {/* org/header.tmpl renders on EVERY page of the org packages family
             — the follow button (header.tmpl:17's follow_unfollow include)
-            rides the loader's IsFollowing state. */}
+            rides the loader's IsFollowing state — and header.tmpl:38 ends
+            with an unconditional org/menu include, so the menu renders here
+            too (package/settings.tmpl:3-7). The menu carries the FULL tab
+            set (menu.tmpl:15-32): Projects INACTIVE (`PageIsViewProjects`
+            false here), Packages ACTIVE (`.IsPackagesPage` — the settings
+            handler rides it too, package.go:418), Code INACTIVE, and
+            Repositories INACTIVE (menu.tmpl:9's `PageIsViewRepositories` is
+            never set on this family — :24's IsPackagesPage is its only
+            active state, the DR-5 posture OrgPackagesChrome lands). */}
         <OrgHeader org={data.owner.org} signedIn={ctx.viewer.kind === "user"} followButton={data.followButton ?? undefined} />
+        <OrgMenu
+          orgLink={`/${ownerName}`}
+          repoCount={data.repoCount}
+          repositoriesActive={false}
+          projectsTab={{ active: false, count: data.openProjects, href: `/${ownerName}/-/projects` }}
+          packagesTab={ctx.packagesEnabled !== false ? { active: true, href: `/${ownerName}/-/packages` } : undefined}
+          codeTab={{ active: false, href: `/${ownerName}/-/code` }}
+        />
         <div class="ui container">{body}</div>
       </BaseLayout>
     );
@@ -618,18 +637,22 @@ export function PackageSettingsPage(props: {
       <SettingsAvatarStrip owner={data.owner} />
       <div class="ui container">
         {/* The overview header (user/overview/header.tmpl): the Packages tab
-            ACTIVE (`.IsPackagesPage` — PackageSettings' package.go:418), the
-            wave I-b C1 Projects + Code tabs INACTIVE (header.tmpl:14-31), and
-            Repositories INACTIVE too — TabName is unset on this page
+            ACTIVE (`.IsPackagesPage` — PackageSettings' package.go:418),
+            the wave I-b C1 Projects + Code tabs INACTIVE (header.tmpl:14-31),
+            and Repositories INACTIVE too — TabName is unset on this page
             (header.tmpl:8's `eq .TabName "repositories"`; the tree's only
-            TabName setter is profile.go:90, never reached here). */}
+            TabName setter is profile.go:90, never reached here). The
+            Packages tab rides the landed packagesEnabled gate
+            (header.tmpl:22's `{{if and .IsPackageEnabled ...}}`). */}
         <ProfileTabs
           username={user.username}
           repoCount={data.repoCount}
           starsCount={user.numStars}
           repositoriesActive={false}
           projectsTab={{ active: false, count: data.openProjects, href: `/${user.username}/-/projects` }}
-          packagesTab={{ active: true, href: `/${user.username}/-/packages` }}
+          packagesTab={
+            ctx.packagesEnabled !== false ? { active: true, href: `/${user.username}/-/packages` } : undefined
+          }
           codeTab={{ active: false, href: `/${user.username}/-/code` }}
         />
         {body}

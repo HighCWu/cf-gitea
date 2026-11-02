@@ -238,6 +238,30 @@ async function ensureProjectsFixtures(): Promise<ProjectsFixture> {
     orgBoardId = existingOrgBoard.id;
   }
 
+  // The org's PRIVATE repo (the R6-6 RepoCount pin): the org listing's
+  // doer-visible total counts it for the org owner (listOrgRepos' isOwner
+  // arm) where the retired public-only profile WHERE counted zero — the
+  // label pins ONE org predicate across the pages.
+  const orgVaultId = "projmx-orgvault";
+  const existingOrgVault = await db
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(eq(repositories.id, orgVaultId))
+    .get();
+  if (existingOrgVault === undefined) {
+    await db.insert(repositories).values({
+      id: orgVaultId,
+      storageKey: `r_${orgVaultId}`,
+      ownerNamespace: ORG_NAME,
+      ownerId: org.id,
+      slug: "projmx-orgvault",
+      visibility: "private",
+      defaultBranch: "main",
+      isEmpty: true,
+      status: "ready",
+    });
+  }
+
   // The repos: the live lab (unit on) and the row-only ARCHIVED twin (unit
   // on, isArchived flipped). Both carry a board so the gate arms have real
   // rows to resolve before refusing.
@@ -703,6 +727,22 @@ describe("the wave I-b strip arms on the projects pages", () => {
     expect(html).toContain('class="item" href="/projmx-owner/-/code"');
     expect(html).toContain("octicon-code");
     expect(html).not.toContain('class="active item" href="/projmx-owner/-/code"');
+    // ProfileTabs' FULL user-kind set (user/overview/header.tmpl — ONE
+    // user-kind strip shape across the pages): Projects ACTIVE
+    // (header.tmpl:15's PageIsViewProjects), Packages present INACTIVE
+    // under the strict-polarity flag (:22-26), Repositories INACTIVE beside
+    // the active Projects tab (header.tmpl:8 — TabName unset on this page),
+    // the Activity/Stars/watching trio present INACTIVE (:32-47).
+    expect(html).toContain('class="active item" href="/projmx-owner/-/projects"');
+    expect(html).toContain('class="item" href="/projmx-owner/-/packages"');
+    expect(html).not.toContain('class="active item" href="/projmx-owner/-/packages"');
+    expect(html).toContain('class="item" href="/projmx-owner?tab=repositories"');
+    expect(html).not.toContain('class="active item" href="/projmx-owner?tab=repositories"');
+    expect(html).toContain('class="item" href="/projmx-owner?tab=activity"');
+    expect(html).toContain('class="item" href="/projmx-owner?tab=stars"');
+    expect(html).toContain('class="item" href="/projmx-owner?tab=watching"');
+    const strip = html.slice(html.indexOf("<overflow-menu"), html.indexOf("</overflow-menu>"));
+    expect((strip.match(/class="active item"/g) ?? []).length).toBe(1);
     // The avatar card's unconditional RSS anchor (profile_big_avatar.tmpl:
     // 31-33 — EnableFeed pins TRUE).
     expect(html).toContain('href="/projmx-owner.rss"');
@@ -747,6 +787,23 @@ describe("the wave I-b strip arms on the projects pages", () => {
     // menu.tmpl:28-32's Code item — present, INACTIVE (PageIsViewProjects).
     expect(html).toContain('class="item" href="/projmxorg/-/code"');
     expect(html).not.toContain('class="active item" href="/projmxorg/-/code"');
+    // The FULL org-kind menu set (asserted once for the kind): the ACTIVE
+    // Projects tab (menu.tmpl:15-22), Packages present INACTIVE under the
+    // strict-polarity flag (:23-27), Repositories INACTIVE (menu.tmpl:9's
+    // PageIsViewRepositories — the DR-5 posture).
+    expect(html).toContain('class="active item" href="/projmxorg/-/projects"');
+    expect(html).toContain('class="item" href="/projmxorg/-/packages"');
+    expect(html).not.toContain('class="active item" href="/projmxorg/-/packages"');
+    expect(html).toContain('class="item" href="/projmxorg"');
+    expect(html).not.toContain('class="active item" href="/projmxorg"');
+    // R6-6: the Repositories label is the org LISTING's doer-visible total —
+    // the org owner (listOrgRepos' isOwner arm) counts the org's PRIVATE
+    // repo where the retired public-only profile WHERE counted zero. The
+    // label rides the repositories item (scoped to that exact anchor — the
+    // trailing `>` excludes the `.rss` anchor — so the members/projects
+    // labels cannot confuse the pin).
+    const reposItem = html.slice(html.indexOf('href="/projmxorg">'));
+    expect(reposItem.slice(0, reposItem.indexOf("</a>"))).toContain('<div class="ui small label">1</div>');
   });
 
   it("the BOARD page carries the same arms on both chrome arms", async () => {
@@ -762,6 +819,22 @@ describe("the wave I-b strip arms on the projects pages", () => {
     expect(userHtml).toContain('href="/projmx-owner.rss"');
     expect(userHtml).toContain('class="item" href="/projmx-owner/-/code"');
     expect(userHtml).not.toContain('class="active item" href="/projmx-owner/-/code"');
+    // ProfileTabs' FULL user-kind set on the board chrome too: Projects
+    // ACTIVE, Packages present INACTIVE, Repositories INACTIVE, the
+    // Activity/Stars/watching trio present.
+    expect(userHtml).toContain('class="active item" href="/projmx-owner/-/projects"');
+    expect(userHtml).toContain('class="item" href="/projmx-owner/-/packages"');
+    expect(userHtml).not.toContain('class="active item" href="/projmx-owner/-/packages"');
+    expect(userHtml).toContain('class="item" href="/projmx-owner?tab=repositories"');
+    expect(userHtml).not.toContain('class="active item" href="/projmx-owner?tab=repositories"');
+    expect(userHtml).toContain('class="item" href="/projmx-owner?tab=activity"');
+    expect(userHtml).toContain('class="item" href="/projmx-owner?tab=stars"');
+    expect(userHtml).toContain('class="item" href="/projmx-owner?tab=watching"');
+    const userStrip = userHtml.slice(
+      userHtml.indexOf("<overflow-menu"),
+      userHtml.indexOf("</overflow-menu>"),
+    );
+    expect((userStrip.match(/class="active item"/g) ?? []).length).toBe(1);
 
     // The ORG arm (the org owner: header follow button + inactive Code).
     const orgBoard = await fetchUi(`/${ORG_NAME}/-/projects/${fixture.orgBoardId}`, {
@@ -773,6 +846,16 @@ describe("the wave I-b strip arms on the projects pages", () => {
     expect(orgHtml).toContain('href="/projmxorg.rss"');
     expect(orgHtml).toContain('class="item" href="/projmxorg/-/code"');
     expect(orgHtml).not.toContain('class="active item" href="/projmxorg/-/code"');
+    // The FULL org-kind menu set on the board chrome too: Projects ACTIVE,
+    // Packages present INACTIVE, Repositories INACTIVE with the org
+    // listing's RepoCount (the R6-6 predicate — the private repo counts).
+    expect(orgHtml).toContain('class="active item" href="/projmxorg/-/projects"');
+    expect(orgHtml).toContain('class="item" href="/projmxorg/-/packages"');
+    expect(orgHtml).not.toContain('class="active item" href="/projmxorg/-/packages"');
+    expect(orgHtml).toContain('class="item" href="/projmxorg"');
+    expect(orgHtml).not.toContain('class="active item" href="/projmxorg"');
+    const orgReposItem = orgHtml.slice(orgHtml.indexOf('href="/projmxorg">'));
+    expect(orgReposItem.slice(0, orgReposItem.indexOf("</a>"))).toContain('<div class="ui small label">1</div>');
     // The org arm renders no avatar card — no gear site.
     expect(orgHtml).not.toContain('data-tooltip-content="User Details"');
   });

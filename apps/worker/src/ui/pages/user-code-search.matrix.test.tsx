@@ -581,6 +581,12 @@ describe("the R05 page over federated engine fixtures (three repos)", () => {
     // the tab strip's repositories label carries the doer-visible count (3
     // public rows: alpha, beta, gamma)
     expect(page.html).toContain('href="/cs-owner?tab=repositories"');
+    // R6-1: the Repositories item renders INACTIVE beside the ACTIVE Code
+    // tab (TabName is never set on /-/code — code.go:37 sets IsCodePage
+    // only; header.tmpl:8's `eq .TabName "repositories"` fails — the org
+    // arm's DR-5 posture mirrored on the user arm).
+    expect(page.html).toContain('class="item" href="/cs-owner?tab=repositories"');
+    expect(page.html).not.toContain('class="active item" href="/cs-owner?tab=repositories"');
   });
 
   it("an anonymous keyword search over the empty-only set answers the clean no-results state", async () => {
@@ -714,6 +720,21 @@ describe("the wave I-b strip arms on the code page", () => {
     expect(page.html).not.toContain('data-tooltip-content="User Details"');
     // The Packages tab renders under the strict-polarity flag (undefined ⇒ on).
     expect(page.html).toContain('class="item" href="/cs-owner/-/packages"');
+    // R6-1: Repositories INACTIVE beside the ACTIVE Code tab (TabName unset
+    // on /-/code — header.tmpl:8's `eq .TabName "repositories"` fails).
+    expect(page.html).toContain('class="item" href="/cs-owner?tab=repositories"');
+    expect(page.html).not.toContain('class="active item" href="/cs-owner?tab=repositories"');
+    // THE user-kind tab-set shape (asserted once for the kind — this strip):
+    // the full user/overview/header.tmpl set renders here — repositories,
+    // projects, packages, code, activity, stars, watching — with exactly one
+    // ACTIVE item (Code) and the Activity/Stars/watching trio INACTIVE
+    // (header.tmpl:32-47; the collapsed-if rule ships both anchors).
+    expect(page.html).toContain('class="item" href="/cs-owner?tab=activity"');
+    expect(page.html).toContain('class="item" href="/cs-owner?tab=stars"');
+    expect(page.html).toContain('class="item" href="/cs-owner?tab=watching"');
+    // (scoped to the strip's own overflow-menu block, not the whole document)
+    const strip = page.html.slice(page.html.indexOf("<overflow-menu"), page.html.indexOf("</overflow-menu>"));
+    expect((strip.match(/class="active item"/g) ?? []).length).toBe(1);
 
     // Following → the unfollow arm drops the primary class
     // (profile_big_avatar.tmpl:126's Iif).
@@ -771,6 +792,20 @@ describe("the wave I-b strip arms on the code page", () => {
     // arm; :28-32's IsCodePage is this page's only active state).
     expect(orgPage.html).toContain('class="item" href="/cs-iborg"');
     expect(orgPage.html).not.toContain('class="active item" href="/cs-iborg"');
+    // THE org-kind tab-set shape (asserted once for the kind — this strip):
+    // the FULL org menu renders here — repositories, projects, packages,
+    // code — with Projects INACTIVE (menu.tmpl:15-22, `PageIsViewProjects`
+    // false on the code page) and Packages INACTIVE under the strict-polarity
+    // flag (menu.tmpl:23-27; undefined ⇒ on).
+    expect(orgPage.html).toContain('class="item" href="/cs-iborg/-/projects"');
+    expect(orgPage.html).not.toContain('class="active item" href="/cs-iborg/-/projects"');
+    expect(orgPage.html).toContain('class="item" href="/cs-iborg/-/packages"');
+    expect(orgPage.html).not.toContain('class="active item" href="/cs-iborg/-/packages"');
+    const orgStrip = orgPage.html.slice(
+      orgPage.html.indexOf("<overflow-menu"),
+      orgPage.html.indexOf("</overflow-menu>"),
+    );
+    expect((orgStrip.match(/class="active item"/g) ?? []).length).toBe(1);
     // The org arm renders no avatar card (OrgHeader renders none upstream).
     expect(orgPage.html).not.toContain('id="profile-avatar-card"');
   });

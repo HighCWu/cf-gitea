@@ -108,25 +108,32 @@
  *   `renderUtils.MarkdownToHtml(project.Description)` (projects.go:106-108)
  *   is the same repo-context-free render; ours escapes raw HTML
  *   (SPEC-0008 §3.4's documented sanitizer divergence).
- * - The user arm's overview menu (user/overview/header.tmpl) renders the
- *   live tabs (Repositories + the active Projects + the C1 Code tab,
- *   header.tmpl:26-31 — the wave I-b completion; Packages/Activity/Stars
- *   stay unrendered, their pages dead links here §2.4.1); the Repositories
- *   tab anchors `/{username}` (the landed profile page, the user-profile
- *   menu convention — upstream's `?tab=repositories` is a no-op here). Tab
- *   count labels ride `loadHeaderCount`'s data (header.go:165-193):
- *   RepoCount = the doer-visible repository total (the profile loader's
- *   WHERE), ProjectCount = the OPEN projects total. The avatar card renders
+ * - The user arm's overview menu is ProfileTabs' FULL set
+ *   (user/overview/header.tmpl, the landed component the profile and
+ *   packages pages use — ONE user-kind strip shape): Repositories INACTIVE
+ *   (TabName unset on this page, header.tmpl:8), the ACTIVE Projects tab
+ *   (header.tmpl:15, `PageIsViewProjects`), Packages INACTIVE under the
+ *   landed packagesEnabled gate (:22-26), Code INACTIVE (:27-31), and the
+ *   Activity/Stars/watching trio INACTIVE (:32-47); the Repositories tab
+ *   anchors `/{username}?tab=repositories` (the landed ProfileTabs
+ *   convention — upstream's `?tab=repositories` is a no-op on the landed
+ *   profile page, which IS the repositories tab). Tab count labels ride
+ *   `loadHeaderCount`'s data (header.go:165-193): RepoCount = the
+ *   doer-visible repository total (the profile loader's WHERE on the user
+ *   arm), ProjectCount = the OPEN projects total. The avatar card renders
  *   the C2 follow button (profile_big_avatar.tmpl:123-136, IsFollowing over
  *   the landed machinery) and the C3 admin gear (:18, the viewer-side admin
  *   flag) beside the unconditional RSS anchor (:31-33 — EnableFeed pins
  *   TRUE, modules/setting/other.go:21).
- * - The org arm's menu renders the Repositories + Projects tabs —
- *   OrgMenu's additive projectsTab extension (org-home.tsx, disclosed) —
- *   plus the C1 Code tab (menu.tmpl:28-32, the wave I-b completion,
- *   inactive); the org header carries the C2 follow button
- *   (org/header.tmpl:17's follow_unfollow include). Members/Teams/Settings
- *   stay OrgMenu's own reduction (not this row's diff).
+ * - The org arm's menu renders the FULL OrgMenu tab set — Repositories,
+ *   the ACTIVE Projects tab (OrgMenu's additive projectsTab extension,
+ *   org-home.tsx, disclosed), Packages INACTIVE under the packagesEnabled
+ *   gate (menu.tmpl:23-27) and the C1 Code tab (menu.tmpl:28-32, inactive);
+ *   the org header carries the C2 follow button (org/header.tmpl:17's
+ *   follow_unfollow include). The org RepoCount is the org LISTING's
+ *   doer-visible total (listOrgRepos — ONE org predicate across the pages,
+ *   header.go:165-176's single RepoCount arm). Members/Teams/Settings stay
+ *   OrgMenu's own reduction (not this row's diff).
  */
 
 import { and, eq, sql } from "drizzle-orm";
@@ -147,13 +154,14 @@ import {
 import type { User } from "../../api/models/user";
 import type { RepositoryWithOwner, Viewer as ApiViewer } from "../../api/services/repository";
 import { repositories } from "../../db/schema";
-import { type OrgRecord } from "../../services/orgs/orgs";
+import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import { parsePageNumber } from "../page-data";
 import { prettyNumber } from "./releases";
 import { OrgHeader, OrgMenu, resolveOrgHome } from "./org-home";
 import {
   ProfileAvatarCard,
+  ProfileTabs,
   resolveUserProfile,
   type ProfileDoer,
   type UserProfileRow,
@@ -373,18 +381,29 @@ export async function loadOwnerProjectsData(
     canWrite = doer.id !== null && doer.id === owner.user.id;
   }
 
-  // loadHeaderCount (header.go:165-176)'s RepoCount arm: the doer-visible
-  // repository total — the profile loader's WHERE (self/admin sees private
-  // rows, everyone else public).
-  const seePrivateRepos = doer.id !== null && (doer.isAdmin || doer.id === ownerId);
-  const repoWhere = seePrivateRepos
-    ? eq(repositories.ownerId, ownerId)
-    : and(eq(repositories.ownerId, ownerId), eq(repositories.visibility, "public"));
-  const repoCountRow = await drizzle(d1)
-    .select({ total: sql<number>`count(*)` })
-    .from(repositories)
-    .where(repoWhere)
-    .get();
+  // loadHeaderCount (shared/user/header.go:165-176)'s RepoCount arm — ONE
+  // doer-visible total per owner kind: the ORG arm reads the org listing's
+  // own total (`listOrgRepos`' team-aware visibility walk — the
+  // user-code-search orgRepoCount convention, ONE predicate across every
+  // org page); the USER arm keeps the profile loader's WHERE (self/admin
+  // sees private rows, everyone else public).
+  const repoCount =
+    owner.kind === "org"
+      ? await new OrgService(d1)
+          .listOrgRepos(owner.org.id, { id: doer.id, isAdmin: doer.isAdmin }, { page: 1, pageSize: 1 })
+          .then((page) => page.total)
+      : await (async () => {
+          const seePrivateRepos = doer.id !== null && (doer.isAdmin || doer.id === ownerId);
+          const repoWhere = seePrivateRepos
+            ? eq(repositories.ownerId, ownerId)
+            : and(eq(repositories.ownerId, ownerId), eq(repositories.visibility, "public"));
+          const repoCountRow = await drizzle(d1)
+            .select({ total: sql<number>`count(*)` })
+            .from(repositories)
+            .where(repoWhere)
+            .get();
+          return Number(repoCountRow?.total ?? 0);
+        })();
 
   // The user arm's avatar-card counts (the profile loader's pair, count-only
   // pages — the numbers are real).
@@ -417,7 +436,7 @@ export async function loadOwnerProjectsData(
     openTotal,
     closedTotal,
     canWrite,
-    repoCount: Number(repoCountRow?.total ?? 0),
+    repoCount,
     followers,
     following,
     followButton: doer.id !== null && doer.id !== ownerId ? { following: viewerFollows } : null,
@@ -583,9 +602,11 @@ export function OwnerProjectsPage(props: { ctx: UiContext; data: OwnerProjectsDa
     // The ORG arm: org/header (the landed OrgHeader; org/header.tmpl:38's
     // trailing org/menu include is the OrgMenu strip) + the list inside the
     // upstream container. The follow button rides the loader's IsFollowing
-    // state (header.tmpl:17's include); the menu's Code tab is the C1 arm
-    // (menu.tmpl:28-32 — inactive here, IsCodePage false on the projects
-    // page).
+    // state (header.tmpl:17's include); the menu carries the FULL tab set
+    // (menu.tmpl:15-32): Projects ACTIVE (`PageIsViewProjects` —
+    // org.Projects sets it), Packages INACTIVE under the packagesEnabled
+    // gate (:23-27), Code inactive (:28-32 — IsCodePage false on the
+    // projects page).
     return (
       <BaseLayout ctx={ctx} title={ownerProjectsLocale.projects} pageClass="organization projects">
         <OrgHeader org={data.owner.org} signedIn={ctx.viewer.kind === "user"} followButton={data.followButton ?? undefined} />
@@ -593,6 +614,7 @@ export function OwnerProjectsPage(props: { ctx: UiContext; data: OwnerProjectsDa
           orgLink={`/${ownerName}`}
           repoCount={data.repoCount}
           projectsTab={{ active: true, count: data.openTotal, href: basePath }}
+          packagesTab={ctx.packagesEnabled !== false ? { active: false, href: `/${ownerName}/-/packages` } : undefined}
           codeTab={{ active: false, href: `/${ownerName}/-/code` }}
         />
         <div class="ui container">
@@ -605,8 +627,14 @@ export function OwnerProjectsPage(props: { ctx: UiContext; data: OwnerProjectsDa
   // column carrying the overview header menu + the list (profile.tmpl's
   // projects shape, shared/user/profile_big_avatar + user/overview/header).
   // The avatar card's follow button + admin gear are the C2/C3 arms
-  // (profile_big_avatar.tmpl:123-136/:18); the menu's Code tab is the C1
-  // arm (header.tmpl:26-31 — inactive here).
+  // (profile_big_avatar.tmpl:123-136/:18). The strip is ProfileTabs' FULL
+  // set (user/overview/header.tmpl — the landed component the profile and
+  // packages pages use, ONE user-kind DOM shape): Projects ACTIVE
+  // (`PageIsViewProjects`/header.tmpl:15), Packages INACTIVE under the
+  // packagesEnabled gate (:22-26), Code inactive (:27-31), and the
+  // Activity/Stars/watching trio INACTIVE (:32-47) — Repositories INACTIVE
+  // beside the active Projects tab (`repositoriesActive=false` — TabName is
+  // never set on this page, header.tmpl:8's `eq .TabName "repositories"`).
   return (
     <BaseLayout ctx={ctx} title={ownerProjectsLocale.projects} pageClass="user profile">
       <div class="ui container">
@@ -621,10 +649,13 @@ export function OwnerProjectsPage(props: { ctx: UiContext; data: OwnerProjectsDa
             />
           </div>
           <div class="ui twelve wide column tw-mb-4">
-            <OrgMenu
-              orgLink={`/${ownerName}`}
+            <ProfileTabs
+              username={ownerName}
               repoCount={data.repoCount}
+              starsCount={data.owner.user.numStars}
+              repositoriesActive={false}
               projectsTab={{ active: true, count: data.openTotal, href: basePath }}
+              packagesTab={ctx.packagesEnabled !== false ? { active: false, href: `/${ownerName}/-/packages` } : undefined}
               codeTab={{ active: false, href: `/${ownerName}/-/code` }}
             />
             <ProjectsListBlock basePath={basePath} data={data} />

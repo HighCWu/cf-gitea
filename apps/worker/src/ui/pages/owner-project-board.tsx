@@ -108,12 +108,12 @@
  * - The linked-PR read is the comments-ref walk upstream does (batched
  *   queries here, LoadComments there).
  * - The user arm's chrome carries the SAME reductions as the LIST page's
- *   (the live overview tabs — Repositories/Projects plus the wave I-b C1
- *   Code tab, header.tmpl:26-31, inactive — no avatar images). The avatar
- *   card renders the C2 follow button (profile_big_avatar.tmpl:123-136) and
- *   the C3 admin gear (:18); the org arm's header carries the C2 follow
- *   button (org/header.tmpl:17) and its menu the C1 Code tab
- *   (menu.tmpl:28-32, inactive).
+ *   (ProfileTabs' FULL overview set — user/overview/header.tmpl — no avatar
+ *   images). The avatar card renders the C2 follow button
+ *   (profile_big_avatar.tmpl:123-136) and the C3 admin gear (:18); the org
+ *   arm's header carries the C2 follow button (org/header.tmpl:17) and its
+ *   menu the FULL OrgMenu tab set (menu.tmpl:15-32 — Packages under the
+ *   packagesEnabled gate, Code inactive).
  * - Markdown renders through the SHARED service in its context-less mode
  *   (SPEC-0008 §3.4's sanitizer divergence, the LIST page's note).
  */
@@ -164,8 +164,9 @@ import { BaseLayout, Icon, renderPage } from "../shell";
 import { TimeSince } from "../components/file-list";
 import { IssueStateIcon, LabelBadge, contrastColor, type IssueListItem } from "./issues-list";
 import { OrgHeader, OrgMenu } from "./org-home";
-import { ProfileAvatarCard, type ProfileDoer } from "./user-profile";
+import { ProfileAvatarCard, ProfileTabs, type ProfileDoer } from "./user-profile";
 import type { OwnerProjectsResolution } from "./owner-projects";
+import { OrgService } from "../../services/orgs/orgs";
 import type { UiContext } from "../ui-context";
 import type { Viewer } from "../viewer";
 import type { Child } from "hono/jsx";
@@ -351,7 +352,11 @@ export interface BoardChromeCounts {
 
 /** loadHeaderCount's RepoCount arm + the owner's OPEN-projects total (the
  *  menu tab's count) + the avatar-card pair — the LIST page's exact reads,
- *  extracted so the board/workflow/form pages share them. */
+ *  extracted so the board/workflow/form pages share them. RepoCount is ONE
+ *  doer-visible total per owner kind (shared/user/header.go:165-176): the
+ *  ORG arm reads the org listing's own total (`listOrgRepos`' team-aware
+ *  walk — the user-code-search orgRepoCount convention), the USER arm the
+ *  profile loader's WHERE. */
 export async function loadProjectChromeCounts(
   d1: D1Database,
   owner: ResolvedOwner,
@@ -359,17 +364,24 @@ export async function loadProjectChromeCounts(
 ): Promise<BoardChromeCounts> {
   const doer = boardDoer(viewer);
   const ownerId = ownerIdOf(owner);
-  const seePrivateRepos = doer.id !== null && (doer.isAdmin || doer.id === ownerId);
-  const repoWhere = seePrivateRepos
-    ? eq(repositories.ownerId, ownerId)
-    : and(eq(repositories.ownerId, ownerId), eq(repositories.visibility, "public"));
   const scope = ownerScope(owner);
-  const [repoCountRow, openPage] = await Promise.all([
-    drizzle(d1)
-      .select({ total: sql<number>`count(*)` })
-      .from(repositories)
-      .where(repoWhere)
-      .get(),
+  const [repoCount, openPage] = await Promise.all([
+    owner.kind === "org"
+      ? new OrgService(d1)
+          .listOrgRepos(owner.org.id, { id: doer.id, isAdmin: doer.isAdmin }, { page: 1, pageSize: 1 })
+          .then((page) => page.total)
+      : (async () => {
+          const seePrivateRepos = doer.id !== null && (doer.isAdmin || doer.id === ownerId);
+          const repoWhere = seePrivateRepos
+            ? eq(repositories.ownerId, ownerId)
+            : and(eq(repositories.ownerId, ownerId), eq(repositories.visibility, "public"));
+          const repoCountRow = await drizzle(d1)
+            .select({ total: sql<number>`count(*)` })
+            .from(repositories)
+            .where(repoWhere)
+            .get();
+          return Number(repoCountRow?.total ?? 0);
+        })(),
     // listProjects isClosed=false, page 1, limit 1 — the total is the count.
     listProjects(d1, scope, false, 1, 1),
   ]);
@@ -390,7 +402,7 @@ export async function loadProjectChromeCounts(
   const viewerFollows =
     doer.id !== null && doer.id !== ownerId ? await isFollowing(d1, doer.id, ownerId) : false;
   return {
-    repoCount: Number(repoCountRow?.total ?? 0),
+    repoCount,
     openTotal: openPage.total,
     followers,
     following,
@@ -673,8 +685,14 @@ export async function loadProjectBoardData(
 // ---------------------------------------------------------------------------
 
 /** The shared chrome (both arms of org/projects/view.tmpl + new/workflows'
- *  templates): the org half renders org/header, the individual half the
- *  profile grid — the LIST page's arms with the page's block inside. */
+ *  templates): the org half renders org/header + OrgMenu's FULL tab set
+ *  (org/header.tmpl:38's trailing org/menu include; menu.tmpl:15-32 —
+ *  Projects ACTIVE, Packages INACTIVE under the packagesEnabled gate,
+ *  Code inactive), the individual half the profile grid with ProfileTabs'
+ *  FULL set (user/overview/header.tmpl — Repositories INACTIVE beside the
+ *  ACTIVE Projects tab, Packages gated, Code inactive, Activity/Stars/
+ *  watching inactive) — the LIST page's arms with the page's block inside,
+ *  ONE strip shape per owner-kind. */
 function BoardChrome(props: {
   ctx: UiContext;
   owner: ResolvedOwner;
@@ -698,6 +716,7 @@ function BoardChrome(props: {
           orgLink={`/${ownerName}`}
           repoCount={props.counts.repoCount}
           projectsTab={{ active: true, count: props.counts.openTotal, href: listPath }}
+          packagesTab={ctx.packagesEnabled !== false ? { active: false, href: `/${ownerName}/-/packages` } : undefined}
           codeTab={{ active: false, href: `/${ownerName}/-/code` }}
         />
         {props.children}
@@ -718,10 +737,13 @@ function BoardChrome(props: {
             />
           </div>
           <div class="ui twelve wide column tw-mb-4">
-            <OrgMenu
-              orgLink={`/${ownerName}`}
+            <ProfileTabs
+              username={ownerName}
               repoCount={props.counts.repoCount}
+              starsCount={props.owner.user.numStars}
+              repositoriesActive={false}
               projectsTab={{ active: true, count: props.counts.openTotal, href: listPath }}
+              packagesTab={ctx.packagesEnabled !== false ? { active: false, href: `/${ownerName}/-/packages` } : undefined}
               codeTab={{ active: false, href: `/${ownerName}/-/code` }}
             />
             {props.children}
