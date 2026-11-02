@@ -322,7 +322,14 @@ export function createApiRouter(options: ApiRouterOptions = {}): OpenAPIHono<Api
   // Inventory batch 6 stage 1: repo-scoped project boards (projects,
   // columns, column-issues, workflows — migration 0024; stages 2-3 add the
   // org/user scopes over the same service). Reads ride optionalAuth where
-  // the contract allows; writes reqToken.
+  // the contract allows; writes reqToken. The Projects-unit toggle gate
+  // (P2-1 — upstream's group prologue reqRepoReader(unit.TypeProjects) +
+  // mustEnableRepoProjects, api.go:1689-1691) lives INSIDE the register
+  // function as repoProjectsUnitGate route middleware: upstream carries
+  // the arms on the GROUP at its registration site, but the unit-absent
+  // 403's admin bypass needs the token-resolved viewer, so the faithful
+  // Hono shape is per-route mounting between optionalAuth and requireAuth
+  // (write ladder 404/403/404 -> 401 -> 403 -> 423 -> 422, upstream's order).
   registerProjectsRepoRoutes(app, requireAuth, optionalAuth);
   // Batch 6 stage 2: the org scope over the same store — orgAssignment
   // 404/307 chain, unit-access 404-never-403, workflows owner-only.

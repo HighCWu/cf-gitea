@@ -12,14 +12,16 @@
  * canWriteRepository-backed writer gates are exercisable against the same
  * rows the guards query.
  *
- * Pins asserted: the anti-enumeration 404s, the writer 403 + archived 423
- * stack, the exact upstream error strings (APIErrorAuto's errorForUser
- * rendering), the template default columns ("Backlog" default first, then
- * the template set — column.go:95-137), the closed-project 403, the
- * default-column delete guard + issue move, the legacy-0 claim on the
- * default column's membership read, the workflow capability matrix, and the
- * system-comment adaptation (type 30/31 rows with ids in content JSON,
- * updated_unix bumped, num_comments untouched).
+ * Pins asserted: the Projects-unit toggle's two arms (P2-1: the unit-absent
+ * 403 with the admin bypass + the projects_mode 404 — api.go:1689-1691's
+ * reqRepoReader/mustEnableRepoProjects prologue), the anti-enumeration 404s,
+ * the writer 403 + archived 423 stack, the exact upstream error strings
+ * (APIErrorAuto's errorForUser rendering), the template default columns
+ * ("Backlog" default first, then the template set — column.go:95-137), the
+ * closed-project 403, the default-column delete guard + issue move, the
+ * legacy-0 claim on the default column's membership read, the workflow
+ * capability matrix, and the system-comment adaptation (type 30/31 rows with
+ * ids in content JSON, updated_unix bumped, num_comments untouched).
  */
 
 import { OpenAPIHono } from "@hono/zod-openapi";
@@ -40,6 +42,8 @@ import {
   projectWorkflows,
   projects,
   repoCollaborators,
+  repoSettings,
+  repoUnits,
   repositories,
   users,
 } from "../../db/schema";
@@ -64,10 +68,12 @@ beforeEach(async () => {
     "issue_pins",
     "milestones",
     "issues",
-    "labels",
-    "repo_collaborators",
-    "repositories",
-    "users",
+  "labels",
+  "repo_collaborators",
+  "repo_settings",
+  "repo_units",
+  "repositories",
+  "users",
   ]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
@@ -167,7 +173,20 @@ interface RepoSeed {
   admin: SeededUser;
 }
 
-async function seedRepoAndActors(suffix: string, options?: { visibility?: "public" | "private"; isArchived?: boolean }): Promise<RepoSeed> {
+async function seedRepoAndActors(
+  suffix: string,
+  options?: {
+    visibility?: "public" | "private";
+    isArchived?: boolean;
+    /** The Projects-unit toggle (P2-1's gate store): `true` (the default —
+     *  every pre-existing pin runs through an ARMED unit) writes the
+     *  repo_settings flag + the repo_units projects row in the store's
+     *  lockstep; "repo"/"owner" arm with that projects_mode; `false` leaves
+     *  both rows unwritten (the unit-absent posture — the loadRepoSettings
+     *  defaults read has_projects false). */
+    projectsUnit?: boolean | "repo" | "owner";
+  },
+): Promise<RepoSeed> {
   const owner = await seedUser(`p-owner-${suffix}`);
   const writer = await seedUser(`p-writer-${suffix}`);
   const reader = await seedUser(`p-reader-${suffix}`);
@@ -187,6 +206,17 @@ async function seedRepoAndActors(suffix: string, options?: { visibility?: "publi
     });
   // The writer is a write-mode collaborator (the reduced matrix's writer arm).
   await db().insert(repoCollaborators).values({ repoId, userId: writer.id, mode: "write", createdAt: NOW });
+  const unit = options?.projectsUnit ?? true;
+  if (unit !== false) {
+    const mode = unit === true ? "all" : unit;
+    // The flag↔row lockstep the store's writers maintain (services/
+    // repo-settings.ts saveRepoSettings): the repo_settings flag AND the
+    // repo_units config row land together.
+    await db().insert(repoSettings).values({ repoId, hasProjects: true, updatedAt: NOW });
+    await db()
+      .insert(repoUnits)
+      .values({ repoId, type: "projects", config: JSON.stringify({ ProjectsMode: mode }) });
+  }
   return { repoId, owner, writer, reader, admin };
 }
 
@@ -302,6 +332,81 @@ describe("GET /repos/{owner}/{repo}/projects (repoListProjects)", () => {
     expect(ownerRes.status).toBe(200);
     const adminRes = await send(`/repos/${s.owner.username}/${s.repoId}/projects`, { headers: authHeaders(s.admin.id) });
     expect(adminRes.status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The Projects-unit toggle gate (P2-1 — the group prologue,
+// api.go:1689-1691: reqRepoReader(unit.TypeProjects) +
+// mustEnableRepoProjects ahead of every per-route check)
+// ---------------------------------------------------------------------------
+
+describe("the Projects-unit toggle gate (repoProjectsUnitGate)", () => {
+  it("unit absent: 403 with upstream's reqRepoReader message for anonymous and non-admin viewers; owner and site admin pass the bypass", async () => {
+    const s = await seedRepoAndActors("gateoff", { projectsUnit: false });
+    const send = router();
+    const base = `/repos/${s.owner.username}/${s.repoId}/projects`;
+    const anonymous = await send(base);
+    expect(anonymous.status).toBe(403);
+    expect((await anonymous.json<Record<string, string>>()).message).toBe(
+      "user should have specific read permission or be a repo admin or a site admin",
+    );
+    const reader = await send(base, { headers: authHeaders(s.reader.id) });
+    expect(reader.status).toBe(403);
+    expect((await reader.json<Record<string, string>>()).message).toBe(
+      "user should have specific read permission or be a repo admin or a site admin",
+    );
+    // The bypass arms: the repo owner and the seeded site admin reach the
+    // handlers (upstream's admin passes reqRepoReader and MustGetUnit
+    // synthesizes the default ProjectsConfig — repo.go:399-424).
+    expect((await send(base, { headers: authHeaders(s.owner.id) })).status).toBe(200);
+    expect((await send(base, { headers: authHeaders(s.admin.id) })).status).toBe(200);
+    // The write arm answers the unit 403 AHEAD of reqToken's 401 (the group
+    // middleware wraps upstream's writeChecks).
+    const anonPost = await send(base, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    expect(anonPost.status).toBe(403);
+    expect((await anonPost.json<Record<string, string>>()).message).toBe(
+      "user should have specific read permission or be a repo admin or a site admin",
+    );
+  });
+
+  it("projects_mode outside {repo, all}: 404 not found for EVERYONE, admins included; the arm precedes reqToken on writes", async () => {
+    const s = await seedRepoAndActors("gateowner", { projectsUnit: "owner" });
+    const send = router();
+    const base = `/repos/${s.owner.username}/${s.repoId}/projects`;
+    expect((await send(base, { headers: authHeaders(s.reader.id) })).status).toBe(404);
+    const adminRes = await send(base, { headers: authHeaders(s.admin.id) });
+    expect(adminRes.status).toBe(404);
+    expect((await adminRes.json<Record<string, string>>()).message).toBe("not found");
+    // Anonymous POST: the mode 404, not the 401 (mustEnableRepoProjects has
+    // no admin bypass and sits ahead of reqToken upstream).
+    const anonPost = await send(base, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    expect(anonPost.status).toBe(404);
+    expect((await anonPost.json<Record<string, string>>()).message).toBe("not found");
+  });
+
+  it("projects_mode repo: the repo-level boards are enabled — reads pass for every visible viewer", async () => {
+    const s = await seedRepoAndActors("gaterepo", { projectsUnit: "repo" });
+    const send = router();
+    expect(
+      (await send(`/repos/${s.owner.username}/${s.repoId}/projects`, { headers: authHeaders(s.reader.id) })).status,
+    ).toBe(200);
+    expect((await send(`/repos/${s.owner.username}/${s.repoId}/projects`)).status).toBe(200);
+  });
+
+  it("an armed unit keeps the write ladder behind the gate: 401 anonymous (not the gate's arms), then the writer 403", async () => {
+    const s = await seedRepoAndActors("gatearmed");
+    const send = router();
+    const base = `/repos/${s.owner.username}/${s.repoId}/projects`;
+    // Anonymous POST: the unit passes (mode all), reqToken answers 401.
+    expect(
+      (await send(base, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })).status,
+    ).toBe(401);
+    // Non-writer POST passes the gate, fails the writer check.
+    expect(
+      (await send(base, { method: "POST", headers: authHeaders(s.reader.id), body: JSON.stringify({ title: "x" }) }))
+        .status,
+    ).toBe(403);
   });
 });
 
@@ -1098,13 +1203,20 @@ describe("column-issues list query-shape witness (query-shape-audit A2, tier-2)"
     const list = await listRes.json<Array<Record<string, unknown> & { number: number; labels: Array<{ name: string }> }>>();
     expect(list.map((item) => item.number)).toEqual([4, 3, 2, 1]); // sorting ASC, then created/id DESC — the flat sorting ties reverse on id
     const count = meter.count();
-    // Post-fix: 1 repo resolve + 1 project/column/membership set + 2 (count
-    // + page) + 5 prefetch arms (posters, labels, pins, milestones — the PR
-    // arm skips: no pulls here) — page-INDEPENDENT. The pre-fix shape paid
-    // 5 + N×(1 poster + 1 labels + 1 pin + 1 milestone) = 21 at this N; the
-    // N×3 bound fails if any per-row fan returns.
-    expect(count).toBeLessThanOrEqual(14);
-    expect(count).toBeLessThan(4 * 3 + 1);
+    // 1 unit-gate prologue (P2-1: repo resolve + repo_settings + repo_units)
+    // + 1 handler repo re-run + 1 project/column/membership set + 2 (count
+    // + page) + 6 prefetch arms (posters, labels, pins, milestones,
+    // assignees, attachments — the PR arm skips: no pulls here, the projects
+    // join is Wave A's coupling arm) = 16, then the Wave A coupling debt:
+    // the per-row `Issue.projects` render calls toApiProject PER ISSUE ROW,
+    // and toApiProject pays its own count + creator read per call (upstream
+    // preloads both — ToProject is O(1) there, convert/project.go:119-157
+    // reads the handler-preloaded NumIssues) — +2×N rows = +8 here. The flat
+    // 24 pins TODAY'S shape; the page-independence property is suspended on
+    // that fan — batching a project-render context (one creators read + one
+    // grouped counts read per page) is the coupling owner's follow-up, and
+    // this cap drops back to ≤16 when it lands.
+    expect(count).toBeLessThanOrEqual(24);
 
     // Contract discipline: the batched list render must be deep-equal to the
     // per-row single-GET renders for every row — the null poster, the

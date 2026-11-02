@@ -47,8 +47,10 @@ import {
 import {
   assertNotArchived,
   canWriteRepository,
+  isRepositoryAdmin,
   requireVisibleRepo,
 } from "../services/repo-access";
+import { loadRepoSettings } from "../services/repo-settings";
 import { viewerOf } from "../services/repository";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import {
@@ -78,14 +80,22 @@ import { prefetchIssueRenderContext, toApiIssue } from "../services/issues";
  *
  *  upstream                                   ours
  *  -----------------------------------------  --------------------------------
- *  repoAssignment() (invisible repo → 404)    requireVisibleRepo (404) — as
- *                                             route middleware on the body
- *                                             routes, handler elsewhere
- *  reqRepoReader(unit.TypeProjects)           visibility ⇒ read in our matrix
- *    (visible-repo-no-read → 403)             (arm unreachable; see below)
- *  mustEnableRepoProjects (404)               no-op — we have no per-repo
- *                                             Projects-unit toggle; the unit
- *                                             cannot be disabled (divergence)
+ *  repoAssignment() (invisible repo → 404)    requireVisibleRepo (404) — in
+ *                                             the unit gate + the write gate
+ *                                             (+ handler re-run: route
+ *                                             middleware cannot hand the
+ *                                             resolved repo to the handler
+ *                                             without widening ApiEnv)
+ *  reqRepoReader(unit.TypeProjects)           the unit-ABSENT arm of
+ *    (unit-absent-no-read → 403,              repoProjectsUnitGate: has_projects
+ *    admin bypass)                            false ⇒ 403 with upstream's
+ *                                             exact message unless
+ *                                             isRepositoryAdmin (see below)
+ *  mustEnableRepoProjects (404)               the MODE arm of
+ *                                             repoProjectsUnitGate: a stored
+ *                                             projects_mode outside
+ *                                             {repo, all} ⇒ 404 "not found",
+ *                                             admins included
  *  reqToken()                                 requireAuth middleware (401)
  *  reqRepoWriter(unit.TypeProjects)           canWriteRepository → 403 "user
  *                                             should have a permission to
@@ -95,10 +105,23 @@ import { prefetchIssueRenderContext, toApiIssue } from "../services/issues";
  *  mustNotBeArchived                          assertNotArchived → 423 "repo
  *                                             is archived" (same middleware)
  *
- * The upstream 403 arm of reqRepoReader (a repo visible to the doer whose
- * Projects unit they cannot read) cannot arise in our reduced matrix —
- * visibility grants read everywhere (services/repo-access.ts header) — so
- * the anti-enumeration 404 is the only read gate.
+ * The unit gate arms run AHEAD of reqToken in upstream's chain (the group
+ * middleware wraps the per-route writeChecks, api.go:1689-1691), so the
+ * write routes mount the gate between optionalAuth and requireAuth: an
+ * anonymous caller on a toggle-gated repo gets the unit arm's 403/404, not
+ * the 401, exactly like upstream — and the gate runs after optionalAuth so
+ * the admin bypass sees the token-resolved viewer.
+ *
+ * Availability note: the store keeps `has_projects` false on every creation
+ * kind (repos/service.ts CREATION_UNIT_POSTURE — the documented house
+ * divergence, upstream arms TypeProjects in DefaultRepoUnits,
+ * models/unit/unit.go:68-77), and pre-flip repos have no settings row (the
+ * DEFAULT_REPO_SETTINGS fallback is false), so until a repo is armed
+ * (PATCH /repos {"has_projects": true, "projects_mode": …} or the web
+ * settings toggle) the family answers the unit-absent arm — 403 for
+ * non-admins, handlers for admins — the same posture the web UI's landed
+ * gate already presents (ui/index.ts resolveRepoProjectsRequest's
+ * repoHasProjects 404 shell; its mode arm is the web side's open tail).
  *
  * Workflow mutations additionally enforce upstream's CanManageWorkflows
  * (services/projects/workflow.go:27-48 — write access to BOTH the issues
@@ -198,6 +221,59 @@ const projectsListQuery = {
 } as const;
 
 /**
+ * The Projects-unit toggle's two arms (the upstream group prologue,
+ * api.go:1689-1691 — `m.Group("/projects", …, reqRepoReader(unit.TypeProjects),
+ * mustEnableRepoProjects)` — reduced to the landed store; see the module
+ * header's table):
+ *
+ *  1. unit absent (reqRepoReader, api.go:403-410): upstream reads
+ *     Permission.CanRead(TypeProjects), which answers AccessModeNone when the
+ *     repo_units row is missing (models/perm/access/repo_permission.go:104-118
+ *     — UnitAccessMode's `Iif(hasUnit, …, AccessModeNone)`, the owner
+ *     included), answered 403 "user should have specific read permission or
+ *     be a repo admin or a site admin" unless the doer is a repo/site admin.
+ *     Our store keeps the flag↔row lockstep (services/repo-settings.ts
+ *     saveRepoSettings: `has_projects: false` DELETES the projects unit row,
+ *     `true` upserts it), so the read is `loadRepoSettings().hasProjects`;
+ *     the bypass is the landed isRepositoryAdmin reduction (owner / site
+ *     admin / collaborator-admin / team admin). A passing admin reaches the
+ *     handlers exactly like upstream: MustGetUnit synthesizes the default
+ *     ProjectsConfig for a missing unit (models/repo/repo.go:399-424 — mode
+ *     "all"), so the mode arm below lets it through.
+ *  2. mode forbids repo boards (mustEnableRepoProjects, api.go:806-813):
+ *     IsProjectsAllowed(ProjectsModeRepo) (models/repo/repo_unit.go:251-259)
+ *     is true only for the "repo" and "all" modes — anything else is the
+ *     anti-enumeration 404 "not found" (APIErrorNotFound,
+ *     services/context/api.go:137-142) for EVERYONE, admins included (the
+ *     check has no bypass arm). The stored mode is upstream's lenient
+ *     FromDB string (repo_unit.go:231-236 keeps whatever JSON decoded), so
+ *     any value outside {repo, all} closes the gate exactly like a
+ *     raw-string ProjectsMode would upstream.
+ *
+ * Mounted AHEAD of requireAuth on the write routes (the group middleware
+ * wraps upstream's per-route reqToken) and after optionalAuth (the admin
+ * bypass needs the token-resolved viewer) — the resulting write ladder is
+ * 404 invisible / 403 unit-absent / 404 mode → 401 → 403 writer → 423
+ * archived → 422 bind, upstream's exact order.
+ */
+const repoProjectsUnitGate: MiddlewareHandler<ApiEnv> = async (c, next) => {
+  // A shared middleware sees hono's untyped param bag; every route this gate
+  // is mounted on matches `/repos/{owner}/{repo}/…` (same posture as the
+  // write gate below — the handlers get the typed record via
+  // c.req.valid("param")).
+  const found = await requireVisibleRepo(c, c.req.param() as { owner: string; repo: string });
+  const settings = await loadRepoSettings(c.env.DB, found.repo.id);
+  if (!settings.hasProjects) {
+    if (!(await isRepositoryAdmin(c, found))) {
+      throw new ApiError(403, "user should have specific read permission or be a repo admin or a site admin");
+    }
+  } else if (settings.projectsMode !== "repo" && settings.projectsMode !== "all") {
+    throw new ApiError(404, "not found");
+  }
+  await next();
+};
+
+/**
  * The upstream pre-bind write stack as route middleware. Upstream mounts the
  * project group under repoAssignment() (404) with the per-route reqRepoWriter
  * (403) + mustNotBeArchived (423) checks AHEAD of web's bind — api.go:783:
@@ -227,7 +303,7 @@ const listProjectsRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "get",
     path: "/repos/{owner}/{repo}/projects",
-    middleware: [optionalAuth],
+    middleware: [optionalAuth, repoProjectsUnitGate],
     tags: ["repository"],
     summary: "List a repository's projects",
     operationId: "repoListProjects",
@@ -241,11 +317,11 @@ const listProjectsRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
     },
   });
 
-const createProjectRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
+const createProjectRoute = (optionalAuth: MiddlewareHandler<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "post",
     path: "/repos/{owner}/{repo}/projects",
-    middleware: [requireAuth, repoProjectWriteGate],
+    middleware: [optionalAuth, repoProjectsUnitGate, requireAuth, repoProjectWriteGate],
     tags: ["repository"],
     summary: "Create a project owned by a repository",
     operationId: "repoCreateProject",
@@ -265,7 +341,7 @@ const getProjectRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "get",
     path: "/repos/{owner}/{repo}/projects/{id}",
-    middleware: [optionalAuth],
+    middleware: [optionalAuth, repoProjectsUnitGate],
     tags: ["repository"],
     summary: "Get a project",
     operationId: "repoGetProject",
@@ -276,11 +352,11 @@ const getProjectRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
     },
   });
 
-const editProjectRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
+const editProjectRoute = (optionalAuth: MiddlewareHandler<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "patch",
     path: "/repos/{owner}/{repo}/projects/{id}",
-    middleware: [requireAuth, repoProjectWriteGate],
+    middleware: [optionalAuth, repoProjectsUnitGate, requireAuth, repoProjectWriteGate],
     tags: ["repository"],
     summary: "Edit a project",
     operationId: "repoEditProject",
@@ -296,11 +372,11 @@ const editProjectRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
     },
   });
 
-const deleteProjectRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
+const deleteProjectRoute = (optionalAuth: MiddlewareHandler<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "delete",
     path: "/repos/{owner}/{repo}/projects/{id}",
-    middleware: [requireAuth],
+    middleware: [optionalAuth, repoProjectsUnitGate, requireAuth],
     tags: ["repository"],
     summary: "Delete a project",
     operationId: "repoDeleteProject",
@@ -316,7 +392,7 @@ const listColumnsRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "get",
     path: "/repos/{owner}/{repo}/projects/{id}/columns",
-    middleware: [optionalAuth],
+    middleware: [optionalAuth, repoProjectsUnitGate],
     tags: ["repository"],
     summary: "List a project's columns",
     operationId: "repoListProjectColumns",
@@ -330,11 +406,11 @@ const listColumnsRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
     },
   });
 
-const createColumnRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
+const createColumnRoute = (optionalAuth: MiddlewareHandler<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "post",
     path: "/repos/{owner}/{repo}/projects/{id}/columns",
-    middleware: [requireAuth, repoProjectWriteGate],
+    middleware: [optionalAuth, repoProjectsUnitGate, requireAuth, repoProjectWriteGate],
     tags: ["repository"],
     summary: "Create a column in a project",
     operationId: "repoCreateProjectColumn",
@@ -355,7 +431,7 @@ const getColumnRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "get",
     path: "/repos/{owner}/{repo}/projects/{id}/columns/{column_id}",
-    middleware: [optionalAuth],
+    middleware: [optionalAuth, repoProjectsUnitGate],
     tags: ["repository"],
     summary: "Get a project column",
     operationId: "repoGetProjectColumn",
@@ -366,11 +442,11 @@ const getColumnRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
     },
   });
 
-const editColumnRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
+const editColumnRoute = (optionalAuth: MiddlewareHandler<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "patch",
     path: "/repos/{owner}/{repo}/projects/{id}/columns/{column_id}",
-    middleware: [requireAuth, repoProjectWriteGate],
+    middleware: [optionalAuth, repoProjectsUnitGate, requireAuth, repoProjectWriteGate],
     tags: ["repository"],
     summary: "Edit a project column",
     operationId: "repoEditProjectColumn",
@@ -387,11 +463,11 @@ const editColumnRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
     },
   });
 
-const deleteColumnRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
+const deleteColumnRoute = (optionalAuth: MiddlewareHandler<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "delete",
     path: "/repos/{owner}/{repo}/projects/{id}/columns/{column_id}",
-    middleware: [requireAuth],
+    middleware: [optionalAuth, repoProjectsUnitGate, requireAuth],
     tags: ["repository"],
     summary: "Delete a project column",
     description: "The default column cannot be deleted while it is still the column new issues land in.",
@@ -406,11 +482,11 @@ const deleteColumnRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
     },
   });
 
-const setDefaultColumnRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
+const setDefaultColumnRoute = (optionalAuth: MiddlewareHandler<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "post",
     path: "/repos/{owner}/{repo}/projects/{id}/columns/{column_id}/default",
-    middleware: [requireAuth],
+    middleware: [optionalAuth, repoProjectsUnitGate, requireAuth],
     tags: ["repository"],
     summary: "Set a project's default column",
     description: "The default column is where newly assigned issues land.",
@@ -424,11 +500,11 @@ const setDefaultColumnRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
     },
   });
 
-const moveColumnsRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
+const moveColumnsRoute = (optionalAuth: MiddlewareHandler<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "post",
     path: "/repos/{owner}/{repo}/projects/{id}/columns/move",
-    middleware: [requireAuth, repoProjectWriteGate],
+    middleware: [optionalAuth, repoProjectsUnitGate, requireAuth, repoProjectWriteGate],
     tags: ["repository"],
     summary: "Reorder a project's columns",
     description: "Reorders every column of the project at once. The body lists all column IDs in their new order.",
@@ -450,7 +526,7 @@ const listColumnIssuesRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "get",
     path: "/repos/{owner}/{repo}/projects/{id}/columns/{column_id}/issues",
-    middleware: [optionalAuth],
+    middleware: [optionalAuth, repoProjectsUnitGate],
     tags: ["repository"],
     summary: "List the issues in a project column",
     operationId: "repoListProjectColumnIssues",
@@ -464,11 +540,11 @@ const listColumnIssuesRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
     },
   });
 
-const addIssueRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
+const addIssueRoute = (optionalAuth: MiddlewareHandler<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "post",
     path: "/repos/{owner}/{repo}/projects/{id}/columns/{column_id}/issues/{issue_id}",
-    middleware: [requireAuth],
+    middleware: [optionalAuth, repoProjectsUnitGate, requireAuth],
     tags: ["repository"],
     summary: "Add an issue to a project column",
     description: "Assigns the issue to the project if it is not a member yet, then places it in the column.",
@@ -483,11 +559,11 @@ const addIssueRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
     },
   });
 
-const removeIssueRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
+const removeIssueRoute = (optionalAuth: MiddlewareHandler<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "delete",
     path: "/repos/{owner}/{repo}/projects/{id}/columns/{column_id}/issues/{issue_id}",
-    middleware: [requireAuth],
+    middleware: [optionalAuth, repoProjectsUnitGate, requireAuth],
     tags: ["repository"],
     summary: "Remove an issue from a project column",
     operationId: "repoRemoveIssueFromProjectColumn",
@@ -500,11 +576,11 @@ const removeIssueRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
     },
   });
 
-const moveIssueRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
+const moveIssueRoute = (optionalAuth: MiddlewareHandler<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "post",
     path: "/repos/{owner}/{repo}/projects/{id}/issues/{issue_id}/move",
-    middleware: [requireAuth, repoProjectWriteGate],
+    middleware: [optionalAuth, repoProjectsUnitGate, requireAuth, repoProjectWriteGate],
     tags: ["repository"],
     summary: "Move an issue between a project's columns",
     operationId: "repoMoveProjectIssue",
@@ -525,7 +601,7 @@ const listWorkflowsRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "get",
     path: "/repos/{owner}/{repo}/projects/{id}/workflows",
-    middleware: [optionalAuth],
+    middleware: [optionalAuth, repoProjectsUnitGate],
     tags: ["repository"],
     summary: "List a project's workflows",
     operationId: "repoListProjectWorkflows",
@@ -543,7 +619,7 @@ const getWorkflowRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "get",
     path: "/repos/{owner}/{repo}/projects/{id}/workflows/{workflow_id}",
-    middleware: [optionalAuth],
+    middleware: [optionalAuth, repoProjectsUnitGate],
     tags: ["repository"],
     summary: "Get a project workflow",
     operationId: "repoGetProjectWorkflow",
@@ -554,11 +630,11 @@ const getWorkflowRoute = (optionalAuth: MiddlewareHandler<ApiEnv>) =>
     },
   });
 
-const createWorkflowRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
+const createWorkflowRoute = (optionalAuth: MiddlewareHandler<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "post",
     path: "/repos/{owner}/{repo}/projects/{id}/workflows",
-    middleware: [requireAuth, repoProjectWriteGate],
+    middleware: [optionalAuth, repoProjectsUnitGate, requireAuth, repoProjectWriteGate],
     tags: ["repository"],
     summary: "Create a project workflow",
     operationId: "repoCreateProjectWorkflow",
@@ -575,11 +651,11 @@ const createWorkflowRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
     },
   });
 
-const editWorkflowRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
+const editWorkflowRoute = (optionalAuth: MiddlewareHandler<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "patch",
     path: "/repos/{owner}/{repo}/projects/{id}/workflows/{workflow_id}",
-    middleware: [requireAuth, repoProjectWriteGate],
+    middleware: [optionalAuth, repoProjectsUnitGate, requireAuth, repoProjectWriteGate],
     tags: ["repository"],
     summary: "Edit a project workflow",
     operationId: "repoEditProjectWorkflow",
@@ -596,11 +672,11 @@ const editWorkflowRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
     },
   });
 
-const deleteWorkflowRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
+const deleteWorkflowRoute = (optionalAuth: MiddlewareHandler<ApiEnv>, requireAuth: MiddlewareHandler<ApiEnv>) =>
   createRoute({
     method: "delete",
     path: "/repos/{owner}/{repo}/projects/{id}/workflows/{workflow_id}",
-    middleware: [requireAuth],
+    middleware: [optionalAuth, repoProjectsUnitGate, requireAuth],
     tags: ["repository"],
     summary: "Delete a project workflow",
     operationId: "repoDeleteProjectWorkflow",
@@ -739,7 +815,7 @@ export function registerProjectsRepoRoutes(
   });
 
   app.openapi(
-    createProjectRoute(requireAuth),
+    createProjectRoute(optionalAuth, requireAuth),
     async (c) => {
       const found = await requireVisibleRepo(c, c.req.valid("param"));
       await requireRepoProjectWriter(c, found);
@@ -767,7 +843,7 @@ export function registerProjectsRepoRoutes(
   });
 
   app.openapi(
-    editProjectRoute(requireAuth),
+    editProjectRoute(optionalAuth, requireAuth),
     async (c) => {
       const found = await requireVisibleRepo(c, c.req.valid("param"));
       await requireRepoProjectWriter(c, found);
@@ -799,7 +875,7 @@ export function registerProjectsRepoRoutes(
     projectBodyHook,
   );
 
-  app.openapi(deleteProjectRoute(requireAuth), async (c) => {
+  app.openapi(deleteProjectRoute(optionalAuth, requireAuth), async (c) => {
     const found = await requireVisibleRepo(c, c.req.valid("param"));
     await requireRepoProjectWriter(c, found);
     const row = await findProjectOr404(c, repoProjectScope(found.repo.id), c.req.valid("param").id);
@@ -821,7 +897,7 @@ export function registerProjectsRepoRoutes(
   });
 
   app.openapi(
-    createColumnRoute(requireAuth),
+    createColumnRoute(optionalAuth, requireAuth),
     async (c) => {
       const found = await requireVisibleRepo(c, c.req.valid("param"));
       await requireRepoProjectWriter(c, found);
@@ -849,7 +925,7 @@ export function registerProjectsRepoRoutes(
   });
 
   app.openapi(
-    editColumnRoute(requireAuth),
+    editColumnRoute(optionalAuth, requireAuth),
     async (c) => {
       const found = await requireVisibleRepo(c, c.req.valid("param"));
       await requireRepoProjectWriter(c, found);
@@ -872,7 +948,7 @@ export function registerProjectsRepoRoutes(
     projectBodyHook,
   );
 
-  app.openapi(deleteColumnRoute(requireAuth), async (c) => {
+  app.openapi(deleteColumnRoute(optionalAuth, requireAuth), async (c) => {
     const found = await requireVisibleRepo(c, c.req.valid("param"));
     await requireRepoProjectWriter(c, found);
     const project = await findOpenProjectOr404(c, repoProjectScope(found.repo.id), c.req.valid("param").id);
@@ -881,7 +957,7 @@ export function registerProjectsRepoRoutes(
     return c.body(null, 204);
   });
 
-  app.openapi(setDefaultColumnRoute(requireAuth), async (c) => {
+  app.openapi(setDefaultColumnRoute(optionalAuth, requireAuth), async (c) => {
     const found = await requireVisibleRepo(c, c.req.valid("param"));
     await requireRepoProjectWriter(c, found);
     const project = await findOpenProjectOr404(c, repoProjectScope(found.repo.id), c.req.valid("param").id);
@@ -891,7 +967,7 @@ export function registerProjectsRepoRoutes(
   });
 
   app.openapi(
-    moveColumnsRoute(requireAuth),
+    moveColumnsRoute(optionalAuth, requireAuth),
     async (c) => {
       const found = await requireVisibleRepo(c, c.req.valid("param"));
       await requireRepoProjectWriter(c, found);
@@ -926,7 +1002,7 @@ export function registerProjectsRepoRoutes(
     const rendered = await Promise.all(items.map((issue) => toApiIssue(c.env.DB, viewer, found, issue, { context: renderContext })));
     return c.json(rendered, 200);
   });
-  app.openapi(addIssueRoute(requireAuth), async (c) => {
+  app.openapi(addIssueRoute(optionalAuth, requireAuth), async (c) => {
     const found = await requireVisibleRepo(c, c.req.valid("param"));
     await requireRepoProjectWriter(c, found);
     const actorId = actorIdOf(c);
@@ -937,7 +1013,7 @@ export function registerProjectsRepoRoutes(
     return c.body(null, 201);
   });
 
-  app.openapi(removeIssueRoute(requireAuth), async (c) => {
+  app.openapi(removeIssueRoute(optionalAuth, requireAuth), async (c) => {
     const found = await requireVisibleRepo(c, c.req.valid("param"));
     await requireRepoProjectWriter(c, found);
     const actorId = actorIdOf(c);
@@ -949,7 +1025,7 @@ export function registerProjectsRepoRoutes(
   });
 
   app.openapi(
-    moveIssueRoute(requireAuth),
+    moveIssueRoute(optionalAuth, requireAuth),
     async (c) => {
       const found = await requireVisibleRepo(c, c.req.valid("param"));
       await requireRepoProjectWriter(c, found);
@@ -993,7 +1069,7 @@ export function registerProjectsRepoRoutes(
   });
 
   app.openapi(
-    createWorkflowRoute(requireAuth),
+    createWorkflowRoute(optionalAuth, requireAuth),
     async (c) => {
       const found = await requireVisibleRepo(c, c.req.valid("param"));
       await requireRepoProjectWriter(c, found);
@@ -1015,7 +1091,7 @@ export function registerProjectsRepoRoutes(
   );
 
   app.openapi(
-    editWorkflowRoute(requireAuth),
+    editWorkflowRoute(optionalAuth, requireAuth),
     async (c) => {
       const found = await requireVisibleRepo(c, c.req.valid("param"));
       await requireRepoProjectWriter(c, found);
@@ -1038,7 +1114,7 @@ export function registerProjectsRepoRoutes(
     projectBodyHook,
   );
 
-  app.openapi(deleteWorkflowRoute(requireAuth), async (c) => {
+  app.openapi(deleteWorkflowRoute(optionalAuth, requireAuth), async (c) => {
     const found = await requireVisibleRepo(c, c.req.valid("param"));
     await requireRepoProjectWriter(c, found);
     const project = await findOpenProjectOr404(c, repoProjectScope(found.repo.id), c.req.valid("param").id);

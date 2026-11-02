@@ -29,7 +29,7 @@ import {
 import { carryRepoCell } from "./carry";
 import { purgeRepoMessage, tombstoneRepoDO } from "./purge";
 import { settleCreatingRepo } from "../git-http/gate";
-import { comments, issueLabels, issues, labels, protectedBranches, repoCollaborators, repoCounters, repoRedirects, repoSettings, repoTransfer, repoUnits, repoWatchers, repositories, stars, teamRepoAccess, teams, users } from "../db/schema";
+import { comments, issueLabels, issues, labels, projectColumns, projectIssues, projectWorkflows, projects, protectedBranches, repoCollaborators, repoCounters, repoRedirects, repoSettings, repoTransfer, repoUnits, repoWatchers, repositories, stars, teamRepoAccess, teams, users } from "../db/schema";
 import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
 import { createWikiPage, readWikiPage } from "../services/wiki";
 import { starRepo } from "../api/services/stars";
@@ -757,6 +757,91 @@ describe("delete pipeline (SPEC-0003 §2.5.5, §4.2, §4.8)", () => {
       .bind(survivorIds[0])
       .first<{ read_at_unix: number }>();
     expect(kept?.read_at_unix).toBe(99);
+  });
+
+  it("cascades the project-board stores with the repo (P2-2 — delete.go:239-241 → project.go:450-488)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const svc = service();
+    const NOW_SEED = new Date("2026-01-05T00:00:00Z");
+    const doomed = await createRepo({ id: alice.id, usernameLower: "alice" }, "boarded");
+    const survivor = await createRepo({ id: alice.id, usernameLower: "alice" }, "boarded-elsewhere");
+    // In-file hygiene: this file's beforeEach does not sweep these tables.
+    await env.DB.prepare("DELETE FROM project_workflows").run();
+    await env.DB.prepare("DELETE FROM project_issues").run();
+    await env.DB.prepare("DELETE FROM project_columns").run();
+    await env.DB.prepare("DELETE FROM projects").run();
+
+    const insertProject = async (repoId: string | null, title: string): Promise<number> => {
+      const rows = await drizzle(env.DB)
+        .insert(projects)
+        .values({
+          title,
+          repoId: repoId ?? "",
+          creatorId: alice.id,
+          // 2 = repository scope; 1 = individual/owner scope (project.go:35-43).
+          type: repoId === null ? 1 : 2,
+          createdAt: NOW_SEED,
+          updatedAt: NOW_SEED,
+        })
+        .returning({ id: projects.id })
+        .all();
+      const row = rows[0];
+      if (row === undefined) throw new Error("project seed failed");
+      return row.id;
+    };
+    const addDepth = async (projectId: number): Promise<number> => {
+      const column = await drizzle(env.DB)
+        .insert(projectColumns)
+        .values({ title: "To Do", projectId, creatorId: alice.id, createdAt: NOW_SEED, updatedAt: NOW_SEED })
+        .returning({ id: projectColumns.id })
+        .all()
+        .then((rows) => rows[0]!.id);
+      await drizzle(env.DB)
+        .insert(projectWorkflows)
+        .values({ projectId, event: "item_closed", createdAt: NOW_SEED, updatedAt: NOW_SEED });
+      return column;
+    };
+
+    const doomedProject = await insertProject(doomed.id, "Doomed board");
+    const doomedOwnerLevel = await insertProject(null, "Alice's own board");
+    const survivorProject = await insertProject(survivor.id, "Survivor board");
+    await addDepth(doomedProject);
+    const ownerColumn = await addDepth(doomedOwnerLevel);
+    await addDepth(survivorProject);
+
+    // Membership rows: one riding the doomed repo's issue (the project_issue
+    // join arm — upstream deletes it through the repo's projects), one under
+    // the OWNER-level board (which must survive with its project).
+    await env.DB.prepare(
+      "INSERT INTO issues (repo_id, `index`, poster_id, title, created_unix) VALUES (?, 1, ?, 'B1', unixepoch())",
+    )
+      .bind(doomed.id, alice.id)
+      .run();
+    const doomedIssueId = (
+      await env.DB.prepare("SELECT id FROM issues WHERE repo_id = ?").bind(doomed.id).first<{ id: number }>()
+    )?.id;
+    expect(doomedIssueId).toBeDefined();
+    await drizzle(env.DB).insert(projectIssues).values([
+      { issueId: doomedIssueId!, projectId: doomedProject },
+      { issueId: doomedIssueId!, projectId: doomedOwnerLevel, projectColumnId: ownerColumn },
+    ]);
+
+    await svc.deleteRepository(doomed.id);
+
+    // The doomed repo's boards are gone; the owner-level board (the
+    // WHERE repo_id = ? arm cannot claim repo_id '' — upstream's 0) and the
+    // survivor repo's board survive with their columns, workflows — and the
+    // owner-level membership.
+    const keptProjects = await drizzle(env.DB).select().from(projects).all();
+    expect(keptProjects.map((p) => [p.title, p.repoId]).sort()).toEqual([
+      ["Alice's own board", ""],
+      ["Survivor board", survivor.id],
+    ]);
+    expect(await drizzle(env.DB).select().from(projectColumns).all()).toHaveLength(2);
+    expect(await drizzle(env.DB).select().from(projectWorkflows).all()).toHaveLength(2);
+    const keptMemberships = await drizzle(env.DB).select().from(projectIssues).all();
+    expect(keptMemberships).toHaveLength(1);
+    expect(keptMemberships[0]?.projectId).toBe(doomedOwnerLevel);
   });
 
   it("§4.2: a push holding a receive lease fails cleanly when the delete lands mid-flight", async () => {

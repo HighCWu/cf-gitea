@@ -29,8 +29,17 @@
  *      stored flag, services/repo-settings.ts; upstream's four-mode
  *      ProjectsConfig reduces to the boolean, the landed store's shape).
  *      Every family and the header tab gate on it; a disabled unit is the
- *      NotFound shell. NOTE the default: upstream's DefaultRepoUnits has
- *      projects disabled on fresh repos too — the store's default matches.
+ *      NotFound shell. NOTE the default: upstream's DefaultRepoUnits ARMS
+ *      the projects unit on fresh repos (models/unit/unit.go:68-77 — the
+ *      TypeProjects entry at :74; the mirror :85-93 and template :95-104
+ *      lists ride it too, only the fork list omits it), so a fresh upstream
+ *      repo HAS the unit. Our store keeps `has_projects` false on every
+ *      creation kind — the documented house divergence (repos/service.ts
+ *      CREATION_UNIT_POSTURE, lifecycle.test.ts's seeding pins), flipping it
+ *      is its own alignment. The web arm therefore reads a false default
+ *      that does NOT match upstream's armed posture — the mismatch, not a
+ *      match, and the API-side gate (routes/projects-repo.ts's
+ *      repoProjectsUnitGate) answers the same flag.
  *    - write group `reqRepoProjectsWriter + RepoMustNotBeArchived`:
  *      anonymous → the login 303, then `canWriteRepository` (the landed
  *      general write grant — the units model is absent, the repo-labels

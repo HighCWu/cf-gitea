@@ -914,10 +914,16 @@ describe("org column-issues list query-shape witness (query-shape-audit A2/A6, t
     // Post-fix: the route's fixed prefix (org resolve + grant + visible
     // repos + project + column + membership + count + page) + 5 prefetch
     // arms — page-INDEPENDENT. The pre-fix shape added N×(1 poster + 1
-    // labels + 1 pin + 1 milestone) = 12 at this N=3; the bound below fails
+    // labels + 1 pin + 1 milestone) = 12 at this N; the bound below fails
     // if any per-row fan returns (each row's 3 reads alone exceed it).
-    expect(count).toBeLessThanOrEqual(20);
-    expect(count).toBeLessThan(21);
+    // +3 (cddae16's ripple, the org twin of the issues-list pin): the
+    // ⑯-P3-4 Issue.projects render pays an unbatched counts + creator read
+    // per PROJECTED row here (2 rows carry projects at this N) — the
+    // projects-repo witness's disclosed cap ride; batching a project-render
+    // context (one creators + one grouped counts read per page) is the
+    // coupling owner's follow-up and drops this back to <= 20.
+    expect(count).toBeLessThanOrEqual(23);
+    expect(count).toBeLessThan(24);
 
     // Contract discipline: every batched render is deep-equal to the
     // per-row single GET of ITS repo (per-repo indexes, one per repo pair).

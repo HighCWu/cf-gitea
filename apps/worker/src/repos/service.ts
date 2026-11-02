@@ -73,6 +73,10 @@ import {
   labels,
   milestones,
   notificationStates,
+  projectColumns,
+  projectIssues,
+  projectWorkflows,
+  projects,
   reactions,
   releaseAssets,
   releases,
@@ -310,9 +314,9 @@ export interface CreateRepoInput {
   /** The create-time default-units posture selector (upstream's
    *  DefaultRepoUnits switch, services/repository/create.go:349-355).
    *  "normal" — the default — arms actions + packages (DefaultRepoUnits,
-   *  models/unit/unit.go:66-75); "fork" leaves both off
+   *  models/unit/unit.go:68-77); "fork" leaves both off
    *  (DefaultForkRepoUnits, unit.go:80-83); "mirror" arms packages only
-   *  (DefaultMirrorRepoUnits, unit.go:86-93). Generate-from-template needs
+   *  (DefaultMirrorRepoUnits, unit.go:85-93). Generate-from-template needs
    *  no kind: upstream's GenerateRepository creates with the NORMAL list
    *  (template.go:90 passes isFork=false and leaves IsTemplate unset). */
   creationKind?: RepoCreationKind;
@@ -335,8 +339,11 @@ export type RepoCreationKind = "normal" | "fork" | "mirror";
  * :385-391); our reduction seeds the `repo_settings` side row (the flag
  * store) plus the `repo_units` actions row (the owner-scope runner scan's
  * join gate) with the same per-kind posture. `has_projects` stays false for
- * every kind — the remaining documented house divergence (upstream arms it
- * for normal/mirror/template; flipping it is its own alignment).
+ * every kind — the remaining documented house divergence (upstream arms the
+ * projects unit on fresh repos: TypeProjects rides DefaultRepoUnits
+ * (models/unit/unit.go:68-77, the entry at :74), DefaultMirrorRepoUnits
+ * (:85-93, :91) and DefaultTemplateRepoUnits (:95-104, :102) — only the fork
+ * list omits it; flipping it is its own alignment).
  */
 const CREATION_UNIT_POSTURE: Record<RepoCreationKind, { actions: boolean; packages: boolean }> = {
   normal: { actions: true, packages: true },
@@ -1007,6 +1014,10 @@ export class RepoService {
     // labels, subscriptions, notifications, reactions); everything else keys
     // on repo_id.
     const issueIds = () => this.db.select({ id: issues.id }).from(issues).where(eq(issues.repoId, repoId));
+    // The repo-scoped project ids (project.go:450-488's join key — the
+    // `SELECT id FROM project WHERE repo_id = ?` subquery its first three
+    // deletes share).
+    const repoProjectIds = () => this.db.select({ id: projects.id }).from(projects).where(eq(projects.repoId, repoId));
     await this.db.batch([
       this.db.delete(comments).where(inArray(comments.issueId, issueIds())),
       this.db.delete(issueLabels).where(inArray(issueLabels.issueId, issueIds())),
@@ -1039,6 +1050,27 @@ export class RepoService {
       // `follows`/`user_settings` are user-scoped — they belong to the
       // (future) delete-user flow, not this cascade.
       this.db.delete(repoTopics).where(eq(repoTopics.repoId, repoId)),
+      // Project-board stores (P2-2 — upstream delete.go:239-241 calls
+      // DeleteProjectByRepoID right after the topics removal, and
+      // models/project/project.go:450-488 sweeps in THIS order: the
+      // project_workflow rows first (`IN (SELECT id FROM project WHERE
+      // repo_id = ?)`, :450-452), then project_issue and project_board (the
+      // column store's legacy table name) joined through the repo's projects
+      // (the per-dialect USING/INNER-JOIN arms collapsed to the portable
+      // subquery form), then the projects rows themselves (`WHERE repo_id =
+      // ?`, :479-481). Only repo-scoped rows die: the WHERE repo_id = ? arm
+      // cannot claim owner-level projects (repo_id '' — upstream's 0), so
+      // the owner's own boards and their columns/memberships/workflows
+      // survive with their project rows. The closing
+      // updateRepositoryProjectCount (:486) is the counters DEVIATION — the
+      // landed repositories table carries no project-count columns (the
+      // projects store's DEVIATION note in db/schema.ts).
+      this.db
+        .delete(projectWorkflows)
+        .where(inArray(projectWorkflows.projectId, repoProjectIds())),
+      this.db.delete(projectIssues).where(inArray(projectIssues.projectId, repoProjectIds())),
+      this.db.delete(projectColumns).where(inArray(projectColumns.projectId, repoProjectIds())),
+      this.db.delete(projects).where(eq(projects.repoId, repoId)),
       this.db.delete(repoWatchers).where(eq(repoWatchers.repoId, repoId)),
       this.db.delete(repoCollaborators).where(eq(repoCollaborators.repoId, repoId)),
       this.db.delete(repoSettings).where(eq(repoSettings.repoId, repoId)),

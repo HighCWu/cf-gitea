@@ -66,10 +66,20 @@ import { apiUserFromRow, canViewRepositoryWithTeams, type RepositoryWithOwner, t
  *    timestamps and the issue.updated_unix bump follow upstream
  *    updateCommentInfos (comment.go:937-948: system comments do NOT bump
  *    num_comments but DO touch updated_unix).
- *  - workflow execution (the notifier reacting to item events,
- *    services/projects/workflow_notifier.go) and the workflow audit trail
- *    (services/projects/workflow.go recordWorkflowAudit) are out of this
- *    batch's scope — only the CRUD surface exists here.
+ *  - workflow execution is CRUD-only at this pin: the notifier port
+ *    (upstream services/projects/workflow_notifier.go — a NullNotifier
+ *    registered against the notify service, reacting to 8 events —
+ *    item_added_to_project, item_removed_from_project, item_reopened,
+ *    item_closed, item_column_changed, code_changes_requested,
+ *    code_review_approved, pull_request_merged — by running each project's
+ *    enabled workflows for that event through matchWorkflowFilters and
+ *    executing their column-move / add-remove-label / close-reopen actions)
+ *    is DEFERRED as SPEC-gated (ledger v1.5.2 §1.5 P2-3; the SPEC addendum
+ *    records the event surface, the trigger sites and the reducer's guards
+ *    — IsProjectWorkflowContext re-entrancy, the archived skip, the
+ *    re-fetched issue for filter freshness). The workflow audit trail
+ *    (services/projects/workflow.go recordWorkflowAudit) rides the same
+ *    deferral.
  */
 
 // ---------------------------------------------------------------------------
