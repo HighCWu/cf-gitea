@@ -1760,6 +1760,7 @@ import {
   renderEditReleasePage,
   renderReleasesPage,
 } from "./pages/releases";
+import { releaseReactionSubmit } from "./pages/release-reaction-writes";
 import { listReleases } from "../api/services/releases";
 import {
   applyBranchProtectionForm,
@@ -2435,6 +2436,19 @@ export interface ReleasesRoute {
  *  release-assets data (the download pages' links answer here). Both are
  *  binary serves, not pages; the routes sit in the releases group's gates
  *  (MustBeNotEmpty + reqRepoReleaseReader — the hasReleases unit gate). */
+/** POST /{owner}/{repo}/releases/{id}/reactions/{action} (web.go:1515's
+ *  reaction mount inside the releases group — reqSignIn +
+ *  RepoMustNotBeArchived over reqRepoReleaseReader+MustBeNotEmpty; the
+ *  handler is pages/release-reaction-writes.ts over the shared service
+ *  seam. POST-only upstream — the GET twin answers chi's 405.) */
+export interface ReleaseReactionRoute {
+  family: "release-reaction";
+  owner: string;
+  repo: string;
+  id: string;
+  action: string;
+}
+
 export interface ReleaseDownloadRoute {
   family: "release-attachment" | "release-download";
   owner: string;
@@ -4152,6 +4166,7 @@ export type ParsedUiRoute =
   | TreeViewAuxRoute
   | BranchesListAuxRoute
   | ReleaseDownloadRoute
+  | ReleaseReactionRoute
   | ReleasesFeedRoute
   | TagsFeedRoute
   | BranchFeedRoute
@@ -6413,6 +6428,10 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   }
   if (head === "releases") {
     if (rest.length === 0) return { family: "releases", owner, repo };
+    // The ⑭ R16(f) reaction mount (web.go:1515 — the exact 3-segment shape).
+    if (rest.length === 3 && rest[1] === "reactions") {
+      return { family: "release-reaction", owner, repo, id: rest[0] as string, action: rest[2] as string };
+    }
     if (rest.length === 1 && rest[0] === "new") return { family: "release-new", owner, repo };
     if (rest.length === 1 && rest[0] === "latest") return { family: "release-latest", owner, repo };
     if (rest.length === 1 && rest[0] === "delete") return { family: "release-delete", owner, repo };
@@ -20198,6 +20217,8 @@ uiRouter.get("/:owner/-/projects/:id/workflows/:wid/delete", () => methodNotAllo
 // not carry (`/releases/tag/*` matches only the "tag" head), the "render"
 // head is a literal no registered pattern carries, and unclaimed shapes
 // never reach the sub-app — the dispatcher consults handlesUiRoute first.
+uiRouter.post("/:owner/:repo/releases/:id/reactions/:action", (c) => releaseReactionSubmit(c));
+uiRouter.get("/:owner/:repo/releases/:id/reactions/:action", () => methodNotAllowed("POST"));
 uiRouter.get("/:owner/:repo/releases/attachments/:uuid", (c) => releaseDownloadTail(c));
 uiRouter.get("/:owner/:repo/releases/download/:vtag/:filename", (c) => releaseDownloadTail(c));
 uiRouter.get("/:owner/:repo/render/branch/*", (c) => renderFileView(c));

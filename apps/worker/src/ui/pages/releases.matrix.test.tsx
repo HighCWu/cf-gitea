@@ -67,6 +67,7 @@ import { createRepoHook } from "../../api/services/hooks";
 import { ZERO_OID, engineReads } from "../../api/services/engine";
 import { saveRepoSettings } from "../../api/services/repo-settings";
 import { uploadReleaseAsset } from "../../api/services/release-assets";
+import { createReleaseReaction } from "../../api/services/release-reactions";
 import { findReleaseByTag } from "../../api/services/releases";
 import { releaseAssets, releases, repositories, users, webhookDeliveries } from "../../db/schema";
 import { IssuesService, type ReleaseRow } from "../../issues/service";
@@ -907,7 +908,10 @@ describe("the release-detail render shapes (w129 batch-10: tag links, attachment
     const { repo, ownerCookie } = await theFixture();
     const seeded = await seedRelease({ repoId: repo.id, publisherId: await ownerId(), tagName: "v1", title: "Asset host" });
     const bytes = new TextEncoder().encode("relmx asset body\n"); // 17 bytes → "17 B"
-    const asset = await uploadReleaseAsset({
+    // (the upload's returned row is intentionally unused — the arms below pin
+    // the RENDERED bytes, not the service return; the assignment used to trip
+    // no-unused-vars, dropped in the R16(f) pass)
+    await uploadReleaseAsset({
       bucket: env.REPO_PACKS,
       d1: env.DB,
       repoId: repo.id,
@@ -1092,5 +1096,136 @@ describe("the release_tag_header menu's Tags item (F9)", () => {
     // The N2 wave: the cell now holds the seed tag + the form-POST test's
     // landed a1 + this v2 = three tags.
     expect(html).toContain("3 Tags");
+  });
+});
+
+// --- the release reactions bar (R16(f) — list.tmpl:110-115's shared/reactions arm) --
+
+describe("the release reactions bar (R16(f))", () => {
+  // The bar renders on every NON-tag NON-draft row (list.tmpl's
+  // `{{if not (or $release.IsTag $release.IsDraft)}}`), when there are
+  // reactions OR the viewer can react (shared/reactions.tmpl's
+  // `{{if or .Reactions $canReact}}`); canReact = signed && !archived
+  // (the allowed set is a constant non-empty list). The POST target is the
+  // GLOBAL release id: `{repo}/releases/{id}/reactions` — the route the
+  // release-reaction-writes module carries (its test owns the write ladder;
+  // these arms pin the RENDER half over the mounted uiRouter).
+
+  /** The relmx read collaborator's user id (fresh per wipe). */
+  async function readId(): Promise<number> {
+    const row = await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "relmx-read")).get();
+    if (row === undefined) throw new Error("relmx read row missing");
+    return row.id;
+  }
+
+  it("the signed-in list render carries the picker (the release set — NO -1/confused) and the grouped labels with counts", async () => {
+    const { repo, ownerCookie, readCookie } = await theFixture();
+    const owner = await ownerId();
+    const reader = await readId();
+    const row = await seedRelease({ repoId: repo.id, publisherId: owner, tagName: "v1", title: "Reacted" });
+    await createReleaseReaction(env.DB, { userId: owner, releaseId: row.id, type: "+1" }, at(120));
+    await createReleaseReaction(env.DB, { userId: reader, releaseId: row.id, type: "heart" }, at(121));
+
+    const res = await fetchUi("/relmx-owner/rel/releases", { headers: { cookie: ownerCookie } });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The bar with the global-id action URL (upstream printf "%s/releases/%d/reactions").
+    expect(html).toContain(`data-action-url="/relmx-owner/rel/releases/${row.id}/reactions"`);
+    // The picker renders ALL SIX release reactions, none of the issue set's extras.
+    expect(html).toContain('value="+1"');
+    expect(html).toContain('value="laugh"');
+    expect(html).toContain('value="hooray"');
+    expect(html).toContain('value="heart"');
+    expect(html).toContain('value="rocket"');
+    expect(html).toContain('value="eyes"');
+    expect(html).not.toContain('value="-1"');
+    expect(html).not.toContain('value="confused"');
+    // The grouped labels: the +1 group (owner's own) shows has-reacted TRUE
+    // for this viewer and toggles onto unreact; the heart group (the read's)
+    // shows FALSE and toggles onto react.
+    expect(html).toContain('data-reaction-content="+1"');
+    expect(html).toContain('data-has-reacted="true"');
+    expect(html).toContain(`action="/relmx-owner/rel/releases/${row.id}/reactions/unreact"`);
+    expect(html).toContain('data-reaction-content="heart"');
+    expect(html).toContain('data-has-reacted="false"');
+    expect(html).toContain(`action="/relmx-owner/rel/releases/${row.id}/reactions/react"`);
+    void readCookie;
+  });
+
+  it("anonymous sees bare disabled labels when reactions exist, and no bar at all when none do", async () => {
+    const { repo } = await theFixture();
+    const owner = await ownerId();
+    const row = await seedRelease({ repoId: repo.id, publisherId: owner, tagName: "v1", title: "Peeked" });
+    await createReleaseReaction(env.DB, { userId: owner, releaseId: row.id, type: "eyes" }, at(122));
+
+    const withReactions = await fetchUi("/relmx-owner/rel/releases");
+    expect(withReactions.status).toBe(200);
+    const html = await withReactions.text();
+    expect(html).toContain("bottom-reactions");
+    expect(html).toContain("ui label basic disabled");
+    expect(html).toContain('aria-label="eyes: 1"'); // the reduced tooltip label
+    expect(html).not.toContain("select-reaction"); // no picker for anonymous
+    expect(html).not.toContain('method="post"'); // no toggle forms either
+
+    // A reaction-less release renders no bar for anonymous (or .Reactions
+    // $canReact needs one of the halves) — pinned on the bare release's own
+    // DETAIL page (the list above still carries v1's bar).
+    await seedRelease({ repoId: repo.id, publisherId: owner, tagName: "v2", title: "Bare" });
+    const res2 = await fetchUi("/relmx-owner/rel/releases/tag/v2");
+    expect(res2.status).toBe(200);
+    const html2 = await res2.text();
+    expect(html2).not.toContain("bottom-reactions");
+  });
+
+  it("draft and tag-record renders carry no bar (list.tmpl's not(IsTag||IsDraft) render gate)", async () => {
+    const { repo, ownerCookie } = await theFixture();
+    const owner = await ownerId();
+    await seedRelease({ repoId: repo.id, publisherId: owner, tagName: "wip", title: "Draft row", isDraft: true });
+    await drizzle(env.DB)
+      .insert(releases)
+      .values({ repoId: repo.id, publisherId: owner, tagName: "just-a-tag", lowerTagName: "just-a-tag", isTag: true, createdAt: at(123) });
+
+    // The DRAFT row renders for the writer (includeDrafts rides the write
+    // grant) without its bar; the tag record is the R12 PageIsSingleTag
+    // detail render, also bar-less.
+    const res = await fetchUi("/relmx-owner/rel/releases", { headers: { cookie: ownerCookie } });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Draft row");
+    expect(html).not.toContain("bottom-reactions");
+
+    const tagPage = await fetchUi("/relmx-owner/rel/releases/tag/just-a-tag", { headers: { cookie: ownerCookie } });
+    expect(tagPage.status).toBe(200);
+    const tagHtml = await tagPage.text();
+    expect(tagHtml).not.toContain("bottom-reactions");
+  });
+
+  it("the DETAIL page carries the bar too (SingleRelease renders the same list template, release.go:335)", async () => {
+    const { repo, ownerCookie } = await theFixture();
+    const owner = await ownerId();
+    const row = await seedRelease({ repoId: repo.id, publisherId: owner, tagName: "v1", title: "Detailed" });
+    await createReleaseReaction(env.DB, { userId: owner, releaseId: row.id, type: "rocket" }, at(124));
+
+    const res = await fetchUi("/relmx-owner/rel/releases/tag/v1", { headers: { cookie: ownerCookie } });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain(`data-action-url="/relmx-owner/rel/releases/${row.id}/reactions"`);
+    expect(html).toContain('data-reaction-content="rocket"');
+    expect(html).toContain('data-has-reacted="true"');
+  });
+
+  it("an archived repo renders the labels but no picker (canReact's !IsArchived arm, shared/reactions.tmpl)", async () => {
+    const { repo, ownerCookie } = await theFixture();
+    const owner = await ownerId();
+    const row = await seedRelease({ repoId: repo.id, publisherId: owner, tagName: "v1", title: "Archived" });
+    await createReleaseReaction(env.DB, { userId: owner, releaseId: row.id, type: "hooray" }, at(125));
+    await drizzle(env.DB).update(repositories).set({ isArchived: true }).where(eq(repositories.id, repo.id));
+
+    const res = await fetchUi("/relmx-owner/rel/releases", { headers: { cookie: ownerCookie } });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("bottom-reactions"); // the reactions half renders
+    expect(html).toContain("ui label basic disabled");
+    expect(html).not.toContain("select-reaction"); // the canReact half does not
   });
 });

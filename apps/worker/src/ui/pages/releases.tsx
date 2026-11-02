@@ -34,6 +34,13 @@
  *                                            `repo.DeleteRelease`,
  *                                            web.go:1523 — the edit page's
  *                                            red button) → 303 onto the list
+ *   POST /{owner}/{repo}/releases/{id}/reactions/{action}
+ *                                            the reaction toggle (R16(f) —
+ *                                            upstream `ChangeReleaseReaction`,
+ *                                            web.go:1515; the handler lives in
+ *                                            pages/release-reaction-writes.ts
+ *                                            beside its index.ts mount recipe,
+ *                                            the issue family's fold pattern)
  *
  * Upstream citations (submodule pin fc4936884584): templates/repo/release/
  * list.tmpl + new.tmpl + label.tmpl + release_tag_header.tmpl,
@@ -125,9 +132,12 @@
  *   survey's top-5 #4): the list renders it for `CanCreateRelease` viewers
  *   (list.tmpl's `{{if and $.CanCreateRelease (not $.PageIsSingleTag)}}` —
  *   the DETAIL page is SingleRelease's PageIsSingleTag render, where the
- *   pencil never shows upstream either). The compare branch dropdown,
- *   commit statuses, the reactions block and the ahead/behind
- *   line are unrendered — no landed surfaces (the upstream ahead line
+ *   pencil never shows upstream either). The REACTIONS block is LANDED
+ *   (R16(f), list.tmpl:110-115's shared/reactions arm:
+ *   the bar on every non-tag non-draft row, the write arm the
+ *   release-reaction-writes.ts module + its mount recipe). The compare
+ *   branch dropdown, commit statuses and the ahead/behind line stay
+ *   unrendered — no landed surfaces (the upstream ahead line
  *   itself never renders while `num_commits` stays 0 at the engine
  *   boundary). The `add_tag_msg` checkbox, the tag-only button and the
  *   generate-notes button target engine tag creation / the
@@ -177,6 +187,7 @@ import { inArray } from "drizzle-orm";
 
 import type { ReleaseAssetRow } from "../../api/services/release-assets";
 import { listReleaseAssets, toApiAttachment } from "../../api/services/release-assets";
+import { ALLOWED_RELEASE_REACTIONS, listReleaseReactions } from "../../api/services/release-reactions";
 import {
   createReleaseWithGitTag,
   deleteRelease,
@@ -188,6 +199,7 @@ import {
   toApiRelease,
   uniqueNameDownloadUrlBuilder,
 } from "../../api/services/releases";
+import type { ReleaseReactionRow } from "../../api/services/release-reactions";
 import { engineReads } from "../../api/services/engine";
 import {
   apiUserFromRow,
@@ -199,12 +211,13 @@ import { type ReleaseRow } from "../../issues/service";
 import { emitIssueEvent, type IssueEventRequest } from "../../services/issue-events";
 import { users } from "../../db/schema";
 import { TimeSince } from "../components/file-list";
-import { renderIssueMarkdown } from "./issue-detail";
+import { REACTION_EMOJI, groupReactions, renderIssueMarkdown, type ReactionGroup } from "./issue-detail";
 import { parseFormBool } from "./notifications";
 import { formatByteSize, parsePageNumber, pathEscapeSegments, shortSha } from "../page-data";
 import { userLink } from "../links";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
+import type { Viewer } from "../viewer";
 
 /** Page chrome text (component-local, the tabLocale pattern — the strings
  *  cite upstream's locale keys). */
@@ -257,6 +270,8 @@ export const releasesLocale = {
   /** "repo.release.deletion_success" — the ?deleted= flash (the tags page's
    *  query-param convention). */
   deletion_success: "The release has been deleted.",
+  /** R16(f): "repo.reactions" — the reaction bar's aria-label. */
+  reactions: "Reactions",
   /** cf-gitea addition (the branches page's server-side flash posture —
    *  upstream's failure flash is the raw "DeleteReleaseByID: {err}" text). */
   deletion_failed(name: string): string {
@@ -324,6 +339,12 @@ export interface ReleaseEntry {
    *  the count is free; the LIST carries it on ReleasesData.numTags instead
    *  and leaves this undefined (enrichEntries never sets it). */
   numTags?: number;
+  /** R16(f): the row's reaction groups (list.tmpl:110-115's
+   *  `$info.Reactions.GroupByType` — upstream getReleaseInfos' single
+   *  FindReleaseReactions over the page's release ids, grouped per row).
+   *  The allowed-set filter rode the READ (api/services/release-reactions.ts
+   *  listReleaseReactions), so every group here is renderable. */
+  reactions: ReactionGroup[];
 }
 
 /** The entry title (upstream renders the title, falling back to the tag name
@@ -353,6 +374,24 @@ async function enrichEntries(
       .all();
     for (const row of rowsById) names.set(row.id, row.username);
   }
+  // R16(f): one batched reactions read (upstream getReleaseInfos' single
+  // FindReleaseReactions over the page's release ids, release.go:96) then
+  // the rows-by-release map (that function's reactionsByRelease) and
+  // GroupByType per row — the first-appearance order the template renders
+  // in, over the created_unix,id read order.
+  const foundReactions = await listReleaseReactions(
+    d1,
+    rows.map((row) => row.id),
+  );
+  const reactionRowsByRelease = new Map<number, ReleaseReactionRow[]>();
+  for (const reaction of foundReactions) {
+    const list = reactionRowsByRelease.get(reaction.releaseId);
+    if (list === undefined) reactionRowsByRelease.set(reaction.releaseId, [reaction]);
+    else list.push(reaction);
+  }
+  const reactionsByRelease = new Map<number, ReactionGroup[]>(
+    [...reactionRowsByRelease].map(([releaseId, reactionRows]) => [releaseId, groupReactions(reactionRows)]),
+  );
   return Promise.all(
     rows.map(async (row): Promise<ReleaseEntry> => {
       const assetRows = await listReleaseAssets(d1, row.id);
@@ -375,6 +414,7 @@ async function enrichEntries(
         noteHtml: renderIssueMarkdown({ text: row.note ?? "", repo, origin }),
         assets,
         tagOid: tags.get(row.tagName) ?? null,
+        reactions: reactionsByRelease.get(row.id) ?? [],
       };
     }),
   );
@@ -890,6 +930,62 @@ function ReleaseAssetItem(props: { asset: ReleaseAssetView }) {
   );
 }
 
+/** R16(f): the shared/reactions.tmpl bar reduced to no-JS forms over the
+ *  RELEASE set (the issue surface's twin — pages/issue-detail.tsx's
+ *  ReactionBar — bakes ITS module's ALLOWED_REACTIONS into the picker, and
+ *  that file is not this unit's; this local render iterates the release
+ *  set instead, upstream passes AllowedReactions per surface to the SAME
+ *  partial). Template shape verbatim: the bar renders when there are
+ *  reactions OR the viewer can react (`{{if or .Reactions $canReact}}`);
+ *  `$canReact = and $allowedReactions IsSigned (not IsArchived)` — the
+ *  picker is the disclosure block of react forms, each grouped label is a
+ *  toggle form POSTing `{actionUrl}/{unreact|react}` with the hidden
+ *  `content`, anonymous visitors get bare labels. The tooltip reduces to
+ *  `type: count` (the issue twin's carried reduction — the reacting-user
+ *  names need the LoadUsers join upstream renders via GetFirstUsers). */
+export function ReleaseReactionBar(props: { actionUrl: string; groups: ReactionGroup[]; viewer: Viewer; canReact: boolean }) {
+  if (props.groups.length === 0 && !props.canReact) return null;
+  const emojiOf = (type: string): string => REACTION_EMOJI[type] ?? `:${type}:`;
+  const viewerId = props.viewer.kind === "user" ? props.viewer.id : null;
+  return (
+    <div class="bottom-reactions" data-action-url={props.actionUrl} role="group" aria-label={releasesLocale.reactions}>
+      {props.canReact ? (
+        <details class="select-reaction">
+          <summary aria-label={releasesLocale.reactions} title={releasesLocale.reactions}>
+            <span aria-hidden="true">🙂</span>
+          </summary>
+          <div class="reaction-picker">
+            {ALLOWED_RELEASE_REACTIONS.map((value) => (
+              <form class="item emoji" method="post" action={`${props.actionUrl}/react`}>
+                <input type="hidden" name="content" value={value} />
+                <button type="submit" aria-label={value} title={value}>
+                  {emojiOf(value)}
+                </button>
+              </form>
+            ))}
+          </div>
+        </details>
+      ) : null}
+      {props.groups.map((group) => {
+        const reacted = viewerId !== null && group.userIds.includes(viewerId);
+        const label = `${group.type}: ${group.count}`;
+        return props.canReact ? (
+          <form class="ui label basic" method="post" action={`${props.actionUrl}/${reacted ? "unreact" : "react"}`}>
+            <input type="hidden" name="content" value={group.type} />
+            <button type="submit" class="reaction" aria-label={label} title={label} data-has-reacted={reacted ? "true" : "false"} data-reaction-content={group.type}>
+              <span class="reaction">{emojiOf(group.type)}</span> <span>{group.count}</span>
+            </button>
+          </form>
+        ) : (
+          <span class="ui label basic disabled" aria-label={label}>
+            <span class="reaction">{emojiOf(group.type)}</span> <span>{group.count}</span>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
 /** One `.release-entry` row of list.tmpl (reductions in the module header).
  *  `firstOpen`: the `<details class="download">` opens for the first entry
  *  of the page render (`{{if eq $idx 0}}open{{end}}`). `canEdit`: the
@@ -897,11 +993,19 @@ function ReleaseAssetItem(props: { asset: ReleaseAssetView }) {
  *  (not $.PageIsSingleTag)}}` — the detail render passes false).
  *  `singleTag`: the PageIsSingleTag render's title arm — the title is PLAIN
  *  text there (no `/releases/tag/` self-link, list.tmpl's
- *  `{{if $.PageIsSingleTag}}` — R12). */
-export function ReleaseEntryItem(props: { entry: ReleaseEntry; repoLink: string; firstOpen: boolean; canEdit?: boolean; singleTag?: boolean }) {
+ *  `{{if $.PageIsSingleTag}}` — R12). `viewer`/`repoArchived`: the R16(f)
+ *  reaction bar's canReact inputs (shared/reactions.tmpl's IsSigned +
+ *  !IsArchived). */
+export function ReleaseEntryItem(props: { entry: ReleaseEntry; repoLink: string; firstOpen: boolean; canEdit?: boolean; singleTag?: boolean; viewer?: Viewer; repoArchived?: boolean }) {
   const { entry, repoLink } = props;
   const { row } = entry;
   const escapedTag = pathEscapeSegments(row.tagName);
+  // R16(f): the reaction bar's gates (list.tmpl:110-115's render gate —
+  // `not (or $release.IsTag $release.IsDraft)` — and shared/reactions.tmpl's
+  // canReact: allowed-set non-empty && signed && !archived; the set is a
+  // constant non-empty list here). The POST target is the GLOBAL release id
+  // (upstream printf "%s/releases/%d/reactions" $.RepoLink $release.ID).
+  const canReact = props.viewer !== undefined && props.viewer.kind === "user" && props.repoArchived !== true;
   return (
     <li class="release-entry">
       <div class="meta">
@@ -1018,6 +1122,14 @@ export function ReleaseEntryItem(props: { entry: ReleaseEntry; repoLink: string;
             ) : null}
           </ul>
         </details>
+        {!(row.isTag || row.isDraft) ? (
+          <ReleaseReactionBar
+            actionUrl={`${repoLink}/releases/${row.id}/reactions`}
+            groups={entry.reactions}
+            viewer={props.viewer ?? { kind: "anonymous" }}
+            canReact={canReact}
+          />
+        ) : null}
       </div>
     </li>
   );
@@ -1095,7 +1207,7 @@ export function ReleasesPage(props: { ctx: UiContext; data: ReleasesData; flash?
         <div class="divider" />
         <ul id="release-list">
           {data.items.map((entry, index) => (
-            <ReleaseEntryItem entry={entry} repoLink={repoLink} firstOpen={index === 0} canEdit={canEdit} />
+            <ReleaseEntryItem entry={entry} repoLink={repoLink} firstOpen={index === 0} canEdit={canEdit} viewer={ctx.viewer} repoArchived={repo.isArchived} />
           ))}
         </ul>
         <ReleasesPagination basePath={`${repoLink}/releases`} page={data.page} more={data.more} />
@@ -1136,7 +1248,7 @@ export function renderReleaseDetailPage(options: { ctx: UiContext; entry: Releas
         />
         <div class="divider" />
         <ul id="release-list">
-          <ReleaseEntryItem entry={entry} repoLink={repoLink} firstOpen={true} canEdit={false} singleTag={singleTag} />
+          <ReleaseEntryItem entry={entry} repoLink={repoLink} firstOpen={true} canEdit={false} singleTag={singleTag} viewer={ctx.viewer} repoArchived={repo.isArchived} />
         </ul>
       </div>
     </BaseLayout>,
