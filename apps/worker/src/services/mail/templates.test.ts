@@ -16,15 +16,19 @@ import {
   issueActionCloseLine,
   issueActionNewLine,
   issueActionMergeLine,
+  issueActionPushLine,
   issueActionReadyForReviewLine,
   issueActionRejectLine,
   issueActionReopenLine,
+  issueActionReviewDismissedLine,
   issueActionReviewLine,
+  issuePushCommitListHtml,
   registerNotifySubject,
   renderIssueActionMail,
   renderIssueAssignedMail,
   renderIssueCommentMail,
   renderRegisterNotify,
+  shortSha,
 } from "./templates";
 
 describe("locale-string pins", () => {
@@ -374,5 +378,133 @@ describe("the IsMention line (mail.issue.x_mentioned_you — default.tmpl's firs
     const html = renderIssueActionMail(base);
     expect(html).toContain("<body>\n\t\n\t\n\t<p>");
     expect(html).not.toContain("mentioned you");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The M1/M3/M4 render pieces (the ledger's §1.4 pass — SPEC §15): the
+// review_dismissed line, the push line + commit list (default.tmpl's push
+// blocks), the ReviewComments excerpt blocks, and the CanReply link-line
+// half.
+// ---------------------------------------------------------------------------
+
+describe("issueActionReviewDismissedLine (mail.issue.action.review_dismissed — the PullReviewDismiss arm)", () => {
+  it("'<b>%[1]s</b> dismissed last review from %[2]s for this pull request.' — both plain-string args escaped (the locale <b>s only %[1]s)", () => {
+    expect(issueActionReviewDismissedLine("admin1", "user2 (Mister X)")).toBe(
+      "<b>admin1</b> dismissed last review from user2 (Mister X) for this pull request.",
+    );
+    expect(issueActionReviewDismissedLine("<i>e</i>", 'r<"1">&x')).toBe(
+      "<b>&lt;i&gt;e&lt;/i&gt;</b> dismissed last review from r&lt;&quot;1&quot;&gt;&amp;x for this pull request.",
+    );
+  });
+});
+
+describe("shortSha (modules/base/tool.go:31-33)", () => {
+  it("truncates to the first 10 runes", () => {
+    expect(shortSha("0123456789abcdef0123456789abcdef01234567")).toBe("0123456789");
+    expect(shortSha("abc")).toBe("abc");
+  });
+});
+
+describe("issueActionPushLine (default.tmpl:9-25 — the push arm's top <p> block)", () => {
+  it("normal push: TrN picks push_1/push_n — no trailing period, the branch escapes", () => {
+    expect(
+      issueActionPushLine({ doerDisplayName: "user2", headBranch: "feature", repoHtmlUrl: "https://x.example/u/r", isForcePush: false, commitCount: 1 }),
+    ).toBe("<b>user2</b> pushed 1 commit to feature");
+    expect(
+      issueActionPushLine({ doerDisplayName: "user2", headBranch: "feature", repoHtmlUrl: "https://x.example/u/r", isForcePush: false, commitCount: 3 }),
+    ).toBe("<b>user2</b> pushed 3 commits to feature");
+    expect(
+      issueActionPushLine({ doerDisplayName: "user2", headBranch: 'f<"1">', repoHtmlUrl: "https://x.example/u/r", isForcePush: false, commitCount: 2 }),
+    ).toBe("<b>user2</b> pushed 2 commits to f&lt;&quot;1&quot;&gt;");
+  });
+
+  it("force push: the force_push line with HTMLFormat anchors (raw through the locale, single-quoted hrefs, ShortSha labels)", () => {
+    expect(
+      issueActionPushLine({
+        doerDisplayName: "user2",
+        headBranch: "main",
+        repoHtmlUrl: "https://x.example/u/r",
+        isForcePush: true,
+        commitCount: 0,
+        oldCommit: "aaaaaaaaaatest",
+        newCommit: "bbbbbbbbbbtest",
+      }),
+    ).toBe(
+      "<b>user2</b> force-pushed the <b>main</b> from <a href='https://x.example/u/r/commit/aaaaaaaaaatest'><b>aaaaaaaaaa</b></a> to <a href='https://x.example/u/r/commit/bbbbbbbbbbtest'><b>bbbbbbbbbb</b></a>.",
+    );
+  });
+});
+
+describe("issuePushCommitListHtml (default.tmpl:61-71 — the push arm's <ul>)", () => {
+  it("one li per commit: ShortSha anchor + ' - ' + the MessageTitle, escaped; the range-boundary tabs trace", () => {
+    expect(
+      issuePushCommitListHtml("https://x.example/u/r", [
+        { sha: "1111111111deadbeef", title: "first <change>" },
+        { sha: "2222222222feedface", title: "second" },
+      ]),
+    ).toBe(
+      "\t<ul>\n\t\t\n\t\t\t\n\t\t\t<li>\n\t\t\t\t<a href=\"https://x.example/u/r/commit/1111111111deadbeef\">1111111111</a> - first &lt;change&gt;\n\t\t\t</li>" +
+        "\n\t\t\t\n\t\t\t<li>\n\t\t\t\t<a href=\"https://x.example/u/r/commit/2222222222feedface\">2222222222</a> - second\n\t\t\t</li>\n\t\t\n\t\t</ul>",
+    );
+  });
+
+  it("the force-push shell: an EMPTY list renders the bare ul (Commits stays nil for the boundary pair)", () => {
+    expect(issuePushCommitListHtml("https://x.example/u/r", [])).toBe("\t<ul>\n\t\t\n\n\t\t\n\t\t</ul>");
+  });
+});
+
+describe("renderIssueActionMail — the push arm blocks, the ReviewComments excerpts, the CanReply half", () => {
+  const base = {
+    subject: "Re: [user2/repo1] issue1 (#1)",
+    actionName: "push" as const,
+    bodyHtml: "",
+    actionLineHtml: null,
+    link: "https://x.example/user2/repo1/pulls/1#issuecomment-9",
+    issueIndex: 1,
+    appName: "Gitea",
+    appUrl: "https://x.example/",
+  };
+
+  it("push: the top line + the commit list fill the two dropped-if lines; the main <p> is the empty-body shape", () => {
+    const html = renderIssueActionMail({
+      ...base,
+      pushLineHtml: issueActionPushLine({ doerDisplayName: "user2", headBranch: "main", repoHtmlUrl: "https://x.example/u/r", isForcePush: false, commitCount: 2 }),
+      pushCommitsHtml: issuePushCommitListHtml("https://x.example/u/r", [{ sha: "1111111111x", title: "t" }]),
+    });
+    expect(html).toContain("<body>\n\t\n\t<b>user2</b> pushed 2 commits to main\n\t<p>\n\t\t\n\t\t\t\n\t\t</p>");
+    expect(html).toContain("\t<ul>\n\t\t\n\t\t\t\n\t\t\t<li>");
+    expect(html).toContain("\t<p><a href=\"https://x.example/user2/repo1/pulls/1#issuecomment-9\">#1</a>.</p>");
+  });
+
+  it("non-push arms keep BOTH bare tab lines even if push data is supplied (the {{if}} keys on ActionName)", () => {
+    const html = renderIssueActionMail({
+      ...base,
+      actionName: "close",
+      actionLineHtml: issueActionCloseLine("user2", 1),
+      pushLineHtml: "SHOULD NOT RENDER",
+      pushCommitsHtml: "NEITHER",
+    });
+    expect(html).not.toContain("SHOULD NOT RENDER");
+    expect(html).not.toContain("NEITHER");
+  });
+
+  it("ReviewComments: each iteration rides inside the main <p> after the body branch; </p> loses its leading tabs", () => {
+    const html = renderIssueActionMail({
+      ...base,
+      actionName: "review",
+      actionLineHtml: issueActionReviewLine("user2"),
+      bodyHtml: "<p>lgtm</p>\n",
+      reviewComments: [{ treePath: "src/main.go", patchHtml: "@@ -1 +1 @@\n-x\n+y", contentHtml: "<p>here</p>" }],
+    });
+    expect(html).toContain(
+      "\t\t\t<p>lgtm</p>\n\n\t\t\n\t\t\t<hr>\n\t\t\tIn src/main.go:\n\t\t\t<div style=\"padding-left: 1em; margin: 1em 0;\">\n\t\t\t\t<pre style=\"padding: 1em; border-left: 1px solid grey;\">@@ -1 +1 @@\n-x\n+y</pre>\n\t\t\t\t<div><p>here</p></div>\n\t\t\t</div>\n\t\t</p>",
+    );
+  });
+
+  it("canReply renders the mail.reply half — ' or reply to this email directly' inside the link line", () => {
+    expect(renderIssueActionMail(base).includes(">#1</a>.</p>")).toBe(true);
+    const withReply = renderIssueActionMail({ ...base, canReply: true });
+    expect(withReply).toContain('>#1</a> or reply to this email directly.</p>');
   });
 });

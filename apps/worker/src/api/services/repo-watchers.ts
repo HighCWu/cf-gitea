@@ -260,6 +260,43 @@ export async function watchRepoWithOptions(
 }
 
 /**
+ * `WatchIfAuto` (models/repo/watch.go:310-323) — the AUTO_WATCH_ON_CHANGES
+ * push-path flip: a WRITE push by a user with NO watch row lands the Auto
+ * watch (mode 3; the row then rides the include-flags resolution like any
+ * watcher — includePullRequests/includeIssues default true on the fresh
+ * insert). Upstream's knob is `[service] AUTO_WATCH_ON_CHANGES`
+ * (modules/setting/service.go:216, default false); ours is the
+ * `AUTO_WATCH_ON_CHANGES` var, strict polarity ("true" arms). Upstream
+ * fires it from the push service's branch-update arm
+ * (services/repository/push.go:204-206 — "even if user delete a branch on
+ * a repository which he didn't watch, he will be watch that", logged Warn
+ * on failure, never the push's outcome); the writer lands here and the
+ * push-path fold is the push service's one-line hop (the
+ * `webhooks-push.ts` wiring — the ledger's §1.4 M7 var-hunk note).
+ *
+ * `isWrite` false stays silent (watch.go:312 — the fetch-side trigger
+ * passes false upstream; our push path is always a write), the knob-off
+ * arm is silent, and an existing row of ANY mode (None never persists, so
+ * a persisted Dont/Normal/Custom/Auto) is the no-op (watch.go:319-321) —
+ * only the absent row (mode None through GetWatch's dummy) transitions,
+ * through `watchRepoByMode`'s Auto arm (watch.go:121-124 would refuse
+ * anyway).
+ */
+export async function watchIfAuto(
+  d1: D1Database,
+  repoId: string,
+  userId: number,
+  autoWatchOnChanges: boolean,
+  isWrite: boolean,
+  now: Date = new Date(),
+): Promise<void> {
+  if (!isWrite || !autoWatchOnChanges) return; // watch.go:312-314
+  const watch = await getWatch(d1, repoId, userId);
+  if (watch.mode !== WatchMode.None) return; // watch.go:319-321
+  return watchRepoByMode(d1, repoId, userId, WatchMode.Auto, now); // watch.go:322
+}
+
+/**
  * `ClearRepoWatches` (models/repo/watch.go:327-333) — the private-flip
  * zeroing (repository.go:179-181: "watchers who lost access must not keep
  * watching the now-private repo"). Upstream's body is exactly two statements

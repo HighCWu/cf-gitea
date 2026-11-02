@@ -176,7 +176,9 @@ import {
 } from "../api/services/repository";
 import { comments, issues, PRFlow, PRStatus, pullRequests, pullReviews, ReviewType, users } from "../db/schema";
 import { CommentType } from "../issues/comment-types";
-import { IssuesService } from "../issues/service";
+import { notifyPullRequestPushCommits } from "./mail/notify";
+import { watchIfAuto } from "../api/services/repo-watchers";
+import { IssuesService, type CommentRow } from "../issues/service";
 import { carryLooseRefs, type CarrySource, type CarryTarget } from "../repos/carry";
 import {
   enrichCommitsWithFileLists,
@@ -201,7 +203,7 @@ export const DISMISS_STALE_MESSAGE =
  * producer probe below looks it up structurally so a binding gap degrades to
  * `pending` delivery rows instead of a type-level requirement.
  */
-export interface WebhookPushEnv extends Pick<Env, "DB" | "REPO" | "REPO_PACKS"> {
+export interface WebhookPushEnv extends Pick<Env, "DB" | "REPO" | "REPO_PACKS" | "REPO_TASKS"> {
   /** Upstream `setting.AppURL` — the instance origin the §2.7 payload URLs
    *  are built against, and the TOP of the appOrigin chain: unset,
    *  request-serving emitters fall back to the receive's origin (the engine's
@@ -211,6 +213,16 @@ export interface WebhookPushEnv extends Pick<Env, "DB" | "REPO" | "REPO_PACKS"> 
    *  (modules/setting/server.go:119-120) — payloads stay upstream-shaped and
    *  absolute, exactly like a default-installed gitea without ROOT_URL. */
   APP_URL?: string;
+  /** The auto-watch push flip (specs/email-outbound.md §15, the M7 fold):
+   *  ONLY the exact string "true" arms the push-path Auto watch — the
+   *  watchIfAuto writer self-guards (watch.go:310-323). */
+  AUTO_WATCH_ON_CHANGES?: string;
+  /** The MailNotifyEnv slice (services/mail/notify.ts:191) — the M1
+   *  push-comment mail arm's gates; the mail side fail-closes on its own
+   *  polarity checks, so an unset slice simply emits nothing. */
+  MAIL_ENABLED?: string;
+  ENABLE_NOTIFY_MAIL?: string;
+  MAIL_FROM?: string;
 }
 
 /** Go's zero oid — the create/delete marker of a receive command. */
@@ -518,6 +530,12 @@ export async function emitPushFamilyUpdates(
           // AdjustPullsCausedByBranchDeleted).
           if (update.ref.startsWith("refs/heads/")) {
             await closePullRequestsOfDeletedBranch(env, pair, identity, origin, update, options, log);
+            // M7 — WatchIfAuto rides the branch delete too (upstream fires
+            // it once per branch push, push.go:204-206; the writer
+            // self-guards on the knob and the write flag).
+            if (env.AUTO_WATCH_ON_CHANGES === "true" && options.pusherId !== undefined && options.pusherId !== null) {
+              await watchIfAuto(env.DB, pair.repo.id, options.pusherId, true, true, options.now ?? new Date());
+            }
           }
           continue;
         }
@@ -627,6 +645,12 @@ export async function emitPushFamilyUpdates(
         // creating a branch"; deletes close, they don't sync).
         if (update.ref.startsWith("refs/heads/")) {
           await emitPullRequestSyncs(env, pair, identity, origin, emit, log, update, options);
+          // M7 — WatchIfAuto in the branch-update tail (push.go:204-206:
+          // upstream fires it in pushUpdateBranch's tail, once per branch
+          // push; the writer self-guards on the knob and the write flag).
+          if (env.AUTO_WATCH_ON_CHANGES === "true" && options.pusherId !== undefined && options.pusherId !== null) {
+            await watchIfAuto(env.DB, pair.repo.id, options.pusherId, true, true, options.now ?? new Date());
+          }
         }
       } catch (error) {
         // Per-ref resilience — upstream logs and continues (:343-345,
@@ -1065,8 +1089,9 @@ async function createPushPullComment(
   const service = new IssuesService(env.DB);
   const now = options.now ?? new Date();
   const posterId = options.pusherId ?? null;
+  let normalComment: CommentRow | null = null;
   if (commitIds.length > 0) {
-    await service.addComment({
+    normalComment = await service.addComment({
       issueId: issue.id,
       type: CommentType.PullRequestPush,
       posterId,
@@ -1074,16 +1099,73 @@ async function createPushPullComment(
       now,
     });
   }
+  let forceComment: CommentRow | null = null;
   if (isForcePush) {
     // The force-push marker comment — CommitIDs is the [old head, new head]
     // pair (models/issues/comment.go:376-381).
-    await service.addComment({
+    forceComment = await service.addComment({
       issueId: issue.id,
       type: CommentType.PullRequestPush,
       posterId,
       content: JSON.stringify({ is_force_push: true, commit_ids: [update.old, update.next] } satisfies PushActionContent),
       now,
     });
+  }
+  await emitPullRequestPushCommitsMail(env, basePair, issue, pr, update, posterId, normalComment, forceComment, isForcePush, commitIds, log);
+}
+
+/**
+ * `notify.PullRequestPushCommits` — the push-comment mail arm (upstream
+ * pull.go:406-411 fires it right after CreatePushPullComment; our
+ * notifyPullRequestPushCommits, services/mail/notify.ts:1898). Best-effort
+ * and log-and-continue: a mail failure never fails the webhook fan-out
+ * (the mail side's own error posture, event.go:136-140's log-and-swallow).
+ * The doer row is re-read here (the comment stores only the poster id) and
+ * a push without a doer (the null-poster degenerate) skips the arm —
+ * upstream always carries the pusher.
+ */
+async function emitPullRequestPushCommitsMail(
+  env: WebhookPushEnv,
+  basePair: RepositoryWithOwner,
+  issue: typeof issues.$inferSelect,
+  pr: typeof pullRequests.$inferSelect,
+  update: PushRefUpdate,
+  posterId: number | null,
+  normalComment: CommentRow | null,
+  forceComment: CommentRow | null,
+  isForcePush: boolean,
+  commitIds: string[],
+  log: (message: string) => void,
+): Promise<void> {
+  const comment = isForcePush ? forceComment : normalComment;
+  if (comment === null || posterId === null) return;
+  try {
+    const doerRows = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(posterId).all<Record<string, unknown>>();
+    const doer = doerRows.results[0] as typeof users.$inferSelect | undefined;
+    if (doer === undefined) return;
+    const cell = env.REPO.getByName(engineName(basePair.repo.ownerNamespace, basePair.repo.slug));
+    const commits: Array<{ sha: string; title: string }> = [];
+    for (const id of commitIds) {
+      const read = await cell.readCommit(id);
+      commits.push({ sha: id, title: read?.subject ?? "" });
+    }
+    await notifyPullRequestPushCommits(
+      env,
+      {
+        issue,
+        comment,
+        doer,
+        headBranch: pr.headBranch,
+        isForcePush,
+        commits: isForcePush ? [] : commits,
+        ...(isForcePush ? { oldCommit: update.old, newCommit: update.next } : {}),
+      },
+    );
+  } catch (error) {
+    log(
+      `[push-webhook] ${basePair.repo.ownerNamespace}/${basePair.repo.slug}: push-comment mail arm failed (the webhook fan-out stands): ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 }
 

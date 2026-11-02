@@ -83,13 +83,15 @@ function spyQueue(): Queue & { sends: number; sendBodies: unknown[] } {
 }
 
 /** The armed env — inbound ON and outbound armed (so the round-trip fan
- *  runs); every override is per-test. */
+ *  runs); every override is per-test. The A2 dual gate: the fan-out needs
+ *  `ENABLE_NOTIFY_MAIL` on top of `MAIL_ENABLED` (mailer.go:33-35). */
 function inboundEnv(overrides: Partial<InboundEmailEnv> = {}): InboundEmailEnv {
   return {
     DB: env.DB,
     REPO_TASKS: spyQueue(),
     APP_URL,
     MAIL_ENABLED: "true",
+    ENABLE_NOTIFY_MAIL: "true",
     MAIL_FROM: "Gitea <noreply@example.com>",
     MAIL_INBOUND_ENABLED: "true",
     MAIL_INBOUND_REPLY_ADDRESS: REPLY_TEMPLATE,

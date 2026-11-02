@@ -336,6 +336,7 @@ describe("the secret hygiene rule (wrangler secret values are never read)", () =
       "appUrl",
       "auditRetentionDays",
       "demoMode",
+      "enableNotifyMail", // the A2 register-gate var (declared, non-secret; empty = off)
       "mailEnabled", // the MAIL_* family: declared, non-secret (the API key is a secret, not a var)
       "mailFrom",
       "mailProvider",

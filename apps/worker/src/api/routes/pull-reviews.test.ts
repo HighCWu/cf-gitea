@@ -1011,6 +1011,7 @@ describe("POST …/requested_reviewers team_reviewers mail fan-out (teamReviewRe
     const a = app();
     const armed: ApiEnv["Bindings"] = Object.assign({}, env, {
       MAIL_ENABLED: "true",
+      ENABLE_NOTIFY_MAIL: "true", // the A2 dual gate (mailer.go:33-35)
       MAIL_PROVIDER: "dummy",
       MAIL_FROM: "Gitea <noreply@example.com>",
     });

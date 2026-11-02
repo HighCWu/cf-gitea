@@ -411,7 +411,7 @@ Section-by-section mapping (upstream's eleven → ours):
 | db (:94) | POSTURE-flavored REAL: "Cloudflare D1 (binding DB)"; no host/user/ssl to print |
 | service (:122) | REAL: ALLOW_SIGNUP (mapped to upstream's registration rows); POSTURE: email-confirm/OpenID/captcha/timetracking lines (the last also published as `time_tracking_disabled: true`, misc-t2.ts:516-528) |
 | webhook (:172) | REAL: enabled, delivered via the landed family; POSTURE: skip-tls-verify follows platform fetch defaults |
-| mailer (:186) | POSTURE row only (+ upstream's test-mail rider is absent with it) |
+| mailer (:186) | REAL (landed `2bc24d7`): the four declared vars render effective values — MAIL_ENABLED (armed/off), MAIL_PROVIDER (resend/dummy + the secret note), MAIL_FROM (the armed gate's parse), MAIL_SUBJECT_PREFIX; POSTURE: upstream's send-test-mail rider (config.tmpl:220-228) is absent (a POST rider, no config write path) and the upstream knob family has no row — `OVERRIDE_HEADER` (sender/message.go:81-87), `FROM_DISPLAY_NAME_FORMAT` (mail.go:157-168), `EMBED_ATTACHMENT_IMAGES` (mail_issue_common.go:77-89) and `ENVELOPE_FROM` (relay-N/A) are unported, enumerated with per-knob reasons in specs/email-outbound.md §2.4 (the ledger's M5); the knob rows' admin-config hunk is recorded for the orchestrator, not yet applied |
 | cache (:234) | POSTURE row only (upstream's test-cache rider absent) |
 | session (:259) | REAL: the D1 provider; POSTURE: provider-config details mirror upstream's own blanking (config.go:93-95) |
 | git (:277) | REAL: engine-backed git (the vendored engine); POSTURE: gc-args/timeout rows have no user-facing knob |

@@ -108,6 +108,7 @@ const armed = () =>
     REPO_TASKS: spyQueue(),
     APP_URL: "https://mail.example",
     MAIL_ENABLED: "true",
+    ENABLE_NOTIFY_MAIL: "true", // the A2 dual gate (mailer.go:33-35)
     MAIL_FROM: "gitea@tests.invalid",
   });
 

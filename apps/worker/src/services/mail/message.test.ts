@@ -170,8 +170,12 @@ describe("shapeOutgoingMail (ToMessage port, message.go:44-89)", () => {
     expect(withHeaders.headers["X-Gitea-Sender"]).toBe("root");
     expect(withHeaders.headers["List-ID"]).toBe("Broken <a@b>");
 
-    const malformed = shapeOutgoingMail({ ...row, headers: "{not json" });
-    expect(Object.keys(malformed.headers)).toEqual(["Message-ID", "X-Auto-Response-Suppress"]);
+    const malformed = shapeOutgoingMail({ ...row, headers: "{not json" }, { now: new Date("2006-01-02T15:04:05Z") });
+    // The M6 Date header rides after X-Auto-Response-Suppress (the M6 fix —
+    // sender/message.go:61's SetDateWithValue now lands in the shape; the
+    // RFC 1123Z wire form renders in UTC).
+    expect(Object.keys(malformed.headers)).toEqual(["Message-ID", "X-Auto-Response-Suppress", "Date"]);
+    expect(malformed.headers["Date"]).toBe("Mon, 02 Jan 2006 15:04:05 +0000");
   });
 
   it("treats an empty replyTo as absent", () => {

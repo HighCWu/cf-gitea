@@ -130,6 +130,15 @@
     "MAIL_FROM": "",
     "MAIL_SUBJECT_PREFIX": "",
     "MAIL_API_BASE": "",
+    // The notify-mail register gate (specs/email-outbound.md §6, the A2
+    // fold): upstream's [service] ENABLE_NOTIFY_MAIL — the mail NOTIFIER
+    // registers only when it sits ON TOP of a live mail service
+    // (services/mailer/mailer.go:33-35 over loadNotifyMailFrom,
+    // modules/setting/mailer.go:227-235). ONLY the exact string "true"
+    // arms the participant fan-out (every issue/PR mail arm);
+    // register-notify keeps riding MAIL_ENABLED alone. Unset/anything
+    // else = participant mail OFF (fail-closed).
+    "ENABLE_NOTIFY_MAIL": "",
     // Inbound email (specs/email-inbound.md §8): strict-polarity, OFF by
     // default — Cloudflare Email Routing delivers to the Worker's `email()`
     // handler (NO binding; the handler export is the whole story). Arming =
@@ -150,6 +159,15 @@
     // applies to the compressed request body too: a gzipped push body
     // (Content-Length-declared or counted off the stream) over the cap is
     // rejected 413 BEFORE the bytes buffer or the inflate runs.
+    // The auto-watch push flip (specs/email-outbound.md §15, the ledger's
+    // M7): upstream's [service] AUTO_WATCH_ON_CHANGES
+    // (modules/setting/service.go:216, default false) — a branch push by a
+    // user with NO watch row lands the Auto watch (models/repo/watch.go:
+    // 310-323, fired from services/repository/push.go:204-206). ONLY the
+    // exact string "true" arms it; unset/anything else = off
+    // (fail-closed). Consumed by services/webhooks-push.ts' watchIfAuto
+    // fold (services/repo-watchers.ts).
+    "AUTO_WATCH_ON_CHANGES": "",
     "MAX_PUSH_MB": "512"
   },
   "observability": {

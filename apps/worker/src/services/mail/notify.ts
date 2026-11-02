@@ -39,6 +39,20 @@
  *     MailMentionsComment's mentions-only batch per attached code comment)
  *     and `PullRequestReviewRequest` (:129-136, SendIssueAssignedMail's
  *     "Requested to review <htmlurl>." twin of IssueChangeAssignee).
+ *     Slice nine (the ledger's §1.4 M1/M3/M4/A2/A3 pass) lands the last
+ *     two participant-funnel receivers — `PullRequestPushCommits`
+ *     (:158-180, the type-29 push comment mail whose content
+ *     mail_comment.go:24-26 empties; the push/commit-list template blocks
+ *     ride default.tmpl:9-25/:61-71) and `PullReviewDismiss` (:182-189,
+ *     the review_dismissed mail over the type-32 comment, its inline
+ *     excerpts riding `.ReviewComments` per mail_issue_common.go:93-100) —
+ *     and restores the two folded gates: the notify-mail register gate
+ *     (A2 — every participant fan-out arm needs
+ *     `[service] ENABLE_NOTIFY_MAIL` ON TOP of the mail service,
+ *     mailer.go:33-35; register-notify keeps riding the service alone)
+ *     and the unit gate's admin short-circuit (A3 — CheckRepoUnitUser's
+ *     `user.IsAdmin → true` at repo_permission.go:663-665 outranks the
+ *     unit half, so a disabled unit drops only non-admins).
  *
  * The inbound fold (specs/email-inbound.md §9 — mail_issue_common.go:
  * 181-202) rides the same loop: with `MAIL_INBOUND_ENABLED=true` (+ secret +
@@ -82,7 +96,7 @@
  *     (mail_issue_common.go:133) — no alias table ported.
  */
 
-import { and, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import {
@@ -122,14 +136,18 @@ import {
   issueActionCloseLine,
   issueActionMergeLine,
   issueActionNewLine,
+  issueActionPushLine,
   issueActionReadyForReviewLine,
   issueActionRejectLine,
   issueActionReopenLine,
+  issueActionReviewDismissedLine,
   issueActionReviewLine,
   issueMailFallbackSubject,
+  issuePushCommitListHtml,
   renderIssueActionMail,
   renderIssueAssignedMail,
   renderIssueCommentMail,
+  type ReviewCommentExcerptData,
 } from "./templates";
 
 /** The issue row the arm composes over (schema-derived; no issues/service
@@ -156,13 +174,23 @@ export type MailNotifyEvent =
   | "MergePullRequest"
   | "PullRequestReview"
   | "PullRequestCodeComment"
-  | "PullRequestReviewRequest";
+  | "PullRequestReviewRequest"
+  | "PullRequestPushCommits"
+  | "PullReviewDismiss";
 
 /** The env slice the hub reads (both bindings ride the outbox; the
  *  MAIL_INBOUND_* trio arms the per-recipient token carriers — SPEC
- *  email-inbound §9). */
+ *  email-inbound §9). `ENABLE_NOTIFY_MAIL` is upstream's
+ *  `[service] ENABLE_NOTIFY_MAIL` (modules/setting/service.go:45 →
+ *  Service.EnableNotifyMail, loadNotifyMailFrom modules/setting/mailer.go:
+ *  227-235): the mail NOTIFIER registers only when it is set on top of a
+ *  live mail service (services/mailer/mailer.go:33-35), so every
+ *  participant fan-out arm below gates on BOTH vars while the
+ *  register-notify mail keeps riding MAIL_ENABLED alone (upstream fires it
+ *  from the admin handlers with `MailService != nil` only, SPEC §2.4). */
 export type MailNotifyEnv = Pick<MailOutboxEnv, "DB" | "REPO_TASKS" | "APP_URL"> & {
   MAIL_ENABLED?: string;
+  ENABLE_NOTIFY_MAIL?: string;
   MAIL_FROM?: string;
   MAIL_INBOUND_ENABLED?: string;
   MAIL_INBOUND_REPLY_ADDRESS?: string;
@@ -458,15 +486,38 @@ function unionIds(...sources: number[][]): number[] {
 }
 
 /**
- * `mailIssueCommentToParticipants`' recipient resolution port
+ * `CheckRepoUnitUser`'s port (models/perm/access/repo_permission.go:
+ * 660-672) over the resolution's folded halves: the SITE ADMIN
+ * short-circuit FIRST (:663-665 — `if user != nil && user.IsAdmin
+ * { return true }`, outranking everything), then `perm.CanRead(unit)`'s
+ * two halves as we fold them — the unit's enabled state (`unitEnabled`,
+ * the CanRead false-when-disabled arm) and the access grant (a public repo
+ * reads to everyone, a private repo needs `doerRepoAccessMode` ≠ none —
+ * the repo_permission.go:448-508 grant fold, per its header).
+ */
+async function checkRepoUnitUserForMail(
+  d1: D1Database,
+  repo: Pick<RepositoryRow, "id" | "ownerId" | "visibility">,
+  user: UserRow,
+  unitEnabled: boolean,
+): Promise<boolean> {
+  if (user.isAdmin) return true;
+  if (!unitEnabled) return false;
+  if (repo.visibility === "public") return true;
+  return (await doerRepoAccessMode(d1, repo, user.id)) !== "none";
+}
+
+/**
+ * `mailIssueCommentToParticipants' recipient resolution port
  * (mail_issue.go:28-120) over our tables, upstream's source order: repo
  * watchers (built first, mail_issue.go:67-76 — upstream appends them ahead
  * of the accumulated slice), then poster, assignees, participants, issue
  * watchers. Filters, in upstream order:
- *   - the unit enabled (upstream `perm.CanRead(unit)` folds the unit's
- *     enabled state into the access check; ours reads the landed
- *     repo-settings flags — false excludes everyone upstream-shaped, so it
- *     is checked once here);
+ *   - the unit enabled — folded PER USER below (upstream
+ *     `perm.CanRead(unit)` rides CheckRepoUnitUser; the admin
+ *     short-circuit at repo_permission.go:663-665 OUTRANKS the unit half,
+ *     so a disabled unit drops only the non-admins — the batch-level
+ *     early-return that excluded admins was A3's divergence);
  *   - the repo-watch MODE arms (see the watcher block below): include-flag
  *     gate by IsPull, the custom-watch onmention allowance, ignorers into
  *     `visited` ahead of everything;
@@ -481,10 +532,8 @@ function unionIds(...sources: number[][]): number[] {
  *   - the doer excluded unless their preference is andyourown
  *     (mail_issue.go:94-97);
  *   - explicit issue unwatchers excluded (mail_issue.go:104-109);
- *   - `CheckRepoUnitUser` (models/perm/access/repo_permission.go:660-672):
- *     site admin always; a public repo reads to everyone; a private repo
- *     needs a grant — our single grant predicate `doerRepoAccessMode` ≠ none
- *     (the repo_permission.go:448-508 grant fold, per its header).
+ *   - `CheckRepoUnitUser` (models/perm/access/repo_permission.go:660-672)
+ *     per user via `checkRepoUnitUserForMail` above.
  * Zero survivors ⇒ the caller skips mail entirely (the empty batch arm —
  * mailIssueCommentBatch over no users sends nothing).
  */
@@ -517,11 +566,10 @@ export async function resolveIssueMailRecipients(
 ): Promise<UserRow[]> {
   const db = drizzle(d1);
 
-  // The unit-enabled gate — one read (upstream's CanRead(unit) unit half).
+  // The unit-enabled half — one read, folded into the per-user
+  // CheckRepoUnitUser below (the admin short-circuit outranks it).
   const settings = await loadRepoSettings(d1, input.repo.id);
-  if (input.issue.isPull ? !settings.hasPullRequests : !settings.hasIssues) {
-    return [];
-  }
+  const unitEnabled = input.issue.isPull ? settings.hasPullRequests : settings.hasIssues;
 
   // =========== Repo watchers + ignorers (mail_issue.go:67-92), from ONE row
   // read of the mode-carrying `repo_watchers` (upstream runs three queries:
@@ -664,7 +712,6 @@ export async function resolveIssueMailRecipients(
     visited.add(input.doer.id);
   }
 
-  const publicRepo = input.repo.visibility === "public";
   const recipients: UserRow[] = [];
   for (const id of orderedIds) {
     if (visited.has(id)) {
@@ -678,9 +725,9 @@ export async function resolveIssueMailRecipients(
     }
     const user = byId.get(id);
     if (user === undefined) continue; // not mailable at the prefilter
-    // CheckRepoUnitUser (repo_permission.go:660-672): admin short-circuit,
-    // public reads to everyone, private needs a grant.
-    if (!(user.isAdmin || publicRepo || (await doerRepoAccessMode(d1, input.repo, user.id)) !== "none")) {
+    // CheckRepoUnitUser (repo_permission.go:660-672) via the shared fold —
+    // admin short-circuit first, then the unit half + public/grant.
+    if (!(await checkRepoUnitUserForMail(d1, input.repo, user, unitEnabled))) {
       continue;
     }
     recipients.push(user);
@@ -690,11 +737,16 @@ export async function resolveIssueMailRecipients(
 
 /**
  * The arms' shared prelude — the master gate (SPEC §5.1, upstream
- * `setting.MailService == nil`), the MAIL_FROM parse (§5.2) and the repo
- * pair load (upstream loads the repo before composing, mail_issue.go:30-32;
- * a missing row logs and skips — the push-wave degradation rule). `mailName`
- * names the arm in both log lines; notifyIssueComment's landed messages are
- * byte-identical through it.
+ * `setting.MailService == nil`), the notify-mail gate (A2: upstream's mail
+ * notifier only registers when `[service] ENABLE_NOTIFY_MAIL` sits on top
+ * of a live mail service — mailer.go:33-35 over
+ * `loadNotifyMailFrom`'s MailService prerequisite, modules/setting/
+ * mailer.go:227-235 — so the PARTICIPANT FAN-OUT needs BOTH vars while
+ * register-notify keeps riding MAIL_ENABLED alone), the MAIL_FROM parse
+ * (§5.2) and the repo pair load (upstream loads the repo before composing,
+ * mail_issue.go:30-32; a missing row logs and skips — the push-wave
+ * degradation rule). `mailName` names the arm in both log lines;
+ * notifyIssueComment's landed messages are byte-identical through it.
  */
 type MailArmPrelude =
   | { ok: false; outcome: MailNotifyOutcome }
@@ -702,6 +754,7 @@ type MailArmPrelude =
 
 async function mailArmPrelude(env: MailNotifyEnv, mailName: string, warnDetail: string, repoId: string): Promise<MailArmPrelude> {
   if (env.MAIL_ENABLED !== "true") return { ok: false, outcome: { outcome: "disabled" } };
+  if (env.ENABLE_NOTIFY_MAIL !== "true") return { ok: false, outcome: { outcome: "disabled" } };
   const from = parseMailFrom(env.MAIL_FROM ?? "");
   if (from === null) {
     const message = `[mail] MAIL_ENABLED=true but MAIL_FROM is missing or unparseable; skipping ${warnDetail}`;
@@ -852,10 +905,11 @@ interface NotifyIssueArmInput {
    *  activities constant, not the name — notify.go:63-73);
    *  ActionPullRequestReadyForReview → "ready_for_review" (:248);
    *  ActionMergePullRequest|ActionAutoMergePullRequest → "merge" (:235-236);
+   *  ActionPullReviewDismissed → "review_dismissed" (:238-239);
    *  the UNKNOWN action types fall to the comment-type switch (:247-268):
    *  CommentTypeReview → "approve"|"reject"|"review" by the review's type,
-   *  CommentTypeCode → "code"-shaped "comment", CommentTypeReviewRequest →
-   *  "default". */
+   *  CommentTypeCode → "code"-shaped "comment", CommentTypePullRequestPush →
+   *  "push" (:257-258), CommentTypeReviewRequest → "default". */
   actionName:
     | "new"
     | "close"
@@ -865,6 +919,8 @@ interface NotifyIssueArmInput {
     | "approve"
     | "reject"
     | "review"
+    | "review_dismissed"
+    | "push"
     | "comment"
     | "default";
   /** MailParticipants' content rule (mail_issue.go:179-185): the issue
@@ -884,7 +940,9 @@ interface NotifyIssueArmInput {
     | "pull-merge"
     | "pull-review"
     | "pull-code-comment"
-    | "pull-review-request";
+    | "pull-review-request"
+    | "pull-review-dismissed"
+    | "pull-push";
   /** The pull-create arm's repo-watcher WIP-gate exception (the
    *  resolveIssueMailRecipients flag, mail_issue.go:67-76). */
   pullCreate?: boolean;
@@ -917,6 +975,31 @@ interface NotifyIssueArmInput {
    *  "issue comments" for the participant/mention batches, mail_issue.go:
    *  157/165, "issue assigned" for SendIssueAssignedMail's, :222). */
   info?: string;
+  /** The review mail's inline excerpts (M3 — composeIssueCommentMessages'
+   *  `ReviewComments`, mail_issue_common.go:93-100: the LOADED
+   *  `Comment.Review.CodeComments` flatten; only the arms whose upstream
+   *  caller loads Comment.Review — the review submission and the
+   *  dismissal — pass it; the code-comment arm's Comment.Review stays nil
+   *  upstream, so it never does). Each entry: tree path, the stored patch
+   *  (raw in the `<pre>`) and the content pre-rendered to HTML. */
+  reviewComments?: ReviewCommentExcerptData[];
+  /** The review_dismissed line's %[2]s (`.Comment.Review.Reviewer
+   *  .DisplayNameWithFullName` — the reviewer whose review was dismissed;
+   *  the receiver loads Reviewer, notify.go:183-185). Required for
+   *  "review_dismissed", ignored otherwise. */
+  reviewerDisplayName?: string;
+  /** The push arm's data (default.tmpl's push blocks; required for "push",
+   *  ignored otherwise): the PR head branch (the push line's %[2]s), the
+   *  parsed `is_force_push`, the loaded commits (title = the first line of
+   *  the trimmed message, `CommitMessage.MessageTitle`) and the
+   *  force-push boundary pair. */
+  push?: {
+    headBranch: string;
+    isForcePush: boolean;
+    commits: Array<{ sha: string; title: string }>;
+    oldCommit?: string;
+    newCommit?: string;
+  };
 }
 
 /**
@@ -978,9 +1061,13 @@ async function notifyIssueArm(
             ? "code-comment mail"
             : input.actionName === "default"
               ? "review-request mail"
-              : input.actionName === "approve" || input.actionName === "reject" || input.actionName === "review"
-                ? "pull-review mail"
-                : "issue-status mail";
+              : input.actionName === "review_dismissed"
+                ? "review-dismissed mail"
+                : input.actionName === "push"
+                  ? "push mail"
+                  : input.actionName === "approve" || input.actionName === "reject" || input.actionName === "review"
+                    ? "pull-review mail"
+                    : "issue-status mail";
   const pre = await mailArmPrelude(env, armName, `${armName} for issue ${input.issue.id}`, input.issue.repoId);
   if (!pre.ok) return pre.outcome;
   const { from, pair } = pre;
@@ -1044,9 +1131,11 @@ async function notifyIssueArm(
                 ? issueActionRejectLine(doerDisplay)
                 : input.actionName === "review"
                   ? issueActionReviewLine(doerDisplay)
-                  : bodyHtml === "" && input.actionName === "new"
-                    ? issueActionNewLine(doerDisplay, input.issue.index)
-                    : null;
+                  : input.actionName === "review_dismissed"
+                    ? issueActionReviewDismissedLine(doerDisplay, input.reviewerDisplayName ?? "")
+                    : bodyHtml === "" && input.actionName === "new"
+                      ? issueActionNewLine(doerDisplay, input.issue.index)
+                      : null;
   const fromDisplayName = mailFromDisplayName(input.doer);
   // generateMessageIDForIssue (mail_issue_common.go:280-292): the COMMENT
   // branch outranks the action switch; comment-nil "new" has no extra; the
@@ -1067,6 +1156,33 @@ async function notifyIssueArm(
   const info = `Subject: ${sanitized}, ${input.info ?? "issue comments"}`;
   // The per-recipient token gate (mail_issue_common.go:181).
   const inbound = inboundComposeOf(env);
+  // Upstream `CanReply` (mail_issue_common.go:122): the inbound arm is up
+  // AND the mail's comment type is not the push comment — the push mail
+  // never advertises reply-by-email (the comment-nil arms key on
+  // CommentTypeComment, the compose's default).
+  const canReply = inbound.armed && (input.comment === undefined || input.comment.type !== CommentType.PullRequestPush);
+  // The push arm's two template blocks (default.tmpl:9-25 and :61-71 — the
+  // links key on the BASE repo's HTMLURL, which repoHtmlUrl is: the issue
+  // lives on the base). The commit titles ride `push.commits` (the caller
+  // threads the engine read — upstream's receiver loads them itself,
+  // notify.go:176-178 → LoadCommentPushCommits; force-push mails carry the
+  // EMPTY list, comments.go:168-174 leaves Commits nil for the pair).
+  const pushLineHtml =
+    input.actionName === "push" && input.push !== undefined
+      ? issueActionPushLine({
+          doerDisplayName: doerDisplay,
+          headBranch: input.push.headBranch,
+          repoHtmlUrl,
+          isForcePush: input.push.isForcePush,
+          commitCount: input.push.commits.length,
+          oldCommit: input.push.oldCommit,
+          newCommit: input.push.newCommit,
+        })
+      : undefined;
+  const pushCommitsHtml =
+    input.actionName === "push" && input.push !== undefined
+      ? issuePushCommitListHtml(repoHtmlUrl, input.push.commits)
+      : undefined;
   // The per-recipient IsMention (compose's fromMention — the mention batch's
   // membership, mail_issue.go:101/115).
   const mentionIdSet = new Set<number>((input.mentions ?? []).map((user) => user.id));
@@ -1117,6 +1233,10 @@ async function notifyIssueArm(
             appUrl: origin,
             isMention: mentionIdSet.has(recipient.id),
             doerName: input.doer.username,
+            pushLineHtml,
+            pushCommitsHtml,
+            reviewComments: input.reviewComments,
+            canReply,
           }),
           headers: JSON.stringify({
             "Message-ID": messageId,
@@ -1519,6 +1639,22 @@ export async function notifyPullRequestReview(
   input: NotifyPullRequestReviewInput,
   options: { now?: Date } = {},
 ): Promise<MailNotifyOutcome> {
+  // M3: the review's inline excerpts (the loaded Comment.Review.CodeComments
+  // flatten, mail_issue_common.go:93-100) — the submit receiver's comment
+  // carries the Review, so its code comments ride every recipient's mail.
+  const pre = await findRepositoryById(env.DB, input.issue.repoId);
+  if (pre === null) {
+    console.error(`[mail] pull-review mail skipped: repository row missing [id: ${input.issue.repoId}]`);
+    return { outcome: "no-recipients" };
+  }
+  const origin = appUrlWithSlash(env.APP_URL);
+  const repoPath = `${pre.repo.ownerNamespace}/${pre.repo.slug}`;
+  const reviewComments =
+    input.comment.reviewId === null
+      ? []
+      : await loadReviewCommentExcerpts(env.DB, input.comment.reviewId, (text) =>
+          renderMarkdownToHtml({ text, mode: "comment", context: repoPath, wiki: false, origin }),
+        );
   return notifyIssueArm(
     env,
     {
@@ -1529,6 +1665,7 @@ export async function notifyPullRequestReview(
       content: input.comment.content ?? "",
       dedupePrefix: "pull-review",
       mentions: input.mentions,
+      reviewComments,
     },
     options,
   );
@@ -1555,14 +1692,21 @@ export async function notifyPullRequestCodeComment(
   input: { issue: IssueMailRow; comment: CommentMailRow; doer: UserRow; mentions: UserRow[] },
   options: { now?: Date } = {},
 ): Promise<MailNotifyOutcome> {
-  // The receiver's master gate first (MailMentionsComment's MailService nil
-  // arm — no point reading rows for a disabled mailer).
+  // The receiver's master gates first (MailMentionsComment's MailService
+  // nil arm — no point reading rows for a disabled mailer — plus A2's
+  // notify-mail register gate, the prelude's pair verbatim).
   if (env.MAIL_ENABLED !== "true") return { outcome: "disabled" };
+  if (env.ENABLE_NOTIFY_MAIL !== "true") return { outcome: "disabled" };
   const pair = await findRepositoryById(env.DB, input.issue.repoId);
   if (pair === null) {
     console.error(`[mail] code-comment mail skipped: repository row missing [id: ${input.issue.repoId}]`);
     return { outcome: "no-recipients" };
   }
+  // The unit half of CheckRepoUnitUser (one read — the same fold the
+  // participants resolution makes; the admin short-circuit lives in
+  // checkRepoUnitUserForMail below).
+  const settings = await loadRepoSettings(env.DB, input.issue.repoId);
+  const unitEnabled = input.issue.isPull ? settings.hasPullRequests : settings.hasIssues;
   // mailIssueCommentBatch's filter (mail_issue.go:122-151) over the mentions
   // batch: IsMailable → preference (fromMention=true: enabled/andyourown/
   // onmention all pass, disabled does not) → visited (the poster is
@@ -1575,9 +1719,7 @@ export async function notifyPullRequestCodeComment(
       (await drizzle(env.DB).select().from(userSettings).where(eq(userSettings.userId, user.id)).get())
         ?.emailNotificationsPreference ?? "enabled";
     if (pref === "disabled") continue;
-    // CheckRepoUnitUser (repo_permission.go:660-672), the resolution's fold:
-    // admin short-circuit, public reads to everyone, private needs a grant.
-    if (!(user.isAdmin || pair.repo.visibility === "public" || (await doerRepoAccessMode(env.DB, pair.repo, user.id)) !== "none")) {
+    if (!(await checkRepoUnitUserForMail(env.DB, pair.repo, user, unitEnabled))) {
       continue;
     }
     recipients.push(user);
@@ -1666,6 +1808,179 @@ export async function notifyPullRequestReviewRequest(
       dedupePrefix: "pull-review-request",
       recipients: [input.reviewer],
       info: "issue assigned",
+    },
+    options,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The M1 pair (docs/compat/v1.5.2-ledger.md §1.4) — the two notify receivers
+// whose mail arms were missing: PullRequestPushCommits (notify.go:158-180)
+// and PullReviewDismiss (:182-189).
+// ---------------------------------------------------------------------------
+
+/**
+ * The review mail's inline excerpts (M3 — composeIssueCommentMessages'
+ * `ReviewComments`, mail_issue_common.go:93-100): the review's attached code
+ * comments (type 21 rows over the same review id, id order — upstream
+ * flattens the path-grouped `Review.CodeComments` map) with the tree path,
+ * the stored patch (RAW in the template's `<pre>`) and the content rendered
+ * like the body (upstream `RenderedContent` = RenderString over the
+ * repo-comment context, comment_code.go:122 — the same render call the
+ * mail body takes).
+ */
+async function loadReviewCommentExcerpts(
+  d1: D1Database,
+  reviewId: number,
+  render: (content: string) => string,
+): Promise<ReviewCommentExcerptData[]> {
+  const rows = await drizzle(d1)
+    .select({ treePath: comments.treePath, patch: comments.patch, content: comments.content })
+    .from(comments)
+    .where(and(eq(comments.reviewId, reviewId), eq(comments.type, CommentType.Code)))
+    .orderBy(asc(comments.id))
+    .all();
+  return rows.map((row) => ({
+    treePath: row.treePath ?? "",
+    patchHtml: row.patch ?? "",
+    contentHtml: render(row.content ?? ""),
+  }));
+}
+
+/** The `PullRequestPushCommits` arm's input (notify.go:158's parameters
+ *  plus the data upstream's receiver LOADS — our hub is D1-only, so the
+ *  engine reads move one hop to the push service that fires it). */
+export interface NotifyPullRequestPushCommitsInput {
+  /** The PR's issue row (`comment.Issue` — the receiver's
+   *  `comment.LoadIssue`, notify.go:160-162). */
+  issue: IssueMailRow;
+  /** The type-29 push comment just landed (`comment` — the mail's anchor,
+   *  Message-ID and PushActionContent carrier). */
+  comment: CommentMailRow;
+  /** The pusher (`doer` — the comment's poster; the funnel's doer
+   *  exclusion keys on them). */
+  doer: UserRow;
+  /** `.Issue.PullRequest.HeadBranch` — the push line's branch. */
+  headBranch: string;
+  /** The comment's parsed PushActionContent (models/issues/comment.go:
+   *  375-381): `is_force_push` picks the line shape, the commit pair
+   *  [old, new] rides `oldCommit`/`newCommit`. */
+  isForcePush: boolean;
+  /** The loaded push commits for a NORMAL push — oldest-first, each with
+   *  its `CommitMessage.MessageTitle` (the receiver's
+   *  `LoadCommentPushCommits`, notify.go:176-178 →
+   *  services/issue/comments.go:157-189). A FORCE push passes []
+   *  (upstream leaves Commits nil for the boundary pair,
+   *  comments.go:168-174 — the mail renders the bare `<ul>` shell). */
+  commits: Array<{ sha: string; title: string }>;
+  /** The force-push boundary pair (`.Comment.OldCommit`/`NewCommit`). */
+  oldCommit?: string;
+  newCommit?: string;
+}
+
+/**
+ * The `PullRequestPushCommits` arm's mail (notify.go:158-180 →
+ * `CreateIssueComment` over the type-29 comment → the switch maps it to
+ * ActionType(0) (:44-45) → `MailParticipantsComment`, whose
+ * mail_comment.go:24-26 EMPTIES the push content) — the full participants
+ * funnel (mentions nil), the "Re: " subject over the emptied body, and the
+ * push template name (actionToTemplate's CommentTypePullRequestPush case,
+ * mail_issue_common.go:257-258 → no push template file at the pin →
+ * default.tmpl). default.tmpl renders the TOP push line (force-push:
+ * `mail.issue.action.force_push` with the boundary anchors; normal: TrN
+ * push_1/push_n over the commit count), NO main-chain action line, the
+ * emptied body branch, and the commit `<ul>` below the main `<p>` — and
+ * CanReply is ALWAYS false for the push type (mail_issue_common.go:122,
+ * folded into notifyIssueArm's canReply). The type-29 comment carries NO
+ * HasMailReplySupport (comment.go:196-201) → the reply payload is nil.
+ * Dedupe `pull-push:<commentId>:<recipientId>`.
+ */
+export async function notifyPullRequestPushCommits(
+  env: MailNotifyEnv,
+  input: NotifyPullRequestPushCommitsInput,
+  options: { now?: Date } = {},
+): Promise<MailNotifyOutcome> {
+  return notifyIssueArm(
+    env,
+    {
+      issue: input.issue,
+      doer: input.doer,
+      comment: input.comment,
+      actionName: "push",
+      content: "", // mail_comment.go:24-26 — the push content is emptied
+      dedupePrefix: "pull-push",
+      push: {
+        headBranch: input.headBranch,
+        isForcePush: input.isForcePush,
+        commits: input.commits,
+        oldCommit: input.oldCommit,
+        newCommit: input.newCommit,
+      },
+    },
+    options,
+  );
+}
+
+/** The `PullReviewDismiss` arm's input (notify.go:182's parameters). */
+export interface NotifyPullReviewDismissInput {
+  /** The PR's issue row (`review.Issue`). */
+  issue: IssueMailRow;
+  /** The type-32 dismissal comment just landed (the `CreateComment` row —
+   *  content = the dismiss message, reviewId = the dismissed review). */
+  comment: CommentMailRow;
+  /** The dismissing admin (`doer` — the comment's poster, review.go:462). */
+  doer: UserRow;
+  /** The dismissed review's reviewer (the receiver's
+   *  `comment.Review.LoadReviewer`, notify.go:183-185) — the dismissed
+   *  line's %[2]s. */
+  reviewer: UserRow;
+}
+
+/**
+ * The `PullReviewDismiss` arm's mail (notify.go:182-189 →
+ * MailParticipantsComment over the type-32 comment with
+ * ActionPullReviewDismissed → actionToTemplate's dedicated case,
+ * mail_issue_common.go:238-239 → name "review_dismissed" → no such
+ * template file at the pin → default.tmpl). The kept content (the dismiss
+ * message — MailParticipantsComment empties only the push type) renders
+ * beneath the `mail.issue.action.review_dismissed` line (%[1]s the
+ * dismissing admin, %[2]s the dismissed reviewer's display name); the
+ * review's inline code comments ride as `.ReviewComments` (the receiver
+ * loads the Review, review.go:462 — M3's compose gate
+ * `comment.Comment.Review != nil`); link/Message-ID carry the type-32
+ * comment, whose HasMailReplySupport binds the reply token (comment.go:
+ * 198). Recipients: the full participants funnel (mentions nil). Dedupe
+ * `pull-review-dismissed:<commentId>:<recipientId>`.
+ */
+export async function notifyPullReviewDismiss(
+  env: MailNotifyEnv,
+  input: NotifyPullReviewDismissInput,
+  options: { now?: Date } = {},
+): Promise<MailNotifyOutcome> {
+  // The compose's body render (mail_issue_common.go:71-72) — one render
+  // shared by the body and the excerpt `RenderedContent`s.
+  const pair = await findRepositoryById(env.DB, input.issue.repoId);
+  if (pair === null) {
+    console.error(`[mail] review-dismissed mail skipped: repository row missing [id: ${input.issue.repoId}]`);
+    return { outcome: "no-recipients" };
+  }
+  const origin = appUrlWithSlash(env.APP_URL);
+  const repoPath = `${pair.repo.ownerNamespace}/${pair.repo.slug}`;
+  const render = (text: string) =>
+    renderMarkdownToHtml({ text, mode: "comment", context: repoPath, wiki: false, origin });
+  const reviewComments =
+    input.comment.reviewId === null ? [] : await loadReviewCommentExcerpts(env.DB, input.comment.reviewId, render);
+  return notifyIssueArm(
+    env,
+    {
+      issue: input.issue,
+      doer: input.doer,
+      comment: input.comment,
+      actionName: "review_dismissed",
+      content: input.comment.content ?? "",
+      dedupePrefix: "pull-review-dismissed",
+      reviewerDisplayName: displayNameWithFullName(input.reviewer.username, input.reviewer.fullName),
+      reviewComments,
     },
     options,
   );

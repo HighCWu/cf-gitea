@@ -17,6 +17,10 @@ import {
   users,
 } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
+import { notifyIssueComment } from "../../services/mail/notify";
+import { findIssueMentions } from "../../services/mentions/service";
+import { updateIssueMentions } from "../../services/mentions/carrier";
+import { emitIssueEvent, issueEventIdentity } from "../../services/issue-events";
 import { carryRepoCell } from "../../repos/carry";
 import { tombstoneRepoDO } from "../../repos/purge";
 import {
@@ -44,7 +48,7 @@ import {
 } from "../services/repository";
 import { assertPullsUnit } from "../services/issue-unit-gates";
 import { canWriteRepository, isRepositoryAdmin, requireVisibleRepo } from "../services/repo-access";
-import { userNotExistError } from "../services/issues";
+import { toApiComment, toApiIssue, userNotExistError } from "../services/issues";
 import { lastCommitForPath } from "../services/contents";
 import { refMissError, treeEntryMissError } from "./contents";
 import { toApiCommit, toContentsEntry, usernamesByEmail } from "../services/git-models";
@@ -109,7 +113,11 @@ import { contentsResponseSchema, type ContentsResponse } from "../models/content
  *     209-287): the parent comment must be a CODE comment of this repo
  *     attached to a review; the reply is a new code comment sharing the
  *     parent's line/tree_path/patch/commit_sha/review_id (one batch with the
- *     numComments counter, the IssuesService.addComment discipline).
+ *     numComments counter, the IssuesService.addComment discipline) + the
+ *     CreateCodeComment tail's notify pair (mentions resolution, then BOTH
+ *     receivers — the CreateIssueComment mail arm over the participants
+ *     funnel and the pull_request_comment "created" webhook — both legs
+ *     best-effort, never failing the 201).
  *   - POST /repos/{owner}/{repo}/pulls/comments/{id}/resolve and /unresolve
  *     (repoResolvePullReviewComment / repoUnresolvePullReviewComment,
  *     pull_review.go:290-379 over models/issues/review.go:933-959,961-990):
@@ -1514,6 +1522,75 @@ export function registerRepoExtrasT2Routes(
       if (inserted === undefined) {
         throw new ApiError(500, "");
       }
+      // The notify pair (M2 — the ledger's §1.4): upstream's route ends at
+      // `pull_service.CreateCodeComment`, whose body resolves the content's
+      // mentions (FindAndUpdateIssueMentions, services/pull/review.go:
+      // 126-129) and fires `notify_service.CreateIssueComment` (:133) —
+      // ONE dispatch that fans BOTH receivers: the mail arm
+      // (mailNotifier.CreateIssueComment: the type-21 comment maps to
+      // ActionCommentIssue → MailParticipantsComment over the participants
+      // funnel, mentions riding first) and the webhook arm
+      // (HookEventPullRequestComment "created", webhook/notifier.go:
+      // 463-491). Both legs are best-effort: a failure logs, the 201 and
+      // the committed write stand (the emit sites' caught-and-logged
+      // posture — upstream logs at the receivers too).
+      const doerRow = await userById(c.env.DB, doer.id);
+      if (doerRow !== null) {
+        // The FULL FindAndUpdateIssueMentions (parse + visibility + the
+        // issue_user carrier) runs UNCONDITIONALLY — upstream runs it with
+        // no mailer configured (the IssuesService.resolveMailMentions
+        // posture); a resolution failure degrades the notify, never the
+        // write.
+        try {
+          const mentions = await findIssueMentions(c.env.DB, {
+            repo: found.repo,
+            issue: parent.issue,
+            doer: doerRow,
+            content: form.body,
+          });
+          if (mentions.length > 0) {
+            await updateIssueMentions(c.env.DB, parent.issue.id, mentions);
+          }
+          // The mail leg — the landed CreateIssueComment receiver (the type-0
+          // arm takes the type-21 comment whole: MailParticipantsComment keys
+          // on the comment row, not its type).
+          const outcome = await notifyIssueComment(c.env, {
+            issue: parent.issue,
+            comment: inserted,
+            doer: doerRow,
+            mentions,
+          });
+          if (outcome.outcome === "enqueued" && outcome.enqueue.some((e) => e.outcome === "pending-unqueued")) {
+            console.warn(`[pull-review] reply mail: some rows stayed pending-unqueued (comment ${inserted.id})`);
+          }
+        } catch (error) {
+          console.error(
+            `[pull-review] reply mail failed (comment ${inserted.id}): ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      } else {
+        console.error(`[pull-review] reply mail skipped: doer row missing [id: ${doer.id}]`);
+      }
+      // The webhook leg — pull_request_comment "created" (the issue.IsPull
+      // discriminant is fixed true: resolveReviewCommentTarget 400s
+      // non-PRs), the created emission's payload shape (routes/issues.ts's
+      // issueCreateComment: the shared ToAPIIssue render + the comment in
+      // the API shape — upstream's webhook embeds convert.ToAPIComment,
+      // NOT the PullReviewComment the route body renders).
+      const identity = issueEventIdentity(viewerOf(c), found, c.get("authUser"));
+      await emitIssueEvent(c, {
+        repoId: found.repo.id,
+        ownerId: identity.ownerId,
+        eventType: "pull_request_comment",
+        payload: {
+          action: "created",
+          issue: await toApiIssue(c.env.DB, viewerOf(c), found, parent.issue),
+          comment: await toApiComment(c.env.DB, viewerOf(c), found, parent.issue, inserted),
+          repository: identity.repository,
+          sender: identity.sender,
+          is_pull: true,
+        },
+      });
       const viewer = viewerOf(c);
       const poster = await posterUserOf(c.env.DB, inserted.posterId, viewer);
       return c.json(toPullReviewComment(inserted, parent.issue, found, viewer, poster, null), 201);

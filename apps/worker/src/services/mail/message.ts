@@ -14,12 +14,17 @@
  *     reduction documented as the SPEC §5.6 divergence);
  *   - the `To` display form      — models/user/user.go:450-465 (`EmailTo`:
  *     "Name <addr>" with the emailToReplacer strip of \n \r < > , : ;,
- *     user.go:587-596).
+ *     user.go:587-596);
+ *   - the `Date` header          — ToMessage's `SetDateWithValue(m.Date)`
+ *     (sender/message.go:61), RFC 1123Z ("Mon, 02 Jan 2006 15:04:05
+ *     -0700", gomail's own format), set when the stored headers don't
+ *     carry one (the same caller-supplied-first rule as the Message-ID).
+ *     SPEC §4.2 lists Date among the consume-time transforms; the M6
+ *     drift (the ledger's §1.4) was the omitted header.
  *
- * Deliberate divergences (both recorded in the SPEC): MIME Q-encoding of the
+ * Deliberate divergence (recorded in the SPEC): MIME Q-encoding of the
  * subject and of the To display name is NOT applied — upstream encodes for
- * the raw SMTP wire, while a relay transport carries UTF-8 JSON end to end;
- * and the Date header is emitted by the transport mapping, not here.
+ * the raw SMTP wire, while a relay transport carries UTF-8 JSON end to end.
  */
 
 /** The stored outbox row's mail half (schema.ts `emailOutbox`). */
@@ -120,6 +125,22 @@ export function formatAddress(displayName: string, address: string): string {
 }
 
 /**
+ * Go's `time.RFC1123Z` layout ("Mon, 02 Jan 2006 15:04:05 -0700") — the
+ * Date header's wire form (sender/message.go:61 `SetDateWithValue`, gomail's
+ * own format). Rendered in UTC, so the zone renders "+0000" (RFC 5322's
+ * numeric form of GMT).
+ */
+export function formatRfc1123Z(date: Date): string {
+  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return (
+    `${days[date.getUTCDay()]}, ${pad(date.getUTCDate())} ${months[date.getUTCMonth()]} ${date.getUTCFullYear()}` +
+    ` ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())} +0000`
+  );
+}
+
+/**
  * The SPEC §5.6 divergence: a deterministic HTML→text reduction standing in
  * for upstream's `html2text.FromString` (sender/message.go:64). Style and
  * script blocks drop whole, block-level closers become newlines, remaining
@@ -203,6 +224,11 @@ export function shapeOutgoingMail(
     });
   }
   headers["X-Auto-Response-Suppress"] = "All";
+  // The Date header (SPEC §4.2's consume-time list; sender/message.go:61's
+  // SetDateWithValue) — caller-supplied-first, like the Message-ID above.
+  if (headers["Date"] === undefined || headers["Date"] === "") {
+    headers["Date"] = formatRfc1123Z(now);
+  }
 
   return {
     from: formatAddress(row.fromDisplayName, row.fromAddress),

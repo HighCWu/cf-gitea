@@ -114,7 +114,9 @@ function spyQueue(): Queue & { sends: number; sendBodies: MailOutboxMessage[] } 
   return queue;
 }
 
-/** The armed env the hub (and the consumer) read. */
+/** The armed env the hub (and the consumer) read. The A2 dual gate: the
+ *  participant fan-out needs `[service] ENABLE_NOTIFY_MAIL` ON TOP of the
+ *  mail service (mailer.go:33-35) — both vars ride the armed fixture. */
 function armedEnv(
   overrides: Partial<MailNotifyEnv & { MAIL_PROVIDER?: string }> = {},
 ): MailNotifyEnv & { MAIL_PROVIDER?: string } {
@@ -123,6 +125,7 @@ function armedEnv(
     REPO_TASKS: spyQueue(),
     APP_URL: "https://mail.example",
     MAIL_ENABLED: "true",
+    ENABLE_NOTIFY_MAIL: "true",
     MAIL_PROVIDER: "dummy",
     MAIL_FROM: "Gitea <noreply@example.com>",
     ...overrides,
@@ -1167,6 +1170,7 @@ describe("mergePullRequest's winning-merge emit — the real merge flow (pull-en
     return Object.assign({}, env, {
       APP_URL: "https://mail.example",
       MAIL_ENABLED: "true",
+      ENABLE_NOTIFY_MAIL: "true",
       MAIL_PROVIDER: "dummy",
       MAIL_FROM: "Gitea <noreply@example.com>",
       REPO_TASKS: spyQueue(),

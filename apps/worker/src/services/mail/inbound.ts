@@ -712,6 +712,10 @@ export interface InboundEmailEnv {
   REPO_TASKS?: Queue;
   APP_URL?: string;
   MAIL_ENABLED?: string;
+  /** The A2 notify-mail register gate — the round-trip's fan-out arm reads
+   *  it (the same var the hub's `MailNotifyEnv` carries); the inbound
+   *  PIPELINE itself never gates on it. */
+  ENABLE_NOTIFY_MAIL?: string;
   MAIL_FROM?: string;
   MAIL_INBOUND_ENABLED?: string;
   MAIL_INBOUND_REPLY_ADDRESS?: string;

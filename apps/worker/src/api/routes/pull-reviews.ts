@@ -60,7 +60,11 @@
  *     dismisses the reviewer's other undismissed approve/reject rows
  *     (services/pull/review.go:423–436), the dismiss (not undismiss) lands a
  *     `CommentTypeDismissReview` (32) comment with the message (:443–456).
- *     Silence arm: no webhook (mailer/feed only upstream).
+ *     Mail arm: the dismiss (not undismiss) fires the landed
+ *     `notifyPullReviewDismiss` receiver (notify.go:182–189 →
+ *     MailParticipantsComment with ActionPullReviewDismissed — upstream
+ *     mailer/feed only) beside the insert, best-effort. Silence arm: no
+ *     webhook (upstream has no notifier call).
  *   - request arms (:744–956 + services/issue/review_request.go): reviewers
  *     resolve by name or email (404 "user doesn't exist: X"), team reviewers
  *     only on org-owned repos (404 "team doesn't exist: X"); a REQUEST row
@@ -178,7 +182,7 @@ import { pullRequestDiff, pullRequestDiffShortStat } from "../services/pull-engi
 // mailEnv) seam; this route passes `c.env` at the write arms). The read
 // consults stay local imports — the route's handlers + arms still look up
 // pending/decision rows for their own gates.
-import { notifyPullRequestReviewRequest } from "../../services/mail/notify";
+import { notifyPullRequestReviewRequest, notifyPullReviewDismiss } from "../../services/mail/notify";
 import { PullReviewsService, currentPendingReview, latestDecisionReview, type ReviewRow } from "../services/pull-reviews";
 
 // ---------------------------------------------------------------------------
@@ -1309,18 +1313,59 @@ export function registerPullReviewRoutes(
     }
     if (isDismiss) {
       // The CommentTypeDismissReview (32) comment (services/pull/review.go:443–456).
-      await db.batch([
-        db.insert(comments).values({
-          type: CommentType.DismissReview,
-          posterId: doerId,
-          issueId: issue.id,
-          content: form.message ?? "",
-          reviewId: review.id,
-          createdAt: now,
-          updatedAt: now,
-        }),
+      const insertResults = await db.batch([
+        db
+          .insert(comments)
+          .values({
+            type: CommentType.DismissReview,
+            posterId: doerId,
+            issueId: issue.id,
+            content: form.message ?? "",
+            reviewId: review.id,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .returning(),
         numCommentsBump(db, issue.id, now),
       ]);
+      // The PullReviewDismiss receiver (services/pull/review.go:462 —
+      // `notify.PullReviewDismiss(ctx, doer, review, comment)` →
+      // MailParticipantsComment over the type-32 comment with
+      // ActionPullReviewDismissed): the review_dismissed mail over the
+      // participants funnel, the dismissed reviewer riding the locale line
+      // (notify.go:183-185's LoadReviewer). The undismiss leg stays SILENT
+      // (upstream returns before the comment + notify, review.go:438-440).
+      // Best-effort — caught and logged, the 200 and the write stand (the
+      // emit sites' posture; upstream logs at the receiver, notify.go:184/:187).
+      const insertedComment = insertResults[0]?.[0];
+      if (insertedComment !== undefined) {
+        try {
+          const doerRow = (await drizzle(c.env.DB).select().from(users).where(eq(users.id, doerId)).get()) ?? null;
+          const reviewerRow =
+            review.reviewerId === null
+              ? null
+              : (await drizzle(c.env.DB).select().from(users).where(eq(users.id, review.reviewerId)).get()) ?? null;
+          if (doerRow === null) {
+            console.error(`[pull-review] dismissal mail skipped: doer row missing [id: ${doerId}]`);
+          } else if (reviewerRow === null) {
+            console.error(`[pull-review] dismissal mail skipped: reviewer row missing [id: ${review.reviewerId}]`);
+          } else {
+            const outcome = await notifyPullReviewDismiss(c.env, {
+              issue,
+              comment: insertedComment,
+              doer: doerRow,
+              reviewer: reviewerRow,
+            }, { now });
+            if (outcome.outcome === "enqueued" && outcome.enqueue.some((e) => e.outcome === "pending-unqueued")) {
+              console.warn(`[pull-review] dismissal mail: some rows stayed pending-unqueued (comment ${insertedComment.id})`);
+            }
+          }
+        } catch (error) {
+          console.error(
+            `[pull-review] dismissal mail failed (comment ${insertedComment.id}): ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
     }
 
     // Silence arm: upstream has NO webhook on dismissal (mailer/feed only).

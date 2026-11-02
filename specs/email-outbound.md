@@ -61,17 +61,14 @@ upstream's shape impossible and multiple equally faithful adaptations exist
   upstream notify.go order — `IssueChangeTitle` (:80-90) and
   `IssueChangeAssignee` (:119-127, the assigned.tmpl family). STILL
   FOLLOW-UP, in upstream notify.go order:
-  - `PullRequestReview` (:98-111) — STAGED: the write lives inline in
-    `api/routes/pull-reviews.ts` (route-handler D1 writes; no review
-    service layer exists to host the emit, and route-handler emits are
-    against the method) — extracting the review-submission service is the
-    exactly-what-is-missing;
-  - `PullRequestCodeComment` (:113-117) — STAGED: its sole recipient
-    source is mentions (`MailMentionsComment`) and the mention parser is
-    not ported (§8.2);
-  - `PullRequestReviewRequest` (:129-136) — STAGED with the review family
-    (the same route-handler write site); its mail half is the landed
-    `notifyIssueAssigneeChanged` shape with a review-request `ct`;
+  - `PullRequestReview` (:98-111) — LANDED (§14.6, the review-service
+    extraction firing it + the code-comment receiver from the submit
+    core's tail);
+  - `PullRequestCodeComment` (:113-117) — LANDED (§14.6 — the
+    `MailMentionsComment` mentions-only batch over the attached code
+    comments);
+  - `PullRequestReviewRequest` (:129-136) — LANDED (§14.6, the
+    `SendIssueAssignedMail` twin over the type-27 request comment);
   - `MergePullRequest` (:138-146) — LANDED (§14): the winning-merge mail
     over the shared funnel, emitted from `api/services/pull-engine.ts`'s
     `mergePullRequest` D1 landing (upstream's `markAsMergedPostProcess`
@@ -105,8 +102,12 @@ upstream's shape impossible and multiple equally faithful adaptations exist
     issue-indexer/repo-search mention reads, both STAGED with the
     surfaces they ride (§13.4);
   - `MailMentionsComment` (code-comment mentions, mail_comment.go:42-62) —
-    the parser half is now landed; the arm itself still rides the review
-    service extraction (the STAGED family above).
+    LANDED (§14.6, the review family's code-comment receiver);
+  - `PullRequestPushCommits` (:158-180) + `PullReviewDismiss` (:182-189) —
+    LANDED (§15, the ledger's M1 pair — the push mail over the emptied
+    type-29 content, the review_dismissed mail over the type-32 comment;
+    the push arm's emit-site wiring rides the push service's reported
+    hunk).
 - `SendActivateAccountMail` (upstream `mail_user.go:52`) + the
   `REGISTER_EMAIL_CONFIRM` flow: needs an activation-code store and the
   `/user/activate` web arm.
@@ -194,6 +195,28 @@ upstream's shape impossible and multiple equally faithful adaptations exist
   note the register-notify mail does NOT ride this gate: upstream fires it
   from the admin handlers with only `MailService != nil` +
   `form.SendNotify` (below).
+- The config knobs the relay transport does NOT port (the ledger's §1.4
+  M5 enumeration; each is recorded here so the admin-config surface can
+  list them without re-deriving):
+  - `OVERRIDE_HEADER` (`modules/setting/mailer.go:30`,
+    `map[string][]string`, loaded from `mailer.HEADER_<NAME>` keys at
+    :118-120; applied LAST in `ToMessage` — sender/message.go:81-87, every
+    generated header loses to it) — a relay-hosted override map is a
+    per-provider decision (resend's `headers` field already carries ours);
+    unported, no var.
+  - `FROM_DISPLAY_NAME_FORMAT` (a Go template over
+    `{DisplayName, AppName, Domain}`, `mail.go:157-168`; the DEFAULT
+    template's output — `FullName (username)` / username — is what
+    `mailFromDisplayName` pins) — unported; the default derivation rides.
+  - `EMBED_ATTACHMENT_IMAGES` (`mail_issue_common.go:77-89`, the
+    base64-inline embedder over the rendered body) — Workers' 128 MB
+    isolate memory makes unbounded base64 inlining a failure mode, not a
+    knob; unported, mails carry absolute image links.
+  - `ENVELOPE_FROM` (mailer.go:24 + the :201-211 parse; the SMTP envelope
+    sender, distinct from the `From:` header) — RELAY-N/A: the envelope is
+    the relay's own (resend derives it from the verified domain), there is
+    no SMTP envelope in a JSON POST; unported by platform shape, not by
+    choice.
 
 ### 2.5 The trigger this slice ports
 
@@ -615,7 +638,8 @@ The documented REDUCTIONS (schema-absent upstream pieces, none invented):
   logged (upstream logs at the receiver, notify.go:48-50); the write stays
   committed. The plain type-0 guard scopes the arm: close/reopen system
   comments ride `transitionClosed` (the IssueChangeStatus surface),
-  code/review/push comments their own arms (§1.3).
+  code/review/push comments their own arms (§15 — the push + review arms'
+  as-built record; the §1.3 list names the family's staging).
 
 ### 8.4 HANDOFF — the API route wiring (one line, routes-owner)
 
@@ -1533,6 +1557,74 @@ service suite's original 16 still pass unchanged):
   compose + filter matrix; the templates.test.ts byte pins cover the
   verdict lines + the `x_mentioned_you` line).
 
+## 15. SLICE NINE AS-BUILT — the push + dismiss mails, the excerpts, the CanReply half, the two gates, the Date header
+
+The ledger's §1.4 mail pass (docs/compat/v1.5.2-ledger.md), landed 2026-11-02:
+
+- **The M1 pair** — the last two participant-funnel receivers:
+  `notifyPullRequestPushCommits` (upstream `PullRequestPushCommits`,
+  notify.go:158-180 → `CreateIssueComment` over the type-29 comment →
+  ActionType(0) → `MailParticipantsComment`, whose mail_comment.go:24-26
+  EMPTIES the push content) and `notifyPullReviewDismiss` (notify.go:
+  182-189 → MailParticipantsComment over the type-32 comment with
+  ActionPullReviewDismissed, the kept dismiss message beneath the
+  `mail.issue.action.review_dismissed` line). Both ride the full
+  participants funnel (mentions nil), the `/comment/<id>` Message-ID over
+  the plain reference, dedupe `pull-push|pull-review-dismissed:
+  <commentId>:<recipientId>`. Emission: the dismissal arm fires from the
+  routes/pull-reviews.ts dismissals handler beside the type-32 insert
+  (the undismiss leg stays silent, review.go:438-440); the push arm's
+  receiver takes the commit metadata (titles, head branch, the
+  force-push pair) as INPUT — upstream's receiver loads them itself
+  (notify.go:176-178 → LoadCommentPushCommits) and our hub is D1-only,
+  so the engine read moves one hop to the push service; that one-hop
+  wiring in services/webhooks-push.ts is a reported orchestrator hunk,
+  not landed here.
+- **M3** — `ReviewComments`: the review/dismiss mails carry the review's
+  inline code comments (the loaded `Comment.Review.CodeComments` flatten,
+  mail_issue_common.go:93-100 — type-21 rows over the same review id, id
+  order), each rendered as the default.tmpl:52-59 excerpt block
+  (tree path, the stored patch RAW in the `<pre>`, the content rendered
+  like the body). Only the arms whose upstream caller loads Comment.Review
+  (the submit + the dismissal) resolve them — the code-comment arm's
+  Comment.Review stays nil upstream.
+- **M4** — `CanReply` (mail_issue_common.go:122): default.tmpl's link line
+  gains the `mail.reply` half ("or reply to this email directly") whenever
+  the inbound arm is up — except the push type, whose mail NEVER
+  advertises it. Comment-nil arms key on the compose's CommentTypeComment
+  default (the half shows when inbound is armed).
+- **A2** — the notify-mail register gate restored: the shared prelude and
+  the code-comment arm's inline gate now require
+  `ENABLE_NOTIFY_MAIL === "true"` ON TOP of `MAIL_ENABLED` (upstream
+  registers the mail notifier only when `[service] ENABLE_NOTIFY_MAIL`
+  sits on a live mail service — mailer.go:33-35 over
+  modules/setting/mailer.go:227-235). register-notify keeps riding
+  `MAIL_ENABLED` alone (§2.4). Fail-closed: deployments without the new
+  var keep the register mail and lose the participant fan-out until they
+  set it.
+- **A3** — the unit gate's admin short-circuit: `CheckRepoUnitUser`'s
+  `user.IsAdmin → true` (repo_permission.go:663-665) outranks the unit
+  half, so the resolution's unit fold is PER USER
+  (`checkRepoUnitUserForMail`) — a disabled issues/pulls unit drops only
+  the non-admins, where the batch-level early return dropped everyone.
+  The code-comment arm's filter shares the fold (its unit half was
+  absent, the inverse gap).
+- **M6** — the Date header: `shapeOutgoingMail` sets `Date` (RFC 1123Z,
+  gomail's `SetDateWithValue` layout, sender/message.go:61) when the
+  stored headers don't carry one — §4.2's consume-time list is now
+  complete.
+- **M5** — the unported knob enumeration (§2.4): `OVERRIDE_HEADER`,
+  `FROM_DISPLAY_NAME_FORMAT`, `EMBED_ATTACHMENT_IMAGES`, `ENVELOPE_FROM`
+  (relay-N/A), with per-knob reasons; the admin-config surface rows ride
+  the reported orchestrator hunk (SPEC-0018 §3.2's matrix row carries the
+  state).
+- **M7 (adjacent)** — `watchIfAuto` (models/repo/watch.go:310-323) lands
+  in services/repo-watchers.ts over the `AUTO_WATCH_ON_CHANGES` var
+  (strict polarity); the push-path fold is the push service's one-line
+  hop (reported hunk). The mention→watch reading is NOT a finding:
+  upstream has none (`models/issues/issue_update.go:567`,
+  issue_user.is_mentioned) — §13.2's record stands.
+
 ---
 
 ## 6. API/config surface
@@ -1543,10 +1635,18 @@ No new bindings (the arm reads `DB` + `REPO_TASKS`, both landed). Vars
 | var | default | upstream |
 |---|---|---|
 | `MAIL_ENABLED` | `"false"` (only `"true"` arms) | `[mailer] ENABLED` (mailer.go:72) |
+| `ENABLE_NOTIFY_MAIL` | unset (participant fan-out off) | `[service] ENABLE_NOTIFY_MAIL` (the loader `loadNotifyMailFrom`, modules/setting/mailer.go:227-235; the `Service.EnableNotifyMail` field, service.go:45) — the mail notifier's register gate (mailer.go:33-35): every participant-funnel arm (§8, §9-§14, the M1 pair) fires only when it sits ON TOP of `MAIL_ENABLED`; register-notify keeps riding `MAIL_ENABLED` alone (§2.4). The A2 fold |
 | `MAIL_PROVIDER` | `"dummy"` | `PROTOCOL` ∈ {dummy, resend} (mailer.go:37-44,102) |
 | `MAIL_FROM` | unset | `FROM` (mailer.go:24,180-189) — RFC 5322 `Name <addr>` |
 | `MAIL_SUBJECT_PREFIX` | unset (no prefix) | `SUBJECT_PREFIX` (message.go:56-60) |
 | `MAIL_API_BASE` | provider default | (none — test/diagnostic override of the relay base URL) |
+
+The unported upstream knobs (`OVERRIDE_HEADER`, `FROM_DISPLAY_NAME_FORMAT`,
+`EMBED_ATTACHMENT_IMAGES`, `ENVELOPE_FROM` relay-N/A) carry no var — §2.4
+records the per-knob reason. The `[service] AUTO_WATCH_ON_CHANGES` push-path
+knob (watch.go:312) is NOT a mail var: it rides the repo-subscription
+surface (SPEC-0004 §2.4) as `AUTO_WATCH_ON_CHANGES`, gating
+`services/repo-watchers.ts` `watchIfAuto` from the push path.
 
 Secret: `MAIL_PROVIDER_API_KEY` — name declared in the example's
 `secrets.required` (names only, per the existing comment's discipline);

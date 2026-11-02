@@ -1140,7 +1140,7 @@ describe("the user-push created arms and the true total (push.go's pushQueueHand
     // The VARLESS bindings: the direct calls thread an explicit request
     // origin, which the appOrigin chain only honors without the APP_URL var
     // (the var outranks it — the pinned precedence).
-    const varless: WebhookPushEnv = { DB: env.DB, REPO: env.REPO, REPO_PACKS: env.REPO_PACKS };
+    const varless: WebhookPushEnv = { DB: env.DB, REPO: env.REPO, REPO_PACKS: env.REPO_PACKS, REPO_TASKS: env.REPO_TASKS };
     const identity = { repository: { full_name: "alice/pushposture" }, pusher: { login: "Alice" }, sender: { login: "Alice" } };
     const origin = "https://direct.example.com";
     const person = { name: "Test User", email: "t@example.com", time: 1700000000, tz: "+0000" };
@@ -1327,7 +1327,7 @@ describe("the user-push created arms and the true total (push.go's pushQueueHand
 describe("appOrigin — the APP_URL / event-origin / request-origin / default chain", () => {
   /** The real bindings, no APP_URL var: the fresh-deployment shape the
    *  request-origin fallback serves (the varless env throughout). */
-  const bindings: WebhookPushEnv = { DB: env.DB, REPO: env.REPO, REPO_PACKS: env.REPO_PACKS };
+  const bindings: WebhookPushEnv = { DB: env.DB, REPO: env.REPO, REPO_PACKS: env.REPO_PACKS, REPO_TASKS: env.REPO_TASKS };
 
   it("unset var, no request origin → upstream's default ROOT_URL (off-request emitters)", () => {
     expect(appOrigin(bindings)).toBe("http://localhost:3000");
@@ -1372,7 +1372,7 @@ describe("push-family payload origins — the request-origin fallback", () => {
   /** The bindings minus the APP_URL var (and minus WEBHOOK_DELIVERY: the
    *  delivery rows are the assertion surface — payloadContent is written by
    *  the producer, the consumer's state flip is irrelevant here). */
-  const varlessEnv: WebhookPushEnv = { DB: env.DB, REPO: env.REPO, REPO_PACKS: env.REPO_PACKS };
+  const varlessEnv: WebhookPushEnv = { DB: env.DB, REPO: env.REPO, REPO_PACKS: env.REPO_PACKS, REPO_TASKS: env.REPO_TASKS };
 
   /** One created-ref delta through the shared builder (the created branch
    *  emits the bare-AppURL compare_url — the origin-bearing field); returns
@@ -1442,7 +1442,7 @@ describe("PushEvent.origin — the engine adapter threads the receive origin int
   /** The bindings minus the APP_URL var — a varless deployment's env view
    *  (the WebhookPushEnv pattern; the generated Env types the var required,
    *  this structural slice is exactly what the adapter reads). */
-  const varlessBindings: WebhookPushEnv = { DB: env.DB, REPO: env.REPO, REPO_PACKS: env.REPO_PACKS };
+  const varlessBindings: WebhookPushEnv = { DB: env.DB, REPO: env.REPO, REPO_PACKS: env.REPO_PACKS, REPO_TASKS: env.REPO_TASKS };
 
   it("the var outranks the live receive origin on the real path; a varless replay carries the event origin (workers.dev shape)", async () => {
     const { row, token } = await seedRepoWithToken("pushorigin");

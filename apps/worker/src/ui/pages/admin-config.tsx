@@ -136,6 +136,7 @@ export interface AdminConfigVars {
    *  specs/email-outbound.md §6). All optional: absent = the reader's own
    *  code default (disabled, dummy provider, empty from/prefix). */
   mailEnabled: string;
+  enableNotifyMail: string;
   mailProvider: string;
   mailFrom: string;
   mailSubjectPrefix: string;
@@ -161,6 +162,7 @@ export type AdminConfigEnv = {
   PACKAGES_ENABLED?: string;
   PACKAGE_CLEANUP_OLDER_THAN?: string;
   MAIL_ENABLED?: string;
+  ENABLE_NOTIFY_MAIL?: string;
   MAIL_PROVIDER?: string;
   MAIL_FROM?: string;
   MAIL_SUBJECT_PREFIX?: string;
@@ -211,6 +213,7 @@ export function adminConfigVarsFromEnv(env: AdminConfigEnv): AdminConfigVars {
     packageCleanupOlderThan: env.PACKAGE_CLEANUP_OLDER_THAN ?? PACKAGES_VAR_DEFAULTS.cleanupHours,
     oauth2Enabled: env.OAUTH2_ENABLED ?? OAUTH2_VAR_DEFAULT,
     mailEnabled: env.MAIL_ENABLED ?? MAIL_VAR_DEFAULTS.enabled,
+    enableNotifyMail: env.ENABLE_NOTIFY_MAIL ?? "",
     mailProvider: env.MAIL_PROVIDER ?? MAIL_VAR_DEFAULTS.provider,
     mailFrom: env.MAIL_FROM ?? MAIL_VAR_DEFAULTS.from,
     mailSubjectPrefix: env.MAIL_SUBJECT_PREFIX ?? MAIL_VAR_DEFAULTS.subjectPrefix,
@@ -604,6 +607,20 @@ export function loadAdminConfigData(vars: AdminConfigVars): Promise<AdminConfigD
             vars.mailSubjectPrefix === ""
               ? 'empty (MAIL_SUBJECT_PREFIX="") — subjects render unprefixed'
               : `${vars.mailSubjectPrefix} (MAIL_SUBJECT_PREFIX="${vars.mailSubjectPrefix}")`,
+        },
+        {
+          kind: "real",
+          label: "Notify fan-out (ENABLE_NOTIFY_MAIL)", // the A2 register gate (mailer.go:33-35)
+          value:
+            vars.enableNotifyMail === "true"
+              ? 'armed (ENABLE_NOTIFY_MAIL="true") — issue/PR participant mail rides the funnel'
+              : `off (ENABLE_NOTIFY_MAIL="${vars.enableNotifyMail ?? ""}") — participant fan-out off until the var sits on top of MAIL_ENABLED`,
+        },
+        {
+          kind: "posture",
+          label: "Unported mailer knobs", // the ledger's M5 enumeration (email-outbound §2.4)
+          value:
+            "OVERRIDE_HEADER, FROM_DISPLAY_NAME_FORMAT, EMBED_ATTACHMENT_IMAGES and ENVELOPE_FROM have no row — unported with per-knob reasons (specs/email-outbound.md §2.4); the relay transport derives the envelope from the verified domain",
         },
         {
           kind: "posture",

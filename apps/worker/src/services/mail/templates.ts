@@ -261,6 +261,105 @@ export function issueActionReviewLine(doerDisplayName: string): string {
   return `<b>${escapeHtml(doerDisplayName)}</b> commented on this pull request.`;
 }
 
+/** `mail.issue.action.review_dismissed` (locale_en-US.json: `<b>%[1]s</b>
+ *  dismissed last review from %[2]s for this pull request.`) — the
+ *  PullReviewDismiss arm's line (default.tmpl's review_dismissed case,
+ *  :39-40): %[1]s is the DISMISSING admin (`.Doer
+ *  .DisplayNameWithFullName`), %[2]s the reviewer whose review was
+ *  dismissed (`.Comment.Review.Reviewer.DisplayNameWithFullName`). Both
+ *  are plain-string locale args — escaped like every line. */
+export function issueActionReviewDismissedLine(doerDisplayName: string, reviewerDisplayName: string): string {
+  return `<b>${escapeHtml(doerDisplayName)}</b> dismissed last review from ${escapeHtml(reviewerDisplayName)} for this pull request.`;
+}
+
+/** `ShortSha` (modules/base/tool.go:31-33) — the first 10 runes. */
+export function shortSha(sha: string): string {
+  return [...sha].slice(0, 10).join("");
+}
+
+/**
+ * The push arm's action line (default.tmpl:9-25, the TOP `<p>` block —
+ * outside the close/reopen chain). Two shapes, picked by
+ * `.Comment.IsForcePush`:
+ *   - normal (`mail.issue.action.push_1` / `push_n`, TrN over
+ *     `len .Comment.Commits`): `<b>%[1]s</b> pushed %[3]d commit[s] to
+ *     %[2]s` — NO trailing period; %[2]s the PR head branch (plain-string
+ *     arg, escaped);
+ *   - force (`mail.issue.action.force_push`): `<b>%[1]s</b> force-pushed
+ *     the <b>%[2]s</b> from %[3]s to %[4]s.` — %[2]s the head branch
+ *     (escaped, the <b> wrapper is the locale string's own); %[3]s/%[4]s
+ *     are HTMLFormat-built anchors `<a href='URL'><b>SHORTSHA</b></a>`
+ *     (template.HTML — passed through the locale render RAW, the assigned
+ *     template's anchor precedent), URL = the BASE repo's HTMLURL +
+ *     "/commit/" + the full sha.
+ */
+export function issueActionPushLine(input: {
+  doerDisplayName: string;
+  headBranch: string;
+  repoHtmlUrl: string;
+  isForcePush: boolean;
+  commitCount: number;
+  oldCommit?: string;
+  newCommit?: string;
+}): string {
+  const doer = escapeHtml(input.doerDisplayName);
+  const branch = escapeHtml(input.headBranch);
+  if (input.isForcePush) {
+    const anchor = (sha: string | undefined) =>
+      `<a href='${escapeHtml(`${input.repoHtmlUrl}/commit/${sha ?? ""}`)}'><b>${escapeHtml(shortSha(sha ?? ""))}</b></a>`;
+    return `<b>${doer}</b> force-pushed the <b>${branch}</b> from ${anchor(input.oldCommit)} to ${anchor(input.newCommit)}.`;
+  }
+  const noun = input.commitCount === 1 ? "commit" : "commits";
+  return `<b>${doer}</b> pushed ${input.commitCount} ${noun} to ${branch}`;
+}
+
+/**
+ * The push arm's commit list (default.tmpl:61-71, the `<ul>` block below
+ * the main `<p>`) — one `<li>` per loaded push commit:
+ * `<a href="$repoURL/commit/$sha">SHORTSHA</a> - $MESSAGE_TITLE`. The href
+ * is a template-literal interpolation (NOT escaped by the template — the
+ * go.sh/HTML contexts differ; the sha is engine-derived hex and the URL
+ * the repo's own, so the raw form is upstream's byte shape), the title is
+ * `CommitMessage.MessageTitle` (the first line of the trimmed message —
+ * the caller threads it, the same derivation) escaped like the display
+ * name. Force-push mails carry an EMPTY commit list (the receiver's
+ * LoadCommentPushCommits leaves Commits nil for the boundary pair,
+ * services/issue/comments.go:168-174) — the block renders the bare
+ * `<ul>…</ul>` shell, upstream's own output.
+ */
+export function issuePushCommitListHtml(repoHtmlUrl: string, commits: Array<{ sha: string; title: string }>): string {
+  const items = commits
+    .map(
+      (commit) =>
+        `\t\t\t\n\t\t\t<li>\n\t\t\t\t<a href="${repoHtmlUrl}/commit/${commit.sha}">${escapeHtml(shortSha(commit.sha))}</a> - ${escapeHtml(commit.title)}\n\t\t\t</li>`,
+    )
+    .join("\n");
+  return `\t<ul>\n\t\t\n${items}\n\t\t\n\t\t</ul>`;
+}
+
+/** One `.ReviewComments` entry (mail_issue_common.go:93-100's flattened
+ *  `Review.CodeComments` — the review's inline code comments). */
+export interface ReviewCommentExcerptData {
+  /** Upstream `.TreePath` (the in-tree file). */
+  treePath: string;
+  /** Upstream `.Patch` — the stored diff hunk, RAW inside the `<pre>`. */
+  patchHtml: string;
+  /** Upstream `.RenderedContent` — the comment content rendered to HTML. */
+  contentHtml: string;
+}
+
+/**
+ * One `{{- range .ReviewComments}}` iteration (default.tmpl:52-59): the
+ * `<hr>` + `mail.issue.in_tree_path` ("In %s:") + the patch `<pre>` and
+ * the rendered content `<div>`. The leading "\n" and trailing "\t\t" are
+ * the range-body boundary trace (L52's newline; L59's leading tabs before
+ * `{{end -}}`, whose `-` trims the closing `</p>`'s own indentation —
+ * the caller joins iterations directly and appends "</p>" bare).
+ */
+export function reviewCommentExcerptHtml(excerpt: ReviewCommentExcerptData): string {
+  return `\n\t\t\t<hr>\n\t\t\tIn ${escapeHtml(excerpt.treePath)}:\n\t\t\t<div style="padding-left: 1em; margin: 1em 0;">\n\t\t\t\t<pre style="padding: 1em; border-left: 1px solid grey;">${excerpt.patchHtml}</pre>\n\t\t\t\t<div>${excerpt.contentHtml}</div>\n\t\t\t</div>\n\t\t`;
+}
+
 /** `mail.issue.x_mentioned_you` — the IsMention batch's line above the <p>
  *  block (`{{if .IsMention}}<p>{{.locale.Tr "mail.issue.x_mentioned_you"
  *  .Doer.Name}}</p>{{end}}`). The arg is `.Doer.Name` — the RAW username,
@@ -275,10 +374,12 @@ export interface IssueActionMailData {
   /** Upstream `.Subject` — the compose-time SANITIZED subject. */
   subject: string;
   /** Upstream `.ActionName` — actionToTemplate's arm name
-   *  (mail_issue_common.go:227-246): "new" | "close" | "reopen" | "comment" |
+   *  (mail_issue_common.go:227-262): "new" | "close" | "reopen" | "comment" |
    *  "ready_for_review" | "merge" | "approve" | "reject" | "review"
-   *  (CommentTypeReview's default branch, :248-257) | "default"
-   *  (CommentTypeReviewRequest's fall-through, :258-268). */
+   *  (CommentTypeReview's default branch, :244-252) | "review_dismissed"
+   *  (ActionPullReviewDismissed, :238-239) | "push" (CommentTypePullRequestPush's
+   *  default-branch case, :257-258) | "default"
+   *  (CommentTypeReviewRequest's fall-through, :259-260). */
   actionName:
     | "new"
     | "close"
@@ -289,6 +390,8 @@ export interface IssueActionMailData {
     | "approve"
     | "reject"
     | "review"
+    | "review_dismissed"
+    | "push"
     | "default";
   /** Upstream `.Body` — the content rendered to HTML (the issue content for
    *  "new", emptied by MailParticipants for close/reopen, mail_issue.go:
@@ -316,13 +419,36 @@ export interface IssueActionMailData {
    *  (default.tmpl's `mail.issue.x_mentioned_you` arg). Required when
    *  isMention is true; ignored otherwise. */
   doerName?: string;
+  /** The push arm's TOP action line (default.tmpl:9-25's `<p>` block —
+   *  `issueActionPushLine`'s output). Rendered between the mention line
+   *  and the main `<p>` when actionName is "push"; absent → the dropped-if
+   *  bare-tab line (every other arm). */
+  pushLineHtml?: string;
+  /** The push arm's commit list (default.tmpl:61-71 —
+   *  `issuePushCommitListHtml`'s output, force-push mails carry the bare
+   *  shell). Rendered between the main `<p>` and the link line when
+   *  actionName is "push"; absent → the dropped-if bare-tab line. */
+  pushCommitsHtml?: string;
+  /** Upstream `.ReviewComments` — the review's inline code comments
+   *  (mail_issue_common.go:93-100, the loaded `Comment.Review.CodeComments`
+   *  flatten; empty/absent → the range renders nothing, the pre-fold
+   *  bytes). Rendered inside the main `<p>` after the body branch. */
+  reviewComments?: ReviewCommentExcerptData[];
+  /** Upstream `.CanReply` (mail_issue_common.go:122 —
+   *  `setting.IncomingEmail.Enabled && commentType != PullRequestPush`);
+   *  true renders the link line's `mail.reply` half
+   *  ("or reply to this email directly", default.tmpl:72). Default false —
+   *  the pre-fold bytes. */
+  canReply?: boolean;
 }
 
 /**
  * `templates/mail/repo/issue/default.tmpl` for the new/close/reopen arms —
  * byte-faithful traces of the Go template with `.IsMention` false (pass
- * `isMention` for the mention-batch copies), empty `.ReviewComments`,
- * `.CanReply` false (no incoming email). The `<p>` block
+ * `isMention` for the mention-batch copies), empty `.ReviewComments`
+ * (pass `reviewComments` for the review/dismiss arms' inline excerpts),
+ * `.CanReply` false (pass `canReply` when the inbound arm is up — the
+ * link line's "or reply to this email directly" half). The `<p>` block
  * has four reachable shapes (both dropped `{{if}}` lines above it and the
  * second dropped push `{{if}}` below it leave their tab+newline):
  *   - a NON-EMPTY body with no action line (comment, or "new" with content):
@@ -342,6 +468,10 @@ export interface IssueActionMailData {
  *   - "new" with an EMPTY body: the action chain is skipped, and the nested
  *     `{{if eq .ActionName "new"}}` emits its locale line 4-tab indented
  *     after the empty branch's own "\t\t\t" line.
+ * The push arm ("push" + `pushLineHtml`/`pushCommitsHtml`) fills the two
+ * dropped-if lines with the template's push blocks (its main `<p>` is the
+ * no-action-line empty-body shape — the push content is emptied,
+ * mail_comment.go:25-27, and the push chain matches no action line).
  * Upstream's `emoji.ReplaceAliases` on the subject is NOT applied (the
  * recorded §8.2 divergence).
  */
@@ -360,19 +490,37 @@ export function renderIssueActionMail(data: IssueActionMailData): string {
   } else {
     pBlock = `\t<p>\n\t\t\n\t\t\t${data.bodyHtml}\n\t\t</p>`;
   }
+  // The ReviewComments range (default.tmpl:52-59): each iteration's trace
+  // starts with the boundary "\n" and ends with "\t\t" (L59's leading tabs
+  // ahead of `{{end -}}`, whose `-` trims the `</p>` line's own indent) —
+  // so the shapes' closing "\t\t</p>" becomes "\t\t" + iterations + "</p>".
+  // Empty/absent renders nothing (the pre-fold bytes).
+  const excerpts = data.reviewComments ?? [];
+  if (excerpts.length > 0) {
+    pBlock = `${pBlock.slice(0, -"</p>".length)}${excerpts.map(reviewCommentExcerptHtml).join("")}</p>`;
+  }
   // The IsMention line: `{{if .IsMention}}<p>…</p>{{end}}` — true renders the
   // locale line on the first tab line, false leaves the bare "\t".
   const mentionLine =
     data.isMention === true && data.doerName !== undefined
       ? `\t${issueMentionedYouLine(data.doerName)}`
       : "\t";
+  // The two push blocks (default.tmpl:9-25 and :61-71): keyed on
+  // `eq .ActionName "push"` INDEPENDENTLY of the data — only the push arm
+  // supplies the html, every other arm leaves the dropped-if bare "\t".
+  const pushTopLine = data.actionName === "push" && data.pushLineHtml !== undefined ? `\t${data.pushLineHtml}` : "\t";
+  const pushListLine =
+    data.actionName === "push" && data.pushCommitsHtml !== undefined ? `\t${data.pushCommitsHtml}` : "\t";
+  // The CanReply half (default.tmpl:72): `{{if .CanReply}} {{Tr "mail.reply"}}{{end}}`
+  // — the space before "or" is the template literal's own.
+  const replyHalf = data.canReply === true ? " or reply to this email directly" : "";
   return `${baseHead(title)}
 <body>
 ${mentionLine}
-\t
+${pushTopLine}
 ${pBlock}
-\t
-\t<p><a href="${link}">#${data.issueIndex}</a>.</p>
+${pushListLine}
+\t<p><a href="${link}">#${data.issueIndex}</a>${replyHalf}.</p>
 \t${baseFooter(data.appUrl, data.appName)}
 </body>
 </html>`;
