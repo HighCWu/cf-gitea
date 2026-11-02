@@ -62,10 +62,14 @@ import {
   evaluateRunConcurrency,
   filterPatterns,
   getEventsFromContent,
+  cronOccurrenceInWindow,
+  handleActionsScheduleTrigger,
   insertTriggeredRun,
+  isActionsScheduleTriggerMessage,
   isWorkflowPath,
   listWorkflows,
   marshalRawConcurrency,
+  parseCronSpec,
   matchPushEvent,
   parseRawOn,
   readWorkflowRawConcurrency,
@@ -2117,5 +2121,198 @@ describe("the trigger end-to-end (receive-pack → onPush → action rows)", () 
       expect.objectContaining({ sha: tip, ref: "feature", ref_type: "branch" }),
     );
     void ZERO_OID;
+  });
+
+  // -- the schedule pass (handleActionsScheduleTrigger) over the real tree --
+
+  it("an on:schedule workflow fires at the due hour; the non-due one waits (㉕-C)", async () => {
+    const { owner, slug, repoId, userId } = await seedE2eRepo("scheduled");
+    const token = (await mintFor(userId, "t-sched", "write:repository")).plaintext;
+    const hourly = 'name: Hourly\non:\n  schedule:\n    - cron: "0 * * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
+    const dailyNoon = 'name: Noon\non:\n  schedule:\n    - cron: "0 12 * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
+    const { tips, pack } = await buildChainPack(null, [
+      {
+        message: "ci: schedule workflows",
+        files: [
+          { path: ".gitea/workflows/hourly.yml", content: hourly },
+          { path: ".gitea/workflows/noon.yml", content: dailyNoon },
+        ],
+      },
+    ]);
+    // the registering push itself inserts NOTHING (schedules never match push)
+    const response = await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[0]! }], pack, token);
+    expect(response.status).toBe(200);
+    expect(await db().select().from(actionRuns)).toHaveLength(0);
+
+    // tick 12:00 — the window (11:00, 12:00] holds BOTH specs' occurrences
+    const tickNoon = Math.floor(Date.UTC(2026, 5, 1, 12, 0, 0) / 1000);
+    expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId, scheduledUnix: tickNoon })).toBe(2);
+    let runs = await db().select().from(actionRuns).orderBy(actionRuns.id);
+    expect(runs).toHaveLength(2);
+    expect(runs[0]?.workflowId).toBe(".gitea/workflows/hourly.yml");
+    expect(runs[1]?.workflowId).toBe(".gitea/workflows/noon.yml");
+    for (const run of runs) {
+      expect(run.triggerEvent).toBe("schedule");
+      expect(run.event).toBe("push"); // upstream CreateScheduleTaskBySpec's Event: cron.Event
+      expect(run.commitSha).toBe(tips[0]);
+      expect(run.ref).toBe("refs/heads/main");
+      expect(run.title).toBe("ci: schedule workflows");
+      expect(run.triggerUserId).toBe(ACTIONS_USER_ID);
+      const payload = JSON.parse(run.eventPayload) as { schedule?: string; schedule_unix?: number; head_commit?: { id?: string } };
+      expect(payload.head_commit?.id).toBe(tips[0]);
+      expect(payload.schedule_unix).toBe(tickNoon);
+    }
+    expect(runs[1] && (JSON.parse(runs[1].eventPayload) as { schedule?: string }).schedule).toBe("0 12 * * *");
+
+    // tick 14:00 — only the hourly spec is due (noon's 12:00 < 13:00)
+    const tick14 = Math.floor(Date.UTC(2026, 5, 1, 14, 0, 0) / 1000);
+    expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId, scheduledUnix: tick14 })).toBe(1);
+    runs = await db().select().from(actionRuns).orderBy(actionRuns.id);
+    expect(runs).toHaveLength(3);
+    expect(runs[2]?.workflowId).toBe(".gitea/workflows/hourly.yml");
+
+    // the noon workflow never fired at the 14:00 tick — the mission's
+    // non-due arm, asserted on the rows
+    expect(runs.filter((r) => r.workflowId === ".gitea/workflows/noon.yml")).toHaveLength(1);
+    expect(runs.filter((r) => r.workflowId === ".gitea/workflows/hourly.yml")).toHaveLength(2);
+  });
+
+  it("a redelivered tick message inserts nothing (the schedule_unix dedupe)", async () => {
+    const { owner, slug, repoId, userId } = await seedE2eRepo("sched-dedupe");
+    const token = (await mintFor(userId, "t-dedupe", "write:repository")).plaintext;
+    const wf = 'name: Hourly\non:\n  schedule:\n    - cron: "*/5 * * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
+    const { tips, pack } = await buildChainPack(null, [
+      { message: "seed", files: [{ path: ".gitea/workflows/every5.yml", content: wf }] },
+    ]);
+    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[0]! }], pack, token);
+    const tick = Math.floor(Date.UTC(2026, 5, 1, 9, 0, 0) / 1000);
+    const message = { kind: "actions-trigger" as const, repoId, scheduledUnix: tick };
+    expect(await handleActionsScheduleTrigger(env, message)).toBe(1);
+    // the sub-hourly spec collapses to ONE run per window, and the exact
+    // same message (a queue redelivery) inserts NOTHING more
+    expect(await handleActionsScheduleTrigger(env, message)).toBe(0);
+    const runs = await db().select().from(actionRuns);
+    expect(runs).toHaveLength(1);
+    // a DIFFERENT tick is a new window — the next run lands
+    expect(await handleActionsScheduleTrigger(env, { ...message, scheduledUnix: tick + 3600 })).toBe(1);
+    expect(await db().select().from(actionRuns)).toHaveLength(2);
+  });
+
+  it("an invalid spec logs and skips; the pass continues to the next workflow", async () => {
+    const { owner, slug, repoId, userId } = await seedE2eRepo("sched-invalid");
+    const token = (await mintFor(userId, "t-inv", "write:repository")).plaintext;
+    const broken = 'name: Broken\non:\n  schedule:\n    - cron: "99 * * * *"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
+    const good = 'name: Good\non:\n  schedule:\n    - cron: "@hourly"\njobs:\n  build:\n    runs-on: x\n    steps:\n      - run: y\n';
+    const { tips, pack } = await buildChainPack(null, [
+      {
+        message: "seed",
+        files: [
+          { path: ".gitea/workflows/broken.yml", content: broken },
+          { path: ".gitea/workflows/good.yml", content: good },
+        ],
+      },
+    ]);
+    await push(owner, slug, wiredEngine, [{ ref: "refs/heads/main", oid: tips[0]! }], pack, token);
+    const tick = Math.floor(Date.UTC(2026, 5, 1, 20, 0, 0) / 1000);
+    expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId, scheduledUnix: tick })).toBe(1);
+    const runs = await db().select().from(actionRuns);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.workflowId).toBe(".gitea/workflows/good.yml");
+    expect((JSON.parse(runs[0]?.eventPayload ?? "{}") as { schedule?: string }).schedule).toBe("@hourly");
+  });
+
+  it("archived and empty repos skip the pass before any tree read", async () => {
+    await db().insert(users).values({ id: 4242, username: "arch", usernameLower: "arch", status: "active", createdAt: new Date(0) });
+    await db().insert(repositories).values({
+      id: "repo-sched-arch",
+      storageKey: "r_repo-sched-arch",
+      ownerNamespace: "arch",
+      ownerId: 4242,
+      slug: "dead",
+      visibility: "public",
+      isArchived: true,
+    });
+    await db().insert(repositories).values({
+      id: "repo-sched-empty",
+      storageKey: "r_repo-sched-empty",
+      ownerNamespace: "arch",
+      ownerId: 4242,
+      slug: "blank",
+      visibility: "public",
+      isEmpty: true,
+    });
+    const tick = Math.floor(Date.UTC(2026, 5, 1, 8, 0, 0) / 1000);
+    expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId: "repo-sched-arch", scheduledUnix: tick })).toBe(0);
+    expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId: "repo-sched-empty", scheduledUnix: tick })).toBe(0);
+    expect(await handleActionsScheduleTrigger(env, { kind: "actions-trigger", repoId: "repo-sched-missing", scheduledUnix: tick })).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The schedule matcher (robfig/cron v3 ParseStandard + the tick-window probe)
+// ---------------------------------------------------------------------------
+
+describe("parseCronSpec + cronOccurrenceInWindow (robfig standard)", () => {
+  const sec = (iso: string): number => Math.floor(Date.parse(iso) / 1000);
+  // June 2026: the 1st is a Monday, the 5th a Friday, the 7th a Sunday.
+  const due = (spec: string, startIso: string, endIso: string): boolean =>
+    cronOccurrenceInWindow(parseCronSpec(spec), sec(startIso), sec(endIso));
+
+  it("the mission's pair: '0 * * * *' fires at the hour, '0 12 * * *' does not at 14:00", () => {
+    expect(parseCronSpec("0 * * * *")).not.toBeNull();
+    expect(due("0 * * * *", "2026-06-01T13:00:00Z", "2026-06-01T14:00:00Z")).toBe(true);
+    expect(due("0 12 * * *", "2026-06-01T13:00:00Z", "2026-06-01T14:00:00Z")).toBe(false);
+  });
+
+  it("minute-precision specs land in the window that holds their occurrence", () => {
+    expect(due("30 2 * * *", "2026-06-01T02:00:00Z", "2026-06-01T03:00:00Z")).toBe(true);
+    expect(due("30 2 * * *", "2026-06-01T03:00:00Z", "2026-06-01T04:00:00Z")).toBe(false);
+    expect(due("15,45 * * * *", "2026-06-01T10:00:00Z", "2026-06-01T11:00:00Z")).toBe(true);
+    expect(due("10-12 * * * *", "2026-06-01T10:09:00Z", "2026-06-01T11:11:00Z")).toBe(true); // 10:10..10:12, 11:10
+    expect(due("10-12 * * * *", "2026-06-01T10:13:00Z", "2026-06-01T11:09:00Z")).toBe(false); // neither end holds a fire
+    expect(due("*/15 * * * *", "2026-06-01T10:16:00Z", "2026-06-01T10:44:00Z")).toBe(true); // 10:30
+    expect(due("*/15 * * * *", "2026-06-01T10:16:00Z", "2026-06-01T10:29:00Z")).toBe(false);
+  });
+
+  it("dayMatches: restricted dom+dow OR; a starred arm ANDs", () => {
+    // dom 13 + dow Friday restricted → fires every Friday OR the 13th
+    expect(due("0 0 13 * 5", "2026-06-04T23:00:00Z", "2026-06-05T00:30:00Z")).toBe(true); // a Friday (dow)
+    expect(due("0 0 13 * 5", "2026-06-12T23:00:00Z", "2026-06-13T00:30:00Z")).toBe(true); // the 13th (dom; a Saturday)
+    expect(due("0 0 13 * 5", "2026-06-09T23:00:00Z", "2026-06-10T00:30:00Z")).toBe(false); // Wednesday the 10th
+    // dom 1 with a starred dow → AND (dow=* matches every day, dom gates)
+    expect(due("0 0 1 * *", "2026-05-31T23:00:00Z", "2026-06-01T00:30:00Z")).toBe(true);
+    expect(due("0 0 1 * *", "2026-06-01T23:00:00Z", "2026-06-02T00:30:00Z")).toBe(false);
+  });
+
+  it("descriptors and @every (robfig descriptors.go, the stateless divergence)", () => {
+    expect(due("@hourly", "2026-06-01T06:00:00Z", "2026-06-01T07:00:00Z")).toBe(true);
+    expect(due("@daily", "2026-05-31T23:00:00Z", "2026-06-01T00:30:00Z")).toBe(true);
+    expect(due("@daily", "2026-06-01T00:30:00Z", "2026-06-01T01:30:00Z")).toBe(false);
+    expect(due("@weekly", "2026-06-06T23:00:00Z", "2026-06-07T00:30:00Z")).toBe(true); // Sunday
+    expect(due("@annually", "2026-12-31T23:00:00Z", "2027-01-01T00:30:00Z")).toBe(true);
+    expect(parseCronSpec("@every 30m")).toMatchObject({ every: true });
+    expect(cronOccurrenceInWindow(parseCronSpec("@every 30m"), 1000, 2000)).toBe(true);
+  });
+
+  it("the grammar: names, steps, ranges, leading zeros, dow 7, month boundaries", () => {
+    expect(due("0 0 1 jan *", "2026-12-31T23:00:00Z", "2027-01-01T00:30:00Z")).toBe(true);
+    expect(due("0 0 1 jan *", "2025-12-31T23:00:00Z", "2026-01-01T00:30:00Z")).toBe(true);
+    expect(due("07 * * * *", "2026-06-01T05:06:00Z", "2026-06-01T05:07:30Z")).toBe(true);
+    expect(due("0 0 ? * mon", "2026-05-31T23:00:00Z", "2026-06-01T00:30:00Z")).toBe(true); // Monday the 1st
+    // robfig's dow range caps at 6 — 7 is a parse error
+    expect(() => parseCronSpec("0 0 * * 7")).toThrow();
+    expect(() => parseCronSpec("* * * *")).toThrow(); // 4 fields
+    expect(() => parseCronSpec("60 * * * *")).toThrow(); // minute above max
+    expect(() => parseCronSpec("0 0 30 2 *")).not.toThrow(); // parses; never fires (Feb 30)
+    expect(due("0 0 30 2 *", "2026-02-01T00:00:00Z", "2027-02-01T00:00:00Z")).toBe(false);
+    expect(() => parseCronSpec("")).toThrow();
+    expect(() => parseCronSpec("@fortnightly")).toThrow();
+  });
+
+  it("the message guard narrows the producer's shape", () => {
+    expect(isActionsScheduleTriggerMessage({ kind: "actions-trigger", repoId: "r1", scheduledUnix: 5 })).toBe(true);
+    expect(isActionsScheduleTriggerMessage({ kind: "demo-sweep", repoId: "r1" })).toBe(false);
+    expect(isActionsScheduleTriggerMessage({ kind: "actions-trigger", repoId: "r1" })).toBe(false);
+    expect(isActionsScheduleTriggerMessage(null)).toBe(false);
   });
 });

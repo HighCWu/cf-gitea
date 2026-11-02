@@ -43,8 +43,11 @@
  * (services/pull/merge.go:694–742) over the landed `pull_reviews` table; the
  * returned string is the upstream 405 body VERBATIM (ErrNotReadyToMerge's
  * Error() renders only the message, modules/util/error.go:56–58). The
- * status-check, codeowner and protected-file arms are stored-but-unenforced
- * (SPEC-0013 §6 — no status consumer, no CODEOWNERS, no file walking).
+ * status-check arm IS ENFORCED (SPEC-0013 §6 retired: the status consumer
+ * landed with SPEC-0012 — commit_statuses has a producer, so the
+ * IsPullCommitStatusPass arm merge.go:707–713 reads the head sha the callers
+ * thread in); codeowner and protected-file arms stay stored-but-unenforced
+ * (§6 — no CODEOWNERS, no file walking).
  *
  * SANITIZATION (SPEC-0013 M4) — the save-side whitelist normalization port of
  * UpdateProtectBranch (protected_branch.go:418–527): every user allowlist runs
@@ -82,6 +85,8 @@ import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import type { User } from "../api/models/user";
+import type { CommitStatusState } from "../api/models/commit-status";
+import { combineCommitStatusStates, latestCommitStatuses } from "../api/services/commit-status";
 import { repositoryPermissions, type RepositoryRow, type Viewer } from "../api/services/repository";
 import { collaboratorModeOf } from "../api/services/repo-collaborators";
 import { issues, protectedBranches, pullRequests, pullReviews, repositories, ReviewType, teamMembers, teamRepoAccess, teams, users } from "../db/schema";
@@ -713,18 +718,104 @@ export interface PullBranchProtectionInput {
   issueId: number;
   /** `pull_requests.commits_behind` — the mergeability check's count. */
   commitsBehind: number;
+  /**
+   * The head branch tip the status-check arm evaluates at. Upstream resolves
+   * it LIVE inside the gate (GetPullRequestCommitStatusState's
+   * GetBranchCommitID, commit_status.go:126–135); here the callers thread the
+   * checked row's fresh sha (the merge route's `checked.headSha`, the
+   * auto-merge ladder's post-check sha — the same posture its explicit
+   * isPullCommitStatusPass call already pins). ABSENT the arm fails closed:
+   * a rule that arms status checks answers the 405 (pending), never merges.
+   */
+  headSha?: string | null;
+}
+
+/**
+ * MergeRequiredContextsCommitStatus (services/pull/commit_status.go:19–71)
+ * over the landed `commit_statuses` rows at the head sha. The required
+ * contexts compile as PLAIN globs (upstream's separator-less glob.Compile —
+ * `*` crosses `/` here, unlike the rule-name compiler); an invalid pattern is
+ * logged and EXCLUDED, its requirement then can never match (the pending
+ * polarity below). Every surviving required glob must match ≥1
+ * latest-per-context status; the matched set aggregates through
+ * combineCommitStatusStates (CalcCommitStatus + CommitStatusStates.Combine);
+ * zero matched statuses settles "pending", a partially-matched requirement
+ * keeps a "failure" and downgrades everything else to "pending".
+ * services/pull-automerge.ts carries the twin port for the auto-merge
+ * ladder's explicit gate — same upstream cites, one behavior.
+ */
+export async function mergeRequiredContextsCommitStatus(
+  d1: D1Database,
+  repoId: string,
+  headSha: string | null,
+  requiredContexts: readonly string[],
+): Promise<CommitStatusState> {
+  // A missing tip fails closed (upstream errors "Head branch does not exist,
+  // can not merge" — commit_status.go:118–123 — and the gate fails with it).
+  if (headSha === null || headSha === "") return "pending";
+  // GetLatestCommitStatus (commit_status.go:137–141): the latest row per
+  // context at the sha — latestCommitStatuses' max-id-per-context grouping
+  // (the module comment's context_hash reduction). The read is bounded at the
+  // auto-merge ladder's page (100 contexts — the twin's own posture).
+  const statuses = (await latestCommitStatuses(d1, repoId, headSha, 1, 100)).items;
+  if (requiredContexts.length === 0) {
+    // No required contexts: the WHOLE status set aggregates
+    // (commit_status.go:25–29) — an armed-but-empty rule means "all checks
+    // must pass". Zero statuses at the sha stays pending (:22–24).
+    if (statuses.length === 0) return "pending";
+    return combineCommitStatusStates(statuses.map((status) => status.state));
+  }
+  const globs: RegExp[] = [];
+  for (const context of requiredContexts) {
+    try {
+      globs.push(new RegExp(`^${compileGlobPattern([...context], [])}$`));
+    } catch (error) {
+      console.error(
+        `[branch-protection] glob.Compile ${context} failed. Error: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  const matched: CommitStatusState[] = [];
+  let allRequiredContextsMatched = true;
+  for (const glob of globs) {
+    let requiredContextMatched = false;
+    for (const status of statuses) {
+      if (glob.test(status.context)) {
+        matched.push(status.state);
+        requiredContextMatched = true;
+      }
+    }
+    allRequiredContextsMatched = allRequiredContextsMatched && requiredContextMatched;
+  }
+  if (matched.length === 0) return "pending"; // :50–52
+  const returned = combineCommitStatusStates(matched);
+  if (allRequiredContextsMatched) return returned; // :54–56
+  return returned === "failure" ? "failure" : "pending"; // :57–60
 }
 
 /**
  * CheckPullBranchProtections (merge.go:694–742) — the rule's decision for one
  * PR: null = mergeable, or the upstream 405 body VERBATIM (the
- * ErrNotReadyToMerge message texts). Order mirrors upstream: approvals,
- * rejected reviews, official review requests, outdated branch.
+ * ErrNotReadyToMerge message texts). Order mirrors upstream: the status pass
+ * (:707–713 — IsPullCommitStatusPass, commit_status.go:73–101: the rule's
+ * stored statusCheckContexts arm the check; the EffectiveRequiredContexts
+ * scoped-workflow half stages with that feature's merge-gate wiring), then
+ * approvals, rejected reviews, official review requests, outdated branch.
  */
 export async function checkPullBranchProtections(d1: D1Database, rule: ProtectedBranchRow, input: PullBranchProtectionInput): Promise<string | null> {
   const config = parseRuleConfig(rule.rules);
-  // IsPullCommitStatusPass (:707–713) — no status consumer exists (SPEC-0013
-  // §6): the arm is stored-only, never enforced.
+  // IsPullCommitStatusPass (:707–713) — SPEC-0013 §6's stored-only posture is
+  // RETIRED: the status consumer landed with SPEC-0012, so the arm enforces.
+  // Success passes; pending/failure (and a head sha the caller could not
+  // thread) answer the 405. Upstream's `!pb.EnableStatusCheck` arm reads the
+  // scoped-required patterns there; the store landed (scoped-workflow-sources)
+  // but the merge-gate union stages — recorded in the SPEC's §6 list.
+  if (config.enableStatusCheck) {
+    const state = await mergeRequiredContextsCommitStatus(d1, rule.repoId, input.headSha ?? null, config.statusCheckContexts);
+    if (state !== "success") {
+      return "Not all required status checks successful";
+    }
+  }
   if (config.requiredApprovals > 0 && (await grantedApprovalsCount(d1, input.issueId, config)) < config.requiredApprovals) {
     return "Does not have enough approvals";
   }

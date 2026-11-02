@@ -43,7 +43,7 @@
  * — the SPEC-0016 §4.4 packages ratification shape and the FOURTH
  * sanctioned extension; the actions-endless producer, upstream's
  * `stop_endless_tasks`, tasks_actions.go:38-45 — the FIFTH) — and runs
- * SEVEN producer blocks (EIGHT producer calls) on the hourly "0 * * * *"
+ * EIGHT producer blocks (NINE producer calls) on the hourly "0 * * * *"
  * entry (carried by wrangler.jsonc.example): the (self-gated) demo
  * producer, the (self-gated) audit-retention producer (the FIRST
  * sanctioned extension), the (probe-gated, ratified non-demo-gated)
@@ -53,11 +53,15 @@
  * actions-abandoned + ephemeral block (the SIXTH — the ungated
  * `cancel_abandoned_jobs` + `cleanup_ephemeral_runners` pair;
  * SPEC-0015 §4.3 + SPEC-0016 §4.4 + SPEC-0012 §4.5 — SIX sanctioned
- * extensions total), and the probe-gated webhook-maintenance producer
+ * extensions total), the probe-gated webhook-maintenance producer
  * (SPEC-0005 §4.9 as-built — upstream's own registered
  * `cleanup_hook_task_table` task, services/cron/tasks_basic.go:124-135;
- * parity-placed with the ratified non-demo-gated packages shape). Twelve
- * producer calls across the two entries; the services/cron-state.ts
+ * parity-placed with the ratified non-demo-gated packages shape), and the
+ * probe-gated actions-schedule producer (upstream's own registered
+ * `start_schedule_tasks`, cron/tasks_actions.go:55-67, enabled default —
+ * the SEVENTH sanctioned extension; the due-derivation and its recorded
+ * divergences live in services/actions/trigger.ts's schedule section).
+ * Thirteen producer calls across the two entries; the services/cron-state.ts
  * CRON_ARMS census gains the matching `cleanup_hook_task_table` row as
  * this block's integration follow-up (the census list stays pinned by
  * cron-state.test.ts until then; see the marked blocks in
@@ -67,18 +71,15 @@
  * the delegation itself is one await.
  */
 
-import { asc, eq, inArray, isNull, lt, or, and } from "drizzle-orm";
+import { asc, eq, inArray, isNull, lt, or, and, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { repositories, users, webhookDeliveries } from "../db/schema";
 import { enqueueDueAuditRetention } from "./audit";
 import { enqueueDueAutoMergeChecks } from "./pull-automerge";
 import { enqueueDueActionsRetention, enqueueDueZombieStops } from "./actions/retention";
-import {
-  enqueueDueAbandonedJobCancels,
-  enqueueDueEndlessTaskStops,
-  enqueueDueEphemeralCleanup,
-} from "./actions/sweeps";
+import { enqueueDueAbandonedJobCancels, enqueueDueEndlessTaskStops, enqueueDueEphemeralCleanup } from "./actions/sweeps";
+import type { ActionsScheduleTriggerMessage } from "./actions/trigger";
 import { enqueueDuePackagesCleanup } from "./packages/cleanup";
 import { enqueueDueMirrorSyncs } from "./mirror/sync";
 import { enqueueDuePushMirrorSyncs } from "./mirror/push-sync";
@@ -396,6 +397,75 @@ export async function enqueueDueWebhookMaintenance(
 }
 
 // ---------------------------------------------------------------------------
+// The actions schedule producer (SPEC-0012 — upstream's registered
+// `start_schedule_tasks`, cron/tasks_actions.go:55-67, enabled default) — the
+// SEVENTH sanctioned extension's producer, riding the hourly entry
+// ---------------------------------------------------------------------------
+
+/**
+ * The env slice the schedule producer touches (the WebhookMaintenanceProducerEnv
+ * posture — bindings optional for the tests, the generated Env satisfies the
+ * required shape, the runtime guard below is the fail-closed defense).
+ */
+export type ActionsScheduleProducerEnv = Partial<Pick<Env, "DB" | "REPO_TASKS">>;
+
+/**
+ * The schedule producer (upstream startTasks, services/actions/schedule_tasks.go:38-55):
+ * ONE `{kind: "actions-trigger", repoId, scheduledUnix}` message per
+ * actions-enabled repo — the consumer arm (handleActionsScheduleTrigger,
+ * services/actions/trigger.ts) re-derives the due workflows from the
+ * default-branch tree. Upstream registers parsed specs into
+ * action_schedules/action_schedule_specs on every default-branch push and the
+ * @every-1m ticker iterates those rows; the schedule pair is deferred storage
+ * here (schema.ts), so the producer's probe is the candidate SELECT (non-
+ * archived, non-empty, actions unit on — the DetectAndHandleSchedules +
+ * startTask gates pulled INTO the probe) and the tree read happens
+ * consume-side with its own queue budget ("crons enqueue, consumers do the
+ * work"). NOT demo-gated and NOT var-gated (upstream's arm is enabled default
+ * with no knob — the ratified non-demo-gated packages shape); zero sends on
+ * an instance with no candidate repos. No CAS claim: the consumer's
+ * payload-stamped `schedule_unix` dedupe absorbs redelivery AND a duplicate
+ * enqueue of the same tick. Returns the number of messages enqueued.
+ */
+export async function enqueueDueActionSchedules(env: ActionsScheduleProducerEnv, options: { now?: Date } = {}): Promise<number> {
+  const db = env.DB;
+  const queue = env.REPO_TASKS;
+  if (db === undefined || queue === undefined) {
+    // Unbound bindings are a config bug — fail loud (the packages-cleanup
+    // producer's posture); the generated Env types the bindings required,
+    // this is the fail-closed runtime defense.
+    throw new Error("DB/REPO_TASKS not bound (wrangler.jsonc); the actions schedule producer cannot enqueue");
+  }
+  const scheduledUnix = Math.floor((options.now ?? new Date()).getTime() / 1000);
+  // The candidate probe: DetectAndHandleSchedules' empty/archived skips
+  // (notifier_helper.go:668-670) and startTask's unit gate
+  // (schedule_tasks.go:112-121) as ONE indexed scan (repo_units.repo_id is
+  // the unit table's lookup column).
+  const candidates = await drizzle(db)
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(
+      and(
+        eq(repositories.isArchived, false),
+        eq(repositories.isEmpty, false),
+        sql`EXISTS (SELECT 1 FROM repo_units WHERE repo_units.repo_id = ${repositories.id} AND repo_units.type = 'actions')`,
+      ),
+    )
+    .orderBy(asc(repositories.id))
+    .all();
+  const messages: ActionsScheduleTriggerMessage[] = candidates.map((row) => ({
+    kind: "actions-trigger",
+    repoId: row.id,
+    scheduledUnix,
+  }));
+  for (let i = 0; i < messages.length; i += 100) {
+    await queue.sendBatch(messages.slice(i, i + 100).map((message) => ({ body: message })));
+  }
+  console.log(`[actions-schedule] enqueued ${messages.length} repo passes for tick ${scheduledUnix}`);
+  return messages.length;
+}
+
+// ---------------------------------------------------------------------------
 // The scheduled dispatch (§3.1) — see the mount record in the module header
 // ---------------------------------------------------------------------------
 
@@ -411,7 +481,10 @@ export async function enqueueDueWebhookMaintenance(
  * set → zero reads and zero sends), the auto-merge due-scan producer
  * (probe-shaped, ungated — the 58f9890 fold) and the webhook-maintenance
  * producer (probe-gated, never var-gated — SPEC-0005 §4.9 as-built: no stale
- * `delivering` row AND no over-age terminal row → zero sends); every OTHER entry — the standing
+ * `delivering` row AND no over-age terminal row → zero sends), and the
+ * actions-schedule producer (probe-shaped, never var-gated — upstream's
+ * `start_schedule_tasks`, the trigger.ts schedule section's due-derivation);
+ * every OTHER entry — the standing
  * 10-minute step entry and anything a future config adds — runs the mirror
  * producers exactly as the inline handler always has: unconditional,
  * gate-independent (their CAS guard absorbs any :00 overlap, sync.ts:890-898),
@@ -535,6 +608,31 @@ export async function handleScheduledCron(controller: ScheduledController, env: 
       );
     }
     // --- END webhook-maintenance producer block -----------------------------
+    // --- BEGIN actions-schedule producer block (SPEC-0012; upstream's own
+    // --- registered `start_schedule_tasks` @every 1m enabled default,
+    // --- cron/tasks_actions.go:55-67; the SEVENTH sanctioned extension) ----
+    // ONE D1 SELECT of the actions-enabled repos (non-archived, non-empty —
+    // the DetectAndHandleSchedules/startTask gates pulled into the probe)
+    // arms the tick: one {kind: "actions-trigger", repoId, scheduledUnix}
+    // message per candidate, and the REPO_TASKS consumer arm
+    // (handleActionsScheduleTrigger, services/actions/trigger.ts) re-derives
+    // the due `on: schedule` entries from the default-branch tree with its
+    // own queue budget. Upstream registers parsed specs at push time and
+    // iterates them per minute; the schedule pair is deferred storage, so
+    // the tree is the registry and the hourly tick window (absorbing every
+    // minute-resolution spec) is the cadence — the divergences are recorded
+    // in trigger.ts's schedule section header. Not demo-gated, not var-gated
+    // (upstream's arm is enabled default with no knob); zero candidates →
+    // zero sends. Swallowed failures keep the hourly invocation intact (the
+    // tail-arm rationale); the next tick re-probes.
+    try {
+      await enqueueDueActionSchedules(env, {});
+    } catch (error) {
+      console.error(
+        `[actions-schedule] producer probe failed (retrying next tick): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    // --- END actions-schedule producer block --------------------------------
     return;
   }
   // The mirror producers, exactly as today (index.ts scheduled) — the

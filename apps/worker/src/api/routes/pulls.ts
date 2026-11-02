@@ -1728,6 +1728,7 @@ export function registerPullRoutes(
         const failure = await checkPullBranchProtections(c.env.DB, rule, {
           issueId: issue.id,
           commitsBehind: checked.commitsBehind ?? 0,
+          headSha: checked.headSha,
         });
         if (failure !== null) {
           const bypass =

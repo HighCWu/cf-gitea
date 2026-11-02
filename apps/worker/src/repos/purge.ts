@@ -68,6 +68,7 @@ import {
   isActionsEphemeralCleanupMessage,
   stopEndlessTasks,
 } from "../services/actions/sweeps";
+import { handleActionsScheduleTrigger, isActionsScheduleTriggerMessage } from "../services/actions/trigger";
 import { handlePackagesCleanup, isPackageCleanupMessage } from "../services/packages/cleanup";
 import { isMailOutboxMessage, runMailOutboxArm } from "../services/mail/outbox";
 import { handleAutoMergeCheck, isAutoMergeCheckMessage } from "../services/pull-automerge";
@@ -223,6 +224,13 @@ export async function destroyRepoDO(env: Env, engineName: string): Promise<void>
  *     delivery sweep FIRST (unblocks the §3.6 redelivery paths a crashed
  *     consumer wedged), then the delivery-log cleanup (upstream
  *     CleanupHookTaskTable parity), one idempotent pass per message.
+ *   - actions schedule triggers ({kind: "actions-trigger", repoId,
+ *     scheduledUnix}, SPEC-0012 — upstream `start_schedule_tasks`): the
+ *     hourly producer's per-repo pass (services/demo-sweep.ts
+ *     enqueueDueActionSchedules) — handleActionsScheduleTrigger re-derives
+ *     the due `on: schedule` workflows from the default-branch tree and
+ *     inserts their runs; the payload-stamped `schedule_unix` key absorbs
+ *     redelivery.
  *
  * Per message: idempotent work, then ack; a throw retries THAT message (the
  * redelivery re-runs the idempotent steps). Storage errors never fail the
@@ -440,6 +448,24 @@ export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): P
         message.ack();
       } catch (error) {
         console.error(`[repo-tasks] auto-merge-check ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
+        message.retry();
+      }
+      continue;
+    }
+    // Actions schedule trigger (SPEC-0012 — upstream start_schedule_tasks'
+    // consumer half): one message = one repo = one due-window pass over the
+    // default-branch tree's `on: schedule` workflows (handleActionsScheduleTrigger,
+    // services/actions/trigger.ts — the run inserts ride the same
+    // PrepareRunAndInsert port as the push family). The payload-stamped
+    // `schedule_unix` dedupe makes redelivery a no-op when the inserts
+    // landed; a throw retries THAT message (the mirror-sync posture).
+    if (isActionsScheduleTriggerMessage(message.body)) {
+      try {
+        const inserted = await handleActionsScheduleTrigger(env, message.body);
+        console.log(`[repo-tasks] actions-trigger ${message.id}: repo ${message.body.repoId} tick ${message.body.scheduledUnix} inserted ${inserted}`);
+        message.ack();
+      } catch (error) {
+        console.error(`[repo-tasks] actions-trigger ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
         message.retry();
       }
       continue;

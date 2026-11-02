@@ -545,9 +545,10 @@ export async function handleAutoMergeCheck(env: Env, issueId: number, options: {
   // The branch protections at merge time (CheckPullMergeable General does
   // NOT skip them — approvals etc. must hold when green; the arm lives in
   // check.go:178-215, reached through the consumer's whole-ladder call,
-  // automerge.go:221-223).
+  // automerge.go:221-223). The status-check arm inside now re-reads the SAME
+  // fresh sha the explicit isPullCommitStatusPass gate above used.
   if (rule !== null) {
-    const failure = await checkPullBranchProtections(d1, rule, { issueId, commitsBehind: checked.commitsBehind ?? 0 });
+    const failure = await checkPullBranchProtections(d1, rule, { issueId, commitsBehind: checked.commitsBehind ?? 0, headSha: checked.headSha });
     if (failure !== null) return "skipped-protections";
   }
 

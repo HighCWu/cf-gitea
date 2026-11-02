@@ -34,6 +34,7 @@ import {
   isUserOfficialReviewer,
   listRepoRules,
   matchedBranchNamesForRule,
+  mergeRequiredContextsCommitStatus,
   parseRuleConfig,
   principalAccessOf,
   recomputeOfficialForRule,
@@ -48,7 +49,7 @@ import {
   type ProtectedBranchConfig,
   type PrincipalAccess,
 } from "./branch-protection";
-import { protectedBranches, pullReviews, repoCollaborators, repositories, ReviewType, teamMembers, teamRepoAccess, teams } from "../db/schema";
+import { commitStatuses, protectedBranches, pullReviews, repoCollaborators, repositories, ReviewType, teamMembers, teamRepoAccess, teams } from "../db/schema";
 import { IssuesService } from "../issues/service";
 
 beforeAll(async () => {
@@ -62,6 +63,7 @@ beforeEach(async () => {
   for (const table of [
     "protected_branches",
     "pull_reviews",
+    "commit_statuses",
     "comments",
     "pull_requests",
     "issues",
@@ -450,6 +452,181 @@ describe("checkPullBranchProtections (merge.go:694–742) over pull_reviews", ()
     const rule = await ruleOf(repoId, ruleId);
     expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0 })).toBeNull();
     expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 3 })).toBe("The head branch is behind the base branch");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The status-check arm (IsPullCommitStatusPass, services/pull/
+// commit_status.go:73-101 + MergeRequiredContextsCommitStatus :19-71) —
+// SPEC-0013 §6's stored-only posture retired now that statuses have a
+// producer (SPEC-0012's Actions trigger chain posts them).
+// ---------------------------------------------------------------------------
+
+describe("checkPullBranchProtections status-check arm (commit_status.go:73-101)", () => {
+  let repoId: string;
+  let pull: { issueId: number; index: number };
+  const HEAD = "d".repeat(40);
+
+  beforeEach(async () => {
+    repoId = await seedRepo();
+    pull = await seedPull(repoId);
+  });
+
+  async function seedStatus(context: string, state: "pending" | "success" | "failure" | "warning" | "skipped" | "error", sha = HEAD): Promise<void> {
+    await db().insert(commitStatuses).values({ repoId, sha, context, state, description: "", createdAt: new Date(), updatedAt: new Date() });
+  }
+
+  it("a required context with a success status merges (null)", async () => {
+    const ruleId = await seedRule(repoId, "main", { enableStatusCheck: true, statusCheckContexts: ["ci/test"] });
+    const rule = await ruleOf(repoId, ruleId);
+    await seedStatus("ci/test", "success");
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, headSha: HEAD })).toBeNull();
+  });
+
+  it("a required context with only failures 405s verbatim", async () => {
+    const ruleId = await seedRule(repoId, "main", { enableStatusCheck: true, statusCheckContexts: ["ci/test"] });
+    const rule = await ruleOf(repoId, ruleId);
+    await seedStatus("ci/test", "failure");
+    expect(
+      await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, headSha: HEAD }),
+    ).toBe("Not all required status checks successful");
+  });
+
+  it("a required context with NO statuses 405s (the pending polarity)", async () => {
+    const ruleId = await seedRule(repoId, "main", { enableStatusCheck: true, statusCheckContexts: ["ci/test"] });
+    const rule = await ruleOf(repoId, ruleId);
+    // an UNRELATED status at the sha does not satisfy the requirement
+    await seedStatus("lint", "success");
+    expect(
+      await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, headSha: HEAD }),
+    ).toBe("Not all required status checks successful");
+  });
+
+  it("pending and warning states are not success; latest-per-context supersedes", async () => {
+    const ruleId = await seedRule(repoId, "main", { enableStatusCheck: true, statusCheckContexts: ["ci/test"] });
+    const rule = await ruleOf(repoId, ruleId);
+    await seedStatus("ci/test", "pending");
+    expect(
+      await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, headSha: HEAD }),
+    ).toBe("Not all required status checks successful");
+    // a newer success in the SAME context supersedes the older failure
+    // (GetLatestCommitStatus keeps max-id-per-context)
+    await seedStatus("ci/test", "failure");
+    await seedStatus("ci/test", "success");
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, headSha: HEAD })).toBeNull();
+  });
+
+  it("every required context must match: a second unmatched context downgrades to the 405", async () => {
+    const ruleId = await seedRule(repoId, "main", { enableStatusCheck: true, statusCheckContexts: ["ci/test", "e2e"] });
+    const rule = await ruleOf(repoId, ruleId);
+    await seedStatus("ci/test", "success");
+    expect(
+      await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, headSha: HEAD }),
+    ).toBe("Not all required status checks successful");
+    // a matched-but-failing context keeps failure even with an unmatched one
+    await db().delete(commitStatuses).run();
+    await seedStatus("ci/test", "failure");
+    expect(
+      await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, headSha: HEAD }),
+    ).toBe("Not all required status checks successful");
+  });
+
+  it("required contexts compile as plain globs (`*` crosses `/`)", async () => {
+    const ruleId = await seedRule(repoId, "main", { enableStatusCheck: true, statusCheckContexts: ["ci/*"] });
+    const rule = await ruleOf(repoId, ruleId);
+    await seedStatus("ci/build/linux", "success");
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, headSha: HEAD })).toBeNull();
+  });
+
+  it("an armed rule with EMPTY contexts aggregates every status at the sha", async () => {
+    const ruleId = await seedRule(repoId, "main", { enableStatusCheck: true, statusCheckContexts: [] });
+    const rule = await ruleOf(repoId, ruleId);
+    // zero statuses at the sha is the PENDING arm first (:22-24 precedes the
+    // no-required-contexts aggregate) — the 405, not a pass
+    expect(
+      await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, headSha: HEAD }),
+    ).toBe("Not all required status checks successful");
+    await seedStatus("lint", "success");
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, headSha: HEAD })).toBeNull();
+    await seedStatus("lint2", "failure");
+    expect(
+      await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, headSha: HEAD }),
+    ).toBe("Not all required status checks successful");
+  });
+
+  it("the flag-off rule never enforces stored contexts (upstream: a disabled rule contributes none)", async () => {
+    const ruleId = await seedRule(repoId, "main", { enableStatusCheck: false, statusCheckContexts: ["ci/test"] });
+    const rule = await ruleOf(repoId, ruleId);
+    expect(await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, headSha: HEAD })).toBeNull();
+  });
+
+  it("a missing head sha fails closed (pending → 405)", async () => {
+    const ruleId = await seedRule(repoId, "main", { enableStatusCheck: true, statusCheckContexts: ["ci/test"] });
+    const rule = await ruleOf(repoId, ruleId);
+    await seedStatus("ci/test", "success");
+    expect(
+      await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0 }),
+    ).toBe("Not all required status checks successful");
+  });
+
+  it("statuses at a DIFFERENT sha never count (the head moves, the gate re-arms)", async () => {
+    const ruleId = await seedRule(repoId, "main", { enableStatusCheck: true, statusCheckContexts: ["ci/test"] });
+    const rule = await ruleOf(repoId, ruleId);
+    await seedStatus("ci/test", "success", "e".repeat(40));
+    expect(
+      await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, headSha: HEAD }),
+    ).toBe("Not all required status checks successful");
+  });
+
+  it("force_merge bypasses the arm through the route's existing escape (canBypassBranchProtection)", async () => {
+    const ruleId = await seedRule(repoId, "main", { enableStatusCheck: true, statusCheckContexts: ["ci/test"] });
+    const rule = await ruleOf(repoId, ruleId);
+    const config = parseRuleConfig(rule.rules);
+    // the arm fails...
+    expect(
+      await checkPullBranchProtections(env.DB, rule, { issueId: pull.issueId, commitsBehind: 0, headSha: HEAD }),
+    ).toBe("Not all required status checks successful");
+    // ...and the route's escape (pulls.ts: failure !== null && form.force_merge
+    // && await canBypassBranchProtection(...)) clears it for a bypasser — an
+    // admin without block_admin_merge_override passes, a plain writer does not.
+    expect(await canBypassBranchProtection(env.DB, config, { userId: 1, write: true, admin: true })).toBe(true);
+    expect(await canBypassBranchProtection(env.DB, config, { userId: 2, write: true, admin: false })).toBe(false);
+  });
+});
+
+describe("mergeRequiredContextsCommitStatus (commit_status.go:19-71) directly", () => {
+  let repoId: string;
+  const HEAD = "f".repeat(40);
+
+  beforeEach(async () => {
+    repoId = await seedRepo();
+  });
+
+  async function seedStatus(context: string, state: "pending" | "success" | "failure" | "warning" | "skipped" | "error", sha = HEAD): Promise<void> {
+    await db().insert(commitStatuses).values({ repoId, sha, context, state, description: "", createdAt: new Date(), updatedAt: new Date() });
+  }
+
+  it("skipped counts toward success; error and warning are failure-family; the dom/dow-free states combine", async () => {
+    await seedStatus("ci/test", "skipped");
+    await seedStatus("ci/build", "success");
+    expect(await mergeRequiredContextsCommitStatus(env.DB, repoId, HEAD, ["ci/*"])).toBe("success");
+    await db().delete(commitStatuses).run();
+    await seedStatus("ci/test", "warning");
+    expect(await mergeRequiredContextsCommitStatus(env.DB, repoId, HEAD, ["ci/*"])).toBe("failure");
+  });
+
+  it("a null sha answers pending without reading", async () => {
+    expect(await mergeRequiredContextsCommitStatus(env.DB, repoId, null, ["ci/*"])).toBe("pending");
+    expect(await mergeRequiredContextsCommitStatus(env.DB, repoId, "", [])).toBe("pending");
+  });
+
+  it("no required contexts aggregates ALL statuses (zero statuses → pending)", async () => {
+    expect(await mergeRequiredContextsCommitStatus(env.DB, repoId, HEAD, [])).toBe("pending");
+    await seedStatus("a", "success");
+    await seedStatus("b", "success");
+    expect(await mergeRequiredContextsCommitStatus(env.DB, repoId, HEAD, [])).toBe("success");
+    await seedStatus("c", "failure");
+    expect(await mergeRequiredContextsCommitStatus(env.DB, repoId, HEAD, [])).toBe("failure");
   });
 });
 

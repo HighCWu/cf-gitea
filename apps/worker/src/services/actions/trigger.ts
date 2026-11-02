@@ -75,8 +75,15 @@
  *     whose `on:` node fails to parse stays on the log-and-skip arm —
  *     upstream's NON-static classification (workflows.go:202-207), never a
  *     failed run.
- *   - Schedules (`on: schedule`) parse but produce nothing — SPEC §1.4 defers
- *     the schedule machinery (services/actions/schedule_tasks.go).
+ *   - Schedules (`on: schedule`) are WIRED statelessly: the hourly cron
+ *     producer (services/demo-sweep.ts enqueueDueActionSchedules) enqueues
+ *     `{kind: "actions-trigger", repoId, scheduledUnix}` per actions-enabled
+ *     repo and handleActionsScheduleTrigger (bottom of this file) re-derives
+ *     the due (workflow, cron-spec) pairs from the default-branch tree —
+ *     upstream's action_schedules/specs registry (schedule_tasks.go) is
+ *     deferred storage (schema.ts), so the tick-window matcher + the
+ *     payload's `schedule_unix` dedupe key stand in; the recorded divergences
+ *     (hourly cadence floor, @every phasing) live in the section header.
  *   - The notifier census hooks beyond the push/create/delete family (issues,
  *     PRs, releases, packages, wikis, migrations/automerge —
  *     services/actions/notifier.go:41-784, 35 hooks) are pinned, not wired:
@@ -132,7 +139,7 @@ import {
   repositories,
   users,
 } from "../../db/schema";
-import { findRepositoryByPath, type RepositoryWithOwner } from "../../api/services/repository";
+import { findRepositoryById, findRepositoryByPath, type RepositoryWithOwner } from "../../api/services/repository";
 import { engineName } from "../../repos/service";
 import { findRule, listRepoRules, parseRuleConfig, type ProtectedBranchRow } from "../branch-protection";
 import { loadRepoActionsConfig } from "./config";
@@ -543,8 +550,9 @@ export function parseRawOn(rawOn: YamlNode): WorkflowEvent[] {
             return record;
           });
           // Upstream validates each cron with cron.ParseStandard here; the
-          // schedule MACHINERY is §1.4-staged, so the entries parse but no
-          // validator runs (a staged row's reduction, disclosed).
+          // validation rides the schedule pass instead (parseCronSpec, bottom
+          // of this file — an invalid spec logs and skips at tick time, the
+          // CreateScheduleTaskBySchedules skip arm's effect).
           res.push({ name: k, acts: {}, schedules });
         } else {
           res.push({ name: k, acts: {}, schedules: null });
@@ -3964,4 +3972,392 @@ async function buildPushEventPayload(
     pusher: {},
     sender: {},
   });
+}
+
+// ---------------------------------------------------------------------------
+// Schedules (services/actions/schedule_tasks.go — upstream's registered
+// `start_schedule_tasks` cron, tasks_actions.go:55-67, enabled default) over
+// the robfig/cron v3 standard grammar the upstream spec rows parse with.
+// ---------------------------------------------------------------------------
+
+/**
+ * The producer/consumer split this module serves (SPEC-0012 §4.5's shape,
+ * upstream's own two halves): the hourly cron producer
+ * (services/demo-sweep.ts enqueueDueActionSchedules) enqueues ONE
+ * `{kind: "actions-trigger", repoId, scheduledUnix}` message per
+ * actions-enabled repo, and `handleActionsScheduleTrigger` — the consumer arm
+ * the REPO_TASKS dispatcher runs — re-derives the due workflows from the
+ * DEFAULT BRANCH TREE at tick time (upstream instead registers parsed specs
+ * into action_schedules/action_schedule_specs on every default-branch push,
+ * handleSchedules notifier_helper.go:586-651, and the ticker iterates those
+ * rows; the schedule pair is deferred storage here — schema.ts — so the tree
+ * IS the registry, re-read per tick).
+ *
+ * Due-ness is the stateless substitute for the spec rows' prev/next columns:
+ * a spec is due when it fires at least once inside the look-back window
+ * (scheduledUnix - SCHEDULE_TICK_WINDOW_SECONDS, scheduledUnix]. At the
+ * hourly cadence this reproduces upstream's per-occurrence counts for every
+ * minute-resolution spec (each window holds exactly its occurrences), while
+ * sub-hourly specs (`* * * * *`, upstream one run per minute) collapse to ONE
+ * run per window — the recorded cadence-floor divergence. `@every <dur>`
+ * anchors its phase at registration upstream (ConstantDelaySchedule from the
+ * stored next); stateless, it is due EVERY tick — over-firing long delays,
+ * the second recorded divergence (an @every 12h workflow runs hourly; cron
+ * syntax needs no such allowance).
+ *
+ * Idempotence replaces upstream's advance-Next-before-insert claim
+ * (schedule_tasks.go:69-77): the run insert dedupes on the exact tick key —
+ * `json_extract(event_payload, '$.schedule_unix')` — so a redelivered
+ * message re-derives the same due set and finds every insert already done.
+ */
+
+/** The look-back window the producer's cadence implies (the hourly entry). */
+export const SCHEDULE_TICK_WINDOW_SECONDS = 3600;
+
+/** The REPO_TASKS message the schedule producer enqueues per repo (the
+ *  mission-specified `{kind: "actions-trigger"}` shape). */
+export interface ActionsScheduleTriggerMessage {
+  kind: "actions-trigger";
+  repoId: string;
+  /** The producer tick (unix seconds): the due-window anchor AND the dedupe
+   *  key stamped into each run's event payload. */
+  scheduledUnix: number;
+}
+
+export function isActionsScheduleTriggerMessage(value: unknown): value is ActionsScheduleTriggerMessage {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as ActionsScheduleTriggerMessage).kind === "actions-trigger" &&
+    typeof (value as ActionsScheduleTriggerMessage).repoId === "string" &&
+    typeof (value as ActionsScheduleTriggerMessage).scheduledUnix === "number"
+  );
+}
+
+/** The robfig month/dow name tables (parser.go's monthChars/dowChars — the
+ *  three-letter, lowercase forms ParseStandard accepts). */
+const CRON_MONTH_NAMES: Record<string, number> = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+const CRON_DOW_NAMES: Record<string, number> = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+
+/** The descriptor table (robfig descriptors.go), normalized to the five-field
+ *  form (upstream's six-field constants lead with the seconds 0). */
+const CRON_DESCRIPTORS: Record<string, string> = {
+  "@yearly": "0 0 1 1 *",
+  "@annually": "0 0 1 1 *",
+  "@monthly": "0 0 1 * *",
+  "@weekly": "0 0 * * 0",
+  "@daily": "0 0 * * *",
+  "@midnight": "0 0 * * *",
+  "@hourly": "0 * * * *",
+};
+
+/**
+ * A parsed standard spec — SpecSchedule's five field sets plus the two star
+ * flags the dayMatches OR rule reads (parser.go:284-296: a STARRED (unstepped
+ * star-or-question-mark) dom or dow ANDs both fields; two restricted fields
+ * OR — and a stepped star (star over step two) clears the star bit, `if step
+ * greater than 1, extra = 0`). `every` carries the `@every <duration>` form
+ * (ConstantDelaySchedule): due every window, per the header's divergence note.
+ */
+export interface CronSchedule {
+  every: boolean;
+  minute: boolean[]; // 0-59
+  hour: boolean[]; // 0-23
+  dom: boolean[]; // 1-31
+  domStar: boolean;
+  month: boolean[]; // 1-12
+  dow: boolean[]; // 0-6 (0 = Sunday — JS getUTCDay's own base)
+  dowStar: boolean;
+}
+
+function parseIntOrName(token: string, names: Record<string, number> | undefined): number {
+  if (names !== undefined) {
+    const named = names[token];
+    if (named !== undefined) return named;
+  }
+  // strconv.Atoi's decimal arm: leading zeros parse ("07" = 7)
+  if (!/^\d+$/.test(token)) {
+    throw new Error(`failed to parse int or name ${token}`);
+  }
+  return Number(token);
+}
+
+/** getField (parser.go:299-311): the comma-list split, each part through
+ *  getRange, the bit sets OR'd (a star part keeps the star flag). */
+function parseCronField(field: string, min: number, max: number, names: Record<string, number> | undefined, bits: boolean[]): boolean {
+  let star = false;
+  for (const expr of field.split(",")) {
+    if (parseCronRange(expr, min, max, names, bits)) star = true;
+  }
+  return star;
+}
+
+/** getRange (parser.go:213-282) over a boolean set — the errors verbatim. */
+function parseCronRange(expr: string, min: number, max: number, names: Record<string, number> | undefined, bits: boolean[]): boolean {
+  const rangeAndStep = expr.split("/");
+  if (rangeAndStep.length > 2) throw new Error(`too many slashes: ${expr}`);
+  const lowAndHigh = rangeAndStep[0]!.split("-");
+  if (lowAndHigh.length > 2) throw new Error(`too many hyphens: ${expr}`);
+  const singleDigit = lowAndHigh.length === 1;
+  let star = false;
+  let start: number;
+  let end: number;
+  if (lowAndHigh[0] === "*" || lowAndHigh[0] === "?") {
+    start = min;
+    end = max;
+    star = true;
+  } else {
+    start = parseIntOrName(lowAndHigh[0]!, names);
+    switch (lowAndHigh.length) {
+      case 1:
+        end = start;
+        break;
+      case 2:
+        end = parseIntOrName(lowAndHigh[1]!, names);
+        break;
+      default:
+        throw new Error(`too many hyphens: ${expr}`);
+    }
+  }
+  let step = 1;
+  if (rangeAndStep.length === 2) {
+    if (!/^\d+$/.test(rangeAndStep[1]!)) throw new Error(`failed to parse int: ${rangeAndStep[1]}`);
+    step = Number(rangeAndStep[1]);
+    // Special handling: "N/step" means "N-max/step".
+    if (singleDigit) end = max;
+    if (step > 1) star = false; // the starBit clear
+  }
+  if (start < min) throw new Error(`beginning of range (${start}) below minimum (${min}): ${expr}`);
+  if (end > max) throw new Error(`end of range (${end}) above maximum (${max}): ${expr}`);
+  if (start > end) throw new Error(`beginning of range (${start}) beyond end of range (${end}): ${expr}`);
+  if (step <= 0) throw new Error(`step of range should be a positive number: ${expr}`);
+  for (let v = start; v <= end; v += step) bits[v] = true;
+  return star;
+}
+
+/**
+ * cron.ParseStandard (robfig/cron v3 parser.go:66-141): the descriptor forms,
+ * else exactly five whitespace-separated fields (minute hour dom month dow —
+ * ParseStandard carries no seconds field), each through getRange. A parse
+ * failure THROWS — the schedule pass catches it and skips the entry
+ * (upstream's spec rows that fail Parse never register, schedule.go:104-107,
+ * the same observable effect at tick time).
+ */
+export function parseCronSpec(raw: string): CronSchedule {
+  const text = raw.trim().toLowerCase();
+  if (text === "") throw new Error("empty spec string");
+  const schedule: CronSchedule = {
+    every: false,
+    minute: new Array<boolean>(60).fill(false),
+    hour: new Array<boolean>(24).fill(false),
+    dom: new Array<boolean>(32).fill(false),
+    domStar: false,
+    month: new Array<boolean>(13).fill(false),
+    dow: new Array<boolean>(7).fill(false),
+    dowStar: false,
+  };
+  if (text.startsWith("@")) {
+    if (text.startsWith("@every ")) {
+      // ConstantDelaySchedule — the duration itself is not load-bearing
+      // stateless (the header's divergence); anything time.ParseDuration
+      // would accept the simple unit forms of is honored, junk is not.
+      const delay = text.slice("@every ".length).trim();
+      if (!/^\d+(ns|us|µs|ms|s|m|h)+$/.test(delay)) throw new Error(`failed to parse duration: ${delay}`);
+      schedule.every = true;
+      return schedule;
+    }
+    const mapped = CRON_DESCRIPTORS[text];
+    if (mapped === undefined) throw new Error(`unrecognized descriptor: ${text}`);
+    return parseCronSpec(mapped);
+  }
+  const fields = text.split(/\s+/);
+  if (fields.length !== 5) throw new Error(`expected exactly 5 fields, found ${fields.length}: ${raw}`);
+  parseCronField(fields[0]!, 0, 59, undefined, schedule.minute);
+  parseCronField(fields[1]!, 0, 23, undefined, schedule.hour);
+  schedule.domStar = parseCronField(fields[2]!, 1, 31, undefined, schedule.dom);
+  parseCronField(fields[3]!, 1, 12, CRON_MONTH_NAMES, schedule.month);
+  schedule.dowStar = parseCronField(fields[4]!, 0, 6, CRON_DOW_NAMES, schedule.dow);
+  return schedule;
+}
+
+/** dayMatches (parser.go:284-296) + the minute/hour/month gates
+ *  (SpecSchedule.Next's field checks) over one UTC minute — workerd runs UTC,
+ *  upstream's server-local arm lands there. */
+function cronMinuteMatches(s: CronSchedule, d: Date): boolean {
+  if (s.every) return true;
+  if (s.minute[d.getUTCMinutes()] !== true || s.hour[d.getUTCHours()] !== true || s.month[d.getUTCMonth() + 1] !== true) return false;
+  const domMatch = s.dom[d.getUTCDate()] === true;
+  const dowMatch = s.dow[d.getUTCDay()] === true;
+  if (s.domStar || s.dowStar) return domMatch && dowMatch;
+  return domMatch || dowMatch;
+}
+
+/**
+ * The stateless next-occurrence probe: does the spec fire at ANY minute m
+ * with windowStartExclusive < m <= windowEndInclusive (unix seconds, minutes
+ * scanned newest-first — a 1 h window is ≤ 60 matches)? A never-firing spec
+ * ("0 0 30 2 *", the schedule.go:110 comment's own example) simply finds no
+ * occurrence, exactly as upstream's `next.IsZero()` skip.
+ */
+export function cronOccurrenceInWindow(schedule: CronSchedule, windowStartExclusive: number, windowEndInclusive: number): boolean {
+  if (schedule.every) return windowEndInclusive > windowStartExclusive;
+  const lastMinute = Math.floor(windowEndInclusive / 60);
+  const firstMinute = Math.floor(windowStartExclusive / 60);
+  for (let minute = lastMinute; minute > firstMinute; minute -= 1) {
+    if (cronMinuteMatches(schedule, new Date(minute * 60_000))) return true;
+  }
+  return false;
+}
+
+/**
+ * The schedule consumer arm (CreateScheduleTaskBySpec, schedule_tasks.go:111-170,
+ * per repo per tick): the default branch tree re-read, each workflow's
+ * `on: schedule` entries matched against the message's window, and every due
+ * (workflow, spec) inserted through the same PrepareRunAndInsert port the
+ * push family uses — run.Event stays the registration family's "push"
+ * (upstream's `Event: cron.Event`, schedule_tasks.go:130) while
+ * TriggerEvent is "schedule" (HookEventSchedule), TriggerUser the Actions
+ * user, and the payload the synthesized push shape (upstream's
+ * withScheduleInEventPayload merge) carrying `schedule` AND the
+ * `schedule_unix` dedupe key. Skips mirror startTask: archived/empty repo
+ * (:96/:106-108), the unit gate (:112-121), the disabled-workflow list
+ * (:122-125), an invalid spec (:66-68 via Parse) — and one failing workflow
+ * never aborts the pass (startTasks' :42-46 own posture). Returns the number
+ * of runs inserted; a systemic failure throws (the queue's retry signal).
+ */
+export async function handleActionsScheduleTrigger(env: ActionsTriggerEnv, message: ActionsScheduleTriggerMessage): Promise<number> {
+  const pair = await findRepositoryById(env.DB, message.repoId);
+  if (pair === null) return 0;
+  const repo = pair.repo;
+  // DetectAndHandleSchedules' empty/archived skips (notifier_helper.go:668-670)
+  if (repo.isArchived || repo.isEmpty) return 0;
+  if (!(await repoActionsUnitEnabled(env.DB, repo.id))) return 0;
+
+  const cell = env.REPO.getByName(engineName(repo.ownerNamespace, repo.slug));
+  const reads: TriggerCellReads = cell;
+  const ref = `refs/heads/${repo.defaultBranch}`;
+  const commit = await reads.readCommit(ref);
+  if (commit === null) return 0; // no default branch — nothing can be scheduled
+  const appUrl = (env.APP_URL ?? "").replace(/\/+$/, "");
+  const windowStart = message.scheduledUnix - SCHEDULE_TICK_WINDOW_SECONDS;
+
+  const cfg = await loadRepoActionsConfig(env.DB, repo.id);
+  const workflowFiles = await listWorkflows(reads, ref);
+  let inserted = 0;
+  for (const file of workflowFiles) {
+    // startTasks' per-spec isolation: one broken workflow logs, the pass goes on
+    try {
+      if (cfg.disabledWorkflows.includes(file.entryName)) continue;
+      // CreateScheduleTaskBySpec's ValidateWorkflowStatic gate
+      // (schedule_tasks.go:148-156): a static violation logs and skips —
+      // the push path's failed-run arm belongs to pushes, not ticks.
+      const { runName, jobIfs } = staticExpressionsOf(file.content);
+      const problem = validateStaticExpressions({ runName, jobIfs });
+      if (problem !== null) {
+        console.error(
+          `[actions-schedule] ${repo.ownerNamespace}/${repo.slug}: ignore invalid workflow ${file.entryName}: ${problem}`,
+        );
+        continue;
+      }
+      const events = getEventsFromContent(file.content);
+      for (const evt of events) {
+        if (evt.schedules === null) continue;
+        for (const record of evt.schedules) {
+          const specText = record["cron"] ?? "";
+          if (specText === "") continue; // OnSchedule keeps only cron-keyed entries
+          let schedule: CronSchedule;
+          try {
+            schedule = parseCronSpec(specText);
+          } catch (err) {
+            console.error(
+              `[actions-schedule] ${repo.ownerNamespace}/${repo.slug}: skip spec "${specText}" of ${file.entryName}: ` +
+                `${err instanceof Error ? err.message : String(err)}`,
+            );
+            continue;
+          }
+          if (!cronOccurrenceInWindow(schedule, windowStart, message.scheduledUnix)) continue;
+
+          // The exact-tick claim (the header's idempotence note): a run of
+          // this workflow whose payload carries THIS tick was already
+          // inserted — the redelivery and the duplicate-producer guard.
+          const existing = await drizzle(env.DB)
+            .select({ id: actionRuns.id })
+            .from(actionRuns)
+            .where(
+              and(
+                eq(actionRuns.repoId, repo.id),
+                eq(actionRuns.workflowId, file.entryName),
+                eq(actionRuns.triggerEvent, "schedule"),
+                sql`json_extract(${actionRuns.eventPayload}, '$.schedule_unix') = ${message.scheduledUnix}`,
+              ),
+            )
+            .limit(1);
+          if (existing.length > 0) continue;
+
+          // withScheduleInEventPayload (schedule_tasks.go:174-206): the push
+          // shape the claim context reads, merged with the schedule identity.
+          const eventPayloadJson = JSON.stringify({
+            ref,
+            before: PUSH_ZERO_OID,
+            after: commit.oid,
+            compare_url: "",
+            commits: [],
+            total_commits: 0,
+            head_commit: {
+              id: commit.oid,
+              message: commit.message,
+              url: "",
+              author: commit.author,
+              committer: commit.committer,
+              added: [],
+              removed: [],
+              modified: [],
+              timestamp: null,
+            },
+            repository: {},
+            pusher: {},
+            sender: {},
+            schedule: specText,
+            schedule_unix: message.scheduledUnix,
+          });
+          try {
+            await insertTriggeredRunSplit(
+              env.DB,
+              {
+                repoId: repo.id,
+                ownerId: repo.ownerId ?? 0,
+                workflowId: file.entryName,
+                triggerUserId: ACTIONS_USER_ID,
+                ref,
+                commitSha: commit.oid,
+                isForkPullRequest: false,
+                event: "push",
+                eventPayloadJson,
+                triggerEvent: "schedule",
+                title: commit.subject,
+                repoOwnerNamespace: repo.ownerNamespace,
+                repoSlug: repo.slug,
+                appUrl,
+              },
+              file.content,
+              readWorkflowRawConcurrency(file.content),
+            );
+            inserted += 1;
+          } catch (err) {
+            // handleWorkflows logs-and-continues (:357-361)
+            console.error(
+              `[actions-schedule] ${repo.ownerNamespace}/${repo.slug}: insert ${file.entryName} failed: ` +
+                `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+      }
+    } catch (err) {
+      console.error(
+        `[actions-schedule] ${repo.ownerNamespace}/${repo.slug}: schedule pass skipped ${file.entryName}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  return inserted;
 }

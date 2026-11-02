@@ -18,13 +18,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
-import { repoMirrors, repositories, webhookDeliveries, webhooks } from "../db/schema";
+import { repoMirrors, repoUnits, repositories, webhookDeliveries, webhooks } from "../db/schema";
 import {
   DEMO_RETENTION_HOURS,
   DEMO_SWEEP_CRON,
   WEBHOOK_DELIVERY_AGE_DAYS,
   WEBHOOK_STUCK_AFTER_SECONDS,
   demoModeEnabled,
+  enqueueDueActionSchedules,
   enqueueDueDemoSweeps,
   enqueueDueWebhookMaintenance,
   handleScheduledCron,
@@ -177,6 +178,7 @@ const WIPED_TABLES = [
   "repo_mirrors",
   "push_mirrors",
   "repo_counters",
+  "repo_units",
   "repositories",
   "repo_redirects",
   "webhook_deliveries",
@@ -678,5 +680,67 @@ describe("isDemoSweepMessage narrowing (§3.2)", () => {
     expect(isDemoSweepMessage("demo-sweep")).toBe(false);
     expect(isDemoSweepMessage(42)).toBe(false);
     expect(isDemoSweepMessage(undefined)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The actions-schedule producer (SPEC-0012 — upstream start_schedule_tasks)
+// ---------------------------------------------------------------------------
+
+describe("the actions-schedule producer (enqueueDueActionSchedules)", () => {
+  beforeEach(resetD1);
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** A repo row + its actions unit (the candidate probe's EXISTS arm). */
+  async function seedScheduleRepo(id: string, opts: { actionsUnit?: boolean; isEmpty?: boolean; isArchived?: boolean } = {}): Promise<void> {
+    await drizzle(env.DB)
+      .insert(repositories)
+      .values({
+        id,
+        storageKey: `r_${id}`,
+        ownerNamespace: `owner-${id}`,
+        ownerId: null,
+        slug: `repo-${id}`,
+        visibility: "public",
+        isEmpty: opts.isEmpty ?? false,
+        isArchived: opts.isArchived ?? false,
+      });
+    if (opts.actionsUnit ?? true) {
+      await drizzle(env.DB).insert(repoUnits).values({ repoId: id, type: "actions" });
+    }
+  }
+
+  it("a quiet instance: zero candidates → zero sends, one log line", async () => {
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
+    const queue = spyQueue();
+    expect(await enqueueDueActionSchedules({ DB: env.DB, REPO_TASKS: queue }, { now: NOW })).toBe(0);
+    expect(totalSends(queue)).toBe(0);
+    expect(consoleLog).toHaveBeenCalledTimes(1);
+  });
+
+  it("enqueues ONE actions-trigger message per actions-enabled repo (archived/empty/unit-less skip)", async () => {
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
+    await seedScheduleRepo("7001");
+    await seedScheduleRepo("7002");
+    await seedScheduleRepo("7003", { isArchived: true }); // DetectAndHandleSchedules' archived skip
+    await seedScheduleRepo("7004", { isEmpty: true }); // the empty skip
+    await seedScheduleRepo("7005", { actionsUnit: false }); // startTask's unit gate, probed away
+    const queue = spyQueue();
+    const enqueued = await enqueueDueActionSchedules({ DB: env.DB, REPO_TASKS: queue }, { now: NOW });
+    expect(enqueued).toBe(2);
+    expect(queue.bodies).toEqual([
+      [
+        { kind: "actions-trigger", repoId: "7001", scheduledUnix: NOW_SEC },
+        { kind: "actions-trigger", repoId: "7002", scheduledUnix: NOW_SEC },
+      ],
+    ]);
+    expect(consoleLog).toHaveBeenCalledTimes(1);
+  });
+
+  it("DB or REPO_TASKS unbound: fails loud before the first read (the packages-cleanup posture)", async () => {
+    await expect(enqueueDueActionSchedules({ DB: undefined, REPO_TASKS: spyQueue() }, { now: NOW })).rejects.toThrow(/not bound/);
+    await expect(enqueueDueActionSchedules({ DB: env.DB, REPO_TASKS: undefined }, { now: NOW })).rejects.toThrow(/not bound/);
   });
 });
