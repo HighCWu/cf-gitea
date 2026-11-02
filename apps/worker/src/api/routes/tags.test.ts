@@ -272,8 +272,17 @@ describe("annotated-tag message arms (residuals P3-11)", () => {
     expect(Number.isNaN(Date.parse(tagger.date as string))).toBe(false);
     // the annotated-object body peels to the target commit
     expect((body.object as Record<string, unknown>).sha).toBe(TIP2);
-    // a LIGHTWEIGHT tag's commit sha 404s the annotated-only surface (unchanged)
+  });
+
+  it("GET /git/tags/{sha} answers the 400 on EVERY lookup failure (R15 — tag.go:113-118 maps GetAnnotatedTag/GetTagCommit errors to 400)", async () => {
+    // a LIGHTWEIGHT tag's commit sha is not a tag object — upstream
+    // GetAnnotatedTag errors → ctx.APIError(400) (never a 404, despite the
+    // swagger's declared 404)
     const lightweight = await get(`${REPO_PATH}/git/tags/${TIP2}`);
-    expect(lightweight.status).toBe(404);
+    expect(lightweight.status).toBe(400);
+    expect((await jsonBody(lightweight)).message).toBe("tag does not exist");
+    // an UNKNOWN oid rides the same arm
+    const unknown = await get(`${REPO_PATH}/git/tags/0123456789012345678901234567890123456789`);
+    expect(unknown.status).toBe(400);
   });
 });

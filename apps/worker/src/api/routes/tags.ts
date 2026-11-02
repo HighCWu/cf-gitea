@@ -18,8 +18,11 @@ import {
 import { annotatedTagSchema, createTagOptionSchema, tagSchema, type Tag } from "../models/git";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { assertNotArchived, canWriteRepository, requireVisibleRepo } from "../services/repo-access";
+import { compareUrl } from "../services/hooks";
 import { toApiRepository, viewerOf, type RepositoryWithOwner } from "../services/repository";
+import { toPayloadCommit, usernamesByEmail } from "../services/git-models";
 import { isTagControlAllowed, listProtectedTags } from "../../services/tag-protection";
+import { enrichCommitsWithFileLists } from "../../issues/webhooks";
 import { emitRefWebhook, readTagData, renderAnnotatedTag, renderTag, resolveTagTarget, writeTagRef, zeroCommitPushPayload } from "../services/tags";
 
 /**
@@ -84,19 +87,20 @@ import { emitRefWebhook, readTagData, renderAnnotatedTag, renderTag, resolveTagT
  * mirror halves already emit via emitPushFamilyUpdates. Payloads are the
  * upstream renderers verbatim (services/webhook/notifier.go): CreatePayload
  * (CreateRef:821→:830 — ref = the SHORT tag name, ref_type "tag", sha = the
- * created ref's tip) and DeletePayload (DeleteRef:858→:870 — pusher_type
- * "user"). The sender is the authenticated API caller (upstream's `pusher`
- * doer); the repository renders with the caller's viewer, like every
- * api-routes emission. The annotated-tag `sha` is the TAG OBJECT oid — the
- * ref tip `Sha: refID` actually carries (the push path's semantics, identical
- * to what emitPushFamilyUpdates emits for a pushed annotated tag); upstream's
- * own API path passes the pre-peel target commit instead (release.go:136
- * resolves GetCommit(target) before CreateAnnotatedTag) — a quirk we do not
- * copy. Upstream's API tag create/delete additionally fire a zero-commit
- * `push` event around the create/delete pair (release.go:136-143 / :396-403,
- * always push first) — emitted here with the push family's zero-commit shape
- * (zeroCommitPushPayload below), so an API-written tag and a pushed tag
- * produce byte-identical `push` payloads.
+ * created ref's tip — the TAG OBJECT oid for an annotated create, the push
+ * path's `Sha: refID` semantics) and DeletePayload (DeleteRef:858→:870 —
+ * pusher_type "user"). The sender is the authenticated API caller (upstream's
+ * `pusher` doer); the repository renders with the caller's viewer, like every
+ * api-routes emission. Upstream's API tag create/delete additionally fire a
+ * zero-commit `push` event around the create/delete pair (release.go:136-143
+ * / :396-403, always push first). The CREATE pair carries the corrected
+ * SPEC-0005 §2.3 shape (tagCreatePushPayload below — the git-push tag arm's
+ * exact shape, emitUserPushCreatedRef: head_commit = the PEELED tip commit,
+ * compare_url = `compare/{zero}...{raw tip}`, push FIRST then create — the
+ * W5 follow-up; the zero-list mirror shape it replaces rode the mirror path's
+ * headless payload). The DELETE pair stays the zero-commit shape
+ * (zeroCommitPushPayload): upstream's delete PushCommits is the bare
+ * NewPushCommits() with no head (release.go:396-403, push.go:100-110).
  */
 
 const notFoundResponse = {
@@ -132,7 +136,8 @@ interface TagTip {
   peeled?: string;
 }
 
-/** Tag refs sorted by name — the engine's list order is unspecified. */
+/** Tag refs sorted by name — the engine's list order is unspecified, and the
+ *  name order is the -*creatordate tiebreak (the stable sort below keeps it). */
 async function sortedTags(c: Context<ApiEnv>, pair: { ownerNamespace: string; slug: string }): Promise<TagTip[]> {
   const refs = await engineReads(c.env, pair).listRefs();
   return (refs?.refs ?? [])
@@ -145,15 +150,60 @@ async function sortedTags(c: Context<ApiEnv>, pair: { ownerNamespace: string; sl
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 
-/** True when a release row is attached to the tag (upstream release coupling). */
-async function hasRelease(d1: D1Database, repoId: string, tagName: string): Promise<boolean> {
-  const row = await drizzle(d1)
-    .select({ id: releases.id })
+/**
+ * The API tag list's order: upstream GetTagInfos sorts `--sort -*creatordate`
+ * then re-sorts in memory by `Tagger.When` DESCENDING (modules/git/
+ * repo_tag.go:117-150 + tag.go:104-127 — R9). The creatordate of a tag is
+ * the TAGGER time for an annotated tag and the COMMIT's committer time for a
+ * lightweight one (the `*` dereference), which is exactly what the release
+ * rows the tags page feeds carry (pushUpdateAddTags: created_unix = the
+ * commit's committer time). One object read per tag (readTag/readCommit) —
+ * upstream pays the same shape (a full `for-each-ref` with creator parsing
+ * over every tag, sorted, THEN paginated :149-151). The sort is stable over
+ * the name-sorted base, so ties keep upstream's refname fallback order; an
+ * unreadable date sorts as 0 (the degraded read never breaks the list).
+ */
+async function tagsByCreatorDate(c: Context<ApiEnv>, pair: { ownerNamespace: string; slug: string }): Promise<Array<TagTip & { creatorTime: number }>> {
+  const base = await sortedTags(c, pair);
+  const withTime = await Promise.all(
+    base.map(async (tip): Promise<TagTip & { creatorTime: number }> => {
+      let creatorTime: number;
+      try {
+        if (tip.peeled !== undefined) {
+          const tag = await engineCell(c.env, pair).readTag(tip.target);
+          creatorTime = tag?.tagger?.time ?? 0;
+        } else {
+          const commit = await engineReads(c.env, pair).readCommit(tip.target);
+          creatorTime = commit?.committer.time ?? 0;
+        }
+      } catch {
+        creatorTime = 0; // transport-class: degrade the date, keep the tag
+      }
+      return { ...tip, creatorTime };
+    }),
+  );
+  return withTime.sort((a, b) => b.creatorTime - a.creatorTime);
+}
+
+/**
+ * The release coupling reads (R3 + R2): upstream resolves the tag name
+ * through `GetRelease(repoID, tagName)` — a LOWER_TAG_NAME lookup with no
+ * is_tag filter (models/repo/release.go:219-227). The record kind splits the
+ * behavior: a non-tag row (a real release) is the DELETE route's 409 "a tag
+ * attached to a release cannot be deleted directly" (tag.go:265-268); a
+ * tag-only row (a converted release — R2's is_tag conversion) rides the
+ * delete to its full DeleteReleaseByID(delTag=true) cascade, ROW included
+ * (release.go:388-434). The CREATE route's duplicate gate is the same table
+ * read: CreateNewTag's `IsReleaseExist` (services/release/release.go:224-232)
+ * — ANY row for the lower name answers ErrTagAlreadyExists.
+ */
+async function findReleaseRecord(d1: D1Database, repoId: string, tagName: string) {
+  return drizzle(d1)
+    .select()
     .from(releases)
-    .where(and(eq(releases.repoId, repoId), eq(releases.tagName, tagName)))
+    .where(and(eq(releases.repoId, repoId), eq(releases.lowerTagName, tagName.toLowerCase())))
     .limit(1)
     .then((rows) => rows[0]);
-  return row !== undefined;
 }
 
 /** The wildcard siblings' Hono pattern — the runtime catch-all under the
@@ -193,7 +243,13 @@ async function deleteTagByName(c: Context<ApiEnv>, pair: RepositoryWithOwner, ta
   if (!(await canWriteRepository(c, pair))) {
     throw new ApiError(403, "user should have a permission to write to the target branch");
   }
-  if ((await hasRelease(c.env.DB, pair.repo.id, tagName))) {
+  // The release coupling (R3: the lower_tag_name lookup; upstream GetRelease
+  // → `!tag.IsTag` → 409, tag.go:247-268). A TAG-ONLY record (R2's is_tag
+  // conversion) does NOT conflict — upstream's delete proceeds through
+  // DeleteReleaseByID(delTag=true), which removes the record beside the ref
+  // (release.go:388-412) — the sweep runs after the ref CAS below.
+  const record = await findReleaseRecord(c.env.DB, pair.repo.id, tagName);
+  if (record !== undefined && !record.isTag) {
     throw new ApiError(409, "a tag attached to a release cannot be deleted directly");
   }
   const tip = refTipMap(await engineReads(c.env, pair.repo).listRefs()).get(tagRef(tagName));
@@ -213,6 +269,17 @@ async function deleteTagByName(c: Context<ApiEnv>, pair: RepositoryWithOwner, ta
   if (result.tag !== "deleted") {
     const error = deleteApiRefError(result);
     if (error !== null) throw error;
+  }
+  // The tag-only record goes WITH the ref (upstream's delTag=true branch:
+  // `git tag -d` then `DeleteByID[Release]`, release.go:388-412; the ledger
+  // R2 note "tags-API delete finds it"). Upstream's delTag arm deletes ONLY
+  // the row here (its attachment/reaction sweeps and the storage loop are
+  // shared tail code this bare tag-record delete rides too — a converted
+  // record's assets were already swept at the release delete that converted
+  // it, so the bare row delete is the complete cascade for the states our
+  // tree can reach).
+  if (record !== undefined && record.isTag) {
+    await drizzle(c.env.DB).delete(releases).where(eq(releases.id, record.id));
   }
   // Upstream's API tag delete fires the zero-commit `push` event too
   // (services/release/release.go:396-403 — PushCommits with
@@ -290,6 +357,66 @@ function wildcardRepoPath(c: Context<ApiEnv, typeof WILDCARD_ROUTE>): { owner: s
 // never fail the API write (§3.5's post-commit posture).
 // ---------------------------------------------------------------------------
 
+/**
+ * The CORRECTED zero-list `push` payload around a tag create (SPEC-0005 §2.3
+ * — upstream's git-push tag arm and the API surfaces' shared createTag
+ * emission, services/repository/push.go:115-138 + services/release/
+ * release.go:127-134; the W5 follow-up): a zero commit LIST with
+ * head_commit = the PEELED tip commit (push.go:124's GetCommit peel — the
+ * tag object for an annotated tag peels first) and
+ * `compare_url = compare/{zero}...{RAW tip}` (:125 — ComposeCompareURL over
+ * the PushUpdateOptions oids, the raw ref tip, NOT the peel). `after` is
+ * likewise the RAW ref tip (the PushUpdateOptions.NewCommitID — the tag
+ * object oid for an annotated tag), while the RELEASE surfaces pass their
+ * pre-peel commit oid (createTag's PushUpdateOptions carries
+ * commit.ID.String(), release.go:129-133) — the caller picks. The commit
+ * render is emitUserPushCreatedRef's exact shape (toPayloadCommit + the
+ * added/removed/modified enrichment, head_commit matched by id, null on a
+ * failed read — the push arm's dirty-data tolerance skips BOTH events there;
+ * here the write already committed, so the payload degrades instead).
+ * Exported for routes/releases.ts — upstream runs ONE createTag emission for
+ * both surfaces (the release create/edit paths share this function's shape).
+ */
+export async function tagCreatePushPayload(
+  c: Context<ApiEnv>,
+  pair: RepositoryWithOwner,
+  ref: string,
+  before: string,
+  after: string,
+  headCommitSha: string,
+): Promise<Record<string, unknown>> {
+  const origin = viewerOf(c).origin;
+  const sender = c.get("authUser") ?? null;
+  let headCommit: unknown = null;
+  try {
+    const commit = await engineReads(c.env, pair.repo).readCommit(headCommitSha);
+    if (commit !== null) {
+      const usernames = await usernamesByEmail(c.env.DB, [commit]);
+      const enriched = await enrichCommitsWithFileLists(
+        [{ ...toPayloadCommit(commit, pair, usernames, origin), id: commit.oid }],
+        (id) => engineReads(c.env, pair.repo).readDiff(id),
+      );
+      headCommit = enriched.commits[0] ?? null;
+    }
+  } catch (error) {
+    console.error(`[tags] tag-create push payload commit read failed (${headCommitSha}): ${
+      error instanceof Error ? error.message : String(error)
+    }`);
+  }
+  return {
+    ref,
+    before,
+    after,
+    compare_url: `${origin}/${compareUrl(pair, before, after)}`,
+    commits: [],
+    total_commits: 0,
+    head_commit: headCommit,
+    repository: toApiRepository(viewerOf(c), pair),
+    pusher: sender,
+    sender,
+  };
+}
+
 export function registerTagRoutes(
   app: OpenAPIHono<ApiEnv>,
   requireAuth: MiddlewareHandler<ApiEnv>,
@@ -323,7 +450,10 @@ export function registerTagRoutes(
     async (c) => {
       const pair = await requireVisibleRepo(c, c.req.valid("param"));
       const listOptions = parseListOptions(new URL(c.req.url));
-      const tags = await sortedTags(c, pair.repo);
+      // -*creatordate DESC (upstream GetTagInfos' sort, R9 — see
+      // tagsByCreatorDate), paginated AFTER the full sort exactly like
+      // upstream's PaginateSlice (repo_tag.go:149-151).
+      const tags = await tagsByCreatorDate(c, pair.repo);
       setPaginationHeaders(c, tags.length, listOptions);
       const start = (listOptions.page - 1) * listOptions.limit;
       const page = tags.slice(start, start + listOptions.limit);
@@ -388,8 +518,21 @@ export function registerTagRoutes(
       }
       const commitSha = resolved.commitSha;
 
+      // The duplicate gate, upstream's order (CreateTag → CreateNewTag's
+      // `IsReleaseExist` — models/repo/release.go:160-166's LOWER_TAG_NAME
+      // lookup over the releases table, ANY row kind, R3; answered
+      // ErrTagAlreadyExists → 409 `err.Error()` = "tag already exists
+      // [name: X]" (services/release/release.go:212-217 + tag.go:212-214,
+      // R16-a's suffix)). The git-ref existence arm below is our engine
+      // boundary's second gate (upstream rides a bare pushed ref with no
+      // releases row through createTag's IsTagExist — a divergence kept:
+      // this surface does not mint the is_tag record pushUpdateAddTags
+      // would) — the same upstream text.
+      if ((await findReleaseRecord(c.env.DB, pair.repo.id, name)) !== undefined) {
+        throw new ApiError(409, `tag already exists [name: ${name}]`);
+      }
       if (resolved.tips.has(tagRef(name))) {
-        throw new ApiError(409, "tag already exists");
+        throw new ApiError(409, `tag already exists [name: ${name}]`);
       }
 
       // Protected-tag enforcement on the create arm (upstream CreateTag →
@@ -414,7 +557,11 @@ export function registerTagRoutes(
         requestHost: new URL(c.req.url).hostname,
       });
       if (written.tag === "invalid") {
-        throw new ApiError(422, written.reason);
+        // ErrInvalidTagName is UNMAPPED on this surface (R16-d): upstream's
+        // handler forks only IsErrTagAlreadyExists (409) and
+        // IsErrProtectedTagName (422) out of CreateNewTag; everything else
+        // falls to ctx.APIErrorInternal → 500 (tag.go:211-222).
+        throw new Error(written.reason);
       }
       if (written.tag === "conflict") {
         throw written.error;
@@ -423,11 +570,13 @@ export function registerTagRoutes(
 
       // Upstream's API tag create fires the zero-commit `push` event around
       // the `create` event (services/release/release.go:136-143 — PushCommits
-      // :136 first, CreateRef :143; the mirror create path orders it the same
-      // way, mirror_pull.go:347-352). Before = the zero oid (nothing existed),
-      // after = the new ref tip — the TAG OBJECT oid for the annotated case,
-      // exactly what the create payload below pins as `sha`.
-      await emitRefWebhook(c, pair, "push", zeroCommitPushPayload(c, pair, tagRef(name), ZERO_OID, newTarget), tagRef(name));
+      // :136 first, CreateRef :143). The push payload is the §2.3 tag-create
+      // shape (tagCreatePushPayload, the W5 correction): before = the zero
+      // oid, after = the new ref tip — the TAG OBJECT oid for the annotated
+      // case — head_commit = the PEELED tip commit and
+      // compare/{zero}...{raw tip}; the create event's `sha` stays the raw
+      // tip (the push path's `Sha: refID` semantics, the module header).
+      await emitRefWebhook(c, pair, "push", await tagCreatePushPayload(c, pair, tagRef(name), ZERO_OID, newTarget, commitSha), tagRef(name));
 
       // Upstream CreateRef (notifier.go:821→:830): ref is the SHORT tag name
       // (never an oid — the annotated peel stays out of `ref`), ref_type
@@ -582,8 +731,13 @@ export function registerTagRoutes(
       const tags = await sortedTags(c, pair.repo);
       const tip = tags.find((tag) => tag.target === sha);
       if (tip === undefined || tip.peeled === undefined) {
-        // unknown oid or a lightweight tag (no peel on the refs row)
-        throw new ApiError(404, "not found");
+        // Unknown oid or a lightweight tag (no peel on the refs row) — BOTH
+        // answer the 400 (R15): upstream maps EVERY GetAnnotatedTag lookup
+        // failure to `ctx.APIError(400, err.Error())` (tag.go:113-118 — the
+        // bare "SHA not provided" 400 covers only the empty param; the
+        // GetAnnotatedTag/GetTagCommit errors ride the same 400 arm), so
+        // this route never 404s at runtime despite its declared 404.
+        throw new ApiError(400, "tag does not exist");
       }
       // The message + tagger arms ride readTag (the annotated tag OBJECT at
       // this sha) — upstream ToAnnotatedTag's MessageUTF8 + ToCommitUser.

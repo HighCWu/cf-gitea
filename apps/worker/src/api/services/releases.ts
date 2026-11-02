@@ -1,7 +1,7 @@
-import { and, desc, eq, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, inArray, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { releaseAssets, releases, users } from "../../db/schema";
+import { reactions, releaseAssets, releases, users } from "../../db/schema";
 import { ReleaseAlreadyExistError } from "../../issues/errors";
 import { IssuesService, type ReleaseRow } from "../../issues/service";
 import { isTagControlAllowed, listProtectedTags } from "../../services/tag-protection";
@@ -10,8 +10,8 @@ import type { ApiEnv } from "../env";
 import type { Release } from "../models/release";
 import type { User } from "../models/user";
 import { engineReads, refTipMap, tagRef } from "./engine";
-import { listReleaseAssets, toApiAttachment } from "./release-assets";
-import { apiUserFromRow, type RepositoryWithOwner, type Viewer } from "./repository";
+import { listReleaseAssets, toApiAttachment, type ReleaseAssetRow } from "./release-assets";
+import { apiUserFromRow, GO_ZERO_TIME, type RepositoryWithOwner, type Viewer } from "./repository";
 import { resolveTagTarget, writeTagRef, type TagCreator } from "./tags";
 
 /**
@@ -58,7 +58,15 @@ import { resolveTagTarget, writeTagRef, type TagCreator } from "./tags";
  *    UpdateRelease ("updated") unless the edit CREATED the tag or converted a
  *    tag record, in which case NewRelease ("published") fires (release.go:
  *    361-367);
- *  - delete: `DeleteReleaseByID` — the row plus its attachments;
+ *  - delete: `DeleteReleaseByID` (services/release/release.go:408-434) with
+ *    the API's delTag=false: the row is NOT dropped — `rel.IsTag = true`
+ *    is persisted (release.go:414-417) so a re-create keeps the id (the §2.3
+ *    conversion) and the tags-API delete lookup finds the record; beside it
+ *    the attachment ROWS go (DeleteAttachmentsByRelease), the release's
+ *    reactions go (release.go:425-429), and the R2 asset OBJECTS are swept
+ *    (the storage loop, release.go:431-434 — best-effort there, logged,
+ *    never failing the delete); the git tag is never touched (delTag=false's
+ *    whole point) — the ledger R2+R4 thread;
  *  - converter: `services/convert/release.go ToAPIRelease` + the Release URL
  *    methods (models/repo/release.go:130–155) — APIURL
  *    `{repo APIURL}/releases/{id}`, HTMLURL `{repo HTMLURL}/releases/tag/
@@ -67,7 +75,7 @@ import { resolveTagTarget, writeTagRef, type TagCreator } from "./tags";
  *    drafts; assets render the release's attachment rows (upstream
  *    LoadAttributes → GetReleaseAttachments — the R2 asset wave has landed:
  *    upload/list/edit/delete + serving all work; see toApiRelease's doc
- *    comment for the two pinned divergences).
+ *    comment for the converter's order/url notes).
  */
 
 /** The release-write gate's data dependency set (canAccessReleaseDraft). */
@@ -246,6 +254,23 @@ export async function findReleaseForRepoById(d1: D1Database, repoId: string, id:
 // absent). Without it every git-tag-shaped link for the release 404s.
 // ---------------------------------------------------------------------------
 
+/**
+ * `util.EllipsisDisplayString(s, limit)` (modules/util/truncate.go) —
+ * truncate to `limit - 1` runes and append "…" when past the limit. The
+ * release title's write-time form (CreateRelease's release.go:187 and the
+ * model UpdateRelease's models/repo/release.go:169-173 both apply it, R8);
+ * the rune-count port is the tree's landed shape (services/actions/
+ * model.ts ellipsisDisplayString, duplicated here to keep the actions
+ * module graph out of the releases service).
+ */
+function ellipsisDisplayString(s: string, limit: number): string {
+  const runes = Array.from(s);
+  if (runes.length <= limit) {
+    return s;
+  }
+  return runes.slice(0, Math.max(0, limit - 1)).join("") + "…";
+}
+
 export interface CreateReleaseWithGitTagInput {
   /** The worker bindings — the engine cell client's source. */
   env: ApiEnv["Bindings"];
@@ -277,9 +302,15 @@ export interface CreateReleaseWithGitTagResult {
   /** True when THIS call created the git tag (upstream createTag's `created`
    *  — drives the ref-webhook pair; an existing tag rides silently). */
   tagCreated: boolean;
-  /** The new ref's tip — the TAG OBJECT oid when annotated — the create
-   *  payload's `sha`. Defined only when tagCreated. */
+  /** The new ref's tip — the TAG OBJECT oid when annotated. Defined only
+   *  when tagCreated. Upstream's createTag notifications never carry this
+   *  oid (both PushCommits and CreateRef use the peeled commit, release.go:
+   *  131-143) — prefer `tagCommitSha` for the wire. */
   tagTip?: string;
+  /** The tagged COMMIT's oid (the fill's sha1) when the tag was created —
+   *  upstream's createTag emission oid (release.go:136/:143 both carry
+   *  `commit.ID.String()`, the pre-peel GetCommit resolution, R16-e). */
+  tagCommitSha?: string;
 }
 
 /**
@@ -396,14 +427,25 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
   const { pair } = input;
   const repoId = pair.repo.id;
 
+  // Upstream's IsReleaseExist (models/repo/release.go:160-166) — a
+  // lower_tag_name lookup with NO is_tag filter (R3): any row for the tag
+  // (release or tag-only record) counts; the handler splits the outcome by
+  // IsTag (release.go:288-310 — duplicate release → the 409, tag record →
+  // the §2.3 conversion).
   const existing = await drizzle(input.d1)
     .select()
     .from(releases)
-    .where(and(eq(releases.repoId, repoId), eq(releases.tagName, input.tagName)))
+    .where(and(eq(releases.repoId, repoId), eq(releases.lowerTagName, input.tagName.toLowerCase())))
     .get();
   if (existing !== undefined && !existing.isTag) {
-    throw new ReleaseAlreadyExistError(input.tagName);
+    throw new ReleaseAlreadyExistError(input.tagName); // 409 "Release is has no Tag" (release.go:292)
   }
+  // The conversion arm keeps the STORED tag-name spelling: upstream reaches
+  // it through the handler's loaded `rel` (GetRelease → the row's TagName)
+  // and never rewrites TagName there (release.go:288-310) — the git tag and
+  // the converted row both carry the original spelling, whatever case the
+  // request used (the lower_tag_name lookup above matched it caseless).
+  const tagName = existing !== undefined ? existing.tagName : input.tagName;
 
   // createTag's MustNotBeArchived arm (services/release/release.go:75-78),
   // in createTag's position: after the duplicate check (upstream's
@@ -421,22 +463,23 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
 
   let tagCreated = false;
   let tagTip: string | undefined;
+  let tagCommitSha: string | undefined;
   // The tagged COMMIT's oid — the fill's read target. Undefined = draft (no
   // tag, no fill).
   let taggedCommitSha: string | undefined;
   if (!input.isDraft) {
     const tips = refTipMap(await engineReads(input.env, pair.repo).listRefs());
-    const existingTip = tips.get(tagRef(input.tagName));
+    const existingTip = tips.get(tagRef(tagName));
     if (existingTip === undefined) {
-      if (!(await isTagControlAllowed(input.d1, await listProtectedTags(input.d1, repoId), input.tagName, input.doer?.id ?? 0))) {
-        throw new ApiError(422, `release tag name is protected [tag_name: ${input.tagName}]`);
+      if (!(await isTagControlAllowed(input.d1, await listProtectedTags(input.d1, repoId), tagName, input.doer?.id ?? 0))) {
+        throw new ApiError(422, `release tag name is protected [tag_name: ${tagName}]`);
       }
       const resolved = await resolveTagTarget(input.env, pair.repo, input.targetCommitish);
       if (resolved.tag === "not-found") {
         throw new ApiError(404, "target not found");
       }
       const written = await writeTagRef(input.env, pair.repo, {
-        name: input.tagName,
+        name: tagName,
         commitSha: resolved.commitSha,
         message: input.tagMessage,
         doer: input.doer,
@@ -451,6 +494,7 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
       tagCreated = true;
       tagTip = written.refTip;
       taggedCommitSha = written.commitSha; // already the peeled commit (resolveTagTarget)
+      tagCommitSha = written.commitSha; // upstream's createTag emission oid (release.go:136/:143)
     } else {
       // The ride arm: the ref's tip peeled to its commit — an annotated tag
       // carries the engine's peel cache (`peeled`), a lightweight tag's
@@ -467,21 +511,36 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
     fill = await readTaggedCommitFill(engineReads(input.env, pair.repo), taggedCommitSha);
   }
 
+  // The row's `target`: the FRESH arm stores the handler's defaulted
+  // `form.Target` (release.go:260-265 — `If len(form.Target) == 0 →
+  // DefaultBranch` runs inside the not-exist branch, before the rel is
+  // built); the CONVERSION arm stores `form.Target` VERBATIM (release.go:303
+  // — `rel.Target = form.Target`, no IfZero on the else arm, R16-b), so an
+  // absent target_commitish lands "" there and createTag's own
+  // `IfZero(rel.Target, DefaultBranch)` (release.go:104) still resolves the
+  // tag write.
   const target =
-    input.targetCommitish !== undefined && input.targetCommitish !== "" ? input.targetCommitish : pair.repo.defaultBranch;
+    existing !== undefined
+      ? (input.targetCommitish ?? "")
+      : input.targetCommitish !== undefined && input.targetCommitish !== ""
+        ? input.targetCommitish
+        : pair.repo.defaultBranch;
+  // CreateRelease's title ellipsis (release.go:187 — `util.EllipsisDisplay-
+  // String(rel.Title, 255)` before the insert; R8).
+  const title = ellipsisDisplayString(input.title, 255);
   const row = await new IssuesService(input.d1).createRelease({
     repoId,
     publisherId: input.publisherId,
-    tagName: input.tagName,
+    tagName,
     target,
-    title: input.title,
+    title,
     note: input.note,
     isDraft: input.isDraft,
     isPrerelease: input.isPrerelease,
   });
 
   if (fill === undefined) {
-    return { row, tagCreated, tagTip };
+    return { row, tagCreated, tagTip, tagCommitSha };
   }
   // The fill write (the shared-writer residual — see step 4 above): the
   // returned row already carries sha1/num_commits/created_unix for the
@@ -491,7 +550,7 @@ export async function createReleaseWithGitTag(input: CreateReleaseWithGitTagInpu
     .set({ sha1: fill.sha1, numCommits: fill.numCommits, createdAt: fill.createdAt })
     .where(eq(releases.id, row.id))
     .returning();
-  return { row: filled[0] ?? row, tagCreated, tagTip };
+  return { row: filled[0] ?? row, tagCreated, tagTip, tagCommitSha };
 }
 
 export interface EditReleasePatch {
@@ -662,7 +721,9 @@ export async function editRelease(input: EditReleaseTagContext & {
       tagName,
       lowerTagName: tagName.toLowerCase(), // release.go:273 — unconditional
       target,
-      title: patch.title ?? row.title,
+      // The model UpdateRelease ellipsifies the title on EVERY update
+      // (models/repo/release.go:169-173 — R8).
+      title: ellipsisDisplayString(patch.title ?? row.title, 255),
       note: patch.note ?? row.note,
       isDraft,
       isPrerelease: patch.isPrerelease ?? row.isPrerelease,
@@ -678,14 +739,112 @@ export async function editRelease(input: EditReleaseTagContext & {
   return { row: rows[0] ?? null, tagCreated };
 }
 
+/** The R2 slice the R2-object sweep reads (routes/ui callers pass `env`). */
+export interface ReleaseDeleteEnv {
+  /** The asset-object bucket (SPEC-0005 §3.3; undefined = no sweep — the
+   *  tests' posture; production always binds it). */
+  REPO_PACKS?: R2Bucket | null;
+}
+
+export interface DeleteReleaseResult {
+  /**
+   * The asset rows as they were BEFORE the delete — the delete webhook's
+   * payload carries them (upstream's DeleteReleaseByID loads Attachments in
+   * LoadAttributes BEFORE DeleteAttachmentsByRelease wipes the rows,
+   * release.go:418-421, so the notification still renders them).
+   */
+  assets: ReleaseAssetRow[];
+}
+
 /**
- * `DeleteReleaseByID` — the release row and its asset rows in one batch (the
- * R2 blobs follow the asset wave; the D1 cascade is complete).
+ * `DeleteReleaseByID` with the API's delTag=false (services/release/
+ * release.go:408-434) — the ledger R2+R4 thread. The row is NOT dropped:
+ * `rel.IsTag = true` is persisted (release.go:414-417) so the id survives a
+ * re-create (the §2.3 conversion) and the tags-API delete's GetRelease
+ * lookup still finds the record; the release's attachment ROWS go
+ * (DeleteAttachmentsByRelease, :421-424), the release's REACTIONS go
+ * (:425-429), and the R2 asset OBJECTS are swept (the storage loop,
+ * :431-434 — best-effort: a failed object delete logs and moves on, the D1
+ * state is already authoritative). The git tag is untouched (delTag=false).
+ * One D1 batch (the row conversion + the attachment/reaction deletes);
+ * upstream orders the conversion first, the sweeps after — same net state.
  */
-export async function deleteRelease(d1: D1Database, row: ReleaseRow): Promise<void> {
+export async function deleteRelease(env: ReleaseDeleteEnv, d1: D1Database, row: ReleaseRow): Promise<DeleteReleaseResult> {
+  const assets = await listReleaseAssets(d1, row.id);
   await drizzle(d1).batch([
     drizzle(d1).delete(releaseAssets).where(eq(releaseAssets.releaseId, row.id)),
-    drizzle(d1).delete(releases).where(eq(releases.id, row.id)),
+    // release.go:425-429 — `DeleteByBean(&Reaction{ReleaseID: rel.ID})`.
+    drizzle(d1).delete(reactions).where(eq(reactions.releaseId, row.id)),
+    // release.go:414-417 — the is_tag conversion keeps the row (and its id).
+    drizzle(d1)
+      .update(releases)
+      .set({ isTag: true })
+      .where(eq(releases.id, row.id)),
+  ]);
+  // The R2 sweep (release.go:431-434's storage loop): per-object best-effort
+  // — a failed delete logs and continues, exactly upstream's "Even delete
+  // files failed ... should not return error but only record the error on
+  // logs" posture.
+  const bucket = env.REPO_PACKS;
+  if (bucket !== undefined && bucket !== null) {
+    for (const asset of assets) {
+      try {
+        await bucket.delete(asset.r2Key);
+      } catch (error) {
+        console.error(
+          `[releases] asset object sweep failed (release ${row.id}, key ${asset.r2Key}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+  }
+  return { assets };
+}
+
+/**
+ * `DeleteReleaseByID`'s delTag=true row arm (services/release/release.go:
+ * 399-403 — `db.DeleteByID[Release](rel.ID)`): drop the bare tag-record row.
+ * The tags-API delete reaches this after the ref CAS; the attachment/
+ * reaction/storage sweeps are the shared tail a bare tag record rides empty
+ * (its assets went with the release delete that converted it).
+ */
+export async function deleteTagRecord(d1: D1Database, row: ReleaseRow): Promise<void> {
+  await drizzle(d1).delete(releases).where(eq(releases.id, row.id));
+}
+
+/**
+ * `PushUpdateDeleteTags` (models/repo/release.go:465-492, reached from
+ * services/repository/push.go:317's PushUpdateAddDeleteTags): the GIT-PUSH
+ * tag-deletion lifecycle, the R5 arm. Upstream's shape, statement for
+ * statement: the tag-only records for the lowered names are DELETED
+ * (`is_tag = true` rows — a converted release's record is the tags-API's
+ * addressable leftover and dies with its tag), and the REAL releases are
+ * DRAFT-FLIPPED — `Update(&Release{IsDraft: true})` over
+ * `Cols("is_draft", "num_commits", "sha1", "published_unix")`, i.e. the
+ * zero-value columns go with the draft flag (num_commits 0, sha1 "",
+ * published_unix 0): the release row SURVIVES its tag, withdrawn back to
+ * draft, ready for a re-create (the §2.3 conversion keeps the id). The
+ * lookup is `lower_tag_name IN` — case-insensitive like every release
+ * resolution (R3). Upstream receives the tags from the hook's applied
+ * command list; the git-http gate tail passes the tags a push ACTUALLY
+ * deleted (verified against the post-commit refs). Idempotent: deleting
+ * missing rows and re-flipping already-draft releases are no-ops.
+ */
+export async function pushUpdateDeleteTags(d1: D1Database, repoId: string, tags: string[]): Promise<void> {
+  const lowerTags = [...new Set(tags.map((tag) => tag.toLowerCase()))];
+  if (lowerTags.length === 0) return;
+  await drizzle(d1).batch([
+    // release.go:471-478 — the is_tag=true rows die with their tag.
+    drizzle(d1)
+      .delete(releases)
+      .where(and(eq(releases.repoId, repoId), eq(releases.isTag, true), inArray(releases.lowerTagName, lowerTags))),
+    // release.go:480-490 — the real releases withdraw to draft with the
+    // zero-valued Cols (num_commits, sha1, published_unix).
+    drizzle(d1)
+      .update(releases)
+      .set({ isDraft: true, numCommits: 0, sha1: "", publishedUnix: 0 })
+      .where(and(eq(releases.repoId, repoId), eq(releases.isTag, false), inArray(releases.lowerTagName, lowerTags))),
   ]);
 }
 
@@ -732,38 +891,129 @@ function releaseUrls(pair: RepositoryWithOwner, origin: string, row: ReleaseRow)
 }
 
 /**
+ * The Ghost publisher's wire render (upstream NewGhostUser,
+ * models/user/user_system.go:19-25 — ID -1, "Ghost" — through ToAuthor →
+ * toUser; R6). LoadAttributes swaps a missing publisher row for the Ghost
+ * (models/repo/release.go:116-125), so a release whose publisher row is
+ * gone renders the ghost identity instead of `author: null`. Fields follow
+ * the canonical apiUserFromRow projection at the zero-row values (the
+ * ghost's CreatedUnix/LastLogin are the Go zero time; the placeholder
+ * email follows the tree's fixed noreply stand-in).
+ */
+function ghostApiUser(origin: string): User {
+  return {
+    id: -1,
+    login: "Ghost",
+    username: "Ghost",
+    type: "User",
+    login_name: "",
+    source_id: 0,
+    full_name: "",
+    email: "-1+ghost@users.noreply.gitea.invalid",
+    avatar_url: `${origin}/avatars/ghost`,
+    html_url: `${origin}/Ghost`,
+    language: "",
+    is_admin: false,
+    last_login: GO_ZERO_TIME,
+    created: GO_ZERO_TIME,
+    restricted: false,
+    active: false,
+    prohibit_login: false,
+    location: "",
+    website: "",
+    description: "",
+    visibility: "public",
+    followers_count: 0,
+    following_count: 0,
+    starred_repos_count: 0,
+  };
+}
+
+/**
+ * `hasDuplicateName` (models/repo/release.go:421-428) — true when any name
+ * repeats within the release's asset set. Drives the R13 download-url flip:
+ * unique names → the name-based URL, duplicates → the uuid shape.
+ */
+function hasDuplicateName(assets: ReleaseAssetRow[]): boolean {
+  const seen = new Set<string>();
+  for (const asset of assets) {
+    if (seen.has(asset.name)) return true;
+    seen.add(asset.name);
+  }
+  return false;
+}
+
+/**
+ * The R13 name-based download-url builder: `release.Repo.HTMLURL() +
+ * /releases/download/ + PathEscape(tag) + / + PathEscape(name)` (models/repo/
+ * release.go:430-443's CustomDownloadURL assignment), returned ONLY when the
+ * release's asset names are unique — `undefined` means the caller keeps the
+ * uuid shape (upstream's DownloadURL fallback). Shared by toApiRelease (which
+ * unwraps its RepositoryWithOwner to the repo row) and the UI asset rows
+ * (list.tmpl renders `$att.DownloadURL` — the same flip); both pass the flat
+ * repo row (`ownerNamespace`/`slug`), the HTMLURL() stand-in.
+ */
+export function uniqueNameDownloadUrlBuilder(
+  origin: string,
+  pair: { ownerNamespace: string; slug: string },
+  tagName: string,
+  assets: ReleaseAssetRow[],
+): ((name: string) => string) | undefined {
+  if (hasDuplicateName(assets)) {
+    return undefined;
+  }
+  const base = `${origin}/${encodeURIComponent(pair.ownerNamespace)}/${encodeURIComponent(pair.slug)}/releases/download/${encodeURIComponent(tagName)}`;
+  return (name: string) => `${base}/${encodeURIComponent(name)}`;
+}
+
+/**
  * `convert.ToAPIRelease` — the publisher row is fetched per render (upstream
  * `release.LoadAttributes` + `ToAuthor`) and the release's attachment rows
  * ride along: LoadAttributes ends in GetReleaseAttachments (models/repo/
  * release.go:111-127, :389-449), rendered here through the attachment-list
  * route's own converter (`toApiAttachment`) over the route's own read
- * (`listReleaseAssets`) — every caller of this converter (list, latest,
- * by-tag, by-id, the `release` webhook payload, the UI form writes' webhook
- * leg) gets the assets for free. A deleted release's asset rows go with the
- * row (deleteRelease's batch), so a render can never orphan; the read
- * touches D1 rows only — no R2 interaction.
+ * (`listReleaseAssets`, the `Asc(release_id, name)` order — R14/R1-a) —
+ * every caller of this converter (list, latest, by-tag, by-id, the `release`
+ * webhook payload, the UI form writes' webhook leg) gets the assets for
+ * free. `assets` may be PRELOADED by a caller that read the rows before a
+ * delete wiped them (deleteRelease returns them: upstream's delete
+ * notification renders the Attachments it loaded before
+ * DeleteAttachmentsByRelease) — the read is skipped when set. A deleted
+ * release's asset rows go with the conversion (deleteRelease's batch), so a
+ * live render can never orphan; the read touches D1 rows only — no R2
+ * interaction.
  *
- * Two pinned divergences from upstream's GetReleaseAttachments/
- * ToAPIAttachments:
- *  - order: ours is asset-id ASC (listReleaseAssets — primary-key order,
- *    the attachment-list route's read); upstream orders
- *    `Asc("release_id", "name")` (release.go:417).
- *  - `browser_download_url` keeps the uuid shape (`/attachments/{uuid}`);
- *    upstream prefers `/releases/download/{tag}/{name}` when a release's
- *    asset names are unique (GetReleaseAttachments' CustomDownloadURL,
- *    release.go:443, consumed by Attachment.DownloadURL) — the release
- *    review's R13 finding; the flip rides the v1.5.2 wave together with
- *    the order pin.
+ * `browser_download_url` is upstream's CustomDownloadURL flip (R13/QW-3,
+ * models/repo/release.go:430-443): when a release's asset NAMES are unique
+ * (`hasDuplicateName`), every attachment renders
+ * `{repo HTMLURL}/releases/download/{tag}/{name}`; on duplicates the uuid
+ * shape (`/attachments/{uuid}`) stands in, exactly upstream's
+ * DownloadURL fallback (models/repo/attachment.go:66-74).
+ *
+ * A missing publisher row renders the Ghost identity (R6 — upstream
+ * LoadAttributes' `NewGhostUser()` arm, models/repo/release.go:116-125),
+ * never `author: null`.
  */
-export async function toApiRelease(d1: D1Database, viewer: Viewer, pair: RepositoryWithOwner, row: ReleaseRow): Promise<Release> {
+export async function toApiRelease(
+  d1: D1Database,
+  viewer: Viewer,
+  pair: RepositoryWithOwner,
+  row: ReleaseRow,
+  assets?: ReleaseAssetRow[],
+): Promise<Release> {
   const [publisherRow, assetRows] = await Promise.all([
     row.publisherId > 0
       ? drizzle(d1).select().from(users).where(eq(users.id, row.publisherId)).get()
       : Promise.resolve(undefined),
-    listReleaseAssets(d1, row.id),
+    assets !== undefined ? Promise.resolve(assets) : listReleaseAssets(d1, row.id),
   ]);
-  const author: User | null = publisherRow === undefined ? null : apiUserFromRow(publisherRow, viewer);
+  // Upstream LoadAttributes: `IsErrUserNotExist → NewGhostUser()` (the nil
+  // row becomes the ghost) — an author is ALWAYS rendered.
+  const author: User = publisherRow === undefined ? ghostApiUser(viewer.origin) : apiUserFromRow(publisherRow, viewer);
   const urls = releaseUrls(pair, viewer.origin, row);
+  // The unique-name flip (R13): computed over THIS release's asset set,
+  // GetReleaseAttachments' per-release loop (release.go:430-443).
+  const downloadUrl = uniqueNameDownloadUrlBuilder(viewer.origin, pair.repo, row.tagName, assetRows);
   return {
     id: row.id,
     tag_name: row.tagName,
@@ -780,6 +1030,6 @@ export async function toApiRelease(d1: D1Database, viewer: Viewer, pair: Reposit
     created_at: isoOrZero(row.createdAt),
     published_at: row.isDraft ? null : row.publishedUnix === 0 ? null : new Date(row.publishedUnix * 1000).toISOString(),
     author,
-    assets: assetRows.map((assetRow) => toApiAttachment(viewer.origin, assetRow)),
+    assets: assetRows.map((assetRow) => toApiAttachment(viewer.origin, assetRow, downloadUrl?.(assetRow.name))),
   };
 }

@@ -471,7 +471,7 @@ describe("the cross-origin 403s (sameOriginGuard fronts the new/edit/delete arms
       "https://test.local/relmx-owner/rel/releases/edit/v1",
     );
     expect(ownRef.status).toBe(303);
-    expect(await findReleaseByTag(env.DB, repo.id, "v1")).toBeNull();
+    expect((await findReleaseByTag(env.DB, repo.id, "v1"))?.isTag).toBe(true); // R2's conversion
   });
 });
 
@@ -711,8 +711,10 @@ describe("the delete arms (cascade + webhook scope + junk carriers)", () => {
     expect(res.headers.get("location")).toBe(
       `/relmx-owner/rel/releases?deleted=${encodeURIComponent("Rel v1")}`,
     );
-    // The batch cascade: the release row AND its asset rows are gone.
-    expect(await findReleaseByTag(env.DB, repo.id, "v1")).toBeNull();
+    // The batch cascade: the asset rows are gone and the row CONVERTED to
+    // the tag-only record (R2 — DeleteReleaseByID's delTag=false is_tag flip;
+    // a re-create keeps the id, the tags-API delete finds it).
+    expect((await findReleaseByTag(env.DB, repo.id, "v1"))?.isTag).toBe(true);
     expect(
       (await drizzle(env.DB).select({ id: releaseAssets.id }).from(releaseAssets).where(eq(releaseAssets.releaseId, seeded.id)).all())
         .length,
@@ -739,7 +741,7 @@ describe("the delete arms (cascade + webhook scope + junk carriers)", () => {
     expect(res.headers.get("location")).toBe(
       `/relmx-owner/rel/releases?deleted=${encodeURIComponent("Hushed draft")}`,
     );
-    expect(await findReleaseByTag(env.DB, repo.id, "hush")).toBeNull();
+    expect((await findReleaseByTag(env.DB, repo.id, "hush"))?.isTag).toBe(true); // R2's conversion
     expect(await releaseDeliveries()).toEqual([]);
   });
 
@@ -923,9 +925,11 @@ describe("the release-detail render shapes (w129 batch-10: tag links, attachment
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('<li class="item">');
+    // R13: a unique asset name renders the name-based download URL
+    // (list.tmpl's $att.DownloadURL → CustomDownloadURL).
     expect(html).toMatch(
       new RegExp(
-        `<a target="_blank" class="tw-flex-1 gt-ellipsis" rel="nofollow" download="" href="https://test\\.local/attachments/${asset.uuid}">`,
+        `<a target="_blank" class="tw-flex-1 gt-ellipsis" rel="nofollow" download="" href="https://test\\.local/relmx-owner/rel/releases/download/v1/notes\\.txt">`,
       ),
     );
     expect(html).toContain("octicon-package");

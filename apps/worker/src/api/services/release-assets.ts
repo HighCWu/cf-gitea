@@ -113,22 +113,33 @@ function sanitizeAssetNameSegment(name: string): string {
   return cleaned.length > 0 ? cleaned : "asset";
 }
 
-/** List a release's assets in id order (upstream Find → primary-key order). */
+/**
+ * List a release's assets in upstream GetReleaseAttachments' order —
+ * `Asc("release_id", "name")` (models/repo/release.go:415-420, the `:417`
+ * Asc; R14/R1-a): within one release that is name-ascending (the release_id
+ * head is shared). Upstream leaves the tail unordered beyond the two keys;
+ * SQLite's rowid order fills the name ties the same way here.
+ */
 export async function listReleaseAssets(d1: D1Database, releaseId: number): Promise<ReleaseAssetRow[]> {
   return drizzle(d1)
     .select()
     .from(releaseAssets)
     .where(eq(releaseAssets.releaseId, releaseId))
-    .orderBy(asc(releaseAssets.id))
+    .orderBy(asc(releaseAssets.releaseId), asc(releaseAssets.name))
     .all();
 }
 
 /**
  * `convert.toAttachment` → the contract `Attachment`. `browser_download_url`
- * is upstream's Attachment.DownloadURL: AppSubURL (empty) + /attachments/ +
- * the path-escaped uuid, made absolute against the request origin.
+ * is upstream's Attachment.DownloadURL (models/repo/attachment.go:66-74):
+ * `CustomDownloadURL` when one was set, else AppSubURL (empty) +
+ * /attachments/ + the path-escaped uuid, absolute against the request
+ * origin. The custom arm is the caller's input — upstream sets it in
+ * GetReleaseAttachments when a release's asset names are unique
+ * (hasDuplicateName, release.go:421-443): `{repo HTMLURL}/releases/download/
+ * {tag}/{name}` (R13); absent → the uuid shape.
  */
-export function toApiAttachment(origin: string, row: ReleaseAssetRow): Attachment {
+export function toApiAttachment(origin: string, row: ReleaseAssetRow, downloadUrl?: string): Attachment {
   return {
     id: row.id,
     name: row.name,
@@ -136,7 +147,7 @@ export function toApiAttachment(origin: string, row: ReleaseAssetRow): Attachmen
     download_count: row.downloadCount,
     size: row.size,
     uuid: row.uuid,
-    browser_download_url: `${origin}/attachments/${encodeURIComponent(row.uuid)}`,
+    browser_download_url: downloadUrl ?? `${origin}/attachments/${encodeURIComponent(row.uuid)}`,
   };
 }
 

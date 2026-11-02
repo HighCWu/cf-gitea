@@ -294,7 +294,7 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
     expect(body.assets).toEqual([]);
   });
 
-  it("409s a duplicate tag with the upstream ReleaseAlreadyExist message", async () => {
+  it("409s a duplicate tag with the upstream handler message (R7 — 'Release is has no Tag', release.go:292)", async () => {
     await seedRelease({ tag: "v1.0.0" });
     const res = await makeApp()(`${REPO_PATH}/releases`, {
       method: "POST",
@@ -302,7 +302,18 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
       body: JSON.stringify({ tag_name: "v1.0.0" }),
     });
     expect(res.status).toBe(409);
-    expect(await res.json()).toEqual({ message: "release tag already exist [tag_name: v1.0.0]", url: ERROR_URL });
+    expect(await res.json()).toEqual({ message: "Release is has no Tag", url: ERROR_URL });
+  });
+
+  it("409s a case-variant duplicate through the lower_tag_name lookup (R3)", async () => {
+    await seedRelease({ tag: "v1.0.0" });
+    const res = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "V1.0.0" }),
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ message: "Release is has no Tag", url: ERROR_URL });
   });
 
   it("converts a tag-only record on the same tag (§2.3)", async () => {
@@ -388,7 +399,7 @@ describe("POST /repos/{owner}/{repo}/releases (repoCreateRelease)", () => {
       body: JSON.stringify({ tag_name: "v1.0.0" }),
     });
     expect(res.status).toBe(409);
-    expect(await res.json()).toEqual({ message: "release tag already exist [tag_name: v1.0.0]", url: ERROR_URL });
+    expect(await res.json()).toEqual({ message: "Release is has no Tag", url: ERROR_URL });
   });
 
   it("401s an anonymous caller", async () => {
@@ -947,7 +958,7 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
     expect((await makeApp()(`${REPO_PATH}/releases/${tagOnlyId}`, { method: "PATCH", headers: jsonAuth, body: "{}" })).status).toBe(404);
   });
 
-  it("deletes by id with the asset rows", async () => {
+  it("delete CONVERTS the row to is_tag=true and sweeps the asset rows (R2/R4 — DeleteReleaseByID delTag=false)", async () => {
     await drizzle(env.DB).insert(releaseAssets).values({
       uuid: "u-1",
       repoId: "7301",
@@ -958,8 +969,49 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
       createdAt: new Date(),
     });
     expect((await makeApp()(`${REPO_PATH}/releases/${releaseId}`, { method: "DELETE", headers: jsonAuth })).status).toBe(204);
-    expect(await drizzle(env.DB).select().from(releases).where(eq(releases.id, releaseId)).all()).toEqual([]);
+    // The row SURVIVES as the tag-only record (release.go:414-417) — a
+    // re-create keeps the id and the tags-API delete finds it.
+    const converted = await drizzle(env.DB).select().from(releases).where(eq(releases.id, releaseId)).all();
+    expect(converted).toHaveLength(1);
+    expect(converted[0]?.isTag).toBe(true);
+    expect(converted[0]?.tagName).toBe("v1");
+    // The attachment rows went (DeleteAttachmentsByRelease).
     expect(await drizzle(env.DB).select().from(releaseAssets).where(eq(releaseAssets.releaseId, releaseId)).all()).toEqual([]);
+    // The converted record no longer renders as a release ...
+    expect((await makeApp()(`${REPO_PATH}/releases/${releaseId}`, { headers: jsonAuth })).status).toBe(404);
+    // ... and a re-create CONVERTS it back, keeping the id (the §2.3 arm).
+    const reborn = await makeApp()(`${REPO_PATH}/releases`, {
+      method: "POST",
+      headers: jsonAuth,
+      body: JSON.stringify({ tag_name: "v1", name: "Reborn" }),
+    });
+    expect(reborn.status).toBe(201);
+    expect((await reborn.json<Record<string, unknown>>()).id).toBe(releaseId);
+  });
+
+  it("the tags-API delete finds the CONVERTED record and drops the row beside the ref (R2's tail — delTag=true)", async () => {
+    // A real git ref for v1 (seedRelease writes the D1 row only) — the
+    // tags-API delete needs the ref to CAS. Idempotent across runs: create
+    // only when absent.
+    const cell = env.REPO.getByName("cf-gitea-stub/rel");
+    const existing = (await cell.listRefs()).refs ?? [];
+    if (!existing.some((ref) => ref.name === tagRef("v1"))) {
+      const landed = await cell.commitApiChange({ ref: tagRef("v1"), expectedOldOid: ZERO_OID, newOid: MAIN_TIP });
+      if (landed.tag !== "committed") throw new Error(`v1 ref seed failed: ${landed.tag}`);
+    }
+    try {
+      // The release delete CONVERTS (delTag=false) — see the pin above.
+      expect((await makeApp()(`${REPO_PATH}/releases/${releaseId}`, { method: "DELETE", headers: jsonAuth })).status).toBe(204);
+      const converted = await drizzle(env.DB).select().from(releases).where(eq(releases.id, releaseId)).get();
+      expect(converted?.isTag).toBe(true);
+      // The tags-API delete: a REAL release answers 409; the tag-only record
+      // rides the delete to its delTag=true row arm (release.go:388-412) —
+      // ref gone, ROW gone.
+      expect((await makeApp()(`${REPO_PATH}/tags/v1`, { method: "DELETE", headers: jsonAuth })).status).toBe(204);
+      expect(await drizzle(env.DB).select().from(releases).where(eq(releases.id, releaseId)).all()).toEqual([]);
+    } finally {
+      await deleteTagRef("v1");
+    }
   });
 
   it("404s the DELETE on a missing/tag-only release and 401s anonymously", async () => {
@@ -976,14 +1028,16 @@ describe("GET/PATCH/DELETE /repos/{owner}/{repo}/releases/{id} (global id, repo-
 // list, latest, by-tag, by-id — carries the release's attachment rows.
 // Pinned in OUR renderer's order (asset-id ascending — the attachment-list
 // route's own read via listReleaseAssets); upstream orders by name
-// (release.go:417). browser_download_url keeps the uuid shape (upstream's
-// unique-name /releases/download/{tag}/{name} — the release review's R13
-// finding — rides the v1.5.2 wave).
+// (release.go:417) — ours matches since R14/R1-a. browser_download_url is
+// upstream's CustomDownloadURL flip (R13, release.go:430-443): unique asset
+// names render /releases/download/{tag}/{name}, duplicates keep the uuid
+// /attachments/{uuid} shape (hasDuplicateName's fallback).
 // ---------------------------------------------------------------------------
 
 /** Two assets on one release, seeded so id order and name order DISAGREE
- *  (the first row carries the later name): the render pins id order (ours),
- *  not upstream's name order. */
+ *  (the first row carries the later name): the render pins the UPSTREAM
+ *  name order (the Asc(release_id, name) read — R14), which disagreeing id
+ *  order proves the read re-ordered. */
 async function seedAssets(releaseId: number): Promise<void> {
   await drizzle(env.DB).insert(releaseAssets).values([
     {
@@ -1018,27 +1072,30 @@ describe("release assets render in the release payloads (ToAPIRelease attachment
     await seedAssets(assetReleaseId);
   });
 
-  it("GET by id renders both assets (id order — ours; upstream orders by name)", async () => {
+  it("GET by id renders both assets (name order — upstream's Asc(release_id,name), R14) with the unique-name download URLs (R13)", async () => {
     const res = await makeApp()(`${REPO_PATH}/releases/${assetReleaseId}`);
     expect(res.status).toBe(200);
     const body = await res.json<{
       assets: Array<{ id: number; name: string; uuid: string; size: number; download_count: number; browser_download_url: string }>;
     }>();
-    expect(body.assets.map((a) => a.name)).toEqual(["zeta.zip", "alpha.zip"]); // id order, NOT upstream's name order
-    expect(body.assets.map((a) => a.uuid)).toEqual(["asset-u-late-name", "asset-u-early-name"]);
+    expect(body.assets.map((a) => a.name)).toEqual(["alpha.zip", "zeta.zip"]); // name asc, NOT the seeded id order
+    expect(body.assets.map((a) => a.uuid)).toEqual(["asset-u-early-name", "asset-u-late-name"]);
+    // The unique names ride upstream's CustomDownloadURL shape
+    // (`{repo HTMLURL}/releases/download/{tag}/{name}`).
     expect(body.assets[0]).toMatchObject({
-      size: 30,
+      size: 20,
       download_count: 0,
-      browser_download_url: "https://example.com/attachments/asset-u-late-name", // the uuid shape (R13 pending)
+      browser_download_url: "https://example.com/cf-gitea-stub/rel/releases/download/asset-v1/alpha.zip",
     });
+    expect(body.assets[1]?.browser_download_url).toBe("https://example.com/cf-gitea-stub/rel/releases/download/asset-v1/zeta.zip");
   });
 
   it("GET by tag renders both assets", async () => {
     const res = await makeApp()(`${REPO_PATH}/releases/tags/asset-v1`);
     expect(res.status).toBe(200);
     expect((await res.json<{ assets: Array<{ name: string }> }>()).assets.map((a) => a.name)).toEqual([
-      "zeta.zip",
       "alpha.zip",
+      "zeta.zip",
     ]);
   });
 
@@ -1047,7 +1104,7 @@ describe("release assets render in the release payloads (ToAPIRelease attachment
     expect(res.status).toBe(200);
     const body = await res.json<Array<{ tag_name: string; assets: Array<{ name: string }> }>>();
     const assetsByTag = Object.fromEntries(body.map((r) => [r.tag_name, r.assets.map((a) => a.name)]));
-    expect(assetsByTag["asset-v1"]).toEqual(["zeta.zip", "alpha.zip"]);
+    expect(assetsByTag["asset-v1"]).toEqual(["alpha.zip", "zeta.zip"]);
     expect(assetsByTag["plain-v1"]).toEqual([]);
   });
 
@@ -1056,7 +1113,27 @@ describe("release assets render in the release payloads (ToAPIRelease attachment
     expect(res.status).toBe(200);
     const body = await res.json<{ tag_name: string; assets: Array<{ name: string }> }>();
     expect(body.tag_name).toBe("asset-v1");
-    expect(body.assets.map((a) => a.name)).toEqual(["zeta.zip", "alpha.zip"]);
+    expect(body.assets.map((a) => a.name)).toEqual(["alpha.zip", "zeta.zip"]);
+  });
+
+  it("DUPLICATE asset names fall back to the uuid download shape (R13's hasDuplicateName gate, release.go:421-428)", async () => {
+    await drizzle(env.DB).insert(releaseAssets).values({
+      uuid: "asset-u-dup",
+      repoId: "7301",
+      releaseId: assetReleaseId,
+      name: "alpha.zip", // repeats the early-name asset
+      size: 5,
+      r2Key: "repos/r_7301/release-assets/asset-u-dup",
+      createdAt: new Date(),
+    });
+    const res = await makeApp()(`${REPO_PATH}/releases/${assetReleaseId}`);
+    expect(res.status).toBe(200);
+    const body = await res.json<{ assets: Array<{ name: string; uuid: string; browser_download_url: string }> }>();
+    // all three render the uuid shape — the gate is per-RELEASE, not per-row
+    for (const asset of body.assets) {
+      expect(asset.browser_download_url).toBe(`https://example.com/attachments/${asset.uuid}`);
+    }
+    expect(body.assets.map((a) => a.name)).toEqual(["alpha.zip", "alpha.zip", "zeta.zip"]); // name asc with the tie
   });
 });
 
@@ -1116,8 +1193,10 @@ describe("release webhook emissions (repoCreateRelease/repoEditRelease/repoDelet
       release: { assets: Array<{ name: string; browser_download_url: string }> };
     };
     expect(payload.action).toBe("updated");
-    expect(payload.release.assets.map((a) => a.name)).toEqual(["zeta.zip", "alpha.zip"]);
-    expect(payload.release.assets[0]?.browser_download_url).toBe("https://example.com/attachments/asset-u-late-name");
+    expect(payload.release.assets.map((a) => a.name)).toEqual(["alpha.zip", "zeta.zip"]); // name asc (R14)
+    expect(payload.release.assets[0]?.browser_download_url).toBe(
+      "https://example.com/cf-gitea-stub/rel/releases/download/ride-tag/alpha.zip", // R13's unique-name shape
+    );
   });
 
   it("emits `updated` on a riding edit and `published` on a tag-creating edit (upstream isTagCreated fork, release.go:361-367)", async () => {

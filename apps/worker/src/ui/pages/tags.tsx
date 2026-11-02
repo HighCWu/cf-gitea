@@ -4,10 +4,12 @@
  * `GET /{owner}/{repo}/tags` — upstream's repo tags group
  * (web.go:1493-1500: `m.Get("", context.RepoRefByDefaultBranch(), repo.TagsList)`
  * under the `/tags` group, handlers/web/repo/release.go:227-275 TagsList)
- * over the ENGINE ref universe — the brief's data authority, exactly the
- * landed repoListTags API's read (routes/tags.ts sortedTags: `refs/tags/*`
- * filtered, name-sorted byte order, the peel cache distinguishing annotated
- * from lightweight without reading objects).
+ * over the ENGINE ref universe — the brief's data authority, with the R11
+ * (v1.5.2 wave) order and filter semantics: creator-date newest-first (the
+ * API list's -*creatordate sort, one read per tag) and the `?q` SQL-LIKE
+ * match (tagNameLikeMatch below), the release-table ordering's push-side
+ * source (upstream's rows carry created_unix = the commit's committer time,
+ * pushUpdateAddTags).
  *
  * ## Gates (the group's order, reduced to the landed model)
  *
@@ -34,11 +36,10 @@
  *
  * Per row (`.item.tag-list-row`): the h3 title link — upstream
  * `{{if $canReadReleases}}` links EVERY tag onto `/releases/tag/{name}`
- * (SingleRelease renders tag-only rows upstream — release.go:332-341); the
- * LANDED release detail 404s tag-only rows (pages/releases.tsx's documented
- * assertNotTagRecord posture), so only release-backed tags keep that href
- * and tag-only tags fall to upstream's OWN else-arm target `/src/tag/{name}`
- * (the dead-link rule — the landed file view resolves tag refs). The meta
+ * (SingleRelease renders tag-only rows upstream — release.go:332-341);
+ * since R12 (the v1.5.2 wave) the LANDED detail renders tag-only records
+ * too (the PageIsSingleTag shape), so the old releaseBacked split is closed
+ * and every tag takes that href. The meta
  * line: the ShortSha commit link onto `/src/commit/{oid}` (octicon-git-commit
  * — allowlisted), then the ZIP / TAR.GZ archive pair onto the LANDED
  * web-shape archive route (below), then the upstream action links this
@@ -84,9 +85,10 @@
  *   upstream — the tags page never qualified); the per-row link above is the
  *   page's create surface, riding the landed `/releases/new` form whose
  *   `?tag=` prefill this wave adds to the GET handler (index.ts).
- * - `?q=` filters by case-insensitive substring over the tag names (the
- *   branches page's honest stand-in for upstream's SQL LIKE NamePattern);
- *   the h4 count carries the FILTERED count exactly like upstream's
+ * - `?q=` filters with upstream's exact LIKE NamePattern semantics (R11 —
+ *   `builder.Like{"lower_tag_name", lower(q)}`: case-insensitive substring,
+ *   `%`/`_` wildcards, FormTrim'd; tagNameLikeMatch below); the h4 count
+ *   carries the FILTERED count exactly like upstream's
  *   TagCount (opts carries NamePattern through the count query).
  * - Pagination sizes with upstream `setting.Repository.Release.
  *   DefaultPagingNum` = 10 (release.go:246-250) — the releases list's own
@@ -104,7 +106,7 @@
 
 import { engineReads, engineCell, refTipMap, tagRef, ZERO_OID } from "../../api/services/engine";
 import {
-  deleteRelease,
+  deleteTagRecord,
   findReleaseByTag,
   findReleaseForRepoById,
   listReleases,
@@ -199,6 +201,47 @@ export interface TagsData {
 }
 
 /**
+ * One tag's creator date (the `-*creatordate` sort key, modules/git/
+ * repo_tag.go:124 + tag.go:104-127): the TAGGER time for an annotated tag,
+ * the COMMIT's committer time for a lightweight one (the `*` dereference).
+ * A failed read answers 0 — the degraded date sorts last, never breaking
+ * the page (the §4.9 posture).
+ */
+async function tagCreatorTime(env: Env, repo: RepoRow, ref: { target: string; peeled?: string }): Promise<number> {
+  try {
+    if (ref.peeled !== undefined) {
+      const tag = await engineCell(env, repo).readTag(ref.target);
+      return tag?.tagger?.time ?? 0;
+    }
+    const commit = await engineReads(env, repo).readCommit(ref.target);
+    return commit?.committer.time ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Upstream's `NamePattern` filter (TagsList's `ctx.FormTrim("q")` →
+ * `builder.Like{"lower_tag_name", strings.ToLower(pattern)}`,
+ * models/repo/release.go:299-301): a SQL LIKE over the lowered name —
+ * case-insensitive substring with `%` (any run) and `_` (any one char) as
+ * the only wildcards (R11's "exact LIKE"). `q` is trimmed like
+ * `FormTrim`.
+ */
+export function tagNameLikeMatch(name: string, pattern: string): boolean {
+  const subject = name.toLowerCase();
+  // Regex-metacharacters go literal FIRST (a "v1.0" query's dot is a literal
+  // in LIKE), then the two LIKE wildcards translate.
+  const escaped = pattern
+    .trim()
+    .toLowerCase()
+    .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    .replace(/%/g, ".*")
+    .replace(/_/g, ".");
+  return new RegExp(`^.*${escaped}.*$`).test(subject);
+}
+
+/**
  * Load the page. The repo row is non-empty and visible by the time this
  * runs (the handler's MustBeNotEmpty + §2.5 posture); a failed ref read
  * degrades to the empty list (§4.9 — unreadable storage never breaks the
@@ -211,22 +254,31 @@ export async function loadTagsData(
   options: { page: number; keyword: string; viewer: Viewer },
 ): Promise<TagsData> {
   const refs = await engineReads(env, repo).listRefs();
-  // The repoListTags API's universe: refs/tags/ filtered, name-sorted (byte
-  // order — routes/tags.ts sortedTags, "the engine's list order is
-  // unspecified" so the sort is ours exactly like the API's). The ref rows
-  // stay in a map for the per-row tip resolution below.
+  // The repoListTags API's universe: refs/tags/ filtered. The ORDER is
+  // upstream TagsList's release-table `created_unix DESC, id DESC`
+  // (models/repo/release.go:317-335) whose push-side source IS the tag's
+  // creator date (pushUpdateAddTags stamps created_unix = the commit's
+  // committer time), so the engine-universe stand-in sorts creator-date
+  // DESC (R11 — the API list's -*creatordate semantics, one read per tag)
+  // with the name order as the tiebreak (the stable sort over the
+  // name-sorted base; upstream's id tiebreak has no row to read for a
+  // rowless tag). The ref rows stay in a map for the per-row resolution.
   const tagRefs = (refs?.refs ?? []).filter((ref) => ref.name.startsWith("refs/tags/"));
   const tagTips = new Map(tagRefs.map((ref) => [ref.name, ref]));
-  const tagNames = tagRefs
-    .map((ref) => ref.name.slice("refs/tags/".length))
-    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const tagNames = tagRefs.map((ref) => ref.name.slice("refs/tags/".length)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const times = await Promise.all(
+    tagRefs.map(async (ref) => ({
+      name: ref.name.slice("refs/tags/".length),
+      time: await tagCreatorTime(env, repo, ref),
+    })),
+  );
+  const timeByName = new Map(times.map((entry) => [entry.name, entry.time]));
+  tagNames.sort((a, b) => (timeByName.get(b) ?? 0) - (timeByName.get(a) ?? 0));
 
-  // The keyword filter (case-insensitive substring — the search combo's
-  // honest stand-in for upstream's LIKE NamePattern), then the page slice
-  // (§4.11 clamps); the per-row reads run for the rendered slice only (the
-  // branches page's ENRICH_MAX budget discipline).
-  const needle = options.keyword.trim().toLowerCase();
-  const filtered = needle === "" ? tagNames : tagNames.filter((name) => name.toLowerCase().includes(needle));
+  // The keyword filter (the LIKE NamePattern — tagNameLikeMatch), then the
+  // page slice (§4.11 clamps); the per-row reads run for the rendered slice
+  // only (the branches page's ENRICH_MAX budget discipline).
+  const filtered = options.keyword.trim() === "" ? tagNames : tagNames.filter((name) => tagNameLikeMatch(name, options.keyword));
   const page = Math.max(options.page, 1);
   const start = (page - 1) * RELEASES_PAGE_SIZE;
   const pageNames = filtered.slice(start, start + RELEASES_PAGE_SIZE);
@@ -431,15 +483,14 @@ export function TagsPage(props: { ctx: UiContext; data: TagsData; flash?: TagsFl
               {data.rows.map((row) => (
                 <div class="item tag-list-row tw-p-4">
                   <h3 class="tag-list-row-title tw-mb-2">
-                    {/* Release-backed tags link onto the landed release
-                        detail; tag-only tags fall to upstream's OWN else-arm
-                        target — the landed detail 404s tag-only rows (the
-                        module header's DOM-contract note). */}
-                    <a
-                      class="tag-list-row-link"
-                      href={`${repoLink}/${row.releaseBacked ? "releases/tag" : "src/tag"}/${pathEscapeSegments(row.name)}`}
-                      rel="nofollow"
-                    >
+                    {/* Upstream's $canReadReleases arm links EVERY tag onto
+                        /releases/tag/{name} (tag/list.tmpl:22-27) — with R12
+                        landed the detail page renders tag-only records too
+                        (SingleRelease's PageIsSingleTag shape), so the old
+                        releaseBacked split (tag-only tags fell to /src/tag/)
+                        is closed: every tag takes the releases link, the
+                        dead-link rule satisfied by the landed target. */}
+                    <a class="tag-list-row-link" href={`${repoLink}/releases/tag/${pathEscapeSegments(row.name)}`} rel="nofollow">
                       {row.name}
                     </a>
                   </h3>
@@ -609,10 +660,11 @@ export async function applyTagDelete(
   if (refDeleted) {
     await emitTagDeletedWebhooks(env, input, name, tip?.target ?? "");
   }
-  // 6. The D1 record drop (a tag record carries no assets; deleteRelease's
-  //    batch is the landed cascade).
+  // 6. The D1 record drop (a tag record carries no assets — deleteRelease's
+  //    conversion arm is the RELEASE-delete semantics; the tag-page delete
+  //    runs upstream's delTag=true row arm).
   if (row !== null) {
-    await deleteRelease(d1, row);
+    await deleteTagRecord(d1, row);
   }
   return { outcome: "deleted", name };
 }

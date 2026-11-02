@@ -85,6 +85,7 @@ const VARS: AdminConfigVars = {
   packagesEnabled: "true",
   packageCleanupOlderThan: "24",
   mailEnabled: "false",
+  enableNotifyMail: "",
   mailProvider: "dummy",
   mailFrom: "",
   mailSubjectPrefix: "",

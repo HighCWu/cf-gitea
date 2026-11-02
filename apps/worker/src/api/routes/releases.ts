@@ -12,6 +12,7 @@ import { issueErrorToApiError } from "../services/issues";
 import { ApiError, apiErrorSchema } from "../errors";
 import type { ApiEnv } from "../env";
 import { tagRef, ZERO_OID } from "../services/engine";
+import type { ReleaseAssetRow } from "../services/release-assets";
 import {
   createReleaseOptionSchema,
   editReleaseOptionSchema,
@@ -34,7 +35,8 @@ import {
   listReleases,
   toApiRelease,
 } from "../services/releases";
-import { emitRefWebhook, zeroCommitPushPayload } from "../services/tags";
+import { emitRefWebhook } from "../services/tags";
+import { tagCreatePushPayload } from "./tags";
 
 /**
  * Tier-1 release routes (SPEC-0004 §2.4 rows repoListReleases /
@@ -74,7 +76,10 @@ import { emitRefWebhook, zeroCommitPushPayload } from "../services/tags";
  * lands the missing tag, a tag_name rename lands the NEW ref while the old
  * ref stays (upstream deletes tags only in DeleteReleaseByID, release.go:388),
  * and every published edit re-fills sha1/created/num_commits); DELETE does
- * not delete the ref (the API passes delTag=false).
+ * not delete the ref (the API passes delTag=false) and CONVERTS the row to
+ * `is_tag = true` instead of dropping it (release.go:414-417 — a re-create
+ * keeps the id, the tags-API delete finds the record, the R2 asset objects
+ * are swept beside the rows; the ledger R2+R4 thread).
  *
  * Webhook triggers (`release`, upstream services/webhook/notifier.go
  * sendReleaseHook:879 ← NewRelease:889 / UpdateRelease:893 / DeleteRelease:897,
@@ -249,7 +254,11 @@ function releasePayload(
  * The post-mutation emit shared by the three write routes. `row` is the
  * release state the payload renders (post-edit for PATCH, the deleted row for
  * DELETE); drafts stay silent per the upstream `!rel.IsDraft` gate
- * (release.go:198,358,435).
+ * (release.go:198,358,435). `assets` preloads the attachment rows the
+ * payload renders — the DELETE arm passes the rows deleteRelease read
+ * before wiping them, because upstream's DeleteReleaseByID loads
+ * Attachments in LoadAttributes BEFORE DeleteAttachmentsByRelease and the
+ * notification still renders them (release.go:418-424).
  *
  * Activity-feed leg (specs/activity-feeds.md §3.3): ONLY the "published"
  * action records a row — upstream's actionNotifier has a NewRelease method
@@ -265,6 +274,7 @@ async function emitReleaseEvent(
   found: RepositoryWithOwner,
   row: ReleaseRow,
   action: string,
+  assets?: ReleaseAssetRow[],
 ): Promise<void> {
   if (row.isDraft) {
     return; // upstream emits nothing for drafts (any action)
@@ -274,7 +284,12 @@ async function emitReleaseEvent(
     repoId: found.repo.id,
     ownerId: found.repo.ownerId,
     eventType: "release",
-    payload: releasePayload(action, await toApiRelease(c.env.DB, viewerOf(c), found, row), repository, c.get("authUser")),
+    payload: releasePayload(
+      action,
+      await toApiRelease(c.env.DB, viewerOf(c), found, row, assets),
+      repository,
+      c.get("authUser"),
+    ),
   });
   if (action !== "published") {
     return; // updated/deleted write no action upstream (no notifier method)
@@ -456,7 +471,10 @@ export function registerReleaseRoutes(
       includeDrafts: canWrite,
       isDraft: formOptionalBool(query.draft),
       isPrerelease: formOptionalBool(query["pre-release"]),
-      tagFilter: (query.tag_filter ?? "").trim(),
+      // `ctx.FormString("tag_filter")` — the RAW query value (release.go:185);
+      // upstream does NOT trim here (R16-c; the tag_filterCondition doc
+      // covers the LIKE translation).
+      tagFilter: query.tag_filter ?? "",
       page: listOptions.page,
       limit: listOptions.limit,
     });
@@ -484,7 +502,7 @@ export function registerReleaseRoutes(
 
       let row: ReleaseRow;
       let tagCreated: boolean;
-      let tagTip: string | undefined;
+      let tagCommitSha: string | undefined;
       try {
         // The create + git-tag sequence (upstream CreateRelease →
         // release_service.CreateRelease → createTag) — the shared service
@@ -508,27 +526,41 @@ export function registerReleaseRoutes(
         });
         row = created.row;
         tagCreated = created.tagCreated;
-        tagTip = created.tagTip;
+        tagCommitSha = created.tagCommitSha;
       } catch (error) {
         if (error instanceof ReleaseAlreadyExistError) {
           throw issueErrorToApiError(error); // the declared 409 (error-body)
         }
         throw error;
       }
-      // The ref-webhook pair for a freshly created tag — upstream createTag
-      // notifies the created ref exactly like the tags API does
-      // (services/release/release.go:125-148 PushCommits + CreateRef); the
-      // emission is the tags route's own helpers (byte-identical payloads).
-      if (tagCreated && tagTip !== undefined) {
-        const fullName = tagRef(form.tag_name);
-        await emitRefWebhook(c, found, "push", zeroCommitPushPayload(c, found, fullName, ZERO_OID, tagTip), fullName);
+      // The ref-webhook pair for a freshly created tag — upstream's
+      // createTag emission (services/release/release.go:125-148): PushCommits
+      // FIRST (:136) with head_commit = the tagged COMMIT (its
+      // `commits.HeadCommit = CommitToPushCommit(commit)`, :128) and a
+      // `compare/{zero}...{commit}` compare URL (:129), THEN CreateRef (:143)
+      // whose `sha` is the COMMIT oid too (`commit.ID.String()` — the
+      // release path's pre-peel resolution; R16-e: unlike the tags API
+      // (tag.go — which rides the raw ref tip), createTag resolves
+      // GetCommit(target) BEFORE writing, so BOTH events carry the peeled
+      // commit, never the annotated tag object oid). The payload shape is
+      // the §2.3 tag-create pair (tagCreatePushPayload — the tags route's
+      // corrected builder, emitUserPushCreatedRef's exact shape).
+      if (tagCreated && tagCommitSha !== undefined) {
+        const fullName = tagRef(row.tagName);
+        await emitRefWebhook(
+          c,
+          found,
+          "push",
+          await tagCreatePushPayload(c, found, fullName, ZERO_OID, tagCommitSha, tagCommitSha),
+          fullName,
+        );
         await emitRefWebhook(
           c,
           found,
           "create",
           {
-            sha: tagTip,
-            ref: form.tag_name,
+            sha: tagCommitSha,
+            ref: row.tagName,
             ref_type: "tag",
             repository: toApiRepository(viewerOf(c), found),
             sender: c.get("authUser") ?? null,
@@ -575,9 +607,13 @@ export function registerReleaseRoutes(
       throw releaseNotExist();
     }
     assertNotTagRecord(row);
-    await deleteRelease(c.env.DB, row);
+    // DeleteReleaseByID(delTag=false): the row CONVERTS to is_tag=true (the
+    // id survives a re-create; the tags-API delete finds it), the asset rows
+    // + R2 objects + reactions go. `assets` are the pre-wipe rows — the
+    // delete payload still renders them (release.go:418-424).
+    const { assets } = await deleteRelease(c.env, c.env.DB, row);
     // Webhook: DeleteRelease (release.go:437) — drafts stay silent.
-    await emitReleaseEvent(c, found, row, "deleted");
+    await emitReleaseEvent(c, found, row, "deleted", assets);
     return c.body(null, 204);
   });
 
@@ -637,15 +673,15 @@ export function registerReleaseRoutes(
         }
         return c.json(await toApiRelease(c.env.DB, viewer, found, fresh), 200);
       }
-      // The ref-webhook pair when the edit landed a FRESH tag — upstream
-      // createTag notifies the created ref exactly like the create path
-      // (release.go:135-143 PushCommits + CreateRef). The edit-created tag is
-      // always lightweight (msg="", release.go:269), so the ref tip IS the
-      // filled commit sha1.
+      // The ref-webhook pair when the edit landed a FRESH tag — the same
+      // createTag emission the create path runs (release.go:125-148, R16-e:
+      // both events carry the PEELED COMMIT — the edit-created tag is
+      // lightweight (msg="", release.go:269) so the tip IS the filled sha1,
+      // and the payload shape is the §2.3 tag-create pair).
       if (updated.tagCreated) {
         const fullName = tagRef(updated.row.tagName);
         const tip = updated.row.sha1 ?? ZERO_OID;
-        await emitRefWebhook(c, found, "push", zeroCommitPushPayload(c, found, fullName, ZERO_OID, tip), fullName);
+        await emitRefWebhook(c, found, "push", await tagCreatePushPayload(c, found, fullName, ZERO_OID, tip, tip), fullName);
         await emitRefWebhook(
           c,
           found,
@@ -676,9 +712,11 @@ export function registerReleaseRoutes(
     await requireReleaseWriter(c, found);
     const { id } = c.req.valid("param");
     const row = await requireReleaseById(c, found.repo.id, id);
-    await deleteRelease(c.env.DB, row);
+    // DeleteReleaseByID(delTag=false) — the is_tag conversion (see the
+    // by-tag arm's note); the payload carries the pre-wipe assets.
+    const { assets } = await deleteRelease(c.env, c.env.DB, row);
     // Webhook: DeleteRelease (release.go:437) — drafts stay silent.
-    await emitReleaseEvent(c, found, row, "deleted");
+    await emitReleaseEvent(c, found, row, "deleted", assets);
     return c.body(null, 204);
   });
 }

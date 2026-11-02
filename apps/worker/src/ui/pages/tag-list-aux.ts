@@ -7,7 +7,7 @@
  *                                   repo_model.GetTagNamesByRepoID into the
  *                                   shared branchTagSearchResponse)
  *
- * ## JSON shape (the ported contract, byte-order included)
+ * ## JSON shape (the ported contract)
  *
  * `branchTagSearchResponse` (repo.go:560-562) marshals exactly
  *
@@ -36,10 +36,20 @@
  *   MustBeNotEmpty + reqUnitCodeReader) reduce to the tags page's own
  *   posture: an invisible repo 404-shells through the §2.5 read, an EMPTY
  *   repo 404-shells (MustBeNotEmpty).
- * - order: upstream's GetTagNamesByRepoID defers to git's tag order; the
- *   engine boundary's listRefs order is unspecified, so the names sort in
- *   byte order — the landed API repoListTags sortedTags convention
- *   (routes/tags.ts), the tags page's own sort, documented divergence.
+ * - order: upstream's GetTagNamesByRepoID reads the RELEASES TABLE with
+ *   `Desc("created_unix", "id")` (models/repo/release.go:317-335) over
+ *   IncludeDrafts+IncludeTags+HasSha1 rows — NOT git's tag order (the
+ *   earlier "defers to git's tag order" note here was a false premise, R10:
+ *   the release rows' created_unix is stamped FROM the tag's creator date by
+ *   pushUpdateAddTags — the commit's committer time). The engine boundary's
+ *   listRefs carries no dates, so the names sort creator-date DESC (one
+ *   readTag/readCommit per tag — the API list's -*creatordate semantics,
+ *   routes/tags.ts tagsByCreatorDate / the tags page's R11 sort) over the
+ *   engine tag universe, the name order the tiebreak (upstream's id
+ *   tiebreak has no row for a rowless tag). Documented divergence: the NAME
+ *   universe is the engine's (the push-sync stand-in), upstream's is the
+ *   release table's — a tag pushed with no API interaction has no row
+ *   upstream either until the push syncs it.
  *
  * This module holds the loader + the JSON Response builder only; the handler
  * lives in src/ui/index.ts beside its sibling dispatchers (the resolveUiRequest
@@ -47,7 +57,7 @@
  * commit-contained-refs aux-JSON sibling.
  */
 
-import { engineReads } from "../../api/services/engine";
+import { engineCell, engineReads } from "../../api/services/engine";
 
 /** `branchTagSearchResponse` (repo.go:560-562) — the field order is the Go
  *  struct's marshal order (one member). */
@@ -64,17 +74,35 @@ export type TagListRepo = {
 
 /**
  * Load the tag-name universe (the tags page's exact read: `refs/tags/*`
- * filtered, byte-order sorted — the module header's order note). A failed
- * ref read degrades to the empty list (§4.9 — unreadable storage answers an
- * empty feed, never a broken page; the API LIST's `refs ?? []` arm).
+ * filtered, creator-date newest-first — the module header's order note). A
+ * failed ref read degrades to the empty list (§4.9 — unreadable storage
+ * answers an empty feed, never a broken page; the API LIST's `refs ?? []`
+ * arm); a failed per-tag date read answers 0 and sorts last.
  */
 export async function loadTagListAux(env: Env, repo: TagListRepo): Promise<TagListSearchResponse> {
   if (repo.isEmpty) return { results: [] }; // MustBeNotEmpty (web.go:1499's group gate)
   const refs = await engineReads(env, repo).listRefs();
-  const names = (refs?.refs ?? [])
-    .filter((ref) => ref.name.startsWith("refs/tags/"))
-    .map((ref) => ref.name.slice("refs/tags/".length))
-    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const tagRefs = (refs?.refs ?? []).filter((ref) => ref.name.startsWith("refs/tags/"));
+  const names = tagRefs.map((ref) => ref.name.slice("refs/tags/".length)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const times = await Promise.all(
+    tagRefs.map(async (ref): Promise<{ name: string; time: number }> => {
+      let time: number;
+      try {
+        if (ref.peeled !== undefined) {
+          const tag = await engineCell(env, repo).readTag(ref.target);
+          time = tag?.tagger?.time ?? 0;
+        } else {
+          const commit = await engineReads(env, repo).readCommit(ref.target);
+          time = commit?.committer.time ?? 0;
+        }
+      } catch {
+        time = 0;
+      }
+      return { name: ref.name.slice("refs/tags/".length), time };
+    }),
+  );
+  const timeByName = new Map(times.map((entry) => [entry.name, entry.time]));
+  names.sort((a, b) => (timeByName.get(b) ?? 0) - (timeByName.get(a) ?? 0));
   return { results: names };
 }
 

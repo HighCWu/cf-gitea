@@ -72,7 +72,7 @@
  * passthrough on `.wiki` JSON/admin shapes.
  */
 
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import type { ClassifiedPushCommand, DurableGitHandler, EngineCallOptions, PushValidator, PushVerdict, PusherIdentity } from "@cf-gitea/git-engine";
 
@@ -106,12 +106,14 @@ import {
   engineRepoNotFound,
   goGetMeta,
   headFile,
+  ownerUnavailable,
   redirectPermanent,
   repositoryNotFound,
   routeOp,
   scopeForbidden,
 } from "./respond";
 import { findRepositoryById, type RepositoryRow } from "../api/services/repository";
+import { pushUpdateDeleteTags } from "../api/services/releases";
 import { loadRepoSettings } from "../api/services/repo-settings";
 import type { AuthUser } from "../auth/auth-context";
 import { ScopeSet } from "../auth/scopes";
@@ -131,13 +133,15 @@ import {
 import { isTagControlAllowed, listProtectedTags } from "../services/tag-protection";
 import { OrgService } from "../services/orgs/orgs";
 import { handleLfsGateBranch, parseLfsRoute } from "../lfs/router";
-import { repoCounters, repoUnits, repositories, users } from "../db/schema";
+import { repoCounters, repoUnits, repositories, issues, users } from "../db/schema";
 import { deleteRepositoryViaEngineShape } from "../repos/purge";
 import { RepoNameCollisionError, RepoService, lookupRedirect } from "../repos/service";
 import { assertDemoRepoQuota } from "../services/demo-quota";
 import { emitRepoEventInline, repositoryEventIdentity, repositoryEventPayload } from "../services/repo-events";
 import { appOrigin } from "../services/webhooks-push";
 import { oauth2FeatureEnabled } from "../services/oauth2/token";
+import { CARGO_INDEX_REPOSITORY_NAME } from "../services/packages/cargo";
+import type { AutoMergeCheckMessage } from "../services/pull-automerge";
 
 /**
  * Requests the gate has already authorized. The engine `authorize` hook
@@ -220,6 +224,17 @@ export async function gitHttpGate(
     // redirect before a Basic prompt).
     const redirect = await lookupRedirect(env.DB, ownerLower, repoLower);
     if (redirect !== null) return redirectPermanent(req.url, redirect.ownerNamespace, redirect.slug);
+    // The rowless cargo index cell (S-2, specs/0016-packages.md §7's M7
+    // as-built: "the git-URL face 404s until a wiki-style gate family
+    // teaches the gate the marker"). A repositories ROW at the address
+    // never reaches this arm — the ordinary flow above already resolved it
+    // (the mirror's collision guard keeps that row user-owned and the
+    // infrastructure arms off it). The engine's repoPath admits the name
+    // since b389b84; this arm owns the ACL, the priv:1 registry seed, and
+    // the forward.
+    if (repoLower === CARGO_INDEX_REPOSITORY_NAME) {
+      return handleCargoIndexGitRoute(req, url, env, ctx, engine, route, ownerLower);
+    }
     return handleUnknownRepository(req, env, ctx, engine, url, route, ownerLower, repoLower);
   }
 
@@ -315,7 +330,13 @@ export async function gitHttpGate(
   // the URL name, so renames/transfers never fork the storage namespace —
   // and the authenticated pusher (in-process, see resolvePushPusher), which
   // the engine surfaces on PushEvent so the push webhooks name the real
-  // pusher instead of the owner fallback.
+  // pusher instead of the owner fallback. The validator is the R5/D-7c
+  // collector: the per-push command set is only visible in-process here
+  // (the engine surfaces applied updates on its own onPush hook, wired in
+  // the worker entry — a file this gate does not own), so the wrapper
+  // records the policy-allowed tag-delete / PR-head commands beside the
+  // ordinary evaluation.
+  const pushTail: PushTailCommands = { tagDeletes: [], prHeadPushes: [] };
   const response = await forwardToEngine(
     req,
     url,
@@ -324,7 +345,7 @@ export async function gitHttpGate(
     engine,
     isPush ? resolved.repo.storageKey : undefined,
     pusher,
-    isPush ? protectedBranchValidator(env, resolved.repo) : undefined,
+    isPush ? pushTailValidator(env, resolved.repo, pushTail) : undefined,
   );
 
   // First-push settle on ANY empty D1-backed repo (the wave-settle-is-empty
@@ -340,8 +361,19 @@ export async function gitHttpGate(
   // re-verifies via listRefs and CAS-guards on is_empty, so a failed or
   // rejected receive is a no-op and a probe/advert never schedules it (this
   // arm runs only on the receive-pack RPC).
-  if (isPush && resolved.repo.isEmpty) {
-    ctx.waitUntil(settleCreatingRepo(env, resolved.repo.id, `${route.owner}/${route.repo}`, url.origin));
+  //
+  // The R5/D-7c tail rides the same post-commit window (see applyPushTail):
+  // one listRefs verifies what actually landed, then the tag-deletion
+  // draft-flips and the auto-merge re-check enqueues run — upstream's
+  // hook_post_receive → PushUpdate ordering (push.go:317) reduced to the
+  // gate's process. Scheduled for every authenticated receive with a
+  // collected command; a push with neither is a no-op return before any
+  // RPC (applyPushTail's head guard).
+  if (isPush) {
+    ctx.waitUntil(applyPushTail(env, resolved.repo, `${route.owner}/${route.repo}`, pushTail));
+    if (resolved.repo.isEmpty) {
+      ctx.waitUntil(settleCreatingRepo(env, resolved.repo.id, `${route.owner}/${route.repo}`, url.origin));
+    }
   }
   return response;
 }
@@ -608,6 +640,211 @@ async function ensureWikiRegistryRow(env: Env, repo: RepositoryRow): Promise<voi
     await registry.setConfig(name, { priv: true });
   } catch (error) {
     console.error(`[wiki-git] registry seed ${name} failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
+ * The rowless `_cargo-index` git family (S-2 — upstream Gitea's cargo
+ * sparse-index MIRROR repository, services/packages/cargo/index.go:
+ * `IndexRepositoryName = "_cargo-index"`, cloneable at
+ * `{origin}/{owner}/_cargo-index.git`). Upstream's index repo is a REAL
+ * repositories row (CreateRepositoryDirectly, index.go:210-226, born
+ * public); ours is the ROWLESS engine cell `owner/_cargo-index`
+ * (cargo-index.ts cargoIndexCellName — specs/0016-packages.md §7's M7
+ * as-built "hiding posture"), served here so the git-URL face stops 404ing
+ * the marker. The wiki family's contract, mirrored arm for arm:
+ *
+ * - OWNER resolution (never a repo row): the users row under the namespace
+ *   — a plain user OR an org (both are `users` rows; upstream's index owner
+ *   is whoever owns the packages, getOrCreateIndexRepository's `owner`). A
+ *   missing owner is the bare 404 for every route and credential — the
+ *   wiki family's no-parent arm (upstream answers the same 404 through
+ *   GetRepositoryByOwnerAndName's not-exist) and the push-create surface
+ *   must never see the name (an unparented cell is purge debris).
+ * - OWNER-prohibited → the pre-auth 403 (the matrix's owner-inactive arm,
+ *   githttp.go:103-107).
+ * - ACL: the index repo is upstream-born PUBLIC, so the matrix runs with
+ *   `repoVisibility: "public"` and NO team/collaborator fold (no repo id to
+ *   resolve them with — the rowless divergence; upstream's settings can
+ *   flip the repo private or grant collaborators, ours cannot). Anonymous
+ *   read = the public-public posture (readGrant row 1); writes need the
+ *   owner themself or a site admin (an org-owned cell is admin-only — the
+ *   owner id belongs to the org). The credential ladder is
+ *   authorizeGitHttp's shape without the deploy-token arm (no repo row for
+ *   the key to bind) and without the failure limiter (the push-create
+ *   interceptor's lighter posture — gate.ts:707's precedent).
+ * - Registry seed BEFORE the forward on protocol reads —
+ *   ensureWikiRegistryRow verbatim: the engine 404s protocol reads of
+ *   registry-unknown names and this rowless cell is born registry-less;
+ *   priv=1 keeps it out of every index (upstream's own index repo shows in
+ *   listings, the recorded divergence the hiding posture buys).
+ * - NO settle after a receive (no D1 row to settle), NO storage key (no
+ *   row → no storage_key; the cell keeps its name-addressed namespace, the
+ *   wiki family's exact posture), NO protected-branch validator (no repo id
+ *   to load rules for — upstream's index repo could carry rules; ours
+ *   carries none, the same reduction the rowless posture buys).
+ * - The mirror arms' collision guard (`cargoIndexAddressOwned`) means a
+ *   repositories ROW at this address is USER-OWNED and the infrastructure
+ *   writers refuse it — the dispatch above never reaches this arm for a
+ *   row, so the ordinary family serves such a repo with the full matrix.
+ */
+async function handleCargoIndexGitRoute(
+  req: Request,
+  url: URL,
+  env: Env,
+  ctx: ExecutionContext,
+  engine: DurableGitHandler<Env>,
+  route: GitHttpRoute,
+  ownerLower: string,
+): Promise<Response> {
+  const ownerRow = await cargoIndexOwnerRow(env.DB, ownerLower);
+  if (ownerRow === null) return repositoryNotFound();
+  const ownerVisibility = ownerRow.visibility;
+
+  // Route table row 4: the synthetic HEAD (a read over the cell).
+  if (route.kind === "head") {
+    if (req.method !== "GET") return engine.fetch(req, env, ctx);
+    const decision = await cargoIndexAuthorize(req, env, (p) => ctx.waitUntil(p), "read", ownerRow, ownerVisibility);
+    if (decision !== true) return decision;
+    return serveHead(env, { owner: ownerLower, repo: CARGO_INDEX_REPOSITORY_NAME, kind: "head" }, CARGO_INDEX_BRANCH);
+  }
+
+  // §2.1 item 2: service parse before auth, byte-identical to the families.
+  let op: "read" | "write";
+  if (route.kind === "info-refs") {
+    const refsOp = infoRefsOp(url);
+    if (refsOp === null) return bareBadRequest();
+    op = refsOp;
+  } else {
+    op = routeOp(route.kind);
+    if (req.method === "POST" && req.headers.get("content-type") !== rpcRequestContentType(route.kind)) {
+      return bareBadRequest();
+    }
+  }
+
+  const decision = await cargoIndexAuthorize(req, env, (p) => ctx.waitUntil(p), op, ownerRow, ownerVisibility);
+  if (decision !== true) return decision;
+
+  // Protocol reads need the cell's registry row (the wiki family's seed
+  // contract — mod.ts:1492-1495 404s registry-unknown reads).
+  if (op === "read") await ensureCargoIndexRegistryRow(env, ownerLower);
+
+  // §2.1 item 5: the ordinary engine forward — no storage key, no settle,
+  // no validator (see the doc's posture list). The pusher rides for
+  // PushEvent attribution.
+  const isPush = route.kind === "receive-pack";
+  const pusher = isPush ? await resolvePushPusher(env, req) : undefined;
+  return forwardToEngine(req, url, env, ctx, engine, undefined, pusher, undefined);
+}
+
+/** The cargo index branch lives at the DEFAULT_BRANCH birth value ("main" —
+ *  cargo-index.ts CARGO_INDEX_BRANCH pins the same upstream setting). */
+const CARGO_INDEX_BRANCH = "main";
+
+/** The row slice the cargo family's ACL needs (the push-create resolver's
+ *  shape plus `visibility` for the §2.5.6 owner-visibility arms). */
+interface CargoIndexOwnerRow {
+  id: number;
+  usernameLower: string;
+  isAdmin: boolean;
+  status: "active" | "prohibited";
+  visibility: "public" | "limited" | "private";
+}
+
+async function cargoIndexOwnerRow(d1: D1Database, usernameLower: string): Promise<CargoIndexOwnerRow | null> {
+  const row = await drizzle(d1)
+    .select({ id: users.id, usernameLower: users.usernameLower, isAdmin: users.isAdmin, status: users.status, visibility: users.visibility })
+    .from(users)
+    .where(eq(users.usernameLower, usernameLower))
+    .get();
+  return row ?? null;
+}
+
+/**
+ * The cargo family's reduced matrix (the handler doc lists the divergences):
+ * upstream's index repo semantics — born public, owner/admin writes — over
+ * the rowless cell, with the matrix's response shapes (401 challenge, 403
+ * pre-auth arms, scope 403, the masked 404).
+ */
+async function cargoIndexAuthorize(
+  req: Request,
+  env: Env,
+  waitUntil: (promise: Promise<void>) => void,
+  op: GitHttpOp,
+  ownerRow: CargoIndexOwnerRow,
+  ownerVisibility: "public" | "limited" | "private",
+): Promise<Response | true> {
+  // Pre-auth: the owner's account is unavailable for EVERY caller
+  // (githttp.go:103-107 — reads included).
+  if (ownerRow.status === "prohibited") return ownerUnavailable();
+
+  // Row 1: public repo + active PUBLIC owner — the anonymous read posture.
+  const publiclyVisible = ownerVisibility === "public";
+
+  const credential = requestCredential(req);
+  if (credential === null) {
+    if (op === "read" && publiclyVisible) return true;
+    // Every other anonymous request challenges (pushes always need
+    // identity; the masked reads challenge too, like the matrix's rows 2/3).
+    return basicChallenge(oauth2FeatureEnabled(env));
+  }
+
+  const verified = await new TokenService(env.DB).verify(credential).catch(() => null);
+  if (verified === null) return basicChallenge(oauth2FeatureEnabled(env));
+
+  // Row 7: the repository-category scope for the op (write implies read via
+  // the bitmap — the same CheckRepoScopedToken shape).
+  const scope = ScopeSet.parseLenient(verified.token.scopes);
+  const required = op === "read" ? "read:repository" : "write:repository";
+  if (!scope.has(required)) return scopeForbidden();
+
+  // Row 11: disabled/prohibited doer, checked after the scope.
+  if (verified.user.status === "prohibited") return accountDisabled();
+
+  // Rows 9/11: the read grant over a born-public repo (no team fold — the
+  // rowless divergence), plus the public-only masking arm.
+  const canRead = readGrant({
+    repoVisibility: "public",
+    owner: { id: ownerRow.id, status: ownerRow.status },
+    ownerVisibility,
+    doer: { id: verified.user.id, isAdmin: verified.user.isAdmin },
+    teamMode: null,
+  });
+  if (!canRead || (scope.publicOnly && !publiclyVisible)) return repositoryNotFound();
+
+  if (op === "write") {
+    // The owner themself or a site admin (no team/collaborator fold — the
+    // rowless divergence; an org-owned cell's id belongs to the org).
+    const isOwner = verified.user.id === ownerRow.id;
+    if (!isOwner && !verified.user.isAdmin) return repositoryNotFound();
+  }
+  return true;
+}
+
+/**
+ * One-time registry seed for the rowless cargo index cell —
+ * `ensureWikiRegistryRow` verbatim over the cell name
+ * `<ownerLower>/_cargo-index` (cargoIndexCellName's convention; the cell is
+ * seeded at the owner row's LOWERCASE namespace, the registry is
+ * case-sensitive). priv=1 ALWAYS, self-healing on later reads: the cell
+ * must never appear in any engine index (the hiding posture — upstream's
+ * own index repo is a listed row, the recorded divergence), and the
+ * gate-owned ACL above owns the actual authorization. The tighten also
+ * re-pins after the engine's push-time upsert bookkeeping (priv DDL
+ * default 0), exactly like the wiki seed.
+ */
+async function ensureCargoIndexRegistryRow(env: Env, ownerLower: string): Promise<void> {
+  const name = `${ownerLower}/${CARGO_INDEX_REPOSITORY_NAME}`;
+  const registry = env.REGISTRY.getByName("registry");
+  try {
+    const known = await registry.get(name);
+    if (known !== null && known.priv === 1) return;
+    // Awaited, not fire-and-forget: the forward's own registry consult must
+    // observe the seeded row (the wiki seed's ordering note verbatim).
+    if (known === null) await registry.upsert(name, Date.now());
+    await registry.setConfig(name, { priv: true });
+  } catch (error) {
+    console.error(`[cargo-index-git] registry seed ${name} failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -1157,6 +1394,159 @@ function protectedBranchValidator(env: Env, repo: RepositoryRow): PushValidator 
 }
 
 /**
+ * `refs/pull/N/head` — the PR head ref the §3.4 head-sync maintains
+ * (`pullHeadRef`, api/services/engine.ts; N is the per-repo ISSUE index,
+ * upstream GetGitHeadRefName, models/issues/pull.go:406). A client push
+ * that lands this ref is a PR head move exactly like the sync's own write.
+ */
+const PR_HEAD_REF_PATTERN = /^refs\/pull\/([1-9][0-9]*)\/head$/;
+
+/**
+ * The R5/D-7c tail's structural env — the settle's SettleEnv precedent
+ * (request-less/varless callers and test stubs satisfy it without the full
+ * generated Env).
+ */
+export interface PushTailEnv extends Pick<Env, "DB" | "REPO"> {
+  /** Duck-typed at repoTasksQueue (sendBatch only); absent disables the
+   *  D-7c enqueue (logged, the applied push stands). */
+  REPO_TASKS?: unknown;
+}
+
+/**
+ * The R5/D-7c command set one receive may contribute: tag deletions and
+ * PR-head pushes that PASSED the per-ref policy (a rejected command never
+ * applies, so it never reaches the tail). Collected inside the validator
+ * callback — the only in-process point that sees the receive's command
+ * list — and consumed by applyPushTail after the forward returns. Exported
+ * for the tail tests (the same shape the validator fills).
+ */
+export interface PushTailCommands {
+  /** Tag names (refs/tags/ stripped) with an allowed delete command. */
+  tagDeletes: string[];
+  /** Issue indexes (refs/pull/N/head's N) with an allowed create/move. */
+  prHeadPushes: number[];
+}
+
+/**
+ * The main family's receive validator: `protectedBranchValidator`'s
+ * evaluation BESIDE the R5/D-7c collection. The engine surfaces its applied
+ * updates only on the embedding Worker's onPush hook (mod.d.ts PushEvent —
+ * wired in the worker entry, a file the gate does not own), so the tail's
+ * command visibility rides the same in-process channel the policy hook
+ * already uses: commands whose verdict allows them ARE the apply set by
+ * contract ("rejected commands ... never apply; their siblings land",
+ * mod.d.ts PushValidator). The post-commit verification in applyPushTail
+ * closes the remaining gap (a CAS-conflicted or atomic-failed command
+ * reports ng without a reject verdict).
+ */
+function pushTailValidator(env: Env, repo: RepositoryRow, tail: PushTailCommands): PushValidator {
+  return async (commands, hookCtx) => {
+    const verdicts = await protectedBranchValidator(env, repo)(commands, hookCtx);
+    if (verdicts !== undefined) {
+      for (let i = 0; i < commands.length; i++) {
+        const cmd = commands[i]!;
+        if (verdicts[i]?.reject !== undefined) continue; // ng-rendered, never applies
+        if (cmd.ref.startsWith("refs/tags/") && cmd.kind === "delete") {
+          tail.tagDeletes.push(cmd.ref.slice("refs/tags/".length));
+        }
+        const head = PR_HEAD_REF_PATTERN.exec(cmd.ref);
+        if (head !== null && cmd.kind !== "delete") {
+          tail.prHeadPushes.push(Number(head[1]));
+        }
+      }
+    }
+    return verdicts;
+  };
+}
+
+/**
+ * The REPO_TASKS producer seam, webhooks-push.ts webhookDeliveryQueue's
+ * duck-typed shape: structural so tests can pass a stub and a varless env
+ * view (SettleEnv's precedent) still satisfies it.
+ */
+function repoTasksQueue(env: { REPO_TASKS?: unknown }): { sendBatch(messages: { body: AutoMergeCheckMessage }[]): Promise<unknown> } | null {
+  const candidate = env.REPO_TASKS as { sendBatch?: (messages: { body: AutoMergeCheckMessage }[]) => Promise<unknown> } | undefined;
+  return candidate !== undefined && typeof candidate.sendBatch === "function" ? { sendBatch: candidate.sendBatch.bind(candidate) } : null;
+}
+
+/**
+ * The R5/D-7c push tail — upstream's hook_post_receive tag arm reduced to
+ * the gate's process (models/repo/release.go:465-492 PushUpdateDeleteTags,
+ * reached from services/repository/push.go:317; upstream reads the applied
+ * commands off its own hook pipeline, ours collects them in the validator
+ * and verifies against the post-commit refs). Runs in waitUntil AFTER the
+ * forward resolved — the engine commits refs before its response returns
+ * (the settle-safety argument) — and NEVER fails the push: the applied
+ * push stands, a tail failure is a logged no-op.
+ *
+ * R5 — tag deletions: only the collected deletes whose ref is GONE from the
+ * post-commit refs land the D1 lifecycle (services/releases.ts
+ * pushUpdateDeleteTags: the is_tag records die, the real releases withdraw
+ * to draft with the zero-valued sha1/num_commits/published_unix). A
+ * CAS-conflicted delete ("fetch first" ng, no reject verdict — the CAS ran
+ * after the policy hook) leaves its ref in place and is filtered here; a
+ * re-created same-name tag between the verify read and the D1 write flips a
+ * brand-new release the same way upstream's queue lag could — the
+ * eventual-consistency shape both trees tolerate.
+ *
+ * D-7c — PR-head pushes: ONE {kind:"auto-merge-check", issueId} message per
+ * pushed/moved head through the standing REPO_TASKS queue (the same
+ * sendBatch seam the webhook-delivery and purge producers use). The N in
+ * refs/pull/N/head is the ISSUE index; the message wants the global issue
+ * id, so one indexed read resolves repo+index+is_pull → id (an unknown
+ * index — a stray push to a PR that never existed — resolves nothing and
+ * sends nothing). Upstream re-enqueues only when a scheduled merge exists
+ * (services/pull/check.go:297-300's GetScheduledMergeByPullID gate); ours
+ * enqueues for every PR-head push and lets the consumer's ladder decide —
+ * "not scheduled → skip" (pull-automerge.ts) is the named idempotence, and
+ * the cron producer re-probes every scheduled row each tick regardless.
+ */
+export async function applyPushTail(
+  env: PushTailEnv,
+  repo: RepositoryRow,
+  engineRepo: string,
+  tail: PushTailCommands,
+): Promise<void> {
+  if (tail.tagDeletes.length === 0 && tail.prHeadPushes.length === 0) return;
+  try {
+    const refNames = new Set(((await env.REPO.getByName(engineRepo).listRefs()).refs ?? []).map((ref) => ref.name));
+
+    const deletedTags = [...new Set(tail.tagDeletes)].filter((tag) => !refNames.has(`refs/tags/${tag}`));
+    if (deletedTags.length > 0) {
+      await pushUpdateDeleteTags(env.DB, repo.id, deletedTags);
+    }
+
+    const headIndexes = [...new Set(tail.prHeadPushes)];
+    if (headIndexes.length > 0) {
+      const prIssues = await drizzle(env.DB)
+        .select({ id: issues.id, index: issues.index })
+        .from(issues)
+        .where(and(eq(issues.repoId, repo.id), inArray(issues.index, headIndexes), eq(issues.isPull, true)))
+        .all();
+      if (prIssues.length > 0) {
+        const queue = repoTasksQueue(env);
+        if (queue !== null) {
+          const messages = [...new Set(prIssues.map((row) => row.id))].map(
+            (issueId): { body: AutoMergeCheckMessage } => ({ body: { kind: "auto-merge-check", issueId } }),
+          );
+          await queue.sendBatch(messages);
+        } else {
+          console.error(`[push-tail] ${repo.ownerNamespace}/${repo.slug}: REPO_TASKS binding lacks sendBatch — auto-merge re-check not enqueued`);
+        }
+      }
+      // headIndexes with no matching PR row: a stray refs/pull/N/head push
+      // for a PR that does not exist — nothing to check, nothing to send.
+    }
+  } catch (error) {
+    console.error(
+      `[push-tail] ${repo.ownerNamespace}/${repo.slug}: tail failed (the applied push stands): ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
+
+/**
  * The per-push evaluation (SPEC-0013 §3.5): rules load ONCE per push, the
  * predicates are M1's service ports consumed read-only. Verdicts are
  * index-aligned with the engine's classified commands (a crafted request
@@ -1347,7 +1737,7 @@ async function serveHead(env: Env, route: GitHttpRoute, defaultBranch: string): 
  * Request in hand and passes `url.origin`; request-less callers (the
  * ui/testing seed-repo settle) omit it and keep the env/default fallback.
  */
-export interface SettleEnv extends Pick<Env, "DB" | "REPO" | "REPO_PACKS"> {
+export interface SettleEnv extends Pick<Env, "DB" | "REPO" | "REPO_PACKS" | "REPO_TASKS"> {
   /** Upstream `setting.AppURL` — optional here so request-less callers can
    *  pass a varless bindings view (the WebhookPushEnv pattern); the full
    *  generated Env satisfies this structurally. */

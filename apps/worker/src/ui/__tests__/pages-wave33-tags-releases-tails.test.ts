@@ -254,20 +254,21 @@ describe("wave-33 parser families (parseUiRoute / handlesUiRoute)", () => {
 // --- the tags aux JSON -----------------------------------------------------------
 
 describe("GET /{owner}/{repo}/tags/list", () => {
-  it("serves the branchTagSearchResponse byte shape over the byte-order names", async () => {
+  it("serves the branchTagSearchResponse byte shape over the creator-date order (R10)", async () => {
     const res = await fetchUi("/wave33-owner/tagged/tags/list");
     expect(res.status).toBe(200);
     // ctx.JSON's content type + the middleware's zero-option prod stamp (the
     // wave-32 containedRefsResponse sibling).
     expect(res.headers.get("content-type")).toBe("application/json;charset=utf-8");
     expect(res.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate");
-    // No filter, no query: every tag name, byte-order sorted ("keep/me" <
-    // "rel/1.0" < "v1" < "v2" — the landed sortedTags convention; upstream's
-    // git tag order divergence is the module header's note). ?q= is IGNORED
-    // like upstream's handler.
-    expect(await res.text()).toBe('{"results":["keep/me","rel/1.0","v1","v2"]}');
+    // No filter, no query: every tag name, creator-date DESC (R10 — the
+    // release-table Desc(created_unix,id) semantics over the engine tag
+    // universe; v1@c0 sorts last, the c1 tags keep name order as the
+    // tiebreak: "keep/me" < "rel/1.0" < "v2"). ?q= is IGNORED like
+    // upstream's handler.
+    expect(await res.text()).toBe('{"results":["keep/me","rel/1.0","v2","v1"]}');
     const filtered = await fetchUi("/wave33-owner/tagged/tags/list?q=v1&page=2");
-    expect(await filtered.text()).toBe('{"results":["keep/me","rel/1.0","v1","v2"]}');
+    expect(await filtered.text()).toBe('{"results":["keep/me","rel/1.0","v2","v1"]}');
   });
 
   it("404s the empty repo (MustBeNotEmpty) and the deeper tails", async () => {
@@ -546,7 +547,10 @@ describe("POST /{owner}/{repo}/releases/delete + the list pencil", () => {
     expect(res.headers.get("location")).toBe(
       `/wave33-owner/tagged/releases?deleted=${encodeURIComponent("Renamed release")}`,
     );
-    expect(await findReleaseByTag(env.DB, repoId, "v1")).toBeNull();
+    // R2: the row CONVERTS to the tag-only record — it survives the delete
+    // (a re-create keeps the id; the tags-API delete finds it).
+    const converted = await findReleaseByTag(env.DB, repoId, "v1");
+    expect(converted?.isTag).toBe(true);
     // The flash text renders on the list page (deletion_success).
     const html = await (
       await fetchUi("/wave33-owner/tagged/releases?deleted=R", withCookie("/x", ownerCookie))

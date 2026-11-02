@@ -38,6 +38,21 @@ export interface GitHttpRoute {
 const REPO_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 /**
+ * Infrastructure-cell NAME segments — the engine's `INFRA_REPO_NAMES`
+ * (mod.ts, landed b389b84 for S-2's engine half): rowless cells the
+ * embedding Worker's gate serves over git HTTP WITHOUT a D1 repositories
+ * row. `_cargo-index` is upstream Gitea's exact cargo sparse-index mirror
+ * repository name (services/packages/cargo/index.go:28-29); the leading
+ * underscore keeps it outside the D1 name alphabet, so the admission can
+ * never shadow a user repository. The engine admits these in its own path
+ * parser; this gate-side literal mirrors that admission so the four git
+ * routes PARSE for the cell and the cargo family's arm
+ * (gate.ts handleCargoIndexGitRoute) gets its dispatch — the registry
+ * oracle downstream still 404s any name the gate's family arm declines.
+ */
+const INFRA_REPO_NAMES = new Set(["_cargo-index"]);
+
+/**
  * Parse a repository-scoped pathname into a git-HTTP route, or null when the
  * path is not one of the four git routes (→ engine passthrough). The tail
  * after `/:owner/:repo[.git]` must be exactly the route literal — anything
@@ -73,11 +88,19 @@ export function parseGitHttpRoute(pathname: string): GitHttpRoute | null {
   } catch {
     return null; // undecodable escapes: the engine 404s these, so pass through
   }
-  if (!REPO_NAME.test(owner) || !REPO_NAME.test(name)) return null;
-
   // Trim exactly one trailing ".git", case-sensitive like upstream
-  // (`strings.TrimSuffix`, githttp.go:96; §4.4).
+  // (`strings.TrimSuffix`, githttp.go:96; §4.4) — BEFORE the alphabet
+  // check: infrastructure cells arrive with the suffix ON
+  // (`{owner}/_cargo-index.git`), so the admission below must key on the
+  // STRIPPED name (the engine's own router admits the segment the same
+  // way; the salvage fix — the raw-name check rejected the leading
+  // underscore before the admission ever ran).
   const repo = name.endsWith(".git") ? name.slice(0, -4) : name;
+  if (!REPO_NAME.test(owner) || (!REPO_NAME.test(name) && !INFRA_REPO_NAMES.has(repo))) return null;
+  // Infrastructure cells arrive with the `.git` suffix ON (the client clones
+  // `{owner}/_cargo-index.git`), so the admission runs against the STRIPPED
+  // name — the engine's own router admits the segment the same way.
+  if (!REPO_NAME.test(repo) && !INFRA_REPO_NAMES.has(repo)) return null;
   return { owner, repo, kind };
 }
 
@@ -153,11 +176,18 @@ export function parseEngineRoute(pathname: string, method: string): EngineRoute 
   } catch {
     return null; // engine repoPath 404s undecodable owner/name pre-auth
   }
-  if (!REPO_NAME.test(owner) || !REPO_NAME.test(name)) return null;
   if (ENGINE_RESERVED.has(owner)) return null;
 
-  // The repo name carries the same `.git` trim as the git routes (§4.4).
+  // The repo name carries the same `.git` trim as the git routes (§4.4) —
+  // before the alphabet check, the git-route twin's salvage fix (the raw
+  // name with the suffix on fails the leading-underscore rule).
   const repo = name.endsWith(".git") ? name.slice(0, -4) : name;
+  if (!REPO_NAME.test(owner) || (!REPO_NAME.test(name) && !INFRA_REPO_NAMES.has(repo))) return null;
+  // The infrastructure-cell admission runs against the STRIPPED name here
+  // too (parseGitHttpRoute's note; these paths stay the engine passthrough
+  // for the rowless cell — the admission only lets the parse claim the
+  // shape so the D1-miss flow keeps its engine behavior).
+  if (!REPO_NAME.test(repo) && !INFRA_REPO_NAMES.has(repo)) return null;
 
   // Repo-root shapes: sub "/" per the engine's router (a missing or empty
   // wildcard). DELETE is the engine's wipe; every other method is a page

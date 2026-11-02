@@ -67,10 +67,13 @@ import { doerRepoAccessMode } from "../api/services/repository";
 import { addDeployKeyToken } from "../api/services/deploy-keys";
 import { TeamsService } from "../api/routes/org-teams";
 import { OrgService } from "../services/orgs/orgs";
-import { settleCreatingRepo } from "./gate";
+import { settleCreatingRepo, applyPushTail, type PushTailCommands } from "./gate";
 import { createWikiPage } from "../services/wiki";
-import { deployKeys, repoCounters, repoRedirects, repoSettings, repositories, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
+import { ensureCargoIndexMirror } from "../services/packages/cargo-index";
+import type { AutoMergeCheckMessage } from "../services/pull-automerge";
+import { deployKeys, repoCounters, repoRedirects, repoSettings, repositories, issues, releases, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
 import { purgeRepoMessage } from "../repos/purge";
+import { IssuesService } from "../issues/service";
 import { RepoService } from "../repos/service";
 import { LFS_MEDIA_TYPE } from "../services/lfs/batch";
 import { ZERO_OID, buildPack, buildReceivePackBody, pktLine } from "../repos/testing/git-pack";
@@ -703,7 +706,7 @@ describe("settleCreatingRepo emits repository action=created (the push-create ar
     // carry the REQUEST origin (appOrigin's middle leg, the zero-config
     // fallback the settle threads from the receive in hand).
     const noVarRow = await seedCreatingRepoWithRef("settledorigin");
-    await settleCreatingRepo({ DB: env.DB, REPO: env.REPO, REPO_PACKS: env.REPO_PACKS }, noVarRow, "alice/settledorigin", requestOrigin);
+    await settleCreatingRepo({ DB: env.DB, REPO: env.REPO, REPO_PACKS: env.REPO_PACKS, REPO_TASKS: env.REPO_TASKS }, noVarRow, "alice/settledorigin", requestOrigin);
     let rows = await settleDeliveries(hookId);
     expect(rows).toHaveLength(1);
     const noVarPayload = JSON.parse(rows[0]!.payloadContent) as { repository: { html_url: string } };
@@ -1940,5 +1943,298 @@ describe("upstream-parity arms: mirror 403 body, pre-auth 403s, go-get on every 
     const head = await SELF.fetch("https://example.com/nobody/nothing.git/HEAD?go-get=1");
     expect(head.status).toBe(404);
     expect(await head.text()).not.toContain("go-import");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The R5/D-7c push tail (the v1.5.3 continuation): a receive-pack's tag
+// deletions run upstream PushUpdateDeleteTags' D1 lifecycle (models/repo/
+// release.go:465-492 — the is_tag records die, the real releases withdraw to
+// draft with the zero-valued sha1/num_commits/published_unix), and a PR-head
+// push (refs/pull/N/head) enqueues ONE auto-merge-check REPO_TASKS message.
+// The command collection rides the receive validator (in-process — the
+// engine surfaces its applied updates only on the worker entry's onPush
+// hook), and applyPushTail verifies against the post-commit refs before
+// touching D1, so a CAS-conflicted delete ("fetch first" ng) flips nothing.
+// ---------------------------------------------------------------------------
+
+
+/** A sendBatch-recording REPO_TASKS stub (pull-automerge.test.ts's
+ *  spyQueue shape). */
+function spyQueue(): { sendBatch: (messages: { body: unknown }[]) => Promise<unknown>; bodies: { body: unknown }[][] } {
+  const bodies: { body: unknown }[][] = [];
+  return {
+    bodies,
+    sendBatch: (messages) => {
+      bodies.push(messages);
+      return Promise.resolve();
+    },
+  };
+}
+
+/** alice/<slug> via RepoService with a pushed main; returns the row + the
+ *  owner's write token (the tag-protection-push fixture shape). */
+async function seedTailRepo(slug: string): Promise<{ repoId: string; engineName: string; ownerId: number; token: string; tip: string }> {
+  const alice = await seedVerifiedUser({ username: "Alice" });
+  const created = await repoService().create({
+    owner: { id: alice.id, usernameLower: "alice" },
+    name: slug,
+    isPrivate: false,
+  });
+  const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+  const { oid, pack } = await buildPack();
+  const body = buildReceivePackBody([{ ref: "refs/heads/main", oid }], pack);
+  const push = await SELF.fetch(`https://example.com/alice/${slug}.git/git-receive-pack`, {
+    method: "POST",
+    headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+    body,
+  });
+  expect(push.status).toBe(200);
+  return { repoId: created.id, engineName: `alice/${slug}`, ownerId: alice.id, token, tip: oid };
+}
+
+/** Seed one release row (a real release or a tag-only record) through the
+ *  shared service (the releases.test.ts seeding shape). */
+async function seedReleaseRow(repoId: string, publisherId: number, tag: string, isTag: boolean): Promise<number> {
+  const row = await new IssuesService(env.DB).createRelease({
+    repoId,
+    publisherId,
+    tagName: tag,
+    target: "main",
+    title: `Rel ${tag}`,
+    note: "",
+    isDraft: false,
+    isPrerelease: false,
+    isTag,
+    now: new Date(),
+  });
+  return row.id;
+}
+
+describe("the R5 push tail: git-push tag deletion draft-flips releases (PushUpdateDeleteTags, release.go:465-492)", () => {
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM releases").run();
+    await env.DB.prepare("DELETE FROM issues").run();
+  });
+
+  it("a receive-pack tag delete draft-flips the release and drops the tag-only record (end-to-end)", async () => {
+    const { repoId, engineName, ownerId, token, tip } = await seedTailRepo("r5flip");
+    // Engine refs first: v1 and v2 exist as real tag refs (buildPack's commit).
+    const cell = env.REPO.getByName(engineName);
+    for (const ref of ["refs/tags/v1", "refs/tags/v2"]) {
+      const landed = await cell.commitApiChange({ ref, expectedOldOid: ZERO_OID, newOid: tip });
+      expect(landed.tag).toBe("committed");
+    }
+    const releaseId = await seedReleaseRow(repoId, ownerId, "v1", false);
+    const tagOnlyId = await seedReleaseRow(repoId, ownerId, "v2", true);
+    // The release is published and filled (the state a delete withdraws).
+    await drizzle(env.DB)
+      .update(releases)
+      .set({ publishedUnix: 1_700_000_000, sha1: tip, numCommits: 3 })
+      .where(eq(releases.id, releaseId));
+
+    // THE PUSH: delete both tags over the real receive-pack (old = the live
+    // tip, new = the zero oid — a delete command carries NO pack; the
+    // tag-protection-push suite's receiveBody shape). The tail runs in
+    // waitUntil on the runner (production ctx.waitUntil; observed landed
+    // within seconds — the settle precedent), so poll for the flip.
+    const section =
+      pktLine(`${tip} ${ZERO_OID} refs/tags/v1\0report-status side-band-64k`) +
+      pktLine(`${tip} ${ZERO_OID} refs/tags/v2`) +
+      "0000";
+    const push = await SELF.fetch(`https://example.com/${engineName}.git/git-receive-pack`, {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: new TextEncoder().encode(section),
+    });
+    expect(push.status).toBe(200);
+
+    await vi.waitFor(
+      async () => {
+        const flipped = await drizzle(env.DB).select().from(releases).where(eq(releases.id, releaseId)).get();
+        // The real release SURVIVES, withdrawn to draft with the zero-valued
+        // Cols (release.go:480-490 — is_draft, num_commits, sha1,
+        // published_unix).
+        expect(flipped?.isDraft).toBe(true);
+        expect(flipped?.publishedUnix).toBe(0);
+        expect(flipped?.sha1).toBe("");
+        expect(flipped?.numCommits).toBe(0);
+      },
+      { timeout: 15_000, interval: 300 },
+    );
+    // The tag-only record DIED with its tag (release.go:471-478).
+    expect(await drizzle(env.DB).select().from(releases).where(eq(releases.id, tagOnlyId)).all()).toEqual([]);
+    // The engine refs are gone (the receive itself, not the tail).
+    const refs = (await cell.listRefs()).refs.map((r) => r.name);
+    expect(refs).not.toContain("refs/tags/v1");
+    expect(refs).not.toContain("refs/tags/v2");
+  });
+
+  it("a CAS-conflicted delete (the ref still present post-push) flips nothing (the verify arm)", async () => {
+    const { repoId, engineName, ownerId } = await seedTailRepo("r5conflict");
+    const cell = env.REPO.getByName(engineName);
+    const landed = await cell.commitApiChange({ ref: "refs/tags/v1", expectedOldOid: ZERO_OID, newOid: (await cell.listRefs()).refs.find((r) => r.name === "refs/heads/main")!.target });
+    expect(landed.tag).toBe("committed");
+    const releaseId = await seedReleaseRow(repoId, ownerId, "v1", false);
+
+    // The tail invoked with a delete whose ref is STILL THERE (the shape a
+    // CAS-conflicted command leaves behind): the verify filters it, D1
+    // untouched.
+    const tail: PushTailCommands = { tagDeletes: ["v1"], prHeadPushes: [] };
+    await applyPushTail(env, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, tail);
+
+    const row = await drizzle(env.DB).select().from(releases).where(eq(releases.id, releaseId)).get();
+    expect(row?.isDraft).toBe(false);
+    // The service stamped published_at on the seeded publish — untouched
+    // means the withdrawal never ran.
+    expect((row?.publishedUnix ?? 0)).toBeGreaterThan(0);
+  });
+
+  it("the D-7c producer: a PR-head push enqueues ONE auto-merge-check message, non-PR-head shapes enqueue zero", async () => {
+    const { repoId, engineName } = await seedTailRepo("d7c");
+    // PR index 7 exists (the issues row the refs/pull/N/head index resolves).
+    const inserted = await drizzle(env.DB)
+      .insert(issues)
+      .values({ repoId, index: 7, title: "PR seven", isPull: true, isClosed: false, createdAt: new Date(), updatedAt: new Date() })
+      .returning({ id: issues.id });
+    const issueId = inserted[0]!.id;
+
+    const queue = spyQueue();
+    const tailEnv = { ...env, REPO_TASKS: queue };
+    // The PR-head push: exactly ONE message, resolved to the global issue id.
+    await applyPushTail(tailEnv, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, {
+      tagDeletes: [],
+      prHeadPushes: [7],
+    });
+    expect(queue.bodies.length).toBe(1);
+    const first = (queue.bodies[0] ?? []).map((wrapper) => wrapper.body as AutoMergeCheckMessage);
+    expect(first).toEqual([{ kind: "auto-merge-check", issueId }]);
+
+    // A crafted duplicate command for the same head still sends ONE (dedupe).
+    await applyPushTail(tailEnv, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, {
+      tagDeletes: [],
+      prHeadPushes: [7, 7],
+    });
+    expect((queue.bodies[1] ?? []).length).toBe(1);
+
+    // Non-PR-head shapes: an empty tail and an unknown PR index send NOTHING.
+    const quiet = spyQueue();
+    await applyPushTail({ ...env, REPO_TASKS: quiet }, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, {
+      tagDeletes: [],
+      prHeadPushes: [],
+    });
+    await applyPushTail({ ...env, REPO_TASKS: quiet }, (await drizzle(env.DB).select().from(repositories).where(eq(repositories.id, repoId)).get())!, engineName, {
+      tagDeletes: [],
+      prHeadPushes: [99], // no issues row at index 99
+    });
+    expect(quiet.bodies).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The rowless `_cargo-index` git family (S-2 — upstream's cargo sparse-index
+// mirror repository, services/packages/cargo/index.go IndexRepositoryName,
+// cloneable at {origin}/{owner}/_cargo-index.git). The wiki family's
+// contract mirrored: the OWNER resolves (never a repo row), the index cell
+// is upstream-born public, reads seed the priv:1 registry row before the
+// forward, writes need the owner or a site admin, and a repositories ROW at
+// the address is user-owned — the ordinary flow serves it.
+// ---------------------------------------------------------------------------
+
+/** Seed the mirror cell through the REAL production path (the config root
+ *  commit on refs/heads/main), then return the owner. */
+async function seedCargoIndexFixture(username: string): Promise<{ ownerId: number; token: string }> {
+  const owner = await seedVerifiedUser({ username });
+  await ensureCargoIndexMirror({ repo: env.REPO, origin: "https://example.com" }, env.DB, owner.id);
+  const token = (await mintFor(owner.id, "w", "write:repository")).plaintext;
+  return { ownerId: owner.id, token };
+}
+
+describe("the _cargo-index git family (S-2 — the wiki family's contract over the rowless cell)", () => {
+  it("serves the anonymous clone advert of a public owner's mirror cell, registry row seeded index-hidden", async () => {
+    const { ownerId } = await seedCargoIndexFixture("cargoalice");
+    const cellTip = (await env.REPO.getByName("cargoalice/_cargo-index").listRefs()).refs.find((r) => r.name === "refs/heads/main")?.target;
+
+    const advert = await SELF.fetch("https://example.com/cargoalice/_cargo-index.git/info/refs?service=git-upload-pack");
+    expect(advert.status).toBe(200);
+    expect(advert.headers.get("content-type")).toBe("application/x-git-upload-pack-advertisement");
+    const body = new TextDecoder().decode(await advert.arrayBuffer());
+    expect(body).toContain("refs/heads/main");
+    expect(body).toContain(cellTip);
+
+    // The seed discipline (the wiki family's, verbatim): priv=1 — hidden
+    // from every engine index; the gate-owned ACL owns authorization.
+    const row = await env.REGISTRY.getByName("registry").get("cargoalice/_cargo-index");
+    expect(row).not.toBeNull();
+    expect(row?.priv).toBe(1);
+    expect(ownerId).toBeGreaterThan(0);
+  });
+
+  it("serves the mirror cell's synthetic HEAD and 404s an unknown owner (the bare-404 arm)", async () => {
+    await seedCargoIndexFixture("cargohead");
+    const head = await SELF.fetch("https://example.com/cargohead/_cargo-index.git/HEAD");
+    expect(head.status).toBe(200);
+    expect(head.headers.get("content-type")).toBe("text/plain");
+    expect(new TextDecoder().decode(await head.arrayBuffer())).toBe("ref: refs/heads/main\n");
+
+    // No owner row at the namespace → the bare 404 for every credential
+    // (the wiki family's no-parent arm; the push-create surface never
+    // claims the name).
+    const missing = await SELF.fetch("https://example.com/ghost/_cargo-index.git/info/refs?service=git-upload-pack");
+    expect(missing.status).toBe(404);
+  });
+
+  it("masks the cell behind the owner's visibility: private owner challenges anonymous, 404s a stranger, serves the owner", async () => {
+    const { ownerId, token } = await seedCargoIndexFixture("cargohide");
+    const cellTip = (await env.REPO.getByName("cargohide/_cargo-index").listRefs()).refs.find((r) => r.name === "refs/heads/main")?.target;
+    await drizzle(env.DB).update(users).set({ visibility: "private" }).where(eq(users.id, ownerId));
+    const stranger = await seedVerifiedUser({ username: "CargoBob" });
+    const strangerToken = (await mintFor(stranger.id, "r", "read:repository")).plaintext;
+
+    const anon = await SELF.fetch("https://example.com/cargohide/_cargo-index.git/info/refs?service=git-upload-pack");
+    expect(anon.status).toBe(401);
+    expect(anon.headers.get("www-authenticate")).toBe(CHALLENGE);
+
+    const masked = await SELF.fetch("https://example.com/cargohide/_cargo-index.git/info/refs?service=git-upload-pack", {
+      headers: { authorization: basicTokenHeader(strangerToken) },
+    });
+    expect(masked.status).toBe(404);
+    expect(new TextDecoder().decode(await masked.arrayBuffer())).toBe("Repository not found");
+
+    const ownerView = await SELF.fetch("https://example.com/cargohide/_cargo-index.git/info/refs?service=git-upload-pack", {
+      headers: { authorization: basicTokenHeader(token) },
+    });
+    expect(ownerView.status).toBe(200);
+    expect(new TextDecoder().decode(await ownerView.arrayBuffer())).toContain(cellTip);
+  });
+
+  it("keeps writes owner/admin-only: anonymous 401, a stranger 404-masked, the owner's push lands in the cell", async () => {
+    const { ownerId, token } = await seedCargoIndexFixture("cargopush");
+    const stranger = await seedVerifiedUser({ username: "CargoPushBob" });
+    const strangerToken = (await mintFor(stranger.id, "w", "write:repository")).plaintext;
+
+    const anon = await SELF.fetch("https://example.com/cargopush/_cargo-index.git/info/refs?service=git-receive-pack");
+    expect(anon.status).toBe(401);
+    expect(anon.headers.get("www-authenticate")).toBe(CHALLENGE);
+
+    const { oid, pack } = await buildPack();
+    const pushBody = buildReceivePackBody([{ ref: "refs/heads/notes", oid }], pack);
+    const strangerPush = await SELF.fetch("https://example.com/cargopush/_cargo-index.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(strangerToken), "content-type": RECEIVE_CT },
+      body: pushBody,
+    });
+    expect(strangerPush.status).toBe(404);
+
+    const ownerPush = await SELF.fetch("https://example.com/cargopush/_cargo-index.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(token), "content-type": RECEIVE_CT },
+      body: buildReceivePackBody([{ ref: "refs/heads/notes", oid }], pack),
+    });
+    expect(ownerPush.status).toBe(200);
+    const refs = (await env.REPO.getByName("cargopush/_cargo-index").listRefs()).refs.map((r) => r.name);
+    expect(refs).toContain("refs/heads/notes");
+    expect(refs).toContain("refs/heads/main");
+    expect(ownerId).toBeGreaterThan(0);
   });
 });

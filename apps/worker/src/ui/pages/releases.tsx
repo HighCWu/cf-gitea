@@ -57,10 +57,11 @@
  * tag-only rows excluded, drafts included for writers only,
  * `created_unix DESC, id DESC`); the Latest mark rides `findLatestRelease`
  * (the API's GetLatestReleaseByRepoID arm — the install-script contract);
- * detail rides `findReleaseByTag` with the API's exact visibility rules
- * (`assertNotTagRecord` + `assertDraftVisible` postures — tag-only records
- * and foreign-eye drafts 404); assets ride `listReleaseAssets` +
- * `toApiAttachment` (the landed asset URLs); notes render through the shared
+ * detail rides `findReleaseByTag` with the SingleRelease rules (R12: the
+ * lookup includes tag-only records and renders them as the PageIsSingleTag
+ * page; drafts stay write-gated — `assertDraftVisible`'s posture); assets
+ * ride `listReleaseAssets` + `toApiAttachment` (the landed asset URLs, the
+ * R13 unique-name flip included); notes render through the shared
  * markdown pipeline (§3.4 — the issue-detail `comment` mode, imported from
  * pages/issue-detail.tsx so the two bodies can never diverge). The write
  * goes through `IssuesService.createRelease` (the landed create arm with its
@@ -107,14 +108,14 @@
  *   tab) and, since the git-e2e F9 fix, on the DETAIL page too: upstream
  *   renders release_tag_header on EVERY tplReleasesList render (SingleRelease
  *   included — release.go:335 `ctx.HTML(http.StatusOK, tplReleasesList)`),
- *   with the Tags item ACTIVE only on the tags page/single-tag arm
- *   (`{{if or .PageIsTagList .PageIsSingleTag}}active{{end}}`) — our detail
- *   is always a REAL release (tag-only rows 404), so Releases stays active
- *   and Tags renders plain, the list page's exact shape. The count is the
- *   engine refs/tags universe (the ReleasesData.numTags note upstream counts
- *   releases-table tag records). The RSS button stays unrendered — the
- *   feed family is the repo header's links (wave-2e), not this header's
- *   button surface.
+ *   with the Tags item ACTIVE on the tags page AND the single-tag render
+ *   (`{{if or .PageIsTagList .PageIsSingleTag}}active{{end}}`). Since R2/R12
+ *   (the v1.5.2 wave) a deleted release CONVERTS to an is_tag record and the
+ *   detail page renders it as the SingleTag page — Tags goes active there
+ *   (releasesLocale's count is the engine refs/tags universe, the
+ *   ReleasesData.numTags note upstream counts releases-table tag records).
+ *   The RSS button stays unrendered — the feed family is the repo header's
+ *   links (wave-2e), not this header's button surface.
  * - The tab strip's Releases count label (`{{if .NumReleases}}` — computed
  *   per repo page upstream, services/context/repo.go:634) is unrendered:
  *   D1 keeps no maintained num_releases counter and the shared shell would
@@ -151,8 +152,11 @@
  *   render since the P2-7 remaining-S wave (release/list.tmpl:78-89 — the
  *   non-draft gate; the wave-32 web-shape archive route the old reduction
  *   called missing is LANDED, so the premise was stale); the attachment
- *   rows render the landed `browser_download_url` (`/attachments/{uuid}`)
- *   whose serving route is the survey's separate S row
+ *   rows render the landed `browser_download_url` — the R13 flip (the v1.5.2
+ *   wave): the unique-name `/releases/download/{tag}/{name}` when a
+ *   release's asset names are unique, the uuid `/attachments/{uuid}` shape
+ *   on duplicates, exactly upstream's DownloadURL.
+ *   The uuid arm's serving route is the survey's separate S row
  *   (`/releases/attachments/{uuid}`).
  * - The create form's JS tag dropdown reduces to a native `<select>` over
  *   the branch universe (the file-editor target-branch select); the two
@@ -182,6 +186,7 @@ import {
   findReleaseForRepoById,
   listReleases,
   toApiRelease,
+  uniqueNameDownloadUrlBuilder,
 } from "../../api/services/releases";
 import { engineReads } from "../../api/services/engine";
 import {
@@ -350,10 +355,16 @@ async function enrichEntries(
   }
   return Promise.all(
     rows.map(async (row): Promise<ReleaseEntry> => {
-      const assets = (await listReleaseAssets(d1, row.id)).map((assetRow): ReleaseAssetView => {
+      const assetRows = await listReleaseAssets(d1, row.id);
+      // The R13 flip rides the UI rows too (list.tmpl renders
+      // `$att.DownloadURL` — upstream's DownloadURL carries the same
+      // unique-name CustomDownloadURL; uniqueNameDownloadUrlBuilder returns
+      // undefined on duplicate names and the uuid shape stands in).
+      const downloadUrl = uniqueNameDownloadUrlBuilder(origin, repo, row.tagName, assetRows);
+      const assets = assetRows.map((assetRow): ReleaseAssetView => {
         return {
           row: assetRow,
-          downloadUrl: toApiAttachment(origin, assetRow).browser_download_url ?? "",
+          downloadUrl: toApiAttachment(origin, assetRow, downloadUrl?.(assetRow.name)).browser_download_url ?? "",
           sizeText: formatByteSize(assetRow.size),
         };
       });
@@ -432,11 +443,16 @@ export async function loadReleasesData(
 // ---------------------------------------------------------------------------
 
 /**
- * Load one release by tag with the API family's exact visibility rules
- * (findReleaseByTag → assertNotTagRecord → assertDraftVisible postures):
- * a missing or tag-only row answers null, a draft answers null for viewers
- * without the write grant (the recurring 404 — the service module's
- * canAccessReleaseDraft note).
+ * Load one release by tag with the upstream SingleRelease rules (R12 —
+ * routers/web/repo/release.go:303-339): the release-table lookup INCLUDES
+ * tag-only records (`IncludeTags: true`), drafts stay write-gated
+ * (`IncludeDrafts: writeAccess`), a miss 404s, and a tag-only record renders
+ * the SingleTag page (PageIsSingleTag — the same list template, the title
+ * falling back to the tag name, release.go:331-334). Before the R2
+ * conversion landed this row never existed in our tree, so the loader's old
+ * `isTag → null` arm was the documented corollary; now a deleted release
+ * leaves its record behind and the tag page must render it exactly like
+ * upstream's.
  */
 export async function loadReleaseDetailData(
   env: Env,
@@ -447,7 +463,7 @@ export async function loadReleaseDetailData(
   origin: string,
 ): Promise<ReleaseEntry | null> {
   const row = await findReleaseByTag(d1, repo.id, tag);
-  if (row === null || row.isTag) return null;
+  if (row === null) return null;
   if (row.isDraft && !canWrite) return null;
   const [latest, tags] = await Promise.all([findLatestRelease(d1, repo.id), tagTipsOf(env, repo)]);
   const [entry] = await enrichEntries(env, d1, repo, [row], latest?.id ?? -1, origin, tags);
@@ -738,13 +754,14 @@ export type DeleteReleaseResult =
 /**
  * The delete write (upstream DeleteRelease → deleteReleaseOrTag(isDelTag
  * =false), release.go:656-706): the row lookup by the form's `id`
- * (GetReleaseForRepoByID — a miss 404s), then the LANDED `deleteRelease`
- * cascade (the row + its assets — upstream keeps a converted tag-only
- * record behind delTag=false and keeps the git tag; our landed DELETE arm
- * drops the row outright and the git tag was never ours to touch — the API
- * seam's documented semantics, the tags page still shows the tag), then the
- * `release` "deleted" webhook through the shared emit seam, drafts silent
- * (upstream `if !rel.IsDraft` + the API DELETE route's exact emit).
+ * (GetReleaseForRepoByID — a miss 404s), then `deleteRelease` — the R2
+ * conversion: the row flips to `is_tag = true` (a re-create keeps the id,
+ * the tags-API delete finds the record), the asset rows + R2 objects +
+ * reactions are swept (R4), the git tag is untouched — then the
+ * `release` "deleted" webhook through the shared emit seam with the
+ * PRE-wipe assets (upstream's DeleteReleaseByID loads Attachments before
+ * DeleteAttachmentsByRelease, release.go:418-424), drafts silent (upstream
+ * `if !rel.IsDraft` + the API DELETE route's exact emit).
  */
 export async function deleteReleaseFromForm(input: {
   env: Env;
@@ -757,11 +774,11 @@ export async function deleteReleaseFromForm(input: {
 }): Promise<DeleteReleaseResult> {
   const row = await findReleaseForRepoById(input.env.DB, input.repo.id, input.id);
   if (row === null) return { outcome: "missing", name: `#${input.id}` };
-  await deleteRelease(input.env.DB, row);
+  const { assets } = await deleteRelease(input.env, input.env.DB, row);
   if (!row.isDraft) {
     try {
       const apiViewer = { origin: input.origin, requester: apiUserFromRow(input.doer, { origin: input.origin, requester: null }) };
-      const rendered = await toApiRelease(input.env.DB, apiViewer, input.pair, row);
+      const rendered = await toApiRelease(input.env.DB, apiViewer, input.pair, row, assets);
       await emitIssueEvent(input.request, {
         repoId: input.repo.id,
         ownerId: input.repo.ownerId,
@@ -806,17 +823,21 @@ function ReleasesHeader(props: {
    *  by the DETAIL page (the entry's `numTags` — SingleRelease renders the
    *  same header). Upstream keeps Releases ACTIVE on the list and on the
    *  real-release detail (`PageIsReleaseList && !PageIsSingleTag`) and hands
-   *  active to Tags only on the tags page itself — the plain item here. */
+   *  active to Tags on the tags page AND the single-tag render
+   *  (`{{if or .PageIsTagList .PageIsSingleTag}}active{{end}}` — R12). */
   tags?: { href: string; count: number };
+  /** The single-tag render's active swap (R12): Tags active, Releases
+   *  plain — release_tag_header.tmpl's `or PageIsTagList PageIsSingleTag`. */
+  tagsActive?: boolean;
 }) {
   return (
     <div class="flex-left-right">
       <h2 class="ui compact small menu small-menu-items">
-        <a class="active item" href={props.basePath}>
+        <a class={props.tagsActive === true ? "item" : "active item"} href={props.basePath}>
           {prettyNumber(props.total)} {props.total === 1 ? releasesLocale.release : releasesLocale.page_title}
         </a>
         {props.tags !== undefined ? (
-          <a class="item" href={props.tags.href}>
+          <a class={props.tagsActive === true ? "active item" : "item"} href={props.tags.href}>
             {prettyNumber(props.tags.count)} {props.tags.count === 1 ? releasesLocale.tag : releasesLocale.tags_label}
           </a>
         ) : null}
@@ -873,8 +894,11 @@ function ReleaseAssetItem(props: { asset: ReleaseAssetView }) {
  *  `firstOpen`: the `<details class="download">` opens for the first entry
  *  of the page render (`{{if eq $idx 0}}open{{end}}`). `canEdit`: the
  *  wave-33 edit pencil (list.tmpl's `{{if and $.CanCreateRelease
- *  (not $.PageIsSingleTag)}}` — the detail render passes false). */
-export function ReleaseEntryItem(props: { entry: ReleaseEntry; repoLink: string; firstOpen: boolean; canEdit?: boolean }) {
+ *  (not $.PageIsSingleTag)}}` — the detail render passes false).
+ *  `singleTag`: the PageIsSingleTag render's title arm — the title is PLAIN
+ *  text there (no `/releases/tag/` self-link, list.tmpl's
+ *  `{{if $.PageIsSingleTag}}` — R12). */
+export function ReleaseEntryItem(props: { entry: ReleaseEntry; repoLink: string; firstOpen: boolean; canEdit?: boolean; singleTag?: boolean }) {
   const { entry, repoLink } = props;
   const { row } = entry;
   const escapedTag = pathEscapeSegments(row.tagName);
@@ -907,9 +931,15 @@ export function ReleaseEntryItem(props: { entry: ReleaseEntry; repoLink: string;
               are unchanged, the commit-list scope=col precedent of additive
               a11y deviations). */}
           <h3 class="release-list-title tw-break-anywhere">
-            <a class="muted" href={`${repoLink}/releases/tag/${escapedTag}`}>
-              {releaseTitleOf(entry)}
-            </a>
+            {props.singleTag === true ? (
+              // PageIsSingleTag's title arm (list.tmpl:30 — the plain text,
+              // no self-link; R12).
+              <span class="muted">{releaseTitleOf(entry)}</span>
+            ) : (
+              <a class="muted" href={`${repoLink}/releases/tag/${escapedTag}`}>
+                {releaseTitleOf(entry)}
+              </a>
+            )}
             <ReleaseLabel entry={entry} />
           </h3>
           {/* The wave-33 edit pencil (list.tmpl's CanCreateRelease arm —
@@ -1076,14 +1106,20 @@ export function ReleasesPage(props: { ctx: UiContext; data: ReleasesData; flash?
 
 /** The release detail page — upstream SingleRelease renders the SAME list
  *  template over one row (release.go:327 tplReleasesList); the title is the
- *  release's (or the tag's), the header menu shows the repo's totals
- *  (F9: the Tags item included — the entry's numTags the detail loader
- *  attaches). */
+ *  release's (or the tag's — a tag-only record's title falls back to the
+ *  tag name, release.go:331-332, R12), the header menu shows the repo's
+ *  totals (F9: the Tags item included — the entry's numTags the detail
+ *  loader attaches), and a TAG-ONLY record renders the PageIsSingleTag
+ *  shape: the title plain (no self-link), the edit pencil hidden (R12;
+ *  the pencil was already detail-absent, now it is contract-explicit), the
+ *  Tags menu item active
+ *  (`{{if or .PageIsTagList .PageIsSingleTag}}active{{end}}`). */
 export function renderReleaseDetailPage(options: { ctx: UiContext; entry: ReleaseEntry; total: number }): string {
   const { ctx, entry, total } = options;
   const repo = ctx.repo;
   if (repo === undefined) throw new Error("renderReleaseDetailPage requires ctx.repo");
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
+  const singleTag = entry.row.isTag;
   return renderPage(
     <BaseLayout ctx={ctx} title={releaseTitleOf(entry)} pageClass="repository releases" activeTab="releases">
       <div class="ui container">
@@ -1096,10 +1132,11 @@ export function renderReleaseDetailPage(options: { ctx: UiContext; entry: Releas
           canCreate={false}
           newHref={null}
           tags={entry.numTags !== undefined ? { href: `${repoLink}/tags`, count: entry.numTags } : undefined}
+          tagsActive={singleTag}
         />
         <div class="divider" />
         <ul id="release-list">
-          <ReleaseEntryItem entry={entry} repoLink={repoLink} firstOpen={true} />
+          <ReleaseEntryItem entry={entry} repoLink={repoLink} firstOpen={true} canEdit={false} singleTag={singleTag} />
         </ul>
       </div>
     </BaseLayout>,

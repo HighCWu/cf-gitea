@@ -393,7 +393,7 @@ describe("POST /repos/{owner}/{repo}/releases/{id}/assets (repoCreateReleaseAtta
 });
 
 describe("GET /repos/{owner}/{repo}/releases/{id}/assets (repoListReleaseAttachments)", () => {
-  it("lists a release's assets in id order with the Attachment shape", async () => {
+  it("lists a release's assets in name order (R14 — the Asc(release_id,name) read) with the Attachment shape", async () => {
     const releaseId = await seedRelease();
     for (const name of ["beta.zip", "alpha.zip"]) {
       const body = new TextEncoder().encode(`bytes of ${name}`);
@@ -407,7 +407,7 @@ describe("GET /repos/{owner}/{repo}/releases/{id}/assets (repoListReleaseAttachm
     const res = await makeApp()(`${REPO_PATH}/releases/${releaseId}/assets`);
     expect(res.status).toBe(200);
     const list = await res.json<Record<string, unknown>[]>();
-    expect(list.map((asset) => asset.name)).toEqual(["beta.zip", "alpha.zip"]);
+    expect(list.map((asset) => asset.name)).toEqual(["alpha.zip", "beta.zip"]); // name asc, NOT the seeded id order
     for (const asset of list) {
       expect(asset.size).toBe(`bytes of ${String(asset.name)}`.length);
       expect(asset.download_count).toBe(0);
