@@ -468,13 +468,16 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
     expect(headings.map((el) => accessibleName(el))).toEqual(["User Account Management (Total: 4)"]);
   });
 
-  it("admin-users: the users table's header cells are named — and all nine carry scope (the closed gap's membership arm)", () => {
+  it("admin-users: the users table's header cells are named — and all ten carry scope (the closed gap's membership arm)", () => {
     const root = parseHtmlTree(adminUsersGolden);
     const table = descendants(root).find((el) => el.tag === "table");
     expect(table, "the users table").toBeDefined();
     const thead = (table ?? root).children.find((el) => el.tag === "thead");
     expect(thead, "the users table has a thead").toBeDefined();
     const ths = descendants(thead ?? root).filter((el) => el.tag === "th");
+    // The tenth cell is list.tmpl:105's EMPTY actions-column header (the
+    // upstream template's own unnamed `<th></th>` — the B1 actions pair
+    // under it is per-row icon links with aria-labels).
     expect(ths.map((el) => accessibleName(el))).toEqual([
       "ID",
       "Username",
@@ -485,6 +488,7 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
       "2FA",
       "Created",
       "Last Sign-In",
+      "",
     ]);
     // The gap's fix flipped to membership: every header cell now carries
     // scope="col" (the fix landed with the golden regeneration — see the
@@ -986,14 +990,20 @@ describe("wave-129 expansion arms (explicit cases, not the shared table)", () =>
 
   it("profile-activity: the overview strip marks Public Activity active, the avatar card renders, and the three create-repo rows carry the pinned epoch", () => {
     const root = parseHtmlTree(profileActivityGolden);
-    // The signed-in self-view strip: four arms, the ?tab=activity arm active.
-    // Names are the walker's exact accessible names — the count label joins
-    // its anchor text with no separator ("Repositories3").
+    // The signed-in self-view strip: seven arms in header.tmpl's order, the
+    // ?tab=activity arm active — the C1 Projects/Code tabs (their pages are
+    // live) sit between Repositories and Activity, Packages rides the
+    // strict-polarity flag. Names are the walker's exact accessible names —
+    // the count label joins its anchor text with no separator
+    // ("Repositories3").
     const strip = descendants(root).find((el) => el.tag === "overflow-menu");
     expect(strip, "the profile tab strip").toBeDefined();
     const tabs = descendants(strip ?? root).filter((el) => el.tag === "a");
     expect(tabs.map((el) => [el.attrs.href, hasClass(el, "active"), accessibleName(el)])).toEqual([
       ["/alice?tab=repositories", false, "Repositories3"],
+      ["/alice/-/projects", false, "Projects"],
+      ["/alice/-/packages", false, "Packages"],
+      ["/alice/-/code", false, "Code"],
       ["/alice?tab=activity", true, "Public Activity"],
       ["/alice?tab=stars", false, "Starred Repositories"],
       ["/alice?tab=watching", false, "Watched Repositories"],

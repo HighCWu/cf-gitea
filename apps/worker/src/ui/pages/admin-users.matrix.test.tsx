@@ -18,9 +18,11 @@
  *     with the total, the search form + filter radios' checked states, the
  *     row projection (the Admin label, the constant Local/Auth-Source and
  *     Never-Signed-In cells, the check/x svgs, the AbsoluteShort created
- *     stamp), the no-results row, the pager hrefs — and the dead-link
- *     assertions (no per-row details/edit links, no New Account button),
- *     plus the row-link posture: active rows carry upstream's HomeLink
+ *     stamp), the no-results row, the pager hrefs — and the actions-column
+ *     assertions (the per-row details/edit pair against the LIVE
+ *     /-/admin/users/{id}[/edit] targets, list.tmpl:130-135; the New
+ *     Account button stays omitted), plus the row-link posture: active rows
+ *     carry upstream's HomeLink
  *     (list.tmpl:109) while prohibited rows — the synthetic
  *     `gitea:deploy-key` negative-id identity included — render the name
  *     PLAIN (the link-crawl D1/D2 fix; the module header).
@@ -297,11 +299,24 @@ describe("the admin users DOM (templates/admin/user/list.tmpl at the pin)", () =
     expect(html).not.toContain(">Newer<"); // page 1
   });
 
-  it("renders NO dead controls — no per-row details/edit links and no New Account button", async () => {
+  it("renders the per-row details/edit actions against the LIVE targets; the New Account button stays omitted", async () => {
     await seedBaseFixtures();
-    const html = render(await load(""));
-    expect(html).not.toContain('href="/-/admin/users/'); // the details/edit targets (list.tmpl:132-133)
-    expect(html).not.toContain('href="/-/admin/users/new"'); // list.tmpl:6
+    const data = await load("");
+    const html = render(data);
+    // list.tmpl:130-135's pair onto the landed detail + edit pages (the
+    // admin-badges row-actions DOM: tooltip + aria per link). Every row —
+    // the prohibited carol included — carries the pair (the actions target
+    // the ADMIN surfaces, not the profile); the ids ride the loaded rows.
+    for (const row of data.items) {
+      expect(html).toContain(`href="/-/admin/users/${row.id}"`);
+      expect(html).toContain(`href="/-/admin/users/${row.id}/edit"`);
+    }
+    expect(html).toContain('data-tooltip-content="User Details"');
+    expect(html).toContain('data-tooltip-content="Edit"');
+    expect(html).toContain("octicon-person");
+    expect(html).toContain("octicon-pencil");
+    // The unlanded create page stays omitted (list.tmpl:6 — the dead-link rule).
+    expect(html).not.toContain('href="/-/admin/users/new"');
     expect(html).not.toContain("Create User Account");
   });
 

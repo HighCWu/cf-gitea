@@ -21,7 +21,7 @@
  * per entry mirror handleScheduledCron's dispatch EXACTLY
  * (services/demo-sweep.ts — the mount record in its module header):
  *
- *   - the hourly entry (`0 * * * *`, DEMO_SWEEP_CRON) carries EIGHT producer
+ *   - the hourly entry (`0 * * * *`, DEMO_SWEEP_CRON) carries NINE producer
  *     arms: demo_sweep (SPEC-0014), delete_old_audit_events (SPEC-0015
  *     §4.3), cleanup_packages (SPEC-0016 §4.4), cleanup_actions
  *     (SPEC-0012 §4.5), auto_merge_due_scan (the 58f9890 fold — upstream's
@@ -29,8 +29,10 @@
  *     the due scan needs a tick), cancel_abandoned_jobs and
  *     cleanup_ephemeral_runners (SPEC-0012 §4.5's parity-review sweeps —
  *     the dispatcher's actions-abandoned + ephemeral block, its SIXTH
- *     sanctioned extension), and cleanup_hook_task_table (SPEC-0005 §4.9
+ *     sanctioned extension), cleanup_hook_task_table (SPEC-0005 §4.9
  *     as-built, the 870c9b3 landing — the dispatcher's webhook-maintenance
+ *     block), and start_schedule_tasks (SPEC-0012's schedule producer,
+ *     upstream's own registered task — the dispatcher's actions-schedule
  *     block, mounted LAST on the entry);
  *   - EVERY OTHER entry (today the standing 10-minute step) carries the
  *     FOUR unconditional arms: update_mirrors + update_push_mirrors
@@ -46,6 +48,8 @@
  * tasks_actions.go:46 cancel_abandoned_jobs; tasks_basic.go:140
  * cleanup_packages; tasks_basic.go:124-135 cleanup_hook_task_table — the
  * webhook-maintenance producer's faithful twin, SPEC-0005 §4.9 as-built;
+ * tasks_actions.go:55-67 start_schedule_tasks — the actions-schedule
+ * producer's faithful twin (SPEC-0012, the SEVENTH sanctioned extension);
  * tasks_extended.go:146 delete_old_audit_events; tasks_actions.go:70/:80 —
  * our single actions-retention producer carries the cleanup_actions +
  * cleanup_action_runs pair's bodies, folded per SPEC-0012 §4.5). FOUR arms
@@ -161,9 +165,14 @@ export const CRON_ARMS: readonly CronArm[] = [
   { arm: "cleanup_ephemeral_runners", spec: DEMO_SWEEP_CRON },
   // upstream tasks_basic.go:124-135 (@midnight) — the webhook-maintenance
   // producer (SPEC-0005 §4.9 as-built, the 870c9b3 landing), probe-gated
-  // and NOT demo-gated (the packages shape); mounted as the dispatcher's
-  // LAST hourly block, so its census row closes the list.
+  // and NOT demo-gated (the packages shape).
   { arm: "cleanup_hook_task_table", spec: DEMO_SWEEP_CRON },
+  // upstream tasks_actions.go:55-67 (@every 1m, RunAtStart false) — the
+  // actions-schedule producer (SPEC-0012's SEVENTH sanctioned extension,
+  // the W14 landing), probe-shaped and never var-gated (upstream's arm is
+  // enabled default with no knob); mounted as the dispatcher's LAST hourly
+  // block, so its census row closes the list (the 2b15f6f row shape).
+  { arm: "start_schedule_tasks", spec: DEMO_SWEEP_CRON },
 ];
 
 /** The entry's arms (the census filter — the hourly entry is matched EXACTLY
@@ -265,7 +274,7 @@ export interface CronStateRow {
 }
 
 /**
- * The full tick state, keyed by arm name — ONE point scan of a ≤12-row
+ * The full tick state, keyed by arm name — ONE point scan of a ≤13-row
  * table. Arms without a row (nothing recorded yet — a fresh deployment, or the
  * golden harness) are simply absent: the monitor renders the never-fired
  * arms, exactly upstream's unset-Prev posture.

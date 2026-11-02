@@ -52,14 +52,7 @@
  *                                  identity (migration 0020, user_accounts:
  *                                  its colon username has no legal profile
  *                                  shape) is prohibited, so the status arm
- *                                  covers it). Upstream's per-row ACTIONS
- *                                  cell (list.tmpl:130-135) links the admin
- *                                  details/edit surfaces — the upstream
- *                                  intent for managing an account like
- *                                  these — but those pages are UNMOUNTED
- *                                  (index.ts's admin block claims only the
- *                                  literals), and they are already omitted
- *                                  below under the same rule.
+ *                                  covers it).
  *                                  + the "Admin" basic label when isAdmin
  *                                  (list.tmpl:110-111); the Reserved (type 2)
  *                                  / Remote (type 5) / Bot
@@ -95,12 +88,16 @@
  *                                  lastlogin/reverselastlogin sorter
  *                                  (list.tmpl:97) has no backing → rendered
  *                                  as a PLAIN header (no link, no arrow).
- *   (actions)                      list.tmpl:130-135's details/edit links
- *                                  target /-/admin/users/{id}[/edit] —
- *                                  UNLANDED pages → OMITTED (the dead-link
- *                                  rule §2.4.1; the column collapses to the
- *                                  9 live columns, the empty-state colspan
- *                                  follows)
+ *   (actions)                      list.tmpl:130-135's per-row pair against
+ *                                  the LIVE targets: the details person-link
+ *                                  `/-/admin/users/{id}` (GET — the landed
+ *                                  admin-user-detail page, octicon-person,
+ *                                  tooltip "admin.users.details") and the
+ *                                  edit pencil-link `/-/admin/users/{id}/edit`
+ *                                  (GET — the landed admin-user-edit page,
+ *                                  octicon-pencil, tooltip "edit"), the
+ *                                  admin-badges row-actions twin; the empty
+ *                                  state's colspan follows the column count
  *
  * The header's "Create User Account" button (list.tmpl:6 → /-/admin/users/new)
  * is an UNLANDED page → omitted. The search/filter form and the sorters are
@@ -176,8 +173,10 @@
  * The claim sits in the landed admin literal family block
  * (`raw[1] === "-" && raw[2] === "admin"`): `tail.length === 1 &&
  * tail[0] === "users"` returns `{ family: "admin-users" }` BEFORE any
- * dynamic `/users/{id}` arm can exist (the
- * static-before-dynamic rule; the detail routes stay unclaimed → 404).
+ * dynamic `/users/{id}` arm can claim (the static-before-dynamic rule; the
+ * detail/edit/impersonate arms claim the DEEPER shapes after this literal —
+ * the landed admin-user-detail/admin-user-edit/admin-users-impersonate
+ * family).
  * Registration order within the file is inert (the parser claims by shape),
  * but the FAMILY block itself must stay ahead of the owner/repo parse (it
  * already is). The sibling pages mount in the same block:
@@ -265,6 +264,12 @@ export const ADMIN_EMBEDDED_ICONS: Record<string, { paths: string[]; viewBox: st
   "octicon-apps": {
     paths: [
       "M1.5 3.25c0-.966.784-1.75 1.75-1.75h2.5c.966 0 1.75.784 1.75 1.75v2.5A1.75 1.75 0 0 1 5.75 7.5h-2.5A1.75 1.75 0 0 1 1.5 5.75Zm7 0c0-.966.784-1.75 1.75-1.75h2.5c.966 0 1.75.784 1.75 1.75v2.5a1.75 1.75 0 0 1-1.75 1.75h-2.5A1.75 1.75 0 0 1 8.5 5.75Zm-7 7c0-.966.784-1.75 1.75-1.75h2.5c.966 0 1.75.784 1.75 1.75v2.5a1.75 1.75 0 0 1-1.75 1.75h-2.5a1.75 1.75 0 0 1-1.75-1.75Zm7 0c0-.966.784-1.75 1.75-1.75h2.5c.966 0 1.75.784 1.75 1.75v2.5a1.75 1.75 0 0 1-1.75 1.75h-2.5a1.75 1.75 0 0 1-1.75-1.75ZM3.25 3a.25.25 0 0 0-.25.25v2.5c0 .138.112.25.25.25h2.5A.25.25 0 0 0 6 5.75v-2.5A.25.25 0 0 0 5.75 3Zm7 0a.25.25 0 0 0-.25.25v2.5c0 .138.112.25.25.25h2.5a.25.25 0 0 0 .25-.25v-2.5a.25.25 0 0 0-.25-.25Zm-7 7a.25.25 0 0 0-.25.25v2.5c0 .138.112.25.25.25h2.5a.25.25 0 0 0 .25-.25v-2.5a.25.25 0 0 0-.25-.25Zm7 0a.25.25 0 0 0-.25.25v2.5c0 .138.112.25.25.25h2.5a.25.25 0 0 0 .25-.25v-2.5a.25.25 0 0 0-.25-.25Z",
+    ],
+    viewBox: "0 0 16 16",
+  },
+  "octicon-gear": {
+    paths: [
+      "M8 0a8 8 0 0 1 .701.031C9.444.095 9.99.645 10.16 1.29l.288 1.107c.018.066.079.158.212.224q.347.171.668.386c.123.082.233.09.299.071l1.103-.303c.644-.176 1.392.021 1.82.63q.406.578.704 1.218c.315.675.111 1.422-.364 1.891l-.814.806c-.049.048-.098.147-.088.294q.024.386 0 .772c-.01.147.038.246.088.294l.814.806c.475.469.679 1.216.364 1.891a8 8 0 0 1-.704 1.217c-.428.61-1.176.807-1.82.63l-1.102-.302c-.067-.019-.177-.011-.3.071a6 6 0 0 1-.668.386c-.133.066-.194.158-.211.224l-.29 1.106c-.168.646-.715 1.196-1.458 1.26a8 8 0 0 1-1.402 0c-.743-.064-1.289-.614-1.458-1.26l-.289-1.106c-.018-.066-.079-.158-.212-.224a6 6 0 0 1-.668-.386c-.123-.082-.233-.09-.299-.071l-1.103.303c-.644.176-1.392-.021-1.82-.63a8 8 0 0 1-.704-1.218c-.315-.675-.111-1.422.363-1.891l.815-.806c.05-.048.098-.147.088-.294a6 6 0 0 1 0-.772c.01-.147-.038-.246-.088-.294l-.815-.806C.635 6.045.431 5.298.746 4.623a8 8 0 0 1 .704-1.217c.428-.61 1.176-.807 1.82-.63l1.102.302c.067.019.177.011.3-.071q.321-.215.668-.386c.133-.066.194-.158.211-.224l.29-1.106C6.009.645 6.556.095 7.299.03Q7.646 0 8 0m-.571 1.525c-.036.003-.108.036-.137.146l-.289 1.105c-.147.561-.549.967-.998 1.189q-.26.13-.5.29c-.417.278-.97.423-1.529.27l-1.103-.303c-.109-.03-.175.016-.195.045q-.33.47-.573.99c-.014.031-.021.11.059.19l.815.806c.411.406.562.957.53 1.456a5 5 0 0 0 0 .582c.032.499-.119 1.05-.53 1.456l-.815.806c-.081.08-.073.159-.059.19q.243.52.573.989c.02.03.085.076.195.046l1.102-.303c.56-.153 1.113-.008 1.53.27q.242.16.501.29c.447.222.85.629.997 1.189l.289 1.105c.029.109.101.143.137.146a6.6 6.6 0 0 0 1.142 0c.036-.003.108-.036.137-.146l.289-1.105c.147-.561.549-.967.998-1.189q.26-.13.5-.29c.417-.278.97-.423 1.529-.27l1.103.303c.109.029.175-.016.195-.045q.33-.47.573-.99c.014-.031.021-.11-.059-.19l-.815-.806c-.411-.406-.562-.957-.53-1.456a5 5 0 0 0 0-.582c-.032-.499.119-1.05.53-1.456l.815-.806c.081-.08.073-.159.059-.19a6.5 6.5 0 0 0-.573-.989c-.02-.03-.085-.076-.195-.046l-1.102.303c-.56.153-1.113.008-1.53-.27a4.4 4.4 0 0 0-.501-.29c-.447-.222-.85-.629-.997-1.189l-.289-1.105c-.029-.11-.101-.143-.137-.146a6.6 6.6 0 0 0-1.142 0M11 8a3 3 0 1 1-6 0 3 3 0 0 1 6 0M9.5 8a1.5 1.5 0 1 0-3.001.001A1.5 1.5 0 0 0 9.5 8",
     ],
     viewBox: "0 0 16 16",
   },
@@ -630,6 +635,8 @@ export const adminUsersLocale = {
   admin_label: "Admin", // "admin.users.admin" (list.tmpl:111)
   never_login: "Never Signed In", // "admin.users.never_login" (list.tmpl:128)
   no_results: "No results found.", // "no_results_found" (list.tmpl:138)
+  details: "User Details", // "admin.users.details" (the actions column's person-link tooltip, list.tmpl:131)
+  edit: "Edit", // "edit" (the actions column's pencil-link tooltip, list.tmpl:132)
 } as const;
 
 /** Upstream `setting.UI.Admin.UserPagingNum` (modules/setting/ui.go:138). */
@@ -874,7 +881,7 @@ export function renderAdminUsersPage(ctx: UiContext, data: AdminUsersData): stri
  *  users.go:60). */
 export function AdminUsersPage(props: { ctx: UiContext; data: AdminUsersData }) {
   const { params } = props.data;
-  const colCount = 9; // the live columns (the actions column omitted — the module header)
+  const colCount = 10; // the live columns, list.tmpl's actions pair included (the module header)
   const sortHref = (sort: string): string => {
     const next = new URLSearchParams(props.data.query);
     // The header toggle keeps every param and replaces sort (tablesort.ts's
@@ -1036,7 +1043,7 @@ export function AdminUsersPage(props: { ctx: UiContext; data: AdminUsersData }) 
           </details>
         </form>
       </div>
-      {/* The table (list.tmpl:82-142) — the nine live columns. The sortable
+      {/* The table (list.tmpl:82-142) — the ten live columns. The sortable
           headers are the tablesort.ts link reduction (the module header); the
           Last Sign-In header's lastlogin sorter has no backing → plain text. */}
       <div class="ui attached table segment">
@@ -1071,6 +1078,7 @@ export function AdminUsersPage(props: { ctx: UiContext; data: AdminUsersData }) 
               <th scope="col">{adminUsersLocale.col_2fa}</th>
               <th scope="col">{adminUsersLocale.col_created}</th>
               <th scope="col">{adminUsersLocale.col_last_login}</th>
+              <th scope="col"></th>
             </tr>
           </thead>
           <tbody>
@@ -1091,9 +1099,7 @@ export function AdminUsersPage(props: { ctx: UiContext; data: AdminUsersData }) 
                         the synthetic `gitea:deploy-key` negative-id identity
                         is prohibited, so its row degrades to plain text too
                         (the dead-link rule; the link-crawl D1/D2 fix — the
-                        module header's Username row). Upstream's per-row
-                        admin details/edit targets (list.tmpl:130-135) are
-                        unmounted → the actions column stays omitted. */}
+                        module header's Username row). */}
                     {row.status === "active" ? (
                       <a href={`/${row.username}`}>{row.username}</a>
                     ) : (
@@ -1119,6 +1125,25 @@ export function AdminUsersPage(props: { ctx: UiContext; data: AdminUsersData }) 
                   <td>{formatAdminDate(row.createdAt)}</td>
                   <td>
                     <span>{adminUsersLocale.never_login}</span>
+                  </td>
+                  {/* The per-row actions pair (list.tmpl:130-135) against the
+                      LIVE targets: the details person-link onto the landed
+                      admin-user-detail page and the edit pencil-link onto the
+                      landed admin-user-edit page — the admin-badges row
+                      actions' exact DOM (tooltip + aria per link). */}
+                  <td>
+                    <div class="tw-flex tw-gap-2">
+                      <a href={`/-/admin/users/${row.id}`} data-tooltip-content={adminUsersLocale.details} aria-label={adminUsersLocale.details}>
+                        <Icon name="octicon-person" />
+                      </a>
+                      <a
+                        href={`/-/admin/users/${row.id}/edit`}
+                        data-tooltip-content={adminUsersLocale.edit}
+                        aria-label={adminUsersLocale.edit}
+                      >
+                        <Icon name="octicon-pencil" />
+                      </a>
+                    </div>
                   </td>
                 </tr>
               ))

@@ -60,7 +60,7 @@
  *            cron-state.ts, the usability F3 listing): one row per scheduled
  *            arm of the Worker's `scheduled` handler, mirroring
  *            handleScheduledCron's dispatch exactly (four arms on every
- *            10-minute step entry, six producer arms on the hourly entry;
+ *            10-minute step entry, nine producer arms on the hourly entry;
  *            the census block comment holds the per-arm upstream twin cites
  *            and the three cf-gitea-extension names). The per-arm tick state —
  *            Previous Time / Executions / Result, upstream's TaskTableRow
@@ -86,10 +86,9 @@
  *            serves both triggers). The API registry's CRON_RUN_BODIES and
  *            this module's dispatch map hold the same names — extending
  *            run capability extends BOTH registries in one change (both
- *            modules' extension rules) — ONE disclosed divergence while the
- *            cleanup_hook_task_table twin is pending with the API module's
- *            owner (this map runs it; the API route 404s it, its test
- *            pins that).
+ *            modules' extension rules; the API-registry twin
+ *            gained the cleanup_hook_task_table body in 2b15f6f's
+ *            follow-up — both registries run every census arm now).
  *   queue    Cloudflare Queues expose no depth introspection and there is no
  *            in-process queue manager to enumerate — but the LANDED D1 state
  *            of the two queue-backed pipelines answers "number in queue" for

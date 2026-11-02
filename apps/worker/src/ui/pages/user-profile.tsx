@@ -55,23 +55,27 @@
  * - The avatar slot renders a placeholder circle with the person octicon
  *   (no avatar pipeline — an `<img>` to a missing route is a dead link, the
  *   avatar-slot rule the org home set).
- * - The overview menu (user/overview/header.tmpl) renders its two LIVE
- *   tabs (Repositories — ACTIVE here; Activity — the mounted `?tab=activity`
- *   page, both header.tmpl:12-34 hrefs): Overview needs a profile-readme
- *   pipeline, Projects/Code/Stars need their pages (dead links forbidden,
- *   §2.4.1). SPEC-0016 M2 arms the Packages anchor (header.tmpl:22-25)
- *   whenever `ctx.packagesEnabled !== false` — the `/{username}/-/packages`
- *   family is live (pages/packages.tsx).
+ * - The overview menu (user/overview/header.tmpl) renders its LIVE tabs in
+ *   the template's order: Repositories (ACTIVE here), Projects (header.tmpl:16-21
+ *   — the C1 tab, the `/-/projects` page, inactive with the ProjectCount
+ *   label), Packages (header.tmpl:22-25, armed whenever
+ *   `ctx.packagesEnabled !== false` — SPEC-0016 M2), Code (header.tmpl:26-31
+ *   — the C1 tab, the `/-/code` page, inactive), Activity (the mounted
+ *   `?tab=activity` page) and the Stars/watching pair (the collapsed-if note
+ *   on ProfileTabs). Overview needs a profile-readme pipeline — not
+ *   rendered (dead links forbidden, §2.4.1).
  * - The visibility badge next to the username follows the task brief and
  *   the org-header badge DOM (`ui large basic horizontal label`) — upstream
  *   badges org profiles only at this pin (org_profile_avatar.tmpl:9-10); an
  *   intentional divergence, kept discoverable for the visibility ladder.
  * - The email row needs the `ShowUserEmail` profile setting (no such model
- *   — profile_big_avatar.tmpl:60-66) and is not rendered; the admin gear
- *   link (profile_big_avatar.tmpl:18) needs the admin users page — not
- *   rendered; the follow/block buttons are signed-in write actions (§2.5) —
- *   not rendered; the org-avatar row (profile_big_avatar.tmpl:92-105) needs
- *   avatars — not rendered.
+ *   — profile_big_avatar.tmpl:60-66) and is not rendered. The admin gear
+ *   (:18), the RSS feed anchor (:31-33) and the follow button (:123-136)
+ *   ARE rendered (the C2/C3 rows — the gear on the viewer-side admin flag,
+ *   the feed anchor unconditionally, the button when the loader passes
+ *   followButton); the block-user link (:139-148) has no landed POST arm —
+ *   not rendered (the dead-control rule); the org-avatar row
+ *   (profile_big_avatar.tmpl:92-105) needs avatars — not rendered.
  * - The description renders as plain text (upstream renders markup through
  *   the README pipeline; the description is profile metadata here).
  * - The shared/repo/search box and its `<div class="divider">` are not
@@ -90,10 +94,11 @@ import { drizzle } from "drizzle-orm/d1";
 
 import { doerCanViewPrivate } from "../../api/services/orgs";
 import { isFollowing, listFollowers, listFollowing } from "../../api/services/follows";
-import { orgMembers, repoSettings, repositories, users } from "../../db/schema";
-import { OrgService } from "../../services/orgs/orgs";
+import { orgMembers, projects, repoSettings, repositories, users } from "../../db/schema";
+import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
 import { formatDueDate } from "./milestones";
-import { OrgHomePagination, OrgRepoListItem, type OrgHomeRepoItem } from "./org-home";
+import { OrgHomePagination, OrgRepoListItem, orgDisplayName, type OrgHomeRepoItem } from "./org-home";
+import { AdminEmbeddedSvg } from "./admin-users";
 import { parsePageNumber } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
@@ -106,12 +111,18 @@ export const userProfileLocale = {
   followers: "followers", // "user.followers"
   following: "following", // "user.following"
   repositories: "Repositories", // "user.repositories" (header.tmpl:13)
+  projects: "Projects", // "user.projects" (header.tmpl:23's item — the C1 tab)
   packages: "Packages", // "packages.title" (header.tmpl:22-25's item — SPEC-0016 M2)
+  code: "Code", // "user.code" (header.tmpl:29's item — the C1 tab)
   activity: "Public Activity", // "user.activity" (header.tmpl:34)
   starred: "Starred Repositories", // "user.starred" (header.tmpl:38)
   watched: "Watched Repositories", // "user.watched" (header.tmpl:45)
   visibility_limited: "Limited", // "org.settings.visibility.limited_shortname"
   visibility_private: "Private", // "org.settings.visibility.private_shortname"
+  follow: "Follow", // "user.follow" (profile_big_avatar.tmpl:145)
+  unfollow: "Unfollow", // "user.unfollow" (profile_big_avatar.tmpl:141)
+  rss_feed: "RSS Feed", // "rss_feed" (profile_big_avatar.tmpl:32's tooltip)
+  admin_details: "User Details", // "admin.users.details" (profile_big_avatar.tmpl:19's gear tooltip)
 } as const;
 
 /** Upstream `setting.UI.User.RepoPagingNum` (modules/setting/ui.go:147) —
@@ -253,6 +264,19 @@ export interface UserProfileData {
   following: number;
   page: number;
   more: boolean;
+  /** The strip's Projects tab count (header.tmpl:24's `{{if .ProjectCount}}`
+   *  label — the OPEN individual projects total, loadHeaderCount parity,
+   *  shared/user/header.go:172-192). */
+  openProjects: number;
+  /** profile_big_avatar.tmpl:123-136's follow button input: present only
+   *  for a signed-in viewer who is not the target (upstream's
+   *  `and .IsSigned (ne .SignedUserID .ContextUser.ID)` gate — no block
+   *  store exists, so the `{{if not .UserBlocking}}` arm always holds);
+   *  `following` is IsFollowing(doer, target) (header.go:28). */
+  followButton: { following: boolean } | null;
+  /** profile_big_avatar.tmpl:18's admin gear gate (`{{if .IsAdmin}}` — the
+   *  signed-in viewer's admin flag; anonymous is false). */
+  viewerIsAdmin: boolean;
 }
 
 /**
@@ -315,9 +339,22 @@ export async function loadUserProfileData(
   }
 
   const followViewer = { id: doer.id, isAdmin: doer.isAdmin };
-  const [followers, following] = await Promise.all([
+  const [followers, following, openProjectsRow, viewerFollows] = await Promise.all([
     listFollowers(d1, user.id, followViewer, { page: 1, pageSize: 1 }),
     listFollowing(d1, user.id, followViewer, { page: 1, pageSize: 1 }),
+    // header.tmpl:24's ProjectCount (the OPEN individual projects —
+    // loadHeaderCount parity, shared/user/header.go:172-192's
+    // SearchOptions{OwnerID, IsClosed: false, Type: individual} count; the
+    // individual scope IS the projects.ownerId arm).
+    drizzle(d1)
+      .select({ total: sql<number>`count(*)` })
+      .from(projects)
+      .where(and(eq(projects.ownerId, user.id), eq(projects.isClosed, false)))
+      .get(),
+    // profile_big_avatar.tmpl:123-136's gate + state: a signed-in viewer
+    // who is not the target carries the button, IsFollowing(doer, target)
+    // is its label (header.go:28's exact argument order).
+    doer.id !== null && doer.id !== user.id ? isFollowing(d1, doer.id, user.id) : Promise.resolve(false),
   ]);
 
   return {
@@ -328,6 +365,9 @@ export async function loadUserProfileData(
     following: following.total,
     page,
     more: page * USER_PROFILE_PAGE_SIZE < total,
+    openProjects: Number(openProjectsRow?.total ?? 0),
+    followButton: doer.id !== null && doer.id !== user.id ? { following: viewerFollows } : null,
+    viewerIsAdmin: doer.isAdmin,
   };
 }
 
@@ -349,13 +389,33 @@ function ProfileVisibilityBadge(props: { user: UserProfileRow }) {
 
 /**
  * shared/user/profile_big_avatar.tmpl reduced: the avatar placeholder circle,
- * the username (+ visibility badge — the divergence note) + display name
- * lines, the followers/following counts as the two tab-page anchors
- * (profile_big_avatar.tmpl:25 — `?tab=followers` carries the 18px
- * octicon-person glyph, the following anchor is bare), then the location /
- * website / description / "Joined on" rows.
+ * the username (+ visibility badge — the divergence note) + the admin gear
+ * (:18's `{{if .IsAdmin}}` row, the viewer-side admin flag — absent prop
+ * renders none) + display name lines, the followers/following counts as the
+ * two tab-page anchors (profile_big_avatar.tmpl:25 — `?tab=followers`
+ * carries the 18px octicon-person glyph, the following anchor is bare) with
+ * the RSS feed icon (:31-33 — `{{if .EnableFeed}}`; the setting pins TRUE
+ * upstream, modules/setting/other.go:21, and the landed `/{owner}.rss` route
+ * serves the bytes, so the anchor renders unconditionally), the follow
+ * button (:123-136 — `{{if and .IsSigned (ne .SignedUserID
+ * .ContextUser.ID)}}`; rendered only when the consumer passes
+ * `followButton`, its POST is the landed `POST /{username}?action=…` arm and
+ * the no-JS reduction 303s back onto the profile), then the location /
+ * website / description / "Joined on" rows. Upstream's block-user link
+ * (:139-148) has no landed POST arm — not rendered (the dead-control rule).
  */
-export function ProfileAvatarCard(props: { user: UserProfileRow; followers: number; following: number }) {
+export function ProfileAvatarCard(props: {
+  user: UserProfileRow;
+  followers: number;
+  following: number;
+  /** The follow button's state — present only for a signed-in viewer who is
+   *  not the target (the loaders' gate); absent keeps the prior DOM
+   *  (the projectsTab optional-prop convention). */
+  followButton?: { following: boolean };
+  /** The viewer's site-admin flag (profile_big_avatar.tmpl:18's gear gate);
+   *  truthy renders the gear link onto the landed admin user-detail page. */
+  viewerIsAdmin?: boolean;
+}) {
   const { user } = props;
   return (
     <div id="profile-avatar-card" class="ui fitted segment">
@@ -369,6 +429,11 @@ export function ProfileAvatarCard(props: { user: UserProfileRow; followers: numb
           <span class="tw-text-center">
             {user.username}
             <ProfileVisibilityBadge user={user} />
+            {props.viewerIsAdmin ? (
+              <a href={`/-/admin/users/${user.id}`} data-tooltip-content={userProfileLocale.admin_details} aria-label={userProfileLocale.admin_details}>
+                <AdminEmbeddedSvg name="octicon-gear" size={18} />
+              </a>
+            ) : null}
           </span>
           {user.fullName !== null && user.fullName !== "" ? (
             <span class="tw-text-center">{user.fullName}</span>
@@ -382,7 +447,31 @@ export function ProfileAvatarCard(props: { user: UserProfileRow; followers: numb
             <a href={`/${user.username}?tab=following`}>
               {props.following} {userProfileLocale.following}
             </a>
+            {/* profile_big_avatar.tmpl:31-33 — the RSS feed anchor; the
+                EnableFeed setting pins TRUE (modules/setting/other.go:21),
+                the /{owner}.rss route is landed. The aria-label pairs the
+                tooltip (the icon-only-link rule, the admin-badges twin). */}
+            <a href={`/${user.username}.rss`} data-tooltip-content={userProfileLocale.rss_feed} aria-label={userProfileLocale.rss_feed}>
+              <i class="ui tw-text-text-light tw-ml-2" data-tooltip-content={userProfileLocale.rss_feed}>
+                <Icon name="octicon-rss" size={18} />
+              </i>
+            </a>
           </div>
+          {props.followButton ? (
+            <div class="item">
+              {/* profile_big_avatar.tmpl:127-134 — upstream's
+                  data-fetch POST `?action=follow|unfollow` reduces to the
+                  no-JS form POST (the house convention; the route 303s back
+                  onto the profile). The button carries `primary` only when
+                  NOT following (the Iif arms), octicon-person both ways. */}
+              <form method="post" action={`/${user.username}?action=${props.followButton.following ? "unfollow" : "follow"}`}>
+                <button type="submit" class={`ui basic ${props.followButton.following ? "" : "primary"} button tw-w-full`}>
+                  <Icon name="octicon-person" />{" "}
+                  {props.followButton.following ? userProfileLocale.unfollow : userProfileLocale.follow}
+                </button>
+              </form>
+            </div>
+          ) : null}
         </div>
         {user.location !== null && user.location !== "" ? (
           <div class="item">
@@ -415,46 +504,75 @@ export function ProfileAvatarCard(props: { user: UserProfileRow; followers: numb
 }
 
 /**
- * The overview header (user/overview/header.tmpl:12-34 reduced to its live
- *  tabs): Repositories ACTIVE (header.tmpl:12's exact `?tab=repositories`
- *  href — the tab pages' twin renders it inactive), the Activity anchor
- *  (header.tmpl:33-34), then the Stars anchor (header.tmpl:36-44) and the
- *  watching anchor (header.tmpl:43-46). THE COLLAPSED-IF: upstream renders
- *  Stars and watching as the two arms of `{{if not .DisableStars}}` —
- *  DisableStars defaults FALSE at the pin, so Stars is the default anchor
- *  and watching is direct-URL-only with NOTHING active. The landed
- *  reduction cannot model a setting that does not exist, so BOTH anchors
- *  render here INACTIVE (the repositories tab keeps the ACTIVE item) —
- *  never watching instead of stars.
+ * The overview header (user/overview/header.tmpl:12-46 reduced to its live
+ *  tabs, in the template's order): Repositories ACTIVE here (header.tmpl:12's
+ *  exact `?tab=repositories` href — the tab pages' twins render it
+ *  inactive), the Projects anchor (header.tmpl:16-21 — the C1 tab, the
+ *  `/{username}/-/projects` page; `octicon-project-symlink` + the
+ *  `{{if .ProjectCount}}` label), the Packages anchor (header.tmpl:22-25,
+ *  SPEC-0016 M2), the Code anchor (header.tmpl:26-31 — the C1 tab, the
+ *  `/{username}/-/code` page; `octicon-code`, active on `IsCodePage`), the
+ *  Activity anchor (header.tmpl:33-34), then the Stars anchor
+ *  (header.tmpl:36-44) and the watching anchor (header.tmpl:43-46). THE
+ *  COLLAPSED-IF: upstream renders Stars and watching as the two arms of
+ *  `{{if not .DisableStars}}` — DisableStars defaults FALSE at the pin, so
+ *  Stars is the default anchor and watching is direct-URL-only with NOTHING
+ *  active. The landed reduction cannot model a setting that does not exist,
+ *  so BOTH anchors render here INACTIVE (the repositories tab keeps the
+ *  ACTIVE item on this page) — never watching instead of stars.
  *
- * SPEC-0016 M2: the optional `packagesTab` item (header.tmpl:22-25's
- * Packages anchor — rendered between Projects, unlanded, and Code;
- * `octicon-package`, no count label upstream) rides the same optional-prop
- * pattern OrgMenu's projectsTab set: absent keeps the byte-stable prior
- * DOM; present renders INACTIVE unless `active` (the packages family's own
- * pages pass active — pages/packages.tsx). The profile page arms it whenever
- * `ctx.packagesEnabled !== false` (the strict-polarity global — absent
- * means enabled).
+ * The Projects/Code/Packages tabs ride OrgMenu's optional-prop pattern
+ * (projectsTab since wave 37, packagesTab since SPEC-0016 M2; the C1
+ * completion adds ProfileTabs' projectsTab + both strips' codeTab): absent
+ * keeps the byte-stable prior DOM; present renders INACTIVE unless `active`
+ * (the tab's own page passes active). The profile page arms Projects
+ * unconditionally (header.tmpl:16's `{{if or .ContextUser.IsIndividual
+ * .CanReadProjects}}` — every row on this page IS an individual) and Code
+ * unconditionally (header.tmpl:26's `{{if and .IsRepoIndexerEnabled ...}}` —
+ * the indexer is live, the /-/code page is landed), each inactive here.
  */
 export function ProfileTabs(props: {
   username: string;
   repoCount: number;
   starsCount: number;
+  /** Whether the Repositories item is active (header.tmpl:11's
+   *  `{{if eq .TabName "repositories"}}` arm) — true on this page (the
+   *  default), false on the tab pages whose TabName matches nothing
+   *  (the organizations arm). */
+  repositoriesActive?: boolean;
+  /** The upstream Projects tab (header.tmpl:16-21), present only when the
+   *  consumer owns the `/{username}/-/projects` page (the OrgMenu
+   *  projectsTab precedent); count = the open-projects total, the
+   *  `{{if .ProjectCount}}` label. */
+  projectsTab?: { active: boolean; count: number; href: string };
   /** The upstream Packages tab (header.tmpl:22-25), present only when the
-   *  consumer owns the `/{username}/-/packages` family (the OrgMenu
-   *  projectsTab precedent). */
+   *  consumer owns the `/{username}/-/packages` family. */
   packagesTab?: { active: boolean; href: string };
+  /** The upstream Code tab (header.tmpl:26-31), present only when the
+   *  consumer owns the `/{username}/-/code` page; no count label upstream. */
+  codeTab?: { active: boolean; href: string };
 }) {
   return (
     <overflow-menu class="ui secondary pointing tabular borderless menu tw-mb-4">
       <div class="overflow-menu-items">
-        <a class="active item" href={`/${props.username}?tab=repositories`}>
+        <a class={props.repositoriesActive === false ? "item" : "active item"} href={`/${props.username}?tab=repositories`}>
           <Icon name="octicon-repo" /> {userProfileLocale.repositories}
           {props.repoCount > 0 ? <div class="ui small label">{props.repoCount}</div> : null}
         </a>
+        {props.projectsTab ? (
+          <a class={props.projectsTab.active ? "active item" : "item"} href={props.projectsTab.href}>
+            <Icon name="octicon-project-symlink" /> {userProfileLocale.projects}
+            {props.projectsTab.count > 0 ? <div class="ui small label">{props.projectsTab.count}</div> : null}
+          </a>
+        ) : null}
         {props.packagesTab ? (
           <a class={props.packagesTab.active ? "active item" : "item"} href={props.packagesTab.href}>
             <Icon name="octicon-package" /> {userProfileLocale.packages}
+          </a>
+        ) : null}
+        {props.codeTab ? (
+          <a class={props.codeTab.active ? "active item" : "item"} href={props.codeTab.href}>
+            <Icon name="octicon-code" /> {userProfileLocale.code}
           </a>
         ) : null}
         <a class="item" href={`/${props.username}?tab=activity`}>
@@ -489,16 +607,24 @@ export function UserProfilePage(props: { ctx: UiContext; data: UserProfileData }
       <div class="ui container">
         <div class="ui stackable grid">
           <div class="ui four wide column">
-            <ProfileAvatarCard user={data.user} followers={data.followers} following={data.following} />
+            <ProfileAvatarCard
+              user={data.user}
+              followers={data.followers}
+              following={data.following}
+              followButton={data.followButton ?? undefined}
+              viewerIsAdmin={data.viewerIsAdmin}
+            />
           </div>
           <div class="ui twelve wide column tw-mb-4">
             <ProfileTabs
               username={data.user.username}
               repoCount={data.total}
               starsCount={data.user.numStars}
+              projectsTab={{ active: false, count: data.openProjects, href: `/${data.user.username}/-/projects` }}
               packagesTab={
                 ctx.packagesEnabled !== false ? { active: false, href: `/${data.user.username}/-/packages` } : undefined
               }
+              codeTab={{ active: false, href: `/${data.user.username}/-/code` }}
             />
             {/* shared/repo/list.tmpl: the wrapper renders unconditionally
                 (zero repos = an empty list, upstream's own shape — the org
@@ -509,6 +635,245 @@ export function UserProfilePage(props: { ctx: UiContext; data: UserProfileData }
               ))}
             </div>
             <OrgHomePagination orgLink={link} page={data.page} more={data.more} />
+          </div>
+        </div>
+      </div>
+    </BaseLayout>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The ?tab=organizations arm (profile.go:260-278 — the C4 row; the index.ts
+// dispatch hunk rides the orchestrator's fold, the mount recipe below)
+// ---------------------------------------------------------------------------
+
+/** The organizations tab's render inputs. */
+export interface UserProfileOrganizationsData {
+  user: UserProfileRow;
+  /** One page of the membership cards (the OrgRecord projection — the
+   *  landed listUserOrgs read, upstream's org.AsUser() cards). */
+  orgs: OrgRecord[];
+  /** The DoerViewOtherVisibility ceiling the listing ran at (the loader's
+   *  ladder result, surfaced for the header doc/tests). */
+  visibilityCeiling: "public" | "limited" | "private";
+  followers: number;
+  following: number;
+  /** The strip's counts (the repositories loader's parity reads). */
+  repoCount: number;
+  openProjects: number;
+  page: number;
+  more: boolean;
+  /** The avatar card's follow-button input (the repositories loader's
+   *  shape — the same template renders on every profile tab). */
+  followButton: { following: boolean } | null;
+  /** The avatar card's admin gear gate (the viewer's admin flag). */
+  viewerIsAdmin: boolean;
+}
+
+/**
+ * `DoerViewOtherVisibility` (models/organization/org_list.go:79-90) over the
+ * landed columns: an anonymous (or private-incapable) doer sees PUBLIC orgs
+ * only; the site admin and the user themself see PRIVATE; a restricted doer
+ * would see PUBLIC (the arm is unreachable — no users.restricted column);
+ * every other signed-in doer sees LIMITED. This is the ceiling the landed
+ * `listUserOrgs` `maxVisibility` encodes (the service's own upstream note).
+ */
+export function orgVisibilityCeiling(doer: ProfileDoer, user: UserProfileRow): "public" | "limited" | "private" {
+  if (!doerCanViewPrivate(doer)) return "public";
+  if (doer.isAdmin || doer.id === user.id) return "private";
+  return "limited";
+}
+
+/**
+ * Load the organizations tab (profile.go:260-278's case arm over the landed
+ * read): `FindAndCount[organization.Organization]{UserID: ContextUser.ID,
+ * IncludeVisibility: DoerViewOtherVisibility(Doer, ContextUser),
+ * ListOptions{Page, PageSize: RepoPagingNum}}` is exactly
+ * `OrgService.listUserOrgs(user.id, { maxVisibility: ceiling, page,
+ * pageSize: USER_PROFILE_PAGE_SIZE })` — the cards are the org rows
+ * (`org.AsUser()`), the count is the pager's total. The avatar-card and
+ * strip counts ride the repositories loader's parity reads (the followers
+ * pair's visibility-filtered totals, header.go's loadHeaderCount pair).
+ */
+export async function loadUserProfileOrganizationsData(
+  d1: D1Database,
+  user: UserProfileRow,
+  doer: ProfileDoer,
+  params: URLSearchParams,
+): Promise<UserProfileOrganizationsData> {
+  const page = parsePageNumber(params.get("page"));
+  const visibilityCeiling = orgVisibilityCeiling(doer, user);
+  const listing = await new OrgService(d1).listUserOrgs(user.id, {
+    maxVisibility: visibilityCeiling,
+    page,
+    pageSize: USER_PROFILE_PAGE_SIZE,
+  });
+
+  const followViewer = { id: doer.id, isAdmin: doer.isAdmin };
+  const seePrivate = doer.id !== null && (doer.isAdmin || doer.id === user.id);
+  const repoWhere = seePrivate
+    ? eq(repositories.ownerId, user.id)
+    : and(eq(repositories.ownerId, user.id), eq(repositories.visibility, "public"));
+  const [followers, following, repoCountRow, openProjectsRow, viewerFollows] = await Promise.all([
+    listFollowers(d1, user.id, followViewer, { page: 1, pageSize: 1 }),
+    listFollowing(d1, user.id, followViewer, { page: 1, pageSize: 1 }),
+    drizzle(d1).select({ total: sql<number>`count(*)` }).from(repositories).where(repoWhere).get(),
+    // The strip's Projects count (the loader's parity read — see
+    // loadUserProfileData's note).
+    drizzle(d1)
+      .select({ total: sql<number>`count(*)` })
+      .from(projects)
+      .where(and(eq(projects.ownerId, user.id), eq(projects.isClosed, false)))
+      .get(),
+    // The avatar card is the SAME template on every profile tab
+    // (prepareContextForProfileBigAvatar runs for each) — the follow
+    // button's gate + state ride along here too.
+    doer.id !== null && doer.id !== user.id ? isFollowing(d1, doer.id, user.id) : Promise.resolve(false),
+  ]);
+
+  return {
+    user,
+    orgs: listing.items,
+    visibilityCeiling,
+    followers: followers.total,
+    following: following.total,
+    repoCount: Number(repoCountRow?.total ?? 0),
+    openProjects: Number(openProjectsRow?.total ?? 0),
+    page,
+    more: page * USER_PROFILE_PAGE_SIZE < listing.total,
+    followButton: doer.id !== null && doer.id !== user.id ? { following: viewerFollows } : null,
+    viewerIsAdmin: doer.isAdmin,
+  };
+}
+
+/**
+ * One user_cards.tmpl card row over an ORG record (the FollowCard twin —
+ * the template's exact reductions: the placeholder avatar glyph OUTSIDE the
+ * anchor (an icon-only link has no accessible name — the avatar-slot rule),
+ * the DisplayName link in the `h3.name.flex-text-block`, then the
+ * `.meta.flex-text-block` arm chain website → location → joined-on; the
+ * `user_type_label` bot badge is unproducible — no bot type).
+ */
+function ProfileOrgCard(props: { org: OrgRecord }) {
+  const card = props.org;
+  const homeLink = `/${card.username}`;
+  return (
+    <li class="item ui segment">
+      <span class="ui avatar" aria-hidden="true">
+        <Icon name="octicon-organization" size={48} />
+      </span>
+      <h3 class="name flex-text-block">
+        <a href={homeLink}>{orgDisplayName(card)}</a>
+      </h3>
+      <div class="meta flex-text-block">
+        {card.website !== null && card.website !== "" ? (
+          <>
+            <Icon name="octicon-link" />{" "}
+            <a href={card.website} target="_blank">
+              {card.website}
+            </a>
+          </>
+        ) : card.location !== null && card.location !== "" ? (
+          <>
+            <Icon name="octicon-location" /> {card.location}
+          </>
+        ) : (
+          <>
+            <Icon name="octicon-calendar" /> {userProfileLocale.joined_on} {formatDueDate(card.createdAt)}
+          </>
+        )}
+      </div>
+    </li>
+  );
+}
+
+/**
+ * The user_cards container (user_cards.tmpl:2-30 minus the never-set
+ * CardsTitle arm — profile.go sets no CardsTitle on this tab) with the
+ * base/paginate reduction to the Older/Newer pair carrying
+ * `tab=organizations` + `page` (AddParamFromRequest's output shape).
+ */
+function OrganizationsCardsList(props: { username: string; orgs: OrgRecord[]; page: number; more: boolean }) {
+  if (props.page <= 1 && !props.more) {
+    return (
+      <div class="user-cards" id="user-cards-container" data-fetch-trigger="fetch-reload">
+        <ul class="list">
+          {props.orgs.map((org) => (
+            <ProfileOrgCard org={org} />
+          ))}
+        </ul>
+      </div>
+    );
+  }
+  const href = (page: number): string =>
+    page > 1 ? `/${props.username}?tab=organizations&page=${page}` : `/${props.username}?tab=organizations`;
+  return (
+    <div class="user-cards" id="user-cards-container" data-fetch-trigger="fetch-reload">
+      <ul class="list">
+        {props.orgs.map((org) => (
+          <ProfileOrgCard org={org} />
+        ))}
+      </ul>
+      <div class="center page buttons">
+        <div class="ui borderless pagination menu">
+          {props.page > 1 ? (
+            <a class="item navigation" href={href(props.page - 1)}>
+              <span class="navigation_label">Newer</span>
+            </a>
+          ) : null}
+          {props.more ? (
+            <a class="item navigation" href={href(props.page + 1)}>
+              <span class="navigation_label">Older</span>
+            </a>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** The full-document render (the render.tsx pattern — `index.ts` stays a
+ *  pure-TS router module, so the JSX invocation lives beside the component). */
+export function renderUserProfileOrganizationsPage(ctx: UiContext, data: UserProfileOrganizationsData): string {
+  return renderPage(<UserProfileOrganizationsPage ctx={ctx} data={data} />);
+}
+
+/**
+ * The profile organizations tab (profile.tmpl's grid + the
+ * `tab == "organizations"` branch: §2.4.1 discriminator `user profile`).
+ * The strip renders with NO active item (header.tmpl's `eq .TabName`
+ * conditions all fail for "organizations" — the follow-tabs twin's exact
+ * posture), carrying every live tab; the cards list renders unconditionally
+ * (an empty `<ul class="list">` is upstream's own empty state).
+ */
+export function UserProfileOrganizationsPage(props: { ctx: UiContext; data: UserProfileOrganizationsData }) {
+  const { ctx, data } = props;
+  return (
+    <BaseLayout ctx={ctx} title={userDisplayName(data.user)} pageClass="user profile">
+      <div class="ui container">
+        <div class="ui stackable grid">
+          <div class="ui four wide column">
+            <ProfileAvatarCard
+              user={data.user}
+              followers={data.followers}
+              following={data.following}
+              followButton={data.followButton ?? undefined}
+              viewerIsAdmin={data.viewerIsAdmin}
+            />
+          </div>
+          <div class="ui twelve wide column tw-mb-4">
+            <ProfileTabs
+              username={data.user.username}
+              repoCount={data.repoCount}
+              starsCount={data.user.numStars}
+              repositoriesActive={false}
+              projectsTab={{ active: false, count: data.openProjects, href: `/${data.user.username}/-/projects` }}
+              packagesTab={
+                ctx.packagesEnabled !== false ? { active: false, href: `/${data.user.username}/-/packages` } : undefined
+              }
+              codeTab={{ active: false, href: `/${data.user.username}/-/code` }}
+            />
+            <OrganizationsCardsList username={data.user.username} orgs={data.orgs} page={data.page} more={data.more} />
           </div>
         </div>
       </div>

@@ -26,8 +26,10 @@
  *   - the GATES: the loader's full viewer ladder — signed-in stranger, site
  *     admin (the service's self-or-admin fast path), the keep_activity_private
  *     owner (users.visibility = 'private' empties the feed behind the
- *     act-user condition, action.go:473-497 — the data gate behind the info
- *     message) and the unconditional is_deleted filter;
+ *     act-user condition, action.go:473-497 — the data gate; the MESSAGE
+ *     itself keys on the landed hide_activity setting, the C5 re-key, and
+ *     the pair's disclosed mismatch lives in the module header) and the
+ *     unconditional is_deleted filter;
  *   - the 14 wired op types through the LOADER (real `action` rows → the
  *     per-item projection: op_type wire name, icon, message segments, body
  *     arm, live title/comment resolution) — the pure matrix's complement,
@@ -267,6 +269,14 @@ describe("the gates (the loader's viewer ladder beyond the module suite's self/a
     await seedBaseFixtures();
     await seedVisibilityPair();
     await env.DB.prepare("UPDATE users SET visibility = 'private' WHERE id = 1").run();
+    // The C5 re-key: the MESSAGE flag keys on the landed hide_activity
+    // setting (profile.tmpl:15-19's KeepActivityPrivate), while the FEED
+    // gate still folds KeepActivityPrivate onto the visibility enum (the
+    // module header's disclosed wire-visible compromise) — this test arms
+    // BOTH signals.
+    await env.DB.prepare(
+      "INSERT INTO user_settings (user_id, theme, language, diff_view_style, hide_email, hide_activity) VALUES (1, 'gitea-auto', '', '', 0, 1)",
+    ).run();
 
     // The route would 404 a stranger on a private-visibility user first
     // (the resolution ladder); the loader's act-user condition
@@ -285,10 +295,15 @@ describe("the gates (the loader's viewer ladder beyond the module suite's self/a
     }
   });
 
-  it("the info message renders for a stranger's load too (the flag is viewer-independent)", async () => {
+  it("the info message renders for a stranger's load too (the flag keys on the hide_activity setting, viewer-independent)", async () => {
     await seedBaseFixtures();
     await seedVisibilityPair();
-    await env.DB.prepare("UPDATE users SET visibility = 'private' WHERE id = 1").run();
+    // The C5 re-key: a PUBLIC user with the preference set shows the
+    // message (the earlier build keyed the owner's visibility enum — the
+    // wire-visible mis-message the v1.5.2 ledger's C5 row pinned).
+    await env.DB.prepare(
+      "INSERT INTO user_settings (user_id, theme, language, diff_view_style, hide_email, hide_activity) VALUES (1, 'gitea-auto', '', '', 0, 1)",
+    ).run();
 
     const html = renderPage(await load(strangerViewer));
     expect(html).toContain(activityFeedsLocale.disabled_public_activity);

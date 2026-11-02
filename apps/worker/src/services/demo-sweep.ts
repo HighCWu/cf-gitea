@@ -62,10 +62,8 @@
  * the SEVENTH sanctioned extension; the due-derivation and its recorded
  * divergences live in services/actions/trigger.ts's schedule section).
  * Thirteen producer calls across the two entries; the services/cron-state.ts
- * CRON_ARMS census gains the matching `cleanup_hook_task_table` row as
- * this block's integration follow-up (the census list stays pinned by
- * cron-state.test.ts until then; see the marked blocks in
- * handleScheduledCron).
+ * CRON_ARMS census carries both integration rows (cleanup_hook_task_table
+ * with 870c9b3, start_schedule_tasks with the D-7a completion).
  * Tests exercise `handleScheduledCron` / `enqueueDueDemoSweeps` / the
  * purge.ts consumer arms directly with fabricated ScheduledControllers —
  * the delegation itself is one await.

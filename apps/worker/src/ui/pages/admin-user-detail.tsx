@@ -27,11 +27,16 @@
  * (active "users"), then:
  *
  *   - The header row: "User Details" (admin.users.details) with the
- *     impersonate button + edit link OMITTED — the impersonate POST is the
- *     2a00e28 STOP arm (needs `sessions.impersonator_user_id`, the
- *     adjudication lives with that landing) and `/-/admin/users/{id}/edit`
- *     is unlanded: dead controls are forbidden (§2.4.1), the same rule that
- *     dropped the list page's actions column.
+ *     Impersonate button + Edit link against the LIVE targets
+ *     (view.tmpl:6-11): the impersonate POST `/{id}/impersonate` is landed
+ *     (admin-users-impersonate.ts, migration 0058 — its upstream
+ *     `link-action data-url` JS dialect reduces to the no-JS form POST, the
+ *     house convention; the success arm 303s onto /user/settings) and the
+ *     edit link `/{id}/edit` is the landed admin-user-edit page. Upstream's
+ *     `{{if not .User.IsTypeBot}}` guard is a documented dead arm here — the
+ *     users.type enum has no bot value (the impersonate module's own note).
+ *     The no-JS form is rendered in upstream's flex-text-block span beside
+ *     the Edit anchor.
  *   - view_details: the 48px avatar (the landed serving seam
  *     `/user/avatar/{name}/48`), the shared/user/name link (upstream
  *     DisplayNameWithFullName — "name (Full Name)" when the full name is
@@ -170,6 +175,8 @@ export const adminUserDetailLocale = {
   private: "Private", // "repo.desc.private" (view_orgs.tmpl:31)
   joined_on: "Joined on %s", // "user.joined_on" (view_orgs.tmpl:37)
   avatar_section: "Avatar", // "settings.avatar" (edit.tmpl:190's section header — the fold's title)
+  impersonate: "Impersonate", // "admin.users.impersonate" (view.tmpl:8 — the header's POST button)
+  edit: "Edit", // "admin.users.edit" (view.tmpl:10 — the header's Edit link)
 } as const;
 
 /** Upstream `DisplayNameWithFullName` (models/user/user.go:496-501): the
@@ -434,11 +441,24 @@ export function AdminUserDetailPage(props: { ctx: UiContext; data: AdminUserDeta
     <AdminFamilyShell ctx={ctx} title={adminUserDetailLocale.details} pageClass="admin view user" active="users" oauth2Enabled={data.oauth2Enabled}>
       <div class="admin-responsive-columns">
         <div class="tw-flex-1">
-          {/* The header (view.tmpl:5-13): the Title span; the impersonate
-              button + edit link are OMITTED (the module header — the STOP
-              arm + the unlanded edit page, the dead-control rule). */}
+          {/* The header (view.tmpl:5-13): the Title span + the Impersonate
+              button + Edit link against the LIVE targets (the module header —
+              the landed impersonate POST's no-JS form reduction inside
+              upstream's flex-text-block span, and the landed edit page's
+              anchor; the IsTypeBot guard is a dead arm, the users.type enum
+              has no bot value). */}
           <h4 class="ui top attached header flex-left-right">
             <span>{adminUserDetailLocale.details}</span>
+            <span class="flex-text-block">
+              <form method="post" action={`${link}/impersonate`}>
+                <button type="submit" class="ui primary compact tiny basic button">
+                  {adminUserDetailLocale.impersonate}
+                </button>
+              </form>
+              <a class="ui primary compact tiny button" href={`${link}/edit`}>
+                {adminUserDetailLocale.edit}
+              </a>
+            </span>
           </h4>
           <div class="ui attached segment">
             <UserDetailsBlock user={user} />

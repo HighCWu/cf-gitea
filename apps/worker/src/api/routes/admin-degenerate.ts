@@ -4,7 +4,7 @@ import type { MiddlewareHandler } from "hono";
 import { z } from "zod";
 
 import { enqueueDueAuditRetention } from "../../services/audit";
-import { enqueueDueDemoSweeps } from "../../services/demo-sweep";
+import { enqueueDueDemoSweeps, enqueueDueWebhookMaintenance } from "../../services/demo-sweep";
 import { enqueueDueMirrorSyncs } from "../../services/mirror/sync";
 import { enqueueDuePushMirrorSyncs } from "../../services/mirror/push-sync";
 import { enqueueDuePackagesCleanup } from "../../services/packages/cleanup";
@@ -54,7 +54,8 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
  *               ExecTimes counts manual runs too, tasks.go:95-97).
  *
  *             The registry SPLIT the two surfaces keep (disclosed): the
- *             census (10 arms) is the SCHEDULER's lens while the API's run
+ *             census (the scheduler's lens — CRON_ARMS, thirteen arms) while
+ *             the API's run
  *             gate is the runnable subset whose producer bodies are landed
  *             here — upstream's registry is its runnable set, but upstream
  *             is one process where we are two invocation kinds (fetch vs
@@ -170,13 +171,17 @@ type CronRunBody = (env: Env) => Promise<number>;
  * landed here (services/cron-state.ts's census holds the per-arm upstream
  * cites; the bodies are the scheduled dispatcher's exact producer calls,
  * "run = enqueue" — "crons enqueue, consumers do the work"). A census arm
- * absent from this map (the FIVE actions-family arms — stop_zombie_tasks,
- * cleanup_actions, stop_endless_tasks, cancel_abandoned_jobs and
- * cleanup_ephemeral_runners, whose producer modules live in
- * services/actions/**, an in-flight sibling's ownership) answers the run
- * arm's 404 exactly like an unknown task — the monitor's adjudicated arm —
- * and extending run capability extends the monitor's RUNNABLE_CRON_ARMS in
- * the same landing.
+ * absent from this map answers the run arm's 404 exactly like an unknown
+ * task — the monitor's adjudicated arm — and extending run capability
+ * extends the monitor's RUNNABLE_CRON_ARMS in the same landing. The SEVEN
+ * still-bodyless census arms: the five actions-family sweep arms
+ * (stop_zombie_tasks, cleanup_actions, stop_endless_tasks,
+ * cancel_abandoned_jobs, cleanup_ephemeral_runners — their producer modules
+ * live in services/actions/**) plus auto_merge_due_scan
+ * (services/pull-automerge.ts) and start_schedule_tasks
+ * (services/demo-sweep.ts) — each joins THIS map only with its own
+ * disclosed one-liner, the 2b15f6f shape the cleanup_hook_task_table entry
+ * below follows.
  */
 const CRON_RUN_BODIES: Readonly<Record<string, CronRunBody>> = {
   update_mirrors: (env) => enqueueDueMirrorSyncs(env, {}),
@@ -184,6 +189,10 @@ const CRON_RUN_BODIES: Readonly<Record<string, CronRunBody>> = {
   demo_sweep: (env) => enqueueDueDemoSweeps(env, {}),
   delete_old_audit_events: (env) => enqueueDueAuditRetention(env, {}),
   cleanup_packages: (env) => enqueueDuePackagesCleanup(env, {}),
+  // The webhook-maintenance producer (SPEC-0005 §4.9 as-built, 870c9b3) —
+  // the divergence the monitor's map disclosed while this twin was pending:
+  // the monitor's dispatch already ran this arm, THIS registry 404ed it.
+  cleanup_hook_task_table: (env) => enqueueDueWebhookMaintenance(env, {}),
 };
 
 /** Go's zero time.Time as json.Marshal renders it (services/cron leaves
@@ -417,7 +426,7 @@ export function registerAdminDegenerateRoutes(app: OpenAPIHono<ApiEnv>, requireA
   // GET /admin/cron — the full arm census, upstream-paginated (cron.go:
   // ListCronTasks — count before the slice, X-Total-Count over the full
   // registry) with the recorded tick state merged (the monitor's loader
-  // shape; one point scan of a ≤10-row table).
+  // shape; one point scan of a ≤13-row table).
   app.openapi(adminCronListRoute(requireAuth), async (c) => {
     const options = parseListOptions(new URL(c.req.url));
     const start = (options.page - 1) * options.limit;

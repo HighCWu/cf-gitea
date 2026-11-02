@@ -361,7 +361,7 @@ describe("loadAdminMonitorStats (GetStatistic's landed-table subset, sorted keys
 const NOW = new Date("2026-01-01T12:07:33Z");
 
 describe("loadAdminMonitorCron (the FULL landed arm census — the usability F3 listing)", () => {
-  it("carries all TWELVE landed arms with their wrangler schedules in registry order", () => {
+  it("carries all THIRTEEN landed arms with their wrangler schedules in registry order", () => {
     const { entries } = loadAdminMonitorCron(NOW);
     expect(entries.map((entry) => [entry.name, entry.spec])).toEqual([
       ["update_mirrors", "*/10 * * * *"],
@@ -376,6 +376,7 @@ describe("loadAdminMonitorCron (the FULL landed arm census — the usability F3 
       ["cancel_abandoned_jobs", "0 * * * *"],
       ["cleanup_ephemeral_runners", "0 * * * *"],
       ["cleanup_hook_task_table", "0 * * * *"],
+      ["start_schedule_tasks", "0 * * * *"],
     ]);
     // The never-fired posture without recorded state (the sync loader's
     // shape): prev null, zero executions, the empty-Status result arm.

@@ -282,12 +282,18 @@ describe("the render (view.tmpl + the folds)", () => {
     expect(html).toContain('src="/user/avatar/detail-alice/64"');
   });
 
-  it("the dead arms render nowhere: no impersonate button, no edit link (the STOP arm + the unlanded page)", async () => {
+  it("the header pair targets the LIVE arms: the impersonate form POST + the edit link (view.tmpl:6-11)", async () => {
     const seeded = await seedDetail();
     const data = (await loadAdminUserDetail(env.DB, seeded.aliceId))!;
     const html = renderAdminUserDetailPage(ctx, { ...data });
-    expect(html).not.toContain("/impersonate");
-    expect(html).not.toContain(`/-/admin/users/${seeded.aliceId}/edit`);
+    // The no-JS form reduction of upstream's link-action button (the landed
+    // admin-users-impersonate POST; success 303s onto /user/settings).
+    expect(html).toContain(`action="/-/admin/users/${seeded.aliceId}/impersonate"`);
+    expect(html).toContain('<button type="submit" class="ui primary compact tiny basic button">');
+    expect(html).toContain(">Impersonate</button>");
+    // The edit anchor onto the landed admin-user-edit page.
+    expect(html).toContain(`href="/-/admin/users/${seeded.aliceId}/edit"`);
+    expect(html).toContain(">Edit</a>");
   });
 });
 

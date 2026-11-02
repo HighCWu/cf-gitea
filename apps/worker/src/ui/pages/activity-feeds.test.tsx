@@ -539,13 +539,18 @@ describe("loadActivityFeedsData (profile.go:162-190's arm)", () => {
     expect(anon.items[0]?.content).toBe("1|public work");
   });
 
-  it("the keep_activity_private info-message flag follows the owner's visibility", async () => {
+  it("the keep_activity_private info-message flag keys on the owner's hide_activity setting (the C5 re-key)", async () => {
     await seedBaseFixtures();
     const alice = await userRow("alice");
     const data = await loadActivityFeedsData(env.DB, alice, selfViewer, ORIGIN, new URLSearchParams());
     expect(data.keepActivityPrivate).toBe(false);
 
-    await env.DB.prepare("UPDATE users SET visibility = 'private' WHERE id = 1").run();
+    // profile.tmpl:15-19's KeepActivityPrivate = the landed
+    // user_settings.hide_activity preference (NOT the visibility enum the
+    // earlier build keyed — the module header's C5 note).
+    await env.DB.prepare(
+      "INSERT INTO user_settings (user_id, theme, language, diff_view_style, hide_email, hide_activity) VALUES (1, 'gitea-auto', '', '', 0, 1)",
+    ).run();
     const privated = await loadActivityFeedsData(
       env.DB,
       await userRow("alice"),
@@ -716,8 +721,10 @@ describe("activity feeds query-shape witness (query-shape-audit C2)", () => {
 
     // (a) Statement count fixed at the documented arms — 2 (page + count)
     // + 2 (act users + repo pairs) + 1 (coordinates) + 1 (titles) + 1
-    // (badge count) + 4 (follow count+page ×2) = 11, corpus-independent.
-    expect(meter.count()).toBeLessThanOrEqual(11);
+    // (badge count) + 4 (follow count+page ×2) + 1 (hide_activity setting —
+    // the C5 re-key) + 1 (open-projects count — the C1 strip) + 1
+    // (isFollowing — the C2 card) = 14, corpus-independent.
+    expect(meter.count()).toBeLessThanOrEqual(14);
 
     // (b) The loader's ACTUAL title statement carries BOTH filters — a
     // revert to the repo-only select fails this pin (and no other loader

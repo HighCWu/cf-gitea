@@ -85,17 +85,41 @@
  *
  * ## Documented v1 degradations (§6 method)
  *
- * - The overview header (user/overview/header.tmpl) renders its two LIVE
- *   tabs only — Repositories (`?tab=repositories`, upstream header.tmpl:12's
+ * - THE C5 RE-KEY (the private-activity message, profile.tmpl:15-19): the
+ *   `user.disabled_public_activity` info message keys on the owner's
+ *   LANDED KeepActivityPrivate setting — `user_settings.hide_activity`
+ *   (api/services/user-settings.ts, the `keep_activity_private` PATCH key,
+ *   migration 0008's side store) — exactly upstream's
+ *   `{{if .ContextUser.KeepActivityPrivate}}`, NOT on the owner's
+ *   `users.visibility` value the earlier build keyed (the wire-visible
+ *   mis-message the v1.5.2 ledger's C5 row pinned: a `private`-visibility
+ *   user who never set the preference saw the message, a public user who
+ *   set it did not). THE DISCLOSED WIRE-VISIBLE COMPROMISE that remains
+ *   (no migration in this unit): the FEED-DATA gate still folds
+ *   KeepActivityPrivate onto the visibility enum —
+ *   `includePrivate = signed ∧ (admin ∨ self)` over the visibility ladder
+ *   (specs/activity-feeds.md §3.4's landed mapping) — so the two
+ *   signals can disagree on the wire: a public user WITH the setting sees
+ *   the message but a full feed (upstream empties it for strangers —
+ *   ActivityReadable, models/activities/action.go), and a
+ *   private-visibility user WITHOUT the setting sees a strangers-empty
+ *   feed with no message (upstream shows the feeds). Both signals are
+ *   real upstream behaviors; the mismatch is which owner flag drives
+ *   which half, and it is visible only across the two halves.
+ * - The overview header (user/overview/header.tmpl) renders the live tab
+ *   set — Repositories (`?tab=repositories`, upstream header.tmpl:12's
  *   exact href; the landed profile page answers the query by ignoring it,
- *   upstream's no-readme default-tab rule profile.go:84-101) and Activity
- *   (header.tmpl:33-34, ACTIVE here). Packages/Code/Projects/Stars need
- *   their owner-scoped surfaces (rendering a tab whose page the route has
- *   not claimed is a dead link, §2.4.1). The strip is module-local — OrgMenu
- *   has no activity slot and org-home.tsx is not this wave's file (the
- *   wave-37 extension pattern, kept local).
- * - The Activity tab's upstream glyph is `octicon-rss` — not in the
- *   generated set; `octicon-history` (the timeline/clock glyph) stands in.
+ *   upstream's no-readme default-tab rule profile.go:84-101), Projects
+ *   (header.tmpl:16-21 — the C1 tab, the `/-/projects` page, with the
+ *   ProjectCount label), Packages (header.tmpl:22-25, the strict-polarity
+ *   packages flag), Code (header.tmpl:26-31 — the C1 tab, the `/-/code`
+ *   page) and Activity (header.tmpl:33-34, ACTIVE here), plus the
+ *   Stars/watching pair (the collapsed-if note on the component). The strip
+ *   is module-local — OrgMenu has no activity slot and org-home.tsx is not
+ *   this wave's file (the wave-37 extension pattern, kept local).
+ * - The Activity tab's upstream glyph is `octicon-rss` — the generated set
+ *   carries it now (the earlier `octicon-history` stand-in predates the
+ *   allowlist gaining rss; the strip renders the upstream glyph).
  * - The actor avatar renders the placeholder octicon in a 28px `ui avatar`
  *   span (the avatar-slot rule; upstream AvatarHTML —
  *   modules/templates/util_avatar.go:31-36 — carries
@@ -141,11 +165,12 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { feedIssueTitles, getFeedRows, renderFeedItems, type Activity } from "../../api/services/activity-feeds";
-import { listFollowers, listFollowing } from "../../api/services/follows";
+import { isFollowing, listFollowers, listFollowing } from "../../api/services/follows";
 import { renderMarkdownToHtml } from "../../api/services/markdown";
 import type { Viewer as ApiViewer } from "../../api/services/repository";
+import { loadUserSettings } from "../../api/services/user-settings";
 import type { OrgRecord } from "../../services/orgs/orgs";
-import { repositories } from "../../db/schema";
+import { projects, repositories } from "../../db/schema";
 import { TimeSince } from "../components/file-list";
 import type { IconName } from "../icons";
 import { parsePageNumber } from "../page-data";
@@ -166,6 +191,9 @@ import {
  *  is shared and not this wave's file; upstream locale keys cited). */
 export const activityFeedsLocale = {
   repositories: "Repositories", // "user.repositories"
+  projects: "Projects", // "user.projects" (header.tmpl:23 — the C1 strip tab)
+  packages: "Packages", // "packages.title" (header.tmpl:22-25 — SPEC-0016 M2)
+  code: "Code", // "user.code" (header.tmpl:29 — the C1 strip tab)
   activity: "Public Activity", // "user.activity"
   starred: "Starred Repositories", // "user.starred" (header.tmpl:38)
   watched: "Watched Repositories", // "user.watched" (header.tmpl:45)
@@ -487,15 +515,28 @@ export interface ActivityFeedsData {
   /** The `?date=YYYY-MM-DD` passthrough (unparsable input never reaches
    *  the query — the service's FeedDateCond warn-and-continue). */
   date: string;
-  /** `users.visibility = 'private'` — the landed keep_activity_private
-   *  mapping (specs/activity-feeds.md §3.4): the profile.tmpl:11-15 info
-   *  message shows regardless of the viewer, exactly upstream. */
+  /** The owner's `user_settings.hide_activity` preference (the landed
+   *  KeepActivityPrivate setting — `keep_activity_private` in the PATCH
+   *  vocabulary; api/services/user-settings.ts, migration 0008's side
+   *  store): profile.tmpl:11-15's info message keys on THIS, regardless of
+   *  the viewer, exactly upstream. See the module header's C5 note for the
+   *  feed-data gate's disclosed mismatch. */
   keepActivityPrivate: boolean;
   /** The overview header's Repositories count (the profile loader's
    *  doer-visible WHERE — loadHeaderCount parity). */
   repoCount: number;
+  /** The overview header's Projects count (header.tmpl:24's
+   *  `{{if .ProjectCount}}` label — the OPEN individual projects,
+   *  loadHeaderCount parity). */
+  openProjects: number;
   followers: number;
   following: number;
+  /** profile_big_avatar.tmpl:123-136's follow button input (the profile
+   *  loader's shape — the same avatar card renders on every profile tab). */
+  followButton: { following: boolean } | null;
+  /** profile_big_avatar.tmpl:18's admin gear gate (the viewer's admin
+   *  flag). */
+  viewerIsAdmin: boolean;
 }
 
 /** The api `Viewer` projection of the session viewer (the owner-projects
@@ -632,9 +673,22 @@ export async function loadActivityFeedsData(
     .get();
 
   const followViewer = { id: viewerId, isAdmin: viewerIsAdmin };
-  const [followers, following] = await Promise.all([
+  const [followers, following, settings, openProjectsRow, viewerFollows] = await Promise.all([
     listFollowers(d1, user.id, followViewer, { page: 1, pageSize: 1 }),
     listFollowing(d1, user.id, followViewer, { page: 1, pageSize: 1 }),
+    // The C5 re-key: the message keys on the landed KeepActivityPrivate
+    // setting (user_settings.hide_activity), not the owner's visibility —
+    // profile.tmpl:15-19's `{{if .ContextUser.KeepActivityPrivate}}`.
+    loadUserSettings(d1, user.id),
+    // The strip's Projects count (header.tmpl:24 — loadHeaderCount parity,
+    // the OPEN individual projects: the projects.ownerId arm).
+    drizzle(d1)
+      .select({ total: sql<number>`count(*)` })
+      .from(projects)
+      .where(and(eq(projects.ownerId, user.id), eq(projects.isClosed, false)))
+      .get(),
+    // The avatar card's follow button (the profile loader's shape).
+    viewerId !== null && viewerId !== user.id ? isFollowing(d1, viewerId, user.id) : Promise.resolve(false),
   ]);
 
   return {
@@ -644,10 +698,13 @@ export async function loadActivityFeedsData(
     total,
     more: page * ACTIVITY_FEEDS_PAGE_SIZE < total,
     date,
-    keepActivityPrivate: user.visibility === "private",
+    keepActivityPrivate: settings.hideActivity,
     repoCount: Number(repoCountRow?.total ?? 0),
+    openProjects: Number(openProjectsRow?.total ?? 0),
     followers: followers.total,
     following: following.total,
+    followButton: viewerId !== null && viewerId !== user.id ? { following: viewerFollows } : null,
+    viewerIsAdmin,
   };
 }
 
@@ -744,18 +801,35 @@ export function ActivityFeedList(props: { items: ActivityFeedItem[] }) {
 
 /** The overview header (user/overview/header.tmpl reduced to its live
  *  tabs — the header's degradation note; module-local because OrgMenu has
- *  no activity slot and org-home.tsx is not this wave's file). The Activity
- *  anchor is ACTIVE here; Stars (header.tmpl:36-44) and watching
- *  (header.tmpl:43-46) render INACTIVE — the collapsed-if rule: upstream
- *  swaps Stars→watching under DisableStars (default false), the landed
- *  strips ship BOTH anchors and never mark either active on this page. */
-function OverviewTabs(props: { username: string; repoCount: number }) {
+ *  no activity slot and org-home.tsx is not this wave's file). The full
+ *  C1 strip now: Repositories, Projects (header.tmpl:16-21 — the C1 tab,
+ *  `octicon-project-symlink`, the `{{if .ProjectCount}}` label), Packages
+ *  (header.tmpl:22-25, armed on the strict-polarity packages flag), Code
+ *  (header.tmpl:26-31 — the C1 tab, `octicon-code`, no count label
+ *  upstream), Activity (ACTIVE here), Stars (header.tmpl:36-44) and
+ *  watching (header.tmpl:43-46) — Stars and watching INACTIVE (the
+ *  collapsed-if rule: upstream swaps Stars→watching under DisableStars
+ *  (default false), the landed strips ship BOTH anchors and never mark
+ *  either active on this page). */
+function OverviewTabs(props: { username: string; repoCount: number; openProjects: number; packagesEnabled?: boolean }) {
   return (
     <overflow-menu class="ui secondary pointing tabular borderless menu">
       <div class="overflow-menu-items">
         <a class="item" href={`/${props.username}?tab=repositories`}>
           <Icon name="octicon-repo" /> {activityFeedsLocale.repositories}
           {props.repoCount > 0 ? <div class="ui small label">{props.repoCount}</div> : null}
+        </a>
+        <a class="item" href={`/${props.username}/-/projects`}>
+          <Icon name="octicon-project-symlink" /> {activityFeedsLocale.projects}
+          {props.openProjects > 0 ? <div class="ui small label">{props.openProjects}</div> : null}
+        </a>
+        {props.packagesEnabled !== false ? (
+          <a class="item" href={`/${props.username}/-/packages`}>
+            <Icon name="octicon-package" /> {activityFeedsLocale.packages}
+          </a>
+        ) : null}
+        <a class="item" href={`/${props.username}/-/code`}>
+          <Icon name="octicon-code" /> {activityFeedsLocale.code}
         </a>
         <a class="active item" href={`/${props.username}?tab=activity`}>
           <Icon name="octicon-rss" /> {activityFeedsLocale.activity}
@@ -852,10 +926,21 @@ export function ActivityFeedsPage(props: { ctx: UiContext; data: ActivityFeedsDa
       <div class="ui container">
         <div class="ui stackable grid">
           <div class="ui four wide column">
-            <ProfileAvatarCard user={data.user} followers={data.followers} following={data.following} />
+            <ProfileAvatarCard
+              user={data.user}
+              followers={data.followers}
+              following={data.following}
+              followButton={data.followButton ?? undefined}
+              viewerIsAdmin={data.viewerIsAdmin}
+            />
           </div>
           <div class="ui twelve wide column tw-mb-4">
-            <OverviewTabs username={data.user.username} repoCount={data.repoCount} />
+            <OverviewTabs
+              username={data.user.username}
+              repoCount={data.repoCount}
+              openProjects={data.openProjects}
+              packagesEnabled={ctx.packagesEnabled}
+            />
             {data.keepActivityPrivate ? (
               <div class="ui info message">
                 <p>{activityFeedsLocale.disabled_public_activity}</p>

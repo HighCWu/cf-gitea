@@ -70,6 +70,7 @@
 import { inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
+import { isFollowing } from "../../api/services/follows";
 import { listOrgRepositories, orgVisibleToDoer, type OrgDoer } from "../../api/services/org-repos";
 import { resolveOrgForRequest, type ResolvedOrg } from "../../api/services/orgs";
 import { OrgService, type OrgRecord } from "../../services/orgs/orgs";
@@ -86,6 +87,7 @@ export const orgHomeLocale = {
   repositories: "Repositories", // "user.repositories"
   projects: "Projects", // "user.projects" (the wave-37 projectsTab item)
   packages: "Packages", // "packages.title" (menu.tmpl:32-35's item — SPEC-0016 M2)
+  code: "Code", // "org.code" (menu.tmpl:38-42's item — the C1 codeTab)
   repos_empty: "No repositories yet.", // "org.repos.empty"
   repos_empty_description: "Create a repository to share code with the organization.", // "org.repos.empty_description"
   repo_updated: "Updated", // "org.repo_updated"
@@ -95,6 +97,9 @@ export const orgHomeLocale = {
   repo_pulls_aria: "Pull Requests", // "repo.pulls"
   visibility_limited: "Limited", // "org.settings.visibility.limited_shortname"
   visibility_private: "Private", // "org.settings.visibility.private_shortname"
+  rss_feed: "RSS Feed", // "rss_feed" (org/header.tmpl:18's tooltip)
+  follow: "Follow", // "user.follow" (org/follow_unfollow.tmpl:5)
+  unfollow: "Unfollow", // "user.unfollow" (org/follow_unfollow.tmpl:3)
 } as const;
 
 /** Upstream `setting.UI.User.RepoPagingNum` (modules/setting/ui.go:147). */
@@ -114,6 +119,11 @@ export interface OrgHomeData {
   total: number;
   page: number;
   more: boolean;
+  /** org/header.tmpl:17's follow button input (`{{if .IsSigned}}` — the
+   *  RenderUserOrgHeader IsFollowing state, header.go:28): present only for
+   *  a signed-in doer; orgs have no self-follow (a doer row of the org
+   *  itself cannot exist — type='org' never follows). */
+  followButton: { following: boolean } | null;
 }
 
 /** Upstream `DisplayName()` (models/user: fullName or the username). */
@@ -125,7 +135,10 @@ export function orgDisplayName(org: OrgRecord): string {
  * Load the page (§3.2 — the landed services, never a self-fetch): the
  * visible-row listing (the §4.7 owner predicate lives in the service), then
  * one batched description read for the page's rows (the wave-2 batching
- * pattern — loadRepoSettings is per-repo; the list needs the column only).
+ * pattern — loadRepoSettings is per-repo; the list needs the column only),
+ * then the org-header follow state (org/header.tmpl:17's
+ * `{{template "org/follow_unfollow"}}` arm — IsFollowing(doer, org), the
+ * users-row org id the landed follows table keys).
  */
 export async function loadOrgHomeData(
   d1: D1Database,
@@ -146,12 +159,16 @@ export async function loadOrgHomeData(
     for (const row of rows) descriptions.set(row.repoId, row.description);
   }
 
+  const viewerFollows =
+    doer.id !== null && doer.id !== org.id ? await isFollowing(d1, doer.id, org.id) : false;
+
   return {
     org,
     repos: listing.items.map((item) => ({ repo: item.repo, description: descriptions.get(item.repo.id) ?? "" })),
     total: listing.total,
     page,
     more: page * ORG_HOME_PAGE_SIZE < listing.total,
+    followButton: doer.id !== null && doer.id !== org.id ? { following: viewerFollows } : null,
   };
 }
 
@@ -172,9 +189,15 @@ function OrgVisibilityBadge(props: { org: OrgRecord }) {
 }
 
 /** org/header.tmpl: avatar slot (placeholder circle — no avatar pipeline),
- *  display name + visibility badge, description, the location/website/email
- *  rows (email is the upstream `{{if and .IsSigned .Org.Email}}` gate). */
-export function OrgHeader(props: { org: OrgRecord; signedIn: boolean }) {
+ *  display name + visibility badge, the header's actions block (the RSS
+ *  feed anchor :16-20 — `{{if .EnableFeed}}`, the setting pins TRUE
+ *  upstream and the landed `/{owner}.rss` route serves the org channel, so
+ *  the anchor renders unconditionally — and the follow button :17's
+ *  org/follow_unfollow include, rendered only when the consumer passes
+ *  `followButton`, its POST the landed `POST /{owner}?action=…` arm), the
+ *  description, the location/website/email rows (email is the upstream
+ *  `{{if and .IsSigned .Org.Email}}` gate). */
+export function OrgHeader(props: { org: OrgRecord; signedIn: boolean; followButton?: { following: boolean } }) {
   const { org } = props;
   return (
     <div class="ui container flex-container">
@@ -188,6 +211,30 @@ export function OrgHeader(props: { org: OrgRecord; signedIn: boolean }) {
           <div class="flex-text-block">
             <span class="tw-text-2xl">{orgDisplayName(org)}</span>
             <OrgVisibilityBadge org={org} />
+          </div>
+          <div class="flex-text-block">
+            {/* org/header.tmpl:16-20 — the RSS anchor (`ui basic label
+                button`, the 24px glyph, the rss_feed tooltip; the aria-label
+                pairs the tooltip — the icon-only-link rule). */}
+            <a
+              class="ui basic label button"
+              href={`/${org.username}.rss`}
+              data-tooltip-content={orgHomeLocale.rss_feed}
+              aria-label={orgHomeLocale.rss_feed}
+            >
+              <Icon name="octicon-rss" size={24} />
+            </a>
+            {/* org/header.tmpl:17's follow_unfollow include (the `ui basic
+                button`, no primary arm upstream — org/follow_unfollow.tmpl
+                stays plain); upstream's data-fetch POST reduces to the no-JS
+                form POST, the route 303s back onto the org home. */}
+            {props.followButton ? (
+              <form method="post" action={`/${org.username}?action=${props.followButton.following ? "unfollow" : "follow"}`}>
+                <button type="submit" class="ui basic button">
+                  {props.followButton.following ? orgHomeLocale.unfollow : orgHomeLocale.follow}
+                </button>
+              </form>
+            ) : null}
           </div>
         </div>
         {org.description !== null && org.description !== "" ? (
@@ -230,6 +277,11 @@ export function OrgHeader(props: { org: OrgRecord; signedIn: boolean }) {
  * `packagesTab` twin — menu.tmpl:32-35's Packages item (`octicon-package`,
  * no count label upstream), rendered only when the consumer passes it and
  * active on the family's own pages; absent keeps the prior DOM byte-stable.
+ * The C1 completion adds the optional `codeTab` twin — menu.tmpl:38-42's
+ * Code item (`{{if and .IsRepoIndexerEnabled .CanReadCode}}`,
+ * `octicon-code`, the "org.code" label, no count label upstream, active on
+ * `IsCodePage`) — rendered only when the consumer owns the `/{owner}/-/code`
+ * page; absent keeps the prior DOM byte-stable.
  */
 export function OrgMenu(props: {
   orgLink: string;
@@ -242,6 +294,9 @@ export function OrgMenu(props: {
    *  only on a consumer that owns the `/-/packages` family; upstream arms
    *  no count label on it). */
   packagesTab?: { active: boolean; href: string };
+  /** The upstream Code tab (menu.tmpl:38-42, the C1 completion — present
+   *  only on a consumer that owns the `/{owner}/-/code` page). */
+  codeTab?: { active: boolean; href: string };
 }) {
   return (
     <div class="ui container">
@@ -260,6 +315,11 @@ export function OrgMenu(props: {
           {props.packagesTab ? (
             <a class={props.packagesTab.active ? "active item" : "item"} href={props.packagesTab.href}>
               <Icon name="octicon-package" /> {orgHomeLocale.packages}
+            </a>
+          ) : null}
+          {props.codeTab ? (
+            <a class={props.codeTab.active ? "active item" : "item"} href={props.codeTab.href}>
+              <Icon name="octicon-code" /> {orgHomeLocale.code}
             </a>
           ) : null}
         </div>
@@ -382,7 +442,11 @@ export function OrgHomePage(props: { ctx: UiContext; data: OrgHomeData }) {
   const orgLink = `/${data.org.username}`;
   return (
     <BaseLayout ctx={ctx} title={orgDisplayName(data.org)} pageClass="organization profile">
-      <OrgHeader org={data.org} signedIn={ctx.viewer.kind === "user"} />
+      <OrgHeader
+        org={data.org}
+        signedIn={ctx.viewer.kind === "user"}
+        followButton={data.followButton ?? undefined}
+      />
       <OrgMenu orgLink={orgLink} repoCount={data.total} />
       <div class="ui container">
         {data.repos.length === 0 ? (

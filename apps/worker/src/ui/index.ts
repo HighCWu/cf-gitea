@@ -910,6 +910,7 @@ import {
   timeEstimateSubmit,
 } from "./pages/issue-timeline-writes";
 import { loadOrgHomeData, renderOrgHomePage, resolveOrgHome } from "./pages/org-home";
+import { followUser, unfollowUser } from "../api/services/follows";
 // The census R06 org dashboard (web.go:982-985's /org/{org}/dashboard
 // family) — the member-only page over the landed org-feed reads.
 import {
@@ -1424,6 +1425,8 @@ import {
 } from "./pages/admin-config";
 import {
   loadUserProfileData,
+  loadUserProfileOrganizationsData,
+  renderUserProfileOrganizationsPage,
   renderUserProfilePage,
   resolveUserProfile,
   type ProfileDoer,
@@ -10535,8 +10538,70 @@ async function ownerHomePage(c: Context<{ Bindings: Env }>): Promise<Response> {
     const data = await loadUserWatchingTabData(c.env.DB, profile.user, doer, url.searchParams);
     return respond(c.html(renderUserWatchingTabPage(ctx, data), 200));
   }
+  // The ORGANIZATIONS tab (profile.go:260-278 — the same profile route's
+  // user half): the org-membership cards at the DoerViewOtherVisibility
+  // ceiling (org_list.go:79-90) the loader applies; org names never reach
+  // here (the org half above already ignored the query, org.Home parity).
+  if (url.searchParams.get("tab") === "organizations") {
+    const data = await loadUserProfileOrganizationsData(c.env.DB, profile.user, doer, url.searchParams);
+    return respond(c.html(renderUserProfileOrganizationsPage(ctx, data), 200));
+  }
   const data = await loadUserProfileData(c.env.DB, profile.user, doer, url.searchParams);
   return respond(c.html(renderUserProfilePage(ctx, data), 200));
+}
+
+/** POST /{owner} — the follow/unfollow write (web.go:915's
+ *  `m.Post("/{username}", reqSignIn, context.UserAssignmentWeb(),
+ *  user.ActionUserFollow)`): the UI POST the avatar-card/org-header follow
+ *  buttons submit (`?action=follow|unfollow` in the query — upstream's
+ *  FormString("action")). reqSignIn → the anonymous login-303;
+ *  UserAssignmentWeb's visibility gate IS the resolve pair's ladder (an
+ *  invisible/unknown owner 404-shells, ActionUserFollow's NotFound arm —
+ *  profile.go:326-330); a renamed owner 307s through the same seams the
+ *  GET half rides; an unknown action is upstream's silent no-op (err stays
+ *  nil) → the same 303. Upstream re-renders a fragment
+ *  (profile_big_avatar / org follow_unfollow) — the no-JS reduction 303s
+ *  back onto the owner home (the house POST convention, the
+ *  admin-users-impersonate posture). */
+async function userFollowActionSubmit(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiSession(c);
+  if (!resolved.ok) return resolved.response;
+  const { url, route, ctx, viewer, respond } = resolved;
+  if (route.family !== "owner-home") return respond(await c.notFound()); // drift guard
+  if (viewer.kind === "anonymous") return respond(loginRedirect(url.pathname + url.search));
+  const doer = { id: viewer.id, isAdmin: viewer.isAdmin };
+  const pathname = url.pathname;
+  const query = url.search.startsWith("?") ? url.search.slice(1) : url.search;
+  // UserAssignmentWeb's shape: the ORG half resolves first (the org header
+  // button posts org names), then the user half (the avatar-card button).
+  const org = await resolveOrgHome(c.env.DB, route.owner, doer, pathname, query);
+  let ownerId: number;
+  let ownerName: string;
+  if (org.kind === "org") {
+    ownerId = org.org.id;
+    ownerName = org.org.username;
+  } else if (org.kind === "redirect") {
+    return respond(new Response(null, { status: 307, headers: { location: org.location } }));
+  } else {
+    const profile = await resolveUserProfile(c.env.DB, route.owner, doer, pathname, query);
+    if (profile.kind === "redirect") {
+      return respond(new Response(null, { status: 307, headers: { location: profile.location } }));
+    }
+    if (profile.kind !== "user") {
+      return respond(c.html(renderNotFound(ctx), 404)); // invisible/unknown — existence never leaks
+    }
+    ownerId = profile.user.id;
+    ownerName = profile.user.username;
+  }
+  const action = url.searchParams.get("action");
+  if (action === "follow") {
+    await followUser(c.env.DB, viewer.id, ownerId); // self-follow is the service's silent no-op
+  } else if (action === "unfollow") {
+    await unfollowUser(c.env.DB, viewer.id, ownerId);
+  } // any other action: upstream's silent no-op arm (FormString matches neither case)
+  return respond(new Response(null, { status: 303, headers: { location: `/${ownerName}` } }));
 }
 
 /** GET /{owner}/{repo}/milestones (pages/milestones.tsx — the list; every
@@ -19828,6 +19893,7 @@ uiRouter.post("/:owner/:repo/_fork/*", (c) => editorForkSubmit(c));
 // miss this sub-app to their own routers. The parser stays the source of
 // truth; the handler 404-shells any drift.
 uiRouter.get("/:owner{^(?!login$|logout$|healthz$)[\\w.-]+$}", (c) => ownerHomePage(c));
+uiRouter.post("/:owner{^(?!login$|logout$|healthz$)[\\w.-]+$}", (c) => userFollowActionSubmit(c));
 // Wave-23 org families (parseUiRoute claims exactly these shapes —
 // upstream's /org/{org}/members literal web.go:965 and the /{username}/-
 // repositories route web.go:1134; appended at the physical tail because no
