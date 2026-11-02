@@ -1219,13 +1219,14 @@ describe("pulls list query-shape witness (query-shape-audit A3/B1/A9)", () => {
     const count = meter.count();
     // Post-fix: 1 repo resolve + the unit-gate read (the mustAllowPulls
     // mount — one constant loadRepoSettings per request, riding the shared
-    // settings+units loader) + 2 (count + page) + 6 issue-side arms
-    // (posters, labels, pins, milestones, PR rows, assignees — the fold's
-    // added arm) + 1 mergers + 1 head repos — page-INDEPENDENT. The pre-fix
+    // settings+units loader) + 2 (count + page) + 7 issue-side arms
+    // (posters, labels, pins, milestones, PR rows, assignees, the direct
+    // issue attachments — the asset render's page twin) + 1 mergers + 1 head
+    // repos — page-INDEPENDENT. The pre-fix
     // shape paid 1 + 2 + 5×(3 base reads + 1 B1 PR re-select + 1 milestone
     // + 1 merger + 1 fork head repo) = 26 at this N; 5 rows × 4 alone would
     // break the second bound.
-    expect(count).toBeLessThanOrEqual(13);
+    expect(count).toBeLessThanOrEqual(14);
     expect(count).toBeLessThan(5 * 4);
     // The fork head renders (batched pair lookup worked) and the merged row
     // carries its merger (the batched mergers arm worked).
