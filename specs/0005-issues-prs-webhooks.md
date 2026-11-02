@@ -257,9 +257,21 @@ Citations: `gitea/models/issues/pull.go`, `services/pull/pull.go`, `check.go`,
   pointer-typed, so a present lowercase value, even `""`, wins); the remaining
   fields are lowercase-only. The emitted OpenAPI document declares only the
   lowercase names.
-- **Merge commit message (as-built, 2026-11-02)**: a trimmed `merge_title_field`
-  wins; empty/absent falls to the style's template-less default
-  (`GetDefaultMergeMessage`, `services/pull/merge.go:112–148`) — rebase → `""`,
+- **Merge commit message (as-built, 2026-11-02; template arm 2026-11-02)**: a
+  trimmed `merge_title_field` wins; empty/absent falls to the style's default
+  (`GetDefaultMergeMessage`, `services/pull/merge.go:54–165`). THE TEMPLATE ARM
+  (resolved 2026-11-02, both surfaces): the `.gitea/default_merge_message/`
+  resolution upstream runs first (`merge.go:116–122` →
+  `resolveMergeMessageTemplate :150–166`) is modeled in the shared builder —
+  `{UPPER STYLE}_TEMPLATE.md` is read off the BASE repo's default-branch tip,
+  `DEFAULT_TEMPLATE.md` the fallback, each read truncated at
+  `DefaultMergeMessageSize` (5 KiB); a found template's first line IS the
+  default title and its trimmed remainder the default body, both expanded
+  shell-like (`vars.ExpandShellLike`, `${VAR}`/`$VAR`, missing keys verbatim)
+  over the upstream vars map (`BaseRepoOwnerName` … `PullRequestReference`,
+  `ReviewedOn`, `ReviewedBy`, and `ClosingIssues` — the latest
+  closes/reopens xref per source issue kept, close-actions joined
+  `close #N, …`; `merge.go:88–114`). Template-less defaults: rebase → `""`,
   squash → `{title} (#{index})`, otherwise
   `Merge pull request '{title}' (#{index}) from {head} into {base}` with the fork
   form `from {owner}/{name}:{head}` and `<deleted>:{head}` for a deleted head repo
@@ -271,17 +283,24 @@ Citations: `gitea/models/issues/pull.go`, `services/pull/pull.go`, `check.go`,
   suppresses the arm, `services/forms/repo_form.go:455–457`) and the style is
   squash, the route composes `CommitMessageMerge(GetSquashMergeCommitMessages,
   defaultBody)` — the aggregated commit bullets + co-author trailers + the
-  `Reviewed-on`/`Reviewed-by` block — through the merge box's shared builders
-  (ui/pages/pull-merge-box.tsx exports; the api→page seam). The web merge-box
-  path always carries the field (prefilled verbatim, upstream web
-  `pull.go:1116–1129` has no default-body arm) — the arm is API-only, exactly
-  upstream. The UI prefill (SPEC-0008's merge box, the U31 seam) composes the
-  identical bytes, so the divergence is closed on BOTH paths. Remaining
-  divergences: the `.gitea/default_merge_message/*.md` template resolution
-  (`merge.go:116–122`) stays unmodeled — the template-less default is the only
-  path; read failures degrade to the empty-strings shape (the box loader's
-  disclosed err-arm posture) instead of upstream's `APIErrorInternal` 500.
-  manually-merged composes no message (upstream returns before it).
+  default body (the template's expanded remainder when a template exists) —
+  through the merge box's shared builders (ui/pages/pull-merge-box.tsx exports;
+  the api→page seam). The web merge-box path always carries the field
+  (prefilled verbatim, upstream web `pull.go:1116–1129` has no default-body
+  arm) — the arm is API-only, exactly upstream. The UI prefill (SPEC-0008's
+  merge box, the U31 seam) composes the identical bytes, so the divergence is
+  closed on BOTH paths. Remaining divergences: template/engine read failures
+  degrade to the template-less shape (the box loader's disclosed err-arm
+  posture) instead of upstream's `APIErrorInternal` 500; the squash walk's
+  newest-50 window (`pull.go:759–761`, `DefaultMergeMessageCommitsLimit`) is
+  exact within a 1000-commit walk ceiling (the engine answers the range
+  oldest-first — the read takes the whole in-range set at the ceiling and
+  slices the newest 50; ranges past the ceiling keep the oldest-first page),
+  and the co-author scan iterates that window newest-first (upstream's
+  rev-list order, `pull.go:796`) with both signature ends derived from the
+  one `NewGitSig` port (the contents-route commit stamps stamp the same
+  derivation, `temp_repo.go:236–250`). manually-merged composes no message
+  (upstream returns before it).
 - **Work-in-progress**: titles prefixed `WIP:`, `[WIP]`, `Draft`, etc. block merge
   (`models/issues/pull.go HasWorkInProgressPrefix`).
 
@@ -647,7 +666,20 @@ commit-builder flag:
   merged_unix`, close the issue with `merge_pull` comment, delete the base-repo PR
   head ref only on explicit head-branch deletion (upstream keeps the ref for merged
   PRs until the PR row is deleted), fire the `pull_request` closed/merged webhook, and
-  bump `refs_version`-mirroring cache keys per SPEC-0004 §3.3.
+  bump `refs_version`-mirroring cache keys per SPEC-0004 §3.3. THE MERGE CLOSE'S
+  ERROR SHAPE (as-built 2026-11-02, the manual-mark-on-deps-blocked fix): the close
+  is upstream's `SetIssueAsClosed` INSIDE `MarkAsMerged`'s transaction
+  (`services/pull/merge.go:838–843` — every failure wraps `ChangeIssueStatus: %w`
+  and fails the WHOLE mark), so a close failure must not let the PR mark proceed:
+  the ONE tolerated case is the already-closed race (a concurrent close loses the
+  close CAS — `IssueAlreadyChangedError` — and the mark proceeds), everything else
+  propagates. `DependenciesLeftError` reaches the close through the manually-merged
+  style (upstream's `CheckPullMergeable` skips the dependencies arm for the
+  Manually check type, `check.go:161–165`) and through a dependency added between
+  the engine's pre-gate and the close; it lands NOTHING (the deps gate sits before
+  the close CAS and the PR update never runs) — the web handler's
+  `MergedManually` default arm ServerErrors and the API falls to
+  `APIErrorInternal` (500).
 
 ### 3.5 Webhook fan-out in our write paths
 
