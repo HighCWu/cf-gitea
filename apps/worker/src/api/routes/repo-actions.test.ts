@@ -30,8 +30,28 @@
  *     the job rows from the YAML (runs-on), the inputs merge (defaults,
  *     provided values, the boolean coercion), the 422 ladder (Ref: Required
  *     binder text, has-no-workflow_dispatch, invalid workflow), the 404s
- *     (ref miss, workflow miss, the scoped reduction), the 403 disabled
- *     check ordering.
+ *     (ref miss, workflow miss, the scoped effective-source gate), the 403
+ *     disabled check ordering.
+ *   - THE SCOPED DISPATCH TWIN (the v1.5.4 K14 wave — action.go:1120-1123's
+ *     query param + workflow.go:237-268's scoped arm): a non-empty
+ *     scoped_workflow_source_repo_id (the TEXT source id verbatim, ""/"0" =
+ *     repo-level — the WEB arm's recorded adaptation) dispatches the SOURCE
+ *     repo's default-branch .gitea/scoped_workflows content: the effective-
+ *     source gate 404s a non-registered id, the validation ladder runs over
+ *     the SOURCE content, the inputs merge reads the SOURCE declarations,
+ *     and the run records the content-source parity columns
+ *     (is_scoped_run/workflow_repo_id/workflow_commit_sha — the SOURCE sha
+ *     beside the consumer ref's commit_sha). The scoped opt-out (the
+ *     WEB-side toggle's store) 403s the dispatch; a REQUIRED workflow
+ *     ignores the opt-out (workflow.go:89-92's conjunction).
+ *   - THE API TOGGLE'S SCOPED ABSENCE (the pin's decision — LAND NOTHING):
+ *     upstream's enable/disable swagger declares owner/repo/workflow_id
+ *     only (action.go:1047-1084/:1194-1230) and the handlers never read the
+ *     param (:1081/:1230 — the scoped mutators are the WEB handler's
+ *     view.go:1338-1361 branch); the API toggle ignores a passed param —
+ *     the CONSUMER's repo-level workflow flips, the scoped opt-out map
+ *     stays untouched, and a REQUIRED scoped registration refuses nothing
+ *     on the API (the web-only JSONError never arms here).
  *   - getWorkflowJob (action.go:1702-1752): the ActionWorkflowJob wire
  *     (convert.go:545-590), the repo-mismatch 404 "not found", the junk-id
  *     404.
@@ -72,7 +92,8 @@ import {
   users,
 } from "../../db/schema";
 import { insertActionRun } from "../../services/actions/model";
-import { loadRepoActionsConfig } from "../../services/actions/config";
+import { loadRepoActionsConfig, toggleRepoActionsWorkflow } from "../../services/actions/config";
+import { scopedWorkflowSourcesStore } from "../../services/actions/scoped-workflow-sources";
 import { createTokenAuthMiddleware, extractTokenHeader, STUB_USER, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -139,6 +160,38 @@ const SUITE_COMMITS: SeedCommit[] = [
   },
 ];
 
+// The scoped twin's SOURCE repo: the SCOPED_WORKFLOW_DIRS walk (.gitea/
+// scoped_workflows — services/actions/scoped-workflows.ts's default) with a
+// dispatchable ci.yml whose inputs differ from the CONSUMER's ci.yml (the
+// content-source proof), a push-only file (the has-no-dispatch 422 arm over
+// the SOURCE content) and a broken file (the invalid 422 arm).
+const SCOPED_CI_YML = `name: ScopedCI
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: "The note"
+        default: "from-source"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo scoped
+`;
+
+const SCOPED_SOURCE_COMMITS: SeedCommit[] = [
+  {
+    message: "seed: scoped workflows",
+    time: T0 + 90,
+    files: [
+      { path: "README.md", content: "# scoped source\n" },
+      { path: ".gitea/scoped_workflows/ci.yml", content: SCOPED_CI_YML },
+      { path: ".gitea/scoped_workflows/push-only.yml", content: NOTIFY_YML },
+      { path: ".gitea/scoped_workflows/broken.yml", content: BROKEN_YML },
+    ],
+  },
+];
+
 const FALLBACK_COMMIT: SeedCommit = {
   message: "seed: github workflows dir",
   time: T0 + 30,
@@ -162,6 +215,11 @@ let ADMIN_ID = 0;
 let SUITE_REPO_ID = "";
 let EMPTY_REPO_ID = "";
 let TIP_MAIN = "";
+/** The scoped twin's SOURCE repo (the TEXT repositories.id the dispatch
+ *  param carries verbatim — the schema's own TEXT adaptation) + its default
+ *  branch HEAD (the workflow_commit_sha parity column's value). */
+let SOURCE_REPO_ID = "";
+let SOURCE_TIP = "";
 const ORIGIN = "https://example.com";
 
 beforeAll(async () => {
@@ -175,6 +233,8 @@ beforeAll(async () => {
   TIP_MAIN = seeded.tips[1] as string;
   await ensureSeededRepo({ owner: OWNER, slug: "actions-fallback", commits: [FALLBACK_COMMIT] });
   await ensureSeededRepo({ owner: OWNER, slug: "actions-empty", commits: [EMPTY_COMMIT] });
+  const scopedSource = await ensureSeededRepo({ owner: OWNER, slug: "scoped-source", commits: SCOPED_SOURCE_COMMITS });
+  SOURCE_TIP = scopedSource.tips[0] as string;
 
   const bob = await seedVerifiedUser({ username: "bob" });
   const admin = await seedVerifiedUser({ username: "act-admin", isAdmin: true });
@@ -207,6 +267,16 @@ beforeAll(async () => {
   EMPTY_REPO_ID = emptyRow.id;
   await db.update(repoSettings).set({ hasActions: false }).where(eq(repoSettings.repoId, EMPTY_REPO_ID));
   await db.delete(repoUnits).where(eq(repoUnits.repoId, EMPTY_REPO_ID));
+
+  // The scoped twin's SOURCE registration: the instance-level row (owner_id
+  // 0 — effective for every consumer owner) over the source repo's TEXT id.
+  // addSource is idempotent (the exists pre-check), so the D-8
+  // double-execution rides calm. The registration survives the run-family
+  // wipe below on purpose — the sources table is not run state.
+  const sourceRow = await db.select().from((await import("../../db/schema")).repositories).where(eq((await import("../../db/schema")).repositories.slug, "scoped-source")).get();
+  if (sourceRow === undefined) throw new Error("scoped-source repo row missing");
+  SOURCE_REPO_ID = sourceRow.id;
+  await scopedWorkflowSourcesStore(env.DB).addSource(0, SOURCE_REPO_ID);
 
   // The M3 trigger wiring (6cdc698) rides the engine's onPush seam — fired
   // in waitUntil AFTER the receive answers — so the seeds' REAL pushes above
@@ -456,6 +526,59 @@ describe("PUT .../disable + .../enable (the LANDED ActionsConfig store)", () => 
     expect((await res.json<{ message: string }>()).message).toBe("user should have a permission to write to a repo");
     expect((await put(`${SUITE}/actions/workflows/ci.yml/disable`)).status).toBe(401);
   });
+
+  afterAll(async () => {
+    // D-8 posture (the audit describe's re-enable note): a mid-test failure
+    // must not strand a disabled entry into a re-execution's state pins.
+    await put(`${SUITE}/actions/workflows/ci.yml/enable`, "alice-token");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The API toggle's scoped ABSENCE (the pin's decision — upstream's
+// enable/disable API surface carries NO scoped param: the swagger declares
+// owner/repo/workflow_id only, action.go:1047-1084/:1194-1230, and the
+// handlers never read the param — :1081/:1230 call the repo-level-only
+// actions_service.EnableOrDisableWorkflow, workflow.go:30-52; the scoped
+// mutators + the required-refusal are the WEB handler's view.go:1338-1361
+// branch). LAND NOTHING on the toggle — pin the ignored-param behavior.
+// ---------------------------------------------------------------------------
+
+describe("PUT .../disable + .../enable ignore scoped_workflow_source_repo_id (the API surface's recorded absence)", () => {
+  afterAll(async () => {
+    // D-8 posture + the stranded-state defense: the repo-level toggle back
+    // to enabled; the scoped opt-out map and the registration's configs
+    // cleared (repo_units + the sources table survive every barrier).
+    await put(`${SUITE}/actions/workflows/ci.yml/enable`, "alice-token");
+    await scopedWorkflowSourcesStore(env.DB).setSourceConfigs(0, SOURCE_REPO_ID, {});
+    await toggleRepoActionsWorkflow(env.DB, SUITE_REPO_ID, ALICE_ID, {
+      workflowId: "ci.yml",
+      isEnable: true,
+      scopedWorkflowSourceRepoId: SOURCE_REPO_ID,
+    });
+  });
+
+  it("a scoped param on the disable wire toggles the CONSUMER's repo-level workflow; the opt-out map stays empty", async () => {
+    // the registration marks ci.yml REQUIRED — the WEB disable would refuse
+    // (view.go:1338-1344's scoped_required_cannot_disable JSONError); the
+    // API never consults the registration.
+    await scopedWorkflowSourcesStore(env.DB).setSourceConfigs(0, SOURCE_REPO_ID, { "ci.yml": { required: true, patterns: ["*"] } });
+    const res = await put(
+      `${SUITE}/actions/workflows/ci.yml/disable?scoped_workflow_source_repo_id=${SOURCE_REPO_ID}`,
+      "alice-token",
+    );
+    expect(res.status).toBe(204); // no required-refusal — the API has no scoped branch to arm
+    const cfg = await loadRepoActionsConfig(env.DB, SUITE_REPO_ID);
+    expect(cfg.disabledWorkflows).toEqual(["ci.yml"]); // the repo-level entry flipped
+    expect(cfg.disabledScopedWorkflows).toEqual({}); // the opt-out map untouched
+    // the enable arm rides the same absence.
+    expect(
+      (await put(`${SUITE}/actions/workflows/ci.yml/enable?scoped_workflow_source_repo_id=${SOURCE_REPO_ID}`, "alice-token")).status,
+    ).toBe(204);
+    const cfgAfter = await loadRepoActionsConfig(env.DB, SUITE_REPO_ID);
+    expect(cfgAfter.disabledWorkflows).toEqual([]);
+    expect(cfgAfter.disabledScopedWorkflows).toEqual({});
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -657,6 +780,22 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
     // like a fresh file — the dispatches describe's empty-set bootstrap
     // below stays coherent.
     await db.delete(repoCounters).where(eq(repoCounters.repoId, SUITE_REPO_ID));
+    // the scoped twin's stranded-state defense (the audit describe's
+    // re-enable posture): a mid-test failure could leave the scoped opt-out
+    // flag or the registration's required mark behind — either would poison
+    // a re-execution's repo-level dispatch pins (repo_units + the sources
+    // table survive every barrier in this file).
+    await scopedWorkflowSourcesStore(env.DB).setSourceConfigs(0, SOURCE_REPO_ID, {});
+    await toggleRepoActionsWorkflow(env.DB, SUITE_REPO_ID, ALICE_ID, {
+      workflowId: "ci.yml",
+      isEnable: true,
+      scopedWorkflowSourceRepoId: SOURCE_REPO_ID,
+    });
+    await toggleRepoActionsWorkflow(env.DB, SUITE_REPO_ID, ALICE_ID, {
+      workflowId: "ci.yml",
+      isEnable: true,
+      scopedWorkflowSourceRepoId: "0",
+    });
   });
 
   it("dispatches with defaults (204), inserting the waiting run + job rows", async () => {
@@ -752,7 +891,7 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
     expect((await invalid.json<{ message: string }>()).message).toContain('invalid workflow "broken.yml":');
   });
 
-  it("404s: an unknown ref, an unknown workflow, the scoped reduction", async () => {
+  it("404s: an unknown ref, an unknown workflow, the scoped effective-source gate", async () => {
     const badRef = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "nope" }, "alice-token");
     expect(badRef.status).toBe(404);
     expect((await badRef.json<{ message: string }>()).message).toBe('ref "nope" doesn\'t exist');
@@ -761,8 +900,13 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
     expect(badWorkflow.status).toBe(404);
     expect((await badWorkflow.json<{ message: string }>()).message).toBe('workflow "ghost.yml" not found');
 
+    // A non-registered source id rides the scoped arm's first gate —
+    // IsScopedWorkflowSourceEffective's miss answers the not-found text
+    // (workflow.go:241-249; the formerly recorded "scoped reduction" 404 is
+    // superseded by the landed twin).
     const scoped = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "main" }, "alice-token", "?scoped_workflow_source_repo_id=1");
     expect(scoped.status).toBe(404);
+    expect((await scoped.json<{ message: string }>()).message).toBe('workflow "ci.yml" not found');
   });
 
   it("403s a disabled workflow — the disabled check runs BEFORE the ref resolution", async () => {
@@ -775,6 +919,135 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
     const noRef = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "nonexistent-branch" }, "alice-token");
     expect(noRef.status).toBe(403);
     expect((await put(`${SUITE}/actions/workflows/ci.yml/enable`, "alice-token")).status).toBe(204);
+  });
+
+  // -------------------------------------------------------------------------
+  // The SCOPED DISPATCH TWIN (action.go:1120-1123's query param +
+  // workflow.go:237-268's scoped arm — the K14 landing; the WEB arm's TEXT
+  // adaptation rides verbatim: ""/"0" = repo-level, otherwise the source
+  // repo's TEXT id through config.ts's scopedSourceRepoParam).
+  // -------------------------------------------------------------------------
+
+  it("the scoped twin: a '0' param stays repo-level (FormInt64's zero arm)", async () => {
+    const res = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "main" }, "alice-token", "?scoped_workflow_source_repo_id=0");
+    expect(res.status).toBe(204);
+    const latest = (await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.workflowId, "ci.yml")).all()).sort(
+      (a, b) => b.index - a.index,
+    )[0];
+    expect(latest?.isScopedRun).toBe(false);
+    expect(latest?.workflowRepoId).toBe("");
+    expect(latest?.workflowCommitSha).toBe("");
+    // the consumer's OWN ci.yml content dispatched (the greeting input — the
+    // source's ci.yml declares `note` instead).
+    const payload = JSON.parse(latest?.eventPayload ?? "{}") as { inputs: Record<string, string> };
+    expect(payload.inputs).toEqual({ greeting: "hello", flag: "false" });
+  });
+
+  it("the scoped twin dispatches the SOURCE's content and records the parity columns", async () => {
+    const res = await post(
+      `${SUITE}/actions/workflows/ci.yml/dispatches`,
+      { ref: "main", inputs: { note: "override" } },
+      "alice-token",
+      `?scoped_workflow_source_repo_id=${SOURCE_REPO_ID}`,
+    );
+    expect(res.status).toBe(204);
+    const latest = (await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.workflowId, "ci.yml")).all()).sort(
+      (a, b) => b.index - a.index,
+    )[0];
+    // the content-source parity columns (workflow.go:139-142/:260-263):
+    // is_scoped_run + the SOURCE repo row + the SOURCE default-branch sha,
+    // beside the consumer ref's own commit_sha.
+    expect(latest?.isScopedRun).toBe(true);
+    expect(latest?.workflowRepoId).toBe(SOURCE_REPO_ID);
+    expect(latest?.workflowCommitSha).toBe(SOURCE_TIP);
+    expect(latest?.commitSha).toBe(TIP_MAIN);
+    expect(latest?.ref).toBe("refs/heads/main");
+    expect(latest?.title).toBe("seed: docs"); // the CONSUMER commit's message title
+    // the SOURCE content validated and merged its inputs (ScopedCI's `note`
+    // — the CONSUMER ci.yml's greeting/flag pair proves the content source).
+    const payload = JSON.parse(latest?.eventPayload ?? "{}") as { inputs: Record<string, string> };
+    expect(payload.inputs).toEqual({ note: "override" });
+  });
+
+  it("the scoped twin's ladder validates the SOURCE content (no-dispatch 422, broken 422)", async () => {
+    const noTrigger = await post(
+      `${SUITE}/actions/workflows/push-only.yml/dispatches`,
+      { ref: "main" },
+      "alice-token",
+      `?scoped_workflow_source_repo_id=${SOURCE_REPO_ID}`,
+    );
+    expect(noTrigger.status).toBe(422);
+    expect((await noTrigger.json<{ message: string }>()).message).toBe(
+      'workflow "push-only.yml" has no workflow_dispatch event trigger',
+    );
+
+    const invalid = await post(
+      `${SUITE}/actions/workflows/broken.yml/dispatches`,
+      { ref: "main" },
+      "alice-token",
+      `?scoped_workflow_source_repo_id=${SOURCE_REPO_ID}`,
+    );
+    expect(invalid.status).toBe(422);
+    expect((await invalid.json<{ message: string }>()).message).toContain('invalid workflow "broken.yml":');
+  });
+
+  it("the scoped twin's disabled check: the opt-out 403s (before the ref resolution); a REQUIRED workflow ignores the opt-out", async () => {
+    // the opt-out flag rides the WEB toggle's service arm (the API toggle
+    // has no scoped branch — the recorded absence).
+    expect(
+      await toggleRepoActionsWorkflow(env.DB, SUITE_REPO_ID, ALICE_ID, {
+        workflowId: "ci.yml",
+        isEnable: false,
+        scopedWorkflowSourceRepoId: SOURCE_REPO_ID,
+      }),
+    ).toBe("saved");
+    const optedOut = await post(
+      `${SUITE}/actions/workflows/ci.yml/dispatches`,
+      { ref: "main" },
+      "alice-token",
+      `?scoped_workflow_source_repo_id=${SOURCE_REPO_ID}`,
+    );
+    expect(optedOut.status).toBe(403);
+    expect((await optedOut.json<{ message: string }>()).message).toBe("workflow is disabled");
+    // the check's order: a missing ref STILL answers the opt-out 403
+    // (workflow.go:84-99 precedes the ref arms).
+    const noRef = await post(
+      `${SUITE}/actions/workflows/ci.yml/dispatches`,
+      { ref: "nonexistent-branch" },
+      "alice-token",
+      `?scoped_workflow_source_repo_id=${SOURCE_REPO_ID}`,
+    );
+    expect(noRef.status).toBe(403);
+
+    // IsScopedWorkflowOptedOut's conjunction: flagged disabled AND not
+    // required — a REQUIRED workflow dispatches through the stranded flag
+    // (workflow.go:89-92).
+    await scopedWorkflowSourcesStore(env.DB).setSourceConfigs(0, SOURCE_REPO_ID, { "ci.yml": { required: true, patterns: ["*"] } });
+    const required = await post(
+      `${SUITE}/actions/workflows/ci.yml/dispatches`,
+      { ref: "main" },
+      "alice-token",
+      `?scoped_workflow_source_repo_id=${SOURCE_REPO_ID}`,
+    );
+    expect(required.status).toBe(204);
+
+    // restore: drop the required mark, clear the opt-out flag.
+    await scopedWorkflowSourcesStore(env.DB).setSourceConfigs(0, SOURCE_REPO_ID, {});
+    expect(
+      await toggleRepoActionsWorkflow(env.DB, SUITE_REPO_ID, ALICE_ID, {
+        workflowId: "ci.yml",
+        isEnable: true,
+        scopedWorkflowSourceRepoId: SOURCE_REPO_ID,
+      }),
+    ).toBe("saved");
+    // the cleared opt-out dispatches again.
+    const cleared = await post(
+      `${SUITE}/actions/workflows/ci.yml/dispatches`,
+      { ref: "main" },
+      "alice-token",
+      `?scoped_workflow_source_repo_id=${SOURCE_REPO_ID}`,
+    );
+    expect(cleared.status).toBe(204);
   });
 
   it("gates: the writer arm 403s bob; anonymous 401", async () => {

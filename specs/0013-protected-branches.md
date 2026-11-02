@@ -807,6 +807,35 @@ is_scoped_run=false arm).
 - `ui/pages/repo-actions-runs.tsx` — the "Other workflows" listing
   excludes scoped runs (`is_scoped_run = false`), GetRepoRunWorkflowIDs'
   arm made load-bearing by the new producer.
+- `api/routes/repo-actions.ts` — the API twin (the K14 wave; ledger §1.9
+  DR-1(d)). THE POSTURE at the pin, by surface: upstream's API DISPATCH
+  carries the scoped param — `scoped_workflow_source_repo_id` `in: query`
+  (action.go:1120-1123), the handler read threading the SHARED
+  DispatchActionWorkflow (action.go:1147-1148; the same service the web
+  arm calls, view.go:1393-1394) — so the dispatch route grew the scoped
+  arm: the TEXT source id verbatim through config.ts's
+  `scopedSourceRepoParam` (""/"0" = repo-level — the WEB arm's recorded
+  adaptation, the divergence paragraph below; the TEXT space cannot ride
+  upstream's FormInt64), the opt-out disabled check
+  (isScopedWorkflowOptedOut — workflow.go:84-99's isScoped branch)
+  answering the disabled 403 BEFORE the ref resolution, and the
+  resolveScopedDispatchContent port (the effective-source gate answering
+  the not-found 404, the source row + the SOURCE default-branch
+  SCOPED_WORKFLOW_DIRS walk with the entry-name match, the ServerError-class
+  throws) threaded through the producer's `sourceEngineFor` input shape;
+  the run records the content-source parity columns via the service arm's
+  post-insert UPDATE compensation (workflow_repo_id/is_scoped_run, with
+  workflow_commit_sha folded in — the M1a insert's input carries no such
+  fields and builds no insert-time github context; the claim-time context
+  reads the row column). Upstream's API TOGGLE carries NO scoped arm — the
+  enable/disable swagger declares owner/repo/workflow_id only
+  (action.go:1047-1084/:1194-1230) and the handlers never read the param
+  (:1081/:1230 — the shared actions_service.EnableOrDisableWorkflow is
+  repo-level only, workflow.go:30-52; the scoped mutators + the
+  required-refusal are the WEB handler's view.go:1338-1361 branch) — the
+  API toggle routes are UNCHANGED and the absence is the landed decision
+  (a passed param toggles the CONSUMER's repo-level workflow, the opt-out
+  map stays empty, a REQUIRED registration refuses nothing on the API).
 - Tests: `services/actions/config.test.ts` (the trio's semantics, the
   effective/required/opted-out reads over real D1, the toggle arm's
   scoped/repo-level/required-refusal/missing arms) and
@@ -819,6 +848,14 @@ is_scoped_run=false arm).
   (run-name interpolation: `workflow_sha` = the SOURCE HEAD, `sha` = the
   consumer commit); `services/actions/trigger.test.ts` adds the shared
   insert's trio defaults and the `workflowSha` input's split (K12)).
+  `api/routes/repo-actions.test.ts` carries the API twin's pins (the K14
+  wave, the audit-arm suite's conventions + the D-8 afterAll barriers):
+  the "0" repo-level parity, the SOURCE-content dispatch with the parity
+  columns (is_scoped_run/workflow_repo_id/workflow_commit_sha = the SOURCE
+  HEAD beside the consumer commit_sha), the SOURCE-content validation
+  ladder (the no-dispatch + broken 422s), the effective-source-gate 404,
+  the opt-out 403 (before the ref resolution) with the
+  required-ignores-the-flag 204, and the toggle-absence pair.
 
 **Landed (the Wave K11 follow-on, 2026-11-03 — K4's two one-away residuals):**
 

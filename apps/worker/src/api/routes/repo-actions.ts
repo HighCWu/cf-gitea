@@ -25,7 +25,14 @@ import type { AuthInfo } from "../../auth/auth-context";
 import { emitWorkflowDispatchAudit, emitWorkflowToggleAudit } from "../../services/actions/audit-arms";
 import type { RunJobRow, RunRow, RunAttemptRow, TaskRow } from "../../services/actions/model";
 import { increaseTaskVersion, insertActionRun } from "../../services/actions/model";
-import { loadRepoActionsConfig, saveRepoActionsConfig } from "../../services/actions/config";
+import {
+  isScopedWorkflowOptedOut,
+  isScopedWorkflowSourceEffective,
+  loadRepoActionsConfig,
+  saveRepoActionsConfig,
+  scopedSourceRepoParam,
+} from "../../services/actions/config";
+import { SCOPED_WORKFLOW_DIRS } from "../../services/actions/scoped-workflows";
 import { findReadableArtifacts, type ArtifactRow } from "../../services/actions/artifacts";
 import { nextRunIndex } from "../../services/actions/trigger";
 import { getFailedJobsForRerun, rerunWorkflowRunJobs } from "../../services/actions/rerun";
@@ -227,9 +234,27 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
  *     UNIQUE(repo_id, index) arbitration stays as defense-in-depth only —
  *     the CAS never issues one value twice, so the lost-race 500 the old
  *     max+1 reduction surfaced has no producer left.
- *   - scoped_workflow_source_repo_id > 0 answers 404 (the scoped-workflow
- *     source family is C10/post-M3; isScopedRun is never written — the
- *     dispatch-inputs UI module's same documented reduction).
+ *   - THE SCOPED DISPATCH TWIN (the v1.5.4 K14 wave — upstream carries the
+ *     param on the API dispatch ONLY): the dispatch's
+ *     `scoped_workflow_source_repo_id` (action.go:1120-1123, `in: query`;
+ *     the handler read :1147 threading the shared DispatchActionWorkflow,
+ *     workflow.go:64-268) resolves the SOURCE repo's default-branch
+ *     `.gitea/scoped_workflows` content through services/actions/config.ts's
+ *     effective-source/opt-out reads — the same seams the WEB dispatch
+ *     producer rides (services/actions/workflow-dispatch.ts) — and records
+ *     the run's content-source columns (workflow_repo_id /
+ *     workflow_commit_sha / is_scoped_run, workflow.go:139-142/:260-263).
+ *     The param rides the TEXT repositories.id space verbatim through
+ *     config.ts's scopedSourceRepoParam (""/"0" = repo-level) — the WEB
+ *     arm's recorded adaptation (SPEC-0013 §6's divergence note; upstream's
+ *     FormInt64 junk→0 has no TEXT twin). The API TOGGLE carries NO scoped
+ *     arm: upstream's enable/disable swagger declares owner/repo/
+ *     workflow_id only (action.go:1047-1084/:1194-1230) and the handlers
+ *     never read the param (:1081/:1230 — the shared
+ *     actions_service.EnableOrDisableWorkflow is repo-level only,
+ *     workflow.go:30-52; the scoped mutators are the WEB handler's
+ *     view.go:1338-1361 branch) — a scoped param on the API toggle wire is
+ *     ignored exactly as upstream's chi binder drops it.
  *   - The dispatch's form-urlencoded inputs arm (action.go:1148-1153) is not
  *     ported — the contract's body is JSON; upstream's chi binder accepts
  *     both, our zod route declares JSON.
@@ -1174,10 +1199,20 @@ function dispatchEventInputs(inputs: Map<string, unknown>): Record<string, strin
 }
 
 /**
- * DispatchActionWorkflow (workflow.go:64-190) — the M3-free port: the
- * disabled check, the ref resolution, the workflow-content read, the light
- * validation, the dispatch-config gate, the inputs merge and the
- * insertActionRun insert. The caller resolved the repo row + gates.
+ * DispatchActionWorkflow (workflow.go:64-190, repo-level + :237-268 scoped
+ * arms) — the M3-free port: the disabled check, the ref resolution, the
+ * workflow-content read, the light validation, the dispatch-config gate,
+ * the inputs merge and the insertActionRun insert. The caller resolved the
+ * repo row + gates.
+ *
+ * `scopedWorkflowSourceRepoId` is the RAW `scoped_workflow_source_repo_id`
+ * query value normalized through config.ts's scopedSourceRepoParam (the
+ * TEXT source id verbatim; ""/"0" = the repo-level arm — the WEB arm's
+ * recorded adaptation, SPEC-0013 §6). `sourceEngineFor` builds the reads
+ * for the SOURCE repo's full name (the producer's input shape,
+ * workflow-dispatch.ts — the scoped walk reads the source the way
+ * resolveScopedDispatchContent opens it); the repo-level arm never calls
+ * it.
  */
 export async function dispatchActionWorkflow(input: {
   d1: D1Database;
@@ -1187,26 +1222,31 @@ export async function dispatchActionWorkflow(input: {
   doerId: number;
   workflowId: string;
   ref: string;
-  scopedWorkflowSourceRepoId: number;
+  scopedWorkflowSourceRepoId: string;
+  sourceEngineFor: (fullName: string) => ReturnType<typeof engineReads>;
   bodyInputs: Record<string, string> | undefined;
 }): Promise<DispatchOutcome> {
-  const { d1, reads, origin, pair, doerId, workflowId, ref, scopedWorkflowSourceRepoId, bodyInputs } = input;
+  const { d1, reads, origin, pair, doerId, workflowId, ref, bodyInputs } = input;
+  const scopedSourceRepoId = scopedSourceRepoParam(input.scopedWorkflowSourceRepoId);
+  const isScoped = scopedSourceRepoId !== "";
   if (workflowId === "") {
     return { outcome: "not-found", message: `workflow "${workflowId}" not found` };
   }
   if (ref === "") {
     return { outcome: "not-found", message: `ref "${ref}" doesn't exist` };
   }
-  if (scopedWorkflowSourceRepoId > 0) {
-    // The scoped arm's source walk is C10/post-M3 (the module header's
-    // reduction) — the not-found answer the dispatch-inputs module records.
-    return { outcome: "not-found", message: `workflow "${workflowId}" not found` };
-  }
 
-  // The disabled check runs FIRST (workflow.go:83-98) — against the request
-  // id exactly as upstream compares cfg.DisabledWorkflows entries.
+  // The disabled check runs FIRST (workflow.go:83-98) — the repo-level arm
+  // against the request id exactly as upstream compares cfg.DisabledWorkflows
+  // entries; the scoped arm reads the opt-out store instead
+  // (IsScopedWorkflowOptedOut — flagged disabled AND not required,
+  // workflow.go:89-92's isScoped branch).
   const cfg = await loadRepoActionsConfig(d1, pair.repo.id);
-  if (cfg.disabledWorkflows.includes(workflowId)) {
+  if (isScoped) {
+    if (await isScopedWorkflowOptedOut(d1, cfg, pair.owner.id, scopedSourceRepoId, workflowId)) {
+      return { outcome: "forbidden", message: "workflow is disabled" };
+    }
+  } else if (cfg.disabledWorkflows.includes(workflowId)) {
     return { outcome: "forbidden", message: "workflow is disabled" };
   }
 
@@ -1235,19 +1275,33 @@ export async function dispatchActionWorkflow(input: {
     return { outcome: "not-found", message: `ref "${ref}" doesn't exist` };
   }
 
-  // resolveDispatchWorkflowContent (repo-level arm, workflow.go:222+): the
-  // workflow file at the TARGET commit; a miss is the not-found arm.
-  const entries = await listWorkflowEntries(reads, runTargetCommit.oid);
-  const wanted = baseSegment(workflowId);
-  const entry = entries?.find((e) => e.name === wanted);
-  if (entry === undefined) {
-    return { outcome: "not-found", message: `workflow "${workflowId}" not found` };
+  // resolveDispatchWorkflowContent (workflow.go:222-268): the repo-level arm
+  // reads the workflow file at the TARGET commit (a miss is the not-found
+  // arm); the scoped arm reads the SOURCE repo's default branch instead —
+  // the run's commit stays the consumer ref's (workflow.go:135) while the
+  // CONTENT source rides the scoped resolution below.
+  let content: string;
+  let scopedSource: { repoId: string; sha: string } | null = null;
+  if (isScoped) {
+    const resolved = await resolveScopedDispatchContent(d1, pair, input.sourceEngineFor, scopedSourceRepoId, workflowId);
+    if (resolved.outcome !== null) {
+      return resolved.outcome;
+    }
+    content = resolved.content;
+    scopedSource = { repoId: resolved.sourceRepoId, sha: resolved.sourceSha };
+  } else {
+    const entries = await listWorkflowEntries(reads, runTargetCommit.oid);
+    const wanted = baseSegment(workflowId);
+    const entry = entries?.find((e) => e.name === wanted);
+    if (entry === undefined) {
+      return { outcome: "not-found", message: `workflow "${workflowId}" not found` };
+    }
+    const blob = await reads.readBlob(runTargetCommit.oid, `${entry.dir}/${entry.name}`);
+    if (blob === null) {
+      return { outcome: "not-found", message: `workflow "${workflowId}" not found` };
+    }
+    content = new TextDecoder().decode(blob.data);
   }
-  const blob = await reads.readBlob(runTargetCommit.oid, `${entry.dir}/${entry.name}`);
-  if (blob === null) {
-    return { outcome: "not-found", message: `workflow "${workflowId}" not found` };
-  }
-  const content = new TextDecoder().decode(blob.data);
 
   // ValidateWorkflowStatic + ReadWorkflow (workflow.go:127-140) — the light
   // YAML check; then the dispatch-config gate (workflow.go:141-146).
@@ -1316,7 +1370,98 @@ export async function dispatchActionWorkflow(input: {
     })),
   );
 
+  // The scoped run's content-source columns (workflow.go:139-142's
+  // WorkflowRepoID/WorkflowCommitSHA skeleton + :260-263's IsScopedRun):
+  // upstream sets them BEFORE PrepareRunAndInsert; the M1a insert's input
+  // carries no such fields, so the scoped arm compensates with one
+  // post-insert UPDATE — the service arm's exact compensation shape
+  // (services/actions/workflow-dispatch.ts), the sha folded in (this light
+  // insert builds no github context at insert time; the claim-time context
+  // reads the row column, context.go:115).
+  if (scopedSource !== null) {
+    await drizzle(d1)
+      .update(actionRuns)
+      .set({ workflowRepoId: scopedSource.repoId, workflowCommitSha: scopedSource.sha, isScopedRun: true })
+      .where(eq(actionRuns.id, run.id));
+  }
+
   return { outcome: "dispatched", runId: run.id };
+}
+
+/**
+ * resolveScopedDispatchContent (workflow.go:237-268) — the API twin of the
+ * service arm's private resolver (services/actions/workflow-dispatch.ts):
+ *   1. the source must be EFFECTIVE for the consumer's owner
+ *      (IsScopedWorkflowSourceEffective — a miss answers the not-found arm,
+ *      :241-249's actions.workflow.not_found);
+ *   2. the source repo row (GetRepositoryByID, :251-254 — the miss is the
+ *      ServerError class, a thrown Error into the 500 handler);
+ *   3. the source's DEFAULT-BRANCH HEAD + the SCOPED_WORKFLOW_DIRS walk
+ *      with the entry-name match (LoadParsedScopedWorkflows'
+ *      ListScopedWorkflows half; an unresolvable source HEAD is the
+ *      GetBranchExisting error arm — the ServerError class; a missing
+ *      workflow answers not-found, :260-267).
+ * Returns the content plus the (repo, commit) the run records.
+ */
+async function resolveScopedDispatchContent(
+  d1: D1Database,
+  pair: RepositoryWithOwner,
+  sourceEngineFor: (fullName: string) => ReturnType<typeof engineReads>,
+  sourceRepoId: string,
+  workflowId: string,
+): Promise<{ outcome: DispatchOutcome | null; content: string; sourceRepoId: string; sourceSha: string }> {
+  const notFound: DispatchOutcome = { outcome: "not-found", message: `workflow "${workflowId}" not found` };
+  if (!(await isScopedWorkflowSourceEffective(d1, pair.owner.id, sourceRepoId))) {
+    return { outcome: notFound, content: "", sourceRepoId, sourceSha: "" };
+  }
+
+  // GetRepositoryByID (:251-254) — the row miss is upstream's ServerError
+  // class (the error propagates un-translated into the 500 handler).
+  const sourceRows = await drizzle(d1)
+    .select({ id: repositories.id, ownerNamespace: repositories.ownerNamespace, slug: repositories.slug, defaultBranch: repositories.defaultBranch })
+    .from(repositories)
+    .where(eq(repositories.id, sourceRepoId))
+    .limit(1);
+  const sourceRepo = sourceRows[0];
+  if (sourceRepo === undefined) {
+    throw new Error(`ActionsDispatchWorkflow: GetRepositoryByID ${sourceRepoId} failed`);
+  }
+
+  // LoadParsedScopedWorkflows (scoped_workflow_cache.go:39-70): the source's
+  // default-branch HEAD, then the FIRST scoped dir that exists with its
+  // .yml/.yaml entries (the walk's one-level reduction — the repo-level
+  // twin's note; the service arm's same loop).
+  const sourceReads = sourceEngineFor(`${sourceRepo.ownerNamespace}/${sourceRepo.slug}`);
+  const sourceRef = `refs/heads/${sourceRepo.defaultBranch}`;
+  const sourceHead = await sourceReads.readCommit(sourceRef);
+  if (sourceHead === null) {
+    throw new Error(`ActionsDispatchWorkflow: source default branch ${sourceRepoId}@${sourceRef} unresolvable`);
+  }
+
+  let dir: string | null = null;
+  let entries: Array<{ name: string; type: string }> = [];
+  for (const candidate of SCOPED_WORKFLOW_DIRS) {
+    const tree = await sourceReads.listTree(sourceRef, candidate);
+    if (tree !== null) {
+      dir = candidate;
+      entries = tree.entries;
+      break;
+    }
+  }
+  const wanted = baseSegment(workflowId);
+  const entryName = entries.find(
+    (entry) => entry.type === "blob" && (entry.name.endsWith(".yml") || entry.name.endsWith(".yaml")) && entry.name === wanted,
+  )?.name;
+  if (dir === null || entryName === undefined) {
+    // the parsed set has no such EntryName (:260-267's not-found)
+    return { outcome: notFound, content: "", sourceRepoId, sourceSha: sourceHead.oid };
+  }
+  const blob = await sourceReads.readBlob(sourceRef, `${dir}/${entryName}`);
+  if (blob === null) {
+    // GetContentFromEntry's error arm — the ServerError class.
+    throw new Error(`ActionsDispatchWorkflow: GetContentFromEntry ${dir}/${entryName} (source ${sourceRepoId}) failed`);
+  }
+  return { outcome: null, content: new TextDecoder().decode(blob.data), sourceRepoId: sourceRepo.id, sourceSha: sourceHead.oid };
 }
 
 /** The raw `on:` scan the dispatch-config gate uses (the parsed inputs are
@@ -2409,8 +2554,11 @@ export function registerRepoActionsRoutes(
         throw new ApiError(422, "Ref: Required");
       }
       const url = new URL(c.req.url);
-      const scopedRaw = url.searchParams.get("scoped_workflow_source_repo_id") ?? "0";
-      const scopedId = /^\d+$/.test(scopedRaw) ? Number.parseInt(scopedRaw, 10) : 0;
+      // The scoped source param rides RAW — dispatchActionWorkflow normalizes
+      // through scopedSourceRepoParam (the TEXT source id verbatim; ""/"0" =
+      // the repo-level arm; the module header's THE SCOPED DISPATCH TWIN
+      // note).
+      const scopedRaw = url.searchParams.get("scoped_workflow_source_repo_id") ?? "";
 
       const viewer = viewerOf(c);
       const outcome = await dispatchActionWorkflow({
@@ -2421,7 +2569,14 @@ export function registerRepoActionsRoutes(
         doerId: viewer.requester?.id ?? 0,
         workflowId,
         ref: opt.ref,
-        scopedWorkflowSourceRepoId: scopedId,
+        scopedWorkflowSourceRepoId: scopedRaw,
+        // The scoped arm's SOURCE walk — the source repo's full name → its
+        // engine cell (the producer's sourceEngineFor input shape;
+        // owner namespaces and repo slugs carry no '/').
+        sourceEngineFor: (fullName) => {
+          const at = fullName.lastIndexOf("/");
+          return engineReads(c.env, { ownerNamespace: fullName.slice(0, at), slug: fullName.slice(at + 1) });
+        },
         bodyInputs: opt.inputs,
       });
       if (outcome.outcome === "not-found") {
