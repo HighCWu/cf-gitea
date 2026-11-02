@@ -58,6 +58,13 @@
  *                                action value lands in WikiPost's default arm)
  *   POST P/wiki/{PageURL}?action=_delete    delete
  *   GET  P/wiki/raw/*                       raw blob (WikiRaw)
+ *   GET  P/wiki/{RawName}                   the raw-file round (wiki.go:240-242):
+ *                                           a stored non-`.md` entry under a page
+ *                                           name 303s onto P/wiki/raw/{RawName}
+ *                                           (the loader carries rawRedirectTo;
+ *                                           the serving arm's mapping is the
+ *                                           disclosed interim — see the 404-arm
+ *                                           note below)
  *   GET  P/wiki/commit/{sha}                the revision-diff view (repo.Diff's
  *                                PageIsWiki arm — the PageIsWiki commit page;
  *                                chi specificity puts the pattern BEFORE the
@@ -72,7 +79,15 @@
  * (reservedWikiNames, wiki_path.go:42) — precisely so these action values
  * can never collide with page names. The wiki 404 arm: a missing page on
  * view/edit/revision REDIRECTS to `P/wiki/?action=_pages` (wiki.go:238,
- * 340, 400); a whole-absent wiki renders tplWikiStart (wiki.go:471-475) or
+ * 340, 400) — EXCEPT the raw-file round: when the page-name probes miss but
+ * the `.md`-trimmed name matches a stored entry (a git-pushed non-`.md`
+ * file — an image, wiki.go:156-164), upstream redirects THAT view onto
+ * `P/wiki/raw/{pageName}` (wiki.go:240-242). Our view loader runs the same
+ * round (services/wiki.ts wikiRawFileRound) and carries the target as
+ * `rawRedirectTo` on the missing outcome; the serving arm's 303 mapping is
+ * the DISCLOSED interim — the family fold answers until the one-arm index.ts
+ * hunk lands (the commit-diff view's 404 interim precedent). A whole-absent
+ * wiki renders tplWikiStart (wiki.go:471-475) or
  * redirects to P/wiki (WikiPages wiki.go:537-540, EditWiki wiki.go:692-695).
  *
  * THE SLASHED TAILS (the findings-git-e2e F5 fix, carve 8fdee92): the
@@ -177,8 +192,11 @@
  *       service has no TOC extraction; the `with-sidebar` class keys on the
  *       sidebar content alone;
  *     - the FormatWarning arm (wiki.go:488-491) — unreachable here: every
- *       coded page path ends `.md`, and the raw-file fallback redirects to
- *       /wiki/raw before any render.
+ *       coded page path ends `.md`, and a non-`.md` request never renders —
+ *       the view loader's raw-file round (wiki.go:156-164) folds it to the
+ *       isRaw redirect decision (`rawRedirectTo` on the missing outcome,
+ *       wiki.go:240-242; the serving arm's 303 mapping is the disclosed
+ *       interim — the family fold answers, the commit-diff 404's twin).
  * - pages.tmpl — the header + writer-gated New Page button, the admin-only
  *   default-wiki-branch line (ours = the repo default branch, the
  *   wikiBranch value), and the `wiki-pages-list` table: file icon, name
@@ -202,10 +220,13 @@
  *   last-edited line, the "{count} Commits" attached
  *   header and the landed CommitList (repo/commits_list parity) over the
  *   mapped wiki commits, plus the Newer/Older pagination at CommitsRangeSize
- *   (the service op's own page size). The commit rows link
- *   `{repoLink}/commit/{sha}` exactly like upstream's commits_list — wiki
- *   shas do not resolve in the repo view there either (upstream quirk kept
- *   for parity).
+ *   (the service op's own page size). The commit rows ride CommitList's
+ *   WIKI arm (`wiki` prop — commits_list.tmpl:23-34's PageIsWiki
+ *   discriminator): the sha cell links the `{repoLink}/wiki/commit/{sha}`
+ *   base (the landed wiki commit-diff page) and the subject renders as the
+ *   PLAIN commit-summary span — no anchor (the earlier "rows link
+ *   /commit/{sha} like upstream" claim was FALSE: upstream's wiki arm
+ *   never linked the dead repo view).
  *
  * ## Data sourcing (§3.2 — service ops, never a self-fetch)
  *
@@ -240,6 +261,7 @@ import {
   readWikiPage,
   webPathFromRequest,
   webPathToUserTitle,
+  wikiRawFileRound,
   wikiReads,
   type WikiCommitJson,
   type WikiDoer,
@@ -558,7 +580,19 @@ export type WikiCommitViewData = {
 
 export type WikiViewData =
   | { outcome: "start" } // no wiki branch — tplWikiStart (wiki.go:471-475)
-  | { outcome: "missing" } // page absent — 303 ?action=_pages (wiki.go:237-239)
+  | {
+      outcome: "missing";
+      /**
+       * The raw-file round's redirect target (wiki.go:240-242 — the
+       * `isRaw` class): set when the page-name probes missed AND the
+       * `.md`-trimmed entry exists, in which case upstream 303s onto
+       * `{repoLink}/wiki/raw/{rawRedirectTo}` instead of the _pages fold.
+       * The serving arm's mapping is the DISCLOSED interim (the family
+       * fold answers; the commit-diff 404's twin — see the mount record's
+       * raw-file note). Absent = the plain noEntry fold (wiki.go:237-239).
+       */
+      rawRedirectTo?: string;
+    }
   | WikiPageViewData
   | WikiCommitViewData;
 
@@ -594,21 +628,41 @@ export async function loadWikiViewData(env: Env, pair: RepositoryWithOwner, rawT
   const tip = await wikiTipOf(env, pair);
   if (tip === undefined) return { outcome: "start" }; // HasWiki (wiki.go:471)
   const page = await readWikiPage(env, pair, wikiName, origin);
-  if (page === null) return { outcome: "missing" }; // noEntry (wiki.go:237-239)
+  if (page === null) {
+    // The `.md` probes missed — upstream's wikiEntryByName falls through to
+    // the raw-file round (wiki.go:156-164): a `.md`-trimmed entry match is
+    // the isRaw class and redirects onto /wiki/raw/{pageName} (wiki.go:
+    // 240-242). The loader carries the target on the outcome; the serving
+    // arm's 303 mapping is the disclosed interim (the family fold answers
+    // until the index.ts hunk lands — the commit-diff 404's twin).
+    if (await wikiRawFileRound(env, pair, wikiName)) {
+      return { outcome: "missing", rawRedirectTo: wikiName };
+    }
+    return { outcome: "missing" }; // noEntry (wiki.go:237-239)
+  }
   const repo = { ownerNamespace: pair.repo.ownerNamespace, slug: pair.repo.slug };
   // The dropdown's page list — the no-last-commit tree walk (module header).
   const pages = await listWikiTreeEntries(wikiReads(env, pair), tip.target, {
     dropSideBars: true,
     withUpdated: false,
   });
+  // The _Sidebar/_Footer suppression (wiki.go:232-233, 285, 297): viewing
+  // the page that IS the sidebar/footer skips loading that own box (the
+  // other one still loads — `if !isSideBar` / `if !isFooter`). The service
+  // read stays the API-parity shape (both fields always populated — the
+  // upstream API getWikiPage loads unconditionally); this is the view
+  // arm's render decision, so the box keys (sidebarHtml/footerHtml !== "")
+  // drop the duplicate.
+  const isSideBar = wikiName === "_Sidebar";
+  const isFooter = wikiName === "_Footer";
   return {
     outcome: "view",
     title: webPathToUserTitle(wikiName).display,
     pageUrl: wikiName,
     page,
     contentHtml: renderWikiMarkdown({ text: decodeWikiBase64(page.content_base64), repo, origin }),
-    sidebarHtml: renderWikiMarkdown({ text: decodeWikiBase64(page.sidebar), repo, origin }),
-    footerHtml: renderWikiMarkdown({ text: decodeWikiBase64(page.footer), repo, origin }),
+    sidebarHtml: isSideBar ? "" : renderWikiMarkdown({ text: decodeWikiBase64(page.sidebar), repo, origin }),
+    footerHtml: isFooter ? "" : renderWikiMarkdown({ text: decodeWikiBase64(page.footer), repo, origin }),
     pages,
   };
 }
@@ -1117,7 +1171,9 @@ export function WikiRevisionPage(props: { ctx: UiContext; data: Extract<WikiRevi
               </div>
             </div>
           </h4>
-          {data.commits.length > 0 && data.count > 0 ? <CommitList repoLink={repoLink} commits={data.commits.map(wikiCommitAsEngineCommit)} /> : null}
+          {data.commits.length > 0 && data.count > 0 ? (
+            <CommitList repoLink={repoLink} commits={data.commits.map(wikiCommitAsEngineCommit)} wiki={true} />
+          ) : null}
           {/* base/paginate — the family's Newer/Older reduction with the
               action-carrying hrefs (CommitsPagination's DOM shape). */}
           {data.page > 1 || data.page * WIKI_REVISIONS_PAGE_SIZE < data.count ? (

@@ -479,6 +479,33 @@ async function pageBlob(
 }
 
 /**
+ * `wikiEntryByName`'s raw-file round (wiki.go:156-164): when the CODED
+ * `.md` candidates missed (pageBlob's round — the caller's precondition),
+ * the `.md`-trimmed name is probed (`strings.TrimSuffix(gitFilename, ".md")`,
+ * then its QueryUnescaped form) — a hit is upstream's `isRaw` class and the
+ * view arm answers the `/wiki/raw/{pageName}` redirect (wiki.go:240-242).
+ * `wikiName` is the resolved WebPath (the "Home" fallback included). False
+ * on an unborn branch (the caller has already folded that to "start").
+ */
+export async function wikiRawFileRound(
+  env: ApiEnv["Bindings"],
+  pair: RepositoryWithOwner,
+  wikiName: string,
+): Promise<boolean> {
+  const { reads, tip } = await wikiTip(env, pair);
+  if (tip === undefined) return false;
+  const gitPath = webPathToGitPath(wikiName);
+  const trimmed = gitPath.endsWith(".md") ? gitPath.slice(0, -3) : gitPath;
+  if (trimmed === "") return false;
+  const unescaped = queryUnescape(trimmed);
+  const candidates = unescaped !== null && unescaped !== trimmed ? [trimmed, unescaped] : [trimmed];
+  for (const candidate of candidates) {
+    if ((await reads.readBlob(tip.target, enginePath(candidate))) !== null) return true;
+  }
+  return false;
+}
+
+/**
  * `git.FileCommitsCount` — total commits touching the path (paged log walk).
  * The filter path rides the same encode: the engine decodes it back to the
  * stored entry name before walking the trees (matchesFilter → pathOid).

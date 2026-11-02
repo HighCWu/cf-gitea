@@ -9,7 +9,9 @@
  * no UI route exists yet, the module header's HANDOFF NOTE — so unlike the
  * editor tails there is no router POST to drive; the seams ARE the write
  * path the mount wave wires). Renders are full documents through the
- * module's renderPage.
+ * module's renderPage. The later families (6 webhook emissions, 7 the
+ * commit-diff twin, 8 the view loader's raw-file round + the
+ * _Sidebar/_Footer suppression) keep the same happy-path discipline.
  */
 
 import { env } from "cloudflare:test";
@@ -17,8 +19,13 @@ import { drizzle } from "drizzle-orm/d1";
 import { and, asc, eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 
+import { serializeCommit, serializeTree, type ApiObject, type Person } from "@cf-gitea/git-engine";
+
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
+import { branchRef, commitApiChangeError } from "../../api/services/engine";
+import { buildBlobObject } from "../../api/services/git-models";
 import { repositories, users, webhookDeliveries, webhooks } from "../../db/schema";
+import { wikiBranch, wikiCell } from "../../services/wiki";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { RepositoryWithOwner } from "../../api/services/repository";
@@ -265,7 +272,7 @@ describe("smoke: the form family (new.tmpl's two arms)", () => {
 // --- 5. the REVISION family (revision.tmpl over the paged log) ----------------
 
 describe("smoke: the revision family (revision.tmpl over listWikiPageRevisions)", () => {
-  it("edits Home again and renders both revisions with the commit list", async () => {
+  it("edits Home again and renders both revisions with the WIKI-arm commit list", async () => {
     const { ctx, pair } = await ensureFixtures();
     // The edit seam (EditWikiPost's write) — the second commit on Home.md.
     const edited = await editWikiPageFromForm(
@@ -294,6 +301,17 @@ describe("smoke: the revision family (revision.tmpl over listWikiPageRevisions)"
     // engine-display projection (wikiCommitAsEngineCommit).
     expect(html).toContain("Add &quot;Home&quot;"); // the service's Go-%q default message
     expect(html).toContain("Update &quot;Home&quot;");
+    // The WIKI arm (commits_list.tmpl:23-34's PageIsWiki discriminator):
+    // the sha cells link the /wiki/commit base (the landed wiki commit-diff
+    // page — never the dead repo view) and the subject renders as the PLAIN
+    // commit-summary span (no anchor, commits_list.tmpl:33-36).
+    expect(html).toContain(`href="${REPO_LINK}/wiki/commit/`);
+    expect(html).not.toContain(`href="${REPO_LINK}/commit/`);
+    const attrEscape = (text: string): string =>
+      text.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;");
+    for (const commit of data.commits) {
+      expect(html).toContain(`<span class="commit-summary" title="${attrEscape(commit.message.split("\n")[0] ?? "")}">`);
+    }
     // Single page → no pagination links (the Newer/Older reduction).
     expect(html).not.toContain('class="item navigation"');
     // Sanity: the decoded base64 round trip the loaders rely on.
@@ -497,5 +515,87 @@ describe("smoke: the commit-diff family (web.go:1619-1620 over the wiki cell)", 
     // bytes at the route). The VIEW loader's own page-name fold below stays
     // the grammar's documented miss shape for a tail it never claims.
     expect(await loadWikiViewData(env, pair, `commit/${sha}.diff`, ORIGIN)).toEqual({ outcome: "missing" });
+  });
+});
+
+// --- 8. the view loader's render decisions (the wiki.go VIEW-handler arms:
+//        the raw-file round wiki.go:156-164/240-242 + the _Sidebar/_Footer
+//        suppression wiki.go:232-233/285/297 — appended LAST: the raw-file
+//        seed moves the wiki ref, append-only like the matrix's commit-diff
+//        world; nothing after this describe reads the tip)
+
+describe("smoke: the view loader's raw-file round and the sidebar/footer suppression", () => {
+  it("carries the isRaw redirect decision for a stored non-.md entry and skips the own sidebar/footer box", async () => {
+    const { ctx, pair } = await ensureFixtures();
+    // The _Footer page (the sidebar exists from the view family) — the
+    // suppression pins need the OTHER box to assert a LOADED counterpart.
+    const footer = await createWikiPageFromForm(
+      env,
+      pair,
+      DOER,
+      parseWikiPageForm(new URLSearchParams({ title: "_Footer", content: "- footer line\n", message: "" })),
+      ORIGIN,
+    );
+    expect(footer.title).toBe("_Footer");
+
+    // Viewing _Sidebar: the OWN box suppresses (wiki.go:285's !isSideBar
+    // guard) while the footer still loads (wiki.go:297).
+    const sideData = await loadWikiViewData(env, pair, "_Sidebar", ORIGIN);
+    if (sideData.outcome !== "view" || sideData.kind === "commit-diff") throw new Error(`expected page view, got ${sideData.outcome}`);
+    expect(sideData.sidebarHtml).toBe("");
+    expect(sideData.footerHtml).not.toBe("");
+    const sideHtml = renderWikiViewPage({ ctx, data: sideData, canWrite: true });
+    expect(sideHtml).not.toContain("wiki-content-sidebar");
+    expect(sideHtml).not.toContain("with-sidebar");
+    expect(sideHtml).toContain("wiki-content-footer");
+
+    // Viewing _Footer: the mirror arm (wiki.go:297's guard drops the own
+    // box, the sidebar loads).
+    const footData = await loadWikiViewData(env, pair, "_Footer", ORIGIN);
+    if (footData.outcome !== "view" || footData.kind === "commit-diff") throw new Error(`expected page view, got ${footData.outcome}`);
+    expect(footData.footerHtml).toBe("");
+    expect(footData.sidebarHtml).not.toBe("");
+
+    // A plain missing page stays the bare noEntry fold — no redirect field.
+    expect(await loadWikiViewData(env, pair, "Never-Was", ORIGIN)).toEqual({ outcome: "missing" });
+
+    // The raw-file round (wiki.go:156-164): a stored NON-.md entry — a
+    // git-pushed image, the page writer's codec cannot produce one — seeded
+    // through the same cell primitives applyWikiChanges uses.
+    const tip = await wikiTipOf(env, pair);
+    if (tip === undefined) throw new Error("wiki tip missing for the raw-file seed");
+    const blob = await buildBlobObject(new TextEncoder().encode("not-really-a-png\n"));
+    const tree = serializeTree([{ name: "logo.png", mode: "100644", oid: blob.oid }]);
+    const person: Person = { name: DOER.name, email: DOER.email, time: 1_700_000_200, tz: "+0000" };
+    const commit = serializeCommit({
+      tree: tree.oid,
+      parents: [tip.target],
+      author: person,
+      committer: person,
+      message: "seed: the raw-file fixture",
+    });
+    const objects: ApiObject[] = [
+      blob,
+      { oid: tree.oid, type: tree.type, data: tree.data },
+      { oid: commit.oid, type: commit.type, data: commit.data },
+    ];
+    const cell = wikiCell(env, pair);
+    const stored = await cell.putApiObjects(objects);
+    if (stored.tag !== "ok") throw new Error(`raw-file seed objects refused: ${stored.tag}`);
+    const landed = await cell.commitApiChange({
+      ref: branchRef(wikiBranch(pair)),
+      expectedOldOid: tip.target,
+      newOid: commit.oid,
+    });
+    if (landed.tag !== "committed") throw commitApiChangeError(landed);
+
+    // The view of the raw name: the .md probes miss, the trimmed round hits
+    // — the loader carries the isRaw redirect target (wiki.go:240-242) on
+    // the missing outcome; the serving arm's 303 mapping is the disclosed
+    // interim (the matrix pins the interim fold at the route).
+    expect(await loadWikiViewData(env, pair, "logo.png", ORIGIN)).toEqual({
+      outcome: "missing",
+      rawRedirectTo: "logo.png",
+    });
   });
 });

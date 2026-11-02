@@ -50,16 +50,24 @@
  *     landed wiki's branch IS the repository's default branch with no
  *     setter seam (`wikiBranch`, src/services/wiki.ts:348 — specs/wiki.md
  *     §3). Rendered as a read-only line carrying the effective branch.
- *   - the Delete Wiki Data button + `#delete-wiki-modal` (`action=delete-wiki`
- *     → `wiki_service.DeleteWiki`): no landed whole-wiki delete — the wiki
- *     service arms are per-page (`deleteWikiPage`, src/services/wiki.ts:735).
- *     The danger item renders its upstream title/body with the absence note
- *     in the item-trailing slot; the modal and its typed-confirmation form
- *     are not reproduced (a modal wrapping a dead form is still a dead
- *     control). The whole danger segment is gated on the wiki being enabled
- *     — upstream renders the item only when the wiki unit is readable and
- *     the modal only when the unit is enabled; a disabled wiki has nothing
- *     to delete.
+ *   - Delete Wiki Data (LANDED — the earlier "delete write not supported"
+ *     note retired): the whole-wiki delete arm exists — services/wiki.ts
+ *     `deleteWiki` (wiki_service.DeleteWiki's port, services/wiki/
+ *     wiki.go:365-381) driven by the MAIN settings page's danger-zone
+ *     ladder (`applyRepoBasics` → `applyRepoDangerAction` case
+ *     "delete-wiki", pages/settings.tsx — options.tmpl:873-885's row +
+ *     #delete-wiki-modal's form, settings.go:983-1001). This sub-page
+ *     renders the SAME dangerous_operation_form shape (hidden
+ *     `action=delete-wiki` + the typed FULL repo name + the red
+ *     confirm_wiki_delete submit, wrapped in the danger-zone
+ *     details-disclosure reduction, upstream's wiki_delete_notices_1 line
+ *     as the warning) POSTing to `{repoLink}/settings` — the exact target
+ *     the landed ladder serves (upstream's modal posts to
+ *     `{{.Link}}` = the settings URL too), so the sub-page needs no write
+ *     arm of its own. The whole danger segment is gated on the wiki being
+ *     enabled — upstream renders the item only when the wiki unit is
+ *     readable and the modal only when the unit is enabled; a disabled
+ *     wiki has nothing to delete.
  *
  * ## Mount record (MOUNTED at 46e7e68, window-2d — the wiring HANDOFF,
  *    retired; kept as the landed-shape record)
@@ -115,8 +123,13 @@ export const wikiSettingsLocale = {
     "The built-in wiki is the only wiki flavor on this deployment. Upstream has an external-wiki option (the enable_external_wiki radio and external_wiki_url field); it is not rendered here: the repository-edit API accepts the external_wiki object but has no store for it.",
   branch_note:
     "The wiki follows the repository default branch; the upstream per-wiki branch setter has no landed write arm.",
-  delete_unavailable:
-    "The delete write is not supported yet: the wiki service exposes only per-page deletes (no whole-wiki delete arm landed).",
+  // The delete-wiki form's strings — the MAIN settings danger zone's exact
+  // keys (pages/settings.tsx settingsLocale, upstream locale keys cited):
+  // the sub-page renders the same dangerous_operation_form shape.
+  enter_repo_name_to_confirm: "Enter the repository name as confirmation:", // "repo.settings.enter_repo_name_to_confirm" (dangerous_operation_form.tmpl:8)
+  repo_name: "Repository Name", // "repo.repo_name"
+  wiki_delete_notices_1: "- This will permanently delete and disable the repository wiki for %s.", // "repo.settings.wiki_delete_notices_1" (%s = the full name)
+  confirm_wiki_delete: "Delete Wiki Data", // "repo.settings.confirm_wiki_delete" (the modal's danger submit)
 } as const;
 
 /** The panel's render inputs: the stored unit flag (loadRepoSettings) plus
@@ -235,20 +248,49 @@ export function RepoWikiSettingsPage(props: {
           {/* options.tmpl's Danger-Zone wiki item (options.tmpl:873-880) +
               #delete-wiki-modal (options.tmpl:1046-1062) — the item's
               upstream gate (CanRead wiki / the modal's UnitEnabled) reduced
-              to the stored flag; the item-trailing button + modal are the
-              module header's honest absence. */}
+              to the stored flag; the LANDED delete-wiki ladder
+              (applyRepoDangerAction's case "delete-wiki", the MAIN settings
+              POST) renders as the same details-disclosure form the main
+              danger zone uses — hidden action + typed FULL name, POSTing to
+              `{repoLink}/settings` (upstream's modal target too). */}
           {data.hasWiki ? (
             <>
               <h4 class="ui top attached error header">{wikiSettingsLocale.danger_zone}</h4>
               <div class="ui attached error danger segment">
                 <div class="flex-divided-list items-with-main">
-                  <div class="item">
+                  <div class="item tw-items-center">
                     <div class="item-main">
                       <div class="item-title">{wikiSettingsLocale.wiki_delete}</div>
                       <div class="item-body">{wikiSettingsLocale.wiki_delete_desc}</div>
                     </div>
                     <div class="item-trailing">
-                      <p class="help">{wikiSettingsLocale.delete_unavailable}</p>
+                      <details class="ui basic red button tw-p-0">
+                        <summary class="tw-p-2">{wikiSettingsLocale.wiki_delete}</summary>
+                        <div class="ui attached segment tw-text-left">
+                          <div class="ui warning message">
+                            {wikiSettingsLocale.wiki_delete_notices_1.replace(
+                              "%s",
+                              `${repo.ownerNamespace}/${repo.slug}`,
+                            )}
+                          </div>
+                          <form class="ui form" action={`${repoLink}/settings`} method="post">
+                            <input type="hidden" name="action" value="delete-wiki" />
+                            <div class="field">
+                              <label>
+                                {wikiSettingsLocale.enter_repo_name_to_confirm}{" "}
+                                <span class="tw-text-red">{`${repo.ownerNamespace}/${repo.slug}`}</span>
+                              </label>
+                            </div>
+                            <div class="required field">
+                              <label for="delete_wiki_repo_name">{wikiSettingsLocale.repo_name}</label>
+                              <input id="delete_wiki_repo_name" name="repo_name" required />
+                            </div>
+                            <button type="submit" class="ui red button">
+                              {wikiSettingsLocale.confirm_wiki_delete}
+                            </button>
+                          </form>
+                        </div>
+                      </details>
                     </div>
                   </div>
                 </div>

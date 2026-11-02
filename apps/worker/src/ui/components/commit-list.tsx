@@ -8,9 +8,16 @@
  * Omitted per §3.3: total count header, keyword search box, per-commit CI
  * statuses, signature badges, branch/tag decorations, and the trailing
  * actions column (copy-hash/view-at-rev buttons — no octicon-copy in the
- * generated icon allowlist, and the buttons' targets are all dead this
- * slice). Sha/subject links use the upstream-shaped `/commit/{oid}` URLs
- * that land on the 404 shell this slice (§1.2, open question 1).
+ * generated icon allowlist; the view-file targets are the `not $.PageIsWiki`
+ * arm, commits_list.tmpl:62-77, so their omission suppresses them on the
+ * wiki arm inherently). Sha/subject links use the upstream-shaped
+ * `/commit/{oid}` URLs (the commit view is landed — family "commit",
+ * ui/index.ts) — EXCEPT on the WIKI arm: upstream's PageIsWiki discriminator
+ * (commits_list.tmpl:23-34) swaps the sha cell's base link to
+ * `{repoLink}/wiki/commit` and renders the subject as the PLAIN
+ * commit-summary span (no anchor — the subject links nothing on
+ * wiki revisions). The `wiki` prop carries that arm; the revision page
+ * passes it (pages/repo-wiki.tsx's WikiRevisionPage).
  */
 
 import type { CommitJson } from "@cf-gitea/git-engine";
@@ -38,7 +45,11 @@ export const commitsLocale = {
   older: "Older",
 } as const;
 
-export function CommitList(props: { repoLink: string; commits: readonly CommitJson[] }) {
+export function CommitList(props: { repoLink: string; commits: readonly CommitJson[]; wiki?: boolean }) {
+  // commits_list.tmpl:22-32's CommitBaseLink arm: the wiki sha labels ride
+  // the `{repoLink}/wiki/commit` base (commit_sign_badge's target), every
+  // other page the plain `/commit`.
+  const commitBaseLink = props.wiki === true ? `${props.repoLink}/wiki/commit` : props.repoLink;
   return (
     <div class="ui attached table segment commit-table">
       <table class="ui very basic table unstackable" id="commits-table">
@@ -58,7 +69,7 @@ export function CommitList(props: { repoLink: string; commits: readonly CommitJs
               <td class="author">{commit.author.name}</td>
               <td class="sha">
                 <a
-                  href={commitLink(props.repoLink, commit.oid)}
+                  href={`${commitBaseLink}/commit/${encodeURIComponent(commit.oid)}`}
                   class="ui label commit-id-short"
                   rel="nofollow"
                 >
@@ -67,8 +78,15 @@ export function CommitList(props: { repoLink: string; commits: readonly CommitJs
               </td>
               <td class="message">
                 <span class="message-wrapper">
+                  {/* commits_list.tmpl:33-44: the PageIsWiki arm renders the
+                      subject as the PLAIN commit-summary span (no anchor);
+                      every other arm links `/commit/{oid}`. */}
                   <span class="commit-summary" title={commit.subject}>
-                    <a href={commitLink(props.repoLink, commit.oid)}>{commit.subject}</a>
+                    {props.wiki === true ? (
+                      commit.subject
+                    ) : (
+                      <a href={commitLink(props.repoLink, commit.oid)}>{commit.subject}</a>
+                    )}
                   </span>
                 </span>
               </td>

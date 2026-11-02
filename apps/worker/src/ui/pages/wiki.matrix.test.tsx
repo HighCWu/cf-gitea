@@ -406,6 +406,11 @@ describe("anonymous reads of a public wiki (and the anonymous write gates)", () 
     expect(revisionHtml).toContain('<div class="sixteen wide column">1 Commits</div>');
     expect(revisionHtml).toContain("Add &quot;Home&quot;"); // the default create subject
     expect(revisionHtml).not.toContain("navigation_label"); // a single revision → no pager
+    // The WIKI CommitList arm (commits_list.tmpl:23-34's PageIsWiki
+    // discriminator): the sha labels ride the /wiki/commit base (the landed
+    // wiki commit-diff page) and the dead repo /commit links are gone.
+    expect(revisionHtml).toContain(`href="${REPO_LINK}/wiki/commit/`);
+    expect(revisionHtml).not.toContain(`href="${REPO_LINK}/commit/`);
 
     expect((await get(`${REPO_LINK}/wiki?action=_new`)).status).toBe(404);
     expect((await get(`${REPO_LINK}/wiki/Home?action=_edit`)).status).toBe(404);
@@ -1005,5 +1010,55 @@ index 0000000..7e68207
     expect(patch2).toContain("Subject: [PATCH 2/2] side two: wiki merge fixture");
     expect(patch2).not.toContain(`From ${merge2.oid} `); // never a merge mail
     expect(patch2).not.toContain("\n-- \n"); // --no-signature parity (diff.go:73)
+  });
+});
+
+// --- the raw-file view round (wiki.go:156-164, 240-242 — the loader's
+//     isRaw decision; APPENDED ABSOLUTE LAST: it moves the w107wik ref like
+//     the commit-diff world above, and nothing after it reads the tip)
+
+describe("the raw-file view round (the loader's isRaw decision — the disclosed interim)", () => {
+  it("serves the raw bytes and keeps the raw-name VIEW on the family fold until the serving arm's mapping lands", async () => {
+    const pair = await pairFor("w107wik");
+    const cell = wikiCell(env, pair);
+    const ref = branchRef(wikiBranch(pair));
+    const tip = await wikiTipOf(env, pair);
+    if (tip === undefined) throw new Error("w107wik tip missing");
+    // A stored NON-.md entry (a git-pushed image — the page writer's codec
+    // cannot produce one), seeded through the cell primitives.
+    const blob = await buildBlobObject(new TextEncoder().encode("not-really-a-png\n"));
+    const tree = serializeTree([{ name: "img.png", mode: "100644", oid: blob.oid }]);
+    const person: Person = { name: DOER.name, email: DOER.email, time: T0 + 10_000, tz: "+0000" };
+    const commit = serializeCommit({
+      tree: tree.oid,
+      parents: [tip.target],
+      author: person,
+      committer: person,
+      message: "seed: the raw-file fixture",
+    });
+    const stored = await cell.putApiObjects([
+      blob,
+      { oid: tree.oid, type: tree.type, data: tree.data },
+      { oid: commit.oid, type: commit.type, data: commit.data },
+    ]);
+    if (stored.tag !== "ok") throw new Error(`raw-file seed objects refused: ${stored.tag}`);
+    const landed = await cell.commitApiChange({ ref, expectedOldOid: tip.target, newOid: commit.oid });
+    if (landed.tag !== "committed") throw commitApiChangeError(landed);
+
+    // The raw arm serves the bytes (web.go:1621) — the redirect DESTINATION
+    // exists.
+    const raw = await get(`${REPO_LINK}/wiki/raw/img.png`);
+    expect(raw.status).toBe(200);
+    expect(await raw.text()).toBe("not-really-a-png\n");
+    // The VIEW of the raw name (wiki.go:240-242's isRaw redirect): the
+    // loader probes the trimmed round (wikiRawFileRound) and carries
+    // rawRedirectTo on the missing outcome, but the serving arm cannot
+    // express the redirect yet — the fixed missing-arm location answers
+    // with the family fold. DISCLOSED INTERIM (the commit-diff view's 404
+    // twin, repo-wiki.tsx's header): the one-arm index.ts mapping flips
+    // this 303 onto `${REPO_LINK}/wiki/raw/img.png`.
+    const view = await get(`${REPO_LINK}/wiki/img.png`);
+    expect(view.status).toBe(303);
+    expect(view.headers.get("location")).toBe(PAGES_ACTION);
   });
 });

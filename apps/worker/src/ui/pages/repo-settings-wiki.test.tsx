@@ -10,7 +10,9 @@
  * on GET and POST, the admin GET reflecting the stored enable state, the
  * POST→303 ?saved=1 round-trip with the flash + persisted state on the
  * follow-up GET, the honest-absence read-only lines through the route (no
- * dead inputs), the guard-first cross-origin 403, and the settings-family
+ * dead inputs) beside the LANDED delete-wiki danger form (the main
+ * settings ladder's dangerous_operation_form shape, POSTing to
+ * /settings), the guard-first cross-origin 403, and the settings-family
  * claim pin.
  */
 
@@ -227,27 +229,35 @@ describe("the wiki panel DOM (options.tmpl:319-355 + 873-880 + 1046-1062 at the 
     expect(html).toContain(wikiSettingsLocale.branch_note);
   });
 
-  it("the danger segment renders only while the wiki is enabled, with the absence note (no button, no modal)", async () => {
+  it("the danger segment renders only while the wiki is enabled, with the LANDED delete-wiki form (no modal)", async () => {
     const enabled = await loadRepoWikiSettings(env.DB, repo);
     const enabledHtml = renderToString(<PageForTest data={enabled} error={null} saved={false} />);
     expect(enabledHtml).toContain("ui top attached error header"); // options.tmpl:802-803's danger header pair
     expect(enabledHtml).toContain(wikiSettingsLocale.danger_zone);
     expect(enabledHtml).toContain(wikiSettingsLocale.wiki_delete);
     expect(enabledHtml).toContain(wikiSettingsLocale.wiki_delete_desc);
-    expect(enabledHtml).toContain(wikiSettingsLocale.delete_unavailable);
-    // Scoped to the danger segment: the shared shell now carries the repo
-    // WATCH options modal (header.tmpl:93, the watch-UI wave 916943f) on every
-    // signed repo page — its .show-modal is legit page chrome, not the wiki
-    // delete modal this pin guards against.
-    const danger = enabledHtml.slice(enabledHtml.indexOf(wikiSettingsLocale.wiki_delete_desc));
-    expect(danger.slice(0, 2000)).not.toContain("show-modal"); // the #delete-wiki-modal opener is not reproduced
+    // The delete-wiki ladder LANDED (8b46159: services/wiki.ts deleteWiki +
+    // the main settings danger zone) — the sub-page renders the SAME
+    // dangerous_operation_form shape, POSTing to the settings route the
+    // ladder serves (upstream's modal target too).
+    expect(enabledHtml).toContain(wikiSettingsLocale.wiki_delete_notices_1.replace("%s", "alice/demo"));
+    expect(enabledHtml).toContain(wikiSettingsLocale.enter_repo_name_to_confirm);
+    expect(enabledHtml).toContain('<span class="tw-text-red">alice/demo</span>');
+    expect(enabledHtml).toContain('name="action" value="delete-wiki"');
+    expect(enabledHtml).toContain('id="delete_wiki_repo_name" name="repo_name" required');
+    expect(enabledHtml).toContain(`action="/alice/demo/settings" method="post"`);
+    expect(enabledHtml).toContain(`>${wikiSettingsLocale.confirm_wiki_delete}</button>`);
+    // Still the details-disclosure reduction — never a modal dialog (the
+    // shared shell's watch modal is legit chrome; scoped check as before).
     expect(enabledHtml).not.toContain("delete-wiki-modal");
-    expect(enabledHtml).not.toContain('name="action" value="delete-wiki"');
+    const danger = enabledHtml.slice(enabledHtml.indexOf(wikiSettingsLocale.wiki_delete_desc));
+    expect(danger.slice(0, 2000)).not.toContain("show-modal");
 
     await applyRepoWikiSettings(env.DB, repo, { enableWiki: false });
     const disabled = await loadRepoWikiSettings(env.DB, repo);
     const disabledHtml = renderToString(<PageForTest data={disabled} error={null} saved={false} />);
     expect(disabledHtml).not.toContain(wikiSettingsLocale.wiki_delete);
+    expect(disabledHtml).not.toContain('name="action" value="delete-wiki"');
     expect(disabledHtml).not.toContain("ui attached error danger segment");
   });
 
@@ -456,25 +466,30 @@ describe("the mounted routes (GET + POST /{owner}/{repo}/settings/wiki)", () => 
     expect(html).toContain("ui attached error danger segment"); // the danger segment is back with the wiki
   });
 
-  it("renders the honest-absence read-only lines through the route and never a dead input", async () => {
+  it("renders the honest-absence read-only lines and the landed delete-wiki form through the route", async () => {
     const res = await wikiGet();
     expect(res.status).toBe(200);
     const html = await res.text();
-    // No radio pair, no external-URL input, no default-branch input, no
-    // delete modal — the landed arms they would bind to do not exist.
+    // No radio pair, no external-URL input, no default-branch input — the
+    // landed arms they would bind to do not exist. No modal either (the
+    // delete form rides the details-disclosure reduction).
     expect(html).not.toContain('name="enable_external_wiki"');
     expect(html).not.toContain('name="external_wiki_url"');
     expect(html).not.toContain('name="default_wiki_branch"');
     expect(html).not.toContain('type="url"');
-    expect(html.slice(html.indexOf("Wiki"))).not.toContain("delete-wiki-modal");
     expect(html).not.toContain("delete-wiki-modal");
+    // The delete-wiki form targets the LANDED ladder's route (the main
+    // settings POST) with the typed-name confirmation.
+    expect(html).toContain('name="action" value="delete-wiki"');
+    expect(html).toContain('id="delete_wiki_repo_name" name="repo_name" required');
+    expect(html).toContain('action="/alice/demo/settings" method="post"');
+    expect(html).toContain(wikiSettingsLocale.wiki_delete_notices_1.replace("%s", "alice/demo"));
     // The read-only reductions render through the route.
     expect(html).toContain(wikiSettingsLocale.use_internal_wiki);
     expect(html).toContain(wikiSettingsLocale.flavor_note);
     expect(html).toContain("<p>main</p>"); // the effective branch (the repo default)
     expect(html).toContain(wikiSettingsLocale.default_wiki_branch_name);
     expect(html).toContain(wikiSettingsLocale.branch_note);
-    expect(html).toContain(wikiSettingsLocale.delete_unavailable);
   });
 
   it("rejects a cross-origin POST with 403 before any write (sameOriginGuard first)", async () => {

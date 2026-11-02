@@ -33,8 +33,11 @@
  *     → config.go:108-113). Requires the write path; the nav item stays
  *     omitted with it (the dead-link rule, AdminFamilyNav).
  *   - the two POST riders `test_mail` (web.go:792 → config.go:29-39) and
- *     `test_cache` (web.go:793 → config.go:42-55) — no mailer, no cache
- *     adapter (the §3.2 mailer/cache arms' own notes).
+ *     `test_cache` (web.go:793 → config.go:42-55) — no POST write path
+ *     exists (§1); upstream renders the test-mail rider INSIDE the mailer
+ *     section only while the mailer is enabled (config.tmpl:220-228) and
+ *     ours stays absent with it (SPEC-0018's §-out — arming is a var edit +
+ *     redeploy), the test-cache rider absent with the cache adapter.
  *
  * ## The THREE row classes (§3.2 — the dashboard's posture-line idiom
  * generalized; admin-dashboard.tsx renders upstream's inapplicable ops "as
@@ -42,7 +45,10 @@
  *
  *   1. REAL rows — values read from the landed surface at request time:
  *      SERVER_VERSION (../../api/config:13), the declared non-secret
- *      wrangler vars (wrangler.jsonc.example:41-66), the published settings
+ *      wrangler vars (wrangler.jsonc.example:41-132 — the four core vars,
+ *      the packages family, OAUTH2_ENABLED, and the outbound-mail family
+ *      MAIL_ENABLED/MAIL_PROVIDER/MAIL_FROM/MAIL_SUBJECT_PREFIX —
+ *      specs/email-outbound.md §6), the published settings
  *      constants (misc-t2's four GENERAL_* groups — IMPORTED, not
  *      re-declared; §8.2), the session provider (the D1 `sessions` table,
  *      schema.ts:1694), LFS over the shared R2 bucket, webhook delivery
@@ -54,9 +60,11 @@
  *      config value for infrastructure we deliberately do not run. Rendered
  *      muted (the dashboard's `tw-text-placeholder-text` idiom) and carrying
  *      `data-row-kind="posture"` in the DOM. The honest-absence lines the
- *      census called for (census :383-385): no SSH server, no mailer, no
- *      cache adapter, no filesystem, no app.ini — configuration is wrangler
- *      vars applied at deploy; changes are a var edit + redeploy.
+ *      census called for (census :383-385): no SSH server, no cache
+ *      adapter, no filesystem, no app.ini — configuration is wrangler
+ *      vars applied at deploy; changes are a var edit + redeploy (the
+ *      earlier "no mailer" line retired: the outbound mailer LANDED —
+ *      specs/email-outbound.md — and its rows are REAL above).
  *   3. SECRET rows never exist (§3.2 rule 3) — upstream blanks the session
  *      ProviderConfig before render (config.go:93-95); we go further:
  *      `wrangler secret` values are never READ for the page at all. The
@@ -124,6 +132,13 @@ export interface AdminConfigVars {
    *  "false" disables). Optional like the packages vars: absent = the code
    *  default (enabled). */
   oauth2Enabled?: string;
+  /** The outbound-mail family (wrangler.jsonc.example:119-132 —
+   *  specs/email-outbound.md §6). All optional: absent = the reader's own
+   *  code default (disabled, dummy provider, empty from/prefix). */
+  mailEnabled: string;
+  mailProvider: string;
+  mailFrom: string;
+  mailSubjectPrefix: string;
 }
 
 /** The env slice `adminConfigVarsFromEnv` reads — a WEAK STRUCTURAL slice,
@@ -131,9 +146,9 @@ export interface AdminConfigVars {
  *  string fields keep the generated Env assignable (its deployed literal
  *  types widen) without the page module pinning the operator's literals,
  *  and keep the tests free to flip values. The four core vars are required
- *  (the generated Env always declares them); the packages vars and
- *  OAUTH2_ENABLED are optional (their readers' own slices declare them
- *  optional — absent = the code default). */
+ *  (the generated Env always declares them); the packages vars,
+ *  OAUTH2_ENABLED and the MAIL_* family are optional (their readers' own
+ *  slices declare them optional — absent = the code default). */
 export type AdminConfigEnv = {
   APP_URL: string;
   ALLOW_SIGNUP: string;
@@ -145,6 +160,10 @@ export type AdminConfigEnv = {
   PACKAGES_LIMIT_TOTAL_OWNER_SIZE?: string;
   PACKAGES_ENABLED?: string;
   PACKAGE_CLEANUP_OLDER_THAN?: string;
+  MAIL_ENABLED?: string;
+  MAIL_PROVIDER?: string;
+  MAIL_FROM?: string;
+  MAIL_SUBJECT_PREFIX?: string;
 };
 
 /** Code defaults for the optional packages vars (the strict-polarity
@@ -164,6 +183,19 @@ const PACKAGES_VAR_DEFAULTS = {
  *  reader's own posture — absent = enabled). */
 const OAUTH2_VAR_DEFAULT = "true";
 
+/** Code defaults for the optional mail vars (the strict-polarity readers'
+ *  own postures: register-notify.ts:95 / notify.ts:704 `MAIL_ENABLED !==
+ *  "true"` disables; transport.ts:128 an unset/empty MAIL_PROVIDER is the
+ *  dummy protocol; MAIL_FROM/MAIL_SUBJECT_PREFIX read as "" when absent —
+ *  notify.ts:705, outbox.ts:213). An unset var renders the EFFECTIVE
+ *  default. */
+const MAIL_VAR_DEFAULTS = {
+  enabled: "false",
+  provider: "dummy",
+  from: "",
+  subjectPrefix: "",
+} as const;
+
 /** Project the env slice onto the page's vars struct (the handler's only
  *  env touchpoint — secrets are not in the slice type). */
 export function adminConfigVarsFromEnv(env: AdminConfigEnv): AdminConfigVars {
@@ -178,6 +210,10 @@ export function adminConfigVarsFromEnv(env: AdminConfigEnv): AdminConfigVars {
     packagesEnabled: env.PACKAGES_ENABLED ?? PACKAGES_VAR_DEFAULTS.enabled,
     packageCleanupOlderThan: env.PACKAGE_CLEANUP_OLDER_THAN ?? PACKAGES_VAR_DEFAULTS.cleanupHours,
     oauth2Enabled: env.OAUTH2_ENABLED ?? OAUTH2_VAR_DEFAULT,
+    mailEnabled: env.MAIL_ENABLED ?? MAIL_VAR_DEFAULTS.enabled,
+    mailProvider: env.MAIL_PROVIDER ?? MAIL_VAR_DEFAULTS.provider,
+    mailFrom: env.MAIL_FROM ?? MAIL_VAR_DEFAULTS.from,
+    mailSubjectPrefix: env.MAIL_SUBJECT_PREFIX ?? MAIL_VAR_DEFAULTS.subjectPrefix,
   };
 }
 
@@ -502,7 +538,8 @@ export function loadAdminConfigData(vars: AdminConfigVars): Promise<AdminConfigD
         {
           kind: "posture",
           label: "Email confirmation / OpenID / captcha", // config.tmpl:126-139's family
-          value: "no substrate — no mailer, no external login chain",
+          value:
+            "no email-confirmation flow and no captcha — the registration email arm and the captcha rows have no landed arm; the external-registration/OpenID-login rows are served by the LANDED OAuth2 auth sources (/-/admin/auths, specs/external-auth-sources.md) and the mailer by the section below",
         },
       ],
     },
@@ -527,15 +564,52 @@ export function loadAdminConfigData(vars: AdminConfigVars): Promise<AdminConfigD
       ],
     },
     {
-      // config.tmpl:186-231 — mailer. POSTURE-only (§3.2); upstream's
-      // send-test-mail rider (config.tmpl:220-228) is absent with it.
+      // config.tmpl:186-231 — mailer. REAL (the outbound mailer LANDED —
+      // specs/email-outbound.md §6): the four declared vars render their
+      // effective values; POSTURE: upstream's send-test-mail rider
+      // (config.tmpl:220-228) — rendered only while the mailer is enabled —
+      // is absent with it: it is a POST /-/admin/config rider and the write
+      // path is §1's §-out (SPEC-0018: arming is a var edit + redeploy).
       key: "mailer",
       title: adminConfigLocale.sections.mailer,
       rows: [
         {
+          kind: "real",
+          label: "Mailer (MAIL_ENABLED)", // "admin.config.mailer_enabled" (config.tmpl:190)
+          value:
+            vars.mailEnabled === "true"
+              ? 'armed (MAIL_ENABLED="true") — the senders gate on the parseable MAIL_FROM'
+              : `off (MAIL_ENABLED="${vars.mailEnabled}") — strict polarity, only the exact string "true" arms the senders`,
+        },
+        {
+          kind: "real",
+          label: "Provider (MAIL_PROVIDER)", // "admin.config.mailer_protocol"/"mailer_use_dummy" (config.tmpl:196-217)
+          value:
+            vars.mailProvider === "resend"
+              ? 'resend (MAIL_PROVIDER="resend") — the HTTP relay arm; the key rides the MAIL_PROVIDER_API_KEY secret (never rendered)'
+              : `dummy (MAIL_PROVIDER="${vars.mailProvider}") — render+log, upstream's dummy protocol; any non-"resend" value rides dummy`,
+        },
+        {
+          kind: "real",
+          label: "From (MAIL_FROM)", // the armed gate's parse (notify.ts:705)
+          value:
+            vars.mailFrom === ""
+              ? 'empty (MAIL_FROM="") — an armed mailer with no parseable From skips the send and logs'
+              : `${vars.mailFrom} (MAIL_FROM="${vars.mailFrom}")`,
+        },
+        {
+          kind: "real",
+          label: "Subject prefix (MAIL_SUBJECT_PREFIX)", // the per-attempt read (outbox.ts:213)
+          value:
+            vars.mailSubjectPrefix === ""
+              ? 'empty (MAIL_SUBJECT_PREFIX="") — subjects render unprefixed'
+              : `${vars.mailSubjectPrefix} (MAIL_SUBJECT_PREFIX="${vars.mailSubjectPrefix}")`,
+        },
+        {
           kind: "posture",
-          label: "Mailer", // "admin.config.mailer_enabled" (config.tmpl:190)
-          value: "no mailer — email notifications absent (upstream's send-test-mail rider is absent with it)",
+          label: "Send-test-mail rider", // config.tmpl:220-228 (mailer-enabled-gated)
+          value:
+            "absent — upstream renders the test-mail form inside this section only while the mailer is enabled; it is a POST /-/admin/config rider and this deployment has no config write path (SPEC-0018 §1: arming is a var edit + redeploy, never a runtime toggle)",
         },
       ],
     },

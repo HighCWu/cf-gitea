@@ -10,7 +10,9 @@
  *     (no form anywhere on the page — the write path is §1's §-out);
  *   - the ROW CLASSES (§3.2): REAL rows carrying `data-row-kind="real"`,
  *     POSTURE rows the muted `tw-text-placeholder-text` pairs with
- *     `data-row-kind="posture"` — ssh/mailer/cache are POSTURE-only, every
+ *     `data-row-kind="posture"` — ssh/cache are POSTURE-only, the mailer
+ *     is REAL as-built (the outbound mailer landed; its send-test-mail
+ *     rider stays the section's POSTURE row), every
  *     section carries at least one posture or real row per §3.2's mapping;
  *   - the VALUES-CROSS-CHECK (§6/§8.2): the page's `published` slice is the
  *     misc-t2 constants BY IDENTITY (a page-local copy fails), and every
@@ -82,6 +84,10 @@ const VARS: AdminConfigVars = {
   packagesLimitTotalOwnerSize: "-1",
   packagesEnabled: "true",
   packageCleanupOlderThan: "24",
+  mailEnabled: "false",
+  mailProvider: "dummy",
+  mailFrom: "",
+  mailSubjectPrefix: "",
 };
 
 async function load(vars: AdminConfigVars = VARS) {
@@ -140,7 +146,7 @@ describe("the admin config sections (config.tmpl at the pin)", () => {
     expect(html.slice(contentStart, contentEnd)).not.toContain("<button");
   });
 
-  it("every section's rows carry a row class; ssh/mailer/cache are POSTURE-only (§3.2's mapping)", async () => {
+  it("every section's rows carry a row class; ssh/cache are POSTURE-only, the mailer is REAL now (§3.2's mapping as-built)", async () => {
     const data = await load();
     for (const section of data.sections) {
       expect(section.rows.length).toBeGreaterThan(0);
@@ -149,10 +155,15 @@ describe("the admin config sections (config.tmpl at the pin)", () => {
       }
     }
     expect(adminConfigSection(data, "ssh").rows.every((row) => row.kind === "posture")).toBe(true);
-    expect(adminConfigSection(data, "mailer").rows.every((row) => row.kind === "posture")).toBe(true);
     expect(adminConfigSection(data, "cache").rows.every((row) => row.kind === "posture")).toBe(true);
+    // The mailer LANDED (specs/email-outbound.md): the four var rows are
+    // REAL, the send-test-mail rider stays the section's one POSTURE row.
+    const mailer = adminConfigSection(data, "mailer");
+    expect(mailer.rows.some((row) => row.kind === "real")).toBe(true);
+    expect(mailer.rows.at(-1)?.kind).toBe("posture");
+    expect(mailer.rows.at(-1)?.label).toContain("Send-test-mail");
     // The REAL side of the mapping: these sections carry at least one live row.
-    for (const key of ["server", "lfs", "db", "service", "webhook", "session", "git", "log"] as const) {
+    for (const key of ["server", "lfs", "db", "service", "webhook", "mailer", "session", "git", "log"] as const) {
       expect(adminConfigSection(data, key).rows.some((row) => row.kind === "real")).toBe(true);
     }
   });
@@ -168,10 +179,24 @@ describe("the admin config sections (config.tmpl at the pin)", () => {
   });
 
   it("renders the build-time REAL inventory: SERVER_VERSION, the posture absent-families, engine and provider lines", async () => {
-    const html = render(await load());
+    const data = await load();
+    const html = render(data);
     expect(html).toContain(`>${SERVER_VERSION}</dd>`); // src/api/config.ts:13
     expect(html).toContain("no SSH server — git smart-HTTP over HTTPS only");
-    expect(html).toContain("no mailer — email notifications absent");
+    // The mailer LANDED — the false "no mailer" posture line is retired;
+    // the section renders the four REAL var rows (canonical example values;
+    // quoted values assert at the DATA level — JSX escapes them in text) and
+    // the send-test-mail POSTURE row citing SPEC-0018's §-out.
+    const mailer = adminConfigSection(data, "mailer");
+    expect(mailer.rows.some((row) => row.value.includes('off (MAIL_ENABLED="false") — strict polarity, only the exact string "true" arms the senders'))).toBe(true);
+    expect(mailer.rows.some((row) => row.value.includes('dummy (MAIL_PROVIDER="dummy") — render+log, upstream\'s dummy protocol; any non-"resend" value rides dummy'))).toBe(true);
+    expect(mailer.rows.some((row) => row.value.includes('empty (MAIL_FROM="") — an armed mailer with no parseable From skips the send and logs'))).toBe(true);
+    expect(mailer.rows.some((row) => row.value.includes('empty (MAIL_SUBJECT_PREFIX="") — subjects render unprefixed'))).toBe(true);
+    expect(html).toContain("SPEC-0018 §1: arming is a var edit + redeploy, never a runtime toggle");
+    // The service posture row no longer claims "no mailer / no external
+    // login chain" — both landed; the remaining absences are named.
+    expect(html).toContain("no email-confirmation flow and no captcha");
+    expect(html).toContain("the LANDED OAuth2 auth sources (/-/admin/auths");
     expect(html).toContain("no cache adapter — stateless workers");
     expect(html).toContain("no app.ini — configuration is the wrangler vars applied at deploy");
     expect(html).toContain("Cloudflare D1 (binding DB)");
@@ -263,9 +288,29 @@ describe("the env-var matrix (wrangler vars at request time, §5.9)", () => {
     expect(defaulted.packagesLimitTotalOwnerCount).toBe("-1"); // UNLIMITED_QUOTA
     expect(defaulted.packagesEnabled).toBe("true"); // model.ts `!== "false"`
     expect(defaulted.packageCleanupOlderThan).toBe("24"); // cleanup.ts DEFAULT_CLEANUP_OLDER_THAN_HOURS
+    // The MAIL_* family defaults with the readers' own postures.
+    expect(defaulted.mailEnabled).toBe("false"); // notify.ts/register-notify.ts `!== "true"`
+    expect(defaulted.mailProvider).toBe("dummy"); // transport.ts:128's unset/empty arm
+    expect(defaulted.mailFrom).toBe("");
+    expect(defaulted.mailSubjectPrefix).toBe("");
     const html = render(await load(defaulted));
     expect(html).toContain("536870912 bytes (512 MiB)");
     expect(html).toContain("unlimited (-1)");
+    const mailer = adminConfigSection(await load(defaulted), "mailer");
+    expect(mailer.rows[0]?.value).toContain('off (MAIL_ENABLED="false")');
+  });
+
+  it("MAIL_ENABLED / MAIL_PROVIDER flip the mailer rows (strict polarity — only \"true\" arms, \"resend\" selects the relay)", async () => {
+    const armed = await load({ ...VARS, mailEnabled: "true", mailProvider: "resend", mailFrom: "no-reply@cf-gitea.test" });
+    const mailer = adminConfigSection(armed, "mailer");
+    expect(mailer.rows.some((row) => row.value.includes('armed (MAIL_ENABLED="true")'))).toBe(true);
+    expect(mailer.rows.some((row) => row.value.includes('resend (MAIL_PROVIDER="resend")'))).toBe(true);
+    expect(mailer.rows.some((row) => row.value.includes('no-reply@cf-gitea.test (MAIL_FROM="no-reply@cf-gitea.test")'))).toBe(true);
+    const armedHtml = render(armed);
+    expect(armedHtml).toContain("the senders gate on the parseable MAIL_FROM");
+    expect(armedHtml).toContain("the key rides the MAIL_PROVIDER_API_KEY secret (never rendered)");
+    const disabled = await load({ ...VARS, mailEnabled: "TRUE" }); // NOT the exact string
+    expect(adminConfigSection(disabled, "mailer").rows.some((row) => row.value.includes('off (MAIL_ENABLED="TRUE")'))).toBe(true);
   });
 });
 
@@ -291,6 +336,10 @@ describe("the secret hygiene rule (wrangler secret values are never read)", () =
       "appUrl",
       "auditRetentionDays",
       "demoMode",
+      "mailEnabled", // the MAIL_* family: declared, non-secret (the API key is a secret, not a var)
+      "mailFrom",
+      "mailProvider",
+      "mailSubjectPrefix",
       "oauth2Enabled", // the OAUTH2_ENABLED nav-gate var (declared, non-secret)
       "packageCleanupOlderThan",
       "packagesEnabled",
