@@ -899,9 +899,13 @@ describe("tracked-time aggregate query-shape witness (query-shape-audit A2/A6, t
     const count = meter.count();
     // The issues batch rides the issue-context prefetch — one batched read
     // per entity kind (posters, labels, pins, assignees; the milestone/PR
-    // arms skip here: no milestones, no pulls). Measured 9 at this N since
-    // the assignee fold added its arm (was 8 — the +1 IS that arm),
-    // page-INDEPENDENT. The pre-batch shape paid 2 + N×3 = 11 at this N=3
+    // arms skip here: no milestones, no pulls; the ⑯-P3-4
+    // project-membership arm rides too, its creator+counts render stage
+    // batching to ONE creators + ONE grouped counts read per page and
+    // skipping here — no projects). Measured 11 at this N — the page-constant
+    // arm sum (the assignee fold and cddae16's project-membership arm each
+    // added their +1 along the way), page-INDEPENDENT. The pre-batch shape
+    // paid 2 + N×3 = 11 at this N=3
     // (N=30 → 92); the bounds fail if any per-row fan returns.
     expect(count).toBeLessThanOrEqual(11);
     expect(count).toBeLessThan(12);
@@ -935,7 +939,10 @@ describe("tracked-time aggregate query-shape witness (query-shape-audit A2/A6, t
     const count = meter.count();
     // Post-fix: 1 doer row + 1 rows select + 1 issues batch + 1 batched
     // pair fetch + 2 grant probes on the hidden repo + renderTimeRows'
-    // issues re-read + 3 issue-context arms = 11 — CONSTANT in the row and
+    // issues re-read + 3 issue-context arms = 11, plus cddae16's
+    // ⑯-P3-4 project-membership arm (+1 — its creator+counts render stage
+    // batches to ONE creators + ONE grouped counts read per page and skips
+    // here: no projects) — measured 14 at this page, CONSTANT in the row and
     // repo counts (pre-fix paid findRepositoryById PER DISTINCT repo and the
     // enrichment fan PER row: 11 + 3 repos + 2×3 rows = 20 at this page).
     // The bound fails if the per-repo loop or any per-row fan returns

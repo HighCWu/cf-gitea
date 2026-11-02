@@ -21,6 +21,7 @@ import { PRFlow, PRStatus, comments, issues, pullAutoMerges, pullRequests, users
 import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { CommentType } from "../../issues/comment-types";
 import { IssueAlreadyChangedError } from "../../issues/errors";
+import { notifyMergePullRequest as notifyMergePullRequestWorkflow } from "../../services/projects-workflow";
 import { IssuesService } from "../../issues/service";
 // Cycle disclosure: ./issues imports pullRequestDiffShortStatForEnv from THIS
 // module; both directions use the import inside function bodies only (live
@@ -711,6 +712,16 @@ export async function mergePullRequest(
       console.error(`[pull-engine] merge mark-read failed (issue ${issue.id}): ${error instanceof Error ? error.message : String(error)}`);
     }
     await notifyMailMergePullRequest(c.env, mergedIssue, opts.doerId, pr.baseBranch, opts.now);
+    // The project-workflow arm (workflow_notifier.go:44-50): the merge's
+    // MergePullRequest notification's workflow consumer — pull_request_merged
+    // over the RELOADED closed issue (markAsMergedPostProcess's position,
+    // merge.go:406). Best-effort past the landed merge: the port's reducer
+    // logs per-action and never throws.
+    try {
+      await notifyMergePullRequestWorkflow(c.env.DB, { issue: mergedIssue, doerId: opts.doerId, now: opts.now, mailEnv: c.env });
+    } catch (error) {
+      console.error(`[pull-engine] project workflow notify failed (issue ${issue.id}): ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   return { commitOid };

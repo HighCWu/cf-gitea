@@ -58,6 +58,7 @@ import {
 } from "../../services/mail/notify";
 import { updateIssueMentions } from "../../services/mentions/carrier";
 import { findIssueMentions } from "../../services/mentions/service";
+import { notifyPullRequestReview as notifyProjectWorkflowReview } from "../../services/projects-workflow";
 import { ApiError } from "../errors";
 import type { RepositoryWithOwner, UserRow } from "./repository";
 
@@ -339,6 +340,26 @@ export class PullReviewsService {
     // type-22 comment's mentions + PullRequestReview, then per attached
     // code comment PullRequestCodeComment — both from ONE upstream body.
     await this.emitReviewMail(found, issue, input.doerRow, review, reviewComment);
+
+    // The project-workflow arm (workflow_notifier.go:56-65): the review's
+    // PullRequestReview notification's ONLY workflow consumer — official
+    // approve/reject reviews map to code_review_approved /
+    // code_changes_requested (the gate lives in the port, exactly like the
+    // upstream notifier). Best-effort past the committed review: the port's
+    // reducer logs per-action and never throws, and the wrap keeps the
+    // emitReviewMail posture — a failure logs and the review stays landed.
+    try {
+      await notifyProjectWorkflowReview(this.d1, {
+        issue,
+        doerId,
+        official,
+        reviewType,
+        now,
+        mailEnv: this.mailEnv,
+      });
+    } catch (error) {
+      console.error(`[pull-reviews] project workflow notify failed (issue ${issue.id}): ${error instanceof Error ? error.message : String(error)}`);
+    }
 
     return review;
   }

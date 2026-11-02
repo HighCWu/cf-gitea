@@ -32,6 +32,11 @@ import type {
 } from "../models/project";
 import type { User } from "../models/user";
 import { OrgService } from "../../services/orgs/orgs";
+import {
+  notifyIssueChangeProjectColumn,
+  notifyIssueChangeProjects,
+  type WorkflowSeamOptions,
+} from "../../services/projects-workflow";
 import { apiUserFromRow, canViewRepositoryWithTeams, type RepositoryWithOwner, type Viewer } from "./repository";
 
 /**
@@ -66,20 +71,14 @@ import { apiUserFromRow, canViewRepositoryWithTeams, type RepositoryWithOwner, t
  *    timestamps and the issue.updated_unix bump follow upstream
  *    updateCommentInfos (comment.go:937-948: system comments do NOT bump
  *    num_comments but DO touch updated_unix).
- *  - workflow execution is CRUD-only at this pin: the notifier port
- *    (upstream services/projects/workflow_notifier.go — a NullNotifier
- *    registered against the notify service, reacting to 8 events —
- *    item_added_to_project, item_removed_from_project, item_reopened,
- *    item_closed, item_column_changed, code_changes_requested,
- *    code_review_approved, pull_request_merged — by running each project's
- *    enabled workflows for that event through matchWorkflowFilters and
- *    executing their column-move / add-remove-label / close-reopen actions)
- *    is DEFERRED as SPEC-gated (ledger v1.5.2 §1.5 P2-3; the SPEC addendum
- *    records the event surface, the trigger sites and the reducer's guards
- *    — IsProjectWorkflowContext re-entrancy, the archived skip, the
- *    re-fetched issue for filter freshness). The workflow audit trail
- *    (services/projects/workflow.go recordWorkflowAudit) rides the same
- *    deferral.
+ *  - workflow execution landed with the notifier port (the deferred surface
+ *    of ledger v1.5.2 §1.5 P2-3, implemented per
+ *    specs/projects-workflow-notifier.md): the column add/remove/move arms
+ *    below emit into src/services/projects-workflow.ts (the upstream
+ *    workflow_notifier ports), guarded by the explicit re-entrancy mark
+ *    (upstream WithProjectWorkflow). The workflow audit trail
+ *    (services/projects/workflow.go recordWorkflowAudit) stays unlanded —
+ *    no audit table exists.
  */
 
 // ---------------------------------------------------------------------------
@@ -869,6 +868,12 @@ async function moveColumnsIssues(
  * column (append). One batch per step; a failure cannot strand the row in
  * the default column because the assign only happens when the move's inputs
  * are already known.
+ *
+ * The workflow arms (issue.go:45-46): an attach emits `item_added_to_project`,
+ * a real column change emits `item_column_changed` — both SKIPPED when
+ * `opts.viaWorkflow` is present (a workflow's own move, the WithProjectWorkflow
+ * re-entrancy guard) and carrying `opts.mailEnv` into the emitted workflows'
+ * action writes.
  */
 export async function addIssueToColumn(
   d1: D1Database,
@@ -877,8 +882,10 @@ export async function addIssueToColumn(
   column: ProjectColumnRow,
   doerId: number,
   now: Date,
+  opts?: WorkflowSeamOptions,
 ): Promise<void> {
   const membership = await projectIssueRow(d1, issue.id, project.id);
+  let attached = false;
   if (membership === null) {
     // IssueAssignOrRemoveProject's add arm (issue_project.go:103-148):
     // land in the default column at its next sorting.
@@ -893,15 +900,41 @@ export async function addIssueToColumn(
         sorting: nextSorting,
       });
     await writeProjectComment(d1, 30, issue.id, doerId, { old_project_id: 0, project_id: project.id }, now);
+    attached = true;
   }
-  await moveIssueWithinProject(d1, project, issue, column, null, doerId, now);
+  const move = await moveIssueWithinProject(d1, project, issue, column, null, doerId, now);
+  // notifyColumnMoves ordering (issue.go:45-46): IssueChangeProjects first,
+  // then IssueChangeProjectColumn.
+  if (opts?.viaWorkflow === undefined) {
+    if (attached) {
+      await notifyIssueChangeProjects(d1, {
+        issue,
+        doerId,
+        addedProjectIds: [project.id],
+        removedProjectIds: [],
+        now,
+        mailEnv: opts?.mailEnv,
+      });
+    }
+    if (move.moved) {
+      await notifyIssueChangeProjectColumn(d1, {
+        issue,
+        doerId,
+        oldColumnId: move.oldColumnId,
+        newColumn: column,
+        now,
+        mailEnv: opts?.mailEnv,
+      });
+    }
+  }
 }
 
 /**
  * `project_service.RemoveIssueFromColumn` (services/projects/issue.go:78-99):
  * the issue must be in the column (404 "issue N is not in column M"
  * otherwise), then the project membership row goes with a
- * CommentTypeProject removal comment.
+ * CommentTypeProject removal comment. The workflow arm (issue.go:97): the
+ * removal emits `item_removed_from_project` — skipped under `opts.viaWorkflow`.
  */
 export async function removeIssueFromColumn(
   d1: D1Database,
@@ -910,6 +943,7 @@ export async function removeIssueFromColumn(
   column: ProjectColumnRow,
   doerId: number,
   now: Date,
+  opts?: WorkflowSeamOptions,
 ): Promise<void> {
   const exists = await issueInColumn(d1, issue.id, column);
   if (!exists) {
@@ -919,6 +953,16 @@ export async function removeIssueFromColumn(
     .delete(projectIssues)
     .where(and(eq(projectIssues.issueId, issue.id), eq(projectIssues.projectId, project.id)));
   await writeProjectComment(d1, 30, issue.id, doerId, { old_project_id: project.id, project_id: 0 }, now);
+  if (opts?.viaWorkflow === undefined) {
+    await notifyIssueChangeProjects(d1, {
+      issue,
+      doerId,
+      addedProjectIds: [],
+      removedProjectIds: [project.id],
+      now,
+      mailEnv: opts?.mailEnv,
+    });
+  }
 }
 
 /**
@@ -929,7 +973,9 @@ export async function removeIssueFromColumn(
  * (issue_id, project_id) — the upstream IMPORTANT clause: a move in one
  * project must not touch the issue's row in another project — and a real
  * column change writes the CommentTypeProjectColumn comment. Legacy-0 rows
- * resolve their old column through the default column.
+ * resolve their old column through the default column. The workflow arm
+ * (issue.go:120): a real column change emits `item_column_changed` — skipped
+ * under `opts.viaWorkflow`.
  */
 export async function moveIssueToColumn(
   d1: D1Database,
@@ -939,12 +985,31 @@ export async function moveIssueToColumn(
   sorting: number | null,
   doerId: number,
   now: Date,
+  opts?: WorkflowSeamOptions,
 ): Promise<void> {
   const membership = await projectIssueRow(d1, issue.id, project.id);
   if (membership === null) {
     throw new ApiError(422, "all issues have to be added to a project first");
   }
-  await moveIssueWithinProject(d1, project, issue, column, sorting, doerId, now);
+  const move = await moveIssueWithinProject(d1, project, issue, column, sorting, doerId, now);
+  if (move.moved && opts?.viaWorkflow === undefined) {
+    await notifyIssueChangeProjectColumn(d1, {
+      issue,
+      doerId,
+      oldColumnId: move.oldColumnId,
+      newColumn: column,
+      now,
+      mailEnv: opts?.mailEnv,
+    });
+  }
+}
+
+/** The write's move result — `oldColumnId` is the legacy-resolved source
+ *  column (services/projects/issue.go:169-176), `moved` is a REAL column
+ *  change (the only kind upstream's notifyColumnMoves collects, :177-189). */
+interface ColumnMoveResult {
+  oldColumnId: number;
+  moved: boolean;
 }
 
 async function moveIssueWithinProject(
@@ -955,7 +1020,7 @@ async function moveIssueWithinProject(
   sorting: number | null,
   doerId: number,
   now: Date,
-): Promise<void> {
+): Promise<ColumnMoveResult> {
   const membership = await projectIssueRow(d1, issue.id, project.id);
   if (membership === null) {
     // Only reachable when a concurrent remove raced the caller's membership
@@ -973,7 +1038,8 @@ async function moveIssueWithinProject(
     .update(projectIssues)
     .set({ projectColumnId: column.id, sorting: position })
     .where(and(eq(projectIssues.issueId, issue.id), eq(projectIssues.projectId, project.id)));
-  if (oldColumnId !== column.id) {
+  const moved = oldColumnId !== column.id;
+  if (moved) {
     await writeProjectComment(
       d1,
       31,
@@ -983,6 +1049,7 @@ async function moveIssueWithinProject(
       now,
     );
   }
+  return { oldColumnId, moved };
 }
 
 // ---------------------------------------------------------------------------
@@ -1330,7 +1397,30 @@ export function toApiWorkflowActions(raw: string): ProjectWorkflowActions {
   };
 }
 
-function parseWorkflowFilters(raw: string): ProjectWorkflowFilters {
+/** `Workflow.UnsupportedRule` (workflows.go:171-184) — the first present
+ *  filter/action type outside the event's capability lists ("" when all
+ *  supported; an unknown event carries empty capability lists, so every
+ *  present rule reads unsupported — the reducer's no-match arm). */
+export function unsupportedWorkflowRule(
+  event: string,
+  filters: ProjectWorkflowFilters,
+  actions: ProjectWorkflowActions,
+): string {
+  const capabilities = WORKFLOW_CAPABILITIES[event] ?? { filters: [], actions: [] };
+  for (const type of filterTypes(filters)) {
+    if (!capabilities.filters.includes(type)) {
+      return type;
+    }
+  }
+  for (const type of actionTypes(actions)) {
+    if (!capabilities.actions.includes(type)) {
+      return type;
+    }
+  }
+  return "";
+}
+
+export function parseWorkflowFilters(raw: string): ProjectWorkflowFilters {
   try {
     const parsed = JSON.parse(raw) as Partial<ProjectWorkflowFilters> | null;
     return {
@@ -1344,7 +1434,7 @@ function parseWorkflowFilters(raw: string): ProjectWorkflowFilters {
   }
 }
 
-function parseWorkflowActions(raw: string): ProjectWorkflowActions {
+export function parseWorkflowActions(raw: string): ProjectWorkflowActions {
   try {
     const parsed = JSON.parse(raw) as Partial<ProjectWorkflowActions> | null;
     return {

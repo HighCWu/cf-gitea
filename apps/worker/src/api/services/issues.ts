@@ -30,9 +30,12 @@ import { CommentType } from "../../issues/comment-types";
 import { IssueError } from "../../issues/errors";
 import { emitWebhookDeliveries, type HookEventType } from "../../issues/webhooks";
 import type { CommentRow, IssueRow, LabelRow, MilestoneRow, PullRequestRow } from "../../issues/service";
+import type { MailNotifyEnv } from "../../services/mail/notify";
+import { notifyIssueChangeProjects } from "../../services/projects-workflow";
 import { ApiError } from "../errors";
 import type { ApiEnv } from "../env";
 import type { Comment, Issue, TimelineComment } from "../models/issue";
+import type { Project } from "../models/project";
 import type { Attachment as ReleaseAttachment } from "../models/release";
 import type { User } from "../models/user";
 import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "./blocks";
@@ -41,7 +44,15 @@ import { findCollaborator } from "./repo-collaborators";
 import { pullRequestDiffShortStatForEnv } from "./pull-engine";
 import { toApiPullRequest } from "./pulls";
 import { toApiMilestone } from "./milestones";
-import { addIssueToColumn, mustDefaultColumn, toApiProject, type ProjectRow } from "./projects";
+import {
+  addIssueToColumn,
+  cardTypeToString,
+  mustDefaultColumn,
+  projectTypeToString,
+  templateTypeToString,
+  toApiProject,
+  type ProjectRow,
+} from "./projects";
 import { engineRepoName, pullHeadRef } from "./engine";
 import {
   apiRepositoryUrl,
@@ -341,6 +352,21 @@ export interface IssueRenderContext {
    *  (or a dangling membership whose project row is gone) renders the empty
    *  set's null on both paths. */
   projectsByIssue: Map<number, ProjectRow[]>;
+  /** The page's distinct projects' creator user rows by user id — ONE inArray
+   *  read, the page twin of `creatorUser` and the same batch upstream's
+   *  `loadProjectCreators` runs per list (services/convert/project.go:69-100:
+   *  CreatorID > 0 into a set, one GetUsersMapByIDs, best-effort). A missing
+   *  id (creatorId <= 0, or a vanished user row) renders the per-row null —
+   *  the dropped `creator` field. */
+  projectCreators: Map<number, UserRow>;
+  /** The page's distinct projects' joined open/closed member-issue counts by
+   *  project id — ONE GROUP BY read over the page's project ids, the page
+   *  twin of `projectIssueCounts` (the plain-joined branch of upstream
+   *  `LoadIssueNumbersForProject`, services/projects/issue.go:291-309, whose
+   *  numbers `toProject` renders preloaded, services/convert/project.go:
+   *  126-152). A project with no live member issues (or a map miss) renders
+   *  the zero counts — the per-project read's empty-join answer. */
+  projectCounts: Map<number, { open: number; closed: number; total: number }>;
 }
 
 /** Optional preloaded reads for `toApiIssue` — the list routes' batch
@@ -356,8 +382,12 @@ export interface IssueRenderPreload {
 /**
  * One batched read per entity kind for the page's rows (posters, the label
  * join, pin orders, milestones, PR rows, the assignee join, the direct
- * attachments), fanned with Promise.all. Empty or homogeneous pages skip
- * their arms entirely — 0
+ * attachments), fanned with Promise.all — then the project-render stage: the
+ * page's DISTINCT project ids are known only once the membership join
+ * resolves, so the `Issue.projects` render's two reads ride ONE follow-up
+ * round (one creators inArray + one grouped counts GROUP BY) instead of
+ * `toApiProject`'s per-project counts+creator pair. Empty or homogeneous
+ * pages skip their arms entirely — 0
  * statements there, exactly like the per-row path. The id lists stay far under
  * the D1 100-variable cap: the API paging clamps at 50 rows
  * (pagination.ts MAX_RESPONSE_ITEMS).
@@ -459,6 +489,38 @@ export async function prefetchIssueRenderContext(d1: D1Database, pageRows: Issue
       bucket.push(row.project);
     }
   }
+  // The project-render stage (the ⑯-P3-4 batching follow-up): one creators
+  // read (upstream's loadProjectCreators posture — the CreatorID > 0 set,
+  // one inArray) + ONE grouped counts read (the page twin of
+  // projectIssueCounts' joined GROUP BY, its inner join kept so a dangling
+  // membership's vanished issue never counts) over the page's DISTINCT
+  // project ids — a page with no memberships skips both (0 statements,
+  // exactly like the per-row path whose toApiProject is never reached).
+  const projectIds = [...new Set(projectRows.map((row) => row.project.id))];
+  const projectCreatorIds = [...new Set(projectRows.flatMap((row) => (row.project.creatorId <= 0 ? [] : [row.project.creatorId])))];
+  const [projectCreatorRows, projectCountRows] = await Promise.all([
+    projectCreatorIds.length > 0 ? db.select().from(users).where(inArray(users.id, projectCreatorIds)).all() : Promise.resolve([]),
+    projectIds.length > 0
+      ? db
+          .select({ projectId: projectIssues.projectId, closed: issues.isClosed, value: sql<number>`count(*)` })
+          .from(projectIssues)
+          .innerJoin(issues, eq(projectIssues.issueId, issues.id))
+          .where(inArray(projectIssues.projectId, projectIds))
+          .groupBy(projectIssues.projectId, issues.isClosed)
+          .all()
+      : Promise.resolve([]),
+  ]);
+  const projectCounts = new Map<number, { open: number; closed: number; total: number }>();
+  for (const row of projectCountRows) {
+    const bucket = projectCounts.get(row.projectId) ?? { open: 0, closed: 0, total: 0 };
+    if (row.closed) {
+      bucket.closed = Number(row.value);
+    } else {
+      bucket.open = Number(row.value);
+    }
+    bucket.total = bucket.open + bucket.closed;
+    projectCounts.set(row.projectId, bucket);
+  }
   return {
     posters: new Map(posterRows.map((row) => [row.id, row])),
     labelsByIssue,
@@ -468,6 +530,8 @@ export async function prefetchIssueRenderContext(d1: D1Database, pageRows: Issue
     assigneesByIssue,
     attachmentsByIssue,
     projectsByIssue,
+    projectCreators: new Map(projectCreatorRows.map((row) => [row.id, row])),
+    projectCounts,
   };
 }
 
@@ -478,6 +542,45 @@ function posterFromContext(context: IssueRenderContext, viewer: Viewer, posterId
   }
   const row = context.posters.get(posterId);
   return row === undefined ? null : apiUserFromRow(row, viewer);
+}
+
+/**
+ * The context twin of `toApiProject` (services/projects.ts) — the identical
+ * wire shape with 0 reads: counts come from the page's grouped read (a map
+ * miss renders `projectIssueCounts`' empty-join zeros) and the creator from
+ * the batched creators read, the exact posture of upstream's `toProject`
+ * rendering straight from the preloaded creators map (services/convert/
+ * project.go:154-156 — `if creator, ok := creators[p.CreatorID]`; a vanished
+ * creator, or creatorId <= 0, drops the field on both paths). The field
+ * mapping mirrors `toApiProject` verbatim — `ToProject`
+ * (convert/project.go:119-152) — so the batched and per-row renders stay
+ * deep-equal (the witnesses' contract discipline).
+ */
+function projectFromContext(context: IssueRenderContext, row: ProjectRow, viewer: Viewer, htmlUrl: string): Project {
+  const counts = context.projectCounts.get(row.id) ?? { open: 0, closed: 0, total: 0 };
+  const creatorRow = row.creatorId <= 0 ? undefined : context.projectCreators.get(row.creatorId);
+  const isClosed = row.isClosed;
+  return {
+    id: row.id,
+    title: row.title,
+    description: row.description,
+    owner_id: row.ownerId,
+    repo_id: repoIdNumber(row.repoId),
+    creator: creatorRow === undefined ? undefined : apiUserFromRow(creatorRow, viewer),
+    creator_id: row.creatorId,
+    state: isClosed ? "closed" : "open",
+    is_closed: isClosed,
+    template_type: templateTypeToString(row.boardType),
+    card_type: cardTypeToString(row.cardType),
+    type: projectTypeToString(row.type),
+    num_open_issues: counts.open,
+    num_closed_issues: counts.closed,
+    num_issues: counts.total,
+    created_at: row.createdAt.toISOString(),
+    updated_at: row.updatedAt.toISOString(),
+    closed_at: isClosed && row.closedAtUnix !== null ? row.closedAtUnix.toISOString() : undefined,
+    html_url: htmlUrl,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -546,8 +649,11 @@ function toAttachmentApi(origin: string, row: IssueAttachmentRow): ReleaseAttach
  * (LoadPoster/LoadLabels/LoadAssignees/LoadMilestone/LoadPullRequest/
  * LoadAttachments/LoadProjects). LIST routes pass `preload` (the page-scoped
  * `prefetchIssueRenderContext` maps + the caller-held PR row) so the reads
- * collapse to 0 per row; without it the per-row selects run exactly as
- * before — the single-item routes' unchanged path.
+ * collapse to 0 per row — including the projects render itself, which goes
+ * through the `projectFromContext` twin (the page's one creators read + one
+ * grouped counts read) instead of `toApiProject`'s per-project pair; without
+ * it the per-row selects run exactly as before — the single-item routes'
+ * unchanged path.
  *
  * The ASSIGNEE FOLD (the PATCH-assignee landing's named wave): `assignee`/
  * `assignees` render the REAL set — `convert.ToIssue` issue.go:105-113, the
@@ -579,6 +685,19 @@ export async function toApiIssue(d1: D1Database, viewer: Viewer, pair: Repositor
         : (context.milestones.get(issue.milestoneId) ?? null);
   const pullRequest = await pullRequestMetaOf(d1, pair, viewer.origin, issue, preload?.prRow ?? context?.pullRequestsByIssue.get(issue.id));
   const assignees = assigneeRows.map((row) => apiUserFromRow(row, viewer));
+  // ToProjectList (convert/issue.go:98-102) — the loaded memberships, the
+  // landed project converter per row; the empty set is upstream's Go nil,
+  // rendered null (never []). The batched pages render through the context
+  // twin (ToProjectList's shared creators map — convert/project.go:181-188 —
+  // plus the grouped counts read): a plain map, 0 awaits. The per-row path
+  // keeps toApiProject fanned with Promise.all.
+  let projectsWire: Project[] | null = null;
+  if (projectRows.length > 0) {
+    projectsWire =
+      context === undefined
+        ? await Promise.all(projectRows.map((row) => toApiProject(d1, row, viewer, issueProjectHtmlUrl(pair, viewer.origin, row))))
+        : projectRows.map((row) => projectFromContext(context, row, viewer, issueProjectHtmlUrl(pair, viewer.origin, row)));
+  }
 
   return {
     id: issue.id,
@@ -592,11 +711,7 @@ export async function toApiIssue(d1: D1Database, viewer: Viewer, pair: Repositor
     assets: attachmentRows.map((row) => toAttachmentApi(viewer.origin, row)),
     labels: labelRows.map((row) => toEmbeddedLabel(row, pair, viewer.origin)),
     milestone: milestoneRow === null ? null : toApiMilestone(milestoneRow),
-    // ToProjectList (convert/issue.go:98-102) — the loaded memberships, the
-    // landed project converter per row; the empty set is upstream's Go nil,
-    // rendered null (never []).
-    projects:
-      projectRows.length === 0 ? null : await Promise.all(projectRows.map((row) => toApiProject(d1, row, viewer, issueProjectHtmlUrl(pair, viewer.origin, row)))),
+    projects: projectsWire,
     // ToIssue issue.go:105-113 — the first assignee duplicated into the
     // deprecated `assignee`; an empty set leaves BOTH null (upstream's
     // `len > 0` gate — never []).
@@ -2115,10 +2230,14 @@ export interface IssueProjectsWriteResult {
  * ErrNotExist/ErrPermissionDenied pair to 400 (issue.go:633-636 create /
  * :829-833 PATCH), so both throw here BEFORE any write (upstream's tx rolls
  * the whole diff back — the observable "bad request touches nothing" is
- * kept by validating up front). Returns the diff for callers; upstream
- * notifies IssueChangeProjects whose only implementation is the workflow
- * notifier (services/projects/workflow_notifier.go:32 — NO webhook, NO mail
- * arm exists), so this write emits nothing by design.
+ * kept by validating up front). Returns the diff for callers. The workflow
+ * notification (upstream IssueChangeProjects — services/issue/project.go:17
+ * PATCH / services/issue/issue.go:88 create tail, whose ONLY implementation
+ * is the projects workflow notifier, workflow_notifier.go:32-35 — NO
+ * webhook, NO mail arm exists): the removals emit here in upstream's
+ * removed-first position; the adds ride `addIssueToColumn`'s own
+ * `item_added_to_project` emission (its attach arm), so this writer emits
+ * them exactly once without double-firing.
  */
 export async function assignOrRemoveIssueProjects(
   d1: D1Database,
@@ -2127,6 +2246,7 @@ export async function assignOrRemoveIssueProjects(
   requestedProjectIds: number[],
   doerId: number,
   now: Date,
+  mailEnv?: MailNotifyEnv,
 ): Promise<IssueProjectsWriteResult> {
   const membershipRows = await drizzle(d1)
     .select({ projectId: projectIssues.projectId })
@@ -2172,7 +2292,8 @@ export async function assignOrRemoveIssueProjects(
 
   // Removals: the direct membership delete + one removal comment per project
   // (upstream's exact shape — CreateComment{OldProjectID: projectID,
-  // ProjectID: 0}).
+  // ProjectID: 0}), then the removed-first workflow emission
+  // (workflow_notifier.go:33 — runWorkflows(removed) precedes the adds').
   if (removed.length > 0) {
     await drizzle(d1)
       .delete(projectIssues)
@@ -2180,6 +2301,14 @@ export async function assignOrRemoveIssueProjects(
     for (const projectId of removed) {
       await writeIssueProjectComment(d1, issue.id, doerId, { old_project_id: projectId, project_id: 0 }, now);
     }
+    await notifyIssueChangeProjects(d1, {
+      issue,
+      doerId,
+      addedProjectIds: [],
+      removedProjectIds: removed,
+      now,
+      mailEnv,
+    });
   }
   // Adds: the default column + the landed attach seam (which writes the
   // add comment {old_project_id: 0, project_id: project.id} internally).

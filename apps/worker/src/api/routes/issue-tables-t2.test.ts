@@ -1153,7 +1153,9 @@ describe("tier-2 list query-shape witness (query-shape-audit A2, dependencies/bl
     // arms (posters, labels, pins, assignees, the direct issue attachments —
     // the asset render's page twin; milestones/PR arms skip),
     // page-INDEPENDENT. +1 (cddae16's ripple, the tier-2 twin): the
-    // ⑯-P3-4 project-membership arm rides the issue-context prefetch.
+    // ⑯-P3-4 project-membership arm rides the issue-context prefetch — and
+    // its creator+counts render stage batches to ONE creators + ONE grouped
+    // counts read per page (it skips here: no memberships on this page).
     // Pre-fix: the same 4 + 2×(1 pair + 3 enrichment) = 14 at this N; any
     // returning per-row fan breaks the bound.
     expect(count).toBeLessThanOrEqual(14);
@@ -1192,7 +1194,9 @@ describe("tier-2 list query-shape witness (query-shape-audit A2, dependencies/bl
     // (posters, labels, pins, assignees, the direct issue attachments —
     // the asset render's page twin; milestone/PR arms skip),
     // page-INDEPENDENT. +1 (cddae16's ripple, the tier-2 twin): the
-    // ⑯-P3-4 project-membership arm rides the issue-context prefetch.
+    // ⑯-P3-4 project-membership arm rides the issue-context prefetch — and
+    // its creator+counts render stage batches to ONE creators + ONE grouped
+    // counts read per page (it skips here: no memberships on this page).
     // Pre-fix: 4 + N×(1 pair + 3
     // enrichment) = 14 at this N=2; any returning per-row fan breaks it.
     expect(blocksCount).toBeLessThanOrEqual(14);
@@ -1222,8 +1226,9 @@ describe("tier-2 list query-shape witness (query-shape-audit A2, dependencies/bl
     // services/issue-unit-gates.ts) + 1 issue + 1 rows select + the context
     // arms (posters, labels, pins, assignees — the fold's added arm; the
     // ⑯-P3-4 project-membership arm rides the same prefetch — cddae16's
-    // tier-2 ripple; milestone/PR skip) regardless of the row count
-    // (pre-fix 3 + N×3 = 9 at this N=2; N=30 → 93).
+    // tier-2 ripple, its creator+counts render stage batching per page and
+    // skipping here: no memberships; milestone/PR skip) regardless of the
+    // row count (pre-fix 3 + N×3 = 9 at this N=2; N=30 → 93).
     expect(timesCount).toBeLessThanOrEqual(11);
     expect(timesCount).toBeLessThan(12);
     const singleA = await metered(`/repos/cf-gitea-stub/writes/issues/${issueA.index}`, authed({}));

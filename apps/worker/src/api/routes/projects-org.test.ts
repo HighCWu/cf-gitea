@@ -913,17 +913,19 @@ describe("org column-issues list query-shape witness (query-shape-audit A2/A6, t
     const count = meter.count();
     // Post-fix: the route's fixed prefix (org resolve + grant + visible
     // repos + project + column + membership + count + page) + 5 prefetch
-    // arms — page-INDEPENDENT. The pre-fix shape added N×(1 poster + 1
-    // labels + 1 pin + 1 milestone) = 12 at this N; the bound below fails
-    // if any per-row fan returns (each row's 3 reads alone exceed it).
-    // +3 (cddae16's ripple, the org twin of the issues-list pin): the
-    // ⑯-P3-4 Issue.projects render pays an unbatched counts + creator read
-    // per PROJECTED row here (2 rows carry projects at this N) — the
-    // projects-repo witness's disclosed cap ride; batching a project-render
-    // context (one creators + one grouped counts read per page) is the
-    // coupling owner's follow-up and drops this back to <= 20.
-    expect(count).toBeLessThanOrEqual(23);
-    expect(count).toBeLessThan(24);
+    // arms + the ⑯-P3-4 project-render stage — ONE creators read + ONE
+    // grouped counts read over the page's DISTINCT project ids — = 19
+    // measured at this N, page-INDEPENDENT. Upstream renders the same two
+    // preloaded: ToProjectList shares one loadProjectCreators map per list
+    // (services/convert/project.go:69-100, 181-188) and toProject reads the
+    // handler-preloaded counts (:119-152). The original pre-fix shape added
+    // N×(1 poster + 1 labels + 1 pin + 1 milestone) = 12 at this N; the
+    // interim shape (cddae16) paid the unbatched toApiProject counts+creator
+    // pair PER PROJECTED row (all 3 rows carry projects → measured 23); the
+    // bounds below fail if any per-project or per-row fan returns (each
+    // row's 3 reads alone exceed it).
+    expect(count).toBeLessThanOrEqual(19);
+    expect(count).toBeLessThan(20);
 
     // Contract discipline: every batched render is deep-equal to the
     // per-row single GET of ITS repo (per-repo indexes, one per repo pair).

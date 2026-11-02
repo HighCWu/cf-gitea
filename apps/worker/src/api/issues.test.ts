@@ -4001,7 +4001,10 @@ describe("issues list query-shape witness (query-shape-audit A2)", () => {
     // the shared settings+units loader) + 2 (count + page) + 8 prefetch arms
     // (posters, labels, pins, milestones, PR rows, assignees, the direct
     // issue attachments — the asset render's page twin, the project
-    // memberships — the ⑯-P3-4 Issue.projects render) —
+    // memberships — the ⑯-P3-4 Issue.projects render; that render's
+    // creator+counts stage batches to ONE creators + ONE grouped counts read
+    // per page and skips here — no projects seeded, the batching follow-up
+    // leaves the observed 13 unchanged) —
     // page-INDEPENDENT (the assignees arm is ONE join read for the whole
     // page, the fold's added arm). The pre-fix shape (audit formula
     // 2 + N×3..5) paid 1 + 2 + 6×3 + 2 milestones + 1 PR row = 24 at this N;

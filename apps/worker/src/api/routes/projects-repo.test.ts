@@ -1206,17 +1206,17 @@ describe("column-issues list query-shape witness (query-shape-audit A2, tier-2)"
     // 1 unit-gate prologue (P2-1: repo resolve + repo_settings + repo_units)
     // + 1 handler repo re-run + 1 project/column/membership set + 2 (count
     // + page) + 6 prefetch arms (posters, labels, pins, milestones,
-    // assignees, attachments — the PR arm skips: no pulls here, the projects
-    // join is Wave A's coupling arm) = 16, then the Wave A coupling debt:
-    // the per-row `Issue.projects` render calls toApiProject PER ISSUE ROW,
-    // and toApiProject pays its own count + creator read per call (upstream
-    // preloads both — ToProject is O(1) there, convert/project.go:119-157
-    // reads the handler-preloaded NumIssues) — +2×N rows = +8 here. The flat
-    // 24 pins TODAY'S shape; the page-independence property is suspended on
-    // that fan — batching a project-render context (one creators read + one
-    // grouped counts read per page) is the coupling owner's follow-up, and
-    // this cap drops back to ≤16 when it lands.
-    expect(count).toBeLessThanOrEqual(24);
+    // assignees, attachments — the PR arm skips: no pulls here) + the
+    // ⑯-P3-4 project-render stage — ONE creators read + ONE grouped counts
+    // read over the page's DISTINCT project ids — = 18 measured at this N,
+    // page-INDEPENDENT. Upstream renders the same two preloaded:
+    // ToProjectList shares one loadProjectCreators map per list (services/
+    // convert/project.go:69-100, 181-188) and toProject reads the handler-
+    // preloaded counts (:119-152). The interim shape (cddae16) paid the
+    // unbatched toApiProject count + creator read PER ISSUE ROW (+2×N = +8
+    // here → measured 24); the bound below fails if any per-project or
+    // per-row fan returns.
+    expect(count).toBeLessThanOrEqual(18);
 
     // Contract discipline: the batched list render must be deep-equal to the
     // per-row single-GET renders for every row — the null poster, the
@@ -1231,5 +1231,160 @@ describe("column-issues list query-shape witness (query-shape-audit A2, tier-2)"
     expect(list.find((item) => item.number === 4)?.milestone).toBeNull();
     expect(list.find((item) => item.number === 2)?.labels.map((l: { name: string }) => l.name)).toEqual(["bug", "ui"]);
     expect(list.find((item) => item.number === 3)?.user).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The project-workflow notifier's route-level integration (the deferred
+// surface landed — specs/projects-workflow-notifier.md): the column add /
+// move arms and the issue PATCH projects arm emit into the reducer
+// (services/projects-workflow.ts), which runs the touched project's enabled
+// workflows for the event. The observables are the ACTIONS' committed rows —
+// the same service writes the human arms use.
+// ---------------------------------------------------------------------------
+
+describe("project workflows fire from the mutation seams", () => {
+  it("repoAddIssueToProjectColumn's attach fires the item_added workflow (move + label)", async () => {
+    const s = await seedRepoAndActors("wfadd");
+    const project = await seedProject(s.repoId, s.owner.id);
+    const def = await seedColumn(project.id, { title: "Backlog", isDefault: true });
+    const requested = await seedColumn(project.id, { title: "Requested", sorting: 1 });
+    const workflowTarget = await seedColumn(project.id, { title: "Workflow Target", sorting: 2 });
+    const label = await db()
+      .insert(labels)
+      .values({ repoId: s.repoId, name: "triaged", color: "#00aabb", description: "" })
+      .returning({ id: labels.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+    await db()
+      .insert(projectWorkflows)
+      .values({
+        projectId: project.id,
+        event: "item_added_to_project",
+        filters: "{}",
+        actions: JSON.stringify({ column_id: workflowTarget.id, add_label_ids: [label] }),
+        enabled: true,
+        createdAt: NOW,
+        updatedAt: NOW,
+      });
+    const issue = await seedIssue(s.repoId, 1);
+    const send = router();
+
+    const res = await send(`/repos/${s.owner.username}/${s.repoId}/projects/${project.id}/columns/${requested.id}/issues/${issue.id}`, {
+      method: "POST",
+      headers: authHeaders(s.writer.id),
+    });
+    expect(res.status).toBe(201);
+
+    // The workflow's move overrode the requested placement; its label action
+    // attached through the human write path.
+    const membership = (await db().select().from(projectIssues).where(eq(projectIssues.issueId, issue.id)).all())[0];
+    expect(membership).toMatchObject({ projectId: project.id, projectColumnId: workflowTarget.id });
+    const attached = await db().select().from(issueLabels).where(eq(issueLabels.issueId, issue.id)).all();
+    expect(attached.map((row) => row.labelId)).toEqual([label]);
+    void def;
+  });
+
+  it("repoMoveIssueInProjectColumn fires the item_column_changed workflow", async () => {
+    const s = await seedRepoAndActors("wfmove");
+    const project = await seedProject(s.repoId, s.owner.id);
+    const a = await seedColumn(project.id, { title: "A", isDefault: true });
+    const b = await seedColumn(project.id, { title: "B", sorting: 1 });
+    const label = await db()
+      .insert(labels)
+      .values({ repoId: s.repoId, name: "in-progress", color: "#00aabb", description: "" })
+      .returning({ id: labels.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+    await db()
+      .insert(projectWorkflows)
+      .values({
+        projectId: project.id,
+        event: "item_column_changed",
+        filters: JSON.stringify({ target_column_id: b.id }),
+        actions: JSON.stringify({ add_label_ids: [label] }),
+        enabled: true,
+        createdAt: NOW,
+        updatedAt: NOW,
+      });
+    const issue = await seedIssue(s.repoId, 1);
+    await seedMembership(issue.id, project.id, a.id);
+    const send = router();
+
+    const res = await send(`/repos/${s.owner.username}/${s.repoId}/projects/${project.id}/issues/${issue.id}/move`, {
+      method: "POST",
+      headers: authHeaders(s.writer.id),
+      body: JSON.stringify({ column_id: b.id }),
+    });
+    expect(res.status).toBe(204);
+    const attached = await db().select().from(issueLabels).where(eq(issueLabels.issueId, issue.id)).all();
+    expect(attached.map((row) => row.labelId)).toEqual([label]);
+  });
+
+  it("the issue PATCH projects arm fires item_added and item_removed workflows", async () => {
+    const s = await seedRepoAndActors("wfpatch");
+    const project = await seedProject(s.repoId, s.owner.id);
+    await seedColumn(project.id, { title: "Backlog", isDefault: true });
+    const addedLabel = await db()
+      .insert(labels)
+      .values({ repoId: s.repoId, name: "on-board", color: "#00aabb", description: "" })
+      .returning({ id: labels.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+    const removedLabel = await db()
+      .insert(labels)
+      .values({ repoId: s.repoId, name: "off-board", color: "#00ccdd", description: "" })
+      .returning({ id: labels.id })
+      .all()
+      .then((rows) => rows[0]!.id);
+    await db().insert(projectWorkflows).values([
+      {
+        projectId: project.id,
+        event: "item_added_to_project",
+        filters: "{}",
+        actions: JSON.stringify({ add_label_ids: [addedLabel] }),
+        enabled: true,
+        createdAt: NOW,
+        updatedAt: NOW,
+      },
+      {
+        projectId: project.id,
+        event: "item_removed_from_project",
+        filters: "{}",
+        actions: JSON.stringify({ add_label_ids: [removedLabel] }),
+        enabled: true,
+        createdAt: NOW,
+        updatedAt: NOW,
+      },
+    ]);
+    const issue = await seedIssue(s.repoId, 1);
+
+    // The witness mount's shape: projects + issue routes on one app.
+    const app = new OpenAPIHono<ApiEnv>();
+    app.onError(giteaErrorHandler);
+    registerProjectsRepoRoutes(app, createTokenAuthMiddleware(resolver), createOptionalTokenAuthMiddleware(resolver));
+    registerIssueRoutes(app, createTokenAuthMiddleware(resolver), createOptionalTokenAuthMiddleware(resolver));
+    const send = async (path: string, init?: RequestInit): Promise<Response> =>
+      app.fetch(new Request(`https://example.com${path}`, init), env);
+
+    const patch = await send(`/repos/${s.owner.username}/${s.repoId}/issues/1`, {
+      method: "PATCH",
+      headers: authHeaders(s.writer.id),
+      body: JSON.stringify({ projects: [project.id] }),
+    });
+    expect(patch.status).toBe(201);
+    expect((await db().select().from(issueLabels).where(eq(issueLabels.issueId, issue.id)).all()).map((row) => row.labelId)).toEqual([addedLabel]);
+
+    const clear = await send(`/repos/${s.owner.username}/${s.repoId}/issues/1`, {
+      method: "PATCH",
+      headers: authHeaders(s.writer.id),
+      body: JSON.stringify({ projects: [] }),
+    });
+    expect(clear.status).toBe(201);
+    // The removed event's workflow ran even though the membership is gone
+    // (upstream notifies the removed ids the same way).
+    expect(
+      (await db().select().from(issueLabels).where(eq(issueLabels.issueId, issue.id)).all()).map((row) => row.labelId).sort((x, y) => x - y),
+    ).toEqual([addedLabel, removedLabel].sort((x, y) => x - y));
   });
 });

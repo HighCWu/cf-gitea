@@ -51,6 +51,7 @@ import {
 import { changeIssueTitle, issueNoDependenciesLeft, replaceIssueAssignees } from "../api/services/issues";
 import { labelExclusiveScope, removeDuplicateExclusiveLabels } from "../api/services/labels";
 import { findRepositoryById, type RepositoryWithOwner, type UserRow } from "../api/services/repository";
+import { notifyIssueChangeStatus } from "../services/projects-workflow";
 import {
   notifyIssueAssigneeChanged,
   notifyIssueComment,
@@ -182,6 +183,16 @@ export interface TransitionOptions {
   /** System comment type override — the merge path writes MergePull (§2.4). */
   commentType?: CommentTypeValue;
   now?: Date;
+  /**
+   * The project-workflow re-entrancy mark (upstream WithProjectWorkflow,
+   * models/issues/comment.go:261-266): the event of the workflow whose action
+   * performs this transition. Presence suppresses the transition's own
+   * workflow emission — a workflow-driven close must not re-trigger
+   * item_closed workflows. Merge closes skip the emission independently
+   * (their MergePull comment type — upstream's model-level close fires no
+   * IssueChangeStatus, services/pull/merge.go:838).
+   */
+  viaWorkflow?: string;
 }
 
 export interface AddCommentInput {
@@ -692,6 +703,28 @@ export class IssuesService {
       throw new IssueAlreadyChangedError();
     }
     await this.notifyMailIssueStatus(updated[0]!, close, options.actorId ?? null, now);
+    // The project-workflow arm (services/issue/status.go:43/:56 — the
+    // notify fires AFTER the tx commits, on the RELOADED issue): every real
+    // close/reopen seam funnels through here, so the human PATCH arms, the
+    // push-close (webhooks-push.ts) and a workflow's own state action all
+    // reach this point. The merge close stays silent — upstream's merge runs
+    // the model-level SetIssueAsClosed (merge.go:838, no IssueChangeStatus
+    // notify) and the merge's own notification emits pull_request_merged —
+    // keyed on its MergePull comment type. A workflow-driven transition
+    // carries viaWorkflow (the WithProjectWorkflow mark) and skips too.
+    if (options.viaWorkflow === undefined && commentType !== CommentType.MergePull) {
+      try {
+        await notifyIssueChangeStatus(this.d1, {
+          issue: updated[0]!,
+          doerId: options.actorId ?? 0,
+          isClosed: close,
+          now,
+          mailEnv: this.mailEnv,
+        });
+      } catch (error) {
+        console.error(`[issues] workflow notify failed (issue ${issueId}): ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     return updated[0]!;
   }
 
