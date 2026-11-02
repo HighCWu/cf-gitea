@@ -33,6 +33,7 @@ import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor } from "../auth/testing/seeds";
 import { users, protectedBranches, repositories, comments, issueDependencies, issueUsers, issues, notificationStates, PRStatus, pullAutoMerges, pullRequests, repoUnits } from "../db/schema";
 import { CommentType } from "../issues/comment-types";
+import { DependenciesLeftError } from "../issues/service";
 import { emptyRuleConfig, serializeRuleConfig } from "../services/branch-protection";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "./auth";
 import { ApiError, giteaErrorHandler } from "./errors";
@@ -367,6 +368,31 @@ describe("merge gating — conflict, WIP, schedule", () => {
     const issueId = joined.issue.id;
     const scheduledRowsOf = () => drizzle(env.DB).select().from(pullAutoMerges).where(eq(pullAutoMerges.issueId, issueId)).all();
 
+    // DETERMINISM BARRIER (the W16 wiki-settle precedent): the schedule arm's
+    // inline {kind:"auto-merge-check"} enqueue is CONSUMED by the real queue
+    // in this environment, and a green scheduled PR is EXACTLY what the
+    // consumer exists to merge — racing it from the test side is
+    // nondeterministic (observed: the consumer merged between the
+    // re-schedule and the direct merge). A required-status rule on the BASE
+    // branch (enableStatusCheck + a context with no statuses, SPEC-0013 §6)
+    // makes the consumer's IsPullCommitStatusPass answer pending on EVERY
+    // tick — "skipped-status-checks", the row deterministically STAYS (the
+    // schedule's whole point: wait for checks). The direct merge below then
+    // rides force_merge (upstream's DoForceMerge clears the status gate —
+    // merge.go:707-713; the deps check is never bypassed, check.go:219-223,
+    // and this PR carries no dependencies).
+    const statusRule = emptyRuleConfig();
+    statusRule.enableStatusCheck = true;
+    statusRule.statusCheckContexts = ["ci/lint"];
+    await drizzle(env.DB).insert(protectedBranches).values({
+      repoId: repoRow.id,
+      ruleName: "main",
+      priority: 0,
+      rules: serializeRuleConfig(statusRule),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
     // First schedule → the bare 201 Created, EMPTY body (pull.go:1004-1006's
     // ctx.Status(http.StatusCreated)).
     const first = await send(`${AMS_REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge", merge_when_checks_succeed: true }));
@@ -390,7 +416,9 @@ describe("merge gating — conflict, WIP, schedule", () => {
 
     // The direct merge does not conflict with the standing schedule — and
     // upstream's Merge success tail deletes the row (merge.go:827-837):
-    expect((await send(`${AMS_REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge", merge_title_field: "Scheduled then merged" }))).status).toBe(200);
+    // force_merge clears the standing required-status gate (DoForceMerge,
+    // merge.go:707-713) so the direct merge lands deterministically:
+    expect((await send(`${AMS_REPO}/pulls/${index}/merge`, jsonInit("POST", { do: "merge", merge_title_field: "Scheduled then merged", force_merge: true }))).status).toBe(200);
     expect(await scheduledRowsOf()).toHaveLength(0);
     expect((await jsonBody(await get(`${AMS_REPO}/pulls/${index}`))).merged).toBe(true);
   });
@@ -522,29 +550,40 @@ describe("the open-dependency merge gate (check.go:218-223)", () => {
     expect((refused as ApiError).message).toBe("You need to close all issues that are blocking this pull request before you can merge it.");
 
     // The Manually check type returns BEFORE the deps gate upstream — the
-    // mark lands on a verified ancestor despite the standing blocker, and
-    // the base refs stay untouched (MergedManually marks, never merges).
+    // ENGINE's pre-gate skips too, so the refusal fires at the LANDING's
+    // close: closeIssue's DependenciesLeftError propagates (the UF-1 catch
+    // narrow — the bare catch used to swallow it and mark the PR merged
+    // under an open issue), failing the whole mark exactly like upstream
+    // (SetIssueAsClosed runs inside MarkAsMerged's transaction,
+    // merge.go:838-843, so ErrDependenciesLeft aborts MergedManually — the
+    // web handler's default arm ServerErrors, the API falls to
+    // APIErrorInternal). The PR stays OPEN and the issue stays OPEN — a
+    // blocked close writes nothing (the gate sits before the close CAS).
     const mainTip = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: DEPS_SLUG }).listRefs()).get("refs/heads/main")?.target as string;
-    const { commitOid } = await mergePullRequest(captured, pair, found.issue, found.pullRequest, {
+    const marked = await mergePullRequest(captured, pair, found.issue, found.pullRequest, {
       style: "manually-merged",
       message: "",
       deleteBranchAfterMerge: false,
       mergeCommitId: mainTip,
       doerId: OWNER_ID,
       now: new Date(),
-    });
-    expect(commitOid).toBe(mainTip);
+    }).then(
+      (): "landed" => "landed",
+      (error: unknown): unknown => error,
+    );
+    expect(marked).toBeInstanceOf(DependenciesLeftError);
     const after = await findPullRequestByIndex(env.DB, repoRow.id, index);
-    // AS-BUILT (since U39's close gate, daeb15b): the mark lands (the Manually
-    // check type skips the deps arm, check.go:160-165) and the CLOSE then
-    // refuses with DependenciesLeftError — which mergePullRequest's landing
-    // catch tolerates, leaving the issue OPEN under the merged row. Upstream
-    // fails the whole mark here (SetIssueAsClosed runs inside MarkAsMerged's
-    // transaction, merge.go:838-843, so ErrDependenciesLeft aborts
-    // MergedManually) — the mark-and-close pair is a standing divergence to
-    // reconcile; this pin holds the landed shape until that arm is owned.
-    expect(after?.pullRequest.hasMerged).toBe(true);
+    expect(after?.pullRequest.hasMerged).toBe(false);
     expect(after?.issue.isClosed).toBe(false);
+    // The base refs stay untouched (MergedManually marks, never merges — and
+    // the failed mark landed no close comment either).
+    expect(refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: DEPS_SLUG }).listRefs()).get("refs/heads/main")?.target).toBe(mainTip);
+    const closeComments = await drizzle(env.DB)
+      .select({ id: comments.id })
+      .from(comments)
+      .where(and(eq(comments.issueId, found.issue.id), eq(comments.type, CommentType.MergePull)))
+      .all();
+    expect(closeComments).toHaveLength(0);
   });
 });
 
@@ -1017,11 +1056,13 @@ describe("POST …/merge — the squash default body on the ABSENT merge_message
     // static token identity carries STUB_USER's email while the seeded D1
     // poster row has none, so collectSquashMergeCommitCoAuthors' poster-sig
     // exclusion misses (the exclusion itself is pinned with real rows in
-    // pull-merge-box.test.tsx). Oldest-first: the doer line, then Landr's.
+    // pull-merge-box.test.tsx). The trailer lines run in upstream's rev-list
+    // order — newest commit's author first: Landr's walk tip, then the
+    // doer's.
     expect(main?.message).toBe(
       `Arm squash default (#${index})\n\n` +
         "* u31a: u31-a.txt\n\n* landr: c\n\n---------\n\n" +
-        "Co-authored-by: apisuite <stub@cf-gitea.invalid>\nCo-authored-by: Landr <landr@u31.invalid>\n" +
+        "Co-authored-by: Landr <landr@u31.invalid>\nCo-authored-by: apisuite <stub@cf-gitea.invalid>\n" +
         `Reviewed-on: ${ORIGIN}/${OWNER}/${SQ_SLUG}/pulls/${index}\n`,
     );
   });

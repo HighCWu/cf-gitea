@@ -29,6 +29,7 @@ import {
   type ContentsResponse,
 } from "../models/contents";
 import { assertNotArchived, requireVisibleRepo } from "../services/repo-access";
+import { gitSigOf } from "../../ui/pages/pull-merge-box";
 
 /**
  * Tier-1 contents routes (SPEC-0004 §2.4 rows repoGetContentsList /
@@ -253,14 +254,27 @@ async function contentsPayload(
 // FileResponse-family payload + status for c.json.
 // ---------------------------------------------------------------------------
 
+/**
+ * The file-change commit's default author/committer identity — upstream's
+ * `makeGitUserSignature` doer arm (services/repository/files/temp_repo.go:
+ * 236-250): `doer.GitName()` (the display name with the username fallback)
+ * and `doer.GetEmail()`. The derivation is the NewGitSig port (the
+ * `gitSigOf` seam, ui/pages/pull-merge-box.tsx) so the stamped author
+ * signature EQUALS the squash co-author exclusion's poster signature —
+ * upstream compares `commit.Author.String()` against
+ * `Poster.NewGitSig().String()` (services/pull/pull.go:798) with both ends
+ * NewGitSig-derived, and a displayName-differing doer must not see their own
+ * commits listed as co-authors (the UF-2 derivation gap). GetEmail's
+ * keep-private placeholder arm has no landed reader (the gitSigString
+ * posture): the projection's email verbatim, "" when absent.
+ */
 function doerIdentity(c: Context<ApiEnv>): { name: string; email: string } {
   const doer = c.get("authUser");
   const hostname = new URL(c.req.url).hostname;
   if (doer === undefined) {
     return { name: "Gitea", email: `gitea@noreply.${hostname}` };
   }
-  const email = doer.email === undefined || doer.email === "" ? `${doer.login ?? "gitea"}@noreply.${hostname}` : doer.email;
-  return { name: doer.login ?? "gitea", email };
+  return gitSigOf({ displayName: doer.full_name ?? null, username: doer.login ?? "gitea", email: doer.email ?? null });
 }
 
 /** The unverified verification block every file-change response carries. */

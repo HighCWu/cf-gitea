@@ -20,6 +20,7 @@ import type { MergeabilityStatus, MergeStyle, Person, RebaseOutcome } from "@cf-
 import { PRFlow, PRStatus, comments, issues, pullAutoMerges, pullRequests, users } from "../../db/schema";
 import type { IssueRow, PullRequestRow } from "../../issues/service";
 import { CommentType } from "../../issues/comment-types";
+import { IssueAlreadyChangedError } from "../../issues/errors";
 import { IssuesService } from "../../issues/service";
 // Cycle disclosure: ./issues imports pullRequestDiffShortStatForEnv from THIS
 // module; both directions use the import inside function bodies only (live
@@ -52,7 +53,7 @@ import { loadRepoSettings } from "./repo-settings";
 // merge entry points back, so the edge is a lazy cycle (function-body bindings
 // only, resolved at call time — the same shape upload-staging→repo-editor-tails
 // established, with the back-edge noted in both doc comments).
-import { commitMessageMerge, defaultMergeBodyOf, reviewedByLines, squashMergeCommitMessages } from "../../ui/pages/pull-merge-box";
+import { commitMessageMerge, getDefaultMergeMessageParts, squashMergeCommitMessages } from "../../ui/pages/pull-merge-box";
 import { canWriteRepository } from "./repo-access";
 
 /** `PullRequestStatus` mapping (§2.4; unrelated has no upstream row → Empty). */
@@ -352,8 +353,15 @@ export interface MergePullOptions {
 /**
  * The API merge message (findings F2 — the empty merge commit). Port of the
  * API handler's composition (gitea/routers/api/v1/repo/pull.go:963-986) over
- * GetDefaultMergeMessage (services/pull/merge.go:112-148): a trimmed
- * `merge_title_field` wins; empty/absent falls to the style's default —
+ * GetDefaultMergeMessage: a trimmed `merge_title_field` wins; empty/absent
+ * falls to the style's default — getDefaultMergeMessageParts
+ * (ui/pages/pull-merge-box.tsx, the api→page seam) resolves the
+ * `.gitea/default_merge_message/*.md` template FIRST (merge.go:116-122 →
+ * resolveMergeMessageTemplate :150-166: `{STYLE}_TEMPLATE.md` off the base
+ * repo's default-branch tip, `DEFAULT_TEMPLATE.md` the fallback; a found
+ * template's first line IS the title and its trimmed remainder the body,
+ * both shell-like expanded over the vars map with ClosingIssues —
+ * merge.go:88-114/:168-175), else the template-less defaults —
  *   rebase                          → "" (the fast-forward rebase amends nothing)
  *   squash                          → `{title} (#{index})`
  *   merge/rebase-merge/fast-forward-only →
@@ -367,21 +375,18 @@ export interface MergePullOptions {
  * present-even-empty JSON value sets HasMergeMessageField and SKIPS the arm;
  * a present-empty field stores the title only) — and style `squash` composes
  * `CommitMessageMerge(GetSquashMergeCommitMessages(pr), defaultBody)` where
- * defaultBody is GetDefaultMergeMessage's `Reviewed-on`/`Reviewed-by` block
- * (merge.go:163-165). The composition reuses the merge box's exported
- * builders (ui/pages/pull-merge-box.tsx — the api→page seam, the
+ * defaultBody is GetDefaultMergeMessage's body (the template's expanded
+ * remainder, or the `Reviewed-on`/`Reviewed-by` block, merge.go:163-165).
+ * The composition reuses the merge box's exported builders — the
  * upload-staging→repo-editor-tails precedent; the back-edge is lazy
- * call-time bindings). A non-empty trimmed `merge_message_field` appends as
+ * call-time bindings. A non-empty trimmed `merge_message_field` appends as
  * `\n\n{field}`. The web merge-box path passes a plain string (its form
  * always carries the field, upstream web pull.go:1116-1129 has NO default-
- * body arm) — the arm is API-only, exactly upstream. The
- * `.gitea/default_merge_message/*.md` template resolution upstream runs
- * first (merge.go:116-122) is NOT modeled — the template-less default is the
- * only path (documented SPEC-0005 divergence). Read failures degrade to the
- * empty-strings shape (the box loader's disclosed err-arm posture) instead
- * of upstream's APIErrorInternal 500 — a prefilled-body read never fails the
- * merge. manually-merged callers skip composition entirely (upstream
- * returns at pull.go:945-951 before it).
+ * body arm) — the arm is API-only, exactly upstream. Template/read failures
+ * degrade to the template-less shape (the box loader's disclosed err-arm
+ * posture) instead of upstream's APIErrorInternal 500 — a prefilled-body
+ * read never fails the merge. manually-merged callers skip composition
+ * entirely (upstream returns at pull.go:945-951 before it).
  */
 export async function composeMergeMessage(
   c: Context<ApiEnv>,
@@ -390,33 +395,23 @@ export async function composeMergeMessage(
   pr: PullRequestRow,
   input: { style: MergePullOptions["style"]; mergeTitleField: string; mergeMessageField: string | undefined },
 ): Promise<string> {
-  let defaultTitle: string;
-  if (input.style === "rebase") {
-    // fast-forward rebase: upstream returns ("", "") — no amend, no message.
-    defaultTitle = "";
-  } else if (input.style === "squash") {
-    defaultTitle = `${issue.title} (#${pr.index})`;
-  } else if (pr.headRepoId === pair.repo.id) {
-    defaultTitle = `Merge pull request '${issue.title}' (#${pr.index}) from ${pr.headBranch} into ${pr.baseBranch}`;
-  } else {
-    const head = await findRepositoryById(c.env.DB, pr.headRepoId);
-    const from = head === null ? `<deleted>:${pr.headBranch}` : `${head.repo.ownerNamespace}/${head.repo.slug}:${pr.headBranch}`;
-    defaultTitle = `Merge pull request '${issue.title}' (#${pr.index}) from ${from} into ${pr.baseBranch}`;
-  }
+  const reads = engineReads(c.env, pair.repo);
+  const parts = await getDefaultMergeMessageParts(
+    c.env.DB,
+    { repo: pair.repo, issue, pr, reads, origin: new URL(c.req.url).origin },
+    input.style,
+  );
   const title = input.mergeTitleField.trim();
-  let message = title === "" ? defaultTitle : title;
+  let message = title === "" ? parts.title : title;
   let field = input.mergeMessageField;
   if (field === undefined && input.style === "squash") {
     // useDefaultSquashBody (pull.go:966-983): the absent field composes the
-    // squash default — the commit-message walk + the Reviewed-on block
-    // joined through git.CommitMessageMerge, then trimmed and appended with
-    // the title below.
-    const origin = new URL(c.req.url).origin;
-    const issueLink = `/${pair.repo.ownerNamespace}/${pair.repo.slug}/pulls/${pr.index}`;
-    const reviewedBody = defaultMergeBodyOf(`${origin}${issueLink}`, await reviewedByLines(c.env.DB, issue.id));
+    // squash default — the commit-message walk + GetDefaultMergeMessage's
+    // body joined through git.CommitMessageMerge, then trimmed and appended
+    // with the title below.
     const prUnit = (await loadRepoSettings(c.env.DB, pair.repo.id)).prUnit;
-    const squashMessages = await squashMergeCommitMessages(c.env.DB, { issue, pr, reads: engineReads(c.env, pair.repo) }, prUnit.DefaultSquashMergeMessage);
-    field = commitMessageMerge(squashMessages, reviewedBody);
+    const squashMessages = await squashMergeCommitMessages(c.env.DB, { issue, pr, reads }, prUnit.DefaultSquashMergeMessage);
+    field = commitMessageMerge(squashMessages, parts.body);
   }
   const body = (field ?? "").trim();
   if (body !== "") {
@@ -639,8 +634,28 @@ export async function mergePullRequest(
   let mergedIssue = issue;
   try {
     mergedIssue = await service.closeIssue(issue.id, { actorId: opts.doerId, commentType: CommentType.MergePull, now: opts.now });
-  } catch {
-    // already closed (upstream tolerates the closed state on merge)
+  } catch (error) {
+    // Upstream's SetIssueAsClosed sits INSIDE MarkAsMerged's transaction
+    // (merge.go:838-843 — every failure wraps as `ChangeIssueStatus: %w` and
+    // fails the WHOLE mark: the PR row update at :845-853 never runs). The one
+    // tolerated case is the already-closed race — a concurrent close between
+    // the caller's issue load and this close loses closeIssue's CAS
+    // (`WHERE is_closed = 0`) and answers IssueAlreadyChangedError; the mark
+    // proceeds (the merged-PR tolerance this landing documented). EVERYTHING
+    // else propagates — DependenciesLeftError first (issue_update.go:62-72's
+    // open-dependency arm, our 412 gate): reachable here through the
+    // manually-merged style (CheckPullMergeable skips the deps arm for it,
+    // check.go:161-165, so the engine's pre-gate above never fired) and
+    // through a dependency added between the pre-gate and this close. A
+    // blocked close writes nothing (the gate sits before the CAS batch) and
+    // the PR update below never runs — the mark lands NOTHING, exactly
+    // upstream: web pull.go MergedManually's default arm ServerErrors and the
+    // API handler falls to APIErrorInternal.
+    if (error instanceof IssueAlreadyChangedError) {
+      // already closed (upstream tolerates the closed state on merge)
+    } else {
+      throw error;
+    }
   }
   const merged = await drizzle(c.env.DB)
     .update(pullRequests)
