@@ -497,20 +497,34 @@ describe("pinned issues/pulls (issue-t2)", () => {
 });
 
 describe("issue deadline (issue-t2)", () => {
-  it("sets, updates and clears the deadline with 201 bodies; 400 on a bad date; 403 for non-writers", async () => {
+  it("applies ApplyAPIDeadlineTimestamp (end-of-day store, absent no-op, null/'' clear, epoch body) with 201 IssueDeadline bodies; 400 on a bad date; 403 for non-writers", async () => {
+    // RFC3339 input — the parsed wall day lands at its 23:59:59 end.
     const set = await issueT2Send(
       `/repos/cf-gitea-stub/extras/issues/${issueA.index}/deadline`,
       jsonAuthed({ due_date: "2026-03-01T00:00:00Z" }, "POST"),
     );
     expect(set.status).toBe(201);
-    expect(((await set.json<Record<string, unknown>>())).due_date).toBe("2026-03-01T00:00:00.000Z");
+    expect(((await set.json<Record<string, unknown>>())).due_date).toBe("2026-03-01T23:59:59.000Z");
 
     const row = await drizzle(env.DB).select().from(issues).where(eq(issues.id, issueA.id)).limit(1).then((rows) => rows[0]);
-    expect(row?.deadlineAt?.toISOString()).toBe("2026-03-01T00:00:00.000Z");
+    expect(row?.deadlineAt?.toISOString()).toBe("2026-03-01T23:59:59.000Z");
 
+    // The ABSENT key is the no-op (deadline.go:37-38) — the deadline and the
+    // comment count stay put, the 201 body echoes the current deadline.
+    const noop = await issueT2Send(`/repos/cf-gitea-stub/extras/issues/${issueA.index}/deadline`, jsonAuthed({}, "POST"));
+    expect(noop.status).toBe(201);
+    expect(((await noop.json<Record<string, unknown>>())).due_date).toBe("2026-03-01T23:59:59.000Z");
+
+    // A PRESENT null removes; the IssueDeadline body renders the zero
+    // TimeStamp's Unix epoch (issue.go:972 — AsTimePtr never nulls).
     const cleared = await issueT2Send(`/repos/cf-gitea-stub/extras/issues/${issueA.index}/deadline`, jsonAuthed({ due_date: null }, "POST"));
     expect(cleared.status).toBe(201);
-    expect(((await cleared.json<Record<string, unknown>>())).due_date).toBeNull();
+    expect(((await cleared.json<Record<string, unknown>>())).due_date).toBe("1970-01-01T00:00:00.000Z");
+
+    // A sub-2-day value clears too ("tolerate timezone difference").
+    const tiny = await issueT2Send(`/repos/cf-gitea-stub/extras/issues/${issueA.index}/deadline`, jsonAuthed({ due_date: "1970-01-01" }, "POST"));
+    expect(tiny.status).toBe(201);
+    expect(((await tiny.json<Record<string, unknown>>())).due_date).toBe("1970-01-01T00:00:00.000Z");
 
     expect(
       (await issueT2Send(`/repos/cf-gitea-stub/extras/issues/${issueA.index}/deadline`, jsonAuthed({ due_date: "not-a-date" }, "POST"))).status,

@@ -34,12 +34,13 @@ import {
   unlockIssue,
   usersById,
 } from "../services/issue-extras";
-import { commentSchema, issueListSchema, issueSchema } from "../models/issue";
+import { commentSchema, issueListSchema } from "../models/issue";
 import { pullRequestListSchema } from "../models/pull";
 import { userListSchema } from "../models/user";
 import { watchInfoSchema } from "../models/watch";
 import type { WatchInfo } from "../models/watch";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
+import { parseMilestoneDeadline } from "../services/milestones";
 import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "../services/blocks";
 import {
   assertIssueRowUnit,
@@ -86,7 +87,8 @@ import { toApiUser } from "../services/user";
  *   - subscription PUT/DELETE for a non-self target without admin → 403
  *     (upstream's own undeclared arm);
  *   - deadline POST with an unparseable due_date → 400 (the
- *     ApplyAPIDeadlineTimestamp quirk routes/issues.ts documents).
+ *     ApplyAPIDeadlineTimestamp quirk, implemented via the shared
+ *     parseMilestoneDeadline — services/milestones.ts).
  *
  * Divergences: reaction permission collapses CanSelfChangeOrAccessContent to
  * "signed-in + visible" (any reader may react); the CREATE arms run upstream's
@@ -152,6 +154,14 @@ const editDeadlineOptionSchema = z.object({
     .nullable()
     .optional()
     .openapi({ format: "date-time", description: "The updated due date; null or empty removes the deadline" }),
+});
+
+/** api.IssueDeadline — the deadline route's 201 body (issue.go:972), the
+ *  single `due_date` field. Upstream renders `issue.DeadlineUnix.AsTimePtr()`
+ *  AFTER the update, so the cleared form carries the zero TimeStamp's Unix
+ *  epoch — a string, never null. */
+const issueDeadlineSchema = z.object({
+  due_date: z.string().openapi({ format: "date-time", description: "the deadline" }),
 });
 
 const lockIssueOptionSchema = z.object({
@@ -435,7 +445,7 @@ const editDeadlineRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
       body: { required: false, content: { "application/json": { schema: editDeadlineOptionSchema } } },
     },
     responses: {
-      201: { description: "Issue", content: { "application/json": { schema: issueSchema } } },
+      201: { description: "IssueDeadline", content: { "application/json": { schema: issueDeadlineSchema } } },
       403: forbiddenResponse,
       404: notFoundResponse,
     },
@@ -840,11 +850,15 @@ export function registerIssueT2Routes(
 
   // -------------------------------------------------------------------------
   // Deadline (UpdateIssueDeadline): writer-only 403 "Not repo writer"; the
-  // null/absent due_date clears; the change rides changeIssueDeadline's
-  // system-comment batch; the re-read serves the 201 body.
+  // body rides ApplyAPIDeadlineTimestamp's exact semantics (a PRESENT
+  // null/"" due_date clears, an ABSENT due_date is the 201 no-op, parses
+  // the 3 accepted formats to end-of-day, sub-2-day values clear) via the
+  // shared parseMilestoneDeadline; a changed value rides
+  // changeIssueDeadline's system-comment batch; the 201 body is the
+  // IssueDeadline shape (issue.go:972).
   // -------------------------------------------------------------------------
   app.openapi(editDeadlineRoute(requireAuth), async (c) => {
-    const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
     // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674 +
     // api.go:720-746) at upstream's chain position — unit-less repos 404
     // before any handler logic (services/issue-unit-gates.ts).
@@ -854,24 +868,30 @@ export function registerIssueT2Routes(
       throw new ApiError(403, "Not repo writer");
     }
     const form = c.req.valid("json");
+    // ApplyAPIDeadlineTimestamp (routers/common/deadline.go:27-56): the
+    // tri-state input — JSON `undefined` is the absent key (`!input.Has()` →
+    // unchanged), null/"" is the remove arm, anything present parses (the
+    // 400 `invalid date format` on a bad value, sub-2-day values → no
+    // deadline, else that day's 23:59:59).
+    const previous = issue.deadlineAt ?? null;
     let deadline: Date | null;
-    if (form.due_date === null || form.due_date === undefined || form.due_date === "") {
+    if (form.due_date === undefined) {
+      deadline = previous;
+    } else if (form.due_date === null || form.due_date === "") {
       deadline = null;
     } else {
-      const parsed = new Date(form.due_date);
-      if (Number.isNaN(parsed.getTime())) {
-        // Upstream ApplyAPIDeadlineTimestamp: "invalid date format: X" — the
-        // undeclared 400 (routes/issues.ts documents the same quirk).
-        throw new ApiError(400, `invalid date format: ${form.due_date}`);
-      }
-      deadline = parsed;
+      deadline = parseMilestoneDeadline(form.due_date);
     }
-    const previous = issue.deadlineAt ?? null;
-    if (deadline?.getTime() !== previous?.getTime()) {
+    const changed = (deadline?.getTime() ?? null) !== (previous?.getTime() ?? null);
+    if (changed) {
       await changeIssueDeadline(c.env.DB, issue, deadline, previous, requireDoerId(c), new Date());
     }
-    const updated = await findIssueByRepoAndIndex(c.env.DB, found.repo.id, issue.index);
-    return c.json(await toApiIssue(c.env.DB, viewer, found, updated ?? issue), 201);
+    // The 201 body mirrors ctx.JSON(201, api.IssueDeadline{...}) reading the
+    // POST-update DeadlineUnix — the applied value, or the untouched one on
+    // the no-op. AsTimePtr never nils, so the cleared form renders the zero
+    // TimeStamp's Unix epoch, not null.
+    const applied = changed ? deadline : previous;
+    return c.json({ due_date: (applied ?? new Date(0)).toISOString() }, 201);
   });
 
   // -------------------------------------------------------------------------

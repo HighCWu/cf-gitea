@@ -477,13 +477,27 @@ describe("milestones (§3.2 basics)", () => {
     expect((await repoRow(repoId)).numClosedMilestones).toBe(0);
   });
 
-  it("rejects a milestone from another repo at issue creation", async () => {
+  it("silently drops a milestone from another repo at issue creation (issue_update.go:365-377)", async () => {
+    // NewIssueWithIndex: a milestone the repo doesn't own is "assumed invalid
+    // and dropped silently" — the creation SUCCEEDS with milestone_id 0 (no
+    // counter move, no Milestone comment), it never errors.
     const repoA = await seedRepo();
     const repoB = await seedRepo();
     const ms = await service().createMilestone({ repoId: repoA, name: "foreign" });
-    await expect(service().createIssue({ repoId: repoB, title: "x", milestoneId: ms.id })).rejects.toThrow(
-      /milestone does not exist/,
-    );
+    const issue = await service().createIssue({ repoId: repoB, title: "x", milestoneId: ms.id });
+    expect(issue.milestoneId).toBeNull();
+
+    // The foreign milestone held nothing; no Milestone (8) comment either.
+    const truth = await service().getMilestone(ms.id);
+    expect(truth?.numIssues).toBe(0);
+    const types = (await db().select().from(comments).where(eq(comments.issueId, issue.id)).all()).map((r) => r.type);
+    expect(types).toEqual([]);
+  });
+
+  it("silently drops an unknown milestone id at issue creation (issue_update.go:365-377)", async () => {
+    const repoB = await seedRepo();
+    const issue = await service().createIssue({ repoId: repoB, title: "x", milestoneId: 999 });
+    expect(issue.milestoneId).toBeNull();
   });
 
   // M3 (⑩-review P3): upstream UpdateMilestone → UpdateMilestoneCounters
@@ -577,6 +591,24 @@ describe("labels (§3.2 counters)", () => {
     const foreign = await seedLabel(repoA, "foreign");
     const issue = await service().createIssue({ repoId: repoB, title: "x" });
     await expect(service().setLabel(issue.id, foreign)).rejects.toThrow(/label does not exist/);
+  });
+
+  it("silently drops unknown and foreign label ids at issue creation (issue_update.go:425-428)", async () => {
+    // NewIssueWithIndex's label loop: ids that resolve to nothing, or to
+    // rows of another repo/org, are skipped — the creation succeeds with the
+    // remaining (here: only the repo's own) label attached.
+    const repoA = await seedRepo();
+    const repoB = await seedRepo();
+    const foreign = await seedLabel(repoA, "foreign");
+    const own = await seedLabel(repoB, "own");
+    const issue = await service().createIssue({ repoId: repoB, title: "x", labelIds: [own, foreign, 999] });
+
+    const linked = (await db().select().from(issueLabels).where(eq(issueLabels.issueId, issue.id)).all()).map((r) => r.labelId);
+    expect(linked).toEqual([own]);
+    const foreignRow = await db().select().from(labels).where(eq(labels.id, foreign)).get();
+    expect(foreignRow?.numIssues).toBe(0);
+    const ownRow = await db().select().from(labels).where(eq(labels.id, own)).get();
+    expect(ownRow?.numIssues).toBe(1);
   });
 });
 

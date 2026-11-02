@@ -432,14 +432,7 @@ export class IssuesService {
   ): Promise<{ statements: BatchStatements; resultIndex: { issueInsert: number } }> {
     const now = input.now ?? new Date();
     const title = ellipsisDisplayString(input.title, MAX_TITLE_DISPLAY_WIDTH);
-    const labelIds = [...new Set(input.labelIds ?? [])];
-
-    if (input.milestoneId != null) {
-      await this.validateMilestone(input.milestoneId, input.repoId);
-    }
-    if (labelIds.length > 0) {
-      await this.validateLabels(labelIds, input.repoId, input.ownerOrgId ?? null);
-    }
+    const { milestoneId, labelIds } = await this.resolveCreationRefs(input);
     // The NewIssueUsers enumeration reads the pre-create assignee state —
     // the same pre-tx read upstream's in-tx call performs (nothing in the
     // create writes the collaborator/team tables), so resolving it here and
@@ -468,7 +461,7 @@ export class IssuesService {
           content: input.content ?? null,
           isPull: options.isPull,
           ref: input.ref ?? "",
-          milestoneId: input.milestoneId ?? null,
+          milestoneId,
           createdAt: now,
           updatedAt: now,
         })
@@ -481,7 +474,7 @@ export class IssuesService {
     ];
     const resultIndex = { issueInsert: 2 };
 
-    if (input.milestoneId != null) {
+    if (milestoneId != null) {
       // Milestone/label counters count PRs too (upstream updateIssueNumbers).
       statements.push(
         this.db
@@ -490,7 +483,7 @@ export class IssuesService {
             numIssues: sql`num_issues + 1`,
             completeness: sql`CASE WHEN num_issues + 1 > 0 THEN num_closed_issues * 100 / (num_issues + 1) ELSE 0 END`,
           })
-          .where(eq(milestones.id, input.milestoneId)),
+          .where(eq(milestones.id, milestoneId)),
       );
     }
     for (const labelId of labelIds) {
@@ -541,11 +534,38 @@ export class IssuesService {
     return sql`(SELECT id FROM issues WHERE repo_id = ${repoId} AND "index" = ${indexSub})`;
   }
 
-  private async validateMilestone(milestoneId: number, repoId: string): Promise<void> {
-    const milestone = await this.getMilestone(milestoneId);
-    if (milestone === null || milestone.repoId !== repoId) {
-      throw new MilestoneNotExistError({ id: milestoneId, repoId });
+  /**
+   * The create-time reference resolution — NewIssueWithIndex's model-layer
+   * drops (issue_update.go:365-377 + :425-428), NOT validation: a milestone
+   * the repo doesn't own ("Assume milestone is invalid and drop silently")
+   * and label ids absent from the store or not applying to the repo/org
+   * ("Silently drop invalid labels") fall out of the creation instead of
+   * failing it — the issue/PR still creates with the references unset, the
+   * counters moving only for what actually attached. The pulls create route
+   * pre-resolves the milestone itself (pull.go:477-484's bare 404), so this
+   * drop is the probe→batch race backstop there — the same model-layer
+   * posture upstream's race window has. (The PATCH arms keep their
+   * resolving-and-erroring behavior.)
+   */
+  private async resolveCreationRefs(input: CreateIssueInput): Promise<{ milestoneId: number | null; labelIds: number[] }> {
+    let milestoneId = input.milestoneId ?? null;
+    if (milestoneId !== null) {
+      const milestone = await this.getMilestone(milestoneId);
+      if (milestone === null || milestone.repoId !== input.repoId) {
+        milestoneId = null;
+      }
     }
+    const requested = [...new Set(input.labelIds ?? [])];
+    let labelIds = requested;
+    if (requested.length > 0) {
+      const found = await this.db.select().from(labels).where(inArray(labels.id, requested)).all();
+      const byId = new Map(found.map((label) => [label.id, label]));
+      labelIds = requested.filter((id) => {
+        const label = byId.get(id);
+        return label !== undefined && labelAppliesToRepo(label, input.repoId, input.ownerOrgId ?? null);
+      });
+    }
+    return { milestoneId, labelIds };
   }
 
   private async validateLabels(labelIds: number[], repoId: string, ownerOrgId: number | null): Promise<void> {

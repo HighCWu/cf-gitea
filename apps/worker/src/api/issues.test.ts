@@ -580,11 +580,9 @@ describe("POST /repos/{owner}/{repo}/issues (issueCreateIssue)", () => {
     expect(await db().select().from(webhookDeliveries).all()).toHaveLength(1);
   });
 
-  it("422s a missing title (bind) and 404s unknown milestone/label ids", async () => {
+  it("422s a missing title (bind) and SILENTLY DROPS unknown milestone/label ids on create (issue_update.go:365-377/:425-428)", async () => {
     const owner = await seedUser("Alice");
-    // The 404 arms ride the WRITER path — a non-writer's milestone/label ids
-    // are dropped before NewIssue validates them (issue.go:619-621).
-    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
+    await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
 
     const noTitle = await router()("/repos/Alice/visible/issues", {
       method: "POST",
@@ -594,27 +592,22 @@ describe("POST /repos/{owner}/{repo}/issues (issueCreateIssue)", () => {
     expect(noTitle.status).toBe(422);
     expect((await noTitle.json<{ message: string }>()).message).toBe("invalid request body");
 
-    const badMilestone = await router()("/repos/Alice/visible/issues", {
+    // NewIssueWithIndex drops unresolvable references at the model layer —
+    // the WRITER's unknown milestone id and label ids no longer 404; the
+    // issue still creates (201) with milestone null and no labels attached.
+    const badRefs = await router()("/repos/Alice/visible/issues", {
       method: "POST",
       headers: authHeaders,
-      body: JSON.stringify({ title: "x", milestone: 99 }),
+      body: JSON.stringify({ title: "x", milestone: 99, labels: [77] }),
     });
-    expect(badMilestone.status).toBe(404);
-    expect(await badMilestone.json()).toEqual({
-      message: `milestone does not exist [id: 99, repo_id: ${repoId}]`,
-      url: ERROR_URL,
-    });
-
-    const badLabel = await router()("/repos/Alice/visible/issues", {
-      method: "POST",
-      headers: authHeaders,
-      body: JSON.stringify({ title: "x", labels: [77] }),
-    });
-    expect(badLabel.status).toBe(404);
-    expect(await badLabel.json()).toEqual({
-      message: `label does not exist [label_id: 77, repo_id: ${repoId}]`,
-      url: ERROR_URL,
-    });
+    expect(badRefs.status).toBe(201);
+    const body = await badRefs.json<{ id: number; milestone: { id: number } | null; labels: Array<{ id: number }> }>();
+    expect(body.milestone).toBeNull();
+    expect(body.labels).toEqual([]);
+    const types = (await db().select().from(comments).where(eq(comments.issueId, body.id)).all()).map((r) => r.type);
+    expect(types).toEqual([]);
+    expect(await db().select().from(milestones).all()).toHaveLength(0);
+    expect(await db().select().from(labels).all()).toHaveLength(0);
   });
 
   it("requires a token, a visible repo, and an unarchived repo", async () => {
@@ -1245,15 +1238,19 @@ describe("PATCH /repos/{owner}/{repo}/issues/{index} (issueEditIssue)", () => {
     const types = (await db().select().from(comments).where(eq(comments.issueId, issue.id)).all()).map((r) => r.type);
     expect(types).toEqual([CommentType.Milestone]);
 
+    // The writer's resolution miss rides upstream's APIErrorInternal arm
+    // (issue.go:793-798) — the runtime 500 carrying the exact
+    // ErrMilestoneNotExist text, not a mapped 404.
     const unknown = await router()("/repos/alice/visible/issues/1", {
       method: "PATCH",
       headers: authHeaders,
       body: JSON.stringify({ milestone: 42 }),
     });
-    expect(unknown.status).toBe(404);
+    expect(unknown.status).toBe(500);
+    expect((await unknown.json<{ message: string }>()).message).toBe(`milestone does not exist [id: 42, repo_id: ${repoId}]`);
   });
 
-  it("sets and unsets the due date", async () => {
+  it("sets and unsets the due date (ApplyAPIDeadlineTimestamp's tri-state input)", async () => {
     const owner = await seedUser("Alice");
     const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
     await seedIssue(repoId, "deadline", { posterId: 1 });
@@ -1265,6 +1262,42 @@ describe("PATCH /repos/{owner}/{repo}/issues/{index} (issueEditIssue)", () => {
     });
     expect(set.status).toBe(201);
     expect((await set.json<{ due_date: string | null }>()).due_date).toBe("2031-03-04T23:59:59.000Z");
+
+    // The ABSENT key is the no-op (`!input.Has()` — deadline.go:37-38): the
+    // set deadline survives, no deadline system comment appended.
+    const noop = await router()("/repos/alice/visible/issues/1", {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({}),
+    });
+    expect(noop.status).toBe(201);
+    expect((await noop.json<{ due_date: string | null }>()).due_date).toBe("2031-03-04T23:59:59.000Z");
+
+    // A PRESENT-but-empty due_date (JSON null or "") is the remove arm
+    // (deadline.go:29-32), not a no-op.
+    const nulled = await router()("/repos/alice/visible/issues/1", {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ due_date: null }),
+    });
+    expect(nulled.status).toBe(201);
+    expect((await nulled.json<{ due_date: string | null }>()).due_date).toBeNull();
+
+    const reset = await router()("/repos/alice/visible/issues/1", {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ due_date: "2031-03-04 10:20:30" }),
+    });
+    expect(reset.status).toBe(201);
+    expect((await reset.json<{ due_date: string | null }>()).due_date).toBe("2031-03-04T23:59:59.000Z");
+
+    const emptied = await router()("/repos/alice/visible/issues/1", {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ due_date: "" }),
+    });
+    expect(emptied.status).toBe(201);
+    expect((await emptied.json<{ due_date: string | null }>()).due_date).toBeNull();
 
     const unset = await router()("/repos/alice/visible/issues/1", {
       method: "PATCH",

@@ -7,7 +7,7 @@ import { z } from "zod";
 
 import { issues, pullRequests } from "../../db/schema";
 import { CommentType } from "../../issues/comment-types";
-import { IssueError, IssueNotExistError, MilestoneNotExistError } from "../../issues/errors";
+import { IssueError, IssueNotExistError } from "../../issues/errors";
 import { DependenciesLeftError, IssuesService, type IssueRow, type PullRequestRow } from "../../issues/service";
 import type { HookEventType } from "../../issues/webhooks";
 import { emitIssueEvent, issueEventIdentity, issueEventPayload, type IssueEventIdentity } from "../../services/issue-events";
@@ -1571,23 +1571,30 @@ export function registerIssueRoutes(
       issue = { ...issue, ref };
     }
 
-    // Deadline: unset_due_date removes; due_date sets. WRITER-gated upstream
-    // (issue.go:760) — the arm (including the due_date format validation) is
-    // skipped entirely for a non-writer, so their bad formats stay unparsed
-    // and the request answers 201 with the deadline untouched.
+    // Deadline (issue.go:760 editIssueDeadline → ApplyAPIDeadlineTimestamp,
+    // routers/common/deadline.go:27-56): `unset_due_date` removes first (the
+    // remove flag wins over any due_date); a PRESENT-but-empty due_date (JSON
+    // null or "") removes; an ABSENT due_date is the no-op (`!input.Has()` →
+    // unchanged); a present value parses (400 on the bad format, a sub-2-day
+    // value clears, else end-of-day). WRITER-gated upstream (:760) — the arm
+    // (including the format validation) skips entirely for a non-writer, so
+    // their bad formats stay unparsed and the request answers 201 with the
+    // deadline untouched. The write fires only on an actual change
+    // (UpdateIssueDeadline's own no-op guard, issue_update.go:532-535).
     if (canWrite) {
-      if (patchField(form.unset_due_date) === true && issue.deadlineAt !== null) {
-        await changeIssueDeadline(c.env.DB, issue, null, issue.deadlineAt, actorId, now);
-        issue = { ...issue, deadlineAt: null };
+      const removeDeadline = patchField(form.unset_due_date) === true;
+      const dueDate = form.due_date; // tri-state: undefined = key absent, null/"" = remove, string = set
+      let deadline: Date | null;
+      if (removeDeadline || dueDate === null || dueDate === "") {
+        deadline = null;
+      } else if (dueDate === undefined) {
+        deadline = issue.deadlineAt;
       } else {
-        const dueDate = patchField(form.due_date);
-        if (dueDate !== undefined && dueDate !== "") {
-          const parsed = parseMilestoneDeadline(dueDate);
-          if (parsed === null || parsed.getTime() !== issue.deadlineAt?.getTime()) {
-            await changeIssueDeadline(c.env.DB, issue, parsed, issue.deadlineAt, actorId, now);
-            issue = { ...issue, deadlineAt: parsed };
-          }
-        }
+        deadline = parseMilestoneDeadline(dueDate);
+      }
+      if ((deadline?.getTime() ?? null) !== (issue.deadlineAt?.getTime() ?? null)) {
+        await changeIssueDeadline(c.env.DB, issue, deadline, issue.deadlineAt, actorId, now);
+        issue = { ...issue, deadlineAt: deadline };
       }
     }
 
@@ -1625,16 +1632,19 @@ export function registerIssueRoutes(
     }
 
     // Milestone: only on actual change (upstream guards with !=). WRITER-gated
-    // upstream (issue.go:789) — the whole arm (the unknown-milestone 404
-    // validation included) skips for a non-writer, so their PATCH succeeds
-    // with the milestone untouched.
+    // upstream (issue.go:789) — the whole arm skips for a non-writer, so their
+    // PATCH succeeds with the milestone untouched. The writer's resolution
+    // miss rides upstream's APIErrorInternal arm (:793-798 — GetMilestoneByRepoID's
+    // ErrMilestoneNotExist is NOT a mapped error here): the runtime 500 with
+    // the exact ErrMilestoneNotExist text, the issue-tables-t2 convention for
+    // APIErrorInternal arms (undeclared in the vendored contract).
     const milestone = patchField(form.milestone);
     if (canWrite && milestone !== undefined && milestone !== issue.milestoneId) {
       const newMilestoneId = milestone === 0 ? null : milestone;
       if (newMilestoneId !== null) {
         const row = await service.getMilestone(newMilestoneId);
         if (row === null || row.repoId !== found.repo.id) {
-          throw issueErrorToApiError(new MilestoneNotExistError({ id: newMilestoneId, repoId: found.repo.id }));
+          throw new ApiError(500, `milestone does not exist [id: ${newMilestoneId}, repo_id: ${found.repo.id}]`);
         }
       }
       const oldMilestoneId = issue.milestoneId;
