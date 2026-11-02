@@ -103,6 +103,22 @@ describe("parsePointer (positional — upstream ReadPointerFromBuffer, pointer.g
     expect(() => parsePointer(missingSize)).toThrow(InvalidPointerError);
   });
 
+  it("a BOM'd pointer is NOT a pointer — Go string(buf) keeps the BOM, HasPrefix fails (pointer.go:58-61)", () => {
+    // The default TextDecoder strips EF BB BF, which would let the version
+    // prefix match where upstream's ErrMissingPrefix arm serves the file raw;
+    // ignoreBOM:true keeps the BOM in the decoded text (the v1.5.5 R4-3
+    // correction). Both strict modes answer not-a-pointer.
+    const bom = new Uint8Array([0xef, 0xbb, 0xbf, ...enc(`version https://git-lfs.github.com/spec/v1\noid sha256:${OID}\nsize 1\n`)]);
+    expect(() => parsePointer(bom)).toThrow(NotAPointerError);
+    expect(parsePointer(bom, { strict: false })).toBeNull();
+    // Sanity: the identical bytes WITHOUT the BOM still parse — the flag's
+    // effect is the BOM, not the content.
+    expect(parsePointer(enc(`version https://git-lfs.github.com/spec/v1\noid sha256:${OID}\nsize 1\n`))).toEqual({
+      oid: OID,
+      size: 1,
+    });
+  });
+
   it("malformed pointer payloads are always invalid", () => {
     const upper = enc(`version https://git-lfs.github.com/spec/v1\noid sha256:${"A".repeat(64)}\nsize 1\n`);
     expect(() => parsePointer(upper)).toThrow(InvalidPointerError);

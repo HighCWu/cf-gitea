@@ -380,7 +380,21 @@ export async function buildDownloadHref(
   ctx: BatchShapingContext,
   deps: BatchDeps,
 ): Promise<BatchLink> {
-  const presigned = await deps.store.presignGet({ key: lfsKey(ctx.storageKey, oid), now: deps.now ?? new Date() });
+  // Upstream's batch presign passes pointer.Oid as ServeDirectURL's NAME
+  // (server.go:504-507), which prepareServeDirectOptions renders as
+  // `EncodeContentDispositionInline(path.Base(name))` into the URL's
+  // response-content-disposition (storage.go:66-82). For a bare oid — the
+  // only input this arm ever sees, isValidPointerFields gated 64-hex before
+  // the call — Go's mime.FormatMediaType emits exactly the quoted-string
+  // shape below (content_disposition.go:47-54); the RFC 5987 arm of the
+  // shared encoder (lfs/router.ts contentDisposition) is unreachable for a
+  // hex-only name, so the constant shape is the faithful port.
+  const responseContentDisposition = `inline; filename="${oid}"`;
+  const presigned = await deps.store.presignGet({
+    key: lfsKey(ctx.storageKey, oid),
+    now: deps.now ?? new Date(),
+    responseContentDisposition,
+  });
   if (presigned !== null) return toBatchLink(presigned);
   const relayBase = buildRelayHrefBase(ctx);
   const header = withAuth({}, ctx.authHeader);

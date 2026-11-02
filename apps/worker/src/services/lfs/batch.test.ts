@@ -296,6 +296,18 @@ describe("presign mode hrefs (same shaping code, capability-probe dispatch)", ()
     expect(download?.href).toContain("X-Amz-Signature=");
     expect(download?.header).toBeUndefined();
   });
+
+  it("the armed download href carries the oid disposition (server.go:504-507 → response-content-disposition)", async () => {
+    await state().insertVerified(REPO_ID, OID.DOWNLOAD, SIZE, NOW);
+    const result = await shapeBatchObject({ oid: OID.DOWNLOAD, size: SIZE }, "download", ctx, deps(presign()));
+    const url = new URL(result.actions?.download?.href ?? "");
+    // Upstream passes pointer.Oid as ServeDirectURL's NAME (server.go:504-507)
+    // and prepareServeDirectOptions renders EncodeContentDispositionInline
+    // (storage.go:66-82) — for the hex-only oid the quoted-string shape is
+    // exact, and the param is signed INTO the query (the v1.5.5 R4-4 pin).
+    expect(url.searchParams.get("response-content-disposition")).toBe(`inline; filename="${OID.DOWNLOAD}"`);
+    expect(url.searchParams.get("X-Amz-Signature")).not.toBeNull();
+  });
 });
 
 describe("relay href base shape", () => {

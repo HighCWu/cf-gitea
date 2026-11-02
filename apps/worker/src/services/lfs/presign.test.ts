@@ -299,6 +299,23 @@ describe("reachable presign path — the media resolve arm's ServeDirect-or-rela
     expect(resolved.object).toBeNull(); // the redirect answers; no bytes are opened
   });
 
+  it("the caller's disposition rides the presigned href (file.go:186-190's ServeDirectURL → response-content-disposition)", async () => {
+    const presign = new PresignLfsStore(env.REPO_PACKS, CREDENTIALS, { bucketName: BUCKET });
+    const resolved = await resolveLfsFile(
+      { d1: env.DB, store: presign },
+      { repoId: REPO_ID, storageKey: "r_7", blobData: pointerBlob },
+      { responseContentDisposition: `inline; filename="asset.bin"` },
+    );
+    if (resolved === null || resolved.href === null) throw new Error("expected a presigned href");
+    const url = new URL(resolved.href);
+    // The override is signed INTO the query (the v1.5.5 R4-4 correction: the
+    // capability existed but no caller passed it) — upstream's presigns carry
+    // EncodeContentDispositionInline via prepareServeDirectOptions
+    // (storage.go:66-82).
+    expect(url.searchParams.get("response-content-disposition")).toBe(`inline; filename="asset.bin"`);
+    expect(url.searchParams.get("X-Amz-Signature")).not.toBeNull();
+  });
+
   it("the relay store (and the view arm's presign:false) keep the inline-stream posture", async () => {
     const relay = await resolveLfsFile(
       { d1: env.DB, store: new RelayLfsStore(env.REPO_PACKS) },

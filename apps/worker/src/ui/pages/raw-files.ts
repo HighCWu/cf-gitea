@@ -149,7 +149,7 @@
  * the lfsObjects meta row.
  */
 
-import { defaultLfsDeps, lfsRepoId } from "../../lfs/router";
+import { contentDisposition, defaultLfsDeps, lfsRepoId } from "../../lfs/router";
 import { lfsKey } from "../../services/lfs/store";
 import { parsePointer, PointerTooLargeError } from "../../services/lfs/pointer";
 import { engineReads } from "../../api/services/engine";
@@ -460,7 +460,11 @@ export async function loadMediaBlob(env: Env, repo: RawMediaRepo, target: RawMed
 
   const filename = baseName(found.treePath);
   const key = lfsKey(repo.storageKey, pointerOid);
-  const href = await store.presignGet({ key });
+  // The presign carries the filename disposition (download.go:46-54 —
+  // ServeDirectURL's blob.Name() lands in the URL's
+  // response-content-disposition, INLINE per prepareServeDirectOptions,
+  // storage.go:81; the shared contentDisposition() renders the shape).
+  const href = await store.presignGet({ key, responseContentDisposition: contentDisposition(filename, "inline") });
   if (href !== null) {
     return { kind: "redirect", location: href.href, pointerOid, metaUpdatedAt: meta.updatedAt, filename };
   }

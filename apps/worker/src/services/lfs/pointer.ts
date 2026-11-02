@@ -13,12 +13,18 @@
  * (HasPrefix over the whole content — trailing characters on the version line
  * are tolerated), split to ≥3 newline-separated segments, then exactly two
  * positional reads — lines[1] is the oid line, lines[2] the size line.
- * Anything past lines[2] is never read: extra/blank/duplicate/out-of-order
- * keys are invisible, upstream's exact leniency envelope. `size` parses with
- * Go strconv.ParseInt(…, 10, 64) semantics (optional sign, ASCII digits,
- * int64 range), so `size +5` is valid — the ledger L4 correction
- * (2026-11-02): the earlier scan-all-lines parser accepted out-of-order
- * shapes upstream rejects and rejected `+5` upstream accepts.
+ * Decoding is Go's `string(buf)` byte-verbatim: a leading UTF-8 BOM STAYS in
+ * the text (TextDecoder ignoreBOM:true) and fails the prefix check — a BOM'd
+ * pointer is not a pointer, upstream's ErrMissingPrefix arm
+ * (pointer.go:58-61). Anything past lines[2] is never read: extra/blank/
+ * duplicate/out-of-order keys are invisible, upstream's exact leniency
+ * envelope. `size` parses with Go strconv.ParseInt(…, 10, 64) semantics
+ * (optional sign, ASCII digits, int64 range), so `size +5` is valid — the
+ * ledger L4 correction (2026-11-02): the earlier scan-all-lines parser
+ * accepted out-of-order shapes upstream rejects and rejected `+5` upstream
+ * accepts. The BOM polarity is the v1.5.5 R4-3 correction: the earlier
+ * default decoder stripped the BOM and accepted a BOM'd pointer upstream
+ * serves raw.
  *
  * Three error classes mirror upstream's parser outcomes: too-large input,
  * not-a-pointer (prefix miss / invalid structure), and an invalid oid/size
@@ -85,7 +91,13 @@ export function parsePointer(
   if (bytes.byteLength > POINTER_MAX_BYTES) {
     throw new PointerTooLargeError(bytes.byteLength);
   }
-  const text = new TextDecoder().decode(bytes);
+  // Go's `string(buf)` is the bytes verbatim — a leading UTF-8 BOM stays in
+  // the text and HasPrefix fails (ErrMissingPrefix, pointer.go:58-61), so a
+  // BOM'd pointer is NOT a pointer upstream. The TextDecoder default strips
+  // the BOM (ignoreBOM:false omits EF BB BF from the output), which would
+  // accept a BOM'd pointer where upstream serves it raw; ignoreBOM:true is
+  // the WHATWG "do not strip" polarity and keeps the BOM in `text`.
+  const text = new TextDecoder("utf-8", { fatal: false, ignoreBOM: true }).decode(bytes);
   // Upstream checks HasPrefix over the WHOLE buffer, not exact line equality —
   // trailing characters on the version line pass (pointer.go:57-59).
   if (!text.startsWith(VERSION_LINE)) {

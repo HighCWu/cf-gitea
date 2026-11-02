@@ -1001,17 +1001,23 @@ function decodeFilenameSegment(raw: string): string | null {
   }
 }
 
-/** `mime.FormatMediaType("attachment", {filename})` equivalent (upstream
- *  `EncodeContentDispositionAttachment`): quoted string for safe printable
- *  ascii, RFC 5987 `filename*` for anything else. */
-function contentDisposition(filename: string): string {
+/** `mime.FormatMediaType(type, {filename})` equivalent (upstream
+ *  `EncodeContentDispositionAttachment` / `EncodeContentDispositionInline`,
+ *  content_disposition.go:38-44 over :47-54): quoted string for safe printable
+ *  ascii, RFC 5987 `filename*` for anything else. Exported for the presign
+ *  arms: upstream's ServeDirect URLs carry the SAME shape as the
+ *  `response-content-disposition` query param (file.go:186-190 /
+ *  download.go:46-54 / server.go:504-507 — all three presign
+ *  `EncodeContentDispositionInline` via prepareServeDirectOptions,
+ *  storage.go:66-82), so the callers pass `type: "inline"`. */
+export function contentDisposition(filename: string, type: "attachment" | "inline" = "attachment"): string {
   if (/^[\x20-\x7e]+$/.test(filename) && !/["\\]/.test(filename)) {
-    return `attachment; filename="${filename}"`;
+    return `${type}; filename="${filename}"`;
   }
   const encoded = [...new TextEncoder().encode(filename)]
     .map((byte) => `%${byte.toString(16).padStart(2, "0")}`)
     .join("");
-  return `attachment; filename*=utf-8''${encoded}`;
+  return `${type}; filename*=utf-8''${encoded}`;
 }
 
 async function handleDownload(

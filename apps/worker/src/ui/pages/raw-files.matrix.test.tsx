@@ -160,6 +160,37 @@ async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
   return response;
 }
 
+/** The presign-armed env (LFS_STORE_PRESIGN, SPEC-0006 §6): the media arm's
+ *  ServeDirect posture becomes reachable so the 303's Location can be pinned.
+ *  The credentials are the presign.test.ts vectors — signing is local HMAC,
+ *  no network. The mutation view (demo-sweep.test.ts's documented pattern):
+ *  wrangler types declared vars by their LITERAL config value, so a spread
+ *  override alone cannot flip them. */
+const presignRouteEnv: RouteEnv = (() => {
+  const copy: RouteEnv = { ...routeEnv };
+  // R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY are wrangler SECRETS — absent
+  // from the generated Env — so the carrier keys are all optional (the
+  // audit.test.ts mutation pattern).
+  const armed = copy as {
+    LFS_STORE_PRESIGN?: string;
+    R2_ACCOUNT_ID?: string;
+    R2_ACCESS_KEY_ID?: string;
+    R2_SECRET_ACCESS_KEY?: string;
+  };
+  armed.LFS_STORE_PRESIGN = "true";
+  armed.R2_ACCOUNT_ID = "abc123def456";
+  armed.R2_ACCESS_KEY_ID = "AKIDEXAMPLE";
+  armed.R2_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDAG/bJEPyPg5m9mQY2glgvmW";
+  return copy;
+})();
+
+async function fetchUiWith(testEnv: RouteEnv, path: string, init?: RequestInit): Promise<Response> {
+  const context = createExecutionContext();
+  const response = await uiRouter.fetch(new Request(`${ORIGIN}${path}`, init), testEnv, context);
+  await waitOnExecutionContext(context);
+  return response;
+}
+
 beforeAll(async () => {
   await ensureFixtures();
 });
@@ -375,6 +406,25 @@ describe("the media arm (SingleDownloadOrLFS's port)", () => {
     expect(notModified.headers.get("etag")).toBe(`"${LFS_OID}"`);
     expect(notModified.headers.get("last-modified")).toBe(new Date(1_700_002_000_000).toUTCString());
     expect(notModified.headers.get("cache-control")).toBe("max-age=0, private, must-revalidate"); // the middleware's stamp
+  });
+
+  it("the armed presign 303 carries the filename disposition in the Location (download.go:46-54, R4-4)", async () => {
+    const current = await ensureFixtures();
+    // The same idempotent seeding the relay posture test rides — the
+    // presign env flips only the STORE, not the rows.
+    await new LfsStateService(env.DB).insertVerified(lfsRepoId(current.repoId), LFS_OID, PNG_BYTES.byteLength, new Date(1_700_002_000_000));
+    await new RelayLfsStore(env.REPO_PACKS).put(lfsKey(current.storageKey, LFS_OID), PNG_BYTES);
+
+    const response = await fetchUiWith(presignRouteEnv, "/alice/rawserve/media/branch/main/assets/big.bin");
+    expect(response.status).toBe(303);
+    const location = response.headers.get("location") ?? "";
+    const url = new URL(location);
+    // download.go:46-54 passes blob.Name() through ServeDirectURL —
+    // prepareServeDirectOptions renders EncodeContentDispositionInline
+    // (storage.go:66-82) into the URL's response-content-disposition; the
+    // shared contentDisposition() renders the shape (lfs/router.ts).
+    expect(url.searchParams.get("response-content-disposition")).toBe(`inline; filename="big.bin"`);
+    expect(url.searchParams.get("X-Amz-Signature")).not.toBeNull();
   });
 
   it("degrades to the plain blob when the meta row exists but the object is gone", async () => {

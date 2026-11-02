@@ -46,6 +46,11 @@ beforeAll(async () => {
 
   OID = await sha256Hex(OBJECT_BYTES);
   const pointerText = (oid: string, size: number): string => new TextDecoder().decode(pointerBytes(oid, size));
+  // A crafted pointer-PREFIXED file padded past the 1024-byte window, pointing
+  // at the OID that HAS a meta row — decisive for the caller's size gate
+  // (file.go:138-143): without the gate the media arm would probe, parse, and
+  // answer the OBJECT; with it the raw bytes answer.
+  const bigPointer = `${pointerText(OID, OBJECT_BYTES.byteLength)}${"padding beyond the pointer window\n".repeat(30)}`;
   const commits: SeedCommit[] = [
     {
       message: "seed: lfs pointer",
@@ -53,6 +58,7 @@ beforeAll(async () => {
       files: [
         { path: "asset.bin", content: pointerText(OID, OBJECT_BYTES.byteLength) },
         { path: "ghost.bin", content: pointerText("f".repeat(64), 7) },
+        { path: "big-pointer.bin", content: bigPointer },
         { path: "plain.txt", content: "a plain file\n" },
       ],
     },
@@ -111,6 +117,18 @@ describe("GET /repos/{owner}/{repo}/raw (GetRawFileOrLFS — the ⑳ L2 pins)", 
     expect(body).toContain(`oid sha256:${"f".repeat(64)}`);
   });
 
+  it("/media serves RAW for a >1024-byte pointer-prefixed file — the API caller's size gate (file.go:138-143)", async () => {
+    const res = await apiGet(`/repos/${OWNER}/${SLUG}/media/big-pointer.bin`);
+    expect(res.status).toBe(200);
+    const bytes = await res.arrayBuffer();
+    expect(bytes.byteLength).toBeGreaterThan(1024);
+    const body = new TextDecoder().decode(bytes);
+    // The raw bytes — the pointer text AND its padding — not the stored object.
+    expect(body).toContain(`oid sha256:${OID}`);
+    expect(body).toContain("padding beyond the pointer window");
+    expect(body).not.toContain("the actual stored LFS payload");
+  });
+
   it("a non-pointer file reads unchanged (the probe declines — content.go:249's window)", async () => {
     const res = await apiGet(`/repos/${OWNER}/${SLUG}/raw/plain.txt`);
     expect(res.status).toBe(200);
@@ -134,7 +152,7 @@ describe("the file view's LFS render (the ⑳ L3 pin — view.go:104-123's swap)
     const row = await drizzle(env.DB).select().from(repositories).where(eq(repositories.slug, SLUG)).get();
     if (row === undefined) throw new Error("repo row missing");
     const repo = { ownerNamespace: OWNER, slug: SLUG, defaultBranch: "main", id: row.id, storageKey: row.storageKey };
-    const data = await loadFileViewData(engineClient(env, `${OWNER}/${SLUG}`) as never, repo, ORIGIN, "branch/main/asset.bin", env);
+    const data = await loadFileViewData(engineClient(env, `${OWNER}/${SLUG}`), repo, ORIGIN, "branch/main/asset.bin", env);
     if (!("kind" in data) || data.kind !== "blob") throw new Error("expected blob view data");
     const rendered = JSON.stringify(data);
     expect(rendered).toContain("the actual stored LFS payload");
@@ -147,7 +165,7 @@ describe("the file view's LFS render (the ⑳ L3 pin — view.go:104-123's swap)
     const row = await drizzle(env.DB).select().from(repositories).where(eq(repositories.slug, SLUG)).get();
     if (row === undefined) throw new Error("repo row missing");
     const repo = { ownerNamespace: OWNER, slug: SLUG, defaultBranch: "main", id: row.id, storageKey: row.storageKey };
-    const data = await loadFileViewData(engineClient(env, `${OWNER}/${SLUG}`) as never, repo, ORIGIN, "branch/main/ghost.bin", env);
+    const data = await loadFileViewData(engineClient(env, `${OWNER}/${SLUG}`), repo, ORIGIN, "branch/main/ghost.bin", env);
     if (!("kind" in data) || data.kind !== "blob") throw new Error("expected blob view data");
     const rendered = JSON.stringify(data);
     expect(rendered).toContain("git-lfs.github.com/spec");

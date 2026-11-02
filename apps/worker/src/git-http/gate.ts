@@ -493,11 +493,14 @@ function mirrorReadOnly(): Response {
  *   routers/private/hook_post_receive.go:96 — no parent updates, no wiki
  *   push webhooks; our engine-level onPush consumers resolve
  *   `owner/x.wiki` to no D1 row and no-op, webhooks-push.ts:1407-1413).
- * - Protocol READS seed the engine registry row first (ensureWikiRegistryRow
- *   below): the engine 404s protocol/api reads of registry-unknown names
- *   (packages/git-engine mod.ts:1492-1495) and wiki cells are deliberately
- *   registry-unseeded (services/wiki.ts — the index-leak posture of the
- *   still-404ing gate, now obsolete).
+ * - Protocol traffic seeds the engine registry row first (both ops —
+ *   ensureWikiRegistryRow below): the engine 404s protocol/api reads of
+ *   registry-unknown names (packages/git-engine mod.ts:1492-1495) and wiki
+ *   cells are deliberately registry-unseeded (services/wiki.ts — the
+ *   index-leak posture of the still-404ing gate, now obsolete). The write
+ *   arm seeds BEFORE the forward so a first-ever receive's post-push upsert
+ *   (mod.ts:1399-1401) finds the row priv=1 instead of INSERTing it at the
+ *   DDL default 0.
  */
 async function handleWikiGitRoute(
   req: Request,
@@ -580,7 +583,7 @@ async function handleWikiGitRoute(
   // check against unitType=TypeWiki (githttp.go:95-99 + :187-199) before the
   // mirror refusal (:201-204), so the disabled verdict sits here — between
   // the matrix and the mirror 403. A disabled wiki never seeds the registry
-  // row below (the read tail is unreachable).
+  // row below (both protocol tails are unreachable).
   if (!(await loadRepoSettings(env.DB, resolved.repo.id)).hasWiki) {
     return wikiDisabledStop(resolved.repo, resolved.owner, resolved.ownerVisibility, op);
   }
@@ -591,10 +594,15 @@ async function handleWikiGitRoute(
     return mirrorReadOnly();
   }
 
-  // Protocol reads need the wiki cell's registry row (module doc) — seeded
+  // Protocol traffic needs the wiki cell's registry row (module doc) — seeded
   // from the D1 row's CANONICAL casing, never the request's (the registry is
-  // case-sensitive; the cells are seeded at the row's lowercase name).
-  if (op === "read") await ensureWikiRegistryRow(env, resolved.repo);
+  // case-sensitive; the cells are seeded at the row's lowercase name). The
+  // WRITE arm seeds too: the engine's post-push bookkeeping upsert
+  // (mod.ts:1399-1401) INSERTs priv at the DDL default 0 on a first-ever
+  // receive, so the seed must land BEFORE the forward — the row is born
+  // priv=1 and the engine's upsert rides its ON CONFLICT arm (idle/ver only,
+  // registry.ts:37-44).
+  await ensureWikiRegistryRow(env, resolved.repo);
 
   // §2.1 item 5: the ordinary engine forward — parent-validated receives
   // (upstream's wiki pre-receive parity), no storage key, no settle.
@@ -613,19 +621,23 @@ async function handleWikiGitRoute(
 }
 
 /**
- * One-time registry seed for the sibling wiki cell (the read path's
+ * One-time registry seed for the sibling wiki cell (every protocol arm's
  * prerequisite — packages/git-engine mod.ts:1492-1495 404s protocol and API
  * reads of registry-unknown names, and wiki cells are born registry-less,
- * services/wiki.ts). `priv: true` ALWAYS, self-healing on later reads: the
- * registry's documented semantic for priv=1 is "requires auth for all
- * access, hidden from index" (registry.ts) — the wiki cell must never appear
- * in any index (upstream's wiki repo is likewise in no repo index), and the
- * gate-cleared mark owns the actual authorization, so the bit costs nothing
- * and degrades nothing. The tighten (priv !== 1 → re-pin) also covers the
- * engine's own push-time `upsert` bookkeeping, which inserts priv at the DDL
- * default 0 when a wiki receive lands before any read seeded the row. Best
- * effort: a failed seed only delays the read (the engine 404s the unknown
- * name; the next read re-seeds) — never fails an authorized request.
+ * services/wiki.ts). Runs on the WRITE arm too, always BEFORE the engine
+ * forward: the engine's post-push bookkeeping upsert (mod.ts:1399-1401)
+ * INSERTs priv at the DDL default 0 on a first-ever receive, so seeding here
+ * pins the row priv=1 from birth (the engine's upsert then rides its ON
+ * CONFLICT arm — idle/ver only, registry.ts:37-44). `priv: true` ALWAYS,
+ * self-healing on later traffic: the registry's documented semantic for
+ * priv=1 is "requires auth for all access, hidden from index" (registry.ts)
+ * — the wiki cell must never appear in any index (upstream's wiki repo is
+ * likewise in no repo index), and the gate-cleared mark owns the actual
+ * authorization, so the bit costs nothing and degrades nothing. The tighten
+ * (priv !== 1 → re-pin) re-pins any row the engine or an older deploy left
+ * at 0. Best effort: a failed seed only delays the traffic (the engine 404s
+ * the unknown name on reads; the next request re-seeds) — never fails an
+ * authorized request.
  */
 async function ensureWikiRegistryRow(env: Env, repo: RepositoryRow): Promise<void> {
   const name = `${repo.ownerNamespace}/${repo.slug}.wiki`;
@@ -673,11 +685,13 @@ async function ensureWikiRegistryRow(env: Env, repo: RepositoryRow): Promise<voi
  *   authorizeGitHttp's shape without the deploy-token arm (no repo row for
  *   the key to bind) and without the failure limiter (the push-create
  *   interceptor's lighter posture — gate.ts:707's precedent).
- * - Registry seed BEFORE the forward on protocol reads —
- *   ensureWikiRegistryRow verbatim: the engine 404s protocol reads of
- *   registry-unknown names and this rowless cell is born registry-less;
+ * - Registry seed BEFORE the forward on EVERY protocol arm, reads AND
+ *   writes — ensureWikiRegistryRow verbatim: the engine 404s protocol reads
+ *   of registry-unknown names and this rowless cell is born registry-less;
  *   priv=1 keeps it out of every index (upstream's own index repo shows in
- *   listings, the recorded divergence the hiding posture buys).
+ *   listings, the recorded divergence the hiding posture buys), and seeding
+ *   before a first-ever receive beats the engine's post-push upsert to the
+ *   row (that upsert INSERTs priv at the DDL default 0, mod.ts:1399-1401).
  * - NO settle after a receive (no D1 row to settle), NO storage key (no
  *   row → no storage_key; the cell keeps its name-addressed namespace, the
  *   wiki family's exact posture), NO protected-branch validator (no repo id
@@ -725,9 +739,12 @@ async function handleCargoIndexGitRoute(
   const decision = await cargoIndexAuthorize(req, env, (p) => ctx.waitUntil(p), op, ownerRow, ownerVisibility);
   if (decision !== true) return decision;
 
-  // Protocol reads need the cell's registry row (the wiki family's seed
-  // contract — mod.ts:1492-1495 404s registry-unknown reads).
-  if (op === "read") await ensureCargoIndexRegistryRow(env, ownerLower);
+  // Protocol traffic needs the cell's registry row (the wiki family's seed
+  // contract — mod.ts:1492-1495 404s registry-unknown reads). The WRITE arm
+  // seeds too, before the forward: the engine's post-push upsert
+  // (mod.ts:1399-1401) INSERTs priv at the DDL default 0 on a first-ever
+  // receive — born priv=1 keeps the cell out of every index from birth.
+  await ensureCargoIndexRegistryRow(env, ownerLower);
 
   // §2.1 item 5: the ordinary engine forward — no storage key, no settle,
   // no validator (see the doc's posture list). The pusher rides for
@@ -826,12 +843,16 @@ async function cargoIndexAuthorize(
  * `ensureWikiRegistryRow` verbatim over the cell name
  * `<ownerLower>/_cargo-index` (cargoIndexCellName's convention; the cell is
  * seeded at the owner row's LOWERCASE namespace, the registry is
- * case-sensitive). priv=1 ALWAYS, self-healing on later reads: the cell
- * must never appear in any engine index (the hiding posture — upstream's
- * own index repo is a listed row, the recorded divergence), and the
- * gate-owned ACL above owns the actual authorization. The tighten also
- * re-pins after the engine's push-time upsert bookkeeping (priv DDL
- * default 0), exactly like the wiki seed.
+ * case-sensitive). Runs on the WRITE arm too, always BEFORE the engine
+ * forward: the engine's post-push bookkeeping upsert (mod.ts:1399-1401)
+ * INSERTs priv at the DDL default 0 on a first-ever receive, so seeding
+ * here pins the row priv=1 from birth (that upsert then rides its ON
+ * CONFLICT arm — idle/ver only, registry.ts:37-44). priv=1 ALWAYS,
+ * self-healing on later traffic: the cell must never appear in any engine
+ * index (the hiding posture — upstream's own index repo is a listed row,
+ * the recorded divergence), and the gate-owned ACL above owns the actual
+ * authorization. The tighten re-pins any row the engine or an older deploy
+ * left at 0, exactly like the wiki seed.
  */
 async function ensureCargoIndexRegistryRow(env: Env, ownerLower: string): Promise<void> {
   const name = `${ownerLower}/${CARGO_INDEX_REPOSITORY_NAME}`;
@@ -1117,8 +1138,9 @@ async function handleEnginePathBranch(
   // The wiki family's ENGINE paths (`/{owner}/{repo}.wiki/api/*`, the admin
   // shapes) gate on the PARENT too (handleWikiGitRoute's module doc): the
   // sibling cell was born registry-less so these names 404'd through the
-  // oracle below, but the git family's read-path seed (ensureWikiRegistryRow)
-  // makes the row EXIST — the verbatim passthrough would then hand the
+  // oracle below, but the git family's registry seed (ensureWikiRegistryRow,
+  // protocol reads AND writes) makes the row EXIST — the verbatim passthrough
+  // would then hand the
   // engine's grant-less hook every verified token (src/git-http/authorize.ts
   // returns true for any D1-verifiable credential), so the parent's matrix
   // decides here. Same name handling as the git family: `.wiki` strips,

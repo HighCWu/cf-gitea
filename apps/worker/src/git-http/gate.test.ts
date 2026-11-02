@@ -1411,6 +1411,36 @@ describe("the *.wiki git family (upstream githttp.go:94-101 — the wiki SPEC's 
     expect(row?.status).toBe("ready");
   });
 
+  it("a first-ever wiki push births the registry row ALREADY priv=1 — the write arm seeds BEFORE the forward (engine upsert mod.ts:1399-1401)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    await repoService().create({ owner: { id: alice.id, usernameLower: "alice" }, name: "wikipushseed", isPrivate: false });
+    const aliceToken = (await mintFor(alice.id, "w", "write:repository")).plaintext;
+    const name = "alice/wikipushseed.wiki";
+
+    // The cell is born registry-less (services/wiki.ts) and this push is the
+    // FIRST protocol traffic it ever sees — no prior read ever seeded it.
+    expect(await env.REGISTRY.getByName("registry").get(name)).toBeNull();
+
+    const { oid, pack } = await buildPack();
+    const body = buildReceivePackBody([{ ref: "refs/heads/main", oid }], pack);
+    const push = await SELF.fetch("https://example.com/alice/wikipushseed.wiki.git/git-receive-pack", {
+      method: "POST",
+      headers: { authorization: basicTokenHeader(aliceToken), "content-type": RECEIVE_CT },
+      body,
+    });
+    expect(push.status).toBe(200);
+    const cellRefs = await env.REPO.getByName(name).listRefs();
+    expect(cellRefs.refs.map((r) => r.name)).toContain("refs/heads/main");
+
+    // The invariant: the row the engine's post-push bookkeeping upsert
+    // (mod.ts:1399-1401) would otherwise INSERT at the DDL default 0 exists
+    // at priv=1 — the gate seeded it before the forward, so the engine's
+    // upsert rode its ON CONFLICT arm (idle/ver only, registry.ts:37-44).
+    const row = await env.REGISTRY.getByName("registry").get(name);
+    expect(row).not.toBeNull();
+    expect(row?.priv).toBe(1);
+  });
+
   it("keeps wiki push-create absent: a receive on an unparented wiki name is the bare 404 (githttp.go:215-218)", async () => {
     const alice = await seedVerifiedUser({ username: "Alice" });
     const token = (await mintFor(alice.id, "w", "write:repository")).plaintext;

@@ -30,7 +30,8 @@ import {
 } from "../models/contents";
 import { assertNotArchived, requireVisibleRepo } from "../services/repo-access";
 import { gitSigOf } from "../../ui/pages/pull-merge-box";
-import { defaultLfsDeps, lfsRepoId } from "../../lfs/router";
+import { contentDisposition, defaultLfsDeps, lfsRepoId } from "../../lfs/router";
+import { POINTER_MAX_BYTES } from "../../services/lfs/pointer";
 import { resolveLfsFile, type LfsResolvedFile } from "../../services/lfs/resolve";
 import { httpTime } from "../../ui/pages/release-downloads";
 
@@ -507,12 +508,24 @@ async function getRawBytes(
   const objectType = blob.mode === "120000" ? "symlink" : "blob";
   const plain = (): Response => plainRawResponse(blob.data, objectType);
   if (family === "media") {
+    // The size gate lives ONLY in this API caller: "LFS Pointer files are at
+    // most 1024 bytes — so any blob greater than 1024 bytes cannot be an LFS
+    // file" (file.go:138-143) — a bigger blob answers RAW before any probe.
+    // The shared chain (resolve.ts) stays gate-less on purpose: the WEB arm
+    // probes unconditionally (view.go:96-98's prefetchSize has no size
+    // branch), so the gate must not move into it.
+    if (blob.data.byteLength > POINTER_MAX_BYTES) return plain();
     // GetRawFileOrLFS's chain (file.go:154-178): probe → row; a null answer
     // (non-pointer / malformed pointer / missing meta row) keeps the raw
-    // twin's bytes. The object streams from the store — never buffered.
+    // twin's bytes. The object streams from the store — never buffered. The
+    // presign carries the filename disposition (file.go:186-190 —
+    // ServeDirectURL's blob.Name() lands in the URL's
+    // response-content-disposition, INLINE per prepareServeDirectOptions,
+    // storage.go:81).
     const lfs = await resolveLfsFile(
       { d1: c.env.DB, store: defaultLfsDeps(c.env).store },
       { repoId: lfsRepoId(pair.repo.id), storageKey: pair.repo.storageKey, blobData: blob.data },
+      { responseContentDisposition: contentDisposition(baseName(resolved.filepath), "inline") },
     );
     if (lfs !== null) return mediaLfsResponse(c, lfs, objectType, plain);
   }
@@ -537,6 +550,15 @@ function templateList(value: string | undefined): string[] | undefined {
 function tailAfter(c: Context<ApiEnv>, prefix: string): string {
   const index = c.req.path.indexOf(prefix);
   return decodeURIComponent(index < 0 ? "" : c.req.path.slice(index + prefix.length));
+}
+
+/** Go path.Base over a repo-relative tree path — the blob NAME upstream's
+ *  ServeDirectURL calls carry (file.go:186-190 / download.go:46-54 pass
+ *  blob.Name(); prepareServeDirectOptions basenames again, storage.go:75). */
+function baseName(treePath: string): string {
+  if (treePath === "") return ".";
+  const base = treePath.slice(treePath.lastIndexOf("/") + 1);
+  return base === "" ? "." : base;
 }
 
 export function registerContentsRoutes(

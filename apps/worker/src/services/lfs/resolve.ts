@@ -58,7 +58,16 @@ export interface LfsResolveDeps {
 export async function resolveLfsFile(
   deps: LfsResolveDeps,
   input: { repoId: number; storageKey: string; blobData: Uint8Array },
-  options: { presign?: boolean } = {},
+  options: {
+    presign?: boolean;
+    /** Signed into the presigned GET's `response-content-disposition` — the
+     *  caller's filename decoration, rendered with the shared
+     *  `contentDisposition(name, "inline")` shape. Upstream builds the URL in
+     *  the API CALLER too (file.go:186-190's ServeDirectURL carries
+     *  blob.Name(); the shared chain and the web view arm never redirect), so
+     *  the chain stays disposition-blind when the option is absent. */
+    responseContentDisposition?: string;
+  } = {},
 ): Promise<LfsResolvedFile | null> {
   // The probe window — `lfs.MetaFileMaxSize` bytes of the GIT blob
   // (file.go:154's GetBlobBytes cap; view.go:96-98's prefetchSize). The slice
@@ -82,8 +91,15 @@ export async function resolveLfsFile(
   const key = lfsKey(input.storageKey, pointer.oid);
   if (options.presign !== false) {
     // The ServeDirect arm sits BEFORE the read (file.go:186-192) — a signed
-    // URL answers the redirect and no bytes are opened.
-    const href = await deps.store.presignGet({ key });
+    // URL answers the redirect and no bytes are opened. The caller's
+    // disposition rides the URL (file.go:186-190 passes blob.Name() through
+    // ServeDirectURL → prepareServeDirectOptions' response-content-disposition).
+    const href = await deps.store.presignGet({
+      key,
+      ...(options.responseContentDisposition !== undefined
+        ? { responseContentDisposition: options.responseContentDisposition }
+        : {}),
+    });
     if (href !== null) return { pointer, meta, href: href.href, object: null };
   }
   const object = await deps.store.get(key);
