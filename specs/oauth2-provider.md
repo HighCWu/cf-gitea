@@ -1,9 +1,25 @@
 # SPEC: OAuth2 Provider (+ OIDC discovery) — "Sign in with cf-gitea" for third-party apps
 
-Status: draft (written for the v1.4 implementation waves; not yet ratified)
+Status: as-built — the surface is IMPLEMENTED in the tree (SPEC ratified at
+landing 78e5f68, 2026-10-31; the flow landed across v1.5.2–v1.5.3). Landed
+surface by wave (§6 carries each wave's own-eyes gates): W1 substrate —
+migration `0052_redundant_zarek` + `services/oauth2/{jws,keys,grants}.ts`
+(ed52dd5); W2+W3 — the token endpoint family, the dotted-Bearer auth dispatch,
+authorize + consent (`services/oauth2/token.ts`, `web/oauth2-token.ts`,
+`ui/oauth2-authorize.ts`, `ui/pages/oauth2-grant.tsx`) (469fab9); W4 —
+discovery + the `OAUTH2_ENABLED` gate + the git-HTTP realm flip
+(`web/oauth2-wellknown.ts`, the conditional challenge in
+`git-http/respond.ts`) (18b78a8, salvaged; the discovery mount fix 4754bdc);
+W5 — the settings UI halves (`ui/pages/oauth2-app-edit.tsx` + the user/org/
+admin arms) (b91dd1c); W6 — the auth-oauth2 probe battery (4754bdc).
+Residual-parity tail: the F3–F10 batch (0e4b35c — the as-built addendum
+below), the `/users/{username}/tokens` audit twins (cc38cf8), the
+avatar-chain picture claims + the link-account 2FA gate (7362128).
 Upstream pin: fc4936884584 (`gitea/` submodule)
 Supersedes: SPEC-0002 §2.8's "OAuth2 provider deferred to a later SPEC" note (that
-SPEC's deferral clause is retired when this lands)
+SPEC's deferral clause is retired when this lands — the surface HAS landed; the
+one-line retirement edit in `0002-auth.md` itself is still pending paperwork,
+tracked in §6 W6's as-built)
 
 ## 1. Problem and scope
 
@@ -221,6 +237,15 @@ identical to the OIDC discovery `issuer` and the prefix rule
 (openid-connect-discovery §4: the issuer MUST equal the URL used to fetch
 `/.well-known/openid-configuration`).
 
+> **As-built (U45, 7362128, 2026-11-02):** both `picture` claims (the
+> id_token's `profile` arm and userinfo) resolve through the avatar chain —
+> `avatarPictureLink(bucket, user, appUrl)` composing `avatarLinkWithSize`
+> (upstream `AvatarLink` = `MakeAbsoluteURL(AvatarLinkWithSize(0))`,
+> access_token.go:231 / oauth2_provider.go:121): a stored avatar renders
+> `/avatars/u_<id>`, otherwise the generated identicon file (the object is
+> actually written to the bucket). The first cut's hand-spelled
+> `${appUrl}avatars/{username}` 404'd — the storage keys are never usernames.
+
 ### 2.5 Scopes
 
 Grant scope is one space-separated string mixing two families
@@ -319,11 +344,18 @@ The org twin shares the handlers (`OAuth2CommonHandlers`, `routers/web/user/sett
 — cf-gitea's landed org-settings page already carries create/delete; this SPEC's UI
 wave adds the edit/regenerate/grants arms there only if the landed page's brief
 recorded them as staged (check at implementation; the user page is the required arm).
+**(As-built, W5, b91dd1c: the org twin's edit/regenerate arms LANDED — the landed
+brief's "edit shapes stay UNCLAIMED" note had staged them, OQ2 resolved; the grants
+section stayed user-only, upstream parity — `RevokeGrant` refuses the org/admin
+owners outright, `oauth2_common.go:204`; see §6 W5's as-built.)**
 
 Admin's global applications arm (`web.go:888–897`, uid=0 rows) exists upstream;
 cf-gitea's landed `admin-applications.tsx` is the list-only reduction (its header
 records the write arms as unported) — the write arms remain out of scope here unless
 the implementation wave finds them trivial over the shared service.
+**(As-built, W5, b91dd1c: they were trivial — OQ4 resolved, the full upstream
+family landed on the admin twin: create → the edit page with the once-only
+secret, the BuiltinApplications lock arm, show/save/regenerate.)**
 
 ### 2.9 Builtin applications (the git-credential ergonomics)
 
@@ -443,6 +475,10 @@ cf-gitea adaptation (decisions):
   that string per the `OAUTH2_ENABLED` var and updates the SPEC-0003 matrix row +
   the landed realm test to the conditional form. **The flip is only meaningful once
   the builtin applications exist (§2.9) — seed + flip land in the same wave.**
+  **(As-built, W4, 18b78a8: the conditional realm LANDED — `git-http/respond.ts`'s
+  `OAUTH2_BASIC_CHALLENGE` / `BASIC_AUTH_CHALLENGE` pair behind `oauth2Enabled`;
+  the challenge suite pins both arms. The SPEC-0003 §2.4 matrix row's matching
+  text update is still OUTSTANDING — recorded for the docs tail.)**
 
 ## 3. Data model
 
@@ -845,7 +881,10 @@ not edit the shared index themselves).
   scope-boundary note amended — the check is a pure application-row predicate
   both flow halves consume), and the scope services (`normalizeGrantScope`/
   `grantAdditionalScopes`, access_token.go:87-134) co-located with the
-  handlers for W2's token/introspect consumers. Suite 33/33 own-eyes (the
+  handlers for W2's token/introspect consumers. (F9 update: the W3-era
+  handler-side copies were absorbed into `services/oauth2/token.ts` — the one
+  home — by the v1.5.2 residual batch, 0e4b35c; the handlers import from
+  there now; see the addendum and W2's closed IPv6 item above.) Suite 33/33 own-eyes (the
   §2.2 decision table + ContainsRedirectURI units incl. the IPv6/https/
   confidential-loopback refusals + scope pins + the two goldens + a11y);
   oauth2-apps 19/19, grants 20/20, session 56/56 neighbors green; tsc 0 in
@@ -866,6 +905,10 @@ not edit the shared index themselves).
   RECORDED OPEN ISSUE — the landed audit action registry (services/audit.ts)
   has no OAuth2 family entry and the const is a shared-file hunk outside
   W3's ownership; lands with the W4/W6 audit-registry window.
+  (RESOLVED at W4, 18b78a8: the registry row + the consent POST's emit
+  landed — `ui/oauth2-authorize.ts` emits `UserOAuth2ApplicationGrant` on
+  first consent; the full audit family followed at 0e4b35c, its API twins at
+  cc38cf8.)
 - **W4 — discovery, gate, realm flip** (depends W2). Owns: GET
   `/.well-known/openid-configuration`; the `OAUTH2_ENABLED` var plumbing
   (strict polarity, example-config entry), the endpoint gating, the settings
@@ -874,6 +917,22 @@ not edit the shared index themselves).
   attribute it in the wave brief so the commit message says so). Gates:
   discovery-shape suite, gate suite, the git-HTTP suite re-baselined for the
   conditional realm.
+  **LANDED 2026-10-31** — salvaged whole (18b78a8: the unit completed, then
+  died to a sibling wave; every surface verified green on the tree at find —
+  wellknown+gate 75/75, the authorize/token/audit/push-create/lifecycle/index
+  battery 246/246, tree tsc zero): the discovery doc (the issuer rides the
+  SAME source the id_token's `iss` uses — the fetched-URL equality §4
+  demands), the `OAUTH2_ENABLED` strict-polarity 403 wrap over the provider
+  group + the well-known 404 when off, the conditional git-HTTP realm (§2.11's
+  flip — on ⇒ `Basic realm="Gitea"`, off ⇒ the kept `BASIC_AUTH_CHALLENGE`),
+  the audit registry's first OAuth2 row (the consent POST's
+  `UserOAuth2ApplicationGrant` emit — W3's open issue (6)), and the
+  `OAUTH2_SIGNING_ALGORITHM` / `OAUTH2_JWT_CLAIM_ISSUER` /
+  `OAUTH2_INVALIDATE_REFRESH_TOKENS` plumbing connected to W2's widened
+  aliases; the example config documents the family. The discovery router's
+  mount handoff had NOT executed at salvage — fixed at the W6 battery landing
+  (4754bdc). Outstanding: the SPEC-0003 §2.4 matrix row still reads the
+  pre-flip unconditional realm (§2.11's as-built note; docs tail).
 - **W5 — settings UI halves** (depends W1; parallel to W2–W4). Owns: the
   `applications.tmpl` OAuth2 halves on the user settings page (list section, edit
   page with the secret-shown-once arm, regenerate-secret POST, delete), the grants
@@ -978,6 +1037,24 @@ not edit the shared index themselves).
   arm (§5 live battery), the upstream-fixture sweep across all suites, the SPEC's
   as-built amendments, the SPEC-0002 §2.8 deferral-note retirement. Gates: full
   battery green, `pnpm check:api` PASS, SPEC as-built current.
+  **LANDED 2026-10-31** — the auth-oauth2 battery (4754bdc; ONE independent
+  battery for this SPEC + the external-auth sibling, 18 batteries / 219
+  probes): the scripted third-party client end-to-end — app create with the
+  secret-exactly-once, the five builtin rows verified in D1, the discovery
+  13-member shape, the git-HTTP realm pair (`Basic realm="Gitea"` exact), the
+  PKCE consent dance (the consent page's hidden fields parsed and posted),
+  the form + Basic exchanges, the auto-consent second dance, the
+  dotted-Bearer dispatch through `apiScopeGate`, userinfo's Go struct order +
+  PAT refusal, the offline JWKS verify (WebCrypto TRUE on both tokens, header
+  alg/kid match), the refresh pair with the no-rotation `counter==1` D1 pin,
+  introspection's exact member set, the revoke-kills-token arm (the
+  outstanding token 401s + introspects inactive), the cleanup pair. Green
+  twice locally + the force-red rehearsal. Outstanding docs tail: the
+  W6-owned SPEC-0002 §2.8 deferral-note retirement has NOT landed
+  (`0002-auth.md:206` still carries "deferred to a later SPEC") — the
+  header's outstanding-paperwork note tracks it. The SPEC's as-built
+  amendments were completed by the C+C2 addendum (0e4b35c) and this
+  header/status refresh.
 
 Shared-file discipline: `wrangler.jsonc.example` (`OAUTH2_ENABLED`,
 `OAUTH2_SIGNING_ALGORITHM`) and the git-HTTP realm constant are the two cross-wave
@@ -1009,6 +1086,12 @@ Parity closes against the pin, each with its upstream cite:
   (outside the batch's ownership) and the user twin's revoke mount in
   `ui/index.ts` still calls the grant store inline — both orchestrator
   hunks; the emit helpers are ready for exactly those shapes.
+  (CLOSED — both halves landed: the revoke mount swapped onto the shared
+  `revokeOauth2GrantFromForm` in the same batch's orchestrator fold, 0e4b35c
+  — the `user:oauth2application:revoke` row rides the hit — and the
+  account-aggregates twins emit `UserAccessTokenAdd`/`UserAccessTokenRemove`
+  at the app.go:156/:231 positions via `emitAccessTokenAudit`, cc38cf8. The
+  F3 family is complete.)
 - **F4 — the JSON Content-Type.** Every token-endpoint JSON arm renders
   `application/json;charset=utf-8` (ctx.JSON, services/context/base.go:
   114-116) — hono's `c.json` bare type is not upstream's. `/login/oauth/
@@ -1067,7 +1150,12 @@ Parity closes against the pin, each with its upstream cite:
    as-built.)
 3. **`iat` enforcement on refresh tokens** — upstream checks `iat` only in the API
    auth path (`services/auth/oauth2.go:53`), not in `ParseToken` at the refresh
-   flow; port the asymmetry verbatim (no smoothing).
+   flow; port the asymmetry verbatim (no smoothing). (RESOLVED at W1/W2,
+   2026-10-31, ed52dd5 + 469fab9: the asymmetry ported verbatim — `jws.ts`'s
+   default claim arms check exp/nbf only, zero leeway, and the API dispatch
+   path applies `assertApiTimeBounds`'s strict `exp >= now && iat <= now`
+   gate (`services/oauth2/token.ts`); the refresh flow keeps the no-iat
+   posture.)
 4. **Admin global-applications write arms** — out of scope (§2.8) unless the W5
    wave finds them trivial over the shared service; keep the landed list-only
    reduction recorded either way. (RESOLVED at W5, 2026-10-31: they ARE trivial —
