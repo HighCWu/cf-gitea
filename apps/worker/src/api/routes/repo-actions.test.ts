@@ -19,19 +19,25 @@
  *     fallthrough (404 when the file is gone), the filter ladder
  *     (status/actor/branch/event/head_sha, the 400 invalid-status and the
  *     404 user-not-exist texts, shared/action.go:100-123 + :151-163) and the
- *     pagination headers.
+ *     pagination headers. The scoped filter carries BOTH conds
+ *     (workflow_repo_id + is_scoped_run, shared/action.go:142-145 +
+ *     run_list.go:105-109 — the R1-F6 fix; the TEXT id rides
+ *     scopedSourceRepoParam verbatim, and a scoped query skips the
+ *     git-lookup fallback, repo/action.go:1034-1041).
  *   - ActionsDisableWorkflow / ActionsEnableWorkflow (action.go:1038-1104
  *     + workflow.go:30-52): the 204s, the store readback through the LANDED
  *     ActionsConfig (append-if-absent / SliceRemoveAll, no duplicate on
  *     re-disable), the state flip on the workflow wire, the 404s.
  *   - ActionsDispatchWorkflow (action.go:1106-1178 + workflow.go:64-190):
- *     the 204 / return_run_details 200 RunDetails, the run row (waiting,
- *     workflow_dispatch, the resolved full ref, the commit-subject title),
- *     the job rows from the YAML (runs-on), the inputs merge (defaults,
- *     provided values, the boolean coercion), the 422 ladder (Ref: Required
- *     binder text, has-no-workflow_dispatch, invalid workflow), the 404s
- *     (ref miss, workflow miss, the scoped effective-source gate), the 403
- *     disabled check ordering.
+ *     the 204 / return_run_details 200 RunDetails (FormBool's parse set,
+ *     base_form.go:61-67 — the R1-F8 fix), the run row through the shared
+ *     producer legs (insertTriggeredRunSplit — the R1-F4 fix: waiting run +
+ *     attempt + combos, the always-filled content-source skeleton
+ *     workflow.go:136-137 pre-insert, the R1-F5 pin), the inputs merge
+ *     (defaults, provided values, the boolean coercion), the 422 ladder
+ *     (Ref: Required binder text, has-no-workflow_dispatch, invalid
+ *     workflow), the 404s (ref miss, workflow miss, the scoped
+ *     effective-source gate), the 403 disabled check ordering.
  *   - THE SCOPED DISPATCH TWIN (the v1.5.4 K14 wave — action.go:1120-1123's
  *     query param + workflow.go:237-268's scoped arm): a non-empty
  *     scoped_workflow_source_repo_id (the TEXT source id verbatim, ""/"0" =
@@ -737,6 +743,59 @@ describe("GET .../workflows/{workflow_id}/runs (ActionsListWorkflowRuns)", () =>
     expect((await sha.json<{ workflow_runs: Array<{ id: number }> }>()).workflow_runs.map((r) => r.id)).toEqual([runAId]);
   });
 
+  it("the scoped filter selects on BOTH conds: workflow_repo_id + is_scoped_run (shared/action.go:142-145 + run_list.go:105-109, the R1-F6 fix)", async () => {
+    const db = drizzle(env.DB);
+    // A repo-level run and a scoped twin of one workflow id: the query id
+    // rides scopedSourceRepoParam verbatim (the store id space is TEXT
+    // UUIDs — the former digits-only parse could never equal a real source
+    // id, so the workflowRepoId half filtered nothing).
+    await db.delete(actionRuns).where(eq(actionRuns.workflowId, "scoped-filter.yml"));
+    const seed = async (index: number) =>
+      insertActionRun(
+        env.DB,
+        {
+          repoId: SUITE_REPO_ID,
+          ownerId: ALICE_ID,
+          workflowId: "scoped-filter.yml",
+          index,
+          triggerUserId: ALICE_ID,
+          ref: "refs/heads/main",
+          commitSha: TIP_MAIN,
+          event: "workflow_dispatch",
+          eventPayload: "{}",
+          triggerEvent: "workflow_dispatch",
+          title: "seed: docs",
+        },
+        [{ jobId: "build", runsOn: ["ubuntu-latest"], workflowPayload: new TextEncoder().encode("jobs:\n  build: {}\n") }],
+      );
+    const { run: repoLevel } = await seed(91);
+    const { run: scoped } = await seed(92);
+    await db
+      .update(actionRuns)
+      .set({ isScopedRun: true, workflowRepoId: SOURCE_REPO_ID, workflowCommitSha: SOURCE_TIP })
+      .where(eq(actionRuns.id, scoped.id));
+
+    const scopedList = await get(`${SUITE}/actions/workflows/scoped-filter.yml/runs?scoped_workflow_source_repo_id=${SOURCE_REPO_ID}`, "alice-token");
+    expect(scopedList.status).toBe(200);
+    expect((await scopedList.json<{ workflow_runs: Array<{ id: number }> }>()).workflow_runs.map((r) => r.id)).toEqual([scoped.id]);
+
+    const repoLevelList = await get(`${SUITE}/actions/workflows/scoped-filter.yml/runs?scoped_workflow_source_repo_id=0`, "alice-token");
+    expect((await repoLevelList.json<{ workflow_runs: Array<{ id: number }> }>()).workflow_runs.map((r) => r.id)).toEqual([repoLevel.id]);
+
+    // The rows go; then the probe gate: a SCOPED query over an empty set
+    // skips the git-lookup fallback (upstream arms it only on the repo-level
+    // spelling, repo/action.go:1034-1041) — 200/0, not the workflow 404
+    // (scoped-filter.yml exists in no tree); a repo-level query over the
+    // same empty set still 404s through the fallback.
+    await db.delete(actionRuns).where(eq(actionRuns.workflowId, "scoped-filter.yml"));
+    const emptyScoped = await get(`${SUITE}/actions/workflows/scoped-filter.yml/runs?scoped_workflow_source_repo_id=${SOURCE_REPO_ID}`, "alice-token");
+    expect(emptyScoped.status).toBe(200);
+    expect(await emptyScoped.json()).toEqual({ total_count: 0, workflow_runs: [] });
+    const emptyRepoLevel = await get(`${SUITE}/actions/workflows/scoped-filter.yml/runs`, "alice-token");
+    expect(emptyRepoLevel.status).toBe(404);
+    expect((await emptyRepoLevel.json<{ message: string }>()).message).toBe('workflow "scoped-filter.yml" not found');
+  });
+
   it("paginates with the X-Total-Count and Link headers (limit/page)", async () => {
     const page1 = await get(`${SUITE}/actions/workflows/ci.yml/runs?limit=1`, "alice-token");
     expect(page1.headers.get("X-Total-Count")).toBe("2");
@@ -844,8 +903,18 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
     expect(jobRows).toHaveLength(1);
     expect(jobRows[0]?.jobId).toBe("build");
     expect(jobRows[0]?.name).toBe("build");
+    expect(jobRows[0]?.status).toBe(5); // waiting — the producer legs' insert-time status arm
     expect(JSON.parse(jobRows[0]?.runsOn ?? "[]")).toEqual(["ubuntu-latest"]);
     expect(new TextDecoder().decode((jobRows[0]?.workflowPayload as Uint8Array) ?? new Uint8Array(0))).toContain("jobs:");
+
+    // The producer legs' always-filled content-source pin (the R1-F4/F5
+    // fix): the repo-level skeleton carries the source PRE-INSERT —
+    // WorkflowRepoID = this repo, WorkflowCommitSHA = the run commit
+    // (workflow.go:136-137) — no bare-insert "" residue.
+    expect(dispatched?.workflowRepoId).toBe(SUITE_REPO_ID);
+    expect(dispatched?.workflowCommitSha).toBe(TIP_MAIN);
+    expect(dispatched?.isScopedRun).toBe(false);
+    expect(dispatched?.rawConcurrency).toBe(""); // no `concurrency:` in ci.yml — the E4 fill absent
   });
 
   it("merges the provided inputs over the defaults and coerces boolean type", async () => {
@@ -867,6 +936,18 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
     expect(runRow?.id).toBe(body.workflow_run_id);
     expect(body.run_url).toBe(`${ORIGIN}/api/v1/repos/alice/actions-suite/actions/runs/${body.workflow_run_id}`);
     expect(body.html_url).toBe(`${ORIGIN}/alice/actions-suite/actions/runs/${body.workflow_run_id}`);
+  });
+
+  it("return_run_details parses the FormBool set (base_form.go:61-67, the R1-F8 fix): ?=1 and ?=on yield the 200, the false spellings stay 204", async () => {
+    const one = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "main" }, "alice-token", "?return_run_details=1");
+    expect(one.status).toBe(200);
+    expect(await one.json<{ workflow_run_id: number }>()).toHaveProperty("workflow_run_id");
+    const on = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "main" }, "alice-token", "?return_run_details=ON");
+    expect(on.status).toBe(200);
+    const zero = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "main" }, "alice-token", "?return_run_details=0");
+    expect(zero.status).toBe(204);
+    const junk = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "main" }, "alice-token", "?return_run_details=bogus");
+    expect(junk.status).toBe(204); // ParseBool's error stays false upstream's way
   });
 
   it("dispatches a TAG by its full ref; a BARE tag name 404s (the spoof-test parity)", async () => {
@@ -946,8 +1027,11 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
       (a, b) => b.index - a.index,
     )[0];
     expect(latest?.isScopedRun).toBe(false);
-    expect(latest?.workflowRepoId).toBe("");
-    expect(latest?.workflowCommitSha).toBe("");
+    // The repo-level skeleton fills the trio PRE-INSERT (workflow.go:136-137
+    // — WorkflowRepoID = this repo, WorkflowCommitSHA = the run commit; the
+    // R1-F5 pin over the former bare-insert "" residue).
+    expect(latest?.workflowRepoId).toBe(SUITE_REPO_ID);
+    expect(latest?.workflowCommitSha).toBe(TIP_MAIN);
     // the consumer's OWN ci.yml content dispatched (the greeting input — the
     // source's ci.yml declares `note` instead).
     const payload = JSON.parse(latest?.eventPayload ?? "{}") as { inputs: Record<string, string> };
@@ -965,9 +1049,11 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
     const latest = (await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.workflowId, "ci.yml")).all()).sort(
       (a, b) => b.index - a.index,
     )[0];
-    // the content-source parity columns (workflow.go:139-142/:260-263):
-    // is_scoped_run + the SOURCE repo row + the SOURCE default-branch sha,
-    // beside the consumer ref's own commit_sha.
+    // the content-source parity columns (workflow.go:139-142/:260-263), set
+    // PRE-INSERT through the shared insert's trio input (the R1-F5 fix —
+    // no post-insert UPDATE remains): is_scoped_run + the SOURCE repo row +
+    // the SOURCE default-branch sha, beside the consumer ref's own
+    // commit_sha.
     expect(latest?.isScopedRun).toBe(true);
     expect(latest?.workflowRepoId).toBe(SOURCE_REPO_ID);
     expect(latest?.workflowCommitSha).toBe(SOURCE_TIP);

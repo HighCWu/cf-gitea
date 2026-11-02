@@ -153,7 +153,7 @@ import {
   type RunRow,
   type TaskRow,
 } from "../../services/actions/model";
-import { loadRepoActionsConfig } from "../../services/actions/config";
+import { isScopedWorkflowOptedOut, loadRepoActionsConfig } from "../../services/actions/config";
 import { getFailedJobsForRerun, rerunWorkflowRunJobs } from "../../services/actions/rerun";
 import { getTaskStepsByTaskId, readTaskLogs, type TaskStepRow } from "../../services/actions/update";
 import { avatarLinkWithSize, defaultAvatarLink, type AvatarChainUser } from "../../services/avatars";
@@ -1402,8 +1402,13 @@ export async function buildViewResponse(
         done,
         workflowID: run.workflowId,
         workflowLink,
-        // Scoped runs read their source repo here (canViewScopedWorkflowFile);
-        // v1 rows never carry isScopedRun (the parity columns are unread).
+        // Upstream sets CanViewWorkflowFile = true and re-arms the SCOPED runs
+        // through canViewScopedWorkflowFile (view.go:610-614 — the file link
+        // only when the viewer reads the source repo). The rows now CARRY the
+        // parity columns (is_scoped_run/workflow_repo_id land on every
+        // producer), but the source-repo readability probe stays a recorded
+        // reduction here: the flag answers true unconditionally (the
+        // workflowLink above already branches on run.isScopedRun).
         canViewWorkflowFile: true,
         isSchedule,
         runAttempt: attempt === null ? 0 : attempt.attempt,
@@ -2034,13 +2039,22 @@ export async function rerunActionRun(
 
   // checkRunRerunAllowed (view.go:919-942) — the JSONError shapes
   // (context.go:276-278's {"errorMessage", "renderFormat": "text"}). The
-  // scoped-run twin (IsScopedWorkflowOptedOut, view.go:929-936) has no v1
-  // rows (the isScopedRun parity column is unread, SPEC §1.4).
+  // scoped-run twin REPLACES the repo-level disabled read with the opt-out
+  // store over the run's own WorkflowRepoID (view.go:929-936's
+  // `disabled = IsScopedWorkflowOptedOut(...)` — the landed parity columns
+  // carry is_scoped_run/workflow_repo_id on every producer row); the owner
+  // arg rides run.ownerId, the sibling gate's shape (rerun.ts's
+  // validateRerun — the repo's CURRENT-owner divergence after a transfer is
+  // R1-F9's separate thread).
   if (!isDoneStatusValue(run.status)) {
     return { kind: "json", status: 400, body: { errorMessage: repoActionsViewLocale.runNotDone, renderFormat: "text" } };
   }
   const cfg = await loadRepoActionsConfig(d1, run.repoId);
-  if (cfg.disabledWorkflows.includes(run.workflowId)) {
+  let workflowDisabled = cfg.disabledWorkflows.includes(run.workflowId);
+  if (run.isScopedRun) {
+    workflowDisabled = await isScopedWorkflowOptedOut(d1, cfg, run.ownerId, run.workflowRepoId, run.workflowId);
+  }
+  if (workflowDisabled) {
     return { kind: "json", status: 400, body: { errorMessage: repoActionsViewLocale.workflowDisabled, renderFormat: "text" } };
   }
 

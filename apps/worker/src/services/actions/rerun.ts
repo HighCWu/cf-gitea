@@ -524,9 +524,13 @@ export async function rerunWorkflowRunJobs(
       // triggerUserId rides run.TriggerUserID (the context.go:83/112 actor
       // sources — a rerun's github.actor stays the original trigger user;
       // the single-seam export collapses triggering_actor onto it).
-      // workflow_sha is the run commit: v1 rows never carry
-      // workflow_commit_sha (SPEC §1.4) and the push family's workflow
-      // content commit IS the run commit (the insert path's equation).
+      // workflow_sha reads the row's own content-source column
+      // (context.go:115's run.WorkflowCommitSHA): a SCOPED run carries the
+      // SOURCE commit there (workflow.go:260-263's pre-insert trio, the
+      // landed producers fill it), a repo-level run carries the run commit
+      // (the insert path's equation). Legacy rows predating the column keep
+      // the ""-default → the run-commit fallback (the trigger insert's
+      // reader twin, trigger.ts's context rebuild).
       const repoRecordRows = await db
         .select({ ownerNamespace: repositories.ownerNamespace, slug: repositories.slug })
         .from(repositories)
@@ -544,7 +548,7 @@ export async function rerunWorkflowRunJobs(
         ref: run.ref,
         commitSha: run.commitSha,
         workflowId: run.workflowId,
-        workflowSha: run.commitSha,
+        workflowSha: run.workflowCommitSha !== "" ? run.workflowCommitSha : run.commitSha,
         eventName: run.triggerEvent,
         eventPayloadJson: run.eventPayload,
         appUrl: "",

@@ -24,7 +24,7 @@ import {
 import type { AuthInfo } from "../../auth/auth-context";
 import { emitWorkflowDispatchAudit, emitWorkflowToggleAudit } from "../../services/actions/audit-arms";
 import type { RunJobRow, RunRow, RunAttemptRow, TaskRow } from "../../services/actions/model";
-import { increaseTaskVersion, insertActionRun } from "../../services/actions/model";
+import { increaseTaskVersion } from "../../services/actions/model";
 import {
   isScopedWorkflowOptedOut,
   isScopedWorkflowSourceEffective,
@@ -34,7 +34,7 @@ import {
 } from "../../services/actions/config";
 import { SCOPED_WORKFLOW_DIRS } from "../../services/actions/scoped-workflows";
 import { findReadableArtifacts, type ArtifactRow } from "../../services/actions/artifacts";
-import { nextRunIndex } from "../../services/actions/trigger";
+import { insertTriggeredRunSplit, readWorkflowRawConcurrency } from "../../services/actions/trigger";
 import { getFailedJobsForRerun, rerunWorkflowRunJobs } from "../../services/actions/rerun";
 import type { RerunResult } from "../../services/actions/rerun";
 import {
@@ -68,9 +68,11 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
  * actions stores: the git-tree workflow reader rides the engine reads (the
  * repo-actions-workflow/repo-actions-runs UI modules' WORKFLOW_DIRS walk),
  * the disable/enable store IS the LANDED ActionsConfig (`repo_units.config`
- * — services/actions/config.ts), the dispatch inserts through the LANDED
- * `insertActionRun` seam, and job logs read the LANDED DBFS chunk/R2 store
- * (the repo-actions-logs UI module's read arms).
+ * — services/actions/config.ts), the dispatch rides the LANDED producer legs
+ * (`insertTriggeredRunSplit` — the same insert the web dispatch and the
+ * push/schedule family take, services/actions/trigger.ts), and job logs read
+ * the LANDED DBFS chunk/R2 store (the repo-actions-logs UI module's read
+ * arms).
  *
  * FAMILY/FILE — the /api/v1 actions family lives in
  * routes/secrets-variables.ts (secrets/variables/runners), but that file is
@@ -1042,11 +1044,18 @@ export function statusFilterToInternal(status: string): number[] | null {
   }
 }
 
-/** FormOptionalBool's spelling of the query booleans (base_form.go:71-79):
- *  exactly "true" parses true; every other spelling parses FALSE upstream's
- *  own way — except absent (undefined = no flag). */
+/** FormBool's spelling of the query booleans (base_form.go:61-67): ParseBool's
+ *  true set {1,t,T,TRUE,true,True} plus the case-insensitive "on" — a parse
+ *  error stays false upstream's way (absent/junk and the 0-armed false
+ *  spellings all answer false). Both query booleans of this family read
+ *  through it upstream: exclude_pull_requests (shared/action.go:164) and
+ *  return_run_details (action.go:1181 — ?=1 yields the RunDetails 200, the
+ *  R1-F8 fix over the former exact-"true" parse). */
 function formBool(url: URL, key: string): boolean {
-  return url.searchParams.get(key) === "true";
+  const raw = url.searchParams.get(key);
+  if (raw === null) return false;
+  const parsed = raw === "1" || raw === "t" || raw === "T" || raw === "TRUE" || raw === "true" || raw === "True";
+  return parsed || raw.toLowerCase() === "on";
 }
 
 // ---------------------------------------------------------------------------
@@ -1203,8 +1212,12 @@ function dispatchEventInputs(inputs: Map<string, unknown>): Record<string, strin
  * DispatchActionWorkflow (workflow.go:64-190, repo-level + :237-268 scoped
  * arms) — the M3-free port: the disabled check, the ref resolution, the
  * workflow-content read, the light validation, the dispatch-config gate,
- * the inputs merge and the insertActionRun insert. The caller resolved the
- * repo row + gates.
+ * the inputs merge and the insertTriggeredRunSplit producer legs (the
+ * R1-F4 fix — the same shared insert the web dispatch and the push/schedule
+ * family take, so a dispatched run carries the run-name interpolation, the
+ * concurrency fill + gate, the matrix combos, the per-job statuses and the
+ * commit statuses exactly like every other producer). The caller resolved
+ * the repo row + gates.
  *
  * `scopedWorkflowSourceRepoId` is the RAW `scoped_workflow_source_repo_id`
  * query value normalized through config.ts's scopedSourceRepoParam (the
@@ -1329,12 +1342,9 @@ export async function dispatchActionWorkflow(input: {
   }
   coerceDispatchInputTypes(parsed.dispatchInputs, inputsWithDefaults);
 
-  // The run row (workflow.go:122-125): title = the commit's message title,
-  // event/triggerEvent workflow_dispatch, status waiting; index = the
-  // repo_counters.run_index CAS (the module header's note — the same
-  // allocation every run producer shares).
-  const nextIndex = await nextRunIndex(d1, pair.repo.id);
-
+  // The payload (WorkflowDispatchPayload, workflow.go:174-193): the API arm
+  // keeps the full repository/sender objects — the web arm's {}-shape
+  // reduction is services/actions/workflow-dispatch.ts's documented split.
   const settings = await loadRepoSettings(d1, pair.repo.id);
   const senderRow = await userRowOrNull(d1, doerId);
   const eventPayload = JSON.stringify({
@@ -1345,7 +1355,21 @@ export async function dispatchActionWorkflow(input: {
     sender: senderRow === null ? null : apiUserFromRow(senderRow, { origin, requester: null }),
   });
 
-  const { run } = await insertActionRun(
+  // PrepareRunAndInsert (workflow.go:189 → run.go:63-217) through the shared
+  // producer legs — the same insert the web dispatch and the push/schedule
+  // family take (the R1-F4 fix; the bare insertActionRun shape is retired):
+  // the E5 model split (matrix combos + job names), the E2 run-name
+  // interpolation over the commit-subject title, the E4 workflow-level
+  // concurrency fill + gate, the job-level concurrency/statuses, the
+  // invalid-if/runs-on summaries, the task-version bump, the commit statuses
+  // (run.go:45-52) and the post-commit emitter kick. The run index is the
+  // split's own repo_counters.run_index CAS (the bare insert's pre-allocated
+  // index input died with insertActionRun); `inputs` thread ${{ inputs.* }}
+  // (jobparser.WithInputs). A deep parse/concurrency failure throws into the
+  // 500 chrome after the split's row compensation — upstream's own split:
+  // the light ladder above answers the 422s, while run.go:121-123's parse
+  // error propagates to the APIErrorInternal arm.
+  const outcome = await insertTriggeredRunSplit(
     d1,
     {
       repoId: pair.repo.id,
@@ -1353,40 +1377,33 @@ export async function dispatchActionWorkflow(input: {
       // is nullable; the resolved owner row is not).
       ownerId: pair.owner.id,
       workflowId,
-      index: nextIndex,
       triggerUserId: doerId,
       ref: refName,
       commitSha: runTargetCommit.oid,
+      // The content-source skeleton, set PRE-INSERT exactly as upstream sets
+      // it on the run (the R1-F5 pin — workflow.go:136-137's repo-level
+      // fields, :260-263's scoped overrides): the repo-level default is this
+      // repo at the run commit (undefined → the shared insert's defaults),
+      // the scoped arm carries the SOURCE pair verbatim. No post-insert
+      // compensation UPDATE remains on either arm.
+      workflowSha: scopedSource !== null ? scopedSource.sha : undefined,
+      workflowRepoId: scopedSource !== null ? scopedSource.repoId : undefined,
+      isScopedRun: scopedSource !== null ? true : undefined,
+      isForkPullRequest: false,
       event: "workflow_dispatch",
-      eventPayload,
+      eventPayloadJson: eventPayload,
       triggerEvent: "workflow_dispatch",
       title: runTargetCommit.subject,
+      repoOwnerNamespace: pair.repo.ownerNamespace,
+      repoSlug: pair.repo.slug,
+      appUrl: origin,
     },
-    parsed.jobs.map((job) => ({
-      jobId: job.jobId,
-      name: job.name,
-      needs: job.needs,
-      runsOn: job.runsOn,
-      workflowPayload: new TextEncoder().encode(job.payload),
-    })),
+    content,
+    readWorkflowRawConcurrency(content),
+    Object.fromEntries(inputsWithDefaults),
   );
 
-  // The scoped run's content-source columns (workflow.go:139-142's
-  // WorkflowRepoID/WorkflowCommitSHA skeleton + :260-263's IsScopedRun):
-  // upstream sets them BEFORE PrepareRunAndInsert; the M1a insert's input
-  // carries no such fields, so the scoped arm compensates with one
-  // post-insert UPDATE — the service arm's exact compensation shape
-  // (services/actions/workflow-dispatch.ts), the sha folded in (this light
-  // insert builds no github context at insert time; the claim-time context
-  // reads the row column, context.go:115).
-  if (scopedSource !== null) {
-    await drizzle(d1)
-      .update(actionRuns)
-      .set({ workflowRepoId: scopedSource.repoId, workflowCommitSha: scopedSource.sha, isScopedRun: true })
-      .where(eq(actionRuns.id, run.id));
-  }
-
-  return { outcome: "dispatched", runId: run.id };
+  return { outcome: "dispatched", runId: outcome.run.id };
 }
 
 /**
@@ -2324,10 +2341,28 @@ export function registerRepoActionsRoutes(
         triggerUserId = row.id;
       }
 
-      // The scoped filter (action.go:1003-1004 + shared/action.go:139-142):
-      // a non-zero source id selects scoped runs; 0/absent is repo-level.
-      const scopedRaw = url.searchParams.get("scoped_workflow_source_repo_id") ?? "0";
-      const scopedId = /^\d+$/.test(scopedRaw) ? Number.parseInt(scopedRaw, 10) : 0;
+      // The scoped filter (repo/action.go:1025-1026's probe +
+      // shared/action.go:142-145's ListRuns, applied by
+      // models/actions/run_list.go:105-109): the is_scoped_run half applies
+      // on EVERY spelling (upstream sets `opts.IsScopedRun =
+      // optional.Some(workflowSourceRepoID > 0)` whenever workflowID is
+      // non-empty — the false arm filters scoped runs OUT of the repo-level
+      // query); the workflow_repo_id half joins only when an id is present
+      // (run_list.go:105-107's `> 0` gate). The TEXT adaptation keeps the id
+      // verbatim through config.ts's scopedSourceRepoParam (the dispatch
+      // arm's spelling: ""/"0"/a negative = the repo-level arm) — the
+      // store's id space is TEXT UUIDs, so the former digits-only parse
+      // could never equal a real source id and the workflowRepoId half
+      // filtered nothing (the R1-F6 fix). A junk id selects the (empty)
+      // scoped set — the dispatch arm's recorded divergence from upstream's
+      // FormInt64 junk→0 fallback.
+      const scopedSourceId = scopedSourceRepoParam(
+        url.searchParams.get("scoped_workflow_source_repo_id") ?? "",
+      );
+      const scopedConds =
+        scopedSourceId === ""
+          ? [eq(actionRuns.isScopedRun, false)]
+          : [eq(actionRuns.isScopedRun, true), eq(actionRuns.workflowRepoId, scopedSourceId)];
 
       // The store id match: upstream passes the RAW path param to
       // FindRunOptions.WorkflowID and the ToConds arm is an exact Eq
@@ -2338,16 +2373,19 @@ export function registerRepoActionsRoutes(
       // the landed like()-over-path-spelled-rows bridge is retired.
       const workflowMatch = eq(actionRuns.workflowId, workflowId);
 
-      // The existence probe (action.go:1009-1032): existing runs prove the
-      // workflow valid — historical files list without a git lookup; a
-      // never-run repo-level workflow falls back to the tree walk.
+      // The existence probe (repo/action.go:1027-1042): BOTH scoped conds
+      // ride it too (upstream's FindRunOptions carries the pair); existing
+      // runs prove the workflow valid — historical files list without a git
+      // lookup; a never-run REPO-LEVEL workflow falls back to the tree walk
+      // (a scoped query may legitimately return an empty list, so the
+      // fallback arms only on the repo-level spelling).
       const db = drizzle(c.env.DB);
       const probe = await db
         .select({ id: actionRuns.id })
         .from(actionRuns)
-        .where(and(eq(actionRuns.repoId, pair.repo.id), workflowMatch, eq(actionRuns.isScopedRun, scopedId > 0)))
+        .where(and(eq(actionRuns.repoId, pair.repo.id), workflowMatch, ...scopedConds))
         .limit(1);
-      if (probe[0] === undefined && scopedId === 0) {
+      if (probe[0] === undefined && scopedSourceId === "") {
         const reads = engineReads(c.env, { ownerNamespace: pair.repo.ownerNamespace, slug: pair.repo.slug });
         const found = await findWorkflowEntry(reads, pair, workflowId);
         if (found === null) {
@@ -2358,7 +2396,7 @@ export function registerRepoActionsRoutes(
       // shared.ListRuns (shared/action.go:131-228) at (0, repoID, workflowID)
       // — the filters over the landed columns; repo-scoped order is
       // `index DESC` (run_list.go:142-149).
-      const conditions = [eq(actionRuns.repoId, pair.repo.id), workflowMatch, eq(actionRuns.isScopedRun, scopedId > 0)];
+      const conditions = [eq(actionRuns.repoId, pair.repo.id), workflowMatch, ...scopedConds];
       const eventParam = url.searchParams.get("event") ?? "";
       if (eventParam !== "") conditions.push(eq(actionRuns.triggerEvent, eventParam));
       const branchParam = url.searchParams.get("branch") ?? "";

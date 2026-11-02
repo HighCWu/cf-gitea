@@ -2423,10 +2423,9 @@ export async function insertTriggeredRunSplit(
           // default is this repo at the run commit (notifier_helper.go:381
           // + dwf.SourceCommitSHA), a scoped caller overrides through the
           // workflowSha/workflowRepoId/isScopedRun inputs (workflow.go:139-142
-          // + :260-263's pre-insert fields — the dispatch producer's
-          // post-insert compensation for the sha half is retired; the
-          // repo_id/is_scoped_run halves still ride the dispatch arm's
-          // post-insert UPDATE).
+          // + :260-263's pre-insert fields — ALL THREE halves ride the
+          // insert on both producers; the dispatch arms' post-insert
+          // compensation UPDATEs are retired).
           workflowRepoId: input.workflowRepoId ?? input.repoId,
           workflowCommitSha: input.workflowSha ?? input.commitSha,
           isScopedRun: input.isScopedRun ?? false,

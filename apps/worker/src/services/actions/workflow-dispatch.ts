@@ -78,17 +78,16 @@
  *     → ParseScopedWorkflows' ListScopedWorkflows — the SCOPED_WORKFLOW_DIRS
  *     walk at the source's default-branch HEAD, the entry-name match);
  *     a missing workflow answers not-found (:260-267);
- *   5. the run records its content source: WorkflowCommitSHA rides the
- *     shared insert's workflowSha input (upstream's pre-insert skeleton
- *     field, :139-142 — the SOURCE sha on this arm, the run commit on the
- *     repo-level arm), so github.workflow_sha (context.go:115) and the
- *     workflow_commit_sha column carry the content commit from birth; the
- *     post-insert UPDATE writes the remaining pair workflow_repo_id/
- *     is_scoped_run (:260-263 — the shared input carries no fields for
- *     them yet, so the scoped arm compensates right after — one extra
- *     UPDATE the repo-level arm never takes). The first PRODUCER of the
- *     is_scoped_run parity column (SPEC-0012 §1.4's "schema lands,
- *     nothing writes" note is superseded for this arm).
+ *   5. the run records its content source: the whole trio rides the shared
+ *     insert's input PRE-INSERT (workflowSha/workflowRepoId/isScopedRun —
+ *     upstream sets the fields on the run skeleton before PrepareRunAndInsert,
+ *     :260-263; the repo-level arm leaves them undefined for the shared
+ *     insert's workflow.go:136-137 defaults), so github.workflow_sha
+ *     (context.go:115) and the workflow_commit_sha/workflow_repo_id/
+ *     is_scoped_run columns carry the content source from birth — the
+ *     R1-F5 fix retired the scoped arm's former post-insert UPDATE. The
+ *     first PRODUCER of the is_scoped_run parity column (SPEC-0012 §1.4's
+ *     "schema lands, nothing writes" note is superseded for this arm).
  *
  * The former `workflow_sha` residual is LANDED (SPEC-0013 §6): the shared
  * insert grew the workflowSha input, so a scoped run's github.workflow_sha
@@ -97,6 +96,9 @@
  * exact split (workflow.go:126-142 builds CommitSHA = runTargetCommit and
  * WorkflowCommitSHA = the content source as two independent skeleton
  * fields). A repo-level dispatch keeps them equal (workflow.go:136-137).
+ * The whole trio is insert-carried now (the R1-F5 note above) — the
+ * repo_id/is_scoped_run halves stopped riding the old post-insert UPDATE
+ * with it.
  *
  * ## Documented reductions (§6 method — each cites its upstream arm)
  *
@@ -139,7 +141,7 @@ import {
   readWorkflowRawConcurrency,
   type TriggerRunOutcome,
 } from "./trigger";
-import { actionRuns, repositories } from "../../db/schema";
+import { repositories } from "../../db/schema";
 import {
   isScopedWorkflowOptedOut,
   isScopedWorkflowSourceEffective,
@@ -363,11 +365,16 @@ export async function dispatchWorkflow(input: WorkflowDispatchInputRequest): Pro
   // PrepareRunAndInsert (workflow.go:195-198) with the inputs threaded —
   // the landed insert's optional `inputs` parameter (jobparser.WithInputs'
   // expression surface). Title = MessageTitle = the commit subject; Ref =
-  // the NORMALIZED RefName (workflow.go:132/141). workflowSha carries the
-  // skeleton's WorkflowCommitSHA (workflow.go:137's runTargetCommit on the
-  // repo-level arm — the run commit itself; workflow.go:266's source HEAD
-  // on the scoped arm), so github.workflow_sha (context.go:115) and the
-  // row's workflow_commit_sha column carry the content commit from birth.
+  // the NORMALIZED RefName (workflow.go:132/141). The content-source trio
+  // rides the shared insert's input PRE-INSERT exactly as upstream sets the
+  // fields on the run (workflow.go:136-137's repo-level skeleton —
+  // WorkflowRepoID = this repo, WorkflowCommitSHA = the run commit, the
+  // undefined-defaults arm; :260-263's scoped overrides — the SOURCE repo +
+  // HEAD sha + IsScopedRun), so github.workflow_sha (context.go:115), the
+  // workflow_commit_sha column and the scoped parity pair carry the content
+  // source from birth (the R1-F5 fix retires the scoped arm's former
+  // post-insert compensation UPDATE — the insert→update window no longer
+  // exists).
   const outcome = await insertTriggeredRunSplit(
     d1,
     {
@@ -378,6 +385,8 @@ export async function dispatchWorkflow(input: WorkflowDispatchInputRequest): Pro
       ref: refName,
       commitSha: commit.oid,
       workflowSha: scopedSource !== null ? scopedSource.sha : undefined,
+      workflowRepoId: scopedSource !== null ? scopedSource.repoId : undefined,
+      isScopedRun: scopedSource !== null ? true : undefined,
       isForkPullRequest: false,
       event: "workflow_dispatch",
       eventPayloadJson,
@@ -392,20 +401,6 @@ export async function dispatchWorkflow(input: WorkflowDispatchInputRequest): Pro
     typed,
   );
 
-  // The scoped run's remaining content-source columns (workflow.go:139-142's
-  // WorkflowRepoID skeleton + :260-263's IsScopedRun): upstream sets the
-  // fields on the run BEFORE PrepareRunAndInsert; the shared insert's input
-  // carries the workflowSha half (above) but not these two, so the scoped
-  // arm compensates right after (the module header). The in-memory row
-  // mirrors the write.
-  if (scopedSource !== null) {
-    await drizzle(d1)
-      .update(actionRuns)
-      .set({ workflowRepoId: scopedSource.repoId, isScopedRun: true })
-      .where(eq(actionRuns.id, outcome.run.id));
-    outcome.run.workflowRepoId = scopedSource.repoId;
-    outcome.run.isScopedRun = true;
-  }
   return { status: "ok", run: outcome.run, jobs: outcome.jobs };
 }
 

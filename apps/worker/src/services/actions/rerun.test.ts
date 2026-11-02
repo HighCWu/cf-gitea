@@ -371,6 +371,28 @@ describe("the run-level concurrency fill + gate (rerun.go:209-233)", () => {
     expect(attempt.status).toBe(ACTION_STATUS_WAITING);
   });
 
+  it("the expression-bearing raw reads github.workflow_sha from the row's content-source column (context.go:115 — a scoped run's SOURCE sha, the R1-F10 arm)", async () => {
+    await seedRepo();
+    const SOURCE_SHA = "aaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const seeded = await seedRun(1, [{ jobId: "build" }]);
+    // The scoped producer's pre-insert trio (workflow.go:260-263): the
+    // content source commit differs from the run's own commit_sha.
+    await db()
+      .update(actionRuns)
+      .set({ isScopedRun: true, workflowRepoId: "repo-source", workflowCommitSha: SOURCE_SHA })
+      .where(eq(actionRuns.id, seeded.runId));
+    await wearRawConcurrency(seeded.runId, "group: ${{ github.workflow_sha }}\n");
+    await finishRun(seeded.runId, seeded.attemptId, ACTION_STATUS_FAILURE, [
+      { id: seeded.jobIds[0]!, status: ACTION_STATUS_FAILURE },
+    ]);
+
+    const result = await rerunWorkflowRunJobs(env.DB, REPO_ID, await runRow(seeded.runId), USER_ID, []);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const attempt = (await db().select().from(actionRunAttempts).where(eq(actionRunAttempts.id, result.attempt.id)))[0]!;
+    expect(attempt.concurrencyGroup).toBe(SOURCE_SHA); // the row column, NOT the run commit
+  });
+
   it("cancel-in-progress clears the group's other holders (CancelPreviousJobsByRunConcurrency)", async () => {
     await seedRepo();
     const seeded = await seedRun(1, [{ jobId: "build" }]);

@@ -336,8 +336,8 @@ describe("dispatchWorkflow's scoped arm (resolveScopedDispatchContent, workflow.
     expect(outcome.run.commitSha).toBe(SHA); // ... at the consumer's commit
     expect(outcome.run.title).toBe("default subject"); // Title = the CONSUMER commit's MessageTitle
     const row = await db().select().from(actionRuns).where(eq(actionRuns.id, outcome.run.id)).get();
-    expect(row?.isScopedRun).toBe(true); // the post-insert UPDATE persisted it
-    expect(row?.workflowRepoId).toBe(SRC_ID);
+    expect(row?.isScopedRun).toBe(true); // the insert's trio input carried it (the R1-F5 pin)
+    expect(row?.workflowRepoId).toBe(SRC_ID); // ...pre-insert, no post-insert UPDATE
     expect(row?.workflowCommitSha).toBe(SRC_SHA); // the insert's workflowSha input persisted it
     const jobs = await db().select().from(actionRunJobs).where(eq(actionRunJobs.runId, outcome.run.id));
     expect(jobs.length).toBe(1);

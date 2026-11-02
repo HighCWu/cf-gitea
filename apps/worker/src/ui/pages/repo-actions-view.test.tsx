@@ -34,6 +34,7 @@ import {
   type TaskRow,
 } from "../../services/actions/model";
 import { parseRepoActionsConfig, saveRepoActionsConfig } from "../../services/actions/config";
+import { scopedWorkflowSourcesStore } from "../../services/actions/scoped-workflow-sources";
 import { updateLog, updateTaskByState } from "../../services/actions/update";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
@@ -1199,6 +1200,46 @@ describe("the rerun arm (POST runs/{run}/rerun[-failed] + jobs/{job}/rerun — v
       status: 400,
       body: { errorMessage: "Workflow is disabled.", renderFormat: "text" },
     });
+  });
+
+  it("a SCOPED run consults the opt-out store instead of the repo-level map (checkRunRerunAllowed's scoped twin, view.go:929-936 — the R1-F10 gate)", async () => {
+    const store = scopedWorkflowSourcesStore(env.DB);
+    const SRC_ID = "repo-scoped-src";
+    await store.removeSource(0, SRC_ID); // defensive: the sources table outlives the beforeEach wipe
+    await store.addSource(0, SRC_ID); // instance-level registration
+
+    const seeded = await seedRun(1, { jobs: [{ jobId: "build" }] });
+    await setStatus(seeded.run.id, seeded.attempt.id, ACTION_STATUS_SUCCESS, { jobStatus: ACTION_STATUS_SUCCESS });
+    // Mark the run the way the scoped dispatch producer writes it
+    // (is_scoped_run + workflow_repo_id — the landed parity columns).
+    await drizzle(env.DB)
+      .update(actionRuns)
+      .set({ isScopedRun: true, workflowRepoId: SRC_ID })
+      .where(eq(actionRuns.id, seeded.run.id));
+
+    // Flagged + not required → the opt-out gate answers the disabled locale;
+    // the repo-level disabled map stays empty (the arms are exclusive).
+    await saveRepoActionsConfig(env.DB, repo.id, {
+      ...parseRepoActionsConfig(null),
+      disabledScopedWorkflows: { [SRC_ID]: [WORKFLOW_ID] },
+    });
+    const refused = await rerun(seeded.run.id, { kind: "run" });
+    expect(refused).toEqual({
+      kind: "json",
+      status: 400,
+      body: { errorMessage: "Workflow is disabled.", renderFormat: "text" },
+    });
+    const attempts = await drizzle(env.DB).select().from(actionRunAttempts).where(eq(actionRunAttempts.runId, seeded.run.id));
+    expect(attempts).toHaveLength(1); // nothing written
+
+    // REQUIRED in the registration → the stale flag is dead
+    // (IsScopedWorkflowOptedOut's conjunction, workflow.go:89-92) — the
+    // rerun proceeds to attempt 2.
+    await store.setSourceConfigs(0, SRC_ID, { [WORKFLOW_ID]: { required: true, patterns: ["*"] } });
+    const allowed = await rerun(seeded.run.id, { kind: "run" });
+    expect(allowed).toMatchObject({ kind: "json", status: 200 });
+
+    await store.removeSource(0, SRC_ID);
   });
 
   it("the job rerun: a foreign job 404-shells, the run's own job succeeds (view.go:970-974)", async () => {
