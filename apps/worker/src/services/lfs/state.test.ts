@@ -1,9 +1,9 @@
 /**
- * `lfs_objects` state machine on real D1 (SPEC-0006 §3.2–3.4): idempotent
- * `ensureUploading`, verify flip, adopt (success / size / checksum), stale
- * sweep query shapes, GC candidates + reachability predicate. The table is
- * created from the DDL-in-waiting (`LFS_OBJECTS_DDL_STATEMENTS`) until the
- * drizzle migration lands.
+ * `lfs_objects` state machine on real D1 (SPEC-0006 §3.2–3.4):
+ * `insertUploadingIfAbsent` (the PUT handler's row creator — upstream
+ * `NewLFSMetaObject` insert-if-absent), verify flip, adopt (success / size /
+ * checksum), stale sweep query shapes, GC candidates + reachability
+ * predicate.
  */
 
 import { env } from "cloudflare:workers";
@@ -34,22 +34,26 @@ const rawRow = async (oid: string): Promise<{ state: string; size: number; updat
 beforeAll(applyLfsObjectsDdl);
 beforeEach(resetLfsTables);
 
-describe("ensureUploading (idempotent batch row)", () => {
-  it("inserts an uploading row and refreshes it on re-batch", async () => {
-    await service().ensureUploading(REPO, OID, 100, NOW);
+describe("insertUploadingIfAbsent (the PUT handler's row creator)", () => {
+  it("inserts an uploading row and leaves an EXISTING row untouched (NewLFSMetaObject)", async () => {
+    expect(await service().insertUploadingIfAbsent(REPO, OID, 100, NOW)).toBe(true);
     expect(await rawRow(OID)).toMatchObject({ state: "uploading", size: 100 });
 
+    // A second insert is a NO-OP: no size refresh, no state demotion, no
+    // updated_at bump (models/git/lfs.go:106-119 — upstream never refreshes a
+    // row; the ledger L5/L6 correction retired the ensureUploading upsert).
     const later = new Date(NOW.getTime() + DEFAULT_STALE_UPLOADING_AFTER_SECONDS * 1000);
-    await service().ensureUploading(REPO, OID, 100, later);
+    expect(await service().insertUploadingIfAbsent(REPO, OID, 200, later)).toBe(false);
     const row = await rawRow(OID);
     expect(row?.state).toBe("uploading");
-    expect(row?.updated_at).toBe(Math.floor(later.getTime() / 1000));
+    expect(row?.size).toBe(100);
+    expect(row?.updated_at).toBe(Math.floor(NOW.getTime() / 1000));
     expect(await service().get(REPO, OID)).toMatchObject({ repoId: REPO, oid: OID, size: 100, state: "uploading" });
   });
 
   it("is per-repo: same oid in another repo is an independent row", async () => {
-    await service().ensureUploading(REPO, OID, 100, NOW);
-    await service().ensureUploading(REPO + 1, OID, 200, NOW);
+    await service().insertUploadingIfAbsent(REPO, OID, 100, NOW);
+    await service().insertUploadingIfAbsent(REPO + 1, OID, 200, NOW);
     expect((await service().get(REPO, OID))?.size).toBe(100);
     expect((await service().get(REPO + 1, OID))?.size).toBe(200);
   });
@@ -61,7 +65,7 @@ describe("ensureUploading (idempotent batch row)", () => {
 
 describe("markVerified (verify handler flip)", () => {
   it("flips uploading → verified and reports no-op for absent rows", async () => {
-    await service().ensureUploading(REPO, OID, 100, NOW);
+    await service().insertUploadingIfAbsent(REPO, OID, 100, NOW);
     expect(await service().markVerified(REPO, OID, NOW)).toBe(true);
     expect(await rawRow(OID)).toMatchObject({ state: "verified" });
     expect(await service().markVerified(REPO, OID2, NOW)).toBe(false);
@@ -102,7 +106,7 @@ describe("adopt (§3.3)", () => {
 
 describe("quota projection", () => {
   it("sums every row of the repo (uploading included, conservative)", async () => {
-    await service().ensureUploading(REPO, OID, 100, NOW);
+    await service().insertUploadingIfAbsent(REPO, OID, 100, NOW);
     await service().insertVerified(REPO, OID2, 250, NOW);
     expect(await service().sumSize(REPO)).toBe(350);
     expect(await service().sumSize(REPO + 1)).toBe(0);
@@ -116,9 +120,9 @@ describe("stale-uploading sweep queries (§3.4)", () => {
     const past = new Date(NOW.getTime() - 25 * HOUR);
     const fresh = new Date(NOW.getTime() - 1 * HOUR);
 
-    await service().ensureUploading(REPO, OID, 100, past); // stale, object present
-    await service().ensureUploading(REPO, OID2, 200, past); // stale, object missing
-    await service().ensureUploading(REPO + 1, OID, 300, fresh); // not stale
+    await service().insertUploadingIfAbsent(REPO, OID, 100, past); // stale, object present
+    await service().insertUploadingIfAbsent(REPO, OID2, 200, past); // stale, object missing
+    await service().insertUploadingIfAbsent(REPO + 1, OID, 300, fresh); // not stale
 
     const cutoff = new Date(NOW.getTime() - DEFAULT_STALE_UPLOADING_AFTER_SECONDS * 1000);
     expect(await service().repoIdsWithStaleUploading(cutoff)).toEqual([REPO]);
@@ -142,7 +146,7 @@ describe("stale-uploading sweep queries (§3.4)", () => {
   });
 
   it("sweep validation rejects checksum mismatches (row is deleted, object GC'd later)", async () => {
-    await service().ensureUploading(REPO, OID, 100, new Date(NOW.getTime() - 48 * HOUR));
+    await service().insertUploadingIfAbsent(REPO, OID, 100, new Date(NOW.getTime() - 48 * HOUR));
     const cutoff = new Date(NOW.getTime() - DEFAULT_STALE_UPLOADING_AFTER_SECONDS * 1000);
     const outcome = await service().sweepStaleUploading(
       REPO,
@@ -161,7 +165,7 @@ describe("GC candidates + reachability predicate (§3.4)", () => {
     await service().insertVerified(REPO, "aa".repeat(32), 1, old); // candidate
     await service().insertVerified(REPO, "cc".repeat(32), 2, old); // candidate
     await service().insertVerified(REPO, "bb".repeat(32), 3, recent); // within grace
-    await service().ensureUploading(REPO, "dd".repeat(32), 4, old); // wrong state
+    await service().insertUploadingIfAbsent(REPO, "dd".repeat(32), 4, old); // wrong state
 
     const grace = { olderThan: new Date("2026-10-10T00:00:00Z"), updatedLessRecentlyThan: new Date("2026-10-10T00:00:00Z") };
     const page1 = await service().listGcCandidates(REPO, grace, { limit: 1 });

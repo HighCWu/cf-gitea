@@ -2711,8 +2711,14 @@ describe("the run-viewer write quartet (web.go:1588, 1590, 1597-1598 — the rer
       run: "7",
       job: "9",
     });
-    // Upstream's unregistered sibling: chi 404s it, the engine keeps it.
-    expect(parseUiRoute("/alice/demo/actions/runs/7/delete")).toBeNull();
+    // The ⑲A2 delete POST's claim (web.go:1597-1598 — landed with the I-a
+    // kebab; the drift guard keys on the family).
+    expect(parseUiRoute("/alice/demo/actions/runs/7/delete")).toEqual({
+      family: "actions-run-delete",
+      owner: "alice",
+      repo: "demo",
+      run: "7",
+    });
     // The deeper tail past the job param stays unclaimed (the parser's
     // exact-literal rule).
     expect(parseUiRoute("/alice/demo/actions/runs/7/jobs/9/rerun/extra")).toBeNull();

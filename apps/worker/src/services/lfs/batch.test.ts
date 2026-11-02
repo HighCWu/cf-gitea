@@ -100,38 +100,36 @@ const deps = (store: LfsStore = relay()): Parameters<typeof shapeBatchObject>[3]
 
 describe("batch request parsing (whole-request failures)", () => {
   it("400 on malformed JSON", () => {
-    expect(() => parseBatchRequest("{not json", LIMITS)).toThrow(new BatchRequestError(400, "Bad Request"));
+    expect(() => parseBatchRequest("{not json")).toThrow(new BatchRequestError(400, "Bad Request"));
   });
 
   it("400 on unknown/missing operation", () => {
-    expect(() => parseBatchRequest({ operation: "delete", objects: [] }, LIMITS)).toThrow(BatchRequestError);
-    expect(() => parseBatchRequest({}, LIMITS)).toThrow(BatchRequestError);
+    expect(() => parseBatchRequest({ operation: "delete", objects: [] })).toThrow(BatchRequestError);
+    expect(() => parseBatchRequest({})).toThrow(BatchRequestError);
   });
 
-  it("413 over the batch cap (0 = unlimited, upstream parity)", () => {
-    const objects = [{ oid: OID.UPLOAD, size: 1 }, { oid: OID.UPLOAD, size: 1 }, { oid: OID.UPLOAD, size: 1 }, { oid: OID.UPLOAD, size: 1 }];
-    expect(() => parseBatchRequest({ operation: "upload", objects }, LIMITS)).toThrow(
-      new BatchRequestError(413, "Request Entity Too Large"),
-    );
-    expect(() => parseBatchRequest({ operation: "upload", objects }, { maxBatchSize: 0 })).not.toThrow();
+  it("the object-count cap is NOT parse's job — upstream checks it after auth (L10, server.go:214-222)", () => {
+    const objects = Array.from({ length: LIMITS.maxBatchSize + 1 }, () => ({ oid: OID.UPLOAD, size: 1 }));
+    expect(() => parseBatchRequest({ operation: "upload", objects })).not.toThrow();
   });
 
   it("400 on non-string oid / non-integral size / non-array objects", () => {
-    expect(() => parseBatchRequest({ operation: "upload", objects: [{ oid: 5, size: 1 }] }, LIMITS)).toThrow(
+    expect(() => parseBatchRequest({ operation: "upload", objects: [{ oid: 5, size: 1 }] })).toThrow(
       BatchRequestError,
     );
-    expect(() => parseBatchRequest({ operation: "upload", objects: [{ oid: OID.UPLOAD, size: 1.5 }] }, LIMITS)).toThrow(
+    expect(() => parseBatchRequest({ operation: "upload", objects: [{ oid: OID.UPLOAD, size: 1.5 }] })).toThrow(
       BatchRequestError,
     );
-    expect(() => parseBatchRequest({ operation: "upload", objects: "nope" }, LIMITS)).toThrow(BatchRequestError);
+    expect(() => parseBatchRequest({ operation: "upload", objects: "nope" })).toThrow(BatchRequestError);
   });
 
-  it("missing objects yields zero results; transfers/ref accepted and ignored", () => {
-    const request = parseBatchRequest(
-      { operation: "upload", transfers: ["basic"], ref: { name: "refs/heads/main" } },
-      LIMITS,
-    );
-    expect(request).toMatchObject({ operation: "upload", objects: [] });
+  it("missing/null objects decode as upstream's nil slice; an explicit [] stays [] (L11)", () => {
+    const absent = parseBatchRequest({ operation: "upload", transfers: ["basic"], ref: { name: "refs/heads/main" } });
+    expect(absent.operation).toBe("upload");
+    expect(absent.objects).toBeNull();
+
+    expect(parseBatchRequest({ operation: "upload", objects: null }).objects).toBeNull();
+    expect(parseBatchRequest({ operation: "upload", objects: [] }).objects).toEqual([]);
   });
 });
 
@@ -157,7 +155,7 @@ describe("upload op per-object table", () => {
   });
 
   it("row exists with another size → 422 'Object <oid> is not <size> bytes'", async () => {
-    await state().ensureUploading(REPO_ID, OID_MISMATCH, 999, NOW);
+    await state().insertVerified(REPO_ID, OID_MISMATCH, 999, NOW);
     const result = await shapeBatchObject({ oid: OID_MISMATCH, size: SIZE }, "upload", ctx, deps());
     expect(result.error).toEqual({ code: 422, message: `Object ${OID_MISMATCH} is not ${SIZE} bytes` });
   });
@@ -184,7 +182,7 @@ describe("upload op per-object table", () => {
     expect(await state().get(REPO_ID, OID.ADOPT)).toMatchObject({ state: "verified" });
   });
 
-  it("absent object → upload + verify hrefs (relay shapes), row becomes uploading", async () => {
+  it("absent object → upload + verify hrefs (relay shapes); batch creates NO row (L5)", async () => {
     const result = await shapeBatchObject({ oid: OID.UPLOAD, size: SIZE }, "upload", ctx, deps());
     expect(result.error).toBeUndefined();
     expect(result.actions?.upload).toEqual({
@@ -195,7 +193,19 @@ describe("upload op per-object table", () => {
       href: relayVerifyHref(RELAY_BASE),
       header: { Accept: LFS_ACCEPT_HEADER, Authorization: AUTH },
     });
-    expect(await state().get(REPO_ID, OID.UPLOAD)).toMatchObject({ state: "uploading", size: SIZE });
+    // Upstream rows arise only in UploadHandler (server.go:369) — a batched
+    // upload issues hrefs against a rowless key; the relay PUT (or the verify
+    // adopt) creates the row.
+    expect(await state().get(REPO_ID, OID.UPLOAD)).toBeNull();
+  });
+
+  it("upload-then-mismatched-download 404s like upstream (the L5 corner — no row, so no 422)", async () => {
+    // Batch(upload) declares SIZE; no PUT happens; a later batch(download)
+    // declares a different size: upstream has no row → the download arm's
+    // `meta == nil` 404 fires (server.go:283-288), NOT the size-mismatch 422.
+    await shapeBatchObject({ oid: OID.UPLOAD, size: SIZE }, "upload", ctx, deps());
+    const result = await shapeBatchObject({ oid: OID.UPLOAD, size: 999999 }, "download", ctx, deps());
+    expect(result.error).toEqual({ code: 404, message: "Not Found" });
   });
 
   it("quota exceeded → 422 'LFS quota exceeded for repository'", async () => {
@@ -212,16 +222,18 @@ describe("upload op per-object table", () => {
 
   it("mixed batch: invalid objects never block valid ones (§4.8)", async () => {
     const results = await shapeBatchResponse(
-      parseBatchRequest(
-        { operation: "upload", objects: [{ oid: OID_BAD, size: 1 }, { oid: OID.UPLOAD, size: SIZE }] },
-        LIMITS,
-      ),
+      parseBatchRequest({ operation: "upload", objects: [{ oid: OID_BAD, size: 1 }, { oid: OID.UPLOAD, size: SIZE }] }),
       ctx,
       deps(),
     );
     expect(results).toHaveLength(2);
     expect(results[0]?.error?.code).toBe(422);
     expect(results[1]?.actions?.upload).toBeDefined();
+  });
+
+  it("nil objects shape to an empty list; the caller decides null vs [] in the envelope (L11)", async () => {
+    const results = await shapeBatchResponse(parseBatchRequest({ operation: "download" }), ctx, deps());
+    expect(results).toEqual([]);
   });
 });
 

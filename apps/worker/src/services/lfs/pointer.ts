@@ -2,15 +2,27 @@
  * LFS pointer file format — spec v1 (SPEC-0006 §2.4, port of upstream
  * `modules/lfs/pointer.go:20-112`).
  *
- * A pointer blob is < 1024 bytes, first line exactly
- * `version https://git-lfs.github.com/spec/v1`, then `oid sha256:<64 lowercase
- * hex>` and `size <n>` (non-negative). Canonical serialization has fixed
- * key/value order, so pointer bytes are reproducible — generate() and a
+ * A pointer blob is < 1024 bytes, starts with
+ * `version https://git-lfs.github.com/spec/v1`, then carries `oid sha256:<64
+ * lowercase hex>` and `size <n>`. Canonical serialization has fixed key/value
+ * order, so pointer bytes are reproducible — generate() and a
  * parsed-then-reserialized pointer are byte-identical.
  *
+ * The parser is the POSITIONAL port of upstream `ReadPointerFromBuffer`
+ * (pointer.go:53-80): the buffer must start with the version identifier
+ * (HasPrefix over the whole content — trailing characters on the version line
+ * are tolerated), split to ≥3 newline-separated segments, then exactly two
+ * positional reads — lines[1] is the oid line, lines[2] the size line.
+ * Anything past lines[2] is never read: extra/blank/duplicate/out-of-order
+ * keys are invisible, upstream's exact leniency envelope. `size` parses with
+ * Go strconv.ParseInt(…, 10, 64) semantics (optional sign, ASCII digits,
+ * int64 range), so `size +5` is valid — the ledger L4 correction
+ * (2026-11-02): the earlier scan-all-lines parser accepted out-of-order
+ * shapes upstream rejects and rejected `+5` upstream accepts.
+ *
  * Three error classes mirror upstream's parser outcomes: too-large input,
- * not-a-pointer (wrong version line / missing keys / bad line shape), and an
- * invalid oid/size payload.
+ * not-a-pointer (prefix miss / invalid structure), and an invalid oid/size
+ * payload (ErrInvalidOIDFormat and the ParseInt arms).
  */
 
 export const POINTER_MAX_BYTES = 1024;
@@ -59,11 +71,12 @@ export function generatePointer(oid: string, size: number): Uint8Array {
 }
 
 /**
- * Parse a candidate blob. Non-pointer content is NOT an error at the call
- * sites that probe blobs (`media/`, enrichment): pass `strict: false` to get
- * `null` instead of NotAPointerError; InvalidPointerError (a *malformed*
- * pointer) always throws — upstream serves those as raw content, a decision
- * the caller owns.
+ * Parse a candidate blob — the positional port of upstream
+ * `ReadPointerFromBuffer` (pointer.go:53-80). Non-pointer content is NOT an
+ * error at the call sites that probe blobs (`media/`, enrichment): pass
+ * `strict: false` to get `null` instead of NotAPointerError;
+ * InvalidPointerError (a *malformed* pointer) always throws — upstream serves
+ * those as raw content, a decision the caller owns.
  */
 export function parsePointer(
   bytes: Uint8Array,
@@ -73,44 +86,46 @@ export function parsePointer(
     throw new PointerTooLargeError(bytes.byteLength);
   }
   const text = new TextDecoder().decode(bytes);
+  // Upstream checks HasPrefix over the WHOLE buffer, not exact line equality —
+  // trailing characters on the version line pass (pointer.go:57-59).
+  if (!text.startsWith(VERSION_LINE)) {
+    if (strict) throw new NotAPointerError("content lacks the LFS prefix");
+    return null;
+  }
   const lines = text.split("\n");
-  if (lines[0] !== VERSION_LINE) {
-    if (strict) throw new NotAPointerError("missing version line");
+  if (lines.length < 3) {
+    if (strict) throw new NotAPointerError("invalid structure");
     return null;
   }
-  let oid: string | null = null;
-  let size: number | null = null;
-  // Parser mirrors upstream: ≥3 lines, `key value` shape, unknown keys ignored
-  // (forward compat), oid/size required exactly once.
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i] as string;
-    if (line === "") continue;
-    const sep = line.indexOf(" ");
-    if (sep === -1) {
-      if (strict) throw new NotAPointerError(`line ${i + 1} is not key/value`);
-      return null;
-    }
-    const key = line.slice(0, sep);
-    const value = line.slice(sep + 1);
-    if (key === "oid") {
-      if (!value.startsWith("sha256:")) {
-        throw new InvalidPointerError("oid algorithm must be sha256");
-      }
-      const hex = value.slice("sha256:".length);
-      if (!OID_RE.test(hex)) {
-        throw new InvalidPointerError(`oid is not 64 lowercase hex chars: ${hex}`);
-      }
-      oid = hex;
-    } else if (key === SIZE_KEY) {
-      if (!/^\d+$/.test(value)) {
-        throw new InvalidPointerError(`size is not a non-negative integer: ${value}`);
-      }
-      size = Number(value);
-    }
+
+  // Positional read 1 — the oid line (pointer.go:67-70). Go's TrimPrefix is a
+  // no-op when the prefix is absent, so a BARE 64-hex line is accepted, exactly
+  // like upstream; anything else fails isValidOid (ErrInvalidOIDFormat).
+  const oidLine = lines[1] as string;
+  const oid = oidLine.startsWith(OID_PREFIX) ? oidLine.slice(OID_PREFIX.length) : oidLine;
+  if (!OID_RE.test(oid)) {
+    throw new InvalidPointerError(`oid is not 64 lowercase hex chars: ${oid}`);
   }
-  if (oid === null || size === null) {
-    if (strict) throw new NotAPointerError("oid or size missing");
-    return null;
+
+  // Positional read 2 — the size line (pointer.go:71-74): the `size ` prefix
+  // strips when present, then Go strconv.ParseInt(s, 10, 64) — optional sign
+  // (so `size +5` parses to 5), ASCII digits only at base 10, int64 range.
+  const sizeLine = lines[2] as string;
+  const rawSize = sizeLine.startsWith(`${SIZE_KEY} `) ? sizeLine.slice(SIZE_KEY.length + 1) : sizeLine;
+  if (!/^[+-]?[0-9]+$/.test(rawSize)) {
+    throw new InvalidPointerError(`size is not an integer: ${JSON.stringify(rawSize)}`);
+  }
+  const value = BigInt(rawSize);
+  if (value > 9223372036854775807n || value < -9223372036854775808n) {
+    throw new InvalidPointerError(`size is out of int64 range: ${rawSize}`);
+  }
+  const size = Number(value); // lossy only past 2^53 — absurd sizes, exact int64 accept-range preserved
+  // Upstream parses a negative size fine and rejects it later at IsValid()
+  // (pointer.go:98-106); parsePointer's contract is "returns usable pointers",
+  // so the IsValid arm is this throw (InvalidPointerError — the same outcome
+  // upstream callers observe).
+  if (size < 0) {
+    throw new InvalidPointerError(`size is negative: ${rawSize}`);
   }
   return { oid, size };
 }

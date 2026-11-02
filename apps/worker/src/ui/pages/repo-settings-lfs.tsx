@@ -32,11 +32,11 @@
  * render (lfs.tmpl's delete trash button + #delete-lfs-object dialog,
  * lfs_pointers.tmpl's associate form, lfs_locks.tmpl's lock/unlock forms all
  * stay unrendered — the no-dead-controls rule). The Locks anchor on the list
- * header (lfs.tmpl:6) omits for the same reason WITH a stronger one: the
- * locks API is a 501 defer at this pin (SPEC-0006 §2.7 P2,
- * src/lfs/router.ts:432) — there is no locks page to anchor. The census
- * impact table's "locks already landed" reads SPEC-0006's PLAN, not the pin
- * (the census correction this module's header records).
+ * header (lfs.tmpl:6) omits for the same reason: the locks API itself IS
+ * landed (2026-10-30, SPEC-0006 §2.7 — services/lfs/locks.ts + src/lfs/
+ * locks.ts; an earlier note here called it a "501 defer", stale, fixed in the
+ * ledger L15 sweep, 2026-11-02) but the settings LOCKS page (lfs_locks.tmpl,
+ * lfs.go:71-227) is unported, so there is no locks page to anchor yet.
  *
  * ## Reductions (the divergence-ledger records)
  *

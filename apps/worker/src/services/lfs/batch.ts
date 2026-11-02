@@ -4,14 +4,26 @@
  * Wire contract ported from upstream `services/lfs/server.go:186-293` and
  * `modules/lfs/shared.go`: the envelope is always `200` with per-object
  * results (object-level problems never fail the whole request, §4.8); JSON
- * decode failures, unknown operations and oversized batches are the only
- * whole-request errors (400/400/413). Error strings are upstream's, verbatim:
+ * decode failures and unknown operations are the only pre-auth whole-request
+ * errors (400/400) — the object-count cap (413) runs AFTER auth, upstream's
+ * order (`server.go:214-222`; the ledger L10 correction, 2026-11-02). Error
+ * strings are upstream's, verbatim:
  *
  * - 422 "Oid or size are invalid"                    (invalid pointer fields)
  * - 422 "Object <oid> is not <size> bytes"           (declared size ≠ row size)
  * - 422 "Size must be less than or equal to <max>"   (upload, not yet stored)
  * - 404 "Not Found"                                  (download, absent object)
  * - 422 "LFS quota exceeded for repository"          (our addition, §4.7)
+ *
+ * A missing or null `objects` key decodes as upstream's nil slice and the
+ * response marshals `{"objects":null}` (shared.go:49-52 has no omitempty —
+ * the ledger L11 correction); an explicit `[]` marshals `[]`.
+ *
+ * batch(upload) creates NO rows (the ledger L5 correction): upstream rows
+ * arise only in UploadHandler (`server.go:369` NewLFSMetaObject), so an
+ * absent object gets hrefs against a rowless key and the upload-then-
+ * mismatched-download corner answers 404 like upstream. The relay PUT (or
+ * the verify/batch adopt) creates the row.
  *
  * Href strategy per §2.3: the store's capability probe decides — presigned
  * R2 URLs when `presignPut`/`presignGet` return a link, otherwise relay
@@ -83,7 +95,12 @@ export interface LfsBatchRequest {
   /** Accepted and ignored (upstream never reads them; basic always). */
   transfers?: string[];
   ref?: { name?: unknown };
-  objects: LfsBatchPointer[];
+  /**
+   * Upstream's `Objects []Pointer` (shared.go:27-32): `null` when the key is
+   * missing or JSON-null (a nil slice — the response carries `"objects":null`),
+   * `[]` only for an explicit empty array.
+   */
+  objects: LfsBatchPointer[] | null;
 }
 
 /**
@@ -106,12 +123,14 @@ type RawBatchBody = {
  * Parse + validate a batch request body (already-decoded JSON or raw text).
  * Strict like upstream's typed decode: `operation` must be exactly
  * "upload"/"download" (400), each object must carry a string oid and an
- * integral number size (400 — Go's json would fail the decode), and the
- * object count is capped (413). `transfers`/`ref` are accepted and ignored.
- * A missing/empty `objects` array yields zero results (upstream loops a nil
- * slice), never an error.
+ * integral number size (400 — Go's json would fail the decode). The object
+ * COUNT cap is deliberately absent here: upstream checks it after
+ * authentication (`server.go:214-222`), so the caller enforces it post-auth.
+ * `transfers`/`ref` are accepted and ignored. A missing/null `objects` key
+ * yields `objects: null` (upstream's nil slice); an explicit `[]` yields `[]`
+ * — never an error either way.
  */
-export function parseBatchRequest(body: unknown, limits: Pick<LfsLimits, "maxBatchSize">): LfsBatchRequest {
+export function parseBatchRequest(body: unknown): LfsBatchRequest {
   let raw: unknown;
   if (typeof body === "string") {
     try {
@@ -139,14 +158,12 @@ export function parseBatchRequest(body: unknown, limits: Pick<LfsLimits, "maxBat
       throw new BatchRequestError(400, "Bad Request");
   }
 
-  const objects: LfsBatchPointer[] = [];
-  if (record.objects !== undefined) {
+  let objects: LfsBatchPointer[] | null = null;
+  if (record.objects !== undefined && record.objects !== null) {
     if (!Array.isArray(record.objects)) {
       throw new BatchRequestError(400, "Bad Request");
     }
-    if (limits.maxBatchSize > 0 && record.objects.length > limits.maxBatchSize) {
-      throw new BatchRequestError(413, "Request Entity Too Large");
-    }
+    objects = [];
     for (const entry of record.objects) {
       if (typeof entry !== "object" || entry === null) {
         throw new BatchRequestError(400, "Bad Request");
@@ -284,8 +301,9 @@ export async function shapeBatchObject(
 
   let present: boolean;
   if (meta !== null && meta.state === "verified") {
-    // Row says verified but the object vanished (GC race): self-heal by
-    // re-issuing hrefs — ensureUploading demotes the row on the way (§3.3).
+    // Row says verified but the object vanished (GC race): the download arm
+    // 404s and the upload arm re-issues hrefs; the stale row itself heals
+    // only through the PUT/verify/sweep paths (batch never writes rows, L5).
     present = stat !== null;
   } else if (validateAdoptStat(stat, oid, size, { requireChecksum })) {
     await deps.state.insertVerified(ctx.repoId, oid, size, now);
@@ -314,7 +332,11 @@ export async function shapeBatchObject(
   if (limits.repoQuota > 0 && (await deps.state.sumSize(ctx.repoId)) + size > limits.repoQuota) {
     return errorObject(oid, size, 422, "LFS quota exceeded for repository");
   }
-  await deps.state.ensureUploading(ctx.repoId, oid, size, now);
+  // NO row write here — upstream rows arise only in UploadHandler
+  // (server.go:369 NewLFSMetaObject); batch(upload) issues hrefs against a
+  // rowless key and the relay PUT (or the verify adopt) creates the row
+  // (the ledger L5 correction — the upload-then-mismatched-download corner
+  // now 404s like upstream instead of our old 422).
 
   const relayBase = buildRelayHrefBase(ctx);
   const actions: Record<string, BatchLink> = {};
@@ -373,12 +395,15 @@ export async function buildDownloadHref(
 /**
  * Shape a whole batch — one pass over objects; per-object results are
  * independent (§4.8), store/D1 failures surface as a whole-request error
- * (upstream answers 500 on storage errors, `server.go:236-241`).
+ * (upstream answers 500 on storage errors, `server.go:236-241`). A nil
+ * `objects` (missing/null key) shapes to an empty list; the CALLER decides
+ * whether the envelope carries `[]` or upstream's `null` for it (L11).
  */
 export async function shapeBatchResponse(
   request: LfsBatchRequest,
   ctx: BatchShapingContext,
   deps: BatchDeps,
 ): Promise<BatchObjectResponse[]> {
+  if (request.objects === null) return [];
   return Promise.all(request.objects.map((pointer) => shapeBatchObject(pointer, request.operation, ctx, deps)));
 }

@@ -19,10 +19,12 @@
  *
  * The write arms (LFSDelete, LFSAutoAssociate, the locks trio) stay out of
  * this wave — read-only pages (the census's ratified split). The locks
- * settings page in particular has NO substrate at this pin: the LFS locks
- * API is a 501 defer (SPEC-0006 §2.7 P2; src/lfs/router.ts:432), so the
- * census impact table's "locks already landed" reads the PLAN, not the pin —
- * the pages render no Locks anchor (the dead-link rule).
+ * settings page has no substrate at this pin NOT because the API is missing
+ * — the LFS locks API LANDED 2026-10-30 (SPEC-0006 §2.7: services/lfs/locks.ts
+ * + src/lfs/locks.ts; the old "501 defer" note here was stale, fixed in the
+ * ledger L15 sweep, 2026-11-02) — but because the settings LOCKS page itself
+ * (lfs_locks.tmpl + its list/verify arms, lfs.go:71-227) is unported: the
+ * pages render no Locks anchor (the dead-link rule) until that page lands.
  *
  * All D1 access goes through Drizzle (the AGENTS boundary); blob access goes
  * through the injected `LfsStore`; the engine answers through the injected

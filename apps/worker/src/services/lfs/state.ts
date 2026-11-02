@@ -10,11 +10,15 @@
  * Timestamps are unix seconds (repo convention, `mode: "timestamp"` — drizzle
  * maps Date ↔ integer seconds exactly like the previous raw `toUnix`/
  * `fromUnix` helpers). Rows exist only for objects the LFS API touched — a
- * pointer merely seen in git history never creates a row. State transitions
- * (§3.3):
+ * pointer merely seen in git history never creates a row, and a batch(upload)
+ * never creates one either: rows arise ONLY in the relay PUT handler
+ * (`insertUploadingIfAbsent` — upstream `NewLFSMetaObject`, called solely from
+ * UploadHandler, `services/lfs/server.go:369`) or as verified via the
+ * verify/adopt paths. State transitions (§3.3, as corrected 2026-11-02):
  *
- *   absent --batch(upload)--> uploading --verify(200)--> verified
- *   absent --adopt(HEAD ok)--> verified        (upload finished, verify lost)
+ *   absent --relay PUT--> uploading --verify(200)--> verified
+ *   absent --presign PUT + verify(200)--> verified   (verify's insert-if-absent arm)
+ *   absent --batch/verify adopt(HEAD ok)--> verified (upload finished, verify lost)
  *   uploading --sweep(HEAD ok)--> verified     (stale >24 h)
  *   uploading --sweep(HEAD missing)--> deleted
  *   verified --GC(unreachable > grace)--> row+object deleted
@@ -111,21 +115,20 @@ export class LfsStateService {
   }
 
   /**
-   * Idempotent `uploading` row for a batch that is about to issue hrefs.
-   * Callers must reach this only after the "already present ⇒ no actions"
-   * rule excluded `verified` rows, so a plain upsert is correct: re-batching
-   * after a failed verify re-issues hrefs and refreshes `updated_at`
-   * (post-sweep grace), and the one demotion case — a `verified` row whose
-   * object vanished from R2 — is the self-heal path that WANTS the demotion.
+   * `NewLFSMetaObject` (models/git/lfs.go:106-119): insert the `uploading`
+   * row only when absent — an EXISTING row is never touched (no size refresh,
+   * no state demotion), the write-side twin of the skip-body-check-on-row rule
+   * (upstream UploadHandler, `services/lfs/server.go:369`, is the ONLY row
+   * creator; the ledger L5/L6 correction, 2026-11-02, retired the old
+   * batch-side `ensureUploading` upsert).
    */
-  async ensureUploading(repoId: number, oid: string, size: number, now: Date): Promise<void> {
-    await this.db
+  async insertUploadingIfAbsent(repoId: number, oid: string, size: number, now: Date): Promise<boolean> {
+    const inserted = await this.db
       .insert(lfsObjects)
       .values({ repoId, oid, size, state: "uploading", createdAt: now, updatedAt: now })
-      .onConflictDoUpdate({
-        target: [lfsObjects.repoId, lfsObjects.oid],
-        set: { size, state: "uploading", updatedAt: now },
-      });
+      .onConflictDoNothing({ target: [lfsObjects.repoId, lfsObjects.oid] })
+      .returning({ oid: lfsObjects.oid });
+    return inserted.length > 0;
   }
 
   /**

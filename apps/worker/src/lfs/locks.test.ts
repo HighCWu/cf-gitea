@@ -16,7 +16,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { basicHeader, basicTokenHeader, mintFor, resetAuthTables, seedVerifiedUser } from "../auth/testing/seeds";
 import { TeamsService } from "../api/routes/org-teams";
-import { deployKeys, repoCollaborators, repositories } from "../db/schema";
+import { deployKeys, repoCollaborators, repoRedirects, repositories } from "../db/schema";
 import { LFS_MEDIA_TYPE } from "../services/lfs/batch";
 import {
   goParseInt64,
@@ -44,6 +44,7 @@ beforeEach(async () => {
   await resetAuthTables();
   await env.DB.prepare("DELETE FROM deploy_keys").run();
   await env.DB.prepare("DELETE FROM repositories").run();
+  await env.DB.prepare("DELETE FROM repo_redirects").run();
   await resetLfsTables();
 });
 
@@ -487,19 +488,31 @@ describe("unlock (UnLockHandler)", () => {
     expect(junk.status).toBe(500);
   });
 
-  it("400s an undecodable body or a non-bool force on the writeStatus arm (LFS media type)", async () => {
+  it("400s an empty body, an undecodable body or a non-bool force on the writeStatus arm (L13)", async () => {
     const fixtures = await seedFixtures();
+    const rawHeaders = {
+      accept: "application/vnd.git-lfs+json",
+      authorization: basicTokenHeader(fixtures.write),
+      "content-type": "application/vnd.git-lfs+json",
+    };
+
+    // An EMPTY body is Go's decode-EOF error → the same writeStatus 400 arm
+    // (the ledger L13 correction — it used to read as `{}`).
+    const empty = await SELF.fetch(locksUrl(fixtures.privateRepo, "/1/unlock"), {
+      method: "POST",
+      headers: rawHeaders,
+      body: "",
+    });
+    expect(empty.status).toBe(400);
+    expect(empty.headers.get("content-type")).toBe(LFS_MEDIA_TYPE);
+    expect(await empty.json()).toEqual({ message: "Bad Request" });
+
     const raw = await SELF.fetch(locksUrl(fixtures.privateRepo, "/1/unlock"), {
       method: "POST",
-      headers: {
-        accept: "application/vnd.git-lfs+json",
-        authorization: basicTokenHeader(fixtures.write),
-        "content-type": "application/vnd.git-lfs+json",
-      },
+      headers: rawHeaders,
       body: "{not json",
     });
     expect(raw.status).toBe(400);
-    expect(raw.headers.get("content-type")).toBe(LFS_MEDIA_TYPE);
     expect(await raw.json()).toEqual({ message: "Bad Request" });
 
     const badForce = await lockFetch(locksUrl(fixtures.privateRepo, "/1/unlock"), {
@@ -508,6 +521,90 @@ describe("unlock (UnLockHandler)", () => {
       body: { force: "yes" },
     });
     expect(badForce.status).toBe(400);
+
+    // A non-object JSON value fails Go's struct decode too.
+    const scalar = await SELF.fetch(locksUrl(fixtures.privateRepo, "/1/unlock"), {
+      method: "POST",
+      headers: rawHeaders,
+      body: "5",
+    });
+    expect(scalar.status).toBe(400);
+  });
+
+  it("treats force:null (and a JSON null body) as Go's zero value — the unlock proceeds (L13)", async () => {
+    const fixtures = await seedFixtures();
+    const first = await createLock(fixtures.privateRepo, fixtures.write, "force-null.bin");
+    const id = (first.body.lock as WireLock).id;
+
+    // Go's null-into-bool rule: `"force": null` leaves the field at false —
+    // no decode error, so the owner's unlock succeeds.
+    const nullForce = await SELF.fetch(locksUrl(fixtures.privateRepo, `/${id}/unlock`), {
+      method: "POST",
+      headers: {
+        accept: "application/vnd.git-lfs+json",
+        authorization: basicTokenHeader(fixtures.write),
+        "content-type": "application/vnd.git-lfs+json",
+      },
+      body: '{"force":null}',
+    });
+    expect(nullForce.status).toBe(200);
+    expect((await nullForce.json<{ lock: WireLock }>()).lock.id).toBe(id);
+
+    // A bare JSON `null` body decodes as the zero struct (also no error).
+    const second = await createLock(fixtures.privateRepo, fixtures.write, "null-body.bin");
+    const id2 = (second.body.lock as WireLock).id;
+    const nullBody = await SELF.fetch(locksUrl(fixtures.privateRepo, `/${id2}/unlock`), {
+      method: "POST",
+      headers: {
+        accept: "application/vnd.git-lfs+json",
+        authorization: basicTokenHeader(fixtures.write),
+        "content-type": "application/vnd.git-lfs+json",
+      },
+      body: "null",
+    });
+    expect(nullBody.status).toBe(200);
+  });
+});
+
+// --- repo-missing arms (L9) -----------------------------------------------------------
+
+describe("locks repo-missing arms (L9 — the route message 401, no redirect, no passthrough)", () => {
+  it("401s a nonexistent repo with the route message + realm BEFORE any scope/grant work", async () => {
+    const fixtures = await seedFixtures();
+    const list = await SELF.fetch("http://example.com/nobody/nothing.git/info/lfs/locks", {
+      headers: { accept: LFS_MEDIA_TYPE, authorization: basicTokenHeader(fixtures.write) },
+    });
+    expect(list.status).toBe(401);
+    expect(list.headers.get("www-authenticate")).toBe('Basic realm="gitea-lfs"');
+    expect(list.headers.get("content-type")).toBe(LOCKS_JSON);
+    expect(await list.json()).toEqual({ message: "You must have pull access to list locks" });
+
+    const create = await SELF.fetch("http://example.com/nobody/nothing.git/info/lfs/locks", {
+      method: "POST",
+      headers: { accept: LFS_MEDIA_TYPE, "content-type": LFS_MEDIA_TYPE, authorization: basicTokenHeader(fixtures.write) },
+      body: "{}",
+    });
+    expect(create.status).toBe(401);
+    expect(await create.json()).toEqual({ message: "You must have push access to create locks" });
+  });
+
+  it("401s a renamed repo's old URL the same way — upstream never consults redirects (L9)", async () => {
+    const fixtures = await seedFixtures();
+    await drizzle(env.DB)
+      .insert(repoRedirects)
+      .values({
+        ownerId: fixtures.alice.id,
+        ownerNamespace: "alice",
+        lowerName: "oldlocks",
+        redirectRepoId: fixtures.privateRepo.id,
+      })
+      .run();
+
+    const list = await SELF.fetch("http://example.com/alice/oldlocks.git/info/lfs/locks", {
+      headers: { accept: LFS_MEDIA_TYPE, authorization: basicTokenHeader(fixtures.write) },
+    });
+    expect(list.status).toBe(401);
+    expect(await list.json()).toEqual({ message: "You must have pull access to list locks" });
   });
 });
 

@@ -20,15 +20,25 @@
  * requests 401 even on public repos, with the route-specific message:
  * "You must have pull access to list locks" / "You must have push access to
  * {create,verify,delete} locks" + `WWW-Authenticate: Basic realm="gitea-lfs"`.
+ * A missing or renamed repo 401s with the same route message FIRST (each
+ * handler opens with the repo lookup, locks.go:51-59 and siblings; upstream
+ * never consults the redirect table — models/repo/repo.go:747-763 — so an
+ * old URL answers exactly like a never-existing one; the ledger L9
+ * correction, 2026-11-02).
  * A `gdt_` deploy-key token signs in as the synthetic key user (upstream
  * mounts the family WITH `AllowDeployToken`, web.go:1777): list needs the
  * key's own repo at ANY mode, create/verify/unlock need mode >= 2 (verify is
  * a WRITE-authenticate route at the pin, locks.go:216 vs 221); a foreign
  * key's zero permission takes the same route-message 401 (no anonymous arm
  * for the key user). Doer attribution uses upstream's shared synthetic user
- * id -3 (`LFS_DEPLOY_KEY_DOER_ID`).
+ * id -3 (`LFS_DEPLOY_KEY_DOER_ID`). Basic is the ONLY credential carrier
+ * (upstream's group carries AllowBasic + AllowDeployToken, web.go:1777, NOT
+ * AllowOAuth2; upstream's `parseToken` Bearer arm is the internal SSH JWT —
+ * the ledger L8 correction: a `Bearer` header reads as anonymous here).
  * A known token lacking the scope category → `CheckRepoScopedToken` → plain
- * 403 "Forbidden\n" (`scopeForbidden`, unchanged). The no-grant arm is a 401
+ * 403 "Forbidden\n" (`scopeForbidden`, unchanged) — upstream locks checks
+ * the scope BEFORE `authenticate` (locks.go:62→67 and siblings), so this
+ * 403-first order is upstream's own and stays. The no-grant arm is a 401
  * with the same route message (upstream's `authenticate` false arm) — the
  * §5.2 family divergence (challenge instead of the git-HTTP 404 mask).
  *
@@ -178,12 +188,12 @@ export async function authorizeLfsLocks(input: {
 
   const header = req.headers.get("authorization");
   const parsed = header === null ? null : parseAuthorizationHeader(header);
-  // Two credential carriers, kept apart (mirrors authorizeLfs): the
-  // deploy-token method parses ONLY the Basic header, so a `Bearer gdt_…`
-  // rides the access-token arm and fails there.
-  const bearerToken = parsed?.bearerToken?.token ?? null;
+  // Basic is the ONLY credential carrier (mirrors authorizeLfs — the ledger
+  // L8 correction): upstream locks handlers carry no auth-group Bearer method
+  // either, and its `parseToken` Bearer arm is the internal SSH JWT only. A
+  // `Bearer` header reads as anonymous → the route-message 401.
   const basicCandidate = parsed?.basicAuth ? basicAuthTokenCandidate(parsed.basicAuth) : null;
-  const credential = bearerToken ?? basicCandidate;
+  const credential = basicCandidate;
 
   // requireSigned (locks.go:67/156/221/289): anonymous requests never pass —
   // a public repo's locks still 401 with the route message.
@@ -306,7 +316,7 @@ export async function handleLocks(
   env: Env,
   waitUntil: (promise: Promise<void>) => void,
   lfs: LfsRoute,
-  resolved: ResolvedLfsRepo,
+  resolved: ResolvedLfsRepo | null,
   deps: LfsDeps,
 ): Promise<Response> {
   const route = lfs.lock;
@@ -320,6 +330,12 @@ export async function handleLocks(
   }
 
   const { verb } = route;
+  // Upstream's repo lookup opens EVERY locks handler (locks.go:51-59 list,
+  // :140-148 create, :205-213 verify, :273-281 unlock): a missing or renamed
+  // repo 401s with the route message BEFORE any scope/grant work (the ledger
+  // L9 correction — upstream has no redirect consultation here either).
+  if (resolved === null) return lockChallenge(LOCK_MESSAGES[verb]);
+
   const access: LocksAccess = verb === "list" ? "read" : "write";
   const scope: LocksScope = verb === "create" || verb === "unlock" ? "write" : "read";
   const auth = await authorizeLfsLocks({
@@ -474,11 +490,16 @@ function handleLockVerify(
 
 /**
  * `UnLockHandler` (locks.go:268-320): `PathParamInt64` discards the parse
- * error (syntax → 0, range → clamp); the body decodes `LFSLockDeleteRequest`
- * (failure → the writeStatus 400 arm). Every `DeleteLFSLockByID` error —
- * not-found AND not-owner-without-force (lfs_lock.go:154-171) — maps to the
- * ONE upstream arm: 500 "unable to delete lock : Internal Server Error"
- * (locks.go:311-318). Success echoes the deleted lock: 200.
+ * error (syntax → 0, range → clamp); the body decodes
+ * `api.LFSLockDeleteRequest{Force bool}` — an EMPTY body is a Go decode error
+ * (io.EOF → the writeStatus 400 arm; the ledger L13 correction, 2026-11-02:
+ * it used to read as `{}`), a JSON `null` body decodes as the zero struct
+ * (no error), `"force": null` leaves the field at its zero value `false`
+ * (no error — Go's null-into-bool rule), and any other non-object JSON value
+ * or non-bool `force` fails the decode → 400. Every `DeleteLFSLockByID`
+ * error — not-found AND not-owner-without-force (lfs_lock.go:154-171) — maps
+ * to the ONE upstream arm: 500 "unable to delete lock : Internal Server
+ * Error" (locks.go:311-318). Success echoes the deleted lock: 200.
  */
 function handleLockUnlock(
   req: Request,
@@ -499,15 +520,19 @@ function handleLockUnlock(
     }
     let parsed: unknown;
     try {
-      parsed = text === "" ? {} : (JSON.parse(text) as unknown);
+      parsed = JSON.parse(text) as unknown; // "" throws — Go's decode-EOF 400 arm (L13)
     } catch {
       return lockWriteStatus(400, "Bad Request");
     }
+    // Go json.Unmarshal of a non-object value into the struct errors; `null`
+    // decodes as the untouched (zero) struct.
+    if (parsed !== null && typeof parsed !== "object") return lockWriteStatus(400, "Bad Request");
     let force = false;
     if (typeof parsed === "object" && parsed !== null && "force" in parsed) {
       const rawForce = (parsed as { force?: unknown }).force;
-      if (typeof rawForce !== "boolean") return lockWriteStatus(400, "Bad Request");
-      force = rawForce;
+      // `null` leaves the bool at its zero value (Go null-into-bool rule).
+      if (rawForce !== null && typeof rawForce !== "boolean") return lockWriteStatus(400, "Bad Request");
+      force = rawForce === true;
     }
 
     const lock = await deps.locks.getByIdAndRepo(lockId, lfsRepoId(resolved.repo.id));

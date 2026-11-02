@@ -218,19 +218,58 @@ describe("parseLfsRoute (SPEC-0006 §2.1 shapes)", () => {
 // --- auth & routing matrix ------------------------------------------------------
 
 describe("LFS family auth (§2.2 split)", () => {
-  it("404s a nonexistent repo before any auth challenge — engine passthrough, byte-identical", async () => {
+  it("404s a nonexistent repo with the LFS JSON envelope before any auth challenge (L9)", async () => {
     const response = await lfsBatch("https://example.com/nobody/nothing.git/info/lfs/objects/batch", {
       operation: "upload",
       objects: [],
     });
 
-    // The D1-missing passthrough hands the ORIGINAL request to the engine —
-    // its own 404 (plain text), no challenge, exactly the pre-LFS behavior.
-    // The engine owns that shape (another wave's file); we only pin that the
-    // LFS family did NOT answer it.
+    // Upstream getAuthenticatedRepository (server.go:462-468): the repo
+    // lookup arms AFTER decode/operation and BEFORE auth — the LFS family
+    // answers its own JSON 404 (no engine passthrough, no challenge).
     expect(response.status).toBe(404);
     expect(response.headers.get("www-authenticate")).toBeNull();
-    expect(response.headers.get("content-type")).not.toContain("vnd.git-lfs");
+    expect(response.headers.get("content-type")).toBe(LFS_MEDIA_TYPE);
+    expect(await response.json()).toEqual({ message: "Not Found" });
+  });
+
+  it("404s a renamed repo's old URL — upstream never consults the redirect table (L9)", async () => {
+    const alice = await seedVerifiedUser({ username: "Alice" });
+    const repo = await seedRepo("alice", "newname", "public");
+    await drizzle(env.DB)
+      .insert(repoRedirects)
+      .values({ ownerId: alice.id, ownerNamespace: "alice", lowerName: "oldname", redirectRepoId: repo.id })
+      .run();
+
+    // GetRepositoryByOwnerAndName (models/repo/repo.go:747-763) has no
+    // LookupRedirect arm: an old URL answers exactly like a never-existing
+    // one — the LFS JSON 404, NOT the git-HTTP pipeline's 301 (L9).
+    const response = await lfsBatch("https://example.com/alice/oldname.git/info/lfs/objects/batch", {
+      operation: "upload",
+      objects: [],
+    });
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get("content-type")).toBe(LFS_MEDIA_TYPE);
+    expect(await response.json()).toEqual({ message: "Not Found" });
+  });
+
+  it("the repo-missing 404 still follows the handler's pre-repo arms (a bad oid 422s first)", async () => {
+    const oid = await sha256Hex(content(90));
+    const download = await SELF.fetch(`https://example.com/nobody/nothing.git/info/lfs/objects/${oid}`, {});
+    expect(download.status).toBe(404); // valid oid → past the 422 arm, into the 404
+    expect(await download.json()).toEqual({ message: "Not Found" });
+
+    const junk = await SELF.fetch("https://example.com/nobody/nothing.git/info/lfs/objects/short", {});
+    expect(junk.status).toBe(422);
+    expect(await junk.json()).toEqual({ message: "Oid or size are invalid" });
+
+    const upload = await SELF.fetch("https://example.com/nobody/nothing.git/info/lfs/objects/zz/128", {
+      method: "PUT",
+      headers: { "content-length": "128" },
+      body: "x",
+    });
+    expect(upload.status).toBe(422); // the strconv/IsValid arms precede the repo lookup
   });
 
   it("challenges anonymous batch upload on a private repo with the gitea-lfs realm", async () => {
@@ -281,6 +320,56 @@ describe("LFS family auth (§2.2 split)", () => {
     expect(await response.text()).toContain("Forbidden");
   });
 
+  it("challenges (401) when BOTH the grant and the scope fail — authenticate before CheckRepoScopedToken (L7)", async () => {
+    // Upstream order (server.go:470-483): authenticate (401) runs before the
+    // scope check (403). An outsider's token that ALSO lacks the repository
+    // scope therefore challenges — the old scope-first order 403'd here.
+    const bob = await seedVerifiedUser({ username: "Bob" });
+    const bobWrongScope = (await mintFor(bob.id, "bob-wrong", "write:user")).plaintext;
+    const repo = await seedRepo("alice", "closed", "private");
+
+    const response = await lfsBatch(`${repoUrl(repo)}/info/lfs/objects/batch`, {
+      operation: "upload",
+      objects: [],
+    }, { authorization: basicTokenHeader(bobWrongScope) });
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get("www-authenticate")).toBe('Basic realm="gitea-lfs"');
+    expect(await response.json()).toEqual({ message: "Unauthorized" });
+  });
+
+  it("401s a Bearer ACCESS token — Basic (+ deploy keys) is the family's only credential (L8)", async () => {
+    // Upstream mounts AllowBasic + AllowDeployToken, NOT AllowOAuth2
+    // (web.go:1777); its parseToken Bearer arm is the internal SSH JWT
+    // (server.go:621-630). A Bearer access token reads as anonymous.
+    const fixtures = await seedFixtures();
+    const response = await lfsBatch(`${repoUrl(fixtures.privateRepo)}/info/lfs/objects/batch`, {
+      operation: "download",
+      objects: [],
+    }, { authorization: `Bearer ${fixtures.write}` });
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get("www-authenticate")).toBe('Basic realm="gitea-lfs"');
+  });
+
+  it("a Bearer access token on a PUBLIC repo read passes as anonymous — upstream's anonymous arm", async () => {
+    // credential-less reads of a publicly visible repo pass (§5 ACL matrix);
+    // an unparseable-as-Basic Bearer header is credential-less (L8 posture).
+    const fixtures = await seedFixtures();
+    const response = await SELF.fetch(`${repoUrl(fixtures.publicRepo)}/info/lfs/objects/batch`, {
+      method: "POST",
+      headers: {
+        accept: LFS_MEDIA_TYPE,
+        "content-type": LFS_MEDIA_TYPE,
+        authorization: `Bearer ${fixtures.write}`,
+      },
+      body: JSON.stringify({ operation: "download" }), // no objects key at all
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ objects: null }); // L11: nil objects ⇒ null envelope
+  });
+
   it("403s a read-scope token on the upload operation", async () => {
     const fixtures = await seedFixtures();
     const response = await lfsBatch(`${repoUrl(fixtures.privateRepo)}/info/lfs/objects/batch`, {
@@ -315,29 +404,8 @@ describe("LFS family auth (§2.2 split)", () => {
     expect(await response.text()).toContain("archived");
   });
 
-  it("301s a renamed repo's old LFS URL before any auth challenge (row 13 pipeline)", async () => {
-    const alice = await seedVerifiedUser({ username: "Alice" });
-    const repo = await seedRepo("alice", "newname", "public");
-    await drizzle(env.DB)
-      .insert(repoRedirects)
-      .values({ ownerId: alice.id, ownerNamespace: "alice", lowerName: "oldname", redirectRepoId: repo.id })
-      .run();
-
-    // redirect: "manual" — a following client would take the 301 to
-    // /alice/newname.git/... and observe the catch-all 404 of the FOLLOWED
-    // GET instead of the redirect itself.
-    const response = await SELF.fetch("https://example.com/alice/oldname.git/info/lfs/objects/batch", {
-      method: "POST",
-      redirect: "manual",
-      headers: { accept: LFS_MEDIA_TYPE, "content-type": LFS_MEDIA_TYPE },
-      body: JSON.stringify({ transfers: ["basic"], ref: { name: "refs/heads/main" }, operation: "upload", objects: [] }),
-    });
-
-    expect(response.status).toBe(301);
-    expect(response.headers.get("location")).toBe(
-      "https://example.com/alice/newname.git/info/lfs/objects/batch",
-    );
-  });
+  // (The renamed-repo arm moved up: it is now the L9 404 test above — the
+  // row-13 301 retired with the engine passthrough.)
 });
 
 // --- deploy-key tokens on the family (F1, upstream AllowDeployToken) ---------------
@@ -740,10 +808,10 @@ describe("collaborator and org-team grants on the LFS family (SPEC-0007 §3.5 + 
   });
 });
 
-// --- gate branch passthrough (the e2e invariant) -----------------------------------
+// --- gate branch: D1-missing repos are the family's own arms (L9) -------------------
 
-describe("handleLfsGateBranch passthrough for D1-missing repos", () => {
-  it("hands the ORIGINAL request object to the engine untouched (byte-identical)", async () => {
+describe("handleLfsGateBranch repo-missing arms (L9 — the engine passthrough retired)", () => {
+  it("answers the family arms for a D1-missing repo; the engine is never consulted", async () => {
     const request = new Request("https://example.com/demo/absent.git/info/lfs/objects/batch", {
       method: "POST",
       headers: { accept: LFS_MEDIA_TYPE, "content-type": LFS_MEDIA_TYPE },
@@ -759,20 +827,44 @@ describe("handleLfsGateBranch passthrough for D1-missing repos", () => {
         return Promise.resolve(new Response(null, { status: 404 }));
       },
     };
-    // The passthrough never touches ctx members (only forwards it to the
-    // engine) — the repo's stub-ctx convention (cf. webhooks/dlq.test.ts).
-    const ctx = {} as ExecutionContext;
+    // The branch now touches exactly one ctx member (its waitUntil) — the
+    // stub carries it (cf. webhooks/dlq.test.ts's stub-ctx convention).
+    const ctx = Object.assign({} as ExecutionContext, {
+      waitUntil: (): void => {},
+    });
 
     const response = await handleLfsGateBranch(request, env, ctx, engine, route);
 
-    // Identity, not a rebuild: the engine sees the exact request it would
-    // have received before the LFS branch existed (method/URL/body and the
-    // streamed body undisturbed). The vendored e2e suite's 32/35 allowlist
-    // depends on this — its repositories are all D1-missing.
-    expect(seen).toHaveLength(1);
-    expect(seen[0]).toBe(request);
+    // Upstream's LFS handlers own the whole subtree (server.go:462-468): the
+    // repo-missing batch 404s with the LFS JSON envelope, the engine never
+    // sees the request.
+    expect(seen).toHaveLength(0);
     expect(response.status).toBe(404);
-    expect(response.headers.get("www-authenticate")).toBeNull();
+    expect(response.headers.get("content-type")).toBe(LFS_MEDIA_TYPE);
+    expect(await response.json()).toEqual({ message: "Not Found" });
+  });
+
+  it("a missing repo's LOCKS route 401s with the route message before any auth (locks.go:51-59, L9)", async () => {
+    const list = await SELF.fetch("https://example.com/nobody/nothing.git/info/lfs/locks", {
+      headers: { accept: LFS_MEDIA_TYPE },
+    });
+    expect(list.status).toBe(401);
+    expect(list.headers.get("www-authenticate")).toBe('Basic realm="gitea-lfs"');
+    expect(list.headers.get("content-type")).toBe("application/json;charset=utf-8");
+    expect(await list.json()).toEqual({ message: "You must have pull access to list locks" });
+
+    const unlock = await SELF.fetch("https://example.com/nobody/nothing.git/info/lfs/locks/1/unlock", {
+      method: "POST",
+      headers: { accept: LFS_MEDIA_TYPE, "content-type": LFS_MEDIA_TYPE },
+      body: "{}",
+    });
+    expect(unlock.status).toBe(401);
+    expect(await unlock.json()).toEqual({ message: "You must have push access to delete locks" });
+
+    // The catch-all keeps its stdlib shape (route match only — no repo lookup).
+    const junk = await SELF.fetch("https://example.com/nobody/nothing.git/info/lfs/whatever", {});
+    expect(junk.status).toBe(404);
+    expect(await junk.text()).toBe("404 page not found\n");
   });
 });
 
@@ -859,7 +951,7 @@ describe("LFS batch envelope (§2.2, upstream error tables)", () => {
     expect(await response.json()).toEqual({ message: "Request Entity Too Large" });
   });
 
-  it("issues relay upload+verify hrefs and creating rows for absent objects", async () => {
+  it("issues relay upload+verify hrefs for absent objects WITHOUT creating rows (L5)", async () => {
     const fixtures = await seedFixtures();
     const bytes = content(1);
     const oid = await sha256Hex(bytes);
@@ -884,15 +976,55 @@ describe("LFS batch envelope (§2.2, upstream error tables)", () => {
       href: `${repoUrl(fixtures.privateRepo)}/info/lfs/verify`,
       header: { Accept: LFS_ACCEPT_HEADER, Authorization: auth },
     });
-    expect(await lastRowState(lfsRepoIdOf(fixtures.privateRepo), oid)).toBe("uploading");
+    // Upstream rows arise only in UploadHandler (server.go:369) — batched
+    // hrefs ride against a rowless key; the PUT creates the row.
+    expect(await lastRowState(lfsRepoIdOf(fixtures.privateRepo), oid)).toBeNull();
+  });
+
+  it("emits {\"objects\":null} when the request omits or nulls the objects key (L11, shared.go:49-52)", async () => {
+    const fixtures = await seedFixtures();
+    const auth = { authorization: basicTokenHeader(fixtures.write) };
+    const url = `${repoUrl(fixtures.privateRepo)}/info/lfs/objects/batch`;
+
+    const absent = await SELF.fetch(url, {
+      method: "POST",
+      headers: { accept: LFS_MEDIA_TYPE, "content-type": LFS_MEDIA_TYPE, ...auth },
+      body: JSON.stringify({ operation: "upload" }),
+    });
+    expect(absent.status).toBe(200);
+    expect(await absent.text()).toBe('{"objects":null}'); // byte-exact nil slice
+
+    const nulled = await SELF.fetch(url, {
+      method: "POST",
+      headers: { accept: LFS_MEDIA_TYPE, "content-type": LFS_MEDIA_TYPE, ...auth },
+      body: '{"operation":"upload","objects":null}',
+    });
+    expect(nulled.status).toBe(200);
+    expect(await nulled.text()).toBe('{"objects":null}');
+  });
+
+  it("413 comes AFTER auth: an anonymous over-cap batch challenges instead (L10, server.go:214-222)", async () => {
+    const fixtures = await seedFixtures();
+    const objects = Array.from({ length: DEFAULT_LFS_LIMITS.maxBatchSize + 1 }, () => ({
+      oid: "0".repeat(64),
+      size: 1,
+    }));
+    const anonymous = await lfsBatch(`${repoUrl(fixtures.privateRepo)}/info/lfs/objects/batch`, {
+      operation: "upload",
+      objects,
+    });
+    expect(anonymous.status).toBe(401);
+    expect(anonymous.headers.get("www-authenticate")).toBe('Basic realm="gitea-lfs"');
   });
 
   it("answers per-object errors without failing the envelope (§4.8)", async () => {
     const fixtures = await seedFixtures();
     const bytes = content(2);
     const oid = await sha256Hex(bytes);
-    // A stale row with a different size → the mismatch error for that object.
-    await new LfsStateService(env.DB).ensureUploading(lfsRepoIdOf(fixtures.privateRepo), oid, 999, new Date());
+    // A stale row with a different size → the mismatch error for that object
+    // (rows can only get here via the PUT handler; the size it recorded then
+    // can disagree with a fresh batch's declaration, upstream server.go:251-257).
+    await new LfsStateService(env.DB).insertVerified(lfsRepoIdOf(fixtures.privateRepo), oid, 999, new Date());
 
     const response = await lfsBatch(`${repoUrl(fixtures.privateRepo)}/info/lfs/objects/batch`, {
       operation: "upload",
@@ -934,11 +1066,12 @@ describe("relay roundtrip: batch → PUT → verify → batch download → GET",
     const oid = await sha256Hex(bytes);
     const auth = `Basic ${btoa(`${fixtures.write}:`)}`;
 
-    // 1. batch(upload) → relay hrefs, row uploading.
+    // 1. batch(upload) → relay hrefs; NO row yet (L5 — rows arise at the PUT).
     const batch = await lfsBatch(`${repoUrl(fixtures.privateRepo)}/info/lfs/objects/batch`, {
       operation: "upload",
       objects: [{ oid, size: bytes.byteLength }],
     }, { authorization: basicTokenHeader(fixtures.write) });
+    expect(await lastRowState(lfsRepoIdOf(fixtures.privateRepo), oid)).toBeNull();
     const shaped = await batch.json<{ objects: { actions: Record<string, { href: string }> }[] }>();
     const uploadHref = shaped.objects[0]?.actions.upload?.href;
     const verifyHref = shaped.objects[0]?.actions.verify?.href;
@@ -1096,7 +1229,7 @@ describe("relay roundtrip: batch → PUT → verify → batch download → GET",
     expect(await put.json()).toEqual({ message: "Length Required" });
   });
 
-  it("422s uploads with an invalid pointer path before auth (upstream order)", async () => {
+  it("422s uploads with an invalid oid path before auth — writeStatus status text (L12)", async () => {
     const fixtures = await seedFixtures();
     const put = await SELF.fetch(`${repoUrl(fixtures.privateRepo)}/info/lfs/objects/zz/128`, {
       method: "PUT",
@@ -1104,11 +1237,62 @@ describe("relay roundtrip: batch → PUT → verify → batch download → GET",
       body: content(9, 128),
     });
 
+    // Upstream UploadHandler's IsValid arm is writeStatus(422) — the bare
+    // status text, NOT getAuthenticatedMeta's "Oid or size are invalid"
+    // (server.go:315-318 vs :443; the ledger L12 correction).
     expect(put.status).toBe(422);
-    expect(await put.json()).toEqual({ message: "Oid or size are invalid" });
+    expect(await put.json()).toEqual({ message: "Unprocessable Entity" });
   });
 
-  it("skips the body check when the object is present with a matching row", async () => {
+  it("422s non-integer size segments with the Go strconv NumError text (L12)", async () => {
+    const fixtures = await seedFixtures();
+    const oid = await sha256Hex(content(9, 128));
+    const auth = { authorization: basicTokenHeader(fixtures.write) };
+
+    const junk = await SELF.fetch(`${repoUrl(fixtures.privateRepo)}/info/lfs/objects/${oid}/abc`, {
+      method: "PUT",
+      headers: { ...auth, "content-length": "128" },
+      body: content(9, 128),
+    });
+    expect(junk.status).toBe(422);
+    expect(await junk.json()).toEqual({ message: 'strconv.ParseInt: parsing "abc": invalid syntax' });
+
+    // Out of int64 range — Go's range error text.
+    const huge = await SELF.fetch(
+      `${repoUrl(fixtures.privateRepo)}/info/lfs/objects/${oid}/99999999999999999999`,
+      { method: "PUT", headers: { ...auth, "content-length": "128" }, body: content(9, 128) },
+    );
+    expect(huge.status).toBe(422);
+    expect(await huge.json()).toEqual({
+      message: 'strconv.ParseInt: parsing "99999999999999999999": value out of range',
+    });
+
+    // A negative size PARSES (Go accepts the sign) and then fails IsValid →
+    // the status-text arm. (Upstream then forgets to return and continues —
+    // the missing-return bug we deliberately do NOT replicate, server.go:311-313.)
+    const negative = await SELF.fetch(`${repoUrl(fixtures.privateRepo)}/info/lfs/objects/${oid}/-1`, {
+      method: "PUT",
+      headers: { ...auth, "content-length": "128" },
+      body: content(9, 128),
+    });
+    expect(negative.status).toBe(422);
+    expect(await negative.json()).toEqual({ message: "Unprocessable Entity" });
+
+    // `+128` is a VALID Go integer — the signed size parses, passes IsValid,
+    // and the honest upload completes with the row insert (the L4-adjacent
+    // ParseInt sign leniency on the wire; the raw {size} segment carries the
+    // literal plus).
+    const signed = await SELF.fetch(`${repoUrl(fixtures.privateRepo)}/info/lfs/objects/${oid}/+128`, {
+      method: "PUT",
+      headers: { ...auth, "content-length": "128" },
+      body: content(9, 128),
+    });
+    expect(signed.status).toBe(200);
+    expect(await signed.json()).toEqual({ message: "OK" });
+    expect(await lastRowState(lfsRepoIdOf(fixtures.privateRepo), oid)).toBe("uploading");
+  });
+
+  it("skips the body check whenever a row exists with the bytes present — sizes never compared (L6)", async () => {
     const fixtures = await seedFixtures();
     const bytes = content(10);
     const oid = await sha256Hex(bytes);
@@ -1118,7 +1302,7 @@ describe("relay roundtrip: batch → PUT → verify → batch download → GET",
       size: bytes.byteLength,
       expectedSha256Hex: oid,
     });
-    await state.ensureUploading(lfsRepoIdOf(fixtures.privateRepo), oid, bytes.byteLength, new Date());
+    await state.insertUploadingIfAbsent(lfsRepoIdOf(fixtures.privateRepo), oid, bytes.byteLength, new Date());
 
     // A PUT whose body proves nothing (wrong bytes, valid length) still 200s —
     // the object is linked to this repo already (upstream server.go:328-339).
@@ -1134,6 +1318,56 @@ describe("relay roundtrip: batch → PUT → verify → batch download → GET",
     // The stored bytes were NOT overwritten by the mismatching body (skip).
     const stat = await store.head(lfsKey(fixtures.privateRepo.storageKey, oid));
     expect(stat?.size).toBe(bytes.byteLength);
+
+    // Even a DISAGREEING declared size skips (no re-hash, no row refresh):
+    // upstream checks only `meta == nil` for the body proof and
+    // NewLFSMetaObject is insert-if-absent — the row keeps its original size
+    // and state (the ledger L6 correction; the old code re-hashed and
+    // refreshed the row here).
+    const lying = await SELF.fetch(`${repoUrl(fixtures.privateRepo)}/info/lfs/objects/${oid}/999999`, {
+      method: "PUT",
+      headers: { authorization: basicTokenHeader(fixtures.write), "content-length": "6" },
+      body: content(11, 6),
+    });
+    expect(lying.status).toBe(200);
+    const row = await state.get(lfsRepoIdOf(fixtures.privateRepo), oid);
+    expect(row).toMatchObject({ size: bytes.byteLength, state: "uploading" });
+    const statAfter = await store.head(lfsKey(fixtures.privateRepo.storageKey, oid));
+    expect(statAfter?.size).toBe(bytes.byteLength);
+  });
+
+  it("creates the row at the PUT (insert-if-absent) and leaves an existing row untouched (L5/L6)", async () => {
+    const fixtures = await seedFixtures();
+    const bytes = content(12);
+    const oid = await sha256Hex(bytes);
+    const store = new RelayLfsStore(env.REPO_PACKS);
+    const state = new LfsStateService(env.DB);
+    const auth = { authorization: basicTokenHeader(fixtures.write) };
+    const put = (sizeDecl: number, body: Uint8Array): Promise<Response> =>
+      SELF.fetch(`${repoUrl(fixtures.privateRepo)}/info/lfs/objects/${oid}/${sizeDecl}`, {
+        method: "PUT",
+        headers: { ...auth, "content-length": String(body.byteLength) },
+        body,
+      });
+
+    // First PUT: bytes absent → hash-and-forward → the row arises HERE
+    // (upstream server.go:369 — the family's only row creator).
+    const first = await put(bytes.byteLength, bytes);
+    expect(first.status).toBe(200);
+    expect(await state.get(lfsRepoIdOf(fixtures.privateRepo), oid)).toMatchObject({
+      size: bytes.byteLength,
+      state: "uploading",
+    });
+
+    // Bytes now present + row present: a second PUT with a DIFFERENT declared
+    // size skips the body check AND the row write — no refresh, no demotion.
+    const second = await put(123456, content(12, 6));
+    expect(second.status).toBe(200);
+    expect(await state.get(lfsRepoIdOf(fixtures.privateRepo), oid)).toMatchObject({
+      size: bytes.byteLength,
+      state: "uploading",
+    });
+    expect((await store.head(lfsKey(fixtures.privateRepo.storageKey, oid)))?.size).toBe(bytes.byteLength);
   });
 
   it("verifies 404 for objects that never arrived", async () => {

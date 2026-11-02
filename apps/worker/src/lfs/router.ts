@@ -4,11 +4,16 @@
  * Upstream registers the whole family under one group with `m.Any("/*",
  * NotFound)` (`routers/common/lfs.go:15-31`); cf-gitea mounts the identical
  * shapes at `/:owner/:repo(.git)?/info/lfs/*`. The branch is intercepted in
- * the SPEC-0003 gitHttpGate (before engine delegation): repos with a D1 row
- * dispatch here through the gate's resolve/redirect pipeline; repos WITHOUT a
- * row keep passing through to the engine verbatim — the transitional
- * passthrough is deliberate (the e2e suite's repositories live there) and
- * stays byte-identical.
+ * the SPEC-0003 gitHttpGate (before engine delegation). Repos WITHOUT a D1
+ * row are served by THIS family too (the ledger L9 correction, 2026-11-02 —
+ * the old engine passthrough retired): upstream's LFS handlers resolve the
+ * repo themselves (`getAuthenticatedRepository`, `server.go:462-468`) and
+ * never consult the redirect table (`GetRepositoryByOwnerAndName`,
+ * `models/repo/repo.go:747-763`, has no LookupRedirect arm), so a
+ * nonexistent OR renamed repo's old URL answers the same arms: the
+ * batch/objects/verify family 404s with the LFS JSON envelope, the locks
+ * family 401s with the route-specific message (locks.go:51-59 and its three
+ * siblings).
  *
  * Wire parity notes (upstream pin `fc49368845`, services/lfs/server.go):
  * - Error responses outside the batch envelope carry the LFS media type and a
@@ -21,30 +26,50 @@
  * - The 401 challenge is `WWW-Authenticate: Basic realm="gitea-lfs"` with that
  *   same JSON body (`requireAuth` → `writeStatus(401)`) — unlike the git-HTTP
  *   gate's plain-text `realm="Gitea"` challenge.
- * - Auth split (§2.2): nonexistent repo → 404 before any challenge (here: the
- *   engine passthrough 404s for D1-missing repos); no credentials / no access
- *   → 401 + realm (upstream challenges where git-HTTP 404-masks — documented
- *   divergence from SPEC-0003 §2.4, kept per §2.2); verified token lacking
- *   `read:`/`write:repository` → 403; a `gdt_` deploy-key token authenticates
- *   with the key's own repo at its mode (upstream mounts the family WITH
- *   `AllowDeployToken`, web.go:1777 — see `decideLfsDeployKey` below).
- * - Batch: accept check 415 → decode 400 / unknown operation 400 / batch cap
- *   413 → auth (`upload` op writes, `download` reads) → per-object results in
- *   a 200 envelope (object-level errors never fail the request).
- * - Upload: pointer-from-path validation → 422; relay uploads REQUIRE
+ * - Auth split (§2.2): nonexistent/renamed repo → 404 before any challenge on
+ *   the batch/objects/verify routes (the repo-lookup arm runs inside each
+ *   handler, after its own pre-repo validation — a bad oid still 422s first);
+ *   no credentials / no access → 401 + realm (upstream challenges where
+ *   git-HTTP 404-masks — documented divergence from SPEC-0003 §2.4, kept per
+ *   §2.2); authenticated but lacking `read:`/`write:repository` → 403, with
+ *   upstream's ORDER: authenticate (401) runs BEFORE the scope check (403),
+ *   so a double failure challenges (the ledger L7 correction, 2026-11-02 —
+ *   the locks family keeps its own scope-first order, which IS upstream's
+ *   locks shape); a `gdt_` deploy-key token authenticates with the key's own
+ *   repo at its mode (upstream mounts the family WITH `AllowDeployToken`,
+ *   web.go:1777 — see `decideLfsDeployKey` below).
+ * - Credentials: Basic + deploy-key token ONLY (upstream's group carries
+ *   `AllowBasic` + `AllowDeployToken`, web.go:1777 — NOT AllowOAuth2; the
+ *   `Bearer` arm in upstream's `parseToken` is the internal SSH JWT,
+ *   `server.go:621-630`, which no external client can mint). A `Bearer`
+ *   access token therefore reads as anonymous here (the ledger L8
+ *   correction, 2026-11-02 — SPEC-0006 §2.3 always said Basic only).
+ * - Batch: accept check 415 → decode 400 / unknown operation 400 → repo
+ *   lookup 404 → auth (`upload` op writes, `download` reads) → object-count
+ *   cap 413 (upstream's order, `server.go:214-222`; L10) → per-object
+ *   results in a 200 envelope (object-level errors never fail the request);
+ *   a missing/null `objects` key marshals `{"objects":null}` (L11).
+ * - Upload: pointer-from-path validation → 422 (the size segment parses with
+ *   Go strconv.ParseInt semantics and its NumError text — upstream's
+ *   missing-return bug after that 422 is NOT replicated, documented at the
+ *   handler; L12) → repo lookup 404 → write auth; relay uploads REQUIRE
  *   Content-Length (git-lfs basic always sends one) → 411 otherwise, because
  *   the store's streaming put enforces the declared size (SPEC-0006 §2.3);
- *   bytes already present with a matching row skip the body check; bytes
- *   present without a row (or absent) are streamed through the single-pass
- *   hash-and-forward put, which proves sha256(content) == oid and deletes the
- *   object on mismatch → 422 with the upstream error strings.
- * - Verify: decode 422 → pointer validation 422 → write auth → HEAD-based
- *   verification (presign mode additionally requires the stored checksum);
- *   success flips `uploading → verified`, or adopts a missing row (§3.3
- *   self-heal — our extension, covers a lost batch row write, §4.13).
- * - Download: pointer validation 422 → read auth → row 404 → relay stream
- *   with `Content-Type: application/octet-stream`, the parity header
- *   `X-Gitea-LFS-Content-Length`, upstream's `bytes=(\d+)-(\d*)` Range
+ *   bytes present WITH a row for this repo skip the body check entirely —
+ *   no size comparison, no re-hash, no row refresh (`NewLFSMetaObject` is
+ *   insert-if-absent, `models/git/lfs.go:106-119`; the ledger L6 correction);
+ *   bytes present without a row (or absent) are streamed through the
+ *   single-pass hash-and-forward put, which proves sha256(content) == oid and
+ *   deletes the object on mismatch → 422 with the upstream error strings;
+ *   success inserts the row if absent (rows arise ONLY here — L5).
+ * - Verify: decode 422 → pointer validation 422 → repo lookup 404 → write
+ *   auth → HEAD-based verification (presign mode additionally requires the
+ *   stored checksum); success flips `uploading → verified`, or adopts a
+ *   missing row (§3.3 self-heal — our extension, covers a lost row write,
+ *   §4.13).
+ * - Download: pointer validation 422 → repo lookup 404 → read auth → row 404
+ *   → relay stream with `Content-Type: application/octet-stream`, the parity
+ *   header `X-Gitea-LFS-Content-Length`, upstream's `bytes=(\d+)-(\d*)` Range
  *   handling (206/416), and `Content-Disposition` from the base64url
  *   `{filename}` segment (decode failure ⇒ param ignored, never reflected).
  * - The catch-all is stdlib-shaped, like upstream's `m.Any("/*",
@@ -56,7 +81,8 @@
  * Locks (`info/lfs/locks/*`, §2.7) are implemented per upstream
  * `services/lfs/locks.go`: the four group registrations (GET/POST `locks`,
  * POST `locks/verify`, POST `locks/{lid}/unlock`) run the group's
- * `CheckAcceptMediaType` (415) before per-verb auth (list/verify read,
+ * `CheckAcceptMediaType` (415), then the repo-missing 401 (route message —
+ * locks.go:51-59 and siblings; L9), then per-verb auth (list/verify read,
  * create/unlock write — all REQUIRE a signed-in doer, `requireSigned`), then
  * the upstream arms: 401 with the route-specific "You must have pull/push
  * access to <verb> locks" JSON body + the gitea-lfs realm, 403 scope, 400
@@ -105,11 +131,9 @@ import {
   accountDisabled,
   ownerUnavailable,
   rateLimited,
-  redirectPermanent,
   repositoryArchived,
   scopeForbidden,
 } from "../git-http/respond";
-import { lookupRedirect } from "../repos/service";
 import {
   acceptsLfsMediaType,
   BatchRequestError,
@@ -122,6 +146,7 @@ import {
   type LfsLimits,
 } from "../services/lfs/batch";
 import { LfsLockService } from "../services/lfs/locks";
+import { goParseInt64, goParseInt64ErrorText } from "../services/lfs/locks";
 import { handleLocks } from "./locks";
 import { LfsStateService, validateAdoptStat } from "../services/lfs/state";
 import {
@@ -354,14 +379,16 @@ export async function authorizeLfs(input: {
 
   const header = req.headers.get("authorization");
   const parsed = header === null ? null : parseAuthorizationHeader(header);
-  // The two credential carriers, kept apart (same shape as the git-HTTP
-  // gate's ladder): the deploy-token method parses ONLY the Basic header
-  // (basic.go parseAuthBasic), so a `Bearer gdt_…` is not a deploy
-  // credential — it falls to the access-token arm and fails there, exactly
-  // like upstream's OAuth2 arm skipping it.
-  const bearerToken = parsed?.bearerToken?.token ?? null;
+  // Basic is the ONLY external credential carrier on the LFS family (the
+  // ledger L8 correction, 2026-11-02 — SPEC-0006 §2.3 said Basic all along):
+  // upstream mounts the routes with `AllowBasic` + `AllowDeployToken`
+  // (web.go:1777, NOT AllowOAuth2), and its `parseToken` Bearer arm carries
+  // only the internal SSH JWT (`server.go:621-630`) which no external client
+  // can mint. A `Bearer` header — access token or `gdt_` alike — is
+  // therefore NOT a credential here: it reads as anonymous, exactly like
+  // upstream's unauthenticated request.
   const basicCandidate = parsed?.basicAuth ? basicAuthTokenCandidate(parsed.basicAuth) : null;
-  const credential = bearerToken ?? basicCandidate;
+  const credential = basicCandidate;
 
   const ownerActive = owner !== null && owner.status === "active";
   const publiclyVisible = repo.visibility === "public" && ownerActive && input.ownerVisibility === "public";
@@ -447,10 +474,6 @@ export async function authorizeLfs(input: {
       : Promise.resolve(),
   );
 
-  // Row 7 parity: known token lacking the repository-category scope → 403.
-  const required = op === "read" ? "read:repository" : "write:repository";
-  if (!scope.has(required)) return scopeForbidden();
-
   // Row 11 parity: disabled/prohibited doer; then upstream httpBase's
   // owner-status check (applies to every caller, owner included).
   if (verified.user.status === "prohibited") return accountDisabled();
@@ -494,6 +517,15 @@ export async function authorizeLfs(input: {
     const teamWrites = teamMode === "write" || teamMode === "admin" || teamMode === "owner";
     if (!isOwner && !isSiteAdmin && !teamWrites) return lfsChallenge();
   }
+
+  // Row 7 parity — AFTER the grant arms (the ledger L7 correction,
+  // 2026-11-02): upstream order is authenticate (requireAuth 401,
+  // server.go:470-473) THEN CheckRepoScopedToken (403, server.go:475-483),
+  // so a credential that both fails the grant and lacks the repository
+  // scope CHALLENGES like upstream instead of 403ing first. (The locks
+  // family keeps its scope-first order — that IS upstream's locks shape.)
+  const required = op === "read" ? "read:repository" : "write:repository";
+  if (!scope.has(required)) return scopeForbidden();
   return true;
 }
 
@@ -569,6 +601,16 @@ export interface LfsDeps {
 /**
  * Production deps: relay store by default — presign requires S3 credentials
  * that arrive as wrangler secrets (`createLfsStore` probes, §2.3 fallback).
+ *
+ * Presign-mode posture (the ledger L14 record, 2026-11-02): `PresignLfsStore`
+ * is class-complete and exercised by the suites (a direct `serveLfs` pass),
+ * but UNREACHABLE in production at this pin — `createLfsStore` is called with
+ * no config, and the credential triple (`R2_ACCESS_KEY_ID` /
+ * `R2_SECRET_ACCESS_KEY` secrets + `R2_ACCOUNT_ID` var / bucket name) has no
+ * config surface (`wrangler.jsonc` is account-local and orchestrator-owned).
+ * Flipping it on is the M2 follow-up: thread an `LfsStoreConfig` through here
+ * once the vars land — handlers stay untouched behind the `LfsStore`
+ * capability interface (SPEC-0006 §2.3, §6).
  */
 export function defaultLfsDeps(env: Env): LfsDeps {
   return {
@@ -581,10 +623,16 @@ export function defaultLfsDeps(env: Env): LfsDeps {
 }
 
 /**
- * The gate's LFS branch: resolve the repo through the existing D1 pipeline
- * (row → redirect row 13), then dispatch to the family. D1-missing repos fall
- * through to the engine untouched — byte-identical with the pre-LFS behavior
- * (the transitional passthrough that keeps the e2e suite working).
+ * The gate's LFS branch: resolve the repo, then dispatch to the family. A
+ * D1-missing repo (never existed OR renamed — upstream's
+ * `GetRepositoryByOwnerAndName`, `models/repo/repo.go:747-763`, never
+ * consults the redirect table) is served by THIS family with the upstream
+ * repo-missing arms: batch/objects/verify → 404 LFS JSON
+ * (`server.go:462-468`), locks → 401 with the route message
+ * (`locks.go:51-59` and siblings) — the ledger L9 correction (2026-11-02)
+ * that retired the old engine passthrough and the row-13 301 redirect.
+ * `engine` stays in the signature only because the gate's call site
+ * (git-http/gate.ts) is shared with the non-LFS pipeline.
  */
 export async function handleLfsGateBranch(
   req: Request,
@@ -593,26 +641,18 @@ export async function handleLfsGateBranch(
   engine: DurableGitHandler<Env>,
   lfs: LfsRoute,
 ): Promise<Response> {
-  const ownerLower = lfs.owner.toLowerCase();
-  const repoLower = lfs.repo.toLowerCase();
-  const resolved = await resolveRepository(env.DB, ownerLower, repoLower);
-  if (resolved === null) {
-    // Row 13: a renamed/transferred repo's old URL 301s to the canonical
-    // path before any auth challenge (§2.5.3) — LFS URLs included.
-    const redirect = await lookupRedirect(env.DB, ownerLower, repoLower);
-    if (redirect !== null) return redirectPermanent(req.url, redirect.ownerNamespace, redirect.slug);
-    return engine.fetch(req, env, ctx);
-  }
+  void engine;
+  const resolved = await resolveRepository(env.DB, lfs.owner.toLowerCase(), lfs.repo.toLowerCase());
   return serveLfs(req, env, (p) => ctx.waitUntil(p), lfs, resolved, defaultLfsDeps(env));
 }
 
-/** Serve one LFS family request against a resolved repo. */
+/** Serve one LFS family request; `resolved === null` = repo missing/renamed. */
 export async function serveLfs(
   req: Request,
   env: Env,
   waitUntil: (promise: Promise<void>) => void,
   lfs: LfsRoute,
-  resolved: ResolvedLfsRepo,
+  resolved: ResolvedLfsRepo | null,
   deps: LfsDeps,
 ): Promise<Response> {
   // Route-level decisions before auth (upstream: routing first; the §2.1
@@ -685,7 +725,7 @@ async function handleBatch(
   env: Env,
   waitUntil: (promise: Promise<void>) => void,
   lfs: LfsRoute,
-  resolved: ResolvedLfsRepo,
+  resolved: ResolvedLfsRepo | null,
   deps: LfsDeps,
 ): Promise<Response> {
   // Upstream `CheckAcceptMediaType` (batch + verify only; §4.9).
@@ -700,11 +740,16 @@ async function handleBatch(
   }
   let request;
   try {
-    request = parseBatchRequest(text, deps.limits);
+    request = parseBatchRequest(text);
   } catch (error) {
     if (error instanceof BatchRequestError) return lfsError(error.status, error.message);
     throw error;
   }
+
+  // Upstream order (server.go:212-217): the repo lookup (404, LFS JSON) runs
+  // after the decode/operation arms and before both auth and the batch cap —
+  // a nonexistent or renamed repo 404s here (L9).
+  if (resolved === null) return lfsError(404);
 
   // `upload` op mutates (rows + hrefs), `download` only reads (§2.1 table).
   const decision = await authorizeLfs({
@@ -718,15 +763,27 @@ async function handleBatch(
   });
   if (decision !== true) return decision;
 
+  // Upstream's object-count cap runs AFTER authentication (server.go:219-222;
+  // the ledger L10 correction — it used to ride the pre-auth parse). The body
+  // cap above stays pre-auth out of necessity: the endpoint takes
+  // unauthenticated input and Workers must bound the read (documented
+  // divergence — upstream decodes an unbounded body before auth too).
+  if (deps.limits.maxBatchSize > 0 && (request.objects?.length ?? 0) > deps.limits.maxBatchSize) {
+    return lfsError(413);
+  }
+
   const objects = await shapeBatchResponse(request, shapingContext(req, lfs, resolved), {
     state: deps.state,
     store: deps.store,
     limits: deps.limits,
     now: deps.now(),
   });
-  // Compact body, no trailing newline — the pin's jsonv2 `MarshalWrite`
-  // (same wire discipline as `lfsError` / the locks family).
-  return new Response(JSON.stringify({ objects }), {
+  // `{"objects":null}` for a missing/null request key — upstream's
+  // BatchResponse.Objects carries no omitempty, so its nil slice marshals as
+  // null (shared.go:49-52; the ledger L11 correction). Compact body, no
+  // trailing newline — the pin's jsonv2 `MarshalWrite` (same wire discipline
+  // as `lfsError` / the locks family).
+  return new Response(JSON.stringify({ objects: request.objects === null ? null : objects }), {
     status: 200,
     headers: { "content-type": LFS_MEDIA_TYPE },
   });
@@ -764,14 +821,30 @@ async function handleUpload(
   env: Env,
   waitUntil: (promise: Promise<void>) => void,
   lfs: LfsRoute,
-  resolved: ResolvedLfsRepo,
+  resolved: ResolvedLfsRepo | null,
   deps: LfsDeps,
 ): Promise<Response> {
-  // Pointer-from-path validation before auth (upstream order, server.go:310-321;
-  // message wording per getAuthenticatedMeta's pointer-validation 422).
+  // Pointer-from-path validation before auth (upstream order, server.go:309-321;
+  // the ledger L12 correction, 2026-11-02): the size segment parses with Go
+  // strconv.ParseInt(…, 10, 64) semantics and the failure arm answers 422 with
+  // the Go NumError text; the IsValid arm answers writeStatus(422) — the bare
+  // status text. Upstream FORGETS to return after the parse-failure 422 and
+  // continues into auth + row insert with size 0 (the missing-return bug at
+  // server.go:311-313); we do NOT replicate it — a failed parse is terminal
+  // here (documented divergence, SPEC-0006 §2.3).
   const oid = lfs.oid ?? "";
-  const size = lfs.arg !== null && /^\d+$/.test(lfs.arg) ? Number(lfs.arg) : -1;
-  if (!isValidPointerFields(oid, size)) return lfsError(422, "Oid or size are invalid");
+  const rawSize = lfs.arg ?? "";
+  const parsedSize = goParseInt64(rawSize);
+  if (parsedSize.errorClass !== null) {
+    return lfsError(422, goParseInt64ErrorText(rawSize, parsedSize.errorClass));
+  }
+  const size = Number(parsedSize.value);
+  if (!isValidPointerFields(oid, size)) return lfsError(422); // "Unprocessable Entity"
+
+  // Upstream getAuthenticatedRepository (server.go:462-468): the repo lookup
+  // follows the pointer arms and precedes auth — a nonexistent or renamed
+  // repo 404s with the LFS JSON envelope (L9).
+  if (resolved === null) return lfsError(404);
 
   const decision = await authorizeLfs({
     req,
@@ -793,13 +866,16 @@ async function handleUpload(
   const key = lfsKey(resolved.repo.storageKey, oid);
   const now = deps.now();
 
-  // Bytes present AND linked to this repo with agreeing sizes: skip the body
-  // check (upstream server.go:328-339, tightened to require the size match).
-  // Present without a row, or sizes in disagreement: stream the body through
-  // the hash-and-forward put — the re-hash is the proof of possession (and a
-  // mismatching row is refreshed only by a proven re-upload).
+  // Upstream skip (server.go:328-358): bytes present AND a row linked to this
+  // repo → skip the body check ENTIRELY — no size comparison (against the URL
+  // or the stat), no re-hash, and the row is NOT refreshed (the ledger L6
+  // correction, 2026-11-02: the old re-hash-and-refresh arm diverged from both
+  // upstream and SPEC-0006 §2.3's "row exists ⇒ skip"). Present without a row,
+  // or bytes absent: stream the body through the hash-and-forward put — the
+  // re-hash is the proof of possession (upstream hashes-only; our put lands
+  // the same hash-verified bytes under the content-addressed key).
   const [row, stat] = await Promise.all([deps.state.get(repoId, oid), deps.store.head(key)]);
-  if (row !== null && row.size === size && stat !== null && stat.size === size) {
+  if (row !== null && stat !== null) {
     return lfsError(200); // upstream writeStatus(200): LFS JSON {"message":"OK"}
   }
 
@@ -812,9 +888,11 @@ async function handleUpload(
     }
     throw error;
   }
-  // NewLFSMetaObject insert-if-absent semantics: the row stays `uploading`
-  // until verify (or adopt/sweep) promotes it (§3.3).
-  await deps.state.ensureUploading(repoId, oid, size, now);
+  // NewLFSMetaObject insert-if-absent (models/git/lfs.go:106-119): the row
+  // arises HERE — upstream's only row creator (server.go:369; the ledger L5
+  // correction) — and an existing row is never refreshed. A fresh row stays
+  // `uploading` until verify (or adopt/sweep) promotes it (§3.3).
+  await deps.state.insertUploadingIfAbsent(repoId, oid, size, now);
   return lfsError(200);
 }
 
@@ -827,7 +905,7 @@ async function handleVerify(
   env: Env,
   waitUntil: (promise: Promise<void>) => void,
   lfs: LfsRoute,
-  resolved: ResolvedLfsRepo,
+  resolved: ResolvedLfsRepo | null,
   deps: LfsDeps,
 ): Promise<Response> {
   // Upstream `CheckAcceptMediaType` (§4.9).
@@ -846,6 +924,10 @@ async function handleVerify(
   if (typeof pointer.oid !== "string" || typeof pointer.size !== "number") return lfsError(422);
   const { oid, size } = pointer;
   if (!isValidPointerFields(oid, size)) return lfsError(422, "Oid or size are invalid");
+
+  // Upstream getAuthenticatedMeta order (server.go:440-457): pointer
+  // validation → repo lookup (404) → auth (L9).
+  if (resolved === null) return lfsError(404);
 
   const decision = await authorizeLfs({
     req,
@@ -931,12 +1013,14 @@ async function handleDownload(
   env: Env,
   waitUntil: (promise: Promise<void>) => void,
   lfs: LfsRoute,
-  resolved: ResolvedLfsRepo,
+  resolved: ResolvedLfsRepo | null,
   deps: LfsDeps,
 ): Promise<Response> {
-  // `getAuthenticatedMeta` order: pointer validation (422) → auth → row (404).
+  // `getAuthenticatedMeta` order (server.go:440-457): pointer validation (422)
+  // → repo lookup (404, L9) → auth → row (404).
   const oid = lfs.oid ?? "";
   if (!isValidPointerFields(oid, 0)) return lfsError(422, "Oid or size are invalid");
+  if (resolved === null) return lfsError(404);
 
   const decision = await authorizeLfs({
     req,
