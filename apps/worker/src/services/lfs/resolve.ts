@@ -32,7 +32,7 @@ export interface LfsResolvedFile {
    *  `updatedAt` the ETag gate's Last-Modified (file.go:182). */
   meta: { oid: string; size: number; updatedAt: Date };
   /** The ServeDirect posture's redirect target (file.go:186-190); null in
-   *  relay posture — the landed defaultLfsDeps store never presigns. */
+   *  relay posture — the landed defaultLfsDeps store presigns only when LFS_STORE_PRESIGN arms the store (the L14 config wave). */
   href: string | null;
   /** The relayed object (stream + size + upload time). Null when presigned,
    *  or in the row-without-bytes race (the callers' graceful arms — the

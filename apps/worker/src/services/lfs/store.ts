@@ -33,6 +33,11 @@
  * - `R2_ACCOUNT_ID` — Cloudflare account id (plain var is fine; not secret).
  * The presigned host is `<account>.r2.cloudflarestorage.com/<bucket>/…`, so
  * `bucketName` must match the bound bucket (or the dedicated-bucket override).
+ *
+ * The production gate is the `LFS_STORE_PRESIGN` env var (SPEC-0006 §6
+ * as-built, the ledger L14 config wave): strict polarity — ONLY the exact
+ * string "true" arms presign, unset/anything else = relay (fail-closed).
+ * See `LfsStoreEnv` / `lfsStoreConfigFromEnv` below.
  */
 
 import { AwsV4Signer } from "aws4fetch";
@@ -383,7 +388,12 @@ export class PresignLfsStore extends RelayLfsStore {
 }
 
 export interface LfsStoreConfig {
-  /** "auto" (default): presign when S3 credentials are present, else relay. */
+  /**
+   * "auto" (default): presign when the S3 credential triple + bucket name are
+   * present, else relay — the programmatic surface's capability probe. The
+   * PRODUCTION surface is the `LFS_STORE_PRESIGN` env gate
+   * (`lfsStoreConfigFromEnv`), which is opt-in (fail-closed) instead.
+   */
   mode?: "auto" | "relay" | "presign";
   /** S3 credentials for presign mode; absent ⇒ relay fallback. */
   credentials?: Partial<R2S3Credentials>;
@@ -400,16 +410,18 @@ export function hasPresignCredentials(config: LfsStoreConfig): boolean {
 }
 
 /**
- * Mode selection (SPEC-0006 §2.3): presign is the default when S3 credentials
- * exist and `LFS_HREF_MODE` does not force relay; explicit "presign" with
- * missing credentials is a loud misconfiguration.
+ * Mode selection (SPEC-0006 §2.3/§6): presign when the config carries the
+ * capability (complete S3 credentials + bucket name) and `mode` does not
+ * force relay. Explicit "presign" with missing credentials is a loud
+ * misconfiguration (programmatic callers only — the env-derived config
+ * degrades to relay instead, see `lfsStoreConfigFromEnv`).
  */
 export function createLfsStore(bucket: R2Bucket, config: LfsStoreConfig = {}): LfsStore {
   const mode = config.mode ?? "auto";
   const canPresign = hasPresignCredentials(config) && config.bucketName !== undefined;
   if (mode === "presign" && !canPresign) {
     throw new LfsKeyError(
-      "LFS_HREF_MODE=presign requires R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY secrets and an R2_ACCOUNT_ID var",
+      "presign mode requires R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY secrets, an R2_ACCOUNT_ID var and the bucket name",
     );
   }
   if (mode !== "relay" && canPresign) {
@@ -419,6 +431,74 @@ export function createLfsStore(bucket: R2Bucket, config: LfsStoreConfig = {}): L
     });
   }
   return new RelayLfsStore(bucket);
+}
+
+/**
+ * The shipped R2 bucket name — `wrangler.jsonc.example` `r2_buckets[0].
+ * bucket_name`, provisioned under exactly this name by
+ * `scripts/setup-deploy.mjs` (`R2_NAME`). Presigned URLs carry the bucket in
+ * their PATH and the R2 binding never exposes its own name at runtime, so
+ * the env-derived config pins the shipped name instead of inventing a second
+ * config var; an operator who hand-renames the bound bucket must keep this
+ * constant in step (recorded in SPEC-0006 §6).
+ */
+export const DEFAULT_R2_LFS_BUCKET_NAME = "cf-gitea-packs";
+
+/**
+ * The env surface the LFS store config reads (SPEC-0006 §6 as-built — the
+ * ledger L14 config wave). Declared HERE, all-optional, so production reads
+ * the vars through a type this module owns: `Env` structurally satisfies the
+ * interface before AND after the orchestrator folds the wrangler.jsonc hunk
+ * (the generated Env picks the declared names up at `wrangler types`), and
+ * an unset name reads as undefined = relay, the fail-closed posture.
+ *
+ * - `LFS_STORE_PRESIGN` — the mode gate: upstream's `ServeDirect()` posture
+ *   (`modules/setting/storage.go:49,96-98` — direct-served LFS hrefs only
+ *   for a storage provider configured to serve direct) as a wrangler var
+ *   with STRICT polarity. ONLY the exact string "true" arms presign;
+ *   unset/anything else = relay — a deployment never presigns by accident
+ *   (deliberately stricter than the §2.3 credentials-present auto-default;
+ *   the `LFS_HREF_MODE` naming is superseded by this var).
+ * - `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` — the S3 API token secrets
+ *   (`wrangler secret put`; workerd exposes set secrets on the env object
+ *   whether or not the generated Env declares them).
+ * - `R2_ACCOUNT_ID` — plain var, first label of the S3 endpoint host.
+ */
+export interface LfsStoreEnv {
+  /**
+   * The R2 binding the stores wrap — present in every generated `Env`, which
+   * keeps the interface from being a weak type (an all-optional shape no
+   * pre-fold `Env` shares a property with would reject the structural pass,
+   * TS2559) while honestly naming the one binding the surface needs.
+   */
+  REPO_PACKS?: R2Bucket;
+  LFS_STORE_PRESIGN?: string;
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
+  R2_ACCOUNT_ID?: string;
+}
+
+/**
+ * Derive the store config from the env surface (SPEC-0006 §6 as-built). The
+ * var gates the MODE; the credential triple gates the CAPABILITY: `"true"`
+ * with an incomplete triple yields mode "auto", whose capability probe
+ * degrades to relay — never a throw, because `defaultLfsDeps` runs per
+ * request and a half-armed deployment must not 500 the family (the same
+ * fall-through posture as upstream's download arm, `server.go:496-503`,
+ * which drops the direct link whenever `ServeDirectURL` fails and hands out
+ * the relayed Authorization-echo link instead).
+ */
+export function lfsStoreConfigFromEnv(lfsEnv: LfsStoreEnv): LfsStoreConfig {
+  if (lfsEnv.LFS_STORE_PRESIGN !== "true") return { mode: "relay" };
+  return {
+    mode: "auto",
+    credentials: {
+      accessKeyId: lfsEnv.R2_ACCESS_KEY_ID ?? "",
+      secretAccessKey: lfsEnv.R2_SECRET_ACCESS_KEY ?? "",
+      accountId: lfsEnv.R2_ACCOUNT_ID ?? "",
+    },
+    bucketName: DEFAULT_R2_LFS_BUCKET_NAME,
+  };
 }
 
 function assertExpected(digestHex: string, size: number, options: LfsPutOptions): void {

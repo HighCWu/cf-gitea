@@ -7,7 +7,7 @@
  */
 
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 
 import {
   checksumHeaderFor,
@@ -19,8 +19,12 @@ import {
   PresignLfsStore,
   RelayLfsStore,
   type LfsHref,
+  sha256Hex,
 } from "./store";
 import { InvalidPointerError } from "./pointer";
+import { LfsStateService } from "./state";
+import { resolveLfsFile } from "./resolve";
+import { applyLfsObjectsDdl } from "./testing";
 
 /** Narrow after an assertion — keeps the tests cast-free. */
 function mustBe(link: LfsHref | null): LfsHref {
@@ -238,5 +242,82 @@ describe("store factory / capability probe", () => {
   it("explicit presign without credentials is a loud misconfiguration", () => {
     expect(() => createLfsStore(env.REPO_PACKS, { mode: "presign" })).toThrow(LfsKeyError);
     expect(() => createLfsStore(env.REPO_PACKS, { mode: "relay" })).not.toThrow();
+  });
+});
+
+// --- the reachable presign path (SPEC-0006 §6 as-built, the L14 config wave) ---------
+
+describe("reachable presign path — the media resolve arm's ServeDirect-or-relay split", () => {
+  /**
+   * With `LFS_STORE_PRESIGN=true` (SPEC-0006 §6 as-built) `defaultLfsDeps`
+   * constructs the presign store, so the landed resolve chain
+   * (`services/lfs/resolve.ts` — the /media arm's GetRawFileOrLFS port)
+   * stops degrading to the relay stream: its ServeDirect arm
+   * (`file.go:186-192` — `store.presignGet` first, bytes only when null)
+   * becomes REACHABLE and answers the presigned GET href. The real
+   * `PresignLfsStore` backs this test (signing is pure local HMAC — no
+   * network), so the suite exercises the exact production href path.
+   */
+
+  const REPO_ID = 7; // matches the file's KEY fixture storage key `r_7`
+  let bytes = new Uint8Array(0);
+  let oid = "";
+  let pointerBlob = new Uint8Array(0);
+
+  beforeAll(async () => {
+    await applyLfsObjectsDdl();
+    bytes = new Uint8Array(128).fill(61);
+    oid = await sha256Hex(bytes);
+    pointerBlob = new Uint8Array(
+      new TextEncoder().encode(
+        `version https://git-lfs.github.com/spec/v1\noid sha256:${oid}\nsize ${bytes.byteLength}\n`,
+      ),
+    );
+    // Object bytes under the fixture key + the verified meta row the resolve
+    // chain's GetLFSMetaObjectByOid arm requires.
+    await new RelayLfsStore(env.REPO_PACKS).put(`lfs/r_7/${oid}`, bytes, {
+      size: bytes.byteLength,
+      expectedSha256Hex: oid,
+    });
+    await new LfsStateService(env.DB).insertVerified(REPO_ID, oid, bytes.byteLength, new Date());
+  });
+
+  it("a presign store answers the redirect href and opens no bytes (ServeDirect arm reachable)", async () => {
+    const presign = new PresignLfsStore(env.REPO_PACKS, CREDENTIALS, { bucketName: BUCKET });
+    const resolved = await resolveLfsFile(
+      { d1: env.DB, store: presign },
+      { repoId: REPO_ID, storageKey: "r_7", blobData: pointerBlob },
+    );
+
+    if (resolved === null) throw new Error("expected the pointer to resolve");
+    expect(resolved.pointer.oid).toBe(oid);
+    expect(resolved.href).not.toBeNull();
+    const url = new URL(resolved.href ?? "");
+    expect(url.origin).toBe(`https://${HOST}`);
+    expect(url.pathname).toBe(`/${BUCKET}/lfs/r_7/${oid}`);
+    expect(url.searchParams.get("X-Amz-Signature")).not.toBeNull();
+    expect(resolved.object).toBeNull(); // the redirect answers; no bytes are opened
+  });
+
+  it("the relay store (and the view arm's presign:false) keep the inline-stream posture", async () => {
+    const relay = await resolveLfsFile(
+      { d1: env.DB, store: new RelayLfsStore(env.REPO_PACKS) },
+      { repoId: REPO_ID, storageKey: "r_7", blobData: pointerBlob },
+    );
+    if (relay === null) throw new Error("expected the pointer to resolve");
+    expect(relay.href).toBeNull();
+    if (relay.object === null) throw new Error("expected the relayed object");
+    expect(new Uint8Array(await relay.object.arrayBuffer())).toEqual(bytes);
+
+    // The file-view arm passes `presign: false` (view.go:113-117's
+    // ReadMetaObject — the view never redirects) — a presign store must not
+    // flip THAT caller's posture.
+    const view = await resolveLfsFile(
+      { d1: env.DB, store: new PresignLfsStore(env.REPO_PACKS, CREDENTIALS, { bucketName: BUCKET }) },
+      { repoId: REPO_ID, storageKey: "r_7", blobData: pointerBlob },
+      { presign: false },
+    );
+    expect(view?.href).toBeNull();
+    expect(view?.object).not.toBeNull();
   });
 });

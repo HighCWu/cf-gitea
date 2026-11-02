@@ -168,7 +168,22 @@
     // (fail-closed). Consumed by services/webhooks-push.ts' watchIfAuto
     // fold (services/repo-watchers.ts).
     "AUTO_WATCH_ON_CHANGES": "",
-    "MAX_PUSH_MB": "512"
+    "MAX_PUSH_MB": "512",
+    // LFS store mode (SPEC-0006 §6 as-built, the L14 config wave) — strict
+    // polarity: ONLY the exact string "true" constructs the presign store
+    // (PresignLfsStore) over the relay store; absent/anything else = relay
+    // (fail-closed: a deployment never presigns by accident). Upstream's
+    // posture is the storage ServeDirect gate (modules/setting/storage.go:
+    // 49,96-98; services/lfs/server.go:496-503 falls back to the relayed
+    // link). Arming ALSO requires the S3 credential triple — an incomplete
+    // triple keeps relay (the §2.3 capability probe, never a 500): the two
+    // SECRETS via `wrangler secret put R2_ACCESS_KEY_ID` /
+    // `R2_SECRET_ACCESS_KEY`, plus R2_ACCOUNT_ID here. Presigned paths name
+    // the shipped bucket (DEFAULT_R2_LFS_BUCKET_NAME, "cf-gitea-packs" —
+    // setup-deploy.mjs provisions it; the R2 binding never exposes its name
+    // at runtime).
+    "LFS_STORE_PRESIGN": "false",
+    "R2_ACCOUNT_ID": ""
   },
   "observability": {
     "enabled": true,

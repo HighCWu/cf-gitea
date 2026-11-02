@@ -154,6 +154,7 @@ import {
   LfsHashMismatchError,
   LfsSizeMismatchError,
   lfsKey,
+  lfsStoreConfigFromEnv,
   type LfsStore,
 } from "../services/lfs/store";
 import type { repositories } from "../db/schema";
@@ -599,23 +600,28 @@ export interface LfsDeps {
 }
 
 /**
- * Production deps: relay store by default — presign requires S3 credentials
- * that arrive as wrangler secrets (`createLfsStore` probes, §2.3 fallback).
- *
- * Presign-mode posture (the ledger L14 record, 2026-11-02): `PresignLfsStore`
- * is class-complete and exercised by the suites (a direct `serveLfs` pass),
- * but UNREACHABLE in production at this pin — `createLfsStore` is called with
- * no config, and the credential triple (`R2_ACCESS_KEY_ID` /
- * `R2_SECRET_ACCESS_KEY` secrets + `R2_ACCOUNT_ID` var / bucket name) has no
- * config surface (`wrangler.jsonc` is account-local and orchestrator-owned).
- * Flipping it on is the M2 follow-up: thread an `LfsStoreConfig` through here
- * once the vars land — handlers stay untouched behind the `LfsStore`
- * capability interface (SPEC-0006 §2.3, §6).
+ * Production deps: the store mode rides the `LFS_STORE_PRESIGN` env gate
+ * (SPEC-0006 §6 as-built — the ledger L14 config wave, 2026-11-03). STRICT
+ * polarity: ONLY the exact string "true" constructs `PresignLfsStore` over
+ * `RelayLfsStore`, and even then only when the S3 credential triple
+ * (`R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` secrets + `R2_ACCOUNT_ID`
+ * var) is complete — an incomplete triple degrades to relay through the
+ * §2.3 capability probe, never a throw (this constructor runs per request;
+ * upstream's own degrade is the server.go:496-503 fall-through from the
+ * ServeDirect link to the relayed one). Unset/anything else = relay,
+ * fail-closed: upstream's `ServeDirect()` posture
+ * (`modules/setting/storage.go:49,96-98`) translated to a wrangler var,
+ * stricter than the old credentials-present auto-default. The vars are read
+ * through `LfsStoreEnv` — the type `store.ts` owns — NOT the global `Env`,
+ * so this compiles before the orchestrator folds the wrangler.jsonc hunk
+ * and picks the declared vars up at `wrangler types`. The handlers stay
+ * untouched behind the `LfsStore` capability interface (SPEC-0006 §2.3, §6):
+ * a store without the presign capability answers the existing relay degrade.
  */
 export function defaultLfsDeps(env: Env): LfsDeps {
   return {
     state: new LfsStateService(env.DB),
-    store: createLfsStore(env.REPO_PACKS),
+    store: createLfsStore(env.REPO_PACKS, lfsStoreConfigFromEnv(env)),
     locks: new LfsLockService(env.DB),
     limits: DEFAULT_LFS_LIMITS,
     now: () => new Date(),
