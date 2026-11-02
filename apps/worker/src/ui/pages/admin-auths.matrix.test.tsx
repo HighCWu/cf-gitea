@@ -21,10 +21,14 @@
  *   - the VALIDATOR: the name require/size/slug ladder, the provider
  *     membership, the discovery-URL scheme gate (auths.go:272-278);
  *   - the WRITE SEAMS: create (validate-before-persist — a bad cfg writes
- *     NO row; the name-exists arm; the store's defaults), update (the
- *     write-only secret keeps the stored value on an empty post; the
- *     name clash excludes self), delete (the in-use refusal first, the
- *     missing arm);
+ *     NO row; the LIVE discovery probe, SPEC §5.1's
+ *     ErrOpenIDConnectInitialize arm: a bogus-but-well-formed URL
+ *     re-renders unable_to_initialize_openid with NO row, a valid one
+ *     saves — the injected stub IdP; the name-exists arm; the store's
+ *     defaults), update (the write-only secret keeps the stored value on
+ *     an empty post; the probe refusal leaves the stored row untouched;
+ *     the name clash excludes self), delete (the in-use refusal first,
+ *     the missing arm);
  *   - the FORM DOM: the new page (the OAuth2-only type row, the wire
  *     names, the checked-by-default active box, the reduced tips + the
  *     callback-URL element), the edit page (the stored values back, the
@@ -47,6 +51,7 @@ import {
   type LoginSourceRow,
 } from "../../services/auth-sources/store";
 import { serializeOAuth2SourceConfig } from "../../services/auth-sources/cfg";
+import { resetOidcDiscoveryCacheForTests } from "../../services/auth-sources/oidc-client";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 import type { UiManifest } from "../manifest";
 import type { Viewer } from "../viewer";
@@ -125,6 +130,26 @@ function form(values: Partial<Record<string, string>> = {}): URLSearchParams {
   return params;
 }
 
+/** The stub discovery IdP for the save-time probe (SPEC §8's injectable
+ *  fetch): answers a well-formed document for any URL unless the test arms
+ *  a status/body failure. */
+function stubDiscoveryFetch(opts: { status?: number; body?: unknown } = {}): typeof fetch {
+  return (): Promise<Response> =>
+    Promise.resolve(
+      new Response(
+        JSON.stringify(
+          opts.body ?? {
+            issuer: "https://idp.example.com",
+            authorization_endpoint: "https://idp.example.com/authorize",
+            token_endpoint: "https://idp.example.com/token",
+            jwks_uri: "https://idp.example.com/jwks.json",
+          },
+        ),
+        { status: opts.status ?? 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+}
+
 beforeAll(async () => {
   await applyAuthD1Migrations();
 });
@@ -135,6 +160,9 @@ beforeEach(async () => {
   for (const table of ["external_login_user", "login_source", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
+  // The probe's memo is module-level (the oidc-client cache) — clear it so
+  // each test's stub answers its own scenario (the keys.ts reset idiom).
+  resetOidcDiscoveryCacheForTests();
 });
 
 // --- the loader ---------------------------------------------------------------
@@ -381,7 +409,7 @@ describe("applyAdminAuthSourceCreate (NewAuthSourcePost reduced, validate-before
       clientSecret: "s3cret",
       discoveryUrl: "https://idp/.well-known/openid-configuration",
     };
-    const created = await applyAdminAuthSourceCreate(env.DB, values);
+    const created = await applyAdminAuthSourceCreate(env.DB, values, { fetchImpl: stubDiscoveryFetch() });
     expect(created.outcome).toBe("created");
     const row = await drizzle(env.DB).select().from(loginSources).get();
     expect(row?.name).toBe("corp-oidc");
@@ -455,18 +483,104 @@ describe("applyAdminAuthSourceCreate (NewAuthSourcePost reduced, validate-before
   });
 });
 
+describe("the LIVE discovery probe at save (SPEC §5.1's eager-validate-then-persist — ErrOpenIDConnectInitialize)", () => {
+  /** A fully-credentialled OIDC form over the given discovery URL. */
+  function oidcForm(discoveryUrl: string) {
+    return {
+      ...newAdminAuthSourceFormValues(),
+      name: "probe-arm",
+      provider: "openidConnect",
+      clientId: "client-abc",
+      clientSecret: "s3cret",
+      discoveryUrl,
+    };
+  }
+
+  it("CREATE, bogus URL (404): the unable_to_initialize_openid re-render shape + NO row", async () => {
+    const outcome = await applyAdminAuthSourceCreate(env.DB, oidcForm("https://bogus-idp/.well-known/openid-configuration"), {
+      fetchImpl: stubDiscoveryFetch({ status: 404 }),
+    });
+    expect(outcome.outcome).toBe("invalid");
+    if (outcome.outcome === "invalid") {
+      // The upstream Tr shape with the CAUSE substituted (auths.go:317's
+      // errInit.Unwrap()) + the Err_DiscoveryURL flag.
+      expect(outcome.message).toBe(
+        "Unable to initialize OpenID Connect Provider: discovery document fetch answered 404",
+      );
+      expect(outcome.field).toBe("discoveryUrl");
+      expect(outcome.form.discoveryUrl).toBe("https://bogus-idp/.well-known/openid-configuration"); // the posted values survive the re-render
+    }
+    expect((await loadAdminAuthsData(env.DB)).total).toBe(0); // failure ⇒ no row
+  });
+
+  it("CREATE, well-formed-but-dead document (shape failure): the same arm", async () => {
+    const outcome = await applyAdminAuthSourceCreate(env.DB, oidcForm("https://shapeless-idp/.well-known/openid-configuration"), {
+      fetchImpl: stubDiscoveryFetch({ body: { issuer: "https://shapeless-idp" } }), // missing the endpoints
+    });
+    expect(outcome.outcome).toBe("invalid");
+    if (outcome.outcome === "invalid") {
+      expect(outcome.message).toBe(
+        "Unable to initialize OpenID Connect Provider: discovery document is missing authorization_endpoint",
+      );
+      expect(outcome.field).toBe("discoveryUrl");
+    }
+    expect((await loadAdminAuthsData(env.DB)).total).toBe(0);
+  });
+
+  it("CREATE, a valid discovery URL: the save proceeds (the probe's success arm)", async () => {
+    const outcome = await applyAdminAuthSourceCreate(env.DB, oidcForm("https://live-idp/.well-known/openid-configuration"), {
+      fetchImpl: stubDiscoveryFetch(),
+    });
+    expect(outcome.outcome).toBe("created");
+    expect((await loadAdminAuthsData(env.DB)).total).toBe(1);
+  });
+
+  it("UPDATE, bogus URL: the edit is refused and the STORED cfg is untouched (validate-before-write)", async () => {
+    const source = await insertSource("stable");
+    const outcome = await applyAdminAuthSourceUpdate(env.DB, source.id, oidcForm("https://bogus-edit/.well-known/openid-configuration"), {
+      fetchImpl: stubDiscoveryFetch({ status: 500 }),
+    });
+    expect(outcome.outcome).toBe("invalid");
+    if (outcome.outcome === "invalid") {
+      expect(outcome.message).toBe(
+        "Unable to initialize OpenID Connect Provider: discovery document fetch answered 500",
+      );
+      expect(outcome.field).toBe("discoveryUrl");
+    }
+    const row = await drizzle(env.DB).select().from(loginSources).where(eq(loginSources.id, source.id)).get();
+    expect(row?.name).toBe("stable"); // the pre-update values survive
+    expect(JSON.parse(row!.cfg)).toMatchObject({ discoveryUrl: "https://idp.example.com/.well-known/openid-configuration" });
+  });
+
+  it("a non-OIDC provider saves without any probe (the github arm answers created with an unreachable stub)", async () => {
+    const outcome = await applyAdminAuthSourceCreate(env.DB, {
+      ...newAdminAuthSourceFormValues(),
+      name: "gh-no-probe",
+      provider: "github",
+      clientId: "k",
+      clientSecret: "s",
+    }, { fetchImpl: (): Promise<Response> => Promise.reject(new Error("probe must not run")) });
+    expect(outcome.outcome).toBe("created");
+  });
+});
+
 describe("applyAdminAuthSourceUpdate (EditAuthSourcePost reduced)", () => {
   it("saves the new values; an empty posted secret keeps the stored one", async () => {
     const source = await insertSource("rename-me");
-    const outcome = await applyAdminAuthSourceUpdate(env.DB, source.id, {
-      ...newAdminAuthSourceFormValues(),
-      name: "renamed",
-      provider: "openidConnect",
-      clientId: "client-new",
-      clientSecret: "", // write-only empty — keep
-      discoveryUrl: "https://idp2/.well-known/openid-configuration",
-      isActive: false,
-    });
+    const outcome = await applyAdminAuthSourceUpdate(
+      env.DB,
+      source.id,
+      {
+        ...newAdminAuthSourceFormValues(),
+        name: "renamed",
+        provider: "openidConnect",
+        clientId: "client-new",
+        clientSecret: "", // write-only empty — keep
+        discoveryUrl: "https://idp2/.well-known/openid-configuration",
+        isActive: false,
+      },
+      { fetchImpl: stubDiscoveryFetch() },
+    );
     expect(outcome.outcome).toBe("saved");
     const row = await drizzle(env.DB).select().from(loginSources).where(eq(loginSources.id, source.id)).get();
     expect(row?.name).toBe("renamed");
@@ -479,14 +593,19 @@ describe("applyAdminAuthSourceUpdate (EditAuthSourcePost reduced)", () => {
 
   it("a posted secret replaces the stored one; the name clash excludes self", async () => {
     const source = await insertSource("self");
-    const replaced = await applyAdminAuthSourceUpdate(env.DB, source.id, {
-      ...newAdminAuthSourceFormValues(),
-      name: "self",
-      provider: "openidConnect",
-      clientId: "k",
-      clientSecret: "brand-new",
-      discoveryUrl: "https://idp/.well-known/openid-configuration",
-    });
+    const replaced = await applyAdminAuthSourceUpdate(
+      env.DB,
+      source.id,
+      {
+        ...newAdminAuthSourceFormValues(),
+        name: "self",
+        provider: "openidConnect",
+        clientId: "k",
+        clientSecret: "brand-new",
+        discoveryUrl: "https://idp/.well-known/openid-configuration",
+      },
+      { fetchImpl: stubDiscoveryFetch() },
+    );
     expect(replaced.outcome).toBe("saved");
     const row = await drizzle(env.DB).select().from(loginSources).where(eq(loginSources.id, source.id)).get();
     const replacedCfg = JSON.parse(row!.cfg) as { clientSecret: string };

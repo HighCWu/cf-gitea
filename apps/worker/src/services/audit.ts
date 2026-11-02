@@ -154,6 +154,21 @@ export const AuditActions = {
   // (auth.go:476's RecordAs — actor the ADMIN, scope the target).
   UserImpersonation: defineAction("user:impersonation:start", "User {actor} started impersonating user {scope}."),
   UserImpersonationExit: defineAction("user:impersonation:exit", "User {actor} stopped impersonating user {scope}."),
+  // The external-login link pair (action.go:89-90 — ids AND templates
+  // verbatim): the add row emits at the dance callback's link completion
+  // (web/oauth2-login.ts's linkIdentityToUser arms — upstream
+  // LinkAccountToUser, externalaccount/user.go:51-52), the remove row at
+  // the settings unlink arm (ui/pages/user-settings-security.tsx's
+  // applyAccountLinkUnlink — upstream DeleteAccountLink,
+  // security.go:59-61).
+  UserExternalLoginAdd: defineAction(
+    "user:externallogin:add",
+    "Added external login {external_id} for user {scope} using provider {provider}.",
+  ),
+  UserExternalLoginRemove: defineAction(
+    "user:externallogin:remove",
+    "Removed external login from authentication source {auth_source_id} for user {scope}.",
+  ),
   // organization:* (action.go:114-134)
   OrganizationCreate: defineAction("organization:create", "Created organization {scope}."),
   OrganizationDelete: defineAction("organization:delete", "Deleted organization {scope}."),

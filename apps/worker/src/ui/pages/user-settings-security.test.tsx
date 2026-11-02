@@ -13,16 +13,20 @@
  * rows: icon, source name, the Active badge, the Remove form), the
  * Link-Account buttons (the OrderedOAuth2Names arm), the missing-source
  * skip arm (security.go's `err == nil`), the dead-cfg degrade, and the
- * unlink seams (parse + apply — removed / not-exist).
+ * unlink seams (parse + apply — removed / not-exist; the removed arm
+ * records upstream's `user:externallogin:remove` audit row,
+ * security.go:59-61, asserted over the read seam).
  */
 
 import { env } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { renderToString } from "hono/jsx/dom/server";
+import { drizzle } from "drizzle-orm/d1";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { runA11y } from "../__tests__/a11y";
 import { cborEncode } from "../../web/webauthn-fixtures";
+import { findAuditEvents } from "../../services/audit";
 import { serializeOAuth2SourceConfig } from "../../services/auth-sources/cfg";
 import {
   createLoginSource,
@@ -72,6 +76,7 @@ beforeEach(async () => {
   await env.DB.prepare("DELETE FROM login_source").run();
   await env.DB.prepare("DELETE FROM two_factor").run(); // the 2FA arms' clean slate (the enrolled describes re-seed)
   await env.DB.prepare("DELETE FROM webauthn_credentials").run(); // the webauthn arms' clean slate (the enrolled describe re-seeds)
+  await env.DB.prepare("DELETE FROM audit_event").run(); // the unlink arm's audit rows (the removed-arm assertion reads it)
   await env.DB.prepare(
     "INSERT INTO users (id, username, username_lower, display_name, created_at) VALUES (1, 'alice', 'alice', 'Alice Doe', unixepoch())",
   ).run();
@@ -80,6 +85,12 @@ beforeEach(async () => {
 async function pageHtml(): Promise<string> {
   const data = await loadUserSettingsSecurityPageData(env.DB, 1);
   return renderToString(<UserSettingsSecurityPage ctx={ctx} data={data} />);
+}
+
+/** The audit_event rows (the unlink arm's emit assertions — the read seam
+ *  the settings audit tabs render from). */
+async function auditRows() {
+  return findAuditEvents(drizzle(env.DB));
 }
 
 async function seedSource(name: string, options: { isActive?: boolean; provider?: "openidConnect" | "github"; iconUrl?: string } = {}) {
@@ -385,14 +396,29 @@ describe("the unlink seams (parse + apply)", () => {
     const source = await seedSource("oidc-corp");
     await ensureExternalLogin(env.DB, { externalId: "sub-1", loginSourceId: source.id, userId: 1, provider: "openidConnect" });
 
-    // Not the doer's link: not-exist, and the row SURVIVES.
+    // Not the doer's link: not-exist, and the row SURVIVES — no audit row
+    // (upstream records only after a successful RemoveAccountLink).
     expect(await applyAccountLinkUnlink(env.DB, 999, source.id)).toEqual({ outcome: "not-exist" });
     expect(await getLoginSource(env.DB, source.id)).not.toBeNull();
+    expect(await auditRows()).toHaveLength(0);
 
-    // The doer's link: removed — the row is gone.
+    // The doer's link: removed — the row is gone, and upstream's audit row
+    // lands (security.go:59-61): actor = scope = the doer, the source id
+    // rides the message's auth_source_id var.
     expect(await applyAccountLinkUnlink(env.DB, 1, source.id)).toEqual({ outcome: "removed" });
     const data = await loadUserSettingsSecurityPageData(env.DB, 1);
     expect(data.accountLinks).toEqual([]);
+    const rows = await auditRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: "user:externallogin:remove",
+      actorId: 1,
+      actorName: "alice",
+      scopeType: "user",
+      scopeId: "1",
+      origin: "ui",
+      message: `Removed external login from authentication source ${String(source.id)} for user alice.`,
+    });
   });
 
   it("the pin carries NO last-link guard: the only link unlinks too (the recorded posture)", async () => {

@@ -10,8 +10,10 @@
  * through the route (join hit ⇒ fresh-row mint + returnTo; signed-in link
  * arm ⇒ settings/security; the re-dance continuation ⇒ returnTo; the
  * anonymous miss ⇒ the link-page redirect with untrusted hints), the
- * prohibited arm, the PathEscape'd source-name parity, and the one-time
- * state spend on every terminal outcome.
+ * prohibited arm, the PathEscape'd source-name parity, the one-time
+ * state spend on every terminal outcome, and the link-completion audit row
+ * (`user:externallogin:add` — upstream LinkAccountToUser's RecordAs,
+ * emitted at the signed-in link arm only; the join-hit login emits none).
  */
 
 import { env } from "cloudflare:workers";
@@ -109,7 +111,7 @@ let router: ReturnType<typeof createOAuth2LoginRouter>;
 
 beforeEach(async () => {
   await applyAuthD1Migrations();
-  for (const table of ["external_login_user", "login_source", "sessions", "users"]) {
+  for (const table of ["audit_event", "external_login_user", "login_source", "sessions", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   idp = await stubIdp();
@@ -371,6 +373,10 @@ describe("the callback leg (GET /user/oauth2/{source}/callback)", () => {
     expect(await sessionCount()).toBe(before + 1);
     const { results } = await env.DB.prepare("SELECT last_login_at FROM users WHERE id = ?").bind(String(userId)).all<{ last_login_at: number }>();
     expect(results[0]?.last_login_at).not.toBeNull();
+    // The JOIN-hit login path writes NO link — no user:externallogin:add row
+    // (upstream emits only inside LinkAccountToUser).
+    const { results: auditRows } = await env.DB.prepare("SELECT count(*) AS n FROM audit_event").all<{ n: number }>();
+    expect(auditRows[0]?.n).toBe(0);
   });
 
   it("a prohibited linked identity signs into NOTHING (the mint-time posture)", async () => {
@@ -396,6 +402,23 @@ describe("the callback leg (GET /user/oauth2/{source}/callback)", () => {
     expect(response.headers.get("location")).toBe("/user/settings/security");
     const { results } = await env.DB.prepare("SELECT user_id FROM external_login_user WHERE external_id = ?").bind("sub-123").all<{ user_id: number }>();
     expect(results[0]?.user_id).toBe(userId);
+
+    // The link-completion audit row (upstream LinkAccountToUser's
+    // RecordAs — externalaccount/user.go:51-52): actor = scope = the doer,
+    // the message renders the external id + the provider key.
+    const { results: auditRows } = await env.DB
+      .prepare("SELECT action, actor_id, actor_name, scope_type, scope_id, scope_name, origin, message FROM audit_event")
+      .all<{ action: string; actor_id: number; actor_name: string; scope_type: string; scope_id: string; scope_name: string; origin: string; message: string }>();
+    expect(auditRows).toHaveLength(1);
+    const row = auditRows[0]!;
+    expect(row.action).toBe("user:externallogin:add");
+    expect(row.actor_id).toBe(userId);
+    expect(row.actor_name).toBe("jane");
+    expect(row.scope_type).toBe("user");
+    expect(row.scope_id).toBe(String(userId));
+    expect(row.scope_name).toBe("jane");
+    expect(row.origin).toBe("ui");
+    expect(row.message).toBe("Added external login sub-123 for user jane using provider openidConnect.");
   });
 
   it("the re-dance continuation (W5's arms): the link completes onto the returnTo, NOT settings/security", async () => {

@@ -1068,16 +1068,18 @@ describe("uiRouter", () => {
     expect(fresh.status).toBe(200);
     expect(await fresh.text()).toContain('action="/-/admin/auths/new"');
 
-    // The create POST (upstream's wire fields): 303 onto the list.
+    // The create POST (upstream's wire fields): 303 onto the list. The
+    // github provider rides the CRUD (the OIDC probe at save would
+    // correctly refuse the fictional discovery URL — the matrix suite
+    // pins that refusal; the CRUD here exercises the full round-trip).
     const create = await fetchAuthed("/-/admin/auths/new", cookie, {
       method: "POST",
       headers: formHeaders,
       body: new URLSearchParams({
-        name: "corp-oidc",
-        oauth2_provider: "openidConnect",
+        name: "corp-gh",
+        oauth2_provider: "github",
         oauth2_key: "client-abc",
         oauth2_secret: "s3cret",
-        open_id_connect_auto_discovery_url: "https://idp.example.com/.well-known/openid-configuration",
         is_active: "on",
       }).toString(),
     });
@@ -1085,7 +1087,7 @@ describe("uiRouter", () => {
     expect(create.headers.get("location")).toBe("/-/admin/auths");
 
     const row = await drizzle(env.DB).select().from(loginSources).get();
-    expect(row?.name).toBe("corp-oidc");
+    expect(row?.name).toBe("corp-gh");
     const id = row!.id;
 
     // The list carries the row; the edit combo's GET renders it — the secret
@@ -1095,7 +1097,7 @@ describe("uiRouter", () => {
     const edit = await fetchAuthed(`/-/admin/auths/${id}`, cookie);
     expect(edit.status).toBe(200);
     const editHtml = await edit.text();
-    expect(editHtml).toContain('value="corp-oidc"');
+    expect(editHtml).toContain('value="corp-gh"');
     expect(editHtml).not.toContain("s3cret");
 
     // The delete POST: 303 back onto the list, the row gone — the edit GET

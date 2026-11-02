@@ -125,6 +125,7 @@ import {
   type OAuth2SourceConfig,
 } from "../../services/auth-sources/cfg";
 import { getProviderDescriptor, listExecutableProviders } from "../../services/auth-sources/registry";
+import { fetchOidcDiscovery, OidcVerifyError, type FetchImpl } from "../../services/auth-sources/oidc-client";
 import {
   countLoginSourceUsers,
   findLoginSources,
@@ -194,6 +195,11 @@ export const adminAuthsLocale = {
   login_source_exist: 'The authentication source "%s" already exists.', // "admin.auths.login_source_exist"
   invalid_discovery_url:
     "Invalid Auto Discovery URL (this must be a valid URL starting with http:// or https://)", // "admin.auths.invalid_openIdConnectAutoDiscoveryURL"
+  // The LIVE-probe failure (SPEC §5.1's eager-validate-then-persist): the
+  // en-US value with the CAUSE substituted for %s (upstream interpolates
+  // errInit.Unwrap() — auths.go:317; the edit arm re-renders the same
+  // Err_DiscoveryURL flag, auths.go:426-428).
+  unable_to_initialize_openid: "Unable to initialize OpenID Connect Provider: %s", // "admin.auths.unable_to_initialize_openid"
   still_in_used:
     "The authentication source is still in use. Convert or delete any users using this authentication source first.", // "admin.auths.still_in_used"
   new_success: "The authentication %s has been added.", // "admin.auths.new_success" (unused — the success arms redirect; kept for the message-shape record)
@@ -406,20 +412,52 @@ function oauth2ConfigErrorMessage(error: OAuth2ConfigError): { message: string; 
 // The write seams (the upstream handler ladders, store + codec beneath)
 // ---------------------------------------------------------------------------
 
+/** The LIVE discovery probe — SPEC §5.1's eager-validate-then-persist: the
+ *  OIDC arm fetches + parses the discovery document AT SAVE (upstream's
+ *  eager construction, source_register.go:35-47 wrapped as
+ *  ErrOpenIDConnectInitialize; create arm auths.go:315-317, edit arm
+ *  auths.go:426-428). Returns the failure CAUSE string (the re-render's
+ *  %s substitution) or null when the document fetches and parses. A
+ *  non-OidcVerifyError is a programming error and propagates.
+ *
+ *  The memo key namespaces the probe AWAY from the login flow's
+ *  `${id}:${updatedAt}` keys and anchors it to the URL itself: a bogus URL
+ *  never yields a successful fetch, so its entry never exists and every
+ *  probe of it re-fetches fresh (and fails); a valid URL's cached document
+ *  is exactly what this URL served. Entries are bounded by the distinct
+ *  valid URLs ever probed in this isolate. */
+async function probeOidcDiscovery(fetchImpl: FetchImpl, discoveryUrl: string): Promise<string | null> {
+  try {
+    await fetchOidcDiscovery(fetchImpl, `admin-auth-probe:${discoveryUrl}`, discoveryUrl);
+    return null;
+  } catch (error) {
+    if (error instanceof OidcVerifyError) return error.message;
+    throw error;
+  }
+}
+
 export type AdminAuthSourceWriteOutcome =
   | { outcome: "created"; name: string }
   | { outcome: "saved"; id: number }
   | { outcome: "invalid"; message: string; field: AdminAuthSourceField | null; form: AdminAuthSourceFormValues };
 
-/** The form-layer validation + cfg assembly + the store create — upstream
- *  NewAuthSourcePost (auths.go:238-341) reduced to the OAuth2 arm, the
- *  register/rollback dance collapsed to this validate-before-persist (SPEC
- *  §5.1). The field checks run in upstream's order: name (require/size/
- *  slug), provider, client id/secret, the discovery-URL SCHEME check
- *  (auths.go:272-278's form-layer arm — the LIVE discovery probe rides the
- *  W2 client seam's landing; the create arm's ErrOpenIDConnectInitialize
- *  branch is the recorded handoff), then the codec. */
-export async function applyAdminAuthSourceCreate(d1: D1Database, values: AdminAuthSourceFormValues): Promise<AdminAuthSourceWriteOutcome> {
+/** The form-layer validation + cfg assembly + the LIVE discovery probe +
+ *  the store create — upstream NewAuthSourcePost (auths.go:238-341)
+ *  reduced to the OAuth2 arm, the register/rollback dance collapsed to
+ *  this validate-before-persist (SPEC §5.1: a probe failure means NO row —
+ *  upstream deletes the half-registered source, source.go:248-252, with
+ *  the same net observable). The field checks run in upstream's order:
+ *  name (require/size/slug), provider, client id/secret, the discovery-URL
+ *  SCHEME check (auths.go:272-278's form-layer arm), the codec, then the
+ *  LIVE probe (upstream's in-CreateSource registration — the
+ *  ErrOpenIDConnectInitialize branch, auths.go:315-317). `opts.fetchImpl`
+ *  defaults to global fetch (the production probe); tests inject the stub
+ *  IdP (SPEC §8's seam). */
+export async function applyAdminAuthSourceCreate(
+  d1: D1Database,
+  values: AdminAuthSourceFormValues,
+  opts: { fetchImpl?: FetchImpl } = {},
+): Promise<AdminAuthSourceWriteOutcome> {
   const invalid = validateAdminAuthSourceForm(values, { requireSecret: true });
   if (invalid !== null) return { outcome: "invalid", ...invalid, form: values };
   let cfg: string;
@@ -431,6 +469,19 @@ export async function applyAdminAuthSourceCreate(d1: D1Database, values: AdminAu
       return { outcome: "invalid", message: mapped.message, field: mapped.field, form: values };
     }
     throw error;
+  }
+  if (values.provider === "openidConnect") {
+    // Reachable only with a non-empty discoveryUrl (the codec's
+    // discovery-required arm already returned above).
+    const cause = await probeOidcDiscovery(opts.fetchImpl ?? fetch, values.discoveryUrl);
+    if (cause !== null) {
+      return {
+        outcome: "invalid",
+        message: adminAuthsLocale.unable_to_initialize_openid.replace("%s", cause),
+        field: "discoveryUrl",
+        form: values,
+      };
+    }
   }
   try {
     const row = await createLoginSource(d1, {
@@ -453,10 +504,19 @@ export async function applyAdminAuthSourceCreate(d1: D1Database, values: AdminAu
   }
 }
 
-/** EditAuthSourcePost (auths.go:349-456) reduced the same way. The
- *  write-only secret: an empty posted clientSecret keeps the stored cfg's
- *  secret (buildCfg's existingSecret arm). */
-export async function applyAdminAuthSourceUpdate(d1: D1Database, id: number, values: AdminAuthSourceFormValues): Promise<AdminAuthSourceWriteOutcome> {
+/** EditAuthSourcePost (auths.go:349-456) reduced the same way — including
+ *  the LIVE discovery probe before the write (upstream's UpdateSource
+ *  re-registration fails the edit through the same
+ *  ErrOpenIDConnectInitialize branch, auths.go:426-428; SPEC §6.2's
+ *  validate-before-write keeps the stored row untouched on a probe
+ *  failure). The write-only secret: an empty posted clientSecret keeps the
+ *  stored cfg's secret (buildCfg's existingSecret arm). */
+export async function applyAdminAuthSourceUpdate(
+  d1: D1Database,
+  id: number,
+  values: AdminAuthSourceFormValues,
+  opts: { fetchImpl?: FetchImpl } = {},
+): Promise<AdminAuthSourceWriteOutcome> {
   const current = await getLoginSource(d1, id);
   if (current === null) {
     return { outcome: "invalid", message: `login source does not exist [id: ${id}]`, field: null, form: values };
@@ -480,6 +540,17 @@ export async function applyAdminAuthSourceUpdate(d1: D1Database, id: number, val
       return { outcome: "invalid", message: mapped.message, field: mapped.field, form: values };
     }
     throw error;
+  }
+  if (values.provider === "openidConnect") {
+    const cause = await probeOidcDiscovery(opts.fetchImpl ?? fetch, values.discoveryUrl);
+    if (cause !== null) {
+      return {
+        outcome: "invalid",
+        message: adminAuthsLocale.unable_to_initialize_openid.replace("%s", cause),
+        field: "discoveryUrl",
+        form: values,
+      };
+    }
   }
   try {
     const row = await updateLoginSource(d1, id, { name: values.name, isActive: values.isActive, cfg });

@@ -207,6 +207,23 @@ describe("audit action registry (SPEC-0015 §4.2)", () => {
     // the 3-segment id derives its family prefix filter
     expect(actionFilters()).toContain("repository:wiki");
   });
+
+  it("the external-login pair (upstream action.go:89-90) is registered with the verbatim ids and templates", () => {
+    expect(messageTemplate("user:externallogin:add")).toBe(
+      "Added external login {external_id} for user {scope} using provider {provider}.",
+    );
+    expect(messageTemplate("user:externallogin:remove")).toBe(
+      "Removed external login from authentication source {auth_source_id} for user {scope}.",
+    );
+    expect(
+      renderMessage(AuditActions.UserExternalLoginAdd, { external_id: "sub-123", scope: "jane", provider: "openidConnect" }),
+    ).toBe("Added external login sub-123 for user jane using provider openidConnect.");
+    expect(renderMessage(AuditActions.UserExternalLoginRemove, { auth_source_id: "7", scope: "jane" })).toBe(
+      "Removed external login from authentication source 7 for user jane.",
+    );
+    // the 3-segment ids derive their family prefix filter
+    expect(actionFilters()).toContain("user:externallogin");
+  });
 });
 
 // ---------------------------------------------------------------------------

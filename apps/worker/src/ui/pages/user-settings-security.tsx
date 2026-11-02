@@ -70,11 +70,11 @@
  * outcomes; the plain-form reduction keeps the failure message alive with a
  * 200 re-render notice (the W4 delete-refusal posture) and 303s the success
  * (the W4 success-arm posture — the message rides no wire; the removed row's
- * absence IS the feedback). Upstream emits an audit row
- * (`UserExternalLoginRemove`, security.go:59-61) — NOT emitted here: the
- * action id `user:externallogin:remove` (action.go:90) is unregistered in
- * the landed audit registry and services/audit.ts is outside this wave's
- * ownership; the exact registration hunk rides the W6 tail.
+ * absence IS the feedback). Upstream's audit row (`UserExternalLoginRemove`,
+ * security.go:59-61) is EMITTED here — applyAccountLinkUnlink records it on
+ * the removed arm (action id `user:externallogin:remove`, action.go:90;
+ * actor = scope = the doer, the seam resolves the username for the message
+ * vars).
  *
  * ## Mount record (MOUNTED at 0c2b151 — the wiring HANDOFF is retired)
  *
@@ -157,6 +157,9 @@
  * the accountlinks section.
  */
 
+import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
+
 import { UserSettingsNavbar } from "../components/settings-nav";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import { hasTwoFactorByUid } from "../../auth/two-factor";
@@ -165,6 +168,8 @@ import { formatKeyDate } from "./user-settings-keys";
 import { getProviderDescriptor } from "../../services/auth-sources/registry";
 import { parseOAuth2SourceConfig } from "../../services/auth-sources/cfg";
 import { findExternalLogins, getLoginSource, listActiveOAuth2Sources, removeExternalLogin } from "../../services/auth-sources/store";
+import { AuditActions, emitAudit } from "../../services/audit";
+import { users } from "../../db/schema";
 import { listCredentialsByUser } from "../../web/webauthn-store";
 import type { UiContext } from "../ui-context";
 
@@ -398,14 +403,42 @@ export type AccountLinkUnlinkOutcome = { outcome: "removed" } | { outcome: "not-
  * `RemoveAccountLink` (external_login_user.go:107-118) over the W1 store
  * op: delete the (userId, loginSourceId) pair; zero rows deleted is
  * upstream's ErrExternalLoginUserNotExist (`not-exist` — the caller's 404
- * decision is the notice re-render per the header recipe). The pin carries
- * NO last-link guard (the mission's "if the pin carries one": it does not —
- * a doer may unlink every external identity; the password-less posture
- * keeps PAT sign-in working).
+ * decision is the notice re-render per the header recipe). The removed arm
+ * records upstream's audit row (`audit.Record(ctx,
+ * UserExternalLoginRemove, ctx.Doer, "auth_source_id", id)`,
+ * security.go:59-61): actor = scope = the doer, the message's
+ * `auth_source_id` var carries the source id, and the doer's username is
+ * resolved for the template's `{scope}` (admin-users-impersonate.ts's
+ * lookup idiom). A failed audit row must not fail the unlink (upstream
+ * writeEvent logs, never throws — services/audit/event.go:136-140). The
+ * pin carries NO last-link guard (the mission's "if the pin carries one":
+ * it does not — a doer may unlink every external identity; the
+ * password-less posture keeps PAT sign-in working).
  */
 export async function applyAccountLinkUnlink(d1: D1Database, userId: number, loginSourceId: number): Promise<AccountLinkUnlinkOutcome> {
   const deleted = await removeExternalLogin(d1, userId, loginSourceId);
-  return deleted > 0 ? { outcome: "removed" } : { outcome: "not-exist" };
+  if (deleted === 0) return { outcome: "not-exist" };
+  // The doer's name for the message vars + the actor snapshot (the seam
+  // holds no resolved name — the impersonation emit's lookup idiom).
+  const username = (await drizzle(d1).select({ username: users.username }).from(users).where(eq(users.id, userId)).get())?.username ?? "";
+  try {
+    await emitAudit(drizzle(d1), {
+      action: AuditActions.UserExternalLoginRemove,
+      actorId: userId,
+      actorName: username,
+      actorCredential: null, // the write rode a session
+      scopeType: "user",
+      scopeId: userId,
+      scopeName: username,
+      origin: "ui",
+      // the message column stores the RENDERED template (the seam's
+      // contract) — the upstream template's two tokens
+      vars: { scope: username, auth_source_id: String(loginSourceId) },
+    });
+  } catch (error) {
+    console.error("security: unable to record the external-login unlink audit event", error);
+  }
+  return { outcome: "removed" };
 }
 
 // ---------------------------------------------------------------------------

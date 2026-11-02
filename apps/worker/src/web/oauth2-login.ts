@@ -101,6 +101,7 @@ import {
   exchangeGplusCode,
 } from "../services/auth-sources/gplus-client";
 import { getActiveOAuth2SourceByName } from "../services/auth-sources/store";
+import { AuditActions, emitAudit } from "../services/audit";
 import { lookupValidSession, mintSession, safeRedirectTarget, sessionCookieValue, sessionSetCookie } from "../ui/session";
 
 export type FetchImpl = OidcFetchImpl;
@@ -194,6 +195,36 @@ export function createOAuth2LoginRouter(deps: RouterDeps = {}): Hono<{ Bindings:
 
   // The dance state carriers (identity.ts) — the row when a session
   // exists, the cookie otherwise; both helpers answer what they used.
+
+  /** The link-completion audit row — upstream LinkAccountToUser's
+   *  `audit.RecordAs(ctx, user, UserExternalLoginAdd, user, "external_id",
+   *  …, "provider", …)` (externalaccount/user.go:51-52): actor = scope =
+   *  the user whose account gains the link. A failed audit row must not
+   *  fail the dance (upstream writeEvent logs, never throws —
+   *  services/audit/event.go:136-140). */
+  async function emitExternalLoginAdd(
+    d1: D1Database,
+    doer: { id: number; username: string },
+    link: { externalId: string; provider: string },
+  ): Promise<void> {
+    try {
+      await emitAudit(drizzle(d1), {
+        action: AuditActions.UserExternalLoginAdd,
+        actorId: doer.id,
+        actorName: doer.username,
+        actorCredential: null, // the write rode a session
+        scopeType: "user",
+        scopeId: doer.id,
+        scopeName: doer.username,
+        origin: "ui",
+        // the message column stores the RENDERED template (the seam's
+        // contract) — the upstream template's three tokens
+        vars: { scope: doer.username, external_id: link.externalId, provider: link.provider },
+      });
+    } catch (error) {
+      console.error("oauth2: unable to record the external-login link audit event", error);
+    }
+  }
 
   async function readParkedState(c: RouteContext | CallbackContext): Promise<{ state: OAuth2LoginState | null; sessionId: string | null }> {
     const cookie = sessionCookieValue(c.req.raw);
@@ -390,7 +421,8 @@ export function createOAuth2LoginRouter(deps: RouterDeps = {}): Hono<{ Bindings:
       const sessionCookie = sessionCookieValue(c.req.raw);
       const doer = sessionCookie !== null ? await lookupValidSession(c.env.DB, sessionCookie) : null;
       if (doer !== null) {
-        await linkIdentityToUser(c.env.DB, source, doer.id, simpleIdentity);
+        const linked = await linkIdentityToUser(c.env.DB, source, doer.id, simpleIdentity);
+        await emitExternalLoginAdd(c.env.DB, doer, linked);
         const destination = state.continue !== undefined ? returnTo : "/user/settings/security";
         return seeOther(destination, spentCookies);
       }
@@ -440,7 +472,8 @@ export function createOAuth2LoginRouter(deps: RouterDeps = {}): Hono<{ Bindings:
     const sessionCookie = sessionCookieValue(c.req.raw);
     const doer = sessionCookie !== null ? await lookupValidSession(c.env.DB, sessionCookie) : null;
     if (doer !== null) {
-      await linkIdentityToUser(c.env.DB, source, doer.id, identity);
+      const linked = await linkIdentityToUser(c.env.DB, source, doer.id, identity);
+      await emitExternalLoginAdd(c.env.DB, doer, linked);
       const destination = state.continue !== undefined ? returnTo : "/user/settings/security";
       return seeOther(destination, spentCookies);
     }
