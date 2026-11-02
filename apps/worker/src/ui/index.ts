@@ -8583,6 +8583,7 @@ async function repoActionsRunDispatch(c: Context<{ Bindings: Env }>): Promise<Re
       ref: form.get("ref") ?? url.searchParams.get("ref") ?? "",
       runId: String(outcome.run.id),
       actor: { id: viewer.id, username: viewer.username },
+      impersonatorUserId: viewer.impersonatorUserId ?? null, // the admin behind an impersonated session (migration 0058)
       origin: "ui",
       ipAddress: c.req.header("cf-connecting-ip") ?? null,
     });
@@ -8661,6 +8662,7 @@ async function repoActionsWorkflowToggle(c: Context<{ Bindings: Env }>): Promise
     workflowId: workflow,
     isEnable: route.action === "enable",
     actor: { id: viewer.id, username: viewer.username },
+    impersonatorUserId: viewer.impersonatorUserId ?? null, // the admin behind an impersonated session (migration 0058)
     origin: "ui",
     ipAddress: c.req.header("cf-connecting-ip") ?? null,
   });

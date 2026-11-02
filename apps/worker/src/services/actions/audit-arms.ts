@@ -34,10 +34,41 @@
  * Failure posture: upstream's audit writeEvent LOGS failures and never fails
  * the request (services/audit/event.go:136-140) — every helper catches and
  * logs, the caller's response is unaffected (the oauth2 arms' posture).
+ *
+ * ## The impersonation derivation (the Wave K9 threading)
+ *
+ * Upstream attaches the admin behind an impersonated session at the record
+ * seam itself: RecordAs derives `Impersonator: impersonatorRef(
+ * ImpersonatorFromContext(ctx), doer)` (event.go:124), where
+ * impersonatorRef drops the arm when the admin is absent or IS the doer and
+ * otherwise snapshots {ID, Name} (refs.go:29-36), and buildEvent writes
+ * ImpersonatorID/ImpersonatorName only when the ref is non-nil
+ * (event.go:77-80). The context's admin is a FULL user object resolved at
+ * auth time FROM THE SESSION's id backup with ONE GetUserByID — log and
+ * continue when that lookup fails, "the session stays usable, but audit
+ * events must not silently lose the admin behind it"
+ * (routers/common/auth.go:37-45).
+ *
+ * Our session rows carry the id alone (migration 0058's
+ * `impersonator_user_id`; the viewer's `impersonatorUserId`, ui/viewer.ts —
+ * the name is not on the row), so the AuthShared derivation rides these
+ * helpers: the arms accept the id-only form (`impersonatorUserId`) and
+ * resolve the name with ONE `users` read, ONLY on the impersonated arm. A
+ * vanished admin row degrades to ID-ONLY — the id stays on the audit row,
+ * the name column goes null, the failure is logged, the emit still lands
+ * (upstream's log-and-continue arm drops the admin entirely; keeping the id
+ * is deliberate — the row stays attributable, refs.go's own fallback posture
+ * "a failed lookup still yields a usable scope" applied to the actor ref).
+ * The full `impersonator` snapshot stays for callers that already hold the
+ * admin row (the session.ts exit seam resolves the pair in its own join).
+ * The same-id fold is upstream's verbatim: a session whose admin id equals
+ * the doer's records NOT impersonated (refs.go:31-36).
  */
 
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
+import { users } from "../../db/schema";
 import { AuditActions, emitAudit } from "../audit";
 
 /** The repo projection the scope needs (ScopeFromRepository's
@@ -68,8 +99,16 @@ export interface WorkflowToggleAuditArm {
    *  documented format; null when the write rode a session). */
   actorCredential?: string | null;
   /** The admin behind an impersonated session (impersonatorRef,
-   *  refs.go:31-36); absent/null = not impersonated. */
+   *  refs.go:31-36); absent/null = not impersonated. The FULL snapshot for
+   *  callers that already hold the admin's name. */
   impersonator?: { id: number; username: string } | null;
+  /** The id-only impersonation form — the viewer's `impersonatorUserId`
+   *  (the session row carries the id alone, migration 0058). The helper
+   *  derives the name with ONE users read, only on the impersonated arm
+   *  (upstream AuthShared's GetUserByID, routers/common/auth.go:37-45); a
+   *  vanished row degrades to id-only. Ignored when `impersonator` carries
+   *  the full snapshot. */
+  impersonatorUserId?: number | null;
 }
 
 /** The dispatch arm's input (DispatchActionWorkflow's :192-193 pairs). */
@@ -86,7 +125,10 @@ export interface WorkflowDispatchAuditArm {
   origin?: "ui" | "api";
   ipAddress?: string | null;
   actorCredential?: string | null;
+  /** See WorkflowToggleAuditArm.impersonator. */
   impersonator?: { id: number; username: string } | null;
+  /** See WorkflowToggleAuditArm.impersonatorUserId. */
+  impersonatorUserId?: number | null;
 }
 
 /** ScopeFromRepository (refs.go:65-70): the repo's FullName — the
@@ -101,6 +143,52 @@ function swallow(scope: string, error: unknown): void {
   console.error(`actions: unable to record the ${scope} audit event`, error);
 }
 
+/** The impersonation carrier both arms share (the actor plus either
+ *  impersonation input form). */
+interface WorkflowAuditImpersonation {
+  actor: { id: number; username: string };
+  impersonator?: { id: number; username: string } | null;
+  impersonatorUserId?: number | null;
+}
+
+/** impersonatorRef's nil arm rendered in the row's zero shape
+ *  (buildEvent leaves ImpersonatorID 0 / ImpersonatorName unset,
+ *  event.go:77-80). */
+const NOT_IMPERSONATED: { id: number; name: string | null } = { id: 0, name: null };
+
+/**
+ * impersonatorRef's port (refs.go:29-36) over the two input forms: the
+ * full `{id, username}` snapshot wins; otherwise the id-only form
+ * (`impersonatorUserId` — migration 0058's session column, the viewer's
+ * field) derives the name with ONE users read, taken ONLY on the
+ * impersonated arm (upstream AuthShared resolves the admin the same way,
+ * routers/common/auth.go:37-45). The same-id fold is verbatim (refs.go:31-36:
+ * the admin IS the doer ⇒ not impersonated). A vanished admin row (and a
+ * failed read) degrade to ID-ONLY — logged, never thrown, so the audit row
+ * still lands with its actor, scope, and message intact ("the session stays
+ * usable, but audit events must not silently lose the admin behind it" —
+ * ours keeps the id on the row where upstream drops it).
+ */
+async function resolveImpersonator(db: D1Database, arm: WorkflowAuditImpersonation): Promise<{ id: number; name: string | null }> {
+  if (arm.impersonator !== null && arm.impersonator !== undefined) {
+    return arm.impersonator.id === arm.actor.id ? NOT_IMPERSONATED : { id: arm.impersonator.id, name: arm.impersonator.username };
+  }
+  const id = arm.impersonatorUserId ?? 0;
+  if (id === 0 || id === arm.actor.id) return NOT_IMPERSONATED; // refs.go:31-36's fold
+  try {
+    const row = await drizzle(db)
+      .select({ username: users.username })
+      .from(users)
+      .where(eq(users.id, id))
+      .get();
+    if (row !== undefined) return { id, name: row.username };
+    console.error(`actions: unable to resolve impersonator ${id}: no users row`);
+  } catch (error) {
+    console.error(`actions: unable to resolve impersonator ${id}`, error);
+  }
+  return { id, name: null };
+}
+
 /**
  * RecordWorkflowToggle's port (:53-60): the action by polarity, the repo
  * scope, metadata {"workflow"}, vars {workflow, scope}.
@@ -108,13 +196,14 @@ function swallow(scope: string, error: unknown): void {
 export async function emitWorkflowToggleAudit(db: D1Database, arm: WorkflowToggleAuditArm): Promise<void> {
   try {
     const scopeName = repoFullName(arm.repo);
+    const impersonator = await resolveImpersonator(db, arm);
     await emitAudit(drizzle(db), {
       action: arm.isEnable ? AuditActions.ActionsWorkflowEnable : AuditActions.ActionsWorkflowDisable,
       actorId: arm.actor.id,
       actorName: arm.actor.username,
       actorCredential: arm.actorCredential ?? null, // the web toggle rides a session
-      impersonatorId: arm.impersonator?.id ?? 0,
-      impersonatorName: arm.impersonator?.username ?? null,
+      impersonatorId: impersonator.id,
+      impersonatorName: impersonator.name,
       scopeType: "repository",
       scopeId: arm.repo.id,
       scopeName,
@@ -136,13 +225,14 @@ export async function emitWorkflowToggleAudit(db: D1Database, arm: WorkflowToggl
 export async function emitWorkflowDispatchAudit(db: D1Database, arm: WorkflowDispatchAuditArm): Promise<void> {
   try {
     const scopeName = repoFullName(arm.repo);
+    const impersonator = await resolveImpersonator(db, arm);
     await emitAudit(drizzle(db), {
       action: AuditActions.ActionsWorkflowDispatch,
       actorId: arm.actor.id,
       actorName: arm.actor.username,
       actorCredential: arm.actorCredential ?? null,
-      impersonatorId: arm.impersonator?.id ?? 0,
-      impersonatorName: arm.impersonator?.username ?? null,
+      impersonatorId: impersonator.id,
+      impersonatorName: impersonator.name,
       scopeType: "repository",
       scopeId: arm.repo.id,
       scopeName,

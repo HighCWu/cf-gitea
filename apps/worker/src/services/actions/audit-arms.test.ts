@@ -16,6 +16,7 @@ import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
+import { users } from "../../db/schema";
 import { actionFilters, findAuditEvents, messageTemplate, renderMessage, AuditActions } from "../audit";
 import { emitWorkflowDispatchAudit, emitWorkflowToggleAudit } from "./audit-arms";
 
@@ -143,6 +144,90 @@ describe("emitWorkflowDispatchAudit (DispatchActionWorkflow's tail, workflow.go:
     const row = (await findAuditEvents(db(), { scopeType: "repository", scopeId: REPO.id }))[0]!;
     expect(JSON.parse(row.metadata ?? "")).toEqual({ ref: "main", run_id: "7", workflow: "build.yml" });
     expect(row.origin).toBe("api");
+  });
+});
+
+describe("the impersonation derivation (the Wave K9 threading — impersonatorRef over the id-only session column)", () => {
+  const T0 = new Date("2026-01-01T00:00:00Z");
+
+  beforeEach(async () => {
+    // The admin behind the impersonated session. The session row carries
+    // only its id (migration 0058's impersonator_user_id — the viewer's
+    // impersonatorUserId), so the helper's ONE users read has a row to
+    // resolve (upstream AuthShared's GetUserByID, routers/common/auth.go:
+    // 37-45). Delete-first: the local D1 outlives a single test here, the
+    // seed must stay idempotent.
+    await env.DB.prepare("DELETE FROM users WHERE id = 1").run();
+    await db().insert(users).values({ id: 1, username: "root", usernameLower: "root", status: "active", createdAt: T0 });
+  });
+
+  it("the toggle arm derives the admin's name from the id-only form", async () => {
+    await emitWorkflowToggleAudit(env.DB, {
+      repo: REPO,
+      workflowId: "build.yml",
+      isEnable: true,
+      actor: ACTOR,
+      impersonatorUserId: 1,
+    });
+    const row = (await findAuditEvents(db(), { scopeType: "repository", scopeId: REPO.id }))[0]!;
+    expect(row.impersonatorId).toBe(1);
+    expect(row.impersonatorName).toBe("root");
+    // the derivation leaves the rest of the row untouched
+    expect(row.actorId).toBe(7);
+    expect(row.actorName).toBe("alice");
+    expect(row.message).toBe("Enabled Actions workflow build.yml in repository alice/alpha.");
+  });
+
+  it("the dispatch arm derives identically", async () => {
+    await emitWorkflowDispatchAudit(env.DB, {
+      repo: REPO,
+      workflowId: "build.yml",
+      ref: "main",
+      runId: 42,
+      actor: ACTOR,
+      impersonatorUserId: 1,
+    });
+    const row = (await findAuditEvents(db(), { scopeType: "repository", scopeId: REPO.id }))[0]!;
+    expect(row.impersonatorId).toBe(1);
+    expect(row.impersonatorName).toBe("root");
+    expect(row.message).toBe("Dispatched Actions workflow build.yml on main in repository alice/alpha.");
+  });
+
+  it("a vanished impersonator row degrades to id-only — the emit still lands", async () => {
+    const errSpy = vi.spyOn(console, "error");
+    await emitWorkflowDispatchAudit(env.DB, {
+      repo: REPO,
+      workflowId: "build.yml",
+      ref: "main",
+      runId: 42,
+      actor: ACTOR,
+      impersonatorUserId: 99999, // no users row — the admin's row is gone
+    });
+    const row = (await findAuditEvents(db(), { scopeType: "repository", scopeId: REPO.id }))[0]!;
+    expect(row.impersonatorId).toBe(99999); // the id STAYS on the row
+    expect(row.impersonatorName).toBeNull();
+    expect(row.actorId).toBe(7); // the rest of the row is intact
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("unable to resolve impersonator 99999"));
+  });
+
+  it("the same-id fold records NOT impersonated (refs.go:31-36)", async () => {
+    await emitWorkflowToggleAudit(env.DB, {
+      repo: REPO,
+      workflowId: "build.yml",
+      isEnable: true,
+      actor: ACTOR,
+      impersonatorUserId: 7, // === actor.id
+    });
+    const row = (await findAuditEvents(db(), { scopeType: "repository", scopeId: REPO.id }))[0]!;
+    expect(row.impersonatorId).toBe(0);
+    expect(row.impersonatorName).toBeNull();
+  });
+
+  it("the unimpersonated arm stays the zero row", async () => {
+    await emitWorkflowToggleAudit(env.DB, { repo: REPO, workflowId: "build.yml", isEnable: true, actor: ACTOR });
+    const row = (await findAuditEvents(db(), { scopeType: "repository", scopeId: REPO.id }))[0]!;
+    expect(row.impersonatorId).toBe(0);
+    expect(row.impersonatorName).toBeNull();
   });
 });
 
