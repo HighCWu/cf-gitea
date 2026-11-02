@@ -32,6 +32,7 @@ import { inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { users } from "../../db/schema";
+import { parsePointer, POINTER_MAX_BYTES } from "../../services/lfs/pointer";
 import type {
   AnnotatedTag,
   Branch,
@@ -540,7 +541,31 @@ export async function collectTreeRecursive(
   return { flattened: out, truncated };
 }
 
-/** GitBlobResponse — base64 content (the LFS fields stay unset pre-LFS-SPEC). */
+/**
+ * `parsePossibleLfsPointerBuffer` (services/repository/files/content.go:254-260)
+ * — the ContentsResponse/GitBlobResponse `lfs_oid`/`lfs_size` writer: the
+ * POINTER-DECLARED oid/size when the content parses as a valid pointer, no
+ * meta-row lookup (upstream reports the pointer's own fields —
+ * content.go:249's GetBlobBySHA probes only while `0 < blobSize <
+ * lfs.MetaFileMaxSize`, the 1024-byte window where content is read at all).
+ * A malformed pointer (`IsValid() == false`, including InvalidPointerError)
+ * reports nothing. Directory listings never inline content, so they never
+ * carry the fields at this pin (upstream gates them on
+ * `IncludeSingleFileContent`/`IncludeLfsMetadata`, content.go:170-184 — our
+ * list payloads pass `content: null`).
+ */
+function lfsFieldsOf(content: Uint8Array | null): { lfs_oid?: string; lfs_size?: number } {
+  if (content === null || content.byteLength === 0 || content.byteLength >= POINTER_MAX_BYTES) return {};
+  try {
+    const pointer = parsePointer(content, { strict: false });
+    return pointer === null ? {} : { lfs_oid: pointer.oid, lfs_size: pointer.size };
+  } catch {
+    return {}; // InvalidPointerError — the malformed-pointer arm
+  }
+}
+
+/** GitBlobResponse — base64 content; a pointer blob additionally reports its
+ *  lfs_oid/lfs_size (GetBlobBySHA's parse, content.go:249). */
 export function toGitBlob(oid: string, data: Uint8Array, pair: RepositoryWithOwner, origin: string): GitBlobResponse {
   const owner = encodeURIComponent(pair.repo.ownerNamespace);
   const slug = encodeURIComponent(pair.repo.slug);
@@ -550,6 +575,7 @@ export function toGitBlob(oid: string, data: Uint8Array, pair: RepositoryWithOwn
     size: data.byteLength,
     content: base64Encode(data),
     encoding: "base64",
+    ...lfsFieldsOf(data),
   };
 }
 
@@ -601,6 +627,10 @@ export function toContentsEntry(
     size: opts.size ?? 0,
     encoding: inline ? "base64" : null,
     content: inline ? base64Encode(opts.content as Uint8Array) : null,
+    // lfs_oid/lfs_size ride the regular-file arm only when the content was
+    // read (upstream content.go:168-177: IsRegular/IsExecutable gates on
+    // IncludeSingleFileContent; symlink/submodule/dir arms never set them).
+    ...(isFile ? lfsFieldsOf(opts.content) : {}),
     ...(opts.target === undefined || opts.target === null ? {} : { target: opts.target }),
     ...(opts.type === "submodule" ? { submodule_git_url: "" } : {}), // TODO(SPEC-0005): submodule URL resolution
     url: `${apiUrl}/contents/${opts.path}?ref=${pair.repo.defaultBranch}`,

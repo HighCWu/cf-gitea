@@ -30,6 +30,9 @@ import {
 } from "../models/contents";
 import { assertNotArchived, requireVisibleRepo } from "../services/repo-access";
 import { gitSigOf } from "../../ui/pages/pull-merge-box";
+import { defaultLfsDeps, lfsRepoId } from "../../lfs/router";
+import { resolveLfsFile, type LfsResolvedFile } from "../../services/lfs/resolve";
+import { httpTime } from "../../ui/pages/release-downloads";
 
 /**
  * Tier-1 contents routes (SPEC-0004 §2.4 rows repoGetContentsList /
@@ -53,7 +56,9 @@ import { gitSigOf } from "../../ui/pages/pull-merge-box";
  *   - raw/media resolve the legacy `{ref}/{filepath}` embedded form (the
  *     plain-hono catchalls below, outside the generated doc — the imports.ts
  *     precedent) plus the `ref` query param (the openapi route); media is
- *     LFS-aware upstream and stays a byte-for-byte raw twin here (SPEC-0006).
+ *     LFS-aware upstream and LFS-resolves here too (the probe → row → object
+ *     chain of services/lfs/resolve.ts), while raw stays the byte-verbatim
+ *     twin serving pointer bytes (SPEC-0006: raw never LFS-resolves).
  *
  * Runtime-only emissions (undeclared; the orchestrator-owned
  * RUNTIME_ONLY_RESPONSES tables are not extended by this batch): 404 on the
@@ -389,9 +394,103 @@ async function applyAndRespond(
 // contract's binary response family is content-typed octet-stream, so the
 // openapi handlers return the raw Response (zod-openapi maps non-json/text
 // content types to a bare Response return).
+//
+// The two families split exactly like upstream's bindings (api.go:1309-1310):
+// `/raw` is GetRawFile — `common.ServeBlob` verbatim, NO pointer probe, so an
+// LFS pointer file serves the POINTER bytes (SPEC-0006's "raw never
+// LFS-resolves"; download.go:105-121 at the web twin); `/media` is
+// GetRawFileOrLFS — the probe → meta row → object chain of
+// services/lfs/resolve.ts answers the OBJECT bytes with the oid-ETag gate
+// and the 303-or-relay posture (file.go:154-201).
 // ---------------------------------------------------------------------------
 
-async function getRawBytes(c: Context<ApiEnv>, owner: string, repo: string, rawPath: string, refParam: string | null): Promise<Response> {
+/** The byte-verbatim answer both families fall back to. */
+function plainRawResponse(data: Uint8Array, objectType: string): Response {
+  return new Response(new Uint8Array(data), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "X-Gitea-Object-Type": objectType,
+    },
+  });
+}
+
+/** The wiki-raw module's etagMatches — the comma-list, W/-insensitive,
+ *  `*`-matching If-None-Match test (httpcache.go:57-75; the raw-files.ts
+ *  private copy is the landed template). */
+function etagMatches(ifNoneMatch: string | null, etag: string): boolean {
+  if (ifNoneMatch === null) return false;
+  const trimmed = ifNoneMatch.trim();
+  if (trimmed === "") return false;
+  if (trimmed === "*") return true;
+  const bare = etag.replace(/^W\//, "");
+  return trimmed.split(",").some((candidate) => candidate.trim().replace(/^W\//, "") === bare);
+}
+
+/** httpcache.go:104-113's second-truncated If-Modified-Since compare —
+ *  ignored whenever If-None-Match is present. */
+function ifModifiedSinceMatches(ifModifiedSince: string | null, lastModified: Date): boolean {
+  if (ifModifiedSince === null || ifModifiedSince === "") return false;
+  const since = new Date(ifModifiedSince);
+  if (Number.isNaN(since.getTime())) return false;
+  return Math.floor(lastModified.getTime() / 1000) <= Math.floor(since.getTime() / 1000);
+}
+
+/**
+ * The MEDIA LFS outcome — GetRawFileOrLFS's tail (file.go:182-201) over the
+ * landed web arm's posture (ui/pages/raw-files.ts mediaBlobResponse, the
+ * ONE-copy template): the SECOND cache gate answers ETag `"${oid}"` +
+ * Last-Modified = the meta row's updated time (HandleGenericETagPrivateCache,
+ * httpcache.go:81-117), 304 with those two headers only (If-None-Match, or —
+ * absent INM — If-Modified-Since); the presign posture 303-redirects
+ * (ctx.Redirect's default status, base.go:157); the relayed 200 streams the
+ * object with the zero-duration private stamp and the object's storage time
+ * as Last-Modified (ServeUserContentByFile's Stat().ModTime). The
+ * row-without-bytes race degrades to the plain pointer bytes — the web
+ * arm's graceful posture of upstream's ReadMetaObject failure (file.go:195).
+ */
+function mediaLfsResponse(
+  c: Context<ApiEnv>,
+  resolved: LfsResolvedFile,
+  objectType: string,
+  plainFallback: () => Response,
+): Response {
+  const etag = `"${resolved.pointer.oid}"`;
+  const lastModified = httpTime(resolved.meta.updatedAt);
+  const gateHeaders = new Headers({
+    "Content-Type": "application/octet-stream",
+    "X-Gitea-Object-Type": objectType,
+    ETag: etag,
+    "Last-Modified": lastModified,
+  });
+  const notModified = (): Response =>
+    new Response(null, { status: 304, headers: new Headers({ ETag: etag, "Last-Modified": lastModified }) });
+  const ifNoneMatch = c.req.header("if-none-match") ?? null;
+  if (etagMatches(ifNoneMatch, etag)) return notModified();
+  if (ifNoneMatch === null && ifModifiedSinceMatches(c.req.header("if-modified-since") ?? null, resolved.meta.updatedAt)) {
+    return notModified();
+  }
+  if (resolved.href !== null) {
+    return new Response(null, { status: 303, headers: new Headers({ ...gateHeaders, Location: resolved.href }) });
+  }
+  if (resolved.object === null) return plainFallback();
+  const headers = new Headers(gateHeaders);
+  // ServeUserContentByFile re-dates Last-Modified to the object's storage
+  // time and stamps the zero-duration private cache form (the raw-files.ts
+  // WEB_CACHE_CONTROL twin).
+  headers.set("Last-Modified", new Date(resolved.object.uploaded).toUTCString());
+  headers.set("Cache-Control", "max-age=0, private, must-revalidate");
+  return new Response(resolved.object.body, { status: 200, headers });
+}
+
+async function getRawBytes(
+  c: Context<ApiEnv>,
+  owner: string,
+  repo: string,
+  rawPath: string,
+  refParam: string | null,
+  family: "raw" | "media" = "raw",
+): Promise<Response> {
   const pair = await requireVisibleRepo(c, { owner, repo });
   if (pair.repo.isEmpty) {
     throw new ApiError(404, "not found");
@@ -405,13 +504,19 @@ async function getRawBytes(c: Context<ApiEnv>, owner: string, repo: string, rawP
   if (blob === null) {
     throw new ApiError(404, "not found");
   }
-  return new Response(new Uint8Array(blob.data), {
-    status: 200,
-    headers: {
-      "Content-Type": "application/octet-stream",
-      "X-Gitea-Object-Type": blob.mode === "120000" ? "symlink" : "blob",
-    },
-  });
+  const objectType = blob.mode === "120000" ? "symlink" : "blob";
+  const plain = (): Response => plainRawResponse(blob.data, objectType);
+  if (family === "media") {
+    // GetRawFileOrLFS's chain (file.go:154-178): probe → row; a null answer
+    // (non-pointer / malformed pointer / missing meta row) keeps the raw
+    // twin's bytes. The object streams from the store — never buffered.
+    const lfs = await resolveLfsFile(
+      { d1: c.env.DB, store: defaultLfsDeps(c.env).store },
+      { repoId: lfsRepoId(pair.repo.id), storageKey: pair.repo.storageKey, blobData: blob.data },
+    );
+    if (lfs !== null) return mediaLfsResponse(c, lfs, objectType, plain);
+  }
+  return plain();
 }
 
 /**
@@ -652,7 +757,8 @@ export function registerContentsRoutes(
 
   // -------------------------------------------------------------------------
   // GET /repos/{owner}/{repo}/media/{filepath} (repoGetRawFileOrLFS) — the
-  // raw-or-LFS twin; byte-identical pre-LFS (SPEC-0006 resolves pointers).
+  // raw-or-LFS twin: a pointer with a meta row answers the OBJECT bytes
+  // (file.go:154-201); every other blob stays the byte-verbatim raw twin.
   // -------------------------------------------------------------------------
   app.openapi(
     createRoute({
@@ -673,7 +779,7 @@ export function registerContentsRoutes(
     }),
     (c) => {
       const { owner, repo, filepath } = c.req.valid("param");
-      return getRawBytes(c, owner, repo, filepath, c.req.valid("query").ref ?? null);
+      return getRawBytes(c, owner, repo, filepath, c.req.valid("query").ref ?? null, "media");
     },
   );
 
@@ -774,6 +880,6 @@ export function registerContentsRoutes(
   });
   app.get("/repos/:owner/:repo/media/*", (c) => {
     const { owner, repo } = c.req.param();
-    return getRawBytes(c, owner, repo, tailAfter(c, `/${owner}/${repo}/media/`), c.req.query("ref") ?? null);
+    return getRawBytes(c, owner, repo, tailAfter(c, `/${owner}/${repo}/media/`), c.req.query("ref") ?? null, "media");
   });
 }

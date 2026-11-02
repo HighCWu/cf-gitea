@@ -72,7 +72,10 @@ import type { EngineClient } from "../engine";
 import { resolveRefSuffix, splitRefSuffix } from "../index";
 import type { RefType } from "../index";
 import { blameLink, treeLink } from "../links";
+import { defaultLfsDeps, lfsRepoId } from "../../lfs/router";
+import type { LfsPointer } from "../../services/lfs/pointer";
 import { parsePointer, POINTER_MAX_BYTES, PointerTooLargeError } from "../../services/lfs/pointer";
+import { resolveLfsFile } from "../../services/lfs/resolve";
 import {
   classifyBlob,
   enrichTreeCommits,
@@ -110,8 +113,15 @@ export type FileViewData =
       entry: TreeEntryJson;
       variant: BlobViewVariant;
       /** file_info.tmpl:14's LFS badge gate — the loader's pointer probe
-       *  (view.go:72-123 getFileReader's isLFSFile). */
+       *  (view.go:72-123 getFileReader's isLFSFile). Parse-only: true whenever
+       *  the blob parses as a pointer, meta row or not (view.go:104-110 sets
+       *  lfsMeta on the row-miss path too). */
       isLfsFile: boolean;
+      /** view_file.go:219's FileSize = `blobOrLfsSize` (view.go:118) — the
+       *  OBJECT's row size when the view renders LFS content, undefined for a
+       *  plain file (lfs_view_test.go:62 pins the object size on the badge).
+       *  Also the too-large cap's input for the swap (view_file.go:274-275). */
+      lfsSize?: number;
       markupHtml?: string;
       text?: string;
       mediaKind?: MediaKind;
@@ -134,20 +144,21 @@ function parentDirOf(path: string): string {
  * lfs.MetaFileMaxSize (= POINTER_MAX_BYTES) bytes of the GIT blob, text-gated
  * (`if !fi.st.IsText() … return` — our landed null-byte sniff is the §4.2
  * port of the same gate), then `lfs.ReadPointerFromBuffer`. A VALID pointer
- * answers true — INCLUDING when the meta row is missing (view.go:104-110
- * sets lfsMeta on that error path, so `isLFSFile()` stays true and the badge
- * shows over pointer content). A MALFORMED pointer (the parser's
- * InvalidPointerError — upstream's `pointer.IsValid() == false`) is a plain
- * file; PointerTooLargeError cannot fire (the probe slices at the cap).
+ * answers the parsed pointer — INCLUDING when the meta row is missing
+ * (view.go:104-110 sets lfsMeta on that error path, so `isLFSFile()` stays
+ * true and the badge shows over pointer content). A MALFORMED pointer (the
+ * parser's InvalidPointerError — upstream's `pointer.IsValid() == false`) is
+ * a plain file; PointerTooLargeError cannot fire (the probe slices at the
+ * cap).
  */
-function probeIsLfsFile(blobData: Uint8Array): boolean {
+function probeLfsPointer(blobData: Uint8Array): LfsPointer | null {
   const probe = blobData.subarray(0, Math.min(blobData.byteLength, POINTER_MAX_BYTES));
-  if (probe.byteLength === 0 || isBinaryData(probe)) return false; // the IsText gate
+  if (probe.byteLength === 0 || isBinaryData(probe)) return null; // the IsText gate
   try {
-    return parsePointer(probe, { strict: false }) !== null;
+    return parsePointer(probe, { strict: false });
   } catch (error) {
     if (error instanceof PointerTooLargeError) throw error; // unreachable — the probe slices
-    return false; // InvalidPointerError — upstream's invalid-pointer arm
+    return null; // InvalidPointerError — upstream's invalid-pointer arm
   }
 }
 
@@ -246,12 +257,19 @@ function TreeBreadcrumb(props: {
 
 /** Load the file/tree view data. Every miss (non-exact or unresolvable ref
  *  suffix, path that is neither tree nor blob, submodule file views) →
- *  notFound → 404 shell. The ref suffix is REQUIRED (§3.3). */
+ *  notFound → 404 shell. The ref suffix is REQUIRED (§3.3).
+ *
+ * `lfsEnv` (the worker env) arms the LFS content swap — view.go:104-123's
+ * ReadMetaObject: a valid pointer WITH an lfs_objects meta row renders the
+ * OBJECT's content (the sniff re-runs on the object bytes; the size badge
+ * flips to blobOrLfsSize). Absent — the pre-LFS render.tsx callers — keeps
+ * the pointer-text render byte-identical (the badge stays parse-only). */
 export async function loadFileViewData(
   engine: EngineClient,
-  repo: { ownerNamespace: string; slug: string; defaultBranch: string },
+  repo: { ownerNamespace: string; slug: string; defaultBranch: string; id?: string; storageKey?: string },
   origin: string,
   refSuffix: string,
+  lfsEnv?: Env,
 ): Promise<FileViewData> {
   const split = splitRefSuffix(refSuffix);
   if (split === null) return { notFound: true }; // no (or non-exact) prefix (§3.3)
@@ -328,44 +346,76 @@ export async function loadFileViewData(
   ]);
   if (blob === null) return { notFound: true };
 
-  let variant: BlobViewVariant = classifyBlob(entry, blob.data);
-  let markupHtml: string | undefined;
-  let text: string | undefined;
-  let mediaKind: MediaKind | undefined;
-  // The census R08 Blame anchor's gate, computed where the decoded text is
-  // already in hand: text-representable variants only, inside the engine's
-  // tip-size and line-count budgets (MAX_BLAME_BYTES / MAX_BLAME_LINES —
-  // the engine 404s the rest; the dead-link rule forbids the button there).
-  let blameLines: number | undefined;
-  if (variant === "markup") {
-    // §3.4: the shared renderer with repo context against the file's directory.
-    const raw = new TextDecoder().decode(blob.data);
-    blameLines = splitLines(raw).length;
-    const html = renderRepoMarkdown({
-      text: raw,
-      name: entry.name,
-      repo,
-      refType,
-      ref,
-      origin,
-    });
-    if (html !== "") {
-      markupHtml = html;
-    } else {
+  /**
+   * The per-data render arms (the landed §3.3/§4.2 chain): classify on
+   * (entry, size, data), then build the variant's content. `renderLines`
+   * carries the decoded text's line count for the blame budget (undefined on
+   * the content-free arms — view-raw/too-large/empty).
+   */
+  const renderBlobData = (
+    data: Uint8Array,
+    size: number,
+  ): { variant: BlobViewVariant; markupHtml?: string; text?: string; mediaKind?: MediaKind; renderLines?: number } => {
+    const variant = classifyBlob({ ...entry, size }, data);
+    if (variant === "markup") {
+      // §3.4: the shared renderer with repo context against the file's directory.
+      const raw = new TextDecoder().decode(data);
+      const html = renderRepoMarkdown({ text: raw, name: entry.name, repo, refType, ref, origin });
+      if (html !== "") return { variant, markupHtml: html, renderLines: splitLines(raw).length };
       // Pipeline failure → plain-text fallback (§3.4 posture).
-      variant = "plain-text";
-      text = raw;
+      return { variant: "plain-text", text: raw, renderLines: splitLines(raw).length };
     }
-  } else if (variant === "code-view" || variant === "plain-text") {
-    text = new TextDecoder().decode(blob.data);
-    blameLines = splitLines(text).length;
-  } else if (variant === "view-raw") {
-    mediaKind = mediaKindOf(entry.name) ?? undefined;
+    if (variant === "code-view" || variant === "plain-text") {
+      const text = new TextDecoder().decode(data);
+      return { variant, text, renderLines: splitLines(text).length };
+    }
+    if (variant === "view-raw") {
+      return { variant, mediaKind: mediaKindOf(entry.name) ?? undefined };
+    }
+    return { variant }; // too-large / empty — no content arms
+  };
+
+  let render = renderBlobData(blob.data, entry.size ?? blob.data.byteLength);
+  // The census R08 Blame anchor's gate: text-representable variants only,
+  // inside the engine's tip-size and line-count budgets (MAX_BLAME_BYTES /
+  // MAX_BLAME_LINES — the engine 404s the rest; the dead-link rule forbids
+  // the button there). The budget reads the GIT blob (blame.go has no LFS
+  // arm at the pin — an LFS file's blame walks the pointer blobs upstream),
+  // captured BEFORE any LFS content swap below.
+  const gitBlameLines = render.renderLines;
+  const pointer = probeLfsPointer(blob.data);
+  // The LFS content swap (view.go:104-123): a valid pointer WITH a meta row
+  // re-runs the arms over the OBJECT's bytes; without the row (or without
+  // this module's env — the pre-LFS callers) the pointer-text render stands.
+  let lfsSize: number | undefined;
+  if (pointer !== null && lfsEnv !== undefined && repo.id !== undefined && repo.storageKey !== undefined) {
+    const resolved = await resolveLfsFile(
+      { d1: lfsEnv.DB, store: defaultLfsDeps(lfsEnv).store },
+      { repoId: lfsRepoId(repo.id), storageKey: repo.storageKey, blobData: blob.data },
+      { presign: false }, // the view arm reads the local store (view.go:113-117) — no redirect posture
+    );
+    if (resolved !== null) {
+      lfsSize = resolved.meta.size; // blobOrLfsSize (view.go:118)
+      if (lfsSize >= MAX_DISPLAY_FILE_SIZE) {
+        // view_file.go:274-275's IsFileTooLarge arm — blobOrLfsSize >=
+        // MaxDisplayFileSize caps the rendered preview BEFORE the read; the
+        // too-large prompt keeps the /media link via isLfsFile.
+        render = { variant: "too-large" };
+      } else if (resolved.object !== null) {
+        // The object decides the arm — the sniff re-runs on the OBJECT bytes
+        // (view.go:119's DetectContentType over the re-read buffer); the read
+        // is bounded by the cap above.
+        const objectData = new Uint8Array(await resolved.object.arrayBuffer());
+        render = renderBlobData(objectData, lfsSize);
+      }
+      // resolved.object === null — the row-without-bytes race: keep the
+      // pointer-text render (the raw-files.ts graceful arm).
+    }
   }
   const blameable =
-    (variant === "markup" || variant === "plain-text" || variant === "code-view" || variant === "empty") &&
+    (render.variant === "markup" || render.variant === "plain-text" || render.variant === "code-view" || render.variant === "empty") &&
     (entry.size ?? 0) <= MAX_BLAME_BYTES &&
-    (blameLines === undefined || blameLines <= MAX_BLAME_LINES);
+    (gitBlameLines === undefined || gitBlameLines <= MAX_BLAME_LINES);
 
   return {
     kind: "blob",
@@ -374,11 +424,12 @@ export async function loadFileViewData(
     treePath,
     siblings: parentTree?.entries ?? [],
     entry,
-    variant,
-    isLfsFile: probeIsLfsFile(blob.data),
-    markupHtml,
-    text,
-    mediaKind,
+    variant: render.variant,
+    isLfsFile: pointer !== null,
+    lfsSize,
+    markupHtml: render.markupHtml,
+    text: render.text,
+    mediaKind: render.mediaKind,
     blameable,
     latestCommit: lastCommitLog?.commits[0] ?? null,
   };

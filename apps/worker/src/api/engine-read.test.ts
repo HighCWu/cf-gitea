@@ -319,7 +319,9 @@ describe("tags (repoListTags / repoCreateTag / repoGetTag / repoDeleteTag / GetA
 
     // the lightweight seed tag is NOT an annotated object → 404
     const tips = refTipMap(await engineReads(env, { ownerNamespace: OWNER, slug: SLUG }).listRefs());
-    expect((await get(`${REPO_PATH}/git/tags/${tips.get("refs/tags/v1.0.0")?.target}`)).status).toBe(404);
+    // R15 (e95ce33): upstream maps EVERY GetAnnotatedTag lookup failure to
+    // 400 (tag.go:113-118) — was 404.
+    expect((await get(`${REPO_PATH}/git/tags/${tips.get("refs/tags/v1.0.0")?.target}`)).status).toBe(400);
     expect((await get(`${REPO_PATH}/git/tags/nothex`)).status).toBe(400);
   });
 
@@ -839,8 +841,22 @@ describe("API tag push-pair + branch-rename webhook emissions (ref family wave 2
     expect(push.after).toBe(tag.id); // the annotated tag object oid — the ref tip, same sha the create payload pins
     expect(push.commits).toEqual([]);
     expect(push.total_commits).toBe(0);
-    expect(push.head_commit).toBeNull();
-    expect(push.compare_url).toBe(`${ORIGIN}/`); // AppURL + CompareURL "" (the zero-commit compare_url)
+    // The CORRECTED tag-create shape (SPEC-0005 §2.3 as re-derived in W5 and
+    // adopted by the tags API in e95ce33 — release.go:124 carries the PEELED
+    // commit as head_commit, not null; the old null was the mirror shape).
+    const headCommit = push.head_commit as Record<string, unknown>;
+    expect(headCommit.id).toBe(TIP1); // the annotated tag's target — peeled
+    // The push family's per-commit file-list enrichment (upstream fills
+    // Added/Removed/Modified in push payloads; W3 keeps the three keys
+    // always-emitted): the peeled seed commit's whole tree is ADDED (a root
+    // commit), the other two lists empty.
+    expect(headCommit.added).toEqual([".editorconfig", ".gitea/ISSUE_TEMPLATE/bug.yml", "README.md", "src/lib.txt"]);
+    expect(headCommit.removed).toEqual([]);
+    expect(headCommit.modified).toEqual([]);
+    // The corrected shape (push.go:125): ComposeCompareURL over the
+    // PushUpdateOptions oids — compare/{zero}...{RAW ref tip} (the annotated
+    // tag OBJECT oid, not the peel; the old `${ORIGIN}/` was the mirror arm).
+    expect(push.compare_url).toBe(`${ORIGIN}/${OWNER}/${SLUG}/compare/${ZERO_OID}...${String(tag.id)}`);
     expect(push.pusher).toMatchObject({ login: OWNER }); // pusher AND sender = the authenticated caller (notifier.go:919-920)
     expect(push.sender).toMatchObject({ login: OWNER });
     expect(push.repository).toMatchObject({ full_name: `${OWNER}/${SLUG}` });
