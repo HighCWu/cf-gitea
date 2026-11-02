@@ -44,7 +44,7 @@
 import { OpenAPIHono } from "@hono/zod-openapi";
 import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 import { eq } from "drizzle-orm";
 
@@ -410,6 +410,25 @@ let runAId = 0;
 let runBId = 0;
 
 describe("GET .../workflows/{workflow_id}/runs (ActionsListWorkflowRuns)", () => {
+  afterAll(async () => {
+    // D-8 (the v1.5.2 gate R3/R4 flake): under 466-worker load the harness
+    // can re-execute this file against the same D1 — the small fixed
+    // indexes this describe seeds (1/2/3) then collide on UNIQUE and every
+    // later assert cascades off the stale rows. Wiping the actions tables
+    // at the describe's END guarantees the next describe (and any
+    // re-execution) starts from empty; this file's worker owns its D1
+    // exclusively, so the unfiltered deletes touch nothing else.
+    const db = drizzle(env.DB);
+    await db.delete(actionRunAttempts);
+    await db.delete(actionRunJobs);
+    await db.delete(actionRuns);
+    // the counter row goes too: nextRunIndex bootstraps at the repo max
+    // (the module header's note), so the next allocate starts at 1 exactly
+    // like a fresh file — the dispatches describe's empty-set bootstrap
+    // below stays coherent.
+    await db.delete(repoCounters).where(eq(repoCounters.repoId, SUITE_REPO_ID));
+  });
+
   it("404s a workflow that has no runs AND no file; 200/0 when the file exists", async () => {
     // notify.yml exists in the tree but has no runs yet — the git-lookup
     // fallthrough answers an EMPTY list (action.go:1022-1031).
@@ -564,12 +583,33 @@ describe("GET .../workflows/{workflow_id}/runs (ActionsListWorkflowRuns)", () =>
 // ---------------------------------------------------------------------------
 
 describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)", () => {
+  afterAll(async () => {
+    // D-8 (the v1.5.2 gate R3/R4 flake): under 466-worker load the harness
+    // can re-execute this file against the same D1 — the small fixed
+    // indexes this describe seeds (1/2/3) then collide on UNIQUE and every
+    // later assert cascades off the stale rows. Wiping the actions tables
+    // at the describe's END guarantees the next describe (and any
+    // re-execution) starts from empty; this file's worker owns its D1
+    // exclusively, so the unfiltered deletes touch nothing else.
+    const db = drizzle(env.DB);
+    await db.delete(actionRunAttempts);
+    await db.delete(actionRunJobs);
+    await db.delete(actionRuns);
+    // the counter row goes too: nextRunIndex bootstraps at the repo max
+    // (the module header's note), so the next allocate starts at 1 exactly
+    // like a fresh file — the dispatches describe's empty-set bootstrap
+    // below stays coherent.
+    await db.delete(repoCounters).where(eq(repoCounters.repoId, SUITE_REPO_ID));
+  });
+
   it("dispatches with defaults (204), inserting the waiting run + job rows", async () => {
     const before = await drizzle(env.DB)
       .select({ index: actionRuns.index })
       .from(actionRuns)
       .where(eq(actionRuns.repoId, SUITE_REPO_ID));
-    const expectedIndex = Math.max(...before.map((r) => r.index)) + 1;
+    // the before-set may be EMPTY (the runs describe's D-8 wipe): the counter
+    // row is gone with it, so the first allocate bootstraps at 1.
+    const expectedIndex = before.length === 0 ? 1 : Math.max(...before.map((r) => r.index)) + 1;
 
     const res = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "main" }, "alice-token");
     expect(res.status).toBe(204);
@@ -693,6 +733,25 @@ describe("POST .../workflows/{workflow_id}/dispatches (ActionsDispatchWorkflow)"
 // ---------------------------------------------------------------------------
 
 describe("GET /repos/{owner}/{repo}/actions/jobs/{job_id} (getWorkflowJob)", () => {
+  afterAll(async () => {
+    // D-8 (the v1.5.2 gate R3/R4 flake): under 466-worker load the harness
+    // can re-execute this file against the same D1 — the small fixed
+    // indexes this describe seeds (1/2/3) then collide on UNIQUE and every
+    // later assert cascades off the stale rows. Wiping the actions tables
+    // at the describe's END guarantees the next describe (and any
+    // re-execution) starts from empty; this file's worker owns its D1
+    // exclusively, so the unfiltered deletes touch nothing else.
+    const db = drizzle(env.DB);
+    await db.delete(actionRunAttempts);
+    await db.delete(actionRunJobs);
+    await db.delete(actionRuns);
+    // the counter row goes too: nextRunIndex bootstraps at the repo max
+    // (the module header's note), so the next allocate starts at 1 exactly
+    // like a fresh file — the dispatches describe's empty-set bootstrap
+    // below stays coherent.
+    await db.delete(repoCounters).where(eq(repoCounters.repoId, SUITE_REPO_ID));
+  });
+
   let jobId = 0;
   let foreignJobId = 0;
 
@@ -769,6 +828,25 @@ describe("GET /repos/{owner}/{repo}/actions/jobs/{job_id} (getWorkflowJob)", () 
 // ---------------------------------------------------------------------------
 
 describe("GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs (downloadActionsRunJobLogs)", () => {
+  afterAll(async () => {
+    // D-8 (the v1.5.2 gate R3/R4 flake): under 466-worker load the harness
+    // can re-execute this file against the same D1 — the small fixed
+    // indexes this describe seeds (1/2/3) then collide on UNIQUE and every
+    // later assert cascades off the stale rows. Wiping the actions tables
+    // at the describe's END guarantees the next describe (and any
+    // re-execution) starts from empty; this file's worker owns its D1
+    // exclusively, so the unfiltered deletes touch nothing else.
+    const db = drizzle(env.DB);
+    await db.delete(actionRunAttempts);
+    await db.delete(actionRunJobs);
+    await db.delete(actionRuns);
+    // the counter row goes too: nextRunIndex bootstraps at the repo max
+    // (the module header's note), so the next allocate starts at 1 exactly
+    // like a fresh file — the dispatches describe's empty-set bootstrap
+    // below stays coherent.
+    await db.delete(repoCounters).where(eq(repoCounters.repoId, SUITE_REPO_ID));
+  });
+
   /** The (run, job, task, chunks) fixture: a claimed job with a hot log. */
   let logJobId = 0;
   let logTaskId = 0;
