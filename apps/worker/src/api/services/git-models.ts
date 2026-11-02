@@ -766,6 +766,21 @@ export function diffBlobSource(
   };
 }
 
+/**
+ * A caller-supplied blob source for the series walker: per-commit factories
+ * need the walker's own read client plus that commit's diff envelope (the
+ * old side is the commit's first parent, the new side the commit itself).
+ * The default is the plain `diffBlobSource`; the wiki sibling passes the
+ * `enginePath`-encoded source (services/wiki.ts — the wiki cell's STORED
+ * flat entry names, so the renderer's context-blob fetches must re-encode
+ * the diff envelope's paths).
+ */
+export type DiffBlobSourceFactory = (
+  reads: Pick<EngineReads, "readBlob">,
+  oldTip: string | null,
+  newTip: string,
+) => DiffBlobSource;
+
 /** Trailing-newline facts of one blob text ("" = zero lines, never a marker). */
 function textFacts(text: string): { lines: string[]; count: number; hasNL: boolean } {
   if (text === "") return { lines: [], count: 0, hasNL: false };
@@ -1028,6 +1043,12 @@ export async function renderPatchAsync(
  * and the last mail's tail is the stream's tail. The walk pages at
  * PATCH_SERIES_PAGE up to PATCH_SERIES_COMMIT_CAP (a series past the cap
  * truncates, flagged nowhere in git's output either).
+ *
+ * The blob source is caller-suppliable (`buildDiffBlobSource`, default the
+ * plain `diffBlobSource`): a repository family whose STORED entry names need
+ * a read-back encode passes its own factory (the wiki sibling's
+ * `enginePath`-encoded source — wiki-commit-diff.tsx; the former wiki mirror
+ * of this walker collapsed onto it once the hook landed, the D-1 seam).
  */
 export const PATCH_SERIES_COMMIT_CAP = 2000;
 const PATCH_SERIES_PAGE = 500;
@@ -1037,6 +1058,7 @@ export async function renderPatchSeries(
   base: string,
   head: string,
   options?: RenderPatchOptions,
+  buildDiffBlobSource: DiffBlobSourceFactory = diffBlobSource,
 ): Promise<string> {
   const commits: CommitJson[] = [];
   for (let page = 0; commits.length < PATCH_SERIES_COMMIT_CAP; page++) {
@@ -1053,7 +1075,7 @@ export async function renderPatchSeries(
     const parent = commit.parents.length === 1 ? commit.parents[0] : undefined;
     const diff = await reads.readDiff(commit.oid, parent);
     const files = diff?.files ?? [];
-    const src = diffBlobSource(reads, diff?.old ?? null, diff?.new ?? commit.oid);
+    const src = buildDiffBlobSource(reads, diff?.old ?? null, diff?.new ?? commit.oid);
     mails.push(
       await renderPatchAsync(commit, files, src, {
         ...options,

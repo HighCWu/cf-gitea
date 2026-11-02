@@ -115,8 +115,8 @@ import { RepoService } from "../../repos/service";
 import { wikiBranch, wikiCell, wikiReads } from "../../services/wiki";
 import { handlesUiRoute, parseUiRoute, uiRouter, type UiAssetsFetcher } from "../index";import type { UiManifest } from "../manifest";
 import { mintSession, SESSION_COOKIE_NAME } from "../session";
-import { createWikiPageFromForm, parseWikiPageForm, wikiTipOf } from "./repo-wiki";
-import { loadWikiCommitDiffPatch } from "./wiki-commit-diff";
+import { createWikiPageFromForm, loadWikiViewData, parseWikiPageForm, wikiTipOf } from "./repo-wiki";
+import { loadWikiCommitDiffPatch, wikiDiffBlobSource } from "./wiki-commit-diff";
 
 // --- fixtures -------------------------------------------------------------------
 
@@ -748,9 +748,10 @@ describe("the ?page= revision pager at CommitsRangeSize (50)", () => {
 // SERVING rides index.ts's wikiPage branch (web.go:1620 — the parse-gated
 // grammar dispatches before the page folds): a hex+dotted tail now answers
 // the raw bytes, a well-shaped unknown sha on the DOWNLOAD arm 404-shells
-// (commit.go's IsErrNotExist → ctx.NotFound), and the VIEW arm keeps the
-// family's missing fold (the view loader's fixed outcome set cannot answer
-// a 404 — the view-side interim stays disclosed).
+// (commit.go's IsErrNotExist → ctx.NotFound), and the VIEW arm answers the
+// loader's `not-found` outcome (commit.go:302-305's IsErrNotExist →
+// ctx.NotFound — the D-2 fold; the route-level 404 rides index.ts's
+// orchestrator-owned mapping hunk, reported with the wave).
 
 describe("the wiki commit-diff arm (web.go:1619 — the PageIsWiki commit page)", () => {
   it("admits the commit tail through the wiki family catch-all and serves the diff view", async () => {
@@ -793,20 +794,20 @@ describe("the wiki commit-diff arm (web.go:1619 — the PageIsWiki commit page)"
     expect(html).toContain('data-new-filename="Diff-Arm-Probe.md"');
   });
 
-  it("keeps the unknown sha's VIEW on the family fold and serves the dotted tail's raw bytes (web.go:1620's arm)", async () => {
+  it("answers the unknown sha's VIEW with the loader's not-found outcome and serves the dotted tail's raw bytes (web.go:1620's arm)", async () => {
     const pair = await pairFor("w107wik");
     const tip = await wikiTipOf(env, pair);
     if (tip === undefined) throw new Error("w107wik tip missing");
-    // Unknown-but-well-shaped VIEW: upstream Diff 404-shells (commit.go's
-    // IsErrNotExist → ctx.NotFound); the view loader's fixed outcome set
-    // cannot answer a 404 — the family's missing fold REMAINS the view
-    // arm's disclosed interim (the DOWNLOAD arm answers the 404 directly
-    // below — the serving branch is not outcome-set-bound).
-    const ghost = await get(`/w107gal/w107wik/wiki/commit/${"a".repeat(40)}`);
-    expect(ghost.status).toBe(303);
-    expect(ghost.headers.get("location")).toBe(PAGES_ACTION);
+    // Unknown-but-well-shaped VIEW: upstream Diff 404-shells (commit.go:302-305's
+    // `git.IsErrNotExist(err) → ctx.NotFound`). The LOADER carries that arm as
+    // the `not-found` outcome (the D-2 fold — pinned at the loader level
+    // here); the route-level 404 shell rides index.ts's orchestrator-owned
+    // mapping hunk (reported with the wave — the route GET is deliberately
+    // un-pinned until that mount lands).
+    const loaded = await loadWikiViewData(env, pair, `commit/${"a".repeat(40)}`, ORIGIN);
+    expect(loaded).toEqual({ outcome: "not-found" });
     // The dotted download tail serves the raw bytes (web.go:1620): the
-    // diffpatch family's plain-text shape — the interim 303 fold is gone.
+    // diffpatch family's plain-text shape.
     const dotted = await get(`/w107gal/w107wik/wiki/commit/${tip.target}.diff`);
     expect(dotted.status).toBe(200);
     expect(dotted.headers.get("content-type")).toBe("text/plain; charset=utf-8");
@@ -916,12 +917,13 @@ index 0000000..7e68207
     expect(patch).not.toContain(`From ${merge.oid} `); // never the merge mail
     expect(patch).not.toContain("merge the wiki side");
     expect(patch).not.toContain("\n-- \n"); // --no-signature parity (diff.go:73)
-    // PARITY PIN: the family walker (git-models' shared renderPatchSeries —
-    // the same fixed D11 join) produces IDENTICAL bytes over the same cell.
-    // The join half of the collapse verdict is resolved; only the blob
-    // read-back encode still keeps the mirror (wiki-commit-diff.tsx's
-    // verdict comment).
-    const shared = await renderPatchSeries(wikiReads(env, pair), baseTip, merge.oid, { signature: null });
+    // PARITY PIN: the loader's merge arm IS the family walker now (the D-1
+    // fold — renderPatchSeries with wikiDiffBlobSource as the caller-supplied
+    // blob source), so the byte equality above holds by construction; this
+    // pin drives the SHARED walker with the SAME encoded factory over the
+    // same cell and demands the identical bytes — one implementation, both
+    // call shapes.
+    const shared = await renderPatchSeries(wikiReads(env, pair), baseTip, merge.oid, { signature: null }, wikiDiffBlobSource);
     expect(shared).toBe(patch);
     // .diff over the merge: the first-parent tree delta (RawDiffNormal) —
     // the side's file, not a whole-tree re-diff.
@@ -1010,6 +1012,77 @@ index 0000000..7e68207
     expect(patch2).toContain("Subject: [PATCH 2/2] side two: wiki merge fixture");
     expect(patch2).not.toContain(`From ${merge2.oid} `); // never a merge mail
     expect(patch2).not.toContain("\n-- \n"); // --no-signature parity (diff.go:73)
+  });
+
+  it("keeps the no-newline marker on a codec-space stored entry through the shared series walker (the D-1 encode seam: 607 vs 636)", async () => {
+    // THE D-1 ACCEPTANCE (the collapse verdict's item 2, now resolved): a
+    // wiki entry stored FLAT under its codec name (`Weird%2FName.md` — one
+    // literal tree segment; the write path splits on "/" only) whose content
+    // lacks the trailing newline. The renderer's context-blob read-back must
+    // go through enginePath's "%25" doubling: the PLAIN source's read
+    // decodes %2F into a nested miss, the file degrades to the marker-less
+    // shape (636 bytes on the verdict's probe) — the encoded source reads
+    // the stored name and emits git's "\ No newline at end of file" (607).
+    const pair = await pairFor("w107wik");
+    const cell = wikiCell(env, pair);
+    const ref = branchRef(wikiBranch(pair));
+    const tip = await wikiTipOf(env, pair);
+    if (tip === undefined) throw new Error("w107wik tip missing");
+    const baseTip = tip.target;
+    const encoder = new TextEncoder();
+    const homeBlob = await buildBlobObject(encoder.encode("# Home base\n"));
+    const weirdBlob = await buildBlobObject(encoder.encode("weird body without newline"));
+    const sideTree = serializeTree([{ name: "Weird%2FName.md", mode: "100644", oid: weirdBlob.oid }]);
+    const person: Person = { name: DOER.name, email: DOER.email, time: T0 + 9_300, tz: "+0000" };
+    const side = serializeCommit({
+      tree: sideTree.oid,
+      parents: [baseTip],
+      author: person,
+      committer: person,
+      message: "side: the codec-space no-newline fixture",
+    });
+    const mergeTree = serializeTree([
+      { name: "Home.md", mode: "100644", oid: homeBlob.oid },
+      { name: "Weird%2FName.md", mode: "100644", oid: weirdBlob.oid },
+    ]);
+    const merge3 = serializeCommit({
+      tree: mergeTree.oid,
+      parents: [baseTip, side.oid],
+      author: person,
+      committer: person,
+      message: "merge the codec-space side",
+    });
+    const stored = await cell.putApiObjects([
+      weirdBlob,
+      { oid: sideTree.oid, type: sideTree.type, data: sideTree.data },
+      { oid: side.oid, type: side.type, data: side.data },
+      homeBlob,
+      { oid: mergeTree.oid, type: mergeTree.type, data: mergeTree.data },
+      { oid: merge3.oid, type: merge3.type, data: merge3.data },
+    ]);
+    if (stored.tag !== "ok") throw new Error(`codec-space seed objects refused: ${stored.tag}`);
+    const landed = await cell.commitApiChange({ ref, expectedOldOid: baseTip, newOid: merge3.oid });
+    if (landed.tag !== "committed") throw commitApiChangeError(landed);
+
+    // The loader's merge-series mail — the shared walker WITH the encoded
+    // factory — carries git's marker after the unterminated line.
+    const patch3 = await loadWikiCommitDiffPatch(env, pair, merge3.oid, "patch");
+    if (patch3 === null) throw new Error("expected the codec-space merge .patch body");
+    expect(patch3).toContain("diff --git a/Weird%2FName.md b/Weird%2FName.md");
+    expect(patch3).toContain("+++ b/Weird%2FName.md");
+    expect(patch3).toContain("+weird body without newline\n\\ No newline at end of file\n");
+    // THE DIFFERENTIAL (636 vs 607): the SAME walker over the SAME range
+    // with the PLAIN source loses the marker — the unencoded read decodes
+    // %2F into a nested miss and the file degrades (the verdict's probe).
+    const plain = await renderPatchSeries(wikiReads(env, pair), baseTip, merge3.oid, { signature: null });
+    expect(plain).toContain("+++ b/Weird%2FName.md");
+    expect(plain).toContain("+weird body without newline");
+    expect(plain).not.toContain("\\ No newline at end of file");
+    // and the encoded walker directly (not just through the loader) — the
+    // factory IS the seam, byte-identical to the loader's mail.
+    const encoded = await renderPatchSeries(wikiReads(env, pair), baseTip, merge3.oid, { signature: null }, wikiDiffBlobSource);
+    expect(encoded).toBe(patch3);
+    expect(encoded.length).toBeGreaterThan(plain.length); // the marker rides the encoded read
   });
 });
 

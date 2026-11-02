@@ -15603,6 +15603,14 @@ async function wikiPage(c: Context<{ Bindings: Env }>): Promise<Response> {
   }
   const data = await loadWikiViewData(c.env, pair, rawTail, url.origin);
   if (data.outcome === "start") return respond(c.html(renderWikiStartPage({ ctx, canWrite }), 200));
+  if (data.outcome === "not-found") {
+    // The commit-diff VIEW arm's 404 family (D-2): a well-shaped but
+    // unresolvable sha — upstream Diff answers its NotFound shell
+    // (`git.IsErrNotExist(err) → ctx.NotFound`, commit.go:302-305; the
+    // download arm's twin at :449-455 landed with the raw downloads). The
+    // loader's not-found pin carries the same cite.
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
   if (data.outcome === "missing") {
     // The raw-file round's 303 (wiki.go:240-242 — the isRaw class): the
     // `.md`-trimmed entry exists, so the resolved WebPath interpolates

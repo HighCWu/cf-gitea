@@ -62,18 +62,21 @@
  *                                           a stored non-`.md` entry under a page
  *                                           name 303s onto P/wiki/raw/{RawName}
  *                                           (the loader carries rawRedirectTo;
- *                                           the serving arm's mapping is the
- *                                           disclosed interim — see the 404-arm
- *                                           note below)
+ *                                           the serving arm maps it to exactly
+ *                                           that 303 — index.ts wikiPage)
  *   GET  P/wiki/commit/{sha}                the revision-diff view (repo.Diff's
  *                                PageIsWiki arm — the PageIsWiki commit page;
  *                                chi specificity puts the pattern BEFORE the
  *                                `/*` combo, so a matching tail is NEVER a
- *                                page name)
+ *                                page name); an unresolvable sha answers the
+ *                                `not-found` outcome → the serving arm's 404
+ *                                shell (commit.go:302-305, the D-2 fold)
  *   GET  P/wiki/commit/{sha}.{diff|patch}   the raw downloads (repo.RawDiff's
  *                                wiki arm over the sibling cell — loader +
- *                                grammar landed in pages/wiki-commit-diff.tsx,
- *                                the raw serving arm pending in index.ts)
+ *                                grammar in pages/wiki-commit-diff.tsx, the
+ *                                serving arm in index.ts wikiPage's download
+ *                                branch; the loader's null → the 404 shell,
+ *                                commit.go:449-455)
  *
  * A page NAME of "_pages"/"_new"/"_edit"/"raw" is refused at write time
  * (reservedWikiNames, wiki_path.go:42) — precisely so these action values
@@ -84,9 +87,9 @@
  * file — an image, wiki.go:156-164), upstream redirects THAT view onto
  * `P/wiki/raw/{pageName}` (wiki.go:240-242). Our view loader runs the same
  * round (services/wiki.ts wikiRawFileRound) and carries the target as
- * `rawRedirectTo` on the missing outcome; the serving arm's 303 mapping is
- * the DISCLOSED interim — the family fold answers until the one-arm index.ts
- * hunk lands (the commit-diff view's 404 interim precedent). A whole-absent
+ * `rawRedirectTo` on the missing outcome; the serving arm maps it to
+ * exactly that 303 (index.ts wikiPage — the W11 fold, the interim fold
+ * retired). A whole-absent
  * wiki renders tplWikiStart (wiki.go:471-475) or
  * redirects to P/wiki (WikiPages wiki.go:537-540, EditWiki wiki.go:692-695).
  *
@@ -195,8 +198,7 @@
  *       coded page path ends `.md`, and a non-`.md` request never renders —
  *       the view loader's raw-file round (wiki.go:156-164) folds it to the
  *       isRaw redirect decision (`rawRedirectTo` on the missing outcome,
- *       wiki.go:240-242; the serving arm's 303 mapping is the disclosed
- *       interim — the family fold answers, the commit-diff 404's twin).
+ *       wiki.go:240-242; the serving arm maps it to that exact 303).
  * - pages.tmpl — the header + writer-gated New Page button, the admin-only
  *   default-wiki-branch line (ours = the repo default branch, the
  *   wikiBranch value), and the `wiki-pages-list` table: file icon, name
@@ -587,12 +589,20 @@ export type WikiViewData =
        * `isRaw` class): set when the page-name probes missed AND the
        * `.md`-trimmed entry exists, in which case upstream 303s onto
        * `{repoLink}/wiki/raw/{rawRedirectTo}` instead of the _pages fold.
-       * The serving arm's mapping is the DISCLOSED interim (the family
-       * fold answers; the commit-diff 404's twin — see the mount record's
-       * raw-file note). Absent = the plain noEntry fold (wiki.go:237-239).
+       * The serving arm answers exactly that 303 (index.ts wikiPage — the
+       * landed W11 fold). Absent = the plain noEntry fold (wiki.go:237-239).
        */
       rawRedirectTo?: string;
     }
+  /**
+   * The commit-diff VIEW arm's 404 family — a well-shaped but unresolvable
+   * sha (`commit/{7..64hex}` the engine cannot resolve): upstream Diff
+   * answers its NotFound shell (`git.IsErrNotExist(err) → ctx.NotFound`,
+   * commit.go:302-305; the download arm's twin at :449-455). The serving
+   * arm maps the outcome to the §4.5 not-found shell (the D-2 fold; the
+   * loader-level pin carries the upstream cite).
+   */
+  | { outcome: "not-found" }
   | WikiPageViewData
   | WikiCommitViewData;
 
@@ -611,11 +621,11 @@ export async function loadWikiViewData(env: Env, pair: RepositoryWithOwner, rawT
     const view = await loadWikiCommitDiffData(env, env.DB, pair, commitTail.sha);
     if (view === null) {
       // Well-shaped but unresolvable (unknown oid / short prefix): upstream
-      // Diff 404-shells (commit.go's IsErrNotExist → ctx.NotFound) — the
-      // fixed handler outcome set cannot answer a 404, so the family's
-      // missing fold answers until the serving arm's not-found mapping
-      // lands in index.ts (disclosed to the orchestrator).
-      return { outcome: "missing" };
+      // Diff 404-shells (`git.IsErrNotExist(err) → ctx.NotFound`,
+      // commit.go:302-305) — the `not-found` outcome carries that arm to the
+      // serving arm's mapping (index.ts wikiPage's 404 shell, the D-2 fold;
+      // the download loader's null is the same shell, commit.go:449-455).
+      return { outcome: "not-found" };
     }
     return {
       outcome: "view",
@@ -633,8 +643,7 @@ export async function loadWikiViewData(env: Env, pair: RepositoryWithOwner, rawT
     // the raw-file round (wiki.go:156-164): a `.md`-trimmed entry match is
     // the isRaw class and redirects onto /wiki/raw/{pageName} (wiki.go:
     // 240-242). The loader carries the target on the outcome; the serving
-    // arm's 303 mapping is the disclosed interim (the family fold answers
-    // until the index.ts hunk lands — the commit-diff 404's twin).
+    // arm maps it to exactly that 303 (index.ts wikiPage — the W11 fold).
     if (await wikiRawFileRound(env, pair, wikiName)) {
       return { outcome: "missing", rawRedirectTo: wikiName };
     }
@@ -780,9 +789,11 @@ export function WikiStartPage(props: { ctx: UiContext; canWrite: boolean }) {
 
 /** The full-document VIEW render — the "view" outcome's dispatch: the
  *  commit-diff twin (web.go:1619's PageIsWiki commit page over the sibling
- *  cell) or the classic view.tmpl page. The handler funnels EVERY
- *  non-start/missing outcome here (the fixed index.ts narrowing cannot grow
- *  an outcome), so the two kinds ride inside the outcome under `kind`. */
+ *  cell) or the classic view.tmpl page. The handler answers start, missing
+ *  (the rawRedirectTo 303 or the _pages fold) and not-found (the commit-diff
+ *  404 family, commit.go:302-305) from the outcome set; every "view"
+ *  outcome funnels HERE, so the two kinds ride inside the outcome under
+ *  `kind`. */
 export function renderWikiViewPage(options: { ctx: UiContext; data: WikiPageViewData | WikiCommitViewData; canWrite: boolean }): string {
   if (options.data.kind === "commit-diff") return renderWikiCommitDiffPage({ ctx: options.ctx, data: options.data.view });
   return renderPage(<WikiViewPage ctx={options.ctx} data={options.data} canWrite={options.canWrite} />);

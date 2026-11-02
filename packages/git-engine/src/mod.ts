@@ -178,6 +178,23 @@ const DEFAULT_MAX_PUSH_MB = 512;
 
 const REPO_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const RESERVED = new Set(["api", "cgit.css", "favicon.ico", "robots.txt", "info", "git-upload-pack", "git-receive-pack"]);
+/**
+ * Infrastructure-cell names — rowless engine cells the embedding Worker's
+ * git gate serves over git HTTP WITHOUT a D1 repositories row (the wiki
+ * sibling's hiding posture: no registry entry, invisible to every listing).
+ * `_cargo-index` is upstream Gitea's exact cargo sparse-index mirror
+ * repository name (services/packages/cargo/index.go:28-29,
+ * `IndexRepositoryName = "_cargo-index"` — the traditional git-protocol
+ * mirror cargo's git-URL face clones); the leading underscore keeps it
+ * outside the D1 name alphabet (the worker enforces this regex's
+ * alphanumeric first char on top of upstream's own name rules, so the name
+ * can never collide with a user repository). Admission here is ROUTE parsing
+ * only — the registry-existence oracle below still 404s protocol reads of a
+ * registry-unknown name until the gate seeds the priv:1 row, exactly the
+ * wiki family's contract; the `.wiki` sibling needs no entry here (`x.wiki`
+ * already satisfies REPO_NAME).
+ */
+const INFRA_REPO_NAMES = new Set(["_cargo-index"]);
 const CACHE_TTL = 60;
 
 /** What a request is asking to do, from the repository's point of view. */
@@ -836,7 +853,14 @@ async function stagePack(
   let lastLogged = 0;
   const absorb = (data: Uint8Array) => {
     total += data.length;
-    if (total > maxBytes) throw new Error("pack exceeds maximum push size");
+    // the wording is load-bearing: a body over the cap answers the STANDARD
+    // 413 like every other size failure in the receive family
+    // (overDeclaredLength up front, readGzipBodyBounded/gunzipLimited on the
+    // gzip arm) — the receive staging catch rethrows an "exceeds maximum
+    // size" message to the outer catch, whose filter maps it to
+    // tooLargeResponse. (Was "pack exceeds maximum push size", which no
+    // filter matched — the W11 follow-up.)
+    if (total > maxBytes) throw new Error("pack exceeds maximum size");
     if (total - lastLogged >= 64 * 1024 * 1024) {
       lastLogged = total;
       const msg = `Receiving pack: ${Math.round(total / 1048576)}MB\n`;
@@ -1134,7 +1158,22 @@ async function receivePack<E extends Env>(
       try {
         staged = await stagePack(bucket, begin.stagingKey, push, maxBytes, sideband, emit, metrics);
       } catch (err) {
-        unpackError = err instanceof Error ? err.message : String(err);
+        const stagedMsg = err instanceof Error ? err.message : String(err);
+        // the cap's violation is a TRANSPORT answer, not a protocol one: the
+        // same violation detected from the declared length 413s before any
+        // byte streams (overDeclaredLength above), so the same violation
+        // detected mid-stream 413s here — the size messages rethrow to the
+        // outer catch (lease release + staging sweep + tooLargeResponse);
+        // every other staging failure stays the report-status unpack ng.
+        if (stagedMsg.includes("exceeds maximum size")) {
+          try {
+            await push.reader?.cancel();
+          } catch {
+            // client may already be gone
+          }
+          throw err;
+        }
+        unpackError = stagedMsg;
         console.log(`[receive ${repo}] staging failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
         try {
           await push.reader?.cancel();
@@ -1485,7 +1524,9 @@ function repoPath(
   if (!m) return null;
   const g = m.pathname.groups;
   const segs: string[] = [];
-  for (const raw of namespaced ? [g.owner, g.name] : [g.name]) {
+  const raws = namespaced ? [g.owner, g.name] : [g.name];
+  for (let i = 0; i < raws.length; i++) {
+    const raw = raws[i];
     if (!raw) return null;
     let seg: string;
     try {
@@ -1493,7 +1534,10 @@ function repoPath(
     } catch {
       return null;
     }
-    if (!REPO_NAME.test(seg)) return null;
+    // the infrastructure-cell marker rides the NAME segment only (the flat
+    // form's only segment); an OWNER segment stays on the strict alphabet
+    const isNameSegment = i === raws.length - 1;
+    if (!REPO_NAME.test(seg) && !(isNameSegment && INFRA_REPO_NAMES.has(seg))) return null;
     segs.push(seg);
   }
   if (RESERVED.has(segs[0])) return null;
@@ -1672,9 +1716,32 @@ export function createDurableGit<E extends Env = Env>(options: DurableGitOptions
           // buffer the tiny negotiation body so a full clone can be served straight
           // from R2 (never touching the DO for bytes); the auth gate above has
           // already run, so a private repo cannot reach this point anonymously.
-          const raw = new Uint8Array(await req.arrayBuffer());
+          // A gzipped body reads through the receive arm's bounded reader (the
+          // readGzipBodyBounded parity — an arrayBuffer()-first read would hold
+          // the whole COMPRESSED body before the inflate cap applies, and a
+          // chunked gzipped upload-pack request carries no Content-Length, so
+          // the "small" predicate above admits it unbounded): the declared
+          // length pre-checks and the counted walk cancels the reader the
+          // moment the compressed count passes the cap, throwing the standard
+          // "exceeds maximum size" message — mapped to the standard 413 here,
+          // the same mapping the DO-side upload-pack arm applies to its own
+          // size errors (repo.ts uploadPack's catch).
+          const gzipped = req.headers.get("content-encoding")?.includes("gzip") ?? false;
+          let raw: Uint8Array;
+          if (gzipped) {
+            try {
+              raw = await readGzipBodyBounded(req, MAX_UPLOAD_PACK_BYTES);
+            } catch (err) {
+              if (err instanceof Error && err.message.includes("exceeds maximum size")) {
+                return tooLargeResponse(MAX_UPLOAD_PACK_BYTES);
+              }
+              throw err;
+            }
+          } else {
+            raw = new Uint8Array(await req.arrayBuffer());
+          }
           let parsed: Uint8Array = raw;
-          if (req.headers.get("content-encoding")?.includes("gzip")) {
+          if (gzipped) {
             try {
               parsed = gunzipLimited(raw, MAX_UPLOAD_PACK_BYTES);
             } catch {

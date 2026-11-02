@@ -43,9 +43,9 @@
  *   reachable oids only — short prefixes parse but `readCommit` nulls (the
  *   commit view's documented full-oid divergence, inherited). A well-shaped
  *   unresolvable sha is upstream's Diff 404 (commit.go's IsErrNotExist →
- *   ctx.NotFound); the view arm interim-folds to the family's missing
- *   outcome (the fixed handler outcome set cannot answer a 404), the
- *   download loader nulls (the serving arm's shell).
+ *   ctx.NotFound, commit.go:302-305 — the download arm's twin at :449-455):
+ *   the VIEW loader answers the `not-found` outcome (repo-wiki.tsx) and the
+ *   serving arm 404-shells it; the download loader nulls (the same shell).
  * - the diff/patch rendering rides the landed raw renderer family
  *   (api/services/git-models.ts: `readDiff` → `renderUnifiedDiffAsync` /
  *   `renderPatchAsync`, the verbatim-bytes contract with the no-newline
@@ -62,23 +62,24 @@
  * - `.patch` over a MERGE commit: upstream's RawDiffPatch arm runs
  *   format-patch `<merge>...<parent0>` and format-patch skips merges — the
  *   non-merge side-commit series, EMPTY when the series is empty
- *   (diff.go:87-99). `wikiPatchSeries` mirrors the family's series walker
+ *   (diff.go:87-99). The SHARED family series walker
  *   (api/services/git-models.ts `renderPatchSeries` — diffpatch-files.ts's
- *   private copy folded there at decf55d) over the wiki blob source, with
+ *   private copy folded there at decf55d) serves it with the
+ *   `wikiDiffBlobSource` factory passed through the walker's caller-supplied
+ *   blob-source hook (git-models.ts DiffBlobSourceFactory — the D-1 seam):
  *   the walker's fixed D11 join (`mails.join("\n")` — byte-pinned in the
- *   matrix). It STAYS a mirror for ONE remaining difference — the blob
- *   read-back encode (the walker's COLLAPSE VERDICT below).
+ *   matrix) and the encoded read-back in ONE implementation. The former
+ *   `wikiPatchSeries` mirror is gone (the COLLAPSE VERDICT's two
+ *   differences both resolved).
  */
-
-import type { CommitJson } from "@cf-gitea/git-engine";
 
 import { type EngineReads } from "../../api/services/engine";
 import {
   renderPatchAsync,
+  renderPatchSeries,
   renderUnifiedDiffAsync,
   usernamesByEmail,
   type DiffBlobSource,
-  type RenderPatchOptions,
 } from "../../api/services/git-models";
 import type { RepositoryWithOwner } from "../../api/services/repository";
 import { enginePath, wikiReads } from "../../services/wiki";
@@ -116,7 +117,8 @@ export function parseWikiCommitViewTail(rawTail: string): { sha: string } | null
 /**
  * web.go:1620's pattern as a tail parse: `commit/{sha}.{diff|patch}` — the
  * raw-download arm. `null` = a pattern miss → page name. Consumed by the
- * serving arm (index.ts, pending — module doc).
+ * serving arm (index.ts wikiPage's download branch — the specific commit
+ * route beats the page combo, upstream's mux order).
  */
 export function parseWikiCommitDownloadTail(rawTail: string): { sha: string; ext: WikiCommitDownloadExt } | null {
   const match = /^commit\/([0-9a-f]{7,64})\.(diff|patch)$/.exec(rawTail);
@@ -125,12 +127,14 @@ export function parseWikiCommitDownloadTail(rawTail: string): { sha: string; ext
 }
 
 /**
- * The DiffBlobSource over the wiki cell's reads — diffBlobSource's shape
- * with services/wiki.ts's exported `enginePath` as the read-back encode
- * (the renderer's context-blob fetches must address the STORED flat entry
- * names).
+ * The wiki cell's DiffBlobSource factory — diffBlobSource's shape with
+ * services/wiki.ts's exported `enginePath` as the read-back encode (the
+ * renderer's context-blob fetches must address the STORED flat entry
+ * names). Passed to BOTH the single-commit renders and the shared series
+ * walker's caller-supplied blob-source hook (the D-1 seam). Exported for
+ * the matrix's walker-parity pins (the exact factory the loader passes).
  */
-function wikiDiffBlobSource(reads: EngineReads, oldTip: string | null, newTip: string): DiffBlobSource {
+export function wikiDiffBlobSource(reads: Pick<EngineReads, "readBlob">, oldTip: string | null, newTip: string): DiffBlobSource {
   return {
     oldTip,
     newTip,
@@ -296,89 +300,17 @@ export function WikiCommitDiffPage(props: { ctx: UiContext; data: CommitViewData
 // ---------------------------------------------------------------------------
 
 /**
- * The series walker: the non-merge commits of `base..head` oldest-first,
- * one `--no-signature` mail per commit diffed against its own first parent
- * — the diffpatch family's renderPatchSeries mirrored over the wiki blob
- * source (module doc). The walk cap and the between-mail seam bytes are
- * that walker's verbatim (recorded against `git format-patch --stdout`).
- *
- * COLLAPSE VERDICT (2026-11-02, UPDATED — the join fix landed; one true
- * difference keeps the mirror off the shared `renderPatchSeries`. The
- * original probe ran in a scratch harness against the live wiki cell and
- * recorded TWO differences; the first is now RESOLVED in place):
- *
- *   1. THE JOIN SEAM — RESOLVED. This mirror was written against the
- *      PRE-V4 family walker and joined `(mail + "\n")` with "\n" — one
- *      newline OFF against `git format-patch --stdout` at BOTH seams
- *      (V4's D11, 326904e, xxd-recorded the git shape and fixed the family
- *      copy to `mails.join("\n")`: each mail carries its own trailing
- *      newline, the join adds only the inter-mail blank line, the last
- *      mail's tail is the stream's tail — re-verified against a scratch
- *      real-git repo: unsigned tail `+line\n`, unsigned seam
- *      `+line\n\nFrom`, signed seam `2.43.0\n\n\nFrom`). The mirror now
- *      carries that exact join, and the matrix pins the bytes over the
- *      merge fixture: 646 bytes post-fix vs 647 pre-fix (the scratch
- *      harness had recorded the same single-extra-newline defect as
- *      464 vs 463 on its own, since-deleted world), the 2-mail series
- *      pins the seam (`…one\n\nFrom`, never `\n\n\nFrom`), and a parity
- *      pin asserts the shared walker's output equals the mirror's
- *      byte-for-byte on the fixture.
- *   2. THE BLOB READ-BACK ENCODE — the REMAINING blocker. The wiki cell
- *      stores codec-space flat entry names (`Docs%2FDiff-Guide.md`), so
- *      this walker's `wikiDiffBlobSource` re-encodes every context-blob
- *      read through services/wiki.ts's `enginePath` ("%25" doubling,
- *      module doc); the shared walker builds a plain `diffBlobSource` with
- *      no encode, and a probe over a stored `Weird%2FName.md` entry
- *      (content without the trailing newline) lost the renderer's
- *      "\ No newline at end of file" marker there — the unencoded read
- *      decodes %2F into a nested miss, and the file degrades to the
- *      marker-less shape (636 vs 607 bytes). Any future shared-walker fold
- *      needs an encode hook (or a caller-supplied DiffBlobSource
- *      parameter) at git-models.ts first. Until then the mirror STAYS.
- *
- * The matrix's merge-series pins are now BYTE-exact over the fixed walker
- * (the fixture output with its tail, the 2-mail seam, the no-signature
- * posture) — they arbitrate the join, not just the shape.
- */
-const MERGE_SERIES_COMMIT_CAP = 2000;
-const MERGE_SERIES_PAGE = 500;
-
-async function wikiPatchSeries(reads: EngineReads, base: string, head: string, options: RenderPatchOptions): Promise<string> {
-  const commits: CommitJson[] = [];
-  for (let page = 0; commits.length < MERGE_SERIES_COMMIT_CAP; page++) {
-    const walked = await reads.listCommitsRange(base, head, MERGE_SERIES_PAGE, page);
-    if (walked === null) break;
-    for (const commit of walked.commits) {
-      if (commit.parents.length <= 1) commits.push(commit);
-    }
-    if (!walked.more) break;
-  }
-  const numbered = commits.length > 1;
-  const mails: string[] = [];
-  for (let i = 0; i < commits.length; i++) {
-    const commit = commits[i] as CommitJson;
-    const parent = commit.parents.length === 1 ? commit.parents[0] : undefined;
-    const diff = await reads.readDiff(commit.oid, parent);
-    const files = diff?.files ?? [];
-    const src = wikiDiffBlobSource(reads, diff?.old ?? null, diff?.new ?? commit.oid);
-    mails.push(
-      await renderPatchAsync(commit, files, src, {
-        ...options,
-        ...(numbered ? { patchNumber: { index: i + 1, count: commits.length } } : {}),
-      }),
-    );
-  }
-  return mails.join("\n");
-}
-
-/**
  * The wiki download's body — loadCommitDiffPatch's exact composition over
  * the SIBLING cell (pages/diffpatch-files.ts): `.diff` is the plain unified
  * diff (readDiff's default-second-parent semantic; a root commit diffs
  * against the empty tree), `.patch` the git-am mail WITHOUT the signature
- * tail, a merge the non-merge side-commit series. `null` = the 404 family
- * (wrong shape, unknown/unresolvable oid — the serving arm answers the
- * §4.5 shell, the diffpatch family's convention).
+ * tail, a merge the non-merge side-commit series rendered by the SHARED
+ * family walker (`renderPatchSeries`) with `wikiDiffBlobSource` passed as
+ * its caller-supplied blob source — the D-1 encode seam (module doc; the
+ * former `wikiPatchSeries` mirror collapsed onto the walker once the hook
+ * landed: same walk cap, same D11 join, encoded read-back). `null` = the
+ * 404 family (wrong shape, unknown/unresolvable oid — the serving arm
+ * answers the §4.5 shell, the diffpatch family's convention).
  */
 export async function loadWikiCommitDiffPatch(env: Env, pair: RepositoryWithOwner, sha: string, ext: WikiCommitDownloadExt): Promise<string | null> {
   if (!WIKI_COMMIT_SHA.test(sha)) return null;
@@ -386,7 +318,7 @@ export async function loadWikiCommitDiffPatch(env: Env, pair: RepositoryWithOwne
   const commit = await reads.readCommit(sha);
   if (commit === null) return null;
   if (ext === "patch" && commit.parents.length > 1) {
-    return wikiPatchSeries(reads, commit.parents[0] as string, commit.oid, { signature: null });
+    return renderPatchSeries(reads, commit.parents[0] as string, commit.oid, { signature: null }, wikiDiffBlobSource);
   }
   const diff = await reads.readDiff(commit.oid);
   const files = diff?.files ?? [];

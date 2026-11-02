@@ -495,13 +495,13 @@ describe("smoke: the commit-diff family (web.go:1619-1620 over the wiki cell)", 
 
     // A well-shaped UNKNOWN sha: the download loader nulls (the serving
     // arm's §4.5 shell — the diffpatch family's convention); the view arm
-    // interim-folds to the family's missing outcome (upstream Diff 404s —
-    // the loader cannot answer a 404 through the fixed outcome set, the
-    // module doc carries the disclosure).
+    // answers the `not-found` outcome (upstream Diff's `git.IsErrNotExist →
+    // ctx.NotFound`, commit.go:302-305 — the D-2 fold; index.ts's mapping
+    // 404-shells it, the download twin at :449-455 is the loader's null).
     const ghost = "a".repeat(40);
     expect(await loadWikiCommitDiffPatch(env, pair, ghost, "diff")).toBeNull();
     expect(await loadWikiCommitDiffPatch(env, pair, ghost, "patch")).toBeNull();
-    expect(await loadWikiViewData(env, pair, `commit/${ghost}`, ORIGIN)).toEqual({ outcome: "missing" });
+    expect(await loadWikiViewData(env, pair, `commit/${ghost}`, ORIGIN)).toEqual({ outcome: "not-found" });
 
     // Uppercase hex is a PATTERN miss (web.go's lowercase-only class) — the
     // tail stays a page name, upstream's combo fold.

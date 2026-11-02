@@ -638,22 +638,27 @@ await check("§7.3 boundary (declared over cap): a Content-Length over MAX_PUSH_
   assertEq(t.stagingDeletes.length, 0, "nothing to sweep");
 });
 
-await check("§7.3 boundary (undeclared over cap, the 101-without-Content-Length shape): the stream aborts AT the cap mid-staging — every command ng in report-status, zero refs, staging aborted and swept", async () => {
+await check("§7.3 boundary (undeclared over cap, the 101-without-Content-Length shape): the stream aborts AT the cap mid-staging — the STANDARD 413, zero refs, staging aborted and swept", async () => {
   const t = makeRepo();
   const commands = [createCommand("0".repeat(40), "1".repeat(40), "refs/heads/main")];
   const junk = new Uint8Array(Math.floor(CAP_BYTES * 1.5));
   for (let i = 0; i < junk.length; i += 65536) crypto.getRandomValues(junk.subarray(i, Math.min(i + 65536, junk.length)));
   const res = await postReceive(t, receiveBody(commands, junk), { chunked: true });
-  assertEq(res.status, 200, "the over-cap abort is a PROTOCOL-level outcome, not a transport error");
-  const { status } = parseReportStatus(Buffer.from(await res.arrayBuffer()));
-  assert(/unpack pack exceeds maximum push size/.test(status), `the abort surfaced in report-status: ${JSON.stringify(status)}`);
-  assert(/ng refs\/heads\/main/.test(status), `the command is ng: ${JSON.stringify(status)}`);
+  // the cap's violation is a TRANSPORT answer, not a protocol one: the same
+  // violation detected from the declared length 413s before any byte streams
+  // (§7.3's declared check above), so the mid-stream detection 413s too — the
+  // receive staging catch rethrows an "exceeds maximum size" message to the
+  // outer catch, whose filter maps it to tooLargeResponse.
+  assertEq(res.status, 413, `the standard 413: ${res.status}`);
+  const text = await res.text();
+  assert(/exceeds/.test(text), `the rejection names the limit: ${JSON.stringify(text)}`);
   assertEq(t.store.getRef("refs/heads/main"), null, "zero refs touched");
   assertEq(t.store.refsVersion(), t.store.refsVersion(), "refs_version unchanged");
   assertEq([...t.objects.keys()].filter((k) => k.includes("/packs/")).length, 0, "no pack ever reached packs/");
   assertEq(t.multipartAborts, 1, "the staged multipart upload was aborted (no partial R2 object)");
-  assertEq(t.stagingDeletes.length, 1, "the lease decision swept the staging key");
-  assert(t.rpcs.includes("beginReceive") && t.rpcs.includes("finalizeReceive"), `the lease lifecycle ran: ${t.rpcs.join(",")}`);
+  assertEq(t.stagingDeletes.length, 1, "the outer catch's release swept the staging key");
+  assert(t.rpcs.includes("beginReceive"), `the lease opened: ${t.rpcs.join(",")}`);
+  assert(!t.rpcs.includes("finalizeReceive"), `no finalize ran: ${t.rpcs.join(",")}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -874,6 +879,52 @@ await check("§7.3 incremental fetch with negotiated haves: ACK negotiation shap
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// S-2 — the `_cargo-index` infrastructure-cell route seam (the v1.5.2
+// ledger's S-2 row): upstream Gitea's cargo sparse-index mirror repository
+// (services/packages/cargo/index.go:28-29 IndexRepositoryName) is a rowless
+// engine cell in cf-gitea (the wiki sibling's hiding posture), and the
+// leading underscore sat OUTSIDE REPO_NAME's alphabet — every git-URL
+// request 404'd at the ROUTE PARSE, before the registry oracle even ran.
+// The seam admits the name on the NAME segment only; admission is parsing
+// only — the registry-existence oracle still 404s a registry-unknown name
+// (the wiki family's contract: the worker's gate seeds the priv:1 row
+// before the forward, reported gate-side).
+// ---------------------------------------------------------------------------
+
+async function getRefs(path, namespaced = false) {
+  const t = makeRepo();
+  const handler = createDurableGit({ authorize: () => true, ui: false, ...(namespaced ? { namespaces: true } : {}) });
+  const res = await handler.fetch(new Request(`http://dgit.test${path}`, { headers: {} }), t.env, { waitUntil() {} });
+  return { status: res.status, body: await res.text() };
+}
+
+await check("S-2 route seam: `_cargo-index` parses on the NAME segment — the registry-unknown answer is the ORACLE's 404 text, not the parse miss", async () => {
+  const admitted = await getRefs("/_cargo-index.git/info/refs?service=git-upload-pack");
+  assertEq(admitted.status, 404, "the oracle still 404s a registry-unknown name");
+  // the distinguisher: the parse MISS answers the site-level "not found\n"
+  // page arm; an ADMITTED name reaches the protocol branch and its 404
+  // carries the repository name (`repository not found: ${repo}\n`)
+  assert(admitted.body === "repository not found: _cargo-index\n", `the oracle's protocol 404: ${JSON.stringify(admitted.body)}`);
+});
+
+await check("S-2 route seam (the worker's namespaced form): owner/_cargo-index admits; the marker rides the NAME segment only", async () => {
+  const admitted = await getRefs("/someowner/_cargo-index.git/info/refs?service=git-upload-pack", true);
+  assertEq(admitted.status, 404, "the oracle still 404s a registry-unknown name");
+  assert(admitted.body === "repository not found: someowner/_cargo-index\n", `the oracle's protocol 404: ${JSON.stringify(admitted.body)}`);
+  // an OWNER segment keeps the strict alphabet even when the tail names the
+  // marker (the infrastructure cells are name-addressed under a real owner)
+  const ownerMiss = await getRefs("/_cargo-index/r0.git/info/refs?service=git-upload-pack", true);
+  assertEq(ownerMiss.status, 404, "the marker never admits an OWNER segment");
+  assert(ownerMiss.body === "not found\n", `the parse-miss page arm: ${JSON.stringify(ownerMiss.body)}`);
+});
+
+await check("S-2 route seam: the strict alphabet still rejects names outside it", async () => {
+  const plainMiss = await getRefs("/_not-a-cell.git/info/refs?service=git-upload-pack");
+  assertEq(plainMiss.status, 404, "an unknown underscore name stays outside the alphabet");
+  assert(plainMiss.body === "not found\n", `the parse-miss page arm: ${JSON.stringify(plainMiss.body)}`);
 });
 
 // ---------------------------------------------------------------------------
