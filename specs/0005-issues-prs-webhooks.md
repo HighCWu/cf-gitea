@@ -157,8 +157,17 @@ Citations: `gitea/models/repo/release.go`, `models/repo/attachment.go`,
   NO release row created (release.go:104-113 + release.go:283-284); absent
   `target_commitish` → the default branch; a `tag_message` creates the ANNOTATED
   tag object (release.go:110-121). A created tag fires the tags-API's byte-identical
-  zero-commit `push` + `create` ref-webhook pair (upstream createTag's PushCommits +
-  CreateRef, release.go:125-148). The fill (`sha1`/`num_commits`/the commit-dated
+  `push` + `create` ref-webhook pair (upstream createTag's PushCommits +
+  CreateRef, release.go:131-143) — the TAG-CREATE shape, not a bare
+  zero-everything pair: the push event fires FIRST (release.go:136) with a
+  zero commit LIST (`total_commits` 0) but a real `head_commit` — the tagged
+  (peeled) commit (`commits.HeadCommit = CommitToPushCommit(commit)`, release.go:132)
+  — and a real `compare_url` over the zero base
+  (`ComposeCompareURL(zero, commit.ID)`, release.go:133); the `create` event
+  follows (:143). The SAME shape rides a tag created by a user push
+  (`services/repository/push.go:123-136` — push-then-create there too; CORRECTED
+  2026-11-02: this passage's earlier "zero-commit" reading described the bare
+  mirror shape and mis-stated the cited arm). The fill (`sha1`/`num_commits`/the commit-dated
   `created_unix`, release.go:150-157) and the EDIT path's tag arm (upstream
   UpdateRelease → createTag, release.go:262/269) LANDED with the UpdateRelease tag
   wave; only DELETE's `delTag` arm remains D1-only (the API passes `delTag=false`).
@@ -296,10 +305,32 @@ Citations: `gitea/services/repository/push.go:185–197`, `services/issue/commit
 - The push **webhook** payload's `commits` array is capped at `UI.FeedMaxCommitNum`
   (**default 5**, `modules/setting/ui.go:92`, applied at
   `services/repository/push.go:190–192`) while `total_commits` carries the true count;
-  commits are listed newest-first; `head_commit` is the new tip.
+  commits are listed newest-first; `head_commit` is the new tip. The Len nuance is a
+  posture split (CLARIFIED 2026-11-02): the USER-push arms walk UNCAPPED —
+  `pushUpdateBranch`'s `CommitsBetween(new, old, -1)` (push.go:279) makes
+  `total_commits` the FULL delta count while the array caps at 5 (:190-192 trims the
+  ARRAY only, `GitToPushCommits` sets `Len` from the walk, commits.go:150) — whereas
+  the MIRROR arm's own walk is capped (`CommitsBetween(new, old, FeedMaxCommitNum)`,
+  mirror_pull.go:363), so its Len ≤ 5.
 - Ref create/delete pushes fire `create`/`delete` webhooks with
   `ref_type ∈ branch|tag` and the short ref name
-  (`services/webhook/notifier.go:822–858`).
+  (`services/webhook/notifier.go:822–858`). CREATED refs split by posture and kind
+  (spelled out 2026-11-02 — the mirror arm and the user-push arms differ in shape
+  AND order):
+  - MIRROR created ref (mirror_pull.go:347-352): the bare zero-everything `push`
+    event FIRST (empty `NewPushCommits()` — no head, no compare URL, Len 0), then
+    `create`.
+  - USER-push BRANCH create (push.go:255-276): `create` FIRST (CreateRef inside
+    pushNewBranch, :274, after the walk), then the `push` payload of the real
+    `CommitsBeforeLimit(10)` walk (:270) — array = the newest 5 of that walk,
+    `total_commits` = the walk length (≤10), `head_commit` = the tip (:182),
+    `compare_url` real (getCompareURL, :188/:227-253 — the oldest walked commit's
+    first parent, falling to the default-branch name for a root, and to the bare
+    AppURL when neither resolves).
+  - USER-push TAG create (push.go:123-136): the zero-list `push` event FIRST
+    (:127-133) carrying `head_commit` = the peeled tip (:124) and
+    `compare/{zero}...{new}` (:125) — the §2.3 tag-create shape — then `create`
+    (:136).
 
 ### 2.6 Webhooks — upstream model and event catalog
 

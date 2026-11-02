@@ -25,8 +25,31 @@
  *   - `refs/pull/*` deltas are never notified (GitHub's PR refs ride the
  *     mirror refspec upstream, mirror_pull.go:334-337; the engine accepts
  *     such pushes, so the filter is load-bearing here too);
- *   - created ref (old = zero oid): the zero-commit push event FIRST, then
- *     the create event (mirror_pull.go:347, 352 — upstream's order);
+ *   - created ref (old = zero oid): THE POSTURE SPLIT (options.userPush).
+ *     The MIRROR posture (the default — sync.ts's delegate passes no flag)
+ *     keeps upstream's mirror shape byte-for-byte: the zero-commit push event
+ *     FIRST, then the create event (mirror_pull.go:347, 352 — NewPushCommits()
+ *     carries no head and no compare URL). The USER-PUSH posture implements
+ *     pushQueueHandleUpdates' two user arms, which differ from the mirror in
+ *     BOTH shape and order:
+ *       - BRANCH create (pushNewBranch, push.go:255-276): the create event
+ *         FIRST (CreateRef inside pushNewBranch, :274), THEN the push event
+ *         (:194) whose payload is the real `CommitsBeforeLimit(10)` walk
+ *         (:270 — newest ≤10 of the tip's ancestry; Len = that walk length,
+ *         NOT the cap), capped to the newest `FeedMaxCommitNum` (:190-192),
+ *         head_commit = the tip (:182) and a real compare_url (getCompareURL,
+ *         :188/:227-253 — the base is the oldest walked commit's first
+ *         parent, falling to the default-branch name for a root commit, and
+ *         to the empty "" (bare AppURL) when the branch IS the default);
+ *       - TAG create (push.go:115-138): the push event FIRST (:127-133) with
+ *         a zero commit LIST but head_commit = the peeled tip commit (:124)
+ *         and compare_url = compare/{zero}...{new} (:125), THEN the create
+ *         event (:136). A tip that does not read skips BOTH events (the
+ *         dirty-data tolerance, :117-122). (The tags-API createTag arm,
+ *         release.go:129-148, is this same shape.)
+ *       - any OTHER created ref (neither refs/heads/ nor refs/tags/):
+ *         silent — upstream's "Non-tag and non-branch commits pushed."
+ *         trace (:208-210).
  *   - deleted ref (new = zero oid): the delete event (notifier.go:858-870);
  *   - updated BRANCH ref: the push event with the capped old→new commit list —
  *     `listCommitsRange(old, new, FeedMaxCommitNum)` = the engine's
@@ -40,7 +63,16 @@
  *     request hasn't been created yet when creating a branch", so created and
  *     deleted refs never sync). Each event routes through the PR's BASE
  *     repository (`EventSource{Repository: pr.Issue.Repo}`) — for fork-head
- *     PRs that is a different repo than the one pushed to.
+ *     PRs that is a different repo than the one pushed to. The USER-push
+ *     payload's `total_commits` is the TRUE delta count — upstream's Len is
+ *     set from the UNCAPPED walk (GitToPushCommits, commits.go:150; the
+ *     :190-193 cap trims the ARRAY only) — read through
+ *     `countDivergence(old, new).ahead` (= `rev-list --left-right --count`'s
+ *     head-only side = `rev-list old..new` exactly, the uncapped
+ *     CommitsBetween walk of pushUpdateBranch, push.go:279); the capped
+ *     array length is the degradation fallback. The MIRROR posture keeps
+ *     Len = the capped array (its upstream walk is capped:
+ *     CommitsBetween(new, old, FeedMaxCommitNum), mirror_pull.go:363).
  *
  * The builder lives HERE rather than in src/issues/webhooks.ts because it
  * composes api/services converters (`compareUrl`, `toPayloadCommit`,
@@ -188,6 +220,12 @@ export const PUSH_ZERO_OID = "0".repeat(40);
  *  push payload's commit cap (§2.5). */
 export const FEED_MAX_COMMIT_NUM = 5;
 
+/** pushNewBranch's walk bound (`newCommit.CommitsBeforeLimit(ctx, gitRepo,
+ *  10)`, services/repository/push.go:270) — the user-push branch-create arm
+ *  walks the tip's newest 10 ancestors; the payload list is then capped to
+ *  FEED_MAX_COMMIT_NUM while `total_commits` carries THIS walk's length. */
+export const PUSH_NEW_BRANCH_COMMITS_LIMIT = 10;
+
 /** `maxPushCommitsInCommentCount` (services/pull/comment.go:21) — the type-29
  *  comment's commit cap; upstream keeps the NEWEST of a bigger delta
  *  (`rev-list --reverse -n limit`). */
@@ -269,12 +307,28 @@ export interface PushRefUpdate {
  * The engine-read slice the payload construction needs. Satisfied by the repo
  * cell (`listCommitsRange` — the capped oldest-first range walk; `readDiff` —
  * one id = diff against the first parent; `readCommit` — the tip read) and
- * overridable in tests (the MirrorSyncOptions.fetchImpl precedent).
+ * overridable in tests (the MirrorSyncOptions.fetchImpl precedent). The two
+ * OPTIONAL members back the user-push arms only — `engineWalk` provides them
+ * from the same cell, so the mirror path (which never takes a user arm)
+ * needs nothing; stubs may omit them and the arm degrades to its logged
+ * walk-failure posture.
  */
 export interface WebhookPushWalk {
   listCommitsRange(base: string, head: string, limit: number): Promise<{ commits: CommitJson[]; more: boolean } | null>;
   readDiff(id: string): Promise<DiffResult | null>;
   readCommit(id: string): Promise<CommitJson | null>;
+  /** `git log` over a tip's ancestry, newest-first (`LogResult`) — the
+   *  branch-create arm's `CommitsBeforeLimit` walk (push.go:270). An
+   *  unresolvable ref answers the empty page (the cell's contract), never a
+   *  throw. */
+  listLog?(ref: string, opts?: { ofs?: number; n?: number }): Promise<{ commits: CommitJson[]; more: boolean }>;
+  /** `rev-list --left-right --count base head` in one walk — the head-only
+   *  side IS `rev-list base..head`'s count, the branch-update arm's true
+   *  delta count (upstream Len, push.go:181 + commits.go:150). */
+  countDivergence?(base: string, head: string): Promise<
+    | { tag: "ok"; ahead: number; behind: number; exhausted: boolean }
+    | { tag: "missing" }
+  >;
 }
 
 /** The real walk: the repo cell of the notification's repository. Shared by
@@ -286,6 +340,8 @@ export function engineWalk(env: WebhookPushEnv, pair: RepositoryWithOwner): Webh
     listCommitsRange: (base, head, limit) => cell.listCommitsRange(base, head, limit),
     readDiff: (id) => cell.readDiff(id),
     readCommit: (id) => cell.readCommit(id),
+    listLog: (ref, opts) => cell.listLog(ref, opts),
+    countDivergence: (base, head) => cell.countDivergence(base, head),
   };
 }
 
@@ -319,6 +375,15 @@ export interface WebhookPushOptions {
    *  origin in the appOrigin chain; the literal origin ships, never a
    *  proxy-header rewrite (the proxy stance lives on appOrigin). */
   eventOrigin?: string;
+  /** The user-push posture (services/repository/push.go's
+   *  pushQueueHandleUpdates) for the created-ref arm: branch create = the
+   *  real-walk payload fired create-FIRST, tag create = the zero-list
+   *  head-bearing payload fired push-FIRST (the module header's split).
+   *  ABSENT/undefined = the mirror posture (mirror_pull.go:347-352) — the
+   *  zero-commit push event first, then create — which is what sync.ts's
+   *  delegate gets by passing no options. `handleUserPushNotifications`
+   *  sets this; only direct callers (tests, future emitters) choose. */
+  userPush?: boolean;
 }
 
 /** The compat-frozen PushPayload field set (SPEC-0005 §2.7,
@@ -393,7 +458,14 @@ export async function emitPushFamilyUpdates(
     for (const update of notifiable) {
       try {
         if (update.old === PUSH_ZERO_OID && update.next !== PUSH_ZERO_OID) {
-          // Created ref — the zero-commit push event, then the create event
+          if (options.userPush === true) {
+            // The user-push created arms — pushQueueHandleUpdates' branch/tag
+            // split (the module header's posture table; upstream's own order
+            // per arm: create-first for branches, push-first for tags).
+            await emitUserPushCreatedRef(env, pair, identity, origin, emit, update, walk, log);
+            continue;
+          }
+          // Mirror posture — the zero-commit push event, then the create event
           // (mirror_pull.go:347, 352 — upstream's emission order). The bare
           // AppURL with its trailing "/" is the zero-commit compare_url
           // (notifier.go:913 with CompareURL "" — ComposeCompareURL only runs
@@ -506,6 +578,31 @@ export async function emitPushFamilyUpdates(
             headCommit = tipEnriched.commits[0]!;
           }
         }
+        // total_commits — A POSTURE SPLIT, like upstream's own walks: the
+        // USER-PUSH Len rides the UNCAPPED walk (GitToPushCommits,
+        // commits.go:150; push.go:190-193 trims the ARRAY only) — the true
+        // old→new delta count, read through `countDivergence(old, new).ahead`
+        // (graph.ts:377 "ahead = |base..head|" = `rev-list old..new` = the
+        // uncapped CommitsBetween of pushUpdateBranch, push.go:279 — one
+        // RPC). The capped array length is the degradation fallback (the
+        // count seam absent from a stub walk, or a side unresolvable — the
+        // engine-native transitional populations), logged; `exhausted` (the
+        // walk budget clipped the count) degrades silently like every
+        // budgeted walk here. The MIRROR posture keeps Len = the capped
+        // array (upstream's mirror walk is capped: CommitsBetween(new, old,
+        // FeedMaxCommitNum), mirror_pull.go:363 → Len ≤ cap), byte-kept.
+        let totalCommits = commits.length;
+        if (options.userPush === true) {
+          const counted = walk.countDivergence ? await walk.countDivergence(update.old, update.next) : null;
+          if (counted !== null && counted.tag === "ok") {
+            totalCommits = counted.ahead;
+          } else {
+            log(
+              `[push-webhook] ${pair.repo.ownerNamespace}/${pair.repo.slug}: delta count unavailable for ${update.ref} ` +
+                `(${counted === null ? "count seam absent" : "a side unresolvable"}) — total_commits degrades to the capped window (${commits.length})`,
+            );
+          }
+        }
         const push: PushPayload = {
           ref: update.ref,
           before: update.old,
@@ -515,7 +612,7 @@ export async function emitPushFamilyUpdates(
           // with "/").
           compare_url: `${origin}/${compareUrl(pair, update.old, update.next)}`,
           commits,
-          total_commits: commits.length,
+          total_commits: totalCommits,
           head_commit: headCommit,
           repository: identity.repository,
           pusher: identity.pusher,
@@ -545,6 +642,152 @@ export async function emitPushFamilyUpdates(
         `${error instanceof Error ? error.message : String(error)}`,
     );
   }
+}
+
+/**
+ * The user-push created-ref arms (services/repository/push.go's
+ * pushQueueHandleUpdates — the module header's posture split). Branch create:
+ * the `CommitsBeforeLimit(10)` walk FIRST (pushNewBranch, :270 — upstream's
+ * CreateRef at :274 fires only after it succeeded, so a failed/empty walk
+ * skips BOTH events, like upstream's returned error), then the create event,
+ * then the push payload of that walk. Tag create: the tip read (GetCommit's
+ * peel, :116 — the dirty-data tolerance skips BOTH events when it fails,
+ * :117-122), then the zero-list head-bearing push event (:127-133), then the
+ * create event (:136). Created refs that are neither branch nor tag stay
+ * silent (:208-210, "Non-tag and non-branch commits pushed.").
+ *
+ * The branch payload (push.go:181-194): newest-first (the log walk's order —
+ * no reversal), file lists enriched per commit, capped to the newest
+ * FeedMaxCommitNum (:190-192 — upstream's `Commits[:cap]` of a newest-first
+ * list KEEPS the newest five, so the tip always survives the cap and
+ * head_commit = :182's CommitToPushCommit(newCommit) always matches into the
+ * array), total = the walk length (the ≤10 Len — NOT the array cap), and
+ * compare_url from getCompareURL (:188, :227-253): the base is the OLDEST
+ * walked commit's first parent (the pre-cap `commits[len-1]`), a root
+ * oldest falls to the default-branch NAME (only when the branch is not the
+ * default, :245-247), and neither resolving leaves "" — the bare AppURL
+ * (notifier.go:672). The tag payload: total 0, `commits: []`,
+ * head_commit = the PEELED tip commit (:124), compare_url =
+ * compare/{zero}...{new-oid} (:125 — the RAW ref target oid, the tag object
+ * for an annotated tag; our `after`/`sha` carry it verbatim too).
+ */
+async function emitUserPushCreatedRef(
+  env: WebhookPushEnv,
+  pair: RepositoryWithOwner,
+  identity: WebhookPushIdentity,
+  origin: string,
+  emit: (eventType: HookEventType, payload: unknown, refName: string) => Promise<unknown>,
+  update: PushRefUpdate,
+  walk: WebhookPushWalk,
+  log: (message: string) => void,
+): Promise<void> {
+  const createPayload = () => ({
+    sha: update.next,
+    ref: shortRefName(update.ref),
+    ref_type: refTypeOf(update.ref),
+    repository: identity.repository,
+    sender: identity.sender,
+  });
+
+  if (update.ref.startsWith("refs/heads/")) {
+    // The walk BEFORE any event (pushNewBranch's CommitsBeforeLimit(10),
+    // push.go:270; CreateRef only fires after it succeeded, :274).
+    if (walk.listLog === undefined) {
+      log(
+        `[push-webhook] ${pair.repo.ownerNamespace}/${pair.repo.slug}: no log walk on the seam — ` +
+          `branch create ${update.ref} not notified`,
+      );
+      return;
+    }
+    const walked = await walk.listLog(update.next, { ofs: 0, n: PUSH_NEW_BRANCH_COMMITS_LIMIT });
+    if (walked === null || walked.commits.length === 0) {
+      // Unresolvable tip / empty page — upstream's walk error returns before
+      // CreateRef (:271-273), so neither event fires.
+      log(
+        `[push-webhook] ${pair.repo.ownerNamespace}/${pair.repo.slug}: branch-create walk failed for ${update.ref} ` +
+          `(${update.next.slice(0, 7)}) — ref not notified`,
+      );
+      return;
+    }
+    // 1. CreateRef (pushNewBranch :274) — create-FIRST for branches.
+    await emit("create", createPayload(), update.ref);
+    // 2. The push payload (push.go:181-194; PushCommits :194 — SECOND).
+    const usernames = await usernamesByEmail(env.DB, walked.commits);
+    const rendered = walked.commits.map((commit) => ({
+      ...toPayloadCommit(commit, pair, usernames, origin),
+      id: commit.oid,
+    }));
+    const enriched = await enrichCommitsWithFileLists(rendered, (id) => walk.readDiff(id));
+    // The newest-first list capped to its FIRST FeedMaxCommitNum entries —
+    // upstream's Commits[:cap] (:190-192): the newest five, tip included.
+    const commits = (enriched.enriched ? enriched.commits : rendered).slice(0, FEED_MAX_COMMIT_NUM);
+    // head_commit (:182, rendered through ToAPIPayloadCommits' id match,
+    // commits.go:113): the tip is the walk's head and the cap keeps the
+    // newest, so it always matches; null only on the impossible empty cap.
+    const headCommit = commits.find((commit) => commit.id === update.next) ?? null;
+    // getCompareURL (:188, :227-253) — see the doc block.
+    const branch = shortRefName(update.ref);
+    const oldest = walked.commits[walked.commits.length - 1]!;
+    const oldestParent = oldest.parents[0];
+    let compareBase: string | null = null;
+    if (oldestParent !== undefined && oldestParent !== PUSH_ZERO_OID) {
+      compareBase = oldestParent;
+    } else if (pair.repo.defaultBranch !== branch) {
+      compareBase = pair.repo.defaultBranch;
+    }
+    const push: PushPayload = {
+      ref: update.ref,
+      before: PUSH_ZERO_OID,
+      after: update.next,
+      compare_url: compareBase === null ? `${origin}/` : `${origin}/${compareUrl(pair, compareBase, update.next)}`,
+      commits,
+      total_commits: walked.commits.length,
+      head_commit: headCommit,
+      repository: identity.repository,
+      pusher: identity.pusher,
+      sender: identity.sender,
+    };
+    await emit("push", push, update.ref);
+    return;
+  }
+
+  if (update.ref.startsWith("refs/tags/")) {
+    // The tip read first (GetCommit's peel, push.go:116) — a failed read
+    // skips BOTH events (the dirty-data tolerance, :117-122).
+    const tip = await walk.readCommit(update.next);
+    if (tip === null) {
+      log(
+        `[push-webhook] ${pair.repo.ownerNamespace}/${pair.repo.slug}: tag-create tip read failed for ${update.ref} ` +
+          `(${update.next.slice(0, 7)}) — ref not notified`,
+      );
+      return;
+    }
+    const usernames = await usernamesByEmail(env.DB, [tip]);
+    const tipEnriched = await enrichCommitsWithFileLists(
+      [{ ...toPayloadCommit(tip, pair, usernames, origin), id: tip.oid }],
+      (id) => walk.readDiff(id),
+    );
+    const push: PushPayload = {
+      ref: update.ref,
+      before: PUSH_ZERO_OID,
+      after: update.next,
+      // ComposeCompareURL(zero, NEW) (:125) — the RAW ref target oid (the
+      // tag object for an annotated tag), not the peeled commit.
+      compare_url: `${origin}/${compareUrl(pair, PUSH_ZERO_OID, update.next)}`,
+      commits: [],
+      total_commits: 0,
+      head_commit: tipEnriched.commits[0] ?? null,
+      repository: identity.repository,
+      pusher: identity.pusher,
+      sender: identity.sender,
+    };
+    // PushCommits :127-133 FIRST, CreateRef :136 SECOND.
+    await emit("push", push, update.ref);
+    await emit("create", createPayload(), update.ref);
+    return;
+  }
+
+  // Neither branch nor tag — silent (push.go:208-210).
 }
 
 /**
@@ -1212,6 +1455,11 @@ export async function handleUserPushNotifications(
       // The sync arms' comment attribution rides the authenticated pusher
       // (upstream CreatePushPullComment's Doer); null attributes to no poster.
       pusherId: pusher?.id ?? null,
+      // The USER-PUSH posture: the created-ref arms take upstream's
+      // pushQueueHandleUpdates shapes/orders (the module header's split) —
+      // branch create walks + fires create-first, tag create carries the
+      // tip. The mirror keeps its zero-commit shape by passing no flag.
+      userPush: true,
     });
   } catch (error) {
     console.error(

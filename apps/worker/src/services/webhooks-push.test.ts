@@ -22,9 +22,16 @@
  * the pre-delivery instant (the suite-stability ledger's webhooks-push
  * flake: under load the consumer's delivered landed before the read).
  *
- * Covered: the per-created-ref zero-commit push + create pair, the updated-ref
+ * Covered: the user-push created arms (branch create = the create-FIRST
+ * event then the walked push payload — total = the ≤10 walk length, the
+ * newest-5 array, the tip head_commit and the getCompareURL compare_url;
+ * tag create = the push-FIRST zero-list event carrying the tip head_commit
+ * and the compare/{zero}...{new} URL; an unwalkable tip or a neither-branch-
+ * nor-tag ref stays silent — upstream's error arms), the updated-ref
  * capped push payload (newest-first commit list, added/removed/modified
- * enrichment, head_commit, compare_url), the delete event, the
+ * enrichment, head_commit, compare_url, and the TRUE total_commits — the
+ * uncapped delta count behind the 5-item array), the mirror-posture
+ * zero-commit created shape (the shared builder's default), the delete event, the
  * pull_request_sync family (an updated PR head branch syncs every open
  * github-flow PR on it with the delta; created refs, non-PR branches and
  * closed PRs stay silent; the subscription gates), the branch-delete cascade
@@ -492,13 +499,14 @@ async function expectRef(ownerNamespace: string, slug: string, ref: string, oid:
 // ---------------------------------------------------------------------------
 
 describe("user pushes emit the push/create/delete family (the engine onPush seam)", () => {
-  it("a first push emits the zero-commit push event + create event per created ref", async () => {
+  it("a first push emits the user-push created arms: create-first branch walk + push-first tag with the tip", async () => {
     const { row, token } = await seedRepoWithToken("pushweb");
     const hookId = await seedHook({ repoId: row.id });
     const { tips, pack } = await buildChainPack(null, [
       { message: "seed one", files: [{ path: "README.md", content: "one\n" }], time: 1700000000 },
       { message: "seed two", files: [{ path: "README.md", content: "two\n" }], time: 1700000001 },
     ]);
+    const first = tips[0]!;
     const tip = tips[1]!;
 
     // One receive creating a branch AND a tag — the per-ref split.
@@ -522,11 +530,13 @@ describe("user pushes emit the push/create/delete family (the engine onPush seam
     // over the same settled snapshot, deterministically.
     await settleDeliveries();
     const rows = await deliveries();
-    // Upstream's emission order per ref: the zero-commit push event FIRST,
-    // then the create event (mirror_pull.go:347, 352).
+    // Upstream's user-push created arms (pushQueueHandleUpdates): the BRANCH
+    // fires create FIRST (CreateRef inside pushNewBranch, push.go:274) then
+    // the walked push payload (:194); the TAG fires the zero-list push event
+    // FIRST (:127-133) then create (:136).
     expect(rows.map((r) => [r.hookId, r.eventType, r.eventGroup])).toEqual([
-      [hookId, "push", "push"],
       [hookId, "create", "create"],
+      [hookId, "push", "push"],
       [hookId, "push", "push"],
       [hookId, "create", "create"],
     ]);
@@ -536,26 +546,63 @@ describe("user pushes emit the push/create/delete family (the engine onPush seam
     // `skipped` is the missing/inactive-hook branch, not this fixture.
     expect(rows.map((r) => r.state)).toEqual(["delivered", "delivered", "delivered", "delivered"]);
 
-    // The branch's zero-commit push payload (§2.7 PushPayload field set).
-    // ORIGIN PRECEDENCE, end-to-end with both legs populated: the engine
-    // derived event.origin from THIS receive's request URL (https://example.com
-    // — the pushThroughGate base) and the adapter threads it, yet the varless
-    // fallback never shows — the configured APP_URL var outranks the event leg.
-    const branchPush = JSON.parse(rows[0]!.payloadContent) as Record<string, unknown>;
+    // The branch-create push payload: the REAL walk (newest-first), head at
+    // the tip, total = the walk length. The compare base (getCompareURL,
+    // push.go:227-253): the oldest walked commit is the ROOT here (no
+    // parent) and the branch IS the adopted default, so the compare_url is
+    // the bare AppURL. ORIGIN PRECEDENCE, end-to-end with both legs
+    // populated: the engine derived event.origin from THIS receive's request
+    // URL (https://example.com — the pushThroughGate base) and the adapter
+    // threads it, yet the varless fallback never shows — the configured
+    // APP_URL var outranks the event leg.
+    const branchPush = JSON.parse(rows[1]!.payloadContent) as {
+      ref: string;
+      before: string;
+      after: string;
+      compare_url: string;
+      commits: Array<{ id: string }>;
+      total_commits: number;
+      head_commit: { id: string } | null;
+      pusher: { login: string };
+      sender: { login: string };
+      repository: { full_name: string };
+    };
     expect(branchPush).toMatchObject({
       ref: "refs/heads/main",
       before: PUSH_ZERO_OID,
       after: tip,
       compare_url: `${EXPECTED_ORIGIN}/`,
-      commits: [],
-      total_commits: 0,
-      head_commit: null,
+      total_commits: 2,
+      head_commit: { id: tip },
     });
-    expect((branchPush.repository as { full_name: string }).full_name).toBe("alice/pushweb");
+    expect(branchPush.commits.map((c) => c.id)).toEqual([tip, first]);
+    expect(branchPush.repository.full_name).toBe("alice/pushweb");
     // The authenticated pusher (gate-threaded, PushEvent.pusherId) — Alice
     // pushed on her own token, so the payload coincides with the owner shape.
-    expect((branchPush.pusher as { login: string }).login).toBe("Alice");
-    expect((branchPush.sender as { login: string }).login).toBe("Alice");
+    expect(branchPush.pusher.login).toBe("Alice");
+    expect(branchPush.sender.login).toBe("Alice");
+
+    // The tag-create push payload (push.go:123-133): zero commit LIST and
+    // total 0, but head_commit = the (peeled) tip and a REAL compare_url
+    // over the zero base — never the bare-AppURL zero-everything shape.
+    const tagPush = JSON.parse(rows[2]!.payloadContent) as {
+      ref: string;
+      before: string;
+      after: string;
+      compare_url: string;
+      commits: unknown[];
+      total_commits: number;
+      head_commit: { id: string } | null;
+    };
+    expect(tagPush).toMatchObject({
+      ref: "refs/tags/v1",
+      before: PUSH_ZERO_OID,
+      after: tip,
+      compare_url: `${EXPECTED_ORIGIN}/alice/pushweb/compare/${PUSH_ZERO_OID}...${tip}`,
+      commits: [],
+      total_commits: 0,
+      head_commit: { id: tip },
+    });
 
     const tagCreate = JSON.parse(rows[3]!.payloadContent) as Record<string, unknown>;
     expect(tagCreate).toMatchObject({ sha: tip, ref: "v1", ref_type: "tag" });
@@ -771,8 +818,8 @@ describe("user pushes emit the push/create/delete family (the engine onPush seam
       return [row.eventType, payload.ref ?? payload.sha ?? ""];
     };
     expect(rows.map(familyOf)).toEqual([
-      ["push", "refs/heads/side"],
       ["create", "side"],
+      ["push", "refs/heads/side"],
     ]);
     expect(rows.map((r) => r.payloadContent.includes("refs/pull")).some(Boolean)).toBe(false);
   });
@@ -859,10 +906,13 @@ describe("user pushes emit the push/create/delete family (the engine onPush seam
       ).status,
     ).toBe(200);
     rows = await deliveries();
+    // The user-push branch-create arms: create fires FIRST (suppressed on
+    // the push_only hook, taken by the filtered send-everything hook), then
+    // the walked push event.
     expect(rows.map((r) => [r.hookId, r.eventType])).toEqual([
+      [releaseOnly, "create"],
       [pushOnly, "push"],
       [releaseOnly, "push"],
-      [releaseOnly, "create"],
     ]);
   });
 
@@ -878,8 +928,8 @@ describe("user pushes emit the push/create/delete family (the engine onPush seam
     ).toBe(200);
     const rows = await deliveries();
     expect(rows.map((r) => [r.hookId, r.eventType])).toEqual([
-      [ownerIdHook, "push"],
       [ownerIdHook, "create"],
+      [ownerIdHook, "push"],
     ]);
   });
 
@@ -936,6 +986,341 @@ describe("user pushes emit the push/create/delete family (the engine onPush seam
       ["push", "refs/heads/fresh"],
       ["create", "fresh"],
     ]);
+  });
+});
+
+describe("the user-push created arms and the true total (push.go's pushQueueHandleUpdates)", () => {
+  it("a branch create over an 8-commit ancestry pins total > the 5-item array (the walk length, not the cap)", async () => {
+    const { row, token } = await seedRepoWithToken("pushcreatewalk");
+    await seedHook({ repoId: row.id });
+    const { tips, pack } = await buildChainPack(
+      null,
+      Array.from({ length: 8 }, (_, i) => ({
+        message: `c${i}`,
+        files: [{ path: `f${i}.txt`, content: `${i}\n` }],
+        time: 1700000500 + i,
+      })),
+    );
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: tips[7]!, ref: "refs/heads/main" }], pack, token)).status,
+    ).toBe(200);
+
+    const rows = await deliveries();
+    expect(rows.map((r) => r.eventType)).toEqual(["create", "push"]);
+    const payload = JSON.parse(rows[1]!.payloadContent) as {
+      compare_url: string;
+      commits: Array<{ id: string }>;
+      total_commits: number;
+      head_commit: { id: string } | null;
+    };
+    // push.go:190-193 caps the ARRAY only — Len stays the walk length
+    // (commits.go:150): 8 walked, the newest 5 kept, tip first and as head.
+    expect(payload.total_commits).toBe(8);
+    expect(payload.commits.map((c) => c.id)).toEqual([tips[7], tips[6], tips[5], tips[4], tips[3]]);
+    expect(payload.head_commit?.id).toBe(tips[7]);
+    // getCompareURL: the oldest walked commit is the chain's root (no
+    // parent) and main is the adopted default — the bare AppURL.
+    expect(payload.compare_url).toBe(`${EXPECTED_ORIGIN}/`);
+  });
+
+  it("a branch create with a >10 ancestry caps the walk at 10 and compares from the oldest walked parent", async () => {
+    const { row, token } = await seedRepoWithToken("pushcreatecap");
+    await seedHook({ repoId: row.id });
+    // main = the 1-commit root (adopted default), then feature = 11 commits
+    // over it: the ancestry is 12 — CommitsBeforeLimit(10) keeps the newest
+    // 10, whose oldest (the second chain commit) HAS a parent —
+    // getCompareURL's parent arm (push.go:227-243).
+    const root = await buildChainPack(null, [
+      { message: "root", files: [{ path: "README.md", content: "r\n" }], time: 1700000520 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: root.tips[0]!, ref: "refs/heads/main" }], root.pack, token)).status,
+    ).toBe(200);
+    await clearDeliveries();
+
+    const chain = await buildChainPack(
+      root.tips[0]!,
+      Array.from({ length: 11 }, (_, i) => ({
+        message: `c${i + 1}`,
+        files: [{ path: `f${i}.txt`, content: `${i}\n` }],
+        time: 1700000521 + i,
+      })),
+    );
+    const tip = chain.tips[10]!;
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: tip, ref: "refs/heads/feature" }], chain.pack, token)).status,
+    ).toBe(200);
+
+    const rows = await deliveries();
+    expect(rows.map((r) => r.eventType)).toEqual(["create", "push"]);
+    const payload = JSON.parse(rows[1]!.payloadContent) as {
+      compare_url: string;
+      commits: Array<{ id: string }>;
+      total_commits: number;
+      head_commit: { id: string } | null;
+    };
+    expect(payload.total_commits).toBe(10);
+    expect(payload.commits.map((c) => c.id)).toEqual([tip, chain.tips[9], chain.tips[8], chain.tips[7], chain.tips[6]]);
+    expect(payload.head_commit?.id).toBe(tip);
+    // The base is the OLDEST WALKED commit's first parent: the walk keeps
+    // c11..c2, so c2's parent (the first chain commit) names the base.
+    expect(payload.compare_url).toBe(`${EXPECTED_ORIGIN}/alice/pushcreatecap/compare/${chain.tips[0]}...${tip}`);
+  });
+
+  it("a created non-default branch from an unrelated root compares from the default branch NAME", async () => {
+    const { row, token } = await seedRepoWithToken("pushcreatename");
+    await seedHook({ repoId: row.id });
+    const main = await buildChainPack(null, [
+      { message: "main root", files: [{ path: "README.md", content: "m\n" }], time: 1700000540 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: main.tips[0]!, ref: "refs/heads/main" }], main.pack, token)).status,
+    ).toBe(200);
+    await clearDeliveries();
+
+    // feature = an unrelated second root: its walk's oldest commit has no
+    // parent, so getCompareURL falls to the DEFAULT BRANCH NAME (push.go:245-247).
+    const feature = await buildChainPack(null, [
+      { message: "island", files: [{ path: "island.txt", content: "i\n" }], time: 1700000541 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: feature.tips[0]!, ref: "refs/heads/feature" }], feature.pack, token)).status,
+    ).toBe(200);
+    const rows = await deliveries();
+    expect(rows.map((r) => r.eventType)).toEqual(["create", "push"]);
+    const payload = JSON.parse(rows[1]!.payloadContent) as { compare_url: string; total_commits: number };
+    expect(payload.compare_url).toBe(`${EXPECTED_ORIGIN}/alice/pushcreatename/compare/main...${feature.tips[0]}`);
+    expect(payload.total_commits).toBe(1);
+  });
+
+  it("an updated ref's true delta count rides total_commits (7 pushed, 5 listed)", async () => {
+    const { row, token } = await seedRepoWithToken("pushtotal");
+    await seedHook({ repoId: row.id });
+    const base = await buildChainPack(null, [
+      { message: "base", files: [{ path: "README.md", content: "b\n" }], time: 1700000560 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: base.tips[0]!, ref: "refs/heads/main" }], base.pack, token)).status,
+    ).toBe(200);
+    await clearDeliveries();
+
+    // Seven commits appended in ONE receive: the array caps at 5
+    // (push.go:190-192), Len stays the uncapped walk (7) — pushUpdateBranch's
+    // CommitsBetween (push.go:279) is the unbounded old..new rev-list, read
+    // here through countDivergence's head-only side.
+    const append = await buildChainPack(
+      base.tips[0]!,
+      Array.from({ length: 7 }, (_, i) => ({
+        message: `w${i}`,
+        files: [{ path: `w${i}.txt`, content: `${i}\n` }],
+        time: 1700000561 + i,
+      })),
+    );
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: base.tips[0]!, oid: append.tips[6]!, ref: "refs/heads/main" }], append.pack, token)).status,
+    ).toBe(200);
+
+    const rows = await deliveries();
+    expect(rows.map((r) => r.eventType)).toEqual(["push"]);
+    const payload = JSON.parse(rows[0]!.payloadContent) as {
+      total_commits: number;
+      commits: Array<{ id: string }>;
+      head_commit: { id: string } | null;
+    };
+    expect(payload.total_commits).toBe(7);
+    expect(payload.commits).toHaveLength(5);
+    // head_commit names the tip regardless of the cap (push.go:185-192).
+    expect(payload.head_commit?.id).toBe(append.tips[6]!);
+  });
+
+  it("direct-call postures: mirror keeps the zero shape, userPush splits the arms, the count degrades logged", async () => {
+    const { row } = await seedRepoWithToken("pushposture");
+    await seedHook({ repoId: row.id });
+    const pair = (await findRepositoryById(env.DB, row.id))!;
+    // The VARLESS bindings: the direct calls thread an explicit request
+    // origin, which the appOrigin chain only honors without the APP_URL var
+    // (the var outranks it — the pinned precedence).
+    const varless: WebhookPushEnv = { DB: env.DB, REPO: env.REPO, REPO_PACKS: env.REPO_PACKS };
+    const identity = { repository: { full_name: "alice/pushposture" }, pusher: { login: "Alice" }, sender: { login: "Alice" } };
+    const origin = "https://direct.example.com";
+    const person = { name: "Test User", email: "t@example.com", time: 1700000000, tz: "+0000" };
+    const tip = "c".repeat(40);
+    const mid = "b".repeat(40);
+    const root = "a".repeat(40);
+    const commitJson = (oid: string, parents: string[]) => ({
+      oid,
+      tree: "t".repeat(40),
+      parents,
+      author: person,
+      committer: person,
+      subject: "s",
+      message: "s",
+    });
+    // The stub walk: listLog answers the newest-first ancestry, readCommit
+    // the (peeled) tip, readDiff null (the list-less enrichment degrade).
+    const walk: WebhookPushWalk = {
+      listCommitsRange: () => Promise.resolve(null),
+      readDiff: () => Promise.resolve(null),
+      readCommit: (id) => Promise.resolve(id === tip ? commitJson(tip, [mid]) : null),
+      listLog: (ref) =>
+        Promise.resolve(ref === tip ? { commits: [commitJson(tip, [mid]), commitJson(mid, [root]), commitJson(root, ["9".repeat(40)])], more: false } : { commits: [], more: false }),
+      countDivergence: () => Promise.resolve({ tag: "ok", ahead: 0, behind: 0, exhausted: false }),
+    };
+    const lines: string[] = [];
+    const log = (message: string): void => {
+      lines.push(message);
+    };
+
+    // 1. USER-PUSH branch create: create FIRST, then the walked payload —
+    // total = the walk length (3), array = the newest 3 (under the cap),
+    // head = tip, compare from the OLDEST walked commit's parent (the walk's
+    // last element's first parent — the `9` oid).
+    await emitPushFamilyUpdates(varless, pair, identity, [{ ref: "refs/heads/main", old: PUSH_ZERO_OID, next: tip }], walk, {
+      userPush: true,
+      origin,
+      log,
+    });
+    let rows = await deliveries();
+    expect(rows.map((r) => r.eventType)).toEqual(["create", "push"]);
+    const branchPush = JSON.parse(rows[1]!.payloadContent) as {
+      compare_url: string;
+      commits: Array<{ id: string }>;
+      total_commits: number;
+      head_commit: { id: string } | null;
+    };
+    expect(branchPush).toMatchObject({
+      compare_url: `${origin}/alice/pushposture/compare/${"9".repeat(40)}...${tip}`,
+      total_commits: 3,
+      head_commit: { id: tip },
+    });
+    expect(branchPush.commits.map((c) => c.id)).toEqual([tip, mid, root]);
+    await clearDeliveries();
+
+    // 2. MIRROR posture (no flag — sync.ts's delegate shape): the zero-commit
+    // push FIRST, then create — the pre-existing shape, byte-kept.
+    await emitPushFamilyUpdates(varless, pair, identity, [{ ref: "refs/heads/main", old: PUSH_ZERO_OID, next: tip }], walk, { origin, log });
+    rows = await deliveries();
+    expect(rows.map((r) => r.eventType)).toEqual(["push", "create"]);
+    const mirrorPush = JSON.parse(rows[0]!.payloadContent) as Record<string, unknown>;
+    expect(mirrorPush).toMatchObject({
+      before: PUSH_ZERO_OID,
+      after: tip,
+      compare_url: `${origin}/`,
+      commits: [],
+      total_commits: 0,
+      head_commit: null,
+    });
+    await clearDeliveries();
+
+    // 3. USER-PUSH tag create: the zero-list push FIRST (head_commit = the
+    // peeled tip, compare = zero...{raw new}), then create.
+    await emitPushFamilyUpdates(varless, pair, identity, [{ ref: "refs/tags/v1", old: PUSH_ZERO_OID, next: tip }], walk, {
+      userPush: true,
+      origin,
+      log,
+    });
+    rows = await deliveries();
+    expect(rows.map((r) => r.eventType)).toEqual(["push", "create"]);
+    const tagPush = JSON.parse(rows[0]!.payloadContent) as {
+      compare_url: string;
+      commits: unknown[];
+      total_commits: number;
+      head_commit: { id: string } | null;
+      after: string;
+    };
+    expect(tagPush).toMatchObject({
+      after: tip,
+      compare_url: `${origin}/alice/pushposture/compare/${PUSH_ZERO_OID}...${tip}`,
+      commits: [],
+      total_commits: 0,
+      head_commit: { id: tip },
+    });
+    await clearDeliveries();
+
+    // 4. USER-PUSH created ref that is neither branch nor tag: silent
+    // (push.go:208-210).
+    await emitPushFamilyUpdates(varless, pair, identity, [{ ref: "refs/notes/x", old: PUSH_ZERO_OID, next: tip }], walk, {
+      userPush: true,
+      origin,
+      log,
+    });
+    expect(await deliveries()).toHaveLength(0);
+
+    // 5. The count degradation (USER-push posture only — the mirror keeps
+    // its capped Len without a count read): a stub WITHOUT the count seam
+    // answers the capped window and logs it (the F1 fallback arm).
+    const countless: WebhookPushWalk = {
+      listCommitsRange: () =>
+        Promise.resolve({ commits: [commitJson("1".repeat(40), []), commitJson("2".repeat(40), ["1".repeat(40)])], more: true }),
+      readDiff: () => Promise.resolve(null),
+      readCommit: () => Promise.resolve(null),
+    };
+    await emitPushFamilyUpdates(varless, pair, identity, [{ ref: "refs/heads/main", old: `${"0".repeat(39)}1`, next: "9".repeat(40) }], countless, {
+      userPush: true,
+      origin,
+      log,
+    });
+    rows = await deliveries();
+    expect(rows.map((r) => r.eventType)).toEqual(["push"]);
+    expect((JSON.parse(rows[0]!.payloadContent) as { total_commits: number }).total_commits).toBe(2);
+    expect(lines.some((line) => line.includes("delta count unavailable"))).toBe(true);
+
+    // 5b. The MIRROR posture of the same delta: Len stays the capped array
+    // (upstream's mirror walk is capped, mirror_pull.go:363) and the count
+    // seam is never consulted (the degrade log count above is unchanged).
+    await clearDeliveries();
+    const before = lines.filter((line) => line.includes("delta count unavailable")).length;
+    await emitPushFamilyUpdates(varless, pair, identity, [{ ref: "refs/heads/main", old: `${"0".repeat(39)}1`, next: "9".repeat(40) }], countless, {
+      origin,
+      log,
+    });
+    rows = await deliveries();
+    expect(rows.map((r) => r.eventType)).toEqual(["push"]);
+    expect((JSON.parse(rows[0]!.payloadContent) as { total_commits: number }).total_commits).toBe(2);
+    expect(lines.filter((line) => line.includes("delta count unavailable")).length).toBe(before);
+
+    // 6. A poisoned user-push walk never throws and stays silent per ref
+    // (rejections ride the caller's per-ref catch, like every arm).
+    await clearDeliveries();
+    const poisoned: WebhookPushWalk = {
+      listCommitsRange: () => Promise.resolve(null),
+      readDiff: () => Promise.reject(new Error("diff exploded")),
+      readCommit: () => Promise.reject(new Error("tip exploded")),
+      listLog: () => Promise.reject(new Error("log exploded")),
+    };
+    await expect(
+      emitPushFamilyUpdates(
+        varless,
+        pair,
+        identity,
+        [
+          { ref: "refs/heads/broken", old: PUSH_ZERO_OID, next: tip },
+          { ref: "refs/tags/brokentag", old: PUSH_ZERO_OID, next: tip },
+        ],
+        poisoned,
+        { userPush: true, origin, log },
+      ),
+    ).resolves.toBeUndefined();
+    expect(await deliveries()).toHaveLength(0);
+    expect(lines.filter((line) => line.includes("notification failed for refs/"))).toHaveLength(2);
+
+    // 7. The graceful user-push failure arms DO log "not notified": an
+    // unresolvable tip (empty page) skips a branch's BOTH events; an
+    // unreadable tag tip skips the tag's pair (upstream's dirty-data
+    // tolerance, push.go:117-122).
+    await emitPushFamilyUpdates(
+      varless,
+      pair,
+      identity,
+      [
+        { ref: "refs/heads/void", old: PUSH_ZERO_OID, next: "d".repeat(40) },
+        { ref: "refs/tags/void", old: PUSH_ZERO_OID, next: "d".repeat(40) },
+      ],
+      walk,
+      { userPush: true, origin, log },
+    );
+    expect(await deliveries()).toHaveLength(0);
+    expect(lines.filter((line) => line.includes("not notified"))).toHaveLength(2);
   });
 });
 
@@ -1065,7 +1450,10 @@ describe("PushEvent.origin — the engine adapter threads the receive origin int
 
     // Landing push 1 (branch create): the engine derives event.origin from
     // THIS receive's URL (https://example.com, the pushThroughGate base) and
-    // the adapter threads it — yet the payload renders the APP_URL var.
+    // the adapter threads it — yet the payload renders the APP_URL var. The
+    // push row is SECOND on a branch create (create fires first); its
+    // compare_url is the bare AppURL (the walked oldest commit is the root
+    // and main is the adopted default).
     const initial = await buildChainPack(null, [
       { message: "base", files: [{ path: "README.md", content: "base\n" }], time: 1700000160 },
       { message: "tip b", files: [{ path: "README.md", content: "b\n" }], time: 1700000161 },
@@ -1075,7 +1463,7 @@ describe("PushEvent.origin — the engine adapter threads the receive origin int
         .status,
     ).toBe(200);
     let rows = await deliveries();
-    expect((JSON.parse(rows[0]!.payloadContent) as { compare_url: string }).compare_url).toBe(`${EXPECTED_ORIGIN}/`);
+    expect((JSON.parse(rows[1]!.payloadContent) as { compare_url: string }).compare_url).toBe(`${EXPECTED_ORIGIN}/`);
     await clearDeliveries();
 
     // Landing push 2 (branch update): the compare URL stays var-shaped.
@@ -1128,19 +1516,41 @@ describe("PushEvent.origin — the engine adapter threads the receive origin int
     expect(payload.head_commit?.url).toBe(`https://pushorigin-test.whc.workers.dev/alice/pushorigin/commit/${append.tips[0]}`);
   });
 
-  it("an event without origin keeps the downstream chain (varless adapter → upstream's default ROOT_URL)", async () => {
-    // event.origin absent (a request-less emitter's event shape) + varless
-    // bindings + no threaded origin → the chain's bottom leg.
-    const { row } = await seedRepoWithToken("pushnoorigin");
+  it("an event without origin keeps the downstream chain; an unwalkable branch-create tip skips both events (upstream's error arm)", async () => {
+    // The tip is a fake oid (the engine-native transitional population): the
+    // branch-create walk reads nothing, and upstream's pushNewBranch returns
+    // the error BEFORE its CreateRef (push.go:271-274) — neither event fires.
+    const { row, token } = await seedRepoWithToken("pushnoorigin");
     await seedHook({ repoId: row.id });
     await handleUserPushEvent(varlessBindings, {
       repo: "alice/pushnoorigin",
       updates: [{ ref: "refs/heads/main", old: PUSH_ZERO_OID, new: "e".repeat(40) }],
       commitTime: 0,
     });
+    expect(await deliveries()).toHaveLength(0);
+
+    // The origin chain itself pins on a resolvable tip through the varless
+    // adapter (no event.origin, no threaded origin): the tag-create push
+    // event renders the chain's bottom leg — upstream's default ROOT_URL —
+    // in its zero-based compare_url (deterministic: no default-branch read).
+    const initial = await buildChainPack(null, [
+      { message: "origin seed", files: [{ path: "README.md", content: "seed\n" }], time: 1700000163 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: initial.tips[0]!, ref: "refs/heads/main" }], initial.pack, token))
+        .status,
+    ).toBe(200);
+    await clearDeliveries();
+    await handleUserPushEvent(varlessBindings, {
+      repo: "alice/pushnoorigin",
+      updates: [{ ref: "refs/tags/v1", old: PUSH_ZERO_OID, new: initial.tips[0]! }],
+      commitTime: 0,
+    });
     const rows = await deliveries();
     expect(rows.map((r) => r.eventType)).toEqual(["push", "create"]);
-    expect((JSON.parse(rows[0]!.payloadContent) as { compare_url: string }).compare_url).toBe("http://localhost:3000/");
+    expect((JSON.parse(rows[0]!.payloadContent) as { compare_url: string }).compare_url).toBe(
+      `http://localhost:3000/alice/pushnoorigin/compare/${PUSH_ZERO_OID}...${initial.tips[0]}`,
+    );
   });
 });
 
@@ -1208,11 +1618,12 @@ describe("pull_request_sync — PR-head branch updates ride the push (notifier.g
     const initial = await buildChainPack(null, [
       { message: "seed", files: [{ path: "README.md", content: "seed\n" }], time: 1700000110 },
     ]);
-    // Creating a branch never syncs — even the PR's own head branch.
+    // Creating a branch never syncs — even the PR's own head branch (the
+    // user-push created arms: create first, then the walked push).
     expect(
       (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: initial.tips[0]!, ref: "refs/heads/feature" }], initial.pack, token)).status,
     ).toBe(200);
-    expect((await deliveries()).map((r) => r.eventType)).toEqual(["push", "create"]);
+    expect((await deliveries()).map((r) => r.eventType)).toEqual(["create", "push"]);
     await clearDeliveries();
 
     // Updating a branch with NO open PR head is just a push.
@@ -1222,7 +1633,7 @@ describe("pull_request_sync — PR-head branch updates ride the push (notifier.g
     expect(
       (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: other.tips[0]!, ref: "refs/heads/other" }], other.pack, token)).status,
     ).toBe(200);
-    expect((await deliveries()).map((r) => r.eventType)).toEqual(["push", "create"]);
+    expect((await deliveries()).map((r) => r.eventType)).toEqual(["create", "push"]);
     await clearDeliveries();
 
     // Updating the PR head branch syncs the OPEN PR only (the closed one is
@@ -1655,20 +2066,36 @@ describe("the PR-head sync arms — ref CAS, head_sha, re-check, comment (SPEC-0
 
 describe("pusher identity and degrades", () => {
   it("an explicit authenticated pusher overrides the owner in the payload identity", async () => {
-    const { row } = await seedRepoWithToken("pushident");
+    const { row, token } = await seedRepoWithToken("pushident");
     await seedHook({ repoId: row.id });
     const bob = await seedVerifiedUser({ username: "Bob" });
     const bobRow = await drizzle(env.DB).select().from(users).where(eq(users.id, bob.id)).get();
 
+    // Land REAL objects first (the branch-create arm walks the tip — a fake
+    // oid skips both events, the upstream error posture): the gate pushes
+    // Alice's chain, the replayed notification below walks the same cell.
+    const initial = await buildChainPack(null, [
+      { message: "identity seed", files: [{ path: "README.md", content: "seed\n" }], time: 1700000145 },
+    ]);
+    expect(
+      (await pushThroughGate(row, wiredEngine, [{ old: PUSH_ZERO_OID, oid: initial.tips[0]!, ref: "refs/heads/main" }], initial.pack, token))
+        .status,
+    ).toBe(200);
+    await clearDeliveries();
+
     await handleUserPushNotifications(
       env,
       row,
-      [{ ref: "refs/heads/main", old: PUSH_ZERO_OID, next: "a".repeat(40) }],
+      [{ ref: "refs/heads/main", old: PUSH_ZERO_OID, next: initial.tips[0]! }],
       bobRow, // the fan-out's pusher seam (the engine's PushEvent.pusherId resolves here)
     );
     const rows = await deliveries();
-    expect(rows).toHaveLength(2); // push + create
-    const payload = JSON.parse(rows[0]!.payloadContent) as { pusher: { login: string }; sender: { login: string }; repository: { owner: { login: string } } };
+    expect(rows.map((r) => r.eventType)).toEqual(["create", "push"]);
+    // The CREATE payload carries the sender only; the PUSH payload carries
+    // pusher AND sender — both Bob, overriding the owner.
+    const created = JSON.parse(rows[0]!.payloadContent) as { sender?: { login: string }; pusher?: { login: string } };
+    expect(created.sender?.login).toBe("Bob");
+    const payload = JSON.parse(rows[1]!.payloadContent) as { pusher: { login: string }; sender: { login: string }; repository: { owner: { login: string } } };
     expect(payload.pusher.login).toBe("Bob");
     expect(payload.sender.login).toBe("Bob");
     // The repository object stays the repo's real owner.
@@ -1735,8 +2162,9 @@ describe("the gate threads the authenticated pusher (the identity-gap closure)",
     await expectRef(fx.row.ownerNamespace, fx.row.slug, "refs/heads/main", initial.tips[0]!);
 
     let rows = await deliveries();
-    expect(rows.map((r) => r.eventType)).toEqual(["push", "create"]);
-    const created = JSON.parse(rows[0]!.payloadContent) as {
+    // The user-push branch-create arms: create first, then the walked push.
+    expect(rows.map((r) => r.eventType)).toEqual(["create", "push"]);
+    const created = JSON.parse(rows[1]!.payloadContent) as {
       pusher: { login: string };
       sender: { login: string };
       repository: { owner: { login: string } };
@@ -1807,7 +2235,7 @@ describe("the gate threads the authenticated pusher (the identity-gap closure)",
     await drainWaits();
 
     const rows = await deliveries();
-    expect(rows.map((r) => r.eventType)).toEqual(["push", "create"]);
+    expect(rows.map((r) => r.eventType)).toEqual(["create", "push"]);
     for (const row2 of rows) {
       const payload = JSON.parse(row2.payloadContent) as { pusher?: { login: string }; sender?: { login: string } };
       expect(payload.pusher?.login ?? payload.sender?.login).toBe("Alice");
@@ -1867,7 +2295,7 @@ describe("the gate threads the authenticated pusher (the identity-gap closure)",
     await expectRef(row.ownerNamespace, row.slug, "refs/heads/main", tips[0]!);
 
     const rows = await deliveries();
-    expect(rows.map((r) => r.eventType)).toEqual(["push", "create"]);
+    expect(rows.map((r) => r.eventType)).toEqual(["create", "push"]);
     for (const row2 of rows) {
       const payload = JSON.parse(row2.payloadContent) as { pusher?: { login: string }; sender?: { login: string } };
       expect(payload.pusher?.login ?? payload.sender?.login).toBe("Alice");
