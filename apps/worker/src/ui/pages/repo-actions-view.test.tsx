@@ -205,7 +205,7 @@ async function setStatus(
 // --- the parse/claim pin -------------------------------------------------------
 
 describe("the route claim pin (the runs subtree claims exactly its shapes)", () => {
-  it("parses the three view shapes + the cancel write", () => {
+  it("parses the three view shapes + the cancel/approve/rerun writes", () => {
     expect(parseUiRoute("/alice/demo/actions/runs/7")).toEqual({
       family: "actions-run-view",
       owner: "alice",
@@ -232,6 +232,33 @@ describe("the route claim pin (the runs subtree claims exactly its shapes)", () 
       repo: "demo",
       run: "7",
     });
+    // The C5 write trio + approve landed (W13, 0ad4356 — web.go:1597-1598
+    // run-level rerun pair, :1590 approve, :1588 job-level rerun).
+    expect(parseUiRoute("/alice/demo/actions/runs/7/rerun")).toEqual({
+      family: "actions-run-rerun",
+      owner: "alice",
+      repo: "demo",
+      run: "7",
+    });
+    expect(parseUiRoute("/alice/demo/actions/runs/7/rerun-failed")).toEqual({
+      family: "actions-run-rerun-failed",
+      owner: "alice",
+      repo: "demo",
+      run: "7",
+    });
+    expect(parseUiRoute("/alice/demo/actions/runs/7/approve")).toEqual({
+      family: "actions-run-approve",
+      owner: "alice",
+      repo: "demo",
+      run: "7",
+    });
+    expect(parseUiRoute("/alice/demo/actions/runs/7/jobs/9/rerun")).toEqual({
+      family: "actions-run-job-rerun",
+      owner: "alice",
+      repo: "demo",
+      run: "7",
+      job: "9",
+    });
     expect(parseUiRoute("/alice/demo/actions/runs/latest")).toEqual({
       family: "actions-run-view",
       owner: "alice",
@@ -243,11 +270,8 @@ describe("the route claim pin (the runs subtree claims exactly its shapes)", () 
   it("leaves the sibling tails and every deeper/junk shape unclaimed", () => {
     for (const path of [
       "/alice/demo/actions/runs", // the bare /runs has no upstream route
-      "/alice/demo/actions/runs/7/rerun", // C5's emitter-dependent tail
-      "/alice/demo/actions/runs/7/rerun-failed",
-      "/alice/demo/actions/runs/7/approve",
-      "/alice/demo/actions/runs/7/delete",
-      "/alice/demo/actions/runs/7/logs",
+      "/alice/demo/actions/runs/7/delete", // engine-owned (upstream m.Post too)
+      "/alice/demo/actions/runs/7/logs", // upstream has NO run-level logs route
       "/alice/demo/actions/runs/7/attempts/2/extra", // deeper than any shape
       "/alice/demo/actions/runs/7/jobs/9/extra",
       "/alice/demo/actions/run/1", // upstream's singular /run — unlanded

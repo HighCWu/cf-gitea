@@ -338,9 +338,12 @@ export function engineWalk(env: WebhookPushEnv, pair: RepositoryWithOwner): Webh
   const cell = env.REPO.getByName(engineName(pair.repo.ownerNamespace, pair.repo.slug));
   return {
     listCommitsRange: (base, head, limit) => cell.listCommitsRange(base, head, limit),
-    readDiff: (id) => cell.readDiff(id),
     readCommit: (id) => cell.readCommit(id),
-    listLog: (ref, opts) => cell.listLog(ref, opts),
+    // Scan reads: the walk's ancestry reads and per-commit diffs skip the
+    // engine's ObjCache write (the detection-horizon contract — see
+    // NOTICE.md 2026-11-02).
+    listLog: (ref, opts) => cell.listLog(ref, { ...opts, skipCacheWrite: true }),
+    readDiff: (id) => cell.readDiff(id, undefined, { skipCacheWrite: true }),
     countDivergence: (base, head) => cell.countDivergence(base, head),
   };
 }

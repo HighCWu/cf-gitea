@@ -355,13 +355,19 @@ export class PackStore {
    * inline immediately before it starts. SQLite-backed chunks never consult
    * the gate (no R2 GET, nothing to authorize).
    */
-  async readRaw(packKey: string, off: number, len: number, gate?: ReadGate): Promise<Uint8Array> {
+  async readRaw(
+    packKey: string,
+    off: number,
+    len: number,
+    gate?: ReadGate,
+    opts?: { skipCacheWrite?: boolean }
+  ): Promise<Uint8Array> {
     this.assertOpen();
     const first = Math.floor(off / PACK_CHUNK);
     const last = Math.floor((off + len - 1) / PACK_CHUNK);
     const out = new Uint8Array(len);
     for (let seq = first; seq <= last; seq++) {
-      const chunk = await this.chunk(packKey, seq, gate);
+      const chunk = await this.chunk(packKey, seq, gate, opts);
       const chunkStart = seq * PACK_CHUNK;
       const from = Math.max(off, chunkStart);
       const to = Math.min(off + len, chunkStart + chunk.length);
@@ -384,13 +390,20 @@ export class PackStore {
    * GET segment may start without the lease authorization it performs (§3.3).
    * A throwing gate aborts the read before any R2 bytes move (fail-stop).
    */
-  private async chunk(packKey: string, seq: number, gate?: ReadGate): Promise<Uint8Array> {
+  private async chunk(
+    packKey: string,
+    seq: number,
+    gate?: ReadGate,
+    opts?: { skipCacheWrite?: boolean }
+  ): Promise<Uint8Array> {
     const key = `${packKey}:${seq}`;
-    const hit = this.chunks.get(key);
-    if (hit) {
-      this.chunks.delete(key); // reinsert: most-recently-used goes last
-      this.chunks.set(key, hit);
-      return hit;
+    if (!opts?.skipCacheWrite) {
+      const hit = this.chunks.get(key);
+      if (hit) {
+        this.chunks.delete(key); // reinsert: most-recently-used goes last
+        this.chunks.set(key, hit);
+        return hit;
+      }
     }
     let chunk: Uint8Array;
     if (this.backendOf(packKey) === "r2") {
@@ -413,9 +426,11 @@ export class PackStore {
       if (!rows.length) throw new Error(`pack ${packKey}: missing chunk ${seq}`);
       chunk = new Uint8Array(rows[0].data);
     }
-    this.chunks.set(key, chunk);
-    while (this.chunks.size > RAW_CHUNK_CACHE) {
-      this.chunks.delete(this.chunks.keys().next().value as string);
+    if (!opts?.skipCacheWrite) {
+      this.chunks.set(key, chunk);
+      while (this.chunks.size > RAW_CHUNK_CACHE) {
+        this.chunks.delete(this.chunks.keys().next().value as string);
+      }
     }
     return chunk;
   }
@@ -431,7 +446,12 @@ export class PackStore {
    * `gate` rides every raw read (base entries and delta entries alike — a
    * cross-pack delta base is exactly the multi-pack union §4.1 gates).
    */
-  async getObject(oid: string, cache: ObjCache, gate?: ReadGate): Promise<ObjRec | null> {
+  async getObject(
+    oid: string,
+    cache: ObjCache,
+    gate?: ReadGate,
+    opts?: { skipCacheWrite?: boolean }
+  ): Promise<ObjRec | null> {
     const cached = cache.get(oid);
     if (cached) return cached;
     const first = this.lookup(oid);
@@ -448,7 +468,10 @@ export class PackStore {
       if (seen.has(cur.oid)) throw new Error(`cyclic delta chain at ${cur.oid}`);
       seen.add(cur.oid);
       if (!cur.baseOid) {
-        base = { type: cur.type, data: inflateAll(await this.readRaw(cur.packKey, cur.dataOff, cur.dataLen, gate)) };
+        base = {
+          type: cur.type,
+          data: inflateAll(await this.readRaw(cur.packKey, cur.dataOff, cur.dataLen, gate, opts)),
+        };
         break;
       }
       if (chain.length >= MAX_DELTA_DEPTH) throw new Error(`delta chain exceeds depth ${MAX_DELTA_DEPTH} at ${oid}`);
@@ -469,11 +492,11 @@ export class PackStore {
     let obj = base;
     for (let i = chain.length - 1; i >= 0; i--) {
       const d = chain[i];
-      const delta = inflateAll(await this.readRaw(d.packKey, d.dataOff, d.dataLen, gate));
+      const delta = inflateAll(await this.readRaw(d.packKey, d.dataOff, d.dataLen, gate, opts));
       obj = { type: base.type, data: applyDelta(obj.data, delta) };
-      cache.put(d.oid, obj);
+      if (!opts?.skipCacheWrite) cache.put(d.oid, obj);
     }
-    if (!chain.length) cache.put(oid, obj);
+    if (!chain.length && !opts?.skipCacheWrite) cache.put(oid, obj);
     return obj;
   }
 

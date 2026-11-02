@@ -1579,7 +1579,10 @@ export class RepoCell extends DurableObject<Env> {
     });
   }
 
-  async listLog(ref?: string, opts: { path?: string; ofs?: number; n?: number } = {}): Promise<LogResult> {
+  async listLog(
+    ref?: string,
+    opts: { path?: string; ofs?: number; n?: number; skipCacheWrite?: boolean } = {}
+  ): Promise<LogResult> {
     this.rpcBind();
     return this.withContentLease(async (gate) => {
       const rr = await this.resolveRef(ref, gate);
@@ -1587,7 +1590,8 @@ export class RepoCell extends DurableObject<Env> {
       const n = Math.min(Math.max(opts.n ?? LOG_PAGE, 1), 100);
       const ofs = Math.max(opts.ofs ?? 0, 0);
       const filter: LogFilter = opts.path ? { path: decodePath("/" + opts.path) } : {};
-      const { entries, more } = await this.walkLog(rr.oid, ofs, n, filter, gate);
+      const cacheOpts = opts.skipCacheWrite ? { skipCacheWrite: true } : undefined;
+      const { entries, more } = await this.walkLog(rr.oid, ofs, n, filter, gate, cacheOpts);
       return { commits: entries.map((e) => commitJson(e.oid, e.commit)), more };
     });
   }
@@ -1646,24 +1650,34 @@ export class RepoCell extends DurableObject<Env> {
   }
 
   /** Changes id2..id (default id2 = first parent of id, like the diff page). */
-  async readDiff(id?: string, id2?: string): Promise<DiffResult | null> {
+  async readDiff(
+    id?: string,
+    id2?: string,
+    opts?: { skipCacheWrite?: boolean }
+  ): Promise<DiffResult | null> {
     this.rpcBind();
     return this.withContentLease(async (gate) => {
       const rr = await this.resolveRef(id, gate);
       if (!rr) return null;
-      const head = await this.peelToCommit(rr.oid, gate);
+      const head = await this.peelToCommit(rr.oid, gate, opts);
       if (!head) return null;
       let oldOid: string | null = null;
       if (id2) {
         const rr2 = await this.resolveRef(id2, gate);
-        const c2 = rr2 ? await this.peelToCommit(rr2.oid, gate) : null;
+        const c2 = rr2 ? await this.peelToCommit(rr2.oid, gate, opts) : null;
         if (!c2) return null;
         oldOid = c2.oid;
       } else {
         oldOid = head.commit.parents[0] ?? null;
       }
-      const oldCommit = oldOid ? await this.loadCommit(oldOid, gate) : null;
-      const { files, truncated } = await this.computeDiff(oldCommit?.tree ?? null, head.commit.tree, gate);
+      // Every scan read below (parent load, tree flattening) skips the
+      // ObjCache write like the log walks: a diff is a scan over history,
+      // and caching its boundary commits and trees would extend the serve
+      // cache's hot set one level past every walked window — the invariants
+      // checker's documented detection horizon depends on scan-touched
+      // content reading through to R2 (NOTICE.md 2026-11-02 row).
+      const oldCommit = oldOid ? await this.loadCommit(oldOid, gate, opts) : null;
+      const { files, truncated } = await this.computeDiff(oldCommit?.tree ?? null, head.commit.tree, gate, opts);
       return {
         old: oldOid,
         new: head.oid,
@@ -2420,7 +2434,13 @@ export class RepoCell extends DurableObject<Env> {
       const meta = this.store.typeAndSize(oid);
       if (!meta) continue;
       if (meta.type === "blob") continue;
-      const obj = await this.store.get(oid, gate);
+      // Provability scan: the walk's object reads skip the ObjCache write —
+      // caching the whole reachable graph here would blind the pack-loss
+      // detection horizon (worker src/invariants/check.ts) to everything
+      // this walk touched (NOTICE.md 2026-11-02 row). The persistent
+      // reachable-set cache (loadReachable/saveReachable) is the intended
+      // memo for this walk.
+      const obj = await this.store.get(oid, gate, { skipCacheWrite: true });
       if (!obj) continue;
       if (obj.type === "commit") {
         const c = parseCommit(obj.data);
@@ -2457,15 +2477,19 @@ export class RepoCell extends DurableObject<Env> {
    * content, so a start oid that actually peeled through a tag has its final
    * commit oid cached — a hit skips every intermediate tag object read.
    */
-  private async peelToCommit(oid: string, gate?: ReadGate): Promise<{ oid: string; commit: Commit } | null> {
+  private async peelToCommit(
+    oid: string,
+    gate?: ReadGate,
+    opts?: { skipCacheWrite?: boolean }
+  ): Promise<{ oid: string; commit: Commit } | null> {
     const start = oid;
     const cached = this.store.getPeeled(start);
     if (cached !== null) {
-      const obj = await this.store.get(cached, gate);
+      const obj = await this.store.get(cached, gate, opts);
       return obj?.type === "commit" ? { oid: cached, commit: parseCommit(obj.data) } : null;
     }
     for (let i = 0; i < 10; i++) {
-      const obj = await this.store.get(oid, gate);
+      const obj = await this.store.get(oid, gate, opts);
       if (!obj) return null;
       if (obj.type === "commit") {
         if (oid !== start) this.store.setPeeled(start, oid);
@@ -2480,8 +2504,12 @@ export class RepoCell extends DurableObject<Env> {
     return null;
   }
 
-  private async loadCommit(oid: string, gate?: ReadGate): Promise<Commit | null> {
-    const obj = await this.store.get(oid, gate);
+  private async loadCommit(
+    oid: string,
+    gate?: ReadGate,
+    opts?: { skipCacheWrite?: boolean }
+  ): Promise<Commit | null> {
+    const obj = await this.store.get(oid, gate, opts);
     return obj?.type === "commit" ? parseCommit(obj.data) : null;
   }
 
@@ -2546,7 +2574,8 @@ export class RepoCell extends DurableObject<Env> {
     skip: number,
     limit: number,
     filter: LogFilter = {},
-    gate?: ReadGate
+    gate?: ReadGate,
+    opts?: { skipCacheWrite?: boolean }
   ): Promise<{ entries: LogEntry[]; more: boolean }> {
     const first = await this.peelToCommit(tip, gate);
     if (!first) return { entries: [], more: false };
@@ -2564,7 +2593,14 @@ export class RepoCell extends DurableObject<Env> {
       for (const p of cur.commit.parents) {
         if (seen.has(p)) continue;
         seen.add(p);
-        const c = await this.loadCommit(p, gate);
+        // When the caller opts in (the webhook scan walks), the walk's
+        // parent loads SKIP the ObjCache write: a log scan reads the FULL
+        // ancestry (the caller's limit slices the result), and caching
+        // scanned ancestry would extend the serve cache's hot set — the
+        // invariants checker's documented detection horizon depends on
+        // scan-touched content reading through to R2 (NOTICE.md
+        // 2026-11-02 row). The tip itself stays peel-cached as before.
+        const c = await this.loadCommit(p, gate, opts);
         if (c) frontier.push({ oid: p, commit: c });
       }
     }
@@ -2725,12 +2761,18 @@ export class RepoCell extends DurableObject<Env> {
     return null;
   }
 
-  private async flattenTree(treeOid: string, prefix: string, out: Map<string, { oid: string; mode: string }>, gate?: ReadGate): Promise<void> {
-    const obj = await this.store.get(treeOid, gate);
+  private async flattenTree(
+    treeOid: string,
+    prefix: string,
+    out: Map<string, { oid: string; mode: string }>,
+    gate?: ReadGate,
+    opts?: { skipCacheWrite?: boolean }
+  ): Promise<void> {
+    const obj = await this.store.get(treeOid, gate, opts);
     if (obj?.type !== "tree") return;
     for (const e of parseTree(obj.data)) {
       const p = prefix ? `${prefix}/${e.name}` : e.name;
-      if (isTreeMode(e.mode)) await this.flattenTree(e.oid, p, out, gate);
+      if (isTreeMode(e.mode)) await this.flattenTree(e.oid, p, out, gate, opts);
       // gitlink entries (mode 160000) participate in tree diffs with the
       // submodule's commit sha as their "oid" — the entry the submodule-diff
       // surfaces need (NOTICE-recorded adaptation; the vendored skip was an
@@ -2741,11 +2783,16 @@ export class RepoCell extends DurableObject<Env> {
   }
 
 
-  private async computeDiff(oldTree: string | null, newTree: string, gate?: ReadGate): Promise<{ files: FileDiff[]; truncated: boolean }> {
+  private async computeDiff(
+    oldTree: string | null,
+    newTree: string,
+    gate?: ReadGate,
+    opts?: { skipCacheWrite?: boolean }
+  ): Promise<{ files: FileDiff[]; truncated: boolean }> {
     const oldFiles = new Map<string, { oid: string; mode: string }>();
     const newFiles = new Map<string, { oid: string; mode: string }>();
-    if (oldTree) await this.flattenTree(oldTree, "", oldFiles, gate);
-    await this.flattenTree(newTree, "", newFiles, gate);
+    if (oldTree) await this.flattenTree(oldTree, "", oldFiles, gate, opts);
+    await this.flattenTree(newTree, "", newFiles, gate, opts);
     const paths = [...new Set([...oldFiles.keys(), ...newFiles.keys()])].sort();
     const files: FileDiff[] = [];
     let truncated = false;

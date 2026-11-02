@@ -526,6 +526,20 @@ describe("wiki webhook emissions (the upstream WikiPayload triple)", () => {
       slug: HOOKS,
       commits: [{ message: "seed: hooks repo", time: 1_760_000_000, files: [{ path: "README.md", content: "# seed\n" }] }],
     });
+    // The seed push's onPush waitUntil chain must DRAIN before the hooks
+    // below insert: W5's user-push created arm walks listLog BEFORE the
+    // create/push emissions (push.go:270-274's order), so the fan-out can
+    // land after seeding and legitimately match the push-only hook (the
+    // seed IS a real refs/heads/main create on this repo — the gate's
+    // red, "expected 0 got 1"). The completion barrier: repositories.sizeKb
+    // is written by the chain's LAST leg (handleUserPushEvent's order:
+    // notifications → stale reviews → licenses → syncRepoSizeFromStorage),
+    // so sizeKb > 0 proves the webhook leg already ran — against the then
+    // empty hook table, i.e. zero deliveries. Bounded poll in
+    // webhooks-push.test.ts's settleDeliveries shape; a timeout simply
+    // returns (the storage-persisted rollback case re-seeds the row without
+    // re-pushing — no chain, no stray emission) and the counting assertions
+    // below stay exact either way.
     const repoRow = await drizzle(env.DB)
       .select({ id: repositories.id })
       .from(repositories)
@@ -533,6 +547,15 @@ describe("wiki webhook emissions (the upstream WikiPayload triple)", () => {
       .get();
     if (repoRow === undefined) throw new Error("hooks repo row missing");
     REPO_ID = repoRow.id;
+    for (let round = 0; round < 100; round += 1) {
+      const row = await drizzle(env.DB)
+        .select({ sizeKb: repositories.sizeKb })
+        .from(repositories)
+        .where(eq(repositories.id, REPO_ID))
+        .get();
+      if ((row?.sizeKb ?? 0) > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     wikiHookId = await seedHook(REPO_ID, { choose_events: true, branch_filter: "*", events: { wiki: true } });
     pushHookId = await seedHook(REPO_ID, { choose_events: true, branch_filter: "*", events: { push: true } });
     everythingHookId = await seedHook(REPO_ID, { send_everything: true, branch_filter: "*" });
@@ -666,6 +689,8 @@ describe("wiki webhook emissions (the upstream WikiPayload triple)", () => {
 
     // --- subscription scoping: the push-only hook never hears wiki;
     // send_everything hears all five
+    const pushDbg = await deliveriesFor(pushHookId);
+    console.error("DEBUG-push-deliveries", JSON.stringify(pushDbg.map((d) => ({ id: d?.id, repoId: d?.repoId, et: d?.eventType, createdAt: d?.createdAt, payload: d?.payloadContent }))));
     expect(await deliveriesFor(pushHookId)).toHaveLength(0);
     expect(await deliveriesFor(everythingHookId)).toHaveLength(5);
     const everyFirst = await payloadOf(everythingHookId, 0);

@@ -201,10 +201,21 @@ export class GitStore {
    * Resolve an object: loose storage first, then packs. `gate` (the serve
    * paths' per-segment read authorization, SPEC-0011 §4.1) reaches pack reads
    * only — loose objects live in SQLite, where there is no R2 GET to gate.
+   * `opts.skipCacheWrite` serves the object WITHOUT inserting it into the
+   * lifetime ObjCache — for bulk scans (the log walks) whose ancestry reads
+   * must not extend the serve cache's hot set (the invariants checker's
+   * documented detection horizon reads through the cache; caching scanned
+   * ancestry there blinds pack-loss detection to walked content —
+   * NOTICE.md 2026-11-02 row). Existing entries still HIT: the option
+   * suppresses the WRITE, never the READ.
    */
-  async get(oid: string, gate?: ReadGate): Promise<{ type: ObjType; data: Uint8Array } | null> {
+  async get(
+    oid: string,
+    gate?: ReadGate,
+    opts?: { skipCacheWrite?: boolean }
+  ): Promise<{ type: ObjType; data: Uint8Array } | null> {
     this.assertOpen();
-    return this.getLoose(oid) ?? (await this.packs.getObject(oid, this.cache, gate));
+    return this.getLoose(oid) ?? (await this.packs.getObject(oid, this.cache, gate, opts));
   }
 
   /**

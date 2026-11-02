@@ -24,7 +24,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { createRepoLabel, findRepoLabelByName } from "../../api/services/labels";
 import { fireTestDelivery } from "../../api/services/hooks";
-import { issues, milestones, repositories, users, webhookDeliveries, webhooks } from "../../db/schema";
+import { issueLabels, issues, milestones, repositories, users, webhookDeliveries, webhooks } from "../../db/schema";
 import { uiRouter } from "../index";
 import { IssuesService } from "../../issues/service";
 import { ensureSeededRepo, type SeedCommit } from "../testing/seed-repo";
@@ -312,16 +312,26 @@ describe("new issue POST (/issues/new)", () => {
     expect(count).toHaveLength(3); // the two seeds + the happy-path create — no new row
   });
 
-  it("surfaces the service's IssueError message for a foreign label id (no partial write)", async () => {
+  it("silently drops a foreign label id and still 303s onto the created detail page (W10, fef1a40 — issue_update.go:425-428; no partial write)", async () => {
     const fixture = await ensureWave4Fixtures();
     const res = await fetchUi(
       "/alice/wave4/issues/new",
       withCookie(formPost({ title: "bad label", label_ids: "999999" }), fixture.ownerCookie),
     );
-    expect(res.status).toBe(200);
-    const html = await res.text();
-    expect(html).toContain("label does not exist [label_id: 999999, repo_id:");
-    expect(html).toContain('value="bad label"'); // the title keeps the submission
+    // W10 replaced the validate-throws with resolveCreationRefs' silent drop:
+    // the create SUCCEEDS without the foreign label (upstream-faithful).
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/alice/wave4/issues/4");
+
+    // No partial write: the issue is fully formed AND the foreign label
+    // never attached — the created row carries zero issue_labels edges.
+    const html = await (await fetchUi("/alice/wave4/issues/4")).text();
+    expect(html).toContain("<h1>bad label <span class=\"index\">#4</span></h1>");
+    expect(html).not.toContain("labels=999999");
+    const created = await drizzle(env.DB).select().from(issues).where(eq(issues.title, "bad label")).get();
+    expect(created).toBeDefined();
+    const attach = await drizzle(env.DB).select().from(issueLabels).where(eq(issueLabels.issueId, created!.id)).all();
+    expect(attach).toHaveLength(0);
   });
 });
 

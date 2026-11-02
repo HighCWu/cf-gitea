@@ -73,16 +73,18 @@ beforeEach(async () => {
 // --- the loader (the landed cron registry) -------------------------------------
 
 describe("loadAdminDashboardData (the landed registry, the monitor loader's rows)", () => {
-  it("answers the FIVE runnable maintenance rows with computed next fires (the census absorption 067449a grew the set — the pinned spec shapes per arm)", async () => {
+  it("answers the SIX runnable maintenance rows with computed next fires (the census absorption 067449a grew the set, W8's 2b15f6f added cleanup_hook_task_table — the pinned spec shapes per arm)", async () => {
     const { maintenance } = await loadAdminDashboardData(NOW);
     // The runnable registry (CRON_RUN_BODIES): update_mirrors, update_push_mirrors,
-    // demo_sweep, delete_old_audit_events, cleanup_packages — the census order.
+    // demo_sweep, delete_old_audit_events, cleanup_packages,
+    // cleanup_hook_task_table — the census order.
     expect(maintenance.map((row) => row.name)).toEqual([
       "update_mirrors",
       "update_push_mirrors",
       "demo_sweep",
       "delete_old_audit_events",
       "cleanup_packages",
+      "cleanup_hook_task_table",
     ]);
     expect(maintenance[0]!.spec).toBe("*/10 * * * *");
     expect(maintenance[0]!.next).toEqual(new Date("2026-01-01T00:10:00Z")); // the next UTC step
@@ -90,12 +92,13 @@ describe("loadAdminDashboardData (the landed registry, the monitor loader's rows
     expect(maintenance[1]!.name).toBe("update_push_mirrors");
     expect(maintenance[1]!.spec).toBe("*/10 * * * *");
     expect(maintenance[1]!.next).toEqual(new Date("2026-01-01T00:10:00Z"));
-    // The three hourly arms (0 * * * * — the top of the next hour).
+    // The four hourly arms (0 * * * * — the top of the next hour).
     const hourly = maintenance.slice(2);
     expect(hourly.map((row) => row.name)).toEqual([
       "demo_sweep",
       "delete_old_audit_events",
       "cleanup_packages",
+      "cleanup_hook_task_table",
     ]);
     for (const row of hourly) {
       expect(row.spec).toBe("0 * * * *");
