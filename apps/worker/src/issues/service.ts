@@ -1311,11 +1311,23 @@ export class IssuesService {
   // ---------------------------------------------------------------------------
 
   /**
-   * Create a release. Duplicate `(repo_id, tag_name)` →
+   * Create a release. Duplicate `(repo_id, lower_tag_name)` →
    * `ReleaseAlreadyExistError` (409, §4.11); a pre-existing tag-only record
    * (`is_tag`) is converted into a release instead (§2.3). Drafts get
    * `published_unix = 0` — the `release` webhook fires only at publish time
    * (§2.3; the emit call itself is the route's job).
+   *
+   * Both the duplicate probe AND the tag-record coupling key on the
+   * LOWERED tag name (ledger ⑭-R3's issues/service hunk): upstream
+   * `IsReleaseExist` (models/repo/release.go:160-166 — `LowerTagName:
+   * strings.ToLower(tagName)`) and `GetRelease` (:219-227 —
+   * `lower_tag_name = strings.ToLower(tagName)`) are case-INSENSITIVE, so
+   * creating `V1.0` over an existing `v1.0` release 409s and over an
+   * existing `v1.0` TAG RECORD converts that row. NOTE the D1 unique index
+   * stays `(repo_id, tag_name)` (releases_repo_tag_uq) — the race-catch
+   * below only covers the exact-case insert race; a case-variant concurrent
+   * create slips the index (upstream's own unique is on lower_tag_name —
+   * closing that gap needs a migration, out of this unit's grant).
    */
   async createRelease(input: CreateReleaseInput): Promise<ReleaseRow> {
     const now = input.now ?? new Date();
@@ -1326,7 +1338,7 @@ export class IssuesService {
     const existing = await this.db
       .select()
       .from(releases)
-      .where(and(eq(releases.repoId, input.repoId), eq(releases.tagName, tagName)))
+      .where(and(eq(releases.repoId, input.repoId), eq(releases.lowerTagName, lowerTagName)))
       .get();
     if (existing !== undefined) {
       if (!existing.isTag) throw new ReleaseAlreadyExistError(tagName);

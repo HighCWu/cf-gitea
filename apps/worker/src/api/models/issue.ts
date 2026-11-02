@@ -8,9 +8,11 @@ import { z } from "@hono/zod-openapi";
  * CreateIssueCommentOption, EditIssueCommentOption, IssueLabelsOption}),
  * field-for-field. The contract declares no `required` fields on the
  * response models; the schemas mirror that literally. The `User`,
- * `Label`, and `Milestone` blocks are inlined (byte-identical to
- * models/user.ts / models/label.ts / models/milestone.ts) so the model file
- * mirrors the contract's own embedding.
+ * `Label`, `Milestone`, and `Project` blocks are inlined (byte-identical to
+ * models/user.ts / models/label.ts / models/milestone.ts / models/project.ts)
+ * so the model file mirrors the contract's own embedding (a `Project` import
+ * here would cycle: models/project.ts already imports the inlined
+ * `embeddedUserSchema` from this file).
  *
  * Go-nullability notes baked into the TS types (upstream marshals absent Go
  * values as null, never omits them — these structs carry no `omitempty`):
@@ -20,7 +22,13 @@ import { z } from "@hono/zod-openapi";
  * `[]` (services/convert/issue.go toIssue + convert/attachment.go).
  */
 
-/** `#/definitions/Attachment` — no assets exist yet; always rendered `[]`. */
+/**
+ * `#/definitions/Attachment` — the issue/comment attachment render (ledger
+ * ⑬-#6 landed: both attachment stores are live, and the issue/comment
+ * converters render the real rows through services/issues.ts toAttachmentApi;
+ * an item with no attachments still renders `[]` — the upstream
+ * SliceNilAsEmpty/make(…,0) empties).
+ */
 export const attachmentSchema = z.object({
   browser_download_url: z.string().optional(),
   created_at: z.string().optional().openapi({ format: "date-time" }),
@@ -130,6 +138,38 @@ export const issueMilestoneSchema = z.object({
   updated_at: z.string().nullable().optional().openapi({ format: "date-time" }),
 });
 
+/**
+ * `#/definitions/Project` — same wire shape as the project routes'
+ * projectSchema (src/api/models/project.ts); re-declared so the Issue model
+ * is self-contained (and acyclic — project.ts imports this file's embedded
+ * user). Byte-identical field-for-field, so the two cannot drift on the
+ * wire (the Issue.projects render is the same toApiProject converter the
+ * /projects routes answer with).
+ */
+export const issueProjectSchema = z.object({
+  id: z.number().int().openapi({ format: "int64" }),
+  title: z.string(),
+  description: z.string(),
+  owner_id: z.number().int().openapi({ format: "int64" }),
+  repo_id: z.number().int().openapi({ format: "int64" }),
+  creator: embeddedUserSchema.optional(),
+  creator_id: z.number().int().openapi({ format: "int64", description: "Deprecated: use Creator instead" }),
+  state: z.enum(["open", "closed"]),
+  is_closed: z.boolean().openapi({ description: "Deprecated: use State instead" }),
+  template_type: z.string().openapi({ description: 'Template type: "none", "basic_kanban" or "bug_triage"' }),
+  card_type: z.string().openapi({ description: 'Card type: "text_only" or "images_and_text"' }),
+  type: z.string().openapi({ description: 'Project type: "individual", "repository" or "organization"' }),
+  num_open_issues: z.number().int().openapi({ format: "int64" }),
+  num_closed_issues: z.number().int().openapi({ format: "int64" }),
+  num_issues: z.number().int().openapi({ format: "int64" }),
+  created_at: z.string().openapi({ format: "date-time" }),
+  updated_at: z.string().openapi({ format: "date-time" }).nullable().optional(),
+  closed_at: z.string().openapi({ format: "date-time" }).nullable().optional(),
+  html_url: z.string().optional(),
+});
+
+export type IssueProject = z.infer<typeof issueProjectSchema>;
+
 /** `#/definitions/Issue` — upstream `api.Issue` (modules/structs/issue.go). */
 export const issueSchema = z.object({
   assets: z.array(attachmentSchema).optional(),
@@ -148,7 +188,7 @@ export const issueSchema = z.object({
   milestone: issueMilestoneSchema.nullable().optional(),
   number: z.number().int().optional().openapi({ format: "int64" }),
   pin_order: z.number().int().optional().openapi({ format: "int64" }),
-  projects: z.array(z.unknown()).nullable().optional(),
+  projects: z.array(issueProjectSchema).nullable().optional(),
   pull_request: pullRequestMetaSchema.nullable().optional(),
   ref: z.string().optional(),
   repository: repositoryMetaSchema.nullable().optional(),
@@ -237,7 +277,13 @@ export const timelineCommentListSchema = z.array(timelineCommentSchema);
 
 /**
  * `#/definitions/CreateIssueOption` — `title` is the only required field
- * (bind failure → the declared 422); `labels` are label ids.
+ * (bind failure → the declared 422); `labels` are label ids; `projects` are
+ * project ids (structs/issue.go:104-105), the writer-gated attach arm — the
+ * handler nils the field for non-writers before NewIssue consumes it
+ * (routers/api/v1/repo/issue.go:621-624). The Required
+ * rule (structs/issue.go:92 `binding:"Required"`) fires on the ZERO value,
+ * so an empty-string title fails the bind with 422 exactly like an absent
+ * one (api.go:838-845) — the `.min(1)` is that rule (ledger ⑬-#14).
  */
 export const createIssueOptionSchema = z.object({
   assignee: z.string().optional().openapi({ description: "deprecated (use assignees)" }),
@@ -250,9 +296,9 @@ export const createIssueOptionSchema = z.object({
     .openapi({ format: "date-time", description: "only the date is taken into account, time of day ignored" }),
   labels: z.array(z.number().int()).optional().openapi({ description: "list of label ids" }),
   milestone: z.number().int().optional().openapi({ format: "int64", description: "milestone id" }),
-  projects: z.array(z.number().int()).optional(),
+  projects: z.array(z.number().int()).optional().openapi({ description: "list of project ids" }),
   ref: z.string().optional(),
-  title: z.string().openapi({ description: "title of the issue" }),
+  title: z.string().min(1).openapi({ description: "title of the issue" }),
 });
 
 export type CreateIssueOption = z.infer<typeof createIssueOptionSchema>;
@@ -263,6 +309,9 @@ export type CreateIssueOption = z.infer<typeof createIssueOptionSchema>;
  * so Go-style payloads never fail bind; the route treats them alike).
  * `unset_due_date: true` removes the deadline; `state` ∈ open|closed;
  * `content_version` enables the optimistic body-edit lock (409 on mismatch).
+ * `projects` (structs/issue.go:118 — "list of project ids to set (replaces
+ * existing projects)") is the writer-gated diff arm: an empty array clears
+ * every membership (issue.go:827-828).
  */
 export const editIssueOptionSchema = z.object({
   assignee: z.string().nullable().optional().openapi({ description: "deprecated (use assignees)" }),

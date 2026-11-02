@@ -366,16 +366,39 @@ describe("releases (§2.3, §4.11)", () => {
       caught = error;
     }
     expect(caught).toBeInstanceOf(ReleaseAlreadyExistError);
-    expect((caught as ReleaseAlreadyExistError).message).toBe("release tag already exist [tag_name: v1.0.0]");
+    // The wire text is the R7 flip (routers/api/v1/repo/release.go:289-293 —
+    // "Release is has no Tag", sic), folded into errors.ts by the releases
+    // wave; the model-error suffix is gone with it.
+    expect((caught as ReleaseAlreadyExistError).message).toBe("Release is has no Tag");
     expect((caught as ReleaseAlreadyExistError).status).toBe(409);
 
-    // The same tag on a different repo is fine; case-insensitive twin rows
-    // are distinct (lower_tag_name only backs lookup).
+    // The same tag on a different repo is fine.
     const otherRepo = await seedRepo();
     await expect(svc.createRelease({ repoId: otherRepo, publisherId: 1, tagName: "v1.0.0" })).resolves.toMatchObject({
       tagName: "v1.0.0",
       lowerTagName: "v1.0.0",
     });
+  });
+
+  it("duplicate + tag-coupling checks key on the LOWERED tag name (⑭-R3: IsReleaseExist release.go:160-166 / GetRelease :219-227)", async () => {
+    const repoId = await seedRepo();
+    const svc = service();
+    await svc.createRelease({ repoId, publisherId: 1, tagName: "V1.0", title: "upper" });
+
+    // A case-variant duplicate of an existing RELEASE 409s (upstream
+    // IsReleaseExist probes lower_tag_name).
+    await expect(svc.createRelease({ repoId, publisherId: 1, tagName: "v1.0" })).rejects.toBeInstanceOf(ReleaseAlreadyExistError);
+
+    // A case-variant create over an existing TAG RECORD converts that row
+    // (upstream GetRelease's lower_tag_name lookup), keeping the row's own
+    // tag_name/lower_tag_name verbatim.
+    await svc.createRelease({ repoId, publisherId: 1, tagName: "RC1", isTag: true, title: "" });
+    const converted = await svc.createRelease({ repoId, publisherId: 1, tagName: "rc1", title: "coupled" });
+    expect(converted.isTag).toBe(false);
+    expect(converted.tagName).toBe("RC1");
+    expect(converted.lowerTagName).toBe("rc1");
+    const rows = await db().select().from(releases).where(eq(releases.repoId, repoId)).all();
+    expect(rows).toHaveLength(2);
   });
 
   it("drafts store published_unix = 0; published releases get the publish time", async () => {

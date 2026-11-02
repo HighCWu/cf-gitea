@@ -16,10 +16,11 @@
 import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { comments, reactions, repositories, userBlocking, users } from "../../db/schema";
+import { comments, reactions, repositories, userBlocking, users, webhookDeliveries, webhooks } from "../../db/schema";
 import { IssuesService } from "../../issues/service";
 import { CommentType } from "../../issues/comment-types";
 import { createOptionalTokenAuthMiddleware, createTokenAuthMiddleware, type AuthResolver } from "../auth";
@@ -232,5 +233,171 @@ describe("POST …/reactions: the CreateIssueReaction/CreateCommentReaction bloc
     });
     expect(res.status).toBe(204);
     expect(await drizzle(env.DB).select().from(reactions).all()).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The deprecated nested comment pair's webhook emissions (ledger ⑬-#10) and
+// the lock route's reason ride (ledger ⑬-#12's W15 follow-up). Upstream's
+// deprecated PATCH/DELETE routes call the SAME editIssueComment/
+// deleteIssueComment functions as the canonical global pair (routers/api/v1/
+// repo/issue_comment.go:554-584/:651-670), so the edited/deleted webhooks
+// fire identically; the lock reason rides the Lock system comment's content
+// (models/issues/issue_lock.go:44-53 — CreateCommentOptions{Content:
+// opts.Reason}).
+// ---------------------------------------------------------------------------
+
+describe("the deprecated nested comment pair webhooks + the lock reason ride", () => {
+  /** recluse's repo with recluse's issue #1 and a comment by `speaker`. */
+  async function seedNestedFixture(): Promise<{ ownerId: number; speakerId: number; issueId: number; issueIndex: number; commentId: number }> {
+    const owner = await seedUser("recluse");
+    const speaker = await seedUser("speaker");
+    await drizzle(env.DB).insert(repositories).values({
+      id: "7404",
+      storageKey: "r_7404",
+      ownerNamespace: "recluse",
+      ownerId: owner.id,
+      slug: "repo",
+      visibility: "public",
+      refsVersion: 1,
+      backend: "self-hosted",
+      createdAt: new Date("2026-02-03T04:05:06Z"),
+    });
+    const issue = await new IssuesService(env.DB).createIssue({ repoId: "7404", title: "nested pair", posterId: owner.id });
+    const comment = await drizzle(env.DB)
+      .insert(comments)
+      .values({
+        type: CommentType.Comment,
+        posterId: speaker.id,
+        issueId: issue.id,
+        content: "pre-edit",
+        createdAt: new Date("2026-02-04T00:00:00Z"),
+        updatedAt: new Date("2026-02-04T00:00:00Z"),
+      })
+      .returning({ id: comments.id })
+      .all();
+    return { ownerId: owner.id, speakerId: speaker.id, issueId: Number(issue.id), issueIndex: issue.index, commentId: comment[0]!.id };
+  }
+
+  async function seedHook(): Promise<number> {
+    const rows = await drizzle(env.DB)
+      .insert(webhooks)
+      .values({
+        repoId: "7404",
+        url: "https://hooks.invalid/nested",
+        events: JSON.stringify({ choose_events: true, branch_filter: "*", events: { issue_comment: true } }),
+        isActive: true,
+        type: "gitea",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .returning({ id: webhooks.id })
+      .all();
+    return rows[0]!.id;
+  }
+
+  async function deliveriesFor(hookId: number): Promise<Array<{ eventType: string; payloadContent: string }>> {
+    return drizzle(env.DB)
+      .select({ eventType: webhookDeliveries.eventType, payloadContent: webhookDeliveries.payloadContent })
+      .from(webhookDeliveries)
+      .where(eq(webhookDeliveries.hookId, hookId))
+      .all();
+  }
+
+  beforeEach(async () => {
+    // The shared beforeEach misses the webhook family (this describe's
+    // emissions land delivery rows inline under app.request).
+    await env.DB.prepare("DELETE FROM webhook_deliveries").run();
+    await env.DB.prepare("DELETE FROM webhooks").run();
+    await env.DB.prepare("DELETE FROM issue_labels").run();
+    await env.DB.prepare("DELETE FROM milestones").run();
+    await env.DB.prepare("DELETE FROM labels").run();
+    await env.DB.prepare("DELETE FROM repo_settings").run();
+  });
+
+  it("PATCH nested emits the edited webhook with changes.body.from (the global pair's exact shape)", async () => {
+    const f = await seedNestedFixture();
+    const hookId = await seedHook();
+
+    // The no-op skip: an unchanged body emits nothing (upstream's
+    // `form.Body != comment.Content` gate, issue_comment.go:569).
+    const noop = await makeApp()(`/repos/recluse/repo/issues/${f.issueIndex}/comments/${f.commentId}`, {
+      method: "PATCH",
+      headers: { Authorization: `token u${f.speakerId}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ body: "pre-edit" }),
+    });
+    expect(noop.status).toBe(200);
+    expect(await deliveriesFor(hookId)).toHaveLength(0);
+
+    const edited = await makeApp()(`/repos/recluse/repo/issues/${f.issueIndex}/comments/${f.commentId}`, {
+      method: "PATCH",
+      headers: { Authorization: `token u${f.speakerId}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ body: "post-edit" }),
+    });
+    expect(edited.status).toBe(200);
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]?.eventType).toBe("issue_comment");
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as {
+      action: string;
+      comment: { body: string };
+      changes: { body: { from: string } };
+    };
+    expect(payload.action).toBe("edited");
+    expect(payload.comment.body).toBe("post-edit");
+    expect(payload.changes).toEqual({ body: { from: "pre-edit" } });
+  });
+
+  it("DELETE nested emits the deleted webhook with no changes block", async () => {
+    const f = await seedNestedFixture();
+    const hookId = await seedHook();
+
+    const res = await makeApp()(`/repos/recluse/repo/issues/${f.issueIndex}/comments/${f.commentId}`, {
+      method: "DELETE",
+      headers: { Authorization: `token u${f.speakerId}` },
+    });
+    expect(res.status).toBe(204);
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]?.eventType).toBe("issue_comment");
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as { action: string; changes?: unknown };
+    expect(payload.action).toBe("deleted");
+    expect(payload.changes).toBeUndefined();
+  });
+
+  it("PUT …/lock stores the body's lock_reason in the Lock(23) comment's content (issue_lock.go:44-53)", async () => {
+    const f = await seedNestedFixture();
+
+    const res = await makeApp()(`/repos/recluse/repo/issues/${f.issueIndex}/lock`, {
+      method: "PUT",
+      headers: { Authorization: `token u${f.ownerId}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ lock_reason: "off-topic" }),
+    });
+    expect(res.status).toBe(204);
+    const rows = await drizzle(env.DB)
+      .select({ content: comments.content })
+      .from(comments)
+      .where(and(eq(comments.issueId, f.issueId), eq(comments.type, CommentType.Lock)))
+      .all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.content).toBe("off-topic");
+  });
+
+  it("PUT …/lock without a body stores the empty reason (the zero-value IssueLockOptions.Reason)", async () => {
+    const f = await seedNestedFixture();
+
+    const res = await makeApp()(`/repos/recluse/repo/issues/${f.issueIndex}/lock`, {
+      method: "PUT",
+      headers: { Authorization: `token u${f.ownerId}`, "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(204);
+    const rows = await drizzle(env.DB)
+      .select({ content: comments.content })
+      .from(comments)
+      .where(and(eq(comments.issueId, f.issueId), eq(comments.type, CommentType.Lock)))
+      .all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.content).toBe("");
   });
 });

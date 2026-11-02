@@ -33,6 +33,7 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { assertNotBlockedForIssueContent, assertNotBlockedForIssueCreate } from "../services/blocks";
 import { toApiLabel } from "../services/labels";
 import {
+  assignOrRemoveIssueProjects,
   changeIssueBody,
   changeIssueDeadline,
   changeIssueMilestone,
@@ -396,7 +397,14 @@ function pullRequestEventPayload(
  * issue title/body emissions' convention (the Go struct's non-omitempty
  * `added_labels`/`removed_labels` nil-slice nulls are not copied).
  */
-async function emitCommentEvent(
+/**
+ * Exported for the DEPRECATED nested comment pair (routes/issue-t2.ts — the
+ * ledger ⑬-#10 webhook arm): upstream's deprecated routes share the same
+ * editIssueComment/deleteIssueComment service functions as the canonical
+ * global pair (routers/api/v1/repo/issue_comment.go:554-584/:651-670), so
+ * the edited/deleted webhooks fire identically from both surfaces.
+ */
+export async function emitCommentEvent(
   c: Context<ApiEnv>,
   found: RepositoryWithOwner,
   issue: IssueRow,
@@ -1242,6 +1250,24 @@ export function registerIssueRoutes(
           .returning();
         issue = updated[0] ?? issue;
       }
+      // The writer-gated projects arm (issue.go:621-624, ledger ⑯-P3-4): the
+      // non-writer's form.Projects was already cleared with the labels (the
+      // writer gate above leaves nothing to clear — this route reads
+      // form.projects only here), the writer's list attaches through the
+      // upstream IssueAssignOrRemoveProject diff writer. Upstream runs the
+      // attach INSIDE NewIssue's tx (a bad project id rolls the whole create
+      // back); the landed create is not one transaction — a projects failure
+      // here 400s AFTER the issue row committed (the same committed-prefix
+      // posture the PATCH assignee arm documents), and the request never
+      // reaches the opened webhook below.
+      if (canWrite && form.projects !== undefined && form.projects.length > 0) {
+        try {
+          await assignOrRemoveIssueProjects(c.env.DB, found, issue, form.projects, requester.id ?? 0, new Date());
+        } catch (error) {
+          asApiError(error);
+          throw error;
+        }
+      }
       // The opened webhook fires BEFORE the close attempt — upstream's
       // opened notification rides INSIDE issue_service.NewIssue
       // (services/issue/issue.go), so the upstream NewIssue → CloseIssue
@@ -1264,6 +1290,21 @@ export function registerIssueRoutes(
           event.sender,
         ),
       });
+      // NewIssue's create-time enrichment notifications (services/issue/
+      // issue.go:74-79, ledger ⑬-#17): a create that CARRIED labels/milestone
+      // notifies IssueChangeLabels (when the attached set is non-empty) and
+      // IssueChangeMilestone (when a milestone is set) right after the opened
+      // notification — the SAME emitters the PATCH label/milestone arms use
+      // (the IsPull discriminant inside each emitter picks the event type).
+      // The reads decide on the ATTACHED state, upstream's `len(issue.Labels)
+      // > 0` / `issue.Milestone != nil` — silently-dropped invalid ids and a
+      // silently-dropped invalid milestone never fire.
+      if ((await issueLabelRows(c.env.DB, issue.id)).length > 0) {
+        await emitLabelEvent(c, found, issue, "label_updated");
+      }
+      if (issue.milestoneId !== null) {
+        await emitMilestoneEvent(c, found, issue, "milestoned");
+      }
       if (form.closed === true) {
         try {
           issue = await service.closeIssue(issue.id, { actorId: requester.id });
@@ -1529,7 +1570,16 @@ export function registerIssueRoutes(
     }
 
     const body = patchField(form.body);
-    if (body !== undefined && body !== (issue.content ?? "")) {
+    if (body !== undefined) {
+      // Upstream runs ChangeContent on EVERY PRESENT body key — there is NO
+      // content-equality guard at the route (issue.go:735-750) and none in
+      // ChangeContent (services/issue/content.go:16-33) nor in
+      // ChangeIssueContent (issue_update.go:316-350): a no-op body PATCH
+      // still advances the state — content_version bumps, the lazy history
+      // back-fill + the edited revision land, AddCrossReferences re-runs and
+      // IssueChangeContent fires the edited webhook with the unchanged
+      // `changes.body.from` (ledger ⑬-#15). Only the ABSENT key (and the
+      // JSON-null nil pointer, patchField above) skips.
       // ChangeContent's blocked arm (services/issue/content.go:21-23) —
       // the same doer-blocked-by-poster-or-owner / repo-admin-bypass rule
       // as the title arm above.
@@ -1705,6 +1755,20 @@ export function registerIssueRoutes(
         // so the default wire render.
         payload: issueEventPayload("reopened", await toApiIssue(c.env.DB, viewer, found, issue), issue.index, event.repository, event.sender),
       });
+    }
+
+    // Projects (issue.go:825-835, the PATCH arm's LAST field, ledger ⑯-P3-4):
+    // writer-gated on the SAME resolved canWrite; a PRESENT list replaces the
+    // membership set the GitHub-way (form.Projects is *[]int64 — JSON null is
+    // the nil pointer and skips, an EMPTY array clears every membership). The
+    // diff rides the upstream IssueAssignOrRemoveProject writer (missing
+    // project id / inaccessible project answer the 400 family — issue.go:
+    // 829-833's ErrPermissionDenied/ErrNotExist mapping). No webhook fires:
+    // upstream's IssueChangeProjects notification has no webhook or mail
+    // implementation — its only consumer is the projects workflow notifier
+    // (services/projects/workflow_notifier.go:32).
+    if (canWrite && form.projects !== undefined && form.projects !== null) {
+      await assignOrRemoveIssueProjects(c.env.DB, found, issue, form.projects, actorId, now);
     }
 
     return c.json(await toApiIssue(c.env.DB, viewer, found, issue), 201);
@@ -1949,12 +2013,19 @@ export function registerIssueRoutes(
     // shape is unchanged, and the per-row fallback stays intact for
     // omitted-preload callers.
     const timelineContext = await prefetchTimelineContext(c.env.DB, rows);
-    const rendered: TimelineComment[] = await Promise.all(
+    const converted = await Promise.all(
       rows
         .filter((comment) => comment.type !== CommentType.Code) // upstream drops code comments
         .map((comment) => toTimelineComment(c.env.DB, viewer, found, issue, comment, timelineContext)),
     );
-    // Upstream counts the FILTERED list (SetTotalCountHeader(len(apiComments))).
+    // The degenerate-arm drop (ledger ⑬-#16): a convert whose metadata load
+    // errored upstream returns nil and leaves the stream (see
+    // toTimelineComment's docstring); upstream's caller appends the nil to
+    // the slice (issue_comment.go:197) and would emit an out-of-contract
+    // JSON null element — the filter is the schema-valid shape of the same
+    // drop. The count header rides the FILTERED list, upstream's
+    // SetTotalCountHeader(len(apiComments)).
+    const rendered: TimelineComment[] = converted.filter((item): item is TimelineComment => item !== null);
     setPaginationHeaders(c, rendered.length, listOptions);
     return c.json(rendered, 200);
   });

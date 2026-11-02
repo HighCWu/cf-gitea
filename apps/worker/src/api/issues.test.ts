@@ -3998,15 +3998,16 @@ describe("issues list query-shape witness (query-shape-audit A2)", () => {
     const count = meter.count();
     // Post-fix: 1 repo resolve + the unit-gate read (the mustEnableIssuesOrPulls
     // mount — one constant loadRepoSettings per request, not per row; it rides
-    // the shared settings+units loader) + 2 (count + page) + 7 prefetch arms
+    // the shared settings+units loader) + 2 (count + page) + 8 prefetch arms
     // (posters, labels, pins, milestones, PR rows, assignees, the direct
-    // issue attachments — the asset render's page twin) —
+    // issue attachments — the asset render's page twin, the project
+    // memberships — the ⑯-P3-4 Issue.projects render) —
     // page-INDEPENDENT (the assignees arm is ONE join read for the whole
     // page, the fold's added arm). The pre-fix shape (audit formula
     // 2 + N×3..5) paid 1 + 2 + 6×3 + 2 milestones + 1 PR row = 24 at this N;
     // the bounds below fail if any per-row fan returns (each issue's 3 reads
     // alone would exceed it).
-    expect(count).toBeLessThanOrEqual(12);
+    expect(count).toBeLessThanOrEqual(13);
     expect(count).toBeLessThan(6 * 3);
 
     // The folded assignee block: the multi set renders in edge-row (insertion)
@@ -4196,11 +4197,15 @@ describe("timeline query-shape witness (query-shape-audit A5)", () => {
     const insert = (values: Omit<typeof comments.$inferInsert, "issueId">) =>
       db().insert(comments).values({ issueId: issue.id, content: "", createdAt: now, updatedAt: now, ...values });
 
-    // Every timeline row kind + every null/missing arm — 14 seeded rows, 13
-    // rendered (the Code row is dropped): plain comments across two posters
-    // (one deduped), change_title, a label on a real AND a dangling id, a
-    // milestone change old→new AND a dangling old, an assignee real AND
-    // dangling, a NULL-poster system close, a reopen, a commit_ref.
+    // Every timeline row kind + every null/missing arm — 14 seeded rows, 12
+    // rendered (the Code row is dropped, AND the dangling-assignee row DROPS:
+    // the ledger ⑬-#16 degenerate arm — upstream's LoadAssigneeUserAndTeam
+    // error nils the whole convert, convert/issue_comment.go:37-40, while a
+    // dangling label/milestone stays the silent-nil null render):
+    // plain comments across two posters (one deduped), change_title, a label
+    // on a real AND a dangling id, a milestone change old→new AND a dangling
+    // old, an assignee (the dangling twin no longer renders), a NULL-poster
+    // system close, a reopen, a commit_ref.
     await insert({ type: CommentType.Comment, posterId: owner.id, content: "note one" });
     await insert({ type: CommentType.Comment, posterId: other.id, content: "note two" });
     await insert({ type: CommentType.Comment, posterId: owner.id, content: "note three" }); // poster dedupe
@@ -4210,7 +4215,7 @@ describe("timeline query-shape witness (query-shape-audit A5)", () => {
     await insert({ type: CommentType.Milestone, posterId: owner.id, oldMilestoneId: v1, milestoneId: v2 });
     await insert({ type: CommentType.Milestone, posterId: owner.id, oldMilestoneId: 999999 }); // dangling old → null
     await insert({ type: CommentType.Assignees, posterId: other.id, assigneeId: other.id, removedAssignee: 0 });
-    await insert({ type: CommentType.Assignees, posterId: other.id, assigneeId: 999999 }); // dangling assignee → null
+    await insert({ type: CommentType.Assignees, posterId: other.id, assigneeId: 999999 }); // dangling assignee → the ROW drops (#16)
     await insert({ type: CommentType.Close, posterId: null }); // the null-poster arm
     await insert({ type: CommentType.Reopen, posterId: owner.id });
     await insert({ type: CommentType.CommitRef, posterId: other.id, commitSha: "abc123", refAction: 1 });
@@ -4231,7 +4236,7 @@ describe("timeline query-shape witness (query-shape-audit A5)", () => {
     });
     expect(res.status).toBe(200);
     const timeline = await res.json<Array<Record<string, unknown> & { type: string; user: unknown }>>();
-    expect(timeline).toHaveLength(13);
+    expect(timeline).toHaveLength(12);
     expect(timeline.map((item) => item.type)).toEqual([
       "comment",
       "comment",
@@ -4241,7 +4246,6 @@ describe("timeline query-shape witness (query-shape-audit A5)", () => {
       "label",
       "milestone",
       "milestone",
-      "assignees",
       "assignees",
       "close",
       "reopen",
@@ -4282,7 +4286,7 @@ describe("timeline query-shape witness (query-shape-audit A5)", () => {
       });
     const rows = await db().select().from(comments).where(eq(comments.issueId, issue.id)).orderBy(asc(comments.id)).all();
     const fallbackMeter = countedD1();
-    const perRow: TimelineComment[] = [];
+    const perRow: Array<TimelineComment | null> = [];
     for (const comment of rows) {
       if (comment.type === CommentType.Code) continue; // the route's filter arm
       perRow.push(await toTimelineComment(fallbackMeter.db, viewer, pair, issueRow, comment));
@@ -4293,13 +4297,15 @@ describe("timeline query-shape witness (query-shape-audit A5)", () => {
 
     // Contract discipline: the batched route render is deep-equal to the
     // per-row fallback render on the SAME rows and viewer — covers every row
-    // kind and the null/dangling arms in one sweep.
-    expect(timeline).toEqual(perRow);
+    // kind and the null/dangling arms in one sweep. (The degenerate-arm drop
+    // answers null on BOTH paths; the filter mirrors the route's — #16.)
+    expect(timeline).toEqual(perRow.filter((item): item is TimelineComment => item !== null));
     expect(timeline.find((item) => item.type === "close")?.user).toBeNull(); // the null-poster arm
     expect(timeline.filter((item) => item.label !== null)).toHaveLength(1); // the dangling label renders null
     expect(timeline.filter((item) => item.old_milestone !== null)).toHaveLength(1); // the dangling old renders null
     expect(timeline.filter((item) => item.milestone !== null)).toHaveLength(1);
-    expect(timeline.filter((item) => item.assignee !== null)).toHaveLength(1); // the dangling assignee renders null
+    expect(timeline.filter((item) => item.assignee !== null)).toHaveLength(1); // the healthy assignee renders
+    expect(perRow.some((item) => item === null)).toBe(true); // the dangling-assignee row DROPPED (⑬-#16)
   });
 });
 
@@ -4407,5 +4413,373 @@ describe("issue unit gates (mustEnableIssuesOrPulls)", () => {
     });
     expect(created.status).toBe(423);
     expect(await created.json()).toEqual({ message: "repo is archived", url: ERROR_URL });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The v1.5.3 Wave A residual rows (docs/compat/v1.5.2-ledger.md §1.1): #14
+// (the create title Required bind), #15 (the no-op body PATCH advances
+// state), #17 (create-time label/milestone notifications), #13 (the comment
+// before-boundary Lte + the epoch-0 unset), and the ⑯-P3-4 handover (the
+// API issue↔project coupling + the Issue.projects render).
+// ---------------------------------------------------------------------------
+
+describe("v1.5.3 wave A residual rows (ledger §1.1)", () => {
+  it("#14: an empty-string title fails the create bind with 422 (structs/issue.go:92 binding:Required fires on the zero value)", async () => {
+    await seedUser("Alice");
+    await seedRepo("alice", "visible");
+
+    const empty = await router()("/repos/alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "" }),
+    });
+    expect(empty.status).toBe(422);
+    expect(await empty.json()).toEqual({ message: "invalid request body", url: ERROR_URL });
+
+    const absent = await router()("/repos/alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "no title" }),
+    });
+    expect(absent.status).toBe(422);
+
+    // A whitespace title is a NON-zero value upstream — Go's Required only
+    // fires on the zero value — so it passes the bind (the model-layer
+    // EllipsisDisplayString is the only later transform).
+    const blank = await router()("/repos/alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: " " }),
+    });
+    expect(blank.status).toBe(201);
+  });
+
+  it("#15: a no-op body PATCH advances the state — content_version, both history revisions, and the edited webhook (issue.go:735-750, content.go:16-33)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const issue = await seedIssue(repoId, "no-op edit", { posterId: 1, content: "same body" });
+    const hookId = await seedHook(repoId, ["issues"]);
+
+    const res = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ body: "same body" }),
+    });
+    expect(res.status).toBe(201);
+    expect((await res.json<{ content_version: number }>()).content_version).toBe(1);
+
+    // ChangeIssueContent (issue_update.go:316-350): the lazy first-revision
+    // back-fill + the edited revision land even when the content is equal.
+    const history = await db()
+      .select()
+      .from(issueContentHistory)
+      .where(eq(issueContentHistory.issueId, issue.id))
+      .orderBy(asc(issueContentHistory.editedAt))
+      .all();
+    expect(history).toHaveLength(2);
+    expect(history[0]?.isFirstCreated).toBe(true);
+    expect(history[0]?.contentText).toBe("same body");
+    expect(history[1]?.isFirstCreated).toBe(false);
+    expect(history[1]?.contentText).toBe("same body");
+
+    // IssueChangeContent fires with the UNCHANGED changes.body.from.
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries.map((d) => d.eventType)).toEqual(["issues"]);
+    const payload = JSON.parse(deliveries[0]!.payloadContent) as { action: string; changes: { body: { from: string } } };
+    expect(payload.action).toBe("edited");
+    expect(payload.changes).toEqual({ body: { from: "same body" } });
+
+    // An ABSENT body key still skips the arm entirely (no second bump).
+    const untouched = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "no body key" }),
+    });
+    expect(untouched.status).toBe(201);
+    expect((await untouched.json<{ content_version: number }>()).content_version).toBe(1);
+    // JSON null is Go's nil pointer — skipped like the absent key.
+    const nulled = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ body: null }),
+    });
+    expect(nulled.status).toBe(201);
+    expect((await nulled.json<{ content_version: number }>()).content_version).toBe(1);
+  });
+
+  it("#17: a create carrying labels/milestone notifies IssueChangeLabels + IssueChangeMilestone right after opened (services/issue/issue.go:74-79)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
+    const a = await seedLabel(repoId, "alpha");
+    const milestoneId = await seedMilestone(repoId, "v1");
+    const hookId = await seedHook(repoId, ["issues", "issue_label", "issue_milestone"]);
+
+    const res = await router()("/repos/alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "enriched at birth", labels: [a], milestone: milestoneId }),
+    });
+    expect(res.status).toBe(201);
+
+    const deliveries = await deliveriesFor(hookId);
+    expect(deliveries.map((d) => d.eventType)).toEqual(["issues", "issue_label", "issue_milestone"]);
+    const actions = deliveries.map((d) => (JSON.parse(d.payloadContent) as { action: string }).action);
+    expect(actions).toEqual(["opened", "label_updated", "milestoned"]);
+    // The label event renders the attached set; the milestone event the
+    // milestoned issue (the PATCH arms' exact emitters — no `changes`).
+    const labeled = JSON.parse(deliveries[1]!.payloadContent) as { issue: { labels: Array<{ id: number }> }; changes?: unknown };
+    expect(labeled.issue.labels.map((l) => l.id)).toEqual([a]);
+    expect(labeled.changes).toBeUndefined();
+    const milestoned = JSON.parse(deliveries[2]!.payloadContent) as { issue: { milestone: { id: number } | null }; changes?: unknown };
+    expect(milestoned.issue.milestone?.id).toBe(milestoneId);
+    expect(milestoned.changes).toBeUndefined();
+  });
+
+  it("#17: a bare create (and a create whose labels/milestone dropped silently) emits ONLY opened", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
+    const hookId = await seedHook(repoId, ["issues", "issue_label", "issue_milestone"]);
+
+    const bare = await router()("/repos/alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "bare" }),
+    });
+    expect(bare.status).toBe(201);
+    expect((await deliveriesFor(hookId)).map((d) => d.eventType)).toEqual(["issues"]);
+
+    // An INVALID label id and an INVALID milestone id drop silently
+    // (issue_update.go:365-377/:425-428) — the notifications key on the
+    // ATTACHED state, so neither fires.
+    const dropped = await router()("/repos/alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "dropped refs", labels: [7777], milestone: 8888 }),
+    });
+    expect(dropped.status).toBe(201);
+    expect((await deliveriesFor(hookId)).map((d) => d.eventType)).toEqual(["issues", "issues"]);
+  });
+
+  it("#13: a comment updated exactly at ?before stays in the stream (comment.go:1133-1135 builder.Lte)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const issue = await seedIssue(repoId, "boundary", { posterId: owner.id });
+    await service().addComment({ issueId: issue.id, posterId: owner.id, content: "at the boundary" });
+    await db()
+      .update(comments)
+      .set({ updatedAt: new Date("2026-06-01T00:00:00Z") })
+      .where(eq(comments.issueId, issue.id));
+
+    const at = await router()(`/repos/alice/visible/issues/${issue.index}/comments?before=2026-06-01T00:00:00Z`);
+    expect(at.status).toBe(200);
+    expect((await at.json<Array<unknown>>())).toHaveLength(1); // the old lt dropped this row
+
+    const justBefore = await router()(`/repos/alice/visible/issues/${issue.index}/comments?before=2026-05-31T23:59:59Z`);
+    expect((await justBefore.json<Array<unknown>>())).toHaveLength(0);
+  });
+
+  it("#13: an epoch-0 (or pre-1970) since/before parses fine and filters nothing — the unset sentinel, never a 422 (utils.go:31-40 + the >0 gates)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    await seedIssue(repoId, "epoch target", { posterId: owner.id });
+
+    const epoch = await router()("/repos/alice/visible/issues?before=1970-01-01T00:00:00Z");
+    expect(epoch.status).toBe(200);
+    expect(epoch.headers.get("X-Total-Count")).toBe("1");
+
+    const preEpoch = await router()("/repos/alice/visible/issues?since=1969-12-31T23:59:59Z");
+    expect(preEpoch.status).toBe(200);
+    expect(preEpoch.headers.get("X-Total-Count")).toBe("1");
+
+    // The malformed format still 422s — only the PARSED <=0 value is unset.
+    const bad = await router()("/repos/alice/visible/issues?before=1970-01-01T00:00:00");
+    expect(bad.status).toBe(422);
+  });
+
+  it("#B: deleting a PR issue sweeps refs/pull/N/head off the base cell (services/issue/issue.go:173-181)", async () => {
+    // The owner USER row is part of the route's reachability: the repo
+    // resolver joins users on ownerNamespace (repositoryWithOwnerQuery), so
+    // an owner-less repo row 404s before the handler ever sees the issue.
+    const owner = await seedUser("Alice");
+    const seeded = await seedTrioPr(owner.usernameLower, "ghost-ref", "the pr");
+    // The stale-ghost shape: land the head ref, then delete the PR through
+    // the API — the ref must not survive the cascade.
+    const res = await router()(`/repos/alice/ghost-ref/issues/${seeded.issueIndex}`, { method: "DELETE", headers: authHeaders });
+    expect(res.status).toBe(204);
+
+    const tips = refTipMap(await engineReads(env, { ownerNamespace: "alice", slug: "ghost-ref" }).listRefs());
+    expect(tips.get(`refs/pull/${seeded.pullIndex}/head`)).toBeUndefined();
+    // The branch refs are untouched — only the PR head ref sweeps.
+    expect(tips.get(branchRef("main"))).toBeDefined();
+    expect(tips.get(branchRef("topic"))).toBeDefined();
+  });
+
+  it("#B: a PR issue whose head ref was never landed deletes clean (the engine's idempotent-gone arm)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "no-ref", { stubWriter: true });
+    const tip = await seedEngineBranches(owner.usernameLower, "no-ref", ["feature"]);
+    const pull = await service().createPullRequest({
+      repoId,
+      headRepoId: repoId,
+      baseBranch: "main",
+      headBranch: "feature",
+      title: "ref-less pr",
+      posterId: owner.id,
+    });
+    void tip;
+    const res = await router()(`/repos/alice/no-ref/issues/${pull.issue.index}`, { method: "DELETE", headers: authHeaders });
+    expect(res.status).toBe(204);
+  });
+
+  it("⑯-P3-4: a writer create with projects attaches them and Issue.projects renders the real list (issue.go:621-624, convert/issue.go:98-102)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
+    const project = await db()
+      .insert(projects)
+      .values({
+        title: "board one",
+        description: "",
+        ownerId: 0,
+        repoId,
+        creatorId: owner.id,
+        boardType: 0,
+        cardType: 0,
+        type: 2,
+        createdAt: new Date("2026-04-01T00:00:00Z"),
+        updatedAt: new Date("2026-04-01T00:00:00Z"),
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    const res = await router()("/repos/alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "born on a board", projects: [project.id] }),
+    });
+    expect(res.status).toBe(201);
+    const created = await res.json<{ id: number; projects: Array<Record<string, unknown>> | null }>();
+    expect(created.projects).toHaveLength(1);
+    expect(created.projects?.[0]).toMatchObject({ id: project.id, title: "board one", repo_id: Number(repoId) });
+    expect(created.projects?.[0]?.html_url).toBe(`https://example.com/alice/visible/projects/${project.id}`);
+
+    // GET renders the same membership.
+    const got = await router()("/repos/alice/visible/issues/1");
+    expect((await got.json<{ projects: Array<{ id: number }> | null }>().then((b) => b.projects?.map((p) => p.id)))).toEqual([project.id]);
+
+    // The membership row + the type-30 add comment landed.
+    const memberships = await db().select().from(projectIssues).where(eq(projectIssues.issueId, created.id));
+    expect(memberships.map((m) => m.projectId)).toEqual([project.id]);
+    const projectComments = await db().select().from(comments).where(eq(comments.type, CommentType.Project)).all();
+    expect(projectComments).toHaveLength(1);
+    expect(JSON.parse(projectComments[0]!.content ?? "{}")).toEqual({ old_project_id: 0, project_id: project.id });
+  });
+
+  it("⑯-P3-4: a non-writer's create projects are cleared silently (issue.go:622's form.Projects = nil)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const project = await db()
+      .insert(projects)
+      .values({
+        title: "board two",
+        description: "",
+        ownerId: 0,
+        repoId,
+        creatorId: owner.id,
+        boardType: 0,
+        cardType: 0,
+        type: 2,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    const res = await router()("/repos/alice/visible/issues", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ title: "reader create", projects: [project.id, 9999] }),
+    });
+    // The non-writer arm never validates: no 400 for the unknown id, the
+    // issue still creates, no membership lands.
+    expect(res.status).toBe(201);
+    expect((await res.json<{ projects: unknown[] | null }>()).projects).toBeNull();
+    expect(await db().select().from(projectIssues).all()).toHaveLength(0);
+  });
+
+  it("⑯-P3-4: PATCH projects replaces the set (empty array clears) and 400s the unknown id (issue.go:827-833)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
+    const issue = await seedIssue(repoId, "movable", { posterId: owner.id });
+    const p1 = await db()
+      .insert(projects)
+      .values({ title: "p1", description: "", ownerId: 0, repoId, creatorId: owner.id, boardType: 0, cardType: 0, type: 2, createdAt: new Date(), updatedAt: new Date() })
+      .returning()
+      .then((rows) => rows[0]!);
+    const p2 = await db()
+      .insert(projects)
+      .values({ title: "p2", description: "", ownerId: 0, repoId, creatorId: owner.id, boardType: 0, cardType: 0, type: 2, createdAt: new Date(), updatedAt: new Date() })
+      .returning()
+      .then((rows) => rows[0]!);
+
+    const set = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ projects: [p1.id, p2.id] }),
+    });
+    expect(set.status).toBe(201);
+    expect((await set.json<{ projects: Array<{ id: number }> | null }>().then((b) => b.projects?.map((p) => p.id)))).toEqual([p1.id, p2.id]);
+    // The SET arm comments its adds exactly like the create arm — both funnel
+    // through IssueAssignOrRemoveProject's per-side comments
+    // (issue_project.go:137-151, one type-30 add per project, request order).
+    const adds = await db().select().from(comments).where(eq(comments.type, CommentType.Project)).all();
+    expect(adds.map((c) => JSON.parse(c.content ?? "{}") as { old_project_id: number; project_id: number })).toEqual([
+      { old_project_id: 0, project_id: p1.id },
+      { old_project_id: 0, project_id: p2.id },
+    ]);
+
+    // Replace: [p2] removes p1, keeps p2 — one REMOVAL comment joins the set
+    // step's two adds (the removal shape old=p1/new=0 vs the add shape
+    // old=0/new=pN) and the kept membership stays intact.
+    const replace = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ projects: [p2.id] }),
+    });
+    expect(replace.status).toBe(201);
+    const memberships = await db().select().from(projectIssues).where(eq(projectIssues.issueId, issue.id)).all();
+    expect(memberships.map((m) => m.projectId)).toEqual([p2.id]);
+    const afterReplace = await db().select().from(comments).where(eq(comments.type, CommentType.Project)).all();
+    const removals = afterReplace.filter((c) => (JSON.parse(c.content ?? "{}") as { project_id: number }).project_id === 0);
+    expect(removals).toHaveLength(1);
+    expect(JSON.parse(removals[0]!.content ?? "{}")).toEqual({ old_project_id: p1.id, project_id: 0 });
+
+    // Clear: the empty array removes the last membership.
+    const clear = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ projects: [] }),
+    });
+    expect(clear.status).toBe(201);
+    expect((await clear.json<{ projects: unknown[] | null }>()).projects).toBeNull();
+    expect(await db().select().from(projectIssues).where(eq(projectIssues.issueId, issue.id)).all()).toHaveLength(0);
+
+    // JSON null is the nil pointer — the arm skips, nothing changes.
+    const nulled = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ projects: null }),
+    });
+    expect(nulled.status).toBe(201);
+
+    // The unknown id answers upstream's ErrNotExist text via the 400 family
+    // (issue.go:829-833).
+    const missing = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ projects: [424242] }),
+    });
+    expect(missing.status).toBe(400);
+    expect(await missing.json()).toEqual({ message: "project 424242 not found", url: ERROR_URL });
   });
 });

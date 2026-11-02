@@ -5,6 +5,7 @@ import { z } from "zod";
 
 import { IssueNotExistError } from "../../issues/errors";
 import type { IssueRow } from "../../issues/service";
+import { emitCommentEvent } from "./issues";
 import {
   changeIssueDeadline,
   commentHasContentSupport,
@@ -96,12 +97,18 @@ import { toApiUser } from "../services/user";
  * :41-42 for the comment — wired by the blocks-enforcement sweep, 403 "user
  * is blocked" via issue_reaction.go:202/417's ErrBlockedUser unwrap, placed
  * ahead of the allowed-set check like upstream's probe-before-CreateReaction
- * order); the lock reason is accepted
- * and not stored (no lock_reason column — services/issue-extras.ts header);
- * the nested comment pair enforces comment.IssueID == issue.ID (upstream
- * resolves the issue by index first); the archived-repo gate is NOT wired on
- * the nested pair (upstream registers no mustNotBeArchived there either —
- * the landed global comment routes do; a documented asymmetry we mirror).
+ * order); the lock reason rides the Lock system comment's content
+ * (CreateCommentOptions{Content: opts.Reason}, models/issues/issue_lock.go:
+ * 44-53 — there is no lock_reason column upstream either;
+ * services/issue-extras.ts lockIssue); the nested comment pair enforces
+ * comment.IssueID == issue.ID (upstream resolves the issue by index first)
+ * and emits the SAME edited/deleted webhooks as the canonical global pair —
+ * upstream's deprecated routes share the exact editIssueComment/
+ * deleteIssueComment service functions (issue_comment.go:554-584/:651-670),
+ * so the emissions are the landed emitCommentEvent seam (ledger ⑬-#10); the
+ * archived-repo gate is NOT wired on the nested pair (upstream registers no
+ * mustNotBeArchived there either — the landed global comment routes do; a
+ * documented asymmetry we mirror).
  */
 
 const notFoundResponse = {
@@ -562,7 +569,12 @@ export function registerIssueT2Routes(
   // -------------------------------------------------------------------------
   // The deprecated nested comment pair — the landed global semantics plus the
   // comment-belongs-to-this-issue check (upstream resolves the issue by index
-  // first; a comment from a sibling issue answers the 404).
+  // first; a comment from a sibling issue answers the 404). Upstream's
+  // deprecated routes call the SAME editIssueComment/deleteIssueComment
+  // functions as the canonical global pair (issue_comment.go:554-584 funnels
+  // into UpdateComment's notifier; :651-670 into DeleteComment's), so BOTH
+  // arms emit the edited/deleted webhooks through the shared emitCommentEvent
+  // seam (ledger ⑬-#10).
   // -------------------------------------------------------------------------
   app.openapi(editNestedCommentRoute(requireAuth), async (c) => {
     const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
@@ -588,14 +600,26 @@ export function registerIssueT2Routes(
     }
     const form = c.req.valid("json");
     if (form.body !== (row.comment.content ?? "")) {
+      const oldContent = row.comment.content ?? "";
       await updateCommentBody(c.env.DB, row.comment.id, form.body, new Date(), doer?.id ?? null);
       row.comment = { ...row.comment, content: form.body };
+      // Webhook: comment edited (UpdateComment:420-461's emission, the
+      // global pair's exact shape — `issue.IsPull` discriminant,
+      // `changes.body.from` = the pre-edit content).
+      await emitCommentEvent(
+        c,
+        found,
+        row.issue,
+        await toApiComment(c.env.DB, viewer, found, row.issue, row.comment),
+        "edited",
+        { changes: { body: { from: oldContent } } },
+      );
     }
     return c.json(await toApiComment(c.env.DB, viewer, found, row.issue, row.comment), 200);
   });
 
   app.openapi(deleteNestedCommentRoute(requireAuth), async (c) => {
-    const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
+    const { viewer, found } = await requireVisibleRepoPair(c, c.req.valid("param"));
     // The issues-group UNIT gate (mustEnableIssuesOrPulls, api.go:1674 +
     // api.go:720-746) at upstream's chain position — unit-less repos 404
     // before any handler logic (services/issue-unit-gates.ts).
@@ -615,7 +639,14 @@ export function registerIssueT2Routes(
       // Upstream deleteIssueComment answers StatusBadRequest (undeclared).
       throw new ApiError(400, "comment type does not support content");
     }
-    await deleteComment(c.env.DB, row.comment, new Date());
+    // Render before the delete (upstream DeleteComment serializes the
+    // in-memory comment; toApiComment reads only the poster row) — the
+    // deleted emission is the global pair's exact shape (no `changes`).
+    const rendered = await toApiComment(c.env.DB, viewer, found, row.issue, row.comment);
+    const removed = await deleteComment(c.env.DB, row.comment, new Date());
+    if (removed) {
+      await emitCommentEvent(c, found, row.issue, rendered, "deleted");
+    }
     return c.body(null, 204);
   });
 
@@ -896,8 +927,10 @@ export function registerIssueT2Routes(
 
   // -------------------------------------------------------------------------
   // Lock / unlock (issue_lock.go): the writer gate carries the upstream
-  // messages; already-(un)locked is the silent no-op; the reason is accepted
-  // and not stored (no column — the module header).
+  // messages; already-(un)locked is the silent no-op; the lock reason rides
+  // the Lock system comment's content (issue_lock.go:44-53 — no lock_reason
+  // column exists upstream either; unlock carries no reason — the DELETE
+  // route reads no body upstream).
   // -------------------------------------------------------------------------
   app.openapi(lockIssueRoute(requireAuth), async (c) => {
     const { found } = await requireVisibleRepoPair(c, c.req.valid("param"));
@@ -910,7 +943,13 @@ export function registerIssueT2Routes(
       throw new ApiError(403, "no permission to lock this issue");
     }
     if (!issue.isLocked) {
-      await lockIssue(c.env.DB, issue.id, requireDoerId(c), new Date());
+      // The doer-supplied reason rides the Lock system comment's content —
+      // upstream IssueLockOptions.Reason (models/issues/issue_lock.go:44-53,
+      // `CreateCommentOptions{Content: opts.Reason}`, no validation, the
+      // API arm reads IssueLockOption.Reason verbatim; ledger ⑬-#12's W15
+      // follow-up threading the callers).
+      const form = c.req.valid("json");
+      await lockIssue(c.env.DB, issue.id, requireDoerId(c), new Date(), form.lock_reason);
     }
     return c.body(null, 204);
   });

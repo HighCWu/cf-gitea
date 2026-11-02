@@ -298,10 +298,11 @@
  *   cannot be locked twice." / "Cannot unlock an issue that is not
  *   locked.") as the 200 re-render; the flips ride the landed
  *   `lockIssue`/`unlockIssue` (issue-extras.ts — the Lock/Unlock system
- *   comments; the `reason` field is accepted and NOT stored — the landed
- *   issue-extras header's documented no-column divergence). The reason
- *   select renders upstream's default set ("Too heated", "Off-topic",
- *   "Spam", "Resolved" — modules/setting/repository.go:222).
+ *   comments; the `reason` field rides the Lock system comment's content,
+ *   upstream web arm `Reason: form.Reason`, issue_lock.go:27-31 — no
+ *   lock_reason column exists upstream either). The reason select renders
+ *   upstream's default set ("Too heated", "Off-topic", "Spam", "Resolved" —
+ *   modules/setting/repository.go:222).
  * - IssuePinOrUnpin (issue_pin.go:17-53): the TOGGLE — unpinned pins (the
  *   cap arm answers upstream's "You can't pin more issues" re-render;
  *   MaxPinned default 3 per type), pinned unpins; both redirect canonical.
@@ -730,12 +731,14 @@ export type LockWriteResult = { outcome: "applied" } | { outcome: "duplicate" };
 export type UnlockWriteResult = { outcome: "applied" } | { outcome: "not-locked" };
 
 /** LockIssue (issue_lock.go:15-37): the duplicate arm carries upstream's
- *  exact message; the flip rides the landed lockIssue (the Lock system
- *  comment; the reason is accepted but not stored — the issue-extras
- *  divergence). */
-export async function applyIssueLockWrite(d1: D1Database, issue: IssueRow, actorId: number, now: Date): Promise<LockWriteResult> {
+ *  exact message; the flip rides the landed lockIssue — the doer-supplied
+ *  `reason` rides the Lock system comment's content exactly like upstream's
+ *  web arm (`Reason: form.Reason`, routers/web/repo/issue_lock.go:27-31 →
+ *  CreateCommentOptions{Content: opts.Reason}; no lock_reason column exists
+ *  upstream either). Unlock passes no reason (the mirror arm, :40-60). */
+export async function applyIssueLockWrite(d1: D1Database, issue: IssueRow, actorId: number, now: Date, reason?: string | null): Promise<LockWriteResult> {
   if (issue.isLocked) return { outcome: "duplicate" };
-  await lockIssue(d1, issue.id, actorId, now);
+  await lockIssue(d1, issue.id, actorId, now, reason);
   return { outcome: "applied" };
 }
 
@@ -1180,8 +1183,8 @@ export async function issueLockSubmit(c: RouteContext): Promise<Response> {
   if ("response" in selected) return selected.response;
   const issue = selected.issue;
 
-  parseIssueLockForm(await readUrlEncodedForm(c.req.raw)); // the reason is accepted, not stored (the issue-extras divergence)
-  const result = await applyIssueLockWrite(c.env.DB, issue, viewer.id, new Date());
+  const form = parseIssueLockForm(await readUrlEncodedForm(c.req.raw));
+  const result = await applyIssueLockWrite(c.env.DB, issue, viewer.id, new Date(), form.reason);
   if (result.outcome === "duplicate") return reRenderDetailWithMessage(c, resolved, issue, issueSidebarLocale.lock_duplicate);
   return respond(new Response(null, { status: 303, headers: { location: canonicalIssuePath(repo, issue) } }));
 }

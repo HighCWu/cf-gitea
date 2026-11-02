@@ -603,7 +603,7 @@ describe("POST /{issues|pulls}/{index}/watch (upstream IssueWatch)", () => {
 // --- the lock/unlock writes -------------------------------------------------------------------
 
 describe("POST /{issues|pulls}/{index}/lock + /unlock (upstream LockIssue/UnlockIssue)", () => {
-  it("locks: the flip + the Lock(23) comment; the reason is accepted but not stored (the issue-extras divergence)", async () => {
+  it("locks: the flip + the Lock(23) comment whose content carries the form reason (issue_lock.go:27-31 — CreateCommentOptions{Content: opts.Reason})", async () => {
     const f = await ensureFixture();
     const res = await fetchTail(
       `/sb-owner/writes/issues/${f.issueIndex}/lock`,
@@ -612,7 +612,27 @@ describe("POST /{issues|pulls}/{index}/lock + /unlock (upstream LockIssue/Unlock
     expect(res.status).toBe(303);
     const row = await drizzle(env.DB).select({ isLocked: issues.isLocked }).from(issues).where(eq(issues.id, f.issueId)).get();
     expect(row?.isLocked).toBe(true);
-    expect(await commentsOfType(f.issueId, CommentType.Lock)).toBe(1);
+    const lockRows = await drizzle(env.DB)
+      .select({ content: comments.content })
+      .from(comments)
+      .where(and(eq(comments.issueId, f.issueId), eq(comments.type, CommentType.Lock)))
+      .all();
+    expect(lockRows).toHaveLength(1);
+    expect(lockRows[0]?.content).toBe("Too heated");
+  });
+
+  it("locks without a reason write the empty content (upstream's zero-value Reason)", async () => {
+    const f = await ensureFixture();
+    await fetchTail(`/sb-owner/writes/issues/${f.issueIndex}/unlock`, formPost("/x", {}, f.ownerCookie));
+    const res = await fetchTail(`/sb-owner/writes/issues/${f.issueIndex}/lock`, formPost("/x", {}, f.ownerCookie));
+    expect(res.status).toBe(303);
+    const lockRows = await drizzle(env.DB)
+      .select({ content: comments.content })
+      .from(comments)
+      .where(and(eq(comments.issueId, f.issueId), eq(comments.type, CommentType.Lock)))
+      .all();
+    expect(lockRows).toHaveLength(1);
+    expect(lockRows[0]?.content).toBe("");
   });
 
   it("the duplicate lock re-renders at 200 with upstream's exact message and writes nothing more", async () => {

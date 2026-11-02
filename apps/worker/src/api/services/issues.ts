@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, like, lt, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, like, lte, or, sql, type SQL } from "drizzle-orm";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 import type { Context } from "hono";
 
@@ -19,6 +19,7 @@ import {
   milestones,
   notificationStates,
   projectIssues,
+  projects,
   pullRequests,
   reactions,
   repositories,
@@ -40,6 +41,8 @@ import { findCollaborator } from "./repo-collaborators";
 import { pullRequestDiffShortStatForEnv } from "./pull-engine";
 import { toApiPullRequest } from "./pulls";
 import { toApiMilestone } from "./milestones";
+import { addIssueToColumn, mustDefaultColumn, toApiProject, type ProjectRow } from "./projects";
+import { engineRepoName, pullHeadRef } from "./engine";
 import {
   apiRepositoryUrl,
   apiUserFromRow,
@@ -163,6 +166,38 @@ export async function issueLabelRows(d1: D1Database, issueId: number): Promise<L
     .orderBy(asc(labels.id))
     .all();
   return rows.map((row) => row.label);
+}
+
+/**
+ * `issue.LoadProjects` (models/issues/issue_project.go:21-31) — the project
+ * memberships resolved to project rows, `project.id ASC`. A dangling
+ * membership (its project row gone) drops on both paths (the inner join).
+ */
+export async function listIssueProjects(d1: D1Database, issueId: number): Promise<ProjectRow[]> {
+  const rows = await drizzle(d1)
+    .select({ project: projects })
+    .from(projectIssues)
+    .innerJoin(projects, eq(projects.id, projectIssues.projectId))
+    .where(eq(projectIssues.issueId, issueId))
+    .orderBy(asc(projects.id))
+    .all();
+  return rows.map((row) => row.project);
+}
+
+/**
+ * `Project.Link` (models/project/project.go:129-155 + MakeAbsoluteURL): an
+ * owner-scoped row links `{origin}/{ownerHomeLink}/-/projects/{id}`
+ * (ProjectLinkForOrg, :133-135), a repo-scoped row
+ * `{origin}/{owner}/{repo}/projects/{id}` (ProjectLinkForRepo, :136-138).
+ * The owner-scoped name comes from the ISSUE's repo pair in hand — the only
+ * owner-scoped projects reachable from an issue are the repo owner's
+ * (CanBeAccessedByOwnerRepo, project.go:209-216), so no extra lookup.
+ */
+function issueProjectHtmlUrl(pair: RepositoryWithOwner, origin: string, row: ProjectRow): string {
+  if (row.ownerId > 0) {
+    return `${origin}/${encodeURIComponent(pair.repo.ownerNamespace)}/-/projects/${row.id}`;
+  }
+  return `${origin}/${encodeURIComponent(pair.repo.ownerNamespace)}/${encodeURIComponent(pair.repo.slug)}/projects/${row.id}`;
 }
 
 /**
@@ -300,6 +335,12 @@ export interface IssueRenderContext {
   /** The issue's direct attachment rows (`comment_id = 0`) per issue id,
    *  each bucket in id order (the per-row `listIssueAttachments` orderBy). */
   attachmentsByIssue: Map<number, IssueAttachmentRow[]>;
+  /** The issue's project memberships resolved to project rows per issue id,
+   *  each bucket in project-id order (LoadProjects' `project.id ASC`,
+   *  models/issues/issue_project.go:21-31); an issue with no memberships
+   *  (or a dangling membership whose project row is gone) renders the empty
+   *  set's null on both paths. */
+  projectsByIssue: Map<number, ProjectRow[]>;
 }
 
 /** Optional preloaded reads for `toApiIssue` — the list routes' batch
@@ -327,7 +368,7 @@ export async function prefetchIssueRenderContext(d1: D1Database, pageRows: Issue
   const milestoneIds = [...new Set(pageRows.flatMap((row) => (row.milestoneId === null ? [] : [row.milestoneId])))];
   const prIssueIds = pageRows.flatMap((row) => (row.isPull ? [row.id] : []));
   const db = drizzle(d1);
-  const [posterRows, labelRows, pinRows, milestoneRows, prRows, assigneeRows, attachmentRows] = await Promise.all([
+  const [posterRows, labelRows, pinRows, milestoneRows, prRows, assigneeRows, attachmentRows, projectRows] = await Promise.all([
     posterIds.length > 0 ? db.select().from(users).where(inArray(users.id, posterIds)).all() : Promise.resolve([]),
     issueIds.length > 0
       ? db
@@ -369,6 +410,18 @@ export async function prefetchIssueRenderContext(d1: D1Database, pageRows: Issue
           .orderBy(asc(issueAttachments.id))
           .all()
       : Promise.resolve([]),
+    // The project-membership join, project-id order per bucket (LoadProjects'
+    // orderBy) — the same inner join the per-row read runs, so a dangling
+    // membership id drops on both paths.
+    issueIds.length > 0
+      ? db
+          .select({ issueId: projectIssues.issueId, project: projects })
+          .from(projectIssues)
+          .innerJoin(projects, eq(projects.id, projectIssues.projectId))
+          .where(inArray(projectIssues.issueId, issueIds))
+          .orderBy(asc(projects.id))
+          .all()
+      : Promise.resolve([]),
   ]);
   const labelsByIssue = new Map<number, LabelRow[]>();
   for (const row of labelRows) {
@@ -397,6 +450,15 @@ export async function prefetchIssueRenderContext(d1: D1Database, pageRows: Issue
       bucket.push(row);
     }
   }
+  const projectsByIssue = new Map<number, ProjectRow[]>();
+  for (const row of projectRows) {
+    const bucket = projectsByIssue.get(row.issueId);
+    if (bucket === undefined) {
+      projectsByIssue.set(row.issueId, [row.project]);
+    } else {
+      bucket.push(row.project);
+    }
+  }
   return {
     posters: new Map(posterRows.map((row) => [row.id, row])),
     labelsByIssue,
@@ -405,6 +467,7 @@ export async function prefetchIssueRenderContext(d1: D1Database, pageRows: Issue
     pullRequestsByIssue: new Map(prRows.map((row) => [row.issueId, row])),
     assigneesByIssue,
     attachmentsByIssue,
+    projectsByIssue,
   };
 }
 
@@ -476,9 +539,12 @@ function toAttachmentApi(origin: string, row: IssueAttachmentRow): ReleaseAttach
 /**
  * `convert.ToIssue` → the contract `Issue`. Enrichment reads per render:
  * poster row, label join, assignee join, milestone row, PR row (PRs only),
- * the direct attachment rows — the same loads upstream's toIssue performs
+ * the direct attachment rows, the project memberships (ledger ⑯-P3-4 —
+ * `Issue.projects` renders `ToProjectList` of the loaded rows,
+ * services/convert/issue.go:98-102, null when the set is empty exactly like
+ * upstream's Go nil) — the same loads upstream's toIssue performs
  * (LoadPoster/LoadLabels/LoadAssignees/LoadMilestone/LoadPullRequest/
- * LoadAttachments). LIST routes pass `preload` (the page-scoped
+ * LoadAttachments/LoadProjects). LIST routes pass `preload` (the page-scoped
  * `prefetchIssueRenderContext` maps + the caller-held PR row) so the reads
  * collapse to 0 per row; without it the per-row selects run exactly as
  * before — the single-item routes' unchanged path.
@@ -499,6 +565,7 @@ export async function toApiIssue(d1: D1Database, viewer: Viewer, pair: Repositor
   const pinOrder = context === undefined ? await pinOrderOf(d1, issue.id) : (context.pinOrders.get(issue.id) ?? -1);
   const assigneeRows = context === undefined ? await listIssueAssignees(d1, issue.id) : (context.assigneesByIssue.get(issue.id) ?? []);
   const attachmentRows = context === undefined ? await listIssueAttachments(d1, issue.id) : (context.attachmentsByIssue.get(issue.id) ?? []);
+  const projectRows = context === undefined ? await listIssueProjects(d1, issue.id) : (context.projectsByIssue.get(issue.id) ?? []);
   const milestoneRow =
     issue.milestoneId === null
       ? null
@@ -525,7 +592,11 @@ export async function toApiIssue(d1: D1Database, viewer: Viewer, pair: Repositor
     assets: attachmentRows.map((row) => toAttachmentApi(viewer.origin, row)),
     labels: labelRows.map((row) => toEmbeddedLabel(row, pair, viewer.origin)),
     milestone: milestoneRow === null ? null : toApiMilestone(milestoneRow),
-    projects: null, // projects are tier 3 (SPEC-0004 §2.6)
+    // ToProjectList (convert/issue.go:98-102) — the loaded memberships, the
+    // landed project converter per row; the empty set is upstream's Go nil,
+    // rendered null (never []).
+    projects:
+      projectRows.length === 0 ? null : await Promise.all(projectRows.map((row) => toApiProject(d1, row, viewer, issueProjectHtmlUrl(pair, viewer.origin, row)))),
     // ToIssue issue.go:105-113 — the first assignee duplicated into the
     // deprecated `assignee`; an empty set leaves BOTH null (upstream's
     // `len > 0` gate — never []).
@@ -925,6 +996,19 @@ interface TimelineTrackedTime {
   issue: Issue | null;
 }
 
+/** The outcome of the time-comment correlation (see trackedTimeOfComment):
+ *  `none` — no entry expected (types outside the family, or an arm whose
+ *  correlation keys are missing): renders null `tracked_time`, upstream's
+ *  `TimeID == 0` early return (models/issues/comment.go:733-736); `missing` —
+ *  an entry IS expected but the store holds no matching row: upstream's
+ *  GetTrackedTimeByID error arm, which ToTimelineComment answers by DROPPING
+ *  the whole row (services/convert/issue_comment.go:53-56; ledger ⑬-#16);
+ *  `found` — the rendered TimelineTrackedTime. */
+type TimelineTimeCorrelation =
+  | { kind: "none" }
+  | { kind: "missing" }
+  | { kind: "found"; time: TimelineTrackedTime };
+
 /**
  * The time-tracking comment's tracked_time — upstream `Comment.LoadTime`
  * (models/issues/comment.go:733-738) reads the comment's `time_id` column,
@@ -941,17 +1025,20 @@ interface TimelineTrackedTime {
  *     (stopwatch.go:160) as do our writers — the batch-mate is the newest
  *     live entry created in the comment's own second (both rows of the batch
  *     share the write's Date).
- * delete_time_manual (26) stays null — upstream sets no TimeID there either
+ * delete_time_manual (26) is `none` — upstream sets no TimeID there either
  * (tracked_time.go:252-263/:276-286), so its render is the same null; types
  * outside the time family are LoadTime's `TimeID == 0` early return. A
  * dangling entry (purged row, an admin-add whose poster is not the entry's
- * user) renders null rather than a guess.
+ * user) is `missing` — the upstream LoadTime error arm that drops the row,
+ * never a null-metadata render.
  */
-async function trackedTimeOfComment(d1: D1Database, viewer: Viewer, pair: RepositoryWithOwner, issue: IssueRow, comment: CommentRow): Promise<TimelineTrackedTime | null> {
+async function trackedTimeOfComment(d1: D1Database, viewer: Viewer, pair: RepositoryWithOwner, issue: IssueRow, comment: CommentRow): Promise<TimelineTimeCorrelation> {
   let entry: { id: number; issueId: number; userId: number; seconds: number; createdAt: Date | null } | null = null;
+  let expected = false;
   if (comment.type === CommentType.AddTimeManual && (comment.content ?? "").startsWith("|")) {
     const seconds = goParseInt64((comment.content ?? "").slice(1));
     if (comment.posterId !== null && seconds !== 0) {
+      expected = true;
       entry =
         (
           await drizzle(d1)
@@ -971,6 +1058,7 @@ async function trackedTimeOfComment(d1: D1Database, viewer: Viewer, pair: Reposi
         ) ?? null;
     }
   } else if (comment.type === CommentType.StopTracking && comment.posterId !== null && comment.createdAt !== null && comment.createdAt !== undefined) {
+    expected = true;
     entry =
       (
         await drizzle(d1)
@@ -989,8 +1077,11 @@ async function trackedTimeOfComment(d1: D1Database, viewer: Viewer, pair: Reposi
           .then((rows) => (rows[0] === undefined ? null : rows[0]))
       ) ?? null;
   }
+  if (!expected) {
+    return { kind: "none" };
+  }
   if (entry === null) {
-    return null;
+    return { kind: "missing" };
   }
   // t.User (LoadAttributes): the ENTRY's user row — the upstream writer posts
   // the comment as the time's owner, so this is the poster row there; our
@@ -1006,16 +1097,19 @@ async function trackedTimeOfComment(d1: D1Database, viewer: Viewer, pair: Reposi
           .limit(1)
           .then((rows) => (rows[0] === undefined ? null : apiUserFromRow(rows[0], viewer)));
   return {
-    id: entry.id,
-    created: isoOrZero(entry.createdAt),
-    time: entry.seconds,
-    user_id: entry.userId,
-    user_name: entryUser?.login ?? "",
-    issue_id: entry.issueId,
-    // t.Issue (LoadAttributes) — GetTrackedTimeByID filtered the entry to the
-    // comment's own issue, so the render is the SAME issue (correlation keys
-    // include issue_id; the full recursive ToAPIIssue is upstream's shape).
-    issue: await toApiIssue(d1, viewer, pair, issue),
+    kind: "found",
+    time: {
+      id: entry.id,
+      created: isoOrZero(entry.createdAt),
+      time: entry.seconds,
+      user_id: entry.userId,
+      user_name: entryUser?.login ?? "",
+      issue_id: entry.issueId,
+      // t.Issue (LoadAttributes) — GetTrackedTimeByID filtered the entry to the
+      // comment's own issue, so the render is the SAME issue (correlation keys
+      // include issue_id; the full recursive ToAPIIssue is upstream's shape).
+      issue: await toApiIssue(d1, viewer, pair, issue),
+    },
   };
 }
 
@@ -1037,6 +1131,26 @@ async function trackedTimeOfComment(d1: D1Database, viewer: Viewer, pair: Reposi
  * reviews, teams (tier 2/3 surfaces), and the xref issue enrichment (the
  * xref writers land with the push pipeline).
  *
+ * THE DEGENERATE ARMS DROP THE ROW (ledger ⑬-#16, services/convert/
+ * issue_comment.go:34-68): upstream's per-type loads ERROR on a dangling
+ * reference and ToTimelineComment answers `return nil` — the row leaves no
+ * metadata render behind. Three arms error upstream and drop here:
+ *   - the assignee user row missing (LoadAssigneeUserAndTeam →
+ *     GetPossibleUserByID ErrUserNotExist, :37-40);
+ *   - the dependent issue row (or its repo pair) unresolvable
+ *     (LoadDepIssueDetails → GetIssueByID error, :44-47; the pair is
+ *     FK-coupled to the issue, so both collapse to one arm);
+ *   - the expected tracked-time entry absent (LoadTime → GetTrackedTimeByID
+ *     error, :53-56 — see trackedTimeOfComment's `missing`).
+ * The silent-nil arms stay null METADATA renders, matching upstream's
+ * `has → set, else log-and-continue` loads: a dangling milestone
+ * (comment.go:619-638) or label (:575-588) renders null old_milestone/
+ * milestone/label. Upstream's caller appends the nil convert to the response
+ * slice (issue_comment.go:197), emitting an out-of-contract JSON null
+ * element; this renderer answers null and the route FILTERS it — the
+ * schema-valid shape of the same drop (the rows are unreachable through
+ * healthy writes either way).
+ *
  * The poster plus up to four metadata rows (old/new milestone, label,
  * assignee) are fetched per render; the timeline ROUTE passes `preload` (the
  * page-scoped `prefetchTimelineContext` maps — the query-shape audit's A5)
@@ -1053,12 +1167,12 @@ export async function toTimelineComment(
   issue: IssueRow,
   comment: CommentRow,
   preload?: TimelineRenderContext,
-): Promise<TimelineComment> {
+): Promise<TimelineComment | null> {
   const poster = preload === undefined ? await toPoster(d1, viewer, comment.posterId) : posterFromMap(preload.posters, viewer, comment.posterId);
   const issuePageUrl = issueHtmlUrl(pair, viewer.origin, issue.index);
   const htmlUrl = commentHtmlUrl(pair, viewer.origin, issue.index, issue.isPull, comment.id);
 
-  const [oldMilestoneRow, milestoneRow, labelRow, assigneeRow, dependentLeg, trackedTime] = await Promise.all([
+  const [oldMilestoneRow, milestoneRow, labelRow, assigneeRow, dependentLeg, timeCorrelation] = await Promise.all([
     preload !== undefined
       ? milestoneFromMap(preload.milestones, comment.oldMilestoneId)
       : comment.oldMilestoneId === null || comment.oldMilestoneId === undefined
@@ -1104,11 +1218,23 @@ export async function toTimelineComment(
       : preload === undefined
         ? dependentIssueLegOf(d1, comment.dependentIssueId)
         : Promise.resolve(preload.dependentIssues.get(comment.dependentIssueId) ?? null),
-    // The time family's rare arms only — a null for every other row.
+    // The time family's rare arms only — `none` for every other row.
     comment.type === CommentType.AddTimeManual || comment.type === CommentType.StopTracking
       ? trackedTimeOfComment(d1, viewer, pair, issue, comment)
-      : Promise.resolve(null),
+      : Promise.resolve({ kind: "none" as const }),
   ]);
+
+  // The degenerate arms drop the row (see the docstring) — null, never a
+  // null-metadata render.
+  if (comment.assigneeId !== null && comment.assigneeId !== undefined && assigneeRow === null) {
+    return null;
+  }
+  if (comment.dependentIssueId !== null && comment.dependentIssueId !== undefined && dependentLeg === null) {
+    return null;
+  }
+  if (timeCorrelation.kind === "missing") {
+    return null;
+  }
 
   return {
     id: comment.id,
@@ -1124,7 +1250,7 @@ export async function toTimelineComment(
     project_id: 0,
     old_milestone: oldMilestoneRow === null ? null : toApiMilestone(oldMilestoneRow),
     milestone: milestoneRow === null ? null : toApiMilestone(milestoneRow),
-    tracked_time: trackedTime,
+    tracked_time: timeCorrelation.kind === "found" ? timeCorrelation.time : null,
     old_title: comment.oldTitle ?? "",
     new_title: comment.newTitle ?? "",
     old_ref: comment.oldRef ?? "",
@@ -1152,7 +1278,18 @@ export function goRfc3339ParseError(value: string): string {
   return `parsing time "${value}" as "2006-01-02T15:04:05Z07:00": cannot parse "${value}" as "2006"`;
 }
 
-/** RFC3339-only query-time parse (parseFormTime); ""/absent → null; bad → 422. */
+/**
+ * RFC3339-only query-time parse (parseFormTime, services/context/utils.go:31-40);
+ * ""/absent → null; a malformed value → 422 (the GetQueryBeforeSince callers,
+ * routers/api/v1/repo/issue.go:152-156 / issue_comment.go:173-176). A value
+ * that PARSES to unix seconds <= 0 is the UNSET sentinel, never a 422
+ * (ledger ⑬-#13): Go returns the parsed Unix() and every filter gate is
+ * `> 0` — comment.go:1129-1135 (`opts.Since > 0` / `opts.Before > 0`) and
+ * issue_search.go:263-267 (`!= 0` over the same non-negative parse) — so an
+ * epoch-0 `?before=1970-01-01T00:00:00Z` parses fine and filters nothing
+ * (Go's own IsZero year-1 edge, e.g. `0001-01-01T00:00:00Z`, lands here too:
+ * a negative unix).
+ */
 export function parseQueryTime(raw: string | null): number | null {
   const value = (raw ?? "").trim();
   if (value === "") {
@@ -1162,10 +1299,11 @@ export function parseQueryTime(raw: string | null): number | null {
     throw new ApiError(422, goRfc3339ParseError(value));
   }
   const date = new Date(value);
-  if (Number.isNaN(date.getTime()) || date.getTime() === 0) {
+  if (Number.isNaN(date.getTime())) {
     throw new ApiError(422, goRfc3339ParseError(value));
   }
-  return Math.floor(date.getTime() / 1000);
+  const seconds = Math.floor(date.getTime() / 1000);
+  return seconds > 0 ? seconds : null;
 }
 
 /** `state` filter (common.ParseIssueFilterStateIsClosed): null = all. */
@@ -1345,7 +1483,9 @@ function issueFilterConditions(d1: D1Database, repoIds: string[], filters: Issue
     conditions.push(gte(issues.updatedAt, new Date(filters.since * 1000)));
   }
   if (filters.before !== null) {
-    conditions.push(lt(issues.updatedAt, new Date(filters.before * 1000)));
+    // INCLUSIVE boundary (issue_search.go:267 `builder.Lte`) — the ledger
+    // ⑬-#13 boundary arm on the issue list/search side.
+    conditions.push(lte(issues.updatedAt, new Date(filters.before * 1000)));
   }
   if (filters.posterId !== undefined && filters.posterId !== null) {
     conditions.push(eq(issues.posterId, filters.posterId));
@@ -1450,7 +1590,10 @@ function commentTimeConditions(since: number | null, before: number | null): SQL
     conditions.push(gte(comments.updatedAt, new Date(since * 1000)));
   }
   if (before !== null) {
-    conditions.push(lt(comments.updatedAt, new Date(before * 1000)));
+    // INCLUSIVE boundary — `builder.Lte{"comment.updated_unix": opts.Before}`
+    // (models/issues/comment.go:1133-1135; ledger ⑬-#13): a comment updated
+    // exactly at `before` stays in the stream.
+    conditions.push(lte(comments.updatedAt, new Date(before * 1000)));
   }
   return conditions;
 }
@@ -1902,6 +2045,149 @@ export async function changeIssueMilestone(
     );
   }
   await drizzle(d1).batch(statements);
+}
+
+// ---------------------------------------------------------------------------
+// The issue↔project coupling write (ledger ⑯-P3-4's service half) — upstream
+// `IssueAssignOrRemoveProject` (models/issues/issue_project.go:92-160) over
+// the landed projects seams. The API arms: create (issue.go:621-624 — the
+// writer branch passes form.Projects through NewIssue, the non-writer arm
+// clears it) and PATCH (issue.go:827-828 — `canWrite && form.Projects !=
+// nil`, an empty array clearing every membership).
+// ---------------------------------------------------------------------------
+
+/** `CanBeAccessedByOwnerRepo` (models/project/project.go:209-216): repo-scoped
+ *  rows match on repoId, owner-scoped on the owning user/org id. */
+function projectCanBeAccessedByOwnerRepo(repo: RepositoryWithOwner, project: ProjectRow): boolean {
+  if (project.repoId !== "") return project.repoId === repo.repo.id;
+  return repo.repo.ownerId !== null && project.ownerId === repo.repo.ownerId;
+}
+
+/**
+ * The type-30 project comment, the landed projects-service shape verbatim
+ * (services/projects.ts writeProjectComment): the ids ride `content` JSON
+ * (the landed adaptation — upstream has dedicated int64 columns), the row
+ * does NOT count into num_comments (upstream updateCommentInfos,
+ * comment.go:937-948) and bumps the issue's updated_unix. Replicated here
+ * because the REMOVAL arm is upstream's direct row delete
+ * (issue_project.go:113-127 — no column dance) and projects.ts is outside
+ * this family's file set; the ADD arm rides the landed addIssueToColumn,
+ * which writes the same shape internally.
+ */
+async function writeIssueProjectComment(
+  d1: D1Database,
+  issueId: number,
+  posterId: number | null,
+  payload: Record<string, unknown>,
+  now: Date,
+): Promise<void> {
+  const db = drizzle(d1);
+  await db.batch([
+    db.insert(comments).values({
+      type: CommentType.Project,
+      posterId,
+      issueId,
+      content: JSON.stringify(payload),
+      createdAt: now,
+      updatedAt: now,
+    }),
+    db.update(issues).set({ updatedAt: now }).where(eq(issues.id, issueId)),
+  ]);
+}
+
+export interface IssueProjectsWriteResult {
+  /** Memberships created, request order deduped (util.DiffSlice's added). */
+  added: number[];
+  /** Memberships removed, stored order deduped (util.DiffSlice's removed). */
+  removed: number[];
+}
+
+/**
+ * The API diff writer behind both arms. Upstream order: removals first, then
+ * adds, one type-30 comment per side (issue_project.go:110-152); adds land
+ * in the project's DEFAULT column at its next sorting through the landed
+ * `addIssueToColumn` (the web sidebar arm's primitive,
+ * ui/pages/issue-sidebar-writes.ts). Requested ids resolve UNSCOPED
+ * (GetProjectsMapByIDs — any scope); a missing id is upstream's
+ * `project %d not found` (util.NewNotExistErrorf, :123-126) and an
+ * inaccessible one `issue %d can't be accessed by project %d`
+ * (util.NewPermissionDeniedErrorf, :128-130) — the API arms map the
+ * ErrNotExist/ErrPermissionDenied pair to 400 (issue.go:633-636 create /
+ * :829-833 PATCH), so both throw here BEFORE any write (upstream's tx rolls
+ * the whole diff back — the observable "bad request touches nothing" is
+ * kept by validating up front). Returns the diff for callers; upstream
+ * notifies IssueChangeProjects whose only implementation is the workflow
+ * notifier (services/projects/workflow_notifier.go:32 — NO webhook, NO mail
+ * arm exists), so this write emits nothing by design.
+ */
+export async function assignOrRemoveIssueProjects(
+  d1: D1Database,
+  repo: RepositoryWithOwner,
+  issue: IssueRow,
+  requestedProjectIds: number[],
+  doerId: number,
+  now: Date,
+): Promise<IssueProjectsWriteResult> {
+  const membershipRows = await drizzle(d1)
+    .select({ projectId: projectIssues.projectId })
+    .from(projectIssues)
+    .where(eq(projectIssues.issueId, issue.id))
+    .all();
+  const current = membershipRows.map((row) => row.projectId);
+  // util.DiffSlice (modules/util/util.go:323-338): added keeps the request
+  // order deduped, removed keeps the stored order deduped.
+  const oldSet = new Set(current);
+  const newSet = new Set(requestedProjectIds);
+  const added: number[] = [];
+  const addedSeen = new Set<number>();
+  for (const id of requestedProjectIds) {
+    if (!oldSet.has(id) && !addedSeen.has(id)) {
+      addedSeen.add(id);
+      added.push(id);
+    }
+  }
+  const removed: number[] = [];
+  const removedSeen = new Set<number>();
+  for (const id of current) {
+    if (!newSet.has(id) && !removedSeen.has(id)) {
+      removedSeen.add(id);
+      removed.push(id);
+    }
+  }
+
+  // The adds' resolution/validation first (the rollback-equivalent posture —
+  // see the docstring), request order like upstream's add loop.
+  const addRows: ProjectRow[] = [];
+  for (const projectId of added) {
+    const rows = await drizzle(d1).select().from(projects).where(eq(projects.id, projectId)).limit(1);
+    const project = rows[0];
+    if (project === undefined) {
+      throw new ApiError(400, `project ${projectId} not found`);
+    }
+    if (!projectCanBeAccessedByOwnerRepo(repo, project)) {
+      throw new ApiError(400, `issue ${issue.id} can't be accessed by project ${project.id}`);
+    }
+    addRows.push(project);
+  }
+
+  // Removals: the direct membership delete + one removal comment per project
+  // (upstream's exact shape — CreateComment{OldProjectID: projectID,
+  // ProjectID: 0}).
+  if (removed.length > 0) {
+    await drizzle(d1)
+      .delete(projectIssues)
+      .where(and(eq(projectIssues.issueId, issue.id), inArray(projectIssues.projectId, removed)));
+    for (const projectId of removed) {
+      await writeIssueProjectComment(d1, issue.id, doerId, { old_project_id: projectId, project_id: 0 }, now);
+    }
+  }
+  // Adds: the default column + the landed attach seam (which writes the
+  // add comment {old_project_id: 0, project_id: project.id} internally).
+  for (const project of addRows) {
+    const defaultColumn = await mustDefaultColumn(d1, project, now);
+    await addIssueToColumn(d1, project, issue, defaultColumn, doerId, now);
+  }
+  return { added, removed };
 }
 
 // ---------------------------------------------------------------------------
@@ -2422,10 +2708,10 @@ async function emitIssueDeletedEvent(d1: D1Database, event: IssueDeletedEvent, e
  * `IssueUser` bean is not modeled (the derived read-state design — schema's
  * notification_states comment). The `ProjectIssue` detach (issue.go:246)
  * rides this sweep too — the review-wave closure: without it a deleted issue
- * left a ghost `project_issues` membership row behind. DEVIATION (kept):
- * upstream also removes `refs/pull/N/head` from the engine
- * (services/issue/issue.go:174–181) — the engine ref write lands with the PR
- * routes (SPEC-0005 §3.4) and is deferred with them.
+ * left a ghost `project_issues` membership row behind. The upstream git-data
+ * half (issue.go:173–181 — the `refs/pull/N/head` RemoveRef) lands through
+ * `removePullHeadRefOf` below, riding the emission context's REPO binding
+ * (ledger ⑬-#B).
  *
  * Attachment STORAGE is deleted first (the landed single-attachment delete's
  * storage-first contract — routes/issue-attachments.ts:986-991: a failed R2
@@ -2443,6 +2729,58 @@ async function emitIssueDeletedEvent(d1: D1Database, event: IssueDeletedEvent, e
  * the second attempt; the IsPull discriminant picks the arm, so a delete
  * never emits both).
  */
+/**
+ * The PR's `refs/pull/N/head` sweep (ledger ⑬-#B — the stale-deferral close):
+ * upstream DeleteIssue deletes the pull request's git data after the bean
+ * cascade — `git.RemoveRef(ctx, issue.PullRequest.BaseRepo,
+ * issue.PullRequest.GetGitHeadRefName())` (services/issue/issue.go:173-181;
+ * `update-ref --no-deref -d`, modules/git/ref.go:264-266) — so a deleted PR
+ * never leaves a ghost head ref on the base cell. Rides the emission
+ * context's REPO binding: a bare cascade (in-process callers without a
+ * request, the webhook half's fail-closed posture) leaves the engine
+ * untouched. Error posture mirrors upstream: a refused delete THROWS after
+ * the D1 cascade committed — the same post-commit failure upstream's
+ * RemoveRef error produces (the retry then 404s at the issue lookup). The
+ * one tolerated arm is the ref ALREADY absent: upstream's `update-ref -d`
+ * errors there too, but our pre-refs-era PR rows (created before the
+ * refs/pull machinery landed) make the arm reachable-in-practice, and the
+ * engine itself models an already-gone ref as an idempotent ok
+ * (deleteApiRef's `ref_conflict` with a null currentOid). A CAS loss
+ * (concurrent push moved the tip between the read and the delete) retries
+ * once with the fresh tip before giving up.
+ */
+async function removePullHeadRefOf(d1: D1Database, pr: PullRequestRow, repo: ApiEnv["Bindings"]["REPO"]): Promise<void> {
+  const pair = await findRepositoryById(d1, pr.baseRepoId);
+  if (pair === null) {
+    // Upstream LoadBaseRepo errors here and fails the delete; the base repo
+    // row is gone either way, so the sweep degrades to a skip (the FK keeps
+    // this unreachable through healthy deletes).
+    console.error(`[issues] delete: PR head-ref sweep skipped, base repository row missing [id: ${pr.baseRepoId}]`);
+    return;
+  }
+  const cell = repo.getByName(engineRepoName({ ownerNamespace: pair.repo.ownerNamespace, slug: pair.repo.slug }));
+  const ref = pullHeadRef(pr.index);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const tip = await cell.readCommit(ref);
+    if (tip === null) {
+      return; // already absent — the engine's idempotent-gone ok
+    }
+    const result = await cell.deleteApiRef({ ref, expectedOid: tip.oid });
+    if (result.tag === "deleted") {
+      return;
+    }
+    if (result.tag === "ref_conflict" && result.currentOid === null) {
+      return; // raced to absent — same idempotent ok
+    }
+    if (result.tag !== "ref_conflict") {
+      throw new Error(`pull head ref delete refused (${result.tag}${result.tag === "invalid" ? `: ${result.reason}` : ""})`);
+    }
+    // ref_conflict with a live currentOid: a concurrent push moved the tip —
+    // one retry with the fresh value, then the failure propagates.
+  }
+  throw new Error(`pull head ref delete kept losing the CAS race [ref: ${ref}]`);
+}
+
 export async function deleteIssueCascade(d1: D1Database, bucket: R2Bucket, issue: IssueRow, emission?: IssueDeleteEmission): Promise<void> {
   let event: IssueDeletedEvent | null = null;
   if (emission !== undefined) {
@@ -2452,6 +2790,13 @@ export async function deleteIssueCascade(d1: D1Database, bucket: R2Bucket, issue
       console.error(`[issues] delete webhook render failed (deleted): ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+  // The PR row is captured BEFORE the batch — upstream LoadPullRequest
+  // (issue.go:160-162) runs pre-delete too, and the post-commit head-ref
+  // sweep (:173-181) reads it: the batch below deletes the row, so a
+  // post-batch re-query would always miss and silently skip the sweep.
+  const pullRow = issue.isPull
+    ? ((await drizzle(d1).select().from(pullRequests).where(eq(pullRequests.issueId, issue.id)).limit(1).all())[0] ?? null)
+    : null;
   const attachmentKeys = (
     await drizzle(d1)
       .select({ r2Key: issueAttachments.r2Key })
@@ -2568,6 +2913,12 @@ export async function deleteIssueCascade(d1: D1Database, bucket: R2Bucket, issue
     );
   }
   await drizzle(d1).batch(statements);
+  // The PR head-ref sweep sits between the bean cascade and the notify,
+  // upstream's DeleteIssue order (issue.go:167-181 → notify at :183). It
+  // consumes the PRE-batch PR row captured above.
+  if (pullRow !== null && emission !== undefined) {
+    await removePullHeadRefOf(d1, pullRow, emission.env.REPO);
+  }
   // The delete event fans out AFTER the sweep committed (upstream notify
   // order, issue.go:183) — from the pre-delete render taken above.
   if (event !== null && emission !== undefined) {
