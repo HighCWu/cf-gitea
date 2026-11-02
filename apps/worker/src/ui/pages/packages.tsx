@@ -155,6 +155,21 @@
  * - The `type` filter select renders the 23-member TypeList (the model's
  *   open string set — SPEC-0016 §5.9); `all` and the empty value both clear
  *   the facet (the template's `{{if eq $.PackageType $type}}` selected arm).
+ * - The strip's ACTIVE posture (the K2 drift adjudication, landed K10):
+ *   upstream marks the Packages tab active with `IsPackagesPage` —
+ *   package.go:103/:197/:348/:418 set it on every handler of this family,
+ *   and user/overview/header.tmpl:23 + org/menu.tmpl:24 test it
+ *   (repo/header.tmpl:141 on the repo tab) — NOT `TabName` (profile.go:90
+ *   is the whole tree's only TabName setter, fed by the `tab` form value,
+ *   never "packages"). With TabName unset the Repositories item renders
+ *   INACTIVE on every packages page (header.tmpl:8's
+ *   `eq .TabName "repositories"`, menu.tmpl:9's `PageIsViewRepositories`).
+ *   The USER arm lands that (`repositoriesActive={false}` on ProfileTabs in
+ *   UserProfileGrid + package-settings.tsx); the ORG arm keeps Repositories
+ *   ACTIVE — OrgMenu (org-home.tsx, the strip's owner) keys that class on
+ *   `projectsTab?.active` and carries no repositories-active control, so
+ *   the upstream shape is inexpressible from this consumer. RECORDED
+ *   divergence; extending OrgMenu is its owner's change.
  */
 
 import { and, asc, desc, eq, inArray, like, sql } from "drizzle-orm";
@@ -1516,8 +1531,14 @@ function PackagesListBlock(props: {
  *  overview header). The avatar card renders the wave I-b C2 follow button
  *  + C3 admin gear beside the unconditional RSS anchor
  *  (profile_big_avatar.tmpl:123-136/:18/:31-33); the overview header carries
- *  the C1 Projects + Code tabs INACTIVE (header.tmpl:14-31 — the Packages
- *  tab stays the active one here, `.IsPackagesPage`). */
+ *  the C1 Projects + Code tabs INACTIVE (header.tmpl:14-31) with the strip's
+ *  one ACTIVE item the Packages tab itself: upstream marks it via
+ *  `IsPackagesPage` (header.tmpl:23 — package.go:103/:197/:348/:418 set it
+ *  on every handler of this family), while Repositories renders INACTIVE
+ *  because `TabName` is unset here (header.tmpl:8's
+ *  `eq .TabName "repositories"` — the packages routes never set TabName;
+ *  profile.go:90 is the tree's only setter, fed by the `tab` form value,
+ *  never "packages") — hence `repositoriesActive={false}`. */
 function UserProfileGrid(props: {
   ctx: UiContext;
   user: UserProfileRow;
@@ -1542,6 +1563,7 @@ function UserProfileGrid(props: {
             username={username}
             repoCount={props.chrome.repoCount}
             starsCount={props.user.numStars}
+            repositoriesActive={false}
             projectsTab={{ active: false, count: props.chrome.openProjects, href: `/${username}/-/projects` }}
             packagesTab={{ active: true, href: `/${username}/-/packages` }}
             codeTab={{ active: false, href: `/${username}/-/code` }}
@@ -1557,7 +1579,15 @@ function UserProfileGrid(props: {
  *  Packages tab ACTIVE) — exported for pages/package-settings.tsx, the
  *  settings page's org arm. The header's follow button is the C2 arm
  *  (org/header.tmpl:17); the menu's Code tab is the C1 arm (menu.tmpl:28-32,
- *  inactive here). */
+ *  inactive here). RECORDED DIVERGENCE (the K2 drift adjudication, module
+ *  header): upstream renders the menu's Repositories item INACTIVE on this
+ *  family (menu.tmpl:9's `PageIsViewRepositories` — never set here) beside
+ *  the ACTIVE Packages item (:24's `IsPackagesPage`), but OrgMenu
+ *  (org-home.tsx — the strip's owner, outside this wave's ownership) keys
+ *  the Repositories active class on `projectsTab?.active` and carries no
+ *  repositories-active control, so the upstream shape is inexpressible from
+ *  this consumer; Repositories stays ACTIVE until OrgMenu's owner extends
+ *  it. */
 export function OrgPackagesChrome(props: {
   ctx: UiContext;
   org: OrgRecord;

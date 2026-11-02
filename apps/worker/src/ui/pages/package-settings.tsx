@@ -618,12 +618,16 @@ export function PackageSettingsPage(props: {
       <SettingsAvatarStrip owner={data.owner} />
       <div class="ui container">
         {/* The overview header (user/overview/header.tmpl): the Packages tab
-            ACTIVE (`.IsPackagesPage`), the wave I-b C1 Projects + Code tabs
-            INACTIVE (header.tmpl:14-31). */}
+            ACTIVE (`.IsPackagesPage` — PackageSettings' package.go:418), the
+            wave I-b C1 Projects + Code tabs INACTIVE (header.tmpl:14-31), and
+            Repositories INACTIVE too — TabName is unset on this page
+            (header.tmpl:8's `eq .TabName "repositories"`; the tree's only
+            TabName setter is profile.go:90, never reached here). */}
         <ProfileTabs
           username={user.username}
           repoCount={data.repoCount}
           starsCount={user.numStars}
+          repositoriesActive={false}
           projectsTab={{ active: false, count: data.openProjects, href: `/${user.username}/-/projects` }}
           packagesTab={{ active: true, href: `/${user.username}/-/packages` }}
           codeTab={{ active: false, href: `/${user.username}/-/code` }}

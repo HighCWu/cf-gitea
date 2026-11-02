@@ -407,6 +407,11 @@ describe("the wave I-b strip arms on the settings page", () => {
     expect(html).toContain('class="item" href="/ibsetter/-/code"');
     expect(html).not.toContain('class="active item" href="/ibsetter/-/code"');
     expect(html).toContain('<a class="active item" href="/ibsetter/-/packages">'); // ACTIVE Packages
+    // Repositories INACTIVE — the settings handler rides IsPackagesPage
+    // alone (package.go:418; TabName unset, header.tmpl:8's
+    // `eq .TabName "repositories"`).
+    expect(html).toContain('<a class="item" href="/ibsetter?tab=repositories">');
+    expect(html).not.toContain('class="active item" href="/ibsetter?tab=repositories"');
     // org_profile_avatar.tmpl carries no follow control, no gear, no RSS —
     // the shared profile_big_avatar arms never render on this page.
     expect(html).not.toContain('method="post" action="/ibsetter?action=');

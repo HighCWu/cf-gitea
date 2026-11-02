@@ -1000,6 +1000,13 @@ describe("the wave I-b strip arms on the packages pages", () => {
     expect(html).toContain('class="item" href="/ibowner/-/code"');
     expect(html).not.toContain('class="active item" href="/ibowner/-/code"');
     expect(html).toContain('<a class="active item" href="/ibowner/-/packages">'); // the ACTIVE Packages tab
+    // The strip's ONE active item is Packages (header.tmpl:23's
+    // `.IsPackagesPage`); Repositories renders INACTIVE — the packages
+    // routes never set TabName (package.go:103/:197/:348/:418;
+    // header.tmpl:8's `eq .TabName "repositories"`; profile.go:90 is the
+    // tree's only TabName setter, never "packages").
+    expect(html).toContain('<a class="item" href="/ibowner?tab=repositories">');
+    expect(html).not.toContain('class="active item" href="/ibowner?tab=repositories"');
     expect(html).toContain('href="/ibowner.rss"'); // the card's unconditional RSS anchor
     expect(html).not.toContain('data-tooltip-content="User Details"'); // no gear for a non-admin
 
@@ -1036,6 +1043,15 @@ describe("the wave I-b strip arms on the packages pages", () => {
     expect(html).toContain('class="item" href="/iborg/-/code"');
     expect(html).not.toContain('class="active item" href="/iborg/-/code"');
     expect(html).toContain('<a class="active item" href="/iborg/-/packages">');
+    // RECORDED divergence (the K2 adjudication, module header): upstream
+    // renders the menu's Repositories item INACTIVE here (menu.tmpl:9's
+    // `PageIsViewRepositories` — never set by the packages routes) beside
+    // the ACTIVE Packages item (:24's `IsPackagesPage`), but OrgMenu
+    // (org-home.tsx — the strip's owner, outside the packages waves'
+    // ownership) keys the Repositories active class on
+    // `projectsTab?.active` and carries no repositories-active control;
+    // the item stays ACTIVE until OrgMenu's owner extends it. No assert —
+    // neither the drifted nor the upstream state is enshrined here.
     // The org arm renders no avatar card — no gear site.
     expect(html).not.toContain('id="profile-avatar-card"');
 
@@ -1061,6 +1077,11 @@ describe("the wave I-b strip arms on the packages pages", () => {
     expect(html).toContain('class="item" href="/ibview/-/projects"');
     expect(html).toContain('<div class="ui small label">1</div>');
     expect(html).toContain('class="item" href="/ibview/-/code"');
+    // The version view's strip: Repositories INACTIVE beside the ACTIVE
+    // Packages tab (the same IsPackagesPage/TabName posture — package.go:
+    // 197, header.tmpl:8/:23).
+    expect(html).toContain('<a class="item" href="/ibview?tab=repositories">');
+    expect(html).not.toContain('class="active item" href="/ibview?tab=repositories"');
 
     // The org twin: the view page's OrgPackagesChrome carries the follow
     // button + the inactive Code tab too.
