@@ -484,7 +484,10 @@ commit (`pull-reviews.ts`, migration 0018).
   never enforced: there is no CI (SPEC-0012 gated) and statuses are a write-only
   API (`src/api/routes/statuses.ts`); the `IsPullCommitStatusPass` arm
   (`merge.go:707-713`) has no producer. Enforcement returns only with a status
-  consumer.
+  consumer. (The scoped-workflow half of this gap — the consumer-side
+  opt-out store, the scoped workflow toggle/dispatch arms — landed
+  2026-11-03: see "As-built — the scoped-workflow half-stage" below; the
+  merge-gate enforcement side stays with the M3 trigger chain.)
 - **Protected/unprotected file patterns** — pre-receive diff walking
   (`hook_pre_receive.go:210-226`) is real CPU per push for the least-demanded arm;
   the `unprotected_files_only` allowance (`:248-260`) compounds it.
@@ -737,3 +740,112 @@ API-render ids, wildcard GET/PATCH/DELETE on a multi-segment name + the
 mount-composition test); probe battery arm `bp-slash-glob-wildcard` added and
 `bp-rule-priority-204` rewritten API-only — the full battery re-run green
 against local `pnpm dev` (18/18 arms, verdict true).
+
+## As-built — the scoped-workflow half-stage (2026-11-03, the v1.5.4 C10 landing)
+
+§6's status-check clause and the release notes' "scoped-workflow status
+half-stage" pointer resolve here: the consumer-side opt-out store, the
+workflow toggle's scoped branch and the dispatch producer's scoped
+resolution landed as ONE unit (Wave K4), riding the substrate the earlier
+waves staged (the `action_scoped_workflow_source` store, migration 0051's
+table + `services/actions/scoped-workflow-sources.ts`; the pure layer
+`scoped-workflows.ts`; the settings pages). Upstream citations at the pin
+`fc493688`: `models/repo/repo_unit_actions.go:111-131` (the
+DisabledScopedWorkflows trio), `models/actions/scoped_workflow.go:84-159`
+(the effective-source/required/opted-out reads),
+`routers/web/repo/actions/view.go:1324-1375` (disableOrEnableWorkflowFile's
+scoped branch), `services/actions/workflow.go:64-199,237-268`
+(DispatchActionWorkflow's isScoped arms + resolveScopedDispatchContent),
+`models/actions/run.go:56-61,113-115` (the run's content-source columns and
+the scoped run link's param), `run_list.go:198-200` (GetRepoRunWorkflowIDs'
+is_scoped_run=false arm).
+
+**Landed (the unit's files):**
+
+- `services/actions/config.ts` — the scoped map's mutators
+  (`disableScopedWorkflow`/`enableScopedWorkflow`/`isScopedWorkflowDisabled`,
+  the upstream trio including the emptied-key DELETE and the
+  repo-level/scoped independence), the effective-source reads
+  (`isScopedWorkflowSourceEffective`, `isScopedWorkflowRequired`,
+  `isScopedWorkflowOptedOut` — the flagged-AND-not-required conjunction with
+  upstream's unflagged early-out; composed from the sources store's indexed
+  (owner, repo) gets over owner 0 + the consumer owner), and the toggle arm
+  `toggleRepoActionsWorkflow` (view.go's body: scoped disable refuses with
+  `"scoped-required"` when the registration marks the workflow required —
+  the `actions.workflow.scoped_required_cannot_disable` JSONError arm, NO
+  save —; scoped enable never consults required; the repo-level arm keeps
+  the landed splice semantics; persist via the landed
+  saveRepoActionsConfig). The map's keys are the TEXT repositories.id space
+  (the schema's own TEXT adaptation, schema.ts:3931 — upstream's
+  map[int64][]string rides JSON string keys either way).
+- `services/actions/workflow-dispatch.ts` — the dispatch producer's scoped
+  resolution (the module header carries the full contract): the opt-out
+  disabled check, the effective-source gate (a miss answers the same
+  `actions.workflow.not_found` translatable), the source repo row, the
+  SOURCE default-branch `SCOPED_WORKFLOW_DIRS` walk with the entry-name
+  match, and the run's content-source columns written post-insert
+  (`workflow_repo_id`/`workflow_commit_sha`/`is_scoped_run` — upstream sets
+  them on the run skeleton BEFORE PrepareRunAndInsert; the shared insert
+  cannot carry them, so the scoped arm compensates with one UPDATE). The
+  first PRODUCER of the `is_scoped_run` parity column (SPEC-0012 §1.4's
+  "schema lands, nothing writes" note is superseded for this arm).
+- `ui/pages/repo-actions-runs.tsx` — the "Other workflows" listing
+  excludes scoped runs (`is_scoped_run = false`), GetRepoRunWorkflowIDs'
+  arm made load-bearing by the new producer.
+- Tests: `services/actions/config.test.ts` (the trio's semantics, the
+  effective/required/opted-out reads over real D1, the toggle arm's
+  scoped/repo-level/required-refusal/missing arms) and
+  `services/actions/workflow-dispatch.test.ts` (the scoped resolution:
+  instance- and owner-level effectiveness, the missing-entry not-found,
+  the opt-out disabled answer, the required workflow dispatching anyway,
+  the store/engine throw arms, the shared validation ladder over the
+  SOURCE content, the persisted content-source columns).
+
+**Recorded (NOT staged — each cites why):**
+
+- The runs-list per-run FILTER by `scoped_workflow_source_repo_id`
+  (upstream `actions.go:454-460`: `WorkflowRepoID` + `IsScopedRun`
+  constraints on FindRunOptions; the API twin `shared/action.go:143-146`).
+  The upstream param is FormInt64 over an int64 repo-id space; ours is
+  TEXT — the numeric parse landed on the page (junk → 0, the matrix pins)
+  cannot carry a TEXT source id, and flipping the param's type breaks the
+  pinned wire (`=0` renderings, junk→0) in files outside the unit's
+  ownership. Staging waits for a wave that owns the runs page + its
+  matrix pins together; the filter links' passthrough shape is unchanged.
+- The sidebar's scoped-workflow groups (sidebar.tmpl:17-34,
+  `actions.go:296-366` prepareScopedWorkflows) and the scoped dispatch
+  banner (prepareWorkflowDispatchTemplate's `loadScopedWorkflowModel`,
+  actions.go:372-406) — the C10 pages' remaining surface; they need the
+  source-repo parse/cache layer and the scoped engine binding on the page.
+- The rerun scoped twin (view.go:929-936: `run.IsScopedRun` →
+  IsScopedWorkflowOptedOut) — rerun.ts/repo-actions-view.tsx were outside
+  the unit's ownership; the check it needs
+  (`isScopedWorkflowOptedOut`) is exported by config.ts now, so the wire
+  is one guard away.
+- The workflow-toggle and dispatch AUDIT emits (RecordWorkflowToggle,
+  workflow.go:46-52/205-206) — unchanged deferral: the
+  `actions:workflow:{enable,disable,dispatch}` ids are not in the landed
+  AuditActions table.
+- The github context's `workflow_sha` on a scoped run carries the
+  CONSUMER commitSha (the shared insert derives it from the run's commit,
+  trigger.ts) where upstream carries run.WorkflowCommitSHA (context.go:115
+  — the SOURCE sha). The run COLUMNS are correct; only the context field
+  diverges until the insert grows a workflowSha input.
+- The upstream parse-first nuance: ParseScopedWorkflows drops files whose
+  `on:` fails to decode BEFORE the entry match (scoped_workflows.go:50-52);
+  ours matches by name first and applies the light validation after, so a
+  broken scoped file answers the invalid arm instead of not-found (the
+  module header's light-check class).
+
+**Divergences recorded:** the `scoped_workflow_source_repo_id` param
+carries the TEXT repo id verbatim where upstream parses FormInt64 (the
+handlers' parse adaptation is the orchestrator's hunk; both service arms
+normalize through config.ts's `scopedSourceRepoParam` — "" (absent) and
+"0" (the landed page's dispatch form always posts it) are the repo-level
+arm, upstream's FormInt64 zero exactly). A bogus NON-empty id diverges:
+upstream's junk→0 falls to the repo-level arm, ours takes the scoped arm
+where the dispatch's effective-source gate answers not-found and the
+toggle writes a dead opt-out key (admin-only, exactly what upstream's
+deliberate nonexistent-source opt-out writes). Numeric non-zero ids ride
+the scoped arm and answer not-found — upstream's identical wire answer
+for a nonexistent numeric repo, reached through the same gate.

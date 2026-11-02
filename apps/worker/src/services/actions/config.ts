@@ -12,8 +12,9 @@
  *     (models/repo/repo_unit_actions.go:76-93): CollaborativeOwnerIDs,
  *     TokenPermissionMode, MaxTokenPermissions, OverrideOwnerConfig plus
  *     the workflow-disable maps (DisabledWorkflows, DisabledScopedWorkflows
- *     — carried for round-trip fidelity; their write arms are the
- *     workflow-list pages, not this store's settings arms). Landed
+ *     — the repo-level map's write arms stay the workflow-list pages, not
+ *     this store's settings arms; the SCOPED map's arms landed with the C10
+ *     half-stage — the section at the foot of this file). Landed
  *     home: `repo_units.config` (schema.ts, migration 0043) —
  *     column-for-column with upstream, on the same row the landed unit
  *     toggle already maintains in lockstep (repo-settings.ts
@@ -71,6 +72,7 @@ import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
 import { repoUnits } from "../../db/schema";
+import { scopedWorkflowSourcesStore, type ScopedWorkflowSourceRow } from "./scoped-workflow-sources";
 
 // ---------------------------------------------------------------------------
 // The enum/values (models/repo/repo_unit_actions.go:15-26, 30-56)
@@ -371,6 +373,153 @@ export async function applyRepoTokenPermissionsForm(d1: D1Database, repoId: stri
     } else {
       cfg.maxTokenPermissions = null;
     }
+  }
+  return (await saveRepoActionsConfig(d1, repoId, cfg)) === "saved" ? "saved" : "missing";
+}
+
+// ---------------------------------------------------------------------------
+// The scoped-workflow opt-out arms (the C10 half-stage): the
+// DisabledScopedWorkflows map's mutators (repo_unit_actions.go:111-131),
+// the effective-source reads they predicate on (models/actions/
+// scoped_workflow.go:84-151) and the workflow-list pages' toggle arm
+// (routers/web/repo/actions/view.go:1324-1375). The source-repo id is the
+// TEXT repositories.id space (the schema's own TEXT adaptation,
+// schema.ts:3931 — upstream's map[int64][]string keys ride JSON string
+// keys either way).
+// ---------------------------------------------------------------------------
+
+/** The `scoped_workflow_source_repo_id` form param's TEXT adaptation
+ *  (shared by the toggle and dispatch arms): upstream parses FormInt64 —
+ *  absent/junk → 0 and a literal "0" both mean the repo-level arm — while
+ *  our source ids are TEXT. "" and "0" reduce to the repo-level ""; every
+ *  other nonempty value rides verbatim as a source-id candidate (a bogus
+ *  one is policed downstream: the dispatch's effective-source gate answers
+ *  not-found, the toggle writes a dead opt-out key exactly as upstream's
+ *  deliberate nonexistent-source opt-out does). */
+export function scopedSourceRepoParam(raw: string): string {
+  return raw === "" || raw === "0" ? "" : raw;
+}
+
+/** IsScopedWorkflowDisabled (:111-113) — the consumer's opt-out flag for
+ *  (sourceRepoId, workflowId). */
+export function isScopedWorkflowDisabled(cfg: Pick<RepoActionsConfig, "disabledScopedWorkflows">, sourceRepoId: string, workflowId: string): boolean {
+  return cfg.disabledScopedWorkflows[sourceRepoId]?.includes(workflowId) === true;
+}
+
+/** DisableScopedWorkflow (:115-123) — append-if-absent per source repo.
+ *  Pure: the caller persists with saveRepoActionsConfig. */
+export function disableScopedWorkflow(cfg: RepoActionsConfig, sourceRepoId: string, workflowId: string): void {
+  const ids = cfg.disabledScopedWorkflows[sourceRepoId] ?? [];
+  if (ids.includes(workflowId)) return;
+  cfg.disabledScopedWorkflows[sourceRepoId] = [...ids, workflowId];
+}
+
+/** EnableScopedWorkflow (:125-132) — remove-all; an emptied entry DELETES
+ *  the map key (upstream's `delete(cfg.DisabledScopedWorkflows, ...)`,
+ *  so the serializer emits Go's nil-map null once the last opt-out goes).
+ *  Pure: the caller persists. */
+export function enableScopedWorkflow(cfg: RepoActionsConfig, sourceRepoId: string, workflowId: string): void {
+  const ids = cfg.disabledScopedWorkflows[sourceRepoId];
+  if (ids === undefined) return;
+  const rest = ids.filter((id) => id !== workflowId);
+  if (rest.length === 0) {
+    delete cfg.disabledScopedWorkflows[sourceRepoId];
+    return;
+  }
+  cfg.disabledScopedWorkflows[sourceRepoId] = rest;
+}
+
+// --- the effective-source reads (models/actions/scoped_workflow.go) -------
+
+/** GetEffectiveScopedWorkflowSources (:84-91) reduced to what the toggle and
+ *  dispatch arms ask: the (owner, sourceRepo) registration rows effective for
+ *  a repo owned by consumerOwnerId — the owner's own rows plus the
+ *  instance-level (owner_id=0) rows. The landed sources store's
+ *  (owner, repo) get composes the two rows (an indexed get each) — the
+ *  upstream single EXISTS/Find over owner_id IN (0, ownerId) rides the same
+ *  UNIQUE(owner_repo) index. */
+async function effectiveSourceFor(
+  d1: D1Database,
+  consumerOwnerId: number,
+  sourceRepoId: string,
+): Promise<ScopedWorkflowSourceRow | null> {
+  const store = scopedWorkflowSourcesStore(d1);
+  const instance = await store.getSource(0, sourceRepoId);
+  if (instance !== null) return instance;
+  if (consumerOwnerId === 0) return null;
+  return store.getSource(consumerOwnerId, sourceRepoId);
+}
+
+/** IsScopedWorkflowSourceEffective (:93-101) — is sourceRepoId a scoped
+ *  source for a repo owned by consumerOwnerId. */
+export async function isScopedWorkflowSourceEffective(d1: D1Database, consumerOwnerId: number, sourceRepoId: string): Promise<boolean> {
+  return (await effectiveSourceFor(d1, consumerOwnerId, sourceRepoId)) !== null;
+}
+
+/** IsWorkflowRequiredInSources (:103-108) over the effective rows — the
+ *  source registration marks this workflow required (a required workflow
+ *  cannot be opted out and still gates merges). */
+function isWorkflowRequiredInSource(source: ScopedWorkflowSourceRow | null, workflowId: string): boolean {
+  return source?.workflowConfigs[workflowId]?.required === true;
+}
+
+/** IsScopedWorkflowRequired (:151-159) — required by any effective source. */
+export async function isScopedWorkflowRequired(d1: D1Database, consumerOwnerId: number, sourceRepoId: string, workflowId: string): Promise<boolean> {
+  return isWorkflowRequiredInSource(await effectiveSourceFor(d1, consumerOwnerId, sourceRepoId), workflowId);
+}
+
+/** ScopedWorkflowOptedOut (:146-151) — the consumer's opt-out of
+ *  (sourceRepoId, workflowId) is in effect: flagged disabled AND not
+ *  required by the effective registration. */
+function scopedWorkflowOptedOut(cfg: Pick<RepoActionsConfig, "disabledScopedWorkflows">, source: ScopedWorkflowSourceRow | null, sourceRepoId: string, workflowId: string): boolean {
+  return !isWorkflowRequiredInSource(source, workflowId) && isScopedWorkflowDisabled(cfg, sourceRepoId, workflowId);
+}
+
+/** IsScopedWorkflowOptedOut (:139-144) — the store read with upstream's
+ *  cheap early-out: an unflagged consumer answers false without touching the
+ *  sources table. This is the DISPATCH (:84-99 of services/actions/
+ *  workflow.go) and RERUN (view.go:929-936) disabled check's scoped arm. */
+export async function isScopedWorkflowOptedOut(d1: D1Database, cfg: Pick<RepoActionsConfig, "disabledScopedWorkflows">, consumerOwnerId: number, sourceRepoId: string, workflowId: string): Promise<boolean> {
+  if (!isScopedWorkflowDisabled(cfg, sourceRepoId, workflowId)) {
+    return false;
+  }
+  return scopedWorkflowOptedOut(cfg, await effectiveSourceFor(d1, consumerOwnerId, sourceRepoId), sourceRepoId, workflowId);
+}
+
+// --- the workflow-list pages' toggle arm (view.go:1324-1375) --------------
+
+/** The disableOrEnableWorkflowFile body (view.go:1324-1375) minus the wire
+ *  (the handler owns the form parse, the JSONError/JSONRedirect answers and
+ *  the RecordWorkflowToggle emit — the landed actions-workflow-toggle
+ *  handler's shape): load the config, branch scoped vs repo-level, persist.
+ *  The scoped DISABLE refusal — a required scoped workflow can never be
+ *  opted out (:1338-1344's IsScopedWorkflowRequired JSONError,
+ *  "actions.workflow.scoped_required_cannot_disable") — answers
+ *  "scoped-required" with NO save; upstream's SaveSuccess flash arms and
+ *  the enable_success/disable_success texts ride the handler. `"missing"`
+ *  is the unit gate (see saveRepoActionsConfig). */
+export async function toggleRepoActionsWorkflow(
+  d1: D1Database,
+  repoId: string,
+  consumerOwnerId: number,
+  req: { workflowId: string; isEnable: boolean; scopedWorkflowSourceRepoId: string },
+): Promise<"saved" | "scoped-required" | "missing"> {
+  const cfg = await loadRepoActionsConfig(d1, repoId);
+  const scopedSourceRepoId = scopedSourceRepoParam(req.scopedWorkflowSourceRepoId);
+  if (scopedSourceRepoId !== "") {
+    if (!req.isEnable) {
+      // a required scoped workflow can never be opted out (:1338-1344)
+      if (await isScopedWorkflowRequired(d1, consumerOwnerId, scopedSourceRepoId, req.workflowId)) {
+        return "scoped-required";
+      }
+      disableScopedWorkflow(cfg, scopedSourceRepoId, req.workflowId);
+    } else {
+      enableScopedWorkflow(cfg, scopedSourceRepoId, req.workflowId);
+    }
+  } else if (req.isEnable) {
+    cfg.disabledWorkflows = cfg.disabledWorkflows.filter((name) => name !== req.workflowId); // EnableWorkflow's SliceRemoveAll
+  } else if (!cfg.disabledWorkflows.includes(req.workflowId)) {
+    cfg.disabledWorkflows = [...cfg.disabledWorkflows, req.workflowId]; // DisableWorkflow's append-if-absent
   }
   return (await saveRepoActionsConfig(d1, repoId, cfg)) === "saved" ? "saved" : "missing";
 }

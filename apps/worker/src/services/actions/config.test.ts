@@ -31,14 +31,22 @@ import {
   makeRestrictedPermissions,
   makeWriteAllActionsTokenPermissions,
   addRepoActionsCollaborativeOwner,
+  disableScopedWorkflow,
+  enableScopedWorkflow,
+  isScopedWorkflowDisabled,
+  isScopedWorkflowOptedOut,
+  isScopedWorkflowRequired,
+  isScopedWorkflowSourceEffective,
   loadRepoActionsConfig,
   parseRepoActionsConfig,
   removeRepoActionsCollaborativeOwner,
   saveRepoActionsConfig,
   serializeRepoActionsConfig,
+  toggleRepoActionsWorkflow,
   type RepoActionsConfig,
   type RepoTokenPermissionsForm,
 } from "./config";
+import { scopedWorkflowSourcesStore } from "./scoped-workflow-sources";
 
 const T0 = new Date(1_700_000_000 * 1000);
 
@@ -49,7 +57,7 @@ beforeAll(async () => {
 let repoId: string;
 
 beforeEach(async () => {
-  for (const table of ["repo_units", "repo_settings", "repositories", "users"]) {
+  for (const table of ["action_scoped_workflow_source", "repo_units", "repo_settings", "repositories", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   await env.DB.prepare(
@@ -308,5 +316,118 @@ describe("the repo_units.config column", () => {
     const row = await drizzle(env.DB).select().from(repoUnits).where(eq(repoUnits.repoId, repoId)).get();
     expect(row?.config).toBe('{"CollaborativeOwnerIDs":[42]}');
     expect((await drizzle(env.DB).select().from(repositories).all()).length).toBe(1); // sanity: the fixture is single-repo
+  });
+});
+
+// --- the scoped-workflow opt-out arms (the C10 half-stage) -----------------------
+// repo_unit_actions.go:111-131's trio, models/actions/scoped_workflow.go's
+// effective/required/opted-out reads and view.go:1324-1375's toggle arm,
+// over the landed action_scoped_workflow_source store.
+
+const SRC_ID = "src-repo"; // the source repo's TEXT id (the map key shape)
+
+describe("the DisabledScopedWorkflows mutators (repo_unit_actions.go:111-131)", () => {
+  it("isScopedWorkflowDisabled answers false on an unflagged config (the upstream zero)", () => {
+    expect(isScopedWorkflowDisabled(parseRepoActionsConfig(null), SRC_ID, "ci.yml")).toBe(false);
+  });
+
+  it("disableScopedWorkflow appends once per workflow (idempotent), keyed by the source repo", () => {
+    const cfg = parseRepoActionsConfig(null);
+    disableScopedWorkflow(cfg, SRC_ID, "ci.yml");
+    disableScopedWorkflow(cfg, SRC_ID, "ci.yml"); // the contains-guard dedupe
+    expect(cfg.disabledScopedWorkflows).toEqual({ [SRC_ID]: ["ci.yml"] });
+    disableScopedWorkflow(cfg, SRC_ID, "deploy.yml");
+    expect(cfg.disabledScopedWorkflows[SRC_ID]).toEqual(["ci.yml", "deploy.yml"]);
+    disableScopedWorkflow(cfg, "other-src", "ci.yml");
+    expect(cfg.disabledScopedWorkflows["other-src"]).toEqual(["ci.yml"]);
+  });
+
+  it("enableScopedWorkflow removes all and DELETES an emptied key; a repo-level disable never touches the scoped entry", () => {
+    const cfg = parseRepoActionsConfig(null);
+    disableScopedWorkflow(cfg, SRC_ID, "ci.yml");
+    cfg.disabledWorkflows = ["ci.yml"]; // the repo-level array, upstream :30-34's independence case
+    enableScopedWorkflow(cfg, SRC_ID, "ci.yml");
+    expect(cfg.disabledScopedWorkflows).toEqual({}); // the emptied key is gone
+    expect(cfg.disabledWorkflows).toEqual(["ci.yml"]); // untouched
+    enableScopedWorkflow(cfg, SRC_ID, "ci.yml"); // absent key: a calm no-op
+    expect(cfg.disabledScopedWorkflows).toEqual({});
+  });
+
+  it("serializes through the Go-marshal bytes (null map when empty, string keys otherwise)", () => {
+    const cfg = parseRepoActionsConfig(null);
+    disableScopedWorkflow(cfg, SRC_ID, "ci.yml");
+    expect(serializeRepoActionsConfig(cfg)).toContain('"DisabledScopedWorkflows":{"src-repo":["ci.yml"]}');
+  });
+});
+
+describe("the effective-source reads (models/actions/scoped_workflow.go:84-159)", () => {
+  it("instance-level (owner 0) and owner-level registrations are both effective; an unknown source is not", async () => {
+    const store = scopedWorkflowSourcesStore(env.DB);
+    await store.addSource(0, SRC_ID); // instance-level
+    expect(await isScopedWorkflowSourceEffective(env.DB, 1, SRC_ID)).toBe(true);
+    await store.removeSource(0, SRC_ID);
+    expect(await isScopedWorkflowSourceEffective(env.DB, 1, SRC_ID)).toBe(false);
+    await store.addSource(1, SRC_ID); // the owner's own registration (users.id 1 = alice)
+    expect(await isScopedWorkflowSourceEffective(env.DB, 1, SRC_ID)).toBe(true);
+    expect(await isScopedWorkflowSourceEffective(env.DB, 2, SRC_ID)).toBe(false); // another owner's scope
+  });
+
+  it("isScopedWorkflowRequired reads the registration's required flag; opted-out = flagged AND not required", async () => {
+    const store = scopedWorkflowSourcesStore(env.DB);
+    await store.addSource(1, SRC_ID);
+    await store.setSourceConfigs(1, SRC_ID, {});
+    expect(await isScopedWorkflowRequired(env.DB, 1, SRC_ID, "ci.yml")).toBe(false);
+    await store.setSourceConfigs(1, SRC_ID, { "ci.yml": { required: true, patterns: ["*"] } });
+    expect(await isScopedWorkflowRequired(env.DB, 1, SRC_ID, "ci.yml")).toBe(true);
+
+    const cfg = parseRepoActionsConfig(null);
+    disableScopedWorkflow(cfg, SRC_ID, "ci.yml");
+    expect(await isScopedWorkflowOptedOut(env.DB, cfg, 1, SRC_ID, "ci.yml")).toBe(false); // required → opt-out dead
+    await store.setSourceConfigs(1, SRC_ID, {});
+    expect(await isScopedWorkflowOptedOut(env.DB, cfg, 1, SRC_ID, "ci.yml")).toBe(true); // flagged AND not required
+    enableScopedWorkflow(cfg, SRC_ID, "ci.yml");
+    expect(await isScopedWorkflowOptedOut(env.DB, cfg, 1, SRC_ID, "ci.yml")).toBe(false); // the unflagged early-out
+  });
+});
+
+describe("toggleRepoActionsWorkflow (view.go:1324-1375's disableOrEnableWorkflowFile body)", () => {
+  it("the scoped arm writes the SCOPED array, never the repo-level one (disable, then enable deletes the key)", async () => {
+    await enableActions();
+    expect(await toggleRepoActionsWorkflow(env.DB, repoId, 1, { workflowId: "ci.yml", isEnable: false, scopedWorkflowSourceRepoId: SRC_ID })).toBe("saved");
+    let stored = await loadRepoActionsConfig(env.DB, repoId);
+    expect(stored.disabledScopedWorkflows).toEqual({ [SRC_ID]: ["ci.yml"] });
+    expect(stored.disabledWorkflows).toEqual([]); // the repo-level array untouched — the documented C10 reduction, retired
+    expect(await toggleRepoActionsWorkflow(env.DB, repoId, 1, { workflowId: "ci.yml", isEnable: true, scopedWorkflowSourceRepoId: SRC_ID })).toBe("saved");
+    stored = await loadRepoActionsConfig(env.DB, repoId);
+    expect(stored.disabledScopedWorkflows).toEqual({}); // the emptied key deleted
+  });
+
+  it("a required scoped workflow refuses the disable with NO save (the scoped_required_cannot_disable JSONError arm)", async () => {
+    await enableActions();
+    const store = scopedWorkflowSourcesStore(env.DB);
+    await store.addSource(1, SRC_ID);
+    await store.setSourceConfigs(1, SRC_ID, { "ci.yml": { required: true, patterns: ["*"] } });
+    expect(
+      await toggleRepoActionsWorkflow(env.DB, repoId, 1, { workflowId: "ci.yml", isEnable: false, scopedWorkflowSourceRepoId: SRC_ID }),
+    ).toBe("scoped-required");
+    expect(await loadRepoActionsConfig(env.DB, repoId)).toEqual(parseRepoActionsConfig(null)); // the config untouched
+    // the enable arm never consults required-ness (upstream :1345-1347)
+    expect(
+      await toggleRepoActionsWorkflow(env.DB, repoId, 1, { workflowId: "ci.yml", isEnable: true, scopedWorkflowSourceRepoId: SRC_ID }),
+    ).toBe("saved");
+  });
+
+  it("the repo-level arm keeps the landed splice semantics (the ⑲A5 shape)", async () => {
+    await enableActions();
+    expect(await toggleRepoActionsWorkflow(env.DB, repoId, 1, { workflowId: "ci.yml", isEnable: false, scopedWorkflowSourceRepoId: "" })).toBe("saved");
+    expect((await loadRepoActionsConfig(env.DB, repoId)).disabledWorkflows).toEqual(["ci.yml"]);
+    expect(await toggleRepoActionsWorkflow(env.DB, repoId, 1, { workflowId: "ci.yml", isEnable: false, scopedWorkflowSourceRepoId: "" })).toBe("saved"); // append-if-absent
+    expect((await loadRepoActionsConfig(env.DB, repoId)).disabledWorkflows).toEqual(["ci.yml"]);
+    expect(await toggleRepoActionsWorkflow(env.DB, repoId, 1, { workflowId: "ci.yml", isEnable: true, scopedWorkflowSourceRepoId: "" })).toBe("saved");
+    expect((await loadRepoActionsConfig(env.DB, repoId)).disabledWorkflows).toEqual([]);
+  });
+
+  it("answers missing on a unit-less repo (the UpdateRepoUnitConfig gate)", async () => {
+    expect(await toggleRepoActionsWorkflow(env.DB, repoId, 1, { workflowId: "ci.yml", isEnable: false, scopedWorkflowSourceRepoId: SRC_ID })).toBe("missing");
   });
 });

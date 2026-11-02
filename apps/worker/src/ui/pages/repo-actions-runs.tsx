@@ -80,6 +80,14 @@
  * - Scoped-workflow groups (sidebar.tmpl:17-34) defer with C10 (SPEC-0012
  *   keeps scoped workflows post-M3); the `scoped_workflow_source_repo_id`
  *   param parses (junk → 0 — FormInt64) and rides the filter links' shape.
+ *   The C10 half-stage lands the PRODUCER side (services/actions/
+ *   workflow-dispatch.ts writes is_scoped_run/workflow_repo_id on scoped
+ *   dispatches) and this page's GetRepoRunWorkflowIDs twin excludes those
+ *   rows from "Other workflows" (run_list.go:198-200); the per-run row
+ *   FILTER by the param stays the recorded reduction — the numeric
+ *   FormInt64 parse cannot carry our TEXT source-repo ids (SPEC-0013
+ *   as-built), so `Other workflows`-orphan semantics are the only staged
+ *   listing arm.
  * - The workflow DISABLED red label (sidebar.tmpl:12-14) and the
  *   disable/enable kebab item (list.tmpl:88-92) ride the LANDED repo
  *   ActionsConfig store (services/actions/config.ts — the ⑲A5 row); the
@@ -886,9 +894,14 @@ export async function loadRepoActionsRunsData(input: RepoActionsRunsInput): Prom
   let pageBlock: RepoActionsRunsPageBlock | null = null;
   if (!query.partialRefresh) {
     // prepareOtherWorkflows: distinct repo-level run workflow ids not in the
-    // listed set (GetRepoRunWorkflowIDs — is_scoped_run=false, v1 always).
+    // listed set (GetRepoRunWorkflowIDs — run_list.go:198-200's
+    // is_scoped_run=false arm; the C10 half-stage's dispatch producer now
+    // WRITES is_scoped_run=true rows, so the exclusion is load-bearing).
     const otherWorkflows = (
-      await db.selectDistinct({ workflowId: actionRuns.workflowId }).from(actionRuns).where(eq(actionRuns.repoId, repo.id))
+      await db
+        .selectDistinct({ workflowId: actionRuns.workflowId })
+        .from(actionRuns)
+        .where(and(eq(actionRuns.repoId, repo.id), eq(actionRuns.isScopedRun, false)))
     )
       .map((row) => row.workflowId)
       .filter((id) => id !== "" && !(id in workflowNames))

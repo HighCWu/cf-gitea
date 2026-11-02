@@ -1,13 +1,18 @@
 /**
  * The workflow DISPATCH producer's tests (the ⑲A4 row's service arm —
- * workflow.go:64-199's repo-level port): the validation ladder with its
+ * workflow.go:64-199's port): the validation ladder with its
  * upstream messages (the disabled check, the ref resolution arms, the
  * workflow-not-found and has-no-dispatch arms, the light invalid arm), the
  * input processing (boolean coercion, the default fallback, the form-value
  * precedence), the payload shape (the raw ref string verbatim, the
  * stringified inputs, the {}-shaped repository/sender), and the inserted
  * run's skeleton (event/trigger_event workflow_dispatch, the normalized
- * ref, the commit-subject title) with its waiting jobs.
+ * ref, the commit-subject title) with its waiting jobs. The C10 half-stage
+ * adds the SCOPED arm's battery (workflow.go:237-268's
+ * resolveScopedDispatchContent): the effective-source gate, the source
+ * default-branch walk, the opt-out/required disabled check and the run's
+ * content-source columns (is_scoped_run / workflow_repo_id /
+ * workflow_commit_sha — the first producer of the parity columns).
  */
 
 import { applyD1Migrations } from "cloudflare:test";
@@ -16,9 +21,11 @@ import { eq } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
-import { actionRunJobs, repoUnits, repositories, users } from "../../db/schema";
+import { actionRunJobs, actionRuns, repoUnits, repositories, users } from "../../db/schema";
 import { ACTION_STATUS_WAITING } from "./model";
 import { saveRepoActionsConfig } from "./config";
+
+import { scopedWorkflowSourcesStore } from "./scoped-workflow-sources";
 import { dispatchWorkflow, workflowDispatchLocale, type WorkflowDispatchReads } from "./workflow-dispatch";
 
 beforeAll(async () => {
@@ -28,7 +35,7 @@ beforeAll(async () => {
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
 });
 
-const CLEANUP_TABLES = ["action_runs", "action_run_jobs", "action_run_attempts", "action_tasks", "action_tasks_versions", "repo_counters", "repo_units", "repositories", "users"];
+const CLEANUP_TABLES = ["action_runs", "action_run_jobs", "action_run_attempts", "action_tasks", "action_tasks_versions", "action_scoped_workflow_source", "repo_counters", "repo_units", "repositories", "users"];
 
 beforeEach(async () => {
   for (const table of CLEANUP_TABLES) {
@@ -112,12 +119,23 @@ function dispatch(reads: WorkflowDispatchReads, patch: Partial<Parameters<typeof
     repo: { id: REPO_ID, ownerId: USER_ID, ownerNamespace: "alice", slug: "demo", defaultBranch: "main" },
     workflowId: "ci.yml",
     ref: "refs/heads/main",
-    scopedWorkflowSourceRepoId: 0,
+    scopedWorkflowSourceRepoId: "",
+    sourceEngineFor: () => deadReads(),
     form: {},
     triggerUserId: USER_ID,
     appUrl: "https://test.local",
     ...patch,
   });
+}
+
+/** The engine that never resolves — the sourceEngineFor default (the
+ *  repo-level arm never calls it; the scoped throw arm proves it). */
+function deadReads(): WorkflowDispatchReads {
+  return {
+    readCommit: () => Promise.resolve(null),
+    listTree: () => Promise.resolve(null),
+    readBlob: () => Promise.resolve(null),
+  };
 }
 
 describe("dispatchWorkflow (workflow.go:64-199's repo-level arm, the ⑲A4 producer)", () => {
@@ -224,11 +242,143 @@ describe("dispatchWorkflow (workflow.go:64-199's repo-level arm, the ⑲A4 produ
     }
   });
 
-  it("the guards: an empty workflow id or ref throws (the Run handler's ServerError arms); the scoped id answers not-found", async () => {
+  it("the guards: an empty workflow id or ref throws (the Run handler's ServerError arms); a scoped id without an effective source answers not-found", async () => {
     const reads = fakeReads({ ".gitea/workflows/ci.yml": DISPATCH_WORKFLOW });
     expect((await dispatch(reads, { workflowId: "" })).status).toBe("throw");
     expect((await dispatch(reads, { ref: "" })).status).toBe("throw");
-    const scoped = await dispatch(reads, { scopedWorkflowSourceRepoId: 5 });
-    expect(scoped).toEqual({ status: "translatable", message: "Workflow 'ci.yml' not found." });
+    const scoped = await dispatch(reads, { scopedWorkflowSourceRepoId: "src-repo" });
+    expect(scoped).toEqual({ status: "translatable", message: "Workflow 'ci.yml' not found." }); // IsScopedWorkflowSourceEffective's miss arm
+    // The landed wire: the page's dispatch form always posts "0" — the
+    // FormInt64 zero, the REPO-LEVEL arm (scopedSourceRepoParam), so the
+    // run dispatches from this repo's own workflow dir.
+    const zero = await dispatch(reads, { scopedWorkflowSourceRepoId: "0" });
+    expect(zero.status).toBe("ok");
+  });
+});
+
+describe("dispatchWorkflow's scoped arm (resolveScopedDispatchContent, workflow.go:237-268 — the C10 half-stage)", () => {
+  const SRC_ID = "src-repo";
+  const SRC_SHA = "aaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+  beforeEach(async () => {
+    await seedRepo();
+    // the SOURCE repo row (GetRepositoryByID's substrate) — alice/source.
+    await db().insert(repositories).values({
+      id: SRC_ID,
+      storageKey: `r_${SRC_ID}`,
+      ownerNamespace: "alice",
+      ownerId: USER_ID,
+      slug: "source",
+      visibility: "public",
+    });
+  });
+
+  /** The SOURCE engine fake: the scoped-dir walk at the default branch,
+   *  resolving to the source's own sha (distinct from the consumer's). */
+  function sourceReads(files: Record<string, string>): WorkflowDispatchReads {
+    const inner = fakeReads(files);
+    return {
+      readCommit: async (id) => {
+        const row = await inner.readCommit(id);
+        return row === null ? null : { oid: SRC_SHA, subject: row.subject };
+      },
+      listTree: (ref, path) => inner.listTree(ref, path),
+      readBlob: (ref, path) => inner.readBlob(ref, path),
+    };
+  }
+
+  function dispatchScoped(sourceFiles: Record<string, string>, patch: Partial<Parameters<typeof dispatchWorkflow>[0]> = {}) {
+    return dispatch(fakeReads({ ".gitea/workflows/ci.yml": DISPATCH_WORKFLOW }), {
+      scopedWorkflowSourceRepoId: SRC_ID,
+      sourceEngineFor: (fullName) => (fullName === "alice/source" ? sourceReads(sourceFiles) : deadReads()),
+      ...patch,
+    });
+  }
+
+  async function registerSource(ownerId: number, configs: Record<string, { required: boolean; patterns: string[] }> = {}): Promise<void> {
+    const store = scopedWorkflowSourcesStore(env.DB);
+    await store.addSource(ownerId, SRC_ID);
+    await store.setSourceConfigs(ownerId, SRC_ID, configs);
+  }
+
+  it("an effective source dispatches the SOURCE's file: the run records the content source columns (is_scoped_run, workflow_repo_id, workflow_commit_sha)", async () => {
+    await registerSource(0); // instance-level
+    const outcome = await dispatchScoped({ ".gitea/scoped_workflows/ci.yml": DISPATCH_WORKFLOW });
+    expect(outcome.status).toBe("ok");
+    if (outcome.status !== "ok") return;
+    expect(outcome.run.isScopedRun).toBe(true); // workflow.go:262's IsScopedRun
+    expect(outcome.run.workflowRepoId).toBe(SRC_ID); // :260's WorkflowRepoID = sourceRepo.ID
+    expect(outcome.run.workflowCommitSha).toBe(SRC_SHA); // :261's WorkflowCommitSHA = the source HEAD
+    expect(outcome.run.repoId).toBe(REPO_ID); // the run lives in the CONSUMER repo
+    expect(outcome.run.commitSha).toBe(SHA); // ... at the consumer's commit
+    expect(outcome.run.title).toBe("default subject"); // Title = the CONSUMER commit's MessageTitle
+    const row = await db().select().from(actionRuns).where(eq(actionRuns.id, outcome.run.id)).get();
+    expect(row?.isScopedRun).toBe(true); // the post-insert UPDATE persisted it
+    expect(row?.workflowRepoId).toBe(SRC_ID);
+    expect(row?.workflowCommitSha).toBe(SRC_SHA);
+    const jobs = await db().select().from(actionRunJobs).where(eq(actionRunJobs.runId, outcome.run.id));
+    expect(jobs.length).toBe(1);
+  });
+
+  it("an OWNER-level registration is equally effective; the workflow entry must exist on the source's default branch", async () => {
+    await registerSource(USER_ID); // the consumer owner's own scope
+    const ok = await dispatchScoped({ ".gitea/scoped_workflows/ci.yml": DISPATCH_WORKFLOW });
+    expect(ok.status).toBe("ok");
+
+    const missing = await dispatchScoped({ ".gitea/scoped_workflows/other.yml": DISPATCH_WORKFLOW });
+    expect(missing).toEqual({ status: "translatable", message: "Workflow 'ci.yml' not found." }); // :260-267's not-found
+  });
+
+  it("the opt-out check: a flagged consumer's dispatch answers disabled; a REQUIRED workflow dispatches anyway (workflow.go:84-99)", async () => {
+    await registerSource(0);
+    await saveRepoActionsConfig(env.DB, REPO_ID, {
+      disabledWorkflows: [],
+      disabledScopedWorkflows: { [SRC_ID]: ["ci.yml"] },
+      collaborativeOwnerIds: [],
+      tokenPermissionMode: "permissive",
+      maxTokenPermissions: null,
+      overrideOwnerConfig: false,
+    });
+    const optedOut = await dispatchScoped({ ".gitea/scoped_workflows/ci.yml": DISPATCH_WORKFLOW });
+    expect(optedOut).toEqual({ status: "translatable", message: workflowDispatchLocale.workflowDisabled });
+
+    // required in the registration → the opt-out is dead (ScopedWorkflowOptedOut)
+    await scopedWorkflowSourcesStore(env.DB).setSourceConfigs(0, SRC_ID, { "ci.yml": { required: true, patterns: ["*"] } });
+    const required = await dispatchScoped({ ".gitea/scoped_workflows/ci.yml": DISPATCH_WORKFLOW });
+    expect(required.status).toBe("ok");
+  });
+
+  it("the store/engine failure arms: a registration without a repo row throws (GetRepositoryByID); an unresolvable source HEAD throws (GetBranchExisting)", async () => {
+    await registerSource(0); // the registration exists...
+    await db().delete(repositories).where(eq(repositories.id, SRC_ID)); // ...but the repositories row does not
+    const noRow = await dispatchScoped({ ".gitea/scoped_workflows/ci.yml": DISPATCH_WORKFLOW });
+    expect(noRow).toEqual({ status: "throw", reason: `workflow dispatch: GetRepositoryByID ${SRC_ID} failed` });
+
+    await db().insert(repositories).values({
+      id: "src-empty",
+      storageKey: "r_src-empty",
+      ownerNamespace: "alice",
+      ownerId: USER_ID,
+      slug: "empty",
+      visibility: "public",
+    });
+    await scopedWorkflowSourcesStore(env.DB).addSource(0, "src-empty");
+    const noHead = await dispatch(fakeReads({}), {
+      scopedWorkflowSourceRepoId: "src-empty",
+      sourceEngineFor: () => deadReads(),
+    });
+    expect(noHead).toEqual({ status: "throw", reason: "workflow dispatch: source default branch src-empty@refs/heads/main unresolvable" });
+  });
+
+  it("the source file's own validation rides the shared ladder (invalid / no-dispatch on the SOURCE content)", async () => {
+    await registerSource(0);
+    const invalid = await dispatchScoped({ ".gitea/scoped_workflows/ci.yml": "\t: [broken" });
+    expect(invalid.status).toBe("translatable");
+    if (invalid.status === "translatable") expect(invalid.message).toContain("Workflow config file is invalid");
+    const noDispatch = await dispatchScoped({ ".gitea/scoped_workflows/ci.yml": PUSH_ONLY_WORKFLOW });
+    expect(noDispatch).toEqual({
+      status: "translatable",
+      message: "Workflow 'ci.yml' has no workflow_dispatch event trigger.",
+    });
   });
 });

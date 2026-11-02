@@ -741,7 +741,7 @@ import {
 } from "./pages/repo-actions-view";
 import { approveRun } from "../services/actions/approve";
 import { emitWorkflowDispatchAudit, emitWorkflowToggleAudit } from "../services/actions/audit-arms";
-import { loadRepoActionsConfig, saveRepoActionsConfig } from "../services/actions/config";
+import { toggleRepoActionsWorkflow } from "../services/actions/config";
 import { deleteRun } from "../services/actions/retention";
 import { isDoneStatus } from "../services/actions/update";
 import { dispatchWorkflow } from "../services/actions/workflow-dispatch";
@@ -8550,12 +8550,12 @@ async function repoActionsRunDispatch(c: Context<{ Bindings: Env }>): Promise<Re
   }
   const form = await readUrlEncodedForm(c.req.raw);
   const formValue = (key: string): string => form.get(key) ?? url.searchParams.get(key) ?? ""; // FormString's merge, body wins
-  const formInt64 = (raw: string | null): number => (raw !== null && /^\d+$/.test(raw) ? Number.parseInt(raw, 10) : 0);
   const formMap: Record<string, string> = {};
   for (const [key, value] of form) formMap[key] = value;
+  const scopedParam = form.get("scoped_workflow_source_repo_id") ?? url.searchParams.get("scoped_workflow_source_repo_id") ?? ""; // the TEXT id; the service's scopedSourceRepoParam reduces "0"/"" to repo-level
   const redirectUrl = `${repoLinkOf(repo)}/actions?${new URLSearchParams({
     workflow: formValue("workflow"),
-    scoped_workflow_source_repo_id: String(formInt64(form.get("scoped_workflow_source_repo_id") ?? url.searchParams.get("scoped_workflow_source_repo_id"))),
+    scoped_workflow_source_repo_id: scopedParam, // actionsListRedirectURL composes the raw FormString (view.go:1379)
     actor: formValue("actor"),
     status: formValue("status"),
     branch: formValue("branch"),
@@ -8566,7 +8566,8 @@ async function repoActionsRunDispatch(c: Context<{ Bindings: Env }>): Promise<Re
     repo,
     workflowId: formValue("workflow"),
     ref: form.get("ref") ?? url.searchParams.get("ref") ?? "",
-    scopedWorkflowSourceRepoId: formInt64(form.get("scoped_workflow_source_repo_id") ?? url.searchParams.get("scoped_workflow_source_repo_id")),
+    scopedWorkflowSourceRepoId: scopedParam,
+    sourceEngineFor: (fullName) => engineClient(c.env, fullName), // the scoped arm's SOURCE repo walk (resolveScopedDispatchContent)
     form: formMap,
     triggerUserId: viewer.id,
     appUrl: ctx.origin,
@@ -8598,10 +8599,11 @@ async function repoActionsRunDispatch(c: Context<{ Bindings: Env }>): Promise<Re
  *  fetch-action arm, never the login 303). The workflow id + the four
  *  filter facets ride the kebab's data-url (FormString's merge). An empty
  *  id answers ctx.JSONError's 400. The scoped arm
- *  (scoped_workflow_source_repo_id > 0) is the C10 documented reduction —
- *  this surface never writes disabledScopedWorkflows; the repo-level pair
- *  (repo_unit_actions.go's EnableWorkflow/DisableWorkflow) is the landed
- *  config store's array splice. The answer is ctx.JSONRedirect's
+ *  rides the config store's toggleRepoActionsWorkflow — a disable of a
+ *  REQUIRED scoped workflow refuses with the scoped_required_cannot_disable
+ *  JSONError (view.go:1338-1344), else the DisabledScopedWorkflows map
+ *  writes (repo_unit_actions.go:115-131); the repo-level pair stays the
+ *  same store's array splice. The answer is ctx.JSONRedirect's
  *  `{"redirect": ...}` onto the actions-list URL
  *  (actionsListRedirectURL's five-param shape). Upstream's
  *  RecordWorkflowToggle audit emit rides services/actions/audit-arms.ts
@@ -8631,13 +8633,23 @@ async function repoActionsWorkflowToggle(c: Context<{ Bindings: Env }>): Promise
       }),
     );
   }
-  const cfg = await loadRepoActionsConfig(c.env.DB, repo.id);
-  if (route.action === "enable") {
-    cfg.disabledWorkflows = cfg.disabledWorkflows.filter((name) => name !== workflow); // EnableWorkflow
-  } else if (!cfg.disabledWorkflows.includes(workflow)) {
-    cfg.disabledWorkflows = [...cfg.disabledWorkflows, workflow]; // DisableWorkflow's append-if-absent
+  // disableOrEnableWorkflowFile's body (view.go:1324-1375) — the service arm
+  // branches scoped vs repo-level; "0"/"" is repo-level (scopedSourceRepoParam).
+  const toggleOutcome = await toggleRepoActionsWorkflow(c.env.DB, repo.id, repo.ownerId ?? 0, {
+    workflowId: workflow,
+    isEnable: route.action === "enable",
+    scopedWorkflowSourceRepoId: formValue("scoped_workflow_source_repo_id"),
+  });
+  if (toggleOutcome === "scoped-required") {
+    // view.go:1341-1344 — a required scoped workflow's JSONError refusal.
+    return respond(
+      new Response(JSON.stringify({ errorMessage: "This scoped workflow is required and cannot be disabled.", renderFormat: "text" }), {
+        status: 400,
+        headers: { "content-type": "application/json;charset=utf-8" },
+      }),
+    );
   }
-  if ((await saveRepoActionsConfig(c.env.DB, repo.id, cfg)) === "missing") {
+  if (toggleOutcome === "missing") {
     // UpdateRepoUnitConfig on a unit-less repo — unreachable behind the
     // MustEnableActions gate; the store seam's 404 is the honest answer.
     return respond(c.html(renderNotFound(ctx), 404));
@@ -8652,10 +8664,9 @@ async function repoActionsWorkflowToggle(c: Context<{ Bindings: Env }>): Promise
     origin: "ui",
     ipAddress: c.req.header("cf-connecting-ip") ?? null,
   });
-  const formInt64 = (raw: string | null): number => (raw !== null && /^\d+$/.test(raw) ? Number.parseInt(raw, 10) : 0);
   const redirectUrl = `${repoLinkOf(repo)}/actions?${new URLSearchParams({
     workflow,
-    scoped_workflow_source_repo_id: String(formInt64(formValue("scoped_workflow_source_repo_id"))),
+    scoped_workflow_source_repo_id: formValue("scoped_workflow_source_repo_id"), // the raw FormString (view.go:1373)
     actor: formValue("actor"),
     status: formValue("status"),
     branch: formValue("branch"),
