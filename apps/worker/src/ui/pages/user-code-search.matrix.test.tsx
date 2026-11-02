@@ -765,6 +765,12 @@ describe("the wave I-b strip arms on the code page", () => {
     expect(orgPage.html).toContain('<form method="post" action="/cs-iborg?action=follow">');
     expect(orgPage.html).toContain('class="ui basic button"');
     expect(orgPage.html).toContain('class="active item" href="/cs-iborg/-/code"');
+    // The Repositories item renders INACTIVE beside the ACTIVE Code tab
+    // (menu.tmpl:9's `PageIsViewRepositories` is never set on this page —
+    // the DR-5 landing: OrgMenu's `repositoriesActive={false}` on the org
+    // arm; :28-32's IsCodePage is this page's only active state).
+    expect(orgPage.html).toContain('class="item" href="/cs-iborg"');
+    expect(orgPage.html).not.toContain('class="active item" href="/cs-iborg"');
     // The org arm renders no avatar card (OrgHeader renders none upstream).
     expect(orgPage.html).not.toContain('id="profile-avatar-card"');
   });

@@ -165,11 +165,11 @@
  *   INACTIVE on every packages page (header.tmpl:8's
  *   `eq .TabName "repositories"`, menu.tmpl:9's `PageIsViewRepositories`).
  *   The USER arm lands that (`repositoriesActive={false}` on ProfileTabs in
- *   UserProfileGrid + package-settings.tsx); the ORG arm keeps Repositories
- *   ACTIVE — OrgMenu (org-home.tsx, the strip's owner) keys that class on
- *   `projectsTab?.active` and carries no repositories-active control, so
- *   the upstream shape is inexpressible from this consumer. RECORDED
- *   divergence; extending OrgMenu is its owner's change.
+ *   UserProfileGrid + package-settings.tsx); the ORG arm lands with the
+ *   DR-5 completion (v1.5.4 cycle): OrgMenu gained the optional
+ *   `repositoriesActive` control and OrgPackagesChrome passes `false`, so
+ *   the org pages render Repositories INACTIVE beside the ACTIVE Packages
+ *   item — the upstream shape, no longer a divergence.
  */
 
 import { and, asc, desc, eq, inArray, like, sql } from "drizzle-orm";
@@ -1575,19 +1575,16 @@ function UserProfileGrid(props: {
   );
 }
 
-/** The org chrome both org-arm pages share (org/header + org/menu with the
- *  Packages tab ACTIVE) — exported for pages/package-settings.tsx, the
- *  settings page's org arm. The header's follow button is the C2 arm
- *  (org/header.tmpl:17); the menu's Code tab is the C1 arm (menu.tmpl:28-32,
- *  inactive here). RECORDED DIVERGENCE (the K2 drift adjudication, module
- *  header): upstream renders the menu's Repositories item INACTIVE on this
- *  family (menu.tmpl:9's `PageIsViewRepositories` — never set here) beside
- *  the ACTIVE Packages item (:24's `IsPackagesPage`), but OrgMenu
- *  (org-home.tsx — the strip's owner, outside this wave's ownership) keys
- *  the Repositories active class on `projectsTab?.active` and carries no
- *  repositories-active control, so the upstream shape is inexpressible from
- *  this consumer; Repositories stays ACTIVE until OrgMenu's owner extends
- *  it. */
+/** The org chrome the packages-family org pages share (org/header +
+ *  org/menu with the Packages tab ACTIVE) — used by the owner list and
+ *  version view renders below (package-settings.tsx's org arm renders
+ *  org/header ALONE — upstream renders no menu there). The header's follow
+ *  button is the C2 arm (org/header.tmpl:17); the menu's Code tab is the
+ *  C1 arm (menu.tmpl:28-32, inactive here). Repositories renders INACTIVE
+ *  (`repositoriesActive=false` — menu.tmpl:9's `PageIsViewRepositories` is
+ *  never set on this family, whose only active state is the Packages item,
+ *  :24's `IsPackagesPage`; the DR-5 landing closed the K2 drift the module
+ *  header records). */
 export function OrgPackagesChrome(props: {
   ctx: UiContext;
   org: OrgRecord;
@@ -1601,6 +1598,7 @@ export function OrgPackagesChrome(props: {
       <OrgMenu
         orgLink={`/${props.org.username}`}
         repoCount={props.repoCount}
+        repositoriesActive={false}
         packagesTab={{ active: true, href: `/${props.org.username}/-/packages` }}
         codeTab={{ active: false, href: `/${props.org.username}/-/code` }}
       />

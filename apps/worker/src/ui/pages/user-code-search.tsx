@@ -580,7 +580,10 @@ export function UserCodeSearchPage(props: { ctx: UiContext; data: UserCodeSearch
     // org arm: `page-content organization code` — org/header + the search
     // block (user/code.tmpl:3-7). The header's follow button is the C2 arm
     // (org/header.tmpl:17); the menu's Code tab is the C1 arm
-    // (menu.tmpl:28-32 — ACTIVE here, IsCodePage true on this page).
+    // (menu.tmpl:28-32 — ACTIVE here, IsCodePage true on this page), so
+    // Repositories renders INACTIVE beside it (`repositoriesActive=false` —
+    // menu.tmpl:9's `PageIsViewRepositories` is never set on this page; the
+    // DR-5 landing's control).
     return (
       <BaseLayout ctx={ctx} title={userCodeSearchLocale.title} pageClass="organization code">
         <OrgHeader
@@ -591,6 +594,7 @@ export function UserCodeSearchPage(props: { ctx: UiContext; data: UserCodeSearch
         <OrgMenu
           orgLink={`/${data.owner.org.username}`}
           repoCount={data.chrome.repoCount}
+          repositoriesActive={false}
           packagesTab={ctx.packagesEnabled !== false ? { active: false, href: `/${data.owner.org.username}/-/packages` } : undefined}
           codeTab={{ active: true, href: action }}
         />

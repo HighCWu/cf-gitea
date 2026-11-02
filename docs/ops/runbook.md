@@ -285,6 +285,42 @@ Troubleshooting quick reads:
 - `dropped-expired-token`: the reply is older than 1 year (upstream's
   token lifetime) or the secret was rotated.
 
+### LFS presign store (specs/0006-lfs.md §6)
+
+Off by default (strict polarity — a deployment never presigns by accident;
+upstream's posture is the storage ServeDirect gate,
+`modules/setting/storage.go:49,96-98`). Armed, LFS media downloads answer
+302s to presigned R2 GETs instead of relaying bytes through the Worker
+(`services/lfs/resolve.ts`'s ServeDirect-or-relay split).
+
+Arming on a deployment (then `pnpm build` + `pnpm deploy` — deploy ships
+dist's generated config):
+
+1. **Vars** in `wrangler.jsonc`:
+   - `"LFS_STORE_PRESIGN": "true"` — ONLY the exact string `true` arms
+     presign; unset/anything else stays relay (fail-closed).
+   - `"R2_ACCOUNT_ID": "<account id>"`.
+2. **Secrets** — the R2 S3-API token pair (minted in the dashboard):
+
+   ```bash
+   wrangler secret put R2_ACCESS_KEY_ID
+   wrangler secret put R2_SECRET_ACCESS_KEY
+   ```
+
+Fail-closed matrix: an incomplete credential triple silently keeps the
+relay store (the SPEC-0006 §2.3 capability probe — never a 500; the store
+is constructed per request, so a half-armed deployment keeps serving LFS).
+The polarity + degrade matrix is pinned in
+`apps/worker/src/services/lfs/store-config.test.ts`, the presigned-GET
+media arm in `apps/worker/src/services/lfs/presign.test.ts`.
+
+Bucket-name caveat: presigned paths name the shipped bucket
+(`cf-gitea-packs` — `DEFAULT_R2_LFS_BUCKET_NAME`; `pnpm setup:deploy`
+provisions exactly it, and the R2 binding never exposes its own name at
+runtime). If you hand-rename the bucket, keep the constant in step. Full
+config commentary: the LFS tail of `apps/worker/wrangler.jsonc.example`;
+the as-built record: SPEC-0006 §6.
+
 ### Building from a fresh worktree
 
 A fresh `git worktree add` checks out neither `gitea/` (submodule dirs start

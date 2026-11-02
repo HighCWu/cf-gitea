@@ -1026,7 +1026,7 @@ describe("the wave I-b strip arms on the packages pages", () => {
     expect(anonHtml).toContain('href="/ibowner.rss"');
   });
 
-  it("the owner list ORG arm: the header follow button + RSS anchor, the Code tab inactive beside the ACTIVE Packages tab", async () => {
+  it("the owner list ORG arm: the header follow button + RSS anchor, the Code tab inactive beside the ACTIVE Packages tab, Repositories inactive (DR-5)", async () => {
     const owner = await seedUser("iborgowner");
     const orgs = new OrgService(env.DB);
     const org = await orgs.createOrg({ name: "iborg", ownerId: owner.id });
@@ -1043,15 +1043,14 @@ describe("the wave I-b strip arms on the packages pages", () => {
     expect(html).toContain('class="item" href="/iborg/-/code"');
     expect(html).not.toContain('class="active item" href="/iborg/-/code"');
     expect(html).toContain('<a class="active item" href="/iborg/-/packages">');
-    // RECORDED divergence (the K2 adjudication, module header): upstream
-    // renders the menu's Repositories item INACTIVE here (menu.tmpl:9's
-    // `PageIsViewRepositories` — never set by the packages routes) beside
-    // the ACTIVE Packages item (:24's `IsPackagesPage`), but OrgMenu
-    // (org-home.tsx — the strip's owner, outside the packages waves'
-    // ownership) keys the Repositories active class on
-    // `projectsTab?.active` and carries no repositories-active control;
-    // the item stays ACTIVE until OrgMenu's owner extends it. No assert —
-    // neither the drifted nor the upstream state is enshrined here.
+    // Repositories renders INACTIVE beside the ACTIVE Packages item
+    // (menu.tmpl:9's `PageIsViewRepositories` — never set by the packages
+    // routes; :24's `IsPackagesPage` is this family's only active state).
+    // This pins the DR-5 landing: OrgMenu's `repositoriesActive` control,
+    // passed `false` by OrgPackagesChrome — the K2 drift adjudication's
+    // org arm, previously a recorded divergence.
+    expect(html).toContain('class="item" href="/iborg"');
+    expect(html).not.toContain('class="active item" href="/iborg"');
     // The org arm renders no avatar card — no gear site.
     expect(html).not.toContain('id="profile-avatar-card"');
 
@@ -1095,5 +1094,9 @@ describe("the wave I-b strip arms on the packages pages", () => {
     expect(orgHtml).toContain('<form method="post" action="/ibvieworg?action=follow">');
     expect(orgHtml).toContain('class="item" href="/ibvieworg/-/code"');
     expect(orgHtml).not.toContain('class="active item" href="/ibvieworg/-/code"');
+    // The twin's Repositories item is INACTIVE too (the same DR-5 posture —
+    // OrgPackagesChrome's `repositoriesActive={false}`, menu.tmpl:9).
+    expect(orgHtml).toContain('class="item" href="/ibvieworg"');
+    expect(orgHtml).not.toContain('class="active item" href="/ibvieworg"');
   });
 });

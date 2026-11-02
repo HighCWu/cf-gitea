@@ -282,6 +282,15 @@ export function OrgHeader(props: { org: OrgRecord; signedIn: boolean; followButt
  * `octicon-code`, the "org.code" label, no count label upstream, active on
  * `IsCodePage`) — rendered only when the consumer owns the `/{owner}/-/code`
  * page; absent keeps the prior DOM byte-stable.
+ *
+ * The DR-5 landing (v1.5.4 cycle) adds the optional `repositoriesActive`
+ * control for the Repositories item itself: upstream keys that item on
+ * `PageIsViewRepositories` (menu.tmpl:9) — a per-page state, so a consumer
+ * whose own tab is active (the packages family, menu.tmpl:24's
+ * `IsPackagesPage`; the org code page) passes `false` to deactivate it.
+ * Absent keeps the prior DOM byte-stable (default arm), which is why
+ * org-home, org-repos, the projects family, and the project board render
+ * unchanged.
  */
 export function OrgMenu(props: {
   orgLink: string;
@@ -297,12 +306,24 @@ export function OrgMenu(props: {
   /** The upstream Code tab (menu.tmpl:38-42, the C1 completion — present
    *  only on a consumer that owns the `/{owner}/-/code` page). */
   codeTab?: { active: boolean; href: string };
+  /** The Repositories item's own active control (the DR-5 landing):
+   *  menu.tmpl:9 keys that item on `PageIsViewRepositories` — a per-page
+   *  state the CONSUMER owns, not something derivable from the optional
+   *  tabs. `false` renders the item plain (the packages family —
+   *  `IsPackagesPage` is that family's only active state, menu.tmpl:24 —
+   *  and the org code page, where the Code tab is active). Absent or true
+   *  keeps the prior DOM byte-stable; the wave-37 shape also stands (an
+   *  active projectsTab still deactivates the item). */
+  repositoriesActive?: boolean;
 }) {
   return (
     <div class="ui container">
       <overflow-menu class="ui secondary pointing tabular borderless menu tw-mb-4">
         <div class="overflow-menu-items">
-          <a class={props.projectsTab?.active ? "item" : "active item"} href={props.orgLink}>
+          <a
+            class={props.repositoriesActive === false || props.projectsTab?.active ? "item" : "active item"}
+            href={props.orgLink}
+          >
             <Icon name="octicon-repo" /> {orgHomeLocale.repositories}
             {props.repoCount > 0 ? <div class="ui small label">{props.repoCount}</div> : null}
           </a>
