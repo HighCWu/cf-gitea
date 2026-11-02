@@ -284,6 +284,37 @@ export const AuditActions = {
   // `audit.Record(ctx, audit_model.RepositoryWikiDelete, repo)` — the
   // sweep's final statement, reached even when the storage sweep failed).
   RepositoryWikiDelete: defineAction("repository:wiki:delete", "Deleted wiki of repository {scope}."),
+  // actions:* (action.go:196-198) — the workflow toggle/dispatch trio, ids
+  // AND templates verbatim. Upstream emit sites (pin fc4936884584a41931906553d9
+  // 6c2601d750e6ef, all in services/actions/workflow.go):
+  //   - RecordWorkflowToggle (:53-60) arms the enable/disable pair —
+  //     audit.Record(ctx, action, repo, "workflow", workflowID) — called from
+  //     the web toggle (routers/web/repo/actions/view.go:1365) and the API
+  //     twin (EnableOrDisableWorkflow, workflow.go:49 — reached from
+  //     routers/api/v1/repo/action.go:1081/:1230).
+  //   - DispatchActionWorkflow's tail (:192-193) — audit.RecordAs(ctx, doer,
+  //     …, repo, "workflow", workflowID, "ref", ref, "run_id", run.ID): the
+  //     RAW form ref (not the RefName-normalized branch ref), and run_id is
+  //     extra metadata the template does NOT name (upstream's metadata
+  //     carries every parser key, renderMessage only renders the named ones).
+  // Upstream has NO audit emits for the actions run delete / rerun / approve
+  // arms (view.go:954 Rerun, :990 RerunFailed, :1058 Approve, :1071 Delete,
+  // :1284 ApproveAllChecks; services/actions/cleanup.go:168 DeleteRun — none
+  // call audit.Record), so no further actions:* ids exist to register.
+  // Emits ride services/actions/audit-arms.ts (the oauth2/audit-arms.ts
+  // pattern).
+  ActionsWorkflowEnable: defineAction(
+    "actions:workflow:enable",
+    "Enabled Actions workflow {workflow} in repository {scope}.",
+  ),
+  ActionsWorkflowDisable: defineAction(
+    "actions:workflow:disable",
+    "Disabled Actions workflow {workflow} in repository {scope}.",
+  ),
+  ActionsWorkflowDispatch: defineAction(
+    "actions:workflow:dispatch",
+    "Dispatched Actions workflow {workflow} on {ref} in repository {scope}.",
+  ),
 } as const;
 
 // ---------------------------------------------------------------------------

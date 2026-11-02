@@ -224,6 +224,17 @@ describe("audit action registry (SPEC-0015 §4.2)", () => {
     // the 3-segment ids derive their family prefix filter
     expect(actionFilters()).toContain("user:externallogin");
   });
+
+  it("the actions workflow trio (upstream action.go:196-198) is registered with the verbatim ids and templates", () => {
+    expect(messageTemplate("actions:workflow:enable")).toBe("Enabled Actions workflow {workflow} in repository {scope}.");
+    expect(messageTemplate("actions:workflow:disable")).toBe("Disabled Actions workflow {workflow} in repository {scope}.");
+    expect(messageTemplate("actions:workflow:dispatch")).toBe("Dispatched Actions workflow {workflow} on {ref} in repository {scope}.");
+    expect(renderMessage(AuditActions.ActionsWorkflowDispatch, { workflow: "build.yml", ref: "main", scope: "alice/alpha" })).toBe(
+      "Dispatched Actions workflow build.yml on main in repository alice/alpha.",
+    );
+    // the 3-segment ids derive their family prefix filter
+    expect(actionFilters()).toContain("actions:workflow");
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -740,6 +740,7 @@ import {
   type RerunActionRunRequest,
 } from "./pages/repo-actions-view";
 import { approveRun } from "../services/actions/approve";
+import { emitWorkflowDispatchAudit, emitWorkflowToggleAudit } from "../services/actions/audit-arms";
 import { loadRepoActionsConfig, saveRepoActionsConfig } from "../services/actions/config";
 import { deleteRun } from "../services/actions/retention";
 import { isDoneStatus } from "../services/actions/update";
@@ -8571,6 +8572,20 @@ async function repoActionsRunDispatch(c: Context<{ Bindings: Env }>): Promise<Re
     appUrl: ctx.origin,
   });
   if (outcome.status === "throw") throw new Error(outcome.reason); // ctx.ServerError's shape
+  // DispatchActionWorkflow's audit tail (workflow.go:192-193 — RecordAs
+  // after PrepareRunAndInsert): the RAW form ref rides the row, NOT the
+  // RefName-normalized branch ref the run stores.
+  if (outcome.status === "ok") {
+    await emitWorkflowDispatchAudit(c.env.DB, {
+      repo: { id: repo.id, ownerNamespace: repo.ownerNamespace, slug: repo.slug },
+      workflowId: formValue("workflow"),
+      ref: form.get("ref") ?? url.searchParams.get("ref") ?? "",
+      runId: String(outcome.run.id),
+      actor: { id: viewer.id, username: viewer.username },
+      origin: "ui",
+      ipAddress: c.req.header("cf-connecting-ip") ?? null,
+    });
+  }
   // The translatable arms are upstream's Flash + ctx.Redirect pair — the
   // 303 carries no flash text (the no-session-flash reduction).
   return respond(new Response(null, { status: 303, headers: { location: redirectUrl } }));
@@ -8589,9 +8604,8 @@ async function repoActionsRunDispatch(c: Context<{ Bindings: Env }>): Promise<Re
  *  config store's array splice. The answer is ctx.JSONRedirect's
  *  `{"redirect": ...}` onto the actions-list URL
  *  (actionsListRedirectURL's five-param shape). Upstream's
- *  RecordWorkflowToggle audit emit defers with the audit family (the
- *  actions:workflow:{enable,disable} ids are not in the landed
- *  AuditActions table). */
+ *  RecordWorkflowToggle audit emit rides services/actions/audit-arms.ts
+ *  (the actions:workflow:{enable,disable,dispatch} family). */
 async function repoActionsWorkflowToggle(c: Context<{ Bindings: Env }>): Promise<Response> {
   const guard = sameOriginGuard(c.req.raw);
   if (guard !== null) return guard;
@@ -8628,6 +8642,16 @@ async function repoActionsWorkflowToggle(c: Context<{ Bindings: Env }>): Promise
     // MustEnableActions gate; the store seam's 404 is the honest answer.
     return respond(c.html(renderNotFound(ctx), 404));
   }
+  // RecordWorkflowToggle (view.go:1365 — after UpdateRepoUnitConfig, before
+  // the Flash arms): the enable/disable audit family's web arm.
+  await emitWorkflowToggleAudit(c.env.DB, {
+    repo: { id: repo.id, ownerNamespace: repo.ownerNamespace, slug: repo.slug },
+    workflowId: workflow,
+    isEnable: route.action === "enable",
+    actor: { id: viewer.id, username: viewer.username },
+    origin: "ui",
+    ipAddress: c.req.header("cf-connecting-ip") ?? null,
+  });
   const formInt64 = (raw: string | null): number => (raw !== null && /^\d+$/.test(raw) ? Number.parseInt(raw, 10) : 0);
   const redirectUrl = `${repoLinkOf(repo)}/actions?${new URLSearchParams({
     workflow,
