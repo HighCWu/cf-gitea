@@ -824,7 +824,10 @@ not edit the shared index themselves).
     the duplicate `normalizeGrantScope`/`grantAdditionalScopes` pair this
     module carries beside `ui/oauth2-authorize.ts`'s: same upstream port,
     one should absorb the other at integration; the services copy is the
-    mint/dispatch consumer's home).
+    mint/dispatch consumer's home). (CLOSED by the v1.5.2 residual batch,
+    2026-11-02 — F9 absorbed the authorize-side copies into
+    `services/oauth2/token.ts`, and `NormalizeGrantScope` gained upstream's
+    space-joined `StringSlice()` shape; see §6's as-built addendum below.)
 - **W3 — authorize + consent** (depends W1). Owns: GET/POST
   `/login/oauth/authorize` + POST `/login/oauth/grant` handlers, the session-state
   column read/write via the SPEC-0010 session seam, `ui/pages/oauth2-grant.tsx`
@@ -979,6 +982,73 @@ not edit the shared index themselves).
 Shared-file discipline: `wrangler.jsonc.example` (`OAUTH2_ENABLED`,
 `OAUTH2_SIGNING_ALGORITHM`) and the git-HTTP realm constant are the two cross-wave
 shared hunks — W4 owns both; W1–W3/W5 never touch them.
+
+### As-built addendum — the v1.5.2 residual batch (ledger §1.3 F3–F10, 2026-11-02)
+
+Parity closes against the pin, each with its upstream cite:
+
+- **F3 — the audit family.** The token + OAuth2-app write arms emit the
+  upstream audit rows through `services/oauth2/audit-arms.ts` (the
+  `emitOAuth2ApplicationAudit` RecordScoped port — the variant and scope
+  follow the OWNER per `ScopeFromUser`, services/audit/refs.go:38-46: an org
+  row renders `organization:oauth2application:*`, uid 0 the `system:*`
+  variants, an individual `user:*`; revoke carries ONLY the user variant,
+  scoped.go:58-60 — and the `emitAccessTokenAudit` pair). Registered ids AND
+  templates verbatim in `services/audit.ts` (action.go:93-100 + the
+  org/system blocks). Emit positions: the API app CRUD (user/app.go:278/
+  :460/:360 — origin "api", the `access-token:<id>` credential when the
+  request rode a token), the web settings arms via the shared page module
+  (oauth2_common.go:77/:143/:170/:189/:220 — origin "ui", session writes
+  carry no credential), and the PAT panel's create/revoke
+  (applications.go:133/:162). Upstream's RegenerateAccessToken records NO
+  audit row (applications.go:176-185) — the PAT regenerate arm stays
+  audit-free. Failure posture: upstream's writeEvent logs and never fails
+  the request (services/audit/event.go:136-140) — every helper catches.
+  Known open tail (NOT landed here): the `/api/v1/users/{username}/tokens`
+  API twins (user/app.go:156/:231) live in `api/routes/account-aggregates.ts`
+  (outside the batch's ownership) and the user twin's revoke mount in
+  `ui/index.ts` still calls the grant store inline — both orchestrator
+  hunks; the emit helpers are ready for exactly those shapes.
+- **F4 — the JSON Content-Type.** Every token-endpoint JSON arm renders
+  `application/json;charset=utf-8` (ctx.JSON, services/context/base.go:
+  114-116) — hono's `c.json` bare type is not upstream's. `/login/oauth/
+  keys` keeps the handler's literal `application/json` (:498).
+- **F5a — the grant session-mismatch 400.** `ctx.HTTPError` ⇒ net/http
+  `http.Error`: `text/plain; charset=utf-8` WITH the space, nosniff, body
+  `Bad Request\n` (base.go:105-111 over oauth2_provider.go:413) — NOT the
+  unspaced PlainText spelling.
+- **F5b — the keys body.** Go `json.NewEncoder(...).Encode` writes the
+  terminating newline (:499-502) — the body is the JSON document PLUS `\n`.
+- **F6 — introspection scope omitempty.** `json:"scope,omitempty"`
+  (oauth2_provider.go:171): an empty-scope grant's active response OMITS the
+  member; the struct order survives with the slot dropped.
+- **F7 — the mint-time user lookup.** `GetUserByID` sits INSIDE the
+  `ScopeContains("openid")` branch (access_token.go:212-221): a non-openid
+  grant mints WITHOUT the subject user; an openid grant without one takes
+  invalid_request "cannot find user" (:213-218). The mint input's `user` is
+  optional accordingly. The response `scope` member itself rides
+  UNCONDITIONALLY (`Scope: NormalizeGrantScope(grant.Scope)`, :269) —
+  omitempty drops only the empty string.
+- **F8 — RegenerateSecret's Cols-only posture.** The web regenerate touches
+  ONLY the client_secret column (models/auth/oauth2.go:213-224 — no
+  updated_unix bump); the drift that set `updatedAt` is dead.
+- **F9 — the scope family's one home.** `splitGrantScopes`/
+  `normalizeGrantScope`/`grantAdditionalScopes` live ONLY in
+  `services/oauth2/token.ts` (the W2 as-built's "one should absorb the
+  other" above); `normalizeGrantScope` renders the upstream space-joined
+  shape (`accessScope.StringSlice()`, access_token.go:121-125) while
+  `grantAdditionalScopes` keeps the comma-joined authority string.
+- **F10 — the PAT regenerate arm.** Upstream's RegenerateAccessToken
+  (applications.go:176-185 over models/auth/access_token.go:64-78) is
+  ported: the row's Regenerate button (access_tokens.tmpl:51-56; the
+  confirm dialog reduces to the plain form POST, the IsBot gate renders
+  never — no bot users), `POST /user/settings/applications/regenerate`
+  (web.go:695), the credential columns rotate (`setNewTokenValue` — the
+  digest + prefix swap, name/scopes/created/last-used untouched, NoAutoTime),
+  the once-only plaintext re-render (the create arm's carrier — upstream
+  flashes Success + Info(t.Token) + JSONRedirects; the no-flash posture).
+  The mount rides the orchestrator's `ui/index.ts` window (the handler is
+  the page module's `regenerateTokenFromForm`).
 
 ## Open questions (resolve before or during implementation)
 

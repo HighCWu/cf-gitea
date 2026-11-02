@@ -2,8 +2,11 @@ import { createRoute, z } from "@hono/zod-openapi";
 import type { OpenAPIHono } from "@hono/zod-openapi";
 import type { MiddlewareHandler } from "hono";
 
+import type { AuthInfo } from "../../auth/auth-context";
+import { emitOAuth2ApplicationAudit } from "../../services/oauth2/audit-arms";
 import type { ApiEnv } from "../env";
 import { ApiError, apiErrorSchema } from "../errors";
+import type { User as ApiUser } from "../models/user";
 import { parseListOptions, setPaginationHeaders } from "../pagination";
 import { orgDoerOf } from "../services/org-repos";
 import {
@@ -42,6 +45,13 @@ import {
  * list", app.go ListOauth2Applications) and get blanks it (app.go
  * GetOauth2Application); a foreign user's app is an indistinguishable 404 on
  * get (app.UID check) and on delete (the (id, uid) delete's 0-rows arm).
+ *
+ * AUDIT ARMS (the v1.5.2 ledger F3 family) — upstream audits create/update/
+ * delete here (user/app.go:278/:460/:360, `UserOAuth2Application*`, the
+ * doer as actor AND scope). The emits ride the three write handlers after
+ * the successful service call, through
+ * services/oauth2/audit-arms.ts's emitOAuth2ApplicationAudit (origin "api",
+ * the actor credential the "access-token:<id>" format).
  *
  * SCOPE BOUNDARY — CRUD ONLY. The authorize/token flow that consumes these
  * registrations is web-UI territory: no token issuance, no grants, no
@@ -186,6 +196,22 @@ function requireValidRedirectUris(uris: string[]): void {
   }
 }
 
+/**
+ * The audit arms' actor snapshot — upstream `audit.Record(ctx, …, ctx.Doer,
+ * …)`: the login as the name, the credential in the "access-token:<id>"
+ * format (models/audit/audit_event.go:27's documented shapes; null when the
+ * request rode another auth method — session/basic resolutions carry no
+ * token row). The `auth` read follows the scope-gate's `| undefined`
+ * annotation (the standalone-router injection path may leave it unset).
+ */
+function auditActorOf(authUser: ApiUser, auth: AuthInfo | undefined): { id: number; username: string; credential: string | null } {
+  return {
+    id: authUser.id ?? 0,
+    username: authUser.username ?? "",
+    credential: auth?.token ? `access-token:${auth.token.id}` : null,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // The routes.
 // ---------------------------------------------------------------------------
@@ -259,6 +285,19 @@ export function registerOAuth2AppRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: M
         },
         new Date(),
       );
+      // audit.Record(ctx, audit_model.UserOAuth2ApplicationAdd, ctx.Doer,
+      // "oauth2_application", app.Name) (user/app.go:278) — after the write
+      // + secret generation, before the 201 (upstream's exact position).
+      const createActor = auditActorOf(c.get("authUser"), c.get("auth"));
+      await emitOAuth2ApplicationAudit(c.env.DB, {
+        ownerId: doer.id,
+        appName: name,
+        verb: "add",
+        origin: "api",
+        ipAddress: c.req.header("cf-connecting-ip") ?? null,
+        actor: { id: createActor.id, username: createActor.username },
+        actorCredential: createActor.credential,
+      });
       return c.json(toApiOAuth2Application(row, secret), 201);
     },
     oauth2BodyHook,
@@ -350,6 +389,19 @@ export function registerOAuth2AppRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: M
         // upstream handler routes it to APIErrorInternal (500), not 404.
         throw new Error("UID mismatch");
       }
+      // audit.Record(ctx, audit_model.UserOAuth2ApplicationUpdate, ctx.Doer,
+      // "oauth2_application", app.Name) (user/app.go:460) — after the write
+      // + secret regeneration, before the 200.
+      const patchActor = auditActorOf(c.get("authUser"), c.get("auth"));
+      await emitOAuth2ApplicationAudit(c.env.DB, {
+        ownerId: doer.id,
+        appName: result.row.name,
+        verb: "update",
+        origin: "api",
+        ipAddress: c.req.header("cf-connecting-ip") ?? null,
+        actor: { id: patchActor.id, username: patchActor.username },
+        actorCredential: patchActor.credential,
+      });
       return c.json(toApiOAuth2Application(result.row, result.secret), 200);
     },
     oauth2BodyHook,
@@ -387,6 +439,19 @@ export function registerOAuth2AppRoutes(app: OpenAPIHono<ApiEnv>, requireAuth: M
       if (!(await deleteOAuth2Application(c.env.DB, id, doer.id))) {
         throw new ApiError(404, "not found");
       }
+      // audit.Record(ctx, audit_model.UserOAuth2ApplicationRemove, ctx.Doer,
+      // "oauth2_application", app.Name) (user/app.go:360) — after the
+      // delete, before the 204; the name rides the pre-delete load.
+      const deleteActor = auditActorOf(c.get("authUser"), c.get("auth"));
+      await emitOAuth2ApplicationAudit(c.env.DB, {
+        ownerId: doer.id,
+        appName: app.name,
+        verb: "remove",
+        origin: "api",
+        ipAddress: c.req.header("cf-connecting-ip") ?? null,
+        actor: { id: deleteActor.id, username: deleteActor.username },
+        actorCredential: deleteActor.credential,
+      });
       return c.body(null, 204);
     },
   );

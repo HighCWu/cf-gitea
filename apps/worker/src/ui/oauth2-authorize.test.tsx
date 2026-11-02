@@ -44,11 +44,10 @@ import { demoModeEnabled } from "../services/demo-sweep";
 import type { UiAssetsFetcher } from "./index";
 import type { UiManifest } from "./manifest";
 import { mintSession } from "./session";
-import {
-  grantAdditionalScopes,
-  normalizeGrantScope,
-  oauth2AuthorizeRouter,
-} from "./oauth2-authorize";
+// The scope family's ONE home is the service module (the v1.5.2 F9 absorb —
+// the authorize module re-imports from there too).
+import { grantAdditionalScopes, normalizeGrantScope } from "../services/oauth2/token";
+import { oauth2AuthorizeRouter } from "./oauth2-authorize";
 import { runA11y } from "./__tests__/a11y";
 import grantGolden from "./oauth2-goldens/oauth2-grant.html?raw";
 import grantErrorGolden from "./oauth2-goldens/oauth2-grant-error.html?raw";
@@ -559,7 +558,7 @@ describe("POST /login/oauth/grant", () => {
     expect(codes).toHaveLength(0);
   });
 
-  it("a mismatched form (state tampered) is a plain 400 — and consumes the state", async () => {
+  it("a mismatched form (state tampered) is http.Error's plain 400 — and consumes the state", async () => {
     const user = await seedUser();
     await seedConsentFixture();
     const fields = await harvestConsentForm(user);
@@ -569,7 +568,12 @@ describe("POST /login/oauth/grant", () => {
       body: formBody({ ...fields, state: "tampered", granted: "true" }),
     });
     expect(res.status).toBe(400);
-    expect(await res.text()).toContain("Bad Request");
+    // the v1.5.2 F5a shape: ctx.HTTPError → net/http http.Error — the exact
+    // "Bad Request\n" body at `text/plain; charset=utf-8` WITH the space
+    // (base.go:105-111 / oauth2_provider.go:413), plus http.Error's nosniff
+    expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(await res.text()).toBe("Bad Request\n");
     expect(await oauthStateOf(user.cookie)).toBeNull();
   });
 

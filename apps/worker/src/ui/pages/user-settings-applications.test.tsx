@@ -23,7 +23,7 @@ import { eq } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
-import { oauth2Applications, oauth2Grants, personalAccessTokens, users } from "../../db/schema";
+import { auditEvents, oauth2Applications, oauth2Grants, personalAccessTokens, users } from "../../db/schema";
 import { createOAuth2Application, verifyClientSecret } from "../../api/services/oauth2-apps";
 import { getOrCreateGrant } from "../../services/oauth2/grants";
 import { BUILTIN_OAUTH2_CLIENT_IDS, oauth2AppEditLocale } from "./oauth2-app-edit";
@@ -40,6 +40,7 @@ import {
   loadUserSettingsApplicationsPageData,
   parseUserSettingsApplicationsDeleteForm,
   parseUserSettingsApplicationsForm,
+  regenerateTokenFromForm,
   renderUserSettingsApplicationsPage,
   revokeTokenFromForm,
   tokenScopeCategories,
@@ -81,8 +82,9 @@ async function resetTables(): Promise<void> {
   // "sessions" too: the mounted-route matrix below mints session rows (the
   // users delete would cascade them, but the reset stays explicit). The W5
   // oauth2 pair rides the reset too (the builtin seed rows are wiped per
-  // test — the lock-arm test seeds its own builtin-clientId row).
-  for (const table of ["personal_access_tokens", "sessions", "users", "oauth2_grant", "oauth2_application"]) {
+  // test — the lock-arm test seeds its own builtin-clientId row). The F3
+  // audit rows reset with the writes they describe.
+  for (const table of ["audit_event", "personal_access_tokens", "sessions", "users", "oauth2_grant", "oauth2_application"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
 }
@@ -206,6 +208,108 @@ describe("revokeTokenFromForm (upstream DeleteAccessToken over the landed revoke
     expect(await drizzle(env.DB).select().from(personalAccessTokens).all()).toHaveLength(0);
     expect(await revokeTokenFromForm(env.DB, aliceId, row.id)).toBe("missing");
     expect((created as { plaintext: string }).plaintext).toBeDefined();
+  });
+});
+
+// --- the v1.5.2 residual batch (F3 PAT audit + F10 regenerate) ------------------
+
+describe("the PAT audit arms (F3 — applications.go:133/:162)", () => {
+  it("create emits user:accesstoken:add with the token_scope pair and the rendered template", async () => {
+    await createTokenFromForm(env.DB, aliceId, { name: "ci", scopesRaw: "write:repository,public-only" }, NOW);
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.action).toBe("user:accesstoken:add");
+    expect(row.actorId).toBe(aliceId);
+    expect(row.actorName).toBe("alice");
+    expect(row.actorCredential).toBeNull(); // the write rode a session
+    expect(row.scopeType).toBe("user");
+    expect(row.scopeId).toBe(String(aliceId));
+    expect(row.scopeName).toBe("alice");
+    expect(row.origin).toBe("ui");
+    expect(row.message).toBe("Added access token ci for user alice with scope public-only,write:repository.");
+    expect(JSON.parse(row.metadata ?? "null")).toEqual({ token: "ci", token_scope: "public-only,write:repository" });
+  });
+
+  it("revoke emits user:accesstoken:remove; a missing revoke emits nothing", async () => {
+    await createTokenFromForm(env.DB, aliceId, { name: "ci", scopesRaw: "read:user" }, NOW);
+    const row = (await drizzle(env.DB).select().from(personalAccessTokens).all())[0]!;
+    expect(await revokeTokenFromForm(env.DB, aliceId, row.id)).toBe("deleted");
+    expect(await revokeTokenFromForm(env.DB, aliceId, row.id)).toBe("missing");
+    // TWO rows: the create's add + the revoke's remove; the missing revoke
+    // (the stale-form arm) emitted nothing.
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows.map((row) => row.action)).toEqual(["user:accesstoken:add", "user:accesstoken:remove"]);
+    expect(rows[1]!.message).toBe("Removed access token ci from user alice.");
+    expect(JSON.parse(rows[1]!.metadata ?? "null")).toEqual({ token: "ci" });
+  });
+
+  it("the failed create arms emit nothing (binder, gate, duplicate)", async () => {
+    expect(await createTokenFromForm(env.DB, aliceId, { name: "", scopesRaw: "read:user" }, NOW)).toEqual({
+      outcome: "invalid",
+      message: "Name: Required",
+    });
+    expect(await createTokenFromForm(env.DB, aliceId, { name: "ci", scopesRaw: "public-only" }, NOW)).toEqual({
+      outcome: "invalid",
+      message: userSettingsApplicationsLocale.at_least_one_permission,
+    });
+    expect(await drizzle(env.DB).select().from(auditEvents).all()).toHaveLength(0);
+  });
+});
+
+describe("regenerateTokenFromForm (F10 — upstream RegenerateAccessToken, applications.go:176-185)", () => {
+  it("rotates the value: the old plaintext dies, the new one verifies, name/scopes/created ride", async () => {
+    const created = await createTokenFromForm(env.DB, aliceId, { name: "ci", scopesRaw: "write:repository" }, NOW);
+    const oldPlaintext = (created as { plaintext: string }).plaintext;
+    const row = (await drizzle(env.DB).select().from(personalAccessTokens).all())[0]!;
+    expect(row.createdAt.getTime()).toBe(NOW.getTime());
+
+    const { TokenService } = await import("../../auth/token-service");
+    const before = await new TokenService(env.DB).verify(oldPlaintext);
+    expect(before?.token.id).toBe(row.id); // the old value resolves pre-regenerate
+
+    const regenerated = await regenerateTokenFromForm(env.DB, aliceId, row.id);
+    expect(regenerated.outcome).toBe("regenerated");
+    const fresh = (regenerated as { plaintext: string }).plaintext;
+    expect(fresh).toMatch(/^cfg_[0-9a-f]{8}_[A-Z2-9]{32}$/);
+    expect(fresh).not.toBe(oldPlaintext);
+
+    // the old value is dead; the new one resolves the SAME row (name,
+    // scopes, created and the last-used history ride untouched — upstream
+    // updates ONLY the credential columns, NoAutoTime)
+    expect(await new TokenService(env.DB).verify(oldPlaintext)).toBeNull();
+    const after = await new TokenService(env.DB).verify(fresh);
+    expect(after?.token.id).toBe(row.id);
+    expect(after?.token.name).toBe("ci");
+    const stored = (await drizzle(env.DB).select().from(personalAccessTokens).all())[0]!;
+    expect(stored.name).toBe("ci");
+    expect(stored.scopes).toBe("write:repository");
+    expect(stored.createdAt.getTime()).toBe(NOW.getTime());
+    expect(stored.lastUsedAt).toBeNull();
+  });
+
+  it("a missing id answers the stale-form outcome and changes nothing", async () => {
+    expect(await regenerateTokenFromForm(env.DB, aliceId, 424242)).toEqual({ outcome: "missing" });
+    expect(await drizzle(env.DB).select().from(personalAccessTokens).all()).toHaveLength(0);
+  });
+
+  it("a foreign user's id answers missing (the (id, uid) pair)", async () => {
+    const created = await createTokenFromForm(env.DB, aliceId, { name: "ci", scopesRaw: "read:user" }, NOW);
+    const row = (await drizzle(env.DB).select().from(personalAccessTokens).all())[0]!;
+    const bobId = await seedUser("bob", false);
+    expect((await regenerateTokenFromForm(env.DB, bobId, row.id)).outcome).toBe("missing");
+    // alice's credential is untouched
+    const { TokenService } = await import("../../auth/token-service");
+    expect((await new TokenService(env.DB).verify((created as { plaintext: string }).plaintext))?.token.id).toBe(row.id);
+  });
+
+  it("renders the row's Regenerate form (access_tokens.tmpl:51-56 — the button the dialog reduces to)", async () => {
+    await createTokenFromForm(env.DB, aliceId, { name: "ci", scopesRaw: "read:user" }, NOW);
+    const data = await loadUserSettingsApplicationsPageData(env.DB, aliceId, false, NOW);
+    const html = renderUserSettingsApplicationsPage(ctx, data);
+    expect(html).toContain('action="/user/settings/applications/regenerate"');
+    expect(html).toContain(`name="id" value="${data.tokens[0]!.token.id}"`);
+    expect(html).toContain("Regenerate");
   });
 });
 

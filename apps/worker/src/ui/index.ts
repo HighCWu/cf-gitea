@@ -1080,13 +1080,13 @@ import {
   oauth2SettingsForbidden,
   parseOauth2AppEditForm,
   regenerateOauth2ApplicationSecret,
+  revokeOauth2GrantFromForm,
   saveOauth2ApplicationFromForm,
   showOauth2Application,
   renderAdminOauth2AppEditPage,
   renderOrgOauth2AppEditPage,
   renderUserOauth2AppEditPage,
 } from "./pages/oauth2-app-edit";
-import { getGrantByID, revokeGrant } from "../services/oauth2/grants";
 // The census R13 arm: the settings audit log pages (ONE shared module —
 // upstream routers/web/shared/audit — with the repo and the org mounts; the
 // scope pairs key the M4 instrumentation's encodings).
@@ -1277,6 +1277,7 @@ import {
   loadUserSettingsApplicationsPageData,
   parseUserSettingsApplicationsDeleteForm,
   parseUserSettingsApplicationsForm,
+  regenerateTokenFromForm,
   renderUserSettingsApplicationsPage,
   revokeTokenFromForm,
 } from "./pages/user-settings-applications";
@@ -11264,6 +11265,26 @@ async function userSettingsApplicationsDelete(c: Context<{ Bindings: Env }>): Pr
   return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/applications" } }));
 }
 
+/** POST /user/settings/applications/regenerate (web.go:695's group →
+ *  RegenerateAccessToken, applications.go:176-185): the same single-`id`
+ *  body; the hit re-renders the FULL page with data.newToken — the once-only
+ *  carrier (upstream flashes Success + Info(t.Token) + JSONRedirects; the
+ *  create arm's no-flash posture). A "missing" outcome (a stale form id)
+ *  303s silently — upstream ServerErrors it (unreachable from the rendered
+ *  buttons). NO audit row: upstream's RegenerateAccessToken records none. */
+async function userSettingsApplicationsRegenerate(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const p = await userSettingsTabPrologue(c, true);
+  if (!p.ok) return p.response;
+  const form = parseUserSettingsApplicationsDeleteForm(await readUrlEncodedForm(c.req.raw));
+  const outcome = await regenerateTokenFromForm(c.env.DB, p.viewer.id, form.id ?? 0);
+  if (outcome.outcome === "regenerated") {
+    const data = await loadUserSettingsApplicationsPageData(c.env.DB, p.viewer.id, p.viewer.isAdmin);
+    data.newToken = outcome.plaintext;
+    return p.respond(c.html(renderUserSettingsApplicationsPage(p.ctx, data)));
+  }
+  return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/applications" } }));
+}
+
 // --- W5 (specs/oauth2-provider.md §6 W5): the /oauth2 subgroup
 // (web.go:682-689's user settings group half — ALL of it inside the group's
 // `oauth2Enabled` wrap; the handlers call the shared
@@ -11383,9 +11404,8 @@ async function userSettingsOauth2Revoke(c: Context<{ Bindings: Env }>, grantId: 
   if (gate !== null) return gate;
   const p = await userSettingsTabPrologue(c, true);
   if (!p.ok) return p.response;
-  const grant = await getGrantByID(c.env.DB, grantId);
-  if (grant === null || grant.userId !== p.viewer.id) return p.respond(c.html(renderNotFound(p.ctx), 404));
-  await revokeGrant(c.env.DB, grant.id, p.viewer.id);
+  const outcome = await revokeOauth2GrantFromForm(c.env.DB, p.viewer.id, grantId);
+  if (outcome.kind === "not_found") return p.respond(c.html(renderNotFound(p.ctx), 404));
   return p.respond(new Response(null, { status: 303, headers: { location: "/user/settings/applications" } }));
 }
 
@@ -18633,6 +18653,8 @@ uiRouter.post("/user/settings/keys/delete", (c) => userSettingsKeysDelete(c));
 uiRouter.get("/user/settings/applications", (c) => userSettingsApplicationsPage(c));
 uiRouter.post("/user/settings/applications", (c) => userSettingsApplicationsSubmit(c));
 uiRouter.post("/user/settings/applications/delete", (c) => userSettingsApplicationsDelete(c));
+uiRouter.post("/user/settings/applications/regenerate", (c) => userSettingsApplicationsRegenerate(c));
+uiRouter.get("/user/settings/applications/regenerate", () => methodNotAllowed("POST"));
 // The W5 /oauth2 subgroup (web.go:682-689's exact route set — upstream
 // orders GET/{id} → POST/{id} → regenerate_secret → POST "" → delete →
 // revoke/{grantId}, all inside the oauth2Enabled gate the handlers carry).

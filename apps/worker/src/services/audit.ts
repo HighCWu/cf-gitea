@@ -135,15 +135,97 @@ export function renderMessage(action: string, vars: Record<string, string> = {})
  */
 export const AuditActions = {
   // user:* (action.go:64-110) — the slice grows one row at a time as the
-  // owning wave lands its emit. This row is the OAuth2 provider's first
-  // consent (SPEC specs/oauth2-provider.md §2.2/§6 W4):
-  // audit.Record(..., UserOAuth2ApplicationGrant, ctx.Doer,
+  // owning wave lands its emit.
+  //
+  // The F3 audit family (v1.5.2 ledger §1.3): the access-token pair and the
+  // OAuth2-application CRUD/secret/revoke/remove quintet, ids AND templates
+  // verbatim from action.go:93-100. Emits ride this cycle's surfaces:
+  //   - UserAccessTokenAdd/Remove — the PAT panel's create/revoke write arms
+  //     (pages/user-settings-applications.tsx; upstream applications.go:133
+  //     web / app.go:156 API for the add, applications.go:162 web / app.go:231
+  //     API for the remove).
+  //   - UserOAuth2ApplicationAdd/Update/Secret/Remove — the API CRUD family
+  //     (routes/oauth2-apps.ts; upstream app.go:278/:460/:360) and the web
+  //     OAuth2CommonHandlers write arms (pages/oauth2-app-edit.tsx; upstream
+  //     oauth2_common.go:77/:143/:170/:189 — the web emits select the
+  //     org/system variant by owner kind, the RecordScoped shape,
+  //     services/audit/scoped.go:39-63 + :108-131).
+  //   - UserOAuth2ApplicationRevoke — the settings grant-revoke write half
+  //     (oauth2_common.go:220; the ONLY variant — grants belong to
+  //     individuals, scoped.go:58-60).
+  UserAccessTokenAdd: defineAction(
+    "user:accesstoken:add",
+    "Added access token {token} for user {scope} with scope {token_scope}.",
+  ),
+  UserAccessTokenRemove: defineAction(
+    "user:accesstoken:remove",
+    "Removed access token {token} from user {scope}.",
+  ),
+  UserOAuth2ApplicationAdd: defineAction(
+    "user:oauth2application:add",
+    "Added OAuth2 application {oauth2_application} for user {scope}.",
+  ),
+  UserOAuth2ApplicationUpdate: defineAction(
+    "user:oauth2application:update",
+    "Updated OAuth2 application {oauth2_application} of user {scope}.",
+  ),
+  UserOAuth2ApplicationSecret: defineAction(
+    "user:oauth2application:secret",
+    "Regenerated secret for OAuth2 application {oauth2_application} of user {scope}.",
+  ),
+  // The OAuth2 provider's first consent row (SPEC specs/oauth2-provider.md
+  // §2.2/§6 W4): audit.Record(..., UserOAuth2ApplicationGrant, ctx.Doer,
   // "oauth2_application", app.Name, "granted_scope", form.Scope) at
   // oauth2_provider.go:449-453 — FIRST-consent grant creation only (the
   // re-consent scope-update branch records nothing upstream, :455-461).
   UserOAuth2ApplicationGrant: defineAction(
     "user:oauth2application:grant",
     "Granted OAuth2 application {oauth2_application} access to user {scope}.",
+  ),
+  UserOAuth2ApplicationRevoke: defineAction(
+    "user:oauth2application:revoke",
+    "Revoked OAuth2 grant for application {oauth2_application} of user {scope}.",
+  ),
+  UserOAuth2ApplicationRemove: defineAction(
+    "user:oauth2application:remove",
+    "Removed OAuth2 application {oauth2_application} of user {scope}.",
+  ),
+  // organization:oauth2application:* (action.go:125-128) — the org twin's
+  // variants of the OAuth2CommonHandlers write arms (the RecordScoped Org
+  // leg; NO revoke variant exists upstream — grants belong to individuals).
+  OrganizationOAuth2ApplicationAdd: defineAction(
+    "organization:oauth2application:add",
+    "Added OAuth2 application {oauth2_application} for organization {scope}.",
+  ),
+  OrganizationOAuth2ApplicationUpdate: defineAction(
+    "organization:oauth2application:update",
+    "Updated OAuth2 application {oauth2_application} of organization {scope}.",
+  ),
+  OrganizationOAuth2ApplicationSecret: defineAction(
+    "organization:oauth2application:secret",
+    "Regenerated secret for OAuth2 application {oauth2_application} of organization {scope}.",
+  ),
+  OrganizationOAuth2ApplicationRemove: defineAction(
+    "organization:oauth2application:remove",
+    "Removed OAuth2 application {oauth2_application} of organization {scope}.",
+  ),
+  // system:oauth2application:* (action.go:210-213) — the instance-wide admin
+  // family's variants (the RecordScoped System leg: owner nil ⇒ uid 0).
+  SystemOAuth2ApplicationAdd: defineAction(
+    "system:oauth2application:add",
+    "Added instance-wide OAuth2 application {oauth2_application}.",
+  ),
+  SystemOAuth2ApplicationUpdate: defineAction(
+    "system:oauth2application:update",
+    "Updated instance-wide OAuth2 application {oauth2_application}.",
+  ),
+  SystemOAuth2ApplicationSecret: defineAction(
+    "system:oauth2application:secret",
+    "Regenerated secret for instance-wide OAuth2 application {oauth2_application}.",
+  ),
+  SystemOAuth2ApplicationRemove: defineAction(
+    "system:oauth2application:remove",
+    "Removed instance-wide OAuth2 application {oauth2_application}.",
   ),
   // The impersonation pair (admin impersonation's audit rows — the
   // sanctioned 2a00e28 follow-up): ids AND templates verbatim from

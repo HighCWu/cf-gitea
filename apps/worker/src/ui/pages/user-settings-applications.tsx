@@ -39,6 +39,22 @@
  *                flash-error arm carries the Go error string
  *                ("GetAccessTokenByID: …", applications.go:170-173), which
  *                has no renderable analog.
+ *   POST /user/settings/applications/regenerate → the sameOriginGuard + the
+ *                signed-in gate (web.go:695's group), `readUrlEncodedForm`,
+ *                `parseUserSettingsApplicationsDeleteForm` (the body is the
+ *                same single `id` field),
+ *                `regenerateTokenFromForm`; the hit re-renders the FULL page
+ *                with `data.newToken` set — upstream flashes the success +
+ *                the fresh value and JSONRedirects (RegenerateAccessToken,
+ *                applications.go:176-185 — `Flash.Success(generate_token_
+ *                success)` + `Flash.Info(t.Token)`); the no-JS shell's
+ *                once-only carrier is the create arm's full-page re-render
+ *                (the same posture). A "missing" outcome (a stale form id)
+ *                303s silently — upstream ServerErrors it (unreachable from
+ *                the rendered buttons). THE AUDIT: upstream's
+ *                RegenerateAccessToken records NO audit row — the
+ *                regenerate arm stays audit-free (the v1.5.2 F3 family
+ *                covers add/remove only, applications.go:133/:162).
  *
  * Upstream's settings navbar (user/settings/navbar.tmpl) is the SHARED
  * components/settings-nav UserSettingsNavbar (the wave-114 swap) with this
@@ -149,11 +165,15 @@
  * - The OAuth2 halves of applications.tmpl (grants_oauth2 + applications_
  *   oauth2, gated on .EnableOAuth2) are UNRENDERED: the landed OAuth2 store
  *   is API-only (routes/oauth2-apps.ts) with no web UI surface — this brief
- *   pins the PAT panel (access_tokens.tmpl).
+ *   pins the PAT panel (access_tokens.tmpl). [RETIRED W5 — the halves render
+ *   above.]
  * - The Regenerate button + dialog (access_tokens.tmpl:51-56, 115-125) are
  *   UNRENDERED: upstream RegenerateAccessToken (applications.go:176-185)
  *   has no landed analog — TokenService carries mint/revoke only; a
- *   rendered button would post a dead route.
+ *   rendered button would post a dead route. [RETIRED v1.5.2 F10 — the
+ *   button renders above posting /user/settings/applications/regenerate;
+ *   the confirm dialog reduces to the plain form POST (the delete
+ *   reduction's convention, the desc text the aria label).]
  * - The copy button beside the new token (access_tokens.tmpl:11,
  *   data-clipboard-target) is the bundle's clipboard JS — the no-JS shape
  *   renders the bare `<code id="new-access-token-value">`.
@@ -171,12 +191,19 @@
  *   wrapper (the plain-text error line; the locale's HTML tags stripped).
  */
 
+import { and, eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
+
 import { TokenService } from "../../auth/token-service";
 import type { AuthToken } from "../../auth/auth-context";
+import { sha256Hex } from "../../auth/digest";
+import { generateToken } from "../../auth/token-format";
 import { InvalidScopeError, normalizeScope, SCOPE_CATEGORIES, ScopeSet, scopeStringSlice } from "../../auth/scopes";
 import { TokenNameExistsError, TokenNameTooLongError } from "../../auth/errors";
+import { personalAccessTokens } from "../../db/schema";
 import { listOAuth2Applications, toApiOAuth2Application, type OAuth2AppRow } from "../../api/services/oauth2-apps";
 import { listGrantsByUserID, type OAuth2GrantRow, type OAuth2ApplicationRow } from "../../services/oauth2/grants";
+import { emitAccessTokenAudit } from "../../services/oauth2/audit-arms";
 import type { OAuth2AppEditForm } from "./oauth2-app-edit";
 import { UserSettingsNavbar } from "../components/settings-nav";
 import { BaseLayout, Icon, renderPage } from "../shell";
@@ -215,6 +242,16 @@ export const userSettingsApplicationsLocale = {
   generate_token: "Generate Token", // "settings.generate_token"
   at_least_one_permission: "You must select at least one permission to create a token", // "settings.at_least_one_permission"
   delete_token_success: "The token has been deleted. Applications using it no longer have access to your account.", // "settings.delete_token_success" (the flash reduction never renders it — kept for the outcome docs)
+  /** "settings.regenerate_token" — the row's Regenerate button
+   *  (access_tokens.tmpl:52-55, the v1.5.2 F10 arm). */
+  regenerate_token: "Regenerate", // "settings.regenerate_token"
+  /** "settings.access_token_regeneration" — the confirm-dialog reduction's
+   *  aria label (access_tokens.tmpl:116). */
+  access_token_regeneration: "Regenerate Access Token", // "settings.access_token_regeneration"
+  /** "settings.access_token_regeneration_desc" — the confirm-dialog
+   *  reduction's aria description (access_tokens.tmpl:118-120). */
+  access_token_regeneration_desc:
+    "Regenerating a token immediately invalidates its old value; applications still using the old value will lose access. Its name and permissions are kept. This cannot be undone. Continue?",
 
   // --- the W5 OAuth2 halves (grants_oauth2.tmpl + applications_oauth2*.tmpl
   //     at the pin; en-US values) ---
@@ -299,8 +336,10 @@ export interface TokenListItem {
 }
 
 /** The applications tab's render inputs. `form` re-renders the submitted
- *  name ("" on the plain GET); `newToken` carries the minted plaintext
- *  exactly once (the create POST's full-page re-render). The W5 tail is the
+ *  name ("" on the plain GET); `newToken` carries the minted/regenerated
+ *  plaintext exactly once (the create/regenerate POST's full-page re-render
+ *  — the create arm's once-only carrier, shared with the v1.5.2 F10
+ *  regenerate arm). The W5 tail is the
  *  OAuth2 half: `oauth2Enabled` gates the two sections
  *  (applications.tmpl:5), `apps`/`grants` are the uid-scoped reads, and
  *  `oauth2Form`/`oauth2Error` re-render a failed oauth2 create (the kept
@@ -386,7 +425,10 @@ export function parseUserSettingsApplicationsForm(params: URLSearchParams): User
   return { name: params.get("name") ?? "", scopesRaw: scopeNames.join(",") };
 }
 
-/** The delete POST body (upstream ctx.FormInt64("id")). */
+/** The delete POST body (upstream ctx.FormInt64("id")). The regenerate
+ *  POST carries the same single `id` field (access_tokens.tmpl:51-56's
+ *  data-url `?id={{$token.ID}}` shape — the plain-form POST folds the query
+ *  param into the body field). */
 export function parseUserSettingsApplicationsDeleteForm(params: URLSearchParams): { id: number | null } {
   const raw = params.get("id") ?? "";
   return { id: /^\d+$/.test(raw) ? Number.parseInt(raw, 10) : null };
@@ -425,6 +467,17 @@ export async function createTokenFromForm(
   }
   try {
     const minted = await new TokenService(d1).mint({ userId, name: form.name, scopes: normalized, now });
+    // audit.Record(ctx, audit_model.UserAccessTokenAdd, owner, "token",
+    // t.Name, "token_scope", t.Scope) (applications.go:133 — after the mint,
+    // before the panel render). The web write rides a session: no actor
+    // credential.
+    await emitAccessTokenAudit(d1, {
+      userId,
+      tokenName: form.name,
+      tokenScope: normalized,
+      verb: "add",
+      origin: "ui",
+    });
     return { outcome: "created", plaintext: minted.plaintext };
   } catch (error) {
     return mintErrorToOutcome(error, form.name);
@@ -448,10 +501,78 @@ function mintErrorToOutcome(error: unknown, name: string): CreateTokenOutcome {
 }
 
 /** The revoke — upstream DeleteAccessToken (applications.go:167-174) over
- *  the landed owner-scoped `TokenService.revoke`. A miss answers "missing"
- *  (the stale-form arm — the module header's silent-303 note). */
+ *  the landed owner-scoped `TokenService.revoke`: the row loads first (the
+ *  audit name — upstream's GetAccessTokenByID arm, applications.go:169-173;
+ *  a miss answers "missing" with NO audit — the stale-form arm), then the
+ *  delete, then the UserAccessTokenRemove audit row (applications.go:162). */
 export async function revokeTokenFromForm(d1: D1Database, userId: number, id: number): Promise<RevokeTokenOutcome> {
-  return (await new TokenService(d1).revoke(userId, id)) ? "deleted" : "missing";
+  const row = await drizzle(d1)
+    .select({ id: personalAccessTokens.id, name: personalAccessTokens.name })
+    .from(personalAccessTokens)
+    .where(and(eq(personalAccessTokens.id, id), eq(personalAccessTokens.userId, userId)))
+    .get();
+  if (row === undefined) {
+    return "missing";
+  }
+  const deleted = await new TokenService(d1).revoke(userId, id);
+  if (!deleted) {
+    return "missing";
+  }
+  await emitAccessTokenAudit(d1, { userId, tokenName: row.name, verb: "remove", origin: "ui" });
+  return "deleted";
+}
+
+/** The regenerate outcome — the hit carries the fresh plaintext (the
+ *  once-only value, the create arm's carrier). */
+export type RegenerateTokenOutcome = { outcome: "regenerated"; plaintext: string } | { outcome: "missing" };
+
+/**
+ * The regenerate — upstream RegenerateAccessToken (applications.go:176-185)
+ * over models/auth/access_token.go:64-78: the (id, uid) load (a miss is the
+ * "missing" stale-form outcome — upstream ServerErrors it, unreachable from
+ * the rendered buttons), then `setNewTokenValue`'s fresh value: a new
+ * `cfg_` token whose public prefix replaces the row's lookup key
+ * (`token_hash, token_salt, token_last_eight` upstream — cf-gitea's shape
+ * keeps the digest under `sha256Digest` and folds the salt into it; the
+ * unique `pat_prefix_uq` prefix plays the last-eight lookup role and its
+ * collision retries exactly like the mint's, SPEC-0002 §4.5). The name,
+ * scopes, created stamp and last-used history ride untouched (upstream
+ * updates ONLY the three credential columns, `NoAutoTime` — no updated_unix
+ * bump; this table carries no updated column). NO audit row: upstream's
+ * RegenerateAccessToken records none (applications.go:176-185).
+ */
+export async function regenerateTokenFromForm(d1: D1Database, userId: number, id: number): Promise<RegenerateTokenOutcome> {
+  const existing = await drizzle(d1)
+    .select({ id: personalAccessTokens.id })
+    .from(personalAccessTokens)
+    .where(and(eq(personalAccessTokens.id, id), eq(personalAccessTokens.userId, userId)))
+    .get();
+  if (existing === undefined) {
+    return { outcome: "missing" };
+  }
+  // The mint's prefix-collision retry (SPEC-0002 §4.5 — the unique
+  // `cfg_<8hex>` lookup key): regenerate until the prefix is free; exhausted
+  // retries propagate (the mint's PREFIX_RETRY_LIMIT posture). The digest
+  // never collides (160 bits of entropy over sha256), only the prefix can.
+  let lastError: unknown = new Error("token prefix collisions exhausted the regenerate retries");
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const fresh = generateToken();
+    const digest = await sha256Hex(fresh.value);
+    try {
+      const updated = await drizzle(d1)
+        .update(personalAccessTokens)
+        .set({ prefix: fresh.prefix, sha256Digest: digest })
+        .where(and(eq(personalAccessTokens.id, id), eq(personalAccessTokens.userId, userId)))
+        .returning({ id: personalAccessTokens.id });
+      if (updated.length === 0) {
+        return { outcome: "missing" }; // the row vanished mid-regenerate
+      }
+      return { outcome: "regenerated", plaintext: fresh.value };
+    } catch (error) {
+      lastError = error; // a prefix collision — draw a fresh value and retry
+    }
+  }
+  throw lastError;
 }
 
 // ---------------------------------------------------------------------------
@@ -566,8 +687,27 @@ export function UserSettingsApplicationsPage(props: { ctx: UiContext; data: User
                       </div>
                     </div>
                     <div class="item-trailing">
-                      {/* No Regenerate button: the op has no landed analog
-                          (the module header). */}
+                      {/* access_tokens.tmpl:51-56 — the Regenerate button (the
+                          v1.5.2 F10 arm; the confirm dialog reduces to the
+                          plain form POST, the desc text the aria label — the
+                          delete reduction's convention). The IsBot gate
+                          (tmpl:51) renders never — cf-gitea has no bot
+                          users (the module header). */}
+                      <form
+                        method="post"
+                        action="/user/settings/applications/regenerate"
+                        class="tw-inline-block tw-mr-2"
+                        aria-label={userSettingsApplicationsLocale.access_token_regeneration}
+                      >
+                        <input type="hidden" name="id" value={String(item.token.id)} />
+                        <button
+                          type="submit"
+                          class="ui tiny button"
+                          title={userSettingsApplicationsLocale.access_token_regeneration_desc}
+                        >
+                          {userSettingsApplicationsLocale.regenerate_token}
+                        </button>
+                      </form>
                       <form method="post" action="/user/settings/applications/delete">
                         <input type="hidden" name="id" value={String(item.token.id)} />
                         <button type="submit" class="ui red tiny button">

@@ -875,6 +875,105 @@ describe("parseClientSecretBasic / parseTokenForm (the RFC 6749 §2.3.1 shape)",
 });
 
 // ---------------------------------------------------------------------------
+// The v1.5.2 residual batch (docs/compat/v1.5.2-ledger.md §1.3 F4/F5b/F6/F7)
+// ---------------------------------------------------------------------------
+
+describe("the v1.5.2 residual batch (F4/F5b/F6/F7)", () => {
+  it("F4: every JSON arm carries application/json;charset=utf-8 (ctx.JSON, base.go:114-116)", async () => {
+    // the token 400 error body
+    const err = await call("/login/oauth/access_token", { method: "POST", headers: formHeaders, body: "grant_type=bogus" });
+    expect(err.status).toBe(400);
+    expect(err.headers.get("content-type")).toBe("application/json;charset=utf-8");
+    // the 200 mint envelope (public client, no PKCE on the code)
+    const user = await seedUser();
+    const app = await seedApp();
+    const grant = await seedGrant(user.id, app.id, "read:repository");
+    const code = await generateAuthorizationCode(
+      env.DB,
+      { grantId: grant.id, redirectUri: "http://127.0.0.1", codeChallenge: "", codeChallengeMethod: "" },
+      NOW(),
+    );
+    const mint = await call("/login/oauth/access_token", {
+      method: "POST",
+      headers: formHeaders,
+      body: new URLSearchParams({ grant_type: "authorization_code", client_id: app.clientId, code: code.code, redirect_uri: "http://127.0.0.1" }).toString(),
+    });
+    expect(mint.status).toBe(200);
+    expect(mint.headers.get("content-type")).toBe("application/json;charset=utf-8");
+  });
+
+  it("F6: an empty-scope grant's introspection OMITS the scope member (omitempty, oauth2_provider.go:171)", async () => {
+    const user = await seedUser();
+    const conf = await seedConfidentialApp();
+    const grant = await seedGrant(user.id, conf.id, "");
+    const minted = await mintForGrant(grant, conf.id, user.id);
+    const response = await call("/login/oauth/introspect", {
+      method: "POST",
+      headers: { ...formHeaders, authorization: `Basic ${btoa(`${conf.clientId}:${conf.secret}`)}` },
+      body: new URLSearchParams({ token: minted.access_token }).toString(),
+    });
+    const text = await response.text();
+    expect(response.status, text).toBe(200);
+    const body = JSON.parse(text) as Record<string, unknown>;
+    // the struct order survives — scope's slot simply drops out
+    expect(Object.keys(body)).toEqual(["active", "username", "iss", "sub", "aud"]);
+    expect(body.scope).toBeUndefined();
+  });
+
+  it("F7: the mint-time user lookup rides the openid arm ONLY (access_token.go:212-221)", async () => {
+    const user = await seedUser();
+    const app = await seedApp();
+    const nonOpenid = await seedGrant(user.id, app.id, "read:repository");
+    // a SECOND application — the grant store keeps ONE grant per (user, app)
+    // pair, so the openid grant needs its own app row
+    const app2 = await seedApp();
+    const openid = await seedGrant(user.id, app2.id, "openid");
+    const codeA = await generateAuthorizationCode(
+      env.DB,
+      { grantId: nonOpenid.id, redirectUri: "http://127.0.0.1", codeChallenge: "", codeChallengeMethod: "" },
+      NOW(),
+    );
+    const codeB = await generateAuthorizationCode(
+      env.DB,
+      { grantId: openid.id, redirectUri: "http://127.0.0.1", codeChallenge: "", codeChallengeMethod: "" },
+      NOW(),
+    );
+    // the subject user reference vanishes (the grant's user_id carries no
+    // FK — the store shape keeps the orphan grant resolvable, exactly the
+    // state upstream's IsErrUserNotExist arm defends)
+    await drizzle(env.DB).update(oauth2Grants).set({ userId: 999999999 }).where(eq(oauth2Grants.id, nonOpenid.id));
+    await drizzle(env.DB).update(oauth2Grants).set({ userId: 999999999 }).where(eq(oauth2Grants.id, openid.id));
+
+    const nonOpenidMint = await call("/login/oauth/access_token", {
+      method: "POST",
+      headers: formHeaders,
+      body: new URLSearchParams({ grant_type: "authorization_code", client_id: app.clientId, code: codeA.code, redirect_uri: "http://127.0.0.1" }).toString(),
+    });
+    expect(nonOpenidMint.status).toBe(200);
+    const nonOpenidBody = await nonOpenidMint.json<Record<string, unknown>>();
+    // Scope rides unconditionally (access_token.go:269 — omitempty drops only
+    // the EMPTY string; this grant's scope normalizes non-empty).
+    expect(Object.keys(nonOpenidBody)).toEqual(["access_token", "token_type", "expires_in", "refresh_token", "scope"]);
+
+    const openidMint = await call("/login/oauth/access_token", {
+      method: "POST",
+      headers: formHeaders,
+      body: new URLSearchParams({ grant_type: "authorization_code", client_id: app2.clientId, code: codeB.code, redirect_uri: "http://127.0.0.1" }).toString(),
+    });
+    expect(openidMint.status).toBe(400);
+    expect(await openidMint.json()).toEqual({ error: "invalid_request", error_description: "cannot find user" });
+  });
+
+  it("F5b: the keys body is Go Encoder's shape — the JSON document PLUS its trailing newline (:499-502)", async () => {
+    const response = await call("/login/oauth/keys");
+    const text = await response.text();
+    expect(text.endsWith("\n")).toBe(true);
+    expect(text.endsWith("\n\n")).toBe(false);
+    expect(JSON.parse(text)).toHaveProperty("keys");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Local org/team seeds (the schema's SPEC-0007 shapes, minimal columns)
 // ---------------------------------------------------------------------------
 

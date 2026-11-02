@@ -149,13 +149,20 @@ export function splitGrantScopes(grantScopes: string): { generalScopes: string[]
 }
 
 /**
- * NormalizeGrantScope (access_token.go:122-125): the grant scope string as
- * stored — general scopes verbatim + the normalized access scope, joined by
- * single spaces. userinfo/introspection report THIS form.
+ * NormalizeGrantScope (access_token.go:121-125): the grant scope string as
+ * stored — general scopes verbatim + the normalized access scope joined by
+ * single spaces. userinfo/introspection/the token response report THIS
+ * form. Upstream appends `accessScope.StringSlice()` — the comma-joined
+ * authority SPLITS back into space-joined words before the join — so a
+ * multi-word access part renders "openid read:user write:issue", never
+ * "openid read:user,write:issue" (the v1.5.2 F9 absorb: the
+ * ui/oauth2-authorize.ts twin carried this upstream shape while this
+ * module's comma-joined blob diverged from the pin; one home now, the
+ * upstream shape).
  */
 export function normalizeGrantScope(grantScopes: string): string {
   const { generalScopes, accessScope } = splitGrantScopes(grantScopes);
-  const accessParts = accessScope === "" ? [] : [accessScope];
+  const accessParts = accessScope === "" ? [] : accessScope.split(",");
   return [...generalScopes, ...accessParts].join(" ");
 }
 
@@ -357,8 +364,12 @@ export interface MintTokenTrioInput {
   /** The application row — loaded only when the grant scope carries openid
    *  (NewAccessTokenResponse's GetOAuth2ApplicationByID arm). */
   application: OAuth2ApplicationRow;
-  /** The subject user row (GetUserByID's arm, :208). */
-  user: OAuth2UserRow;
+  /** The subject user row (GetUserByID's arm) — OPTIONAL: upstream loads it
+   *  ONLY inside the openid branch (access_token.go:212-221; the v1.5.2 F7
+   *  fix — a non-openid grant mints without the subject user), and an
+   *  openid grant without a row takes the IsErrUserNotExist arm,
+   *  invalid_request "cannot find user" (:213-218). */
+  user?: OAuth2UserRow;
   material: OAuth2SigningMaterial;
   /** The id_token's HMAC key when the deployment alg is symmetric (the
    *  client secret). RS/ES deployments pass the server key via `material`. */
@@ -419,6 +430,12 @@ export async function mintTokenTrio(input: MintTokenTrioInput): Promise<AccessTo
 
   let signedIdToken = "";
   if (grantScopeContains(grant.scope, "openid")) {
+    if (user === undefined) {
+      // access_token.go:212-221 — the GetUserByID arm INSIDE the openid
+      // branch; the not-exist error renders invalid_request "cannot find
+      // user" (:213-218).
+      return { ok: false, error: accessTokenError("invalidRequest", "cannot find user") };
+    }
     const idToken = await buildIdTokenClaims({
       db: input.db,
       grant,

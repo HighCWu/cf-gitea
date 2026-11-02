@@ -28,7 +28,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 import { eq } from "drizzle-orm";
 
-import { oauth2Applications, users } from "../../db/schema";
+import { auditEvents, oauth2Applications, users } from "../../db/schema";
 import { createTokenAuthMiddleware, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -44,7 +44,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  for (const table of ["oauth2_application", "users"]) {
+  for (const table of ["audit_event", "oauth2_application", "users"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   seededUsers.clear();
@@ -82,11 +82,15 @@ async function seedUser(username: string): Promise<SeededUser> {
   return { id: user.id, username: user.username };
 }
 
-/** API `User` projection the resolver returns (the auth middleware's shape). */
+/** API `User` projection the resolver returns (the auth middleware's shape).
+ *  `username` rides — the canonical converter (apiUserFromRow) renders the
+ *  upstream MarshalJSON alias on EVERY User payload, so a resolver-shaped
+ *  User carries it (the audit arms read it). */
 function apiUser(user: SeededUser): User {
   return {
     id: user.id,
     login: user.username,
+    username: user.username,
     email: `${user.username.toLowerCase()}@example.com`,
     full_name: "",
     avatar_url: "",
@@ -456,5 +460,78 @@ describe("DELETE /user/applications/oauth2/{id} (userDeleteOAuth2Application)", 
   it("401s an anonymous caller", async () => {
     const res = await del("/api/v1/user/applications/oauth2/1");
     expect(res.status).toBe(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The audit arms (v1.5.2 ledger F3 — user/app.go:278/:460/:360): each write
+// emits its UserOAuth2Application* row through
+// services/oauth2/audit-arms.ts (actor = scope = the doer, origin "api");
+// the failure arms emit nothing.
+// ---------------------------------------------------------------------------
+
+describe("the audit arms (F3 — user/app.go:278/:460/:360)", () => {
+  it("create emits UserOAuth2ApplicationAdd: actor = scope = the doer, the rendered template", async () => {
+    const { alice } = await seedWorld();
+    const created = await createApp(alice.id);
+
+    const rows = await db().select().from(auditEvents).all();
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.action).toBe("user:oauth2application:add");
+    expect(row.actorId).toBe(alice.id);
+    expect(row.actorName).toBe(alice.username);
+    expect(row.actorCredential).toBeNull(); // this rig's resolver carries no token row
+    expect(row.scopeType).toBe("user");
+    expect(row.scopeId).toBe(String(alice.id));
+    expect(row.scopeName).toBe(alice.username);
+    expect(row.origin).toBe("api");
+    expect(row.message).toBe(`Added OAuth2 application ${created.name} for user ${alice.username}.`);
+    expect(JSON.parse(row.metadata ?? "null")).toEqual({ oauth2_application: created.name });
+  });
+
+  it("the failure arms emit nothing (invalid URI, Required binder)", async () => {
+    const { alice } = await seedWorld();
+    const badUri = await post("/api/v1/user/applications/oauth2", { ...createBody, redirect_uris: ["not-a-url"] }, alice.id);
+    expect(badUri.status).toBe(400);
+    const missingName = await post("/api/v1/user/applications/oauth2", { redirect_uris: ["https://example.com/cb"] }, alice.id);
+    expect(missingName.status).toBe(422);
+    expect(await db().select().from(auditEvents).all()).toHaveLength(0);
+  });
+
+  it("patch emits UserOAuth2ApplicationUpdate; delete emits UserOAuth2ApplicationRemove", async () => {
+    const { alice } = await seedWorld();
+    const created = await createApp(alice.id);
+
+    const patched = await patch(
+      `/api/v1/user/applications/oauth2/${created.id}`,
+      { name: "renamed", redirect_uris: ["https://example.com/cb"] },
+      alice.id,
+    );
+    expect(patched.status).toBe(200);
+    const removed = await del(`/api/v1/user/applications/oauth2/${created.id}`, alice.id);
+    expect(removed.status).toBe(204);
+
+    const rows = await db().select().from(auditEvents).all();
+    // the create's own add row leads (createApp rode the audited handler)
+    expect(rows.map((r) => r.action)).toEqual([
+      "user:oauth2application:add",
+      "user:oauth2application:update",
+      "user:oauth2application:remove",
+    ]);
+    const [, update, remove] = rows;
+    expect(update!.actorId).toBe(alice.id);
+    expect(update!.scopeId).toBe(String(alice.id));
+    expect(update!.message).toBe(`Updated OAuth2 application renamed of user ${alice.username}.`);
+    expect(remove!.message).toBe(`Removed OAuth2 application renamed of user ${alice.username}.`);
+  });
+
+  it("a foreign user's 404 delete emits nothing", async () => {
+    const { alice, bob } = await seedWorld();
+    const created = await createApp(alice.id);
+    expect(await db().select().from(auditEvents).all()).toHaveLength(1); // the create's add row
+    const foreign = await del(`/api/v1/user/applications/oauth2/${created.id}`, bob.id);
+    expect(foreign.status).toBe(404);
+    expect(await db().select().from(auditEvents).all()).toHaveLength(1); // the 404 arm emitted nothing
   });
 });

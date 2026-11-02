@@ -42,9 +42,12 @@
  *
  * ## Byte shapes
  *
- * ctx.JSON (services/context/base.go:114-120 → modules/json/jsonv2.go):
- * compact, struct member order, nil slices null, no trailing newline —
- * services/oauth2/token.ts builds every body in Go struct order. The plain
+ * ctx.JSON (services/context/base.go:114-116 → modules/json/jsonv2.go):
+ * compact, struct member order, nil slices null, no trailing newline, and
+ * the `application/json;charset=utf-8` Content-Type (the jsonResponse
+ * helper — hono's c.json emits a bare "application/json", the v1.5.2 F4
+ * fix) — services/oauth2/token.ts builds every body in Go struct order. The
+ * plain
  * error lines are Go's PlainText (text/plain;charset=utf-8 + nosniff, no
  * newline). OIDCKeys writes its own Content-Type "application/json" and
  * marshals a MAP — Go sorts map keys, so the JWK members are emitted
@@ -63,6 +66,7 @@ import {
   getGrantByID,
   getAuthorizationByCode,
   consumeAuthorizationCode,
+  grantScopeContains,
   isAuthorizationCodeExpired,
   ErrOAuth2AuthorizationCodeInvalidated,
   type OAuth2ApplicationRow,
@@ -136,10 +140,18 @@ function plainTextResponse(status: 401 | 403 | 500, text: string, extraHeaders?:
   });
 }
 
+/** Upstream ctx.JSON (services/context/base.go:114-116): the Content-Type is
+ *  `application/json;charset=utf-8` (NO space), body JSON.stringify. The
+ *  v1.5.2 F4 fix — hono's c.json emits a bare "application/json" (no
+ *  charset), diverging from the pin on every JSON arm below. */
+function jsonResponse(c: Context<{ Bindings: OAuth2TokenEnv }>, body: unknown, status: 200 | 400): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json;charset=utf-8" } });
+}
+
 /** The RFC 6749 §5.2 error body at 400 (oauth2_provider.go:722-724 —
  *  ctx.JSON of AccessTokenError; member order error, error_description). */
 function tokenErrorResponse(c: Context<{ Bindings: OAuth2TokenEnv }>, err: AccessTokenErrorShape): Response {
-  return c.json({ error: err.error, error_description: err.error_description }, 400);
+  return jsonResponse(c, { error: err.error, error_description: err.error_description }, 400);
 }
 
 /** optionsCorsHandler's deny arm (:79-82): bare 405, empty body, no CORS
@@ -480,17 +492,23 @@ async function mintResponse(
     rotate: boolean;
   },
 ): Promise<Response> {
-  // The subject user row (NewAccessTokenResponse's GetUserByID arm,
-  // access_token.go:208-221 — not-exist ⇒ "cannot find user").
-  const userRow = await getUserRowById(c.env.DB, input.grant.userId);
-  if (userRow === null) {
-    return tokenErrorResponse(c, accessTokenError("invalidRequest", "cannot find user"));
+  // The subject user row — loads ONLY in the openid arm (access_token.go:
+  // 212-221: GetUserByID sits INSIDE `if grant.ScopeContains("openid")` — a
+  // non-openid grant mints without the subject user; the v1.5.2 F7 fix, a
+  // drift looked it up unconditionally and 400'd a gone user on both grant
+  // types). The not-exist arm is invalid_request "cannot find user".
+  let userRow: OAuth2UserRow | null = null;
+  if (grantScopeContains(input.grant.scope, "openid")) {
+    userRow = await getUserRowById(c.env.DB, input.grant.userId);
+    if (userRow === null) {
+      return tokenErrorResponse(c, accessTokenError("invalidRequest", "cannot find user"));
+    }
   }
   const result = await mintTokenTrio({
     db: c.env.DB,
     grant: input.grant,
     application: input.app,
-    user: userRow,
+    user: userRow ?? undefined,
     material: input.material,
     clientKey: input.clientKey,
     issuer: oauth2Issuer(c.env, new URL(c.req.url).origin),
@@ -502,7 +520,7 @@ async function mintResponse(
   if (!result.ok) {
     return tokenErrorResponse(c, result.error);
   }
-  return c.json(result.response);
+  return jsonResponse(c, result.response, 200);
 }
 
 /** GetUserByID's typed half (oauth2.go via drizzle — the routes' only user
@@ -610,7 +628,7 @@ oauth2Router.post("/login/oauth/introspect", async (c) => {
 
   // Invalid/unknown tokens answer 200 {"active":false} — never an error
   // (RFC 7662 §2.2, :176-184).
-  const inactive = (): Response => c.json({ active: false });
+  const inactive = (): Response => jsonResponse(c, { active: false }, 200);
   const form = await parseTokenForm(c.req.raw);
   const material = await loadOAuth2SigningMaterial(db, c.env.OAUTH2_SIGNING_ALGORITHM);
   let claims: Record<string, unknown> | null;
@@ -636,16 +654,20 @@ oauth2Router.post("/login/oauth/introspect", async (c) => {
     // die with their users; the app's onError 500 arm answers.
     throw new Error(`introspect: grant ${grant.id} references missing user ${grant.userId}`);
   }
-  // Active shape (:169-208): active, scope, username, then the registered
+  // Active shape (:169-208): active, scope (omitempty — an empty-scope grant
+  // OMITS the member, `json:"scope,omitempty"` at oauth2_provider.go:171;
+  // the v1.5.2 F6 fix emitted it as `""`), username, then the registered
   // claims iss/sub/aud — exp EXPLICITLY nil upstream and omitted here.
-  return c.json({
-    active: true,
-    scope: normalizeGrantScope(grant.scope),
-    username: userRow.username,
-    iss: oauth2Issuer(c.env, new URL(c.req.url).origin),
-    sub: String(grant.userId),
-    aud: [introspectingApp.clientId],
-  });
+  const normalizedScope = normalizeGrantScope(grant.scope);
+  const body: Record<string, unknown> = { active: true };
+  if (normalizedScope !== "") {
+    body.scope = normalizedScope;
+  }
+  body.username = userRow.username;
+  body.iss = oauth2Issuer(c.env, new URL(c.req.url).origin);
+  body.sub = String(grant.userId);
+  body.aud = [introspectingApp.clientId];
+  return jsonResponse(c, body, 200);
 });
 
 // ---------------------------------------------------------------------------
@@ -684,7 +706,7 @@ async function infoOAuth(c: Context<{ Bindings: OAuth2TokenEnv }>): Promise<Resp
     onlyPublicGroups: scopeSet.publicOnly,
     bucket: c.env.REPO_PACKS,
   });
-  return c.json(body);
+  return jsonResponse(c, body, 200);
 }
 
 oauth2Router.get("/login/oauth/userinfo", (c) => infoOAuth(c));
@@ -699,7 +721,10 @@ oauth2Router.get("/login/oauth/keys", async (c) => {
   // ToJWK builds a Go MAP — the JSON encoder sorts map keys — so the JWK
   // members emit ALPHABETICALLY (RSA: alg,e,kid,kty,n,use; EC:
   // alg,crv,kid,kty,use,x,y; oct: alg,kty). The response's own Content-Type
-  // is the handler's literal "application/json" (:498).
+  // is the handler's literal "application/json" (:498 — ctx.JSON's charset
+  // form is NOT used here), and the body is json.NewEncoder(...).Encode's
+  // shape: the JSON DOCUMENT PLUS ITS TRAILING NEWLINE (the v1.5.2 F5b fix
+  // — Encode writes the terminating "\n" a plain marshal does not).
   const keys = jwks.keys.map((jwk) => {
     const sorted: Record<string, string> = {};
     for (const key of Object.keys(jwk).sort()) {
@@ -707,7 +732,7 @@ oauth2Router.get("/login/oauth/keys", async (c) => {
     }
     return sorted;
   });
-  return new Response(JSON.stringify({ keys }), { headers: { "content-type": "application/json" } });
+  return new Response(`${JSON.stringify({ keys })}\n`, { headers: { "content-type": "application/json" } });
 });
 
 // ---------------------------------------------------------------------------

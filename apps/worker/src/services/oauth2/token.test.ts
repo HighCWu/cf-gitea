@@ -153,11 +153,17 @@ describe("splitGrantScopes / normalizeGrantScope / grantAdditionalScopes (access
   });
 
   it("expands comma-joined access words and normalizes them (the bitmap order: issue before repository)", () => {
-    // comma words live INSIDE one space-separated word (the SPEC §2.5 shape)
-    expect(normalizeGrantScope("openid read:repository,write:issue")).toBe("openid write:issue,read:repository");
+    // comma words live INSIDE one space-separated word (the SPEC §2.5 shape);
+    // NormalizeGrantScope joins the access scope's StringSlice() — the
+    // SPACE-joined word shape (access_token.go:122-124; the v1.5.2 F9 fix —
+    // the comma-joined blob diverged from the pin)
+    expect(normalizeGrantScope("openid read:repository,write:issue")).toBe("openid write:issue read:repository");
     // write⇒read collapse through the landed bitmap normalizer
     expect(grantAdditionalScopes("write:repository")).toBe("write:repository");
     expect(grantAdditionalScopes("read:repository,read:issue")).toBe("read:issue,read:repository");
+    // the API authority STAYS the comma-joined scope string — only the
+    // grant-scope STRING splits (GrantAdditionalScopes returns the scope)
+    expect(grantAdditionalScopes("openid read:repository,write:issue")).toBe("write:issue,read:repository");
   });
 
   it("normalization that discards every invalid scope leaves no-token-scope, NOT all (:110-118)", () => {
@@ -319,6 +325,50 @@ describe("mintTokenTrio through the real store (NewAccessTokenResponse, access_t
     if (!result.ok) throw new Error("mint failed");
     expect(Object.keys(result.response)).toEqual(["access_token", "token_type", "expires_in", "refresh_token"]);
     expect(grantAdditionalScopes(grant.scope)).toBe("all");
+  });
+
+  // The v1.5.2 F7 shape: the subject user loads ONLY in the openid arm
+  // (access_token.go:212-221 — GetUserByID sits INSIDE the openid branch),
+  // so a non-openid grant mints WITHOUT a user row and an openid grant
+  // without one takes the IsErrUserNotExist arm.
+  it("a non-openid grant mints with NO user row; an openid grant without one is 'cannot find user' (F7)", async () => {
+    const userId = await seedUser();
+    const app = await seedApp();
+    const material = await loadOAuth2SigningMaterial(env.DB);
+    const nonOpenidGrant = await seedGrant(userId, app.id, "read:repository");
+    const noUser = await mintTokenTrio({
+      db: env.DB,
+      grant: nonOpenidGrant,
+      application: (await drizzle(env.DB).select().from(oauth2Applications).where(eq(oauth2Applications.id, app.id)).get())!,
+      material,
+      issuer: "https://git.example.com",
+      appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
+      now: T0,
+    });
+    expect(noUser.ok).toBe(true);
+    if (!noUser.ok) throw new Error("mint failed");
+    // Scope rides UNCONDITIONALLY upstream (access_token.go:269 — Scope:
+    // NormalizeGrantScope(grant.Scope)); omitempty drops only the EMPTY
+    // string, and this grant's scope normalizes to "read:repository".
+    expect(Object.keys(noUser.response)).toEqual(["access_token", "token_type", "expires_in", "refresh_token", "scope"]);
+    expect(noUser.response.scope).toBe("read:repository");
+
+    const openidGrant = await seedGrant(userId, (await seedApp()).id, "openid"); // a SECOND app — one grant per (user, app) pair
+    const missingUser = await mintTokenTrio({
+      db: env.DB,
+      grant: openidGrant,
+      application: (await drizzle(env.DB).select().from(oauth2Applications).where(eq(oauth2Applications.id, openidGrant.applicationId)).get())!,
+      material,
+      issuer: "https://git.example.com",
+      appUrl: "https://git.example.com/",
+      bucket: env.REPO_PACKS,
+      now: T0,
+    });
+    expect(missingUser).toEqual({
+      ok: false,
+      error: { error: "invalid_request", error_description: "cannot find user" },
+    });
   });
 });
 

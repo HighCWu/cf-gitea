@@ -62,7 +62,6 @@ import { Hono, type Context } from "hono";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { normalizeScope } from "../auth/scopes";
 import { containsRedirectURI } from "../api/services/oauth2-apps";
 import {
   generateAuthorizationCode,
@@ -71,7 +70,11 @@ import {
   setGrantNonce,
   updateGrantScope,
 } from "../services/oauth2/grants";
-import { oauth2FeatureEnabled } from "../services/oauth2/token";
+// The scope family's ONE home is services/oauth2/token.ts (the v1.5.2 F9
+// absorb — W2's "one should absorb the other" note closed: this module's
+// W3-era parallel copies are gone; normalizeGrantScope's space-joined
+// stored shape was the upstream-exact one and token.ts now carries it).
+import { grantAdditionalScopes, normalizeGrantScope, oauth2FeatureEnabled } from "../services/oauth2/token";
 import { oauth2Applications, sessions, users } from "../db/schema";
 import { AuditActions, emitAudit } from "../services/audit";
 import { demoModeEnabled } from "../services/demo-sweep";
@@ -88,68 +91,10 @@ import { renderOauth2GrantErrorPage, renderOauth2GrantPage } from "./pages/oauth
 import { shellAssetsFromManifest, type UiContext } from "./ui-context";
 
 // ---------------------------------------------------------------------------
-// Scopes (services/oauth2_provider/access_token.go:87-134) — exported for the
-// token endpoint's `scope` response field and introspection (W2/W4 consume;
-// this module is the shared home until a dedicated service file wins).
+// Scopes (services/oauth2_provider/access_token.go:87-134) — the family's
+// ONE home is services/oauth2/token.ts (see the import note above); this
+// module consumes normalizeGrantScope + grantAdditionalScopes from there.
 // ---------------------------------------------------------------------------
-
-/** GeneralScopesSupported (access_token.go:78-85) — the four OIDC scopes,
- *  stored verbatim, driving id_token/userinfo claims. */
-export const GENERAL_SCOPES = ["openid", "profile", "email", "groups"] as const;
-
-/**
- * splitGrantScopes (access_token.go:87-119): one space-separated string
- * mixing general scopes (kept verbatim) with comma-joinable access-scope
- * words. Every access word is normalized alone and DROPPED on failure
- * (upstream's `if err == nil` — normalization that discards every invalid
- * scope leaves `no-token-scope`, never `all`: :110-118). No access word at
- * all ⇒ "" (the CALLER decides the legacy-`all` default —
- * grantAdditionalScopes below, :127-134).
- */
-function splitGrantScopes(grantScopes: string): { generalScopes: string[]; accessScope: string } {
-  const generalScopes: string[] = [];
-  const accessWords: string[] = [];
-  let hasAccessScopes = false;
-  for (const scope of grantScopes.split(" ")) {
-    if (scope === "") continue;
-    if ((GENERAL_SCOPES as readonly string[]).includes(scope)) {
-      generalScopes.push(scope);
-      continue;
-    }
-    hasAccessScopes = true;
-    for (const word of scope.split(",")) {
-      try {
-        accessWords.push(normalizeScope(word));
-      } catch {
-        // invalid word dropped (access_token.go:101-104)
-      }
-    }
-  }
-  if (!hasAccessScopes) {
-    return { generalScopes, accessScope: "" };
-  }
-  if (accessWords.length === 0) {
-    return { generalScopes, accessScope: "no-token-scope" };
-  }
-  // The join re-normalizes (a no-op over valid words — the bitmap is
-  // idempotent) exactly like upstream's join-then-Normalize (:116-118).
-  return { generalScopes, accessScope: normalizeScope(accessWords.join(",")) };
-}
-
-/** NormalizeGrantScope (access_token.go:121-125) — general scopes then the
- *  normalized access scope, space-joined; the stored grant-scope shape. */
-export function normalizeGrantScope(grantScopes: string): string {
-  const { generalScopes, accessScope } = splitGrantScopes(grantScopes);
-  return [...generalScopes, ...(accessScope === "" ? [] : accessScope.split(","))].join(" ");
-}
-
-/** GrantAdditionalScopes (access_token.go:127-134) — the API authority an
- *  empty access part keeps: grants without access scopes retain the legacy
- *  `all` default (since 1.22). */
-export function grantAdditionalScopes(grantScopes: string): string {
-  const { accessScope } = splitGrantScopes(grantScopes);
-  return accessScope === "" ? "all" : accessScope;
-}
 
 /** util.DiffSlice (modules/util/util.go:323-339) — order-preserving,
  *  de-duplicated added/removed between the granted and requested scope
@@ -657,8 +602,13 @@ async function grantPost(c: RouteContext): Promise<Response> {
   };
 
   // The session-state verification (:411-415): the stashed client_id / state
-  // / redirect_uri must equal the form's, else plain 400. Read-and-clear —
-  // the consent form is one-shot (see readAndClearOauthState).
+  // / redirect_uri must equal the form's, else http.Error's 400 (upstream
+  // ctx.HTTPError(http.StatusBadRequest), oauth2_provider.go:413 — net/http
+  // http.Error's shape: the text + "\n" at `text/plain; charset=utf-8` WITH
+  // the space (base.go:105-111's http.Error spelling, NOT PlainText's
+  // unspaced one), nosniff; the v1.5.2 F5a fix — the drift went through the
+  // unspaced plainStatus helper). Read-and-clear — the consent form is
+  // one-shot (see readAndClearOauthState).
   const stashed = await readAndClearOauthState(c.env.DB, signedIn.sessionId);
   if (
     stashed === null ||
@@ -666,7 +616,7 @@ async function grantPost(c: RouteContext): Promise<Response> {
     stashed.state !== form.state ||
     stashed.redirect_uri !== form.redirectUri
   ) {
-    return plainStatus(400, "Bad Request");
+    return httpError(400, "Bad Request");
   }
 
   if (!form.granted) {
@@ -766,15 +716,22 @@ async function grantPost(c: RouteContext): Promise<Response> {
 
 export const oauth2AuthorizeRouter = new Hono<{ Bindings: Env }>();
 
-/** ctx.HTTPError(http.StatusForbidden) (services/context/base.go:105-111 →
- *  net/http http.Error): body "Forbidden\n", `text/plain; charset=utf-8`
- *  (WITH the space — http.Error's own spelling; Gitea's PlainText omits
- *  it), nosniff. */
-function httpForbidden(): Response {
-  return new Response("Forbidden\n", {
-    status: 403,
+/** net/http http.Error (services/context/base.go:105-111's HTTPError →
+ *  http.Error): the status text + "\n" at `text/plain; charset=utf-8` WITH
+ *  the space (http.Error's own spelling; Gitea's PlainText omits it), plus
+ *  the nosniff header http.Error sets. The v1.5.2 F5a session-mismatch 400
+ *  rides this shape (oauth2_provider.go:413); the group's 403 gate has been
+ *  on it since W4. */
+function httpError(status: 400 | 403, text: string): Response {
+  return new Response(`${text}\n`, {
+    status,
     headers: { "content-type": "text/plain; charset=utf-8", "x-content-type-options": "nosniff" },
   });
+}
+
+/** ctx.HTTPError(http.StatusForbidden) — the group gate's wrap (web.go:373-378). */
+function httpForbidden(): Response {
+  return httpError(403, "Forbidden");
 }
 
 // THE GATE SLOT, WIRED (W4): oauth2Enabled (web.go:373-378 —

@@ -114,12 +114,23 @@ import {
   type OAuth2AppRow,
 } from "../../api/services/oauth2-apps";
 import { oauth2Applications } from "../../db/schema";
+import { emitOAuth2ApplicationAudit } from "../../services/oauth2/audit-arms";
+import { getGrantByID, revokeGrant } from "../../services/oauth2/grants";
 import type { OrgRecord } from "../../services/orgs/orgs";
 import { OrgSettingsNavbar, UserSettingsNavbar } from "../components/settings-nav";
 import { AdminFamilyShell } from "./admin-users";
 import { OrgHeader } from "./org-home";
 import { BaseLayout, renderPage } from "../shell";
 import type { UiContext } from "../ui-context";
+
+// The write arms carry their audit rows (the v1.5.2 ledger F3 family):
+// each successful write emits through services/oauth2/audit-arms.ts's
+// emitOAuth2ApplicationAudit — the RecordScoped shape
+// (services/audit/scoped.go:108-131) whose action variant and scope follow
+// the OWNER (oauth2_common.go:35-39's recordAudit): an org row renders the
+// organization:* variant, uid 0 the system:* variant, an individual the
+// user:* variant. Revoke is user-only (grants belong to individuals). The
+// upstream positions are pinned at each arm.
 
 // ---------------------------------------------------------------------------
 // The builtin lock (BuiltinApplications, models/auth/oauth2.go:64-101).
@@ -299,7 +310,12 @@ export async function saveOauth2ApplicationFromForm(
     })
     .where(eq(oauth2Applications.id, id))
     .returning();
-  return { kind: "saved", row: updated[0]! };
+  const row = updated[0]!;
+  // audit.RecordScoped(ctx, oa.Owner, nil, OAuth2ApplicationUpdate,
+  // "oauth2_application", updatedApp.Name) (oauth2_common.go:143) — after
+  // the write, before the flash+redirect (upstream's exact position).
+  await emitOAuth2ApplicationAudit(d1, { ownerId, appName: row.name, verb: "update", origin: "ui" });
+  return { kind: "saved", row };
 }
 
 export type RegenerateOauth2SecretResult =
@@ -310,14 +326,17 @@ export type RegenerateOauth2SecretResult =
  * RegenerateSecret (oauth2_common.go:150-174) over GenerateClientSecret
  * (oauth2.go:213-224): the landed generator returns (plaintext, hash); the
  * persistence here covers ONLY the client_secret column
- * (`Cols("client_secret")`, oauth2.go:221 — no updated_unix touch). No
- * builtin lock (upstream's RegenerateSecret has none — the module header).
+ * (`Cols("client_secret")`, oauth2.go:221 — NO updated_unix touch; the
+ * v1.5.2 F8 fix — a drift had bumped updatedAt here, contradicting the
+ * Cols-only pin and this header). No builtin lock (upstream's
+ * RegenerateSecret has none — the module header). The OAuth2Application-
+ * Secret audit row rides the successful write (oauth2_common.go:170 —
+ * the RecordScoped emit, origin "ui").
  */
 export async function regenerateOauth2ApplicationSecret(
   d1: D1Database,
   ownerId: number,
   id: number,
-  now: Date = new Date(),
 ): Promise<RegenerateOauth2SecretResult> {
   const app = await getOAuth2ApplicationById(d1, id);
   if (app === null || app.uid !== ownerId) {
@@ -326,10 +345,12 @@ export async function regenerateOauth2ApplicationSecret(
   const { plaintext, hash } = await generateClientSecret();
   const updated = await drizzle(d1)
     .update(oauth2Applications)
-    .set({ clientSecret: hash, updatedAt: now })
+    .set({ clientSecret: hash }) // Cols("client_secret") — updatedAt untouched (oauth2.go:221)
     .where(eq(oauth2Applications.id, id))
     .returning();
-  return { kind: "ok", app: updated[0]!, secret: plaintext };
+  const row = updated[0]!;
+  await emitOAuth2ApplicationAudit(d1, { ownerId, appName: row.name, verb: "secret", origin: "ui" });
+  return { kind: "ok", app: row, secret: plaintext };
 }
 
 export type CreateOauth2AppResult =
@@ -364,6 +385,10 @@ export async function createOauth2ApplicationFromForm(
     },
     now,
   );
+  // audit.RecordScoped(ctx, oa.Owner, nil, OAuth2ApplicationAdd,
+  // "oauth2_application", app.Name) (oauth2_common.go:77) — after the
+  // create, before the secret render (upstream's exact position).
+  await emitOAuth2ApplicationAudit(d1, { ownerId, appName: row.name, verb: "add", origin: "ui" });
   return { kind: "created", row, secret };
 }
 
@@ -386,7 +411,45 @@ export async function deleteOauth2ApplicationFromForm(d1: D1Database, ownerId: n
     return { kind: "locked" };
   }
   const deleted = await deleteOAuth2Application(d1, id, ownerId);
-  return deleted ? { kind: "deleted" } : { kind: "not_found" };
+  if (!deleted) {
+    return { kind: "not_found" };
+  }
+  // audit.RecordScoped(ctx, oa.Owner, nil, OAuth2ApplicationRemove,
+  // "oauth2_application", app.Name) (oauth2_common.go:189) — after the
+  // delete, before the flash+redirect (upstream's exact position).
+  await emitOAuth2ApplicationAudit(d1, { ownerId, appName: app.name, verb: "remove", origin: "ui" });
+  return { kind: "deleted" };
+}
+
+export type RevokeOauth2GrantResult = { kind: "revoked"; appName: string } | { kind: "not_found" };
+
+/**
+ * RevokeGrant's write half (oauth2_common.go:196-224) — the grants-section
+ * revoke POST's arm: the grant must exist AND belong to the owner (grants
+ * belong to individual users — the org/admin twins refuse by construction,
+ * :204-207; the instance-wide Owner-nil twin 404s the same way), the app
+ * loads for the audit name (:209-215 — no UID check upstream, the grant is
+ * the ownership anchor), then the (grant, userId)-scoped delete and the
+ * OAuth2ApplicationRevoke audit row (:220 — the ONLY variant, the user
+ * action). A missing app row is unreachable upstream (the grant's FK);
+ * this port answers it with the family's 404 shell (upstream ServerErrors
+ * — the delete half's documented posture).
+ */
+export async function revokeOauth2GrantFromForm(d1: D1Database, ownerId: number, grantId: number): Promise<RevokeOauth2GrantResult> {
+  const grant = await getGrantByID(d1, grantId);
+  if (grant === null || grant.userId !== ownerId) {
+    return { kind: "not_found" }; // oauth2_common.go:204-207
+  }
+  const app = await getOAuth2ApplicationById(d1, grant.applicationId);
+  if (app === null) {
+    return { kind: "not_found" }; // the ServerError arm's unreachable shape, the family's shell
+  }
+  const revoked = await revokeGrant(d1, grant.id, ownerId);
+  if (!revoked) {
+    return { kind: "not_found" };
+  }
+  await emitOAuth2ApplicationAudit(d1, { ownerId, appName: app.name, verb: "revoke", origin: "ui" });
+  return { kind: "revoked", appName: app.name };
 }
 
 // ---------------------------------------------------------------------------
