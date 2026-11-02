@@ -52,8 +52,19 @@ import type { ContentsResponse } from "../models/contents";
 import type { EngineReads, RefTip } from "./engine";
 import { apiUserFromRow, type RepositoryWithOwner, type UserRow, type Viewer } from "./repository";
 
-/** Files at or under this many bytes carry base64 `content` on GET contents. */
-export const MAX_CONTENTS_RENDER_BYTES = 1024 * 1024;
+/**
+ * The contents-API blob inlining cap — upstream `setting.API.DefaultMaxBlobSize`
+ * (modules/setting/api.go:21, default 10 MiB; the `[api] DEFAULT_MAX_BLOB_SIZE`
+ * setting): GetBlobBySHA answers `content`/`encoding` null for an over-cap blob
+ * WITHOUT reading it (services/repository/files/content.go:233). The former
+ * 1 MiB `MAX_CONTENTS_RENDER_BYTES` was an unsanctioned divergence (upstream
+ * parity review ㉑ W2). Residual, recorded in SPEC-0004 §3.2: upstream's check
+ * rides the tree-entry metadata BEFORE any content read; our engine surface has
+ * no size-only RPC, so readBlob's data IS the size probe and an over-cap blob's
+ * bytes cross the RPC boundary before the builder drops them — bounded by the
+ * same full-blob read /git/blobs already performs uncapped.
+ */
+export const DEFAULT_MAX_BLOB_SIZE = 10 * 1024 * 1024;
 
 /** Recursive tree walks cap here (truncated=true beyond — upstream behavior). */
 export const MAX_RECURSIVE_TREE_ENTRIES = 1000;
@@ -158,7 +169,15 @@ const UNVERIFIED: PayloadCommitVerification = {
   payload: "",
 };
 
-/** convert.ToPayloadCommit. */
+/**
+ * convert.ToPayloadCommit. The diff lists are ALWAYS emitted: upstream's
+ * Added/Removed/Modified carry no omitempty (modules/structs/hook.go:170-175),
+ * so an unenriched commit marshals all three as null — ToAPIPayloadCommit's
+ * diff-tree fill (commits.go:91-93) is the enrichment that overwrites them
+ * with the arrays (our enrichCommitsWithFileLists spread). Branch.commit,
+ * webhook push payloads, and every spread site inherit the nulls for free
+ * (parity review ㉑ W3: the keys were dropped, not nulled).
+ */
 export function toPayloadCommit(
   commit: CommitJson,
   pair: RepositoryWithOwner,
@@ -175,6 +194,9 @@ export function toPayloadCommit(
     committer: toPayloadUser(commit.committer, usernames),
     timestamp: personDate(commit.author),
     verification: UNVERIFIED,
+    added: null,
+    removed: null,
+    modified: null,
   };
 }
 
@@ -535,6 +557,11 @@ export function toGitBlob(oid: string, data: Uint8Array, pair: RepositoryWithOwn
  * ContentsResponse for one entry. `last_commit_*` enrichment rides a
  * listLog(ref, {path}) RPC per entry (the documented interim fallback — the
  * batched enrichment RPC of SPEC-0008 §3.5 is not on the boundary yet).
+ *
+ * `mode` is ALWAYS emitted — upstream's field is a non-pointer, non-omitempty
+ * string (modules/structs/repo_file.go:143, populated entry.Mode().String() at
+ * content.go:136), so every entry type carries its raw git mode (review ㉑ W1:
+ * it was dropped despite arriving on opts).
  */
 export function toContentsEntry(
   opts: {
@@ -556,7 +583,7 @@ export function toContentsEntry(
   const apiUrl = `${origin}/api/v1/repos/${owner}/${slug}`;
   const htmlUrl = `${origin}/${owner}/${slug}`;
   const isFile = opts.type === "file";
-  const inline = isFile && opts.content !== null && opts.content.byteLength <= MAX_CONTENTS_RENDER_BYTES;
+  const inline = isFile && opts.content !== null && opts.content.byteLength <= DEFAULT_MAX_BLOB_SIZE;
   return {
     name: opts.name,
     path: opts.path,
@@ -570,6 +597,7 @@ export function toContentsEntry(
           last_commit_message: opts.lastCommit.subject,
         }),
     type: opts.type,
+    mode: opts.mode,
     size: opts.size ?? 0,
     encoding: inline ? "base64" : null,
     content: inline ? base64Encode(opts.content as Uint8Array) : null,

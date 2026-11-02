@@ -230,7 +230,7 @@ each time.
 | `GET /repos/{owner}/{repo}/git/trees/{sha}` | engine | `read:repository` | `refs_version` | Paginated with **`page` + `per_page`** (not `limit`!); `recursive=true` + `truncated` flag in the response body. |
 | `GET /repos/{owner}/{repo}/git/blobs/{sha}` | engine | `read:repository` | Cache API | `content` is base64 with `encoding:"base64"`; LFS pointers surface `lfs_oid`/`lfs_size`. |
 | `GET /repos/{owner}/{repo}/contents` | engine | `read:repository` | `refs_version` | Directory → **array**, file → **object** (union response by target type). |
-| `GET /repos/{owner}/{repo}/contents/{filepath}` | engine | `read:repository` | `refs_version` | `type` ∈ file/dir/symlink/submodule; `content` base64; enriches `last_commit_sha`/`last_committer_date`. |
+| `GET /repos/{owner}/{repo}/contents/{filepath}` | engine | `read:repository` | `refs_version` | `type` ∈ file/dir/symlink/submodule; `content` base64; enriches `last_commit_sha`/`last_committer_date`. As-built (2026-11-02, the ㉑ W2 closeout): `mode` is ALWAYS emitted (upstream `Mode string json:"mode"` is non-pointer/non-omitempty, repo_file.go:143) and file inlining rides upstream's `setting.API.DefaultMaxBlobSize` cap — see §4. |
 | `POST /repos/{owner}/{repo}/contents/{filepath}` | both | `write:repository` | invalidates `refs_version` | **201**; body needs `content` (base64); optional `branch`, `new_branch`, `author`, `committer`, `dates`, `signoff`, `force_push`. |
 | `PUT /repos/{owner}/{repo}/contents/{filepath}` | both | `write:repository` | invalidates `refs_version` | 200/201 both declared; requires `sha` of the replaced file (CAS); `from_path` = rename. |
 | `DELETE /repos/{owner}/{repo}/contents/{filepath}` | both | `write:repository` | invalidates `refs_version` | Returns **200** with `FileDeleteResponse` (not 204); requires `sha`. |
@@ -391,6 +391,24 @@ Deltas and pull-forwards it forces:
 - **Union response shapes**: `contents` returns an object for a file and an array for
   a directory (and the same endpoint family is the only place this happens). Clients
   depend on it; the zod schema must be a discriminated union, not a normalization.
+- **Contents blob-inlining cap** (as-built 2026-11-02, the ㉑ W2 closeout — upstream
+  parity, NOT a platform divergence): file `content`/`encoding` inline only at or
+  under `DEFAULT_MAX_BLOB_SIZE` = 10 MiB — upstream's `setting.API.DefaultMaxBlobSize`
+  (modules/setting/api.go:21, `[api] DEFAULT_MAX_BLOB_SIZE`), whose `GetBlobBySHA`
+  answers `content: null`/`encoding: null` for an over-cap blob
+  (services/repository/files/content.go:233); the cap rides the same builder on
+  the write-path contents too (GetContentsListFromTreePaths → GetFileContents → the
+  same GetBlobBySHA). The earlier 1 MiB `MAX_CONTENTS_RENDER_BYTES` was an
+  unsanctioned threshold divergence and is gone. Residual placement difference:
+  upstream checks the tree-entry's size BEFORE any content read; our engine surface
+  has no size-only read (`readBlob` returns data+size in one RPC), so an over-cap
+  blob's bytes cross the RPC boundary before the builder drops them — probing via a
+  parent `listTree` first would tax every under-cap single-file GET one extra DO
+  round-trip to save a bounded read (the same full-blob read `/git/blobs/{sha}`
+  already performs uncapped), so the post-read check stands. Upstream's separate
+  `DefaultMaxResponseSize` (100 MiB cumulative base64 across a BATCH write's files,
+  file.go:35) is not yet modeled — batch responses are currently uncapped
+  cumulatively; add it if a write family ever fans out wide.
 - **Pagination clamps** (upstream `services/convert/utils.go ToCorrectPageSize`):
   `page <= 0` → `1`; `limit <= 0` → `DefaultPagingNum` (30); `limit > MaxResponseItems`
   → `50` — clamped silently, never a 422. `git/trees` `per_page` has its own cap

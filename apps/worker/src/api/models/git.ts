@@ -94,15 +94,21 @@ export const commitAffectedFilesSchema = z.object({
   status: z.string().optional(),
 });
 
-/** `#/definitions/PayloadCommit` — branch/tag/commit summary used across payloads. */
+/**
+ * `#/definitions/PayloadCommit` — branch/tag/commit summary used across
+ * payloads. `added`/`removed`/`modified` are nullable beyond the contract's
+ * array type because upstream's Go fields carry no omitempty (hook.go:170-175):
+ * a nil slice marshals `null`, and the unenriched converter emits exactly that
+ * (services/git-models.ts toPayloadCommit).
+ */
 export const payloadCommitSchema = z.object({
-  added: z.array(z.string()).optional(),
+  added: z.array(z.string()).nullable().optional(),
   author: payloadUserSchema.optional(),
   committer: payloadUserSchema.optional(),
   id: z.string().optional(),
   message: z.string().optional(),
-  modified: z.array(z.string()).optional(),
-  removed: z.array(z.string()).optional(),
+  modified: z.array(z.string()).nullable().optional(),
+  removed: z.array(z.string()).nullable().optional(),
   timestamp: z.string().optional().openapi({ format: "date-time" }),
   url: z.string().optional(),
   verification: payloadCommitVerificationSchema.nullable().optional(),
