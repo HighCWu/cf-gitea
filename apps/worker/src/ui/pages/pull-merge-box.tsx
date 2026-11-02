@@ -1072,11 +1072,15 @@ export function gitSigString(user: { displayName: string | null; username: strin
 }
 
 /** `pr.GetApprovers` (models/issues/pull.go:351-384) — the "Reviewed-by: "
- *  lines for the PR's official approvers: FindLatestReviews' per-reviewer
- *  latest APPROVE review (official-only, the DefaultMergeMessageOfficial
- *  ApproversOnly default; NOT dismissed-filtered — toCond touches dismissed
- *  only when set), oldest review first, the `reviewersWritten > maxReview
- *  ers` PRE-write break kept bug-for-bug (10 writes 11 upstream).
+ *  lines for the PR's official approvers: FindLatestReviews' rows (official-
+ *  only APPROVE reviews, the DefaultMergeMessageOfficialApproversOnly
+ *  default; NOT dismissed-filtered — toCond touches dismissed only when
+ *  set) — max(id) PER REVIEWER (review_list.go:141-145's `In("id", Select
+ *  max(id) … GroupBy reviewer_id)`) read in Asc("created_unix"), Asc("id")
+ *  order (:147-150), so each reviewer's position is their LATEST review's
+ *  timestamp (first-review order drifts once re-reviews shuffle). The
+ *  `reviewersWritten > maxReviewers` PRE-write break kept bug-for-bug
+ *  (10 writes 11 upstream).
  *
  *  Shared seam: exported for the API merge's compose arm
  *  (api/services/pull-engine.ts — upstream's GetDefaultMergeMessage body
@@ -1084,15 +1088,22 @@ export function gitSigString(user: { displayName: string | null; username: strin
  *  above. */
 export async function reviewedByLines(d1: D1Database, issueId: number): Promise<string> {
   const rows = await drizzle(d1)
-    .select({ id: pullReviews.id, reviewerId: pullReviews.reviewerId })
+    .select({ id: pullReviews.id, reviewerId: pullReviews.reviewerId, createdAt: pullReviews.createdAt })
     .from(pullReviews)
     .where(and(eq(pullReviews.issueId, issueId), eq(pullReviews.type, ReviewType.Approve), eq(pullReviews.official, true)))
     .orderBy(pullReviews.id)
     .all();
-  const latestPerReviewer = new Map<number, number>();
-  for (const row of rows) latestPerReviewer.set(row.reviewerId, row.id); // max id = the latest review
-  const reviewerIds = [...latestPerReviewer.keys()];
-  if (reviewerIds.length === 0) return "";
+  const latestPerReviewer = new Map<number, { id: number; reviewerId: number; createdAt: Date | null }>();
+  for (const row of rows) {
+    const known = latestPerReviewer.get(row.reviewerId);
+    if (known === undefined || row.id > known.id) latestPerReviewer.set(row.reviewerId, row); // max id = the latest review
+  }
+  const ordered = [...latestPerReviewer.values()].sort((a, b) => {
+    const at = a.createdAt?.getTime() ?? 0;
+    const bt = b.createdAt?.getTime() ?? 0;
+    return at !== bt ? at - bt : a.id - b.id; // Asc("created_unix"), Asc("id")
+  });
+  if (ordered.length === 0) return "";
   const reviewers = await drizzle(d1)
     .select({ id: users.id, displayName: users.displayName, username: users.username, email: users.email })
     .from(users)
@@ -1100,9 +1111,9 @@ export async function reviewedByLines(d1: D1Database, issueId: number): Promise<
   const byId = new Map(reviewers.map((reviewer) => [reviewer.id, reviewer]));
   let out = "";
   let reviewersWritten = 0;
-  for (const reviewerId of reviewerIds) {
+  for (const review of ordered) {
     if (reviewersWritten > MERGE_MESSAGE_MAX_APPROVERS) break; // the pre-write cap quirk
-    const reviewer = byId.get(reviewerId);
+    const reviewer = byId.get(review.reviewerId);
     if (reviewer === undefined) continue; // LoadReviewer's vanished-row arm
     out += `Reviewed-by: ${gitSigString(reviewer)}\n`;
     reviewersWritten += 1;
@@ -1220,22 +1231,30 @@ async function mergeMessageTemplateVars(
     vars.HeadRepoOwnerName = head.repo.ownerNamespace;
     vars.HeadRepoName = head.repo.slug;
   }
-  const refRows = await drizzle(d1)
-    .select({ issueId: comments.issueId, refAction: comments.refAction })
-    .from(comments)
-    .where(and(eq(comments.refRepoId, repo.id), eq(comments.refIssueId, issue.id), inArray(comments.refAction, [1, 2])))
-    .orderBy(comments.id)
-    .all();
-  const latestActionPerSource = new Map<number, number>();
-  for (const row of refRows) latestActionPerSource.set(row.issueId, row.refAction ?? 0); // the highest id wins
-  const closeSourceIds = [...latestActionPerSource.entries()].filter(([, action]) => action === 1).map(([issueId]) => issueId);
-  let closingIssues = "";
-  if (closeSourceIds.length > 0) {
-    const sources = await drizzle(d1).select({ id: issues.id, index: issues.index }).from(issues).where(inArray(issues.id, closeSourceIds)).all();
-    const indexById = new Map(sources.map((row) => [row.id, row.index]));
-    closingIssues = closeSourceIds.map((issueId) => `close #${indexById.get(issueId) ?? 0}`).join(", ");
+  // The xref read guarded (merge.go:101-121): ResolveCrossReferences' ERROR
+  // arm leaves vars["ClosingIssues"] UNSET — the template's ${ClosingIssues}
+  // renders literal — and the merge message still composes. A failed read
+  // here does the same: the key stays off the map, never a failed merge.
+  try {
+    const refRows = await drizzle(d1)
+      .select({ issueId: comments.issueId, refAction: comments.refAction })
+      .from(comments)
+      .where(and(eq(comments.refRepoId, repo.id), eq(comments.refIssueId, issue.id), inArray(comments.refAction, [1, 2])))
+      .orderBy(comments.id)
+      .all();
+    const latestActionPerSource = new Map<number, number>();
+    for (const row of refRows) latestActionPerSource.set(row.issueId, row.refAction ?? 0); // the highest id wins
+    const closeSourceIds = [...latestActionPerSource.entries()].filter(([, action]) => action === 1).map(([issueId]) => issueId);
+    let closingIssues = "";
+    if (closeSourceIds.length > 0) {
+      const sources = await drizzle(d1).select({ id: issues.id, index: issues.index }).from(issues).where(inArray(issues.id, closeSourceIds)).all();
+      const indexById = new Map(sources.map((row) => [row.id, row.index]));
+      closingIssues = closeSourceIds.map((issueId) => `close #${indexById.get(issueId) ?? 0}`).join(", ");
+    }
+    vars.ClosingIssues = closingIssues;
+  } catch {
+    // the error arm: the key stays unset (the var-expander keeps the literal)
   }
-  vars.ClosingIssues = closingIssues;
   return vars;
 }
 

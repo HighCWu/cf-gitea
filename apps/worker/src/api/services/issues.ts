@@ -149,8 +149,14 @@ function repoIdNumber(id: string): number {
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
 }
 
-/** WIP prefixes (setting.Repository.PullRequest.WorkInProgressPrefixes default). */
-const WIP_PREFIXES: readonly string[] = ["WIP:", "[WIP]", "WIP]", "Draft"];
+/** WIP prefixes — setting.Repository.PullRequest.WorkInProgressPrefixes'
+ *  DEFAULT, verbatim (modules/setting/repository.go:199:
+ *  `[]string{"WIP:", "[WIP]"}` — "Same as GitHub"). The only consumers are
+ *  HasWorkInProgressPrefix ports (models/issues/pull.go:661-673 reads this
+ *  setting and nothing wider), so a "Draft: x" title is NOT work in
+ *  progress: it merges, renders wip/draft:false, and auto-merge does not
+ *  skip it. */
+const WIP_PREFIXES: readonly string[] = ["WIP:", "[WIP]"];
 
 /** `HasWorkInProgressPrefix` — ASCII case-insensitive prefix match. */
 export function hasWorkInProgressPrefix(title: string): boolean {

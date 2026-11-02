@@ -13,7 +13,7 @@
 
 import { env } from "cloudflare:test";
 import { drizzle } from "drizzle-orm/d1";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { Context } from "hono";
 import { serializeCommit, serializeTree } from "@cf-gitea/git-engine";
@@ -61,6 +61,7 @@ import {
   type PullMergeBoxData,
   type PullMergeBoxWriteContext,
 } from "./pull-merge-box";
+import { getDefaultMergeMessageParts, reviewedByLines } from "./pull-merge-box";
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -1731,6 +1732,29 @@ describe("the squash message-body prefill (CommitMessageMerge composition)", () 
     );
   });
 
+  it("orders the Reviewed-by lines by each reviewer's LATEST approve (review_list.go:141-150's max(id)-per-reviewer, Asc created_unix/id)", async () => {
+    // A re-review REPOSITIONS the reviewer: erin approves early, re-approves
+    // late; frank approves once in between. First-review order would list
+    // erin before frank; the latest-approve order (createdUnix, id asc)
+    // lists frank first. Rows are removed after the pin (the sibling tests
+    // read the two-approver fixture verbatim).
+    await d1().insert(users).values([
+      { id: 105, username: "erin", usernameLower: "erin", displayName: "Erin Early", email: "erin@sqrepo.invalid", createdAt: new Date(T0 * 1000) },
+      { id: 106, username: "frank", usernameLower: "frank", displayName: "Frank Mid", email: "frank@sqrepo.invalid", createdAt: new Date(T0 * 1000) },
+    ]);
+    await d1().insert(pullReviews).values([
+      { type: ReviewType.Approve, reviewerId: 105, issueId: sqIssueId, official: true, createdAt: new Date(T0 * 1000), updatedAt: new Date(T0 * 1000) },
+      { type: ReviewType.Approve, reviewerId: 106, issueId: sqIssueId, official: true, createdAt: new Date((T0 + 5) * 1000), updatedAt: new Date((T0 + 5) * 1000) },
+      { type: ReviewType.Approve, reviewerId: 105, issueId: sqIssueId, official: true, createdAt: new Date((T0 + 10) * 1000), updatedAt: new Date((T0 + 10) * 1000) },
+    ]);
+    expect(await reviewedByLines(env.DB, sqIssueId)).toBe(
+      "Reviewed-by: Cara Null <>\nReviewed-by: Dave Mail <dave@sqrepo.invalid>\n" +
+        "Reviewed-by: Frank Mid <frank@sqrepo.invalid>\nReviewed-by: Erin Early <erin@sqrepo.invalid>\n",
+    );
+    await d1().delete(pullReviews).where(inArray(pullReviews.reviewerId, [105, 106]));
+    await d1().delete(users).where(inArray(users.id, [105, 106]));
+  });
+
   it("swaps the body alongside the title on the default-style switch", async () => {
     const squash = await loadSq({ DefaultMergeStyle: "squash", DefaultSquashMergeMessage: "COMMIT_MESSAGES" });
     expect(squash!.mergeForm!.defaultBody).toContain("* c1 subject");
@@ -1830,4 +1854,130 @@ describe("the merged box renders the cleanup delete", () => {
     });
     expect(asBob).toBeNull();
   });
+});
+
+// --- the template vars' ClosingIssues arm (merge.go:101-121) ---------------------
+
+describe("getDefaultMergeMessageParts' ClosingIssues var (the xref compose)", () => {
+  let xRepoId = "";
+  let xIssueId = 0;
+  let xPrIndex = 0;
+  const xPair = { ownerNamespace: "alice", slug: "xrepo" };
+
+  /** The xrepo ROOT commit: README plus .gitea/default_merge_message/
+   *  MERGE_TEMPLATE.md whose ${ClosingIssues} rides both lines, so the var's
+   *  presence/absence is observable in the composed pair. serializeTree
+   *  writes entry names VERBATIM (flat), so the nested directories are
+   *  composed bottom-up as subtree entries. */
+  async function landXrepoRoot(): Promise<string> {
+    const cell = env.REPO.getByName("alice/xrepo");
+    const enc = new TextEncoder();
+    const readme = enc.encode("# xrepo\n");
+    const readmeOid = await gitObjectOid("blob", readme);
+    const template = enc.encode("merge ${ClosingIssues}\n\nbody-close: ${ClosingIssues}\n");
+    const templateOid = await gitObjectOid("blob", template);
+    const msgTree = serializeTree([{ mode: "100644", name: "MERGE_TEMPLATE.md", oid: templateOid }]);
+    const giteaTree = serializeTree([{ mode: "40000", name: "default_merge_message", oid: msgTree.oid }]);
+    const rootTree = serializeTree([
+      { mode: "100644", name: "README.md", oid: readmeOid },
+      { mode: "40000", name: ".gitea", oid: giteaTree.oid },
+    ]);
+    const person = { name: "seed", email: "seed@mergetest.invalid", time: T0, tz: "+0000" };
+    const commit = serializeCommit({ tree: rootTree.oid, parents: [], author: person, committer: person, message: "root\n" });
+    const put = await cell.putApiObjects([
+      { oid: readmeOid, type: "blob", data: readme },
+      { oid: templateOid, type: "blob", data: template },
+      { oid: msgTree.oid, type: "tree", data: msgTree.data },
+      { oid: giteaTree.oid, type: "tree", data: giteaTree.data },
+      { oid: rootTree.oid, type: "tree", data: rootTree.data },
+      { oid: commit.oid, type: "commit", data: commit.data },
+    ]);
+    if (put.tag !== "ok") throw new Error(`xrepo root put failed: ${put.tag}`);
+    const landed = await cell.commitApiChange({ ref: branchRef("main"), expectedOldOid: ZERO_OID, newOid: commit.oid });
+    if (landed.tag !== "committed") throw new Error(`xrepo main landing failed (${landed.tag})`);
+    return commit.oid;
+  }
+
+  beforeAll(async () => {
+    const repo = await new RepoService(env.DB).create({
+      owner: { id: alice.id, usernameLower: "alice" },
+      name: "xrepo",
+      isPrivate: false,
+      status: "ready",
+    });
+    xRepoId = repo.id;
+    const root = await landXrepoRoot();
+    const feat = await landCommit(xPair, branchRef("feature"), { parents: [root], message: "feat", fileName: "f.ts", content: "f\n" });
+    await env.REPO.getByName("alice/xrepo").setHead("main");
+    const { issue, pullRequest } = await new IssuesService(env.DB).createPullRequest({
+      repoId: xRepoId,
+      title: "feat: xref",
+      posterId: bob.id,
+      headRepoId: xRepoId,
+      baseBranch: "main",
+      headBranch: "feature",
+      now: new Date((T0 + 400) * 1000),
+    });
+    xIssueId = issue.id;
+    xPrIndex = pullRequest.index;
+    await d1().update(pullRequests).set({ status: PRStatus.Mergeable, headSha: feat }).where(eq(pullRequests.id, pullRequest.id));
+    const landed = await env.REPO.getByName("alice/xrepo").commitApiChange({
+      ref: pullHeadRef(pullRequest.index),
+      expectedOldOid: ZERO_OID,
+      newOid: feat,
+    });
+    if (landed.tag !== "committed") throw new Error(`xrepo pull ref failed: ${landed.tag}`);
+  });
+
+  async function compose(): Promise<{ title: string; body: string }> {
+    const found = (await findPullRequestByIndex(env.DB, xRepoId, xPrIndex))!;
+    const repoRow = (await d1().select().from(repositories).where(eq(repositories.id, xRepoId)).all())[0]!;
+    return getDefaultMergeMessageParts(env.DB, { repo: repoRow, issue: found.issue, pr: found.pullRequest, reads: engineReads(env, xPair), origin: ORIGIN }, "merge");
+  }
+
+  async function seedXrefComment(sourceId: number, refAction: number, at: number): Promise<void> {
+    await d1().insert(comments).values({
+      issueId: sourceId,
+      posterId: bob.id,
+      type: CommentType.Comment,
+      content: `xref ${at}`,
+      refRepoId: xRepoId,
+      refIssueId: xIssueId,
+      refAction,
+      createdAt: new Date(at * 1000),
+      updatedAt: new Date(at * 1000),
+    });
+  }
+
+  it("zero xref rows compose the EMPTY string (the no-refs arm — ${ClosingIssues} expands empty, never literal)", async () => {
+    const parts = await compose();
+    expect(parts.title).toBe("merge ");
+    expect(parts.body).toBe("body-close: ");
+  });
+
+  it("a close xref composes 'close #N'; a later reopen on the SAME source displaces it (the latest action per source)", async () => {
+    const source = await new IssuesService(env.DB).createIssue({
+      repoId: xRepoId,
+      title: "closer",
+      content: null,
+      posterId: bob.id,
+      labelIds: [],
+      milestoneId: null,
+    });
+    await seedXrefComment(source.id, 1, T0 + 401);
+    const parts = await compose();
+    expect(parts.title).toBe(`merge close #${source.index}`);
+    expect(parts.body).toBe(`body-close: close #${source.index}`);
+    // The same source flipping to reopen (refAction 2) drops it from the list.
+    await seedXrefComment(source.id, 2, T0 + 402);
+    const parts2 = await compose();
+    expect(parts2.title).toBe("merge ");
+    expect(parts2.body).toBe("body-close: ");
+  });
+
+  // The GUARD arm (the read's try/catch) is merge.go:102's `if err == nil`
+  // port: a failed xref read leaves vars.ClosingIssues unset so the template
+  // renders the literal and the merge message still composes. D1 has no
+  // fault-injection seam here (the poster/head reads precede the guard and
+  // would throw first), so the arm is pinned by the code path's structure.
 });

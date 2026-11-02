@@ -628,6 +628,18 @@ describe("mergeRequiredContextsCommitStatus (commit_status.go:19-71) directly", 
     await seedStatus("c", "failure");
     expect(await mergeRequiredContextsCommitStatus(env.DB, repoId, HEAD, [])).toBe("failure");
   });
+
+  it("pages past the newest 100 contexts (commit_status.go:144's ListOptionsAll) — the oldest required context still gates", async () => {
+    // The required context lands FIRST — 105 later contexts push it off the
+    // newest-100 window; a capped read would miss it and answer pending
+    // (the 405). Upstream reads with db.ListOptionsAll: every row.
+    await seedStatus("ctx-oldest", "success");
+    for (let i = 0; i < 105; i++) await seedStatus(`noise-${i}`, "success");
+    expect(await mergeRequiredContextsCommitStatus(env.DB, repoId, HEAD, ["ctx-oldest"])).toBe("success");
+    expect(await mergeRequiredContextsCommitStatus(env.DB, repoId, HEAD, ["ctx-*"])).toBe("success");
+    // The missing-context polarity is unchanged (a context on NO page).
+    expect(await mergeRequiredContextsCommitStatus(env.DB, repoId, HEAD, ["ctx-missing"])).toBe("pending");
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -34,7 +34,9 @@
  *   not scheduled → skip; closed/merged → DELETE the row and skip; the
  *   stored quick check (not MERGEABLE — IsStatusMergeable has no Empty arm,
  *   models/issues/pull.go:446-448 / WIP) → skip; head branch missing →
- *   skip; the doer's merge permission gone → skip;
+ *   skip; the live head ref off the SCHEDULED row's sha (automerge.go:
+ *   164-177's expected-head gate) → skip; the doer's merge permission gone
+ *   → skip;
  *   the fresh mergeability check (ensurePullRequestChecked — the General
  *   re-check CheckPullMergeable runs at merge time) not mergeable → skip;
  *   required commit statuses not green at the CHECKED row's fresh sha
@@ -54,13 +56,19 @@
  * ## Divergences (each cited at the seam)
  *
  * - The head-sha gate: upstream's queue item pins the sha it was enqueued
- *   for and skips when the ref moved (services/automerge/automerge.go:165-178);
- *   the cron re-probe has no stale item — it re-reads the LIVE head every
- *   tick (upstream itself re-gets the latest sha "to handle the case where
- *   the check of a previous push did not succeed", automerge.go:180-182 —
- *   the read itself sits inside IsPullCommitStatusPass, commit_status.go:
- *   126-135) and the status gate reads that fresh sha, never the row's
- *   stored one. The row's `sha` stays the schedule-time record.
+ *   for and the consumer skips when the ref moved (services/automerge/
+ *   automerge.go:164-177); ours re-reads the LIVE head ref in the flow arms
+ *   and skips unless it equals the row's scheduled `sha` — a push between
+ *   the green check and this tick leaves the row scheduled, no merge.
+ *   Upstream additionally passes the expected sha INTO Merge for a final
+ *   re-check (ErrSHADoesNotMatch → skip, automerge.go:227-229) — the landed
+ *   mergePullRequest has no expectedHeadSha option yet, so the window
+ *   between our ref read and the merge stays unguarded (the longer-term
+ *   option; upstream's residual window is the same shape, one Merge-call
+ *   wide). The status gate still reads the FRESH checked sha (upstream
+ *   re-gets the latest sha "to handle the case where the check of a
+ *   previous push did not succeed", automerge.go:180-182 — the read itself
+ *   sits inside IsPullCommitStatusPass, commit_status.go:126-135).
  * - `MergedCommitID` (upstream's post-merge stamp) has no landed column —
  *   the merge's own `pull_requests.merged_commit_id` is the record.
  * - `EffectiveRequiredContexts` (the owner/admin mandated scoped checks,
@@ -72,7 +80,7 @@
  *   merge-person fallback's hostname arm).
  */
 
-import { eq, asc } from "drizzle-orm";
+import { eq, asc, and, gt, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { Context } from "hono";
 
@@ -211,10 +219,35 @@ export function mergeRequiredContextsCommitStatus(
   return returned === "failure" ? "failure" : "pending";
 }
 
+/** The per-request page for the status reads (upstream pages with
+ *  db.ListOptionsAll — models/db/list.go:40 — so the bound here is a
+ *  transport page, never a cap). */
+const STATUS_READ_PAGE_SIZE = 100;
+
+/** `GetLatestCommitStatus(ctx, repo, sha, db.ListOptionsAll)` (commit_status.
+ *  go:142-145): EVERY latest-per-context row at the sha — paged to
+ *  exhaustion, so a required context beyond the newest page still gates.
+ *  latestCommitStatuses orders by id desc, so offset pages tile the set
+ *  deterministically. The twin in branch-protection.ts carries the same
+ *  loop (one behavior, two consumers). */
+async function allLatestCommitStatuses(d1: D1Database, repoId: string, headSha: string): Promise<CommitStatusRow[]> {
+  const out: CommitStatusRow[] = [];
+  for (let page = 1; ; page++) {
+    const { items } = await latestCommitStatuses(d1, repoId, headSha, page, STATUS_READ_PAGE_SIZE);
+    out.push(...items);
+    if (items.length < STATUS_READ_PAGE_SIZE) return out;
+  }
+}
+
 /** `IsPullCommitStatusPass` (commit_status.go:73-101): no rule → true; the
- *  rule's required contexts (the landed `statusCheckContexts` — the
- *  EffectiveRequiredContexts scoped half has no source, module doc) merged
- *  over the latest statuses at the head sha must be `success`. */
+ *  enableStatusCheck flag OFF → true — the flag-off arm there consults
+ *  EffectiveRequiredContexts (the owner/admin mandated scoped checks,
+ *  :81-94), and that source has no landed reader (the module-divergence
+ *  note), so with the flag off nothing is in effect (:90-93's empty arm).
+ *  The flag ON enforces the rule's stored `statusCheckContexts` (the landed
+ *  posture — the scoped half stages with its merge-gate wiring) merged over
+ *  the latest statuses at the head sha, which must be `success`. The same
+ *  gate shape is branch-protection.ts:813's status arm (the twins agree). */
 export async function isPullCommitStatusPass(
   d1: D1Database,
   repoId: string,
@@ -223,9 +256,9 @@ export async function isPullCommitStatusPass(
 ): Promise<boolean> {
   if (config === null) return true; // pb == nil → true
   const required = config.statusCheckContexts;
-  if (!config.enableStatusCheck && required.length === 0) return true; // nothing in effect
+  if (!config.enableStatusCheck) return true; // flag off → nothing in effect (commit_status.go:81-94)
   if (headSha === null || headSha === "") return required.length === 0;
-  const statuses = (await latestCommitStatuses(d1, repoId, headSha, 1, 100)).items;
+  const statuses = await allLatestCommitStatuses(d1, repoId, headSha);
   return mergeRequiredContextsCommitStatus(statuses, required) === "success";
 }
 
@@ -358,12 +391,18 @@ export function isAutoMergeCheckMessage(value: unknown): value is AutoMergeCheck
  *  optional members so the gate-off/unbound tests drive it structurally). */
 export type AutoMergeProducerEnv = Partial<Pick<Env, "DB" | "REPO_TASKS">>;
 
-/** Per-tick page size (the mirror producers' LIMIT 50). */
+/** Per-PAGE size for the producer's keyset scan (NOT a cap — the whole
+ *  scheduled table drains each tick; upstream Init re-populates every
+ *  scheduled row's queue item, automerge.go:34-68). */
 export const AUTO_MERGE_CHECK_PAGE_LIMIT = 50;
 
 /**
  * The cron producer: SELECT the scheduled rows (oldest first — the mirror
- * producers' order), enqueue one check message per row. SELECT + enqueue
+ * producers' order), enqueue one check message per row. The WHOLE table
+ * drains each tick: a keyset cursor over (createdUnix, issueId) pages until
+ * exhausted, so schedules beyond any fixed limit still enqueue (a capped
+ * read would re-probe the same oldest rows forever and starve the rest).
+ * The gathered messages ride sendBatch's own 100-chunking. SELECT + enqueue
  * ONLY (the sub-hour cron's 30 s CPU budget, AGENTS.md) — the ladder runs
  * in the REPO_TASKS consumer. No CAS claim (unlike the mirror producer):
  * the row IS the state; the check is idempotent and a duplicate message
@@ -372,21 +411,38 @@ export const AUTO_MERGE_CHECK_PAGE_LIMIT = 50;
  */
 export async function enqueueDueAutoMergeChecks(
   env: AutoMergeProducerEnv,
-  options: { limit?: number } = {},
+  options: { pageSize?: number } = {},
 ): Promise<number> {
-  const limit = options.limit ?? AUTO_MERGE_CHECK_PAGE_LIMIT;
+  const pageSize = options.pageSize ?? AUTO_MERGE_CHECK_PAGE_LIMIT;
   const db = env.DB;
   const queue = env.REPO_TASKS;
   if (db === undefined || queue === undefined) {
     throw new Error("DB/REPO_TASKS not bound (wrangler.jsonc); the auto-merge cron producer cannot enqueue");
   }
-  const due = await drizzle(db)
-    .select({ issueId: pullAutoMerges.issueId })
-    .from(pullAutoMerges)
-    .orderBy(asc(pullAutoMerges.createdUnix))
-    .limit(limit);
-  if (due.length === 0) return 0; // the quiet-tick probe — zero sends
-  const messages: AutoMergeCheckMessage[] = due.map((row) => ({ kind: "auto-merge-check", issueId: row.issueId }));
+  const dbx = drizzle(db);
+  const messages: AutoMergeCheckMessage[] = [];
+  let cursor: { createdUnix: number; issueId: number } | null = null;
+  for (;;) {
+    const rows: { issueId: number; createdUnix: number }[] = await dbx
+      .select({ issueId: pullAutoMerges.issueId, createdUnix: pullAutoMerges.createdUnix })
+      .from(pullAutoMerges)
+      .where(
+        cursor === null
+          ? undefined
+          : or(
+              gt(pullAutoMerges.createdUnix, cursor.createdUnix),
+              and(eq(pullAutoMerges.createdUnix, cursor.createdUnix), gt(pullAutoMerges.issueId, cursor.issueId)),
+            ),
+      )
+      .orderBy(asc(pullAutoMerges.createdUnix), asc(pullAutoMerges.issueId))
+      .limit(pageSize);
+    if (rows.length === 0) break; // the exhausted table (or the quiet-tick probe)
+    for (const row of rows) messages.push({ kind: "auto-merge-check", issueId: row.issueId });
+    const last: { createdUnix: number; issueId: number } = rows[rows.length - 1]!;
+    cursor = { createdUnix: last.createdUnix, issueId: last.issueId };
+    if (rows.length < pageSize) break;
+  }
+  if (messages.length === 0) return 0; // zero sends on an empty table
   for (let i = 0; i < messages.length; i += 100) {
     await queue.sendBatch(messages.slice(i, i + 100).map((message) => ({ body: message })));
   }
@@ -406,6 +462,7 @@ export type AutoMergeCheckOutcome =
   | "skipped-not-mergeable"
   | "skipped-wip"
   | "skipped-head-branch-missing"
+  | "skipped-head-sha-changed"
   | "skipped-status-checks"
   | "skipped-doer-missing"
   | "skipped-no-merge-permission"
@@ -488,17 +545,34 @@ export async function handleAutoMergeCheck(env: Env, issueId: number, options: {
 
   // The head-branch existence check (automerge.go:183-196): Github flow →
   // the branch exists in the HEAD repo; AGit → the PR ref exists on base.
-  // A failed (null) ref read is the missing arm — nothing to merge.
+  // A failed (null) ref read is the missing arm — nothing to merge. The same
+  // listing yields the live head-ref commit id (upstream's GetRefCommitID
+  // read, automerge.go:171-174 — the flow arms run AFTER that gate there;
+  // one engine read serves both here).
+  let headRefOid: string;
   if (pr.flow === PRFlow.Github) {
     if (headRepo === null) return "skipped-head-branch-missing";
     const refs = await engineReads(env, { ownerNamespace: headRepo.repo.ownerNamespace, slug: headRepo.repo.slug }).listRefs();
-    if (refs === null || !refs.refs.some((entry) => entry.name === `refs/heads/${pr.headBranch}`)) return "skipped-head-branch-missing";
+    headRefOid = refs?.refs.find((entry) => entry.name === `refs/heads/${pr.headBranch}`)?.target ?? "";
+    if (headRefOid === "") return "skipped-head-branch-missing";
   } else if (pr.flow === PRFlow.AGit) {
     const refs = await engineReads(env, { ownerNamespace: pair.repo.ownerNamespace, slug: pair.repo.slug }).listRefs();
-    if (refs === null || !refs.refs.some((entry) => entry.name === `refs/pull/${pr.index}/head`)) return "skipped-head-branch-missing";
+    headRefOid = refs?.refs.find((entry) => entry.name === `refs/pull/${pr.index}/head`)?.target ?? "";
+    if (headRefOid === "") return "skipped-head-branch-missing";
   } else {
     return "skipped-not-mergeable"; // unsupported flow (upstream's default arm)
   }
+
+  // The expected-head gate (automerge.go:175-177): the LIVE head ref must
+  // still be the sha the SCHEDULED row pinned — a push between the green
+  // check and this tick skips with the row kept (the pushed head re-arms its
+  // own checks; nothing merges an unchecked tip). `scheduled.sha` is the
+  // head sha at schedule time (both schedule arms store `checked.headSha`),
+  // so this is the queue item's `headCommitID != expectedHeadCommitID` pin;
+  // an empty stored sha (corrupt row) can never equal a resolved oid — the
+  // same skip. Upstream's Merge-internal re-check (ErrSHADoesNotMatch →
+  // skip, automerge.go:227-229) has no landed option yet (module doc).
+  if (headRefOid !== scheduled.sha) return "skipped-head-sha-changed";
 
   const rule = await findRule(d1, pair.repo.id, pr.baseBranch);
   const config = rule === null ? null : parseRuleConfig(rule.rules);

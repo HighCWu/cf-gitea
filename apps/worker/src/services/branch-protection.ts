@@ -89,7 +89,7 @@ import type { CommitStatusState } from "../api/models/commit-status";
 import { combineCommitStatusStates, latestCommitStatuses } from "../api/services/commit-status";
 import { repositoryPermissions, type RepositoryRow, type Viewer } from "../api/services/repository";
 import { collaboratorModeOf } from "../api/services/repo-collaborators";
-import { issues, protectedBranches, pullRequests, pullReviews, repositories, ReviewType, teamMembers, teamRepoAccess, teams, users } from "../db/schema";
+import { issues, protectedBranches, pullRequests, pullReviews, repositories, ReviewType, teamMembers, teamRepoAccess, teams, users, type CommitStatusRow } from "../db/schema";
 
 // ---------------------------------------------------------------------------
 // The system pseudo-principals (user_system.go:51) — resolvable by name at the
@@ -714,6 +714,11 @@ export function mergeBlockedByOutdatedBranch(config: ProtectedBranchConfig, comm
 // The merge gate core (services/pull/merge.go:694–742).
 // ---------------------------------------------------------------------------
 
+/** The per-request page for the status reads (upstream pages with
+ *  db.ListOptionsAll — commit_status.go:142–145 — so the bound here is a
+ *  transport page, never a cap). */
+const STATUS_READ_PAGE_SIZE = 100;
+
 export interface PullBranchProtectionInput {
   issueId: number;
   /** `pull_requests.commits_behind` — the mergeability check's count. */
@@ -755,9 +760,18 @@ export async function mergeRequiredContextsCommitStatus(
   if (headSha === null || headSha === "") return "pending";
   // GetLatestCommitStatus (commit_status.go:137–141): the latest row per
   // context at the sha — latestCommitStatuses' max-id-per-context grouping
-  // (the module comment's context_hash reduction). The read is bounded at the
-  // auto-merge ladder's page (100 contexts — the twin's own posture).
-  const statuses = (await latestCommitStatuses(d1, repoId, headSha, 1, 100)).items;
+  // (the module comment's context_hash reduction). Upstream pages with
+  // db.ListOptionsAll (commit_status.go:142–145, models/db/list.go:40) —
+  // every row, no cap — so the read pages to exhaustion here too (a required
+  // context beyond the newest 100 must still gate). latestCommitStatuses
+  // orders by id desc, so offset pages tile the set deterministically. The
+  // twin in pull-automerge.ts carries the same loop.
+  const statuses: CommitStatusRow[] = [];
+  for (let page = 1; ; page++) {
+    const { items } = await latestCommitStatuses(d1, repoId, headSha, page, STATUS_READ_PAGE_SIZE);
+    statuses.push(...items);
+    if (items.length < STATUS_READ_PAGE_SIZE) break;
+  }
   if (requiredContexts.length === 0) {
     // No required contexts: the WHOLE status set aggregates
     // (commit_status.go:25–29) — an armed-but-empty rule means "all checks

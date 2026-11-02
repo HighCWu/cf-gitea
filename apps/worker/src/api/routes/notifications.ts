@@ -433,13 +433,13 @@ function lastAnyActivityExpr(): SQL {
  * `HasWorkInProgressPrefix` (models/issues/pull.go:652-658) as a SQL
  * fragment — the same prefix set as the mail layer's `hasWorkInProgressPrefix`
  * (api/services/issues.ts `WIP_PREFIXES`, the upstream
- * setting.Repository.PullRequest.WorkInProgressPrefixes default plus the
- * mail layer's carried extensions; kept in literal sync — that constant is
+ * setting.Repository.PullRequest.WorkInProgressPrefixes default verbatim,
+ * modules/setting/repository.go:199; kept in literal sync — that constant is
  * not exported and this module owns no shared file). SQLite LIKE is ASCII
  * case-insensitive, the helper's own matching rule; no prefix contains a
  * LIKE metacharacter ("[" is literal in SQLite).
  */
-const RECIPIENT_WIP_PREFIXES: readonly string[] = ["WIP:", "[WIP]", "WIP]", "Draft"];
+const RECIPIENT_WIP_PREFIXES: readonly string[] = ["WIP:", "[WIP]"];
 
 /** The WIP-title match over the issues row in scope (reads issues.title). */
 function wipTitleExpr(): SQL {

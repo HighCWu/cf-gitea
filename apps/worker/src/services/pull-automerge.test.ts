@@ -16,8 +16,15 @@
  *   - an Empty PR schedules but never merges (the quick check is
  *     Mergeable-only) and an open dependency skips with the row kept until
  *     the blocker closes (check.go:219-222's consumer arm);
+ *   - the expected-head gate (automerge.go:175-177): a post-schedule push
+ *     skips with the row kept — the live ref must still be the scheduled
+ *     sha, and the old sha's green statuses never merge the new head;
+ *   - the status gate's flag-off rule passes even with stored contexts
+ *     (commit_status.go:81-94) and pages past the newest 100 contexts
+ *     (commit_status.go:144's ListOptionsAll);
  *   - the producer enqueues one message per scheduled row (and zero for an
- *     empty table) through a recording queue spy (the demo-sweep shape).
+ *     empty table) through a recording queue spy (the demo-sweep shape) and
+ *     drains the WHOLE table — pages past any fixed limit.
  */
 
 import { env } from "cloudflare:test";
@@ -41,6 +48,7 @@ import {
   enqueueDueAutoMergeChecks,
   getScheduledAutoMerge,
   handleAutoMergeCheck,
+  isPullCommitStatusPass,
   scheduleAutoMergeRow,
 } from "./pull-automerge";
 
@@ -275,6 +283,10 @@ describe("handleAutoMergeCheck (the consume-time ladder)", () => {
     const tip = await landChildCommitOnBranch("blockedpr-branch", headOid, "blocked.ts", "// blocked work\n");
     await d1().update(pullRequests).set({ headSha: tip }).where(eq(pullRequests.id, found.pullRequest.id));
     await env.REPO.getByName("alice/amrepo").commitApiChange({ ref: pullHeadRef(found.pullRequest.index), expectedOldOid: headOid, newOid: tip });
+    // The expected-head gate reads the LIVE ref against the SCHEDULED sha —
+    // re-pin the schedule to the pushed tip (the re-schedule arm a real
+    // push flow carries) so the dependency arm below is what's under test.
+    await d1().update(pullAutoMerges).set({ sha: tip }).where(eq(pullAutoMerges.issueId, found.issue.id));
     await createCommitStatus(env.DB, {
       repoId,
       sha: tip,
@@ -317,7 +329,7 @@ describe("handleAutoMergeCheck (the consume-time ladder)", () => {
     expect(await getScheduledAutoMerge(env.DB, found.issue.id)).toBeNull();
   });
 
-  it("a post-schedule push re-gates at the FRESH head sha — the stale sha's green never merges the new head", async () => {
+  it("a post-schedule push skips with the row kept — the live head left the scheduled sha (automerge.go:175-177)", async () => {
     const index = await seedScheduledPr("racepr", "merge");
     const found = (await findPullRequestByIndex(env.DB, repoId, index))!;
     // Green ci/build ONLY at the schedule-time sha (headOid) — the exact
@@ -339,18 +351,18 @@ describe("handleAutoMergeCheck (the consume-time ladder)", () => {
     await d1().update(pullRequests).set({ status: PRStatus.Checking }).where(eq(pullRequests.id, found.pullRequest.id));
 
     // Tick 1 on the checking row: the stored quick check waits (a checking
-    // row is not IsStatusMergeable, automerge.go:143-145) — the OLD sha's
-    // green must not merge the NEW head out from under the settle.
+    // row is not IsStatusMergeable, automerge.go:143-145).
     expect(await handleAutoMergeCheck(env, found.issue.id)).toBe("skipped-not-mergeable");
     expect(await getScheduledAutoMerge(env.DB, found.issue.id)).not.toBeNull();
 
-    // The settle (any GET's lazy check CAS): the row lands Mergeable at the
-    // NEW sha — then tick 2 gates the statuses at the CHECKED row's fresh
-    // sha (the B2 seam; upstream's own live read sits inside the gate,
-    // commit_status.go:126-135). No green ci/build at racedOid → the
-    // schedule waits; the PR is never merged under the old sha's green.
+    // Tick 2 — the row settles Mergeable at the NEW sha: the expected-head
+    // gate reads the LIVE ref (racedOid) against the SCHEDULED sha (headOid)
+    // and skips BEFORE any status read — the old sha's green ci/build never
+    // merges the pushed head, and the row stays scheduled (upstream's queue
+    // item pins its sha; a fresh MWCS schedule re-arms the new head).
     await d1().update(pullRequests).set({ status: PRStatus.Mergeable, headSha: racedOid }).where(eq(pullRequests.id, found.pullRequest.id));
-    expect(await handleAutoMergeCheck(env, found.issue.id)).toBe("skipped-status-checks");
+    expect(await handleAutoMergeCheck(env, found.issue.id)).toBe("skipped-head-sha-changed");
+    expect(await getScheduledAutoMerge(env.DB, found.issue.id)).not.toBeNull();
     expect((await findPullRequestByIndex(env.DB, repoId, index))!.pullRequest.hasMerged).toBe(false);
   });
 
@@ -360,6 +372,32 @@ describe("handleAutoMergeCheck (the consume-time ladder)", () => {
     await d1().delete(pullRequests).where(eq(pullRequests.id, found.pullRequest.id));
     expect(await handleAutoMergeCheck(env, found.issue.id)).toBe("deleted-closed-or-merged");
     expect(await getScheduledAutoMerge(env.DB, found.issue.id)).toBeNull();
+  });
+});
+
+// --- the required-context gate ---------------------------------------------------
+
+describe("isPullCommitStatusPass (commit_status.go:73-101)", () => {
+  it("the flag-off rule passes even with stored contexts (commit_status.go:81-94 — with no scoped source nothing else is in effect)", async () => {
+    const sha = "c".repeat(40);
+    const flagOff = { ...emptyRuleConfig(), enableStatusCheck: false, statusCheckContexts: ["ci/build"] };
+    const flagOn = { ...emptyRuleConfig(), enableStatusCheck: true, statusCheckContexts: ["ci/build"] };
+    // Red ci/build at the sha: the flag ON enforces it, the flag OFF passes.
+    await createCommitStatus(env.DB, { repoId, sha, state: "failure", targetUrl: "", description: "build broke", context: "ci/build", creatorId: alice.id });
+    expect(await isPullCommitStatusPass(env.DB, repoId, sha, flagOff)).toBe(true);
+    expect(await isPullCommitStatusPass(env.DB, repoId, sha, flagOn)).toBe(false);
+  });
+
+  it("pages past the newest 100 contexts (commit_status.go:144's ListOptionsAll) — the oldest required context still gates", async () => {
+    const sha = "d".repeat(40);
+    const config = { ...emptyRuleConfig(), enableStatusCheck: true, statusCheckContexts: ["ctx-oldest"] };
+    // The required context lands FIRST — 105 later contexts push it off the
+    // newest-100 window; a capped read would answer pending forever.
+    await createCommitStatus(env.DB, { repoId, sha, state: "success", targetUrl: "", description: "", context: "ctx-oldest", creatorId: alice.id });
+    for (let i = 0; i < 105; i++) {
+      await createCommitStatus(env.DB, { repoId, sha, state: "failure", targetUrl: "", description: "", context: `noise-${i}`, creatorId: alice.id });
+    }
+    expect(await isPullCommitStatusPass(env.DB, repoId, sha, config)).toBe(true);
   });
 });
 
@@ -399,6 +437,37 @@ describe("enqueueDueAutoMergeChecks (the cron producer)", () => {
     const after = await enqueueDueAutoMergeChecks(producerEnv, {});
     expect(after).toBe(0);
     expect(queue.bodies.length).toBe(1); // no NEW batch since the first
+  });
+
+  it("drains the WHOLE scheduled table each tick — pages past any fixed limit (no oldest-50 starvation)", async () => {
+    const queue = spyQueue();
+    const producerEnv: Partial<Pick<Env, "DB" | "REPO_TASKS">> = { DB: env.DB, REPO_TASKS: queue };
+    // 120 synthetic rows (issueIds far from the fixtures'); pageSize 50
+    // forces three pages — a capped read would enqueue exactly the oldest 50
+    // every tick and starve the rest.
+    const synthetic: number[] = [];
+    for (let i = 0; i < 120; i++) {
+      const issueId = 4_100_000 + i;
+      synthetic.push(issueId);
+      await d1().insert(pullAutoMerges).values({
+        issueId,
+        doerId: alice.id,
+        sha: "a".repeat(40),
+        mergeStyle: "merge",
+        deleteBranchAfterMerge: false,
+        mergeMessage: null,
+        createdUnix: T0 + 500 + i,
+      });
+    }
+    const count = await enqueueDueAutoMergeChecks(producerEnv, { pageSize: 50 });
+    expect(count).toBe(120);
+    const flat = queue.bodies.flat() as { kind: string; issueId: number }[];
+    const seen = new Set(flat.map((message) => message.issueId));
+    for (const issueId of synthetic) expect(seen.has(issueId)).toBe(true);
+    // The oldest row leads (the keyset order, asc createdUnix).
+    expect(flat[0]!.issueId).toBe(4_100_000);
+    // Cleanup — the suite's other producers start from a drained table.
+    for (const issueId of synthetic) await deleteScheduledAutoMerge(env.DB, issueId);
   });
 });
 
