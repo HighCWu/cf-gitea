@@ -44,8 +44,10 @@
  *     (:158-180, the type-29 push comment mail whose content
  *     mail_comment.go:24-26 empties; the push/commit-list template blocks
  *     ride default.tmpl:9-25/:61-71) and `PullReviewDismiss` (:182-189,
- *     the review_dismissed mail over the type-32 comment, its inline
- *     excerpts riding `.ReviewComments` per mail_issue_common.go:93-100) —
+ *     the review_dismissed mail over the type-32 comment — no inline
+ *     excerpts: the dismiss receivers never LoadCodeComments, review.go:
+ *     372-376/:458-462, so the compose's `.ReviewComments` flatten
+ *     (mail_issue_common.go:92-97) ranges over the nil map) —
  *     and restores the two folded gates: the notify-mail register gate
  *     (A2 — every participant fan-out arm needs
  *     `[service] ENABLE_NOTIFY_MAIL` ON TOP of the mail service,
@@ -977,11 +979,13 @@ interface NotifyIssueArmInput {
   info?: string;
   /** The review mail's inline excerpts (M3 — composeIssueCommentMessages'
    *  `ReviewComments`, mail_issue_common.go:93-100: the LOADED
-   *  `Comment.Review.CodeComments` flatten; only the arms whose upstream
-   *  caller loads Comment.Review — the review submission and the
-   *  dismissal — pass it; the code-comment arm's Comment.Review stays nil
-   *  upstream, so it never does). Each entry: tree path, the stored patch
-   *  (raw in the `<pre>`) and the content pre-rendered to HTML. */
+   *  `Comment.Review.CodeComments` flatten; only the review-SUBMISSION arm
+   *  passes it — its caller loads the review (models/issues/review.go:510).
+   *  The dismissal arm passes `[]`: upstream's dismiss receivers never
+   *  LoadCodeComments (review.go:372-376/:458-462), so its map is nil and
+   *  the compose carries zero excerpts; the code-comment arm's Comment.Review
+   *  stays nil upstream, so it never does either). Each entry: tree path, the
+   *  stored patch (raw in the `<pre>`) and the content pre-rendered to HTML. */
   reviewComments?: ReviewCommentExcerptData[];
   /** The review_dismissed line's %[2]s (`.Comment.Review.Reviewer
    *  .DisplayNameWithFullName` — the reviewer whose review was dismissed;
@@ -1944,10 +1948,15 @@ export interface NotifyPullReviewDismissInput {
  * template file at the pin → default.tmpl). The kept content (the dismiss
  * message — MailParticipantsComment empties only the push type) renders
  * beneath the `mail.issue.action.review_dismissed` line (%[1]s the
- * dismissing admin, %[2]s the dismissed reviewer's display name); the
- * review's inline code comments ride as `.ReviewComments` (the receiver
- * loads the Review, review.go:462 — M3's compose gate
- * `comment.Comment.Review != nil`); link/Message-ID carry the type-32
+ * dismissing admin, %[2]s the dismissed reviewer's display name). NO inline
+ * excerpts: upstream's dismissal receivers set `comment.Review` WITHOUT
+ * LoadCodeComments (the stale-priors loop, review.go:372-376, and
+ * DismissReview itself, :458-462 — only SubmitReview's review-merge loads,
+ * models/issues/review.go:510), so `Review.CodeComments` is the nil map and
+ * the compose's `.ReviewComments` flatten (mail_issue_common.go:92-97)
+ * ranges over nothing — the dismissal mail carries zero excerpts at the pin
+ * (the submission arm's loaded review is the contrast, notify.ts's M3).
+ * link/Message-ID carry the type-32
  * comment, whose HasMailReplySupport binds the reply token (comment.go:
  * 198). Recipients: the full participants funnel (mentions nil). Dedupe
  * `pull-review-dismissed:<commentId>:<recipientId>`.
@@ -1957,19 +1966,13 @@ export async function notifyPullReviewDismiss(
   input: NotifyPullReviewDismissInput,
   options: { now?: Date } = {},
 ): Promise<MailNotifyOutcome> {
-  // The compose's body render (mail_issue_common.go:71-72) — one render
-  // shared by the body and the excerpt `RenderedContent`s.
   const pair = await findRepositoryById(env.DB, input.issue.repoId);
   if (pair === null) {
     console.error(`[mail] review-dismissed mail skipped: repository row missing [id: ${input.issue.repoId}]`);
     return { outcome: "no-recipients" };
   }
-  const origin = appUrlWithSlash(env.APP_URL);
-  const repoPath = `${pair.repo.ownerNamespace}/${pair.repo.slug}`;
-  const render = (text: string) =>
-    renderMarkdownToHtml({ text, mode: "comment", context: repoPath, wiki: false, origin });
-  const reviewComments =
-    input.comment.reviewId === null ? [] : await loadReviewCommentExcerpts(env.DB, input.comment.reviewId, render);
+  // reviewComments: [] — the dismissal mail never carries excerpts (upstream
+  // never LoadCodeComments on the dismiss paths; see the doc block above).
   return notifyIssueArm(
     env,
     {
@@ -1980,7 +1983,7 @@ export async function notifyPullReviewDismiss(
       content: input.comment.content ?? "",
       dedupePrefix: "pull-review-dismissed",
       reviewerDisplayName: displayNameWithFullName(input.reviewer.username, input.reviewer.fullName),
-      reviewComments,
+      reviewComments: [],
     },
     options,
   );

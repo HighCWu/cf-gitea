@@ -32,6 +32,10 @@
  * enrichment, head_commit, compare_url, and the TRUE total_commits — the
  * uncapped delta count behind the 5-item array), the mirror-posture
  * zero-commit created shape (the shared builder's default), the delete event, the
+ * M7 auto-watch fold (the AUTO_WATCH_ON_CHANGES-guarded watchIfAuto on the
+ * created-branch arm too — push.go:204-206 sits inside the IsBranch arm, so
+ * create fires it like the update/delete tails; the knob-off, tag-create,
+ * failed-walk and existing-row silences), the
  * pull_request_sync family (an updated PR head branch syncs every open
  * github-flow PR on it with the delta; created refs, non-PR branches and
  * closed PRs stay silent; the subscription gates), the branch-delete cascade
@@ -69,9 +73,10 @@ import { createDurableGit, type DurableGitHandler } from "@cf-gitea/git-engine";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicHeader, basicTokenHeader, mintFor, seedVerifiedUser } from "../auth/testing/seeds";
+import { WatchMode } from "../api/services/repo-watchers";
 import { findRepositoryById } from "../api/services/repository";
 import { TeamsService } from "../api/routes/org-teams";
-import { actions, comments, issues, PRStatus, protectedBranches, pullRequests, pullReviews, repositories, ReviewType, users, webhookDeliveries, webhooks } from "../db/schema";
+import { actions, comments, issues, PRStatus, protectedBranches, pullRequests, pullReviews, repositories, repoWatchers, ReviewType, users, webhookDeliveries, webhooks } from "../db/schema";
 import { ActionType } from "../api/services/activity-feeds";
 import { CommentType } from "../issues/comment-types";
 import { IssuesService } from "../issues/service";
@@ -218,6 +223,7 @@ beforeEach(async () => {
     "pull_requests",
     "comments",
     "issues",
+    "repo_watchers",
     "repositories",
     "webhook_deliveries",
     "webhooks",
@@ -1321,6 +1327,75 @@ describe("the user-push created arms and the true total (push.go's pushQueueHand
     );
     expect(await deliveries()).toHaveLength(0);
     expect(lines.filter((line) => line.includes("not notified"))).toHaveLength(2);
+  });
+
+  it("a user-push branch create arms the M7 auto-watch too (push.go:204-206 sits inside the IsBranch arm)", async () => {
+    const { row } = await seedRepoWithToken("pushcreatewatch");
+    await seedHook({ repoId: row.id });
+    const pair = (await findRepositoryById(env.DB, row.id))!;
+    const alice = (await drizzle(env.DB).select({ id: users.id }).from(users).where(eq(users.usernameLower, "alice")).get())!;
+    // The knob-armed bindings: the var rides the env exactly like every
+    // arm's gate — the direct calls thread it without touching the config.
+    const armed: WebhookPushEnv = { DB: env.DB, REPO: env.REPO, REPO_PACKS: env.REPO_PACKS, REPO_TASKS: env.REPO_TASKS, AUTO_WATCH_ON_CHANGES: "true" };
+    const identity = { repository: { full_name: `alice/${row.slug}` }, pusher: { login: "Alice" }, sender: { login: "Alice" } };
+    const tip = "c".repeat(40);
+    const mid = "b".repeat(40);
+    const root = "a".repeat(40);
+    const person = { name: "Test User", email: "t@example.com", time: 1700000000, tz: "+0000" };
+    const commitJson = (oid: string, parents: string[]) => ({
+      oid,
+      tree: "t".repeat(40),
+      parents,
+      author: person,
+      committer: person,
+      subject: "s",
+      message: "s",
+    });
+    const walk: WebhookPushWalk = {
+      listCommitsRange: () => Promise.resolve(null),
+      readDiff: () => Promise.resolve(null),
+      readCommit: () => Promise.resolve(null),
+      listLog: (ref) =>
+        Promise.resolve(
+          ref === tip
+            ? { commits: [commitJson(tip, [mid]), commitJson(mid, [root]), commitJson(root, ["9".repeat(40)])], more: false }
+            : { commits: [], more: false },
+        ),
+    };
+    const watchRows = () => drizzle(env.DB).select().from(repoWatchers).all();
+    const opts = { userPush: true, pusherId: alice.id, origin: "https://direct.example.com" };
+
+    // The created BRANCH arms the watch: upstream's WatchIfAuto sits INSIDE
+    // the IsBranch arm AFTER the create/update if-else (push.go:204-206), so
+    // pushNewBranch's create (:270-274) reaches it exactly like
+    // pushUpdateBranch's tail does — the Auto row lands with the events.
+    await emitPushFamilyUpdates(armed, pair, identity, [{ ref: "refs/heads/feature", old: PUSH_ZERO_OID, next: tip }], walk, opts);
+    expect((await deliveries()).map((r) => r.eventType)).toEqual(["create", "push"]);
+    expect((await watchRows()).map((r) => ({ userId: r.userId, mode: r.mode }))).toEqual([{ userId: alice.id, mode: WatchMode.Auto }]);
+    await env.DB.prepare("DELETE FROM repo_watchers").run();
+
+    // The knob off stays silent (the writer's own gate — watch.go:312-314).
+    await emitPushFamilyUpdates({ ...armed, AUTO_WATCH_ON_CHANGES: "" }, pair, identity, [{ ref: "refs/heads/feature", old: PUSH_ZERO_OID, next: tip }], walk, opts);
+    expect(await watchRows()).toHaveLength(0);
+
+    // A TAG create never watches — the watch lives in the IsBranch arm only;
+    // tags fall to push.go:208-210's silence.
+    await emitPushFamilyUpdates(armed, pair, identity, [{ ref: "refs/tags/v1", old: PUSH_ZERO_OID, next: tip }], walk, opts);
+    expect(await watchRows()).toHaveLength(0);
+
+    // A failed walk returns BEFORE any event (upstream's error return,
+    // push.go:165-167) — WatchIfAuto at :204 is never reached.
+    await clearDeliveries();
+    await emitPushFamilyUpdates(armed, pair, identity, [{ ref: "refs/heads/void", old: PUSH_ZERO_OID, next: "d".repeat(40) }], walk, opts);
+    expect(await deliveries()).toHaveLength(0);
+    expect(await watchRows()).toHaveLength(0);
+
+    // A persisted row of ANY mode is the writer's no-op (watch.go:319-321):
+    // the create fires, the Dont row survives.
+    await env.DB.prepare("INSERT INTO repo_watchers (repo_id, user_id, mode) VALUES (?, ?, 2)").bind(row.id, alice.id).run();
+    await emitPushFamilyUpdates(armed, pair, identity, [{ ref: "refs/heads/feature", old: PUSH_ZERO_OID, next: tip }], walk, opts);
+    expect((await deliveries()).map((r) => r.eventType)).toEqual(["create", "push"]);
+    expect((await watchRows()).map((r) => ({ userId: r.userId, mode: r.mode }))).toEqual([{ userId: alice.id, mode: WatchMode.Dont }]);
   });
 });
 

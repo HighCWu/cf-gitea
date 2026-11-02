@@ -477,7 +477,7 @@ export async function emitPushFamilyUpdates(
             // The user-push created arms — pushQueueHandleUpdates' branch/tag
             // split (the module header's posture table; upstream's own order
             // per arm: create-first for branches, push-first for tags).
-            await emitUserPushCreatedRef(env, pair, identity, origin, emit, update, walk, log);
+            await emitUserPushCreatedRef(env, pair, identity, origin, emit, update, walk, log, options);
             continue;
           }
           // Mirror posture — the zero-commit push event, then the create event
@@ -697,6 +697,14 @@ export async function emitPushFamilyUpdates(
  * head_commit = the PEELED tip commit (:124), compare_url =
  * compare/{zero}...{new-oid} (:125 — the RAW ref target oid, the tag object
  * for an annotated tag; our `after`/`sha` carry it verbatim too).
+ *
+ * The branch arm's tail rides the M7 WatchIfAuto too (push.go:204-206 sits
+ * AFTER the create/update if-else INSIDE the IsBranch arm — the create
+ * arm's pushNewBranch (:270-274) fires it exactly like pushUpdateBranch's
+ * tail does; the :204 comment names the delete case but the placement
+ * covers all three). A failed walk returns before any event (upstream's
+ * error return, :165-167 — WatchIfAuto never reached), so only a landed
+ * create arms the watch.
  */
 async function emitUserPushCreatedRef(
   env: WebhookPushEnv,
@@ -707,6 +715,7 @@ async function emitUserPushCreatedRef(
   update: PushRefUpdate,
   walk: WebhookPushWalk,
   log: (message: string) => void,
+  options: WebhookPushOptions = {},
 ): Promise<void> {
   const createPayload = () => ({
     sha: update.next,
@@ -775,6 +784,13 @@ async function emitUserPushCreatedRef(
       sender: identity.sender,
     };
     await emit("push", push, update.ref);
+    // M7 — WatchIfAuto rides the branch create too (push.go:204-206 sits
+    // inside the IsBranch arm after the create/update if-else: pushNewBranch's
+    // create reaches it like pushUpdateBranch's update does; the writer
+    // self-guards on the knob and the write flag).
+    if (env.AUTO_WATCH_ON_CHANGES === "true" && options.pusherId !== undefined && options.pusherId !== null) {
+      await watchIfAuto(env.DB, pair.repo.id, options.pusherId, true, true, options.now ?? new Date());
+    }
     return;
   }
 

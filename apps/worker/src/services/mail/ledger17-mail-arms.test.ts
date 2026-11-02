@@ -2,7 +2,10 @@
  * The ledger ⑰ mail pass's behavioral pins (docs/compat/v1.5.2-ledger.md
  * §1.4 — specs/email-outbound.md §15's as-built record): the M1 pair's
  * receivers end to end (`notifyPullReviewDismiss` — the review_dismissed
- * mail over the type-32 comment with its inline `.ReviewComments` excerpts;
+ * mail over the type-32 comment, ZERO inline excerpts: upstream's dismiss
+ * receivers never LoadCodeComments, review.go:372-376/:458-462, so the
+ * compose's `.ReviewComments` flatten (mail_issue_common.go:92-97) ranges
+ * over the nil map;
  * `notifyPullRequestPushCommits` — the push mail over the emptied type-29
  * content), the A2 notify-mail register gate (ENABLE_NOTIFY_MAIL on top of
  * MAIL_ENABLED, mailer.go:33-35), the A3 admin short-circuit inside the
@@ -249,8 +252,11 @@ describe("A3 — CheckRepoUnitUser's admin short-circuit in the unit fold", () =
 
 // ---------------------------------------------------------------------------
 // M1 + M3 — the PullReviewDismiss arm: the review_dismissed mail over the
-// type-32 comment, the review's inline code comments riding as
-// .ReviewComments (mail_issue_common.go:93-100).
+// type-32 comment. NO inline excerpts: upstream's dismissal receivers set
+// comment.Review WITHOUT LoadCodeComments (review.go:372-376/:458-462 —
+// only SubmitReview's review-merge loads, models/issues/review.go:510), so
+// the compose's .ReviewComments flatten (mail_issue_common.go:92-97)
+// ranges over the nil map and the mail carries zero excerpts.
 // ---------------------------------------------------------------------------
 
 describe("notifyPullReviewDismiss — the PullReviewDismiss receiver (notify.go:182-189)", () => {
@@ -301,7 +307,7 @@ describe("notifyPullReviewDismiss — the PullReviewDismiss receiver (notify.go:
     return { issue, dismissed };
   }
 
-  it("the review_dismissed mail: both display names on the action line, the kept message, the inline excerpts, the type-32 anchor", async () => {
+  it("the review_dismissed mail: both display names on the action line, the kept message, the type-32 anchor, NO inline excerpts", async () => {
     const { issue, dismissed } = await seedDismissal("needs another look");
     const outcome = await notifyPullReviewDismiss(
       armedEnv(),
@@ -327,11 +333,17 @@ describe("notifyPullReviewDismiss — the PullReviewDismiss receiver (notify.go:
       );
       // The KEPT dismiss message renders beneath the line (the body branch).
       expect(row.bodyHtml).toContain("needs another look");
-      // M3: the review's inline excerpts — the tree-path line, the RAW patch
-      // in the <pre>, the rendered content. NO reply half (inbound unarmed).
-      expect(row.bodyHtml).toContain("In src/a.txt:");
-      expect(row.bodyHtml).toContain("diff --git a/src/a.txt b/src/a.txt");
-      expect(row.bodyHtml).toContain("second <strong>note</strong>");
+      // NO inline excerpts — the review's type-21 rows EXIST in this fixture
+      // (over review 9001) and the dismissal mail still carries none of them:
+      // upstream's dismiss receivers set comment.Review WITHOUT
+      // LoadCodeComments (review.go:372-376/:458-462; only SubmitReview's
+      // review-merge loads, models/issues/review.go:510), so the compose's
+      // .ReviewComments flatten (mail_issue_common.go:92-97) ranges over the
+      // nil map. Re-baselined from the D2-era excerpt pin on this upstream
+      // cite. NO reply half (inbound unarmed).
+      expect(row.bodyHtml).not.toContain("In src/a.txt:");
+      expect(row.bodyHtml).not.toContain("diff --git a/src/a.txt b/src/a.txt");
+      expect(row.bodyHtml).not.toContain("second <strong>note</strong>");
       expect(row.bodyHtml).not.toContain("or reply to this email directly");
     }
   });

@@ -446,7 +446,7 @@ export interface IssueActionMailData {
  * `templates/mail/repo/issue/default.tmpl` for the new/close/reopen arms —
  * byte-faithful traces of the Go template with `.IsMention` false (pass
  * `isMention` for the mention-batch copies), empty `.ReviewComments`
- * (pass `reviewComments` for the review/dismiss arms' inline excerpts),
+ * (pass `reviewComments` for the review arm's inline excerpts — the DISMISS arm passes none: upstream's dismiss paths never LoadCodeComments, review.go:372-376/:458-462),
  * `.CanReply` false (pass `canReply` when the inbound arm is up — the
  * link line's "or reply to this email directly" half). The `<p>` block
  * has four reachable shapes (both dropped `{{if}}` lines above it and the
