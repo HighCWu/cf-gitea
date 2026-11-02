@@ -210,6 +210,23 @@ async function seedRun(spec: SeedRunSpec): Promise<number> {
   return run.id;
 }
 
+/** Mark a seeded run as a SCOPED dispatch's row — the C10 half-stage's
+ *  producer shape (workflow-dispatch.ts's post-insert UPDATE: is_scoped_run
+ *  + workflow_repo_id, schema.ts:4067-4069). */
+async function markRunScoped(runId: number, sourceRepoId: string): Promise<void> {
+  await drizzle(env.DB).update(actionRuns).set({ isScopedRun: true, workflowRepoId: sourceRepoId }).where(eq(actionRuns.id, runId));
+}
+
+/** A second repositories row playing the SOURCE repo of scoped workflows
+ *  (the TEXT id space — schema.ts's repositories.id). */
+async function seedSourceRepo(id: string, slug: string): Promise<void> {
+  await env.DB.prepare(
+    "INSERT INTO repositories (id, storage_key, owner_namespace, owner_id, slug, default_branch, visibility, is_empty, created_at) VALUES (?, ?, 'alice', 1, ?, 'main', 'public', 0, unixepoch())",
+  )
+    .bind(id, id, slug)
+    .run();
+}
+
 /** A runner row through the model (the Register seam). */
 async function seedRunner(labels: string[], onlineAgoSeconds: number): Promise<void> {
   await drizzle(env.DB).insert(actionRunners).values({
@@ -274,7 +291,7 @@ const emptyEngine = fakeEngine();
 function baseQuery(patch: Partial<ActionRunListQuery> = {}): ActionRunListQuery {
   return {
     workflow: "",
-    scopedWorkflowSourceRepoId: 0,
+    scopedWorkflowSourceRepoId: "",
     actor: 0,
     status: 0,
     branch: "",
@@ -367,7 +384,7 @@ describe("parseActionRunQuery (prepareWorkflowList's Form semantics)", () => {
   it("parses the five filters with junk→0 and the page floor", () => {
     expect(parseActionRunQuery(new URLSearchParams("workflow=ci.yml&actor=7&status=2&branch=main&page=3&limit=10"))).toEqual({
       workflow: "ci.yml",
-      scopedWorkflowSourceRepoId: 0,
+      scopedWorkflowSourceRepoId: "",
       actor: 7,
       status: 2,
       branch: "main",
@@ -381,7 +398,15 @@ describe("parseActionRunQuery (prepareWorkflowList's Form semantics)", () => {
     expect(junk.status).toBe(0);
     expect(junk.page).toBe(1); // floors at 1
     expect(junk.limit).toBe(ACTIONS_RUNS_PAGE_SIZE_MAX); // caps at 50
-    expect(junk.scopedWorkflowSourceRepoId).toBe(0);
+    // The scoped param is the TEXT id (the FormInt64 id-space adaptation:
+    // upstream's repositories.id is int64 — run.go:58/115 — so its junk
+    // non-numeric text PROVABLY reduces to 0; our TEXT space carries the
+    // raw verbatim and the repo-level reduction is scopedSourceRepoParam's
+    // ""/"0" at the use points, the dispatch/toggle arms' landed shape).
+    expect(junk.scopedWorkflowSourceRepoId).toBe("abc");
+    expect(parseActionRunQuery(new URLSearchParams("scoped_workflow_source_repo_id=repo-9")).scopedWorkflowSourceRepoId).toBe("repo-9");
+    expect(parseActionRunQuery(new URLSearchParams("scoped_workflow_source_repo_id=0")).scopedWorkflowSourceRepoId).toBe("0");
+    expect(parseActionRunQuery(new URLSearchParams()).scopedWorkflowSourceRepoId).toBe("");
     expect(parseActionRunQuery(new URLSearchParams()).limit).toBe(ACTIONS_RUNS_PAGE_SIZE_DEFAULT); // 30
   });
 
@@ -750,6 +775,74 @@ describe("loadRepoActionsRunsData (the rollup + filters over the M1a store)", ()
     expect(data.total).toBe(1);
     expect(data.runs.every((run) => run.link.startsWith("/alice/demo/"))).toBe(true);
   });
+
+  // --- the scoped-source row filter (the C10 row-filter wave): upstream
+  //     prepareFullPageRuns (actions.go:477-491) sets WorkflowRepoID from
+  //     the TEXT-adapted param (ToConds run_list.go:105-110 — nonempty =
+  //     the id constraint) and the is_scoped_run half ONLY for a listed
+  //     workflow (:489-491's !slices.Contains arm).
+  describe("the scoped-source row filter (actions.go:489-491 + ToConds run_list.go:105-110)", () => {
+    const listedEngine = fakeEngine({
+      branches: ["main"],
+      workflowFiles: { ".gitea/workflows/ci.yml": "on: push\njobs:\n  a:\n    steps: []\n" },
+    });
+
+    /** The scene: ci.yml LISTED (the engine serves the file), legacy.yml an
+     *  orphan; each carries a repo-level run and scoped runs from two
+     *  source repos (the producer-marked rows). */
+    async function seedScene(): Promise<void> {
+      await seedSourceRepo("repo-9", "source-nine");
+      await seedSourceRepo("repo-8", "source-eight");
+      await seedRun({ index: 1, workflowId: "ci.yml" }); // repo-level
+      await markRunScoped(await seedRun({ index: 2, workflowId: "ci.yml" }), "repo-9");
+      await markRunScoped(await seedRun({ index: 3, workflowId: "ci.yml" }), "repo-8");
+      await seedRun({ index: 4, workflowId: "legacy.yml" }); // repo-level orphan
+    }
+
+    it("the All-Workflows view lists BOTH kinds — no is_scoped_run constraint (actions.go:489-491's guard)", async () => {
+      await seedScene();
+      const data = await loadData({}, listedEngine);
+      expect(data.runs.map((run) => run.index)).toEqual([4, 3, 2, 1]);
+    });
+
+    it("a LISTED workflow with no scoped source EXCLUDES scoped runs — the repo-level arm (is_scoped_run = false)", async () => {
+      await seedScene();
+      const data = await loadData({ workflow: "ci.yml" }, listedEngine);
+      expect(data.runs.map((run) => run.index)).toEqual([1]); // scoped 2 + 3 hidden
+      const zero = await loadData({ workflow: "ci.yml", scopedWorkflowSourceRepoId: "0" }, listedEngine);
+      expect(zero.runs.map((run) => run.index)).toEqual([1]); // the posted "0" is the same arm
+    });
+
+    it("a LISTED workflow + a scoped source shows ONLY that source's runs (workflow_repo_id + is_scoped_run = true)", async () => {
+      await seedScene();
+      const nine = await loadData({ workflow: "ci.yml", scopedWorkflowSourceRepoId: "repo-9" }, listedEngine);
+      expect(nine.runs.map((run) => run.index)).toEqual([2]);
+      const eight = await loadData({ workflow: "ci.yml", scopedWorkflowSourceRepoId: "repo-8" }, listedEngine);
+      expect(eight.runs.map((run) => run.index)).toEqual([3]);
+      expect(nine.total).toBe(1);
+    });
+
+    it("a dead source id matches no row — upstream's own empty answer for a numeric-but-nonexistent id", async () => {
+      await seedScene();
+      const dead = await loadData({ workflow: "ci.yml", scopedWorkflowSourceRepoId: "repo-gone" }, listedEngine);
+      expect(dead.runs).toEqual([]);
+      expect(dead.total).toBe(0);
+    });
+
+    it("an OTHER-workflow selection carries no is_scoped_run constraint (the !slices.Contains arm)", async () => {
+      await seedScene();
+      await markRunScoped(await seedRun({ index: 5, workflowId: "legacy.yml" }), "repo-9");
+      // legacy.yml is unlisted (no file on the default branch) →
+      // otherWorkflows; the constraint is absent even with the repo-level
+      // arm posted, while the WorkflowRepoID half still applies when a
+      // source id rides (ToConds is unconditional on it).
+      const repoLevel = await loadData({ workflow: "legacy.yml", scopedWorkflowSourceRepoId: "0" }, listedEngine);
+      expect(repoLevel.runs.map((run) => run.index)).toEqual([5, 4]);
+      const scoped = await loadData({ workflow: "legacy.yml", scopedWorkflowSourceRepoId: "repo-9" }, listedEngine);
+      expect(scoped.runs.map((run) => run.index)).toEqual([5]);
+      expect(repoLevel.pageBlock?.otherWorkflows).toEqual(["legacy.yml"]);
+    });
+  });
 });
 
 // --- the DOM -----------------------------------------------------------------
@@ -846,6 +939,28 @@ describe("the runs list DOM (list.tmpl + runs_list.tmpl)", () => {
     expect(html).toContain("All actors"); // actors_no_select
     expect(html).toContain("All status");
     expect(html).toContain("All branches");
+  });
+
+  it("the filter links re-render the TEXT scoped source id verbatim and list only that source's rows (the C10 row-filter wave)", async () => {
+    await seedSourceRepo("repo-9", "source-nine");
+    const scopedId = await seedRun({ index: 1, workflowId: "ci.yml" });
+    await markRunScoped(scopedId, "repo-9");
+    await seedRun({ index: 2, workflowId: "ci.yml" }); // the repo-level row the filter hides
+    const engine = fakeEngine({
+      branches: ["main"],
+      workflowFiles: { ".gitea/workflows/ci.yml": "on: push\njobs:\n  a:\n    steps: []\n" },
+    });
+    const html = renderRepoActionsRunsPage(
+      { ...ctx, repo, repoHasActions: true },
+      await loadData({ workflow: "ci.yml", scopedWorkflowSourceRepoId: "repo-9" }, engine),
+    );
+    // Upstream re-renders its PARSED FormInt64 through every link
+    // (CurWorkflowRepoID, actions.go:710); ours re-renders the raw TEXT
+    // param — the canonical "0" only for the repo-level arm.
+    expect(html).toContain('href="/alice/demo/actions?workflow=ci.yml&amp;scoped_workflow_source_repo_id=repo-9&amp;actor=0&amp;status=0&amp;branch="');
+    // Only the source's own row survives the filter.
+    expect(html).toContain(`id="action-run-item-${scopedId}"`);
+    expect(html).not.toContain("<b>ci.yml #2</b>:");
   });
 
   it("the sidebar lists the workflows with display names and the Other-workflows disclosure", async () => {
@@ -1000,6 +1115,14 @@ describe("the runs list DOM (list.tmpl + runs_list.tmpl)", () => {
     // CanWrite gate).
     const reader = await seededHtml(engine, { workflow: "ci.yml" }, { canWriteActions: false });
     expect(reader).not.toContain("runWorkflowDispatchModal");
+    // The literal "0" post (the landed dispatch form's shape) keeps the
+    // repo-level arm; a SCOPED source selection suppresses the banner —
+    // upstream's isScoped branch (actions.go:407/425, loadScopedWorkflowModel)
+    // is the C10-remaining surface.
+    const zeroPosted = await seededHtml(engine, { workflow: "ci.yml", scopedWorkflowSourceRepoId: "0" });
+    expect(zeroPosted).toContain("runWorkflowDispatchModal");
+    const scopedSelected = await seededHtml(engine, { workflow: "ci.yml", scopedWorkflowSourceRepoId: "repo-9" });
+    expect(scopedSelected).not.toContain("runWorkflowDispatchModal");
   });
 
   it("no dispatch banner without the trigger declaration, when disabled, or unselected", async () => {

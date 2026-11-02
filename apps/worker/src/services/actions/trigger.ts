@@ -2282,6 +2282,22 @@ export interface TriggeredRunInput {
   triggerUserId: number;
   ref: string;
   commitSha: string;
+  /** run.WorkflowCommitSHA (run.go:56-59): the commit the workflow CONTENT
+   *  was read at — upstream's skeleton always fills it ("repo-level run =
+   *  the repo itself['s commit]"; dwf.SourceCommitSHA notifier_helper.go:407,
+   *  workflow.go:137's runTargetCommit, schedule_tasks.go:145's
+   *  cron.CommitSHA), while a SCOPED run carries the SOURCE repo's resolved
+   *  commit (workflow.go:266). Undefined → input.commitSha (the repo-level
+   *  posture, where the content commit IS the run commit). Feeds
+   *  github.workflow_sha (context.go:115) and the workflow_commit_sha
+   *  column. */
+  workflowSha?: string;
+  /** run.WorkflowRepoID: the repo the workflow content came from — the repo
+   *  itself for repo-level runs (notifier_helper.go:381), the source repo
+   *  for scoped (workflow.go:265). Undefined → input.repoId. */
+  workflowRepoId?: string;
+  /** run.IsScopedRun (run.go:61). Undefined → false. */
+  isScopedRun?: boolean;
   isForkPullRequest: boolean;
   event: string;
   eventPayloadJson: string;
@@ -2390,6 +2406,18 @@ export async function insertTriggeredRunSplit(
           triggerUserId: input.triggerUserId,
           ref: input.ref,
           commitSha: input.commitSha,
+          // The content-source skeleton (run.go:56-61), always filled the
+          // way upstream's run construction fills it: the repo-level
+          // default is this repo at the run commit (notifier_helper.go:381
+          // + dwf.SourceCommitSHA), a scoped caller overrides through the
+          // workflowSha/workflowRepoId/isScopedRun inputs (workflow.go:139-142
+          // + :260-263's pre-insert fields — the dispatch producer's
+          // post-insert compensation for the sha half is retired; the
+          // repo_id/is_scoped_run halves still ride the dispatch arm's
+          // post-insert UPDATE).
+          workflowRepoId: input.workflowRepoId ?? input.repoId,
+          workflowCommitSha: input.workflowSha ?? input.commitSha,
+          isScopedRun: input.isScopedRun ?? false,
           isForkPullRequest: input.isForkPullRequest,
           event: input.event,
           eventPayload: input.eventPayloadJson,
@@ -2445,7 +2473,10 @@ export async function insertTriggeredRunSplit(
         ref: input.ref,
         commitSha: input.commitSha,
         workflowId: input.workflowId,
-        workflowSha: input.commitSha, // WorkflowCommitSHA = the content commit (dwf.SourceCommitSHA)
+        // WorkflowCommitSHA = the commit the workflow CONTENT was read at
+        // (context.go:115's workflow_sha source; dwf.SourceCommitSHA on the
+        // repo-level family, workflow.go:266's source HEAD when scoped).
+        workflowSha: input.workflowSha ?? input.commitSha,
         eventName: input.triggerEvent,
         eventPayloadJson: input.eventPayloadJson,
         appUrl: input.appUrl,
@@ -2962,7 +2993,10 @@ export async function checkJobsOfRun(d1: D1Database, runId: number): Promise<voi
         ref: run.ref,
         commitSha: run.commitSha,
         workflowId: run.workflowId,
-        workflowSha: run.commitSha,
+        // context.go:115 reads run.WorkflowCommitSHA — the row column
+        // (the SOURCE sha on a scoped run); legacy rows predating the
+        // column's fill fall back to the run commit (oidc.ts:139's twin).
+        workflowSha: run.workflowCommitSha !== "" ? run.workflowCommitSha : run.commitSha,
         eventName: run.triggerEvent,
         eventPayloadJson: run.eventPayload,
         appUrl: "",

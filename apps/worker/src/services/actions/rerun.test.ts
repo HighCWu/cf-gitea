@@ -37,6 +37,7 @@ import {
   insertActionRun,
 } from "./model";
 import { parseRepoActionsConfig, saveRepoActionsConfig } from "./config";
+import { scopedWorkflowSourcesStore } from "./scoped-workflow-sources";
 import { unmarshalRawConcurrency, getArtifactAttemptIds, getFailedJobsForRerun, MAX_RERUN_ATTEMPTS, rerunWorkflowRunJobs } from "./rerun";
 
 beforeAll(async () => {
@@ -53,6 +54,7 @@ const CLEANUP_TABLES = [
   "action_tasks",
   "action_artifacts",
   "action_tasks_versions",
+  "action_scoped_workflow_source",
   "repo_units",
   "repositories",
   "users",
@@ -728,5 +730,72 @@ describe("validateRerun's arms (rerun.go:71-117) + the plan guards", () => {
     ]);
     const result = await rerunWorkflowRunJobs(env.DB, "repo-other", await runRow(seeded.runId), USER_ID, []);
     expect(result).toMatchObject({ ok: false, reason: "repo-mismatch" });
+  });
+
+  // --- the scoped-run twin (rerun.go:89-99; the web twin checkRunRerunAllowed,
+  //     view.go:929-936 — the C10 row-filter wave): a scoped run consults the
+  //     opt-out store INSTEAD of the repo-level map.
+  describe("the rerun scoped twin (rerun.go:89-99 + view.go:929-936)", () => {
+    const SRC_ID = "repo-source";
+
+    /** A done run marked the way the scoped dispatch producer writes it
+     *  (is_scoped_run + workflow_repo_id, schema.ts:4067-4069). */
+    async function seedDoneScopedRun(index = 1): Promise<{ runId: number; attemptId: number; jobIds: number[] }> {
+      const seeded = await seedRun(index, [{ jobId: "build" }]);
+      await db().update(actionRuns).set({ isScopedRun: true, workflowRepoId: SRC_ID }).where(eq(actionRuns.id, seeded.runId));
+      await finishRun(seeded.runId, seeded.attemptId, ACTION_STATUS_SUCCESS, [
+        { id: seeded.jobIds[0]!, status: ACTION_STATUS_SUCCESS },
+      ]);
+      return seeded;
+    }
+
+    async function flagOptOut(): Promise<void> {
+      await saveRepoActionsConfig(env.DB, REPO_ID, {
+        ...parseRepoActionsConfig(null),
+        disabledScopedWorkflows: { [SRC_ID]: [WORKFLOW_ID] },
+      });
+    }
+
+    it("a run whose scoped workflow is opted-out refuses with the disabled posture (rerun.go:98-99's text)", async () => {
+      await seedRepo();
+      const seeded = await seedDoneScopedRun();
+      await flagOptOut(); // flagged; NO source registration → not required → opted out
+      const result = await rerunWorkflowRunJobs(env.DB, REPO_ID, await runRow(seeded.runId), USER_ID, []);
+      expect(result).toMatchObject({
+        ok: false,
+        reason: "workflow-disabled",
+        message: `scoped workflow ${WORKFLOW_ID} is disabled`,
+      });
+    });
+
+    it("a flagged-but-REQUIRED scoped workflow reruns — the stale-flag arm (rerun.go:90-93)", async () => {
+      await seedRepo();
+      const store = scopedWorkflowSourcesStore(env.DB);
+      await store.addSource(USER_ID, SRC_ID); // the consumer owner's registration
+      await store.setSourceConfigs(USER_ID, SRC_ID, { [WORKFLOW_ID]: { required: true, patterns: ["*"] } });
+      const seeded = await seedDoneScopedRun();
+      await flagOptOut(); // a stale flag — a required workflow can never be opted out
+      const result = await rerunWorkflowRunJobs(env.DB, REPO_ID, await runRow(seeded.runId), USER_ID, []);
+      expect(result.ok).toBe(true); // the rerun proceeds
+      expect((await attemptsOfRun(seeded.runId)).length).toBe(2);
+    });
+
+    it("the arms are exclusive: an opted-out map never blocks a repo-level run, and the repo-level map never blocks a scoped run", async () => {
+      await seedRepo();
+      // A repo-level run ignores the scoped opt-out map (the else-if).
+      const plain = await seedRun(1, [{ jobId: "build" }]);
+      await finishRun(plain.runId, plain.attemptId, ACTION_STATUS_SUCCESS, [
+        { id: plain.jobIds[0]!, status: ACTION_STATUS_SUCCESS },
+      ]);
+      await flagOptOut();
+      expect((await rerunWorkflowRunJobs(env.DB, REPO_ID, await runRow(plain.runId), USER_ID, [])).ok).toBe(true);
+      // A scoped run ignores the repo-level disabled map.
+      const scoped = await seedDoneScopedRun(2); // a fresh (repo_id, index)
+      await saveRepoActionsConfig(env.DB, REPO_ID, {
+        ...parseRepoActionsConfig(null),
+        disabledWorkflows: [WORKFLOW_ID], // repo-level only — NOT consulted for a scoped run
+      });
+      expect((await rerunWorkflowRunJobs(env.DB, REPO_ID, await runRow(scoped.runId), USER_ID, [])).ok).toBe(true);
+    });
   });
 });

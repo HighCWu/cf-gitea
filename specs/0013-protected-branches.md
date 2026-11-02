@@ -783,12 +783,27 @@ is_scoped_run=false arm).
   disabled check, the effective-source gate (a miss answers the same
   `actions.workflow.not_found` translatable), the source repo row, the
   SOURCE default-branch `SCOPED_WORKFLOW_DIRS` walk with the entry-name
-  match, and the run's content-source columns written post-insert
-  (`workflow_repo_id`/`workflow_commit_sha`/`is_scoped_run` — upstream sets
-  them on the run skeleton BEFORE PrepareRunAndInsert; the shared insert
-  cannot carry them, so the scoped arm compensates with one UPDATE). The
-  first PRODUCER of the `is_scoped_run` parity column (SPEC-0012 §1.4's
-  "schema lands, nothing writes" note is superseded for this arm).
+  match, and the run's content-source columns. As LANDED (the K12
+  residual-completion amended in place): `workflow_commit_sha` rides the
+  shared insert's `workflowSha` input (the SOURCE sha on this arm, the run
+  commit on the repo-level arm — upstream's pre-insert skeleton field,
+  workflow.go:137/:266), while the post-insert UPDATE carries the
+  remaining pair `workflow_repo_id`/`is_scoped_run` (upstream sets the
+  skeleton fields BEFORE PrepareRunAndInsert; the shared input has no
+  fields for the pair yet, so the scoped arm compensates with one UPDATE).
+  The first PRODUCER of the `is_scoped_run` parity column (SPEC-0012
+  §1.4's "schema lands, nothing writes" note is superseded for this arm).
+- `services/actions/trigger.ts` (the K12 amendment) — the shared insert
+  grew the `workflowSha` input (with the repo-level `workflowRepoId`/
+  `isScopedRun` defaults: the run's own repo at its commit, false —
+  run.go:56-61's always-filled skeleton): the insert-time github context's
+  `workflow_sha` now carries run.WorkflowCommitSHA exactly (context.go:115
+  — the SOURCE sha on a scoped run, the run commit everywhere else), the
+  emitter's shared per-pass context rebuild reads the row column with the
+  legacy-'' fallback (oidc.ts:139's twin), and every repo-level row
+  (dispatch AND the push/schedule family) persists
+  `workflow_commit_sha = commit_sha`, the pin's "a repo-level dispatch's
+  row keeps them equal".
 - `ui/pages/repo-actions-runs.tsx` — the "Other workflows" listing
   excludes scoped runs (`is_scoped_run = false`), GetRepoRunWorkflowIDs'
   arm made load-bearing by the new producer.
@@ -799,38 +814,64 @@ is_scoped_run=false arm).
   instance- and owner-level effectiveness, the missing-entry not-found,
   the opt-out disabled answer, the required workflow dispatching anyway,
   the store/engine throw arms, the shared validation ladder over the
-  SOURCE content, the persisted content-source columns).
+  SOURCE content, the persisted content-source columns, the repo-level
+  row's equal-sha posture, and the insert-time github context split
+  (run-name interpolation: `workflow_sha` = the SOURCE HEAD, `sha` = the
+  consumer commit); `services/actions/trigger.test.ts` adds the shared
+  insert's trio defaults and the `workflowSha` input's split (K12)).
+
+**Landed (the Wave K11 follow-on, 2026-11-03 — K4's two one-away residuals):**
+
+- The runs-list per-run FILTER by `scoped_workflow_source_repo_id`
+  (upstream `actions.go:477-491` prepareFullPageRuns + ToConds
+  `run_list.go:105-110`; the API twin `shared/action.go:143-146` stays the
+  API family's own wave). THE DECISION, by the pin: upstream's FormInt64
+  parse exists BECAUSE its repositories.id is int64 (`run.go:58`
+  WorkflowRepoID, `run.go:115`'s `%d` link) — the numeric form is its
+  id-space fact, not its filter semantics; our TEXT id space cannot carry
+  a source id through it, so the page's param flipped to the RAW TEXT
+  (the dispatch/toggle arms' landed parse adaptation:
+  config.ts's `scopedSourceRepoParam` — ""/"0" is the repo-level arm =
+  upstream's parsed zero; a dead id rides the scoped arm to an empty set,
+  upstream's own answer for a numeric-but-nonexistent id; the junk→0
+  RENDERING canonicalization survives as the block's raw-or-"0"). The
+  CONSTRAINTS are upstream-exact: `workflow_repo_id = param` whenever it
+  names a source, and `is_scoped_run = (param is a source id)` ONLY for a
+  LISTED workflow (`actions.go:489-491`'s
+  `!slices.Contains(otherWorkflows, ...)` — the All-Workflows view and an
+  other-workflow selection list both kinds). otherWorkflows hoisted above
+  the runs query (upstream's List order) to feed that arm; the renderings
+  carry the TEXT id verbatim (CurWorkflowRepoID, actions.go:710), the
+  four `scoped_workflow_source_repo_id=0` wire pins unchanged, the
+  re-baselined matrix pins cite the id-space adaptation, and the runs
+  page's dispatch-banner gate sits on the repo-level arm explicitly. Files:
+  `ui/pages/repo-actions-runs.tsx` + its matrix test.
+- The rerun scoped twin (`view.go:929-936` checkRunRerunAllowed +
+  `rerun.go:89-102` validateRerun): `run.IsScopedRun` consults the
+  opt-out store INSTEAD of the repo-level map — the exported
+  `isScopedWorkflowOptedOut` over the run's own content-source columns
+  (`workflowRepoId`), the required-workflow stale-flag arm included (a
+  required scoped workflow reruns past a stale flag, rerun.go:90-93), the
+  refusal text `scoped workflow {id} is disabled` (rerun.go:98-99) under
+  the same `workflow-disabled` rejection (the InvalidArgument class both
+  upstream handlers map to their disabled posture). One guard in
+  `services/actions/rerun.ts`'s validateRerun — the web handler funnels
+  through it. Files: `services/actions/rerun.ts` + its test.
 
 **Recorded (NOT staged — each cites why):**
 
-- The runs-list per-run FILTER by `scoped_workflow_source_repo_id`
-  (upstream `actions.go:454-460`: `WorkflowRepoID` + `IsScopedRun`
-  constraints on FindRunOptions; the API twin `shared/action.go:143-146`).
-  The upstream param is FormInt64 over an int64 repo-id space; ours is
-  TEXT — the numeric parse landed on the page (junk → 0, the matrix pins)
-  cannot carry a TEXT source id, and flipping the param's type breaks the
-  pinned wire (`=0` renderings, junk→0) in files outside the unit's
-  ownership. Staging waits for a wave that owns the runs page + its
-  matrix pins together; the filter links' passthrough shape is unchanged.
 - The sidebar's scoped-workflow groups (sidebar.tmpl:17-34,
   `actions.go:296-366` prepareScopedWorkflows) and the scoped dispatch
   banner (prepareWorkflowDispatchTemplate's `loadScopedWorkflowModel`,
   actions.go:372-406) — the C10 pages' remaining surface; they need the
   source-repo parse/cache layer and the scoped engine binding on the page.
-- The rerun scoped twin (view.go:929-936: `run.IsScopedRun` →
-  IsScopedWorkflowOptedOut) — rerun.ts/repo-actions-view.tsx were outside
-  the unit's ownership; the check it needs
-  (`isScopedWorkflowOptedOut`) is exported by config.ts now, so the wire
-  is one guard away.
+- The API twin of the runs filter (`shared/action.go:143-146`) — the
+  api/routes/repo-actions family's own surface (its in-flight wave's
+  files); the page arm above is the wire the frontend uses.
 - The workflow-toggle and dispatch AUDIT emits (RecordWorkflowToggle,
   workflow.go:46-52/205-206) — unchanged deferral: the
   `actions:workflow:{enable,disable,dispatch}` ids are not in the landed
   AuditActions table.
-- The github context's `workflow_sha` on a scoped run carries the
-  CONSUMER commitSha (the shared insert derives it from the run's commit,
-  trigger.ts) where upstream carries run.WorkflowCommitSHA (context.go:115
-  — the SOURCE sha). The run COLUMNS are correct; only the context field
-  diverges until the insert grows a workflowSha input.
 - The upstream parse-first nuance: ParseScopedWorkflows drops files whose
   `on:` fails to decode BEFORE the entry match (scoped_workflows.go:50-52);
   ours matches by name first and applies the light validation after, so a
@@ -848,4 +889,9 @@ where the dispatch's effective-source gate answers not-found and the
 toggle writes a dead opt-out key (admin-only, exactly what upstream's
 deliberate nonexistent-source opt-out writes). Numeric non-zero ids ride
 the scoped arm and answer not-found — upstream's identical wire answer
-for a nonexistent numeric repo, reached through the same gate.
+for a nonexistent numeric repo, reached through the same gate. The K11
+runs-page filter joins the same class: a bogus non-empty param filters
+`workflow_repo_id = dead` to an empty set (upstream's junk→0 would list
+the repo-level rows; our TEXT space cannot syntactically separate junk
+from a candidate id — the empty set IS upstream's answer for a
+numeric-but-nonexistent source).

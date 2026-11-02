@@ -79,15 +79,19 @@
  *   renders (the ⑲A3 row) — the route landed with C6.
  * - Scoped-workflow groups (sidebar.tmpl:17-34) defer with C10 (SPEC-0012
  *   keeps scoped workflows post-M3); the `scoped_workflow_source_repo_id`
- *   param parses (junk → 0 — FormInt64) and rides the filter links' shape.
- *   The C10 half-stage lands the PRODUCER side (services/actions/
- *   workflow-dispatch.ts writes is_scoped_run/workflow_repo_id on scoped
- *   dispatches) and this page's GetRepoRunWorkflowIDs twin excludes those
- *   rows from "Other workflows" (run_list.go:198-200); the per-run row
- *   FILTER by the param stays the recorded reduction — the numeric
- *   FormInt64 parse cannot carry our TEXT source-repo ids (SPEC-0013
- *   as-built), so `Other workflows`-orphan semantics are the only staged
- *   listing arm.
+ *   param is the TEXT source-repo id — the id-space adaptation of upstream's
+ *   FormInt64 (its repositories.id is int64: run.go:58's WorkflowRepoID,
+ *   run.go:115's %d link; ours is TEXT, schema.ts's workflow_repo_id) with
+ *   config.ts's scopedSourceRepoParam reduction: ""/"0" is the repo-level
+ *   arm, exactly upstream's parsed zero. The per-run ROW filter is LANDED
+ *   (actions.go:489-491 + ToConds run_list.go:105-110): a listed workflow's
+ *   selection constrains is_scoped_run to the arm the param names and, on
+ *   the scoped arm, the source id itself; the All-Workflows view and an
+ *   other-workflow selection carry no is_scoped_run constraint (upstream
+ *   sets the option only under the !slices.Contains arm). The dispatch
+ *   banner stays the repo-level arm (prepareWorkflowDispatchTemplate's
+ *   isScoped branch — loadScopedWorkflowModel — defers with the C10
+ *   sidebar/banner wave).
  * - The workflow DISABLED red label (sidebar.tmpl:12-14) and the
  *   disable/enable kebab item (list.tmpl:88-92) ride the LANDED repo
  *   ActionsConfig store (services/actions/config.ts — the ⑲A5 row); the
@@ -133,7 +137,7 @@ import { renderToString } from "hono/jsx/dom/server";
 import { parse as yamlParse } from "yaml";
 
 import { actionRunJobs, actionRunners, actionRuns, users } from "../../db/schema";
-import { loadRepoActionsConfig } from "../../services/actions/config";
+import { loadRepoActionsConfig, scopedSourceRepoParam } from "../../services/actions/config";
 import {
   ACTION_STATUS_BLOCKED,
   ACTION_STATUS_CANCELLED,
@@ -360,7 +364,15 @@ export function refTooltipOf(ref: string, eventPayload: string): string {
 
 // ---------------------------------------------------------------------------
 // The query parse (prepareWorkflowList, actions.go:624-638 — Go FormInt64/
-// FormInt semantics: junk/absent → 0; `page` floors at 1; ToCorrectPageSize)
+// FormInt semantics: junk/absent → 0; `page` floors at 1; ToCorrectPageSize).
+// The `scoped_workflow_source_repo_id` exception: upstream parses FormInt64
+// BECAUSE its repositories.id is int64 (run.go:58/115); ours is TEXT, so the
+// param rides VERBATIM (the raw FormString — the same parse adaptation the
+// dispatch/toggle arms landed) and config.ts's scopedSourceRepoParam does
+// the zero-reduction at the use points: ""/"0" is the repo-level arm
+// (upstream's parsed 0), any other text is a source-id candidate whose
+// deadness polices downstream (workflow_repo_id = dead matches no row —
+// upstream's own answer for a numeric-but-nonexistent id).
 // ---------------------------------------------------------------------------
 
 /** Upstream setting.API defaults (modules/setting/api.go:18-19). */
@@ -369,7 +381,10 @@ export const ACTIONS_RUNS_PAGE_SIZE_MAX = 50;
 
 export interface ActionRunListQuery {
   workflow: string;
-  scopedWorkflowSourceRepoId: number;
+  /** The RAW param text — "" absent, "0" the repo-level post, else the TEXT
+   *  source-repo id (the FormInt64 id-space adaptation; see the block
+   *  comment). */
+  scopedWorkflowSourceRepoId: string;
   actor: number;
   status: number;
   branch: string;
@@ -397,7 +412,7 @@ export function parseActionRunQuery(params: URLSearchParams): ActionRunListQuery
     .filter((n) => !Number.isNaN(n));
   return {
     workflow: params.get("workflow") ?? "",
-    scopedWorkflowSourceRepoId: intParam("scoped_workflow_source_repo_id"),
+    scopedWorkflowSourceRepoId: params.get("scoped_workflow_source_repo_id") ?? "",
     actor: intParam("actor"),
     status: intParam("status"),
     branch: params.get("branch") ?? "",
@@ -603,7 +618,11 @@ export interface RepoActionsRunsPageBlock {
   curActor: number;
   curStatus: number;
   curBranch: string;
-  curWorkflowRepoId: number;
+  /** The rendered `scoped_workflow_source_repo_id` — upstream's parsed
+   *  FormInt64 re-rendered through the templates (junk → "0"): ours renders
+   *  the raw TEXT param, or "0" when absent (the canonical repo-level
+   *  rendering). */
+  curWorkflowRepoId: string;
   hasWorkflowsOrRuns: boolean;
   canWriteActions: boolean;
   canWriteCode: boolean;
@@ -704,9 +723,36 @@ export async function loadRepoActionsRunsData(input: RepoActionsRunsInput): Prom
     workflowNames[wf.entryName] = wf.displayName;
   }
 
+  // prepareOtherWorkflows (actions.go:146-171) — hoisted ABOVE the runs query
+  // (upstream's List order: prepareOtherWorkflows → prepareFullPageRuns)
+  // because the row filter's IsScopedRun arm needs the other-workflow set
+  // (actions.go:489-491's !slices.Contains). Distinct repo-level run
+  // workflow ids not in the listed set (GetRepoRunWorkflowIDs — run_list.go:
+  // 198-200's is_scoped_run=false arm; the C10 half-stage's dispatch producer
+  // now WRITES is_scoped_run=true rows, so the exclusion is load-bearing).
+  // The fragment arm never computes it (upstream returns before the prepare
+  // chain); the empty array is unread there.
+  const otherWorkflows = query.partialRefresh
+    ? []
+    : (
+        await db
+          .selectDistinct({ workflowId: actionRuns.workflowId })
+          .from(actionRuns)
+          .where(and(eq(actionRuns.repoId, repo.id), eq(actionRuns.isScopedRun, false)))
+      )
+        .map((row) => row.workflowId)
+        .filter((id) => id !== "" && !(id in workflowNames))
+        .sort();
+
+  // The scoped param's zero-reduction (scopedSourceRepoParam): ""/"0" is the
+  // repo-level arm — exactly upstream's FormInt64 parsed 0 (actions.go:629).
+  const scopedSourceId = scopedSourceRepoParam(query.scopedWorkflowSourceRepoId);
+
   let runRows: RunRow[];
   if (query.partialRefresh) {
     // preparePartialRefreshRuns: ids ∩ repo, request order, misses dropped.
+    // (Upstream's GetRunsByRepoAndID carries no scoped constraint — the
+    // client morphs exactly these rows.)
     if (query.refreshRunIds.length === 0) {
       runRows = [];
     } else {
@@ -728,6 +774,17 @@ export async function loadRepoActionsRunsData(input: RepoActionsRunsInput): Prom
     if (query.workflow !== "") conds.push(eq(actionRuns.workflowId, query.workflow));
     if (query.actor > 0) conds.push(eq(actionRuns.triggerUserId, query.actor));
     if (query.branch !== "") conds.push(eq(actionRuns.ref, `refs/heads/${query.branch}`));
+    // The scoped-source row filter (actions.go:483-491 + ToConds run_list.go:
+    // 105-110). WorkflowRepoID rides whenever the param names a source (0 =
+    // any, upstream's comment on the option); the is_scoped_run half
+    // constrains ONLY for a LISTED workflow — the All-Workflows view and an
+    // other-workflow selection list both kinds (upstream sets the option
+    // only under `workflowID != "" && !slices.Contains(otherWorkflows, ...)`;
+    // an other-workflow's link never carries the param).
+    if (scopedSourceId !== "") conds.push(eq(actionRuns.workflowRepoId, scopedSourceId));
+    if (query.workflow !== "" && !otherWorkflows.includes(query.workflow)) {
+      conds.push(eq(actionRuns.isScopedRun, scopedSourceId !== ""));
+    }
     runRows = await db
       .select()
       .from(actionRuns)
@@ -893,19 +950,8 @@ export async function loadRepoActionsRunsData(input: RepoActionsRunsInput): Prom
   // ---- the full-page block (prepareOtherWorkflows + prepareFullPageTemplate)
   let pageBlock: RepoActionsRunsPageBlock | null = null;
   if (!query.partialRefresh) {
-    // prepareOtherWorkflows: distinct repo-level run workflow ids not in the
-    // listed set (GetRepoRunWorkflowIDs — run_list.go:198-200's
-    // is_scoped_run=false arm; the C10 half-stage's dispatch producer now
-    // WRITES is_scoped_run=true rows, so the exclusion is load-bearing).
-    const otherWorkflows = (
-      await db
-        .selectDistinct({ workflowId: actionRuns.workflowId })
-        .from(actionRuns)
-        .where(and(eq(actionRuns.repoId, repo.id), eq(actionRuns.isScopedRun, false)))
-    )
-      .map((row) => row.workflowId)
-      .filter((id) => id !== "" && !(id in workflowNames))
-      .sort();
+    // otherWorkflows was computed above the runs query (the row filter's
+    // !slices.Contains arm — actions.go:489-491); the block reuses it.
 
     // The ActionsConfig read (prepareWorkflowTemplate's MustGetUnit arm —
     // ctx.Data["ActionsConfig"]): the sidebar's disabled red labels
@@ -921,12 +967,14 @@ export async function loadRepoActionsRunsData(input: RepoActionsRunsInput): Prom
     // the selected workflow + a writer + the repo-level arm + the enabled
     // check, then the file's parse — the banner renders only when the
     // dispatch declaration exists (list.tmpl:99's .WorkflowDispatchConfig
-    // gate). The parse is the landed fragment parser (the module header's
-    // single-parse note: upstream derives this from the SAME ReadWorkflow
-    // pass the sidebar uses; our light name-parse is a separate pass, so
-    // the selected file parses twice — one extra yaml read, full page only).
+    // gate). Upstream's isScoped branch (loadScopedWorkflowModel,
+    // actions.go:407/425) is the C10-remaining surface. The parse is the
+    // landed fragment parser (the module header's single-parse note:
+    // upstream derives this from the SAME ReadWorkflow pass the sidebar
+    // uses; our light name-parse is a separate pass, so the selected file
+    // parses twice — one extra yaml read, full page only).
     let workflowDispatch: { inputs: WorkflowDispatchInput[] } | null = null;
-    if (canWriteActions && query.workflow !== "" && query.scopedWorkflowSourceRepoId === 0 && !disabledWorkflows.includes(query.workflow)) {
+    if (canWriteActions && query.workflow !== "" && scopedSourceId === "" && !disabledWorkflows.includes(query.workflow)) {
       const selected = workflows.find((wf) => wf.entryName === query.workflow);
       if (selected !== undefined && selected.errMsg === null) {
         const content = await readWorkflowContent(engine, repo.defaultBranch, query.workflow);
@@ -980,6 +1028,11 @@ export async function loadRepoActionsRunsData(input: RepoActionsRunsInput): Prom
 
     const canWriteCode = canWriteActions; // the code unit is not toggleable in our store (the reduction)
     const hasWorkflowsOrRuns = workflows.length > 0 || otherWorkflows.length > 0 || total > 0;
+    // The rendered param (curWorkflowRepoID, actions.go:710): upstream
+    // re-renders its PARSED FormInt64 (absent/junk → "0"); ours renders the
+    // raw TEXT param verbatim — the parse adaptation — with "" (absent) and
+    // "0" (the posted repo-level shape) both rendering the canonical "0".
+    const curWorkflowRepoId = query.scopedWorkflowSourceRepoId === "" ? "0" : query.scopedWorkflowSourceRepoId;
     pageBlock = {
       workflows,
       otherWorkflows,
@@ -988,7 +1041,7 @@ export async function loadRepoActionsRunsData(input: RepoActionsRunsInput): Prom
       curActor: query.actor,
       curStatus: query.status,
       curBranch: query.branch,
-      curWorkflowRepoId: query.scopedWorkflowSourceRepoId,
+      curWorkflowRepoId,
       hasWorkflowsOrRuns,
       canWriteActions,
       canWriteCode,
@@ -1209,15 +1262,16 @@ function RunsList(props: { repoLink: string; data: RepoActionsRunsData }) {
 
 /** The filter bar's href helper — every dropdown item carries the FULL
  *  filter set with exactly its own slot rewritten (list.tmpl:27-77's
- *  five-param query shape). */
+ *  five-param query shape). The scoped param rides the TEXT id verbatim
+ *  (the block's canonical "0" for the repo-level arm). */
 function filterHref(
   basePath: string,
-  cur: { workflow: string; workflowRepoId: number; actor: number; status: number; branch: string },
+  cur: { workflow: string; workflowRepoId: string; actor: number; status: number; branch: string },
   patch: Partial<{ actor: number; status: number; branch: string }>,
 ): string {
   const params = new URLSearchParams();
   params.set("workflow", cur.workflow);
-  params.set("scoped_workflow_source_repo_id", String(cur.workflowRepoId));
+  params.set("scoped_workflow_source_repo_id", cur.workflowRepoId);
   params.set("actor", String(patch.actor ?? cur.actor));
   params.set("status", String(patch.status ?? cur.status));
   params.set("branch", patch.branch ?? cur.branch);
@@ -1275,7 +1329,7 @@ function ActionsSidebar(props: { repoLink: string; data: RepoActionsRunsData }) 
                 <a
                   key={name}
                   class={props.data.curWorkflow === name ? "item active" : "item"}
-                  href={filterHref(`${props.repoLink}/actions`, { ...carried, workflow: name, workflowRepoId: 0 }, {})}
+                  href={filterHref(`${props.repoLink}/actions`, { ...carried, workflow: name, workflowRepoId: "0" }, {})}
                 >
                   <span class="gt-ellipsis" data-tooltip-content={name}>
                     {name}
@@ -1388,7 +1442,7 @@ function RunsFilterMenu(props: { repoLink: string; data: RepoActionsRunsData }) 
                 class="item link-action"
                 data-url={`${basePath}/${block.disabledWorkflows.includes(props.data.curWorkflow) ? "enable" : "disable"}?${new URLSearchParams({
                   workflow: props.data.curWorkflow,
-                  scoped_workflow_source_repo_id: String(block.curWorkflowRepoId),
+                  scoped_workflow_source_repo_id: block.curWorkflowRepoId,
                   actor: String(block.curActor),
                   status: String(block.curStatus),
                   branch: block.curBranch,
@@ -1408,9 +1462,10 @@ function RunsFilterMenu(props: { repoLink: string; data: RepoActionsRunsData }) 
 
 /** $showCreateWorkflowBadge (list.tmpl:3): WorkflowBadge is set exactly for
  *  a selected REPO-LEVEL workflow (prepareFullPageTemplate's scoped guard +
- *  prepareWorkflowBadgeTemplate's empty-id arm). */
+ *  prepareWorkflowBadgeTemplate's empty-id arm) — the canonical "0" param
+ *  rendering, i.e. not a scoped-source selection. */
 function showCreateWorkflowBadge(data: RepoActionsRunsData): boolean {
-  return data.curWorkflow !== "" && data.pageBlock !== null && data.pageBlock.curWorkflowRepoId === 0;
+  return data.curWorkflow !== "" && data.pageBlock !== null && data.pageBlock.curWorkflowRepoId === "0";
 }
 
 /** $showEnableDisableWorkflow (list.tmpl:4): admin + listed + selected. */
@@ -1432,7 +1487,7 @@ function RunsListPagination(props: { basePath: string; data: RepoActionsRunsData
   const href = (page: number): string => {
     const params = new URLSearchParams();
     params.set("workflow", props.data.curWorkflow);
-    params.set("scoped_workflow_source_repo_id", String(block.curWorkflowRepoId));
+    params.set("scoped_workflow_source_repo_id", block.curWorkflowRepoId);
     params.set("actor", String(block.curActor));
     params.set("status", String(block.curStatus));
     params.set("branch", block.curBranch);
@@ -1470,11 +1525,11 @@ function WorkflowDispatchBanner(props: { basePath: string; curWorkflow: string; 
   const { block } = props;
   const fetchUrl = `${props.basePath}/workflow-dispatch-inputs?${new URLSearchParams({
     workflow: props.curWorkflow,
-    scoped_workflow_source_repo_id: String(block.curWorkflowRepoId),
+    scoped_workflow_source_repo_id: block.curWorkflowRepoId,
   }).toString()}`;
   const action = `${props.basePath}/run?${new URLSearchParams({
     workflow: props.curWorkflow,
-    scoped_workflow_source_repo_id: String(block.curWorkflowRepoId),
+    scoped_workflow_source_repo_id: block.curWorkflowRepoId,
     actor: String(block.curActor),
     status: String(block.curStatus),
     branch: block.curBranch,

@@ -713,6 +713,13 @@ describe("insertTriggeredRun (InsertRun rows + index + statuses)", () => {
     expect(run.status).toBe(ACTION_STATUS_WAITING);
     expect(run.workflowId).toBe(".github/workflows/ci.yml");
     expect(run.triggerEvent).toBe("push");
+    // The content-source trio at the repo-level default (run.go:56-61's
+    // always-filled skeleton: the repo itself at the run commit; dwf.
+    // SourceCommitSHA = the walked commit = CommitSHA on this family).
+    expect(run.workflowRepoId).toBe(REPO_ID);
+    expect(run.workflowCommitSha).toBe(TIP);
+    expect(run.commitSha).toBe(TIP);
+    expect(run.isScopedRun).toBe(false);
 
     const attempts = await db().select().from(actionRunAttempts).where(eq(actionRunAttempts.runId, run.id));
     expect(attempts).toHaveLength(1);
@@ -871,6 +878,40 @@ jobs:
     // the consumed index rolled back — the next run is 1 again
     const next = await insertTriggeredRun(env.DB, runInput(".github/workflows/ok.yml"), "on: push\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: y\n");
     expect(next.run.index).toBe(1);
+  });
+
+  it("the workflowSha input splits the content commit from the run commit (run.WorkflowCommitSHA vs CommitSHA, context.go:115)", async () => {
+    await seedRepo();
+    // The scoped-dispatch posture: commitSha = the consumer ref's commit,
+    // workflowSha = the SOURCE repo's resolved content commit (workflow.go:
+    // 266). The run-name interpolates both fields out of the insert-time
+    // github context.
+    const SOURCE_SHA = "f".repeat(40);
+    const { run } = await insertTriggeredRun(
+      env.DB,
+      {
+        ...runInput(".github/workflows/ci.yml"),
+        workflowSha: SOURCE_SHA,
+      },
+      `run-name: "\${{ github.workflow_sha }} \${{ github.sha }}"
+on: push
+jobs:
+  build:
+    runs-on: x
+    steps:
+      - run: y
+`,
+    );
+    expect(run.title).toBe(`${SOURCE_SHA} ${TIP}`); // workflow_sha = the content commit, sha = the run commit
+    expect(run.commitSha).toBe(TIP);
+    expect(run.workflowCommitSha).toBe(SOURCE_SHA);
+    expect(run.workflowRepoId).toBe(REPO_ID); // the repo_id half defaults to the run's repo...
+    expect(run.isScopedRun).toBe(false); // ...the scoped caller's UPDATE still owns it (workflow-dispatch.ts)
+
+    // The row persists the split.
+    const row = (await db().select().from(actionRuns).where(eq(actionRuns.id, run.id)))[0];
+    expect(row?.workflowCommitSha).toBe(SOURCE_SHA);
+    expect(row?.commitSha).toBe(TIP);
   });
 
   it("E4 — a literal workflow-level concurrency blocks the second run of the group", async () => {

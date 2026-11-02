@@ -154,9 +154,22 @@ describe("dispatchWorkflow (workflow.go:64-199's repo-level arm, the ⑲A4 produ
     expect(outcome.run.commitSha).toBe(SHA);
     expect(outcome.run.isForkPullRequest).toBe(false);
     expect(outcome.run.status).toBe(ACTION_STATUS_WAITING);
+    // The content-source trio at the repo-level posture (workflow.go:136-137's
+    // skeleton: WorkflowRepoID = the repo itself, WorkflowCommitSHA = the run
+    // target commit — the two shas stay EQUAL; IsScopedRun false).
+    expect(outcome.run.workflowCommitSha).toBe(SHA);
+    expect(outcome.run.workflowRepoId).toBe(REPO_ID);
+    expect(outcome.run.isScopedRun).toBe(false);
     const jobs = await db().select().from(actionRunJobs).where(eq(actionRunJobs.runId, outcome.run.id));
     expect(jobs.length).toBe(1);
     expect(jobs[0]?.status).toBe(ACTION_STATUS_WAITING);
+    // The persisted row keeps the equal-sha posture (the pin: a repo-level
+    // dispatch's workflow_commit_sha = its commit_sha).
+    const row = await db().select().from(actionRuns).where(eq(actionRuns.id, outcome.run.id)).get();
+    expect(row?.workflowCommitSha).toBe(SHA);
+    expect(row?.commitSha).toBe(SHA);
+    expect(row?.workflowRepoId).toBe(REPO_ID);
+    expect(row?.isScopedRun).toBe(false);
   });
 
   it("a bare branch ref re-reads as refs/heads/<branch> (workflow.go:113-115's RefNameFromBranch arm); the payload keeps the RAW ref", async () => {
@@ -315,9 +328,28 @@ describe("dispatchWorkflow's scoped arm (resolveScopedDispatchContent, workflow.
     const row = await db().select().from(actionRuns).where(eq(actionRuns.id, outcome.run.id)).get();
     expect(row?.isScopedRun).toBe(true); // the post-insert UPDATE persisted it
     expect(row?.workflowRepoId).toBe(SRC_ID);
-    expect(row?.workflowCommitSha).toBe(SRC_SHA);
+    expect(row?.workflowCommitSha).toBe(SRC_SHA); // the insert's workflowSha input persisted it
     const jobs = await db().select().from(actionRunJobs).where(eq(actionRunJobs.runId, outcome.run.id));
     expect(jobs.length).toBe(1);
+  });
+
+  it("the insert-time github context splits the shas: workflow_sha carries the SOURCE commit while sha keeps the consumer's (context.go:115)", async () => {
+    await registerSource(0); // instance-level
+    // run-name interpolates the two context fields at insert (the E2 pass
+    // reads the exact github context the residual was recorded against).
+    const content = `run-name: "\${{ github.workflow_sha }} \${{ github.sha }}"
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    steps: []
+`;
+    const outcome = await dispatchScoped({ ".gitea/scoped_workflows/ci.yml": content });
+    expect(outcome.status).toBe("ok");
+    if (outcome.status !== "ok") return;
+    expect(outcome.run.title).toBe(`${SRC_SHA} ${SHA}`); // workflow_sha = the SOURCE HEAD, sha = the CONSUMER commit
+    expect(outcome.run.commitSha).toBe(SHA);
+    expect(outcome.run.workflowCommitSha).toBe(SRC_SHA);
   });
 
   it("an OWNER-level registration is equally effective; the workflow entry must exist on the source's default branch", async () => {

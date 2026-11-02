@@ -66,7 +66,7 @@ import { drizzle } from "drizzle-orm/d1";
 import { isMap, isScalar, parseDocument, type Node as YamlNode } from "yaml";
 
 import { actionArtifacts, actionRunAttempts, actionRunJobs, actionRuns, repositories } from "../../db/schema";
-import { loadRepoActionsConfig } from "./config";
+import { isScopedWorkflowOptedOut, loadRepoActionsConfig } from "./config";
 import {
   ACTION_STATUS_BLOCKED,
   ACTION_STATUS_PENDING,
@@ -152,7 +152,9 @@ export type RerunRejection =
   | "job-not-in-run"
   /** rerun.go:86-88 — trigger user required (internal misuse). */
   | "trigger-user-required"
-  /** rerun.go:100-102 — cfg.IsWorkflowDisabled(run.WorkflowID). */
+  /** rerun.go:89-102 — the repo-level map (cfg.IsWorkflowDisabled) or the
+   *  scoped twin (run.IsScopedRun → IsScopedWorkflowOptedOut over the run's
+   *  WorkflowRepoID; the web twin view.go:929-936). */
   | "workflow-disabled"
   /** rerun.go:104-114 — the latest attempt is already at MAX_RERUN_ATTEMPTS. */
   | "max-attempts"
@@ -240,12 +242,21 @@ export async function validateRerun(
   if (triggerUserId <= 0) {
     return rejected("trigger-user-required", "trigger user is required"); // rerun.go:86-88
   }
-  // The workflow-disabled arm (rerun.go:89-102). The scoped-run twin
-  // (IsScopedWorkflowOptedOut, rerun.go:91-99) is scoped-workflows substrate
-  // that does not exist here (SPEC §1.4; v1 rows never carry isScopedRun) —
-  // the plain DisableWorkflow map is the only readable arm.
+  // The workflow-disabled arm (rerun.go:89-102): a scoped run consults the
+  // opt-out store INSTEAD of the repo-level map — IsScopedWorkflowOptedOut
+  // (flagged disabled AND not required, the unflagged early-out) over the
+  // run's own content-source columns (run.WorkflowRepoID, run.IsScopedRun);
+  // "a required scoped workflow can never be opted out, so a stale disabled
+  // flag must not block rerun" (rerun.go:90-99, the landed
+  // isScopedWorkflowOptedOut in config.ts). The web handler's twin gate
+  // (checkRunRerunAllowed, view.go:929-936) funnels through this validation
+  // — one guard, the same disabled posture as dispatch.
   const cfg = await loadRepoActionsConfig(d1, run.repoId);
-  if (cfg.disabledWorkflows.includes(run.workflowId)) {
+  if (run.isScopedRun) {
+    if (await isScopedWorkflowOptedOut(d1, cfg, run.ownerId, run.workflowRepoId, run.workflowId)) {
+      return rejected("workflow-disabled", `scoped workflow ${run.workflowId} is disabled`); // rerun.go:98-99's text
+    }
+  } else if (cfg.disabledWorkflows.includes(run.workflowId)) {
     return rejected("workflow-disabled", `workflow ${run.workflowId} is disabled`); // rerun.go:100-102
   }
   // The attempts cap (rerun.go:104-114): legacy runs (latestAttemptId == 0)
