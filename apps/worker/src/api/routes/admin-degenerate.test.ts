@@ -209,12 +209,13 @@ describe("adminCronList (GET /admin/cron)", () => {
   it("renders the full arm census under upstream's Cron shape (zero state when nothing recorded)", async () => {
     const res = await adminSend("/admin/cron", authed());
     expect(res.status).toBe(200);
-    // The census: the step entry's four arms, then the hourly entry's seven
+    // The census: the step entry's four arms, then the hourly entry's eight
     // (services/cron-state.ts CRON_ARMS order — the monitor's render order;
-    // the hourly census gained the auto_merge_due_scan producer, 79a94f9).
-    expect(res.headers.get("X-Total-Count")).toBe("11");
+    // the hourly census gained the auto_merge_due_scan producer, 79a94f9,
+    // and the cleanup_hook_task_table producer, 870c9b3).
+    expect(res.headers.get("X-Total-Count")).toBe("12");
     const list: Record<string, unknown>[] = await res.json();
-    expect(list).toHaveLength(11);
+    expect(list).toHaveLength(12);
     expect(list.map((entry) => entry.name)).toEqual([
       "update_mirrors",
       "update_push_mirrors",
@@ -227,12 +228,14 @@ describe("adminCronList (GET /admin/cron)", () => {
       "auto_merge_due_scan",
       "cancel_abandoned_jobs",
       "cleanup_ephemeral_runners",
+      "cleanup_hook_task_table",
     ]);
     expect(list.map((entry) => entry.schedule)).toEqual([
       "*/10 * * * *",
       "*/10 * * * *",
       "*/10 * * * *",
       "*/10 * * * *",
+      "0 * * * *",
       "0 * * * *",
       "0 * * * *",
       "0 * * * *",
@@ -284,7 +287,7 @@ describe("adminCronList (GET /admin/cron)", () => {
   it("paginates like upstream (page beyond the set → empty, total kept)", async () => {
     const page2 = await adminSend("/admin/cron?page=2&limit=5", authed());
     expect(page2.status).toBe(200);
-    expect(page2.headers.get("X-Total-Count")).toBe("11");
+    expect(page2.headers.get("X-Total-Count")).toBe("12");
     const page2List: Record<string, unknown>[] = await page2.json();
     expect(page2List.map((entry) => entry.name)).toEqual([
       "delete_old_audit_events",
@@ -319,13 +322,19 @@ describe("adminCronRun (POST /admin/cron/{task})", () => {
   it("404s a listed-but-unrunnable census arm exactly like an unknown task, recording nothing", async () => {
     // Every actions-family census arm IS in the list's census (its producer
     // module — services/actions/** — is an in-flight sibling's ownership) —
-    // the run gate answers the same 404 for all five.
+    // the run gate answers the same 404 for all five. So does
+    // cleanup_hook_task_table FOR NOW: its producer is landed (870c9b3) and
+    // the monitor page's dispatch map already runs it, but THIS registry's
+    // twin entry is the pending one-liner (the census row's boundary grant
+    // covered the UI module only) — extending this map drops it from this
+    // loop and gains the runnable-tick test.
     for (const task of [
       "stop_zombie_tasks",
       "cleanup_actions",
       "stop_endless_tasks",
       "cancel_abandoned_jobs",
       "cleanup_ephemeral_runners",
+      "cleanup_hook_task_table",
     ]) {
       const res = await adminSend(`/admin/cron/${task}`, authed({ method: "POST" }));
       expect(res.status, task).toBe(404);

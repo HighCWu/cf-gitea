@@ -75,17 +75,21 @@
  *            merges the recorded state; the swap is the disclosed
  *            integration — ui/index.ts is outside this module's ownership).
  *            The run arm is the landed RUN-CAPABLE subset — exactly
- *            admin-degenerate.ts's CRON_RUN_BODIES (five runnable arms:
+ *            admin-degenerate.ts's CRON_RUN_BODIES (six runnable arms:
  *            update_mirrors, update_push_mirrors, demo_sweep,
- *            delete_old_audit_events, cleanup_packages; "run = enqueue"):
+ *            delete_old_audit_events, cleanup_packages,
+ *            cleanup_hook_task_table; "run = enqueue"):
  *            the button renders only there and the five still-bodyless
  *            actions-family census arms render an empty first cell (never a
  *            dead control); a manual run records its tick too (upstream
  *            ExecTimes counts run STARTS — tasks.go:95-97 — and RunWithUser
  *            serves both triggers). The API registry's CRON_RUN_BODIES and
- *            this module's dispatch map hold the same five names — extending
+ *            this module's dispatch map hold the same names — extending
  *            run capability extends BOTH registries in one change (both
- *            modules' extension rules).
+ *            modules' extension rules) — ONE disclosed divergence while the
+ *            cleanup_hook_task_table twin is pending with the API module's
+ *            owner (this map runs it; the API route 404s it, its test
+ *            pins that).
  *   queue    Cloudflare Queues expose no depth introspection and there is no
  *            in-process queue manager to enumerate — but the LANDED D1 state
  *            of the two queue-backed pipelines answers "number in queue" for
@@ -470,7 +474,7 @@ import { drizzle } from "drizzle-orm/d1";
 import type { Child } from "hono/jsx";
 
 import { enqueueDueAuditRetention } from "../../services/audit";
-import { enqueueDueDemoSweeps } from "../../services/demo-sweep";
+import { enqueueDueDemoSweeps, enqueueDueWebhookMaintenance } from "../../services/demo-sweep";
 import { enqueueDueMirrorSyncs } from "../../services/mirror/sync";
 import { enqueueDuePushMirrorSyncs } from "../../services/mirror/push-sync";
 import { enqueueDuePackagesCleanup } from "../../services/packages/cleanup";
@@ -551,6 +555,7 @@ export const adminMonitorLocale = {
   taskCleanupActions: "Clean up expired actions' resources", // "admin.dashboard.cleanup_actions"
   taskCancelAbandonedJobs: "Cancel actions abandoned jobs", // "admin.dashboard.cancel_abandoned_jobs"
   taskCleanupEphemeralRunners: "Clean up old ephemeral runners", // cf-gitea extension (no upstream key — upstream's own wrap text, cleanup.go:37)
+  taskCleanupHookTaskTable: "Clean up hook_task table", // "admin.dashboard.cleanup_hook_task_table"
   // The queue table headers (queue.tmpl:10-15, reduced to the sourced three).
   queueName: "Name", // "admin.monitor.queue.name"
   queueType: "Type", // "admin.monitor.queue.type"
@@ -939,6 +944,13 @@ const CRON_RUN_BODIES: Readonly<Record<string, CronRunBody>> = {
   demo_sweep: (env, options) => enqueueDueDemoSweeps(env, { now: options.now }),
   delete_old_audit_events: (env, options) => enqueueDueAuditRetention(env, { now: options.now }),
   cleanup_packages: (env, options) => enqueueDuePackagesCleanup(env, { now: options.now }),
+  // The webhook-maintenance producer (SPEC-0005 §4.9 as-built, the 870c9b3
+  // landing) — this module's twin landed FIRST (the orchestrator's one-shot
+  // boundary grant for the census row's ripple); the API registry's twin
+  // entry is a pending one-liner with admin-degenerate.ts's owner, so the
+  // API POST /admin/cron/cleanup_hook_task_table answers the
+  // listed-but-unrunnable 404 until it lands (pinned by the route's test).
+  cleanup_hook_task_table: (env, options) => enqueueDueWebhookMaintenance(env, { now: options.now }),
 };
 
 /** The run-capable subset — the dispatch map's keys (never drifts apart). */
@@ -1036,6 +1048,8 @@ function taskDisplayName(name: string): string {
       return adminMonitorLocale.taskCancelAbandonedJobs;
     case "cleanup_ephemeral_runners":
       return adminMonitorLocale.taskCleanupEphemeralRunners;
+    case "cleanup_hook_task_table":
+      return adminMonitorLocale.taskCleanupHookTaskTable;
     default:
       return name;
   }

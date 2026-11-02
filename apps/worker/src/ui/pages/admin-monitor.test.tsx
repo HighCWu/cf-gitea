@@ -361,7 +361,7 @@ describe("loadAdminMonitorStats (GetStatistic's landed-table subset, sorted keys
 const NOW = new Date("2026-01-01T12:07:33Z");
 
 describe("loadAdminMonitorCron (the FULL landed arm census — the usability F3 listing)", () => {
-  it("carries all ELEVEN landed arms with their wrangler schedules in registry order", () => {
+  it("carries all TWELVE landed arms with their wrangler schedules in registry order", () => {
     const { entries } = loadAdminMonitorCron(NOW);
     expect(entries.map((entry) => [entry.name, entry.spec])).toEqual([
       ["update_mirrors", "*/10 * * * *"],
@@ -375,6 +375,7 @@ describe("loadAdminMonitorCron (the FULL landed arm census — the usability F3 
       ["auto_merge_due_scan", "0 * * * *"],
       ["cancel_abandoned_jobs", "0 * * * *"],
       ["cleanup_ephemeral_runners", "0 * * * *"],
+      ["cleanup_hook_task_table", "0 * * * *"],
     ]);
     // The never-fired posture without recorded state (the sync loader's
     // shape): prev null, zero executions, the empty-Status result arm.
@@ -392,6 +393,7 @@ describe("loadAdminMonitorCron (the FULL landed arm census — the usability F3 
       "demo_sweep",
       "delete_old_audit_events",
       "cleanup_packages",
+      "cleanup_hook_task_table",
     ]);
   });
 
@@ -476,8 +478,8 @@ describe("loadAdminMonitorCronRunState (the state-bearing loader — the route s
     // The error arm renders the x glyph with the stored one-liner tooltip.
     expect(html).toContain('data-tooltip-content="producer probes failed"');
     expect(html).toContain('class="svg octicon-x"');
-    // Exactly FIVE run buttons (the runnable arms) among ten rows.
-    expect((html.match(/name="op" value=/g) ?? []).length).toBe(5);
+    // Exactly SIX run buttons (the runnable arms) among the census rows.
+    expect((html.match(/name="op" value=/g) ?? []).length).toBe(6);
   });
 });
 
@@ -654,6 +656,39 @@ describe("applyAdminMonitorCronForm (DashboardPost's task arm over the landed pr
     expect(tasks.batches).toEqual([[{ kind: "package-cleanup" }]]);
     const state = await listCronState(env.DB);
     expect(state.get("cleanup_packages")).toMatchObject({ runs: 1, lastSuccess: NOW, lastError: null });
+  });
+
+  it("cleanup_hook_task_table runs its producer — an age-stale terminal delivery arms one enqueue, tick recorded", async () => {
+    // One terminal-state delivery past the 30 d age threshold arms the
+    // producer's second probe (the demo-sweep.test.ts seeding shape).
+    const hookRows = await drizzle(env.DB)
+      .insert(webhooks)
+      .values([{ repoId: "r_hook", url: "https://hook.test", events: "{}", isActive: true, createdAt: AT }])
+      .returning({ id: webhooks.id })
+      .all();
+    await drizzle(env.DB)
+      .insert(webhookDeliveries)
+      .values({
+        hookId: hookRows[0]!.id,
+        repoId: "r_hook",
+        uuid: "u_hook",
+        eventType: "issues",
+        eventGroup: "issues",
+        payloadContent: "{}",
+        state: "delivered",
+        createdAt: new Date(NOW.getTime() - 31 * 24 * 60 * 60 * 1000), // past the 30 d window
+      })
+      .run();
+    const tasks = recordingQueue();
+    const result = await applyAdminMonitorCronForm(
+      { ...env, REPO_TASKS: tasks },
+      { op: "cleanup_hook_task_table", from: "monitor" },
+      { now: NOW },
+    );
+    expect(result).toEqual({ outcome: "applied", message: "Started Task: Clean up hook_task table" });
+    expect(tasks.batches).toEqual([[{ kind: "webhook-maintenance" }]]);
+    const state = await listCronState(env.DB);
+    expect(state.get("cleanup_hook_task_table")).toMatchObject({ runs: 1, lastSuccess: NOW, lastError: null });
   });
 
   it("an unknown task answers task.unknown WITHOUT running anything", async () => {
