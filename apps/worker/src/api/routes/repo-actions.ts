@@ -21,6 +21,8 @@ import {
   repositories,
   users,
 } from "../../db/schema";
+import type { AuthInfo } from "../../auth/auth-context";
+import { emitWorkflowDispatchAudit, emitWorkflowToggleAudit } from "../../services/actions/audit-arms";
 import type { RunJobRow, RunRow, RunAttemptRow, TaskRow } from "../../services/actions/model";
 import { increaseTaskVersion, insertActionRun } from "../../services/actions/model";
 import { loadRepoActionsConfig, saveRepoActionsConfig } from "../../services/actions/config";
@@ -237,10 +239,13 @@ import { parseListOptions, setPaginationHeaders } from "../pagination";
  *     ("ref is required parameter", action.go:1141-1144) is dead for JSON
  *     bodies (the binder's Required rejects empty strings) and is not
  *     separately reachable.
- *   - The enable/disable/dispatch audit events (RecordWorkflowToggle,
- *     workflow.go:47-52; the dispatch's RecordAs, workflow.go:189) have no
- *     landed audit-actions registry entries (services/audit.ts carries the
- *     org/repo families only) — the events ride the audit-families wave.
+ *   - The enable/disable/dispatch audit arms (the v1.5.4 cycle —
+ *     RecordWorkflowToggle, workflow.go:49; the dispatch's RecordAs tail,
+ *     workflow.go:192-193) emit through services/actions/audit-arms.ts AFTER
+ *     each write succeeds, origin "api" (api.go:954's AuditOrigin(OriginAPI)
+ *     marks the whole /api/v1 router) with the requester as actor and the
+ *     "access-token:<id>" credential (the auditActorOf house shape —
+ *     oauth2-apps.ts's derivation, models/audit/audit_event.go:27).
  */
 
 // ---------------------------------------------------------------------------
@@ -271,6 +276,23 @@ async function requireActionsWriter(c: Context<ApiEnv>, pair: RepositoryWithOwne
     return;
   }
   throw new ApiError(403, "user should have a permission to write to a repo");
+}
+
+/**
+ * The audit arms' actor snapshot — upstream `audit.Record(ctx, …)` resolves
+ * the actor from the context doer: the login as the name, the credential in
+ * the "access-token:<id>" format (models/audit/audit_event.go:27's
+ * documented shapes; null when the request rode another auth method —
+ * session/basic resolutions carry no token row). The `auth` read follows the
+ * scope-gate's `| undefined` annotation (the standalone-router injection
+ * path may leave it unset). The oauth2-apps.ts auditActorOf house shape.
+ */
+function auditActorOf(authUser: User, auth: AuthInfo | undefined): { id: number; username: string; credential: string | null } {
+  return {
+    id: authUser.id ?? 0,
+    username: authUser.username ?? "",
+    credential: auth?.token ? `access-token:${auth.token.id}` : null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -2273,6 +2295,18 @@ export function registerRepoActionsRoutes(
       if (saved === "missing") {
         throw new Error("ActionsDisableWorkflow: UpdateRepoUnitConfig missed the actions unit row");
       }
+      // RecordWorkflowToggle (workflow.go:49 — after UpdateRepoUnitConfig,
+      // before the wire answer): the API twin's disable arm.
+      const actor = auditActorOf(c.get("authUser"), c.get("auth"));
+      await emitWorkflowToggleAudit(c.env.DB, {
+        repo: pair.repo,
+        workflowId: found.entry.name,
+        isEnable: false,
+        actor: { id: actor.id, username: actor.username },
+        actorCredential: actor.credential,
+        origin: "api",
+        ipAddress: c.req.header("cf-connecting-ip") ?? null,
+      });
       return c.body(null, 204);
     },
   );
@@ -2314,6 +2348,17 @@ export function registerRepoActionsRoutes(
       if (saved === "missing") {
         throw new Error("ActionsEnableWorkflow: UpdateRepoUnitConfig missed the actions unit row");
       }
+      // RecordWorkflowToggle (workflow.go:49): the API twin's enable arm.
+      const actor = auditActorOf(c.get("authUser"), c.get("auth"));
+      await emitWorkflowToggleAudit(c.env.DB, {
+        repo: pair.repo,
+        workflowId: found.entry.name,
+        isEnable: true,
+        actor: { id: actor.id, username: actor.username },
+        actorCredential: actor.credential,
+        origin: "api",
+        ipAddress: c.req.header("cf-connecting-ip") ?? null,
+      });
       return c.body(null, 204);
     },
   );
@@ -2388,6 +2433,21 @@ export function registerRepoActionsRoutes(
       if (outcome.outcome === "invalid") {
         throw new ApiError(422, outcome.message);
       }
+
+      // DispatchActionWorkflow's audit tail (workflow.go:192-193 — RecordAs
+      // after PrepareRunAndInsert, before the run-id answer): the RAW ref
+      // rides the row, NOT the RefName-normalized branch ref the run stores.
+      const actor = auditActorOf(c.get("authUser"), c.get("auth"));
+      await emitWorkflowDispatchAudit(c.env.DB, {
+        repo: pair.repo,
+        workflowId,
+        ref: opt.ref,
+        runId: outcome.runId,
+        actor: { id: actor.id, username: actor.username },
+        actorCredential: actor.credential,
+        origin: "api",
+        ipAddress: c.req.header("cf-connecting-ip") ?? null,
+      });
 
       // FormBool (base_form.go): absent/false → 204 (action.go:1168-1171);
       // true → the RunDetails body (action.go:1173-1178).

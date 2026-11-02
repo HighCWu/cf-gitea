@@ -39,12 +39,20 @@
  *     98-132): the 200 attachment (text/plain; charset=utf-8, the
  *     FileNameJoinFields filename, the chunk bytes verbatim, the sealed-R2
  *     arm), the 404 ladder (repo-miss text, job not started, logs expired).
+ *   - The audit arms (v1.5.4 — RecordWorkflowToggle, workflow.go:49; the
+ *     dispatch's RecordAs tail, workflow.go:192-193, both through
+ *     services/actions/audit-arms.ts): each successful write emits its row —
+ *     origin "api", the requester as actor, the "access-token:<id>"
+ *     credential (the rig's resolveAuth stand-in carries the token row), the
+ *     RAW ref + numeric run_id in the dispatch metadata; a failed write
+ *     emits nothing.
  */
 
 import { OpenAPIHono } from "@hono/zod-openapi";
 import { applyD1Migrations } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { MiddlewareHandler } from "hono";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 import { eq } from "drizzle-orm";
 
@@ -57,6 +65,7 @@ import {
   actionRunJobs,
   actionRuns,
   actionTasks,
+  auditEvents,
   repoCounters,
   repoSettings,
   repoUnits,
@@ -64,7 +73,7 @@ import {
 } from "../../db/schema";
 import { insertActionRun } from "../../services/actions/model";
 import { loadRepoActionsConfig } from "../../services/actions/config";
-import { createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "../auth";
+import { createTokenAuthMiddleware, extractTokenHeader, STUB_USER, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
 import type { User } from "../models/user";
@@ -249,10 +258,50 @@ function identity(id: number, login: string, isAdmin = false): User {
   return { ...STUB_USER, id, login, username: login, is_admin: isAdmin };
 }
 
+/** The rig's token-row ids — the resolveAuth stand-in's AuthToken.id per
+ *  presented credential (the audit arms' "access-token:<id>" pin source). */
+const RIG_TOKEN_IDS: Record<string, number> = { "alice-token": 11, "bob-token": 12, "admin-token": 13 };
+
+/**
+ * The family middleware: the standalone createTokenAuthMiddleware (the 401
+ * ladder) PLUS the production resolveAuth's AuthInfo attachment — at
+ * /api/v1/* resolveAuth always publishes `auth` carrying the verified token
+ * row (SPEC-0002 §2.5), and the API audit arms derive their
+ * "access-token:<id>" credential from it (the oauth2-apps.ts auditActorOf
+ * house shape). The stand-in maps the presented credential to a fixed rig
+ * row id; `user` stays null — identity rides `authUser`, the arms read the
+ * token row only.
+ */
+const requireToken: MiddlewareHandler<ApiEnv> = async (c, next) => {
+  await createTokenAuthMiddleware(resolver)(c, async () => {
+    const presented = extractTokenHeader(c.req.header("Authorization"));
+    const tokenId = presented === null ? undefined : RIG_TOKEN_IDS[presented];
+    c.set("auth", {
+      user: null,
+      token:
+        tokenId === undefined
+          ? null
+          : {
+              id: tokenId,
+              userId: 0,
+              name: presented ?? "",
+              prefix: "cfg_rig",
+              scopes: "all",
+              expiresAt: null,
+              lastUsedAt: null,
+              createdAt: new Date(),
+            },
+      scope: null,
+      isBasicAuth: false,
+    });
+    await next();
+  });
+};
+
 function router() {
   const app = new OpenAPIHono<ApiEnv>();
   app.onError(giteaErrorHandler);
-  registerRepoActionsRoutes(app, createTokenAuthMiddleware(resolver));
+  registerRepoActionsRoutes(app, requireToken);
   return async (path: string, init?: RequestInit): Promise<Response> =>
     app.fetch(new Request(`${ORIGIN}${path.replace(/^\/api\/v1/, "")}`, init), env);
 }
@@ -982,5 +1031,112 @@ describe("GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs (downloadActionsR
   it("gates: 401 anonymous, 403 on the disabled unit", async () => {
     expect((await get(`${SUITE}/actions/jobs/${logJobId}/logs`)).status).toBe(401);
     expect((await get(`${EMPTY}/actions/jobs/1/logs`, "bob-token")).status).toBe(403);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The audit arms (v1.5.4 — workflow.go:49 / :192-193 through
+// services/actions/audit-arms.ts): each successful write emits its row,
+// origin "api", the requester as actor, the access-token credential; a
+// failed write emits nothing.
+// ---------------------------------------------------------------------------
+
+describe("the audit arms (workflow.go:49/:192-193 — the API twins)", () => {
+  beforeEach(async () => {
+    await env.DB.prepare("DELETE FROM audit_event").run();
+  });
+
+  afterAll(async () => {
+    // D-8 (the v1.5.2 gate R3/R4 flake) posture — the end-of-describe wipe
+    // the run-family describes carry: this file's worker owns its D1
+    // exclusively, so the unfiltered deletes touch nothing else. The
+    // defensive re-enable FIRST: the toggle pins leave ci.yml enabled on
+    // success, and a mid-test failure's stranded disabled entry would poison
+    // a re-execution's "active" state pins (repo_units survives the beforeAll
+    // barrier). The re-enable's own audit row dies with the wipe after it.
+    await put(`${SUITE}/actions/workflows/ci.yml/enable`, "alice-token");
+    const db = drizzle(env.DB);
+    await db.delete(actionRunAttempts);
+    await db.delete(actionRunJobs);
+    await db.delete(actionRuns);
+    await db.delete(repoCounters).where(eq(repoCounters.repoId, SUITE_REPO_ID));
+    await db.delete(auditEvents);
+  });
+
+  it("the disable arm emits actions:workflow:disable after the store write (204)", async () => {
+    const res = await router()(`${SUITE}/actions/workflows/ci.yml/disable`, {
+      method: "PUT",
+      headers: { Authorization: "token alice-token", "cf-connecting-ip": "203.0.113.9" },
+    });
+    expect(res.status).toBe(204);
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.action).toBe("actions:workflow:disable");
+    expect(row.actorId).toBe(ALICE_ID); // the requester as actor
+    expect(row.actorName).toBe(OWNER);
+    expect(row.actorCredential).toBe("access-token:11"); // alice-token's rig row (the auditActorOf house derivation)
+    expect(row.scopeType).toBe("repository");
+    expect(row.scopeId).toBe(SUITE_REPO_ID);
+    expect(row.scopeName).toBe("alice/actions-suite"); // ScopeFromRepository's FullName
+    expect(row.origin).toBe("api"); // api.go:954's AuditOrigin(OriginAPI)
+    expect(row.message).toBe("Disabled Actions workflow ci.yml in repository alice/actions-suite.");
+    expect(JSON.parse(row.metadata ?? "null")).toEqual({ workflow: "ci.yml" });
+    expect(row.ipAddress).toBe("203.0.113.9"); // the cf-connecting-ip pass-through
+    // cleanup: hand the store back enabled (the enable's own row dies with
+    // the next beforeEach wipe)
+    expect((await put(`${SUITE}/actions/workflows/ci.yml/enable`, "alice-token")).status).toBe(204);
+  });
+
+  it("the enable arm flips the action id; the toggle pair rides in emit order", async () => {
+    expect((await put(`${SUITE}/actions/workflows/ci.yml/disable`, "alice-token")).status).toBe(204);
+    expect((await put(`${SUITE}/actions/workflows/ci.yml/enable`, "alice-token")).status).toBe(204);
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows.map((r) => r.action)).toEqual(["actions:workflow:disable", "actions:workflow:enable"]);
+    expect(rows[1]!.message).toBe("Enabled Actions workflow ci.yml in repository alice/actions-suite.");
+    expect(JSON.parse(rows[1]!.metadata ?? "null")).toEqual({ workflow: "ci.yml" });
+  });
+
+  it("the dispatch arm emits actions:workflow:dispatch: the RAW ref + the numeric run_id", async () => {
+    const res = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "main" }, "alice-token");
+    expect(res.status).toBe(204);
+    const rows = await drizzle(env.DB).select().from(auditEvents).all();
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.action).toBe("actions:workflow:dispatch");
+    expect(row.actorId).toBe(ALICE_ID);
+    expect(row.actorCredential).toBe("access-token:11");
+    expect(row.origin).toBe("api");
+    expect(row.message).toBe("Dispatched Actions workflow ci.yml on main in repository alice/actions-suite.");
+    const metadata = JSON.parse(row.metadata ?? "null") as { ref: string; run_id: number; workflow: string };
+    // the RAW body ref, NOT the normalized branch ref the run row stores
+    expect(metadata.ref).toBe("main");
+    expect(metadata.workflow).toBe("ci.yml");
+    const dispatched = (await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.workflowId, "ci.yml")).all()).sort(
+      (a, b) => b.index - a.index,
+    )[0];
+    expect(dispatched?.ref).toBe("refs/heads/main"); // the run row's normalization — the metadata's contrast
+    expect(metadata.run_id).toBe(dispatched?.id); // numeric, upstream's int64 run.ID
+  });
+
+  it("the emit precedes the return_run_details branch (the 200 body's run id)", async () => {
+    const res = await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "main" }, "alice-token", "?return_run_details=true");
+    expect(res.status).toBe(200);
+    const body = await res.json<{ workflow_run_id: number }>();
+    const row = (await drizzle(env.DB).select().from(auditEvents).all())[0]!;
+    expect(JSON.parse(row.metadata ?? "null")).toEqual({ ref: "main", run_id: body.workflow_run_id, workflow: "ci.yml" });
+  });
+
+  it("a failed write emits nothing (the 404/403 arms)", async () => {
+    const auditRows = () => drizzle(env.DB).select().from(auditEvents).all();
+    // the 404 workflow miss answers before the store write
+    expect((await put(`${SUITE}/actions/workflows/ghost.yml/disable`, "alice-token")).status).toBe(404);
+    expect(await auditRows()).toHaveLength(0);
+    // the writer-gate 403 never reaches the handler body
+    expect((await put(`${SUITE}/actions/workflows/ci.yml/disable`, "bob-token")).status).toBe(403);
+    expect(await auditRows()).toHaveLength(0);
+    // the dispatch's ref miss 404s before the RecordAs tail
+    expect((await post(`${SUITE}/actions/workflows/ci.yml/dispatches`, { ref: "nope" }, "alice-token")).status).toBe(404);
+    expect(await auditRows()).toHaveLength(0);
   });
 });
