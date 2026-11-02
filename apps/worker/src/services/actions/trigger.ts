@@ -1395,8 +1395,9 @@ export function evaluateRunConcurrency(
   githubContext: unknown,
   raw: RawConcurrency,
   vars: Record<string, string>,
+  inputs: Record<string, unknown> | undefined = undefined,
 ): { group: string; cancel: boolean } {
-  const evaluator = serverEvaluator(githubContext, { jobId: "", results: { "": {} }, vars, inputs: undefined });
+  const evaluator = serverEvaluator(githubContext, { jobId: "", results: { "": {} }, vars, inputs });
   if (raw.rawExpression !== "") {
     // the whole value evaluates, then re-decodes as the RawExpression arm
     // (UnmarshalYAML tries the string first) → group, no cancel
@@ -1789,6 +1790,9 @@ export function evaluateJobIfExpression(input: {
   githubContext: unknown;
   results: Record<string, ServerJobResult>;
   vars: Record<string, string> | undefined;
+  /** The dispatch-inputs map (jobparser.WithInputs' expression surface) —
+   *  undefined on the push/schedule family, upstream's nil there too. */
+  inputs?: Record<string, unknown> | undefined;
 }): { value: boolean; invalidSummary: string | null } {
   const unavailable = unavailableContext(ifExpression(input.rawIf), jobConditionContexts);
   if (unavailable !== "") {
@@ -1801,7 +1805,7 @@ export function evaluateJobIfExpression(input: {
     jobId: input.jobId,
     results: input.results,
     vars: input.vars,
-    inputs: undefined,
+    inputs: input.inputs,
   });
   const verdict = evaluator.evalBool(input.rawIf, DefaultStatusCheck.Success);
   if (verdict.error !== null) {
@@ -1824,6 +1828,7 @@ function decideJobIfAtInsert(input: {
   rawIf: string;
   githubContext: unknown;
   vars: Record<string, string>;
+  inputs?: Record<string, unknown> | undefined;
 }): { shouldStart: boolean; invalidSummary: string | null } {
   if (input.rawIf === "") {
     return { shouldStart: true, invalidSummary: null };
@@ -1834,6 +1839,7 @@ function decideJobIfAtInsert(input: {
     githubContext: input.githubContext,
     results: { [input.jobId]: {} },
     vars: input.vars,
+    inputs: input.inputs,
   });
   return { shouldStart: verdict.value, invalidSummary: verdict.invalidSummary };
 }
@@ -2331,13 +2337,19 @@ export async function insertTriggeredRun(
  * the workflow source the E5 model split expands after the run row exists
  * (the github context needs run_id/run_number — run.go:106-111's own order);
  * `wfRawConcurrency` is PrepareRunAndInsert's ReadWorkflowRawConcurrency
- * product (run.go:39-41).
+ * product (run.go:39-41). `inputs` is InsertRun's dispatch-inputs map
+ * (run.go:63's parameter — the workflow_dispatch producer's
+ * inputsWithDefaults; jobparser.WithInputs / the concurrency fill models
+ * evaluate `${{ inputs.* }}` through it). The push/schedule family leaves
+ * it undefined exactly as before (upstream passes nil there — run.go:45's
+ * caller), so every existing call site keeps its behavior.
  */
 export async function insertTriggeredRunSplit(
   d1: D1Database,
   input: TriggeredRunInput,
   content: string,
   wfRawConcurrency: RawConcurrency | null = null,
+  inputs: Record<string, unknown> | undefined = undefined,
 ): Promise<TriggerRunOutcome> {
   const db = drizzle(d1);
   const now = new Date();
@@ -2448,7 +2460,7 @@ export async function insertTriggeredRunSplit(
       // way upstream's "parse workflow: %w" rolls the transaction back.
       let combos: WorkflowJobCombo[] = [];
       try {
-        const parsed = parseWorkflowCombos(content, { gitContext: githubContext, vars, inputs: undefined, eraseNeeds: true });
+        const parsed = parseWorkflowCombos(content, { gitContext: githubContext, vars, inputs, eraseNeeds: true });
         if (parsed.error !== null) {
           throw parsed.error;
         }
@@ -2464,7 +2476,7 @@ export async function insertTriggeredRunSplit(
       if (first !== undefined && first.runName !== "") {
         let runName = "";
         try {
-          const evaluator = serverEvaluator(githubContext, { jobId: "", results: {}, vars, inputs: undefined });
+          const evaluator = serverEvaluator(githubContext, { jobId: "", results: {}, vars, inputs });
           const interpolated = evaluator.interpolate(first.runName);
           if (interpolated.error !== null) throw interpolated.error;
           runName = interpolated.value;
@@ -2488,7 +2500,7 @@ export async function insertTriggeredRunSplit(
         let group = "";
         let cancel = false;
         try {
-          ({ group, cancel } = evaluateRunConcurrency(githubContext, wfRawConcurrency, vars));
+          ({ group, cancel } = evaluateRunConcurrency(githubContext, wfRawConcurrency, vars, inputs));
         } catch (err) {
           await abort(err, "evaluate concurrency");
         }
@@ -2556,6 +2568,7 @@ export async function insertTriggeredRunSplit(
             rawIf: combo.job.rawIf,
             githubContext,
             vars,
+            inputs,
           });
           invalidIf = decision.invalidSummary;
           if (!decision.shouldStart) {
@@ -2585,7 +2598,7 @@ export async function insertTriggeredRunSplit(
                 gitContext: githubContext,
                 results,
                 vars,
-                inputs: undefined,
+                inputs,
               });
             } catch (err) {
               evaluated = { group: "", cancel: false, error: err instanceof Error ? err : new Error(String(err)) };

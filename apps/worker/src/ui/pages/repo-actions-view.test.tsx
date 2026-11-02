@@ -21,7 +21,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { saveRepoSettings } from "../../api/services/repo-settings";
-import { actionArtifacts, actionLogChunks, actionRunAttempts, actionRunJobs, actionRuns, actionTaskSteps, actionTasks, repositories } from "../../db/schema";
+import { actionArtifacts, actionLogChunks, actionRunAttempts, actionRunJobs, actionRuns, actionTaskSteps, actionTasks, issues, pullRequests, repositories } from "../../db/schema";
 import {
   ACTION_STATUS_FAILURE,
   ACTION_STATUS_PENDING,
@@ -115,6 +115,8 @@ beforeEach(async () => {
     "action_tasks_versions",
     "repo_settings",
     "repo_units",
+    "pull_requests",
+    "issues",
     "repositories",
     "users",
   ]) {
@@ -270,12 +272,10 @@ describe("the route claim pin (the runs subtree claims exactly its shapes)", () 
   it("leaves the sibling tails and every deeper/junk shape unclaimed", () => {
     for (const path of [
       "/alice/demo/actions/runs", // the bare /runs has no upstream route
-      "/alice/demo/actions/runs/7/delete", // engine-owned (upstream m.Post too)
       "/alice/demo/actions/runs/7/logs", // upstream has NO run-level logs route
       "/alice/demo/actions/runs/7/attempts/2/extra", // deeper than any shape
       "/alice/demo/actions/runs/7/jobs/9/extra",
-      "/alice/demo/actions/run/1", // upstream's singular /run — unlanded
-      "/alice/demo/actions/disable",
+      "/alice/demo/actions/run/1", // deeper than the 1-segment /run literal
     ]) {
       expect(parseUiRoute(path)).toBeNull();
       expect(handlesUiRoute(path)).toBe(false);
@@ -793,6 +793,88 @@ describe("the ViewResponse JSON (POST — pinned against view.go's field list)",
     // exact port), so the link composes "/src/" bare.
     expect(body.state.run.commit.branch.link).toBe("/contributor/fork/src/");
     expect(body.state.run.commit.branch.isDeleted).toBe(false);
+  });
+
+  // --- the arm-3 lookup (view.go:436-453 — the ⑲A7 row) ----------------------
+
+  /** Seed one PR row pair (the join the arm-3 lookup rides). */
+  async function seedPr(opts: {
+    index: number;
+    headBranch: string;
+    headRepoId?: string;
+    baseRepoId?: string;
+    isClosed?: boolean;
+    hasMerged?: boolean;
+    flow?: number;
+  }): Promise<void> {
+    const issueRows = await drizzle(env.DB)
+      .insert(issues)
+      .values({
+        repoId: repo.id,
+        index: opts.index,
+        posterId: 1,
+        title: `PR ${opts.index}`,
+        isClosed: opts.isClosed ?? false,
+        isPull: true,
+        createdAt: T0,
+        updatedAt: T0,
+      })
+      .returning();
+    await drizzle(env.DB).insert(pullRequests).values({
+      issueId: issueRows[0]!.id,
+      index: opts.index,
+      headRepoId: opts.headRepoId ?? repo.id,
+      baseRepoId: opts.baseRepoId ?? repo.id,
+      headBranch: opts.headBranch,
+      baseBranch: "main",
+      flow: opts.flow ?? 0,
+      hasMerged: opts.hasMerged ?? false,
+    });
+  }
+
+  it("a push run on a branch with exactly ONE open PR surfaces the Back-to-PR link (view.go:436-453, the ⑲A7 row)", async () => {
+    await enableActions();
+    await seedPr({ index: 5, headBranch: "feature" });
+    const seeded = await seedRun(1, { ref: "refs/heads/feature" });
+    const res = await postJson(`/alice/demo/actions/runs/${seeded.run.id}`, 1, {});
+    const body = await res.json<ViewResponse>();
+    expect(body.state.run.pullRequest).toEqual({ index: "#5", link: "/alice/demo/pulls/5" });
+  });
+
+  it("the arm-3 negatives: two candidates, a closed PR, a merged PR and an agit flow PR stay absent", async () => {
+    await enableActions();
+    // Two open PRs on the head branch → the len(prs)==1 arm fails.
+    await seedPr({ index: 5, headBranch: "feature" });
+    await seedPr({ index: 6, headBranch: "feature" });
+    const two = await seedRun(1, { ref: "refs/heads/feature" });
+    const twoRes = await postJson(`/alice/demo/actions/runs/${two.run.id}`, 1, {});
+    expect((await twoRes.json<ViewResponse>()).state.run.pullRequest).toBeUndefined();
+    await drizzle(env.DB).delete(pullRequests);
+    await drizzle(env.DB).delete(issues);
+    // Closed → the issue.is_closed arm.
+    await seedPr({ index: 5, headBranch: "feature", isClosed: true });
+    const closed = await seedRun(2, { ref: "refs/heads/feature" });
+    const closedRes = await postJson(`/alice/demo/actions/runs/${closed.run.id}`, 1, {});
+    expect((await closedRes.json<ViewResponse>()).state.run.pullRequest).toBeUndefined();
+    await drizzle(env.DB).update(issues).set({ isClosed: false });
+    await drizzle(env.DB).update(pullRequests).set({ hasMerged: true });
+    const merged = await seedRun(3, { ref: "refs/heads/feature" });
+    const mergedRes = await postJson(`/alice/demo/actions/runs/${merged.run.id}`, 1, {});
+    expect((await mergedRes.json<ViewResponse>()).state.run.pullRequest).toBeUndefined();
+    await drizzle(env.DB).update(pullRequests).set({ hasMerged: false, flow: 1 }); // PRFlow.AGit
+    const agit = await seedRun(4, { ref: "refs/heads/feature" });
+    const agitRes = await postJson(`/alice/demo/actions/runs/${agit.run.id}`, 1, {});
+    expect((await agitRes.json<ViewResponse>()).state.run.pullRequest).toBeUndefined();
+  });
+
+  it("a fork-head push run links the PR through its BASE repo (LoadBaseRepo)", async () => {
+    await enableActions();
+    await seedRepo("base"); // the base repo row (owner alice, slug base)
+    await seedPr({ index: 7, headBranch: "patch", headRepoId: "repo-demo", baseRepoId: "repo-base" });
+    const seeded = await seedRun(1, { ref: "refs/heads/patch" });
+    const res = await postJson(`/alice/demo/actions/runs/${seeded.run.id}`, 1, {});
+    const body = await res.json<ViewResponse>();
+    expect(body.state.run.pullRequest).toEqual({ index: "#7", link: "/alice/base/pulls/7" });
   });
 
   it("the approval posture: needApproval flips canApprove + the currentJob detail", async () => {

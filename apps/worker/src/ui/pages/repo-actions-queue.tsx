@@ -59,24 +59,29 @@
  *
  * ## Documented reductions (§6 method — never dead controls)
  *
- * - The Job cell renders the name + `#index` as PLAIN TEXT: upstream links
- *   `$job.Run.Link` (the run viewer — unlanded, the census C2 unit's page).
- *   The commit cell keeps its link (the commit page is landed); the repo
- *   cell keeps its link (repo home is landed).
+ * - The Job cell links `$job.Run.Link` (job_queue_list.tmpl:78) onto the
+ *   LANDED run viewer (the ⑲A6 row's link fix — the census C2 page
+ *   landed; the name + `#index` render inside the one anchor exactly like
+ *   the template, falling back to plain text only when the run row or the
+ *   repo row is missing). The commit cell keeps its link (the commit page
+ *   is landed); the repo cell keeps its link (repo home is landed).
  * - The dev-mode arms of `RefreshIntervalMs`/RenderJobQueue (the 1 s/2 s
  *   values and the blank-first-screen debug arm) are upstream's
  *   `setting.IsProd` harness — not ported; the prod intervals (3 s with
  *   activity / 12 s idle) render unconditionally (the census's open
  *   question 6 verdict).
  * - The sidebar (`repo/actions/sidebar.tmpl`) reduces to the Management
- *   menu only: the workflows menu's every item targets the unlanded runs
- *   list (the census C1 unit) or needs M3's workflow parser — rendered as
- *   nothing; the Job-queue item is the page's own (active) entry.
- * - The status glyphs follow `repo/icons/action_status.tmpl`; only
- *   octicon-check / octicon-dot-fill sit in the generated allowlist —
- *   running/cancelling stand in with octicon-clock (carrying upstream's
- *   `rotate-clockwise` class on the running arm), blocked/failure/unknown
- *   with octicon-info; the color classes are upstream's verbatim.
+ *   menu only: the workflows menu's every item targets the runs list's
+ *   own filter state (the runs page renders the full workflows menu — the
+ *   ⑲A3 row); the Job-queue item is the page's own (active) entry, and its
+ *   glyph is the template's octicon-list-ordered verbatim (the generated
+ *   allowlist grew with the ⑲A3 landing — the octicon-checklist stand-in
+ *   retired).
+ * - The status glyphs follow `repo/icons/action_status.tmpl` through the
+ *   runs-list module's EXACT map (the ⑲A6 row's icon fix — the allowlist
+ *   now carries every glyph the map names, so the octicon-clock /
+ *   octicon-info stand-ins retired): the plain variant, upstream's color
+ *   classes verbatim.
  * - The owner/repo/status filter dropdowns render the upstream anchor
  *   lists; their Fomantic dropdown JS is the bundle's business — the
  *   anchors are plain links that survive without it.
@@ -92,8 +97,10 @@ import { actionRunJobs, actionRunners, actionRuns, actionTasks, repositories } f
 import { TimeSince } from "../components/file-list";
 import { shortSha } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
+import type { IconName } from "../icons";
 import type { UiContext } from "../ui-context";
 import { AdminFamilyShell } from "./admin-users";
+import { actionStatusIcon } from "./repo-actions-runs";
 
 // ---------------------------------------------------------------------------
 // Locale (the component-local pattern — every string cites its upstream key;
@@ -186,38 +193,12 @@ export function actionsQueueRefreshIntervalMs(hasActivity: boolean): number {
   return hasActivity ? 3_000 : 12_000;
 }
 
-/** repo/icons/action_status.tmpl — the icon map with the allowlist stand-ins
- *  (the module header's glyph note); the color classes are verbatim. */
-export function actionsStatusIcon(status: number): {
-  name: "octicon-check" | "octicon-dot-fill" | "octicon-clock" | "octicon-info";
-  class: string;
-} {
-  switch (actionsStatusToString(status)) {
-    case "success":
-      return { name: "octicon-check", class: "tw-text-green" };
-    case "waiting":
-      return { name: "octicon-dot-fill", class: "tw-text-yellow" };
-    case "running":
-      // Upstream gitea-running (a spinner) — octicon-clock carries the same
-      // rotation class.
-      return { name: "octicon-clock", class: "tw-text-yellow rotate-clockwise" };
-    case "cancelling":
-      // Upstream octicon-stop (yellow).
-      return { name: "octicon-clock", class: "tw-text-yellow" };
-    case "skipped":
-      // Upstream octicon-skip (text-light) — the clock's neutral arm.
-      return { name: "octicon-clock", class: "tw-text-text-light" };
-    case "pending":
-      // Upstream octicon-circle (text-light).
-      return { name: "octicon-dot-fill", class: "tw-text-text-light" };
-    case "blocked":
-      // Upstream octicon-blocked (yellow).
-      return { name: "octicon-info", class: "tw-text-yellow" };
-    default:
-      // failure / unknown — upstream octicon-x (red); octicon-info is the
-      // red stand-in (the glyph differs, the color contract carries).
-      return { name: "octicon-info", class: "tw-text-red" };
-  }
+/** repo/icons/action_status.tmpl through the runs-list module's EXACT map
+ *  (the ⑲A6 row's icon fix — the plain variant, upstream's color classes
+ *  verbatim; the module header's stand-in note retired). */
+export function actionsStatusIcon(status: number): { name: IconName; class: string } {
+  const glyph = actionStatusIcon(actionsStatusToString(status), "plain");
+  return { name: glyph.name, class: glyph.className };
 }
 
 /** One status glyph (action_status.tmpl's 16px default — the tooltip rides
@@ -376,6 +357,9 @@ export interface JobQueueJobView {
   updated: Date;
   runnerName: string;
   runIndex: number | null;
+  /** `$job.Run.Link` — the run-viewer URL (null when the run row or the
+   *  repo row is missing; the cell falls back to plain text). */
+  runLink: string | null;
   commitSha: string;
   repoFullName: string | null;
   repoLink: string | null;
@@ -582,6 +566,13 @@ export async function loadJobQueuePageData(d1: D1Database, scope: JobQueueScope,
       updated: job.updated,
       runnerName: runnerNames.get(job.taskId) ?? "",
       runIndex: run?.index ?? null,
+      // Run.Link (run.go:95) — the run viewer needs BOTH the run and the
+      // repo rows (the repo-scope arm composes the same link from its own
+      // scope when the repo row is missing).
+      runLink:
+        run !== undefined && repoLink !== null
+          ? `${repoLink}/actions/runs/${job.runId}`
+          : null,
       commitSha: run?.commitSha ?? "",
       repoFullName: repo !== undefined ? `${repo.ownerNamespace}/${repo.slug}` : null,
       repoLink,
@@ -745,10 +736,19 @@ export function JobQueueFragment(props: { data: JobQueuePageData }) {
                   {data.showRepoColumn ? (
                     <td>{job.repoLink !== null ? <a href={job.repoLink}>{job.repoFullName}</a> : null}</td>
                   ) : null}
-                  {/* The run link is the census C2 unit's page (unlanded) —
-                      the name renders as text (the module header). */}
+                  {/* The Job cell (job_queue_list.tmpl:78): the name +
+                      #index anchor onto the LANDED run viewer when the run
+                      row resolved; plain text on the missing-row fallback. */}
                   <td>
-                    {job.name} <span class="text grey">#{job.runIndex ?? "?"}</span>
+                    {job.runLink !== null ? (
+                      <a href={job.runLink}>
+                        {job.name} <span class="text grey">#{job.runIndex ?? "?"}</span>
+                      </a>
+                    ) : (
+                      <>
+                        {job.name} <span class="text grey">#{job.runIndex ?? "?"}</span>
+                      </>
+                    )}
                   </td>
                   <td>
                     <span class="flex-text-inline tw-flex-wrap">
@@ -808,19 +808,19 @@ export function renderJobQueueFragment(data: JobQueuePageData): string {
 // The repo tab shell (templates/repo/actions/job_queue.tmpl)
 // ---------------------------------------------------------------------------
 
-/** The sidebar's Management menu (repo/actions/sidebar.tmpl:38-49) — the
- *  workflows menu renders NOTHING until the runs list lands (its every
- *  item targets the census C1 unit's page — the dead-link rule; the module
- *  header). octicon-list-ordered is outside the generated allowlist —
- *  octicon-checklist is the documented stand-in (the SECRET_ICON
- *  convention). */
+/** The sidebar's Management menu (repo/actions/sidebar.tmpl:54-62) — the
+ *  workflows menu renders NOTHING here (the runs list page renders the
+ *  full menu; the module header), the Job-queue item is the page's own
+ *  (active) entry. The glyph is the template's octicon-list-ordered
+ *  verbatim (the ⑲A3/A6 landing grew the allowlist — the
+ *  octicon-checklist stand-in retired). */
 export function RepoActionsQueueSidebar(props: { repoLink: string }) {
   return (
     <div class="flex-container-nav">
       <div class="ui fluid secondary vertical menu flex-items-block">
         <div>{actionsQueueLocale.management}</div>
         <a class="item active" href={`${props.repoLink}/actions/job_queue`}>
-          <Icon name="octicon-checklist" />
+          <Icon name="octicon-list-ordered" />
           <span class="gt-ellipsis">{actionsQueueLocale.job_queue}</span>
         </a>
       </div>

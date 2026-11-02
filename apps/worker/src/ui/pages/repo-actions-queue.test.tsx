@@ -353,6 +353,10 @@ describe("the fragment + page renders (job_queue_list.tmpl / job_queue.tmpl / ad
     // The morph root id + the run/repo/commit cells.
     expect(fragment).toContain(actionsQueueLocale.job_queue);
     expect(fragment).toContain("build");
+    // The Job cell links the LANDED run viewer (the ⑲A6 fix — the name +
+    // #index inside the one anchor, job_queue_list.tmpl:78's shape).
+    expect(fragment).toContain(`href="${REPO_LINK}/actions/runs/`);
+    expect(fragment).toMatch(/<a href="[^"]*\/actions\/runs\/\d+">build <span class="text grey">#1<\/span><\/a>/);
     expect(fragment).toContain(`href="${REPO_LINK}/commit/${SHA}"`);
   });
 
@@ -380,12 +384,15 @@ describe("the fragment + page renders (job_queue_list.tmpl / job_queue.tmpl / ad
     expect(() => RepoActionsJobQueuePage({ ctx, data })).toThrow("RepoActionsJobQueuePage requires ctx.repo");
   });
 
-  it("the sidebar renders the Management menu only (the C1 dead-link reduction)", () => {
+  it("the sidebar renders the Management menu only (the runs page carries the workflows menu — the ⑲A3 split)", () => {
     const sidebar = renderToString(<RepoActionsQueueSidebar repoLink={REPO_LINK} />);
     expect(sidebar).toContain(actionsQueueLocale.job_queue);
+    // The glyph is the template's octicon-list-ordered verbatim (the ⑲A6
+    // stand-in retirement).
+    expect(sidebar).toContain("octicon-list-ordered");
     // The workflows menu renders NOTHING — its All-Workflows item targets
-    // the unlanded runs list (the module header's reduction; C1's page is
-    // the target when it lands).
+    // the runs list's own filter state (the module header's reduction; the
+    // runs page renders the full menu).
     expect(sidebar).not.toContain("All Workflows");
   });
 });
@@ -546,11 +553,15 @@ describe("the status vocabulary", () => {
     expect(actionsStatusLocaleText(8)).toBe("Canceling");
   });
 
-  it("actionsStatusIcon follows action_status.tmpl with the allowlist stand-ins", () => {
+  it("actionsStatusIcon follows the runs-list module's exact action_status.tmpl map (the ⑲A6 fix — no stand-ins)", () => {
     expect(actionsStatusIcon(1)).toEqual({ name: "octicon-check", class: "tw-text-green" });
     expect(actionsStatusIcon(5)).toEqual({ name: "octicon-dot-fill", class: "tw-text-yellow" });
-    expect(actionsStatusIcon(6)).toEqual({ name: "octicon-clock", class: "tw-text-yellow rotate-clockwise" });
-    expect(actionsStatusIcon(8)).toEqual({ name: "octicon-clock", class: "tw-text-yellow" });
-    expect(actionsStatusIcon(2)).toEqual({ name: "octicon-info", class: "tw-text-red" });
+    expect(actionsStatusIcon(6)).toEqual({ name: "octicon-sync", class: "tw-text-yellow rotate-clockwise" });
+    expect(actionsStatusIcon(8)).toEqual({ name: "octicon-stop", class: "tw-text-yellow" });
+    expect(actionsStatusIcon(2)).toEqual({ name: "octicon-x", class: "tw-text-red" });
+    expect(actionsStatusIcon(4)).toEqual({ name: "octicon-skip", class: "tw-text-text-light" });
+    expect(actionsStatusIcon(7)).toEqual({ name: "octicon-blocked", class: "tw-text-yellow" });
+    expect(actionsStatusIcon(9)).toEqual({ name: "octicon-circle", class: "tw-text-text-light" });
+    expect(actionsStatusIcon(0)).toEqual({ name: "octicon-x", class: "tw-text-red" });
   });
 });

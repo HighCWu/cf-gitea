@@ -208,6 +208,14 @@ const ALLOWLIST = [
   // glyph the hide-toggle's). Both carry multi-path 16x16 bodies at the pin.
   'octicon-sidebar-collapse',
   'octicon-sidebar-expand',
+  // The ⑲ actions-UI mount wave (docs/compat/v1.5.2-ledger.md §1.6, A2/A3):
+  // the runs-list row kebab (runs_list.tmpl:56's octicon-kebab-horizontal —
+  // the filter-menu kebab button list.tmpl:81 renders the same glyph) and
+  // the sidebar Management section's job-queue mark (sidebar.tmpl:59's
+  // octicon-list-ordered — the queue page's octicon-checklist stand-in
+  // retired with the ⑲A6 icon fix).
+  'octicon-kebab-horizontal',
+  'octicon-list-ordered',
 ];
 
 // What shell.tsx's Icon component hardcodes; a body needing anything else

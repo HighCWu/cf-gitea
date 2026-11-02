@@ -61,24 +61,37 @@
  *   lastOnline is inside RunnerOfflineTime = 1 min, runner.go:76 — the
  *   upstream error text verbatim). The invalid-workflow-payload and
  *   reusable-`uses:` arms need M3's jobparser — they never fire here.
- * - The row kebab menu (runs_list.tmpl:55-73) renders nothing: all three
- *   items point at unlanded routes (the run view / workflow file is C2's,
- *   the cancel/delete POSTs are C5's) — the dead-link rule.
- * - The status-badge modal + kebab entry (list.tmpl:79-95,115-161) and the
- *   badge.svg endpoint (census C1's tail) are NOT this module — neither
- *   renders (the badge route is unlanded; the census leaves it to review).
- * - The dispatch banner (workflow_dispatch.tmpl) rides POST /actions/run —
- *   M3's producer arm; it renders nothing (census open question 4).
+ * - The row kebab menu (runs_list.tmpl:55-73) is LIVE (the ⑲A2 row): the
+ *   View-workflow-file link and the cancel/delete `link-action` POSTs ride
+ *   the official bundle's fetch-action handler; the delete POST's route is
+ *   the orchestrator-owned ui/index.ts mount (the ⑲A2 landing's patch).
+ * - The status-badge modal + kebab entry (list.tmpl:79-95,115-161) render
+ *   against the LIVE badge.svg route (the ⑲A5 row); the badge URL composes
+ *   from the render-time origin (upstream's HTMLURL — the same origin the
+ *   shell injects).
+ * - The dispatch banner + modal (workflow_dispatch.tmpl, the ⑲A4 row)
+ *   render when the selected workflow declares `workflow_dispatch` and the
+ *   viewer writes the unit; the form POSTs to /actions/run (the
+ *   orchestrator-owned mount; the producer is services/actions/
+ *   workflow-dispatch.ts) and the inputs body re-fetches the LIVE
+ *   /actions/workflow-dispatch-inputs fragment on a branch change.
  * - The sidebar's Management section (job-queue link, sidebar.tmpl:54-62)
- *   renders nothing — `/actions/job_queue` is C6's route (the dead-link
- *   rule; it lands with C6).
+ *   renders (the ⑲A3 row) — the route landed with C6.
  * - Scoped-workflow groups (sidebar.tmpl:17-34) defer with C10 (SPEC-0012
  *   keeps scoped workflows post-M3); the `scoped_workflow_source_repo_id`
  *   param parses (junk → 0 — FormInt64) and rides the filter links' shape.
  * - The workflow DISABLED red label (sidebar.tmpl:12-14) and the
- *   disable/enable kebab item (list.tmpl:88-92) ride the repo ActionsConfig
- *   store — unlanded (the census's POST /disable /enable tail); neither
- *   renders.
+ *   disable/enable kebab item (list.tmpl:88-92) ride the LANDED repo
+ *   ActionsConfig store (services/actions/config.ts — the ⑲A5 row); the
+ *   POST /disable|/enable routes are the orchestrator-owned mounts. The
+ *   scoped `CurWorkflowRequired` disabled-class arm is v1-inert (the
+ *   scoped family defers, the flag is never set).
+ * - The row title renders the RenderCommitMessageLinkSubject reduction
+ *   (runs_list.tmpl:22, the ⑲A7 row's title clause): the first-line subject
+ *   cut + the `title-full-link-hover`/`muted title-full-link` wrapper onto
+ *   the run link — the repo-lastcommit-fragment module's documented
+ *   reduction; the inner post-processors (issue refs, emoji, linkify) ride
+ *   the view module's titleHTML reduction note.
  * - Trigger-user ghost fallback: upstream's LoadTriggerUser re-resolves a
  *   missing user onto the Ghost row (run_list.go:38-42); ours renders the
  *   unlinked "Ghost" text (no ghost user row exists in the store).
@@ -112,6 +125,7 @@ import { renderToString } from "hono/jsx/dom/server";
 import { parse as yamlParse } from "yaml";
 
 import { actionRunJobs, actionRunners, actionRuns, users } from "../../db/schema";
+import { loadRepoActionsConfig } from "../../services/actions/config";
 import {
   ACTION_STATUS_BLOCKED,
   ACTION_STATUS_CANCELLED,
@@ -126,8 +140,14 @@ import {
 import { TimeSince } from "../components/file-list";
 import type { EngineClient } from "../engine";
 import type { IconName } from "../icons";
+import { pathEscapeSegments } from "../page-data";
 import { BaseLayout, Icon, renderPage } from "../shell";
 import type { RepoRow, UiContext } from "../ui-context";
+import {
+  parseWorkflowDispatchInputs,
+  renderWorkflowDispatchInputsFragment,
+  type WorkflowDispatchInput,
+} from "./repo-actions-dispatch-inputs";
 
 /** The run rows/actions rows the loader selects (drizzle's select shape). */
 type RunRow = typeof actionRuns.$inferSelect;
@@ -493,6 +513,32 @@ export const repoActionsRunsLocale = {
   workflow_runs_one: "workflow run", // "actions.runs.workflow_run_count_1"
   workflow_runs_n: "workflow runs", // "actions.runs.workflow_run_count_n"
   ghost: "Ghost", // user_model.GhostUserName
+  // --- the ⑲A2 kebab (runs_list.tmpl:55-73) ---
+  view_workflow_file: "View workflow file", // "actions.runs.view_workflow_file"
+  cancel: "Cancel workflow run", // "actions.runs.cancel"
+  delete: "Delete workflow run", // "actions.runs.delete"
+  delete_confirm: "Are you sure you want to permanently delete this workflow run? This action cannot be undone.", // "actions.runs.delete.description"
+  // --- the ⑲A3 sidebar Management section (sidebar.tmpl:54-62) ---
+  management: "Management", // "actions.management"
+  job_queue: "Job queue", // "actions.job_queue.title"
+  disabled: "Disabled", // "disabled" (sidebar.tmpl:13's red label)
+  // --- the ⑲A5 kebab + badge modal (list.tmpl:79-95,115-161) ---
+  create_status_badge: "Create status badge", // "actions.workflow.create_status_badge"
+  status_badge: "Status Badge", // "actions.workflow.status_badge"
+  status_badge_url: "Badge URL", // "actions.workflow.status_badge_url"
+  enable_workflow: "Enable Workflow", // "actions.workflow.enable"
+  disable_workflow: "Disable Workflow", // "actions.workflow.disable"
+  // --- the ⑲A4 dispatch banner + modal (workflow_dispatch.tmpl) ---
+  has_workflow_dispatch: "This workflow has a workflow_dispatch event trigger.", // "actions.workflow.has_workflow_dispatch"
+  run: "Run Workflow", // "actions.workflow.run"
+  from_ref: "Use workflow from", // "actions.workflow.from_ref"
+  branches: "Branches", // "repo.branches"
+  tags: "Tags", // "repo.tags"
+  filter_branch_and_tag: "Filter branch or tag", // "repo.filter_branch_and_tag" (the template appends the literal "...")
+  no_results_found: "No results found.", // "no_results_found"
+  copy: "Copy", // "copy"
+  markdown: "Markdown", // the badge modal's literal label
+  html: "HTML", // the badge modal's literal label
 } as const;
 
 /** The status-filter dropdown's entries (GetStatusInfoList — the 8 statuses
@@ -538,9 +584,9 @@ export interface ActionsRunView {
 }
 
 /** The full-page block — everything the shell needs beyond the rows
- *  (prepareOtherWorkflows + prepareFullPageTemplate); null on the fragment
- *  arm (upstream renders the fragment template without the shell's
- *  ctx.Data). */
+ *  (prepareOtherWorkflows + prepareFullPageTemplate + the ⑲A4/A5 template
+ *  data); null on the fragment arm (upstream renders the fragment template
+ *  without the shell's ctx.Data). */
 export interface RepoActionsRunsPageBlock {
   workflows: ActionsWorkflowInfo[];
   otherWorkflows: string[];
@@ -553,6 +599,28 @@ export interface RepoActionsRunsPageBlock {
   hasWorkflowsOrRuns: boolean;
   canWriteActions: boolean;
   canWriteCode: boolean;
+  // --- the ⑲A5 store wiring (prepareWorkflowTemplate's ctx.Data arms) ---
+  /** The ActionsConfig's disabled repo-level workflow ids
+   *  (sidebar.tmpl:12-14's red labels + list.tmpl:88-92's kebab label). */
+  disabledWorkflows: string[];
+  /** Permission.IsAdmin — AllowDisableOrEnableWorkflow
+   *  (actions.go:255); false until the route threads the admin grant. */
+  allowDisableOrEnable: boolean;
+  /** CurWorkflowIsListed (actions.go:169's repo-level shape — the scoped
+   *  arm defers with C10). */
+  curWorkflowIsListed: boolean;
+  // --- the ⑲A4 dispatch template data (prepareWorkflowDispatchTemplate) ---
+  /** The selected workflow's declared dispatch inputs — non-null exactly
+   *  when the banner renders (list.tmpl:99's .WorkflowDispatchConfig gate:
+   *  a selected, listed, enabled workflow + a writer viewer + a parsed
+   *  workflow_dispatch declaration). */
+  workflowDispatch: { inputs: WorkflowDispatchInput[] } | null;
+  /** The modal's branch list — the git-refs reduction (upstream reads its
+   *  branch table), the default branch hoisted to the top
+   *  (prepareWorkflowDispatchTemplate's SliceRemoveAll+prepend). */
+  dispatchBranches: string[];
+  /** The modal's tag list (GetTagNamesByRepoID — the git-refs twin). */
+  dispatchTags: string[];
 }
 
 export interface RepoActionsRunsData {
@@ -560,6 +628,9 @@ export interface RepoActionsRunsData {
   isFiltered: boolean;
   workflowNames: Record<string, string>;
   curWorkflow: string;
+  /** The unit-write grant both arms carry (runs_list.tmpl:59,64's
+   *  $data.CanWriteRepoUnitActions — the kebab's cancel/delete gates). */
+  canWriteActions: boolean;
   refreshLink: string;
   refreshIntervalMs: number;
   total: number;
@@ -579,6 +650,11 @@ export interface RepoActionsRunsInput {
    *  AppSubURL + RequestURI; we have no sub-url, census open question 8). */
   requestUri: string;
   canWriteActions: boolean;
+  /** Permission.IsAdmin — the ⑲A5 kebab's AllowDisableOrEnableWorkflow
+   *  gate (actions.go:255). OPTIONAL with a false default so the landed
+   *  route call site keeps compiling; the route's mount hunk threads the
+   *  canAdminRepo grant. */
+  isAdmin?: boolean;
   /** The route clock (seconds) — the running-duration arm + the runner
    *  freshness check; the hand-rolled-clock convention. */
   nowSeconds: number;
@@ -608,6 +684,7 @@ const RUNNER_OFFLINE_SECONDS = 60;
  */
 export async function loadRepoActionsRunsData(input: RepoActionsRunsInput): Promise<RepoActionsRunsData> {
   const { d1, engine, repo, query, requestUri, canWriteActions, nowSeconds } = input;
+  const allowDisableOrEnable = input.isAdmin === true;
   const db = drizzle(d1);
   const repoLink = `/${repo.ownerNamespace}/${repo.slug}`;
   const isFiltered = query.actor > 0 || query.status !== 0 || query.branch !== "";
@@ -817,6 +894,47 @@ export async function loadRepoActionsRunsData(input: RepoActionsRunsInput): Prom
       .filter((id) => id !== "" && !(id in workflowNames))
       .sort();
 
+    // The ActionsConfig read (prepareWorkflowTemplate's MustGetUnit arm —
+    // ctx.Data["ActionsConfig"]): the sidebar's disabled red labels
+    // (sidebar.tmpl:12-14) + the ⑲A5 kebab's enable/disable state. One D1
+    // read per full page.
+    const actionsConfig = await loadRepoActionsConfig(d1, repo.id);
+    const disabledWorkflows = actionsConfig.disabledWorkflows;
+    // CurWorkflowIsListed (actions.go:169's repo-level shape — the scoped
+    // arm defers with C10).
+    const curWorkflowIsListed = query.workflow === "" || workflows.some((wf) => wf.entryName === query.workflow);
+
+    // prepareWorkflowDispatchTemplate (actions.go:400-465) at the v1 stage:
+    // the selected workflow + a writer + the repo-level arm + the enabled
+    // check, then the file's parse — the banner renders only when the
+    // dispatch declaration exists (list.tmpl:99's .WorkflowDispatchConfig
+    // gate). The parse is the landed fragment parser (the module header's
+    // single-parse note: upstream derives this from the SAME ReadWorkflow
+    // pass the sidebar uses; our light name-parse is a separate pass, so
+    // the selected file parses twice — one extra yaml read, full page only).
+    let workflowDispatch: { inputs: WorkflowDispatchInput[] } | null = null;
+    if (canWriteActions && query.workflow !== "" && query.scopedWorkflowSourceRepoId === 0 && !disabledWorkflows.includes(query.workflow)) {
+      const selected = workflows.find((wf) => wf.entryName === query.workflow);
+      if (selected !== undefined && selected.errMsg === null) {
+        const content = await readWorkflowContent(engine, repo.defaultBranch, query.workflow);
+        if (content !== null) {
+          const parsed = parseWorkflowDispatchInputs(content);
+          if (parsed.errMsg === null && parsed.dispatch !== null) {
+            workflowDispatch = { inputs: parsed.dispatch.inputs };
+          }
+        }
+      }
+    }
+
+    // The dispatch modal's branch/tag lists (prepareWorkflowDispatchTemplate's
+    // tail — FindBranchNames + GetTagNamesByRepoID): the git-refs reduction
+    // (the module header's RunBranches note — upstream reads its branch
+    // table), the default branch hoisted to the top, tags name-sorted.
+    const dispatchBranches = [repo.defaultBranch, ...[...branchNames].filter((name) => name !== repo.defaultBranch).sort((a, b) => a.localeCompare(b))];
+    const dispatchTags = (refs?.refs ?? [])
+      .flatMap((ref) => (ref.name.startsWith("refs/tags/") ? [ref.name.slice("refs/tags/".length)] : []))
+      .sort((a, b) => a.localeCompare(b));
+
     // GetActors: the runs' distinct trigger users (viewer self on top —
     // MakeSelfOnTop; then display-name order — the GetOrderByName
     // reduction).
@@ -861,6 +979,12 @@ export async function loadRepoActionsRunsData(input: RepoActionsRunsInput): Prom
       hasWorkflowsOrRuns,
       canWriteActions,
       canWriteCode,
+      disabledWorkflows,
+      allowDisableOrEnable,
+      curWorkflowIsListed,
+      workflowDispatch,
+      dispatchBranches,
+      dispatchTags,
     };
   }
 
@@ -869,6 +993,7 @@ export async function loadRepoActionsRunsData(input: RepoActionsRunsInput): Prom
     isFiltered,
     workflowNames,
     curWorkflow: query.workflow,
+    canWriteActions,
     refreshLink,
     refreshIntervalMs,
     total,
@@ -877,6 +1002,23 @@ export async function loadRepoActionsRunsData(input: RepoActionsRunsInput): Prom
     more,
     pageBlock,
   };
+}
+
+/** One workflow file's content re-read for the dispatch parse — the
+ *  workflow-dir probe again (listWorkflowsFromEngine keeps the winning dir
+ *  internal), then the blob. null answers the availability ladder. */
+async function readWorkflowContent(engine: EngineClient, defaultBranch: string, entryName: string): Promise<string | null> {
+  for (const candidate of WORKFLOW_DIRS) {
+    const tree = await engine.listTree(defaultBranch, candidate);
+    if (tree === null) continue;
+    const entry = tree.entries.find(
+      (item) => item.type === "blob" && (item.name.endsWith(".yml") || item.name.endsWith(".yaml")) && item.name === entryName,
+    );
+    if (entry === undefined) return null; // the first EXISTING dir wins — the walk stops there
+    const blob = await engine.readBlob(defaultBranch, `${candidate}/${entry.name}`);
+    return blob === null ? null : new TextDecoder().decode(blob.data);
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -918,6 +1060,13 @@ export function actionStatusIcon(name: string, variant: "plain" | "circle-fill")
 // The render (list.tmpl / runs_list.tmpl / sidebar.tmpl / no_workflows.tmpl)
 // ---------------------------------------------------------------------------
 
+/** RenderCommitMessageLinkSubject's first-line cut (util_render.go:61-64:
+ *  TrimSpace → Cut("\n") → TrimSpace) — the ⑲A7 title clause's subject
+ *  arm; the wrapper/link shape renders in the row. */
+export function titleSubjectOf(title: string): string {
+  return title.trim().split("\n", 1)[0]?.trim() ?? "";
+}
+
 /** The runs_list rows + the container attrs (the fragment IS this markup —
  *  runs_list.tmpl:1-5's data-global-init contract). */
 function RunsList(props: { repoLink: string; data: RepoActionsRunsData }) {
@@ -939,6 +1088,7 @@ function RunsList(props: { repoLink: string; data: RepoActionsRunsData }) {
         const statusString = statusName(run.status);
         const icon = actionStatusIcon(statusString, "circle-fill");
         const workflowDisplayName = data.workflowNames[run.workflowId];
+        const done = isDoneStatus(run.status);
         const title = run.title !== "" ? run.title : repoActionsRunsLocale.empty_commit_message;
         return (
           <div id={`action-run-item-${run.id}`} class="item tw-items-center" data-status={statusString} data-morph-whole>
@@ -949,7 +1099,14 @@ function RunsList(props: { repoLink: string; data: RepoActionsRunsData }) {
             </div>
             <div class="item-main">
               <div class="item-title">
-                <a href={run.link}>{title}</a>
+                {/* RenderCommitMessageLinkSubject's reduction (runs_list.tmpl:22
+                    — the module header): the first-line subject onto the run
+                    link, the upstream wrapper classes. */}
+                <span class="title-full-link-hover">
+                  <a class="muted title-full-link" href={run.link}>
+                    {titleSubjectOf(title)}
+                  </a>
+                </span>
               </div>
               <div class="item-body">
                 <span>
@@ -1002,6 +1159,33 @@ function RunsList(props: { repoLink: string; data: RepoActionsRunsData }) {
                   {run.durationText}
                 </div>
               </div>
+              {/* The row kebab (runs_list.tmpl:55-73 — the ⑲A2 row): the
+                  view-workflow-file link rides the landed route; cancel and
+                  delete are the bundle's link-action POSTs (delete carries
+                  the data-modal-confirm dialog). The IsDone gate reads the
+                  ROLLED-UP status — the same value the row's leading icon
+                  and data-status render (the module header's M1a seam). */}
+              <div class="ui dropdown jump tw-p-2">
+                <Icon name="octicon-kebab-horizontal" />
+                <div class="menu flex-items-menu">
+                  <a class="item" href={`${run.link}/workflow`}>
+                    <Icon name="octicon-play" />
+                    {repoActionsRunsLocale.view_workflow_file}
+                  </a>
+                  {data.canWriteActions && !done ? (
+                    <a class="item link-action" data-url={`${run.link}/cancel`}>
+                      <Icon name="octicon-x" />
+                      {repoActionsRunsLocale.cancel}
+                    </a>
+                  ) : null}
+                  {data.canWriteActions && done ? (
+                    <a class="item link-action negative" data-url={`${run.link}/delete`} data-modal-confirm={repoActionsRunsLocale.delete_confirm}>
+                      <Icon name="octicon-trash" />
+                      {repoActionsRunsLocale.delete}
+                    </a>
+                  ) : null}
+                </div>
+              </div>
             </div>
           </div>
         );
@@ -1027,8 +1211,9 @@ function filterHref(
   return `${basePath}?${params.toString()}`;
 }
 
-/** The sidebar (sidebar.tmpl:1-52 reduced — the scoped groups defer with
- *  C10, the Management section lands with C6; the module header). */
+/** The sidebar (sidebar.tmpl:1-62 — the scoped groups defer with C10; the
+ *  disabled red labels ride the LANDED ActionsConfig store, and the
+ *  Management section is the ⑲A3 row's live job-queue link). */
 function ActionsSidebar(props: { repoLink: string; data: RepoActionsRunsData }) {
   const block = props.data.pageBlock;
   if (block === null) return null;
@@ -1039,10 +1224,6 @@ function ActionsSidebar(props: { repoLink: string; data: RepoActionsRunsData }) 
     status: block.curStatus,
     branch: block.curBranch,
   };
-  // CurWorkflowIsListed (actions.go:169) — the scoped arm is deferred, so
-  // the Other-workflows disclosure opens exactly when the selected
-  // workflow is one of the orphans.
-  const curWorkflowIsListed = props.data.curWorkflow === "" || block.workflows.some((wf) => wf.entryName === props.data.curWorkflow);
   return (
     <div class="flex-container-nav">
       <div class="ui fluid vertical menu">
@@ -1063,10 +1244,13 @@ function ActionsSidebar(props: { repoLink: string; data: RepoActionsRunsData }) 
                 <Icon name="octicon-alert" class="tw-text-red" />
               </span>
             ) : null}
+            {block.disabledWorkflows.includes(wf.entryName) ? (
+              <div class="ui red label tw-shrink-0">{repoActionsRunsLocale.disabled}</div>
+            ) : null}
           </a>
         ))}
         {block.otherWorkflows.length > 0 ? (
-          <details class="item" open={!curWorkflowIsListed}>
+          <details class="item" open={!block.curWorkflowIsListed}>
             <summary data-tooltip-content={repoActionsRunsLocale.other_workflows_tooltip}>
               <span class="flex-text-block">
                 {repoActionsRunsLocale.other_workflows}
@@ -1089,12 +1273,22 @@ function ActionsSidebar(props: { repoLink: string; data: RepoActionsRunsData }) 
           </details>
         ) : null}
       </div>
+      {/* The Management menu (sidebar.tmpl:54-62 — the ⑲A3 row): the
+          job-queue item never carries `active` here (PageIsActionsJobQueue
+          is the queue page's own arm). */}
+      <div class="ui fluid secondary vertical menu flex-items-block">
+        <div>{repoActionsRunsLocale.management}</div>
+        <a class="item" href={`${props.repoLink}/actions/job_queue`}>
+          <Icon name="octicon-list-ordered" />
+          <span class="gt-ellipsis">{repoActionsRunsLocale.job_queue}</span>
+        </a>
+      </div>
     </div>
   );
 }
 
-/** The filter menu (list.tmpl:17-96 reduced — the kebab arm renders nothing,
- *  the module header). */
+/** The filter menu (list.tmpl:17-96 — the kebab arm is the ⑲A5 row's live
+ *  badge-modal entry + enable/disable item). */
 function RunsFilterMenu(props: { repoLink: string; data: RepoActionsRunsData }) {
   const block = props.data.pageBlock;
   if (block === null) return null;
@@ -1161,8 +1355,59 @@ function RunsFilterMenu(props: { repoLink: string; data: RepoActionsRunsData }) 
           ))}
         </div>
       </div>
+      {/* The kebab button (list.tmpl:79-95 — the ⑲A5 row): the badge-modal
+          entry rides the LIVE badge.svg route; the enable/disable item is
+          the bundle's link-action POST to the orchestrator-owned
+          /actions/{enable|disable} mount. CurWorkflowRequired is the scoped
+          arm — v1-inert (the module header), so the item is never the
+          disabled class. */}
+      {runsFilterKebabVisible(props.data) ? (
+        <button type="button" class="ui jump dropdown btn interact-bg tw-p-2">
+          <Icon name="octicon-kebab-horizontal" />
+          <div class="menu">
+            {showCreateWorkflowBadge(props.data) ? (
+              <div class="item show-modal" data-modal="#workflow-status-badge-modal">
+                {repoActionsRunsLocale.create_status_badge}
+              </div>
+            ) : null}
+            {showEnableDisableWorkflow(props.data) ? (
+              <a
+                class="item link-action"
+                data-url={`${basePath}/${block.disabledWorkflows.includes(props.data.curWorkflow) ? "enable" : "disable"}?${new URLSearchParams({
+                  workflow: props.data.curWorkflow,
+                  scoped_workflow_source_repo_id: String(block.curWorkflowRepoId),
+                  actor: String(block.curActor),
+                  status: String(block.curStatus),
+                  branch: block.curBranch,
+                }).toString()}`}
+              >
+                {block.disabledWorkflows.includes(props.data.curWorkflow)
+                  ? repoActionsRunsLocale.enable_workflow
+                  : repoActionsRunsLocale.disable_workflow}
+              </a>
+            ) : null}
+          </div>
+        </button>
+      ) : null}
     </div>
   );
+}
+
+/** $showCreateWorkflowBadge (list.tmpl:3): WorkflowBadge is set exactly for
+ *  a selected REPO-LEVEL workflow (prepareFullPageTemplate's scoped guard +
+ *  prepareWorkflowBadgeTemplate's empty-id arm). */
+function showCreateWorkflowBadge(data: RepoActionsRunsData): boolean {
+  return data.curWorkflow !== "" && data.pageBlock !== null && data.pageBlock.curWorkflowRepoId === 0;
+}
+
+/** $showEnableDisableWorkflow (list.tmpl:4): admin + listed + selected. */
+function showEnableDisableWorkflow(data: RepoActionsRunsData): boolean {
+  const block = data.pageBlock;
+  return block !== null && block.allowDisableOrEnable && block.curWorkflowIsListed && data.curWorkflow !== "";
+}
+
+function runsFilterKebabVisible(data: RepoActionsRunsData): boolean {
+  return showCreateWorkflowBadge(data) || showEnableDisableWorkflow(data);
 }
 
 /** The Older/Newer pager (base/paginate's landed reduction — the admin
@@ -1196,6 +1441,186 @@ function RunsListPagination(props: { basePath: string; data: RepoActionsRunsData
         ) : null}
       </div>
     </div>
+  );
+}
+
+/** The dispatch banner + modal (workflow_dispatch.tmpl — the ⑲A4 row). The
+ *  form POSTs to /actions/run with the FULL filter set (the template's
+ *  action URL — the orchestrator-owned mount; the producer is
+ *  services/actions/workflow-dispatch.ts); the branch dropdown's hidden
+ *  input carries the bundle's data-fetch pair — a change re-fetches the
+ *  LIVE /actions/workflow-dispatch-inputs fragment and syncs it into
+ *  #runWorkflowDispatchModalInputs. The initial body is the SSR'd fragment
+ *  at the default ref (the template's include; the one-wrapper delta is
+ *  the string-include reduction). */
+function WorkflowDispatchBanner(props: { basePath: string; curWorkflow: string; block: RepoActionsRunsPageBlock; defaultBranch: string }) {
+  const { block } = props;
+  const fetchUrl = `${props.basePath}/workflow-dispatch-inputs?${new URLSearchParams({
+    workflow: props.curWorkflow,
+    scoped_workflow_source_repo_id: String(block.curWorkflowRepoId),
+  }).toString()}`;
+  const action = `${props.basePath}/run?${new URLSearchParams({
+    workflow: props.curWorkflow,
+    scoped_workflow_source_repo_id: String(block.curWorkflowRepoId),
+    actor: String(block.curActor),
+    status: String(block.curStatus),
+    branch: block.curBranch,
+  }).toString()}`;
+  const firstBranch = props.block.dispatchBranches[0] ?? props.defaultBranch;
+  return (
+    <>
+      <div class="ui blue info attached message flex-left-right tw-z-1">
+        <span>{repoActionsRunsLocale.has_workflow_dispatch}</span>
+        <div class="flex-text-block tw-bg-box-body tw-rounded">
+          <button type="button" class="ui mini button show-modal" data-modal="#runWorkflowDispatchModal">
+            {repoActionsRunsLocale.run}
+            <Icon name="octicon-triangle-down" size={14} class="dropdown icon" />
+          </button>
+        </div>
+      </div>
+      <dialog id="runWorkflowDispatchModal" class="modal-dialog">
+        <div class="content">
+          <form id="runWorkflowDispatchForm" class="ui form ignore-dirty" action={action} method="post">
+            <div class="ui inline field required tw-flex tw-items-center">
+              <span class="ui inline required field">
+                <label>{repoActionsRunsLocale.from_ref}:</label>
+              </span>
+              <div class="ui inline field dropdown button select-branch branch-selector-dropdown ellipsis-text-items">
+                <input
+                  type="hidden"
+                  name="ref"
+                  value={`refs/heads/${firstBranch}`}
+                  data-fetch-trigger="change"
+                  data-fetch-sync="$body #runWorkflowDispatchModalInputs"
+                  data-fetch-url={fetchUrl}
+                />
+                <Icon name="octicon-git-branch" size={14} />
+                <div class="default text">{firstBranch}</div>
+                <Icon name="octicon-triangle-down" size={14} class="dropdown icon" />
+                <div class="menu transition">
+                  <div class="ui icon search input">
+                    <i class="icon">
+                      <Icon name="octicon-filter" size={16} />
+                    </i>
+                    <input name="search" type="text" placeholder={`${repoActionsRunsLocale.filter_branch_and_tag}...`} />
+                  </div>
+                  <div class="branch-tag-tab">
+                    <button type="button" class="btn branch-tag-item reference column active" data-target="#branch-list">
+                      <Icon name="octicon-git-branch" size={16} class="tw-mr-1" /> {repoActionsRunsLocale.branches}
+                    </button>
+                    <button type="button" class="btn branch-tag-item reference column" data-target="#tag-list">
+                      <Icon name="octicon-tag" size={16} class="tw-mr-1" /> {repoActionsRunsLocale.tags}
+                    </button>
+                  </div>
+                  <div class="branch-tag-divider" />
+                  <div id="branch-list" class="scrolling menu reference-list-menu">
+                    {block.dispatchBranches.map((branch) => (
+                      <div class="item" data-value={`refs/heads/${branch}`} title={branch}>
+                        {branch}
+                      </div>
+                    ))}
+                    {block.dispatchBranches.length === 0 ? <div class="item">{repoActionsRunsLocale.no_results_found}</div> : null}
+                  </div>
+                  <div id="tag-list" class="scrolling menu reference-list-menu tw-hidden">
+                    {block.dispatchTags.map((tag) => (
+                      <div class="item" data-value={`refs/tags/${tag}`} title={tag}>
+                        {tag}
+                      </div>
+                    ))}
+                    {block.dispatchTags.length === 0 ? <div class="item">{repoActionsRunsLocale.no_results_found}</div> : null}
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="divider" />
+            {/* workflow_dispatch_inputs.tmpl's include — the SSR'd body at
+                the default ref (the fetch-sync swaps it on a branch change;
+                the wrapper div is the string-include's carrier). */}
+            <div
+              dangerouslySetInnerHTML={{
+                __html: renderWorkflowDispatchInputsFragment({
+                  curWorkflow: props.curWorkflow,
+                  errMsg: null,
+                  curWorkflowExists: true,
+                  dispatch: block.workflowDispatch,
+                }),
+              }}
+            />
+          </form>
+        </div>
+      </dialog>
+    </>
+  );
+}
+
+/** The badge modal (list.tmpl:115-161 — the ⑲A5 row) against the LIVE
+ *  badge.svg route. The URL/Markdown/HTML fields stay empty — the bundle's
+ *  initWorkflowBadgeForm fills them from the data-* attributes (the branch
+ *  dropdown re-composes the badge URL per branch, exactly upstream's
+ *  empty-readonly posture). */
+function WorkflowStatusBadgeModal(props: { ctx: UiContext; data: RepoActionsRunsData }) {
+  const { ctx, data } = props;
+  const repo = ctx.repo;
+  if (repo === undefined) throw new Error("WorkflowStatusBadgeModal requires ctx.repo");
+  const block = data.pageBlock;
+  if (block === null) return null;
+  const displayName = data.workflowNames[data.curWorkflow] ?? data.curWorkflow;
+  const badgeUrl = `${ctx.origin}/${repo.ownerNamespace}/${repo.slug}/actions/workflows/${pathEscapeSegments(data.curWorkflow)}/badge.svg?branch=${encodeURIComponent(repo.defaultBranch)}`;
+  const workflowUrl = `${ctx.origin}/${repo.ownerNamespace}/${repo.slug}/actions?workflow=${encodeURIComponent(data.curWorkflow)}`;
+  return (
+    <dialog id="workflow-status-badge-modal" class="modal-dialog">
+      <div class="header">{repoActionsRunsLocale.status_badge}</div>
+      <div class="content">
+        <div
+          class="ui form"
+          data-global-init="initWorkflowBadgeForm"
+          data-badge-url={badgeUrl}
+          data-workflow-url={workflowUrl}
+          data-workflow-display-name={displayName}
+        >
+          <div class="field">
+            <img data-workflow-badge-image src={badgeUrl} alt={data.curWorkflow} />
+          </div>
+          <div class="field">
+            <label>{repoActionsRunsLocale.branch}</label>
+            <div class="ui selection dropdown">
+              <input type="hidden" data-workflow-badge-branch="" value={repo.defaultBranch} />
+              <Icon name="octicon-triangle-down" size={14} class="dropdown icon" />
+              <div class="text">{repo.defaultBranch}</div>
+              <div class="menu">
+                <div class="item selected" data-value={repo.defaultBranch}>
+                  {repo.defaultBranch}
+                </div>
+                {block.runBranches
+                  .filter((branch) => branch !== repo.defaultBranch)
+                  .map((branch) => (
+                    <div key={branch} class="item" data-value={branch}>
+                      {branch}
+                    </div>
+                  ))}
+              </div>
+            </div>
+          </div>
+          <div class="field">
+            <label>{repoActionsRunsLocale.status_badge_url}</label>
+            <div class="ui action input">
+              <input id="workflow-badge-url" readonly autofocus />
+              <button type="button" class="ui icon button" data-tooltip-content={repoActionsRunsLocale.copy} data-clipboard-target="#workflow-badge-url">
+                <Icon name="octicon-copy" size={14} />
+              </button>
+            </div>
+          </div>
+          <div class="field">
+            <label>{repoActionsRunsLocale.markdown}</label>
+            <textarea id="workflow-badge-markdown" rows={2} readonly />
+          </div>
+          <div class="field">
+            <label>{repoActionsRunsLocale.html}</label>
+            <textarea id="workflow-badge-html" rows={2} readonly />
+          </div>
+        </div>
+      </div>
+    </dialog>
   );
 }
 
@@ -1243,6 +1668,15 @@ export function RepoActionsRunsPage(props: { ctx: UiContext; data: RepoActionsRu
                 </strong>
                 <RunsFilterMenu repoLink={repoLink} data={props.data} />
               </div>
+              {/* The dispatch banner (list.tmpl:99-101 — .WorkflowDispatchConfig's gate). */}
+              {block.workflowDispatch !== null ? (
+                <WorkflowDispatchBanner
+                  basePath={`${repoLink}/actions`}
+                  curWorkflow={props.data.curWorkflow}
+                  block={block}
+                  defaultBranch={repo.defaultBranch}
+                />
+              ) : null}
               <div class="ui attached segment">
                 <RunsList repoLink={repoLink} data={props.data} />
                 <RunsListPagination basePath={`${repoLink}/actions`} data={props.data} />
@@ -1251,6 +1685,11 @@ export function RepoActionsRunsPage(props: { ctx: UiContext; data: RepoActionsRu
           </div>
         )}
       </div>
+      {/* The badge modal rides the DOCUMENT (list.tmpl:115 — outside the
+          container), gated on the same $showCreateWorkflowBadge. */}
+      {block !== null && block.hasWorkflowsOrRuns && showCreateWorkflowBadge(props.data) ? (
+        <WorkflowStatusBadgeModal ctx={ctx} data={props.data} />
+      ) : null}
     </BaseLayout>
   );
 }

@@ -1,0 +1,234 @@
+/**
+ * The workflow DISPATCH producer's tests (the ⑲A4 row's service arm —
+ * workflow.go:64-199's repo-level port): the validation ladder with its
+ * upstream messages (the disabled check, the ref resolution arms, the
+ * workflow-not-found and has-no-dispatch arms, the light invalid arm), the
+ * input processing (boolean coercion, the default fallback, the form-value
+ * precedence), the payload shape (the raw ref string verbatim, the
+ * stringified inputs, the {}-shaped repository/sender), and the inserted
+ * run's skeleton (event/trigger_event workflow_dispatch, the normalized
+ * ref, the commit-subject title) with its waiting jobs.
+ */
+
+import { applyD1Migrations } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { eq } from "drizzle-orm";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { drizzle } from "drizzle-orm/d1";
+
+import { actionRunJobs, repoUnits, repositories, users } from "../../db/schema";
+import { ACTION_STATUS_WAITING } from "./model";
+import { saveRepoActionsConfig } from "./config";
+import { dispatchWorkflow, workflowDispatchLocale, type WorkflowDispatchReads } from "./workflow-dispatch";
+
+beforeAll(async () => {
+  if (env.TEST_MIGRATIONS === undefined) {
+    throw new Error("TEST_MIGRATIONS binding missing — vitest.config.ts must inject readD1Migrations()");
+  }
+  await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
+});
+
+const CLEANUP_TABLES = ["action_runs", "action_run_jobs", "action_run_attempts", "action_tasks", "action_tasks_versions", "repo_counters", "repo_units", "repositories", "users"];
+
+beforeEach(async () => {
+  for (const table of CLEANUP_TABLES) {
+    await env.DB.prepare(`DELETE FROM ${table}`).run();
+  }
+});
+
+const db = () => drizzle(env.DB);
+
+const REPO_ID = "repo-dispatch";
+const USER_ID = 7;
+const T0 = new Date(1_700_000_000 * 1000);
+const SHA = "ccccdddddddddddddddddddddddddddddddddddd";
+
+const DISPATCH_WORKFLOW = `name: Greet
+on:
+  workflow_dispatch:
+    inputs:
+      greeting:
+        description: The greeting
+        default: hello
+      flag:
+        description: The flag
+        type: boolean
+        default: "true"
+jobs:
+  build:
+    steps: []
+`;
+
+const PUSH_ONLY_WORKFLOW = "on: push\njobs:\n  build:\n    steps: []\n";
+
+/** The engine fake — the workflow dir walk + the ref-aware commit read (the
+ *  commits map carries the resolvable refs and their subjects; refs/heads/
+ *  main resolves by default, any other ref answers null — the miss arm). */
+function fakeReads(files: Record<string, string>, commits: Record<string, string> = {}): WorkflowDispatchReads {
+  const resolved: Record<string, string> = { "refs/heads/main": "default subject", ...commits };
+  const dirNames = new Set(Object.keys(files).map((path) => path.split("/").slice(0, 2).join("/")));
+  return {
+    readCommit: (id) => {
+      const subject = id === undefined ? undefined : resolved[id];
+      return subject === undefined
+        ? Promise.resolve(null)
+        : Promise.resolve({ oid: SHA, subject: subject.split("\n", 1)[0] ?? "" });
+    },
+    listTree: (_ref, path) =>
+      dirNames.has(path ?? "")
+        ? Promise.resolve({
+            oid: SHA,
+            entries: Object.keys(files)
+              .filter((p) => p.startsWith(`${path ?? ""}/`))
+              .map((p) => ({ name: p.slice((path ?? "").length + 1), type: "blob" })),
+          })
+        : Promise.resolve(null),
+    readBlob: (_ref, path) => {
+      const content = files[path];
+      return content === undefined
+        ? Promise.resolve(null)
+        : Promise.resolve({ oid: SHA, mode: "100644", data: new TextEncoder().encode(content) });
+    },
+  };
+}
+
+async function seedRepo(): Promise<void> {
+  await db().insert(users).values({ id: USER_ID, username: "alice", usernameLower: "alice", status: "active", createdAt: T0 });
+  await db().insert(repositories).values({
+    id: REPO_ID,
+    storageKey: `r_${REPO_ID}`,
+    ownerNamespace: "alice",
+    ownerId: USER_ID,
+    slug: "demo",
+    visibility: "public",
+  });
+  await db().insert(repoUnits).values({ repoId: REPO_ID, type: "actions" });
+}
+
+function dispatch(reads: WorkflowDispatchReads, patch: Partial<Parameters<typeof dispatchWorkflow>[0]> = {}) {
+  return dispatchWorkflow({
+    d1: env.DB,
+    reads,
+    repo: { id: REPO_ID, ownerId: USER_ID, ownerNamespace: "alice", slug: "demo", defaultBranch: "main" },
+    workflowId: "ci.yml",
+    ref: "refs/heads/main",
+    scopedWorkflowSourceRepoId: 0,
+    form: {},
+    triggerUserId: USER_ID,
+    appUrl: "https://test.local",
+    ...patch,
+  });
+}
+
+describe("dispatchWorkflow (workflow.go:64-199's repo-level arm, the ⑲A4 producer)", () => {
+  beforeEach(seedRepo);
+
+  it("inserts the run with the dispatch skeleton: normalized ref, commit-subject title, event pair, waiting jobs", async () => {
+    const outcome = await dispatch(
+      fakeReads({ ".gitea/workflows/ci.yml": DISPATCH_WORKFLOW }, { "refs/heads/main": "Fix the thing\n\nthe body" }),
+    );
+    expect(outcome.status).toBe("ok");
+    if (outcome.status !== "ok") return;
+    expect(outcome.run.event).toBe("workflow_dispatch");
+    expect(outcome.run.triggerEvent).toBe("workflow_dispatch");
+    expect(outcome.run.ref).toBe("refs/heads/main"); // the normalized RefName
+    expect(outcome.run.title).toBe("Fix the thing"); // MessageTitle
+    expect(outcome.run.commitSha).toBe(SHA);
+    expect(outcome.run.isForkPullRequest).toBe(false);
+    expect(outcome.run.status).toBe(ACTION_STATUS_WAITING);
+    const jobs = await db().select().from(actionRunJobs).where(eq(actionRunJobs.runId, outcome.run.id));
+    expect(jobs.length).toBe(1);
+    expect(jobs[0]?.status).toBe(ACTION_STATUS_WAITING);
+  });
+
+  it("a bare branch ref re-reads as refs/heads/<branch> (workflow.go:113-115's RefNameFromBranch arm); the payload keeps the RAW ref", async () => {
+    const outcome = await dispatch(fakeReads({ ".gitea/workflows/ci.yml": DISPATCH_WORKFLOW }), { ref: "feature" });
+    expect(outcome.status).toBe("translatable"); // the fake resolves only refs/heads/main
+    if (outcome.status !== "translatable") return;
+    expect(outcome.message).toBe(workflowDispatchLocale.targetRefNotExist.replace("%s", "feature"));
+
+    // A resolvable bare branch: readCommit sees refs/heads/feature through
+    // the fake's commits map.
+    const reads = fakeReads({ ".gitea/workflows/ci.yml": DISPATCH_WORKFLOW }, { "refs/heads/feature": "branch subject" });
+    const ok = await dispatch(reads, { ref: "feature" });
+    expect(ok.status).toBe("ok");
+    if (ok.status !== "ok") return;
+    expect(ok.run.ref).toBe("refs/heads/feature");
+    const payload = JSON.parse(ok.run.eventPayload) as { ref: string; inputs: Record<string, string> };
+    expect(payload.ref).toBe("feature"); // the RAW form string (workflow.go:179)
+  });
+
+  it("processes the inputs: booleans coerce, the default fills, the form value wins (view.go:1397-1404 + workflow.go:201-210)", async () => {
+    const outcome = await dispatch(fakeReads({ ".gitea/workflows/ci.yml": DISPATCH_WORKFLOW }), {
+      form: { greeting: "hi there", flag: "on" },
+    });
+    expect(outcome.status).toBe("ok");
+    if (outcome.status !== "ok") return;
+    const payload = JSON.parse(outcome.run.eventPayload) as { workflow: string; inputs: Record<string, string>; repository: Record<string, never>; sender: Record<string, never> };
+    expect(payload.workflow).toBe("ci.yml");
+    expect(payload.inputs.greeting).toBe("hi there");
+    expect(payload.inputs.flag).toBe("true"); // the typed bool → CoerceToString
+    expect(payload.repository).toEqual({});
+    expect(payload.sender).toEqual({});
+
+    // The typed map (the expression surface) carries a REAL boolean.
+    const typed = await dispatch(fakeReads({ ".gitea/workflows/ci.yml": DISPATCH_WORKFLOW }), { form: { flag: "1" } });
+    if (typed.status !== "ok") throw new Error("expected ok");
+    expect(typed.status).toBe("ok");
+    // The empty-form arm: the non-boolean falls back to the declared
+    // default; the boolean takes FormBool directly (an absent checkbox is
+    // false — the form's checked state carries the default, view.go:1397-1404).
+    const defaultForm = await dispatch(fakeReads({ ".gitea/workflows/ci.yml": DISPATCH_WORKFLOW }));
+    if (defaultForm.status !== "ok") throw new Error("expected ok");
+    const defaultPayload = JSON.parse(defaultForm.run.eventPayload) as { inputs: Record<string, string> };
+    expect(defaultPayload.inputs.greeting).toBe("hello");
+    expect(defaultPayload.inputs.flag).toBe("false");
+  });
+
+  it("answers the translatable ladder verbatim: not-found, no-dispatch, disabled, invalid", async () => {
+    const reads = fakeReads({ ".gitea/workflows/ci.yml": PUSH_ONLY_WORKFLOW });
+    // Unknown workflow id.
+    const missing = await dispatch(reads, { workflowId: "nope.yml" });
+    expect(missing).toEqual({ status: "translatable", message: "Workflow 'nope.yml' not found." });
+    // Parsed but no workflow_dispatch declaration.
+    const noDispatch = await dispatch(reads);
+    expect(noDispatch).toEqual({
+      status: "translatable",
+      message: "Workflow 'ci.yml' has no workflow_dispatch event trigger.",
+    });
+    // Disabled via the ActionsConfig store.
+    await saveRepoActionsConfig(env.DB, REPO_ID, {
+      disabledWorkflows: ["ci.yml"],
+      disabledScopedWorkflows: {},
+      collaborativeOwnerIds: [],
+      tokenPermissionMode: "permissive",
+      maxTokenPermissions: null,
+      overrideOwnerConfig: false,
+    });
+    const dispatchReads = fakeReads({ ".gitea/workflows/ci.yml": DISPATCH_WORKFLOW });
+    const disabled = await dispatch(dispatchReads);
+    expect(disabled).toEqual({ status: "translatable", message: workflowDispatchLocale.workflowDisabled });
+    // A broken document → the light invalid arm.
+    await saveRepoActionsConfig(env.DB, REPO_ID, {
+      disabledWorkflows: [],
+      disabledScopedWorkflows: {},
+      collaborativeOwnerIds: [],
+      tokenPermissionMode: "permissive",
+      maxTokenPermissions: null,
+      overrideOwnerConfig: false,
+    });
+    const invalid = await dispatch(fakeReads({ ".gitea/workflows/ci.yml": "\t: [broken" }));
+    expect(invalid.status).toBe("translatable");
+    if (invalid.status === "translatable") {
+      expect(invalid.message).toContain("Workflow config file is invalid");
+    }
+  });
+
+  it("the guards: an empty workflow id or ref throws (the Run handler's ServerError arms); the scoped id answers not-found", async () => {
+    const reads = fakeReads({ ".gitea/workflows/ci.yml": DISPATCH_WORKFLOW });
+    expect((await dispatch(reads, { workflowId: "" })).status).toBe("throw");
+    expect((await dispatch(reads, { ref: "" })).status).toBe("throw");
+    const scoped = await dispatch(reads, { scopedWorkflowSourceRepoId: 5 });
+    expect(scoped).toEqual({ status: "translatable", message: "Workflow 'ci.yml' not found." });
+  });
+});

@@ -19,6 +19,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
 import { loadRepoSettings, saveRepoSettings } from "../../api/services/repo-settings";
+import { saveRepoActionsConfig, type RepoActionsConfig } from "../../services/actions/config";
 import { insertActionRun } from "../../services/actions/model";
 import { actionRunJobs, actionRunners, actionRuns, repositories } from "../../db/schema";
 import { locale } from "../locale";
@@ -99,6 +100,7 @@ beforeEach(async () => {
     "action_runners",
     "action_runner_tokens",
     "action_tasks_versions",
+    "repo_units", // the ActionsConfig store's row — the ⑲A5 tests write it
     "repo_settings",
     "repositories",
     "users",
@@ -125,6 +127,19 @@ async function seedRepo(slug: string): Promise<RepoRow> {
 /** The Actions unit ON — the MustEnableActions arm's happy path. */
 async function enableActions(): Promise<void> {
   await saveRepoSettings(env.DB, repo.id, { hasActions: true }, T0);
+}
+
+/** The zero ActionsConfig (parseRepoActionsConfig's zero shape) for the
+ *  ⑲A5 store-wiring seeds. */
+function zeroActionsConfig(): RepoActionsConfig {
+  return {
+    disabledWorkflows: [],
+    disabledScopedWorkflows: {},
+    collaborativeOwnerIds: [],
+    tokenPermissionMode: "permissive",
+    maxTokenPermissions: null,
+    overrideOwnerConfig: false,
+  };
 }
 
 const PAYLOAD = new Uint8Array([1]); // the staged insert's blob is unread here
@@ -275,6 +290,7 @@ async function loadData(
   patch: Partial<ActionRunListQuery> = {},
   engine: EngineClient = emptyEngine,
   requestUri = "/alice/demo/actions",
+  opts: { canWriteActions?: boolean; isAdmin?: boolean } = {},
 ): Promise<RepoActionsRunsData> {
   return loadRepoActionsRunsData({
     d1: env.DB,
@@ -282,7 +298,8 @@ async function loadData(
     repo,
     query: baseQuery(patch),
     requestUri,
-    canWriteActions: true,
+    canWriteActions: opts.canWriteActions ?? true,
+    isAdmin: opts.isAdmin,
     nowSeconds: NOW_SECONDS,
   });
 }
@@ -738,8 +755,12 @@ describe("loadRepoActionsRunsData (the rollup + filters over the M1a store)", ()
 // --- the DOM -----------------------------------------------------------------
 
 describe("the runs list DOM (list.tmpl + runs_list.tmpl)", () => {
-  async function seededHtml(engine: EngineClient = emptyEngine, patch: Partial<ActionRunListQuery> = {}): Promise<string> {
-    const data = await loadData(patch, engine);
+  async function seededHtml(
+    engine: EngineClient = emptyEngine,
+    patch: Partial<ActionRunListQuery> = {},
+    opts: { canWriteActions?: boolean; isAdmin?: boolean } = {},
+  ): Promise<string> {
+    const data = await loadData(patch, engine, "/alice/demo/actions", opts);
     // repoHasActions rides the resolved ctx in production (resolveUiRequest's
     // threading); the component-level render passes it explicitly.
     return renderRepoActionsRunsPage({ ...ctx, repo, repoHasActions: true }, data);
@@ -838,9 +859,161 @@ describe("the runs list DOM (list.tmpl + runs_list.tmpl)", () => {
     expect(html).toContain('data-tooltip-content="Build"');
     expect(html).toContain("Other workflows"); // sidebar.tmpl:39
     expect(html).toContain("legacy.yml");
-    // The Management section (job queue) renders nothing — C6's route is
-    // unlanded (the dead-link rule, the module header).
-    expect(html).not.toContain("actions/job_queue");
+    // The Management section (sidebar.tmpl:54-62 — the ⑲A3 row): the
+    // job-queue item against the LANDED route, never active here
+    // (PageIsActionsJobQueue is the queue page's own arm), with the
+    // template's octicon-list-ordered glyph.
+    expect(html).toContain('href="/alice/demo/actions/job_queue"');
+    expect(html).toContain("Management");
+    expect(html).toContain("Job queue");
+    expect(html).toContain("octicon-list-ordered");
+    expect(html).not.toMatch(new RegExp('class="item active" href="/alice/demo/actions/job_queue"'));
+  });
+
+  it("the sidebar renders the workflow DISABLED red label from the ActionsConfig store (sidebar.tmpl:12-14, the ⑲A5 store wiring)", async () => {
+    await enableActions();
+    await saveRepoActionsConfig(env.DB, repo.id, { ...zeroActionsConfig(), disabledWorkflows: ["ci.yml"] });
+    const engine = fakeEngine({
+      branches: ["main"],
+      workflowFiles: {
+        ".gitea/workflows/ci.yml": "on: push\njobs:\n  a:\n    steps: []\n",
+        ".gitea/workflows/other.yml": "on: push\njobs:\n  a:\n    steps: []\n",
+      },
+    });
+    const html = await seededHtml(engine);
+    expect(html).toContain('<div class="ui red label tw-shrink-0">Disabled</div>');
+    // Only the disabled workflow's item carries it (two workflows listed).
+    expect(html.match(/ui red label/g)?.length).toBe(1);
+  });
+
+  it("the row kebab renders the view-workflow-file link and gates cancel/delete by the write grant and IsDone (runs_list.tmpl:55-73, the ⑲A2 row)", async () => {
+    const liveId = await seedRun({ index: 1, jobs: [{ jobId: "a", status: ACTION_STATUS_WAITING }] });
+    const doneId = await seedRun({ index: 2, jobs: [{ jobId: "a", status: ACTION_STATUS_SUCCESS }] });
+    const html = await seededHtml();
+    // Both rows carry the kebab + the view-workflow-file link.
+    expect(html).toContain("octicon-kebab-horizontal");
+    expect(html).toContain(`href="/alice/demo/actions/runs/${liveId}/workflow"`);
+    expect(html).toContain(`href="/alice/demo/actions/runs/${doneId}/workflow"`);
+    // The LIVE run: the cancel link-action; NO delete.
+    expect(html).toContain(`data-url="/alice/demo/actions/runs/${liveId}/cancel"`);
+    expect(html).not.toContain(`data-url="/alice/demo/actions/runs/${liveId}/delete"`);
+    // The DONE run: the negative delete link-action with the confirm
+    // dialog; NO cancel.
+    expect(html).toContain(`data-url="/alice/demo/actions/runs/${doneId}/delete"`);
+    expect(html).toContain(`data-modal-confirm="${repoActionsRunsLocale.delete_confirm}"`);
+    expect(html).not.toContain(`data-url="/alice/demo/actions/runs/${doneId}/cancel"`);
+    // A non-writer loses BOTH write items (the view-workflow-file link
+    // stays — the read arm).
+    const reader = await seededHtml(emptyEngine, {}, { canWriteActions: false });
+    expect(reader).toContain('href="/alice/demo/actions/runs/');
+    expect(reader).not.toContain("link-action");
+  });
+
+  it("the row title renders the RenderCommitMessageLinkSubject reduction (the ⑲A7 title clause)", async () => {
+    await seedRun({ index: 1, title: "Fix the thing\n\nthe body line" });
+    const html = await seededHtml();
+    // The first-line subject inside the upstream wrapper classes.
+    expect(html).toContain('<span class="title-full-link-hover"><a class="muted title-full-link" href="/alice/demo/actions/runs/');
+    expect(html).toContain(">Fix the thing</a></span>");
+    expect(html).not.toContain("the body line");
+  });
+
+  it("the filter kebab renders the badge entry + the enable/disable item per the store and the admin grant (list.tmpl:79-95, the ⑲A5 row)", async () => {
+    const engine = fakeEngine({
+      branches: ["main", "feature"],
+      workflowFiles: { ".gitea/workflows/ci.yml": "on: push\njobs:\n  a:\n    steps: []\n" },
+    });
+    // No workflow selected → no kebab at all.
+    const unselected = await seededHtml(engine);
+    expect(unselected).not.toContain("interact-bg tw-p-2");
+    // Selected + admin → the badge entry + the Disable item.
+    const admin = await seededHtml(engine, { workflow: "ci.yml" }, { isAdmin: true });
+    expect(admin).toContain("interact-bg tw-p-2");
+    expect(admin).toContain('data-modal="#workflow-status-badge-modal"');
+    expect(admin).toContain("Create status badge");
+    expect(admin).toMatch(/data-url="\/alice\/demo\/actions\/disable\?workflow=ci\.yml&amp;scoped_workflow_source_repo_id=0&amp;actor=0&amp;status=0&amp;branch="/);
+    expect(admin).toContain(">Disable Workflow</a>");
+    // The disabled workflow flips the item to Enable.
+    await enableActions();
+    await saveRepoActionsConfig(env.DB, repo.id, { ...zeroActionsConfig(), disabledWorkflows: ["ci.yml"] });
+    const adminEnabled = await seededHtml(engine, { workflow: "ci.yml" }, { isAdmin: true });
+    expect(adminEnabled).toMatch(/data-url="\/alice\/demo\/actions\/enable\?workflow=ci\.yml/);
+    expect(adminEnabled).toContain(">Enable Workflow</a>");
+    // Non-admin + selected → the badge entry only (AllowDisableOrEnableWorkflow).
+    const writer = await seededHtml(engine, { workflow: "ci.yml" });
+    expect(writer).toContain("Create status badge");
+    expect(writer).not.toContain("Disable Workflow");
+  });
+
+  it("the badge modal renders against the LIVE badge.svg route for a selected repo-level workflow (list.tmpl:115-161, the ⑲A5 row)", async () => {
+    const engine = fakeEngine({
+      branches: ["main", "feature"],
+      workflowFiles: { ".gitea/workflows/ci.yml": "name: Build\non: push\njobs:\n  a:\n    steps: []\n" },
+    });
+    const html = await seededHtml(engine, { workflow: "ci.yml" });
+    expect(html).toContain('id="workflow-status-badge-modal"');
+    expect(html).toContain('data-global-init="initWorkflowBadgeForm"');
+    // The badge URL composes per prepareWorkflowBadgeTemplate (the origin +
+    // the escaped workflow id + the default branch), the workflow URL the
+    // display name rides.
+    expect(html).toContain('data-badge-url="https://test.local/alice/demo/actions/workflows/ci.yml/badge.svg?branch=main"');
+    expect(html).toContain('data-workflow-url="https://test.local/alice/demo/actions?workflow=ci.yml"');
+    expect(html).toContain('data-workflow-display-name="Build"');
+    expect(html).toContain('src="https://test.local/alice/demo/actions/workflows/ci.yml/badge.svg?branch=main"');
+    // The branch dropdown carries the default branch selected + the others
+    // (the bare data attribute renders as the empty string in hono/jsx —
+    // the hook attribute the bundle's form init reads).
+    expect(html).toContain('data-workflow-badge-branch="" value="main"');
+    expect(html).toContain('data-value="feature"');
+    // No selection → no modal.
+    const unselected = await seededHtml(engine);
+    expect(unselected).not.toContain("workflow-status-badge-modal");
+  });
+
+  it("the dispatch banner + modal render for a writer on a selected workflow_dispatch workflow (workflow_dispatch.tmpl, the ⑲A4 row)", async () => {
+    const engine = fakeEngine({
+      branches: ["main", "feature"],
+      workflowFiles: {
+        ".gitea/workflows/ci.yml":
+          "on:\n  workflow_dispatch:\n    inputs:\n      greeting:\n        description: The greeting\n        default: hello\njobs:\n  a:\n    steps: []\n",
+      },
+    });
+    const html = await seededHtml(engine, { workflow: "ci.yml" });
+    // The banner.
+    expect(html).toContain("ui blue info attached message flex-left-right tw-z-1");
+    expect(html).toContain(repoActionsRunsLocale.has_workflow_dispatch);
+    expect(html).toContain('data-modal="#runWorkflowDispatchModal"');
+    // The modal's form posts /actions/run with the FULL filter set (the
+    // orchestrator-owned mount).
+    expect(html).toMatch(/action="\/alice\/demo\/actions\/run\?workflow=ci\.yml&amp;scoped_workflow_source_repo_id=0&amp;actor=0&amp;status=0&amp;branch=" method="post"/);
+    // The branch dropdown's fetch pair targets the LIVE inputs fragment.
+    expect(html).toContain('data-fetch-sync="$body #runWorkflowDispatchModalInputs"');
+    expect(html).toMatch(/data-fetch-url="\/alice\/demo\/actions\/workflow-dispatch-inputs\?workflow=ci\.yml&amp;scoped_workflow_source_repo_id=0"/);
+    expect(html).toContain('value="refs/heads/main"');
+    expect(html).toContain('data-value="refs/heads/feature"');
+    expect(html).toContain('data-value="refs/heads/main"');
+    // The SSR'd inputs body at the default ref (the declared input).
+    expect(html).toContain('id="runWorkflowDispatchModalInputs"');
+    expect(html).toContain('name="greeting"');
+    expect(html).toContain("The greeting");
+    // A non-writer sees NO banner (prepareWorkflowDispatchTemplate's
+    // CanWrite gate).
+    const reader = await seededHtml(engine, { workflow: "ci.yml" }, { canWriteActions: false });
+    expect(reader).not.toContain("runWorkflowDispatchModal");
+  });
+
+  it("no dispatch banner without the trigger declaration, when disabled, or unselected", async () => {
+    const engine = fakeEngine({
+      branches: ["main"],
+      workflowFiles: { ".gitea/workflows/ci.yml": "on: push\njobs:\n  a:\n    steps: []\n" },
+    });
+    const noTrigger = await seededHtml(engine, { workflow: "ci.yml" });
+    expect(noTrigger).not.toContain("runWorkflowDispatchModal");
+    // Disabled → prepareWorkflowDispatchTemplate's early return.
+    await enableActions();
+    await saveRepoActionsConfig(env.DB, repo.id, { ...zeroActionsConfig(), disabledWorkflows: ["ci.yml"] });
+    const disabled = await seededHtml(engine, { workflow: "ci.yml" });
+    expect(disabled).not.toContain("runWorkflowDispatchModal");
   });
 
   it("the empty states: no_workflows arm (with the writer's quick start), no_runs and no_results", async () => {
@@ -1022,9 +1195,6 @@ describe("the mounted repo actions route (the census C1: the minted-session rout
     // suite pins its shapes); this pin holds only THIS family's fidelity:
     // the bare literal plus the junk tails upstream's chi answers 404.
     for (const path of [
-      "/alice/demo/actions/run",
-      "/alice/demo/actions/disable",
-      "/alice/demo/actions/enable",
       "/alice/demo/actions/extra",
     ]) {
       expect(parseUiRoute(path)).toBeNull();

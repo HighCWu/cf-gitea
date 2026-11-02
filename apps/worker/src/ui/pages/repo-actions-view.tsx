@@ -86,11 +86,13 @@
  *   recommendation. Block-level markdown in a title renders (upstream's
  *   post-process-only arm keeps it literal); the pipeline carries the
  *   backtick/code and link arms.
- * - `pullRequest` arms 1-2 (a `refs/pull/N/head` ref, a pull_request event
- *   payload) are ported; upstream's arm 3 (the open-PR-by-head-branch
- *   lookup, GetUnmergedPullRequestsByHeadInfo) needs the pulls service'
- *   head index and is deferred with C5's PR-nav wave — the field stays
- *   absent for push runs (omitempty upstream too).
+ * - `pullRequest` arms 1-3 (a `refs/pull/N/head` ref, a pull_request event
+ *   payload, and the push-run open-PR-by-head-branch lookup —
+ *   GetUnmergedPullRequestsByHeadInfo, pull_list.go:64-70 at view.go:436-453)
+ *   are ported (arm 3 landed with the ⑲A7 row): exactly ONE open,
+ *   unmerged, github-flow PR whose head matches the run's branch surfaces
+ *   the Back-to-PR link; the link resolves through the PR's BASE repo
+ *   (LoadBaseRepo) — a fork-head push names the base repo's page.
  * - The summary ref cache (getViewSummaryRefInfo's 10 s TTL over the 1 s
  *   poll) is not ported — the instance cache module has no Workers analog
  *   here; the branch-existence read rides the landed engine `listRefs` RPC
@@ -133,6 +135,9 @@ import {
   actionRuns,
   actionRunners,
   actionTasks,
+  issues,
+  pullRequests,
+  repositories,
   users,
 } from "../../db/schema";
 import {
@@ -1268,8 +1273,8 @@ export async function buildViewResponse(
   }));
 
   // The commit + ref summary (viewSummaryBranchFromRun / viewPullRequestFromRun
-  // minus the deferred head-PR arm — the module header).
-  const refSummary = await resolveRefSummary(input, run, repoLink, triggerUser, pusherAvatar);
+  // — arms 1-3, the module header).
+  const refSummary = await resolveRefSummary(input, d1, run, repoLink, triggerUser, pusherAvatar);
   const duration = rowDurationString(
     attempt === null ? run.started : attempt.started,
     attempt === null ? run.stopped : attempt.stopped,
@@ -1428,6 +1433,7 @@ export async function buildViewResponse(
  *  pair, view.go:424-494 + 673-684). */
 async function resolveRefSummary(
   input: BuildViewResponseInput,
+  d1: D1,
   run: RunRow,
   repoLink: string,
   triggerUser: ViewUserRow | undefined,
@@ -1496,16 +1502,66 @@ async function resolveRefSummary(
     branch,
   };
 
-  // viewPullRequestFromRun (view.go:424-434 + 455-460): a pull ref names
-  // "#N" and links the PR page; a pull_request payload's index rides too.
+  // viewPullRequestFromRun (view.go:424-460): a pull ref names "#N" and
+  // links the PR page; a pull_request payload's index rides too; arm 3
+  // (view.go:436-453 — the ⑲A7 row) surfaces the ONE open, unmerged
+  // github-flow PR whose head matches the run's branch, linked through its
+  // BASE repo (LoadBaseRepo — a fork-head push names the base repo's page).
   let pullRequest: ViewResponse["state"]["run"]["pullRequest"] | null = null;
   if (run.ref.startsWith("refs/pull/")) {
     const index = run.ref.slice("refs/pull/".length).replace(/\/head$/, "");
     pullRequest = { index: `#${index}`, link: `${repoLink}/pulls/${index}` };
   } else if (prPayload !== null && prPayload.index > 0) {
     pullRequest = { index: `#${prPayload.index}`, link: `${repoLink}/pulls/${prPayload.index}` };
+  } else if (run.ref.startsWith("refs/heads/")) {
+    const headPr = await findOpenPullRequestByHead(d1, run.repoId, shortRefName(run.ref));
+    if (headPr !== null) {
+      pullRequest = { index: `#${headPr.index}`, link: `${headPr.baseRepoLink}/pulls/${headPr.index}` };
+    }
   }
   return { commit, pullRequest };
+}
+
+/** GetUnmergedPullRequestsByHeadInfo (pull_list.go:64-70) + LoadBaseRepo —
+ *  the arm-3 lookup: exactly ONE open (`issue.is_closed = false`),
+ *  unmerged (`has_merged = false`), github-flow (`flow = github`) PR with
+ *  `head_repo_id = run.RepoID AND head_branch = branch`, ordered by id,
+ *  answers its index + the BASE repo's link. Every other row count, a
+ *  missing base repo row, or a query failure answers null (view.go:440-446's
+ *  log-and-nil arms). */
+async function findOpenPullRequestByHead(
+  d1: D1,
+  repoId: string,
+  headBranch: string,
+): Promise<{ index: number; baseRepoLink: string } | null> {
+  const db = drizzle(d1);
+  const rows = await db
+    .select({ index: pullRequests.index, baseRepoId: pullRequests.baseRepoId })
+    .from(pullRequests)
+    .innerJoin(issues, eq(issues.id, pullRequests.issueId))
+    .where(
+      and(
+        eq(pullRequests.headRepoId, repoId),
+        eq(pullRequests.headBranch, headBranch),
+        eq(pullRequests.hasMerged, false),
+        eq(issues.isClosed, false),
+        eq(pullRequests.flow, 0), // PRFlow.Github — the template's `flow = ?` arm
+      ),
+    )
+    .orderBy(asc(pullRequests.id));
+  const row = rows.length === 1 ? rows[0] : undefined;
+  if (row === undefined) return null;
+  try {
+    const baseRepo = await db
+      .select({ ownerNamespace: repositories.ownerNamespace, slug: repositories.slug })
+      .from(repositories)
+      .where(eq(repositories.id, row.baseRepoId))
+      .get();
+    if (baseRepo === undefined) return null; // LoadBaseRepo's miss → log-and-nil
+    return { index: row.index, baseRepoLink: `/${baseRepo.ownerNamespace}/${baseRepo.slug}` };
+  } catch {
+    return null; // view.go:444-446's LoadBaseRepo error arm
+  }
 }
 
 /** GetPullRequestEventPayload's reduction (run.go:184-192): the pull_request

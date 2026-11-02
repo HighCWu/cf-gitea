@@ -740,6 +740,10 @@ import {
   type RerunActionRunRequest,
 } from "./pages/repo-actions-view";
 import { approveRun } from "../services/actions/approve";
+import { loadRepoActionsConfig, saveRepoActionsConfig } from "../services/actions/config";
+import { deleteRun } from "../services/actions/retention";
+import { isDoneStatus } from "../services/actions/update";
+import { dispatchWorkflow } from "../services/actions/workflow-dispatch";
 import {
   loadArtifactPreviewPageData,
   renderArtifactPreviewPage,
@@ -3391,7 +3395,8 @@ export interface RepoActionsRunViewRoute {
     | "actions-run-rerun"
     | "actions-run-rerun-failed"
     | "actions-run-job-rerun"
-    | "actions-run-approve";
+    | "actions-run-approve"
+    | "actions-run-delete";
   owner: string;
   repo: string;
   /** The raw {run} segment: the run row id, the legacy per-repo run index,
@@ -3468,6 +3473,34 @@ export interface RepoActionsWorkflowBadgeRoute {
  *  `/workflow-dispatch-inputs` aux GET, an HTML fragment the official
  *  bundle's data-fetch-sync swaps into the modal). GET-only, writer-gated
  *  per upstream's reqRepoActionsWriter on the route. */
+/** The ⑲A4 row: the dispatch-modal form's POST (upstream web.go:1570's
+ *  `m.Post("/run", reqRepoActionsWriter, actions.Run)` inside the /actions
+ *  group — the group read ladder PLUS the writer gate). The five filter
+ *  facets ride the query (the modal form's action URL), `ref` + the
+ *  declared inputs the POST body; the producer is
+ *  services/actions/workflow-dispatch.ts. POST-only upstream — the GET twin
+ *  answers chi's 405. */
+export interface RepoActionsRunDispatchRoute {
+  family: "repo-actions-run-dispatch";
+  owner: string;
+  repo: string;
+}
+
+/** The ⑲A5 row: the filter kebab's enable/disable link-action POSTs
+ *  (upstream web.go:1571-1572's `m.Post("/disable"|"/enable", reqRepoAdmin,
+ *  actions.DisableWorkflowFile|EnableWorkflowFile)`) — the group read
+ *  ladder PLUS RequireRepoAdmin's NotFound. One family for BOTH literals
+ *  (the repo-action family's action-field shape); the answer is
+ *  ctx.JSONRedirect's `{"redirect": ...}` the bundle's link-action reloads
+ *  on. */
+export interface RepoActionsWorkflowToggleRoute {
+  family: "actions-workflow-toggle";
+  owner: string;
+  repo: string;
+  /** "disable" | "enable" — the POSTed literal. */
+  action: string;
+}
+
 export interface RepoActionsDispatchInputsRoute {
   family: "repo-actions-dispatch-inputs";
   owner: string;
@@ -4065,6 +4098,8 @@ export type ParsedUiRoute =
   | RepoActionsRunArtifactRoute
   | RepoActionsWorkflowBadgeRoute
   | RepoActionsDispatchInputsRoute
+  | RepoActionsRunDispatchRoute
+  | RepoActionsWorkflowToggleRoute
   | RepoActionRoute
   | RepoActionWatchOptionsRoute
   | SiteHomeRoute
@@ -5586,6 +5621,11 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
     if (rest.length === 3 && rest[2] === "cancel") {
       return { family: "actions-run-cancel", owner, repo, run: rest[1] as string };
     }
+    // The ⑲A2 kebab's delete POST (web.go:1597-1598 — the exact 3-segment
+    // literal, disjoint from cancel's).
+    if (rest.length === 3 && rest[2] === "delete") {
+      return { family: "actions-run-delete", owner, repo, run: rest[1] as string };
+    }
     // The C5 write trio + approve (web.go:1597-1598 run-level rerun pair,
     // :1590 approve, :1588 job-level rerun — the exact 3/5-segment
     // literals, disjoint from cancel's).
@@ -5645,6 +5685,16 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   // exact literal; the ref/workflow facets ride the query).
   if (head === "actions" && rest.length === 1 && rest[0] === "workflow-dispatch-inputs") {
     return { family: "repo-actions-dispatch-inputs", owner, repo };
+  }
+  // The ⑲A4 row: the dispatch form's POST target (web.go:1570 — the exact
+  // literal; the facet filters ride the query).
+  if (head === "actions" && rest.length === 1 && rest[0] === "run") {
+    return { family: "repo-actions-run-dispatch", owner, repo };
+  }
+  // The ⑲A5 row: the kebab's enable/disable link-action POSTs
+  // (web.go:1571-1572 — the two literals, one family).
+  if (head === "actions" && rest.length === 1 && (rest[0] === "disable" || rest[0] === "enable")) {
+    return { family: "actions-workflow-toggle", owner, repo, action: rest[0] };
   }
   // The repo header's fetch-action family (web.go:1765-1772 — star/unstar/
   // watch/participate/ignore) + the custom watch-options form (web.go:1771,
@@ -7952,6 +8002,7 @@ async function repoActionsRunsPage(c: Context<{ Bindings: Env }>): Promise<Respo
     query: parseActionRunQuery(url.searchParams),
     requestUri: url.pathname + url.search,
     canWriteActions: viewer.kind === "user" && (await canWriteRepo(c.env, repo, viewer)),
+    isAdmin: viewer.kind === "user" && (await canAdminRepo(c.env, repo, viewer)), // AllowDisableOrEnableWorkflow (the ⑲A5 kebab)
     nowSeconds: Math.floor(routeNow().getTime() / 1000),
   });
   if (resolved.url.searchParams.has("run_ids")) {
@@ -8430,6 +8481,166 @@ async function actionsRunRerun(c: Context<{ Bindings: Env }>): Promise<Response>
  *  that does not await approval is approve.go:36-38's silent continue, so
  *  the body carries no signal and the frontend re-polls the view. The
  *  service's rejections are the internal-misuse arms → the 500 chrome. */
+/** POST /{owner}/{repo}/actions/runs/{run}/delete (actions.Delete —
+ *  web.go:1597-1598's route, view.go:1071-1086): the cancel arm's ladder
+ *  verbatim (the sameOriginGuard, the drift guard, the C2 read gate, then
+ *  RequireUnitWriter's NotFound — anonymous and non-writer 404-shells,
+ *  never the login 303), getCurrentRunByPathParam's ID-based resolution,
+ *  the !run.Status.IsDone() JSONError arm (view.go:1077-1080 — the 400
+ *  `{"errorMessage": ...}` body), then the landed DeleteRun port
+ *  (services/actions/retention.ts deleteRun — cleanup.go:169-263's
+ *  rows+logs+artifacts sweep). Success answers ctx.JSONOK()'s dummy. */
+async function actionsRunDelete(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "actions-run-delete") return respond(await c.notFound()); // drift guard
+  const gate = await actionsRunViewGate(c, resolved);
+  if (gate !== null) return gate;
+  if (viewer.kind !== "user" || !(await canWriteRepo(c.env, repo, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404)); // RequireUnitWriter's NotFound
+  }
+  const run = await resolveActionsRunOrAnswer(c, resolved, (resolved.route as { run: string }).run, "", true);
+  if (!("answer" in run)) return run;
+  if (!isDoneStatus(run.run.status)) {
+    // view.go:1077-1080's JSONError arm (context.go:276-284's 400 shape).
+    return respond(
+      new Response(JSON.stringify({ errorMessage: "This workflow run is not done.", renderFormat: "text" }), {
+        status: 400,
+        headers: { "content-type": "application/json;charset=utf-8" },
+      }),
+    );
+  }
+  await deleteRun(c.env, repo.id, run.run.id);
+  return respond(
+    new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json;charset=utf-8" },
+    }),
+  );
+}
+
+/** POST /{owner}/{repo}/actions/run (actions.Run — web.go:1570,
+ *  view.go:1378-1419): the group read ladder (the C1 handler's
+ *  MustBeNotEmpty + MustEnableActions arms) PLUS reqRepoActionsWriter's
+ *  NotFound, then the landed producer (services/actions/workflow-dispatch.ts
+ *  — workflow.go:64-199's port). ctx.FormString merges the query facets and
+ *  the POST body (body wins). Both user-facing outcomes 303 back onto the
+ *  actions list (upstream Flash.Success/Flash.Error + ctx.Redirect — the
+ *  no-session-flash reduction); the producer's throw arm propagates into
+ *  the 500 chrome (ctx.ServerError). */
+async function repoActionsRunDispatch(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, url, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "repo-actions-run-dispatch") return respond(await c.notFound()); // drift guard
+  if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404)); // repo.MustBeNotEmpty
+  const settings = await loadRepoSettings(c.env.DB, repo.id);
+  if (!settings.hasActions) return respond(c.html(renderNotFound(ctx), 404)); // MustEnableActions
+  if (viewer.kind !== "user" || !(await canWriteRepo(c.env, repo, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404)); // reqRepoActionsWriter's NotFound
+  }
+  const form = await readUrlEncodedForm(c.req.raw);
+  const formValue = (key: string): string => form.get(key) ?? url.searchParams.get(key) ?? ""; // FormString's merge, body wins
+  const formInt64 = (raw: string | null): number => (raw !== null && /^\d+$/.test(raw) ? Number.parseInt(raw, 10) : 0);
+  const formMap: Record<string, string> = {};
+  for (const [key, value] of form) formMap[key] = value;
+  const redirectUrl = `${repoLinkOf(repo)}/actions?${new URLSearchParams({
+    workflow: formValue("workflow"),
+    scoped_workflow_source_repo_id: String(formInt64(form.get("scoped_workflow_source_repo_id") ?? url.searchParams.get("scoped_workflow_source_repo_id"))),
+    actor: formValue("actor"),
+    status: formValue("status"),
+    branch: formValue("branch"),
+  }).toString()}`;
+  const outcome = await dispatchWorkflow({
+    d1: c.env.DB,
+    reads: engineClient(c.env, `${repo.ownerNamespace}/${repo.slug}`),
+    repo,
+    workflowId: formValue("workflow"),
+    ref: form.get("ref") ?? url.searchParams.get("ref") ?? "",
+    scopedWorkflowSourceRepoId: formInt64(form.get("scoped_workflow_source_repo_id") ?? url.searchParams.get("scoped_workflow_source_repo_id")),
+    form: formMap,
+    triggerUserId: viewer.id,
+    appUrl: ctx.origin,
+  });
+  if (outcome.status === "throw") throw new Error(outcome.reason); // ctx.ServerError's shape
+  // The translatable arms are upstream's Flash + ctx.Redirect pair — the
+  // 303 carries no flash text (the no-session-flash reduction).
+  return respond(new Response(null, { status: 303, headers: { location: redirectUrl } }));
+}
+
+/** POST /{owner}/{repo}/actions/disable and /enable (web.go:1571-1572 —
+ *  actions.DisableWorkflowFile/EnableWorkflowFile → view.go:1320-1376's
+ *  disableOrEnableWorkflowFile): the group read ladder PLUS
+ *  RequireRepoAdmin's NotFound (anonymous and non-admin 404-shell — the
+ *  fetch-action arm, never the login 303). The workflow id + the four
+ *  filter facets ride the kebab's data-url (FormString's merge). An empty
+ *  id answers ctx.JSONError's 400. The scoped arm
+ *  (scoped_workflow_source_repo_id > 0) is the C10 documented reduction —
+ *  this surface never writes disabledScopedWorkflows; the repo-level pair
+ *  (repo_unit_actions.go's EnableWorkflow/DisableWorkflow) is the landed
+ *  config store's array splice. The answer is ctx.JSONRedirect's
+ *  `{"redirect": ...}` onto the actions-list URL
+ *  (actionsListRedirectURL's five-param shape). Upstream's
+ *  RecordWorkflowToggle audit emit defers with the audit family (the
+ *  actions:workflow:{enable,disable} ids are not in the landed
+ *  AuditActions table). */
+async function repoActionsWorkflowToggle(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, url, viewer, repo, respond } = resolved;
+  const route = resolved.route;
+  if (route.family !== "actions-workflow-toggle") return respond(await c.notFound()); // drift guard
+  if (repo.isEmpty) return respond(c.html(renderNotFound(ctx), 404)); // repo.MustBeNotEmpty
+  const settings = await loadRepoSettings(c.env.DB, repo.id);
+  if (!settings.hasActions) return respond(c.html(renderNotFound(ctx), 404)); // MustEnableActions
+  if (viewer.kind !== "user" || !(await canAdminRepo(c.env, repo, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404)); // RequireRepoAdmin's NotFound
+  }
+  const form = await readUrlEncodedForm(c.req.raw);
+  const formValue = (key: string): string => form.get(key) ?? url.searchParams.get(key) ?? ""; // FormString's merge
+  const workflow = formValue("workflow");
+  if (workflow === "") {
+    return respond(
+      new Response(JSON.stringify({ errorMessage: "workflow is required", renderFormat: "text" }), {
+        status: 400,
+        headers: { "content-type": "application/json;charset=utf-8" },
+      }),
+    );
+  }
+  const cfg = await loadRepoActionsConfig(c.env.DB, repo.id);
+  if (route.action === "enable") {
+    cfg.disabledWorkflows = cfg.disabledWorkflows.filter((name) => name !== workflow); // EnableWorkflow
+  } else if (!cfg.disabledWorkflows.includes(workflow)) {
+    cfg.disabledWorkflows = [...cfg.disabledWorkflows, workflow]; // DisableWorkflow's append-if-absent
+  }
+  if ((await saveRepoActionsConfig(c.env.DB, repo.id, cfg)) === "missing") {
+    // UpdateRepoUnitConfig on a unit-less repo — unreachable behind the
+    // MustEnableActions gate; the store seam's 404 is the honest answer.
+    return respond(c.html(renderNotFound(ctx), 404));
+  }
+  const formInt64 = (raw: string | null): number => (raw !== null && /^\d+$/.test(raw) ? Number.parseInt(raw, 10) : 0);
+  const redirectUrl = `${repoLinkOf(repo)}/actions?${new URLSearchParams({
+    workflow,
+    scoped_workflow_source_repo_id: String(formInt64(formValue("scoped_workflow_source_repo_id"))),
+    actor: formValue("actor"),
+    status: formValue("status"),
+    branch: formValue("branch"),
+  }).toString()}`;
+  return respond(
+    new Response(JSON.stringify({ redirect: redirectUrl }), {
+      status: 200,
+      headers: { "content-type": "application/json;charset=utf-8" },
+    }),
+  );
+}
+
 async function actionsRunApprove(c: Context<{ Bindings: Env }>): Promise<Response> {
   const guard = sameOriginGuard(c.req.raw);
   if (guard !== null) return guard;
@@ -19439,6 +19650,18 @@ uiRouter.get("/:owner/:repo/actions/workflows/:workflowName/badge.svg", (c) => r
 uiRouter.post("/:owner/:repo/actions/workflows/:workflowName/badge.svg", () => methodNotAllowed("GET"));
 uiRouter.get("/:owner/:repo/actions/workflow-dispatch-inputs", (c) => repoActionsDispatchInputsRoute(c));
 uiRouter.post("/:owner/:repo/actions/workflow-dispatch-inputs", () => methodNotAllowed("GET"));
+// The ⑲A2 kebab's delete POST (view.go:1071-1086 — POST-only upstream,
+// chi-405 GET twin).
+uiRouter.get("/:owner/:repo/actions/runs/:run/delete", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/actions/runs/:run/delete", (c) => actionsRunDelete(c));
+// The ⑲A4 dispatch form POST (view.go:1378-1419 — POST-only upstream).
+uiRouter.get("/:owner/:repo/actions/run", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/actions/run", (c) => repoActionsRunDispatch(c));
+// The ⑲A5 kebab's enable/disable POSTs (view.go:1320-1376 — POST-only).
+uiRouter.get("/:owner/:repo/actions/disable", () => methodNotAllowed("POST"));
+uiRouter.get("/:owner/:repo/actions/enable", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/actions/disable", (c) => repoActionsWorkflowToggle(c));
+uiRouter.post("/:owner/:repo/actions/enable", (c) => repoActionsWorkflowToggle(c));
 // The repo header's fetch-action family (the fragment swap; GET twins 405)
 // + the custom watch-options form (the modal's JSONRedirect arm). The
 // watch/options LITERAL registers FIRST — this Hono pin's RegExpRouter lets
