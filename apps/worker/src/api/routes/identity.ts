@@ -154,12 +154,17 @@ const userListKeysRoute = (requireAuth: MiddlewareHandler<ApiEnv>) =>
     operationId: "userListKeys",
     request: {
       ...listQuery,
+      // `fingerprint` is a QUERY param upstream (v1-swagger: in: query — the
+      // runtime reads searchParams; the former in-params placement here was
+      // invalid OpenAPI: a param not present in the path template).
+      query: listQuery.query.extend({
+        fingerprint: z.string().optional().openapi({ description: "fingerprint of the key" }),
+      }),
       params: z.object({
         username: z
           .string()
           .min(1)
           .openapi({ description: "username of the user whose public keys are to be listed" }),
-        fingerprint: z.string().optional().openapi({ description: "fingerprint of the key" }),
       }),
     },
     responses: {

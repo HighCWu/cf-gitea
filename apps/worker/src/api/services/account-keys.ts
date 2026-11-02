@@ -28,8 +28,17 @@ function publicKeyApiLink(origin: string): string {
   return `${origin}/api/v1/user/keys/`;
 }
 
+/** Upstream KeyType iota (models/asymkey/ssh_key.go:29-35; schema.ts carries
+ *  the raw-integer mapping on `public_keys.type`). */
+const KEY_TYPE_USER = 1;
+const KEY_TYPE_DEPLOY = 2;
+
 /** convert.ToPublicKey (convert.go:840-851) + appendPrivateInformation
- *  (key.go:26-47) when the viewer is the owner or a site admin. */
+ *  (user/key.go:26-48) when the viewer is the owner or a site admin. The
+ *  private arm switches on the ROW's type like upstream: user keys render
+ *  key_type "user" + the owner object; deploy keys render "deploy" with NO
+ *  owner; anything else (principals) renders "unknown". read_only renders in
+ *  every private-arm branch (key.go:48). */
 export function toApiPublicKey(
   c: Context<ApiEnv>,
   row: typeof publicKeys.$inferSelect,
@@ -50,9 +59,11 @@ export function toApiPublicKey(
   }
   return {
     ...base,
-    user: toApiUser(viewerOf(c), owner),
+    // `user` is omitempty upstream — only the KeyTypeUser branch sets Owner
+    // (user/key.go:31-43), so deploy/principal rows omit the object entirely.
+    ...(row.type === KEY_TYPE_USER ? { user: toApiUser(viewerOf(c), owner) } : {}),
     read_only: row.mode === 1,
-    key_type: "user",
+    key_type: row.type === KEY_TYPE_DEPLOY ? "deploy" : row.type === KEY_TYPE_USER ? "user" : "unknown",
   };
 }
 

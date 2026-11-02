@@ -175,10 +175,13 @@ const KEY_SEEDED_AT = new Date("2026-02-01T00:00:00Z");
 const GPG_CREATED_AT = new Date("2026-01-15T00:00:00Z");
 
 /** Raw `public_keys` row (migration 0016 columns; the write path's parsing
- *  is misc-t3's concern — the identity listings only read). */
+ *  is misc-t3's concern — the identity listings only read). `type` selects
+ *  the upstream KeyType (1 user / 2 deploy / 3 principal, ssh_key.go:29-35);
+ *  the plain listing arm excludes ONLY principals (key.go:74-78), so deploy
+ *  rows surface through this route with the type-switched private render. */
 async function seedPublicKey(
   ownerId: number,
-  fields: { name: string; fingerprint: string; content: string; mode?: number },
+  fields: { name: string; fingerprint: string; content: string; mode?: number; type?: number },
 ): Promise<{ id: number }> {
   const rows = await db()
     .insert(publicKeys)
@@ -188,7 +191,7 @@ async function seedPublicKey(
       fingerprint: fields.fingerprint,
       content: fields.content,
       mode: fields.mode ?? 2,
-      type: 1,
+      type: fields.type ?? 1,
       loginSourceId: 0,
       verified: false,
       createdAt: KEY_SEEDED_AT,
@@ -501,6 +504,25 @@ describe("GET /users/{username}/keys (userListKeys, real rows)", () => {
     expect((first.user as Record<string, unknown>).login).toBe("alice");
   });
 
+  it("a deploy-key row renders key_type deploy with NO owner object (appendPrivateInformation's type switch, user/key.go:26-48)", async () => {
+    const seed = await seedFollowGraph();
+    await seedPublicKey(seed.alice.id, {
+      name: "repo-deploy",
+      fingerprint: ALICE_FP,
+      content: ALICE_KEY,
+      type: 2, // KeyTypeDeploy — deploy rows list here (only principals are excluded, key.go:74-78)
+    });
+    const response = await router()(`/users/${seed.alice.username}/keys`, { headers: authHeaders(seed.alice.id) });
+    expect(response.status).toBe(200);
+    const body: Array<Record<string, unknown>> = await response.json();
+    expect(body).toHaveLength(1);
+    const first = body[0]!;
+    expect(first.key_type).toBe("deploy");
+    expect(first.read_only).toBe(false);
+    // the Owner object is omitempty and set ONLY in the KeyTypeUser branch
+    expect(first).not.toHaveProperty("user");
+  });
+
   it("the fingerprint filter scopes to the target (key.go:59-70: the named-user arm stays restricted)", async () => {
     const seed = await seedFollowGraph();
     await seedPublicKey(seed.alice.id, { name: "laptop", fingerprint: ALICE_FP, content: ALICE_KEY });
@@ -603,6 +625,30 @@ describe("GET /users/{username}/gpg_keys (userListGPGKeys, real rows)", () => {
     expect(await empty.json()).toEqual([]);
     expect((await send("/users/ghost/gpg_keys", { headers: viewer })).status).toBe(404);
     expect((await send("/users/ghost/gpg_keys")).status).toBe(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OpenAPI parameter placement (the declared contract, not the runtime) —
+// `fingerprint` is a QUERY param upstream (v1-swagger in:query); a route-param
+// declaration here was invalid OpenAPI (named but absent from the template).
+// ---------------------------------------------------------------------------
+
+describe("GET /users/{username}/keys declared parameters", () => {
+  it("declares fingerprint in:query and username as the only in:path param", () => {
+    const app = new OpenAPIHono<ApiEnv>();
+    app.onError(giteaErrorHandler);
+    registerIdentityRoutes(app, createTokenAuthMiddleware(resolver));
+    const doc = app.getOpenAPIDocument({ openapi: "3.0.3", info: { title: "identity", version: "0" } });
+    const parameters = (doc.paths?.["/users/{username}/keys"]?.get?.parameters ?? []) as Array<{
+      name?: string;
+      in?: string;
+    }>;
+    const fingerprint = parameters.find((parameter) => parameter.name === "fingerprint");
+    expect(fingerprint?.in).toBe("query");
+    expect(parameters.filter((parameter) => parameter.in === "path").map((parameter) => parameter.name)).toEqual([
+      "username",
+    ]);
   });
 });
 

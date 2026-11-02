@@ -1407,11 +1407,14 @@ export function registerMiscT3Routes(
   });
 
   // DELETE /admin/users/{username}/keys/{id} — adminDeleteUserPublicKey over
-  // asymkey_service.DeletePublicKey(ContextUser, id): the admin caller
-  // always passes the access check; miss → 404.
+  // asymkey_service.DeletePublicKey(ContextUser, id) (admin/user.go:378): the
+  // access check runs against the CONTEXT USER, not the admin caller
+  // (ssh_key.go:22-29 — `!doer.IsAdmin && doer.ID != key.OwnerID`), so a key
+  // owned by someone other than the named {username} 403s "You do not have
+  // access to this key" (admin/user.go:381-382); miss → 404.
   app.openapi(adminDeleteUserPublicKeyRoute(requireAuth, requireAdmin), async (c) => {
     const { username } = c.req.valid("param");
-    await resolveAdminTargetRow(c, username);
+    const target = await resolveAdminTargetRow(c, username);
     const row = (
       await drizzle(c.env.DB)
         .select()
@@ -1421,6 +1424,9 @@ export function registerMiscT3Routes(
     )[0];
     if (row === undefined) {
       throw new ApiError(404, "not found");
+    }
+    if (target.isAdmin !== true && target.id !== row.ownerId) {
+      throw new ApiError(403, "You do not have access to this key");
     }
     await drizzle(c.env.DB).delete(publicKeys).where(eq(publicKeys.id, row.id));
     return c.body(null, 204);

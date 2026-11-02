@@ -21,7 +21,7 @@ import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { users } from "../../db/schema";
+import { publicKeys, users } from "../../db/schema";
 import { createTokenAuthMiddleware, STUB_USER, type AuthResolver } from "../auth";
 import { giteaErrorHandler } from "../errors";
 import type { ApiEnv } from "../env";
@@ -188,6 +188,33 @@ const GO_ZERO = "0001-01-01T00:00:00Z";
 async function addEmail(email: string): Promise<void> {
   const response = await miscSend("/user/emails", authed(json({ emails: [email] }, { method: "POST" })));
   expect(response.status).toBe(201);
+}
+
+/** Raw `public_keys` row — the only way to reach a non-user KeyType through
+ *  this suite (the POST arms always create type=1 rows; deploy rows are the
+ *  deploy-keys service's writes). `mode` follows upstream's deploy-key
+ *  default (perm.AccessModeRead = 1). */
+async function seedPublicKeyRow(
+  ownerId: number,
+  fields: { type: number; fingerprint: string; name?: string; mode?: number },
+): Promise<{ id: number }> {
+  const rows = await drizzle(env.DB)
+    .insert(publicKeys)
+    .values({
+      ownerId,
+      name: fields.name ?? "seeded-key",
+      fingerprint: fields.fingerprint,
+      content: ED25519_KEY,
+      mode: fields.mode ?? 1,
+      type: fields.type,
+      loginSourceId: 0,
+      verified: false,
+      createdAt: NOW,
+      updatedAt: NOW,
+    })
+    .returning({ id: publicKeys.id })
+    .all();
+  return rows[0]!;
 }
 
 // ---------------------------------------------------------------------------
@@ -542,6 +569,29 @@ describe("GET /user/keys[/{id}] (misc-t3)", () => {
 
     expect((await miscSend("/user/keys/999", authed())).status).toBe(404);
   });
+
+  it("a deploy-key row renders key_type deploy with NO owner object through the unrestricted arm and the by-id read (appendPrivateInformation's type switch, user/key.go:26-48)", async () => {
+    const key = await seedPublicKeyRow(neighborId, { type: 2, fingerprint: ED25519_FINGERPRINT, name: "deploy-key" });
+    // the unrestricted fingerprint arm ("Querying not just listing",
+    // key.go:58-72) surfaces the deploy row; the admin viewer is in the
+    // private arm, which upstream still renders WITHOUT the Owner object
+    // for a deploy key.
+    const list = await miscSend(`/user/keys?fingerprint=${ED25519_FINGERPRINT}`, authed(undefined, TOKEN_ADMIN));
+    expect(list.status).toBe(200);
+    const entries = await list.json<Array<Record<string, unknown>>>();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.id).toBe(key.id);
+    expect(entries[0]!.key_type).toBe("deploy");
+    expect(entries[0]!.read_only).toBe(true); // mode 1 = perm.AccessModeRead
+    expect(entries[0]!).not.toHaveProperty("user");
+    // the un-scoped by-id read (key.go:190) renders the same shape
+    const byId = await miscSend(`/user/keys/${key.id}`, authed(undefined, TOKEN_ADMIN));
+    expect(byId.status).toBe(200);
+    const body = await byId.json<Record<string, unknown>>();
+    expect(body.key_type).toBe("deploy");
+    expect(body.read_only).toBe(true);
+    expect(body).not.toHaveProperty("user");
+  });
 });
 
 describe("DELETE /user/keys/{id} (misc-t3)", () => {
@@ -625,6 +675,33 @@ describe("admin key arms (misc-t3)", () => {
       (await miscSend(`/admin/users/neighbor/keys/${keyId}`, authed({ method: "DELETE" }, TOKEN_ADMIN))).status,
     ).toBe(404);
     expect((await miscSend(`/admin/users/ghost/keys/${keyId}`, authed({ method: "DELETE" }, TOKEN_ADMIN))).status).toBe(404);
+  });
+
+  it("DELETE 403s verbatim when the key's owner is not the named {username} (the ContextUser access check, ssh_key.go:22-29)", async () => {
+    // the stub user (id 1) owns the key; the admin names NEIGHBOR —
+    // DeletePublicKey(ContextUser=neighbor, id) answers ErrKeyAccessDenied
+    // (admin/user.go:381-382: "You do not have access to this key").
+    const created = await miscSend("/user/keys", authed(json({ title: "mine", key: ED25519_KEY }, { method: "POST" })));
+    const keyId = (await created.json<Record<string, unknown>>()).id as number;
+    const forbidden = await miscSend(`/admin/users/neighbor/keys/${keyId}`, authed({ method: "DELETE" }, TOKEN_ADMIN));
+    expect(forbidden.status).toBe(403);
+    expect((await forbidden.json<Record<string, unknown>>()).message).toBe("You do not have access to this key");
+    // the foreign key SURVIVES the denied delete
+    expect((await miscSend(`/user/keys/${keyId}`, authed())).status).toBe(200);
+    // naming the OWNER answers 204 (the same check passes on ownership)
+    expect(
+      (await miscSend(`/admin/users/cf-gitea-stub/keys/${keyId}`, authed({ method: "DELETE" }, TOKEN_ADMIN))).status,
+    ).toBe(204);
+  });
+
+  it("DELETE skips the ownership check when the NAMED user is themself a site admin (upstream's !doer.IsAdmin escape, ssh_key.go:23)", async () => {
+    // key owned by the stub; the admin names ROOT (a site-admin ContextUser)
+    // — upstream's guard short-circuits and the delete proceeds.
+    const created = await miscSend("/user/keys", authed(json({ title: "mine", key: ED25519_KEY }, { method: "POST" })));
+    const keyId = (await created.json<Record<string, unknown>>()).id as number;
+    expect(
+      (await miscSend(`/admin/users/root/keys/${keyId}`, authed({ method: "DELETE" }, TOKEN_ADMIN))).status,
+    ).toBe(204);
   });
 });
 
