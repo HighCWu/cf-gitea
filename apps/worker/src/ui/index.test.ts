@@ -22,7 +22,8 @@ import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { seedVerifiedUser } from "../auth/testing/seeds";
 import { applyTwofaEnrollment, clearTwofaSetCookie, generateTotpSecret, mintPendingTicket } from "../auth/two-factor";
 import { totpCode } from "../auth/totp";
-import { comments, externalLoginUsers, issuePins, issues, loginSources, orgMembers, PRStatus, pullRequests, repositories, repoSettings, repoTransfer, repoUnits, teamMembers, trackedTimes, twoFactor, userSettingsKv, users } from "../db/schema";
+import { actionRunAttempts, actionRunJobs, actionRuns, comments, externalLoginUsers, issuePins, issues, loginSources, orgMembers, PRStatus, pullRequests, repositories, repoSettings, repoTransfer, repoUnits, teamMembers, trackedTimes, twoFactor, userSettingsKv, users } from "../db/schema";
+import { ACTION_STATUS_FAILURE, ACTION_STATUS_PENDING, ACTION_STATUS_SUCCESS, ACTION_STATUS_WAITING, insertActionRun } from "../services/actions/model";
 import type { RepositoryWithOwner } from "../api/services/repository";
 import { branchRef, pullHeadRef, ZERO_OID } from "../api/services/engine";
 import { RepoService } from "../repos/service";
@@ -178,6 +179,12 @@ beforeEach(async () => {
     // repositories — goes before it, the children-first sweep convention).
     "repo_transfer",
     "repositories",
+    // The run-viewer write-quartet battery's action rows (children first —
+    // jobs/attempts under runs; the versions table the wake bumps).
+    "action_runs",
+    "action_run_jobs",
+    "action_run_attempts",
+    "action_tasks_versions",
     // The dead-route-fix route fixtures (children first): the unpin/time
     // ladders' issue rows, the pins, the comments the unpin writes, the
     // tracked-time rows the delete soft-deletes.
@@ -2598,5 +2605,294 @@ describe("GET /{owner}/{repo}/wiki/commit/{sha}.{diff|patch} (the raw serving ar
     expect(html).toContain('class="page-content repository diff"');
     expect(html).toContain("serving arm commit");
     expect(html).toContain(`href="/wikidl-alice/wikidl/wiki/commit/${sha}"`);
+  });
+});
+
+describe("the run-viewer write quartet (web.go:1588, 1590, 1597-1598 — the rerun trio + approve)", () => {
+  const T0 = new Date(1_700_000_000 * 1000);
+  const PAYLOAD = new TextEncoder().encode("jobs: {}\n");
+  const WORKFLOW_ID = ".github/workflows/ci.yml";
+  const COMMIT = "ccccdddddddddddddddddddddddddddddddddddd";
+
+  async function fetchUi(path: string, init?: RequestInit): Promise<Response> {
+    return uiRouter.fetch(new Request(`https://test.local${path}`, init), uiEnv);
+  }
+
+  async function sessionHeader(userId: number): Promise<string> {
+    return `${SESSION_COOKIE_NAME}=${await mintSession(env.DB, userId)}`;
+  }
+
+  /** Alice the owner-writer + bob the signed-in non-writer + the repo with
+   *  the actions unit ON (the C2 gate's repo_settings.has_actions row — the
+   *  missing row defaults false, the gate 404s before the writer check) and
+   *  NON-empty (the schema's is_empty defaults TRUE — a fresh repo is empty
+   *  until the first push — and the C2 gate's MustBeNotEmpty arm 404-shells
+   *  an empty repo before every later arm). */
+  async function seedFixture(): Promise<{ aliceId: number; bobId: number; repoId: string }> {
+    const alice = await seedVerifiedUser({ username: "run-alice" });
+    const bob = await seedVerifiedUser({ username: "run-bob" });
+    await seedRepo("run-alice", "demo");
+    await drizzle(env.DB).update(repositories).set({ isEmpty: false }).where(eq(repositories.slug, "demo"));
+    const repo = await drizzle(env.DB).select({ id: repositories.id }).from(repositories).where(eq(repositories.slug, "demo")).get();
+    if (repo === undefined) throw new Error("seed repo missing");
+    await drizzle(env.DB).insert(repoSettings).values({ repoId: repo.id, hasActions: true });
+    return { aliceId: alice.id, bobId: bob.id, repoId: repo.id };
+  }
+
+  /** A done run through the LANDED insert (attempt 1 + its jobs), forced
+   *  onto per-job terminal shapes: success stays/gets 1, failure gets 2. */
+  async function seedDoneRun(
+    repoId: string,
+    ownerId: number,
+    index: number,
+    jobs: Array<{ jobId: string; needs?: string[]; status: number }>,
+  ): Promise<{ runId: number; attemptId: number; jobIds: number[] }> {
+    const seeded = await insertActionRun(
+      env.DB,
+      {
+        repoId,
+        ownerId,
+        workflowId: WORKFLOW_ID,
+        index,
+        triggerUserId: ownerId,
+        ref: "refs/heads/main",
+        commitSha: COMMIT,
+        event: "push",
+        eventPayload: "{}",
+        triggerEvent: "push",
+      },
+      jobs.map((job) => ({ jobId: job.jobId, needs: job.needs, workflowPayload: PAYLOAD })),
+    );
+    const aggregate = jobs.some((job) => job.status === ACTION_STATUS_FAILURE) ? ACTION_STATUS_FAILURE : ACTION_STATUS_SUCCESS;
+    await drizzle(env.DB).update(actionRuns).set({ status: aggregate }).where(eq(actionRuns.id, seeded.run.id));
+    await drizzle(env.DB).update(actionRunAttempts).set({ status: aggregate }).where(eq(actionRunAttempts.id, seeded.attempt.id));
+    for (const [i, job] of jobs.entries()) {
+      await drizzle(env.DB)
+        .update(actionRunJobs)
+        .set({ status: job.status, started: T0, stopped: new Date(T0.getTime() + 1000) })
+        .where(eq(actionRunJobs.id, seeded.jobRows[i]!.id));
+    }
+    return { runId: seeded.run.id, attemptId: seeded.attempt.id, jobIds: seeded.jobRows.map((row) => row.id) };
+  }
+
+  const post = (cookie: string | null, origin = "https://test.local"): RequestInit => ({
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      origin,
+      ...(cookie === null ? {} : { cookie }),
+    },
+    body: "{}",
+  });
+
+  it("parses the four POST shapes and leaves the delete sibling engine-owned", () => {
+    expect(parseUiRoute("/alice/demo/actions/runs/7/rerun")).toEqual({
+      family: "actions-run-rerun",
+      owner: "alice",
+      repo: "demo",
+      run: "7",
+    });
+    expect(parseUiRoute("/alice/demo/actions/runs/7/rerun-failed")).toEqual({
+      family: "actions-run-rerun-failed",
+      owner: "alice",
+      repo: "demo",
+      run: "7",
+    });
+    expect(parseUiRoute("/alice/demo/actions/runs/7/approve")).toEqual({
+      family: "actions-run-approve",
+      owner: "alice",
+      repo: "demo",
+      run: "7",
+    });
+    expect(parseUiRoute("/alice/demo/actions/runs/7/jobs/9/rerun")).toEqual({
+      family: "actions-run-job-rerun",
+      owner: "alice",
+      repo: "demo",
+      run: "7",
+      job: "9",
+    });
+    // Upstream's unregistered sibling: chi 404s it, the engine keeps it.
+    expect(parseUiRoute("/alice/demo/actions/runs/7/delete")).toBeNull();
+    // The deeper tail past the job param stays unclaimed (the parser's
+    // exact-literal rule).
+    expect(parseUiRoute("/alice/demo/actions/runs/7/jobs/9/rerun/extra")).toBeNull();
+  });
+
+  it("rerun: the writer POST answers the redirect JSON and lands attempt 2 (the state change)", async () => {
+    const fx = await seedFixture();
+    const seeded = await seedDoneRun(fx.repoId, fx.aliceId, 1, [
+      { jobId: "build", status: ACTION_STATUS_SUCCESS },
+      { jobId: "test", needs: ["build"], status: ACTION_STATUS_FAILURE },
+    ]);
+
+    const res = await fetchUi(`/run-alice/demo/actions/runs/${seeded.runId}/rerun`, post(await sessionHeader(fx.aliceId)));
+    expect(res.status).toBe(200);
+    // ctx.JSONRedirect(run.Link()) — the frontend's follow.
+    expect(await res.json<{ redirect: string }>()).toEqual({ redirect: `/run-alice/demo/actions/runs/${seeded.runId}` });
+
+    // The state change: attempt 2 exists, latest_attempt_id moved, EVERY
+    // job reset (the needs-less one waits, the dependent one pends).
+    const attempts = await drizzle(env.DB).select().from(actionRunAttempts).where(eq(actionRunAttempts.runId, seeded.runId));
+    expect(attempts).toHaveLength(2);
+    const stored = (await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.id, seeded.runId)).get())!;
+    expect(attempts.map((a) => a.id)).toContain(stored.latestAttemptId);
+    const attempt2Id = stored.latestAttemptId;
+    const attempt2Jobs = await drizzle(env.DB).select().from(actionRunJobs).where(eq(actionRunJobs.runAttemptId, attempt2Id));
+    const byKey = new Map(attempt2Jobs.map((job) => [job.jobId, job]));
+    expect(byKey.get("build")?.status).toBe(ACTION_STATUS_WAITING);
+    expect(byKey.get("test")?.status).toBe(ACTION_STATUS_PENDING);
+  });
+
+  it("rerun-failed: only the failed job resets (the succeeded one passes through); a green run 400s the no_failed_jobs JSONError", async () => {
+    const fx = await seedFixture();
+    const seeded = await seedDoneRun(fx.repoId, fx.aliceId, 1, [
+      { jobId: "build", status: ACTION_STATUS_SUCCESS },
+      { jobId: "deploy", status: ACTION_STATUS_FAILURE },
+    ]);
+    const cookie = await sessionHeader(fx.aliceId);
+
+    const res = await fetchUi(`/run-alice/demo/actions/runs/${seeded.runId}/rerun-failed`, post(cookie));
+    expect(res.status).toBe(200);
+    expect(await res.json<{ redirect: string }>()).toEqual({ redirect: `/run-alice/demo/actions/runs/${seeded.runId}` });
+
+    // The partial rerun's split: deploy resets to waiting, build clones as
+    // the pass-through row KEEPING its terminal status.
+    const stored = (await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.id, seeded.runId)).get())!;
+    const attempt2Jobs = await drizzle(env.DB).select().from(actionRunJobs).where(eq(actionRunJobs.runAttemptId, stored.latestAttemptId));
+    const byKey = new Map(attempt2Jobs.map((job) => [job.jobId, job]));
+    expect(byKey.get("deploy")?.status).toBe(ACTION_STATUS_WAITING);
+    expect(byKey.get("build")?.status).toBe(ACTION_STATUS_SUCCESS);
+
+    // The green run: the empty failed set is an ERROR, not a rerun-all
+    // (view.go:1002-1008) — the JSONError shape, nothing written.
+    const green = await seedDoneRun(fx.repoId, fx.aliceId, 2, [{ jobId: "build", status: ACTION_STATUS_SUCCESS }]);
+    const refused = await fetchUi(`/run-alice/demo/actions/runs/${green.runId}/rerun-failed`, post(cookie));
+    expect(refused.status).toBe(400);
+    expect(await refused.json<{ errorMessage: string; renderFormat: string }>()).toEqual({
+      errorMessage: "This workflow run has no failed jobs to re-run.",
+      renderFormat: "text",
+    });
+    const greenRun = (await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.id, green.runId)).get())!;
+    expect(greenRun.latestAttemptId).toBe(green.attemptId); // no attempt 2
+  });
+
+  it("job-level rerun: the named job resets on the new attempt; a junk {job} 404-shells (findCurrentJobByPathParam's miss)", async () => {
+    const fx = await seedFixture();
+    const seeded = await seedDoneRun(fx.repoId, fx.aliceId, 1, [
+      { jobId: "build", status: ACTION_STATUS_SUCCESS },
+      { jobId: "deploy", status: ACTION_STATUS_FAILURE },
+    ]);
+    const cookie = await sessionHeader(fx.aliceId);
+
+    const deployJob = seeded.jobIds[1]!;
+    const res = await fetchUi(`/run-alice/demo/actions/runs/${seeded.runId}/jobs/${deployJob}/rerun`, post(cookie));
+    expect(res.status).toBe(200);
+    expect(await res.json<{ redirect: string }>()).toEqual({ redirect: `/run-alice/demo/actions/runs/${seeded.runId}` });
+
+    // The state change: attempt 2, and BOTH the named job and its transitive
+    // downstream reset (deploy has no dependents here; build passes through).
+    const stored = (await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.id, seeded.runId)).get())!;
+    expect(stored.latestAttemptId).not.toBe(seeded.attemptId);
+    const attempt2Jobs = await drizzle(env.DB).select().from(actionRunJobs).where(eq(actionRunJobs.runAttemptId, stored.latestAttemptId));
+    const byKey = new Map(attempt2Jobs.map((job) => [job.jobId, job]));
+    expect(byKey.get("deploy")?.status).toBe(ACTION_STATUS_WAITING);
+    expect(byKey.get("build")?.status).toBe(ACTION_STATUS_SUCCESS);
+
+    // A {job} that parses to 0 (junk) misses the run's job set — the 404
+    // shell (view.go:970-974), never a rerun-all.
+    // A junk {job} on a STILL-DONE run misses the job set — the 404 shell
+    // (view.go:970-974), never a rerun-all. (On this test's own run the
+    // pin would read the not-done JSONError 400 first — attempt 2 above is
+    // running; upstream checks checkRunRerunAllowed BEFORE the job find.)
+    const fresh = await seedDoneRun(fx.repoId, fx.aliceId, 2, [{ jobId: "solo", status: ACTION_STATUS_FAILURE }]);
+    const junk = await fetchUi(`/run-alice/demo/actions/runs/${fresh.runId}/jobs/0/rerun`, post(cookie));
+    expect(junk.status).toBe(404);
+    expect((await junk.text()).includes("Page Not Found")).toBe(true);
+  });
+
+  it("approve: the writer POST answers JSONOK, flips the flag, records the approver, and releases the needs-less job", async () => {
+    const fx = await seedFixture();
+    const seeded = await insertActionRun(
+      env.DB,
+      {
+        repoId: fx.repoId,
+        ownerId: fx.aliceId,
+        workflowId: WORKFLOW_ID,
+        index: 1,
+        triggerUserId: fx.aliceId,
+        ref: "refs/heads/main",
+        commitSha: COMMIT,
+        event: "pull_request",
+        eventPayload: "{}",
+        triggerEvent: "pull_request",
+      },
+      [{ jobId: "build", workflowPayload: PAYLOAD }],
+    );
+    // The fork-PR posture: the run awaits approval, its job sits BLOCKED.
+    await drizzle(env.DB).update(actionRuns).set({ needApproval: true }).where(eq(actionRuns.id, seeded.run.id));
+    await drizzle(env.DB).update(actionRunAttempts).set({ status: 7 }).where(eq(actionRunAttempts.id, seeded.attempt.id));
+    await drizzle(env.DB).update(actionRunJobs).set({ status: 7 }).where(eq(actionRunJobs.id, seeded.jobRows[0]!.id));
+
+    const res = await fetchUi(`/run-alice/demo/actions/runs/${seeded.run.id}/approve`, post(await sessionHeader(fx.aliceId)));
+    expect(res.status).toBe(200);
+    expect(await res.json<{ ok: boolean }>()).toEqual({ ok: true }); // ctx.JSONOK's dummy
+
+    const stored = (await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.id, seeded.run.id)).get())!;
+    expect(stored.needApproval).toBe(false);
+    expect(stored.approvedBy).toBe(fx.aliceId);
+    const job = (await drizzle(env.DB).select().from(actionRunJobs).where(eq(actionRunJobs.id, seeded.jobRows[0]!.id)).get())!;
+    expect(job.status).toBe(ACTION_STATUS_WAITING);
+  });
+
+  it("approve on a non-awaiting run is the silent continue: 200 JSONOK, nothing written", async () => {
+    const fx = await seedFixture();
+    const seeded = await seedDoneRun(fx.repoId, fx.aliceId, 1, [{ jobId: "build", status: ACTION_STATUS_SUCCESS }]);
+
+    const res = await fetchUi(`/run-alice/demo/actions/runs/${seeded.runId}/approve`, post(await sessionHeader(fx.aliceId)));
+    expect(res.status).toBe(200);
+    expect(await res.json<{ ok: boolean }>()).toEqual({ ok: true });
+    const stored = (await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.id, seeded.runId)).get())!;
+    expect(stored.approvedBy).toBe(0); // approve.go:36-38 wrote nothing
+  });
+
+  it("gates the quartet: anonymous and non-writer 404-shell (RequireUnitWriter's NotFound), cross-origin 403, the GET twins 405", async () => {
+    const fx = await seedFixture();
+    const seeded = await seedDoneRun(fx.repoId, fx.aliceId, 1, [
+      { jobId: "build", status: ACTION_STATUS_SUCCESS },
+      { jobId: "deploy", status: ACTION_STATUS_FAILURE },
+    ]);
+    const paths = [
+      `/run-alice/demo/actions/runs/${seeded.runId}/rerun`,
+      `/run-alice/demo/actions/runs/${seeded.runId}/rerun-failed`,
+      `/run-alice/demo/actions/runs/${seeded.runId}/approve`,
+      `/run-alice/demo/actions/runs/${seeded.runId}/jobs/${seeded.jobIds[1]!}/rerun`,
+    ];
+
+    for (const path of paths) {
+      // Anonymous: the fetch arm 404-shells — never the login 303.
+      const anon = await fetchUi(path, post(null));
+      expect(anon.status, path).toBe(404);
+      // bob: a signed-in non-collaborator on the readable public repo — the
+      // writer gate 404-shells the write.
+      const bob = await fetchUi(path, post(await sessionHeader(fx.bobId)));
+      expect(bob.status, path).toBe(404);
+      // The guard fronts the handler: a cross-origin POST 403s before any
+      // read.
+      const evil = await fetchUi(path, post(await sessionHeader(fx.aliceId), "https://evil.example"));
+      expect(evil.status, path).toBe(403);
+      // The GET twin answers chi's 405 with Allow: POST.
+      const twin = await fetchUi(path, { method: "GET" });
+      expect(twin.status, path).toBe(405);
+      expect(twin.headers.get("allow"), path).toBe("POST");
+    }
+
+    // Nothing wrote through any gated arm: attempt 1 is still the latest,
+    // the dispatch wake never fired (the version row is the SEED's own —
+    // insertActionRun bumps it for the dispatchable waiting jobs; the gated
+    // POSTs leave it).
+    const stored = (await drizzle(env.DB).select().from(actionRuns).where(eq(actionRuns.id, seeded.runId)).get())!;
+    expect(stored.latestAttemptId).toBe(seeded.attemptId);
+    const jobs = await drizzle(env.DB).select().from(actionRunJobs).where(eq(actionRunJobs.runId, seeded.runId));
+    expect(jobs.every((job) => job.status !== ACTION_STATUS_WAITING)).toBe(true);
   });
 });

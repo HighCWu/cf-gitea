@@ -736,7 +736,10 @@ import {
   resolveRunAttemptAndJobs,
   resolveRunByPath,
   resolveRunForView,
+  rerunActionRun,
+  type RerunActionRunRequest,
 } from "./pages/repo-actions-view";
+import { approveRun } from "../services/actions/approve";
 import {
   loadArtifactPreviewPageData,
   renderArtifactPreviewPage,
@@ -3362,19 +3365,32 @@ export interface RepoActionsJobQueueRoute {
  *  `/runs/{run}`, `/runs/{run}/attempts/{attempt}` and `/runs/{run}/jobs/{job}`
  *  (one View shell / ViewPost JSON pair per shape) — plus web.go:1601's
  *  `m.Post("/runs/{run}/cancel", reqRepoActionsWriter, actions.Cancel)` (the
- *  census C5-adjacent arm; the rerun/rerun-failed tails are
- *  emitter-dependent and stay unclaimed per the census C5 flag). The same
- *  read-group middleware ladder gates every shape (the C1 family's note:
- *  optSignIn + RepoAssignment + MustBeNotEmpty + reqRepoActionsReader +
- *  MustEnableActions). The segments claim for ANY single-segment value (chi
- *  params; PathParamInt64 parses junk to 0 — the loader's 404/absent arms),
- *  the exact literal tails only; every deeper tail and the remaining
- *  siblings (`/run`, `/disable`, `/enable`, `/workflow-dispatch-inputs`,
- *  `/approve-all-checks`, `/runs/{run}/rerun*`, `/runs/{run}/workflow`,
+ *  census C5-adjacent arm) and web.go:1588/1590/1597-1598's write quartet —
+ *  `m.Post("/runs/{run}/approve" | "/runs/{run}/rerun" |
+ *  "/runs/{run}/rerun-failed" | "/runs/{run}/jobs/{job}/rerun",
+ *  reqRepoActionsWriter, actions.Approve | Rerun | RerunFailed)` (the
+ *  rerun trio's service is services/actions/rerun.ts's port; the approve
+ *  arm's is services/actions/approve.ts). The same read-group middleware
+ *  ladder gates every shape (the C1 family's note: optSignIn +
+ *  RepoAssignment + MustBeNotEmpty + reqRepoActionsReader +
+ *  MustEnableActions), the write POSTs adding RequireUnitWriter's NotFound.
+ *  The segments claim for ANY single-segment value (chi params;
+ *  PathParamInt64 parses junk to 0 — the loader's 404/absent arms), the
+ *  exact literal tails only; every deeper tail and the remaining siblings
+ *  (`/run`, `/disable`, `/enable`, `/workflow-dispatch-inputs`,
+ *  `/approve-all-checks`, `/runs/{run}/delete`, `/runs/{run}/workflow`,
  *  `/runs/{run}/logs`, the artifacts tails) stay unclaimed → the engine's
  *  404 until their units land. */
 export interface RepoActionsRunViewRoute {
-  family: "actions-run-view" | "actions-run-cancel" | "actions-run-job-logs" | "actions-run-workflow";
+  family:
+    | "actions-run-view"
+    | "actions-run-cancel"
+    | "actions-run-job-logs"
+    | "actions-run-workflow"
+    | "actions-run-rerun"
+    | "actions-run-rerun-failed"
+    | "actions-run-job-rerun"
+    | "actions-run-approve";
   owner: string;
   repo: string;
   /** The raw {run} segment: the run row id, the legacy per-repo run index,
@@ -5555,19 +5571,34 @@ export function parseUiRoute(pathname: string): ParsedUiRoute | null {
   }
 
   // The census C2 run-viewer subtree (pages/repo-actions-view.tsx —
-  // web.go:1601-1605's cancel POST + the three GET+POST view pairs under
-  // /runs). The {run}/{attempt}/{job} segments claim for ANY single-segment
-  // value (chi params — junk parses to PathParamInt64's 0, the loader's
-  // 404/absent arms), the exact literal tails only; every deeper tail
-  // (`/runs/{run}/attempts/{n}/...`) and the remaining siblings (`/run`,
-  // `/disable`, `/enable`, `/workflow-dispatch-inputs`,
-  // `/approve-all-checks`, `/runs/{run}/rerun*`, `/runs/{run}/workflow`,
-  // `/runs/{run}/logs`, the artifacts tails) stay unclaimed → the engine's
-  // 404 until their units land (the RepoActionsRunViewRoute interface's
-  // note).
+  // web.go:1588-1605's cancel + approve + rerun trio POSTs and the three
+  // GET+POST view pairs under /runs). The {run}/{attempt}/{job} segments
+  // claim for ANY single-segment value (chi params — junk parses to
+  // PathParamInt64's 0, the loader's 404/absent arms), the exact literal
+  // tails only; every deeper tail (`/runs/{run}/attempts/{n}/...`) and the
+  // remaining siblings (`/run`, `/disable`, `/enable`,
+  // `/workflow-dispatch-inputs`, `/approve-all-checks`,
+  // `/runs/{run}/delete`, `/runs/{run}/workflow`, `/runs/{run}/logs`, the
+  // artifacts tails) stay unclaimed → the engine's 404 until their units
+  // land (the RepoActionsRunViewRoute interface's note).
   if (head === "actions" && rest.length >= 3 && rest[0] === "runs") {
     if (rest.length === 3 && rest[2] === "cancel") {
       return { family: "actions-run-cancel", owner, repo, run: rest[1] as string };
+    }
+    // The C5 write trio + approve (web.go:1597-1598 run-level rerun pair,
+    // :1590 approve, :1588 job-level rerun — the exact 3/5-segment
+    // literals, disjoint from cancel's).
+    if (rest.length === 3 && rest[2] === "rerun") {
+      return { family: "actions-run-rerun", owner, repo, run: rest[1] as string };
+    }
+    if (rest.length === 3 && rest[2] === "rerun-failed") {
+      return { family: "actions-run-rerun-failed", owner, repo, run: rest[1] as string };
+    }
+    if (rest.length === 3 && rest[2] === "approve") {
+      return { family: "actions-run-approve", owner, repo, run: rest[1] as string };
+    }
+    if (rest.length === 5 && rest[2] === "jobs" && rest[4] === "rerun") {
+      return { family: "actions-run-job-rerun", owner, repo, run: rest[1] as string, job: rest[3] as string };
     }
     // The F-row tail: the run→workflow-file redirect (web.go:1591 — the
     // exact 3-segment literal, disjoint from cancel's).
@@ -8326,6 +8357,97 @@ async function actionsRunCancel(c: Context<{ Bindings: Env }>): Promise<Response
     return respond(c.html(renderNotFound(ctx), 404));
   }
   await cancelActionRun(c.env.DB, run.run, jobs);
+  return respond(
+    new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json;charset=utf-8" },
+    }),
+  );
+}
+
+/** POST /{owner}/{repo}/actions/runs/{run}/rerun | /runs/{run}/rerun-failed
+ *  and /{owner}/{repo}/actions/runs/{run}/jobs/{job}/rerun (actions.Rerun /
+ *  actions.RerunFailed — web.go:1597-1598, :1588): the cancel arm's ladder
+ *  verbatim (the sameOriginGuard, the drift guard, the C2 read gate, then
+ *  RequireUnitWriter's NotFound — anonymous and non-writer 404-shells,
+ *  never the login 303), then getCurrentRunJobsByPathParam's ID-based
+ *  resolution (the job-scoped shape resolving the attempt THROUGH the job,
+ *  view.go:1099-1160's precedence), then the landed rerunActionRun port
+ *  (pages/repo-actions-view.tsx — checkLatestAttempt, checkRunRerunAllowed,
+ *  the JSONError/JSONRedirect wire shapes). The port's not-found arm
+ *  answers the 404 shell (view.go:944-950's attempt check, :970-974's job
+ *  miss), everything else is the port's JSON body with its status (200
+ *  redirect / 400 JSONError / 409 message); the port's ServerError throws
+ *  propagate into the app's 500 chrome. */
+async function actionsRunRerun(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, repo, respond } = resolved;
+  const route = resolved.route;
+  if (
+    route.family !== "actions-run-rerun" &&
+    route.family !== "actions-run-rerun-failed" &&
+    route.family !== "actions-run-job-rerun"
+  ) {
+    return respond(await c.notFound()); // drift guard
+  }
+  const gate = await actionsRunViewGate(c, resolved);
+  if (gate !== null) return gate;
+  if (viewer.kind !== "user" || !(await canWriteRepo(c.env, repo, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404)); // RequireUnitWriter's NotFound
+  }
+  const run = await resolveActionsRunOrAnswer(c, resolved, route.run, "", true);
+  if (!("answer" in run)) return run;
+  const { attempt, jobs } = await resolveRunAttemptAndJobs(c.env.DB, run.run, "", route.job ?? "");
+  const request: RerunActionRunRequest =
+    route.family === "actions-run-rerun"
+      ? { kind: "run" }
+      : route.family === "actions-run-rerun-failed"
+        ? { kind: "run-failed" }
+        : { kind: "job", jobId: parsePathParamInt64(route.job ?? "") };
+  const outcome = await rerunActionRun(c.env.DB, repo, run.run, attempt, jobs, viewer.id, request);
+  if (outcome.kind === "not-found") return respond(c.html(renderNotFound(ctx), 404));
+  return respond(
+    new Response(JSON.stringify(outcome.body), {
+      status: outcome.status,
+      headers: { "content-type": "application/json;charset=utf-8" },
+    }),
+  );
+}
+
+/** POST /{owner}/{repo}/actions/runs/{run}/approve (actions.Approve —
+ *  web.go:1590): the cancel arm's ladder verbatim (the guards, the drift
+ *  check, the C2 read gate, RequireUnitWriter's NotFound), then
+ *  getCurrentRunByPathParam's ID-based resolution (view.go:1057-1060 — no
+ *  attempt/job params on this shape), then the landed approve service
+ *  (services/actions/approve.ts — approve.go:25-187 at the v1 stage: the
+ *  flag flip need_approval=false + approved_by, the needs-less BLOCKED
+ *  release, the wake + re-aggregate). Upstream answers ctx.JSONOK()'s
+ *  {"ok":true} dummy (context.go:245-247) on EVERY non-error arm — a run
+ *  that does not await approval is approve.go:36-38's silent continue, so
+ *  the body carries no signal and the frontend re-polls the view. The
+ *  service's rejections are the internal-misuse arms → the 500 chrome. */
+async function actionsRunApprove(c: Context<{ Bindings: Env }>): Promise<Response> {
+  const guard = sameOriginGuard(c.req.raw);
+  if (guard !== null) return guard;
+  const resolved = await resolveUiRequest(c);
+  if (!resolved.ok) return resolved.response;
+  const { ctx, viewer, repo, respond } = resolved;
+  if (resolved.route.family !== "actions-run-approve") return respond(await c.notFound()); // drift guard
+  const gate = await actionsRunViewGate(c, resolved);
+  if (gate !== null) return gate;
+  if (viewer.kind !== "user" || !(await canWriteRepo(c.env, repo, viewer))) {
+    return respond(c.html(renderNotFound(ctx), 404)); // RequireUnitWriter's NotFound
+  }
+  const route = resolved.route;
+  const run = await resolveActionsRunOrAnswer(c, resolved, route.run, "", true);
+  if (!("answer" in run)) return run;
+  const outcome = await approveRun(c.env.DB, repo.id, run.run, viewer.id);
+  if (!outcome.ok) {
+    throw new Error(`actions: approve for run ${run.run.id}: ${outcome.message}`); // ctx.ServerError's shape
+  }
   return respond(
     new Response(JSON.stringify({ ok: true }), {
       status: 200,
@@ -19250,6 +19372,18 @@ uiRouter.get("/:owner/:repo/actions/runs/:run/jobs/:job", (c) => actionsRunViewP
 uiRouter.post("/:owner/:repo/actions/runs/:run/jobs/:job", (c) => actionsRunViewJson(c));
 uiRouter.get("/:owner/:repo/actions/runs/:run/cancel", () => methodNotAllowed("POST"));
 uiRouter.post("/:owner/:repo/actions/runs/:run/cancel", (c) => actionsRunCancel(c));
+// The C5 write quartet (web.go:1588, 1590, 1597-1598 — all POST-only;
+// the GET twins answer chi's 405). The rerun pair shares the ONE handler
+// (the family literal picks the mode); the job-level rerun rides the
+// 5-segment shape.
+uiRouter.get("/:owner/:repo/actions/runs/:run/rerun", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/actions/runs/:run/rerun", (c) => actionsRunRerun(c));
+uiRouter.get("/:owner/:repo/actions/runs/:run/rerun-failed", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/actions/runs/:run/rerun-failed", (c) => actionsRunRerun(c));
+uiRouter.get("/:owner/:repo/actions/runs/:run/approve", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/actions/runs/:run/approve", (c) => actionsRunApprove(c));
+uiRouter.get("/:owner/:repo/actions/runs/:run/jobs/:job/rerun", () => methodNotAllowed("POST"));
+uiRouter.post("/:owner/:repo/actions/runs/:run/jobs/:job/rerun", (c) => actionsRunRerun(c));
 // The census C4 artifacts preview subtree (GET-only upstream — the POST
 // twins answer chi's 405): the SSR file browser + the signed raw serving.
 uiRouter.get("/:owner/:repo/actions/artifacts/:id/preview", (c) => actionsArtifactPreviewPage(c));
