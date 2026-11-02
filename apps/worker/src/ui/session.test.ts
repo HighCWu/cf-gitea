@@ -73,6 +73,7 @@ import {
   impersonateSessionUser,
   lookupValidSession,
   mintSession,
+  oauth2ErrorMessage,
   rotateSession,
   safeRedirectTarget,
   sessionRouter,
@@ -597,6 +598,51 @@ describe("GET /login (§2.1)", () => {
     const res = await request(`/login?redirect_to=${encodeURIComponent("//evil.example/x")}`);
     expect(res.status).toBe(200);
     expect(await res.text()).toContain('name="redirect_to" value="//evil.example/x"');
+  });
+
+  it("renders the oauth2_error flash as the inline error banner (upstream's flash arms, oauth.go:111-121)", async () => {
+    // The OAuth2 dance's failure arms 303 here with the marker code
+    // (web/oauth2-login.ts loginErrorRedirect); every code of the fixed set
+    // maps to its upstream locale message and renders in the same
+    // `ui negative message` slot the POST failures use.
+    const denied = await request("/login?oauth2_error=access_denied");
+    expect(denied.status).toBe(200);
+    const deniedHtml = await denied.text();
+    expect(deniedHtml).toContain("ui negative message");
+    expect(deniedHtml).toContain("The authorization request was denied."); // auth.oauth.signin.error.access_denied
+
+    const unavailable = await request("/login?oauth2_error=temporarily_unavailable");
+    expect(await unavailable.text()).toContain(
+      "Authorization failed because the authentication server is temporarily unavailable", // auth.oauth.signin.error.temporarily_unavailable
+    );
+
+    // The default arm (upstream auth.oauth.signin.error.general, the %s
+    // description dropped — the no-reflection divergence): the state
+    // mismatch and the unavailable-provider codes share it, exactly like
+    // upstream's errCallback default (its own state mismatch surfaces as
+    // `internal`, oauth.go:479).
+    for (const code of ["internal", "state", "provider_unavailable"]) {
+      const res = await request(`/login?oauth2_error=${code}`);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain("error processing the authorization request");
+    }
+
+    // The prohibited code renders the house's prohibited message (upstream
+    // renders its dedicated prohibit-login page instead — the mapper's
+    // documented divergence).
+    const prohibited = await request("/login?oauth2_error=prohibited");
+    expect(await prohibited.text()).toContain("prohibited from signing in");
+  });
+
+  it("an unknown oauth2_error code is INERT — no banner, no reflection (the param carries only the fixed code set)", async () => {
+    const res = await request(`/login?oauth2_error=${encodeURIComponent("<script>alert(1)</script>")}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).not.toContain("negative message");
+    expect(html).not.toContain("alert(1)"); // the crafted value reflects nowhere
+    // The mapper seam, directly: absent and unknown are null.
+    expect(oauth2ErrorMessage(null)).toBeNull();
+    expect(oauth2ErrorMessage("garbage")).toBeNull();
   });
 
   it("redirects a valid session to / and clears a garbage cookie", async () => {

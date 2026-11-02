@@ -14,15 +14,23 @@
  *   2. `externalSignupBlockedByInitWindow` FIRST — before any credential
  *      work (§5.5.3's strengthening; the identity.ts wrapper named by the
  *      W2 marks) — the open window answers `303 /user/login`;
- *   3. the signup arm's ALLOW_SIGNUP gate — closed ⇒ the full-shell 404
+ *   3. SIGNIN ARM ONLY — the `auth_failures` budget (SPEC §7.11): the arm
+ *      verifies a PAT, so it rides the SAME per-IP D1FailureLimiter as the
+ *      login POST (SPEC-0002 §2.7; SPEC-0010 §2.2 step 1's posture) —
+ *      check first (blocked ⇒ the shared 429), one failure recorded per
+ *      failed verify (invalid / scope / prohibited), reset on every
+ *      verified arm (the 2FA parks and the mint alike — the credential
+ *      proof SUCCEEDED). All through the fail-open wrappers (ef2c049's
+ *      rule: a broken limiter never 500s the arm);
+ *   4. the signup arm's ALLOW_SIGNUP gate — closed ⇒ the full-shell 404
  *      (the SPEC's exact polarity, the first-run signupNotFound posture);
- *   4. the source hint RE-RESOLVED against the ACTIVE store
+ *   5. the source hint RE-RESOLVED against the ACTIVE store
  *      (`getActiveOAuth2SourceByName`) — a miss is the honest full-shell
  *      404 (the hints are untrusted; a stale/deactivated source cannot
  *      complete the chain it names);
- *   5. the apply seam (page module): the credential ladder (signin) or the
+ *   6. the apply seam (page module): the credential ladder (signin) or the
  *      shared registration ladder (signup);
- *   6. failure ⇒ the 200 re-render with the inline message (the §2.2
+ *   7. failure ⇒ the 200 re-render with the inline message (the §2.2
  *      posture; the failed arm's tab carries the error);
  *      success on the SIGNIN arm ⇒ THE 2FA GATE (upstream gates this exact
  *      arm — oauth2LinkAccount's HasTwoFactorOrWebAuthn check,
@@ -65,6 +73,12 @@
 
 import { Hono, type Context } from "hono";
 
+import { D1FailureLimiter } from "../../auth/failure-limiter";
+import {
+  limiterCheckFailOpen,
+  limiterRecordFailureFailOpen,
+  limiterResetFailOpen,
+} from "../../auth/middleware";
 import { hasTwoFactorByUid, mintPendingTicket, twofaSetCookie } from "../../auth/two-factor";
 import { readUrlEncodedForm } from "../forms";
 import { renderNotFound } from "../render";
@@ -85,7 +99,16 @@ import { signUpLocale } from "./first-run";
 import { getActiveOAuth2SourceByName } from "../../services/auth-sources/store";
 import { allowSignup } from "../../services/user-accounts";
 import { demoModeEnabled } from "../../services/demo-sweep";
-import { sameOriginGuard, mintSession, safeRedirectTarget, sessionCookieValue, sessionSetCookie, verifySession } from "../session";
+import {
+  clientIp,
+  loginRateLimited,
+  sameOriginGuard,
+  mintSession,
+  safeRedirectTarget,
+  sessionCookieValue,
+  sessionSetCookie,
+  verifySession,
+} from "../session";
 import { AssetBuildError, loadManifest } from "../manifest";
 import { shellAssetsFromManifest, type UiContext } from "../ui-context";
 
@@ -254,6 +277,21 @@ async function linkAccountSignInSubmit(c: RouteContext): Promise<Response> {
   // contract; the first human comes from the one-shot /install).
   if (await externalSignupBlockedByInitWindow(c.env.DB)) return seeOther("/user/login");
 
+  // SPEC §7.11 — the auth_failures budget: this arm verifies a PAT, so it
+  // rides the SAME per-IP D1FailureLimiter as the login POST (SPEC-0010
+  // §2.2 step 1's check-first posture; the same `clientIp` extraction and
+  // the same 429 wire shape). Fail-open (ef2c049's rule — a broken limiter
+  // must not 500 the arm; the credential ladder below stays the real
+  // gate). Everything after this check — parse, source resolve, verify —
+  // consumes the budget; the guard above keeps its W2-contract first place
+  // (the limiter is not credential work).
+  const sink = backgroundSink(c);
+  const now = new Date();
+  const ip = clientIp(c.req.raw);
+  const limiter = new D1FailureLimiter(c.env.DB);
+  const verdict = await limiterCheckFailOpen(limiter, ip, now);
+  if (verdict.blocked) return loginRateLimited(verdict.retryAfterSeconds);
+
   const params = await readUrlEncodedForm(c.req.raw, MAX_FORM_BYTES);
   const form = parseLinkAccountSignInForm(params);
   const hints = { oauth2Source: form.oauth2Source, oauth2UsernameHint: form.userName, redirectTo: form.redirectTo };
@@ -264,6 +302,9 @@ async function linkAccountSignInSubmit(c: RouteContext): Promise<Response> {
 
   const outcome = await applyLinkAccountSignIn(c.env.DB, form);
   if (outcome.outcome === "invalid") {
+    // One budget failure per failed verify (awaited so the §8 tests count
+    // it deterministically — the login POST's renderLoginFailure rule).
+    await limiterRecordFailureFailOpen(limiter, ip, now);
     return reRender(c, hints, {
       allowSignup: allowSignup(c.env),
       error: linkAccountLocale.username_password_incorrect,
@@ -271,6 +312,7 @@ async function linkAccountSignInSubmit(c: RouteContext): Promise<Response> {
     });
   }
   if (outcome.outcome === "scope") {
+    await limiterRecordFailureFailOpen(limiter, ip, now);
     return reRender(c, hints, {
       allowSignup: allowSignup(c.env),
       error: locale.login_error_scope,
@@ -278,12 +320,23 @@ async function linkAccountSignInSubmit(c: RouteContext): Promise<Response> {
     });
   }
   if (outcome.outcome === "prohibited") {
+    await limiterRecordFailureFailOpen(limiter, ip, now);
     return reRender(c, hints, {
       allowSignup: allowSignup(c.env),
       error: locale.login_error_prohibited,
       errorTab: "signin",
     });
   }
+
+  // -- Verified: the budget resets (SPEC §7.11 — the login POST's rule) -----
+  //
+  // The credential proof SUCCEEDED, so this is not a failure arm: the
+  // reset runs here once, ahead of the 2FA parks AND the direct mint —
+  // exactly the local login's park-vs-complete posture (ui/session.ts
+  // steps 4.5a/4.5b: "the password proof SUCCEEDED … the house limiter's
+  // semantics reset on every verified-password arm alike"). Rides the
+  // background sink like the login POST's reset.
+  sink(limiterResetFailOpen(limiter, ip));
 
   // -- THE 2FA GATE (upstream gates this exact arm) --------------------------
   //

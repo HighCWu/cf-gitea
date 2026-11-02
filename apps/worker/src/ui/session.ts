@@ -2,7 +2,12 @@
  * Web sessions (SPEC-0010): PAT login, the `gitea_session` cookie, upstream
  * rotation + reuse-detection semantics, and the top-level routes
  *
- *   GET  /login   — the form (renders anonymous; a valid session redirects)
+ *   GET  /login   — the form (renders anonymous; a valid session redirects).
+ *                   The `?oauth2_error={code}` marker from the OAuth2 dance's
+ *                   failure arms (web/oauth2-login.ts's loginErrorRedirect)
+ *                   renders as the form's inline error banner — the wire
+ *                   analog of upstream's Flash.Error arms (oauth.go:111-121),
+ *                   message-mapped in `oauth2ErrorMessage` below.
  *   POST /login   — verify PAT → mint the sessions row → Set-Cookie
  *   POST /logout  — delete the row (id + digest match), clear the cookie;
  *                   the admin-impersonation EXIT arm (upstream SignOut's
@@ -862,8 +867,10 @@ export function sameOriginGuard(req: Request): Response | null {
 
 type RouteContext = Context<{ Bindings: Env }>;
 
-/** IP extraction follows the gate's convention (acl.ts:155-158). */
-function clientIp(req: Request): string {
+/** IP extraction follows the gate's convention (acl.ts:155-158). Exported
+ *  for the link-account router's limiter wiring (SPEC §7.11 — the same
+ *  per-IP bucket as the login POST, so the same extraction). */
+export function clientIp(req: Request): string {
   return (
     req.headers.get("cf-connecting-ip") ??
     req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
@@ -906,8 +913,10 @@ function seeOtherCookies(location: string, setCookies: string[]): Response {
 /** 429 + Retry-After in the gate's plain-text shape (`respond.ts
  *  rateLimited`) — SPEC-0010 §2.2 pins the machine-readable status for the
  *  web surface (the gate's git-HTTP shape answers 403; here an active block
- *  makes the form pointless and a 200 page would hide the block). */
-function loginRateLimited(retryAfterSeconds: number): Response {
+ *  makes the form pointless and a 200 page would hide the block). Exported
+ *  for the link-account arm's limiter (SPEC §7.11 — the same budget answers
+ *  the same wire shape). */
+export function loginRateLimited(retryAfterSeconds: number): Response {
   return new Response("too many authentication failures, retry later\n", {
     status: 429,
     headers: {
@@ -986,10 +995,70 @@ async function pageContext(
   }
 }
 
+// ---------------------------------------------------------------------------
+// The oauth2_error flash — the reader behind web/oauth2-login.ts's failure
+// redirect (`/login?oauth2_error={code}`, loginErrorRedirect). Upstream
+// flashes the translated message through its server-side session
+// (oauth.go:111-121) and the login template renders the flash above the
+// form; our flash rides the URL (Workers isolates have no server-side
+// session state — the same substitution the dance-state cookie makes) and
+// the GET arm maps the code onto the fixed message here.
+// ---------------------------------------------------------------------------
+
+/** The default arm's message — upstream `auth.oauth.signin.error.general`
+ *  with the `%s` description DROPPED (web/oauth2-login.ts's recorded
+ *  no-reflection divergence: fixed codes only, never provider-controlled
+ *  text in our UI). */
+const OAUTH2_ERROR_GENERAL =
+  "There was an error processing the authorization request. If this error persists, please contact the site administrator.";
+
+/**
+ * Map an `oauth2_error` code onto its flash message — upstream's
+ * `auth.oauth.signin.error.*` locale keys (locale_en-US.json) over
+ * web/oauth2-login.ts's fixed code set:
+ *
+ *   - `access_denied` → `auth.oauth.signin.error.access_denied`
+ *     (upstream's errCallback switch, oauth.go:114-115);
+ *   - `temporarily_unavailable` → `auth.oauth.signin.error.temporarily_unavailable`
+ *     (oauth.go:116-117);
+ *   - `internal` / `state` / `provider_unavailable` → the default arm's
+ *     general message (oauth.go:118-120 — upstream's state-mismatch surfaces
+ *     as `errCallback{Code: "internal"}` too, oauth.go:479);
+ *   - `prohibited` → the house's prohibited message (upstream renders the
+ *     dedicated prohibit-login PAGE instead, oauth.go:105-109 — here the
+ *     same condition renders as the login page's inline banner, the house
+ *     posture every other prohibited arm shares; DOCUMENTED DIVERGENCE).
+ *
+ * An absent or UNKNOWN code is inert (`null` — no banner): the param only
+ * ever carries this fixed set from our own redirects, and an
+ * attacker-crafted value must reflect nothing (the no-reflection rule
+ * above, applied to the URL carrier as well).
+ */
+export function oauth2ErrorMessage(code: string | null): string | null {
+  switch (code) {
+    case "access_denied":
+      return "The authorization request was denied.";
+    case "temporarily_unavailable":
+      return "Authorization failed because the authentication server is temporarily unavailable. Please try again later.";
+    case "internal":
+    case "state":
+    case "provider_unavailable":
+      return OAUTH2_ERROR_GENERAL;
+    case "prohibited":
+      return locale.login_error_prohibited;
+    default:
+      return null;
+  }
+}
+
 /** GET /login — the form in the anonymous shell (§2.1: renders anonymous; a
  *  valid session redirects to `/`, carrying a rotation cookie if one was
  *  minted during the check). The §2.4 directives travel on every outcome:
- *  a dead cookie is cleared here too. */
+ *  a dead cookie is cleared here too. The OAuth2 dance's failure arms land
+ *  here with `?oauth2_error={code}` — the code maps to the inline banner
+ *  message (oauth2ErrorMessage; upstream's flash render, oauth.go:111-121).
+ *  A signed-in visitor's redirect to `/` drops the marker exactly like
+ *  upstream's performAutoLogin arm drops the flash (auth.go:208-227). */
 async function loginPage(c: RouteContext): Promise<Response> {
   const sink = backgroundSink(c);
   let setCookie: string | null = null;
@@ -1015,7 +1084,9 @@ async function loginPage(c: RouteContext): Promise<Response> {
   }
   const assembled = await pageContext(c, { kind: "anonymous" });
   if ("response" in assembled) return assembled.response;
-  const redirectTo = new URL(c.req.url).searchParams.get("redirect_to");
+  const url = new URL(c.req.url);
+  const redirectTo = url.searchParams.get("redirect_to");
+  const oauth2Error = oauth2ErrorMessage(url.searchParams.get("oauth2_error"));
   // The external-auth buttons (specs/external-auth-sources.md §5.6): ONE
   // store read — the active OAuth2 sources, name order — projected through
   // the page module's mapper (dead cfgs drop). Empty table ⇒ the option is
@@ -1024,7 +1095,7 @@ async function loginPage(c: RouteContext): Promise<Response> {
   const html = renderLoginPage({
     ctx: assembled.ctx,
     redirectTo,
-    error: null,
+    error: oauth2Error,
     adminInit: (await initWindowOpen(c.env.DB)) ? { open: true, error: null } : undefined,
     signUpLink: allowSignup(c.env),
     oauth2Sources: oauth2LoginSourceButtons(activeSources),

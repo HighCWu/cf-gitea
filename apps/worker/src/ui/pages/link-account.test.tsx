@@ -18,6 +18,7 @@ import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:
 import { beforeEach, describe, expect, it } from "vitest";
 import { Hono } from "hono";
 
+import { fnv1a32 } from "../../auth/failure-limiter";
 import { TWOFA_COOKIE_NAME, applyTwofaEnrollment, generateTotpSecret, mintPendingTicket, verifyPendingTicket } from "../../auth/two-factor";
 import { totpCode } from "../../auth/totp";
 import { applyAuthD1Migrations } from "../../auth/testing/apply-d1-migrations";
@@ -132,8 +133,8 @@ const CLOSED_ENV: GateTestEnv = { ...env, ALLOW_SIGNUP: "false" };
 beforeEach(async () => {
   await applyAuthD1Migrations();
   // `two_factor` + `webauthn_credentials` ride the signin arm's 2FA gate
-  // (the describe below).
-  for (const table of ["external_login_user", "login_source", "sessions", "users", "personal_access_tokens", "two_factor", "webauthn_credentials"]) {
+  // (the describe below); `auth_failures` rides its limiter (§7.11).
+  for (const table of ["external_login_user", "login_source", "sessions", "users", "personal_access_tokens", "two_factor", "webauthn_credentials", "auth_failures"]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   idp = await stubIdp();
@@ -181,6 +182,11 @@ const sessionCount = async (): Promise<number> => {
   const { results } = await env.DB.prepare("SELECT count(*) AS n FROM sessions").all<{ n: number }>();
   return results[0]?.n ?? 0;
 };
+
+/** The per-IP auth_failures counter (session.test.ts's shape, raw-SQL per
+ *  this file's harness convention) — the §7.11 budget's assertion seam. */
+const failureCount = async (ip: string): Promise<number> =>
+  (await env.DB.prepare("SELECT count FROM auth_failures WHERE ip = ?").bind(ip).first<{ count: number }>())?.count ?? 0;
 
 /** Form-post the signin/signup arms. */
 function formPost(fields: Record<string, string>): RequestInit {
@@ -478,6 +484,106 @@ describe("POST /user/link_account_signin (LinkAccountPostSignIn's ladder)", () =
       );
       expect(post.status).toBe(404);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The signin arm's auth_failures budget (SPEC §7.11 — the /login budget)
+// ---------------------------------------------------------------------------
+
+describe("the signin arm's auth_failures budget (SPEC §7.11)", () => {
+  const SIGNIN_URL = "https://app.example.com/user/link_account_signin";
+  /** A pinned-bucket POST (x-forwarded-for selects the per-IP window). */
+  const postAs = (fields: Record<string, string>, ip: string): RequestInit => ({
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", "x-forwarded-for": ip },
+    body: new URLSearchParams(fields).toString(),
+  });
+
+  it("every failed verify records ONE budget failure — invalid, scope, prohibited (the login POST's §2.2/§4.11 posture)", async () => {
+    await seedOidcSource();
+    const janeId = await seedUserRow({ name: "jane", email: "jane@example.com" });
+    const ip = "10.7.0.1";
+
+    await req(SIGNIN_URL, postAs({ user_name: "jane", password: "gitea_wrong", oauth2_source: "OIDC" }, ip));
+    expect(await failureCount(ip)).toBe(1); // the invalid arm
+
+    await req(SIGNIN_URL, postAs({ user_name: "jane", password: await mintPat(janeId, "write:package"), oauth2_source: "OIDC" }, ip));
+    expect(await failureCount(ip)).toBe(2); // the scope arm counts too
+
+    const suspendedId = await seedUserRow({ name: "suspended", status: "prohibited", email: "suspended@example.com" });
+    await req(SIGNIN_URL, postAs({ user_name: "suspended", password: await mintPat(suspendedId), oauth2_source: "OIDC" }, ip));
+    expect(await failureCount(ip)).toBe(3); // the prohibited arm counts too
+
+    // The non-credential exits budget NOTHING: the unknown-source 404 dies
+    // before the verify (and the limiter CHECK itself never records).
+    await req(SIGNIN_URL, postAs({ user_name: "jane", password: "gitea_wrong", oauth2_source: "GHOST" }, ip));
+    expect(await failureCount(ip)).toBe(3);
+  });
+
+  it("a spent budget answers the shared 429 + Retry-After BEFORE any credential work — even a VALID PAT", async () => {
+    await seedOidcSource();
+    const userId = await seedUserRow({ name: "jane", email: "jane@example.com" });
+    const pat = await mintPat(userId);
+    const ip = "10.7.0.2";
+    // The threshold is deterministically jittered +0-20% per IP (SPEC-0002 §2.7
+    // — the login POST's own 429 test computes it the same way).
+    const threshold = 20 + (fnv1a32(ip) % 5);
+    let blocked: Response | null = null;
+    for (let attempt = 0; attempt < threshold + 1; attempt++) {
+      const res = await req(SIGNIN_URL, postAs({ user_name: "jane", password: "gitea_wrong", oauth2_source: "OIDC" }, ip));
+      if (res.status === 429) {
+        blocked = res;
+        break;
+      }
+      expect(res.status).toBe(200);
+    }
+    expect(blocked).not.toBeNull();
+    expect(blocked?.headers.get("retry-after")).toMatch(/^[1-9][0-9]*$/);
+    expect(await blocked?.text()).toContain("too many authentication failures");
+
+    // The check runs FIRST: a valid credential stays blocked, nothing mints
+    // (the unthrottled-PAT-oracle hole is closed at the same gate).
+    const before = await sessionCount();
+    const valid = await req(SIGNIN_URL, postAs({ user_name: "jane", password: pat, oauth2_source: "OIDC" }, ip));
+    expect(valid.status).toBe(429);
+    expect(await sessionCount()).toBe(before);
+  });
+
+  it("a verified arm RESETS the budget — the direct mint AND the 2FA park (the proof succeeded)", async () => {
+    await seedOidcSource();
+    const userId = await seedUserRow({ name: "jane", email: "jane@example.com" });
+    const pat = await mintPat(userId);
+    const ip = "10.7.0.3";
+    const badPost = (): RequestInit => postAs({ user_name: "jane", password: "gitea_wrong", oauth2_source: "OIDC" }, ip);
+    const goodPost = (): RequestInit => postAs({ user_name: "jane", password: pat, oauth2_source: "OIDC" }, ip);
+    /** The router fetch with a REAL execution context — the reset rides
+     *  `ctx.waitUntil` (session.test.ts's capture shape); the detached `req`
+     *  helper cannot await it, so the count assertion needs the settled
+     *  sink. */
+    const reqCtx = async (init: RequestInit): Promise<Response> => {
+      const context = createExecutionContext();
+      const response = await linkRouter.fetch(new Request(SIGNIN_URL, init), env, context);
+      await waitOnExecutionContext(context);
+      return response;
+    };
+
+    // One failed verify, then the direct-mint success resets.
+    await req(SIGNIN_URL, badPost());
+    expect(await failureCount(ip)).toBe(1);
+    const mint = await reqCtx(goodPost());
+    expect(mint.status).toBe(303);
+    expect(await failureCount(ip)).toBe(0);
+
+    // The park arm resets identically (ui/session.ts steps 4.5a/4.5b's
+    // posture: the credential proof SUCCEEDED — a park is not a failure).
+    await req(SIGNIN_URL, badPost());
+    expect(await failureCount(ip)).toBe(1);
+    await enrollTotp(userId);
+    const park = await reqCtx(goodPost());
+    expect(park.status).toBe(303);
+    expect(park.headers.get("location")).toBe("/user/two_factor");
+    expect(await failureCount(ip)).toBe(0);
   });
 });
 
