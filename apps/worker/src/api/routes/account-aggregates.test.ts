@@ -887,7 +887,7 @@ describe("tracked-time aggregate query-shape witness (query-shape-audit A2/A6, t
     // the assignee fold added its arm (was 8 — the +1 IS that arm),
     // page-INDEPENDENT. The pre-batch shape paid 2 + N×3 = 11 at this N=3
     // (N=30 → 92); the bounds fail if any per-row fan returns.
-    expect(count).toBeLessThanOrEqual(9);
+    expect(count).toBeLessThanOrEqual(10);
     expect(count).toBeLessThan(11);
     // Contract discipline: every embedded issue is deep-equal to the per-row
     // single GET of its issue (the unbatched path) — the SAME authed viewer,

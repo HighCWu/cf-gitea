@@ -1,4 +1,4 @@
-import { and, asc, eq, gte, inArray, like, lt, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, like, lt, or, sql, type SQL } from "drizzle-orm";
 import { drizzle, type DrizzleD1Database } from "drizzle-orm/d1";
 import type { Context } from "hono";
 
@@ -32,6 +32,7 @@ import type { CommentRow, IssueRow, LabelRow, MilestoneRow, PullRequestRow } fro
 import { ApiError } from "../errors";
 import type { ApiEnv } from "../env";
 import type { Comment, Issue, TimelineComment } from "../models/issue";
+import type { Attachment as ReleaseAttachment } from "../models/release";
 import type { User } from "../models/user";
 import { BLOCKED_USER_MESSAGE, isUserBlockedBy } from "./blocks";
 import { ActionType } from "./activity-feeds";
@@ -43,6 +44,7 @@ import {
   apiRepositoryUrl,
   apiUserFromRow,
   findRepositoryById,
+  findRepositoriesByIds,
   findUserByName,
   GO_ZERO_TIME,
   toApiRepository,
@@ -295,6 +297,9 @@ export interface IssueRenderContext {
    *  user row is gone — the inner join drops it on both paths) renders the
    *  empty-set nulls. */
   assigneesByIssue: Map<number, UserRow[]>;
+  /** The issue's direct attachment rows (`comment_id = 0`) per issue id,
+   *  each bucket in id order (the per-row `listIssueAttachments` orderBy). */
+  attachmentsByIssue: Map<number, IssueAttachmentRow[]>;
 }
 
 /** Optional preloaded reads for `toApiIssue` — the list routes' batch
@@ -309,8 +314,9 @@ export interface IssueRenderPreload {
 
 /**
  * One batched read per entity kind for the page's rows (posters, the label
- * join, pin orders, milestones, PR rows, the assignee join), fanned with
- * Promise.all. Empty or homogeneous pages skip their arms entirely — 0
+ * join, pin orders, milestones, PR rows, the assignee join, the direct
+ * attachments), fanned with Promise.all. Empty or homogeneous pages skip
+ * their arms entirely — 0
  * statements there, exactly like the per-row path. The id lists stay far under
  * the D1 100-variable cap: the API paging clamps at 50 rows
  * (pagination.ts MAX_RESPONSE_ITEMS).
@@ -321,7 +327,7 @@ export async function prefetchIssueRenderContext(d1: D1Database, pageRows: Issue
   const milestoneIds = [...new Set(pageRows.flatMap((row) => (row.milestoneId === null ? [] : [row.milestoneId])))];
   const prIssueIds = pageRows.flatMap((row) => (row.isPull ? [row.id] : []));
   const db = drizzle(d1);
-  const [posterRows, labelRows, pinRows, milestoneRows, prRows, assigneeRows] = await Promise.all([
+  const [posterRows, labelRows, pinRows, milestoneRows, prRows, assigneeRows, attachmentRows] = await Promise.all([
     posterIds.length > 0 ? db.select().from(users).where(inArray(users.id, posterIds)).all() : Promise.resolve([]),
     issueIds.length > 0
       ? db
@@ -353,6 +359,16 @@ export async function prefetchIssueRenderContext(d1: D1Database, pageRows: Issue
           .orderBy(asc(issueAssignees.id))
           .all()
       : Promise.resolve([]),
+    // The DIRECT attachment rows only (comment_id = 0) — the per-row
+    // listIssueAttachments scope — id order preserved per bucket.
+    issueIds.length > 0
+      ? db
+          .select()
+          .from(issueAttachments)
+          .where(and(inArray(issueAttachments.issueId, issueIds), eq(issueAttachments.commentId, 0)))
+          .orderBy(asc(issueAttachments.id))
+          .all()
+      : Promise.resolve([]),
   ]);
   const labelsByIssue = new Map<number, LabelRow[]>();
   for (const row of labelRows) {
@@ -372,6 +388,15 @@ export async function prefetchIssueRenderContext(d1: D1Database, pageRows: Issue
       bucket.push(row.user);
     }
   }
+  const attachmentsByIssue = new Map<number, IssueAttachmentRow[]>();
+  for (const row of attachmentRows) {
+    const bucket = attachmentsByIssue.get(row.issueId);
+    if (bucket === undefined) {
+      attachmentsByIssue.set(row.issueId, [row]);
+    } else {
+      bucket.push(row);
+    }
+  }
   return {
     posters: new Map(posterRows.map((row) => [row.id, row])),
     labelsByIssue,
@@ -379,6 +404,7 @@ export async function prefetchIssueRenderContext(d1: D1Database, pageRows: Issue
     milestones: new Map(milestoneRows.map((row) => [row.id, row])),
     pullRequestsByIssue: new Map(prRows.map((row) => [row.issueId, row])),
     assigneesByIssue,
+    attachmentsByIssue,
   };
 }
 
@@ -391,14 +417,71 @@ function posterFromContext(context: IssueRenderContext, viewer: Viewer, posterId
   return row === undefined ? null : apiUserFromRow(row, viewer);
 }
 
+// ---------------------------------------------------------------------------
+// Issue/comment attachments (the ledger ⑬-#6): upstream loads the attachment
+// rows inside the renders — `issue.LoadAttachments` in toIssue
+// (services/convert/issue.go:43) feeding `toAttachments` (:56), and
+// `c.Attachments` in ToAPIComment (issue_comment.go:26 → ToAPIAttachments) —
+// and renders them through `convert.toAttachment`. Our rows live in the
+// `issue_attachments` family (SPEC-0005 §3.3, migration 0014); the render is
+// the release-assets twin (services/release-assets.ts toApiAttachment) typed
+// to this row, exactly the twin routes/issue-attachments.ts already carries
+// for its single-asset responses.
+// ---------------------------------------------------------------------------
+
+/** Inferred row of the `issue_attachments` table (SPEC-0005 §3.3). */
+export type IssueAttachmentRow = typeof issueAttachments.$inferSelect;
+
+/** The issue's DIRECT attachments (`comment_id = 0`), id order — upstream
+ *  issue.LoadAttachments → Find primary-key order, the release list's
+ *  convention (services/release-assets.ts listReleaseAssets). */
+export async function listIssueAttachments(d1: D1Database, issueId: number): Promise<IssueAttachmentRow[]> {
+  return drizzle(d1)
+    .select()
+    .from(issueAttachments)
+    .where(and(eq(issueAttachments.issueId, issueId), eq(issueAttachments.commentId, 0)))
+    .orderBy(asc(issueAttachments.id))
+    .all();
+}
+
+/** One comment's attachments (the (issue_id, comment_id) scope of upstream's
+ *  `attachmentBelongsToComment`, routers/api/v1/repo/issue_comment_attachment.go),
+ *  id order. */
+export async function listCommentAttachments(d1: D1Database, issueId: number, commentId: number): Promise<IssueAttachmentRow[]> {
+  return drizzle(d1)
+    .select()
+    .from(issueAttachments)
+    .where(and(eq(issueAttachments.issueId, issueId), eq(issueAttachments.commentId, commentId)))
+    .orderBy(asc(issueAttachments.id))
+    .all();
+}
+
+/** `convert.toAttachment` → the contract `Attachment` — the release-assets
+ *  render twin typed to the `issue_attachments` row (whose r2_key is
+ *  nullable). `browser_download_url` is upstream's Attachment.DownloadURL:
+ *  AppSubURL (empty) + /attachments/ + the path-escaped uuid, made absolute
+ *  against the request origin. */
+function toAttachmentApi(origin: string, row: IssueAttachmentRow): ReleaseAttachment {
+  return {
+    id: row.id,
+    name: row.name,
+    created_at: row.createdAt === null || row.createdAt === undefined ? undefined : row.createdAt.toISOString(),
+    download_count: row.downloadCount,
+    size: row.size,
+    uuid: row.uuid,
+    browser_download_url: `${origin}/attachments/${encodeURIComponent(row.uuid)}`,
+  };
+}
+
 /**
  * `convert.ToIssue` → the contract `Issue`. Enrichment reads per render:
- * poster row, label join, assignee join, milestone row, PR row (PRs only) —
- * the same loads upstream's toIssue performs (LoadPoster/LoadLabels/
- * LoadAssignees/LoadMilestone/LoadPullRequest). LIST routes pass `preload`
- * (the page-scoped `prefetchIssueRenderContext` maps + the caller-held PR
- * row) so the reads collapse to 0 per row; without it the per-row selects run
- * exactly as before — the single-item routes' unchanged path.
+ * poster row, label join, assignee join, milestone row, PR row (PRs only),
+ * the direct attachment rows — the same loads upstream's toIssue performs
+ * (LoadPoster/LoadLabels/LoadAssignees/LoadMilestone/LoadPullRequest/
+ * LoadAttachments). LIST routes pass `preload` (the page-scoped
+ * `prefetchIssueRenderContext` maps + the caller-held PR row) so the reads
+ * collapse to 0 per row; without it the per-row selects run exactly as
+ * before — the single-item routes' unchanged path.
  *
  * The ASSIGNEE FOLD (the PATCH-assignee landing's named wave): `assignee`/
  * `assignees` render the REAL set — `convert.ToIssue` issue.go:105-113, the
@@ -415,6 +498,7 @@ export async function toApiIssue(d1: D1Database, viewer: Viewer, pair: Repositor
   const labelRows = context === undefined ? await issueLabelRows(d1, issue.id) : (context.labelsByIssue.get(issue.id) ?? []);
   const pinOrder = context === undefined ? await pinOrderOf(d1, issue.id) : (context.pinOrders.get(issue.id) ?? -1);
   const assigneeRows = context === undefined ? await listIssueAssignees(d1, issue.id) : (context.assigneesByIssue.get(issue.id) ?? []);
+  const attachmentRows = context === undefined ? await listIssueAttachments(d1, issue.id) : (context.attachmentsByIssue.get(issue.id) ?? []);
   const milestoneRow =
     issue.milestoneId === null
       ? null
@@ -438,7 +522,7 @@ export async function toApiIssue(d1: D1Database, viewer: Viewer, pair: Repositor
     title: issue.title,
     body: issue.content ?? "",
     ref: issue.ref ?? "",
-    assets: [],
+    assets: attachmentRows.map((row) => toAttachmentApi(viewer.origin, row)),
     labels: labelRows.map((row) => toEmbeddedLabel(row, pair, viewer.origin)),
     milestone: milestoneRow === null ? null : toApiMilestone(milestoneRow),
     projects: null, // projects are tier 3 (SPEC-0004 §2.6)
@@ -477,6 +561,49 @@ export async function prefetchCommentPosters(d1: D1Database, commentRows: Commen
   return new Map(rows.map((row) => [row.id, row]));
 }
 
+/**
+ * One batched attachment read for a comment page (the asset render's page
+ * twin — upstream batches the same rows through comment.Attachments): one
+ * inArray select over the page's comment ids, each bucket in id order (the
+ * per-row `listCommentAttachments` orderBy); a no-comment page skips to zero
+ * statements.
+ */
+export async function prefetchCommentAttachments(d1: D1Database, commentRows: CommentRow[]): Promise<Map<number, IssueAttachmentRow[]>> {
+  const commentIds = commentRows.map((row) => row.id);
+  if (commentIds.length === 0) {
+    return new Map();
+  }
+  const rows = await drizzle(d1)
+    .select()
+    .from(issueAttachments)
+    .where(inArray(issueAttachments.commentId, commentIds))
+    .orderBy(asc(issueAttachments.id))
+    .all();
+  const byComment = new Map<number, IssueAttachmentRow[]>();
+  for (const row of rows) {
+    const bucket = byComment.get(row.commentId);
+    if (bucket === undefined) {
+      byComment.set(row.commentId, [row]);
+    } else {
+      bucket.push(row);
+    }
+  }
+  return byComment;
+}
+
+/** The combined `toApiComment` page preload — the A7 plumbing for the list
+ *  routes: posters + attachments in one fan (each sub-read keeps its own
+ *  empty-page skip). */
+export interface CommentRenderPreload {
+  posters?: Map<number, UserRow>;
+  attachmentsByComment?: Map<number, IssueAttachmentRow[]>;
+}
+
+export async function prefetchCommentRenderPreload(d1: D1Database, commentRows: CommentRow[]): Promise<CommentRenderPreload> {
+  const [posters, attachmentsByComment] = await Promise.all([prefetchCommentPosters(d1, commentRows), prefetchCommentAttachments(d1, commentRows)]);
+  return { posters, attachmentsByComment };
+}
+
 /** The context twin of `toPoster` for the comment pages — identical null
  *  semantics, 0 reads. */
 function posterFromMap(posters: Map<number, UserRow>, viewer: Viewer, posterId: number | null): User | null {
@@ -491,10 +618,12 @@ function posterFromMap(posters: Map<number, UserRow>, viewer: Viewer, posterId: 
  * `convert.ToAPIComment` → the contract `Comment`. `issue_url` is the issue
  * page for issues and the EMPTY STRING for PRs; `pull_request_url` the
  * mirror image (models/issues/comment.go IssueURL/PRURL). The poster row is
- * fetched per render (upstream `comments.LoadPosters`); the comment-LIST
- * routes pass `preload.posters` (the page-scoped `prefetchCommentPosters`
- * map) so the read collapses to a lookup — a map miss renders the per-row
- * null verbatim. Omitted keeps the per-row select (single-item routes).
+ * fetched per render (upstream `comments.LoadPosters`), the attachment rows
+ * per render too (upstream ToAPIComment renders `c.Attachments` — the
+ * (issue_id, comment_id) scope); the comment-LIST routes pass `preload`
+ * (the page-scoped maps) so the reads collapse to lookups — a map miss
+ * renders the per-row select's result verbatim. Omitted keeps the per-row
+ * selects (single-item routes).
  */
 export async function toApiComment(
   d1: D1Database,
@@ -502,9 +631,13 @@ export async function toApiComment(
   pair: RepositoryWithOwner,
   issue: IssueRow,
   comment: CommentRow,
-  preload?: { posters?: Map<number, UserRow> },
+  preload?: { posters?: Map<number, UserRow>; attachmentsByComment?: Map<number, IssueAttachmentRow[]> },
 ): Promise<Comment> {
   const poster = preload?.posters === undefined ? await toPoster(d1, viewer, comment.posterId) : posterFromMap(preload.posters, viewer, comment.posterId);
+  const attachmentRows =
+    preload?.attachmentsByComment === undefined
+      ? await listCommentAttachments(d1, comment.issueId, comment.id)
+      : (preload.attachmentsByComment.get(comment.id) ?? []);
   const htmlUrl = commentHtmlUrl(pair, viewer.origin, issue.index, issue.isPull, comment.id);
   const issuePageUrl = issueHtmlUrl(pair, viewer.origin, issue.index);
   return {
@@ -514,7 +647,7 @@ export async function toApiComment(
     issue_url: issue.isPull ? "" : issuePageUrl,
     user: poster,
     body: comment.content ?? "",
-    assets: [],
+    assets: attachmentRows.map((row) => toAttachmentApi(viewer.origin, row)),
     created_at: isoOrZero(comment.createdAt),
     updated_at: isoOrZero(comment.updatedAt),
   };
@@ -602,15 +735,28 @@ export interface TimelineRenderContext {
   labels: Map<number, LabelRow>;
   /** Assignee rows by user id (the per-comment `assignee` arm). */
   assignees: Map<number, UserRow>;
+  /** The type-19/20 comments' dependent-issue legs by issue id: the issue
+   *  row plus its OWN repo pair (dependency edges may cross repos — the
+   *  render's URLs and repository meta resolve against the pair); a dangling
+   *  issue or an owner-less repo row renders the null dependent_issue (the
+   *  same join miss `findRepositoryById` produces everywhere else). */
+  dependentIssues: Map<number, DependentIssueLeg>;
+}
+
+/** One dependent-issue leg: the issue row + the resolved repo pair its
+ *  render (a full ToAPIIssue — upstream issue_comment.go:193-195) needs. */
+export interface DependentIssueLeg {
+  issue: IssueRow;
+  pair: RepositoryWithOwner;
 }
 
 /**
  * One batched read per entity kind for the timeline page's rows (posters,
- * milestones, labels, assignees), fanned with Promise.all. Empty pages skip
- * every arm entirely — 0 statements there, exactly like the per-row path
- * (whose empty page also fans nothing). The id lists stay far under the D1
- * 100-variable cap: the API paging clamps at 50 rows
- * (pagination.ts MAX_RESPONSE_ITEMS).
+ * milestones, labels, assignees, the dependent-issue legs), fanned with
+ * Promise.all. Empty pages skip every arm entirely — 0 statements there,
+ * exactly like the per-row path (whose empty page also fans nothing). The id
+ * lists stay far under the D1 100-variable cap: the API paging clamps at 50
+ * rows (pagination.ts MAX_RESPONSE_ITEMS).
  */
 export async function prefetchTimelineContext(d1: D1Database, commentRows: CommentRow[]): Promise<TimelineRenderContext> {
   const posterIds = [...new Set(commentRows.flatMap((row) => (row.posterId === null ? [] : [row.posterId])))];
@@ -624,19 +770,53 @@ export async function prefetchTimelineContext(d1: D1Database, commentRows: Comme
   ];
   const labelIds = [...new Set(commentRows.flatMap((row) => (row.labelId === null || row.labelId === undefined ? [] : [row.labelId])))];
   const assigneeIds = [...new Set(commentRows.flatMap((row) => (row.assigneeId === null || row.assigneeId === undefined ? [] : [row.assigneeId])))];
+  const dependentIssueIds = [
+    ...new Set(commentRows.flatMap((row) => (row.dependentIssueId === null || row.dependentIssueId === undefined ? [] : [row.dependentIssueId]))),
+  ];
   const db = drizzle(d1);
-  const [posterRows, milestoneRows, labelRows, assigneeRows] = await Promise.all([
+  const [posterRows, milestoneRows, labelRows, assigneeRows, dependentIssueRows] = await Promise.all([
     posterIds.length > 0 ? db.select().from(users).where(inArray(users.id, posterIds)).all() : Promise.resolve([]),
     milestoneIds.length > 0 ? db.select().from(milestones).where(inArray(milestones.id, milestoneIds)).all() : Promise.resolve([]),
     labelIds.length > 0 ? db.select().from(labels).where(inArray(labels.id, labelIds)).all() : Promise.resolve([]),
     assigneeIds.length > 0 ? db.select().from(users).where(inArray(users.id, assigneeIds)).all() : Promise.resolve([]),
+    dependentIssueIds.length > 0 ? db.select().from(issues).where(inArray(issues.id, dependentIssueIds)).all() : Promise.resolve([]),
   ]);
+  // The dependent legs' repo pairs — the A6 batch twin (ONE repositories ⋈
+  // users read over the DISTINCT repo ids the issues arm resolved; a
+  // dangling issue id never reaches it, and an owner-less repo row renders
+  // the null dependent_issue exactly like the per-row select's miss).
+  const legRepoIds = [...new Set(dependentIssueRows.map((row) => row.repoId))];
+  const legPairs = await findRepositoriesByIds(d1, legRepoIds);
+  const dependentIssues = new Map<number, DependentIssueLeg>();
+  for (const issue of dependentIssueRows) {
+    const pair = legPairs.get(issue.repoId);
+    if (pair !== undefined) {
+      dependentIssues.set(issue.id, { issue, pair });
+    }
+  }
   return {
     posters: new Map(posterRows.map((row) => [row.id, row])),
     milestones: new Map(milestoneRows.map((row) => [row.id, row])),
     labels: new Map(labelRows.map((row) => [row.id, row])),
     assignees: new Map(assigneeRows.map((row) => [row.id, row])),
+    dependentIssues,
   };
+}
+
+/** The per-row twin of the batched dependent-issue leg (identical null
+ *  semantics: a dangling issue or an unresolvable repo pair → null). */
+async function dependentIssueLegOf(d1: D1Database, dependentIssueId: number): Promise<DependentIssueLeg | null> {
+  const issue = await drizzle(d1)
+    .select()
+    .from(issues)
+    .where(eq(issues.id, dependentIssueId))
+    .limit(1)
+    .then((rows) => (rows[0] === undefined ? null : rows[0]));
+  if (issue === null) {
+    return null;
+  }
+  const pair = await findRepositoryById(d1, issue.repoId);
+  return pair === null ? null : { issue, pair };
 }
 
 /** The context twin of the per-row milestone select — identical null
@@ -658,6 +838,187 @@ function assigneeRowFromMap(rows: Map<number, UserRow>, id: number | null | unde
   return id === null || id === undefined ? null : (rows.get(id) ?? null);
 }
 
+// ---------------------------------------------------------------------------
+// Time-tracking body humanization + the tracked_time/dependent_issue fill
+// (the ledger ⑬-#9): upstream ToTimelineComment humanizes the raw-seconds
+// time bodies on the way out (services/convert/issue_comment.go:70-84) and
+// fills `tracked_time` (LoadTime → ToTrackedTime, :126-130) and
+// `dependent_issue` (LoadDepIssueDetails → ToAPIIssue, :193-195).
+// ---------------------------------------------------------------------------
+
+/** `util.SecToHours` (modules/util/sec_to_time.go:15-32) — the humanized
+ *  hours/minutes string ("1 hour 30 minutes"); seconds appear only below one
+ *  minute, singulars never pluralize, and the `seconds > 0` sentinel falls
+ *  back to the seconds unit. Go truncates integer division → Math.trunc
+ *  (the value is a duration; negatives render "" on both runtimes). */
+function secToHours(totalSeconds: number): string {
+  const hours = Math.trunc(totalSeconds / 3600);
+  const minutes = Math.trunc(totalSeconds / 60) % 60;
+  const unit = (value: number, name: string): string => (value === 1 ? `1 ${name} ` : value > 1 ? `${value} ${name}s ` : "");
+  const out = `${unit(hours, "hour")}${unit(minutes, "minute")}`;
+  if (out === "" && totalSeconds > 0) {
+    return unit(totalSeconds, "second").trimEnd();
+  }
+  return out.replace(/ $/, "");
+}
+
+/** `util.TimeEstimateString` (modules/util/time_str.go:82-92) — the compact
+ *  h/m/s chain, largest unit first, SPACE-joined ("2h 30m"); a zero/negative
+ *  amount renders "" (no unit term fits). */
+function timeEstimateString(amount: number): string {
+  let rest = amount;
+  const parts: string[] = [];
+  for (const [name, num] of [
+    ["h", 3600],
+    ["m", 60],
+    ["s", 1],
+  ] as const) {
+    if (rest >= num) {
+      parts.push(`${Math.trunc(rest / num)}${name}`);
+      rest %= num;
+    }
+  }
+  return parts.join(" ");
+}
+
+/** `util.ToInt64` over strings (modules/util/util.go:171-206 →
+ *  strconv.ParseInt base 10): digits with an optional sign, else the zero
+ *  the error path yields. Out-of-int64 digit runs are Go parse errors → 0. */
+function goParseInt64(raw: string): number {
+  if (!/^[+-]?\d{1,19}$/.test(raw)) {
+    return 0;
+  }
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? value : 0;
+}
+
+/** The time-comment body render (convert/issue_comment.go:69-84 verbatim):
+ *  the v1.21+ writers store raw seconds behind the `|` delimiter
+ *  (tracked_time.go:185/:261/:285) and the three time-tracking types get the
+ *  on-demand humanization; change_time_estimate (38) stores decimal seconds
+ *  and renders TimeEstimateString. Everything else passes through verbatim. */
+function timelineBodyOf(comment: CommentRow): string {
+  const content = comment.content ?? "";
+  if (
+    content !== "" &&
+    (comment.type === CommentType.AddTimeManual || comment.type === CommentType.StopTracking || comment.type === CommentType.DeleteTimeManual) &&
+    content[0] === "|"
+  ) {
+    return secToHours(goParseInt64(content.slice(1)));
+  }
+  if (comment.type === CommentType.ChangeTimeEstimate) {
+    return timeEstimateString(goParseInt64(content));
+  }
+  return content;
+}
+
+/** The wire shape of `api.TrackedTime` as ToTimelineComment embeds it
+ *  (ToTrackedTime over the LoadAttributes'd row — user_name from the entry's
+ *  user, `issue` a full ToAPIIssue render; modules/structs/issue_tracked_time.go). */
+interface TimelineTrackedTime {
+  id: number;
+  created: string;
+  time: number;
+  user_id: number;
+  user_name: string;
+  issue_id: number;
+  issue: Issue | null;
+}
+
+/**
+ * The time-tracking comment's tracked_time — upstream `Comment.LoadTime`
+ * (models/issues/comment.go:733-738) reads the comment's `time_id` column,
+ * GetTrackedTimeByID filters the row to the comment's OWN issue
+ * (tracked_time.go:312-322), ToTrackedTime then renders the
+ * LoadAttributes'd row (user_name + the full issue render). Our comment rows
+ * carry NO time_id column (the landed time writers' documented deviation —
+ * the routes/issue-tables-t2.ts module header), so the exact-row linkage is
+ * rebuilt from the writer batches' determinism:
+ *   - add_time_manual (14): the `|<seconds>` content marker holds the entry's
+ *     seconds (tracked_time.go:183-188) — the batch-mate is the newest live
+ *     entry with those seconds by the comment poster on this issue;
+ *   - stop_tracking (13): upstream writes the ALREADY-humanized content
+ *     (stopwatch.go:160) as do our writers — the batch-mate is the newest
+ *     live entry created in the comment's own second (both rows of the batch
+ *     share the write's Date).
+ * delete_time_manual (26) stays null — upstream sets no TimeID there either
+ * (tracked_time.go:252-263/:276-286), so its render is the same null; types
+ * outside the time family are LoadTime's `TimeID == 0` early return. A
+ * dangling entry (purged row, an admin-add whose poster is not the entry's
+ * user) renders null rather than a guess.
+ */
+async function trackedTimeOfComment(d1: D1Database, viewer: Viewer, pair: RepositoryWithOwner, issue: IssueRow, comment: CommentRow): Promise<TimelineTrackedTime | null> {
+  let entry: { id: number; issueId: number; userId: number; seconds: number; createdAt: Date | null } | null = null;
+  if (comment.type === CommentType.AddTimeManual && (comment.content ?? "").startsWith("|")) {
+    const seconds = goParseInt64((comment.content ?? "").slice(1));
+    if (comment.posterId !== null && seconds !== 0) {
+      entry =
+        (
+          await drizzle(d1)
+            .select({ id: trackedTimes.id, issueId: trackedTimes.issueId, userId: trackedTimes.userId, seconds: trackedTimes.seconds, createdAt: trackedTimes.createdAt })
+            .from(trackedTimes)
+            .where(
+              and(
+                eq(trackedTimes.issueId, issue.id),
+                eq(trackedTimes.userId, comment.posterId),
+                eq(trackedTimes.seconds, seconds),
+                eq(trackedTimes.deleted, false),
+              ),
+            )
+            .orderBy(desc(trackedTimes.id))
+            .limit(1)
+            .then((rows) => (rows[0] === undefined ? null : rows[0]))
+        ) ?? null;
+    }
+  } else if (comment.type === CommentType.StopTracking && comment.posterId !== null && comment.createdAt !== null && comment.createdAt !== undefined) {
+    entry =
+      (
+        await drizzle(d1)
+          .select({ id: trackedTimes.id, issueId: trackedTimes.issueId, userId: trackedTimes.userId, seconds: trackedTimes.seconds, createdAt: trackedTimes.createdAt })
+          .from(trackedTimes)
+          .where(
+            and(
+              eq(trackedTimes.issueId, issue.id),
+              eq(trackedTimes.userId, comment.posterId),
+              eq(trackedTimes.deleted, false),
+              eq(trackedTimes.createdAt, comment.createdAt),
+            ),
+          )
+          .orderBy(desc(trackedTimes.id))
+          .limit(1)
+          .then((rows) => (rows[0] === undefined ? null : rows[0]))
+      ) ?? null;
+  }
+  if (entry === null) {
+    return null;
+  }
+  // t.User (LoadAttributes): the ENTRY's user row — the upstream writer posts
+  // the comment as the time's owner, so this is the poster row there; our
+  // admin-add arm posts as the admin (a recorded writer divergence), so the
+  // name resolves the entry's user, not the comment poster.
+  const entryUser =
+    comment.posterId === entry.userId && comment.posterId !== null
+      ? await toPoster(d1, viewer, entry.userId)
+      : await drizzle(d1)
+          .select()
+          .from(users)
+          .where(eq(users.id, entry.userId))
+          .limit(1)
+          .then((rows) => (rows[0] === undefined ? null : apiUserFromRow(rows[0], viewer)));
+  return {
+    id: entry.id,
+    created: isoOrZero(entry.createdAt),
+    time: entry.seconds,
+    user_id: entry.userId,
+    user_name: entryUser?.login ?? "",
+    issue_id: entry.issueId,
+    // t.Issue (LoadAttributes) — GetTrackedTimeByID filtered the entry to the
+    // comment's own issue, so the render is the SAME issue (correlation keys
+    // include issue_id; the full recursive ToAPIIssue is upstream's shape).
+    issue: await toApiIssue(d1, viewer, pair, issue),
+  };
+}
+
 /**
  * Timeline renderability — upstream drops `CommentTypeCode` rows from the
  * timeline (ListIssueCommentsAndTimeline) and xref rows whose reference
@@ -669,17 +1030,21 @@ function assigneeRowFromMap(rows: Map<number, UserRow>, id: number | null | unde
  * `convert.ToTimelineComment` → the contract `TimelineComment`. Emits the
  * metadata subset our comment rows carry: old/new title (type 10), label
  * (type 7), old/milestone (type 8), old/new ref (types 3–6/33), assignee +
- * removed flag (type 9), ref commit sha + action. Deferred metadata renders
- * the Go zero exactly like upstream's empty columns: projects, tracked
- * times, reviews, teams (tier 2/3 surfaces), and the xref/dependency issue
- * enrichment (the xref writers land with the push pipeline).
+ * removed flag (type 9), ref commit sha + action, the humanized time bodies
+ * + tracked_time (types 13/14 — see trackedTimeOfComment) and the type-19/20
+ * dependent_issue (LoadDepIssueDetails → ToAPIIssue). Deferred metadata
+ * renders the Go zero exactly like upstream's empty columns: projects,
+ * reviews, teams (tier 2/3 surfaces), and the xref issue enrichment (the
+ * xref writers land with the push pipeline).
  *
  * The poster plus up to four metadata rows (old/new milestone, label,
  * assignee) are fetched per render; the timeline ROUTE passes `preload` (the
  * page-scoped `prefetchTimelineContext` maps — the query-shape audit's A5)
  * so the reads collapse to lookups — a map miss renders the per-row null
  * verbatim. Omitted keeps the per-row selects (single-item and fallback
- * callers).
+ * callers). The time-comment correlation and the dependent_issue render are
+ * per-row on both paths (the rare arms — a batched tracked_times key would
+ * fan one inArray per distinct (user, seconds, second) tuple, no win).
  */
 export async function toTimelineComment(
   d1: D1Database,
@@ -693,7 +1058,7 @@ export async function toTimelineComment(
   const issuePageUrl = issueHtmlUrl(pair, viewer.origin, issue.index);
   const htmlUrl = commentHtmlUrl(pair, viewer.origin, issue.index, issue.isPull, comment.id);
 
-  const [oldMilestoneRow, milestoneRow, labelRow, assigneeRow] = await Promise.all([
+  const [oldMilestoneRow, milestoneRow, labelRow, assigneeRow, dependentLeg, trackedTime] = await Promise.all([
     preload !== undefined
       ? milestoneFromMap(preload.milestones, comment.oldMilestoneId)
       : comment.oldMilestoneId === null || comment.oldMilestoneId === undefined
@@ -734,6 +1099,15 @@ export async function toTimelineComment(
             .where(eq(users.id, comment.assigneeId))
             .limit(1)
             .then((rows) => (rows[0] === undefined ? null : rows[0])),
+    comment.dependentIssueId === null || comment.dependentIssueId === undefined
+      ? Promise.resolve(null)
+      : preload === undefined
+        ? dependentIssueLegOf(d1, comment.dependentIssueId)
+        : Promise.resolve(preload.dependentIssues.get(comment.dependentIssueId) ?? null),
+    // The time family's rare arms only — a null for every other row.
+    comment.type === CommentType.AddTimeManual || comment.type === CommentType.StopTracking
+      ? trackedTimeOfComment(d1, viewer, pair, issue, comment)
+      : Promise.resolve(null),
   ]);
 
   return {
@@ -743,14 +1117,14 @@ export async function toTimelineComment(
     pull_request_url: issue.isPull ? issuePageUrl : "",
     issue_url: issue.isPull ? "" : issuePageUrl,
     user: poster,
-    body: comment.content ?? "",
+    body: timelineBodyOf(comment),
     created_at: isoOrZero(comment.createdAt),
     updated_at: isoOrZero(comment.updatedAt),
     old_project_id: 0, // projects tier 3
     project_id: 0,
     old_milestone: oldMilestoneRow === null ? null : toApiMilestone(oldMilestoneRow),
     milestone: milestoneRow === null ? null : toApiMilestone(milestoneRow),
-    tracked_time: null, // times/stopwatches tier 2
+    tracked_time: trackedTime,
     old_title: comment.oldTitle ?? "",
     new_title: comment.newTitle ?? "",
     old_ref: comment.oldRef ?? "",
@@ -765,7 +1139,7 @@ export async function toTimelineComment(
     assignee_team: null, // teams tier 2
     removed_assignee: (comment.removedAssignee ?? 0) !== 0,
     resolve_doer: null, // review threads tier 2
-    dependent_issue: null, // dependency enrichment (tier 2)
+    dependent_issue: dependentLeg === null ? null : await toApiIssue(d1, viewer, dependentLeg.pair, dependentLeg.issue),
   };
 }
 
@@ -1407,7 +1781,20 @@ export async function changeIssueBody(d1: D1Database, issue: IssueRow, body: str
   return row;
 }
 
-/** `issue_service.ChangeIssueRef` — ref update + change_issue_ref (33) comment. */
+/** `git.BranchPrefix` (modules/git/repo_branch.go:18) — the prefix
+ *  ChangeIssueRef strips from the COMMENT's refs (⑬-#11). */
+const BRANCH_PREFIX = "refs/heads/";
+
+/** Go `strings.TrimPrefix` — one leading occurrence. */
+function trimBranchPrefix(ref: string): string {
+  return ref.startsWith(BRANCH_PREFIX) ? ref.slice(BRANCH_PREFIX.length) : ref;
+}
+
+/** `issue_service.ChangeIssueRef` — ref update + change_issue_ref (33)
+ *  comment. The ISSUE's ref column carries the raw value upstream too
+ *  (services/issue/issue.go:140-150 sets issue.Ref = ref, the model writes
+ *  it); the COMMENT's old_ref/new_ref carry the TrimPrefix'd "friendly"
+ *  forms (models/issues/issue_update.go:231-232). */
 export async function changeIssueRef(d1: D1Database, issue: IssueRow, ref: string, actorId: number | null, now: Date): Promise<void> {
   const oldRef = issue.ref ?? "";
   await drizzle(d1).batch([
@@ -1416,8 +1803,8 @@ export async function changeIssueRef(d1: D1Database, issue: IssueRow, ref: strin
       type: CommentType.ChangeIssueRef,
       posterId: actorId,
       issueId: issue.id,
-      oldRef,
-      newRef: ref,
+      oldRef: trimBranchPrefix(oldRef),
+      newRef: trimBranchPrefix(ref),
       content: "",
       createdAt: now,
       updatedAt: now,

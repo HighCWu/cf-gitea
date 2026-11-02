@@ -24,10 +24,13 @@ import { getWatch, isWatchModeWatching } from "./repo-watchers";
  *     reactions always join the acting user row;
  *   - upstream validates `content` against `setting.UI.Reactions` (the
  *     instance default set) and answers ErrForbiddenIssueReaction with 403;
- *     the same default set is enforced here (modules/setting/ui.go:102);
- *   - `IssueLockOptions.Reason` is accepted but not stored — the `issues`
- *     schema has no lock_reason column yet (the Lock/Unlock system comments
- *     still land, CommentType 23/24, so the timeline stays upstream-shaped).
+ *     the same default set is enforced here (modules/setting/ui.go:102).
+ *
+ * (The former "lock reason is not stored" note was FALSE — upstream never
+ * had a lock_reason column either: `IssueLockOptions.Reason` rides the
+ * type-23/24 system comment's `content` (models/issues/issue_lock.go:44-53,
+ * CreateCommentOptions{Content: opts.Reason}); lockIssue/unlockIssue now
+ * carry it the same way.)
  */
 
 /** The instance's allowed reaction short-codes (setting.UI.Reactions default). */
@@ -389,16 +392,19 @@ export async function moveIssuePin(d1: D1Database, issue: IssueRow, currentOrder
 // the same num_comments discipline as the landed comment writes.
 // ---------------------------------------------------------------------------
 
-/** LockIssue: the is_locked flip + the Lock system comment in one batch (the
- *  already-locked arm is upstream's silent no-op — the route guards it). */
-export async function lockIssue(d1: D1Database, issueId: number, actorId: number | null, now: Date): Promise<void> {
+/** LockIssue (models/issues/issue_lock.go:44-53): the is_locked flip + the
+ *  Lock system comment in one batch, the doer-supplied `reason` riding the
+ *  comment's content (`CreateCommentOptions{Content: opts.Reason}` — there
+ *  is no lock_reason column upstream either; the already-locked arm is
+ *  upstream's silent no-op — the route guards it). */
+export async function lockIssue(d1: D1Database, issueId: number, actorId: number | null, now: Date, reason?: string | null): Promise<void> {
   await drizzle(d1).batch([
     drizzle(d1).update(issues).set({ isLocked: true, updatedAt: now }).where(eq(issues.id, issueId)),
     drizzle(d1).insert(comments).values({
       type: CommentType.Lock,
       posterId: actorId,
       issueId,
-      content: "",
+      content: reason ?? "",
       createdAt: now,
       updatedAt: now,
     }),
@@ -406,15 +412,16 @@ export async function lockIssue(d1: D1Database, issueId: number, actorId: number
   ] as const);
 }
 
-/** UnlockIssue: the mirror flip + the Unlock system comment. */
-export async function unlockIssue(d1: D1Database, issueId: number, actorId: number | null, now: Date): Promise<void> {
+/** UnlockIssue (issue_lock.go's mirror arm): the flip + the Unlock system
+ *  comment, the reason in the content like the lock arm. */
+export async function unlockIssue(d1: D1Database, issueId: number, actorId: number | null, now: Date, reason?: string | null): Promise<void> {
   await drizzle(d1).batch([
     drizzle(d1).update(issues).set({ isLocked: false, updatedAt: now }).where(eq(issues.id, issueId)),
     drizzle(d1).insert(comments).values({
       type: CommentType.Unlock,
       posterId: actorId,
       issueId,
-      content: "",
+      content: reason ?? "",
       createdAt: now,
       updatedAt: now,
     }),

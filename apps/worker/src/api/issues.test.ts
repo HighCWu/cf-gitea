@@ -3367,6 +3367,232 @@ describe("GET /repos/{owner}/{repo}/issues/{index}/timeline (issueGetCommentsAnd
 });
 
 // ---------------------------------------------------------------------------
+// The ⑬ P2 render pins: real asset rows on the issue/comment renders (the
+// ledger #6 — upstream loads the attachment rows inside the renders,
+// services/convert/issue.go:43/:56 + issue_comment.go:26), the timeline's
+// humanized time bodies + tracked_time/dependent_issue fill (#9 —
+// services/convert/issue_comment.go:70-84/:126-130/:193-195), the lock
+// comment's reason body (#12 — models/issues/issue_lock.go:44-53), and the
+// type-33 comment's branch-prefix trim (#11 — models/issues/issue_update.go:
+// 231-232).
+// ---------------------------------------------------------------------------
+
+describe("issue/comment asset + timeline enrichment renders (⑬ P2)", () => {
+  it("renders seeded attachment rows as issue/comment assets; the unattached render [] (#6)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const issue = await seedIssue(repoId, "attached", { posterId: owner.id });
+    const bare = await seedIssue(repoId, "bare", { posterId: owner.id });
+    const comment = await service().addComment({ issueId: issue.id, posterId: owner.id, content: "with a file" });
+    const seededAssets = await db()
+      .insert(issueAttachments)
+      .values([
+        {
+          uuid: "uuid-issue-1",
+          issueId: issue.id,
+          commentId: 0, // the direct issue attachment
+          uploaderId: owner.id,
+          name: "spec.pdf",
+          size: 1234,
+          downloadCount: 3,
+          r2Key: "repos/r700/attachments/1/spec.pdf",
+          createdAt: new Date("2026-03-04T05:06:07Z"),
+        },
+        {
+          uuid: "uuid-comment-1",
+          issueId: issue.id,
+          commentId: comment.id,
+          uploaderId: owner.id,
+          name: "shot.png",
+          size: 42,
+          downloadCount: 0,
+          r2Key: null, // the row-first landing's in-flight state renders fine
+          createdAt: new Date("2026-03-04T05:06:08Z"),
+        },
+      ])
+      .returning({ id: issueAttachments.id, uuid: issueAttachments.uuid })
+      .all();
+    const issueAssetId = seededAssets.find((row) => row.uuid === "uuid-issue-1")?.id;
+    const commentAssetId = seededAssets.find((row) => row.uuid === "uuid-comment-1")?.id;
+
+    const issueRes = await router()(`/repos/alice/visible/issues/${issue.index}`);
+    expect(issueRes.status).toBe(200);
+    const issueBody = await issueRes.json<{ assets: Array<Record<string, unknown>> }>();
+    // ONLY the comment_id = 0 half is the issue's asset set — the comment's
+    // row never leaks onto the issue render.
+    expect(issueBody.assets).toEqual([
+      {
+        id: issueAssetId,
+        name: "spec.pdf",
+        size: 1234,
+        download_count: 3,
+        uuid: "uuid-issue-1",
+        created_at: "2026-03-04T05:06:07.000Z",
+        browser_download_url: "https://example.com/attachments/uuid-issue-1",
+      },
+    ]);
+
+    const threadRes = await router()(`/repos/alice/visible/issues/${issue.index}/comments`);
+    expect(threadRes.status).toBe(200);
+    const thread = await threadRes.json<Array<{ id: number; assets: Array<Record<string, unknown>> }>>();
+    const rendered = thread.find((item) => item.id === comment.id);
+    expect(rendered?.assets).toEqual([
+      {
+        id: commentAssetId,
+        name: "shot.png",
+        size: 42,
+        download_count: 0,
+        uuid: "uuid-comment-1",
+        created_at: "2026-03-04T05:06:08.000Z",
+        browser_download_url: "https://example.com/attachments/uuid-comment-1",
+      },
+    ]);
+
+    // The empty-set arm: an issue (and its comments) without rows render the
+    // upstream make(…, 0) empty.
+    const bareRes = await router()(`/repos/alice/visible/issues/${bare.index}`);
+    const bareBody = await bareRes.json<{ assets: unknown[] }>();
+    expect(bareBody.assets).toEqual([]);
+    const bareThreadRes = await router()(`/repos/alice/visible/issues/${bare.index}/comments`);
+    const bareThread = await bareThreadRes.json<Array<{ assets: unknown[] }>>();
+    expect(bareThread.every((item) => item.assets.length === 0)).toBe(true);
+  });
+
+  it("humanizes the timeline's raw-seconds time bodies and fills tracked_time (#9)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const issue = await seedIssue(repoId, "timed", { posterId: owner.id });
+    const addAt = new Date("2026-05-01T00:00:00Z");
+    await db().insert(comments).values([
+      // The v1.21+ writer format: raw seconds behind the "|" delimiter
+      // (tracked_time.go:185) — the timeline humanizes on the way out.
+      { type: CommentType.AddTimeManual, posterId: owner.id, issueId: issue.id, content: "|3600", createdAt: addAt, updatedAt: addAt },
+      // The stopwatch stop stores the ALREADY-humanized content upstream
+      // (stopwatch.go:160) — a raw-seeded row proves the strip arm covers
+      // type 13 too, and the tracked_time correlation keys on the shared
+      // batch Date.
+      { type: CommentType.StopTracking, posterId: owner.id, issueId: issue.id, content: "|7200", createdAt: addAt, updatedAt: addAt },
+      // delete_time_manual carries no TimeID upstream either
+      // (tracked_time.go:252-263) — the body humanizes, tracked_time nulls.
+      { type: CommentType.DeleteTimeManual, posterId: owner.id, issueId: issue.id, content: "|1800", createdAt: addAt, updatedAt: addAt },
+      // change_time_estimate stores decimal seconds — TimeEstimateString.
+      { type: CommentType.ChangeTimeEstimate, posterId: owner.id, issueId: issue.id, content: "7200", createdAt: addAt, updatedAt: addAt },
+    ]);
+    await db().insert(trackedTimes).values([
+      { issueId: issue.id, userId: owner.id, seconds: 3600, deleted: false, createdAt: addAt }, // the add_time batch-mate
+      { issueId: issue.id, userId: owner.id, seconds: 7200, deleted: false, createdAt: addAt }, // the stop_tracking batch-mate
+    ]);
+
+    const res = await router()(`/repos/alice/visible/issues/${issue.index}/timeline`);
+    expect(res.status).toBe(200);
+    const body = await res.json<Array<{ type: string; body: string; tracked_time: Record<string, unknown> | null }>>();
+    const byType = Object.fromEntries(body.map((item) => [item.type, item]));
+    expect(byType.add_time_manual?.body).toBe("1 hour");
+    expect(byType.stop_tracking?.body).toBe("2 hours");
+    expect(byType.delete_time_manual?.body).toBe("30 minutes");
+    expect(byType.change_time_estimate?.body).toBe("2h");
+
+    // tracked_time: the add_time arm renders the correlated batch-mate (the
+    // LoadAttributes'd ToTrackedTime shape — user_name from the entry's
+    // user, `issue` a full ToAPIIssue render of the SAME issue).
+    expect(byType.add_time_manual?.tracked_time).toMatchObject({
+      time: 3600,
+      user_id: owner.id,
+      user_name: "Alice",
+      issue_id: issue.id,
+      created: "2026-05-01T00:00:00.000Z",
+    });
+    const addIssue = byType.add_time_manual?.tracked_time?.issue as { number: number } | null;
+    expect(addIssue?.number).toBe(issue.index);
+    expect(byType.stop_tracking?.tracked_time).toMatchObject({ time: 7200, user_name: "Alice" });
+    // The arms upstream leaves TimeID-less stay null.
+    expect(byType.delete_time_manual?.tracked_time).toBeNull();
+    expect(byType.change_time_estimate?.tracked_time).toBeNull();
+  });
+
+  it("renders the type-19/20 dependent_issue through the issue's own repo pair (#9)", async () => {
+    const owner = await seedUser("Alice");
+    const other = await seedUser("Bob");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const foreignRepoId = await seedRepo(other.usernameLower, "other");
+    const dependent = await seedIssue(repoId, "the dependent", { posterId: owner.id });
+    const blocker = await seedIssue(repoId, "the blocker", { posterId: owner.id });
+    const foreign = await seedIssue(foreignRepoId, "the foreign blocker", { posterId: other.id });
+    const at = new Date("2026-05-02T00:00:00Z");
+    // The dependency comments carry the OTHER issue's id — including the
+    // cross-repo edge the model allows (routes/issue-tables-t2.ts
+    // dependencySideFromMeta) — so the render resolves the dependent's OWN
+    // repo pair, never the timeline's.
+    await db().insert(comments).values([
+      { type: CommentType.AddDependency, posterId: owner.id, issueId: dependent.id, dependentIssueId: blocker.id, content: "", createdAt: at, updatedAt: at },
+      { type: CommentType.RemoveDependency, posterId: owner.id, issueId: dependent.id, dependentIssueId: foreign.id, content: "", createdAt: at, updatedAt: at },
+    ]);
+
+    const res = await router()(`/repos/alice/visible/issues/${dependent.index}/timeline`);
+    expect(res.status).toBe(200);
+    const body = await res.json<Array<{ type: string; dependent_issue: { number: number; title: string; repository: { full_name: string } } | null }>>();
+    const add = body.find((item) => item.type === "add_dependency");
+    expect(add?.dependent_issue?.number).toBe(blocker.index);
+    expect(add?.dependent_issue?.title).toBe("the blocker");
+    expect(add?.dependent_issue?.repository.full_name).toBe("alice/visible");
+    const remove = body.find((item) => item.type === "remove_dependency");
+    expect(remove?.dependent_issue?.number).toBe(foreign.index);
+    expect(remove?.dependent_issue?.repository.full_name).toBe("bob/other");
+  });
+
+  it("renders the lock comment's reason as the timeline body (#12)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible");
+    const issue = await seedIssue(repoId, "lockable", { posterId: owner.id });
+    const at = new Date("2026-05-03T00:00:00Z");
+    // The reason rides the type-23 comment's content (issue_lock.go:44-53).
+    await db().insert(comments).values({ type: CommentType.Lock, posterId: owner.id, issueId: issue.id, content: "spam", createdAt: at, updatedAt: at });
+
+    const res = await router()(`/repos/alice/visible/issues/${issue.index}/timeline`);
+    expect(res.status).toBe(200);
+    const body = await res.json<Array<{ type: string; body: string }>>();
+    expect(body.find((item) => item.type === "lock")?.body).toBe("spam");
+  });
+
+  it("stores refs/heads-trimmed forms in the change_issue_ref comment only (#11)", async () => {
+    const owner = await seedUser("Alice");
+    const repoId = await seedRepo(owner.usernameLower, "visible", { stubWriter: true });
+    const issue = await seedIssue(repoId, "refffed", { posterId: 1 });
+
+    const first = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ ref: "refs/heads/feature" }),
+    });
+    expect(first.status).toBe(201);
+    // The ISSUE's ref column carries the raw value (services/issue/issue.go
+    // :140-150 sets issue.Ref verbatim); the COMMENT carries the friendly
+    // trimmed forms (issue_update.go:231-232).
+    expect((await first.json<{ ref: string }>()).ref).toBe("refs/heads/feature");
+    const firstComments = await db().select().from(comments).where(eq(comments.type, CommentType.ChangeIssueRef)).all();
+    expect(firstComments.map((row) => [row.oldRef, row.newRef])).toEqual([["", "feature"]]);
+
+    const second = await router()(`/repos/alice/visible/issues/${issue.index}`, {
+      method: "PATCH",
+      headers: authHeaders,
+      body: JSON.stringify({ ref: "bare" }),
+    });
+    expect(second.status).toBe(201);
+    expect((await second.json<{ ref: string }>()).ref).toBe("bare");
+    const secondComments = await db()
+      .select()
+      .from(comments)
+      .where(eq(comments.type, CommentType.ChangeIssueRef))
+      .orderBy(asc(comments.id))
+      .all();
+    expect(secondComments.map((row) => [row.oldRef, row.newRef])).toEqual([
+      ["", "feature"],
+      ["feature", "bare"],
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // GET /repos/issues/search (issueSearchIssues)
 // ---------------------------------------------------------------------------
 
@@ -3772,14 +3998,15 @@ describe("issues list query-shape witness (query-shape-audit A2)", () => {
     const count = meter.count();
     // Post-fix: 1 repo resolve + the unit-gate read (the mustEnableIssuesOrPulls
     // mount — one constant loadRepoSettings per request, not per row; it rides
-    // the shared settings+units loader) + 2 (count + page) + 6 prefetch arms
-    // (posters, labels, pins, milestones, PR rows, assignees) —
+    // the shared settings+units loader) + 2 (count + page) + 7 prefetch arms
+    // (posters, labels, pins, milestones, PR rows, assignees, the direct
+    // issue attachments — the asset render's page twin) —
     // page-INDEPENDENT (the assignees arm is ONE join read for the whole
     // page, the fold's added arm). The pre-fix shape (audit formula
     // 2 + N×3..5) paid 1 + 2 + 6×3 + 2 milestones + 1 PR row = 24 at this N;
     // the bounds below fail if any per-row fan returns (each issue's 3 reads
     // alone would exceed it).
-    expect(count).toBeLessThanOrEqual(11);
+    expect(count).toBeLessThanOrEqual(12);
     expect(count).toBeLessThan(6 * 3);
 
     // The folded assignee block: the multi set renders in edge-row (insertion)
@@ -3895,9 +4122,10 @@ describe("comment list query-shape witness (query-shape-audit A7)", () => {
 
     // (a) The issue-scoped thread: 1 repo resolve + the unit-gate read (the
     // shared settings+units loader, one constant per request) + 1 issue
-    // lookup + 1 page + 1 poster batch — page-INDEPENDENT (5 distinct
-    // posters dedupe to one read). The pre-fix shape paid 3 + C×1 (C=6
-    // here); the 6 per-comment posters alone would break the bound.
+    // lookup + 1 page + 1 poster batch + 1 attachment batch (the asset
+    // render's page twin) — page-INDEPENDENT (5 distinct posters dedupe to
+    // one read). The pre-fix shape paid 3 + C×1 (C=6 here); the 6
+    // per-comment posters alone would break the bound.
     const threadMeter = countedD1();
     const threadRes = await app.fetch(new Request(`https://example.com/repos/alice/visible/issues/${issue.index}/comments`), {
       ...env,
@@ -3907,11 +4135,12 @@ describe("comment list query-shape witness (query-shape-audit A7)", () => {
     const thread = await threadRes.json<Array<Record<string, unknown> & { id: number; user: unknown }>>();
     expect(thread).toHaveLength(6); // the null-poster row renders too
     const threadCount = threadMeter.count();
-    expect(threadCount).toBeLessThanOrEqual(6);
-    expect(threadCount).toBeLessThan(7); // 6 per-comment posters alone exceed it
+    expect(threadCount).toBeLessThanOrEqual(7);
+    expect(threadCount).toBeLessThan(8); // 6 per-comment posters alone exceed it
 
     // (b) The repo-wide feed: 1 repo resolve + the unit-gate read + 2 (count
-    // + page) + 1 poster batch (pre-fix 3 + C×1 = 11 at C=8).
+    // + page) + 1 poster batch + 1 attachment batch (pre-fix 3 + C×1 = 11 at
+    // C=8).
     const feedMeter = countedD1();
     const feedRes = await app.fetch(new Request("https://example.com/repos/alice/visible/issues/comments?state=all"), {
       ...env,
@@ -3921,7 +4150,7 @@ describe("comment list query-shape witness (query-shape-audit A7)", () => {
     const feed = await feedRes.json<Array<Record<string, unknown> & { id: number; user: unknown }>>();
     expect(feed).toHaveLength(8);
     const feedCount = feedMeter.count();
-    expect(feedCount).toBeLessThanOrEqual(6);
+    expect(feedCount).toBeLessThanOrEqual(7);
     expect(feedCount).toBeLessThan(8); // 8 per-comment posters alone exceed it
 
     // Contract discipline: every batched render is deep-equal to the

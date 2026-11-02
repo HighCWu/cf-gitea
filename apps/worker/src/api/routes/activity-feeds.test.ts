@@ -667,8 +667,9 @@ describe("activity feeds query-shape witness (query-shape-audit A8)", () => {
     await recordAction(env.DB, { actUserId: 1, repoId: "7303", opType: ActionType.CreateIssue, isPrivate: false, content: "1|gone" }); // join-miss arm
 
     // (a) The route, metered end to end: 1 subject lookup + 2 (count + page)
-    // + 5 batched render reads (act users, repo pairs, comments, issues,
-    // posters) = 8 — page-INDEPENDENT. The pre-fix shape paid
+    // + 6 batched render reads (act users, repo pairs, comments, issues,
+    // posters, the comment attachments — the asset render's page twin) = 9 —
+    // page-INDEPENDENT. The pre-fix shape paid
     // 1 + 2 + 1 + R(3) + 2 + C(3) = 12 at this N; the 3 per-row repo pairs
     // and 3 per-comment posters alone would break the bound.
     const meter = countedD1();
@@ -684,7 +685,7 @@ describe("activity feeds query-shape witness (query-shape-audit A8)", () => {
     const body = await res.json<Array<Record<string, unknown> & { act_user_id: number; comment_id: number; comment?: unknown }>>();
     expect(body).toHaveLength(6); // ...the join-miss repo row is skipped at render
     const routeCount = meter.count();
-    expect(routeCount).toBeLessThanOrEqual(8);
+    expect(routeCount).toBeLessThanOrEqual(9);
     expect(routeCount).toBeLessThan(13); // the pre-fix route shape at this N
 
     // Empty-skip discipline: an empty page skips every render arm — exactly
@@ -783,14 +784,15 @@ describe("activity feeds query-shape witness (query-shape-audit A8)", () => {
     const fallbackCount = fallbackMeter.count();
     expect(fallbackCount).toBeGreaterThanOrEqual(6); // the per-row repos + posters alone (R=3 + C=3)
 
-    // (c) The BATCHED render, metered on the same rows and viewer: 5 (act
-    // users + repo pairs + comments + issues + posters) — page-INDEPENDENT
-    // and strictly under the fallback at this N.
+    // (c) The BATCHED render, metered on the same rows and viewer: 6 (act
+    // users + repo pairs + comments + issues + posters + the comment
+    // attachments) — page-INDEPENDENT and strictly under the fallback at
+    // this N.
     const renderMeter = countedD1();
     const rendered = await renderFeedItems(renderMeter.db, viewer, rows);
     const renderCount = renderMeter.count();
-    expect(renderCount).toBeLessThanOrEqual(5);
-    expect(renderCount).toBeLessThan(fallbackCount); // 5 vs 9 at this N
+    expect(renderCount).toBeLessThanOrEqual(6);
+    expect(renderCount).toBeLessThan(fallbackCount); // 6 vs 12 at this N
 
     // Contract discipline: the batched render AND the route body are
     // deep-equal to the per-row fallback render — covers both act users,

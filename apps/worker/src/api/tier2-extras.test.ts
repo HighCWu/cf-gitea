@@ -38,6 +38,7 @@ import { registerHookDeliveryRoute } from "./routes/hook-delivery";
 import { registerSocialT2Routes } from "./routes/social-t2";
 import { registerTopicItemRoutes } from "./routes/topic-items";
 import { IssuesService } from "../issues/service";
+import { lockIssue, unlockIssue } from "./services/issue-extras";
 import { applyRepoExtrasDdl } from "./testing/repo-ddl";
 import { createRepoHook } from "./services/hooks";
 import { starRepo } from "./services/stars";
@@ -553,6 +554,33 @@ describe("issue lock/unlock (issue-t2)", () => {
       .all();
     expect(lockComments.map((entry) => entry.type).filter((type) => type === 23 || type === 24)).toEqual([23, 24]);
   });
+
+  it("stores the doer-supplied lock/unlock reason in the type-23/24 comment's content (issue_lock.go:44-53)", async () => {
+    // Upstream has NO lock_reason column — CreateCommentOptions rides the
+    // reason on the system comment's Content, so the service seam carries it
+    // verbatim (the route wiring is the issue-t2 owner's follow-up).
+    await lockIssue(env.DB, issueA.id, 1, NOW, "spam");
+    await unlockIssue(env.DB, issueA.id, 1, NOW, "reopened cleanly");
+
+    const rows = await drizzle(env.DB)
+      .select({ type: comments.type, content: comments.content })
+      .from(comments)
+      .where(eq(comments.issueId, issueA.id))
+      .all();
+    const lock = rows.find((row) => row.type === 23);
+    const unlock = rows.find((row) => row.type === 24);
+    expect(lock?.content).toBe("spam");
+    expect(unlock?.content).toBe("reopened cleanly");
+    // The omitted-reason arm keeps the empty-content default (the API route's
+    // current call shape — an optional parameter, not a breaking one).
+    await lockIssue(env.DB, issueA.id, 1, NOW);
+    const locks = await drizzle(env.DB)
+      .select({ content: comments.content })
+      .from(comments)
+      .where(and(eq(comments.issueId, issueA.id), eq(comments.type, 23)))
+      .all();
+    expect(locks.map((row) => row.content)).toEqual(["spam", ""]);
+  });
 });
 
 /** The seeded pull's underlying issues-row id (pull_requests keys on it). */
@@ -652,8 +680,9 @@ describe("pinned-list query-shape witness (query-shape-audit A2/A3, tier-2)", ()
     const send = async (path: string, init?: RequestInit, dbOverride?: D1Database): Promise<Response> =>
       app.fetch(new Request(`https://example.com${path}`, init), { ...env, DB: dbOverride ?? env.DB });
 
-    // (a) Pinned ISSUES: 1 repo resolve + 1 pinned page + 4 arms (posters,
-    // labels, pins, milestones — the PR arm skips: no pulls here) = 6,
+    // (a) Pinned ISSUES: 1 repo resolve + 1 pinned page + 5 arms (posters,
+    // labels, pins, milestones, the direct issue attachments — the asset
+    // render's page twin; the PR arm skips: no pulls here) = 7,
     // page-INDEPENDENT. Pre-fix: 2 + N×(1 poster + 1 labels + 1 pin + 1
     // milestone) = 12 at this N; any returning per-row fan breaks it.
     const issuesMeter = countedD1();
@@ -665,7 +694,7 @@ describe("pinned-list query-shape witness (query-shape-audit A2/A3, tier-2)", ()
     // + the route's two unit-gate reads (mustEnableIssuesOrPulls + the
     // reqRepoReader(TypeIssues) arm of api.go:1577 — each ONE constant
     // loadRepoSettings riding the shared settings+units loader).
-    expect(issuesCount).toBeLessThanOrEqual(11);
+    expect(issuesCount).toBeLessThanOrEqual(12);
     expect(issuesCount).toBeLessThan(13);
     expect(pinned.find((entry) => entry.number === issueA.index)?.user).toMatchObject({ login: "cf-gitea-stub" });
     expect(pinned.find((entry) => entry.number === issueB.index)?.user).toMatchObject({ login: "neighbor" });

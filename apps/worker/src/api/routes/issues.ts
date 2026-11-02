@@ -60,7 +60,7 @@ import {
   parseQueryTime,
   parseStateFilter,
   parseTypeFilter,
-  prefetchCommentPosters,
+  prefetchCommentRenderPreload,
   prefetchIssueRenderContext,
   prefetchTimelineContext,
   searchIssuesGlobally,
@@ -1318,10 +1318,12 @@ export function registerIssueRoutes(
     setPaginationHeaders(c, total, listOptions);
     // The query-shape audit's A7: the per-comment poster select batches into
     // ONE inArray read for the page (upstream's comments.LoadPosters is the
-    // same fix); the response shape is unchanged.
-    const posters = await prefetchCommentPosters(c.env.DB, items.map((row) => row.comment));
+    // same fix), and the asset render's per-comment attachment select batches
+    // the same way (upstream comment.Attachments); the response shape is
+    // unchanged.
+    const { posters, attachmentsByComment } = await prefetchCommentRenderPreload(c.env.DB, items.map((row) => row.comment));
     const rendered = await Promise.all(
-      items.map(({ comment, issue }) => toApiComment(c.env.DB, viewer, found, issue, comment, { posters })),
+      items.map(({ comment, issue }) => toApiComment(c.env.DB, viewer, found, issue, comment, { posters, attachmentsByComment })),
     );
     return c.json(rendered, 200);
   });
@@ -1737,9 +1739,11 @@ export function registerIssueRoutes(
     // Upstream sets X-Total-Count but does not paginate this endpoint.
     c.header("X-Total-Count", String(rows.length));
     // The query-shape audit's A7: the per-comment poster select batches into
-    // ONE inArray read for the thread; the response shape is unchanged.
-    const posters = await prefetchCommentPosters(c.env.DB, rows);
-    const rendered = await Promise.all(rows.map((comment) => toApiComment(c.env.DB, viewer, found, issue, comment, { posters })));
+    // ONE inArray read for the thread, and the asset render's per-comment
+    // attachment select batches the same way (upstream comment.Attachments);
+    // the response shape is unchanged.
+    const { posters, attachmentsByComment } = await prefetchCommentRenderPreload(c.env.DB, rows);
+    const rendered = await Promise.all(rows.map((comment) => toApiComment(c.env.DB, viewer, found, issue, comment, { posters, attachmentsByComment })));
     return c.json(rendered, 200);
   });
 

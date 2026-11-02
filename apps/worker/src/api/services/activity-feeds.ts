@@ -24,7 +24,7 @@ import {
   toApiRepository,
   type Viewer,
 } from "./repository";
-import { prefetchCommentPosters, toApiComment } from "./issues";
+import { prefetchCommentRenderPreload, toApiComment } from "./issues";
 
 /**
  * The activity-feed store over the `action` table (specs/activity-feeds.md):
@@ -577,11 +577,12 @@ function isoOrZero(value: Date | null): string {
  * Page-scoped batching (the query-shape audit's A8): the page's distinct
  * repos resolve through ONE `findRepositoriesByIds` join (the per-row
  * `findRepositoryById` twin — a map miss skips the row exactly like the
- * per-row null), and the live comments' posters load through ONE
- * `prefetchCommentPosters` inArray (upstream `comments.LoadPosters`; a map
- * miss renders the per-row null user verbatim inside `toApiComment`). The
- * single-item surface is the feed itself — every caller is a page render —
- * but the per-row helpers stay intact for the fallback the witness meters.
+ * per-row null), and the live comments' posters + attachments load through
+ * ONE `prefetchCommentRenderPreload` fan (upstream `comments.LoadPosters`
+ * + the comment.Attachments rows; a map miss renders the per-row null user
+ * verbatim inside `toApiComment`). The single-item surface is the feed
+ * itself — every caller is a page render — but the per-row helpers stay
+ * intact for the fallback the witness meters.
  */
 export async function renderFeedItems(
   db: D1Database,
@@ -608,14 +609,14 @@ export async function renderFeedItems(
       .where(inArray(issues.id, [...new Set(commentRows.map((row) => row.issueId))]))
       .all();
     const issuesById = new Map(issueRows.map((row) => [row.id, row]));
-    const posters = await prefetchCommentPosters(db, commentRows);
+    const { posters, attachmentsByComment } = await prefetchCommentRenderPreload(db, commentRows);
     await Promise.all(
       commentRows.map(async (commentRow) => {
         const issueRow = issuesById.get(commentRow.issueId);
         const pair = issueRow === undefined ? undefined : repoPairs.get(issueRow.repoId);
         if (issueRow === undefined || pair === undefined) return;
         commentRenders.set(commentRow.id, {
-          comment: await toApiComment(db, viewer, pair, issueRow, commentRow, { posters }),
+          comment: await toApiComment(db, viewer, pair, issueRow, commentRow, { posters, attachmentsByComment }),
           issueId: issueRow.id,
         });
       }),

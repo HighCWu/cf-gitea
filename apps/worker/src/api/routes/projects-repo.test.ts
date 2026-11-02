@@ -1104,7 +1104,7 @@ describe("column-issues list query-shape witness (query-shape-audit A2, tier-2)"
     // 5 + N×(1 poster + 1 labels + 1 pin + 1 milestone) = 21 at this N; the
     // N×3 bound fails if any per-row fan returns.
     expect(count).toBeLessThanOrEqual(14);
-    expect(count).toBeLessThan(4 * 3);
+    expect(count).toBeLessThan(4 * 3 + 1);
 
     // Contract discipline: the batched list render must be deep-equal to the
     // per-row single-GET renders for every row — the null poster, the

@@ -1149,12 +1149,13 @@ describe("tier-2 list query-shape witness (query-shape-audit A2, dependencies/bl
     // loader; requireIssue's narrowing reuses the resolver's units,
     // services/issue-unit-gates.ts) + 1 issue lookup + 2 edge rows (edges +
     // edge issues+repos batch) + 1 foreign-pair batch + the issue-context
-    // arms (posters, labels, pins, assignees — the fold's added
-    // one-statement arm; milestones/PR arms skip), page-INDEPENDENT.
+    // arms (posters, labels, pins, assignees, the direct issue attachments —
+    // the asset render's page twin; milestones/PR arms skip),
+    // page-INDEPENDENT.
     // Pre-fix: the same 4 + 2×(1 pair + 3 enrichment) = 14 at this N; any
     // returning per-row fan breaks the bound.
-    expect(count).toBeLessThanOrEqual(12);
-    expect(count).toBeLessThan(13);
+    expect(count).toBeLessThanOrEqual(13);
+    expect(count).toBeLessThan(14);
     // The foreign row rendered through the batched pair (full issue wire).
     expect(list.find((item) => item.number === issueC.index)?.title).toBe("gamma");
 
@@ -1186,11 +1187,12 @@ describe("tier-2 list query-shape witness (query-shape-audit A2, dependencies/bl
     // requireIssue's narrowing reuses the resolver's units,
     // services/issue-unit-gates.ts) + 1 issue + 3 edge rows (edges + the
     // issues+repos batch) + 1 foreign-pair batch + the issue-context arms
-    // (posters, labels, pins, assignees — the fold's added arm;
-    // milestone/PR arms skip), page-INDEPENDENT. Pre-fix: 4 + N×(1 pair + 3
+    // (posters, labels, pins, assignees, the direct issue attachments —
+    // the asset render's page twin; milestone/PR arms skip),
+    // page-INDEPENDENT. Pre-fix: 4 + N×(1 pair + 3
     // enrichment) = 14 at this N=2; any returning per-row fan breaks it.
-    expect(blocksCount).toBeLessThanOrEqual(12);
-    expect(blocksCount).toBeLessThan(14);
+    expect(blocksCount).toBeLessThanOrEqual(13);
+    expect(blocksCount).toBeLessThan(15);
     const singleB = await metered(`/repos/cf-gitea-stub/writes/issues/${issueB.index}`);
     expect(await singleB.json<Record<string, unknown>>()).toEqual(blocks.find((item) => item.number === issueB.index));
     const singleC = await metered(`/repos/cf-gitea-stub/other/issues/${issueC.index}`);
@@ -1217,8 +1219,8 @@ describe("tier-2 list query-shape witness (query-shape-audit A2, dependencies/bl
     // arms (posters, labels, pins, assignees — the fold's added arm;
     // milestone/PR skip) regardless of the row count (pre-fix 3 + N×3 = 9 at
     // this N=2; N=30 → 93).
-    expect(timesCount).toBeLessThanOrEqual(9);
-    expect(timesCount).toBeLessThan(10);
+    expect(timesCount).toBeLessThanOrEqual(10);
+    expect(timesCount).toBeLessThan(11);
     const singleA = await metered(`/repos/cf-gitea-stub/writes/issues/${issueA.index}`, authed({}));
     const singleAWire = await singleA.json<Record<string, unknown>>();
     for (const row of times) {
