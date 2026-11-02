@@ -43,27 +43,34 @@
  * — the SPEC-0016 §4.4 packages ratification shape and the FOURTH
  * sanctioned extension; the actions-endless producer, upstream's
  * `stop_endless_tasks`, tasks_actions.go:38-45 — the FIFTH) — and runs
- * FIVE producer blocks (SIX producer calls) on the hourly "0 * * * *"
+ * SEVEN producer blocks (EIGHT producer calls) on the hourly "0 * * * *"
  * entry (carried by wrangler.jsonc.example): the (self-gated) demo
  * producer, the (self-gated) audit-retention producer (the FIRST
  * sanctioned extension), the (probe-gated, ratified non-demo-gated)
  * packages-cleanup producer (the SECOND), the (self-gated on the
  * ACTIONS_*_RETENTION_DAYS trio) actions-retention producer (the THIRD),
- * and the actions-abandoned + ephemeral block (the SIXTH — the ungated
+ * the probe-gated auto-merge due-scan producer (the 58f9890 fold), the
+ * actions-abandoned + ephemeral block (the SIXTH — the ungated
  * `cancel_abandoned_jobs` + `cleanup_ephemeral_runners` pair;
  * SPEC-0015 §4.3 + SPEC-0016 §4.4 + SPEC-0012 §4.5 — SIX sanctioned
- * extensions total, ten producer calls across the two entries, the exact
- * mirror of services/cron-state.ts's CRON_ARMS census: six hourly arms,
- * four step arms; see the marked blocks in handleScheduledCron).
+ * extensions total), and the probe-gated webhook-maintenance producer
+ * (SPEC-0005 §4.9 as-built — upstream's own registered
+ * `cleanup_hook_task_table` task, services/cron/tasks_basic.go:124-135;
+ * parity-placed with the ratified non-demo-gated packages shape). Twelve
+ * producer calls across the two entries; the services/cron-state.ts
+ * CRON_ARMS census gains the matching `cleanup_hook_task_table` row as
+ * this block's integration follow-up (the census list stays pinned by
+ * cron-state.test.ts until then; see the marked blocks in
+ * handleScheduledCron).
  * Tests exercise `handleScheduledCron` / `enqueueDueDemoSweeps` / the
  * purge.ts consumer arms directly with fabricated ScheduledControllers —
  * the delegation itself is one await.
  */
 
-import { asc, eq, isNull, lt, or, and } from "drizzle-orm";
+import { asc, eq, inArray, isNull, lt, or, and } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 
-import { repositories, users } from "../db/schema";
+import { repositories, users, webhookDeliveries } from "../db/schema";
 import { enqueueDueAuditRetention } from "./audit";
 import { enqueueDueAutoMergeChecks } from "./pull-automerge";
 import { enqueueDueActionsRetention, enqueueDueZombieStops } from "./actions/retention";
@@ -260,6 +267,135 @@ export async function enqueueDueDemoSweeps(
 }
 
 // ---------------------------------------------------------------------------
+// The webhook-maintenance producer (SPEC-0005 §4.9 as-built + §3.6) — the
+// enqueueDuePackagesCleanup probe shape
+// ---------------------------------------------------------------------------
+
+/**
+ * The one REPO_TASKS message the webhook-maintenance producer enqueues: the
+ * trigger for the serialized consumer arm (repos/purge.ts) to run BOTH
+ * webhook-delivery sweeps — `sweepStuckDeliveries` (§3.6 stuck-row pass,
+ * webhooks/dlq.ts) and `cleanupWebhookDeliveries` (§4.9 log-growth control,
+ * upstream `CleanupHookTaskTable`) — with its own queue-consumer budget
+ * ("crons enqueue, consumers do the work", AGENTS.md Workers rules).
+ */
+export interface WebhookMaintenanceMessage {
+  kind: "webhook-maintenance";
+}
+
+export function isWebhookMaintenanceMessage(value: unknown): value is WebhookMaintenanceMessage {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as WebhookMaintenanceMessage).kind === "webhook-maintenance"
+  );
+}
+
+/**
+ * The env slice the webhook-maintenance producer touches (the
+ * DemoSweepProducerEnv posture — bindings OPTIONAL here so tests can drive
+ * unbound structurally; the generated Env, whose members are required,
+ * satisfies this structurally, and the runtime guard below stays as the
+ * fail-closed defense).
+ */
+export type WebhookMaintenanceProducerEnv = Partial<Pick<Env, "DB" | "REPO_TASKS">>;
+
+/**
+ * The stuck threshold the probe arms on — webhooks/dlq.ts
+ * `sweepStuckDeliveries`' default (15 min, far past the 5 s delivery
+ * timeout). Kept in lockstep with dlq.ts's default on purpose: the probe and
+ * the sweep MUST agree on "stuck" (a probe threshold past the sweep's would
+ * enqueue for rows the sweep then no-ops; the reverse would let wedged rows
+ * age past the probe between ticks). A row in `delivering` past this means a
+ * delivery consumer died between the §3.6 pending→delivering CAS and the
+ * outcome write — the queue redelivery CAS no-op-acks those forever, so the
+ * sweep is the designed way out.
+ */
+export const WEBHOOK_STUCK_AFTER_SECONDS = 900;
+
+/**
+ * The cleanup age threshold the probe arms on — webhooks/dlq.ts
+ * `cleanupWebhookDeliveries`' `olderThanDays` default (30, §4.9, upstream's
+ * `CleanupHookTaskTable` OlderThan window). Same lockstep note as above.
+ */
+export const WEBHOOK_DELIVERY_AGE_DAYS = 30;
+
+/**
+ * dlq.ts's terminal set (private there — mirrored locally; keeping dlq.ts
+ * untouched was the wiring constraint). Drift can only DE-ARM the probe
+ * early, never delete anything the cleanup would keep — the consumer re-checks
+ * every predicate at consume time.
+ */
+const WEBHOOK_TERMINAL_STATES = ["delivered", "skipped", "failed"] as const;
+
+/**
+ * The webhook-maintenance producer (SPEC-0005 §4.9 as-built): TWO existence
+ * probes gate ONE enqueue —
+ *
+ *   1. the stuck-sweep probe: any `delivering` row older than
+ *      WEBHOOK_STUCK_AFTER_SECONDS (sweepStuckDeliveries' exact predicate);
+ *   2. the cleanup probe: any TERMINAL row older than WEBHOOK_DELIVERY_AGE_DAYS
+ *      (cleanupWebhookDeliveries' age-rule predicate — the newest-N-per-webhook
+ *      rule has no cheap existence probe and rides any trigger of this message).
+ *
+ * Neither hits → zero sends: a quiet deployment's hourly tick costs two
+ * LIMIT-1 reads (the packages-cleanup producer's probe posture; the
+ * deliveries table has no (state, created_unix) index, but its size is held
+ * near the §4.9 keep-set by the cleanup itself, so the scan stays bounded).
+ * Work exists → ONE `{kind: "webhook-maintenance"}` message on REPO_TASKS.
+ * NOT demo-gated (upstream's `cleanup_hook_task_table` never was — parity
+ * with the ratified non-demo-gated cleanup_packages). No CAS claim: both
+ * sweeps re-check "stuck"/"old" at consume time and are idempotent, so a
+ * duplicate message is absorbed as a no-op. Returns the number of messages
+ * enqueued (0 or 1).
+ */
+export async function enqueueDueWebhookMaintenance(
+  env: WebhookMaintenanceProducerEnv,
+  options: { now?: Date; stuckAfterSeconds?: number; olderThanDays?: number } = {},
+): Promise<number> {
+  const db = env.DB;
+  const queue = env.REPO_TASKS;
+  if (db === undefined || queue === undefined) {
+    // Unbound bindings are a config bug — fail loud (the packages-cleanup
+    // producer's posture); the generated Env types the bindings required,
+    // this is the fail-closed runtime defense.
+    throw new Error("DB/REPO_TASKS not bound (wrangler.jsonc); the webhook maintenance producer cannot probe");
+  }
+  const now = options.now ?? new Date();
+  const stuckAfterSeconds = options.stuckAfterSeconds ?? WEBHOOK_STUCK_AFTER_SECONDS;
+  const olderThanDays = options.olderThanDays ?? WEBHOOK_DELIVERY_AGE_DAYS;
+  const stuckCut = new Date(now.getTime() - stuckAfterSeconds * 1000);
+  const ageCut = new Date(now.getTime() - olderThanDays * 86_400_000);
+  // Raw binding in, drizzle wrapped here (the demo-sweep producer posture).
+  const d1 = drizzle(db);
+  // Probe 1 — sweepStuckDeliveries' exact predicate (webhooks/dlq.ts): a
+  // `delivering` row past the stuck threshold. The sweep unblocks the §3.6
+  // redelivery paths, so it gates on its own.
+  const stuckDue = await d1
+    .select({ id: webhookDeliveries.id })
+    .from(webhookDeliveries)
+    .where(and(eq(webhookDeliveries.state, "delivering"), lt(webhookDeliveries.createdAt, stuckCut)))
+    .limit(1);
+  // Probe 2 — cleanupWebhookDeliveries' age rule (the upstream
+  // `is_delivered`-guarded OlderThan sweep): terminal rows only, past the
+  // age cutoff. In-flight/pending rows never arm it.
+  const agedDue = await d1
+    .select({ id: webhookDeliveries.id })
+    .from(webhookDeliveries)
+    .where(and(inArray(webhookDeliveries.state, [...WEBHOOK_TERMINAL_STATES]), lt(webhookDeliveries.createdAt, ageCut)))
+    .limit(1);
+  if (stuckDue.length === 0 && agedDue.length === 0) {
+    console.log(`[webhook-maintenance] 0 due (stuck > ${stuckAfterSeconds}s, terminal older than ${olderThanDays}d)`);
+    return 0;
+  }
+  await queue.sendBatch([{ body: { kind: "webhook-maintenance" } satisfies WebhookMaintenanceMessage }]);
+  console.log(
+    `[webhook-maintenance] enqueued 1 sweep (stuck=${stuckDue.length > 0} aged=${agedDue.length > 0}, stuck > ${stuckAfterSeconds}s, terminal older than ${olderThanDays}d)`,
+  );
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
 // The scheduled dispatch (§3.1) — see the mount record in the module header
 // ---------------------------------------------------------------------------
 
@@ -272,7 +408,10 @@ export async function enqueueDueDemoSweeps(
  * non-demo-gated — SPEC-0016 §4.4 — but probe-gated: no enabled rule AND no
  * expired orphans → zero sends) and the actions-retention producer
  * (self-gated on the ACTIONS_*_RETENTION_DAYS trio — SPEC-0012 §4.5: no var
- * set → zero reads and zero sends); every OTHER entry — the standing
+ * set → zero reads and zero sends), the auto-merge due-scan producer
+ * (probe-shaped, ungated — the 58f9890 fold) and the webhook-maintenance
+ * producer (probe-gated, never var-gated — SPEC-0005 §4.9 as-built: no stale
+ * `delivering` row AND no over-age terminal row → zero sends); every OTHER entry — the standing
  * 10-minute step entry and anything a future config adds — runs the mirror
  * producers exactly as the inline handler always has: unconditional,
  * gate-independent (their CAS guard absorbs any :00 overlap, sync.ts:890-898),
@@ -374,6 +513,28 @@ export async function handleScheduledCron(controller: ScheduledController, env: 
       );
     }
     // --- END actions-abandoned + ephemeral producer block -------------------
+    // --- BEGIN webhook-maintenance producer block (SPEC-0005 §4.9 as-built;
+    // --- upstream's own registered `cleanup_hook_task_table` task,
+    // --- services/cron/tasks_basic.go:124-135) ------------------------------
+    // TWO existence probes (webhooks/dlq.ts sweepStuckDeliveries' stale-
+    // `delivering` predicate past WEBHOOK_STUCK_AFTER_SECONDS;
+    // cleanupWebhookDeliveries' terminal-age predicate past
+    // WEBHOOK_DELIVERY_AGE_DAYS) gate ONE {kind: "webhook-maintenance"}
+    // enqueue on REPO_TASKS; the serialized consumer arm (repos/purge.ts)
+    // runs the stuck sweep FIRST — it unblocks the §3.6 redelivery paths a
+    // consumer crashed post-CAS wedges — then the cleanup, and acks.
+    // NOT demo-gated (upstream's arm never was; parity with the ratified
+    // non-demo-gated cleanup_packages) and probe-gated: zero sends on a
+    // quiet instance. Swallowed failures keep the hourly invocation intact
+    // (the tail-arm rationale); the next tick re-probes.
+    try {
+      await enqueueDueWebhookMaintenance(env, {});
+    } catch (error) {
+      console.error(
+        `[webhook-maintenance] producer probes failed (retrying next tick): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    // --- END webhook-maintenance producer block -----------------------------
     return;
   }
   // The mirror producers, exactly as today (index.ts scheduled) — the

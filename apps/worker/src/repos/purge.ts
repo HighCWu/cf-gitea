@@ -71,7 +71,8 @@ import {
 import { handlePackagesCleanup, isPackageCleanupMessage } from "../services/packages/cleanup";
 import { isMailOutboxMessage, runMailOutboxArm } from "../services/mail/outbox";
 import { handleAutoMergeCheck, isAutoMergeCheckMessage } from "../services/pull-automerge";
-import { DEMO_RETENTION_HOURS, isDemoSweepMessage } from "../services/demo-sweep";
+import { DEMO_RETENTION_HOURS, isDemoSweepMessage, isWebhookMaintenanceMessage } from "../services/demo-sweep";
+import { cleanupWebhookDeliveries, sweepStuckDeliveries } from "../webhooks/dlq";
 import { handleMirrorSync, isMirrorSyncMessage } from "../services/mirror/sync";
 import { handlePushMirrorSync, isPushMirrorSyncMessage } from "../services/mirror/push-sync";
 import { drizzle } from "drizzle-orm/d1";
@@ -216,6 +217,12 @@ export async function destroyRepoDO(env: Env, engineName: string): Promise<void>
  *     upstream handlePullRequestAutoMerge ladder run per scheduled row
  *     (a skip leaves the row for the next cron probe; merged/closed
  *     deletes it).
+ *   - webhook maintenance ({kind: "webhook-maintenance"}, SPEC-0005 §4.9
+ *     as-built + §3.6): the hourly probe-gated producer's trigger
+ *     (services/demo-sweep.ts enqueueDueWebhookMaintenance) — the stuck
+ *     delivery sweep FIRST (unblocks the §3.6 redelivery paths a crashed
+ *     consumer wedged), then the delivery-log cleanup (upstream
+ *     CleanupHookTaskTable parity), one idempotent pass per message.
  *
  * Per message: idempotent work, then ack; a throw retries THAT message (the
  * redelivery re-runs the idempotent steps). Storage errors never fail the
@@ -382,6 +389,32 @@ export async function handleRepoTasks(batch: MessageBatch<unknown>, env: Env): P
         console.error(
           `[repo-tasks] actions-ephemeral-cleanup ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`,
         );
+        message.retry();
+      }
+      continue;
+    }
+    // Webhook maintenance (SPEC-0005 §4.9 as-built + §3.6) — ONE message
+    // from the hourly probe-gated producer (services/demo-sweep.ts
+    // enqueueDueWebhookMaintenance) drives BOTH delivery-log sweeps:
+    // `sweepStuckDeliveries` FIRST (it fails rows a delivery consumer left
+    // in `delivering` by dying between the §3.6 pending→delivering CAS and
+    // the outcome write — the delivery queue's redelivery CAS no-op-acks
+    // those forever, so this sweep is the designed way out and unblocks the
+    // redelivery paths), THEN `cleanupWebhookDeliveries` (the §4.9 log-growth
+    // control: newest-100 terminal rows per webhook, terminal rows older
+    // than 30 days dropped — upstream `CleanupHookTaskTable`). Both sweeps
+    // re-check every predicate at consume time and are idempotent; a throw
+    // retries THAT message (the mirror-sync posture).
+    if (isWebhookMaintenanceMessage(message.body)) {
+      try {
+        const swept = await sweepStuckDeliveries(env.DB);
+        const cleaned = await cleanupWebhookDeliveries(env.DB);
+        console.log(
+          `[repo-tasks] webhook-maintenance ${message.id}: swept ${swept} stuck, aged-deleted ${cleaned.deletedByAge}, count-deleted ${cleaned.deletedByCount} across ${cleaned.hooksSwept} hooks`,
+        );
+        message.ack();
+      } catch (error) {
+        console.error(`[repo-tasks] webhook-maintenance ${message.id} retrying: ${error instanceof Error ? error.message : String(error)}`);
         message.retry();
       }
       continue;

@@ -18,14 +18,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { drizzle } from "drizzle-orm/d1";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
-import { repoMirrors, repositories } from "../db/schema";
+import { repoMirrors, repositories, webhookDeliveries, webhooks } from "../db/schema";
 import {
   DEMO_RETENTION_HOURS,
   DEMO_SWEEP_CRON,
+  WEBHOOK_DELIVERY_AGE_DAYS,
+  WEBHOOK_STUCK_AFTER_SECONDS,
   demoModeEnabled,
   enqueueDueDemoSweeps,
+  enqueueDueWebhookMaintenance,
   handleScheduledCron,
   isDemoSweepMessage,
+  isWebhookMaintenanceMessage,
 } from "./demo-sweep";
 
 // ---------------------------------------------------------------------------
@@ -169,7 +173,15 @@ async function seedDueMirror(): Promise<void> {
   });
 }
 
-const WIPED_TABLES = ["repo_mirrors", "push_mirrors", "repo_counters", "repositories", "repo_redirects"];
+const WIPED_TABLES = [
+  "repo_mirrors",
+  "push_mirrors",
+  "repo_counters",
+  "repositories",
+  "repo_redirects",
+  "webhook_deliveries",
+  "webhooks",
+];
 
 async function resetD1(): Promise<void> {
   // Storage isolation resets D1 between tests (apply-d1-migrations.ts
@@ -452,6 +464,190 @@ describe("the armed producer (§3.1 candidate selection)", () => {
     const enqueued = await enqueueDueDemoSweeps({ ...env, REPO_TASKS: queue }, { now: NOW });
     expect(enqueued).toBe(0);
     expect(totalSends(queue)).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SPEC-0005 §4.9 as-built — the webhook-maintenance producer: TWO existence
+// probes (stale `delivering` rows; terminal rows past the §4.9 age cutoff)
+// gate ONE {kind: "webhook-maintenance"} enqueue on REPO_TASKS, and the
+// consumer arm (repos/purge.test.ts) runs webhooks/dlq.ts's
+// sweepStuckDeliveries + cleanupWebhookDeliveries with its own budget.
+// The sweeps' own semantics are pinned in webhooks/dlq.test.ts; these tests
+// pin the PROBE gates and the hourly-entry wiring.
+// ---------------------------------------------------------------------------
+
+/** Local seed helpers (the test-file-copy precedent; dlq.test.ts's shapes). */
+async function seedWebhook(): Promise<number> {
+  const rows = await drizzle(env.DB)
+    .insert(webhooks)
+    .values({ repoId: "r_wm", url: "http://receiver.test/hook", events: '{"send_everything":true}', isActive: true })
+    .returning({ id: webhooks.id })
+    .all();
+  return rows[0]!.id;
+}
+
+async function seedDelivery(
+  hookId: number,
+  overrides: Partial<typeof webhookDeliveries.$inferInsert> = {},
+): Promise<number> {
+  const rows = await drizzle(env.DB)
+    .insert(webhookDeliveries)
+    .values({
+      hookId,
+      repoId: "r_wm",
+      uuid: crypto.randomUUID(),
+      eventType: "issues",
+      eventGroup: "issues",
+      payloadContent: "{}",
+      state: "pending",
+      createdAt: new Date(),
+      ...overrides,
+    })
+    .returning({ id: webhookDeliveries.id })
+    .all();
+  return rows[0]!.id;
+}
+
+describe("the webhook-maintenance producer (SPEC-0005 §4.9 probe gates)", () => {
+  beforeEach(resetD1);
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("a quiet instance: neither probe hits → 0 enqueued, zero sends, one compact 0-due log line", async () => {
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
+    const queue = spyQueue();
+    const enqueued = await enqueueDueWebhookMaintenance({ DB: env.DB, REPO_TASKS: queue }, { now: NOW });
+    expect(enqueued).toBe(0);
+    expect(totalSends(queue)).toBe(0);
+    expect(consoleLog).toHaveBeenCalledTimes(1);
+    expect(consoleLog).toHaveBeenCalledWith(
+      `[webhook-maintenance] 0 due (stuck > ${WEBHOOK_STUCK_AFTER_SECONDS}s, terminal older than ${WEBHOOK_DELIVERY_AGE_DAYS}d)`,
+    );
+  });
+
+  it("a stale `delivering` row past the stuck threshold arms the stuck probe: ONE webhook-maintenance message", async () => {
+    const hookId = await seedWebhook();
+    await seedDelivery(hookId, {
+      state: "delivering",
+      attempts: 1,
+      // The crash-after-CAS shape: past the 15-minute stuck threshold.
+      createdAt: new Date(NOW.getTime() - (WEBHOOK_STUCK_AFTER_SECONDS + 60) * 1000),
+    });
+    const queue = spyQueue();
+    const enqueued = await enqueueDueWebhookMaintenance({ DB: env.DB, REPO_TASKS: queue }, { now: NOW });
+    expect(enqueued).toBe(1);
+    expect(queue.bodies).toEqual([[{ kind: "webhook-maintenance" }]]);
+  });
+
+  it("the stuck threshold is strict: a `delivering` row exactly AT the cutoff is not stuck (lt, not lte)", async () => {
+    const hookId = await seedWebhook();
+    await seedDelivery(hookId, {
+      state: "delivering",
+      attempts: 1,
+      createdAt: new Date(NOW.getTime() - WEBHOOK_STUCK_AFTER_SECONDS * 1000),
+    });
+    const queue = spyQueue();
+    const enqueued = await enqueueDueWebhookMaintenance({ DB: env.DB, REPO_TASKS: queue }, { now: NOW });
+    expect(enqueued).toBe(0);
+    expect(totalSends(queue)).toBe(0);
+  });
+
+  it("a terminal row past the §4.9 age cutoff arms the cleanup probe — with no stuck rows anywhere", async () => {
+    const hookId = await seedWebhook();
+    await seedDelivery(hookId, {
+      state: "delivered",
+      isSucceed: true,
+      createdAt: new Date(NOW.getTime() - (WEBHOOK_DELIVERY_AGE_DAYS + 1) * 86_400_000),
+    });
+    const queue = spyQueue();
+    const enqueued = await enqueueDueWebhookMaintenance({ DB: env.DB, REPO_TASKS: queue }, { now: NOW });
+    expect(enqueued).toBe(1);
+    expect(queue.bodies).toEqual([[{ kind: "webhook-maintenance" }]]);
+  });
+
+  it("recent terminal rows and ANCIENT non-terminal rows arm nothing (the is_delivered guard)", async () => {
+    const hookId = await seedWebhook();
+    await seedDelivery(hookId, {
+      state: "delivered",
+      isSucceed: true,
+      createdAt: new Date(NOW.getTime() - (WEBHOOK_DELIVERY_AGE_DAYS - 1) * 86_400_000), // inside the window
+    });
+    await seedDelivery(hookId, { state: "failed", createdAt: new Date(NOW.getTime() - 1 * 86_400_000) });
+    // The upstream guard: in-flight and pending rows NEVER arm the cleanup
+    // probe, however old they are (the stuck probe reads fresh `delivering`
+    // rows either).
+    await seedDelivery(hookId, { state: "pending", createdAt: new Date(NOW.getTime() - 400 * 86_400_000) });
+    await seedDelivery(hookId, { state: "delivering", attempts: 1, createdAt: new Date(NOW.getTime() - 60_000) });
+    const queue = spyQueue();
+    const enqueued = await enqueueDueWebhookMaintenance({ DB: env.DB, REPO_TASKS: queue }, { now: NOW });
+    expect(enqueued).toBe(0);
+    expect(totalSends(queue)).toBe(0);
+  });
+
+  it("armed but REPO_TASKS unbound: fails loud before the first send (the MIRROR_SYNC_QUEUE guard posture)", async () => {
+    await expect(
+      enqueueDueWebhookMaintenance({ DB: env.DB, REPO_TASKS: undefined }, { now: NOW }),
+    ).rejects.toThrow(/not bound/);
+  });
+
+  it("the hourly entry runs the probe-gated producer regardless of the DEMO gate — the */10 entry never does", async () => {
+    const hookId = await seedWebhook();
+    await seedDelivery(hookId, {
+      state: "delivering",
+      attempts: 1,
+      createdAt: new Date(NOW.getTime() - 20 * 60_000), // stuck
+    });
+
+    // Hourly, gate OFF: the DEMO producer stays silent (§2) but the webhook
+    // arm is NOT demo-gated (upstream's cleanup_hook_task_table never was) —
+    // exactly one {kind: "webhook-maintenance"} lands on REPO_TASKS.
+    const hourlyQueue = spyQueue();
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    await handleScheduledCron(cronController(DEMO_SWEEP_CRON), {
+      ...scheduledEnv("false"),
+      DB: env.DB,
+      MIRROR_SYNC_QUEUE: spyQueue(),
+      REPO_TASKS: hourlyQueue,
+    });
+    const hourlyKinds = (hourlyQueue.bodies.flat() as { kind?: string }[]).map((m) => m.kind);
+    expect(hourlyKinds).toEqual(["webhook-maintenance"]);
+
+    // The step entry: no webhook-maintenance message, ever (the producers it
+    // carries probe empty tables here).
+    await seedDelivery(hookId, {
+      state: "delivering",
+      attempts: 1,
+      createdAt: new Date(NOW.getTime() - 20 * 60_000),
+    });
+    const stepQueue = spyQueue();
+    await handleScheduledCron(cronController("*/10 * * * *"), {
+      ...scheduledEnv("false"),
+      DB: env.DB,
+      MIRROR_SYNC_QUEUE: spyQueue(),
+      REPO_TASKS: stepQueue,
+    });
+    const stepKinds = (stepQueue.bodies.flat() as { kind?: string }[]).map((m) => m.kind);
+    expect(stepKinds).toEqual([]);
+  });
+});
+
+describe("isWebhookMaintenanceMessage narrowing (SPEC-0005 §4.9)", () => {
+  it("accepts only {kind: \"webhook-maintenance\"}", () => {
+    expect(isWebhookMaintenanceMessage({ kind: "webhook-maintenance" })).toBe(true);
+  });
+
+  it("rejects the sibling families' shapes and junk", () => {
+    expect(isWebhookMaintenanceMessage({ kind: "demo-sweep", repoId: "r_1" })).toBe(false);
+    expect(isWebhookMaintenanceMessage({ kind: "audit-retention" })).toBe(false);
+    expect(isWebhookMaintenanceMessage({ kind: "package-cleanup" })).toBe(false);
+    // Extra fields don't disqualify — the guard narrows on the kind literal.
+    expect(isWebhookMaintenanceMessage({ kind: "webhook-maintenance", extra: true })).toBe(true);
+    expect(isWebhookMaintenanceMessage({ storageKey: "r_1", engineNames: ["a/b"] })).toBe(false);
+    expect(isWebhookMaintenanceMessage(null)).toBe(false);
+    expect(isWebhookMaintenanceMessage("webhook-maintenance")).toBe(false);
+    expect(isWebhookMaintenanceMessage(undefined)).toBe(false);
   });
 });
 

@@ -24,7 +24,7 @@ import { eq } from "drizzle-orm";
 
 import { applyAuthD1Migrations } from "../auth/testing/apply-d1-migrations";
 import { basicTokenHeader, mintFor } from "../auth/testing/seeds";
-import { repoRedirects, repositories, users } from "../db/schema";
+import { repoRedirects, repositories, users, webhookDeliveries, webhooks } from "../db/schema";
 import type { RepositoryRow, RepositoryWithOwner } from "../api/services/repository";
 import { createWikiPage, readWikiPage } from "../services/wiki";
 import { handleRepoTasks, purgeRepoMessage } from "./purge";
@@ -154,7 +154,15 @@ async function resetD1(): Promise<void> {
   // Storage isolation resets D1 between tests (apply-d1-migrations.ts
   // header) — re-apply, then wipe defensively anyway.
   await applyAuthD1Migrations();
-  for (const table of ["repo_mirrors", "push_mirrors", "repo_counters", "repositories", "repo_redirects"]) {
+  for (const table of [
+    "repo_mirrors",
+    "push_mirrors",
+    "repo_counters",
+    "repositories",
+    "repo_redirects",
+    "webhook_deliveries",
+    "webhooks",
+  ]) {
     await env.DB.prepare(`DELETE FROM ${table}`).run();
   }
   await env.DB.prepare("DELETE FROM users").run();
@@ -479,5 +487,138 @@ describe("repo delete purge wiki cascade (specs/wiki.md §3 sibling cell)", () =
     await purgeRepoMessage(env, body);
     expect((await env.REPO_PACKS.list({ prefix: nameAddressedPrefix })).objects).toHaveLength(0);
     expect((await env.REPO_PACKS.list({ prefix: carriedPrefix })).objects).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SPEC-0005 §4.9 as-built + §3.6 — the webhook-maintenance arm: ONE
+// {kind: "webhook-maintenance"} message from the hourly probe-gated producer
+// (src/services/demo-sweep.test.ts pins the probes) drives BOTH
+// webhooks/dlq.ts sweeps through this dispatch — sweepStuckDeliveries FIRST
+// (the §3.6 crash-after-CAS safety net; it unblocks the delivery queue's
+// redelivery paths), cleanupWebhookDeliveries SECOND (the §4.9 log-growth
+// control, upstream CleanupHookTaskTable) — then acks; a throw retries THAT
+// message.
+// ---------------------------------------------------------------------------
+
+async function seedMaintenanceWebhook(): Promise<number> {
+  const rows = await drizzle(env.DB)
+    .insert(webhooks)
+    .values({ repoId: "r_test1", url: "http://receiver.test/hook", events: '{"send_everything":true}', isActive: true })
+    .returning({ id: webhooks.id })
+    .all();
+  return rows[0]!.id;
+}
+
+async function seedMaintenanceDelivery(
+  hookId: number,
+  overrides: Partial<typeof webhookDeliveries.$inferInsert> = {},
+): Promise<number> {
+  const rows = await drizzle(env.DB)
+    .insert(webhookDeliveries)
+    .values({
+      hookId,
+      repoId: "r_test1",
+      uuid: crypto.randomUUID(),
+      eventType: "issues",
+      eventGroup: "issues",
+      payloadContent: "{}",
+      state: "pending",
+      createdAt: new Date(),
+      ...overrides,
+    })
+    .returning({ id: webhookDeliveries.id })
+    .all();
+  return rows[0]!.id;
+}
+
+async function maintenanceDeliveryRow(id: number) {
+  const row = await drizzle(env.DB).select().from(webhookDeliveries).where(eq(webhookDeliveries.id, id)).get();
+  if (row === undefined) throw new Error("delivery row vanished");
+  return row;
+}
+
+describe("webhook-maintenance consumer arm (SPEC-0005 §4.9 + §3.6)", () => {
+  beforeEach(resetD1);
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("ONE message runs BOTH sweeps: the crash-orphaned `delivering` row is failed with the fallback outcome, old terminal rows are reclaimed, recent + non-terminal rows survive", async () => {
+    const hookId = await seedMaintenanceWebhook();
+    const now = Date.now();
+    // The §3.6 wedged row: the delivery consumer died after the
+    // pending→delivering CAS and before the outcome write — the delivery
+    // queue's redelivery CAS no-op-acks it forever; the sweep must resolve it.
+    const stuck = await seedMaintenanceDelivery(hookId, {
+      state: "delivering",
+      attempts: 1,
+      createdAt: new Date(now - 20 * 60_000),
+    });
+    // §4.9 age rule: a terminal row past the 30-day cutoff plus a recent keeper.
+    const oldDone = await seedMaintenanceDelivery(hookId, {
+      state: "delivered",
+      isSucceed: true,
+      createdAt: new Date(now - 40 * 86_400_000),
+    });
+    const recentDone = await seedMaintenanceDelivery(hookId, {
+      state: "delivered",
+      isSucceed: true,
+      createdAt: new Date(now - 1 * 86_400_000),
+    });
+    // The upstream is_delivered guard: non-terminal rows survive both sweeps.
+    const pending = await seedMaintenanceDelivery(hookId, {
+      state: "pending",
+      createdAt: new Date(now - 40 * 86_400_000),
+    });
+
+    const { batch, acked, retried } = fabricatedBatch([{ id: "wm-1", body: { kind: "webhook-maintenance" } }]);
+    await handleRepoTasks(batch, env);
+
+    expect(acked).toEqual(["wm-1"]);
+    expect(retried).toEqual([]);
+    // The stuck sweep resolved the wedged row: failed, outcome-stamped.
+    const stuckRow = await maintenanceDeliveryRow(stuck);
+    expect(stuckRow.state).toBe("failed");
+    expect(stuckRow.deliveredAt).not.toBeNull();
+    expect(JSON.parse(stuckRow.responseContent ?? "{}")).toMatchObject({ status: 0 });
+    // The cleanup kept the recent terminal row and the ancient pending row…
+    expect((await maintenanceDeliveryRow(recentDone)).state).toBe("delivered");
+    expect((await maintenanceDeliveryRow(pending)).state).toBe("pending");
+    // …and deleted the over-age terminal row (gone = the row vanished).
+    await expect(maintenanceDeliveryRow(oldDone)).rejects.toThrow();
+  });
+
+  it("runs the stuck sweep BEFORE the cleanup: a wedged row already past the age cutoff ends GONE (failed, then reclaimed) — not stranded as `failed`", async () => {
+    const hookId = await seedMaintenanceWebhook();
+    // Older than BOTH thresholds, so the arm's order is observable: the
+    // sweep-first order fails the row and the cleanup's age rule then
+    // deletes it. A cleanup-first order would leave the row stranded as
+    // `failed` for another 30 days (the cleanup never deletes what the
+    // sweep hasn't terminalized yet — and the already-terminal rows here
+    // would be the only thing it touched).
+    const wedged = await seedMaintenanceDelivery(hookId, {
+      state: "delivering",
+      attempts: 1,
+      createdAt: new Date(Date.now() - 40 * 86_400_000),
+    });
+    const { batch, acked, retried } = fabricatedBatch([{ id: "wm-2", body: { kind: "webhook-maintenance" } }]);
+    await handleRepoTasks(batch, env);
+    expect(acked).toEqual(["wm-2"]);
+    expect(retried).toEqual([]);
+    await expect(maintenanceDeliveryRow(wedged)).rejects.toThrow();
+  });
+
+  it("a throw retries THAT message with the family's log line (no silent drop)", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { batch, acked, retried } = fabricatedBatch([{ id: "wm-3", body: { kind: "webhook-maintenance" } }]);
+    // The tripwire DB: the arm's first D1 read (the stuck sweep's UPDATE)
+    // throws for real — no module mocks — and that throw must surface as a
+    // RETRY plus the observability line.
+    await handleRepoTasks(batch, { ...env, DB: d1ThatThrows() });
+    expect(retried).toEqual(["wm-3"]);
+    expect(acked).toEqual([]);
+    const lines = consoleError.mock.calls.map((args) => args.map(String).join(" "));
+    expect(lines.some((line) => line.includes("[repo-tasks] webhook-maintenance wm-3 retrying"))).toBe(true);
   });
 });
