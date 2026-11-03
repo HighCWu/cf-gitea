@@ -21,7 +21,7 @@ import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import { OpenAPIHono } from "@hono/zod-openapi";
 
-import { orgMembers, repoRedirects, repoTransfer, repoUnits, repoWatchers, actionRunJobs, actionRuns, actionSchedules, actionScheduleSpecs, repositories, stars, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
+import { orgMembers, repoMirrors, repoRedirects, repoTransfer, repoUnits, repoWatchers, actionRunJobs, actionRuns, actionSchedules, actionScheduleSpecs, repositories, stars, userBlocking, users, webhookDeliveries, webhooks } from "../db/schema";
 import { ACTION_STATUS_CANCELLED, ACTION_STATUS_WAITING } from "../services/actions/model";
 import {
   createOptionalTokenAuthMiddleware,
@@ -34,6 +34,7 @@ import { basicTokenHeader, mintFor } from "../auth/testing/seeds";
 import { giteaErrorHandler } from "./errors";
 import type { ApiEnv } from "./env";
 import { registerRepoRoutes } from "./routes/repo";
+import { mirrorAuthHeader } from "../services/mirror/sync";
 import { LICENSE_CORPUS_TEXTS } from "../services/license-corpus";
 import { getRepoLicenses } from "../services/repo-licenses";
 import { addOrUpdateCollaborator } from "./services/repo-collaborators";
@@ -1422,5 +1423,155 @@ describe("PATCH /repos/{owner}/{repo} — the default-branch license arm (repo.g
     const res = await app(LIC_REPO_PATH, licJsonInit({ default_branch: "ghost" }));
     expect(res.status).toBe(200);
     expect(await licenseRows(repoId)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PATCH mirror fields (SPEC-0009 §2.3.1 — upstream updateMirror,
+// routers/api/v1/repo/repo.go:1023-1135). The PATCH's mirror arm over the
+// landed repo_mirrors row: interval (with the reschedule side effect),
+// enable_prune, the write-only credential triple, the silent non-mirror
+// skip, and the mirror triple's presence on EVERY mirror-repo PATCH render.
+// ---------------------------------------------------------------------------
+
+const mirrorPath = "/repos/cf-gitea-stub/edit-me";
+
+async function seedMirrorRow(): Promise<void> {
+  // The arm's table is outside the file's shared beforeEach reset.
+  await env.DB.prepare("DELETE FROM repo_mirrors").run();
+  await drizzle(env.DB).insert(repoMirrors).values({
+    repoId: "7401",
+    intervalSeconds: 28800,
+    enablePrune: true,
+    remoteAddress: "https://src.example.com/org/repo.git",
+    syncState: "idle",
+    nextSyncAt: 1700000000,
+  });
+  // The PATCH route requires is_mirror on the repositories row too (the
+  // service reads the 1:1 row; the render gates on the flag).
+  await drizzle(env.DB)
+    .update(repositories)
+    .set({ isMirror: true, originalUrl: "https://src.example.com/org/repo.git" })
+    .where(eq(repositories.id, "7401"));
+}
+
+const mirrorRow = () => drizzle(env.DB).select().from(repoMirrors).where(eq(repoMirrors.repoId, "7401")).get();
+
+describe("PATCH /repos/{owner}/{repo} — the mirror fields (updateMirror)", () => {
+  it("writes the interval in seconds and RE-ARMS the sync (next_sync_at = now + interval), rendering the updated triple", async () => {
+    await seedMirrorRow();
+    const before = Math.floor(Date.now() / 1000);
+    const res = await makeApp()(mirrorPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ mirror_interval: "30m" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json<Record<string, unknown>>();
+    expect(body.mirror_interval).toBe("30m0s");
+    const row = await mirrorRow();
+    expect(row?.intervalSeconds).toBe(1800);
+    expect(Math.abs((row?.nextSyncAt ?? 0) - (before + 1800))).toBeLessThanOrEqual(2);
+    expect(row?.syncState).toBe("idle"); // the CAS state machine untouched
+  });
+
+  it("interval 0 disables scheduling (next_sync_at = 0)", async () => {
+    await seedMirrorRow();
+    const res = await makeApp()(mirrorPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ mirror_interval: "0" }),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json<Record<string, unknown>>()).mirror_interval).toBe("0");
+    expect((await mirrorRow())?.nextSyncAt).toBe(0);
+  });
+
+  it("422s a below-minimum interval with the upstream text (repo.go:1050-1057)", async () => {
+    await seedMirrorRow();
+    const res = await makeApp()(mirrorPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ mirror_interval: "5m" }),
+    });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({
+      message: "invalid mirror interval: 5m0s is below minimum interval: 10m0s",
+      url: ERROR_URL,
+    });
+    expect((await mirrorRow())?.intervalSeconds).toBe(28800); // untouched
+  });
+
+  it("422s an unparseable interval with the ParseDuration text (repo.go:1044-1048)", async () => {
+    await seedMirrorRow();
+    const res = await makeApp()(mirrorPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ mirror_interval: "soon" }),
+    });
+    expect(res.status).toBe(422);
+    expect(await res.json()).toEqual({ message: 'time: invalid duration "soon"', url: ERROR_URL });
+  });
+
+  it("flips enable_prune without re-arming the schedule", async () => {
+    await seedMirrorRow();
+    const res = await makeApp()(mirrorPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ enable_prune: false }),
+    });
+    expect(res.status).toBe(200);
+    const row = await mirrorRow();
+    expect(row?.enablePrune).toBe(false);
+    expect(row?.nextSyncAt).toBe(1700000000); // prune never re-arms (§2.3.1)
+  });
+
+  it("re-seals the credentials on mirror_password (write-only — never echoed), carrying the stored username", async () => {
+    await seedMirrorRow();
+    await drizzle(env.DB)
+      .update(repoMirrors)
+      .set({ credentialsUsername: "alice", credentialsCiphertext: null })
+      .where(eq(repoMirrors.repoId, "7401"));
+    const res = await makeApp()(mirrorPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ mirror_password: "s3cret" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json<Record<string, unknown>>();
+    expect(JSON.stringify(body)).not.toContain("s3cret"); // write-only
+    const row = await mirrorRow();
+    expect(row?.credentialsUsername).toBe("alice");
+    expect(row?.credentialsCiphertext).not.toBeNull();
+    // The envelope decrypts through the sync consumer's half: Basic alice:s3cret.
+    const header = await mirrorAuthHeader(env, row!);
+    expect(header).toBe(`Basic ${btoa("alice:s3cret")}`);
+  });
+
+  it("SILENTLY skips the arm on a non-mirror repo — 200, no row, no error (repo.go:1029-1033)", async () => {
+    await env.DB.prepare("DELETE FROM repo_mirrors").run();
+    const res = await makeApp()(mirrorPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ mirror_interval: "30m", enable_prune: false, mirror_username: "x" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json<Record<string, unknown>>();
+    expect(body.mirror_interval).toBe(""); // the non-mirror zero-default
+    expect((await mirrorRow()) ?? null).toBeNull();
+  });
+
+  it("renders the mirror triple on a mirror repo even when the PATCH touches no mirror field (innerToRepo parity)", async () => {
+    await seedMirrorRow();
+    const res = await makeApp()(mirrorPath, {
+      method: "PATCH",
+      headers: jsonAuth,
+      body: JSON.stringify({ description: "not a mirror field" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json<Record<string, unknown>>();
+    expect(body.description).toBe("not a mirror field");
+    expect(body.mirror_interval).toBe("8h0m0s");
+    expect(body.mirror).toBe(true);
   });
 });
